@@ -1,0 +1,255 @@
+name: Build Wheels
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build_wheels:
+    name: Build wheel for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+        python-version: ["3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit 13.0.2
+        uses: Jimver/cuda-toolkit@v0.2.29
+        id: cuda-toolkit
+        with:
+          cuda: '13.0.2'
+          method: 'network'
+          use-github-cache: 'true'
+          log-file-suffix: '${{ matrix.os }}.txt'
+
+      - name: Set additional CUDA environment variables (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo "LD_LIBRARY_PATH=$CUDA_PATH/lib64:$CUDA_PATH/lib64/stubs:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=$CUDA_PATH/lib64:$CUDA_PATH/lib64/stubs:$LIBRARY_PATH" >> $GITHUB_ENV
+
+      - name: Set additional CUDA environment variables (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          echo "CUDA_PATH_V13_0=$env:CUDA_PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify CUDA installation
+        shell: bash
+        run: |
+          echo "CUDA_HOME: $CUDA_HOME"
+          echo "CUDA_PATH: $CUDA_PATH"
+          nvcc --version
+
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup CUDA MSBuild integration (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Copy CUDA MSBuild integration files to Visual Studio directory
+          $cudaPath = $env:CUDA_PATH
+          $cudaMSBuildSource = Join-Path $cudaPath "extras\visual_studio_integration\MSBuildExtensions"
+          
+          if (-not (Test-Path $cudaMSBuildSource)) {
+            Write-Error "CUDA MSBuild extensions not found at $cudaMSBuildSource"
+            exit 1
+          }
+          
+          # Find Visual Studio installation
+          $vsBasePaths = @(
+            "C:\Program Files (x86)\Microsoft Visual Studio",
+            "C:\Program Files\Microsoft Visual Studio"
+          )
+          
+          $vsVersions = @("2022", "2019")
+          $vsEditions = @("BuildTools", "Enterprise", "Professional", "Community")
+          $toolsets = @("v170", "v160")
+          
+          $destinations = @()
+          
+          foreach ($basePath in $vsBasePaths) {
+            if (Test-Path $basePath) {
+              foreach ($version in $vsVersions) {
+                foreach ($edition in $vsEditions) {
+                  foreach ($toolset in $toolsets) {
+                    $vsPath = Join-Path $basePath "$version\$edition\MSBuild\Microsoft\VC\$toolset\BuildCustomizations"
+                    if (Test-Path $vsPath) {
+                      $destinations += $vsPath
+                    }
+                  }
+                }
+              }
+            }
+          }
+          
+          if ($destinations.Count -eq 0) {
+            Write-Error "Could not find Visual Studio MSBuild directory"
+            exit 1
+          }
+          
+          # CUDA 13.0 uses versioned filenames that need to be copied as both versioned and standard names
+          $fileMapping = @{
+            "CUDA 13.0.props" = @("CUDA 13.0.props", "CUDA.props")
+            "CUDA 13.0.targets" = @("CUDA 13.0.targets", "CUDA.targets")
+            "CUDA 13.0.xml" = @("CUDA 13.0.xml", "CUDA.xml")
+            "Nvda.Build.CudaTasks.v13.0.dll" = @("Nvda.Build.CudaTasks.v13.0.dll")
+          }
+          
+          $copySuccess = $false
+          
+          foreach ($destDir in $destinations) {
+            try {
+              foreach ($srcFileName in $fileMapping.Keys) {
+                $srcFile = Join-Path $cudaMSBuildSource $srcFileName
+                
+                if (Test-Path $srcFile) {
+                  foreach ($destFileName in $fileMapping[$srcFileName]) {
+                    $destFile = Join-Path $destDir $destFileName
+                    Copy-Item -Path $srcFile -Destination $destFile -Force
+                  }
+                }
+              }
+              $copySuccess = $true
+            } catch {
+              Write-Warning "Failed to copy to $destDir : $_"
+            }
+          }
+          
+          if (-not $copySuccess) {
+            Write-Error "Failed to copy CUDA MSBuild files to any destination"
+            exit 1
+          }
+          
+          Write-Host "CUDA MSBuild integration configured successfully"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Create python3.lib for stable ABI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Create python3.lib for stable ABI support
+          $pythonDir = Split-Path -Parent (Get-Command python).Source
+          $libsDir = Join-Path $pythonDir "libs"
+          $pythonLib = Get-ChildItem -Path $libsDir -Filter "python3*.lib" | Where-Object { $_.Name -match "python3\d+\.lib" } | Select-Object -First 1
+          
+          if ($pythonLib) {
+            $python3Lib = Join-Path $libsDir "python3.lib"
+            if (-not (Test-Path $python3Lib)) {
+              Copy-Item -Path $pythonLib.FullName -Destination $python3Lib
+              Write-Host "Created python3.lib for stable ABI"
+            }
+          } else {
+            Write-Error "Could not find python3XX.lib"
+            exit 1
+          }
+
+      - name: Install CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "~3.27.0"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install build setuptools wheel nanobind
+
+      - name: Build CUDA wheel (Stable ABI - cp312-abi3)
+        shell: bash
+        run: |
+          # Build with default platform-specific CUDA architectures from setup.py
+          python setup.py bdist_wheel
+
+      - name: Build CPU-only wheel (Linux only - py3-none-any)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Clean build artifacts to avoid conflicts
+          rm -rf build *.egg-info
+          # Build CPU-only variant (pure Python, no CUDA)
+          # This produces a universal wheel that works on any platform
+          python setup.py bdist_wheel --no-cuda
+
+      - name: List built wheels
+        shell: bash
+        run: |
+          ls -lh dist/
+          echo "Built wheels:"
+          ls -1 dist/*.whl
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  test:
+    name: Test on ${{ matrix.os }}
+    needs: build_wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+        python-version: ["3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: dist/
+
+      - name: Install wheel and test dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # Install CPU-only PyTorch first (smaller download, no CUDA needed for CI)
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # Install the CPU-only wheel on Linux, CUDA wheel on Windows
+          # (CPU wheel is py3-none-any, works everywhere without CUDA runtime)
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            pip install dist/*py3-none-any.whl
+          else
+            # Windows: install the CUDA wheel (will work in CPU-only mode)
+            pip install dist/*.whl
+          fi
+          pip install pytest ruff
+
+      - name: Ruff check
+        shell: bash
+        run: |
+          ruff check .
+
+      - name: Run tests
+        shell: bash
+        run: |
+          # Run all tests - conftest handles backend availability
+          # Tests requiring CUDA will be skipped on CPU-only runners
+          python -m pytest tests/ -v --tb=short
+

@@ -1,0 +1,89 @@
+ComfyKitchen
+
+Copyright (c) 2025 Comfy Org. All rights reserved.
+
+This product includes software developed at NVIDIA CORPORATION.
+
+================================================================================
+
+This software uses the following third-party libraries:
+
+--------------------------------------------------------------------------------
+NVIDIA CUDA Runtime (cudart)
+--------------------------------------------------------------------------------
+Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+License: NVIDIA CUDA Toolkit End User License Agreement (EULA)
+Website: https://developer.nvidia.com/cuda-toolkit
+
+This software statically links and redistributes the NVIDIA CUDA Runtime library
+(cudart_static) in accordance with the NVIDIA CUDA Toolkit EULA. The full license
+is available at: https://docs.nvidia.com/cuda/eula/index.html
+
+NVIDIA permits redistribution of the CUDA runtime libraries as part of applications
+that use the CUDA toolkit, provided that proper attribution is included.
+
+--------------------------------------------------------------------------------
+PyTorch
+--------------------------------------------------------------------------------
+Copyright (c) 2016-present, Meta Platforms, Inc. and PyTorch contributors
+License: BSD-3-Clause
+Website: https://pytorch.org/
+
+PyTorch is used as a runtime dependency for tensor operations.
+
+--------------------------------------------------------------------------------
+nanobind
+--------------------------------------------------------------------------------
+Copyright (c) 2022 Wenzel Jakob <wenzel.jakob@epfl.ch>
+License: BSD-3-Clause
+Website: https://github.com/wjakob/nanobind
+
+nanobind is used at build time to create Python bindings for C++/CUDA code.
+
+--------------------------------------------------------------------------------
+PyTorch AO (torchao)
+--------------------------------------------------------------------------------
+Copyright (c) Meta Platforms, Inc. and affiliates.
+License: BSD-3-Clause
+Website: https://github.com/pytorch/ao
+
+Portions of the following files are derived from PyTorch AO:
+
+- comfy_kitchen/backends/eager/quantization.py
+  Source: https://github.com/pytorch/ao/blob/main/torchao/prototype/mx_formats/nvfp4_tensor.py
+
+- comfy_kitchen/float_utils.py (_f32_to_floatx_unpacked, _floatx_unpacked_to_f32)
+  Source: https://github.com/pytorch/ao/blob/main/torchao/prototype/mx_formats/custom_cast.py
+
+BSD 3-Clause License:
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+================================================================================
+
+For full license texts of these dependencies, please refer to their respective
+project repositories or installation directories.
+
