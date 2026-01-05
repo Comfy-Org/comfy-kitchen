@@ -12,6 +12,18 @@ from typing import Any
 import torch
 import torch._dynamo
 
+
+LAYOUTS = {}
+
+
+def register_layout_class(name: str, cls):
+    LAYOUTS[name] = cls
+
+
+def get_layout_class(name: str):
+    return LAYOUTS[name]
+
+
 # ==================== Capability Utilities ====================
 
 @lru_cache(maxsize=1)
@@ -24,7 +36,7 @@ def get_cuda_capability() -> tuple[int, int] | None:
 
 # ==================== Base Params Dataclass ====================
 
-@dataclass
+@dataclass(frozen=True)
 class BaseLayoutParams:
     """Base dataclass for layout parameters with common functionality.
 
@@ -132,7 +144,7 @@ class QuantizedTensor(torch.Tensor):
     def __new__(
         cls,
         qdata: torch.Tensor,
-        layout_cls: type[QuantizedLayout],
+        layout_cls: str,
         params: Any,
     ):
         return torch.Tensor._make_wrapper_subclass(
@@ -146,9 +158,10 @@ class QuantizedTensor(torch.Tensor):
     def __init__(
         self,
         qdata: torch.Tensor,
-        layout_cls: type[QuantizedLayout],
+        layout_cls: str,
         params: Any,
     ):
+        assert isinstance(layout_cls, str)
         self._qdata = qdata
         self._layout_cls = layout_cls
         self._params = params
@@ -157,7 +170,7 @@ class QuantizedTensor(torch.Tensor):
         return (
             f"QuantizedTensor(shape={tuple(self.shape)}, "
             f"storage_shape={self.storage_shape}, "
-            f"layout={self._layout_cls.__name__}, "
+            f"layout={self._layout_cls}, "
             f"dtype={self._params.orig_dtype})"
         )
 
@@ -184,8 +197,9 @@ class QuantizedTensor(torch.Tensor):
 
     @property
     def padded_shape(self) -> tuple[int, ...]:
-        if hasattr(self._layout_cls, "get_logical_shape_from_storage"):
-            return self._layout_cls.get_logical_shape_from_storage(self.storage_shape)
+        layout_cls = get_layout_class(self._layout_cls)
+        if hasattr(layout_cls, "get_logical_shape_from_storage"):
+            return layout_cls.get_logical_shape_from_storage(self.storage_shape)
         return self.storage_shape
 
     @property
@@ -194,7 +208,7 @@ class QuantizedTensor(torch.Tensor):
 
     @property
     def layout_cls(self) -> type[QuantizedLayout]:
-        return self._layout_cls
+        return get_layout_class(self._layout_cls)
 
     @property
     def params(self) -> Any:
@@ -203,14 +217,13 @@ class QuantizedTensor(torch.Tensor):
     # ==================== Factory Methods ====================
 
     @classmethod
-    @torch._dynamo.disable()
     def from_float(
         cls,
         tensor: torch.Tensor,
-        layout_cls: type[QuantizedLayout],
+        layout_cls: str,
         **kwargs,
     ) -> QuantizedTensor:
-        qdata, params = layout_cls.quantize(tensor, **kwargs)
+        qdata, params = get_layout_class(layout_cls).quantize(tensor, **kwargs)
         return cls(qdata, layout_cls, params)
 
     def _copy_with(
@@ -256,13 +269,13 @@ class QuantizedTensor(torch.Tensor):
 
         if is_transposed:
             physical_shape = (self._params.orig_shape[1], self._params.orig_shape[0])
-            full = self._layout_cls.dequantize(qdata, self._params)
+            full = self.layout_cls.dequantize(qdata, self._params)
             if full.shape[:2] != physical_shape:
                 slices = tuple(slice(0, s) for s in physical_shape)
                 full = full[slices]
             return full.t()
 
-        full = self._layout_cls.dequantize(qdata, self._params)
+        full = self.layout_cls.dequantize(qdata, self._params)
         orig = self._params.orig_shape
         if full.shape != orig:
             slices = tuple(slice(0, s) for s in orig)
@@ -270,7 +283,7 @@ class QuantizedTensor(torch.Tensor):
         return full
 
     def state_dict(self, prefix: str = "") -> dict[str, torch.Tensor]:
-        tensors = self._layout_cls.state_dict_tensors(self._qdata, self._params)
+        tensors = self.layout_cls.state_dict_tensors(self._qdata, self._params)
         return {f"{prefix}{suffix}": tensor for suffix, tensor in tensors.items()}
 
     # ==================== Flatten/Unflatten Protocol ====================
@@ -396,7 +409,7 @@ def _handle_to(qt, args, kwargs, force_copy=False):
         new_params = qt._params.clone()
 
     if needs_dtype:
-        new_params.orig_dtype = target_dtype
+        new_params = dataclasses.replace(new_params, orig_dtype=target_dtype)
 
     return qt._copy_with(qdata=new_qdata, params=new_params, clone_params=False)
 
@@ -420,14 +433,14 @@ def _handle_copy_(qt, args, kwargs):
     if not isinstance(src, QuantizedTensor):
         raise TypeError(f"Cannot copy {type(src).__name__} to QuantizedTensor")
     if dst._layout_cls != src._layout_cls:
-        raise TypeError(f"Layout mismatch: {dst._layout_cls.__name__} vs {src._layout_cls.__name__}")
+        raise TypeError(f"Layout mismatch: {dst._layout_cls} vs {src._layout_cls}")
 
     dst_orig_dtype = dst._params.orig_dtype
     non_blocking = kwargs.get("non_blocking", len(args) >= 3)
 
     dst._qdata.copy_(src._qdata, non_blocking=non_blocking)
     dst._params.copy_from(src._params, non_blocking=non_blocking)
-    dst._params.orig_dtype = dst_orig_dtype
+    dst._params = dataclasses.replace(dst._params, orig_dtype=dst_orig_dtype)
     return dst
 
 
@@ -441,7 +454,7 @@ def _handle_empty_like(qt, args, kwargs):
     if target_device is not None:
         new_params = new_params.to_device(target_device)
     if target_dtype is not None:
-        new_params.orig_dtype = target_dtype
+        new_params = dataclasses.replace(new_params, orig_dtype=target_dtype)
 
     return qt._copy_with(qdata=new_qdata, params=new_params, clone_params=False)
 
@@ -481,9 +494,9 @@ def _get_layout_from_args(args) -> type[QuantizedLayout] | None:
     """Extract layout class from operation arguments."""
     for arg in args:
         if isinstance(arg, QuantizedTensor):
-            return arg._layout_cls
+            return get_layout_class(arg._layout_cls)
         elif isinstance(arg, (list, tuple)):
             for item in arg:
                 if isinstance(item, QuantizedTensor):
-                    return item._layout_cls
+                    return get_layout_class(item._layout_cls)
     return None

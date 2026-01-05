@@ -111,7 +111,7 @@ class TestQuantizedTensor:
 
     def test_from_float_fp8(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         assert isinstance(qt, QuantizedTensor)
         assert qt.shape == (64, 64)
@@ -122,7 +122,7 @@ class TestQuantizedTensor:
 
     def test_from_float_nvfp4(self):
         x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         assert isinstance(qt, QuantizedTensor)
         assert qt.shape == (128, 256)
@@ -130,7 +130,7 @@ class TestQuantizedTensor:
 
     def test_shape_vs_storage_shape_aligned(self):
         x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         assert qt.shape == (128, 256)
         assert qt.storage_shape == (128, 128)  # packed (cols / 2)
@@ -139,7 +139,7 @@ class TestQuantizedTensor:
 
     def test_shape_vs_storage_shape_unaligned(self):
         x = torch.randn(129, 130, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         assert qt.shape == (129, 130)
         assert qt.storage_shape == (144, 72)   # padded to 144x144, then packed
@@ -148,7 +148,7 @@ class TestQuantizedTensor:
 
     def test_dequantize_fp8(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16) * 5
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         dq = qt.dequantize()
 
         assert dq.dtype == torch.bfloat16
@@ -157,7 +157,7 @@ class TestQuantizedTensor:
 
     def test_dequantize_nvfp4_unpadded(self):
         x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16) * 4
-        qt = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
         dq = qt.dequantize()
 
         assert dq.shape == (128, 128)
@@ -166,7 +166,7 @@ class TestQuantizedTensor:
 
     def test_dequantize_nvfp4_with_padding(self):
         x = torch.randn(129, 130, device="cuda", dtype=torch.bfloat16) * 4
-        qt = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
         dq = qt.dequantize()
 
         # Should return original shape, not padded
@@ -174,7 +174,7 @@ class TestQuantizedTensor:
 
     def test_detach(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         qt_detached = qt.detach()
 
         assert isinstance(qt_detached, QuantizedTensor)
@@ -182,7 +182,7 @@ class TestQuantizedTensor:
 
     def test_clone(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         qt_cloned = qt.clone()
 
         assert isinstance(qt_cloned, QuantizedTensor)
@@ -192,7 +192,7 @@ class TestQuantizedTensor:
     def test_to_device_roundtrip(self):
         """Test device transfer: cuda -> cpu -> cuda preserves data."""
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16) * 5
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         # Move to CPU
         qt_cpu = qt.to("cpu")
@@ -212,7 +212,7 @@ class TestQuantizedTensor:
 
     def test_to_dtype_changes_orig_dtype(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         assert qt._params.orig_dtype == torch.bfloat16
 
@@ -229,7 +229,7 @@ class TestQuantizedTensor:
 
     def test_to_dtype_dequantize_uses_new_dtype(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_float = qt.float()
         dq = qt_float.dequantize()
@@ -238,7 +238,7 @@ class TestQuantizedTensor:
 
     def test_to_device_and_dtype(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         # Move to CPU and change dtype
         qt_cpu_float = qt.to("cpu", dtype=torch.float32)
@@ -249,7 +249,7 @@ class TestQuantizedTensor:
 
     def test_to_dtype_positional_arg(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_copy = qt.to(torch.float32, copy=True)
 
@@ -261,7 +261,7 @@ class TestQuantizedTensor:
 
     def test_to_copy_without_dtype_change(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_copy = qt.to(copy=True)
 
@@ -272,7 +272,7 @@ class TestQuantizedTensor:
 
     def test_empty_like_with_dtype_preserves_qdata_format(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_empty = torch.empty_like(qt, dtype=torch.float32)
 
@@ -282,7 +282,7 @@ class TestQuantizedTensor:
 
     def test_empty_like_copy_pattern_preserves_dtype(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         r = torch.empty_like(qt, dtype=torch.float16, device="cuda")
         r.copy_(qt)
@@ -294,7 +294,7 @@ class TestQuantizedTensor:
 
     def test_repr(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         r = repr(qt)
 
         assert "QuantizedTensor" in r
@@ -303,7 +303,7 @@ class TestQuantizedTensor:
 
     def test_params_property(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         assert qt.params is qt._params
         assert hasattr(qt.params, "scale")
@@ -312,7 +312,7 @@ class TestQuantizedTensor:
 
     def test_contiguous(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         # Already contiguous - should return self
         qt_contig = qt.contiguous()
@@ -321,7 +321,7 @@ class TestQuantizedTensor:
 
     def test_is_contiguous(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         assert qt.is_contiguous()
 
@@ -329,8 +329,8 @@ class TestQuantizedTensor:
         x1 = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
         x2 = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16) * 2
 
-        qt1 = QuantizedTensor.from_float(x1, TensorCoreFP8Layout)
-        qt2 = QuantizedTensor.from_float(x2, TensorCoreFP8Layout)
+        qt1 = QuantizedTensor.from_float(x1, "TensorCoreFP8Layout")
+        qt2 = QuantizedTensor.from_float(x2, "TensorCoreFP8Layout")
 
         # Copy qt2 into qt1
         qt1.copy_(qt2)
@@ -340,7 +340,7 @@ class TestQuantizedTensor:
 
     def test_empty_like(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_empty = torch.empty_like(qt)
 
@@ -350,7 +350,7 @@ class TestQuantizedTensor:
 
     def test_empty_like_different_device(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_empty_cpu = torch.empty_like(qt, device="cpu")
 
@@ -360,7 +360,7 @@ class TestQuantizedTensor:
 
     def test_fallback_to_dequantize(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         # Operations not explicitly handled should dequantize and proceed
         result = qt + 1.0
@@ -374,7 +374,7 @@ class TestQuantizedTensorFlatten:
 
     def test_tensor_flatten_unflatten_fp8(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         inner_tensors, ctx = qt.__tensor_flatten__()
 
@@ -384,7 +384,7 @@ class TestQuantizedTensorFlatten:
 
     def test_tensor_flatten_unflatten_nvfp4(self):
         x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         inner_tensors, _ctx = qt.__tensor_flatten__()
 
@@ -446,7 +446,7 @@ class TestCopyValidation:
         x1 = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
         x2 = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
 
-        qt1 = QuantizedTensor.from_float(x1, TensorCoreFP8Layout)
+        qt1 = QuantizedTensor.from_float(x1, "TensorCoreFP8Layout")
 
         with pytest.raises(TypeError, match=r"Cannot copy.*to QuantizedTensor"):
             qt1.copy_(x2)
@@ -456,8 +456,8 @@ class TestCopyValidation:
         x1 = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         x2 = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
 
-        qt1 = QuantizedTensor.from_float(x1, TensorCoreFP8Layout)
-        qt2 = QuantizedTensor.from_float(x2, TensorCoreNVFP4Layout)
+        qt1 = QuantizedTensor.from_float(x1, "TensorCoreFP8Layout")
+        qt2 = QuantizedTensor.from_float(x2, "TensorCoreNVFP4Layout")
 
         with pytest.raises(TypeError, match="Layout mismatch"):
             qt1.copy_(qt2)
@@ -525,8 +525,8 @@ class TestFP8LinearOperations:
         x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
 
-        qt_x = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
-        qt_w = QuantizedTensor.from_float(w, TensorCoreFP8Layout)
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreFP8Layout")
 
         result = torch.nn.functional.linear(qt_x, qt_w)
         expected = torch.nn.functional.linear(qt_x.dequantize(), qt_w.dequantize())
@@ -544,8 +544,8 @@ class TestFP8LinearOperations:
         w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(out_features, device="cuda", dtype=torch.bfloat16)
 
-        qt_x = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
-        qt_w = QuantizedTensor.from_float(w, TensorCoreFP8Layout)
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreFP8Layout")
 
         result = torch.nn.functional.linear(qt_x, qt_w, b)
         expected = torch.nn.functional.linear(qt_x.dequantize(), qt_w.dequantize(), b)
@@ -562,8 +562,8 @@ class TestFP8LinearOperations:
         x = torch.randn(batch, seq_len, in_features, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
 
-        qt_x = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
-        qt_w = QuantizedTensor.from_float(w, TensorCoreFP8Layout)
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreFP8Layout")
 
         result = torch.nn.functional.linear(qt_x, qt_w)
         expected = torch.nn.functional.linear(qt_x.dequantize(), qt_w.dequantize())
@@ -577,8 +577,8 @@ class TestFP8LinearOperations:
         x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
 
-        qt_x = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
-        qt_w = QuantizedTensor.from_float(w, TensorCoreFP8Layout)
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreFP8Layout")
 
         result_w = torch.nn.functional.linear(x, qt_w)
         expected_w = torch.nn.functional.linear(x, qt_w.dequantize())
@@ -599,8 +599,8 @@ class TestFP8LinearOperations:
         a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
 
-        qt_a = QuantizedTensor.from_float(a, TensorCoreFP8Layout)
-        qt_b = QuantizedTensor.from_float(b, TensorCoreFP8Layout)
+        qt_a = QuantizedTensor.from_float(a, "TensorCoreFP8Layout")
+        qt_b = QuantizedTensor.from_float(b, "TensorCoreFP8Layout")
 
         result = torch.mm(qt_a, qt_b)
         expected = torch.mm(qt_a.dequantize(), qt_b.dequantize())
@@ -614,7 +614,7 @@ class TestFP8LinearOperations:
         a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
 
-        qt_a = QuantizedTensor.from_float(a, TensorCoreFP8Layout)
+        qt_a = QuantizedTensor.from_float(a, "TensorCoreFP8Layout")
 
         result = torch.mm(qt_a, b)
         expected = torch.mm(qt_a.dequantize(), b)
@@ -632,8 +632,8 @@ class TestFP8LinearOperations:
         a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
 
-        qt_a = QuantizedTensor.from_float(a, TensorCoreFP8Layout)
-        qt_b = QuantizedTensor.from_float(b, TensorCoreFP8Layout)
+        qt_a = QuantizedTensor.from_float(a, "TensorCoreFP8Layout")
+        qt_b = QuantizedTensor.from_float(b, "TensorCoreFP8Layout")
 
         result = torch.addmm(bias, qt_a, qt_b)
         expected = torch.addmm(bias, qt_a.dequantize(), qt_b.dequantize())
@@ -648,7 +648,7 @@ class TestFP8LinearOperations:
         a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
 
-        qt_a = QuantizedTensor.from_float(a, TensorCoreFP8Layout)
+        qt_a = QuantizedTensor.from_float(a, "TensorCoreFP8Layout")
 
         # Both paths dequantize qt_a, so results should match exactly
         result = torch.addmm(bias, qt_a, b)
@@ -666,8 +666,8 @@ class TestFP8LinearOperations:
         x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
 
-        qt_x = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
-        qt_w = QuantizedTensor.from_float(w, TensorCoreFP8Layout)
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreFP8Layout")
 
         result = torch.nn.functional.linear(qt_x, qt_w)
 
@@ -684,8 +684,8 @@ class TestFP8LinearOperations:
         x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16) * 10
         w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16) * 0.1
 
-        qt_x = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
-        qt_w = QuantizedTensor.from_float(w, TensorCoreFP8Layout)
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreFP8Layout")
 
         # Scales should be different
         assert not torch.allclose(qt_x._params.scale, qt_w._params.scale)
@@ -703,20 +703,20 @@ class TestFP8ViewOperations:
     def test_fp8_view(self):
         """Test FP8 view preserves quantization."""
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_viewed = qt.view(16, 256)
 
         assert isinstance(qt_viewed, QuantizedTensor)
         assert qt_viewed.shape == (16, 256)
-        assert qt_viewed._layout_cls is TensorCoreFP8Layout
+        assert qt_viewed._layout_cls == "TensorCoreFP8Layout"
         # Scale should be shared (same tensor, not cloned)
         assert qt_viewed._params.scale is qt._params.scale
 
     def test_fp8_view_multiple_shapes(self):
         """Test FP8 view with various shape transformations."""
         x = torch.randn(2, 3, 4, 5, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         # Flatten
         qt_flat = qt.view(-1)
@@ -736,31 +736,31 @@ class TestFP8ViewOperations:
     def test_fp8_transpose(self):
         """Test FP8 transpose preserves quantization."""
         x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_t = qt.t()
 
         assert isinstance(qt_t, QuantizedTensor)
         assert qt_t.shape == (64, 32)
-        assert qt_t._layout_cls is TensorCoreFP8Layout
+        assert qt_t._layout_cls == "TensorCoreFP8Layout"
         # Scale should be shared
         assert qt_t._params.scale is qt._params.scale
 
     def test_fp8_reshape(self):
         """Test FP8 reshape preserves quantization."""
         x = torch.randn(4, 8, 16, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_reshaped = qt.reshape(32, 16)
 
         assert isinstance(qt_reshaped, QuantizedTensor)
         assert qt_reshaped.shape == (32, 16)
-        assert qt_reshaped._layout_cls is TensorCoreFP8Layout
+        assert qt_reshaped._layout_cls == "TensorCoreFP8Layout"
 
     def test_fp8_reshape_with_minus_one(self):
         """Test FP8 reshape with inferred dimension."""
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_reshaped = qt.reshape(-1, 128)
 
@@ -775,7 +775,7 @@ class TestFP8ViewOperations:
     def test_fp8_shape_op_dequantize_consistency(self, op_name, input_shape, op_args):
         """Test that shape op then dequantize matches dequantize then shape op."""
         x = torch.randn(*input_shape, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         qt_op = getattr(qt, op_name)
         dq_op = getattr(qt.dequantize(), op_name)
@@ -788,7 +788,7 @@ class TestFP8ViewOperations:
     def test_fp8_chained_shape_ops(self):
         """Test chaining multiple shape operations."""
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         # Chain: view -> reshape -> view
         qt_chain = qt.view(16, 256).reshape(32, 128).view(4096)
@@ -808,8 +808,8 @@ class TestFP8ViewOperations:
         x = torch.randn(batch, seq, features, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(out_features, features, device="cuda", dtype=torch.bfloat16)
 
-        qt_x = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
-        qt_w = QuantizedTensor.from_float(w, TensorCoreFP8Layout)
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreFP8Layout")
 
         # Reshape to 2D, do linear, reshape back
         qt_flat = qt_x.reshape(-1, features)
@@ -824,7 +824,7 @@ class TestFP8ViewOperations:
     def test_fp8_orig_shape_updated(self):
         """Test that orig_shape is updated after shape operations."""
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
         assert qt._params.orig_shape == (64, 64)
 
@@ -851,8 +851,8 @@ class TestNVFP4LinearOperations:
         x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
 
-        qt_x = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
-        qt_w = QuantizedTensor.from_float(w, TensorCoreNVFP4Layout)
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreNVFP4Layout")
 
         result = torch.nn.functional.linear(qt_x, qt_w)
         expected = torch.nn.functional.linear(qt_x.dequantize(), qt_w.dequantize())
@@ -872,8 +872,8 @@ class TestNVFP4LinearOperations:
         w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(out_features, device="cuda", dtype=torch.bfloat16)
 
-        qt_x = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
-        qt_w = QuantizedTensor.from_float(w, TensorCoreNVFP4Layout)
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreNVFP4Layout")
 
         result = torch.nn.functional.linear(qt_x, qt_w, b)
         expected = torch.nn.functional.linear(qt_x.dequantize(), qt_w.dequantize(), b)
@@ -891,8 +891,8 @@ class TestNVFP4LinearOperations:
         x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
 
-        qt_x = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
-        qt_w = QuantizedTensor.from_float(w, TensorCoreNVFP4Layout)
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreNVFP4Layout")
 
         # Verify tensors were padded
         assert qt_x.is_padded
@@ -909,7 +909,7 @@ class TestNVFP4LinearOperations:
         x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
 
-        qt_w = QuantizedTensor.from_float(w, TensorCoreNVFP4Layout)
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreNVFP4Layout")
 
         # Should work via dequantize fallback
         result = torch.nn.functional.linear(x, qt_w)
@@ -924,7 +924,7 @@ class TestNVFP4LinearOperations:
         x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
 
-        qt_x = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         # Should work via dequantize fallback
         result = torch.nn.functional.linear(qt_x, w)
@@ -939,8 +939,8 @@ class TestNVFP4LinearOperations:
         a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
 
-        qt_a = QuantizedTensor.from_float(a, TensorCoreNVFP4Layout)
-        qt_b = QuantizedTensor.from_float(b, TensorCoreNVFP4Layout)
+        qt_a = QuantizedTensor.from_float(a, "TensorCoreNVFP4Layout")
+        qt_b = QuantizedTensor.from_float(b, "TensorCoreNVFP4Layout")
 
         # mm with non-transposed b should fall back to dequantization
         # (scaled_mm_nvfp4 expects b.T semantics)
@@ -960,8 +960,8 @@ class TestNVFP4LinearOperations:
         # b has shape (n, k) - like a linear weight
         b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
 
-        qt_a = QuantizedTensor.from_float(a, TensorCoreNVFP4Layout)
-        qt_b = QuantizedTensor.from_float(b, TensorCoreNVFP4Layout)
+        qt_a = QuantizedTensor.from_float(a, "TensorCoreNVFP4Layout")
+        qt_b = QuantizedTensor.from_float(b, "TensorCoreNVFP4Layout")
 
         # mm(a, b.t()) is the common torch.compile decomposition of linear
         # This should use the quantized mm path since b.t() has transposed=True
@@ -979,8 +979,8 @@ class TestNVFP4LinearOperations:
         a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
 
-        qt_a = QuantizedTensor.from_float(a, TensorCoreNVFP4Layout)
-        qt_b = QuantizedTensor.from_float(b, TensorCoreNVFP4Layout)
+        qt_a = QuantizedTensor.from_float(a, "TensorCoreNVFP4Layout")
+        qt_b = QuantizedTensor.from_float(b, "TensorCoreNVFP4Layout")
 
         # addmm should fall back to dequantization
         result = torch.addmm(bias, qt_a, qt_b)
@@ -998,8 +998,8 @@ class TestNVFP4LinearOperations:
         x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
 
-        qt_x = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
-        qt_w = QuantizedTensor.from_float(w, TensorCoreNVFP4Layout)
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreNVFP4Layout")
 
         result = torch.nn.functional.linear(qt_x, qt_w)
 
@@ -1014,7 +1014,7 @@ class TestNVFP4ShapeOperationsFallback:
     def test_nvfp4_view_falls_back(self):
         """Test that view on NVFP4 tensor dequantizes (no native support)."""
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         # view should trigger dequantize fallback
         result = qt.view(16, 256)
@@ -1027,7 +1027,7 @@ class TestNVFP4ShapeOperationsFallback:
     def test_nvfp4_transpose_is_noop(self):
         """Test that transpose on NVFP4 tensor is a no-op that tracks transposition."""
         x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         # t() should return a QuantizedTensor with transposed flag
         result = qt.t()
@@ -1042,7 +1042,7 @@ class TestNVFP4ShapeOperationsFallback:
     def test_nvfp4_double_transpose_restores_state(self):
         """Test that double transpose restores original state."""
         x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         result = qt.t().t()
 
@@ -1053,7 +1053,7 @@ class TestNVFP4ShapeOperationsFallback:
     def test_nvfp4_reshape_falls_back(self):
         """Test that reshape on NVFP4 tensor dequantizes (no native support)."""
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         # reshape should trigger dequantize fallback
         result = qt.reshape(32, 128)
@@ -1066,7 +1066,7 @@ class TestNVFP4ShapeOperationsFallback:
     def test_nvfp4_view_values_correct(self):
         """Test that NVFP4 view fallback produces correct values."""
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         result = qt.view(-1)
         expected = qt.dequantize().view(-1)
@@ -1076,7 +1076,7 @@ class TestNVFP4ShapeOperationsFallback:
     def test_nvfp4_transpose_dequantize_values_correct(self):
         """Test that dequantizing a transposed NVFP4 tensor produces correct values."""
         x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
-        qt = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout)
+        qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         # Transpose then dequantize should give same result as dequantize then transpose
         result = qt.t().dequantize()

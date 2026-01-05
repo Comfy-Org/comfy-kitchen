@@ -6,6 +6,8 @@ from .base import (
     dequantize_args,
     get_cuda_capability,
     register_layout_op,
+    register_layout_class,
+    get_layout_class,
 )
 from .fp8 import TensorCoreFP8Layout
 from .nvfp4 import TensorCoreNVFP4Layout
@@ -19,4 +21,9 @@ __all__ = [
     "dequantize_args",
     "get_cuda_capability",
     "register_layout_op",
+    "register_layout_class",
+    "get_layout_class",
 ]
+
+register_layout_class("TensorCoreFP8Layout", TensorCoreFP8Layout)
+register_layout_class("TensorCoreNVFP4Layout", TensorCoreNVFP4Layout)

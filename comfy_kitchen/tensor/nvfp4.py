@@ -30,7 +30,7 @@ class TensorCoreNVFP4Layout(QuantizedLayout):
 
     MIN_SM_VERSION = (10, 0)
 
-    @dataclass
+    @dataclass(frozen=True)
     class Params(BaseLayoutParams):
         """NVFP4 layout parameters.
 
@@ -137,7 +137,7 @@ def _handle_nvfp4_transpose(qt, args, kwargs):
         block_scale=input_tensor._params.block_scale,
         transposed=not input_tensor._params.transposed,
     )
-    return QuantizedTensor(input_tensor._qdata, TensorCoreNVFP4Layout, new_params)
+    return QuantizedTensor(input_tensor._qdata, "TensorCoreNVFP4Layout", new_params)
 
 
 # ==================== NVFP4 Matmul Operations ====================

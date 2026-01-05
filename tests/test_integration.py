@@ -24,7 +24,7 @@ class DummyQuantizedModel(torch.nn.Module):
         in_features: int = 64,
         hidden: int = 128,
         out_features: int = 32,
-        layout_cls=TensorCoreNVFP4Layout,
+        layout_cls="TensorCoreNVFP4Layout",
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
@@ -67,7 +67,7 @@ class TestQuantizedCUDAGraph:
             reqs = layout_cls.get_requirements()
             pytest.skip(f"{layout_cls.__name__} matmul not supported (requires SM >= {reqs['min_sm_version']}, have {reqs['current_sm_version']})")
         return DummyQuantizedModel(
-            in_features=64, hidden=128, out_features=32, layout_cls=layout_cls, device="cuda"
+            in_features=64, hidden=128, out_features=32, layout_cls=layout_cls.__name__, device="cuda"
         )
 
     @pytest.fixture
@@ -171,7 +171,7 @@ class TestQuantizedCompile:
             reqs = layout_cls.get_requirements()
             pytest.skip(f"{layout_cls.__name__} matmul not supported (requires SM >= {reqs['min_sm_version']}, have {reqs['current_sm_version']})")
         return DummyQuantizedModel(
-            in_features=64, hidden=128, out_features=32, layout_cls=layout_cls, device="cuda"
+            in_features=64, hidden=128, out_features=32, layout_cls=layout_cls.__name__, device="cuda"
         )
 
     @pytest.mark.parametrize("model", LAYOUT_CONFIGS, indirect=True)

@@ -35,7 +35,7 @@ class TensorCoreFP8Layout(QuantizedLayout):
 
     MIN_SM_VERSION = (8, 9)
 
-    @dataclass
+    @dataclass(frozen=True)
     class Params(BaseLayoutParams):
         """FP8 layout parameters. Inherits scale, orig_dtype, orig_shape."""
         pass
@@ -124,7 +124,7 @@ def _make_fp8_shape_handler(aten_op):
             orig_dtype=input_tensor._params.orig_dtype,
             orig_shape=tuple(new_qdata.shape),
         )
-        return QuantizedTensor(new_qdata, TensorCoreFP8Layout, new_params)
+        return QuantizedTensor(new_qdata, "TensorCoreFP8Layout", new_params)
 
     return handler
 
@@ -164,7 +164,7 @@ def _handle_fp8_linear(qt, args, kwargs):
                 orig_dtype=input_tensor._params.orig_dtype,
                 orig_shape=tuple(output.shape),
             )
-            return QuantizedTensor(output, TensorCoreFP8Layout, output_params)
+            return QuantizedTensor(output, "TensorCoreFP8Layout", output_params)
         return output
 
     except (RuntimeError, TypeError) as e:
