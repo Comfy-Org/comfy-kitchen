@@ -383,6 +383,8 @@ def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         _wrap_for_dlpack(x),
         _wrap_for_dlpack(freqs_cis),
         _wrap_for_dlpack(x_out),
+        None,  # xk
+        None,  # xk_out
         stream_ptr,
     )
 
@@ -392,8 +394,26 @@ def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 def apply_rope(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    xq_out = apply_rope1(xq, freqs_cis)
-    xk_out = apply_rope1(xk, freqs_cis)
+    if not xq.is_contiguous():
+        xq = xq.contiguous()
+    if not xk.is_contiguous():
+        xk = xk.contiguous()
+    if not freqs_cis.is_contiguous():
+        freqs_cis = freqs_cis.contiguous()
+
+    xq_out = torch.empty_like(xq)
+    xk_out = torch.empty_like(xk)
+    stream_ptr = torch.cuda.current_stream(xq.device).cuda_stream
+
+    _C.apply_rope(
+        _wrap_for_dlpack(xq),
+        _wrap_for_dlpack(freqs_cis),
+        _wrap_for_dlpack(xq_out),
+        _wrap_for_dlpack(xk),
+        _wrap_for_dlpack(xk_out),
+        stream_ptr,
+    )
+
     return xq_out, xk_out
 
 

@@ -17,7 +17,6 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <cuda_runtime.h>
-#include <stdexcept>
 #include <cstring>
 
 namespace nb = nanobind;
@@ -68,22 +67,25 @@ extern "C" {
         cudaStream_t stream);
 
     void launch_apply_rope_kernel(
-        const void* x,
+        const void* xq,
+        const void* xk,
         const void* freqs,
-        void* x_out,
+        void* xq_out,
+        void* xk_out,
         int64_t batch,
-        int64_t n_heads,
-        int64_t seq_len,
+        int64_t dim1,
+        int64_t dim2,
         int64_t head_dim,
         int64_t freqs_batch,
-        int64_t freqs_heads,
+        int64_t freqs_dim1,
+        int64_t freqs_dim2,
         int64_t stride_x_batch,
-        int64_t stride_x_heads,
-        int64_t stride_x_seq,
+        int64_t stride_x_dim1,
+        int64_t stride_x_dim2,
         int64_t stride_x_dim,
         int64_t stride_freqs_batch,
-        int64_t stride_freqs_heads,
-        int64_t stride_freqs_seq,
+        int64_t stride_freqs_dim1,
+        int64_t stride_freqs_dim2,
         int64_t stride_freqs_dim,
         int64_t stride_freqs_rot,
         int64_t stride_freqs_pair,
@@ -294,40 +296,71 @@ void dequantize_nvfp4(
         stream);
 }
 
-// Nanobind wrapper for apply_rope
+// Nanobind wrapper for apply_rope (handles both single tensor and q/k pair)
 void apply_rope(
-    nb::ndarray<nb::device::cuda> x,
+    nb::ndarray<nb::device::cuda> xq,
     nb::ndarray<nb::device::cuda> freqs,
-    nb::ndarray<nb::device::cuda> x_out,
+    nb::ndarray<nb::device::cuda> xq_out,
+    nb::object xk_obj,
+    nb::object xk_out_obj,
     uintptr_t stream_ptr) {
 
-    // Get x dimensions: (batch, n_heads, seq_len, head_dim)
-    int64_t batch = x.shape(0);
-    int64_t n_heads = x.shape(1);
-    int64_t seq_len = x.shape(2);
-    int64_t head_dim = x.shape(3);
+    // Get xq dimensions: (batch, dim1, dim2, head_dim) - layout agnostic
+    int64_t batch = xq.shape(0);
+    int64_t dim1 = xq.shape(1);
+    int64_t dim2 = xq.shape(2);
+    int64_t head_dim = xq.shape(3);
 
-    // Get freqs dimensions
+    // Get freqs dimensions (for broadcasting)
     int64_t freqs_batch = freqs.shape(0);
-    int64_t freqs_heads = freqs.shape(1);
+    int64_t freqs_dim1 = freqs.shape(1);
+    int64_t freqs_dim2 = freqs.shape(2);
 
-    // Validate dimensions match
-    if (freqs.shape(2) != seq_len) {
-        throw std::runtime_error("Freqs seq_len dimension must match input seq_len");
-    }
+    // Validate freqs last dimensions
     if (freqs.shape(3) != head_dim / 2) {
         throw std::runtime_error("Freqs dimension 3 must be head_dim//2");
     }
 
-    // Validate output shape matches input
-    if (x_out.ndim() != 4 ||
-        x_out.shape(0) != batch || x_out.shape(1) != n_heads ||
-        x_out.shape(2) != seq_len || x_out.shape(3) != head_dim) {
+    // Validate xq_out shape matches xq
+    if (xq_out.ndim() != 4 ||
+        xq_out.shape(0) != batch || xq_out.shape(1) != dim1 ||
+        xq_out.shape(2) != dim2 || xq_out.shape(3) != head_dim) {
         throw std::runtime_error("Output shape must match input shape");
     }
 
+    // Handle optional xk and xk_out
+    bool has_xk = !xk_obj.is_none();
+    bool has_xk_out = !xk_out_obj.is_none();
+    
+    if (has_xk != has_xk_out) {
+        throw std::runtime_error("xk and xk_out must both be provided or both be None");
+    }
+    
+    void* xk_data = nullptr;
+    void* xk_out_data = nullptr;
+    
+    if (has_xk) {
+        auto xk = nb::cast<nb::ndarray<nb::device::cuda>>(xk_obj);
+        auto xk_out = nb::cast<nb::ndarray<nb::device::cuda>>(xk_out_obj);
+        
+        if (xk.ndim() != 4 ||
+            xk.shape(0) != batch || xk.shape(1) != dim1 ||
+            xk.shape(2) != dim2 || xk.shape(3) != head_dim) {
+            throw std::runtime_error("xk shape must match xq shape");
+        }
+        
+        if (xk_out.ndim() != 4 ||
+            xk_out.shape(0) != batch || xk_out.shape(1) != dim1 ||
+            xk_out.shape(2) != dim2 || xk_out.shape(3) != head_dim) {
+            throw std::runtime_error("xk_out shape must match xq shape");
+        }
+        
+        xk_data = xk.data();
+        xk_out_data = xk_out.data();
+    }
+
     // Get input dtype code
-    int input_dtype_code = map_dtype_to_code(x.dtype());
+    int input_dtype_code = map_dtype_to_code(xq.dtype());
     if (input_dtype_code < 0) {
         throw std::runtime_error("Unsupported input dtype for apply_rope");
     }
@@ -335,36 +368,39 @@ void apply_rope(
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
     // Get strides (nanobind provides strides in elements, not bytes)
-    int64_t stride_x_batch = x.stride(0);
-    int64_t stride_x_heads = x.stride(1);
-    int64_t stride_x_seq = x.stride(2);
-    int64_t stride_x_dim = x.stride(3);
+    int64_t stride_x_batch = xq.stride(0);
+    int64_t stride_x_dim1 = xq.stride(1);
+    int64_t stride_x_dim2 = xq.stride(2);
+    int64_t stride_x_dim = xq.stride(3);
 
     int64_t stride_freqs_batch = freqs.stride(0);
-    int64_t stride_freqs_heads = freqs.stride(1);
-    int64_t stride_freqs_seq = freqs.stride(2);
+    int64_t stride_freqs_dim1 = freqs.stride(1);
+    int64_t stride_freqs_dim2 = freqs.stride(2);
     int64_t stride_freqs_dim = freqs.stride(3);
     int64_t stride_freqs_rot = freqs.stride(4);
     int64_t stride_freqs_pair = freqs.stride(5);
 
     // Launch kernel
     launch_apply_rope_kernel(
-        x.data(),
+        xq.data(),
+        xk_data,
         freqs.data(),
-        x_out.data(),
+        xq_out.data(),
+        xk_out_data,
         batch,
-        n_heads,
-        seq_len,
+        dim1,
+        dim2,
         head_dim,
         freqs_batch,
-        freqs_heads,
+        freqs_dim1,
+        freqs_dim2,
         stride_x_batch,
-        stride_x_heads,
-        stride_x_seq,
+        stride_x_dim1,
+        stride_x_dim2,
         stride_x_dim,
         stride_freqs_batch,
-        stride_freqs_heads,
-        stride_freqs_seq,
+        stride_freqs_dim1,
+        stride_freqs_dim2,
         stride_freqs_dim,
         stride_freqs_rot,
         stride_freqs_pair,
@@ -413,9 +449,11 @@ NB_MODULE(_C, m) {
 
     m.def("apply_rope", &apply_rope,
           "Apply Rotary Position Embedding (RoPE) using nanobind ndarrays",
-          nb::arg("x"),
+          nb::arg("xq"),
           nb::arg("freqs"),
-          nb::arg("x_out"),
+          nb::arg("xq_out"),
+          nb::arg("xk") = nullptr,
+          nb::arg("xk_out") = nullptr,
           nb::arg("stream_ptr"));
 
     m.def("quantize_nvfp4", &quantize_nvfp4,

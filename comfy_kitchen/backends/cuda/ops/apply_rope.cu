@@ -18,7 +18,6 @@
 #include "dtype_dispatch.cuh"
 
 #include <stdexcept>
-#include <string>
 
 namespace comfy {
 
@@ -26,256 +25,240 @@ namespace {
 
 constexpr int kBlockSize = 128;
 
-// Helper to convert to float32 for computation
-template<typename T>
-__forceinline__ __device__ float to_float(T val) {
-    if constexpr (std::is_same_v<T, half>) {
-        return __half2float(val);
-    } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
-        return __bfloat162float(val);
-    }
-    return 0.0f;
-}
-
-// Helper to convert from float32 back to output type
-template<typename T>
-__forceinline__ __device__ T from_float(float val) {
-    if constexpr (std::is_same_v<T, half>) {
-        return __float2half(val);
-    } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
-        return __float2bfloat16(val);
-    }
-    return T(0);
-}
-
-// Vectorized version - uses union trick for guaranteed aligned loads/stores
-template <typename InputType>
-__global__ void apply_rope_kernel_vectorized(
-    const InputType* x,
-    const float* freqs,
-    InputType* x_out,
-    int64_t batch,
-    int64_t n_heads,
-    int64_t seq_len,
-    int64_t head_dim,
-    int64_t freqs_batch,
-    int64_t freqs_heads,
-    int64_t stride_x_batch,
-    int64_t stride_x_heads,
-    int64_t stride_x_seq,
-    int64_t stride_x_dim,
-    int64_t stride_freqs_batch,
-    int64_t stride_freqs_heads,
-    int64_t stride_freqs_seq,
-    int64_t stride_freqs_dim,
-    int64_t stride_freqs_rot,
-    int64_t stride_freqs_pair) {
-    
-    // Each thread processes 1 pair (2 elements) using vectorized load/store via union
-    const int64_t n_pairs = head_dim / 2;
-    const int64_t total_pairs = batch * n_heads * seq_len * n_pairs;
-    
-    // Global thread index
-    const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total_pairs) {
-        return;
-    }
-    
-    // Decompose linear index into (batch_idx, head_idx, seq_idx, pair_idx)
-    const int64_t pair_idx = idx % n_pairs;
-    int64_t temp = idx / n_pairs;
-    const int64_t seq_idx = temp % seq_len;
-    temp = temp / seq_len;
-    const int64_t head_idx = temp % n_heads;
-    const int64_t batch_idx = temp / n_heads;
-    
-    // Calculate base offset for this (batch, head, seq) location
-    const int64_t x_base = batch_idx * stride_x_batch + 
-                           head_idx * stride_x_heads + 
-                           seq_idx * stride_x_seq + 
-                           pair_idx * 2;
-    
-    // Union for vectorized load/store (2 fp16/bf16 = 32 bits = uint32_t)
-    union {
-        uint32_t vec;  // 32-bit vectorized load/store for one pair
-        InputType elems[2];
-    } x_data, x_out_data;
-    
-    // Vectorized load using reinterpret_cast
-    x_data.vec = *reinterpret_cast<const uint32_t*>(&x[x_base]);
-    
-    // Convert to float32 for computation
-    const float x_0 = to_float(x_data.elems[0]);
-    const float x_1 = to_float(x_data.elems[1]);
-    
-    // Handle broadcasting for freqs_cis
-    const int64_t freqs_batch_idx = (freqs_batch == 1) ? 0 : batch_idx;
-    const int64_t freqs_head_idx = (freqs_heads == 1) ? 0 : head_idx;
-    
-    // Calculate base offset for freqs_cis
-    const int64_t freqs_base = freqs_batch_idx * stride_freqs_batch + 
-                               freqs_head_idx * stride_freqs_heads + 
-                               seq_idx * stride_freqs_seq + 
-                               pair_idx * stride_freqs_dim;
-    
-    // Load rotation matrix elements using read-only cache
-    const float freqs_00 = __ldg(&freqs[freqs_base + 0 * stride_freqs_rot + 0 * stride_freqs_pair]);
-    const float freqs_01 = __ldg(&freqs[freqs_base + 0 * stride_freqs_rot + 1 * stride_freqs_pair]);
-    const float freqs_10 = __ldg(&freqs[freqs_base + 1 * stride_freqs_rot + 0 * stride_freqs_pair]);
-    const float freqs_11 = __ldg(&freqs[freqs_base + 1 * stride_freqs_rot + 1 * stride_freqs_pair]);
-    
-    // Apply 2D rotation in float32
-    const float x_out_0 = freqs_00 * x_0 + freqs_01 * x_1;
-    const float x_out_1 = freqs_10 * x_0 + freqs_11 * x_1;
-    
-    // Convert back to input type and store in union
-    x_out_data.elems[0] = from_float<InputType>(x_out_0);
-    x_out_data.elems[1] = from_float<InputType>(x_out_1);
-    
-    // Vectorized store using reinterpret_cast
-    *reinterpret_cast<uint32_t*>(&x_out[x_base]) = x_out_data.vec;
-}
-
-// Fallback scalar version for edge cases
 template <typename InputType>
 __global__ void apply_rope_kernel(
-    const InputType* x,
+    const InputType* xq,
+    const InputType* xk,
     const float* freqs,
-    InputType* x_out,
+    InputType* xq_out,
+    InputType* xk_out,
     int64_t batch,
-    int64_t n_heads,
-    int64_t seq_len,
+    int64_t dim1,
+    int64_t dim2,
     int64_t head_dim,
     int64_t freqs_batch,
-    int64_t freqs_heads,
+    int64_t freqs_dim1,
+    int64_t freqs_dim2,
     int64_t stride_x_batch,
-    int64_t stride_x_heads,
-    int64_t stride_x_seq,
+    int64_t stride_x_dim1,
+    int64_t stride_x_dim2,
     int64_t stride_x_dim,
     int64_t stride_freqs_batch,
-    int64_t stride_freqs_heads,
-    int64_t stride_freqs_seq,
+    int64_t stride_freqs_dim1,
+    int64_t stride_freqs_dim2,
     int64_t stride_freqs_dim,
     int64_t stride_freqs_rot,
     int64_t stride_freqs_pair) {
     
-    // Calculate total number of pairs to process
+    // Each thread processes 2 pairs (4 elements) for better memory coalescing
     const int64_t n_pairs = head_dim / 2;
-    const int64_t total_elements = batch * n_heads * seq_len * n_pairs;
+    const int64_t pairs_per_thread = 2;
+    const int64_t n_pair_groups = (n_pairs + pairs_per_thread - 1) / pairs_per_thread;
+    const int64_t total_pair_groups = batch * dim1 * dim2 * n_pair_groups;
     
-    // Global thread index
     const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total_elements) {
-        return;
+    if (idx >= total_pair_groups) return;
+    
+    // Decompose linear index into (batch_idx, dim1_idx, dim2_idx, pair_group_idx)
+    const int64_t pair_group_idx = idx % n_pair_groups;
+    int64_t temp = idx / n_pair_groups;
+    const int64_t dim2_idx = temp % dim2;
+    temp = temp / dim2;
+    const int64_t dim1_idx = temp % dim1;
+    const int64_t batch_idx = temp / dim1;
+    
+    // Calculate actual pair indices for this thread
+    const int64_t pair_idx_0 = pair_group_idx * pairs_per_thread;
+    const int64_t pair_idx_1 = pair_idx_0 + 1;
+    const bool process_pair_1 = pair_idx_1 < n_pairs;
+    
+    // Handle broadcasting for freqs_cis (all spatial dimensions)
+    const int64_t freqs_batch_idx = (freqs_batch == 1) ? 0 : batch_idx;
+    const int64_t freqs_dim1_idx = (freqs_dim1 == 1) ? 0 : dim1_idx;
+    const int64_t freqs_dim2_idx = (freqs_dim2 == 1) ? 0 : dim2_idx;
+    
+    // Helper lambda to load a single 2x2 rotation matrix with adaptive vectorization
+    auto load_freqs_matrix = [&](int64_t pair_idx, float& f00, float& f01, float& f10, float& f11) {
+        const int64_t freqs_base = freqs_batch_idx * stride_freqs_batch + 
+                                   freqs_dim1_idx * stride_freqs_dim1 + 
+                                   freqs_dim2_idx * stride_freqs_dim2 + 
+                                   pair_idx * stride_freqs_dim;
+        
+        if (stride_freqs_pair == 1 && stride_freqs_rot == 2) {
+            // Fully contiguous 2x2 matrix - single float4 load
+            const float4 mat = *reinterpret_cast<const float4*>(&freqs[freqs_base]);
+            f00 = mat.x;
+            f01 = mat.y;
+            f10 = mat.z;
+            f11 = mat.w;
+        } else if (stride_freqs_pair == 1) {
+            // Rows are contiguous - two float2 loads
+            const float2 row0 = *reinterpret_cast<const float2*>(&freqs[freqs_base + 0 * stride_freqs_rot]);
+            const float2 row1 = *reinterpret_cast<const float2*>(&freqs[freqs_base + 1 * stride_freqs_rot]);
+            f00 = row0.x;
+            f01 = row0.y;
+            f10 = row1.x;
+            f11 = row1.y;
+        } else if (stride_freqs_rot == 1) {
+            // Columns are contiguous - two float2 loads
+            const float2 col0 = *reinterpret_cast<const float2*>(&freqs[freqs_base + 0 * stride_freqs_pair]);
+            const float2 col1 = *reinterpret_cast<const float2*>(&freqs[freqs_base + 1 * stride_freqs_pair]);
+            f00 = col0.x;
+            f10 = col0.y;
+            f01 = col1.x;
+            f11 = col1.y;
+        } else {
+            // Fully strided - four scalar loads
+            f00 = freqs[freqs_base + 0 * stride_freqs_rot + 0 * stride_freqs_pair];
+            f01 = freqs[freqs_base + 0 * stride_freqs_rot + 1 * stride_freqs_pair];
+            f10 = freqs[freqs_base + 1 * stride_freqs_rot + 0 * stride_freqs_pair];
+            f11 = freqs[freqs_base + 1 * stride_freqs_rot + 1 * stride_freqs_pair];
+        }
+    };
+    
+    // Load rotation matrices for both pairs
+    float freqs_00_0, freqs_01_0, freqs_10_0, freqs_11_0;
+    float freqs_00_1, freqs_01_1, freqs_10_1, freqs_11_1;
+    
+    load_freqs_matrix(pair_idx_0, freqs_00_0, freqs_01_0, freqs_10_0, freqs_11_0);
+    
+    if (process_pair_1) {
+        load_freqs_matrix(pair_idx_1, freqs_00_1, freqs_01_1, freqs_10_1, freqs_11_1);
     }
     
-    // Decompose linear index into (batch_idx, head_idx, seq_idx, pair_idx)
-    const int64_t pair_idx = idx % n_pairs;
-    int64_t temp = idx / n_pairs;
-    const int64_t seq_idx = temp % seq_len;
-    temp = temp / seq_len;
-    const int64_t head_idx = temp % n_heads;
-    const int64_t batch_idx = temp / n_heads;
+    // Helper lambda to calculate base offset for x tensors
+    auto calc_offset = [&](int64_t elem_offset) {
+        return batch_idx * stride_x_batch + 
+               dim1_idx * stride_x_dim1 + 
+               dim2_idx * stride_x_dim2 + 
+               elem_offset;
+    };
     
-    // Calculate indices for the two elements in each pair
-    const int64_t dim_idx_0 = pair_idx * 2;
-    const int64_t dim_idx_1 = pair_idx * 2 + 1;
+    // Helper lambda to load 2 pairs (4 elements) - adapts to contiguous vs strided
+    auto load_pairs = [&](const InputType* x_in, float& x_0, float& x_1, float& x_2, float& x_3) {
+        if (stride_x_dim == 1) {
+            // Vectorized load for contiguous tensors (4x fp16/bf16 = 64-bit as float2)
+            union { float2 vec; InputType elems[4]; } data;
+            data.vec = *reinterpret_cast<const float2*>(&x_in[calc_offset(pair_idx_0 * 2)]);
+            x_0 = static_cast<float>(data.elems[0]);
+            x_1 = static_cast<float>(data.elems[1]);
+            x_2 = static_cast<float>(data.elems[2]);
+            x_3 = static_cast<float>(data.elems[3]);
+        } else {
+            // Scalar load for strided tensors
+            const int64_t off0 = calc_offset(pair_idx_0 * 2 * stride_x_dim);
+            x_0 = static_cast<float>(x_in[off0]);
+            x_1 = static_cast<float>(x_in[off0 + stride_x_dim]);
+            if (process_pair_1) {
+                x_2 = static_cast<float>(x_in[off0 + 2 * stride_x_dim]);
+                x_3 = static_cast<float>(x_in[off0 + 3 * stride_x_dim]);
+            }
+        }
+    };
     
-    // Calculate offsets for x and x_out
-    const int64_t x_offset_0 = batch_idx * stride_x_batch + 
-                               head_idx * stride_x_heads + 
-                               seq_idx * stride_x_seq + 
-                               dim_idx_0 * stride_x_dim;
-    const int64_t x_offset_1 = batch_idx * stride_x_batch + 
-                               head_idx * stride_x_heads + 
-                               seq_idx * stride_x_seq + 
-                               dim_idx_1 * stride_x_dim;
+    // Helper lambda to store 2 pairs (4 elements) - adapts to contiguous vs strided
+    auto store_pairs = [&](InputType* x_out, float x_0, float x_1, float x_2, float x_3) {
+        if (stride_x_dim == 1) {
+            // Vectorized store for contiguous tensors (4x fp16/bf16 = 64-bit as float2)
+            union { float2 vec; InputType elems[4]; } data;
+            data.elems[0] = static_cast<InputType>(x_0);
+            data.elems[1] = static_cast<InputType>(x_1);
+            data.elems[2] = static_cast<InputType>(x_2);
+            data.elems[3] = static_cast<InputType>(x_3);
+            *reinterpret_cast<float2*>(&x_out[calc_offset(pair_idx_0 * 2)]) = data.vec;
+        } else {
+            // Scalar store for strided tensors
+            const int64_t off0 = calc_offset(pair_idx_0 * 2 * stride_x_dim);
+            x_out[off0] = static_cast<InputType>(x_0);
+            x_out[off0 + stride_x_dim] = static_cast<InputType>(x_1);
+            if (process_pair_1) {
+                x_out[off0 + 2 * stride_x_dim] = static_cast<InputType>(x_2);
+                x_out[off0 + 3 * stride_x_dim] = static_cast<InputType>(x_3);
+            }
+        }
+    };
     
-    // Handle broadcasting for freqs_cis (batch=1 and/or heads=1)
-    const int64_t freqs_batch_idx = (freqs_batch == 1) ? 0 : batch_idx;
-    const int64_t freqs_head_idx = (freqs_heads == 1) ? 0 : head_idx;
+    // Process xq (always) - load 2 pairs (4 elements)
+    float x_0, x_1, x_2, x_3;
+    load_pairs(xq, x_0, x_1, x_2, x_3);
     
-    // Calculate base offset for freqs_cis
-    // freqs_cis shape: (batch, heads, seq_len, head_dim//2, 2, 2)
-    const int64_t freqs_base = freqs_batch_idx * stride_freqs_batch + 
-                               freqs_head_idx * stride_freqs_heads + 
-                               seq_idx * stride_freqs_seq + 
-                               pair_idx * stride_freqs_dim;
+    // Apply 2D rotation to first pair
+    float out_0 = freqs_00_0 * x_0 + freqs_01_0 * x_1;
+    float out_1 = freqs_10_0 * x_0 + freqs_11_0 * x_1;
     
-    // Load rotation matrix elements using read-only cache (__ldg)
-    const float freqs_00 = __ldg(&freqs[freqs_base + 0 * stride_freqs_rot + 0 * stride_freqs_pair]);
-    const float freqs_01 = __ldg(&freqs[freqs_base + 0 * stride_freqs_rot + 1 * stride_freqs_pair]);
-    const float freqs_10 = __ldg(&freqs[freqs_base + 1 * stride_freqs_rot + 0 * stride_freqs_pair]);
-    const float freqs_11 = __ldg(&freqs[freqs_base + 1 * stride_freqs_rot + 1 * stride_freqs_pair]);
+    // Apply 2D rotation to second pair (if processing)
+    float out_2 = 0.0f, out_3 = 0.0f;
+    if (process_pair_1) {
+        out_2 = freqs_00_1 * x_2 + freqs_01_1 * x_3;
+        out_3 = freqs_10_1 * x_2 + freqs_11_1 * x_3;
+    }
     
-    // Load input values and convert to float32
-    const float x_0 = to_float(x[x_offset_0]);
-    const float x_1 = to_float(x[x_offset_1]);
+    store_pairs(xq_out, out_0, out_1, out_2, out_3);
     
-    // Apply 2D rotation in float32
-    const float x_out_0 = freqs_00 * x_0 + freqs_01 * x_1;
-    const float x_out_1 = freqs_10 * x_0 + freqs_11 * x_1;
-    
-    // Convert back to input type and store
-    x_out[x_offset_0] = from_float<InputType>(x_out_0);
-    x_out[x_offset_1] = from_float<InputType>(x_out_1);
+    // Process xk if provided (reuse loaded freqs)
+    if (xk != nullptr) {
+        load_pairs(xk, x_0, x_1, x_2, x_3);
+        
+        // Apply same rotation to first pair
+        out_0 = freqs_00_0 * x_0 + freqs_01_0 * x_1;
+        out_1 = freqs_10_0 * x_0 + freqs_11_0 * x_1;
+        
+        // Apply rotation to second pair (if processing)
+        if (process_pair_1) {
+            out_2 = freqs_00_1 * x_2 + freqs_01_1 * x_3;
+            out_3 = freqs_10_1 * x_2 + freqs_11_1 * x_3;
+        }
+        
+        store_pairs(xk_out, out_0, out_1, out_2, out_3);
+    }
 }
 
 template <typename InputType>
 void apply_rope_launcher(
-    const InputType* x,
+    const InputType* xq,
+    const InputType* xk,
     const float* freqs,
-    InputType* x_out,
+    InputType* xq_out,
+    InputType* xk_out,
     int64_t batch,
-    int64_t n_heads,
-    int64_t seq_len,
+    int64_t dim1,
+    int64_t dim2,
     int64_t head_dim,
     int64_t freqs_batch,
-    int64_t freqs_heads,
+    int64_t freqs_dim1,
+    int64_t freqs_dim2,
     int64_t stride_x_batch,
-    int64_t stride_x_heads,
-    int64_t stride_x_seq,
+    int64_t stride_x_dim1,
+    int64_t stride_x_dim2,
     int64_t stride_x_dim,
     int64_t stride_freqs_batch,
-    int64_t stride_freqs_heads,
-    int64_t stride_freqs_seq,
+    int64_t stride_freqs_dim1,
+    int64_t stride_freqs_dim2,
     int64_t stride_freqs_dim,
     int64_t stride_freqs_rot,
     int64_t stride_freqs_pair,
     cudaStream_t stream) {
     
     const int64_t n_pairs = head_dim / 2;
-    const int64_t total_elements = batch * n_heads * seq_len * n_pairs;
+    const int64_t pairs_per_thread = 2;
+    const int64_t n_pair_groups = (n_pairs + pairs_per_thread - 1) / pairs_per_thread;
+    const int64_t total_pair_groups = batch * dim1 * dim2 * n_pair_groups;
     
-    if (total_elements == 0) {
+    if (total_pair_groups == 0) {
         return;
     }
     
-    // Adaptively choose block size based on problem characteristics
     const int block_size = kBlockSize;
+    const int64_t num_blocks = (total_pair_groups + block_size - 1) / block_size;
     
-    // Launch with adaptive block size
-    const int64_t num_blocks = (total_elements + block_size - 1) / block_size;
-    
-    if (stride_x_dim == 1) {
-        // Use vectorized kernel for contiguous tensors
-        apply_rope_kernel_vectorized<InputType><<<num_blocks, block_size, 0, stream>>>(
-            x, freqs, x_out, batch, n_heads, seq_len, head_dim,
-            freqs_batch, freqs_heads,
-            stride_x_batch, stride_x_heads, stride_x_seq, stride_x_dim,
-            stride_freqs_batch, stride_freqs_heads, stride_freqs_seq, stride_freqs_dim,
-            stride_freqs_rot, stride_freqs_pair
-        );
-    } else {
-        // Fallback to scalar kernel for non-contiguous tensors
-        apply_rope_kernel<InputType><<<num_blocks, block_size, 0, stream>>>(
-            x, freqs, x_out, batch, n_heads, seq_len, head_dim,
-            freqs_batch, freqs_heads,
-            stride_x_batch, stride_x_heads, stride_x_seq, stride_x_dim,
-            stride_freqs_batch, stride_freqs_heads, stride_freqs_seq, stride_freqs_dim,
-            stride_freqs_rot, stride_freqs_pair
-        );
-    }
+    // Single unified kernel handles both contiguous and strided tensors
+    apply_rope_kernel<InputType><<<num_blocks, block_size, 0, stream>>>(
+        xq, xk, freqs, xq_out, xk_out, batch, dim1, dim2, head_dim,
+        freqs_batch, freqs_dim1, freqs_dim2,
+        stride_x_batch, stride_x_dim1, stride_x_dim2, stride_x_dim,
+        stride_freqs_batch, stride_freqs_dim1, stride_freqs_dim2, stride_freqs_dim,
+        stride_freqs_rot, stride_freqs_pair
+    );
     
     // Check for kernel launch errors
     cudaError_t err = cudaGetLastError();
@@ -292,22 +275,25 @@ void apply_rope_launcher(
 extern "C" {
 
 void launch_apply_rope_kernel(
-    const void* x,
+    const void* xq,
+    const void* xk,
     const void* freqs,
-    void* x_out,
+    void* xq_out,
+    void* xk_out,
     int64_t batch,
-    int64_t n_heads,
-    int64_t seq_len,
+    int64_t dim1,
+    int64_t dim2,
     int64_t head_dim,
     int64_t freqs_batch,
-    int64_t freqs_heads,
+    int64_t freqs_dim1,
+    int64_t freqs_dim2,
     int64_t stride_x_batch,
-    int64_t stride_x_heads,
-    int64_t stride_x_seq,
+    int64_t stride_x_dim1,
+    int64_t stride_x_dim2,
     int64_t stride_x_dim,
     int64_t stride_freqs_batch,
-    int64_t stride_freqs_heads,
-    int64_t stride_freqs_seq,
+    int64_t stride_freqs_dim1,
+    int64_t stride_freqs_dim2,
     int64_t stride_freqs_dim,
     int64_t stride_freqs_rot,
     int64_t stride_freqs_pair,
@@ -318,13 +304,15 @@ void launch_apply_rope_kernel(
     // dtype codes: 1=float16, 2=bfloat16
     DISPATCH_HALF_DTYPE(input_dtype_code, InputType, [&] {
         comfy::apply_rope_launcher<InputType>(
-            static_cast<const InputType*>(x),
+            static_cast<const InputType*>(xq),
+            xk ? static_cast<const InputType*>(xk) : nullptr,
             static_cast<const float*>(freqs),
-            static_cast<InputType*>(x_out),
-            batch, n_heads, seq_len, head_dim,
-            freqs_batch, freqs_heads,
-            stride_x_batch, stride_x_heads, stride_x_seq, stride_x_dim,
-            stride_freqs_batch, stride_freqs_heads, stride_freqs_seq, stride_freqs_dim,
+            static_cast<InputType*>(xq_out),
+            xk_out ? static_cast<InputType*>(xk_out) : nullptr,
+            batch, dim1, dim2, head_dim,
+            freqs_batch, freqs_dim1, freqs_dim2,
+            stride_x_batch, stride_x_dim1, stride_x_dim2, stride_x_dim,
+            stride_freqs_batch, stride_freqs_dim1, stride_freqs_dim2, stride_freqs_dim,
             stride_freqs_rot, stride_freqs_pair,
             stream
         );

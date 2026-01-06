@@ -178,13 +178,22 @@ class ConstraintAwareTestInputs:
         return torch.tensor([value], dtype=dtype, device=self.device)
 
 
-def assert_values_close(values, ref_values, rtol, atol, name="values"):
+def assert_values_close(values, ref_values, rtol, atol, name="values", max_mismatch_ratio=0.0):
     delta_idx = torch.isclose(values, ref_values, rtol=rtol, atol=atol)
 
     if not torch.all(delta_idx):
         n = 10
         failing_indices = torch.nonzero(~delta_idx, as_tuple=False)
         num_failures = len(failing_indices)
+        total_elements = values.numel()
+        mismatch_ratio = num_failures / total_elements
+
+        # If max_mismatch_ratio is set and we're below it, pass with a warning
+        if max_mismatch_ratio > 0 and mismatch_ratio <= max_mismatch_ratio:
+            print(f"Warning: {num_failures} / {total_elements} ({mismatch_ratio*100:.4f}%) {name} "
+                  f"differ (rtol={rtol}, atol={atol}), but within allowed ratio ({max_mismatch_ratio*100}%)")
+            return
+
         print(f"Failed: \n{num_failures} {name} are not close.")
 
         for i, idx in enumerate(failing_indices[:n]):

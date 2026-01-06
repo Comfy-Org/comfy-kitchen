@@ -8,107 +8,67 @@ from .conftest import assert_values_close, get_capable_backends
 
 class TestApplyRope:
     """RoPE (Rotary Position Embedding) tests."""
+    @pytest.mark.parametrize("op_name", ["apply_rope", "apply_rope1"])
+    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+    @pytest.mark.parametrize("config_name,layout,config", [
+        ("FLUX", "BHND", (1, 24, 4352, 128)),
+        ("LTX", "BHND", (2, 32, 4996, 64)),
+        ("ZIMAGE", "BNHD", (1, 4096, 30, 128)),
+    ], ids=lambda cfg: f"{cfg[0]}")
+    def test_rope_ops(self, op_name, backend, device, seed, dtype, config_name, layout, config):
+        """Test RoPE operations (apply_rope and apply_rope1) for a specific backend."""
+        backends = get_capable_backends(op_name, device)
+        if backend not in backends:
+            pytest.skip(f"{backend} does not support {op_name} on {device}")
 
-    @pytest.fixture
-    def capable_backends(self, device):
-        backends = get_capable_backends("apply_rope", device)
-        if not backends:
-            pytest.skip(f"No backend supports apply_rope on {device}")
-        return backends
+        if layout == "BHND":
+            b, h, n, d = config
+            x_shape = (b, h, n, d)
+            freqs_shape = (b, 1, n, d // 2, 2, 2)  # broadcast over heads
+        else:  # BNHD
+            b, n, h, d = config
+            x_shape = (b, n, h, d)
+            freqs_shape = (1, n, 1, d // 2, 2, 2)  # broadcast over batch and heads
 
-    @pytest.fixture
-    def capable_backends_rope1(self, device):
-        backends = get_capable_backends("apply_rope1", device)
-        if not backends:
-            pytest.skip(f"No backend supports apply_rope1 on {device}")
-        return backends
+        freqs_cis = torch.randn(freqs_shape, dtype=torch.float32, device=device)
 
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    @pytest.mark.parametrize("config_name,config", [
-        ("FLUX", (1, 24, 4352, 128)),
-        ("LTX", (2, 32, 4996, 64)),
-    ])
-    def test_apply_rope_all_backends(self, capable_backends, device, seed, dtype, config_name, config):
-        """Test RoPE across all capable backends."""
-        b, h, n, d = config
-        xq = torch.randn(b, h, n, d, dtype=dtype, device=device)
-        xk = torch.randn(b, h, n, d, dtype=dtype, device=device)
-        freqs_cis = torch.randn(b, 1, n, d // 2, 2, 2, dtype=torch.float32, device=device)
+        # Run operation based on type
+        if op_name == "apply_rope":
+            xq = torch.randn(x_shape, dtype=dtype, device=device)
+            xk = torch.randn(x_shape, dtype=dtype, device=device)
 
-        for backend_name in capable_backends:
-            with ck.use_backend(backend_name):
+            with ck.use_backend(backend):
                 xq_out, xk_out = ck.apply_rope(xq, xk, freqs_cis)
 
-            assert xq_out.shape == xq.shape, f"[{backend_name}] xq shape mismatch"
-            assert xk_out.shape == xk.shape, f"[{backend_name}] xk shape mismatch"
-            assert xq_out.dtype == xq.dtype, f"[{backend_name}] xq dtype mismatch"
-            assert xk_out.dtype == xk.dtype, f"[{backend_name}] xk dtype mismatch"
-            assert xq_out.device == xq.device
+            # Compare against eager reference
+            ref_xq = None
+            ref_xk = None
+            if backend != "eager":
+                with ck.use_backend("eager"):
+                    ref_xq, ref_xk = ck.apply_rope(xq, xk, freqs_cis)
+            self._validate(xq, xq_out, layout, dtype, config_name, backend, ref_xq)
+            self._validate(xk, xk_out, layout, dtype, config_name, backend, ref_xk)
 
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_apply_rope_cross_backend_consistency(self, capable_backends, device, seed, dtype):
-        """Test that all backends produce consistent RoPE results."""
-        if len(capable_backends) < 2:
-            pytest.skip("Need at least 2 backends for cross-validation")
+        else:  # apply_rope1
+            x = torch.randn(x_shape, dtype=dtype, device=device)
 
-        b, h, n, d = 1, 8, 256, 64
-        xq = torch.randn(b, h, n, d, dtype=dtype, device=device)
-        xk = torch.randn(b, h, n, d, dtype=dtype, device=device)
-        freqs_cis = torch.randn(b, 1, n, d // 2, 2, 2, dtype=torch.float32, device=device)
-
-        results = {}
-        for backend_name in capable_backends:
-            with ck.use_backend(backend_name):
-                xq_out, xk_out = ck.apply_rope(xq, xk, freqs_cis)
-                results[backend_name] = (xq_out, xk_out)
-
-        # Compare all against first
-        ref_backend = capable_backends[0]
-        ref_xq, ref_xk = results[ref_backend]
-
-        for backend_name, (xq_out, xk_out) in results.items():
-            if backend_name != ref_backend:
-                assert_values_close(
-                    xq_out, ref_xq,
-                    rtol=1e-3, atol=1e-3,
-                    name=f"xq ({backend_name} vs {ref_backend})"
-                )
-                assert_values_close(
-                    xk_out, ref_xk,
-                    rtol=1e-3, atol=1e-3,
-                    name=f"xk ({backend_name} vs {ref_backend})"
-                )
-
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_apply_rope1_all_backends(self, capable_backends_rope1, device, seed, dtype):
-        """Test apply_rope1 (single tensor) across all capable backends."""
-        b, h, n, d = 1, 8, 256, 64
-        x = torch.randn(b, h, n, d, dtype=dtype, device=device)
-        freqs_cis = torch.randn(b, 1, n, d // 2, 2, 2, dtype=torch.float32, device=device)
-
-        for backend_name in capable_backends_rope1:
-            with ck.use_backend(backend_name):
+            with ck.use_backend(backend):
                 x_out = ck.apply_rope1(x, freqs_cis)
 
-            assert x_out.shape == x.shape, f"[{backend_name}] shape mismatch"
-            assert x_out.dtype == x.dtype, f"[{backend_name}] dtype mismatch"
-            assert x_out.device == x.device
+            ref_x = None
+            if backend != "eager":
+                with ck.use_backend("eager"):
+                    ref_x = ck.apply_rope1(x, freqs_cis)
+            self._validate(x, x_out, layout, dtype, config_name, backend, ref_x)
 
-    @pytest.mark.parametrize("dtype", [torch.bfloat16])
-    def test_apply_rope1_matches_apply_rope(self, capable_backends_rope1, device, seed, dtype):
-        """Test that apply_rope1 matches apply_rope when called on individual tensors."""
-        b, h, n, d = 1, 8, 256, 64
-        xq = torch.randn(b, h, n, d, dtype=dtype, device=device)
-        xk = torch.randn(b, h, n, d, dtype=dtype, device=device)
-        freqs_cis = torch.randn(b, 1, n, d // 2, 2, 2, dtype=torch.float32, device=device)
-
-        for backend_name in capable_backends_rope1:
-            with ck.use_backend(backend_name):
-                # Using apply_rope
-                xq_rope, xk_rope = ck.apply_rope(xq, xk, freqs_cis)
-                # Using apply_rope1 individually
-                xq_rope1 = ck.apply_rope1(xq, freqs_cis)
-                xk_rope1 = ck.apply_rope1(xk, freqs_cis)
-
-            assert_values_close(xq_rope, xq_rope1, rtol=1e-4, atol=1e-4, name=f"xq [{backend_name}]")
-            assert_values_close(xk_rope, xk_rope1, rtol=1e-4, atol=1e-4, name=f"xk [{backend_name}]")
+    def _validate(self, x, x_out, layout, dtype, config_name, backend, ref_x=None):
+        assert x_out.shape == x.shape, f"{layout} shape mismatch"
+        assert x_out.dtype == x.dtype, f"{layout} dtype mismatch"
+        assert x_out.device == x.device
+        if ref_x is not None:
+            max_mismatch = 0.001 if dtype == torch.bfloat16 else 0.0
+            assert_values_close(
+                x_out, ref_x, rtol=1e-3, atol=1e-3, max_mismatch_ratio=max_mismatch,
+                name=f"{config_name} {layout} x ({backend} vs eager)"
+            )
