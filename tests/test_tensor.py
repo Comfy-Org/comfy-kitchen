@@ -513,6 +513,27 @@ class TestBaseLayoutParams:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestParamsDtypeValidation:
+    """Tests for automatic dtype validation and conversion in Params."""
+
+    def test_fp8_params_scale_dtype_auto_conversion(self):
+        """Test that FP8 Params automatically converts scale to float32."""
+        # Create scale with wrong dtype (float16)
+        scale_f16 = torch.tensor([1.0], device="cuda", dtype=torch.float16)
+
+        # Creating Params should auto-convert to float32
+        params = TensorCoreFP8Layout.Params(
+            scale=scale_f16,
+            orig_dtype=torch.bfloat16,
+            orig_shape=(128, 128),
+        )
+
+        # Verify scale was converted to float32
+        assert params.scale.dtype == torch.float32
+        assert params.scale.device.type == "cuda"
+        assert params.scale.item() == 1.0
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestFP8LinearOperations:
     """Tests for FP8 linear, mm, addmm operations."""
 

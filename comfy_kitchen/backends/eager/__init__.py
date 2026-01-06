@@ -27,7 +27,7 @@ def _build_constraints() -> dict:
         ParamConstraint,
     )
 
-    all_devices = frozenset({"cuda", "cpu"})
+    all_devices = frozenset({"cpu", "cuda", "mps", "xpu", "hpu", "meta"})
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
 
     return {
@@ -46,7 +46,7 @@ def _build_constraints() -> dict:
                 "x": ParamConstraint(
                     dtypes=frozenset({torch.float8_e4m3fn, torch.float8_e5m2}),
                 ),
-                "scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "scale": ParamConstraint(dtypes=standard_floats),
                 "output_type": ParamConstraint(dtypes=standard_floats),
             },
             default_devices=all_devices,

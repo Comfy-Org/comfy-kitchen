@@ -46,6 +46,13 @@ class BaseLayoutParams:
     orig_dtype: torch.dtype
     orig_shape: tuple[int, ...]
 
+    def __post_init__(self):
+        self._validate_tensor_fields()
+
+    def _validate_tensor_fields(self):
+        # Implemented in subclasses
+        pass
+
     def _tensor_fields(self) -> list[str]:
         """Return list of field names that are tensors. Override in subclass."""
         return ["scale"]
