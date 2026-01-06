@@ -24,7 +24,7 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/comfyanonymous/ComfyKitchen"
+Homepage = "https://github.com/Comfy-Org/comfy-kitchen"
 
 [project.optional-dependencies]
 cublas = [
