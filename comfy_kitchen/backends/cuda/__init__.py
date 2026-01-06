@@ -13,13 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import importlib.util
 import os
 import sys
 
 import torch
-
-from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
-from comfy_kitchen.float_utils import roundup
 
 __all__ = [
     "apply_rope",
@@ -61,11 +59,27 @@ except Exception:
     pass  # nvidia.cu13 not installed or path doesn't exist
 
 
+# Load _C extension using importlib to avoid circular import issues on Windows
 try:
-    from . import _C
+    _C = None  # type: ignore
+    _module_path = os.path.join(os.path.dirname(__file__), "_C.abi3.pyd" if sys.platform == "win32" else "_C.abi3.so")
 
-    _EXT_AVAILABLE = True
-    _EXT_ERROR = None
+    if os.path.exists(_module_path):
+        _spec = importlib.util.spec_from_file_location(
+            "comfy_kitchen.backends.cuda._C", _module_path
+        )
+        if _spec and _spec.loader:
+            _C = importlib.util.module_from_spec(_spec)
+            sys.modules["comfy_kitchen.backends.cuda._C"] = _C
+            _spec.loader.exec_module(_C)
+            _EXT_AVAILABLE = True
+            _EXT_ERROR = None
+        else:
+            _EXT_AVAILABLE = False
+            _EXT_ERROR = f"Could not create module spec for {_module_path}"
+    else:
+        _EXT_AVAILABLE = False
+        _EXT_ERROR = f"Extension file not found: {_module_path}"
 except ImportError as e:
     _EXT_AVAILABLE = False
     _EXT_ERROR = str(e)
@@ -74,6 +88,9 @@ except Exception as e:
     _EXT_AVAILABLE = False
     _EXT_ERROR = f"Failed to load extension: {e}"
     _C = None  # type: ignore
+
+from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE  # noqa: E402
+from comfy_kitchen.float_utils import roundup  # noqa: E402
 
 _cublas_workspace: torch.Tensor | None = None
 
