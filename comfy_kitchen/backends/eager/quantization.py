@@ -55,7 +55,7 @@ def quantize_per_tensor_fp8(
 def dequantize_per_tensor_fp8(
     x: torch.Tensor, scale: torch.Tensor, output_type: torch.dtype = torch.bfloat16
 ) -> torch.Tensor:
-    dq_tensor = x.to(dtype=output_type) * scale.to(dtype=output_type))\
+    dq_tensor = x.to(dtype=output_type) * scale.to(dtype=output_type))
     return dq_tensor
 
 def quantize_nvfp4(
