@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "comfy-kitchen"
-version = "0.2.2"
+version = "0.2.3"
 description = "Fast Kernel Library for ComfyUI with multiple compute backends"
 readme = "README.md"
 requires-python = ">=3.10"
