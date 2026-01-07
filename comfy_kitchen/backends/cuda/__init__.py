@@ -411,6 +411,9 @@ def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 def apply_rope(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if xq.shape != xk.shape:  # TODO: fix cuda apply_rope to not need this?
+        return apply_rope1(xq, freqs_cis), apply_rope1(xk, freqs_cis)
+
     if not xq.is_contiguous():
         xq = xq.contiguous()
     if not xk.is_contiguous():
