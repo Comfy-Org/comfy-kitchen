@@ -28,6 +28,11 @@ else()
     endif()
 endif()
 
+# Force stable ABI on Windows before finding Python
+if(WIN32 AND Python_VERSION VERSION_GREATER_EQUAL "3.12")
+    set(Python_FIND_ABI "OFF" "ANY" "ANY")  # Request stable ABI
+endif()
+
 # Find Python (required by nanobind - must use "Python" not "Python3")
 # Only require Development.Module for extension modules, not full Development
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
