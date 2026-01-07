@@ -120,11 +120,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install CUDA Toolkit 13.0.2
+      - name: Install CUDA Toolkit 13.0.0
         uses: Jimver/cuda-toolkit@v0.2.29
         id: cuda-toolkit
         with:
-          cuda: '13.0.2'
+          cuda: '13.0.0'
           method: 'network'
           use-github-cache: 'true'
           log-file-suffix: 'windows-2022.txt'
