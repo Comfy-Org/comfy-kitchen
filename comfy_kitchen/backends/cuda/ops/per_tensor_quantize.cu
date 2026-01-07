@@ -22,10 +22,10 @@
 #include <stdexcept>
 #include <string>
 
+namespace comfy {
+
 constexpr int kQMaxKernelThreads = 128;
 constexpr int kE4M3Alignment = 16;
-
-namespace comfy {
 
 namespace {
 
@@ -138,8 +138,8 @@ void launch_quantize_fp8_kernel(
 
     const float* scale_f = static_cast<const float*>(scale);
     
-    constexpr int vals_per_thread = kE4M3Alignment;
-    constexpr int vals_per_block = vals_per_thread * kQMaxKernelThreads;
+    constexpr int vals_per_thread = comfy::kE4M3Alignment;
+    constexpr int vals_per_block = vals_per_thread * comfy::kQMaxKernelThreads;
     const int blocks = static_cast<int>((numel + vals_per_block - 1) / vals_per_block);
 
     // Dispatch based on input and output dtypes
@@ -150,7 +150,7 @@ void launch_quantize_fp8_kernel(
         input_dtype_code, output_dtype_code, 
         InputType, OutputType, [&] {
             comfy::quantize_fp8_tensor_kernel<InputType, OutputType>
-                <<<blocks, kQMaxKernelThreads, 0, stream>>>(
+                <<<blocks, comfy::kQMaxKernelThreads, 0, stream>>>(
                     static_cast<const InputType*>(input),
                     static_cast<OutputType*>(output),
                     scale_f,
@@ -180,7 +180,7 @@ void launch_dequantize_fp8_kernel(
     const float* scale_f = static_cast<const float*>(scale);
 
     constexpr int vals_per_thread = 8;
-    constexpr int vals_per_block = vals_per_thread * kQMaxKernelThreads;
+    constexpr int vals_per_block = vals_per_thread * comfy::kQMaxKernelThreads;
     const int blocks = static_cast<int>((numel + vals_per_block - 1) / vals_per_block);
 
     // Dispatch based on input and output dtypes
@@ -190,7 +190,7 @@ void launch_dequantize_fp8_kernel(
         input_dtype_code, output_dtype_code,
         InputType, OutputType, [&] {
             comfy::dequantize_fp8_tensor_kernel<InputType, OutputType>
-                <<<blocks, kQMaxKernelThreads, 0, stream>>>(
+                <<<blocks, comfy::kQMaxKernelThreads, 0, stream>>>(
                     static_cast<const InputType*>(input),
                     static_cast<OutputType*>(output),
                     scale_f,

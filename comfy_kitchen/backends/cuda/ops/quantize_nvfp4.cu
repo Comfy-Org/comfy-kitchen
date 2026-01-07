@@ -26,13 +26,13 @@
 #include <stdexcept>
 
 
+namespace comfy {
+
 constexpr unsigned int kValsPerThread = 4; // Can only be 2 or 4
 constexpr unsigned int kBlockSize = 16; // Always 16 for NVFP4
 constexpr unsigned int kThreadsPerGroup = kBlockSize / kValsPerThread;  // 4 threads per group (with kValsPerThread=4)
 
-namespace comfy {
-    namespace {
-
+namespace {
 
 /*
  * FP4 E2M1 Block Quantization with E4M3 Scales
@@ -325,7 +325,7 @@ void launch_quantize_nvfp4_kernel(
     }
     
     // Check that dimensions are divisible by block size (16)
-    if (num_rows % kBlockSize != 0 || num_cols % kBlockSize != 0) {
+    if (num_rows % comfy::kBlockSize != 0 || num_cols % comfy::kBlockSize != 0) {
         throw std::runtime_error("num_rows and num_cols must be divisible by 16 for FP4 block quantization");
     }
     
@@ -337,7 +337,7 @@ void launch_quantize_nvfp4_kernel(
     
     // Each thread processes kValsPerThread values (same for both aligned and misaligned paths)
     constexpr int threads_per_block = 128;  // CUDA block size
-    const int64_t total_threads_needed = numel / kValsPerThread;
+    const int64_t total_threads_needed = numel / comfy::kValsPerThread;
     const int blocks = static_cast<int>((total_threads_needed + threads_per_block - 1) / threads_per_block);
     
     // Dispatch based on input dtype (only FP16/BF16 supported)
@@ -394,7 +394,7 @@ void launch_dequantize_nvfp4_kernel(
     }
     
     // Check that dimensions are divisible by block size (16)
-    if (num_rows % kBlockSize != 0 || num_cols % kBlockSize != 0) {
+    if (num_rows % comfy::kBlockSize != 0 || num_cols % comfy::kBlockSize != 0) {
         throw std::runtime_error("num_rows and num_cols must be divisible by 16 for FP4 block dequantization");
     }
     
@@ -403,7 +403,7 @@ void launch_dequantize_nvfp4_kernel(
     
     // Each thread processes kValsPerThread values
     constexpr int threads_per_block = 128;
-    const int64_t total_threads_needed = numel / kValsPerThread;
+    const int64_t total_threads_needed = numel / comfy::kValsPerThread;
     const int blocks = static_cast<int>((total_threads_needed + threads_per_block - 1) / threads_per_block);
     
     // Dispatch based on output dtype

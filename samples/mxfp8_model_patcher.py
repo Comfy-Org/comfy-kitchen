@@ -147,8 +147,9 @@ def patch_model_with_mxfp8(
 def debug_mxfp8_capability():
     """Print detailed MXFP8 capability information for debugging."""
     import torch
-    from comfy_kitchen.tensor import TensorCoreMXFP8Layout
+
     from comfy_kitchen.scaled_mm_v2 import get_pytorch_version_info
+    from comfy_kitchen.tensor import TensorCoreMXFP8Layout
 
     print("=" * 70)
     print("MXFP8 Debug Information")
@@ -162,7 +163,7 @@ def debug_mxfp8_capability():
     gpu_name = torch.cuda.get_device_name()
     print(f"GPU: {gpu_name}")
     print(f"Compute Capability: SM {sm_major}.{sm_minor}")
-    print(f"Native MXFP8 Required: SM >= 10.0 (Blackwell)")
+    print("Native MXFP8 Required: SM >= 10.0 (Blackwell)")
     print(f"Native MXFP8 Supported: {sm_major >= 10}")
     print()
 
@@ -243,7 +244,7 @@ class ApplyMXFP8Quantization:
         )
 
         if debug:
-            print(f"\nMXFP8 Patching:")
+            print("\nMXFP8 Patching:")
             print(f"  Total nn.Linear layers: {total_linear}")
             print(f"  Eligible (>= {min_features} features): {eligible_linear}")
             if skip_names:
@@ -297,8 +298,8 @@ if __name__ == "__main__":
         print("CUDA not available, skipping test")
         exit(0)
 
+    from comfy_kitchen.scaled_mm_v2 import get_pytorch_version_info
     from comfy_kitchen.tensor import TensorCoreMXFP8Layout
-    from comfy_kitchen.scaled_mm_v2 import has_scaled_mm_v2, get_pytorch_version_info
 
     print("=" * 80)
     print("MXFP8 Capability Check")
@@ -308,7 +309,7 @@ if __name__ == "__main__":
     gpu_name = torch.cuda.get_device_name()
     print(f"GPU: {gpu_name}")
     print(f"Compute Capability: SM {sm_major}.{sm_minor}")
-    print(f"MXFP8 Required: SM >= 10.0 (Blackwell)")
+    print("MXFP8 Required: SM >= 10.0 (Blackwell)")
     print(f"Native MXFP8 Matmul Supported: {TensorCoreMXFP8Layout.supports_fast_matmul()}")
     print()
 
@@ -329,7 +330,6 @@ if __name__ == "__main__":
     print("=" * 80)
     print()
 
-    import comfy_kitchen as ck
     logging.getLogger("comfy_kitchen.dispatch").setLevel(logging.DEBUG)
 
     model = SimpleModel().to(device).to(torch.bfloat16)

@@ -25,12 +25,13 @@
 #include <stdexcept>
 
 
+namespace comfy {
+
 constexpr unsigned int kMXFP8ValsPerThread = 4;
 constexpr unsigned int kMXFP8BlockSize = 32; // Always 32 for MXFP8
 constexpr unsigned int kMXFP8ThreadsPerGroup = kMXFP8BlockSize / kMXFP8ValsPerThread;  // 8 threads per group
 
-namespace comfy {
-    namespace {
+namespace {
 
 template <
     typename IType,
@@ -169,7 +170,7 @@ void launch_quantize_mxfp8_kernel(
     }
     
     // Check that dimensions are divisible by block size (32)
-    if (num_rows % kMXFP8BlockSize != 0 || num_cols % kMXFP8BlockSize != 0) {
+    if (num_rows % comfy::kMXFP8BlockSize != 0 || num_cols % comfy::kMXFP8BlockSize != 0) {
         throw std::runtime_error("num_rows and num_cols must be divisible by 32 for MXFP8 block quantization");
     }
     
@@ -180,7 +181,7 @@ void launch_quantize_mxfp8_kernel(
     
     // Each thread processes kMXFP8ValsPerThread values
     constexpr int threads_per_block = 128;
-    const int64_t total_threads_needed = numel / kMXFP8ValsPerThread;
+    const int64_t total_threads_needed = numel / comfy::kMXFP8ValsPerThread;
     const int blocks = static_cast<int>((total_threads_needed + threads_per_block - 1) / threads_per_block);
     
     // Dispatch based on input dtype

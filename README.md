@@ -82,7 +82,7 @@ These options require using `setup.py` directly (not `pip install`):
 | Option | Command | Description | Default |
 |--------|---------|-------------|---------|
 | `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Build CPU-only wheel (`py3-none-any`) | Enabled (build with CUDA) |
-| `--cuda-archs=...` | `python setup.py build_ext --cuda-archs="80;89"` | CUDA architectures to build for | `120f` (Linux), `80;89;120f` (Windows) |
+| `--cuda-archs=...` | `python setup.py build_ext --cuda-archs="80;89"` | CUDA architectures to build for | `70-virtual;80;89;90a;100f;120f` (Linux), `70-virtual;80;89;120f` (Windows) |
 | `--debug-build` | `python setup.py build_ext --debug-build` | Build in debug mode with symbols | Disabled (Release) |
 | `--lineinfo` | `python setup.py build_ext --lineinfo` | Enable NVCC line info for profiling | Disabled |
 

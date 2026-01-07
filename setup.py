@@ -45,8 +45,8 @@ class CMakeBuildExt(build_ext):
     ]
 
     # Default values for options
-    DEFAULT_CUDA_ARCHS_WINDOWS = "80;89;120f" # No need for Datacenter GPUs
-    DEFAULT_CUDA_ARCHS_LINUX = "80;89;90a;100f;120f"  # + H100, B100
+    DEFAULT_CUDA_ARCHS_WINDOWS = "75-virtual;80;89;120f"  # No need for Datacenter GPUs
+    DEFAULT_CUDA_ARCHS_LINUX = "75-virtual;80;89;90a;100f;120f"  # + H100, B100
 
     def initialize_options(self):
         super().initialize_options()
@@ -65,9 +65,6 @@ class CMakeBuildExt(build_ext):
                 else self.DEFAULT_CUDA_ARCHS_LINUX
             )
 
-        # Validate cuda_archs format
-        if self.cuda_archs and not all(c in "0123456789;af" for c in self.cuda_archs.lower()):
-            raise ValueError(f"Invalid CUDA architectures: {self.cuda_archs}")
 
     def run(self):
         try:
