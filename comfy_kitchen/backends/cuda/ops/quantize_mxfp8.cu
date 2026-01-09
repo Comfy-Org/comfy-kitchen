@@ -27,9 +27,9 @@
 
 namespace comfy {
 
-constexpr unsigned int kMXFP8ValsPerThread = 4;
+constexpr unsigned int kMXFP8ValsPerThread = 8;
 constexpr unsigned int kMXFP8BlockSize = 32; // Always 32 for MXFP8
-constexpr unsigned int kMXFP8ThreadsPerGroup = kMXFP8BlockSize / kMXFP8ValsPerThread;  // 8 threads per group
+constexpr unsigned int kMXFP8ThreadsPerGroup = kMXFP8BlockSize / kMXFP8ValsPerThread;  // 4 threads per group
 
 namespace {
 
@@ -38,26 +38,28 @@ template <
     typename OType=__nv_fp8_e4m3,
     bool Misaligned = false>
 __global__ void quantize_mxfp8_kernel(
-    const IType* const input,
-    OType* const output,
-    uint8_t* const block_scales,  // E8M0 stored as uint8
+    const IType* __restrict__ input,
+    OType* __restrict__ output,
+    uint8_t* __restrict__ block_scales,  // E8M0 stored as uint8
     const size_t num_cols,
     const size_t num_rows,
     const size_t orig_rows,
     const size_t orig_cols) {
 
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t global_elem_idx = static_cast<size_t>(idx) * kMXFP8ValsPerThread;
+    
+    // Early exit for threads beyond data (reduces divergence)
+    if (global_elem_idx >= num_rows * num_cols) return;
 
     // Storage for values
     IType vals[kMXFP8ValsPerThread];
     
     if constexpr (Misaligned) {
         // Misaligned path: load values one at a time with 2D bounds checking
-        const size_t base_elem_idx = static_cast<size_t>(idx) * kMXFP8ValsPerThread;
-        
 #pragma unroll
         for (int i = 0; i < kMXFP8ValsPerThread; i++) {
-            const size_t elem_idx = base_elem_idx + i;
+            const size_t elem_idx = global_elem_idx + i;
             const size_t row = elem_idx / num_cols;
             const size_t col = elem_idx % num_cols;
             
@@ -68,13 +70,9 @@ __global__ void quantize_mxfp8_kernel(
             }
         }
     } else {
-        // Aligned path: vectorized load
-        const IType *vals_ptr = load_f16x4(input + kMXFP8ValsPerThread * idx);
-        
-#pragma unroll
-        for (int i = 0; i < kMXFP8ValsPerThread; i++) {
-            vals[i] = vals_ptr[i];
-        }
+        // Aligned path: 128-bit vectorized load (8 half values)
+        float4 loaded = *reinterpret_cast<const float4*>(input + global_elem_idx);
+        *reinterpret_cast<float4*>(vals) = loaded;
     }
 
     // Compute local absmax
@@ -84,18 +82,15 @@ __global__ void quantize_mxfp8_kernel(
         absmax = __hmax(absmax, __habs(vals[i]));
     }
 
-    // Shuffle down reduction across kMXFP8ThreadsPerGroup threads
-    unsigned int mask = 0xffffffff;
+    // XOR shuffle reduction across kMXFP8ThreadsPerGroup threads
+    // All threads end up with the same max value - no broadcast needed
+    constexpr unsigned int mask = 0xffffffff;
+    
 #pragma unroll
     for (int offset = kMXFP8ThreadsPerGroup / 2; offset >= 1; offset /= 2) {
-        IType other = __shfl_down_sync(mask, absmax, offset, kMXFP8ThreadsPerGroup);
+        IType other = __shfl_xor_sync(mask, absmax, offset);
         absmax = __hmax(absmax, other);
     }
-    
-    // Broadcast from group leader to all threads in the group
-    unsigned int lane_id = threadIdx.x & 0x1f;
-    unsigned int group_leader = (lane_id / kMXFP8ThreadsPerGroup) * kMXFP8ThreadsPerGroup;
-    absmax = __shfl_sync(mask, absmax, group_leader, comfy::kThreadsPerWarp);
     
     // Compute E8M0 scale: smallest power-of-2 such that absmax / scale <= FP8_MAX
     // Use CUDA intrinsic for E8M0 conversion with round toward +infinity
@@ -107,11 +102,8 @@ __global__ void quantize_mxfp8_kernel(
     // For zero/near-zero, __NV_SATFINITE saturates to minimum E8M0 (2^-127)
     __nv_fp8_storage_t e8m0_val = __nv_cvt_float_to_e8m0(ratio, __NV_SATFINITE, cudaRoundPosInf);
     
-    // Store E8M0 scale in swizzled layout
-    const bool is_group_leader = (threadIdx.x % kMXFP8ThreadsPerGroup) == 0;
-    const size_t global_elem_idx = static_cast<size_t>(idx) * kMXFP8ValsPerThread;
-    
-    if (is_group_leader) {
+    // Store E8M0 scale in swizzled layout (only group leaders)
+    if ((threadIdx.x % kMXFP8ThreadsPerGroup) == 0) {
         // Calculate which block this thread group is processing
         const size_t block_linear_idx = global_elem_idx / kMXFP8BlockSize;
         
@@ -142,9 +134,8 @@ __global__ void quantize_mxfp8_kernel(
         vals_output[i] = static_cast<OType>(val_scaled);
     }
 
-    // Store output - FP8 is 1 byte per value, so kMXFP8ValsPerThread=4 uses float (4 bytes)
-    OType* output_ptr = output + kMXFP8ValsPerThread * idx;
-    *reinterpret_cast<float*>(output_ptr) = *reinterpret_cast<float*>(vals_output);
+    // Store output - FP8 is 1 byte per value, so kMXFP8ValsPerThread=8 uses float2 (8 bytes)
+    *reinterpret_cast<float2*>(output + global_elem_idx) = *reinterpret_cast<float2*>(vals_output);
 }
 
 } // namespace
