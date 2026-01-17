@@ -114,6 +114,8 @@ class ParamConstraint:
     def check_device(self, tensor: torch.Tensor, default_devices: frozenset[str]) -> bool:
         """Check if tensor's device is allowed."""
         devices = self.devices if self.devices is not None else default_devices
+        if "*" in devices:
+            return True
         return tensor.device.type in devices
 
     def check_shape(self, tensor: torch.Tensor) -> bool:
