@@ -330,7 +330,7 @@ void quantize_mxfp8(
     // Calculate effective padded dimensions
     int64_t num_rows = orig_rows;
     int64_t num_cols = orig_cols;
-    
+
     if (pad_32x) {
         // Round up to nearest multiple of 32
         num_rows = (orig_rows + 31) / 32 * 32;
@@ -552,7 +552,7 @@ NB_MODULE(_C, m) {
 
     // Feature availability flag (computed at module load time)
     m.attr("HAS_CUBLASLT") = comfy::CublasLtRuntime::instance().is_available();
-    
+
     // Add version info
     m.attr("__version__") = "0.1.0";
     m.attr("__nanobind__") = true;

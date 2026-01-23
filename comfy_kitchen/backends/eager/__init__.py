@@ -33,7 +33,7 @@ def _build_constraints() -> dict:
         ParamConstraint,
     )
 
-    all_devices = frozenset({"cpu", "cuda", "mps", "xpu", "hpu", "meta"})
+    all_devices = frozenset({"cpu", "cuda", "mps", "xpu", "hpu", "meta", "*"})
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
 
     return {

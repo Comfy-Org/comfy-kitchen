@@ -67,6 +67,13 @@ try:
     _C = None  # type: ignore
     _module_path = os.path.join(os.path.dirname(__file__), "_C.abi3.pyd" if sys.platform == "win32" else "_C.abi3.so")
 
+    if not os.path.exists(_module_path):
+        ext = '.pyd' if sys.platform == 'win32' else '.so'
+        directory = os.path.dirname(__file__)
+        for filename in os.listdir(directory):
+            if filename.startswith('_C.') and filename.endswith(ext):
+                _module_path = os.path.join(directory, filename)
+
     if os.path.exists(_module_path):
         _spec = importlib.util.spec_from_file_location(
             "comfy_kitchen.backends.cuda._C", _module_path

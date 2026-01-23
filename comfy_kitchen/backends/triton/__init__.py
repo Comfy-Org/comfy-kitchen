@@ -38,6 +38,7 @@ def _build_constraints() -> dict:
     )
 
     cuda_devices = frozenset({"cuda"})
+    triton_devices = frozenset({"cuda", "xpu"})
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
 
     return {
@@ -49,7 +50,7 @@ def _build_constraints() -> dict:
                     dtypes=frozenset({torch.float8_e4m3fn, torch.float8_e5m2}),
                 ),
             },
-            default_devices=cuda_devices,
+            default_devices=triton_devices,
         ),
         "dequantize_per_tensor_fp8": FunctionConstraints(
             params={
@@ -59,7 +60,7 @@ def _build_constraints() -> dict:
                 "scale": ParamConstraint(dtypes=frozenset({torch.float32})),
                 "output_type": ParamConstraint(dtypes=standard_floats),
             },
-            default_devices=cuda_devices,
+            default_devices=triton_devices,
         ),
         "quantize_nvfp4": FunctionConstraints(
             params={
@@ -101,7 +102,7 @@ def _build_constraints() -> dict:
                 "x": ParamConstraint(dtypes=standard_floats),
                 "freqs_cis": ParamConstraint(dtypes=standard_floats),
             },
-            default_devices=cuda_devices,
+            default_devices=triton_devices,
         ),
         "apply_rope": FunctionConstraints(
             params={
@@ -109,7 +110,7 @@ def _build_constraints() -> dict:
                 "xk": ParamConstraint(dtypes=standard_floats),
                 "freqs_cis": ParamConstraint(dtypes=standard_floats),
             },
-            default_devices=cuda_devices,
+            default_devices=triton_devices,
         ),
     }
 
@@ -120,11 +121,14 @@ def _register():
     from comfy_kitchen.registry import registry
 
     if not _TRITON_AVAILABLE:
-        registry.mark_unavailable("triton", _TRITON_ERROR)
+        registry.mark_unavailable("triton", _TRITON_ERROR or "Triton not available")
         return
 
-    if not torch.cuda.is_available():
-        registry.mark_unavailable("triton", "CUDA not available on this system")
+    has_cuda = torch.cuda.is_available()
+    has_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
+
+    if not has_cuda and not has_xpu:
+        registry.mark_unavailable("triton", "Neither CUDA nor XPU available on this system")
         return
 
     registry.register(
@@ -135,4 +139,3 @@ def _register():
 
 
 _register()
-

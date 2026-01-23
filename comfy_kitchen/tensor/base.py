@@ -472,6 +472,7 @@ _DISPATCH_TABLE = {
     torch.ops.aten.clone.default: _handle_clone,
     torch.ops.aten._to_copy.default: _handle_to_copy,
     torch.ops.aten.to.dtype_layout: _handle_to,
+    torch.ops.aten.to.dtype: _handle_to,
     torch.ops.aten.contiguous.default: _handle_contiguous,
     torch.ops.aten.is_contiguous.default: _handle_is_contiguous,
     torch.ops.aten.copy_.default: _handle_copy_,
