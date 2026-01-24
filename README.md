@@ -11,6 +11,9 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `quantize_nvfp4`            | ✓     | ✓    | ✓      |
 | `dequantize_nvfp4`          | ✓     | ✓    |        |
 | `scaled_mm_nvfp4`           | ✓     | ✓    |        |
+| `quantize_mxfp8`            | ✓     | ✓    | ✓      |
+| `dequantize_mxfp8`          | ✓     |      |        |
+| `scaled_mm_mxfp8`           | ✓     |      |        |
 | `apply_rope`                | ✓     | ✓    | ✓      |
 | `apply_rope1`               | ✓     | ✓    | ✓      |
 
@@ -23,6 +26,7 @@ The library provides `QuantizedTensor`, a `torch.Tensor` subclass that transpare
 |------------------------|--------------|-----------------|----------------------------------------|
 | `TensorCoreFP8Layout`  | FP8 E4M3     | SM ≥ 8.9 (Ada)  | Per-tensor scaling, 1:1 element mapping |
 | `TensorCoreNVFP4Layout`| NVFP4 E2M1   | SM ≥ 10.0 (Blackwell) | Block quantization with 16-element blocks |
+| `TensorCoreMXFP8Layout`| MXFP8 E4M3   | SM ≥ 10.0 (Blackwell) | Block quantization with 32-element blocks, E8M0 scales |
 
 ```python
 from comfy_kitchen.tensor import QuantizedTensor, TensorCoreFP8Layout, TensorCoreNVFP4Layout

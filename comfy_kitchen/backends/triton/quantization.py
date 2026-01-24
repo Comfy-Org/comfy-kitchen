@@ -561,3 +561,184 @@ def dequantize_nvfp4(
     )
 
     return output
+
+@triton.jit
+def quantize_mxfp8_kernel_tl(
+    x_ptr,
+    output_ptr,
+    swizzled_scales_ptr,
+    m,
+    n,
+    num_blocks,
+    scale_rows,
+    scale_cols,
+    padded_scale_cols,
+    block_size: tl.constexpr,
+    blocks_per_program: tl.constexpr,
+):
+    """Single Triton kernel for MXFP8 quantization with E8M0 scale swizzling.
+
+    Performs:
+    1. Computes block-wise max and converts to E8M0 (power-of-2) scales
+    2. Quantizes data to FP8 E4M3
+    3. Applies to_blocked swizzle pattern to E8M0 scales
+
+    Args:
+        x_ptr: Input tensor pointer (m x n)
+        output_ptr: Output FP8 data (m x n)
+        swizzled_scales_ptr: Output swizzled E8M0 block scales
+        m: Number of rows in input
+        n: Number of columns in input (must be divisible by block_size)
+        num_blocks: Number of blocks per row (n // block_size)
+        scale_rows: Unpadded scale rows (m)
+        scale_cols: Unpadded scale cols (num_blocks)
+        padded_scale_cols: Padded scale cols for swizzle
+        block_size: Size of each quantization block (32 for MXFP8)
+        blocks_per_program: Number of blocks to process per program
+    """
+    # Get program IDs
+    pid_m = tl.program_id(axis=0)
+    pid_n_base = tl.program_id(axis=1) * blocks_per_program
+
+    # FP8 E4M3 max value
+    fp8_max: tl.constexpr = 448.0
+
+    # Process multiple blocks per program
+    for block_offset in range(blocks_per_program):
+        pid_n = pid_n_base + block_offset
+
+        if pid_n < num_blocks:
+            # Calculate offsets for the input data block
+            offs_n = pid_n * block_size + tl.arange(0, block_size)
+            mask = offs_n < n
+            x_offs = pid_m * n + offs_n
+
+            # Load input data block
+            x = tl.load(x_ptr + x_offs, mask=mask, other=0.0).to(tl.float32)
+
+            # Compute block-wise absolute maximum
+            x_abs = tl.abs(x)
+            max_abs = tl.max(x_abs, axis=0)
+
+            # Compute E8M0 scale: find power-of-2 that covers max_abs
+            # E8M0 has bias 127, so scale = 2^(exp - 127)
+            # We want 2^exp >= max_abs / fp8_max, so exp = ceil(log2(max_abs / fp8_max)) + 127
+            # Using floor(log2(x)) + 1 for ceiling
+            scale_ratio = max_abs / fp8_max
+            # Clamp to avoid log2(0) and ensure valid E8M0 range
+            scale_ratio = tl.maximum(scale_ratio, 2.0 ** (-127))  # min E8M0 value
+            scale_ratio = tl.minimum(scale_ratio, 2.0 ** 127)     # max E8M0 value
+
+            # Compute exponent: round up to next power of 2
+            log2_ratio = tl.log2(scale_ratio)
+            exp_unbiased = tl.math.ceil(log2_ratio).to(tl.int32)
+            exp_biased = exp_unbiased + 127  # E8M0 bias
+
+            # Clamp to valid E8M0 range [0, 254] (255 is NaN)
+            exp_biased = tl.maximum(exp_biased, 0)
+            exp_biased = tl.minimum(exp_biased, 254)
+
+            # Compute actual scale value for quantization
+            block_scale = tl.exp2((exp_biased - 127).to(tl.float32))
+
+            # Store E8M0 scale in swizzled layout
+            n_col_blocks = tl.cdiv(scale_cols, 4)
+            swizzled_offs = _compute_swizzled_scale_offset(
+                pid_m, pid_n, n_col_blocks, padded_scale_cols
+            )
+            if pid_m < scale_rows and pid_n < scale_cols:
+                # Store as uint8 (E8M0 is just an 8-bit exponent)
+                tl.store(swizzled_scales_ptr + swizzled_offs, exp_biased.to(tl.uint8))
+
+            # Quantize data to FP8
+            # Handle zero scale to avoid division by zero
+            safe_scale = tl.where(block_scale < 1e-30, 1.0, block_scale)
+            data_scaled = x / safe_scale
+            data_scaled = tl.where(block_scale < 1e-30, 0.0, data_scaled)
+
+            # Clamp to FP8 range and convert
+            data_clamped = tl.maximum(tl.minimum(data_scaled, fp8_max), -fp8_max)
+
+            # Store as FP8 E4M3
+            out_offs = pid_m * n + offs_n
+            tl.store(output_ptr + out_offs, data_clamped.to(tl.float8e4nv), mask=mask)
+
+
+def quantize_mxfp8(
+    x: torch.Tensor,
+    pad_32x: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to MXFP8 format with block-wise E8M0 scaling.
+
+    MXFP8 uses block size 32 with power-of-2 (E8M0) block scales.
+
+    Args:
+        x: Input tensor (2D, shape M x K)
+        pad_32x: If True, pad dimensions to be divisible by 32
+
+    Returns:
+        Tuple of (quantized_fp8_tensor, block_scales_e8m0)
+    """
+    block_size = 32
+
+    # Handle padding
+    if pad_32x:
+        rows, cols = x.shape
+        pad_rows = (rows + 31) // 32 * 32 - rows
+        pad_cols = (cols + 31) // 32 * 32 - cols
+        if pad_rows > 0 or pad_cols > 0:
+            x = torch.nn.functional.pad(x, (0, pad_cols, 0, pad_rows))
+
+    m, n = x.shape
+    num_blocks = n // block_size
+
+    # Ensure contiguous
+    x = x.contiguous()
+
+    # Calculate swizzled scale dimensions
+    scale_rows = m
+    scale_cols = num_blocks
+    n_row_blocks = ceil_div(scale_rows, 128)
+    n_col_blocks = ceil_div(scale_cols, 4)
+    padded_scale_rows = n_row_blocks * 128
+    padded_scale_cols = n_col_blocks * 4
+
+    # Allocate output tensors
+    output = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=x.device)
+    # Use zeros for scales to avoid garbage in padded regions
+    swizzled_scales = torch.zeros(
+        (padded_scale_rows, padded_scale_cols),
+        dtype=torch.uint8,  # E8M0 stored as uint8
+        device=x.device
+    )
+
+    # Determine blocks per program
+    total_blocks = m * num_blocks
+    if total_blocks < 1024:
+        blocks_per_program = 1
+    elif total_blocks < 4096:
+        blocks_per_program = 2
+    else:
+        blocks_per_program = 4
+
+    # Launch kernel
+    grid = (m, triton.cdiv(num_blocks, blocks_per_program))
+
+    quantize_mxfp8_kernel_tl[grid](
+        x,
+        output,
+        swizzled_scales,
+        m,
+        n,
+        num_blocks,
+        scale_rows,
+        scale_cols,
+        padded_scale_cols,
+        block_size=block_size,
+        blocks_per_program=blocks_per_program,
+    )
+
+    # Convert uint8 scales to float8_e8m0fnu
+    swizzled_scales = swizzled_scales.view(torch.float8_e8m0fnu)
+
+    return output, swizzled_scales

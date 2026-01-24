@@ -2,10 +2,12 @@
 import pytest
 import torch
 
+import comfy_kitchen
 from comfy_kitchen.tensor import (
     BaseLayoutParams,
     QuantizedTensor,
     TensorCoreFP8Layout,
+    TensorCoreMXFP8Layout,
     TensorCoreNVFP4Layout,
     get_cuda_capability,
 )
@@ -392,6 +394,16 @@ class TestQuantizedTensorFlatten:
         assert "_param_scale" in inner_tensors
         assert "_param_block_scale" in inner_tensors
 
+    def test_tensor_flatten_unflatten_mxfp8(self):
+        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(x, "TensorCoreMXFP8Layout")
+
+        inner_tensors, ctx = qt.__tensor_flatten__()
+
+        assert "_qdata" in inner_tensors
+        assert "_param_scale" in inner_tensors
+        assert "layout_cls" in ctx
+
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -410,6 +422,9 @@ class TestCapabilityChecking:
 
     def test_nvfp4_min_sm_version(self):
         assert TensorCoreNVFP4Layout.MIN_SM_VERSION == (10, 0)
+
+    def test_mxfp8_min_sm_version(self):
+        assert TensorCoreMXFP8Layout.MIN_SM_VERSION == (10, 0)
 
     def test_supports_fast_matmul_returns_bool(self):
         result = TensorCoreFP8Layout.supports_fast_matmul()
@@ -432,7 +447,7 @@ class TestCapabilityChecking:
         assert isinstance(reqs["fast_matmul_supported"], bool)
 
     def test_supports_fast_matmul_consistent_with_requirements(self):
-        for layout_cls in [TensorCoreFP8Layout, TensorCoreNVFP4Layout]:
+        for layout_cls in [TensorCoreFP8Layout, TensorCoreNVFP4Layout, TensorCoreMXFP8Layout]:
             reqs = layout_cls.get_requirements()
             assert reqs["fast_matmul_supported"] == layout_cls.supports_fast_matmul()
 
@@ -506,9 +521,8 @@ class TestBaseLayoutParams:
         assert torch.equal(params_clone.scale, params.scale)
         assert torch.equal(params_clone.block_scale, params.block_scale)
 
-    @pytest.mark.parametrize("layout_cls", [TensorCoreFP8Layout, TensorCoreNVFP4Layout])
+    @pytest.mark.parametrize("layout_cls", [TensorCoreFP8Layout, TensorCoreNVFP4Layout, TensorCoreMXFP8Layout])
     def test_params_inherits_from_base(self, layout_cls):
-        """Test that layout Params classes inherit from BaseLayoutParams."""
         assert issubclass(layout_cls.Params, BaseLayoutParams)
 
 
@@ -874,8 +888,8 @@ class TestNVFP4LinearOperations:
 
         qt_x = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
         qt_w = QuantizedTensor.from_float(w, "TensorCoreNVFP4Layout")
-
-        result = torch.nn.functional.linear(qt_x, qt_w)
+        with comfy_kitchen.use_backend("eager"):
+            result = torch.nn.functional.linear(qt_x, qt_w)
         expected = torch.nn.functional.linear(qt_x.dequantize(), qt_w.dequantize())
 
         # Verify output shape matches original (non-padded)
@@ -1099,7 +1113,221 @@ class TestNVFP4ShapeOperationsFallback:
         x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
-        # Transpose then dequantize should give same result as dequantize then transpose
+        result = qt.t().dequantize()
+        expected = qt.dequantize().t()
+
+        assert torch.equal(result, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestTensorCoreMXFP8Layout:
+
+    def test_quantize_aligned(self):
+        x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        qdata, params = TensorCoreMXFP8Layout.quantize(x)
+
+        assert qdata.dtype == torch.float8_e4m3fn
+        assert qdata.shape == (128, 256)
+        assert params.orig_shape == (128, 256)
+        assert params.scale.dtype == torch.float8_e8m0fnu
+
+    def test_quantize_unaligned_pads(self):
+        x = torch.randn(129, 130, device="cuda", dtype=torch.bfloat16)
+        qdata, params = TensorCoreMXFP8Layout.quantize(x)
+
+        assert qdata.shape == (160, 160)
+        assert params.orig_shape == (129, 130)
+
+    def test_dequantize_roundtrip(self):
+        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16) * 4
+        qdata, params = TensorCoreMXFP8Layout.quantize(x)
+        dq = TensorCoreMXFP8Layout.dequantize(qdata, params)
+
+        assert dq.dtype == torch.bfloat16
+        assert dq.shape == (128, 128)
+
+    def test_get_padded_shape(self):
+        assert TensorCoreMXFP8Layout.get_padded_shape((128, 256)) == (128, 256)
+        assert TensorCoreMXFP8Layout.get_padded_shape((129, 128)) == (160, 128)
+        assert TensorCoreMXFP8Layout.get_padded_shape((100, 100)) == (128, 128)
+
+    def test_get_storage_shape(self):
+        assert TensorCoreMXFP8Layout.get_storage_shape((128, 256)) == (128, 256)
+        assert TensorCoreMXFP8Layout.get_storage_shape((129, 128)) == (160, 128)
+
+    def test_requires_2d(self):
+        x = torch.randn(10, 10, 10, device="cuda", dtype=torch.bfloat16)
+        with pytest.raises(ValueError, match="2D tensor"):
+            TensorCoreMXFP8Layout.quantize(x)
+
+    def test_mxfp8_min_sm_version(self):
+        assert TensorCoreMXFP8Layout.MIN_SM_VERSION == (10, 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestMXFP8LinearOperations:
+
+    def test_mxfp8_linear_both_quantized(self):
+        if not TensorCoreMXFP8Layout.supports_fast_matmul():
+            pytest.skip("MXFP8 matmul not supported on this hardware (requires SM >= 10.0)")
+
+        batch, in_features, out_features = 32, 64, 128
+        x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
+
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreMXFP8Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreMXFP8Layout")
+
+        result = torch.nn.functional.linear(qt_x, qt_w)
+        expected = torch.nn.functional.linear(qt_x.dequantize(), qt_w.dequantize())
+
+        assert result.shape == (batch, out_features)
+        assert torch.allclose(result, expected, rtol=0.2, atol=0.2)
+
+    def test_mxfp8_linear_with_bias(self):
+        if not TensorCoreMXFP8Layout.supports_fast_matmul():
+            pytest.skip("MXFP8 matmul not supported on this hardware")
+
+        batch, in_features, out_features = 16, 32, 64
+        x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(out_features, device="cuda", dtype=torch.bfloat16)
+
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreMXFP8Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreMXFP8Layout")
+
+        result = torch.nn.functional.linear(qt_x, qt_w, b)
+        expected = torch.nn.functional.linear(qt_x.dequantize(), qt_w.dequantize(), b)
+
+        assert result.shape == (batch, out_features)
+        assert torch.allclose(result, expected, rtol=0.2, atol=0.2)
+
+    def test_mxfp8_linear_padded_input(self):
+        if not TensorCoreMXFP8Layout.supports_fast_matmul():
+            pytest.skip("MXFP8 matmul not supported on this hardware")
+
+        batch, in_features, out_features = 49, 65, 97
+        x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
+
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreMXFP8Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreMXFP8Layout")
+
+        assert qt_x.is_padded
+        assert qt_w.is_padded
+
+        result = torch.nn.functional.linear(qt_x, qt_w)
+
+        assert result.shape == (batch, out_features)
+
+    def test_mxfp8_linear_weight_only_quantized(self):
+        batch, in_features, out_features = 16, 32, 64
+        x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
+
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreMXFP8Layout")
+
+        result = torch.nn.functional.linear(x, qt_w)
+        expected = torch.nn.functional.linear(x, qt_w.dequantize())
+
+        assert result.shape == (batch, out_features)
+        assert torch.equal(result, expected)
+
+    def test_mxfp8_mm_fallback(self):
+        m, k, n = 32, 64, 128
+        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
+
+        qt_a = QuantizedTensor.from_float(a, "TensorCoreMXFP8Layout")
+        qt_b = QuantizedTensor.from_float(b, "TensorCoreMXFP8Layout")
+
+        result = torch.mm(qt_a, qt_b)
+        expected = torch.mm(qt_a.dequantize(), qt_b.dequantize())
+
+        assert result.shape == expected.shape
+        assert torch.equal(result, expected)
+
+    def test_mxfp8_mm_with_transposed_b(self):
+        if not TensorCoreMXFP8Layout.supports_fast_matmul():
+            pytest.skip("MXFP8 matmul not supported on this hardware (requires SM >= 10.0)")
+
+        m, k, n = 32, 64, 128
+        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+
+        qt_a = QuantizedTensor.from_float(a, "TensorCoreMXFP8Layout")
+        qt_b = QuantizedTensor.from_float(b, "TensorCoreMXFP8Layout")
+
+        result = torch.mm(qt_a, qt_b.t())
+        expected = torch.mm(qt_a.dequantize(), qt_b.dequantize().t())
+
+        assert result.shape == expected.shape
+        assert torch.allclose(result, expected, rtol=0.2, atol=0.2)
+
+    def test_mxfp8_linear_output_dtype(self):
+        if not TensorCoreMXFP8Layout.supports_fast_matmul():
+            pytest.skip("MXFP8 matmul not supported on this hardware")
+
+        batch, in_features, out_features = 16, 32, 64
+        x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
+
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreMXFP8Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreMXFP8Layout")
+
+        result = torch.nn.functional.linear(qt_x, qt_w)
+
+        assert result.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestMXFP8ShapeOperationsFallback:
+
+    def test_mxfp8_view_falls_back(self):
+        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(x, "TensorCoreMXFP8Layout")
+
+        result = qt.view(16, 256)
+
+        assert not isinstance(result, QuantizedTensor)
+        assert isinstance(result, torch.Tensor)
+        assert result.shape == (16, 256)
+
+    def test_mxfp8_transpose_is_noop(self):
+        x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(x, "TensorCoreMXFP8Layout")
+
+        result = qt.t()
+
+        assert isinstance(result, QuantizedTensor)
+        assert result.shape == (64, 32)
+        assert result._params.transposed is True
+        assert result._qdata.data_ptr() == qt._qdata.data_ptr()
+
+    def test_mxfp8_double_transpose_restores_state(self):
+        x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(x, "TensorCoreMXFP8Layout")
+
+        result = qt.t().t()
+
+        assert isinstance(result, QuantizedTensor)
+        assert result.shape == (32, 64)
+        assert result._params.transposed is False
+
+    def test_mxfp8_reshape_falls_back(self):
+        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(x, "TensorCoreMXFP8Layout")
+
+        result = qt.reshape(32, 128)
+
+        assert not isinstance(result, QuantizedTensor)
+        assert isinstance(result, torch.Tensor)
+        assert result.shape == (32, 128)
+
+    def test_mxfp8_transpose_dequantize_values_correct(self):
+        x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(x, "TensorCoreMXFP8Layout")
+
         result = qt.t().dequantize()
         expected = qt.dequantize().t()
 

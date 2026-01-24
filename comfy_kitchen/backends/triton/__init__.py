@@ -3,6 +3,7 @@ __all__ = [
     "apply_rope1",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
+    "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
 ]
@@ -17,6 +18,7 @@ try:
     from .quantization import (
         dequantize_nvfp4,
         dequantize_per_tensor_fp8,
+        quantize_mxfp8,
         quantize_nvfp4,
         quantize_per_tensor_fp8,
     )
@@ -67,6 +69,15 @@ def _build_constraints() -> dict:
                     shape_rules=(ExactDims(2),),
                 ),
                 "per_tensor_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+            },
+            default_devices=cuda_devices,
+        ),
+        "quantize_mxfp8": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=standard_floats,
+                    shape_rules=(ExactDims(2),),
+                ),
             },
             default_devices=cuda_devices,
         ),

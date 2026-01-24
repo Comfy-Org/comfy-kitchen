@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 
 import comfy_kitchen as ck
+from comfy_kitchen.scaled_mm_v2 import scaled_mm_v2
 
 from .base import BaseLayoutParams, QuantizedLayout, dequantize_args, register_layout_op
 
@@ -90,17 +91,14 @@ def _fp8_scaled_mm(
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Core FP8 scaled matrix multiplication using torch._scaled_mm."""
-    output = torch._scaled_mm(
+    return scaled_mm_v2(
         input_qdata.contiguous(),
         weight_qdata,
-        bias=bias,
         scale_a=scale_a,
         scale_b=scale_b,
+        bias=bias,
         out_dtype=out_dtype,
     )
-    # Handle tuple return for older PyTorch versions
-    return output[0] if isinstance(output, tuple) else output
 
 
 def _make_fp8_shape_handler(aten_op):

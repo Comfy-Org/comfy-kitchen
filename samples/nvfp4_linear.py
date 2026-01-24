@@ -49,7 +49,7 @@ class NVFP4Linear(nn.Module):
             block_scale=weight_block_scale,
         )
 
-        self.weight = nn.Parameter(QuantizedTensor(weight, TensorCoreNVFP4Layout, params), requires_grad=False)
+        self.weight = nn.Parameter(QuantizedTensor(weight, "TensorCoreNVFP4Layout", params), requires_grad=False)
         manually_loaded_keys = [prefix + "weight", prefix + "weight_scale_2", prefix + "weight_scale"]
 
         input_scale = state_dict.pop(prefix + "input_scale", None)
@@ -69,16 +69,14 @@ class NVFP4Linear(nn.Module):
 
     def state_dict(self, *args, **kwargs) -> dict[str, torch.Tensor]:
         state_dict = super().state_dict(*args, **kwargs)
-        qdata, scale, block_scale = TensorCoreNVFP4Layout.get_plain_tensors(self.weight)
-        state_dict["weight"] = qdata
-        state_dict["weight_scale_2"] = scale
-        state_dict["weight_scale"] = block_scale
+        del state_dict["weight"]  # Remove the QuantizedTensor
+        state_dict.update(self.weight.state_dict("weight"))
         return state_dict
 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not isinstance(x, QuantizedTensor):
-            x = QuantizedTensor.from_float(x, TensorCoreNVFP4Layout, scale=self.input_scale)
+            x = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout", scale=self.input_scale)
         return torch.nn.functional.linear(x, self.weight, self.bias)
 
 

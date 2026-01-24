@@ -117,6 +117,17 @@ extern "C" {
         int64_t num_cols,
         int output_dtype_code,
         cudaStream_t stream);
+
+    void launch_quantize_mxfp8_kernel(
+        const void* input,
+        void* output,
+        void* block_scales,
+        int64_t num_rows,
+        int64_t num_cols,
+        int64_t orig_rows,
+        int64_t orig_cols,
+        int input_dtype_code,
+        cudaStream_t stream);
 }
 
 // Nanobind wrapper for quantize_per_tensor_fp8
@@ -304,6 +315,47 @@ void dequantize_nvfp4(
         stream);
 }
 
+// Nanobind wrapper for quantize_mxfp8
+void quantize_mxfp8(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<nb::device::cuda> output,
+    nb::ndarray<nb::device::cuda> block_scales,
+    bool pad_32x,
+    uintptr_t stream_ptr) {
+
+    // Get input dimensions (orig_rows, orig_cols)
+    int64_t orig_rows = input.shape(0);
+    int64_t orig_cols = input.shape(1);
+
+    // Calculate effective padded dimensions
+    int64_t num_rows = orig_rows;
+    int64_t num_cols = orig_cols;
+
+    if (pad_32x) {
+        // Round up to nearest multiple of 32
+        num_rows = (orig_rows + 31) / 32 * 32;
+        num_cols = (orig_cols + 31) / 32 * 32;
+    }
+
+    // Get input dtype code
+    int input_dtype_code = map_dtype_to_code(input.dtype());
+    if (input_dtype_code < 0 || input_dtype_code > 2) {
+        throw std::runtime_error("Unsupported input dtype for MXFP8 quantization (must be float32, float16, or bfloat16)");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quantize_mxfp8_kernel(
+        input.data(),
+        output.data(),
+        block_scales.data(),
+        num_rows,
+        num_cols,
+        orig_rows,
+        orig_cols,
+        input_dtype_code,
+        stream);
+}
+
 // Nanobind wrapper for apply_rope (handles both single tensor and q/k pair)
 void apply_rope(
     nb::ndarray<nb::device::cuda> xq,
@@ -488,6 +540,14 @@ NB_MODULE(_C, m) {
           nb::arg("block_scales"),
           nb::arg("output"),
           nb::arg("output_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("quantize_mxfp8", &quantize_mxfp8,
+          "Quantize to FP8 E4M3 with E8M0 block scales using cuBLAS tiled layout",
+          nb::arg("input"),
+          nb::arg("output"),
+          nb::arg("block_scales"),
+          nb::arg("pad_32x") = false,
           nb::arg("stream_ptr"));
 
     // Feature availability flag (computed at module load time)

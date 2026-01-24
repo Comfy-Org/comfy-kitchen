@@ -27,14 +27,17 @@ __all__ = [
     # Core functions
     "apply_rope",
     "apply_rope1",
+    "dequantize_mxfp8",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
     # Backend configuration
     "disable_backend",
     "enable_backend",
     "list_backends",
+    "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
+    "scaled_mm_mxfp8",
     "scaled_mm_nvfp4",
     "set_backend_priority",
     "use_backend",
@@ -160,6 +163,76 @@ def scaled_mm_nvfp4(
     return torch.ops.comfy_kitchen.scaled_mm_nvfp4(
         a, b, tensor_scale_a, tensor_scale_b,
         block_scale_a, block_scale_b, bias, dtype_code, alpha
+    )
+
+
+def quantize_mxfp8(
+    x: torch.Tensor,
+    pad_32x: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to MXFP8 format with block-wise E8M0 scaling.
+
+    MXFP8 uses block size 32 with power-of-2 (E8M0) block scales.
+
+    Args:
+        x: Input tensor (2D, shape M x K, K must be divisible by 32)
+        pad_32x: If True, pad dimensions to be divisible by 32
+
+    Returns:
+        Tuple of (quantized_fp8_tensor, block_scales_e8m0)
+        - quantized_fp8_tensor: FP8 E4M3 data of shape (M, K)
+        - block_scales_e8m0: E8M0 scales in swizzled layout
+    """
+    return torch.ops.comfy_kitchen.quantize_mxfp8(x, pad_32x)
+
+
+def dequantize_mxfp8(
+    qx: torch.Tensor,
+    block_scales: torch.Tensor,
+    output_type: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize tensor from MXFP8 format.
+
+    Args:
+        qx: Quantized FP8 tensor (float8_e4m3fn)
+        block_scales: E8M0 block scales in swizzled layout (float8_e8m0fnu)
+        output_type: Target output dtype (float32, float16, or bfloat16)
+
+    Returns:
+        Dequantized tensor in specified output format
+    """
+    dtype_code = DTYPE_TO_CODE[output_type]
+    return torch.ops.comfy_kitchen.dequantize_mxfp8(qx, block_scales, dtype_code)
+
+
+def scaled_mm_mxfp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Matrix multiplication with MXFP8 quantized inputs.
+
+    Computes: y = a @ b.T + bias
+
+    Args:
+        a: Quantized FP8 matrix A (M, K)
+        b: Quantized FP8 matrix B (N, K)
+        block_scale_a: E8M0 block scales for A in swizzled layout
+        block_scale_b: E8M0 block scales for B in swizzled layout
+        bias: Optional bias vector
+        out_dtype: Output dtype (defaults to bfloat16)
+
+    Returns:
+        Result tensor of shape (M, N)
+    """
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    dtype_code = DTYPE_TO_CODE[out_dtype]
+    return torch.ops.comfy_kitchen.scaled_mm_mxfp8(
+        a, b, block_scale_a, block_scale_b, bias, dtype_code
     )
 
 

@@ -24,6 +24,10 @@ F8_E4M3_EPS = 0.125
 F8_E5M2_MAX = 57344.0
 F8_E5M2_EPS = 0.0625
 
+# E8M0 (8 exponent bits, 0 mantissa bits) - used for MXFP8 block scales
+# Value = 2^(exp - 127) where exp is the 8-bit unsigned value
+E8M0_BIAS = 127
+
 
 def roundup(x: int, multiple: int) -> int:
     """Round up x to the nearest multiple."""
@@ -332,3 +336,27 @@ def fp4_x2_to_f32(a):
     a_u8 = unpack_uint4(a)
     a_f32 = _floatx_unpacked_to_f32(a_u8, 2, 1)
     return a_f32
+
+def f32_to_e8m0(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.float32, "Input must be float32"
+    x_int = x.view(torch.int32)
+    biased_exp = (x_int >> MBITS_F32) & 0xFF
+
+    # Get mantissa for rounding decision (round to nearest power of 2)
+    # If mantissa >= 0.5 (in normalized form), round up the exponent
+    mantissa = x_int & _n_ones(MBITS_F32)
+    round_up = mantissa >= (1 << (MBITS_F32 - 1))
+    biased_exp = biased_exp + round_up.to(torch.int32)
+
+    biased_exp = torch.clamp(biased_exp, 0, 255)
+
+    return biased_exp.to(torch.uint8)
+
+
+def e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.uint8, "Input must be uint8"
+    biased_exp = x.to(torch.int32)
+    result = biased_exp << MBITS_F32
+    result = torch.where(biased_exp == 0, torch.zeros_like(result), result)
+
+    return result.view(torch.float32)

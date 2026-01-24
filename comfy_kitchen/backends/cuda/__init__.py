@@ -24,6 +24,7 @@ __all__ = [
     "apply_rope1",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
+    "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
     "scaled_mm_nvfp4",
@@ -270,6 +271,42 @@ def dequantize_nvfp4(
     return output
 
 
+def quantize_mxfp8(
+    x: torch.Tensor,
+    pad_32x: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+
+    orig_rows, orig_cols = x.shape
+    if pad_32x:
+        num_rows = roundup(orig_rows, 32)
+        num_cols = roundup(orig_cols, 32)
+    else:
+        num_rows, num_cols = orig_rows, orig_cols
+        assert num_rows % 32 == 0, f"num_rows must be divisible by 32, got {num_rows}"
+        assert num_cols % 32 == 0, f"num_cols must be divisible by 32, got {num_cols}"
+
+    qx = torch.empty((num_rows, num_cols), device=x.device, dtype=torch.float8_e4m3fn, memory_format=torch.contiguous_format)
+
+    scale_rows = roundup(num_rows, 128)
+    scale_cols = roundup(num_cols // 32, 4)
+    sx_uint8 = torch.zeros((scale_rows, scale_cols), device=x.device, dtype=torch.uint8)
+
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    _C.quantize_mxfp8(
+        _wrap_for_dlpack(x),
+        _wrap_for_dlpack(qx),
+        _wrap_for_dlpack(sx_uint8),
+        pad_32x,
+        stream_ptr,
+    )
+
+    # View uint8 scales as float8_e8m0fnu before returning
+    sx = sx_uint8.view(torch.float8_e8m0fnu)
+
+    return qx, sx
+
+
 def scaled_mm_nvfp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -494,6 +531,15 @@ def _build_constraints() -> dict:
                 ),
                 "per_tensor_scale": ParamConstraint(
                     dtypes=frozenset({torch.float32}),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "quantize_mxfp8": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
                 ),
             },
             default_devices=cuda_devices,

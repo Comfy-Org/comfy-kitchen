@@ -257,6 +257,68 @@ class TestDequantizeNVFP4:
             )
 
 
+# =============================================================================
+# MXFP8 Quantization Tests
+# =============================================================================
+
+
+class TestQuantizeMXFP8:
+    """MXFP8 quantization tests."""
+
+    @pytest.fixture
+    def capable_backends(self, device):
+        backends = get_capable_backends("quantize_mxfp8", device)
+        if not backends:
+            pytest.skip(f"No backend supports quantize_mxfp8 on {device}")
+        return backends
+
+    @pytest.mark.parametrize("m,k", [
+        (1024, 2048),
+        (512, 1024),
+        (128, 256),
+        (65, 96),  # Edge case: odd rows requiring padding
+    ])
+    def test_quantize_mxfp8_all_backends(self, capable_backends, device, seed, m, k):
+        """Test MXFP8 quantization across all capable backends."""
+        if "eager" not in capable_backends:
+            pytest.skip("Need eager backend as reference")
+
+        # Create test input
+        x = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 10
+        needs_padding = (m % 32 != 0) or (k % 32 != 0)
+
+        with ck.use_backend("eager"):
+            ref_qx, ref_sx = ck.quantize_mxfp8(x, pad_32x=needs_padding)
+
+        for backend_name in capable_backends:
+            with ck.use_backend(backend_name):
+                qx, sx = ck.quantize_mxfp8(x, pad_32x=needs_padding)
+
+                # Check basic properties
+                assert qx.dtype == torch.float8_e4m3fn, f"{backend_name}: expected float8_e4m3fn, got {qx.dtype}"
+                assert sx.dtype == torch.float8_e8m0fnu, f"{backend_name}: expected float8_e8m0fnu, got {sx.dtype}"
+                assert qx.shape == ref_qx.shape, f"{backend_name}: qx shape mismatch"
+                assert sx.shape == ref_sx.shape, f"{backend_name}: sx shape mismatch"
+
+                # Compare scales (E8M0 should match exactly or be very close)
+                assert_values_close(
+                    sx.view(torch.uint8).to(torch.float32),
+                    ref_sx.view(torch.uint8).to(torch.float32),
+                    rtol=0.0,
+                    atol=1.0,  # Allow 1 ULP difference in exponent
+                    name=f"scales ({backend_name} vs eager)"
+                )
+
+                # Compare quantized data
+                assert_values_close(
+                    qx.to(torch.float32),
+                    ref_qx.to(torch.float32),
+                    rtol=1e-3,
+                    atol=1e-3,
+                    name=f"quantized data ({backend_name} vs eager)"
+                )
+
+
 class TestScaledMMNVFP4:
     """NVFP4 matrix multiplication tests."""
 
