@@ -57,6 +57,15 @@ def quantize_per_tensor_fp8(
 def dequantize_per_tensor_fp8(
     x: torch.Tensor, scale: torch.Tensor, output_type: torch.dtype = torch.bfloat16
 ) -> torch.Tensor:
+    # Handle FP8 tensors on MPS (not natively supported)
+    if x.device.type == 'mps' and x.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        # Move computation to CPU where FP8 is supported
+        x_cpu = x.cpu()
+        scale_cpu = scale.cpu()
+        dq_tensor = x_cpu.to(dtype=output_type) * scale_cpu.to(dtype=output_type)
+        return dq_tensor.to(x.device)
+    
+    # Normal path for other cases
     dq_tensor = x.to(dtype=output_type) * scale.to(dtype=output_type)
     return dq_tensor
 
