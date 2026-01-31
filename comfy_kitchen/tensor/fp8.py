@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -214,9 +214,10 @@ def _handle_fp8_addmm(qt, args, kwargs):
 
 
 # ==================== Distributed Operations ====================
+# Required c10d ops : c10d allgather, c10d wait
+# Required aten ops : slice, split, new_zeros, as_strided
 
 @register_layout_op(torch.ops._c10d_functional.all_gather_into_tensor.default, TensorCoreFP8Layout)
-@register_layout_op(torch.ops.c10d_functional.all_gather_into_tensor.default, TensorCoreFP8Layout)
 def _handle_all_gather(qt, args, kwargs):
     from .base import QuantizedTensor
 
@@ -243,11 +244,11 @@ def _handle_all_gather(qt, args, kwargs):
     )
 
     gathered_qdata = gathered_bytes.view(qdata.dtype)
-    return QuantizedTensor(gathered_qdata, layout_cls, params)
+    gathered_params = replace(params, orig_shape=tuple(gathered_qdata.shape))
+    return QuantizedTensor(gathered_qdata, layout_cls, gathered_params)
 
 
 @register_layout_op(torch.ops._c10d_functional.wait_tensor.default, TensorCoreFP8Layout)
-@register_layout_op(torch.ops.c10d_functional.wait_tensor.default, TensorCoreFP8Layout)
 def _handle_wait_tensor(qt, args, kwargs):
     from .base import QuantizedTensor
 
@@ -260,7 +261,47 @@ def _handle_wait_tensor(qt, args, kwargs):
     )
 
     waited_qdata = waited_bytes.view(qtensor._qdata.dtype)
-    return QuantizedTensor(waited_qdata, qtensor._layout_cls, qtensor._params)
+    waited_params = replace(qtensor._params, orig_shape=tuple(waited_qdata.shape))
+    return QuantizedTensor(waited_qdata, qtensor._layout_cls, waited_params)
+
+
+def _wrap_fp8_tensor(qtensor, qdata):
+    from .base import QuantizedTensor
+
+    new_params = TensorCoreFP8Layout.Params(
+        scale=qtensor._params.scale,
+        orig_dtype=qtensor._params.orig_dtype,
+        orig_shape=tuple(qdata.shape),
+    )
+    return QuantizedTensor(qdata, qtensor._layout_cls, new_params)
+
+
+@register_layout_op(torch.ops.aten.slice.Tensor, TensorCoreFP8Layout)
+def _handle_fp8_slice_tensor(qt, args, kwargs):
+    from .base import QuantizedTensor
+
+    input_tensor = args[0]
+    if not isinstance(input_tensor, QuantizedTensor):
+        return torch.ops.aten.slice.Tensor(*args, **kwargs)
+
+    sliced_qdata = torch.ops.aten.slice.Tensor(input_tensor._qdata, *args[1:], **kwargs)
+    return _wrap_fp8_tensor(input_tensor, sliced_qdata)
+
+
+@register_layout_op(torch.ops.aten.split.Tensor, TensorCoreFP8Layout)
+def _handle_fp8_split(qt, args, kwargs):
+    from .base import QuantizedTensor
+
+    input_tensor = args[0]
+    if not isinstance(input_tensor, QuantizedTensor):
+        return torch.ops.aten.split.Tensor(*args, **kwargs)
+
+    qdata_chunks = torch.ops.aten.split.Tensor(input_tensor._qdata, *args[1:], **kwargs)
+    wrapped_chunks = tuple(
+        _wrap_fp8_tensor(input_tensor, chunk)
+        for chunk in qdata_chunks
+    )
+    return wrapped_chunks
 
 
 # ==================== FP8 Shape Operations ====================
@@ -270,5 +311,7 @@ for _aten_op in (
     torch.ops.aten.view.default,
     torch.ops.aten.reshape.default,
     torch.ops.aten.t.default,
+    torch.ops.aten.as_strided.default,
+    torch.ops.aten.new_zeros.default,
 ):
     register_layout_op(_aten_op, TensorCoreFP8Layout)(_make_fp8_shape_handler(_aten_op))
