@@ -438,13 +438,15 @@ def _handle_is_contiguous(qt, args, kwargs):
 
 def _handle_copy_(qt, args, kwargs):
     dst, src = args[0], args[1]
-    if not isinstance(src, QuantizedTensor):
-        raise TypeError(f"Cannot copy {type(src).__name__} to QuantizedTensor")
+    non_blocking = kwargs.get("non_blocking", len(args) >= 3)
+
+    if not isinstance(dst, QuantizedTensor):
+        dst = QuantizedTensor(src._qdata, src._layout_cls, src._params)
+
     if dst._layout_cls != src._layout_cls:
         raise TypeError(f"Layout mismatch: {dst._layout_cls} vs {src._layout_cls}")
 
     dst_orig_dtype = dst._params.orig_dtype
-    non_blocking = kwargs.get("non_blocking", len(args) >= 3)
 
     dst._qdata.copy_(src._qdata, non_blocking=non_blocking)
     dst._params.copy_from(src._params, non_blocking=non_blocking)
