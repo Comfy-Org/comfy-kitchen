@@ -265,6 +265,8 @@ def _handle_wait_tensor(qt, args, kwargs):
     return QuantizedTensor(waited_qdata, qtensor._layout_cls, waited_params)
 
 
+# Should not be use, since tensor.copy_ inside fsdp, calls native dtype that can't recieve correct Quantized class
+# This is mainly for state_dict broadcast from rank 0.
 @register_layout_op(torch.ops.c10d.broadcast_.default, TensorCoreFP8Layout)
 def _handle_broadcast(qt, args, kwargs):
     from .base import QuantizedTensor
@@ -434,6 +436,13 @@ def _handle_fp8_cat(qt, args, kwargs):
     return _wrap_fp8_tensor(first_qtensor, concatenated_qdata)
 
 
+@register_layout_op(torch.ops.aten.new_zeros.default, TensorCoreFP8Layout)
+def _handle_new_zeros(qt, args, kwargs):
+    input_tensor = args[0]
+    new_zero_qdata = torch.ops.aten.new_zeros.default(input_tensor._qdata, *args[1:], **kwargs)
+    return _wrap_fp8_tensor(input_tensor, new_zero_qdata)
+
+
 # ==================== FP8 Shape Operations ====================
 # These preserve quantization since FP8 is not packed (1:1 element mapping)
 
@@ -442,7 +451,6 @@ for _aten_op in (
     torch.ops.aten.reshape.default,
     torch.ops.aten.t.default,
     torch.ops.aten.as_strided.default,
-    torch.ops.aten.new_zeros.default,
     torch.ops.aten.alias.default
 ):
     register_layout_op(_aten_op, TensorCoreFP8Layout)(_make_fp8_shape_handler(_aten_op))
