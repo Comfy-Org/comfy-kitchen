@@ -17,6 +17,13 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `apply_rope`                | ✓     | ✓    | ✓      |
 | `apply_rope1`               | ✓     | ✓    | ✓      |
 
+## DTensor Capabilities Matrix
+| Layout                 | Status |
+|------------------------|--------|
+| `TensorCoreFP8Layout`  |  ✓     |
+| `TensorCoreNVFP4Layout`|        |
+| `TensorCoreMXFP8Layout`|        |
+
 
 ## Quantized Tensors
 
