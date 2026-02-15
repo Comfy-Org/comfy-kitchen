@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional, Tuple
+from .base import QuantizedTensor
 
 import torch
 
@@ -454,3 +455,65 @@ for _aten_op in (
     torch.ops.aten.alias.default
 ):
     register_layout_op(_aten_op, TensorCoreFP8Layout)(_make_fp8_shape_handler(_aten_op))
+
+
+# ==================== FSDP All-Gather Hooks ====================
+
+def _fsdp_pre_all_gather_fp8(self, mesh):
+    if self._layout_cls != "TensorCoreFP8Layout":
+        raise NotImplementedError(f"FSDP all_gather not supported for {self._layout_cls}")
+
+    qdata = self._qdata
+    if not qdata.is_contiguous():
+        qdata = qdata.contiguous()
+
+    scale = self._params.scale
+    if isinstance(scale, torch.Tensor):
+        scale = scale.to(device=qdata.device)
+
+    return (qdata,), (scale,)
+
+
+def _fsdp_post_all_gather_fp8(
+    self,
+    all_gather_outputs: Tuple[torch.Tensor, ...],
+    metadata: Any,
+    param_dtype: torch.dtype,
+    *,
+    out: Optional[torch.Tensor] = None,
+):
+    if self._layout_cls != "TensorCoreFP8Layout":
+        raise NotImplementedError(f"FSDP all_gather not supported for {self._layout_cls}")
+
+    (data,) = all_gather_outputs
+    (scale,) = metadata
+
+    if out is not None:
+        from .base import QuantizedTensor
+
+        if not isinstance(out, QuantizedTensor):
+            raise TypeError(f"Expected QuantizedTensor out, got {type(out)}")
+        out._qdata = data
+        out._params = TensorCoreFP8Layout.Params(
+            scale=scale,
+            orig_dtype=param_dtype,
+            orig_shape=tuple(data.shape),
+        )
+        return
+
+    from .base import QuantizedTensor
+
+    params = TensorCoreFP8Layout.Params(
+        scale=scale,
+        orig_dtype=param_dtype,
+        orig_shape=tuple(data.shape),
+    )
+    return QuantizedTensor(data, "TensorCoreFP8Layout", params), (data,)
+
+
+# Monkey patch for now
+if not hasattr(QuantizedTensor, "fsdp_pre_all_gather"):
+    QuantizedTensor.fsdp_pre_all_gather = _fsdp_pre_all_gather_fp8  # type: ignore[attr-defined]
+
+if not hasattr(QuantizedTensor, "fsdp_post_all_gather"):
+    QuantizedTensor.fsdp_post_all_gather = _fsdp_post_all_gather_fp8  # type: ignore[attr-defined]
