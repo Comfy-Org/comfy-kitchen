@@ -553,8 +553,6 @@ NB_MODULE(_C, m) {
     // Feature availability flag (computed at module load time)
     m.attr("HAS_CUBLASLT") = comfy::CublasLtRuntime::instance().is_available();
 
-    // Add version info
-    m.attr("__version__") = "0.1.0";
     m.attr("__nanobind__") = true;
     m.attr("__stable_abi__") = true;
 }
