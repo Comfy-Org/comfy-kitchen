@@ -21,7 +21,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | Layout                 | Status |
 |------------------------|--------|
 | `TensorCoreFP8Layout`  |  ✓     |
-| `TensorCoreNVFP4Layout`|        |
+| `TensorCoreNVFP4Layout`|  ✓     |
 | `TensorCoreMXFP8Layout`|        |
 
 
