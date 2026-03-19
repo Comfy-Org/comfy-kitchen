@@ -20,13 +20,43 @@ from setuptools.command.build_ext import build_ext
 # Usage: python setup.py install --no-cuda
 #    or: pip install . --no-cuda
 BUILD_NO_CUDA = False
-if "--no-cuda" in sys.argv:
+if "--no-cuda" in sys.argv or os.environ.get("COMFY_NO_CUDA", "0") == "1":
+    if "--no-cuda" in sys.argv:
+        sys.argv.remove("--no-cuda")  # Remove so setuptools doesn't complain
     BUILD_NO_CUDA = True
-    sys.argv.remove("--no-cuda")  # Remove so setuptools doesn't complain
     print("\n" + "=" * 80)
     print("Building CPU-only variant (--no-cuda flag)")
     print("CUDA backend excluded - only eager, triton backends")
     print("=" * 80 + "\n")
+
+BUILD_ROCM = False
+if "--rocm" in sys.argv:
+    BUILD_ROCM = True
+    sys.argv.remove("--rocm")
+
+ROCM_ARCHS = None
+for _arg in sys.argv[:]:
+    if _arg.startswith("--rocm-archs="):
+        ROCM_ARCHS = _arg.split("=", 1)[1]
+        sys.argv.remove(_arg)
+        break
+
+# Auto-detect ROCm PyTorch and skip the CUDA extension.
+# On a ROCm system there is no nvcc or CUDA toolkit, so setup_cuda_extension()
+# would fail (ImportError for nanobind or RuntimeError for missing nvcc).
+# Setting BUILD_NO_CUDA bypasses that entire path; the pure-Python ROCm
+# backend registers itself at import time without any compiled extension.
+if not BUILD_NO_CUDA and not BUILD_ROCM:
+    try:
+        import torch as _torch
+        if getattr(_torch.version, "hip", None) is not None:
+            BUILD_NO_CUDA = True
+            BUILD_ROCM = True
+            print("\n[ROCm] Detected ROCm PyTorch — skipping CUDA extension.")
+            print("[ROCm] Pure-Python ROCm backend will be used.\n")
+        del _torch
+    except ImportError:
+        pass
 
 
 class CMakeExtension(Extension):
@@ -183,6 +213,61 @@ def get_cuda_path():
         cuda_home = str(nvcc_bin.parent.parent)
 
     return cuda_home, nvcc_bin
+
+def is_rocm_pytorch() -> bool:
+    """Return True when the installed PyTorch is a ROCm build."""
+    try:
+        import torch
+        return getattr(torch.version, "hip", None) is not None
+    except ImportError:
+        return False
+
+
+def get_rocm_extensions() -> list:
+    """Build the optional HIP C extension for the ROCm backend.
+
+    Only attempted on Linux with hipcc available.  The pure-Python ROCm
+    backend (__init__.py) works without this extension on all platforms.
+    """
+    import platform
+
+    if platform.system() == "Windows":
+        # hipcc not in Windows PyTorch ROCm wheel; pure-Python path used instead.
+        return []
+
+    if not (BUILD_ROCM or is_rocm_pytorch()):
+        return []
+
+    if not shutil.which("hipcc"):
+        print(
+            "\n[ROCm] hipcc not found — skipping HIP C extension.\n"
+            "       Pure-Python ROCm backend will still register and run.\n"
+            "       To build: ensure $ROCM_PATH/bin is on PATH.\n"
+        )
+        return []
+
+    try:
+        import nanobind  # noqa: F401
+    except ImportError:
+        print("[ROCm] nanobind not found — skipping HIP extension. pip install nanobind")
+        return []
+
+    rocm_source_dir = str(
+        pathlib.Path(__file__).resolve().parent
+        / "comfy_kitchen" / "backends" / "rocm"
+    )
+
+    cmake_args = []
+    if ROCM_ARCHS:
+        cmake_args.append(f"-DROCM_ARCHS={ROCM_ARCHS}")
+
+    print(f"[ROCm] Configuring HIP extension (archs: {ROCM_ARCHS or 'default'})")
+    return [CMakeExtension(
+        name="comfy_kitchen.backends.rocm._C",
+        source_dir=rocm_source_dir,
+        cmake_args=cmake_args,
+    )]
+
 
 def get_cuda_version() -> tuple[int, ...] | None:
     _cuda_home, nvcc_bin = get_cuda_path()

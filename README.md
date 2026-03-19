@@ -4,29 +4,35 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 
 ## Backend Capabilities Matrix
 
-| Function                    | eager | cuda | triton |
-|-----------------------------|-------|------|--------|
-| `quantize_per_tensor_fp8`   | ✓     | ✓    | ✓      |
-| `dequantize_per_tensor_fp8` | ✓     | ✓    | ✓      |
-| `quantize_nvfp4`            | ✓     | ✓    | ✓      |
-| `dequantize_nvfp4`          | ✓     | ✓    |        |
-| `scaled_mm_nvfp4`           | ✓     | ✓    |        |
-| `quantize_mxfp8`            | ✓     | ✓    | ✓      |
-| `dequantize_mxfp8`          | ✓     |      |        |
-| `scaled_mm_mxfp8`           | ✓     |      |        |
-| `apply_rope`                | ✓     | ✓    | ✓      |
-| `apply_rope1`               | ✓     | ✓    | ✓      |
+| Function                    | eager | cuda | triton | rocm |
+|-----------------------------|-------|------|--------|------|
+| `quantize_per_tensor_fp8`   | ✓     | ✓    | ✓      | ✓    |
+| `dequantize_per_tensor_fp8` | ✓     | ✓    | ✓      | ✓    |
+| `quantize_nvfp4`            | ✓     | ✓    | ✓      | ✓    |
+| `dequantize_nvfp4`          | ✓     | ✓    |        | ✓    |
+| `scaled_mm_nvfp4`           | ✓     | ✓    |        | ✓ ¹  |
+| `quantize_mxfp8`            | ✓     | ✓    | ✓      | ✓    |
+| `dequantize_mxfp8`          | ✓     |      |        | ✓    |
+| `scaled_mm_mxfp8`           | ✓     |      |        | ✓ ²  |
+| `apply_rope`                | ✓     | ✓    | ✓      | ✓    |
+| `apply_rope1`               | ✓     | ✓    | ✓      | ✓    |
+
+> ¹ AMD RDNA hardware lacks native FP4. `scaled_mm_nvfp4` dequantises to BF16 then runs `torch.mm`.
+>
+> ² Uses `torch._scaled_mm` → hipBLASLt FP8 GEMM on RDNA3 (gfx1100+) and RDNA4 (gfx1200+).
+> Falls back to dequant + `torch.mm` on older hardware. TensorWise scaling is used as an
+> approximation until PyTorch ROCm exposes block-scaled hipBLASLt directly.
 
 
 ## Quantized Tensors
 
 The library provides `QuantizedTensor`, a `torch.Tensor` subclass that transparently intercepts PyTorch operations and dispatches them to optimized quantized kernels when available.
 
-| Layout                 | Format       | HW Requirement  | Description                             |
-|------------------------|--------------|-----------------|----------------------------------------|
-| `TensorCoreFP8Layout`  | FP8 E4M3     | SM ≥ 8.9 (Ada)  | Per-tensor scaling, 1:1 element mapping |
-| `TensorCoreNVFP4Layout`| NVFP4 E2M1   | SM ≥ 10.0 (Blackwell) | Block quantization with 16-element blocks |
-| `TensorCoreMXFP8Layout`| MXFP8 E4M3   | SM ≥ 10.0 (Blackwell) | Block quantization with 32-element blocks, E8M0 scales |
+| Layout                  | Format     | HW Requirement        | Description                                        |
+|-------------------------|------------|-----------------------|----------------------------------------------------|
+| `TensorCoreFP8Layout`   | FP8 E4M3   | SM ≥ 8.9 (Ada) / RDNA3+ | Per-tensor scaling, 1:1 element mapping          |
+| `TensorCoreNVFP4Layout` | NVFP4 E2M1 | SM ≥ 10.0 (Blackwell) | Block quantization with 16-element blocks          |
+| `TensorCoreMXFP8Layout` | MXFP8 E4M3 | SM ≥ 10.0 (Blackwell) / RDNA3+ | Block quantization with 32-element blocks, E8M0 scales |
 
 ```python
 from comfy_kitchen.tensor import QuantizedTensor, TensorCoreFP8Layout, TensorCoreNVFP4Layout
@@ -45,6 +51,8 @@ dq = qt.dequantize()
 
 ## Installation
 
+> Note: If you are on a system with a non-UTF-8 locale, builds may fail with a `UnicodeDecodeError`. Set `PYTHONUTF8=1` in your environment.
+
 ### From PyPI
 
 ```bash
@@ -62,6 +70,16 @@ pip install comfy-kitchen[cublas]
 
 Wheels are built for Python 3.10, 3.11, and 3.12+ (using Stable ABI for 3.12+).
 
+### AMD ROCm
+
+The ROCm backend is pure Python and requires no compilation. Install the
+ROCm build of PyTorch for your platform, then install comfy-kitchen normally —
+everything is detected and configured automatically, with no extra setup needed.
+
+**Supported hardware:** RDNA3 (RX 7000 series, gfx1100+), RDNA4 (RX 9000 series,
+gfx1200+), and CDNA3 (MI300X, gfx940+). Older AMD GPUs are supported with
+eager fallback for all ops.
+
 ### From Source
 
 ```bash
@@ -73,6 +91,9 @@ pip install -e ".[dev]"
 
 # For faster rebuilds during development (skip build isolation)
 pip install -e . --no-build-isolation -v
+
+# Installation with ROCm support
+pip install . --no-build-isolation -v
 ```
 
 #### Build Options
@@ -95,6 +116,10 @@ python setup.py build_ext --cuda-archs="80;89" bdist_wheel
 
 # Debug build with line info for profiling
 python setup.py build_ext --debug-build --lineinfo bdist_wheel
+
+# Build with ROCm
+python setup.py bdist_wheel
+
 ```
 
 
@@ -106,6 +131,8 @@ python setup.py build_ext --debug-build --lineinfo bdist_wheel
 - **CUDA Runtime** (for CUDA wheels): ≥13.0
   - Pre-built wheels require NVIDIA Driver r580+
   - Building from source requires CUDA Toolkit ≥12.8 and `CUDA_HOME` environment variable
+- **ROCm PyTorch** (for ROCm backend)
+  - No additional compilation or ROCm stack installation required on Windows
 - **nanobind**: ≥2.0.0 (for building from source)
 - **CMake**: ≥3.18 (for building from source)
 
@@ -115,7 +142,7 @@ python setup.py build_ext --debug-build --lineinfo bdist_wheel
 import comfy_kitchen as ck
 import torch
 
-# Automatic backend selection (triton -> cuda -> eager)
+# Automatic backend selection (cuda -> rocm -> triton -> eager)
 x = torch.randn(100, 100, device="cuda")
 scale = torch.tensor([1.0], device="cuda")
 result = ck.quantize_per_tensor_fp8(x, scale)
@@ -127,27 +154,30 @@ print(ck.list_backends())
 result = ck.quantize_per_tensor_fp8(x, scale, backend="eager")
 
 # Temporarily use a different backend
-with ck.use_backend("triton"):
+with ck.use_backend("rocm"):
     result = ck.quantize_per_tensor_fp8(x, scale)
 ```
 
 ## Backend System
 
 The library supports multiple backends:
-- **eager**: Pure PyTorch implementation
-- **cuda**: Custom CUDA C kernels (CUDA only)
-- **triton**: Triton JIT-compiled kernels
+
+- **eager**: Pure PyTorch implementation, works on any device
+- **cuda**: Custom CUDA C kernels (NVIDIA GPUs)
+- **triton**: Triton JIT-compiled kernels (NVIDIA and AMD)
+- **rocm**: Pure-Python AMD backend using hipBLASLt via `torch._scaled_mm`
 
 ### Automatic Backend Selection
 
-When you call a function, the registry selects the best backend by checking **constraints** in priority order (`cuda` → `triton` → `eager`):
+When you call a function, the registry selects the best backend by checking **constraints** in priority order (`cuda` → `rocm` → `triton` → `eager`):
 
 ```python
 # Backend is selected automatically based on input constraints
 result = ck.quantize_per_tensor_fp8(x, scale)
 
 # On CPU tensors → falls back to eager (only backend supporting CPU)
-# On CUDA tensors → uses cuda or triton (higher priority)
+# On CUDA tensors (NVIDIA) → uses cuda or triton (higher priority)
+# On CUDA tensors (AMD/ROCm) → uses rocm
 ```
 
 ### Constraint System

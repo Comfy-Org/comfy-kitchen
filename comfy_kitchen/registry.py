@@ -22,7 +22,7 @@ class BackendRegistry:
         self._backends = {}  # {name: backend_module}
         self._capabilities = {}  # {name: set of function names}
         self._constraints = {}  # {(backend_name, func_name): FunctionConstraints}
-        self._priority = ["cuda", "triton", "eager"]
+        self._priority = ["cuda", "rocm", "triton", "eager"]
         self._disabled = set()  # Manually disabled backends
         self._unavailable = {}  # {name: error_message} for failed backends
         self._lock = threading.Lock()
