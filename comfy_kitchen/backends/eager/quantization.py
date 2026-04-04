@@ -6,6 +6,8 @@
 #   Copyright (c) Meta Platforms, Inc. and affiliates.
 #   Licensed under the BSD 3-Clause License (see NOTICE file for details)
 
+import logging
+
 import torch
 
 from comfy_kitchen.float_utils import (
@@ -22,6 +24,8 @@ from comfy_kitchen.float_utils import (
     to_blocked,
 )
 from comfy_kitchen.scaled_mm_v2 import ScalingType, SwizzleType, scaled_mm_v2
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Dtype Code Mappings (shared between custom ops and backends)
@@ -54,9 +58,23 @@ def quantize_per_tensor_fp8(
     temp = torch.clamp(temp, -lp_max, lp_max, out=temp)
     return temp.to(output_type)
 
+_fp8_mps_fallback_warned = False
+_FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
+
 def dequantize_per_tensor_fp8(
     x: torch.Tensor, scale: torch.Tensor, output_type: torch.dtype = torch.bfloat16
 ) -> torch.Tensor:
+    if x.device.type == "mps" and x.dtype in _FP8_DTYPES:
+        # MPS does not support FP8 dtype conversion.
+        # Dequantize on CPU and transfer only the final result back.
+        global _fp8_mps_fallback_warned
+        if not _fp8_mps_fallback_warned:
+            _fp8_mps_fallback_warned = True
+            logger.warning(
+                "FP8 dequant: MPS does not support FP8 dtypes, falling back to CPU"
+            )
+        cpu_dq = x.cpu().to(dtype=output_type) * scale.cpu().to(dtype=output_type)
+        return cpu_dq.to(x.device)
     dq_tensor = x.to(dtype=output_type) * scale.to(dtype=output_type)
     return dq_tensor
 

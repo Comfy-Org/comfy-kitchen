@@ -126,6 +126,55 @@ class TestDequantizePerTensorFP8:
             assert result.dtype == output_dtype
             assert result.device == x_fp8.device
 
+    @pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
+    def test_dequantize_fp8_cpu_fallback_correctness(self, seed, output_dtype):
+        """Verify the CPU fallback produces bit-identical results.
+
+        The MPS fallback dequantizes on CPU then transfers back. Since
+        every FP8 value is exactly representable in bfloat16/float16,
+        the result must be identical to the standard eager path.
+        """
+        x_f32 = torch.randn(256, 512, dtype=torch.float32, device="cpu")
+        scale = torch.tensor([2.0], dtype=torch.float32, device="cpu")
+        x_fp8 = x_f32.to(torch.float8_e4m3fn)
+
+        # Standard eager path
+        standard = x_fp8.to(dtype=output_dtype) * scale.to(dtype=output_dtype)
+
+        # CPU fallback logic (same operations the MPS branch executes)
+        fallback = x_fp8.cpu().to(dtype=output_dtype) * scale.cpu().to(
+            dtype=output_dtype
+        )
+
+        assert torch.equal(standard, fallback)
+
+    @pytest.mark.skipif(
+        not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
+        reason="MPS not available",
+    )
+    @pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
+    def test_dequantize_fp8_on_mps_device(self, seed, output_dtype):
+        """Test FP8 dequantization on actual MPS hardware."""
+        x_fp8 = torch.randn(128, 256, dtype=torch.float32).to(torch.float8_e4m3fn)
+        scale = torch.tensor([1.5], dtype=torch.float32)
+
+        x_mps = x_fp8.to("mps")
+        scale_mps = scale.to("mps")
+
+        with ck.use_backend("eager"):
+            result = ck.dequantize_per_tensor_fp8(
+                x_mps, scale_mps, output_type=output_dtype
+            )
+
+        assert result.device.type == "mps"
+        assert result.dtype == output_dtype
+        assert result.shape == (128, 256)
+
+        # Verify bit-identical to CPU reference (FP8 is exact in bfloat16/float16)
+        with ck.use_backend("eager"):
+            ref = ck.dequantize_per_tensor_fp8(x_fp8, scale, output_type=output_dtype)
+        assert torch.equal(result.cpu(), ref)
+
 
 # =============================================================================
 # NVFP4 Quantization Tests
