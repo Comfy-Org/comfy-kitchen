@@ -47,8 +47,10 @@ class TensorCoreSVDQuantW4A4Layout(QuantizedLayout):
         DeepCompressor pipeline to produce the pre-quantized tensors.
     """
 
-    # SVDQuant ships kernels for SM >= 8.0 (Ampere); kitchen dispatches to the
-    # nunchaku backend which enforces this via its own constraint system.
+    # m16n8k64 int4 MMA requires SM >= 8.0 (Ampere). The kitchen CUDA kernels
+    # in comfy_kitchen/backends/cuda/ops/{quantize,scaled_mm}_svdquant_w4a4.cu
+    # gate the PTX body on __CUDA_ARCH__ >= 800 and raise at runtime on older
+    # arches (see svdquant_utils.cuh::trap_pre_sm80).
     MIN_SM_VERSION = (8, 0)
 
     # Activation quantization is fused inside the kernel — do not pre-wrap
@@ -96,9 +98,11 @@ class TensorCoreSVDQuantW4A4Layout(QuantizedLayout):
         """Reconstruct the effective weight W_eff such that plain ``x @ W_eff.T + bias``
         reproduces the SVDQuant kernel output to bf16 precision.
 
-        Uses the kitchen kernel itself with an identity input — bit-exact with the
-        kernel's tile-interleaved packed layout without requiring us to replicate
-        that layout in Python.
+        Uses the kitchen kernel itself with an identity input rather than
+        reimplementing dequant in Python. Kitchen weight layout is natural
+        row-major packed int4 ``(N, K/2)`` — the kernel reads it directly, so
+        this path stays bit-exact with the actual compute path regardless of
+        per-group scaling / LoRA composition details.
         """
         out_features, _ = qdata.shape
         in_features = params.orig_shape[1]
@@ -146,7 +150,18 @@ def _w4a4_forward(
     weight_qt: "QuantizedTensor",
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Compute y = x @ W^T + bias via nunchaku's fused int4 kernel."""
+    """Compute y = x @ W^T + bias via the int4 kernel.
+
+    For layers flagged ``act_unsigned`` (nunchaku convention: post-GELU fc2),
+    we apply the +0.171875 shift to the main-path activation here at the layer
+    so it falls into the unsigned [0, 15] quantization grid. LoRA continues to
+    use the raw un-shifted activation (SVDQuant invariant: LoRA is the residual
+    between full-precision W and the int4 approximation, computed on the
+    pre-quantization activation).
+
+    Kernel API stays shift-free — shift is a Qwen/Flux model-topology constant,
+    not a quantize-op parameter.
+    """
     qdata, wscales, smooth, proj_down, proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(weight_qt)
     act_unsigned = bool(getattr(weight_qt._params, "act_unsigned", False))
 
@@ -154,12 +169,19 @@ def _w4a4_forward(
     x2d = input_tensor.reshape(-1, orig_shape[-1])
     M = x2d.shape[0]
 
+    if act_unsigned:
+        x_main = x2d + _GELU_UNSIGNED_SHIFT  # fed to quantize for unsigned grid
+        lora_x = x2d                         # LoRA always sees raw x
+    else:
+        x_main = x2d
+        lora_x = None                        # wrapper will fall back to x_main
+
     q_x, ascales, lora_act = ck.quantize_svdquant_w4a4(
-        x2d,
+        x_main,
         smooth=smooth,
         lora_down=proj_down,
         act_unsigned=act_unsigned,
-        shift_value=_GELU_UNSIGNED_SHIFT if act_unsigned else 0.0,
+        lora_x=lora_x,
     )
     out = ck.scaled_mm_svdquant_w4a4(
         act=q_x, wgt=qdata, ascales=ascales, wscales=wscales,

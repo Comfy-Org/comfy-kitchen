@@ -4,11 +4,26 @@
 # SVDQuant W4A4 (4-bit weight, 4-bit activation, SVD low-rank correction):
 # eager pure-PyTorch reference implementations plus torch.library dispatch.
 #
+# Two related but distinct int4 ranges appear in this module:
+#
+#   (a) Storage / nibble encoding   = the 4-bit two's-complement field can hold
+#                                     any value in [-8, 7] (signed) or [0, 15]
+#                                     (unsigned). Pack/unpack codecs handle the
+#                                     full range because that's what the physical
+#                                     bits can represent.
+#   (b) Quantizer emission range    = the clamp the quantizer actually applies.
+#                                     For absmax-symmetric quantization with
+#                                     scale = max/7 (nunchaku / kitchen CUDA
+#                                     contract), signed emission is [-7, 7] —
+#                                     we skip -8 so the dequant range is
+#                                     symmetric about zero. Unsigned emission
+#                                     is [0, 15] with scale = max/15.
+#
 # Kitchen-native storage layout (independent of any third-party kernel):
 #
-#   qweight       (N, K // 2)        int8  — two signed int4 values per byte
-#                                            bits 0..3 -> column 2j   (range [-8, 7])
-#                                            bits 4..7 -> column 2j+1 (range [-8, 7])
+#   qweight       (N, K // 2)        int8  — two int4 values per byte
+#                                            bits 0..3 -> column 2j   (nibble)
+#                                            bits 4..7 -> column 2j+1 (nibble)
 #   wscales       (K // 64, N)       same fp dtype as compute
 #   proj_down     (K, R)             fp
 #   proj_up       (N, R)             fp
@@ -34,9 +49,14 @@ import torch
 import torch.nn.functional as F
 
 _INT4_GROUP_SIZE = 64
-_INT4_MAX = 7  # signed int4 [-8, 7], symmetric scale uses 7
-_UINT4_MAX = 15  # unsigned int4 [0, 15], used by fused GELU -> fc2 path
-_GELU_UNSIGNED_SHIFT = 0.171875  # matches nunchaku's SHIFT_GELU
+# Quantizer emission ranges (not the same as the 4-bit storage range — see
+# module header). Symmetric absmax quantization uses scale = max/_INT4_MAX and
+# clamps to [-_INT4_MAX, +_INT4_MAX]; -8 is representable by the nibble but is
+# not emitted because it would break the dequant symmetry (nunchaku contract,
+# see /workspace/nunchaku/src/kernels/zgemm/gemm_w4a4.cuh:435).
+_INT4_MAX = 7   # signed quantizer range: [-7, 7], scale = max/7
+_UINT4_MAX = 15 # unsigned quantizer range: [0, 15], scale = max/15 (post-GELU+shift fc2)
+_GELU_UNSIGNED_SHIFT = 0.171875  # matches nunchaku's SHIFT_GELU constant
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -44,8 +64,12 @@ def _ceil_div(a: int, b: int) -> int:
 
 
 def _pack_int4_row_major(values: torch.Tensor) -> torch.Tensor:
-    """Pack (..., K) signed int4 values (int8 dtype, range [-8, 7]) into
-    (..., K // 2) int8 with two nibbles per byte (low = even column).
+    """Pack (..., K) int4 values into (..., K // 2) int8 (low = even column).
+
+    Storage-level codec: handles the full 4-bit field; the caller decides which
+    quantizer emission range to use. Inputs may contain any value that fits in
+    a nibble (signed [-8, 7] or unsigned [0, 15]); values outside get masked
+    via the & 0x0F below.
     """
     if values.shape[-1] % 2 != 0:
         raise ValueError(f"last dim must be even, got {values.shape[-1]}")
@@ -55,7 +79,13 @@ def _pack_int4_row_major(values: torch.Tensor) -> torch.Tensor:
 
 
 def _unpack_int4_row_major(packed: torch.Tensor) -> torch.Tensor:
-    """Inverse of _pack_int4_row_major. Returns int8 in [-8, 7]."""
+    """Inverse of _pack_int4_row_major with signed-nibble interpretation.
+
+    Storage-level codec: returns int8 across the full signed nibble range
+    [-8, 7]. This is wider than the quantizer's emission range [-7, 7] by
+    design — the codec must accept any bit pattern that could land in the
+    nibble.
+    """
     x32 = packed.to(torch.int32)
     lo = x32 & 0x0F
     hi = (x32 >> 4) & 0x0F
@@ -66,7 +96,11 @@ def _unpack_int4_row_major(packed: torch.Tensor) -> torch.Tensor:
 
 
 def _unpack_uint4_row_major(packed: torch.Tensor) -> torch.Tensor:
-    """Inverse of _pack_int4_row_major for unsigned nibble payloads."""
+    """Inverse of _pack_int4_row_major with unsigned-nibble interpretation.
+
+    Storage-level codec: returns int8 across the full unsigned nibble range
+    [0, 15] (used by the u4.s4 MMA path — post-GELU+shift fc2 activations).
+    """
     x32 = packed.to(torch.int32)
     lo = x32 & 0x0F
     hi = (x32 >> 4) & 0x0F
@@ -80,18 +114,25 @@ def quantize_svdquant_w4a4(
     lora_down: torch.Tensor,
     pad_size: int = 256,
     act_unsigned: bool = False,
-    shift_value: float = 0.0,
+    lora_x: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize activations to int4 with fused smoothing and LoRA down projection.
+    """Quantize activations to int4 with smoothing + separate LoRA down projection.
 
     Args:
-        x: (M, K) bf16/fp16 input.
+        x: (M, K) bf16/fp16 — main-path input (may be shifted by caller for unsigned).
         smooth: (K,) per-channel smoothing factor applied before quantization.
-        lora_down: (K, R) low-rank down projection weight (fp32 accumulation).
+        lora_down: (K, R) low-rank down projection weight. The eager reference
+            here runs the matmul in fp32 for numerical stability; the CUDA
+            backend takes a lower-precision bf16 matmul path for memory/launch
+            savings. Do not use this eager result as a bitwise oracle for the
+            CUDA output — it is a high-precision reference, not a backend parity
+            target.
         pad_size: pad M to a multiple of this (default 256) to match downstream kernels.
-        act_unsigned: if True, quantize into uint4 [0, 15] instead of signed int4.
-        shift_value: additive shift applied before smoothing. Qwen Image MLP fc2
-            uses 0.171875 after GELU to enable unsigned activation quantization.
+        act_unsigned: if True, quantize into uint4 [0, 15] (scale=max/15) instead of
+            signed int4 [-7, 7] (scale=max/7). Selects MMA grid for downstream u4.s4.
+        lora_x: (M, K) bf16/fp16 — input for LoRA matmul. Defaults to x. Pass
+            separately when caller pre-shifts x (SVDQuant LoRA is mathematically
+            defined on pre-quantization, pre-shift activations).
 
     Returns:
         q_x: (M_pad, K // 2) int8 packed (2 int4 per byte, same layout as weight).
@@ -107,17 +148,22 @@ def quantize_svdquant_w4a4(
         raise ValueError(f"K={K} not divisible by group_size={group}")
     M_pad = _ceil_div(M, pad_size) * pad_size
 
-    # LoRA down: computed on the un-smoothed input (matches SVDQuant convention)
-    lora_act = x.float() @ lora_down.float()  # (M, R)
+    # LoRA down uses un-shifted, un-smoothed activation (SVDQuant invariant).
+    lora_src = lora_x if lora_x is not None else x
+    lora_act = lora_src.float() @ lora_down.float()  # (M, R)
 
     # Smooth (divide) + per-row per-group int4 quantization.
     # SmoothQuant: outliers are moved from activations to weights at calibration.
     # At inference, activations divide by smooth so they quantize cleanly.
-    x_smooth = (x + shift_value) / smooth
+    x_smooth = x / smooth
     groups = x_smooth.view(M, K // group, group)
     absmax = groups.abs().amax(dim=-1).clamp(min=1e-10)  # (M, K/G)
+    # Quantizer emission range: symmetric signed [-7, 7] or unsigned [0, 15].
+    # Signed clamp intentionally does NOT reach -8 even though the nibble can
+    # represent it — absmax/7 scaling assumes ±qmax symmetry and emitting -8
+    # would break dequant parity with nunchaku and kitchen CUDA.
     qmax = _UINT4_MAX if act_unsigned else _INT4_MAX
-    qmin = 0 if act_unsigned else (-_INT4_MAX - 1)
+    qmin = 0 if act_unsigned else -_INT4_MAX
     scales = absmax / qmax
     q_vals = (groups / scales.unsqueeze(-1)).round().clamp(qmin, qmax).to(torch.int8)
     q_vals = q_vals.reshape(M, K)
@@ -143,21 +189,35 @@ def scaled_mm_svdquant_w4a4(
     bias: torch.Tensor | None = None,
     act_unsigned: bool = False,
 ) -> torch.Tensor:
-    """SVDQuant W4A4 GEMM with fused LoRA up projection and optional bias.
+    """SVDQuant W4A4 int4 GEMM + LoRA up + optional bias (eager reference impl).
+
+    Semantic mirror of the CUDA path; used as a high-precision reference and on
+    non-CUDA devices. Numerical notes:
+
+    * Quantization grid and emission range match the CUDA kernel exactly
+      (signed absmax/7, unsigned absmax/15 — see module header).
+    * The LoRA-up branch here accumulates in fp32 for stability. The CUDA
+      wrapper takes a bf16 addmm_ path for memory/launch-count savings and
+      drops the fp32 lora_act_in precision. This eager output is therefore a
+      high-precision reference, not a bit-parity oracle for the CUDA backend.
+      Tests that compare the two paths should use tolerances consistent with
+      bf16 matmul (~8e-3 abs).
 
     Args:
         act: (M, K // 2) int8 packed activations from quantize_svdquant_w4a4.
-        wgt: (N, K // 2) int8 packed weights (kitchen-native layout).
+            Bit-pattern interpretation depends on act_unsigned (signed [-7,7]
+            vs unsigned [0,15]).
+        wgt: (N, K // 2) int8 packed weights (kitchen natural row-major).
         ascales: (K // 64, M) per-row per-group activation scales.
         wscales: (K // 64, N) per-group weight scales.
         lora_act_in: (M, R) fp32 LoRA down-projection activations.
-        lora_up: (N, R) fp LoRA up-projection weight.
-        bias: (N,) fp bias or None.
-        act_unsigned: if True, activations are stored as uint4 in [0, 15] with
-            an implicit -8 offset (used after GELU when activations are all positive).
+        lora_up: (N, R) LoRA up-projection weight.
+        bias: (N,) bias or None.
+        act_unsigned: if True, interpret packed activations as unsigned [0, 15]
+            (matches the u4.s4 MMA path used for post-GELU+shift fc2 layers).
 
     Returns:
-        out: (M, N) fp in the dtype of wscales/lora_up.
+        out: (M, N) in the dtype of wscales/lora_up.
     """
     M, K_half = act.shape
     N = wgt.shape[0]
@@ -207,7 +267,7 @@ def _op_quantize_svdquant_w4a4(
     lora_down: torch.Tensor,
     pad_size: int = 256,
     act_unsigned: bool = False,
-    shift_value: float = 0.0,
+    lora_x: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from comfy_kitchen.registry import registry
 
@@ -217,7 +277,7 @@ def _op_quantize_svdquant_w4a4(
         "lora_down": lora_down,
         "pad_size": pad_size,
         "act_unsigned": act_unsigned,
-        "shift_value": shift_value,
+        "lora_x": lora_x,
     }
     impl = registry.get_implementation("quantize_svdquant_w4a4", kwargs=kwargs)
     return impl(**kwargs)
@@ -225,7 +285,7 @@ def _op_quantize_svdquant_w4a4(
 
 @_op_quantize_svdquant_w4a4.register_fake
 def _op_quantize_svdquant_w4a4_fake(
-    x, smooth, lora_down, pad_size=256, act_unsigned=False, shift_value=0.0,
+    x, smooth, lora_down, pad_size=256, act_unsigned=False, lora_x=None,
 ):
     M, K = x.shape
     R = lora_down.shape[1]
