@@ -48,6 +48,8 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 
 _INT4_GROUP_SIZE = 64
+_TILE_PACKED_BLOCK_N = 128
+_TILE_PACKED_INTERLEAVE = 4
 # Quantizer emission ranges (not the same as the 4-bit storage range — see
 # module header). Symmetric absmax quantization uses scale = max/_INT4_MAX and
 # clamps to [-_INT4_MAX, +_INT4_MAX]; -8 is representable by the nibble but is
@@ -105,6 +107,40 @@ def _unpack_uint4_row_major(packed: torch.Tensor) -> torch.Tensor:
     hi = (x32 >> 4) & 0x0F
     stacked = torch.stack([lo, hi], dim=-1)
     return stacked.reshape(*packed.shape[:-1], -1).to(torch.int8)
+
+
+def _tile_packed_weight_to_row_major(packed: torch.Tensor) -> torch.Tensor:
+    """Convert kitchen_tile_packed_w4a4 weight to natural (N, K//2)."""
+    if packed.dim() != 4:
+        return packed
+    n_tiles, k_groups, n_quads, bytes_per_quad = packed.shape
+    if n_quads != _TILE_PACKED_BLOCK_N // _TILE_PACKED_INTERLEAVE:
+        raise ValueError(f"unexpected tile-packed N quads: {n_quads}")
+    if bytes_per_quad != _TILE_PACKED_INTERLEAVE * (_INT4_GROUP_SIZE // 2):
+        raise ValueError(f"unexpected tile-packed byte axis: {bytes_per_quad}")
+    return packed.view(
+        n_tiles, k_groups, n_quads, _TILE_PACKED_INTERLEAVE, _INT4_GROUP_SIZE // 2,
+    ).permute(0, 2, 3, 1, 4).contiguous().view(
+        n_tiles * _TILE_PACKED_BLOCK_N, k_groups * (_INT4_GROUP_SIZE // 2),
+    )
+
+
+def _tile_packed_scales_to_natural(wscales: torch.Tensor) -> torch.Tensor:
+    """Convert tile-packed wscales (N/128, K/G, 128) to natural (K/G, N)."""
+    if wscales.dim() != 3:
+        return wscales
+    return wscales.permute(1, 0, 2).contiguous().view(
+        wscales.shape[1], wscales.shape[0] * _TILE_PACKED_BLOCK_N,
+    )
+
+
+def _tile_packed_lora_up_to_natural(lora_up: torch.Tensor) -> torch.Tensor:
+    """Convert tile-packed proj_up (N/128, R, 128) to natural (N, R)."""
+    if lora_up.dim() != 3:
+        return lora_up
+    return lora_up.permute(0, 2, 1).contiguous().view(
+        lora_up.shape[0] * _TILE_PACKED_BLOCK_N, lora_up.shape[1],
+    )
 
 
 def quantize_svdquant_w4a4(
@@ -206,11 +242,12 @@ def scaled_mm_svdquant_w4a4(
         act: (M, K // 2) int8 packed activations from quantize_svdquant_w4a4.
             Bit-pattern interpretation depends on act_unsigned (signed [-7,7]
             vs unsigned [0,15]).
-        wgt: (N, K // 2) int8 packed weights (kitchen natural row-major).
+        wgt: (N, K // 2) int8 packed weights (kitchen natural row-major) or
+            (N/128, K/64, 32, 128) kitchen_tile_packed_w4a4.
         ascales: (K // 64, M) per-row per-group activation scales.
-        wscales: (K // 64, N) per-group weight scales.
+        wscales: (K // 64, N) natural or (N/128, K/64, 128) tile-packed.
         lora_act_in: (M, R) fp32 LoRA down-projection activations.
-        lora_up: (N, R) LoRA up-projection weight.
+        lora_up: (N, R) natural or (N/128, R, 128) tile-packed.
         bias: (N,) bias or None.
         act_unsigned: if True, interpret packed activations as unsigned [0, 15]
             (matches the u4.s4 MMA path used for post-GELU+shift fc2 layers).
@@ -218,6 +255,10 @@ def scaled_mm_svdquant_w4a4(
     Returns:
         out: (M, N) in the dtype of wscales/lora_up.
     """
+    wgt = _tile_packed_weight_to_row_major(wgt)
+    wscales = _tile_packed_scales_to_natural(wscales)
+    lora_up = _tile_packed_lora_up_to_natural(lora_up)
+
     m, k_half = act.shape
     n = wgt.shape[0]
     k = k_half * 2
@@ -319,5 +360,5 @@ def _op_scaled_mm_svdquant_w4a4_fake(
     act, wgt, ascales, wscales, lora_act_in, lora_up, bias=None, act_unsigned=False,
 ):
     m = act.shape[0]
-    n = wgt.shape[0]
+    n = wgt.shape[0] * _TILE_PACKED_BLOCK_N if wgt.dim() == 4 else wgt.shape[0]
     return torch.empty(m, n, dtype=lora_up.dtype, device=act.device)

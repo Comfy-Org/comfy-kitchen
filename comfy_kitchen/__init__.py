@@ -261,13 +261,11 @@ def quantize_svdquant_w4a4(
             Pass raw (un-shifted) x when x has been pre-shifted for unsigned path.
 
     Returns:
-        (quantized_x uint8 [M_pad, K//2], ascales [K//64, M_pad], lora_act fp32 [M_pad, R])
+        (quantized_x uint8 [M_pad, K//2], ascales [K//64, M_pad], lora_act [M_pad, R])
 
-    Note: the returned lora_act is a fp32 buffer, but under the CUDA backend it
-    carries bf16-matmul precision (the output of a bf16 x bf16 torch matmul
-    upcast to fp32), not fp32-accumulated precision. The eager backend runs the
-    LoRA matmul in fp32 for numerical stability, which makes it a high-precision
-    reference rather than a bit-parity oracle for the CUDA path.
+    Note: eager returns fp32 lora_act as a high-precision reference. The CUDA
+    backend returns lora_act in x.dtype because the runtime epilogue consumes it
+    as bf16/fp16; this avoids an otherwise redundant cast/allocation.
     """
     return torch.ops.comfy_kitchen.quantize_svdquant_w4a4(
         x, smooth, lora_down, pad_size, act_unsigned, lora_x,
@@ -287,22 +285,20 @@ def scaled_mm_svdquant_w4a4(
     """SVDQuant W4A4 int4 GEMM + LoRA-up + bias.
 
     Computes out = int4_matmul(act, wgt, ascales, wscales) + lora_act_in @ lora_up^T + bias.
-    The int4 MMA + per-group dequant happens in one CUDA kernel. LoRA-up and
-    bias are applied in the wrapper (bf16 addmm_ into the bf16/fp16 output
-    buffer — faster than kernel fusion for small R, at the cost of the fp32
-    precision carried by lora_act_in). If LoRA-up precision ever becomes a
-    quality blocker, the correct next step is a dedicated cuBLASLt helper with
-    16-bit operand + fp32 accumulate (matches nunchaku's lora.cuh), not a
-    Python-level .float() upcast which would undo the memory/perf win.
+    The CUDA backend performs int4 MMA + per-group dequant + bias in one
+    kernel and, when lora_act_in/proj_up layout and dtype allow it, fuses
+    LoRA-up into the same writeback epilogue with bf16/fp16 tensor-core MMA.
+    Unsupported combinations fall back to the wrapper's bf16/fp16 addmm_ path.
 
     Args:
         act: (M, K//2) uint8 packed activations from quantize_svdquant_w4a4.
-        wgt: (N, K//2) int8 packed weights (natural row-major).
+        wgt: (N, K//2) int8 packed weights (natural row-major), or backend
+            specific tile-packed storage.
         ascales: (K//64, M) activation scales.
         wscales: (K//64, N) weight scales.
-        lora_act_in: (M, R) fp32 LoRA activations from quantize step. Note:
-            the fp32 precision is dropped at the bf16 addmm_ below.
-        lora_up: (N, R) LoRA up projection weight.
+        lora_act_in: (M, R) LoRA activations from quantize step.
+        lora_up: (N, R) LoRA up projection weight, or matching tile-packed
+            storage for tile-packed weights.
         bias: optional (N,) bias.
         act_unsigned: if True, activations are interpreted as unsigned [0,15] by
             u4.s4 MMA (for post-GELU+shift fc2). Caller pre-shifts.

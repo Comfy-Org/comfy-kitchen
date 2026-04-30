@@ -161,6 +161,10 @@ extern "C" {
         int R,
         int act_unsigned,
         int out_dtype_code,
+        int tile_packed,
+        int fast_accum,
+        int shared_scale,
+        int fuse_lora,
         cudaStream_t stream);
 
     // AWQ W4A16 — see ops/awq_w4a16.cu. Internal M-routing picks
@@ -570,13 +574,36 @@ void svdquant_scaled_mm_w4a4(
     nb::ndarray<nb::device::cuda> bias,          // (N,) or empty
     nb::ndarray<nb::device::cuda> out,           // (M, N)
     bool act_unsigned,
+    bool fast_accum,
+    bool shared_scale,
+    bool fuse_lora,
     uintptr_t stream_ptr)
 {
     int M = static_cast<int>(act.shape(0));
-    int N = static_cast<int>(wgt.shape(0));
     int K = static_cast<int>(act.shape(1)) * 2;
+    const bool tile_packed = (wgt.ndim() == 4);
+    int N = tile_packed ? static_cast<int>(wgt.shape(0)) * 128 : static_cast<int>(wgt.shape(0));
     int R = static_cast<int>(lora_act_in.shape(1));
     int out_code = svdquant_dtype_code(out.dtype());
+    if (fuse_lora && svdquant_dtype_code(lora_act_in.dtype()) != out_code) {
+        throw std::runtime_error(
+            "svdquant_scaled_mm_w4a4: fused LoRA-up requires lora_act_in dtype "
+            "to match output/lora_up dtype");
+    }
+
+    if (tile_packed) {
+        if (wgt.shape(1) != K / 64 || wgt.shape(2) != 32 || wgt.shape(3) != 128) {
+            throw std::runtime_error(
+                "svdquant_scaled_mm_w4a4: tile-packed weight must have shape "
+                "(N/128, K/64, 32, 128)");
+        }
+        if (wscales.ndim() != 3 || wscales.shape(0) != wgt.shape(0) ||
+            wscales.shape(1) != K / 64 || wscales.shape(2) != 128) {
+            throw std::runtime_error(
+                "svdquant_scaled_mm_w4a4: tile-packed wscales must have shape "
+                "(N/128, K/64, 128)");
+        }
+    }
 
     const void* bias_ptr = (bias.data() != nullptr && bias.size() > 0) ? bias.data() : nullptr;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
@@ -586,7 +613,9 @@ void svdquant_scaled_mm_w4a4(
         lora_act_in.data(), lora_up.data(), bias_ptr,
         out.data(),
         M, N, K, R,
-        static_cast<int>(act_unsigned), out_code, stream);
+        static_cast<int>(act_unsigned), out_code,
+        static_cast<int>(tile_packed), static_cast<int>(fast_accum),
+        static_cast<int>(shared_scale), static_cast<int>(fuse_lora), stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -712,6 +741,9 @@ NB_MODULE(_C, m) {
           nb::arg("bias"),
           nb::arg("out"),
           nb::arg("act_unsigned"),
+          nb::arg("fast_accum"),
+          nb::arg("shared_scale"),
+          nb::arg("fuse_lora"),
           nb::arg("stream_ptr"));
 
     m.def("awq_w4a16", &awq_w4a16,

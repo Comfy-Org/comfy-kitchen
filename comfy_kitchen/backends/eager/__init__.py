@@ -141,15 +141,14 @@ def _build_constraints() -> dict:
                 ),
                 "wgt": ParamConstraint(
                     dtypes=frozenset({torch.int8}),
-                    shape_rules=(ExactDims(2),),
                 ),
                 "ascales": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
-                "wscales": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+                "wscales": ParamConstraint(dtypes=standard_floats),
                 "lora_act_in": ParamConstraint(
-                    dtypes=frozenset({torch.float32}),
+                    dtypes=standard_floats,
                     shape_rules=(ExactDims(2),),
                 ),
-                "lora_up": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+                "lora_up": ParamConstraint(dtypes=standard_floats),
             },
             default_devices=all_devices,
         ),

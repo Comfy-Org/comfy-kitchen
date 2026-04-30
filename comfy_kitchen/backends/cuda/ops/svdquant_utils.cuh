@@ -147,6 +147,85 @@ __forceinline__ __device__ void mma_m16n8k64_u4s4s32(
 }
 
 // ---------------------------------------------------------------------------
+// bf16/fp16 tensor-core helpers for LoRA-up epilogues:
+//   mma.sync.aligned.m16n8k16.row.col.f32.{bf16|f16}.{bf16|f16}.f32
+//
+// Shared-memory fragments follow the same lane mapping as the int4 output
+// fragment used by mma_m16n8k64_* above:
+//   d[0]: row=lane/4,   col=(lane%4)*2
+//   d[1]: row=lane/4,   col=(lane%4)*2+1
+//   d[2]: row=lane/4+8, col=(lane%4)*2
+//   d[3]: row=lane/4+8, col=(lane%4)*2+1
+// ---------------------------------------------------------------------------
+__forceinline__ __device__ uint32_t cvta_smem_u32(const void* ptr) {
+    uint32_t s;
+#if __CUDA_ARCH__ >= 800
+    asm("{ .reg .u64 ll; cvta.to.shared.u64 ll, %1; cvt.u32.u64 %0, ll; }"
+        : "=r"(s) : "l"(ptr));
+#else
+    s = 0;
+    (void)ptr;
+#endif
+    return s;
+}
+
+__forceinline__ __device__ void ldmatrix_x4(uint32_t (&dst)[4], uint32_t addr) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+                 "{%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(dst[0]), "=r"(dst[1]), "=r"(dst[2]), "=r"(dst[3])
+                 : "r"(addr));
+#else
+    dst[0] = dst[1] = dst[2] = dst[3] = 0;
+    (void)addr;
+#endif
+}
+
+template<typename T>
+__device__ __forceinline__ void mma_m16n8k16_f32(
+    float (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]);
+
+template<>
+__device__ __forceinline__ void mma_m16n8k16_f32<__nv_bfloat16>(
+    float (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2])
+{
+#if __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]),
+          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+#else
+    (void)a; (void)b;
+#endif
+}
+
+template<>
+__device__ __forceinline__ void mma_m16n8k16_f32<__half>(
+    float (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2])
+{
+#if __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]),
+          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+#else
+    (void)a; (void)b;
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // cp.async.cg.shared.global — 16-byte async copy from GMEM to SMEM.
 // "cg" = "cache-global": bypass L1, go through L2 for smaller footprint.
 // ---------------------------------------------------------------------------

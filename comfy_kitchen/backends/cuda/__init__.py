@@ -497,6 +497,42 @@ def apply_rope(
 # ---------------------------------------------------------------------------
 
 _SVDQUANT_W4A4_GROUP_SIZE = 64
+_SVDQUANT_W4A4_BLOCK_N = 128
+_SVDQUANT_WORKSPACE_CACHE: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+
+def _is_svdquant_tile_packed_weight(wgt: torch.Tensor) -> bool:
+    return wgt.dim() == 4
+
+
+def _svdquant_out_features_from_weight(wgt: torch.Tensor) -> int:
+    if _is_svdquant_tile_packed_weight(wgt):
+        return int(wgt.shape[0]) * _SVDQUANT_W4A4_BLOCK_N
+    return int(wgt.shape[0])
+
+
+def _natural_lora_up_from_tile_packed(lora_up: torch.Tensor) -> torch.Tensor:
+    """Return a natural (N, R) view/copy for tile-packed proj_up.
+
+    Converter layout is (N/128, R, 128). cuBLAS addmm_ wants a natural
+    row-major (N, R) tensor. Cache the one-time reorder on the source tensor so
+    the runtime path keeps cuBLAS speed without paying a per-forward permute.
+    """
+    if lora_up.dim() != 3:
+        return lora_up
+    cached = getattr(lora_up, "_ck_natural_lora_up", None)
+    if (
+        cached is not None
+        and cached.device == lora_up.device
+        and cached.dtype == lora_up.dtype
+        and cached.shape == (lora_up.shape[0] * _SVDQUANT_W4A4_BLOCK_N, lora_up.shape[1])
+    ):
+        return cached
+    natural = lora_up.permute(0, 2, 1).reshape(
+        lora_up.shape[0] * _SVDQUANT_W4A4_BLOCK_N, lora_up.shape[1],
+    ).contiguous()
+    lora_up._ck_natural_lora_up = natural
+    return natural
 
 
 def quantize_svdquant_w4a4(
@@ -506,6 +542,7 @@ def quantize_svdquant_w4a4(
     pad_size: int = 256,
     act_unsigned: bool = False,
     lora_x: torch.Tensor | None = None,
+    reuse_workspace: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """SVDQuant W4A4 activation quantize + smooth + LoRA-down (CUDA).
 
@@ -516,7 +553,7 @@ def quantize_svdquant_w4a4(
       lora_x    (M, K)       bf16/fp16  pre-shift x for LoRA (defaults to x)
       q_x       (M_pad, K/2) int8       two int4 per byte
       ascales   (K/G, M_pad) bf16/fp16  per-row per-group
-      lora_act  (M_pad, R)   fp32
+      lora_act  (M_pad, R)   bf16/fp16 by default (same dtype as x)
 
     act_unsigned=True selects scale=max/15 + clamp [0,15] (u4 bit patterns for
     downstream u4.s4 MMA). Caller must ensure x is non-negative — shift is a
@@ -530,11 +567,30 @@ def quantize_svdquant_w4a4(
     g = _SVDQUANT_W4A4_GROUP_SIZE
     assert k % g == 0, f"K={k} must be divisible by group_size={g}"
 
-    q_x = torch.empty(m_pad, k // 2, dtype=torch.uint8, device=x.device)
-    ascales = torch.empty(k // g, m_pad, dtype=x.dtype, device=x.device)
-    lora_act = torch.empty(m_pad, r, dtype=torch.float32, device=x.device)
-
+    lora_act_dtype = torch.float32 if os.getenv(
+        "COMFY_KITCHEN_SVDQUANT_LORA_ACT_FP32", ""
+    ).lower() in {"1", "true", "yes", "on"} else x.dtype
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    reuse_workspace = reuse_workspace and os.getenv(
+        "COMFY_KITCHEN_SVDQUANT_REUSE_WORKSPACE", "1"
+    ).lower() not in {"0", "false", "no", "off"}
+    if reuse_workspace:
+        device_index = x.device.index if x.device.index is not None else torch.cuda.current_device()
+        key = (device_index, int(stream_ptr), x.dtype, lora_act_dtype, m_pad, k, r)
+        cached = _SVDQUANT_WORKSPACE_CACHE.get(key)
+        if cached is None:
+            cached = (
+                torch.empty(m_pad, k // 2, dtype=torch.uint8, device=x.device),
+                torch.empty(k // g, m_pad, dtype=x.dtype, device=x.device),
+                torch.empty(m_pad, r, dtype=lora_act_dtype, device=x.device),
+            )
+            _SVDQUANT_WORKSPACE_CACHE[key] = cached
+        q_x, ascales, lora_act = cached
+    else:
+        q_x = torch.empty(m_pad, k // 2, dtype=torch.uint8, device=x.device)
+        ascales = torch.empty(k // g, m_pad, dtype=x.dtype, device=x.device)
+        lora_act = torch.empty(m_pad, r, dtype=lora_act_dtype, device=x.device)
+
     _C.svdquant_quantize_w4a4(
         _wrap_for_dlpack(x),
         _wrap_for_dlpack(smooth),
@@ -547,15 +603,18 @@ def quantize_svdquant_w4a4(
     )
 
     # LoRA-down uses un-shifted, un-smoothed x (SVDQuant invariant). Pure bf16
-    # matmul: torch's bf16 @ bf16 returns a bf16 tensor, which we then upcast to
-    # the fp32 lora_act buffer. This is NOT the same as nunchaku's 16-bit-operand
-    # + fp32-accumulate LoRA path (src/kernels/zgemm/lora.cuh:164/284) — the
-    # bf16 output is effectively a rounded approximation to the fp32-accumulated
-    # result (~8e-3 abs error vs true fp32). Accepts lora_x to let callers keep
-    # LoRA on the raw pre-quantization activation when x has been pre-shifted.
+    # matmul returns bf16/fp16, which is exactly what scaled_mm's Python
+    # epilogue consumes. Keeping this buffer 16-bit avoids a per-layer fp32
+    # allocation and a later fp32->bf16/fp16 cast without changing CUDA-path
+    # numerics. Set COMFY_KITCHEN_SVDQUANT_LORA_ACT_FP32=1 to force the older
+    # fp32 staging buffer if a quality regression is suspected.
     lora_src = lora_x if lora_x is not None else x
     if m > 0:
-        lora_act[:m].copy_(lora_src @ lora_down, non_blocking=True)
+        lora_act_rows = lora_act[:m]
+        if lora_act_rows.dtype == lora_src.dtype and lora_act_rows.is_contiguous():
+            torch.mm(lora_src, lora_down, out=lora_act_rows)
+        else:
+            lora_act_rows.copy_(lora_src @ lora_down, non_blocking=True)
     if m_pad > m:
         lora_act[m:].zero_()
     return q_x.view(torch.int8), ascales, lora_act
@@ -573,26 +632,49 @@ def scaled_mm_svdquant_w4a4(
 ) -> torch.Tensor:
     """SVDQuant W4A4 int4 GEMM + LoRA-up + bias (CUDA).
 
-    int4 MMA + per-group dequant in one kernel; LoRA-up + bias are applied in
-    Python via cuBLAS bf16 addmm_ (see the body below — faster than in-kernel
-    fusion for R=96 and similar small ranks).
+    int4 MMA + per-group dequant + bias run in one kernel. By default, when
+    lora_act_in already has the output dtype and proj_up's layout matches the
+    weight layout, LoRA-up is fused into the CUDA epilogue with bf16/fp16
+    tensor-core MMA. Set COMFY_KITCHEN_SVDQUANT_FUSE_LORA_UP=0 to force the
+    older Python/cuBLAS addmm_ epilogue for comparison.
 
     Kitchen-native layouts:
       act         (M, K/2)   int8       two int4 per byte (signed or unsigned)
       wgt         (N, K/2)   int8       signed int4 weight, natural row-major
+        or        (N/128, K/64, 32, 128) int8 kitchen_tile_packed_w4a4
       ascales     (K/G, M)   bf16/fp16  per-row per-group
       wscales     (K/G, N)   bf16/fp16  per-col per-group
-      lora_act_in (M, R)     fp32
-      lora_up     (N, R)     bf16/fp16
-      bias        (N,)       bf16/fp16  (optional)
+        or        (N/128, K/G, 128) bf16/fp16 for tile-packed wgt
+      lora_act_in (M, R)     bf16/fp16 or fp32
+      lora_up     (N, R) or (N/128, R, 128) bf16/fp16
+      bias        (N,) or (N/128, 128) bf16/fp16  (optional)
       out         (M, N)     bf16/fp16  (= lora_up.dtype)
 
     act_unsigned: if True, A fragments go through u4.s4 MMA instead of s4.s4.
+    Set COMFY_KITCHEN_SVDQUANT_FAST_ACCUM=1 to use the experimental packed
+    half2/bfloat162 accumulator instead of the default fp32 accumulator.
     """
     m = act.shape[0]
-    n = wgt.shape[0]
+    n = _svdquant_out_features_from_weight(wgt)
     out = torch.empty(m, n, dtype=lora_up.dtype, device=act.device)
     empty = torch.empty(0, dtype=lora_up.dtype, device=act.device)
+    fast_accum = os.getenv("COMFY_KITCHEN_SVDQUANT_FAST_ACCUM", "").lower() in {
+        "1", "true", "yes", "on",
+    }
+    shared_scale_env = os.getenv("COMFY_KITCHEN_SVDQUANT_SHARED_SCALE")
+    if shared_scale_env is None:
+        shared_scale = _is_svdquant_tile_packed_weight(wgt)
+    else:
+        shared_scale = shared_scale_env.lower() in {"1", "true", "yes", "on"}
+    lora_up_layout_matches_wgt = (
+        _is_svdquant_tile_packed_weight(wgt) == (lora_up.dim() == 3)
+    )
+    fuse_lora_env = os.getenv("COMFY_KITCHEN_SVDQUANT_FUSE_LORA_UP")
+    fuse_lora = (
+        lora_act_in.dtype == out.dtype
+        and lora_up_layout_matches_wgt
+        and (fuse_lora_env is None or fuse_lora_env.lower() in {"1", "true", "yes", "on"})
+    )
 
     stream_ptr = torch.cuda.current_stream(act.device).cuda_stream
     _C.svdquant_scaled_mm_w4a4(
@@ -605,23 +687,18 @@ def scaled_mm_svdquant_w4a4(
         _wrap_for_dlpack(bias if bias is not None else empty),
         _wrap_for_dlpack(out),
         act_unsigned,
+        fast_accum,
+        shared_scale,
+        fuse_lora,
         stream_ptr,
     )
 
-    # LoRA-up + bias via bf16 addmm_. lora_act_in is fp32 but we drop it to bf16
-    # here before the matmul so `out` stays bf16/fp16 throughout — this avoids
-    # allocating a fp32 temporary, at the cost of the fp32 precision carried by
-    # lora_act_in. The (fp32 out_of_quantize) -> (bf16 truncate) -> (bf16 matmul)
-    # -> (bf16 addmm into out) chain is lossier than nunchaku's 16-bit-operand +
-    # fp32-accumulate LoRA (src/kernels/zgemm/lora.cuh:284); kitchen accepts that
-    # tradeoff for the memory/launch-count win. If that ever shows up in model
-    # quality, replace this pair of matmuls with a dedicated cuBLASLt helper
-    # (16-bit operand, fp32 accumulate) rather than Python-level .float() casts,
-    # which would undo the memory/perf gain that motivated the bf16 path.
-    lora_bf16 = lora_act_in.to(out.dtype)
-    out.addmm_(lora_bf16, lora_up.t())
-    if bias is not None:
-        out.add_(bias)
+    if not fuse_lora:
+        # LoRA-up via bf16/fp16 addmm_. CUDA quantize normally returns lora_act
+        # in out.dtype, so the common unfused comparison path avoids a cast.
+        lora_bf16 = lora_act_in if lora_act_in.dtype == out.dtype else lora_act_in.to(out.dtype)
+        lora_up_mm = _natural_lora_up_from_tile_packed(lora_up)
+        out.addmm_(lora_bf16, lora_up_mm.t())
     return out
 
 
@@ -853,10 +930,12 @@ def _build_constraints() -> dict:
         "scaled_mm_svdquant_w4a4": FunctionConstraints(
             params={
                 "act": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
-                "wgt": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+                "wgt": ParamConstraint(dtypes=frozenset({torch.int8})),
                 "ascales": ParamConstraint(dtypes=frozenset({torch.float16, torch.bfloat16})),
                 "wscales": ParamConstraint(dtypes=frozenset({torch.float16, torch.bfloat16})),
-                "lora_act_in": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "lora_act_in": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16})
+                ),
                 "lora_up": ParamConstraint(dtypes=frozenset({torch.float16, torch.bfloat16})),
             },
             default_devices=cuda_devices,

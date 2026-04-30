@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import comfy_kitchen as ck
 from comfy_kitchen.backends.eager.svdquant import (
@@ -22,10 +23,181 @@ from comfy_kitchen.backends.eager.svdquant import (
     _unpack_int4_row_major,
     _unpack_uint4_row_major,
 )
+from comfy_kitchen.tensor import (
+    QuantizedTensor,
+    TensorCoreSVDQuantW4A4Layout,
+    svdquant_w4a4_can_share_quant,
+    svdquant_w4a4_fuse_linear_weights,
+    svdquant_w4a4_fused_grouped_linear,
+    svdquant_w4a4_grouped_linear,
+)
 
 from .conftest import assert_values_close
 
 _GROUP = 64
+_TILE_BN = 128
+_TILE_INTERLEAVE = 4
+
+
+def _pack_tile_packed_weight(w_int4: torch.Tensor) -> torch.Tensor:
+    """Pack dense signed-int4 (N, K) values into kitchen_tile_packed_w4a4."""
+    n, k = w_int4.shape
+    if n % _TILE_BN != 0:
+        raise ValueError(f"N={n} must be divisible by {_TILE_BN}")
+    if k % _GROUP != 0:
+        raise ValueError(f"K={k} must be divisible by {_GROUP}")
+    w = w_int4.view(
+        n // _TILE_BN, _TILE_BN // _TILE_INTERLEAVE, _TILE_INTERLEAVE, k // _GROUP, _GROUP,
+    ).permute(0, 3, 1, 2, 4).contiguous()
+    lo = w[..., 0::2].to(torch.int32) & 0x0F
+    hi = (w[..., 1::2].to(torch.int32) & 0x0F) << 4
+    return (lo | hi).to(torch.int8).view(
+        n // _TILE_BN, k // _GROUP, _TILE_BN // _TILE_INTERLEAVE,
+        _TILE_INTERLEAVE * _GROUP // 2,
+    )
+
+
+def _pack_n_interleaved(t: torch.Tensor) -> torch.Tensor:
+    """Pack natural (N, ...) tensors into (N/128, ..., 128)."""
+    n = t.shape[0]
+    if n % _TILE_BN != 0:
+        raise ValueError(f"N={n} must be divisible by {_TILE_BN}")
+    return t.view(n // _TILE_BN, _TILE_BN, *t.shape[1:]).movedim(1, -1).contiguous()
+
+
+def _pack_natural_int4(w_int4: torch.Tensor) -> torch.Tensor:
+    lo = w_int4[..., 0::2].to(torch.int32) & 0x0F
+    hi = (w_int4[..., 1::2].to(torch.int32) & 0x0F) << 4
+    return (lo | hi).to(torch.int8)
+
+
+def _make_svdquant_qtensor(
+    *,
+    n: int,
+    k: int,
+    r: int,
+    smooth: torch.Tensor,
+    proj_down: torch.Tensor,
+    dtype: torch.dtype,
+    device: str,
+) -> tuple[QuantizedTensor, torch.Tensor]:
+    wgt_int = torch.randint(-7, 8, (n, k), dtype=torch.int8, device=device)
+    wgt = _pack_natural_int4(wgt_int)
+    wscales = torch.rand(k // _GROUP, n, dtype=dtype, device=device) * 0.5 + 0.1
+    proj_up = torch.randn(n, r, dtype=dtype, device=device) * 0.05
+    bias = torch.randn(n, dtype=dtype, device=device) * 0.01
+    params = TensorCoreSVDQuantW4A4Layout.Params(
+        scale=wscales,
+        orig_dtype=dtype,
+        orig_shape=(n, k),
+        proj_down=proj_down,
+        proj_up=proj_up,
+        smooth_factor=smooth,
+    )
+    return QuantizedTensor(wgt, "TensorCoreSVDQuantW4A4Layout", params), bias
+
+
+# =============================================================================
+# Runtime split-QKV grouping
+# =============================================================================
+
+
+class TestGroupedSplitQKV:
+    def test_grouped_linear_matches_individual_eager(self, seed):
+        m0, m1, n, k, r = 2, 7, 128, 128, 16
+        dtype = torch.float32
+        device = "cpu"
+        x = torch.randn(m0, m1, k, dtype=dtype, device=device) * 0.3
+        smooth = torch.rand(k, dtype=dtype, device=device) * 0.5 + 0.75
+        proj_down = torch.randn(k, r, dtype=dtype, device=device) * 0.05
+
+        weights = []
+        biases = []
+        for _ in range(3):
+            weight, bias = _make_svdquant_qtensor(
+                n=n,
+                k=k,
+                r=r,
+                smooth=smooth.clone(),
+                proj_down=proj_down.clone(),
+                dtype=dtype,
+                device=device,
+            )
+            weights.append(weight)
+            biases.append(bias)
+
+        assert not svdquant_w4a4_can_share_quant(weights, validate=False)
+        assert svdquant_w4a4_can_share_quant(weights, validate=True)
+
+        with ck.use_backend("eager"):
+            grouped = svdquant_w4a4_grouped_linear(
+                x, weights, biases, validate_shared_quant=True,
+            )
+            expected = tuple(F.linear(x, weight, bias) for weight, bias in zip(weights, biases))
+
+        assert len(grouped) == 3
+        for idx, (actual, ref) in enumerate(zip(grouped, expected, strict=True)):
+            assert_values_close(actual, ref, rtol=0.0, atol=0.0, name=f"grouped qkv {idx}")
+
+    def test_grouped_linear_can_trust_prevalidated_copies(self, seed):
+        n, k, r = 128, 128, 16
+        dtype = torch.float32
+        device = "cpu"
+        smooth = torch.rand(k, dtype=dtype, device=device) * 0.5 + 0.75
+        proj_down = torch.randn(k, r, dtype=dtype, device=device) * 0.05
+        weights = [
+            _make_svdquant_qtensor(
+                n=n,
+                k=k,
+                r=r,
+                smooth=smooth.clone(),
+                proj_down=proj_down.clone(),
+                dtype=dtype,
+                device=device,
+            )[0]
+            for _ in range(3)
+        ]
+
+        assert not svdquant_w4a4_can_share_quant(weights, validate=False)
+        assert svdquant_w4a4_can_share_quant(weights, validate=True)
+        assert svdquant_w4a4_can_share_quant(weights, trust=True)
+
+    def test_runtime_fused_qkv_matches_individual_eager(self, seed):
+        m0, m1, n, k, r = 2, 5, 128, 128, 16
+        dtype = torch.float32
+        device = "cpu"
+        x = torch.randn(m0, m1, k, dtype=dtype, device=device) * 0.3
+        smooth = torch.rand(k, dtype=dtype, device=device) * 0.5 + 0.75
+        proj_down = torch.randn(k, r, dtype=dtype, device=device) * 0.05
+
+        weights = []
+        biases = []
+        for _ in range(3):
+            weight, bias = _make_svdquant_qtensor(
+                n=n,
+                k=k,
+                r=r,
+                smooth=smooth.clone(),
+                proj_down=proj_down.clone(),
+                dtype=dtype,
+                device=device,
+            )
+            weights.append(weight)
+            biases.append(bias)
+
+        fused_weight, fused_bias, splits = svdquant_w4a4_fuse_linear_weights(
+            weights, biases, validate_shared_quant=True,
+        )
+        assert splits == (n, n, n)
+        assert fused_weight.shape == (3 * n, k)
+        assert fused_bias.shape == (3 * n,)
+
+        with ck.use_backend("eager"):
+            fused = svdquant_w4a4_fused_grouped_linear(x, fused_weight, fused_bias, splits)
+            expected = tuple(F.linear(x, weight, bias) for weight, bias in zip(weights, biases))
+
+        for idx, (actual, ref) in enumerate(zip(fused, expected, strict=True)):
+            assert_values_close(actual, ref, rtol=0.0, atol=0.0, name=f"fused qkv {idx}")
 
 
 # =============================================================================
@@ -304,3 +476,149 @@ class TestSvdquantSmoke:
         assert out.shape[0] >= m  # padded to pad_size
         assert out.shape[1] == n
         assert torch.isfinite(out).all()
+
+    @pytest.mark.parametrize("fast_accum", [False, True])
+    def test_tile_packed_matches_natural_cuda(self, cuda_available, seed, monkeypatch, fast_accum):
+        """Tile-packed storage should be a layout-only change vs natural CUDA."""
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        if fast_accum:
+            monkeypatch.setenv("COMFY_KITCHEN_SVDQUANT_FAST_ACCUM", "1")
+        else:
+            monkeypatch.delenv("COMFY_KITCHEN_SVDQUANT_FAST_ACCUM", raising=False)
+
+        m, n, k, r = 64, 256, 256, 32
+        device = "cuda"
+        x = torch.randn(m, k, dtype=torch.bfloat16, device=device) * 0.3
+        smooth = torch.rand(k, dtype=torch.bfloat16, device=device) * 0.5 + 0.75
+        proj_down = torch.randn(k, r, dtype=torch.bfloat16, device=device) * 0.05
+        proj_up = torch.randn(n, r, dtype=torch.bfloat16, device=device) * 0.05
+        bias = torch.randn(n, dtype=torch.bfloat16, device=device) * 0.01
+        wscales = torch.rand(k // _GROUP, n, dtype=torch.bfloat16, device=device) * 0.5 + 0.1
+
+        wgt_int = torch.randint(-7, 8, (n, k), dtype=torch.int8, device=device)
+        lo = wgt_int[..., 0::2].to(torch.int32) & 0x0F
+        hi = (wgt_int[..., 1::2].to(torch.int32) & 0x0F) << 4
+        wgt_natural = (lo | hi).to(torch.int8)
+        wgt_tile = _pack_tile_packed_weight(wgt_int)
+        wscales_tile = _pack_n_interleaved(wscales.t().contiguous())
+        proj_up_tile = _pack_n_interleaved(proj_up)
+
+        with ck.use_backend("cuda"):
+            q_act, asc, la = ck.quantize_svdquant_w4a4(x, smooth, proj_down, pad_size=64)
+            out_natural = ck.scaled_mm_svdquant_w4a4(
+                act=q_act, wgt=wgt_natural, ascales=asc, wscales=wscales,
+                lora_act_in=la, lora_up=proj_up, bias=bias,
+            )
+            out_tile = ck.scaled_mm_svdquant_w4a4(
+                act=q_act, wgt=wgt_tile, ascales=asc, wscales=wscales_tile,
+                lora_act_in=la, lora_up=proj_up_tile, bias=bias,
+            )
+
+        assert out_tile.shape == out_natural.shape
+        assert_values_close(out_tile, out_natural, rtol=0.0, atol=0.0, name="tile-packed vs natural")
+
+    @pytest.mark.parametrize("layout", ["natural", "tile"])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_fused_lora_epilogue_matches_unfused_cuda(self, cuda_available, seed, monkeypatch, layout, dtype):
+        """Fused LoRA-up should match the old cuBLAS addmm_ epilogue to output dtype precision."""
+        if not cuda_available:
+            pytest.skip("CUDA required")
+
+        m, n, k, r = 64, 256, 256, 32
+        device = "cuda"
+        q_act_i = torch.randint(-7, 8, (m, k), dtype=torch.int8, device=device)
+        wgt_i = torch.randint(-7, 8, (n, k), dtype=torch.int8, device=device)
+        q_act = _pack_natural_int4(q_act_i)
+        wgt = _pack_natural_int4(wgt_i)
+        asc = torch.rand(k // _GROUP, m, dtype=dtype, device=device) * 0.05 + 0.005
+        wscales = torch.rand(k // _GROUP, n, dtype=dtype, device=device) * 0.05 + 0.005
+        lora_act = torch.randn(m, r, dtype=dtype, device=device) * 0.1
+        lora_up = torch.randn(n, r, dtype=dtype, device=device) * 0.1
+        bias = torch.randn(n, dtype=dtype, device=device) * 0.01
+
+        if layout == "tile":
+            wgt = _pack_tile_packed_weight(wgt_i)
+            wscales = _pack_n_interleaved(wscales.t().contiguous())
+            lora_up = _pack_n_interleaved(lora_up)
+
+        with ck.use_backend("cuda"):
+            monkeypatch.setenv("COMFY_KITCHEN_SVDQUANT_FUSE_LORA_UP", "0")
+            unfused = ck.scaled_mm_svdquant_w4a4(
+                q_act, wgt, asc, wscales, lora_act, lora_up, bias,
+            )
+            monkeypatch.setenv("COMFY_KITCHEN_SVDQUANT_FUSE_LORA_UP", "1")
+            fused = ck.scaled_mm_svdquant_w4a4(
+                q_act, wgt, asc, wscales, lora_act, lora_up, bias,
+            )
+
+        atol = 1e-2 if dtype is torch.bfloat16 else 1.2e-3
+        assert_values_close(
+            fused.float(), unfused.float(), rtol=0.0, atol=atol,
+            name=f"fused LoRA epilogue vs unfused ({layout}, {dtype})",
+        )
+
+    def test_quantized_tensor_direct_cuda_survives_disabled_registry(self, cuda_available, seed, monkeypatch):
+        """ComfyUI may globally disable comfy_kitchen's CUDA registry entry on
+        older PyTorch CUDA wheels. SVDQuant QuantizedTensor forward should still
+        call the locally built CUDA extension directly when it is available.
+        """
+        if not cuda_available:
+            pytest.skip("CUDA required")
+
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        if not getattr(cuda_backend, "_EXT_AVAILABLE", False):
+            pytest.skip("CUDA extension required")
+
+        m, n, k, r = 32, 128, 128, 16
+        device = "cuda"
+        dtype = torch.bfloat16
+        x = torch.randn(m, k, dtype=dtype, device=device) * 0.3
+        smooth = torch.rand(k, dtype=dtype, device=device) * 0.5 + 0.75
+        proj_down = torch.randn(k, r, dtype=dtype, device=device) * 0.05
+        proj_up = torch.randn(n, r, dtype=dtype, device=device) * 0.05
+        bias = torch.randn(n, dtype=dtype, device=device) * 0.01
+        wscales = torch.rand(k // _GROUP, n, dtype=dtype, device=device) * 0.5 + 0.1
+        wgt_int = torch.randint(-7, 8, (n, k), dtype=torch.int8, device=device)
+        lo = wgt_int[..., 0::2].to(torch.int32) & 0x0F
+        hi = (wgt_int[..., 1::2].to(torch.int32) & 0x0F) << 4
+        wgt = (lo | hi).to(torch.int8)
+        params = TensorCoreSVDQuantW4A4Layout.Params(
+            scale=wscales,
+            orig_dtype=dtype,
+            orig_shape=(n, k),
+            proj_down=proj_down,
+            proj_up=proj_up,
+            smooth_factor=smooth,
+        )
+        qt = QuantizedTensor(wgt, "TensorCoreSVDQuantW4A4Layout", params)
+
+        calls = {"quantize": 0, "scaled_mm": 0}
+        orig_quantize = cuda_backend.quantize_svdquant_w4a4
+        orig_scaled_mm = cuda_backend.scaled_mm_svdquant_w4a4
+
+        def spy_quantize(*args, **kwargs):
+            calls["quantize"] += 1
+            return orig_quantize(*args, **kwargs)
+
+        def spy_scaled_mm(*args, **kwargs):
+            calls["scaled_mm"] += 1
+            return orig_scaled_mm(*args, **kwargs)
+
+        monkeypatch.setattr(cuda_backend, "quantize_svdquant_w4a4", spy_quantize)
+        monkeypatch.setattr(cuda_backend, "scaled_mm_svdquant_w4a4", spy_scaled_mm)
+
+        cuda_was_disabled = ck.list_backends()["cuda"]["disabled"]
+        ck.disable_backend("cuda")
+        try:
+            out = F.linear(x, qt, bias)
+        finally:
+            if cuda_was_disabled:
+                ck.disable_backend("cuda")
+            else:
+                ck.enable_backend("cuda")
+
+        assert out.shape == (m, n)
+        assert torch.isfinite(out).all()
+        assert calls == {"quantize": 1, "scaled_mm": 1}
