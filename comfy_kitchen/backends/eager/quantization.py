@@ -665,3 +665,221 @@ def _op_scaled_mm_mxfp8_fake(
     m = a.shape[0]
     n = b.shape[0]
     return torch.empty((m, n), dtype=out_dtype, device=a.device)
+# =============================================================================
+# INT8 Tensor-wise Quantization (from dxqb/OneTrainer)
+# =============================================================================
+# Simpler approach: single scale per tensor + per-row activation scaling.
+# Uses torch._int_mm for cuBLASLt acceleration on CUDA.
+
+
+def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N].
+
+    Uses torch._int_mm (cuBLASLt on CUDA). Output is int32.
+
+    Args:
+        a: INT8 tensor [M, K].
+        b: INT8 tensor [K, N].
+
+    Returns:
+        INT32 tensor [M, N] with accumulated dot products.
+    """
+    assert a.dtype == torch.int8 and b.dtype == torch.int8
+    assert a.dim() == 2 and b.dim() == 2
+    assert a.size(1) == b.size(0), f"K mismatch: {a.size(1)} vs {b.size(0)}"
+    if hasattr(torch, "int8_mm"):
+        return torch.int8_mm(a, b)
+    return torch._int_mm(a, b)
+
+
+def quantize_int8_tensorwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with single tensorwise scale.
+
+    Args:
+        x: Input tensor of any shape.
+
+    Returns:
+        Tuple of (quantized_int8, scale):
+            - quantized_int8: INT8 tensor with same shape
+            - scale: Scalar float32 tensor
+    """
+    abs_max = x.abs().max()
+    scale = (abs_max.float() / 127.0).clamp(min=1e-30)
+    q = (x.float() / scale).round().clamp(-128.0, 127.0).to(torch.int8)
+    return q, scale
+
+
+def quantize_int8_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with per-row scales (for activations).
+
+    Args:
+        x: Input tensor [..., K] where quantization is per-row.
+
+    Returns:
+        Tuple of (quantized_int8, scales):
+            - quantized_int8: INT8 tensor with same shape
+            - scales: Float32 tensor [..., 1] with per-row scales
+    """
+    abs_max = x.abs().amax(dim=-1, keepdim=True)
+    scale = (abs_max.float() / 127.0).clamp(min=1e-30)
+    q = (x.float() / scale).round().clamp(-128.0, 127.0).to(torch.int8)
+    return q, scale
+
+
+def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize INT8 tensor with scale.
+
+    Args:
+        q: Quantized INT8 tensor.
+        scale: Scale tensor (scalar or broadcastable).
+
+    Returns:
+        Dequantized float tensor.
+    """
+    return q.float() * scale
+
+
+def int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """INT8 linear layer using torch.int8_mm with memory-efficient scaling.
+
+    Quantizes x dynamically per-row, uses tensorwise weight scale.
+    Processes scaling in chunks to avoid materializing large float32 tensors.
+
+    Args:
+        x: Input tensor [..., K].
+        weight: INT8 weight tensor [N, K].
+        weight_scale: Scalar weight scale.
+        bias: Optional bias [N].
+        out_dtype: Output dtype.
+
+    Returns:
+        Result tensor [..., N].
+    """
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1])
+
+    # Quantize input per-row
+    x_8, x_scale = quantize_int8_rowwise(x_2d)
+
+    # Compute: x_8 @ weight.T using torch.int8_mm (public API) or torch._int_mm
+    # weight is [N, K], we need [K, N] for matmul so transpose
+    if hasattr(torch, "int8_mm"):
+        result = torch.int8_mm(x_8, weight.T.contiguous())
+    else:
+        result = torch._int_mm(x_8, weight.T.contiguous())
+
+    # Scale back efficiently: result * (weight_scale * x_scale)
+    # Process in chunks to avoid materializing large float32 tensor
+    # which causes OOM for large models
+
+    M, N = result.shape
+    chunk_size = max(1, min(M, 256 * 1024 * 1024 // (N * 4)))  # Estimate safe chunk size
+
+    scaled_parts = []
+    for i in range(0, M, chunk_size):
+        end_i = min(i + chunk_size, M)
+        chunk = result[i:end_i].float()
+
+        # Apply scales: chunk * (weight_scale * x_scale[i:end_i])
+        chunk_scales = weight_scale * x_scale[i:end_i]
+        chunk_scaled = chunk * chunk_scales
+
+        # Convert to output dtype immediately to free memory
+        chunk_scaled = chunk_scaled.to(out_dtype)
+        scaled_parts.append(chunk_scaled)
+
+    result = torch.cat(scaled_parts, dim=0)
+
+    if bias is not None:
+        result = result + bias.to(device=result.device, dtype=result.dtype)
+
+    return result.reshape(*orig_shape[:-1], weight.shape[0])
+
+
+# =============================================================================
+# torch.library Custom Op Definitions — INT8 Tensor-wise
+# =============================================================================
+
+
+@torch.library.custom_op("comfy_kitchen::quantize_int8_tensorwise", mutates_args=())
+def _op_quantize_int8_tensorwise(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from comfy_kitchen.registry import registry
+
+    kwargs = {"x": x}
+    impl = registry.get_implementation("quantize_int8_tensorwise", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_int8_tensorwise.register_fake
+def _op_quantize_int8_tensorwise_fake(x):
+    q = torch.empty_like(x, dtype=torch.int8)
+    scale = torch.empty((), dtype=torch.float32, device=x.device)
+    return q, scale
+
+
+@torch.library.custom_op("comfy_kitchen::quantize_int8_rowwise", mutates_args=())
+def _op_quantize_int8_rowwise(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from comfy_kitchen.registry import registry
+
+    kwargs = {"x": x}
+    impl = registry.get_implementation("quantize_int8_rowwise", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_int8_rowwise.register_fake
+def _op_quantize_int8_rowwise_fake(x):
+    q = torch.empty_like(x, dtype=torch.int8)
+    scale = torch.empty(*x.shape[:-1], 1, dtype=torch.float32, device=x.device)
+    return q, scale
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int8_simple", mutates_args=())
+def _op_dequantize_int8_simple(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    from comfy_kitchen.registry import registry
+
+    kwargs = {"q": q, "scale": scale}
+    impl = registry.get_implementation("dequantize_int8_simple", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_int8_simple.register_fake
+def _op_dequantize_int8_simple_fake(q, scale):
+    return torch.empty_like(q, dtype=torch.float32)
+
+
+@torch.library.custom_op("comfy_kitchen::int8_linear", mutates_args=())
+def _op_int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    from comfy_kitchen.registry import registry
+
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {"x": x, "weight": weight, "weight_scale": weight_scale, "out_dtype": out_dtype}
+    impl = registry.get_implementation("int8_linear", kwargs=kwargs)
+    result = impl(**kwargs)
+    if bias is not None:
+        result = result + bias.to(device=result.device, dtype=result.dtype)
+    return result
+
+
+@_op_int8_linear.register_fake
+def _op_int8_linear_fake(x, weight, weight_scale, bias, output_dtype_code):
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty(*x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device)

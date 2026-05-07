@@ -12,6 +12,7 @@ from .base import (
 from .fp8 import TensorCoreFP8Layout
 from .mxfp8 import TensorCoreMXFP8Layout
 from .nvfp4 import TensorCoreNVFP4Layout
+from .int8 import TensorWiseINT8Layout
 
 __all__ = [
     "BaseLayoutParams",
@@ -20,6 +21,7 @@ __all__ = [
     "TensorCoreFP8Layout",
     "TensorCoreMXFP8Layout",
     "TensorCoreNVFP4Layout",
+    "TensorWiseINT8Layout",
     "dequantize_args",
     "get_cuda_capability",
     "get_layout_class",
@@ -30,3 +32,4 @@ __all__ = [
 register_layout_class("TensorCoreFP8Layout", TensorCoreFP8Layout)
 register_layout_class("TensorCoreMXFP8Layout", TensorCoreMXFP8Layout)
 register_layout_class("TensorCoreNVFP4Layout", TensorCoreNVFP4Layout)
+register_layout_class("TensorWiseINT8Layout", TensorWiseINT8Layout)
