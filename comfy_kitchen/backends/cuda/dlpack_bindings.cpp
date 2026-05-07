@@ -503,11 +503,11 @@ void cublas_gemm_int8(
         throw std::runtime_error("cuBLASLt not available: " + runtime.error_message());
     }
 
-    // a is [M, K], b is [K, N], c is [M, N]
+    // a is [M, K], b is [N, K], c is [M, N]
     int64_t M = a.shape(0);
     int64_t K = a.shape(1);
-    int64_t K_b = b.shape(0);
-    int64_t N = b.shape(1);
+    int64_t N = b.shape(0);
+    int64_t K_b = b.shape(1);
 
     if (K != K_b) {
         throw std::runtime_error("Matrix K dimensions do not match");

@@ -131,6 +131,28 @@ class TestTensorWiseINT8Layout:
         assert out.shape == (4, 64)
         assert out.dtype == torch.bfloat16
 
+    @pytest.mark.parametrize("backend", get_capable_backends("int8_linear", "cuda"))
+    def test_int8_linear_correctness(self, seed, backend):
+        """Check int8_linear parity across all capable backends."""
+        import comfy_kitchen as ck
+        from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
+
+        x = torch.randn(128, 256, device="cuda", dtype=torch.float16)
+        w = torch.randn(64, 256, device="cuda", dtype=torch.float16)
+        bias = torch.randn(64, device="cuda", dtype=torch.float16)
+        
+        w_int8, w_scale = quantize_int8_tensorwise(w)
+
+        with ck.registry.use_backend("eager"):
+            ref_out = ck.int8_linear(x, w_int8, w_scale, bias=bias, out_dtype=torch.float16)
+
+        with ck.registry.use_backend(backend):
+            out = ck.int8_linear(x, w_int8, w_scale, bias=bias, out_dtype=torch.float16)
+
+        # cuBLAS INT8 GEMM output compared to eager may have slight differences due to rounding
+        # However, eager vs triton vs cuda should be very close.
+        assert_values_close(out, ref_out, rtol=1e-2, atol=1e-2, name=f"int8_linear_{backend}", max_mismatch_ratio=0.01)
+
     def test_public_api_quantize_tensorwise(self, seed):
         """comfy_kitchen.quantize_int8_tensorwise op is reachable."""
         import comfy_kitchen as ck

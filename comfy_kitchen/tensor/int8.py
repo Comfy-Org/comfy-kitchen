@@ -156,6 +156,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
 def _handle_int8_linear_tensorwise(qt, args, kwargs):
     """INT8 linear for tensor-wise layout: output = input @ weight.T + bias."""
     from .base import QuantizedTensor, dequantize_args
+    import comfy_kitchen as ck
 
     input_tensor = args[0]
     weight = args[1]
@@ -172,44 +173,16 @@ def _handle_int8_linear_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    # Try Triton kernel first
-    try:
-        from comfy_kitchen.backends.triton.quantization import int8_linear
-
-        return int8_linear(
-            input_tensor.contiguous(), weight_qdata.contiguous(), weight_scale, bias, out_dtype
-        )
-    except Exception as e:
-        import traceback
-
-        err_msg = (
-            f"Triton INT8 scaled_mm failed: {e}\n{traceback.format_exc()}\nfalling back to eager"
-        )
-        print(err_msg)  # Force print to stdout
-        logger.debug(err_msg)
-
-    # Fallback to eager backend
-    try:
-        from comfy_kitchen.backends.eager.quantization import int8_linear
-
-        return int8_linear(
-            input_tensor.contiguous(), weight_qdata.contiguous(), weight_scale, bias, out_dtype
-        )
-    except Exception as e:
-        import traceback
-
-        err_msg = f"Eager INT8 scaled_mm failed: {e}\n{traceback.format_exc()}\nfalling back to dequantization"
-        print(err_msg)  # Force print to stdout
-        logger.debug(err_msg)
-
-    # Final fallback
-    return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
+    return ck.int8_linear(
+        input_tensor.contiguous(), weight_qdata.contiguous(), weight_scale, bias, out_dtype
+    )
 
 
 @register_layout_op(torch.ops.aten.mm.default, TensorWiseINT8Layout)
 def _handle_int8_mm_tensorwise(qt, args, kwargs):
     """INT8 matrix multiplication for tensor-wise layout: output = a @ b."""
     from .base import QuantizedTensor, dequantize_args
+    import comfy_kitchen as ck
 
     input_tensor = args[0]
     weight = args[1]
@@ -226,41 +199,16 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
 
     # mm expects b to NOT be transposed, but our kernels expect (N, K)
     # For mm, weight is (K, N), so we need to transpose it to (N, K)
-    try:
-        from comfy_kitchen.backends.triton.quantization import int8_linear
-
-        return int8_linear(
-            input_tensor, weight_qdata.t().contiguous(), weight_scale, None, out_dtype
-        )
-    except Exception as e:
-        import traceback
-
-        err_msg = f"Triton INT8 mm failed: {e}\n{traceback.format_exc()}\nfalling back to eager"
-        print(err_msg)
-        logger.debug(err_msg)
-
-    try:
-        from comfy_kitchen.backends.eager.quantization import int8_linear
-
-        return int8_linear(
-            input_tensor, weight_qdata.t().contiguous(), weight_scale, None, out_dtype
-        )
-    except Exception as e:
-        import traceback
-
-        err_msg = (
-            f"Eager INT8 mm failed: {e}\n{traceback.format_exc()}\nfalling back to dequantization"
-        )
-        print(err_msg)
-        logger.debug(err_msg)
-
-    return torch.mm(*dequantize_args(args), **dequantize_args(kwargs))
+    return ck.int8_linear(
+        input_tensor.contiguous(), weight_qdata.t().contiguous(), weight_scale, None, out_dtype
+    )
 
 
 @register_layout_op(torch.ops.aten.addmm.default, TensorWiseINT8Layout)
 def _handle_int8_addmm_tensorwise(qt, args, kwargs):
     """INT8 addmm for tensor-wise layout: output = bias + input @ weight."""
     from .base import QuantizedTensor, dequantize_args
+    import comfy_kitchen as ck
 
     bias = args[0]
     input_tensor = args[1]
@@ -275,22 +223,6 @@ def _handle_int8_addmm_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    try:
-        from comfy_kitchen.backends.triton.quantization import int8_linear
-
-        return int8_linear(
-            input_tensor, weight_qdata.t().contiguous(), weight_scale, bias, out_dtype
-        )
-    except (ImportError, RuntimeError):
-        pass
-
-    try:
-        from comfy_kitchen.backends.eager.quantization import int8_linear
-
-        return int8_linear(
-            input_tensor, weight_qdata.t().contiguous(), weight_scale, bias, out_dtype
-        )
-    except (ImportError, RuntimeError):
-        pass
-
-    return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
+    return ck.int8_linear(
+        input_tensor.contiguous(), weight_qdata.t().contiguous(), weight_scale, bias, out_dtype
+    )

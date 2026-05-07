@@ -24,6 +24,7 @@ __all__ = [
     "apply_rope1",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
+    "int8_linear",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
@@ -434,6 +435,42 @@ def scaled_mm_nvfp4(
     return out
 
 
+def int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor = None,
+    out_dtype: torch.dtype = None,
+) -> torch.Tensor:
+    # cuBLAS INT8 GEMM requires row-wise quantized activations and tensor-wise quantized weights
+    x_qdata, x_scale = torch.ops.comfy_kitchen.quantize_int8_rowwise(x)
+
+    m, k = x.shape
+    n, k_w = weight.shape
+    assert k == k_w, "Input and weight inner dimensions must match"
+
+    # cuBLAS INT8 GEMM outputs int32
+    out_int32 = torch.empty((m, n), dtype=torch.int32, device=x.device)
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+
+    _C.cublas_gemm_int8(
+        _wrap_for_dlpack(x_qdata),
+        _wrap_for_dlpack(weight),
+        _wrap_for_dlpack(out_int32),
+        _wrap_for_dlpack(get_cublas_workspace()),
+        stream_ptr,
+    )
+
+    # Dequantize/Rescale using eager-friendly operations
+    out = out_int32.float() * (x_scale * weight_scale)
+
+    if bias is not None:
+        out += bias.float()
+
+    out_dtype = out_dtype or x.dtype
+    return out.to(out_dtype)
+
+
 def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     if not x.is_contiguous():
         x = x.contiguous()
@@ -591,6 +628,26 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
+        ),
+        "int8_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "weight_scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                ),
+                "out_dtype": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(7, 5),
         ),
     }
 

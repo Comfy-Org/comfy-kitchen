@@ -61,7 +61,7 @@ cublasLtHandle_t get_cublas_lt_handle_int8() {
 
 void cublas_gemm_int8_impl(
     const int8_t* A_ptr,    // [M, K] row-major
-    const int8_t* B_ptr,    // [K, N] row-major
+    const int8_t* B_ptr,    // [N, K] row-major
     int32_t* C_ptr,         // [M, N] row-major output
     int64_t M,
     int64_t N,
@@ -79,31 +79,20 @@ void cublas_gemm_int8_impl(
     return;
   }
 
-  // cuBLAS uses column-major, so we compute C^T = B^T @ A^T
-  // With row-major inputs: C = A @ B becomes C^T = B^T @ A^T in column-major
-  // We set up the matrices such that cuBLAS computes what we want
-  
-  // For row-major A[M,K] @ B[K,N] = C[M,N]:
-  // In cuBLAS column-major terms:
-  // - A is viewed as [K,M] col-major (transposed)
-  // - B is viewed as [N,K] col-major (transposed)
-  // We compute C = B @ A in column-major, giving C[N,M] col-major = C[M,N] row-major
-  
-  int lda = K;  // Leading dimension of A in row-major = K
-  int ldb = N;  // Leading dimension of B in row-major = N  
-  int ldc = N;  // Leading dimension of C in row-major = N
-
   cublasLtHandle_t ltHandle = get_cublas_lt_handle_int8();
 
-  // Create operation descriptor with INT8 compute type
+  // Create operation descriptor with INT32 compute type
   cublasLtMatmulDesc_t operationDesc = nullptr;
   CUBLAS_CHECK(runtime.cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32I, CUDA_R_32I));
 
-  // Set transpose operations for row-major
-  // For C = A @ B in row-major:
-  // cuBLAS sees C^T = B^T @ A^T, so we mark B as not transposed and A as transposed
-  const cublasOperation_t transa = CUBLAS_OP_T;  // Transpose A (because col-major sees it flipped)
-  const cublasOperation_t transb = CUBLAS_OP_N;  // Don't transpose B
+  // In cuBLAS column-major terms, we want to compute C_col = B_row @ A_row^T
+  // B_row in memory is [N, K] row-major -> [K, N] col-major. 
+  // We want to multiply by B_row, so we need to transpose the [K, N] col-major matrix. transA = T.
+  // A_row in memory is [M, K] row-major -> [K, M] col-major. 
+  // This is already A_row^T, so we don't transpose it. transB = N.
+  
+  const cublasOperation_t transa = CUBLAS_OP_T;
+  const cublasOperation_t transb = CUBLAS_OP_N;
   CUBLAS_CHECK(runtime.cublasLtMatmulDescSetAttribute(
       operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
   CUBLAS_CHECK(runtime.cublasLtMatmulDescSetAttribute(
@@ -112,12 +101,12 @@ void cublas_gemm_int8_impl(
   // Matrix layouts: INT8 inputs, INT32 output
   cublasLtMatrixLayout_t Adesc = nullptr, Bdesc = nullptr, Cdesc = nullptr;
   
-  // A is [M, K] row-major, cuBLAS sees as [K, M] col-major (with transpose)
-  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_8I, K, M, lda));
-  // B is [K, N] row-major, cuBLAS sees as [N, K] col-major (no transpose)
-  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_8I, K, N, ldb));
-  // C is [M, N] row-major, cuBLAS sees as [N, M] col-major
-  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_32I, N, M, ldc));
+  // First operand is B_ptr. Shape [K, N] col-major.
+  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_8I, K, N, K));
+  // Second operand is A_ptr. Shape [K, M] col-major.
+  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_8I, K, M, K));
+  // Output is C_ptr. Shape [N, M] col-major.
+  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_32I, N, M, N));
 
   // Alpha and beta scalars
   int32_t alpha = 1;
@@ -137,11 +126,10 @@ void cublas_gemm_int8_impl(
   cublasLtMatmulHeuristicResult_t heuristicResult = {};
   int returnedResults = 0;
   
-  // For IMMA kernels, we compute B @ A (swapped order for row-major)
   const auto status = runtime.cublasLtMatmulAlgoGetHeuristic(
       ltHandle,
       operationDesc,
-      Bdesc,  // First operand in cuBLAS terms
+      Bdesc,  // First operand
       Adesc,  // Second operand
       Cdesc,
       Cdesc,
@@ -151,19 +139,18 @@ void cublas_gemm_int8_impl(
       &returnedResults);
 
   if (status == CUBLAS_STATUS_NOT_SUPPORTED || returnedResults == 0) {
-    // Clean up and throw
     if (preference) runtime.cublasLtMatmulPreferenceDestroy(preference);
     if (Cdesc) runtime.cublasLtMatrixLayoutDestroy(Cdesc);
     if (Bdesc) runtime.cublasLtMatrixLayoutDestroy(Bdesc);
     if (Adesc) runtime.cublasLtMatrixLayoutDestroy(Adesc);
     if (operationDesc) runtime.cublasLtMatmulDescDestroy(operationDesc);
-    throw std::runtime_error("INT8 GEMM not supported on this GPU (requires SM >= 7.5)");
+    throw std::runtime_error("INT8 GEMM not supported on this GPU for these dimensions (requires SM >= 7.5, and dimensions multiple of 4).");
   }
   if (status != CUBLAS_STATUS_SUCCESS) {
     throw std::runtime_error(std::string("cuBLAS heuristic error: ") + std::to_string(status));
   }
 
-  // Execute matmul: C = B @ A (in cuBLAS column-major terms)
+  // Execute matmul
   CUBLAS_CHECK(runtime.cublasLtMatmul(
       ltHandle,
       operationDesc,
