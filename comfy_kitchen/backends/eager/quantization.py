@@ -781,6 +781,7 @@ def int8_linear(
     M, N = result.shape
     chunk_size = max(1, min(M, 256 * 1024 * 1024 // (N * 4)))  # Estimate safe chunk size
 
+    weight_scale = weight_scale.view(-1)
     scaled_parts = []
     for i in range(0, M, chunk_size):
         end_i = min(i + chunk_size, M)

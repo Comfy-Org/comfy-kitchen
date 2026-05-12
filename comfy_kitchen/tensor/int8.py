@@ -62,13 +62,15 @@ class TensorWiseINT8Layout(QuantizedLayout):
         cls,
         tensor: torch.Tensor,
         is_weight: bool = True,
+        per_channel: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, Params]:
         """Quantize a tensor to INT8 with tensorwise or rowwise scaling.
 
         Args:
             tensor: Input tensor to quantize.
-            is_weight: If True, use tensorwise scale. If False, use per-row.
+            is_weight: If True, use tensorwise or per-channel scale. If False, use per-row.
+            per_channel: If True and is_weight, use per-channel (row-wise) scaling.
             **kwargs: Additional arguments (ignored).
 
         Returns:
@@ -78,10 +80,13 @@ class TensorWiseINT8Layout(QuantizedLayout):
         orig_shape = tuple(tensor.shape)
 
         if is_weight:
-            # Tensorwise: single absmax scale — no triton kernel, eager fast enough.
-            from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
+            if per_channel:
+                qdata, scale = torch.ops.comfy_kitchen.quantize_int8_rowwise(tensor)
+            else:
+                # Tensorwise: single absmax scale — no triton kernel, eager fast enough.
+                from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
 
-            qdata, scale = quantize_int8_tensorwise(tensor)
+                qdata, scale = quantize_int8_tensorwise(tensor)
         else:
             # Rowwise: route through registry (triton -> eager).
             qdata, scale = torch.ops.comfy_kitchen.quantize_int8_rowwise(tensor)

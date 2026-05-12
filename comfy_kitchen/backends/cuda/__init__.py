@@ -462,6 +462,7 @@ def int8_linear(
     )
 
     # Dequantize/Rescale using eager-friendly operations
+    weight_scale = weight_scale.view(-1)
     out = out_int32.float() * (x_scale * weight_scale)
 
     if bias is not None:
