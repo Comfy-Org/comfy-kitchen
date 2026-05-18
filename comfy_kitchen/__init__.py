@@ -1,6 +1,6 @@
 import torch
 
-from .backends import cuda as _cuda_backend
+from .backends import cuda as _cuda_backend  # noqa: F401
 
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
@@ -93,7 +93,19 @@ def stochastic_rounding_fp8(
     rng: torch.Tensor,
     output_type: torch.dtype = torch.float8_e4m3fn,
 ) -> torch.Tensor:
-    return _cuda_backend.stochastic_rounding_fp8(x, rng, output_type)
+    """Stochastically round tensor to FP8 format.
+
+    Args:
+        x: Input tensor
+        rng: Random uint8 tensor with the same shape as x
+        output_type: FP8 dtype (float8_e4m3fn or float8_e5m2)
+
+    Returns:
+        Stochastically rounded FP8 tensor
+    """
+    kwargs = {"x": x, "rng": rng, "output_type": output_type}
+    impl = registry.get_implementation("stochastic_rounding_fp8", kwargs=kwargs)
+    return impl(**kwargs)
 
 
 def quantize_nvfp4(

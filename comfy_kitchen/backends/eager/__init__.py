@@ -9,6 +9,7 @@ __all__ = [
     "quantize_per_tensor_fp8",
     "scaled_mm_mxfp8",
     "scaled_mm_nvfp4",
+    "stochastic_rounding_fp8",
 ]
 
 from .quantization import (
@@ -20,6 +21,7 @@ from .quantization import (
     quantize_per_tensor_fp8,
     scaled_mm_mxfp8,
     scaled_mm_nvfp4,
+    stochastic_rounding_fp8,
 )
 from .rope import apply_rope, apply_rope1
 
@@ -54,6 +56,16 @@ def _build_constraints() -> dict:
                 ),
                 "scale": ParamConstraint(dtypes=standard_floats),
                 "output_type": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "stochastic_rounding_fp8": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "rng": ParamConstraint(dtypes=frozenset({torch.uint8})),
+                "output_type": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn, torch.float8_e5m2}),
+                ),
             },
             default_devices=all_devices,
         ),

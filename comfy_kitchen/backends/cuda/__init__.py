@@ -548,6 +548,18 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
         ),
+        "stochastic_rounding_fp8": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+                "rng": ParamConstraint(dtypes=frozenset({torch.uint8})),
+                "output_type": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn, torch.float8_e5m2}),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
         "quantize_nvfp4": FunctionConstraints(
             params={
                 "x": ParamConstraint(

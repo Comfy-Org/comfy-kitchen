@@ -60,6 +60,58 @@ def dequantize_per_tensor_fp8(
     dq_tensor = x.to(dtype=output_type) * scale.to(dtype=output_type)
     return dq_tensor
 
+
+def calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, rng):  # noqa: N803
+    mantissa_scaled = torch.where(
+        normal_mask,
+        (abs_x / (2.0 ** (exponent - EXPONENT_BIAS)) - 1.0) * (2**MANTISSA_BITS),
+        (abs_x / (2.0 ** (-EXPONENT_BIAS + 1 - MANTISSA_BITS))),
+    )
+
+    mantissa_scaled += rng.to(dtype=mantissa_scaled.dtype) * (1.0 / 256.0)
+    return mantissa_scaled.floor() / (2**MANTISSA_BITS)
+
+
+def stochastic_rounding_fp8(
+    x: torch.Tensor,
+    rng: torch.Tensor,
+    output_type: torch.dtype = torch.float8_e4m3fn,
+) -> torch.Tensor:
+    if output_type == torch.float8_e4m3fn:
+        EXPONENT_BITS, MANTISSA_BITS, EXPONENT_BIAS = 4, 3, 7  # noqa: N806
+    elif output_type == torch.float8_e5m2:
+        EXPONENT_BITS, MANTISSA_BITS, EXPONENT_BIAS = 5, 2, 15  # noqa: N806
+    else:
+        raise ValueError(
+            f"Unsupported output_type: {output_type}. Expected torch.float8_e4m3fn "
+            "or torch.float8_e5m2"
+        )
+
+    x = x.half()
+    sign = torch.sign(x)
+    abs_x = x.abs()
+    sign = torch.where(abs_x == 0, 0, sign)
+
+    exponent = torch.clamp(
+        torch.floor(torch.log2(abs_x)) + EXPONENT_BIAS,
+        0,
+        2**EXPONENT_BITS - 1,
+    )
+    normal_mask = ~(exponent == 0)
+
+    abs_x[:] = calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, rng)
+
+    sign *= torch.where(
+        normal_mask,
+        (2.0 ** (exponent - EXPONENT_BIAS)) * (1.0 + abs_x),
+        (2.0 ** (-EXPONENT_BIAS + 1)) * abs_x,
+    )
+
+    info = torch.finfo(output_type)
+    torch.clamp(sign, min=info.min, max=info.max, out=sign)
+    return sign.to(output_type)
+
+
 def quantize_nvfp4(
     x: torch.Tensor,
     per_tensor_scale: torch.Tensor,
