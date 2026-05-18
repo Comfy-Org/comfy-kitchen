@@ -1,6 +1,6 @@
 import torch
 
-from .backends import cuda as _cuda_backend  # noqa: F401
+from .backends import cuda as _cuda_backend
 
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
@@ -40,6 +40,7 @@ __all__ = [
     "scaled_mm_mxfp8",
     "scaled_mm_nvfp4",
     "set_backend_priority",
+    "stochastic_rounding_fp8",
     "use_backend",
 ]
 
@@ -85,6 +86,14 @@ def dequantize_per_tensor_fp8(
     """
     dtype_code = DTYPE_TO_CODE[output_type]
     return torch.ops.comfy_kitchen.dequantize_fp8(x, scale, dtype_code)
+
+
+def stochastic_rounding_fp8(
+    x: torch.Tensor,
+    rng: torch.Tensor,
+    output_type: torch.dtype = torch.float8_e4m3fn,
+) -> torch.Tensor:
+    return _cuda_backend.stochastic_rounding_fp8(x, rng, output_type)
 
 
 def quantize_nvfp4(

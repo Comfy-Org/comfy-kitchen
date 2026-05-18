@@ -28,6 +28,7 @@ __all__ = [
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
     "scaled_mm_nvfp4",
+    "stochastic_rounding_fp8",
 ]
 
 
@@ -185,6 +186,30 @@ def dequantize_per_tensor_fp8(
     )
 
     return result
+
+
+def stochastic_rounding_fp8(
+    x: torch.Tensor,
+    rng: torch.Tensor,
+    output_type: torch.dtype = torch.float8_e4m3fn,
+) -> torch.Tensor:
+    output_dtype_code = DTYPE_TO_CODE[output_type]
+
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not rng.is_contiguous():
+        rng = rng.contiguous()
+
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    _C.stochastic_round_fp8(
+        _wrap_for_dlpack(rng),
+        _wrap_for_dlpack(x),
+        output_dtype_code,
+        x.numel(),
+        stream_ptr,
+    )
+
+    return rng.view(output_type)
 
 
 def quantize_nvfp4(
