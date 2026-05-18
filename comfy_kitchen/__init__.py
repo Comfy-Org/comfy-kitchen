@@ -1,6 +1,6 @@
 import torch
 
-from .backends import cuda as _cuda_backend
+from .backends import cuda as _cuda_backend  # noqa: F401
 
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
