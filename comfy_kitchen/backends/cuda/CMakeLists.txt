@@ -106,7 +106,27 @@ set(CUDA_SOURCES
     ops/quantize_mxfp8.cu
     ops/cublas_gemm_nvfp4.cu
     ops/apply_rope.cu
+    sage_attention/quant_v_fp8.cu
+    sage_attention/quant_qk_int8.cu
+    sage_attention/sage_attn_launcher.cu
 )
+
+# SageAttention kernels require FP8 types / MMA (SM89+); skip older architectures.
+if(MSVC)
+    set_source_files_properties(
+        sage_attention/sage_attn_launcher.cu
+        sage_attention/quant_qk_int8.cu
+        sage_attention/quant_v_fp8.cu
+        PROPERTIES CUDA_ARCHITECTURES "89;120f"
+    )
+else()
+    set_source_files_properties(
+        sage_attention/sage_attn_launcher.cu
+        sage_attention/quant_qk_int8.cu
+        sage_attention/quant_v_fp8.cu
+        PROPERTIES CUDA_ARCHITECTURES "89;90a;120f"
+    )
+endif()
 
 set(CPP_SOURCES
     dlpack_bindings.cpp
@@ -140,6 +160,7 @@ target_compile_options(_C PRIVATE
 # Include directories
 target_include_directories(_C PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/sage_attention
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 

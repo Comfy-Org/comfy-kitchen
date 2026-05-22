@@ -16,6 +16,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `scaled_mm_mxfp8`           | ✓     |      |        |
 | `apply_rope`                | ✓     | ✓    | ✓      |
 | `apply_rope1`               | ✓     | ✓    | ✓      |
+| `sage_sdpa`                 |       | ✓    |        |
 
 
 ## Quantized Tensors
@@ -40,6 +41,30 @@ output = torch.nn.functional.linear(qt, weight_qt)
 
 # Dequantize back to float
 dq = qt.dequantize()
+```
+
+
+## SageAttention
+
+The library provides `sage_sdpa`, an extremely fast scaled dot-product attention (SDPA) kernel implementing the SageAttention algorithm (INT8 quantization for Q/K and FP8 quantization for V) for SM89+ GPUs (Ada/Blackwell).
+
+Supported input data types:
+- `torch.float32`
+- `torch.bfloat16`
+- `torch.float16`
+
+```python
+from comfy_kitchen import sage_sdpa, sage_is_available
+
+if sage_is_available():
+    # Inputs: [batch_size, num_heads, seq_len, head_dim]
+    # Note: head_dim must be 64 or 128
+    q = torch.randn(1, 4, 1024, 64, dtype=torch.float32, device="cuda")
+    k = torch.randn(1, 4, 1024, 64, dtype=torch.float32, device="cuda")
+    v = torch.randn(1, 4, 1024, 64, dtype=torch.float32, device="cuda")
+
+    # Outputs match the input dtype (e.g., float32)
+    output = sage_sdpa(q, k, v, is_causal=False, smooth_k=True)
 ```
 
 
@@ -187,3 +212,12 @@ pytest -v
 # Run specific test
 pytest tests/test_backends.py::TestBackendSystem::test_list_backends
 ```
+
+## Acknowledgments
+
+This project incorporates CUDA attention kernels and Triton quantization code
+derived from [SageAttention](https://github.com/thu-ml/SageAttention) by
+Jintao Zhang, Haofeng Huang, and contributors, licensed under the
+Apache License 2.0. The vendored sources live under
+`comfy_kitchen/backends/cuda/sage_attention/` and are built into the CUDA
+wheels. See the [NOTICE](NOTICE) file for full attribution details.

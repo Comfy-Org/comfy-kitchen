@@ -82,6 +82,18 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+--------------------------------------------------------------------------------
+SageAttention
+--------------------------------------------------------------------------------
+Copyright (c) 2024 by SageAttention team.
+License: Apache-2.0
+Website: https://github.com/thu-ml/SageAttention
+
+Portions of the SageAttention CUDA kernels and quantization code under
+comfy_kitchen/backends/cuda/sage_attention/ are derived from SageAttention
+(commit d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5). See individual source files
+for specific modification notes.
+
 ================================================================================
 
 For full license texts of these dependencies, please refer to their respective
