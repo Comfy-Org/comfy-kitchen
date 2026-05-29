@@ -6,6 +6,8 @@ __all__ = [
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
+    "int8_linear",
+    "quantize_int8_rowwise",
 ]
 
 # Try to import triton and register if available
@@ -21,6 +23,8 @@ try:
         quantize_mxfp8,
         quantize_nvfp4,
         quantize_per_tensor_fp8,
+        int8_linear,
+        triton_quantize_rowwise as quantize_int8_rowwise,
     )
     from .rope import apply_rope, apply_rope1
 except ImportError as e:
@@ -109,6 +113,22 @@ def _build_constraints() -> dict:
                 "xq": ParamConstraint(dtypes=standard_floats),
                 "xk": ParamConstraint(dtypes=standard_floats),
                 "freqs_cis": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
+        "int8_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "weight_scale": ParamConstraint(dtypes=standard_floats),
+                "out_dtype": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+            min_compute_capability=(8, 0),  # Required for Triton INT8 dot
+        ),
+        "quantize_int8_rowwise": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
             },
             default_devices=triton_devices,
         ),

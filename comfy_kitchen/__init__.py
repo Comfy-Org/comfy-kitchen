@@ -28,11 +28,15 @@ __all__ = [
     "quantize_mxfp8",
     "dequantize_mxfp8",
     "quantize_svdquant_w4a4",
+    "quantize_int8_rowwise",
+    "quantize_int8_tensorwise",
+    "dequantize_int8_simple",
     # Fused matmul
     "scaled_mm_nvfp4",
     "scaled_mm_mxfp8",
     "scaled_mm_svdquant_w4a4",
     "gemv_awq_w4a16",
+    "int8_linear",
     # Positional encoding
     "apply_rope",
     "apply_rope1",
@@ -402,6 +406,115 @@ def apply_rope1(
         Transformed tensor
     """
     return torch.ops.comfy_kitchen.apply_rope1(x, freqs_cis)
+
+
+# =============================================================================
+# Backend Configuration
+# =============================================================================
+
+
+def set_backend_priority(priority: list[str]) -> None:
+    """Set the priority order for backend selection.
+
+    Args:
+        priority: List of backend names in order of preference
+                 Example: ["cuda", "eager"] to prefer CUDA over Torch
+    """
+    registry.set_priority(priority)
+
+
+def disable_backend(name: str) -> None:
+    """Disable a backend, preventing its use.
+
+    Args:
+        name: Backend name to disable ("eager", "cuda", or "triton")
+    """
+    registry.disable(name)
+
+
+def enable_backend(name: str) -> None:
+    """Re-enable a previously disabled backend.
+
+    Args:
+        name: Backend name to enable ("eager", "cuda", or "triton")
+    """
+    registry.enable(name)
+
+
+def list_backends() -> dict:
+    """Get status information for all backends.
+
+    Returns:
+        Dictionary mapping backend names to their status:
+        {
+            "backend_name": {
+                "available": bool,
+                "disabled": bool,
+                "unavailable_reason": str or None,
+                "capabilities": list[str]
+            }
+        }
+    """
+    return registry.list_backends()
+
+
+def use_backend(name: str):
+    """Context manager to temporarily use a specific backend.
+
+    Args:
+        name: Backend name to use within the context
+
+    Example:
+        with comfy_kitchen.use_backend("eager"):
+            result = comfy_kitchen.quantize_per_tensor_fp8(x, scale)
+    """
+    return registry.use_backend(name)
+
+def quantize_int8_tensorwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with single tensorwise scale."""
+    return torch.ops.comfy_kitchen.quantize_int8_tensorwise(x)
+
+
+def quantize_int8_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with per-row scales."""
+    return torch.ops.comfy_kitchen.quantize_int8_rowwise(x)
+
+
+def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize INT8 tensor with scale."""
+    return torch.ops.comfy_kitchen.dequantize_int8_simple(q, scale)
+
+
+def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N]."""
+    from .backends.eager.quantization import mm_int8 as _mm_int8
+
+    return _mm_int8(a, b)
+
+
+def int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """INT8 linear layer dynamically quantized.
+
+    Args:
+        x: Input tensor.
+        weight: INT8 weight tensor.
+        weight_scale: Scalar weight scale.
+        bias: Optional bias.
+        out_dtype: Output dtype.
+
+    Returns:
+        Result tensor.
+    """
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    dtype_code = DTYPE_TO_CODE[out_dtype]
+    return torch.ops.comfy_kitchen.int8_linear(x, weight, weight_scale, bias, dtype_code)
 
 
 # =============================================================================

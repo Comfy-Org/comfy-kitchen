@@ -4,15 +4,19 @@ __all__ = [
     "dequantize_mxfp8",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
+    "dequantize_int8_simple",
     "gemv_awq_w4a16",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
+    "quantize_int8_rowwise",
+    "quantize_int8_tensorwise",
     "quantize_svdquant_w4a4",
     "scaled_mm_mxfp8",
     "scaled_mm_nvfp4",
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
+    "int8_linear",
 ]
 
 from .awq import gemv_awq_w4a16
@@ -20,12 +24,16 @@ from .quantization import (
     dequantize_mxfp8,
     dequantize_nvfp4,
     dequantize_per_tensor_fp8,
+    dequantize_int8_simple,
     quantize_mxfp8,
     quantize_nvfp4,
     quantize_per_tensor_fp8,
+    quantize_int8_rowwise,
+    quantize_int8_tensorwise,
     scaled_mm_mxfp8,
     scaled_mm_nvfp4,
     stochastic_rounding_fp8,
+    int8_linear,
 )
 from .rope import apply_rope, apply_rope1
 from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
@@ -177,6 +185,34 @@ def _build_constraints() -> dict:
             default_devices=all_devices,
         ),
     }
+
+    out["quantize_int8_tensorwise"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["quantize_int8_rowwise"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["dequantize_int8_simple"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=frozenset({torch.int8})),
+            "scale": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["int8_linear"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
+            "weight_scale": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
 
     if hasattr(torch, "float8_e8m0fnu"):
         out["quantize_mxfp8"] = FunctionConstraints(
