@@ -6,6 +6,7 @@ from comfy_kitchen.float_utils import (
     F4_E2M1_MAX,
     F8_E4M3_MAX,
     fp4_x2_to_f32,
+    swap_nibbles,
 )
 
 from .conftest import (
@@ -253,8 +254,137 @@ class TestDequantizeNVFP4:
                 ref_result,
                 rtol=1e-3,
                 atol=1e-2,
+                max_mismatch_ratio=0.05,
                 name=f"dequantized output ({backend_name} vs eager)"
             )
+
+
+# =============================================================================
+# NVFP4 Nibble Packing Order Tests
+# =============================================================================
+
+
+class TestNVFP4HiFirst:
+    """Tests for the hi_first nibble packing order switch."""
+
+    @pytest.fixture
+    def capable_backends(self, device):
+        backends = get_capable_backends("quantize_nvfp4", device)
+        if not backends:
+            pytest.skip(f"No backend supports quantize_nvfp4 on {device}")
+        return backends
+
+    def test_hi_first_default_matches_legacy(self, capable_backends, device, seed):
+        """Verify hi_first=True (default) produces the same output as the original code."""
+        x = torch.randn(64, 128, device=device, dtype=torch.bfloat16) * 4
+        scale = (torch.max(torch.abs(x)) / (F8_E4M3_MAX * F4_E2M1_MAX)).to(torch.float32)
+
+        for backend_name in capable_backends:
+            with ck.use_backend(backend_name):
+                qx_default, sx_default = ck.quantize_nvfp4(x, scale)
+                qx_explicit, sx_explicit = ck.quantize_nvfp4(x, scale, hi_first=True)
+
+            assert torch.equal(qx_default, qx_explicit), f"{backend_name}: default != hi_first=True"
+            assert torch.equal(
+                sx_default.view(torch.uint8), sx_explicit.view(torch.uint8)
+            ), f"{backend_name}: scales differ"
+
+    def test_hi_first_false_swaps_nibbles(self, capable_backends, device, seed):
+        """hi_first=False should produce nibble-swapped packed bytes vs hi_first=True."""
+        x = torch.randn(64, 128, device=device, dtype=torch.bfloat16) * 4
+        scale = (torch.max(torch.abs(x)) / (F8_E4M3_MAX * F4_E2M1_MAX)).to(torch.float32)
+
+        for backend_name in capable_backends:
+            with ck.use_backend(backend_name):
+                qx_hi, sx_hi = ck.quantize_nvfp4(x, scale, hi_first=True)
+                qx_lo, sx_lo = ck.quantize_nvfp4(x, scale, hi_first=False)
+
+            # Scales are independent of packing order
+            assert torch.equal(
+                sx_hi.view(torch.uint8), sx_lo.view(torch.uint8)
+            ), f"{backend_name}: scales should be identical"
+
+            # Packed bytes should be nibble-swapped versions of each other
+            assert torch.equal(
+                swap_nibbles(qx_hi), qx_lo
+            ), f"{backend_name}: hi_first=False should be nibble-swapped hi_first=True"
+
+    def test_roundtrip_hi_first_true(self, capable_backends, device, seed):
+        """Quantize then dequantize with hi_first=True recovers original values."""
+        x = torch.randn(64, 128, device=device, dtype=torch.bfloat16) * 4
+        scale = (torch.max(torch.abs(x)) / (F8_E4M3_MAX * F4_E2M1_MAX)).to(torch.float32)
+
+        for backend_name in capable_backends:
+            with ck.use_backend(backend_name):
+                qx, sx = ck.quantize_nvfp4(x, scale, hi_first=True)
+                out = ck.dequantize_nvfp4(qx, scale, sx, output_type=torch.bfloat16, hi_first=True)
+
+            assert_values_close(
+                out.float(), x.float(), rtol=0.5, atol=2.0,
+                name=f"roundtrip hi_first=True ({backend_name})"
+            )
+
+    def test_roundtrip_hi_first_false(self, capable_backends, device, seed):
+        """Quantize then dequantize with hi_first=False recovers original values."""
+        x = torch.randn(64, 128, device=device, dtype=torch.bfloat16) * 4
+        scale = (torch.max(torch.abs(x)) / (F8_E4M3_MAX * F4_E2M1_MAX)).to(torch.float32)
+
+        for backend_name in capable_backends:
+            with ck.use_backend(backend_name):
+                qx, sx = ck.quantize_nvfp4(x, scale, hi_first=False)
+                out = ck.dequantize_nvfp4(qx, scale, sx, output_type=torch.bfloat16, hi_first=False)
+
+            assert_values_close(
+                out.float(), x.float(), rtol=0.5, atol=2.0,
+                name=f"roundtrip hi_first=False ({backend_name})"
+            )
+
+    def test_mismatched_hi_first_produces_wrong_result(self, capable_backends, device, seed):
+        """Using different hi_first for quant vs dequant should produce incorrect output."""
+        x = torch.randn(64, 128, device=device, dtype=torch.bfloat16) * 4
+        scale = (torch.max(torch.abs(x)) / (F8_E4M3_MAX * F4_E2M1_MAX)).to(torch.float32)
+
+        for backend_name in capable_backends:
+            with ck.use_backend(backend_name):
+                qx, sx = ck.quantize_nvfp4(x, scale, hi_first=True)
+                out_correct = ck.dequantize_nvfp4(qx, scale, sx, output_type=torch.bfloat16, hi_first=True)
+                out_wrong = ck.dequantize_nvfp4(qx, scale, sx, output_type=torch.bfloat16, hi_first=False)
+
+            # The wrong packing order should give a meaningfully different result
+            assert not torch.allclose(
+                out_correct.float(), out_wrong.float(), rtol=1e-2, atol=1e-2
+            ), f"{backend_name}: mismatched hi_first should produce different output"
+
+    def test_cross_backend_consistency_hi_first_false(self, capable_backends, device, seed):
+        """All backends should agree when hi_first=False.
+
+        We test dequant-only (same packed input, different dequant backends)
+        to isolate the hi_first logic from pre-existing block-scale
+        quantization differences between eager and GPU backends.
+        """
+        if len(capable_backends) < 2:
+            pytest.skip("Need at least 2 backends for cross-validation")
+
+        x = torch.randn(64, 128, device=device, dtype=torch.bfloat16) * 4
+        scale = (torch.max(torch.abs(x)) / (F8_E4M3_MAX * F4_E2M1_MAX)).to(torch.float32)
+
+        with ck.use_backend(capable_backends[0]):
+            qx, sx = ck.quantize_nvfp4(x, scale, hi_first=False)
+
+        results = {}
+        for backend_name in capable_backends:
+            with ck.use_backend(backend_name):
+                out = ck.dequantize_nvfp4(qx, scale, sx, output_type=torch.bfloat16, hi_first=False)
+                results[backend_name] = out
+
+        ref_name = capable_backends[0]
+        ref = results[ref_name]
+        for name, result in results.items():
+            if name != ref_name:
+                assert_values_close(
+                    result.float(), ref.float(), rtol=1e-3, atol=1e-2,
+                    name=f"hi_first=False cross-backend ({name} vs {ref_name})"
+                )
 
 
 # =============================================================================

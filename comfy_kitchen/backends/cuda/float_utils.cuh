@@ -81,22 +81,27 @@ template<typename IType>
 #pragma nv_diag_default 1056
 
 // Store 2 FP4 values (1 __nv_fp4x2)
-template<typename OType>
+// hi_first=true: val0 in high nibble, val1 in low nibble (default, matches cuBLAS convention)
+// hi_first=false: val0 in low nibble, val1 in high nibble
+template<typename OType, bool hi_first = true>
 __forceinline__ __device__ void store_fp4x2(OType* output, size_t idx, float val0, float val1) {
+    float2 args = hi_first ? float2{val1, val0} : float2{val0, val1};
     *reinterpret_cast<__nv_fp4x2_storage_t*>(&output[idx]) =
-        __nv_cvt_float2_to_fp4x2(float2{val1, val0}, __NV_E2M1, cudaRoundNearest);
+        __nv_cvt_float2_to_fp4x2(args, __NV_E2M1, cudaRoundNearest);
 }
 
 // Store 4 FP4 values (2 __nv_fp4x2) using single store
-template<typename OType>
+template<typename OType, bool hi_first = true>
 __forceinline__ __device__ void store_fp4x4(OType* output, size_t idx, float val0, float val1, float val2, float val3) {
     union {
         uint16_t u16;
         __nv_fp4x2_storage_t fp4x2[2];
     } packed;
 
-    packed.fp4x2[0] = __nv_cvt_float2_to_fp4x2(float2{val1, val0}, __NV_E2M1, cudaRoundNearest);
-    packed.fp4x2[1] = __nv_cvt_float2_to_fp4x2(float2{val3, val2}, __NV_E2M1, cudaRoundNearest);
+    float2 args0 = hi_first ? float2{val1, val0} : float2{val0, val1};
+    float2 args1 = hi_first ? float2{val3, val2} : float2{val2, val3};
+    packed.fp4x2[0] = __nv_cvt_float2_to_fp4x2(args0, __NV_E2M1, cudaRoundNearest);
+    packed.fp4x2[1] = __nv_cvt_float2_to_fp4x2(args1, __NV_E2M1, cudaRoundNearest);
 
     *reinterpret_cast<uint16_t*>(&output[2*idx]) = packed.u16;
 }

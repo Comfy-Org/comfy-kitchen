@@ -61,7 +61,8 @@ template <
     typename IType,
     typename OType=__nv_fp4x2_e2m1,
     typename ScaleType=__nv_fp8_e4m3,
-    bool Misaligned = false>
+    bool Misaligned = false,
+    bool HiFirst = true>
 __global__ void quantize_nvfp4_kernel(
     const IType* const input,
     const float* global_scale, // absmax(input) / (6.0 * 488.0)
@@ -186,10 +187,10 @@ __global__ void quantize_nvfp4_kernel(
     // Store quantized values to output using vectorized stores
     // Both aligned and misaligned paths use the same store since each thread processes kValsPerThread values
     if (kValsPerThread == 2) {
-        store_fp4x2(output, idx, vals_encoded[0], vals_encoded[1]);
+        store_fp4x2<OType, HiFirst>(output, idx, vals_encoded[0], vals_encoded[1]);
     }
     else if (kValsPerThread == 4) {
-        store_fp4x4(output, idx, vals_encoded[0], vals_encoded[1], vals_encoded[2], vals_encoded[3]);
+        store_fp4x4<OType, HiFirst>(output, idx, vals_encoded[0], vals_encoded[1], vals_encoded[2], vals_encoded[3]);
     }
 }
 
@@ -211,7 +212,8 @@ __global__ void quantize_nvfp4_kernel(
 template <
     typename IType=__nv_fp4x2_e2m1,
     typename OType,
-    typename ScaleType=__nv_fp8_e4m3>
+    typename ScaleType=__nv_fp8_e4m3,
+    bool HiFirst = true>
 __global__ void dequantize_nvfp4_kernel(
     const IType* const input,
     const float* global_scale,
@@ -247,18 +249,23 @@ __global__ void dequantize_nvfp4_kernel(
     // Unpack and dequantize
     OType vals_output[kValsPerThread];
     
+    // __nv_cvt_fp4x2_to_halfraw2 returns: .x = low nibble value, .y = high nibble value.
+    // HiFirst=true:  high nibble = even index (val0), low nibble = odd index (val1) → .y=val0, .x=val1
+    // HiFirst=false: high nibble = odd index (val1), low nibble = even index (val0) → .x=val0, .y=val1
     if (kValsPerThread == 2) {
-        // Read 1 packed value (2 FP4 values)
         __half2_raw unpacked_raw = __nv_cvt_fp4x2_to_halfraw2(
             *reinterpret_cast<const __nv_fp4x2_storage_t*>(input_ptr),
             __NV_E2M1);
         float2 unpacked_f2 = __half22float2(*reinterpret_cast<__half2*>(&unpacked_raw));
-        // Note: order is swapped because store_fp4x2 packs as float2{val1, val0}
-        vals_output[0] = static_cast<OType>(unpacked_f2.y * decode_scale);
-        vals_output[1] = static_cast<OType>(unpacked_f2.x * decode_scale);
+        if constexpr (HiFirst) {
+            vals_output[0] = static_cast<OType>(unpacked_f2.y * decode_scale);
+            vals_output[1] = static_cast<OType>(unpacked_f2.x * decode_scale);
+        } else {
+            vals_output[0] = static_cast<OType>(unpacked_f2.x * decode_scale);
+            vals_output[1] = static_cast<OType>(unpacked_f2.y * decode_scale);
+        }
     }
     else if (kValsPerThread == 4) {
-        // Read 2 packed values (4 FP4 values total)
         union {
             uint16_t u16;
             __nv_fp4x2_storage_t fp4x2[2];
@@ -270,11 +277,17 @@ __global__ void dequantize_nvfp4_kernel(
         float2 unpacked_f2_0 = __half22float2(*reinterpret_cast<__half2*>(&unpacked_raw0));
         float2 unpacked_f2_1 = __half22float2(*reinterpret_cast<__half2*>(&unpacked_raw1));
         
-        // Note: order is swapped because store_fp4x4 packs values with reversed order
-        vals_output[0] = static_cast<OType>(unpacked_f2_0.y * decode_scale);
-        vals_output[1] = static_cast<OType>(unpacked_f2_0.x * decode_scale);
-        vals_output[2] = static_cast<OType>(unpacked_f2_1.y * decode_scale);
-        vals_output[3] = static_cast<OType>(unpacked_f2_1.x * decode_scale);
+        if constexpr (HiFirst) {
+            vals_output[0] = static_cast<OType>(unpacked_f2_0.y * decode_scale);
+            vals_output[1] = static_cast<OType>(unpacked_f2_0.x * decode_scale);
+            vals_output[2] = static_cast<OType>(unpacked_f2_1.y * decode_scale);
+            vals_output[3] = static_cast<OType>(unpacked_f2_1.x * decode_scale);
+        } else {
+            vals_output[0] = static_cast<OType>(unpacked_f2_0.x * decode_scale);
+            vals_output[1] = static_cast<OType>(unpacked_f2_0.y * decode_scale);
+            vals_output[2] = static_cast<OType>(unpacked_f2_1.x * decode_scale);
+            vals_output[3] = static_cast<OType>(unpacked_f2_1.y * decode_scale);
+        }
     }
     
     // Store output using vectorized writes
@@ -318,6 +331,7 @@ void launch_quantize_nvfp4_kernel(
     int64_t orig_cols,
     float epsilon,
     int input_dtype_code,
+    bool hi_first,
     cudaStream_t stream) {
     
     if (num_rows == 0 || num_cols == 0) {
@@ -339,38 +353,28 @@ void launch_quantize_nvfp4_kernel(
     constexpr int threads_per_block = 128;  // CUDA block size
     const int64_t total_threads_needed = numel / comfy::kValsPerThread;
     const int blocks = static_cast<int>((total_threads_needed + threads_per_block - 1) / threads_per_block);
-    
-    // Dispatch based on input dtype (only FP16/BF16 supported)
-    // Input dtype codes: 1=float16, 2=bfloat16
+
+    // Macro to reduce duplication across misaligned x hi_first combinations
+    #define LAUNCH_QUANT_KERNEL(MISALIGNED, HI_FIRST) \
+        comfy::quantize_nvfp4_kernel<InputType, __nv_fp4x2_e2m1, __nv_fp8_e4m3, MISALIGNED, HI_FIRST> \
+            <<<blocks, threads_per_block, 0, stream>>>( \
+                static_cast<const InputType*>(input), \
+                scale_f, \
+                static_cast<__nv_fp4x2_e2m1*>(output), \
+                static_cast<__nv_fp8_e4m3*>(block_scales), \
+                num_cols, num_rows, orig_rows, orig_cols, epsilon)
+
     DISPATCH_HALF_DTYPE(input_dtype_code, InputType, [&] {
         if (misaligned) {
-            // Misaligned path: loads values one at a time with bounds checking
-            comfy::quantize_nvfp4_kernel<InputType, __nv_fp4x2_e2m1, __nv_fp8_e4m3, true>
-                <<<blocks, threads_per_block, 0, stream>>>(
-                    static_cast<const InputType*>(input),
-                    scale_f,
-                    static_cast<__nv_fp4x2_e2m1*>(output),
-                    static_cast<__nv_fp8_e4m3*>(block_scales),
-                    num_cols,
-                    num_rows,
-                    orig_rows,
-                    orig_cols,
-                    epsilon);
+            if (hi_first) { LAUNCH_QUANT_KERNEL(true, true); }
+            else          { LAUNCH_QUANT_KERNEL(true, false); }
         } else {
-            // Aligned path: uses vectorized loads
-            comfy::quantize_nvfp4_kernel<InputType, __nv_fp4x2_e2m1, __nv_fp8_e4m3, false>
-                <<<blocks, threads_per_block, 0, stream>>>(
-                    static_cast<const InputType*>(input),
-                    scale_f,
-                    static_cast<__nv_fp4x2_e2m1*>(output),
-                    static_cast<__nv_fp8_e4m3*>(block_scales),
-                    num_cols,
-                    num_rows,
-                    orig_rows,
-                    orig_cols,
-                    epsilon);
+            if (hi_first) { LAUNCH_QUANT_KERNEL(false, true); }
+            else          { LAUNCH_QUANT_KERNEL(false, false); }
         }
     });
+
+    #undef LAUNCH_QUANT_KERNEL
     
     // Check for kernel launch errors
     cudaError_t err = cudaGetLastError();
@@ -387,6 +391,7 @@ void launch_dequantize_nvfp4_kernel(
     int64_t num_rows,
     int64_t num_cols,
     int output_dtype_code,
+    bool hi_first,
     cudaStream_t stream) {
 
     if (num_rows == 0 || num_cols == 0) {
@@ -405,19 +410,22 @@ void launch_dequantize_nvfp4_kernel(
     constexpr int threads_per_block = 128;
     const int64_t total_threads_needed = numel / comfy::kValsPerThread;
     const int blocks = static_cast<int>((total_threads_needed + threads_per_block - 1) / threads_per_block);
-    
-    // Dispatch based on output dtype
-    // Output dtype codes: 0=float32, 1=float16, 2=bfloat16
+
+    #define LAUNCH_DEQUANT_KERNEL(HI_FIRST) \
+        comfy::dequantize_nvfp4_kernel<__nv_fp4x2_e2m1, OutputType, __nv_fp8_e4m3, HI_FIRST> \
+            <<<blocks, threads_per_block, 0, stream>>>( \
+                static_cast<const __nv_fp4x2_e2m1*>(input), \
+                scale_f, \
+                static_cast<const __nv_fp8_e4m3*>(block_scales), \
+                static_cast<OutputType*>(output), \
+                num_cols, num_rows)
+
     DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
-        comfy::dequantize_nvfp4_kernel<__nv_fp4x2_e2m1, OutputType, __nv_fp8_e4m3>
-            <<<blocks, threads_per_block, 0, stream>>>(
-                static_cast<const __nv_fp4x2_e2m1*>(input),
-                scale_f,
-                static_cast<const __nv_fp8_e4m3*>(block_scales),
-                static_cast<OutputType*>(output),
-                num_cols,
-                num_rows);
+        if (hi_first) { LAUNCH_DEQUANT_KERNEL(true); }
+        else          { LAUNCH_DEQUANT_KERNEL(false); }
     });
+
+    #undef LAUNCH_DEQUANT_KERNEL
     
     // Check for kernel launch errors
     cudaError_t err = cudaGetLastError();

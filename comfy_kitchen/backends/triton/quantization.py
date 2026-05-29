@@ -204,6 +204,7 @@ def quantize_nvfp4_kernel_tl(
     padded_scale_cols,
     block_size: tl.constexpr,
     blocks_per_program: tl.constexpr,
+    hi_first: tl.constexpr,
 ):
     """Single Triton kernel for NVFP4 quantization with packing and scale swizzling.
 
@@ -295,6 +296,12 @@ def quantize_nvfp4_kernel_tl(
             f32_even = tl.sum(tl.where(indices == even_idx[:, None], data_scaled, 0), axis=1)
             f32_odd = tl.sum(tl.where(indices == odd_idx[:, None], data_scaled, 0), axis=1)
 
+            # cvt.rn.satfinite.e2m1x2.f32 packs $1 into the high nibble, $2 into the low nibble.
+            if hi_first:
+                asm_arg_hi, asm_arg_lo = f32_even, f32_odd
+            else:
+                asm_arg_hi, asm_arg_lo = f32_odd, f32_even
+
             packed_bytes_u16 = tl.inline_asm_elementwise(
                 asm="""
                 {
@@ -306,7 +313,7 @@ def quantize_nvfp4_kernel_tl(
                 }
                 """,
                 constraints="=h,f,f",
-                args=[f32_even, f32_odd],
+                args=[asm_arg_hi, asm_arg_lo],
                 dtype=tl.uint16,
                 is_pure=True,
                 pack=1,
@@ -325,6 +332,7 @@ def quantize_nvfp4(
     per_tensor_scale: torch.Tensor,
     epsilon: float = 0.0,
     pad_16x: bool = False,
+    hi_first: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Note: epsilon is accepted for API compatibility but not currently used
     orig_shape = x.shape
@@ -393,6 +401,7 @@ def quantize_nvfp4(
         padded_scale_cols,
         block_size=block_size,
         blocks_per_program=blocks_per_program,
+        hi_first=hi_first,
     )
 
     # Reshape packed output to original shape (with last dim halved)
@@ -415,6 +424,7 @@ def dequantize_nvfp4_kernel_tl(
     padded_scale_cols,
     block_size: tl.constexpr,
     tile_size: tl.constexpr,
+    hi_first: tl.constexpr,
 ):
     """Dequantizes FP4 packed data using per-block scaling factors.
 
@@ -506,11 +516,15 @@ def dequantize_nvfp4_kernel_tl(
     )
 
     # Apply scaling
-    # Note: Due to packing order ((even << 4) | odd) and PTX cvt.rn.f16x2.e2m1x2:
-    # - val_low (from low nibble) contains odd-indexed values
-    # - val_high (from high nibble) contains even-indexed values
-    result_even = val_high * scale_low.to(tl.float32) * global_scale
-    result_odd = val_low * scale_high.to(tl.float32) * global_scale
+    # PTX cvt.rn.f16x2.e2m1x2 unpacks: high nibble -> val_high, low nibble -> val_low.
+    # hi_first=True: high nibble = even-indexed element, low nibble = odd-indexed element.
+    # hi_first=False: high nibble = odd-indexed element, low nibble = even-indexed element.
+    if hi_first:
+        result_even = val_high * scale_low.to(tl.float32) * global_scale
+        result_odd = val_low * scale_high.to(tl.float32) * global_scale
+    else:
+        result_even = val_low * scale_low.to(tl.float32) * global_scale
+        result_odd = val_high * scale_high.to(tl.float32) * global_scale
 
     # Store results
     out_mask_low = packed_mask & (out_col_low < n)
@@ -525,6 +539,7 @@ def dequantize_nvfp4(
     per_tensor_scale: torch.Tensor,
     block_scales: torch.Tensor,
     output_type: torch.dtype = torch.bfloat16,
+    hi_first: bool = True,
 ) -> torch.Tensor:
     # Triton backend: fused kernel with inline SM100 cvt.rn.f16x2.e2m1x2 instruction
     block_size = 16
@@ -558,6 +573,7 @@ def dequantize_nvfp4(
         padded_scale_cols,
         block_size=block_size,
         tile_size=tile_size,
+        hi_first=hi_first,
     )
 
     return output

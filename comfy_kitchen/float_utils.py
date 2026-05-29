@@ -250,23 +250,43 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
-def pack_uint4(uint8_data: torch.Tensor) -> torch.Tensor:
-    # converting to uint8 for operations
+def pack_uint4(uint8_data: torch.Tensor, hi_first: bool = True) -> torch.Tensor:
     shape = uint8_data.shape
     assert shape[-1] % 2 == 0
     uint8_data = uint8_data.contiguous().view(-1)
-    return (uint8_data[::2] << 4 | uint8_data[1::2]).view(down_size(shape))
+    if hi_first:
+        return (uint8_data[::2] << 4 | uint8_data[1::2]).view(down_size(shape))
+    else:
+        return (uint8_data[1::2] << 4 | uint8_data[::2]).view(down_size(shape))
 
 
-def unpack_uint4(uint8_data) -> torch.Tensor:
+def unpack_uint4(uint8_data, hi_first: bool = True) -> torch.Tensor:
     """Get the original weight from the normalized float weight format"""
     assert uint8_data.is_contiguous()
     shape = uint8_data.shape
 
-    first_elements = (uint8_data >> 4).to(torch.uint8)
-    second_elements = (uint8_data & 0b1111).to(torch.uint8)
-    unpacked = torch.stack([first_elements, second_elements], dim=-1).view(up_size(shape))
+    hi = (uint8_data >> 4).to(torch.uint8)
+    lo = (uint8_data & 0b1111).to(torch.uint8)
+    if hi_first:
+        unpacked = torch.stack([hi, lo], dim=-1).view(up_size(shape))
+    else:
+        unpacked = torch.stack([lo, hi], dim=-1).view(up_size(shape))
     return unpacked
+
+
+def swap_nibbles(packed: torch.Tensor) -> torch.Tensor:
+    """Exchange the high and low nibbles of each byte in a uint8 tensor.
+
+    This converts between hi_first=True and hi_first=False FP4 packing
+    without re-quantizing: ``0xAB`` becomes ``0xBA``.
+
+    Args:
+        packed: A uint8 tensor of nibble-packed FP4 values.
+
+    Returns:
+        A new uint8 tensor with the nibble order reversed in every byte.
+    """
+    return ((packed << 4) | (packed >> 4)).to(torch.uint8)
 
 
 def to_blocked(input_matrix, flatten: bool = True) -> torch.Tensor:
@@ -332,8 +352,8 @@ def from_blocked(blocked_matrix, num_rows: int, num_cols: int) -> torch.Tensor:
     return unblocked[:num_rows, :num_cols]
 
 
-def fp4_x2_to_f32(a):
-    a_u8 = unpack_uint4(a)
+def fp4_x2_to_f32(a, hi_first: bool = True):
+    a_u8 = unpack_uint4(a, hi_first=hi_first)
     a_f32 = _floatx_unpacked_to_f32(a_u8, 2, 1)
     return a_f32
 
