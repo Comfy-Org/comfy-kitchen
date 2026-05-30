@@ -105,6 +105,7 @@ set(CUDA_SOURCES
     ops/quantize_nvfp4.cu
     ops/quantize_mxfp8.cu
     ops/cublas_gemm_nvfp4.cu
+    ops/cublas_gemm_int8.cu
     ops/apply_rope.cu
     ops/quantize_svdquant_w4a4.cu
     ops/scaled_mm_svdquant_w4a4.cu
