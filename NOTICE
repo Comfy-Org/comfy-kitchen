@@ -52,6 +52,9 @@ Portions of the following files are derived from PyTorch AO:
 - comfy_kitchen/backends/eager/quantization.py
   Source: https://github.com/pytorch/ao/blob/main/torchao/prototype/mx_formats/nvfp4_tensor.py
 
+- comfy_kitchen/tensor/fp8.py
+  Source: https://github.com/pytorch/ao/blob/main/torchao/dtypes/nf4tensor.py
+
 - comfy_kitchen/float_utils.py (_f32_to_floatx_unpacked, _floatx_unpacked_to_f32)
   Source: https://github.com/pytorch/ao/blob/main/torchao/prototype/mx_formats/custom_cast.py
 
