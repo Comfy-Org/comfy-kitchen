@@ -40,6 +40,8 @@ __all__ = [
     # Positional encoding
     "apply_rope",
     "apply_rope1",
+    "apply_rope_split_half",
+    "apply_rope_split_half1",
     # Utilities
     "swap_nibbles",
     "to_blocked",
@@ -378,9 +380,13 @@ def gemv_awq_w4a16(
 
 
 def apply_rope(
-    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply Rotary Position Embedding (RoPE) to query and key tensors.
+
+    Interleaved layout: pair k uses adjacent elements [2k, 2k+1].
 
     Args:
         xq: Query tensor
@@ -394,9 +400,12 @@ def apply_rope(
 
 
 def apply_rope1(
-    x: torch.Tensor, freqs_cis: torch.Tensor
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
 ) -> torch.Tensor:
     """Apply Rotary Position Embedding (RoPE) to a single tensor.
+
+    Interleaved layout: pair k uses adjacent elements [2k, 2k+1].
 
     Args:
         x: Input tensor
@@ -406,6 +415,52 @@ def apply_rope1(
         Transformed tensor
     """
     return torch.ops.comfy_kitchen.apply_rope1(x, freqs_cis)
+
+
+def apply_rope_split_half(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Rotary Position Embedding (RoPE) to query and key tensors.
+
+    Split-half layout: pair k uses elements [k] and [k + head_dim//2].
+    Matches the formula:
+        t_ = t.reshape(*t.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2).to(freqs.dtype)
+        t_out = freqs[..., 0] * t_[..., 0] + freqs[..., 1] * t_[..., 1]
+        t_out.movedim(-1, -2).reshape(*t.shape).type_as(t)
+
+    Args:
+        xq: Query tensor
+        xk: Key tensor
+        freqs_cis: Precomputed frequency tensor shape (..., head_dim//2, 2, 2)
+
+    Returns:
+        Tuple of (transformed_query, transformed_key)
+    """
+    return torch.ops.comfy_kitchen.apply_rope_split_half(xq, xk, freqs_cis)
+
+
+def apply_rope_split_half1(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> torch.Tensor:
+    """Apply Rotary Position Embedding (RoPE) to a single tensor.
+
+    Split-half layout: pair k uses elements [k] and [k + head_dim//2].
+    Matches the formula:
+        t_ = t.reshape(*t.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2).to(freqs.dtype)
+        t_out = freqs[..., 0] * t_[..., 0] + freqs[..., 1] * t_[..., 1]
+        t_out.movedim(-1, -2).reshape(*t.shape).type_as(t)
+
+    Args:
+        x: Input tensor
+        freqs_cis: Precomputed frequency tensor shape (..., head_dim//2, 2, 2)
+
+    Returns:
+        Transformed tensor
+    """
+    return torch.ops.comfy_kitchen.apply_rope_split_half1(x, freqs_cis)
 
 
 # =============================================================================

@@ -45,6 +45,7 @@ def apply_rope_kernel(
     stride_freqs_pair,
     compute_dtype: tl.constexpr,
     block_size: tl.constexpr,
+    split_half: tl.constexpr,
 ):
     """Triton kernel for RoPE (Rotary Position Embedding) with flexible layout.
 
@@ -59,6 +60,7 @@ def apply_rope_kernel(
         stride_*: Stride information for memory access (enables layout flexibility)
         compute_dtype: Data type for computation (from freqs_cis)
         block_size: Number of elements to process per block
+        split_half: if True, pair k uses elements [k] and [k + n_pairs]; else uses [2k, 2k+1]
     """
     # Get program ID - each program processes a chunk of the output
     pid = tl.program_id(0)
@@ -81,8 +83,14 @@ def apply_rope_kernel(
     batch_idx = temp // dim1
 
     # Calculate indices for the two elements in each pair
-    dim_idx_0 = pair_idx * 2
-    dim_idx_1 = pair_idx * 2 + 1
+    if split_half:
+        # pair k: first component at [k], second at [k + n_pairs]
+        dim_idx_0 = pair_idx
+        dim_idx_1 = pair_idx + n_pairs
+    else:
+        # pair k: adjacent elements [2k, 2k+1]
+        dim_idx_0 = pair_idx * 2
+        dim_idx_1 = pair_idx * 2 + 1
 
     # Calculate offsets for xq and xk using strides (layout-agnostic)
     x_offset_0 = (batch_idx * stride_x_batch +
@@ -135,7 +143,7 @@ def _apply_freq_tile(x_ptr, x_out_ptr, mask, freqs_00, freqs_01, freqs_10, freqs
     tl.store(x_out_ptr + x_offset_1, xq_out_1, mask=mask)
 
 
-def _apply_rope(x1: torch.Tensor, freqs_cis: torch.Tensor, x2: torch.Tensor = None):
+def _apply_rope(x1: torch.Tensor, freqs_cis: torch.Tensor, x2: torch.Tensor = None, split_half: bool = False):
     batch, dim1, dim2, head_dim = x1.shape
     freqs_batch, freqs_dim1, freqs_dim2 = freqs_cis.shape[0], freqs_cis.shape[1], freqs_cis.shape[2]
 
@@ -205,6 +213,7 @@ def _apply_rope(x1: torch.Tensor, freqs_cis: torch.Tensor, x2: torch.Tensor = No
         stride_freqs[5],  # pair element (2)
         compute_dtype=compute_dtype,
         block_size=block_size,
+        split_half=split_half,
     )
 
     return x1_out, x2_out
@@ -216,6 +225,17 @@ def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rope(
-        xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _apply_rope(xq, freqs_cis, xk)
+
+
+def apply_rope_split_half1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    x_out, _ = _apply_rope(x, freqs_cis, split_half=True)
+    return x_out
+
+
+def apply_rope_split_half(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _apply_rope(xq, freqs_cis, xk, split_half=True)

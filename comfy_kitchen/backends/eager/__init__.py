@@ -1,6 +1,8 @@
 __all__ = [
     "apply_rope",
     "apply_rope1",
+    "apply_rope_split_half",
+    "apply_rope_split_half1",
     "dequantize_mxfp8",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
@@ -35,7 +37,7 @@ from .quantization import (
     stochastic_rounding_fp8,
     int8_linear,
 )
-from .rope import apply_rope, apply_rope1
+from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
 from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
 
 
@@ -136,6 +138,21 @@ def _build_constraints() -> dict:
             default_devices=all_devices,
         ),
         "apply_rope": FunctionConstraints(
+            params={
+                "xq": ParamConstraint(dtypes=standard_floats),
+                "xk": ParamConstraint(dtypes=standard_floats),
+                "freqs_cis": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "apply_rope_split_half1": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "freqs_cis": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "apply_rope_split_half": FunctionConstraints(
             params={
                 "xq": ParamConstraint(dtypes=standard_floats),
                 "xk": ParamConstraint(dtypes=standard_floats),

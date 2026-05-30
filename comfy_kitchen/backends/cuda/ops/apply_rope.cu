@@ -48,10 +48,11 @@ __global__ void apply_rope_kernel(
     int64_t stride_freqs_dim2,
     int64_t stride_freqs_dim,
     int64_t stride_freqs_rot,
-    int64_t stride_freqs_pair) {
-    
+    int64_t stride_freqs_pair,
+    bool split_half) {
+
     using ComputeType = FreqsType;
-    
+
     // Each thread processes 2 pairs (4 elements) for better memory coalescing
     const int64_t n_pairs = head_dim / 2;
     const int64_t pairs_per_thread = 2;
@@ -174,46 +175,86 @@ __global__ void apply_rope_kernel(
                elem_offset;
     };
     
-    // Helper lambda to load 2 pairs (4 elements) - adapts to contiguous vs strided
+    // Helper lambda to load 2 pairs (4 elements) - adapts to contiguous vs strided.
+    // split_half=false (default): pair k uses adjacent elements [2k, 2k+1] (interleaved).
+    // split_half=true: pair k uses elements [k] and [k + n_pairs] (first/second half split).
     auto load_pairs = [&](const InputType* x_in, ComputeType& x_0, ComputeType& x_1, ComputeType& x_2, ComputeType& x_3) {
-        if (stride_x_dim == 1) {
-            // Vectorized load for contiguous tensors (4x fp16/bf16 = 64-bit as float2)
-            union { float2 vec; InputType elems[4]; } data;
-            data.vec = *reinterpret_cast<const float2*>(&x_in[calc_offset(pair_idx_0 * 2)]);
-            x_0 = static_cast<ComputeType>(data.elems[0]);
-            x_1 = static_cast<ComputeType>(data.elems[1]);
-            x_2 = static_cast<ComputeType>(data.elems[2]);
-            x_3 = static_cast<ComputeType>(data.elems[3]);
+        if (split_half) {
+            if (stride_x_dim == 1) {
+                // First half: pair_idx_0 and pair_idx_1 are adjacent — one float load (2 halfs)
+                union { float vec; InputType elems[2]; } lo, hi;
+                lo.vec = *reinterpret_cast<const float*>(&x_in[calc_offset(pair_idx_0)]);
+                hi.vec = *reinterpret_cast<const float*>(&x_in[calc_offset(pair_idx_0 + n_pairs)]);
+                x_0 = static_cast<ComputeType>(lo.elems[0]);  // pair 0, first component
+                x_2 = static_cast<ComputeType>(lo.elems[1]);  // pair 1, first component
+                x_1 = static_cast<ComputeType>(hi.elems[0]);  // pair 0, second component
+                x_3 = static_cast<ComputeType>(hi.elems[1]);  // pair 1, second component
+            } else {
+                x_0 = static_cast<ComputeType>(x_in[calc_offset(pair_idx_0 * stride_x_dim)]);
+                x_1 = static_cast<ComputeType>(x_in[calc_offset((pair_idx_0 + n_pairs) * stride_x_dim)]);
+                if (process_pair_1) {
+                    x_2 = static_cast<ComputeType>(x_in[calc_offset(pair_idx_1 * stride_x_dim)]);
+                    x_3 = static_cast<ComputeType>(x_in[calc_offset((pair_idx_1 + n_pairs) * stride_x_dim)]);
+                }
+            }
         } else {
-            // Scalar load for strided tensors
-            const int64_t off0 = calc_offset(pair_idx_0 * 2 * stride_x_dim);
-            x_0 = static_cast<ComputeType>(x_in[off0]);
-            x_1 = static_cast<ComputeType>(x_in[off0 + stride_x_dim]);
-            if (process_pair_1) {
-                x_2 = static_cast<ComputeType>(x_in[off0 + 2 * stride_x_dim]);
-                x_3 = static_cast<ComputeType>(x_in[off0 + 3 * stride_x_dim]);
+            if (stride_x_dim == 1) {
+                // Vectorized load for contiguous tensors (4x fp16/bf16 = 64-bit as float2)
+                union { float2 vec; InputType elems[4]; } data;
+                data.vec = *reinterpret_cast<const float2*>(&x_in[calc_offset(pair_idx_0 * 2)]);
+                x_0 = static_cast<ComputeType>(data.elems[0]);
+                x_1 = static_cast<ComputeType>(data.elems[1]);
+                x_2 = static_cast<ComputeType>(data.elems[2]);
+                x_3 = static_cast<ComputeType>(data.elems[3]);
+            } else {
+                const int64_t off0 = calc_offset(pair_idx_0 * 2 * stride_x_dim);
+                x_0 = static_cast<ComputeType>(x_in[off0]);
+                x_1 = static_cast<ComputeType>(x_in[off0 + stride_x_dim]);
+                if (process_pair_1) {
+                    x_2 = static_cast<ComputeType>(x_in[off0 + 2 * stride_x_dim]);
+                    x_3 = static_cast<ComputeType>(x_in[off0 + 3 * stride_x_dim]);
+                }
             }
         }
     };
-    
-    // Helper lambda to store 2 pairs (4 elements) - adapts to contiguous vs strided
+
+    // Helper lambda to store 2 pairs (4 elements) - adapts to contiguous vs strided.
     auto store_pairs = [&](InputType* x_out, ComputeType x_0, ComputeType x_1, ComputeType x_2, ComputeType x_3) {
-        if (stride_x_dim == 1) {
-            // Vectorized store for contiguous tensors (4x fp16/bf16 = 64-bit as float2)
-            union { float2 vec; InputType elems[4]; } data;
-            data.elems[0] = static_cast<InputType>(x_0);
-            data.elems[1] = static_cast<InputType>(x_1);
-            data.elems[2] = static_cast<InputType>(x_2);
-            data.elems[3] = static_cast<InputType>(x_3);
-            *reinterpret_cast<float2*>(&x_out[calc_offset(pair_idx_0 * 2)]) = data.vec;
+        if (split_half) {
+            if (stride_x_dim == 1) {
+                // First half outputs (pair_idx_0 and pair_idx_1) are adjacent
+                union { float vec; InputType elems[2]; } lo, hi;
+                lo.elems[0] = static_cast<InputType>(x_0);
+                lo.elems[1] = static_cast<InputType>(x_2);
+                hi.elems[0] = static_cast<InputType>(x_1);
+                hi.elems[1] = static_cast<InputType>(x_3);
+                *reinterpret_cast<float*>(&x_out[calc_offset(pair_idx_0)]) = lo.vec;
+                *reinterpret_cast<float*>(&x_out[calc_offset(pair_idx_0 + n_pairs)]) = hi.vec;
+            } else {
+                x_out[calc_offset(pair_idx_0 * stride_x_dim)] = static_cast<InputType>(x_0);
+                x_out[calc_offset((pair_idx_0 + n_pairs) * stride_x_dim)] = static_cast<InputType>(x_1);
+                if (process_pair_1) {
+                    x_out[calc_offset(pair_idx_1 * stride_x_dim)] = static_cast<InputType>(x_2);
+                    x_out[calc_offset((pair_idx_1 + n_pairs) * stride_x_dim)] = static_cast<InputType>(x_3);
+                }
+            }
         } else {
-            // Scalar store for strided tensors
-            const int64_t off0 = calc_offset(pair_idx_0 * 2 * stride_x_dim);
-            x_out[off0] = static_cast<InputType>(x_0);
-            x_out[off0 + stride_x_dim] = static_cast<InputType>(x_1);
-            if (process_pair_1) {
-                x_out[off0 + 2 * stride_x_dim] = static_cast<InputType>(x_2);
-                x_out[off0 + 3 * stride_x_dim] = static_cast<InputType>(x_3);
+            if (stride_x_dim == 1) {
+                // Vectorized store for contiguous tensors (4x fp16/bf16 = 64-bit as float2)
+                union { float2 vec; InputType elems[4]; } data;
+                data.elems[0] = static_cast<InputType>(x_0);
+                data.elems[1] = static_cast<InputType>(x_1);
+                data.elems[2] = static_cast<InputType>(x_2);
+                data.elems[3] = static_cast<InputType>(x_3);
+                *reinterpret_cast<float2*>(&x_out[calc_offset(pair_idx_0 * 2)]) = data.vec;
+            } else {
+                const int64_t off0 = calc_offset(pair_idx_0 * 2 * stride_x_dim);
+                x_out[off0] = static_cast<InputType>(x_0);
+                x_out[off0 + stride_x_dim] = static_cast<InputType>(x_1);
+                if (process_pair_1) {
+                    x_out[off0 + 2 * stride_x_dim] = static_cast<InputType>(x_2);
+                    x_out[off0 + 3 * stride_x_dim] = static_cast<InputType>(x_3);
+                }
             }
         }
     };
@@ -277,27 +318,27 @@ void apply_rope_launcher(
     int64_t stride_freqs_dim,
     int64_t stride_freqs_rot,
     int64_t stride_freqs_pair,
+    bool split_half,
     cudaStream_t stream) {
-    
+
     const int64_t n_pairs = head_dim / 2;
     const int64_t pairs_per_thread = 2;
     const int64_t n_pair_groups = (n_pairs + pairs_per_thread - 1) / pairs_per_thread;
     const int64_t total_pair_groups = batch * dim1 * dim2 * n_pair_groups;
-    
+
     if (total_pair_groups == 0) {
         return;
     }
-    
+
     const int block_size = kBlockSize;
     const int64_t num_blocks = (total_pair_groups + block_size - 1) / block_size;
-    
-    // Single unified kernel handles both contiguous and strided tensors
+
     apply_rope_kernel<InputType, FreqsType><<<num_blocks, block_size, 0, stream>>>(
         xq, xk, freqs, xq_out, xk_out, batch, dim1, dim2, head_dim,
         freqs_batch, freqs_dim1, freqs_dim2,
         stride_x_batch, stride_x_dim1, stride_x_dim2, stride_x_dim,
         stride_freqs_batch, stride_freqs_dim1, stride_freqs_dim2, stride_freqs_dim,
-        stride_freqs_rot, stride_freqs_pair
+        stride_freqs_rot, stride_freqs_pair, split_half
     );
     
     // Check for kernel launch errors
@@ -339,11 +380,12 @@ void launch_apply_rope_kernel(
     int64_t stride_freqs_pair,
     int input_dtype_code,
     int freqs_dtype_code,
+    bool split_half,
     cudaStream_t stream) {
-    
+
     // Dispatch based on input dtype code (FP16/BF16) and freqs dtype code (FP32/FP16/BF16)
     // dtype codes: 0=float32, 1=float16, 2=bfloat16
-    DISPATCH_HALF_INPUT_FP_FREQS_DTYPES(input_dtype_code, freqs_dtype_code, 
+    DISPATCH_HALF_INPUT_FP_FREQS_DTYPES(input_dtype_code, freqs_dtype_code,
                                          InputType, FreqsType, [&] {
         comfy::apply_rope_launcher<InputType, FreqsType>(
             static_cast<const InputType*>(xq),
@@ -355,7 +397,7 @@ void launch_apply_rope_kernel(
             freqs_batch, freqs_dim1, freqs_dim2,
             stride_x_batch, stride_x_dim1, stride_x_dim2, stride_x_dim,
             stride_freqs_batch, stride_freqs_dim1, stride_freqs_dim2, stride_freqs_dim,
-            stride_freqs_rot, stride_freqs_pair,
+            stride_freqs_rot, stride_freqs_pair, split_half,
             stream
         );
     });
