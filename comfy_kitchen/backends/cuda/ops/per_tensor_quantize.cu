@@ -18,9 +18,11 @@
 #include "float_utils.cuh"
 #include "dtype_dispatch.cuh"
 
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace comfy {
 
@@ -116,6 +118,48 @@ __global__ void dequantize_fp8_tensor_kernel(
     }
 }
 
+template<typename InputType, typename OutputType>
+__global__ void stochastic_round_fp8_kernel(
+    uint8_t *rng_and_dst,
+    const InputType *src,
+    const uint32_t size) {
+
+    constexpr float kFP8Max = FP8LimitsTrait<OutputType>::max;
+    constexpr int kExponentBits = std::is_same_v<OutputType, __nv_fp8_e4m3> ? 4 : 5;
+    constexpr int kMantissaBits = std::is_same_v<OutputType, __nv_fp8_e4m3> ? 3 : 2;
+    constexpr int kExponentBias = std::is_same_v<OutputType, __nv_fp8_e4m3> ? 7 : 15;
+    constexpr float kMantissaLevels = static_cast<float>(1 << kMantissaBits);
+    const float subnormal_mantissa_scale = exp2f(-kExponentBias + 1 - kMantissaBits);
+    const float subnormal_value_scale = exp2f(-kExponentBias + 1);
+
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) {
+        return;
+    }
+
+    const float value = __half2float(__float2half(static_cast<float>(src[idx])));
+    const float abs_value = fabsf(value);
+    const float sign = value < 0.0f ? -1.0f : (value > 0.0f ? 1.0f : 0.0f);
+
+    float exponent = floorf(log2f(abs_value)) + kExponentBias;
+    exponent = clamp(exponent, 0.0f, static_cast<float>((1 << kExponentBits) - 1));
+    const bool normal = exponent != 0.0f;
+    const float exponent_scale = exp2f(exponent - kExponentBias);
+
+    const float normal_mantissa = (abs_value / exponent_scale - 1.0f) * kMantissaLevels;
+    const float subnormal_mantissa = abs_value / subnormal_mantissa_scale;
+    const float random = static_cast<float>(rng_and_dst[idx]) * (1.0f / 256.0f);
+    const float mantissa = floorf((normal ? normal_mantissa : subnormal_mantissa) + random) / kMantissaLevels;
+    const float rounded = sign * (normal ? exponent_scale * (1.0f + mantissa) : subnormal_value_scale * mantissa);
+
+    union {
+        OutputType fp8;
+        uint8_t u8;
+    } out;
+    out.fp8 = static_cast<OutputType>(clamp(rounded, -kFP8Max, kFP8Max));
+    rng_and_dst[idx] = out.u8;
+}
+
 } // anonymous namespace
 
 } // namespace comfy
@@ -198,6 +242,43 @@ void launch_dequantize_fp8_kernel(
         });
 
     // Check for kernel launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA kernel launch failed: ") + cudaGetErrorString(err));
+    }
+}
+
+void launch_stochastic_round_fp8_kernel(
+    void* rng_and_output,
+    const void* input,
+    int64_t numel,
+    int rng_dtype_code,
+    int input_dtype_code,
+    int output_dtype_code,
+    cudaStream_t stream) {
+
+    if (numel == 0) {
+        return;
+    }
+
+    if (rng_dtype_code != 3) {
+        throw std::runtime_error("stochastic_round_fp8 requires uint8 RNG storage");
+    }
+
+    constexpr int vals_per_thread = 1;
+    constexpr int vals_per_block = vals_per_thread * comfy::kQMaxKernelThreads;
+    const int blocks = static_cast<int>((numel + vals_per_block - 1) / vals_per_block);
+
+    DISPATCH_INPUT_FP8_OUTPUT_DTYPES(
+        input_dtype_code, output_dtype_code,
+        InputType, OutputType, [&] {
+            comfy::stochastic_round_fp8_kernel<InputType, OutputType>
+                <<<blocks, comfy::kQMaxKernelThreads, 0, stream>>>(
+                    static_cast<uint8_t*>(rng_and_output),
+                    static_cast<const InputType*>(input),
+                    numel);
+        });
+
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string("CUDA kernel launch failed: ") + cudaGetErrorString(err));

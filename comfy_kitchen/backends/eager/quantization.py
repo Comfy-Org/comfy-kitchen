@@ -60,11 +60,64 @@ def dequantize_per_tensor_fp8(
     dq_tensor = x.to(dtype=output_type) * scale.to(dtype=output_type)
     return dq_tensor
 
+
+def calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, rng):  # noqa: N803
+    mantissa_scaled = torch.where(
+        normal_mask,
+        (abs_x / (2.0 ** (exponent - EXPONENT_BIAS)) - 1.0) * (2**MANTISSA_BITS),
+        (abs_x / (2.0 ** (-EXPONENT_BIAS + 1 - MANTISSA_BITS))),
+    )
+
+    mantissa_scaled += rng.to(dtype=mantissa_scaled.dtype) * (1.0 / 256.0)
+    return mantissa_scaled.floor() / (2**MANTISSA_BITS)
+
+
+def stochastic_rounding_fp8(
+    x: torch.Tensor,
+    rng: torch.Tensor,
+    output_type: torch.dtype = torch.float8_e4m3fn,
+) -> torch.Tensor:
+    if output_type == torch.float8_e4m3fn:
+        EXPONENT_BITS, MANTISSA_BITS, EXPONENT_BIAS = 4, 3, 7  # noqa: N806
+    elif output_type == torch.float8_e5m2:
+        EXPONENT_BITS, MANTISSA_BITS, EXPONENT_BIAS = 5, 2, 15  # noqa: N806
+    else:
+        raise ValueError(
+            f"Unsupported output_type: {output_type}. Expected torch.float8_e4m3fn "
+            "or torch.float8_e5m2"
+        )
+
+    x = x.half()
+    sign = torch.sign(x)
+    abs_x = x.abs()
+    sign = torch.where(abs_x == 0, 0, sign)
+
+    exponent = torch.clamp(
+        torch.floor(torch.log2(abs_x)) + EXPONENT_BIAS,
+        0,
+        2**EXPONENT_BITS - 1,
+    )
+    normal_mask = ~(exponent == 0)
+
+    abs_x[:] = calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, rng)
+
+    sign *= torch.where(
+        normal_mask,
+        (2.0 ** (exponent - EXPONENT_BIAS)) * (1.0 + abs_x),
+        (2.0 ** (-EXPONENT_BIAS + 1)) * abs_x,
+    )
+
+    info = torch.finfo(output_type)
+    torch.clamp(sign, min=info.min, max=info.max, out=sign)
+    return sign.to(output_type)
+
+
 def quantize_nvfp4(
     x: torch.Tensor,
     per_tensor_scale: torch.Tensor,
     epsilon: float = 0.0,
     pad_16x: bool = False,
+    hi_first: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     orig_shape = x.shape
 
@@ -102,7 +155,7 @@ def quantize_nvfp4(
     data_scaled = data_scaled.view(orig_shape)
 
     data_lp = _f32_to_floatx_unpacked(data_scaled, 2, 1)
-    data_lp = pack_uint4(data_lp)
+    data_lp = pack_uint4(data_lp, hi_first=hi_first)
     blocked_scales = to_blocked(out_scales.to(torch.float8_e4m3fn), flatten=False)
     return data_lp, blocked_scales
 
@@ -120,6 +173,7 @@ def dequantize_nvfp4(
     per_tensor_scale: torch.Tensor,
     block_scales: torch.Tensor,
     output_type: torch.dtype = torch.bfloat16,
+    hi_first: bool = True,
 ) -> torch.Tensor:
     lut = E2M1_LUT_CACHE.get((qx.device, output_type))
     if lut is None:
@@ -128,7 +182,10 @@ def dequantize_nvfp4(
 
     lo = qx & 0x0F
     hi = qx >> 4
-    out = torch.stack([hi, lo], dim=-1).view(*qx.shape[:-1], -1)
+    if hi_first:
+        out = torch.stack([hi, lo], dim=-1).view(*qx.shape[:-1], -1)
+    else:
+        out = torch.stack([lo, hi], dim=-1).view(*qx.shape[:-1], -1)
     out = torch.nn.functional.embedding(out.int(), lut).squeeze(-1)
 
     # Get original shape (packed tensor has half the columns)
@@ -417,6 +474,7 @@ def _op_quantize_nvfp4(
     per_tensor_scale: torch.Tensor,
     epsilon: float,
     pad_16x: bool,
+    hi_first: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize tensor to NVFP4 format with block-wise scaling.
 
@@ -425,19 +483,21 @@ def _op_quantize_nvfp4(
         per_tensor_scale: Global scale factor
         epsilon: Epsilon for numerical stability
         pad_16x: If True, pad dimensions to be divisible by 16
+        hi_first: If True, the even-indexed element is packed into the high nibble (default).
+                  If False, the even-indexed element goes into the low nibble.
 
     Returns:
         Tuple of (quantized_tensor, block_scales)
     """
     from comfy_kitchen.registry import registry
 
-    kwargs = {"x": x, "per_tensor_scale": per_tensor_scale, "epsilon": epsilon, "pad_16x": pad_16x}
+    kwargs = {"x": x, "per_tensor_scale": per_tensor_scale, "epsilon": epsilon, "pad_16x": pad_16x, "hi_first": hi_first}
     impl = registry.get_implementation("quantize_nvfp4", kwargs=kwargs)
     return impl(**kwargs)
 
 
 @_op_quantize_nvfp4.register_fake
-def _op_quantize_nvfp4_fake(x, per_tensor_scale, epsilon, pad_16x):
+def _op_quantize_nvfp4_fake(x, per_tensor_scale, epsilon, pad_16x, hi_first):
     rows, cols = x.shape
 
     if pad_16x:
@@ -461,6 +521,7 @@ def _op_dequantize_nvfp4(
     per_tensor_scale: torch.Tensor,
     block_scales: torch.Tensor,
     output_dtype_code: int,
+    hi_first: bool,
 ) -> torch.Tensor:
     """Dequantize tensor from NVFP4 format with block-wise scaling.
 
@@ -469,6 +530,8 @@ def _op_dequantize_nvfp4(
         per_tensor_scale: Global scale factor
         block_scales: Block scales in swizzled layout (float8_e4m3fn)
         output_dtype_code: Target dtype code (0=float32, 1=float16, 2=bfloat16)
+        hi_first: If True, the high nibble is the even-indexed element (default).
+                  If False, the low nibble is the even-indexed element.
 
     Returns:
         Dequantized tensor in specified output format
@@ -476,13 +539,13 @@ def _op_dequantize_nvfp4(
     from comfy_kitchen.registry import registry
 
     output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    kwargs = {"qx": qx, "per_tensor_scale": per_tensor_scale, "block_scales": block_scales, "output_type": output_dtype}
+    kwargs = {"qx": qx, "per_tensor_scale": per_tensor_scale, "block_scales": block_scales, "output_type": output_dtype, "hi_first": hi_first}
     impl = registry.get_implementation("dequantize_nvfp4", kwargs=kwargs)
     return impl(**kwargs)
 
 
 @_op_dequantize_nvfp4.register_fake
-def _op_dequantize_nvfp4_fake(qx, per_tensor_scale, block_scales, output_dtype_code):
+def _op_dequantize_nvfp4_fake(qx, per_tensor_scale, block_scales, output_dtype_code, hi_first):
     output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     # Unpacked shape: cols * 2 (since 2 FP4 values per uint8)
     rows, cols_packed = qx.shape

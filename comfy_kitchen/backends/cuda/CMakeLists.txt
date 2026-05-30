@@ -106,6 +106,9 @@ set(CUDA_SOURCES
     ops/quantize_mxfp8.cu
     ops/cublas_gemm_nvfp4.cu
     ops/apply_rope.cu
+    ops/quantize_svdquant_w4a4.cu
+    ops/scaled_mm_svdquant_w4a4.cu
+    ops/awq_w4a16.cu
 )
 
 set(CPP_SOURCES
@@ -191,4 +194,3 @@ install(TARGETS _C
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
 )
-
