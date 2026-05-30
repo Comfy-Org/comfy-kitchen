@@ -101,6 +101,7 @@ extern "C" {
         int64_t stride_freqs_pair,
         int input_dtype_code,
         int freqs_dtype_code,
+        bool split_half,
         cudaStream_t stream);
 
     void launch_quantize_nvfp4_kernel(
@@ -462,7 +463,8 @@ void apply_rope(
     nb::ndarray<nb::device::cuda> xq_out,
     nb::object xk_obj,
     nb::object xk_out_obj,
-    uintptr_t stream_ptr) {
+    uintptr_t stream_ptr,
+    bool split_half = false) {
 
     // Get xq dimensions: (batch, dim1, dim2, head_dim) - layout agnostic
     int64_t batch = xq.shape(0);
@@ -571,6 +573,7 @@ void apply_rope(
         stride_freqs_pair,
         input_dtype_code,
         freqs_dtype_code,
+        split_half,
         stream
     );
 }
@@ -742,7 +745,8 @@ NB_MODULE(_C, m) {
           nb::arg("xq_out"),
           nb::arg("xk") = nullptr,
           nb::arg("xk_out") = nullptr,
-          nb::arg("stream_ptr"));
+          nb::arg("stream_ptr"),
+          nb::arg("split_half") = false);
 
     m.def("quantize_nvfp4", &quantize_nvfp4,
           "Quantize to FP4 E2M1 with E4M3 block scales using cuBLAS tiled layout",

@@ -22,6 +22,8 @@ import torch
 __all__ = [
     "apply_rope",
     "apply_rope1",
+    "apply_rope_split_half",
+    "apply_rope_split_half1",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
     "gemv_awq_w4a16",
@@ -487,6 +489,7 @@ def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         None,  # xk
         None,  # xk_out
         stream_ptr,
+        False,
     )
 
     return x_out
@@ -516,6 +519,61 @@ def apply_rope(
         _wrap_for_dlpack(xk),
         _wrap_for_dlpack(xk_out),
         stream_ptr,
+        False,
+    )
+
+    return xq_out, xk_out
+
+
+def apply_rope_split_half1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not freqs_cis.is_contiguous():
+        freqs_cis = freqs_cis.contiguous()
+
+    x_out = torch.empty_like(x)
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+
+    _C.apply_rope(
+        _wrap_for_dlpack(x),
+        _wrap_for_dlpack(freqs_cis),
+        _wrap_for_dlpack(x_out),
+        None,
+        None,
+        stream_ptr,
+        True,
+    )
+
+    return x_out
+
+
+def apply_rope_split_half(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if xq.shape != xk.shape:
+        return apply_rope_split_half1(xq, freqs_cis), apply_rope_split_half1(xk, freqs_cis)
+
+    if not xq.is_contiguous():
+        xq = xq.contiguous()
+    if not xk.is_contiguous():
+        xk = xk.contiguous()
+    if not freqs_cis.is_contiguous():
+        freqs_cis = freqs_cis.contiguous()
+
+    xq_out = torch.empty_like(xq)
+    xk_out = torch.empty_like(xk)
+    stream_ptr = torch.cuda.current_stream(xq.device).cuda_stream
+
+    _C.apply_rope(
+        _wrap_for_dlpack(xq),
+        _wrap_for_dlpack(freqs_cis),
+        _wrap_for_dlpack(xq_out),
+        _wrap_for_dlpack(xk),
+        _wrap_for_dlpack(xk_out),
+        stream_ptr,
+        True,
     )
 
     return xq_out, xk_out
@@ -935,6 +993,36 @@ def _build_constraints() -> dict:
             default_devices=cuda_devices,
         ),
         "apply_rope": FunctionConstraints(
+            params={
+                "xq": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "xk": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(6),),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "apply_rope_split_half1": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "freqs_cis": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(6),),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "apply_rope_split_half": FunctionConstraints(
             params={
                 "xq": ParamConstraint(
                     dtypes=frozenset({torch.float16, torch.bfloat16}),

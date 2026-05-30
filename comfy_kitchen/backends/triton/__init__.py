@@ -1,6 +1,8 @@
 __all__ = [
     "apply_rope",
     "apply_rope1",
+    "apply_rope_split_half",
+    "apply_rope_split_half1",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
     "quantize_mxfp8",
@@ -22,7 +24,7 @@ try:
         quantize_nvfp4,
         quantize_per_tensor_fp8,
     )
-    from .rope import apply_rope, apply_rope1
+    from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
 except ImportError as e:
     _TRITON_AVAILABLE = False
     _TRITON_ERROR = f"ImportError: {e!s}"
@@ -105,6 +107,21 @@ def _build_constraints() -> dict:
             default_devices=triton_devices,
         ),
         "apply_rope": FunctionConstraints(
+            params={
+                "xq": ParamConstraint(dtypes=standard_floats),
+                "xk": ParamConstraint(dtypes=standard_floats),
+                "freqs_cis": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
+        "apply_rope_split_half1": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "freqs_cis": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
+        "apply_rope_split_half": FunctionConstraints(
             params={
                 "xq": ParamConstraint(dtypes=standard_floats),
                 "xk": ParamConstraint(dtypes=standard_floats),
