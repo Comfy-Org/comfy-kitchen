@@ -43,6 +43,23 @@ class TestBackendSystem:
         backends = ck.list_backends()
         assert backends["triton"]["disabled"] is False
 
+    def test_int8_capabilities_listed(self):
+        """Test that int8 operations are listed in backend capabilities."""
+        import comfy_kitchen as ck
+        backends = ck.list_backends()
+
+        # Check eager
+        eager_caps = backends["eager"]["capabilities"]
+        assert "int8_linear" in eager_caps
+        assert "quantize_int8_tensorwise" in eager_caps
+        assert "quantize_int8_rowwise" in eager_caps
+        assert "dequantize_int8_simple" in eager_caps
+
+        # Check cuda (if available)
+        if backends["cuda"]["available"]:
+            cuda_caps = backends["cuda"]["capabilities"]
+            assert "int8_linear" in cuda_caps
+
     def test_backend_context_manager_override(self, small_tensor):
         """Test that use_backend context manager correctly overrides backend selection."""
         import comfy_kitchen as ck

@@ -188,3 +188,125 @@ class TestCUDAGraphCompatibility:
         assert static_output.dtype == dtype
         assert static_output.shape == (m, n)
         assert not torch.isnan(static_output).any()
+
+    def test_quantize_int8_cuda_graph(self):
+        """Test INT8 quantization inside CUDA graph capture."""
+        try:
+            from comfy_kitchen.backends import cuda as cuda_backend
+            if not cuda_backend._EXT_AVAILABLE:
+                pytest.skip("CUDA extension not available")
+        except ImportError:
+            pytest.skip("CUDA backend not available")
+
+        device = "cuda"
+        dtype = torch.bfloat16
+
+        # Static tensors for graph capture
+        static_input = torch.randn(128, 1024, device=device, dtype=dtype)
+
+        stream = torch.cuda.Stream()
+
+        # Warmup on side stream
+        with torch.cuda.stream(stream), ck.use_backend("cuda"):
+            ck.quantize_int8_tensorwise(static_input)
+        stream.synchronize()
+
+        # Capture graph
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph), ck.use_backend("cuda"):
+            static_q, static_s = ck.quantize_int8_tensorwise(static_input)
+        stream.synchronize()
+
+        # Replay graph
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+
+        # Verify outputs are valid
+        assert static_q.dtype == torch.int8
+        assert static_q.shape == static_input.shape
+        assert static_s.dtype == torch.float32
+
+    def test_dequantize_int8_cuda_graph(self):
+        """Test INT8 dequantization inside CUDA graph capture."""
+        try:
+            from comfy_kitchen.backends import cuda as cuda_backend
+            if not cuda_backend._EXT_AVAILABLE:
+                pytest.skip("CUDA extension not available")
+        except ImportError:
+            pytest.skip("CUDA backend not available")
+
+        device = "cuda"
+        dtype = torch.bfloat16
+
+        # Create input
+        x = torch.randn(128, 1024, device=device, dtype=dtype)
+        with ck.use_backend("cuda"):
+            static_q, static_s = ck.quantize_int8_tensorwise(x)
+
+        stream = torch.cuda.Stream()
+
+        # Warmup
+        with torch.cuda.stream(stream), ck.use_backend("cuda"):
+            ck.dequantize_int8_simple(static_q, static_s)
+        stream.synchronize()
+
+        # Capture graph
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph), ck.use_backend("cuda"):
+            static_output = ck.dequantize_int8_simple(static_q, static_s)
+        stream.synchronize()
+
+        # Replay graph
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+
+        # Verify output
+        assert static_output.dtype == torch.float32 # Default for dequantize_int8_simple
+        assert static_output.shape == static_q.shape
+        assert not torch.isnan(static_output).any()
+
+    def test_int8_linear_cuda_graph(self):
+        """Test INT8 linear inside CUDA graph capture."""
+        try:
+            from comfy_kitchen.backends import cuda as cuda_backend
+            if not cuda_backend._EXT_AVAILABLE:
+                pytest.skip("CUDA extension not available")
+        except ImportError:
+            pytest.skip("CUDA backend not available")
+
+        device = "cuda"
+        dtype = torch.bfloat16
+        m, k, n = 128, 256, 512
+
+        # Create and quantize inputs
+        x = torch.randn(m, k, device=device, dtype=dtype)
+        w = torch.randn(n, k, device=device, dtype=dtype)
+        bias = torch.randn(n, device=device, dtype=dtype)
+
+        with ck.use_backend("cuda"):
+            qw, sw = ck.quantize_int8_tensorwise(w)
+
+        stream = torch.cuda.Stream()
+
+        # Warmup
+        with torch.cuda.stream(stream), ck.use_backend("cuda"):
+            ck.int8_linear(x, qw, sw, bias, out_dtype=dtype)
+        stream.synchronize()
+
+        # Capture graph
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph), ck.use_backend("cuda"):
+            static_output = ck.int8_linear(x, qw, sw, bias, out_dtype=dtype)
+        stream.synchronize()
+
+        # Replay graph
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+
+        # Verify output
+        assert static_output.dtype == dtype
+        assert static_output.shape == (m, n)
+        assert not torch.isnan(static_output).any()

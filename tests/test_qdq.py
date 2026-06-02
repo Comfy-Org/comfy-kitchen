@@ -507,3 +507,188 @@ class TestScaledMMNVFP4:
             delta_hp = torch.abs(out - out_hp).mean()
             delta_hp_fake = torch.abs(out_fake - out_hp).mean()
             assert delta_hp < delta_hp_fake + 1e-1, f"Backend {backend_name} failed"
+
+
+# =============================================================================
+# INT8 Quantization Tests
+# =============================================================================
+
+
+class TestQuantizeINT8:
+    """INT8 quantization tests."""
+
+    @pytest.fixture
+    def capable_backends_tensorwise(self, device):
+        backends = get_capable_backends("quantize_int8_tensorwise", device)
+        if not backends:
+            pytest.skip(f"No backend supports quantize_int8_tensorwise on {device}")
+        return backends
+
+    @pytest.fixture
+    def capable_backends_rowwise(self, device):
+        backends = get_capable_backends("quantize_int8_rowwise", device)
+        if not backends:
+            pytest.skip(f"No backend supports quantize_int8_rowwise on {device}")
+        return backends
+
+    @pytest.mark.parametrize("m,k", [
+        (1024, 2048),
+        (512, 1024),
+    ])
+    def test_quantize_int8_tensorwise_all_backends(self, capable_backends_tensorwise, device, seed, m, k):
+        """Test INT8 tensorwise quantization across all capable backends."""
+        x = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 10
+
+        if "eager" not in capable_backends_tensorwise:
+            pytest.skip("Need eager backend as reference")
+
+        with ck.use_backend("eager"):
+            ref_qx, ref_sx = ck.quantize_int8_tensorwise(x)
+
+        for backend_name in capable_backends_tensorwise:
+            with ck.use_backend(backend_name):
+                qx, sx = ck.quantize_int8_tensorwise(x)
+
+                assert qx.dtype == torch.int8
+                assert sx.dtype == torch.float32
+                assert qx.shape == ref_qx.shape
+                assert sx.shape == ref_sx.shape
+
+                # Allow small differences in quantization
+                assert_values_close(
+                    qx.to(torch.float32),
+                    ref_qx.to(torch.float32),
+                    rtol=0.0,
+                    atol=1.0,
+                    max_mismatch_ratio=0.01,
+                    name=f"quantized data ({backend_name} vs eager)"
+                )
+
+                assert_values_close(
+                    sx,
+                    ref_sx,
+                    rtol=1e-5,
+                    atol=1e-5,
+                    name=f"scales ({backend_name} vs eager)"
+                )
+
+    @pytest.mark.parametrize("m,k", [
+        (1024, 2048),
+        (512, 1024),
+    ])
+    def test_quantize_int8_rowwise_all_backends(self, capable_backends_rowwise, device, seed, m, k):
+        """Test INT8 rowwise quantization across all capable backends."""
+        x = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 10
+
+        if "eager" not in capable_backends_rowwise:
+            pytest.skip("Need eager backend as reference")
+
+        with ck.use_backend("eager"):
+            ref_qx, ref_sx = ck.quantize_int8_rowwise(x)
+
+        for backend_name in capable_backends_rowwise:
+            with ck.use_backend(backend_name):
+                qx, sx = ck.quantize_int8_rowwise(x)
+
+                assert qx.dtype == torch.int8
+                assert sx.dtype == torch.float32
+                assert qx.shape == ref_qx.shape
+                assert sx.shape == ref_sx.shape
+
+                assert_values_close(
+                    qx.to(torch.float32),
+                    ref_qx.to(torch.float32),
+                    rtol=0.0,
+                    atol=1.0,
+                    max_mismatch_ratio=0.01,
+                    name=f"quantized data ({backend_name} vs eager)"
+                )
+
+                assert_values_close(
+                    sx,
+                    ref_sx,
+                    rtol=1e-5,
+                    atol=1e-5,
+                    name=f"scales ({backend_name} vs eager)"
+                )
+
+
+class TestDequantizeINT8:
+    """INT8 dequantization tests."""
+
+    @pytest.fixture
+    def capable_backends(self, device):
+        backends = get_capable_backends("dequantize_int8_simple", device)
+        if not backends:
+            pytest.skip(f"No backend supports dequantize_int8_simple on {device}")
+        return backends
+
+    @pytest.mark.parametrize("m,k", [
+        (1024, 2048),
+    ])
+    def test_dequantize_int8_all_backends(self, capable_backends, device, seed, m, k):
+        """Test INT8 dequantization across all capable backends."""
+        x = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 10
+
+        # We need a reference implementation to get qx and sx
+        with ck.use_backend("eager"):
+            qx, sx = ck.quantize_int8_tensorwise(x)
+            ref_out = ck.dequantize_int8_simple(qx, sx)
+
+        for backend_name in capable_backends:
+            with ck.use_backend(backend_name):
+                out = ck.dequantize_int8_simple(qx, sx)
+
+                assert out.dtype == ref_out.dtype
+                assert out.shape == ref_out.shape
+
+                assert_values_close(
+                    out,
+                    ref_out,
+                    rtol=1e-5,
+                    atol=1e-5,
+                    name=f"dequantized data ({backend_name} vs eager)"
+                )
+
+class TestINT8Linear:
+    """INT8 linear matmul tests."""
+
+    @pytest.fixture
+    def capable_backends(self, device):
+        backends = get_capable_backends("int8_linear", device)
+        if not backends:
+            pytest.skip(f"No backend supports int8_linear on {device}")
+        return backends
+
+    @torch.no_grad()
+    @pytest.mark.parametrize("m,k,n", [
+        (1024, 2048, 4096),
+        (512, 1024, 2048),
+    ])
+    def test_int8_linear_all_backends(self, capable_backends, device, seed, m, k, n):
+        """Test INT8 matmul across all capable backends."""
+        x = torch.randn(m, k, device=device, dtype=torch.bfloat16).contiguous()
+        w = torch.randn(n, k, device=device, dtype=torch.bfloat16).contiguous()
+        bias = torch.randn(n, device=device, dtype=torch.bfloat16).contiguous()
+
+        with ck.use_backend("eager"):
+            x_int8, x_scale = ck.quantize_int8_rowwise(x)
+            w_int8, w_scale = ck.quantize_int8_tensorwise(w)
+
+            x_fake = ck.dequantize_int8_simple(x_int8, x_scale)
+            w_fake = ck.dequantize_int8_simple(w_int8, w_scale)
+            out_hp = torch.nn.functional.linear(x, w, bias=bias)
+            out_fake = torch.nn.functional.linear(x_fake.to(x.dtype), w_fake.to(w.dtype), bias=bias)
+
+        for backend_name in capable_backends:
+            with ck.use_backend(backend_name):
+                out = ck.int8_linear(
+                    x, w_int8,
+                    w_scale,
+                    bias,
+                    out_dtype=x.dtype,
+                )
+
+            delta_hp = torch.abs(out - out_hp).mean()
+            delta_hp_fake = torch.abs(out_fake - out_hp).mean()
+            assert delta_hp < delta_hp_fake + 1e-1, f"Backend {backend_name} failed"

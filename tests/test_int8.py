@@ -140,7 +140,7 @@ class TestTensorWiseINT8Layout:
         x = torch.randn(128, 256, device="cuda", dtype=torch.float16)
         w = torch.randn(64, 256, device="cuda", dtype=torch.float16)
         bias = torch.randn(64, device="cuda", dtype=torch.float16)
-        
+
         w_int8, w_scale = quantize_int8_tensorwise(w)
 
         with ck.registry.use_backend("eager"):

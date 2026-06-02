@@ -9,6 +9,7 @@ from comfy_kitchen.tensor import (
     TensorCoreFP8Layout,
     TensorCoreMXFP8Layout,
     TensorCoreNVFP4Layout,
+    TensorWiseINT8Layout,
     get_cuda_capability,
 )
 
@@ -397,6 +398,16 @@ class TestQuantizedTensorFlatten:
     def test_tensor_flatten_unflatten_mxfp8(self):
         x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, "TensorCoreMXFP8Layout")
+
+        inner_tensors, ctx = qt.__tensor_flatten__()
+
+        assert "_qdata" in inner_tensors
+        assert "_param_scale" in inner_tensors
+        assert "layout_cls" in ctx
+
+    def test_tensor_flatten_unflatten_int8(self):
+        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(x, "TensorWiseINT8Layout")
 
         inner_tensors, ctx = qt.__tensor_flatten__()
 
@@ -1332,5 +1343,74 @@ class TestMXFP8ShapeOperationsFallback:
         expected = qt.dequantize().t()
 
         assert torch.equal(result, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestTensorWiseINT8Layout:
+    """Tests for TensorWiseINT8Layout."""
+
+    def test_quantize_weight(self):
+        x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        qdata, params = TensorWiseINT8Layout.quantize(x, is_weight=True)
+
+        assert qdata.dtype == torch.int8
+        assert qdata.shape == x.shape
+        assert params.scale.dim() == 0 or params.scale.numel() == 1
+        assert params.is_weight is True
+
+    def test_quantize_activation(self):
+        x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        qdata, params = TensorWiseINT8Layout.quantize(x, is_weight=False)
+
+        assert qdata.dtype == torch.int8
+        assert qdata.shape == x.shape
+        assert params.scale.shape == (128, 1)
+        assert params.is_weight is False
+
+    def test_dequantize_roundtrip(self):
+        x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16) * 10
+        qdata, params = TensorWiseINT8Layout.quantize(x)
+        dq = TensorWiseINT8Layout.dequantize(qdata, params)
+
+        assert dq.dtype == torch.bfloat16
+        assert dq.shape == x.shape
+        # INT8 has limited precision, so use loose tolerance
+        assert torch.allclose(dq, x, rtol=0.2, atol=0.2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestINT8LinearOperations:
+    """Tests for INT8 linear operations using QuantizedTensor."""
+
+    def test_int8_linear_weight_quantized(self):
+        batch, in_features, out_features = 32, 64, 128
+        x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(out_features, device="cuda", dtype=torch.bfloat16)
+
+        qt_w = QuantizedTensor.from_float(w, "TensorWiseINT8Layout")
+
+        result = torch.nn.functional.linear(x, qt_w, bias)
+
+        # Reference: manual dequantize and linear
+        expected = torch.nn.functional.linear(x, qt_w.dequantize(), bias)
+
+        assert result.shape == expected.shape
+        # Allow some difference due to INT8 quantization
+        assert torch.allclose(result, expected, rtol=0.1, atol=0.1)
+
+    def test_int8_mm(self):
+        m, k, n = 64, 128, 256
+        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) # (out, in)
+
+        qt_b = QuantizedTensor.from_float(b, "TensorWiseINT8Layout")
+
+        # mm(a, b.t())
+        result = torch.mm(a, qt_b.t())
+        expected = torch.mm(a, qt_b.dequantize().t())
+
+        assert result.shape == expected.shape
+        assert torch.allclose(result, expected, rtol=0.1, atol=0.1)
 
 

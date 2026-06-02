@@ -1067,6 +1067,33 @@ def _build_constraints() -> dict:
             default_devices=cuda_devices,
             min_compute_capability=(7, 5),
         ),
+        "quantize_int8_tensorwise": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "quantize_int8_rowwise": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "dequantize_int8_simple": FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                ),
+                "scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
         "apply_rope_split_half1": FunctionConstraints(
             params={
                 "x": ParamConstraint(
@@ -1096,26 +1123,6 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
-        ),
-        "int8_linear": FunctionConstraints(
-            params={
-                "x": ParamConstraint(
-                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "weight": ParamConstraint(
-                    dtypes=frozenset({torch.int8}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "weight_scale": ParamConstraint(
-                    dtypes=frozenset({torch.float32}),
-                ),
-                "out_dtype": ParamConstraint(
-                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
-                ),
-            },
-            default_devices=cuda_devices,
-            min_compute_capability=(7, 5),
         ),
         "quantize_svdquant_w4a4": FunctionConstraints(
             params={
