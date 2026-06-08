@@ -46,6 +46,7 @@ exclude = ["tests*"]
 
 [tool.setuptools.package-data]
 "comfy_kitchen.backends.cuda" = ["*.cuh", "*.h"]
+"comfy_kitchen.backends.hip" = ["*.cpp", "ops/*.hip"]
 
 [tool.ruff]
 # Set the maximum line length to 100.

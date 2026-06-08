@@ -82,6 +82,8 @@ These options require using `setup.py` directly (not `pip install`):
 | Option | Command | Description | Default                                                                     |
 |--------|---------|-------------|-----------------------------------------------------------------------------|
 | `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Build CPU-only wheel (`py3-none-any`) | Enabled (build with CUDA)                                                   |
+| `--hip` | `python setup.py build_ext --hip` | Build HIP/ROCm backend instead of CUDA | Disabled                                                                    |
+| `--hip-archs=...` | `python setup.py build_ext --hip --hip-archs="gfx1200"` | HIP architectures to build for | CMake auto-detection or `COMFY_HIP_ARCHS`                                   |
 | `--cuda-archs=...` | `python setup.py build_ext --cuda-archs="80;89"` | CUDA architectures to build for | `75-virtual;80;89;90a;100f;120f` (Linux), `75-virtual;80;89;120f` (Windows) |
 | `--debug-build` | `python setup.py build_ext --debug-build` | Build in debug mode with symbols | Disabled (Release)                                                          |
 | `--lineinfo` | `python setup.py build_ext --lineinfo` | Enable NVCC line info for profiling | Disabled                                                                    |
@@ -92,6 +94,9 @@ python setup.py bdist_wheel --no-cuda
 
 # Build with custom CUDA architectures
 python setup.py build_ext --cuda-archs="80;89" bdist_wheel
+
+# Build HIP/ROCm backend for one or more GPU targets
+python setup.py build_ext --hip --hip-archs="gfx1100;gfx1200" bdist_wheel
 
 # Debug build with line info for profiling
 python setup.py build_ext --debug-build --lineinfo bdist_wheel
