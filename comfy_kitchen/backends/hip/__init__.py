@@ -46,7 +46,7 @@ except Exception as e:
     _EXT_ERROR = f"Failed to load extension: {e}"
     _C = None  # type: ignore
 
-from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE  # noqa: E402
+from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
 
 
 def _wrap_for_dlpack(tensor: torch.Tensor):
