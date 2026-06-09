@@ -28,12 +28,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Build CUDA wheel using cibuildwheel with manylinux container
-      - name: Build CUDA wheel (manylinux)
+      # Build one wheel containing both CUDA and HIP native extensions.
+      # cibuildwheel invokes setup.py once inside a manylinux container; setup.py
+      # auto-detects both toolchains and emits cuda/_C*.so plus hip/_C*.so.
+      - name: Build CUDA+HIP wheel (manylinux)
         uses: pypa/cibuildwheel@v2.22.0
         env:
-          # Use NVIDIA's CUDA devel image based on UBI8 (manylinux_2_28 compatible)
-          # CUDA 13.0 will be installed inside the container
           CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64
 
           # Build for Python 3.10, 3.11, and 3.12
@@ -41,32 +41,55 @@ jobs:
           CIBW_BUILD: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64"
           CIBW_SKIP: "*-musllinux_*"
 
-          # Install CUDA 13.0 toolkit inside the container
+          # Install CUDA 13.0 and ROCm HIP SDK inside the same container so the
+          # wheel contains both native backends.
           CIBW_BEFORE_ALL_LINUX: |
             # Install dnf plugins for config-manager command
             dnf install -y dnf-plugins-core
             # Add NVIDIA CUDA repository for RHEL 8
             dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
+            # Add AMD ROCm repository for RHEL 8 / manylinux_2_28
+            printf '%s\n' \
+              '[rocm]' \
+              'name=ROCm 7.2 repository' \
+              'baseurl=https://repo.radeon.com/rocm/el8/7.2.4/main' \
+              'enabled=1' \
+              'priority=50' \
+              'gpgcheck=0' \
+              '' \
+              '[amdgraphics]' \
+              'name=AMD Graphics 7.2 repository' \
+              'baseurl=https://repo.radeon.com/graphics/7.2.4/el/8/main/x86_64/' \
+              'enabled=1' \
+              'priority=50' \
+              'gpgcheck=0' \
+              >/etc/yum.repos.d/rocm.repo
             dnf clean all
-            # Install ONLY the minimal CUDA packages needed for compilation (not the full toolkit)
+            # Install only the CUDA packages needed for compilation, plus HIP SDK.
             dnf install -y cuda-nvcc-13-0 cuda-cudart-devel-13-0 libcublas-devel-13-0 libnvjitlink-devel-13-0
+            dnf install -y rocm-hip-sdk rocm-device-libs
             # Install Python development headers (fallback for CMake FindPython)
             dnf install -y python3-devel
-            # Verify CUDA installation
+            # Verify compiler installations
             /usr/local/cuda-13.0/bin/nvcc --version
+            /opt/rocm/bin/amdclang++ --version
+            /opt/rocm/bin/hipcc --version
 
-          # Set CUDA environment and install build dependencies
+          # Set CUDA and ROCm environments.
           CIBW_ENVIRONMENT_LINUX: >
             CUDA_HOME=/usr/local/cuda-13.0
-            PATH=/usr/local/cuda-13.0/bin:$PATH
-            LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:$LD_LIBRARY_PATH
+            ROCM_HOME=/opt/rocm
+            ROCM_PATH=/opt/rocm
+            PATH=/usr/local/cuda-13.0/bin:/opt/rocm/bin:$PATH
+            LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH
             LIBRARY_PATH=/usr/local/cuda-13.0/lib64/stubs:$LIBRARY_PATH
+            COMFY_HIP_ARCHS='gfx1100;gfx1101;gfx1102;gfx1200;gfx1201'
 
           # Install Python build dependencies
           CIBW_BEFORE_BUILD: "pip install nanobind cmake setuptools wheel"
 
-          # Repair wheel for manylinux compliance, excluding CUDA runtime libs
-          # Users must have CUDA installed on their system
+          # Repair wheel for manylinux compliance, excluding GPU runtime libs.
+          # Users must have the matching CUDA or ROCm runtime installed locally.
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
             auditwheel repair -w {dest_dir} {wheel}
             --exclude libcuda.so.1
@@ -75,17 +98,53 @@ jobs:
             --exclude libcublas.so.13
             --exclude libcublasLt.so.13
             --exclude libnvJitLink.so.13
+            --exclude libamdhip64.so.7
+            --exclude libamdhip64.so
+            --exclude libhsa-runtime64.so.1
+            --exclude libhsa-runtime64.so
+            --exclude libamd_comgr.so.3
+            --exclude libamd_comgr.so
+            --exclude libdrm.so.2
+            --exclude libdrm_amdgpu.so.1
+            --exclude librocm-core.so.1
 
         with:
           output-dir: wheelhouse
+
+      - name: Verify Linux wheels contain CUDA and HIP extensions
+        shell: bash
+        run: |
+          python - <<'PY'
+          import zipfile
+          from pathlib import Path
+
+          wheels = sorted(Path("wheelhouse").glob("*manylinux*.whl"))
+          if not wheels:
+              raise SystemExit("No manylinux wheels found")
+
+          for wheel in wheels:
+              with zipfile.ZipFile(wheel) as zf:
+                  names = zf.namelist()
+              has_cuda = any(
+                  name.startswith("comfy_kitchen/backends/cuda/_C") and name.endswith(".so")
+                  for name in names
+              )
+              has_hip = any(
+                  name.startswith("comfy_kitchen/backends/hip/_C") and name.endswith(".so")
+                  for name in names
+              )
+              print(f"{wheel.name}: cuda={has_cuda} hip={has_hip}")
+              if not has_cuda or not has_hip:
+                  raise SystemExit(f"{wheel.name} does not contain both CUDA and HIP extensions")
+          PY
 
       - name: Build CPU-only wheel (py3-none-any)
         shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install build setuptools wheel
-          # Build CPU-only variant (pure Python, no CUDA)
-          python setup.py bdist_wheel --no-cuda
+          # Build pure Python variant (no native CUDA/HIP extensions)
+          python setup.py bdist_wheel --no-cuda --no-hip
           # Move to wheelhouse directory
           mv dist/*py3-none-any.whl wheelhouse/
 
@@ -96,10 +155,10 @@ jobs:
           echo "Built wheels:"
           ls -1 wheelhouse/*.whl
 
-      - name: Upload Linux CUDA wheel
+      - name: Upload Linux CUDA+HIP wheel
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-linux-cuda
+          name: wheels-linux-cuda-hip
           path: wheelhouse/*manylinux*.whl
           if-no-files-found: error
 
@@ -458,10 +517,10 @@ jobs:
     environment: pypi
 
     steps:
-      - name: Download Linux CUDA wheel
+      - name: Download Linux CUDA+HIP wheel
         uses: actions/download-artifact@v4
         with:
-          name: wheels-linux-cuda
+          name: wheels-linux-cuda-hip
           path: dist/
 
       - name: Download Linux ARM64 CUDA wheel

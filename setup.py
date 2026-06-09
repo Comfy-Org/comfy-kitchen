@@ -24,8 +24,15 @@ if "--hip" in sys.argv:
     BUILD_HIP = True
     sys.argv.remove("--hip")  # Remove so setuptools doesn't complain
     print("\n" + "=" * 80)
-    print("Building HIP/ROCm variant (--hip flag)")
-    print("HIP backend enabled")
+    print("HIP/ROCm backend explicitly enabled (--hip flag)")
+    print("=" * 80 + "\n")
+
+BUILD_NO_HIP = os.getenv("COMFY_KITCHEN_BUILD_NO_HIP") == "1"
+if "--no-hip" in sys.argv:
+    BUILD_NO_HIP = True
+    sys.argv.remove("--no-hip")  # Remove so setuptools doesn't complain
+    print("\n" + "=" * 80)
+    print("HIP/ROCm backend disabled (--no-hip flag)")
     print("=" * 80 + "\n")
 
 BUILD_NO_CUDA = False
@@ -105,7 +112,7 @@ class CMakeBuildExt(build_ext):
         ext_dir = ext_fullpath.parent
         ext_dir.mkdir(parents=True, exist_ok=True)
 
-        build_temp = pathlib.Path(self.build_temp).resolve()
+        build_temp = pathlib.Path(self.build_temp).resolve() / ext.backend
         build_temp.mkdir(parents=True, exist_ok=True)
 
         # Clean CMake cache if it exists (to avoid stale configuration)
@@ -364,21 +371,35 @@ def get_extensions() -> list[setuptools.Extension]:
         if BUILD_HIP:
             print("Building HIP backend plus Python/eager/triton backends")
         else:
-            print("Building CPU-only variant - only eager, triton backends")
+            print("Building Python/eager/triton package without CUDA")
         print("=" * 80 + "\n")
     else:
-        cuda_ext = setup_cuda_extension()
-        if cuda_ext is not None:
-            extensions.append(cuda_ext)
-        else:
+        if get_cuda_version() is None:
             print("\n" + "=" * 80)
-            print("Installing comfy_kitchen without CUDA backend")
-            print("Available backends: eager, triton (if installed)")
+            print("CUDA toolkit not detected; skipping CUDA backend")
             print("=" * 80 + "\n")
+        else:
+            cuda_ext = setup_cuda_extension()
+            if cuda_ext is not None:
+                extensions.append(cuda_ext)
 
-    if BUILD_HIP:
+    _rocm_home, hip_compiler = get_rocm_path()
+    if BUILD_NO_HIP:
+        print("\n" + "=" * 80)
+        print("HIP/ROCm backend excluded")
+        print("=" * 80 + "\n")
+    elif BUILD_HIP or hip_compiler is not None:
         hip_ext = setup_hip_extension()
         extensions.append(hip_ext)
+    else:
+        print("\n" + "=" * 80)
+        print("HIP/ROCm compiler not detected; skipping HIP backend")
+        print("=" * 80 + "\n")
+
+    if not extensions:
+        print("\n" + "=" * 80)
+        print("No native backend toolchains detected; building Python/eager/triton package only")
+        print("=" * 80 + "\n")
 
     return extensions
 
@@ -397,7 +418,7 @@ def get_cmdclass(has_extensions):
                 super().finalize_options()
                 # Set stable ABI tag only for Python 3.12+ (nanobind requirement)
                 # For 3.10/3.11, leave as version-specific (cpXXX-cpXXX)
-                if (not BUILD_NO_CUDA or BUILD_HIP) and sys.version_info >= (3, 12):
+                if has_extensions and sys.version_info >= (3, 12):
                     self.py_limited_api = "cp312"
 
         cmdclass["bdist_wheel"] = CUDABdistWheel

@@ -81,25 +81,28 @@ These options require using `setup.py` directly (not `pip install`):
 
 | Option | Command | Description | Default                                                                     |
 |--------|---------|-------------|-----------------------------------------------------------------------------|
-| `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Build CPU-only wheel (`py3-none-any`) | Enabled (build with CUDA)                                                   |
-| `--hip` | `python setup.py build_ext --hip` | Build HIP/ROCm backend; combine with `--no-cuda` for HIP-only builds | Disabled                                                                    |
-| `--hip-archs=...` | `python setup.py build_ext --hip --hip-archs="gfx1200"` | HIP architectures to build for | CMake auto-detection or `COMFY_HIP_ARCHS`                                   |
+| `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Disable CUDA backend build | CUDA builds automatically when CUDA is detected                             |
+| `--no-hip` | `python setup.py bdist_wheel --no-hip` | Disable HIP/ROCm backend build | HIP builds automatically when ROCm is detected                              |
+| `--hip-archs=...` | `python setup.py build_ext --hip-archs="gfx1200"` | HIP architectures to build for | CMake auto-detection or `COMFY_HIP_ARCHS`                                   |
 | `--cuda-archs=...` | `python setup.py build_ext --cuda-archs="80;89"` | CUDA architectures to build for | `75-virtual;80;89;90a;100f;120f` (Linux), `75-virtual;80;89;120f` (Windows) |
 | `--debug-build` | `python setup.py build_ext --debug-build` | Build in debug mode with symbols | Disabled (Release)                                                          |
 | `--lineinfo` | `python setup.py build_ext --lineinfo` | Enable NVCC line info for profiling | Disabled                                                                    |
 
 ```bash
-# Build CPU-only wheel (pure Python, no CUDA required)
-python setup.py bdist_wheel --no-cuda
+# Build one wheel with every native backend whose toolchain is installed
+python setup.py bdist_wheel
+
+# Build pure Python wheel, no CUDA or HIP required
+python setup.py bdist_wheel --no-cuda --no-hip
 
 # Build with custom CUDA architectures
 python setup.py build_ext --cuda-archs="80;89" bdist_wheel
 
-# Build HIP/ROCm backend only for one or more GPU targets
-python setup.py build_ext --hip --no-cuda --hip-archs="gfx1100;gfx1200" bdist_wheel
+# Build HIP/ROCm backend for one or more GPU targets, alongside CUDA if CUDA is installed
+python setup.py build_ext --hip-archs="gfx1100;gfx1200" bdist_wheel
 
-# Build CUDA and HIP backends into the same wheel, if both toolchains are installed
-python setup.py build_ext --hip --cuda-archs="80;89" --hip-archs="gfx1200" bdist_wheel
+# Build without HIP even if ROCm is installed
+python setup.py build_ext --no-hip bdist_wheel
 
 # Debug build with line info for profiling
 python setup.py build_ext --debug-build --lineinfo bdist_wheel
