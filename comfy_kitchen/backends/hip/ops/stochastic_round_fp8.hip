@@ -26,7 +26,7 @@ __forceinline__ __device__ float to_float<__half>(__half value) {
 }
 
 template<>
-__forceinline__ __device__ float to_float<__hip_bfloat16>(__hip_bfloat16 value) {
+__forceinline__ __device__ float to_float<hip_bfloat16>(hip_bfloat16 value) {
     return static_cast<float>(value);
 }
 
@@ -165,10 +165,10 @@ void launch_stochastic_round_fp8_kernel(
                 static_cast<uint32_t>(numel),
                 output_dtype_code);
     } else if (input_dtype_code == 2) {
-        comfy::hip_backend::stochastic_round_fp8_kernel<__hip_bfloat16>
+        comfy::hip_backend::stochastic_round_fp8_kernel<hip_bfloat16>
             <<<blocks, comfy::hip_backend::kMaxKernelThreads, 0, stream>>>(
                 static_cast<uint8_t*>(rng_and_output),
-                static_cast<const __hip_bfloat16*>(input),
+                static_cast<const hip_bfloat16*>(input),
                 static_cast<uint32_t>(numel),
                 output_dtype_code);
     } else {

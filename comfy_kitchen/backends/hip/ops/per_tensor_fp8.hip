@@ -25,7 +25,7 @@ __forceinline__ __device__ float to_float<__half>(__half value) {
 }
 
 template<>
-__forceinline__ __device__ float to_float<__hip_bfloat16>(__hip_bfloat16 value) {
+__forceinline__ __device__ float to_float<hip_bfloat16>(hip_bfloat16 value) {
     return static_cast<float>(value);
 }
 
@@ -40,8 +40,8 @@ __forceinline__ __device__ void store_value<__half>(void* dst, int64_t idx, floa
 }
 
 template<>
-__forceinline__ __device__ void store_value<__hip_bfloat16>(void* dst, int64_t idx, float value) {
-    reinterpret_cast<__hip_bfloat16*>(dst)[idx] = __float2bfloat16(value);
+__forceinline__ __device__ void store_value<hip_bfloat16>(void* dst, int64_t idx, float value) {
+    reinterpret_cast<hip_bfloat16*>(dst)[idx] = hip_bfloat16(value);
 }
 
 __forceinline__ __device__ uint8_t pack_fp8(float value, int dtype_code) {
@@ -163,7 +163,7 @@ void launch_quantize_per_tensor_fp8_kernel(
     } else if (input_dtype_code == 1) {
         comfy::hip_backend::quantize_per_tensor_fp8_kernel<__half><<<blocks, comfy::hip_backend::kThreads, 0, stream>>>(static_cast<const __half*>(input), static_cast<const float*>(scale), static_cast<uint8_t*>(output), numel, output_dtype_code);
     } else if (input_dtype_code == 2) {
-        comfy::hip_backend::quantize_per_tensor_fp8_kernel<__hip_bfloat16><<<blocks, comfy::hip_backend::kThreads, 0, stream>>>(static_cast<const __hip_bfloat16*>(input), static_cast<const float*>(scale), static_cast<uint8_t*>(output), numel, output_dtype_code);
+        comfy::hip_backend::quantize_per_tensor_fp8_kernel<hip_bfloat16><<<blocks, comfy::hip_backend::kThreads, 0, stream>>>(static_cast<const hip_bfloat16*>(input), static_cast<const float*>(scale), static_cast<uint8_t*>(output), numel, output_dtype_code);
     } else {
         throw std::runtime_error("Unsupported input dtype for quantize_per_tensor_fp8");
     }
@@ -184,7 +184,7 @@ void launch_dequantize_per_tensor_fp8_kernel(
     } else if (output_dtype_code == 1) {
         comfy::hip_backend::dequantize_per_tensor_fp8_kernel<__half><<<blocks, comfy::hip_backend::kThreads, 0, stream>>>(static_cast<const uint8_t*>(input), static_cast<const float*>(scale), output, numel, input_dtype_code);
     } else if (output_dtype_code == 2) {
-        comfy::hip_backend::dequantize_per_tensor_fp8_kernel<__hip_bfloat16><<<blocks, comfy::hip_backend::kThreads, 0, stream>>>(static_cast<const uint8_t*>(input), static_cast<const float*>(scale), output, numel, input_dtype_code);
+        comfy::hip_backend::dequantize_per_tensor_fp8_kernel<hip_bfloat16><<<blocks, comfy::hip_backend::kThreads, 0, stream>>>(static_cast<const uint8_t*>(input), static_cast<const float*>(scale), output, numel, input_dtype_code);
     } else {
         throw std::runtime_error("Unsupported output dtype for dequantize_per_tensor_fp8");
     }
