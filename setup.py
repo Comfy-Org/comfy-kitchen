@@ -25,7 +25,7 @@ if "--hip" in sys.argv:
     sys.argv.remove("--hip")  # Remove so setuptools doesn't complain
     print("\n" + "=" * 80)
     print("Building HIP/ROCm variant (--hip flag)")
-    print("CUDA backend excluded - building HIP backend")
+    print("HIP backend enabled")
     print("=" * 80 + "\n")
 
 BUILD_NO_CUDA = False
@@ -358,26 +358,27 @@ def setup_cuda_extension() -> CMakeExtension | None:
 def get_extensions() -> list[setuptools.Extension]:
     extensions = []
 
+    if BUILD_NO_CUDA:
+        print("\n" + "=" * 80)
+        print("CUDA backend excluded")
+        if BUILD_HIP:
+            print("Building HIP backend plus Python/eager/triton backends")
+        else:
+            print("Building CPU-only variant - only eager, triton backends")
+        print("=" * 80 + "\n")
+    else:
+        cuda_ext = setup_cuda_extension()
+        if cuda_ext is not None:
+            extensions.append(cuda_ext)
+        else:
+            print("\n" + "=" * 80)
+            print("Installing comfy_kitchen without CUDA backend")
+            print("Available backends: eager, triton (if installed)")
+            print("=" * 80 + "\n")
+
     if BUILD_HIP:
         hip_ext = setup_hip_extension()
         extensions.append(hip_ext)
-        return extensions
-
-    if BUILD_NO_CUDA:
-        print("\n" + "=" * 80)
-        print("Building CPU-only variant (COMFY_KITCHEN_BUILD_NO_CUDA=1)")
-        print("CUDA backend excluded - only eager, triton backends")
-        print("=" * 80 + "\n")
-        return extensions
-
-    cuda_ext = setup_cuda_extension()
-    if cuda_ext is not None:
-        extensions.append(cuda_ext)
-    else:
-        print("\n" + "=" * 80)
-        print("Installing comfy_kitchen without CUDA backend")
-        print("Available backends: eager, triton (if installed)")
-        print("=" * 80 + "\n")
 
     return extensions
 
