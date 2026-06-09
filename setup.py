@@ -404,7 +404,7 @@ def get_extensions() -> list[setuptools.Extension]:
     return extensions
 
 
-def get_cmdclass(has_extensions):
+def get_cmdclass(has_extensions, has_hip_extension=False):
     cmdclass = {}
 
     if has_extensions:
@@ -418,7 +418,9 @@ def get_cmdclass(has_extensions):
                 super().finalize_options()
                 # Set stable ABI tag only for Python 3.12+ (nanobind requirement)
                 # For 3.10/3.11, leave as version-specific (cpXXX-cpXXX)
-                if has_extensions and sys.version_info >= (3, 12):
+                # HIP currently builds a version-specific extension, so combined
+                # CUDA+HIP wheels must also be tagged version-specific.
+                if has_extensions and not has_hip_extension and sys.version_info >= (3, 12):
                     self.py_limited_api = "cp312"
 
         cmdclass["bdist_wheel"] = CUDABdistWheel
@@ -448,10 +450,16 @@ def get_packages():
 
 
 extensions = get_extensions()
+has_hip_extension = any(
+    isinstance(ext, CMakeExtension) and ext.backend == "hip" for ext in extensions
+)
 
 setup_kwargs = {
     "ext_modules": extensions,
-    "cmdclass": get_cmdclass(has_extensions=bool(extensions)),
+    "cmdclass": get_cmdclass(
+        has_extensions=bool(extensions),
+        has_hip_extension=has_hip_extension,
+    ),
 }
 
 if BUILD_NO_CUDA and not BUILD_HIP:

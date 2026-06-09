@@ -22,14 +22,6 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=hidden -fdiagnostics-color=
 # Find Python (required by nanobind - must use "Python" not "Python3")
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
-set(COMFY_HAS_PYTHON_SABI OFF)
-if(Python_VERSION VERSION_GREATER_EQUAL "3.12" AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.26")
-    find_package(Python COMPONENTS Development.SABIModule QUIET)
-    if(Python_Development.SABIModule_FOUND)
-        set(COMFY_HAS_PYTHON_SABI ON)
-    endif()
-endif()
-
 # Find nanobind
 execute_process(
     COMMAND "${Python_EXECUTABLE}" -c "import nanobind; print(nanobind.cmake_dir())"
@@ -63,15 +55,8 @@ set(CPP_SOURCES
     dlpack_bindings.cpp
 )
 
-if(Python_VERSION VERSION_GREATER_EQUAL "3.12" AND COMFY_HAS_PYTHON_SABI)
-    message(STATUS "Python ${Python_VERSION} detected - enabling stable ABI (abi3)")
-    nanobind_add_module(_C NB_STATIC STABLE_ABI LTO ${CPP_SOURCES} ${HIP_SOURCES})
-    set_target_properties(_C PROPERTIES SUFFIX ".abi3.so")
-    target_compile_definitions(_C PRIVATE Py_LIMITED_API=0x030C0000)
-else()
-    message(STATUS "Python ${Python_VERSION} detected - building version-specific wheel")
-    nanobind_add_module(_C NB_STATIC LTO ${CPP_SOURCES} ${HIP_SOURCES})
-endif()
+message(STATUS "Python ${Python_VERSION} detected - building version-specific HIP extension")
+nanobind_add_module(_C NB_STATIC LTO ${CPP_SOURCES} ${HIP_SOURCES})
 
 target_compile_definitions(_C PRIVATE NB_STATIC)
 
