@@ -30,7 +30,15 @@ endif()
 
 # Find Python (required by nanobind - must use "Python" not "Python3")
 # Only require Development.Module for extension modules, not full Development
-find_package(Python COMPONENTS Interpreter Development.Module REQUIRED Development.SABIModule)
+find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+
+set(COMFY_HAS_PYTHON_SABI OFF)
+if(Python_VERSION VERSION_GREATER_EQUAL "3.12")
+    find_package(Python COMPONENTS Development.SABIModule QUIET)
+    if(Python_Development.SABIModule_FOUND)
+        set(COMFY_HAS_PYTHON_SABI ON)
+    endif()
+endif()
 
 # Find nanobind
 execute_process(
@@ -118,7 +126,7 @@ set(CPP_SOURCES
 # Create the nanobind module
 # Python 3.12+: Use stable ABI (abi3) for forward compatibility with 3.13+
 # Python 3.10/3.11: Version-specific module (nanobind stable ABI requires 3.12+)
-if(Python_VERSION VERSION_GREATER_EQUAL "3.12")
+if(Python_VERSION VERSION_GREATER_EQUAL "3.12" AND COMFY_HAS_PYTHON_SABI)
     message(STATUS "Python ${Python_VERSION} detected - enabling stable ABI (abi3)")
     nanobind_add_module(_C NB_STATIC STABLE_ABI LTO ${CPP_SOURCES} ${CUDA_SOURCES})
     # Explicitly set abi3 suffix

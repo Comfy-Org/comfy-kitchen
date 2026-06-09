@@ -23,8 +23,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=hidden -fdiagnostics-color=
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
 set(COMFY_HAS_PYTHON_SABI OFF)
-if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.26")
-    find_package(Python COMPONENTS Development.SABIModule)
+if(Python_VERSION VERSION_GREATER_EQUAL "3.12" AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.26")
+    find_package(Python COMPONENTS Development.SABIModule QUIET)
     if(Python_Development.SABIModule_FOUND)
         set(COMFY_HAS_PYTHON_SABI ON)
     endif()
