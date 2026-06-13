@@ -314,6 +314,39 @@ class TestTensorWiseINT8Layout:
         assert out_addmm_rot.shape == (4, 64)
         assert out_addmm_rot.dtype == torch.bfloat16
 
+    def test_convrot_triton_fused_correctness(self, seed):
+        """Verify that fused Triton ConvRot+Quantization matches the eager baseline."""
+        import comfy_kitchen as ck
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        group_size = 64
+        x = torch.randn(32, 128, device="cuda", dtype=torch.float16)
+        w = torch.randn(64, 128, device="cuda", dtype=torch.float16)
+        bias = torch.randn(64, device="cuda", dtype=torch.float16)
+
+        # Quantize weight with convrot
+        qt_w = QuantizedTensor.from_float(
+            w, "TensorWiseINT8Layout", per_channel=True, convrot=True, convrot_groupsize=group_size
+        )
+        weight_qdata, weight_scale = qt_w._qdata, qt_w._params.scale
+
+        # Run with Eager backend
+        with ck.registry.use_backend("eager"):
+            out_eager = ck.int8_linear(
+                x, weight_qdata, weight_scale, bias=bias, out_dtype=torch.float16,
+                convrot=True, convrot_groupsize=group_size
+            )
+
+        # Run with Triton backend
+        with ck.registry.use_backend("triton"):
+            out_triton = ck.int8_linear(
+                x, weight_qdata, weight_scale, bias=bias, out_dtype=torch.float16,
+                convrot=True, convrot_groupsize=group_size
+            )
+
+        # Triton and Eager outputs must be extremely close
+        assert_values_close(out_triton, out_eager, rtol=1.0e-1, atol=1.0e-1, name="convrot_triton_vs_eager", max_mismatch_ratio=0.02)
+
 
 
 

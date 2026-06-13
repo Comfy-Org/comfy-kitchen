@@ -10,6 +10,7 @@ __all__ = [
     "quantize_per_tensor_fp8",
     "int8_linear",
     "quantize_int8_rowwise",
+    "quantize_and_rotate_rowwise",
 ]
 
 # Try to import triton and register if available
@@ -27,6 +28,7 @@ try:
         quantize_per_tensor_fp8,
         int8_linear,
         triton_quantize_rowwise as quantize_int8_rowwise,
+        triton_quantize_and_rotate_rowwise as quantize_and_rotate_rowwise,
     )
     from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
 except ImportError as e:
@@ -124,6 +126,8 @@ def _build_constraints() -> dict:
                 "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
                 "weight_scale": ParamConstraint(dtypes=standard_floats),
                 "out_dtype": ParamConstraint(dtypes=standard_floats),
+                "convrot": ParamConstraint(dtypes=frozenset({bool})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=triton_devices,
             min_compute_capability=(8, 0),  # Required for Triton INT8 dot
@@ -131,6 +135,14 @@ def _build_constraints() -> dict:
         "quantize_int8_rowwise": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
+        "quantize_and_rotate_rowwise": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "H": ParamConstraint(dtypes=standard_floats),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=triton_devices,
         ),

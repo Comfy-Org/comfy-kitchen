@@ -83,17 +83,41 @@ def _rotate_activation(
     H: torch.Tensor,
     group_size: int,
 ) -> torch.Tensor:
-    """Rotate activation online: x_rot = x @ H_block."""
+    """Rotate activation online using Fast Hadamard Transform (FHT) — O(N log N)."""
     orig_shape = x.shape
     features = orig_shape[-1]
     if features % group_size != 0:
         raise ValueError(f"features {features} not divisible by group_size {group_size}")
     n_groups = features // group_size
 
-    x_grouped = x.reshape(*orig_shape[:-1], n_groups, group_size)
-    H_dev = H.to(dtype=x.dtype, device=x.device)
-    x_rot = torch.matmul(x_grouped, H_dev)
-    return x_rot.reshape(orig_shape)
+    # Reshape x to (..., n_groups, group_size)
+    x_grouped = x.reshape(-1, n_groups, group_size)
+
+    h = 1
+    while h < group_size:
+        # Reshape to isolate the size-4 dimension for this step
+        x_grouped = x_grouped.reshape(-1, group_size // (4 * h), 4, h)
+
+        x0 = x_grouped[:, :, 0, :]
+        x1 = x_grouped[:, :, 1, :]
+        x2 = x_grouped[:, :, 2, :]
+        x3 = x_grouped[:, :, 3, :]
+
+        s01 = x0 + x1
+        d01 = x0 - x1
+        s23 = x2 + x3
+        d23 = x2 - x3
+
+        y0 = s01 + d23
+        y1 = s01 - d23
+        y2 = d01 + s23
+        y3 = s23 - d01
+
+        # Stack back along the size-4 dimension
+        x_grouped = torch.stack([y0, y1, y2, y3], dim=2)
+        h *= 4
+
+    return x_grouped.reshape(orig_shape) / (group_size ** 0.5)
 
 
 class TensorWiseINT8Layout(QuantizedLayout):
@@ -273,13 +297,17 @@ def _handle_int8_linear_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    # Apply online activation rotation if weight was quantized with ConvRot
-    if getattr(weight._params, "convrot", False):
-        H = _build_hadamard(weight._params.convrot_groupsize, device=input_tensor.device, dtype=input_tensor.dtype)
-        input_tensor = _rotate_activation(input_tensor, H, weight._params.convrot_groupsize)
+    convrot = getattr(weight._params, "convrot", False)
+    convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
 
     return ck.int8_linear(
-        input_tensor.contiguous(), weight_qdata.contiguous(), weight_scale, bias, out_dtype
+        input_tensor.contiguous(),
+        weight_qdata.contiguous(),
+        weight_scale,
+        bias,
+        out_dtype,
+        convrot=convrot,
+        convrot_groupsize=convrot_groupsize,
     )
 
 
@@ -302,15 +330,19 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    # Apply online activation rotation if weight was quantized with ConvRot
-    if getattr(weight._params, "convrot", False):
-        H = _build_hadamard(weight._params.convrot_groupsize, device=input_tensor.device, dtype=input_tensor.dtype)
-        input_tensor = _rotate_activation(input_tensor, H, weight._params.convrot_groupsize)
+    convrot = getattr(weight._params, "convrot", False)
+    convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
 
     # mm expects b to NOT be transposed, but our kernels expect (N, K)
     # For mm, weight is (K, N), so we need to transpose it to (N, K)
     return ck.int8_linear(
-        input_tensor.contiguous(), weight_qdata.t().contiguous(), weight_scale, None, out_dtype
+        input_tensor.contiguous(),
+        weight_qdata.t().contiguous(),
+        weight_scale,
+        None,
+        out_dtype,
+        convrot=convrot,
+        convrot_groupsize=convrot_groupsize,
     )
 
 
@@ -333,11 +365,15 @@ def _handle_int8_addmm_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    # Apply online activation rotation if weight was quantized with ConvRot
-    if getattr(weight._params, "convrot", False):
-        H = _build_hadamard(weight._params.convrot_groupsize, device=input_tensor.device, dtype=input_tensor.dtype)
-        input_tensor = _rotate_activation(input_tensor, H, weight._params.convrot_groupsize)
+    convrot = getattr(weight._params, "convrot", False)
+    convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
 
     return ck.int8_linear(
-        input_tensor.contiguous(), weight_qdata.t().contiguous(), weight_scale, bias, out_dtype
+        input_tensor.contiguous(),
+        weight_qdata.t().contiguous(),
+        weight_scale,
+        bias,
+        out_dtype,
+        convrot=convrot,
+        convrot_groupsize=convrot_groupsize,
     )

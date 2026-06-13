@@ -789,6 +789,22 @@ def quantize_int8_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q, scale
 
 
+def quantize_and_rotate_rowwise(x: torch.Tensor, H: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused online activation rotation + row-wise quantization (Eager fallback).
+
+    Args:
+        x: Input unrotated activation tensor [M, K].
+        H: Pre-built normalized Hadamard matrix [group_size, group_size].
+        group_size: ConvRot group size.
+
+    Returns:
+        Tuple of (rotated_quantized_x_int8, row_scales).
+    """
+    from comfy_kitchen.tensor.int8 import _rotate_activation
+    x_rot = _rotate_activation(x, H, group_size)
+    return quantize_int8_rowwise(x_rot)
+
+
 def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Dequantize INT8 tensor with scale.
 
@@ -808,6 +824,8 @@ def int8_linear(
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
 ) -> torch.Tensor:
     """INT8 linear layer using torch.int8_mm with memory-efficient scaling.
 
@@ -820,10 +838,17 @@ def int8_linear(
         weight_scale: Scalar weight scale.
         bias: Optional bias [N].
         out_dtype: Output dtype.
+        convrot: If True, apply online activation rotation.
+        convrot_groupsize: Group size for Hadamard rotation.
 
     Returns:
         Result tensor [..., N].
     """
+    if convrot:
+        from comfy_kitchen.tensor.int8 import _build_hadamard, _rotate_activation
+        H = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        x = _rotate_activation(x, H, convrot_groupsize)
+
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
 
@@ -931,11 +956,20 @@ def _op_int8_linear(
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
     output_dtype_code: int,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
 ) -> torch.Tensor:
     from comfy_kitchen.registry import registry
 
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    kwargs = {"x": x, "weight": weight, "weight_scale": weight_scale, "out_dtype": out_dtype}
+    kwargs = {
+        "x": x,
+        "weight": weight,
+        "weight_scale": weight_scale,
+        "out_dtype": out_dtype,
+        "convrot": convrot,
+        "convrot_groupsize": convrot_groupsize,
+    }
     impl = registry.get_implementation("int8_linear", kwargs=kwargs)
     result = impl(**kwargs)
     if bias is not None:
@@ -944,6 +978,6 @@ def _op_int8_linear(
 
 
 @_op_int8_linear.register_fake
-def _op_int8_linear_fake(x, weight, weight_scale, bias, output_dtype_code):
+def _op_int8_linear_fake(x, weight, weight_scale, bias, output_dtype_code, convrot=False, convrot_groupsize=256):
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     return torch.empty(*x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device)
