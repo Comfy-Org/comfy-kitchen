@@ -83,7 +83,7 @@ def _rotate_activation(
     H: torch.Tensor,
     group_size: int,
 ) -> torch.Tensor:
-    """Rotate activation online using Fast Hadamard Transform (FHT) — O(N log N)."""
+    """Rotate activation online using Optimized Matmul implementation."""
     orig_shape = x.shape
     features = orig_shape[-1]
     if features % group_size != 0:
@@ -93,31 +93,11 @@ def _rotate_activation(
     # Reshape x to (..., n_groups, group_size)
     x_grouped = x.reshape(-1, n_groups, group_size)
 
-    h = 1
-    while h < group_size:
-        # Reshape to isolate the size-4 dimension for this step
-        x_grouped = x_grouped.reshape(-1, group_size // (4 * h), 4, h)
+    # Use optimized matmul with the precomputed normalized Hadamard matrix
+    H = H.to(dtype=x.dtype, device=x.device)
+    x_rotated = torch.matmul(x_grouped, H)
 
-        x0 = x_grouped[:, :, 0, :]
-        x1 = x_grouped[:, :, 1, :]
-        x2 = x_grouped[:, :, 2, :]
-        x3 = x_grouped[:, :, 3, :]
-
-        s01 = x0 + x1
-        d01 = x0 - x1
-        s23 = x2 + x3
-        d23 = x2 - x3
-
-        y0 = s01 + d23
-        y1 = s01 - d23
-        y2 = d01 + s23
-        y3 = s23 - d01
-
-        # Stack back along the size-4 dimension
-        x_grouped = torch.stack([y0, y1, y2, y3], dim=2)
-        h *= 4
-
-    return x_grouped.reshape(orig_shape) / (group_size ** 0.5)
+    return x_rotated.reshape(orig_shape)
 
 
 class TensorWiseINT8Layout(QuantizedLayout):
