@@ -192,6 +192,20 @@ extern "C" {
         int G,
         int dtype_code,
         cudaStream_t stream);
+
+    // Fused AdaLN — see ops/adaln.cu.
+    void launch_adaln_kernel(
+        const void* x,
+        const void* scale,
+        const void* shift,
+        void*       out,
+        int64_t     N,
+        int64_t     D,
+        int64_t     scale_group,
+        int64_t     shift_group,
+        float       eps,
+        int         dtype_code,
+        cudaStream_t stream);
 }
 
 // Nanobind wrapper for quantize_per_tensor_fp8
@@ -692,6 +706,26 @@ void awq_w4a16(
         M, N, K, group_size, dtype_code, stream);
 }
 
+// Nanobind wrapper for fused AdaLN
+void adaln(
+    nb::ndarray<nb::device::cuda> x,
+    nb::ndarray<nb::device::cuda> scale,
+    nb::ndarray<nb::device::cuda> shift,
+    nb::ndarray<nb::device::cuda> out,
+    int64_t N,
+    int64_t D,
+    int64_t scale_group,
+    int64_t shift_group,
+    float   eps,
+    int     dtype_code,
+    uintptr_t stream_ptr)
+{
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_adaln_kernel(
+        x.data(), scale.data(), shift.data(), out.data(),
+        N, D, scale_group, shift_group, eps, dtype_code, stream);
+}
+
 // Python module definition
 NB_MODULE(_C, m) {
     m.doc() = "comfy_kitchen CUDA kernels - nanobind + DLPack interface (NO PyTorch C++ dependencies)";
@@ -816,6 +850,20 @@ NB_MODULE(_C, m) {
           nb::arg("wzeros"),
           nb::arg("out"),
           nb::arg("group_size"),
+          nb::arg("stream_ptr"));
+
+    m.def("adaln", &adaln,
+          "Fused AdaLN: layernorm(x) * (1 + scale) + shift",
+          nb::arg("x"),
+          nb::arg("scale"),
+          nb::arg("shift"),
+          nb::arg("out"),
+          nb::arg("N"),
+          nb::arg("D"),
+          nb::arg("scale_group"),
+          nb::arg("shift_group"),
+          nb::arg("eps"),
+          nb::arg("dtype_code"),
           nb::arg("stream_ptr"));
 
     // Feature availability flag (computed at module load time)

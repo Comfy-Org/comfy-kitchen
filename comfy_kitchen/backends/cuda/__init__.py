@@ -20,6 +20,7 @@ import sys
 import torch
 
 __all__ = [
+    "adaln",
     "apply_rope",
     "apply_rope1",
     "apply_rope_split_half",
@@ -105,6 +106,7 @@ except Exception as e:
     _EXT_ERROR = f"Failed to load extension: {e}"
     _C = None  # type: ignore
 
+from comfy_kitchen.backends._modulation import adaln_prep_modulation  # noqa: E402
 from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE  # noqa: E402
 from comfy_kitchen.float_utils import roundup  # noqa: E402
 
@@ -471,6 +473,39 @@ def scaled_mm_nvfp4(
     )
 
     return out
+
+
+def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    orig_shape = x.shape
+    D = x.shape[-1]
+    N = x.numel() // D
+
+    x_flat = x.reshape(N, D)
+    if not x_flat.is_contiguous():
+        x_flat = x_flat.contiguous()
+
+    scale_flat, scale_group = adaln_prep_modulation(scale, x, N, D)
+    shift_flat, shift_group = adaln_prep_modulation(shift, x, N, D)
+
+    out_flat = torch.empty_like(x_flat)
+    dtype_code = DTYPE_TO_CODE[x.dtype]
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+
+    _C.adaln(
+        _wrap_for_dlpack(x_flat),
+        _wrap_for_dlpack(scale_flat),
+        _wrap_for_dlpack(shift_flat),
+        _wrap_for_dlpack(out_flat),
+        N,
+        D,
+        scale_group,
+        shift_group,
+        eps,
+        dtype_code,
+        stream_ptr,
+    )
+
+    return out_flat.reshape(orig_shape)
 
 
 def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -900,6 +935,20 @@ def _build_constraints() -> dict:
     cuda_devices = frozenset({"cuda"})
 
     constraints = {
+        "adaln": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+                "scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+                "shift": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
         "quantize_per_tensor_fp8": FunctionConstraints(
             params={
                 "x": ParamConstraint(

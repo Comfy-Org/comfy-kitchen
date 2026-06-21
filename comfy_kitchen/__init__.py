@@ -20,6 +20,8 @@ from .registry import registry
 __version__ = "0.1.0"
 
 __all__ = [
+    # Normalization
+    "adaln",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -60,6 +62,26 @@ __all__ = [
 # =============================================================================
 # Public API Functions
 # =============================================================================
+
+
+def adaln(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fused Adaptive Layer Normalization: layernorm(x) * (1 + scale) + shift.
+
+    Args:
+        x: Input tensor of any shape (..., D)
+        scale: Modulation scale, broadcastable to x's shape
+        shift: Modulation shift, broadcastable to x's shape
+        eps: LayerNorm epsilon
+
+    Returns:
+        Normalized and modulated tensor with the same shape as x
+    """
+    return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
 
 
 def quantize_per_tensor_fp8(
