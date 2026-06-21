@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
+from torch.nn import functional
 
 
 def adaln(x: Tensor, scale: Tensor, shift: Tensor, eps: float = 1e-6) -> Tensor:
     """Fused AdaLN: layernorm(x, elementwise_affine=False) * (1 + scale) + shift"""
-    normalized = F.layer_norm(x, x.shape[-1:], eps=eps)
+    normalized = functional.layer_norm(x, x.shape[-1:], eps=eps)
     return normalized * (1 + scale) + shift
 
 

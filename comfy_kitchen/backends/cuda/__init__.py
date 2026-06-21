@@ -477,15 +477,15 @@ def scaled_mm_nvfp4(
 
 def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     orig_shape = x.shape
-    D = x.shape[-1]
-    N = x.numel() // D
+    d = x.shape[-1]
+    n = x.numel() // d
 
-    x_flat = x.reshape(N, D)
+    x_flat = x.reshape(n, d)
     if not x_flat.is_contiguous():
         x_flat = x_flat.contiguous()
 
-    scale_flat, scale_group = adaln_prep_modulation(scale, x, N, D)
-    shift_flat, shift_group = adaln_prep_modulation(shift, x, N, D)
+    scale_flat, scale_group = adaln_prep_modulation(scale, x, n, d)
+    shift_flat, shift_group = adaln_prep_modulation(shift, x, n, d)
 
     out_flat = torch.empty_like(x_flat)
     dtype_code = DTYPE_TO_CODE[x.dtype]
@@ -496,8 +496,8 @@ def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float 
         _wrap_for_dlpack(scale_flat),
         _wrap_for_dlpack(shift_flat),
         _wrap_for_dlpack(out_flat),
-        N,
-        D,
+        n,
+        d,
         scale_group,
         shift_group,
         eps,

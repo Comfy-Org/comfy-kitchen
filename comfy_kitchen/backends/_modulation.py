@@ -9,7 +9,7 @@ Triton backends can reuse the exact same broadcast logic without drifting.
 import torch
 
 
-def adaln_prep_modulation(t: torch.Tensor, x: torch.Tensor, N: int, D: int):
+def adaln_prep_modulation(t: torch.Tensor, x: torch.Tensor, n: int, d: int):
     """Flatten a scale/shift tensor to (R, D) distinct rows + a broadcast group.
 
     Returns (flat, group) where output row r reads vector ``r // group`` and
@@ -21,7 +21,7 @@ def adaln_prep_modulation(t: torch.Tensor, x: torch.Tensor, N: int, D: int):
     the expand+copy and the N*D of redundant read traffic. Broadcast patterns
     that don't form contiguous blocks fall back to materializing (group == 1).
     """
-    if t.shape[-1] == D:
+    if t.shape[-1] == d:
         lead_x = x.shape[:-1]
         lead_t = t.shape[:-1]
         # Left-pad scale's leading dims with 1s to align with x (PyTorch broadcast).
@@ -30,7 +30,7 @@ def adaln_prep_modulation(t: torch.Tensor, x: torch.Tensor, N: int, D: int):
             lead_t = (1,) * pad + tuple(lead_t)
             groupable = True
             seen_broadcast = False
-            for s_i, x_i in zip(lead_t, lead_x):
+            for s_i, x_i in zip(lead_t, lead_x, strict=True):
                 if s_i == x_i:
                     # A real "kept" dim must not sit inside a broadcast dim, or
                     # its rows wouldn't repeat in contiguous blocks.
@@ -45,13 +45,13 @@ def adaln_prep_modulation(t: torch.Tensor, x: torch.Tensor, N: int, D: int):
                     break
 
             if groupable:
-                rows = t.numel() // D
-                if rows > 0 and N % rows == 0:
-                    flat = t.reshape(rows, D)
+                rows = t.numel() // d
+                if rows > 0 and n % rows == 0:
+                    flat = t.reshape(rows, d)
                     if not flat.is_contiguous():
                         flat = flat.contiguous()
-                    return flat, N // rows
+                    return flat, n // rows
 
     # General broadcast: materialize. Correct for any shape, just not the fast path.
-    flat = t.expand_as(x).reshape(N, D)
+    flat = t.expand_as(x).reshape(n, d)
     return (flat if flat.is_contiguous() else flat.contiguous()), 1

@@ -3,18 +3,17 @@
 
 import pytest
 import torch
-import torch.nn.functional as F
+from torch.nn import functional
 
 import comfy_kitchen as ck
 from tests.conftest import assert_values_close, get_capable_backends
-
 
 # ---------------------------------------------------------------------------
 # Reference implementation
 # ---------------------------------------------------------------------------
 
 def _ref_adaln(x, scale, shift, eps=1e-6):
-    return F.layer_norm(x, x.shape[-1:], eps=eps) * (1 + scale) + shift
+    return functional.layer_norm(x, x.shape[-1:], eps=eps) * (1 + scale) + shift
 
 
 # ---------------------------------------------------------------------------
@@ -31,9 +30,9 @@ _SHAPES = [
 
 def _scale_shift(shape, dtype, device):
     """Return scale and shift tensors shaped (B, 1, D) — as produced by modulation."""
-    B, N, D = shape
-    scale = torch.randn(B, 1, D, dtype=dtype, device=device) * 0.1
-    shift = torch.randn(B, 1, D, dtype=dtype, device=device) * 0.1
+    batch, _, dim = shape
+    scale = torch.randn(batch, 1, dim, dtype=dtype, device=device) * 0.1
+    shift = torch.randn(batch, 1, dim, dtype=dtype, device=device) * 0.1
     return scale, shift
 
 
@@ -76,7 +75,7 @@ class TestAdaLN:
     @pytest.mark.parametrize("backend", ["cuda", "triton"])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_vs_eager(self, backend, dtype, seed, cuda_available):
-        """Non-eager backends must match the eager reference."""
+        """Non-eager backends must match the appropriate dtype reference."""
         device = "cuda" if cuda_available else "cpu"
         capable = get_capable_backends("adaln", device)
 
@@ -89,8 +88,13 @@ class TestAdaLN:
         x = torch.randn(shape, dtype=dtype, device=device)
         scale, shift = _scale_shift(shape, dtype, device)
 
-        with ck.use_backend("eager"):
-            ref = ck.adaln(x, scale, shift, 1e-6)
+        if dtype is torch.bfloat16:
+            ref = _ref_adaln(
+                x.float(), scale.float(), shift.float(), 1e-6
+            ).to(dtype)
+        else:
+            with ck.use_backend("eager"):
+                ref = ck.adaln(x, scale, shift, 1e-6)
 
         with ck.use_backend(backend):
             out = ck.adaln(x, scale, shift, 1e-6)
@@ -106,11 +110,11 @@ class TestAdaLN:
             pytest.skip("no capable backend available")
 
         shape = (2, 32, 128)
-        B, N, D = shape
+        batch, _, dim = shape
         dtype = torch.float32
         x = torch.randn(shape, dtype=dtype, device=device)
-        scale = torch.randn(B, 1, D, dtype=dtype, device=device)
-        shift = torch.randn(B, 1, D, dtype=dtype, device=device)
+        scale = torch.randn(batch, 1, dim, dtype=dtype, device=device)
+        shift = torch.randn(batch, 1, dim, dtype=dtype, device=device)
 
         out = ck.adaln(x, scale, shift, 1e-6)
         ref = _ref_adaln(x, scale, shift, 1e-6)
@@ -132,7 +136,7 @@ class TestAdaLN:
         shift = torch.zeros_like(x)
 
         out = ck.adaln(x, scale, shift, 1e-6)
-        ref = F.layer_norm(x, x.shape[-1:], eps=1e-6)
+        ref = functional.layer_norm(x, x.shape[-1:], eps=1e-6)
 
         assert_values_close(out, ref, rtol=1e-4, atol=1e-5, name="adaln[no-op scale/shift]")
 
