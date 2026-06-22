@@ -54,6 +54,9 @@ __all__ = [
     "BackendNotFoundError",
     "BackendNotImplementedError",
     "NoCapableBackendError",
+    # Sage attention
+    "sage_is_available",
+    "sage_sdpa",
 ]
 
 
@@ -457,6 +460,35 @@ def apply_rope_split_half1(
         Transformed tensor
     """
     return torch.ops.comfy_kitchen.apply_rope_split_half1(x, freqs_cis)
+
+
+def sage_is_available() -> bool:
+    """Return True if SageAttention CUDA kernels can run on the current device."""
+    from .sage_attention import is_available
+    return is_available()
+
+
+def sage_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    is_causal: bool = False,
+    smooth_k: bool = True,
+) -> torch.Tensor:
+    """SageAttention scaled dot-product attention.
+
+    Args:
+        q: Query tensor [B, H_Q, N_Q, D] (fp16 or bf16)
+        k: Key tensor [B, H_K, N_K, D]
+        v: Value tensor [B, H_K, N_K, D]
+        is_causal: Whether to apply causal masking
+        smooth_k: Whether to subtract per-head K mean before quantisation
+
+    Returns:
+        Output tensor [B, H_Q, N_Q, D] (same dtype as q)
+    """
+    from .sage_attention import sage_sdpa as _sage_sdpa
+    return _sage_sdpa(q, k, v, is_causal=is_causal, smooth_k=smooth_k)
 
 
 # =============================================================================
