@@ -826,6 +826,22 @@ def triton_quantize_rowwise(x: torch.Tensor):
     return y, s
 
 
+def triton_quantize_and_rotate_rowwise(x: torch.Tensor, H: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decoupled online activation rotation + row-wise quantization.
+
+    Args:
+        x: Input unrotated activation tensor [M, K].
+        H: Pre-built normalized Hadamard matrix [group_size, group_size].
+        group_size: ConvRot group size.
+
+    Returns:
+        Tuple of (rotated_quantized_x_int8, row_scales).
+    """
+    from comfy_kitchen.tensor.int8 import _rotate_activation
+    rotated_x = _rotate_activation(x, H, group_size)
+    return triton_quantize_rowwise(rotated_x)
+
+
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
@@ -991,6 +1007,8 @@ def int8_linear(
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
 ) -> torch.Tensor:
     """INT8 linear layer using fused Triton kernel.
 
@@ -1002,6 +1020,8 @@ def int8_linear(
         weight_scale: Weight scale.
         bias: Optional bias [N].
         out_dtype: Output dtype.
+        convrot: If True, apply online activation rotation.
+        convrot_groupsize: Group size for Hadamard rotation.
 
     Returns:
         Result tensor [..., N].
@@ -1012,8 +1032,14 @@ def int8_linear(
     M, K = x_2d.shape
     N = weight.shape[0]
 
-    # Quantize input per-row using fused kernel
-    x_int8, x_scale = triton_quantize_rowwise(x_2d)
+    # Quantize input per-row using fused or normal quantization kernel
+    if convrot:
+        from comfy_kitchen.tensor.int8 import _build_hadamard, _rotate_activation
+        H = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        x_rotated = _rotate_activation(x_2d, H, convrot_groupsize)
+        x_int8, x_scale = triton_quantize_rowwise(x_rotated)
+    else:
+        x_int8, x_scale = triton_quantize_rowwise(x_2d)
 
     output = torch.empty((M, N), device=x.device, dtype=out_dtype)
 

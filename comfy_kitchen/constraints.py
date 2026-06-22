@@ -108,8 +108,8 @@ class ParamConstraint:
             return True
         if isinstance(value, torch.Tensor):
             return value.dtype in self.dtypes
-        # value is a dtype directly (e.g., output_type parameter)
-        return value in self.dtypes
+        # value is a dtype directly (e.g., output_type parameter) or a Python built-in type instance
+        return value in self.dtypes or type(value) in self.dtypes
 
     def check_device(self, tensor: torch.Tensor, default_devices: frozenset[str]) -> bool:
         """Check if tensor's device is allowed."""

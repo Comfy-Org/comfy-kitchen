@@ -27,6 +27,8 @@ __all__ = [
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
     "int8_linear",
+    "quantize_int8_rowwise",
+    "quantize_and_rotate_rowwise",
     "gemv_awq_w4a16",
     "quantize_mxfp8",
     "quantize_nvfp4",
@@ -311,6 +313,18 @@ def dequantize_nvfp4(
     return output
 
 
+def quantize_int8_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with per-row scales (for activations)."""
+    from comfy_kitchen.backends.eager.quantization import quantize_int8_rowwise as eager_quantize
+    return eager_quantize(x)
+
+
+def quantize_and_rotate_rowwise(x: torch.Tensor, H: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused online activation rotation + row-wise quantization."""
+    from comfy_kitchen.backends.eager.quantization import quantize_and_rotate_rowwise as eager_quantize_rotate
+    return eager_quantize_rotate(x, H, group_size)
+
+
 def quantize_mxfp8(
     x: torch.Tensor,
     pad_32x: bool = False,
@@ -480,7 +494,14 @@ def int8_linear(
     weight_scale: torch.Tensor,
     bias: torch.Tensor = None,
     out_dtype: torch.dtype = None,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
 ) -> torch.Tensor:
+    if convrot:
+        from comfy_kitchen.tensor.int8 import _build_hadamard, _rotate_activation
+        H = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        x = _rotate_activation(x, H, convrot_groupsize)
+
     # cuBLAS INT8 GEMM requires row-wise quantized activations and tensor-wise quantized weights
     x_qdata, x_scale = torch.ops.comfy_kitchen.quantize_int8_rowwise(x)
 
@@ -1063,6 +1084,8 @@ def _build_constraints() -> dict:
                 "out_dtype": ParamConstraint(
                     dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
                 ),
+                "convrot": ParamConstraint(dtypes=frozenset({bool})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=cuda_devices,
             min_compute_capability=(7, 5),
@@ -1080,6 +1103,18 @@ def _build_constraints() -> dict:
                 "x": ParamConstraint(
                     dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
                 ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "quantize_and_rotate_rowwise": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+                "H": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=cuda_devices,
         ),

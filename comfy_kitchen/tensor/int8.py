@@ -21,6 +21,85 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_HADAMARD_CACHE = {}
+
+
+def _build_hadamard(
+    size: int,
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Build a normalized REGULAR orthogonal Hadamard matrix (ConvRot).
+
+    Size must be a power of 4 (e.g., 4, 16, 64, 256, 1024...).
+    Uses Kronecker construction to avoid the all-1s column of Sylvester Hadamard.
+    """
+    import math
+
+    cache_key = (size, str(device), dtype)
+    if cache_key in _HADAMARD_CACHE:
+        return _HADAMARD_CACHE[cache_key]
+
+    if size < 4 or (size & (size - 1)) != 0 or math.log(size, 4) % 1 != 0:
+        raise ValueError(f"Regular Hadamard size must be a power of 4, got {size}")
+
+    # Base H4 matrix
+    H4 = torch.tensor(
+        [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
+        dtype=dtype,
+        device=device,
+    )
+
+    H = H4
+    current_size = 4
+    while current_size < size:
+        H = torch.kron(H, H4)
+        current_size *= 4
+
+    H_normalized = H / (size**0.5)
+    _HADAMARD_CACHE[cache_key] = H_normalized
+    return H_normalized
+
+
+def _rotate_weight(
+    weight: torch.Tensor,
+    H: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    """Rotate weight matrix offline: W_rot = W @ H_block^T."""
+    out_f, in_f = weight.shape
+    if in_f % group_size != 0:
+        raise ValueError(f"in_features {in_f} not divisible by group_size {group_size}")
+    n_groups = in_f // group_size
+
+    W_grouped = weight.reshape(out_f, n_groups, group_size)
+    H_t = H.T.to(dtype=weight.dtype, device=weight.device)
+    W_rot = torch.matmul(W_grouped, H_t)
+    return W_rot.reshape(out_f, in_f)
+
+
+def _rotate_activation(
+    x: torch.Tensor,
+    H: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    """Rotate activation online using Optimized Matmul implementation."""
+    orig_shape = x.shape
+    features = orig_shape[-1]
+    if features % group_size != 0:
+        raise ValueError(f"features {features} not divisible by group_size {group_size}")
+    n_groups = features // group_size
+
+    # Reshape x to (..., n_groups, group_size)
+    x_grouped = x.reshape(-1, n_groups, group_size)
+
+    # Use optimized matmul with the precomputed normalized Hadamard matrix
+    H = H.to(dtype=x.dtype, device=x.device)
+    x_rotated = torch.matmul(x_grouped, H)
+
+    return x_rotated.reshape(orig_shape)
+
+
 class TensorWiseINT8Layout(QuantizedLayout):
     """Tensor-wise INT8 quantization (from dxqb/OneTrainer).
 
@@ -50,6 +129,8 @@ class TensorWiseINT8Layout(QuantizedLayout):
         """
 
         is_weight: bool = True
+        convrot: bool = False
+        convrot_groupsize: int = 256
 
         def _tensor_fields(self) -> list[str]:
             return ["scale"]
@@ -63,6 +144,8 @@ class TensorWiseINT8Layout(QuantizedLayout):
         tensor: torch.Tensor,
         is_weight: bool = True,
         per_channel: bool = False,
+        convrot: bool = False,
+        convrot_groupsize: int = 256,
         **kwargs,
     ) -> tuple[torch.Tensor, Params]:
         """Quantize a tensor to INT8 with tensorwise or rowwise scaling.
@@ -71,6 +154,8 @@ class TensorWiseINT8Layout(QuantizedLayout):
             tensor: Input tensor to quantize.
             is_weight: If True, use tensorwise or per-channel scale. If False, use per-row.
             per_channel: If True and is_weight, use per-channel (row-wise) scaling.
+            convrot: If True, apply orthogonal group-wise Hadamard rotation to weight.
+            convrot_groupsize: Group size for Hadamard rotation.
             **kwargs: Additional arguments (ignored).
 
         Returns:
@@ -78,6 +163,15 @@ class TensorWiseINT8Layout(QuantizedLayout):
         """
         orig_dtype = tensor.dtype
         orig_shape = tuple(tensor.shape)
+
+        if convrot:
+            if not is_weight:
+                raise ValueError("convrot is only supported when is_weight is True")
+            if not per_channel:
+                raise ValueError("convrot is only supported when per_channel is True")
+
+            H = _build_hadamard(convrot_groupsize, device=tensor.device, dtype=tensor.dtype)
+            tensor = _rotate_weight(tensor, H, convrot_groupsize)
 
         if is_weight:
             if per_channel:
@@ -96,6 +190,8 @@ class TensorWiseINT8Layout(QuantizedLayout):
             orig_dtype=orig_dtype,
             orig_shape=orig_shape,
             is_weight=is_weight,
+            convrot=convrot,
+            convrot_groupsize=convrot_groupsize,
         )
         return qdata, params
 
@@ -113,6 +209,9 @@ class TensorWiseINT8Layout(QuantizedLayout):
         from comfy_kitchen.backends.eager.quantization import dequantize_int8_simple
 
         result = dequantize_int8_simple(qdata, params.scale)
+        if getattr(params, "convrot", False):
+            H = _build_hadamard(params.convrot_groupsize, device=qdata.device, dtype=result.dtype)
+            result = _rotate_weight(result, H, params.convrot_groupsize)
         return result.to(params.orig_dtype)
 
     @classmethod
@@ -178,8 +277,17 @@ def _handle_int8_linear_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
+    convrot = getattr(weight._params, "convrot", False)
+    convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
+
     return ck.int8_linear(
-        input_tensor.contiguous(), weight_qdata.contiguous(), weight_scale, bias, out_dtype
+        input_tensor.contiguous(),
+        weight_qdata.contiguous(),
+        weight_scale,
+        bias,
+        out_dtype,
+        convrot=convrot,
+        convrot_groupsize=convrot_groupsize,
     )
 
 
@@ -202,10 +310,19 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
+    convrot = getattr(weight._params, "convrot", False)
+    convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
+
     # mm expects b to NOT be transposed, but our kernels expect (N, K)
     # For mm, weight is (K, N), so we need to transpose it to (N, K)
     return ck.int8_linear(
-        input_tensor.contiguous(), weight_qdata.t().contiguous(), weight_scale, None, out_dtype
+        input_tensor.contiguous(),
+        weight_qdata.t().contiguous(),
+        weight_scale,
+        None,
+        out_dtype,
+        convrot=convrot,
+        convrot_groupsize=convrot_groupsize,
     )
 
 
@@ -228,6 +345,15 @@ def _handle_int8_addmm_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
+    convrot = getattr(weight._params, "convrot", False)
+    convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
+
     return ck.int8_linear(
-        input_tensor.contiguous(), weight_qdata.t().contiguous(), weight_scale, bias, out_dtype
+        input_tensor.contiguous(),
+        weight_qdata.t().contiguous(),
+        weight_scale,
+        bias,
+        out_dtype,
+        convrot=convrot,
+        convrot_groupsize=convrot_groupsize,
     )

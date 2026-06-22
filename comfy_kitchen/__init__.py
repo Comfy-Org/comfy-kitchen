@@ -553,6 +553,8 @@ def int8_linear(
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
 ) -> torch.Tensor:
     """INT8 linear layer dynamically quantized.
 
@@ -562,6 +564,8 @@ def int8_linear(
         weight_scale: Scalar weight scale.
         bias: Optional bias.
         out_dtype: Output dtype.
+        convrot: If True, apply online activation rotation.
+        convrot_groupsize: Group size for Hadamard rotation.
 
     Returns:
         Result tensor.
@@ -569,7 +573,9 @@ def int8_linear(
     if out_dtype is None:
         out_dtype = torch.bfloat16
     dtype_code = DTYPE_TO_CODE[out_dtype]
-    return torch.ops.comfy_kitchen.int8_linear(x, weight, weight_scale, bias, dtype_code)
+    return torch.ops.comfy_kitchen.int8_linear(
+        x, weight, weight_scale, bias, dtype_code, convrot, convrot_groupsize
+    )
 
 
 # =============================================================================

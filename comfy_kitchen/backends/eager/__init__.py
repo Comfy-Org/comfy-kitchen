@@ -12,6 +12,7 @@ __all__ = [
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
     "quantize_int8_rowwise",
+    "quantize_and_rotate_rowwise",
     "quantize_int8_tensorwise",
     "quantize_svdquant_w4a4",
     "scaled_mm_mxfp8",
@@ -31,6 +32,7 @@ from .quantization import (
     quantize_nvfp4,
     quantize_per_tensor_fp8,
     quantize_int8_rowwise,
+    quantize_and_rotate_rowwise,
     quantize_int8_tensorwise,
     scaled_mm_mxfp8,
     scaled_mm_nvfp4,
@@ -215,6 +217,14 @@ def _build_constraints() -> dict:
         },
         default_devices=all_devices,
     )
+    out["quantize_and_rotate_rowwise"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "H": ParamConstraint(dtypes=standard_floats),
+            "group_size": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
     out["dequantize_int8_simple"] = FunctionConstraints(
         params={
             "q": ParamConstraint(dtypes=frozenset({torch.int8})),
@@ -227,6 +237,8 @@ def _build_constraints() -> dict:
             "x": ParamConstraint(dtypes=standard_floats),
             "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
             "weight_scale": ParamConstraint(dtypes=standard_floats),
+            "convrot": ParamConstraint(dtypes=frozenset({bool})),
+            "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
         },
         default_devices=all_devices,
     )

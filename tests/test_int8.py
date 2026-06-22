@@ -200,6 +200,153 @@ class TestTensorWiseINT8Layout:
         assert out.shape == (4, 64)
         assert out.dtype == torch.bfloat16
 
+    def test_convrot_hadamard_properties(self):
+        """Verify _build_hadamard constructs correct orthogonal, symmetric matrix."""
+        from comfy_kitchen.tensor.int8 import _build_hadamard
+
+        # Test valid sizes
+        for size in [4, 16, 64, 256]:
+            H = _build_hadamard(size, device="cuda", dtype=torch.float32)
+            assert H.shape == (size, size)
+            # Check symmetry: H^T = H
+            assert torch.allclose(H, H.T, atol=1e-5)
+            # Check orthogonality: H^T @ H = I
+            I = torch.eye(size, device="cuda", dtype=torch.float32)
+            assert torch.allclose(torch.matmul(H.T, H), I, atol=1e-4)
+
+        # Test invalid sizes
+        for size in [2, 8, 32, 128, 500]:
+            with pytest.raises(ValueError, match="Regular Hadamard size must be a power of 4"):
+                _build_hadamard(size, device="cuda")
+
+    def test_convrot_param_validation(self):
+        """Verify parameter combinations for convrot raise expected ValueErrors."""
+        from comfy_kitchen.tensor import TensorWiseINT8Layout
+
+        w = torch.randn(64, 256, device="cuda", dtype=torch.float16)
+
+        # 1. convrot with is_weight=False -> ValueError
+        with pytest.raises(ValueError, match="convrot is only supported when is_weight is True"):
+            TensorWiseINT8Layout.quantize(w, is_weight=False, convrot=True)
+
+        # 2. convrot with per_channel=False -> ValueError
+        with pytest.raises(ValueError, match="convrot is only supported when per_channel is True"):
+            TensorWiseINT8Layout.quantize(w, is_weight=True, per_channel=False, convrot=True)
+
+    def test_convrot_weight_roundtrip(self, seed):
+        """Verify weight roundtrip (quantize -> dequantize) with convrot=True preserves values."""
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        w = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        # Using default convrot_groupsize=256
+        qt = QuantizedTensor.from_float(
+            w, "TensorWiseINT8Layout", per_channel=True, convrot=True, convrot_groupsize=256
+        )
+
+        assert qt._params.convrot is True
+        assert qt._params.convrot_groupsize == 256
+
+        dq = qt.dequantize()
+        assert dq.dtype == torch.bfloat16
+        assert dq.shape == w.shape
+
+        # Roundtrip error should stay within expected INT8 quantization limits
+        rel_err = (w.float() - dq.float()).abs() / (w.float().abs().max() + 1e-8)
+        assert rel_err.mean().item() < 0.02
+
+    def test_convrot_divisibility(self, seed):
+        """Verify error when channels are not divisible by convrot_groupsize."""
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        # in_features (250) not divisible by 256
+        w = torch.randn(64, 250, device="cuda", dtype=torch.bfloat16)
+        with pytest.raises(ValueError, match="not divisible by group_size"):
+            QuantizedTensor.from_float(
+                w, "TensorWiseINT8Layout", per_channel=True, convrot=True, convrot_groupsize=256
+            )
+
+    def test_convrot_linear_mm_addmm_dispatch(self, seed):
+        """Verify linear, mm, and addmm dispatch with convrot=True works and is highly accurate."""
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        # Shapes must be compatible with group_size 64 (which is a valid power of 4)
+        group_size = 64
+        x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(64, device="cuda", dtype=torch.bfloat16)
+
+        # Baseline: normal INT8 Quantization (no rotation)
+        qt_w_normal = QuantizedTensor.from_float(
+            w, "TensorWiseINT8Layout", per_channel=True, convrot=False
+        )
+        out_linear_normal = torch.nn.functional.linear(x, qt_w_normal, bias)
+
+        # Active rotation version
+        qt_w_rot = QuantizedTensor.from_float(
+            w, "TensorWiseINT8Layout", per_channel=True, convrot=True, convrot_groupsize=group_size
+        )
+        out_linear_rot = torch.nn.functional.linear(x, qt_w_rot, bias)
+
+        # Output shapes & dtypes should match perfectly
+        assert out_linear_rot.shape == out_linear_normal.shape
+        assert out_linear_rot.dtype == out_linear_normal.dtype
+
+        # Result with and without ConvRot should be extremely close (it is mathematically equivalent under exact math)
+        # allowing for expected tiny differences in quantization noise.
+        rel_err_linear = (out_linear_rot.float() - out_linear_normal.float()).abs() / (out_linear_normal.float().abs().max() + 1e-8)
+        assert rel_err_linear.mean().item() < 0.02
+
+        # Test mm dispatch
+        # mm: a [M, K] @ b [K, N] where b is shape [64, 64] to ensure K==N for scale matching
+        x_mm = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
+        w_mm = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        qt_w_mm_rot = QuantizedTensor.from_float(
+            w_mm, "TensorWiseINT8Layout", per_channel=True, convrot=True, convrot_groupsize=group_size
+        )
+        out_mm_rot = torch.mm(x_mm, qt_w_mm_rot)
+        assert out_mm_rot.shape == (4, 64)
+        assert out_mm_rot.dtype == torch.bfloat16
+
+        # Test addmm dispatch
+        # addmm: bias + a [M, K] @ b [K, N]
+        bias_mm = torch.randn(64, device="cuda", dtype=torch.bfloat16)
+        out_addmm_rot = torch.addmm(bias_mm, x_mm, qt_w_mm_rot)
+        assert out_addmm_rot.shape == (4, 64)
+        assert out_addmm_rot.dtype == torch.bfloat16
+
+    def test_convrot_triton_fused_correctness(self, seed):
+        """Verify that fused Triton ConvRot+Quantization matches the eager baseline."""
+        import comfy_kitchen as ck
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        group_size = 64
+        x = torch.randn(32, 128, device="cuda", dtype=torch.float16)
+        w = torch.randn(64, 128, device="cuda", dtype=torch.float16)
+        bias = torch.randn(64, device="cuda", dtype=torch.float16)
+
+        # Quantize weight with convrot
+        qt_w = QuantizedTensor.from_float(
+            w, "TensorWiseINT8Layout", per_channel=True, convrot=True, convrot_groupsize=group_size
+        )
+        weight_qdata, weight_scale = qt_w._qdata, qt_w._params.scale
+
+        # Run with Eager backend
+        with ck.registry.use_backend("eager"):
+            out_eager = ck.int8_linear(
+                x, weight_qdata, weight_scale, bias=bias, out_dtype=torch.float16,
+                convrot=True, convrot_groupsize=group_size
+            )
+
+        # Run with Triton backend
+        with ck.registry.use_backend("triton"):
+            out_triton = ck.int8_linear(
+                x, weight_qdata, weight_scale, bias=bias, out_dtype=torch.float16,
+                convrot=True, convrot_groupsize=group_size
+            )
+
+        # Triton and Eager outputs must be extremely close
+        assert_values_close(out_triton, out_eager, rtol=1.0e-1, atol=1.0e-1, name="convrot_triton_vs_eager", max_mismatch_ratio=0.02)
+
 
 
 
