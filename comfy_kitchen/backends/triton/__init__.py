@@ -1,4 +1,5 @@
 __all__ = [
+    "adaln",
     "apply_rope",
     "apply_rope1",
     "apply_rope_split_half",
@@ -20,6 +21,7 @@ _TRITON_ERROR = None
 try:
     import triton  # noqa: F401
 
+    from .adaln import adaln
     from .quantization import (
         dequantize_nvfp4,
         dequantize_per_tensor_fp8,
@@ -50,6 +52,14 @@ def _build_constraints() -> dict:
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
 
     return {
+        "adaln": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "scale": ParamConstraint(dtypes=standard_floats),
+                "shift": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
         "quantize_per_tensor_fp8": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),

@@ -1,4 +1,5 @@
 __all__ = [
+    "adaln",
     "apply_rope",
     "apply_rope1",
     "apply_rope_split_half",
@@ -22,6 +23,7 @@ __all__ = [
     "int8_linear",
 ]
 
+from .adaln import adaln
 from .awq import gemv_awq_w4a16
 from .quantization import (
     dequantize_mxfp8,
@@ -56,6 +58,14 @@ def _build_constraints() -> dict:
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
 
     out = {
+        "adaln": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "scale": ParamConstraint(dtypes=standard_floats),
+                "shift": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
         "quantize_per_tensor_fp8": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
