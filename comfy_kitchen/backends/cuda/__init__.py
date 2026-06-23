@@ -621,6 +621,7 @@ def apply_rope_split_half(
 _SVDQUANT_W4A4_GROUP_SIZE = 64
 _SVDQUANT_W4A4_BLOCK_N = 128
 _SVDQUANT_WORKSPACE_CACHE: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+_SVDQUANT_LORA_DOWN_TMP_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
 
 
 def _is_svdquant_tile_packed_weight(wgt: torch.Tensor) -> bool:
@@ -642,19 +643,44 @@ def _natural_lora_up_from_tile_packed(lora_up: torch.Tensor) -> torch.Tensor:
     """
     if lora_up.dim() != 3:
         return lora_up
-    cached = getattr(lora_up, "_ck_natural_lora_up", None)
+    shape = (lora_up.shape[0] * _SVDQUANT_W4A4_BLOCK_N, lora_up.shape[1])
+    cache_key = (
+        id(lora_up),
+        lora_up.device,
+        lora_up.dtype,
+        shape,
+    )
+    state = getattr(lora_up, "_ck_natural_lora_up", None)
+    cached = (
+        state[1]
+        if isinstance(state, tuple) and len(state) == 2 and state[0] == cache_key
+        else None
+    )
     if (
         cached is not None
         and cached.device == lora_up.device
         and cached.dtype == lora_up.dtype
-        and cached.shape == (lora_up.shape[0] * _SVDQUANT_W4A4_BLOCK_N, lora_up.shape[1])
+        and cached.shape == shape
     ):
         return cached
     natural = lora_up.permute(0, 2, 1).reshape(
         lora_up.shape[0] * _SVDQUANT_W4A4_BLOCK_N, lora_up.shape[1],
     ).contiguous()
-    lora_up._ck_natural_lora_up = natural
+    lora_up._ck_natural_lora_up = (cache_key, natural)
     return natural
+
+
+def _svdquant_use_transposed_lora_down(m: int, r: int) -> bool:
+    """Return True for skinny LoRA-down shapes where transposed cuBLAS wins."""
+    if m <= 1 or r <= 0:
+        return False
+    if r <= 16:
+        return m <= 16
+    if r <= 32:
+        return m < 16
+    if r <= 64:
+        return m < 8
+    return m < 4
 
 
 def quantize_svdquant_w4a4(
@@ -731,10 +757,30 @@ def quantize_svdquant_w4a4(
     # numerics. Set COMFY_KITCHEN_SVDQUANT_LORA_ACT_FP32=1 to force the older
     # fp32 staging buffer if a quality regression is suspected.
     lora_src = lora_x if lora_x is not None else x
-    if m > 0:
+    if m > 0 and r > 0:
         lora_act_rows = lora_act[:m]
         if lora_act_rows.dtype == lora_src.dtype and lora_act_rows.is_contiguous():
-            torch.mm(lora_src, lora_down, out=lora_act_rows)
+            if _svdquant_use_transposed_lora_down(m, r):
+                # cuBLAS picks slow skinny-M paths for some low-rank shapes on
+                # RTX 6000 Ada. The transposed GEMM is faster there even with
+                # this tiny copy; the rank-aware cutoff avoids hurting larger R.
+                if reuse_workspace:
+                    device_index = (
+                        lora_src.device.index
+                        if lora_src.device.index is not None
+                        else torch.cuda.current_device()
+                    )
+                    tmp_key = (device_index, int(stream_ptr), lora_src.dtype, m, r)
+                    tmp = _SVDQUANT_LORA_DOWN_TMP_CACHE.get(tmp_key)
+                    if tmp is None:
+                        tmp = torch.empty(r, m, dtype=lora_src.dtype, device=lora_src.device)
+                        _SVDQUANT_LORA_DOWN_TMP_CACHE[tmp_key] = tmp
+                    torch.mm(lora_down.t(), lora_src.t(), out=tmp)
+                    lora_act_rows.copy_(tmp.t())
+                else:
+                    lora_act_rows.copy_(torch.mm(lora_down.t(), lora_src.t()).t())
+            else:
+                torch.mm(lora_src, lora_down, out=lora_act_rows)
         else:
             lora_act_rows.copy_(lora_src @ lora_down, non_blocking=True)
     if m_pad > m:
@@ -754,11 +800,11 @@ def scaled_mm_svdquant_w4a4(
 ) -> torch.Tensor:
     """SVDQuant W4A4 int4 GEMM + LoRA-up + bias (CUDA).
 
-    int4 MMA + per-group dequant + bias run in one kernel. By default, when
-    lora_act_in already has the output dtype and proj_up's layout matches the
-    weight layout, LoRA-up is fused into the CUDA epilogue with bf16/fp16
-    tensor-core MMA. Set COMFY_KITCHEN_SVDQUANT_FUSE_LORA_UP=0 to force the
-    older Python/cuBLAS addmm_ epilogue for comparison.
+    int4 MMA + per-group dequant + bias run in one kernel. LoRA-up uses an
+    automatic policy: the in-kernel LoRA MMA wins for skinny M and narrower
+    output widths, while cuBLAS addmm_ is better for wide grouped QKV at larger
+    M. Set COMFY_KITCHEN_SVDQUANT_FUSE_LORA_UP=1 or =0 to force either path for
+    comparison or profiling.
 
     Kitchen-native layouts:
       act         (M, K/2)   int8       two int4 per byte (signed or unsigned)
@@ -775,6 +821,7 @@ def scaled_mm_svdquant_w4a4(
     act_unsigned: if True, A fragments go through u4.s4 MMA instead of s4.s4.
     Set COMFY_KITCHEN_SVDQUANT_FAST_ACCUM=1 to use the experimental packed
     half2/bfloat162 accumulator instead of the default fp32 accumulator.
+    Set COMFY_KITCHEN_SVDQUANT_SHARED_SCALE=0 to disable per-CTA wscale staging.
     """
     m = act.shape[0]
     n = _svdquant_out_features_from_weight(wgt)
@@ -785,18 +832,27 @@ def scaled_mm_svdquant_w4a4(
     }
     shared_scale_env = os.getenv("COMFY_KITCHEN_SVDQUANT_SHARED_SCALE")
     if shared_scale_env is None:
-        shared_scale = _is_svdquant_tile_packed_weight(wgt)
+        shared_scale = True
     else:
         shared_scale = shared_scale_env.lower() in {"1", "true", "yes", "on"}
-    lora_up_layout_matches_wgt = (
-        _is_svdquant_tile_packed_weight(wgt) == (lora_up.dim() == 3)
-    )
+    lora_up_layout_matches_wgt = _is_svdquant_tile_packed_weight(wgt) == (lora_up.dim() == 3)
     fuse_lora_env = os.getenv("COMFY_KITCHEN_SVDQUANT_FUSE_LORA_UP")
-    fuse_lora = (
-        lora_act_in.dtype == out.dtype
+    fuse_lora_possible = (
+        lora_act_in.shape[1] > 0
+        and lora_act_in.dtype == out.dtype
         and lora_up_layout_matches_wgt
-        and (fuse_lora_env is None or fuse_lora_env.lower() in {"1", "true", "yes", "on"})
     )
+    if fuse_lora_env is None:
+        # Measured on RTX 6000 Ada for R={16,32,64}: fused LoRA-up wins for
+        # narrow projections and for very small M, but loses for QKV-width
+        # projections once M grows. Keep the automatic policy conservative and
+        # preserve env overrides above it.
+        fuse_lora = fuse_lora_possible and (m <= 16 or n <= 4096 or (n <= 8192 and m <= 128))
+    else:
+        fuse_lora = (
+            fuse_lora_possible
+            and fuse_lora_env.lower() in {"1", "true", "yes", "on"}
+        )
 
     stream_ptr = torch.cuda.current_stream(act.device).cuda_stream
     _C.svdquant_scaled_mm_w4a4(
@@ -815,7 +871,7 @@ def scaled_mm_svdquant_w4a4(
         stream_ptr,
     )
 
-    if not fuse_lora:
+    if not fuse_lora and lora_act_in.shape[1] > 0:
         # LoRA-up via bf16/fp16 addmm_. CUDA quantize normally returns lora_act
         # in out.dtype, so the common unfused comparison path avoids a cast.
         lora_bf16 = lora_act_in if lora_act_in.dtype == out.dtype else lora_act_in.to(out.dtype)
@@ -824,14 +880,130 @@ def scaled_mm_svdquant_w4a4(
     return out
 
 
-# Above this M the fused MMA kernel falls behind cuBLAS bf16 GEMM on Blackwell
-# (cuBLAS approaches peak; the kernel here is single-thread-per-N-row in the
-# dequant pass and lacks cp.async pipelining). Empirically the crossover sits
-# near M=256 on RTX 5090 / Qwen-Image-Edit shapes (M=256: 1.6x vs eager,
-# M=512: 0.88x). Above the limit we route to a CUDA-side dequant +
-# torch.matmul (cuBLAS) path. Future tuning of the MMA kernel will raise
-# this limit and eventually remove the fallback.
-_AWQ_W4A16_MMA_M_LIMIT = 256
+# Above this M the fused MMA kernel falls behind CUDA-side dequant + cuBLAS
+# bf16 GEMM. On RTX 6000 Ada, the fused path wins through M=128 and loses by
+# M=256 for Qwen-Image-style shapes (N=K=4096, group_size=64).
+_AWQ_W4A16_MMA_M_LIMIT = 128
+_AWQ_W4A16_FALLBACK_MM_OUT_NO_BIAS_M_MIN = 1024
+_AWQ_W4A16_SMALL_M_CACHE_CALLS_DEFAULT = 1
+_FALSE_ENV_VALUES = {"0", "false", "no", "off"}
+
+
+def _awq_dequant_cache_enabled() -> bool:
+    value = os.getenv("COMFY_KITCHEN_AWQ_CACHE_DEQUANT")
+    if value is None:
+        return False
+    return value.strip().lower() not in _FALSE_ENV_VALUES
+
+
+def _awq_force_fused_small_m() -> bool:
+    value = os.getenv("COMFY_KITCHEN_AWQ_FORCE_FUSED_SMALL_M")
+    return value is not None and value.strip().lower() not in _FALSE_ENV_VALUES
+
+
+def _awq_small_m_cache_calls() -> int:
+    value = os.getenv("COMFY_KITCHEN_AWQ_SMALL_M_CACHE_CALLS")
+    if value is None:
+        return _AWQ_W4A16_SMALL_M_CACHE_CALLS_DEFAULT
+    value = value.strip().lower()
+    if value in _FALSE_ENV_VALUES:
+        return 0
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return _AWQ_W4A16_SMALL_M_CACHE_CALLS_DEFAULT
+
+
+def _awq_w4a16_cache_key(
+    qweight: torch.Tensor,
+    wscales: torch.Tensor,
+    wzeros: torch.Tensor,
+    group_size: int,
+) -> tuple[object, ...]:
+    """Inference-only AWQ dequant cache key attached to qweight.
+
+    Model tensors are treated as immutable after load. Replacing tensor objects
+    invalidates the cache; in-place mutation of an existing tensor does not.
+    """
+    return (id(qweight), id(wscales), id(wzeros), group_size)
+
+
+def _awq_w4a16_cached_dequant_weight(
+    qweight: torch.Tensor,
+    wscales: torch.Tensor,
+    wzeros: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor | None:
+    cached = getattr(qweight, "_ck_awq_dequant_cache", None)
+    if cached is None:
+        return None
+    cache_key = _awq_w4a16_cache_key(qweight, wscales, wzeros, group_size)
+    return cached[1] if cached[0] == cache_key else None
+
+
+def _awq_w4a16_should_build_small_m_cache(
+    qweight: torch.Tensor,
+    wscales: torch.Tensor,
+    wzeros: torch.Tensor,
+    group_size: int,
+) -> bool:
+    threshold = _awq_small_m_cache_calls()
+    if threshold <= 0 or not _awq_dequant_cache_enabled():
+        return False
+
+    cache_key = _awq_w4a16_cache_key(qweight, wscales, wzeros, group_size)
+    state = getattr(qweight, "_ck_awq_small_m_cache_calls", None)
+    count = (state[1] if state is not None and state[0] == cache_key else 0) + 1
+    qweight._ck_awq_small_m_cache_calls = (cache_key, count)
+    return count >= threshold
+
+
+def _awq_w4a16_dequant_weight(
+    qweight: torch.Tensor,
+    wscales: torch.Tensor,
+    wzeros: torch.Tensor,
+    group_size: int,
+    *,
+    cache: bool,
+) -> torch.Tensor:
+    n, k_half = qweight.shape
+    k = k_half * 2
+    compute_dtype = wscales.dtype
+
+    if cache:
+        cache_key = _awq_w4a16_cache_key(qweight, wscales, wzeros, group_size)
+        cached = getattr(qweight, "_ck_awq_dequant_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+    else:
+        cache_key = None
+
+    if hasattr(_C, "awq_dequant_w4a16"):
+        weight = torch.empty(n, k, dtype=compute_dtype, device=qweight.device)
+        stream_ptr = torch.cuda.current_stream(qweight.device).cuda_stream
+        _C.awq_dequant_w4a16(
+            _wrap_for_dlpack(qweight.view(torch.uint8)),
+            _wrap_for_dlpack(wscales),
+            _wrap_for_dlpack(wzeros),
+            _wrap_for_dlpack(weight),
+            group_size,
+            stream_ptr,
+        )
+    else:
+        x16 = qweight.view(torch.uint8).to(torch.int16)
+        lo = (x16 & 0xF).to(torch.int8)
+        hi = ((x16 >> 4) & 0xF).to(torch.int8)
+        nibbles = torch.stack([lo, hi], dim=-1).reshape(n, k).to(compute_dtype)
+        weight = (
+            (nibbles.view(n, k // group_size, group_size) - 8.0)
+            * wscales.t().unsqueeze(-1)
+            + wzeros.t().unsqueeze(-1)
+        ).view(n, k)
+
+    if cache:
+        weight = weight.contiguous()
+        qweight._ck_awq_dequant_cache = (cache_key, weight)
+    return weight
 
 
 def _awq_w4a16_dequant_then_matmul(
@@ -846,21 +1018,73 @@ def _awq_w4a16_dequant_then_matmul(
     qweight (N, K/2) int8 packed uint4 → W (N, K) bf16 via group dequant, then
     `out = x @ W.T`. Same algebra as eager.gemv_awq_w4a16 — used for M values
     where the in-kitchen MMA kernel is slower than cuBLAS bf16 GEMM.
-    """
-    n, k_half = qweight.shape
-    k = k_half * 2
-    g = group_size
-    compute_dtype = wscales.dtype
 
-    x32 = qweight.to(torch.int32)
-    lo = (x32 & 0xF).to(torch.int8)
-    hi = ((x32 >> 4) & 0xF).to(torch.int8)
-    nibbles = torch.stack([lo, hi], dim=-1).reshape(n, k).to(compute_dtype)
-    w = (
-        (nibbles.view(n, k // g, g) - 8.0) * wscales.t().unsqueeze(-1)
-        + wzeros.t().unsqueeze(-1)
-    ).view(n, k)
+    Set COMFY_KITCHEN_AWQ_CACHE_DEQUANT=1 to cache the dequantized bf16/fp16
+    weight on qweight for repeated calls. This is much faster after the first
+    call but keeps N*K*sizeof(dtype) extra VRAM resident per cached weight.
+    """
+    w = _awq_w4a16_dequant_weight(
+        qweight, wscales, wzeros, group_size, cache=_awq_dequant_cache_enabled(),
+    )
     return x.matmul(w.t())
+
+
+def _awq_w4a16_matmul_with_optional_bias(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, bool]:
+    m = x.shape[0]
+    wt = w.t()
+    if bias is None:
+        if m >= _AWQ_W4A16_FALLBACK_MM_OUT_NO_BIAS_M_MIN:
+            out = torch.empty(m, w.shape[0], dtype=x.dtype, device=x.device)
+            torch.mm(x, wt, out=out)
+            return out, False
+        return x.matmul(wt), False
+
+    return torch.addmm(bias, x, wt), True
+
+
+def _awq_w4a16_dequant_then_matmul_with_optional_bias(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    wscales: torch.Tensor,
+    wzeros: torch.Tensor,
+    bias: torch.Tensor | None,
+    group_size: int,
+) -> tuple[torch.Tensor, bool]:
+    """Large-M fallback with optional cuBLAS beta=bias epilogue.
+
+    On RTX 6000 Ada, torch.addmm(bias, x, w.T) is the most robust cuBLAS route
+    for Qwen-style cached AWQ shapes across fp16/bf16 and tested batch sizes.
+    The no-bias path still switches to explicit mm(out=...) at large M.
+    """
+    w = _awq_w4a16_dequant_weight(
+        qweight, wscales, wzeros, group_size, cache=_awq_dequant_cache_enabled(),
+    )
+    return _awq_w4a16_matmul_with_optional_bias(x, w, bias)
+
+
+def _awq_w4a16_cached_matmul_with_optional_bias(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    wscales: torch.Tensor,
+    wzeros: torch.Tensor,
+    bias: torch.Tensor | None,
+    group_size: int,
+) -> tuple[torch.Tensor, bool] | None:
+    """Use an already-built AWQ dequant cache for any M without creating one.
+
+    Once the cache exists, M=1..128 also route through cuBLAS because it is
+    faster than the fused int4 path on RTX 6000 Ada for 4096x4096 weights.
+    """
+    if not _awq_dequant_cache_enabled():
+        return None
+    w = _awq_w4a16_cached_dequant_weight(qweight, wscales, wzeros, group_size)
+    if w is None:
+        return None
+    return _awq_w4a16_matmul_with_optional_bias(x, w, bias)
 
 
 def gemv_awq_w4a16(
@@ -874,11 +1098,11 @@ def gemv_awq_w4a16(
     """AWQ W4A16 matmul: int4 weight @ fp activation (CUDA, kitchen-native).
 
     Tiered routing:
-      M ≤ 8                    naive 1-thread-per-output kernel (GEMV-style)
-      8 < M ≤ 512              fused int4 x bf16/fp16 MMA kernel — dequant
-                               into shmem, mma.m16n8k16.f32 along K, no
-                               intermediate bf16 W workspace
-      M > 512                  dequant + cuBLAS bf16 matmul fallback
+      existing dequant cache       cuBLAS matmul for any M
+      default path                 temporary dequant + cuBLAS, no resident W
+      opt-in resident cache        dequant cache + cuBLAS for repeated calls
+      forced small-M fused route    naive kernel for M <= 4, MMA kernel for
+                                    4 < M <= 128, no dequant W workspace
 
     bias is applied externally (`out.add_`), mirroring
     scaled_mm_svdquant_w4a4's epilogue contract.
@@ -891,6 +1115,13 @@ def gemv_awq_w4a16(
       wzeros   (K/G, N) bf16/fp16  per-group, per-output-col zero
       bias     (N,)     bf16/fp16  optional (= wscales.dtype)
       out      (..., N) bf16/fp16  same dtype as wscales
+
+    The default path uses temporary dequant + cuBLAS for speed without keeping
+    a full dequantized weight resident. Set COMFY_KITCHEN_AWQ_CACHE_DEQUANT=1
+    to enable the resident cache for repeated calls, and
+    COMFY_KITCHEN_AWQ_SMALL_M_CACHE_CALLS to tune the small-M trigger. Set
+    COMFY_KITCHEN_AWQ_FORCE_FUSED_SMALL_M=1 to benchmark the workspace-saving
+    fused small-M kernel when the resident cache is disabled.
     """
     orig_shape = x.shape
     x2d = x.reshape(-1, orig_shape[-1])
@@ -901,15 +1132,22 @@ def gemv_awq_w4a16(
     if qweight.shape[1] * 2 != k:
         raise ValueError(f"qweight K//2={qweight.shape[1]} inconsistent with x K={k}")
 
-    if m > _AWQ_W4A16_MMA_M_LIMIT:
-        out2d = _awq_w4a16_dequant_then_matmul(
-            x2d.contiguous().to(wscales.dtype), qweight, wscales, wzeros, group_size,
+    x2d_compute = x2d.contiguous().to(wscales.dtype)
+    cached_result = _awq_w4a16_cached_matmul_with_optional_bias(
+        x2d_compute, qweight, wscales, wzeros, bias, group_size,
+    )
+    if cached_result is not None:
+        out2d, bias_applied = cached_result
+    elif m > _AWQ_W4A16_MMA_M_LIMIT or _awq_w4a16_should_build_small_m_cache(qweight, wscales, wzeros, group_size) or (not _awq_dequant_cache_enabled() and not _awq_force_fused_small_m()):
+        out2d, bias_applied = _awq_w4a16_dequant_then_matmul_with_optional_bias(
+            x2d_compute, qweight, wscales, wzeros, bias, group_size,
         )
     else:
+        bias_applied = False
         out2d = torch.empty(m, n, dtype=wscales.dtype, device=x.device)
         stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
         _C.awq_w4a16(
-            _wrap_for_dlpack(x2d.contiguous().to(wscales.dtype)),
+            _wrap_for_dlpack(x2d_compute),
             _wrap_for_dlpack(qweight.view(torch.uint8)),
             _wrap_for_dlpack(wscales),
             _wrap_for_dlpack(wzeros),
@@ -918,7 +1156,7 @@ def gemv_awq_w4a16(
             stream_ptr,
         )
 
-    if bias is not None:
+    if bias is not None and not bias_applied:
         out2d.add_(bias)
 
     return out2d.reshape(*orig_shape[:-1], n)

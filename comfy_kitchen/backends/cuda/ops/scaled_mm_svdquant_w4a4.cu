@@ -3,21 +3,21 @@
 // Kitchen CUDA SVDQuant W4A4 int4 GEMM with per-group dequant.
 //
 // Tile layout:
-//   CTA  = 8 warps × 32 threads = 256 threads, warp grid 2×4
-//   CTA covers 32 M × 128 N output (each warp computes 16 M × 32 N)
-//   grid = (ceil(N/128), ceil(M/32))
+//   CTA  = 8 warps × 32 threads = 256 threads.
+//   Default warp grid is 2×4, covering 64 M × 128 N output.
+//   Tiny-M warp grid is 4×2, covering 128 M × 64 N output.
+//   Small-M warp grid is 8×1, covering 256 M × 32 N output.
 //
 // Per K iteration (BLOCK_K = kGroupSize = 64):
-//   A (32 M × 32 B/group) and, by default, B (128 N × 32 B/group) are
+//   A and B are
 //   CTA-cooperatively loaded into shmem via cp.async, triple-buffered
 //   (kStages=3).
-//   Each warp issues kNUnroll = 4 MMAs covering its 16M × 32N output tile.
+//   Each warp issues kMUnroll × kNUnroll MMAs covering its 32M × 32N output tile.
 //
-// Experimental shared-scale path:
-//   COMFY_KITCHEN_SVDQUANT_SHARED_SCALE=1 stages each CTA's 128 wscales for the
-//   current K group once via cp.async, then all warps read scales from shmem.
-//   This approximates nunchaku's packed scale reuse without requiring a new
-//   checkpoint scale layout or warp shuffle broadcast in the hot dequant loop.
+// Shared-scale path:
+//   Each CTA stages its wscales for the current K group once via cp.async,
+//   then all warps read scales from shmem. This avoids redundant per-warp scale
+//   loads in the hot dequant loop for both natural and tile-packed layouts.
 //
 // Weight storage:
 //   natural:
@@ -74,21 +74,12 @@ using comfy::svdquant::cp_async_wait_group;
 
 constexpr int kStages = 3;  // 3-stage cp.async hides GMEM/scale latency better than 2-stage on sm_120.
 
-constexpr int kMUnroll  = 1;               // MMA_M tiles per warp (each 16 M)
-constexpr int kWarpM    = kMUnroll * 16;   // 16 M rows per warp
+constexpr int kMUnroll  = 2;               // MMA_M tiles per warp (each 16 M)
 constexpr int kNUnroll  = 4;               // MMAs per K iter per warp (N dim)
-constexpr int kWarpN    = kNUnroll * 8;    // 32 N cols per warp
-constexpr int kWarpsM   = 2;               // warps stacked in M
-constexpr int kWarpsN   = 4;               // warps stacked in N
-constexpr int kNumWarps = kWarpsM * kWarpsN;      // 8
-constexpr int kBlockM   = kWarpM * kWarpsM;       // 32 M per CTA
-constexpr int kBlockN   = kWarpN * kWarpsN;       // 128 N per CTA
+constexpr int kNumWarps = 8;
 constexpr int kBlockKBytes = kGroupSize / 2;      // 32 bytes of int4 per K group
 constexpr int kTileInterleave = 4;
 constexpr int kLoraRankTile = 16;
-constexpr int kThreadsPerBlock = kNumWarps * 32;
-constexpr int kBLoadChunks = kBlockN * 2;  // two 16-byte chunks per N row.
-constexpr int kBLoadSweeps = (kBLoadChunks + kThreadsPerBlock - 1) / kThreadsPerBlock;
 constexpr int kScaleChunkBytes = 16;
 
 template<typename OutType>
@@ -216,6 +207,8 @@ struct Vec2Traits<__nv_bfloat16> {
 };
 
 template<
+    int kWarpsMParam,
+    int kWarpsNParam,
     typename OutType,
     bool kActUnsigned,
     bool kTilePacked,
@@ -233,27 +226,39 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
     OutType* __restrict__ out,               // (M, N)
     int M, int N, int K, int R)
 {
+    constexpr int kWarpMLocal = kMUnroll * 16;
+    constexpr int kWarpNLocal = kNUnroll * 8;
+    constexpr int kNumWarpsLocal = kWarpsMParam * kWarpsNParam;
+    constexpr int kBlockMLocal = kWarpMLocal * kWarpsMParam;
+    constexpr int kBlockNLocal = kWarpNLocal * kWarpsNParam;
+    constexpr int kThreadsPerBlockLocal = kNumWarpsLocal * 32;
+    constexpr int kBLoadChunksLocal = kBlockNLocal * 2;
+    constexpr int kBLoadSweepsLocal = (kBLoadChunksLocal + kThreadsPerBlockLocal - 1) /
+                                      kThreadsPerBlockLocal;
+    static_assert(kNumWarpsLocal == 8, "SVDQuant W4A4 kernels require 8 warps per CTA");
+
     if constexpr (!kFuseLora) {
         (void)lora_act_in; (void)lora_up; (void)R;
     }
 
     // CTA coordinates
-    const int cta_m = blockIdx.y * kBlockM;
-    const int cta_n = blockIdx.x * kBlockN;
-    const int cta_n_tile = blockIdx.x;
+    const int cta_m = blockIdx.y * kBlockMLocal;
+    const int cta_n = blockIdx.x * kBlockNLocal;
+    const int cta_n_tile = cta_n / 128;
+    const int cta_n_in_tile = cta_n - cta_n_tile * 128;
 
     // Warp layout within CTA
     const int warp_id   = threadIdx.x >> 5;          // 0..kNumWarps-1
     const int lane      = threadIdx.x & 31;
-    const int warp_m    = warp_id & (kWarpsM - 1);   // 0..kWarpsM-1
-    const int warp_n    = warp_id / kWarpsM;         // 0..kWarpsN-1
+    const int warp_m    = warp_id % kWarpsMParam;    // 0..kWarpsMParam-1
+    const int warp_n    = warp_id / kWarpsMParam;    // 0..kWarpsNParam-1
 
     const int groupID      = lane >> 2;   // 0..7
     const int tid_in_group = lane & 3;    // 0..3
 
     // This warp's output M/N base
-    const int warp_m_base = cta_m + warp_m * kWarpM;
-    const int warp_n_base = cta_n + warp_n * kWarpN;
+    const int warp_m_base = cta_m + warp_m * kWarpMLocal;
+    const int warp_n_base = cta_n + warp_n * kWarpNLocal;
 
     // Per-warp accumulator: kMUnroll M-tiles × kNUnroll N-chunks.
     // We accumulate in fp32 (not fp16) because in production Qwen-Image-Edit,
@@ -295,23 +300,21 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
     const int num_groups  = K / kGroupSize;
 
     // Shared memory: triple-buffered A and B tiles.
-    // B stage: kBlockN rows × kBlockKBytes bytes = 128 * 32 = 4 KB
-    // A stage: kBlockM rows × kBlockKBytes bytes =  32 * 32 = 1 KB
-    __shared__ alignas(16) int8_t smem_B[kStages][kBlockN * kBlockKBytes];
-    __shared__ alignas(16) int8_t smem_A[kStages][kBlockM * kBlockKBytes];
-    __shared__ alignas(16) int8_t smem_WS[kSharedScale ? kStages : 1][kBlockN * sizeof(OutType)];
-    __shared__ alignas(16) OutType smem_LoraA[kFuseLora ? (kBlockM * kLoraRankTile) : 1];
-    __shared__ alignas(16) OutType smem_LoraB[kFuseLora ? (kBlockN * kLoraRankTile) : 1];
+    __shared__ alignas(16) int8_t smem_B[kStages][kBlockNLocal * kBlockKBytes];
+    __shared__ alignas(16) int8_t smem_A[kStages][kBlockMLocal * kBlockKBytes];
+    __shared__ alignas(16) int8_t smem_WS[kSharedScale ? kStages : 1][kBlockNLocal * sizeof(OutType)];
+    __shared__ alignas(16) OutType smem_LoraA[kFuseLora ? (kBlockMLocal * kLoraRankTile) : 1];
+    __shared__ alignas(16) OutType smem_LoraB[kFuseLora ? (kBlockNLocal * kLoraRankTile) : 1];
 
     // ---------- Helper: issue async cp for B tile at group `g` into stage ----------
     auto issue_B_load = [&](int g, int stage) {
         if (g >= num_groups) return;
         const int thread_idx = threadIdx.x;
         #pragma unroll
-        for (int sweep = 0; sweep < kBLoadSweeps; ++sweep) {
-            const int t = thread_idx + sweep * kThreadsPerBlock;
+        for (int sweep = 0; sweep < kBLoadSweepsLocal; ++sweep) {
+            const int t = thread_idx + sweep * kThreadsPerBlockLocal;
             // each t loads one 16-byte chunk: n_row = t/2, half = t%2
-            if (t < kBlockN * 2) {
+            if (t < kBlockNLocal * 2) {
                 const int n_row = t >> 1;
                 const int half  = t & 1;
                 const int n_global = cta_n + n_row;
@@ -319,10 +322,11 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
                 if (n_global < N) {
                     const int8_t* src;
                     if constexpr (kTilePacked) {
-                        const int n_quad = n_row >> 2;
-                        const int n_lane = n_row & (kTileInterleave - 1);
+                        const int n_in_tile = cta_n_in_tile + n_row;
+                        const int n_quad = n_in_tile >> 2;
+                        const int n_lane = n_in_tile & (kTileInterleave - 1);
                         src = wgt + (cta_n_tile * num_groups + g) *
-                              (kBlockN * kBlockKBytes) +
+                              (128 * kBlockKBytes) +
                               n_quad * (kTileInterleave * kBlockKBytes) +
                               n_lane * kBlockKBytes + half * 16;
                     } else {
@@ -338,10 +342,10 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
     };
 
     auto load_B_fragment = [&](int stage, int c, uint32_t (&b_reg)[2]) {
-        const int b_col_local = (warp_n * kWarpN) + c * 8 + groupID;
+        const int b_col_local = (warp_n * kWarpNLocal) + c * 8 + groupID;
         const int b_col_global = cta_n + b_col_local;
         b_reg[0] = b_reg[1] = 0;
-        if (b_col_local < kBlockN && b_col_global < N) {
+        if (b_col_local < kBlockNLocal && b_col_global < N) {
             const int byte0 = tid_in_group * 8;
             const int8_t* row_base = &smem_B[stage][b_col_local * kBlockKBytes];
             b_reg[0] = *reinterpret_cast<const uint32_t*>(row_base + byte0);
@@ -353,7 +357,7 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
     auto issue_A_load = [&](int g, int stage) {
         if (g >= num_groups) return;
         const int t = threadIdx.x;
-        if (t < kBlockM * 2) {
+        if (t < kBlockMLocal * 2) {
             const int m_row = t >> 1;
             const int half  = t & 1;
             const int m_global = cta_m + m_row;
@@ -375,24 +379,34 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
         }
         if (g >= num_groups) return;
         constexpr int kScaleElemsPerChunk = kScaleChunkBytes / sizeof(OutType);
-        constexpr int kScaleLoadChunks = kBlockN / kScaleElemsPerChunk;
+        constexpr int kScaleLoadChunks = kBlockNLocal / kScaleElemsPerChunk;
         const int t = threadIdx.x;
         if (t < kScaleLoadChunks) {
             const int n0 = t * kScaleElemsPerChunk;
             int8_t* dst = &smem_WS[stage][t * kScaleChunkBytes];
-            const OutType* src;
-            if constexpr (kTilePacked) {
-                src = &wscales[(cta_n_tile * num_groups + g) * kBlockN + n0];
-            } else {
-                src = &wscales[g * N + cta_n + n0];
-            }
             if (cta_n + n0 + kScaleElemsPerChunk - 1 < N) {
+                const OutType* src;
+                if constexpr (kTilePacked) {
+                    src = &wscales[(cta_n_tile * num_groups + g) * 128 + cta_n_in_tile + n0];
+                } else {
+                    src = &wscales[g * N + cta_n + n0];
+                }
                 cp_async_16b(dst, src);
             } else {
                 OutType* dst_vals = reinterpret_cast<OutType*>(dst);
                 #pragma unroll
                 for (int i = 0; i < kScaleElemsPerChunk; ++i) {
-                    dst_vals[i] = (cta_n + n0 + i < N) ? src[i] : OutType{};
+                    const int n_global = cta_n + n0 + i;
+                    if (n_global < N) {
+                        if constexpr (kTilePacked) {
+                            dst_vals[i] = wscales[
+                                (cta_n_tile * num_groups + g) * 128 + cta_n_in_tile + n0 + i];
+                        } else {
+                            dst_vals[i] = wscales[g * N + n_global];
+                        }
+                    } else {
+                        dst_vals[i] = OutType{};
+                    }
                 }
             }
         }
@@ -432,8 +446,8 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
             const int m_tile_base = warp_m_base + mi * 16;
             const int row0_m = m_tile_base + groupID;
             const int row1_m = m_tile_base + groupID + 8;
-            const int row0_local = warp_m * kWarpM + mi * 16 + groupID;
-            const int row1_local = warp_m * kWarpM + mi * 16 + groupID + 8;
+            const int row0_local = warp_m * kWarpMLocal + mi * 16 + groupID;
+            const int row1_local = warp_m * kWarpMLocal + mi * 16 + groupID + 8;
             a_reg[mi][0] = a_reg[mi][1] = a_reg[mi][2] = a_reg[mi][3] = 0;
             if (row0_m < M) {
                 const int8_t* rb = &smem_A[cur_stage][row0_local * kBlockKBytes];
@@ -470,7 +484,8 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
             } else {
                 if constexpr (kTilePacked) {
                     const int n0 = col0 - cta_n;
-                    const OutType* ws_base_g = &wscales[(cta_n_tile * num_groups + g) * kBlockN];
+                    const OutType* ws_base_g = &wscales[
+                        (cta_n_tile * num_groups + g) * 128 + cta_n_in_tile];
                     if (col1 < N) {
                         const float2 ws = load_scale2<OutType>(&ws_base_g[n0]);
                         ws_regs[cc][0] = ws.x;
@@ -543,7 +558,7 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
         // the MMA fragment code. Each warp computes its existing 16M x 32N
         // output tile as four m16n8k16 instructions per rank slice.
         for (int r0 = 0; r0 < R; r0 += kLoraRankTile) {
-            for (int idx = threadIdx.x; idx < kBlockM * kLoraRankTile; idx += kThreadsPerBlock) {
+            for (int idx = threadIdx.x; idx < kBlockMLocal * kLoraRankTile; idx += kThreadsPerBlockLocal) {
                 const int m_local = idx / kLoraRankTile;
                 const int r_local = idx - m_local * kLoraRankTile;
                 const int m_global = cta_m + m_local;
@@ -553,7 +568,7 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
                     : OutType{};
             }
 
-            for (int idx = threadIdx.x; idx < kBlockN * kLoraRankTile; idx += kThreadsPerBlock) {
+            for (int idx = threadIdx.x; idx < kBlockNLocal * kLoraRankTile; idx += kThreadsPerBlockLocal) {
                 const int n_local = idx / kLoraRankTile;
                 const int r_local = idx - n_local * kLoraRankTile;
                 const int n_global = cta_n + n_local;
@@ -561,7 +576,7 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
                 OutType v{};
                 if (n_global < N && r < R) {
                     if constexpr (kTilePacked) {
-                        v = lora_up[(cta_n_tile * R + r) * kBlockN + n_local];
+                        v = lora_up[(cta_n_tile * R + r) * 128 + cta_n_in_tile + n_local];
                     } else {
                         v = lora_up[n_global * R + r];
                     }
@@ -570,43 +585,47 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
             }
             __syncthreads();
 
-            uint32_t a_frag[4];
-            const OutType* a_addr = &smem_LoraA[
-                (warp_m * kWarpM + (lane & 15)) * kLoraRankTile + ((lane >> 4) * 8)];
-            ldmatrix_x4(a_frag, cvta_smem_u32(a_addr));
-
             #pragma unroll
-            for (int b_pair = 0; b_pair < kNUnroll / 2; ++b_pair) {
-                const int n_off = warp_n * kWarpN + b_pair * 16;
-                uint32_t b_frag4[4];
-                const OutType* b_addr = &smem_LoraB[
-                    (n_off + (lane & 15)) * kLoraRankTile + ((lane >> 4) * 8)];
-                ldmatrix_x4(b_frag4, cvta_smem_u32(b_addr));
+            for (int mi = 0; mi < kMUnroll; ++mi) {
+                uint32_t a_frag[4];
+                const OutType* a_addr = &smem_LoraA[
+                    (warp_m * kWarpMLocal + mi * 16 + (lane & 15)) * kLoraRankTile +
+                    ((lane >> 4) * 8)];
+                ldmatrix_x4(a_frag, cvta_smem_u32(a_addr));
 
-                {
-                    const uint32_t b0[2] = {b_frag4[0], b_frag4[2]};
-                    if constexpr (kFastAccum) {
-                        float tmp[4] = {0.f, 0.f, 0.f, 0.f};
-                        mma_m16n8k16_f32<OutType>(tmp, a_frag, b0);
-                        out_f[0][b_pair * 2 + 0][0] += tmp[0];
-                        out_f[0][b_pair * 2 + 0][1] += tmp[1];
-                        out_f[0][b_pair * 2 + 0][2] += tmp[2];
-                        out_f[0][b_pair * 2 + 0][3] += tmp[3];
-                    } else {
-                        mma_m16n8k16_f32<OutType>(out_f[0][b_pair * 2 + 0], a_frag, b0);
+                #pragma unroll
+                for (int b_pair = 0; b_pair < kNUnroll / 2; ++b_pair) {
+                    const int n_off = warp_n * kWarpNLocal + b_pair * 16;
+                    uint32_t b_frag4[4];
+                    const OutType* b_addr = &smem_LoraB[
+                        (n_off + (lane & 15)) * kLoraRankTile + ((lane >> 4) * 8)];
+                    ldmatrix_x4(b_frag4, cvta_smem_u32(b_addr));
+
+                    {
+                        const uint32_t b0[2] = {b_frag4[0], b_frag4[2]};
+                        if constexpr (kFastAccum) {
+                            float tmp[4] = {0.f, 0.f, 0.f, 0.f};
+                            mma_m16n8k16_f32<OutType>(tmp, a_frag, b0);
+                            out_f[mi][b_pair * 2 + 0][0] += tmp[0];
+                            out_f[mi][b_pair * 2 + 0][1] += tmp[1];
+                            out_f[mi][b_pair * 2 + 0][2] += tmp[2];
+                            out_f[mi][b_pair * 2 + 0][3] += tmp[3];
+                        } else {
+                            mma_m16n8k16_f32<OutType>(out_f[mi][b_pair * 2 + 0], a_frag, b0);
+                        }
                     }
-                }
-                {
-                    const uint32_t b1[2] = {b_frag4[1], b_frag4[3]};
-                    if constexpr (kFastAccum) {
-                        float tmp[4] = {0.f, 0.f, 0.f, 0.f};
-                        mma_m16n8k16_f32<OutType>(tmp, a_frag, b1);
-                        out_f[0][b_pair * 2 + 1][0] += tmp[0];
-                        out_f[0][b_pair * 2 + 1][1] += tmp[1];
-                        out_f[0][b_pair * 2 + 1][2] += tmp[2];
-                        out_f[0][b_pair * 2 + 1][3] += tmp[3];
-                    } else {
-                        mma_m16n8k16_f32<OutType>(out_f[0][b_pair * 2 + 1], a_frag, b1);
+                    {
+                        const uint32_t b1[2] = {b_frag4[1], b_frag4[3]};
+                        if constexpr (kFastAccum) {
+                            float tmp[4] = {0.f, 0.f, 0.f, 0.f};
+                            mma_m16n8k16_f32<OutType>(tmp, a_frag, b1);
+                            out_f[mi][b_pair * 2 + 1][0] += tmp[0];
+                            out_f[mi][b_pair * 2 + 1][1] += tmp[1];
+                            out_f[mi][b_pair * 2 + 1][2] += tmp[2];
+                            out_f[mi][b_pair * 2 + 1][3] += tmp[3];
+                        } else {
+                            mma_m16n8k16_f32<OutType>(out_f[mi][b_pair * 2 + 1], a_frag, b1);
+                        }
                     }
                 }
             }
@@ -692,12 +711,16 @@ void launch_svdquant_scaled_mm_w4a4_kernel(
 {
     if (K % comfy::svdquant::kGroupSize != 0) return;
 
-    const dim3 grid((N + kBlockN - 1) / kBlockN, (M + kBlockM - 1) / kBlockM);
     const dim3 block(kNumWarps * 32);
 
-    #define LAUNCH_GEMM(OutType, Unsigned, TilePacked, FastAccum, SharedScale, FuseLora) \
+    #define LAUNCH_GEMM_SHAPE(OutType, Unsigned, TilePacked, FastAccum, SharedScale, FuseLora, WarpsM, WarpsN) \
+        do {                                                                                 \
+            constexpr int kLaunchBlockM = kMUnroll * 16 * (WarpsM);                           \
+            constexpr int kLaunchBlockN = kNUnroll * 8 * (WarpsN);                            \
+            const dim3 grid((N + kLaunchBlockN - 1) / kLaunchBlockN,                          \
+                            (M + kLaunchBlockM - 1) / kLaunchBlockM);                         \
         svdquant_scaled_mm_w4a4_kernel<                                                     \
-            OutType, Unsigned, TilePacked, FastAccum, SharedScale, FuseLora>                \
+            WarpsM, WarpsN, OutType, Unsigned, TilePacked, FastAccum, SharedScale, FuseLora> \
             <<<grid, block, 0, stream>>>(                                                   \
             reinterpret_cast<const int8_t*>(act),                                           \
             reinterpret_cast<const int8_t*>(wgt),                                           \
@@ -707,7 +730,19 @@ void launch_svdquant_scaled_mm_w4a4_kernel(
             reinterpret_cast<const OutType*>(lora_up),                                      \
             reinterpret_cast<const OutType*>(bias),                                         \
             reinterpret_cast<OutType*>(out),                                                \
-            M, N, K, R)
+            M, N, K, R);                                                                     \
+        } while (0)
+
+    #define LAUNCH_GEMM(OutType, Unsigned, TilePacked, FastAccum, SharedScale, FuseLora)      \
+        do {                                                                                 \
+            if (M <= 16) {                                                                    \
+                LAUNCH_GEMM_SHAPE(OutType, Unsigned, TilePacked, FastAccum, SharedScale, FuseLora, 4, 2); \
+            } else if (M <= 128) {                                                            \
+                LAUNCH_GEMM_SHAPE(OutType, Unsigned, TilePacked, FastAccum, SharedScale, FuseLora, 8, 1); \
+            } else {                                                                          \
+                LAUNCH_GEMM_SHAPE(OutType, Unsigned, TilePacked, FastAccum, SharedScale, FuseLora, 2, 4); \
+            }                                                                                 \
+        } while (0)
 
     #define DISPATCH_SHARED_SCALE(OutType, Unsigned, TilePacked, FastAccum)                  \
         do {                                                                                 \
@@ -758,6 +793,7 @@ void launch_svdquant_scaled_mm_w4a4_kernel(
         }
     }
     #undef DISPATCH_SHARED_SCALE
+    #undef LAUNCH_GEMM_SHAPE
     #undef LAUNCH_GEMM
 }
 

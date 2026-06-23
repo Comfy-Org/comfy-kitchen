@@ -26,22 +26,67 @@ can be added later without changing this layout.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
+import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from functools import lru_cache
 
 import torch
 
 import comfy_kitchen as ck
 
-from .base import BaseLayoutParams, QuantizedLayout, dequantize_args, register_layout_op
-
-if TYPE_CHECKING:
-    from .base import QuantizedTensor
+from .base import (
+    BaseLayoutParams,
+    QuantizedLayout,
+    QuantizedTensor,
+    dequantize_args,
+    register_layout_op,
+)
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_GROUP_SIZE = 64
+_FALSE_ENV_VALUES = {"0", "false", "no", "off"}
+
+
+def _env_enabled(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in _FALSE_ENV_VALUES
+
+
+def _registry_backend_override() -> str | None:
+    return getattr(ck.registry._thread_local, "backend_override", None)
+
+
+@lru_cache(maxsize=1)
+def _cuda_backend_module():
+    try:
+        from comfy_kitchen.backends import cuda as cuda_backend
+    except Exception:
+        return None
+    if not getattr(cuda_backend, "_EXT_AVAILABLE", False):
+        return None
+    return cuda_backend
+
+
+def _direct_cuda_backend(input_tensor: torch.Tensor, qdata: torch.Tensor):
+    """Return CUDA backend when AWQ can bypass registry dispatch safely."""
+    if not _env_enabled("COMFY_KITCHEN_AWQ_DIRECT_CUDA", default=True):
+        return None
+
+    override = _registry_backend_override()
+    if override is not None and override != "cuda":
+        return None
+
+    if not input_tensor.is_cuda or not qdata.is_cuda:
+        return None
+    if input_tensor.device != qdata.device:
+        return None
+
+    return _cuda_backend_module()
 
 
 class TensorCoreAWQW4A16Layout(QuantizedLayout):
@@ -136,6 +181,13 @@ def _awq_forward(
     qdata, wscales, wzeros = TensorCoreAWQW4A16Layout.get_plain_tensors(weight_qt)
     group_size = int(getattr(weight_qt._params, "group_size", _DEFAULT_GROUP_SIZE))
 
+    cuda_backend = _direct_cuda_backend(input_tensor, qdata)
+    if cuda_backend is not None:
+        return cuda_backend.gemv_awq_w4a16(
+            input_tensor, qdata, wscales, wzeros,
+            bias=bias, group_size=group_size,
+        )
+
     return ck.gemv_awq_w4a16(
         input_tensor, qdata, wscales, wzeros,
         bias=bias, group_size=group_size,
@@ -145,10 +197,6 @@ def _awq_forward(
 @register_layout_op(torch.ops.aten.t.default, TensorCoreAWQW4A16Layout)
 def _handle_awq_t(qt, args, kwargs):
     """Zero-copy logical transpose — flip the ``transposed`` flag."""
-    import dataclasses
-
-    from .base import QuantizedTensor
-
     input_tensor = args[0]
     if not isinstance(input_tensor, QuantizedTensor):
         return torch.ops.aten.t.default(*args, **kwargs)
@@ -175,8 +223,6 @@ def _resolve_awq_rhs(rhs: QuantizedTensor) -> QuantizedTensor:
 @register_layout_op(torch.ops.aten.linear.default, TensorCoreAWQW4A16Layout)
 def _handle_awq_linear(qt, args, kwargs):
     """Direct F.linear(input, W, bias) → AWQ GEMV."""
-    from .base import QuantizedTensor
-
     input_tensor, weight = args[0], args[1]
     bias = args[2] if len(args) > 2 else None
 
@@ -192,8 +238,6 @@ def _handle_awq_linear(qt, args, kwargs):
 @register_layout_op(torch.ops.aten.mm.default, TensorCoreAWQW4A16Layout)
 def _handle_awq_mm(qt, args, kwargs):
     """``mm(x, W.t())`` — F.linear's decomposition for tensor subclass weights."""
-    from .base import QuantizedTensor
-
     a, b = args[0], args[1]
     if not isinstance(b, QuantizedTensor):
         return torch.mm(*dequantize_args((a, b)))
@@ -206,8 +250,6 @@ def _handle_awq_mm(qt, args, kwargs):
 @register_layout_op(torch.ops.aten.addmm.default, TensorCoreAWQW4A16Layout)
 def _handle_awq_addmm(qt, args, kwargs):
     """``addmm(bias, x, W.t())``."""
-    from .base import QuantizedTensor
-
     bias, a, b = args[0], args[1], args[2]
     if not isinstance(b, QuantizedTensor):
         return torch.addmm(*dequantize_args((bias, a, b)))

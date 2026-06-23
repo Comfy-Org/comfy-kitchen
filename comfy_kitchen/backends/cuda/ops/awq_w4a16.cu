@@ -5,7 +5,7 @@
 // Three kernels live here behind one launch entry point
 // (`launch_awq_w4a16_kernel`):
 //
-//   * naive — M ≤ kGemvMThreshold (8): each thread owns one output element,
+//   * naive — M ≤ kGemvMThreshold (4): each thread owns one output element,
 //             dequant on the fly. Best when M is small enough that the
 //             tile-launch overhead of the MMA path swamps the per-output
 //             cost of redundant qweight reads.
@@ -44,7 +44,7 @@
 
 namespace {
 
-constexpr int kGemvMThreshold   = 8;    // M ≤ 8 routes to gemv (naive) kernel
+constexpr int kGemvMThreshold   = 4;    // M ≤ 4 routes to gemv (naive) kernel
 
 template<typename T>
 __device__ __forceinline__ float to_fp32(T v);
@@ -63,6 +63,26 @@ __device__ __forceinline__ __nv_bfloat16 from_fp32<__nv_bfloat16>(float v) { ret
 
 template<>
 __device__ __forceinline__ __half from_fp32<__half>(float v) { return __float2half(v); }
+
+template<typename T>
+__device__ __forceinline__ void store_fp32_pair(T* dst, float lo, float hi) {
+    dst[0] = from_fp32<T>(lo);
+    dst[1] = from_fp32<T>(hi);
+}
+
+template<>
+__device__ __forceinline__ void store_fp32_pair<__nv_bfloat16>(
+    __nv_bfloat16* dst, float lo, float hi)
+{
+    *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(lo, hi);
+}
+
+template<>
+__device__ __forceinline__ void store_fp32_pair<__half>(
+    __half* dst, float lo, float hi)
+{
+    *reinterpret_cast<__half2*>(dst) = __floats2half2_rn(lo, hi);
+}
 
 // ---------------------------------------------------------------------------
 // MMA helpers: ldmatrix + mma.m16n8k16.row.col.f32.bf16.bf16.f32 (or fp16).
@@ -579,6 +599,52 @@ void launch_mma(
         M, N, K, G);
 }
 
+template<typename T>
+__global__ void awq_w4a16_dequant_kernel(
+    const int8_t* __restrict__ qweight, // (N, K/2)
+    const T* __restrict__ wscales,      // (K/G, N)
+    const T* __restrict__ wzeros,       // (K/G, N)
+    T* __restrict__ weight,             // (N, K)
+    int N, int K, int G)
+{
+    const int K_half = K / 2;
+    const int kh = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = blockIdx.y;
+    if (kh >= K_half || n >= N) return;
+
+    const int k = kh * 2;
+    const int g = k / G;
+    const int idx = n * K_half + kh;
+
+    const uint8_t byte = static_cast<uint8_t>(qweight[idx]);
+    const float scale = to_fp32(wscales[g * N + n]);
+    const float zero = to_fp32(wzeros[g * N + n]);
+    store_fp32_pair(
+        weight + n * K + k,
+        (float(byte & 0xF) - 8.0f) * scale + zero,
+        (float((byte >> 4) & 0xF) - 8.0f) * scale + zero);
+}
+
+template<typename T>
+void launch_dequant(
+    const void* qweight,
+    const void* wscales,
+    const void* wzeros,
+    void* weight,
+    int N, int K, int G,
+    cudaStream_t stream)
+{
+    constexpr int kThreads = 256;
+    const dim3 block(kThreads);
+    const dim3 grid(((K / 2) + kThreads - 1) / kThreads, N);
+    awq_w4a16_dequant_kernel<T><<<grid, block, 0, stream>>>(
+        reinterpret_cast<const int8_t*>(qweight),
+        reinterpret_cast<const T*>(wscales),
+        reinterpret_cast<const T*>(wzeros),
+        reinterpret_cast<T*>(weight),
+        N, K, G);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -611,6 +677,24 @@ extern "C" void launch_awq_w4a16_kernel(
     } else if (dtype_code == 1) { // float16
         if (use_mma) launch_mma<__half>(x, qweight, wscales, wzeros, out, M, N, K, G, stream);
         else         launch_naive<__half>(x, qweight, wscales, wzeros, out, M, N, K, G, stream);
+    } else {
+        // Caller validates dtype before reaching here.
+    }
+}
+
+extern "C" void launch_awq_dequant_w4a16_kernel(
+    const void* qweight,
+    const void* wscales,
+    const void* wzeros,
+    void* weight,
+    int N, int K, int G,
+    int dtype_code,
+    cudaStream_t stream)
+{
+    if (dtype_code == 2) {        // bfloat16
+        launch_dequant<__nv_bfloat16>(qweight, wscales, wzeros, weight, N, K, G, stream);
+    } else if (dtype_code == 1) { // float16
+        launch_dequant<__half>(qweight, wscales, wzeros, weight, N, K, G, stream);
     } else {
         // Caller validates dtype before reaching here.
     }

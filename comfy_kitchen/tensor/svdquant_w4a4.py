@@ -18,20 +18,24 @@ activation quantization + low-rank correction + int4 matmul into a single call.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from functools import lru_cache
 
 import torch
 
 import comfy_kitchen as ck
 
-from .base import BaseLayoutParams, QuantizedLayout, dequantize_args, register_layout_op
-
-if TYPE_CHECKING:
-    from .base import QuantizedTensor
+from .base import (
+    BaseLayoutParams,
+    QuantizedLayout,
+    QuantizedTensor,
+    dequantize_args,
+    register_layout_op,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +54,17 @@ def _env_enabled(name: str, *, default: bool) -> bool:
 
 def _registry_backend_override() -> str | None:
     return getattr(ck.registry._thread_local, "backend_override", None)
+
+
+@lru_cache(maxsize=1)
+def _cuda_backend_module():
+    try:
+        from comfy_kitchen.backends import cuda as cuda_backend
+    except Exception:
+        return None
+    if not getattr(cuda_backend, "_EXT_AVAILABLE", False):
+        return None
+    return cuda_backend
 
 
 def _direct_cuda_backend(input_tensor: torch.Tensor, qdata: torch.Tensor):
@@ -73,18 +88,30 @@ def _direct_cuda_backend(input_tensor: torch.Tensor, qdata: torch.Tensor):
     if input_tensor.device != qdata.device:
         return None
 
-    try:
-        from comfy_kitchen.backends import cuda as cuda_backend
-    except Exception:
-        return None
-    if not getattr(cuda_backend, "_EXT_AVAILABLE", False):
-        return None
-    return cuda_backend
+    return _cuda_backend_module()
+
+
+def _cuda_quantize_pad_size(m: int) -> int:
+    """Choose the smallest measured-good pad that reaches a tuned CUDA path."""
+    if m <= 128:
+        if m <= 1:
+            return 1
+        if m == 2:
+            return 2
+        return 4
+    # Above 128, the scaled-mm kernel no longer needs 256-row padding. Tight
+    # padding avoids doubling work at boundaries such as M=257, while 64-row
+    # padding is measurably better through the midrange on RTX 6000 Ada.
+    if m < 132:
+        return 256
+    if m <= 256:
+        return 4
+    if m <= 640:
+        return 64
+    return 4
 
 
 def _is_svdquant_w4a4_qtensor(tensor: torch.Tensor) -> bool:
-    from .base import QuantizedTensor
-
     return (
         isinstance(tensor, QuantizedTensor)
         and tensor._layout_cls == "TensorCoreSVDQuantW4A4Layout"
@@ -144,6 +171,55 @@ def svdquant_w4a4_can_share_quant(
     return True
 
 
+def _svdquant_grouped_fuse_enabled() -> bool:
+    return _env_enabled("COMFY_KITCHEN_SVDQUANT_GROUPED_FUSE", default=True)
+
+
+def _svdquant_grouped_fuse_cache_key(
+    weights: Sequence[torch.Tensor],
+    biases: Sequence[torch.Tensor | None],
+) -> tuple[object, ...]:
+    """Return an inference-only cache key for runtime-fused weights.
+
+    Loaded model tensors are treated as immutable. Replacing a tensor object
+    invalidates the cache; in-place mutation of an existing tensor does not.
+    """
+    key: list[object] = [len(weights)]
+    for weight, bias in zip(weights, biases, strict=True):
+        p = weight._params
+        key.extend((
+            id(weight), id(weight._qdata),
+            id(p),
+            id(p.scale),
+            id(p.smooth_factor),
+            id(p.proj_down),
+            id(p.proj_up),
+            p.orig_dtype, tuple(p.orig_shape), bool(p.act_unsigned),
+        ))
+        if bias is None:
+            key.append(None)
+        else:
+            key.append(id(bias))
+    return tuple(key)
+
+
+def _svdquant_cached_fused_group(
+    weights: Sequence[torch.Tensor],
+    biases: Sequence[torch.Tensor | None],
+) -> tuple[QuantizedTensor, torch.Tensor | None, tuple[int, ...]]:
+    cache_key = _svdquant_grouped_fuse_cache_key(weights, biases)
+    first = weights[0]
+    cached = getattr(first, "_ck_svdquant_fused_group_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1], cached[2], cached[3]
+
+    fused_weight, fused_bias, splits = svdquant_w4a4_fuse_linear_weights(
+        weights, biases, assume_shared_quant=True,
+    )
+    first._ck_svdquant_fused_group_cache = (cache_key, fused_weight, fused_bias, splits)
+    return fused_weight, fused_bias, splits
+
+
 def _w4a4_forward_from_quantized_activation(
     q_x: torch.Tensor,
     ascales: torch.Tensor,
@@ -154,21 +230,25 @@ def _w4a4_forward_from_quantized_activation(
     *,
     m: int,
 ) -> tuple[torch.Tensor, int]:
-    qdata, wscales, _smooth, _proj_down, proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(weight_qt)
-    act_unsigned = bool(getattr(weight_qt._params, "act_unsigned", False))
+    params = weight_qt._params
+    qdata = weight_qt._qdata
+    act_unsigned = bool(params.act_unsigned)
     if cuda_backend is not None:
         out = cuda_backend.scaled_mm_svdquant_w4a4(
-            act=q_x, wgt=qdata, ascales=ascales, wscales=wscales,
-            lora_act_in=lora_act, lora_up=proj_up, bias=bias,
+            act=q_x, wgt=qdata, ascales=ascales, wscales=params.scale,
+            lora_act_in=lora_act, lora_up=params.proj_up, bias=bias,
             act_unsigned=act_unsigned,
         )
     else:
         out = ck.scaled_mm_svdquant_w4a4(
-            act=q_x, wgt=qdata, ascales=ascales, wscales=wscales,
-            lora_act_in=lora_act, lora_up=proj_up, bias=bias,
+            act=q_x, wgt=qdata, ascales=ascales, wscales=params.scale,
+            lora_act_in=lora_act, lora_up=params.proj_up, bias=bias,
             act_unsigned=act_unsigned,
         )
-    out_features = TensorCoreSVDQuantW4A4Layout.get_out_features_from_storage(qdata)
+    out_features = (
+        int(qdata.shape[0]) * _TILE_PACKED_BLOCK_N
+        if qdata.dim() == 4 else int(qdata.shape[0])
+    )
     return out[:m], out_features
 
 
@@ -192,14 +272,13 @@ def svdquant_w4a4_grouped_linear(
         biases = (None,) * len(weights)
     if len(biases) != len(weights):
         raise ValueError(f"got {len(weights)} weights but {len(biases)} biases")
-    if not svdquant_w4a4_can_share_quant(
-        weights, validate=validate_shared_quant, trust=assume_shared_quant,
-    ):
-        raise ValueError("SVDQuant weights do not share quantization parameters")
 
     first = weights[0]
-    qdata, _wscales, smooth, proj_down, _proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(first)
-    act_unsigned = bool(getattr(first._params, "act_unsigned", False))
+    if not _is_svdquant_w4a4_qtensor(first):
+        raise ValueError("SVDQuant weights do not share quantization parameters")
+    first_params = first._params
+    qdata = first._qdata
+    act_unsigned = bool(first_params.act_unsigned)
 
     orig_shape = input_tensor.shape
     x2d = input_tensor.reshape(-1, orig_shape[-1])
@@ -213,11 +292,30 @@ def svdquant_w4a4_grouped_linear(
         lora_x = None
 
     cuda_backend = _direct_cuda_backend(x_main, qdata)
+    if cuda_backend is not None and len(weights) > 1 and _svdquant_grouped_fuse_enabled():
+        fused_weight, fused_bias, splits = _svdquant_cached_fused_group(weights, biases)
+        out = _w4a4_forward_prepared(
+            fused_weight,
+            fused_bias,
+            orig_shape=orig_shape,
+            m=m,
+            x_main=x_main,
+            lora_x=lora_x,
+            cuda_backend=cuda_backend,
+        )
+        return _svdquant_split_fused_output(out, splits)
+
+    if not svdquant_w4a4_can_share_quant(
+        weights, validate=validate_shared_quant, trust=assume_shared_quant,
+    ):
+        raise ValueError("SVDQuant weights do not share quantization parameters")
+
     if cuda_backend is not None:
         q_x, ascales, lora_act = cuda_backend.quantize_svdquant_w4a4(
             x_main,
-            smooth=smooth,
-            lora_down=proj_down,
+            smooth=first_params.smooth_factor,
+            lora_down=first_params.proj_down,
+            pad_size=_cuda_quantize_pad_size(m),
             act_unsigned=act_unsigned,
             lora_x=lora_x,
             reuse_workspace=True,
@@ -225,8 +323,8 @@ def svdquant_w4a4_grouped_linear(
     else:
         q_x, ascales, lora_act = ck.quantize_svdquant_w4a4(
             x_main,
-            smooth=smooth,
-            lora_down=proj_down,
+            smooth=first_params.smooth_factor,
+            lora_down=first_params.proj_down,
             act_unsigned=act_unsigned,
             lora_x=lora_x,
         )
@@ -262,8 +360,6 @@ def svdquant_w4a4_fuse_linear_weights(
     split weights along output-N so a caller can execute Q/K/V as one wider
     SVDQuant linear and split the output view afterwards.
     """
-    from .base import QuantizedTensor
-
     if len(weights) == 0:
         raise ValueError("expected at least one weight")
     if biases is None:
@@ -284,15 +380,18 @@ def svdquant_w4a4_fuse_linear_weights(
     scales = []
     proj_ups = []
     for weight in weights:
-        qdata, wscale, _smooth, _proj_down, proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(weight)
-        if weight._params.orig_shape[1] != in_features:
+        params = weight._params
+        qdata = weight._qdata
+        if params.orig_shape[1] != in_features:
             raise ValueError("all fused SVDQuant weights must have the same input features")
-        if bool(weight._params.act_unsigned) != act_unsigned:
+        if bool(params.act_unsigned) != act_unsigned:
             raise ValueError("all fused SVDQuant weights must have the same act_unsigned flag")
-        out_features.append(TensorCoreSVDQuantW4A4Layout.get_out_features_from_storage(qdata))
+        out_features.append(
+            int(qdata.shape[0]) * _TILE_PACKED_BLOCK_N if qdata.dim() == 4 else int(qdata.shape[0])
+        )
         qdatas.append(qdata)
-        scales.append(wscale)
-        proj_ups.append(proj_up)
+        scales.append(params.scale)
+        proj_ups.append(params.proj_up)
 
     fused_qdata = _cat_svdquant_n_axis(qdatas, natural_dim=0)
     fused_scale = _cat_svdquant_n_axis(scales, natural_dim=1)
@@ -334,6 +433,13 @@ def svdquant_w4a4_fused_grouped_linear(
     if not _is_svdquant_w4a4_qtensor(fused_weight):
         raise TypeError("fused_weight must be a TensorCoreSVDQuantW4A4Layout QuantizedTensor")
     out = _w4a4_forward(input_tensor, fused_weight, fused_bias)
+    return _svdquant_split_fused_output(out, output_features)
+
+
+def _svdquant_split_fused_output(
+    out: torch.Tensor,
+    output_features: Sequence[int],
+) -> tuple[torch.Tensor, ...]:
     return tuple(torch.split(out, tuple(output_features), dim=-1))
 
 
@@ -451,6 +557,55 @@ class TensorCoreSVDQuantW4A4Layout(QuantizedLayout):
 
 # ==================== Linear Dispatch ====================
 
+def _w4a4_forward_prepared(
+    weight_qt: QuantizedTensor,
+    bias: torch.Tensor | None,
+    *,
+    orig_shape: torch.Size,
+    m: int,
+    x_main: torch.Tensor,
+    lora_x: torch.Tensor | None,
+    cuda_backend,
+) -> torch.Tensor:
+    params = weight_qt._params
+    qdata = weight_qt._qdata
+    act_unsigned = bool(params.act_unsigned)
+
+    if cuda_backend is not None:
+        q_x, ascales, lora_act = cuda_backend.quantize_svdquant_w4a4(
+            x_main,
+            smooth=params.smooth_factor,
+            lora_down=params.proj_down,
+            pad_size=_cuda_quantize_pad_size(m),
+            act_unsigned=act_unsigned,
+            lora_x=lora_x,
+            reuse_workspace=True,
+        )
+        out = cuda_backend.scaled_mm_svdquant_w4a4(
+            act=q_x, wgt=qdata, ascales=ascales, wscales=params.scale,
+            lora_act_in=lora_act, lora_up=params.proj_up, bias=bias,
+            act_unsigned=act_unsigned,
+        )
+    else:
+        q_x, ascales, lora_act = ck.quantize_svdquant_w4a4(
+            x_main,
+            smooth=params.smooth_factor,
+            lora_down=params.proj_down,
+            act_unsigned=act_unsigned,
+            lora_x=lora_x,
+        )
+        out = ck.scaled_mm_svdquant_w4a4(
+            act=q_x, wgt=qdata, ascales=ascales, wscales=params.scale,
+            lora_act_in=lora_act, lora_up=params.proj_up, bias=bias,
+            act_unsigned=act_unsigned,
+        )
+    out_features = (
+        int(qdata.shape[0]) * _TILE_PACKED_BLOCK_N
+        if qdata.dim() == 4 else int(qdata.shape[0])
+    )
+    return out[:m].reshape(*orig_shape[:-1], out_features)
+
+
 def _w4a4_forward(
     input_tensor: torch.Tensor,
     weight_qt: QuantizedTensor,
@@ -468,7 +623,7 @@ def _w4a4_forward(
     Kernel API stays shift-free — shift is a Qwen/Flux model-topology constant,
     not a quantize-op parameter.
     """
-    qdata, wscales, smooth, proj_down, proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(weight_qt)
+    qdata = weight_qt._qdata
     act_unsigned = bool(getattr(weight_qt._params, "act_unsigned", False))
 
     orig_shape = input_tensor.shape
@@ -483,35 +638,15 @@ def _w4a4_forward(
         lora_x = None                        # wrapper will fall back to x_main
 
     cuda_backend = _direct_cuda_backend(x_main, qdata)
-    if cuda_backend is not None:
-        q_x, ascales, lora_act = cuda_backend.quantize_svdquant_w4a4(
-            x_main,
-            smooth=smooth,
-            lora_down=proj_down,
-            act_unsigned=act_unsigned,
-            lora_x=lora_x,
-            reuse_workspace=True,
-        )
-        out = cuda_backend.scaled_mm_svdquant_w4a4(
-            act=q_x, wgt=qdata, ascales=ascales, wscales=wscales,
-            lora_act_in=lora_act, lora_up=proj_up, bias=bias,
-            act_unsigned=act_unsigned,
-        )
-    else:
-        q_x, ascales, lora_act = ck.quantize_svdquant_w4a4(
-            x_main,
-            smooth=smooth,
-            lora_down=proj_down,
-            act_unsigned=act_unsigned,
-            lora_x=lora_x,
-        )
-        out = ck.scaled_mm_svdquant_w4a4(
-            act=q_x, wgt=qdata, ascales=ascales, wscales=wscales,
-            lora_act_in=lora_act, lora_up=proj_up, bias=bias,
-            act_unsigned=act_unsigned,
-        )
-    out_features = TensorCoreSVDQuantW4A4Layout.get_out_features_from_storage(qdata)
-    return out[:m].reshape(*orig_shape[:-1], out_features)
+    return _w4a4_forward_prepared(
+        weight_qt,
+        bias,
+        orig_shape=orig_shape,
+        m=m,
+        x_main=x_main,
+        lora_x=lora_x,
+        cuda_backend=cuda_backend,
+    )
 
 
 @register_layout_op(torch.ops.aten.t.default, TensorCoreSVDQuantW4A4Layout)
@@ -521,10 +656,6 @@ def _handle_w4a4_t(qt, args, kwargs):
     Lets ``F.linear(x, W)`` decompose into ``x @ W.t()`` without reordering any
     storage; ``mm`` / ``addmm`` handlers below unwind the flag.
     """
-    import dataclasses
-
-    from .base import QuantizedTensor
-
     input_tensor = args[0]
     if not isinstance(input_tensor, QuantizedTensor):
         return torch.ops.aten.t.default(*args, **kwargs)
@@ -551,8 +682,6 @@ def _resolve_svdquant_rhs(rhs: QuantizedTensor) -> QuantizedTensor:
 @register_layout_op(torch.ops.aten.linear.default, TensorCoreSVDQuantW4A4Layout)
 def _handle_w4a4_linear(qt, args, kwargs):
     """Direct F.linear(input, W, bias) → kitchen kernel."""
-    from .base import QuantizedTensor
-
     input_tensor, weight = args[0], args[1]
     bias = args[2] if len(args) > 2 else None
 
@@ -570,8 +699,6 @@ def _handle_w4a4_mm(qt, args, kwargs):
     """Handle ``mm(x, W.t())`` — the decomposition F.linear takes when the weight
     is a non-default tensor subclass.
     """
-    from .base import QuantizedTensor
-
     a, b = args[0], args[1]
     if not isinstance(b, QuantizedTensor):
         return torch.mm(*dequantize_args((a, b)))
@@ -584,8 +711,6 @@ def _handle_w4a4_mm(qt, args, kwargs):
 @register_layout_op(torch.ops.aten.addmm.default, TensorCoreSVDQuantW4A4Layout)
 def _handle_w4a4_addmm(qt, args, kwargs):
     """Handle ``addmm(bias, x, W.t())``."""
-    from .base import QuantizedTensor
-
     bias, a, b = args[0], args[1], args[2]
     if not isinstance(b, QuantizedTensor):
         return torch.addmm(*dequantize_args((bias, a, b)))

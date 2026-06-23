@@ -31,12 +31,37 @@ from comfy_kitchen.tensor import (
     svdquant_w4a4_fused_grouped_linear,
     svdquant_w4a4_grouped_linear,
 )
+from comfy_kitchen.tensor.svdquant_w4a4 import _cuda_quantize_pad_size
 
 from .conftest import assert_values_close
 
 _GROUP = 64
 _TILE_BN = 128
 _TILE_INTERLEAVE = 4
+
+
+def test_svdquant_lora_down_transposed_gemm_policy():
+    from comfy_kitchen.backends.cuda import _svdquant_use_transposed_lora_down
+
+    assert not _svdquant_use_transposed_lora_down(1, 32)
+    assert _svdquant_use_transposed_lora_down(16, 16)
+    assert not _svdquant_use_transposed_lora_down(24, 16)
+    assert _svdquant_use_transposed_lora_down(15, 32)
+    assert not _svdquant_use_transposed_lora_down(16, 32)
+    assert _svdquant_use_transposed_lora_down(4, 64)
+    assert not _svdquant_use_transposed_lora_down(8, 64)
+    assert _svdquant_use_transposed_lora_down(3, 128)
+    assert not _svdquant_use_transposed_lora_down(4, 128)
+    assert not _svdquant_use_transposed_lora_down(2, 0)
+
+
+def test_svdquant_grouped_fuse_cache_is_enabled_by_default(monkeypatch):
+    import comfy_kitchen.tensor.svdquant_w4a4 as svd_mod
+
+    monkeypatch.delenv("COMFY_KITCHEN_SVDQUANT_GROUPED_FUSE", raising=False)
+    assert svd_mod._svdquant_grouped_fuse_enabled()
+    monkeypatch.setenv("COMFY_KITCHEN_SVDQUANT_GROUPED_FUSE", "0")
+    assert not svd_mod._svdquant_grouped_fuse_enabled()
 
 
 def _pack_tile_packed_weight(w_int4: torch.Tensor) -> torch.Tensor:
@@ -204,6 +229,76 @@ class TestGroupedSplitQKV:
 
         for idx, (actual, ref) in enumerate(zip(fused, expected, strict=True)):
             assert_values_close(actual, ref, rtol=0.0, atol=0.0, name=f"fused qkv {idx}")
+
+    def test_grouped_linear_auto_fuses_cuda_and_reuses_cache(self, cuda_available, seed, monkeypatch):
+        if not cuda_available:
+            pytest.skip("CUDA required")
+
+        import comfy_kitchen.tensor.svdquant_w4a4 as svd_mod
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        if not getattr(cuda_backend, "_EXT_AVAILABLE", False):
+            pytest.skip("CUDA extension required")
+
+        m, n, k, r = 8, 128, 128, 16
+        dtype = torch.bfloat16
+        device = "cuda"
+        x = torch.randn(m, k, dtype=dtype, device=device) * 0.3
+        smooth = torch.rand(k, dtype=dtype, device=device) * 0.5 + 0.75
+        proj_down = torch.randn(k, r, dtype=dtype, device=device) * 0.05
+
+        weights = []
+        biases = []
+        for _ in range(3):
+            weight, bias = _make_svdquant_qtensor(
+                n=n,
+                k=k,
+                r=r,
+                smooth=smooth,
+                proj_down=proj_down,
+                dtype=dtype,
+                device=device,
+            )
+            weights.append(weight)
+            biases.append(bias)
+
+        monkeypatch.setenv("COMFY_KITCHEN_SVDQUANT_GROUPED_FUSE", "0")
+        expected = svdquant_w4a4_grouped_linear(x, weights, biases, assume_shared_quant=True)
+
+        calls = {"fuse": 0}
+        orig_fuse = svd_mod.svdquant_w4a4_fuse_linear_weights
+
+        def spy_fuse(*args, **kwargs):
+            calls["fuse"] += 1
+            return orig_fuse(*args, **kwargs)
+
+        monkeypatch.setattr(svd_mod, "svdquant_w4a4_fuse_linear_weights", spy_fuse)
+        monkeypatch.setenv("COMFY_KITCHEN_SVDQUANT_GROUPED_FUSE", "1")
+
+        actual = svdquant_w4a4_grouped_linear(x, weights, biases, assume_shared_quant=True)
+        again = svdquant_w4a4_grouped_linear(x, weights, biases, assume_shared_quant=True)
+
+        assert calls == {"fuse": 1}
+        assert getattr(weights[0], "_ck_svdquant_fused_group_cache", None) is not None
+        for idx, (got, ref) in enumerate(zip(actual, expected, strict=True)):
+            assert_values_close(got, ref, rtol=0.0, atol=0.0, name=f"auto-fused grouped {idx}")
+        for idx, (got, ref) in enumerate(zip(again, expected, strict=True)):
+            assert_values_close(got, ref, rtol=0.0, atol=0.0, name=f"cached auto-fused grouped {idx}")
+
+        new_biases = [bias.clone() for bias in biases]
+        new_biases[0].add_(0.125)
+        monkeypatch.setenv("COMFY_KITCHEN_SVDQUANT_GROUPED_FUSE", "0")
+        expected_after_replacement = svdquant_w4a4_grouped_linear(
+            x, weights, new_biases, assume_shared_quant=True,
+        )
+        monkeypatch.setenv("COMFY_KITCHEN_SVDQUANT_GROUPED_FUSE", "1")
+        after_replacement = svdquant_w4a4_grouped_linear(
+            x, weights, new_biases, assume_shared_quant=True,
+        )
+
+        assert calls == {"fuse": 2}
+        for idx, (got, ref) in enumerate(zip(after_replacement, expected_after_replacement, strict=True)):
+            assert_values_close(got, ref, rtol=0.0, atol=0.0, name=f"replaced auto-fused grouped {idx}")
 
 
 # =============================================================================
@@ -564,6 +659,62 @@ class TestSvdquantSmoke:
             name=f"fused LoRA epilogue vs unfused ({layout}, {dtype})",
         )
 
+    def test_rank0_lora_quantize_returns_empty_activation(self, cuda_available, seed):
+        if not cuda_available:
+            pytest.skip("CUDA required")
+
+        m, k, r = 13, 256, 0
+        dtype = torch.bfloat16
+        device = "cuda"
+        x = torch.randn(m, k, dtype=dtype, device=device) * 0.1
+        smooth = torch.rand(k, dtype=dtype, device=device) * 0.1 + 0.9
+        lora_down = torch.empty(k, r, dtype=dtype, device=device)
+
+        with ck.use_backend("cuda"):
+            q_act, ascales, lora_act = ck.quantize_svdquant_w4a4(
+                x, smooth, lora_down, pad_size=64,
+            )
+
+        assert q_act.shape == (64, k // 2)
+        assert ascales.shape == (k // _GROUP, 64)
+        assert lora_act.shape == (64, 0)
+
+    @pytest.mark.parametrize("layout", ["natural", "tile"])
+    def test_rank0_lora_skips_unfused_addmm(self, cuda_available, seed, monkeypatch, layout):
+        """Rank-0 LoRA is a no-op and should match the fused kernel path."""
+        if not cuda_available:
+            pytest.skip("CUDA required")
+
+        m, n, k, r = 64, 256, 256, 0
+        dtype = torch.bfloat16
+        device = "cuda"
+        q_act_i = torch.randint(-7, 8, (m, k), dtype=torch.int8, device=device)
+        wgt_i = torch.randint(-7, 8, (n, k), dtype=torch.int8, device=device)
+        q_act = _pack_natural_int4(q_act_i)
+        wgt = _pack_natural_int4(wgt_i)
+        asc = torch.rand(k // _GROUP, m, dtype=dtype, device=device) * 0.05 + 0.005
+        wscales = torch.rand(k // _GROUP, n, dtype=dtype, device=device) * 0.05 + 0.005
+        lora_act = torch.empty(m, r, dtype=dtype, device=device)
+        lora_up = torch.empty(n, r, dtype=dtype, device=device)
+        bias = torch.randn(n, dtype=dtype, device=device) * 0.01
+
+        if layout == "tile":
+            wgt = _pack_tile_packed_weight(wgt_i)
+            wscales = _pack_n_interleaved(wscales.t().contiguous())
+            lora_up = _pack_n_interleaved(lora_up)
+
+        with ck.use_backend("cuda"):
+            monkeypatch.setenv("COMFY_KITCHEN_SVDQUANT_FUSE_LORA_UP", "0")
+            unfused = ck.scaled_mm_svdquant_w4a4(
+                q_act, wgt, asc, wscales, lora_act, lora_up, bias,
+            )
+            monkeypatch.setenv("COMFY_KITCHEN_SVDQUANT_FUSE_LORA_UP", "1")
+            fused = ck.scaled_mm_svdquant_w4a4(
+                q_act, wgt, asc, wscales, lora_act, lora_up, bias,
+            )
+
+        assert torch.equal(unfused, fused)
+
     def test_quantized_tensor_direct_cuda_survives_disabled_registry(self, cuda_available, seed, monkeypatch):
         """ComfyUI may globally disable comfy_kitchen's CUDA registry entry on
         older PyTorch CUDA wheels. SVDQuant QuantizedTensor forward should still
@@ -601,11 +752,13 @@ class TestSvdquantSmoke:
         qt = QuantizedTensor(wgt, "TensorCoreSVDQuantW4A4Layout", params)
 
         calls = {"quantize": 0, "scaled_mm": 0}
+        pad_sizes = []
         orig_quantize = cuda_backend.quantize_svdquant_w4a4
         orig_scaled_mm = cuda_backend.scaled_mm_svdquant_w4a4
 
         def spy_quantize(*args, **kwargs):
             calls["quantize"] += 1
+            pad_sizes.append(kwargs.get("pad_size"))
             return orig_quantize(*args, **kwargs)
 
         def spy_scaled_mm(*args, **kwargs):
@@ -628,3 +781,85 @@ class TestSvdquantSmoke:
         assert out.shape == (m, n)
         assert torch.isfinite(out).all()
         assert calls == {"quantize": 1, "scaled_mm": 1}
+        assert pad_sizes == [4]
+
+        calls.update({"quantize": 0, "scaled_mm": 0})
+        pad_sizes.clear()
+        with ck.use_backend("eager"):
+            eager_out = functional.linear(x, qt, bias)
+
+        assert eager_out.shape == (m, n)
+        assert torch.isfinite(eager_out).all()
+        assert calls == {"quantize": 0, "scaled_mm": 0}
+        assert pad_sizes == []
+
+
+def test_svdquant_direct_cuda_pad_policy():
+    assert [_cuda_quantize_pad_size(m) for m in [0, 1, 2, 3, 32, 128, 129, 132, 256, 257, 640, 641]] == [
+        1, 1, 2, 4, 4, 4, 256, 4, 4, 64, 64, 4,
+    ]
+
+
+def test_svdquant_lora_up_internal_cache_reuses_by_identity():
+    from comfy_kitchen.backends.cuda import _natural_lora_up_from_tile_packed
+
+    tile = torch.arange(2 * 3 * _TILE_BN, dtype=torch.float32).reshape(2, 3, _TILE_BN)
+    natural = _natural_lora_up_from_tile_packed(tile)
+    assert torch.equal(natural, tile.permute(0, 2, 1).reshape(2 * _TILE_BN, 3))
+    assert _natural_lora_up_from_tile_packed(tile).data_ptr() == natural.data_ptr()
+
+
+def test_svdquant_cache_helpers_accept_inference_tensors():
+    from comfy_kitchen.backends.cuda import _natural_lora_up_from_tile_packed
+
+    with torch.inference_mode():
+        tile = torch.arange(2 * 3 * _TILE_BN, dtype=torch.float32).reshape(2, 3, _TILE_BN)
+
+    natural = _natural_lora_up_from_tile_packed(tile)
+    assert torch.equal(natural, tile.permute(0, 2, 1).reshape(2 * _TILE_BN, 3))
+    assert _natural_lora_up_from_tile_packed(tile).data_ptr() == natural.data_ptr()
+
+
+def test_svdquant_lora_up_auto_fuse_policy(cuda_available, seed, monkeypatch):
+    if not cuda_available:
+        pytest.skip("CUDA required")
+
+    from comfy_kitchen.backends import cuda as cuda_backend
+
+    if not getattr(cuda_backend, "_EXT_AVAILABLE", False):
+        pytest.skip("CUDA extension required")
+
+    dtype = torch.bfloat16
+    device = "cuda"
+    k = 64
+    r = 16
+    seen = []
+    orig_scaled_mm = cuda_backend._C.svdquant_scaled_mm_w4a4
+
+    def spy_scaled_mm(*args, **kwargs):
+        seen.append(bool(args[-2]))
+        return orig_scaled_mm(*args, **kwargs)
+
+    monkeypatch.setattr(cuda_backend._C, "svdquant_scaled_mm_w4a4", spy_scaled_mm)
+
+    def run(m: int, n: int):
+        q_act = torch.randint(-7, 8, (m, k // 2), dtype=torch.int8, device=device)
+        wgt = torch.randint(-7, 8, (n, k // 2), dtype=torch.int8, device=device)
+        ascales = torch.rand(k // _GROUP, m, dtype=dtype, device=device) * 0.01 + 0.001
+        wscales = torch.rand(k // _GROUP, n, dtype=dtype, device=device) * 0.01 + 0.001
+        lora_act = torch.randn(m, r, dtype=dtype, device=device) * 0.01
+        lora_up = torch.randn(n, r, dtype=dtype, device=device) * 0.01
+        return cuda_backend.scaled_mm_svdquant_w4a4(
+            q_act, wgt, ascales, wscales, lora_act, lora_up,
+        )
+
+    monkeypatch.delenv("COMFY_KITCHEN_SVDQUANT_FUSE_LORA_UP", raising=False)
+    run(32, 4096)
+    run(32, 12288)
+    run(16, 12288)
+    monkeypatch.setenv("COMFY_KITCHEN_SVDQUANT_FUSE_LORA_UP", "0")
+    run(32, 4096)
+    monkeypatch.setenv("COMFY_KITCHEN_SVDQUANT_FUSE_LORA_UP", "1")
+    run(32, 12288)
+
+    assert seen == [True, False, True, False, True]
