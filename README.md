@@ -17,6 +17,16 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `apply_rope`                | ✓     | ✓    | ✓      |
 | `apply_rope1`               | ✓     | ✓    | ✓      |
 
+## Distributed Capabilities Matrix
+
+| Layout                 | DTensor|FSDP pre/post all-gather|
+|------------------------|--------|------------------------|
+| `TensorCoreFP8Layout`  |  ✓     |  ✓                     |
+| `TensorCoreNVFP4Layout`|  ✓     |  ✓                     |
+| `TensorCoreMXFP8Layout`|        |                        |
+
+This is for custom nodes that might implement distributed operations. Such as [Raylight](https://github.com/komikndr/raylight)
+
 
 ## Quantized Tensors
 

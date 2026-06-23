@@ -137,6 +137,41 @@ class QuantizedLayout(ABC):
             "fast_matmul_supported": cls.supports_fast_matmul(),
         }
 
+    @classmethod
+    def pre_all_gather(cls, qtensor: QuantizedTensor, mesh):
+        """Prepare data for FSDP all_gather.
+
+        Returns:
+            Tuple of (all_gather_outputs, metadata):
+                - all_gather_outputs: data to be gathered (as tuple of tensors)
+                - metadata: additional info needed after gathering (as tuple)
+        """
+        raise NotImplementedError(f"pre_all_gather not implemented for {cls.__name__}")
+
+    @classmethod
+    def post_all_gather(
+        cls,
+        qtensor: QuantizedTensor,
+        all_gather_outputs: tuple[torch.Tensor, ...],
+        metadata: Any,
+        param_dtype: torch.dtype,
+        *,
+        out: QuantizedTensor | None = None,
+    ):
+        """Reconstruct QuantizedTensor after FSDP all_gather.
+
+        Args:
+            qtensor: Original quantized tensor (used for layout context)
+            all_gather_outputs: Gathered tensors
+            metadata: Metadata from pre_all_gather
+            param_dtype: Expected parameter dtype
+            out: Optional output tensor to update in-place
+
+        Returns:
+            Either updates out in-place (returns None) or returns new (QuantizedTensor, metadata) tuple
+        """
+        raise NotImplementedError(f"post_all_gather not implemented for {cls.__name__}")
+
 
 class QuantizedTensor(torch.Tensor):
     """
@@ -327,6 +362,25 @@ class QuantizedTensor(torch.Tensor):
         params = ctx["params_class"](**params_kwargs)
         return QuantizedTensor(inner_tensors["_qdata"], ctx["layout_cls"], params)
 
+    # ==================== FSDP Hooks ====================
+
+    def fsdp_pre_all_gather(self, mesh):
+        """FSDP pre_all_gather hook - delegates to layout class."""
+        return self.layout_cls.pre_all_gather(self, mesh)
+
+    def fsdp_post_all_gather(
+        self,
+        all_gather_outputs: tuple[torch.Tensor, ...],
+        metadata: Any,
+        param_dtype: torch.dtype,
+        *,
+        out: QuantizedTensor | None = None,
+    ):
+        """FSDP post_all_gather hook - delegates to layout class."""
+        return self.layout_cls.post_all_gather(
+            self, all_gather_outputs, metadata, param_dtype, out=out
+        )
+
     # ==================== Torch Dispatch ====================
 
     @classmethod
@@ -348,7 +402,6 @@ class QuantizedTensor(torch.Tensor):
                     return op_handlers[parent_cls](qt, args, kwargs)
 
         # Step 3: Fallback to dequantization
-        logger.debug(f"Unhandled op {func} for {layout_cls.__name__ if layout_cls else 'unknown'}, dequantizing")
         return cls._dequant_and_fallback(func, args, kwargs)
 
     @classmethod
@@ -438,13 +491,15 @@ def _handle_is_contiguous(qt, args, kwargs):
 
 def _handle_copy_(qt, args, kwargs):
     dst, src = args[0], args[1]
-    if not isinstance(src, QuantizedTensor):
-        raise TypeError(f"Cannot copy {type(src).__name__} to QuantizedTensor")
+    non_blocking = kwargs.get("non_blocking", len(args) >= 3)
+
+    if not isinstance(dst, QuantizedTensor):
+        dst = QuantizedTensor(src._qdata, src._layout_cls, src._params)
+
     if dst._layout_cls != src._layout_cls:
         raise TypeError(f"Layout mismatch: {dst._layout_cls} vs {src._layout_cls}")
 
     dst_orig_dtype = dst._params.orig_dtype
-    non_blocking = kwargs.get("non_blocking", len(args) >= 3)
 
     dst._qdata.copy_(src._qdata, non_blocking=non_blocking)
     dst._params.copy_from(src._params, non_blocking=non_blocking)
