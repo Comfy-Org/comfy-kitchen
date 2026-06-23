@@ -897,8 +897,8 @@ def _int8_matmul_dequant_kernel(
 
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         # Load chunks
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0.0)
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0)
 
         # Matrix Multiply
         accumulator += tl.dot(a, b)
@@ -978,8 +978,8 @@ def _int8_matmul_dequant_per_row_kernel(
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
 
     for k in range(0, tl.cdiv(K, BLOCK_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0.0)
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0)
         accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
