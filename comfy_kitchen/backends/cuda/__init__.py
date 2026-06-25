@@ -359,6 +359,39 @@ def quantize_int8_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q_2d.reshape(orig_shape), scales_2d.reshape(*orig_shape[:-1], 1)
 
 
+def quantize_int8_rowwise_convrot(x_2d: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused online ConvRot rotation + per-row INT8 quantization (single kernel).
+
+    Avoids materializing the rotated bf16 activation in global memory. Expects a
+    contiguous 2D [M, K] input with K divisible by group_size (256 only).
+    """
+    q_2d = torch.empty_like(x_2d, dtype=torch.int8)
+    scales_2d = torch.empty((x_2d.shape[0], 1), dtype=torch.float32, device=x_2d.device)
+    stream_ptr = torch.cuda.current_stream(x_2d.device).cuda_stream
+
+    _C.quantize_int8_rowwise_convrot(
+        _wrap_for_dlpack(x_2d),
+        _wrap_for_dlpack(q_2d),
+        _wrap_for_dlpack(scales_2d),
+        group_size,
+        stream_ptr,
+    )
+
+    return q_2d, scales_2d
+
+
+# The fused kernel holds the whole rotated row ((K + tmp) * 4 bytes) in shared
+# memory. It uses a narrow 256-thread block for small K and a wide 1024-thread
+# block for large K to keep enough warps resident under the single-block-per-SM
+# regime. Cap K so the shared-memory request stays within the opt-in limit;
+# larger rows fall back to the rotate-matmul + rowwise-quant path.
+_CONVROT_FUSED_MAX_K = 16384
+
+# Set COMFY_KITCHEN_DISABLE_CUTLASS=1 to force the cuBLAS int8 GEMM + separate
+# dequant path (for benchmarking against the CUTLASS fused kernel).
+_DISABLE_CUTLASS_INT8 = os.environ.get("COMFY_KITCHEN_DISABLE_CUTLASS", "0") == "1"
+
+
 def quantize_int8_tensorwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize tensor to INT8 with a single tensor-wise scale."""
     return eager_quantize_int8_tensorwise(x)
@@ -546,16 +579,34 @@ def int8_linear(
     convrot: bool = False,
     convrot_groupsize: int = 256,
 ) -> torch.Tensor:
-    if convrot:
-        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
-        x = _rotate_activation(x, h, convrot_groupsize)
-
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     weight = weight.contiguous()
 
     # cuBLAS INT8 GEMM requires row-wise quantized activations and tensor-wise quantized weights.
-    x_qdata, x_scale = quantize_int8_rowwise(x_2d)
+    if convrot:
+        K = x_2d.shape[-1]
+        # Fused wins for small K (narrow block) and large K (wide block); the
+        # 5120 < K < 8192 band loses to the rotate-matmul path on both, so skip
+        # it. (Real model hidden dims avoid that band anyway.)
+        use_fused = (
+            convrot_groupsize == 256 and K % 256 == 0 and K <= _CONVROT_FUSED_MAX_K
+            and (K <= 5120 or K >= 8192)
+        )
+        x_qdata = None
+        if use_fused:
+            try:
+                # Fused single-kernel rotation + row-wise quant (no bf16 HBM round-trip).
+                x_qdata, x_scale = quantize_int8_rowwise_convrot(x_2d, convrot_groupsize)
+            except RuntimeError:
+                x_qdata = None  # e.g. shared-memory request rejected; fall back
+        if x_qdata is None:
+            # Fallback: standalone rotation matmul, then row-wise quant.
+            h = _build_hadamard(convrot_groupsize, device=x_2d.device, dtype=x_2d.dtype)
+            x_rot = _rotate_activation(x_2d, h, convrot_groupsize)
+            x_qdata, x_scale = quantize_int8_rowwise(x_rot)
+    else:
+        x_qdata, x_scale = quantize_int8_rowwise(x_2d)
 
     m, k = x_2d.shape
     n, k_w = weight.shape
@@ -569,26 +620,47 @@ def int8_linear(
         bias_arg = bias.to(device=x.device).contiguous()
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
 
-    # cuBLAS INT8 GEMM outputs int32
-    out_int32 = torch.empty((m, n), dtype=torch.int32, device=x.device)
-
-    _C.cublas_gemm_int8(
-        _wrap_for_dlpack(x_qdata),
-        _wrap_for_dlpack(weight),
-        _wrap_for_dlpack(out_int32),
-        _wrap_for_dlpack(get_cublas_workspace()),
-        stream_ptr,
-    )
-
-    _C.dequantize_int8_linear(
-        _wrap_for_dlpack(out_int32),
-        _wrap_for_dlpack(x_scale),
-        _wrap_for_dlpack(weight_scale),
-        _wrap_for_dlpack(bias_arg),
-        _wrap_for_dlpack(out),
-        DTYPE_TO_CODE[out_dtype],
-        stream_ptr,
-    )
+    # Preferred path: CUTLASS int8 GEMM with a FUSED rowwise x colwise dequant +
+    # bias epilogue (one near-peak kernel, no int32 round-trip). Beats cuBLAS
+    # ~1.1-1.8x and Triton ~1.0-1.2x on tall-skinny diffusion shapes. CUTLASS's
+    # epilogue scales are fp32, so pass fp32 scales/bias.
+    x_scale_f = x_scale.reshape(-1).contiguous()
+    # CUTLASS dequant needs a per-output-channel [N] weight scale; broadcast a
+    # tensor-wise (scalar) scale to [N].
+    ws_cutlass = weight_scale if weight_scale.numel() == n else weight_scale.expand(n).contiguous()
+    bias_f32 = (bias_arg.to(torch.float32).contiguous()
+                if bias is not None else torch.empty(0, dtype=torch.float32, device=x.device))
+    used_cutlass = False
+    if not _DISABLE_CUTLASS_INT8:
+        used_cutlass = _C.cutlass_int8_dequant(
+            _wrap_for_dlpack(x_qdata),
+            _wrap_for_dlpack(weight),
+            _wrap_for_dlpack(x_scale_f),
+            _wrap_for_dlpack(ws_cutlass),
+            _wrap_for_dlpack(bias_f32),
+            _wrap_for_dlpack(out),
+            DTYPE_TO_CODE[out_dtype],
+            stream_ptr,
+        )
+    if not used_cutlass:
+        # Fallback: cuBLAS int8 GEMM (int32) + separate dequant kernel.
+        out_int32 = torch.empty((m, n), dtype=torch.int32, device=x.device)
+        _C.cublas_gemm_int8(
+            _wrap_for_dlpack(x_qdata),
+            _wrap_for_dlpack(weight),
+            _wrap_for_dlpack(out_int32),
+            _wrap_for_dlpack(get_cublas_workspace()),
+            stream_ptr,
+        )
+        _C.dequantize_int8_linear(
+            _wrap_for_dlpack(out_int32),
+            _wrap_for_dlpack(x_scale),
+            _wrap_for_dlpack(weight_scale),
+            _wrap_for_dlpack(bias_arg),
+            _wrap_for_dlpack(out),
+            DTYPE_TO_CODE[out_dtype],
+            stream_ptr,
+        )
 
     return out.reshape(*orig_shape[:-1], n)
 

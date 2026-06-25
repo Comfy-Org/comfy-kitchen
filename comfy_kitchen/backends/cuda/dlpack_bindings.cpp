@@ -748,6 +748,29 @@ extern "C" {
         int input_dtype_code,
         cudaStream_t stream);
 
+    bool launch_cutlass_int8_dequant(
+        const void* A,
+        const void* B,
+        const void* xs,
+        const void* ws,
+        const void* bias,
+        void* D,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int out_dtype_code,
+        cudaStream_t stream);
+
+    void launch_quantize_int8_rowwise_convrot_kernel(
+        const void* input,
+        void* output,
+        void* scales,
+        int64_t num_rows,
+        int64_t num_cols,
+        int group_size,
+        int input_dtype_code,
+        cudaStream_t stream);
+
     void launch_dequantize_int8_linear_kernel(
         const void* input,
         const void* x_scales,
@@ -831,6 +854,62 @@ void quantize_int8_rowwise(
         scales.data(),
         M,
         K,
+        input_dtype_code,
+        stream);
+}
+
+// INT8 GEMM + fused dequant (D = acc * xs[m] * ws[n] + bias[n]) via CUTLASS.
+// Returns true on success; false means caller falls back to cuBLAS + dequant.
+bool cutlass_int8_dequant(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> a,   // [M, K]
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> b,   // [N, K]
+    nb::ndarray<float, nb::device::cuda> xs,                // [M] per-row act scale
+    nb::ndarray<float, nb::device::cuda> ws,                // [N] per-col weight scale
+    nb::ndarray<nb::device::cuda> bias,                     // [N] float or empty
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> d,           // [M, N] output
+    int out_dtype_code,
+    uintptr_t stream_ptr) {
+    const int64_t M = a.shape(0);
+    const int64_t K = a.shape(1);
+    const int64_t N = b.shape(0);
+    if (b.shape(1) != K) throw std::runtime_error("cutlass_int8_dequant: K mismatch");
+    if (d.shape(0) != M || d.shape(1) != N) throw std::runtime_error("cutlass_int8_dequant: D shape mismatch");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    const void* bias_ptr = bias.size() > 0 ? bias.data() : nullptr;
+    return launch_cutlass_int8_dequant(a.data(), b.data(), xs.data(), ws.data(),
+                                       bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
+}
+
+void quantize_int8_rowwise_convrot(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> scales,
+    int64_t group_size,
+    uintptr_t stream_ptr) {
+
+    const int64_t M = input.shape(0);
+    const int64_t K = input.shape(1);
+
+    if (output.shape(0) != M || output.shape(1) != K) {
+        throw std::runtime_error("INT8 rowwise convrot output shape mismatch");
+    }
+    if (scales.shape(0) != M || scales.shape(1) != 1) {
+        throw std::runtime_error("INT8 rowwise convrot scale shape mismatch");
+    }
+
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
+    if (input_dtype_code < 0 || input_dtype_code > 2) {
+        throw std::runtime_error("Unsupported input dtype for INT8 rowwise convrot quantization");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quantize_int8_rowwise_convrot_kernel(
+        input.data(),
+        output.data(),
+        scales.data(),
+        M,
+        K,
+        static_cast<int>(group_size),
         input_dtype_code,
         stream);
 }
@@ -943,6 +1022,25 @@ NB_MODULE(_C, m) {
           nb::arg("input"),
           nb::arg("output"),
           nb::arg("scales"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_int8_dequant", &cutlass_int8_dequant,
+          "INT8 GEMM + fused rowwise x colwise dequant + bias via CUTLASS; false -> fall back to cuBLAS",
+          nb::arg("a"),
+          nb::arg("b"),
+          nb::arg("xs"),
+          nb::arg("ws"),
+          nb::arg("bias"),
+          nb::arg("d"),
+          nb::arg("out_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("quantize_int8_rowwise_convrot", &quantize_int8_rowwise_convrot,
+          "Fused ConvRot Hadamard rotation + rowwise INT8 quantization",
+          nb::arg("input"),
+          nb::arg("output"),
+          nb::arg("scales"),
+          nb::arg("group_size"),
           nb::arg("stream_ptr"));
 
     m.def("dequantize_int8_linear", &dequantize_int8_linear,
