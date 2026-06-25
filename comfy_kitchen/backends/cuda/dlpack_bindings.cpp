@@ -179,7 +179,7 @@ extern "C" {
         cudaStream_t stream);
 
     // AWQ W4A16 — see ops/awq_w4a16.cu. Internal M-routing picks
-    // gemv (M ≤ 8) vs gemm path; bias / LoRA-up are applied externally.
+    // gemv (M ≤ 4) vs gemm path; bias / LoRA-up are applied externally.
     void launch_awq_w4a16_kernel(
         const void* x,
         const void* qweight,
@@ -187,6 +187,17 @@ extern "C" {
         const void* wzeros,
         void* out,
         int M,
+        int N,
+        int K,
+        int G,
+        int dtype_code,
+        cudaStream_t stream);
+
+    void launch_awq_dequant_w4a16_kernel(
+        const void* qweight,
+        const void* wscales,
+        const void* wzeros,
+        void* weight,
         int N,
         int K,
         int G,
@@ -706,6 +717,42 @@ void awq_w4a16(
         M, N, K, group_size, dtype_code, stream);
 }
 
+void awq_dequant_w4a16(
+    nb::ndarray<nb::device::cuda> qweight,   // (N, K/2) int8 packed uint4
+    nb::ndarray<nb::device::cuda> wscales,   // (K/G, N)
+    nb::ndarray<nb::device::cuda> wzeros,    // (K/G, N)
+    nb::ndarray<nb::device::cuda> weight,    // (N, K)
+    int group_size,
+    uintptr_t stream_ptr)
+{
+    if (qweight.ndim() != 2 || wscales.ndim() != 2 ||
+        wzeros.ndim() != 2 || weight.ndim() != 2) {
+        throw std::runtime_error("awq_dequant_w4a16: all tensors must be 2D");
+    }
+    const int N = static_cast<int>(qweight.shape(0));
+    const int K = static_cast<int>(qweight.shape(1)) * 2;
+    if (group_size <= 0 || K % group_size != 0) {
+        throw std::runtime_error("awq_dequant_w4a16: K must be divisible by group_size");
+    }
+    const int dtype_code = svdquant_dtype_code(wscales.dtype());
+    if (dtype_code != 1 && dtype_code != 2) {
+        throw std::runtime_error("awq_dequant_w4a16: only fp16 (1) and bf16 (2) outputs supported");
+    }
+    if (svdquant_dtype_code(wzeros.dtype()) != dtype_code ||
+        svdquant_dtype_code(weight.dtype()) != dtype_code) {
+        throw std::runtime_error("awq_dequant_w4a16: wscales, wzeros, and weight dtypes must match");
+    }
+    if (wscales.shape(0) != K / group_size || wscales.shape(1) != N ||
+        wzeros.shape(0) != K / group_size || wzeros.shape(1) != N ||
+        weight.shape(0) != N || weight.shape(1) != K) {
+        throw std::runtime_error("awq_dequant_w4a16: expected qweight (N,K/2), scales/zeros (K/G,N), weight (N,K)");
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_awq_dequant_w4a16_kernel(
+        qweight.data(), wscales.data(), wzeros.data(), weight.data(),
+        N, K, group_size, dtype_code, stream);
+}
+
 // Nanobind wrapper for fused AdaLN
 void adaln(
     nb::ndarray<nb::device::cuda> x,
@@ -901,13 +948,22 @@ NB_MODULE(_C, m) {
 
     m.def("awq_w4a16", &awq_w4a16,
           "AWQ W4A16: int4 weight @ fp activation (kitchen-native row-major). "
-          "Internal M-routing picks gemv (M ≤ 8) vs gemm. bias / LoRA-up are "
+          "Internal M-routing picks gemv (M <= 4) vs gemm. bias / LoRA-up are "
           "applied externally; this kernel only does the dequant + matmul.",
           nb::arg("x"),
           nb::arg("qweight"),
           nb::arg("wscales"),
           nb::arg("wzeros"),
           nb::arg("out"),
+          nb::arg("group_size"),
+          nb::arg("stream_ptr"));
+
+    m.def("awq_dequant_w4a16", &awq_dequant_w4a16,
+          "AWQ W4A16: dequantize packed uint4 weight to fp16/bf16 row-major W.",
+          nb::arg("qweight"),
+          nb::arg("wscales"),
+          nb::arg("wzeros"),
+          nb::arg("weight"),
           nb::arg("group_size"),
           nb::arg("stream_ptr"));
 
