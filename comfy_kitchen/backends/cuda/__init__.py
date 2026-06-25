@@ -585,13 +585,13 @@ def int8_linear(
 
     # cuBLAS INT8 GEMM requires row-wise quantized activations and tensor-wise quantized weights.
     if convrot:
-        K = x_2d.shape[-1]
+        k = x_2d.shape[-1]
         # Fused wins for small K (narrow block) and large K (wide block); the
         # 5120 < K < 8192 band loses to the rotate-matmul path on both, so skip
         # it. (Real model hidden dims avoid that band anyway.)
         use_fused = (
-            convrot_groupsize == 256 and K % 256 == 0 and K <= _CONVROT_FUSED_MAX_K
-            and (K <= 5120 or K >= 8192)
+            convrot_groupsize == 256 and k % 256 == 0 and k <= _CONVROT_FUSED_MAX_K
+            and (k <= 5120 or k >= 8192)
         )
         x_qdata = None
         if use_fused:
