@@ -18,20 +18,28 @@ activation quantization + low-rank correction + int4 matmul into a single call.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 
 import comfy_kitchen as ck
 
-from .base import BaseLayoutParams, QuantizedLayout, dequantize_args, register_layout_op
+from .base import (
+    BaseLayoutParams,
+    QuantizedLayout,
+    QuantizedTensor,
+    dequantize_args,
+    register_layout_op,
+)
 
-if TYPE_CHECKING:
-    from .base import QuantizedTensor
+try:
+    from comfy_kitchen.backends import cuda as cuda_backend
+except Exception:
+    cuda_backend = None
 
 logger = logging.getLogger(__name__)
 
@@ -73,9 +81,7 @@ def _direct_cuda_backend(input_tensor: torch.Tensor, qdata: torch.Tensor):
     if input_tensor.device != qdata.device:
         return None
 
-    try:
-        from comfy_kitchen.backends import cuda as cuda_backend
-    except Exception:
+    if cuda_backend is None:
         return None
     if not getattr(cuda_backend, "_EXT_AVAILABLE", False):
         return None
@@ -83,8 +89,6 @@ def _direct_cuda_backend(input_tensor: torch.Tensor, qdata: torch.Tensor):
 
 
 def _is_svdquant_w4a4_qtensor(tensor: torch.Tensor) -> bool:
-    from .base import QuantizedTensor
-
     return (
         isinstance(tensor, QuantizedTensor)
         and tensor._layout_cls == "TensorCoreSVDQuantW4A4Layout"
@@ -220,7 +224,6 @@ def svdquant_w4a4_grouped_linear(
             lora_down=proj_down,
             act_unsigned=act_unsigned,
             lora_x=lora_x,
-            reuse_workspace=True,
         )
     else:
         q_x, ascales, lora_act = ck.quantize_svdquant_w4a4(
@@ -262,8 +265,6 @@ def svdquant_w4a4_fuse_linear_weights(
     split weights along output-N so a caller can execute Q/K/V as one wider
     SVDQuant linear and split the output view afterwards.
     """
-    from .base import QuantizedTensor
-
     if len(weights) == 0:
         raise ValueError("expected at least one weight")
     if biases is None:
@@ -490,7 +491,6 @@ def _w4a4_forward(
             lora_down=proj_down,
             act_unsigned=act_unsigned,
             lora_x=lora_x,
-            reuse_workspace=True,
         )
         out = cuda_backend.scaled_mm_svdquant_w4a4(
             act=q_x, wgt=qdata, ascales=ascales, wscales=wscales,
@@ -521,10 +521,6 @@ def _handle_w4a4_t(qt, args, kwargs):
     Lets ``F.linear(x, W)`` decompose into ``x @ W.t()`` without reordering any
     storage; ``mm`` / ``addmm`` handlers below unwind the flag.
     """
-    import dataclasses
-
-    from .base import QuantizedTensor
-
     input_tensor = args[0]
     if not isinstance(input_tensor, QuantizedTensor):
         return torch.ops.aten.t.default(*args, **kwargs)
@@ -551,8 +547,6 @@ def _resolve_svdquant_rhs(rhs: QuantizedTensor) -> QuantizedTensor:
 @register_layout_op(torch.ops.aten.linear.default, TensorCoreSVDQuantW4A4Layout)
 def _handle_w4a4_linear(qt, args, kwargs):
     """Direct F.linear(input, W, bias) → kitchen kernel."""
-    from .base import QuantizedTensor
-
     input_tensor, weight = args[0], args[1]
     bias = args[2] if len(args) > 2 else None
 
@@ -570,8 +564,6 @@ def _handle_w4a4_mm(qt, args, kwargs):
     """Handle ``mm(x, W.t())`` — the decomposition F.linear takes when the weight
     is a non-default tensor subclass.
     """
-    from .base import QuantizedTensor
-
     a, b = args[0], args[1]
     if not isinstance(b, QuantizedTensor):
         return torch.mm(*dequantize_args((a, b)))
@@ -584,8 +576,6 @@ def _handle_w4a4_mm(qt, args, kwargs):
 @register_layout_op(torch.ops.aten.addmm.default, TensorCoreSVDQuantW4A4Layout)
 def _handle_w4a4_addmm(qt, args, kwargs):
     """Handle ``addmm(bias, x, W.t())``."""
-    from .base import QuantizedTensor
-
     bias, a, b = args[0], args[1], args[2]
     if not isinstance(b, QuantizedTensor):
         return torch.addmm(*dequantize_args((bias, a, b)))

@@ -728,7 +728,7 @@ void adaln(
 
 // Python module definition
 extern "C" {
-void launch_cublas_gemm_int8_kernel(
+    void launch_cublas_gemm_int8_kernel(
         const void* A_ptr,
         const void* B_ptr,
         void* C_ptr,
@@ -738,6 +738,30 @@ void launch_cublas_gemm_int8_kernel(
         void* workspace_ptr,
         int64_t workspace_size,
         cudaStream_t stream);
+
+    void launch_quantize_int8_rowwise_kernel(
+        const void* input,
+        void* output,
+        void* scales,
+        int64_t num_rows,
+        int64_t num_cols,
+        int input_dtype_code,
+        cudaStream_t stream);
+
+    void launch_dequantize_int8_linear_kernel(
+        const void* input,
+        const void* x_scales,
+        const void* weight_scales,
+        const void* bias,
+        void* output,
+        int64_t num_rows,
+        int64_t num_cols,
+        int64_t weight_scale_size,
+        bool has_bias,
+        int output_dtype_code,
+        int bias_dtype_code,
+        cudaStream_t stream);
+
 }
 
 // Nanobind wrapper for cublas_gemm_int8
@@ -776,6 +800,88 @@ void cublas_gemm_int8(
         M, N, K,
         workspace.data(),
         workspace.size() > 0 ? (int64_t)workspace.size() : 0,
+        stream);
+}
+
+void quantize_int8_rowwise(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> scales,
+    uintptr_t stream_ptr) {
+
+    const int64_t M = input.shape(0);
+    const int64_t K = input.shape(1);
+
+    if (output.shape(0) != M || output.shape(1) != K) {
+        throw std::runtime_error("INT8 rowwise quantization output shape mismatch");
+    }
+    if (scales.shape(0) != M || scales.shape(1) != 1) {
+        throw std::runtime_error("INT8 rowwise quantization scale shape mismatch");
+    }
+
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
+    if (input_dtype_code < 0 || input_dtype_code > 2) {
+        throw std::runtime_error("Unsupported input dtype for INT8 rowwise quantization");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quantize_int8_rowwise_kernel(
+        input.data(),
+        output.data(),
+        scales.data(),
+        M,
+        K,
+        input_dtype_code,
+        stream);
+}
+
+void dequantize_int8_linear(
+    nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> x_scales,
+    nb::ndarray<float, nb::device::cuda> weight_scales,
+    nb::ndarray<nb::device::cuda> bias,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    int output_dtype_code,
+    uintptr_t stream_ptr) {
+
+    const int64_t M = input.shape(0);
+    const int64_t N = input.shape(1);
+
+    if (x_scales.shape(0) != M || x_scales.shape(1) != 1) {
+        throw std::runtime_error("INT8 linear activation scale shape mismatch");
+    }
+    if (output.shape(0) != M || output.shape(1) != N) {
+        throw std::runtime_error("INT8 linear output shape mismatch");
+    }
+    if (output_dtype_code < 0 || output_dtype_code > 2) {
+        throw std::runtime_error("Invalid INT8 linear output dtype code");
+    }
+
+    const bool has_bias = bias.data() && bias.size() > 0;
+    int bias_dtype_code = output_dtype_code;
+    if (has_bias) {
+        if (bias.shape(0) != N) {
+            throw std::runtime_error("INT8 linear bias shape mismatch");
+        }
+        bias_dtype_code = map_dtype_to_code(bias.dtype());
+        if (bias_dtype_code < 0 || bias_dtype_code > 2) {
+            throw std::runtime_error("Unsupported bias dtype for INT8 linear");
+        }
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_dequantize_int8_linear_kernel(
+        input.data(),
+        x_scales.data(),
+        weight_scales.data(),
+        has_bias ? bias.data() : nullptr,
+        output.data(),
+        M,
+        N,
+        static_cast<int64_t>(weight_scales.size()),
+        has_bias,
+        output_dtype_code,
+        bias_dtype_code,
         stream);
 }
 
@@ -831,6 +937,24 @@ NB_MODULE(_C, m) {
           nb::arg("c"),
           nb::arg("workspace"),
           nb::arg("stream_ptr"));
+
+    m.def("quantize_int8_rowwise", &quantize_int8_rowwise,
+          "Rowwise INT8 quantization for CUDA activations",
+          nb::arg("input"),
+          nb::arg("output"),
+          nb::arg("scales"),
+          nb::arg("stream_ptr"));
+
+    m.def("dequantize_int8_linear", &dequantize_int8_linear,
+          "Fused INT8 linear dequantization, bias, and output cast",
+          nb::arg("input"),
+          nb::arg("x_scales"),
+          nb::arg("weight_scales"),
+          nb::arg("bias"),
+          nb::arg("output"),
+          nb::arg("output_dtype_code"),
+          nb::arg("stream_ptr"));
+
     m.def("apply_rope", &apply_rope,
           "Apply Rotary Position Embedding (RoPE) using nanobind ndarrays",
           nb::arg("xq"),

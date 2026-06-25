@@ -21,8 +21,10 @@
 #include <cuda_runtime_api.h>
 #include <stdlib.h>
 #include <cassert>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 #include "utils.cuh"
 #include "../dtype_dispatch.cuh"
@@ -41,7 +43,7 @@ namespace comfy {
 
 namespace {
 
-// Thread-local handle cache to avoid creating/destroying handles repeatedly
+// Thread-local handle cache to avoid creating/destroying handles repeatedly.
 thread_local cublasLtHandle_t cached_int8_handle = nullptr;
 
 cublasLtHandle_t get_cublas_lt_handle_int8() {
@@ -49,7 +51,7 @@ cublasLtHandle_t get_cublas_lt_handle_int8() {
   if (!runtime.is_available()) {
     throw std::runtime_error("cuBLASLt not available: " + runtime.error_message());
   }
-  
+
   if (cached_int8_handle == nullptr) {
     cublasStatus_t status = runtime.cublasLtCreate(&cached_int8_handle);
     if (status != CUBLAS_STATUS_SUCCESS) {
@@ -57,6 +59,118 @@ cublasLtHandle_t get_cublas_lt_handle_int8() {
     }
   }
   return cached_int8_handle;
+}
+
+struct Int8GemmKey {
+  int64_t M;
+  int64_t N;
+  int64_t K;
+  int64_t workspace_size;
+
+  bool operator==(const Int8GemmKey& other) const {
+    return M == other.M
+        && N == other.N
+        && K == other.K
+        && workspace_size == other.workspace_size;
+  }
+};
+
+struct Int8GemmKeyHash {
+  std::size_t operator()(const Int8GemmKey& key) const {
+    std::size_t h = static_cast<std::size_t>(key.M);
+    h ^= static_cast<std::size_t>(key.N) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    h ^= static_cast<std::size_t>(key.K) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    h ^= static_cast<std::size_t>(key.workspace_size) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
+struct CachedInt8GemmPlan {
+  cublasLtMatmulDesc_t operationDesc = nullptr;
+  cublasLtMatrixLayout_t Adesc = nullptr;
+  cublasLtMatrixLayout_t Bdesc = nullptr;
+  cublasLtMatrixLayout_t Cdesc = nullptr;
+  cublasLtMatmulAlgo_t algo = {};
+  size_t workspace_size = 0;
+};
+
+thread_local std::unordered_map<Int8GemmKey, CachedInt8GemmPlan, Int8GemmKeyHash> cached_int8_plans;
+
+CachedInt8GemmPlan& get_int8_gemm_plan(
+    cublasLtHandle_t ltHandle,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t workspace_size) {
+
+  auto& runtime = CublasLtRuntime::instance();
+  const Int8GemmKey key{M, N, K, workspace_size > 0 ? workspace_size : 0};
+  auto found = cached_int8_plans.find(key);
+  if (found != cached_int8_plans.end()) {
+    return found->second;
+  }
+
+  CachedInt8GemmPlan plan;
+  plan.workspace_size = static_cast<size_t>(key.workspace_size);
+
+  CUBLAS_CHECK(runtime.cublasLtMatmulDescCreate(&plan.operationDesc, CUBLAS_COMPUTE_32I, CUDA_R_32I));
+
+  // In cuBLAS column-major terms, we want to compute C_col = B_row @ A_row^T.
+  // B_row in memory is [N, K] row-major -> [K, N] col-major and is transposed.
+  // A_row in memory is [M, K] row-major -> [K, M] col-major and is not transposed.
+  const cublasOperation_t transa = CUBLAS_OP_T;
+  const cublasOperation_t transb = CUBLAS_OP_N;
+  CUBLAS_CHECK(runtime.cublasLtMatmulDescSetAttribute(
+      plan.operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
+  CUBLAS_CHECK(runtime.cublasLtMatmulDescSetAttribute(
+      plan.operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
+
+  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&plan.Bdesc, CUDA_R_8I, K, N, K));
+  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&plan.Adesc, CUDA_R_8I, K, M, K));
+  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&plan.Cdesc, CUDA_R_32I, N, M, N));
+
+  cublasLtMatmulPreference_t preference = nullptr;
+  CUBLAS_CHECK(runtime.cublasLtMatmulPreferenceCreate(&preference));
+  CUBLAS_CHECK(runtime.cublasLtMatmulPreferenceSetAttribute(
+      preference,
+      CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+      &plan.workspace_size,
+      sizeof(plan.workspace_size)));
+
+  cublasLtMatmulHeuristicResult_t heuristicResult = {};
+  int returnedResults = 0;
+  const auto status = runtime.cublasLtMatmulAlgoGetHeuristic(
+      ltHandle,
+      plan.operationDesc,
+      plan.Bdesc,
+      plan.Adesc,
+      plan.Cdesc,
+      plan.Cdesc,
+      preference,
+      1,
+      &heuristicResult,
+      &returnedResults);
+
+  CUBLAS_CHECK(runtime.cublasLtMatmulPreferenceDestroy(preference));
+
+  if (status == CUBLAS_STATUS_NOT_SUPPORTED || returnedResults == 0) {
+    if (plan.Cdesc) runtime.cublasLtMatrixLayoutDestroy(plan.Cdesc);
+    if (plan.Bdesc) runtime.cublasLtMatrixLayoutDestroy(plan.Bdesc);
+    if (plan.Adesc) runtime.cublasLtMatrixLayoutDestroy(plan.Adesc);
+    if (plan.operationDesc) runtime.cublasLtMatmulDescDestroy(plan.operationDesc);
+    throw std::runtime_error("INT8 GEMM not supported on this GPU for these dimensions (requires SM >= 7.5, and dimensions multiple of 4).");
+  }
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    if (plan.Cdesc) runtime.cublasLtMatrixLayoutDestroy(plan.Cdesc);
+    if (plan.Bdesc) runtime.cublasLtMatrixLayoutDestroy(plan.Bdesc);
+    if (plan.Adesc) runtime.cublasLtMatrixLayoutDestroy(plan.Adesc);
+    if (plan.operationDesc) runtime.cublasLtMatmulDescDestroy(plan.operationDesc);
+    throw std::runtime_error(std::string("cuBLAS heuristic error: ") + std::to_string(status));
+  }
+
+  plan.algo = heuristicResult.algo;
+  auto inserted = cached_int8_plans.emplace(key, plan);
+  return inserted.first->second;
 }
 
 void cublas_gemm_int8_impl(
@@ -69,7 +183,7 @@ void cublas_gemm_int8_impl(
     void* workspace_ptr,
     int64_t workspace_size,
     cudaStream_t stream) {
-  
+
   auto& runtime = CublasLtRuntime::instance();
   if (!runtime.is_available()) {
     throw std::runtime_error("cuBLASLt not available: " + runtime.error_message());
@@ -80,101 +194,30 @@ void cublas_gemm_int8_impl(
   }
 
   cublasLtHandle_t ltHandle = get_cublas_lt_handle_int8();
-
-  // Create operation descriptor with INT32 compute type
-  cublasLtMatmulDesc_t operationDesc = nullptr;
-  CUBLAS_CHECK(runtime.cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32I, CUDA_R_32I));
-
-  // In cuBLAS column-major terms, we want to compute C_col = B_row @ A_row^T
-  // B_row in memory is [N, K] row-major -> [K, N] col-major. 
-  // We want to multiply by B_row, so we need to transpose the [K, N] col-major matrix. transA = T.
-  // A_row in memory is [M, K] row-major -> [K, M] col-major. 
-  // This is already A_row^T, so we don't transpose it. transB = N.
-  
-  const cublasOperation_t transa = CUBLAS_OP_T;
-  const cublasOperation_t transb = CUBLAS_OP_N;
-  CUBLAS_CHECK(runtime.cublasLtMatmulDescSetAttribute(
-      operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
-  CUBLAS_CHECK(runtime.cublasLtMatmulDescSetAttribute(
-      operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
-
-  // Matrix layouts: INT8 inputs, INT32 output
-  cublasLtMatrixLayout_t Adesc = nullptr, Bdesc = nullptr, Cdesc = nullptr;
-  
-  // First operand is B_ptr. Shape [K, N] col-major.
-  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_8I, K, N, K));
-  // Second operand is A_ptr. Shape [K, M] col-major.
-  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_8I, K, M, K));
-  // Output is C_ptr. Shape [N, M] col-major.
-  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_32I, N, M, N));
+  CachedInt8GemmPlan& plan = get_int8_gemm_plan(ltHandle, M, N, K, workspace_size);
 
   // Alpha and beta scalars
   int32_t alpha = 1;
   int32_t beta = 0;
 
-  // Preference and heuristic
-  cublasLtMatmulPreference_t preference = nullptr;
-  CUBLAS_CHECK(runtime.cublasLtMatmulPreferenceCreate(&preference));
-  
-  size_t ws_size = workspace_size > 0 ? workspace_size : 0;
-  CUBLAS_CHECK(runtime.cublasLtMatmulPreferenceSetAttribute(
-      preference,
-      CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-      &ws_size,
-      sizeof(ws_size)));
-
-  cublasLtMatmulHeuristicResult_t heuristicResult = {};
-  int returnedResults = 0;
-  
-  const auto status = runtime.cublasLtMatmulAlgoGetHeuristic(
-      ltHandle,
-      operationDesc,
-      Bdesc,  // First operand
-      Adesc,  // Second operand
-      Cdesc,
-      Cdesc,
-      preference,
-      1,
-      &heuristicResult,
-      &returnedResults);
-
-  if (status == CUBLAS_STATUS_NOT_SUPPORTED || returnedResults == 0) {
-    if (preference) runtime.cublasLtMatmulPreferenceDestroy(preference);
-    if (Cdesc) runtime.cublasLtMatrixLayoutDestroy(Cdesc);
-    if (Bdesc) runtime.cublasLtMatrixLayoutDestroy(Bdesc);
-    if (Adesc) runtime.cublasLtMatrixLayoutDestroy(Adesc);
-    if (operationDesc) runtime.cublasLtMatmulDescDestroy(operationDesc);
-    throw std::runtime_error("INT8 GEMM not supported on this GPU for these dimensions (requires SM >= 7.5, and dimensions multiple of 4).");
-  }
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    throw std::runtime_error(std::string("cuBLAS heuristic error: ") + std::to_string(status));
-  }
-
   // Execute matmul
   CUBLAS_CHECK(runtime.cublasLtMatmul(
       ltHandle,
-      operationDesc,
+      plan.operationDesc,
       &alpha,
       B_ptr,  // First operand
-      Bdesc,
+      plan.Bdesc,
       A_ptr,  // Second operand
-      Adesc,
+      plan.Adesc,
       &beta,
       C_ptr,
-      Cdesc,
+      plan.Cdesc,
       C_ptr,
-      Cdesc,
-      &heuristicResult.algo,
+      plan.Cdesc,
+      &plan.algo,
       workspace_ptr,
-      ws_size,
+      plan.workspace_size,
       stream));
-
-  // Cleanup
-  CUBLAS_CHECK(runtime.cublasLtMatmulPreferenceDestroy(preference));
-  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutDestroy(Cdesc));
-  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutDestroy(Bdesc));
-  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutDestroy(Adesc));
-  CUBLAS_CHECK(runtime.cublasLtMatmulDescDestroy(operationDesc));
 }
 
 } // anonymous namespace

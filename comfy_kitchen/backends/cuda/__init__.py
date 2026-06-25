@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import ctypes
 import importlib.util
 import os
 import sys
@@ -27,7 +28,9 @@ __all__ = [
     "apply_rope_split_half1",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
+    "dequantize_int8_simple",
     "int8_linear",
+    "quantize_int8_tensorwise",
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "gemv_awq_w4a16",
@@ -63,7 +66,6 @@ try:
     else:
         lib_dir = find_lib_dir(nvidia_cu13_path, "libcublasLt.so")
         if lib_dir:
-            import ctypes
             for filename in os.listdir(lib_dir):
                 if "cublasLt" in filename and ".so" in filename:
                     with contextlib.suppress(Exception):
@@ -110,11 +112,31 @@ except Exception as e:
     _C = None  # type: ignore
 
 from comfy_kitchen.backends._modulation import adaln_prep_modulation  # noqa: E402
-from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE  # noqa: E402
+from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
+    DTYPE_TO_CODE,
+)
+from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
+    dequantize_int8_simple as eager_dequantize_int8_simple,
+)
+from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
+    quantize_and_rotate_rowwise as eager_quantize_and_rotate_rowwise,
+)
+from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
+    quantize_int8_tensorwise as eager_quantize_int8_tensorwise,
+)
+from comfy_kitchen.constraints import (  # noqa: E402
+    DivisibleBy,
+    ExactDims,
+    FunctionConstraints,
+    MinDims,
+    ParamConstraint,
+)
 from comfy_kitchen.float_utils import roundup  # noqa: E402
+from comfy_kitchen.registry import registry  # noqa: E402
+from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation  # noqa: E402
 
 _CUBLASLT_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUBLASLT", False)
-_cublas_workspace: torch.Tensor | None = None
+_cublas_workspaces: dict[int, torch.Tensor] = {}
 
 
 def get_cublas_workspace_size_bytes() -> int:
@@ -126,12 +148,16 @@ def get_cublas_workspace_size_bytes() -> int:
 
 def get_cublas_workspace() -> torch.Tensor:
     """Returns workspace for cublas."""
-    global _cublas_workspace
-    if _cublas_workspace is None:
-        _cublas_workspace = torch.empty(
-            get_cublas_workspace_size_bytes(), dtype=torch.uint8, device="cuda"
+    device_index = torch.cuda.current_device()
+    workspace = _cublas_workspaces.get(device_index)
+    if workspace is None:
+        workspace = torch.empty(
+            get_cublas_workspace_size_bytes(),
+            dtype=torch.uint8,
+            device=device_index,
         )
-    return _cublas_workspace
+        _cublas_workspaces[device_index] = workspace
+    return workspace
 
 
 def _wrap_for_dlpack(tensor: torch.Tensor):
@@ -317,14 +343,35 @@ def dequantize_nvfp4(
 
 def quantize_int8_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize tensor to INT8 with per-row scales (for activations)."""
-    from comfy_kitchen.backends.eager.quantization import quantize_int8_rowwise as eager_quantize
-    return eager_quantize(x)
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    q_2d = torch.empty_like(x_2d, dtype=torch.int8)
+    scales_2d = torch.empty((x_2d.shape[0], 1), dtype=torch.float32, device=x.device)
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+
+    _C.quantize_int8_rowwise(
+        _wrap_for_dlpack(x_2d),
+        _wrap_for_dlpack(q_2d),
+        _wrap_for_dlpack(scales_2d),
+        stream_ptr,
+    )
+
+    return q_2d.reshape(orig_shape), scales_2d.reshape(*orig_shape[:-1], 1)
 
 
-def quantize_and_rotate_rowwise(x: torch.Tensor, H: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_int8_tensorwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to INT8 with a single tensor-wise scale."""
+    return eager_quantize_int8_tensorwise(x)
+
+
+def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize INT8 tensor with scale."""
+    return eager_dequantize_int8_simple(q, scale)
+
+
+def quantize_and_rotate_rowwise(x: torch.Tensor, h: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused online activation rotation + row-wise quantization."""
-    from comfy_kitchen.backends.eager.quantization import quantize_and_rotate_rowwise as eager_quantize_rotate
-    return eager_quantize_rotate(x, H, group_size)
+    return eager_quantize_and_rotate_rowwise(x, h, group_size)
 
 
 def quantize_mxfp8(
@@ -500,20 +547,30 @@ def int8_linear(
     convrot_groupsize: int = 256,
 ) -> torch.Tensor:
     if convrot:
-        from comfy_kitchen.tensor.int8 import _build_hadamard, _rotate_activation
-        H = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
-        x = _rotate_activation(x, H, convrot_groupsize)
+        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        x = _rotate_activation(x, h, convrot_groupsize)
 
-    # cuBLAS INT8 GEMM requires row-wise quantized activations and tensor-wise quantized weights
-    x_qdata, x_scale = torch.ops.comfy_kitchen.quantize_int8_rowwise(x)
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    weight = weight.contiguous()
 
-    m, k = x.shape
+    # cuBLAS INT8 GEMM requires row-wise quantized activations and tensor-wise quantized weights.
+    x_qdata, x_scale = quantize_int8_rowwise(x_2d)
+
+    m, k = x_2d.shape
     n, k_w = weight.shape
     assert k == k_w, "Input and weight inner dimensions must match"
 
+    out_dtype = out_dtype or x.dtype
+    out = torch.empty((m, n), dtype=out_dtype, device=x.device)
+    weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1).contiguous()
+    bias_arg = bias if bias is not None else torch.empty(0, dtype=out_dtype, device=x.device)
+    if bias is not None and (bias.device != x.device or not bias.is_contiguous()):
+        bias_arg = bias.to(device=x.device).contiguous()
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+
     # cuBLAS INT8 GEMM outputs int32
     out_int32 = torch.empty((m, n), dtype=torch.int32, device=x.device)
-    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
 
     _C.cublas_gemm_int8(
         _wrap_for_dlpack(x_qdata),
@@ -523,15 +580,17 @@ def int8_linear(
         stream_ptr,
     )
 
-    # Dequantize/Rescale using eager-friendly operations
-    weight_scale = weight_scale.view(-1)
-    out = out_int32.float() * (x_scale * weight_scale)
+    _C.dequantize_int8_linear(
+        _wrap_for_dlpack(out_int32),
+        _wrap_for_dlpack(x_scale),
+        _wrap_for_dlpack(weight_scale),
+        _wrap_for_dlpack(bias_arg),
+        _wrap_for_dlpack(out),
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    )
 
-    if bias is not None:
-        out += bias.float()
-
-    out_dtype = out_dtype or x.dtype
-    return out.to(out_dtype)
+    return out.reshape(*orig_shape[:-1], n)
 
 
 def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -723,7 +782,6 @@ def quantize_svdquant_w4a4(
     pad_size: int = 256,
     act_unsigned: bool = False,
     lora_x: torch.Tensor | None = None,
-    reuse_workspace: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """SVDQuant W4A4 activation quantize + smooth + LoRA-down (CUDA).
 
@@ -752,7 +810,7 @@ def quantize_svdquant_w4a4(
         "COMFY_KITCHEN_SVDQUANT_LORA_ACT_FP32", ""
     ).lower() in {"1", "true", "yes", "on"} else x.dtype
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
-    reuse_workspace = reuse_workspace and os.getenv(
+    reuse_workspace = os.getenv(
         "COMFY_KITCHEN_SVDQUANT_REUSE_WORKSPACE", "1"
     ).lower() not in {"0", "false", "no", "off"}
     if reuse_workspace:
@@ -984,13 +1042,6 @@ def gemv_awq_w4a16(
 
 
 def _build_constraints() -> dict:
-    from comfy_kitchen.constraints import (
-        DivisibleBy,
-        ExactDims,
-        FunctionConstraints,
-        ParamConstraint,
-    )
-
     cuda_devices = frozenset({"cuda"})
 
     constraints = {
@@ -1117,28 +1168,6 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
         ),
-        "int8_linear": FunctionConstraints(
-            params={
-                "x": ParamConstraint(
-                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "weight": ParamConstraint(
-                    dtypes=frozenset({torch.int8}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "weight_scale": ParamConstraint(
-                    dtypes=frozenset({torch.float32}),
-                ),
-                "out_dtype": ParamConstraint(
-                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
-                ),
-                "convrot": ParamConstraint(dtypes=frozenset({bool})),
-                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
-            },
-            default_devices=cuda_devices,
-            min_compute_capability=(7, 5),
-        ),
         "quantize_int8_tensorwise": FunctionConstraints(
             params={
                 "x": ParamConstraint(
@@ -1263,6 +1292,31 @@ def _build_constraints() -> dict:
     }
 
     if _CUBLASLT_AVAILABLE:
+        constraints["int8_linear"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(MinDims(2),),
+                ),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "weight_scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                ),
+                "bias": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+                "out_dtype": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+                "convrot": ParamConstraint(dtypes=frozenset({bool})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(7, 5),
+        )
         constraints["scaled_mm_nvfp4"] = FunctionConstraints(
             params={
                 "a": ParamConstraint(
@@ -1298,8 +1352,6 @@ def _build_constraints() -> dict:
 
 def _register():
     """Register CUDA backend with the global registry."""
-    from comfy_kitchen.registry import registry
-
     if not _EXT_AVAILABLE:
         registry.mark_unavailable("cuda", _EXT_ERROR)
         return

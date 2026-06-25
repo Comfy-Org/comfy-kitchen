@@ -11,9 +11,9 @@ from .base import (
     register_layout_op,
 )
 from .fp8 import TensorCoreFP8Layout
+from .int8 import TensorWiseINT8Layout
 from .mxfp8 import TensorCoreMXFP8Layout
 from .nvfp4 import TensorCoreNVFP4Layout
-from .int8 import TensorWiseINT8Layout
 from .svdquant_w4a4 import (
     TensorCoreSVDQuantW4A4Layout,
     svdquant_w4a4_can_share_quant,

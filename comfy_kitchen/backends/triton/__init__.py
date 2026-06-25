@@ -15,6 +15,15 @@ __all__ = [
 ]
 
 # Try to import triton and register if available
+import torch
+
+from comfy_kitchen.constraints import (
+    ExactDims,
+    FunctionConstraints,
+    ParamConstraint,
+)
+from comfy_kitchen.registry import registry
+
 _TRITON_AVAILABLE = True
 _TRITON_ERROR = None
 
@@ -25,12 +34,16 @@ try:
     from .quantization import (
         dequantize_nvfp4,
         dequantize_per_tensor_fp8,
+        int8_linear,
         quantize_mxfp8,
         quantize_nvfp4,
         quantize_per_tensor_fp8,
-        int8_linear,
-        triton_quantize_rowwise as quantize_int8_rowwise,
+    )
+    from .quantization import (
         triton_quantize_and_rotate_rowwise as quantize_and_rotate_rowwise,
+    )
+    from .quantization import (
+        triton_quantize_rowwise as quantize_int8_rowwise,
     )
     from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
 except ImportError as e:
@@ -39,14 +52,6 @@ except ImportError as e:
 
 
 def _build_constraints() -> dict:
-    import torch
-
-    from comfy_kitchen.constraints import (
-        ExactDims,
-        FunctionConstraints,
-        ParamConstraint,
-    )
-
     cuda_devices = frozenset({"cuda"})
     triton_devices = frozenset({"cuda", "xpu"})
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
@@ -175,10 +180,6 @@ def _build_constraints() -> dict:
 
 
 def _register():
-    import torch
-
-    from comfy_kitchen.registry import registry
-
     if not _TRITON_AVAILABLE:
         registry.mark_unavailable("triton", _TRITON_ERROR or "Triton not available")
         return

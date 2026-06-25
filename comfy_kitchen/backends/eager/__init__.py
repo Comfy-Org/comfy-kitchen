@@ -23,37 +23,38 @@ __all__ = [
     "int8_linear",
 ]
 
+import torch
+
+from comfy_kitchen.constraints import (
+    ExactDims,
+    FunctionConstraints,
+    ParamConstraint,
+)
+from comfy_kitchen.registry import registry
+
 from .adaln import adaln
 from .awq import gemv_awq_w4a16
 from .quantization import (
+    dequantize_int8_simple,
     dequantize_mxfp8,
     dequantize_nvfp4,
     dequantize_per_tensor_fp8,
-    dequantize_int8_simple,
+    int8_linear,
+    quantize_and_rotate_rowwise,
+    quantize_int8_rowwise,
+    quantize_int8_tensorwise,
     quantize_mxfp8,
     quantize_nvfp4,
     quantize_per_tensor_fp8,
-    quantize_int8_rowwise,
-    quantize_and_rotate_rowwise,
-    quantize_int8_tensorwise,
     scaled_mm_mxfp8,
     scaled_mm_nvfp4,
     stochastic_rounding_fp8,
-    int8_linear,
 )
 from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
 from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
 
 
 def _build_constraints() -> dict:
-    import torch
-
-    from comfy_kitchen.constraints import (
-        ExactDims,
-        FunctionConstraints,
-        ParamConstraint,
-    )
-
     all_devices = frozenset({"cpu", "cuda", "mps", "xpu", "hpu", "meta", "*"})
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
 
@@ -247,6 +248,7 @@ def _build_constraints() -> dict:
             "x": ParamConstraint(dtypes=standard_floats),
             "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
             "weight_scale": ParamConstraint(dtypes=standard_floats),
+            "bias": ParamConstraint(dtypes=standard_floats),
             "convrot": ParamConstraint(dtypes=frozenset({bool})),
             "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
         },
@@ -300,8 +302,6 @@ def _build_constraints() -> dict:
 
 
 def _register():
-    from comfy_kitchen.registry import registry
-
     registry.register(
         name="eager",
         module=__import__(__name__, fromlist=__all__),

@@ -47,6 +47,8 @@
 import torch
 import torch.nn.functional as F  # noqa: N812
 
+from comfy_kitchen.registry import registry
+
 _INT4_GROUP_SIZE = 64
 _TILE_PACKED_BLOCK_N = 128
 _TILE_PACKED_INTERLEAVE = 4
@@ -306,8 +308,6 @@ def _op_quantize_svdquant_w4a4(
     act_unsigned: bool = False,
     lora_x: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from comfy_kitchen.registry import registry
-
     kwargs = {
         "x": x,
         "smooth": smooth,
@@ -344,8 +344,6 @@ def _op_scaled_mm_svdquant_w4a4(
     bias: torch.Tensor | None = None,
     act_unsigned: bool = False,
 ) -> torch.Tensor:
-    from comfy_kitchen.registry import registry
-
     kwargs = {
         "act": act, "wgt": wgt, "ascales": ascales, "wscales": wscales,
         "lora_act_in": lora_act_in, "lora_up": lora_up,

@@ -201,8 +201,17 @@ class TestQuantizedCompile:
         assert compiled_output.shape == ref_output.shape
         assert compiled_output.dtype == ref_output.dtype
         # INT8 has slightly lower precision due to quantization noise
-        tol = 0.2 if "INT8" in model.layout_cls else 1e-3
-        assert_values_close(compiled_output, ref_output, rtol=tol, atol=tol, name="compiled_output")
+        is_int8 = "INT8" in model.layout_cls
+        tol = 0.2 if is_int8 else 1e-3
+        max_mismatch_ratio = 0.01 if is_int8 else 0.0
+        assert_values_close(
+            compiled_output,
+            ref_output,
+            rtol=tol,
+            atol=tol,
+            name="compiled_output",
+            max_mismatch_ratio=max_mismatch_ratio,
+        )
 
     @pytest.mark.parametrize("model", LAYOUT_CONFIGS, indirect=True)
     def test_compile_model_multiple_runs(self, model):

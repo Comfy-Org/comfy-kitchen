@@ -19,6 +19,8 @@
 
 import torch
 
+from comfy_kitchen.registry import registry
+
 _DEFAULT_GROUP = 64
 
 
@@ -92,8 +94,6 @@ def _op_gemv_awq_w4a16(
     bias: torch.Tensor | None = None,
     group_size: int = _DEFAULT_GROUP,
 ) -> torch.Tensor:
-    from comfy_kitchen.registry import registry
-
     kwargs = {
         "x": x, "qweight": qweight, "wscales": wscales, "wzeros": wzeros,
         "bias": bias, "group_size": group_size,

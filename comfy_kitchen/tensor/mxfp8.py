@@ -3,17 +3,19 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 
 import comfy_kitchen as ck
 from comfy_kitchen.float_utils import roundup
 
-from .base import BaseLayoutParams, QuantizedLayout, dequantize_args, register_layout_op
-
-if TYPE_CHECKING:
-    from .base import QuantizedTensor
+from .base import (
+    BaseLayoutParams,
+    QuantizedLayout,
+    QuantizedTensor,
+    dequantize_args,
+    register_layout_op,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,8 +132,6 @@ def _slice_to_original_shape(result: torch.Tensor, orig_m: int, orig_n: int) -> 
 @register_layout_op(torch.ops.aten.t.default, TensorCoreMXFP8Layout)
 def _handle_mxfp8_transpose(qt, args, kwargs):
     """Handle transpose as a logical flag flip for MXFP8."""
-    from .base import QuantizedTensor
-
     input_tensor = args[0]
     if not isinstance(input_tensor, QuantizedTensor):
         return torch.ops.aten.t.default(*args, **kwargs)
@@ -149,8 +149,6 @@ def _handle_mxfp8_transpose(qt, args, kwargs):
 @register_layout_op(torch.ops.aten.mm.default, TensorCoreMXFP8Layout)
 def _handle_mxfp8_mm(qt, args, kwargs):
     """MXFP8 mm: requires b to be logically transposed (from .t() call)."""
-    from .base import QuantizedTensor
-
     a, b = args[0], args[1]
 
     if not (isinstance(a, QuantizedTensor) and isinstance(b, QuantizedTensor)):
@@ -179,8 +177,6 @@ def _handle_mxfp8_mm(qt, args, kwargs):
 @register_layout_op(torch.ops.aten.addmm.default, TensorCoreMXFP8Layout)
 def _handle_mxfp8_addmm(qt, args, kwargs):
     """MXFP8 addmm: bias + input @ weight.T (decomposed from F.linear with bias)."""
-    from .base import QuantizedTensor
-
     bias, mat1, mat2 = args[0], args[1], args[2]
 
     if not (isinstance(mat1, QuantizedTensor) and isinstance(mat2, QuantizedTensor)):
@@ -211,8 +207,6 @@ def _handle_mxfp8_addmm(qt, args, kwargs):
 @register_layout_op(torch.ops.aten.linear.default, TensorCoreMXFP8Layout)
 def _handle_mxfp8_linear(qt, args, kwargs):
     """MXFP8 linear: input @ weight.T + bias."""
-    from .base import QuantizedTensor
-
     input_tensor, weight = args[0], args[1]
     bias = args[2] if len(args) > 2 else None
 

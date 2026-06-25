@@ -8,9 +8,7 @@ import torch
 from .conftest import (
     assert_values_close,
     get_capable_backends,
-    get_supported_devices,
 )
-
 
 # =============================================================================
 # INT8 Quantization Tests
@@ -27,7 +25,7 @@ class TestTensorWiseINT8Layout:
 
     def test_weight_quantize_shape_dtype(self, seed):
         """Weight path: output INT8, scalar scale, shape preserved."""
-        from comfy_kitchen.tensor import TensorWiseINT8Layout, QuantizedTensor
+        from comfy_kitchen.tensor import QuantizedTensor
 
         w = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(w, "TensorWiseINT8Layout")
@@ -39,7 +37,7 @@ class TestTensorWiseINT8Layout:
 
     def test_activation_quantize_shape_dtype(self, seed):
         """Activation path (is_weight=False): per-row scales [..., 1]."""
-        from comfy_kitchen.tensor import TensorWiseINT8Layout, QuantizedTensor
+        from comfy_kitchen.tensor import TensorWiseINT8Layout
 
         x = torch.randn(32, 128, device="cuda", dtype=torch.float16)
         qdata, params = TensorWiseINT8Layout.quantize(x, is_weight=False)
@@ -50,7 +48,7 @@ class TestTensorWiseINT8Layout:
 
     def test_weight_dequantize_dtype(self, seed):
         """Dequantize restores original dtype."""
-        from comfy_kitchen.tensor import TensorWiseINT8Layout, QuantizedTensor
+        from comfy_kitchen.tensor import QuantizedTensor
 
         for dtype in (torch.float16, torch.bfloat16):
             w = torch.randn(64, 128, device="cuda", dtype=dtype)
@@ -72,7 +70,7 @@ class TestTensorWiseINT8Layout:
 
     def test_state_dict_tensors_keys(self, seed):
         """state_dict_tensors returns '' and '_scale' keys."""
-        from comfy_kitchen.tensor import TensorWiseINT8Layout, QuantizedTensor
+        from comfy_kitchen.tensor import QuantizedTensor, TensorWiseINT8Layout
 
         w = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(w, "TensorWiseINT8Layout")
@@ -114,7 +112,7 @@ class TestTensorWiseINT8Layout:
         b = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16)
         qt_b = QuantizedTensor.from_float(b, "TensorWiseINT8Layout")
 
-        out = torch.mm(a, qt_b.dequantize())
+        out = torch.mm(a, qt_b)
         assert out.shape == (8, 64)
 
     def test_addmm_dispatch(self, seed):
@@ -206,13 +204,13 @@ class TestTensorWiseINT8Layout:
 
         # Test valid sizes
         for size in [4, 16, 64, 256]:
-            H = _build_hadamard(size, device="cuda", dtype=torch.float32)
-            assert H.shape == (size, size)
+            h = _build_hadamard(size, device="cuda", dtype=torch.float32)
+            assert h.shape == (size, size)
             # Check symmetry: H^T = H
-            assert torch.allclose(H, H.T, atol=1e-5)
+            assert torch.allclose(h, h.T, atol=1e-5)
             # Check orthogonality: H^T @ H = I
-            I = torch.eye(size, device="cuda", dtype=torch.float32)
-            assert torch.allclose(torch.matmul(H.T, H), I, atol=1e-4)
+            identity = torch.eye(size, device="cuda", dtype=torch.float32)
+            assert torch.allclose(torch.matmul(h.T, h), identity, atol=1e-4)
 
         # Test invalid sizes
         for size in [2, 8, 32, 128, 500]:
@@ -296,21 +294,21 @@ class TestTensorWiseINT8Layout:
         rel_err_linear = (out_linear_rot.float() - out_linear_normal.float()).abs() / (out_linear_normal.float().abs().max() + 1e-8)
         assert rel_err_linear.mean().item() < 0.02
 
-        # Test mm dispatch
-        # mm: a [M, K] @ b [K, N] where b is shape [64, 64] to ensure K==N for scale matching
-        x_mm = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
-        w_mm = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        # Test mm dispatch through the common linear decomposition shape:
+        # a [M, K] @ weight.t() [K, N].
+        x_mm = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+        w_mm = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
         qt_w_mm_rot = QuantizedTensor.from_float(
             w_mm, "TensorWiseINT8Layout", per_channel=True, convrot=True, convrot_groupsize=group_size
         )
-        out_mm_rot = torch.mm(x_mm, qt_w_mm_rot)
+        out_mm_rot = torch.mm(x_mm, qt_w_mm_rot.t())
         assert out_mm_rot.shape == (4, 64)
         assert out_mm_rot.dtype == torch.bfloat16
 
         # Test addmm dispatch
-        # addmm: bias + a [M, K] @ b [K, N]
+        # addmm: bias + a [M, K] @ weight.t() [K, N]
         bias_mm = torch.randn(64, device="cuda", dtype=torch.bfloat16)
-        out_addmm_rot = torch.addmm(bias_mm, x_mm, qt_w_mm_rot)
+        out_addmm_rot = torch.addmm(bias_mm, x_mm, qt_w_mm_rot.t())
         assert out_addmm_rot.shape == (4, 64)
         assert out_addmm_rot.dtype == torch.bfloat16
 
@@ -356,53 +354,108 @@ class TestTensorWisePublicAPI:
     def seed(self):
         torch.manual_seed(42)
 
-    def test_public_api_quantize_tensorwise(self, seed):
+    def test_public_api_quantize_tensorwise(self, seed, device):
         """comfy_kitchen.quantize_int8_tensorwise op is reachable."""
-        import comfy_kitchen as ck
         import torch
 
-        x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+        import comfy_kitchen as ck
+
+        x = torch.randn(64, 128, device=device, dtype=torch.bfloat16)
         q, scale = ck.quantize_int8_tensorwise(x)
 
         assert q.dtype == torch.int8
         assert q.shape == x.shape
         assert scale.numel() == 1
 
-    def test_public_api_quantize_rowwise(self, seed):
+    def test_public_api_quantize_rowwise(self, seed, device):
         """comfy_kitchen.quantize_int8_rowwise op is reachable."""
-        import comfy_kitchen as ck
         import torch
 
-        x = torch.randn(32, 128, device="cuda", dtype=torch.bfloat16)
+        import comfy_kitchen as ck
+
+        x = torch.randn(32, 128, device=device, dtype=torch.bfloat16)
         q, scale = ck.quantize_int8_rowwise(x)
 
         assert q.dtype == torch.int8
         assert q.shape == x.shape
         assert scale.shape == (32, 1)
 
-    def test_public_api_dequantize_simple(self, seed):
+    def test_public_api_dequantize_simple(self, seed, device):
         """comfy_kitchen.dequantize_int8_simple op is reachable."""
-        import comfy_kitchen as ck
         import torch
 
-        x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
+        import comfy_kitchen as ck
+
+        x = torch.randn(32, 64, device=device, dtype=torch.bfloat16)
         q, scale = ck.quantize_int8_tensorwise(x)
         dq = ck.dequantize_int8_simple(q, scale)
 
         assert dq.dtype == torch.float32
         assert dq.shape == x.shape
 
-    def test_public_api_int8_linear(self, seed):
+    def test_public_api_int8_linear(self, seed, device):
         """comfy_kitchen.int8_linear op is reachable."""
-        import comfy_kitchen as ck
-        from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
         import torch
 
-        x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
-        w = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+        import comfy_kitchen as ck
+        from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
+
+        x = torch.randn(4, 128, device=device, dtype=torch.bfloat16)
+        w = torch.randn(64, 128, device=device, dtype=torch.bfloat16)
         w_int8, w_scale = quantize_int8_tensorwise(w)
 
         out = ck.int8_linear(x, w_int8, w_scale)
 
         assert out.shape == (4, 64)
+        assert out.dtype == torch.bfloat16
+
+    def test_eager_int8_linear_single_row(self, seed, device):
+        """Eager int8_linear supports single-row batches."""
+        import torch
+
+        import comfy_kitchen as ck
+        from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
+
+        x = torch.randn(1, 128, device=device, dtype=torch.bfloat16)
+        w = torch.randn(64, 128, device=device, dtype=torch.bfloat16)
+        w_int8, w_scale = quantize_int8_tensorwise(w)
+
+        with ck.registry.use_backend("eager"):
+            out = ck.int8_linear(x, w_int8, w_scale)
+
+        assert out.shape == (1, 64)
+        assert out.dtype == torch.bfloat16
+
+    def test_eager_int8_linear_pads_k_to_int8_mm_tile(self, seed, device):
+        """Eager int8_linear pads K to int8 matmul's tile size."""
+        import torch
+
+        import comfy_kitchen as ck
+        from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
+
+        x = torch.randn(17, 12, device=device, dtype=torch.bfloat16)
+        w = torch.randn(64, 12, device=device, dtype=torch.bfloat16)
+        w_int8, w_scale = quantize_int8_tensorwise(w)
+
+        with ck.registry.use_backend("eager"):
+            out = ck.int8_linear(x, w_int8, w_scale)
+
+        assert out.shape == (17, 64)
+        assert out.dtype == torch.bfloat16
+
+    def test_eager_int8_linear_pads_n_to_int8_mm_tile(self, seed, device):
+        """Eager int8_linear pads N to int8 matmul's tile size."""
+        import torch
+
+        import comfy_kitchen as ck
+        from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
+
+        x = torch.randn(17, 16, device=device, dtype=torch.bfloat16)
+        w = torch.randn(1, 16, device=device, dtype=torch.bfloat16)
+        w_int8, w_scale = quantize_int8_tensorwise(w)
+
+        with ck.registry.use_backend("eager"):
+            out = ck.int8_linear(x, w_int8, w_scale)
+
+        assert out.shape == (17, 1)
         assert out.dtype == torch.bfloat16

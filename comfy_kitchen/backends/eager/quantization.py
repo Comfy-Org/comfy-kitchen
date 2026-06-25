@@ -21,7 +21,9 @@ from comfy_kitchen.float_utils import (
     roundup,
     to_blocked,
 )
+from comfy_kitchen.registry import registry
 from comfy_kitchen.scaled_mm_v2 import ScalingType, SwizzleType, scaled_mm_v2
+from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
 
 # =============================================================================
 # Dtype Code Mappings (shared between custom ops and backends)
@@ -424,8 +426,6 @@ def _op_quantize_fp8(
     Returns:
         Quantized FP8 tensor
     """
-    from comfy_kitchen.registry import registry
-
     output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {"x": x, "scale": scale, "output_type": output_dtype}
     impl = registry.get_implementation("quantize_per_tensor_fp8", kwargs=kwargs)
@@ -454,8 +454,6 @@ def _op_dequantize_fp8(
     Returns:
         Dequantized tensor in specified output format
     """
-    from comfy_kitchen.registry import registry
-
     output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {"x": x, "scale": scale, "output_type": output_dtype}
     impl = registry.get_implementation("dequantize_per_tensor_fp8", kwargs=kwargs)
@@ -489,8 +487,6 @@ def _op_quantize_nvfp4(
     Returns:
         Tuple of (quantized_tensor, block_scales)
     """
-    from comfy_kitchen.registry import registry
-
     kwargs = {"x": x, "per_tensor_scale": per_tensor_scale, "epsilon": epsilon, "pad_16x": pad_16x, "hi_first": hi_first}
     impl = registry.get_implementation("quantize_nvfp4", kwargs=kwargs)
     return impl(**kwargs)
@@ -536,8 +532,6 @@ def _op_dequantize_nvfp4(
     Returns:
         Dequantized tensor in specified output format
     """
-    from comfy_kitchen.registry import registry
-
     output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {"qx": qx, "per_tensor_scale": per_tensor_scale, "block_scales": block_scales, "output_type": output_dtype, "hi_first": hi_first}
     impl = registry.get_implementation("dequantize_nvfp4", kwargs=kwargs)
@@ -582,8 +576,6 @@ def _op_scaled_mm_nvfp4(
     Returns:
         Result tensor of shape (M, N)
     """
-    from comfy_kitchen.registry import registry
-
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {
         "a": a, "b": b,
@@ -626,8 +618,6 @@ def _op_quantize_mxfp8(
     Returns:
         Tuple of (quantized_fp8_tensor, block_scales_e8m0)
     """
-    from comfy_kitchen.registry import registry
-
     kwargs = {"x": x, "pad_32x": pad_32x}
     impl = registry.get_implementation("quantize_mxfp8", kwargs=kwargs)
     return impl(**kwargs)
@@ -670,8 +660,6 @@ def _op_dequantize_mxfp8(
     Returns:
         Dequantized tensor in specified output format
     """
-    from comfy_kitchen.registry import registry
-
     output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {"qx": qx, "block_scales": block_scales, "output_type": output_dtype}
     impl = registry.get_implementation("dequantize_mxfp8", kwargs=kwargs)
@@ -708,8 +696,6 @@ def _op_scaled_mm_mxfp8(
     Returns:
         Result tensor of shape (M, N)
     """
-    from comfy_kitchen.registry import registry
-
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {
         "a": a, "b": b,
@@ -735,6 +721,41 @@ def _op_scaled_mm_mxfp8_fake(
 # Uses torch._int_mm for cuBLASLt acceleration on CUDA.
 
 
+def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Multiply INT8 matrices and return INT32 accumulators."""
+    def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        if hasattr(torch, "int8_mm"):
+            return torch.int8_mm(lhs, rhs)
+        return torch._int_mm(lhs, rhs)
+
+    orig_m = a.size(0)
+    orig_n = b.size(1)
+    k = a.size(1)
+    if orig_m == 0 or k == 0:
+        return fast_int8_mm(a, b)
+
+    if orig_m <= 16:
+        row_padding = torch.zeros((17 - orig_m, k), device=a.device, dtype=a.dtype)
+        a = torch.cat((a, row_padding), dim=0)
+
+    padded_k = ((k + 7) // 8) * 8
+    if padded_k != k:
+        a_padding = torch.zeros((a.size(0), padded_k - k), device=a.device, dtype=a.dtype)
+        b_padding = torch.zeros((padded_k - k, b.size(1)), device=b.device, dtype=b.dtype)
+        a = torch.cat((a, a_padding), dim=1)
+        b = torch.cat((b, b_padding), dim=0)
+
+    padded_n = ((orig_n + 7) // 8) * 8
+    if padded_n != orig_n:
+        b_padding = torch.zeros((b.size(0), padded_n - orig_n), device=b.device, dtype=b.dtype)
+        b = torch.cat((b, b_padding), dim=1)
+
+    result = fast_int8_mm(a, b)
+    if result.size(0) != orig_m or result.size(1) != orig_n:
+        result = result[:orig_m, :orig_n]
+    return result
+
+
 def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N].
 
@@ -750,9 +771,7 @@ def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     assert a.dtype == torch.int8 and b.dtype == torch.int8
     assert a.dim() == 2 and b.dim() == 2
     assert a.size(1) == b.size(0), f"K mismatch: {a.size(1)} vs {b.size(0)}"
-    if hasattr(torch, "int8_mm"):
-        return torch.int8_mm(a, b)
-    return torch._int_mm(a, b)
+    return _int8_matmul_accumulate(a, b)
 
 
 def quantize_int8_tensorwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -789,19 +808,18 @@ def quantize_int8_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q, scale
 
 
-def quantize_and_rotate_rowwise(x: torch.Tensor, H: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_and_rotate_rowwise(x: torch.Tensor, h: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused online activation rotation + row-wise quantization (Eager fallback).
 
     Args:
         x: Input unrotated activation tensor [M, K].
-        H: Pre-built normalized Hadamard matrix [group_size, group_size].
+        h: Pre-built normalized Hadamard matrix [group_size, group_size].
         group_size: ConvRot group size.
 
     Returns:
         Tuple of (rotated_quantized_x_int8, row_scales).
     """
-    from comfy_kitchen.tensor.int8 import _rotate_activation
-    x_rot = _rotate_activation(x, H, group_size)
+    x_rot = _rotate_activation(x, h, group_size)
     return quantize_int8_rowwise(x_rot)
 
 
@@ -845,9 +863,8 @@ def int8_linear(
         Result tensor [..., N].
     """
     if convrot:
-        from comfy_kitchen.tensor.int8 import _build_hadamard, _rotate_activation
-        H = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
-        x = _rotate_activation(x, H, convrot_groupsize)
+        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        x = _rotate_activation(x, h, convrot_groupsize)
 
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
@@ -855,24 +872,21 @@ def int8_linear(
     # Quantize input per-row
     x_8, x_scale = quantize_int8_rowwise(x_2d)
 
-    # Compute: x_8 @ weight.T using torch.int8_mm (public API) or torch._int_mm
+    # Compute: x_8 @ weight.T using fast int8 matmul when shape constraints allow it.
     # weight is [N, K], we need [K, N] for matmul so transpose
-    if hasattr(torch, "int8_mm"):
-        result = torch.int8_mm(x_8, weight.T.contiguous())
-    else:
-        result = torch._int_mm(x_8, weight.T.contiguous())
+    result = _int8_matmul_accumulate(x_8, weight.T.contiguous())
 
     # Scale back efficiently: result * (weight_scale * x_scale)
     # Process in chunks to avoid materializing large float32 tensor
     # which causes OOM for large models
 
-    M, N = result.shape
-    chunk_size = max(1, min(M, 256 * 1024 * 1024 // (N * 4)))  # Estimate safe chunk size
+    m, n = result.shape
+    chunk_size = max(1, min(m, 256 * 1024 * 1024 // (n * 4)))  # Estimate safe chunk size
 
     weight_scale = weight_scale.view(-1)
     scaled_parts = []
-    for i in range(0, M, chunk_size):
-        end_i = min(i + chunk_size, M)
+    for i in range(0, m, chunk_size):
+        end_i = min(i + chunk_size, m)
         chunk = result[i:end_i].float()
 
         # Apply scales: chunk * (weight_scale * x_scale[i:end_i])
@@ -900,8 +914,6 @@ def int8_linear(
 def _op_quantize_int8_tensorwise(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from comfy_kitchen.registry import registry
-
     kwargs = {"x": x}
     impl = registry.get_implementation("quantize_int8_tensorwise", kwargs=kwargs)
     return impl(**kwargs)
@@ -918,8 +930,6 @@ def _op_quantize_int8_tensorwise_fake(x):
 def _op_quantize_int8_rowwise(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from comfy_kitchen.registry import registry
-
     kwargs = {"x": x}
     impl = registry.get_implementation("quantize_int8_rowwise", kwargs=kwargs)
     return impl(**kwargs)
@@ -937,8 +947,6 @@ def _op_dequantize_int8_simple(
     q: torch.Tensor,
     scale: torch.Tensor,
 ) -> torch.Tensor:
-    from comfy_kitchen.registry import registry
-
     kwargs = {"q": q, "scale": scale}
     impl = registry.get_implementation("dequantize_int8_simple", kwargs=kwargs)
     return impl(**kwargs)
@@ -959,22 +967,18 @@ def _op_int8_linear(
     convrot: bool = False,
     convrot_groupsize: int = 256,
 ) -> torch.Tensor:
-    from comfy_kitchen.registry import registry
-
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {
         "x": x,
         "weight": weight,
         "weight_scale": weight_scale,
+        "bias": bias,
         "out_dtype": out_dtype,
         "convrot": convrot,
         "convrot_groupsize": convrot_groupsize,
     }
     impl = registry.get_implementation("int8_linear", kwargs=kwargs)
-    result = impl(**kwargs)
-    if bias is not None:
-        result = result + bias.to(device=result.device, dtype=result.dtype)
-    return result
+    return impl(**kwargs)
 
 
 @_op_int8_linear.register_fake

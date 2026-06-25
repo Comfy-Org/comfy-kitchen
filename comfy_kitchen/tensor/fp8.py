@@ -3,17 +3,19 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 
 import comfy_kitchen as ck
 from comfy_kitchen.scaled_mm_v2 import scaled_mm_v2
 
-from .base import BaseLayoutParams, QuantizedLayout, dequantize_args, register_layout_op
-
-if TYPE_CHECKING:
-    from .base import QuantizedTensor
+from .base import (
+    BaseLayoutParams,
+    QuantizedLayout,
+    QuantizedTensor,
+    dequantize_args,
+    register_layout_op,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +109,6 @@ def _make_fp8_shape_handler(aten_op):
     These ops work directly on FP8 since it's not packed (1:1 element mapping).
     The aten_op is applied to _qdata and the result is wrapped in a new QuantizedTensor.
     """
-    from .base import QuantizedTensor
-
     def handler(qt, args, kwargs):
         input_tensor = args[0]
         if not isinstance(input_tensor, QuantizedTensor):
@@ -137,8 +137,6 @@ def _handle_fp8_linear(qt, args, kwargs):
     Uses torch._scaled_mm for hardware-accelerated FP8 matmul when both
     input and weight are FP8 QuantizedTensors.
     """
-    from .base import QuantizedTensor
-
     input_tensor, weight = args[0], args[1]
     bias = args[2] if len(args) > 2 else None
 
@@ -174,8 +172,6 @@ def _handle_fp8_linear(qt, args, kwargs):
 @register_layout_op(torch.ops.aten.mm.default, TensorCoreFP8Layout)
 def _handle_fp8_mm(qt, args, kwargs):
     """FP8 matrix multiplication: output = a @ b"""
-    from .base import QuantizedTensor
-
     a, b = args[0], args[1]
 
     if not (isinstance(a, QuantizedTensor) and isinstance(b, QuantizedTensor)):
@@ -194,8 +190,6 @@ def _handle_fp8_mm(qt, args, kwargs):
 @register_layout_op(torch.ops.aten.addmm.default, TensorCoreFP8Layout)
 def _handle_fp8_addmm(qt, args, kwargs):
     """FP8 addmm: output = bias + input @ weight"""
-    from .base import QuantizedTensor
-
     bias, input_tensor, weight = args[0], args[1], args[2]
 
     if not (isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor)):

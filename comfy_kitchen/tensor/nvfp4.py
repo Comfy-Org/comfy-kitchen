@@ -3,17 +3,19 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 
 import comfy_kitchen as ck
 from comfy_kitchen.float_utils import F4_E2M1_MAX, F8_E4M3_MAX, roundup
 
-from .base import BaseLayoutParams, QuantizedLayout, dequantize_args, register_layout_op
-
-if TYPE_CHECKING:
-    from .base import QuantizedTensor
+from .base import (
+    BaseLayoutParams,
+    QuantizedLayout,
+    QuantizedTensor,
+    dequantize_args,
+    register_layout_op,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,8 +127,6 @@ class TensorCoreNVFP4Layout(QuantizedLayout):
 def _handle_nvfp4_transpose(qt, args, kwargs):
     """Handle transpose as a logical no-op for NVFP4.
     """
-    from .base import QuantizedTensor
-
     input_tensor = args[0]
     if not isinstance(input_tensor, QuantizedTensor):
         return torch.ops.aten.t.default(*args, **kwargs)
@@ -167,8 +167,6 @@ def _handle_nvfp4_mm(qt, args, kwargs):
 
     This handles the common torch.compile decomposition: linear(x, w) → mm(x, w.t())
     """
-    from .base import QuantizedTensor
-
     a, b = args[0], args[1]
 
     # Fast path: both operands are NVFP4 QuantizedTensors
@@ -218,8 +216,6 @@ def _handle_nvfp4_linear(qt, args, kwargs):
     Uses ck.scaled_mm_nvfp4 for hardware-accelerated NVFP4 matmul.
     Output is sliced to original (non-padded) shape.
     """
-    from .base import QuantizedTensor
-
     input_tensor, weight = args[0], args[1]
     bias = args[2] if len(args) > 2 else None
 

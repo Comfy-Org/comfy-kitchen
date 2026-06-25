@@ -1383,6 +1383,8 @@ class TestINT8LinearOperations:
     """Tests for INT8 linear operations using QuantizedTensor."""
 
     def test_int8_linear_weight_quantized(self):
+        import comfy_kitchen as ck
+
         batch, in_features, out_features = 32, 64, 128
         x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
@@ -1392,14 +1394,16 @@ class TestINT8LinearOperations:
 
         result = torch.nn.functional.linear(x, qt_w, bias)
 
-        # Reference: manual dequantize and linear
-        expected = torch.nn.functional.linear(x, qt_w.dequantize(), bias)
+        # Reference: same quantized math through the eager backend.
+        with ck.registry.use_backend("eager"):
+            expected = torch.nn.functional.linear(x, qt_w, bias)
 
         assert result.shape == expected.shape
-        # Allow some difference due to INT8 quantization
-        assert torch.allclose(result, expected, rtol=0.1, atol=0.1)
+        assert torch.allclose(result, expected, rtol=1e-2, atol=1e-1)
 
     def test_int8_mm(self):
+        import comfy_kitchen as ck
+
         m, k, n = 64, 128, 256
         a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) # (out, in)
@@ -1408,9 +1412,8 @@ class TestINT8LinearOperations:
 
         # mm(a, b.t())
         result = torch.mm(a, qt_b.t())
-        expected = torch.mm(a, qt_b.dequantize().t())
+        with ck.registry.use_backend("eager"):
+            expected = torch.mm(a, qt_b.t())
 
         assert result.shape == expected.shape
-        assert torch.allclose(result, expected, rtol=0.1, atol=0.1)
-
-
+        assert torch.allclose(result, expected, rtol=1e-2, atol=1e-1)

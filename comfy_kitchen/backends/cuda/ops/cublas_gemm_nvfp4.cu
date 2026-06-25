@@ -42,8 +42,8 @@ namespace comfy {
 
 namespace {
 
-// Thread-local handle cache to avoid creating/destroying handles repeatedly
-// This eliminates implicit device synchronization from cublasLtDestroy
+// Thread-local handle cache to avoid creating/destroying handles repeatedly.
+// This eliminates implicit device synchronization from cublasLtDestroy.
 thread_local cublasLtHandle_t cached_handle = nullptr;
 
 cublasLtHandle_t get_cublas_lt_handle() {
@@ -51,7 +51,7 @@ cublasLtHandle_t get_cublas_lt_handle() {
   if (!runtime.is_available()) {
     throw std::runtime_error("cuBLASLt not available: " + runtime.error_message());
   }
-  
+
   if (cached_handle == nullptr) {
     cublasStatus_t status = runtime.cublasLtCreate(&cached_handle);
     if (status != CUBLAS_STATUS_SUCCESS) {
@@ -127,7 +127,6 @@ void cublas_gemm_blockwise_fp4_impl(
 
   float* beta_ptr = accumulate ? GetScalarOne() : GetScalarZero();
 
-  // Get cached handle - avoids creation/destruction overhead and synchronization
   cublasLtHandle_t ltHandle = get_cublas_lt_handle();
 
   // variable to store heuristic result
@@ -283,8 +282,7 @@ void cublas_gemm_blockwise_fp4_impl(
   if (operationDesc)
     CUBLAS_CHECK(runtime.cublasLtMatmulDescDestroy(operationDesc));
 
-  // ltHandle is cached and reused - no destruction needed here
-  // This avoids implicit device synchronization from cublasLtDestroy
+  // ltHandle is cached and reused, so no destruction is needed here.
 }
 
 } // anonymous namespace

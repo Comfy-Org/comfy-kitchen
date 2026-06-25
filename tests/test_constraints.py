@@ -339,8 +339,7 @@ class TestINT8Constraints:
     """Tests for INT8 specific constraints."""
 
     def test_int8_linear_shape_constraint(self, device):
-        """Test that int8_linear requires 2D input on CUDA backend."""
-        # Note: Eager backend doesn't have 2D constraint for int8_linear, but CUDA does
+        """Test that int8_linear requires at least 2D input on CUDA backend."""
         if device != "cuda":
             pytest.skip("Test requires CUDA device")
 
@@ -349,18 +348,18 @@ class TestINT8Constraints:
         if not cuda_status.get("available", False):
             pytest.skip(f"CUDA backend is unavailable: {cuda_status.get('unavailable_reason')}")
 
-        x_3d = torch.randn(2, 16, 32, dtype=torch.float16, device=device)
+        x_1d = torch.randn(32, dtype=torch.float16, device=device)
         weight = torch.randint(-128, 127, (64, 32), dtype=torch.int8, device=device)
         scale = torch.tensor([1.0], dtype=torch.float32, device=device)
 
         result = ck.registry.validate_backend_for_call(
             "cuda",
             "int8_linear",
-            {"x": x_3d, "weight": weight, "weight_scale": scale, "out_dtype": torch.float16},
+            {"x": x_1d, "weight": weight, "weight_scale": scale, "out_dtype": torch.float16},
         )
 
         assert result.success is False
-        assert "ExactDims(2)" in str(result.failure_reason)
+        assert "at least 2D" in str(result.failure_reason)
 
     def test_int8_linear_dtype_constraint(self, device):
         """Test that int8_linear requires int8 weight."""

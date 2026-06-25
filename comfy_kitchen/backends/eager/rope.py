@@ -3,6 +3,8 @@
 
 import torch
 
+from comfy_kitchen.registry import registry
+
 
 def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor):
     x_ = x.to(dtype=freqs_cis.dtype).reshape(*x.shape[:-1], -1, 1, 2)
@@ -41,8 +43,6 @@ def _op_apply_rope(
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from comfy_kitchen.registry import registry
-
     kwargs = {"xq": xq, "xk": xk, "freqs_cis": freqs_cis}
     impl = registry.get_implementation("apply_rope", kwargs=kwargs)
     return impl(**kwargs)
@@ -58,8 +58,6 @@ def _op_apply_rope1(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> torch.Tensor:
-    from comfy_kitchen.registry import registry
-
     kwargs = {"x": x, "freqs_cis": freqs_cis}
     impl = registry.get_implementation("apply_rope1", kwargs=kwargs)
     return impl(**kwargs)
@@ -76,8 +74,6 @@ def _op_apply_rope_split_half(
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from comfy_kitchen.registry import registry
-
     kwargs = {"xq": xq, "xk": xk, "freqs_cis": freqs_cis}
     impl = registry.get_implementation("apply_rope_split_half", kwargs=kwargs)
     return impl(**kwargs)
@@ -93,8 +89,6 @@ def _op_apply_rope_split_half1(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> torch.Tensor:
-    from comfy_kitchen.registry import registry
-
     kwargs = {"x": x, "freqs_cis": freqs_cis}
     impl = registry.get_implementation("apply_rope_split_half1", kwargs=kwargs)
     return impl(**kwargs)

@@ -26,18 +26,21 @@ can be added later without changing this layout.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 
 import comfy_kitchen as ck
 
-from .base import BaseLayoutParams, QuantizedLayout, dequantize_args, register_layout_op
-
-if TYPE_CHECKING:
-    from .base import QuantizedTensor
+from .base import (
+    BaseLayoutParams,
+    QuantizedLayout,
+    QuantizedTensor,
+    dequantize_args,
+    register_layout_op,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -145,10 +148,6 @@ def _awq_forward(
 @register_layout_op(torch.ops.aten.t.default, TensorCoreAWQW4A16Layout)
 def _handle_awq_t(qt, args, kwargs):
     """Zero-copy logical transpose — flip the ``transposed`` flag."""
-    import dataclasses
-
-    from .base import QuantizedTensor
-
     input_tensor = args[0]
     if not isinstance(input_tensor, QuantizedTensor):
         return torch.ops.aten.t.default(*args, **kwargs)
@@ -175,8 +174,6 @@ def _resolve_awq_rhs(rhs: QuantizedTensor) -> QuantizedTensor:
 @register_layout_op(torch.ops.aten.linear.default, TensorCoreAWQW4A16Layout)
 def _handle_awq_linear(qt, args, kwargs):
     """Direct F.linear(input, W, bias) → AWQ GEMV."""
-    from .base import QuantizedTensor
-
     input_tensor, weight = args[0], args[1]
     bias = args[2] if len(args) > 2 else None
 
@@ -192,8 +189,6 @@ def _handle_awq_linear(qt, args, kwargs):
 @register_layout_op(torch.ops.aten.mm.default, TensorCoreAWQW4A16Layout)
 def _handle_awq_mm(qt, args, kwargs):
     """``mm(x, W.t())`` — F.linear's decomposition for tensor subclass weights."""
-    from .base import QuantizedTensor
-
     a, b = args[0], args[1]
     if not isinstance(b, QuantizedTensor):
         return torch.mm(*dequantize_args((a, b)))
@@ -206,8 +201,6 @@ def _handle_awq_mm(qt, args, kwargs):
 @register_layout_op(torch.ops.aten.addmm.default, TensorCoreAWQW4A16Layout)
 def _handle_awq_addmm(qt, args, kwargs):
     """``addmm(bias, x, W.t())``."""
-    from .base import QuantizedTensor
-
     bias, a, b = args[0], args[1], args[2]
     if not isinstance(b, QuantizedTensor):
         return torch.addmm(*dequantize_args((bias, a, b)))

@@ -5,6 +5,8 @@ import torch
 from torch import Tensor
 from torch.nn import functional
 
+from comfy_kitchen.registry import registry
+
 
 def adaln(x: Tensor, scale: Tensor, shift: Tensor, eps: float = 1e-6) -> Tensor:
     """Fused AdaLN: layernorm(x, elementwise_affine=False) * (1 + scale) + shift"""
@@ -24,8 +26,6 @@ def _op_adaln(
     shift: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    from comfy_kitchen.registry import registry
-
     kwargs = {"x": x, "scale": scale, "shift": shift, "eps": eps}
     impl = registry.get_implementation("adaln", kwargs=kwargs)
     return impl(**kwargs)
