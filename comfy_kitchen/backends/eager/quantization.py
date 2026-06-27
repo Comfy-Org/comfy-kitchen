@@ -721,6 +721,30 @@ def _op_scaled_mm_mxfp8_fake(
 # Uses torch._int_mm for cuBLASLt acceleration on CUDA.
 
 
+_turing_device_cache: dict[int, bool] = {}
+
+
+def _cuda_device_is_turing(device_index: int) -> bool:
+    cached = _turing_device_cache.get(device_index)
+    if cached is not None:
+        return cached
+    try:
+        is_turing = torch.cuda.get_device_capability(device_index) == (7, 5)
+    except RuntimeError:
+        is_turing = False
+    _turing_device_cache[device_index] = is_turing
+    return is_turing
+
+
+def _int8_mm_n_alignment(tensor: torch.Tensor) -> int:
+    # Turing cuBLASLt INT8 rejects some skinny-N shapes, e.g. N=17.
+    return 32 if tensor.is_cuda and _cuda_device_is_turing(tensor.get_device()) else 8
+
+
+def _round_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
+
+
 def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Multiply INT8 matrices and return INT32 accumulators."""
     def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
@@ -745,7 +769,7 @@ def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         a = torch.cat((a, a_padding), dim=1)
         b = torch.cat((b, b_padding), dim=0)
 
-    padded_n = ((orig_n + 7) // 8) * 8
+    padded_n = _round_up(orig_n, _int8_mm_n_alignment(a))
     if padded_n != orig_n:
         b_padding = torch.zeros((b.size(0), padded_n - orig_n), device=b.device, dtype=b.dtype)
         b = torch.cat((b, b_padding), dim=1)

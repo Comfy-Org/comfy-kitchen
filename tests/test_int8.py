@@ -10,6 +10,57 @@ from .conftest import (
     get_capable_backends,
 )
 
+
+def test_cuda_int8_cublas_turing_n_alignment(monkeypatch):
+    """CUDA cuBLAS fallback pads Turing skinny N to 32."""
+    from comfy_kitchen.backends import cuda
+
+    calls = []
+
+    def fake_get_device_capability(device_index):
+        calls.append(device_index)
+        return (7, 5)
+
+    cuda._turing_device_cache.clear()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", fake_get_device_capability)
+
+    class FakeCudaTensor:
+        is_cuda = True
+
+        def get_device(self):
+            return 0
+
+    tensor = FakeCudaTensor()
+    assert cuda._cublas_int8_n_alignment(tensor) == 32
+    assert cuda._round_up(17, cuda._cublas_int8_n_alignment(tensor)) == 32
+    assert calls == [0]
+
+
+def test_eager_int8_matmul_turing_n_alignment(monkeypatch):
+    """Eager torch INT8 matmul pads Turing skinny N to 32."""
+    from comfy_kitchen.backends.eager import quantization
+
+    calls = []
+
+    def fake_get_device_capability(device_index):
+        calls.append(device_index)
+        return (7, 5)
+
+    quantization._turing_device_cache.clear()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", fake_get_device_capability)
+
+    class FakeCudaTensor:
+        is_cuda = True
+
+        def get_device(self):
+            return 0
+
+    tensor = FakeCudaTensor()
+    assert quantization._int8_mm_n_alignment(tensor) == 32
+    assert quantization._round_up(17, quantization._int8_mm_n_alignment(tensor)) == 32
+    assert calls == [0]
+
+
 # =============================================================================
 # INT8 Quantization Tests
 # =============================================================================
@@ -103,6 +154,20 @@ class TestTensorWiseINT8Layout:
         assert out.shape == (4, 64)
         assert out.dtype == torch.bfloat16
 
+    def test_linear_dispatch_uses_activation_dtype(self, seed):
+        """aten.linear defaults output dtype to runtime activation dtype."""
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        x = torch.randn(4, 128, device="cuda", dtype=torch.float16)
+        w = torch.randn(64, 128, device="cuda", dtype=torch.float32)
+        bias = torch.randn(64, device="cuda", dtype=torch.float32)
+        qt_w = QuantizedTensor.from_float(w, "TensorWiseINT8Layout")
+
+        out = torch.nn.functional.linear(x, qt_w, bias)
+
+        assert out.shape == (4, 64)
+        assert out.dtype == torch.float16
+
     def test_mm_dispatch(self, seed):
         """aten.mm dispatch fires and produces correct shape."""
         from comfy_kitchen.tensor import QuantizedTensor
@@ -114,6 +179,19 @@ class TestTensorWiseINT8Layout:
 
         out = torch.mm(a, qt_b)
         assert out.shape == (8, 64)
+
+    def test_mm_dispatch_uses_activation_dtype(self, seed):
+        """aten.mm defaults output dtype to runtime activation dtype."""
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        a = torch.randn(8, 128, device="cuda", dtype=torch.float16)
+        b = torch.randn(128, 64, device="cuda", dtype=torch.float32)
+        qt_b = QuantizedTensor.from_float(b, "TensorWiseINT8Layout")
+
+        out = torch.mm(a, qt_b)
+
+        assert out.shape == (8, 64)
+        assert out.dtype == torch.float16
 
     def test_addmm_dispatch(self, seed):
         """aten.addmm dispatch fires and produces correct shape/dtype."""
@@ -128,6 +206,20 @@ class TestTensorWiseINT8Layout:
 
         assert out.shape == (4, 64)
         assert out.dtype == torch.bfloat16
+
+    def test_addmm_dispatch_uses_activation_dtype(self, seed):
+        """aten.addmm defaults output dtype to runtime activation dtype."""
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        bias = torch.randn(64, device="cuda", dtype=torch.float32)
+        x = torch.randn(4, 128, device="cuda", dtype=torch.float16)
+        w = torch.randn(128, 64, device="cuda", dtype=torch.float32)
+        qt_w = QuantizedTensor.from_float(w, "TensorWiseINT8Layout")
+
+        out = torch.addmm(bias, x, qt_w)
+
+        assert out.shape == (4, 64)
+        assert out.dtype == torch.float16
 
     @pytest.mark.parametrize("backend", get_capable_backends("int8_linear", "cuda"))
     def test_int8_linear_correctness(self, seed, backend):

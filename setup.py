@@ -45,8 +45,8 @@ class CMakeBuildExt(build_ext):
     ]
 
     # Default values for options
-    DEFAULT_CUDA_ARCHS_WINDOWS = "75-virtual;80;89;120f"  # No need for Datacenter GPUs
-    DEFAULT_CUDA_ARCHS_LINUX = "75-virtual;80;89;90a;100f;120f"  # + H100, B100
+    DEFAULT_CUDA_ARCHS_WINDOWS = "75-real;75-virtual;80;89;120f"  # No need for Datacenter GPUs
+    DEFAULT_CUDA_ARCHS_LINUX = "75-real;75-virtual;80;89;90a;100f;120f"  # + H100, B100
 
     def initialize_options(self):
         super().initialize_options()

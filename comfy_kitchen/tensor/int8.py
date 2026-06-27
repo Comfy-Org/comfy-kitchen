@@ -232,12 +232,12 @@ def _handle_int8_linear_tensorwise(qt, args, kwargs):
     if getattr(weight._params, "transposed", False):
         return torch.nn.functional.linear(*dequantize_args(args), **dequantize_args(kwargs))
 
-    weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
-    out_dtype = kwargs.get("out_dtype", weight._params.orig_dtype)
-
     # If input is already quantized, dequantize it (TensorWise needs dynamic row-wise quant)
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
+
+    weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
 
     convrot = getattr(weight._params, "convrot", False)
     convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
@@ -263,11 +263,11 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
     if not isinstance(weight, QuantizedTensor) or weight._layout_cls != "TensorWiseINT8Layout":
         return torch.mm(*dequantize_args(args), **dequantize_args(kwargs))
 
-    weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
-    out_dtype = kwargs.get("out_dtype", weight._params.orig_dtype)
-
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
+
+    weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
 
     convrot = getattr(weight._params, "convrot", False)
     convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
@@ -306,11 +306,11 @@ def _handle_int8_addmm_tensorwise(qt, args, kwargs):
     if not isinstance(weight, QuantizedTensor) or weight._layout_cls != "TensorWiseINT8Layout":
         return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
 
-    weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
-    out_dtype = kwargs.get("out_dtype", weight._params.orig_dtype)
-
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
+
+    weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
 
     convrot = getattr(weight._params, "convrot", False)
     convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)

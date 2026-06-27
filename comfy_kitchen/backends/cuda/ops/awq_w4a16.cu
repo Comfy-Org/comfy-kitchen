@@ -92,6 +92,7 @@ template<>
 __device__ __forceinline__ void mma_m16n8k16_f32<__nv_bfloat16>(
     float (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2])
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
         "{%0, %1, %2, %3}, "
@@ -102,12 +103,14 @@ __device__ __forceinline__ void mma_m16n8k16_f32<__nv_bfloat16>(
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
           "r"(b[0]), "r"(b[1]),
           "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+#endif
 }
 
 template<>
 __device__ __forceinline__ void mma_m16n8k16_f32<__half>(
     float (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2])
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0, %1, %2, %3}, "
@@ -118,6 +121,7 @@ __device__ __forceinline__ void mma_m16n8k16_f32<__half>(
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
           "r"(b[0]), "r"(b[1]),
           "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -603,7 +607,12 @@ extern "C" void launch_awq_w4a16_kernel(
     // the int4 weight tile to bf16 in shmem, then mma.m16n8k16.f32 along K.
     // This eliminates the 113 MB intermediate W workspace that the naive
     // tiled or Python-side fallback paths require.
-    const bool use_mma = (M > kGemvMThreshold);
+    int device = 0;
+    cudaDeviceProp prop{};
+    cudaGetDevice(&device);
+    cudaGetDeviceProperties(&prop, device);
+    const bool supports_mma = prop.major >= 8;
+    const bool use_mma = supports_mma && (M > kGemvMThreshold);
 
     if (dtype_code == 2) {        // bfloat16
         if (use_mma) launch_mma<__nv_bfloat16>(x, qweight, wscales, wzeros, out, M, N, K, G, stream);

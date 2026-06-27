@@ -137,6 +137,28 @@ from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation 
 
 _CUBLASLT_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUBLASLT", False)
 _cublas_workspaces: dict[int, torch.Tensor] = {}
+_turing_device_cache: dict[int, bool] = {}
+
+
+def _cuda_device_is_turing(device_index: int) -> bool:
+    cached = _turing_device_cache.get(device_index)
+    if cached is not None:
+        return cached
+    try:
+        is_turing = torch.cuda.get_device_capability(device_index) == (7, 5)
+    except RuntimeError:
+        is_turing = False
+    _turing_device_cache[device_index] = is_turing
+    return is_turing
+
+
+def _cublas_int8_n_alignment(tensor: torch.Tensor) -> int:
+    # Turing cuBLASLt INT8 rejects some skinny-N shapes, e.g. N=17.
+    return 32 if tensor.is_cuda and _cuda_device_is_turing(tensor.get_device()) else 8
+
+
+def _round_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
 
 
 def get_cublas_workspace_size_bytes() -> int:
@@ -616,8 +638,8 @@ def int8_linear(
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
     weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1).contiguous()
     bias_arg = bias if bias is not None else torch.empty(0, dtype=out_dtype, device=x.device)
-    if bias is not None and (bias.device != x.device or not bias.is_contiguous()):
-        bias_arg = bias.to(device=x.device).contiguous()
+    if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
+        bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
 
     # Preferred path: CUTLASS int8 GEMM with a FUSED rowwise x colwise dequant +
@@ -644,14 +666,22 @@ def int8_linear(
         )
     if not used_cutlass:
         # Fallback: cuBLAS int8 GEMM (int32) + separate dequant kernel.
-        out_int32 = torch.empty((m, n), dtype=torch.int32, device=x.device)
+        padded_n = _round_up(n, _cublas_int8_n_alignment(x_qdata))
+        cublas_weight = weight
+        if padded_n != n:
+            weight_padding = torch.zeros((padded_n - n, k), dtype=weight.dtype, device=weight.device)
+            cublas_weight = torch.cat((weight, weight_padding), dim=0).contiguous()
+
+        out_int32 = torch.empty((m, padded_n), dtype=torch.int32, device=x.device)
         _C.cublas_gemm_int8(
             _wrap_for_dlpack(x_qdata),
-            _wrap_for_dlpack(weight),
+            _wrap_for_dlpack(cublas_weight),
             _wrap_for_dlpack(out_int32),
             _wrap_for_dlpack(get_cublas_workspace()),
             stream_ptr,
         )
+        if padded_n != n:
+            out_int32 = out_int32[:, :n].contiguous()
         _C.dequantize_int8_linear(
             _wrap_for_dlpack(out_int32),
             _wrap_for_dlpack(x_scale),
