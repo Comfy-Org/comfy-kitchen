@@ -177,6 +177,19 @@ class TensorWiseINT8Layout(QuantizedLayout):
         }
 
     @classmethod
+    def requantize_kwargs(cls, qtensor: QuantizedTensor) -> dict[str, object]:
+        """Return INT8 quantization options needed to preserve this layout."""
+        params = qtensor._params
+        is_weight = getattr(params, "is_weight", True)
+        convrot = getattr(params, "convrot", False)
+        return {
+            "is_weight": is_weight,
+            "per_channel": bool(is_weight and (convrot or params.scale.dim() > 0)),
+            "convrot": convrot,
+            "convrot_groupsize": getattr(params, "convrot_groupsize", 256),
+        }
+
+    @classmethod
     def supports_fast_matmul(cls) -> bool:
         """Check if fast INT8 matmul is available."""
         if not torch.cuda.is_available():

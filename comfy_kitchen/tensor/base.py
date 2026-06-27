@@ -117,6 +117,11 @@ class QuantizedLayout(ABC):
         raise NotImplementedError
 
     @classmethod
+    def requantize_kwargs(cls, qtensor: QuantizedTensor) -> dict[str, Any]:
+        """Return layout-specific kwargs for requantizing a dequantized tensor."""
+        return {}
+
+    @classmethod
     def supports_fast_matmul(cls) -> bool:
         """Check if fast quantized matmul is supported on current hardware."""
         if cls.MIN_SM_VERSION is None:
@@ -298,6 +303,15 @@ class QuantizedTensor(torch.Tensor):
     def state_dict(self, prefix: str = "") -> dict[str, torch.Tensor]:
         tensors = self.layout_cls.state_dict_tensors(self._qdata, self._params)
         return {f"{prefix}{suffix}": tensor for suffix, tensor in tensors.items()}
+
+    def requantize_from_float(self, tensor: torch.Tensor, **kwargs) -> QuantizedTensor:
+        """Quantize a float tensor using this tensor's layout-specific options.
+
+        Caller-supplied kwargs override preserved layout options such as scale.
+        """
+        qkwargs = self.layout_cls.requantize_kwargs(self)
+        qkwargs.update(kwargs)
+        return type(self).from_float(tensor, self._layout_cls, **qkwargs)
 
     # ==================== Flatten/Unflatten Protocol ====================
 

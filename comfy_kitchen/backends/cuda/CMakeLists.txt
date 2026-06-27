@@ -106,6 +106,7 @@ set(CUDA_SOURCES
     ops/quantize_mxfp8.cu
     ops/cublas_gemm_nvfp4.cu
     ops/cublas_gemm_int8.cu
+    ops/cutlass_gemm_int8.cu
     ops/int8_linear.cu
     ops/apply_rope.cu
     ops/quantize_svdquant_w4a4.cu
@@ -148,6 +149,20 @@ target_include_directories(_C PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CUDAToolkit_INCLUDE_DIRS}
 )
+
+# CUTLASS (header-only) for the near-peak INT8 GEMM. Vendored at
+# third_party/cutlass (or pass -DCOMFY_CUTLASS_DIR). Optional: without it the
+# CUTLASS op compiles to a stub and int8_linear falls back to cuBLAS.
+if(NOT DEFINED COMFY_CUTLASS_DIR)
+    set(COMFY_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/cutlass/include")
+endif()
+if(EXISTS "${COMFY_CUTLASS_DIR}/cutlass/version.h")
+    message(STATUS "CUTLASS found: ${COMFY_CUTLASS_DIR}")
+    target_include_directories(_C PRIVATE ${COMFY_CUTLASS_DIR})
+    target_compile_definitions(_C PRIVATE COMFY_HAVE_CUTLASS)
+else()
+    message(STATUS "CUTLASS not found at ${COMFY_CUTLASS_DIR} - int8 GEMM uses cuBLAS only")
+endif()
 
 # Link libraries
 # Note: cuBLASLt is loaded dynamically at runtime via dlopen/LoadLibrary

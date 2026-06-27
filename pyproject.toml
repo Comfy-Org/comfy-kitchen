@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "comfy-kitchen"
-version = "0.2.10"
+version = "0.2.13"
 description = "Fast Kernel Library for ComfyUI with multiple compute backends"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -63,6 +63,7 @@ exclude = [
     "dist",
     "*.egg-info",
     ".pytest_cache",
+    "third_party",
 ]
 
 [tool.ruff.lint]
