@@ -119,9 +119,6 @@ from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
     dequantize_int8_simple as eager_dequantize_int8_simple,
 )
 from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
-    quantize_and_rotate_rowwise as eager_quantize_and_rotate_rowwise,
-)
-from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
     quantize_int8_tensorwise as eager_quantize_int8_tensorwise,
 )
 from comfy_kitchen.constraints import (  # noqa: E402
@@ -138,6 +135,7 @@ from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation 
 _CUBLASLT_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUBLASLT", False)
 _cublas_workspaces: dict[int, torch.Tensor] = {}
 _turing_device_cache: dict[int, bool] = {}
+_shared_memory_per_block_cache: dict[int, int] = {}
 
 
 def _cuda_device_is_turing(device_index: int) -> bool:
@@ -152,6 +150,16 @@ def _cuda_device_is_turing(device_index: int) -> bool:
     return is_turing
 
 
+def _cuda_device_supports_cutlass_int8_dequant(tensor: torch.Tensor) -> bool:
+    if not tensor.is_cuda:
+        return False
+    try:
+        major, _minor = torch.cuda.get_device_capability(tensor.get_device())
+    except RuntimeError:
+        return False
+    return major >= 8
+
+
 def _cublas_int8_n_alignment(tensor: torch.Tensor) -> int:
     # Turing cuBLASLt INT8 rejects some skinny-N shapes, e.g. N=17.
     return 32 if tensor.is_cuda and _cuda_device_is_turing(tensor.get_device()) else 8
@@ -159,6 +167,45 @@ def _cublas_int8_n_alignment(tensor: torch.Tensor) -> int:
 
 def _round_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
+
+
+def _pad_2d_cols(x: torch.Tensor, padded_cols: int) -> torch.Tensor:
+    if x.shape[1] == padded_cols:
+        return x
+    padding = torch.zeros((x.shape[0], padded_cols - x.shape[1]), dtype=x.dtype, device=x.device)
+    return torch.cat((x, padding), dim=1).contiguous()
+
+
+def _pad_2d_rows(x: torch.Tensor, padded_rows: int) -> torch.Tensor:
+    if x.shape[0] == padded_rows:
+        return x
+    padding = torch.zeros((padded_rows - x.shape[0], x.shape[1]), dtype=x.dtype, device=x.device)
+    return torch.cat((x, padding), dim=0).contiguous()
+
+
+def _pad_1d(x: torch.Tensor, padded_size: int) -> torch.Tensor:
+    if x.numel() == padded_size:
+        return x
+    padding = torch.zeros((padded_size - x.numel(),), dtype=x.dtype, device=x.device)
+    return torch.cat((x.reshape(-1), padding), dim=0).contiguous()
+
+
+def _convrot_fused_shared_memory_fits(x: torch.Tensor, k: int, group_size: int) -> bool:
+    if not x.is_cuda or group_size != 256:
+        return True
+    device_index = x.get_device()
+    max_shared = _shared_memory_per_block_cache.get(device_index)
+    if max_shared is None:
+        try:
+            props = torch.cuda.get_device_properties(device_index)
+            max_shared = getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
+        except RuntimeError:
+            return False
+        _shared_memory_per_block_cache[device_index] = max_shared
+    # The fused convrot rowwise kernel stages the rotated row plus scratch in
+    # shared memory. For group_size=256 the CUDA kernel requests this amount.
+    requested_shared = (k + 2048) * 4
+    return requested_shared <= max_shared
 
 
 def get_cublas_workspace_size_bytes() -> int:
@@ -425,8 +472,9 @@ def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
 
 
 def quantize_and_rotate_rowwise(x: torch.Tensor, h: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused online activation rotation + row-wise quantization."""
-    return eager_quantize_and_rotate_rowwise(x, h, group_size)
+    """Online activation rotation followed by CUDA row-wise quantization."""
+    x_rot = _rotate_activation(x, h, group_size)
+    return quantize_int8_rowwise(x_rot)
 
 
 def quantize_mxfp8(
@@ -614,6 +662,7 @@ def int8_linear(
         use_fused = (
             convrot_groupsize == 256 and k % 256 == 0 and k <= _CONVROT_FUSED_MAX_K
             and (k <= 5120 or k >= 8192)
+            and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
         )
         x_qdata = None
         if use_fused:
@@ -625,8 +674,7 @@ def int8_linear(
         if x_qdata is None:
             # Fallback: standalone rotation matmul, then row-wise quant.
             h = _build_hadamard(convrot_groupsize, device=x_2d.device, dtype=x_2d.dtype)
-            x_rot = _rotate_activation(x_2d, h, convrot_groupsize)
-            x_qdata, x_scale = quantize_int8_rowwise(x_rot)
+            x_qdata, x_scale = quantize_and_rotate_rowwise(x_2d, h, convrot_groupsize)
     else:
         x_qdata, x_scale = quantize_int8_rowwise(x_2d)
 
@@ -653,7 +701,7 @@ def int8_linear(
     bias_f32 = (bias_arg.to(torch.float32).contiguous()
                 if bias is not None else torch.empty(0, dtype=torch.float32, device=x.device))
     used_cutlass = False
-    if not _DISABLE_CUTLASS_INT8:
+    if not _DISABLE_CUTLASS_INT8 and _cuda_device_supports_cutlass_int8_dequant(x_qdata):
         used_cutlass = _C.cutlass_int8_dequant(
             _wrap_for_dlpack(x_qdata),
             _wrap_for_dlpack(weight),
@@ -666,15 +714,20 @@ def int8_linear(
         )
     if not used_cutlass:
         # Fallback: cuBLAS int8 GEMM (int32) + separate dequant kernel.
-        padded_n = _round_up(n, _cublas_int8_n_alignment(x_qdata))
-        cublas_weight = weight
-        if padded_n != n:
-            weight_padding = torch.zeros((padded_n - n, k), dtype=weight.dtype, device=weight.device)
-            cublas_weight = torch.cat((weight, weight_padding), dim=0).contiguous()
+        use_turing_padding = x_qdata.is_cuda and _cuda_device_is_turing(x_qdata.get_device())
+        if use_turing_padding:
+            padded_k = _round_up(k, 16)
+            padded_n = _round_up(n, _cublas_int8_n_alignment(x_qdata))
+            cublas_x = _pad_2d_cols(x_qdata, padded_k)
+            cublas_weight = _pad_2d_rows(_pad_2d_cols(weight, padded_k), padded_n)
+        else:
+            padded_n = n
+            cublas_x = x_qdata
+            cublas_weight = weight
 
         out_int32 = torch.empty((m, padded_n), dtype=torch.int32, device=x.device)
         _C.cublas_gemm_int8(
-            _wrap_for_dlpack(x_qdata),
+            _wrap_for_dlpack(cublas_x),
             _wrap_for_dlpack(cublas_weight),
             _wrap_for_dlpack(out_int32),
             _wrap_for_dlpack(get_cublas_workspace()),

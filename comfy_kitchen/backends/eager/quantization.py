@@ -758,8 +758,9 @@ def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if orig_m == 0 or k == 0:
         return fast_int8_mm(a, b)
 
-    if orig_m <= 16:
-        row_padding = torch.zeros((17 - orig_m, k), device=a.device, dtype=a.dtype)
+    padded_m = _round_up(max(orig_m, 32), 32) if a.is_cuda else orig_m
+    if padded_m != orig_m:
+        row_padding = torch.zeros((padded_m - orig_m, k), device=a.device, dtype=a.dtype)
         a = torch.cat((a, row_padding), dim=0)
 
     padded_k = ((k + 7) // 8) * 8
@@ -886,7 +887,24 @@ def int8_linear(
     Returns:
         Result tensor [..., N].
     """
+    if x.shape[-1] != weight.shape[-1]:
+        raise ValueError(
+            f"Input and weight inner dimensions must match, got {x.shape[-1]} and {weight.shape[-1]}"
+        )
+
+    weight = weight.to(device=x.device).contiguous()
+    weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1)
+    if weight_scale.numel() not in (1, weight.shape[0]):
+        raise ValueError(
+            f"INT8 weight scale must be scalar or per-output-channel, got {tuple(weight_scale.shape)} "
+            f"for weight shape {tuple(weight.shape)}"
+        )
+
     if convrot:
+        if x.shape[-1] % convrot_groupsize != 0:
+            raise ValueError(
+                f"ConvRot group size {convrot_groupsize} does not divide input features {x.shape[-1]}"
+            )
         h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
         x = _rotate_activation(x, h, convrot_groupsize)
 
@@ -907,14 +925,14 @@ def int8_linear(
     m, n = result.shape
     chunk_size = max(1, min(m, 256 * 1024 * 1024 // (n * 4)))  # Estimate safe chunk size
 
-    weight_scale = weight_scale.view(-1)
+    weight_scale = weight_scale.reshape(1, -1)
     scaled_parts = []
     for i in range(0, m, chunk_size):
         end_i = min(i + chunk_size, m)
         chunk = result[i:end_i].float()
 
         # Apply scales: chunk * (weight_scale * x_scale[i:end_i])
-        chunk_scales = weight_scale * x_scale[i:end_i]
+        chunk_scales = x_scale[i:end_i].to(device=chunk.device, dtype=torch.float32) * weight_scale
         chunk_scaled = chunk * chunk_scales
 
         # Convert to output dtype immediately to free memory
@@ -924,7 +942,7 @@ def int8_linear(
     result = torch.cat(scaled_parts, dim=0)
 
     if bias is not None:
-        result = result + bias.to(device=result.device, dtype=result.dtype)
+        result = result + bias.to(device=result.device, dtype=result.dtype).reshape(1, -1)
 
     return result.reshape(*orig_shape[:-1], weight.shape[0])
 
