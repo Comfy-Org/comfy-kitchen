@@ -38,6 +38,13 @@ def _flatten(qt):
     return {n: getattr(qt, n) for n in names}, ctx
 
 
+class _DummyLayout:
+    pass
+
+
+register_layout_class("Dummy", _DummyLayout)
+
+
 class TestUnflattenOuterSizeCPU:
     """Synthetic + real-layout coverage of the outer_size/outer_stride threading (CPU-only)."""
 
@@ -50,11 +57,7 @@ class TestUnflattenOuterSizeCPU:
         def _tensor_fields(self):
             return ["scale"]
 
-    class _DummyLayout:
-        pass
-
     def _dummy_qt(self):
-        register_layout_class("Dummy", self._DummyLayout)
         return QuantizedTensor(
             torch.zeros(8, 16, dtype=torch.uint8),
             "Dummy",
