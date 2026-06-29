@@ -276,6 +276,47 @@ class TestTensorWiseINT8Layout:
         assert dq.dtype == torch.float32
         assert dq.shape == x.shape
 
+    @pytest.mark.parametrize("backend", get_capable_backends("dequantize_int8_simple", "cuda"))
+    def test_dequantize_simple_backend_correctness(self, seed, backend):
+        """CUDA INT8 dequantize matches eager for scalar and rowwise scales."""
+        import comfy_kitchen as ck
+
+        x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
+        q_scalar, scale_scalar = ck.quantize_int8_tensorwise(x)
+        q_row, scale_row = ck.quantize_int8_rowwise(x)
+
+        with ck.registry.use_backend("eager"):
+            ref_scalar = ck.dequantize_int8_simple(q_scalar, scale_scalar)
+            ref_row = ck.dequantize_int8_simple(q_row, scale_row)
+
+        with ck.registry.use_backend(backend):
+            out_scalar = ck.dequantize_int8_simple(q_scalar, scale_scalar)
+            out_row = ck.dequantize_int8_simple(q_row, scale_row)
+
+        assert_values_close(out_scalar, ref_scalar, rtol=0, atol=0, name=f"dequant_scalar_{backend}")
+        assert_values_close(out_row, ref_row, rtol=0, atol=0, name=f"dequant_rowwise_{backend}")
+
+    def test_dequantize_direct_output_dtype_matches_final_cast(self, seed):
+        """Direct fp16/bf16 dequant output matches the prior float32-then-cast behavior."""
+        import comfy_kitchen as ck
+
+        x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+
+        with ck.registry.use_backend("cuda"):
+            q_row, scale_row = ck.quantize_int8_rowwise(x)
+            ref_row = torch.ops.comfy_kitchen.dequantize_int8_simple(q_row, scale_row)
+            q_conv, scale_conv = torch.ops.comfy_kitchen.quantize_int8_convrot_weight(x, 256)
+            ref_conv = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight(q_conv, scale_conv, 256)
+
+            for dtype, code in ((torch.float16, 1), (torch.bfloat16, 2)):
+                out_row = torch.ops.comfy_kitchen.dequantize_int8_simple_dtype(q_row, scale_row, code)
+                out_conv = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight_dtype(q_conv, scale_conv, 256, code)
+
+                assert out_row.dtype == dtype
+                assert out_conv.dtype == dtype
+                assert torch.equal(out_row, ref_row.to(dtype))
+                assert torch.equal(out_conv, ref_conv.to(dtype))
+
     def test_public_api_int8_linear(self, seed):
         """comfy_kitchen.int8_linear op is reachable."""
         import comfy_kitchen as ck
@@ -292,7 +333,7 @@ class TestTensorWiseINT8Layout:
 
     def test_convrot_hadamard_properties(self):
         """Verify _build_hadamard constructs correct orthogonal, symmetric matrix."""
-        from comfy_kitchen.tensor.int8 import _build_hadamard
+        from comfy_kitchen.tensor.int8_utils import _build_hadamard
 
         # Test valid sizes
         for size in [4, 16, 64, 256]:
@@ -341,6 +382,39 @@ class TestTensorWiseINT8Layout:
         assert dq.shape == w.shape
 
         # Roundtrip error should stay within expected INT8 quantization limits
+        rel_err = (w.float() - dq.float()).abs() / (w.float().abs().max() + 1e-8)
+        assert rel_err.mean().item() < 0.02
+
+    def test_convrot_weight_quantize_cuda_roundtrip(self, seed):
+        """CUDA ConvRot weight quantization preserves the weight after inverse rotation."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+        from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_weight
+
+        w = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        h = _build_hadamard(256, device=w.device, dtype=w.dtype)
+
+        with torch.cuda.device(w.device):
+            q_cuda, scale_cuda = cuda_backend.quantize_int8_convrot_weight(w, 256)
+
+        dq_rotated = q_cuda.float() * scale_cuda
+        dq = _rotate_weight(dq_rotated, h.to(dtype=torch.float32), 256).to(w.dtype)
+
+        rel_err = (w.float() - dq.float()).abs() / (w.float().abs().max() + 1e-8)
+        assert rel_err.mean().item() < 0.02
+
+    def test_convrot_weight_dequantize_torch_op_roundtrip(self, seed):
+        """The ConvRot dequant torch op preserves weights within INT8 tolerance."""
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        w = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(
+            w, "TensorWiseINT8Layout", per_channel=True, convrot=True, convrot_groupsize=256
+        )
+
+        dq = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight(
+            qt._qdata, qt._params.scale, qt._params.convrot_groupsize
+        ).to(w.dtype)
+
         rel_err = (w.float() - dq.float()).abs() / (w.float().abs().max() + 1e-8)
         assert rel_err.mean().item() < 0.02
 

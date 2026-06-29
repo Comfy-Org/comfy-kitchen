@@ -18,11 +18,16 @@ from .base import (
     QuantizedLayout,
     QuantizedTensor,
     dequantize_args,
+    get_cuda_capability,
     register_layout_op,
 )
-from .int8_utils import _build_hadamard, _rotate_weight
-
 logger = logging.getLogger(__name__)
+
+_INT8_DEQUANT_DTYPE_TO_CODE = {
+    torch.float32: 0,
+    torch.float16: 1,
+    torch.bfloat16: 2,
+}
 
 
 def _dtype_code(dtype: torch.dtype) -> int:
@@ -100,26 +105,29 @@ class TensorWiseINT8Layout(QuantizedLayout):
         orig_dtype = tensor.dtype
         orig_shape = tuple(tensor.shape)
 
+        qdata = None
+        scale = None
+
         if convrot:
             if not is_weight:
                 raise ValueError("convrot is only supported when is_weight is True")
             if not per_channel:
                 raise ValueError("convrot is only supported when per_channel is True")
 
-            h = _build_hadamard(convrot_groupsize, device=tensor.device, dtype=tensor.dtype)
-            tensor = _rotate_weight(tensor, h, convrot_groupsize)
+            qdata, scale = torch.ops.comfy_kitchen.quantize_int8_convrot_weight(tensor, convrot_groupsize)
 
-        if is_weight:
-            if per_channel:
-                qdata, scale = torch.ops.comfy_kitchen.quantize_int8_rowwise(tensor)
+        if qdata is None:
+            if is_weight:
+                if per_channel:
+                    qdata, scale = torch.ops.comfy_kitchen.quantize_int8_rowwise(tensor)
+                else:
+                    # Tensorwise: single absmax scale — no triton kernel, eager fast enough.
+                    abs_max = tensor.abs().max()
+                    scale = (abs_max.float() / 127.0).clamp(min=1e-30)
+                    qdata = (tensor.float() / scale).round().clamp(-128.0, 127.0).to(torch.int8)
             else:
-                # Tensorwise: single absmax scale — no triton kernel, eager fast enough.
-                abs_max = tensor.abs().max()
-                scale = (abs_max.float() / 127.0).clamp(min=1e-30)
-                qdata = (tensor.float() / scale).round().clamp(-128.0, 127.0).to(torch.int8)
-        else:
-            # Rowwise: route through registry (triton -> eager).
-            qdata, scale = torch.ops.comfy_kitchen.quantize_int8_rowwise(tensor)
+                # Rowwise: route through registry (triton -> eager).
+                qdata, scale = torch.ops.comfy_kitchen.quantize_int8_rowwise(tensor)
 
         params = cls.Params(
             scale=scale,
@@ -142,10 +150,13 @@ class TensorWiseINT8Layout(QuantizedLayout):
         Returns:
             Dequantized tensor.
         """
-        result = qdata.float() * params.scale
+        output_dtype_code = _INT8_DEQUANT_DTYPE_TO_CODE.get(params.orig_dtype, 0)
         if getattr(params, "convrot", False):
-            h = _build_hadamard(params.convrot_groupsize, device=qdata.device, dtype=result.dtype)
-            result = _rotate_weight(result, h, params.convrot_groupsize)
+            result = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight_dtype(
+                qdata, params.scale, params.convrot_groupsize, output_dtype_code
+            )
+        else:
+            result = torch.ops.comfy_kitchen.dequantize_int8_simple_dtype(qdata, params.scale, output_dtype_code)
         return result.to(params.orig_dtype)
 
     @classmethod
@@ -192,10 +203,10 @@ class TensorWiseINT8Layout(QuantizedLayout):
     @classmethod
     def supports_fast_matmul(cls) -> bool:
         """Check if fast INT8 matmul is available."""
-        if not torch.cuda.is_available():
+        capability = get_cuda_capability()
+        if capability is None:
             return False
-        sm_major, sm_minor = torch.cuda.get_device_capability()
-        return (sm_major, sm_minor) >= cls.MIN_SM_VERSION
+        return capability >= cls.MIN_SM_VERSION
 
 
 # =============================================================================

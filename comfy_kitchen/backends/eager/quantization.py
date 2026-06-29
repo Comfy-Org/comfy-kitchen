@@ -23,7 +23,7 @@ from comfy_kitchen.float_utils import (
 )
 from comfy_kitchen.registry import registry
 from comfy_kitchen.scaled_mm_v2 import ScalingType, SwizzleType, scaled_mm_v2
-from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
+from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation, _rotate_weight
 
 # =============================================================================
 # Dtype Code Mappings (shared between custom ops and backends)
@@ -848,6 +848,26 @@ def quantize_and_rotate_rowwise(x: torch.Tensor, h: torch.Tensor, group_size: in
     return quantize_int8_rowwise(x_rot)
 
 
+def quantize_int8_convrot_weight(weight: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Offline ConvRot weight rotation followed by row-wise INT8 quantization."""
+    h = _build_hadamard(group_size, device=weight.device, dtype=weight.dtype)
+    weight_rot = _rotate_weight(weight, h, group_size)
+    return quantize_int8_rowwise(weight_rot)
+
+
+def dequantize_int8_convrot_weight(q: torch.Tensor, scale: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Dequantize INT8 ConvRot weights and rotate them back to the original basis."""
+    h = _build_hadamard(group_size, device=q.device, dtype=torch.float32)
+    return _rotate_weight(dequantize_int8_simple(q, scale), h, group_size)
+
+
+def dequantize_int8_convrot_weight_dtype(
+    q: torch.Tensor, scale: torch.Tensor, group_size: int, output_dtype_code: int
+) -> torch.Tensor:
+    """Dequantize INT8 ConvRot weights into a requested floating dtype."""
+    return dequantize_int8_convrot_weight(q, scale, group_size).to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
+
+
 def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Dequantize INT8 tensor with scale.
 
@@ -859,6 +879,11 @@ def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
         Dequantized float tensor.
     """
     return q.float() * scale
+
+
+def dequantize_int8_simple_dtype(q: torch.Tensor, scale: torch.Tensor, output_dtype_code: int) -> torch.Tensor:
+    """Dequantize INT8 tensor with scale into a requested floating dtype."""
+    return dequantize_int8_simple(q, scale).to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
 
 
 def int8_linear(
@@ -984,6 +1009,56 @@ def _op_quantize_int8_rowwise_fake(x):
     return q, scale
 
 
+@torch.library.custom_op("comfy_kitchen::quantize_int8_convrot_weight", mutates_args=())
+def _op_quantize_int8_convrot_weight(
+    weight: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kwargs = {"weight": weight, "group_size": group_size}
+    impl = registry.get_implementation("quantize_int8_convrot_weight", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_int8_convrot_weight.register_fake
+def _op_quantize_int8_convrot_weight_fake(weight, group_size):
+    q = torch.empty_like(weight, dtype=torch.int8)
+    scale = torch.empty(*weight.shape[:-1], 1, dtype=torch.float32, device=weight.device)
+    return q, scale
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int8_convrot_weight", mutates_args=())
+def _op_dequantize_int8_convrot_weight(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    kwargs = {"q": q, "scale": scale, "group_size": group_size}
+    impl = registry.get_implementation("dequantize_int8_convrot_weight", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_int8_convrot_weight.register_fake
+def _op_dequantize_int8_convrot_weight_fake(q, scale, group_size):
+    return torch.empty_like(q, dtype=torch.float32)
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int8_convrot_weight_dtype", mutates_args=())
+def _op_dequantize_int8_convrot_weight_dtype(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    kwargs = {"q": q, "scale": scale, "group_size": group_size, "output_dtype_code": output_dtype_code}
+    impl = registry.get_implementation("dequantize_int8_convrot_weight_dtype", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_int8_convrot_weight_dtype.register_fake
+def _op_dequantize_int8_convrot_weight_dtype_fake(q, scale, group_size, output_dtype_code):
+    return torch.empty_like(q, dtype=DTYPE_CODE_TO_DTYPE[output_dtype_code])
+
+
 @torch.library.custom_op("comfy_kitchen::dequantize_int8_simple", mutates_args=())
 def _op_dequantize_int8_simple(
     q: torch.Tensor,
@@ -997,6 +1072,22 @@ def _op_dequantize_int8_simple(
 @_op_dequantize_int8_simple.register_fake
 def _op_dequantize_int8_simple_fake(q, scale):
     return torch.empty_like(q, dtype=torch.float32)
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int8_simple_dtype", mutates_args=())
+def _op_dequantize_int8_simple_dtype(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    kwargs = {"q": q, "scale": scale, "output_dtype_code": output_dtype_code}
+    impl = registry.get_implementation("dequantize_int8_simple_dtype", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_int8_simple_dtype.register_fake
+def _op_dequantize_int8_simple_dtype_fake(q, scale, output_dtype_code):
+    return torch.empty_like(q, dtype=DTYPE_CODE_TO_DTYPE[output_dtype_code])
 
 
 @torch.library.custom_op("comfy_kitchen::int8_linear", mutates_args=())
