@@ -743,11 +743,11 @@ extern "C" {
         const void* input,
         void* output,
         void* scales,
-        const void* rng,
         int64_t num_rows,
         int64_t num_cols,
         int input_dtype_code,
         bool stochastic,
+        uint64_t seed,
         cudaStream_t stream);
 
     bool launch_cutlass_int8_dequant(
@@ -767,12 +767,12 @@ extern "C" {
         const void* input,
         void* output,
         void* scales,
-        const void* rng,
         int64_t num_rows,
         int64_t num_cols,
         int group_size,
         int input_dtype_code,
         bool stochastic,
+        uint64_t seed,
         cudaStream_t stream);
 
     void launch_rotate_int8_convrot_weight_kernel(
@@ -791,25 +791,25 @@ extern "C" {
         void* partial_absmax,
         void* output,
         void* scales,
-        const void* rng,
         int64_t num_rows,
         int64_t num_cols,
         int group_size,
         int input_dtype_code,
         int rotated_dtype_code,
         bool stochastic,
+        uint64_t seed,
         cudaStream_t stream);
 
     void launch_quantize_int8_rowwise_convrot64_kernel(
         const void* input,
         void* output,
         void* scales,
-        const void* rng,
         int64_t num_rows,
         int64_t num_cols,
         int group_size,
         int input_dtype_code,
         bool stochastic,
+        uint64_t seed,
         cudaStream_t stream);
 
     void launch_dequantize_int8_linear_kernel(
@@ -907,8 +907,8 @@ void quantize_int8_rowwise(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
     nb::ndarray<float, nb::ndim<2>, nb::device::cuda> scales,
-    nb::ndarray<nb::device::cuda> rng,
     bool stochastic,
+    uint64_t seed,
     uintptr_t stream_ptr) {
 
     const int64_t M = input.shape(0);
@@ -924,22 +924,17 @@ void quantize_int8_rowwise(
     if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error("Unsupported input dtype for INT8 rowwise quantization");
     }
-    if (stochastic) {
-        if (map_dtype_to_code(rng.dtype()) != input_dtype_code || rng.size() != output.size()) {
-            throw std::runtime_error("INT8 rowwise quantization RNG shape or dtype mismatch");
-        }
-    }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_int8_rowwise_kernel(
         input.data(),
         output.data(),
         scales.data(),
-        rng.data(),
         M,
         K,
         input_dtype_code,
         stochastic,
+        seed,
         stream);
 }
 
@@ -969,9 +964,9 @@ void quantize_int8_rowwise_convrot(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
     nb::ndarray<float, nb::ndim<2>, nb::device::cuda> scales,
-    nb::ndarray<nb::device::cuda> rng,
     int64_t group_size,
     bool stochastic,
+    uint64_t seed,
     uintptr_t stream_ptr) {
 
     const int64_t M = input.shape(0);
@@ -987,23 +982,18 @@ void quantize_int8_rowwise_convrot(
     if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error("Unsupported input dtype for INT8 rowwise convrot quantization");
     }
-    if (stochastic) {
-        if (map_dtype_to_code(rng.dtype()) != input_dtype_code || rng.size() != output.size()) {
-            throw std::runtime_error("INT8 rowwise convrot RNG shape or dtype mismatch");
-        }
-    }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_int8_rowwise_convrot_kernel(
         input.data(),
         output.data(),
         scales.data(),
-        rng.data(),
         M,
         K,
         static_cast<int>(group_size),
         input_dtype_code,
         stochastic,
+        seed,
         stream);
 }
 
@@ -1043,9 +1033,9 @@ void quantize_int8_convrot_staged(
     nb::ndarray<float, nb::ndim<2>, nb::device::cuda> partial_absmax,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
     nb::ndarray<float, nb::ndim<2>, nb::device::cuda> scales,
-    nb::ndarray<nb::device::cuda> rng,
     int64_t group_size,
     bool stochastic,
+    uint64_t seed,
     uintptr_t stream_ptr) {
 
     const int64_t M = input.shape(0);
@@ -1068,11 +1058,6 @@ void quantize_int8_convrot_staged(
     if (input_dtype_code < 0 || input_dtype_code > 2 || rotated_dtype_code < 0 || rotated_dtype_code > 2) {
         throw std::runtime_error("Unsupported dtype for ConvRot staged quantization");
     }
-    if (stochastic) {
-        if (map_dtype_to_code(rng.dtype()) != rotated_dtype_code || rng.size() != output.size()) {
-            throw std::runtime_error("ConvRot staged RNG shape or dtype mismatch");
-        }
-    }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_int8_convrot_staged_kernel(
@@ -1081,13 +1066,13 @@ void quantize_int8_convrot_staged(
         partial_absmax.data(),
         output.data(),
         scales.data(),
-        rng.data(),
         M,
         K,
         static_cast<int>(group_size),
         input_dtype_code,
         rotated_dtype_code,
         stochastic,
+        seed,
         stream);
 }
 
@@ -1095,9 +1080,9 @@ void quantize_int8_rowwise_convrot64(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
     nb::ndarray<float, nb::ndim<2>, nb::device::cuda> scales,
-    nb::ndarray<nb::device::cuda> rng,
     int64_t group_size,
     bool stochastic,
+    uint64_t seed,
     uintptr_t stream_ptr) {
 
     const int64_t M = input.shape(0);
@@ -1113,23 +1098,18 @@ void quantize_int8_rowwise_convrot64(
     if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error("Unsupported input dtype for INT8 rowwise convrot64 quantization");
     }
-    if (stochastic) {
-        if (map_dtype_to_code(rng.dtype()) != input_dtype_code || rng.size() != output.size()) {
-            throw std::runtime_error("INT8 rowwise convrot64 RNG shape or dtype mismatch");
-        }
-    }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_int8_rowwise_convrot64_kernel(
         input.data(),
         output.data(),
         scales.data(),
-        rng.data(),
         M,
         K,
         static_cast<int>(group_size),
         input_dtype_code,
         stochastic,
+        seed,
         stream);
 }
 
@@ -1302,23 +1282,23 @@ void int8_linear_m1(
             input.data(),
             q_scratch.data(),
             x_scales.data(),
-            nullptr,
             M,
             K,
             group_size,
             input_dtype_code,
             false,
+            0,
             stream);
     } else {
         launch_quantize_int8_rowwise_kernel(
             input.data(),
             q_scratch.data(),
             x_scales.data(),
-            nullptr,
             M,
             K,
             input_dtype_code,
             false,
+            0,
             stream);
     }
     launch_int8_gemv_dequant_kernel(
@@ -1465,8 +1445,8 @@ NB_MODULE(_C, m) {
           nb::arg("input"),
           nb::arg("output"),
           nb::arg("scales"),
-          nb::arg("rng"),
           nb::arg("stochastic"),
+          nb::arg("seed"),
           nb::arg("stream_ptr"));
 
     m.def("cutlass_int8_dequant", &cutlass_int8_dequant,
@@ -1485,9 +1465,9 @@ NB_MODULE(_C, m) {
           nb::arg("input"),
           nb::arg("output"),
           nb::arg("scales"),
-          nb::arg("rng"),
           nb::arg("group_size"),
           nb::arg("stochastic"),
+          nb::arg("seed"),
           nb::arg("stream_ptr"));
 
     m.def("rotate_int8_convrot_weight", &rotate_int8_convrot_weight,
@@ -1504,9 +1484,9 @@ NB_MODULE(_C, m) {
           nb::arg("partial_absmax"),
           nb::arg("output"),
           nb::arg("scales"),
-          nb::arg("rng"),
           nb::arg("group_size"),
           nb::arg("stochastic"),
+          nb::arg("seed"),
           nb::arg("stream_ptr"));
 
     m.def("quantize_int8_rowwise_convrot64", &quantize_int8_rowwise_convrot64,
@@ -1514,9 +1494,9 @@ NB_MODULE(_C, m) {
           nb::arg("input"),
           nb::arg("output"),
           nb::arg("scales"),
-          nb::arg("rng"),
           nb::arg("group_size"),
           nb::arg("stochastic"),
+          nb::arg("seed"),
           nb::arg("stream_ptr"));
 
     m.def("dequantize_int8_linear", &dequantize_int8_linear,

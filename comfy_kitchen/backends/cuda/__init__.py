@@ -490,19 +490,6 @@ def dequantize_nvfp4(
     return output
 
 
-def _int8_rng(
-    shape: torch.Size | tuple[int, ...],
-    device: torch.device,
-    dtype: torch.dtype,
-    seed: int | None,
-) -> torch.Tensor:
-    if seed is None or seed <= 0:
-        return torch.empty((0,), dtype=dtype, device=device)
-    generator = torch.Generator(device=device)
-    generator.manual_seed(seed)
-    return torch.rand(shape, dtype=dtype, device=device, generator=generator)
-
-
 def quantize_int8_rowwise(
     x: torch.Tensor,
     stochastic_rounding: int | None = 0,
@@ -512,15 +499,14 @@ def quantize_int8_rowwise(
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     q_2d = torch.empty_like(x_2d, dtype=torch.int8)
     scales_2d = torch.empty((x_2d.shape[0], 1), dtype=torch.float32, device=x.device)
-    rng = _int8_rng(q_2d.shape, x.device, x_2d.dtype, stochastic_rounding)
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
 
     _C.quantize_int8_rowwise(
         _wrap_for_dlpack(x_2d),
         _wrap_for_dlpack(q_2d),
         _wrap_for_dlpack(scales_2d),
-        _wrap_for_dlpack(rng),
         stochastic_rounding is not None and stochastic_rounding > 0,
+        int(stochastic_rounding or 0),
         stream_ptr,
     )
 
@@ -539,16 +525,15 @@ def quantize_int8_rowwise_convrot(
     """
     q_2d = torch.empty_like(x_2d, dtype=torch.int8)
     scales_2d = torch.empty((x_2d.shape[0], 1), dtype=torch.float32, device=x_2d.device)
-    rng = _int8_rng(q_2d.shape, x_2d.device, x_2d.dtype, stochastic_rounding)
     stream_ptr = torch.cuda.current_stream(x_2d.device).cuda_stream
 
     _C.quantize_int8_rowwise_convrot(
         _wrap_for_dlpack(x_2d),
         _wrap_for_dlpack(q_2d),
         _wrap_for_dlpack(scales_2d),
-        _wrap_for_dlpack(rng),
         group_size,
         stochastic_rounding is not None and stochastic_rounding > 0,
+        int(stochastic_rounding or 0),
         stream_ptr,
     )
 
@@ -579,7 +564,6 @@ def quantize_int8_convrot_staged(
     partial_absmax = torch.empty((weight_2d.shape[0], n_groups), dtype=torch.float32, device=weight_2d.device)
     q_2d = torch.empty_like(weight_2d, dtype=torch.int8)
     scales_2d = torch.empty((weight_2d.shape[0], 1), dtype=torch.float32, device=weight_2d.device)
-    rng = _int8_rng(q_2d.shape, weight_2d.device, rotated.dtype, stochastic_rounding)
     stream_ptr = torch.cuda.current_stream(weight_2d.device).cuda_stream
     _C.quantize_int8_convrot_staged(
         _wrap_for_dlpack(weight_2d),
@@ -587,9 +571,9 @@ def quantize_int8_convrot_staged(
         _wrap_for_dlpack(partial_absmax),
         _wrap_for_dlpack(q_2d),
         _wrap_for_dlpack(scales_2d),
-        _wrap_for_dlpack(rng),
         group_size,
         stochastic_rounding is not None and stochastic_rounding > 0,
+        int(stochastic_rounding or 0),
         stream_ptr,
     )
     return q_2d, scales_2d
@@ -603,15 +587,14 @@ def quantize_int8_rowwise_convrot64(
     """Fused ConvRot row-wise INT8 quantization using 64-lane groups."""
     q_2d = torch.empty_like(weight_2d, dtype=torch.int8)
     scales_2d = torch.empty((weight_2d.shape[0], 1), dtype=torch.float32, device=weight_2d.device)
-    rng = _int8_rng(q_2d.shape, weight_2d.device, weight_2d.dtype, stochastic_rounding)
     stream_ptr = torch.cuda.current_stream(weight_2d.device).cuda_stream
     _C.quantize_int8_rowwise_convrot64(
         _wrap_for_dlpack(weight_2d),
         _wrap_for_dlpack(q_2d),
         _wrap_for_dlpack(scales_2d),
-        _wrap_for_dlpack(rng),
         group_size,
         stochastic_rounding is not None and stochastic_rounding > 0,
+        int(stochastic_rounding or 0),
         stream_ptr,
     )
     return q_2d, scales_2d
@@ -1027,9 +1010,9 @@ def int8_linear(
                 _wrap_for_dlpack(x_2d),
                 _wrap_for_dlpack(q_scratch),
                 _wrap_for_dlpack(scale_scratch),
-                _wrap_for_dlpack(_int8_rng((0,), x.device, x_2d.dtype, 0)),
                 convrot_groupsize,
                 False,
+                0,
                 stream_ptr,
             )
             x_qdata, x_scale = q_scratch, scale_scratch
@@ -1046,8 +1029,8 @@ def int8_linear(
             _wrap_for_dlpack(x_2d),
             _wrap_for_dlpack(q_scratch),
             _wrap_for_dlpack(scale_scratch),
-            _wrap_for_dlpack(_int8_rng((0,), x.device, x_2d.dtype, 0)),
             False,
+            0,
             stream_ptr,
         )
         x_qdata, x_scale = q_scratch, scale_scratch

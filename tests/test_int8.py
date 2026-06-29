@@ -86,21 +86,25 @@ def test_eager_int8_stochastic_rounding_tensorwise(seed):
     assert 0.45 < q1.float().mean().item() < 0.55
 
 
-def test_cuda_int8_stochastic_rounding_matches_eager(seed):
-    """CUDA stochastic INT8 kernel matches eager for the same seeded RNG."""
+def test_cuda_int8_stochastic_rounding_seeded(seed):
+    """CUDA stochastic INT8 rounding is seeded and unbiased."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
-    x = torch.randn(1024, device="cuda", dtype=torch.float16)
-
-    with ck.registry.use_backend("eager"):
-        ref, ref_scale = ck.quantize_int8_rowwise(x, stochastic_rounding=123)
+    x = torch.full((4096,), 0.5, device="cuda", dtype=torch.float16)
+    x[0] = 127.0
 
     with ck.registry.use_backend("cuda"):
-        out, out_scale = ck.quantize_int8_rowwise(x, stochastic_rounding=123)
+        q1, scale1 = ck.quantize_int8_rowwise(x, stochastic_rounding=123)
+        q2, scale2 = ck.quantize_int8_rowwise(x, stochastic_rounding=123)
+        q3, scale3 = ck.quantize_int8_rowwise(x, stochastic_rounding=124)
 
-    assert torch.equal(out, ref)
-    assert torch.equal(out_scale, ref_scale)
+    assert torch.equal(q1, q2)
+    assert not torch.equal(q1, q3)
+    assert torch.equal(scale1, scale2)
+    assert torch.equal(scale1, scale3)
+    assert scale1.item() == 1.0
+    assert 0.45 < q1[1:].float().mean().item() < 0.55
 
 
 def test_eager_int8_stochastic_rounding_convrot(seed):
