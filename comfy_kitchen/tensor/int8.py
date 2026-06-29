@@ -21,6 +21,7 @@ from .base import (
     get_cuda_capability,
     register_layout_op,
 )
+
 logger = logging.getLogger(__name__)
 
 _INT8_DEQUANT_DTYPE_TO_CODE = {

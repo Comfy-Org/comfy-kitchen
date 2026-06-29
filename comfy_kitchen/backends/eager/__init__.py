@@ -39,10 +39,10 @@ from comfy_kitchen.registry import registry
 from .adaln import adaln
 from .awq import gemv_awq_w4a16
 from .quantization import (
-    dequantize_int8_simple,
-    dequantize_int8_simple_dtype,
     dequantize_int8_convrot_weight,
     dequantize_int8_convrot_weight_dtype,
+    dequantize_int8_simple,
+    dequantize_int8_simple_dtype,
     dequantize_mxfp8,
     dequantize_nvfp4,
     dequantize_per_tensor_fp8,

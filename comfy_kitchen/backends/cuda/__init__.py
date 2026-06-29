@@ -136,7 +136,11 @@ from comfy_kitchen.constraints import (  # noqa: E402
 )
 from comfy_kitchen.float_utils import roundup  # noqa: E402
 from comfy_kitchen.registry import registry  # noqa: E402
-from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation, _rotate_weight  # noqa: E402
+from comfy_kitchen.tensor.int8_utils import (  # noqa: E402
+    _build_hadamard,
+    _rotate_activation,
+    _rotate_weight,
+)
 
 _CUBLASLT_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUBLASLT", False)
 _cublas_workspaces: dict[int, torch.Tensor] = {}
@@ -226,11 +230,9 @@ def _should_use_convrot_fused_kernel(x: torch.Tensor, k: int, group_size: int) -
 
 
 def _should_use_convrot_dequant_kernel(x: torch.Tensor, k: int, group_size: int) -> bool:
-    if group_size != 256 or k % 256 != 0 or k > _CONVROT_FUSED_MAX_K:
-        return False
     # Dequant rotates each 256-wide group independently, so it does not need the
     # whole row staged in shared memory like ConvRot quantization does.
-    return True
+    return group_size == 256 and k % 256 == 0 and k <= _CONVROT_FUSED_MAX_K
 
 
 def get_cublas_workspace_size_bytes() -> int:
