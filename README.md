@@ -29,11 +29,11 @@ The library provides `QuantizedTensor`, a `torch.Tensor` subclass that transpare
 | `TensorCoreMXFP8Layout`| MXFP8 E4M3   | SM ≥ 10.0 (Blackwell) | Block quantization with 32-element blocks, E8M0 scales |
 
 ```python
-from comfy_kitchen.tensor import QuantizedTensor, TensorCoreFP8Layout, TensorCoreNVFP4Layout
+from comfy_kitchen.tensor import QuantizedTensor
 
 # Quantize a tensor
 x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
-qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
 
 # Operations dispatch to optimized kernels automatically
 output = torch.nn.functional.linear(qt, weight_qt)
