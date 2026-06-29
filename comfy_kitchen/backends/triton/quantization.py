@@ -773,6 +773,7 @@ def _quantize_rowwise_kernel(
     s_ptr,      # Scale pointer (FP32)
     n_elements, # Number of columns
     block_size: tl.constexpr,
+    input_dtype_code: tl.constexpr,
 ):
     # Row index we are processing
     row_idx = tl.program_id(0)
@@ -798,10 +799,15 @@ def _quantize_rowwise_kernel(
     scale = tl.maximum(max_val / 127.0, 1e-30)
 
     # 3. Quantize
-    q_f = x / scale
+    if input_dtype_code == 1:
+        q_f = (x / scale.to(tl.float16)).to(tl.float16)
+    elif input_dtype_code == 2:
+        q_f = (x / scale.to(tl.bfloat16)).to(tl.bfloat16)
+    else:
+        q_f = x / scale
 
     # Round and Clamp
-    q_i = libdevice.rint(q_f).to(tl.int32)
+    q_i = libdevice.rint(q_f.to(tl.float32)).to(tl.int32)
     q_i = tl.clamp(q_i, -128.0, 127.0)
 
     # 4. Store
@@ -817,13 +823,22 @@ def triton_quantize_rowwise(x: torch.Tensor):
     y = torch.empty_like(x, dtype=torch.int8)
     s = torch.empty((rows, 1), device=x.device, dtype=torch.float32)
 
+    input_dtype_code = 1 if x.dtype == torch.float16 else 2 if x.dtype == torch.bfloat16 else 0
+
     # Heuristic for block size
     block_size = triton.next_power_of_2(cols)
     if block_size < 128:
         block_size = 128
 
     grid = (rows,)
-    _quantize_rowwise_kernel[grid](x, y, s, cols, block_size=block_size)
+    _quantize_rowwise_kernel[grid](
+        x,
+        y,
+        s,
+        cols,
+        block_size=block_size,
+        input_dtype_code=input_dtype_code,
+    )
     return y, s
 
 

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 import torch
 
+from comfy_kitchen.registry import registry
+
 from .base import (
     BaseLayoutParams,
     QuantizedLayout,
@@ -84,6 +86,9 @@ class TensorWiseINT8Layout(QuantizedLayout):
     def quantize(
         cls,
         tensor: torch.Tensor,
+        scale: torch.Tensor | float | str | None = None,
+        stochastic_rounding: int | None = 0,
+        inplace_ops: bool = False,
         is_weight: bool = True,
         per_channel: bool = False,
         convrot: bool = False,
@@ -94,6 +99,9 @@ class TensorWiseINT8Layout(QuantizedLayout):
 
         Args:
             tensor: Input tensor to quantize.
+            scale: Optional tensorwise scale. "recalculate" recomputes from tensor absmax.
+            stochastic_rounding: Seed for stochastic rounding. Disabled when <= 0.
+            inplace_ops: Kept for ComfyUI compatibility. INT8 quantization does not mutate input.
             is_weight: If True, use tensorwise or per-channel scale. If False, use per-row.
             per_channel: If True and is_weight, use per-channel (row-wise) scaling.
             convrot: If True, apply orthogonal group-wise Hadamard rotation to weight.
@@ -106,32 +114,40 @@ class TensorWiseINT8Layout(QuantizedLayout):
         orig_dtype = tensor.dtype
         orig_shape = tuple(tensor.shape)
 
-        qdata = None
-        scale = None
-
         if convrot:
             if not is_weight:
                 raise ValueError("convrot is only supported when is_weight is True")
             if not per_channel:
                 raise ValueError("convrot is only supported when per_channel is True")
 
-            qdata, scale = torch.ops.comfy_kitchen.quantize_int8_convrot_weight(tensor, convrot_groupsize)
-
-        if qdata is None:
-            if is_weight:
-                if per_channel:
-                    qdata, scale = torch.ops.comfy_kitchen.quantize_int8_rowwise(tensor)
-                else:
-                    # Tensorwise: single absmax scale — no triton kernel, eager fast enough.
-                    abs_max = tensor.abs().max()
-                    scale = (abs_max.float() / 127.0).clamp(min=1e-30)
-                    qdata = (tensor.float() / scale).round().clamp(-128.0, 127.0).to(torch.int8)
+        if convrot:
+            impl = registry.get_implementation(
+                "quantize_int8_convrot_weight",
+                kwargs={"weight": tensor, "group_size": convrot_groupsize, "stochastic_rounding": stochastic_rounding},
+            )
+            qdata, qscale = impl(tensor, convrot_groupsize, stochastic_rounding=stochastic_rounding)
+        elif is_weight:
+            if per_channel:
+                impl = registry.get_implementation(
+                    "quantize_int8_rowwise",
+                    kwargs={"x": tensor, "stochastic_rounding": stochastic_rounding},
+                )
+                qdata, qscale = impl(tensor, stochastic_rounding=stochastic_rounding)
             else:
-                # Rowwise: route through registry (triton -> eager).
-                qdata, scale = torch.ops.comfy_kitchen.quantize_int8_rowwise(tensor)
+                impl = registry.get_implementation(
+                    "quantize_int8_tensorwise",
+                    kwargs={"x": tensor, "scale": scale, "stochastic_rounding": stochastic_rounding},
+                )
+                qdata, qscale = impl(tensor, scale=scale, stochastic_rounding=stochastic_rounding)
+        else:
+            impl = registry.get_implementation(
+                "quantize_int8_rowwise",
+                kwargs={"x": tensor, "stochastic_rounding": stochastic_rounding},
+            )
+            qdata, qscale = impl(tensor, stochastic_rounding=stochastic_rounding)
 
         params = cls.Params(
-            scale=scale,
+            scale=qscale,
             orig_dtype=orig_dtype,
             orig_shape=orig_shape,
             is_weight=is_weight,

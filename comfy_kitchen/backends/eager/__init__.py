@@ -65,6 +65,7 @@ from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
 def _build_constraints() -> dict:
     all_devices = frozenset({"cpu", "cuda", "mps", "xpu", "hpu", "meta", "*"})
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
+    scale_values = frozenset({torch.float32, torch.float16, torch.bfloat16, float, str})
 
     out = {
         "adaln": FunctionConstraints(
@@ -227,12 +228,15 @@ def _build_constraints() -> dict:
     out["quantize_int8_tensorwise"] = FunctionConstraints(
         params={
             "x": ParamConstraint(dtypes=standard_floats),
+            "scale": ParamConstraint(dtypes=scale_values),
+            "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
         },
         default_devices=all_devices,
     )
     out["quantize_int8_rowwise"] = FunctionConstraints(
         params={
             "x": ParamConstraint(dtypes=standard_floats),
+            "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
         },
         default_devices=all_devices,
     )
@@ -241,6 +245,7 @@ def _build_constraints() -> dict:
             "x": ParamConstraint(dtypes=standard_floats),
             "H": ParamConstraint(dtypes=standard_floats),
             "group_size": ParamConstraint(dtypes=frozenset({int})),
+            "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
         },
         default_devices=all_devices,
     )
@@ -248,6 +253,7 @@ def _build_constraints() -> dict:
         params={
             "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
             "group_size": ParamConstraint(dtypes=frozenset({int})),
+            "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
         },
         default_devices=all_devices,
     )

@@ -490,25 +490,48 @@ def dequantize_nvfp4(
     return output
 
 
-def quantize_int8_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _int8_rng(
+    shape: torch.Size | tuple[int, ...],
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int | None,
+) -> torch.Tensor:
+    if seed is None or seed <= 0:
+        return torch.empty((0,), dtype=dtype, device=device)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    return torch.rand(shape, dtype=dtype, device=device, generator=generator)
+
+
+def quantize_int8_rowwise(
+    x: torch.Tensor,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize tensor to INT8 with per-row scales (for activations)."""
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     q_2d = torch.empty_like(x_2d, dtype=torch.int8)
     scales_2d = torch.empty((x_2d.shape[0], 1), dtype=torch.float32, device=x.device)
+    rng = _int8_rng(q_2d.shape, x.device, x_2d.dtype, stochastic_rounding)
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
 
     _C.quantize_int8_rowwise(
         _wrap_for_dlpack(x_2d),
         _wrap_for_dlpack(q_2d),
         _wrap_for_dlpack(scales_2d),
+        _wrap_for_dlpack(rng),
+        stochastic_rounding is not None and stochastic_rounding > 0,
         stream_ptr,
     )
 
     return q_2d.reshape(orig_shape), scales_2d.reshape(*orig_shape[:-1], 1)
 
 
-def quantize_int8_rowwise_convrot(x_2d: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_int8_rowwise_convrot(
+    x_2d: torch.Tensor,
+    group_size: int,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused online ConvRot rotation + per-row INT8 quantization (single kernel).
 
     Avoids materializing the rotated bf16 activation in global memory. Expects a
@@ -516,13 +539,16 @@ def quantize_int8_rowwise_convrot(x_2d: torch.Tensor, group_size: int) -> tuple[
     """
     q_2d = torch.empty_like(x_2d, dtype=torch.int8)
     scales_2d = torch.empty((x_2d.shape[0], 1), dtype=torch.float32, device=x_2d.device)
+    rng = _int8_rng(q_2d.shape, x_2d.device, x_2d.dtype, stochastic_rounding)
     stream_ptr = torch.cuda.current_stream(x_2d.device).cuda_stream
 
     _C.quantize_int8_rowwise_convrot(
         _wrap_for_dlpack(x_2d),
         _wrap_for_dlpack(q_2d),
         _wrap_for_dlpack(scales_2d),
+        _wrap_for_dlpack(rng),
         group_size,
+        stochastic_rounding is not None and stochastic_rounding > 0,
         stream_ptr,
     )
 
@@ -542,13 +568,18 @@ def rotate_int8_convrot_weight(weight_2d: torch.Tensor, group_size: int) -> torc
     return output
 
 
-def quantize_int8_convrot_staged(weight_2d: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_int8_convrot_staged(
+    weight_2d: torch.Tensor,
+    group_size: int,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """ConvRot rotation with partial absmax followed by INT8 quantization."""
     n_groups = weight_2d.shape[-1] // group_size
     rotated = torch.empty_like(weight_2d)
     partial_absmax = torch.empty((weight_2d.shape[0], n_groups), dtype=torch.float32, device=weight_2d.device)
     q_2d = torch.empty_like(weight_2d, dtype=torch.int8)
     scales_2d = torch.empty((weight_2d.shape[0], 1), dtype=torch.float32, device=weight_2d.device)
+    rng = _int8_rng(q_2d.shape, weight_2d.device, rotated.dtype, stochastic_rounding)
     stream_ptr = torch.cuda.current_stream(weight_2d.device).cuda_stream
     _C.quantize_int8_convrot_staged(
         _wrap_for_dlpack(weight_2d),
@@ -556,22 +587,31 @@ def quantize_int8_convrot_staged(weight_2d: torch.Tensor, group_size: int) -> tu
         _wrap_for_dlpack(partial_absmax),
         _wrap_for_dlpack(q_2d),
         _wrap_for_dlpack(scales_2d),
+        _wrap_for_dlpack(rng),
         group_size,
+        stochastic_rounding is not None and stochastic_rounding > 0,
         stream_ptr,
     )
     return q_2d, scales_2d
 
 
-def quantize_int8_rowwise_convrot64(weight_2d: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_int8_rowwise_convrot64(
+    weight_2d: torch.Tensor,
+    group_size: int,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused ConvRot row-wise INT8 quantization using 64-lane groups."""
     q_2d = torch.empty_like(weight_2d, dtype=torch.int8)
     scales_2d = torch.empty((weight_2d.shape[0], 1), dtype=torch.float32, device=weight_2d.device)
+    rng = _int8_rng(q_2d.shape, weight_2d.device, weight_2d.dtype, stochastic_rounding)
     stream_ptr = torch.cuda.current_stream(weight_2d.device).cuda_stream
     _C.quantize_int8_rowwise_convrot64(
         _wrap_for_dlpack(weight_2d),
         _wrap_for_dlpack(q_2d),
         _wrap_for_dlpack(scales_2d),
+        _wrap_for_dlpack(rng),
         group_size,
+        stochastic_rounding is not None and stochastic_rounding > 0,
         stream_ptr,
     )
     return q_2d, scales_2d
@@ -589,9 +629,13 @@ _CONVROT_FUSED_MAX_K = 16384
 _DISABLE_CUTLASS_INT8 = os.environ.get("COMFY_KITCHEN_DISABLE_CUTLASS", "0") == "1"
 
 
-def quantize_int8_tensorwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_int8_tensorwise(
+    x: torch.Tensor,
+    scale: torch.Tensor | float | str | None = None,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize tensor to INT8 with a single tensor-wise scale."""
-    return eager_quantize_int8_tensorwise(x)
+    return eager_quantize_int8_tensorwise(x, scale=scale, stochastic_rounding=stochastic_rounding)
 
 
 def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -636,13 +680,22 @@ def dequantize_int8_simple_dtype(q: torch.Tensor, scale: torch.Tensor, output_dt
     return output
 
 
-def quantize_and_rotate_rowwise(x: torch.Tensor, h: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_and_rotate_rowwise(
+    x: torch.Tensor,
+    h: torch.Tensor,
+    group_size: int,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Online activation rotation followed by CUDA row-wise quantization."""
     x_rot = _rotate_activation(x, h, group_size)
-    return quantize_int8_rowwise(x_rot)
+    return quantize_int8_rowwise(x_rot, stochastic_rounding=stochastic_rounding)
 
 
-def quantize_int8_convrot_weight(weight: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_int8_convrot_weight(
+    weight: torch.Tensor,
+    group_size: int,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Offline ConvRot weight rotation followed by row-wise INT8 quantization.
 
     Uses the fused ConvRot CUDA kernel when it matches the linear path's launch
@@ -658,23 +711,23 @@ def quantize_int8_convrot_weight(weight: torch.Tensor, group_size: int) -> tuple
         and k % 256 == 0
         and 256 <= k <= _CONVROT_FUSED_MAX_K
     ):
-        return quantize_int8_rowwise_convrot64(weight_2d, group_size)
+        return quantize_int8_rowwise_convrot64(weight_2d, group_size, stochastic_rounding=stochastic_rounding)
 
     if (
         group_size == 256
         and k % 256 == 0
         and 1024 <= k < 8192
     ):
-        return quantize_int8_convrot_staged(weight_2d, group_size)
+        return quantize_int8_convrot_staged(weight_2d, group_size, stochastic_rounding=stochastic_rounding)
 
     if _should_use_convrot_fused_kernel(weight_2d, k, group_size):
-        return quantize_int8_rowwise_convrot(weight_2d, group_size)
+        return quantize_int8_rowwise_convrot(weight_2d, group_size, stochastic_rounding=stochastic_rounding)
 
     if group_size == 256 and k % 256 == 0:
-        return quantize_int8_convrot_staged(weight_2d, group_size)
+        return quantize_int8_convrot_staged(weight_2d, group_size, stochastic_rounding=stochastic_rounding)
 
     h = _build_hadamard(group_size, device=weight_2d.device, dtype=weight_2d.dtype)
-    return quantize_int8_rowwise(_rotate_weight(weight_2d, h, group_size))
+    return quantize_int8_rowwise(_rotate_weight(weight_2d, h, group_size), stochastic_rounding=stochastic_rounding)
 
 
 def dequantize_int8_convrot_weight(q: torch.Tensor, scale: torch.Tensor, group_size: int) -> torch.Tensor:
@@ -974,7 +1027,9 @@ def int8_linear(
                 _wrap_for_dlpack(x_2d),
                 _wrap_for_dlpack(q_scratch),
                 _wrap_for_dlpack(scale_scratch),
+                _wrap_for_dlpack(_int8_rng((0,), x.device, x_2d.dtype, 0)),
                 convrot_groupsize,
+                False,
                 stream_ptr,
             )
             x_qdata, x_scale = q_scratch, scale_scratch
@@ -991,6 +1046,8 @@ def int8_linear(
             _wrap_for_dlpack(x_2d),
             _wrap_for_dlpack(q_scratch),
             _wrap_for_dlpack(scale_scratch),
+            _wrap_for_dlpack(_int8_rng((0,), x.device, x_2d.dtype, 0)),
+            False,
             stream_ptr,
         )
         x_qdata, x_scale = q_scratch, scale_scratch
@@ -1654,6 +1711,10 @@ def _build_constraints() -> dict:
                 "x": ParamConstraint(
                     dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
                 ),
+                "scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16, float, str}),
+                ),
+                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=cuda_devices,
         ),
@@ -1662,6 +1723,7 @@ def _build_constraints() -> dict:
                 "x": ParamConstraint(
                     dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
                 ),
+                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=cuda_devices,
         ),
@@ -1674,6 +1736,7 @@ def _build_constraints() -> dict:
                     dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
                 ),
                 "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=cuda_devices,
         ),
@@ -1684,6 +1747,7 @@ def _build_constraints() -> dict:
                     shape_rules=(ExactDims(2),),
                 ),
                 "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=cuda_devices,
         ),

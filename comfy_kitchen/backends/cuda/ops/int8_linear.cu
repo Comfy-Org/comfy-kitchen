@@ -31,6 +31,18 @@ template<> __device__ __forceinline__ half from_float<half>(float val) { return 
 template<> __device__ __forceinline__ nv_bfloat16 from_float<nv_bfloat16>(float val) { return __float2bfloat16_rn(val); }
 
 template<typename T>
+__device__ __forceinline__ float quant_div_to_float(T val, float scale) {
+    const float scale_t = to_float(from_float<T>(scale));
+    return to_float(from_float<T>(to_float(val) / scale_t));
+}
+
+template<typename T>
+__device__ __forceinline__ float quant_div_float_to_float(float val, float scale) {
+    const float scale_t = to_float(from_float<T>(scale));
+    return to_float(from_float<T>(to_float(from_float<T>(val)) / scale_t));
+}
+
+template<typename T>
 __device__ __forceinline__ void store4_contiguous(T* out, int64_t idx, float x, float y, float z, float w) {
     out[idx] = from_float<T>(x);
     out[idx + 1] = from_float<T>(y);
@@ -99,7 +111,9 @@ __global__ void quantize_int8_rowwise_kernel(
     const InputType* __restrict__ x,
     int8_t* __restrict__ q,
     float* __restrict__ scales,
-    int K)
+    const InputType* __restrict__ rng,
+    int K,
+    bool stochastic)
 {
     constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
     __shared__ float warp_smem[kWarps];
@@ -116,16 +130,18 @@ __global__ void quantize_int8_rowwise_kernel(
 
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
     const float scale = fmaxf(abs_max * (1.0f / 127.0f), 1.0e-30f);
-    const float inv_scale = 1.0f / scale;
 
     if (tid == 0) {
         scales[row] = scale;
     }
 
     for (int col = tid; col < K; col += blockDim.x) {
-        float quantized = nearbyintf(to_float(x[row_offset + col]) * inv_scale);
+        const int idx = row_offset + col;
+        const float scaled = quant_div_to_float<InputType>(x[idx], scale);
+        float quantized = stochastic ? floorf(to_float(from_float<InputType>(scaled + to_float(rng[idx]))))
+                                     : nearbyintf(scaled);
         quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
-        q[row_offset + col] = static_cast<int8_t>(quantized);
+        q[idx] = static_cast<int8_t>(quantized);
     }
 }
 
@@ -188,7 +204,9 @@ __global__ void quantize_int8_rowwise_convrot_kernel(
     const InputType* __restrict__ x,
     int8_t* __restrict__ q,
     float* __restrict__ scales,
-    int K)
+    const InputType* __restrict__ rng,
+    int K,
+    bool stochastic)
 {
     constexpr int kGroupsInFlight = BLOCK_THREADS / kConvRotGroup;
     constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
@@ -248,15 +266,17 @@ __global__ void quantize_int8_rowwise_convrot_kernel(
     }
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
     const float scale = fmaxf(abs_max * (1.0f / 127.0f), 1.0e-30f);
-    const float inv_scale = 1.0f / scale;
     if (tid == 0) {
         scales[row] = scale;
     }
 
     for (int col = tid; col < K; col += BLOCK_THREADS) {
-        float quantized = nearbyintf(row_buf[col] * inv_scale);
+        const int64_t idx = row_offset + col;
+        const float scaled = quant_div_float_to_float<InputType>(row_buf[col], scale);
+        float quantized = stochastic ? floorf(to_float(from_float<InputType>(scaled + to_float(rng[idx]))))
+                                     : nearbyintf(scaled);
         quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
-        q[row_offset + col] = static_cast<int8_t>(quantized);
+        q[idx] = static_cast<int8_t>(quantized);
     }
 }
 
@@ -786,7 +806,9 @@ __global__ void quantize_int8_rowwise_from_partials_kernel(
     const float* __restrict__ partial_absmax,
     int8_t* __restrict__ q,
     float* __restrict__ scales,
-    int K)
+    const InputType* __restrict__ rng,
+    int K,
+    bool stochastic)
 {
     constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
     __shared__ float warp_smem[kWarps];
@@ -804,15 +826,17 @@ __global__ void quantize_int8_rowwise_from_partials_kernel(
     }
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
     const float scale = fmaxf(abs_max * (1.0f / 127.0f), 1.0e-30f);
-    const float inv_scale = 1.0f / scale;
     if (tid == 0) {
         scales[row] = scale;
     }
 
     for (int col = tid; col < K; col += BLOCK_THREADS) {
-        float quantized = nearbyintf(to_float(x[row_offset + col]) * inv_scale);
+        const int64_t idx = row_offset + col;
+        const float scaled = quant_div_to_float<InputType>(x[idx], scale);
+        float quantized = stochastic ? floorf(to_float(from_float<InputType>(scaled + to_float(rng[idx]))))
+                                     : nearbyintf(scaled);
         quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
-        q[row_offset + col] = static_cast<int8_t>(quantized);
+        q[idx] = static_cast<int8_t>(quantized);
     }
 }
 
@@ -821,7 +845,9 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     const InputType* __restrict__ x,
     int8_t* __restrict__ q,
     float* __restrict__ scales,
-    int K)
+    const InputType* __restrict__ rng,
+    int K,
+    bool stochastic)
 {
     constexpr int kGroupThreads = 64;
     constexpr int kGroupsInFlight = BLOCK_THREADS / kGroupThreads;
@@ -878,15 +904,17 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
 
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
     const float scale = fmaxf(abs_max * (1.0f / 127.0f), 1.0e-30f);
-    const float inv_scale = 1.0f / scale;
     if (tid == 0) {
         scales[row] = scale;
     }
 
     for (int col = tid; col < K; col += BLOCK_THREADS) {
-        float quantized = nearbyintf(row_buf[col] * inv_scale);
+        const int64_t idx = row_offset + col;
+        const float scaled = quant_div_float_to_float<InputType>(row_buf[col], scale);
+        float quantized = stochastic ? floorf(to_float(from_float<InputType>(scaled + to_float(rng[idx]))))
+                                     : nearbyintf(scaled);
         quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
-        q[row_offset + col] = static_cast<int8_t>(quantized);
+        q[idx] = static_cast<int8_t>(quantized);
     }
 }
 
@@ -900,9 +928,11 @@ void launch_quantize_int8_rowwise_kernel(
     const void* input,
     void* output,
     void* scales,
+    const void* rng,
     int64_t num_rows,
     int64_t num_cols,
     int input_dtype_code,
+    bool stochastic,
     cudaStream_t stream)
 {
     if (num_rows == 0 || num_cols == 0) {
@@ -919,14 +949,18 @@ void launch_quantize_int8_rowwise_kernel(
                     static_cast<const InputType*>(input),
                     static_cast<int8_t*>(output),
                     static_cast<float*>(scales),
-                    static_cast<int>(num_cols));
+                    static_cast<const InputType*>(rng),
+                    static_cast<int>(num_cols),
+                    stochastic);
         } else {
             comfy::quantize_int8_rowwise_kernel<InputType, comfy::kInt8Threads>
                 <<<static_cast<unsigned int>(num_rows), comfy::kInt8Threads, 0, stream>>>(
                     static_cast<const InputType*>(input),
                     static_cast<int8_t*>(output),
                     static_cast<float*>(scales),
-                    static_cast<int>(num_cols));
+                    static_cast<const InputType*>(rng),
+                    static_cast<int>(num_cols),
+                    stochastic);
         }
     });
 
@@ -940,10 +974,12 @@ void launch_quantize_int8_rowwise_convrot_kernel(
     const void* input,
     void* output,
     void* scales,
+    const void* rng,
     int64_t num_rows,
     int64_t num_cols,
     int group_size,
     int input_dtype_code,
+    bool stochastic,
     cudaStream_t stream)
 {
     if (num_rows == 0 || num_cols == 0) {
@@ -983,7 +1019,9 @@ void launch_quantize_int8_rowwise_convrot_kernel(
                 static_cast<const InputType*>(input),
                 static_cast<int8_t*>(output),
                 static_cast<float*>(scales),
-                static_cast<int>(num_cols));
+                static_cast<const InputType*>(rng),
+                static_cast<int>(num_cols),
+                stochastic);
         };
         if (wide) {
             launch(comfy::quantize_int8_rowwise_convrot_kernel<InputType, 1024>);
@@ -1050,11 +1088,13 @@ void launch_quantize_int8_convrot_staged_kernel(
     void* partial_absmax,
     void* output,
     void* scales,
+    const void* rng,
     int64_t num_rows,
     int64_t num_cols,
     int group_size,
     int input_dtype_code,
     int rotated_dtype_code,
+    bool stochastic,
     cudaStream_t stream)
 {
     if (num_rows == 0 || num_cols == 0) {
@@ -1102,7 +1142,9 @@ void launch_quantize_int8_convrot_staged_kernel(
                     static_cast<const float*>(partial_absmax),
                     static_cast<int8_t*>(output),
                     static_cast<float*>(scales),
-                    static_cast<int>(num_cols));
+                    static_cast<const RotatedType*>(rng),
+                    static_cast<int>(num_cols),
+                    stochastic);
         } else {
             comfy::quantize_int8_rowwise_from_partials_kernel<RotatedType, comfy::kInt8Threads>
                 <<<static_cast<unsigned int>(num_rows), comfy::kInt8Threads, 0, stream>>>(
@@ -1110,7 +1152,9 @@ void launch_quantize_int8_convrot_staged_kernel(
                     static_cast<const float*>(partial_absmax),
                     static_cast<int8_t*>(output),
                     static_cast<float*>(scales),
-                    static_cast<int>(num_cols));
+                    static_cast<const RotatedType*>(rng),
+                    static_cast<int>(num_cols),
+                    stochastic);
         }
     });
 
@@ -1124,10 +1168,12 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
     const void* input,
     void* output,
     void* scales,
+    const void* rng,
     int64_t num_rows,
     int64_t num_cols,
     int group_size,
     int input_dtype_code,
+    bool stochastic,
     cudaStream_t stream)
 {
     if (num_rows == 0 || num_cols == 0) {
@@ -1163,7 +1209,9 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                 static_cast<const InputType*>(input),
                 static_cast<int8_t*>(output),
                 static_cast<float*>(scales),
-                static_cast<int>(num_cols));
+                static_cast<const InputType*>(rng),
+                static_cast<int>(num_cols),
+                stochastic);
         };
 
         if (num_rows == 1) {

@@ -421,6 +421,7 @@ class TestLoraXSeparation:
             _, _, la_correct = ck.quantize_svdquant_w4a4(
                 shifted_x, smooth, lora_down, pad_size=16, lora_x=raw_x,
             )
+            la_correct = la_correct.clone()
             # Incorrect baseline: shifted used for both (what happens if caller
             # forgets lora_x). Used to prove the kwarg is live, not a pass-through.
             _, _, la_if_shifted = ck.quantize_svdquant_w4a4(

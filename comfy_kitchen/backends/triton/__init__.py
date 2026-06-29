@@ -29,6 +29,12 @@ _TRITON_ERROR = None
 
 try:
     import triton  # noqa: F401
+    from comfy_kitchen.backends.eager.quantization import (
+        quantize_and_rotate_rowwise as _eager_quantize_and_rotate_rowwise,
+    )
+    from comfy_kitchen.backends.eager.quantization import (
+        quantize_int8_rowwise as _eager_quantize_int8_rowwise,
+    )
 
     from .adaln import adaln
     from .quantization import (
@@ -40,15 +46,37 @@ try:
         quantize_per_tensor_fp8,
     )
     from .quantization import (
-        triton_quantize_and_rotate_rowwise as quantize_and_rotate_rowwise,
+        triton_quantize_and_rotate_rowwise as _triton_quantize_and_rotate_rowwise,
     )
     from .quantization import (
-        triton_quantize_rowwise as quantize_int8_rowwise,
+        triton_quantize_rowwise as _triton_quantize_int8_rowwise,
     )
     from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
 except ImportError as e:
     _TRITON_AVAILABLE = False
     _TRITON_ERROR = f"ImportError: {e!s}"
+
+
+if _TRITON_AVAILABLE:
+    def quantize_int8_rowwise(
+        x: torch.Tensor,
+        stochastic_rounding: int | None = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if stochastic_rounding is not None and stochastic_rounding > 0:
+            return _eager_quantize_int8_rowwise(x, stochastic_rounding=stochastic_rounding)
+        return _triton_quantize_int8_rowwise(x)
+
+    def quantize_and_rotate_rowwise(
+        x: torch.Tensor,
+        h: torch.Tensor,
+        group_size: int,
+        stochastic_rounding: int | None = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if stochastic_rounding is not None and stochastic_rounding > 0:
+            return _eager_quantize_and_rotate_rowwise(
+                x, h, group_size, stochastic_rounding=stochastic_rounding
+            )
+        return _triton_quantize_and_rotate_rowwise(x, h, group_size)
 
 
 def _build_constraints() -> dict:
@@ -150,6 +178,7 @@ def _build_constraints() -> dict:
         "quantize_int8_rowwise": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
+                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=triton_devices,
         ),
@@ -158,6 +187,7 @@ def _build_constraints() -> dict:
                 "x": ParamConstraint(dtypes=standard_floats),
                 "H": ParamConstraint(dtypes=standard_floats),
                 "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=triton_devices,
         ),

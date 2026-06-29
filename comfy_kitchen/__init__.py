@@ -486,14 +486,25 @@ def apply_rope_split_half1(
     return torch.ops.comfy_kitchen.apply_rope_split_half1(x, freqs_cis)
 
 
-def quantize_int8_tensorwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_int8_tensorwise(
+    x: torch.Tensor,
+    scale: torch.Tensor | float | str | None = None,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize tensor to INT8 with single tensorwise scale."""
-    return torch.ops.comfy_kitchen.quantize_int8_tensorwise(x)
+    kwargs = {"x": x, "scale": scale, "stochastic_rounding": stochastic_rounding}
+    impl = registry.get_implementation("quantize_int8_tensorwise", kwargs=kwargs)
+    return impl(**kwargs)
 
 
-def quantize_int8_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_int8_rowwise(
+    x: torch.Tensor,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize tensor to INT8 with per-row scales."""
-    return torch.ops.comfy_kitchen.quantize_int8_rowwise(x)
+    kwargs = {"x": x, "stochastic_rounding": stochastic_rounding}
+    impl = registry.get_implementation("quantize_int8_rowwise", kwargs=kwargs)
+    return impl(**kwargs)
 
 
 def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:

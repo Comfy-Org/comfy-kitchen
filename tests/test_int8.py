@@ -5,6 +5,9 @@
 import pytest
 import torch
 
+import comfy_kitchen as ck
+from comfy_kitchen.tensor import TensorWiseINT8Layout
+
 from .conftest import (
     assert_values_close,
     get_capable_backends,
@@ -64,6 +67,75 @@ def test_eager_int8_matmul_turing_n_alignment(monkeypatch):
 # =============================================================================
 # INT8 Quantization Tests
 # =============================================================================
+
+
+def test_eager_int8_stochastic_rounding_tensorwise(seed):
+    """Eager INT8 stochastic rounding is seeded and unbiased for half values."""
+    weight = torch.full((4096,), 0.5, dtype=torch.float32)
+    scale = torch.tensor(1.0, dtype=torch.float32)
+
+    with ck.registry.use_backend("eager"):
+        q1, params = TensorWiseINT8Layout.quantize(weight, scale=scale, stochastic_rounding=123)
+        q2, _ = TensorWiseINT8Layout.quantize(weight, scale=scale, stochastic_rounding=123)
+        q3, _ = TensorWiseINT8Layout.quantize(weight, scale=scale, stochastic_rounding=124)
+
+    assert q1.dtype == torch.int8
+    assert params.scale.item() == 1.0
+    assert torch.equal(q1, q2)
+    assert not torch.equal(q1, q3)
+    assert 0.45 < q1.float().mean().item() < 0.55
+
+
+def test_cuda_int8_stochastic_rounding_matches_eager(seed):
+    """CUDA stochastic INT8 kernel matches eager for the same seeded RNG."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    x = torch.randn(1024, device="cuda", dtype=torch.float16)
+
+    with ck.registry.use_backend("eager"):
+        ref, ref_scale = ck.quantize_int8_rowwise(x, stochastic_rounding=123)
+
+    with ck.registry.use_backend("cuda"):
+        out, out_scale = ck.quantize_int8_rowwise(x, stochastic_rounding=123)
+
+    assert torch.equal(out, ref)
+    assert torch.equal(out_scale, ref_scale)
+
+
+def test_eager_int8_stochastic_rounding_convrot(seed):
+    """ConvRot INT8 quantization supports seeded stochastic rounding."""
+    torch.manual_seed(1234)
+    weight = torch.randn(4, 256, dtype=torch.float32)
+
+    with ck.registry.use_backend("eager"):
+        q1, params = TensorWiseINT8Layout.quantize(
+            weight,
+            per_channel=True,
+            convrot=True,
+            convrot_groupsize=256,
+            stochastic_rounding=123,
+        )
+        q2, _ = TensorWiseINT8Layout.quantize(
+            weight,
+            per_channel=True,
+            convrot=True,
+            convrot_groupsize=256,
+            stochastic_rounding=123,
+        )
+        q3, _ = TensorWiseINT8Layout.quantize(
+            weight,
+            per_channel=True,
+            convrot=True,
+            convrot_groupsize=256,
+            stochastic_rounding=124,
+        )
+
+    assert q1.dtype == torch.int8
+    assert params.convrot
+    assert params.scale.shape == (4, 1)
+    assert torch.equal(q1, q2)
+    assert not torch.equal(q1, q3)
 
 
 class TestTensorWiseINT8Layout:
