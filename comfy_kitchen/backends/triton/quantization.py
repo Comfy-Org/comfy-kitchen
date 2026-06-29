@@ -801,7 +801,7 @@ def _quantize_rowwise_kernel(
     q_f = x / scale
 
     # Round and Clamp
-    q_i = libdevice.rint(q_f).to(tl.int32)
+    q_i = tl.floor(q_f + 0.5).to(tl.int32)
     q_i = tl.clamp(q_i, -128.0, 127.0)
 
     # 4. Store
