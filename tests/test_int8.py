@@ -243,6 +243,26 @@ class TestTensorWiseINT8Layout:
         # However, eager vs triton vs cuda should be very close.
         assert_values_close(out, ref_out, rtol=1e-2, atol=1e-2, name=f"int8_linear_{backend}", max_mismatch_ratio=0.01)
 
+    def test_int8_linear_cuda_single_row_gemv(self, seed):
+        """CUDA int8_linear uses the single-row GEMV path correctly."""
+        import comfy_kitchen as ck
+        from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
+
+        x = torch.randn(1, 512, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(384, 512, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(384, device="cuda", dtype=torch.bfloat16)
+        w_int8, w_scale = quantize_int8_tensorwise(w)
+
+        with ck.registry.use_backend("eager"):
+            ref_out = ck.int8_linear(x, w_int8, w_scale, bias=bias, out_dtype=torch.bfloat16)
+
+        with ck.registry.use_backend("cuda"):
+            out = ck.int8_linear(x, w_int8, w_scale, bias=bias, out_dtype=torch.bfloat16)
+
+        assert out.shape == (1, 384)
+        assert out.dtype == torch.bfloat16
+        assert_values_close(out, ref_out, rtol=1e-2, atol=1e-2, name="int8_linear_cuda_single_row_gemv", max_mismatch_ratio=0.01)
+
     def test_public_api_quantize_tensorwise(self, seed):
         """comfy_kitchen.quantize_int8_tensorwise op is reachable."""
         import comfy_kitchen as ck

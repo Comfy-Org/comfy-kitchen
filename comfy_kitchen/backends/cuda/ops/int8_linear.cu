@@ -64,8 +64,35 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
     return v;
 }
 
+__device__ __forceinline__ int warp_reduce_sum_i32(int v) {
+    for (int offset = kThreadsPerWarp / 2; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffff, v, offset);
+    }
+    return v;
+}
+
 template<int NUM_WARPS>
 __device__ __forceinline__ float block_reduce_max_t(float v, float* warp_smem, float* block_smem);
+
+template<int NUM_WARPS>
+__device__ __forceinline__ int block_reduce_sum_i32_t(int v, int* warp_smem, int* block_smem) {
+    const int lane = threadIdx.x & (kThreadsPerWarp - 1);
+    const int wid = threadIdx.x >> 5;
+    v = warp_reduce_sum_i32(v);
+    if (lane == 0) {
+        warp_smem[wid] = v;
+    }
+    __syncthreads();
+    if (wid == 0) {
+        int total = lane < NUM_WARPS ? warp_smem[lane] : 0;
+        total = warp_reduce_sum_i32(total);
+        if (lane == 0) {
+            *block_smem = total;
+        }
+    }
+    __syncthreads();
+    return *block_smem;
+}
 
 template<typename InputType, int BLOCK_THREADS>
 __global__ void quantize_int8_rowwise_kernel(
@@ -258,6 +285,130 @@ __global__ void dequantize_int8_linear_kernel(
         value += to_float(bias[col]);
     }
     output[idx] = from_float<OutputType>(value);
+}
+
+template<typename OutputType>
+__global__ void dequantize_int8_linear_vec4_kernel(
+    const int32_t* __restrict__ input,
+    const float* __restrict__ x_scales,
+    const float* __restrict__ weight_scales,
+    OutputType* __restrict__ output,
+    int64_t total_vec4,
+    int N,
+    int weight_scale_size)
+{
+    const int64_t idx4 = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx4 >= total_vec4) {
+        return;
+    }
+
+    const int64_t idx = idx4 * 4;
+    const int col = static_cast<int>(idx % N);
+    const int row = static_cast<int>(idx / N);
+    const float x_scale = x_scales[row];
+    const int4 acc = reinterpret_cast<const int4*>(input)[idx4];
+
+    if (weight_scale_size == 1) {
+        const float scale = x_scale * weight_scales[0];
+        store4_contiguous(
+            output, idx,
+            static_cast<float>(acc.x) * scale,
+            static_cast<float>(acc.y) * scale,
+            static_cast<float>(acc.z) * scale,
+            static_cast<float>(acc.w) * scale);
+        return;
+    }
+
+    const float4 ws = reinterpret_cast<const float4*>(weight_scales)[col / 4];
+    store4_contiguous(
+        output, idx,
+        static_cast<float>(acc.x) * x_scale * ws.x,
+        static_cast<float>(acc.y) * x_scale * ws.y,
+        static_cast<float>(acc.z) * x_scale * ws.z,
+        static_cast<float>(acc.w) * x_scale * ws.w);
+}
+
+template<int BLOCK_THREADS, typename OutputType, typename BiasType>
+__global__ void int8_gemv_dequant_kernel(
+    const int8_t* __restrict__ x,
+    const int8_t* __restrict__ weight,
+    const float* __restrict__ x_scales,
+    const float* __restrict__ weight_scales,
+    const BiasType* __restrict__ bias,
+    OutputType* __restrict__ output,
+    int N,
+    int K,
+    int weight_scale_size,
+    bool has_bias)
+{
+    constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
+    __shared__ int warp_smem[kWarps];
+    __shared__ int block_smem;
+
+    const int n = static_cast<int>(blockIdx.x);
+    const int tid = threadIdx.x;
+    const int8_t* __restrict__ w_row = weight + static_cast<int64_t>(n) * K;
+
+    int acc = 0;
+    const int K4 = K >> 2;
+    const int* __restrict__ x4 = reinterpret_cast<const int*>(x);
+    const int* __restrict__ w4 = reinterpret_cast<const int*>(w_row);
+    for (int k4 = tid; k4 < K4; k4 += BLOCK_THREADS) {
+        acc = __dp4a(x4[k4], w4[k4], acc);
+    }
+    for (int k = (K4 << 2) + tid; k < K; k += BLOCK_THREADS) {
+        acc += static_cast<int>(x[k]) * static_cast<int>(w_row[k]);
+    }
+
+    acc = block_reduce_sum_i32_t<kWarps>(acc, warp_smem, &block_smem);
+    if (tid == 0) {
+        const float weight_scale = weight_scales[weight_scale_size == 1 ? 0 : n];
+        float value = static_cast<float>(acc) * x_scales[0] * weight_scale;
+        if (has_bias) {
+            value += to_float(bias[n]);
+        }
+        output[n] = from_float<OutputType>(value);
+    }
+}
+
+template<int WARPS_PER_BLOCK, typename OutputType, typename BiasType>
+__global__ void int8_gemv_dequant_warp_kernel(
+    const int8_t* __restrict__ x,
+    const int8_t* __restrict__ weight,
+    const float* __restrict__ x_scales,
+    const float* __restrict__ weight_scales,
+    const BiasType* __restrict__ bias,
+    OutputType* __restrict__ output,
+    int N,
+    int K,
+    int weight_scale_size,
+    bool has_bias)
+{
+    const int lane = threadIdx.x & (kThreadsPerWarp - 1);
+    const int warp = threadIdx.x >> 5;
+    const int n = static_cast<int>(blockIdx.x) * WARPS_PER_BLOCK + warp;
+    if (n >= N) {
+        return;
+    }
+
+    const int K4 = K >> 2;
+    const int* __restrict__ x4 = reinterpret_cast<const int*>(x);
+    const int* __restrict__ w4 = reinterpret_cast<const int*>(weight + static_cast<int64_t>(n) * K);
+
+    int acc = 0;
+    for (int k4 = lane; k4 < K4; k4 += kThreadsPerWarp) {
+        acc = __dp4a(x4[k4], w4[k4], acc);
+    }
+    acc = warp_reduce_sum_i32(acc);
+
+    if (lane == 0) {
+        const float weight_scale = weight_scales[weight_scale_size == 1 ? 0 : n];
+        float value = static_cast<float>(acc) * x_scales[0] * weight_scale;
+        if (has_bias) {
+            value += to_float(bias[n]);
+        }
+        output[n] = from_float<OutputType>(value);
+    }
 }
 
 template<typename OutputType>
@@ -762,7 +913,7 @@ void launch_quantize_int8_rowwise_kernel(
     }
 
     DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
-        if (num_cols >= 4096) {
+        if (num_cols >= 4096 && num_rows != 1) {
             comfy::quantize_int8_rowwise_kernel<InputType, 512>
                 <<<static_cast<unsigned int>(num_rows), 512, 0, stream>>>(
                     static_cast<const InputType*>(input),
@@ -992,27 +1143,48 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
         throw std::runtime_error("convrot64 fused kernel only supports K <= INT_MAX");
     }
 
-    constexpr int block_threads = 1024;
-    constexpr int groups_in_flight = block_threads / 64;
-    const size_t smem_bytes =
-        (static_cast<size_t>(num_cols) + groups_in_flight * 2 * comfy::kConvRotGroup) * sizeof(float);
-
     DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
-        auto kernel = comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads>;
-        cudaError_t attr_err = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(smem_bytes));
-        if (attr_err != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("convrot64 fused kernel shared memory request (") +
-                std::to_string(smem_bytes) + " bytes) failed: " +
-                cudaGetErrorString(attr_err));
+        constexpr int block_threads_single = 512;
+        constexpr int block_threads_multi = 1024;
+        auto launch = [&](auto kernel, int block_threads) {
+            const int groups_in_flight = block_threads / 64;
+            const size_t smem_bytes =
+                (static_cast<size_t>(num_cols) + groups_in_flight * 2 * comfy::kConvRotGroup) * sizeof(float);
+            cudaError_t attr_err = cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(smem_bytes));
+            if (attr_err != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("convrot64 fused kernel shared memory request (") +
+                    std::to_string(smem_bytes) + " bytes) failed: " +
+                    cudaGetErrorString(attr_err));
+            }
+            kernel<<<static_cast<unsigned int>(num_rows), block_threads, smem_bytes, stream>>>(
+                static_cast<const InputType*>(input),
+                static_cast<int8_t*>(output),
+                static_cast<float*>(scales),
+                static_cast<int>(num_cols));
+        };
+
+        if (num_rows == 1) {
+            launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_single>,
+                   block_threads_single);
+        } else if (num_cols == comfy::kConvRotGroup) {
+            constexpr int block_threads_256 = 64;
+            launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_256>,
+                   block_threads_256);
+        } else if (num_cols == 2560) {
+            constexpr int block_threads_2560 = 640;
+            launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_2560>,
+                   block_threads_2560);
+        } else if (num_cols == 6144) {
+            constexpr int block_threads_6144 = 768;
+            launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_6144>,
+                   block_threads_6144);
+        } else {
+            launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_multi>,
+                   block_threads_multi);
         }
-        kernel<<<static_cast<unsigned int>(num_rows), block_threads, smem_bytes, stream>>>(
-            static_cast<const InputType*>(input),
-            static_cast<int8_t*>(output),
-            static_cast<float*>(scales),
-            static_cast<int>(num_cols));
     });
 
     cudaError_t err = cudaGetLastError();
@@ -1050,17 +1222,32 @@ void launch_dequantize_int8_linear_kernel(
 
     DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
         if (!has_bias) {
-            comfy::dequantize_int8_linear_kernel<OutputType, float>
-                <<<blocks, comfy::kInt8Threads, 0, stream>>>(
-                    static_cast<const int32_t*>(input),
-                    static_cast<const float*>(x_scales),
-                    static_cast<const float*>(weight_scales),
-                    nullptr,
-                    static_cast<OutputType*>(output),
-                    total,
-                    static_cast<int>(num_cols),
-                    static_cast<int>(weight_scale_size),
-                    false);
+            if ((num_cols & 3) == 0) {
+                constexpr int kVec4Threads = 256;
+                const int64_t total_vec4 = total / 4;
+                const int vec4_blocks = static_cast<int>((total_vec4 + kVec4Threads - 1) / kVec4Threads);
+                comfy::dequantize_int8_linear_vec4_kernel<OutputType>
+                    <<<vec4_blocks, kVec4Threads, 0, stream>>>(
+                        static_cast<const int32_t*>(input),
+                        static_cast<const float*>(x_scales),
+                        static_cast<const float*>(weight_scales),
+                        static_cast<OutputType*>(output),
+                        total_vec4,
+                        static_cast<int>(num_cols),
+                        static_cast<int>(weight_scale_size));
+            } else {
+                comfy::dequantize_int8_linear_kernel<OutputType, float>
+                    <<<blocks, comfy::kInt8Threads, 0, stream>>>(
+                        static_cast<const int32_t*>(input),
+                        static_cast<const float*>(x_scales),
+                        static_cast<const float*>(weight_scales),
+                        nullptr,
+                        static_cast<OutputType*>(output),
+                        total,
+                        static_cast<int>(num_cols),
+                        static_cast<int>(weight_scale_size),
+                        false);
+            }
             return;
         }
 
@@ -1082,6 +1269,107 @@ void launch_dequantize_int8_linear_kernel(
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string("CUDA INT8 linear dequantization failed: ") + cudaGetErrorString(err));
+    }
+}
+
+void launch_int8_gemv_dequant_kernel(
+    const void* input,
+    const void* weight,
+    const void* x_scales,
+    const void* weight_scales,
+    const void* bias,
+    void* output,
+    int64_t num_cols,
+    int64_t K,
+    int64_t weight_scale_size,
+    bool has_bias,
+    int output_dtype_code,
+    int bias_dtype_code,
+    cudaStream_t stream)
+{
+    if (num_cols == 0 || K == 0) {
+        return;
+    }
+    if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
+        K > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("int8_gemv_dequant only supports N,K <= INT_MAX");
+    }
+    if (weight_scale_size != 1 && weight_scale_size != num_cols) {
+        throw std::runtime_error("INT8 GEMV weight scale must be scalar or per-output-channel");
+    }
+
+    DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+        if (!has_bias) {
+            if ((K & 3) == 0) {
+                constexpr int kWarpsPerBlock = 8;
+                const unsigned int blocks =
+                    static_cast<unsigned int>((num_cols + kWarpsPerBlock - 1) / kWarpsPerBlock);
+                comfy::int8_gemv_dequant_warp_kernel<kWarpsPerBlock, OutputType, float>
+                    <<<blocks, kWarpsPerBlock * comfy::kThreadsPerWarp, 0, stream>>>(
+                        static_cast<const int8_t*>(input),
+                        static_cast<const int8_t*>(weight),
+                        static_cast<const float*>(x_scales),
+                        static_cast<const float*>(weight_scales),
+                        nullptr,
+                        static_cast<OutputType*>(output),
+                        static_cast<int>(num_cols),
+                        static_cast<int>(K),
+                        static_cast<int>(weight_scale_size),
+                        false);
+            } else {
+                comfy::int8_gemv_dequant_kernel<comfy::kInt8Threads, OutputType, float>
+                    <<<static_cast<unsigned int>(num_cols), comfy::kInt8Threads, 0, stream>>>(
+                        static_cast<const int8_t*>(input),
+                        static_cast<const int8_t*>(weight),
+                        static_cast<const float*>(x_scales),
+                        static_cast<const float*>(weight_scales),
+                        nullptr,
+                        static_cast<OutputType*>(output),
+                        static_cast<int>(num_cols),
+                        static_cast<int>(K),
+                        static_cast<int>(weight_scale_size),
+                        false);
+            }
+            return;
+        }
+
+        DISPATCH_FP_DTYPE(bias_dtype_code, BiasType, [&] {
+            if ((K & 3) == 0) {
+                constexpr int kWarpsPerBlock = 8;
+                const unsigned int blocks =
+                    static_cast<unsigned int>((num_cols + kWarpsPerBlock - 1) / kWarpsPerBlock);
+                comfy::int8_gemv_dequant_warp_kernel<kWarpsPerBlock, OutputType, BiasType>
+                    <<<blocks, kWarpsPerBlock * comfy::kThreadsPerWarp, 0, stream>>>(
+                        static_cast<const int8_t*>(input),
+                        static_cast<const int8_t*>(weight),
+                        static_cast<const float*>(x_scales),
+                        static_cast<const float*>(weight_scales),
+                        static_cast<const BiasType*>(bias),
+                        static_cast<OutputType*>(output),
+                        static_cast<int>(num_cols),
+                        static_cast<int>(K),
+                        static_cast<int>(weight_scale_size),
+                        true);
+            } else {
+                comfy::int8_gemv_dequant_kernel<comfy::kInt8Threads, OutputType, BiasType>
+                    <<<static_cast<unsigned int>(num_cols), comfy::kInt8Threads, 0, stream>>>(
+                        static_cast<const int8_t*>(input),
+                        static_cast<const int8_t*>(weight),
+                        static_cast<const float*>(x_scales),
+                        static_cast<const float*>(weight_scales),
+                        static_cast<const BiasType*>(bias),
+                        static_cast<OutputType*>(output),
+                        static_cast<int>(num_cols),
+                        static_cast<int>(K),
+                        static_cast<int>(weight_scale_size),
+                        true);
+            }
+        });
+    });
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA INT8 GEMV dequantization failed: ") + cudaGetErrorString(err));
     }
 }
 
@@ -1151,10 +1439,13 @@ void launch_dequantize_int8_simple_kernel(
 
     if (scale_mode == 0 && (total % 4) == 0) {
         const int64_t total_vec4 = total / 4;
-        const int blocks = static_cast<int>((total_vec4 + comfy::kInt8Threads - 1) / comfy::kInt8Threads);
+        const int block_threads = (total_vec4 >= 8'000'000 && total_vec4 <= 16'000'000)
+            ? 512
+            : comfy::kInt8Threads;
+        const int blocks = static_cast<int>((total_vec4 + block_threads - 1) / block_threads);
         DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
             comfy::dequantize_int8_simple_vec4_kernel<OutputType>
-                <<<blocks, comfy::kInt8Threads, 0, stream>>>(
+                <<<blocks, block_threads, 0, stream>>>(
                     static_cast<const int8_t*>(input),
                     static_cast<const float*>(scales),
                     static_cast<OutputType*>(output),
@@ -1215,7 +1506,7 @@ void launch_dequantize_int8_convrot_kernel(
         throw std::runtime_error("convrot dequant scale must be scalar or per-row");
     }
 
-    if (num_cols >= 1024) {
+    if (num_cols >= comfy::kConvRotGroup) {
         auto launch_groups = [&](auto groups_tag) {
             constexpr int groups_per_block = decltype(groups_tag)::value;
             constexpr int block_threads = groups_per_block * 64;
@@ -1234,7 +1525,9 @@ void launch_dequantize_int8_convrot_kernel(
             });
         };
 
-        if (num_cols < 4096) {
+        if (num_cols < 1024) {
+            launch_groups(std::integral_constant<int, 1>{});
+        } else if (num_cols < 4096) {
             launch_groups(std::integral_constant<int, 2>{});
         } else {
             launch_groups(std::integral_constant<int, 4>{});

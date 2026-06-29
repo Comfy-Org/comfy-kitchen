@@ -140,7 +140,11 @@ from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation,
 
 _CUBLASLT_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUBLASLT", False)
 _cublas_workspaces: dict[int, torch.Tensor] = {}
+_empty_cuda_tensors: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
+_int8_quant_scratch: dict[tuple[str, int | None, int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+_int8_gemm_int32_scratch: dict[tuple[str, int | None, int, int, int], torch.Tensor] = {}
 _turing_device_cache: dict[int, bool] = {}
+_cutlass_int8_device_cache: dict[int, bool] = {}
 _shared_memory_per_block_cache: dict[int, int] = {}
 
 
@@ -148,10 +152,7 @@ def _cuda_device_is_turing(device_index: int) -> bool:
     cached = _turing_device_cache.get(device_index)
     if cached is not None:
         return cached
-    try:
-        is_turing = torch.cuda.get_device_capability(device_index) == (7, 5)
-    except RuntimeError:
-        is_turing = False
+    is_turing = torch.cuda.get_device_capability(device_index) == (7, 5)
     _turing_device_cache[device_index] = is_turing
     return is_turing
 
@@ -159,11 +160,14 @@ def _cuda_device_is_turing(device_index: int) -> bool:
 def _cuda_device_supports_cutlass_int8_dequant(tensor: torch.Tensor) -> bool:
     if not tensor.is_cuda:
         return False
-    try:
-        major, _minor = torch.cuda.get_device_capability(tensor.get_device())
-    except RuntimeError:
-        return False
-    return major >= 8
+    device_index = tensor.get_device()
+    cached = _cutlass_int8_device_cache.get(device_index)
+    if cached is not None:
+        return cached
+    major, _minor = torch.cuda.get_device_capability(device_index)
+    supported = major >= 8
+    _cutlass_int8_device_cache[device_index] = supported
+    return supported
 
 
 def _cublas_int8_n_alignment(tensor: torch.Tensor) -> int:
@@ -202,11 +206,8 @@ def _convrot_fused_shared_memory_fits(x: torch.Tensor, k: int, group_size: int) 
     device_index = x.get_device()
     max_shared = _shared_memory_per_block_cache.get(device_index)
     if max_shared is None:
-        try:
-            props = torch.cuda.get_device_properties(device_index)
-            max_shared = getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
-        except RuntimeError:
-            return False
+        props = torch.cuda.get_device_properties(device_index)
+        max_shared = getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
         _shared_memory_per_block_cache[device_index] = max_shared
     # The fused convrot rowwise kernel stages the rotated row plus scratch in
     # shared memory. For group_size=256 the CUDA kernel requests this amount.
@@ -251,6 +252,59 @@ def get_cublas_workspace() -> torch.Tensor:
         )
         _cublas_workspaces[device_index] = workspace
     return workspace
+
+
+def _empty_cuda_tensor(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = (device.type, device.index, dtype)
+    empty = _empty_cuda_tensors.get(key)
+    if empty is None:
+        empty = torch.empty(0, dtype=dtype, device=device)
+        _empty_cuda_tensors[key] = empty
+    return empty
+
+
+def _int8_quant_scratch_tensors(
+    device: torch.device, stream_ptr: int, num_rows: int, num_cols: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Internal activation quantization scratch. Key by stream so queued kernels
+    # on different streams cannot overwrite each other's temporary q/scale data.
+    key = (device.type, device.index, stream_ptr, num_rows, num_cols)
+    scratch = _int8_quant_scratch.get(key)
+    if scratch is None:
+        scratch = (
+            torch.empty((num_rows, num_cols), dtype=torch.int8, device=device),
+            torch.empty((num_rows, 1), dtype=torch.float32, device=device),
+        )
+        _int8_quant_scratch[key] = scratch
+    return scratch
+
+
+def _int8_gemm_int32_scratch_tensor(
+    device: torch.device, stream_ptr: int, num_rows: int, num_cols: int
+) -> torch.Tensor:
+    key = (device.type, device.index, stream_ptr, num_rows, num_cols)
+    scratch = _int8_gemm_int32_scratch.get(key)
+    if scratch is None:
+        scratch = torch.empty((num_rows, num_cols), dtype=torch.int32, device=device)
+        _int8_gemm_int32_scratch[key] = scratch
+    return scratch
+
+
+def _int8_weight_scale_arg(weight_scale: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if weight_scale.device == device and weight_scale.dtype == torch.float32 and weight_scale.is_contiguous():
+        return weight_scale
+    return weight_scale.to(device=device, dtype=torch.float32).reshape(-1).contiguous()
+
+
+def _prefer_cublas_int8_fallback(m: int, n: int, k: int) -> bool:
+    cutlass_n_le_k_exception = (
+        (n == k and n <= 2560)
+        or (m >= 1024 and n == 2560 and k == 6912)
+    )
+    return m > 1 and (
+        (n <= k and not cutlass_n_le_k_exception)
+        or (m <= 512 and k >= 4096 and n > k and n <= 3 * k)
+    )
 
 
 def _wrap_for_dlpack(tensor: torch.Tensor):
@@ -545,9 +599,6 @@ def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
 
 def dequantize_int8_simple_dtype(q: torch.Tensor, scale: torch.Tensor, output_dtype_code: int) -> torch.Tensor:
     """Dequantize INT8 tensor with scale into the requested floating output dtype."""
-    if not hasattr(_C, "dequantize_int8_simple"):
-        return eager_dequantize_int8_simple(q, scale).to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
-
     if not q.is_contiguous():
         q = q.contiguous()
 
@@ -600,19 +651,15 @@ def quantize_int8_convrot_weight(weight: torch.Tensor, group_size: int) -> tuple
 
     weight_2d = weight.contiguous()
     k = weight_2d.shape[-1]
-    m = weight_2d.shape[0]
     if (
-        hasattr(_C, "quantize_int8_rowwise_convrot64")
-        and group_size == 256
+        group_size == 256
         and k % 256 == 0
-        and 4096 <= k <= _CONVROT_FUSED_MAX_K
-        and (weight_2d.numel() >= 16_000_000 or m <= 128)
+        and 256 <= k <= _CONVROT_FUSED_MAX_K
     ):
         return quantize_int8_rowwise_convrot64(weight_2d, group_size)
 
     if (
-        hasattr(_C, "quantize_int8_convrot_staged")
-        and group_size == 256
+        group_size == 256
         and k % 256 == 0
         and 1024 <= k < 8192
     ):
@@ -621,10 +668,8 @@ def quantize_int8_convrot_weight(weight: torch.Tensor, group_size: int) -> tuple
     if _should_use_convrot_fused_kernel(weight_2d, k, group_size):
         return quantize_int8_rowwise_convrot(weight_2d, group_size)
 
-    if hasattr(_C, "rotate_int8_convrot_weight") and group_size == 256 and k % 256 == 0:
-        if hasattr(_C, "quantize_int8_convrot_staged"):
-            return quantize_int8_convrot_staged(weight_2d, group_size)
-        return quantize_int8_rowwise(rotate_int8_convrot_weight(weight_2d, group_size))
+    if group_size == 256 and k % 256 == 0:
+        return quantize_int8_convrot_staged(weight_2d, group_size)
 
     h = _build_hadamard(group_size, device=weight_2d.device, dtype=weight_2d.dtype)
     return quantize_int8_rowwise(_rotate_weight(weight_2d, h, group_size))
@@ -645,7 +690,7 @@ def dequantize_int8_convrot_weight_dtype(
     q_2d = q.contiguous()
     k = q_2d.shape[-1]
     output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
-    if hasattr(_C, "dequantize_int8_convrot_weight") and _should_use_convrot_dequant_kernel(q_2d, k, group_size):
+    if _should_use_convrot_dequant_kernel(q_2d, k, group_size):
         scale_arg = scale.to(device=q_2d.device, dtype=torch.float32).reshape(-1).contiguous()
         output = torch.empty(q_2d.shape, dtype=output_dtype, device=q_2d.device)
         stream_ptr = torch.cuda.current_stream(q_2d.device).cuda_stream
@@ -660,6 +705,33 @@ def dequantize_int8_convrot_weight_dtype(
 
     h = _build_hadamard(group_size, device=q_2d.device, dtype=torch.float32)
     return _rotate_weight(dequantize_int8_simple(q_2d, scale), h, group_size).to(output_dtype)
+
+
+def int8_gemv_dequant(
+    x_qdata: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Single-row INT8 GEMV with fused dequantization."""
+    out = torch.empty((1, weight.shape[0]), dtype=out_dtype, device=x_qdata.device)
+    bias_arg = bias if bias is not None else _empty_cuda_tensor(x_qdata.device, out_dtype)
+    if bias is not None and (bias.device != x_qdata.device or bias.dtype != out_dtype or not bias.is_contiguous()):
+        bias_arg = bias.to(device=x_qdata.device, dtype=out_dtype).contiguous()
+    stream_ptr = torch.cuda.current_stream(x_qdata.device).cuda_stream
+    _C.int8_gemv_dequant(
+        _wrap_for_dlpack(x_qdata),
+        _wrap_for_dlpack(weight),
+        _wrap_for_dlpack(x_scale),
+        _wrap_for_dlpack(weight_scale),
+        _wrap_for_dlpack(bias_arg),
+        _wrap_for_dlpack(out),
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    )
+    return out
 
 
 def quantize_mxfp8(
@@ -835,8 +907,54 @@ def int8_linear(
     convrot_groupsize: int = 256,
 ) -> torch.Tensor:
     orig_shape = x.shape
-    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-    weight = weight.contiguous()
+    x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    q_scratch = None
+    scale_scratch = None
+
+    m, k = x_2d.shape
+    n, k_w = weight.shape
+    assert k == k_w, "Input and weight inner dimensions must match"
+
+    out_dtype = out_dtype or x.dtype
+    output_dtype_code = DTYPE_TO_CODE[out_dtype]
+    is_2d_output = len(orig_shape) == 2
+    convrot_m1_supported = (
+        m == 1
+        and convrot
+        and convrot_groupsize == 256
+        and k % 256 == 0
+        and 256 <= k <= _CONVROT_FUSED_MAX_K
+    )
+    nonconvrot_m1_supported = (
+        m == 1
+        and not convrot
+        and k % 4 == 0
+        and (k <= 2560 or (k == 6144 and n <= 128))
+    )
+    if convrot_m1_supported or nonconvrot_m1_supported:
+        q_scratch, scale_scratch = _int8_quant_scratch_tensors(x.device, stream_ptr, 1, k)
+        weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
+        out = torch.empty((1, n), dtype=out_dtype, device=x.device)
+        bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
+        if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
+            bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
+        _C.int8_linear_m1(
+            _wrap_for_dlpack(x_2d),
+            _wrap_for_dlpack(q_scratch),
+            _wrap_for_dlpack(scale_scratch),
+            _wrap_for_dlpack(weight),
+            _wrap_for_dlpack(weight_scale),
+            _wrap_for_dlpack(bias_arg),
+            _wrap_for_dlpack(out),
+            output_dtype_code,
+            convrot,
+            convrot_groupsize,
+            stream_ptr,
+        )
+        return out if is_2d_output else out.reshape(*orig_shape[:-1], n)
 
     # cuBLAS INT8 GEMM requires row-wise quantized activations and tensor-wise quantized weights.
     if convrot:
@@ -844,8 +962,21 @@ def int8_linear(
         # Fused wins for small K (narrow block) and large K (wide block); the
         # 5120 < K < 8192 band loses to the rotate-matmul path on both, so skip
         # it. (Real model hidden dims avoid that band anyway.)
-        use_fused = _should_use_convrot_fused_kernel(x_2d, k, convrot_groupsize)
-        if use_fused:
+        if (
+            convrot_groupsize == 256
+            and k % 256 == 0
+            and 256 <= k <= _CONVROT_FUSED_MAX_K
+        ):
+            q_scratch, scale_scratch = _int8_quant_scratch_tensors(x.device, stream_ptr, m, k)
+            _C.quantize_int8_rowwise_convrot64(
+                _wrap_for_dlpack(x_2d),
+                _wrap_for_dlpack(q_scratch),
+                _wrap_for_dlpack(scale_scratch),
+                convrot_groupsize,
+                stream_ptr,
+            )
+            x_qdata, x_scale = q_scratch, scale_scratch
+        elif _should_use_convrot_fused_kernel(x_2d, k, convrot_groupsize):
             # Fused single-kernel rotation + row-wise quant (no bf16 HBM round-trip).
             x_qdata, x_scale = quantize_int8_rowwise_convrot(x_2d, convrot_groupsize)
         else:
@@ -853,40 +984,56 @@ def int8_linear(
             h = _build_hadamard(convrot_groupsize, device=x_2d.device, dtype=x_2d.dtype)
             x_qdata, x_scale = quantize_and_rotate_rowwise(x_2d, h, convrot_groupsize)
     else:
-        x_qdata, x_scale = quantize_int8_rowwise(x_2d)
+        q_scratch, scale_scratch = _int8_quant_scratch_tensors(x.device, stream_ptr, m, k)
+        _C.quantize_int8_rowwise(
+            _wrap_for_dlpack(x_2d),
+            _wrap_for_dlpack(q_scratch),
+            _wrap_for_dlpack(scale_scratch),
+            stream_ptr,
+        )
+        x_qdata, x_scale = q_scratch, scale_scratch
 
-    m, k = x_2d.shape
-    n, k_w = weight.shape
-    assert k == k_w, "Input and weight inner dimensions must match"
+    if m == 1 and k % 4 == 0:
+        weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
+        out = torch.empty((1, n), dtype=out_dtype, device=x.device)
+        bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
+        if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
+            bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
+        _C.int8_gemv_dequant(
+            _wrap_for_dlpack(x_qdata),
+            _wrap_for_dlpack(weight),
+            _wrap_for_dlpack(x_scale),
+            _wrap_for_dlpack(weight_scale),
+            _wrap_for_dlpack(bias_arg),
+            _wrap_for_dlpack(out),
+            output_dtype_code,
+            stream_ptr,
+        )
+        return out if is_2d_output else out.reshape(*orig_shape[:-1], n)
 
-    out_dtype = out_dtype or x.dtype
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
-    weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1).contiguous()
-    bias_arg = bias if bias is not None else torch.empty(0, dtype=out_dtype, device=x.device)
+    weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
+    bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
     if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
         bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
-    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
 
-    # Preferred path: CUTLASS int8 GEMM with a FUSED rowwise x colwise dequant +
-    # bias epilogue (one near-peak kernel, no int32 round-trip). Beats cuBLAS
-    # ~1.1-1.8x and Triton ~1.0-1.2x on tall-skinny diffusion shapes. CUTLASS's
-    # epilogue scales are fp32, so pass fp32 scales/bias.
-    x_scale_f = x_scale.reshape(-1).contiguous()
-    # CUTLASS dequant needs a per-output-channel [N] weight scale; broadcast a
-    # tensor-wise (scalar) scale to [N].
-    ws_cutlass = weight_scale if weight_scale.numel() == n else weight_scale.expand(n).contiguous()
-    bias_f32 = (bias_arg.to(torch.float32).contiguous()
-                if bias is not None else torch.empty(0, dtype=torch.float32, device=x.device))
     used_cutlass = False
-    if not _DISABLE_CUTLASS_INT8 and _cuda_device_supports_cutlass_int8_dequant(x_qdata):
+    prefer_cublas_fallback = _prefer_cublas_int8_fallback(m, n, k)
+    if (
+        not prefer_cublas_fallback
+        and not _DISABLE_CUTLASS_INT8
+        and _cuda_device_supports_cutlass_int8_dequant(x_qdata)
+    ):
+        ws_cutlass = weight_scale if weight_scale.numel() == n else weight_scale.expand(n).contiguous()
+        bias_f32 = bias_arg.to(torch.float32).contiguous() if bias is not None else bias_arg
         used_cutlass = _C.cutlass_int8_dequant(
             _wrap_for_dlpack(x_qdata),
             _wrap_for_dlpack(weight),
-            _wrap_for_dlpack(x_scale_f),
+            _wrap_for_dlpack(x_scale),
             _wrap_for_dlpack(ws_cutlass),
             _wrap_for_dlpack(bias_f32),
             _wrap_for_dlpack(out),
-            DTYPE_TO_CODE[out_dtype],
+            output_dtype_code,
             stream_ptr,
         )
     if not used_cutlass:
@@ -902,7 +1049,7 @@ def int8_linear(
             cublas_x = x_qdata
             cublas_weight = weight
 
-        out_int32 = torch.empty((m, padded_n), dtype=torch.int32, device=x.device)
+        out_int32 = _int8_gemm_int32_scratch_tensor(x.device, stream_ptr, m, padded_n)
         _C.cublas_gemm_int8(
             _wrap_for_dlpack(cublas_x),
             _wrap_for_dlpack(cublas_weight),
@@ -918,11 +1065,11 @@ def int8_linear(
             _wrap_for_dlpack(weight_scale),
             _wrap_for_dlpack(bias_arg),
             _wrap_for_dlpack(out),
-            DTYPE_TO_CODE[out_dtype],
+            output_dtype_code,
             stream_ptr,
         )
 
-    return out.reshape(*orig_shape[:-1], n)
+    return out if is_2d_output else out.reshape(*orig_shape[:-1], n)
 
 
 def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
