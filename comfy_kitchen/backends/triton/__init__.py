@@ -56,6 +56,27 @@ def _build_constraints() -> dict:
     triton_devices = frozenset({"cuda", "xpu"})
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
 
+    # Skip on ROCm — the AMD backend has no `r` register and would crash
+    # with "error: couldn't allocate input reg for constraint 'r'".
+    sm_specific = {} if getattr(torch.version, "hip", None) else {
+        # Uses inline PTX: cvt.rn.f16x2.e2m1x2 (SM100/Blackwell instruction)
+        "dequantize_nvfp4": FunctionConstraints(
+            params={
+                "qx": ParamConstraint(
+                    dtypes=frozenset({torch.uint8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "per_tensor_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "block_scales": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn}),
+                ),
+                "output_type": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(10, 0),  # SM100 required for cvt.rn.f16x2.e2m1x2
+        ),
+    }
+
     return {
         "adaln": FunctionConstraints(
             params={
@@ -104,22 +125,7 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
         ),
-        # Uses inline PTX: cvt.rn.f16x2.e2m1x2 (SM100/Blackwell instruction)
-        "dequantize_nvfp4": FunctionConstraints(
-            params={
-                "qx": ParamConstraint(
-                    dtypes=frozenset({torch.uint8}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "per_tensor_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
-                "block_scales": ParamConstraint(
-                    dtypes=frozenset({torch.float8_e4m3fn}),
-                ),
-                "output_type": ParamConstraint(dtypes=standard_floats),
-            },
-            default_devices=cuda_devices,
-            min_compute_capability=(10, 0),  # SM100 required for cvt.rn.f16x2.e2m1x2
-        ),
+        **sm_specific,
         "apply_rope1": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
