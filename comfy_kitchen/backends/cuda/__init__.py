@@ -211,12 +211,15 @@ def _convrot_fused_shared_memory_fits(x: torch.Tensor, k: int, group_size: int) 
     max_shared = _shared_memory_per_block_cache.get(device_index)
     if max_shared is None:
         props = torch.cuda.get_device_properties(device_index)
-        max_shared = getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
+        if _cuda_device_is_turing(device_index):
+            max_shared = props.shared_memory_per_block
+        else:
+            max_shared = getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
         _shared_memory_per_block_cache[device_index] = max_shared
-    # The fused convrot rowwise kernel stages the rotated row plus scratch in
-    # shared memory. For group_size=256 the CUDA kernel requests this amount.
-    requested_shared = (k + 2048) * 4
-    return requested_shared <= max_shared
+    # The fused convrot64 kernel stages both fp32 scratch and row data in
+    # shared memory. Its launch-time request is 8 bytes per column.
+    requested_shared = k * 8
+    return requested_shared < max_shared
 
 
 def _should_use_convrot_fused_kernel(x: torch.Tensor, k: int, group_size: int) -> bool:
@@ -693,6 +696,7 @@ def quantize_int8_convrot_weight(
         group_size == 256
         and k % 256 == 0
         and 256 <= k <= _CONVROT_FUSED_MAX_K
+        and _convrot_fused_shared_memory_fits(weight_2d, k, group_size)
     ):
         return quantize_int8_rowwise_convrot64(weight_2d, group_size, stochastic_rounding=stochastic_rounding)
 
@@ -965,6 +969,7 @@ def int8_linear(
         and convrot_groupsize == 256
         and k % 256 == 0
         and 256 <= k <= _CONVROT_FUSED_MAX_K
+        and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
     )
     nonconvrot_m1_supported = (
         m == 1
@@ -1004,6 +1009,7 @@ def int8_linear(
             convrot_groupsize == 256
             and k % 256 == 0
             and 256 <= k <= _CONVROT_FUSED_MAX_K
+            and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
         ):
             q_scratch, scale_scratch = _int8_quant_scratch_tensors(x.device, stream_ptr, m, k)
             _C.quantize_int8_rowwise_convrot64(
