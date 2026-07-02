@@ -13,6 +13,7 @@ __all__ = [
     "DivisibleBy",
     "ExactDims",
     "FunctionConstraints",
+    "GfxArchConstraint",
     "MinDims",
     "ParamConstraint",
     "ShapeRule",
@@ -146,6 +147,45 @@ class FunctionConstraints:
 
 
 # =============================================================================
+# ROCm / GFX Architecture Constraint
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class GfxArchConstraint:
+    """Gate an op on a minimum AMD GFX architecture number.
+
+    Evaluated once at ROCm backend registration time (not per call).
+
+    Args:
+        min_gfx: Minimum GFX number, e.g.:
+            906  – any modern CDNA/Vega
+            940  – MI300X / CDNA3
+            1100 – RX 7900 XTX / RDNA3 (first with hipBLASLt FP8)
+            1200 – RX 9060 XT / RDNA4
+    """
+
+    min_gfx: int
+
+    def check(self) -> bool:
+        if not torch.cuda.is_available():
+            return False
+        if getattr(torch.version, "hip", None) is None:
+            return False
+        try:
+            import re
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            arch = getattr(props, "gcnArchName", None)
+            if not arch:
+                return False
+            base = arch.split(":")[0]
+            m = re.search(r"\d+", base)
+            return bool(m) and int(m.group(0)) >= self.min_gfx
+        except Exception:
+            return False
+
+
+# =============================================================================
 # Validation Logic
 # =============================================================================
 
@@ -228,6 +268,17 @@ def validate_function_call(
     Returns:
         ValidationResult indicating success or first failure
     """
+    # ROCm devices don't expose CUDA compute capabilities. If this is a ROCm
+    # build, ops that carry a min_compute_capability constraint (i.e. NVIDIA-only
+    # ops like cublasLt scaled_mm_nvfp4) correctly report unavailable instead of
+    # raising an exception inside torch.cuda.get_device_properties.
+    if getattr(torch.version, "hip", None) is not None:
+        if constraints.min_compute_capability is not None:
+            return ValidationResult.fail(
+                "__hardware__",
+                "CUDA compute capability constraint not applicable on ROCm device",
+            )
+
     if constraints.min_compute_capability is not None:
         if compute_capability is None:
             return ValidationResult.fail(

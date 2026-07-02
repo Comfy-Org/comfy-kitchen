@@ -4,6 +4,7 @@ from .backends import cuda as _cuda_backend  # noqa: F401
 
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
+from .backends import rocm as _rocm_backend   # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
