@@ -197,10 +197,10 @@ class TestInt4LinearCudaParity:
     def test_matches_eager(self, seed, dtype, convrot, shape):
         from comfy_kitchen.backends.cuda import int4_linear as cuda_int4_linear
 
-        M, K, N = shape
-        x = torch.randn(M, K, dtype=dtype, device="cuda")
-        w = torch.randn(N, K, dtype=dtype, device="cuda")
-        bias = torch.randn(N, dtype=dtype, device="cuda")
+        m, k, n = shape
+        x = torch.randn(m, k, dtype=dtype, device="cuda")
+        w = torch.randn(n, k, dtype=dtype, device="cuda")
+        bias = torch.randn(n, dtype=dtype, device="cuda")
         if convrot:
             wq, ws = quantize_int4_convrot_weight(w, 256)
         else:

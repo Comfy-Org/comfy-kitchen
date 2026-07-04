@@ -1473,17 +1473,17 @@ def int4_linear(
       out          (..., N)   out_dtype
     """
     k_half = weight.shape[-1]
-    K = k_half * 2
-    N = weight.shape[0]
-    if x.shape[-1] != K:
+    k = k_half * 2
+    n = weight.shape[0]
+    if x.shape[-1] != k:
         raise ValueError(
-            f"Input and weight inner dimensions must match, got {x.shape[-1]} and {K} "
+            f"Input and weight inner dimensions must match, got {x.shape[-1]} and {k} "
             f"(packed weight {tuple(weight.shape)})"
         )
     if convrot and convrot_groupsize != 256:
         raise ValueError("int4_tensorwise fused kernel only supports convrot_groupsize 256")
-    if convrot and K % 256 != 0:
-        raise ValueError(f"ConvRot group size 256 does not divide input features {K}")
+    if convrot and k % 256 != 0:
+        raise ValueError(f"ConvRot group size 256 does not divide input features {k}")
 
     orig_shape = x.shape
     try:
@@ -1494,19 +1494,19 @@ def int4_linear(
         # back-to-back projections of the same activation object (q/k pattern) —
         # any interleaved int4_linear call evicts it.
         x_version = -1
-    memo_tag = (x_version, K, bool(convrot), int(convrot_groupsize), x.device, x.dtype)
+    memo_tag = (x_version, k, bool(convrot), int(convrot_groupsize), x.device, x.dtype)
     memo = _INT4_TENSORWISE_QUANT_MEMO[0]
     if memo is not None and memo[0] is x and memo[1] == memo_tag:
-        q_x, ascales, M, M_pad = memo[2], memo[3], memo[4], memo[5]
+        q_x, ascales, m, m_pad = memo[2], memo[3], memo[4], memo[5]
     else:
-        x2d = x.reshape(-1, K).contiguous()
-        M = x2d.shape[0]
-        M_pad = roundup(max(M, 1), 256)
+        x2d = x.reshape(-1, k).contiguous()
+        m = x2d.shape[0]
+        m_pad = roundup(max(m, 1), 256)
 
-        q_x = torch.empty(M_pad, k_half, dtype=torch.int8, device=x.device)
+        q_x = torch.empty(m_pad, k_half, dtype=torch.int8, device=x.device)
         # Rank-1 GEMM path reads only the first scale-group row, so a single-group
         # ascales buffer suffices (the quantize kernel writes ascales.shape[0] groups).
-        ascales = torch.empty(1, M_pad, dtype=x2d.dtype, device=x.device)
+        ascales = torch.empty(1, m_pad, dtype=x2d.dtype, device=x.device)
         stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
         _C.int4_tensorwise_quantize(
             _wrap_for_dlpack(x2d),
@@ -1516,17 +1516,17 @@ def int4_linear(
             stream_ptr,
         )
         if _INT4_TENSORWISE_QUANT_MEMO_ENABLED:
-            _INT4_TENSORWISE_QUANT_MEMO[0] = (x, memo_tag, q_x, ascales, M, M_pad)
+            _INT4_TENSORWISE_QUANT_MEMO[0] = (x, memo_tag, q_x, ascales, m, m_pad)
 
     # Rank-1 GEMM path reads only the first wscales row: no per-group broadcast.
-    wscales = weight_scale.reshape(1, N).to(device=weight.device, dtype=x.dtype).contiguous()
+    wscales = weight_scale.reshape(1, n).to(device=weight.device, dtype=x.dtype).contiguous()
 
-    lkey = (x.device.index, out_dtype, N)
+    lkey = (x.device.index, out_dtype, n)
     lora = _INT4_TENSORWISE_EMPTY_LORA_CACHE.get(lkey)
     if lora is None:
-        lora = torch.empty(N, 0, dtype=out_dtype, device=x.device)
+        lora = torch.empty(n, 0, dtype=out_dtype, device=x.device)
         _INT4_TENSORWISE_EMPTY_LORA_CACHE[lkey] = lora
-    lora_act = torch.empty(M_pad, 0, dtype=out_dtype, device=x.device)
+    lora_act = torch.empty(m_pad, 0, dtype=out_dtype, device=x.device)
 
     if bias is not None and bias.dtype != out_dtype:
         bias = bias.to(out_dtype)
@@ -1542,14 +1542,14 @@ def int4_linear(
         act_unsigned=False,
         rank_one=True,
     )
-    return out[:M].reshape(*orig_shape[:-1], N)
+    return out[:m].reshape(*orig_shape[:-1], n)
 
 
-# Above this M the fused MMA kernel falls behind cuBLAS bf16 GEMM on Blackwell
-# (cuBLAS approaches peak; the kernel here is single-thread-per-N-row in the
+# Above this m the fused MMA kernel falls behind cuBLAS bf16 GEMM on Blackwell
+# (cuBLAS approaches peak; the kernel here is single-thread-per-n-row in the
 # dequant pass and lacks cp.async pipelining). Empirically the crossover sits
-# near M=256 on RTX 5090 / Qwen-Image-Edit shapes (M=256: 1.6x vs eager,
-# M=512: 0.88x). Above the limit we route to a CUDA-side dequant +
+# near m=256 on RTX 5090 / Qwen-Image-Edit shapes (m=256: 1.6x vs eager,
+# m=512: 0.88x). Above the limit we route to a CUDA-side dequant +
 # torch.matmul (cuBLAS) path. Future tuning of the MMA kernel will raise
 # this limit and eventually remove the fallback.
 _AWQ_W4A16_MMA_M_LIMIT = 256
