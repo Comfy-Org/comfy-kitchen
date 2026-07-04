@@ -58,6 +58,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 namespace {
@@ -223,7 +224,9 @@ template<
     bool kSharedScale,
     bool kFuseLora,
     bool kRankOne,
-    int kMUnrollT = kMUnroll>
+    int kMUnrollT = kMUnroll,
+    int kWarpsMT = kWarpsM,
+    int kStagesT = kStages>
 __global__ void svdquant_scaled_mm_w4a4_kernel(
     const int8_t* __restrict__ act,          // (M, K/2)
     const int8_t* __restrict__ wgt,          // (N, K/2)
@@ -239,11 +242,19 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
         (void)lora_act_in; (void)lora_up; (void)R;
     }
 
-    // M-tile geometry may be widened per instantiation (rank-one uses a taller
-    // CTA to cut B-tile rereads); these shadow the file-scope defaults.
+    // Tile geometry / pipeline depth may be widened per instantiation (rank-one
+    // uses a taller CTA to cut B-tile rereads); these shadow the file-scope
+    // defaults, and every derived constant is recomputed from them.
     constexpr int kMUnroll = kMUnrollT;
     constexpr int kWarpM   = kMUnroll * 16;
+    constexpr int kWarpsM  = kWarpsMT;
     constexpr int kBlockM  = kWarpM * kWarpsM;
+    constexpr int kNumWarps = kWarpsM * kWarpsN;
+    constexpr int kThreadsPerBlock = kNumWarps * 32;
+    constexpr int kStages = kStagesT;
+    constexpr int kBLoadSweeps = (kBlockN * 2 + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    constexpr int kALoadSweeps = (kBlockM * 2 + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    static_assert((kWarpsM & (kWarpsM - 1)) == 0, "kWarpsM must be a power of two");
 
     // CTA coordinates
     const int cta_m = blockIdx.y * kBlockM;
@@ -375,17 +386,20 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
     // ---------- Helper: issue async cp for A tile at group `g` into stage ----------
     auto issue_A_load = [&](int g, int stage) {
         if (g >= num_groups) return;
-        const int t = threadIdx.x;
-        if (t < kBlockM * 2) {
-            const int m_row = t >> 1;
-            const int half  = t & 1;
-            const int m_global = cta_m + m_row;
-            int8_t* dst = &smem_A[stage][m_row * kBlockKBytes + half * 16];
-            if (m_global < M) {
-                const int8_t* src = act + m_global * K_half + g * kBlockKBytes + half * 16;
-                cp_async_16b(dst, src);
-            } else {
-                reinterpret_cast<uint4*>(dst)[0] = {0, 0, 0, 0};
+        #pragma unroll
+        for (int sweep = 0; sweep < kALoadSweeps; ++sweep) {
+            const int t = threadIdx.x + sweep * kThreadsPerBlock;
+            if (t < kBlockM * 2) {
+                const int m_row = t >> 1;
+                const int half  = t & 1;
+                const int m_global = cta_m + m_row;
+                int8_t* dst = &smem_A[stage][m_row * kBlockKBytes + half * 16];
+                if (m_global < M) {
+                    const int8_t* src = act + m_global * K_half + g * kBlockKBytes + half * 16;
+                    cp_async_16b(dst, src);
+                } else {
+                    reinterpret_cast<uint4*>(dst)[0] = {0, 0, 0, 0};
+                }
             }
         }
     };
@@ -756,29 +770,50 @@ void launch_svdquant_scaled_mm_w4a4_kernel(
 
     if (rank_one) {
         // int4_tensorwise path: natural layout, signed, robust accumulator, no LoRA.
-        // Taller M tile (kMUnroll=4 -> 128 M/CTA) quarters B-tile rereads vs the
-        // default geometry; the freed per-group scale registers pay for it.
-        constexpr int kMUnrollR1 = 4;
-        constexpr int kBlockM_R1 = kMUnrollR1 * 16 * kWarpsM;
-        const dim3 grid_r1((N + kBlockN - 1) / kBlockN, (M + kBlockM_R1 - 1) / kBlockM_R1);
-        #define LAUNCH_GEMM_R1(OutType)                                                     \
-            svdquant_scaled_mm_w4a4_kernel<OutType, false, false, false, false, false, true,\
-                                           kMUnrollR1>                                      \
-                <<<grid_r1, block, 0, stream>>>(                                            \
-                reinterpret_cast<const int8_t*>(act),                                       \
-                reinterpret_cast<const int8_t*>(wgt),                                       \
-                reinterpret_cast<const OutType*>(ascales),                                  \
-                reinterpret_cast<const OutType*>(wscales),                                  \
-                reinterpret_cast<const OutType*>(lora_act_in),                              \
-                reinterpret_cast<const OutType*>(lora_up),                                  \
-                reinterpret_cast<const OutType*>(bias),                                     \
-                reinterpret_cast<OutType*>(out),                                            \
-                M, N, K, R)
-        if (out_dtype_code == 2 /* bf16 */) {
-            LAUNCH_GEMM_R1(__nv_bfloat16);
-        } else if (out_dtype_code == 1 /* fp16 */) {
-            LAUNCH_GEMM_R1(__half);
+        // Taller M tiles cut B-tile rereads (the freed per-group scale registers /
+        // extra warps pay for them). Config selectable for tuning via
+        // COMFY_KITCHEN_INT4_R1_CONFIG (0: 128M/8w/3st, 1: 128M/8w/4st,
+        // 2: 64M/8w/3st, 3: 96M/8w/3st); default 0. Register-file trade: kMUnroll=4
+        // costs 128 regs -> 2 CTAs/SM (33% occupancy); smaller M-tiles raise
+        // occupancy at the price of more (L2-resident) B rereads.
+        int r1_config = 0;
+        if (const char* cfg = std::getenv("COMFY_KITCHEN_INT4_R1_CONFIG")) {
+            r1_config = std::atoi(cfg);
         }
+        #define LAUNCH_GEMM_R1(OutType, MU, WM, ST)                                         \
+            do {                                                                            \
+                constexpr int kBlockM_R1 = (MU) * 16 * (WM);                                \
+                const dim3 grid_r1((N + kBlockN - 1) / kBlockN,                             \
+                                   (M + kBlockM_R1 - 1) / kBlockM_R1);                      \
+                const dim3 block_r1((WM) * kWarpsN * 32);                                   \
+                svdquant_scaled_mm_w4a4_kernel<OutType, false, false, false, false, false,  \
+                                               true, (MU), (WM), (ST)>                      \
+                    <<<grid_r1, block_r1, 0, stream>>>(                                     \
+                    reinterpret_cast<const int8_t*>(act),                                   \
+                    reinterpret_cast<const int8_t*>(wgt),                                   \
+                    reinterpret_cast<const OutType*>(ascales),                              \
+                    reinterpret_cast<const OutType*>(wscales),                              \
+                    reinterpret_cast<const OutType*>(lora_act_in),                          \
+                    reinterpret_cast<const OutType*>(lora_up),                              \
+                    reinterpret_cast<const OutType*>(bias),                                 \
+                    reinterpret_cast<OutType*>(out),                                        \
+                    M, N, K, R);                                                            \
+            } while (0)
+        #define DISPATCH_R1(OutType)                                                        \
+            do {                                                                            \
+                switch (r1_config) {                                                        \
+                    case 1:  LAUNCH_GEMM_R1(OutType, 4, 2, 4); break;                       \
+                    case 2:  LAUNCH_GEMM_R1(OutType, 2, 2, 3); break;                       \
+                    case 3:  LAUNCH_GEMM_R1(OutType, 3, 2, 3); break;                       \
+                    default: LAUNCH_GEMM_R1(OutType, 4, 2, 3); break;                       \
+                }                                                                           \
+            } while (0)
+        if (out_dtype_code == 2 /* bf16 */) {
+            DISPATCH_R1(__nv_bfloat16);
+        } else if (out_dtype_code == 1 /* fp16 */) {
+            DISPATCH_R1(__half);
+        }
+        #undef DISPATCH_R1
         #undef LAUNCH_GEMM_R1
         return;
     }

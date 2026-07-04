@@ -1442,6 +1442,14 @@ def scaled_mm_svdquant_w4a4(
 
 
 _INT4_TENSORWISE_EMPTY_LORA_CACHE: dict = {}
+# Last-activation quantize memo: attention q/k (and txt-stream add_q/add_k)
+# projections receive the SAME activation tensor object back to back, so the
+# rotated+quantized activation can be reused. Guarded by object identity plus
+# torch's in-place version counter — a capacity-1 memo, overwritten every miss.
+_INT4_TENSORWISE_QUANT_MEMO: list = [None]
+_INT4_TENSORWISE_QUANT_MEMO_ENABLED = os.getenv(
+    "COMFY_KITCHEN_INT4_QUANT_MEMO", "1"
+).lower() not in {"0", "false", "no", "off"}
 
 
 def int4_linear(
@@ -1478,25 +1486,40 @@ def int4_linear(
         raise ValueError(f"ConvRot group size 256 does not divide input features {K}")
 
     orig_shape = x.shape
-    x2d = x.reshape(-1, K).contiguous()
-    M = x2d.shape[0]
-    M_pad = roundup(max(M, 1), 256)
+    try:
+        x_version = x._version
+    except RuntimeError:
+        # Inference-mode tensors track no version counter. Fall back to an
+        # identity-only guard: the memo has capacity 1, so it only ever serves
+        # back-to-back projections of the same activation object (q/k pattern) —
+        # any interleaved int4_linear call evicts it.
+        x_version = -1
+    memo_tag = (x_version, K, bool(convrot), int(convrot_groupsize), x.device, x.dtype)
+    memo = _INT4_TENSORWISE_QUANT_MEMO[0]
+    if memo is not None and memo[0] is x and memo[1] == memo_tag:
+        q_x, ascales, M, M_pad = memo[2], memo[3], memo[4], memo[5]
+    else:
+        x2d = x.reshape(-1, K).contiguous()
+        M = x2d.shape[0]
+        M_pad = roundup(max(M, 1), 256)
 
-    q_x = torch.empty(M_pad, k_half, dtype=torch.int8, device=x.device)
-    # Rank-1 GEMM path reads only the first scale-group row, so a single-group
-    # ascales buffer suffices (the quantize kernel writes ascales.shape[0] groups).
-    ascales = torch.empty(1, M_pad, dtype=x2d.dtype, device=x.device)
-    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
-    _C.int4_tensorwise_quantize(
-        _wrap_for_dlpack(x2d),
-        _wrap_for_dlpack(q_x),
-        _wrap_for_dlpack(ascales),
-        bool(convrot),
-        stream_ptr,
-    )
+        q_x = torch.empty(M_pad, k_half, dtype=torch.int8, device=x.device)
+        # Rank-1 GEMM path reads only the first scale-group row, so a single-group
+        # ascales buffer suffices (the quantize kernel writes ascales.shape[0] groups).
+        ascales = torch.empty(1, M_pad, dtype=x2d.dtype, device=x.device)
+        stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+        _C.int4_tensorwise_quantize(
+            _wrap_for_dlpack(x2d),
+            _wrap_for_dlpack(q_x),
+            _wrap_for_dlpack(ascales),
+            bool(convrot),
+            stream_ptr,
+        )
+        if _INT4_TENSORWISE_QUANT_MEMO_ENABLED:
+            _INT4_TENSORWISE_QUANT_MEMO[0] = (x, memo_tag, q_x, ascales, M, M_pad)
 
     # Rank-1 GEMM path reads only the first wscales row: no per-group broadcast.
-    wscales = weight_scale.reshape(1, N).to(device=weight.device, dtype=x2d.dtype).contiguous()
+    wscales = weight_scale.reshape(1, N).to(device=weight.device, dtype=x.dtype).contiguous()
 
     lkey = (x.device.index, out_dtype, N)
     lora = _INT4_TENSORWISE_EMPTY_LORA_CACHE.get(lkey)
