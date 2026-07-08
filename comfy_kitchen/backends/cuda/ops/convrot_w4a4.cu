@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cfloat>
 #include <cstdint>
 #include <type_traits>
 
@@ -56,6 +57,17 @@ __device__ __forceinline__ int quantize_int4_value(float x, float inv_scale, uin
         q = __float2int_rn(scaled);
     }
     return max(-kInt4Max, min(kInt4Max, q));
+}
+
+template<typename T>
+__device__ __forceinline__ float finite_max_for_dtype();
+template<> __device__ __forceinline__ float finite_max_for_dtype<float>() { return FLT_MAX; }
+template<> __device__ __forceinline__ float finite_max_for_dtype<__half>() { return 65504.0f; }
+template<> __device__ __forceinline__ float finite_max_for_dtype<__nv_bfloat16>() { return 3.38953139e38f; }
+
+template<typename T>
+__device__ __forceinline__ float finite_absmax_for_int4_scale(float abs_max) {
+    return fminf(abs_max, finite_max_for_dtype<T>());
 }
 
 __device__ __forceinline__ int unpack_int4_nibble(uint32_t v) {
@@ -1000,7 +1012,9 @@ __global__ void quantize_int4_rowwise_kernel(
         absmax = fmaxf(absmax, fabsf(to_float(x[row_offset + col])));
     }
     absmax = block_reduce_max<kWarps>(absmax, warp_smem, &block_smem);
-    const float scale = fmaxf(absmax * (1.0f / static_cast<float>(kInt4Max)), 1.0e-10f);
+    const float scale = fmaxf(
+        finite_absmax_for_int4_scale<InType>(absmax) * (1.0f / static_cast<float>(kInt4Max)),
+        1.0e-10f);
     if (tid == 0) {
         scales[row] = scale;
     }
@@ -1106,7 +1120,9 @@ __global__ void quantize_int4_rowwise_convrot64_kernel(
     }
 
     abs_max = block_reduce_max<kWarps>(abs_max, warp_smem, &block_smem);
-    const float scale = fmaxf(abs_max * (1.0f / static_cast<float>(kInt4Max)), 1.0e-10f);
+    const float scale = fmaxf(
+        finite_absmax_for_int4_scale<InType>(abs_max) * (1.0f / static_cast<float>(kInt4Max)),
+        1.0e-10f);
     if (tid == 0) {
         scales[row] = scale;
     }
@@ -1201,7 +1217,9 @@ __global__ void quantize_int4_rowwise_convrot64_to_int8_float_kernel(
     }
 
     abs_max = block_reduce_max<kWarps>(abs_max, warp_smem, &block_smem);
-    const float scale = fmaxf(abs_max * (1.0f / static_cast<float>(kInt4Max)), 1.0e-10f);
+    const float scale = fmaxf(
+        finite_absmax_for_int4_scale<InType>(abs_max) * (1.0f / static_cast<float>(kInt4Max)),
+        1.0e-10f);
     if (tid == 0) {
         scales[row] = scale;
     }
@@ -1287,7 +1305,9 @@ __global__ void quantize_int4_rowwise_convrot_small_kernel(
     }
 
     abs_max = block_reduce_max<kWarps>(abs_max, warp_smem, &block_smem);
-    const float scale = fmaxf(abs_max * (1.0f / static_cast<float>(kInt4Max)), 1.0e-10f);
+    const float scale = fmaxf(
+        finite_absmax_for_int4_scale<InType>(abs_max) * (1.0f / static_cast<float>(kInt4Max)),
+        1.0e-10f);
     if (tid == 0) {
         scales[row] = scale;
     }
