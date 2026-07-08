@@ -11,10 +11,14 @@ __all__ = [
     "dequantize_int8_simple_dtype",
     "dequantize_int8_convrot_weight",
     "dequantize_int8_convrot_weight_dtype",
+    "dequantize_convrot_w4a4_weight",
     "gemv_awq_w4a16",
+    "convrot_w4a4_linear",
+    "prepare_int4_weight_for_int8_linear",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
+    "quantize_convrot_w4a4_weight",
     "quantize_int8_rowwise",
     "quantize_int8_convrot_weight",
     "quantize_and_rotate_rowwise",
@@ -38,6 +42,12 @@ from comfy_kitchen.registry import registry
 
 from .adaln import adaln
 from .awq import gemv_awq_w4a16
+from .convrot_w4a4 import (
+    convrot_w4a4_linear,
+    dequantize_convrot_w4a4_weight,
+    prepare_int4_weight_for_int8_linear,
+    quantize_convrot_w4a4_weight,
+)
 from .quantization import (
     dequantize_int8_convrot_weight,
     dequantize_int8_convrot_weight_dtype,
@@ -208,6 +218,42 @@ def _build_constraints() -> dict:
                     shape_rules=(ExactDims(2),),
                 ),
                 "lora_up": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "quantize_convrot_w4a4_weight": FunctionConstraints(
+            params={
+                "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
+                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+            },
+            default_devices=all_devices,
+        ),
+        "dequantize_convrot_w4a4_weight": FunctionConstraints(
+            params={
+                "qdata": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+                "scales": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(1),)),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
+                "output_dtype": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "convrot_w4a4_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "qweight": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+                "wscales": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(1),)),
+                "bias": ParamConstraint(dtypes=standard_floats),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
+            },
+            default_devices=all_devices,
+        ),
+        "prepare_int4_weight_for_int8_linear": FunctionConstraints(
+            params={
+                "weight": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
             },
             default_devices=all_devices,
         ),

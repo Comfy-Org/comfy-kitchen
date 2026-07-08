@@ -750,7 +750,88 @@ extern "C" {
         uint64_t seed,
         cudaStream_t stream);
 
+    void launch_quantize_int4_rowwise_kernel(
+        const void* input,
+        void* output,
+        void* scales,
+        int64_t M,
+        int64_t K,
+        int input_dtype_code,
+        bool stochastic,
+        uint64_t seed,
+        cudaStream_t stream);
+
+    void launch_quantize_int4_rowwise_convrot64_kernel(
+        const void* input,
+        void* output,
+        void* scales,
+        int64_t M,
+        int64_t K,
+        int group_size,
+        int input_dtype_code,
+        bool stochastic,
+        uint64_t seed,
+        cudaStream_t stream);
+
+    void launch_quantize_int4_rowwise_convrot64_to_int8_kernel(
+        const void* input,
+        void* output,
+        void* scales,
+        int64_t M,
+        int64_t K,
+        int group_size,
+        int input_dtype_code,
+        bool stochastic,
+        uint64_t seed,
+        cudaStream_t stream);
+
+    void launch_dequantize_int4_convrot64_kernel(
+        const void* input,
+        const void* scales,
+        void* output,
+        int64_t M,
+        int64_t K,
+        int64_t scale_size,
+        int group_size,
+        int output_dtype_code,
+        cudaStream_t stream);
+
+    void launch_int4_linear_kernel(
+        const void* act,
+        const void* weight,
+        const void* x_scales,
+        const void* weight_scales,
+        const void* bias,
+        void* output,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        bool has_bias,
+        int output_dtype_code,
+        int bias_dtype_code,
+        cudaStream_t stream);
+
+    void launch_unpack_int4_to_int8_kernel(
+        const void* input,
+        void* output,
+        int64_t rows,
+        int64_t K_half,
+        cudaStream_t stream);
+
     bool launch_cutlass_int8_dequant(
+        const void* A,
+        const void* B,
+        const void* xs,
+        const void* ws,
+        const void* bias,
+        void* D,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int out_dtype_code,
+        cudaStream_t stream);
+
+    bool launch_cutlass_int4_dequant(
         const void* A,
         const void* B,
         const void* xs,
@@ -938,6 +1019,243 @@ void quantize_int8_rowwise(
         stream);
 }
 
+void quantize_int4_rowwise(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> scales,
+    bool stochastic,
+    uint64_t seed,
+    uintptr_t stream_ptr) {
+
+    const int64_t M = input.shape(0);
+    const int64_t K = input.shape(1);
+    if (K % 64 != 0) {
+        throw std::runtime_error("INT4 rowwise quantization requires K divisible by 64");
+    }
+    if (output.shape(0) != M || output.shape(1) != K / 2) {
+        throw std::runtime_error("INT4 rowwise quantization output shape mismatch");
+    }
+    if (scales.shape(0) != M || scales.shape(1) != 1) {
+        throw std::runtime_error("INT4 rowwise quantization scale shape mismatch");
+    }
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
+    if (input_dtype_code < 0 || input_dtype_code > 2) {
+        throw std::runtime_error("Unsupported input dtype for INT4 rowwise quantization");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quantize_int4_rowwise_kernel(
+        input.data(),
+        output.data(),
+        scales.data(),
+        M,
+        K,
+        input_dtype_code,
+        stochastic,
+        seed,
+        stream);
+}
+
+void quantize_int4_rowwise_convrot64(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> scales,
+    int group_size,
+    bool stochastic,
+    uint64_t seed,
+    uintptr_t stream_ptr) {
+
+    const int64_t M = input.shape(0);
+    const int64_t K = input.shape(1);
+    if (group_size != 16 && group_size != 64 && group_size != 256) {
+        throw std::runtime_error("INT4 ConvRot quantization requires group_size 16, 64, or 256");
+    }
+    if (K % group_size != 0) {
+        throw std::runtime_error("INT4 ConvRot quantization requires K divisible by group_size");
+    }
+    if (output.shape(0) != M || output.shape(1) != K / 2) {
+        throw std::runtime_error("INT4 ConvRot quantization output shape mismatch");
+    }
+    if (scales.shape(0) != M || scales.shape(1) != 1) {
+        throw std::runtime_error("INT4 ConvRot quantization scale shape mismatch");
+    }
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
+    if (input_dtype_code < 0 || input_dtype_code > 2) {
+        throw std::runtime_error("Unsupported input dtype for INT4 ConvRot quantization");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quantize_int4_rowwise_convrot64_kernel(
+        input.data(),
+        output.data(),
+        scales.data(),
+        M,
+        K,
+        group_size,
+        input_dtype_code,
+        stochastic,
+        seed,
+        stream);
+}
+
+void quantize_int4_rowwise_convrot64_to_int8(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> scales,
+    int group_size,
+    bool stochastic,
+    uint64_t seed,
+    uintptr_t stream_ptr) {
+
+    const int64_t M = input.shape(0);
+    const int64_t K = input.shape(1);
+    if (output.shape(0) != M || output.shape(1) != K) {
+        throw std::runtime_error("INT4 ConvRot fallback activation output shape mismatch");
+    }
+    if (scales.shape(0) != M || scales.shape(1) != 1) {
+        throw std::runtime_error("INT4 ConvRot fallback activation scales must have shape [M, 1]");
+    }
+    if (group_size != 256 || K % group_size != 0) {
+        throw std::runtime_error("INT4 ConvRot fallback activation quantization requires group_size 256 and divisible K");
+    }
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
+    if (input_dtype_code < 0 || input_dtype_code > 2) {
+        throw std::runtime_error("Unsupported input dtype for INT4 ConvRot fallback activation quantization");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quantize_int4_rowwise_convrot64_to_int8_kernel(
+        input.data(),
+        output.data(),
+        scales.data(),
+        M,
+        K,
+        static_cast<int>(group_size),
+        input_dtype_code,
+        stochastic,
+        seed,
+        stream);
+}
+
+void dequantize_int4_convrot64(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    int group_size,
+    uintptr_t stream_ptr) {
+
+    const int64_t M = input.shape(0);
+    const int64_t K = input.shape(1) * 2;
+    if (group_size != 16 && group_size != 64 && group_size != 256) {
+        throw std::runtime_error("INT4 ConvRot dequantization requires group_size 16, 64, or 256");
+    }
+    if (K % group_size != 0) {
+        throw std::runtime_error("INT4 ConvRot dequantization requires K divisible by group_size");
+    }
+    if (output.shape(0) != M || output.shape(1) != K) {
+        throw std::runtime_error("INT4 ConvRot dequantization output shape mismatch");
+    }
+    if (scales.size() != 1 && scales.size() != static_cast<size_t>(M)) {
+        throw std::runtime_error("INT4 ConvRot dequantization scale must be scalar or per-row");
+    }
+    const int output_dtype_code = map_dtype_to_code(output.dtype());
+    if (output_dtype_code < 0 || output_dtype_code > 2) {
+        throw std::runtime_error("Unsupported output dtype for INT4 ConvRot dequantization");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_dequantize_int4_convrot64_kernel(
+        input.data(),
+        scales.data(),
+        output.data(),
+        M,
+        K,
+        static_cast<int64_t>(scales.size()),
+        group_size,
+        output_dtype_code,
+        stream);
+}
+
+void int4_linear(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> act,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> weight,
+    nb::ndarray<float, nb::device::cuda> x_scales,
+    nb::ndarray<float, nb::device::cuda> weight_scales,
+    nb::ndarray<nb::device::cuda> bias,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    int output_dtype_code,
+    uintptr_t stream_ptr) {
+
+    const int64_t M = act.shape(0);
+    const int64_t K_half = act.shape(1);
+    const int64_t N = weight.shape(0);
+    if (weight.shape(1) != K_half) {
+        throw std::runtime_error("INT4 linear K dimensions do not match");
+    }
+    const int64_t K = K_half * 2;
+    if (K % 64 != 0) {
+        throw std::runtime_error("INT4 linear requires K divisible by 64");
+    }
+    if (x_scales.size() != static_cast<size_t>(M)) {
+        throw std::runtime_error("INT4 linear x_scales must have one value per row");
+    }
+    if (weight_scales.size() != static_cast<size_t>(N)) {
+        throw std::runtime_error("INT4 linear weight_scales must have one value per output channel");
+    }
+    if (output.shape(0) != M || output.shape(1) != N) {
+        throw std::runtime_error("INT4 linear output shape mismatch");
+    }
+    const int out_dtype = map_dtype_to_code(output.dtype());
+    if (out_dtype != output_dtype_code) {
+        throw std::runtime_error("INT4 linear output dtype code mismatch");
+    }
+    if (output_dtype_code < 0 || output_dtype_code > 2) {
+        throw std::runtime_error("Unsupported output dtype for INT4 linear");
+    }
+
+    const bool has_bias = bias.size() > 0;
+    int bias_dtype_code = output_dtype_code;
+    if (has_bias) {
+        if (bias.size() != static_cast<size_t>(N)) {
+            throw std::runtime_error("INT4 linear bias shape mismatch");
+        }
+        bias_dtype_code = map_dtype_to_code(bias.dtype());
+        if (bias_dtype_code < 0 || bias_dtype_code > 2) {
+            throw std::runtime_error("Unsupported bias dtype for INT4 linear");
+        }
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_int4_linear_kernel(
+        act.data(),
+        weight.data(),
+        x_scales.data(),
+        weight_scales.data(),
+        has_bias ? bias.data() : nullptr,
+        output.data(),
+        M,
+        N,
+        K,
+        has_bias,
+        output_dtype_code,
+        bias_dtype_code,
+        stream);
+}
+
+void unpack_int4_to_int8(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
+    uintptr_t stream_ptr) {
+
+    const int64_t rows = input.shape(0);
+    const int64_t K_half = input.shape(1);
+    if (output.shape(0) != rows || output.shape(1) != K_half * 2) {
+        throw std::runtime_error("unpack_int4_to_int8 output shape mismatch");
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_unpack_int4_to_int8_kernel(input.data(), output.data(), rows, K_half, stream);
+}
+
 // INT8 GEMM + fused dequant (D = acc * xs[m] * ws[n] + bias[n]) via CUTLASS.
 // Returns true on success; false means caller falls back to cuBLAS + dequant.
 bool cutlass_int8_dequant(
@@ -957,6 +1275,32 @@ bool cutlass_int8_dequant(
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const void* bias_ptr = bias.size() > 0 ? bias.data() : nullptr;
     return launch_cutlass_int8_dequant(a.data(), b.data(), xs.data(), ws.data(),
+                                       bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
+}
+
+// INT4 GEMM + fused dequant via CUTLASS. A and B are packed signed int4 in int8 storage.
+// Returns true on success; false means caller falls back to the hand-written int4 kernel.
+bool cutlass_int4_dequant(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> a,   // [M, K / 2]
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> b,   // [N, K / 2]
+    nb::ndarray<float, nb::device::cuda> xs,                // [M] per-row act scale
+    nb::ndarray<float, nb::device::cuda> ws,                // [N] per-col weight scale
+    nb::ndarray<nb::device::cuda> bias,                     // [N] float or empty
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> d,           // [M, N] output
+    int out_dtype_code,
+    uintptr_t stream_ptr) {
+    const int64_t M = a.shape(0);
+    const int64_t K_half = a.shape(1);
+    const int64_t N = b.shape(0);
+    if (b.shape(1) != K_half) throw std::runtime_error("cutlass_int4_dequant: K mismatch");
+    if (d.shape(0) != M || d.shape(1) != N) throw std::runtime_error("cutlass_int4_dequant: D shape mismatch");
+    if (xs.size() != static_cast<size_t>(M)) throw std::runtime_error("cutlass_int4_dequant: xs shape mismatch");
+    if (ws.size() != static_cast<size_t>(N)) throw std::runtime_error("cutlass_int4_dequant: ws shape mismatch");
+    const int64_t K = K_half * 2;
+    if (K % 64 != 0) throw std::runtime_error("cutlass_int4_dequant: K must be divisible by 64");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    const void* bias_ptr = bias.size() > 0 ? bias.data() : nullptr;
+    return launch_cutlass_int4_dequant(a.data(), b.data(), xs.data(), ws.data(),
                                        bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
 }
 
@@ -1449,8 +1793,73 @@ NB_MODULE(_C, m) {
           nb::arg("seed"),
           nb::arg("stream_ptr"));
 
+    m.def("quantize_int4_rowwise", &quantize_int4_rowwise,
+          "Rowwise signed INT4 quantization for CUDA activations/weights",
+          nb::arg("input"),
+          nb::arg("output"),
+          nb::arg("scales"),
+          nb::arg("stochastic"),
+          nb::arg("seed"),
+          nb::arg("stream_ptr"));
+
+    m.def("quantize_int4_rowwise_convrot64", &quantize_int4_rowwise_convrot64,
+          "Fused regular ConvRot-256 activation rotation plus rowwise signed INT4 quantization",
+          nb::arg("input"),
+          nb::arg("output"),
+          nb::arg("scales"),
+          nb::arg("group_size"),
+          nb::arg("stochastic"),
+          nb::arg("seed"),
+          nb::arg("stream_ptr"));
+
+    m.def("quantize_int4_rowwise_convrot64_to_int8", &quantize_int4_rowwise_convrot64_to_int8,
+          "Fused ConvRot-256 activation rotation plus rowwise INT4-scale quantization into INT8 storage",
+          nb::arg("input"),
+          nb::arg("output"),
+          nb::arg("scales"),
+          nb::arg("group_size"),
+          nb::arg("stochastic"),
+          nb::arg("seed"),
+          nb::arg("stream_ptr"));
+
+    m.def("dequantize_int4_convrot64", &dequantize_int4_convrot64,
+          "Fused packed signed INT4 dequantization plus regular ConvRot-256 inverse rotation",
+          nb::arg("input"),
+          nb::arg("scales"),
+          nb::arg("output"),
+          nb::arg("group_size"),
+          nb::arg("stream_ptr"));
+
+    m.def("int4_linear", &int4_linear,
+          "Signed INT4 GEMM with rowwise x colwise dequantization, bias, and output cast",
+          nb::arg("act"),
+          nb::arg("weight"),
+          nb::arg("x_scales"),
+          nb::arg("weight_scales"),
+          nb::arg("bias"),
+          nb::arg("output"),
+          nb::arg("output_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("unpack_int4_to_int8", &unpack_int4_to_int8,
+          "Unpack row-major packed signed INT4 matrix to row-major INT8 matrix",
+          nb::arg("input"),
+          nb::arg("output"),
+          nb::arg("stream_ptr"));
+
     m.def("cutlass_int8_dequant", &cutlass_int8_dequant,
           "INT8 GEMM + fused rowwise x colwise dequant + bias via CUTLASS; false -> fall back to cuBLAS",
+          nb::arg("a"),
+          nb::arg("b"),
+          nb::arg("xs"),
+          nb::arg("ws"),
+          nb::arg("bias"),
+          nb::arg("d"),
+          nb::arg("out_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_int4_dequant", &cutlass_int4_dequant,
+          "INT4 GEMM + fused rowwise x colwise dequant + bias via CUTLASS; false -> fall back to hand kernel",
           nb::arg("a"),
           nb::arg("b"),
           nb::arg("xs"),

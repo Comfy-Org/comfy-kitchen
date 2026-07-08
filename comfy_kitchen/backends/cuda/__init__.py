@@ -32,9 +32,17 @@ __all__ = [
     "dequantize_int8_simple_dtype",
     "dequantize_int8_convrot_weight",
     "dequantize_int8_convrot_weight_dtype",
+    "dequantize_convrot_w4a4_weight",
     "int8_linear",
+    "int4_linear",
+    "convrot_w4a4_linear",
+    "prepare_int4_weight_for_int8_linear",
     "quantize_int8_tensorwise",
     "quantize_int8_rowwise",
+    "quantize_int4_rowwise",
+    "quantize_int4_rowwise_convrot64",
+    "quantize_int4_rowwise_convrot64_to_int8",
+    "quantize_convrot_w4a4_weight",
     "quantize_int8_convrot_weight",
     "quantize_int8_rowwise_convrot64",
     "quantize_and_rotate_rowwise",
@@ -127,6 +135,10 @@ from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
 from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
     quantize_int8_tensorwise as eager_quantize_int8_tensorwise,
 )
+from comfy_kitchen.backends.eager.svdquant import (  # noqa: E402
+    _INT4_GROUP_SIZE,
+    _unpack_int4_row_major,
+)
 from comfy_kitchen.constraints import (  # noqa: E402
     DivisibleBy,
     ExactDims,
@@ -148,6 +160,7 @@ _empty_cuda_tensors: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {
 _turing_device_cache: dict[int, bool] = {}
 _cutlass_int8_device_cache: dict[int, bool] = {}
 _shared_memory_per_block_cache: dict[int, int] = {}
+_FORCE_INT4_INT8_FALLBACK = os.environ.get("COMFY_KITCHEN_FORCE_INT4_INT8_FALLBACK", "0") == "1"
 
 
 def _cuda_device_is_turing(device_index: int) -> bool:
@@ -170,6 +183,16 @@ def _cuda_device_supports_cutlass_int8_dequant(tensor: torch.Tensor) -> bool:
     supported = major >= 8
     _cutlass_int8_device_cache[device_index] = supported
     return supported
+
+
+def _cuda_device_supports_native_int4_mma(tensor: torch.Tensor) -> bool:
+    if not tensor.is_cuda or _FORCE_INT4_INT8_FALLBACK:
+        return False
+    major, _minor = torch.cuda.get_device_capability(tensor.get_device())
+    # The current ConvRot W4A4 kernel emits m16n8k64 s4 MMA, which is the
+    # sm80+ integer MMA shape. Hopper is routed through the INT8 fallback for
+    # better behavior with this implementation.
+    return major == 8
 
 
 def _cublas_int8_n_alignment(tensor: torch.Tensor) -> int:
@@ -485,6 +508,387 @@ def quantize_int8_rowwise(
     )
 
     return q_2d.reshape(orig_shape), scales_2d.reshape(*orig_shape[:-1], 1)
+
+
+def quantize_int4_rowwise(
+    x: torch.Tensor,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a contiguous 2D tensor to signed int4 with one float scale per row."""
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    if x_2d.shape[-1] % 64 != 0:
+        raise ValueError(f"INT4 rowwise quantization requires K divisible by 64, got {x_2d.shape[-1]}")
+    q_2d = torch.empty((x_2d.shape[0], x_2d.shape[1] // 2), dtype=torch.int8, device=x.device)
+    scales_2d = torch.empty((x_2d.shape[0], 1), dtype=torch.float32, device=x.device)
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    _C.quantize_int4_rowwise(
+        _wrap_for_dlpack(x_2d),
+        _wrap_for_dlpack(q_2d),
+        _wrap_for_dlpack(scales_2d),
+        stochastic_rounding is not None and stochastic_rounding > 0,
+        int(stochastic_rounding or 0),
+        stream_ptr,
+    )
+    return q_2d.reshape(*orig_shape[:-1], orig_shape[-1] // 2), scales_2d.reshape(*orig_shape[:-1], 1)
+
+
+def quantize_int4_rowwise_convrot64(
+    x: torch.Tensor,
+    group_size: int,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused regular ConvRot rotation plus rowwise signed int4 quantization."""
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    if group_size not in (16, 64, 256):
+        raise ValueError(f"INT4 ConvRot fused quantization requires group_size 16, 64, or 256, got {group_size}")
+    if x_2d.shape[-1] % group_size != 0:
+        raise ValueError(f"INT4 ConvRot fused quantization requires K divisible by group_size {group_size}, got {x_2d.shape[-1]}")
+    q_2d = torch.empty((x_2d.shape[0], x_2d.shape[1] // 2), dtype=torch.int8, device=x.device)
+    scales_2d = torch.empty((x_2d.shape[0], 1), dtype=torch.float32, device=x.device)
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    _C.quantize_int4_rowwise_convrot64(
+        _wrap_for_dlpack(x_2d),
+        _wrap_for_dlpack(q_2d),
+        _wrap_for_dlpack(scales_2d),
+        group_size,
+        stochastic_rounding is not None and stochastic_rounding > 0,
+        int(stochastic_rounding or 0),
+        stream_ptr,
+    )
+    return q_2d.reshape(*orig_shape[:-1], orig_shape[-1] // 2), scales_2d.reshape(*orig_shape[:-1], 1)
+
+
+def quantize_int4_rowwise_convrot64_to_int8(
+    x: torch.Tensor,
+    group_size: int,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused ConvRot-256 rotation plus int4-scale quantization into INT8 storage."""
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    if group_size != 256:
+        raise ValueError(f"INT4 fallback INT8 activation quantization requires group_size 256, got {group_size}")
+    if x_2d.shape[-1] % group_size != 0:
+        raise ValueError(f"INT4 ConvRot fallback quantization requires K divisible by {group_size}, got {x_2d.shape[-1]}")
+    q_2d = torch.empty_like(x_2d, dtype=torch.int8)
+    scales_2d = torch.empty((x_2d.shape[0], 1), dtype=torch.float32, device=x.device)
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    _C.quantize_int4_rowwise_convrot64_to_int8(
+        _wrap_for_dlpack(x_2d),
+        _wrap_for_dlpack(q_2d),
+        _wrap_for_dlpack(scales_2d),
+        group_size,
+        stochastic_rounding is not None and stochastic_rounding > 0,
+        int(stochastic_rounding or 0),
+        stream_ptr,
+    )
+    return q_2d.reshape(*orig_shape), scales_2d.reshape(*orig_shape[:-1], 1)
+
+
+def _unpack_int4_to_int8_cuda(qdata: torch.Tensor) -> torch.Tensor:
+    qdata_2d = qdata.contiguous()
+    output = torch.empty((qdata_2d.shape[0], qdata_2d.shape[1] * 2), dtype=torch.int8, device=qdata_2d.device)
+    stream_ptr = torch.cuda.current_stream(qdata_2d.device).cuda_stream
+    _C.unpack_int4_to_int8(_wrap_for_dlpack(qdata_2d), _wrap_for_dlpack(output), stream_ptr)
+    return output
+
+
+def _int4_linear_via_int8_values(
+    x_int8: torch.Tensor,
+    weight_int8: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    if x_int8.dim() != 2 or weight_int8.dim() != 2:
+        raise ValueError("INT4 fallback INT8 GEMM expects 2D activation and weight tensors")
+    if x_int8.shape[1] != weight_int8.shape[1]:
+        raise ValueError("INT4 fallback INT8 GEMM K dimensions do not match")
+    m, k = x_int8.shape
+    n = weight_int8.shape[0]
+    output = torch.empty((m, n), dtype=out_dtype, device=x_int8.device)
+
+    x_scale_arg = x_scale.to(device=x_int8.device, dtype=torch.float32).reshape(-1).contiguous()
+    weight_scale_arg = weight_scale.to(device=x_int8.device, dtype=torch.float32).reshape(-1).contiguous()
+    if x_scale_arg.numel() != m:
+        raise ValueError(f"INT4 fallback x_scale must have {m} values, got {x_scale_arg.numel()}")
+    if weight_scale_arg.numel() != n:
+        raise ValueError(f"INT4 fallback weight_scale must have {n} values, got {weight_scale_arg.numel()}")
+    bias_arg = bias if bias is not None else _empty_cuda_tensor(x_int8.device, out_dtype)
+    if bias is not None and (bias.device != x_int8.device or bias.dtype != out_dtype or not bias.is_contiguous()):
+        bias_arg = bias.to(device=x_int8.device, dtype=out_dtype).contiguous()
+
+    used_cutlass = False
+    if (
+        not _DISABLE_CUTLASS_INT8
+        and _cuda_device_supports_cutlass_int8_dequant(x_int8)
+        and m <= 512
+        and n <= k
+        and k <= 4096
+    ):
+        ws_cutlass = weight_scale_arg if weight_scale_arg.numel() == n else weight_scale_arg.expand(n).contiguous()
+        bias_f32 = bias_arg.to(torch.float32).contiguous() if bias is not None else bias_arg
+        used_cutlass = _C.cutlass_int8_dequant(
+            _wrap_for_dlpack(x_int8),
+            _wrap_for_dlpack(weight_int8),
+            _wrap_for_dlpack(x_scale_arg.reshape(m, 1)),
+            _wrap_for_dlpack(ws_cutlass),
+            _wrap_for_dlpack(bias_f32),
+            _wrap_for_dlpack(output),
+            DTYPE_TO_CODE[out_dtype],
+            torch.cuda.current_stream(x_int8.device).cuda_stream,
+        )
+    if used_cutlass:
+        return output
+
+    if _cuda_device_is_turing(x_int8.get_device()):
+        padded_k = _round_up(k, 16)
+        padded_n = _round_up(n, _cublas_int8_n_alignment(x_int8))
+        cublas_x = _pad_2d_cols(x_int8, padded_k)
+        cublas_weight = _pad_2d_rows(_pad_2d_cols(weight_int8, padded_k), padded_n)
+    else:
+        padded_n = n
+        cublas_x = x_int8
+        cublas_weight = weight_int8
+
+    out_int32 = torch.empty((m, padded_n), dtype=torch.int32, device=x_int8.device)
+    stream_ptr = torch.cuda.current_stream(x_int8.device).cuda_stream
+    _C.cublas_gemm_int8(
+        _wrap_for_dlpack(cublas_x),
+        _wrap_for_dlpack(cublas_weight),
+        _wrap_for_dlpack(out_int32),
+        _wrap_for_dlpack(get_cublas_workspace()),
+        stream_ptr,
+    )
+    if padded_n != n:
+        out_int32 = out_int32[:, :n].contiguous()
+    _C.dequantize_int8_linear(
+        out_int32,
+        x_scale_arg.reshape(m, 1),
+        weight_scale_arg,
+        bias_arg,
+        output,
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    )
+    return output
+
+
+def _int4_linear_via_int8(
+    x_qdata: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    weight_int8: torch.Tensor | None = None,
+) -> torch.Tensor:
+    _m, k_half = x_qdata.shape
+    n = weight.shape[0]
+    k = k_half * 2
+    x_int8 = _unpack_int4_to_int8_cuda(x_qdata)
+    if weight_int8 is None:
+        weight_int8 = _unpack_int4_to_int8_cuda(weight)
+    elif weight_int8.shape != (n, k) or weight_int8.dtype != torch.int8 or weight_int8.device != weight.device:
+        raise ValueError("prepared INT8 fallback weight has incompatible shape, dtype, or device")
+    return _int4_linear_via_int8_values(x_int8, weight_int8, x_scale, weight_scale, bias, out_dtype)
+
+
+def int4_linear(
+    x_qdata: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Signed INT4 linear: output = (x_q @ weight.T) * x_scale * weight_scale + bias."""
+    if x_qdata.dim() != 2 or weight.dim() != 2:
+        raise ValueError("INT4 linear expects 2D activation and weight tensors")
+    if x_qdata.shape[1] != weight.shape[1]:
+        raise ValueError("INT4 linear activation/weight K dimensions do not match")
+    m, _k_half = x_qdata.shape
+    n = weight.shape[0]
+    output = torch.empty((m, n), dtype=out_dtype, device=x_qdata.device)
+    x_scale_arg = x_scale.to(device=x_qdata.device, dtype=torch.float32).reshape(-1).contiguous()
+    weight_scale_arg = weight_scale.to(device=x_qdata.device, dtype=torch.float32).reshape(-1).contiguous()
+    if x_scale_arg.numel() != m:
+        raise ValueError(f"INT4 x_scale must have {m} values, got {x_scale_arg.numel()}")
+    if weight_scale_arg.numel() != n:
+        raise ValueError(f"INT4 weight_scale must have {n} values, got {weight_scale_arg.numel()}")
+    bias_arg = bias if bias is not None else _empty_cuda_tensor(x_qdata.device, out_dtype)
+    if bias is not None and (bias.device != x_qdata.device or not bias.is_contiguous()):
+        bias_arg = bias.to(device=x_qdata.device).contiguous()
+    stream_ptr = torch.cuda.current_stream(x_qdata.device).cuda_stream
+    if not _cuda_device_supports_native_int4_mma(x_qdata):
+        return _int4_linear_via_int8(
+            x_qdata.contiguous(),
+            weight.contiguous(),
+            x_scale_arg,
+            weight_scale_arg,
+            bias_arg if bias is not None else None,
+            out_dtype,
+        )
+    used_cutlass = False
+    if (
+        not _DISABLE_CUTLASS_INT8
+        and _cuda_device_supports_native_int4_mma(x_qdata)
+        and _cuda_device_supports_cutlass_int8_dequant(x_qdata)
+        and hasattr(_C, "cutlass_int4_dequant")
+    ):
+        bias_f32 = bias_arg.to(torch.float32).contiguous() if bias is not None else bias_arg
+        used_cutlass = _C.cutlass_int4_dequant(
+            _wrap_for_dlpack(x_qdata.contiguous()),
+            _wrap_for_dlpack(weight.contiguous()),
+            _wrap_for_dlpack(x_scale_arg),
+            _wrap_for_dlpack(weight_scale_arg),
+            _wrap_for_dlpack(bias_f32),
+            _wrap_for_dlpack(output),
+            DTYPE_TO_CODE[out_dtype],
+            stream_ptr,
+        )
+    if used_cutlass:
+        return output
+    _C.int4_linear(
+        _wrap_for_dlpack(x_qdata.contiguous()),
+        _wrap_for_dlpack(weight.contiguous()),
+        _wrap_for_dlpack(x_scale_arg),
+        _wrap_for_dlpack(weight_scale_arg),
+        _wrap_for_dlpack(bias_arg),
+        _wrap_for_dlpack(output),
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    )
+    return output
+
+
+def prepare_int4_weight_for_int8_linear(weight: torch.Tensor) -> torch.Tensor:
+    """Prepare packed signed INT4 weight as INT8 for non-native INT4 GEMM fallback."""
+    if weight.dim() != 2:
+        raise ValueError("prepared INT4 fallback weight expects a 2D tensor")
+    return _unpack_int4_to_int8_cuda(weight)
+
+
+def quantize_convrot_w4a4_weight(
+    weight: torch.Tensor,
+    convrot_groupsize: int = 256,
+    quant_group_size: int = _INT4_GROUP_SIZE,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Offline ConvRot weight rotation followed by row-wise signed INT4 quantization."""
+    if quant_group_size != _INT4_GROUP_SIZE:
+        raise ValueError(f"int4 MMA kernel requires quant_group_size {_INT4_GROUP_SIZE}")
+    if weight.dim() != 2:
+        raise ValueError(f"ConvRot W4A4 expects a 2D tensor, got shape {tuple(weight.shape)}")
+    if weight.shape[-1] % convrot_groupsize != 0:
+        raise ValueError(f"in_features {weight.shape[-1]} not divisible by convrot_groupsize {convrot_groupsize}")
+    weight_2d = weight.contiguous()
+    if convrot_groupsize in (16, 64, 256) and hasattr(_C, "quantize_int4_rowwise_convrot64"):
+        qdata, scales = quantize_int4_rowwise_convrot64(
+            weight_2d,
+            convrot_groupsize,
+            stochastic_rounding=stochastic_rounding,
+        )
+    else:
+        h = _build_hadamard(convrot_groupsize, device=weight.device, dtype=weight.dtype)
+        weight_rot = _rotate_weight(weight_2d, h, convrot_groupsize)
+        qdata, scales = quantize_int4_rowwise(weight_rot.contiguous(), stochastic_rounding=stochastic_rounding)
+    return qdata, scales.reshape(-1)
+
+
+def dequantize_convrot_w4a4_weight(
+    qdata: torch.Tensor,
+    scales: torch.Tensor,
+    convrot_groupsize: int = 256,
+    quant_group_size: int = _INT4_GROUP_SIZE,
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Dequantize packed ConvRot W4A4 weights and rotate back to original basis."""
+    if quant_group_size != _INT4_GROUP_SIZE:
+        raise ValueError(f"int4 MMA kernel requires quant_group_size {_INT4_GROUP_SIZE}")
+    if qdata.dim() != 2:
+        raise ValueError(f"ConvRot W4A4 dequant expects 2D qdata, got shape {tuple(qdata.shape)}")
+    k = qdata.shape[-1] * 2
+    if k % convrot_groupsize != 0:
+        raise ValueError(f"in_features {k} not divisible by convrot_groupsize {convrot_groupsize}")
+    if convrot_groupsize in (16, 64, 256) and hasattr(_C, "dequantize_int4_convrot64"):
+        qdata_2d = qdata.contiguous()
+        scale_arg = scales.to(device=qdata.device, dtype=torch.float32).reshape(-1).contiguous()
+        output = torch.empty((qdata_2d.shape[0], k), dtype=output_dtype, device=qdata.device)
+        stream_ptr = torch.cuda.current_stream(qdata.device).cuda_stream
+        _C.dequantize_int4_convrot64(
+            _wrap_for_dlpack(qdata_2d),
+            _wrap_for_dlpack(scale_arg),
+            _wrap_for_dlpack(output),
+            convrot_groupsize,
+            stream_ptr,
+        )
+        return output
+    w_int = _unpack_int4_row_major(qdata).to(torch.float32)
+    w_rot = w_int * scales.to(device=qdata.device, dtype=torch.float32).reshape(-1, 1)
+    h = _build_hadamard(convrot_groupsize, device=qdata.device, dtype=torch.float32)
+    return _rotate_weight(w_rot.float(), h, convrot_groupsize).to(output_dtype)
+
+
+def convrot_w4a4_linear(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    wscales: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    convrot_groupsize: int = 256,
+    quant_group_size: int = _INT4_GROUP_SIZE,
+) -> torch.Tensor:
+    """Compute ``x @ W.T + bias`` using ConvRot W4A4 signed INT4 MMA."""
+    if quant_group_size != _INT4_GROUP_SIZE:
+        raise ValueError(f"int4 MMA kernel requires quant_group_size {_INT4_GROUP_SIZE}")
+    if x.shape[-1] != qweight.shape[-1] * 2:
+        raise ValueError(f"Input K={x.shape[-1]} does not match qweight K={qweight.shape[-1] * 2}")
+    if x.shape[-1] % convrot_groupsize != 0:
+        raise ValueError(f"Input K={x.shape[-1]} not divisible by convrot_groupsize {convrot_groupsize}")
+
+    orig_shape = x.shape
+    x2d = x.reshape(-1, orig_shape[-1]).contiguous()
+    if not _cuda_device_supports_native_int4_mma(x2d):
+        weight_int8 = prepare_int4_weight_for_int8_linear(qweight)
+        if (
+            convrot_groupsize == 256
+            and x2d.shape[-1] % 256 == 0
+            and 256 <= x2d.shape[-1] <= _CONVROT_FUSED_MAX_K
+            and _convrot_fused_shared_memory_fits(x2d, x2d.shape[-1], convrot_groupsize)
+        ):
+            qact_int8, x_scale = quantize_int8_rowwise_convrot64(x2d, convrot_groupsize)
+        elif _should_use_convrot_fused_kernel(x2d, x2d.shape[-1], convrot_groupsize):
+            qact_int8, x_scale = quantize_int8_rowwise_convrot(x2d, convrot_groupsize)
+        else:
+            h = _build_hadamard(convrot_groupsize, device=x2d.device, dtype=x2d.dtype)
+            qact_int8, x_scale = quantize_and_rotate_rowwise(x2d, h, convrot_groupsize)
+        out = _int4_linear_via_int8_values(
+            qact_int8,
+            weight_int8,
+            x_scale,
+            wscales,
+            bias,
+            x.dtype,
+        )
+        return out[: x2d.shape[0]].reshape(*orig_shape[:-1], qweight.shape[0])
+    if convrot_groupsize in (16, 64, 256) and hasattr(_C, "quantize_int4_rowwise_convrot64"):
+        qact, x_scale = quantize_int4_rowwise_convrot64(x2d, convrot_groupsize)
+    else:
+        h = _build_hadamard(convrot_groupsize, device=x2d.device, dtype=x2d.dtype)
+        x_rot = _rotate_activation(x2d, h, convrot_groupsize).contiguous()
+        qact, x_scale = quantize_int4_rowwise(x_rot)
+    out = int4_linear(
+        qact,
+        qweight,
+        x_scale,
+        wscales,
+        bias=bias,
+        out_dtype=x.dtype,
+    )
+    return out[: x2d.shape[0]].reshape(*orig_shape[:-1], qweight.shape[0])
 
 
 def quantize_int8_rowwise_convrot(
@@ -1820,6 +2224,66 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
             min_compute_capability=(8, 0),
+        ),
+        "quantize_convrot_w4a4_weight": FunctionConstraints(
+            params={
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2), DivisibleBy(dim=1, factor=64)),
+                ),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
+                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
+        ),
+        "dequantize_convrot_w4a4_weight": FunctionConstraints(
+            params={
+                "qdata": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2), DivisibleBy(dim=1, factor=32)),
+                ),
+                "scales": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(1),),
+                ),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
+                "output_dtype": ParamConstraint(dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16})),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
+        ),
+        "convrot_w4a4_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(MinDims(2),),
+                ),
+                "qweight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2), DivisibleBy(dim=1, factor=32)),
+                ),
+                "wscales": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(1),),
+                ),
+                "bias": ParamConstraint(dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
+        ),
+        "prepare_int4_weight_for_int8_linear": FunctionConstraints(
+            params={
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2), DivisibleBy(dim=1, factor=32)),
+                ),
+            },
+            default_devices=cuda_devices,
         ),
         "gemv_awq_w4a16": FunctionConstraints(
             params={

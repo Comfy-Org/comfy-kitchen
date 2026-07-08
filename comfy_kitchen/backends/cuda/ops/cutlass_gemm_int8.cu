@@ -275,7 +275,7 @@ bool launch_cutlass_int8_dequant(
     const float* x = static_cast<const float*>(xs);
     const float* w = static_cast<const float*>(ws);
     const float* bs = static_cast<const float*>(bias);
-    if (bs == nullptr && M <= 1024) {
+    if (bs == nullptr) {
         switch (out_dtype_code) {
             case 0: return dispatch_fused_no_bias<float>(a, b, x, w, static_cast<float*>(D), M, N, K, stream);
             case 1: return dispatch_fused_no_bias<cutlass::half_t>(a, b, x, w, static_cast<cutlass::half_t*>(D), M, N, K, stream);

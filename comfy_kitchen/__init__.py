@@ -17,6 +17,11 @@ from .float_utils import from_blocked, swap_nibbles, to_blocked
 
 # Import registry and exceptions
 from .registry import registry
+from .tensor.convrot_w4a4 import (
+    convrot_w4a4_linear,
+    dequantize_convrot_w4a4_weight,
+    quantize_convrot_w4a4_weight,
+)
 
 __version__ = "0.1.0"
 
@@ -31,6 +36,7 @@ __all__ = [
     "quantize_mxfp8",
     "dequantize_mxfp8",
     "quantize_svdquant_w4a4",
+    "quantize_convrot_w4a4_weight",
     "quantize_int8_rowwise",
     "quantize_int8_tensorwise",
     "dequantize_int8_simple",
@@ -38,6 +44,8 @@ __all__ = [
     "scaled_mm_nvfp4",
     "scaled_mm_mxfp8",
     "scaled_mm_svdquant_w4a4",
+    "convrot_w4a4_linear",
+    "dequantize_convrot_w4a4_weight",
     "gemv_awq_w4a16",
     "int8_linear",
     # Positional encoding

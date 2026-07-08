@@ -108,6 +108,7 @@ set(CUDA_SOURCES
     ops/cublas_gemm_int8.cu
     ops/cutlass_gemm_int8.cu
     ops/int8_linear.cu
+    ops/convrot_w4a4.cu
     ops/apply_rope.cu
     ops/quantize_svdquant_w4a4.cu
     ops/scaled_mm_svdquant_w4a4.cu
