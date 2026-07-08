@@ -7,6 +7,7 @@
 #include "dtype_dispatch.cuh"
 
 #include <cmath>
+#include <cfloat>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -24,6 +25,17 @@ __device__ __forceinline__ float to_float(T val);
 template<> __device__ __forceinline__ float to_float<float>(float val) { return val; }
 template<> __device__ __forceinline__ float to_float<half>(half val) { return __half2float(val); }
 template<> __device__ __forceinline__ float to_float<nv_bfloat16>(nv_bfloat16 val) { return __bfloat162float(val); }
+
+template<typename T>
+__device__ __forceinline__ float finite_max_for_dtype();
+template<> __device__ __forceinline__ float finite_max_for_dtype<float>() { return FLT_MAX; }
+template<> __device__ __forceinline__ float finite_max_for_dtype<half>() { return 65504.0f; }
+template<> __device__ __forceinline__ float finite_max_for_dtype<nv_bfloat16>() { return 3.38953139e38f; }
+
+template<typename T>
+__device__ __forceinline__ float finite_absmax_for_int8_scale(float abs_max) {
+    return fminf(abs_max, finite_max_for_dtype<T>());
+}
 
 template<typename T>
 __device__ __forceinline__ T from_float(float val);
@@ -163,7 +175,9 @@ __global__ void quantize_int8_rowwise_kernel(
     }
 
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
-    const float scale = fmaxf(abs_max * (1.0f / 127.0f), 1.0e-30f);
+    const float scale = fmaxf(
+        finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f),
+        1.0e-30f);
 
     if (tid == 0) {
         scales[row] = scale;
@@ -303,7 +317,9 @@ __global__ void quantize_int8_rowwise_convrot_kernel(
         abs_max = fmaxf(abs_max, fabsf(row_buf[col]));
     }
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
-    const float scale = fmaxf(abs_max * (1.0f / 127.0f), 1.0e-30f);
+    const float scale = fmaxf(
+        finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f),
+        1.0e-30f);
     if (tid == 0) {
         scales[row] = scale;
     }
@@ -867,7 +883,9 @@ __global__ void quantize_int8_rowwise_from_partials_kernel(
         abs_max = fmaxf(abs_max, row_partials[g]);
     }
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
-    const float scale = fmaxf(abs_max * (1.0f / 127.0f), 1.0e-30f);
+    const float scale = fmaxf(
+        finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f),
+        1.0e-30f);
     if (tid == 0) {
         scales[row] = scale;
     }
@@ -949,7 +967,9 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     }
 
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
-    const float scale = fmaxf(abs_max * (1.0f / 127.0f), 1.0e-30f);
+    const float scale = fmaxf(
+        finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f),
+        1.0e-30f);
     if (tid == 0) {
         scales[row] = scale;
     }

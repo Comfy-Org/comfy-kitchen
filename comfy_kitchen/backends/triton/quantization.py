@@ -807,8 +807,7 @@ def _quantize_rowwise_kernel(
         q_f = x / scale
 
     # Round and Clamp
-    q_i = libdevice.rint(q_f.to(tl.float32)).to(tl.int32)
-    q_i = tl.clamp(q_i, -128.0, 127.0)
+    q_i = tl.clamp(libdevice.rint(q_f.to(tl.float32)), -128.0, 127.0).to(tl.int32)
 
     # 4. Store
     tl.store(y_row_ptr + offsets, q_i.to(tl.int8), mask=mask)
