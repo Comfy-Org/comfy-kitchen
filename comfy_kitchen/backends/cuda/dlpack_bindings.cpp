@@ -818,6 +818,43 @@ extern "C" {
         int64_t K_half,
         cudaStream_t stream);
 
+    void launch_int4_weight_int8_act_gemv_dequant_kernel(
+        const void* input,
+        const void* weight,
+        const void* x_scales,
+        const void* weight_scales,
+        const void* bias,
+        void* output,
+        int64_t num_rows,
+        int64_t num_cols,
+        int64_t K,
+        int64_t weight_scale_size,
+        bool has_bias,
+        int output_dtype_code,
+        int bias_dtype_code,
+        cudaStream_t stream);
+
+    void launch_int4_weight_int8_act_gemm_dequant_chunked_kernel(
+        const void* input,
+        const void* weight,
+        const void* x_scales,
+        const void* weight_scales,
+        const void* bias,
+        void* output,
+        void* weight_workspace,
+        void* acc_workspace,
+        void* cublas_workspace,
+        int64_t cublas_workspace_size,
+        int64_t num_rows,
+        int64_t num_cols,
+        int64_t K,
+        int64_t weight_scale_size,
+        int64_t chunk_cols,
+        bool has_bias,
+        int output_dtype_code,
+        int bias_dtype_code,
+        cudaStream_t stream);
+
     bool launch_cutlass_int8_dequant(
         const void* A,
         const void* B,
@@ -1254,6 +1291,140 @@ void unpack_int4_to_int8(
     }
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_unpack_int4_to_int8_kernel(input.data(), output.data(), rows, K_half, stream);
+}
+
+void int4_weight_int8_act_gemv_dequant(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> weight,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> x_scales,
+    nb::ndarray<float, nb::device::cuda> weight_scales,
+    nb::ndarray<nb::device::cuda> bias,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    int output_dtype_code,
+    uintptr_t stream_ptr) {
+
+    const int64_t M = input.shape(0);
+    const int64_t K = input.shape(1);
+    const int64_t N = weight.shape(0);
+    if (weight.shape(1) * 2 != K) {
+        throw std::runtime_error("packed INT4 weight GEMV weight K mismatch");
+    }
+    if (x_scales.shape(0) != M || x_scales.shape(1) != 1) {
+        throw std::runtime_error("packed INT4 weight GEMV activation scale shape mismatch");
+    }
+    if (output.shape(0) != M || output.shape(1) != N) {
+        throw std::runtime_error("packed INT4 weight GEMV output shape mismatch");
+    }
+    if (output_dtype_code < 0 || output_dtype_code > 2) {
+        throw std::runtime_error("Invalid packed INT4 weight GEMV output dtype code");
+    }
+
+    const bool has_bias = bias.data() && bias.size() > 0;
+    int bias_dtype_code = output_dtype_code;
+    if (has_bias) {
+        if (bias.shape(0) != N) {
+            throw std::runtime_error("packed INT4 weight GEMV bias shape mismatch");
+        }
+        bias_dtype_code = map_dtype_to_code(bias.dtype());
+        if (bias_dtype_code < 0 || bias_dtype_code > 2) {
+            throw std::runtime_error("Unsupported bias dtype for packed INT4 weight GEMV");
+        }
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_int4_weight_int8_act_gemv_dequant_kernel(
+        input.data(),
+        weight.data(),
+        x_scales.data(),
+        weight_scales.data(),
+        has_bias ? bias.data() : nullptr,
+        output.data(),
+        M,
+        N,
+        K,
+        static_cast<int64_t>(weight_scales.size()),
+        has_bias,
+        output_dtype_code,
+        bias_dtype_code,
+        stream);
+}
+
+void int4_weight_int8_act_gemm_dequant_chunked(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> weight,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> x_scales,
+    nb::ndarray<float, nb::device::cuda> weight_scales,
+    nb::ndarray<nb::device::cuda> bias,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> weight_workspace,
+    nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> acc_workspace,
+    nb::ndarray<uint8_t, nb::device::cuda> cublas_workspace,
+    int64_t chunk_cols,
+    int output_dtype_code,
+    uintptr_t stream_ptr) {
+
+    const int64_t M = input.shape(0);
+    const int64_t K = input.shape(1);
+    const int64_t N = weight.shape(0);
+    const int64_t K_half = weight.shape(1);
+    if (K_half * 2 != K) {
+        throw std::runtime_error("chunked INT4 weight GEMM weight K mismatch");
+    }
+    if (x_scales.shape(0) != M || x_scales.shape(1) != 1) {
+        throw std::runtime_error("chunked INT4 weight GEMM activation scale shape mismatch");
+    }
+    if (output.shape(0) != M || output.shape(1) != N) {
+        throw std::runtime_error("chunked INT4 weight GEMM output shape mismatch");
+    }
+    if (chunk_cols <= 0 || chunk_cols > N) {
+        throw std::runtime_error("chunked INT4 weight GEMM invalid chunk_cols");
+    }
+    if (weight_workspace.shape(0) < chunk_cols || weight_workspace.shape(1) != K) {
+        throw std::runtime_error("chunked INT4 weight GEMM weight workspace shape mismatch");
+    }
+    if (acc_workspace.shape(0) != M || acc_workspace.shape(1) < chunk_cols) {
+        throw std::runtime_error("chunked INT4 weight GEMM accumulator workspace shape mismatch");
+    }
+    if (weight_scales.size() != 1 && static_cast<int64_t>(weight_scales.size()) != N) {
+        throw std::runtime_error("chunked INT4 weight GEMM weight scale shape mismatch");
+    }
+    if (output_dtype_code < 0 || output_dtype_code > 2) {
+        throw std::runtime_error("Invalid chunked INT4 weight GEMM output dtype code");
+    }
+
+    const bool has_bias = bias.data() && bias.size() > 0;
+    int bias_dtype_code = output_dtype_code;
+    if (has_bias) {
+        if (bias.shape(0) != N) {
+            throw std::runtime_error("chunked INT4 weight GEMM bias shape mismatch");
+        }
+        bias_dtype_code = map_dtype_to_code(bias.dtype());
+        if (bias_dtype_code < 0 || bias_dtype_code > 2) {
+            throw std::runtime_error("Unsupported bias dtype for chunked INT4 weight GEMM");
+        }
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_int4_weight_int8_act_gemm_dequant_chunked_kernel(
+        input.data(),
+        weight.data(),
+        x_scales.data(),
+        weight_scales.data(),
+        has_bias ? bias.data() : nullptr,
+        output.data(),
+        weight_workspace.data(),
+        acc_workspace.data(),
+        cublas_workspace.data(),
+        static_cast<int64_t>(cublas_workspace.size()),
+        M,
+        N,
+        K,
+        static_cast<int64_t>(weight_scales.size()),
+        chunk_cols,
+        has_bias,
+        output_dtype_code,
+        bias_dtype_code,
+        stream);
 }
 
 // INT8 GEMM + fused dequant (D = acc * xs[m] * ws[n] + bias[n]) via CUTLASS.
@@ -1845,6 +2016,32 @@ NB_MODULE(_C, m) {
           "Unpack row-major packed signed INT4 matrix to row-major INT8 matrix",
           nb::arg("input"),
           nb::arg("output"),
+          nb::arg("stream_ptr"));
+
+    m.def("int4_weight_int8_act_gemv_dequant", &int4_weight_int8_act_gemv_dequant,
+          "M=1 GEMV using INT8 activation and packed row-major INT4 weight with fused dequant",
+          nb::arg("input"),
+          nb::arg("weight"),
+          nb::arg("x_scales"),
+          nb::arg("weight_scales"),
+          nb::arg("bias"),
+          nb::arg("output"),
+          nb::arg("output_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("int4_weight_int8_act_gemm_dequant_chunked", &int4_weight_int8_act_gemm_dequant_chunked,
+          "Chunked INT8 GEMM using INT8 activation and packed row-major INT4 weight with fused dequant",
+          nb::arg("input"),
+          nb::arg("weight"),
+          nb::arg("x_scales"),
+          nb::arg("weight_scales"),
+          nb::arg("bias"),
+          nb::arg("output"),
+          nb::arg("weight_workspace"),
+          nb::arg("acc_workspace"),
+          nb::arg("cublas_workspace"),
+          nb::arg("chunk_cols"),
+          nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"));
 
     m.def("cutlass_int8_dequant", &cutlass_int8_dequant,

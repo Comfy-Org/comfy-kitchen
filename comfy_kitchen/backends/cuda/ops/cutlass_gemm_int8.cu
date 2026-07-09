@@ -73,12 +73,18 @@ struct FusedInt8Gemm {
 
     static bool run(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
                     const float* bias, ElementOutput* D, int M, int N, int K, cudaStream_t stream) {
+        return run_strided(A, B, xs, ws, bias, D, M, N, K, N, stream);
+    }
+
+    static bool run_strided(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
+                            const float* bias, ElementOutput* D, int M, int N, int K,
+                            int output_stride, cudaStream_t stream) {
         cutlass::gemm::GemmCoord problem(M, N, K);
         typename EVTD::Arguments cb{
             { {  { {}, {const_cast<float*>(xs), 0.f, {_1{}, _0{}, M}}, {} },
                  {const_cast<float*>(ws), 0.f, {_0{}, _1{}, N}}, {} },
               {const_cast<float*>(bias), 0.f, {_0{}, _1{}, N}}, {} },
-            {D, {N, _1{}, M * N}} };
+            {D, {output_stride, _1{}, M * output_stride}} };
         typename Gemm::Arguments args(
             cutlass::gemm::GemmUniversalMode::kGemm, problem, 1, cb,
             const_cast<int8_t*>(A), const_cast<int8_t*>(B), nullptr, nullptr,
@@ -131,11 +137,17 @@ struct FusedInt8GemmNoBias {
 
     static bool run(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
                     ElementOutput* D, int M, int N, int K, cudaStream_t stream) {
+        return run_strided(A, B, xs, ws, D, M, N, K, N, stream);
+    }
+
+    static bool run_strided(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
+                            ElementOutput* D, int M, int N, int K, int output_stride,
+                            cudaStream_t stream) {
         cutlass::gemm::GemmCoord problem(M, N, K);
         typename EVTD::Arguments cb{
             { { {}, {const_cast<float*>(xs), 0.f, {_1{}, _0{}, M}}, {} },
               {const_cast<float*>(ws), 0.f, {_0{}, _1{}, N}}, {} },
-            {D, {N, _1{}, M * N}} };
+            {D, {output_stride, _1{}, M * output_stride}} };
         typename Gemm::Arguments args(
             cutlass::gemm::GemmUniversalMode::kGemm, problem, 1, cb,
             const_cast<int8_t*>(A), const_cast<int8_t*>(B), nullptr, nullptr,
@@ -261,6 +273,92 @@ bool dispatch_fused_no_bias(const int8_t* A, const int8_t* B, const float* xs, c
     if (best < 0) return false;
     return runners[best](A, B, xs, ws, D, M, N, K, stream);
 }
+
+template <typename OutT>
+bool dispatch_fused_strided(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
+                            const float* bias, OutT* D, int M, int N, int K, int output_stride,
+                            cudaStream_t stream) {
+    using Fn = bool (*)(const int8_t*, const int8_t*, const float*, const float*, const float*, OutT*, int, int, int, int, cudaStream_t);
+    static const Fn runners[] = {
+        &FusedInt8Gemm<OutT, 128, 256, 64, 64, 64, 64, 3>::run_strided,
+        &FusedInt8Gemm<OutT, 128, 128, 64, 64, 64, 64, 4>::run_strided,
+        &FusedInt8Gemm<OutT,  64, 128, 64, 32, 64, 64, 4>::run_strided,
+    };
+    constexpr int NC = sizeof(runners) / sizeof(runners[0]);
+
+    static std::mutex mtx;
+    static std::map<std::tuple<int, int, int>, int> cache;
+    const std::tuple<int, int, int> key{M, N, K};
+
+    int best;
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        auto it = cache.find(key);
+        best = (it != cache.end()) ? it->second : -2;
+    }
+    if (best == -2) {
+        best = -1;
+        float best_ms = 1e30f;
+        cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
+        for (int i = 0; i < NC; ++i) {
+            if (!runners[i](A, B, xs, ws, bias, D, M, N, K, output_stride, stream)) continue;
+            cudaStreamSynchronize(stream);
+            cudaEventRecord(s, stream);
+            for (int r = 0; r < 3; ++r) runners[i](A, B, xs, ws, bias, D, M, N, K, output_stride, stream);
+            cudaEventRecord(e, stream); cudaEventSynchronize(e);
+            float ms = 0.f; cudaEventElapsedTime(&ms, s, e);
+            if (ms < best_ms) { best_ms = ms; best = i; }
+        }
+        cudaEventDestroy(s); cudaEventDestroy(e);
+        std::lock_guard<std::mutex> lk(mtx);
+        cache[key] = best;
+    }
+    if (best < 0) return false;
+    return runners[best](A, B, xs, ws, bias, D, M, N, K, output_stride, stream);
+}
+
+template <typename OutT>
+bool dispatch_fused_no_bias_strided(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
+                                    OutT* D, int M, int N, int K, int output_stride,
+                                    cudaStream_t stream) {
+    using Fn = bool (*)(const int8_t*, const int8_t*, const float*, const float*, OutT*, int, int, int, int, cudaStream_t);
+    static const Fn runners[] = {
+        &FusedInt8GemmNoBias<OutT, 128, 256, 64, 64, 64, 64, 3>::run_strided,
+        &FusedInt8GemmNoBias<OutT, 128, 128, 64, 64, 64, 64, 4>::run_strided,
+        &FusedInt8GemmNoBias<OutT,  64, 128, 64, 32, 64, 64, 4>::run_strided,
+    };
+    constexpr int NC = sizeof(runners) / sizeof(runners[0]);
+
+    static std::mutex mtx;
+    static std::map<std::tuple<int, int, int>, int> cache;
+    const std::tuple<int, int, int> key{M, N, K};
+
+    int best;
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        auto it = cache.find(key);
+        best = (it != cache.end()) ? it->second : -2;
+    }
+    if (best == -2) {
+        best = -1;
+        float best_ms = 1e30f;
+        cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
+        for (int i = 0; i < NC; ++i) {
+            if (!runners[i](A, B, xs, ws, D, M, N, K, output_stride, stream)) continue;
+            cudaStreamSynchronize(stream);
+            cudaEventRecord(s, stream);
+            for (int r = 0; r < 3; ++r) runners[i](A, B, xs, ws, D, M, N, K, output_stride, stream);
+            cudaEventRecord(e, stream); cudaEventSynchronize(e);
+            float ms = 0.f; cudaEventElapsedTime(&ms, s, e);
+            if (ms < best_ms) { best_ms = ms; best = i; }
+        }
+        cudaEventDestroy(s); cudaEventDestroy(e);
+        std::lock_guard<std::mutex> lk(mtx);
+        cache[key] = best;
+    }
+    if (best < 0) return false;
+    return runners[best](A, B, xs, ws, D, M, N, K, output_stride, stream);
+}
 }  // namespace
 
 extern "C" {
@@ -290,6 +388,34 @@ bool launch_cutlass_int8_dequant(
         default: return false;
     }
 }
+
+bool launch_cutlass_int8_dequant_strided(
+    const void* A, const void* B, const void* xs, const void* ws, const void* bias,
+    void* D, int64_t M, int64_t N, int64_t K, int64_t output_stride, int out_dtype_code,
+    cudaStream_t stream)
+{
+    if (M == 0 || N == 0 || K == 0) return true;
+    if (output_stride < N) return false;
+    const int8_t* a = static_cast<const int8_t*>(A);
+    const int8_t* b = static_cast<const int8_t*>(B);
+    const float* x = static_cast<const float*>(xs);
+    const float* w = static_cast<const float*>(ws);
+    const float* bs = static_cast<const float*>(bias);
+    if (bs == nullptr) {
+        switch (out_dtype_code) {
+            case 0: return dispatch_fused_no_bias_strided<float>(a, b, x, w, static_cast<float*>(D), M, N, K, output_stride, stream);
+            case 1: return dispatch_fused_no_bias_strided<cutlass::half_t>(a, b, x, w, static_cast<cutlass::half_t*>(D), M, N, K, output_stride, stream);
+            case 2: return dispatch_fused_no_bias_strided<cutlass::bfloat16_t>(a, b, x, w, static_cast<cutlass::bfloat16_t*>(D), M, N, K, output_stride, stream);
+            default: return false;
+        }
+    }
+    switch (out_dtype_code) {
+        case 0: return dispatch_fused_strided<float>(a, b, x, w, bs, static_cast<float*>(D), M, N, K, output_stride, stream);
+        case 1: return dispatch_fused_strided<cutlass::half_t>(a, b, x, w, bs, static_cast<cutlass::half_t*>(D), M, N, K, output_stride, stream);
+        case 2: return dispatch_fused_strided<cutlass::bfloat16_t>(a, b, x, w, bs, static_cast<cutlass::bfloat16_t*>(D), M, N, K, output_stride, stream);
+        default: return false;
+    }
+}
 }  // extern "C"
 
 #else  // !COMFY_HAVE_CUTLASS -- stub; caller falls back to cuBLAS + separate dequant.
@@ -297,6 +423,12 @@ bool launch_cutlass_int8_dequant(
 extern "C" bool launch_cutlass_int8_dequant(
     const void*, const void*, const void*, const void*, const void*,
     void*, int64_t, int64_t, int64_t, int, cudaStream_t) {
+    return false;
+}
+
+extern "C" bool launch_cutlass_int8_dequant_strided(
+    const void*, const void*, const void*, const void*, const void*,
+    void*, int64_t, int64_t, int64_t, int64_t, int, cudaStream_t) {
     return false;
 }
 

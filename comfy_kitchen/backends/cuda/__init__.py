@@ -161,6 +161,8 @@ _turing_device_cache: dict[int, bool] = {}
 _cutlass_int8_device_cache: dict[int, bool] = {}
 _shared_memory_per_block_cache: dict[int, int] = {}
 _FORCE_INT4_INT8_FALLBACK = os.environ.get("COMFY_KITCHEN_FORCE_INT4_INT8_FALLBACK", "0") == "1"
+_INT4_PACKED_WEIGHT_SMALL_M_MAX = 8
+_INT4_INT8_WEIGHT_CHUNK_N = max(1, int(os.environ.get("COMFY_KITCHEN_INT4_INT8_WEIGHT_CHUNK_N", "4096")))
 
 
 def _cuda_device_is_turing(device_index: int) -> bool:
@@ -595,6 +597,103 @@ def _unpack_int4_to_int8_cuda(qdata: torch.Tensor) -> torch.Tensor:
     return output
 
 
+def _int4_weight_int8_act_gemv_dequant(
+    x_int8: torch.Tensor,
+    weight_packed: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    if x_int8.dim() != 2:
+        raise ValueError("packed INT4 weight GEMV expects a 2D INT8 activation")
+    if weight_packed.dim() != 2 or x_int8.shape[1] != weight_packed.shape[1] * 2:
+        raise ValueError("packed INT4 weight GEMV K dimensions do not match")
+
+    m = x_int8.shape[0]
+    n = weight_packed.shape[0]
+    output = torch.empty((m, n), dtype=out_dtype, device=x_int8.device)
+    x_scale_arg = x_scale.to(device=x_int8.device, dtype=torch.float32).reshape(-1, 1).contiguous()
+    if x_scale_arg.shape[0] != m:
+        raise ValueError(f"packed INT4 weight GEMV x_scale must have {m} values, got {x_scale_arg.shape[0]}")
+    weight_scale_arg = weight_scale.to(device=x_int8.device, dtype=torch.float32).reshape(-1).contiguous()
+    if weight_scale_arg.numel() != n:
+        raise ValueError(f"packed INT4 weight GEMV weight_scale must have {n} values, got {weight_scale_arg.numel()}")
+    bias_arg = bias if bias is not None else _empty_cuda_tensor(x_int8.device, out_dtype)
+    if bias is not None and (bias.device != x_int8.device or bias.dtype != out_dtype or not bias.is_contiguous()):
+        bias_arg = bias.to(device=x_int8.device, dtype=out_dtype).contiguous()
+
+    stream_ptr = torch.cuda.current_stream(x_int8.device).cuda_stream
+    _C.int4_weight_int8_act_gemv_dequant(
+        _wrap_for_dlpack(x_int8),
+        _wrap_for_dlpack(weight_packed.contiguous()),
+        _wrap_for_dlpack(x_scale_arg),
+        _wrap_for_dlpack(weight_scale_arg),
+        _wrap_for_dlpack(bias_arg),
+        _wrap_for_dlpack(output),
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    )
+    return output
+
+
+def _int4_int8_weight_chunk_cols(m: int, n: int) -> int:
+    if n <= 2560:
+        return n
+    if m <= 128:
+        return min(n, _INT4_INT8_WEIGHT_CHUNK_N)
+    return min(n, _INT4_INT8_WEIGHT_CHUNK_N)
+
+
+def _int4_weight_int8_act_gemm_dequant_chunked(
+    x_int8: torch.Tensor,
+    weight_packed: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    if x_int8.dim() != 2:
+        raise ValueError("chunked INT4 weight GEMM expects a 2D INT8 activation")
+    if weight_packed.dim() != 2 or x_int8.shape[1] != weight_packed.shape[1] * 2:
+        raise ValueError("chunked INT4 weight GEMM K dimensions do not match")
+    if not x_int8.is_contiguous() or not weight_packed.is_contiguous():
+        raise ValueError("chunked INT4 weight GEMM expects contiguous activation and weight tensors")
+
+    m, k = x_int8.shape
+    n = weight_packed.shape[0]
+    chunk_cols = _int4_int8_weight_chunk_cols(m, n)
+    output = torch.empty((m, n), dtype=out_dtype, device=x_int8.device)
+    weight_workspace = torch.empty((chunk_cols, k), dtype=torch.int8, device=x_int8.device)
+    acc_workspace = torch.empty((m, chunk_cols), dtype=torch.int32, device=x_int8.device)
+    x_scale_arg = x_scale.to(device=x_int8.device, dtype=torch.float32).reshape(-1, 1).contiguous()
+    if x_scale_arg.shape[0] != m:
+        raise ValueError(f"chunked INT4 weight GEMM x_scale must have {m} values, got {x_scale_arg.shape[0]}")
+    weight_scale_arg = weight_scale.to(device=x_int8.device, dtype=torch.float32).reshape(-1).contiguous()
+    if weight_scale_arg.numel() != n:
+        raise ValueError(f"chunked INT4 weight GEMM weight_scale must have {n} values, got {weight_scale_arg.numel()}")
+    bias_arg = bias if bias is not None else _empty_cuda_tensor(x_int8.device, out_dtype)
+    if bias is not None:
+        bias_arg = bias.to(device=x_int8.device, dtype=torch.float32).contiguous()
+
+    stream_ptr = torch.cuda.current_stream(x_int8.device).cuda_stream
+    _C.int4_weight_int8_act_gemm_dequant_chunked(
+        _wrap_for_dlpack(x_int8),
+        _wrap_for_dlpack(weight_packed),
+        _wrap_for_dlpack(x_scale_arg),
+        _wrap_for_dlpack(weight_scale_arg),
+        _wrap_for_dlpack(bias_arg),
+        _wrap_for_dlpack(output),
+        _wrap_for_dlpack(weight_workspace),
+        _wrap_for_dlpack(acc_workspace),
+        _wrap_for_dlpack(get_cublas_workspace()),
+        chunk_cols,
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    )
+    return output
+
+
 def _int4_linear_via_int8_values(
     x_int8: torch.Tensor,
     weight_int8: torch.Tensor,
@@ -621,13 +720,26 @@ def _int4_linear_via_int8_values(
     if bias is not None and (bias.device != x_int8.device or bias.dtype != out_dtype or not bias.is_contiguous()):
         bias_arg = bias.to(device=x_int8.device, dtype=out_dtype).contiguous()
 
+    stream_ptr = torch.cuda.current_stream(x_int8.device).cuda_stream
+    if m == 1 and k % 4 == 0 and hasattr(_C, "int8_gemv_dequant"):
+        _C.int8_gemv_dequant(
+            _wrap_for_dlpack(x_int8),
+            _wrap_for_dlpack(weight_int8),
+            _wrap_for_dlpack(x_scale_arg.reshape(1, 1)),
+            _wrap_for_dlpack(weight_scale_arg),
+            _wrap_for_dlpack(bias_arg),
+            _wrap_for_dlpack(output),
+            DTYPE_TO_CODE[out_dtype],
+            stream_ptr,
+        )
+        return output
+
     used_cutlass = False
+    prefer_cublas_fallback = _prefer_cublas_int8_fallback(m, n, k)
     if (
-        not _DISABLE_CUTLASS_INT8
+        not prefer_cublas_fallback
+        and not _DISABLE_CUTLASS_INT8
         and _cuda_device_supports_cutlass_int8_dequant(x_int8)
-        and m <= 512
-        and n <= k
-        and k <= 4096
     ):
         ws_cutlass = weight_scale_arg if weight_scale_arg.numel() == n else weight_scale_arg.expand(n).contiguous()
         bias_f32 = bias_arg.to(torch.float32).contiguous() if bias is not None else bias_arg
@@ -655,7 +767,6 @@ def _int4_linear_via_int8_values(
         cublas_weight = weight_int8
 
     out_int32 = torch.empty((m, padded_n), dtype=torch.int32, device=x_int8.device)
-    stream_ptr = torch.cuda.current_stream(x_int8.device).cuda_stream
     _C.cublas_gemm_int8(
         _wrap_for_dlpack(cublas_x),
         _wrap_for_dlpack(cublas_weight),
@@ -690,8 +801,10 @@ def _int4_linear_via_int8(
     n = weight.shape[0]
     k = k_half * 2
     x_int8 = _unpack_int4_to_int8_cuda(x_qdata)
+    if x_int8.shape[0] <= _INT4_PACKED_WEIGHT_SMALL_M_MAX and hasattr(_C, "int4_weight_int8_act_gemv_dequant"):
+        return _int4_weight_int8_act_gemv_dequant(x_int8, weight, x_scale, weight_scale, bias, out_dtype)
     if weight_int8 is None:
-        weight_int8 = _unpack_int4_to_int8_cuda(weight)
+        return _int4_weight_int8_act_gemm_dequant_chunked(x_int8, weight, x_scale, weight_scale, bias, out_dtype)
     elif weight_int8.shape != (n, k) or weight_int8.dtype != torch.int8 or weight_int8.device != weight.device:
         raise ValueError("prepared INT8 fallback weight has incompatible shape, dtype, or device")
     return _int4_linear_via_int8_values(x_int8, weight_int8, x_scale, weight_scale, bias, out_dtype)
@@ -852,7 +965,6 @@ def convrot_w4a4_linear(
     orig_shape = x.shape
     x2d = x.reshape(-1, orig_shape[-1]).contiguous()
     if not _cuda_device_supports_native_int4_mma(x2d):
-        weight_int8 = prepare_int4_weight_for_int8_linear(qweight)
         if (
             convrot_groupsize == 256
             and x2d.shape[-1] % 256 == 0
@@ -865,9 +977,19 @@ def convrot_w4a4_linear(
         else:
             h = _build_hadamard(convrot_groupsize, device=x2d.device, dtype=x2d.dtype)
             qact_int8, x_scale = quantize_and_rotate_rowwise(x2d, h, convrot_groupsize)
-        out = _int4_linear_via_int8_values(
+        if qact_int8.shape[0] <= _INT4_PACKED_WEIGHT_SMALL_M_MAX and hasattr(_C, "int4_weight_int8_act_gemv_dequant"):
+            out = _int4_weight_int8_act_gemv_dequant(
+                qact_int8,
+                qweight,
+                x_scale,
+                wscales,
+                bias,
+                x.dtype,
+            )
+            return out.reshape(*orig_shape[:-1], qweight.shape[0])
+        out = _int4_weight_int8_act_gemm_dequant_chunked(
             qact_int8,
-            weight_int8,
+            qweight,
             x_scale,
             wscales,
             bias,

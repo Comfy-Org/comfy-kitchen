@@ -2,13 +2,18 @@
 //
 // Plain ConvRot W4A4 helpers: rowwise signed int4 quantization and int4 MMA
 // with row/column dequant scales.
+#include "dtype_dispatch.cuh"
 #include "svdquant_utils.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <algorithm>
 #include <cfloat>
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
 
 #ifdef COMFY_HAVE_CUTLASS
@@ -21,6 +26,31 @@
 #include <mutex>
 #include <tuple>
 #endif
+
+extern "C" void launch_cublas_gemm_int8_kernel(
+    const void* A_ptr,
+    const void* B_ptr,
+    void* C_ptr,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    void* workspace_ptr,
+    int64_t workspace_size,
+    cudaStream_t stream);
+
+extern "C" bool launch_cutlass_int8_dequant_strided(
+    const void* A,
+    const void* B,
+    const void* xs,
+    const void* ws,
+    const void* bias,
+    void* D,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t output_stride,
+    int out_dtype_code,
+    cudaStream_t stream);
 
 namespace {
 
@@ -68,6 +98,15 @@ template<> __device__ __forceinline__ float finite_max_for_dtype<__nv_bfloat16>(
 template<typename T>
 __device__ __forceinline__ float finite_absmax_for_int4_scale(float abs_max) {
     return fminf(abs_max, finite_max_for_dtype<T>());
+}
+
+inline int fp_dtype_size_bytes(int dtype_code) {
+    switch (dtype_code) {
+        case 0: return 4;
+        case 1:
+        case 2: return 2;
+        default: throw std::runtime_error("unsupported floating point dtype code");
+    }
 }
 
 __device__ __forceinline__ int unpack_int4_nibble(uint32_t v) {
@@ -1702,22 +1741,124 @@ __global__ void int4_linear_kernel(
     }
 }
 
-__global__ void unpack_int4_to_int8_kernel(
-    const int8_t* __restrict__ input,
-    int8_t* __restrict__ output,
-    int64_t total_packed,
-    int K_half)
+__device__ __forceinline__ int pack_int4_weight4_as_int8_word(uint32_t packed01, uint32_t packed23) {
+    const uint32_t b0 = static_cast<uint8_t>(static_cast<int8_t>(unpack_int4_nibble(packed01)));
+    const uint32_t b1 = static_cast<uint8_t>(static_cast<int8_t>(unpack_int4_nibble(packed01 >> 4)));
+    const uint32_t b2 = static_cast<uint8_t>(static_cast<int8_t>(unpack_int4_nibble(packed23)));
+    const uint32_t b3 = static_cast<uint8_t>(static_cast<int8_t>(unpack_int4_nibble(packed23 >> 4)));
+    return static_cast<int>(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+}
+
+template<int WARPS_PER_BLOCK, typename OutputType, typename BiasType>
+__global__ void int4_weight_int8_act_gemv_dequant_warp_kernel(
+    const int8_t* __restrict__ x,
+    const int8_t* __restrict__ weight,
+    const float* __restrict__ x_scales,
+    const float* __restrict__ weight_scales,
+    const BiasType* __restrict__ bias,
+    OutputType* __restrict__ output,
+    int M,
+    int N,
+    int K,
+    int weight_scale_size,
+    bool has_bias)
 {
-    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= total_packed) {
+    const int lane = threadIdx.x & (kThreadsPerWarp - 1);
+    const int warp = threadIdx.x >> 5;
+    const int n = static_cast<int>(blockIdx.x) * WARPS_PER_BLOCK + warp;
+    const int m = static_cast<int>(blockIdx.y);
+    if (n >= N) {
         return;
     }
-    const int row = static_cast<int>(idx / K_half);
-    const int packed_col = static_cast<int>(idx - static_cast<int64_t>(row) * K_half);
-    const uint32_t packed = static_cast<uint8_t>(input[idx]);
-    int8_t* out_row = output + static_cast<int64_t>(row) * (K_half * 2);
-    out_row[packed_col * 2] = static_cast<int8_t>(unpack_int4_nibble(packed));
-    out_row[packed_col * 2 + 1] = static_cast<int8_t>(unpack_int4_nibble(packed >> 4));
+
+    const int K4 = K >> 2;
+    const int K_half = K >> 1;
+    const int* __restrict__ x4 = reinterpret_cast<const int*>(x + static_cast<int64_t>(m) * K);
+    const int8_t* __restrict__ w_row = weight + static_cast<int64_t>(n) * K_half;
+
+    int acc = 0;
+    for (int k4 = lane; k4 < K4; k4 += kThreadsPerWarp) {
+        const uint32_t packed01 = static_cast<uint8_t>(w_row[k4 * 2]);
+        const uint32_t packed23 = static_cast<uint8_t>(w_row[k4 * 2 + 1]);
+        acc = __dp4a(x4[k4], pack_int4_weight4_as_int8_word(packed01, packed23), acc);
+    }
+
+    #pragma unroll
+    for (int offset = kThreadsPerWarp / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    if (lane == 0) {
+        const float weight_scale = weight_scales[weight_scale_size == 1 ? 0 : n];
+        float value = static_cast<float>(acc) * x_scales[m] * weight_scale;
+        if (has_bias) {
+            value += to_float(bias[n]);
+        }
+        output[static_cast<int64_t>(m) * N + n] = from_float<OutputType>(value);
+    }
+}
+
+template<typename OutputType, typename BiasType>
+__global__ void dequantize_int4_weight_int8_act_chunk_kernel(
+    const int32_t* __restrict__ input,
+    const float* __restrict__ x_scales,
+    const float* __restrict__ weight_scales,
+    const BiasType* __restrict__ bias,
+    OutputType* __restrict__ output,
+    int64_t total,
+    int output_stride,
+    int chunk_cols,
+    int col_offset,
+    int weight_scale_size,
+    bool has_bias)
+{
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+
+    const int chunk_col = static_cast<int>(idx % chunk_cols);
+    const int row = static_cast<int>(idx / chunk_cols);
+    const int col = col_offset + chunk_col;
+    const float weight_scale = weight_scales[weight_scale_size == 1 ? 0 : col];
+    float value = static_cast<float>(input[idx]) * x_scales[row] * weight_scale;
+    if (has_bias) {
+        value += to_float(bias[col]);
+    }
+    output[static_cast<int64_t>(row) * output_stride + col] = from_float<OutputType>(value);
+}
+
+__device__ __forceinline__ uint64_t unpack_int4_u32_to_int8_u64(uint32_t packed) {
+    uint64_t out = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t byte = (packed >> (i * 8)) & 0xffu;
+        const uint32_t low = static_cast<uint8_t>(static_cast<int8_t>(unpack_int4_nibble(byte)));
+        const uint32_t high = static_cast<uint8_t>(static_cast<int8_t>(unpack_int4_nibble(byte >> 4)));
+        out |= static_cast<uint64_t>(low | (high << 8)) << (i * 16);
+    }
+    return out;
+}
+
+__global__ void unpack_int4_to_int8_vec8_kernel(
+    const int8_t* __restrict__ input,
+    int8_t* __restrict__ output,
+    int64_t total_packed)
+{
+    const int64_t base = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 8;
+    if (base + 7 < total_packed) {
+        const uint2 packed = *reinterpret_cast<const uint2*>(input + base);
+        uint64_t* __restrict__ out64 = reinterpret_cast<uint64_t*>(output + base * 2);
+        out64[0] = unpack_int4_u32_to_int8_u64(packed.x);
+        out64[1] = unpack_int4_u32_to_int8_u64(packed.y);
+        return;
+    }
+
+    for (int64_t idx = base; idx < total_packed; ++idx) {
+        const uint32_t packed = static_cast<uint8_t>(input[idx]);
+        output[idx * 2] = static_cast<int8_t>(unpack_int4_nibble(packed));
+        output[idx * 2 + 1] = static_cast<int8_t>(unpack_int4_nibble(packed >> 4));
+    }
 }
 
 } // namespace
@@ -2619,12 +2760,217 @@ void launch_unpack_int4_to_int8_kernel(
     if (rows == 0 || K_half == 0) return;
     const int64_t total_packed = rows * K_half;
     constexpr int block_threads = 256;
-    const int64_t blocks = (total_packed + block_threads - 1) / block_threads;
-    unpack_int4_to_int8_kernel<<<static_cast<unsigned int>(blocks), block_threads, 0, stream>>>(
+    const int64_t blocks = ((total_packed + 7) / 8 + block_threads - 1) / block_threads;
+    unpack_int4_to_int8_vec8_kernel<<<static_cast<unsigned int>(blocks), block_threads, 0, stream>>>(
         reinterpret_cast<const int8_t*>(input),
         reinterpret_cast<int8_t*>(output),
-        total_packed,
-        static_cast<int>(K_half));
+        total_packed);
+}
+
+void launch_int4_weight_int8_act_gemv_dequant_kernel(
+    const void* input,
+    const void* weight,
+    const void* x_scales,
+    const void* weight_scales,
+    const void* bias,
+    void* output,
+    int64_t num_rows,
+    int64_t num_cols,
+    int64_t K,
+    int64_t weight_scale_size,
+    bool has_bias,
+    int output_dtype_code,
+    int bias_dtype_code,
+    cudaStream_t stream)
+{
+    if (num_cols == 0 || K == 0) return;
+    if ((K & 3) != 0) {
+        throw std::runtime_error("int4_weight_int8_act_gemv_dequant requires K divisible by 4");
+    }
+    if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
+        num_rows > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
+        K > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("int4_weight_int8_act_gemv_dequant only supports M,N,K <= INT_MAX");
+    }
+    if (weight_scale_size != 1 && weight_scale_size != num_cols) {
+        throw std::runtime_error("INT4 packed GEMV weight scale must be scalar or per-output-channel");
+    }
+
+    constexpr int kWarpsPerBlock = 8;
+    const dim3 grid(
+        static_cast<unsigned int>((num_cols + kWarpsPerBlock - 1) / kWarpsPerBlock),
+        static_cast<unsigned int>(num_rows));
+
+    DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+        if (!has_bias) {
+            int4_weight_int8_act_gemv_dequant_warp_kernel<kWarpsPerBlock, OutputType, float>
+                <<<grid, kWarpsPerBlock * kThreadsPerWarp, 0, stream>>>(
+                    static_cast<const int8_t*>(input),
+                    static_cast<const int8_t*>(weight),
+                    static_cast<const float*>(x_scales),
+                    static_cast<const float*>(weight_scales),
+                    nullptr,
+                    static_cast<OutputType*>(output),
+                    static_cast<int>(num_rows),
+                    static_cast<int>(num_cols),
+                    static_cast<int>(K),
+                    static_cast<int>(weight_scale_size),
+                    false);
+            return;
+        }
+
+        DISPATCH_FP_DTYPE(bias_dtype_code, BiasType, [&] {
+            int4_weight_int8_act_gemv_dequant_warp_kernel<kWarpsPerBlock, OutputType, BiasType>
+                <<<grid, kWarpsPerBlock * kThreadsPerWarp, 0, stream>>>(
+                    static_cast<const int8_t*>(input),
+                    static_cast<const int8_t*>(weight),
+                    static_cast<const float*>(x_scales),
+                    static_cast<const float*>(weight_scales),
+                    static_cast<const BiasType*>(bias),
+                    static_cast<OutputType*>(output),
+                    static_cast<int>(num_rows),
+                    static_cast<int>(num_cols),
+                    static_cast<int>(K),
+                    static_cast<int>(weight_scale_size),
+                    true);
+        });
+    });
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA packed INT4 weight GEMV failed: ") + cudaGetErrorString(err));
+    }
+}
+
+void launch_int4_weight_int8_act_gemm_dequant_chunked_kernel(
+    const void* input,
+    const void* weight,
+    const void* x_scales,
+    const void* weight_scales,
+    const void* bias,
+    void* output,
+    void* weight_workspace,
+    void* acc_workspace,
+    void* cublas_workspace,
+    int64_t cublas_workspace_size,
+    int64_t num_rows,
+    int64_t num_cols,
+    int64_t K,
+    int64_t weight_scale_size,
+    int64_t chunk_cols,
+    bool has_bias,
+    int output_dtype_code,
+    int bias_dtype_code,
+    cudaStream_t stream)
+{
+    if (num_rows == 0 || num_cols == 0 || K == 0) return;
+    if ((K & 1) != 0) {
+        throw std::runtime_error("int4_weight_int8_act_gemm_dequant_chunked requires K divisible by 2");
+    }
+    if (chunk_cols <= 0) {
+        throw std::runtime_error("int4_weight_int8_act_gemm_dequant_chunked requires positive chunk_cols");
+    }
+    if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
+        num_rows > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
+        K > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
+        chunk_cols > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("int4_weight_int8_act_gemm_dequant_chunked only supports M,N,K,chunk <= INT_MAX");
+    }
+    if (weight_scale_size != 1 && weight_scale_size != num_cols) {
+        throw std::runtime_error("INT4 chunked GEMM weight scale must be scalar or per-output-channel");
+    }
+
+    const int64_t K_half = K >> 1;
+    constexpr int unpack_threads = 256;
+    constexpr int dequant_threads = 256;
+
+    for (int64_t n0 = 0; n0 < num_cols; n0 += chunk_cols) {
+        const int64_t cols = std::min(chunk_cols, num_cols - n0);
+        const int64_t total_packed = cols * K_half;
+        const int64_t unpack_blocks = ((total_packed + 7) / 8 + unpack_threads - 1) / unpack_threads;
+        unpack_int4_to_int8_vec8_kernel<<<static_cast<unsigned int>(unpack_blocks), unpack_threads, 0, stream>>>(
+            static_cast<const int8_t*>(weight) + n0 * K_half,
+            static_cast<int8_t*>(weight_workspace),
+            total_packed);
+
+        const float* chunk_weight_scales = static_cast<const float*>(weight_scales) + (weight_scale_size == 1 ? 0 : n0);
+        const void* chunk_bias = has_bias ? static_cast<const char*>(bias) + n0 * fp_dtype_size_bytes(bias_dtype_code) : nullptr;
+        void* chunk_output = static_cast<char*>(output) + n0 * fp_dtype_size_bytes(output_dtype_code);
+        const bool used_cutlass = (
+            num_rows >= 1024
+            && (cols >= 4096 || (num_cols == 2560 && cols == 2560))
+            && weight_scale_size != 1
+            && (!has_bias || bias_dtype_code == 0)
+            && launch_cutlass_int8_dequant_strided(
+                input,
+                weight_workspace,
+                x_scales,
+                chunk_weight_scales,
+                chunk_bias,
+                chunk_output,
+                num_rows,
+                cols,
+                K,
+                num_cols,
+                output_dtype_code,
+                stream));
+        if (used_cutlass) {
+            continue;
+        }
+
+        launch_cublas_gemm_int8_kernel(
+            input,
+            weight_workspace,
+            acc_workspace,
+            num_rows,
+            cols,
+            K,
+            cublas_workspace,
+            cublas_workspace_size,
+            stream);
+
+        const int64_t total = num_rows * cols;
+        const int64_t dequant_blocks = (total + dequant_threads - 1) / dequant_threads;
+        DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+            if (!has_bias) {
+                dequantize_int4_weight_int8_act_chunk_kernel<OutputType, float>
+                    <<<static_cast<unsigned int>(dequant_blocks), dequant_threads, 0, stream>>>(
+                        static_cast<const int32_t*>(acc_workspace),
+                        static_cast<const float*>(x_scales),
+                        static_cast<const float*>(weight_scales),
+                        nullptr,
+                        static_cast<OutputType*>(output),
+                        total,
+                        static_cast<int>(num_cols),
+                        static_cast<int>(cols),
+                        static_cast<int>(n0),
+                        static_cast<int>(weight_scale_size),
+                        false);
+                return;
+            }
+
+            DISPATCH_FP_DTYPE(bias_dtype_code, BiasType, [&] {
+                dequantize_int4_weight_int8_act_chunk_kernel<OutputType, BiasType>
+                    <<<static_cast<unsigned int>(dequant_blocks), dequant_threads, 0, stream>>>(
+                        static_cast<const int32_t*>(acc_workspace),
+                        static_cast<const float*>(x_scales),
+                        static_cast<const float*>(weight_scales),
+                        static_cast<const BiasType*>(bias),
+                        static_cast<OutputType*>(output),
+                        total,
+                        static_cast<int>(num_cols),
+                        static_cast<int>(cols),
+                        static_cast<int>(n0),
+                        static_cast<int>(weight_scale_size),
+                        true);
+            });
+        });
+    }
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA chunked INT4 weight INT8 GEMM failed: ") + cudaGetErrorString(err));
+    }
 }
 
 bool launch_cutlass_int4_dequant(
