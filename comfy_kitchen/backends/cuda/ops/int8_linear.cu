@@ -167,7 +167,7 @@ __global__ void quantize_int8_rowwise_kernel(
 
     const int row = static_cast<int>(blockIdx.x);
     const int tid = threadIdx.x;
-    const int row_offset = row * K;
+    const int64_t row_offset = static_cast<int64_t>(row) * K;
 
     float abs_max = 0.0f;
     for (int col = tid; col < K; col += blockDim.x) {
@@ -184,7 +184,7 @@ __global__ void quantize_int8_rowwise_kernel(
     }
 
     for (int col = tid; col < K; col += blockDim.x) {
-        const int idx = row_offset + col;
+        const int64_t idx = row_offset + col;
         const float scaled = quant_div_to_float<InputType>(x[idx], scale);
         float quantized;
         if constexpr (STOCHASTIC) {

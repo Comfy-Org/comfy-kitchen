@@ -245,6 +245,37 @@ def _convrot_fused_shared_memory_fits(x: torch.Tensor, k: int, group_size: int) 
     return requested_shared < max_shared
 
 
+def _convrot_int4_fused_shared_memory_fits(x: torch.Tensor, k: int, group_size: int) -> bool:
+    if not x.is_cuda or group_size not in (16, 64, 256):
+        return True
+    props = torch.cuda.get_device_properties(x.get_device())
+    max_shared = getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
+    if _cuda_device_is_turing(x.get_device()):
+        max_shared = props.shared_memory_per_block
+
+    if group_size in (16, 64):
+        block_threads = 512 if k > 4096 else 128
+        groups_in_flight = block_threads // (group_size // 4)
+        requested_shared = (k + groups_in_flight * 2 * group_size) * x.element_size()
+        return requested_shared < max_shared
+
+    if x.shape[0] != 1 and k <= 4096:
+        block_threads = 256
+        scratch_buffers = 2
+    elif x.shape[0] == 1:
+        block_threads = 512
+        scratch_buffers = 2
+    elif k == 15360:
+        block_threads = 640
+        scratch_buffers = 1
+    else:
+        block_threads = 1024
+        scratch_buffers = 2
+    groups_in_flight = block_threads // 64
+    requested_shared = (k + groups_in_flight * scratch_buffers * 256) * x.element_size()
+    return requested_shared < max_shared
+
+
 def _should_use_convrot_fused_kernel(x: torch.Tensor, k: int, group_size: int) -> bool:
     return (
         group_size == 256
@@ -899,7 +930,11 @@ def quantize_convrot_w4a4_weight(
     if weight.shape[-1] % convrot_groupsize != 0:
         raise ValueError(f"in_features {weight.shape[-1]} not divisible by convrot_groupsize {convrot_groupsize}")
     weight_2d = weight.contiguous()
-    if convrot_groupsize in (16, 64, 256) and hasattr(_C, "quantize_int4_rowwise_convrot64"):
+    if (
+        convrot_groupsize in (16, 64, 256)
+        and hasattr(_C, "quantize_int4_rowwise_convrot64")
+        and _convrot_int4_fused_shared_memory_fits(weight_2d, weight_2d.shape[-1], convrot_groupsize)
+    ):
         qdata, scales = quantize_int4_rowwise_convrot64(
             weight_2d,
             convrot_groupsize,
@@ -999,7 +1034,11 @@ def convrot_w4a4_linear(
             x.dtype,
         )
         return out[: x2d.shape[0]].reshape(*orig_shape[:-1], qweight.shape[0])
-    if convrot_groupsize in (16, 64, 256) and hasattr(_C, "quantize_int4_rowwise_convrot64"):
+    if (
+        convrot_groupsize in (16, 64, 256)
+        and hasattr(_C, "quantize_int4_rowwise_convrot64")
+        and _convrot_int4_fused_shared_memory_fits(x2d, x2d.shape[-1], convrot_groupsize)
+    ):
         qact, x_scale = quantize_int4_rowwise_convrot64(x2d, convrot_groupsize)
     else:
         h = _build_hadamard(convrot_groupsize, device=x2d.device, dtype=x2d.dtype)

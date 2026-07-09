@@ -1929,6 +1929,11 @@ void launch_quantize_int4_rowwise_kernel(
                                              seed);
         }
     }
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA INT4 rowwise quantization failed: ") + cudaGetErrorString(err));
+    }
 }
 
 void launch_quantize_int4_rowwise_convrot64_kernel(
@@ -1983,6 +1988,13 @@ void launch_quantize_int4_rowwise_convrot64_kernel(
             static_cast<int>(K),
             seed);
     };
+    auto check_launch = [] {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("CUDA INT4 rowwise convrot quantization failed: ") + cudaGetErrorString(err));
+        }
+    };
     if (group_size == 16) {
         const bool use_wide_small_group = K > 4096;
         if (input_dtype_code == 2) {
@@ -2025,6 +2037,7 @@ void launch_quantize_int4_rowwise_convrot64_kernel(
                 launch_small(quantize_int4_rowwise_convrot_small_kernel<16, float, 128, false>, typed_input, 16, 128);
             }
         }
+        check_launch();
         return;
     }
     if (group_size == 64) {
@@ -2069,6 +2082,7 @@ void launch_quantize_int4_rowwise_convrot64_kernel(
                 launch_small(quantize_int4_rowwise_convrot_small_kernel<64, float, 128, false>, typed_input, 64, 128);
             }
         }
+        check_launch();
         return;
     }
     if (input_dtype_code == 2) {
@@ -2153,6 +2167,8 @@ void launch_quantize_int4_rowwise_convrot64_kernel(
             }
         }
     }
+
+    check_launch();
 }
 
 void launch_quantize_int4_rowwise_convrot64_to_int8_kernel(
@@ -2305,6 +2321,12 @@ void launch_quantize_int4_rowwise_convrot64_to_int8_kernel(
                 launch(quantize_int4_rowwise_convrot64_kernel<float, block_threads_multi, false, false, true>, typed_input, block_threads_multi, 2);
             }
         }
+    }
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("CUDA INT4 rowwise convrot INT8-output quantization failed: ") + cudaGetErrorString(err));
     }
 }
 
