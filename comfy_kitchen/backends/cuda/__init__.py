@@ -953,8 +953,11 @@ def convrot_w4a4_linear(
     bias: torch.Tensor | None = None,
     convrot_groupsize: int = 256,
     quant_group_size: int = _INT4_GROUP_SIZE,
+    linear_dtype: str = "int4",
 ) -> torch.Tensor:
     """Compute ``x @ W.T + bias`` using ConvRot W4A4 signed INT4 MMA."""
+    if linear_dtype not in {"int4", "int8"}:
+        raise ValueError(f"ConvRot W4A4 linear_dtype must be 'int4' or 'int8', got {linear_dtype!r}")
     if quant_group_size != _INT4_GROUP_SIZE:
         raise ValueError(f"int4 MMA kernel requires quant_group_size {_INT4_GROUP_SIZE}")
     if x.shape[-1] != qweight.shape[-1] * 2:
@@ -964,7 +967,7 @@ def convrot_w4a4_linear(
 
     orig_shape = x.shape
     x2d = x.reshape(-1, orig_shape[-1]).contiguous()
-    if not _cuda_device_supports_native_int4_mma(x2d):
+    if linear_dtype == "int8" or not _cuda_device_supports_native_int4_mma(x2d):
         if (
             convrot_groupsize == 256
             and x2d.shape[-1] % 256 == 0
@@ -2394,6 +2397,7 @@ def _build_constraints() -> dict:
                 "bias": ParamConstraint(dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16})),
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
                 "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
+                "linear_dtype": ParamConstraint(dtypes=frozenset({str})),
             },
             default_devices=cuda_devices,
             min_compute_capability=(8, 0),

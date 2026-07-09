@@ -248,6 +248,7 @@ def _build_constraints() -> dict:
                 "bias": ParamConstraint(dtypes=standard_floats),
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
                 "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
+                "linear_dtype": ParamConstraint(dtypes=frozenset({str})),
             },
             default_devices=all_devices,
         ),

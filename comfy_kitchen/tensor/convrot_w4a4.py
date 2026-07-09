@@ -84,8 +84,11 @@ def convrot_w4a4_linear(
     bias: torch.Tensor | None = None,
     convrot_groupsize: int = 256,
     quant_group_size: int = _INT4_GROUP_SIZE,
+    linear_dtype: str = "int4",
 ) -> torch.Tensor:
     """Compute ``x @ W.T + bias`` using ConvRot W4A4 int4 MMA."""
+    if linear_dtype not in {"int4", "int8"}:
+        raise ValueError(f"ConvRot W4A4 linear_dtype must be 'int4' or 'int8', got {linear_dtype!r}")
     impl = registry.get_implementation(
         "convrot_w4a4_linear",
         kwargs={
@@ -95,6 +98,7 @@ def convrot_w4a4_linear(
             "bias": bias,
             "convrot_groupsize": convrot_groupsize,
             "quant_group_size": quant_group_size,
+            "linear_dtype": linear_dtype,
         },
     )
     return impl(
@@ -104,6 +108,7 @@ def convrot_w4a4_linear(
         bias=bias,
         convrot_groupsize=convrot_groupsize,
         quant_group_size=quant_group_size,
+        linear_dtype=linear_dtype,
     )
 
 
@@ -117,7 +122,13 @@ class TensorCoreConvRotW4A4Layout(QuantizedLayout):
     class Params(BaseLayoutParams):
         convrot_groupsize: int = 256
         quant_group_size: int = _INT4_GROUP_SIZE
+        linear_dtype: str = "int4"
         transposed: bool = False
+
+        def __post_init__(self):
+            super().__post_init__()
+            if self.linear_dtype not in {"int4", "int8"}:
+                raise ValueError(f"ConvRot W4A4 linear_dtype must be 'int4' or 'int8', got {self.linear_dtype!r}")
 
         def _tensor_fields(self) -> list[str]:
             return ["scale"]
@@ -132,8 +143,11 @@ class TensorCoreConvRotW4A4Layout(QuantizedLayout):
         convrot_groupsize: int = 256,
         quant_group_size: int = _INT4_GROUP_SIZE,
         stochastic_rounding: int | None = 0,
+        linear_dtype: str = "int4",
         **kwargs,
     ) -> tuple[torch.Tensor, Params]:
+        if linear_dtype not in {"int4", "int8"}:
+            raise ValueError(f"ConvRot W4A4 linear_dtype must be 'int4' or 'int8', got {linear_dtype!r}")
         qdata, scales = quantize_convrot_w4a4_weight(
             tensor,
             convrot_groupsize,
@@ -146,6 +160,7 @@ class TensorCoreConvRotW4A4Layout(QuantizedLayout):
             orig_shape=tuple(tensor.shape),
             convrot_groupsize=convrot_groupsize,
             quant_group_size=quant_group_size,
+            linear_dtype=linear_dtype,
         )
         return qdata, params
 
@@ -173,6 +188,7 @@ class TensorCoreConvRotW4A4Layout(QuantizedLayout):
         return {
             "convrot_groupsize": params.convrot_groupsize,
             "quant_group_size": params.quant_group_size,
+            "linear_dtype": params.linear_dtype,
         }
 
 
@@ -206,6 +222,7 @@ def _convrot_w4a4_forward(input_tensor: torch.Tensor, weight: QuantizedTensor, b
         bias=bias,
         convrot_groupsize=params.convrot_groupsize,
         quant_group_size=params.quant_group_size,
+        linear_dtype=params.linear_dtype,
     )
 
 

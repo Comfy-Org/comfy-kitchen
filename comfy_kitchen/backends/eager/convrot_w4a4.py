@@ -178,8 +178,11 @@ def convrot_w4a4_linear(
     bias: torch.Tensor | None = None,
     convrot_groupsize: int = 256,
     quant_group_size: int = _INT4_GROUP_SIZE,
+    linear_dtype: str = "int4",
 ) -> torch.Tensor:
     """Compute ``x @ W.T + bias`` using the eager ConvRot W4A4 path."""
+    if linear_dtype not in {"int4", "int8"}:
+        raise ValueError(f"ConvRot W4A4 linear_dtype must be 'int4' or 'int8', got {linear_dtype!r}")
     if quant_group_size != _INT4_GROUP_SIZE:
         raise ValueError(f"int4 MMA kernel requires quant_group_size {_INT4_GROUP_SIZE}")
     if x.shape[-1] != qweight.shape[-1] * 2:

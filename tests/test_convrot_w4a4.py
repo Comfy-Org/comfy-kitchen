@@ -79,6 +79,14 @@ def test_convrot_w4a4_layout_linear_mm_addmm(seed):
     assert torch.allclose(out_linear, out_addmm, rtol=1e-5, atol=1e-5)
 
 
+def test_convrot_w4a4_layout_records_linear_dtype(seed):
+    w = torch.randn(16, 256, dtype=torch.float32)
+    qt = QuantizedTensor.from_float(w, "TensorCoreConvRotW4A4Layout", linear_dtype="int8")
+
+    assert qt._params.linear_dtype == "int8"
+    assert qt._params.convrot_groupsize == 256
+
+
 def test_convrot_w4a4_rejects_bad_groups(seed):
     w = torch.randn(16, 250, dtype=torch.float32)
     with pytest.raises(ValueError, match="not divisible by convrot_groupsize"):
