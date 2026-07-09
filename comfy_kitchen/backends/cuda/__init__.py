@@ -159,7 +159,6 @@ _cublas_workspaces: dict[int, torch.Tensor] = {}
 _empty_cuda_tensors: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
 _turing_device_cache: dict[int, bool] = {}
 _cutlass_int8_device_cache: dict[int, bool] = {}
-_shared_memory_per_block_cache: dict[int, int] = {}
 _FORCE_INT4_INT8_FALLBACK = os.environ.get("COMFY_KITCHEN_FORCE_INT4_INT8_FALLBACK", "0") == "1"
 _INT4_PACKED_WEIGHT_SMALL_M_MAX = 8
 _INT4_INT8_WEIGHT_CHUNK_N = max(1, int(os.environ.get("COMFY_KITCHEN_INT4_INT8_WEIGHT_CHUNK_N", "4096")))
@@ -227,42 +226,39 @@ def _pad_1d(x: torch.Tensor, padded_size: int) -> torch.Tensor:
     return torch.cat((x.reshape(-1), padding), dim=0).contiguous()
 
 
-def _convrot_fused_shared_memory_fits(x: torch.Tensor, k: int, group_size: int) -> bool:
-    if not x.is_cuda or group_size != 256:
-        return True
+def _max_dynamic_shared_memory_per_block(x: torch.Tensor) -> int:
     device_index = x.get_device()
-    max_shared = _shared_memory_per_block_cache.get(device_index)
-    if max_shared is None:
-        props = torch.cuda.get_device_properties(device_index)
-        if _cuda_device_is_turing(device_index):
-            max_shared = props.shared_memory_per_block
-        else:
-            max_shared = getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
-        _shared_memory_per_block_cache[device_index] = max_shared
-    # The fused convrot64 kernel stages both fp32 scratch and row data in
-    # shared memory. Its launch-time request is 8 bytes per column.
-    requested_shared = k * 8
-    return requested_shared < max_shared
-
-
-def _convrot_int4_fused_shared_memory_fits(x: torch.Tensor, k: int, group_size: int) -> bool:
-    if not x.is_cuda or group_size not in (16, 64, 256):
-        return True
     props = torch.cuda.get_device_properties(x.get_device())
-    max_shared = getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
-    if _cuda_device_is_turing(x.get_device()):
-        max_shared = props.shared_memory_per_block
+    if _cuda_device_is_turing(device_index):
+        return props.shared_memory_per_block
+    return getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
 
+
+def _convrot_int8_fused_shared_memory_bytes(m: int, k: int) -> int:
+    if m == 1:
+        block_threads = 512
+    elif k == 256:
+        block_threads = 64
+    elif k == 2560:
+        block_threads = 640
+    elif k == 6144:
+        block_threads = 768
+    else:
+        block_threads = 1024
+    groups_in_flight = block_threads // 64
+    return (k + groups_in_flight * 2 * 256) * 4
+
+
+def _convrot_int4_fused_shared_memory_bytes(m: int, k: int, group_size: int, dtype_size: int) -> int:
     if group_size in (16, 64):
         block_threads = 512 if k > 4096 else 128
         groups_in_flight = block_threads // (group_size // 4)
-        requested_shared = (k + groups_in_flight * 2 * group_size) * x.element_size()
-        return requested_shared < max_shared
+        return (k + groups_in_flight * 2 * group_size) * dtype_size
 
-    if x.shape[0] != 1 and k <= 4096:
+    if m != 1 and k <= 4096:
         block_threads = 256
         scratch_buffers = 2
-    elif x.shape[0] == 1:
+    elif m == 1:
         block_threads = 512
         scratch_buffers = 2
     elif k == 15360:
@@ -272,8 +268,21 @@ def _convrot_int4_fused_shared_memory_fits(x: torch.Tensor, k: int, group_size: 
         block_threads = 1024
         scratch_buffers = 2
     groups_in_flight = block_threads // 64
-    requested_shared = (k + groups_in_flight * scratch_buffers * 256) * x.element_size()
-    return requested_shared < max_shared
+    return (k + groups_in_flight * scratch_buffers * 256) * dtype_size
+
+
+def _convrot_fused_shared_memory_fits(x: torch.Tensor, k: int, group_size: int) -> bool:
+    if not x.is_cuda or group_size != 256:
+        return True
+    requested_shared = _convrot_int8_fused_shared_memory_bytes(x.shape[0], k)
+    return requested_shared < _max_dynamic_shared_memory_per_block(x)
+
+
+def _convrot_int4_fused_shared_memory_fits(x: torch.Tensor, k: int, group_size: int) -> bool:
+    if not x.is_cuda or group_size not in (16, 64, 256):
+        return True
+    requested_shared = _convrot_int4_fused_shared_memory_bytes(x.shape[0], k, group_size, x.element_size())
+    return requested_shared < _max_dynamic_shared_memory_per_block(x)
 
 
 def _should_use_convrot_fused_kernel(x: torch.Tensor, k: int, group_size: int) -> bool:

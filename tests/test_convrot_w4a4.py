@@ -87,6 +87,38 @@ def test_convrot_w4a4_layout_records_linear_dtype(seed):
     assert qt._params.convrot_groupsize == 256
 
 
+@pytest.mark.parametrize(
+    ("m", "k", "expected"),
+    [
+        (1, 65536, (65536 + 8 * 2 * 256) * 4),
+        (2, 256, (256 + 1 * 2 * 256) * 4),
+        (2, 2560, (2560 + 10 * 2 * 256) * 4),
+        (2, 6144, (6144 + 12 * 2 * 256) * 4),
+        (2, 15360, (15360 + 16 * 2 * 256) * 4),
+    ],
+)
+def test_convrot_int8_fused_shared_memory_bytes(m, k, expected):
+    assert cuda_backend._convrot_int8_fused_shared_memory_bytes(m, k) == expected
+
+
+@pytest.mark.parametrize(
+    ("m", "k", "group_size", "dtype_size", "expected"),
+    [
+        (2, 4096, 16, 2, (4096 + 32 * 2 * 16) * 2),
+        (2, 8192, 16, 2, (8192 + 128 * 2 * 16) * 2),
+        (2, 4096, 64, 2, (4096 + 8 * 2 * 64) * 2),
+        (2, 8192, 64, 2, (8192 + 32 * 2 * 64) * 2),
+        (2, 4096, 256, 2, (4096 + 4 * 2 * 256) * 2),
+        (1, 65536, 256, 2, (65536 + 8 * 2 * 256) * 2),
+        (2, 15360, 256, 2, (15360 + 10 * 1 * 256) * 2),
+        (2, 65536, 256, 2, (65536 + 16 * 2 * 256) * 2),
+        (2, 65536, 256, 4, (65536 + 16 * 2 * 256) * 4),
+    ],
+)
+def test_convrot_int4_fused_shared_memory_bytes(m, k, group_size, dtype_size, expected):
+    assert cuda_backend._convrot_int4_fused_shared_memory_bytes(m, k, group_size, dtype_size) == expected
+
+
 def test_convrot_w4a4_rejects_bad_groups(seed):
     w = torch.randn(16, 250, dtype=torch.float32)
     with pytest.raises(ValueError, match="not divisible by convrot_groupsize"):
@@ -122,6 +154,115 @@ def test_convrot_w4a4_cuda_no_bias_large_m(seed):
     out = functional.linear(x, qt)
     assert out.shape == (1152, 128)
     assert out.dtype == torch.bfloat16
+
+
+def test_convrot_cuda_shared_memory_fit_matches_device_limit():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    x_int8 = torch.empty((2, 65536), device="cuda", dtype=torch.float16)
+    max_shared = cuda_backend._max_dynamic_shared_memory_per_block(x_int8)
+    int8_requested = cuda_backend._convrot_int8_fused_shared_memory_bytes(x_int8.shape[0], x_int8.shape[1])
+
+    assert cuda_backend._convrot_fused_shared_memory_fits(x_int8, x_int8.shape[1], 256) == (
+        int8_requested < max_shared
+    )
+
+    x_int4 = torch.empty((2, 65536), device="cuda", dtype=torch.float16)
+    int4_requested = cuda_backend._convrot_int4_fused_shared_memory_bytes(
+        x_int4.shape[0],
+        x_int4.shape[1],
+        256,
+        x_int4.element_size(),
+    )
+
+    assert cuda_backend._convrot_int4_fused_shared_memory_fits(x_int4, x_int4.shape[1], 256) == (
+        int4_requested < max_shared
+    )
+
+
+@pytest.mark.parametrize("linear_dtype", ["int4", "int8"])
+@pytest.mark.parametrize("convrot_groupsize", [16, 64, 256])
+def test_convrot_w4a4_cuda_linear_handles_large_fp16_activations(seed, linear_dtype, convrot_groupsize):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    torch.manual_seed(789)
+    x = torch.empty(8, 256, device="cuda", dtype=torch.float16)
+    pattern = torch.tensor([65504.0, 65504.0, 65504.0, -65504.0], device="cuda", dtype=torch.float16)
+    x.copy_(pattern.repeat(x.numel() // pattern.numel()).reshape_as(x))
+    w = (torch.randn(32, 256, device="cuda", dtype=torch.float16) * 1.0e-4).contiguous()
+    bias = torch.zeros(32, device="cuda", dtype=torch.float16)
+    qt = QuantizedTensor.from_float(
+        w,
+        "TensorCoreConvRotW4A4Layout",
+        convrot_groupsize=convrot_groupsize,
+        linear_dtype=linear_dtype,
+    )
+
+    out = functional.linear(x, qt, bias)
+    qact, scale = cuda_backend.quantize_int4_rowwise_convrot64(x, convrot_groupsize)
+    q_values = _unpack_int4_row_major(qact)
+
+    assert out.shape == (8, 32)
+    assert out.dtype == torch.float16
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(scale).all()
+    assert q_values.min().item() >= -7
+    assert q_values.max().item() <= 7
+
+
+@pytest.mark.parametrize("linear_dtype", ["int4", "int8"])
+@pytest.mark.parametrize(("m", "k"), [(128, 15360), (1152, 6912)])
+def test_convrot_w4a4_cuda_linear_handles_large_fp16_activation_shapes(seed, linear_dtype, m, k):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    torch.manual_seed(790)
+    x = torch.empty(m, k, device="cuda", dtype=torch.float16)
+    pattern = torch.tensor([65504.0, 65504.0, 65504.0, -65504.0], device="cuda", dtype=torch.float16)
+    x.copy_(pattern.repeat(x.numel() // pattern.numel()).reshape_as(x))
+    w = (torch.randn(64, k, device="cuda", dtype=torch.float16) * 1.0e-5).contiguous()
+    qt = QuantizedTensor.from_float(
+        w,
+        "TensorCoreConvRotW4A4Layout",
+        convrot_groupsize=256,
+        linear_dtype=linear_dtype,
+    )
+
+    out = functional.linear(x, qt)
+    qact, scale = cuda_backend.quantize_int4_rowwise_convrot64(x, 256)
+    q_values = _unpack_int4_row_major(qact)
+
+    assert out.shape == (m, 64)
+    assert out.dtype == torch.float16
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(scale).all()
+    assert q_values.min().item() >= -7
+    assert q_values.max().item() <= 7
+
+
+@pytest.mark.parametrize("linear_dtype", ["int4", "int8"])
+@pytest.mark.parametrize(("m", "k", "n"), [(4192, 6144, 1536), (4192, 16384, 512)])
+def test_convrot_w4a4_cuda_linear_handles_big_activation_tensors(seed, linear_dtype, m, k, n):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    torch.manual_seed(791)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.float16)
+    qt = QuantizedTensor.from_float(
+        w,
+        "TensorCoreConvRotW4A4Layout",
+        convrot_groupsize=256,
+        linear_dtype=linear_dtype,
+    )
+
+    out = functional.linear(x, qt)
+
+    assert out.shape == (m, n)
+    assert out.dtype == torch.float16
+    assert torch.isfinite(out).all()
 
 
 def test_convrot_w4a4_cuda_large_k_quantize_matches_reference(seed):
