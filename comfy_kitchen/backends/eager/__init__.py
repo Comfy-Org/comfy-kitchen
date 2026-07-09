@@ -11,6 +11,10 @@ __all__ = [
     "dequantize_int8_simple_dtype",
     "dequantize_int8_convrot_weight",
     "dequantize_int8_convrot_weight_dtype",
+    "dequantize_int4_simple",
+    "dequantize_int4_simple_dtype",
+    "dequantize_int4_convrot_weight",
+    "dequantize_int4_convrot_weight_dtype",
     "gemv_awq_w4a16",
     "quantize_mxfp8",
     "quantize_nvfp4",
@@ -19,12 +23,15 @@ __all__ = [
     "quantize_int8_convrot_weight",
     "quantize_and_rotate_rowwise",
     "quantize_int8_tensorwise",
+    "quantize_int4_rowwise",
+    "quantize_int4_convrot_weight",
     "quantize_svdquant_w4a4",
     "scaled_mm_mxfp8",
     "scaled_mm_nvfp4",
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
     "int8_linear",
+    "int4_linear",
 ]
 
 import torch
@@ -39,6 +46,10 @@ from comfy_kitchen.registry import registry
 from .adaln import adaln
 from .awq import gemv_awq_w4a16
 from .quantization import (
+    dequantize_int4_convrot_weight,
+    dequantize_int4_convrot_weight_dtype,
+    dequantize_int4_simple,
+    dequantize_int4_simple_dtype,
     dequantize_int8_convrot_weight,
     dequantize_int8_convrot_weight_dtype,
     dequantize_int8_simple,
@@ -46,8 +57,11 @@ from .quantization import (
     dequantize_mxfp8,
     dequantize_nvfp4,
     dequantize_per_tensor_fp8,
+    int4_linear,
     int8_linear,
     quantize_and_rotate_rowwise,
+    quantize_int4_convrot_weight,
+    quantize_int4_rowwise,
     quantize_int8_convrot_weight,
     quantize_int8_rowwise,
     quantize_int8_tensorwise,
@@ -290,6 +304,64 @@ def _build_constraints() -> dict:
         default_devices=all_devices,
     )
     out["int8_linear"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
+            "weight_scale": ParamConstraint(dtypes=standard_floats),
+            "bias": ParamConstraint(dtypes=standard_floats),
+            "convrot": ParamConstraint(dtypes=frozenset({bool})),
+            "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["quantize_int4_rowwise"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["quantize_int4_convrot_weight"] = FunctionConstraints(
+        params={
+            "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+            "group_size": ParamConstraint(dtypes=frozenset({int})),
+            "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["dequantize_int4_simple"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=frozenset({torch.int8})),
+            "scale": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["dequantize_int4_simple_dtype"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=frozenset({torch.int8})),
+            "scale": ParamConstraint(dtypes=standard_floats),
+            "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["dequantize_int4_convrot_weight"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+            "scale": ParamConstraint(dtypes=standard_floats),
+            "group_size": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["dequantize_int4_convrot_weight_dtype"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+            "scale": ParamConstraint(dtypes=standard_floats),
+            "group_size": ParamConstraint(dtypes=frozenset({int})),
+            "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["int4_linear"] = FunctionConstraints(
         params={
             "x": ParamConstraint(dtypes=standard_floats),
             "weight": ParamConstraint(dtypes=frozenset({torch.int8})),

@@ -169,6 +169,18 @@ __forceinline__ __device__ uint32_t cvta_smem_u32(const void* ptr) {
     return s;
 }
 
+__forceinline__ __device__ void ldmatrix_x2(uint32_t (&dst)[2], uint32_t addr) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+                 "{%0, %1}, [%2];\n"
+                 : "=r"(dst[0]), "=r"(dst[1])
+                 : "r"(addr));
+#else
+    dst[0] = dst[1] = 0;
+    (void)addr;
+#endif
+}
+
 __forceinline__ __device__ void ldmatrix_x4(uint32_t (&dst)[4], uint32_t addr) {
 #if __CUDA_ARCH__ >= 800
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 "

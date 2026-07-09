@@ -140,6 +140,19 @@ extern "C" {
         int input_dtype_code,
         cudaStream_t stream);
 
+    // int4_tensorwise W4A4 — see ops/int4_tensorwise.cu
+    void launch_int4_tensorwise_quantize_kernel(
+        const void* x,
+        void* q,
+        void* ascales,
+        int64_t M,
+        int64_t M_pad,
+        int64_t K,
+        int64_t n_scale_groups,
+        int input_dtype_code,
+        bool rotate,
+        cudaStream_t stream);
+
     // SVDQuant W4A4 — see ops/quantize_svdquant_w4a4.cu
     void launch_svdquant_quantize_w4a4_kernel(
         const void* x,
@@ -176,6 +189,7 @@ extern "C" {
         int fast_accum,
         int shared_scale,
         int fuse_lora,
+        int rank_one,
         cudaStream_t stream);
 
     // AWQ W4A16 — see ops/awq_w4a16.cu. Internal M-routing picks
@@ -603,6 +617,25 @@ static int svdquant_dtype_code(const nb::dlpack::dtype& dt) {
     return c;
 }
 
+void int4_tensorwise_quantize(
+    nb::ndarray<nb::device::cuda> x,           // (M, K) bf16/fp16
+    nb::ndarray<nb::device::cuda> q_x,         // (M_pad, K/2) int8
+    nb::ndarray<nb::device::cuda> ascales,     // (K/64, M_pad) same dtype as x
+    bool rotate,
+    uintptr_t stream_ptr)
+{
+    int64_t M = static_cast<int64_t>(x.shape(0));
+    int64_t K = static_cast<int64_t>(x.shape(1));
+    int64_t M_pad = static_cast<int64_t>(q_x.shape(0));
+    int64_t n_scale_groups = static_cast<int64_t>(ascales.shape(0));
+    int input_code = svdquant_dtype_code(x.dtype());
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_int4_tensorwise_quantize_kernel(
+        x.data(), q_x.data(), ascales.data(),
+        M, M_pad, K, n_scale_groups, input_code, rotate, stream);
+}
+
 void svdquant_quantize_w4a4(
     nb::ndarray<nb::device::cuda> x,           // (M, K) bf16/fp16 — pre-shifted if unsigned path
     nb::ndarray<nb::device::cuda> smooth,      // (K,)
@@ -640,6 +673,7 @@ void svdquant_scaled_mm_w4a4(
     bool fast_accum,
     bool shared_scale,
     bool fuse_lora,
+    bool rank_one,
     uintptr_t stream_ptr)
 {
     int M = static_cast<int>(act.shape(0));
@@ -678,7 +712,8 @@ void svdquant_scaled_mm_w4a4(
         M, N, K, R,
         static_cast<int>(act_unsigned), out_code,
         static_cast<int>(tile_packed), static_cast<int>(fast_accum),
-        static_cast<int>(shared_scale), static_cast<int>(fuse_lora), stream);
+        static_cast<int>(shared_scale), static_cast<int>(fuse_lora),
+        static_cast<int>(rank_one), stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -1590,6 +1625,16 @@ NB_MODULE(_C, m) {
           nb::arg("pad_32x") = false,
           nb::arg("stream_ptr"));
 
+    m.def("int4_tensorwise_quantize", &int4_tensorwise_quantize,
+          "int4_tensorwise W4A4: optional fused ConvRot (group-256 FHT) + per-row "
+          "symmetric int4 quantize (absmax/7, [-7,7]) packed low-nibble-first; "
+          "per-row scale broadcast into the (K/64, M_pad) svdquant ascales layout.",
+          nb::arg("x"),
+          nb::arg("q_x"),
+          nb::arg("ascales"),
+          nb::arg("rotate"),
+          nb::arg("stream_ptr"));
+
     m.def("svdquant_quantize_w4a4", &svdquant_quantize_w4a4,
           "SVDQuant W4A4: smooth + int4 quantize (LoRA-down is external). "
           "act_unsigned selects scale=max/15 + clamp [0,15] for u4 MMA downstream; "
@@ -1617,6 +1662,7 @@ NB_MODULE(_C, m) {
           nb::arg("fast_accum"),
           nb::arg("shared_scale"),
           nb::arg("fuse_lora"),
+          nb::arg("rank_one"),
           nb::arg("stream_ptr"));
 
     m.def("awq_w4a16", &awq_w4a16,

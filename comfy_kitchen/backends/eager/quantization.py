@@ -1168,3 +1168,366 @@ def _op_int8_linear(
 def _op_int8_linear_fake(x, weight, weight_scale, bias, output_dtype_code, convrot=False, convrot_groupsize=256):
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     return torch.empty(*x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device)
+
+
+# =============================================================================
+# INT4 Tensor-wise (int4_tensorwise): per-row signed INT4, packed 2/byte,
+# optional ConvRot. Downward extension of the int8_tensorwise protocol:
+# same per-row fp32 scale shape, same source-dtype DIVISION recipe, same
+# regular-Hadamard rotation — with the int4 emission contract shared with the
+# svdquant kernels: symmetric [-7, 7], scale = absmax / 7 (no -8).
+# Weights are stored PACKED low-nibble-first in an int8 container [N, K/2]
+# (K must be even; ConvRot additionally requires K % group_size == 0).
+# =============================================================================
+
+INT4_QMAX = 7.0
+
+
+def _round_int4(scaled: torch.Tensor, stochastic_rounding: int | None = 0) -> torch.Tensor:
+    if stochastic_rounding is not None and stochastic_rounding > 0:
+        rng = _int8_stochastic_rng(scaled, stochastic_rounding)
+        scaled.add_(rng)
+        return scaled.floor_().clamp_(-INT4_QMAX, INT4_QMAX).to(torch.int8)
+    return scaled.round_().clamp_(-INT4_QMAX, INT4_QMAX).to(torch.int8)
+
+
+def _int4_pack_rowwise(q: torch.Tensor) -> torch.Tensor:
+    """Pack signed int4 codes ([-7, 7] stored as int8) 2-per-byte, LOW nibble first.
+
+    [..., K] int8 -> [..., K/2] int8 container. Matches the svdquant/kitchen int4
+    nibble order (and comfy-quants ``formats/int4_common.py``); the NVFP4 pack is
+    high-nibble-first — do not mix the two.
+    """
+    if q.shape[-1] % 2 != 0:
+        raise ValueError(f"int4 pack requires an even last dim, got {q.shape[-1]}")
+    u = q.to(torch.int8).contiguous().view(torch.uint8)
+    lo = u[..., 0::2] & 0x0F
+    hi = u[..., 1::2] & 0x0F
+    return (lo | (hi << 4)).contiguous().view(torch.int8)
+
+
+def _int4_unpack_rowwise(packed: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`_int4_pack_rowwise`: [..., K/2] int8 -> [..., K] int8 codes."""
+    u = packed.contiguous().view(torch.uint8)
+    lo = (u & 0x0F).to(torch.int16)
+    hi = (u >> 4).to(torch.int16)
+    lo = torch.where(lo >= 8, lo - 16, lo)
+    hi = torch.where(hi >= 8, hi - 16, hi)
+    out = torch.stack((lo, hi), dim=-1)
+    return out.reshape(*packed.shape[:-1], packed.shape[-1] * 2).to(torch.int8)
+
+
+def _quantize_int4_codes_rowwise(
+    x: torch.Tensor,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row signed INT4 quantization returning UNPACKED codes (internal).
+
+    Same recipe shape as :func:`quantize_int8_rowwise`: fp32 scale =
+    absmax / 7 clamped to >= 1e-30, DIVISION with the scale cast to the source
+    dtype (zeros -> dtype tiny), round-half-even (or stochastic), clamp [-7, 7].
+    """
+    abs_max = x.abs().amax(dim=-1, keepdim=True)
+    scale = (abs_max.float() / INT4_QMAX).clamp(min=1e-30)
+    q = _round_int4(x / _int8_scale_for_math(scale, x), stochastic_rounding=stochastic_rounding)
+    return q, scale
+
+
+def quantize_int4_rowwise(
+    x: torch.Tensor,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor to packed per-row INT4 (storage form).
+
+    Args:
+        x: Input tensor [..., K], K even.
+        stochastic_rounding: Seed for stochastic rounding. Disabled when <= 0.
+
+    Returns:
+        Tuple of (packed_int4, scales):
+            - packed_int4: int8 container [..., K/2], 2 codes/byte low-nibble-first
+            - scales: float32 tensor [..., 1] with per-row scales (absmax / 7)
+    """
+    if x.shape[-1] % 2 != 0:
+        raise ValueError(f"int4 quantization requires an even last dim, got {x.shape[-1]}")
+    q, scale = _quantize_int4_codes_rowwise(x, stochastic_rounding=stochastic_rounding)
+    return _int4_pack_rowwise(q), scale
+
+
+def quantize_int4_convrot_weight(
+    weight: torch.Tensor,
+    group_size: int,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Offline ConvRot weight rotation followed by row-wise packed INT4 quantization.
+
+    The Hadamard is built and applied at the SOURCE weight dtype, exactly like
+    :func:`quantize_int8_convrot_weight`.
+    """
+    h = _build_hadamard(group_size, device=weight.device, dtype=weight.dtype)
+    weight_rot = _rotate_weight(weight, h, group_size)
+    return quantize_int4_rowwise(weight_rot, stochastic_rounding=stochastic_rounding)
+
+
+def dequantize_int4_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize packed INT4 tensor with scale to float32."""
+    return _int4_unpack_rowwise(q).float() * scale
+
+
+def dequantize_int4_simple_dtype(q: torch.Tensor, scale: torch.Tensor, output_dtype_code: int) -> torch.Tensor:
+    """Dequantize packed INT4 tensor with scale into a requested floating dtype."""
+    return dequantize_int4_simple(q, scale).to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
+
+
+def dequantize_int4_convrot_weight(q: torch.Tensor, scale: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Dequantize packed INT4 ConvRot weights and rotate them back to the original basis."""
+    h = _build_hadamard(group_size, device=q.device, dtype=torch.float32)
+    return _rotate_weight(dequantize_int4_simple(q, scale), h, group_size)
+
+
+def dequantize_int4_convrot_weight_dtype(
+    q: torch.Tensor, scale: torch.Tensor, group_size: int, output_dtype_code: int
+) -> torch.Tensor:
+    """Dequantize packed INT4 ConvRot weights into a requested floating dtype."""
+    return dequantize_int4_convrot_weight(q, scale, group_size).to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
+
+
+_int4_eager_cuda_warned = False
+
+
+def int4_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """INT4 W4A4 linear layer (eager reference).
+
+    Weights arrive packed [N, K/2] with per-row fp32 scales; activations are
+    rotated online (when ``convrot``) and dynamically quantized per-token to
+    signed INT4 codes with the same absmax/7 recipe. Both operands stay 4-bit
+    valued, so the int8 matmul accumulates them exactly in INT32; because the
+    scales are rank-1 (per-token x per-row), dequantization happens entirely in
+    the epilogue — no per-group rescaling in the K loop.
+
+    Args:
+        x: Input tensor [..., K].
+        weight: Packed INT4 weight, int8 container [N, K/2], low-nibble-first.
+        weight_scale: Per-output-channel scale [N] / [N, 1] (or scalar).
+        bias: Optional bias [N].
+        out_dtype: Output dtype.
+        convrot: If True, apply online activation rotation.
+        convrot_groupsize: Group size for Hadamard rotation.
+
+    Returns:
+        Result tensor [..., N].
+    """
+    global _int4_eager_cuda_warned
+    if x.is_cuda and not _int4_eager_cuda_warned:
+        _int4_eager_cuda_warned = True
+        import logging
+        try:
+            from comfy_kitchen.backends.cuda import _C as _CUDA_EXT
+            _has_kernels = hasattr(_CUDA_EXT, "int4_tensorwise_quantize")
+        except Exception:
+            _has_kernels = False
+        if _has_kernels:
+            reason = (
+                "the compiled kernels are present but this call does not meet the "
+                "fused path's constraints (SM >= 8.0, K % 64 == 0)"
+            )
+        else:
+            reason = (
+                "the compiled comfy_kitchen CUDA extension with the int4 kernels was "
+                "not found — build it from this checkout "
+                "(python setup.py build_ext --inplace) or install a wheel that ships it"
+            )
+        logging.warning(
+            "int4_tensorwise is running on the SLOW eager reference path on a CUDA "
+            "device (roughly 4x slower than the int8 kernels): %s.", reason
+        )
+    w_codes = _int4_unpack_rowwise(weight.to(device=x.device).contiguous())
+    if x.shape[-1] != w_codes.shape[-1]:
+        raise ValueError(
+            f"Input and weight inner dimensions must match, got {x.shape[-1]} and {w_codes.shape[-1]} "
+            f"(packed weight {tuple(weight.shape)})"
+        )
+
+    weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1)
+    if weight_scale.numel() not in (1, w_codes.shape[0]):
+        raise ValueError(
+            f"INT4 weight scale must be scalar or per-output-channel, got {tuple(weight_scale.shape)} "
+            f"for packed weight shape {tuple(weight.shape)}"
+        )
+
+    if convrot:
+        if x.shape[-1] % convrot_groupsize != 0:
+            raise ValueError(
+                f"ConvRot group size {convrot_groupsize} does not divide input features {x.shape[-1]}"
+            )
+        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        x = _rotate_activation(x, h, convrot_groupsize)
+
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1])
+
+    x_codes, x_scale = _quantize_int4_codes_rowwise(x_2d)
+
+    result = _int8_matmul_accumulate(x_codes, w_codes.T.contiguous())
+
+    m, n = result.shape
+    chunk_size = max(1, min(m, 256 * 1024 * 1024 // (n * 4)))
+
+    weight_scale = weight_scale.reshape(1, -1)
+    scaled_parts = []
+    for i in range(0, m, chunk_size):
+        end_i = min(i + chunk_size, m)
+        chunk = result[i:end_i].float()
+        chunk_scales = x_scale[i:end_i].to(device=chunk.device, dtype=torch.float32) * weight_scale
+        chunk_scaled = chunk * chunk_scales
+        chunk_scaled = chunk_scaled.to(out_dtype)
+        scaled_parts.append(chunk_scaled)
+
+    result = torch.cat(scaled_parts, dim=0)
+
+    if bias is not None:
+        result = result + bias.to(device=result.device, dtype=result.dtype).reshape(1, -1)
+
+    return result.reshape(*orig_shape[:-1], w_codes.shape[0])
+
+
+# =============================================================================
+# torch.library Custom Op Definitions — INT4 Tensor-wise
+# =============================================================================
+
+
+@torch.library.custom_op("comfy_kitchen::quantize_int4_rowwise", mutates_args=())
+def _op_quantize_int4_rowwise(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kwargs = {"x": x}
+    impl = registry.get_implementation("quantize_int4_rowwise", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_int4_rowwise.register_fake
+def _op_quantize_int4_rowwise_fake(x):
+    q = torch.empty(*x.shape[:-1], x.shape[-1] // 2, dtype=torch.int8, device=x.device)
+    scale = torch.empty(*x.shape[:-1], 1, dtype=torch.float32, device=x.device)
+    return q, scale
+
+
+@torch.library.custom_op("comfy_kitchen::quantize_int4_convrot_weight", mutates_args=())
+def _op_quantize_int4_convrot_weight(
+    weight: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kwargs = {"weight": weight, "group_size": group_size}
+    impl = registry.get_implementation("quantize_int4_convrot_weight", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_quantize_int4_convrot_weight.register_fake
+def _op_quantize_int4_convrot_weight_fake(weight, group_size):
+    q = torch.empty(*weight.shape[:-1], weight.shape[-1] // 2, dtype=torch.int8, device=weight.device)
+    scale = torch.empty(*weight.shape[:-1], 1, dtype=torch.float32, device=weight.device)
+    return q, scale
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int4_simple", mutates_args=())
+def _op_dequantize_int4_simple(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    kwargs = {"q": q, "scale": scale}
+    impl = registry.get_implementation("dequantize_int4_simple", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_int4_simple.register_fake
+def _op_dequantize_int4_simple_fake(q, scale):
+    return torch.empty(*q.shape[:-1], q.shape[-1] * 2, dtype=torch.float32, device=q.device)
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int4_simple_dtype", mutates_args=())
+def _op_dequantize_int4_simple_dtype(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    kwargs = {"q": q, "scale": scale, "output_dtype_code": output_dtype_code}
+    impl = registry.get_implementation("dequantize_int4_simple_dtype", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_int4_simple_dtype.register_fake
+def _op_dequantize_int4_simple_dtype_fake(q, scale, output_dtype_code):
+    return torch.empty(*q.shape[:-1], q.shape[-1] * 2, dtype=DTYPE_CODE_TO_DTYPE[output_dtype_code], device=q.device)
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int4_convrot_weight", mutates_args=())
+def _op_dequantize_int4_convrot_weight(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    kwargs = {"q": q, "scale": scale, "group_size": group_size}
+    impl = registry.get_implementation("dequantize_int4_convrot_weight", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_int4_convrot_weight.register_fake
+def _op_dequantize_int4_convrot_weight_fake(q, scale, group_size):
+    return torch.empty(*q.shape[:-1], q.shape[-1] * 2, dtype=torch.float32, device=q.device)
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int4_convrot_weight_dtype", mutates_args=())
+def _op_dequantize_int4_convrot_weight_dtype(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    kwargs = {"q": q, "scale": scale, "group_size": group_size, "output_dtype_code": output_dtype_code}
+    impl = registry.get_implementation("dequantize_int4_convrot_weight_dtype", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_int4_convrot_weight_dtype.register_fake
+def _op_dequantize_int4_convrot_weight_dtype_fake(q, scale, group_size, output_dtype_code):
+    return torch.empty(
+        *q.shape[:-1], q.shape[-1] * 2, dtype=DTYPE_CODE_TO_DTYPE[output_dtype_code], device=q.device
+    )
+
+
+@torch.library.custom_op("comfy_kitchen::int4_linear", mutates_args=())
+def _op_int4_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    output_dtype_code: int,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "x": x,
+        "weight": weight,
+        "weight_scale": weight_scale,
+        "bias": bias,
+        "out_dtype": out_dtype,
+        "convrot": convrot,
+        "convrot_groupsize": convrot_groupsize,
+    }
+    impl = registry.get_implementation("int4_linear", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_int4_linear.register_fake
+def _op_int4_linear_fake(x, weight, weight_scale, bias, output_dtype_code, convrot=False, convrot_groupsize=256):
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty(*x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device)
