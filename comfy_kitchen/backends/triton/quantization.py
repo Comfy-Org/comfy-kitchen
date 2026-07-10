@@ -878,6 +878,12 @@ def _int8_autotune_configs():
         triton.Config({'block_m': 64,  'block_n': 128, 'block_k': 64,  'group_size_m': 8}, num_stages=2, num_warps=4),
         triton.Config({'block_m': 128, 'block_n': 64,  'block_k': 64,  'group_size_m': 8}, num_stages=2, num_warps=4),
         triton.Config({'block_m': 64,  'block_n': 64,  'block_k': 64,  'group_size_m': 4}, num_stages=2, num_warps=4),
+        # waves_per_eu variants -- help occupancy on bandwidth-limited RDNA APUs
+        # (gfx1103/gfx1151: up to ~1.15x); dGPUs autotune-select the base configs above. (thanks @LuXuxue)
+        triton.Config({'block_m': 128, 'block_n': 256, 'block_k': 64,  'group_size_m': 8, 'waves_per_eu': 4}, num_stages=2, num_warps=8),
+        triton.Config({'block_m': 128, 'block_n': 128, 'block_k': 64,  'group_size_m': 8, 'waves_per_eu': 1}, num_stages=2, num_warps=4),
+        triton.Config({'block_m': 64,  'block_n': 128, 'block_k': 64,  'group_size_m': 8, 'waves_per_eu': 1}, num_stages=2, num_warps=4),
+        triton.Config({'block_m': 64,  'block_n': 64,  'block_k': 64,  'group_size_m': 4, 'waves_per_eu': 1}, num_stages=2, num_warps=4),
     ]
 
 
