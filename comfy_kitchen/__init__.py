@@ -4,6 +4,7 @@ from .backends import cuda as _cuda_backend  # noqa: F401
 
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
+from .backends import hip as _hip_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
@@ -24,6 +25,10 @@ from .tensor.convrot_w4a4 import (
 )
 
 __version__ = "0.1.0"
+
+# The HIP backend only registers on gfx12; prefer it there.
+if registry.is_available("hip"):
+    registry.set_priority(["hip", "cuda", "triton", "eager"])
 
 __all__ = [
     # Normalization

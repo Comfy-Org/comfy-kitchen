@@ -3,6 +3,12 @@ requires = [
     "setuptools>=61.0",
     "wheel",
     "nanobind>=2.0.0",
+    # setup.py drives both extensions through CMake. 3.21 is the HIP language's
+    # floor: CMAKE_HIP_ARCHITECTURES does not exist before it.
+    "cmake>=3.21",
+    # The HIP extension pins the Ninja generator on every platform: CMake's default
+    # generator on Windows is Visual Studio, which cannot build the HIP language.
+    "ninja",
     "tomli; python_version < '3.11'",
 ]
 build-backend = "setuptools.build_meta"
