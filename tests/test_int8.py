@@ -345,6 +345,12 @@ def test_int8_autotune_pool_creation_does_not_probe_devices(monkeypatch):
 def test_int8_autotune_cache_key_includes_device():
     from comfy_kitchen.backends.triton import quantization
 
+    assert quantization._INT8_AUTOTUNE_KWARGS == {
+        "configs": quantization._INT8_MATMUL_CONFIGS,
+        "key": ["m", "n", "k", "device_index"],
+        "prune_configs_by": quantization._INT8_PRUNE_CONFIGS_BY,
+    }
+
     assert "device_index" in quantization._int8_matmul_dequant_kernel.keys
     assert "device_index" in quantization._int8_matmul_dequant_per_row_kernel.keys
 

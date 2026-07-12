@@ -906,11 +906,13 @@ def _prune_int8_autotune_configs(configs, named_args, **kwargs):
 
 _INT8_PRUNE_CONFIGS_BY = {'early_config_prune': _prune_int8_autotune_configs}
 
-@triton.autotune(
-    configs=_INT8_MATMUL_CONFIGS,
-    key=['m', 'n', 'k', 'device_index'],
-    prune_configs_by=_INT8_PRUNE_CONFIGS_BY,
-)
+_INT8_AUTOTUNE_KWARGS = {
+    'configs': _INT8_MATMUL_CONFIGS,
+    'key': ['m', 'n', 'k', 'device_index'],
+    'prune_configs_by': _INT8_PRUNE_CONFIGS_BY,
+}
+
+@triton.autotune(**_INT8_AUTOTUNE_KWARGS)
 @triton.jit
 def _int8_matmul_dequant_kernel(
     # Pointers
@@ -982,11 +984,7 @@ def _int8_matmul_dequant_kernel(
     c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
     tl.store(c_ptrs, c, mask=c_mask)
 
-@triton.autotune(
-    configs=_INT8_MATMUL_CONFIGS,
-    key=['m', 'n', 'k', 'device_index'],
-    prune_configs_by=_INT8_PRUNE_CONFIGS_BY,
-)
+@triton.autotune(**_INT8_AUTOTUNE_KWARGS)
 @triton.jit
 def _int8_matmul_dequant_per_row_kernel(
     # Pointers
