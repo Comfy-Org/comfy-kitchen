@@ -857,11 +857,8 @@ def triton_quantize_and_rotate_rowwise(x: torch.Tensor, h: torch.Tensor, group_s
 
 
 def _int8_autotune_configs():
-    """INT8 matmul autotune configs. AMD RDNA (gfx11/gfx12) prefers shallow software
-    pipelining (num_stages=2) and deeper block_k; the NVIDIA defaults use num_stages=3-4.
-    The RDNA pool spans small tiles (RDNA3) and large tiles (RDNA4) so autotune can pick
-    per shape/arch. Empirically 1.03-1.11x faster than the NVIDIA configs on gfx1100/1201."""
-    nvidia = [
+    """Return the default and RDNA-tuned INT8 matmul config pools."""
+    default_configs = [
         triton.Config({'block_m': 128, 'block_n': 256, 'block_k': 64, 'group_size_m': 8}, num_stages=3, num_warps=8),
         triton.Config({'block_m': 64,  'block_n': 256, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
         triton.Config({'block_m': 128, 'block_n': 128, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
@@ -869,30 +866,50 @@ def _int8_autotune_configs():
         triton.Config({'block_m': 64,  'block_n': 128, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
         triton.Config({'block_m': 128, 'block_n': 32,  'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
     ]
-    if getattr(torch.version, 'hip', None) is None:
-        return nvidia
-    return [
+    rdna_configs = [
         triton.Config({'block_m': 128, 'block_n': 256, 'block_k': 64,  'group_size_m': 8}, num_stages=2, num_warps=8),
         triton.Config({'block_m': 128, 'block_n': 128, 'block_k': 128, 'group_size_m': 8}, num_stages=2, num_warps=8),
         triton.Config({'block_m': 128, 'block_n': 128, 'block_k': 64,  'group_size_m': 8}, num_stages=2, num_warps=4),
         triton.Config({'block_m': 64,  'block_n': 128, 'block_k': 64,  'group_size_m': 8}, num_stages=2, num_warps=4),
         triton.Config({'block_m': 128, 'block_n': 64,  'block_k': 64,  'group_size_m': 8}, num_stages=2, num_warps=4),
         triton.Config({'block_m': 64,  'block_n': 64,  'block_k': 64,  'group_size_m': 4}, num_stages=2, num_warps=4),
-        # waves_per_eu variants -- help occupancy on bandwidth-limited RDNA APUs
-        # (gfx1103/gfx1151: up to ~1.15x); dGPUs autotune-select the base configs above. (thanks @LuXuxue)
         triton.Config({'block_m': 128, 'block_n': 256, 'block_k': 64,  'group_size_m': 8, 'waves_per_eu': 4}, num_stages=2, num_warps=8),
         triton.Config({'block_m': 128, 'block_n': 128, 'block_k': 64,  'group_size_m': 8, 'waves_per_eu': 1}, num_stages=2, num_warps=4),
         triton.Config({'block_m': 64,  'block_n': 128, 'block_k': 64,  'group_size_m': 8, 'waves_per_eu': 1}, num_stages=2, num_warps=4),
         triton.Config({'block_m': 64,  'block_n': 64,  'block_k': 64,  'group_size_m': 4, 'waves_per_eu': 1}, num_stages=2, num_warps=4),
     ]
+    return default_configs, rdna_configs
 
 
-_INT8_MATMUL_CONFIGS = _int8_autotune_configs()
+_INT8_DEFAULT_CONFIGS, _INT8_RDNA_CONFIGS = _int8_autotune_configs()
+_INT8_MATMUL_CONFIGS = _INT8_DEFAULT_CONFIGS + _INT8_RDNA_CONFIGS
 
+
+def _prune_int8_autotune_configs(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    if getattr(torch.version, 'hip', None) is None:
+        return _INT8_DEFAULT_CONFIGS
+
+    try:
+        arch = torch.cuda.get_device_properties(args['device_index']).gcnArchName.split(":")[0]
+    except Exception:
+        return _INT8_DEFAULT_CONFIGS
+    if not arch.startswith(("gfx11", "gfx12")):
+        return _INT8_DEFAULT_CONFIGS
+
+    rdna_configs = _INT8_RDNA_CONFIGS
+    # BK128 was consistently slower for small-M calls on gfx1151.
+    if args['m'] <= 128:
+        rdna_configs = [config for config in rdna_configs if config.kwargs['block_k'] <= 64]
+    return rdna_configs
+
+
+_INT8_PRUNE_CONFIGS_BY = {'early_config_prune': _prune_int8_autotune_configs}
 
 @triton.autotune(
     configs=_INT8_MATMUL_CONFIGS,
-    key=['m', 'n', 'k'],
+    key=['m', 'n', 'k', 'device_index'],
+    prune_configs_by=_INT8_PRUNE_CONFIGS_BY,
 )
 @triton.jit
 def _int8_matmul_dequant_kernel(
@@ -900,7 +917,7 @@ def _int8_matmul_dequant_kernel(
     a_ptr, b_ptr, c_ptr,
     a_scale_ptr, b_scale_ptr, bias_ptr,
     # Matrix Dimensions
-    m, n, k,
+    m, n, k, device_index: tl.constexpr,
     # Strides
     stride_am, stride_ak,
     stride_bk, stride_bn,
@@ -967,7 +984,8 @@ def _int8_matmul_dequant_kernel(
 
 @triton.autotune(
     configs=_INT8_MATMUL_CONFIGS,
-    key=['m', 'n', 'k'],
+    key=['m', 'n', 'k', 'device_index'],
+    prune_configs_by=_INT8_PRUNE_CONFIGS_BY,
 )
 @triton.jit
 def _int8_matmul_dequant_per_row_kernel(
@@ -975,7 +993,7 @@ def _int8_matmul_dequant_per_row_kernel(
     a_ptr, b_ptr, c_ptr,
     a_scale_ptr, b_scale_ptr, bias_ptr,
     # Matrix Dimensions
-    m, n, k,
+    m, n, k, device_index: tl.constexpr,
     # Strides
     stride_am, stride_ak,
     stride_bk, stride_bn,
@@ -1065,6 +1083,7 @@ def int8_linear(
 
     m, k = x_2d.shape
     n = weight.shape[0]
+    device_index = x.device.index if x.device.index is not None else 0
 
     # Quantize input per-row using fused or normal quantization kernel
     if convrot:
@@ -1099,7 +1118,7 @@ def int8_linear(
             a_scale_ptr=x_scale,
             b_scale_ptr=weight_scale,
             bias_ptr=bias_ptr,
-            m=m, n=n, k=k,
+            m=m, n=n, k=k, device_index=device_index,
             stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
             stride_bk=weight.stride(1), stride_bn=weight.stride(0),
             stride_cm=output.stride(0), stride_cn=output.stride(1),
@@ -1113,7 +1132,7 @@ def int8_linear(
             a_scale_ptr=x_scale,
             b_scale_ptr=weight_scale,
             bias_ptr=bias_ptr,
-            m=m, n=n, k=k,
+            m=m, n=n, k=k, device_index=device_index,
             stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
             stride_bk=weight.stride(1), stride_bn=weight.stride(0),
             stride_cm=output.stride(0), stride_cn=output.stride(1),
