@@ -23,7 +23,12 @@ from .tensor.convrot_w4a4 import (
     quantize_convrot_w4a4_weight,
 )
 
-__version__ = "0.1.0"
+try:
+    from importlib.metadata import version, PackageNotFoundError
+
+    __version__ = version("comfy-kitchen")
+except PackageNotFoundError:
+    __version__ = "0.0.0"  # Fallback for editable/dev installs
 
 __all__ = [
     # Normalization
