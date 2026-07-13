@@ -205,6 +205,16 @@ def _cuda_device_supports_native_int4_mma(tensor: torch.Tensor) -> bool:
     return major == 8
 
 
+def _should_use_turing_int4(tensor: torch.Tensor) -> bool:
+    return (
+        tensor.is_cuda
+        and not _FORCE_INT4_INT8_FALLBACK
+        and tensor.shape[0] > _INT4_PACKED_WEIGHT_SMALL_M_MAX
+        and _cuda_device_is_turing(tensor.get_device())
+        and hasattr(_C, "cutlass_turing_int4_dequant")
+    )
+
+
 def _cublas_int8_n_alignment(tensor: torch.Tensor) -> int:
     # Turing cuBLASLt INT8 rejects some skinny-N shapes, e.g. N=17.
     return 32 if tensor.is_cuda and _cuda_device_is_turing(tensor.get_device()) else 8
@@ -968,11 +978,7 @@ def int4_linear(
     if bias is not None and (bias.device != x_qdata.device or not bias.is_contiguous()):
         bias_arg = bias.to(device=x_qdata.device).contiguous()
     stream_ptr = torch.cuda.current_stream(x_qdata.device).cuda_stream
-    if (
-        _cuda_device_is_turing(x_qdata.get_device())
-        and m > _INT4_PACKED_WEIGHT_SMALL_M_MAX
-        and hasattr(_C, "cutlass_turing_int4_dequant")
-    ):
+    if _should_use_turing_int4(x_qdata):
         turing_output = _int4_linear_turing(
             x_qdata.contiguous(),
             weight.contiguous(),
@@ -1118,7 +1124,9 @@ def convrot_w4a4_linear(
 
     orig_shape = x.shape
     x2d = x.reshape(-1, orig_shape[-1]).contiguous()
-    if linear_dtype == "int8" or not _cuda_device_supports_native_int4_mma(x2d):
+    if linear_dtype == "int8" or not (
+        _cuda_device_supports_native_int4_mma(x2d) or _should_use_turing_int4(x2d)
+    ):
         if (
             convrot_groupsize == 256
             and x2d.shape[-1] % 256 == 0

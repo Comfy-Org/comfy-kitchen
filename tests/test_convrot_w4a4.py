@@ -241,6 +241,34 @@ def test_int4_linear_routes_turing_to_native_kernel(seed, monkeypatch):
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.parametrize("m, expected_calls", [(8, 0), (128, 1)])
+def test_convrot_w4a4_routes_turing_to_native_kernel(seed, monkeypatch, m, expected_calls):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if torch.cuda.get_device_capability() < (7, 5):
+        pytest.skip("INT4 tensor cores require SM75 or newer")
+    if not hasattr(cuda_backend._C, "cutlass_turing_int4_dequant"):
+        pytest.skip("CUDA extension was built without the Turing INT4 kernel")
+
+    n, k = 128, 256
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    qweight, weight_scale = cuda_backend.quantize_convrot_w4a4_weight(weight)
+    original = cuda_backend._int4_linear_turing
+    calls = []
+
+    def record_call(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cuda_backend, "_cuda_device_is_turing", lambda _device_index: True)
+    monkeypatch.setattr(cuda_backend, "_int4_linear_turing", record_call)
+    output = cuda_backend.convrot_w4a4_linear(x, qweight, weight_scale)
+
+    assert output.shape == (m, n)
+    assert len(calls) == expected_calls
+
+
 def test_convrot_cuda_shared_memory_fit_matches_device_limit():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")

@@ -115,7 +115,7 @@ def convrot_w4a4_linear(
 class TensorCoreConvRotW4A4Layout(QuantizedLayout):
     """ConvRot W4A4 weight layout using kitchen's int4 tensor-core GEMM."""
 
-    MIN_SM_VERSION = (8, 0)
+    MIN_SM_VERSION = (7, 5)
     QUANTIZES_INPUT = False
 
     @dataclass(frozen=True)
