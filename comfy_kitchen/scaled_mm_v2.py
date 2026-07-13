@@ -24,6 +24,79 @@ else:
 def has_scaled_mm_v2() -> bool:
     return _HAS_SCALED_MM_V2
 
+
+_FP8_E4M3 = torch.float8_e4m3fn
+
+
+def _hip_fp8_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype | None,
+    scale_recipe_a,
+    scale_recipe_b,
+    swizzle_a,
+    swizzle_b,
+):
+    """Route an fp8 matmul to the WMMA kernel.
+
+    Returns None when the HIP backend cannot take the call or it is outside the
+    kernel's domain (non-e4m3 operands, non-tensor-wise scaling, swizzled
+    operands, K not a multiple of 16, unsupported output dtype), in which case
+    the caller falls back to torch.
+    """
+    from .backends import hip
+    from .registry import registry
+
+    if not registry.is_available("hip"):
+        return None
+    # This path skips the registry, so its per-architecture capability filter does
+    # not cover it. RDNA2 registers for the elementwise kernels but has no matrix
+    # cores and its GEMM traps, so test for WMMA rather than availability.
+    if not hip.has_wmma():
+        return None
+    # Availability is process-wide, but the kernel launches on one device and takes
+    # raw pointers: every operand has to live on the input's own GPU.
+    if input.device.type != "cuda":
+        return None
+    others = [weight, scale_a, scale_b] + ([] if bias is None else [bias])
+    if any(not torch.is_tensor(t) or t.device != input.device for t in others):
+        return None
+    # The kernel reads both operands row-major.
+    if any(s not in (None, SwizzleType.NO_SWIZZLE) for s in (swizzle_a, swizzle_b)):
+        return None
+    if input.dtype is not _FP8_E4M3 or weight.dtype is not _FP8_E4M3:
+        return None
+    if input.dim() != 2 or weight.dim() != 2:
+        return None
+    if scale_recipe_a != ScalingType.TensorWise or scale_recipe_b != ScalingType.TensorWise:
+        return None
+    if isinstance(scale_a, list) or isinstance(scale_b, list):
+        return None
+    if scale_a.numel() != 1 or scale_b.numel() != 1:
+        return None
+    # The WMMA K-step reads 16 bytes of a row at a time.
+    if input.shape[1] % 16 != 0:
+        return None
+    # out_dtype=None means "the input dtype" to torch, which for an fp8 matmul is
+    # fp8 itself. This epilogue only writes bf16/f16/f32, so substituting a default
+    # here would make the result dtype depend on whether the HIP backend took the
+    # call. Decline instead and let torch keep its own semantics.
+    if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return None
+    # The epilogue indexes bias[col] with a single dtype code.
+    if bias is not None and (
+        bias.dim() != 1
+        or bias.numel() != weight.shape[1]
+        or bias.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+    ):
+        return None
+
+    return hip.scaled_mm_fp8(input, weight, scale_a, scale_b, bias, out_dtype)
+
+
 def scaled_mm_v2(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -36,6 +109,13 @@ def scaled_mm_v2(
     swizzle_a: Optional['SwizzleType'] = SwizzleType.NO_SWIZZLE,
     swizzle_b: Optional['SwizzleType'] = SwizzleType.NO_SWIZZLE,
 ) -> torch.Tensor:
+
+    out = _hip_fp8_gemm(
+        input, weight, scale_a, scale_b, bias, out_dtype, scale_recipe_a, scale_recipe_b,
+        swizzle_a, swizzle_b,
+    )
+    if out is not None:
+        return out
 
     if has_scaled_mm_v2():
         return torch.nn.functional.scaled_mm(
