@@ -83,6 +83,83 @@ def test_cuda_int8_linear_does_not_retain_scratch_tensors():
     assert not hasattr(cuda, "_int8_gemm_int32_scratch_tensor")
 
 
+def test_turing_fused_int8_shape_selection():
+    assert cuda._prefer_turing_fused_int8(128, 4096, 4096)
+    assert cuda._prefer_turing_fused_int8(512, 2048, 1024)
+    assert cuda._prefer_turing_fused_int8(1024, 4096, 2048)
+    assert not cuda._prefer_turing_fused_int8(512, 4096, 4096)
+    assert not cuda._prefer_turing_fused_int8(1024, 2048, 4096)
+
+
+@pytest.mark.parametrize("m", [64, 128, 512, 1024])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("scalar_weight_scale", [False, True])
+def test_turing_int8_fused_gemm_matches_reference(
+    seed,
+    m,
+    dtype,
+    with_bias,
+    scalar_weight_scale,
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if not hasattr(cuda._C, "cutlass_turing_int8_dequant"):
+        pytest.skip("CUDA extension was built without the Turing INT8 kernel")
+
+    n, k = 128, 256
+    activation = torch.randint(-127, 128, (m, k), device="cuda", dtype=torch.int8)
+    weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    activation_scale = torch.rand(m, device="cuda", dtype=torch.float32)
+    weight_scale_shape = () if scalar_weight_scale else (n,)
+    weight_scale = torch.rand(weight_scale_shape, device="cuda", dtype=torch.float32)
+    bias = torch.randn(n, device="cuda", dtype=dtype) if with_bias else None
+
+    actual = cuda._int8_linear_turing_quantized(
+        activation,
+        weight,
+        activation_scale,
+        weight_scale,
+        bias,
+        dtype,
+    )
+    accumulator = activation.cpu().to(torch.int32) @ weight.cpu().to(torch.int32).T
+    expected = accumulator.to(device="cuda", dtype=torch.float32)
+    expected *= activation_scale.reshape(-1, 1)
+    expected *= weight_scale.reshape(1, -1)
+    if bias is not None:
+        expected += bias.float()
+    expected = expected.to(dtype)
+
+    assert actual is not None
+    tolerance = 2 * torch.finfo(dtype).eps
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+
+def test_int8_linear_routes_turing_to_fused_kernel(seed, monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if not hasattr(cuda._C, "cutlass_turing_int8_dequant"):
+        pytest.skip("CUDA extension was built without the Turing INT8 kernel")
+
+    x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randint(-127, 128, (128, 256), device="cuda", dtype=torch.int8)
+    weight_scale = torch.rand(128, device="cuda", dtype=torch.float32)
+    original = cuda._int8_linear_turing_quantized
+    calls = []
+
+    def record_call(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cuda, "_cuda_device_is_turing", lambda _device_index: True)
+    monkeypatch.setattr(cuda, "_int8_linear_turing_quantized", record_call)
+    output = cuda.int8_linear(x, weight, weight_scale, out_dtype=torch.bfloat16)
+
+    assert output.shape == (128, 128)
+    assert calls == [True]
+
+
 # =============================================================================
 # INT8 Quantization Tests
 # =============================================================================

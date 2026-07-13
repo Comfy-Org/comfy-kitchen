@@ -177,6 +177,11 @@ def _cuda_device_is_turing(device_index: int) -> bool:
     return is_turing
 
 
+def _prefer_turing_fused_int8(m: int, n: int, k: int) -> bool:
+    """Use fused SM75 kernels for latency shapes and feed-forward expansions."""
+    return m <= 128 or n >= 2 * k
+
+
 def _cuda_device_supports_cutlass_int8_dequant(tensor: torch.Tensor) -> bool:
     if not tensor.is_cuda:
         return False
@@ -732,6 +737,7 @@ def _int4_weight_int8_act_gemm_dequant_chunked(
         _wrap_for_dlpack(acc_workspace),
         _wrap_for_dlpack(get_cublas_workspace()),
         chunk_cols,
+        not _cuda_device_is_turing(x_int8.get_device()),
         DTYPE_TO_CODE[out_dtype],
         stream_ptr,
     )
@@ -777,6 +783,22 @@ def _int4_linear_via_int8_values(
             stream_ptr,
         )
         return output
+
+    if (
+        _prefer_turing_fused_int8(m, n, k)
+        and _cuda_device_is_turing(x_int8.get_device())
+        and hasattr(_C, "cutlass_turing_int8_dequant")
+    ):
+        turing_output = _int8_linear_turing_quantized(
+            x_int8,
+            weight_int8,
+            x_scale_arg,
+            weight_scale_arg,
+            bias_arg if bias is not None else None,
+            out_dtype,
+        )
+        if turing_output is not None:
+            return turing_output
 
     used_cutlass = False
     prefer_cublas_fallback = _prefer_cublas_int8_fallback(m, n, k)
@@ -832,6 +854,39 @@ def _int4_linear_via_int8_values(
     return output
 
 
+def _int8_linear_turing_quantized(
+    x_qdata: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """Run row-wise INT8 GEMM with Turing tensor cores and a fused scale epilogue."""
+    m = x_qdata.shape[0]
+    n = weight.shape[0]
+    output = torch.empty((m, n), dtype=out_dtype, device=x_qdata.device)
+    weight_scale_arg = weight_scale.reshape(-1)
+    bias_arg = (
+        bias.to(device=x_qdata.device, dtype=out_dtype).contiguous()
+        if bias is not None
+        else _empty_cuda_tensor(x_qdata.device, out_dtype)
+    )
+    used_int8 = _C.cutlass_turing_int8_dequant(
+        _wrap_for_dlpack(x_qdata),
+        _wrap_for_dlpack(weight),
+        _wrap_for_dlpack(x_scale.reshape(-1)),
+        _wrap_for_dlpack(weight_scale_arg),
+        _wrap_for_dlpack(bias_arg),
+        _wrap_for_dlpack(output),
+        DTYPE_TO_CODE[out_dtype],
+        torch.cuda.current_stream(x_qdata.device).cuda_stream,
+    )
+    if not used_int8:
+        return None
+    return output
+
+
 def _int4_linear_via_int8(
     x_qdata: torch.Tensor,
     weight: torch.Tensor,
@@ -852,6 +907,39 @@ def _int4_linear_via_int8(
     elif weight_int8.shape != (n, k) or weight_int8.dtype != torch.int8 or weight_int8.device != weight.device:
         raise ValueError("prepared INT8 fallback weight has incompatible shape, dtype, or device")
     return _int4_linear_via_int8_values(x_int8, weight_int8, x_scale, weight_scale, bias, out_dtype)
+
+
+def _int4_linear_turing(
+    x_qdata: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """Run packed W4A4 with Turing's native m8n8k32 INT4 tensor cores."""
+    m = x_qdata.shape[0]
+    n = weight.shape[0]
+    output = torch.empty((m, n), dtype=out_dtype, device=x_qdata.device)
+    stream_ptr = torch.cuda.current_stream(x_qdata.device).cuda_stream
+    bias_arg = (
+        bias.to(device=x_qdata.device, dtype=torch.float32).contiguous()
+        if bias is not None
+        else _empty_cuda_tensor(x_qdata.device, torch.float32)
+    )
+    used_int4 = _C.cutlass_turing_int4_dequant(
+        _wrap_for_dlpack(x_qdata),
+        _wrap_for_dlpack(weight),
+        _wrap_for_dlpack(x_scale),
+        _wrap_for_dlpack(weight_scale),
+        _wrap_for_dlpack(bias_arg),
+        _wrap_for_dlpack(output),
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    )
+    if not used_int4:
+        return None
+    return output
 
 
 def int4_linear(
@@ -880,6 +968,21 @@ def int4_linear(
     if bias is not None and (bias.device != x_qdata.device or not bias.is_contiguous()):
         bias_arg = bias.to(device=x_qdata.device).contiguous()
     stream_ptr = torch.cuda.current_stream(x_qdata.device).cuda_stream
+    if (
+        _cuda_device_is_turing(x_qdata.get_device())
+        and m > _INT4_PACKED_WEIGHT_SMALL_M_MAX
+        and hasattr(_C, "cutlass_turing_int4_dequant")
+    ):
+        turing_output = _int4_linear_turing(
+            x_qdata.contiguous(),
+            weight.contiguous(),
+            x_scale_arg,
+            weight_scale_arg,
+            bias_arg if bias is not None else None,
+            out_dtype,
+        )
+        if turing_output is not None:
+            return turing_output
     if not _cuda_device_supports_native_int4_mma(x_qdata):
         return _int4_linear_via_int8(
             x_qdata.contiguous(),
@@ -1626,6 +1729,22 @@ def int8_linear(
     bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
     if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
         bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
+
+    if (
+        _prefer_turing_fused_int8(m, n, k)
+        and _cuda_device_is_turing(x_qdata.get_device())
+        and hasattr(_C, "cutlass_turing_int8_dequant")
+    ):
+        turing_out = _int8_linear_turing_quantized(
+            x_qdata,
+            weight,
+            x_scale,
+            weight_scale,
+            bias_arg if bias is not None else None,
+            out_dtype,
+        )
+        if turing_out is not None:
+            return turing_out if is_2d_output else turing_out.reshape(*orig_shape[:-1], n)
 
     used_cutlass = False
     prefer_cublas_fallback = _prefer_cublas_int8_fallback(m, n, k)

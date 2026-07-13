@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <climits>
 #include <cstdint>
 
 #ifdef COMFY_HAVE_CUTLASS
@@ -30,8 +31,34 @@
 namespace {
 using namespace cute;
 
+template <typename ThreadMap, bool Scalar>
+struct WeightScaleBroadcast;
+
+template <typename ThreadMap>
+struct WeightScaleBroadcast<ThreadMap, false> {
+    using Type = cutlass::epilogue::threadblock::VisitorRowBroadcast<
+        ThreadMap, float, cute::Stride<_0, _1, int32_t>>;
+
+    static typename Type::Arguments arguments(const float* scale, int n) {
+        return {scale, 0.f, {_0{}, _1{}, n}};
+    }
+};
+
+template <typename ThreadMap>
+struct WeightScaleBroadcast<ThreadMap, true> {
+    using Type = cutlass::epilogue::threadblock::VisitorScalarBroadcast<float>;
+
+    static typename Type::Arguments arguments(const float* scale, int) {
+        typename Type::Arguments result{};
+        result.scalar_ptrs[0] = scale;
+        return result;
+    }
+};
+
 // One fused int8 GEMM, parameterized on output type AND tile/warp/stage config.
-template <typename ElementOutput, int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages>
+template <typename ElementOutput, int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages,
+          typename ArchTag = cutlass::arch::Sm80, typename ElementBias = float,
+          bool ScalarWeightScale = false>
 struct FusedInt8Gemm {
     using ElementA = int8_t; using ElementB = int8_t;
     using ElementC = ElementOutput;
@@ -49,8 +76,8 @@ struct FusedInt8Gemm {
     using ThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<TB, Warp, ElementC, AlignC, EVTStages>;
     using Accum  = cutlass::epilogue::threadblock::VisitorAccFetch;
     using XScale = cutlass::epilogue::threadblock::VisitorColBroadcast<ThreadMap, ElementCompute, cute::Stride<_1, _0, int32_t>>;
-    using WScale = cutlass::epilogue::threadblock::VisitorRowBroadcast<ThreadMap, ElementCompute, cute::Stride<_0, _1, int32_t>>;
-    using Bias   = cutlass::epilogue::threadblock::VisitorRowBroadcast<ThreadMap, ElementCompute, cute::Stride<_0, _1, int32_t>>;
+    using WScale = typename WeightScaleBroadcast<ThreadMap, ScalarWeightScale>::Type;
+    using Bias   = cutlass::epilogue::threadblock::VisitorRowBroadcast<ThreadMap, ElementBias, cute::Stride<_0, _1, int32_t>>;
     using Mul0 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementCompute, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
     using EVT0 = cutlass::epilogue::threadblock::Sm80EVT<Mul0, Accum, XScale>;
     using Mul1 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementCompute, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
@@ -65,25 +92,26 @@ struct FusedInt8Gemm {
         ElementB, LayoutB, cutlass::ComplexTransform::kNone, AlignB,
         ElementC, LayoutC, AlignC,
         ElementAcc, ElementCompute,
-        cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+        cutlass::arch::OpClassTensorOp, ArchTag,
         TB, Warp, Inst, EVTD,
         cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
         NumStages, cutlass::arch::OpMultiplyAddSaturate, EVTStages>::GemmKernel;
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
     static bool run(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
-                    const float* bias, ElementOutput* D, int M, int N, int K, cudaStream_t stream) {
+                    const ElementBias* bias, ElementOutput* D, int M, int N, int K, cudaStream_t stream) {
         return run_strided(A, B, xs, ws, bias, D, M, N, K, N, stream);
     }
 
     static bool run_strided(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
-                            const float* bias, ElementOutput* D, int M, int N, int K,
+                            const ElementBias* bias, ElementOutput* D, int M, int N, int K,
                             int output_stride, cudaStream_t stream) {
         cutlass::gemm::GemmCoord problem(M, N, K);
+        const auto weight_scale_args = WeightScaleBroadcast<ThreadMap, ScalarWeightScale>::arguments(ws, N);
         typename EVTD::Arguments cb{
             { {  { {}, {const_cast<float*>(xs), 0.f, {_1{}, _0{}, M}}, {} },
-                 {const_cast<float*>(ws), 0.f, {_0{}, _1{}, N}}, {} },
-              {const_cast<float*>(bias), 0.f, {_0{}, _1{}, N}}, {} },
+                 weight_scale_args, {} },
+              {const_cast<ElementBias*>(bias), ElementBias(0), {_0{}, _1{}, N}}, {} },
             {D, {output_stride, _1{}, M * output_stride}} };
         typename Gemm::Arguments args(
             cutlass::gemm::GemmUniversalMode::kGemm, problem, 1, cb,
@@ -98,7 +126,8 @@ struct FusedInt8Gemm {
     }
 };
 
-template <typename ElementOutput, int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages>
+template <typename ElementOutput, int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages,
+          typename ArchTag = cutlass::arch::Sm80, bool ScalarWeightScale = false>
 struct FusedInt8GemmNoBias {
     using ElementA = int8_t; using ElementB = int8_t;
     using ElementC = ElementOutput;
@@ -116,7 +145,7 @@ struct FusedInt8GemmNoBias {
     using ThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<TB, Warp, ElementC, AlignC, EVTStages>;
     using Accum  = cutlass::epilogue::threadblock::VisitorAccFetch;
     using XScale = cutlass::epilogue::threadblock::VisitorColBroadcast<ThreadMap, ElementCompute, cute::Stride<_1, _0, int32_t>>;
-    using WScale = cutlass::epilogue::threadblock::VisitorRowBroadcast<ThreadMap, ElementCompute, cute::Stride<_0, _1, int32_t>>;
+    using WScale = typename WeightScaleBroadcast<ThreadMap, ScalarWeightScale>::Type;
     using Mul0 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementCompute, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
     using EVT0 = cutlass::epilogue::threadblock::Sm80EVT<Mul0, Accum, XScale>;
     using Mul1 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementOutput, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
@@ -129,7 +158,7 @@ struct FusedInt8GemmNoBias {
         ElementB, LayoutB, cutlass::ComplexTransform::kNone, AlignB,
         ElementC, LayoutC, AlignC,
         ElementAcc, ElementCompute,
-        cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+        cutlass::arch::OpClassTensorOp, ArchTag,
         TB, Warp, Inst, EVTD,
         cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
         NumStages, cutlass::arch::OpMultiplyAddSaturate, EVTStages>::GemmKernel;
@@ -144,9 +173,10 @@ struct FusedInt8GemmNoBias {
                             ElementOutput* D, int M, int N, int K, int output_stride,
                             cudaStream_t stream) {
         cutlass::gemm::GemmCoord problem(M, N, K);
+        const auto weight_scale_args = WeightScaleBroadcast<ThreadMap, ScalarWeightScale>::arguments(ws, N);
         typename EVTD::Arguments cb{
             { { {}, {const_cast<float*>(xs), 0.f, {_1{}, _0{}, M}}, {} },
-              {const_cast<float*>(ws), 0.f, {_0{}, _1{}, N}}, {} },
+              weight_scale_args, {} },
             {D, {output_stride, _1{}, M * output_stride}} };
         typename Gemm::Arguments args(
             cutlass::gemm::GemmUniversalMode::kGemm, problem, 1, cb,
@@ -362,7 +392,6 @@ bool dispatch_fused_no_bias_strided(const int8_t* A, const int8_t* B, const floa
 }  // namespace
 
 extern "C" {
-// out_dtype_code: 0=float32, 1=float16, 2=bfloat16 (DTYPE_TO_CODE).
 bool launch_cutlass_int8_dequant(
     const void* A, const void* B, const void* xs, const void* ws, const void* bias,
     void* D, int64_t M, int64_t N, int64_t K, int out_dtype_code, cudaStream_t stream)

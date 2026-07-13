@@ -156,6 +156,91 @@ def test_convrot_w4a4_cuda_no_bias_large_m(seed):
     assert out.dtype == torch.bfloat16
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("m", [64, 128, 256, 512])
+def test_turing_int4_tensor_core_gemm_matches_int8_fallback(seed, dtype, with_bias, m):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if torch.cuda.get_device_capability()[0] < 7:
+        pytest.skip("INT4 tensor cores require SM75 or newer")
+    if not hasattr(cuda_backend._C, "cutlass_turing_int4_dequant"):
+        pytest.skip("CUDA extension was built without the Turing INT4 kernel")
+
+    n, k = 128, 256
+    x = torch.randn(m, k, device="cuda", dtype=dtype)
+    weight = torch.randn(n, k, device="cuda", dtype=dtype)
+    bias = torch.randn(n, device="cuda", dtype=dtype) if with_bias else None
+    x_qdata, x_scale = cuda_backend.quantize_int4_rowwise(x)
+    weight_qdata, weight_scale = cuda_backend.quantize_int4_rowwise(weight)
+
+    actual = cuda_backend._int4_linear_turing(
+        x_qdata,
+        weight_qdata,
+        x_scale.reshape(-1),
+        weight_scale.reshape(-1),
+        bias,
+        dtype,
+    )
+    expected = cuda_backend._int4_linear_via_int8(
+        x_qdata,
+        weight_qdata,
+        x_scale.reshape(-1),
+        weight_scale.reshape(-1),
+        bias,
+        dtype,
+    )
+
+    assert actual is not None
+    tolerance = 2 * torch.finfo(dtype).eps
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+    if torch.cuda.get_device_capability()[0] >= 8:
+        sm80_output = cuda_backend.int4_linear(
+            x_qdata,
+            weight_qdata,
+            x_scale.reshape(-1),
+            weight_scale.reshape(-1),
+            bias,
+            dtype,
+        )
+        torch.testing.assert_close(actual, sm80_output, rtol=tolerance, atol=tolerance)
+
+
+def test_int4_linear_routes_turing_to_native_kernel(seed, monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if not hasattr(cuda_backend._C, "cutlass_turing_int4_dequant"):
+        pytest.skip("CUDA extension was built without the Turing INT4 kernel")
+
+    m, n, k = 128, 128, 256
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    x_qdata, x_scale = cuda_backend.quantize_int4_rowwise(x)
+    weight_qdata, weight_scale = cuda_backend.quantize_int4_rowwise(weight)
+    expected = cuda_backend._int4_linear_turing(
+        x_qdata,
+        weight_qdata,
+        x_scale.reshape(-1),
+        weight_scale.reshape(-1),
+        None,
+        torch.bfloat16,
+    )
+
+    monkeypatch.setattr(cuda_backend, "_cuda_device_is_turing", lambda _device_index: True)
+    actual = cuda_backend.int4_linear(
+        x_qdata,
+        weight_qdata,
+        x_scale,
+        weight_scale,
+        None,
+        torch.bfloat16,
+    )
+
+    assert expected is not None
+    assert torch.equal(actual, expected)
+
+
 def test_convrot_cuda_shared_memory_fit_matches_device_limit():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")

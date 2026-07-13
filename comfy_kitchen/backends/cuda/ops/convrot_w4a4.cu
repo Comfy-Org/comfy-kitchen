@@ -14,7 +14,6 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
 
 #ifdef COMFY_HAVE_CUTLASS
 #include "cutlass/cutlass.h"
@@ -114,7 +113,8 @@ __device__ __forceinline__ int unpack_int4_nibble(uint32_t v) {
 }
 
 #ifdef COMFY_HAVE_CUTLASS
-template <typename ElementOutput, int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages>
+template <typename ElementOutput, int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages,
+          typename ArchTag = cutlass::arch::Sm89>
 struct FusedInt4Gemm {
     using ElementA = cutlass::int4b_t;
     using ElementB = cutlass::int4b_t;
@@ -151,7 +151,7 @@ struct FusedInt4Gemm {
         ElementB, LayoutB, cutlass::ComplexTransform::kNone, AlignB,
         ElementC, LayoutC, AlignC,
         ElementAcc, ElementCompute,
-        cutlass::arch::OpClassTensorOp, cutlass::arch::Sm89,
+        cutlass::arch::OpClassTensorOp, ArchTag,
         TB, Warp, Inst, EVTD,
         cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
         NumStages, cutlass::arch::OpMultiplyAddSaturate, EVTStages>::GemmKernel;
@@ -180,7 +180,8 @@ struct FusedInt4Gemm {
     }
 };
 
-template <typename ElementOutput, int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages>
+template <typename ElementOutput, int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages,
+          typename ArchTag = cutlass::arch::Sm89>
 struct FusedInt4GemmNoBias {
     using ElementA = cutlass::int4b_t;
     using ElementB = cutlass::int4b_t;
@@ -214,7 +215,7 @@ struct FusedInt4GemmNoBias {
         ElementB, LayoutB, cutlass::ComplexTransform::kNone, AlignB,
         ElementC, LayoutC, AlignC,
         ElementAcc, ElementCompute,
-        cutlass::arch::OpClassTensorOp, cutlass::arch::Sm89,
+        cutlass::arch::OpClassTensorOp, ArchTag,
         TB, Warp, Inst, EVTD,
         cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
         NumStages, cutlass::arch::OpMultiplyAddSaturate, EVTStages>::GemmKernel;
@@ -2880,6 +2881,7 @@ void launch_int4_weight_int8_act_gemm_dequant_chunked_kernel(
     int64_t K,
     int64_t weight_scale_size,
     int64_t chunk_cols,
+    bool allow_sm80_cutlass,
     bool has_bias,
     int output_dtype_code,
     int bias_dtype_code,
@@ -2919,7 +2921,8 @@ void launch_int4_weight_int8_act_gemm_dequant_chunked_kernel(
         const void* chunk_bias = has_bias ? static_cast<const char*>(bias) + n0 * fp_dtype_size_bytes(bias_dtype_code) : nullptr;
         void* chunk_output = static_cast<char*>(output) + n0 * fp_dtype_size_bytes(output_dtype_code);
         const bool used_cutlass = (
-            num_rows >= 1024
+            allow_sm80_cutlass
+            && num_rows >= 1024
             && (cols >= 4096 || (num_cols == 2560 && cols == 2560))
             && weight_scale_size != 1
             && (!has_bias || bias_dtype_code == 0)

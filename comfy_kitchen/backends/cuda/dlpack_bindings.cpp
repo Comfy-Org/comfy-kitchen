@@ -1037,6 +1037,7 @@ extern "C" {
         int64_t K,
         int64_t weight_scale_size,
         int64_t chunk_cols,
+        bool allow_sm80_cutlass,
         bool has_bias,
         int output_dtype_code,
         int bias_dtype_code,
@@ -1055,7 +1056,34 @@ extern "C" {
         int out_dtype_code,
         cudaStream_t stream);
 
+    bool launch_cutlass_turing_int8_dequant(
+        const void* A,
+        const void* B,
+        const void* xs,
+        const void* ws,
+        const void* bias,
+        void* D,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int out_dtype_code,
+        bool scalar_weight_scale,
+        cudaStream_t stream);
+
     bool launch_cutlass_int4_dequant(
+        const void* A,
+        const void* B,
+        const void* xs,
+        const void* ws,
+        const void* bias,
+        void* D,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int out_dtype_code,
+        cudaStream_t stream);
+
+    bool launch_cutlass_turing_int4_dequant(
         const void* A,
         const void* B,
         const void* xs,
@@ -1547,6 +1575,7 @@ void int4_weight_int8_act_gemm_dequant_chunked(
     nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> acc_workspace,
     nb::ndarray<uint8_t, nb::device::cuda> cublas_workspace,
     int64_t chunk_cols,
+    bool allow_sm80_cutlass,
     int output_dtype_code,
     uintptr_t stream_ptr) {
 
@@ -1608,6 +1637,7 @@ void int4_weight_int8_act_gemm_dequant_chunked(
         K,
         static_cast<int64_t>(weight_scales.size()),
         chunk_cols,
+        allow_sm80_cutlass,
         has_bias,
         output_dtype_code,
         bias_dtype_code,
@@ -1636,6 +1666,31 @@ bool cutlass_int8_dequant(
                                        bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
 }
 
+bool cutlass_turing_int8_dequant(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> a,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> b,
+    nb::ndarray<float, nb::device::cuda> xs,
+    nb::ndarray<float, nb::device::cuda> ws,
+    nb::ndarray<nb::device::cuda> bias,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> d,
+    int out_dtype_code,
+    uintptr_t stream_ptr) {
+    const int64_t M = a.shape(0);
+    const int64_t K = a.shape(1);
+    const int64_t N = b.shape(0);
+    if (b.shape(1) != K) throw std::runtime_error("cutlass_turing_int8_dequant: K mismatch");
+    if (d.shape(0) != M || d.shape(1) != N) throw std::runtime_error("cutlass_turing_int8_dequant: D shape mismatch");
+    if (xs.size() != static_cast<size_t>(M)) throw std::runtime_error("cutlass_turing_int8_dequant: xs shape mismatch");
+    if (ws.size() != 1 && ws.size() != static_cast<size_t>(N)) {
+        throw std::runtime_error("cutlass_turing_int8_dequant: ws shape mismatch");
+    }
+    const void* bias_ptr = bias.size() > 0 ? bias.data() : nullptr;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    return launch_cutlass_turing_int8_dequant(
+        a.data(), b.data(), xs.data(), ws.data(), bias_ptr, d.data(), M, N, K,
+        out_dtype_code, ws.size() == 1, stream);
+}
+
 // INT4 GEMM + fused dequant via CUTLASS. A and B are packed signed int4 in int8 storage.
 // Returns true on success; false means caller falls back to the hand-written int4 kernel.
 bool cutlass_int4_dequant(
@@ -1660,6 +1715,29 @@ bool cutlass_int4_dequant(
     const void* bias_ptr = bias.size() > 0 ? bias.data() : nullptr;
     return launch_cutlass_int4_dequant(a.data(), b.data(), xs.data(), ws.data(),
                                        bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
+}
+
+bool cutlass_turing_int4_dequant(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> a,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> b,
+    nb::ndarray<float, nb::device::cuda> xs,
+    nb::ndarray<float, nb::device::cuda> ws,
+    nb::ndarray<nb::device::cuda> bias,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> d,
+    int out_dtype_code,
+    uintptr_t stream_ptr) {
+    const int64_t M = a.shape(0);
+    const int64_t K_half = a.shape(1);
+    const int64_t N = b.shape(0);
+    if (b.shape(1) != K_half) throw std::runtime_error("cutlass_turing_int4_dequant: K mismatch");
+    if (d.shape(0) != M || d.shape(1) != N) throw std::runtime_error("cutlass_turing_int4_dequant: D shape mismatch");
+    if (xs.size() != static_cast<size_t>(M)) throw std::runtime_error("cutlass_turing_int4_dequant: xs shape mismatch");
+    if (ws.size() != static_cast<size_t>(N)) throw std::runtime_error("cutlass_turing_int4_dequant: ws shape mismatch");
+    const int64_t K = K_half * 2;
+    const void* bias_ptr = bias.size() > 0 ? bias.data() : nullptr;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    return launch_cutlass_turing_int4_dequant(
+        a.data(), b.data(), xs.data(), ws.data(), bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
 }
 
 void quantize_int8_rowwise_convrot(
@@ -2228,6 +2306,7 @@ NB_MODULE(_C, m) {
           nb::arg("acc_workspace"),
           nb::arg("cublas_workspace"),
           nb::arg("chunk_cols"),
+          nb::arg("allow_sm80_cutlass"),
           nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"));
 
@@ -2242,8 +2321,30 @@ NB_MODULE(_C, m) {
           nb::arg("out_dtype_code"),
           nb::arg("stream_ptr"));
 
+    m.def("cutlass_turing_int8_dequant", &cutlass_turing_int8_dequant,
+          "Turing INT8 tensor-core GEMM with fused row/column dequantization",
+          nb::arg("a"),
+          nb::arg("b"),
+          nb::arg("xs"),
+          nb::arg("ws"),
+          nb::arg("bias"),
+          nb::arg("d"),
+          nb::arg("out_dtype_code"),
+          nb::arg("stream_ptr"));
+
     m.def("cutlass_int4_dequant", &cutlass_int4_dequant,
           "INT4 GEMM + fused rowwise x colwise dequant + bias via CUTLASS; false -> fall back to hand kernel",
+          nb::arg("a"),
+          nb::arg("b"),
+          nb::arg("xs"),
+          nb::arg("ws"),
+          nb::arg("bias"),
+          nb::arg("d"),
+          nb::arg("out_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_turing_int4_dequant", &cutlass_turing_int4_dequant,
+          "Turing packed INT4 tensor-core GEMM with fused row/column dequantization",
           nb::arg("a"),
           nb::arg("b"),
           nb::arg("xs"),
