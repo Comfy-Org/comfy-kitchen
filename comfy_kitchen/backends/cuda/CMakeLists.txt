@@ -99,10 +99,6 @@ if(COMFY_ENABLE_LINEINFO OR CMAKE_BUILD_TYPE STREQUAL "Debug")
     list(APPEND CUDA_NVCC_FLAGS -lineinfo)
 endif()
 
-if(NOT DEFINED COMFY_KITCHEN_VERSION)
-    message(FATAL_ERROR "COMFY_KITCHEN_VERSION must be passed by setup.py")
-endif()
-
 # Source files
 set(CUDA_SOURCES
     ops/per_tensor_quantize.cu
@@ -174,10 +170,7 @@ endif()
 
 target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_cuda_kernels>)
 
-target_compile_definitions(_C PRIVATE
-    NB_STATIC
-    COMFY_KITCHEN_VERSION="${COMFY_KITCHEN_VERSION}"
-)
+target_compile_definitions(_C PRIVATE NB_STATIC)
 
 # Include directories
 target_include_directories(_C PRIVATE

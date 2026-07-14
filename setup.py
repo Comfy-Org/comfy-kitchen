@@ -29,11 +29,6 @@ if "--no-cuda" in sys.argv:
     print("=" * 80 + "\n")
 
 
-_PROJECT_TOML = pathlib.Path(__file__).with_name("pyproject.toml")
-with _PROJECT_TOML.open("rb") as _project_file:
-    PROJECT_METADATA = tomllib.load(_project_file).get("project", {})
-PROJECT_VERSION = PROJECT_METADATA["version"]
-
 
 class CMakeExtension(Extension):
     def __init__(self, name: str, source_dir: str = ""):
@@ -109,7 +104,6 @@ class CMakeBuildExt(build_ext):
             f"-DPython_EXECUTABLE={sys.executable}",
             f"-DCOMFY_CUDA_ARCHS={cuda_archs}",
             f"-DCOMFY_ENABLE_LINEINFO={'ON' if enable_lineinfo else 'OFF'}",
-            f"-DCOMFY_KITCHEN_VERSION={PROJECT_VERSION}",
         ]
 
         # Let CMake manage its own configuration cache. Reconfiguring with the
@@ -346,8 +340,12 @@ setup_kwargs = {
 }
 
 if BUILD_NO_CUDA:
-    version = PROJECT_VERSION
-    description = PROJECT_METADATA.get("description", "")
+    with open("pyproject.toml", "rb") as f:
+        pyproject = tomllib.load(f)
+
+    project_meta = pyproject.get("project", {})
+    version = project_meta["version"]
+    description = project_meta.get("description", "")
 
     setup_kwargs.update({
         "packages": get_packages(),

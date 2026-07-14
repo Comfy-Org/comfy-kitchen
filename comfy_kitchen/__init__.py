@@ -23,8 +23,6 @@ from .tensor.convrot_w4a4 import (
     quantize_convrot_w4a4_weight,
 )
 
-__version__ = "0.2.19"
-
 __all__ = [
     # Normalization
     "adaln",
