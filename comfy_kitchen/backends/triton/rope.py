@@ -61,6 +61,12 @@ def apply_rope_kernel(
         compute_dtype: Data type for computation (from freqs_cis)
         block_size: Number of elements to process per block
         split_half: if True, pair k uses elements [k] and [k + n_pairs]; else uses [2k, 2k+1]
+
+    Note: xq_ptr/xk_ptr describe ONE tensor's geometry (shape + strides). xk_ptr is
+    optional and, when provided, is assumed to share xq's shape and strides exactly.
+    The Python wrapper below never fuses xq and xk this way, since xq and xk are not
+    guaranteed to have matching shapes (e.g. GQA/MQA, cross-attention) - it always
+    launches this kernel once per tensor.
     """
     # Get program ID - each program processes a chunk of the output
     pid = tl.program_id(0)
@@ -143,18 +149,29 @@ def _apply_freq_tile(x_ptr, x_out_ptr, mask, freqs_00, freqs_01, freqs_10, freqs
     tl.store(x_out_ptr + x_offset_1, xq_out_1, mask=mask)
 
 
-def _apply_rope(x1: torch.Tensor, freqs_cis: torch.Tensor, x2: torch.Tensor = None, split_half: bool = False):
-    batch, dim1, dim2, head_dim = x1.shape
-    freqs_batch, freqs_dim1, freqs_dim2 = freqs_cis.shape[0], freqs_cis.shape[1], freqs_cis.shape[2]
+def _apply_rope_single(x: torch.Tensor, freqs_cis: torch.Tensor, split_half: bool) -> torch.Tensor:
+    """Launch the kernel for a single tensor, using that tensor's own shape/strides.
+
+    Kept separate from `_apply_rope` below so that x1 (xq) and x2 (xk) are never
+    forced to share offsets computed from x1's geometry - x1 and x2 can have
+    different dim1/dim2 (e.g. GQA/MQA, cross-attention), and each must be matched
+    against freqs_cis independently.
+    """
+    batch, dim1, dim2, head_dim = x.shape
 
     # Ensure inputs are contiguous
-    if not x1.is_contiguous():
-        x1 = x1.contiguous()
+    if not x.is_contiguous():
+        x = x.contiguous()
+
+    # Crop freqs_cis along dim2 if there is a mismatch (matching the eager behavior)
+    if dim2 != 1 and freqs_cis.shape[2] != 1 and dim2 != freqs_cis.shape[2]:
+        freqs_cis = freqs_cis[:, :, :dim2]
     if not freqs_cis.is_contiguous():
         freqs_cis = freqs_cis.contiguous()
 
-    x1_out = torch.empty_like(x1)
-    x2_out = None
+    freqs_batch, freqs_dim1, freqs_dim2 = freqs_cis.shape[0], freqs_cis.shape[1], freqs_cis.shape[2]
+
+    x_out = torch.empty_like(x)
 
     # Calculate total number of pairs to process
     n_pairs = head_dim // 2
@@ -172,7 +189,7 @@ def _apply_rope(x1: torch.Tensor, freqs_cis: torch.Tensor, x2: torch.Tensor = No
     grid = (triton.cdiv(total_elements, block_size),)
 
     # Get strides - these automatically adapt to the layout (BHND or BNHD)
-    stride_x_batch, stride_x_dim1, stride_x_dim2, stride_x_dim = x1.stride()
+    stride_x_batch, stride_x_dim1, stride_x_dim2, stride_x_dim = x.stride()
     stride_freqs = freqs_cis.stride()
 
     # Map dtype to Triton dtype
@@ -183,17 +200,12 @@ def _apply_rope(x1: torch.Tensor, freqs_cis: torch.Tensor, x2: torch.Tensor = No
     }
     compute_dtype = dtype_map.get(freqs_cis.dtype, tl.float32)
 
-    if x2 is not None:
-        if not x2.is_contiguous():
-            x2 = x2.contiguous()
-        x2_out = torch.empty_like(x2)
-
     apply_rope_kernel[grid](
-        x1,
-        x2,
+        x,
+        None,
         freqs_cis,
-        x1_out,
-        x2_out,
+        x_out,
+        None,
         batch,
         dim1,
         dim2,
@@ -215,6 +227,16 @@ def _apply_rope(x1: torch.Tensor, freqs_cis: torch.Tensor, x2: torch.Tensor = No
         block_size=block_size,
         split_half=split_half,
     )
+
+    return x_out
+
+
+def _apply_rope(x1: torch.Tensor, freqs_cis: torch.Tensor, x2: torch.Tensor = None, split_half: bool = False):
+    x1_out = _apply_rope_single(x1, freqs_cis, split_half)
+
+    x2_out = None
+    if x2 is not None:
+        x2_out = _apply_rope_single(x2, freqs_cis, split_half)
 
     return x1_out, x2_out
 
