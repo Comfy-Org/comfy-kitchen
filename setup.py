@@ -29,6 +29,12 @@ if "--no-cuda" in sys.argv:
     print("=" * 80 + "\n")
 
 
+
+def cmake_path(path: str | os.PathLike[str]) -> str:
+    """Return a CMake-safe path with forward slashes on every platform."""
+    return os.fspath(path).replace("\\", "/")
+
+
 class CMakeExtension(Extension):
     def __init__(self, name: str, source_dir: str = ""):
         super().__init__(name, sources=[])
@@ -92,42 +98,53 @@ class CMakeBuildExt(build_ext):
         build_temp = pathlib.Path(self.build_temp).resolve()
         build_temp.mkdir(parents=True, exist_ok=True)
 
-        # Clean CMake cache if it exists (to avoid stale configuration)
-        cmake_cache = build_temp / "CMakeCache.txt"
-        if cmake_cache.exists():
-            cmake_cache.unlink()
-            print(f"Cleaned stale CMake cache: {cmake_cache}")
-
         # All options have been set in finalize_options with proper defaults
         config = "Debug" if self.debug_build else "Release"
         cuda_archs = self.cuda_archs
         enable_lineinfo = self.lineinfo
 
         cmake_args = [
-            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={ext_dir}",
+            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={cmake_path(ext_dir)}",
             f"-DCMAKE_BUILD_TYPE={config}",
-            f"-DPython_EXECUTABLE={sys.executable}",
+            f"-DPython_EXECUTABLE={cmake_path(sys.executable)}",
             f"-DCOMFY_CUDA_ARCHS={cuda_archs}",
             f"-DCOMFY_ENABLE_LINEINFO={'ON' if enable_lineinfo else 'OFF'}",
         ]
 
-        cuda_home, nvcc_bin = get_cuda_path()
-        cmake_args.append(f"-DCUDAToolkit_ROOT={cuda_home}")
-        cmake_args.append(f"-DCMAKE_CUDA_COMPILER={nvcc_bin}")
+        # Let CMake manage its own configuration cache. Reconfiguring with the
+        # explicit arguments above updates changed settings without throwing
+        # away cached compiler checks and the generated build graph.
+        generator = os.environ.get("CMAKE_GENERATOR")
+        if generator:
+            cmake_args.extend(["-G", generator])
+
+        # Compiler caching is opt-in. Pass project-specific variables so CMake
+        # enables the launchers after compiler identification; wrapping the
+        # identification probes is unreliable with NVCC + MSVC on Windows.
+        cuda_launcher = os.environ.get("COMFY_CUDA_COMPILER_LAUNCHER")
+        if cuda_launcher:
+            cmake_args.append(f"-DCOMFY_CUDA_COMPILER_LAUNCHER={cuda_launcher}")
+        cxx_launcher = os.environ.get("COMFY_CXX_COMPILER_LAUNCHER")
+        if cxx_launcher:
+            cmake_args.append(f"-DCOMFY_CXX_COMPILER_LAUNCHER={cxx_launcher}")
+
+        cuda_paths = get_cuda_path()
+        if cuda_paths is None:
+            raise RuntimeError(
+                "CUDA extension build requested, but nvcc could not be found. "
+                "Set CUDA_HOME to a valid CUDA toolkit or build with --no-cuda."
+            )
+        cuda_home, nvcc_bin = cuda_paths
+        cmake_args.append(f"-DCUDAToolkit_ROOT={cmake_path(cuda_home)}")
+        cmake_args.append(f"-DCMAKE_CUDA_COMPILER={cmake_path(nvcc_bin)}")
 
         build_args = ["--config", config]
 
         max_jobs = os.cpu_count() or 1
-        # Use appropriate parallel build syntax for the platform
-        if os.name == "nt":
-            # Windows MSBuild uses /m:N for parallel builds
-            build_args.extend(["--", f"/m:{max_jobs}"])
-        else:
-            # Unix make uses -jN for parallel builds
-            build_args.extend(["--", f"-j{max_jobs}"])
+        build_args.extend(["--parallel", str(max_jobs)])
 
         # Run CMake configure
-        source_dir = ext.source_dir if ext.source_dir else os.path.dirname(os.path.abspath(__file__))
+        source_dir = cmake_path(ext.source_dir if ext.source_dir else os.path.dirname(os.path.abspath(__file__)))
 
         print(f"Configuring CMake for {ext.name}...")
         print(f"  Source directory: {source_dir}")
@@ -162,7 +179,7 @@ class CMakeBuildExt(build_ext):
 
         print(f"Successfully built {ext.name}")
 
-def get_cuda_path():
+def get_cuda_path() -> tuple[pathlib.Path, pathlib.Path] | None:
     nvcc_bin = None
     cuda_home = os.getenv("CUDA_HOME")
     if cuda_home:
@@ -180,12 +197,16 @@ def get_cuda_path():
         return None
 
     if cuda_home is None:
-        cuda_home = str(nvcc_bin.parent.parent)
+        cuda_home = nvcc_bin.parent.parent
 
-    return cuda_home, nvcc_bin
+    return pathlib.Path(cuda_home), nvcc_bin
 
 def get_cuda_version() -> tuple[int, ...] | None:
-    _cuda_home, nvcc_bin = get_cuda_path()
+    cuda_paths = get_cuda_path()
+    if cuda_paths is None:
+        return None
+
+    _cuda_home, nvcc_bin = cuda_paths
     try:
         output = subprocess.run(
             [nvcc_bin, "-V"],
@@ -193,7 +214,7 @@ def get_cuda_version() -> tuple[int, ...] | None:
             check=True,
             text=True,
         )
-    except subprocess.CalledProcessError:
+    except (OSError, subprocess.CalledProcessError):
         return None
 
     match = re.search(r"release\s*([\d.]+)", output.stdout)
@@ -333,7 +354,7 @@ if BUILD_NO_CUDA:
         pyproject = tomllib.load(f)
 
     project_meta = pyproject.get("project", {})
-    version = project_meta.get("version", "0.1.0")
+    version = project_meta["version"]
     description = project_meta.get("description", "")
 
     setup_kwargs.update({

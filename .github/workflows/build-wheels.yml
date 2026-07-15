@@ -25,6 +25,13 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-4.13.6-linux-x86_64-cuda13-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'third_party/cutlass/.git') }}
+          restore-keys: |
+            ccache-4.13.6-linux-x86_64-cuda13-
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -53,7 +60,24 @@ jobs:
             # Install ONLY the minimal CUDA packages needed for compilation (not the full toolkit)
             dnf install -y cuda-nvcc-13-0 cuda-cudart-devel-13-0 libcublas-devel-13-0 libnvjitlink-devel-13-0
             # Install Python development headers (fallback for CMake FindPython)
-            dnf install -y python3-devel
+            dnf install -y python3-devel curl ninja-build tar xz
+            # EL8 ships ccache 3.7.7, which predates NVCC -x cu handling.
+            # Use the same pinned modern ccache release on both Linux architectures.
+            CCACHE_VERSION=4.13.6
+            CCACHE_ARCH=$(uname -m)
+            case "$CCACHE_ARCH" in
+              x86_64) CCACHE_SHA256=156ec57c5198cc849d92834023d09910b83dc5504c6cf405d09e6ae7b208a3e5 ;;
+              aarch64) CCACHE_SHA256=2098d561e4a8e36bd06a29aedce53ea90c7e365f9573a93d91c230efbf96a958 ;;
+              *) echo "Unsupported ccache architecture: $CCACHE_ARCH" >&2; exit 1 ;;
+            esac
+            CCACHE_ARCHIVE="ccache-$CCACHE_VERSION-linux-$CCACHE_ARCH-musl-static.tar.xz"
+            curl --fail --location --retry 3 --silent --show-error "https://github.com/ccache/ccache/releases/download/v$CCACHE_VERSION/$CCACHE_ARCHIVE" --output "/tmp/$CCACHE_ARCHIVE"
+            echo "$CCACHE_SHA256  /tmp/$CCACHE_ARCHIVE" | sha256sum --check
+            tar -xJf "/tmp/$CCACHE_ARCHIVE" -C /tmp
+            install -m 755 "/tmp/${CCACHE_ARCHIVE%.tar.xz}/ccache" /usr/local/bin/ccache
+            ccache --version
+            # Reset counters, but retain restored compiler objects.
+            CCACHE_DIR=/host${{ github.workspace }}/.ccache ccache --zero-stats
             # Verify CUDA installation
             /usr/local/cuda-13.0/bin/nvcc --version
 
@@ -63,9 +87,18 @@ jobs:
             PATH=/usr/local/cuda-13.0/bin:$PATH
             LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:$LD_LIBRARY_PATH
             LIBRARY_PATH=/usr/local/cuda-13.0/lib64/stubs:$LIBRARY_PATH
+            CMAKE_GENERATOR=Ninja
+            COMFY_CUDA_COMPILER_LAUNCHER=ccache
+            COMFY_CXX_COMPILER_LAUNCHER=ccache
+            CCACHE_DIR=/host${{ github.workspace }}/.ccache
+            CCACHE_BASEDIR=/project
+            CCACHE_COMPILERCHECK=content
 
-          # Install Python build dependencies
-          CIBW_BEFORE_BUILD: "pip install nanobind cmake setuptools wheel"
+          # Report the previous interpreter build's cache result, then install build dependencies.
+          CIBW_BEFORE_BUILD: |
+            python --version
+            ccache --show-stats
+            pip install nanobind cmake setuptools wheel
 
           # Repair wheel for manylinux compliance, excluding CUDA runtime libs
           # Users must have CUDA installed on their system
@@ -80,6 +113,16 @@ jobs:
 
         with:
           output-dir: wheelhouse
+
+      - name: Report final compiler-cache statistics
+        shell: bash
+        run: |
+          ccache_version=4.13.6
+          archive="$RUNNER_TEMP/ccache-$ccache_version-linux-x86_64-musl-static.tar.xz"
+          curl --fail --location --retry 3 --silent --show-error "https://github.com/ccache/ccache/releases/download/v$ccache_version/ccache-$ccache_version-linux-x86_64-musl-static.tar.xz" --output "$archive"
+          echo "156ec57c5198cc849d92834023d09910b83dc5504c6cf405d09e6ae7b208a3e5  $archive" | sha256sum --check
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+          CCACHE_DIR="$GITHUB_WORKSPACE/.ccache" "$RUNNER_TEMP/ccache-$ccache_version-linux-x86_64-musl-static/ccache" --show-stats
 
       - name: Build CPU-only wheel (py3-none-any)
         shell: bash
@@ -122,6 +165,13 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-4.13.6-linux-aarch64-cuda13-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'third_party/cutlass/.git') }}
+          restore-keys: |
+            ccache-4.13.6-linux-aarch64-cuda13-
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -151,7 +201,24 @@ jobs:
             # Install ONLY the minimal CUDA packages needed for compilation (not the full toolkit)
             dnf install -y cuda-nvcc-13-0 cuda-cudart-devel-13-0 libcublas-devel-13-0 libnvjitlink-devel-13-0
             # Install Python development headers (fallback for CMake FindPython)
-            dnf install -y python3-devel
+            dnf install -y python3-devel curl ninja-build tar xz
+            # EL8 ships ccache 3.7.7, which predates NVCC -x cu handling.
+            # Use the same pinned modern ccache release on both Linux architectures.
+            CCACHE_VERSION=4.13.6
+            CCACHE_ARCH=$(uname -m)
+            case "$CCACHE_ARCH" in
+              x86_64) CCACHE_SHA256=156ec57c5198cc849d92834023d09910b83dc5504c6cf405d09e6ae7b208a3e5 ;;
+              aarch64) CCACHE_SHA256=2098d561e4a8e36bd06a29aedce53ea90c7e365f9573a93d91c230efbf96a958 ;;
+              *) echo "Unsupported ccache architecture: $CCACHE_ARCH" >&2; exit 1 ;;
+            esac
+            CCACHE_ARCHIVE="ccache-$CCACHE_VERSION-linux-$CCACHE_ARCH-musl-static.tar.xz"
+            curl --fail --location --retry 3 --silent --show-error "https://github.com/ccache/ccache/releases/download/v$CCACHE_VERSION/$CCACHE_ARCHIVE" --output "/tmp/$CCACHE_ARCHIVE"
+            echo "$CCACHE_SHA256  /tmp/$CCACHE_ARCHIVE" | sha256sum --check
+            tar -xJf "/tmp/$CCACHE_ARCHIVE" -C /tmp
+            install -m 755 "/tmp/${CCACHE_ARCHIVE%.tar.xz}/ccache" /usr/local/bin/ccache
+            ccache --version
+            # Reset counters, but retain restored compiler objects.
+            CCACHE_DIR=/host${{ github.workspace }}/.ccache ccache --zero-stats
             # Verify CUDA installation
             /usr/local/cuda-13.0/bin/nvcc --version
 
@@ -161,9 +228,18 @@ jobs:
             PATH=/usr/local/cuda-13.0/bin:$PATH
             LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:$LD_LIBRARY_PATH
             LIBRARY_PATH=/usr/local/cuda-13.0/lib64/stubs:$LIBRARY_PATH
+            CMAKE_GENERATOR=Ninja
+            COMFY_CUDA_COMPILER_LAUNCHER=ccache
+            COMFY_CXX_COMPILER_LAUNCHER=ccache
+            CCACHE_DIR=/host${{ github.workspace }}/.ccache
+            CCACHE_BASEDIR=/project
+            CCACHE_COMPILERCHECK=content
 
-          # Install Python build dependencies
-          CIBW_BEFORE_BUILD: "pip install nanobind cmake setuptools wheel"
+          # Report the previous interpreter build's cache result, then install build dependencies.
+          CIBW_BEFORE_BUILD: |
+            python --version
+            ccache --show-stats
+            pip install nanobind cmake setuptools wheel
 
           # Repair wheel for manylinux compliance, excluding CUDA runtime libs
           # Users must have CUDA installed on their system
@@ -178,6 +254,16 @@ jobs:
 
         with:
           output-dir: wheelhouse
+
+      - name: Report final compiler-cache statistics
+        shell: bash
+        run: |
+          ccache_version=4.13.6
+          archive="$RUNNER_TEMP/ccache-$ccache_version-linux-aarch64-musl-static.tar.xz"
+          curl --fail --location --retry 3 --silent --show-error "https://github.com/ccache/ccache/releases/download/v$ccache_version/ccache-$ccache_version-linux-aarch64-musl-static.tar.xz" --output "$archive"
+          echo "2098d561e4a8e36bd06a29aedce53ea90c7e365f9573a93d91c230efbf96a958  $archive" | sha256sum --check
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+          CCACHE_DIR="$GITHUB_WORKSPACE/.ccache" "$RUNNER_TEMP/ccache-$ccache_version-linux-aarch64-musl-static/ccache" --show-stats
 
       - name: List built wheels
         shell: bash
@@ -206,6 +292,17 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-windows-x86_64-cuda13-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'third_party/cutlass/.git') }}
+          restore-keys: |
+            ccache-windows-x86_64-cuda13-
+
+      - name: Install compiler cache and Ninja
+        shell: pwsh
+        run: choco install ccache ninja --no-progress --yes
       - name: Install CUDA Toolkit 13.0.2
         uses: Jimver/cuda-toolkit@v0.2.29
         id: cuda-toolkit
@@ -215,10 +312,16 @@ jobs:
           use-github-cache: 'true'
           log-file-suffix: 'windows-2022.txt'
 
-      - name: Set additional CUDA environment variables
+      - name: Set compiler-cache and CUDA environment
         shell: pwsh
         run: |
           echo "CUDA_PATH_V13_0=$env:CUDA_PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "COMFY_CUDA_COMPILER_LAUNCHER=ccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "COMFY_CXX_COMPILER_LAUNCHER=ccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CCACHE_DIR=$env:GITHUB_WORKSPACE\.ccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CCACHE_BASEDIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CCACHE_COMPILERCHECK=content" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Verify CUDA installation
         shell: bash
@@ -229,85 +332,6 @@ jobs:
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Setup CUDA MSBuild integration
-        shell: pwsh
-        run: |
-          # Copy CUDA MSBuild integration files to Visual Studio directory
-          $cudaPath = $env:CUDA_PATH
-          $cudaMSBuildSource = Join-Path $cudaPath "extras\visual_studio_integration\MSBuildExtensions"
-          
-          if (-not (Test-Path $cudaMSBuildSource)) {
-            Write-Error "CUDA MSBuild extensions not found at $cudaMSBuildSource"
-            exit 1
-          }
-          
-          # Find Visual Studio installation
-          $vsBasePaths = @(
-            "C:\Program Files (x86)\Microsoft Visual Studio",
-            "C:\Program Files\Microsoft Visual Studio"
-          )
-          
-          $vsVersions = @("2022", "2019")
-          $vsEditions = @("BuildTools", "Enterprise", "Professional", "Community")
-          $toolsets = @("v170", "v160")
-          
-          $destinations = @()
-          
-          foreach ($basePath in $vsBasePaths) {
-            if (Test-Path $basePath) {
-              foreach ($version in $vsVersions) {
-                foreach ($edition in $vsEditions) {
-                  foreach ($toolset in $toolsets) {
-                    $vsPath = Join-Path $basePath "$version\$edition\MSBuild\Microsoft\VC\$toolset\BuildCustomizations"
-                    if (Test-Path $vsPath) {
-                      $destinations += $vsPath
-                    }
-                  }
-                }
-              }
-            }
-          }
-          
-          if ($destinations.Count -eq 0) {
-            Write-Error "Could not find Visual Studio MSBuild directory"
-            exit 1
-          }
-          
-          # CUDA 13.0 uses versioned filenames that need to be copied as both versioned and standard names
-          $fileMapping = @{
-            "CUDA 13.0.props" = @("CUDA 13.0.props", "CUDA.props")
-            "CUDA 13.0.targets" = @("CUDA 13.0.targets", "CUDA.targets")
-            "CUDA 13.0.xml" = @("CUDA 13.0.xml", "CUDA.xml")
-            "Nvda.Build.CudaTasks.v13.0.dll" = @("Nvda.Build.CudaTasks.v13.0.dll")
-          }
-          
-          $copySuccess = $false
-          
-          foreach ($destDir in $destinations) {
-            try {
-              foreach ($srcFileName in $fileMapping.Keys) {
-                $srcFile = Join-Path $cudaMSBuildSource $srcFileName
-                
-                if (Test-Path $srcFile) {
-                  foreach ($destFileName in $fileMapping[$srcFileName]) {
-                    $destFile = Join-Path $destDir $destFileName
-                    Copy-Item -Path $srcFile -Destination $destFile -Force
-                  }
-                }
-              }
-              $copySuccess = $true
-            } catch {
-              Write-Warning "Failed to copy to $destDir : $_"
-            }
-          }
-          
-          if (-not $copySuccess) {
-            Write-Error "Failed to copy CUDA MSBuild files to any destination"
-            exit 1
-          }
-          
-          Write-Host "CUDA MSBuild integration configured successfully"
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -351,6 +375,10 @@ jobs:
           # Build with default platform-specific CUDA architectures from setup.py
           # Python 3.12 will produce abi3 wheel, 3.10/3.11 will be version-specific
           python setup.py bdist_wheel
+
+      - name: Report compiler-cache statistics
+        shell: pwsh
+        run: ccache --show-stats
 
       - name: List built wheels
         shell: bash
