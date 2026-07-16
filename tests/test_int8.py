@@ -230,16 +230,17 @@ def test_int8_linear_routes_turing_to_fused_kernel(seed, monkeypatch):
     "hip_version,arches,device_index,m,expected_pool",
     [
         (None, ["gfx1100"], 0, 1024, "default"),
-        ("7.2", ["gfx1100"], 0, 1024, "rdna"),
-        ("7.2", ["gfx1151"], 0, 1024, "rdna"),
-        ("7.2", ["gfx1201"], 0, 1024, "rdna"),
-        ("7.2", ["gfx1100"], 0, 128, "rdna-small-m"),
-        ("7.2", ["gfx1100"], 0, 129, "rdna"),
+        ("7.2", ["gfx1100"], 0, 1024, "gfx11"),
+        ("7.2", ["gfx1151"], 0, 1024, "gfx11"),
+        ("7.2", ["gfx1201"], 0, 1024, "gfx12"),
+        ("7.2", ["gfx1100"], 0, 128, "gfx11-small-m"),
+        ("7.2", ["gfx1201"], 0, 128, "gfx12-small-m"),
+        ("7.2", ["gfx1100"], 0, 129, "gfx11"),
         ("7.2", ["gfx908"], 0, 1024, "default"),
         ("7.2", ["gfx90a"], 0, 1024, "default"),
         ("7.2", ["gfx942"], 0, 1024, "default"),
         ("7.2", ["gfx950"], 0, 1024, "default"),
-        ("7.2", ["gfx1100", "gfx90a"], 0, 1024, "rdna"),
+        ("7.2", ["gfx1100", "gfx90a"], 0, 1024, "gfx11"),
         ("7.2", ["gfx1100", "gfx90a"], 1, 1024, "default"),
         ("7.2", ["gfx1300"], 0, 1024, "default"),
     ],
@@ -263,12 +264,24 @@ def test_int8_autotune_configs_are_device_scoped(
         m=m,
     )
 
-    if expected_pool == "rdna":
-        assert configs == quantization._INT8_RDNA_CONFIGS
-    elif expected_pool == "rdna-small-m":
+    expected_configs = {
+        "gfx11": quantization._INT8_GFX11_CONFIGS,
+        "gfx12": quantization._INT8_GFX12_CONFIGS,
+    }
+    if expected_pool in expected_configs:
+        assert configs == expected_configs[expected_pool]
+    elif expected_pool.endswith("-small-m"):
+        full_pool = expected_configs[expected_pool.removesuffix("-small-m")]
         assert len(configs) == 9
-        assert all(config in quantization._INT8_RDNA_CONFIGS for config in configs)
-        assert all(config.kwargs["block_k"] <= 64 for config in configs)
+        assert all(config in full_pool for config in configs)
+        if expected_pool.startswith("gfx11"):
+            assert any(config.kwargs["block_k"] == 128 for config in configs)
+        assert not any(
+            config.kwargs["block_m"] == 128
+            and config.kwargs["block_n"] == 128
+            and config.kwargs["block_k"] == 128
+            for config in configs
+        )
     else:
         signatures = [
             (config.kwargs, config.num_stages, config.num_warps)
@@ -302,7 +315,7 @@ def test_int8_autotune_configs_isolate_heterogeneous_devices(monkeypatch):
         quantization._INT8_MATMUL_CONFIGS, {}, device_index=0, m=1024
     )
 
-    assert rdna_configs == quantization._INT8_RDNA_CONFIGS
+    assert rdna_configs == quantization._INT8_GFX11_CONFIGS
     assert cdna_configs == quantization._INT8_DEFAULT_CONFIGS
     assert rdna_configs_again == rdna_configs
 
@@ -336,10 +349,13 @@ def test_int8_autotune_pool_creation_does_not_probe_devices(monkeypatch):
         lambda _: (_ for _ in ()).throw(AssertionError("unexpected device probe")),
     )
 
-    default_configs, rdna_configs = quantization._int8_autotune_configs()
+    default_configs, gfx11_configs, gfx12_configs = quantization._int8_autotune_configs()
 
     assert len(default_configs) == 6
-    assert len(rdna_configs) == 10
+    assert len(gfx11_configs) == 10
+    assert len(gfx12_configs) == 10
+    assert len(quantization._INT8_MATMUL_CONFIGS) == 17
+    assert gfx11_configs[6] != gfx12_configs[6]
 
 
 def test_int8_autotune_cache_key_includes_device():
@@ -351,8 +367,14 @@ def test_int8_autotune_cache_key_includes_device():
         "prune_configs_by": quantization._INT8_PRUNE_CONFIGS_BY,
     }
 
-    assert "device_index" in quantization._int8_matmul_dequant_kernel.keys
-    assert "device_index" in quantization._int8_matmul_dequant_per_row_kernel.keys
+    for kernel in (
+        quantization._int8_matmul_dequant_kernel,
+        quantization._int8_matmul_dequant_per_row_kernel,
+    ):
+        assert "device_index" in kernel.keys
+        device_index = kernel.fn.params[kernel.fn.arg_names.index("device_index")]
+        assert not device_index.is_constexpr
+        assert device_index.do_not_specialize
 
 
 # =============================================================================
