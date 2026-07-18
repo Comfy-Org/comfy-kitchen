@@ -377,6 +377,65 @@ def test_int8_autotune_cache_key_includes_device():
         assert device_index.do_not_specialize
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize(
+    "per_channel,expected_kernel",
+    [
+        (False, "tensorwise"),
+        (True, "per_row"),
+    ],
+)
+def test_int8_linear_forwards_device_index_to_kernel(
+    monkeypatch, per_channel, expected_kernel
+):
+    from comfy_kitchen.backends.triton import quantization
+
+    launches = []
+
+    class KernelRecorder:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            def launch(**kwargs):
+                launches.append((self.name, kwargs))
+
+            return launch
+
+    device_index = torch.cuda.current_device()
+    device = torch.device("cuda", device_index)
+    x = torch.zeros((2, 4), device=device, dtype=torch.bfloat16)
+    weight = torch.zeros((3, 4), device=device, dtype=torch.int8)
+    scale_size = weight.shape[0] if per_channel else 1
+    weight_scale = torch.ones(scale_size, device=device, dtype=torch.float32)
+
+    monkeypatch.setattr(
+        quantization,
+        "triton_quantize_rowwise",
+        lambda tensor: (
+            torch.zeros_like(tensor, dtype=torch.int8),
+            torch.ones((tensor.shape[0], 1), device=device, dtype=torch.float32),
+        ),
+    )
+    monkeypatch.setattr(
+        quantization,
+        "_int8_matmul_dequant_kernel",
+        KernelRecorder("tensorwise"),
+    )
+    monkeypatch.setattr(
+        quantization,
+        "_int8_matmul_dequant_per_row_kernel",
+        KernelRecorder("per_row"),
+    )
+
+    output = quantization.int8_linear(x, weight, weight_scale)
+
+    assert output.shape == (2, 3)
+    assert [(name, kwargs["device_index"]) for name, kwargs in launches] == [
+        (expected_kernel, x.device.index)
+    ]
+
+
 # =============================================================================
 # INT8 Quantization Tests
 # =============================================================================
