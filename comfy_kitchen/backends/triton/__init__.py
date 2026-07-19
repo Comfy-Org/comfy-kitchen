@@ -4,6 +4,10 @@ __all__ = [
     "apply_rope1",
     "apply_rope_split_half",
     "apply_rope_split_half1",
+    "rms_rope",
+    "rms_rope1",
+    "rms_rope_split_half",
+    "rms_rope_split_half1",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
     "quantize_mxfp8",
@@ -52,6 +56,7 @@ try:
         triton_quantize_rowwise as _triton_quantize_int8_rowwise,
     )
     from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
+    from .rms_rope import rms_rope, rms_rope1, rms_rope_split_half, rms_rope_split_half1
 except ImportError as e:
     _TRITON_AVAILABLE = False
     _TRITON_ERROR = f"ImportError: {e!s}"
@@ -163,6 +168,24 @@ def _build_constraints() -> dict:
             },
             default_devices=triton_devices,
         ),
+        "rms_rope1": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "freqs_cis": ParamConstraint(dtypes=standard_floats),
+                "scale": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
+        "rms_rope": FunctionConstraints(
+            params={
+                "q": ParamConstraint(dtypes=standard_floats),
+                "k": ParamConstraint(dtypes=standard_floats),
+                "freqs_cis": ParamConstraint(dtypes=standard_floats),
+                "q_scale": ParamConstraint(dtypes=standard_floats),
+                "k_scale": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
         "int8_linear": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
@@ -203,6 +226,24 @@ def _build_constraints() -> dict:
                 "xq": ParamConstraint(dtypes=standard_floats),
                 "xk": ParamConstraint(dtypes=standard_floats),
                 "freqs_cis": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
+        "rms_rope_split_half1": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "freqs_cis": ParamConstraint(dtypes=standard_floats),
+                "scale": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
+        "rms_rope_split_half": FunctionConstraints(
+            params={
+                "q": ParamConstraint(dtypes=standard_floats),
+                "k": ParamConstraint(dtypes=standard_floats),
+                "freqs_cis": ParamConstraint(dtypes=standard_floats),
+                "q_scale": ParamConstraint(dtypes=standard_floats),
+                "k_scale": ParamConstraint(dtypes=standard_floats),
             },
             default_devices=triton_devices,
         ),
