@@ -60,6 +60,42 @@ class TestBackendSystem:
             cuda_caps = backends["cuda"]["capabilities"]
             assert "int8_linear" in cuda_caps
 
+    def test_cuda_backend_rejects_non_cuda_pytorch_runtime(self, monkeypatch):
+        """CUDA extension backend must not register on non-CUDA PyTorch builds."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        monkeypatch.setattr(cuda_backend.torch.version, "hip", "7.2", raising=False)
+        monkeypatch.setattr(cuda_backend.torch.version, "cuda", None, raising=False)
+        monkeypatch.setattr(cuda_backend.torch.cuda, "is_available", lambda: True)
+
+        assert (
+            cuda_backend._cuda_backend_unavailable_reason()
+            == "CUDA backend requires a CUDA-enabled PyTorch build"
+        )
+
+    def test_cuda_backend_rejects_cpu_only_pytorch_build(self, monkeypatch):
+        """CUDA extension backend must not register without a CUDA PyTorch build."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        monkeypatch.setattr(cuda_backend.torch.version, "hip", None, raising=False)
+        monkeypatch.setattr(cuda_backend.torch.version, "cuda", None, raising=False)
+        monkeypatch.setattr(cuda_backend.torch.cuda, "is_available", lambda: True)
+
+        assert (
+            cuda_backend._cuda_backend_unavailable_reason()
+            == "CUDA backend requires a CUDA-enabled PyTorch build"
+        )
+
+    def test_cuda_backend_accepts_cuda_runtime(self, monkeypatch):
+        """CUDA extension backend remains available on CUDA PyTorch with a CUDA device."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        monkeypatch.setattr(cuda_backend.torch.version, "hip", None, raising=False)
+        monkeypatch.setattr(cuda_backend.torch.version, "cuda", "12.8", raising=False)
+        monkeypatch.setattr(cuda_backend.torch.cuda, "is_available", lambda: True)
+
+        assert cuda_backend._cuda_backend_unavailable_reason() is None
+
     def test_backend_context_manager_override(self, small_tensor):
         """Test that use_backend context manager correctly overrides backend selection."""
         import comfy_kitchen as ck
