@@ -15,10 +15,10 @@ def pytest_configure(config):
 def pytest_sessionfinish(session, exitstatus):
     # ROCm on Windows: pytest can hang at exit if HIP kernels left pending GPU
     # work. See https://github.com/ROCm/TheRock/issues/999
-    if sys.platform == "win32" and torch.cuda.is_available() and getattr(
-        torch.version, "hip", None
-    ):
-        torch.cuda.synchronize()
+    torch = sys.modules.get("torch")
+    if sys.platform == "win32" and torch is not None:
+        if torch.cuda.is_available() and getattr(torch.version, "hip", None):
+            torch.cuda.synchronize()
 
 
 @pytest.fixture(scope="session")
