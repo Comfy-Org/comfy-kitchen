@@ -989,9 +989,9 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     }
 }
 
-// Final-stage (S=64) H4 butterfly fused directly with quantize-and-store, so
-// the chunked kernel's pass 2 never stages the rotated value through a
-// buffer -- same divide/round/clamp sequence as the per-column loop above.
+// S=64 H4 butterfly with quantize+store fused into the final stage. The
+// divide/round/clamp sequence must match the per-column quantize loop in
+// quantize_int8_rowwise_convrot64_kernel.
 template<int S, typename InputType, bool STOCHASTIC>
 __device__ __forceinline__ void convrot_fht_stage64_quantize(
     const float* __restrict__ src,
@@ -1030,10 +1030,9 @@ __device__ __forceinline__ void convrot_fht_stage64_quantize(
     }
 }
 
-// Shared by both passes of the chunked kernel below: load one group-of-4
-// (zero-filled if `active` is false, e.g. a partial final chunk) and run the
-// first three FHT stages, leaving the result in buf1. Extracted so pass 1 and
-// pass 2 cannot drift apart -- their bitwise agreement is now by construction.
+// Load one group-of-4 (zero-filled when inactive) and run the first three FHT
+// stages, leaving the result in buf1. Both passes of the chunked kernel must
+// go through this helper so their rotated values agree bitwise.
 template<typename InputType>
 __device__ __forceinline__ void convrot_load_rotate_group(
     const InputType* __restrict__ x,
@@ -1063,15 +1062,12 @@ __device__ __forceinline__ void convrot_load_rotate_group(
     __syncthreads();
 }
 
-// Chunked two-pass variant of quantize_int8_rowwise_convrot64_kernel, used for
-// 2048 < K <= 4096. Shared memory is bounded by BLOCK_THREADS alone
-// (kGroupsInFlight * 2 * 256 floats, independent of K) by processing the row
-// in chunks and never materializing more than one chunk's rotated values:
-// pass 1 rotates each chunk and folds its max into abs_max, discarding the
-// values; pass 2 re-loads and re-rotates (deterministic fp32 math, so this
-// reproduces pass 1 exactly) and quantizes with the final scale. Not used
-// beyond K=4096: at K=8192/M=9216 the re-read in pass 2 stops hitting L2 and
-// this kernel regresses ~8% vs the single-pass kernel (see PR description).
+// Two-pass variant for 2048 < K <= 4096: shared memory holds only one chunk's
+// scratch (independent of K). Pass 1 rotates each chunk and folds its abs-max;
+// pass 2 re-loads and re-rotates -- fp32 math is deterministic, so the values
+// match pass 1 -- and quantizes with the final scale. Above K=4096 the pass-2
+// re-read no longer stays L2-resident at large row counts and the single-pass
+// kernel is faster.
 template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC>
 __global__ void quantize_int8_rowwise_convrot64_chunked_kernel(
     const InputType* __restrict__ x,
@@ -1085,7 +1081,7 @@ __global__ void quantize_int8_rowwise_convrot64_chunked_kernel(
     constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
 
     extern __shared__ float smem[];
-    float* tmp = smem;  // kGroupsInFlight * 2 * kConvRotGroup floats -- no row_buf.
+    float* tmp = smem;  // kGroupsInFlight * 2 * kConvRotGroup floats.
 
     __shared__ float warp_smem[kWarps];
     __shared__ float block_smem;
@@ -1112,9 +1108,8 @@ __global__ void quantize_int8_rowwise_convrot64_chunked_kernel(
         convrot_load_rotate_group<InputType>(x, row_offset, group_col, base, active, buf0, buf1, lane);
 
         if (active) {
-            // buf0 is scratch here (dead value, reused next iteration).
-            // fmaxf ignores NaN against a finite abs_max, so an all-NaN
-            // group (huge-magnitude row) can't corrupt the running max.
+            // fmaxf ignores NaN against a finite accumulator, so an all-NaN
+            // group (huge-magnitude row) cannot corrupt the running max.
             abs_max = fmaxf(
                 abs_max,
                 convrot_fht_stage64_store_absmax<64, float>(buf1, buf0, lane));
@@ -1129,7 +1124,6 @@ __global__ void quantize_int8_rowwise_convrot64_chunked_kernel(
     if (tid == 0) {
         scales[row] = scale;
     }
-    __syncthreads();  // all threads must see `scale` before pass 2 reuses smem.
 
     // ---- Pass 2: re-load + re-rotate (identical math -> identical values) + quantize. ----
     for (int it = 0; it < iters; ++it) {
@@ -1461,21 +1455,11 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                 static_cast<int>(num_cols),
                 seed);
         };
-        // Chunked kernel's shared memory is bounded by block_threads alone (no
-        // row_buf, so no num_cols term) -- see quantize_int8_rowwise_convrot64_chunked_kernel.
+        // Dynamic smem here is at most 16 KiB -- under the default limit, no opt-in attribute needed.
         auto launch_chunked = [&](auto kernel, int block_threads) {
             const int groups_in_flight = block_threads / 64;
             const size_t smem_bytes =
                 static_cast<size_t>(groups_in_flight) * 2 * comfy::kConvRotGroup * sizeof(float);
-            cudaError_t attr_err = cudaFuncSetAttribute(
-                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                static_cast<int>(smem_bytes));
-            if (attr_err != cudaSuccess) {
-                throw std::runtime_error(
-                    std::string("convrot64 chunked kernel shared memory request (") +
-                    std::to_string(smem_bytes) + " bytes) failed: " +
-                    cudaGetErrorString(attr_err));
-            }
             kernel<<<static_cast<unsigned int>(num_rows), block_threads, smem_bytes, stream>>>(
                 static_cast<const InputType*>(input),
                 static_cast<int8_t*>(output),
@@ -1520,10 +1504,7 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                        block_threads_6144);
             }
         } else if (num_cols <= 2048) {
-            // Right-sized launch: threads = min(1024, (K/256)*64) via the
-            // switch below (always <= 512 here, so the min never clamps).
-            // The chunked and K>4096 branches below use their own hardcoded
-            // thread counts, not this formula.
+            // One 64-thread group per 256-column block: threads = n_groups * 64.
             const int n_groups = static_cast<int>(num_cols / comfy::kConvRotGroup);
             switch (n_groups) {
                 case 2:  // K=512
@@ -1550,18 +1531,18 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                     if (stochastic) launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 448, true>, 448);
                     else launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 448, false>, 448);
                     break;
-                default:  // K=2048 (n_groups == 8); n_groups < 2 (K < 512) can't reach
-                          // this branch (K==256 is the block_threads_256 special case
-                          // above, and K must be a multiple of 256 and > 256 here).
+                case 8:  // K=2048
                     if (stochastic) launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 512, true>, 512);
                     else launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 512, false>, 512);
                     break;
+                default:
+                    if (stochastic) launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 1024, true>, 1024);
+                    else launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 1024, false>, 1024);
+                    break;
             }
         } else if (num_cols <= 4096) {
-            // Chunked two-pass kernel, fixed at 512 threads. Gated to K<=4096
-            // (not all K>2048): at K=8192/M=9216, pass 2's re-read stops
-            // hitting L2 and this kernel regresses ~8% vs the single-pass
-            // kernel below -- see the PR description.
+            // Above K=4096 the chunked kernel's pass-2 re-read falls out of L2 at large
+            // row counts and loses to the single-pass kernel below.
             constexpr int block_threads_chunked = 512;
             if (stochastic) {
                 launch_chunked(comfy::quantize_int8_rowwise_convrot64_chunked_kernel<InputType, block_threads_chunked, true>,
@@ -1571,8 +1552,6 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                                 block_threads_chunked);
             }
         } else {
-            // K > 4096: unchanged from stock -- same kernel, same fixed
-            // 1024-thread launch.
             constexpr int block_threads_multi = 1024;
             if (stochastic) {
                 launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_multi, true>,
