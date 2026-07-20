@@ -1037,6 +1037,50 @@ __device__ __forceinline__ void convrot_fht_stage64_quantize(
     }
 }
 
+// Shared by both passes of quantize_int8_rowwise_convrot64_chunked_kernel
+// below: load one group-of-4 from global memory (or zero-fill if `active` is
+// false -- the group is past the row's actual group count, e.g. the partial
+// final chunk of a K not evenly divisible by the chunk width) and run the
+// first three FHT stages (S=1 inline, then S=4 and S=16 via
+// convrot_fht_stage64) on it, leaving the post-stage-2 values in buf1. Pass 1
+// and pass 2 previously duplicated this exact sequence verbatim; extracted
+// here so they cannot drift apart -- pass 2's bitwise reproduction of pass
+// 1's rotated values (the determinism this kernel's two-pass design depends
+// on) now holds by construction, not by two hand-kept-in-sync copies. Callers
+// still apply their own final S=64 stage afterward (store_absmax for pass 1,
+// fused quantize for pass 2) since that step differs between the passes.
+// Called uniformly by every thread in the block (the `active` flag only
+// gates whether x0..x3 come from memory or are zero-filled, not whether this
+// function itself is called), so the __syncthreads() calls inside are safe.
+template<typename InputType>
+__device__ __forceinline__ void convrot_load_rotate_group(
+    const InputType* __restrict__ x,
+    int64_t row_offset,
+    int group_col,
+    int base,
+    bool active,
+    float* __restrict__ buf0,
+    float* __restrict__ buf1,
+    int lane)
+{
+    const int64_t x_offset = row_offset + group_col + base;
+
+    const float x0 = active ? to_float(x[x_offset]) : 0.0f;
+    const float x1 = active ? to_float(x[x_offset + 1]) : 0.0f;
+    const float x2 = active ? to_float(x[x_offset + 2]) : 0.0f;
+    const float x3 = active ? to_float(x[x_offset + 3]) : 0.0f;
+    buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
+    buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
+    buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
+    buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+    __syncthreads();
+
+    convrot_fht_stage64<4>(buf1, buf0, lane);
+    __syncthreads();
+    convrot_fht_stage64<16>(buf0, buf1, lane);
+    __syncthreads();
+}
+
 // Chunked two-pass variant of quantize_int8_rowwise_convrot64_kernel, used for
 // 2048 < K <= 4096 (see launch_quantize_int8_rowwise_convrot64_kernel's generic
 // branch -- K > 4096 deliberately does NOT use this kernel, see below) to
@@ -1114,22 +1158,8 @@ __global__ void quantize_int8_rowwise_convrot64_chunked_kernel(
         const bool active = group < n_groups;
         const int base = lane * 4;
         const int group_col = group * kConvRotGroup;
-        const int64_t x_offset = row_offset + group_col + base;
 
-        const float x0 = active ? to_float(x[x_offset]) : 0.0f;
-        const float x1 = active ? to_float(x[x_offset + 1]) : 0.0f;
-        const float x2 = active ? to_float(x[x_offset + 2]) : 0.0f;
-        const float x3 = active ? to_float(x[x_offset + 3]) : 0.0f;
-        buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
-        buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
-        buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
-        buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
-        __syncthreads();
-
-        convrot_fht_stage64<4>(buf1, buf0, lane);
-        __syncthreads();
-        convrot_fht_stage64<16>(buf0, buf1, lane);
-        __syncthreads();
+        convrot_load_rotate_group<InputType>(x, row_offset, group_col, base, active, buf0, buf1, lane);
 
         if (active) {
             // Discard target: buf0 is dead (already consumed above) and gets
@@ -1157,22 +1187,8 @@ __global__ void quantize_int8_rowwise_convrot64_chunked_kernel(
         const bool active = group < n_groups;
         const int base = lane * 4;
         const int group_col = group * kConvRotGroup;
-        const int64_t x_offset = row_offset + group_col + base;
 
-        const float x0 = active ? to_float(x[x_offset]) : 0.0f;
-        const float x1 = active ? to_float(x[x_offset + 1]) : 0.0f;
-        const float x2 = active ? to_float(x[x_offset + 2]) : 0.0f;
-        const float x3 = active ? to_float(x[x_offset + 3]) : 0.0f;
-        buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
-        buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
-        buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
-        buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
-        __syncthreads();
-
-        convrot_fht_stage64<4>(buf1, buf0, lane);
-        __syncthreads();
-        convrot_fht_stage64<16>(buf0, buf1, lane);
-        __syncthreads();
+        convrot_load_rotate_group<InputType>(x, row_offset, group_col, base, active, buf0, buf1, lane);
 
         if (active) {
             convrot_fht_stage64_quantize<64, InputType, STOCHASTIC>(

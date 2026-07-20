@@ -40,7 +40,9 @@ class TestConvrot64QuantizeShapes:
     longer reliably hitting L2 at that row count, so it is gated off beyond
     K=4096; see int8_linear.cu's launcher docstring)."""
 
-    @pytest.mark.parametrize("k", [256, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096, 6144, 8192])
+    @pytest.mark.parametrize(
+        "k", [256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096, 6144, 8192]
+    )
     @pytest.mark.parametrize("m", [1, 4, 63, 9216])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
     def test_shape_dtype_matrix(self, k, m, dtype):
@@ -49,13 +51,15 @@ class TestConvrot64QuantizeShapes:
         M==1 single-row-GEMV passthrough (untouched by the launch-config
         change), the num_cols in {256, 2560, 6144} special cases (also
         untouched), the right-sized single-pass branch (K in {512, 1024,
-        1536, 2048}), the chunked two-pass branch (K in {3072, 3584, 4096} --
-        3072/256=12 and 3584/256=14 groups are NOT multiples of the chunked
-        kernel's 8-groups-per-chunk width, so these two specifically exercise
-        the partial-last-chunk path where some of the 8 "sub" lanes in the
-        final chunk iteration are masked `active=false`, unlike 4096's exact
-        2-chunks-of-8-groups split), and K=8192 (back to the original
-        always-1024-thread single-pass kernel, byte-identical dispatch to
+        1536, 2048}), the chunked two-pass branch (K in {2304, 3072, 3584,
+        4096} -- 2304/256=9, 3072/256=12, and 3584/256=14 groups are NOT
+        multiples of the chunked kernel's 8-groups-per-chunk width, so these
+        three specifically exercise the partial-last-chunk path where some of
+        the 8 "sub" lanes in the final chunk iteration are masked
+        `active=false` (2304 is the most extreme case: only 1 of 8 lanes
+        active in the second chunk), unlike 4096's exact 2-chunks-of-8-groups
+        split), and K=8192 (back to the original always-1024-thread
+        single-pass kernel, byte-identical dispatch to
         stock -- deliberately NOT chunked, see the class docstring)."""
         torch.manual_seed(m * 100_000 + k)
         x = torch.randn(m, k, device="cuda", dtype=dtype)
@@ -85,7 +89,7 @@ class TestConvrot64QuantizeDeterminism:
     the chunked/original-single-pass boundary at K=4096/4352 (the latter
     tested implicitly via K=4096 vs K=8192 here)."""
 
-    @pytest.mark.parametrize("k", [1024, 2048, 3072, 3584, 4096, 8192])
+    @pytest.mark.parametrize("k", [1024, 2048, 2304, 3072, 3584, 4096, 8192])
     def test_two_calls_bitwise_equal(self, k):
         torch.manual_seed(0)
         x = torch.randn(512, k, device="cuda", dtype=torch.bfloat16)
