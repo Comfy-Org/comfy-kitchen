@@ -89,10 +89,10 @@ extern "C" {
         int64_t freqs_batch,
         int64_t freqs_dim1,
         int64_t freqs_dim2,
-        int64_t stride_x_batch,
-        int64_t stride_x_dim1,
-        int64_t stride_x_dim2,
-        int64_t stride_x_dim,
+        int64_t q_s0, int64_t q_s1, int64_t q_s2, int64_t q_s3,
+        int64_t k_s0, int64_t k_s1, int64_t k_s2, int64_t k_s3,
+        int64_t qo_s0, int64_t qo_s1, int64_t qo_s2, int64_t qo_s3,
+        int64_t ko_s0, int64_t ko_s1, int64_t ko_s2, int64_t ko_s3,
         int64_t stride_freqs_batch,
         int64_t stride_freqs_dim1,
         int64_t stride_freqs_dim2,
@@ -101,6 +101,7 @@ extern "C" {
         int64_t stride_freqs_pair,
         int input_dtype_code,
         int freqs_dtype_code,
+        bool has_k,
         bool split_half,
         cudaStream_t stream);
 
@@ -126,23 +127,15 @@ extern "C" {
         const void* k_scale,
         void* q_out,
         void* k_out,
-        int batch,
-        int heads,
-        int seq_len,
-        int head_dim,
-        int64_t stride_q_batch,
-        int64_t stride_q_head,
-        int64_t stride_q_seq,
-        int64_t stride_k_batch,
-        int64_t stride_k_head,
-        int64_t stride_k_seq,
-        int64_t stride_out_batch,
-        int64_t stride_out_head,
-        int64_t stride_out_seq,
-        int64_t stride_freqs_batch,
-        int64_t stride_freqs_seq,
-        int freqs_batch,
-        int freqs_seq_len,
+        int64_t batch, int64_t dim1, int64_t dim2, int64_t head_dim,
+        int64_t freqs_batch, int64_t freqs_dim1, int64_t freqs_dim2,
+        int64_t q_s0, int64_t q_s1, int64_t q_s2, int64_t q_s3,
+        int64_t k_s0, int64_t k_s1, int64_t k_s2, int64_t k_s3,
+        int64_t qo_s0, int64_t qo_s1, int64_t qo_s2, int64_t qo_s3,
+        int64_t ko_s0, int64_t ko_s1, int64_t ko_s2, int64_t ko_s3,
+        int64_t f_s0, int64_t f_s1, int64_t f_s2, int64_t f_s3,
+        int64_t f_s4, int64_t f_s5, int64_t qs_stride,
+        int64_t ks_stride,
         float epsilon,
         int input_dtype_code,
         int freqs_dtype_code,
@@ -513,20 +506,31 @@ void apply_rope(
     uintptr_t stream_ptr,
     bool split_half = false) {
 
+    if (xq.ndim() != 4 || freqs.ndim() != 6) {
+        throw std::runtime_error("apply_rope requires a 4D input and 6D freqs");
+    }
     // Get xq dimensions: (batch, dim1, dim2, head_dim) - layout agnostic
     int64_t batch = xq.shape(0);
     int64_t dim1 = xq.shape(1);
     int64_t dim2 = xq.shape(2);
     int64_t head_dim = xq.shape(3);
+    if (head_dim == 0 || head_dim % 2 != 0) {
+        throw std::runtime_error(
+            "apply_rope requires a positive, even head dimension");
+    }
 
     // Get freqs dimensions (for broadcasting)
     int64_t freqs_batch = freqs.shape(0);
     int64_t freqs_dim1 = freqs.shape(1);
     int64_t freqs_dim2 = freqs.shape(2);
 
-    // Validate freqs last dimensions
-    if (freqs.shape(3) != head_dim / 2) {
-        throw std::runtime_error("Freqs dimension 3 must be head_dim//2");
+    // Validate broadcast and trailing rotation dimensions.
+    if ((freqs_batch != 1 && freqs_batch != batch) ||
+        (freqs_dim1 != 1 && freqs_dim1 != dim1) ||
+        (freqs_dim2 != 1 && freqs_dim2 != dim2) ||
+        freqs.shape(3) != head_dim / 2 ||
+        freqs.shape(4) != 2 || freqs.shape(5) != 2) {
+        throw std::runtime_error("apply_rope freqs shape is not broadcastable to input");
     }
 
     // Validate xq_out shape matches xq
@@ -546,6 +550,8 @@ void apply_rope(
     
     void* xk_data = nullptr;
     void* xk_out_data = nullptr;
+    int64_t k_s0 = 0, k_s1 = 0, k_s2 = 0, k_s3 = 0;
+    int64_t ko_s0 = 0, ko_s1 = 0, ko_s2 = 0, ko_s3 = 0;
     
     if (has_xk) {
         auto xk = nb::cast<nb::ndarray<nb::device::cuda>>(xk_obj);
@@ -565,28 +571,35 @@ void apply_rope(
         
         xk_data = xk.data();
         xk_out_data = xk_out.data();
+        k_s0 = xk.stride(0); k_s1 = xk.stride(1);
+        k_s2 = xk.stride(2); k_s3 = xk.stride(3);
+        ko_s0 = xk_out.stride(0); ko_s1 = xk_out.stride(1);
+        ko_s2 = xk_out.stride(2); ko_s3 = xk_out.stride(3);
+        if (map_dtype_to_code(xk.dtype()) != map_dtype_to_code(xq.dtype()) ||
+            map_dtype_to_code(xk_out.dtype()) != map_dtype_to_code(xq.dtype())) {
+            throw std::runtime_error("apply_rope inputs and outputs must share dtype");
+        }
     }
 
     // Get input dtype code
     int input_dtype_code = map_dtype_to_code(xq.dtype());
-    if (input_dtype_code < 0) {
-        throw std::runtime_error("Unsupported input dtype for apply_rope");
+    int output_dtype_code = map_dtype_to_code(xq_out.dtype());
+    if ((input_dtype_code != 1 && input_dtype_code != 2) ||
+        output_dtype_code != input_dtype_code) {
+        throw std::runtime_error(
+            "apply_rope inputs and outputs must share an FP16/BF16 dtype");
     }
 
     // Get freqs dtype code
     int freqs_dtype_code = map_dtype_to_code(freqs.dtype());
-    if (freqs_dtype_code < 0) {
-        throw std::runtime_error("Unsupported freqs dtype for apply_rope");
+    if (freqs_dtype_code < 0 || freqs_dtype_code > 2) {
+        throw std::runtime_error(
+            "apply_rope frequencies must be FP32, FP16, or BF16");
     }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
     // Get strides (nanobind provides strides in elements, not bytes)
-    int64_t stride_x_batch = xq.stride(0);
-    int64_t stride_x_dim1 = xq.stride(1);
-    int64_t stride_x_dim2 = xq.stride(2);
-    int64_t stride_x_dim = xq.stride(3);
-
     int64_t stride_freqs_batch = freqs.stride(0);
     int64_t stride_freqs_dim1 = freqs.stride(1);
     int64_t stride_freqs_dim2 = freqs.stride(2);
@@ -608,10 +621,10 @@ void apply_rope(
         freqs_batch,
         freqs_dim1,
         freqs_dim2,
-        stride_x_batch,
-        stride_x_dim1,
-        stride_x_dim2,
-        stride_x_dim,
+        xq.stride(0), xq.stride(1), xq.stride(2), xq.stride(3),
+        k_s0, k_s1, k_s2, k_s3,
+        xq_out.stride(0), xq_out.stride(1), xq_out.stride(2), xq_out.stride(3),
+        ko_s0, ko_s1, ko_s2, ko_s3,
         stride_freqs_batch,
         stride_freqs_dim1,
         stride_freqs_dim2,
@@ -620,6 +633,7 @@ void apply_rope(
         stride_freqs_pair,
         input_dtype_code,
         freqs_dtype_code,
+        has_xk,
         split_half,
         stream
     );
@@ -649,25 +663,20 @@ void rms_rope(nb::ndarray<nb::device::cuda> q, nb::ndarray<nb::device::cuda> k,
   }
 
   const int64_t batch = q.shape(0);
-  const int head_axis = bnhd ? 2 : 1;
-  const int seq_axis = bnhd ? 1 : 2;
-  const int freqs_broadcast_axis = bnhd ? 2 : 1;
-  const int freqs_seq_axis = bnhd ? 1 : 2;
-  const int64_t heads = q.shape(head_axis);
-  const int64_t seq_len = q.shape(seq_axis);
+  const int64_t dim1 = q.shape(1);
+  const int64_t dim2 = q.shape(2);
   const int64_t head_dim = q.shape(3);
   if (head_dim < 32 || head_dim % 32 != 0) {
     throw std::runtime_error(
         "native rms_rope requires head_dim to be a positive multiple of 32");
   }
   if (freqs.ndim() != 6 || (freqs.shape(0) != 1 && freqs.shape(0) != batch) ||
-      freqs.shape(freqs_broadcast_axis) != 1 ||
-      (freqs.shape(freqs_seq_axis) != 1 &&
-       freqs.shape(freqs_seq_axis) != seq_len) ||
+      (freqs.shape(1) != 1 && freqs.shape(1) != dim1) ||
+      (freqs.shape(2) != 1 && freqs.shape(2) != dim2) ||
       freqs.shape(3) != head_dim / 2 || freqs.shape(4) != 2 ||
       freqs.shape(5) != 2) {
     throw std::runtime_error(
-        "rms_rope freqs must broadcast its non-sequence layout axis");
+        "rms_rope freqs shape must broadcast to Q/K");
   }
   if (q_scale.ndim() != 1 || k_scale.ndim() != 1 ||
       q_scale.shape(0) != head_dim || k_scale.shape(0) != head_dim) {
@@ -697,14 +706,15 @@ void rms_rope(nb::ndarray<nb::device::cuda> q, nb::ndarray<nb::device::cuda> k,
 
   launch_rms_rope_kernel(
       q.data(), k.data(), freqs.data(), q_scale.data(), k_scale.data(),
-      q_out.data(), k_out.data(), static_cast<int>(batch),
-      static_cast<int>(heads), static_cast<int>(seq_len),
-      static_cast<int>(head_dim), q.stride(0), q.stride(head_axis),
-      q.stride(seq_axis), k.stride(0), k.stride(head_axis), k.stride(seq_axis),
-      q_out.stride(0), q_out.stride(head_axis), q_out.stride(seq_axis),
-      freqs.stride(0), freqs.stride(freqs_seq_axis),
-      static_cast<int>(freqs.shape(0)),
-      static_cast<int>(freqs.shape(freqs_seq_axis)), epsilon, input_dtype_code,
+      q_out.data(), k_out.data(), batch, dim1, dim2, head_dim,
+      freqs.shape(0), freqs.shape(1), freqs.shape(2),
+      q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+      k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+      q_out.stride(0), q_out.stride(1), q_out.stride(2), q_out.stride(3),
+      k_out.stride(0), k_out.stride(1), k_out.stride(2), k_out.stride(3),
+      freqs.stride(0), freqs.stride(1), freqs.stride(2), freqs.stride(3),
+      freqs.stride(4), freqs.stride(5), q_scale.stride(0),
+      k_scale.stride(0), epsilon, input_dtype_code,
       freqs_dtype_code, scale_dtype_code, true, split_half,
       reinterpret_cast<cudaStream_t>(stream_ptr));
 }
@@ -728,25 +738,20 @@ void rms_rope1(nb::ndarray<nb::device::cuda> q,
   }
 
   const int64_t batch = q.shape(0);
-  const int head_axis = bnhd ? 2 : 1;
-  const int seq_axis = bnhd ? 1 : 2;
-  const int freqs_broadcast_axis = bnhd ? 2 : 1;
-  const int freqs_seq_axis = bnhd ? 1 : 2;
-  const int64_t heads = q.shape(head_axis);
-  const int64_t seq_len = q.shape(seq_axis);
+  const int64_t dim1 = q.shape(1);
+  const int64_t dim2 = q.shape(2);
   const int64_t head_dim = q.shape(3);
   if (head_dim < 32 || head_dim % 32 != 0) {
     throw std::runtime_error(
         "native rms_rope1 requires head_dim to be a positive multiple of 32");
   }
   if (freqs.ndim() != 6 || (freqs.shape(0) != 1 && freqs.shape(0) != batch) ||
-      freqs.shape(freqs_broadcast_axis) != 1 ||
-      (freqs.shape(freqs_seq_axis) != 1 &&
-       freqs.shape(freqs_seq_axis) != seq_len) ||
+      (freqs.shape(1) != 1 && freqs.shape(1) != dim1) ||
+      (freqs.shape(2) != 1 && freqs.shape(2) != dim2) ||
       freqs.shape(3) != head_dim / 2 || freqs.shape(4) != 2 ||
       freqs.shape(5) != 2) {
     throw std::runtime_error(
-        "rms_rope1 freqs must broadcast its non-sequence layout axis");
+        "rms_rope1 freqs shape must broadcast to input");
   }
   if (q_scale.ndim() != 1 || q_scale.shape(0) != head_dim) {
     throw std::runtime_error(
@@ -769,12 +774,15 @@ void rms_rope1(nb::ndarray<nb::device::cuda> q,
 
   launch_rms_rope_kernel(
       q.data(), nullptr, freqs.data(), q_scale.data(), nullptr, q_out.data(),
-      nullptr, static_cast<int>(batch), static_cast<int>(heads),
-      static_cast<int>(seq_len), static_cast<int>(head_dim), q.stride(0),
-      q.stride(head_axis), q.stride(seq_axis), 0, 0, 0, q_out.stride(0),
-      q_out.stride(head_axis), q_out.stride(seq_axis), freqs.stride(0),
-      freqs.stride(freqs_seq_axis), static_cast<int>(freqs.shape(0)),
-      static_cast<int>(freqs.shape(freqs_seq_axis)), epsilon, input_dtype_code,
+      nullptr, batch, dim1, dim2, head_dim,
+      freqs.shape(0), freqs.shape(1), freqs.shape(2),
+      q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+      0, 0, 0, 0,
+      q_out.stride(0), q_out.stride(1), q_out.stride(2), q_out.stride(3),
+      0, 0, 0, 0,
+      freqs.stride(0), freqs.stride(1), freqs.stride(2), freqs.stride(3),
+      freqs.stride(4), freqs.stride(5), q_scale.stride(0), 0,
+      epsilon, input_dtype_code,
       freqs_dtype_code, scale_dtype_code, false, split_half,
       reinterpret_cast<cudaStream_t>(stream_ptr));
 }
