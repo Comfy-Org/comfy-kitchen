@@ -9,7 +9,7 @@ from comfy_kitchen.tensor import (
     TensorWiseINT8Layout,
 )
 
-from .conftest import assert_values_close
+from .conftest import assert_values_close, cuda_extension_runtime_available
 
 
 class DummyQuantizedModel(torch.nn.Module):
@@ -62,7 +62,7 @@ LAYOUT_CONFIGS = [
 ]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not cuda_extension_runtime_available(), reason="CUDA extension backend required")
 class TestQuantizedCUDAGraph:
     """Tests for CUDA graph capture with quantized models."""
 
@@ -168,7 +168,7 @@ class TestQuantizedCUDAGraph:
         assert not torch.allclose(output1, output2, rtol=1e-5, atol=1e-5), "Outputs should differ with different inputs"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not cuda_extension_runtime_available(), reason="CUDA extension backend required")
 class TestQuantizedCompile:
     """Tests for torch.compile with quantized models."""
 

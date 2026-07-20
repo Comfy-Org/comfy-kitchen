@@ -60,33 +60,40 @@ __all__ = [
     "stochastic_rounding_fp8",
 ]
 
+_CUDA_PYTORCH_REQUIRED_REASON = "CUDA backend requires a CUDA-enabled PyTorch build"
+
+if getattr(torch.version, "cuda", None) is None:
+    _RUNTIME_UNAVAILABLE_REASON = _CUDA_PYTORCH_REQUIRED_REASON
+else:
+    _RUNTIME_UNAVAILABLE_REASON = None
 
 _dll_handle = None
 try:
-    try:
-        import nvidia.cu13
-        nvidia_cu13_path = nvidia.cu13.__path__[0]
-    except Exception:
-        nvidia_cu13_path = torch.__path__[0]
+    if _RUNTIME_UNAVAILABLE_REASON is None:
+        try:
+            import nvidia.cu13
+            nvidia_cu13_path = nvidia.cu13.__path__[0]
+        except Exception:
+            nvidia_cu13_path = torch.__path__[0]
 
-    def find_lib_dir(start_dir, lib_pattern):
-        for root, _dirs, files in os.walk(start_dir):
-            for file in files:
-                if lib_pattern in file:
-                    return root
-        return None
+        def find_lib_dir(start_dir, lib_pattern):
+            for root, _dirs, files in os.walk(start_dir):
+                for file in files:
+                    if lib_pattern in file:
+                        return root
+            return None
 
-    if sys.platform == "win32":
-        lib_dir = find_lib_dir(nvidia_cu13_path, "cublasLt64")
-        if lib_dir:
-            _dll_handle = os.add_dll_directory(lib_dir)
-    else:
-        lib_dir = find_lib_dir(nvidia_cu13_path, "libcublasLt.so")
-        if lib_dir:
-            for filename in os.listdir(lib_dir):
-                if "cublasLt" in filename and ".so" in filename:
-                    with contextlib.suppress(Exception):
-                        ctypes.CDLL(os.path.join(lib_dir, filename), mode=ctypes.RTLD_GLOBAL)
+        if sys.platform == "win32":
+            lib_dir = find_lib_dir(nvidia_cu13_path, "cublasLt64")
+            if lib_dir:
+                _dll_handle = os.add_dll_directory(lib_dir)
+        else:
+            lib_dir = find_lib_dir(nvidia_cu13_path, "libcublasLt.so")
+            if lib_dir:
+                for filename in os.listdir(lib_dir):
+                    if "cublasLt" in filename and ".so" in filename:
+                        with contextlib.suppress(Exception):
+                            ctypes.CDLL(os.path.join(lib_dir, filename), mode=ctypes.RTLD_GLOBAL)
 except Exception:
     pass  # nvidia.cu13 not installed or path doesn't exist
 
@@ -94,31 +101,40 @@ except Exception:
 # Load _C extension using importlib to avoid circular import issues on Windows
 try:
     _C = None  # type: ignore
-    _module_path = os.path.join(os.path.dirname(__file__), "_C.abi3.pyd" if sys.platform == "win32" else "_C.abi3.so")
+    if _RUNTIME_UNAVAILABLE_REASON is not None:
+        _EXT_AVAILABLE = False
+        _EXT_ERROR = _RUNTIME_UNAVAILABLE_REASON
+    else:
+        _module_path = os.path.join(os.path.dirname(__file__), "_C.abi3.pyd" if sys.platform == "win32" else "_C.abi3.so")
 
-    if not os.path.exists(_module_path):
-        ext = '.pyd' if sys.platform == 'win32' else '.so'
-        directory = os.path.dirname(__file__)
-        for filename in os.listdir(directory):
-            if filename.startswith('_C.') and filename.endswith(ext):
-                _module_path = os.path.join(directory, filename)
+        if not os.path.exists(_module_path):
+            ext = '.pyd' if sys.platform == 'win32' else '.so'
+            directory = os.path.dirname(__file__)
+            for filename in os.listdir(directory):
+                if filename.startswith('_C.') and filename.endswith(ext):
+                    _module_path = os.path.join(directory, filename)
 
-    if os.path.exists(_module_path):
-        _spec = importlib.util.spec_from_file_location(
-            "comfy_kitchen.backends.cuda._C", _module_path
-        )
-        if _spec and _spec.loader:
-            _C = importlib.util.module_from_spec(_spec)
-            sys.modules["comfy_kitchen.backends.cuda._C"] = _C
-            _spec.loader.exec_module(_C)
-            _EXT_AVAILABLE = True
-            _EXT_ERROR = None
+        if os.path.exists(_module_path):
+            _spec = importlib.util.spec_from_file_location(
+                "comfy_kitchen.backends.cuda._C", _module_path
+            )
+            if _spec and _spec.loader:
+                _C = importlib.util.module_from_spec(_spec)
+                sys.modules["comfy_kitchen.backends.cuda._C"] = _C
+                try:
+                    _spec.loader.exec_module(_C)
+                except Exception:
+                    _C = None  # type: ignore
+                    sys.modules.pop("comfy_kitchen.backends.cuda._C", None)
+                    raise
+                _EXT_AVAILABLE = True
+                _EXT_ERROR = None
+            else:
+                _EXT_AVAILABLE = False
+                _EXT_ERROR = f"Could not create module spec for {_module_path}"
         else:
             _EXT_AVAILABLE = False
-            _EXT_ERROR = f"Could not create module spec for {_module_path}"
-    else:
-        _EXT_AVAILABLE = False
-        _EXT_ERROR = f"Extension file not found: {_module_path}"
+            _EXT_ERROR = f"Extension file not found: {_module_path}"
 except ImportError as e:
     _EXT_AVAILABLE = False
     _EXT_ERROR = str(e)
@@ -3023,14 +3039,25 @@ def _build_constraints() -> dict:
     return constraints
 
 
+def _cuda_backend_unavailable_reason() -> str | None:
+    if getattr(torch.version, "cuda", None) is None:
+        return _CUDA_PYTORCH_REQUIRED_REASON
+
+    if not torch.cuda.is_available():
+        return "CUDA not available on this system"
+
+    return None
+
+
 def _register():
     """Register CUDA backend with the global registry."""
     if not _EXT_AVAILABLE:
         registry.mark_unavailable("cuda", _EXT_ERROR)
         return
 
-    if not torch.cuda.is_available():
-        registry.mark_unavailable("cuda", "CUDA not available on this system")
+    unavailable_reason = _cuda_backend_unavailable_reason()
+    if unavailable_reason is not None:
+        registry.mark_unavailable("cuda", unavailable_reason)
         return
 
     registry.register(

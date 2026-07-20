@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for INT8 block-wise quantization."""
 
+import builtins
+import sys
+import types
+
 import pytest
 import torch
 
@@ -12,6 +16,7 @@ from comfy_kitchen.tensor import TensorWiseINT8Layout
 from .conftest import (
     assert_values_close,
     get_capable_backends,
+    skip_without_cuda_extension,
 )
 
 COMFYUI_NVIDIA_16_SERIES = (
@@ -28,7 +33,6 @@ COMFYUI_NVIDIA_16_SERIES = (
     "T1000",
     "T1200",
 )
-
 
 def test_cuda_int8_cublas_turing_n_alignment(monkeypatch):
     """CUDA cuBLAS fallback pads Turing skinny N to 32."""
@@ -129,10 +133,130 @@ def test_eager_int8_matmul_turing_n_alignment(monkeypatch):
     assert calls == [0]
 
 
+@pytest.mark.parametrize(
+    ("convrot", "is_cuda", "hip_version", "expected"),
+    [
+        (True, True, "7.2.0", True),
+        (False, True, "7.2.0", False),
+        (True, False, "7.2.0", False),
+        (True, True, None, False),
+    ],
+)
+def test_eager_int8_convrot_rocm_fast_path_detection(
+    convrot,
+    is_cuda,
+    hip_version,
+    expected,
+    monkeypatch,
+):
+    from comfy_kitchen.backends.eager import quantization
+
+    class FakeTensor:
+        def __init__(self, is_cuda):
+            self.is_cuda = is_cuda
+
+    monkeypatch.setattr(torch.version, "hip", hip_version, raising=False)
+
+    assert quantization._should_use_triton_int8_convrot_on_rocm(FakeTensor(is_cuda), convrot) is expected
+
+
+def test_eager_int8_convrot_rocm_fast_path_forwards_normalized_args(monkeypatch):
+    from comfy_kitchen.backends.eager import quantization
+
+    sentinel = torch.empty(0)
+    calls = {}
+    fake_module = types.ModuleType("comfy_kitchen.backends.triton.quantization")
+
+    def fake_triton_int8_linear(
+        x,
+        weight,
+        weight_scale,
+        *,
+        bias,
+        out_dtype,
+        convrot,
+        convrot_groupsize,
+    ):
+        calls.update(
+            x=x,
+            weight=weight,
+            weight_scale=weight_scale,
+            bias=bias,
+            out_dtype=out_dtype,
+            convrot=convrot,
+            convrot_groupsize=convrot_groupsize,
+        )
+        return sentinel
+
+    fake_module.int8_linear = fake_triton_int8_linear
+    monkeypatch.setitem(sys.modules, "comfy_kitchen.backends.triton.quantization", fake_module)
+    monkeypatch.setattr(quantization, "_should_use_triton_int8_convrot_on_rocm", lambda _x, _convrot: True)
+
+    x = torch.randn(2, 4)
+    weight = torch.randint(-4, 4, (4, 3), dtype=torch.int8).t()
+    weight_scale = torch.ones(3, 1, dtype=torch.float16)
+    bias = torch.randn(3)
+
+    result = quantization.int8_linear(
+        x,
+        weight,
+        weight_scale,
+        bias=bias,
+        out_dtype=torch.float32,
+        convrot=True,
+        convrot_groupsize=4,
+    )
+
+    assert result is sentinel
+    assert calls["x"] is x
+    assert calls["weight"].is_contiguous()
+    assert calls["weight"].device == x.device
+    assert calls["weight_scale"].shape == (3,)
+    assert calls["weight_scale"].dtype == torch.float32
+    assert calls["weight_scale"].device == x.device
+    assert calls["bias"] is bias
+    assert calls["out_dtype"] == torch.float32
+    assert calls["convrot"] is True
+    assert calls["convrot_groupsize"] == 4
+
+
+def test_eager_int8_convrot_rocm_fast_path_import_error_falls_back(monkeypatch):
+    from comfy_kitchen.backends.eager import quantization
+
+    real_import = builtins.__import__
+    import_attempted = False
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        nonlocal import_attempted
+        if name == "comfy_kitchen.backends.triton.quantization" and "int8_linear" in fromlist:
+            import_attempted = True
+            raise ImportError("forced missing triton int8_linear")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(quantization, "_should_use_triton_int8_convrot_on_rocm", lambda _x, _convrot: True)
+
+    x = torch.randn(2, 4)
+    weight = torch.randint(-4, 4, (3, 4), dtype=torch.int8)
+    weight_scale = torch.ones(1, dtype=torch.float32)
+
+    result = quantization.int8_linear(
+        x,
+        weight,
+        weight_scale,
+        out_dtype=torch.float32,
+        convrot=True,
+        convrot_groupsize=4,
+    )
+
+    assert import_attempted
+    assert result.shape == (2, 3)
+    assert result.dtype == torch.float32
+
+
 def test_cuda_int8_linear_does_not_retain_scratch_tensors():
     """CUDA INT8 linear uses per-call temporaries instead of retained scratch caches."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
+    skip_without_cuda_extension()
 
     x = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
     weight = torch.randint(-128, 127, (64, 128), device="cuda", dtype=torch.int8)
@@ -166,8 +290,7 @@ def test_turing_int8_fused_gemm_matches_reference(
     with_bias,
     scalar_weight_scale,
 ):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
+    skip_without_cuda_extension()
     if not hasattr(cuda._C, "cutlass_turing_int8_dequant"):
         pytest.skip("CUDA extension was built without the Turing INT8 kernel")
 
@@ -201,8 +324,7 @@ def test_turing_int8_fused_gemm_matches_reference(
 
 
 def test_int8_linear_routes_turing_to_fused_kernel(seed, monkeypatch):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
+    skip_without_cuda_extension()
     if not hasattr(cuda._C, "cutlass_turing_int8_dequant"):
         pytest.skip("CUDA extension was built without the Turing INT8 kernel")
 
@@ -248,8 +370,7 @@ def test_eager_int8_stochastic_rounding_tensorwise(seed):
 
 def test_cuda_int8_stochastic_rounding_seeded(seed):
     """CUDA stochastic INT8 rounding is seeded and unbiased."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
+    skip_without_cuda_extension()
 
     x = torch.full((4096,), 0.5, device="cuda", dtype=torch.float16)
     x[0] = 127.0
@@ -484,6 +605,8 @@ class TestTensorWiseINT8Layout:
         import comfy_kitchen as ck
         from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
 
+        skip_without_cuda_extension()
+
         x = torch.randn(1, 512, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(384, 512, device="cuda", dtype=torch.bfloat16)
         bias = torch.randn(384, device="cuda", dtype=torch.bfloat16)
@@ -555,6 +678,8 @@ class TestTensorWiseINT8Layout:
     def test_dequantize_direct_output_dtype_matches_final_cast(self, seed):
         """Direct fp16/bf16 dequant output matches the prior float32-then-cast behavior."""
         import comfy_kitchen as ck
+
+        skip_without_cuda_extension()
 
         x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
 
@@ -646,6 +771,8 @@ class TestTensorWiseINT8Layout:
         from comfy_kitchen.backends import cuda as cuda_backend
         from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_weight
 
+        skip_without_cuda_extension()
+
         w = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
         h = _build_hadamard(256, device=w.device, dtype=w.dtype)
 
@@ -676,6 +803,8 @@ class TestTensorWiseINT8Layout:
 
     def test_convrot_int8_supports_65536_rows(self):
         """INT8 and INT4 kernels put large row counts in CUDA's grid.x dimension."""
+        skip_without_cuda_extension()
+
         rows, cols = 1 << 16, 256
         row = torch.linspace(-1.0, 1.0, cols, device="cuda", dtype=torch.bfloat16)
         weight = row.expand(rows, cols).contiguous()

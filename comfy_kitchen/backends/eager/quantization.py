@@ -40,6 +40,11 @@ DTYPE_CODE_TO_DTYPE = {
 
 DTYPE_TO_CODE = {v: k for k, v in DTYPE_CODE_TO_DTYPE.items()}
 
+
+def _should_use_triton_int8_convrot_on_rocm(x: torch.Tensor, convrot: bool) -> bool:
+    return bool(convrot and x.is_cuda and getattr(torch.version, "hip", None) is not None)
+
+
 def quantize_per_tensor_fp8(
     x: torch.Tensor, scale: torch.Tensor, output_type: torch.dtype = torch.float8_e4m3fn
 ) -> torch.Tensor:
@@ -975,11 +980,28 @@ def int8_linear(
             f"for weight shape {tuple(weight.shape)}"
         )
 
-    if convrot:
-        if x.shape[-1] % convrot_groupsize != 0:
-            raise ValueError(
-                f"ConvRot group size {convrot_groupsize} does not divide input features {x.shape[-1]}"
+    if convrot and x.shape[-1] % convrot_groupsize != 0:
+        raise ValueError(
+            f"ConvRot group size {convrot_groupsize} does not divide input features {x.shape[-1]}"
+        )
+
+    if _should_use_triton_int8_convrot_on_rocm(x, convrot):
+        try:
+            from comfy_kitchen.backends.triton.quantization import int8_linear as triton_int8_linear
+        except ImportError:
+            pass
+        else:
+            return triton_int8_linear(
+                x,
+                weight,
+                weight_scale,
+                bias=bias,
+                out_dtype=out_dtype,
+                convrot=convrot,
+                convrot_groupsize=convrot_groupsize,
             )
+
+    if convrot:
         h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
         x = _rotate_activation(x, h, convrot_groupsize)
 

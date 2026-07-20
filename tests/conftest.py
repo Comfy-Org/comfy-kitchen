@@ -28,6 +28,26 @@ def device(cuda_available):
     return "cuda" if cuda_available else "cpu"
 
 
+def cuda_extension_available() -> bool:
+    from comfy_kitchen.backends import cuda as cuda_backend
+
+    return getattr(cuda_backend, "_EXT_AVAILABLE", False) and getattr(cuda_backend, "_C", None) is not None
+
+
+def cuda_extension_runtime_available() -> bool:
+    return torch.cuda.is_available() and cuda_extension_available()
+
+
+def skip_without_cuda_extension():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    from comfy_kitchen.backends import cuda as cuda_backend
+
+    if not cuda_extension_available():
+        pytest.skip(f"CUDA extension backend unavailable: {cuda_backend._EXT_ERROR}")
+
+
 @pytest.fixture
 def small_tensor(cuda_available):
     device = "cuda" if cuda_available else "cpu"
