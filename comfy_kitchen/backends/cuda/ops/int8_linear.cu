@@ -989,16 +989,9 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     }
 }
 
-// Final-stage (S=64) H4 butterfly fused directly with quantize-and-store, used by
-// the chunked kernel below in place of convrot_fht_stage64_store_absmax: since
-// pass 2 already knows the row's final scale, there is no need to stage the
-// rotated fp32 value through any buffer (row_buf or otherwise) before
-// quantizing it -- computing y0..y3 and immediately running them through the
-// exact same triple-roundtrip-through-InputType divide + round + clamp
-// sequence as the per-column loop above (same operations, same order) and
-// writing straight to the int8 output is bitwise identical to
-// rotate-then-buffer-then-quantize, just without the redundant store/load
-// (the buffer being skipped was already fp32 with no precision effect).
+// Final-stage (S=64) H4 butterfly fused directly with quantize-and-store, so
+// the chunked kernel's pass 2 never stages the rotated value through a
+// buffer -- same divide/round/clamp sequence as the per-column loop above.
 template<int S, typename InputType, bool STOCHASTIC>
 __device__ __forceinline__ void convrot_fht_stage64_quantize(
     const float* __restrict__ src,
@@ -1037,21 +1030,10 @@ __device__ __forceinline__ void convrot_fht_stage64_quantize(
     }
 }
 
-// Shared by both passes of quantize_int8_rowwise_convrot64_chunked_kernel
-// below: load one group-of-4 from global memory (or zero-fill if `active` is
-// false -- the group is past the row's actual group count, e.g. the partial
-// final chunk of a K not evenly divisible by the chunk width) and run the
-// first three FHT stages (S=1 inline, then S=4 and S=16 via
-// convrot_fht_stage64) on it, leaving the post-stage-2 values in buf1. Pass 1
-// and pass 2 previously duplicated this exact sequence verbatim; extracted
-// here so they cannot drift apart -- pass 2's bitwise reproduction of pass
-// 1's rotated values (the determinism this kernel's two-pass design depends
-// on) now holds by construction, not by two hand-kept-in-sync copies. Callers
-// still apply their own final S=64 stage afterward (store_absmax for pass 1,
-// fused quantize for pass 2) since that step differs between the passes.
-// Called uniformly by every thread in the block (the `active` flag only
-// gates whether x0..x3 come from memory or are zero-filled, not whether this
-// function itself is called), so the __syncthreads() calls inside are safe.
+// Shared by both passes of the chunked kernel below: load one group-of-4
+// (zero-filled if `active` is false, e.g. a partial final chunk) and run the
+// first three FHT stages, leaving the result in buf1. Extracted so pass 1 and
+// pass 2 cannot drift apart -- their bitwise agreement is now by construction.
 template<typename InputType>
 __device__ __forceinline__ void convrot_load_rotate_group(
     const InputType* __restrict__ x,
@@ -1082,46 +1064,14 @@ __device__ __forceinline__ void convrot_load_rotate_group(
 }
 
 // Chunked two-pass variant of quantize_int8_rowwise_convrot64_kernel, used for
-// 2048 < K <= 4096 (see launch_quantize_int8_rowwise_convrot64_kernel's generic
-// branch -- K > 4096 deliberately does NOT use this kernel, see below) to
-// remove the single-pass kernel's full-row shared-memory buffer (row_buf, K
-// floats) -- at K=4096 that buffer alone is 16KB, and combined with the
-// BLOCK_THREADS-independent-of-K launch it used to force, occupancy was
-// limited to roughly one block per SM. This kernel's shared-memory footprint
-// is bounded by BLOCK_THREADS alone (kGroupsInFlight * 2 * 256 floats -- 16KB
-// at BLOCK_THREADS=512), independent of K, by processing the row in
-// "chunks" of BLOCK_THREADS/64 groups (2048 elements at BLOCK_THREADS=512) and
-// never materializing more than one chunk's rotated values at a time:
-//   pass 1: for each chunk, rotate (identical 4-stage H4 butterfly, byte-for-
-//           byte the same math as the single-pass kernel) and fold its local
-//           max into the row's running abs_max (fmaxf-from-a-finite-0.0-seed,
-//           per group, exactly as the single-pass kernel's own loop already
-//           does -- NaN-safe for the same reason: an entire NaN group never
-//           corrupts a live finite accumulator), then discard the rotated
-//           values (the "store" target is scratch, immediately overwritten by
-//           the next chunk).
-//   pass 2: for each chunk again, RE-load from global (the same lines this
-//           block just read in pass 1, hopefully still L2-resident -- see the
-//           K>4096 caveat below) and RE-rotate -- deterministic fp32 math, so
-//           this reproduces pass 1's per-element rotated values exactly --
-//           then quantize using the now-final scale and store, via
-//           convrot_fht_stage64_quantize above (fusing the last butterfly
-//           stage with the quantize step so there is still no intermediate
-//           buffer in pass 2 either).
-// The recompute in pass 2 is deliberate: it roughly doubles the rotation's
-// arithmetic (already the cheaper side of this kernel's roofline -- see the
-// PR description) in exchange for cutting shared-memory pressure, which is
-// what actually gates how many blocks fit per SM.
-//
-// NOT used beyond K=4096: measured at K=8192 with M=9216 (this kernel's
-// motivating real-world shape) on an RTX 3090, this kernel is a reproducible
-// ~8% *regression* vs the old always-1024-thread single-pass kernel. With
-// 9216 blocks in flight, pass 2's re-read no longer reliably hits L2 -- the
-// resident-rows working set exceeds the card's 6MB L2 at that row count and
-// row width -- so the "recompute instead of buffer" trade that wins at
-// K<=4096 becomes a genuine second DRAM read at K=8192, which is not worth
-// the occupancy gain. See launch_quantize_int8_rowwise_convrot64_kernel's
-// K>4096 branch, which keeps using the original single-pass kernel unchanged.
+// 2048 < K <= 4096. Shared memory is bounded by BLOCK_THREADS alone
+// (kGroupsInFlight * 2 * 256 floats, independent of K) by processing the row
+// in chunks and never materializing more than one chunk's rotated values:
+// pass 1 rotates each chunk and folds its max into abs_max, discarding the
+// values; pass 2 re-loads and re-rotates (deterministic fp32 math, so this
+// reproduces pass 1 exactly) and quantizes with the final scale. Not used
+// beyond K=4096: at K=8192/M=9216 the re-read in pass 2 stops hitting L2 and
+// this kernel regresses ~8% vs the single-pass kernel (see PR description).
 template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC>
 __global__ void quantize_int8_rowwise_convrot64_chunked_kernel(
     const InputType* __restrict__ x,
@@ -1162,9 +1112,9 @@ __global__ void quantize_int8_rowwise_convrot64_chunked_kernel(
         convrot_load_rotate_group<InputType>(x, row_offset, group_col, base, active, buf0, buf1, lane);
 
         if (active) {
-            // Discard target: buf0 is dead (already consumed above) and gets
-            // overwritten again next iteration -- only the returned local max
-            // is used.
+            // buf0 is scratch here (dead value, reused next iteration).
+            // fmaxf ignores NaN against a finite abs_max, so an all-NaN
+            // group (huge-magnitude row) can't corrupt the running max.
             abs_max = fmaxf(
                 abs_max,
                 convrot_fht_stage64_store_absmax<64, float>(buf1, buf0, lane));
@@ -1570,24 +1520,10 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                        block_threads_6144);
             }
         } else if (num_cols <= 2048) {
-            // Right-sized launch: threads = min(1024, (K/256)*64), realized
-            // below as an explicit switch over n_groups (2..8) rather than a
-            // literal min() -- for K in this branch (a multiple of 256, > 256,
-            // <= 2048, and not one of the other special-cased widths above)
-            // (K/256)*64 always lands at or under 512, so the min(1024, ...)
-            // never actually clamps for any K reaching this switch. That min()
-            // is NOT what the branches below this one use, despite the
-            // similar-looking numbers: the 2048 < K <= 4096 branch launches
-            // the chunked kernel at a hardcoded 512 threads (independent of
-            // K, by construction -- see that kernel's docstring), and the
-            // K > 4096 branch launches the original single-pass kernel at a
-            // hardcoded 1024 threads unconditionally (matching stock's prior
-            // behavior verbatim, not derived from this formula, even though
-            // it happens to equal what the formula would produce there).
-            // Was previously ALWAYS 1024 threads regardless of K (e.g. 768 of
-            // 1024 threads sit idle every iteration at K=1024, since only
-            // (K/256)*64 = 256 of them ever have `active` true) -- see the PR
-            // description for the roofline analysis this fixes.
+            // Right-sized launch: threads = min(1024, (K/256)*64) via the
+            // switch below (always <= 512 here, so the min never clamps).
+            // The chunked and K>4096 branches below use their own hardcoded
+            // thread counts, not this formula.
             const int n_groups = static_cast<int>(num_cols / comfy::kConvRotGroup);
             switch (n_groups) {
                 case 2:  // K=512
@@ -1622,24 +1558,10 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                     break;
             }
         } else if (num_cols <= 4096) {
-            // 2048 < K <= 4096: chunked two-pass kernel, fixed at 512 threads
-            // (CHUNK = (512/64)*256 = 2048 elements/iteration).
-            //
-            // Gated to K <= 4096, NOT "K > 2048" unconditionally: measured at
-            // K=8192 (M=9216, RTX 3090) this kernel is a reproducible ~8%
-            // *regression* vs the old always-1024-thread single-pass kernel,
-            // not the win the occupancy math predicts. Root cause: with 9216
-            // blocks in flight, pass 2's re-read of global memory (deliberately
-            // redundant with pass 1 -- see the kernel's docstring) no longer
-            // reliably hits L2 at that row count -- the resident-rows working
-            // set exceeds the RTX 3090's 6MB L2 -- so at K=8192 the "recompute
-            // instead of buffer" trade becomes a genuine second DRAM read
-            // instead of an L2-served one, which is not worth the occupancy
-            // gain. At K<=4096 the smaller per-row footprint keeps enough of
-            // the working set L2-resident for pass 2 to still win. See the PR
-            // description for the measured numbers at both sizes. Lifting this
-            // cap (e.g. occupancy/L2-aware chunk sizing that adapts to M, not
-            // just K) is noted there as future work, not attempted here.
+            // Chunked two-pass kernel, fixed at 512 threads. Gated to K<=4096
+            // (not all K>2048): at K=8192/M=9216, pass 2's re-read stops
+            // hitting L2 and this kernel regresses ~8% vs the single-pass
+            // kernel below -- see the PR description.
             constexpr int block_threads_chunked = 512;
             if (stochastic) {
                 launch_chunked(comfy::quantize_int8_rowwise_convrot64_chunked_kernel<InputType, block_threads_chunked, true>,
@@ -1649,14 +1571,8 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                                 block_threads_chunked);
             }
         } else {
-            // K > 4096: EXISTING full-row generic path, UNCHANGED -- same
-            // kernel, same fixed 1024-thread launch, same `launch` lambda (with
-            // its num_cols-dependent smem formula) stock already used for every
-            // K in this else-branch before this PR. Verified byte-identical
-            // dispatch to stock for these K (same template instantiation, same
-            // block_threads, same smem_bytes computation) -- this branch exists
-            // only so the right-sized (<=2048) and chunked (<=4096) branches
-            // above don't have to special-case "was this K already covered".
+            // K > 4096: unchanged from stock -- same kernel, same fixed
+            // 1024-thread launch.
             constexpr int block_threads_multi = 1024;
             if (stochastic) {
                 launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_multi, true>,
