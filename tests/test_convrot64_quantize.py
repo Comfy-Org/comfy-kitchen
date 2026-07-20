@@ -23,7 +23,7 @@ class TestConvrot64QuantizeShapes:
     """Shape/dtype coverage across the launcher's special cases and branches."""
 
     @pytest.mark.parametrize(
-        "k", [256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096, 6144, 8192]
+        "k", [256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 3072, 3584, 4096, 6144, 8192]
     )
     @pytest.mark.parametrize("m", [1, 4, 63, 9216])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -52,7 +52,7 @@ class TestConvrot64QuantizeShapes:
 class TestConvrot64QuantizeDeterminism:
     """Non-stochastic quantize is a pure function -- two calls must match bitwise."""
 
-    @pytest.mark.parametrize("k", [1024, 2048, 2304, 3072, 3584, 4096, 8192])
+    @pytest.mark.parametrize("k", [768, 1024, 1280, 1792, 2048, 2304, 3072, 3584, 4096, 8192])
     def test_two_calls_bitwise_equal(self, k):
         torch.manual_seed(0)
         x = torch.randn(512, k, device="cuda", dtype=torch.bfloat16)
@@ -62,6 +62,25 @@ class TestConvrot64QuantizeDeterminism:
 
         assert torch.equal(q1, q2)
         assert torch.equal(s1, s2)
+
+
+class TestConvrot64QuantizeStochasticRounding:
+    """Stochastic path (seeded) must be deterministic and produce valid output."""
+
+    @pytest.mark.parametrize("k", [768, 1024, 1280, 1792, 2048, 3072])
+    def test_seeded_calls_bitwise_equal_and_valid(self, k):
+        torch.manual_seed(0)
+        x = torch.randn(512, k, device="cuda", dtype=torch.bfloat16)
+
+        q1, s1 = cuda.quantize_int8_rowwise_convrot64(x, GROUP_SIZE, stochastic_rounding=424242)
+        q2, s2 = cuda.quantize_int8_rowwise_convrot64(x, GROUP_SIZE, stochastic_rounding=424242)
+
+        assert torch.equal(q1, q2)
+        assert torch.equal(s1, s2)
+        assert q1.min() >= -128
+        assert q1.max() <= 127
+        assert torch.isfinite(s1).all()
+        assert (s1 > 0).all()
 
 
 class TestConvrot64QuantizeScaleFloor:
