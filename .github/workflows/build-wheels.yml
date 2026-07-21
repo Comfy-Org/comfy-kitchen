@@ -488,9 +488,335 @@ jobs:
           # Tests requiring CUDA will be skipped on CPU-only runners
           python -m pytest tests/ -v --tb=short
 
+  # Windows on ARM CUDA wheels via CUDA Toolkit 13.4 developer preview
+  # (https://packages.nvidia.com/prerelease/cuda/13.4.0/...).
+  # WoA ships only the Stable ABI (cp312-abi3) wheel — no 3.10/3.11 builds.
+  build_wheels_windows_arm:
+    name: Build Windows ARM abi3 wheel
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-windows-arm64-cuda13.4-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'third_party/cutlass/.git') }}
+          restore-keys: |
+            ccache-windows-arm64-cuda13.4-
+
+      - name: Install compiler cache
+        shell: pwsh
+        run: choco install ccache --no-progress --yes
+
+      - name: Cache CUDA 13.4 WoA installer
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cuda_installer
+          key: cuda-13.4.0-windows-arm64-local-installer
+
+      - name: Download CUDA Toolkit 13.4 (Windows ARM64)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "cuda_installer"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $installer = Join-Path $dir "cuda_13.4.0_windows_arm64.exe"
+          if ((Test-Path $installer) -and (Get-Item $installer).Length -lt 3GB) {
+            Write-Warning "Discarding incomplete cached CUDA installer"
+            Remove-Item $installer -Force
+          }
+          if (-not (Test-Path $installer)) {
+            $uri = "https://packages.nvidia.com/prerelease/cuda/13.4.0/local_installers/cuda_13.4.0_windows_arm64.exe"
+            $partial = "$installer.part"
+            Write-Host "Downloading $uri"
+            curl.exe `
+              --fail `
+              --location `
+              --retry 5 `
+              --retry-all-errors `
+              --retry-delay 10 `
+              --continue-at - `
+              --output $partial `
+              $uri
+            if ($LASTEXITCODE -ne 0) {
+              throw "CUDA installer download failed with curl exit code $LASTEXITCODE"
+            }
+            Move-Item -Path $partial -Destination $installer
+          }
+          Get-Item $installer | Format-List FullName, Length
+
+      - name: Install CUDA Toolkit 13.4
+        id: install-cuda
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $installer = Join-Path $env:RUNNER_TEMP "cuda_installer\cuda_13.4.0_windows_arm64.exe"
+          $logDir = Join-Path $env:RUNNER_TEMP "cuda_install_logs"
+          $diagDir = Join-Path $env:RUNNER_TEMP "woa_cuda_diagnostics"
+          New-Item -ItemType Directory -Force -Path $logDir, $diagDir | Out-Null
+
+          Write-Host "=== Runner diagnostics ==="
+          Write-Host "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE"
+          Write-Host "PROCESSOR_IDENTIFIER=$env:PROCESSOR_IDENTIFIER"
+          [System.Environment]::OSVersion | Format-List | Out-String | Write-Host
+          Write-Host "Installer: $installer"
+          Write-Host "Log dir: $logDir"
+
+          # Minimal compile-time packages (mirrors Linux CI). -n skips reboot.
+          # -log / -loglevel:6 writes verbose NVIDIA installer logs for first-run debugging.
+          $packages = @(
+            "nvcc_13.4",
+            "cudart_13.4",
+            "crt_13.4",
+            "cublas_13.4",
+            "cublas_dev_13.4",
+            "nvjitlink_13.4",
+            "nvvm_13.4",
+            "thrust_13.4",
+            "visual_studio_integration_13.4"
+          )
+          # Pass -log as a single argv token; path has no spaces on GHA runners.
+          $installArgs = @("-s", "-n", "-log:$logDir", "-loglevel:6") + $packages
+          Write-Host "Installing CUDA packages: $($packages -join ', ')"
+          Write-Host "Command: $installer $($installArgs -join ' ')"
+          # The CUDA executable is a bootstrapper: direct invocation returns
+          # after spawning the real installer and leaves $LASTEXITCODE unset.
+          # Start-Process -Wait tracks the child process tree to completion.
+          $installProcess = Start-Process `
+            -FilePath $installer `
+            -ArgumentList $installArgs `
+            -Wait `
+            -PassThru
+          $installExit = $installProcess.ExitCode
+          Write-Host "CUDA installer exit code: $installExit"
+
+          if (Test-Path $logDir) {
+            Copy-Item -Path (Join-Path $logDir "*") -Destination $diagDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          $cudaRootCandidates = @(
+            "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4",
+            "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+          )
+          $treePath = Join-Path $diagDir "cuda_install_tree.txt"
+          foreach ($candidate in $cudaRootCandidates) {
+            if (Test-Path $candidate) {
+              Write-Host "=== Found CUDA path: $candidate ==="
+              Get-ChildItem $candidate -ErrorAction SilentlyContinue | Format-Table Name, Mode, Length | Out-String | Tee-Object -FilePath $treePath -Append | Write-Host
+              if (Test-Path (Join-Path $candidate "bin")) {
+                Get-ChildItem (Join-Path $candidate "bin") -ErrorAction SilentlyContinue |
+                  Select-Object -First 40 Name |
+                  Format-Table | Out-String | Tee-Object -FilePath $treePath -Append | Write-Host
+              }
+            } else {
+              Write-Host "Missing candidate path: $candidate"
+            }
+          }
+
+          function Show-InstallerLogTail {
+            Write-Host "=== Installer log tail (if any) ==="
+            Get-ChildItem $diagDir -File -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "---- $($_.Name) ($($_.Length) bytes) ----"
+              Get-Content $_.FullName -Tail 80 -ErrorAction SilentlyContinue
+            }
+          }
+
+          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+          $nvcc = Join-Path $cudaRoot "bin\nvcc.exe"
+          $cicc = Join-Path $cudaRoot "nvvm\bin\cicc.exe"
+          if ($null -eq $installExit) {
+            Show-InstallerLogTail
+            Write-Error "CUDA installer did not return an exit code (see uploaded woa-cuda-diagnostics artifact)"
+            exit 1
+          }
+          # NVIDIA exit code 1 means success with a reboot requested. A reboot
+          # is unnecessary for compiling, so accept it if nvcc was installed.
+          if ($installExit -notin 0, 1) {
+            Show-InstallerLogTail
+            Write-Error "CUDA installer failed with exit code $installExit (see uploaded woa-cuda-diagnostics artifact)"
+            exit $installExit
+          }
+          if (-not (Test-Path $nvcc)) {
+            Show-InstallerLogTail
+            Write-Error "nvcc not found under $cudaRoot after install (see uploaded woa-cuda-diagnostics artifact)"
+            Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -ErrorAction SilentlyContinue
+            exit 1
+          }
+          if (-not (Test-Path $cicc)) {
+            Show-InstallerLogTail
+            Write-Error "NVVM compiler cicc not found under $cudaRoot after install (see uploaded woa-cuda-diagnostics artifact)"
+            exit 1
+          }
+
+          echo "CUDA_PATH=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CUDA_HOME=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CUDA_PATH_V13_4=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "$cudaRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Upload WoA CUDA install diagnostics
+        if: always() && steps.install-cuda.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: woa-cuda-diagnostics
+          path: ${{ runner.temp }}/woa_cuda_diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Set compiler-cache and CMake environment
+        shell: pwsh
+        run: |
+          echo "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "COMFY_CUDA_COMPILER_LAUNCHER=ccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "COMFY_CXX_COMPILER_LAUNCHER=ccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CCACHE_DIR=$env:GITHUB_WORKSPACE\.ccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CCACHE_BASEDIR=$env:GITHUB_WORKSPACE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CCACHE_COMPILERCHECK=content" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify CUDA installation
+        shell: bash
+        run: |
+          set -x
+          echo "CUDA_HOME: $CUDA_HOME"
+          echo "CUDA_PATH: $CUDA_PATH"
+          echo "PATH: $PATH"
+          which nvcc || true
+          nvcc --version
+          ls -la "$CUDA_PATH" || true
+          ls -la "$CUDA_PATH/bin" | head -50 || true
+          ls -la "$CUDA_PATH/lib" || ls -la "$CUDA_PATH/lib/x64" || true
+
+      - name: Setup MSVC (ARM64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create python3.lib for stable ABI
+        shell: pwsh
+        run: |
+          # Create python3.lib for stable ABI support (cp312-abi3 wheel)
+          $pythonDir = Split-Path -Parent (Get-Command python).Source
+          $libsDir = Join-Path $pythonDir "libs"
+          $pythonLib = Get-ChildItem -Path $libsDir -Filter "python3*.lib" | Where-Object { $_.Name -match "python3\d+\.lib" } | Select-Object -First 1
+
+          if ($pythonLib) {
+            $python3Lib = Join-Path $libsDir "python3.lib"
+            if (-not (Test-Path $python3Lib)) {
+              Copy-Item -Path $pythonLib.FullName -Destination $python3Lib
+              Write-Host "Created python3.lib for stable ABI"
+            }
+          } else {
+            Write-Error "Could not find python3XX.lib"
+            exit 1
+          }
+
+      - name: Install CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "~3.27.0"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install build setuptools wheel nanobind
+          python -c "import sys, platform; print(sys.version); print(platform.platform()); print(platform.machine())"
+
+      - name: Build CUDA abi3 wheel
+        env:
+          COMFY_CUDA_ARCHS: "120f"
+        shell: bash
+        run: |
+          set -x
+          # Python 3.12 produces the cp312-abi3 wheel (covers 3.12+).
+          # WoA / RTX Spark targets Blackwell (SM 120). Keep the arch set narrow
+          # so the 4-core windows-11-arm runners stay within CI time budgets.
+          python setup.py bdist_wheel -v
+
+      - name: Report compiler-cache statistics
+        if: always()
+        shell: pwsh
+        run: |
+          if (Get-Command ccache -ErrorAction SilentlyContinue) {
+            ccache --show-stats
+          } else {
+            Write-Host "ccache not available"
+          }
+
+      - name: List built wheels
+        shell: bash
+        run: |
+          ls -lh dist/
+          echo "Built wheels:"
+          ls -1 dist/*.whl
+          python - <<'PY'
+          from pathlib import Path
+          for p in sorted(Path("dist").glob("*.whl")):
+              print(f"{p.name}: {p.stat().st_size} bytes")
+          PY
+
+      - name: Upload Windows ARM abi3 wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-arm-cuda
+          path: dist/*.whl
+          if-no-files-found: error
+
+  test_windows_arm:
+    name: Test on Windows ARM (abi3)
+    needs: build_wheels_windows_arm
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download Windows ARM abi3 wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-windows-arm-cuda
+          path: dist/
+
+      - name: Install wheel and test dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # Native win_arm64 CPU wheels from the PyTorch CPU index
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # Install the CUDA win_arm64 abi3 wheel (CUDA tests skip without a GPU)
+          pip install dist/*.whl
+          pip install pytest ruff
+
+      - name: Ruff check
+        shell: bash
+        run: |
+          ruff check .
+
+      - name: Run tests
+        shell: bash
+        run: |
+          # Run all tests - conftest handles backend availability
+          # Tests requiring CUDA will be skipped on CPU-only runners
+          python -m pytest tests/ -v --tb=short
+
   publish:
     name: Publish to PyPI
-    needs: [build_wheels_linux, build_wheels_linux_arm64, build_wheels_windows, test_linux, test_windows]
+    needs: [build_wheels_linux, build_wheels_linux_arm64, build_wheels_windows, build_wheels_windows_arm, test_linux, test_windows, test_windows_arm]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     environment: pypi
@@ -524,6 +850,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: wheels-windows-cuda-3.12
+          path: dist/
+
+      - name: Download Windows ARM CUDA abi3 wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-windows-arm-cuda
           path: dist/
 
       - name: Download CPU-only wheel
