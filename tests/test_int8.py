@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for INT8 block-wise quantization."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -222,6 +224,216 @@ def test_int8_linear_routes_turing_to_fused_kernel(seed, monkeypatch):
 
     assert output.shape == (128, 128)
     assert calls == [True]
+
+
+@pytest.mark.parametrize(
+    "hip_version,arches,device_index,m,expected_pool",
+    [
+        (None, ["gfx1100"], 0, 1024, "default"),
+        ("7.2", ["gfx1100"], 0, 1024, "gfx11"),
+        ("7.2", ["gfx1151"], 0, 1024, "gfx11"),
+        ("7.2", ["gfx1201"], 0, 1024, "gfx12"),
+        ("7.2", ["gfx1100"], 0, 128, "gfx11-small-m"),
+        ("7.2", ["gfx1201"], 0, 128, "gfx12-small-m"),
+        ("7.2", ["gfx1100"], 0, 129, "gfx11"),
+        ("7.2", ["gfx908"], 0, 1024, "default"),
+        ("7.2", ["gfx90a"], 0, 1024, "default"),
+        ("7.2", ["gfx942"], 0, 1024, "default"),
+        ("7.2", ["gfx950"], 0, 1024, "default"),
+        ("7.2", ["gfx1100", "gfx90a"], 0, 1024, "gfx11"),
+        ("7.2", ["gfx1100", "gfx90a"], 1, 1024, "default"),
+        ("7.2", ["gfx1300"], 0, 1024, "default"),
+    ],
+)
+def test_int8_autotune_configs_are_device_scoped(
+    monkeypatch, hip_version, arches, device_index, m, expected_pool
+):
+    from comfy_kitchen.backends.triton import quantization
+
+    monkeypatch.setattr(torch.version, "hip", hip_version)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda index: SimpleNamespace(gcnArchName=arches[index]),
+    )
+
+    configs = quantization._prune_int8_autotune_configs(
+        quantization._INT8_MATMUL_CONFIGS,
+        {},
+        device_index=device_index,
+        m=m,
+    )
+
+    expected_configs = {
+        "gfx11": quantization._INT8_GFX11_CONFIGS,
+        "gfx12": quantization._INT8_GFX12_CONFIGS,
+    }
+    if expected_pool in expected_configs:
+        assert configs == expected_configs[expected_pool]
+    elif expected_pool.endswith("-small-m"):
+        full_pool = expected_configs[expected_pool.removesuffix("-small-m")]
+        assert len(configs) == 9
+        assert all(config in full_pool for config in configs)
+        if expected_pool.startswith("gfx11"):
+            assert any(config.kwargs["block_k"] == 128 for config in configs)
+        assert not any(
+            config.kwargs["block_m"] == 128
+            and config.kwargs["block_n"] == 128
+            and config.kwargs["block_k"] == 128
+            for config in configs
+        )
+    else:
+        signatures = [
+            (config.kwargs, config.num_stages, config.num_warps)
+            for config in configs
+        ]
+        default_signatures = [
+            (config.kwargs, config.num_stages, config.num_warps)
+            for config in quantization._INT8_DEFAULT_CONFIGS
+        ]
+        assert signatures == default_signatures
+
+
+def test_int8_autotune_configs_isolate_heterogeneous_devices(monkeypatch):
+    from comfy_kitchen.backends.triton import quantization
+
+    arches = ["gfx1100", "gfx90a"]
+    monkeypatch.setattr(torch.version, "hip", "7.2")
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda index: SimpleNamespace(gcnArchName=arches[index]),
+    )
+
+    rdna_configs = quantization._prune_int8_autotune_configs(
+        quantization._INT8_MATMUL_CONFIGS, {}, device_index=0, m=1024
+    )
+    cdna_configs = quantization._prune_int8_autotune_configs(
+        quantization._INT8_MATMUL_CONFIGS, {}, device_index=1, m=1024
+    )
+    rdna_configs_again = quantization._prune_int8_autotune_configs(
+        quantization._INT8_MATMUL_CONFIGS, {}, device_index=0, m=1024
+    )
+
+    assert rdna_configs == quantization._INT8_GFX11_CONFIGS
+    assert cdna_configs == quantization._INT8_DEFAULT_CONFIGS
+    assert rdna_configs_again == rdna_configs
+
+
+def test_int8_autotune_configs_fall_back_when_device_probe_fails(monkeypatch):
+    from comfy_kitchen.backends.triton import quantization
+
+    monkeypatch.setattr(torch.version, "hip", "7.2")
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: (_ for _ in ()).throw(RuntimeError("device probe failed")),
+    )
+
+    configs = quantization._prune_int8_autotune_configs(
+        quantization._INT8_MATMUL_CONFIGS,
+        {},
+        device_index=0,
+        m=1024,
+    )
+
+    assert configs == quantization._INT8_DEFAULT_CONFIGS
+
+
+def test_int8_autotune_pool_creation_does_not_probe_devices(monkeypatch):
+    from comfy_kitchen.backends.triton import quantization
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: (_ for _ in ()).throw(AssertionError("unexpected device probe")),
+    )
+
+    default_configs, gfx11_configs, gfx12_configs = quantization._int8_autotune_configs()
+
+    assert len(default_configs) == 6
+    assert len(gfx11_configs) == 10
+    assert len(gfx12_configs) == 10
+    assert len(quantization._INT8_MATMUL_CONFIGS) == 17
+    assert gfx11_configs[6] != gfx12_configs[6]
+
+
+def test_int8_autotune_cache_key_includes_device():
+    from comfy_kitchen.backends.triton import quantization
+
+    assert quantization._INT8_AUTOTUNE_KWARGS == {
+        "configs": quantization._INT8_MATMUL_CONFIGS,
+        "key": ["m", "n", "k", "device_index"],
+        "prune_configs_by": quantization._INT8_PRUNE_CONFIGS_BY,
+    }
+
+    for kernel in (
+        quantization._int8_matmul_dequant_kernel,
+        quantization._int8_matmul_dequant_per_row_kernel,
+    ):
+        assert "device_index" in kernel.keys
+        device_index = kernel.fn.params[kernel.fn.arg_names.index("device_index")]
+        assert not device_index.is_constexpr
+        assert device_index.do_not_specialize
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize(
+    "per_channel,expected_kernel",
+    [
+        (False, "tensorwise"),
+        (True, "per_row"),
+    ],
+)
+def test_int8_linear_forwards_device_index_to_kernel(
+    monkeypatch, per_channel, expected_kernel
+):
+    from comfy_kitchen.backends.triton import quantization
+
+    launches = []
+
+    class KernelRecorder:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            def launch(**kwargs):
+                launches.append((self.name, kwargs))
+
+            return launch
+
+    device_index = torch.cuda.current_device()
+    device = torch.device("cuda", device_index)
+    x = torch.zeros((2, 4), device=device, dtype=torch.bfloat16)
+    weight = torch.zeros((3, 4), device=device, dtype=torch.int8)
+    scale_size = weight.shape[0] if per_channel else 1
+    weight_scale = torch.ones(scale_size, device=device, dtype=torch.float32)
+
+    monkeypatch.setattr(
+        quantization,
+        "triton_quantize_rowwise",
+        lambda tensor: (
+            torch.zeros_like(tensor, dtype=torch.int8),
+            torch.ones((tensor.shape[0], 1), device=device, dtype=torch.float32),
+        ),
+    )
+    monkeypatch.setattr(
+        quantization,
+        "_int8_matmul_dequant_kernel",
+        KernelRecorder("tensorwise"),
+    )
+    monkeypatch.setattr(
+        quantization,
+        "_int8_matmul_dequant_per_row_kernel",
+        KernelRecorder("per_row"),
+    )
+
+    output = quantization.int8_linear(x, weight, weight_scale)
+
+    assert output.shape == (2, 3)
+    assert [(name, kwargs["device_index"]) for name, kwargs in launches] == [
+        (expected_kernel, x.device.index)
+    ]
 
 
 # =============================================================================
