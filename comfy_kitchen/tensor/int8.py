@@ -177,6 +177,20 @@ class TensorWiseINT8Layout(QuantizedLayout):
         return result.to(params.orig_dtype)
 
     @classmethod
+    def dequantize_embedding(cls, qdata: torch.Tensor, params: Params, indices: torch.Tensor) -> torch.Tensor:
+        """Gather rows from an INT8 embedding table and dequantize only those rows.
+
+        Embedding counterpart of ``dequantize``, which would materialize the whole ``[vocab, dim]``
+        table to read a few rows. Un-rotates if ``params.convrot``. Returns ``[*indices.shape, dim]``.
+        """
+        output_dtype_code = _INT8_DEQUANT_DTYPE_TO_CODE.get(params.orig_dtype, 0)
+        group_size = params.convrot_groupsize if getattr(params, "convrot", False) else 0
+        result = torch.ops.comfy_kitchen.dequantize_int8_embedding(
+            qdata, params.scale, indices, group_size, output_dtype_code
+        )
+        return result.to(params.orig_dtype)
+
+    @classmethod
     def get_plain_tensors(cls, qtensor: QuantizedTensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract raw tensors for computation.
 

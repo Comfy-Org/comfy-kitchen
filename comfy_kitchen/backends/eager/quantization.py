@@ -931,6 +931,31 @@ def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
     return q.float() * scale
 
 
+def dequantize_int8_embedding(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    group_size: int,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    """Gather rows from an INT8 embedding table ``[vocab, dim]`` and dequantize only those rows.
+
+    Indexes first, unlike ``dequantize_int8_convrot_weight*`` which materializes the whole table.
+    ``scale`` is per-row ``[vocab, 1]`` or scalar. ``group_size <= 0`` means the table is not
+    ConvRot-rotated; if it is, the rows are un-rotated after the lookup (a Linear folds that into
+    its GEMM, a lookup has no GEMM). Returns ``[*indices.shape, dim]``.
+    """
+    x = torch.nn.functional.embedding(indices, q).to(torch.float32)
+    if scale.dim() >= 2:
+        x = x * torch.nn.functional.embedding(indices, scale).to(torch.float32)
+    else:
+        x = x * scale.to(torch.float32)
+    if group_size > 0:
+        h = _build_hadamard(group_size, device=q.device, dtype=torch.float32)
+        x = _rotate_weight(x.reshape(-1, x.shape[-1]), h, group_size).reshape(x.shape)
+    return x.to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
+
+
 def dequantize_int8_simple_dtype(q: torch.Tensor, scale: torch.Tensor, output_dtype_code: int) -> torch.Tensor:
     """Dequantize INT8 tensor with scale into a requested floating dtype."""
     return dequantize_int8_simple(q, scale).to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
@@ -1107,6 +1132,34 @@ def _op_dequantize_int8_convrot_weight_dtype(
 @_op_dequantize_int8_convrot_weight_dtype.register_fake
 def _op_dequantize_int8_convrot_weight_dtype_fake(q, scale, group_size, output_dtype_code):
     return torch.empty_like(q, dtype=DTYPE_CODE_TO_DTYPE[output_dtype_code])
+
+
+@torch.library.custom_op("comfy_kitchen::dequantize_int8_embedding", mutates_args=())
+def _op_dequantize_int8_embedding(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    group_size: int,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    kwargs = {
+        "q": q,
+        "scale": scale,
+        "indices": indices,
+        "group_size": group_size,
+        "output_dtype_code": output_dtype_code,
+    }
+    impl = registry.get_implementation("dequantize_int8_embedding", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_dequantize_int8_embedding.register_fake
+def _op_dequantize_int8_embedding_fake(q, scale, indices, group_size, output_dtype_code):
+    return torch.empty(
+        (*indices.shape, q.shape[-1]),
+        dtype=DTYPE_CODE_TO_DTYPE[output_dtype_code],
+        device=q.device,
+    )
 
 
 @torch.library.custom_op("comfy_kitchen::dequantize_int8_simple", mutates_args=())
