@@ -159,10 +159,14 @@ class QuantizedTensor(torch.Tensor):
         qdata: torch.Tensor,
         layout_cls: str,
         params: Any,
+        outer_stride: Any = None,
     ):
+        # outer_stride is set by __tensor_unflatten__ under torch.compile dynamic shapes, where the
+        # rebuilt wrapper must report the exact (symbolic) stride PyTorch asserts. None -> contiguous.
         return torch.Tensor._make_wrapper_subclass(
             cls,
             params.orig_shape,
+            strides=outer_stride,
             device=qdata.device,
             dtype=params.orig_dtype,
             requires_grad=False,
@@ -173,6 +177,7 @@ class QuantizedTensor(torch.Tensor):
         qdata: torch.Tensor,
         layout_cls: str,
         params: Any,
+        outer_stride: Any = None,
     ):
         assert isinstance(layout_cls, str)
         self._qdata = qdata
@@ -339,6 +344,16 @@ class QuantizedTensor(torch.Tensor):
             params_kwargs[field_name] = inner_tensors[attr_name]
 
         params = ctx["params_class"](**params_kwargs)
+        # torch.compile passes outer_size/outer_stride as sequences the rebuilt subclass must report
+        # exactly (asserted in torch._subclasses.meta_utils), and under dynamic shapes they can differ
+        # from the flatten-time orig_shape -- so adopt outer_size as orig_shape and forward the stride.
+        # Other callers (e.g. comfy.memory_management.interpret_gathered_like) pass scalar 0
+        # placeholders meaning "keep stored shape", so only act on real sequences.
+        if isinstance(outer_size, (tuple, list, torch.Size)):
+            params = dataclasses.replace(params, orig_shape=tuple(outer_size))
+            return QuantizedTensor(
+                inner_tensors["_qdata"], ctx["layout_cls"], params, outer_stride=outer_stride,
+            )
         return QuantizedTensor(inner_tensors["_qdata"], ctx["layout_cls"], params)
 
     # ==================== Torch Dispatch ====================
