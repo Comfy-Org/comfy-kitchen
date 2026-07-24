@@ -15,6 +15,7 @@ __all__ = [
     "dequantize_int8_simple_dtype",
     "dequantize_int8_convrot_weight",
     "dequantize_int8_convrot_weight_dtype",
+    "dequantize_int8_embedding",
     "dequantize_convrot_w4a4_weight",
     "gemv_awq_w4a16",
     "convrot_w4a4_linear",
@@ -55,6 +56,7 @@ from .convrot_w4a4 import (
 from .quantization import (
     dequantize_int8_convrot_weight,
     dequantize_int8_convrot_weight_dtype,
+    dequantize_int8_embedding,
     dequantize_int8_simple,
     dequantize_int8_simple_dtype,
     dequantize_mxfp8,
@@ -397,6 +399,16 @@ def _build_constraints() -> dict:
         params={
             "q": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
             "scale": ParamConstraint(dtypes=standard_floats),
+            "group_size": ParamConstraint(dtypes=frozenset({int})),
+            "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["dequantize_int8_embedding"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+            "scale": ParamConstraint(dtypes=standard_floats),
+            "indices": ParamConstraint(dtypes=frozenset({torch.int64, torch.int32})),
             "group_size": ParamConstraint(dtypes=frozenset({int})),
             "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
         },

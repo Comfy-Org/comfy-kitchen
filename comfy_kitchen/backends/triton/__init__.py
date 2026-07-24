@@ -55,8 +55,8 @@ try:
     from .quantization import (
         triton_quantize_rowwise as _triton_quantize_int8_rowwise,
     )
-    from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
     from .rms_rope import rms_rope, rms_rope1, rms_rope_split_half, rms_rope_split_half1
+    from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
 except ImportError as e:
     _TRITON_AVAILABLE = False
     _TRITON_ERROR = f"ImportError: {e!s}"
