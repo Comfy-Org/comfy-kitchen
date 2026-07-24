@@ -28,6 +28,27 @@ if "--no-cuda" in sys.argv:
     print("CUDA backend excluded - only eager, triton backends")
     print("=" * 80 + "\n")
 
+# The HIP backend is built whenever a ROCm compiler is present. --hip turns a
+# missing compiler into an error rather than a skip; --no-hip suppresses it.
+BUILD_HIP = os.getenv("COMFY_KITCHEN_BUILD_HIP") == "1"
+if "--hip" in sys.argv:
+    BUILD_HIP = True
+    sys.argv.remove("--hip")
+
+BUILD_NO_HIP = os.getenv("COMFY_KITCHEN_BUILD_NO_HIP") == "1"
+if "--no-hip" in sys.argv:
+    BUILD_NO_HIP = True
+    sys.argv.remove("--no-hip")
+
+# build_ext parses --hip-archs itself, but the extension list is built before its
+# options are finalized, so the value has to be read here too. Left in argv for it.
+HIP_ARCHS_CLI = ""
+for _i, _arg in enumerate(sys.argv):
+    if _arg.startswith("--hip-archs="):
+        HIP_ARCHS_CLI = _arg.split("=", 1)[1]
+    elif _arg == "--hip-archs" and _i + 1 < len(sys.argv):
+        HIP_ARCHS_CLI = sys.argv[_i + 1]
+
 
 
 def cmake_path(path: str | os.PathLike[str]) -> str:
@@ -36,9 +57,12 @@ def cmake_path(path: str | os.PathLike[str]) -> str:
 
 
 class CMakeExtension(Extension):
-    def __init__(self, name: str, source_dir: str = ""):
+    def __init__(self, name: str, source_dir: str = "", backend: str = "cuda",
+                 hip_archs: str = ""):
         super().__init__(name, sources=[])
         self.source_dir = os.path.abspath(source_dir) if source_dir else ""
+        self.backend = backend
+        self.hip_archs = hip_archs
 
 
 class CMakeBuildExt(build_ext):
@@ -46,6 +70,7 @@ class CMakeBuildExt(build_ext):
     user_options: ClassVar = [
         *build_ext.user_options,
         ('cuda-archs=', None, 'CUDA architectures to build for (semicolon-separated, e.g., "80;89;90a")'),
+        ('hip-archs=', None, 'HIP architectures to build for (semicolon-separated, e.g., "gfx1200;gfx1201")'),
         ('debug-build', None, 'Build in debug mode with debug symbols'),
         ('lineinfo', None, 'Enable NVCC line information for profiling (adds -lineinfo flag)'),
     ]
@@ -58,6 +83,7 @@ class CMakeBuildExt(build_ext):
         super().initialize_options()
         # Set defaults - can be overridden by command-line arguments
         self.cuda_archs = None  # Will use platform-specific default in finalize_options
+        self.hip_archs = None  # None lets the HIP CMakeLists pick its gfx12 default
         self.debug_build = False  # Default: Release build
         self.lineinfo = False  # Default: disabled
 
@@ -95,7 +121,11 @@ class CMakeBuildExt(build_ext):
         ext_dir = ext_fullpath.parent
         ext_dir.mkdir(parents=True, exist_ok=True)
 
-        build_temp = pathlib.Path(self.build_temp).resolve()
+        # Each backend gets its own build directory: the CUDA and HIP extensions
+        # share self.build_temp, and CMake refuses to reuse a cache generated for a
+        # different source dir ("does not match the source ... used to generate
+        # cache"), so configuring the second one into the first one's directory fails.
+        build_temp = pathlib.Path(self.build_temp).resolve() / ext.backend
         build_temp.mkdir(parents=True, exist_ok=True)
 
         # All options have been set in finalize_options with proper defaults
@@ -107,36 +137,70 @@ class CMakeBuildExt(build_ext):
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={cmake_path(ext_dir)}",
             f"-DCMAKE_BUILD_TYPE={config}",
             f"-DPython_EXECUTABLE={cmake_path(sys.executable)}",
-            f"-DCOMFY_CUDA_ARCHS={cuda_archs}",
             f"-DCOMFY_ENABLE_LINEINFO={'ON' if enable_lineinfo else 'OFF'}",
         ]
 
-        # Let CMake manage its own configuration cache. Reconfiguring with the
-        # explicit arguments above updates changed settings without throwing
-        # away cached compiler checks and the generated build graph.
-        generator = os.environ.get("CMAKE_GENERATOR")
-        if generator:
-            cmake_args.extend(["-G", generator])
+        if ext.backend == "hip":
+            # CMake's default generator on Windows is Visual Studio, which does
+            # not support the HIP language.
+            cmake_args.extend(["-G", "Ninja"])
 
-        # Compiler caching is opt-in. Pass project-specific variables so CMake
-        # enables the launchers after compiler identification; wrapping the
-        # identification probes is unreliable with NVCC + MSVC on Windows.
-        cuda_launcher = os.environ.get("COMFY_CUDA_COMPILER_LAUNCHER")
-        if cuda_launcher:
-            cmake_args.append(f"-DCOMFY_CUDA_COMPILER_LAUNCHER={cuda_launcher}")
-        cxx_launcher = os.environ.get("COMFY_CXX_COMPILER_LAUNCHER")
-        if cxx_launcher:
-            cmake_args.append(f"-DCOMFY_CXX_COMPILER_LAUNCHER={cxx_launcher}")
+            rocm_home, hip_compiler = get_rocm_path()
+            cmake_args.append(f"-DCMAKE_HIP_COMPILER={hip_compiler.as_posix()}")
 
-        cuda_paths = get_cuda_path()
-        if cuda_paths is None:
-            raise RuntimeError(
-                "CUDA extension build requested, but nvcc could not be found. "
-                "Set CUDA_HOME to a valid CUDA toolkit or build with --no-cuda."
-            )
-        cuda_home, nvcc_bin = cuda_paths
-        cmake_args.append(f"-DCUDAToolkit_ROOT={cmake_path(cuda_home)}")
-        cmake_args.append(f"-DCMAKE_CUDA_COMPILER={cmake_path(nvcc_bin)}")
+            # CMake refuses to mix a GNU-like clang with a CL-compatible C/C++
+            # compiler, and would otherwise pick MSVC for C/C++ while using clang
+            # for HIP. Pin all three languages to the ROCm driver. The C driver
+            # drops the ++ (clang++ -> clang, amdclang++ -> amdclang); hipcc
+            # compiles both.
+            c_name = hip_compiler.stem.removesuffix("++")
+            c_compiler = hip_compiler.with_name(c_name + hip_compiler.suffix)
+            if c_compiler.is_file():
+                cmake_args.append(f"-DCMAKE_C_COMPILER={c_compiler.as_posix()}")
+            cmake_args.append(f"-DCMAKE_CXX_COMPILER={hip_compiler.as_posix()}")
+
+            if rocm_home:
+                rocm_posix = pathlib.Path(rocm_home).as_posix()
+                cmake_args.append(f"-DCMAKE_PREFIX_PATH={rocm_posix}")
+                cmake_args.append(f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={rocm_posix}")
+
+            # --hip-archs beats the environment, which beats what setup_hip_extension
+            # resolved from the visible devices. The CLI value is raw, so normalize it
+            # the way ext.hip_archs already was: CMake splits its arch list on ";", and
+            # an unnormalized "gfx1100,gfx1200" would reach it as a single bad target.
+            cli_archs = ";".join(normalize_archs(self.hip_archs)) if self.hip_archs else ""
+            hip_archs = cli_archs or ext.hip_archs
+            if hip_archs:
+                cmake_args.append(f"-DCOMFY_HIP_ARCHS={hip_archs}")
+        else:
+            cmake_args.append(f"-DCOMFY_CUDA_ARCHS={cuda_archs}")
+
+            # Let CMake manage its own configuration cache. Reconfiguring with the
+            # explicit arguments above updates changed settings without throwing
+            # away cached compiler checks and the generated build graph.
+            generator = os.environ.get("CMAKE_GENERATOR")
+            if generator:
+                cmake_args.extend(["-G", generator])
+
+            # Compiler caching is opt-in. Pass project-specific variables so CMake
+            # enables the launchers after compiler identification; wrapping the
+            # identification probes is unreliable with NVCC + MSVC on Windows.
+            cuda_launcher = os.environ.get("COMFY_CUDA_COMPILER_LAUNCHER")
+            if cuda_launcher:
+                cmake_args.append(f"-DCOMFY_CUDA_COMPILER_LAUNCHER={cuda_launcher}")
+            cxx_launcher = os.environ.get("COMFY_CXX_COMPILER_LAUNCHER")
+            if cxx_launcher:
+                cmake_args.append(f"-DCOMFY_CXX_COMPILER_LAUNCHER={cxx_launcher}")
+
+            cuda_paths = get_cuda_path()
+            if cuda_paths is None:
+                raise RuntimeError(
+                    "CUDA extension build requested, but nvcc could not be found. "
+                    "Set CUDA_HOME to a valid CUDA toolkit or build with --no-cuda."
+                )
+            cuda_home, nvcc_bin = cuda_paths
+            cmake_args.append(f"-DCUDAToolkit_ROOT={cmake_path(cuda_home)}")
+            cmake_args.append(f"-DCMAKE_CUDA_COMPILER={cmake_path(nvcc_bin)}")
 
         build_args = ["--config", config]
 
@@ -201,12 +265,207 @@ def get_cuda_path() -> tuple[pathlib.Path, pathlib.Path] | None:
 
     return pathlib.Path(cuda_home), nvcc_bin
 
+# RDNA2 (gfx103x), RDNA3/3.5 (gfx11xx) and RDNA4 (gfx12xx). RDNA1 and older lack
+# even the dot-product paths, and CDNA's matrix cores are MFMA, not WMMA.
+SUPPORTED_HIP_ARCH_PREFIXES = ("gfx103", "gfx11", "gfx12")
+
+# The wheel's default fat binary: every RDNA2/3/3.5/4 target ROCm supports. RDNA2
+# carries only the elementwise kernels, so the size is dominated by the ten
+# gfx11xx/gfx12xx code objects.
+DEFAULT_HIP_ARCHS = (
+    "gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036"  # RDNA2
+    ";gfx1100;gfx1101;gfx1102;gfx1103"  # RDNA3
+    ";gfx1150;gfx1151;gfx1152;gfx1153"  # RDNA3.5
+    ";gfx1200;gfx1201"  # RDNA4
+)
+
+
+def hip_arch_supported(arch: str) -> bool:
+    return arch.startswith(SUPPORTED_HIP_ARCH_PREFIXES)
+
+
+def normalize_archs(value: str) -> list[str]:
+    """Split an arch list on , or ; and drop the :xnack+/-like feature suffixes."""
+    archs = []
+    for part in value.replace(";", ",").split(","):
+        arch = part.strip().split(":", 1)[0]
+        if arch and arch not in archs:
+            archs.append(arch)
+    return archs
+
+
+def get_hip_archs_override() -> list[str]:
+    if HIP_ARCHS_CLI:
+        return normalize_archs(HIP_ARCHS_CLI)
+    # PYTORCH_ROCM_ARCH and GPU_ARCHS are the conventional ROCm spellings.
+    for var in ("COMFY_HIP_ARCHS", "PYTORCH_ROCM_ARCH", "GPU_ARCHS"):
+        value = os.getenv(var)
+        if value:
+            return normalize_archs(value)
+    return []
+
+
+def detect_hip_archs() -> list[str]:
+    """gfx names of the visible AMD devices, empty when none can be enumerated."""
+    try:
+        import torch
+
+        if torch.version.hip is None or not torch.cuda.is_available():
+            return []
+        names = [
+            torch.cuda.get_device_properties(i).gcnArchName
+            for i in range(torch.cuda.device_count())
+        ]
+    except Exception:
+        return []
+    return normalize_archs(";".join(n for n in names if n))
+
+
+def rocm_sdk_root() -> str | None:
+    """Ask the pip rocm-sdk wheel for its root, if it is installed."""
+    try:
+        root = subprocess.run(
+            [sys.executable, "-m", "rocm_sdk", "path", "--root"],
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    return root if root and pathlib.Path(root).exists() else None
+
+
+def get_rocm_path() -> tuple[str | None, pathlib.Path | None]:
+    """Locate a ROCm root and its clang driver.
+
+    Handles the pip ``rocm-sdk`` layout (site-packages/_rocm_sdk_devel) as well
+    as a system ROCm install.
+    """
+    rocm_home = os.getenv("ROCM_HOME") or os.getenv("ROCM_PATH") or os.getenv("HIP_PATH")
+
+    if rocm_home is None:
+        rocm_home = rocm_sdk_root()
+
+    if rocm_home is None:
+        sdk = pathlib.Path(sys.prefix) / "Lib" / "site-packages" / "_rocm_sdk_devel"
+        if not sdk.exists():
+            sdk = (
+                pathlib.Path(sys.prefix)
+                / "lib"
+                / f"python{sys.version_info.major}.{sys.version_info.minor}"
+                / "site-packages"
+                / "_rocm_sdk_devel"
+            )
+        if sdk.exists():
+            rocm_home = str(sdk)
+
+    if rocm_home is None and pathlib.Path("/opt/rocm").exists():
+        rocm_home = "/opt/rocm"
+
+    compiler = None
+    if rocm_home:
+        root = pathlib.Path(rocm_home)
+        for candidate in (
+            root / "lib" / "llvm" / "bin" / "clang++",
+            root / "lib" / "llvm" / "bin" / "clang++.exe",
+            root / "bin" / "amdclang++",
+            # The Windows HIP SDK ships its driver as %HIP_PATH%\bin\clang++.exe.
+            root / "bin" / "clang++.exe",
+            root / "bin" / "hipcc",
+        ):
+            if candidate.is_file():
+                compiler = candidate
+                break
+
+    if compiler is None:
+        for name in ("amdclang++", "hipcc"):
+            found = shutil.which(name)
+            if found:
+                compiler = pathlib.Path(found)
+                if rocm_home is None:
+                    rocm_home = str(compiler.parent.parent)
+                break
+
+    return rocm_home, compiler
+
+
+def setup_hip_extension() -> CMakeExtension | None:
+    print("=" * 80)
+    print("Checking for HIP/ROCm availability...")
+    print("=" * 80)
+
+    if BUILD_NO_HIP:
+        print("HIP extension disabled by --no-hip flag")
+        return None
+
+    rocm_home, hip_compiler = get_rocm_path()
+    if hip_compiler is None:
+        if BUILD_HIP:
+            raise RuntimeError(
+                "ERROR: --hip requested but no ROCm compiler was found "
+                "(looked for clang++/amdclang++/hipcc). Install ROCm or the rocm-sdk wheel."
+            )
+        print("No ROCm compiler detected; skipping HIP backend")
+        return None
+
+    print(f"Found ROCm root: {rocm_home or 'auto'}")
+    print(f"Found HIP compiler: {hip_compiler}")
+
+    # RDNA2 has no matrix cores, so it gets the elementwise kernels only; the GEMMs
+    # need the gfx11 or gfx12 WMMA intrinsics. Everything below RDNA2 (and CDNA,
+    # which uses MFMA rather than WMMA) has no path through these sources at all.
+    archs = get_hip_archs_override()
+    if archs:
+        unsupported = [arch for arch in archs if not hip_arch_supported(arch)]
+        if unsupported:
+            raise RuntimeError(
+                f"ERROR: the HIP backend supports RDNA2/3/4 (gfx103x, gfx11xx, gfx12xx); "
+                f"cannot build for {';'.join(unsupported)}"
+            )
+        print(f"HIP architectures from the override: {';'.join(archs)}")
+    else:
+        detected = detect_hip_archs()
+        if detected:
+            archs = [arch for arch in detected if hip_arch_supported(arch)]
+            if not archs:
+                message = (
+                    f"Visible AMD GPUs ({';'.join(detected)}) are not RDNA2/3/4; "
+                    "these kernels would not run on them."
+                )
+                if BUILD_HIP:
+                    raise RuntimeError(f"ERROR: --hip requested but {message}")
+                print(f"{message} Skipping the HIP backend.")
+                print("Set COMFY_HIP_ARCHS to build for a target anyway.")
+                return None
+            print(f"Detected supported devices: {';'.join(archs)}")
+        else:
+            archs = normalize_archs(DEFAULT_HIP_ARCHS)
+            print(f"No AMD GPU visible; building for the default {';'.join(archs)}")
+
+    root_dir = pathlib.Path(__file__).resolve().parent
+    hip_backend_dir = root_dir / "comfy_kitchen" / "backends" / "hip"
+    if not hip_backend_dir.exists():
+        raise RuntimeError(f"HIP backend directory not found: {hip_backend_dir}")
+
+    print("Building HIP extension with CMake + nanobind: comfy_kitchen.backends.hip._C")
+    return CMakeExtension(
+        name="comfy_kitchen.backends.hip._C",
+        source_dir=str(hip_backend_dir),
+        backend="hip",
+        hip_archs=";".join(archs),
+    )
+
+
 def get_cuda_version() -> tuple[int, ...] | None:
+    # get_cuda_path() returns None rather than a pair when nvcc is absent.
     cuda_paths = get_cuda_path()
     if cuda_paths is None:
         return None
 
     _cuda_home, nvcc_bin = cuda_paths
+    # A toolkit was found: absence is get_cuda_path()'s None above. A present but
+    # broken nvcc (unrunnable, or a failing -V) is a real error and must not be
+    # laundered into "no CUDA", which would silently ship a HIP-only wheel.
     try:
         output = subprocess.run(
             [nvcc_bin, "-V"],
@@ -214,8 +473,8 @@ def get_cuda_version() -> tuple[int, ...] | None:
             check=True,
             text=True,
         )
-    except (OSError, subprocess.CalledProcessError):
-        return None
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"CUDA toolkit was found, but `{nvcc_bin} -V` failed") from exc
 
     match = re.search(r"release\s*([\d.]+)", output.stdout)
     if not match:
@@ -223,6 +482,16 @@ def get_cuda_version() -> tuple[int, ...] | None:
 
     version = tuple(map(int, match.group(1).split(".")))
     return version
+
+
+class CudaToolkitNotFoundError(RuntimeError):
+    """No CUDA toolkit on this machine.
+
+    The only CUDA failure a ROCm box is allowed to shrug off. Everything else (a
+    toolkit too old to use, a missing backend directory, a broken nanobind) means
+    a CUDA build was intended and went wrong, and must not silently degrade the
+    combined wheel to HIP-only.
+    """
 
 
 def assert_cuda_version(version: tuple[int, ...]) -> None:
@@ -250,7 +519,9 @@ def setup_cuda_extension() -> CMakeExtension | None:
 
     cuda_version = get_cuda_version()
     if cuda_version is None:
-        raise RuntimeError("ERROR: Could not detect CUDA toolkit (nvcc not found). Install CUDA toolkit and try again.")
+        raise CudaToolkitNotFoundError(
+            "ERROR: Could not detect CUDA toolkit (nvcc not found). Install CUDA toolkit and try again."
+        )
 
     print(f"Found CUDA version: {'.'.join(map(str, cuda_version))}")
 
@@ -280,19 +551,29 @@ def setup_cuda_extension() -> CMakeExtension | None:
 def get_extensions() -> list[setuptools.Extension]:
     extensions = []
 
-    if BUILD_NO_CUDA:
-        print("\n" + "=" * 80)
-        print("Building CPU-only variant (COMFY_KITCHEN_BUILD_NO_CUDA=1)")
-        print("CUDA backend excluded - only eager, triton backends")
-        print("=" * 80 + "\n")
-        return extensions
+    if not BUILD_NO_CUDA:
+        try:
+            cuda_ext = setup_cuda_extension()
+            if cuda_ext is not None:
+                extensions.append(cuda_ext)
+        except CudaToolkitNotFoundError as e:
+            # An absent toolkit is only survivable when there is a ROCm one to
+            # build instead. Any other CUDA failure propagates: silently dropping
+            # the CUDA extension would ship a HIP-only wheel under the name of a
+            # combined one.
+            _rocm_home, hip_compiler = get_rocm_path()
+            if hip_compiler is None or BUILD_NO_HIP:
+                raise
+            print(f"\nNo CUDA toolkit ({e})")
+            print("A ROCm toolchain was found, so building the HIP backend instead.\n")
 
-    cuda_ext = setup_cuda_extension()
-    if cuda_ext is not None:
-        extensions.append(cuda_ext)
-    else:
+    hip_ext = setup_hip_extension()
+    if hip_ext is not None:
+        extensions.append(hip_ext)
+
+    if not extensions:
         print("\n" + "=" * 80)
-        print("Installing comfy_kitchen without CUDA backend")
+        print("Installing comfy_kitchen without a native backend")
         print("Available backends: eager, triton (if installed)")
         print("=" * 80 + "\n")
 
@@ -308,15 +589,17 @@ def get_cmdclass(has_extensions):
     try:
         from wheel.bdist_wheel import bdist_wheel
 
-        class CUDABdistWheel(bdist_wheel):
+        class ComfyBdistWheel(bdist_wheel):
             def finalize_options(self):
                 super().finalize_options()
-                # Set stable ABI tag only for Python 3.12+ (nanobind requirement)
-                # For 3.10/3.11, leave as version-specific (cpXXX-cpXXX)
-                if not BUILD_NO_CUDA and sys.version_info >= (3, 12):
+                # Stable ABI on 3.12+ only (nanobind's floor); 3.10/3.11 stay
+                # version-specific. Both CMakeLists build against the limited API
+                # there, so a wheel carrying either or both keeps the abi3 tag and
+                # the HIP backend does not multiply the wheel matrix.
+                if has_extensions and sys.version_info >= (3, 12):
                     self.py_limited_api = "cp312"
 
-        cmdclass["bdist_wheel"] = CUDABdistWheel
+        cmdclass["bdist_wheel"] = ComfyBdistWheel
     except ImportError as e:
         print(f"Warning: Could not import wheel.bdist_wheel: {e}")
 

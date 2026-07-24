@@ -4,6 +4,7 @@ from .backends import cuda as _cuda_backend  # noqa: F401
 
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
+from .backends import hip as _hip_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
@@ -22,6 +23,11 @@ from .tensor.convrot_w4a4 import (
     dequantize_convrot_w4a4_weight,
     quantize_convrot_w4a4_weight,
 )
+
+# The HIP backend registers only on a supported AMD device (RDNA2/3/3.5/4), and
+# advertises only the ops that device can run; prefer it where it registers.
+if registry.is_available("hip"):
+    registry.set_priority(["hip", "cuda", "triton", "eager"])
 
 __all__ = [
     # Normalization
