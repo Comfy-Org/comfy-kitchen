@@ -56,6 +56,18 @@ __global__ void dequant_int4_grouped_to_int8_kernel(
     const long srow = (long)n * nG;
     const uint2 pk = *reinterpret_cast<const uint2*>(&qw[(long)n * Khalf + kh]);
     const unsigned words[2] = {pk.x, pk.y};
+    // The 16-col vec spans 1 group (G>=16, the common case), 2 (G=8), or 4 (G=4).
+    // Load+decode each distinct group scale ONCE instead of per output pair.
+    const int base_g = k0 / G;
+    float sc0 = load_scale<ScaleT>(s_rel[srow + base_g]);
+    float sc1 = sc0, sc2 = sc0, sc3 = sc0;
+    if (G < 16) {
+        sc1 = load_scale<ScaleT>(s_rel[srow + base_g + 1]);
+        if (G < 8) {  // G == 4
+            sc2 = load_scale<ScaleT>(s_rel[srow + base_g + 2]);
+            sc3 = load_scale<ScaleT>(s_rel[srow + base_g + 3]);
+        }
+    }
     char4 o4[4];
     #pragma unroll
     for (int w = 0; w < 2; ++w) {
@@ -63,8 +75,8 @@ __global__ void dequant_int4_grouped_to_int8_kernel(
         #pragma unroll
         for (int bi = 0; bi < 4; ++bi) {
             const int oo = w * 4 + bi;             // 0..7 -> cols oo*2, oo*2+1
-            // q0/q1 are consecutive cols (same group since G>=2 even).
-            const float s = load_scale<ScaleT>(s_rel[srow + (k0 + oo * 2) / G]);
+            const int lg = (G >= 16) ? 0 : ((oo * 2) / G);  // local group in the vec
+            const float s = (lg == 0) ? sc0 : (lg == 1 ? sc1 : (lg == 2 ? sc2 : sc3));
             const unsigned byte = (bb >> (bi * 8)) & 0xFF;
             const unsigned c0 = byte & 0xF, c1 = (byte >> 4) & 0xF;
             const float v0 = codebook ? cb[c0] : (static_cast<float>(c0) - 8.0f);
@@ -107,5 +119,45 @@ extern "C" void launch_dequant_int4_grouped_to_int8_e4m3(
         static_cast<const int8_t*>(qw), static_cast<const uint8_t*>(s_rel),
         static_cast<const float*>(codebook),
         static_cast<int8_t*>(out), n_vec, Khalf, static_cast<int>(K), static_cast<int>(G));
+}
+
+// Fused-quality W4A8: dequant int4 -> int8 in column chunks (codebook + per-group
+// s_rel) feeding the tuned STRIDED int8 GEMM, so each int8 weight chunk stays
+// L2-resident instead of the full [N,K] round-tripping global (the convrot_w4a4
+// chunking trick, run at our group-16 codebook quality). Returns false if the
+// strided GEMM rejects a chunk config -> caller falls back to the 2-pass path.
+extern "C" bool launch_cutlass_int8_dequant_strided(
+    const void* A, const void* B, const void* xs, const void* ws, const void* bias,
+    void* D, int64_t M, int64_t N, int64_t K, int64_t output_stride, int out_dtype_code,
+    cudaStream_t stream);
+
+extern "C" bool launch_w4a8_codebook_gemm_chunked(
+    const void* xq,        // [M, K] int8 activation
+    const void* weight,    // [N, K/2] packed uint4
+    const void* s_rel,     // [N, K/G] fp8 (e4m3) per-group scale
+    const void* codebook,  // [16] fp32 or nullptr
+    const void* s_channel, // [N] fp32 per-channel scale
+    const void* xs,        // [M] fp32 per-row activation scale
+    const void* bias,      // [N] fp32 or nullptr
+    void* workspace,       // [chunk_cols, K] int8 scratch (preallocated, reused)
+    void* out,             // [M, N] output (out_dtype)
+    int64_t M, int64_t N, int64_t K, int64_t G, int64_t chunk_cols,
+    int out_dtype_code, cudaStream_t stream)
+{
+    const int64_t Khalf = K / 2, KG = K / G, osz = (out_dtype_code == 0) ? 4 : 2;
+    for (int64_t n0 = 0; n0 < N; n0 += chunk_cols) {
+        const int64_t cols = (chunk_cols < N - n0) ? chunk_cols : (N - n0);
+        launch_dequant_int4_grouped_to_int8_e4m3(
+            static_cast<const int8_t*>(weight) + n0 * Khalf,
+            static_cast<const uint8_t*>(s_rel) + n0 * KG,
+            codebook, workspace, cols, K, G, stream);
+        const void* bias_chunk = bias ? static_cast<const float*>(bias) + n0 : nullptr;
+        void* out_chunk = static_cast<char*>(out) + n0 * osz;
+        if (!launch_cutlass_int8_dequant_strided(
+                xq, workspace, xs, static_cast<const float*>(s_channel) + n0, bias_chunk,
+                out_chunk, M, cols, K, N /*output_stride*/, out_dtype_code, stream))
+            return false;
+    }
+    return true;
 }
 

@@ -1169,6 +1169,24 @@ extern "C" {
         int64_t G,
         cudaStream_t stream);
 
+    bool launch_w4a8_codebook_gemm_chunked(
+        const void* xq,
+        const void* weight,
+        const void* s_rel,
+        const void* codebook,
+        const void* s_channel,
+        const void* xs,
+        const void* bias,
+        void* workspace,
+        void* out,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int64_t G,
+        int64_t chunk_cols,
+        int out_dtype_code,
+        cudaStream_t stream);
+
     void launch_quantize_int8_rowwise_convrot_kernel(
         const void* input,
         void* output,
@@ -1916,6 +1934,30 @@ void dequant_int4_grouped_to_int8_e4m3(
     launch_dequant_int4_grouped_to_int8_e4m3(qw.data(), s_rel.data(), cb, out.data(), N, K, G, stream);
 }
 
+// Chunked fused W4A8: per-chunk (codebook+s_rel) dequant -> L2-hot int8 -> strided int8 GEMM.
+bool w4a8_codebook_gemm_chunked(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> xq,        // [M, K] int8 act
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> weight,    // [N, K/2] packed uint4
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> s_rel,    // [N, K/G] e4m3 bits
+    std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> codebook,  // [16] or None
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> s_channel,  // [N] fp32
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> xs,         // [M] fp32
+    std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> bias,  // [N] or None
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> workspace, // [chunk_cols, K] int8
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> out,               // [M, N] out_dtype
+    int64_t G, int64_t chunk_cols, int out_dtype_code, uintptr_t stream_ptr) {
+    const int64_t M = xq.shape(0);
+    const int64_t K = xq.shape(1);
+    const int64_t N = weight.shape(0);
+    if (weight.shape(1) != K / 2) throw std::runtime_error("w4a8_codebook_gemm: K/2 mismatch");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    const void* cb = codebook.has_value() ? codebook->data() : nullptr;
+    const void* bs = bias.has_value() ? bias->data() : nullptr;
+    return launch_w4a8_codebook_gemm_chunked(
+        xq.data(), weight.data(), s_rel.data(), cb, s_channel.data(), xs.data(), bs,
+        workspace.data(), out.data(), M, N, K, G, chunk_cols, out_dtype_code, stream);
+}
+
 void quantize_int8_rowwise_convrot(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
@@ -2569,6 +2611,13 @@ NB_MODULE(_C, m) {
           "Grouped int4 -> int8 dequant with fp8 e4m3 per-group scale; optional 16-entry codebook",
           nb::arg("qw"), nb::arg("s_rel"), nb::arg("codebook").none(), nb::arg("out"),
           nb::arg("g"), nb::arg("stream_ptr"));
+
+    m.def("w4a8_codebook_gemm_chunked", &w4a8_codebook_gemm_chunked,
+          "Chunked fused W4A8: per-chunk codebook+s_rel dequant -> L2-hot int8 -> strided int8 GEMM",
+          nb::arg("xq"), nb::arg("weight"), nb::arg("s_rel"), nb::arg("codebook").none(),
+          nb::arg("s_channel"), nb::arg("xs"), nb::arg("bias").none(), nb::arg("workspace"),
+          nb::arg("out"), nb::arg("g"), nb::arg("chunk_cols"), nb::arg("out_dtype_code"),
+          nb::arg("stream_ptr"));
 
     m.def("quantize_int8_rowwise_convrot", &quantize_int8_rowwise_convrot,
           "Fused ConvRot Hadamard rotation + rowwise INT8 quantization",

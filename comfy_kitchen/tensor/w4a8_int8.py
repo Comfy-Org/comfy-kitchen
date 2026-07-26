@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from dataclasses import dataclass
 
 import torch
@@ -45,6 +46,12 @@ from .base import (
 from .int8 import _dtype_code
 
 logger = logging.getLogger(__name__)
+
+# Chunked fused path: dequant int4->int8 in L2-sized column chunks feeding the strided
+# int8 GEMM, so the int8 weight chunk stays cache-resident instead of the full [N,K]
+# round-tripping global memory. Matches convrot_w4a4's speed at our codebook quality.
+# Set COMFY_KITCHEN_W4A8_CHUNKED=0 to force the 2-pass path (e.g. for A/B timing).
+_W4A8_CHUNKED = os.environ.get("COMFY_KITCHEN_W4A8_CHUNKED", "1") != "0"
 
 
 class AsymW4A8Int8Layout(QuantizedLayout):
@@ -287,9 +294,33 @@ def _w4a8_int8_matmul(x, weight, bias, out_dtype):
     m = x2.shape[0]
 
     sp = torch.cuda.current_stream(x.device).cuda_stream
-    # int4 -> grouped int8 (transient; weights stay int4 in storage, freed after use)
-    int8_w = torch.empty(n, k, dtype=torch.int8, device=x.device)
     cb = _wrap_for_dlpack(p.codebook) if p.codebook is not None else None
+    # fused rotate + int8 activation quant
+    xq, xs = quantize_int8_rowwise_convrot(x2, p.convrot_groupsize)
+    out = torch.empty(m, n, dtype=out_dtype, device=x.device)
+    # Fuse bias into the epilogue (D = acc*xs*s_channel + bias). fp32 compute type;
+    # the [N] cast is cheap -- don't cache it (inference tensors have no _version).
+    biasf = bias.float().contiguous() if bias is not None else None
+
+    # Chunked fused path (symmetric codebook, fp8 scale): dequant int4->int8 in
+    # L2-sized column chunks feeding the strided int8 GEMM -- no full [N,K] round-trip.
+    if (_W4A8_CHUNKED and p.correction is None and p.codebook is not None
+            and p.scale.dtype == torch.float8_e4m3fn):
+        from comfy_kitchen.backends.cuda import _int4_int8_weight_chunk_cols
+        chunk_cols = _int4_int8_weight_chunk_cols(m, n)
+        workspace = torch.empty(min(chunk_cols, n), k, dtype=torch.int8, device=x.device)
+        ok = _C.w4a8_codebook_gemm_chunked(
+            _wrap_for_dlpack(xq), _wrap_for_dlpack(weight._qdata),
+            _wrap_for_dlpack(p.scale.view(torch.uint8)), cb,
+            _wrap_for_dlpack(p.s_channel), _wrap_for_dlpack(xs.reshape(m).contiguous()),
+            _wrap_for_dlpack(biasf) if biasf is not None else None,
+            _wrap_for_dlpack(workspace), _wrap_for_dlpack(out),
+            g, chunk_cols, _dtype_code(out_dtype), sp)
+        if ok:
+            return out.reshape(*x.shape[:-1], n)
+
+    # 2-pass fallback: full int4 -> int8 dequant, then the int8 GEMM (+ asym correction).
+    int8_w = torch.empty(n, k, dtype=torch.int8, device=x.device)
     if p.scale.dtype == torch.float8_e4m3fn:
         _C.dequant_int4_grouped_to_int8_e4m3(
             _wrap_for_dlpack(weight._qdata), _wrap_for_dlpack(p.scale.view(torch.uint8)),
@@ -298,27 +329,12 @@ def _w4a8_int8_matmul(x, weight, bias, out_dtype):
         _C.dequant_int4_grouped_to_int8(
             _wrap_for_dlpack(weight._qdata), _wrap_for_dlpack(p.scale), cb,
             _wrap_for_dlpack(int8_w), g, sp)
-
-    # fused rotate + int8 activation quant
-    xq, xs = quantize_int8_rowwise_convrot(x2, p.convrot_groupsize)
-
-    out = torch.empty(m, n, dtype=out_dtype, device=x.device)
-    # Fuse bias into the CUTLASS epilogue (D = acc*xs*s_channel + bias) instead of
-    # a separate M*N add pass. fp32 for the epilogue compute type; the cast is
-    # cached on the bias tensor, keyed by _version to catch in-place patches.
-    if bias is None:
-        biasf = _empty_cuda_tensor(x.device, torch.float32)
-    else:
-        cached = getattr(bias, "_ck_bias_f32", None)
-        if cached is None or cached[1] != bias._version:
-            bias._ck_bias_f32 = cached = (bias.float().contiguous(), bias._version)
-        biasf = cached[0]
+    bf = biasf if biasf is not None else _empty_cuda_tensor(x.device, torch.float32)
     used = _C.cutlass_int8_dequant(
         _wrap_for_dlpack(xq), _wrap_for_dlpack(int8_w), _wrap_for_dlpack(xs),
-        _wrap_for_dlpack(p.s_channel), _wrap_for_dlpack(biasf),
+        _wrap_for_dlpack(p.s_channel), _wrap_for_dlpack(bf),
         _wrap_for_dlpack(out), _dtype_code(out_dtype), sp)
     if not used:
-        # tuned path unavailable -> dequant fallback
         return torch.nn.functional.linear(x, weight.dequantize(), bias)
 
     # asymmetric zero-point correction (rank-(K/group)); symmetric path has none.
