@@ -134,6 +134,7 @@ set(CUDA_SOURCES
     ops/quantize_svdquant_w4a4.cu
     ops/scaled_mm_svdquant_w4a4.cu
     ops/awq_w4a16.cu
+    ops/w4a8_gemm.cu
     ops/adaln.cu
 )
 

@@ -16,8 +16,10 @@
  */
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/optional.h>
 #include <cuda_runtime.h>
 #include <cstring>
+#include <optional>
 
 #include "cublaslt_runtime.h"
 #include "input_act_codes.h"
@@ -1147,6 +1149,26 @@ extern "C" {
         int out_dtype_code,
         cudaStream_t stream);
 
+    void launch_dequant_int4_grouped_to_int8(
+        const void* qw,
+        const void* s_rel,
+        const void* codebook,
+        void* out,
+        int64_t N,
+        int64_t K,
+        int64_t G,
+        cudaStream_t stream);
+
+    void launch_dequant_int4_grouped_to_int8_e4m3(
+        const void* qw,
+        const void* s_rel,
+        const void* codebook,
+        void* out,
+        int64_t N,
+        int64_t K,
+        int64_t G,
+        cudaStream_t stream);
+
     void launch_quantize_int8_rowwise_convrot_kernel(
         const void* input,
         void* output,
@@ -1864,6 +1886,36 @@ bool cutlass_turing_int4_dequant(
         a.data(), b.data(), xs.data(), ws.data(), bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
 }
 
+// Grouped int4 -> int8 dequant (group scale folded; per-channel scale applied in GEMM).
+void dequant_int4_grouped_to_int8(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> qw,     // [N, K/2]
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> s_rel,   // [N, K/G]
+    std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> codebook,  // [16] or None
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> out,    // [N, K]
+    int64_t G, uintptr_t stream_ptr) {
+    const int64_t N = qw.shape(0);
+    const int64_t K = out.shape(1);
+    if (qw.shape(1) != K / 2) throw std::runtime_error("dequant_int4_grouped: K/2 mismatch");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    const void* cb = codebook.has_value() ? codebook->data() : nullptr;
+    launch_dequant_int4_grouped_to_int8(qw.data(), s_rel.data(), cb, out.data(), N, K, G, stream);
+}
+
+// fp8 (e4m3) per-group scale: s_rel passed as raw uint8 bits.
+void dequant_int4_grouped_to_int8_e4m3(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> qw,     // [N, K/2]
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> s_rel, // [N, K/G] e4m3 bits
+    std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> codebook,  // [16] or None
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> out,    // [N, K]
+    int64_t G, uintptr_t stream_ptr) {
+    const int64_t N = qw.shape(0);
+    const int64_t K = out.shape(1);
+    if (qw.shape(1) != K / 2) throw std::runtime_error("dequant_int4_grouped: K/2 mismatch");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    const void* cb = codebook.has_value() ? codebook->data() : nullptr;
+    launch_dequant_int4_grouped_to_int8_e4m3(qw.data(), s_rel.data(), cb, out.data(), N, K, G, stream);
+}
+
 void quantize_int8_rowwise_convrot(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
@@ -2507,6 +2559,16 @@ NB_MODULE(_C, m) {
           nb::arg("d"),
           nb::arg("out_dtype_code"),
           nb::arg("stream_ptr"));
+
+    m.def("dequant_int4_grouped_to_int8", &dequant_int4_grouped_to_int8,
+          "Grouped int4 -> int8 dequant (group scale folded into int8); optional 16-entry codebook",
+          nb::arg("qw"), nb::arg("s_rel"), nb::arg("codebook").none(), nb::arg("out"),
+          nb::arg("g"), nb::arg("stream_ptr"));
+
+    m.def("dequant_int4_grouped_to_int8_e4m3", &dequant_int4_grouped_to_int8_e4m3,
+          "Grouped int4 -> int8 dequant with fp8 e4m3 per-group scale; optional 16-entry codebook",
+          nb::arg("qw"), nb::arg("s_rel"), nb::arg("codebook").none(), nb::arg("out"),
+          nb::arg("g"), nb::arg("stream_ptr"));
 
     m.def("quantize_int8_rowwise_convrot", &quantize_int8_rowwise_convrot,
           "Fused ConvRot Hadamard rotation + rowwise INT8 quantization",

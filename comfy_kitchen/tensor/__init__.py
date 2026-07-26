@@ -1,4 +1,5 @@
 """Quantized tensor types with typed layout parameters."""
+from .w4a8_int8 import AsymW4A8Int8Layout
 from .awq_w4a16 import TensorCoreAWQW4A16Layout
 from .base import (
     BaseLayoutParams,
@@ -29,6 +30,7 @@ from .svdquant_w4a4 import (
 )
 
 __all__ = [
+    "AsymW4A8Int8Layout",
     "BaseLayoutParams",
     "QuantizedLayout",
     "QuantizedTensor",
@@ -53,6 +55,7 @@ __all__ = [
     "svdquant_w4a4_grouped_linear",
 ]
 
+register_layout_class("AsymW4A8Int8Layout", AsymW4A8Int8Layout)
 register_layout_class("TensorCoreAWQW4A16Layout", TensorCoreAWQW4A16Layout)
 register_layout_class("TensorCoreConvRotW4A4Layout", TensorCoreConvRotW4A4Layout)
 register_layout_class("TensorCoreFP8Layout", TensorCoreFP8Layout)
