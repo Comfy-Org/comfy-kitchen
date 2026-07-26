@@ -989,6 +989,159 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     }
 }
 
+// S=64 H4 butterfly with quantize+store fused into the final stage. The
+// divide/round/clamp sequence must match the per-column quantize loop in
+// quantize_int8_rowwise_convrot64_kernel.
+template<int S, typename InputType, bool STOCHASTIC>
+__device__ __forceinline__ void convrot_fht_stage64_quantize(
+    const float* __restrict__ src,
+    int8_t* __restrict__ q,
+    int64_t row_offset,
+    int group_col,
+    float scale,
+    uint64_t seed,
+    int lane)
+{
+    const int base = (lane % S) + (lane / S) * (4 * S);
+    const float x0 = src[base];
+    const float x1 = src[base + S];
+    const float x2 = src[base + 2 * S];
+    const float x3 = src[base + 3 * S];
+    const float y[4] = {
+        0.5f * (x0 + x1 + x2 - x3),
+        0.5f * (x0 + x1 - x2 + x3),
+        0.5f * (x0 - x1 + x2 + x3),
+        0.5f * (-x0 + x1 + x2 + x3),
+    };
+    #pragma unroll
+    for (int d = 0; d < 4; ++d) {
+        const int col = group_col + base + d * S;
+        const int64_t idx = row_offset + col;
+        const float scaled = quant_div_float_to_float<InputType>(y[d], scale);
+        float quantized;
+        if constexpr (STOCHASTIC) {
+            const InputType noise = stochastic_rng_value<InputType>(idx, seed);
+            quantized = floorf(stochastic_sum_to_float<InputType>(scaled, noise));
+        } else {
+            quantized = nearbyintf(scaled);
+        }
+        quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
+        q[idx] = static_cast<int8_t>(quantized);
+    }
+}
+
+// Load one group-of-4 (zero-filled when inactive) and run the first three FHT
+// stages, leaving the result in buf1. Both passes of the chunked kernel must
+// go through this helper so their rotated values agree bitwise.
+template<typename InputType>
+__device__ __forceinline__ void convrot_load_rotate_group(
+    const InputType* __restrict__ x,
+    int64_t row_offset,
+    int group_col,
+    int base,
+    bool active,
+    float* __restrict__ buf0,
+    float* __restrict__ buf1,
+    int lane)
+{
+    const int64_t x_offset = row_offset + group_col + base;
+
+    const float x0 = active ? to_float(x[x_offset]) : 0.0f;
+    const float x1 = active ? to_float(x[x_offset + 1]) : 0.0f;
+    const float x2 = active ? to_float(x[x_offset + 2]) : 0.0f;
+    const float x3 = active ? to_float(x[x_offset + 3]) : 0.0f;
+    buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
+    buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
+    buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
+    buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+    __syncthreads();
+
+    convrot_fht_stage64<4>(buf1, buf0, lane);
+    __syncthreads();
+    convrot_fht_stage64<16>(buf0, buf1, lane);
+    __syncthreads();
+}
+
+// Two-pass variant for 2048 < K <= 4096: shared memory holds only one chunk's
+// scratch (independent of K). Pass 1 rotates each chunk and folds its abs-max;
+// pass 2 re-loads and re-rotates -- fp32 math is deterministic, so the values
+// match pass 1 -- and quantizes with the final scale. Above K=4096 the pass-2
+// re-read no longer stays L2-resident at large row counts and the single-pass
+// kernel is faster.
+template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC>
+__global__ void quantize_int8_rowwise_convrot64_chunked_kernel(
+    const InputType* __restrict__ x,
+    int8_t* __restrict__ q,
+    float* __restrict__ scales,
+    int K,
+    uint64_t seed)
+{
+    constexpr int kGroupThreads = 64;
+    constexpr int kGroupsInFlight = BLOCK_THREADS / kGroupThreads;
+    constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
+
+    extern __shared__ float smem[];
+    float* tmp = smem;  // kGroupsInFlight * 2 * kConvRotGroup floats.
+
+    __shared__ float warp_smem[kWarps];
+    __shared__ float block_smem;
+
+    const int row = static_cast<int>(blockIdx.x);
+    const int tid = threadIdx.x;
+    const int sub = tid / kGroupThreads;
+    const int lane = tid % kGroupThreads;
+    const int64_t row_offset = static_cast<int64_t>(row) * K;
+    const int n_groups = K / kConvRotGroup;
+    const int iters = (n_groups + kGroupsInFlight - 1) / kGroupsInFlight;
+
+    float* buf0 = tmp + sub * (2 * kConvRotGroup);
+    float* buf1 = buf0 + kConvRotGroup;
+
+    // ---- Pass 1: rotate each chunk, fold abs-max, discard rotated values. ----
+    float abs_max = 0.0f;
+    for (int it = 0; it < iters; ++it) {
+        const int group = it * kGroupsInFlight + sub;
+        const bool active = group < n_groups;
+        const int base = lane * 4;
+        const int group_col = group * kConvRotGroup;
+
+        convrot_load_rotate_group<InputType>(x, row_offset, group_col, base, active, buf0, buf1, lane);
+
+        if (active) {
+            // fmaxf ignores NaN against a finite accumulator, so an all-NaN
+            // group (huge-magnitude row) cannot corrupt the running max.
+            abs_max = fmaxf(
+                abs_max,
+                convrot_fht_stage64_store_absmax<64, float>(buf1, buf0, lane));
+        }
+        __syncthreads();
+    }
+
+    abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
+    const float scale = fmaxf(
+        finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f),
+        1.0e-30f);
+    if (tid == 0) {
+        scales[row] = scale;
+    }
+
+    // ---- Pass 2: re-load + re-rotate (identical math -> identical values) + quantize. ----
+    for (int it = 0; it < iters; ++it) {
+        const int group = it * kGroupsInFlight + sub;
+        const bool active = group < n_groups;
+        const int base = lane * 4;
+        const int group_col = group * kConvRotGroup;
+
+        convrot_load_rotate_group<InputType>(x, row_offset, group_col, base, active, buf0, buf1, lane);
+
+        if (active) {
+            convrot_fht_stage64_quantize<64, InputType, STOCHASTIC>(
+                buf1, q, row_offset, group_col, scale, seed, lane);
+        }
+        __syncthreads();
+    }
+}
+
 } // namespace
 
 } // namespace comfy
@@ -1282,7 +1435,6 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
 
     DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
         constexpr int block_threads_single = 512;
-        constexpr int block_threads_multi = 1024;
         auto launch = [&](auto kernel, int block_threads) {
             const int groups_in_flight = block_threads / 64;
             const size_t smem_bytes =
@@ -1296,6 +1448,18 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                     std::to_string(smem_bytes) + " bytes) failed: " +
                     cudaGetErrorString(attr_err));
             }
+            kernel<<<static_cast<unsigned int>(num_rows), block_threads, smem_bytes, stream>>>(
+                static_cast<const InputType*>(input),
+                static_cast<int8_t*>(output),
+                static_cast<float*>(scales),
+                static_cast<int>(num_cols),
+                seed);
+        };
+        // Dynamic smem here is at most 16 KiB -- under the default limit, no opt-in attribute needed.
+        auto launch_chunked = [&](auto kernel, int block_threads) {
+            const int groups_in_flight = block_threads / 64;
+            const size_t smem_bytes =
+                static_cast<size_t>(groups_in_flight) * 2 * comfy::kConvRotGroup * sizeof(float);
             kernel<<<static_cast<unsigned int>(num_rows), block_threads, smem_bytes, stream>>>(
                 static_cast<const InputType*>(input),
                 static_cast<int8_t*>(output),
@@ -1339,7 +1503,56 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                 launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_6144, false>,
                        block_threads_6144);
             }
+        } else if (num_cols <= 2048) {
+            // One 64-thread group per 256-column block: threads = n_groups * 64.
+            const int n_groups = static_cast<int>(num_cols / comfy::kConvRotGroup);
+            switch (n_groups) {
+                case 2:  // K=512
+                    if (stochastic) launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 128, true>, 128);
+                    else launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 128, false>, 128);
+                    break;
+                case 3:  // K=768
+                    if (stochastic) launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 192, true>, 192);
+                    else launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 192, false>, 192);
+                    break;
+                case 4:  // K=1024
+                    if (stochastic) launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 256, true>, 256);
+                    else launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 256, false>, 256);
+                    break;
+                case 5:  // K=1280
+                    if (stochastic) launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 320, true>, 320);
+                    else launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 320, false>, 320);
+                    break;
+                case 6:  // K=1536
+                    if (stochastic) launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 384, true>, 384);
+                    else launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 384, false>, 384);
+                    break;
+                case 7:  // K=1792
+                    if (stochastic) launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 448, true>, 448);
+                    else launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 448, false>, 448);
+                    break;
+                case 8:  // K=2048
+                    if (stochastic) launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 512, true>, 512);
+                    else launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 512, false>, 512);
+                    break;
+                default:
+                    if (stochastic) launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 1024, true>, 1024);
+                    else launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 1024, false>, 1024);
+                    break;
+            }
+        } else if (num_cols <= 4096) {
+            // Above K=4096 the chunked kernel's pass-2 re-read falls out of L2 at large
+            // row counts and loses to the single-pass kernel below.
+            constexpr int block_threads_chunked = 512;
+            if (stochastic) {
+                launch_chunked(comfy::quantize_int8_rowwise_convrot64_chunked_kernel<InputType, block_threads_chunked, true>,
+                                block_threads_chunked);
+            } else {
+                launch_chunked(comfy::quantize_int8_rowwise_convrot64_chunked_kernel<InputType, block_threads_chunked, false>,
+                                block_threads_chunked);
+            }
         } else {
+            constexpr int block_threads_multi = 1024;
             if (stochastic) {
                 launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_multi, true>,
                        block_threads_multi);
