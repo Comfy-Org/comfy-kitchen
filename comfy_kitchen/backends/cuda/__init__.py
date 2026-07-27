@@ -159,6 +159,7 @@ from comfy_kitchen.constraints import (  # noqa: E402
     FunctionConstraints,
     MinDims,
     ParamConstraint,
+    ValidationResult,
 )
 from comfy_kitchen.float_utils import roundup  # noqa: E402
 from comfy_kitchen.registry import registry  # noqa: E402
@@ -1995,6 +1996,30 @@ def apply_rope_(
     return _apply_rope_cuda(xq, xk, freqs_cis, split_half=False, inplace=True)
 
 
+def _validate_cuda_rms_rope1(kwargs: dict[str, object]) -> ValidationResult:
+    x = kwargs["x"]
+    freqs_cis = kwargs["freqs_cis"]
+    assert isinstance(x, torch.Tensor) and isinstance(freqs_cis, torch.Tensor)
+    if _native_rms_rope_layout(x, freqs_cis, extension_op="rms_rope1") is None:
+        return ValidationResult.fail("x", "CUDA fused RMS-RoPE requires a supported native layout")
+    return ValidationResult.ok()
+
+
+def _validate_cuda_rms_rope(kwargs: dict[str, object]) -> ValidationResult:
+    q, k, q_scale = kwargs["q"], kwargs["k"], kwargs["q_scale"]
+    k_scale = kwargs.get("k_scale")
+    if k_scale is None:
+        k_scale = q_scale
+    assert all(isinstance(value, torch.Tensor) for value in (q, k, q_scale, k_scale))
+    if _native_rms_rope_layout(q, kwargs["freqs_cis"], extension_op="rms_rope") is None:
+        return ValidationResult.fail("q", "CUDA fused RMS-RoPE requires a supported native layout")
+    if k.shape != q.shape or k.dtype != q.dtype:
+        return ValidationResult.fail("k", "must have the same shape and dtype as q for fused CUDA RMS-RoPE")
+    if k_scale.ndim != 1 or k_scale.numel() != q.shape[-1] or k_scale.dtype != q_scale.dtype:
+        return ValidationResult.fail("k_scale", "must be a 1D tensor matching q head_dim and q_scale dtype")
+    return ValidationResult.ok()
+
+
 def _native_rms_rope_layout(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -2023,20 +2048,7 @@ def _rms_rope1_cuda(
     inplace: bool,
 ) -> torch.Tensor:
     bnhd = _native_rms_rope_layout(x, freqs_cis, extension_op="rms_rope1")
-    if bnhd is None:
-        from comfy_kitchen.backends.eager.rope import (
-            rms_rope1 as eager_rms_rope1,
-        )
-        from comfy_kitchen.backends.eager.rope import (
-            rms_rope_split_half1 as eager_rms_rope_split_half1,
-        )
-
-        impl = eager_rms_rope_split_half1 if split_half else eager_rms_rope1
-        out = impl(x, freqs_cis, scale, epsilon)
-        if inplace:
-            x.copy_(out)
-            return x
-        return out
+    assert bnhd is not None
 
     out = x if inplace else torch.empty_like(x)
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
@@ -2067,32 +2079,8 @@ def _rms_rope_cuda(
     if k_scale is None:
         k_scale = q_scale
 
-    bnhd = _native_rms_rope_layout(
-        q, freqs_cis, extension_op="rms_rope"
-    )
-    native_fast_path = (
-        bnhd is not None
-        and k.shape == q.shape
-        and k.dtype == q.dtype
-        and k_scale.ndim == 1
-        and k_scale.numel() == q.shape[-1]
-        and k_scale.dtype == q_scale.dtype
-    )
-    if not native_fast_path:
-        from comfy_kitchen.backends.eager.rope import (
-            rms_rope as eager_rms_rope,
-        )
-        from comfy_kitchen.backends.eager.rope import (
-            rms_rope_split_half as eager_rms_rope_split_half,
-        )
-
-        impl = eager_rms_rope_split_half if split_half else eager_rms_rope
-        q_result, k_result = impl(q, k, freqs_cis, q_scale, k_scale, epsilon)
-        if inplace:
-            q.copy_(q_result)
-            k.copy_(k_result)
-            return q, k
-        return q_result, k_result
+    bnhd = _native_rms_rope_layout(q, freqs_cis, extension_op="rms_rope")
+    assert bnhd is not None
 
     q_out = q if inplace else torch.empty_like(q)
     k_out = k if inplace else torch.empty_like(k)
@@ -2702,6 +2690,7 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
+            call_rules=(_validate_cuda_rms_rope,),
         ),
         "rms_rope1": FunctionConstraints(
             params={
@@ -2719,6 +2708,7 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
+            call_rules=(_validate_cuda_rms_rope1,),
         ),
         "rms_rope_split_half": FunctionConstraints(
             params={
@@ -2744,6 +2734,7 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
+            call_rules=(_validate_cuda_rms_rope,),
         ),
         "rms_rope_split_half1": FunctionConstraints(
             params={
@@ -2761,6 +2752,7 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
+            call_rules=(_validate_cuda_rms_rope1,),
         ),
         "quantize_int8_tensorwise": FunctionConstraints(
             params={
