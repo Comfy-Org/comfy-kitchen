@@ -26,6 +26,7 @@ from .tensor.convrot_w4a4 import (
 __all__ = [
     # Normalization
     "adaln",
+    "rms_adaln",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -97,6 +98,29 @@ def adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
+
+
+def rms_adaln(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fused Adaptive Layer Normalization with RMSNorm: rmsnorm(x) * (1 + scale) + shift.
+
+    Same modulation as :func:`adaln`, but normalizing by the root mean square
+    instead of subtracting the mean — the form used by LTX/LTX2-style DiTs.
+
+    Args:
+        x: Input tensor of any shape (..., D)
+        scale: Modulation scale, broadcastable to x's shape
+        shift: Modulation shift, broadcastable to x's shape
+        eps: RMSNorm epsilon
+
+    Returns:
+        Normalized and modulated tensor with the same shape as x
+    """
+    return torch.ops.comfy_kitchen.rms_adaln(x, scale, shift, eps)
 
 
 def quantize_per_tensor_fp8(
@@ -599,6 +623,7 @@ def int8_linear(
     out_dtype: torch.dtype | None = None,
     convrot: bool = False,
     convrot_groupsize: int = 256,
+    input_act: str | None = None,
 ) -> torch.Tensor:
     """INT8 linear layer dynamically quantized.
 
@@ -610,6 +635,11 @@ def int8_linear(
         out_dtype: Output dtype.
         convrot: If True, apply online activation rotation.
         convrot_groupsize: Group size for Hadamard rotation.
+        input_act: Optional elementwise activation applied to x before
+            quantization ("gelu_tanh", or None). When the fused ConvRot
+            quantizer handles the shape it is folded in, so an MLP's
+            ``linear(act(proj(x)))`` never writes act's output to HBM; every
+            other path applies it eagerly for identical results.
 
     Returns:
         Result tensor.
@@ -624,6 +654,7 @@ def int8_linear(
         "out_dtype": out_dtype,
         "convrot": convrot,
         "convrot_groupsize": convrot_groupsize,
+        "input_act": input_act,
     }
     impl = registry.get_implementation("int8_linear", kwargs=kwargs)
     return impl(**kwargs)

@@ -8,6 +8,7 @@
 
 import torch
 
+from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
 from comfy_kitchen.float_utils import (
     E8M0_BIAS,
     F4_E2M1_MAX,
@@ -969,6 +970,7 @@ def int8_linear(
     out_dtype: torch.dtype = torch.bfloat16,
     convrot: bool = False,
     convrot_groupsize: int = 256,
+    input_act: str | None = None,
 ) -> torch.Tensor:
     """INT8 linear layer using torch.int8_mm with memory-efficient scaling.
 
@@ -987,6 +989,7 @@ def int8_linear(
     Returns:
         Result tensor [..., N].
     """
+    x = _apply_input_act(x, input_act)
     if x.shape[-1] != weight.shape[-1]:
         raise ValueError(
             f"Input and weight inner dimensions must match, got {x.shape[-1]} and {weight.shape[-1]}"

@@ -15,8 +15,12 @@
  * limitations under the License.
  */
 
-// Fused AdaLN kernel: out = layernorm(x, eps=eps) * (1 + scale) + shift
-// Each block handles one row; 256 threads per block; float32 accumulation.
+// Fused AdaLN kernels:
+//   adaln     — out = layernorm(x, eps=eps) * (1 + scale) + shift
+//   rms_adaln — out = rmsnorm(x, eps=eps)   * (1 + scale) + shift
+// Both are the same kernel templated on kSubtractMean; RMSNorm is LayerNorm
+// with the mean pinned to zero, so only the statistics differ. Each block
+// handles one row; 256 threads per block; float32 accumulation.
 //
 // scale/shift are broadcast: in AdaLN they are produced per-sample with shape
 // (..., 1, D) and shared across all tokens of a sample. Rather than materialize
@@ -95,14 +99,23 @@ __device__ __forceinline__ float2 block_reduce_sum2(float2 v, float2* warp_smem)
     return total;
 }
 
-__device__ __forceinline__ int modulation_row(int row, int group, int n_rows) {
-    if (group == 1) return row;
-    if (group == n_rows) return 0;
-    if ((group & (group - 1)) == 0) return row >> (__ffs(group) - 1);
-    return row / group;
+// Derive (mean, rstd) from the (sum, sum-of-squares) pair. For RMSNorm the mean
+// is pinned to 0 so the shared epilogue below — (x - mean) * rstd — covers both.
+template<bool kSubtractMean>
+__device__ __forceinline__ void norm_stats(float2 acc, float inv_d, float eps,
+                                           float& mean, float& rstd) {
+    if constexpr (kSubtractMean) {
+        mean = acc.x * inv_d;
+        // var = E[x^2] - mean^2; clamp to guard against tiny negative rounding
+        // for (near-)constant rows before the rsqrt.
+        rstd = rsqrtf(fmaxf(acc.y * inv_d - mean * mean, 0.0f) + eps);
+    } else {
+        mean = 0.0f;
+        rstd = rsqrtf(acc.y * inv_d + eps);
+    }
 }
 
-template<typename T>
+template<typename T, bool kSubtractMean>
 __global__ void adaln_kernel(
     const T* __restrict__ x,
     const T* __restrict__ scale,
@@ -146,23 +159,20 @@ __global__ void adaln_kernel(
         #pragma unroll
         for (int j = 0; j < VEC; ++j) {
             float f = to_float(xv.elts[j]);
-            acc.x += f;
+            if constexpr (kSubtractMean) acc.x += f;
             acc.y += f * f;
         }
     }
     for (int i = vec_end + tid; i < D; i += nthreads) {
         float f = to_float(x_row[i]);
-        acc.x += f;
+        if constexpr (kSubtractMean) acc.x += f;
         acc.y += f * f;
     }
 
     acc = block_reduce_sum2(acc, warp_smem);
     const float inv_d = 1.0f / static_cast<float>(D);
-    const float mean  = acc.x * inv_d;
-    // var = E[x^2] - mean^2; clamp to guard against tiny negative rounding for
-    // (near-)constant rows before the rsqrt.
-    const float var   = fmaxf(acc.y * inv_d - mean * mean, 0.0f);
-    const float rstd  = rsqrtf(var + eps);
+    float mean, rstd;
+    norm_stats<kSubtractMean>(acc, inv_d, eps, mean, rstd);
 
     // ---- Pass 3: normalize + modulate ----
     const Vec<T>* s_vec  = reinterpret_cast<const Vec<T>*>(s_row);
@@ -188,7 +198,7 @@ __global__ void adaln_kernel(
     }
 }
 
-template<typename T>
+template<typename T, bool kSubtractMean>
 __global__ void adaln_warp_kernel(
     const T* __restrict__ x,
     const T* __restrict__ scale,
@@ -218,17 +228,16 @@ __global__ void adaln_warp_kernel(
     float2 acc = make_float2(0.0f, 0.0f);
     for (int i = lane; i < D; i += kThreadsPerWarp) {
         float f = to_float(x_row[i]);
-        acc.x += f;
+        if constexpr (kSubtractMean) acc.x += f;
         acc.y += f * f;
     }
 
     acc = warp_reduce_sum2(acc);
-    const float sum = __shfl_sync(0xffffffff, acc.x, 0);
-    const float sumsq = __shfl_sync(0xffffffff, acc.y, 0);
+    acc.x = __shfl_sync(0xffffffff, acc.x, 0);
+    acc.y = __shfl_sync(0xffffffff, acc.y, 0);
     const float inv_d = 1.0f / static_cast<float>(D);
-    const float mean = sum * inv_d;
-    const float var = fmaxf(sumsq * inv_d - mean * mean, 0.0f);
-    const float rstd = rsqrtf(var + eps);
+    float mean, rstd;
+    norm_stats<kSubtractMean>(acc, inv_d, eps, mean, rstd);
 
     for (int i = lane; i < D; i += kThreadsPerWarp) {
         float result = (to_float(x_row[i]) - mean) * rstd
@@ -255,6 +264,7 @@ void launch_adaln_kernel(
     int64_t     shift_group,
     float       eps,
     int         dtype_code,
+    bool        subtract_mean,
     cudaStream_t stream)
 {
     if (N > std::numeric_limits<int>::max() ||
@@ -268,31 +278,33 @@ void launch_adaln_kernel(
     dim3 block(comfy::kAdaLNThreads);
 
     DISPATCH_FP_DTYPE(dtype_code, T, [&]() {
-        if (N <= 1024) {
-            dim3 warp_grid(
-                static_cast<unsigned int>((N + comfy::kAdaLNRowsPerWarpBlock - 1) /
-                                          comfy::kAdaLNRowsPerWarpBlock));
-            comfy::adaln_warp_kernel<T><<<warp_grid, block, 0, stream>>>(
-                static_cast<const T*>(x),
-                static_cast<const T*>(scale),
-                static_cast<const T*>(shift),
-                static_cast<T*>(out),
-                static_cast<int>(N),
-                static_cast<int>(D),
-                static_cast<int>(scale_group),
-                static_cast<int>(shift_group),
-                eps);
-        } else {
-            comfy::adaln_kernel<T><<<grid, block, 0, stream>>>(
-                static_cast<const T*>(x),
-                static_cast<const T*>(scale),
-                static_cast<const T*>(shift),
-                static_cast<T*>(out),
-                static_cast<int>(D),
-                static_cast<int>(scale_group),
-                static_cast<int>(shift_group),
-                eps);
-        }
+        DISPATCH_BOOL(subtract_mean, kSubtractMean, [&]() {
+            if (N <= 1024) {
+                dim3 warp_grid(
+                    static_cast<unsigned int>((N + comfy::kAdaLNRowsPerWarpBlock - 1) /
+                                              comfy::kAdaLNRowsPerWarpBlock));
+                comfy::adaln_warp_kernel<T, kSubtractMean><<<warp_grid, block, 0, stream>>>(
+                    static_cast<const T*>(x),
+                    static_cast<const T*>(scale),
+                    static_cast<const T*>(shift),
+                    static_cast<T*>(out),
+                    static_cast<int>(N),
+                    static_cast<int>(D),
+                    static_cast<int>(scale_group),
+                    static_cast<int>(shift_group),
+                    eps);
+            } else {
+                comfy::adaln_kernel<T, kSubtractMean><<<grid, block, 0, stream>>>(
+                    static_cast<const T*>(x),
+                    static_cast<const T*>(scale),
+                    static_cast<const T*>(shift),
+                    static_cast<T*>(out),
+                    static_cast<int>(D),
+                    static_cast<int>(scale_group),
+                    static_cast<int>(shift_group),
+                    eps);
+            }
+        });
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
             throw std::runtime_error(std::string("adaln kernel launch failed: ") + cudaGetErrorString(err));

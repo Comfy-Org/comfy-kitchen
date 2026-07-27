@@ -52,6 +52,17 @@ namespace comfy {
 
 constexpr int kThreadsPerWarp = 32;
 
+// AdaLN modulation broadcast: scale/shift arrive as (R, D) with `group` = N / R
+// consecutive rows sharing one vector, so row `row` reads vector `row / group`.
+// Must match comfy_kitchen.backends._modulation.adaln_prep_modulation; using
+// modulo instead of divide is silently wrong for batch > 1.
+__device__ __forceinline__ int modulation_row(int row, int group, int n_rows) {
+    if (group == 1) return row;
+    if (group == n_rows) return 0;
+    if ((group & (group - 1)) == 0) return row >> (__ffs(group) - 1);
+    return row / group;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // NOTE: This file previously contained ATen-dependent type traits and macros.
 // Those have been removed to eliminate all PyTorch C++ dependencies.

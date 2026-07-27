@@ -203,3 +203,17 @@ inline cudaDataType_t dtype_code_to_cuda_type(int dtype_code) {
                                  __VA_ARGS__);                                  \
     })
 
+// Macro for turning a runtime bool into a compile-time constant, so a kernel
+// templated on it specializes both ways with no branch in the inner loop.
+// Usage: DISPATCH_BOOL(flag, kFlag, { /* code using kFlag as constexpr */ });
+#define DISPATCH_BOOL(value, const_name, ...)                                  \
+    [&] {                                                                       \
+        if (value) {                                                            \
+            constexpr bool const_name = true;                                   \
+            return __VA_ARGS__();                                               \
+        } else {                                                                \
+            constexpr bool const_name = false;                                  \
+            return __VA_ARGS__();                                               \
+        }                                                                       \
+    }()
+

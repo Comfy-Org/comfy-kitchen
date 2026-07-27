@@ -226,7 +226,8 @@ extern "C" {
         int dtype_code,
         cudaStream_t stream);
 
-    // Fused AdaLN — see ops/adaln.cu.
+    // Fused AdaLN — see ops/adaln.cu. subtract_mean selects LayerNorm (true)
+    // or RMSNorm (false) statistics.
     void launch_adaln_kernel(
         const void* x,
         const void* scale,
@@ -238,6 +239,7 @@ extern "C" {
         int64_t     shift_group,
         float       eps,
         int         dtype_code,
+        bool        subtract_mean,
         cudaStream_t stream);
 }
 
@@ -893,7 +895,7 @@ void awq_w4a16(
         M, N, K, group_size, dtype_code, stream);
 }
 
-// Nanobind wrapper for fused AdaLN
+// Nanobind wrapper for fused AdaLN (LayerNorm statistics)
 void adaln(
     nb::ndarray<nb::device::cuda> x,
     nb::ndarray<nb::device::cuda> scale,
@@ -910,7 +912,27 @@ void adaln(
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_adaln_kernel(
         x.data(), scale.data(), shift.data(), out.data(),
-        N, D, scale_group, shift_group, eps, dtype_code, stream);
+        N, D, scale_group, shift_group, eps, dtype_code, /*subtract_mean=*/true, stream);
+}
+
+// Nanobind wrapper for fused AdaLN with RMSNorm statistics
+void rms_adaln(
+    nb::ndarray<nb::device::cuda> x,
+    nb::ndarray<nb::device::cuda> scale,
+    nb::ndarray<nb::device::cuda> shift,
+    nb::ndarray<nb::device::cuda> out,
+    int64_t N,
+    int64_t D,
+    int64_t scale_group,
+    int64_t shift_group,
+    float   eps,
+    int     dtype_code,
+    uintptr_t stream_ptr)
+{
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_adaln_kernel(
+        x.data(), scale.data(), shift.data(), out.data(),
+        N, D, scale_group, shift_group, eps, dtype_code, /*subtract_mean=*/false, stream);
 }
 
 // Python module definition
@@ -1155,6 +1177,7 @@ extern "C" {
         int group_size,
         int input_dtype_code,
         bool stochastic,
+        int act_code,
         uint64_t seed,
         cudaStream_t stream);
 
@@ -1947,6 +1970,7 @@ void quantize_int8_rowwise_convrot64(
     nb::ndarray<float, nb::ndim<2>, nb::device::cuda> scales,
     int64_t group_size,
     bool stochastic,
+    int64_t act_code,
     uint64_t seed,
     uintptr_t stream_ptr) {
 
@@ -1974,6 +1998,7 @@ void quantize_int8_rowwise_convrot64(
         static_cast<int>(group_size),
         input_dtype_code,
         stochastic,
+        static_cast<int>(act_code),
         seed,
         stream);
 }
@@ -2152,6 +2177,7 @@ void int8_linear_m1(
             group_size,
             input_dtype_code,
             false,
+            /*act_code=*/0,
             0,
             stream);
     } else {
@@ -2493,12 +2519,16 @@ NB_MODULE(_C, m) {
           nb::arg("stream_ptr"));
 
     m.def("quantize_int8_rowwise_convrot64", &quantize_int8_rowwise_convrot64,
-          "Fused ConvRot rowwise INT8 quantization using 64-lane FHT groups",
+          "Fused ConvRot rowwise INT8 quantization using 64-lane FHT groups. "
+          "act_code applies an elementwise activation to the input first "
+          "(0 = none, 1 = gelu tanh-approx), folding an MLP's activation into "
+          "the quantizer instead of round-tripping it through HBM.",
           nb::arg("input"),
           nb::arg("output"),
           nb::arg("scales"),
           nb::arg("group_size"),
           nb::arg("stochastic"),
+          nb::arg("act_code"),
           nb::arg("seed"),
           nb::arg("stream_ptr"));
 
@@ -2648,6 +2678,20 @@ NB_MODULE(_C, m) {
 
     m.def("adaln", &adaln,
           "Fused AdaLN: layernorm(x) * (1 + scale) + shift",
+          nb::arg("x"),
+          nb::arg("scale"),
+          nb::arg("shift"),
+          nb::arg("out"),
+          nb::arg("N"),
+          nb::arg("D"),
+          nb::arg("scale_group"),
+          nb::arg("shift_group"),
+          nb::arg("eps"),
+          nb::arg("dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("rms_adaln", &rms_adaln,
+          "Fused AdaLN: rmsnorm(x) * (1 + scale) + shift",
           nb::arg("x"),
           nb::arg("scale"),
           nb::arg("shift"),

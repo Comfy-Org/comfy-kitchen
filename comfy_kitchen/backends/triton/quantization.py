@@ -17,6 +17,7 @@ import torch
 
 import triton
 import triton.language as tl
+from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
 from comfy_kitchen.float_utils import (
     F8_E4M3_MAX,
     F8_E5M2_MAX,
@@ -1023,6 +1024,7 @@ def int8_linear(
     out_dtype: torch.dtype = torch.bfloat16,
     convrot: bool = False,
     convrot_groupsize: int = 256,
+    input_act: str | None = None,
 ) -> torch.Tensor:
     """INT8 linear layer using fused Triton kernel.
 
@@ -1040,6 +1042,7 @@ def int8_linear(
     Returns:
         Result tensor [..., N].
     """
+    x = _apply_input_act(x, input_act)
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
 

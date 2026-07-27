@@ -17,6 +17,7 @@ def _adaln_fwd_kernel(
     eps,
     block_d: tl.constexpr,
     dtype: tl.constexpr,
+    subtract_mean: tl.constexpr,
 ):
     row = tl.program_id(0)
     x_base  = row * stride_xr
@@ -28,20 +29,26 @@ def _adaln_fwd_kernel(
 
     # Pass 1: mean + variance in one pass (accumulate sum and sum-of-squares),
     # so a single reduction yields both — matching the fused CUDA kernel.
+    # RMSNorm (subtract_mean=False) pins the mean to 0, so the normalize pass
+    # below is shared: it is LayerNorm with mean == 0.
     sum_acc   = tl.zeros([block_d], dtype=tl.float32)
     sumsq_acc = tl.zeros([block_d], dtype=tl.float32)
     for off in range(0, d, block_d):
         cols = off + tl.arange(0, block_d)
         mask = cols < d
         x = tl.load(x_ptr + x_base + cols, mask=mask, other=0.0).to(tl.float32)
-        sum_acc   += x
+        if subtract_mean:
+            sum_acc += x
         sumsq_acc += x * x
-    mean = tl.sum(sum_acc) / d
-    # var = E[x^2] - mean^2, clamped against tiny negative rounding for
-    # (near-)constant rows before the rsqrt.
-    var  = tl.sum(sumsq_acc) / d - mean * mean
-    var  = tl.maximum(var, 0.0)
-    rstd = tl.rsqrt(var + eps)
+    if subtract_mean:
+        mean = tl.sum(sum_acc) / d
+        # var = E[x^2] - mean^2, clamped against tiny negative rounding for
+        # (near-)constant rows before the rsqrt.
+        var  = tl.sum(sumsq_acc) / d - mean * mean
+        rstd = tl.rsqrt(tl.maximum(var, 0.0) + eps)
+    else:
+        mean = 0.0
+        rstd = tl.rsqrt(tl.sum(sumsq_acc) / d + eps)
 
     # Pass 2: normalize + modulate.
     for off in range(0, d, block_d):
@@ -54,7 +61,8 @@ def _adaln_fwd_kernel(
         tl.store(y_ptr + y_base + cols, out.to(dtype), mask=mask)
 
 
-def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def _adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float,
+           subtract_mean: bool) -> torch.Tensor:
     orig_shape = x.shape
     d = x.shape[-1]
     n = x.numel() // d
@@ -86,5 +94,16 @@ def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float 
         eps,
         block_d=block_d,
         dtype=dtype,
+        subtract_mean=subtract_mean,
     )
     return out.reshape(orig_shape)
+
+
+def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """layernorm(x) * (1 + scale) + shift"""
+    return _adaln(x, scale, shift, eps, subtract_mean=True)
+
+
+def rms_adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """rmsnorm(x) * (1 + scale) + shift"""
+    return _adaln(x, scale, shift, eps, subtract_mean=False)

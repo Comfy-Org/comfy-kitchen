@@ -905,7 +905,24 @@ __global__ void quantize_int8_rowwise_from_partials_kernel(
     }
 }
 
-template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC>
+// Optional elementwise activation applied on the way into the quantizer, so an
+// MLP's `linear(act(proj(x)))` never writes act's output to HBM just to read it
+// straight back. Elementwise means no reduction, so it is nearly free here.
+enum : int { kActNone = 0, kActGeluTanh = 1 };
+
+template<int ACT>
+__device__ __forceinline__ float apply_input_act(float v) {
+    if constexpr (ACT == kActGeluTanh) {
+        // Matches torch.nn.functional.gelu(x, approximate="tanh").
+        constexpr float kBeta = 0.7978845608028654f;   // sqrt(2/pi)
+        constexpr float kKappa = 0.044715f;
+        const float inner = kBeta * (v + kKappa * v * v * v);
+        return 0.5f * v * (1.0f + tanhf(inner));
+    }
+    return v;
+}
+
+template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC, int ACT = kActNone>
 __global__ void quantize_int8_rowwise_convrot64_kernel(
     const InputType* __restrict__ x,
     int8_t* __restrict__ q,
@@ -943,10 +960,10 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
         const int group_col = group * kConvRotGroup;
         const int64_t x_offset = row_offset + group_col + base;
 
-        const float x0 = active ? to_float(x[x_offset]) : 0.0f;
-        const float x1 = active ? to_float(x[x_offset + 1]) : 0.0f;
-        const float x2 = active ? to_float(x[x_offset + 2]) : 0.0f;
-        const float x3 = active ? to_float(x[x_offset + 3]) : 0.0f;
+        const float x0 = active ? apply_input_act<ACT>(to_float(x[x_offset])) : 0.0f;
+        const float x1 = active ? apply_input_act<ACT>(to_float(x[x_offset + 1])) : 0.0f;
+        const float x2 = active ? apply_input_act<ACT>(to_float(x[x_offset + 2])) : 0.0f;
+        const float x3 = active ? apply_input_act<ACT>(to_float(x[x_offset + 3])) : 0.0f;
         buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
         buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
         buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
@@ -1264,6 +1281,7 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
     int group_size,
     int input_dtype_code,
     bool stochastic,
+    int act_code,
     uint64_t seed,
     cudaStream_t stream)
 {
@@ -1279,10 +1297,11 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
     if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("convrot64 fused kernel only supports K <= INT_MAX");
     }
+    if (act_code != comfy::kActNone && act_code != comfy::kActGeluTanh) {
+        throw std::runtime_error("convrot64 fused kernel: unsupported input activation code");
+    }
 
     DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
-        constexpr int block_threads_single = 512;
-        constexpr int block_threads_multi = 1024;
         auto launch = [&](auto kernel, int block_threads) {
             const int groups_in_flight = block_threads / 64;
             const size_t smem_bytes =
@@ -1304,50 +1323,36 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                 seed);
         };
 
-        if (num_rows == 1) {
-            if (stochastic) {
-                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_single, true>,
-                       block_threads_single);
-            } else {
-                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_single, false>,
-                       block_threads_single);
-            }
-        } else if (num_cols == comfy::kConvRotGroup) {
-            constexpr int block_threads_256 = 64;
-            if (stochastic) {
-                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_256, true>,
-                       block_threads_256);
-            } else {
-                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_256, false>,
-                       block_threads_256);
-            }
-        } else if (num_cols == 2560) {
-            constexpr int block_threads_2560 = 640;
-            if (stochastic) {
-                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_2560, true>,
-                       block_threads_2560);
-            } else {
-                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_2560, false>,
-                       block_threads_2560);
-            }
-        } else if (num_cols == 6144) {
-            constexpr int block_threads_6144 = 768;
-            if (stochastic) {
-                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_6144, true>,
-                       block_threads_6144);
-            } else {
-                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_6144, false>,
-                       block_threads_6144);
-            }
-        } else {
-            if (stochastic) {
-                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_multi, true>,
-                       block_threads_multi);
-            } else {
-                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_multi, false>,
-                       block_threads_multi);
-            }
-        }
+        // Same block-size heuristic as before; STOCHASTIC and ACT are turned into
+        // compile-time constants so neither costs a branch in the inner loop.
+        const int block_threads = (num_rows == 1) ? 512
+                                : (num_cols == comfy::kConvRotGroup) ? 64
+                                : (num_cols == 2560) ? 640
+                                : (num_cols == 6144) ? 768
+                                : 1024;
+
+        DISPATCH_BOOL(stochastic, kStoch, [&] {
+            DISPATCH_BOOL(act_code == comfy::kActGeluTanh, kGelu, [&] {
+                constexpr int kAct = kGelu ? comfy::kActGeluTanh : comfy::kActNone;
+                switch (block_threads) {
+                    case 64:
+                        launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 64, kStoch, kAct>, 64);
+                        break;
+                    case 512:
+                        launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 512, kStoch, kAct>, 512);
+                        break;
+                    case 640:
+                        launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 640, kStoch, kAct>, 640);
+                        break;
+                    case 768:
+                        launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 768, kStoch, kAct>, 768);
+                        break;
+                    default:
+                        launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 1024, kStoch, kAct>, 1024);
+                        break;
+                }
+            });
+        });
     });
 
     cudaError_t err = cudaGetLastError();

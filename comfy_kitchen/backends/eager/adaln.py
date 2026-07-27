@@ -14,6 +14,12 @@ def adaln(x: Tensor, scale: Tensor, shift: Tensor, eps: float = 1e-6) -> Tensor:
     return normalized * (1 + scale) + shift
 
 
+def rms_adaln(x: Tensor, scale: Tensor, shift: Tensor, eps: float = 1e-6) -> Tensor:
+    """Fused AdaLN with RMSNorm: rmsnorm(x, elementwise_affine=False) * (1 + scale) + shift"""
+    normalized = functional.rms_norm(x, x.shape[-1:], eps=eps)
+    return normalized * (1 + scale) + shift
+
+
 # =============================================================================
 # torch.library Custom Op Definitions
 # =============================================================================
@@ -34,3 +40,21 @@ def _op_adaln(
 @_op_adaln.register_fake
 def _op_adaln_fake(x, scale, shift, eps):
     return torch.empty_like(x)
+
+
+@torch.library.custom_op("comfy_kitchen::rms_adaln", mutates_args=())
+def _op_rms_adaln(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    kwargs = {"x": x, "scale": scale, "shift": shift, "eps": eps}
+    impl = registry.get_implementation("rms_adaln", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_rms_adaln.register_fake
+def _op_rms_adaln_fake(x, scale, shift, eps):
+    return torch.empty_like(x)
+

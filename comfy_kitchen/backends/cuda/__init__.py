@@ -22,6 +22,7 @@ import torch
 
 __all__ = [
     "adaln",
+    "rms_adaln",
     "apply_rope",
     "apply_rope1",
     "apply_rope_split_half",
@@ -128,6 +129,12 @@ except Exception as e:
     _EXT_ERROR = f"Failed to load extension: {e}"
     _C = None  # type: ignore
 
+from comfy_kitchen.backends._activations import (  # noqa: E402
+    apply_input_act as _apply_input_act,
+)
+from comfy_kitchen.backends._activations import (  # noqa: E402
+    input_act_code as _input_act_code,
+)
 from comfy_kitchen.backends._modulation import adaln_prep_modulation  # noqa: E402
 from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
     DTYPE_CODE_TO_DTYPE,
@@ -313,12 +320,21 @@ def _pad_1d(x: torch.Tensor, padded_size: int) -> torch.Tensor:
     return torch.cat((x.reshape(-1), padding), dim=0).contiguous()
 
 
+_max_shared_memory_cache: dict[int, int] = {}
+
+
 def _max_dynamic_shared_memory_per_block(x: torch.Tensor) -> int:
     device_index = x.get_device()
-    props = torch.cuda.get_device_properties(x.get_device())
+    cached = _max_shared_memory_cache.get(device_index)
+    if cached is not None:
+        return cached
+    props = torch.cuda.get_device_properties(device_index)
     if _cuda_device_is_turing(device_index):
-        return props.shared_memory_per_block
-    return getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
+        limit = props.shared_memory_per_block
+    else:
+        limit = getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
+    _max_shared_memory_cache[device_index] = limit
+    return limit
 
 
 def _convrot_int8_fused_shared_memory_bytes(m: int, k: int) -> int:
@@ -1332,8 +1348,13 @@ def quantize_int8_rowwise_convrot64(
     weight_2d: torch.Tensor,
     group_size: int,
     stochastic_rounding: int | None = 0,
+    input_act: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused ConvRot row-wise INT8 quantization using 64-lane groups."""
+    """Fused ConvRot row-wise INT8 quantization using 64-lane groups.
+
+    input_act applies an elementwise activation on the way in, so an MLP's
+    `linear(act(proj(x)))` never materializes act's output in bf16.
+    """
     q_2d = torch.empty_like(weight_2d, dtype=torch.int8)
     scales_2d = torch.empty((weight_2d.shape[0], 1), dtype=torch.float32, device=weight_2d.device)
     stream_ptr = torch.cuda.current_stream(weight_2d.device).cuda_stream
@@ -1343,6 +1364,7 @@ def quantize_int8_rowwise_convrot64(
         _wrap_for_dlpack(scales_2d),
         group_size,
         stochastic_rounding is not None and stochastic_rounding > 0,
+        _input_act_code(input_act),
         int(stochastic_rounding or 0),
         stream_ptr,
     )
@@ -1693,12 +1715,26 @@ def int8_linear(
     out_dtype: torch.dtype = None,
     convrot: bool = False,
     convrot_groupsize: int = 256,
+    input_act: str | None = None,
 ) -> torch.Tensor:
     orig_shape = x.shape
     x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
     if not weight.is_contiguous():
         weight = weight.contiguous()
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+
+    # Only the fused ConvRot quantizer can absorb the activation; every other
+    # route applies it eagerly here and proceeds unchanged, so all paths agree.
+    _fused_convrot_ok = (
+        convrot
+        and convrot_groupsize == 256
+        and x_2d.shape[-1] % 256 == 0
+        and 256 <= x_2d.shape[-1] <= _CONVROT_FUSED_MAX_K
+        and _convrot_fused_shared_memory_fits(x_2d, x_2d.shape[-1], convrot_groupsize)
+    )
+    if input_act not in (None, "none") and not (_fused_convrot_ok and x_2d.shape[0] > 1):
+        x_2d = _apply_input_act(x_2d, input_act)
+        input_act = None
 
     m, k = x_2d.shape
     n, k_w = weight.shape
@@ -1750,12 +1786,7 @@ def int8_linear(
         # Fused wins for small K (narrow block) and large K (wide block); the
         # 5120 < K < 8192 band loses to the rotate-matmul path on both, so skip
         # it. (Real model hidden dims avoid that band anyway.)
-        if (
-            convrot_groupsize == 256
-            and k % 256 == 0
-            and 256 <= k <= _CONVROT_FUSED_MAX_K
-            and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
-        ):
+        if _fused_convrot_ok:
             x_qdata = torch.empty((m, k), dtype=torch.int8, device=x.device)
             x_scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
             _C.quantize_int8_rowwise_convrot64(
@@ -1764,6 +1795,7 @@ def int8_linear(
                 _wrap_for_dlpack(x_scale),
                 convrot_groupsize,
                 False,
+                _input_act_code(input_act),
                 0,
                 stream_ptr,
             )
@@ -1886,7 +1918,7 @@ def int8_linear(
     return out if is_2d_output else out.reshape(*orig_shape[:-1], n)
 
 
-def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def _adaln_impl(kernel, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float):
     orig_shape = x.shape
     d = x.shape[-1]
     n = x.numel() // d
@@ -1902,7 +1934,7 @@ def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float 
     dtype_code = DTYPE_TO_CODE[x.dtype]
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
 
-    _C.adaln(
+    kernel(
         _wrap_for_dlpack(x_flat),
         _wrap_for_dlpack(scale_flat),
         _wrap_for_dlpack(shift_flat),
@@ -1917,6 +1949,14 @@ def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float 
     )
 
     return out_flat.reshape(orig_shape)
+
+
+def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    return _adaln_impl(_C.adaln, x, scale, shift, eps)
+
+
+def rms_adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    return _adaln_impl(_C.rms_adaln, x, scale, shift, eps)
 
 
 def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -2518,6 +2558,19 @@ def _build_constraints() -> dict:
 
     constraints = {
         "adaln": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+                "scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+                "shift": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),        "rms_adaln": FunctionConstraints(
             params={
                 "x": ParamConstraint(
                     dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
