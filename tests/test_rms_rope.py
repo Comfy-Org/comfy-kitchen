@@ -51,7 +51,7 @@ def _shapes(layout, config):
     )
 
 
-def _run_backend(op_name, backend, args, layout, monkeypatch):
+def _run_backend(op_name, backend, args, monkeypatch):
     if backend == "cuda":
         from comfy_kitchen.backends.eager import rope as eager_rope
 
@@ -120,15 +120,11 @@ class TestRMSRope:
                 op_name,
                 backend,
                 (q, k, freqs_cis, q_scale, k_scale),
-                layout,
                 monkeypatch,
             )
 
-            q_ref = None
-            k_ref = None
-            if backend != "eager":
-                with ck.use_backend("eager"):
-                    q_ref, k_ref = ck.rms_rope(q, k, freqs_cis, q_scale, k_scale)
+            q_ref = _reference_rms_rope(q, freqs_cis, q_scale, 1e-6)
+            k_ref = _reference_rms_rope(k, freqs_cis, k_scale, 1e-6)
             self._validate(q, q_out, layout, dtype, freqs_dtype, config_name, backend, q_ref)
             self._validate(k, k_out, layout, dtype, freqs_dtype, config_name, backend, k_ref)
         else:
@@ -137,30 +133,24 @@ class TestRMSRope:
                 op_name,
                 backend,
                 (x, freqs_cis, q_scale),
-                layout,
                 monkeypatch,
             )
 
-            x_ref = None
-            if backend != "eager":
-                with ck.use_backend("eager"):
-                    x_ref = ck.rms_rope1(x, freqs_cis, q_scale)
+            x_ref = _reference_rms_rope(x, freqs_cis, q_scale, 1e-6)
             self._validate(x, x_out, layout, dtype, freqs_dtype, config_name, backend, x_ref)
 
-    def _validate(self, x, x_out, layout, dtype, freqs_dtype, config_name, backend, ref=None):
+    def _validate(self, x, x_out, layout, dtype, freqs_dtype, config_name, backend, ref):
         assert x_out.shape == x.shape, f"{layout} shape mismatch"
         assert x_out.dtype == x.dtype, f"{layout} dtype mismatch"
         assert x_out.device == x.device
-
-        if ref is not None:
-            assert_values_close(
-                x_out,
-                ref,
-                rtol=1e-3,
-                atol=1e-3,
-                max_mismatch_ratio=_max_mismatch(freqs_dtype, dtype),
-                name=(f"{config_name} {layout} x ({backend} vs eager, freqs={freqs_dtype})"),
-            )
+        assert_values_close(
+            x_out,
+            ref,
+            rtol=1e-3,
+            atol=1e-3,
+            max_mismatch_ratio=_max_mismatch(freqs_dtype, dtype),
+            name=f"{config_name} {layout} x ({backend} vs reference, freqs={freqs_dtype})",
+        )
 
 
 class TestRMSRopeSplitHalf:
@@ -179,7 +169,7 @@ class TestRMSRopeSplitHalf:
         _SPLIT_HALF_CONFIGS,
         ids=["WAN", "FLUX", "LTX"],
     )
-    def test_split_half_vs_reference(
+    def test_rms_split_half_vs_reference(
         self,
         op_name,
         backend,
@@ -208,7 +198,6 @@ class TestRMSRopeSplitHalf:
                 op_name,
                 backend,
                 (q, k, freqs_cis, q_scale, k_scale),
-                layout,
                 monkeypatch,
             )
             q_ref = _reference_rms_rope(q, freqs_cis, q_scale, 1e-6, split_half=True)
@@ -221,91 +210,10 @@ class TestRMSRopeSplitHalf:
                 op_name,
                 backend,
                 (x, freqs_cis, q_scale),
-                layout,
                 monkeypatch,
             )
             ref = _reference_rms_rope(x, freqs_cis, q_scale, 1e-6, split_half=True)
             self._validate(x, x_out, ref, layout, dtype, freqs_dtype, config_name, backend)
-
-    @pytest.mark.parametrize("op_name", ["rms_rope_split_half", "rms_rope_split_half1"])
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-    @pytest.mark.parametrize(
-        "freqs_dtype",
-        [torch.float32, torch.float16, torch.bfloat16],
-        ids=["freqs_fp32", "freqs_fp16", "freqs_bf16"],
-    )
-    def test_split_half_cross_backend(self, op_name, device, seed, dtype, freqs_dtype, monkeypatch):
-        if device != "cuda":
-            pytest.skip("cross-backend test requires CUDA")
-
-        backends = get_capable_backends(op_name, device)
-        if len(backends) < 2:
-            pytest.skip(f"need at least 2 backends for cross-backend test, got {backends}")
-        if "eager" not in backends:
-            pytest.skip("cross-backend test requires eager as the reference backend")
-
-        batch, seq_len, heads, head_dim = 2, 256, 16, 128
-        x_shape = (batch, seq_len, heads, head_dim)
-        freqs_shape = (1, seq_len, 1, head_dim // 2, 2, 2)
-        freqs_cis = torch.randn(freqs_shape, dtype=freqs_dtype, device=device)
-        q_scale = torch.randn(head_dim, dtype=torch.float32, device=device)
-
-        results = {}
-        if op_name == "rms_rope_split_half":
-            q = torch.randn(x_shape, dtype=dtype, device=device)
-            k = torch.randn(x_shape, dtype=dtype, device=device)
-            k_scale = torch.randn(head_dim, dtype=torch.float32, device=device)
-            for backend in backends:
-                results[backend] = _run_backend(
-                    op_name,
-                    backend,
-                    (q, k, freqs_cis, q_scale, k_scale),
-                    "BNHD",
-                    monkeypatch,
-                )
-            ref_q, ref_k = results["eager"]
-            for backend, (q_out, k_out) in results.items():
-                if backend == "eager":
-                    continue
-                mismatch = _max_mismatch(freqs_dtype, dtype)
-                assert_values_close(
-                    q_out,
-                    ref_q,
-                    rtol=1e-3,
-                    atol=1e-3,
-                    max_mismatch_ratio=mismatch,
-                    name=f"rms_rope_split_half q ({backend} vs eager)",
-                )
-                assert_values_close(
-                    k_out,
-                    ref_k,
-                    rtol=1e-3,
-                    atol=1e-3,
-                    max_mismatch_ratio=mismatch,
-                    name=f"rms_rope_split_half k ({backend} vs eager)",
-                )
-        else:
-            x = torch.randn(x_shape, dtype=dtype, device=device)
-            for backend in backends:
-                results[backend] = _run_backend(
-                    op_name,
-                    backend,
-                    (x, freqs_cis, q_scale),
-                    "BNHD",
-                    monkeypatch,
-                )
-            ref = results["eager"]
-            for backend, out in results.items():
-                if backend == "eager":
-                    continue
-                assert_values_close(
-                    out,
-                    ref,
-                    rtol=1e-3,
-                    atol=1e-3,
-                    max_mismatch_ratio=_max_mismatch(freqs_dtype, dtype),
-                    name=f"rms_rope_split_half1 ({backend} vs eager)",
-                )
 
     def _validate(self, x, x_out, ref, layout, dtype, freqs_dtype, config_name, backend):
         assert x_out.shape == x.shape, f"{config_name} {layout} shape mismatch"
@@ -337,9 +245,9 @@ def test_rms_rope_cuda_multiple_of_32(op_name, head_dim, monkeypatch):
     split_half = "split_half" in op_name
 
     if op_name.endswith("1"):
-        q_out = _run_backend(op_name, "cuda", (q, freqs, scale), "BHND", monkeypatch)
+        q_out = _run_backend(op_name, "cuda", (q, freqs, scale), monkeypatch)
     else:
-        q_out, k_out = _run_backend(op_name, "cuda", (q, k, freqs, scale), "BHND", monkeypatch)
+        q_out, k_out = _run_backend(op_name, "cuda", (q, k, freqs, scale), monkeypatch)
 
     q_ref = _reference_rms_rope(q, freqs, scale, 1e-6, split_half=split_half)
     assert_values_close(
@@ -360,3 +268,152 @@ def test_rms_rope_cuda_multiple_of_32(op_name, head_dim, monkeypatch):
             max_mismatch_ratio=0.25,
             name=f"{op_name} D={head_dim} k",
         )
+
+
+@pytest.mark.parametrize("op_name", ["rms_rope1", "rms_rope1_"])
+@pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+def test_rms_rope_nondefault_epsilon_and_broadcast(
+    op_name, backend, device, monkeypatch
+):
+    if backend not in get_capable_backends(op_name, device):
+        pytest.skip(f"{backend} does not support {op_name} on {device}")
+
+    epsilon = 0.125
+    x = torch.randn(2, 3, 5, 64, device=device, dtype=torch.float16)
+    freqs = torch.randn(1, 1, 1, 32, 2, 2, device=device, dtype=torch.float32)
+    scale = torch.randn(64, device=device, dtype=torch.float32)
+    reference = _reference_rms_rope(x, freqs, scale, epsilon)
+    pointer = x.data_ptr()
+    actual = _run_backend(op_name, backend, (x, freqs, scale, epsilon), monkeypatch)
+
+    if op_name.endswith("_"):
+        assert actual.data_ptr() == pointer
+    torch.testing.assert_close(actual, reference, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+@pytest.mark.parametrize("split_half", [False, True])
+@pytest.mark.parametrize("last_dim_strided", [False, True])
+def test_rms_rope_strided_views(
+    backend, split_half, last_dim_strided, device, monkeypatch
+):
+    op_name = "rms_rope_split_half1" if split_half else "rms_rope1"
+    if backend not in get_capable_backends(op_name, device):
+        pytest.skip(f"{backend} does not support {op_name} on {device}")
+    head_dim = 64
+    width = head_dim * (2 if last_dim_strided else 1)
+    storage = torch.randn(2, 6, 5, width, device=device, dtype=torch.float16)
+    x = storage[:, ::2, :, ::2] if last_dim_strided else storage[:, ::2]
+    freq_storage = torch.randn(
+        2, 1, 5, head_dim, 4, 4, device=device, dtype=torch.float32
+    )
+    freqs = freq_storage[:, :, :, ::2, ::2, ::2]
+    scale_storage = torch.randn(head_dim * 2, device=device, dtype=torch.float32)
+    scale = scale_storage[::2]
+    reference = _reference_rms_rope(
+        x, freqs, scale, 1e-6, split_half=split_half
+    )
+    actual = _run_backend(op_name, backend, (x, freqs, scale), monkeypatch)
+    torch.testing.assert_close(actual, reference, rtol=2e-3, atol=2e-3)
+
+
+def test_rms_rope_triton_expanded_input(device):
+    if "triton" not in get_capable_backends("rms_rope1", device):
+        pytest.skip(f"triton does not support rms_rope1 on {device}")
+
+    x = torch.randn(1, 1, 1, 64, device=device, dtype=torch.float16).expand(
+        2, 3, 5, 64
+    )
+    freqs = torch.randn(2, 1, 5, 32, 2, 2, device=device, dtype=torch.float32)
+    scale = torch.randn(64, device=device, dtype=torch.float32)
+    reference = _reference_rms_rope(x, freqs, scale, 1e-6)
+
+    with ck.use_backend("triton"):
+        actual = ck.rms_rope1(x, freqs, scale)
+
+    torch.testing.assert_close(actual, reference, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize(
+    "op_name",
+    [
+        "rms_rope",
+        "rms_rope_",
+        "rms_rope_split_half",
+        "rms_rope_split_half_",
+    ],
+)
+@pytest.mark.parametrize("backend", ["cuda", "triton"])
+@pytest.mark.parametrize("layout", ["BHND", "BNHD"])
+def test_rms_rope_gqa_different_qk_shapes(
+    op_name, backend, layout, device, monkeypatch
+):
+    if backend not in get_capable_backends(op_name, device):
+        pytest.skip(f"{backend} does not support {op_name} on {device}")
+
+    if layout == "BHND":
+        q_shape = (2, 8, 5, 64)
+        k_shape = (2, 2, 5, 64)
+        freqs_shape = (1, 1, 5, 32, 2, 2)
+    else:
+        q_shape = (2, 5, 8, 64)
+        k_shape = (2, 5, 2, 64)
+        freqs_shape = (1, 5, 1, 32, 2, 2)
+
+    q = torch.randn(q_shape, device=device, dtype=torch.float16)
+    k = torch.randn(k_shape, device=device, dtype=torch.float16)
+    freqs = torch.randn(freqs_shape, device=device, dtype=torch.float32)
+    q_scale = torch.randn(64, device=device, dtype=torch.float32)
+    k_scale = torch.randn(64, device=device, dtype=torch.float32)
+    split_half = "split_half" in op_name
+    reference = (
+        _reference_rms_rope(q, freqs, q_scale, 1e-6, split_half=split_half),
+        _reference_rms_rope(k, freqs, k_scale, 1e-6, split_half=split_half),
+    )
+
+    pointers = (q.data_ptr(), k.data_ptr())
+    actual = _run_backend(
+        op_name, backend, (q, k, freqs, q_scale, k_scale), monkeypatch
+    )
+
+    assert actual[0].shape == q_shape
+    assert actual[1].shape == k_shape
+    if op_name.endswith("_"):
+        assert (actual[0].data_ptr(), actual[1].data_ptr()) == pointers
+    for result, expected in zip(actual, reference, strict=True):
+        torch.testing.assert_close(result, expected, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize(
+    "op_name",
+    [
+        "rms_rope_",
+        "rms_rope1_",
+        "rms_rope_split_half_",
+        "rms_rope_split_half1_",
+    ],
+)
+@pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+def test_rms_rope_inplace_storage(op_name, backend, device, monkeypatch):
+    if backend not in get_capable_backends(op_name, device):
+        pytest.skip(f"{backend} does not support {op_name} on {device}")
+    paired = not op_name.endswith("1_")
+    functional_name = op_name[:-1]
+    freqs = torch.randn(1, 1, 3, 32, 2, 2, device=device, dtype=torch.float32)
+    q = torch.randn(2, 4, 3, 128, device=device, dtype=torch.float16)[..., ::2]
+    k = torch.randn_like(q)
+    scale = torch.randn(128, device=device, dtype=torch.float32)[::2]
+    args = (q, k, freqs, scale) if paired else (q, freqs, scale)
+    reference_args = tuple(a.clone() if torch.is_tensor(a) else a for a in args)
+    with ck.use_backend("eager"):
+        reference = getattr(ck, functional_name)(*reference_args)
+    tensors = (q, k) if paired else (q,)
+    pointers = tuple(x.data_ptr() for x in tensors)
+    strides = tuple(x.stride() for x in tensors)
+    result = _run_backend(op_name, backend, args, monkeypatch)
+    outputs = result if paired else (result,)
+    assert tuple(x.data_ptr() for x in outputs) == pointers
+    assert tuple(x.stride() for x in outputs) == strides
+    refs = reference if paired else (reference,)
+    for actual, expected in zip(outputs, refs, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)

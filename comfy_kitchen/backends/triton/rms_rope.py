@@ -2,12 +2,7 @@ import torch
 
 import triton
 import triton.language as tl
-
-
-def _detect_seq_axis(x: torch.Tensor, freqs_cis: torch.Tensor) -> int:
-    if freqs_cis.shape[1] == 1 and freqs_cis.shape[2] in (1, x.shape[2]):
-        return 2
-    return 1
+from comfy_kitchen._rope_utils import check_rope_inplace, detect_rms_rope_bnhd
 
 
 @triton.jit
@@ -18,10 +13,15 @@ def rms_rope_kernel(
     out_ptr,
     head_dim,
     freqs_batch,
+    freqs_seq,
     stride_x_batch,
     stride_x_head,
     stride_x_seq,
     stride_x_dim,
+    stride_out_batch,
+    stride_out_head,
+    stride_out_seq,
+    stride_out_dim,
     stride_freqs_batch,
     stride_freqs_seq,
     stride_freqs_dim,
@@ -43,7 +43,10 @@ def rms_rope_kernel(
 
     x_offset = (batch_idx * stride_x_batch + head_idx * stride_x_head + seq_idx * stride_x_seq)
     x_base = x_ptr + x_offset
-    out_base = out_ptr + x_offset
+    out_offset = (batch_idx * stride_out_batch +
+                  head_idx * stride_out_head +
+                  seq_idx * stride_out_seq)
+    out_base = out_ptr + out_offset
 
     full_offsets = tl.arange(0, block_size * 2)
     full_mask = full_offsets < head_dim
@@ -70,9 +73,10 @@ def rms_rope_kernel(
     x_1 = (x_1 * inv_rms * scale_1).to(norm_dtype).to(compute_dtype)
 
     freqs_batch_idx = tl.where(freqs_batch == 1, 0, batch_idx)
+    freqs_seq_idx = tl.where(freqs_seq == 1, 0, seq_idx)
     freqs_base = (freqs_ptr +
                   freqs_batch_idx * stride_freqs_batch +
-                  seq_idx * stride_freqs_seq +
+                  freqs_seq_idx * stride_freqs_seq +
                   offsets * stride_freqs_dim)
 
     freqs_00 = tl.load(freqs_base, mask=mask, other=0.0)
@@ -83,9 +87,8 @@ def rms_rope_kernel(
     out_0 = freqs_00 * x_0 + freqs_01 * x_1
     out_1 = freqs_10 * x_0 + freqs_11 * x_1
 
-    tl.store(out_base + dim_idx_0 * stride_x_dim, out_0, mask=mask)
-    tl.store(out_base + dim_idx_1 * stride_x_dim, out_1, mask=mask)
-
+    tl.store(out_base + dim_idx_0 * stride_out_dim, out_0, mask=mask)
+    tl.store(out_base + dim_idx_1 * stride_out_dim, out_1, mask=mask)
 
 def _rms_rope(
     x: torch.Tensor,
@@ -93,21 +96,17 @@ def _rms_rope(
     scale: torch.Tensor,
     epsilon: float,
     split_half: bool,
+    inplace: bool = False,
 ) -> torch.Tensor:
-    if not x.is_contiguous():
-        x = x.contiguous()
-
-    if not freqs_cis.is_contiguous():
-        freqs_cis = freqs_cis.contiguous()
-
     if not scale.is_contiguous():
         scale = scale.contiguous()
 
     batch, dim1, dim2, head_dim = x.shape
     freqs_batch = freqs_cis.shape[0]
-    seq_axis = _detect_seq_axis(x, freqs_cis)
-
-    if seq_axis == 1:
+    bnhd = detect_rms_rope_bnhd(x, freqs_cis)
+    if bnhd is None:
+        raise ValueError("RMS-RoPE frequencies are not broadcastable to input")
+    if bnhd:
         num_heads = dim2
         seq_len = dim1
         stride_x_head = x.stride(2)
@@ -125,11 +124,9 @@ def _rms_rope(
         torch.float16: tl.float16,
         torch.bfloat16: tl.bfloat16,
     }
-
-    out = torch.empty_like(x)
+    out = x if inplace else torch.empty_like(x)
     block_size = triton.next_power_of_2(head_dim // 2)
     grid = (batch, num_heads, seq_len)
-
     rms_rope_kernel[grid](
         x,
         freqs_cis,
@@ -137,10 +134,15 @@ def _rms_rope(
         out,
         head_dim,
         freqs_batch,
+        freqs_cis.shape[1 if bnhd else 2],
         x.stride(0),
         stride_x_head,
         stride_x_seq,
         x.stride(3),
+        out.stride(0),
+        out.stride(2 if bnhd else 1),
+        out.stride(1 if bnhd else 2),
+        out.stride(3),
         freqs_cis.stride(0),
         stride_freqs_seq,
         freqs_cis.stride(3),
@@ -152,7 +154,6 @@ def _rms_rope(
         block_size=block_size,
         split_half=split_half,
     )
-
     return out
 
 
@@ -165,6 +166,16 @@ def rms_rope1(
     return _rms_rope(x, freqs_cis, scale, epsilon, split_half=False)
 
 
+def rms_rope1_(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    check_rope_inplace(x, readonly=(freqs_cis, scale))
+    return _rms_rope(x, freqs_cis, scale, epsilon, split_half=False, inplace=True)
+
+
 def rms_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -175,10 +186,26 @@ def rms_rope(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k_scale is None:
         k_scale = q_scale
-
     return (
         _rms_rope(q, freqs_cis, q_scale, epsilon, split_half=False),
         _rms_rope(k, freqs_cis, k_scale, epsilon, split_half=False),
+    )
+
+
+def rms_rope_(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k_scale is None:
+        k_scale = q_scale
+    check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
+    return (
+        _rms_rope(q, freqs_cis, q_scale, epsilon, split_half=False, inplace=True),
+        _rms_rope(k, freqs_cis, k_scale, epsilon, split_half=False, inplace=True),
     )
 
 
@@ -191,6 +218,16 @@ def rms_rope_split_half1(
     return _rms_rope(x, freqs_cis, scale, epsilon, split_half=True)
 
 
+def rms_rope_split_half1_(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    check_rope_inplace(x, readonly=(freqs_cis, scale))
+    return _rms_rope(x, freqs_cis, scale, epsilon, split_half=True, inplace=True)
+
+
 def rms_rope_split_half(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -201,8 +238,24 @@ def rms_rope_split_half(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k_scale is None:
         k_scale = q_scale
-
     return (
         _rms_rope(q, freqs_cis, q_scale, epsilon, split_half=True),
         _rms_rope(k, freqs_cis, k_scale, epsilon, split_half=True),
+    )
+
+
+def rms_rope_split_half_(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k_scale is None:
+        k_scale = q_scale
+    check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
+    return (
+        _rms_rope(q, freqs_cis, q_scale, epsilon, split_half=True, inplace=True),
+        _rms_rope(k, freqs_cis, k_scale, epsilon, split_half=True, inplace=True),
     )

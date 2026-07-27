@@ -20,17 +20,27 @@ import sys
 
 import torch
 
+from comfy_kitchen._rope_utils import check_rope_inplace, detect_rms_rope_bnhd
+
 __all__ = [
     "adaln",
     "rms_adaln",
     "apply_rope",
+    "apply_rope_",
     "apply_rope1",
+    "apply_rope1_",
     "apply_rope_split_half",
+    "apply_rope_split_half_",
     "apply_rope_split_half1",
+    "apply_rope_split_half1_",
     "rms_rope",
+    "rms_rope_",
     "rms_rope1",
+    "rms_rope1_",
     "rms_rope_split_half",
+    "rms_rope_split_half_",
     "rms_rope_split_half1",
+    "rms_rope_split_half1_",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
     "dequantize_int8_simple",
@@ -156,6 +166,7 @@ from comfy_kitchen.constraints import (  # noqa: E402
     FunctionConstraints,
     MinDims,
     ParamConstraint,
+    ValidationResult,
 )
 from comfy_kitchen.float_utils import roundup  # noqa: E402
 from comfy_kitchen.registry import registry  # noqa: E402
@@ -1959,13 +1970,10 @@ def rms_adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: fl
     return _adaln_impl(_C.rms_adaln, x, scale, shift, eps)
 
 
-def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    if not x.is_contiguous():
-        x = x.contiguous()
-    if not freqs_cis.is_contiguous():
-        freqs_cis = freqs_cis.contiguous()
-
-    x_out = torch.empty_like(x)
+def _apply_rope1_cuda(
+    x: torch.Tensor, freqs_cis: torch.Tensor, *, split_half: bool, inplace: bool
+) -> torch.Tensor:
+    x_out = x if inplace else torch.empty_like(x)
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
 
     _C.apply_rope(
@@ -1975,27 +1983,22 @@ def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         None,  # xk
         None,  # xk_out
         stream_ptr,
-        False,
+        split_half,
     )
-
     return x_out
 
 
-def apply_rope(
-    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+def _apply_rope_cuda(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor, *,
+    split_half: bool, inplace: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if xq.shape != xk.shape:  # TODO: fix cuda apply_rope to not need this?
-        return apply_rope1(xq, freqs_cis), apply_rope1(xk, freqs_cis)
-
-    if not xq.is_contiguous():
-        xq = xq.contiguous()
-    if not xk.is_contiguous():
-        xk = xk.contiguous()
-    if not freqs_cis.is_contiguous():
-        freqs_cis = freqs_cis.contiguous()
-
-    xq_out = torch.empty_like(xq)
-    xk_out = torch.empty_like(xk)
+    if xq.shape != xk.shape:
+        return (
+            _apply_rope1_cuda(xq, freqs_cis, split_half=split_half, inplace=inplace),
+            _apply_rope1_cuda(xk, freqs_cis, split_half=split_half, inplace=inplace),
+        )
+    xq_out = xq if inplace else torch.empty_like(xq)
+    xk_out = xk if inplace else torch.empty_like(xk)
     stream_ptr = torch.cuda.current_stream(xq.device).cuda_stream
 
     _C.apply_rope(
@@ -2005,11 +2008,66 @@ def apply_rope(
         _wrap_for_dlpack(xk),
         _wrap_for_dlpack(xk_out),
         stream_ptr,
-        False,
+        split_half,
     )
-
     return xq_out, xk_out
 
+
+def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    return _apply_rope1_cuda(x, freqs_cis, split_half=False, inplace=False)
+
+
+def apply_rope1_(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    check_rope_inplace(x, readonly=(freqs_cis,))
+    return _apply_rope1_cuda(x, freqs_cis, split_half=False, inplace=True)
+
+
+def apply_rope(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _apply_rope_cuda(xq, xk, freqs_cis, split_half=False, inplace=False)
+
+
+def apply_rope_(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    check_rope_inplace(xq, xk, readonly=(freqs_cis,))
+    return _apply_rope_cuda(xq, xk, freqs_cis, split_half=False, inplace=True)
+
+
+def _validate_cuda_rms_rope1(kwargs: dict[str, object]) -> ValidationResult:
+    x = kwargs["x"]
+    freqs_cis = kwargs["freqs_cis"]
+    assert isinstance(x, torch.Tensor) and isinstance(freqs_cis, torch.Tensor)
+    if _native_rms_rope_layout(x, freqs_cis, extension_op="rms_rope1") is None:
+        return ValidationResult.fail("x", "CUDA fused RMS-RoPE requires a supported native layout")
+    return ValidationResult.ok()
+
+
+def _validate_cuda_rms_rope(kwargs: dict[str, object]) -> ValidationResult:
+    q, k = kwargs["q"], kwargs["k"]
+    q_scale = kwargs.get("q_scale")
+    if q_scale is None:
+        return ValidationResult.fail("q_scale", "is required for fused CUDA RMS-RoPE")
+    k_scale = kwargs.get("k_scale")
+    if k_scale is None:
+        k_scale = q_scale
+    assert all(isinstance(value, torch.Tensor) for value in (q, k, q_scale, k_scale))
+    freqs_cis = kwargs["freqs_cis"]
+    extension_op = "rms_rope" if k.shape == q.shape else "rms_rope1"
+    if _native_rms_rope_layout(q, freqs_cis, extension_op=extension_op) is None:
+        return ValidationResult.fail("q", "CUDA fused RMS-RoPE requires a supported native layout")
+    if k.dtype != q.dtype:
+        return ValidationResult.fail("k", "must have the same dtype as q for fused CUDA RMS-RoPE")
+    if k.shape != q.shape and _native_rms_rope_layout(k, freqs_cis, extension_op="rms_rope1") is None:
+        return ValidationResult.fail("k", "CUDA fused RMS-RoPE requires a supported native layout")
+    if q_scale.ndim != 1 or q_scale.numel() != q.shape[-1]:
+        return ValidationResult.fail("q_scale", "must be a 1D tensor matching q head_dim")
+    if k_scale.ndim != 1 or k_scale.numel() != k.shape[-1]:
+        return ValidationResult.fail("k_scale", "must be a 1D tensor matching k head_dim")
+    if k.shape == q.shape and k_scale.dtype != q_scale.dtype:
+        return ValidationResult.fail("k_scale", "must match q_scale dtype for fused CUDA RMS-RoPE")
+    return ValidationResult.ok()
 
 
 def _native_rms_rope_layout(
@@ -2018,33 +2076,16 @@ def _native_rms_rope_layout(
     *,
     extension_op: str,
 ) -> bool | None:
-    if not (
+    bnhd = detect_rms_rope_bnhd(x, freqs_cis)
+    if bnhd is None or not (
         _C is not None
         and hasattr(_C, extension_op)
-        and x.ndim == 4
         and x.shape[-1] >= 32
         and x.shape[-1] % 32 == 0
         and x.dtype in (torch.float16, torch.bfloat16)
-        and freqs_cis.ndim == 6
-        and freqs_cis.shape[0] in (1, x.shape[0])
-        and freqs_cis.shape[3:] == (x.shape[-1] // 2, 2, 2)
     ):
         return None
-
-    # BHND freqs are (B|1, 1, N|1, D/2, 2, 2); BNHD exchanges axes 1/2.
-    if freqs_cis.shape[1] == 1 and freqs_cis.shape[2] in (1, x.shape[2]):
-        return False
-    if freqs_cis.shape[1] in (1, x.shape[1]) and freqs_cis.shape[2] == 1:
-        return True
-    return None
-
-
-def _has_vectorizable_rms_rope_rows(x: torch.Tensor) -> bool:
-    return (
-        x.stride(-1) == 1
-        and x.data_ptr() % 8 == 0
-        and all(stride % 4 == 0 for stride in x.stride()[:-1])
-    )
+    return bnhd
 
 
 def _rms_rope1_cuda(
@@ -2054,25 +2095,11 @@ def _rms_rope1_cuda(
     epsilon: float,
     *,
     split_half: bool,
+    inplace: bool,
 ) -> torch.Tensor:
-    bnhd = _native_rms_rope_layout(x, freqs_cis, extension_op="rms_rope1")
-    if bnhd is None:
-        from comfy_kitchen.backends.eager.rope import (
-            rms_rope1 as eager_rms_rope1,
-        )
-        from comfy_kitchen.backends.eager.rope import (
-            rms_rope_split_half1 as eager_rms_rope_split_half1,
-        )
+    assert _native_rms_rope_layout(x, freqs_cis, extension_op="rms_rope1") is not None
 
-        impl = eager_rms_rope_split_half1 if split_half else eager_rms_rope1
-        return impl(x, freqs_cis, scale, epsilon)
-
-    if not _has_vectorizable_rms_rope_rows(x):
-        x = x.contiguous()
-    freqs_cis = freqs_cis.contiguous()
-    scale = scale.contiguous()
-
-    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    out = x if inplace else torch.empty_like(x)
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
     _C.rms_rope1(
         _wrap_for_dlpack(x),
@@ -2082,7 +2109,6 @@ def _rms_rope1_cuda(
         epsilon,
         stream_ptr,
         split_half,
-        bnhd,
     )
     return out
 
@@ -2096,42 +2122,27 @@ def _rms_rope_cuda(
     epsilon: float,
     *,
     split_half: bool,
+    inplace: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k_scale is None:
         k_scale = q_scale
 
-    bnhd = _native_rms_rope_layout(
-        q, freqs_cis, extension_op="rms_rope"
-    )
-    native_fast_path = (
-        bnhd is not None
-        and k.shape == q.shape
-        and k.dtype == q.dtype
-        and k_scale.ndim == 1
-        and k_scale.numel() == q.shape[-1]
-        and k_scale.dtype == q_scale.dtype
-    )
-    if not native_fast_path:
-        from comfy_kitchen.backends.eager.rope import (
-            rms_rope as eager_rms_rope,
-        )
-        from comfy_kitchen.backends.eager.rope import (
-            rms_rope_split_half as eager_rms_rope_split_half,
+    if q.shape != k.shape:
+        return (
+            _rms_rope1_cuda(
+                q, freqs_cis, q_scale, epsilon,
+                split_half=split_half, inplace=inplace,
+            ),
+            _rms_rope1_cuda(
+                k, freqs_cis, k_scale, epsilon,
+                split_half=split_half, inplace=inplace,
+            ),
         )
 
-        impl = eager_rms_rope_split_half if split_half else eager_rms_rope
-        return impl(q, k, freqs_cis, q_scale, k_scale, epsilon)
+    assert _native_rms_rope_layout(q, freqs_cis, extension_op="rms_rope") is not None
 
-    if not _has_vectorizable_rms_rope_rows(q):
-        q = q.contiguous()
-    if not _has_vectorizable_rms_rope_rows(k):
-        k = k.contiguous()
-    freqs_cis = freqs_cis.contiguous()
-    q_scale = q_scale.contiguous()
-    k_scale = k_scale.contiguous()
-
-    q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+    q_out = q if inplace else torch.empty_like(q)
+    k_out = k if inplace else torch.empty_like(k)
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
     _C.rms_rope(
         _wrap_for_dlpack(q),
@@ -2144,7 +2155,6 @@ def _rms_rope_cuda(
         epsilon,
         stream_ptr,
         split_half,
-        bnhd,
     )
     return q_out, k_out
 
@@ -2155,7 +2165,17 @@ def rms_rope1(
     scale: torch.Tensor,
     epsilon: float = 1e-6,
 ) -> torch.Tensor:
-    return _rms_rope1_cuda(x, freqs_cis, scale, epsilon, split_half=False)
+    return _rms_rope1_cuda(x, freqs_cis, scale, epsilon, split_half=False, inplace=False)
+
+
+def rms_rope1_(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    check_rope_inplace(x, readonly=(freqs_cis, scale))
+    return _rms_rope1_cuda(x, freqs_cis, scale, epsilon, split_half=False, inplace=True)
 
 
 def rms_rope(
@@ -2166,7 +2186,27 @@ def rms_rope(
     k_scale: torch.Tensor | None = None,
     epsilon: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _rms_rope_cuda(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half=False)
+    return _rms_rope_cuda(
+        q, k, freqs_cis, q_scale, k_scale, epsilon,
+        split_half=False, inplace=False,
+    )
+
+
+def rms_rope_(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k_scale is None:
+        k_scale = q_scale
+    check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
+    return _rms_rope_cuda(
+        q, k, freqs_cis, q_scale, k_scale, epsilon,
+        split_half=False, inplace=True,
+    )
 
 
 def rms_rope_split_half1(
@@ -2175,7 +2215,17 @@ def rms_rope_split_half1(
     scale: torch.Tensor,
     epsilon: float = 1e-6,
 ) -> torch.Tensor:
-    return _rms_rope1_cuda(x, freqs_cis, scale, epsilon, split_half=True)
+    return _rms_rope1_cuda(x, freqs_cis, scale, epsilon, split_half=True, inplace=False)
+
+
+def rms_rope_split_half1_(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    check_rope_inplace(x, readonly=(freqs_cis, scale))
+    return _rms_rope1_cuda(x, freqs_cis, scale, epsilon, split_half=True, inplace=True)
 
 
 def rms_rope_split_half(
@@ -2186,30 +2236,39 @@ def rms_rope_split_half(
     k_scale: torch.Tensor | None = None,
     epsilon: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _rms_rope_cuda(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half=True)
+    return _rms_rope_cuda(
+        q, k, freqs_cis, q_scale, k_scale, epsilon,
+        split_half=True, inplace=False,
+    )
+
+
+def rms_rope_split_half_(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if k_scale is None:
+        k_scale = q_scale
+    check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
+    return _rms_rope_cuda(
+        q, k, freqs_cis, q_scale, k_scale, epsilon,
+        split_half=True, inplace=True,
+    )
 
 
 
 def apply_rope_split_half1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    if not x.is_contiguous():
-        x = x.contiguous()
-    if not freqs_cis.is_contiguous():
-        freqs_cis = freqs_cis.contiguous()
+    return _apply_rope1_cuda(x, freqs_cis, split_half=True, inplace=False)
 
-    x_out = torch.empty_like(x)
-    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
 
-    _C.apply_rope(
-        _wrap_for_dlpack(x),
-        _wrap_for_dlpack(freqs_cis),
-        _wrap_for_dlpack(x_out),
-        None,
-        None,
-        stream_ptr,
-        True,
-    )
-
-    return x_out
+def apply_rope_split_half1_(
+    x: torch.Tensor, freqs_cis: torch.Tensor
+) -> torch.Tensor:
+    check_rope_inplace(x, readonly=(freqs_cis,))
+    return _apply_rope1_cuda(x, freqs_cis, split_half=True, inplace=True)
 
 
 def apply_rope_split_half(
@@ -2217,31 +2276,16 @@ def apply_rope_split_half(
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if xq.shape != xk.shape:
-        return apply_rope_split_half1(xq, freqs_cis), apply_rope_split_half1(xk, freqs_cis)
+    return _apply_rope_cuda(xq, xk, freqs_cis, split_half=True, inplace=False)
 
-    if not xq.is_contiguous():
-        xq = xq.contiguous()
-    if not xk.is_contiguous():
-        xk = xk.contiguous()
-    if not freqs_cis.is_contiguous():
-        freqs_cis = freqs_cis.contiguous()
 
-    xq_out = torch.empty_like(xq)
-    xk_out = torch.empty_like(xk)
-    stream_ptr = torch.cuda.current_stream(xq.device).cuda_stream
-
-    _C.apply_rope(
-        _wrap_for_dlpack(xq),
-        _wrap_for_dlpack(freqs_cis),
-        _wrap_for_dlpack(xq_out),
-        _wrap_for_dlpack(xk),
-        _wrap_for_dlpack(xk_out),
-        stream_ptr,
-        True,
-    )
-
-    return xq_out, xk_out
+def apply_rope_split_half_(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    check_rope_inplace(xq, xk, readonly=(freqs_cis,))
+    return _apply_rope_cuda(xq, xk, freqs_cis, split_half=True, inplace=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2717,6 +2761,7 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
+            call_rules=(_validate_cuda_rms_rope,),
         ),
         "rms_rope1": FunctionConstraints(
             params={
@@ -2734,6 +2779,7 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
+            call_rules=(_validate_cuda_rms_rope1,),
         ),
         "rms_rope_split_half": FunctionConstraints(
             params={
@@ -2759,6 +2805,7 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
+            call_rules=(_validate_cuda_rms_rope,),
         ),
         "rms_rope_split_half1": FunctionConstraints(
             params={
@@ -2776,6 +2823,7 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
+            call_rules=(_validate_cuda_rms_rope1,),
         ),
         "quantize_int8_tensorwise": FunctionConstraints(
             params={
@@ -3073,6 +3121,17 @@ def _build_constraints() -> dict:
             min_compute_capability=(10, 0),
         )
 
+    for inplace_name, functional_name in {
+        "apply_rope_": "apply_rope",
+        "apply_rope1_": "apply_rope1",
+        "apply_rope_split_half_": "apply_rope_split_half",
+        "apply_rope_split_half1_": "apply_rope_split_half1",
+        "rms_rope_": "rms_rope",
+        "rms_rope1_": "rms_rope1",
+        "rms_rope_split_half_": "rms_rope_split_half",
+        "rms_rope_split_half1_": "rms_rope_split_half1",
+    }.items():
+        constraints[inplace_name] = constraints[functional_name]
     return constraints
 
 

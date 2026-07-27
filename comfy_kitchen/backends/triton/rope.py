@@ -17,6 +17,7 @@ import torch
 
 import triton
 import triton.language as tl
+from comfy_kitchen._rope_utils import check_rope_inplace
 
 
 @triton.jit
@@ -37,6 +38,10 @@ def apply_rope_kernel(
     stride_x_dim1,
     stride_x_dim2,
     stride_x_dim,
+    stride_out_batch,
+    stride_out_dim1,
+    stride_out_dim2,
+    stride_out_dim,
     stride_freqs_batch,
     stride_freqs_dim1,
     stride_freqs_dim2,
@@ -101,6 +106,14 @@ def apply_rope_kernel(
                    dim1_idx * stride_x_dim1 +
                    dim2_idx * stride_x_dim2 +
                    dim_idx_1 * stride_x_dim)
+    out_offset_0 = (batch_idx * stride_out_batch +
+                    dim1_idx * stride_out_dim1 +
+                    dim2_idx * stride_out_dim2 +
+                    dim_idx_0 * stride_out_dim)
+    out_offset_1 = (batch_idx * stride_out_batch +
+                    dim1_idx * stride_out_dim1 +
+                    dim2_idx * stride_out_dim2 +
+                    dim_idx_1 * stride_out_dim)
 
     # Handle broadcasting for freqs_cis (all spatial dimensions)
     freqs_batch_idx = tl.where(freqs_batch == 1, 0, batch_idx)
@@ -124,12 +137,12 @@ def apply_rope_kernel(
     freqs_10 = tl.load(freqs_ptr + freqs_10_offset, mask=mask, other=0.0)
     freqs_11 = tl.load(freqs_ptr + freqs_11_offset, mask=mask, other=0.0)
 
-    _apply_freq_tile(xq_ptr, xq_out_ptr, mask, freqs_00, freqs_01, freqs_10, freqs_11, x_offset_0, x_offset_1, compute_dtype)
+    _apply_freq_tile(xq_ptr, xq_out_ptr, mask, freqs_00, freqs_01, freqs_10, freqs_11, x_offset_0, x_offset_1, out_offset_0, out_offset_1, compute_dtype)
     if xk_ptr is not None:
-        _apply_freq_tile(xk_ptr, xk_out_ptr, mask, freqs_00, freqs_01, freqs_10, freqs_11, x_offset_0, x_offset_1, compute_dtype)
+        _apply_freq_tile(xk_ptr, xk_out_ptr, mask, freqs_00, freqs_01, freqs_10, freqs_11, x_offset_0, x_offset_1, out_offset_0, out_offset_1, compute_dtype)
 
 @triton.jit
-def _apply_freq_tile(x_ptr, x_out_ptr, mask, freqs_00, freqs_01, freqs_10, freqs_11, x_offset_0, x_offset_1, compute_dtype):
+def _apply_freq_tile(x_ptr, x_out_ptr, mask, freqs_00, freqs_01, freqs_10, freqs_11, x_offset_0, x_offset_1, out_offset_0, out_offset_1, compute_dtype):
     # Load xq values and cast to computation dtype
     x_0 = tl.load(x_ptr + x_offset_0, mask=mask, other=0.0).to(compute_dtype)
     x_1 = tl.load(x_ptr + x_offset_1, mask=mask, other=0.0).to(compute_dtype)
@@ -139,54 +152,50 @@ def _apply_freq_tile(x_ptr, x_out_ptr, mask, freqs_00, freqs_01, freqs_10, freqs
     xq_out_1 = freqs_10 * x_0 + freqs_11 * x_1
 
     # Store results
-    tl.store(x_out_ptr + x_offset_0, xq_out_0, mask=mask)
-    tl.store(x_out_ptr + x_offset_1, xq_out_1, mask=mask)
+    tl.store(x_out_ptr + out_offset_0, xq_out_0, mask=mask)
+    tl.store(x_out_ptr + out_offset_1, xq_out_1, mask=mask)
 
 
-def _apply_rope(x1: torch.Tensor, freqs_cis: torch.Tensor, x2: torch.Tensor = None, split_half: bool = False):
+def _apply_rope(
+    x1: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    x2: torch.Tensor | None = None,
+    split_half: bool = False,
+    inplace: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # A paired launch shares one stride description. Use separate launches when
+    # Q and K differ so each tensor retains its exact layout.
+    if x2 is not None and (x1.shape != x2.shape or x1.stride() != x2.stride()):
+        return (
+            _apply_rope(x1, freqs_cis, split_half=split_half, inplace=inplace)[0],
+            _apply_rope(x2, freqs_cis, split_half=split_half, inplace=inplace)[0],
+        )
+
     batch, dim1, dim2, head_dim = x1.shape
-    freqs_batch, freqs_dim1, freqs_dim2 = freqs_cis.shape[0], freqs_cis.shape[1], freqs_cis.shape[2]
+    freqs_batch, freqs_dim1, freqs_dim2 = freqs_cis.shape[:3]
+    x1_out = x1 if inplace else torch.empty_like(x1)
+    if x2 is None or inplace:
+        x2_out = x2
+    else:
+        x2_out = torch.empty_like(x2)
 
-    # Ensure inputs are contiguous
-    if not x1.is_contiguous():
-        x1 = x1.contiguous()
-    if not freqs_cis.is_contiguous():
-        freqs_cis = freqs_cis.contiguous()
-
-    x1_out = torch.empty_like(x1)
-    x2_out = None
-
-    # Calculate total number of pairs to process
     n_pairs = head_dim // 2
     total_elements = batch * dim1 * dim2 * n_pairs
-
-    # Choose block size based on tensor size
     if total_elements < 4096:
         block_size = 256
     elif total_elements < 32768:
         block_size = 512
     else:
         block_size = 1024
-
-    # Calculate grid size
     grid = (triton.cdiv(total_elements, block_size),)
 
-    # Get strides - these automatically adapt to the layout (BHND or BNHD)
     stride_x_batch, stride_x_dim1, stride_x_dim2, stride_x_dim = x1.stride()
     stride_freqs = freqs_cis.stride()
-
-    # Map dtype to Triton dtype
     dtype_map = {
         torch.float32: tl.float32,
         torch.float16: tl.float16,
         torch.bfloat16: tl.bfloat16,
     }
-    compute_dtype = dtype_map.get(freqs_cis.dtype, tl.float32)
-
-    if x2 is not None:
-        if not x2.is_contiguous():
-            x2 = x2.contiguous()
-        x2_out = torch.empty_like(x2)
 
     apply_rope_kernel[grid](
         x1,
@@ -205,23 +214,30 @@ def _apply_rope(x1: torch.Tensor, freqs_cis: torch.Tensor, x2: torch.Tensor = No
         stride_x_dim1,
         stride_x_dim2,
         stride_x_dim,
-        stride_freqs[0],  # batch
-        stride_freqs[1],  # dim1
-        stride_freqs[2],  # dim2
-        stride_freqs[3],  # dim (pairs)
-        stride_freqs[4],  # rotation component (2)
-        stride_freqs[5],  # pair element (2)
-        compute_dtype=compute_dtype,
+        x1_out.stride(0),
+        x1_out.stride(1),
+        x1_out.stride(2),
+        x1_out.stride(3),
+        stride_freqs[0],
+        stride_freqs[1],
+        stride_freqs[2],
+        stride_freqs[3],
+        stride_freqs[4],
+        stride_freqs[5],
+        compute_dtype=dtype_map.get(freqs_cis.dtype, tl.float32),
         block_size=block_size,
         split_half=split_half,
     )
-
     return x1_out, x2_out
 
 
 def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    x_out, _ = _apply_rope(x, freqs_cis)
-    return x_out
+    return _apply_rope(x, freqs_cis)[0]
+
+
+def apply_rope1_(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    check_rope_inplace(x, readonly=(freqs_cis,))
+    return _apply_rope(x, freqs_cis, inplace=True)[0]
 
 
 def apply_rope(
@@ -230,12 +246,30 @@ def apply_rope(
     return _apply_rope(xq, freqs_cis, xk)
 
 
+def apply_rope_(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    check_rope_inplace(xq, xk, readonly=(freqs_cis,))
+    return _apply_rope(xq, freqs_cis, xk, inplace=True)
+
+
 def apply_rope_split_half1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    x_out, _ = _apply_rope(x, freqs_cis, split_half=True)
-    return x_out
+    return _apply_rope(x, freqs_cis, split_half=True)[0]
+
+
+def apply_rope_split_half1_(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    check_rope_inplace(x, readonly=(freqs_cis,))
+    return _apply_rope(x, freqs_cis, split_half=True, inplace=True)[0]
 
 
 def apply_rope_split_half(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _apply_rope(xq, freqs_cis, xk, split_half=True)
+
+
+def apply_rope_split_half_(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    check_rope_inplace(xq, xk, readonly=(freqs_cis,))
+    return _apply_rope(xq, freqs_cis, xk, split_half=True, inplace=True)

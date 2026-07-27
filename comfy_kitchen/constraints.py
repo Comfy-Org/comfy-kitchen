@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 import torch
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping
 
 __all__ = [
     "DivisibleBy",
@@ -136,12 +133,14 @@ class FunctionConstraints:
     params: dict[str, ParamConstraint] = field(default_factory=dict)
     default_devices: frozenset[str] = field(default_factory=lambda: frozenset({"cuda", "cpu"}))
     min_compute_capability: tuple[int, int] | None = None
+    call_rules: tuple[Callable[[Mapping[str, object]], ValidationResult], ...] = ()
 
     def __hash__(self) -> int:
         return hash((
             tuple(sorted(self.params.items(), key=lambda x: x[0])),
             self.default_devices,
             self.min_compute_capability,
+            self.call_rules,
         ))
 
 
@@ -244,6 +243,11 @@ def validate_function_call(
     for param_name, param_constraint in constraints.params.items():
         value = kwargs.get(param_name)
         result = validate_param(param_name, value, param_constraint, constraints.default_devices)
+        if not result.success:
+            return result
+
+    for rule in constraints.call_rules:
+        result = rule(kwargs)
         if not result.success:
             return result
 
