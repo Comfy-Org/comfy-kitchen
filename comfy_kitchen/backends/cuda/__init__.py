@@ -2006,7 +2006,10 @@ def _validate_cuda_rms_rope1(kwargs: dict[str, object]) -> ValidationResult:
 
 
 def _validate_cuda_rms_rope(kwargs: dict[str, object]) -> ValidationResult:
-    q, k, q_scale = kwargs["q"], kwargs["k"], kwargs["q_scale"]
+    q, k = kwargs["q"], kwargs["k"]
+    q_scale = kwargs.get("q_scale")
+    if q_scale is None:
+        return ValidationResult.fail("q_scale", "is required for fused CUDA RMS-RoPE")
     k_scale = kwargs.get("k_scale")
     if k_scale is None:
         k_scale = q_scale
@@ -2015,6 +2018,8 @@ def _validate_cuda_rms_rope(kwargs: dict[str, object]) -> ValidationResult:
         return ValidationResult.fail("q", "CUDA fused RMS-RoPE requires a supported native layout")
     if k.shape != q.shape or k.dtype != q.dtype:
         return ValidationResult.fail("k", "must have the same shape and dtype as q for fused CUDA RMS-RoPE")
+    if q_scale.ndim != 1 or q_scale.numel() != q.shape[-1]:
+        return ValidationResult.fail("q_scale", "must be a 1D tensor matching q head_dim")
     if k_scale.ndim != 1 or k_scale.numel() != q.shape[-1] or k_scale.dtype != q_scale.dtype:
         return ValidationResult.fail("k_scale", "must be a 1D tensor matching q head_dim and q_scale dtype")
     return ValidationResult.ok()
@@ -2047,8 +2052,7 @@ def _rms_rope1_cuda(
     split_half: bool,
     inplace: bool,
 ) -> torch.Tensor:
-    bnhd = _native_rms_rope_layout(x, freqs_cis, extension_op="rms_rope1")
-    assert bnhd is not None
+    assert _native_rms_rope_layout(x, freqs_cis, extension_op="rms_rope1") is not None
 
     out = x if inplace else torch.empty_like(x)
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
@@ -2060,7 +2064,6 @@ def _rms_rope1_cuda(
         epsilon,
         stream_ptr,
         split_half,
-        bnhd,
     )
     return out
 
@@ -2079,8 +2082,7 @@ def _rms_rope_cuda(
     if k_scale is None:
         k_scale = q_scale
 
-    bnhd = _native_rms_rope_layout(q, freqs_cis, extension_op="rms_rope")
-    assert bnhd is not None
+    assert _native_rms_rope_layout(q, freqs_cis, extension_op="rms_rope") is not None
 
     q_out = q if inplace else torch.empty_like(q)
     k_out = k if inplace else torch.empty_like(k)
@@ -2096,7 +2098,6 @@ def _rms_rope_cuda(
         epsilon,
         stream_ptr,
         split_half,
-        bnhd,
     )
     return q_out, k_out
 

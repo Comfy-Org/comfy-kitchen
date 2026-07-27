@@ -272,7 +272,9 @@ def test_rms_rope_cuda_multiple_of_32(op_name, head_dim, monkeypatch):
 
 @pytest.mark.parametrize("op_name", ["rms_rope1", "rms_rope1_"])
 @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
-def test_rms_rope_nondefault_epsilon_and_broadcast(op_name, backend, device):
+def test_rms_rope_nondefault_epsilon_and_broadcast(
+    op_name, backend, device, monkeypatch
+):
     if backend not in get_capable_backends(op_name, device):
         pytest.skip(f"{backend} does not support {op_name} on {device}")
 
@@ -282,8 +284,7 @@ def test_rms_rope_nondefault_epsilon_and_broadcast(op_name, backend, device):
     scale = torch.randn(64, device=device, dtype=torch.float32)
     reference = _reference_rms_rope(x, freqs, scale, epsilon)
     pointer = x.data_ptr()
-    with ck.use_backend(backend):
-        actual = getattr(ck, op_name)(x, freqs, scale, epsilon)
+    actual = _run_backend(op_name, backend, (x, freqs, scale, epsilon), monkeypatch)
 
     if op_name.endswith("_"):
         assert actual.data_ptr() == pointer
@@ -293,7 +294,9 @@ def test_rms_rope_nondefault_epsilon_and_broadcast(op_name, backend, device):
 @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
 @pytest.mark.parametrize("split_half", [False, True])
 @pytest.mark.parametrize("last_dim_strided", [False, True])
-def test_rms_rope_strided_views(backend, split_half, last_dim_strided, device):
+def test_rms_rope_strided_views(
+    backend, split_half, last_dim_strided, device, monkeypatch
+):
     op_name = "rms_rope_split_half1" if split_half else "rms_rope1"
     if backend not in get_capable_backends(op_name, device):
         pytest.skip(f"{backend} does not support {op_name} on {device}")
@@ -310,8 +313,7 @@ def test_rms_rope_strided_views(backend, split_half, last_dim_strided, device):
     reference = _reference_rms_rope(
         x, freqs, scale, 1e-6, split_half=split_half
     )
-    with ck.use_backend(backend):
-        actual = getattr(ck, op_name)(x, freqs, scale)
+    actual = _run_backend(op_name, backend, (x, freqs, scale), monkeypatch)
     torch.testing.assert_close(actual, reference, rtol=2e-3, atol=2e-3)
 
 
@@ -343,7 +345,9 @@ def test_rms_rope_triton_expanded_input(device):
 )
 @pytest.mark.parametrize("backend", ["cuda", "triton"])
 @pytest.mark.parametrize("layout", ["BHND", "BNHD"])
-def test_rms_rope_gqa_different_qk_shapes(op_name, backend, layout, device):
+def test_rms_rope_gqa_different_qk_shapes(
+    op_name, backend, layout, device, monkeypatch
+):
     if backend not in get_capable_backends(op_name, device):
         pytest.skip(f"{backend} does not support {op_name} on {device}")
 
@@ -368,8 +372,9 @@ def test_rms_rope_gqa_different_qk_shapes(op_name, backend, layout, device):
     )
 
     pointers = (q.data_ptr(), k.data_ptr())
-    with ck.use_backend(backend):
-        actual = getattr(ck, op_name)(q, k, freqs, q_scale, k_scale)
+    actual = _run_backend(
+        op_name, backend, (q, k, freqs, q_scale, k_scale), monkeypatch
+    )
 
     assert actual[0].shape == q_shape
     assert actual[1].shape == k_shape
@@ -389,7 +394,7 @@ def test_rms_rope_gqa_different_qk_shapes(op_name, backend, layout, device):
     ],
 )
 @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
-def test_rms_rope_inplace_storage(op_name, backend, device):
+def test_rms_rope_inplace_storage(op_name, backend, device, monkeypatch):
     if backend not in get_capable_backends(op_name, device):
         pytest.skip(f"{backend} does not support {op_name} on {device}")
     paired = not op_name.endswith("1_")
@@ -405,8 +410,7 @@ def test_rms_rope_inplace_storage(op_name, backend, device):
     tensors = (q, k) if paired else (q,)
     pointers = tuple(x.data_ptr() for x in tensors)
     strides = tuple(x.stride() for x in tensors)
-    with ck.use_backend(backend):
-        result = getattr(ck, op_name)(*args)
+    result = _run_backend(op_name, backend, args, monkeypatch)
     outputs = result if paired else (result,)
     assert tuple(x.data_ptr() for x in outputs) == pointers
     assert tuple(x.stride() for x in outputs) == strides

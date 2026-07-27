@@ -646,8 +646,7 @@ void rms_rope(nb::ndarray<nb::device::cuda> q, nb::ndarray<nb::device::cuda> k,
               nb::ndarray<nb::device::cuda> k_scale,
               nb::ndarray<nb::device::cuda> q_out,
               nb::ndarray<nb::device::cuda> k_out, float epsilon,
-              uintptr_t stream_ptr, bool split_half = false,
-              bool bnhd = false) {
+              uintptr_t stream_ptr, bool split_half = false) {
 
   if (q.ndim() != 4 || k.ndim() != 4 || q_out.ndim() != 4 ||
       k_out.ndim() != 4) {
@@ -724,8 +723,7 @@ void rms_rope1(nb::ndarray<nb::device::cuda> q,
                nb::ndarray<nb::device::cuda> freqs,
                nb::ndarray<nb::device::cuda> q_scale,
                nb::ndarray<nb::device::cuda> q_out, float epsilon,
-               uintptr_t stream_ptr, bool split_half = false,
-               bool bnhd = false) {
+               uintptr_t stream_ptr, bool split_half = false) {
 
   if (q.ndim() != 4 || q_out.ndim() != 4) {
     throw std::runtime_error(
@@ -2577,12 +2575,12 @@ NB_MODULE(_C, m) {
           nb::arg("k"), nb::arg("freqs"), nb::arg("q_scale"),
           nb::arg("k_scale"), nb::arg("q_out"), nb::arg("k_out"),
           nb::arg("epsilon"), nb::arg("stream_ptr"),
-          nb::arg("split_half") = false, nb::arg("bnhd") = false);
+          nb::arg("split_half") = false);
 
     m.def("rms_rope1", &rms_rope1, "Fused RMSNorm and RoPE for a single tensor",
           nb::arg("q"), nb::arg("freqs"), nb::arg("q_scale"), nb::arg("q_out"),
           nb::arg("epsilon"), nb::arg("stream_ptr"),
-          nb::arg("split_half") = false, nb::arg("bnhd") = false);
+          nb::arg("split_half") = false);
 
     m.def("quantize_nvfp4", &quantize_nvfp4,
           "Quantize to FP4 E2M1 with E4M3 block scales using cuBLAS tiled layout",
