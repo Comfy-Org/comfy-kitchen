@@ -2014,14 +2014,20 @@ def _validate_cuda_rms_rope(kwargs: dict[str, object]) -> ValidationResult:
     if k_scale is None:
         k_scale = q_scale
     assert all(isinstance(value, torch.Tensor) for value in (q, k, q_scale, k_scale))
-    if _native_rms_rope_layout(q, kwargs["freqs_cis"], extension_op="rms_rope") is None:
+    freqs_cis = kwargs["freqs_cis"]
+    extension_op = "rms_rope" if k.shape == q.shape else "rms_rope1"
+    if _native_rms_rope_layout(q, freqs_cis, extension_op=extension_op) is None:
         return ValidationResult.fail("q", "CUDA fused RMS-RoPE requires a supported native layout")
-    if k.shape != q.shape or k.dtype != q.dtype:
-        return ValidationResult.fail("k", "must have the same shape and dtype as q for fused CUDA RMS-RoPE")
+    if k.dtype != q.dtype:
+        return ValidationResult.fail("k", "must have the same dtype as q for fused CUDA RMS-RoPE")
+    if k.shape != q.shape and _native_rms_rope_layout(k, freqs_cis, extension_op="rms_rope1") is None:
+        return ValidationResult.fail("k", "CUDA fused RMS-RoPE requires a supported native layout")
     if q_scale.ndim != 1 or q_scale.numel() != q.shape[-1]:
         return ValidationResult.fail("q_scale", "must be a 1D tensor matching q head_dim")
-    if k_scale.ndim != 1 or k_scale.numel() != q.shape[-1] or k_scale.dtype != q_scale.dtype:
-        return ValidationResult.fail("k_scale", "must be a 1D tensor matching q head_dim and q_scale dtype")
+    if k_scale.ndim != 1 or k_scale.numel() != k.shape[-1]:
+        return ValidationResult.fail("k_scale", "must be a 1D tensor matching k head_dim")
+    if k.shape == q.shape and k_scale.dtype != q_scale.dtype:
+        return ValidationResult.fail("k_scale", "must match q_scale dtype for fused CUDA RMS-RoPE")
     return ValidationResult.ok()
 
 
@@ -2081,6 +2087,18 @@ def _rms_rope_cuda(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k_scale is None:
         k_scale = q_scale
+
+    if q.shape != k.shape:
+        return (
+            _rms_rope1_cuda(
+                q, freqs_cis, q_scale, epsilon,
+                split_half=split_half, inplace=inplace,
+            ),
+            _rms_rope1_cuda(
+                k, freqs_cis, k_scale, epsilon,
+                split_half=split_half, inplace=inplace,
+            ),
+        )
 
     assert _native_rms_rope_layout(q, freqs_cis, extension_op="rms_rope") is not None
 
