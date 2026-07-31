@@ -905,10 +905,12 @@ __global__ void quantize_int8_rowwise_from_partials_kernel(
     }
 }
 
-// Optional elementwise activation applied on the way into the quantizer, so an
-// MLP's `linear(act(proj(x)))` never writes act's output to HBM just to read it
-// straight back. Elementwise means no reduction, so it is nearly free here.
-enum : int { kActNone = 0, kActGeluTanh = 1 };
+// Optional activation applied on the way into the quantizer, so an MLP's
+// `linear(act(proj(x)))` never writes act's output to HBM just to read it
+// straight back. No reduction is involved, so it is nearly free here. SwiGLU
+// is the gated pair: the raw row is [gate | up] (2*K wide) and the activated
+// row silu(gate) * up is K wide.
+enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2 };
 
 template<int ACT>
 __device__ __forceinline__ float apply_input_act(float v) {
@@ -920,6 +922,23 @@ __device__ __forceinline__ float apply_input_act(float v) {
         return 0.5f * v * (1.0f + tanhf(inner));
     }
     return v;
+}
+
+// Reads one activated value: column `col` of the K-wide activated row starting
+// at `in_row`. For SwiGLU the raw row is 2*K wide with the gate in the first
+// half; every other activation reads the same K-wide row it writes.
+template<int ACT, typename InputType>
+__device__ __forceinline__ float load_input_act(
+    const InputType* __restrict__ x, int64_t in_row, int col, int K)
+{
+    if constexpr (ACT == kActSwiGLU) {
+        // Matches torch silu(gate) * up.
+        const float gate = to_float(x[in_row + col]);
+        const float up = to_float(x[in_row + K + col]);
+        return (gate / (1.0f + expf(-gate))) * up;
+    } else {
+        return apply_input_act<ACT>(to_float(x[in_row + col]));
+    }
 }
 
 template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC, int ACT = kActNone>
@@ -946,6 +965,9 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     const int sub = tid / kGroupThreads;
     const int lane = tid % kGroupThreads;
     const int64_t row_offset = static_cast<int64_t>(row) * K;
+    // SwiGLU reads a [gate | up] raw row twice as wide as the K it writes.
+    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
+    const int64_t in_row_offset = row_offset * kInWidth;
     const int n_groups = K / kConvRotGroup;
 
     float* buf0 = tmp + sub * (2 * kConvRotGroup);
@@ -958,12 +980,12 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
         const bool active = group < n_groups;
         const int base = lane * 4;
         const int group_col = group * kConvRotGroup;
-        const int64_t x_offset = row_offset + group_col + base;
+        const int col = group_col + base;
 
-        const float x0 = active ? apply_input_act<ACT>(to_float(x[x_offset])) : 0.0f;
-        const float x1 = active ? apply_input_act<ACT>(to_float(x[x_offset + 1])) : 0.0f;
-        const float x2 = active ? apply_input_act<ACT>(to_float(x[x_offset + 2])) : 0.0f;
-        const float x3 = active ? apply_input_act<ACT>(to_float(x[x_offset + 3])) : 0.0f;
+        const float x0 = active ? load_input_act<ACT>(x, in_row_offset, col, K) : 0.0f;
+        const float x1 = active ? load_input_act<ACT>(x, in_row_offset, col + 1, K) : 0.0f;
+        const float x2 = active ? load_input_act<ACT>(x, in_row_offset, col + 2, K) : 0.0f;
+        const float x3 = active ? load_input_act<ACT>(x, in_row_offset, col + 3, K) : 0.0f;
         buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
         buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
         buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
@@ -1297,7 +1319,7 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
     if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("convrot64 fused kernel only supports K <= INT_MAX");
     }
-    if (act_code != comfy::kActNone && act_code != comfy::kActGeluTanh) {
+    if (act_code != comfy::kActNone && act_code != comfy::kActGeluTanh && act_code != comfy::kActSwiGLU) {
         throw std::runtime_error("convrot64 fused kernel: unsupported input activation code");
     }
 
@@ -1332,9 +1354,9 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                                 : 1024;
 
         DISPATCH_BOOL(stochastic, kStoch, [&] {
-            DISPATCH_BOOL(act_code == comfy::kActGeluTanh, kGelu, [&] {
-                constexpr int kAct = kGelu ? comfy::kActGeluTanh : comfy::kActNone;
-                switch (block_threads) {
+            auto launch_act = [&](auto act_tag, int bt) {
+                constexpr int kAct = decltype(act_tag)::value;
+                switch (bt) {
                     case 64:
                         launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 64, kStoch, kAct>, 64);
                         break;
@@ -1351,7 +1373,18 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                         launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, 1024, kStoch, kAct>, 1024);
                         break;
                 }
-            });
+            };
+            switch (act_code) {
+                case comfy::kActGeluTanh:
+                    launch_act(std::integral_constant<int, comfy::kActGeluTanh>{}, block_threads);
+                    break;
+                case comfy::kActSwiGLU:
+                    launch_act(std::integral_constant<int, comfy::kActSwiGLU>{}, block_threads);
+                    break;
+                default:
+                    launch_act(std::integral_constant<int, comfy::kActNone>{}, block_threads);
+                    break;
+            }
         });
     });
 
@@ -1677,7 +1710,10 @@ void launch_dequantize_int8_convrot_kernel(
     if (num_cols >= comfy::kConvRotGroup) {
         auto launch_groups = [&](auto groups_tag) {
             constexpr int groups_per_block = decltype(groups_tag)::value;
-            constexpr int block_threads = groups_per_block * 64;
+            // const (not constexpr): MSVC 14.42 rejects capturing a constexpr
+            // local into the nested dispatch lambda (C3495); it is only a
+            // runtime launch dimension here.
+            const int block_threads = groups_per_block * 64;
             const int group_blocks =
                 static_cast<int>((num_cols / comfy::kConvRotGroup + groups_per_block - 1) / groups_per_block);
             const size_t smem_bytes = groups_per_block * 2 * comfy::kConvRotGroup * sizeof(float);
@@ -1685,7 +1721,10 @@ void launch_dequantize_int8_convrot_kernel(
                 static_cast<unsigned int>(num_rows),
                 static_cast<unsigned int>(group_blocks));
             DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
-                comfy::dequantize_int8_convrot_groups64_kernel<groups_per_block, OutputType>
+                // Re-derived from the tag: MSVC 14.42 refuses to capture the
+                // enclosing lambda's constexpr local (C3495).
+                constexpr int kGroupsPerBlock = decltype(groups_tag)::value;
+                comfy::dequantize_int8_convrot_groups64_kernel<kGroupsPerBlock, OutputType>
                     <<<grid, block_threads, smem_bytes, stream>>>(
                         static_cast<const int8_t*>(input),
                         static_cast<const float*>(scales),

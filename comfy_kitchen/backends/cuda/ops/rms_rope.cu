@@ -41,7 +41,7 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
     const ScaleType *__restrict__ q_scale,
     const ScaleType *__restrict__ k_scale, InputType *q_out,
     InputType *k_out, int64_t batch, int64_t dim1, int64_t dim2,
-    int head_dim, int64_t freqs_batch, int64_t freqs_dim1,
+    int head_dim, int rot_dim, int64_t freqs_batch, int64_t freqs_dim1,
     int64_t freqs_dim2, int64_t q_s0, int64_t q_s1, int64_t q_s2,
     int64_t q_s3, int64_t k_s0, int64_t k_s1, int64_t k_s2, int64_t k_s3,
     int64_t qo_s0, int64_t qo_s1, int64_t qo_s2, int64_t qo_s3,
@@ -91,7 +91,9 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
   const int64_t fi1 = freqs_dim1 == 1 ? 0 : i1;
   const int64_t fi2 = freqs_dim2 == 1 ? 0 : i2;
   const int64_t freq_row = fi0 * f_s0 + fi1 * f_s1 + fi2 * f_s2;
-  const int pairs = head_dim / 2;
+  // Rotation covers the first rot_dim dims (split-half pairs (i, i + rot_dim/2));
+  // the RMS reduction above always spans the full head_dim.
+  const int pairs = rot_dim / 2;
   constexpr int kPairsPerLane = SplitHalf && ContigHead ? 2 : 1;
 
   for (int pair_base = lane * kPairsPerLane; pair_base < pairs;
@@ -201,6 +203,29 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
       }
     }
   }
+
+  // Norm-only tail: dims beyond rot_dim are normalized and scaled but never
+  // rotated. Empty in the common rot_dim == head_dim case.
+  const int64_t qo_s3_eff = InPlace ? q_s3 : qo_s3;
+  const int64_t ko_s3_eff = InPlace ? k_s3 : ko_s3;
+  for (int d = rot_dim + lane; d < head_dim; d += kThreadsPerWarp) {
+    InputType qv = q[q_base + static_cast<int64_t>(d) * q_s3];
+    if constexpr (HasRms) {
+      qv = static_cast<InputType>(
+          static_cast<float>(qv) * q_rrms *
+          static_cast<float>(q_scale[static_cast<int64_t>(d) * qs_stride]));
+    }
+    q_out[qo_base + static_cast<int64_t>(d) * qo_s3_eff] = qv;
+    if constexpr (HasK) {
+      InputType kv = k[k_base + static_cast<int64_t>(d) * k_s3];
+      if constexpr (HasRms) {
+        kv = static_cast<InputType>(
+            static_cast<float>(kv) * k_rrms *
+            static_cast<float>(k_scale[static_cast<int64_t>(d) * ks_stride]));
+      }
+      k_out[ko_base + static_cast<int64_t>(d) * ko_s3_eff] = kv;
+    }
+  }
 }
 
 template <typename T>
@@ -215,6 +240,7 @@ void launch_config(
     const InputType *q, const InputType *k, const FreqsType *freqs,
     const ScaleType *q_scale, const ScaleType *k_scale, InputType *q_out,
     InputType *k_out, int64_t batch, int64_t dim1, int64_t dim2, int head_dim,
+    int rot_dim,
     int64_t freqs_batch, int64_t freqs_dim1, int64_t freqs_dim2, int64_t q_s0,
     int64_t q_s1, int64_t q_s2, int64_t q_s3, int64_t k_s0, int64_t k_s1,
     int64_t k_s2, int64_t k_s3, int64_t qo_s0, int64_t qo_s1, int64_t qo_s2,
@@ -231,6 +257,7 @@ void launch_config(
   rope_kernel<InputType, FreqsType, ScaleType, HasRms, SplitHalf, HasK, InPlace,
               ContigHead><<<blocks, kThreads, 0, stream>>>(
       q, k, freqs, q_scale, k_scale, q_out, k_out, batch, dim1, dim2, head_dim,
+      rot_dim,
       freqs_batch, freqs_dim1, freqs_dim2, q_s0, q_s1, q_s2, q_s3, k_s0, k_s1,
       k_s2, k_s3, qo_s0, qo_s1, qo_s2, qo_s3, ko_s0, ko_s1, ko_s2, ko_s3,
       f_s0, f_s1, f_s2, f_s3, f_s4, f_s5, qs_stride, ks_stride, epsilon);
@@ -242,6 +269,7 @@ void rope_launcher(
     const InputType *q, const InputType *k, const FreqsType *freqs,
     const ScaleType *q_scale, const ScaleType *k_scale, InputType *q_out,
     InputType *k_out, int64_t batch, int64_t dim1, int64_t dim2, int head_dim,
+    int rot_dim,
     int64_t freqs_batch, int64_t freqs_dim1, int64_t freqs_dim2, int64_t q_s0,
     int64_t q_s1, int64_t q_s2, int64_t q_s3, int64_t k_s0, int64_t k_s1,
     int64_t k_s2, int64_t k_s3, int64_t qo_s0, int64_t qo_s1, int64_t qo_s2,
@@ -259,13 +287,15 @@ void rope_launcher(
              pair_aligned(k_out, ko_s0, ko_s1, ko_s2);
   }
   // Split-half packs adjacent values independently in each half. Both half
-  // starts must therefore be pair-aligned.
-  contig = contig && (!split_half || head_dim % 4 == 0);
+  // starts must therefore be pair-aligned (the rotated prefix for partial
+  // rotary).
+  contig = contig && (!split_half || (head_dim % 4 == 0 && rot_dim % 4 == 0));
 
 #define LAUNCH(HAS_K, SPLIT, INPLACE, CONTIG)                                  \
   launch_config<InputType, FreqsType, ScaleType, HasRms, SPLIT, HAS_K,         \
                 INPLACE, CONTIG>(                                               \
       q, k, freqs, q_scale, k_scale, q_out, k_out, batch, dim1, dim2, head_dim, \
+      rot_dim,                                                                  \
       freqs_batch, freqs_dim1, freqs_dim2, q_s0, q_s1, q_s2, q_s3, k_s0, k_s1, \
       k_s2, k_s3, qo_s0, qo_s1, qo_s2, qo_s3, ko_s0, ko_s1, ko_s2, ko_s3,      \
       f_s0, f_s1, f_s2, f_s3, f_s4, f_s5, qs_stride, ks_stride, epsilon, stream)
@@ -312,7 +342,8 @@ extern "C" void launch_apply_rope_kernel(
         static_cast<const InputType *>(q), static_cast<const InputType *>(k),
         static_cast<const FreqsType *>(freqs), nullptr, nullptr,
         static_cast<InputType *>(q_out), static_cast<InputType *>(k_out), batch,
-        dim1, dim2, static_cast<int>(head_dim), freqs_batch, freqs_dim1,
+        dim1, dim2, static_cast<int>(head_dim), static_cast<int>(head_dim),
+        freqs_batch, freqs_dim1,
         freqs_dim2, q_s0, q_s1, q_s2, q_s3, k_s0, k_s1, k_s2, k_s3, qo_s0,
         qo_s1, qo_s2, qo_s3, ko_s0, ko_s1, ko_s2, ko_s3, f_s0, f_s1, f_s2,
         f_s3, f_s4, f_s5, 0, 0, 0.0f, has_k, split_half, stream);
@@ -322,7 +353,8 @@ extern "C" void launch_apply_rope_kernel(
 extern "C" void launch_rms_rope_kernel(
     const void *q, const void *k, const void *freqs, const void *q_scale,
     const void *k_scale, void *q_out, void *k_out, int64_t batch, int64_t dim1,
-    int64_t dim2, int64_t head_dim, int64_t freqs_batch, int64_t freqs_dim1,
+    int64_t dim2, int64_t head_dim, int64_t rot_dim,
+    int64_t freqs_batch, int64_t freqs_dim1,
     int64_t freqs_dim2, int64_t q_s0, int64_t q_s1, int64_t q_s2, int64_t q_s3,
     int64_t k_s0, int64_t k_s1, int64_t k_s2, int64_t k_s3, int64_t qo_s0,
     int64_t qo_s1, int64_t qo_s2, int64_t qo_s3, int64_t ko_s0, int64_t ko_s1,
@@ -340,7 +372,8 @@ extern "C" void launch_rms_rope_kernel(
             static_cast<const ScaleType *>(q_scale),
             static_cast<const ScaleType *>(k_scale),
             static_cast<InputType *>(q_out), static_cast<InputType *>(k_out),
-            batch, dim1, dim2, static_cast<int>(head_dim), freqs_batch,
+            batch, dim1, dim2, static_cast<int>(head_dim),
+            static_cast<int>(rot_dim), freqs_batch,
             freqs_dim1, freqs_dim2, q_s0, q_s1, q_s2, q_s3, k_s0, k_s1, k_s2,
             k_s3, qo_s0, qo_s1, qo_s2, qo_s3, ko_s0, ko_s1, ko_s2, ko_s3,
             f_s0, f_s1, f_s2, f_s3, f_s4, f_s5, qs_stride, ks_stride, epsilon,

@@ -145,6 +145,7 @@ except Exception as e:
 
 from comfy_kitchen.backends._activations import (  # noqa: E402
     apply_input_act as _apply_input_act,
+    input_act_width as _input_act_width,
 )
 from comfy_kitchen.backends._activations import (  # noqa: E402
     input_act_code as _input_act_code,
@@ -160,6 +161,7 @@ from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
 from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
     quantize_int8_tensorwise as eager_quantize_int8_tensorwise,
 )
+from comfy_kitchen.backends.eager import rope as _eager_rope  # noqa: E402
 from comfy_kitchen.backends.eager.svdquant import (  # noqa: E402
     _INT4_GROUP_SIZE,
     _unpack_int4_row_major,
@@ -1367,10 +1369,14 @@ def quantize_int8_rowwise_convrot64(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused ConvRot row-wise INT8 quantization using 64-lane groups.
 
-    input_act applies an elementwise activation on the way in, so an MLP's
-    `linear(act(proj(x)))` never materializes act's output in bf16.
+    input_act applies an activation on the way in, so an MLP's
+    `linear(act(proj(x)))` never materializes act's output in bf16. For the
+    gated "swiglu" pair the input rows are [gate | up] and the quantized rows
+    are half as wide.
     """
-    q_2d = torch.empty_like(weight_2d, dtype=torch.int8)
+    q_2d = torch.empty(
+        (weight_2d.shape[0], weight_2d.shape[1] // _input_act_width(input_act)),
+        dtype=torch.int8, device=weight_2d.device)
     scales_2d = torch.empty((weight_2d.shape[0], 1), dtype=torch.float32, device=weight_2d.device)
     stream_ptr = torch.cuda.current_stream(weight_2d.device).cuda_stream
     _C.quantize_int8_rowwise_convrot64(
@@ -1740,18 +1746,21 @@ def int8_linear(
 
     # Only the fused ConvRot quantizer can absorb the activation; every other
     # route applies it eagerly here and proceeds unchanged, so all paths agree.
+    # k_act is the activated (quantized) row width: swiglu halves the raw row.
+    k_act = x_2d.shape[-1] // _input_act_width(input_act)
     _fused_convrot_ok = (
         convrot
         and convrot_groupsize == 256
-        and x_2d.shape[-1] % 256 == 0
-        and 256 <= x_2d.shape[-1] <= _CONVROT_FUSED_MAX_K
-        and _convrot_fused_shared_memory_fits(x_2d, x_2d.shape[-1], convrot_groupsize)
+        and k_act % 256 == 0
+        and 256 <= k_act <= _CONVROT_FUSED_MAX_K
+        and _convrot_fused_shared_memory_fits(x_2d, k_act, convrot_groupsize)
     )
     if input_act not in (None, "none") and not (_fused_convrot_ok and x_2d.shape[0] > 1):
         x_2d = _apply_input_act(x_2d, input_act)
         input_act = None
 
-    m, k = x_2d.shape
+    m = x_2d.shape[0]
+    k = k_act
     n, k_w = weight.shape
     assert k == k_w, "Input and weight inner dimensions must match"
 
@@ -1797,7 +1806,6 @@ def int8_linear(
 
     # cuBLAS INT8 GEMM requires row-wise quantized activations and tensor-wise quantized weights.
     if convrot:
-        k = x_2d.shape[-1]
         # Fused wins for small K (narrow block) and large K (wide block); the
         # 5120 < K < 8192 band loses to the rotate-matmul path on both, so skip
         # it. (Real model hidden dims avoid that band anyway.)
@@ -2062,12 +2070,13 @@ def _validate_cuda_rms_rope(kwargs: dict[str, object]) -> ValidationResult:
         k_scale = q_scale
     assert all(isinstance(value, torch.Tensor) for value in (q, k, q_scale, k_scale))
     freqs_cis = kwargs["freqs_cis"]
+    rot_dim = int(kwargs.get("rot_dim") or 0)
     extension_op = "rms_rope" if k.shape == q.shape else "rms_rope1"
-    if _native_rms_rope_layout(q, freqs_cis, extension_op=extension_op) is None:
+    if _native_rms_rope_layout(q, freqs_cis, extension_op=extension_op, rot_dim=rot_dim) is None:
         return ValidationResult.fail("q", "CUDA fused RMS-RoPE requires a supported native layout")
     if k.dtype != q.dtype:
         return ValidationResult.fail("k", "must have the same dtype as q for fused CUDA RMS-RoPE")
-    if k.shape != q.shape and _native_rms_rope_layout(k, freqs_cis, extension_op="rms_rope1") is None:
+    if k.shape != q.shape and _native_rms_rope_layout(k, freqs_cis, extension_op="rms_rope1", rot_dim=rot_dim) is None:
         return ValidationResult.fail("k", "CUDA fused RMS-RoPE requires a supported native layout")
     if q_scale.ndim != 1 or q_scale.numel() != q.shape[-1]:
         return ValidationResult.fail("q_scale", "must be a 1D tensor matching q head_dim")
@@ -2083,8 +2092,9 @@ def _native_rms_rope_layout(
     freqs_cis: torch.Tensor,
     *,
     extension_op: str,
+    rot_dim: int = 0,
 ) -> bool | None:
-    bnhd = detect_rms_rope_bnhd(x, freqs_cis)
+    bnhd = detect_rms_rope_bnhd(x, freqs_cis, rot_dim=rot_dim)
     if bnhd is None or not (
         _C is not None
         and hasattr(_C, extension_op)
@@ -2131,11 +2141,15 @@ def _rms_rope_cuda(
     *,
     split_half: bool,
     inplace: bool,
+    rot_dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k_scale is None:
         k_scale = q_scale
 
     if q.shape != k.shape:
+        if rot_dim:
+            return _eager_rope.rms_rope_split_half(
+                q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
         return (
             _rms_rope1_cuda(
                 q, freqs_cis, q_scale, epsilon,
@@ -2147,7 +2161,7 @@ def _rms_rope_cuda(
             ),
         )
 
-    assert _native_rms_rope_layout(q, freqs_cis, extension_op="rms_rope") is not None
+    assert _native_rms_rope_layout(q, freqs_cis, extension_op="rms_rope", rot_dim=rot_dim) is not None
 
     q_out = q if inplace else torch.empty_like(q)
     k_out = k if inplace else torch.empty_like(k)
@@ -2163,6 +2177,7 @@ def _rms_rope_cuda(
         epsilon,
         stream_ptr,
         split_half,
+        rot_dim,
     )
     return q_out, k_out
 
@@ -2243,10 +2258,11 @@ def rms_rope_split_half(
     q_scale: torch.Tensor,
     k_scale: torch.Tensor | None = None,
     epsilon: float = 1e-6,
+    rot_dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _rms_rope_cuda(
         q, k, freqs_cis, q_scale, k_scale, epsilon,
-        split_half=True, inplace=False,
+        split_half=True, inplace=False, rot_dim=rot_dim,
     )
 
 
@@ -2257,13 +2273,14 @@ def rms_rope_split_half_(
     q_scale: torch.Tensor,
     k_scale: torch.Tensor | None = None,
     epsilon: float = 1e-6,
+    rot_dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k_scale is None:
         k_scale = q_scale
     check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
     return _rms_rope_cuda(
         q, k, freqs_cis, q_scale, k_scale, epsilon,
-        split_half=True, inplace=True,
+        split_half=True, inplace=True, rot_dim=rot_dim,
     )
 
 

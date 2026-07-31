@@ -545,22 +545,29 @@ def rms_rope_split_half(
     q_scale: torch.Tensor,
     k_scale: torch.Tensor | None = None,
     epsilon: float = 1e-6,
+    rot_dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply per-head RMSNorm and split-half RoPE to query and key tensors.
 
-    Split-half layout: pair k uses elements [k] and [k + head_dim//2].
+    Split-half layout: pair k uses elements [k] and [k + rot_dim//2]. rot_dim
+    restricts the rotation to a head-dim prefix (partial rotary; the norm
+    always spans the full head_dim); 0 rotates everything.
     """
-    return torch.ops.comfy_kitchen.rms_rope_split_half(q, k, freqs_cis, q_scale, k_scale, epsilon)
+    return torch.ops.comfy_kitchen.rms_rope_split_half(q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim)
 
 
 def rms_rope_split_half_(
     q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor,
     q_scale: torch.Tensor, k_scale: torch.Tensor | None = None,
-    epsilon: float = 1e-6,
+    epsilon: float = 1e-6, rot_dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply RMSNorm and split-half RoPE in place (inference only)."""
+    """Apply RMSNorm and split-half RoPE in place (inference only).
+
+    rot_dim restricts the rotation to a head-dim prefix (partial rotary; the
+    norm always spans the full head_dim); 0 rotates everything.
+    """
     torch.ops.comfy_kitchen.rms_rope_split_half_(
-        q, k, freqs_cis, q_scale, k_scale, epsilon
+        q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim
     )
     return q, k
 

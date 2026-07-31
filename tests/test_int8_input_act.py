@@ -174,3 +174,100 @@ class TestInt8LinearInputAct:
         denom = ref.float().abs().max()
         rel = ((got.float() - ref.float()).abs().max() / denom).item()
         assert rel < 0.05, f"3d: rel={rel:.3e}"
+
+
+def _swiglu(x):
+    gate, up = x.chunk(2, dim=-1)
+    return functional.silu(gate) * up
+
+
+class TestSwiGLUInputAct:
+    """swiglu is the gated pair: input rows are [gate | up], the activated row
+    silu(gate) * up is half as wide, and the weight matches the halved width."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("shape", [(512, 256), (1024, 4096), (37, 14336)])
+    def test_at_least_as_accurate_as_eager_chain(self, dtype, shape, seed, cuda_available):
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        m, k = shape
+        h = torch.randn((m, 2 * k), dtype=dtype, device="cuda") * 2.0
+
+        hd = h.double()
+        g = functional.silu(hd[:, :k]) * hd[:, k:]
+        mat = _build_hadamard(_GROUP, device=h.device, dtype=torch.float64)
+        rot = (g.reshape(-1, k // _GROUP, _GROUP) @ mat).reshape(-1, k)
+        scale = (rot.abs().amax(-1, keepdim=True) / 127.0).clamp(min=1e-30)
+        exact_q = (rot / scale).round().clamp(-128, 127)
+
+        chain_q, _ = cuda_backend.quantize_int8_rowwise_convrot64(
+            _swiglu(h).contiguous(), _GROUP
+        )
+        fused_q, fused_s = cuda_backend.quantize_int8_rowwise_convrot64(
+            h, _GROUP, input_act="swiglu"
+        )
+
+        err_chain = (chain_q.double() - exact_q).abs().mean().item()
+        err_fused = (fused_q.double() - exact_q).abs().mean().item()
+        assert err_fused <= max(err_chain * 1.05, 1e-4), (
+            f"fused ({err_fused:.6f}) less accurate than chain ({err_chain:.6f})"
+        )
+        assert fused_q.shape == (m, k)
+        assert fused_q.dtype == torch.int8
+        assert fused_s.shape == (m, 1)
+
+    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    def test_matches_eager_activation(self, backend, seed, cuda_available):
+        """int8_linear(x, input_act="swiglu") == int8_linear(swiglu(x)) everywhere."""
+        device = "cuda" if cuda_available else "cpu"
+        if backend not in get_capable_backends("int8_linear", device):
+            pytest.skip(f"backend '{backend}' not capable")
+
+        m, k, n = 1024, 4096, 512
+        h = torch.randn(m, 2 * k, dtype=torch.bfloat16, device=device)
+        weight = torch.randint(-127, 127, (n, k), dtype=torch.int8, device=device)
+        wscale = torch.tensor(0.01, dtype=torch.float32, device=device)
+
+        with ck.use_backend(backend):
+            ref = ck.int8_linear(
+                _swiglu(h), weight, wscale, None, torch.bfloat16,
+                convrot=True, convrot_groupsize=_GROUP,
+            )
+            got = ck.int8_linear(
+                h, weight, wscale, None, torch.bfloat16,
+                convrot=True, convrot_groupsize=_GROUP, input_act="swiglu",
+            )
+
+        assert got.shape == (m, n)
+        denom = ref.float().abs().max()
+        rel = ((got.float() - ref.float()).abs().max() / denom).item()
+        assert rel < 0.05, f"{backend}: rel={rel:.3e}"
+
+    @pytest.mark.parametrize(
+        "tag,shape,kwargs",
+        [
+            ("no convrot", (1024, 2 * 4096), {"convrot": False}),
+            ("K over smem cap", (64, 2 * 256 * 72), {"convrot": True, "convrot_groupsize": 256}),
+            ("m == 1", (1, 2 * 4096), {"convrot": True, "convrot_groupsize": 256}),
+        ],
+    )
+    def test_fallback_paths_agree(self, tag, shape, kwargs, seed, cuda_available):
+        """Paths the fused kernel cannot serve must still apply the activation."""
+        if not cuda_available:
+            pytest.skip("CUDA required")
+
+        m, k2 = shape
+        k = k2 // 2
+        h = torch.randn(m, k2, dtype=torch.bfloat16, device="cuda")
+        weight = torch.randint(-127, 127, (256, k), dtype=torch.int8, device="cuda")
+        wscale = torch.tensor(0.01, dtype=torch.float32, device="cuda")
+
+        ref = ck.int8_linear(_swiglu(h), weight, wscale, None, torch.bfloat16, **kwargs)
+        got = ck.int8_linear(
+            h, weight, wscale, None, torch.bfloat16, input_act="swiglu", **kwargs
+        )
+        denom = ref.float().abs().max().clamp(min=1e-9)
+        rel = ((got.float() - ref.float()).abs().max() / denom).item()
+        assert rel < 0.05, f"{tag}: rel={rel:.3e}"

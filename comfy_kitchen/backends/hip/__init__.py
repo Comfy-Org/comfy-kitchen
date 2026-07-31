@@ -589,6 +589,11 @@ def int8_linear(
     """INT8 linear with dynamic row-wise activation quantization, on WMMA."""
     # Rejected here so every route fails the same way, not just the fused one.
     _input_act_code(input_act)
+    if input_act == "swiglu":
+        # The WMMA quantizer does not fuse the gated pair; apply it eagerly so
+        # the row width and result match the fused backends.
+        x = _apply_input_act(x, input_act)
+        input_act = None
     if x.shape[-1] != weight.shape[-1]:
         raise ValueError(
             f"Input and weight inner dimensions must match, got {x.shape[-1]} and {weight.shape[-1]}"
@@ -1223,7 +1228,12 @@ def rms_rope_split_half(
     q_scale: torch.Tensor,
     k_scale: torch.Tensor | None = None,
     epsilon: float = 1e-6,
+    rot_dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if rot_dim and rot_dim != q.shape[-1]:
+        # partial rotary is not fused in the WMMA kernel
+        return _eager.rms_rope_split_half(
+            q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
     return _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, True)
 
 
@@ -1234,9 +1244,14 @@ def rms_rope_split_half_(
     q_scale: torch.Tensor,
     k_scale: torch.Tensor | None = None,
     epsilon: float = 1e-6,
+    rot_dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k_scale is None:
         k_scale = q_scale
+    if rot_dim and rot_dim != q.shape[-1]:
+        # partial rotary is not fused in the WMMA kernel
+        return _eager.rms_rope_split_half_(
+            q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
     check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
     return _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, True, inplace=True)
 

@@ -417,3 +417,103 @@ def test_rms_rope_inplace_storage(op_name, backend, device, monkeypatch):
     refs = reference if paired else (reference,)
     for actual, expected in zip(outputs, refs, strict=True):
         torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
+
+
+class TestPartialRotary:
+    """rot_dim rotates a head-dim prefix in split-half pairs (i, i + rot_dim//2);
+    the RMS norm always spans the full head_dim and the tail passes through."""
+
+    _S, _H, _D, _ROT = 333, 8, 128, 96
+
+    def _reference(self, x, freqs_cis, scale, epsilon, rot_dim):
+        x_float = x.float()
+        rrms = torch.rsqrt(x_float.square().mean(dim=-1, keepdim=True) + epsilon)
+        x_norm = (x_float * rrms * scale.float()).to(x.dtype).float()
+        half = rot_dim // 2
+        x1, x2 = x_norm[..., :half], x_norm[..., half:rot_dim]
+        f = freqs_cis.float()
+        o1 = f[..., 0, 0] * x1 + f[..., 0, 1] * x2
+        o2 = f[..., 1, 0] * x1 + f[..., 1, 1] * x2
+        return torch.cat([o1, o2, x_norm[..., rot_dim:]], dim=-1).to(x.dtype)
+
+    def _inputs(self, device, dtype):
+        q = torch.randn(1, self._S, self._H, self._D, dtype=dtype, device=device)
+        k = torch.randn(1, self._S, self._H, self._D, dtype=dtype, device=device)
+        freqs = torch.randn(1, self._S, 1, self._ROT // 2, 2, 2, dtype=torch.float32, device=device)
+        q_scale = torch.randn(self._D, dtype=torch.float32, device=device)
+        k_scale = torch.randn(self._D, dtype=torch.float32, device=device)
+        return q, k, freqs, q_scale, k_scale
+
+    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+    def test_partial_vs_reference(self, backend, device, seed, dtype, monkeypatch):
+        if backend not in get_capable_backends("rms_rope_split_half", device):
+            pytest.skip(f"{backend} does not support rms_rope_split_half on {device}")
+        q, k, freqs, q_scale, k_scale = self._inputs(device, dtype)
+        if backend == "cuda":
+            # the fused kernel must serve partial rotary itself, not fall back
+            q_out, k_out = _run_backend(
+                "rms_rope_split_half", backend,
+                (q, k, freqs, q_scale, k_scale, 1e-6, self._ROT), monkeypatch)
+        else:
+            with ck.use_backend(backend):
+                q_out, k_out = ck.rms_rope_split_half(
+                    q, k, freqs, q_scale, k_scale, rot_dim=self._ROT)
+        for name, out, x, scale in (("q", q_out, q, q_scale), ("k", k_out, k, k_scale)):
+            ref = self._reference(x, freqs, scale, 1e-6, self._ROT)
+            assert_values_close(out, ref, rtol=1e-3, atol=1e-3,
+                                max_mismatch_ratio=_max_mismatch(torch.float32, dtype),
+                                name=f"partial rotary {name} ({backend})")
+
+    @pytest.mark.parametrize("backend", ["cuda", "eager"])
+    def test_full_rot_dim_matches_default(self, backend, device, seed, monkeypatch):
+        """rot_dim == head_dim must be bit-identical to the default full rotation."""
+        if backend not in get_capable_backends("rms_rope_split_half", device):
+            pytest.skip(f"{backend} does not support rms_rope_split_half on {device}")
+        q, k, _, q_scale, k_scale = self._inputs(device, torch.bfloat16)
+        freqs = torch.randn(1, self._S, 1, self._D // 2, 2, 2, dtype=torch.float32, device=device)
+        with ck.use_backend(backend):
+            full = ck.rms_rope_split_half(q, k, freqs, q_scale, k_scale, rot_dim=self._D)
+            default = ck.rms_rope_split_half(q, k, freqs, q_scale, k_scale)
+        assert torch.equal(full[0], default[0]) and torch.equal(full[1], default[1])
+
+    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    def test_inplace_packed_qkv(self, backend, device, seed, monkeypatch):
+        """In-place on q/k slices of a fused QKV projection: interleaved views of
+        one buffer, bounds overlap but the element sets are disjoint."""
+        if backend not in get_capable_backends("rms_rope_split_half_", device):
+            pytest.skip(f"{backend} does not support rms_rope_split_half_ on {device}")
+        S, H, D, ROT = self._S, self._H, self._D, self._ROT
+        qkv = torch.randn(S, 3 * H * D, dtype=torch.bfloat16, device=device)
+        qkv_ref = qkv.clone()
+        freqs = torch.randn(1, S, 1, ROT // 2, 2, 2, dtype=torch.float32, device=device)
+        q_scale = torch.randn(D, dtype=torch.float32, device=device)
+        k_scale = torch.randn(D, dtype=torch.float32, device=device)
+        q, k, v = (t.view(1, S, H, D) for t in qkv.split(H * D, dim=-1))
+        qr, kr, vr = (t.view(1, S, H, D) for t in qkv_ref.split(H * D, dim=-1))
+        with ck.use_backend(backend):
+            ck.rms_rope_split_half_(q, k, freqs, q_scale, k_scale, rot_dim=ROT)
+            q_ref, k_ref = ck.rms_rope_split_half(qr, kr, freqs, q_scale, k_scale, rot_dim=ROT)
+        assert torch.equal(q, q_ref) and torch.equal(k, k_ref)
+        assert torch.equal(v, vr), "v must not be touched by in-place q/k rope"
+
+    def test_inplace_rejects_true_overlap(self, device, seed):
+        """Views that genuinely share elements must still be rejected."""
+        buf = torch.randn(64, 256, dtype=torch.bfloat16, device=device)
+        q = buf[:, :128].view(1, 64, 1, 128)
+        k = buf[:, 64:192].view(1, 64, 1, 128)  # overlaps q's second half
+        freqs = torch.randn(1, 64, 1, 64, 2, 2, dtype=torch.float32, device=device)
+        scale = torch.randn(128, dtype=torch.float32, device=device)
+        with pytest.raises(ValueError, match="non-overlapping"):
+            ck.rms_rope_split_half_(q, k, freqs, scale, scale)
+
+    def test_inplace_rejects_nonmultiple_strides(self, device, seed):
+        """Same-layout views whose outer strides are not multiples of each other
+        can collide through index combinations; the check stays conservative."""
+        base = torch.randn(4096, dtype=torch.bfloat16, device=device)
+        x = base.as_strided((3, 4, 20), (1000, 130, 1), 0).unsqueeze(0)
+        y = base.as_strided((3, 4, 20), (1000, 130, 1), 40).unsqueeze(0)
+        freqs = torch.randn(1, 3, 1, 10, 2, 2, dtype=torch.float32, device=device)
+        scale = torch.randn(20, dtype=torch.float32, device=device)
+        with pytest.raises(ValueError, match="non-overlapping"):
+            ck.rms_rope_split_half_(x, y, freqs, scale, scale)

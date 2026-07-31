@@ -3,6 +3,7 @@ import torch
 import triton
 import triton.language as tl
 from comfy_kitchen._rope_utils import check_rope_inplace, detect_rms_rope_bnhd
+from comfy_kitchen.backends.eager import rope as _eager_rope
 
 
 @triton.jit
@@ -235,9 +236,14 @@ def rms_rope_split_half(
     q_scale: torch.Tensor,
     k_scale: torch.Tensor | None = None,
     epsilon: float = 1e-6,
+    rot_dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k_scale is None:
         k_scale = q_scale
+    if rot_dim and rot_dim != q.shape[-1]:
+        # partial rotary is not fused in the triton kernel
+        return _eager_rope.rms_rope_split_half(
+            q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
     return (
         _rms_rope(q, freqs_cis, q_scale, epsilon, split_half=True),
         _rms_rope(k, freqs_cis, k_scale, epsilon, split_half=True),
@@ -251,9 +257,14 @@ def rms_rope_split_half_(
     q_scale: torch.Tensor,
     k_scale: torch.Tensor | None = None,
     epsilon: float = 1e-6,
+    rot_dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k_scale is None:
         k_scale = q_scale
+    if rot_dim and rot_dim != q.shape[-1]:
+        # partial rotary is not fused in the triton kernel
+        return _eager_rope.rms_rope_split_half_(
+            q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
     check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
     return (
         _rms_rope(q, freqs_cis, q_scale, epsilon, split_half=True, inplace=True),

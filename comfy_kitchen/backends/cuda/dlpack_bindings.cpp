@@ -128,6 +128,7 @@ extern "C" {
         void* q_out,
         void* k_out,
         int64_t batch, int64_t dim1, int64_t dim2, int64_t head_dim,
+        int64_t rot_dim,
         int64_t freqs_batch, int64_t freqs_dim1, int64_t freqs_dim2,
         int64_t q_s0, int64_t q_s1, int64_t q_s2, int64_t q_s3,
         int64_t k_s0, int64_t k_s1, int64_t k_s2, int64_t k_s3,
@@ -648,7 +649,8 @@ void rms_rope(nb::ndarray<nb::device::cuda> q, nb::ndarray<nb::device::cuda> k,
               nb::ndarray<nb::device::cuda> k_scale,
               nb::ndarray<nb::device::cuda> q_out,
               nb::ndarray<nb::device::cuda> k_out, float epsilon,
-              uintptr_t stream_ptr, bool split_half = false) {
+              uintptr_t stream_ptr, bool split_half = false,
+              int64_t rot_dim = 0) {
 
   if (q.ndim() != 4 || k.ndim() != 4 || q_out.ndim() != 4 ||
       k_out.ndim() != 4) {
@@ -671,10 +673,17 @@ void rms_rope(nb::ndarray<nb::device::cuda> q, nb::ndarray<nb::device::cuda> k,
     throw std::runtime_error(
         "native rms_rope requires head_dim to be a positive multiple of 32");
   }
+  // rot_dim restricts the rotation to a head-dim prefix (partial rotary); the
+  // norm always spans the full head_dim. 0 means rotate everything.
+  const int64_t rot = rot_dim > 0 ? rot_dim : head_dim;
+  if (rot % 2 != 0 || rot > head_dim) {
+    throw std::runtime_error(
+        "rms_rope rot_dim must be an even value <= head_dim");
+  }
   if (freqs.ndim() != 6 || (freqs.shape(0) != 1 && freqs.shape(0) != batch) ||
       (freqs.shape(1) != 1 && freqs.shape(1) != dim1) ||
       (freqs.shape(2) != 1 && freqs.shape(2) != dim2) ||
-      freqs.shape(3) != head_dim / 2 || freqs.shape(4) != 2 ||
+      freqs.shape(3) != rot / 2 || freqs.shape(4) != 2 ||
       freqs.shape(5) != 2) {
     throw std::runtime_error(
         "rms_rope freqs shape must broadcast to Q/K");
@@ -707,7 +716,7 @@ void rms_rope(nb::ndarray<nb::device::cuda> q, nb::ndarray<nb::device::cuda> k,
 
   launch_rms_rope_kernel(
       q.data(), k.data(), freqs.data(), q_scale.data(), k_scale.data(),
-      q_out.data(), k_out.data(), batch, dim1, dim2, head_dim,
+      q_out.data(), k_out.data(), batch, dim1, dim2, head_dim, rot,
       freqs.shape(0), freqs.shape(1), freqs.shape(2),
       q.stride(0), q.stride(1), q.stride(2), q.stride(3),
       k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -774,7 +783,7 @@ void rms_rope1(nb::ndarray<nb::device::cuda> q,
 
   launch_rms_rope_kernel(
       q.data(), nullptr, freqs.data(), q_scale.data(), nullptr, q_out.data(),
-      nullptr, batch, dim1, dim2, head_dim,
+      nullptr, batch, dim1, dim2, head_dim, head_dim,
       freqs.shape(0), freqs.shape(1), freqs.shape(2),
       q.stride(0), q.stride(1), q.stride(2), q.stride(3),
       0, 0, 0, 0,
@@ -1981,9 +1990,12 @@ void quantize_int8_rowwise_convrot64(
     uintptr_t stream_ptr) {
 
     const int64_t M = input.shape(0);
-    const int64_t K = input.shape(1);
+    // K is the activated (quantized) row width; the SwiGLU pair reads a
+    // [gate | up] input row twice as wide.
+    const int64_t K = output.shape(1);
+    const int64_t in_width = (act_code == 2) ? 2 : 1;
 
-    if (output.shape(0) != M || output.shape(1) != K) {
+    if (output.shape(0) != M || input.shape(1) != K * in_width) {
         throw std::runtime_error("INT8 rowwise convrot64 output shape mismatch");
     }
     if (scales.shape(0) != M || scales.shape(1) != 1) {
@@ -2605,7 +2617,7 @@ NB_MODULE(_C, m) {
           nb::arg("k"), nb::arg("freqs"), nb::arg("q_scale"),
           nb::arg("k_scale"), nb::arg("q_out"), nb::arg("k_out"),
           nb::arg("epsilon"), nb::arg("stream_ptr"),
-          nb::arg("split_half") = false);
+          nb::arg("split_half") = false, nb::arg("rot_dim") = 0);
 
     m.def("rms_rope1", &rms_rope1, "Fused RMSNorm and RoPE for a single tensor",
           nb::arg("q"), nb::arg("freqs"), nb::arg("q_scale"), nb::arg("q_out"),
