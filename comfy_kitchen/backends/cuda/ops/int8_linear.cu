@@ -5,6 +5,7 @@
 
 #include "utils.cuh"
 #include "dtype_dispatch.cuh"
+#include "input_act_codes.h"
 
 #include <cmath>
 #include <cfloat>
@@ -907,11 +908,8 @@ __global__ void quantize_int8_rowwise_from_partials_kernel(
 
 // Optional activation applied on the way into the quantizer, so an MLP's
 // `linear(act(proj(x)))` never writes act's output to HBM just to read it
-// straight back. No reduction is involved, so it is nearly free here. SwiGLU
-// is the gated pair: the raw row is [gate | up] (2*K wide) and the activated
-// row silu(gate) * up is K wide.
-enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2 };
-
+// straight back. No reduction is involved, so it is nearly free here. The
+// codes live in input_act_codes.h, shared with the nanobind layer.
 template<int ACT>
 __device__ __forceinline__ float apply_input_act(float v) {
     if constexpr (ACT == kActGeluTanh) {

@@ -20,6 +20,7 @@
 #include <cstring>
 
 #include "cublaslt_runtime.h"
+#include "input_act_codes.h"
 
 namespace nb = nanobind;
 
@@ -1993,7 +1994,7 @@ void quantize_int8_rowwise_convrot64(
     // K is the activated (quantized) row width; the SwiGLU pair reads a
     // [gate | up] input row twice as wide.
     const int64_t K = output.shape(1);
-    const int64_t in_width = (act_code == 2) ? 2 : 1;
+    const int64_t in_width = (act_code == comfy::kActSwiGLU) ? 2 : 1;
 
     if (output.shape(0) != M || input.shape(1) != K * in_width) {
         throw std::runtime_error("INT8 rowwise convrot64 output shape mismatch");

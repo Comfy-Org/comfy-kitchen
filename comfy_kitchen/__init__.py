@@ -549,7 +549,7 @@ def rms_rope_split_half(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply per-head RMSNorm and split-half RoPE to query and key tensors.
 
-    Split-half layout: pair k uses elements [k] and [k + rot_dim//2]. rot_dim
+    Split-half layout: pair i uses elements [i] and [i + rot_dim//2]. rot_dim
     restricts the rotation to a head-dim prefix (partial rotary; the norm
     always spans the full head_dim); 0 rotates everything.
     """

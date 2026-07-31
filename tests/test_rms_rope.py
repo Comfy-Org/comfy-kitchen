@@ -465,7 +465,7 @@ class TestPartialRotary:
                                 max_mismatch_ratio=_max_mismatch(torch.float32, dtype),
                                 name=f"partial rotary {name} ({backend})")
 
-    @pytest.mark.parametrize("backend", ["cuda", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
     def test_full_rot_dim_matches_default(self, backend, device, seed, monkeypatch):
         """rot_dim == head_dim must be bit-identical to the default full rotation."""
         if backend not in get_capable_backends("rms_rope_split_half", device):
@@ -483,17 +483,17 @@ class TestPartialRotary:
         one buffer, bounds overlap but the element sets are disjoint."""
         if backend not in get_capable_backends("rms_rope_split_half_", device):
             pytest.skip(f"{backend} does not support rms_rope_split_half_ on {device}")
-        S, H, D, ROT = self._S, self._H, self._D, self._ROT
-        qkv = torch.randn(S, 3 * H * D, dtype=torch.bfloat16, device=device)
+        seq_len, heads, head_dim, rot = self._S, self._H, self._D, self._ROT
+        qkv = torch.randn(seq_len, 3 * heads * head_dim, dtype=torch.bfloat16, device=device)
         qkv_ref = qkv.clone()
-        freqs = torch.randn(1, S, 1, ROT // 2, 2, 2, dtype=torch.float32, device=device)
-        q_scale = torch.randn(D, dtype=torch.float32, device=device)
-        k_scale = torch.randn(D, dtype=torch.float32, device=device)
-        q, k, v = (t.view(1, S, H, D) for t in qkv.split(H * D, dim=-1))
-        qr, kr, vr = (t.view(1, S, H, D) for t in qkv_ref.split(H * D, dim=-1))
+        freqs = torch.randn(1, seq_len, 1, rot // 2, 2, 2, dtype=torch.float32, device=device)
+        q_scale = torch.randn(head_dim, dtype=torch.float32, device=device)
+        k_scale = torch.randn(head_dim, dtype=torch.float32, device=device)
+        q, k, v = (t.view(1, seq_len, heads, head_dim) for t in qkv.split(heads * head_dim, dim=-1))
+        qr, kr, vr = (t.view(1, seq_len, heads, head_dim) for t in qkv_ref.split(heads * head_dim, dim=-1))
         with ck.use_backend(backend):
-            ck.rms_rope_split_half_(q, k, freqs, q_scale, k_scale, rot_dim=ROT)
-            q_ref, k_ref = ck.rms_rope_split_half(qr, kr, freqs, q_scale, k_scale, rot_dim=ROT)
+            ck.rms_rope_split_half_(q, k, freqs, q_scale, k_scale, rot_dim=rot)
+            q_ref, k_ref = ck.rms_rope_split_half(qr, kr, freqs, q_scale, k_scale, rot_dim=rot)
         assert torch.equal(q, q_ref) and torch.equal(k, k_ref)
         assert torch.equal(v, vr), "v must not be touched by in-place q/k rope"
 
@@ -517,3 +517,24 @@ class TestPartialRotary:
         scale = torch.randn(20, dtype=torch.float32, device=device)
         with pytest.raises(ValueError, match="non-overlapping"):
             ck.rms_rope_split_half_(x, y, freqs, scale, scale)
+
+    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    def test_inplace_partial_gqa_shapes(self, backend, device, seed):
+        """Mismatched Q/K head counts route through a fallback that must still
+        honor the in-place contract: the caller's buffers get written even if
+        the return value is ignored."""
+        if backend not in get_capable_backends("rms_rope_split_half_", device):
+            pytest.skip(f"{backend} does not support rms_rope_split_half_ on {device}")
+        seq_len, head_dim, rot = 65, self._D, self._ROT
+        q = torch.randn(1, seq_len, 8, head_dim, dtype=torch.bfloat16, device=device)
+        k = torch.randn(1, seq_len, 2, head_dim, dtype=torch.bfloat16, device=device)
+        q_orig, k_orig = q.clone(), k.clone()
+        freqs = torch.randn(1, seq_len, 1, rot // 2, 2, 2, dtype=torch.float32, device=device)
+        q_scale = torch.randn(head_dim, dtype=torch.float32, device=device)
+        k_scale = torch.randn(head_dim, dtype=torch.float32, device=device)
+        with ck.use_backend(backend):
+            q_ref, k_ref = ck.rms_rope_split_half(q, k, freqs, q_scale, k_scale, rot_dim=rot)
+            ck.rms_rope_split_half_(q, k, freqs, q_scale, k_scale, rot_dim=rot)
+        assert torch.equal(q, q_ref) and torch.equal(k, k_ref)
+        assert not torch.equal(q, q_orig), "q buffer was never written in place"
+        assert not torch.equal(k, k_orig), "k buffer was never written in place"

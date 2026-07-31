@@ -14,9 +14,8 @@ quantized row is half as wide as the raw input row.
 
 import torch
 
-# Must match the kActNone / kActGeluTanh / kActSwiGLU enum in
-# backends/cuda/ops/int8_linear.cu; the CUDA backend passes these codes
-# straight to the kernel.
+# Must match the enum in backends/cuda/input_act_codes.h; the CUDA backend
+# passes these codes straight to the kernel.
 INPUT_ACT_TO_CODE: dict[str | None, int] = {
     None: 0,
     "none": 0,

@@ -2148,8 +2148,9 @@ def _rms_rope_cuda(
 
     if q.shape != k.shape:
         if rot_dim:
-            return _eager_rope.rms_rope_split_half(
-                q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
+            fallback = (_eager_rope.rms_rope_split_half_ if inplace
+                        else _eager_rope.rms_rope_split_half)
+            return fallback(q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
         return (
             _rms_rope1_cuda(
                 q, freqs_cis, q_scale, epsilon,
