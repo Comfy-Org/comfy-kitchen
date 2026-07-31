@@ -121,6 +121,10 @@ def _visible_gfx_arches() -> tuple[str | None, ...]:
     """
     if not torch.cuda.is_available() or not getattr(torch.version, "hip", None):
         return ()
+
+    # ROCm lazy initialization: device_count() may return 0 until HIP is initialized.
+    torch.cuda.current_device()
+
     return tuple(_gfx_arch(i) for i in range(torch.cuda.device_count()))
 
 
