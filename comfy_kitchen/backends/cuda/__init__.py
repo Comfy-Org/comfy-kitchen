@@ -145,12 +145,15 @@ except Exception as e:
 
 from comfy_kitchen.backends._activations import (  # noqa: E402
     apply_input_act as _apply_input_act,
-    input_act_width as _input_act_width,
 )
 from comfy_kitchen.backends._activations import (  # noqa: E402
     input_act_code as _input_act_code,
 )
+from comfy_kitchen.backends._activations import (  # noqa: E402
+    input_act_width as _input_act_width,
+)
 from comfy_kitchen.backends._modulation import adaln_prep_modulation  # noqa: E402
+from comfy_kitchen.backends.eager import rope as _eager_rope  # noqa: E402
 from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
     DTYPE_CODE_TO_DTYPE,
     DTYPE_TO_CODE,
@@ -161,7 +164,6 @@ from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
 from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
     quantize_int8_tensorwise as eager_quantize_int8_tensorwise,
 )
-from comfy_kitchen.backends.eager import rope as _eager_rope  # noqa: E402
 from comfy_kitchen.backends.eager.svdquant import (  # noqa: E402
     _INT4_GROUP_SIZE,
     _unpack_int4_row_major,
