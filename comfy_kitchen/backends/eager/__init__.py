@@ -43,6 +43,7 @@ __all__ = [
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
     "int8_linear",
+    "w4a8_int8_linear",
 ]
 
 import torch
@@ -102,6 +103,7 @@ from .rope import (
     rms_rope_split_half_,
 )
 from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
+from .w4a8_int8 import w4a8_int8_linear
 
 
 def _build_constraints() -> dict:
@@ -357,6 +359,18 @@ def _build_constraints() -> dict:
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
                 "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
                 "linear_dtype": ParamConstraint(dtypes=frozenset({str})),
+            },
+            default_devices=all_devices,
+        ),
+        "w4a8_int8_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "qdata": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
+                "s_rel": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn, torch.float32}), shape_rules=(ExactDims(2),)),
+                "s_channel": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)),
+                "bias": ParamConstraint(dtypes=standard_floats),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=all_devices,
         ),

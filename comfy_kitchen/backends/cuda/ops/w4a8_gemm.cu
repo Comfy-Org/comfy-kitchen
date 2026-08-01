@@ -3,11 +3,10 @@
 //
 // W4A8 weight dequant: grouped int4 -> int8 for the tuned int8-GEMM path.
 //
-// The AsymW4A8Int8Layout dequantizes int4 weights to the "grouped int8"
-// representation (per-group scale folded in, per-channel scale left for the int8
-// GEMM epilogue) and runs comfy's tuned int8 CUTLASS GEMM -- so this file only
-// needs the memory-bound int4->int8 dequant kernel (fp32 and fp8/e4m3 group
-// scales, optional Lloyd-Max codebook). The matmul itself is cutlass_gemm_int8.
+// AsymW4A8Int8Layout dequantizes int4 weights to "grouped int8" (per-group scale
+// folded in, per-channel scale left for the int8 GEMM epilogue), then runs comfy's
+// tuned int8 CUTLASS GEMM. So this file is just the memory-bound int4->int8 dequant
+// kernel (fp32/fp8-e4m3 group scales, optional codebook); the matmul is cutlass_gemm_int8.
 
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
@@ -18,9 +17,8 @@
 // s_rel = per-group scale / per-channel scale (so the int8 range is used). The
 // per-channel scale is applied later in the int8 GEMM epilogue. Memory-bound.
 namespace {
-// Per-group scale may be stored fp32 or fp8 (e4m3). fp8 halves the scale
-// metadata (g16 fp32 -> 0.75 B/elem; fp8 -> ~0.56, ~half int8) at a tiny
-// quality cost (still beats NVFP4). uint8_t storage == e4m3 raw bits.
+// Per-group scale is fp32 or fp8 (e4m3). fp8 halves the scale metadata at a tiny
+// quality cost. uint8_t storage == e4m3 raw bits.
 template <typename ScaleT> __device__ __forceinline__ float load_scale(ScaleT v);
 template <> __device__ __forceinline__ float load_scale<float>(float v) { return v; }
 template <> __device__ __forceinline__ float load_scale<uint8_t>(uint8_t v) {
@@ -29,8 +27,9 @@ template <> __device__ __forceinline__ float load_scale<uint8_t>(uint8_t v) {
 
 // Each thread: 8 packed bytes (uint2) -> 16 int8 (uint4 store). The 16 output
 // cols may span multiple groups when G<16 (finer groups = better int4 quality),
-// so the scale is (re)loaded per output pair from its own group. G must be even
-// and either divide 16 or be a multiple of 16 (so groups stay pair-aligned).
+// so the scale is (re)loaded per output pair from its own group. Only 4 group
+// scales (sc0..sc3) are loaded, so a 16-col vec may span at most 4 groups: G must
+// be in {4, 8, 16} or a multiple of 16 (G<4 would span >4 groups and mis-scale).
 // If codebook != nullptr, the 4-bit code indexes a shared 16-entry non-uniform
 // codebook (Lloyd-Max on the rotated-Gaussian weight) instead of the uniform
 // level (q-8); same storage/speed, ~14% lower weight error at coarse groups.

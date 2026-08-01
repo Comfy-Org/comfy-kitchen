@@ -2,29 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Grouped W4A8 on the tuned INT8 CUTLASS GEMM (symmetric default).
 
-Calibration-free 4-bit weight storage that runs at near-int8-tensor-core speed
-by reusing comfy's tuned INT8 GEMM:
+Calibration-free 4-bit weight storage at near-int8-tensor-core speed, reusing comfy's
+tuned INT8 GEMM. Weights are ConvRot-rotated (data-free Hadamard) then quantized per
+``group_size``. Default = symmetric group-16 with a per-tensor Lloyd-Max 16-level codebook
++ fp8 (e4m3) group scales: ~0.073 weight relL2 on real DiT weights (NVFP4 0.094),
+~0.56 B/elem, no zero-point correction -> ~1.09x int8 speed. ``symmetric=False`` adds a
+rank-(K/group) zero-point correction (~1.4x int8) and is dominated by the default.
 
-- Weights are rotated (data-free Hadamard / ConvRot) then quantized per group of
-  ``group_size``. The default is **symmetric group-16 with a Lloyd-Max codebook
-  and fp8 (e4m3) group scales**: a per-tensor 16-level MSE-optimal codebook fit
-  to the rotated (~Gaussian) weights, plus an alternating least-squares refit of
-  the group scales and a final code assignment against the fp8-rounded scale the
-  kernel actually decodes with. ~0.073 weight relL2 on real DiT weights (NVFP4
-  0.094), ~0.56 B/elem (under NVFP4's footprint, ~56% of int8), no zero-point
-  correction -> ~1.09x int8 speed. ``symmetric=False`` gives asymmetric uniform
-  (uint4 [0,15], per-group min/scale) at the cost of a rank-(K/group) correction
-  pass (~1.4x int8); it is dominated by the symmetric+codebook default.
-- At matmul time the int4 weights are dequantized to the *grouped int8
-  representation* ``round((q-8)*s_rel)`` (group scale folded in, per-channel
-  scale ``s_channel`` left for the GEMM epilogue) and fed to the tuned INT8
-  CUTLASS GEMM. Symmetric packs ``q_signed+8`` so the same kernel computes
-  ``(q-8)*s_rel = q_signed*s_rel``.
-- Asymmetric only: the zero-point is added back as ``Sx @ Cᵀ`` (Sx = per-row
-  per-group int8-activation sums, ``C = 8*s_g + min``).
-
-Storage: int4 weights + per-group scale metadata. Persistent weights stay int4;
-the int8 dequant target is a transient per-call buffer (no int8-sized cache).
+At matmul the int4 weights dequant to "grouped int8" ``round((q-8)*s_rel)`` -- group scale
+folded in, per-channel ``s_channel`` left for the GEMM epilogue -- feeding the INT8 GEMM.
+Symmetric packs ``q_signed+8``; asymmetric adds the zero-point back as ``Sx @ Cᵀ``.
+Weights stay int4 in memory; the int8 dequant target is a transient per-call buffer.
 """
 
 from __future__ import annotations
@@ -44,13 +32,38 @@ from .base import (
     register_layout_op,
 )
 from .int8 import _dtype_code
+from .int8_utils import _build_hadamard, _rotate_weight
 
 logger = logging.getLogger(__name__)
 
+# The tuned W4A8 kernels live in the compiled CUDA backend. Without it (ROCm/AMD, CPU)
+# the layout dispatches dequant + INT8 GEMM through the registry (Triton, else eager) and
+# rotates in portable torch -- runnable on any torch device.
+try:
+    from comfy_kitchen.backends.cuda import _C as _CUDA_C  # noqa: F401
+    _CUDA_AVAILABLE = True
+except Exception as _e:  # pragma: no cover - non-CUDA builds
+    _CUDA_AVAILABLE = False
+    # Loud only when CUDA hardware is present but the extension failed to load; quiet on
+    # ROCm/CPU where the fallback is expected.
+    if torch.cuda.is_available():
+        logger.warning(
+            "W4A8: CUDA backend import failed though CUDA is available (%s); falling "
+            "back to the portable Triton/eager path (slower).", _e)
+
+
+def _convrot_rotate(w: torch.Tensor, groupsize: int) -> torch.Tensor:
+    """Involutory ConvRot (Regular-Hadamard) rotation. Uses the CUDA kernel when
+    available, else the portable int8_utils implementation (bit-matches to ~bf16 eps)."""
+    if _CUDA_AVAILABLE and w.is_cuda:
+        from comfy_kitchen.backends.cuda import rotate_int8_convrot_weight
+        return rotate_int8_convrot_weight(w, groupsize)
+    h = _build_hadamard(groupsize, device=w.device, dtype=w.dtype)
+    return _rotate_weight(w, h, groupsize)
+
 # Chunked fused path: dequant int4->int8 in L2-sized column chunks feeding the strided
-# int8 GEMM, so the int8 weight chunk stays cache-resident instead of the full [N,K]
-# round-tripping global memory. Matches convrot_w4a4's speed at our codebook quality.
-# Set COMFY_KITCHEN_W4A8_CHUNKED=0 to force the 2-pass path (e.g. for A/B timing).
+# int8 GEMM, so each int8 chunk stays cache-resident (no full [N,K] global round-trip).
+# COMFY_KITCHEN_W4A8_CHUNKED=0 forces the 2-pass path.
 _W4A8_CHUNKED = os.environ.get("COMFY_KITCHEN_W4A8_CHUNKED", "1") != "0"
 
 
@@ -91,33 +104,31 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         codebook: bool = True,
         **kwargs,
     ) -> tuple[torch.Tensor, Params]:
-        from comfy_kitchen.backends.cuda import rotate_int8_convrot_weight
-
         orig_dtype = tensor.dtype
         orig_shape = tuple(tensor.shape)
         n, k = tensor.shape
-        # G must be even and pair-aligned to the 16-wide dequant vec: either
-        # divides 16 (fine: 4, 8, 16) or is a multiple of 16 (coarse: 32, 64...).
-        if k % group_size != 0 or group_size % 2 != 0 or (16 % group_size != 0 and group_size % 16 != 0):
-            raise ValueError(f"K={k}%G and G={group_size} must be even & (divides 16 or mult of 16)")
+        # G must be >=4 and in {4,8,16} or a multiple of 16: the dequant kernel loads
+        # at most 4 group scales per 16-col vec, so G>=4 (G=2 would mis-scale cols 8-15).
+        if (k % group_size != 0 or group_size < 4
+                or (16 % group_size != 0 and group_size % 16 != 0)):
+            raise ValueError(
+                f"K={k}%G and G={group_size} must be >=4 & (divides 16 or mult of 16)")
         groups = k // group_size
 
         # Data-free rotation (paired with the fused convrot activation quant).
-        w = rotate_int8_convrot_weight(tensor, convrot_groupsize).float().view(n, groups, group_size)
+        w = _convrot_rotate(tensor, convrot_groupsize).float().view(n, groups, group_size)
 
         cb = None
         if symmetric and codebook:
-            # Non-uniform 16-level codebook (Lloyd-Max on the rotated-Gaussian weight,
-            # calibration-free). ConvRot makes weights ~Gaussian; a codebook matched to
-            # it beats uniform int4 by ~14% at coarse groups, same storage/speed. The
-            # 4-bit code indexes cb directly; kernel computes cb[q]*s_rel.
+            # Non-uniform 16-level codebook (Lloyd-Max, calibration-free). ConvRot makes
+            # weights ~Gaussian; a matched codebook beats uniform int4 ~14% at coarse
+            # groups, same storage/speed. Code indexes cb directly; kernel does cb[q]*s_rel.
             s_g = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)  # group absmax
             wn = (w / s_g)  # [n, groups, group] normalized to [-1, 1]
             cb = cls._fit_codebook(wn)  # [16] fp32
             q = cls._assign_codes(wn, cb)  # [n,groups,group] indices
-            # Alternating least-squares refit of the group scale given the codes:
-            # absmax is only optimal when the extreme code sits at +-1, which a
-            # Lloyd-Max codebook's extreme levels don't. 3 rounds, ~free at quant time.
+            # Least-squares refit of the group scale given the codes (absmax is only
+            # optimal when the extreme code sits at +-1, which Lloyd-Max levels don't).
             for _ in range(3):
                 cbq = cb[q]
                 s_g = ((w * cbq).sum(-1, keepdim=True)
@@ -149,11 +160,9 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         if scale_dtype != torch.float32:
             s_rel = s_rel.to(scale_dtype).contiguous()
         if cb is not None:
-            # int8-grid-aware final assignment: pick codes against the values the
-            # kernel actually decodes -- round(clamp(cb_j * s_rel)) * s_channel,
-            # with s_rel in its stored dtype. Subsumes the fp8-scale-aware
-            # reassignment AND folds the int8 re-rounding into the choice
-            # (measured 0.0730 -> 0.0727 weight relL2 on Krea2 g16-fp8).
+            # Final code assignment against the values the kernel actually decodes
+            # (round(clamp(cb_j * s_rel)) * s_channel, s_rel in its stored dtype) -- folds
+            # the fp8-scale and int8 re-rounding into the choice (0.0730 -> 0.0727 g16-fp8).
             levels = (cb.view(1, 1, 16) * s_rel.float().unsqueeze(-1)).round_().clamp_(-127, 127)
             q_u = cls._assign_grid(w, levels, s_channel).view(n, k)
         # pack uint4: even col -> low nibble, odd col -> high nibble
@@ -173,11 +182,8 @@ class AsymW4A8Int8Layout(QuantizedLayout):
 
     @staticmethod
     def _assign_codes(xn: torch.Tensor, cb: torch.Tensor) -> torch.Tensor:
-        """Nearest-codebook index without materializing the [..., 16] distance tensor
-        (loop the 16 levels; keeps peak memory at a couple of [...] tensors).
-
-        int32 index: half the peak memory of long, still a valid indexing dtype
-        (uint8 is NOT -- byte index tensors are treated as boolean masks)."""
+        """Nearest-codebook index, looping the 16 levels to avoid a [..., 16] distance
+        tensor. int32 (not uint8 -- byte index tensors are treated as boolean masks)."""
         best = (xn - cb[0]).abs()
         idx = torch.zeros_like(xn, dtype=torch.int32)
         for j in range(1, cb.numel()):
@@ -189,9 +195,8 @@ class AsymW4A8Int8Layout(QuantizedLayout):
 
     @staticmethod
     def _assign_grid(wv: torch.Tensor, levels: torch.Tensor, s_channel: torch.Tensor) -> torch.Tensor:
-        """Nearest decoded-int8 level: argmin_j |wv/s_channel - levels[n,g,j]| with
-        per-(channel, group) levels, looped over j like _assign_codes. `levels` is
-        [N, groups, 16] (= K floats/row at group 16; scales up at finer groups)."""
+        """Nearest decoded-int8 level: argmin_j |wv/s_channel - levels[n,g,j]|, looped
+        over j. `levels` is [N, groups, 16] (the per-channel/group decoded values)."""
         t = wv / s_channel.view(-1, 1, 1)
         best = (t - levels[..., 0:1].expand_as(wv)).abs()
         idx = torch.zeros_like(wv, dtype=torch.int32)
@@ -224,9 +229,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
 
     @classmethod
     def dequantize(cls, qdata: torch.Tensor, params: Params) -> torch.Tensor:
-        # Reference dequant (rotated-basis weight); for fallbacks/inspection.
-        from comfy_kitchen.backends.cuda import rotate_int8_convrot_weight
-
+        # Reference dequant (original-basis weight); for fallbacks/inspection.
         n, k_half = qdata.shape
         k = k_half * 2
         g = params.group_size
@@ -240,16 +243,16 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         if params.codebook is not None:
             # w = codebook[q] * s_g (q is a direct [0,15] index)
             lvl = params.codebook.to(q.device).float()[q.view(n, groups, g)]
-            return rotate_int8_convrot_weight(
+            return _convrot_rotate(
                 (lvl * s_g).view(n, k).to(params.orig_dtype), params.convrot_groupsize).to(params.orig_dtype)
         qc = (q.view(n, groups, g).float() - 8.0) * s_g
         if params.correction is None:
             w_rot = qc.view(n, k)  # symmetric: w = (q-8)*s_g
         else:
-            C = params.correction.t().unsqueeze(-1).float()  # [N,groups,1] = 8*s_g + min
-            w_rot = (qc + C).view(n, k)  # w = q*s_g + min = (q-8)*s_g + C
+            corr = params.correction.t().unsqueeze(-1).float()  # [N,groups,1] = 8*s_g + min
+            w_rot = (qc + corr).view(n, k)  # w = q*s_g + min = (q-8)*s_g + corr
         # undo rotation (involutory)
-        return rotate_int8_convrot_weight(w_rot.to(params.orig_dtype), params.convrot_groupsize).to(params.orig_dtype)
+        return _convrot_rotate(w_rot.to(params.orig_dtype), params.convrot_groupsize).to(params.orig_dtype)
 
     @classmethod
     def get_plain_tensors(cls, qtensor: QuantizedTensor):
@@ -277,7 +280,38 @@ class AsymW4A8Int8Layout(QuantizedLayout):
                 "symmetric": p.correction is None, "codebook": p.codebook is not None}
 
 
+def _w4a8_int8_matmul_portable(x, weight, bias, out_dtype):
+    """Backend-agnostic W4A8 linear via the registry (Triton on AMD, else eager). Symmetric
+    weights take the dequant + INT8 GEMM path; asymmetric has no INT8-GEMM form so it falls
+    back to dequantize + F.linear."""
+    from comfy_kitchen.registry import registry
+
+    p = weight._params
+    if p.correction is not None:
+        return torch.nn.functional.linear(x, weight.dequantize().to(x.dtype), bias)
+    kwargs = {
+        "x": x,
+        "qdata": weight._qdata,
+        "s_rel": p.scale,
+        "s_channel": p.s_channel,
+        "bias": bias,
+        "group_size": p.group_size,
+        "convrot_groupsize": p.convrot_groupsize,
+    }
+    impl = registry.get_implementation("w4a8_int8_linear", kwargs=kwargs)
+    return impl(
+        x, weight._qdata, p.scale, p.s_channel,
+        codebook=p.codebook, bias=bias, group_size=p.group_size,
+        convrot_groupsize=p.convrot_groupsize, out_dtype=out_dtype,
+    )
+
+
 def _w4a8_int8_matmul(x, weight, bias, out_dtype):
+    # Portable path (Triton on AMD, else pure-torch eager) when the tuned CUDA kernels
+    # are unavailable or the input is not on CUDA.
+    if not (_CUDA_AVAILABLE and x.is_cuda):
+        return _w4a8_int8_matmul_portable(x, weight, bias, out_dtype)
+
     from comfy_kitchen.backends.cuda import (
         _C,
         _empty_cuda_tensor,
@@ -298,8 +332,8 @@ def _w4a8_int8_matmul(x, weight, bias, out_dtype):
     # fused rotate + int8 activation quant
     xq, xs = quantize_int8_rowwise_convrot(x2, p.convrot_groupsize)
     out = torch.empty(m, n, dtype=out_dtype, device=x.device)
-    # Fuse bias into the epilogue (D = acc*xs*s_channel + bias). fp32 compute type;
-    # the [N] cast is cheap -- don't cache it (inference tensors have no _version).
+    # Bias fuses into the GEMM epilogue (D = acc*xs*s_channel + bias). Cast fresh each
+    # call -- don't cache on the bias tensor (inference tensors have no _version).
     biasf = bias.float().contiguous() if bias is not None else None
 
     # Chunked fused path (symmetric codebook, fp8 scale): dequant int4->int8 in
