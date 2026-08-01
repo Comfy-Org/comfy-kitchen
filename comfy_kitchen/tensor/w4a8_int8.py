@@ -216,7 +216,10 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         """MSE-optimal (Lloyd-Max) 16-level codebook on normalized weights, data-free."""
         x = wn.flatten()
         if x.numel() > sample:
-            idx = torch.randint(0, x.numel(), (sample,), device=x.device)
+            # Fixed-seed local generator so the codebook (and the packed codes, hence the
+            # exported checkpoint) is reproducible run-to-run, independent of global RNG.
+            gen = torch.Generator(device=x.device).manual_seed(0)
+            idx = torch.randint(0, x.numel(), (sample,), device=x.device, generator=gen)
             x = x[idx]
         x = x.float()
         cb = torch.quantile(x, torch.linspace(0, 1, levels, device=x.device))
@@ -241,19 +244,21 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         q = torch.empty(n, k, dtype=torch.int32, device=qdata.device)
         q[:, 0::2] = b & 0xF
         q[:, 1::2] = (b >> 4) & 0xF
-        s_rel = params.scale.float()  # fp8/fp32 -> fp32
-        s_g = (s_rel * params.s_channel.unsqueeze(1)).unsqueeze(-1)  # [N,groups,1]
+        s_rel = params.scale.float().unsqueeze(-1)  # [N, groups, 1]
+        s_channel = params.s_channel.float().view(n, 1, 1)  # [N, 1, 1]
         if params.codebook is not None:
-            # w = codebook[q] * s_g (q is a direct [0,15] index)
-            lvl = params.codebook.to(q.device).float()[q.view(n, groups, g)]
-            w_rot = (lvl * s_g).view(n, k)
+            lvl = params.codebook.to(q.device).float()[q.view(n, groups, g)]  # [N,groups,g]
         else:
-            qc = (q.view(n, groups, g).float() - 8.0) * s_g
-            if params.correction is None:
-                w_rot = qc.view(n, k)  # symmetric: w = (q-8)*s_g
-            else:
-                corr = params.correction.t().unsqueeze(-1).float()  # [N,groups,1] = 8*s_g + min
-                w_rot = (qc + corr).view(n, k)  # w = q*s_g + min = (q-8)*s_g + corr
+            lvl = q.view(n, groups, g).float() - 8.0  # symmetric uniform levels -8..7
+        # Match the executed paths (CUDA/Triton/eager): the per-group scale is folded into a
+        # rounded int8 weight and the per-channel scale is applied afterward, so the reference
+        # dequant must fold the same round+clamp -- else it returns weights the kernels never
+        # use (the codes were even picked against this grid in quantize).
+        int8_w = (lvl * s_rel).round_().clamp_(-127, 127)  # [N, groups, g]
+        w_rot = int8_w * s_channel  # [N, groups, g]
+        if params.correction is not None:  # asymmetric zero-point (rank correction folded per-elem here)
+            w_rot = w_rot + params.correction.t().unsqueeze(-1).float()  # [N,groups,1] = 8*s_g + min
+        w_rot = w_rot.view(n, k)
         # undo rotation (involutory) -> storage-basis weight [N, K]. The base
         # QuantizedTensor.dequantize() applies the lazy-transpose flag (returns W.T for a
         # transposed tensor), so this must always return the [N, K] storage orientation.
