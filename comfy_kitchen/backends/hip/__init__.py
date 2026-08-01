@@ -24,7 +24,7 @@ from collections.abc import Sequence
 
 import torch
 
-from comfy_kitchen._rope_utils import check_rope_inplace
+from comfy_kitchen._rope_utils import check_rope_inplace, trim_rope_freqs
 from comfy_kitchen.backends import eager as _eager
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
 from comfy_kitchen.backends._activations import input_act_code as _input_act_code
@@ -1014,6 +1014,9 @@ def _rope(xq, xk, freqs_cis, split_half, inplace=False):
         xq, xk = _rope_rows(xq, xk)
         xq_out = torch.empty(xq.shape, dtype=xq.dtype, device=xq.device)
         xk_out = None if xk is None else torch.empty(xk.shape, dtype=xk.dtype, device=xk.device)
+
+    if not split_half:
+        freqs_cis = trim_rope_freqs(xq, freqs_cis)
 
     _C.apply_rope(
         _dl(xq), None if xk is None else _dl(xk), _dl(freqs_cis),
