@@ -246,15 +246,17 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         if params.codebook is not None:
             # w = codebook[q] * s_g (q is a direct [0,15] index)
             lvl = params.codebook.to(q.device).float()[q.view(n, groups, g)]
-            return _convrot_rotate(
-                (lvl * s_g).view(n, k).to(params.orig_dtype), params.convrot_groupsize).to(params.orig_dtype)
-        qc = (q.view(n, groups, g).float() - 8.0) * s_g
-        if params.correction is None:
-            w_rot = qc.view(n, k)  # symmetric: w = (q-8)*s_g
+            w_rot = (lvl * s_g).view(n, k)
         else:
-            corr = params.correction.t().unsqueeze(-1).float()  # [N,groups,1] = 8*s_g + min
-            w_rot = (qc + corr).view(n, k)  # w = q*s_g + min = (q-8)*s_g + corr
-        # undo rotation (involutory)
+            qc = (q.view(n, groups, g).float() - 8.0) * s_g
+            if params.correction is None:
+                w_rot = qc.view(n, k)  # symmetric: w = (q-8)*s_g
+            else:
+                corr = params.correction.t().unsqueeze(-1).float()  # [N,groups,1] = 8*s_g + min
+                w_rot = (qc + corr).view(n, k)  # w = q*s_g + min = (q-8)*s_g + corr
+        # undo rotation (involutory) -> storage-basis weight [N, K]. The base
+        # QuantizedTensor.dequantize() applies the lazy-transpose flag (returns W.T for a
+        # transposed tensor), so this must always return the [N, K] storage orientation.
         return _convrot_rotate(w_rot.to(params.orig_dtype), params.convrot_groupsize).to(params.orig_dtype)
 
     @classmethod
@@ -289,6 +291,14 @@ class AsymW4A8Int8Layout(QuantizedLayout):
                 "symmetric": p.correction is None, "codebook": p.codebook is not None}
 
 
+def _storage_dequant(weight):
+    """Dequantize to the [N, K] storage orientation, undoing the lazy-transpose flag.
+    The GEMM fallbacks compute x @ W.T from the [N, K] weight, so they must not see the
+    (K, N) orientation that ``weight.dequantize()`` returns for a transposed tensor."""
+    w = weight.dequantize()
+    return w.t() if weight._params.transposed else w
+
+
 def _w4a8_int8_matmul_portable(x, weight, bias, out_dtype):
     """Backend-agnostic W4A8 linear via the registry (Triton on AMD, else eager). Symmetric
     weights take the dequant + INT8 GEMM path; asymmetric has no INT8-GEMM form so it falls
@@ -297,7 +307,7 @@ def _w4a8_int8_matmul_portable(x, weight, bias, out_dtype):
 
     p = weight._params
     if p.correction is not None:
-        return torch.nn.functional.linear(x, weight.dequantize().to(x.dtype), bias)
+        return torch.nn.functional.linear(x, _storage_dequant(weight).to(x.dtype), bias)
     kwargs = {
         "x": x,
         "qdata": weight._qdata,
@@ -378,7 +388,7 @@ def _w4a8_int8_matmul(x, weight, bias, out_dtype):
         _wrap_for_dlpack(p.s_channel), _wrap_for_dlpack(bf),
         _wrap_for_dlpack(out), _dtype_code(out_dtype), sp)
     if not used:
-        return torch.nn.functional.linear(x, weight.dequantize(), bias)
+        return torch.nn.functional.linear(x, _storage_dequant(weight), bias)
 
     # asymmetric zero-point correction (rank-(K/group)); symmetric path has none.
     if p.correction is not None:
