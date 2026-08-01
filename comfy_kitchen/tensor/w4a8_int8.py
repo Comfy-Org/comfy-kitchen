@@ -107,12 +107,15 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         orig_dtype = tensor.dtype
         orig_shape = tuple(tensor.shape)
         n, k = tensor.shape
-        # G must be >=4 and in {4,8,16} or a multiple of 16: the dequant kernel loads
-        # at most 4 group scales per 16-col vec, so G>=4 (G=2 would mis-scale cols 8-15).
-        if (k % group_size != 0 or group_size < 4
+        # K must be a multiple of 16: the CUDA dequant kernel is vectorized (uint2 load ->
+        # uint4 store, 16 int8/thread, n_vec = N*K/16), so a non-16 K truncates the tail and
+        # misaligns the row start. G must be >=4 and in {4,8,16} or a multiple of 16: the
+        # kernel loads at most 4 group scales per 16-col vec (G=2 would mis-scale cols 8-15).
+        if (k % 16 != 0 or k % group_size != 0 or group_size < 4
                 or (16 % group_size != 0 and group_size % 16 != 0)):
             raise ValueError(
-                f"K={k}%G and G={group_size} must be >=4 & (divides 16 or mult of 16)")
+                f"K={k} must be a multiple of 16 and G={group_size} >=4 & "
+                f"(divides 16 or mult of 16)")
         groups = k // group_size
 
         # Data-free rotation (paired with the fused convrot activation quant).
@@ -261,6 +264,12 @@ class AsymW4A8Int8Layout(QuantizedLayout):
 
     @classmethod
     def state_dict_tensors(cls, qdata: torch.Tensor, params: Params) -> dict[str, torch.Tensor]:
+        # Export-only (checkpoint serialization). The ``_s_rel`` suffix intentionally does
+        # NOT match the ``scale`` field name: it names the per-group *relative* scale to
+        # distinguish it from ``_s_channel``, and matches the checkpoint format the loader
+        # reads. On load, ComfyUI's ``_load_quantized_module`` remaps weight_s_rel->scale,
+        # weight_s_channel->s_channel, etc. explicitly (not by field name). In-memory
+        # flatten/unflatten (__tensor_flatten__) uses field names, so it is unaffected.
         out = {
             "": qdata,
             "_s_rel": params.scale,

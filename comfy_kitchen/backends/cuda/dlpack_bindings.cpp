@@ -1950,6 +1950,23 @@ bool w4a8_codebook_gemm_chunked(
     const int64_t K = xq.shape(1);
     const int64_t N = weight.shape(0);
     if (weight.shape(1) != K / 2) throw std::runtime_error("w4a8_codebook_gemm: K/2 mismatch");
+    // out is untyped; the kernel derives its element size from out_dtype_code and offsets
+    // each chunk by n0*itemsize. Verify the code and the buffer agree, and the out/workspace
+    // geometry the chunk loop indexes, so a mismatch errors here instead of scribbling past
+    // the allocation.
+    if (out_dtype_code < 0 || out_dtype_code > 2)
+        throw std::runtime_error("w4a8_codebook_gemm: out_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
+    const size_t expect_osz = (out_dtype_code == 0) ? 4u : 2u;
+    if (out.itemsize() != expect_osz)
+        throw std::runtime_error("w4a8_codebook_gemm: out.itemsize() does not match out_dtype_code");
+    if (static_cast<int64_t>(out.shape(0)) != M || static_cast<int64_t>(out.shape(1)) != N)
+        throw std::runtime_error("w4a8_codebook_gemm: out must be [M, N]");
+    if (chunk_cols > 0) {  // chunk_cols <= 0 is handled (2-pass fallback) in the launcher
+        const int64_t ws_rows = (chunk_cols < N) ? chunk_cols : N;
+        if (static_cast<int64_t>(workspace.shape(1)) != K
+                || static_cast<int64_t>(workspace.shape(0)) < ws_rows)
+            throw std::runtime_error("w4a8_codebook_gemm: workspace must be [>=min(chunk_cols,N), K] int8");
+    }
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const void* cb = codebook.has_value() ? codebook->data() : nullptr;
     const void* bs = bias.has_value() ? bias->data() : nullptr;

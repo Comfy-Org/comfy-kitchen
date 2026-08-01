@@ -143,6 +143,9 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
     int64_t M, int64_t N, int64_t K, int64_t G, int64_t chunk_cols,
     int out_dtype_code, cudaStream_t stream)
 {
+    // A non-positive chunk stride never advances n0 -> would loop forever; a non-positive
+    // K/G would divide by zero below. Bail so the caller uses the 2-pass path.
+    if (chunk_cols <= 0 || K <= 0 || G <= 0) return false;
     const int64_t Khalf = K / 2, KG = K / G, osz = (out_dtype_code == 0) ? 4 : 2;
     for (int64_t n0 = 0; n0 < N; n0 += chunk_cols) {
         const int64_t cols = (chunk_cols < N - n0) ? chunk_cols : (N - n0);

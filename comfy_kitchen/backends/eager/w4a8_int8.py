@@ -20,16 +20,19 @@ def _dequant_int4_grouped_to_int8(
     folded in, per-channel scale left for the GEMM epilogue. Bit-exact with CUDA."""
     n, k_half = qdata.shape
     k = k_half * 2
+    groups = k // group_size
     b = qdata.to(torch.int32) & 0xFF
     q = torch.empty(n, k, dtype=torch.int32, device=qdata.device)
     q[:, 0::2] = b & 0xF
     q[:, 1::2] = (b >> 4) & 0xF
-    srel = s_rel.float().repeat_interleave(group_size, dim=1)  # [N, K]
     if codebook is not None:
         vals = codebook.to(device=qdata.device, dtype=torch.float32)[q]  # direct [0,15] index
     else:
         vals = q.float() - 8.0  # symmetric uniform levels -8..7
-    return (vals * srel).round().clamp_(-127, 127).to(torch.int8)
+    # Broadcast the per-group scale via a grouped view instead of repeat_interleave
+    # (avoids a full [N, K] fp32 scale copy).
+    vals = vals.view(n, groups, group_size) * s_rel.float().unsqueeze(-1)  # [N, groups, 1]
+    return vals.view(n, k).round().clamp_(-127, 127).to(torch.int8)
 
 
 def w4a8_int8_linear(
