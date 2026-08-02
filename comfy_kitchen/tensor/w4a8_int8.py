@@ -400,8 +400,8 @@ def _w4a8_int8_matmul(x, weight, bias, out_dtype):
         _wrap_for_dlpack(xq), _wrap_for_dlpack(int8_w), _wrap_for_dlpack(xs),
         _wrap_for_dlpack(p.s_channel), _wrap_for_dlpack(bf),
         _wrap_for_dlpack(out), _dtype_code(out_dtype), sp)
-    if not used:
-        return torch.nn.functional.linear(x, _storage_dequant(weight), bias)
+    if not used:  # match x.dtype -- orig_dtype may differ from the runtime dtype (autocast)
+        return torch.nn.functional.linear(x, _storage_dequant(weight).to(x.dtype), bias)
 
     # asymmetric zero-point correction (rank-(K/group)); symmetric path has none.
     if p.correction is not None:
