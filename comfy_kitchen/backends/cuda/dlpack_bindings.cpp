@@ -1760,6 +1760,8 @@ bool cutlass_int8_dequant(
     if (static_cast<int64_t>(ws.size()) != N) throw std::runtime_error("cutlass_int8_dequant: ws must be a length-N vector");
     if (bias.size() != 0 && static_cast<int64_t>(bias.size()) != N)
         throw std::runtime_error("cutlass_int8_dequant: bias must be empty or a length-N vector");
+    if (out_dtype_code < 0 || out_dtype_code > 2)  // allow-list: the launch only supports these
+        throw std::runtime_error("cutlass_int8_dequant: out_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
     if (map_dtype_to_code(d.dtype()) != out_dtype_code)
         throw std::runtime_error("cutlass_int8_dequant: output dtype does not match out_dtype_code (0=fp32, 1=fp16, 2=bf16)");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
@@ -2004,6 +2006,8 @@ bool w4a8_codebook_gemm_chunked(
     // the allocation.
     // Exact dtype match: fp16 and bf16 share itemsize but the launch selects half_t vs
     // bfloat16_t, so a mismatched code would reinterpret the buffer.
+    if (out_dtype_code < 0 || out_dtype_code > 2)  // allow-list: the launch only supports these
+        throw std::runtime_error("w4a8_codebook_gemm: out_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
     if (map_dtype_to_code(out.dtype()) != out_dtype_code)
         throw std::runtime_error("w4a8_codebook_gemm: out dtype does not match out_dtype_code (0=fp32, 1=fp16, 2=bf16)");
     if (static_cast<int64_t>(out.shape(0)) != M || static_cast<int64_t>(out.shape(1)) != N)
