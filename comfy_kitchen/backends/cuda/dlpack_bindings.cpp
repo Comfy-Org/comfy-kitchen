@@ -1752,16 +1752,16 @@ bool cutlass_int8_dequant(
     const int64_t N = b.shape(0);
     if (b.shape(1) != K) throw std::runtime_error("cutlass_int8_dequant: K mismatch");
     if (d.shape(0) != M || d.shape(1) != N) throw std::runtime_error("cutlass_int8_dequant: D shape mismatch");
-    // Per-row (xs) and per-column (ws) scales, and the optional bias, are read as contiguous
-    // [M]/[N] vectors; validate lengths + out dtype so a bad call errors instead of reading OOB.
-    if (static_cast<int64_t>(xs.shape(0)) != M) throw std::runtime_error("cutlass_int8_dequant: xs must have M rows");
-    if (static_cast<int64_t>(ws.shape(0)) != N) throw std::runtime_error("cutlass_int8_dequant: ws must have N entries");
-    if (bias.size() > 0 && static_cast<int64_t>(bias.shape(0)) != N)
-        throw std::runtime_error("cutlass_int8_dequant: bias must be [N]");
-    if (out_dtype_code < 0 || out_dtype_code > 2)
-        throw std::runtime_error("cutlass_int8_dequant: out_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
-    if (d.itemsize() != (out_dtype_code == 0 ? 4u : 2u))
-        throw std::runtime_error("cutlass_int8_dequant: d.itemsize() does not match out_dtype_code");
+    // xs/ws/bias are read as contiguous [M]/[N] vectors; check element counts (via size(),
+    // which tolerates the [M,1] scale the int8 caller passes but rejects degenerate shapes
+    // like [M,0]). Match the output dtype exactly (fp16 and bf16 share itemsize but the
+    // launch selects half_t vs bfloat16_t) so a mismatched code can't reinterpret the buffer.
+    if (static_cast<int64_t>(xs.size()) != M) throw std::runtime_error("cutlass_int8_dequant: xs must be a length-M vector");
+    if (static_cast<int64_t>(ws.size()) != N) throw std::runtime_error("cutlass_int8_dequant: ws must be a length-N vector");
+    if (bias.size() != 0 && static_cast<int64_t>(bias.size()) != N)
+        throw std::runtime_error("cutlass_int8_dequant: bias must be empty or a length-N vector");
+    if (map_dtype_to_code(d.dtype()) != out_dtype_code)
+        throw std::runtime_error("cutlass_int8_dequant: output dtype does not match out_dtype_code (0=fp32, 1=fp16, 2=bf16)");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const void* bias_ptr = bias.size() > 0 ? bias.data() : nullptr;
     return launch_cutlass_int8_dequant(a.data(), b.data(), xs.data(), ws.data(),
@@ -2002,11 +2002,10 @@ bool w4a8_codebook_gemm_chunked(
     // each chunk by n0*itemsize. Verify the code and the buffer agree, and the out/workspace
     // geometry the chunk loop indexes, so a mismatch errors here instead of scribbling past
     // the allocation.
-    if (out_dtype_code < 0 || out_dtype_code > 2)
-        throw std::runtime_error("w4a8_codebook_gemm: out_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
-    const size_t expect_osz = (out_dtype_code == 0) ? 4u : 2u;
-    if (out.itemsize() != expect_osz)
-        throw std::runtime_error("w4a8_codebook_gemm: out.itemsize() does not match out_dtype_code");
+    // Exact dtype match: fp16 and bf16 share itemsize but the launch selects half_t vs
+    // bfloat16_t, so a mismatched code would reinterpret the buffer.
+    if (map_dtype_to_code(out.dtype()) != out_dtype_code)
+        throw std::runtime_error("w4a8_codebook_gemm: out dtype does not match out_dtype_code (0=fp32, 1=fp16, 2=bf16)");
     if (static_cast<int64_t>(out.shape(0)) != M || static_cast<int64_t>(out.shape(1)) != N)
         throw std::runtime_error("w4a8_codebook_gemm: out must be [M, N]");
     if (chunk_cols > 0) {  // chunk_cols <= 0 is handled (2-pass fallback) in the launcher
