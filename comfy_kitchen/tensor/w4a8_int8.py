@@ -40,16 +40,16 @@ logger = logging.getLogger(__name__)
 # the layout dispatches dequant + INT8 GEMM through the registry (Triton, else eager) and
 # rotates in portable torch -- runnable on any torch device.
 try:
-    from comfy_kitchen.backends.cuda import _C as _CUDA_C  # noqa: F401
-    _CUDA_AVAILABLE = True
-except Exception as _e:  # pragma: no cover - non-CUDA builds
-    _CUDA_AVAILABLE = False
-    # Loud only when CUDA hardware is present but the extension failed to load; quiet on
-    # ROCm/CPU where the fallback is expected.
-    if torch.cuda.is_available():
-        logger.warning(
-            "W4A8: CUDA backend import failed though CUDA is available (%s); falling "
-            "back to the portable Triton/eager path (slower).", _e)
+    from comfy_kitchen.backends.cuda import _C as _CUDA_C
+except Exception:  # pragma: no cover - non-CUDA builds
+    _CUDA_C = None
+# The cuda module imports successfully but sets _C=None when the compiled extension fails
+# to load, so importing it is not proof of availability -- gate on the real extension.
+# (is_cuda is also True for ROCm tensors, and there _C is None, so this correctly routes
+# ROCm to the portable Triton/eager path rather than into CUDA-only kernels.)
+_CUDA_AVAILABLE = _CUDA_C is not None
+if not _CUDA_AVAILABLE and torch.version.cuda is not None:  # real CUDA build, ext missing
+    logger.warning("W4A8: CUDA extension unavailable; using the portable Triton/eager path (slower).")
 
 
 def _convrot_rotate(w: torch.Tensor, groupsize: int) -> torch.Tensor:
@@ -107,6 +107,10 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         orig_dtype = tensor.dtype
         orig_shape = tuple(tensor.shape)
         n, k = tensor.shape
+        # The group-scale kernel is templated only for fp32 and fp8-e4m3; any other dtype
+        # (e.g. fp16) would produce a checkpoint no backend can execute.
+        if scale_dtype not in (torch.float32, torch.float8_e4m3fn):
+            raise ValueError(f"scale_dtype must be float32 or float8_e4m3fn, got {scale_dtype}")
         # K must be a multiple of 16: the CUDA dequant kernel is vectorized (uint2 load ->
         # uint4 store, 16 int8/thread, n_vec = N*K/16), so a non-16 K truncates the tail and
         # misaligns the row start. G must be >=4 and in {4,8,16} or a multiple of 16: the
@@ -293,7 +297,8 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         # Preserve quant options across the dequantize->patch->requantize LoRA path.
         p = qtensor._params
         return {"group_size": p.group_size, "convrot_groupsize": p.convrot_groupsize,
-                "symmetric": p.correction is None, "codebook": p.codebook is not None}
+                "symmetric": p.correction is None, "codebook": p.codebook is not None,
+                "scale_dtype": p.scale.dtype}
 
 
 def _storage_dequant(weight):
@@ -352,7 +357,10 @@ def _w4a8_int8_matmul(x, weight, bias, out_dtype):
     m = x2.shape[0]
 
     sp = torch.cuda.current_stream(x.device).cuda_stream
-    cb = _wrap_for_dlpack(p.codebook) if p.codebook is not None else None
+    # DLPack capsules are single-use, so wrap the codebook fresh per native call -- the
+    # chunked path may consume it and return False, then the 2-pass fallback needs its own.
+    def wrap_cb():
+        return _wrap_for_dlpack(p.codebook) if p.codebook is not None else None
     # fused rotate + int8 activation quant
     xq, xs = quantize_int8_rowwise_convrot(x2, p.convrot_groupsize)
     out = torch.empty(m, n, dtype=out_dtype, device=x.device)
@@ -369,7 +377,7 @@ def _w4a8_int8_matmul(x, weight, bias, out_dtype):
         workspace = torch.empty(min(chunk_cols, n), k, dtype=torch.int8, device=x.device)
         ok = _C.w4a8_codebook_gemm_chunked(
             _wrap_for_dlpack(xq), _wrap_for_dlpack(weight._qdata),
-            _wrap_for_dlpack(p.scale.view(torch.uint8)), cb,
+            _wrap_for_dlpack(p.scale.view(torch.uint8)), wrap_cb(),
             _wrap_for_dlpack(p.s_channel), _wrap_for_dlpack(xs.reshape(m).contiguous()),
             _wrap_for_dlpack(biasf) if biasf is not None else None,
             _wrap_for_dlpack(workspace), _wrap_for_dlpack(out),
@@ -382,10 +390,10 @@ def _w4a8_int8_matmul(x, weight, bias, out_dtype):
     if p.scale.dtype == torch.float8_e4m3fn:
         _C.dequant_int4_grouped_to_int8_e4m3(
             _wrap_for_dlpack(weight._qdata), _wrap_for_dlpack(p.scale.view(torch.uint8)),
-            cb, _wrap_for_dlpack(int8_w), g, sp)
+            wrap_cb(), _wrap_for_dlpack(int8_w), g, sp)
     else:
         _C.dequant_int4_grouped_to_int8(
-            _wrap_for_dlpack(weight._qdata), _wrap_for_dlpack(p.scale), cb,
+            _wrap_for_dlpack(weight._qdata), _wrap_for_dlpack(p.scale), wrap_cb(),
             _wrap_for_dlpack(int8_w), g, sp)
     bf = biasf if biasf is not None else _empty_cuda_tensor(x.device, torch.float32)
     used = _C.cutlass_int8_dequant(
@@ -443,7 +451,13 @@ def _handle_w4a8int8_mm(qt, args, kwargs):
 @register_layout_op(torch.ops.aten.addmm.default, AsymW4A8Int8Layout)
 def _handle_w4a8int8_addmm(qt, args, kwargs):
     bias, x, weight = args[0], args[1], args[2]
-    if not _is_w4a8(weight) or not getattr(weight._params, "transposed", False):
+    # The fast path only models F.linear's addmm: bias + x @ W.T with a 1-D bias and
+    # beta=alpha=1. Anything else (scaled addmm, matrix-shaped addend) takes the dequant
+    # fallback, which honors alpha/beta and general addend shapes.
+    scaled = kwargs.get("beta", 1) != 1 or kwargs.get("alpha", 1) != 1
+    bias_nd = isinstance(bias, torch.Tensor) and bias.dim() != 1
+    if (not _is_w4a8(weight) or not getattr(weight._params, "transposed", False)
+            or scaled or bias_nd):
         return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
     if isinstance(x, QuantizedTensor):
         x = x.dequantize()

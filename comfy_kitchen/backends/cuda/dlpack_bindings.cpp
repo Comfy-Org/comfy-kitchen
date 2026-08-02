@@ -1752,6 +1752,16 @@ bool cutlass_int8_dequant(
     const int64_t N = b.shape(0);
     if (b.shape(1) != K) throw std::runtime_error("cutlass_int8_dequant: K mismatch");
     if (d.shape(0) != M || d.shape(1) != N) throw std::runtime_error("cutlass_int8_dequant: D shape mismatch");
+    // Per-row (xs) and per-column (ws) scales, and the optional bias, are read as contiguous
+    // [M]/[N] vectors; validate lengths + out dtype so a bad call errors instead of reading OOB.
+    if (static_cast<int64_t>(xs.shape(0)) != M) throw std::runtime_error("cutlass_int8_dequant: xs must have M rows");
+    if (static_cast<int64_t>(ws.shape(0)) != N) throw std::runtime_error("cutlass_int8_dequant: ws must have N entries");
+    if (bias.size() > 0 && static_cast<int64_t>(bias.shape(0)) != N)
+        throw std::runtime_error("cutlass_int8_dequant: bias must be [N]");
+    if (out_dtype_code < 0 || out_dtype_code > 2)
+        throw std::runtime_error("cutlass_int8_dequant: out_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
+    if (d.itemsize() != (out_dtype_code == 0 ? 4u : 2u))
+        throw std::runtime_error("cutlass_int8_dequant: d.itemsize() does not match out_dtype_code");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const void* bias_ptr = bias.size() > 0 ? bias.data() : nullptr;
     return launch_cutlass_int8_dequant(a.data(), b.data(), xs.data(), ws.data(),
@@ -1914,6 +1924,16 @@ void dequant_int4_grouped_to_int8(
     const int64_t N = qw.shape(0);
     const int64_t K = out.shape(1);
     if (qw.shape(1) != K / 2) throw std::runtime_error("dequant_int4_grouped: K/2 mismatch");
+    if (K % 16 != 0) throw std::runtime_error("dequant_int4_grouped: K must be a multiple of 16");
+    if (G < 4 || (16 % G != 0 && G % 16 != 0))
+        throw std::runtime_error("dequant_int4_grouped: G must be >=4 and divide 16 or be a multiple of 16");
+    if (K % G != 0) throw std::runtime_error("dequant_int4_grouped: K must be divisible by G");
+    if (static_cast<int64_t>(s_rel.shape(0)) != N || static_cast<int64_t>(s_rel.shape(1)) != K / G)
+        throw std::runtime_error("dequant_int4_grouped: s_rel must be [N, K/G]");
+    if (static_cast<int64_t>(out.shape(0)) != N)
+        throw std::runtime_error("dequant_int4_grouped: out must be [N, K]");
+    if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != 16)
+        throw std::runtime_error("dequant_int4_grouped: codebook must be [16]");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const void* cb = codebook.has_value() ? codebook->data() : nullptr;
     launch_dequant_int4_grouped_to_int8(qw.data(), s_rel.data(), cb, out.data(), N, K, G, stream);
@@ -1929,6 +1949,16 @@ void dequant_int4_grouped_to_int8_e4m3(
     const int64_t N = qw.shape(0);
     const int64_t K = out.shape(1);
     if (qw.shape(1) != K / 2) throw std::runtime_error("dequant_int4_grouped: K/2 mismatch");
+    if (K % 16 != 0) throw std::runtime_error("dequant_int4_grouped: K must be a multiple of 16");
+    if (G < 4 || (16 % G != 0 && G % 16 != 0))
+        throw std::runtime_error("dequant_int4_grouped: G must be >=4 and divide 16 or be a multiple of 16");
+    if (K % G != 0) throw std::runtime_error("dequant_int4_grouped: K must be divisible by G");
+    if (static_cast<int64_t>(s_rel.shape(0)) != N || static_cast<int64_t>(s_rel.shape(1)) != K / G)
+        throw std::runtime_error("dequant_int4_grouped: s_rel must be [N, K/G]");
+    if (static_cast<int64_t>(out.shape(0)) != N)
+        throw std::runtime_error("dequant_int4_grouped: out must be [N, K]");
+    if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != 16)
+        throw std::runtime_error("dequant_int4_grouped: codebook must be [16]");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const void* cb = codebook.has_value() ? codebook->data() : nullptr;
     launch_dequant_int4_grouped_to_int8_e4m3(qw.data(), s_rel.data(), cb, out.data(), N, K, G, stream);
@@ -1950,6 +1980,24 @@ bool w4a8_codebook_gemm_chunked(
     const int64_t K = xq.shape(1);
     const int64_t N = weight.shape(0);
     if (weight.shape(1) != K / 2) throw std::runtime_error("w4a8_codebook_gemm: K/2 mismatch");
+    // Grouping contract: the dequant kernel is 16-wide vectorized (K % 16), and G must be a
+    // supported group size (>=4, divides 16 or a multiple of 16) that divides K so K/G groups
+    // are exact. A bad G/K silently truncates or misaligns the kernel.
+    if (K % 16 != 0) throw std::runtime_error("w4a8_codebook_gemm: K must be a multiple of 16");
+    if (G < 4 || (16 % G != 0 && G % 16 != 0))
+        throw std::runtime_error("w4a8_codebook_gemm: G must be >=4 and divide 16 or be a multiple of 16");
+    if (K % G != 0) throw std::runtime_error("w4a8_codebook_gemm: K must be divisible by G");
+    // The launcher reads these as contiguous metadata; a wrong length reads past the buffer.
+    if (static_cast<int64_t>(xq.shape(1)) != K || static_cast<int64_t>(xs.shape(0)) != M)
+        throw std::runtime_error("w4a8_codebook_gemm: xq must be [M, K] and xs [M]");
+    if (static_cast<int64_t>(s_rel.shape(0)) != N || static_cast<int64_t>(s_rel.shape(1)) != K / G)
+        throw std::runtime_error("w4a8_codebook_gemm: s_rel must be [N, K/G]");
+    if (static_cast<int64_t>(s_channel.shape(0)) != N)
+        throw std::runtime_error("w4a8_codebook_gemm: s_channel must be [N]");
+    if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != 16)
+        throw std::runtime_error("w4a8_codebook_gemm: codebook must be [16]");
+    if (bias.has_value() && static_cast<int64_t>(bias->shape(0)) != N)
+        throw std::runtime_error("w4a8_codebook_gemm: bias must be [N]");
     // out is untyped; the kernel derives its element size from out_dtype_code and offsets
     // each chunk by n0*itemsize. Verify the code and the buffer agree, and the out/workspace
     // geometry the chunk loop indexes, so a mismatch errors here instead of scribbling past
