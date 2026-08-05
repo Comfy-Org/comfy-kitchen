@@ -18,6 +18,8 @@
 // registers before the current tile's math.
 #pragma once
 
+#include <atomic>
+
 #include "mma.h"
 
 namespace comfy::hip_backend {
@@ -226,18 +228,21 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
 // path. The fallback only mis-sizes the grid-coverage test below, never a result.
 inline int device_cu_count() {
     constexpr int kMaxDevices = 16;
-    static int cache[kMaxDevices] = {};
+    // Atomic because a GEMM can be launched from several host threads at once.
+    // Relaxed is enough: racing threads write the same value, and nothing else is
+    // published through this, so only the read and write have to be indivisible.
+    static std::atomic<int> cache[kMaxDevices] = {};
     int dev = 0;
     if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDevices) return 64;
-    if (cache[dev] == 0) {
-        int n = 0;
+    int n = cache[dev].load(std::memory_order_relaxed);
+    if (n == 0) {
         if (hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess ||
             n <= 0) {
             n = 64;
         }
-        cache[dev] = n;
+        cache[dev].store(n, std::memory_order_relaxed);
     }
-    return cache[dev];
+    return n;
 }
 
 // Pick and launch a tile for C[M, N] = A[M, K] @ B[N, K]^T. Three axes decide it:
