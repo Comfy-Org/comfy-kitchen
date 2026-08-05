@@ -21,14 +21,10 @@
 // positions centered on it, shifted inward at grid boundaries; per causal
 // axis it attends the min(i+1, kernel_size) nearest previous positions.
 //
-// Flash-attention-2 style: one block covers a run of BQ=64 queries along W
-// at a fixed (t, h), four warps each owning 16 query rows. Because the
-// mma.sync.m16n8k16 thread<->element mapping is documented, the score tile,
-// softmax statistics (m, l), the P operand, and the output accumulator all
-// live in registers for the whole kernel -- shared memory only stages the
-// K tile and a transposed V tile, and the only barriers guard that staging.
-// The T/H windows are scalar per block (key loops visit only valid planes);
-// per-element masking is needed on the W axis alone.
+// Flash-attention-2 style: one block covers BQ queries along W at a fixed
+// (t, h), 16 rows per warp. Scores, softmax stats, P and the accumulator stay
+// in registers; shared memory only stages K and V^T. T/H windows are scalar
+// per block, so only W needs per-element masking.
 //
 // Requires sm80+ (bf16 mma / f32 accumulators). head_dim in {16,32,48,64}.
 // Layout: q/k/v/out are contiguous (B, T, H, W, NH, HD).
@@ -38,13 +34,17 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 
 namespace {
 
-constexpr int BQ = 64;         // queries per block (W run); 16 per warp
 constexpr int BK = 32;         // keys per inner tile (4 n8 mma tiles)
-constexpr int NTHREADS = 128;  // 4 warps
 constexpr float NEG_INF = -3.0e38f;
+
+// BQ (queries per block along W) is a template parameter, 16 rows per warp.
+__host__ __device__ constexpr int warps_for(int bq) { return bq / 16; }
+__host__ __device__ constexpr int threads_for(int bq) { return warps_for(bq) * 32; }
 
 __host__ __device__ inline int imin(int a, int b) { return a < b ? a : b; }
 __host__ __device__ inline int imax(int a, int b) { return a > b ? a : b; }
@@ -94,8 +94,8 @@ template <> struct MmaTraits<__nv_bfloat16> {
 //   B (16x8):   b0=(k=2q..2q+1, n=g) b1=(k=2q+8..2q+9, n=g)   (packed along k)
 //   C (16x8):   c0=(g, 2q) c1=(g, 2q+1) c2=(g+8, 2q) c3=(g+8, 2q+1)   (f32)
 
-template <typename T, int HD>
-__global__ void __launch_bounds__(NTHREADS) na3d_kernel(
+template <typename T, int HD, int BQ>
+__global__ void __launch_bounds__(threads_for(BQ)) na3d_kernel(
     const T* __restrict__ q,
     const T* __restrict__ k,
     const T* __restrict__ v,
@@ -111,6 +111,7 @@ __global__ void __launch_bounds__(NTHREADS) na3d_kernel(
     constexpr int NT = HD / 8;    // n8 output tiles for O += P.V
     constexpr int LDK = HD + 8;   // sK row stride (elements)
     constexpr int LDV = BK + 8;   // sVt row stride (elements)
+    constexpr int NTHREADS = threads_for(BQ);
 
     __shared__ T sK[BK * LDK];
     __shared__ T sVt[HD * LDV];  // transposed V: sVt[col][key]
@@ -150,6 +151,15 @@ __global__ void __launch_bounds__(NTHREADS) na3d_kernel(
         axis_window(imin(w0 + BQ - 1, w_size - 1), kw, w_size, causal_w, lo1, hi1);
         w_lo = lo0;
         w_hi = hi1;
+    }
+    // Key span of this warp's 16 queries: ~16 + kw against the block's BQ + kw.
+    int warp_lo, warp_hi;
+    {
+        int lo0, hi0, lo1, hi1;
+        axis_window(imin(w0 + warp * 16, w_size - 1), kw, w_size, causal_w, lo0, hi0);
+        axis_window(imin(w0 + warp * 16 + 15, w_size - 1), kw, w_size, causal_w, lo1, hi1);
+        warp_lo = lo0;
+        warp_hi = hi1;
     }
 
     // Q operand fragments: loaded once, register-resident for the whole
@@ -204,97 +214,103 @@ __global__ void __launch_bounds__(NTHREADS) na3d_kernel(
                 }
                 __syncthreads();
 
-                // S = Q.K^T: 4 n8 tiles of 16x8, accumulated in registers.
-                float s_acc[4][4];
-                #pragma unroll
-                for (int nt = 0; nt < 4; ++nt) {
-                    s_acc[nt][0] = 0.f; s_acc[nt][1] = 0.f; s_acc[nt][2] = 0.f; s_acc[nt][3] = 0.f;
-                    const T* krow = sK + (nt * 8 + g) * LDK;
+                // Skip fully masked tiles. No barrier inside the guard -- the
+                // one closing the loop is outside, so warps still rendezvous.
+                if (wk0 + BK > warp_lo && wk0 < warp_hi) {
+
+                    // S = Q.K^T: 4 n8 tiles of 16x8, accumulated in registers.
+                    float s_acc[4][4];
                     #pragma unroll
-                    for (int kc = 0; kc < KC; ++kc) {
-                        uint32_t kb[2];
-                        kb[0] = *reinterpret_cast<const uint32_t*>(krow + kc * 16 + qd * 2);
-                        kb[1] = *reinterpret_cast<const uint32_t*>(krow + kc * 16 + qd * 2 + 8);
-                        MmaTraits<T>::mma(s_acc[nt], qa[kc], kb);
+                    for (int nt = 0; nt < 4; ++nt) {
+                        s_acc[nt][0] = 0.f; s_acc[nt][1] = 0.f; s_acc[nt][2] = 0.f; s_acc[nt][3] = 0.f;
+                        const T* krow = sK + (nt * 8 + g) * LDK;
+                        #pragma unroll
+                        for (int kc = 0; kc < KC; ++kc) {
+                            uint32_t kb[2];
+                            kb[0] = *reinterpret_cast<const uint32_t*>(krow + kc * 16 + qd * 2);
+                            kb[1] = *reinterpret_cast<const uint32_t*>(krow + kc * 16 + qd * 2 + 8);
+                            MmaTraits<T>::mma(s_acc[nt], qa[kc], kb);
+                        }
                     }
-                }
 
-                // Masked online softmax, entirely in registers. This thread's
-                // score columns are wk0 + nt*8 + 2*qd (+1) for rows g / g+8.
-                float p_val[4][4];
-                float m_new[2] = {m_r[0], m_r[1]};
-                #pragma unroll
-                for (int nt = 0; nt < 4; ++nt) {
-                    const int c0 = wk0 + nt * 8 + qd * 2;
+                    // Masked online softmax, entirely in registers. This thread's
+                    // score columns are wk0 + nt*8 + 2*qd (+1) for rows g / g+8.
+                    float p_val[4][4];
+                    float m_new[2] = {m_r[0], m_r[1]};
                     #pragma unroll
-                    for (int e = 0; e < 4; ++e) {
-                        const int row = e >> 1;          // c0,c1 -> row g; c2,c3 -> row g+8
-                        const int wk = c0 + (e & 1);
-                        const bool vis = wk >= ws_r[row] && wk < we_r[row] && (wk - wk0) < n_valid_k;
-                        const float s = vis ? s_acc[nt][e] * scale : NEG_INF;
-                        p_val[nt][e] = s;
-                        m_new[row] = fmaxf(m_new[row], s);
+                    for (int nt = 0; nt < 4; ++nt) {
+                        const int c0 = wk0 + nt * 8 + qd * 2;
+                        #pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            const int row = e >> 1;          // c0,c1 -> row g; c2,c3 -> row g+8
+                            const int wk = c0 + (e & 1);
+                            const bool vis = wk >= ws_r[row] && wk < we_r[row] && (wk - wk0) < n_valid_k;
+                            const float s = vis ? s_acc[nt][e] * scale : NEG_INF;
+                            p_val[nt][e] = s;
+                            m_new[row] = fmaxf(m_new[row], s);
+                        }
                     }
-                }
-                // Row max across the quad (a row's columns live in 4 lanes).
-                #pragma unroll
-                for (int off = 1; off <= 2; off <<= 1) {
-                    m_new[0] = fmaxf(m_new[0], __shfl_xor_sync(0xffffffffu, m_new[0], off));
-                    m_new[1] = fmaxf(m_new[1], __shfl_xor_sync(0xffffffffu, m_new[1], off));
-                }
-                const float alpha0 = __expf(m_r[0] - m_new[0]);
-                const float alpha1 = __expf(m_r[1] - m_new[1]);
-                m_r[0] = m_new[0];
-                m_r[1] = m_new[1];
-                float l_add[2] = {0.f, 0.f};
-                #pragma unroll
-                for (int nt = 0; nt < 4; ++nt) {
+                    // Row max across the quad (a row's columns live in 4 lanes).
                     #pragma unroll
-                    for (int e = 0; e < 4; ++e) {
-                        const int row = e >> 1;
-                        const float p = (p_val[nt][e] <= NEG_INF) ? 0.f : __expf(p_val[nt][e] - m_new[row]);
-                        p_val[nt][e] = p;
-                        l_add[row] += p;
+                    for (int off = 1; off <= 2; off <<= 1) {
+                        m_new[0] = fmaxf(m_new[0], __shfl_xor_sync(0xffffffffu, m_new[0], off));
+                        m_new[1] = fmaxf(m_new[1], __shfl_xor_sync(0xffffffffu, m_new[1], off));
                     }
-                }
-                #pragma unroll
-                for (int off = 1; off <= 2; off <<= 1) {
-                    l_add[0] += __shfl_xor_sync(0xffffffffu, l_add[0], off);
-                    l_add[1] += __shfl_xor_sync(0xffffffffu, l_add[1], off);
-                }
-                l_r[0] = l_r[0] * alpha0 + l_add[0];
-                l_r[1] = l_r[1] * alpha1 + l_add[1];
+                    const float alpha0 = __expf(m_r[0] - m_new[0]);
+                    const float alpha1 = __expf(m_r[1] - m_new[1]);
+                    m_r[0] = m_new[0];
+                    m_r[1] = m_new[1];
+                    float l_add[2] = {0.f, 0.f};
+                    #pragma unroll
+                    for (int nt = 0; nt < 4; ++nt) {
+                        #pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            const int row = e >> 1;
+                            const float p = (p_val[nt][e] <= NEG_INF) ? 0.f : __expf(p_val[nt][e] - m_new[row]);
+                            p_val[nt][e] = p;
+                            l_add[row] += p;
+                        }
+                    }
+                    #pragma unroll
+                    for (int off = 1; off <= 2; off <<= 1) {
+                        l_add[0] += __shfl_xor_sync(0xffffffffu, l_add[0], off);
+                        l_add[1] += __shfl_xor_sync(0xffffffffu, l_add[1], off);
+                    }
+                    l_r[0] = l_r[0] * alpha0 + l_add[0];
+                    l_r[1] = l_r[1] * alpha1 + l_add[1];
 
-                // Rescale output accumulators (c0,c1 -> row g; c2,c3 -> g+8).
-                #pragma unroll
-                for (int nt = 0; nt < NT; ++nt) {
-                    o_acc[nt][0] *= alpha0; o_acc[nt][1] *= alpha0;
-                    o_acc[nt][2] *= alpha1; o_acc[nt][3] *= alpha1;
-                }
+                    // Rescale output accumulators (c0,c1 -> row g; c2,c3 -> g+8).
+                    #pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) {
+                        o_acc[nt][0] *= alpha0; o_acc[nt][1] *= alpha0;
+                        o_acc[nt][2] *= alpha1; o_acc[nt][3] *= alpha1;
+                    }
 
-                // P operand fragments: pure register repack of the score tile.
-                // k-step kk covers keys kk*16..+15 = score tiles 2kk, 2kk+1.
-                uint32_t pa[2][4];
-                #pragma unroll
-                for (int kk = 0; kk < 2; ++kk) {
-                    pa[kk][0] = MmaTraits<T>::pack(p_val[2 * kk][0], p_val[2 * kk][1]);
-                    pa[kk][1] = MmaTraits<T>::pack(p_val[2 * kk][2], p_val[2 * kk][3]);
-                    pa[kk][2] = MmaTraits<T>::pack(p_val[2 * kk + 1][0], p_val[2 * kk + 1][1]);
-                    pa[kk][3] = MmaTraits<T>::pack(p_val[2 * kk + 1][2], p_val[2 * kk + 1][3]);
-                }
-
-                // O += P.V via transposed-V fragments (32-bit loads along keys).
-                #pragma unroll
-                for (int nt = 0; nt < NT; ++nt) {
-                    const T* vcol = sVt + (nt * 8 + g) * LDV;
+                    // P operand fragments: pure register repack of the score tile.
+                    // k-step kk covers keys kk*16..+15 = score tiles 2kk, 2kk+1.
+                    uint32_t pa[2][4];
                     #pragma unroll
                     for (int kk = 0; kk < 2; ++kk) {
-                        uint32_t vb[2];
-                        vb[0] = *reinterpret_cast<const uint32_t*>(vcol + kk * 16 + qd * 2);
-                        vb[1] = *reinterpret_cast<const uint32_t*>(vcol + kk * 16 + qd * 2 + 8);
-                        MmaTraits<T>::mma(o_acc[nt], pa[kk], vb);
+                        pa[kk][0] = MmaTraits<T>::pack(p_val[2 * kk][0], p_val[2 * kk][1]);
+                        pa[kk][1] = MmaTraits<T>::pack(p_val[2 * kk][2], p_val[2 * kk][3]);
+                        pa[kk][2] = MmaTraits<T>::pack(p_val[2 * kk + 1][0], p_val[2 * kk + 1][1]);
+                        pa[kk][3] = MmaTraits<T>::pack(p_val[2 * kk + 1][2], p_val[2 * kk + 1][3]);
                     }
-                }
+
+                    // O += P.V via transposed-V fragments (32-bit loads along keys).
+                    #pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) {
+                        const T* vcol = sVt + (nt * 8 + g) * LDV;
+                        #pragma unroll
+                        for (int kk = 0; kk < 2; ++kk) {
+                            uint32_t vb[2];
+                            vb[0] = *reinterpret_cast<const uint32_t*>(vcol + kk * 16 + qd * 2);
+                            vb[1] = *reinterpret_cast<const uint32_t*>(vcol + kk * 16 + qd * 2 + 8);
+                            MmaTraits<T>::mma(o_acc[nt], pa[kk], vb);
+                        }
+                    }
+
+                }  // warp-active tile
                 __syncthreads();
             }
         }
@@ -321,8 +337,16 @@ __global__ void __launch_bounds__(NTHREADS) na3d_kernel(
 #endif  // __CUDA_ARCH__ >= 800 (bf16 mma; dispatch constraints require sm80+)
 }
 
-template <typename T>
-void launch_na3d_typed(
+// Widest tile covering a short axis, narrowest past that -- extra width only
+// adds tiles most warps skip. Measured on sm89, W 16..256, kw 5..17.
+__host__ __device__ inline int choose_bq(int w_size) {
+    if (w_size <= 16) return 16;
+    if (w_size <= 32) return 32;
+    return 16;
+}
+
+template <typename T, int BQ>
+void launch_na3d_bq(
     const void* q, const void* k, const void* v, void* out,
     int t_size, int h_size, int w_size, int num_heads, int head_dim,
     int64_t s_b, int64_t s_t, int64_t s_h, int64_t s_w, int64_t s_n,
@@ -333,7 +357,7 @@ void launch_na3d_typed(
     const dim3 grid((w_size + BQ - 1) / BQ, t_size * h_size, batch * num_heads);
 
 #define NA3D_LAUNCH(HD_)                                                                    \
-    na3d_kernel<T, HD_><<<grid, NTHREADS, 0, stream>>>(                                     \
+    na3d_kernel<T, HD_, BQ><<<grid, threads_for(BQ), 0, stream>>>(                          \
         reinterpret_cast<const T*>(q), reinterpret_cast<const T*>(k),                       \
         reinterpret_cast<const T*>(v), reinterpret_cast<T*>(out),                           \
         t_size, h_size, w_size, num_heads, s_b, s_t, s_h, s_w, s_n,                         \
@@ -344,9 +368,33 @@ void launch_na3d_typed(
         case 32: NA3D_LAUNCH(32); break;
         case 48: NA3D_LAUNCH(48); break;
         case 64: NA3D_LAUNCH(64); break;
-        default: break;  // constrained out by the dispatcher
+        default:
+            throw std::runtime_error(
+                "na3d supports head_dim 16/32/48/64, got " + std::to_string(head_dim));
     }
 #undef NA3D_LAUNCH
+}
+
+template <typename T>
+void launch_na3d_typed(
+    const void* q, const void* k, const void* v, void* out,
+    int t_size, int h_size, int w_size, int num_heads, int head_dim,
+    int64_t s_b, int64_t s_t, int64_t s_h, int64_t s_w, int64_t s_n,
+    int kt, int kh, int kw,
+    bool causal_t, bool causal_h, bool causal_w,
+    float scale, int batch, cudaStream_t stream)
+{
+#define NA3D_DISPATCH_BQ(BQ_)                                                               \
+    launch_na3d_bq<T, BQ_>(q, k, v, out, t_size, h_size, w_size, num_heads, head_dim,       \
+                           s_b, s_t, s_h, s_w, s_n, kt, kh, kw,                             \
+                           causal_t, causal_h, causal_w, scale, batch, stream)
+
+    // Only the widths choose_bq can return are instantiated.
+    switch (choose_bq(w_size)) {
+        case 32: NA3D_DISPATCH_BQ(32); break;
+        default: NA3D_DISPATCH_BQ(16); break;
+    }
+#undef NA3D_DISPATCH_BQ
 }
 
 }  // namespace
@@ -378,5 +426,8 @@ extern "C" void launch_na3d_kernel(
         launch_na3d_typed<__nv_bfloat16>(q, k, v, out, t_size, h_size, w_size, num_heads, head_dim,
                                          s_b, s_t, s_h, s_w, s_n, ckt, ckh, ckw,
                                          causal_t != 0, causal_h != 0, causal_w != 0, scale, batch, stream);
+    } else {
+        throw std::runtime_error(
+            "na3d supports FP16/BF16 only, got dtype code " + std::to_string(dtype_code));
     }
 }

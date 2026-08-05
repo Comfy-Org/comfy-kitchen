@@ -63,7 +63,7 @@ from .convrot_w4a4 import (
     prepare_int4_weight_for_int8_linear,
     quantize_convrot_w4a4_weight,
 )
-from .na import na3d
+from .na import na3d, na3d_common_call_rule
 from .quantization import (
     dequantize_int8_convrot_weight,
     dequantize_int8_convrot_weight_dtype,
@@ -529,6 +529,7 @@ def _build_constraints() -> dict:
             "v": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
         },
         default_devices=all_devices,
+        call_rules=(na3d_common_call_rule,),
     )
     return out
 

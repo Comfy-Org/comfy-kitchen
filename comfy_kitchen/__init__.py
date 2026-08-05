@@ -37,10 +37,10 @@ else:
 __all__ = [
     # Normalization
     "adaln",
-    # Attention
-    "na3d",
-    "na2d",
     "rms_adaln",
+    # Attention
+    "na2d",
+    "na3d",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -145,6 +145,11 @@ def na2d(
     tensors; equivalent to ``na3d`` with a singleton, non-causal T axis."""
     if is_causal is None:
         is_causal = [False, False]
+    # Checked here: both lists gain a T entry below, hiding a wrong length.
+    if len(kernel_size) != 2:
+        raise ValueError(f"na2d kernel_size must have 2 elements, got {len(kernel_size)}")
+    if len(is_causal) != 2:
+        raise ValueError(f"na2d is_causal must have 2 elements, got {len(is_causal)}")
     out = torch.ops.comfy_kitchen.na3d(
         q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1),
         [1, *kernel_size], [False, *is_causal], scale,

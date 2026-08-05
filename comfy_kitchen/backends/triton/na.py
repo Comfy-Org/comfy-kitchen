@@ -95,6 +95,8 @@ def _na3d_kernel(
                     s = tl.dot(q_blk, tl.trans(k_blk)) * scale
                 vis = (wk[None, :] >= w_start[:, None]) & (wk[None, :] < w_end[:, None]) & kmask[None, :]
                 s = tl.where(vis, s, _NEG_INF)
+                # No fully-masked-row guard: such a row would hold m_i at _NEG_INF
+                # and give p = exp(0) = 1. Safe only because block_k >= block_q.
                 m_new = tl.maximum(m_i, tl.max(s, 1))
                 alpha = tl.exp(m_i - m_new)
                 p = tl.exp(s - m_new[:, None])
@@ -132,8 +134,10 @@ def na3d(
     out = torch.empty_like(q)
 
     hd_p = max(16, triton.next_power_of_2(hd))
-    block_q = 64 if w >= 64 else max(16, triton.next_power_of_2(w))
-    block_k = 64 if w >= 64 else max(16, triton.next_power_of_2(min(w + kw, 64)))
+    # Each query sees only kw of the ~block_q + kw keys swept, so wide blocks
+    # mostly compute masked scores. 16 (the tl.dot floor) measured fastest.
+    block_q = 16
+    block_k = max(16, min(32, triton.next_power_of_2(min(w, block_q + kw))))
 
     grid = (triton.cdiv(w, block_q), t * h, batch * nh)
     _na3d_kernel[grid](

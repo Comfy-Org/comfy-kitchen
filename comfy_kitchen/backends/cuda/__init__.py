@@ -155,6 +155,7 @@ from comfy_kitchen.backends._activations import (  # noqa: E402
 )
 from comfy_kitchen.backends._modulation import adaln_prep_modulation  # noqa: E402
 from comfy_kitchen.backends.eager import rope as _eager_rope  # noqa: E402
+from comfy_kitchen.backends.eager.na import na3d_common_call_rule  # noqa: E402
 from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
     DTYPE_CODE_TO_DTYPE,
     DTYPE_TO_CODE,
@@ -2662,6 +2663,9 @@ def gemv_awq_w4a16(
 
 def _build_constraints() -> dict:
     def _na3d_call_rule(kwargs):
+        common = na3d_common_call_rule(kwargs)
+        if not common.success:
+            return common
         q = kwargs.get("q")
         if q is not None:
             hd = q.shape[-1]
@@ -2669,9 +2673,6 @@ def _build_constraints() -> dict:
                 return ValidationResult.fail("q", "head_dim must be a multiple of 16 and <= 64")
             if q.shape[1] * q.shape[2] > 65535 or q.shape[0] * q.shape[4] > 65535:
                 return ValidationResult.fail("q", "grid dims exceed CUDA limits")
-        kernel_size = kwargs.get("kernel_size")
-        if kernel_size is not None and len(kernel_size) != 3:
-            return ValidationResult.fail("kernel_size", "must have 3 elements")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})

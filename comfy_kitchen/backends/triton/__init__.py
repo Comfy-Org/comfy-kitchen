@@ -31,6 +31,7 @@ __all__ = [
 # Try to import triton and register if available
 import torch
 
+from comfy_kitchen.backends.eager.na import na3d_common_call_rule
 from comfy_kitchen.constraints import (
     ExactDims,
     FunctionConstraints,
@@ -116,12 +117,12 @@ if _TRITON_AVAILABLE:
 
 def _build_constraints() -> dict:
     def _na3d_call_rule(kwargs):
+        common = na3d_common_call_rule(kwargs)
+        if not common.success:
+            return common
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
-        kernel_size = kwargs.get("kernel_size")
-        if kernel_size is not None and len(kernel_size) != 3:
-            return ValidationResult.fail("kernel_size", "must have 3 elements")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
