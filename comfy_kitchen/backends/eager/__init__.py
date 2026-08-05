@@ -1,5 +1,6 @@
 __all__ = [
     "adaln",
+    "na3d",
     "rms_adaln",
     "apply_rope",
     "apply_rope_",
@@ -62,6 +63,7 @@ from .convrot_w4a4 import (
     prepare_int4_weight_for_int8_linear,
     quantize_convrot_w4a4_weight,
 )
+from .na import na3d
 from .quantization import (
     dequantize_int8_convrot_weight,
     dequantize_int8_convrot_weight_dtype,
@@ -520,6 +522,14 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
+    out["na3d"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
+            "k": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
+            "v": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
+        },
+        default_devices=all_devices,
+    )
     return out
 
 

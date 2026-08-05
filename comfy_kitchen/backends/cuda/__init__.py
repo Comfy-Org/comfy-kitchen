@@ -27,6 +27,7 @@ from comfy_kitchen._rope_utils import (
 )
 
 __all__ = [
+    "na3d",
     "adaln",
     "rms_adaln",
     "apply_rope",
@@ -1943,6 +1944,40 @@ def int8_linear(
     return out if is_2d_output else out.reshape(*orig_shape[:-1], n)
 
 
+def na3d(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kernel_size: list[int],
+    is_causal: list[bool] | None = None,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Fused 3D neighborhood attention (NATTEN ``na3d`` semantics) over
+    ``(B, T, H, W, NH, HD)`` tensors. See ops/na3d.cu."""
+    causal = [False, False, False] if is_causal is None else list(is_causal)
+    batch, t, h, w, nh, hd = q.shape
+    if scale is None:
+        scale = hd ** -0.5
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    out = torch.empty_like(q)
+    stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
+    _C.na3d(
+        _wrap_for_dlpack(q),
+        _wrap_for_dlpack(k),
+        _wrap_for_dlpack(v),
+        _wrap_for_dlpack(out),
+        batch, t, h, w, nh, hd,
+        int(kernel_size[0]), int(kernel_size[1]), int(kernel_size[2]),
+        int(causal[0]), int(causal[1]), int(causal[2]),
+        float(scale),
+        DTYPE_TO_CODE[q.dtype],
+        stream_ptr,
+    )
+    return out
+
+
 def _adaln_impl(kernel, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float):
     orig_shape = x.shape
     d = x.shape[-1]
@@ -2626,9 +2661,41 @@ def gemv_awq_w4a16(
 
 
 def _build_constraints() -> dict:
+    def _na3d_call_rule(kwargs):
+        q = kwargs.get("q")
+        if q is not None:
+            hd = q.shape[-1]
+            if hd % 16 != 0 or hd > 64:
+                return ValidationResult.fail("q", "head_dim must be a multiple of 16 and <= 64")
+            if q.shape[1] * q.shape[2] > 65535 or q.shape[0] * q.shape[4] > 65535:
+                return ValidationResult.fail("q", "grid dims exceed CUDA limits")
+        kernel_size = kwargs.get("kernel_size")
+        if kernel_size is not None and len(kernel_size) != 3:
+            return ValidationResult.fail("kernel_size", "must have 3 elements")
+        return ValidationResult.ok()
+
     cuda_devices = frozenset({"cuda"})
 
     constraints = {
+        "na3d": FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(6),),
+                ),
+                "k": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(6),),
+                ),
+                "v": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(6),),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
+            call_rules=(_na3d_call_rule,),
+        ),
         "adaln": FunctionConstraints(
             params={
                 "x": ParamConstraint(

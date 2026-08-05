@@ -37,6 +37,9 @@ else:
 __all__ = [
     # Normalization
     "adaln",
+    # Attention
+    "na3d",
+    "na2d",
     "rms_adaln",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
@@ -97,6 +100,56 @@ __all__ = [
 # =============================================================================
 # Public API Functions
 # =============================================================================
+
+
+def na3d(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kernel_size: list[int],
+    is_causal: list[bool] | None = None,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """3D neighborhood attention (NATTEN ``na3d`` semantics, dilation 1).
+
+    Per non-causal axis each query attends a window of exactly
+    ``kernel_size`` positions centered on it, shifted inward at grid
+    boundaries (kernels larger than an axis clamp to that axis); per causal
+    axis it attends the ``min(i + 1, kernel_size)`` nearest previous
+    positions. RoPE/normalization are the caller's responsibility.
+
+    Args:
+        q, k, v: ``(B, T, H, W, num_heads, head_dim)`` tensors, same shape/dtype.
+        kernel_size: Per-axis window sizes ``[k_t, k_h, k_w]``.
+        is_causal: Per-axis causal flags; None means non-causal everywhere.
+        scale: Score scale; None means ``head_dim ** -0.5``. Pass 1.0 for
+            pre-scaled queries.
+
+    Returns:
+        ``(B, T, H, W, num_heads, head_dim)`` attention output.
+    """
+    if is_causal is None:
+        is_causal = [False, False, False]
+    return torch.ops.comfy_kitchen.na3d(q, k, v, kernel_size, is_causal, scale)
+
+
+def na2d(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kernel_size: list[int],
+    is_causal: list[bool] | None = None,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """2D neighborhood attention over ``(B, H, W, num_heads, head_dim)``
+    tensors; equivalent to ``na3d`` with a singleton, non-causal T axis."""
+    if is_causal is None:
+        is_causal = [False, False]
+    out = torch.ops.comfy_kitchen.na3d(
+        q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1),
+        [1, *kernel_size], [False, *is_causal], scale,
+    )
+    return out.squeeze(1)
 
 
 def adaln(

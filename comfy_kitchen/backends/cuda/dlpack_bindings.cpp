@@ -221,6 +221,14 @@ extern "C" {
         int dtype_code,
         cudaStream_t stream);
 
+    // Fused 3D neighborhood attention — see ops/na3d.cu.
+    void launch_na3d_kernel(
+        const void* q, const void* k, const void* v, void* out,
+        int batch, int t_size, int h_size, int w_size, int num_heads, int head_dim,
+        int kt, int kh, int kw,
+        int causal_t, int causal_h, int causal_w,
+        float scale, int dtype_code, cudaStream_t stream);
+
     // Fused AdaLN — see ops/adaln.cu. subtract_mean selects LayerNorm (true)
     // or RMSNorm (false) statistics.
     void launch_adaln_kernel(
@@ -909,6 +917,28 @@ void awq_w4a16(
     launch_awq_w4a16_kernel(
         x.data(), qweight.data(), wscales.data(), wzeros.data(), out.data(),
         M, N, K, group_size, dtype_code, stream);
+}
+
+// Nanobind wrapper for fused 3D neighborhood attention
+void na3d(
+    nb::ndarray<nb::device::cuda> q,
+    nb::ndarray<nb::device::cuda> k,
+    nb::ndarray<nb::device::cuda> v,
+    nb::ndarray<nb::device::cuda> out,
+    int64_t batch, int64_t t_size, int64_t h_size, int64_t w_size,
+    int64_t num_heads, int64_t head_dim,
+    int64_t kt, int64_t kh, int64_t kw,
+    int causal_t, int causal_h, int causal_w,
+    float scale,
+    int dtype_code,
+    uintptr_t stream_ptr)
+{
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_na3d_kernel(
+        q.data(), k.data(), v.data(), out.data(),
+        (int)batch, (int)t_size, (int)h_size, (int)w_size, (int)num_heads, (int)head_dim,
+        (int)kt, (int)kh, (int)kw, causal_t, causal_h, causal_w,
+        scale, dtype_code, stream);
 }
 
 // Nanobind wrapper for fused AdaLN (LayerNorm statistics)
@@ -2694,6 +2724,15 @@ NB_MODULE(_C, m) {
           nb::arg("out"),
           nb::arg("group_size"),
           nb::arg("stream_ptr"));
+
+    m.def("na3d", &na3d,
+          "Fused 3D neighborhood attention (NATTEN na3d semantics)",
+          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("out"),
+          nb::arg("batch"), nb::arg("t_size"), nb::arg("h_size"), nb::arg("w_size"),
+          nb::arg("num_heads"), nb::arg("head_dim"),
+          nb::arg("kt"), nb::arg("kh"), nb::arg("kw"),
+          nb::arg("causal_t"), nb::arg("causal_h"), nb::arg("causal_w"),
+          nb::arg("scale"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
 
     m.def("adaln", &adaln,
           "Fused AdaLN: layernorm(x) * (1 + scale) + shift",
