@@ -271,7 +271,13 @@ void launch_gemm_wmma(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N,
 
     const int wgps = device_wgp_count();
 
-    if (blocks_128 >= wgps) {
+    // A block tile taller than M or wider than N burns MMAs on zero padding the
+    // grid-coverage test cannot see: at M <= 64 the 128-row tile is at least
+    // half empty, and the 64x64 tile's finer grid recovers the waste (+2-12%
+    // across skinny shapes on gfx1201, none slower).
+    const bool skinny = (M <= 64 || N <= 64);
+
+    if (!skinny && blocks_128 >= wgps) {
         if (kbytes >= 4096) {
             constexpr int BM = 128, BN = 128, BKB = 128;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
