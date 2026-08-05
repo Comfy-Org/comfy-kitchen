@@ -218,4 +218,82 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tile selection, shared by the fp8 and int8 launchers.
+// ---------------------------------------------------------------------------
+
+// CUs on the calling device, cached per ordinal so the query stays off the launch
+// path. The fallback only mis-sizes the grid-coverage test below, never a result.
+inline int device_cu_count() {
+    constexpr int kMaxDevices = 16;
+    static int cache[kMaxDevices] = {};
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDevices) return 64;
+    if (cache[dev] == 0) {
+        int n = 0;
+        if (hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess ||
+            n <= 0) {
+            n = 64;
+        }
+        cache[dev] = n;
+    }
+    return cache[dev];
+}
+
+// Pick and launch a tile for C[M, N] = A[M, K] @ B[N, K]^T. Three axes decide it:
+//
+//   1. Grid coverage. 128x128 has the best arithmetic intensity, but a shape
+//      yielding fewer blocks than the device has CUs leaves most of the GPU idle,
+//      and the 64x64 tile's 4x finer grid is worth up to 2.3x there.
+//   2. K depth. BKB=128 halves the LDS round trips and __syncthreads pairs per K
+//      element, once K is deep enough to amortize the coarser tail. int8 is the
+//      binding constraint on the threshold: it loses 0.81x at K=640 if taken
+//      lower, where fp8 only breaks even. The 64x64 tile crosses over earlier.
+//   3. Warp grid, at a fixed block tile. See the deep-K branch below.
+//
+// Tuned on gfx12. Untested on gfx11, where MmaFp8 widens to bf16 and every
+// 128x128 fp8 tile spills registers. Using w4x4/t2x2 throughout would stop that,
+// but it is the slower grid on gfx12 once blocks are plentiful, so a gfx11 fix
+// needs an arch-conditional grid.
+template <typename Mma, typename Epi, typename OutT>
+void launch_gemm_wmma(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int kbytes,
+                      int ldc, Epi epi, hipStream_t stream) {
+    const int blocks_128 = ((M + 127) / 128) * ((N + 127) / 128);
+
+    const int cus = device_cu_count();
+
+    if (blocks_128 >= cus) {
+        if (kbytes >= 4096) {
+            constexpr int BM = 128, BN = 128, BKB = 128;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            // With few blocks per CU there is nothing to interleave across, so the
+            // 16-wave grid wins by hiding latency within a block instead (up to
+            // 1.25x). Past ~4 blocks/CU the 8-wave grid's wider register tile
+            // takes over.
+            if (blocks_128 <= 4 * cus) {
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2>
+                    <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+            } else {
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4>
+                    <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+            }
+        } else {
+            constexpr int BM = 128, BN = 128, BKB = 64;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4>
+                <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        }
+    } else if (kbytes >= 2048) {
+        constexpr int BM = 64, BN = 64, BKB = 128;
+        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2>
+            <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+    } else {
+        constexpr int BM = 64, BN = 64, BKB = 64;
+        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2>
+            <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+    }
+}
+
 }  // namespace comfy::hip_backend
