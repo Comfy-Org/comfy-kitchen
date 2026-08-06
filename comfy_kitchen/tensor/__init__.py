@@ -27,8 +27,15 @@ from .svdquant_w4a4 import (
     svdquant_w4a4_fused_grouped_linear,
     svdquant_w4a4_grouped_linear,
 )
+from .w4a8_int8 import (
+    AsymW4A8Int8Layout,
+    dequantize_w4a8_int8_weight,
+    quantize_w4a8_int8_weight,
+    w4a8_int8_linear,
+)
 
 __all__ = [
+    "AsymW4A8Int8Layout",
     "BaseLayoutParams",
     "QuantizedLayout",
     "QuantizedTensor",
@@ -42,17 +49,21 @@ __all__ = [
     "convrot_w4a4_linear",
     "dequantize_args",
     "dequantize_convrot_w4a4_weight",
+    "dequantize_w4a8_int8_weight",
     "get_cuda_capability",
     "get_layout_class",
     "register_layout_class",
     "register_layout_op",
     "quantize_convrot_w4a4_weight",
+    "quantize_w4a8_int8_weight",
     "svdquant_w4a4_can_share_quant",
     "svdquant_w4a4_fuse_linear_weights",
     "svdquant_w4a4_fused_grouped_linear",
     "svdquant_w4a4_grouped_linear",
+    "w4a8_int8_linear",
 ]
 
+register_layout_class("AsymW4A8Int8Layout", AsymW4A8Int8Layout)
 register_layout_class("TensorCoreAWQW4A16Layout", TensorCoreAWQW4A16Layout)
 register_layout_class("TensorCoreConvRotW4A4Layout", TensorCoreConvRotW4A4Layout)
 register_layout_class("TensorCoreFP8Layout", TensorCoreFP8Layout)

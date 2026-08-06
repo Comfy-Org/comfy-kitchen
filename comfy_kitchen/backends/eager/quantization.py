@@ -906,6 +906,12 @@ def quantize_int8_convrot_weight(
     return quantize_int8_rowwise(weight_rot, stochastic_rounding=stochastic_rounding)
 
 
+def rotate_int8_convrot_weight(weight: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Portable ConvRot weight rotation used when no accelerated backend is available."""
+    h = _build_hadamard(group_size, device=weight.device, dtype=weight.dtype)
+    return _rotate_weight(weight, h, group_size)
+
+
 def dequantize_int8_convrot_weight(q: torch.Tensor, scale: torch.Tensor, group_size: int) -> torch.Tensor:
     """Dequantize INT8 ConvRot weights and rotate them back to the original basis."""
     h = _build_hadamard(group_size, device=q.device, dtype=torch.float32)
