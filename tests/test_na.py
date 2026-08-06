@@ -178,3 +178,45 @@ def test_na2d_rejects_bad_axis_lists(kernel, causal):
     q, k, v = (torch.randn(shape, device=device, dtype=torch.bfloat16) for _ in range(3))
     with pytest.raises(ValueError, match="2 elements"):
         ck.na2d(q, k, v, kernel, causal, None)
+
+
+@pytest.mark.parametrize("kernel", [[0, 3, 3], [3, -1, 3], [3, 3, 0]])
+def test_na3d_rejects_non_positive_kernel(kernel):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    q, k, v = _qkv(device)
+    with pytest.raises(Exception, match=r"(?i)positive|no backend"):
+        ck.na3d(q, k, v, kernel, [False, False, False], None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs two device types")
+@pytest.mark.parametrize("bad", ["k", "v"])
+def test_na3d_rejects_cross_device_qkv(bad):
+    q, k, v = _qkv("cuda", dtype=torch.float32)
+    if bad == "k":
+        k = k.cpu()
+    else:
+        v = v.cpu()
+    with pytest.raises(Exception, match=r"(?i)same device|no backend"):
+        ck.na3d(q, k, v, [3, 3, 3], [False, False, False], None)
+
+
+def test_na3d_scalar_kernel_and_causal():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    q, k, v = _qkv(device)
+    ref = ck.na3d(q, k, v, [3, 3, 3], [True, True, True], None)
+    out = ck.na3d(q, k, v, 3, True, None)
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    torch.testing.assert_close(
+        ck.na3d(q, k, v, 3, None, None),
+        ck.na3d(q, k, v, [3, 3, 3], [False, False, False], None),
+        rtol=0, atol=0,
+    )
+
+
+def test_na2d_scalar_kernel_and_causal():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    shape = (1, 8, 8, 2, 64)
+    q, k, v = (torch.randn(shape, device=device, dtype=torch.bfloat16) for _ in range(3))
+    ref = ck.na2d(q, k, v, [3, 3], [True, True], None)
+    out = ck.na2d(q, k, v, 3, True, None)
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)

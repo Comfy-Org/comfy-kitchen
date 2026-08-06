@@ -274,6 +274,10 @@ def na3d_common_call_rule(kwargs):
                 return ValidationResult.fail(
                     name, f"must have the same dtype as q ({q.dtype}), got {other.dtype}"
                 )
+            if other.device != q.device:
+                return ValidationResult.fail(
+                    name, f"must be on the same device as q ({q.device}), got {other.device}"
+                )
     for name in ("kernel_size", "is_causal"):
         value = kwargs.get(name)
         if value is not None and len(value) != 3:
