@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
+from comfy_kitchen.exceptions import NoCapableBackendError
 from tests.conftest import assert_values_close, get_capable_backends
 
 # ---------------------------------------------------------------------------
@@ -155,7 +156,7 @@ def test_na3d_rejects_mismatched_qkv(bad):
         k = k.float()
     else:
         v = v.float()
-    with pytest.raises(Exception, match=r"(?i)same (shape|dtype)|no backend"):
+    with pytest.raises(NoCapableBackendError, match=r"(?i)same (shape|dtype) as q"):
         ck.na3d(q, k, v, [3, 3, 3], [False, False, False], None)
 
 
@@ -167,7 +168,7 @@ def test_na3d_rejects_mismatched_qkv(bad):
 def test_na3d_rejects_bad_axis_lists(kernel, causal):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     q, k, v = _qkv(device)
-    with pytest.raises(Exception, match=r"(?i)3 elements|no backend"):
+    with pytest.raises(NoCapableBackendError, match=r"(?i)must have 3 elements"):
         ck.na3d(q, k, v, kernel, causal, None)
 
 
@@ -184,7 +185,7 @@ def test_na2d_rejects_bad_axis_lists(kernel, causal):
 def test_na3d_rejects_non_positive_kernel(kernel):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     q, k, v = _qkv(device)
-    with pytest.raises(Exception, match=r"(?i)positive|no backend"):
+    with pytest.raises(NoCapableBackendError, match=r"(?i)entries must be positive"):
         ck.na3d(q, k, v, kernel, [False, False, False], None)
 
 
@@ -196,7 +197,7 @@ def test_na3d_rejects_cross_device_qkv(bad):
         k = k.cpu()
     else:
         v = v.cpu()
-    with pytest.raises(Exception, match=r"(?i)same device|no backend"):
+    with pytest.raises(NoCapableBackendError, match=r"(?i)same device as q"):
         ck.na3d(q, k, v, [3, 3, 3], [False, False, False], None)
 
 
