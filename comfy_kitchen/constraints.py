@@ -253,3 +253,34 @@ def validate_function_call(
 
     return ValidationResult.ok()
 
+
+def na3d_common_call_rule(kwargs):
+    """Shared ``na3d`` validation (used by every backend's entry).
+
+    The fused backends size everything from ``q`` and pass ``k``/``v`` as bare
+    pointers, so a mismatch becomes an out-of-bounds read.
+    """
+    q = kwargs.get("q")
+    if q is not None:
+        for name in ("k", "v"):
+            other = kwargs.get(name)
+            if other is None:
+                continue
+            if tuple(other.shape) != tuple(q.shape):
+                return ValidationResult.fail(
+                    name, f"must have the same shape as q {tuple(q.shape)}, got {tuple(other.shape)}"
+                )
+            if other.dtype != q.dtype:
+                return ValidationResult.fail(
+                    name, f"must have the same dtype as q ({q.dtype}), got {other.dtype}"
+                )
+    for name in ("kernel_size", "is_causal"):
+        value = kwargs.get(name)
+        if value is not None and len(value) != 3:
+            return ValidationResult.fail(name, f"must have 3 elements, got {len(value)}")
+    kernel_size = kwargs.get("kernel_size")
+    if kernel_size is not None and any(k < 1 for k in kernel_size):
+        return ValidationResult.fail(
+            "kernel_size", f"entries must be positive, got {list(kernel_size)}"
+        )
+    return ValidationResult.ok()

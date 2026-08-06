@@ -19,7 +19,6 @@ import math
 import torch
 import torch.nn.functional as functional
 
-from comfy_kitchen.constraints import ValidationResult
 from comfy_kitchen.registry import registry
 
 # Element budget for one tile's [Nq, Nk] attention mask (bounds the mask
@@ -27,33 +26,6 @@ from comfy_kitchen.registry import registry
 NA_SCORE_BUDGET = 2 ** 25
 # Element budget for the stacked K/V copies of one batched SDPA call on CUDA.
 NA_KV_STACK_BUDGET = 2 ** 28
-
-
-def na3d_common_call_rule(kwargs):
-    """Shared ``na3d`` validation.
-
-    The fused backends size everything from ``q`` and pass ``k``/``v`` as bare
-    pointers, so a mismatch becomes an out-of-bounds read.
-    """
-    q = kwargs.get("q")
-    if q is not None:
-        for name in ("k", "v"):
-            other = kwargs.get(name)
-            if other is None:
-                continue
-            if tuple(other.shape) != tuple(q.shape):
-                return ValidationResult.fail(
-                    name, f"must have the same shape as q {tuple(q.shape)}, got {tuple(other.shape)}"
-                )
-            if other.dtype != q.dtype:
-                return ValidationResult.fail(
-                    name, f"must have the same dtype as q ({q.dtype}), got {other.dtype}"
-                )
-    for name in ("kernel_size", "is_causal"):
-        value = kwargs.get(name)
-        if value is not None and len(value) != 3:
-            return ValidationResult.fail(name, f"must have 3 elements, got {len(value)}")
-    return ValidationResult.ok()
 
 
 def _window_bounds(length, kernel, causal):

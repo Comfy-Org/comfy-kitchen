@@ -32,12 +32,12 @@ __all__ = [
 # Try to import triton and register if available
 import torch
 
-from comfy_kitchen.backends.eager.na import na3d_common_call_rule
 from comfy_kitchen.constraints import (
     ExactDims,
     FunctionConstraints,
     ParamConstraint,
     ValidationResult,
+    na3d_common_call_rule,
 )
 from comfy_kitchen.registry import registry
 
@@ -333,6 +333,8 @@ def _build_constraints() -> dict:
             "v": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
         },
         default_devices=cuda_devices,
+        # tl.dot needs Ampere matrix capability for the non-IEEE float paths
+        min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
     )
     return out

@@ -159,7 +159,6 @@ from comfy_kitchen.backends._activations import (  # noqa: E402
 )
 from comfy_kitchen.backends._modulation import adaln_prep_modulation  # noqa: E402
 from comfy_kitchen.backends.eager import rope as _eager_rope  # noqa: E402
-from comfy_kitchen.backends.eager.na import na3d_common_call_rule  # noqa: E402
 from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
     DTYPE_CODE_TO_DTYPE,
     DTYPE_TO_CODE,
@@ -190,6 +189,7 @@ from comfy_kitchen.constraints import (  # noqa: E402
     MinDims,
     ParamConstraint,
     ValidationResult,
+    na3d_common_call_rule,
 )
 from comfy_kitchen.float_utils import roundup  # noqa: E402
 from comfy_kitchen.registry import registry  # noqa: E402

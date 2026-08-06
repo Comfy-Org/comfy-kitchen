@@ -56,6 +56,7 @@ from comfy_kitchen.constraints import (
     ExactDims,
     FunctionConstraints,
     ParamConstraint,
+    na3d_common_call_rule,
 )
 from comfy_kitchen.registry import registry
 
@@ -67,7 +68,7 @@ from .convrot_w4a4 import (
     prepare_int4_weight_for_int8_linear,
     quantize_convrot_w4a4_weight,
 )
-from .na import na3d, na3d_common_call_rule
+from .na import na3d
 from .quantization import (
     dequantize_int8_convrot_weight,
     dequantize_int8_convrot_weight_dtype,
