@@ -210,9 +210,33 @@ def _quantize_rotated_w4a8_int8_weight(
 
 
 # Rows to rotate+pack per chunk: caps the fp32 working set that otherwise scales with the
-# whole tensor and OOMs on large layers (e.g. the LoRA requantize path).
+# whole tensor and OOMs on large layers (e.g. the LoRA requantize path). A 1-row floor keeps
+# wide weights within budget (a fixed row floor would blow it for large k).
 _QUANT_ROW_ELEM_BUDGET = 1 << 22  # ~4M elems/chunk
-_QUANT_MIN_ROWS = 256
+# Elements sampled to decide the codebook. Independent of the chunk size so the chosen table
+# is a function of the whole tensor, never of how it happens to be chunked.
+_CODEBOOK_SAMPLE_ELEMS = 1 << 22
+
+
+def _decide_codebook(
+    weight: torch.Tensor,
+    rotate_fn,
+    group_size: int,
+    convrot_groupsize: int,
+) -> torch.Tensor:
+    """Choose one codebook for the whole tensor from a bounded, deterministic row sample that
+    spans every chunk (evenly strided rows), so the choice never depends on the chunk size."""
+    n, k = weight.shape
+    max_rows = max(1, _CODEBOOK_SAMPLE_ELEMS // max(k, 1))
+    if n > max_rows:
+        idx = torch.linspace(0, n - 1, max_rows, device=weight.device).long()
+        sample = weight.index_select(0, idx)
+    else:
+        sample = weight
+    rotated = rotate_fn(sample.contiguous(), convrot_groupsize)
+    grouped = rotated.float().view(sample.shape[0], k // group_size, group_size)
+    normalized = grouped / grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    return _codebook_for(normalized)
 
 
 def _quantize_w4a8_chunked(
@@ -233,22 +257,20 @@ def _quantize_w4a8_chunked(
 ]:
     """Rotate and pack a weight in row chunks to cap peak memory.
 
-    Row math is independent, so this is bit-identical to the whole-tensor path. The codebook
-    is decided once and shared across chunks to keep the table consistent; a caller-supplied
-    ``codebook_override`` reuses a prior table and skips the decision entirely.
+    One codebook is chosen for the whole tensor -- from a caller ``codebook_override`` (e.g. a
+    LoRA requantize reusing the prior table), else from a whole-tensor-spanning sample -- and
+    shared across every chunk, so the packed result does not depend on the chunk size. Row math
+    is otherwise independent.
     """
     n, k = weight.shape
-    block = max(_QUANT_MIN_ROWS, _QUANT_ROW_ELEM_BUDGET // max(k, 1))
+    block = max(1, _QUANT_ROW_ELEM_BUDGET // max(k, 1))
     override = None
     if symmetric and codebook:
-        if codebook_override is not None:
-            override = codebook_override.to(device=weight.device, dtype=torch.float32)
-        elif n > block:
-            rot_sample = rotate_fn(weight[:block].contiguous(), convrot_groupsize)
-            grouped = rot_sample.float().view(block, k // group_size, group_size)
-            normalized = grouped / grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
-            override = _codebook_for(normalized)
-            del rot_sample, grouped, normalized
+        override = (
+            codebook_override.to(device=weight.device, dtype=torch.float32)
+            if codebook_override is not None
+            else _decide_codebook(weight, rotate_fn, group_size, convrot_groupsize)
+        )
 
     if n <= block:
         return _quantize_rotated_w4a8_int8_weight(
