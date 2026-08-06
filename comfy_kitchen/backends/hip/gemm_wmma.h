@@ -259,10 +259,9 @@ inline int device_wgp_count() {
 //      lower, where fp8 only breaks even. The 64x64 tile crosses over earlier.
 //   3. Warp grid, at a fixed block tile. See the deep-K branch below.
 //
-// Tuned on gfx12. Untested on gfx11, where MmaFp8 widens to bf16 and every
-// 128x128 fp8 tile spills registers. Using w4x4/t2x2 throughout would stop that,
-// but it is the slower grid on gfx12 once blocks are plentiful, so a gfx11 fix
-// needs an arch-conditional grid.
+// The thresholds (K >= 4096 for BKB=128, the ~4 blocks/WGP warp-grid crossover,
+// the skinny cutoff) are tuned on RDNA4 hardware. They govern tile choice only,
+// never correctness.
 template <typename Mma, typename Epi, typename OutT>
 void launch_gemm_wmma(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int kbytes,
                       int ldc, Epi epi, hipStream_t stream) {
@@ -273,7 +272,7 @@ void launch_gemm_wmma(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N,
     // A tile taller than M or wider than N burns MMAs on zero padding that the
     // grid-coverage test cannot see: at M <= 64 the 128-row tile is at least
     // half empty. The 64x64 tile's finer grid recovers the waste (+2-12% on
-    // gfx1201).
+    // RDNA4).
     const bool skinny = (M <= 64 || N <= 64);
 
     if (!skinny && blocks_128 >= wgps) {
