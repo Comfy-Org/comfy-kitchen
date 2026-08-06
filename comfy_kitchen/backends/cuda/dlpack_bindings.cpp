@@ -1931,7 +1931,7 @@ void dequant_int4_grouped_to_int8(
         throw std::runtime_error("dequant_int4_grouped: G must be >=4 and divide 16 or be a multiple of 16");
     if (K % G != 0) throw std::runtime_error("dequant_int4_grouped: K must be divisible by G");
     if (static_cast<int64_t>(s_rel.shape(0)) != N || static_cast<int64_t>(s_rel.shape(1)) != K / G)
-        throw std::runtime_error("dequant_int4_grouped: s_rel must be [N, K/G]");
+        throw std::runtime_error("dequant_int4_grouped: s_rel must have shape [N, K/G]");
     if (static_cast<int64_t>(out.shape(0)) != N)
         throw std::runtime_error("dequant_int4_grouped: out must be [N, K]");
     if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != 16)
@@ -1956,7 +1956,7 @@ void dequant_int4_grouped_to_int8_e4m3(
         throw std::runtime_error("dequant_int4_grouped: G must be >=4 and divide 16 or be a multiple of 16");
     if (K % G != 0) throw std::runtime_error("dequant_int4_grouped: K must be divisible by G");
     if (static_cast<int64_t>(s_rel.shape(0)) != N || static_cast<int64_t>(s_rel.shape(1)) != K / G)
-        throw std::runtime_error("dequant_int4_grouped: s_rel must be [N, K/G]");
+        throw std::runtime_error("dequant_int4_grouped: s_rel must have shape [N, K/G]");
     if (static_cast<int64_t>(out.shape(0)) != N)
         throw std::runtime_error("dequant_int4_grouped: out must be [N, K]");
     if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != 16)
@@ -1964,6 +1964,47 @@ void dequant_int4_grouped_to_int8_e4m3(
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const void* cb = codebook.has_value() ? codebook->data() : nullptr;
     launch_dequant_int4_grouped_to_int8_e4m3(qw.data(), s_rel.data(), cb, out.data(), N, K, G, stream);
+}
+
+static void validate_w4a8_codebook_gemm_contract(
+    int64_t M, int64_t N, int64_t K,
+    int64_t weight_khalf,
+    int64_t s_rel_n, int64_t s_rel_groups,
+    int64_t s_channel_size, int64_t xs_size,
+    int64_t codebook_size, int64_t bias_size,
+    int64_t workspace_rows, int64_t workspace_cols,
+    int64_t out_rows, int64_t out_cols,
+    const nb::dlpack::dtype& out_dtype,
+    int64_t G, int64_t chunk_cols, int out_dtype_code) {
+    if (weight_khalf != K / 2)
+        throw std::runtime_error("w4a8_codebook_gemm: K/2 mismatch");
+    if (K % 16 != 0)
+        throw std::runtime_error("w4a8_codebook_gemm: K must be a multiple of 16");
+    if (G < 4 || (16 % G != 0 && G % 16 != 0))
+        throw std::runtime_error("w4a8_codebook_gemm: G must be >=4 and divide 16 or be a multiple of 16");
+    if (K % G != 0)
+        throw std::runtime_error("w4a8_codebook_gemm: K must be divisible by G");
+    if (xs_size != M)
+        throw std::runtime_error("w4a8_codebook_gemm: xs must have M values");
+    if (s_rel_n != N || s_rel_groups != K / G)
+        throw std::runtime_error("w4a8_codebook_gemm: s_rel must be [N, K/G]");
+    if (s_channel_size != N)
+        throw std::runtime_error("w4a8_codebook_gemm: s_channel must be [N]");
+    if (codebook_size >= 0 && codebook_size != 16)
+        throw std::runtime_error("w4a8_codebook_gemm: codebook must be [16]");
+    if (bias_size >= 0 && bias_size != N)
+        throw std::runtime_error("w4a8_codebook_gemm: bias must be [N]");
+    if (out_dtype_code < 0 || out_dtype_code > 2)
+        throw std::runtime_error("w4a8_codebook_gemm: out_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
+    if (map_dtype_to_code(out_dtype) != out_dtype_code)
+        throw std::runtime_error("w4a8_codebook_gemm: out dtype does not match out_dtype_code (0=fp32, 1=fp16, 2=bf16)");
+    if (out_rows != M || out_cols != N)
+        throw std::runtime_error("w4a8_codebook_gemm: out must be [M, N]");
+    if (chunk_cols > 0) {
+        const int64_t required_rows = (chunk_cols < N) ? chunk_cols : N;
+        if (workspace_cols != K || workspace_rows < required_rows)
+            throw std::runtime_error("w4a8_codebook_gemm: workspace must be [>=min(chunk_cols,N), K] int8");
+    }
 }
 
 // Chunked fused W4A8: per-chunk (codebook+s_rel) dequant -> L2-hot int8 -> strided int8 GEMM.
@@ -1981,44 +2022,77 @@ bool w4a8_codebook_gemm_chunked(
     const int64_t M = xq.shape(0);
     const int64_t K = xq.shape(1);
     const int64_t N = weight.shape(0);
-    if (weight.shape(1) != K / 2) throw std::runtime_error("w4a8_codebook_gemm: K/2 mismatch");
-    // Grouping contract: the dequant kernel is 16-wide vectorized (K % 16), and G must be a
-    // supported group size (>=4, divides 16 or a multiple of 16) that divides K so K/G groups
-    // are exact. A bad G/K silently truncates or misaligns the kernel.
-    if (K % 16 != 0) throw std::runtime_error("w4a8_codebook_gemm: K must be a multiple of 16");
-    if (G < 4 || (16 % G != 0 && G % 16 != 0))
-        throw std::runtime_error("w4a8_codebook_gemm: G must be >=4 and divide 16 or be a multiple of 16");
-    if (K % G != 0) throw std::runtime_error("w4a8_codebook_gemm: K must be divisible by G");
-    // The launcher reads these as contiguous metadata; a wrong length reads past the buffer.
-    if (static_cast<int64_t>(xq.shape(1)) != K || static_cast<int64_t>(xs.shape(0)) != M)
-        throw std::runtime_error("w4a8_codebook_gemm: xq must be [M, K] and xs [M]");
-    if (static_cast<int64_t>(s_rel.shape(0)) != N || static_cast<int64_t>(s_rel.shape(1)) != K / G)
-        throw std::runtime_error("w4a8_codebook_gemm: s_rel must be [N, K/G]");
-    if (static_cast<int64_t>(s_channel.shape(0)) != N)
-        throw std::runtime_error("w4a8_codebook_gemm: s_channel must be [N]");
-    if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != 16)
-        throw std::runtime_error("w4a8_codebook_gemm: codebook must be [16]");
-    if (bias.has_value() && static_cast<int64_t>(bias->shape(0)) != N)
-        throw std::runtime_error("w4a8_codebook_gemm: bias must be [N]");
-    // out is untyped; the kernel derives its element size from out_dtype_code and offsets
-    // each chunk by n0*itemsize. Verify the code and the buffer agree, and the out/workspace
-    // geometry the chunk loop indexes, so a mismatch errors here instead of scribbling past
-    // the allocation.
-    // Exact dtype match: fp16 and bf16 share itemsize but the launch selects half_t vs
-    // bfloat16_t, so a mismatched code would reinterpret the buffer.
-    if (out_dtype_code < 0 || out_dtype_code > 2)  // allow-list: the launch only supports these
-        throw std::runtime_error("w4a8_codebook_gemm: out_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
-    if (map_dtype_to_code(out.dtype()) != out_dtype_code)
-        throw std::runtime_error("w4a8_codebook_gemm: out dtype does not match out_dtype_code (0=fp32, 1=fp16, 2=bf16)");
-    if (static_cast<int64_t>(out.shape(0)) != M || static_cast<int64_t>(out.shape(1)) != N)
-        throw std::runtime_error("w4a8_codebook_gemm: out must be [M, N]");
-    if (chunk_cols > 0) {  // chunk_cols <= 0 is handled (2-pass fallback) in the launcher
-        const int64_t ws_rows = (chunk_cols < N) ? chunk_cols : N;
-        if (static_cast<int64_t>(workspace.shape(1)) != K
-                || static_cast<int64_t>(workspace.shape(0)) < ws_rows)
-            throw std::runtime_error("w4a8_codebook_gemm: workspace must be [>=min(chunk_cols,N), K] int8");
-    }
+    validate_w4a8_codebook_gemm_contract(
+        M, N, K,
+        weight.shape(1),
+        s_rel.shape(0), s_rel.shape(1),
+        s_channel.size(), xs.size(),
+        codebook.has_value() ? static_cast<int64_t>(codebook->size()) : -1,
+        bias.has_value() ? static_cast<int64_t>(bias->size()) : -1,
+        workspace.shape(0), workspace.shape(1),
+        out.shape(0), out.shape(1), out.dtype(),
+        G, chunk_cols, out_dtype_code);
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    const void* cb = codebook.has_value() ? codebook->data() : nullptr;
+    const void* bs = bias.has_value() ? bias->data() : nullptr;
+    return launch_w4a8_codebook_gemm_chunked(
+        xq.data(), weight.data(), s_rel.data(), cb, s_channel.data(), xs.data(), bs,
+        workspace.data(), out.data(), M, N, K, G, chunk_cols, out_dtype_code, stream);
+}
+
+// Common W4A8 inference path: online ConvRot activation quantization followed by the
+// chunked int4 decode + strided INT8 GEMM, coordinated through one Python/native call.
+bool w4a8_codebook_linear_chunked(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,             // [M, K] fp32/fp16/bf16
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> xq,       // [M, K]
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> xs,        // [M, 1]
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> weight,   // [N, K/2]
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> s_rel,   // [N, K/G]
+    std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> codebook,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> s_channel, // [N]
+    std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> bias,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> workspace,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> out,
+    int64_t convrot_group_size, int64_t G, int64_t chunk_cols,
+    int out_dtype_code, uintptr_t stream_ptr) {
+    const int64_t M = input.shape(0);
+    const int64_t K = input.shape(1);
+    const int64_t N = weight.shape(0);
+    if (xq.shape(0) != M || xq.shape(1) != K)
+        throw std::runtime_error("w4a8_codebook_linear: xq must be [M, K]");
+    if (xs.shape(0) != M || xs.shape(1) != 1)
+        throw std::runtime_error("w4a8_codebook_linear: xs must be [M, 1]");
+    if (input.stride(1) != 1 || input.stride(0) != K
+            || xq.stride(1) != 1 || xq.stride(0) != K
+            || xs.stride(1) != 1 || xs.stride(0) != 1)
+        throw std::runtime_error("w4a8_codebook_linear: input, xq, and xs must be contiguous");
+    if (weight.stride(1) != 1 || weight.stride(0) != weight.shape(1)
+            || s_rel.stride(1) != 1 || s_rel.stride(0) != s_rel.shape(1)
+            || s_channel.stride(0) != 1
+            || workspace.stride(1) != 1 || workspace.stride(0) != workspace.shape(1)
+            || out.stride(1) != 1 || out.stride(0) != out.shape(1)
+            || (codebook.has_value() && codebook->stride(0) != 1)
+            || (bias.has_value() && bias->stride(0) != 1))
+        throw std::runtime_error("w4a8_codebook_linear: weight metadata, workspace, and out must be contiguous");
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
+    if (input_dtype_code < 0 || input_dtype_code > 2)
+        throw std::runtime_error("w4a8_codebook_linear: input must be fp32, fp16, or bf16");
+    validate_w4a8_codebook_gemm_contract(
+        M, N, K,
+        weight.shape(1),
+        s_rel.shape(0), s_rel.shape(1),
+        s_channel.size(), xs.size(),
+        codebook.has_value() ? static_cast<int64_t>(codebook->size()) : -1,
+        bias.has_value() ? static_cast<int64_t>(bias->size()) : -1,
+        workspace.shape(0), workspace.shape(1),
+        out.shape(0), out.shape(1), out.dtype(),
+        G, chunk_cols, out_dtype_code);
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quantize_int8_rowwise_convrot_kernel(
+        input.data(), xq.data(), xs.data(), M, K,
+        static_cast<int>(convrot_group_size), input_dtype_code,
+        false, 0, stream);
     const void* cb = codebook.has_value() ? codebook->data() : nullptr;
     const void* bs = bias.has_value() ? bias->data() : nullptr;
     return launch_w4a8_codebook_gemm_chunked(
@@ -2686,6 +2760,14 @@ NB_MODULE(_C, m) {
           nb::arg("s_channel"), nb::arg("xs"), nb::arg("bias").none(), nb::arg("workspace"),
           nb::arg("out"), nb::arg("g"), nb::arg("chunk_cols"), nb::arg("out_dtype_code"),
           nb::arg("stream_ptr"));
+
+    m.def("w4a8_codebook_linear_chunked", &w4a8_codebook_linear_chunked,
+          "Fused W4A8 inference orchestration: ConvRot activation quantization followed by chunked decode/GEMM",
+          nb::arg("input"), nb::arg("xq"), nb::arg("xs"), nb::arg("weight"),
+          nb::arg("s_rel"), nb::arg("codebook").none(), nb::arg("s_channel"),
+          nb::arg("bias").none(), nb::arg("workspace"), nb::arg("out"),
+          nb::arg("convrot_group_size"), nb::arg("g"), nb::arg("chunk_cols"),
+          nb::arg("out_dtype_code"), nb::arg("stream_ptr"));
 
     m.def("quantize_int8_rowwise_convrot", &quantize_int8_rowwise_convrot,
           "Fused ConvRot Hadamard rotation + rowwise INT8 quantization",

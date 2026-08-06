@@ -20,6 +20,11 @@ from .tensor.convrot_w4a4 import (
     dequantize_convrot_w4a4_weight,
     quantize_convrot_w4a4_weight,
 )
+from .tensor.w4a8_int8 import (
+    dequantize_w4a8_int8_weight,
+    quantize_w4a8_int8_weight,
+    w4a8_int8_linear,
+)
 
 # Loading the HIP extension also loads the ROCm runtime. Do that only under a
 # ROCm PyTorch build so CUDA/CPU processes do not pay the import cost or acquire
@@ -47,6 +52,7 @@ __all__ = [
     "dequantize_mxfp8",
     "quantize_svdquant_w4a4",
     "quantize_convrot_w4a4_weight",
+    "quantize_w4a8_int8_weight",
     "quantize_int8_rowwise",
     "quantize_int8_tensorwise",
     "dequantize_int8_simple",
@@ -56,8 +62,10 @@ __all__ = [
     "scaled_mm_svdquant_w4a4",
     "convrot_w4a4_linear",
     "dequantize_convrot_w4a4_weight",
+    "dequantize_w4a8_int8_weight",
     "gemv_awq_w4a16",
     "int8_linear",
+    "w4a8_int8_linear",
     # Positional encoding
     "apply_rope",
     "apply_rope_",

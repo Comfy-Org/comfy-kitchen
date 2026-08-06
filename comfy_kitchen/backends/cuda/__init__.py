@@ -52,7 +52,9 @@ __all__ = [
     "dequantize_int8_convrot_weight",
     "dequantize_int8_convrot_weight_dtype",
     "dequantize_convrot_w4a4_weight",
+    "dequantize_w4a8_int8_weight",
     "int8_linear",
+    "w4a8_int8_linear",
     "int4_linear",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
@@ -62,7 +64,9 @@ __all__ = [
     "quantize_int4_rowwise_convrot64",
     "quantize_int4_rowwise_convrot64_to_int8",
     "quantize_convrot_w4a4_weight",
+    "quantize_w4a8_int8_weight",
     "quantize_int8_convrot_weight",
+    "rotate_int8_convrot_weight",
     "quantize_int8_rowwise_convrot64",
     "quantize_and_rotate_rowwise",
     "gemv_awq_w4a16",
@@ -168,6 +172,15 @@ from comfy_kitchen.backends.eager.svdquant import (  # noqa: E402
     _INT4_GROUP_SIZE,
     _unpack_int4_row_major,
 )
+from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
+    _dequantize_w4a8_int8_weight_from_int8,
+    _quantize_rotated_w4a8_int8_weight,
+    validate_w4a8_operands,
+    validate_w4a8_weight_shape,
+)
+from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
+    w4a8_int8_linear as eager_w4a8_int8_linear,
+)
 from comfy_kitchen.constraints import (  # noqa: E402
     DivisibleBy,
     ExactDims,
@@ -195,6 +208,7 @@ _device_multiprocessor_count_cache: dict[int, int] = {}
 _FORCE_INT4_INT8_FALLBACK = os.environ.get("COMFY_KITCHEN_FORCE_INT4_INT8_FALLBACK", "0") == "1"
 _INT4_PACKED_WEIGHT_SMALL_M_MAX = 8
 _INT4_INT8_WEIGHT_CHUNK_N = max(1, int(os.environ.get("COMFY_KITCHEN_INT4_INT8_WEIGHT_CHUNK_N", "4096")))
+_W4A8_CHUNKED = os.environ.get("COMFY_KITCHEN_W4A8_CHUNKED", "1") != "0"
 _NVIDIA_16_SERIES = (
     "1660",
     "1650",
@@ -1324,17 +1338,43 @@ def quantize_int8_rowwise_convrot(
     return q_2d, scales_2d
 
 
-def rotate_int8_convrot_weight(weight_2d: torch.Tensor, group_size: int) -> torch.Tensor:
+def rotate_int8_convrot_weight(weight: torch.Tensor, group_size: int) -> torch.Tensor:
     """ConvRot weight rotation using the CUDA FHT kernel."""
-    output = torch.empty_like(weight_2d)
-    stream_ptr = torch.cuda.current_stream(weight_2d.device).cuda_stream
+    output = torch.empty_like(weight)
+    stream_ptr = torch.cuda.current_stream(weight.device).cuda_stream
     _C.rotate_int8_convrot_weight(
-        _wrap_for_dlpack(weight_2d),
+        _wrap_for_dlpack(weight),
         _wrap_for_dlpack(output),
         group_size,
         stream_ptr,
     )
     return output
+
+
+def quantize_w4a8_int8_weight(
+    weight: torch.Tensor,
+    group_size: int = 16,
+    convrot_groupsize: int = 256,
+    symmetric: bool = True,
+    scale_dtype: torch.dtype = torch.float8_e4m3fn,
+    codebook: bool = True,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Prepare W4A8 weights using native CUDA ConvRot and eager packing math."""
+    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize)
+    rotated = rotate_int8_convrot_weight(weight.contiguous(), convrot_groupsize)
+    return _quantize_rotated_w4a8_int8_weight(
+        rotated,
+        group_size=group_size,
+        symmetric=symmetric,
+        scale_dtype=scale_dtype,
+        codebook=codebook,
+    )
 
 
 def quantize_int8_convrot_staged(
@@ -1941,6 +1981,223 @@ def int8_linear(
         )
 
     return out if is_2d_output else out.reshape(*orig_shape[:-1], n)
+
+
+def dequantize_w4a8_int8_weight(
+    qdata: torch.Tensor,
+    s_rel: torch.Tensor,
+    s_channel: torch.Tensor,
+    codebook: torch.Tensor | None = None,
+    correction: torch.Tensor | None = None,
+    group_size: int = 16,
+    convrot_groupsize: int = 256,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize W4A8 weights with native CUDA decode and ConvRot operations."""
+    validate_w4a8_operands(
+        qdata,
+        s_rel,
+        s_channel,
+        codebook,
+        correction,
+        group_size,
+        convrot_groupsize,
+    )
+    qdata_arg = qdata.contiguous()
+    s_rel_arg = s_rel.contiguous()
+    codebook_arg = codebook.contiguous() if codebook is not None else None
+    n, k_half = qdata_arg.shape
+    int8_weight = torch.empty(n, k_half * 2, dtype=torch.int8, device=qdata.device)
+    stream_ptr = torch.cuda.current_stream(qdata.device).cuda_stream
+    wrapped_codebook = _wrap_for_dlpack(codebook_arg) if codebook_arg is not None else None
+    if s_rel_arg.dtype == torch.float8_e4m3fn:
+        _C.dequant_int4_grouped_to_int8_e4m3(
+            _wrap_for_dlpack(qdata_arg),
+            _wrap_for_dlpack(s_rel_arg.view(torch.uint8)),
+            wrapped_codebook,
+            _wrap_for_dlpack(int8_weight),
+            group_size,
+            stream_ptr,
+        )
+    else:
+        _C.dequant_int4_grouped_to_int8(
+            _wrap_for_dlpack(qdata_arg),
+            _wrap_for_dlpack(s_rel_arg),
+            wrapped_codebook,
+            _wrap_for_dlpack(int8_weight),
+            group_size,
+            stream_ptr,
+        )
+    weight_rotated = _dequantize_w4a8_int8_weight_from_int8(
+        int8_weight,
+        s_channel,
+        correction,
+        group_size,
+        output_dtype,
+    )
+    return rotate_int8_convrot_weight(weight_rotated.contiguous(), convrot_groupsize).to(output_dtype)
+
+
+def w4a8_int8_linear(
+    x: torch.Tensor,
+    qdata: torch.Tensor,
+    s_rel: torch.Tensor,
+    s_channel: torch.Tensor,
+    codebook: torch.Tensor | None = None,
+    correction: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    group_size: int = 16,
+    convrot_groupsize: int = 256,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """CUDA W4A8 linear using chunked INT4 decode and the tuned INT8 GEMM."""
+    validate_w4a8_operands(
+        qdata,
+        s_rel,
+        s_channel,
+        codebook,
+        correction,
+        group_size,
+        convrot_groupsize,
+    )
+    n, k_half = qdata.shape
+    k = k_half * 2
+    if x.shape[-1] != k:
+        raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={k}")
+    groups = k // group_size
+    x_2d = x.reshape(-1, k).contiguous()
+    m = x_2d.shape[0]
+    output_dtype_code = DTYPE_TO_CODE[out_dtype]
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+
+    def wrap_codebook():
+        return _wrap_for_dlpack(codebook) if codebook is not None else None
+
+    xq = torch.empty(m, k, dtype=torch.int8, device=x.device)
+    xs = torch.empty(m, 1, dtype=torch.float32, device=x.device)
+    out = torch.empty(m, n, dtype=out_dtype, device=x.device)
+    bias_float = bias.float().contiguous() if bias is not None else None
+
+    chunked = (
+        _W4A8_CHUNKED
+        and correction is None
+        and s_rel.dtype == torch.float8_e4m3fn
+    )
+    if chunked:
+        chunk_cols = _int4_int8_weight_chunk_cols(m, n)
+        workspace = torch.empty(
+            min(chunk_cols, n), k, dtype=torch.int8, device=x.device
+        )
+        if hasattr(_C, "w4a8_codebook_linear_chunked"):
+            used = _C.w4a8_codebook_linear_chunked(
+                _wrap_for_dlpack(x_2d),
+                _wrap_for_dlpack(xq),
+                _wrap_for_dlpack(xs),
+                _wrap_for_dlpack(qdata),
+                _wrap_for_dlpack(s_rel.view(torch.uint8)),
+                wrap_codebook(),
+                _wrap_for_dlpack(s_channel),
+                _wrap_for_dlpack(bias_float) if bias_float is not None else None,
+                _wrap_for_dlpack(workspace),
+                _wrap_for_dlpack(out),
+                convrot_groupsize,
+                group_size,
+                chunk_cols,
+                output_dtype_code,
+                stream_ptr,
+            )
+        else:
+            _C.quantize_int8_rowwise_convrot(
+                _wrap_for_dlpack(x_2d),
+                _wrap_for_dlpack(xq),
+                _wrap_for_dlpack(xs),
+                convrot_groupsize,
+                False,
+                0,
+                stream_ptr,
+            )
+            used = _C.w4a8_codebook_gemm_chunked(
+                _wrap_for_dlpack(xq),
+                _wrap_for_dlpack(qdata),
+                _wrap_for_dlpack(s_rel.view(torch.uint8)),
+                wrap_codebook(),
+                _wrap_for_dlpack(s_channel),
+                _wrap_for_dlpack(xs.reshape(m)),
+                _wrap_for_dlpack(bias_float) if bias_float is not None else None,
+                _wrap_for_dlpack(workspace),
+                _wrap_for_dlpack(out),
+                group_size,
+                chunk_cols,
+                output_dtype_code,
+                stream_ptr,
+            )
+        if used:
+            return out.reshape(*x.shape[:-1], n)
+    else:
+        _C.quantize_int8_rowwise_convrot(
+            _wrap_for_dlpack(x_2d),
+            _wrap_for_dlpack(xq),
+            _wrap_for_dlpack(xs),
+            convrot_groupsize,
+            False,
+            0,
+            stream_ptr,
+        )
+
+    int8_weight = torch.empty(n, k, dtype=torch.int8, device=x.device)
+    if s_rel.dtype == torch.float8_e4m3fn:
+        _C.dequant_int4_grouped_to_int8_e4m3(
+            _wrap_for_dlpack(qdata),
+            _wrap_for_dlpack(s_rel.view(torch.uint8)),
+            wrap_codebook(),
+            _wrap_for_dlpack(int8_weight),
+            group_size,
+            stream_ptr,
+        )
+    else:
+        _C.dequant_int4_grouped_to_int8(
+            _wrap_for_dlpack(qdata),
+            _wrap_for_dlpack(s_rel),
+            wrap_codebook(),
+            _wrap_for_dlpack(int8_weight),
+            group_size,
+            stream_ptr,
+        )
+
+    bias_arg = (
+        bias_float
+        if bias_float is not None
+        else _empty_cuda_tensor(x.device, torch.float32)
+    )
+    used = _C.cutlass_int8_dequant(
+        _wrap_for_dlpack(xq),
+        _wrap_for_dlpack(int8_weight),
+        _wrap_for_dlpack(xs),
+        _wrap_for_dlpack(s_channel),
+        _wrap_for_dlpack(bias_arg),
+        _wrap_for_dlpack(out),
+        output_dtype_code,
+        stream_ptr,
+    )
+    if not used:
+        return eager_w4a8_int8_linear(
+            x,
+            qdata,
+            s_rel,
+            s_channel,
+            codebook=codebook,
+            correction=correction,
+            bias=bias,
+            group_size=group_size,
+            convrot_groupsize=convrot_groupsize,
+            out_dtype=out_dtype,
+        )
+
+    if correction is not None:
+        sx = xq.view(m, groups, group_size).sum(-1, dtype=torch.int32).to(out_dtype)
+        sx = sx * xs.to(out_dtype)
+        out.addmm_(sx, correction.to(out_dtype))
+    return out.reshape(*x.shape[:-1], n)
 
 
 def _adaln_impl(kernel, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float):
@@ -2897,6 +3154,99 @@ def _build_constraints() -> dict:
                 "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=cuda_devices,
+        ),
+        "rotate_int8_convrot_weight": FunctionConstraints(
+            params={
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+            },
+            default_devices=cuda_devices,
+        ),
+        "quantize_w4a8_int8_weight": FunctionConstraints(
+            params={
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "symmetric": ParamConstraint(dtypes=frozenset({bool})),
+                "scale_dtype": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn, torch.float32})),
+                "codebook": ParamConstraint(dtypes=frozenset({bool})),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
+        ),
+        "dequantize_w4a8_int8_weight": FunctionConstraints(
+            params={
+                "qdata": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "s_rel": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn, torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "s_channel": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(1),),
+                ),
+                "codebook": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(1),),
+                ),
+                "correction": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "output_dtype": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
+        ),
+        "w4a8_int8_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+                "qdata": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "s_rel": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn, torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "s_channel": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(1),),
+                ),
+                "codebook": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(1),),
+                ),
+                "correction": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "bias": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "out_dtype": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
         ),
         "dequantize_int8_convrot_weight": FunctionConstraints(
             params={

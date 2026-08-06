@@ -10,6 +10,12 @@ import torch
 
 import triton
 import triton.language as tl
+from comfy_kitchen.backends.eager.w4a8_int8 import (
+    validate_w4a8_operands,
+)
+from comfy_kitchen.backends.eager.w4a8_int8 import (
+    w4a8_int8_linear as eager_w4a8_int8_linear,
+)
 from triton.language.extra import libdevice
 
 from .quantization import int8_linear
@@ -96,12 +102,40 @@ def w4a8_int8_linear(
     s_rel: torch.Tensor,
     s_channel: torch.Tensor,
     codebook: torch.Tensor | None = None,
+    correction: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """``x @ W.T + bias`` for AsymW4A8Int8 via the fused Triton dequant + INT8 GEMM."""
+    validate_w4a8_operands(
+        qdata,
+        s_rel,
+        s_channel,
+        codebook,
+        correction,
+        group_size,
+        convrot_groupsize,
+    )
+    if x.shape[-1] != qdata.shape[-1] * 2:
+        raise ValueError(
+            f"Input K={x.shape[-1]} does not match qdata K={qdata.shape[-1] * 2}"
+        )
+    if correction is not None:
+        return eager_w4a8_int8_linear(
+            x,
+            qdata,
+            s_rel,
+            s_channel,
+            codebook=codebook,
+            correction=correction,
+            bias=bias,
+            group_size=group_size,
+            convrot_groupsize=convrot_groupsize,
+            out_dtype=out_dtype,
+        )
+
     int8_w = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
     return int8_linear(
         x, int8_w, s_channel, bias=bias, out_dtype=out_dtype,
