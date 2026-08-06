@@ -225,11 +225,10 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
 // ---------------------------------------------------------------------------
 
 // WGPs on the calling device, cached per ordinal so the query stays off the
-// launch path. hipDeviceAttributeMultiprocessorCount reports workgroup
-// processors on RDNA (a WGP is two CUs; 32 on a 64-CU gfx1201), and a workgroup
-// schedules onto a WGP, so this is the right unit for the grid-coverage test
-// below. The fallback (16 WGPs, a mid-size part) only mis-sizes that test,
-// never a result.
+// launch path. hipDeviceAttributeMultiprocessorCount reports WGPs on RDNA, not
+// CUs (32 on a 64-CU gfx1201), and a workgroup schedules onto a WGP, so that is
+// the unit the grid-coverage test below needs. The fallback (16, a mid-size
+// part) only mis-sizes that test, never a result.
 inline int device_wgp_count() {
     constexpr int kMaxDevices = 16;
     // Atomic because a GEMM can be launched from several host threads at once.
@@ -271,10 +270,10 @@ void launch_gemm_wmma(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N,
 
     const int wgps = device_wgp_count();
 
-    // A block tile taller than M or wider than N burns MMAs on zero padding the
+    // A tile taller than M or wider than N burns MMAs on zero padding that the
     // grid-coverage test cannot see: at M <= 64 the 128-row tile is at least
-    // half empty, and the 64x64 tile's finer grid recovers the waste (+2-12%
-    // across skinny shapes on gfx1201, none slower).
+    // half empty. The 64x64 tile's finer grid recovers the waste (+2-12% on
+    // gfx1201).
     const bool skinny = (M <= 64 || N <= 64);
 
     if (!skinny && blocks_128 >= wgps) {
