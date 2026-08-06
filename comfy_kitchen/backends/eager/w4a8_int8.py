@@ -8,6 +8,30 @@ import torch
 
 from .quantization import int8_linear, rotate_int8_convrot_weight
 
+# Lloyd-Max-optimal 16 levels for a group-normalized Gaussian. ConvRot makes every layer's
+# rotated groups Gaussian, so this one table matches a per-tensor fit and skips the k-means.
+_FIXED_LUT = (
+    -0.980602, -0.794529, -0.638165, -0.500986, -0.377321, -0.263187, -0.155210, -0.050720,
+    0.052541, 0.156985, 0.265284, 0.379533, 0.502636, 0.638953, 0.794876, 0.980671,
+)
+# Fit per-tensor instead when the rotated groups stay heavy-tailed. Gaussian layers sit near
+# -0.5; the threshold only trips on genuinely non-Gaussian ones (real models never do).
+_W4A8_GATE_KURTOSIS = -0.1
+_KURTOSIS_SAMPLE = 1 << 19
+
+
+def _codebook_for(normalized: torch.Tensor) -> torch.Tensor:
+    """Frozen LUT unless the group-normalized rotated weight is heavy-tailed, then fit."""
+    x = normalized.detach().flatten()
+    if x.numel() > _KURTOSIS_SAMPLE:
+        gen = torch.Generator(device=x.device).manual_seed(0)
+        x = x[torch.randint(0, x.numel(), (_KURTOSIS_SAMPLE,), device=x.device, generator=gen)]
+    x = x.float()
+    excess_kurtosis = ((x - x.mean()) / (x.std() + 1e-9)).pow(4).mean() - 3.0
+    if excess_kurtosis.item() <= _W4A8_GATE_KURTOSIS:
+        return torch.tensor(_FIXED_LUT, device=normalized.device, dtype=torch.float32)
+    return _fit_codebook(normalized)
+
 
 def _assign_codes(normalized: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
     """Find nearest codebook indices without a trailing 16-wide temporary."""
@@ -101,6 +125,7 @@ def _quantize_rotated_w4a8_int8_weight(
     symmetric: bool = True,
     scale_dtype: torch.dtype = torch.float8_e4m3fn,
     codebook: bool = True,
+    codebook_override: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -108,7 +133,11 @@ def _quantize_rotated_w4a8_int8_weight(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Quantize an already ConvRot-rotated weight into W4A8 storage."""
+    """Quantize an already ConvRot-rotated weight into W4A8 storage.
+
+    ``codebook_override`` lets a chunked caller pin the same table across chunks; when None
+    it is chosen from this (sub)tensor via _codebook_for.
+    """
     if scale_dtype not in (torch.float32, torch.float8_e4m3fn):
         raise ValueError(f"scale_dtype must be float32 or float8_e4m3fn, got {scale_dtype}")
 
@@ -121,7 +150,11 @@ def _quantize_rotated_w4a8_int8_weight(
     if symmetric and codebook:
         group_scale = grouped_weight.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
         normalized = grouped_weight / group_scale
-        codebook_tensor = _fit_codebook(normalized)
+        codebook_tensor = (
+            codebook_override
+            if codebook_override is not None
+            else _codebook_for(normalized)
+        )
         quantized = _assign_codes(normalized, codebook_tensor)
         for _ in range(3):
             quantized_codebook = codebook_tensor[quantized]
@@ -176,6 +209,87 @@ def _quantize_rotated_w4a8_int8_weight(
     )
 
 
+# Rows to rotate+pack per chunk: caps the fp32 working set that otherwise scales with the
+# whole tensor and OOMs on large layers (e.g. the LoRA requantize path).
+_QUANT_ROW_ELEM_BUDGET = 1 << 22  # ~4M elems/chunk
+_QUANT_MIN_ROWS = 256
+
+
+def _quantize_w4a8_chunked(
+    weight: torch.Tensor,
+    rotate_fn,
+    group_size: int,
+    convrot_groupsize: int,
+    symmetric: bool,
+    scale_dtype: torch.dtype,
+    codebook: bool,
+    codebook_override: torch.Tensor | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Rotate and pack a weight in row chunks to cap peak memory.
+
+    Row math is independent, so this is bit-identical to the whole-tensor path. The codebook
+    is decided once and shared across chunks to keep the table consistent; a caller-supplied
+    ``codebook_override`` reuses a prior table and skips the decision entirely.
+    """
+    n, k = weight.shape
+    block = max(_QUANT_MIN_ROWS, _QUANT_ROW_ELEM_BUDGET // max(k, 1))
+    override = None
+    if symmetric and codebook:
+        if codebook_override is not None:
+            override = codebook_override.to(device=weight.device, dtype=torch.float32)
+        elif n > block:
+            rot_sample = rotate_fn(weight[:block].contiguous(), convrot_groupsize)
+            grouped = rot_sample.float().view(block, k // group_size, group_size)
+            normalized = grouped / grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+            override = _codebook_for(normalized)
+            del rot_sample, grouped, normalized
+
+    if n <= block:
+        return _quantize_rotated_w4a8_int8_weight(
+            rotate_fn(weight.contiguous(), convrot_groupsize),
+            group_size=group_size,
+            symmetric=symmetric,
+            scale_dtype=scale_dtype,
+            codebook=codebook,
+            codebook_override=override,
+        )
+
+    packed_parts, srel_parts, sch_parts, corr_parts = [], [], [], []
+    codebook_tensor = None
+    for r0 in range(0, n, block):
+        rot = rotate_fn(weight[r0 : r0 + block].contiguous(), convrot_groupsize)
+        packed, s_rel, s_channel, correction, codebook_tensor = (
+            _quantize_rotated_w4a8_int8_weight(
+                rot,
+                group_size=group_size,
+                symmetric=symmetric,
+                scale_dtype=scale_dtype,
+                codebook=codebook,
+                codebook_override=override,
+            )
+        )
+        packed_parts.append(packed)
+        srel_parts.append(s_rel)
+        sch_parts.append(s_channel)
+        if correction is not None:
+            corr_parts.append(correction)
+        del rot
+
+    return (
+        torch.cat(packed_parts, dim=0),
+        torch.cat(srel_parts, dim=0),
+        torch.cat(sch_parts, dim=0),
+        torch.cat(corr_parts, dim=1) if corr_parts else None,
+        codebook_tensor,
+    )
+
+
 def quantize_w4a8_int8_weight(
     weight: torch.Tensor,
     group_size: int = 16,
@@ -183,6 +297,7 @@ def quantize_w4a8_int8_weight(
     symmetric: bool = True,
     scale_dtype: torch.dtype = torch.float8_e4m3fn,
     codebook: bool = True,
+    codebook_tensor: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -192,13 +307,15 @@ def quantize_w4a8_int8_weight(
 ]:
     """Rotate and prepare a floating weight for grouped W4A8 storage."""
     validate_w4a8_weight_shape(weight, group_size, convrot_groupsize)
-    rotated = rotate_int8_convrot_weight(weight, convrot_groupsize)
-    return _quantize_rotated_w4a8_int8_weight(
-        rotated,
+    return _quantize_w4a8_chunked(
+        weight,
+        rotate_int8_convrot_weight,
         group_size=group_size,
+        convrot_groupsize=convrot_groupsize,
         symmetric=symmetric,
         scale_dtype=scale_dtype,
         codebook=codebook,
+        codebook_override=codebook_tensor,
     )
 
 

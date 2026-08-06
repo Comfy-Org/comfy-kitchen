@@ -174,7 +174,7 @@ from comfy_kitchen.backends.eager.svdquant import (  # noqa: E402
 )
 from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     _dequantize_w4a8_int8_weight_from_int8,
-    _quantize_rotated_w4a8_int8_weight,
+    _quantize_w4a8_chunked,
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
@@ -1358,6 +1358,7 @@ def quantize_w4a8_int8_weight(
     symmetric: bool = True,
     scale_dtype: torch.dtype = torch.float8_e4m3fn,
     codebook: bool = True,
+    codebook_tensor: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1367,13 +1368,15 @@ def quantize_w4a8_int8_weight(
 ]:
     """Prepare W4A8 weights using native CUDA ConvRot and eager packing math."""
     validate_w4a8_weight_shape(weight, group_size, convrot_groupsize)
-    rotated = rotate_int8_convrot_weight(weight.contiguous(), convrot_groupsize)
-    return _quantize_rotated_w4a8_int8_weight(
-        rotated,
+    return _quantize_w4a8_chunked(
+        weight,
+        rotate_int8_convrot_weight,
         group_size=group_size,
+        convrot_groupsize=convrot_groupsize,
         symmetric=symmetric,
         scale_dtype=scale_dtype,
         codebook=codebook,
+        codebook_override=codebook_tensor,
     )
 
 

@@ -33,6 +33,7 @@ def quantize_w4a8_int8_weight(
     symmetric: bool = True,
     scale_dtype: torch.dtype = torch.float8_e4m3fn,
     codebook: bool = True,
+    codebook_tensor: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -40,7 +41,11 @@ def quantize_w4a8_int8_weight(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Rotate and prepare a floating weight for grouped W4A8 storage."""
+    """Rotate and prepare a floating weight for grouped W4A8 storage.
+
+    ``codebook_tensor`` reuses a previously decided table (e.g. on LoRA requantize) so the
+    codebook decision -- kurtosis probe and any k-means -- is skipped.
+    """
     if scale_dtype not in (torch.float32, torch.float8_e4m3fn):
         raise ValueError(f"scale_dtype must be float32 or float8_e4m3fn, got {scale_dtype}")
     kwargs = {
@@ -50,6 +55,7 @@ def quantize_w4a8_int8_weight(
         "symmetric": symmetric,
         "scale_dtype": scale_dtype,
         "codebook": codebook,
+        "codebook_tensor": codebook_tensor,
     }
     impl = registry.get_implementation("quantize_w4a8_int8_weight", kwargs=kwargs)
     return impl(**kwargs)
@@ -178,6 +184,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         symmetric: bool = True,
         scale_dtype: torch.dtype = torch.float8_e4m3fn,
         codebook: bool = True,
+        codebook_tensor: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, Params]:
         qdata, s_rel, s_channel, correction, codebook_tensor = quantize_w4a8_int8_weight(
@@ -187,6 +194,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             symmetric=symmetric,
             scale_dtype=scale_dtype,
             codebook=codebook,
+            codebook_tensor=codebook_tensor,
         )
         params = cls.Params(
             scale=s_rel,
@@ -254,6 +262,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             "convrot_groupsize": params.convrot_groupsize,
             "symmetric": params.correction is None,
             "codebook": params.codebook is not None,
+            "codebook_tensor": params.codebook,
             "scale_dtype": params.scale.dtype,
         }
 
