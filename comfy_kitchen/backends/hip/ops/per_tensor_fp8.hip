@@ -28,16 +28,6 @@ struct alignas(16) VecChunk {
 };
 
 template<typename T>
-__forceinline__ __device__ void store_value(void* dst, int64_t idx, float value) {
-    reinterpret_cast<T*>(dst)[idx] = static_cast<T>(value);
-}
-
-template<>
-__forceinline__ __device__ void store_value<__half>(void* dst, int64_t idx, float value) {
-    reinterpret_cast<__half*>(dst)[idx] = __float2half(value);
-}
-
-template<typename T>
 __forceinline__ __device__ T from_float_as(float value) {
     return static_cast<T>(value);
 }
@@ -45,6 +35,13 @@ __forceinline__ __device__ T from_float_as(float value) {
 template<>
 __forceinline__ __device__ __half from_float_as<__half>(float value) {
     return __float2half(value);
+}
+
+// Delegates so the vectorized body and the scalar tail of one kernel cannot
+// drift onto different float->T conversions.
+template<typename T>
+__forceinline__ __device__ void store_value(void* dst, int64_t idx, float value) {
+    reinterpret_cast<T*>(dst)[idx] = from_float_as<T>(value);
 }
 
 template<typename InputType>
