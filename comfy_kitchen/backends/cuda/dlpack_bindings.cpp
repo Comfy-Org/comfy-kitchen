@@ -1169,6 +1169,19 @@ extern "C" {
         int64_t G,
         cudaStream_t stream);
 
+    void launch_quantize_w4a8_convrot(
+        const void* rotated,
+        const void* codebook,
+        void* packed,
+        void* s_rel,
+        void* s_channel,
+        int64_t N,
+        int64_t K,
+        int in_dtype_code,
+        bool stochastic,
+        uint64_t seed,
+        cudaStream_t stream);
+
     bool launch_w4a8_codebook_gemm_chunked(
         const void* xq,
         const void* weight,
@@ -1966,6 +1979,35 @@ void dequant_int4_grouped_to_int8_e4m3(
     launch_dequant_int4_grouped_to_int8_e4m3(qw.data(), s_rel.data(), cb, out.data(), N, K, G, stream);
 }
 
+// Fused W4A8 requantize (group_size=16): rotated weight [N,K] -> packed int4
+// [N,K/2] + fp8-e4m3 s_rel [N,K/16] + f32 s_channel [N] in one launch.
+void quantize_w4a8_convrot(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> rotated,          // [N, K] fp32/fp16/bf16
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> codebook,  // [16]
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> packed,   // [N, K/2]
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> s_rel,   // [N, K/16] e4m3 bits
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> s_channel, // [N]
+    bool stochastic, uint64_t seed, uintptr_t stream_ptr) {
+    const int64_t N = rotated.shape(0);
+    const int64_t K = rotated.shape(1);
+    const int in_code = map_dtype_to_code(rotated.dtype());
+    if (in_code < 0 || in_code > 2)
+        throw std::runtime_error("quantize_w4a8_convrot: rotated must be fp32/fp16/bf16");
+    if (K % 16 != 0) throw std::runtime_error("quantize_w4a8_convrot: K must be a multiple of 16");
+    if (static_cast<int64_t>(packed.shape(0)) != N || static_cast<int64_t>(packed.shape(1)) != K / 2)
+        throw std::runtime_error("quantize_w4a8_convrot: packed must be [N, K/2]");
+    if (static_cast<int64_t>(s_rel.shape(0)) != N || static_cast<int64_t>(s_rel.shape(1)) != K / 16)
+        throw std::runtime_error("quantize_w4a8_convrot: s_rel must be [N, K/16]");
+    if (static_cast<int64_t>(s_channel.shape(0)) != N)
+        throw std::runtime_error("quantize_w4a8_convrot: s_channel must be [N]");
+    if (static_cast<int64_t>(codebook.shape(0)) != 16)
+        throw std::runtime_error("quantize_w4a8_convrot: codebook must be [16]");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quantize_w4a8_convrot(
+        rotated.data(), codebook.data(), packed.data(), s_rel.data(), s_channel.data(),
+        N, K, in_code, stochastic, seed, stream);
+}
+
 static void validate_w4a8_codebook_gemm_contract(
     int64_t M, int64_t N, int64_t K,
     int64_t weight_khalf,
@@ -2753,6 +2795,11 @@ NB_MODULE(_C, m) {
           "Grouped int4 -> int8 dequant with fp8 e4m3 per-group scale; optional 16-entry codebook",
           nb::arg("qw"), nb::arg("s_rel"), nb::arg("codebook").none(), nb::arg("out"),
           nb::arg("g"), nb::arg("stream_ptr"));
+
+    m.def("quantize_w4a8_convrot", &quantize_w4a8_convrot,
+          "Fused W4A8 requant (group_size=16): rotated weight -> packed int4 + fp8 s_rel + f32 s_channel",
+          nb::arg("rotated"), nb::arg("codebook"), nb::arg("packed"), nb::arg("s_rel"),
+          nb::arg("s_channel"), nb::arg("stochastic"), nb::arg("seed"), nb::arg("stream_ptr"));
 
     m.def("w4a8_codebook_gemm_chunked", &w4a8_codebook_gemm_chunked,
           "Chunked fused W4A8: per-chunk codebook+s_rel dequant -> L2-hot int8 -> strided int8 GEMM",

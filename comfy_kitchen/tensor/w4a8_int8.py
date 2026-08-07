@@ -34,6 +34,7 @@ def quantize_w4a8_int8_weight(
     scale_dtype: torch.dtype = torch.float8_e4m3fn,
     codebook: bool = True,
     codebook_tensor: torch.Tensor | None = None,
+    stochastic_rounding: int = 0,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -44,7 +45,9 @@ def quantize_w4a8_int8_weight(
     """Rotate and prepare a floating weight for grouped W4A8 storage.
 
     ``codebook_tensor`` reuses a previously decided table (e.g. on LoRA requantize) so the
-    codebook decision -- kurtosis probe and any k-means -- is skipped.
+    codebook decision -- kurtosis probe and any k-means -- is skipped. ``stochastic_rounding``
+    > 0 seeds stochastic rounding of the level assignment so a merged LoRA below the int4 step
+    is preserved instead of rounded away.
     """
     if scale_dtype not in (torch.float32, torch.float8_e4m3fn):
         raise ValueError(f"scale_dtype must be float32 or float8_e4m3fn, got {scale_dtype}")
@@ -56,6 +59,7 @@ def quantize_w4a8_int8_weight(
         "scale_dtype": scale_dtype,
         "codebook": codebook,
         "codebook_tensor": codebook_tensor,
+        "stochastic_rounding": stochastic_rounding,
     }
     impl = registry.get_implementation("quantize_w4a8_int8_weight", kwargs=kwargs)
     return impl(**kwargs)
@@ -185,6 +189,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         scale_dtype: torch.dtype = torch.float8_e4m3fn,
         codebook: bool = True,
         codebook_tensor: torch.Tensor | None = None,
+        stochastic_rounding: int = 0,
         **kwargs,
     ) -> tuple[torch.Tensor, Params]:
         qdata, s_rel, s_channel, correction, codebook_tensor = quantize_w4a8_int8_weight(
@@ -195,6 +200,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             scale_dtype=scale_dtype,
             codebook=codebook,
             codebook_tensor=codebook_tensor,
+            stochastic_rounding=stochastic_rounding,
         )
         params = cls.Params(
             scale=s_rel,
