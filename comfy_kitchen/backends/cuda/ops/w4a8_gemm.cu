@@ -305,12 +305,20 @@ __global__ void quantize_w4a8_convrot_kernel(
 }  // namespace
 
 // rotated: [N,K] in in_dtype (0=fp32,1=fp16,2=bf16); s_rel: [N,K/16] e4m3 bits (uint8).
-extern "C" void launch_quantize_w4a8_convrot(
+// Returns false (caller must fall back / raise) if the group-scale shared memory won't fit
+// or the launch is rejected, so uninitialized outputs are never mistaken for a result.
+extern "C" bool launch_quantize_w4a8_convrot(
     const void* rotated, const void* codebook, void* packed, void* s_rel, void* s_channel,
     int64_t N, int64_t K, int in_dtype_code, bool stochastic, uint64_t seed, cudaStream_t stream)
 {
     const int threads = 256;
     const size_t shmem = static_cast<size_t>(K / 16) * sizeof(float);
+    // Static shared is cb[16] + warp_max[32] = 192 bytes; bail if static+dynamic won't fit.
+    int dev = 0, max_shmem = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (cudaDeviceGetAttribute(&max_shmem, cudaDevAttrMaxSharedMemoryPerBlock, dev) != cudaSuccess)
+        return false;
+    if (shmem + 192 > static_cast<size_t>(max_shmem)) return false;
     dim3 grid(static_cast<unsigned>(N));
 #define RQ_LAUNCH(IT)                                                                              \
     do {                                                                                           \
@@ -329,4 +337,5 @@ extern "C" void launch_quantize_w4a8_convrot(
     else if (in_dtype_code == 1) RQ_LAUNCH(__half);
     else RQ_LAUNCH(__nv_bfloat16);
 #undef RQ_LAUNCH
+    return cudaGetLastError() == cudaSuccess;
 }

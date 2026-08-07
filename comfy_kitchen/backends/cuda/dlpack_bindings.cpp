@@ -1169,7 +1169,7 @@ extern "C" {
         int64_t G,
         cudaStream_t stream);
 
-    void launch_quantize_w4a8_convrot(
+    bool launch_quantize_w4a8_convrot(
         const void* rotated,
         const void* codebook,
         void* packed,
@@ -1993,6 +1993,7 @@ void quantize_w4a8_convrot(
     const int in_code = map_dtype_to_code(rotated.dtype());
     if (in_code < 0 || in_code > 2)
         throw std::runtime_error("quantize_w4a8_convrot: rotated must be fp32/fp16/bf16");
+    if (N <= 0) throw std::runtime_error("quantize_w4a8_convrot: N must be positive");
     if (K % 16 != 0) throw std::runtime_error("quantize_w4a8_convrot: K must be a multiple of 16");
     if (static_cast<int64_t>(packed.shape(0)) != N || static_cast<int64_t>(packed.shape(1)) != K / 2)
         throw std::runtime_error("quantize_w4a8_convrot: packed must be [N, K/2]");
@@ -2003,9 +2004,12 @@ void quantize_w4a8_convrot(
     if (static_cast<int64_t>(codebook.shape(0)) != 16)
         throw std::runtime_error("quantize_w4a8_convrot: codebook must be [16]");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    launch_quantize_w4a8_convrot(
-        rotated.data(), codebook.data(), packed.data(), s_rel.data(), s_channel.data(),
-        N, K, in_code, stochastic, seed, stream);
+    if (!launch_quantize_w4a8_convrot(
+            rotated.data(), codebook.data(), packed.data(), s_rel.data(), s_channel.data(),
+            N, K, in_code, stochastic, seed, stream))
+        throw std::runtime_error(
+            "quantize_w4a8_convrot: launch failed (group scales exceed shared memory, or "
+            "invalid launch config)");
 }
 
 static void validate_w4a8_codebook_gemm_contract(
