@@ -63,16 +63,26 @@ def hip():
     return hip_backend
 
 
-# Covers each tile path: GEMV (M <= 8), 64x64, 128x128 and 256x128 (K > N), plus
-# sizes that are not multiples of the macro tile.
+# Covers each tile path on 16-48 WGP parts: GEMV (M <= 8), skinny
+# (M or N <= 64), and 64x64/128x128 at both K depths including both deep-K warp
+# grids. Sizes include non-multiples of the macro tile, and K=2064/4112 are
+# multiples of 16 but not of BKB=128 to hit its K tail. Which shape lands on
+# which branch depends on the device's WGP count.
 GEMM_SHAPES = [
     (1, 256, 256),
     (8, 512, 256),
     (17, 256, 512),
+    (64, 512, 2064),
     (128, 512, 256),
+    (256, 48, 512),
+    (300, 300, 2064),
     (333, 1152, 1152),
     (512, 256, 1024),
+    (512, 512, 4112),
+    (1024, 512, 4112),
+    (1024, 1024, 4112),
     (1024, 2048, 512),
+    (2048, 2048, 4112),
 ]
 
 

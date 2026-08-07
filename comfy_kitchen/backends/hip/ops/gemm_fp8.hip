@@ -56,26 +56,7 @@ static void launch_fp8(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N
         gemv_fp8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, epi);
         return;
     }
-    // A 256x128 block reads (256+128)*K bytes per output tile against
-    // (128+128)*K for 128x128, i.e. 25% less global traffic per output. Selected
-    // for deep-K shapes, which are bandwidth bound; wide-N shapes have enough
-    // reuse and prefer the larger grid of the squarer tile.
-    if (M >= 512 && N >= 128 && K > N) {
-        constexpr int BM = 256, BN = 128, BKB = 64;
-        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-        gemm_wmma_kernel<MmaFp8, EpiTensorwise, OutT, BM, BN, BKB, 4, 2, 4, 4>
-            <<<grid, 256, 0, stream>>>(A, B, C, M, N, K, N, epi);
-    } else if (M >= 96 && N >= 96) {
-        constexpr int BM = 128, BN = 128, BKB = 64;
-        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-        gemm_wmma_kernel<MmaFp8, EpiTensorwise, OutT, BM, BN, BKB, 4, 2, 2, 4>
-            <<<grid, 256, 0, stream>>>(A, B, C, M, N, K, N, epi);
-    } else {
-        constexpr int BM = 64, BN = 64, BKB = 64;
-        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-        gemm_wmma_kernel<MmaFp8, EpiTensorwise, OutT, BM, BN, BKB, 2, 2, 2, 2>
-            <<<grid, 128, 0, stream>>>(A, B, C, M, N, K, N, epi);
-    }
+    launch_gemm_wmma<MmaFp8, EpiTensorwise, OutT>(A, B, C, M, N, K, N, epi, stream);
 }
 
 }  // namespace comfy::hip_backend
