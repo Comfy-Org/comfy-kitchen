@@ -32,14 +32,19 @@ from comfy_kitchen.backends._activations import input_act_width as _input_act_wi
 from comfy_kitchen.backends.eager import rope as _eager_rope
 from comfy_kitchen.backends.eager.quantization import DTYPE_CODE_TO_DTYPE, DTYPE_TO_CODE
 from comfy_kitchen.backends.eager.w4a8_int8 import (
+    _QUANT_ROW_ELEM_BUDGET,
+    _decide_codebook,
     _dequantize_w4a8_int8_weight_from_int8,
+    _quantize_w4a8_chunked,
     validate_w4a8_operands,
+    validate_w4a8_weight_shape,
 )
 
 logger = logging.getLogger("comfy_kitchen.hip")
 
 __all__ = [
     "adaln",
+    "na3d",
     "rms_adaln",
     "gemv_awq_w4a16",
     "quantize_svdquant_w4a4",
@@ -67,6 +72,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_int8_tensorwise",
     "quantize_per_tensor_fp8",
+    "quantize_w4a8_int8_weight",
     "rms_rope",
     "rms_rope_",
     "rms_rope1",
@@ -156,6 +162,7 @@ _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 # which gates on has_wmma() itself rather than through the registry.
 _WMMA_ONLY_OPS = frozenset({
     "int8_linear",
+    "na3d",
     "convrot_w4a4_linear",
     "scaled_mm_svdquant_w4a4",
     "w4a8_int8_linear",
@@ -819,6 +826,118 @@ def _w4a8_int8_linear_chunked(
     return out.reshape(*orig_shape[:-1], n)
 
 
+# Keyed by device: the fused requantize holds one float per 16-wide group in LDS,
+# so the widest K it can take is a property of whichever card the weight lives on.
+_w4a8_requant_max_k: dict[int, int] = {}
+
+
+def _requant_supported(k: int, device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether the fused requantize can take a row of this width on ``device``.
+
+    The budget is read for the weight's own device rather than the process-current
+    one, so a multi-GPU process asks the card the kernel will actually launch on.
+    """
+    if not _EXT_AVAILABLE or k % 16 != 0:
+        return False
+    if dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        return False
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    max_k = _w4a8_requant_max_k.get(index)
+    if max_k is None:
+        with torch.cuda.device(index):
+            max_k = _C.w4a8_requant_max_k()
+        _w4a8_requant_max_k[index] = max_k
+    return max_k > 0 and k <= max_k
+
+
+def _fused_quantize_w4a8(
+    weight: torch.Tensor,
+    codebook: torch.Tensor,
+    convrot_groupsize: int,
+    stochastic_rounding: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, torch.Tensor]:
+    """Rotate and requantize a row block at a time, so no whole rotated copy is held.
+
+    Every output is per-row and the kernel reduces only within a row, so a block
+    writes straight into its own output slices.
+    """
+    n, k = weight.shape
+    cb = codebook.to(device=weight.device, dtype=torch.float32).contiguous()
+    packed = torch.empty(n, k // 2, dtype=torch.int8, device=weight.device)
+    s_rel = torch.empty(n, k // 16, dtype=torch.float8_e4m3fn, device=weight.device)
+    s_channel = torch.empty(n, dtype=torch.float32, device=weight.device)
+    block = max(1, _QUANT_ROW_ELEM_BUDGET // max(k, 1))
+    for r0 in range(0, n, block):
+        r1 = min(r0 + block, n)
+        rot = _eager.rotate_int8_convrot_weight(weight[r0:r1].contiguous(), convrot_groupsize)
+        # Offset the seed by the row start so blocks decorrelate but a fixed block
+        # size still reproduces.
+        seed = stochastic_rounding + r0 if stochastic_rounding > 0 else 0
+        _C.quantize_w4a8_convrot(
+            _dl(rot.contiguous()),
+            _dl(cb),
+            _dl(packed[r0:r1]),
+            _dl(s_rel[r0:r1].view(torch.uint8)),
+            _dl(s_channel[r0:r1]),
+            r1 - r0,
+            k,
+            stochastic_rounding > 0,
+            seed,
+            _stream(weight),
+        )
+        del rot
+    return packed, s_rel, s_channel, None, cb
+
+
+def quantize_w4a8_int8_weight(
+    weight: torch.Tensor,
+    group_size: int = 16,
+    convrot_groupsize: int = 256,
+    symmetric: bool = True,
+    scale_dtype: torch.dtype = torch.float8_e4m3fn,
+    codebook: bool = True,
+    codebook_tensor: torch.Tensor | None = None,
+    stochastic_rounding: int = 0,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Prepare W4A8 weights with the fused HIP requantize and eager ConvRot."""
+    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize)
+    # The fused kernel covers the default codebook layout only. Asymmetric, uniform,
+    # fp32-scale and other group sizes stay on the chunked eager path.
+    if (
+        symmetric
+        and codebook
+        and group_size == 16
+        and scale_dtype == torch.float8_e4m3fn
+        and _requant_supported(weight.shape[1], weight.device, weight.dtype)
+    ):
+        cb = (
+            codebook_tensor
+            if codebook_tensor is not None
+            else _decide_codebook(
+                weight, _eager.rotate_int8_convrot_weight, group_size, convrot_groupsize
+            )
+        )
+        return _fused_quantize_w4a8(weight, cb, convrot_groupsize, stochastic_rounding)
+    return _quantize_w4a8_chunked(
+        weight,
+        _eager.rotate_int8_convrot_weight,
+        group_size,
+        convrot_groupsize,
+        symmetric=symmetric,
+        scale_dtype=scale_dtype,
+        codebook=codebook,
+        codebook_override=codebook_tensor,
+        stochastic_rounding=stochastic_rounding,
+    )
+
+
 def dequantize_w4a8_int8_weight(
     qdata: torch.Tensor,
     s_rel: torch.Tensor,
@@ -1182,6 +1301,54 @@ def scaled_mm_svdquant_w4a4(
 # Normalization and positional encoding
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Neighborhood attention
+# ---------------------------------------------------------------------------
+
+
+def na3d(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kernel_size: Sequence[int],
+    is_causal: Sequence[bool] | None = None,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Fused 3D neighborhood attention (NATTEN ``na3d`` semantics) over
+    ``(B, T, H, W, NH, HD)`` tensors, on WMMA. See ops/na3d.hip."""
+    causal = (False, False, False) if is_causal is None else tuple(is_causal)
+    batch, t, h, w, num_heads, head_dim = q.shape
+    if scale is None:
+        scale = head_dim ** -0.5
+
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    out = torch.empty_like(q)
+    _C.na3d(
+        _dl(q),
+        _dl(k),
+        _dl(v),
+        _dl(out),
+        batch,
+        t,
+        h,
+        w,
+        num_heads,
+        head_dim,
+        int(kernel_size[0]),
+        int(kernel_size[1]),
+        int(kernel_size[2]),
+        int(causal[0]),
+        int(causal[1]),
+        int(causal[2]),
+        float(scale),
+        DTYPE_TO_CODE[q.dtype],
+        _stream(q),
+    )
+    return out
+
+
 def _adaln_impl(kernel, x, scale, shift, eps) -> torch.Tensor:
     """``kernel`` is _C.adaln (LayerNorm) or _C.rms_adaln (RMSNorm)."""
     from comfy_kitchen.backends._modulation import adaln_prep_modulation
@@ -1519,15 +1686,43 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ExactDims,
         FunctionConstraints,
         ParamConstraint,
+        ValidationResult,
+        na3d_common_call_rule,
     )
 
     # PyTorch exposes ROCm tensors with device type "cuda".
     dev = frozenset({"cuda", "hip"})
     floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
+    half_floats = frozenset({torch.float16, torch.bfloat16})
     fp8s = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
     out_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
 
+    def _na3d_call_rule(kwargs):
+        common = na3d_common_call_rule(kwargs)
+        if not common.success:
+            return common
+        q = kwargs.get("q")
+        if q is not None:
+            head_dim = q.shape[-1]
+            # The WMMA K-step is 16 wide and the output accumulators are held in
+            # registers, one 16-column tile each.
+            if head_dim % 16 != 0 or head_dim > 64:
+                return ValidationResult.fail("q", "head_dim must be a multiple of 16 and <= 64")
+            if q.shape[1] * q.shape[2] > 65535 or q.shape[0] * q.shape[4] > 65535:
+                return ValidationResult.fail("q", "grid dims exceed HIP limits")
+        return ValidationResult.ok()
+
     constraints = {
+        # fp32 has no 16-bit matrix path, so it goes to triton/eager.
+        "na3d": FunctionConstraints(
+            params={
+                "q": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(6),)),
+                "k": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(6),)),
+                "v": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(6),)),
+            },
+            default_devices=dev,
+            call_rules=(_na3d_call_rule,),
+        ),
         "quantize_per_tensor_fp8": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=floats),
@@ -1593,6 +1788,17 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 "x": ParamConstraint(dtypes=floats, shape_rules=(DivisibleBy(-1, 16),)),
                 "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
                 "out_dtype": ParamConstraint(dtypes=out_floats),
+            },
+            default_devices=dev,
+        ),
+        "quantize_w4a8_int8_weight": FunctionConstraints(
+            params={
+                "weight": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "scale_dtype": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float8_e4m3fn})
+                ),
             },
             default_devices=dev,
         ),

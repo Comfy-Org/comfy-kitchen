@@ -60,6 +60,12 @@ void launch_convrot_quant_int4_kernel(const void*, int, void*, void*, int, int, 
 void launch_unpack_int4_kernel(const void*, void*, int64_t, hipStream_t);
 int convrot_max_k_host(int);
 
+void launch_quantize_w4a8_convrot_kernel(const void*, const void*, void*, void*, void*, int64_t,
+                                         int64_t, int, bool, uint64_t, hipStream_t);
+int w4a8_requant_max_k_kernel();
+void launch_na3d_kernel(const void*, const void*, const void*, void*, int, int, int, int, int, int,
+                        int, int, int, int, int, int, float, int, hipStream_t);
+
 void launch_adaln_kernel(const void*, const void*, const void*, void*, int, int, int, int, float,
                          int, int, int, bool, hipStream_t);
 void launch_gemv_awq_kernel(const void*, const void*, const void*, const void*, const void*, void*,
@@ -530,6 +536,33 @@ void unpack_int4(nb::ndarray<> q, nb::ndarray<> out, int64_t nbytes, uintptr_t s
 
 // scale_code names the s_rel storage: 0 float32, 5 e4m3 (crossing as uint8, as
 // elsewhere). codebook is optional; without it the levels are uniform.
+// Fused W4A8 requantize (group_size 16): a rotated weight [N, K] becomes packed
+// int4 [N, K/2], raw e4m3 s_rel [N, K/16] and f32 s_channel [N] in one launch.
+void quantize_w4a8_convrot(nb::ndarray<> rotated, nb::ndarray<> codebook, nb::ndarray<> packed,
+                           nb::ndarray<> s_rel, nb::ndarray<> s_channel, int N, int K,
+                           bool stochastic, uint64_t seed, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "quantize_w4a8_convrot";
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    if (K % 16 != 0) {
+        throw std::runtime_error(std::string(kFn) + ": K must be a multiple of 16");
+    }
+    require_dtype(rotated, 0, 2, kFn, "rotated");
+    require_dtype(packed, 4, 4, kFn, "packed");
+    require_dtype(s_rel, 3, 3, kFn, "s_rel");
+    require_scale_len(s_channel, static_cast<size_t>(N), kFn, "s_channel");
+    require_scale_len(codebook, 16, kFn, "codebook");
+    require_len(rotated, static_cast<int64_t>(N) * K, kFn, "rotated");
+    require_len(packed, static_cast<int64_t>(N) * (K / 2), kFn, "packed");
+    require_len(s_rel, static_cast<int64_t>(N) * (K / 16), kFn, "s_rel");
+
+    launch_quantize_w4a8_convrot_kernel(rotated.data(), codebook.data(), packed.data(),
+                                        s_rel.data(), s_channel.data(), N, K,
+                                        map_dtype_to_code(rotated.dtype()), stochastic, seed,
+                                        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
 void dequant_int4_grouped_to_int8(nb::ndarray<> qdata, nb::ndarray<> s_rel, int scale_code,
                                   OptArray codebook, nb::ndarray<> out, int N, int K,
                                   int group_size, uintptr_t stream_ptr) {
@@ -637,6 +670,44 @@ static void adaln_impl(const char* kFn, nb::ndarray<>& x, nb::ndarray<>& scale,
                         shift_group, eps, map_dtype_to_code(x.dtype()),
                         map_dtype_to_code(scale.dtype()), map_dtype_to_code(shift.dtype()),
                         subtract_mean, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// Fused 3D neighborhood attention. Every extent is caller-supplied and the kernel
+// indexes up to it, so the operands are sized here rather than trusted.
+void na3d(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> out, int batch,
+          int t_size, int h_size, int w_size, int num_heads, int head_dim, int kt, int kh, int kw,
+          int causal_t, int causal_h, int causal_w, float scale, int dtype_code,
+          uintptr_t stream_ptr) {
+    constexpr const char* kFn = "na3d";
+    require_positive(batch, kFn, "batch");
+    require_positive(t_size, kFn, "t_size");
+    require_positive(h_size, kFn, "h_size");
+    require_positive(w_size, kFn, "w_size");
+    require_positive(num_heads, kFn, "num_heads");
+    require_positive(head_dim, kFn, "head_dim");
+    require_positive(kt, kFn, "kt");
+    require_positive(kh, kFn, "kh");
+    require_positive(kw, kFn, "kw");
+    if (dtype_code != 1 && dtype_code != 2) {
+        throw std::runtime_error(std::string(kFn) + ": q must be float16 or bfloat16");
+    }
+    // The kernel reads k and v off bare pointers with q's extents, so a differing
+    // dtype or a shorter operand is an out-of-bounds device read.
+    const int64_t need = static_cast<int64_t>(batch) * t_size * h_size * w_size * num_heads *
+                         head_dim;
+    require_dtype(q, dtype_code, dtype_code, kFn, "q");
+    require_dtype(k, dtype_code, dtype_code, kFn, "k");
+    require_dtype(v, dtype_code, dtype_code, kFn, "v");
+    require_dtype(out, dtype_code, dtype_code, kFn, "out");
+    require_len(q, need, kFn, "q");
+    require_len(k, need, kFn, "k");
+    require_len(v, need, kFn, "v");
+    require_len(out, need, kFn, "out");
+
+    launch_na3d_kernel(q.data(), k.data(), v.data(), out.data(), batch, t_size, h_size, w_size,
+                       num_heads, head_dim, kt, kh, kw, causal_t, causal_h, causal_w, scale,
+                       dtype_code, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -958,7 +1029,10 @@ NB_MODULE(_C, m) {
     m.def("convrot_max_k", &convrot_max_k_host);
     m.def("unpack_int4", &unpack_int4);
     m.def("dequant_int4_grouped_to_int8", &dequant_int4_grouped_to_int8);
+    m.def("quantize_w4a8_convrot", &quantize_w4a8_convrot);
+    m.def("w4a8_requant_max_k", &w4a8_requant_max_k_kernel);
     m.def("w4a8_int8_gemm_chunked", &w4a8_int8_gemm_chunked);
+    m.def("na3d", &na3d);
     m.def("adaln", &adaln);
     m.def("rms_adaln", &rms_adaln);
     m.def("apply_rope", &apply_rope);

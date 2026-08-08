@@ -13,6 +13,10 @@ from comfy_kitchen.backends.eager.convrot_w4a4 import _unpack_int4_row_major
 from comfy_kitchen.backends.eager.quantization import (
     quantize_and_rotate_rowwise as eager_quantize_and_rotate_rowwise,
 )
+from comfy_kitchen.backends.eager.quantization import (
+    rotate_int8_convrot_weight as eager_rotate_int8_convrot_weight,
+)
+from comfy_kitchen.constraints import validate_function_call
 from comfy_kitchen.registry import registry
 from comfy_kitchen.tensor import AsymW4A8Int8Layout, QuantizedTensor
 from comfy_kitchen.tensor.int8_utils import _build_hadamard
@@ -602,6 +606,222 @@ def test_w4a8_consumes_a_row_chunked_quantize(hip):
 
     scale = ref.float().abs().max().item()
     assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
+
+
+# ---------------------------------------------------------------------------
+# Fused W4A8 requantize
+# ---------------------------------------------------------------------------
+
+
+def _requant_inputs(n, k, dtype=torch.bfloat16, seed=0):
+    torch.manual_seed(seed)
+    w = torch.randn(n, k, device=DEV, dtype=dtype) * 0.02
+    cb = eager_w4a8._decide_codebook(w, eager_rotate_int8_convrot_weight, 16, 256)
+    return w, cb
+
+
+def _requires_fused_requant(hip, w):
+    """The wrapper falls back to the eager packer when the device's LDS budget declines
+    this K, which would leave a test exercising eager under the kernel's name."""
+    assert hip._requant_supported(w.shape[1], w.device, w.dtype)
+
+
+def _assert_same_packed(out, ref):
+    """Bit equality across the packed tuple, reaching the fp8 scales through uint8."""
+    for got, want in zip(out, ref, strict=True):
+        if want is None:
+            assert got is None
+        elif want.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+        else:
+            assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(("n", "k"), [(64, 256), (33, 512), (128, 1024), (96, 4096)])
+def test_w4a8_fused_quantize_matches_eager(hip, dtype, n, k):
+    """The kernel repeats eager's arithmetic on the same rotated values, so it has to
+    reproduce eager's codes, not merely land near them.
+
+    The one thing it cannot reproduce is the summation order of eager's 16-wide
+    reductions, which is torch's, not a sequential accumulate. That moves an ALS group
+    scale by an ulp, and an ulp is visible only where the scale sat on an e4m3 rounding
+    boundary -- so a handful of groups shift one e4m3 code, and the weights in those
+    groups shift at most one int4 level. Anything wider than that is a real divergence.
+    """
+    w, cb = _requant_inputs(n, k, dtype)
+    _requires_fused_requant(hip, w)
+    ref = eager_w4a8.quantize_w4a8_int8_weight(w, 16, convrot_groupsize=256, codebook_tensor=cb)
+    out = hip.quantize_w4a8_int8_weight(w, 16, convrot_groupsize=256, codebook_tensor=cb)
+
+    # Adjacency is the real assertion; the counts are a second guard against a
+    # systematic divergence, which would flip a large fraction rather than a few.
+    # Measured over these cases: at most 1 group and 0 weights differ, and the
+    # smallest shapes differ nowhere, so the floor keeps their bound a handful wide
+    # instead of exactly one.
+    srel_delta = (out[1].view(torch.uint8).int() - ref[1].view(torch.uint8).int()).abs()
+    assert srel_delta.max() <= 1
+    assert srel_delta.count_nonzero() <= max(8, srel_delta.numel() // 1000)
+
+    code_delta = (
+        _unpack_int4_row_major(out[0]).int() - _unpack_int4_row_major(ref[0]).int()
+    ).abs()
+    assert code_delta.max() <= 1
+    assert code_delta.count_nonzero() <= max(8, code_delta.numel() // 10000)
+
+    torch.testing.assert_close(out[2], ref[2], rtol=1e-6, atol=0)
+    assert out[3] is None and ref[3] is None
+
+    # ...and the decode is no less faithful to the weight than eager's.
+    def rel(packed):
+        decoded = ck.dequantize_w4a8_int8_weight(
+            packed[0], packed[1], packed[2], packed[4], None, 16, 256, torch.float32
+        )
+        return ((decoded - w.float()).norm() / w.float().norm()).item()
+
+    assert rel(out) <= rel(ref) * 1.01
+
+
+def test_w4a8_fused_quantize_does_not_depend_on_the_row_block(hip, monkeypatch):
+    """Rows are rotated a block at a time to cap peak memory. Every output is per-row
+    and the kernel reduces only within a row, so the packed result must be the same
+    whether a row block covers the tensor or a ragged tail closes it.
+
+    The stochastic draw is the documented exception. The kernel keys it on the element
+    index within its launch and the caller shifts the seed by the block's first row, so
+    the draw is reproducible for a given block size and deliberately decorrelated
+    across blocks. Both other backends do this; pinned here so a "fix" that keys the
+    draw globally has to change a test that says why.
+
+    The rotation ahead of the kernel is an eager matmul, and its tiling follows the
+    row count, so a row comes out of it up to an ulp apart between blockings on some
+    cards. Every blocking is handed the same rotated rows, which leaves the kernel as
+    the only thing the comparison can fail on; the stub checks the rows it is asked to
+    rotate, so the caller's slicing is still under test.
+    """
+    n, k = 700, 512
+    w, cb = _requant_inputs(n, k)
+    _requires_fused_requant(hip, w)
+    kwargs = {"convrot_groupsize": 256, "codebook_tensor": cb}
+
+    rotated = eager_rotate_int8_convrot_weight(w, 256)
+    cursor = [0]
+
+    def rotate_rows(block, groupsize):
+        r0, r1 = cursor[0], cursor[0] + block.shape[0]
+        assert groupsize == 256 and torch.equal(block, w[r0:r1])
+        cursor[0] = r1
+        return rotated[r0:r1]
+
+    monkeypatch.setattr(hip._eager, "rotate_int8_convrot_weight", rotate_rows)
+
+    def quantize(budget, **extra):
+        monkeypatch.setattr(hip, "_QUANT_ROW_ELEM_BUDGET", budget)
+        cursor[0] = 0
+        return hip.quantize_w4a8_int8_weight(w, 16, **kwargs, **extra)
+
+    whole = quantize(n * k)
+    chunked = quantize(128 * k)  # 5 blocks + a 60-row tail
+
+    assert torch.equal(whole[0], chunked[0])
+    assert torch.equal(whole[1].view(torch.uint8), chunked[1].view(torch.uint8))
+    assert torch.equal(whole[2], chunked[2])
+
+    assert not torch.equal(quantize(n * k, stochastic_rounding=7)[0],
+                           quantize(128 * k, stochastic_rounding=7)[0])
+
+
+@pytest.mark.parametrize(
+    ("tag", "kwargs"),
+    [
+        ("asymmetric", {"symmetric": False}),
+        ("uniform", {"codebook": False}),
+        ("fp32_scale", {"scale_dtype": torch.float32}),
+        ("group_size_32", {"group_size": 32}),
+    ],
+)
+def test_w4a8_fused_quantize_declines_off_the_default_layout(hip, tag, kwargs, monkeypatch):
+    """The kernel implements one layout. Everything else has to reach the shared
+    packer unchanged, not a near-miss fast path.
+
+    The fused entry is stubbed rather than inferred from output equality: the two
+    paths happen to agree to an ulp today, so equality alone would keep passing if
+    the gate ever let one of these layouts through.
+    """
+    w, _ = _requant_inputs(64, 512)
+    kwargs = {"convrot_groupsize": 256, **kwargs}
+
+    def _refuse(*_args, **_kwargs):
+        raise AssertionError(f"fused path taken for {tag}")
+
+    monkeypatch.setattr(hip, "_fused_quantize_w4a8", _refuse)
+    ref = eager_w4a8.quantize_w4a8_int8_weight(w, **kwargs)
+    out = hip.quantize_w4a8_int8_weight(w, **kwargs)
+
+    _assert_same_packed(out, ref)
+
+
+def test_w4a8_fused_quantize_declines_a_row_wider_than_lds(hip, monkeypatch):
+    """Group scales sit in LDS, so K is bounded per device. Past the budget the
+    wrapper must fall back instead of launching something that cannot fit.
+
+    Declining the budget and consulting it are two claims: the fused entry is
+    stubbed so the second one is asserted rather than inferred from a shape the two
+    paths happen to agree on.
+    """
+    w, cb = _requant_inputs(8, 512)
+    monkeypatch.setattr(hip, "_w4a8_requant_max_k", {})
+    monkeypatch.setattr(hip._C, "w4a8_requant_max_k", lambda: 256)
+    assert not hip._requant_supported(512, w.device, w.dtype)
+
+    def _refuse(*_args, **_kwargs):
+        raise AssertionError("fused path taken for a row wider than the LDS budget")
+
+    monkeypatch.setattr(hip, "_fused_quantize_w4a8", _refuse)
+    ref = eager_w4a8.quantize_w4a8_int8_weight(w, 16, convrot_groupsize=256, codebook_tensor=cb)
+    out = hip.quantize_w4a8_int8_weight(w, 16, convrot_groupsize=256, codebook_tensor=cb)
+    _assert_same_packed(out, ref)
+
+
+def test_w4a8_fused_quantize_stochastic_rounding_is_seeded(hip):
+    """A seed has to reproduce, and two seeds have to disagree, or the draw is not
+    doing the job it was added for."""
+    w, cb = _requant_inputs(128, 512)
+    _requires_fused_requant(hip, w)
+    kwargs = {"convrot_groupsize": 256, "codebook_tensor": cb}
+    a = hip.quantize_w4a8_int8_weight(w, 16, stochastic_rounding=7, **kwargs)[0]
+    b = hip.quantize_w4a8_int8_weight(w, 16, stochastic_rounding=7, **kwargs)[0]
+    c = hip.quantize_w4a8_int8_weight(w, 16, stochastic_rounding=8, **kwargs)[0]
+
+    assert torch.equal(a, b)
+    assert not torch.equal(a, c)
+
+
+def test_w4a8_fused_quantize_stochastic_rounding_is_unbiased(hip):
+    """Round-to-nearest carries a fixed per-weight bias: the same weight always lands
+    on the same code, so a merged delta smaller than the int4 step rounds away every
+    time. The seeded draw is unbiased instead, so averaging decodes over seeds closes
+    on the original weight where a single nearest decode cannot."""
+    w, cb = _requant_inputs(128, 512)
+    _requires_fused_requant(hip, w)
+    kwargs = {"convrot_groupsize": 256, "codebook_tensor": cb}
+    reference = w.float()
+
+    def decode(packed):
+        return ck.dequantize_w4a8_int8_weight(
+            packed[0], packed[1], packed[2], packed[4], None, 16, 256, torch.float32
+        )
+
+    def rel(decoded):
+        return ((decoded - reference).norm() / reference.norm()).item()
+
+    nearest = decode(hip.quantize_w4a8_int8_weight(w, 16, **kwargs))
+    draws = torch.zeros_like(reference)
+    seeds = 32
+    for seed in range(1, seeds + 1):
+        draws += decode(hip.quantize_w4a8_int8_weight(w, 16, stochastic_rounding=seed, **kwargs))
+
+    assert rel(draws / seeds) < 0.6 * rel(nearest)
 
 
 @needs_wmma
@@ -1922,3 +2142,160 @@ def test_convrot_launcher_rejects_unsupported_group_size(hip, group_size):
         hip._C.convrot_quant_int4(
             hip._dl(x), hip._dl(q), hip._dl(scales), 8, 128, group_size, hip._stream(x)
         )
+
+
+# ---------------------------------------------------------------------------
+# Neighborhood attention
+# ---------------------------------------------------------------------------
+
+
+def _na_window(i, kernel, length, causal):
+    if causal:
+        return max(0, i - kernel + 1), i + 1
+    kernel = min(kernel, length)
+    s = min(max(i - kernel // 2, 0), length - kernel)
+    return s, s + kernel
+
+
+def _ref_na3d(q, k, v, kernel_size, is_causal, scale):
+    """Per-query loop over the NATTEN window, accumulated and returned in fp32.
+
+    Upstream's copy of this reference rounds each window result back to the input
+    dtype. Keeping it in fp32 costs nothing and stops a fifth of the bf16 tolerance
+    budget going on a rounding the reference never had to do.
+    """
+    b, t, h, w, nh, hd = q.shape
+    if scale is None:
+        scale = hd ** -0.5
+    out = torch.empty(q.shape, device=q.device, dtype=torch.float32)
+    for ti in range(t):
+        t0, t1 = _na_window(ti, kernel_size[0], t, is_causal[0])
+        for hi in range(h):
+            h0, h1 = _na_window(hi, kernel_size[1], h, is_causal[1])
+            for wi in range(w):
+                w0, w1 = _na_window(wi, kernel_size[2], w, is_causal[2])
+                kk = k[:, t0:t1, h0:h1, w0:w1].reshape(b, -1, nh, hd)
+                vv = v[:, t0:t1, h0:h1, w0:w1].reshape(b, -1, nh, hd)
+                s = torch.einsum("bnd,bknd->bnk", q[:, ti, hi, wi].float(), kk.float()) * scale
+                a = torch.softmax(s, dim=-1)
+                out[:, ti, hi, wi] = torch.einsum("bnk,bknd->bnd", a, vv.float())
+    return out
+
+
+NA_CASES = [
+    ((1, 5, 9, 12, 2, 64), (3, 7, 7), (False, False, False)),
+    ((1, 12, 13, 15, 2, 64), (11, 11, 11), (False, False, False)),
+    ((2, 6, 8, 8, 4, 64), (5, 5, 5), (True, False, False)),
+    ((1, 3, 6, 6, 2, 64), (5, 5, 5), (True, False, False)),    # kernel > dims, causal T
+    ((1, 2, 5, 5, 2, 64), (3, 7, 7), (False, False, False)),   # kernel > dims -> clamp
+    ((1, 1, 16, 16, 2, 64), (1, 5, 5), (False, False, False)),  # single frame (na2d shape)
+    ((1, 4, 7, 40, 2, 32), (3, 5, 5), (False, False, False)),
+    ((1, 2, 3, 65, 2, 64), (3, 3, 5), (False, False, False)),  # ragged tail query block
+    ((1, 2, 3, 96, 1, 64), (1, 3, 33), (False, False, False)),  # window wider than a key tile
+    ((1, 3, 4, 34, 2, 16), (3, 3, 5), (False, False, False)),
+    ((1, 3, 4, 34, 2, 48), (3, 3, 5), (False, False, False)),  # head_dim not a power of 2
+    ((1, 4, 6, 20, 2, 64), (3, 5, 7), (False, False, True)),   # causal W
+    ((1, 4, 6, 20, 2, 64), (3, 5, 7), (False, True, False)),   # causal H
+    ((1, 4, 6, 20, 2, 64), (3, 5, 7), (True, True, True)),
+    ((2, 3, 4, 18, 3, 32), (3, 3, 5), (False, False, False)),  # batch and heads > 1
+]
+
+
+@pytest.mark.parametrize(("shape", "kernel", "causal"), NA_CASES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("scale", [None, 1.0])
+@needs_wmma
+def test_na3d_matches_the_windowed_reference(hip, shape, kernel, causal, dtype, scale):
+    torch.manual_seed(0)
+    q = torch.randn(shape, device=DEV, dtype=dtype)
+    k = torch.randn(shape, device=DEV, dtype=dtype)
+    v = torch.randn(shape, device=DEV, dtype=dtype)
+
+    out = hip.na3d(q, k, v, list(kernel), list(causal), scale)
+    ref = _ref_na3d(q, k, v, kernel, causal, scale)
+
+    assert out.shape == q.shape
+    torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+
+
+@needs_wmma
+def test_na3d_reads_a_non_contiguous_input(hip):
+    """The kernel indexes off bare pointers with contiguous strides, so a permuted
+    view has to be materialised rather than read at its own strides."""
+    torch.manual_seed(0)
+    shape = (1, 4, 6, 20, 2, 64)
+    kernel, causal = (3, 5, 5), (False, False, False)
+    # A head slice, so the head stride no longer packs. All three operands get one:
+    # the kernel reads each off a bare pointer, so a copy dropped from any of them
+    # would leave that one read at packed strides.
+    views = [
+        torch.randn(1, 4, 6, 20, 4, 64, device=DEV, dtype=torch.bfloat16)[:, :, :, :, :2]
+        for _ in range(3)
+    ]
+    assert all(x.shape == shape and not x.is_contiguous() for x in views)
+
+    torch.testing.assert_close(
+        hip.na3d(*views, list(kernel), list(causal), None).float(),
+        hip.na3d(*(x.contiguous() for x in views), list(kernel), list(causal), None).float(),
+        rtol=0,
+        atol=0,
+    )
+
+
+@needs_wmma
+def test_na3d_dispatches_to_hip(hip):
+    """fp32 has no 16-bit matrix path and must not reach the kernel; the half types
+    must, or the op silently needs triton at runtime."""
+    constraints = hip._build_constraints(has_wmma=True)["na3d"]
+    shape = (1, 4, 6, 20, 2, 64)
+    for dtype, expected in ((torch.bfloat16, True), (torch.float16, True), (torch.float32, False)):
+        x = torch.zeros(shape, device=DEV, dtype=dtype)
+        kwargs = {"q": x, "k": x, "v": x, "kernel_size": [3, 5, 5], "is_causal": None}
+        assert validate_function_call(constraints, kwargs).success is expected
+
+    # head_dim is bounded by the WMMA K-step and the register-resident accumulators.
+    for head_dim, expected in ((16, True), (48, True), (64, True), (80, False), (24, False)):
+        x = torch.zeros(1, 2, 3, 8, 2, head_dim, device=DEV, dtype=torch.bfloat16)
+        kwargs = {"q": x, "k": x, "v": x, "kernel_size": [1, 3, 3], "is_causal": None}
+        assert validate_function_call(constraints, kwargs).success is expected
+
+    # Both grid dims at their boundary, off a stride-0 view so the rejected shape
+    # costs no memory. The reason is read back as well, or a shape some other rule
+    # happens to decline would pass this for the wrong branch.
+    base = torch.zeros(1, 1, 1, 1, 1, 64, device=DEV, dtype=torch.bfloat16)
+    for fits, over in (
+        ((1, 65535, 1, 1, 1, 64), (1, 65536, 1, 1, 1, 64)),  # blocks over T*H
+        ((65535, 1, 1, 1, 1, 64), (65536, 1, 1, 1, 1, 64)),  # blocks over B*heads
+    ):
+        def call(shape):
+            x = base.expand(shape)
+            return validate_function_call(
+                constraints,
+                {"q": x, "k": x, "v": x, "kernel_size": [1, 1, 1], "is_causal": None},
+            )
+
+        assert call(fits).success
+        assert call(over).failure_reason == "grid dims exceed HIP limits"
+
+
+@needs_wmma
+def test_na3d_launcher_rejects_a_mismatched_operand(hip):
+    """_C is importable, so the size checks cannot be left to the Python layer: the
+    kernel reads k and v with q's extents."""
+    q = torch.zeros(1, 2, 3, 16, 2, 64, device=DEV, dtype=torch.bfloat16)
+    short = torch.zeros(1, 2, 3, 8, 2, 64, device=DEV, dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    # Codes come from the shared table the wrapper dispatches on, so a change there
+    # cannot leave this test asserting against a stale literal.
+    extents = (1, 2, 3, 16, 2, 64, 1, 3, 3, 0, 0, 0, 0.125)
+    stream = 0
+
+    # Both operands are read with q's extents, so both slots are checked: a launcher
+    # that validates one and forgets the other reads past the end of the other.
+    for k_arg, v_arg in ((short, q), (q, short)):
+        with pytest.raises(RuntimeError, match="needs at least"):
+            hip._C.na3d(hip._dl(q), hip._dl(k_arg), hip._dl(v_arg), hip._dl(out),
+                        *extents, hip.DTYPE_TO_CODE[torch.bfloat16], stream)
+    with pytest.raises(RuntimeError, match="float16 or bfloat16"):
+        hip._C.na3d(hip._dl(q.float()), hip._dl(q), hip._dl(q), hip._dl(out),
+                    *extents, hip.DTYPE_TO_CODE[torch.float32], stream)

@@ -153,12 +153,17 @@ def test_hip_drops_gemms_without_matrix_cores():
     # would pass while any single one was missing from the constraints.
     assert set(with_wmma) >= hip_backend._WMMA_ONLY_OPS
     assert not (hip_backend._WMMA_ONLY_OPS & set(without))
+    # na3d is a matrix-core kernel: without one it traps rather than answers.
+    assert "na3d" in hip_backend._WMMA_ONLY_OPS
     # The elementwise kernels need no matrix cores and must survive.
     for op in ("apply_rope", "apply_rope_", "rms_rope", "rms_rope_split_half1_", "adaln",
                "rms_adaln", "quantize_per_tensor_fp8", "gemv_awq_w4a16",
                "dequantize_int8_simple_dtype",
                "dequantize_int8_convrot_weight_dtype"):
         assert op in without
+    # The fused W4A8 requantize is elementwise too: it packs weights and never
+    # reaches a matrix core, so RDNA2 must keep it.
+    assert "quantize_w4a8_int8_weight" in without
 
 
 def test_hip_advertises_every_inplace_rope_entry():

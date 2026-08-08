@@ -17,8 +17,8 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `scaled_mm_mxfp8`           | ✓     |      |        |     |
 | `adaln`                     | ✓     | ✓    | ✓      | ✓   |
 | `rms_adaln`                 | ✓     | ✓    | ✓      | ✓   |
-| `na3d`                      | ✓     | ✓    | ✓      |     |
-| `na2d`                      | ✓     | ✓    | ✓      |     |
+| `na3d`                      | ✓     | ✓    | ✓      | ✓   |
+| `na2d`                      | ✓     | ✓    | ✓      | ✓   |
 | `apply_rope`                | ✓     | ✓    | ✓      | ✓   |
 | `apply_rope1`               | ✓     | ✓    | ✓      | ✓   |
 | `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   |
