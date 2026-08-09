@@ -28,6 +28,7 @@ from comfy_kitchen._rope_utils import (
 
 __all__ = [
     "na3d",
+    "sol_attn",
     "adaln",
     "rms_adaln",
     "apply_rope",
@@ -192,6 +193,7 @@ from comfy_kitchen.constraints import (  # noqa: E402
     ParamConstraint,
     ValidationResult,
     na3d_common_call_rule,
+    sol_attn_common_call_rule,
 )
 from comfy_kitchen.float_utils import roundup  # noqa: E402
 from comfy_kitchen.registry import registry  # noqa: E402
@@ -2313,6 +2315,75 @@ def na3d(
     return out
 
 
+def sol_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tau: float = 1.0,
+    scale: float | None = None,
+    sink_blocks: list[int] | None = None,
+    sink_q: list[int] | None = None,
+    max_blocks: int = 0,
+    workspace: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 tensors.
+    See ops/sol_attn.cu."""
+    batch, t, h, d = q.shape
+    if scale is None:
+        scale = d ** -0.5
+    # Only the last dim must be contiguous (the staging loads are 16 B), so a
+    # BHND view goes in as-is; full contiguity would copy all three inputs.
+    for name, x in (("q", q), ("k", k), ("v", v)):
+        if x.stride(-1) != 1:
+            raise ValueError(f"sol_attn: {name} must have a contiguous last dim")
+        # A misaligned 16 B load faults asynchronously and poisons the CUDA
+        # context, so reject it here: the base pointer and every leading stride
+        # must be 16-byte aligned. Size-1 dims never contribute to an offset,
+        # so their (arbitrary) strides are exempt.
+        if x.data_ptr() % 16:
+            raise ValueError(
+                f"sol_attn: {name} must be 16-byte aligned (storage_offset "
+                f"{x.storage_offset()} leaves it at +{x.data_ptr() % 16}); "
+                f"call .contiguous() on it")
+        for dim in range(3):
+            if x.shape[dim] > 1 and x.stride(dim) % 8:
+                raise ValueError(
+                    f"sol_attn: {name} stride({dim}) = {x.stride(dim)} elements "
+                    f"is not a multiple of 8, so the 16-byte staging loads would "
+                    f"be misaligned; call .contiguous() on it")
+    out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    need = _C.sol_attn_workspace(batch, t, h, max_blocks)
+    if workspace is None:
+        workspace = torch.empty(need, dtype=torch.uint8, device=q.device)
+    elif workspace.numel() * workspace.element_size() < need:
+        raise ValueError(
+            f"sol_attn workspace too small: {workspace.numel() * workspace.element_size()} "
+            f"< {need} bytes; size it with sol_attn_workspace_bytes()")
+    sb = [0, 0] if sink_blocks is None else list(sink_blocks)
+    sq = [0, 0] if sink_q is None else list(sink_q)
+    stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
+    _C.sol_attn(
+        _wrap_for_dlpack(q),
+        _wrap_for_dlpack(k),
+        _wrap_for_dlpack(v),
+        _wrap_for_dlpack(out),
+        _wrap_for_dlpack(workspace),
+        batch, t, h, d, int(max_blocks),
+        float(tau), float(scale),
+        int(sb[0]), int(sb[1]), int(sq[0]), int(sq[1]),
+        list(q.stride()[:3]), list(k.stride()[:3]), list(v.stride()[:3]),
+        stream_ptr,
+    )
+    return out
+
+
+def sol_attn_workspace_bytes(batch: int, seq_len: int, num_heads: int,
+                             max_blocks: int = 0) -> int:
+    """Workspace bytes ``sol_attn`` needs for this shape. Reuse one buffer across
+    calls to avoid re-allocating ~1 GB at video lengths."""
+    return _C.sol_attn_workspace(batch, seq_len, num_heads, max_blocks)
+
+
 def _adaln_impl(kernel, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float):
     orig_shape = x.shape
     d = x.shape[-1]
@@ -3012,6 +3083,25 @@ def _build_constraints() -> dict:
     cuda_devices = frozenset({"cuda"})
 
     constraints = {
+        "sol_attn": FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "k": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "v": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
+            call_rules=(sol_attn_common_call_rule,),
+        ),
         "na3d": FunctionConstraints(
             params={
                 "q": ParamConstraint(
