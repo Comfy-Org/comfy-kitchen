@@ -34,12 +34,25 @@ __device__ __forceinline__ float warp_reduce_fmax(float v) {
   return v;
 }
 
-__device__ __forceinline__ int8_t quant_int8(float v, float scale) {
-  float t = v / scale;
-  t += (t >= 0.f ? 0.5f : -0.5f);
-  return static_cast<int8_t>(t);
+__device__ __forceinline__ int8_t float_to_int8_rn(float value) {
+  int32_t quantized;
+  asm volatile("cvt.rni.sat.s8.f32 %0, %1;"
+               : "=r"(quantized)
+               : "f"(value));
+  return static_cast<int8_t>(quantized);
 }
 
+__device__ __forceinline__ int8_t quant_int8_rcp(float v,
+                                                 float inv_scale) {
+  return float_to_int8_rn(v * inv_scale);
+}
+
+__device__ __forceinline__ int8_t quant_int8(float v, float scale) {
+  return quant_int8_rcp(v, 1.f / scale);
+}
+
+// ptr must be 4-byte aligned. Callers must preserve that alignment at every
+// row offset, for example by requiring the row stride to be a multiple of 4.
 __device__ __forceinline__ void store4_i8(int8_t *ptr, int8_t a, int8_t b,
                                           int8_t c, int8_t d) {
   *reinterpret_cast<int32_t *>(ptr) =

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Vendored unmodified from SageAttention
+// Derived from SageAttention
 // (https://github.com/thu-ml/SageAttention) commit
 // d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5.
 
@@ -79,7 +79,7 @@ floatx4_to_e5m2x4(uint32_t *dest, float *source0, float *source1) {
                "mov.b32 %0, {lo, hi};\n"
                "}"
                : "=r"(dest[0])
-               : "f"(source0[0]), "f"(source1[1]), "f"(source1[0]),
+               : "f"(source0[0]), "f"(source0[1]), "f"(source1[0]),
                  "f"(source1[1]));
 #else
   RUNTIME_ASSERT("Unsupported CUDA architecture for FP8 CAST instruction");
@@ -157,4 +157,3 @@ __device__ __forceinline__ int8_t float_to_int8_rn(float x) {
   asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(dst) : "f"(x));
   return reinterpret_cast<const int8_t &>(dst);
 }
-

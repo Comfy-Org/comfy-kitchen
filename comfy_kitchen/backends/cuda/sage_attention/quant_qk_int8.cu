@@ -27,8 +27,10 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <stdexcept>
+#include <string>
 
-using comfy::quant_int8;
+using comfy::quant_int8_rcp;
 using comfy::store4_i8;
 using comfy::warp_reduce_fmax;
 
@@ -243,6 +245,7 @@ process_q(const T *__restrict__ in, int8_t *__restrict__ out,
 
     mx = warp_reduce_fmax(mx);
     const float sc = mx / 127.f + 1e-7f;
+    const float inv_sc = 1.f / sc;
 
     if (lane == 0)
       sc_buf[oblk * 8 + otld] = sc;
@@ -257,9 +260,11 @@ process_q(const T *__restrict__ in, int8_t *__restrict__ out,
           const int n = base + j * 8;
           const int vi = tile_base + j * 4;
           if (n < L) {
-            store4_i8(&out[(int64_t)n * C + ch], quant_int8(v[vi], sc),
-                      quant_int8(v[vi + 1], sc), quant_int8(v[vi + 2], sc),
-                      quant_int8(v[vi + 3], sc));
+            store4_i8(&out[(int64_t)n * C + ch],
+                      quant_int8_rcp(v[vi], inv_sc),
+                      quant_int8_rcp(v[vi + 1], inv_sc),
+                      quant_int8_rcp(v[vi + 2], inv_sc),
+                      quant_int8_rcp(v[vi + 3], inv_sc));
           }
         }
       } else if (ch < C) {
@@ -271,7 +276,8 @@ process_q(const T *__restrict__ in, int8_t *__restrict__ out,
 #pragma unroll
             for (int c = 0; c < 4; ++c) {
               if (ch + c < C)
-                out[(int64_t)n * C + ch + c] = quant_int8(v[vi + c], sc);
+                out[(int64_t)n * C + ch + c] =
+                    quant_int8_rcp(v[vi + c], inv_sc);
             }
           }
         }
@@ -417,6 +423,7 @@ process_k(const T *__restrict__ in, int8_t *__restrict__ out,
 
   mx = warp_reduce_fmax(mx);
   const float sc = mx / 127.f + 1e-7f;
+  const float inv_sc = 1.f / sc;
 
   if (lane == 0)
     sc_buf[oblk * 4 + otld] = sc;
@@ -433,9 +440,11 @@ process_k(const T *__restrict__ in, int8_t *__restrict__ out,
           const int n = oblk * WARPK + j * 8 + otld * 2 + p;
           const int vi = tile_base + (j * 2 + p) * 4;
           if (n < L) {
-            store4_i8(&out[(int64_t)n * C + ch], quant_int8(v[vi], sc),
-                      quant_int8(v[vi + 1], sc), quant_int8(v[vi + 2], sc),
-                      quant_int8(v[vi + 3], sc));
+            store4_i8(&out[(int64_t)n * C + ch],
+                      quant_int8_rcp(v[vi], inv_sc),
+                      quant_int8_rcp(v[vi + 1], inv_sc),
+                      quant_int8_rcp(v[vi + 2], inv_sc),
+                      quant_int8_rcp(v[vi + 3], inv_sc));
           }
         }
       }
@@ -450,7 +459,8 @@ process_k(const T *__restrict__ in, int8_t *__restrict__ out,
 #pragma unroll
             for (int c = 0; c < 4; ++c) {
               if (ch + c < C)
-                out[(int64_t)n * C + ch + c] = quant_int8(v[vi + c], sc);
+                out[(int64_t)n * C + ch + c] =
+                    quant_int8_rcp(v[vi + c], inv_sc);
             }
           }
         }
@@ -544,13 +554,16 @@ __global__ __launch_bounds__(MEAN_BLK_DIM) void k_mean_reduce(
   }
   __syncthreads();
 
+  __shared__ bool is_last_block;
   if (threadIdx.x == 0) {
     __threadfence();
     int prev = atomicAdd(&done[bh_idx], 1);
-    if (prev == n_blks - 1) {
-      for (int c = 0; c < C; ++c)
-        km_out[bh_idx * C + c] *= inv_Lk;
-    }
+    is_last_block = prev == n_blks - 1;
+  }
+  __syncthreads();
+  if (is_last_block) {
+    for (int c = threadIdx.x; c < C; c += blockDim.x)
+      km_out[bh_idx * C + c] *= inv_Lk;
   }
 }
 
@@ -818,6 +831,34 @@ extern "C" void launch_quant_qk_per_thread_int8(
     int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
     int input_dtype_code, int convrot, int stabilize_k, void *anchor_indices,
     cudaStream_t stream) {
+  if (C <= 0 || C > CENTER_MAX_CHANNELS) {
+    throw std::runtime_error(
+        "quant_qk_per_thread_int8: head_dim must be in [1, 256]");
+  }
+  if (C % 4 != 0) {
+    throw std::runtime_error(
+        "quant_qk_per_thread_int8: head_dim must be a multiple of 4");
+  }
+  if (BLKQ != 128 || (WARPQ != 16 && WARPQ != 32) ||
+      (BLKK != 64 && BLKK != 128) || WARPK != BLKK) {
+    throw std::runtime_error(
+        "quant_qk_per_thread_int8: unsupported block/warp configuration");
+  }
+  const size_t element_size = input_dtype_code == 0 ? sizeof(float) : sizeof(half);
+  const size_t vector_size = 4 * element_size;
+  const auto is_vector_aligned = [vector_size](const void *ptr, int64_t stride_b,
+                                                int64_t stride_h,
+                                                int64_t stride_n) {
+    return stride_b > 0 && stride_h > 0 && stride_n > 0 &&
+           reinterpret_cast<uintptr_t>(ptr) % vector_size == 0 &&
+           stride_b % 4 == 0 && stride_h % 4 == 0 && stride_n % 4 == 0;
+  };
+  if (!is_vector_aligned(q, q_stride_b, q_stride_h, q_stride_n) ||
+      !is_vector_aligned(k, k_stride_b, k_stride_h, k_stride_n)) {
+    throw std::runtime_error(
+        "quant_qk_per_thread_int8: Q/K base pointers and B/H/N strides must preserve 4-element alignment");
+  }
+
   const int q_oblk = (Lq + BLKQ - 1) / BLKQ * (BLKQ / WARPQ);
   const int k_oblk = (Lk + BLKK - 1) / BLKK * (BLKK / WARPK);
   const int q_sc_per_h = q_oblk * 8;
@@ -834,8 +875,16 @@ extern "C" void launch_quant_qk_per_thread_int8(
 
     const size_t km_bytes = (size_t)B * H_kv * C * sizeof(float);
     const size_t done_bytes = (size_t)B * H_kv * sizeof(int);
-    cudaMemsetAsync(km_scratch, 0, km_bytes, stream);
-    cudaMemsetAsync(km_done, 0, done_bytes, stream);
+    cudaError_t error = cudaMemsetAsync(km_scratch, 0, km_bytes, stream);
+    if (error != cudaSuccess) {
+      throw std::runtime_error(std::string("quant_qk km_scratch memset failed: ") +
+                               cudaGetErrorString(error));
+    }
+    error = cudaMemsetAsync(km_done, 0, done_bytes, stream);
+    if (error != cudaSuccess) {
+      throw std::runtime_error(std::string("quant_qk km_done memset failed: ") +
+                               cudaGetErrorString(error));
+    }
 
     dim3 gm(mean_blks, H_kv, B);
     DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
@@ -849,6 +898,11 @@ extern "C" void launch_quant_qk_per_thread_int8(
             mean_blks, inv_Lk, k_stride_b, k_stride_h, k_stride_n);
       }
     });
+    cudaError_t launch_error = cudaGetLastError();
+    if (launch_error != cudaSuccess) {
+      throw std::runtime_error(std::string("k_mean_reduce kernel launch failed: ") +
+                               cudaGetErrorString(launch_error));
+    }
     km_ptr = (float *)km_scratch;
   }
 
@@ -860,6 +914,11 @@ extern "C" void launch_quant_qk_per_thread_int8(
           (const T *)k, (int *)anchor_indices, Lk, C, H_kv, k_stride_b,
           k_stride_h, k_stride_n);
     });
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+      throw std::runtime_error(std::string("detect_k_anchor kernel launch failed: ") +
+                               cudaGetErrorString(error));
+    }
     anchor_ptr = (int *)anchor_indices;
   }
 
@@ -870,11 +929,19 @@ extern "C" void launch_quant_qk_per_thread_int8(
         <<<gq, 128, 0, stream>>>((const T *)q, (int8_t *)q_int8,               \
                                  (float *)q_scale, Lq, C, H_q, q_sc_per_h,     \
                                  q_stride_b, q_stride_h, q_stride_n);           \
+    cudaError_t q_error = cudaGetLastError();                                   \
+    if (q_error != cudaSuccess)                                                 \
+      throw std::runtime_error(std::string("quant_q kernel launch failed: ") + \
+                               cudaGetErrorString(q_error));                    \
     dim3 gk(k_oblk, H_kv, B);                                                  \
     quant_k_kernel<T, NL, WK, CT, ROT, AUTO, A4>                               \
         <<<gk, 128, 0, stream>>>(                                              \
         (const T *)k, (int8_t *)k_int8, (float *)k_scale, km_ptr, anchor_ptr,  \
         Lk, C, H_kv, k_sc_per_h, k_stride_b, k_stride_h, k_stride_n);          \
+    cudaError_t k_error = cudaGetLastError();                                   \
+    if (k_error != cudaSuccess)                                                 \
+      throw std::runtime_error(std::string("quant_k kernel launch failed: ") + \
+                               cudaGetErrorString(k_error));                    \
   } while (0)
 
 #define LAUNCH_FUSED(T, NR, NL, BQ, WQ, BK, WK, CT, ROT, AUTO, A4)             \
@@ -887,6 +954,11 @@ extern "C" void launch_quant_qk_per_thread_int8(
         (int8_t *)k_int8, (float *)k_scale, km_ptr, anchor_ptr, Lq, Lk, C,     \
         q_oblk, H_q, H_kv, q_sc_per_h, k_sc_per_h, q_stride_b, q_stride_h,     \
         q_stride_n, k_stride_b, k_stride_h, k_stride_n);                       \
+    cudaError_t qk_error = cudaGetLastError();                                  \
+    if (qk_error != cudaSuccess)                                                \
+      throw std::runtime_error(                                                 \
+          std::string("quant_qk fused kernel launch failed: ") +              \
+          cudaGetErrorString(qk_error));                                        \
   } while (0)
 
 #define LAUNCH_SELECTED(T, ROT, AUTO)                                          \

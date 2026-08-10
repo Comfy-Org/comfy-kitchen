@@ -955,6 +955,11 @@ void sage_sdpa_quantize(
     const int Lk = static_cast<int>(k.shape(2));
     const int padded_Lk = ((Lk + cta_k - 1) / cta_k) * cta_k;
 
+    if (cta_k == 128 && D == 64) {
+        throw std::runtime_error(
+            "sage_sdpa_quantize: cta_k 128 is unsupported for head_dim 64");
+    }
+
     if (k.shape(0) != B || v.shape(0) != B || v.shape(1) != H_kv ||
         v.shape(2) != Lk || k.shape(3) != D || v.shape(3) != D) {
         throw std::runtime_error("sage_sdpa_quantize: incompatible q, k, and v shapes");
@@ -1038,6 +1043,15 @@ void sage_sdpa_prequantized(
     const int H_kv = static_cast<int>(k_int8.shape(1));
     const int Lk = static_cast<int>(k_int8.shape(2));
     const int padded_Lk = ((Lk + cta_k - 1) / cta_k) * cta_k;
+
+    if (attn_mask.has_value() && is_causal) {
+        throw std::runtime_error(
+            "sage_sdpa_prequantized: attention mask and causal mode cannot be combined");
+    }
+    if (cta_k == 128 && (D == 64 || attn_mask.has_value() || is_causal)) {
+        throw std::runtime_error(
+            "sage_sdpa_prequantized: cta_k 128 requires unmasked, non-causal head_dim 128 or 256");
+    }
 
     if (k_int8.shape(0) != B || k_int8.shape(3) != D ||
         o.shape(0) != B || o.shape(1) != H_q || o.shape(2) != Lq ||
@@ -1151,6 +1165,14 @@ void sage_attn(
         throw std::runtime_error("sage_attn: output_dtype_code must be 1 (fp16) or 2 (bf16)");
     }
 
+    constexpr int CTA_K = 64;
+    const int64_t padded_k_length =
+        ((static_cast<int64_t>(k.shape(2)) + CTA_K - 1) / CTA_K) * CTA_K;
+    if (v.shape(3) < padded_k_length || v.shape(3) % CTA_K != 0) {
+        throw std::runtime_error(
+            "sage_attn: packed V sequence extent must cover K and be a multiple of 64");
+    }
+
     const int64_t st_q_bz = static_cast<int64_t>(q.stride(0));
     const int64_t st_k_bz = static_cast<int64_t>(k.stride(0));
     const int64_t st_v_bz = static_cast<int64_t>(v.stride(0));
@@ -1166,7 +1188,7 @@ void sage_attn(
         q.data(), k.data(), v.data(), o.data(),
         q_scale.data(), k_scale.data(), v_scale.data(),
         nullptr, 0, 0, 0, 0, -1,
-        64,
+        CTA_K,
         static_cast<int>(q.shape(0)),
         static_cast<int>(q.shape(2)),
         static_cast<int>(k.shape(2)),
@@ -1206,7 +1228,8 @@ void sage_sdpa(
     uintptr_t km_done_ptr = 0,
     int stabilize_k = 1,
     uintptr_t anchor_indices_ptr = 0,
-    std::optional<nb::ndarray<nb::device::cuda>> attn_mask = std::nullopt)
+    std::optional<nb::ndarray<nb::device::cuda>> attn_mask = std::nullopt,
+    int cta_k = 0)
 {
     if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || o.ndim() != 4) {
         throw std::runtime_error("sage_sdpa: q, k, v, o must be 4D [B,H,L,D]");
@@ -1251,18 +1274,35 @@ void sage_sdpa(
     if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error("sage_sdpa: input_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
     }
+    if (output_dtype_code != 1 && output_dtype_code != 2) {
+        throw std::runtime_error(
+            "sage_sdpa: output_dtype_code must be 1 (fp16) or 2 (bf16)");
+    }
+    if (cta_k == 0) {
+        cta_k = !attn_mask.has_value() && !is_causal && D >= 128 && Lk > 1024
+            ? 128
+            : 64;
+    }
+    if (cta_k != 64 && cta_k != 128) {
+        throw std::runtime_error("sage_sdpa: cta_k must be 64 or 128");
+    }
+    if (attn_mask.has_value() && is_causal) {
+        throw std::runtime_error(
+            "sage_sdpa: attention mask and causal mode cannot be combined");
+    }
+    if (cta_k == 128 && (D == 64 || attn_mask.has_value() || is_causal)) {
+        throw std::runtime_error(
+            "sage_sdpa: cta_k 128 requires unmasked, non-causal head_dim 128 or 256");
+    }
     if (stabilize_k && !smooth_k && !anchor_indices_ptr) {
         throw std::runtime_error(
             "sage_sdpa: stabilize_k requires anchor_indices scratch");
     }
     constexpr int BLKQ = 128;
     const int WARPQ = D == 256 ? 16 : 32;
-    const bool use_large_cta_k =
-        mask_ptr == nullptr && !is_causal && D >= 128 && Lk > 1024;
-    const int CTA_K = use_large_cta_k ? 128 : 64;
-    const int BLKK = CTA_K;
-    const int WARPK = CTA_K;
-    const int padded_Lk = ((Lk + CTA_K - 1) / CTA_K) * CTA_K;
+    const int BLKK = cta_k;
+    const int WARPK = cta_k;
+    const int padded_Lk = ((Lk + cta_k - 1) / cta_k) * cta_k;
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
@@ -1308,7 +1348,7 @@ void sage_sdpa(
         q_int8.data(), k_int8.data(), v_int8.data(), o.data(),
         q_scale.data(), k_scale.data(), v_scale.data(),
         mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
-        mask_dtype_code, CTA_K,
+        mask_dtype_code, cta_k,
         B, Lq, Lk, H_q, H_kv, D,
         qi_st_bz, qi_st_n, qi_st_h,
         ki_st_bz, ki_st_n, ki_st_h,
@@ -3616,7 +3656,8 @@ NB_MODULE(_C, m) {
           nb::arg("km_done_ptr") = 0,
           nb::arg("stabilize_k") = 1,
           nb::arg("anchor_indices_ptr") = 0,
-          nb::arg("attn_mask") = nb::none());
+          nb::arg("attn_mask") = nb::none(),
+          nb::arg("cta_k") = 0);
 
     m.def("svdquant_quantize_w4a4", &svdquant_quantize_w4a4,
           "SVDQuant W4A4: smooth + int4 quantize (LoRA-down is external). "

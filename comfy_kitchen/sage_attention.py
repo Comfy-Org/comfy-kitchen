@@ -47,6 +47,18 @@ def _pad_to_cta_k(length: int, cta_k: int = CTA_K) -> int:
     return ((length + cta_k - 1) // cta_k) * cta_k
 
 
+def _select_cta_k(
+    kernel_head_dim: int,
+    kv_length: int,
+    *,
+    is_causal: bool,
+    has_mask: bool,
+) -> int:
+    if not has_mask and not is_causal and kernel_head_dim >= 128 and kv_length > 1024:
+        return LARGE_CTA_K
+    return CTA_K
+
+
 def is_available(device: torch.device | int | None = None) -> bool:
     """Return whether the compiled INT8 attention kernel supports this GPU."""
     if not torch.cuda.is_available():
@@ -149,13 +161,11 @@ def _int8_attention_cuda(
 
     batch, q_heads, q_length, _ = q.shape
     _, kv_heads, kv_length, _ = k.shape
-    cta_k = (
-        LARGE_CTA_K
-        if attn_mask is None
-        and not is_causal
-        and kernel_head_dim >= 128
-        and kv_length > 1024
-        else CTA_K
+    cta_k = _select_cta_k(
+        kernel_head_dim,
+        kv_length,
+        is_causal=is_causal,
+        has_mask=attn_mask is not None,
     )
     padded_k_length = _pad_to_cta_k(kv_length, cta_k)
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
@@ -229,6 +239,7 @@ def _int8_attention_cuda(
             km_done_ptr,
             int(stabilize_k),
             anchor_indices_ptr,
+            cta_k=cta_k,
         )
     else:
         _cuda_backend._C.sage_sdpa(
@@ -254,6 +265,7 @@ def _int8_attention_cuda(
             int(stabilize_k),
             anchor_indices_ptr,
             _cuda_backend._wrap_for_dlpack(attn_mask),
+            cta_k=cta_k,
         )
 
     output = output[..., :original_head_dim]
@@ -306,13 +318,11 @@ def prequantize_int8_attention(
 
     batch, q_heads, q_length, _ = q.shape
     _, kv_heads, kv_length, _ = k.shape
-    cta_k = (
-        LARGE_CTA_K
-        if attn_mask is None
-        and not is_causal
-        and kernel_head_dim >= 128
-        and kv_length > 1024
-        else CTA_K
+    cta_k = _select_cta_k(
+        kernel_head_dim,
+        kv_length,
+        is_causal=is_causal,
+        has_mask=attn_mask is not None,
     )
     padded_k_length = _pad_to_cta_k(kv_length, cta_k)
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
@@ -409,6 +419,28 @@ def int8_attention_from_prequantized(
         raise TypeError(
             "quantized must be returned by prequantize_int8_attention, got "
             f"{type(quantized).__name__}"
+        )
+
+    packed_tensors = (
+        quantized.q,
+        quantized.k,
+        quantized.v,
+        quantized.q_scale,
+        quantized.k_scale,
+        quantized.v_scale,
+    )
+    if not quantized.q.is_cuda:
+        raise ValueError("prequantized INT8 attention tensors must be on a CUDA device")
+    if any(tensor.device != quantized.q.device for tensor in packed_tensors[1:]):
+        raise ValueError("prequantized INT8 attention tensors must be on the same CUDA device")
+    if quantized.attn_mask is not None:
+        if quantized.is_causal:
+            raise ValueError("attn_mask and is_causal cannot be used together")
+        if quantized.attn_mask.device != quantized.q.device:
+            raise ValueError("attn_mask must be on the same CUDA device as the packed tensors")
+    if not is_available(quantized.q.device):
+        raise RuntimeError(
+            "INT8 attention requires the comfy-kitchen CUDA extension on SM75 or newer"
         )
 
     batch, q_heads, q_length, kernel_head_dim = quantized.q.shape

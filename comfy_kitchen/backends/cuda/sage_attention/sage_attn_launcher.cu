@@ -46,8 +46,14 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
       DTypeOut, ComputeUnit::kCudaCore, mask_mode, false, true, false, false,
       fuse_fp32_probabilities>;
 
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       smem_max);
+  cudaError_t error = cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(smem_max));
+  if (error != cudaSuccess) {
+    throw std::runtime_error(
+        "sage_attn failed to request " + std::to_string(smem_max) +
+        " bytes of dynamic shared memory: " + cudaGetErrorString(error));
+  }
 
   dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
   dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
@@ -59,6 +65,12 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
       stride_seq_q, stride_h_q, stride_bz_k, stride_seq_k, stride_h_k,
       stride_bz_v, stride_h_v, stride_d_v, stride_bz_o, stride_seq_o,
       stride_h_o, sm_scale);
+
+  error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    throw std::runtime_error(std::string("sage_attn kernel launch failed: ") +
+                             cudaGetErrorString(error));
+  }
 }
 
 } // anonymous namespace
@@ -74,6 +86,17 @@ extern "C" void launch_sage_attn_kernel(
     int stride_seq_k, int stride_h_k, int stride_bz_v, int stride_h_v,
     int stride_d_v, int stride_bz_o, int stride_seq_o, int stride_h_o,
     int is_causal, float sm_scale, int output_dtype_code, cudaStream_t stream) {
+  if (cta_k != 64 && cta_k != 128) {
+    throw std::runtime_error("sage_attn: cta_k must be 64 or 128");
+  }
+  if (mask != nullptr && is_causal) {
+    throw std::runtime_error(
+        "sage_attn: attention mask and causal mode cannot be combined");
+  }
+  if (cta_k == 128 && (head_dim == 64 || mask != nullptr || is_causal)) {
+    throw std::runtime_error(
+        "sage_attn: cta_k 128 requires unmasked, non-causal head_dim 128 or 256");
+  }
   int num_kv_groups = num_qo_heads / num_kv_heads;
 
   // Upstream kernel uses non-const pointers; cast away const from the

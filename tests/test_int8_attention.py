@@ -37,6 +37,34 @@ def test_int8_attention_availability_is_bool():
     assert isinstance(ck.int8_attention_is_available(), bool)
 
 
+def test_int8_attention_cta_k_selection():
+    select = sage_attention_module._select_cta_k
+    assert select(128, 1025, is_causal=False, has_mask=False) == 128
+    assert select(64, 1025, is_causal=False, has_mask=False) == 64
+    assert select(128, 1025, is_causal=True, has_mask=False) == 64
+    assert select(128, 1025, is_causal=False, has_mask=True) == 64
+
+
+def test_prequantized_attention_rejects_cpu_tensors():
+    packed = sage_attention_module.PrequantizedInt8Attention(
+        q=torch.empty(1, 1, 1, 64, dtype=torch.int8),
+        k=torch.empty(1, 1, 1, 64, dtype=torch.int8),
+        v=torch.empty(64, 64, dtype=torch.int8),
+        q_scale=torch.empty(1, dtype=torch.float32),
+        k_scale=torch.empty(1, dtype=torch.float32),
+        v_scale=torch.empty(64, dtype=torch.float32),
+        original_head_dim=64,
+        input_dtype=torch.float16,
+        is_causal=False,
+        attention_scale=0.125,
+        cta_k=64,
+        attn_mask=None,
+    )
+
+    with pytest.raises(ValueError, match="CUDA device"):
+        ck.int8_attention_from_prequantized(packed)
+
+
 @pytest.mark.parametrize(
     ("capability", "expected"),
     [
@@ -92,6 +120,16 @@ def test_int8_attention_matches_sdpa(dtype, head_dim):
 def test_int8_attention_has_no_low_precision_options(option):
     with pytest.raises(TypeError):
         ck.int8_attention(None, None, None, **{option: "input"})
+
+
+@requires_int8_attention
+def test_int8_attention_rejects_mask_with_causal_mode():
+    q, k, v = _qkv(1, 4, 4, 64, 64, 64)
+    mask = torch.ones(1, 1, 64, 64, dtype=torch.bool, device="cuda")
+
+    with pytest.raises(ValueError, match="cannot be used together"):
+        ck.int8_attention(q, k, v, attn_mask=mask, is_causal=True)
+
 
 @requires_int8_attention
 def test_int8_attention_gqa_and_unequal_lengths():
@@ -350,17 +388,18 @@ def test_int8_attention_torch_compile_fullgraph():
 
 
 @requires_int8_attention
-def test_int8_attention_cuda_graph():
+@pytest.mark.parametrize("smooth_k", [False, True])
+def test_int8_attention_cuda_graph(smooth_k):
     q, k, v = _qkv(1, 4, 4, 129, 129, 64)
     warmup_stream = torch.cuda.Stream()
     warmup_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup_stream):
-        ck.int8_attention(q, k, v)
+        ck.int8_attention(q, k, v, smooth_k=smooth_k)
     torch.cuda.current_stream().wait_stream(warmup_stream)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = ck.int8_attention(q, k, v)
+        actual = ck.int8_attention(q, k, v, smooth_k=smooth_k)
     graph.replay()
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
     assert _nrmse(actual, expected) < 0.03

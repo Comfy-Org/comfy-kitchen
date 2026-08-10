@@ -20,6 +20,8 @@
 #include "float_utils.cuh"
 
 #include <cuda_runtime.h>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
 
 namespace {
@@ -32,14 +34,6 @@ constexpr int kDTile = 8;
 __device__ __forceinline__ int inv_perm16(int w) {
   return (w & 1) | (((w >> 3) & 1) << 1) | (((w >> 1) & 1) << 2) |
          (((w >> 2) & 1) << 3);
-}
-
-__device__ __forceinline__ int8_t quantize_s8(float value) {
-  int32_t quantized;
-  asm volatile("cvt.rni.sat.s8.f32 %0, %1;"
-               : "=r"(quantized)
-               : "f"(value));
-  return static_cast<int8_t>(quantized);
 }
 
 template <typename T>
@@ -161,7 +155,7 @@ quant_v_int8_kernel(const T *__restrict__ v, int8_t *__restrict__ out,
 #pragma unroll
     for (int di = 0; di < kDTile; ++di) {
       out[(out_row + di) * padded_N + dst] =
-          quantize_s8(tmp[di] * inv_sc[di]);
+          comfy::float_to_int8_rn(tmp[di] * inv_sc[di]);
     }
   }
 
@@ -183,6 +177,18 @@ extern "C" void launch_quant_v_int8_kernel(const void *v, void *out, void *scale
                                           int padded_N, int64_t sb, int64_t sh,
                                           int64_t sn, int input_dtype_code,
                                           cudaStream_t stream) {
+  const size_t element_size = input_dtype_code == 0 ? sizeof(float) : sizeof(half);
+  if (reinterpret_cast<uintptr_t>(v) % 16 != 0 ||
+      (static_cast<size_t>(sb) * element_size) % 16 != 0 ||
+      (static_cast<size_t>(sh) * element_size) % 16 != 0 ||
+      (static_cast<size_t>(sn) * element_size) % 16 != 0) {
+    throw std::runtime_error(
+        "quant_v_int8: V base pointer and B/H/N strides must be 16-byte aligned");
+  }
+  if (D <= 0 || D % kDTile != 0) {
+    throw std::runtime_error("quant_v_int8: head_dim must be a positive multiple of 8");
+  }
+
   const int blocks = B * H * (D / kDTile);
 
   DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
@@ -196,4 +202,10 @@ extern "C" void launch_quant_v_int8_kernel(const void *v, void *out, void *scale
           static_cast<float *>(scale), N, padded_N, H, D, sb, sh, sn);
     }
   });
+
+  cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    throw std::runtime_error(std::string("quant_v_int8 kernel launch failed: ") +
+                             cudaGetErrorString(error));
+  }
 }
