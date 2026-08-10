@@ -259,9 +259,11 @@ inline int device_wgp_count() {
 //      lower, where fp8 only breaks even. The 64x64 tile crosses over earlier.
 //   3. Warp grid, at a fixed block tile. See the deep-K branch below.
 //
-// The thresholds (K >= 4096 for BKB=128, the ~4 blocks/WGP warp-grid crossover,
-// the skinny cutoff) are tuned on RDNA4 hardware. They govern tile choice only,
-// never correctness.
+// The thresholds (kbytes >= 4096 for BKB=128, the ~4 blocks/WGP warp-grid
+// crossover, the skinny cutoff) are tuned on RDNA4 hardware. They govern tile
+// choice only, never correctness. The depth thresholds compare kbytes — bytes
+// of K, equal to K only for the 8-bit policies; an int4 caller passing K/2
+// doubles the effective K they fire at.
 template <typename Mma, typename Epi, typename OutT>
 void launch_gemm_wmma(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int kbytes,
                       int ldc, Epi epi, hipStream_t stream) {
