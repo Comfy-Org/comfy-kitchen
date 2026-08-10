@@ -15,6 +15,13 @@ from .exceptions import (
 )
 from .float_utils import from_blocked, swap_nibbles, to_blocked
 from .registry import registry
+from .sage_attention import (
+    PrequantizedInt8Attention,
+    int8_attention,
+    int8_attention_from_prequantized,
+    prequantize_int8_attention,
+)
+from .sage_attention import is_available as int8_attention_is_available
 from .tensor.convrot_w4a4 import (
     convrot_w4a4_linear,
     dequantize_convrot_w4a4_weight,
@@ -44,6 +51,11 @@ __all__ = [
     "adaln",
     "rms_adaln",
     # Attention
+    "PrequantizedInt8Attention",
+    "int8_attention",
+    "int8_attention_from_prequantized",
+    "int8_attention_is_available",
+    "prequantize_int8_attention",
     "na2d",
     "na3d",
     # Quantization / dequantization
