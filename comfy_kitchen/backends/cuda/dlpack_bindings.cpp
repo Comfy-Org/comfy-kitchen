@@ -180,7 +180,8 @@ extern "C" {
         int BLKQ, int WARPQ, int BLKK, int WARPK,
         int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
         int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
-        int input_dtype_code, int convrot, cudaStream_t stream);
+        int input_dtype_code, int convrot, int stabilize_k,
+        void* anchor_indices, cudaStream_t stream);
 
     void launch_quant_v_int8_kernel(
         const void* v, void* out, void* scale,
@@ -879,7 +880,9 @@ void quant_qk_per_thread_int8(
     int smooth_k = 0,
     int convrot = 0,
     uintptr_t km_scratch_ptr = 0,
-    uintptr_t km_done_ptr = 0)
+    uintptr_t km_done_ptr = 0,
+    int stabilize_k = 0,
+    uintptr_t anchor_indices_ptr = 0)
 {
     if (q.ndim() != 4 || k.ndim() != 4) {
         throw std::runtime_error("quant_qk_per_thread_int8: q and k must be 4D [B,H,L,D]");
@@ -900,7 +903,8 @@ void quant_qk_per_thread_int8(
         BLKQ, WARPQ, BLKK, WARPK,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
-        input_dtype_code, convrot, stream);
+        input_dtype_code, convrot, stabilize_k,
+        reinterpret_cast<void *>(anchor_indices_ptr), stream);
 }
 
 // Quantization half of the split INT8 SDPA API.  This deliberately launches
@@ -923,7 +927,9 @@ void sage_sdpa_quantize(
     int smooth_k = 0,
     int convrot = 0,
     uintptr_t km_scratch_ptr = 0,
-    uintptr_t km_done_ptr = 0)
+    uintptr_t km_done_ptr = 0,
+    int stabilize_k = 1,
+    uintptr_t anchor_indices_ptr = 0)
 {
     if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
         throw std::runtime_error(
@@ -935,6 +941,10 @@ void sage_sdpa_quantize(
     if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error(
             "sage_sdpa_quantize: input_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
+    }
+    if (stabilize_k && !smooth_k && !anchor_indices_ptr) {
+        throw std::runtime_error(
+            "sage_sdpa_quantize: stabilize_k requires anchor_indices scratch");
     }
 
     const int B = static_cast<int>(q.shape(0));
@@ -973,7 +983,8 @@ void sage_sdpa_quantize(
         BLKQ, WARPQ, cta_k, cta_k,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
-        input_dtype_code, convrot, stream);
+        input_dtype_code, convrot, stabilize_k,
+        reinterpret_cast<void *>(anchor_indices_ptr), stream);
 
     launch_quant_v_int8_kernel(
         v.data(), v_int8.data(), v_scale.data(),
@@ -1193,6 +1204,8 @@ void sage_sdpa(
     int convrot = 0,
     uintptr_t km_scratch_ptr = 0,
     uintptr_t km_done_ptr = 0,
+    int stabilize_k = 1,
+    uintptr_t anchor_indices_ptr = 0,
     std::optional<nb::ndarray<nb::device::cuda>> attn_mask = std::nullopt)
 {
     if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || o.ndim() != 4) {
@@ -1238,6 +1251,10 @@ void sage_sdpa(
     if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error("sage_sdpa: input_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
     }
+    if (stabilize_k && !smooth_k && !anchor_indices_ptr) {
+        throw std::runtime_error(
+            "sage_sdpa: stabilize_k requires anchor_indices scratch");
+    }
     constexpr int BLKQ = 128;
     const int WARPQ = D == 256 ? 16 : 32;
     const bool use_large_cta_k =
@@ -1259,7 +1276,8 @@ void sage_sdpa(
         BLKQ, WARPQ, BLKK, WARPK,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
-        input_dtype_code, convrot, stream);
+        input_dtype_code, convrot, stabilize_k,
+        reinterpret_cast<void *>(anchor_indices_ptr), stream);
 
     launch_quant_v_int8_kernel(
         v.data(), v_int8.data(), v_scale.data(),
@@ -3520,7 +3538,9 @@ NB_MODULE(_C, m) {
           nb::arg("smooth_k") = 0,
           nb::arg("convrot") = 0,
           nb::arg("km_scratch_ptr") = 0,
-          nb::arg("km_done_ptr") = 0);
+          nb::arg("km_done_ptr") = 0,
+          nb::arg("stabilize_k") = 0,
+          nb::arg("anchor_indices_ptr") = 0);
 
     m.def("_sage_attn", &sage_attn,
           "Pure INT8 QK / U8-softmax / INT8-V attention kernel",
@@ -3553,7 +3573,9 @@ NB_MODULE(_C, m) {
           nb::arg("smooth_k") = 0,
           nb::arg("convrot") = 0,
           nb::arg("km_scratch_ptr") = 0,
-          nb::arg("km_done_ptr") = 0);
+          nb::arg("km_done_ptr") = 0,
+          nb::arg("stabilize_k") = 1,
+          nb::arg("anchor_indices_ptr") = 0);
 
     m.def("sage_sdpa_prequantized", &sage_sdpa_prequantized,
           "Run pure-INT8 SDPA from prequantized Q/K/V",
@@ -3592,6 +3614,8 @@ NB_MODULE(_C, m) {
           nb::arg("convrot") = 0,
           nb::arg("km_scratch_ptr") = 0,
           nb::arg("km_done_ptr") = 0,
+          nb::arg("stabilize_k") = 1,
+          nb::arg("anchor_indices_ptr") = 0,
           nb::arg("attn_mask") = nb::none());
 
     m.def("svdquant_quantize_w4a4", &svdquant_quantize_w4a4,

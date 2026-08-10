@@ -125,6 +125,7 @@ def _int8_attention_cuda(
     scale: float | None = None,
     smooth_k: bool = False,
     convrot: bool = False,
+    stabilize_k: bool = True,
     attn_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     attn_mask = _validate_inputs(q, k, v, is_causal, attn_mask)
@@ -197,6 +198,13 @@ def _int8_attention_cuda(
         km_scratch_ptr = km_scratch.data_ptr()
         km_done_ptr = km_done.data_ptr()
 
+    anchor_indices_ptr = 0
+    if stabilize_k and not smooth_k:
+        anchor_indices = torch.empty(
+            batch, kv_heads, dtype=torch.int32, device=q.device
+        )
+        anchor_indices_ptr = anchor_indices.data_ptr()
+
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
     if attn_mask is None:
         _cuda_backend._C.sage_sdpa(
@@ -219,6 +227,8 @@ def _int8_attention_cuda(
             int(convrot),
             km_scratch_ptr,
             km_done_ptr,
+            int(stabilize_k),
+            anchor_indices_ptr,
         )
     else:
         _cuda_backend._C.sage_sdpa(
@@ -241,6 +251,8 @@ def _int8_attention_cuda(
             int(convrot),
             km_scratch_ptr,
             km_done_ptr,
+            int(stabilize_k),
+            anchor_indices_ptr,
             _cuda_backend._wrap_for_dlpack(attn_mask),
         )
 
@@ -257,6 +269,7 @@ def prequantize_int8_attention(
     scale: float | None = None,
     smooth_k: bool = False,
     convrot: bool = False,
+    stabilize_k: bool = True,
     attn_mask: torch.Tensor | None = None,
 ) -> PrequantizedInt8Attention:
     """Quantize Q, K, and V without allocating the attention output.
@@ -343,6 +356,13 @@ def prequantize_int8_attention(
         km_scratch_ptr = km_scratch.data_ptr()
         km_done_ptr = km_done.data_ptr()
 
+    anchor_indices_ptr = 0
+    if stabilize_k and not smooth_k:
+        anchor_indices = torch.empty(
+            batch, kv_heads, dtype=torch.int32, device=q.device
+        )
+        anchor_indices_ptr = anchor_indices.data_ptr()
+
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
     _cuda_backend._C.sage_sdpa_quantize(
         _cuda_backend._wrap_for_dlpack(q),
@@ -361,6 +381,8 @@ def prequantize_int8_attention(
         int(convrot),
         km_scratch_ptr,
         km_done_ptr,
+        int(stabilize_k),
+        anchor_indices_ptr,
     )
 
     return PrequantizedInt8Attention(
@@ -438,6 +460,7 @@ def _op_int8_attention(
     scale: float | None,
     smooth_k: bool,
     convrot: bool,
+    stabilize_k: bool,
 ) -> torch.Tensor:
     return _int8_attention_cuda(
         q,
@@ -447,6 +470,7 @@ def _op_int8_attention(
         scale=scale,
         smooth_k=smooth_k,
         convrot=convrot,
+        stabilize_k=stabilize_k,
         attn_mask=None,
     )
 
@@ -460,6 +484,7 @@ def _op_int8_attention_fake(
     scale,
     smooth_k,
     convrot,
+    stabilize_k,
 ):
     return q.new_empty(q.shape)
 
@@ -473,6 +498,7 @@ def _op_int8_attention_masked(
     scale: float | None,
     smooth_k: bool,
     convrot: bool,
+    stabilize_k: bool,
 ) -> torch.Tensor:
     return _int8_attention_cuda(
         q,
@@ -481,6 +507,7 @@ def _op_int8_attention_masked(
         scale=scale,
         smooth_k=smooth_k,
         convrot=convrot,
+        stabilize_k=stabilize_k,
         attn_mask=attn_mask,
     )
 
@@ -494,6 +521,7 @@ def _op_int8_attention_masked_fake(
     scale,
     smooth_k,
     convrot,
+    stabilize_k,
 ):
     return q.new_empty(q.shape)
 
@@ -507,6 +535,7 @@ def int8_attention(
     scale: float | None = None,
     smooth_k: bool = False,
     convrot: bool = False,
+    stabilize_k: bool = True,
     attn_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute inference SDPA with signed INT8 Q/K/V and unsigned INT8 P.
@@ -518,10 +547,15 @@ def int8_attention(
     ``convrot`` is true, Q and K receive the same fused block-Hadamard rotation
     before INT8 quantization, preserving their exact dot products while
     reducing quantization outliers. K lengths up to 256 use low-overhead H4
-    blocks; longer D64 attention uses H64, while D128 and D256 use H128.
+    blocks and longer D64 attention uses H64. The common D128 path uses a fixed
+    signed H128 transform; smooth-K and padded D256 retain plain H128.
     ``smooth_k`` subtracts each key channel's sequence mean before quantization;
     softmax makes this score shift exact, but the extra reduction is disabled by
-    default for throughput.
+    default for throughput. By default, ``stabilize_k`` samples K on the GPU and
+    subtracts a representative key only when doing so improves the quantization
+    range. This model-independent shift is also exactly softmax-invariant and
+    uses one int32 of temporary storage per batch/KV-head. ``smooth_k`` takes
+    precedence when both options are enabled.
     Softmax score, maximum, exponential, denominator, reciprocal, and V-scale
     arithmetic is FP32. This path does not allocate FP8 tensors or execute FP8
     MMA instructions.
@@ -535,6 +569,7 @@ def int8_attention(
             scale,
             smooth_k,
             convrot,
+            stabilize_k,
         )
     if is_causal:
         raise ValueError("attn_mask and is_causal cannot be used together")
@@ -546,4 +581,5 @@ def int8_attention(
         scale,
         smooth_k,
         convrot,
+        stabilize_k,
     )

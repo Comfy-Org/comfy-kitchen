@@ -68,6 +68,7 @@ def test_int8_attention_allocates_only_integer_8bit_scratch(monkeypatch):
     ck.int8_attention(q, k, v)
 
     assert allocated_dtypes.count(torch.int8) == 3
+    assert allocated_dtypes.count(torch.int32) == 1
     assert torch.float8_e4m3fn not in allocated_dtypes
 
 
@@ -203,6 +204,42 @@ def test_int8_attention_smooth_k():
 
 
 @requires_int8_attention
+def test_int8_attention_stabilizes_large_common_key_component():
+    torch.manual_seed(7)
+    q, k, v = _qkv(1, 16, 16, 513, 513, 128)
+    common_key = torch.randn(
+        1, 16, 1, 128, device="cuda", dtype=torch.float32
+    )
+    common_key.mul_(40.0 / common_key.square().mean(-1, keepdim=True).sqrt())
+    k.add_(common_key.to(k.dtype))
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    stabilized = ck.int8_attention(q, k, v, convrot=True)
+    unstabilized = ck.int8_attention(
+        q, k, v, convrot=True, stabilize_k=False
+    )
+
+    stabilized_error = _nrmse(stabilized, expected)
+    unstabilized_error = _nrmse(unstabilized, expected)
+    assert torch.isfinite(stabilized).all()
+    assert stabilized_error < 0.03
+    assert not torch.isfinite(unstabilized).all() or (
+        stabilized_error < unstabilized_error * 0.25
+    )
+
+
+@requires_int8_attention
+def test_int8_attention_stabilization_preserves_normal_key_path():
+    torch.manual_seed(11)
+    q, k, v = _qkv(1, 8, 8, 257, 257, 128)
+
+    stabilized = ck.int8_attention(q, k, v, convrot=True)
+    original = ck.int8_attention(q, k, v, convrot=True, stabilize_k=False)
+
+    assert torch.equal(stabilized, original)
+
+
+@requires_int8_attention
 @pytest.mark.parametrize(
     "configuration",
     [
@@ -220,6 +257,12 @@ def test_int8_attention_smooth_k():
             "smooth_k": True,
             "dtype": torch.float32,
         },
+        {
+            "q_length": 193,
+            "kv_length": 1281,
+            "head_dim": 128,
+            "stabilize_k": False,
+        },
         {"q_length": 257, "kv_length": 257, "head_dim": 256, "is_causal": True},
     ],
 )
@@ -227,7 +270,7 @@ def test_prequantized_attention_is_bitwise_identical_to_fused(configuration):
     torch.manual_seed(123)
     options = {
         key: configuration[key]
-        for key in ("convrot", "smooth_k", "is_causal")
+        for key in ("convrot", "smooth_k", "stabilize_k", "is_causal")
         if key in configuration
     }
     q, k, v = _qkv(

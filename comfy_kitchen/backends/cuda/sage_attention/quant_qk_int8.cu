@@ -87,6 +87,30 @@ __forceinline__ __device__ void convrot4(float *values) {
   values[3] = (a1 - a3) * 0.5f;
 }
 
+// A fixed random diagonal makes the following Hadamard a randomized
+// orthogonal transform instead of aligning every row to the same structured
+// basis. Q and K use the same signs, so their exact dot product is unchanged.
+// Flip the IEEE sign bit directly: this is exact and avoids an FP multiply.
+__forceinline__ __device__ void apply_convrot_sign128(float *values,
+                                                      const int lane) {
+  constexpr uint32_t signs_0 = 0x1035997bu;
+  constexpr uint32_t signs_1 = 0x8087f5eeu;
+  constexpr uint32_t signs_2 = 0xee2e4e1au;
+  constexpr uint32_t signs_3 = 0x71132418u;
+  const uint32_t signs =
+      lane < 8    ? signs_0
+      : lane < 16 ? signs_1
+      : lane < 24 ? signs_2
+                  : signs_3;
+  const int shift = (lane & 7) * 4;
+#pragma unroll
+  for (int channel = 0; channel < 4; ++channel) {
+    const uint32_t flip = ((signs >> (shift + channel)) & 1u) ^ 1u;
+    values[channel] =
+        __uint_as_float(__float_as_uint(values[channel]) ^ (flip << 31));
+  }
+}
+
 // Apply a normalized Walsh-Hadamard H64 to one 64-channel half-warp group.
 // H4 covers the four adjacent channels owned by each lane; four shuffle
 // butterflies cover the remaining 16-lane dimension. This uses half as many
@@ -112,7 +136,7 @@ __forceinline__ __device__ void convrot64(float *values) {
 }
 
 // Apply a normalized Walsh-Hadamard H128 across all four-channel warp groups.
-__forceinline__ __device__ void convrot128(float *values) {
+__forceinline__ __device__ void convrot128_plain(float *values) {
   convrot4(values);
   const int lane = threadIdx.x & 31;
 
@@ -128,6 +152,11 @@ __forceinline__ __device__ void convrot128(float *values) {
 #pragma unroll
   for (int c = 0; c < 4; ++c)
     values[c] *= 0.1767766952966369f;
+}
+
+__forceinline__ __device__ void convrot128(float *values) {
+  apply_convrot_sign128(values, threadIdx.x & 31);
+  convrot128_plain(values);
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +227,8 @@ process_q(const T *__restrict__ in, int8_t *__restrict__ out,
         for (int j = 0; j < NR; ++j) {
           if constexpr (ROTATION == 128)
             convrot128(&v[(tile * NR + j) * 4]);
+          else if constexpr (ROTATION == 129)
+            convrot128_plain(&v[(tile * NR + j) * 4]);
           else if constexpr (ROTATION == 64)
             convrot64(&v[(tile * NR + j) * 4]);
           else
@@ -252,16 +283,18 @@ process_q(const T *__restrict__ in, int8_t *__restrict__ out,
 // ---------------------------------------------------------------------------
 // K processing device function
 //
-// When km != nullptr (float32), subtracts the per-channel mean from each
-// loaded value before abs-max reduction and quantization.  km points to
-// D floats for the current (b,h) slice.
+// When AUTO_CENTER_K is enabled and anchor_index is nonnegative, subtracts
+// that key vector from every key. Otherwise, when km != nullptr (float32),
+// subtracts the per-channel mean. Both shifts are exactly softmax-invariant
+// and happen before abs-max reduction, rotation, and quantization.
 // ---------------------------------------------------------------------------
 template <typename T, int NL, int WARPK, int CHANNEL_TILES, int ROTATION,
-          bool ALIGNED4>
+          bool AUTO_CENTER_K, bool ALIGNED4>
 __forceinline__ __device__ void
 process_k(const T *__restrict__ in, int8_t *__restrict__ out,
           float *__restrict__ sc_buf, const int oblk, const int L, const int C,
-          const float *__restrict__ km, const int64_t stride_n) {
+          const float *__restrict__ km, const int anchor_index,
+          const int64_t stride_n) {
   const int lane = threadIdx.x & 31;
   const int wid = threadIdx.x >> 5;
   const int otld = wid;
@@ -271,7 +304,26 @@ process_k(const T *__restrict__ in, int8_t *__restrict__ out,
   for (int i = 0; i < CHANNEL_TILES * 4; ++i)
     bias[i] = 0.f;
 
-  if (km) {
+  if constexpr (AUTO_CENTER_K) {
+    if (anchor_index >= 0) {
+#pragma unroll
+      for (int tile = 0; tile < CHANNEL_TILES; ++tile) {
+        const int ch = tile * 128 + (lane << 2);
+        const int64_t anchor_offset =
+            (int64_t)anchor_index * stride_n + ch;
+        if (ALIGNED4 || ch + 3 < C) {
+          VectorLoader4<T>::load(&in[anchor_offset], &bias[tile * 4]);
+        } else if (ch < C) {
+#pragma unroll
+          for (int c = 0; c < 4; ++c)
+            bias[tile * 4 + c] =
+                (ch + c < C)
+                    ? static_cast<float>(__ldg(&in[anchor_offset + c]))
+                    : 0.f;
+        }
+      }
+    }
+  } else if (km) {
 #pragma unroll
     for (int tile = 0; tile < CHANNEL_TILES; ++tile) {
       const int ch = tile * 128 + (lane << 2);
@@ -349,6 +401,8 @@ process_k(const T *__restrict__ in, int8_t *__restrict__ out,
       for (int j = 0; j < 2 * NL; ++j) {
         if constexpr (ROTATION == 128)
           convrot128(&v[(tile * 2 * NL + j) * 4]);
+        else if constexpr (ROTATION == 129)
+          convrot128_plain(&v[(tile * 2 * NL + j) * 4]);
         else if constexpr (ROTATION == 64)
           convrot64(&v[(tile * 2 * NL + j) * 4]);
         else
@@ -501,6 +555,167 @@ __global__ __launch_bounds__(MEAN_BLK_DIM) void k_mean_reduce(
 }
 
 // ---------------------------------------------------------------------------
+// Model-independent K stabilization detector
+//
+// Samples nine evenly spaced keys per (batch, head), selects the sampled key
+// that minimizes residual energy, and enables centering only when that anchor
+// reduces sampled energy without increasing sampled abs-max by more than
+// 12.5%. The output is an absolute sequence index, or -1 when the original K
+// range is preferable. No host synchronization is required.
+// ---------------------------------------------------------------------------
+constexpr int CENTER_DETECT_THREADS = 128;
+constexpr int CENTER_SAMPLES = 9;
+constexpr int CENTER_MAX_CHANNELS = 256;
+
+template <typename T>
+__global__ __launch_bounds__(CENTER_DETECT_THREADS) void detect_k_anchor(
+    const T *__restrict__ k_in, int *__restrict__ anchor_indices, const int Lk,
+    const int C, const int H_kv, const int64_t stride_b,
+    const int64_t stride_h, const int64_t stride_n) {
+  const int h = blockIdx.x;
+  const int b = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int64_t bh_offset =
+      (int64_t)b * stride_b + (int64_t)h * stride_h;
+
+  __shared__ float samples[CENTER_SAMPLES * CENTER_MAX_CHANNELS];
+  __shared__ float warp_original_energy[4];
+  __shared__ float warp_original_max[4];
+  __shared__ float warp_candidate_distance[CENTER_SAMPLES][4];
+  __shared__ float warp_best_energy[4];
+  __shared__ float warp_best_max[4];
+  __shared__ int selected_candidate;
+
+  for (int index = tid; index < CENTER_SAMPLES * C;
+       index += CENTER_DETECT_THREADS) {
+    const int sample = index / C;
+    const int channel = index - sample * C;
+    const int row = sample * (Lk - 1) / (CENTER_SAMPLES - 1);
+    samples[index] = static_cast<float>(
+        __ldg(&k_in[bh_offset + (int64_t)row * stride_n + channel]));
+  }
+  __syncthreads();
+
+  float original_energy = 0.f;
+  float original_max = 0.f;
+  float candidate_distance[CENTER_SAMPLES];
+#pragma unroll
+  for (int candidate = 0; candidate < CENTER_SAMPLES; ++candidate) {
+    candidate_distance[candidate] = 0.f;
+  }
+
+  for (int channel = tid; channel < C; channel += CENTER_DETECT_THREADS) {
+    float channel_sum = 0.f;
+#pragma unroll
+    for (int sample = 0; sample < CENTER_SAMPLES; ++sample) {
+      const float value = samples[sample * C + channel];
+      original_energy = fmaf(value, value, original_energy);
+      original_max = fmaxf(original_max, fabsf(value));
+      channel_sum += value;
+    }
+#pragma unroll
+    for (int candidate = 0; candidate < CENTER_SAMPLES; ++candidate) {
+      const float distance =
+          CENTER_SAMPLES * samples[candidate * C + channel] - channel_sum;
+      candidate_distance[candidate] =
+          fmaf(distance, distance, candidate_distance[candidate]);
+    }
+  }
+
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    original_energy +=
+        __shfl_down_sync(0xffffffffu, original_energy, offset);
+    original_max = fmaxf(
+        original_max, __shfl_down_sync(0xffffffffu, original_max, offset));
+#pragma unroll
+    for (int candidate = 0; candidate < CENTER_SAMPLES; ++candidate) {
+      candidate_distance[candidate] += __shfl_down_sync(
+          0xffffffffu, candidate_distance[candidate], offset);
+    }
+  }
+
+  if (lane == 0) {
+    warp_original_energy[warp] = original_energy;
+    warp_original_max[warp] = original_max;
+#pragma unroll
+    for (int candidate = 0; candidate < CENTER_SAMPLES; ++candidate) {
+      warp_candidate_distance[candidate][warp] =
+          candidate_distance[candidate];
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    int best_candidate = 0;
+    float best_distance = 3.402823466e+38F;
+#pragma unroll
+    for (int candidate = 0; candidate < CENTER_SAMPLES; ++candidate) {
+      float distance = 0.f;
+#pragma unroll
+      for (int w = 0; w < 4; ++w) {
+        distance += warp_candidate_distance[candidate][w];
+      }
+      if (distance < best_distance) {
+        best_candidate = candidate;
+        best_distance = distance;
+      }
+    }
+    selected_candidate = best_candidate;
+  }
+  __syncthreads();
+
+  float best_energy = 0.f;
+  float best_max = 0.f;
+  for (int channel = tid; channel < C; channel += CENTER_DETECT_THREADS) {
+    const float anchor = samples[selected_candidate * C + channel];
+#pragma unroll
+    for (int sample = 0; sample < CENTER_SAMPLES; ++sample) {
+      const float residual = samples[sample * C + channel] - anchor;
+      best_energy = fmaf(residual, residual, best_energy);
+      best_max = fmaxf(best_max, fabsf(residual));
+    }
+  }
+
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    best_energy += __shfl_down_sync(0xffffffffu, best_energy, offset);
+    best_max = fmaxf(
+        best_max, __shfl_down_sync(0xffffffffu, best_max, offset));
+  }
+  if (lane == 0) {
+    warp_best_energy[warp] = best_energy;
+    warp_best_max[warp] = best_max;
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    float total_original_energy = 0.f;
+    float total_original_max = 0.f;
+    float total_best_energy = 0.f;
+    float total_best_max = 0.f;
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+      total_original_energy += warp_original_energy[w];
+      total_original_max =
+          fmaxf(total_original_max, warp_original_max[w]);
+      total_best_energy += warp_best_energy[w];
+      total_best_max = fmaxf(total_best_max, warp_best_max[w]);
+    }
+
+    const bool improves_range =
+        total_best_energy < total_original_energy &&
+        total_best_max <= total_original_max * 1.125f;
+    anchor_indices[b * H_kv + h] =
+        improves_range
+            ? selected_candidate * (Lk - 1) / (CENTER_SAMPLES - 1)
+            : -1;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Standalone Q kernel
 // ---------------------------------------------------------------------------
 template <typename T, int NR, int BLKQ, int WARPQ, int CHANNEL_TILES,
@@ -524,11 +739,12 @@ __global__ __launch_bounds__(128, 4) void quant_q_kernel(
 // km is float32 [B, H_kv, C] computed by k_mean_reduce.
 // ---------------------------------------------------------------------------
 template <typename T, int NL, int WARPK, int CHANNEL_TILES, int ROTATION,
-          bool ALIGNED4>
+          bool AUTO_CENTER_K, bool ALIGNED4>
 __global__ __launch_bounds__(128, 4) void quant_k_kernel(
     const T *__restrict__ k_in, int8_t *__restrict__ k_out,
-    float *__restrict__ k_sb, const float *__restrict__ km, const int Lk,
-    const int C, const int H_kv, const int k_sc_per_h, const int64_t stride_b,
+    float *__restrict__ k_sb, const float *__restrict__ km,
+    const int *__restrict__ anchor_indices, const int Lk, const int C,
+    const int H_kv, const int k_sc_per_h, const int64_t stride_b,
     const int64_t stride_h, const int64_t stride_n) {
   const int oblk = blockIdx.x;
   const int h = blockIdx.y, b = blockIdx.z;
@@ -536,9 +752,12 @@ __global__ __launch_bounds__(128, 4) void quant_k_kernel(
   const int64_t out_bh = ((int64_t)b * H_kv + h) * Lk * C;
   const int64_t sbh = ((int64_t)b * H_kv + h) * k_sc_per_h;
   const float *km_bh = km ? km + ((int64_t)b * H_kv + h) * C : nullptr;
-  process_k<T, NL, WARPK, CHANNEL_TILES, ROTATION, ALIGNED4>(
-      k_in + in_bh, k_out + out_bh, k_sb + sbh, oblk, Lk, C, km_bh,
-      stride_n);
+  int anchor_index = -1;
+  if constexpr (AUTO_CENTER_K)
+    anchor_index = __ldg(&anchor_indices[b * H_kv + h]);
+  process_k<T, NL, WARPK, CHANNEL_TILES, ROTATION, AUTO_CENTER_K,
+            ALIGNED4>(k_in + in_bh, k_out + out_bh, k_sb + sbh, oblk, Lk,
+                      C, km_bh, anchor_index, stride_n);
 }
 
 // ---------------------------------------------------------------------------
@@ -547,14 +766,15 @@ __global__ __launch_bounds__(128, 4) void quant_k_kernel(
 // blockIdx.x >= q_oblk_count →  K path
 // ---------------------------------------------------------------------------
 template <typename T, int NR, int NL, int BLKQ, int WARPQ, int BLKK, int WARPK,
-          int CHANNEL_TILES, int ROTATION, bool ALIGNED4>
+          int CHANNEL_TILES, int ROTATION, bool AUTO_CENTER_K, bool ALIGNED4>
 __global__ __launch_bounds__(128, 3) void quant_qk_fused(
     const T *__restrict__ q_in, int8_t *__restrict__ q_out,
     float *__restrict__ q_sb, const T *__restrict__ k_in,
     int8_t *__restrict__ k_out, float *__restrict__ k_sb,
-    const float *__restrict__ km, const int Lq, const int Lk, const int C,
-    const int q_oblk_count, const int H_q, const int H_kv, const int q_sc_per_h,
-    const int k_sc_per_h, const int64_t q_stride_b, const int64_t q_stride_h,
+    const float *__restrict__ km, const int *__restrict__ anchor_indices,
+    const int Lq, const int Lk, const int C, const int q_oblk_count,
+    const int H_q, const int H_kv, const int q_sc_per_h, const int k_sc_per_h,
+    const int64_t q_stride_b, const int64_t q_stride_h,
     const int64_t q_stride_n, const int64_t k_stride_b,
     const int64_t k_stride_h, const int64_t k_stride_n) {
   const int h = blockIdx.y, b = blockIdx.z;
@@ -575,9 +795,13 @@ __global__ __launch_bounds__(128, 3) void quant_qk_fused(
     const int64_t out_bh = ((int64_t)b * H_kv + h) * Lk * C;
     const int64_t sbh = ((int64_t)b * H_kv + h) * k_sc_per_h;
     const float *km_bh = km ? km + ((int64_t)b * H_kv + h) * C : nullptr;
-    process_k<T, NL, WARPK, CHANNEL_TILES, ROTATION, ALIGNED4>(
-        k_in + in_bh, k_out + out_bh, k_sb + sbh,
-        (int)blockIdx.x - q_oblk_count, Lk, C, km_bh, k_stride_n);
+    int anchor_index = -1;
+    if constexpr (AUTO_CENTER_K)
+      anchor_index = __ldg(&anchor_indices[b * H_kv + h]);
+    process_k<T, NL, WARPK, CHANNEL_TILES, ROTATION, AUTO_CENTER_K,
+              ALIGNED4>(k_in + in_bh, k_out + out_bh, k_sb + sbh,
+                        (int)blockIdx.x - q_oblk_count, Lk, C, km_bh,
+                        anchor_index, k_stride_n);
   }
 }
 
@@ -592,7 +816,8 @@ extern "C" void launch_quant_qk_per_thread_int8(
     int H_q, int Lq, int H_kv, int Lk, int C, int BLKQ, int WARPQ, int BLKK,
     int WARPK, int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
     int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
-    int input_dtype_code, int convrot, cudaStream_t stream) {
+    int input_dtype_code, int convrot, int stabilize_k, void *anchor_indices,
+    cudaStream_t stream) {
   const int q_oblk = (Lq + BLKQ - 1) / BLKQ * (BLKQ / WARPQ);
   const int k_oblk = (Lk + BLKK - 1) / BLKK * (BLKK / WARPK);
   const int q_sc_per_h = q_oblk * 8;
@@ -627,7 +852,18 @@ extern "C" void launch_quant_qk_per_thread_int8(
     km_ptr = (float *)km_scratch;
   }
 
-#define LAUNCH_SPLIT(T, NR, NL, BQ, WQ, BK, WK, CT, ROT, A4)                   \
+  int *anchor_ptr = nullptr;
+  if (stabilize_k && !smooth_k && anchor_indices) {
+    dim3 gd(H_kv, B);
+    DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
+      detect_k_anchor<T><<<gd, CENTER_DETECT_THREADS, 0, stream>>>(
+          (const T *)k, (int *)anchor_indices, Lk, C, H_kv, k_stride_b,
+          k_stride_h, k_stride_n);
+    });
+    anchor_ptr = (int *)anchor_indices;
+  }
+
+#define LAUNCH_SPLIT(T, NR, NL, BQ, WQ, BK, WK, CT, ROT, AUTO, A4)             \
   do {                                                                         \
     dim3 gq(q_oblk, H_q, B);                                                   \
     quant_q_kernel<T, NR, BQ, WQ, CT, ROT, A4>                                 \
@@ -635,59 +871,72 @@ extern "C" void launch_quant_qk_per_thread_int8(
                                  (float *)q_scale, Lq, C, H_q, q_sc_per_h,     \
                                  q_stride_b, q_stride_h, q_stride_n);           \
     dim3 gk(k_oblk, H_kv, B);                                                  \
-    quant_k_kernel<T, NL, WK, CT, ROT, A4><<<gk, 128, 0, stream>>>(            \
-        (const T *)k, (int8_t *)k_int8, (float *)k_scale, km_ptr, Lk, C, H_kv, \
-        k_sc_per_h, k_stride_b, k_stride_h, k_stride_n);                       \
+    quant_k_kernel<T, NL, WK, CT, ROT, AUTO, A4>                               \
+        <<<gk, 128, 0, stream>>>(                                              \
+        (const T *)k, (int8_t *)k_int8, (float *)k_scale, km_ptr, anchor_ptr,  \
+        Lk, C, H_kv, k_sc_per_h, k_stride_b, k_stride_h, k_stride_n);          \
   } while (0)
 
-#define LAUNCH_FUSED(T, NR, NL, BQ, WQ, BK, WK, CT, ROT, A4)                   \
+#define LAUNCH_FUSED(T, NR, NL, BQ, WQ, BK, WK, CT, ROT, AUTO, A4)             \
   do {                                                                         \
     const int H_max = H_q > H_kv ? H_q : H_kv;                                 \
     dim3 g(q_oblk + k_oblk, H_max, B);                                         \
-    quant_qk_fused<T, NR, NL, BQ, WQ, BK, WK, CT, ROT, A4>                     \
+    quant_qk_fused<T, NR, NL, BQ, WQ, BK, WK, CT, ROT, AUTO, A4>               \
         <<<g, 128, 0, stream>>>(                                                \
         (const T *)q, (int8_t *)q_int8, (float *)q_scale, (const T *)k,        \
-        (int8_t *)k_int8, (float *)k_scale, km_ptr, Lq, Lk, C, q_oblk, H_q,    \
-        H_kv, q_sc_per_h, k_sc_per_h, q_stride_b, q_stride_h, q_stride_n,       \
-        k_stride_b, k_stride_h, k_stride_n);                                   \
+        (int8_t *)k_int8, (float *)k_scale, km_ptr, anchor_ptr, Lq, Lk, C,     \
+        q_oblk, H_q, H_kv, q_sc_per_h, k_sc_per_h, q_stride_b, q_stride_h,     \
+        q_stride_n, k_stride_b, k_stride_h, k_stride_n);                       \
   } while (0)
 
-#define LAUNCH_SELECTED(T, ROT)                                                \
+#define LAUNCH_SELECTED(T, ROT, AUTO)                                          \
   do {                                                                         \
     if (BLKQ == 128 && WARPQ == 16 && BLKK == 128 && WARPK == 128) {           \
-      LAUNCH_SPLIT(T, 2, 16, 128, 16, 128, 128, 2, ROT, true);                 \
+      LAUNCH_SPLIT(T, 2, 16, 128, 16, 128, 128, 2, ROT, AUTO, true);           \
     } else if (BLKQ == 128 && WARPQ == 16 && BLKK == 64 && WARPK == 64) {      \
-      LAUNCH_SPLIT(T, 2, 8, 128, 16, 64, 64, 2, ROT, true);                    \
+      LAUNCH_SPLIT(T, 2, 8, 128, 16, 64, 64, 2, ROT, AUTO, true);              \
     } else if (BLKK == 128 && WARPK == 128 && C == 256) {                      \
-      LAUNCH_SPLIT(T, 4, 16, 128, 32, 128, 128, 2, ROT, true);                 \
+      LAUNCH_SPLIT(T, 4, 16, 128, 32, 128, 128, 2, ROT, AUTO, true);           \
     } else if (C == 256) {                                                     \
-      LAUNCH_SPLIT(T, 4, 8, 128, 32, 64, 64, 2, ROT, true);                    \
+      LAUNCH_SPLIT(T, 4, 8, 128, 32, 64, 64, 2, ROT, AUTO, true);              \
     } else if (BLKK == 128 && WARPK == 128 && aligned4) {                      \
-      LAUNCH_FUSED(T, 4, 16, 128, 32, 128, 128, 1, ROT, true);                 \
+      LAUNCH_FUSED(T, 4, 16, 128, 32, 128, 128, 1, ROT, AUTO, true);           \
     } else if (BLKK == 128 && WARPK == 128) {                                  \
-      LAUNCH_FUSED(T, 4, 16, 128, 32, 128, 128, 1, ROT, false);                \
+      LAUNCH_FUSED(T, 4, 16, 128, 32, 128, 128, 1, ROT, AUTO, false);          \
     } else if (aligned4) {                                                     \
-      LAUNCH_FUSED(T, 4, 8, 128, 32, 64, 64, 1, ROT, true);                    \
+      LAUNCH_FUSED(T, 4, 8, 128, 32, 64, 64, 1, ROT, AUTO, true);              \
     } else {                                                                   \
-      LAUNCH_FUSED(T, 4, 8, 128, 32, 64, 64, 1, ROT, false);                   \
+      LAUNCH_FUSED(T, 4, 8, 128, 32, 64, 64, 1, ROT, AUTO, false);             \
     }                                                                          \
   } while (0)
 
-#define DO(T)                                                                  \
+#define DO_AUTO(T, AUTO)                                                       \
   if (!convrot) {                                                              \
-    LAUNCH_SELECTED(T, 0);                                                     \
+    LAUNCH_SELECTED(T, 0, AUTO);                                               \
   } else if (Lk <= 256) {                                                      \
-    LAUNCH_SELECTED(T, 4);                                                     \
+    LAUNCH_SELECTED(T, 4, AUTO);                                               \
+  } else if (C == 128 && !smooth_k) {                                          \
+    LAUNCH_SELECTED(T, 128, AUTO);                                             \
   } else if (C >= 128) {                                                       \
-    LAUNCH_SELECTED(T, 128);                                                   \
+    LAUNCH_SELECTED(T, 129, AUTO);                                             \
   } else {                                                                     \
-    LAUNCH_SELECTED(T, 64);                                                    \
+    LAUNCH_SELECTED(T, 64, AUTO);                                              \
   }
+
+#define DO(T)                                                                  \
+  do {                                                                         \
+    if (anchor_ptr) {                                                          \
+      DO_AUTO(T, true);                                                        \
+    } else {                                                                   \
+      DO_AUTO(T, false);                                                       \
+    }                                                                          \
+  } while (0)
 
   DISPATCH_FP_DTYPE(input_dtype_code, T, [&] { DO(T); });
 
 #undef LAUNCH_SPLIT
 #undef LAUNCH_FUSED
 #undef LAUNCH_SELECTED
+#undef DO_AUTO
 #undef DO
 }
