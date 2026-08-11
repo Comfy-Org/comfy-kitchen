@@ -13,6 +13,13 @@
 
 extern "C" {
 
+// Fused 3D neighborhood attention over contiguous (B, T, H, W, NH, HD) tensors.
+// dtype_code is a DTYPE_TO_CODE value: 1 float16, 2 bfloat16. See ops/na3d.hip.
+void launch_na3d_kernel(const void* q, const void* k, const void* v, void* out, int batch,
+                        int t_size, int h_size, int w_size, int num_heads, int head_dim, int kt,
+                        int kh, int kw, int causal_t, int causal_h, int causal_w, float scale,
+                        int dtype_code, hipStream_t stream);
+
 // ldc is c's row stride, so a caller writing an N-column slice of a wider output
 // passes that output's width; a whole GEMM passes N.
 void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* scale_a,
@@ -25,6 +32,16 @@ void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* 
 void launch_dequant_int4_grouped_to_int8_kernel(const void* qw, const void* s_rel, int scale_code,
                                                 const void* codebook, void* out, int64_t n,
                                                 int64_t k, int group_size, hipStream_t stream);
+
+// in_dtype_code is a DTYPE_TO_CODE value: 0 float32, 1 float16, 2 bfloat16.
+// s_rel is written as raw e4m3 bytes; seed is ignored unless stochastic is set.
+void launch_quantize_w4a8_convrot_kernel(const void* rotated, const void* codebook, void* packed,
+                                         void* s_rel, void* s_channel, int64_t n, int64_t k,
+                                         int in_dtype_code, bool stochastic, uint64_t seed,
+                                         hipStream_t stream);
+
+// Widest K the fused requantize can take on the current device, 0 if unknown.
+int w4a8_requant_max_k_kernel();
 
 void launch_w4a8_int8_gemm_chunked_kernel(const void* xq, const void* qw, const void* s_rel,
                                           int scale_code, const void* codebook,

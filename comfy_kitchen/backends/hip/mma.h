@@ -44,6 +44,8 @@ typedef int v8i __attribute__((ext_vector_type(8)));
 typedef float v8f __attribute__((ext_vector_type(8)));
 typedef __bf16 v8bf __attribute__((ext_vector_type(8)));
 typedef __bf16 v16bf __attribute__((ext_vector_type(16)));
+typedef _Float16 v8h __attribute__((ext_vector_type(8)));
+typedef _Float16 v16h __attribute__((ext_vector_type(16)));
 
 constexpr int kWave = 32;
 
@@ -109,6 +111,22 @@ __forceinline__ __device__ v16bf load_frag_fp8_as_bf16(const void* lds, int row,
         r[i] = static_cast<__bf16>(E5M2 ? bf8_to_float(p[i]) : fp8_to_float(p[i]));
     }
     return r;
+}
+
+// A K-step of a 16-bit row, straight out of whatever address space `row` points
+// at. The half-wave slice is the policy's, since gfx11 hands every lane the whole
+// K-step and gfx12 splits it. The elements are contiguous, so this folds into
+// vector loads.
+template <typename Mma>
+__forceinline__ __device__ typename Mma::Frag load_frag_16bit(const typename Mma::Elem* row,
+                                                              int lane) {
+    typename Mma::Frag f;
+    const typename Mma::Elem* p = row + Mma::frag_base(lane);
+    #pragma unroll
+    for (int i = 0; i < Mma::kFragElems; ++i) {
+        f[i] = p[i];
+    }
+    return f;
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +203,35 @@ struct MmaInt4 {
     static __forceinline__ __device__ float get(Acc c, int e) { return static_cast<float>(c[e]); }
 };
 
+// 16-bit float MMA, used by the attention kernels rather than the GEMM core: they
+// build fragments from global memory and from LDS scratch, so the policy exposes
+// the element type and the half-wave's K slice instead of a byte-addressed load.
+struct MmaBf16 {
+    using Acc = v8f;
+    using Frag = v8bf;
+    using Elem = __bf16;
+    static constexpr int kFragElems = 8;
+    static __forceinline__ __device__ int frag_base(int lane) { return 8 * (lane / 16); }
+    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+    static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
+        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
+    }
+    static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
+};
+
+struct MmaF16 {
+    using Acc = v8f;
+    using Frag = v8h;
+    using Elem = _Float16;
+    static constexpr int kFragElems = 8;
+    static __forceinline__ __device__ int frag_base(int lane) { return 8 * (lane / 16); }
+    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+    static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
+        return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+    }
+    static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
+};
+
 #elif defined(COMFY_MMA_GFX11)
 
 struct MmaFp8 {
@@ -253,6 +300,34 @@ struct MmaInt4 {
     static __forceinline__ __device__ float get(Acc c, int e) { return static_cast<float>(c[e]); }
 };
 
+
+// gfx11 hands every lane the whole 16-wide K-step, duplicated across half-waves.
+struct MmaBf16 {
+    using Acc = v8f;
+    using Frag = v16bf;
+    using Elem = __bf16;
+    static constexpr int kFragElems = 16;
+    static __forceinline__ __device__ int frag_base(int) { return 0; }
+    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+    static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
+        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
+    }
+    static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
+};
+
+struct MmaF16 {
+    using Acc = v8f;
+    using Frag = v16h;
+    using Elem = _Float16;
+    static constexpr int kFragElems = 16;
+    static __forceinline__ __device__ int frag_base(int) { return 0; }
+    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+    static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
+        return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+    }
+    static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
+};
+
 #else
 
 // No matrix cores (RDNA2 and older) and the host pass. The GEMM kernels are
@@ -287,6 +362,28 @@ struct MmaInt8 {
 };
 
 struct MmaInt4 : MmaInt8 {};
+
+struct MmaBf16 {
+    using Acc = v8f;
+    using Frag = v8bf;
+    using Elem = __bf16;
+    static constexpr int kFragElems = 8;
+    static __forceinline__ __device__ int frag_base(int) { return 0; }
+    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+    static __forceinline__ __device__ Acc mma(Frag, Frag, Acc c) { COMFY_MMA_STUB_BODY }
+    static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
+};
+
+struct MmaF16 {
+    using Acc = v8f;
+    using Frag = v8h;
+    using Elem = _Float16;
+    static constexpr int kFragElems = 8;
+    static __forceinline__ __device__ int frag_base(int) { return 0; }
+    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+    static __forceinline__ __device__ Acc mma(Frag, Frag, Acc c) { COMFY_MMA_STUB_BODY }
+    static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
+};
 
 #undef COMFY_MMA_STUB_BODY
 

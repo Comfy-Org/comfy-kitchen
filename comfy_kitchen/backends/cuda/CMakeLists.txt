@@ -142,6 +142,9 @@ set(CUDA_SOURCES
     ops/awq_w4a16.cu
     ops/w4a8_gemm.cu
     ops/adaln.cu
+    sage_attention/quant_v_int8.cu
+    sage_attention/quant_qk_int8.cu
+    sage_attention/sage_attn_launcher.cu
 )
 
 set(CPP_SOURCES
@@ -158,6 +161,7 @@ target_compile_options(comfy_kitchen_cuda_kernels PRIVATE
 )
 target_include_directories(comfy_kitchen_cuda_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/sage_attention
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
