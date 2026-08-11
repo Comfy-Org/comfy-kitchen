@@ -257,6 +257,7 @@ inline void launch_convrot_quant(
     const void* x, int in_dtype, int8_t* qout, float* scaleout,
     int M, int K, int group_size, hipStream_t stream) {
 
+    check_convrot_group_size(group_size);
     if (group_size == 16) {
         launch_convrot_quant_group<PACK_INT4, ACT, 16>(
             x, in_dtype, qout, scaleout, M, K, stream);
