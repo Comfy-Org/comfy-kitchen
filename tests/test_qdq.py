@@ -96,6 +96,15 @@ class TestQuantizePerTensorFP8:
         assert result.dtype == torch.float8_e4m3fn
 
 
+def _with_hip(backends: list[str], func_name: str) -> list[str]:
+    """get_capable_backends does not enumerate hip; these tests exist for its
+    vectorized/scalar split, so add it explicitly when it is present."""
+    hip_info = ck.list_backends().get("hip", {})
+    if hip_info.get("available") and func_name in hip_info.get("capabilities", []):
+        backends = [*backends, "hip"]
+    return backends
+
+
 class TestQuantizeFP8MisalignedView:
     """A storage-offset view must quantize to the same bits as its contiguous
     copy. Backends with a vectorized fast path gate on base-pointer alignment,
@@ -103,7 +112,8 @@ class TestQuantizeFP8MisalignedView:
 
     @pytest.fixture
     def capable_backends(self, device):
-        backends = get_capable_backends("quantize_per_tensor_fp8", device)
+        backends = _with_hip(get_capable_backends("quantize_per_tensor_fp8", device),
+                             "quantize_per_tensor_fp8")
         if not backends:
             pytest.skip(f"No backend supports quantize_per_tensor_fp8 on {device}")
         return backends
@@ -115,7 +125,7 @@ class TestQuantizeFP8MisalignedView:
         for backend_name in capable_backends:
             with ck.use_backend(backend_name):
                 out_view = ck.quantize_per_tensor_fp8(base[1:], scale)
-                out_contig = ck.quantize_per_tensor_fp8(base[1:].contiguous(), scale)
+                out_contig = ck.quantize_per_tensor_fp8(base[1:].clone(), scale)
 
             assert torch.equal(out_view.view(torch.uint8), out_contig.view(torch.uint8))
 
@@ -137,11 +147,11 @@ class TestDequantizePerTensorFP8:
         with ck.use_backend("eager"):
             x_fp8 = ck.quantize_per_tensor_fp8(x, scale)
 
-        for backend_name in capable_backends:
+        for backend_name in _with_hip(capable_backends, "dequantize_per_tensor_fp8"):
             with ck.use_backend(backend_name):
                 dq_view = ck.dequantize_per_tensor_fp8(x_fp8[1:], scale, output_type=torch.float16)
                 dq_contig = ck.dequantize_per_tensor_fp8(
-                    x_fp8[1:].contiguous(), scale, output_type=torch.float16
+                    x_fp8[1:].clone(), scale, output_type=torch.float16
                 )
 
             assert torch.equal(dq_view.view(torch.uint16), dq_contig.view(torch.uint16))
