@@ -272,6 +272,25 @@ def test_int8_linear_swiglu_matches_the_eager_chain(tag, shape, kwargs):
 
 
 @needs_wmma
+def test_int8_linear_h3_swiglu_convrot_matches_eager():
+    """Cover the fused quantizer and deep-K tile at a MiniMax H3 MLP width."""
+    torch.manual_seed(0)
+    m, n, k = 512, 256, 14336
+    x = torch.randn(m, 2 * k, device=DEV, dtype=torch.bfloat16)
+    wq = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
+    ws = torch.rand(n, device=DEV, dtype=torch.float32) * 0.01 + 0.001
+
+    kwargs = {"convrot": True, "convrot_groupsize": 256, "input_act": "swiglu"}
+    with ck.use_backend("hip"):
+        out = ck.int8_linear(x, wq, ws, None, torch.bfloat16, **kwargs)
+    with ck.use_backend("eager"):
+        ref = ck.int8_linear(x, wq, ws, None, torch.bfloat16, **kwargs)
+
+    scale = ref.float().abs().max().item()
+    assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
+
+
+@needs_wmma
 def test_swiglu_quantizer_is_at_least_as_accurate_as_the_chain(hip):
     """Fusing the gate into the rotation's load must not lose accuracy against
     materializing silu(gate) * up in bf16 first."""

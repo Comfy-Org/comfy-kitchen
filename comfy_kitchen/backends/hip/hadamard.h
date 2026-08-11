@@ -29,7 +29,7 @@ inline void check_convrot_group_size(int group_size) {
     }
 }
 
-// The kernel's static LDS: the g[256] and red[256] reductions below.
+// The kernel's static LDS: two 256-element butterfly buffers below.
 constexpr size_t kConvrotStaticLds = 2 * 256 * sizeof(float);
 
 // convrot_quant_kernel stages the whole rotated row in dynamic LDS, preserving
@@ -112,10 +112,10 @@ template <int ACT>
 __forceinline__ __device__ float load_input_act(
     const void* x, int64_t in_row, int col, int K, int code) {
     if constexpr (ACT == kActSwiGLU) {
-        // Matches torch silu(gate) * up.
+        // SwiGLU computes silu(gate) * up.
         const float gate = load_in(x, in_row + col, code);
         const float up = load_in(x, in_row + K + col, code);
-        return (gate / (1.0f + expf(-gate))) * up;
+        return (gate / (1.0f + __expf(-gate))) * up;
     } else {
         return apply_input_act<ACT>(load_in(x, in_row + col, code));
     }
@@ -141,23 +141,21 @@ __forceinline__ __device__ float load_row_value<__half>(__half v) {
     return __half2float(v);
 }
 
-template <typename RowT, bool PACK_INT4, int ACT = kActNone>
+template <typename RowT, bool PACK_INT4, int ACT, int G>
 __global__ __launch_bounds__(256) void convrot_quant_kernel(
     const void* __restrict__ x, int in_dtype,
     int8_t* __restrict__ qout, float* __restrict__ scaleout,
-    int M, int K, int G) {
+    int M, int K) {
 
     const float h4[4][4] = {{1, 1, 1, -1}, {1, 1, -1, 1}, {1, -1, 1, 1}, {-1, 1, 1, 1}};
-    __shared__ float g[256];
-    __shared__ float red[256];
+    __shared__ float g[2][256];
     extern __shared__ unsigned char rowbuf_raw[];
     RowT* rowbuf = reinterpret_cast<RowT*>(rowbuf_raw);  // K entries: the rotated row
 
     const int row = blockIdx.x;
     const int t = threadIdx.x;
 
-    int nstages = 0;
-    while ((1 << (2 * nstages)) < G) nstages++;  // log4(G)
+    constexpr int nstages = G == 16 ? 2 : (G == 64 ? 3 : 4);
 
     const int gpw = 256 / G;      // groups handled per pass
     const int glocal = t / G;     // this thread's group within the pass
@@ -173,38 +171,41 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
     for (int gbase = 0; gbase < ngrp; gbase += gpw) {
         const int grp = gbase + glocal;
         const bool active = grp < ngrp;
-        g[t] = active ? load_input_act<ACT>(x, in_row, grp * G + e, K, in_dtype) : 0.0f;
+        g[0][t] = active ? load_input_act<ACT>(x, in_row, grp * G + e, K, in_dtype) : 0.0f;
         __syncthreads();
 
+        int src = 0;
+#pragma unroll
         for (int stage = 0; stage < nstages; ++stage) {
             const int stride = 1 << (2 * stage);
             const int ds = (e / stride) & 3;
             const int b = gbase_idx + (e - ds * stride);
-            const float v0 = g[b], v1 = g[b + stride], v2 = g[b + 2 * stride], v3 = g[b + 3 * stride];
-            const float nv = h4[ds][0] * v0 + h4[ds][1] * v1 + h4[ds][2] * v2 + h4[ds][3] * v3;
+            const float v0 = g[src][b], v1 = g[src][b + stride];
+            const float v2 = g[src][b + 2 * stride], v3 = g[src][b + 3 * stride];
+            const float v = h4[ds][0] * v0 + h4[ds][1] * v1 + h4[ds][2] * v2 + h4[ds][3] * v3;
+            const int dst = src ^ 1;
+            g[dst][t] = v;
             __syncthreads();
-            g[t] = nv;
-            __syncthreads();
+            src = dst;
         }
 
         if (active) {
-            const float tv = g[t] * norm;
+            const float tv = g[src][t] * norm;
             const RowT stored = store_row_value<RowT>(tv);
             rowbuf[static_cast<int64_t>(grp) * G + e] = stored;
             lmax = fmaxf(lmax, fabsf(load_row_value(stored)));
         }
-        __syncthreads();
     }
 
-    red[t] = lmax;
+    g[0][t] = lmax;
     __syncthreads();
     for (int s = 128; s > 0; s >>= 1) {
-        if (t < s) red[t] = fmaxf(red[t], red[t + s]);
+        if (t < s) g[0][t] = fmaxf(g[0][t], g[0][t + s]);
         __syncthreads();
     }
 
     constexpr float kQMax = PACK_INT4 ? 7.0f : 127.0f;
-    const float rowmax = fmaxf(red[0], 1e-10f);
+    const float rowmax = fmaxf(g[0][0], 1e-10f);
     const float scale = rowmax / kQMax;
     const float inv = kQMax / rowmax;
     if (t == 0) scaleout[row] = scale;
@@ -231,23 +232,40 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
     }
 }
 
+template <bool PACK_INT4, int ACT, int G>
+inline void launch_convrot_quant_group(
+    const void* x, int in_dtype, int8_t* qout, float* scaleout,
+    int M, int K, hipStream_t stream) {
+
+    const size_t shmem = static_cast<size_t>(K) * convrot_row_element_size(in_dtype);
+    if (in_dtype == 0) {
+        convrot_quant_kernel<float, PACK_INT4, ACT, G><<<M, 256, shmem, stream>>>(
+            x, in_dtype, qout, scaleout, M, K);
+    } else if (in_dtype == 1) {
+        convrot_quant_kernel<__half, PACK_INT4, ACT, G><<<M, 256, shmem, stream>>>(
+            x, in_dtype, qout, scaleout, M, K);
+    } else if (in_dtype == 2) {
+        convrot_quant_kernel<__bf16, PACK_INT4, ACT, G><<<M, 256, shmem, stream>>>(
+            x, in_dtype, qout, scaleout, M, K);
+    } else {
+        throw std::runtime_error("convrot: unsupported input dtype code");
+    }
+}
+
 template <bool PACK_INT4, int ACT = kActNone>
 inline void launch_convrot_quant(
     const void* x, int in_dtype, int8_t* qout, float* scaleout,
     int M, int K, int group_size, hipStream_t stream) {
 
-    const size_t shmem = static_cast<size_t>(K) * convrot_row_element_size(in_dtype);
-    if (in_dtype == 0) {
-        convrot_quant_kernel<float, PACK_INT4, ACT><<<M, 256, shmem, stream>>>(
-            x, in_dtype, qout, scaleout, M, K, group_size);
-    } else if (in_dtype == 1) {
-        convrot_quant_kernel<__half, PACK_INT4, ACT><<<M, 256, shmem, stream>>>(
-            x, in_dtype, qout, scaleout, M, K, group_size);
-    } else if (in_dtype == 2) {
-        convrot_quant_kernel<__bf16, PACK_INT4, ACT><<<M, 256, shmem, stream>>>(
-            x, in_dtype, qout, scaleout, M, K, group_size);
+    if (group_size == 16) {
+        launch_convrot_quant_group<PACK_INT4, ACT, 16>(
+            x, in_dtype, qout, scaleout, M, K, stream);
+    } else if (group_size == 64) {
+        launch_convrot_quant_group<PACK_INT4, ACT, 64>(
+            x, in_dtype, qout, scaleout, M, K, stream);
     } else {
-        throw std::runtime_error("convrot: unsupported input dtype code");
+        launch_convrot_quant_group<PACK_INT4, ACT, 256>(
+            x, in_dtype, qout, scaleout, M, K, stream);
     }
 }
 
