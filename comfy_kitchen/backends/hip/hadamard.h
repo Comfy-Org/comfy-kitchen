@@ -112,10 +112,10 @@ template <int ACT>
 __forceinline__ __device__ float load_input_act(
     const void* x, int64_t in_row, int col, int K, int code) {
     if constexpr (ACT == kActSwiGLU) {
-        // SwiGLU computes silu(gate) * up.
+        // Matches torch silu(gate) * up.
         const float gate = load_in(x, in_row + col, code);
         const float up = load_in(x, in_row + K + col, code);
-        return (gate / (1.0f + __expf(-gate))) * up;
+        return (gate / (1.0f + expf(-gate))) * up;
     } else {
         return apply_input_act<ACT>(load_in(x, in_row + col, code));
     }
