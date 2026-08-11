@@ -968,6 +968,31 @@ def dequantize_int8_simple_dtype(q: torch.Tensor, scale: torch.Tensor, output_dt
     return dequantize_int8_simple(q, scale).to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
 
 
+def _dequantized_int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    convrot: bool,
+    convrot_groupsize: int,
+) -> torch.Tensor:
+    """Floating-point fallback for devices without INT8 accumulator matmul."""
+    if convrot:
+        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        x = _rotate_activation(x, h, convrot_groupsize)
+
+    dequantized_weight = weight.to(dtype=x.dtype)
+    scale = weight_scale.to(device=x.device, dtype=x.dtype)
+    if scale.numel() != 1:
+        scale = scale.reshape(-1, 1)
+    dequantized_weight.mul_(scale)
+
+    if bias is not None:
+        bias = bias.to(device=x.device, dtype=x.dtype)
+    return torch.nn.functional.linear(x, dequantized_weight, bias).to(out_dtype)
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1009,11 +1034,26 @@ def int8_linear(
             f"for weight shape {tuple(weight.shape)}"
         )
 
+    if convrot and x.shape[-1] % convrot_groupsize != 0:
+        raise ValueError(
+            f"ConvRot group size {convrot_groupsize} does not divide input features {x.shape[-1]}"
+        )
+
+    # MPS does not implement aten::_int_mm. Widen the stored INT8 weight only for
+    # this operation and use the activation dtype, which is normally BF16 in
+    # ComfyUI. This keeps model storage quantized and avoids a CPU round-trip.
+    if x.device.type == "mps":
+        return _dequantized_int8_linear(
+            x,
+            weight,
+            weight_scale,
+            bias,
+            out_dtype,
+            convrot,
+            convrot_groupsize,
+        )
+
     if convrot:
-        if x.shape[-1] % convrot_groupsize != 0:
-            raise ValueError(
-                f"ConvRot group size {convrot_groupsize} does not divide input features {x.shape[-1]}"
-            )
         h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
         x = _rotate_activation(x, h, convrot_groupsize)
 
