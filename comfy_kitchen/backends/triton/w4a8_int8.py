@@ -20,6 +20,18 @@ from triton.language.extra import libdevice
 
 from .quantization import int8_linear
 
+# ROCm/HIP's libdevice has no rint() (round-half-to-even), only nearbyint()
+# (same rounding semantics, differs only in floating-point exception flags,
+# which is irrelevant here). CUDA's libdevice does have rint(). The generic
+# `triton.language.extra.libdevice` dispatcher always exposes `rint` as a
+# symbol regardless of active backend (it resolves at trace time), so
+# hasattr() on it is useless here -- check the concrete backend module.
+if torch.version.hip is not None:
+    from triton.language.extra.hip import libdevice as _libdevice_backend
+else:
+    from triton.language.extra.cuda import libdevice as _libdevice_backend
+_rint = _libdevice_backend.rint if hasattr(_libdevice_backend, "rint") else _libdevice_backend.nearbyint
+
 
 @triton.jit
 def _dequant_int4_grouped_to_int8_kernel(
@@ -60,8 +72,8 @@ def _dequant_int4_grouped_to_int8_kernel(
         v_low = (low - 8).to(tl.float32)                    # symmetric uniform levels
         v_high = (high - 8).to(tl.float32)
 
-    q_low = tl.clamp(libdevice.rint(v_low * s), -127.0, 127.0).to(tl.int8)
-    q_high = tl.clamp(libdevice.rint(v_high * s), -127.0, 127.0).to(tl.int8)
+    q_low = tl.clamp(_rint(v_low * s), -127.0, 127.0).to(tl.int8)
+    q_high = tl.clamp(_rint(v_high * s), -127.0, 127.0).to(tl.int8)
 
     tl.store(out_ptr + rows[:, None] * stride_on + (2 * bcols)[None, :] * stride_ok, q_low, mask=m)
     tl.store(out_ptr + rows[:, None] * stride_on + (2 * bcols + 1)[None, :] * stride_ok, q_high, mask=m)

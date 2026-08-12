@@ -26,6 +26,17 @@ from comfy_kitchen.float_utils import (
 from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
 from triton.language.extra import libdevice
 
+# ROCm/HIP's libdevice has no rint(), only nearbyint() (same rounding
+# semantics, differs only in floating-point exception flags). The generic
+# `triton.language.extra.libdevice` dispatcher always exposes `rint` as a
+# symbol regardless of active backend (it resolves at trace time), so
+# hasattr() on it is useless here -- check the concrete backend module.
+if torch.version.hip is not None:
+    from triton.language.extra.hip import libdevice as _libdevice_backend
+else:
+    from triton.language.extra.cuda import libdevice as _libdevice_backend
+_rint = _libdevice_backend.rint if hasattr(_libdevice_backend, "rint") else _libdevice_backend.nearbyint
+
 
 @triton.jit
 def quantize_fp8_kernel_tl(
@@ -808,7 +819,7 @@ def _quantize_rowwise_kernel(
         q_f = x / scale
 
     # Round and Clamp
-    q_i = tl.clamp(libdevice.rint(q_f.to(tl.float32)), -128.0, 127.0).to(tl.int32)
+    q_i = tl.clamp(_rint(q_f.to(tl.float32)), -128.0, 127.0).to(tl.int32)
 
     # 4. Store
     tl.store(y_row_ptr + offsets, q_i.to(tl.int8), mask=mask)
