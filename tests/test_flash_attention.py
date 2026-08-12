@@ -4,7 +4,6 @@ import torch
 import comfy_kitchen as ck
 from comfy_kitchen.backends import cuda as cuda_backend
 
-
 requires_flash_decode = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not cuda_backend._EXT_AVAILABLE
