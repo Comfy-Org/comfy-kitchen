@@ -31,7 +31,7 @@ def flash_attention_decode(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_lengths: torch.Tensor
 ) -> torch.Tensor:
     """Decode attention for BF16 [batch, length, heads, 128] tensors."""
-    batch, query_length, query_heads, head_dim = q.shape
+    batch, _, query_heads, head_dim = q.shape
     _, kv_capacity, kv_heads, _ = k.shape
     if not _cuda_backend._EXT_AVAILABLE or torch.cuda.get_device_capability(q.device) < (8, 0):
         raise RuntimeError("flash_attention_decode requires the CUDA extension on SM80 or newer")
