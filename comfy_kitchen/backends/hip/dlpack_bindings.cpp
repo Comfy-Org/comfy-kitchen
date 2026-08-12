@@ -66,6 +66,17 @@ int w4a8_requant_max_k_kernel();
 void launch_na3d_kernel(const void*, const void*, const void*, void*, int, int, int, int, int, int,
                         int, int, int, int, int, int, float, int, hipStream_t);
 
+void launch_sage_quant_qk_int8(const void*, void*, void*, const void*, void*, void*, void*, int,
+                               int, int, int, int, int, int, int, int64_t, int64_t, int64_t,
+                               int64_t, int64_t, int64_t, int, int, hipStream_t);
+void launch_sage_quant_v_int8(const void*, void*, void*, int, int, int, int, int, int64_t, int64_t,
+                              int64_t, int, hipStream_t);
+void launch_sage_int8_attn(const void*, const void*, const void*, void*, const void*, const void*,
+                           const void*, const void*, int64_t, int64_t, int64_t, int64_t, int, int,
+                           int, int, int, int, int, int, int, int, int64_t, int64_t, int64_t,
+                           int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                           float, int, hipStream_t);
+
 void launch_adaln_kernel(const void*, const void*, const void*, void*, int, int, int, int, float,
                          int, int, int, bool, hipStream_t);
 void launch_gemv_awq_kernel(const void*, const void*, const void*, const void*, const void*, void*,
@@ -1012,6 +1023,329 @@ void svdquant_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarra
     check_hip_launch();
 }
 
+// ---------------------------------------------------------------------------
+// INT8 attention
+//
+// Buffer shapes differ from the CUDA backend because the scale granularity does;
+// see sage_attention/quant_qk_int8.hip. _C is importable on its own, so every
+// extent the kernels index off a raw pointer is checked here rather than trusted
+// from the Python layer.
+// ---------------------------------------------------------------------------
+
+// Must match kCtaQ and the key tile in sage_attention/int8_attn.hip.
+constexpr int kSageCtaQ = 128;
+constexpr int kSageCtaK = 64;
+constexpr int kSageKeyGroup = 16;
+
+static int sage_padded_q(int qo_len) { return ((qo_len + kSageCtaQ - 1) / kSageCtaQ) * kSageCtaQ; }
+
+static int sage_padded_k(int kv_len, int cta_k) { return ((kv_len + cta_k - 1) / cta_k) * cta_k; }
+
+static void sage_check_cta_k(int cta_k, const char* fn) {
+    if (cta_k != 64 && cta_k != 128) {
+        throw std::runtime_error(std::string(fn) + ": cta_k must be 64 or 128");
+    }
+}
+
+// Same selection the CUDA backend makes: short keys take the cheap H4 blocks,
+// longer ones the widest Hadamard that fits the head dimension. Q and K must
+// agree on it or their dot products change. 128 is the signed H128; padded D256
+// keeps the plain one, which is 129.
+static int sage_rotation(int kv_len, int head_dim) {
+    if (kv_len <= 256) return 4;
+    if (head_dim >= 256) return 129;
+    return head_dim >= 128 ? 128 : 64;
+}
+
+static void sage_check_shapes(const nb::ndarray<>& q, const nb::ndarray<>& k,
+                              const nb::ndarray<>& v, const char* fn) {
+    if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
+        throw std::runtime_error(std::string(fn) + ": q, k and v must be 4D [B, H, L, D]");
+    }
+    const int head_dim = static_cast<int>(q.shape(3));
+    if (head_dim != 64 && head_dim != 128 && head_dim != 256) {
+        throw std::runtime_error(std::string(fn) + ": head_dim must be 64, 128 or 256, got " +
+                                 std::to_string(head_dim));
+    }
+    if (k.shape(0) != q.shape(0) || v.shape(0) != q.shape(0) || v.shape(1) != k.shape(1) ||
+        v.shape(2) != k.shape(2) || k.shape(3) != q.shape(3) || v.shape(3) != q.shape(3)) {
+        throw std::runtime_error(std::string(fn) + ": incompatible q, k and v shapes");
+    }
+    // The modulo below divides by the k/v head count, and _C is importable, so a
+    // zero here would be a SIGFPE rather than an exception.
+    if (q.shape(0) == 0 || q.shape(1) == 0 || k.shape(1) == 0 || q.shape(2) == 0 ||
+        k.shape(2) == 0) {
+        throw std::runtime_error(
+            std::string(fn) + ": batch, head counts and sequence lengths must be positive");
+    }
+    if (q.shape(1) % k.shape(1) != 0) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": q head count must be a multiple of the k/v head count");
+    }
+}
+
+// sage_attend synthesizes Q/K/V/O strides from the extents rather than reading
+// them, so anything but the packed row-major layout is read as though it were
+// packed. The Python layer only ever allocates fresh contiguous buffers; a caller
+// reaching _C directly can pass a view.
+static void require_packed_contiguous(const nb::ndarray<>& t, const char* fn, const char* name) {
+    int64_t expected = 1;
+    for (int axis = static_cast<int>(t.ndim()) - 1; axis >= 0; --axis) {
+        if (t.shape(axis) != 1 && t.stride(axis) != expected) {
+            throw std::runtime_error(std::string(fn) + ": " + name +
+                                     " must be contiguous in the packed layout");
+        }
+        expected *= static_cast<int64_t>(t.shape(axis));
+    }
+}
+
+static void sage_check_quantized(const nb::ndarray<>& q_int8, const nb::ndarray<>& q_scale,
+                                 const nb::ndarray<>& k_int8, const nb::ndarray<>& k_scale,
+                                 const nb::ndarray<>& v_int8, const nb::ndarray<>& v_scale,
+                                 int batch, int q_heads, int kv_heads, int qo_len, int kv_len,
+                                 int head_dim, int cta_k, const char* fn) {
+    const int64_t padded_q = sage_padded_q(qo_len);
+    const int64_t padded_k = sage_padded_k(kv_len, cta_k);
+    require_dtype(q_int8, 4, 4, fn, "q_int8");
+    require_dtype(k_int8, 4, 4, fn, "k_int8");
+    require_dtype(v_int8, 4, 4, fn, "v_int8");
+    require_len(q_int8, static_cast<int64_t>(batch) * q_heads * qo_len * head_dim, fn, "q_int8");
+    require_len(k_int8, static_cast<int64_t>(batch) * kv_heads * kv_len * head_dim, fn, "k_int8");
+    require_len(v_int8, static_cast<int64_t>(batch) * kv_heads * head_dim * padded_k, fn,
+                "v_int8");
+    require_scale_len(q_scale, static_cast<size_t>(batch) * q_heads * padded_q, fn, "q_scale");
+    require_scale_len(k_scale, static_cast<size_t>(batch) * kv_heads * (padded_k / kSageKeyGroup),
+                      fn, "k_scale");
+    require_scale_len(v_scale, static_cast<size_t>(batch) * kv_heads * head_dim, fn, "v_scale");
+    // The quantizers and sage_attend both synthesize every stride from the
+    // extents, so a strided view would be written, and later read, as though it
+    // were packed. Both entry points reach this helper.
+    require_packed_contiguous(q_int8, fn, "q_int8");
+    require_packed_contiguous(k_int8, fn, "k_int8");
+    require_packed_contiguous(v_int8, fn, "v_int8");
+    require_packed_contiguous(q_scale, fn, "q_scale");
+    require_packed_contiguous(k_scale, fn, "k_scale");
+    require_packed_contiguous(v_scale, fn, "v_scale");
+}
+
+static void sage_quantize(const nb::ndarray<>& q, const nb::ndarray<>& k, const nb::ndarray<>& v,
+                          const nb::ndarray<>& q_int8, const nb::ndarray<>& q_scale,
+                          const nb::ndarray<>& k_int8, const nb::ndarray<>& k_scale,
+                          const nb::ndarray<>& v_int8, const nb::ndarray<>& v_scale,
+                          const nb::ndarray<>& anchor_indices, int input_dtype_code, int cta_k,
+                          hipStream_t stream, const char* fn) {
+    const int batch = static_cast<int>(q.shape(0));
+    const int q_heads = static_cast<int>(q.shape(1));
+    const int qo_len = static_cast<int>(q.shape(2));
+    const int head_dim = static_cast<int>(q.shape(3));
+    const int kv_heads = static_cast<int>(k.shape(1));
+    const int kv_len = static_cast<int>(k.shape(2));
+    const int padded_k = sage_padded_k(kv_len, cta_k);
+
+    if (input_dtype_code < 0 || input_dtype_code > 2) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": input dtype must be float32, float16 or bfloat16");
+    }
+    require_dtype(q, input_dtype_code, input_dtype_code, fn, "q");
+    require_dtype(k, input_dtype_code, input_dtype_code, fn, "k");
+    require_dtype(v, input_dtype_code, input_dtype_code, fn, "v");
+    if (q.stride(3) != 1 || k.stride(3) != 1 || v.stride(3) != 1) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": the last dimension of q, k and v must be contiguous");
+    }
+    sage_check_quantized(q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, batch, q_heads,
+                         kv_heads, qo_len, kv_len, head_dim, cta_k, fn);
+    // The detector writes one index per (batch, kv head); there is no int32 code
+    // in map_dtype_to_code, so the width is what gets checked.
+    if (anchor_indices.dtype().bits != 32) {
+        throw std::runtime_error(std::string(fn) + ": anchor_indices must be a 32-bit element");
+    }
+    require_len(anchor_indices, static_cast<int64_t>(batch) * kv_heads, fn, "anchor_indices");
+
+    launch_sage_quant_qk_int8(q.data(), q_int8.data(), q_scale.data(), k.data(), k_int8.data(),
+                              k_scale.data(), anchor_indices.data(), batch, q_heads, qo_len,
+                              sage_padded_q(qo_len), kv_heads, kv_len, padded_k / kSageKeyGroup,
+                              head_dim, q.stride(0), q.stride(1), q.stride(2), k.stride(0),
+                              k.stride(1), k.stride(2), input_dtype_code,
+                              sage_rotation(kv_len, head_dim), stream);
+
+    launch_sage_quant_v_int8(v.data(), v_int8.data(), v_scale.data(), batch, kv_heads, kv_len,
+                             head_dim, padded_k, v.stride(0), v.stride(1), v.stride(2),
+                             input_dtype_code, stream);
+}
+
+// An expanded mask carries zero strides, so a per-key mask arrives with
+// mask_stride_q == 0 and its query term drops out of the kernel's addressing on
+// its own. That needs no separate mask mode.
+static void sage_mask_info(const OptArray& attn_mask, int batch, int q_heads, int qo_len,
+                           int kv_len, const void*& ptr, int64_t& stride_b, int64_t& stride_h,
+                           int64_t& stride_q, int64_t& stride_k, int& dtype_code,
+                           const char* fn) {
+    ptr = nullptr;
+    stride_b = stride_h = stride_q = stride_k = 0;
+    dtype_code = -1;
+    if (!attn_mask.has_value()) return;
+
+    const auto& mask = attn_mask.value();
+    if (mask.ndim() != 4 || static_cast<int>(mask.shape(0)) != batch ||
+        static_cast<int>(mask.shape(1)) != q_heads || static_cast<int>(mask.shape(2)) != qo_len ||
+        static_cast<int>(mask.shape(3)) != kv_len) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": attention mask must be expanded to [B, H_q, Lq, Lk]");
+    }
+    if (mask.dtype().code == static_cast<uint8_t>(nb::dlpack::dtype_code::Bool)) {
+        dtype_code = 3;
+    } else {
+        // map_dtype_to_code gives uint8 the same code 3 that marks a bool mask
+        // here, and mask_keep would then read it as one. Only the float codes may
+        // come through this branch.
+        dtype_code = map_dtype_to_code(mask.dtype());
+        if (dtype_code > 2) dtype_code = -1;
+    }
+    if (dtype_code < 0 || dtype_code > 3) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": attention mask must be bool, float16, bfloat16 or float32");
+    }
+    ptr = mask.data();
+    stride_b = mask.stride(0);
+    stride_h = mask.stride(1);
+    stride_q = mask.stride(2);
+    stride_k = mask.stride(3);
+}
+
+static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8,
+                        const nb::ndarray<>& v_int8, const nb::ndarray<>& o,
+                        const nb::ndarray<>& q_scale, const nb::ndarray<>& k_scale,
+                        const nb::ndarray<>& v_scale, const OptArray& attn_mask, int batch,
+                        int q_heads, int kv_heads, int qo_len, int kv_len, int head_dim,
+                        int cta_k, float sm_scale, int output_dtype_code, hipStream_t stream,
+                        const char* fn) {
+    if (output_dtype_code != 1 && output_dtype_code != 2) {
+        throw std::runtime_error(std::string(fn) + ": output dtype must be float16 or bfloat16");
+    }
+    require_dtype(o, output_dtype_code, output_dtype_code, fn, "o");
+    require_len(o, static_cast<int64_t>(batch) * q_heads * qo_len * head_dim, fn, "o");
+    // The output strides below are synthesized from the extents rather than read
+    // from o, so anything but the packed layout would be written as though it
+    // were packed. Both entry points reach this, so the check belongs here.
+    if (o.ndim() != 4 || static_cast<int>(o.shape(0)) != batch ||
+        static_cast<int>(o.shape(1)) != q_heads || static_cast<int>(o.shape(2)) != qo_len ||
+        static_cast<int>(o.shape(3)) != head_dim) {
+        throw std::runtime_error(std::string(fn) + ": o must be [B, H_q, Lq, D]");
+    }
+    require_packed_contiguous(o, fn, "o");
+
+    const void* mask_ptr = nullptr;
+    int64_t mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k;
+    int mask_dtype_code;
+    sage_mask_info(attn_mask, batch, q_heads, qo_len, kv_len, mask_ptr, mask_stride_b,
+                   mask_stride_h, mask_stride_q, mask_stride_k, mask_dtype_code, fn);
+
+    const int padded_k = sage_padded_k(kv_len, cta_k);
+    launch_sage_int8_attn(
+        q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(), k_scale.data(),
+        v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
+        mask_dtype_code, cta_k, batch, qo_len, kv_len, sage_padded_q(qo_len), q_heads,
+        kv_heads, head_dim, padded_k / kSageKeyGroup,
+        static_cast<int64_t>(q_heads) * qo_len * head_dim, static_cast<int64_t>(qo_len) * head_dim,
+        static_cast<int64_t>(kv_heads) * kv_len * head_dim,
+        static_cast<int64_t>(kv_len) * head_dim,
+        static_cast<int64_t>(kv_heads) * head_dim * padded_k,
+        static_cast<int64_t>(head_dim) * padded_k, padded_k,
+        static_cast<int64_t>(q_heads) * qo_len * head_dim, static_cast<int64_t>(qo_len) * head_dim,
+        head_dim, sm_scale, output_dtype_code, stream);
+    check_hip_launch();
+}
+
+// Quantize plus attention in one call. Every scratch buffer is allocated by the
+// Python layer.
+void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> o,
+               nb::ndarray<> q_int8, nb::ndarray<> q_scale, nb::ndarray<> k_int8,
+               nb::ndarray<> k_scale, nb::ndarray<> v_int8, nb::ndarray<> v_scale,
+               nb::ndarray<> anchor_indices, float sm_scale, int cta_k, int input_dtype_code,
+               int output_dtype_code, uintptr_t stream_ptr, OptArray attn_mask = std::nullopt) {
+    constexpr const char* kFn = "sage_sdpa";
+    sage_check_shapes(q, k, v, kFn);
+    sage_check_cta_k(cta_k, kFn);
+    const auto stream = reinterpret_cast<hipStream_t>(stream_ptr);
+    const int batch = static_cast<int>(q.shape(0));
+    const int q_heads = static_cast<int>(q.shape(1));
+    const int qo_len = static_cast<int>(q.shape(2));
+    const int head_dim = static_cast<int>(q.shape(3));
+    const int kv_heads = static_cast<int>(k.shape(1));
+    const int kv_len = static_cast<int>(k.shape(2));
+
+    sage_quantize(q, k, v, q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, anchor_indices,
+                  input_dtype_code, cta_k, stream, kFn);
+    check_hip_launch();
+    sage_attend(q_int8, k_int8, v_int8, o, q_scale, k_scale, v_scale, attn_mask, batch, q_heads,
+                kv_heads, qo_len, kv_len, head_dim, cta_k, sm_scale, output_dtype_code, stream,
+                kFn);
+}
+
+// Quantization half of the split API. Deliberately the same launches with the
+// same tiling as sage_sdpa, so deferring the attention until after the caller
+// releases q, k and v changes no numbers.
+void sage_sdpa_quantize(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> q_int8,
+                        nb::ndarray<> q_scale, nb::ndarray<> k_int8, nb::ndarray<> k_scale,
+                        nb::ndarray<> v_int8, nb::ndarray<> v_scale,
+                        nb::ndarray<> anchor_indices, int cta_k, int input_dtype_code,
+                        uintptr_t stream_ptr) {
+    constexpr const char* kFn = "sage_sdpa_quantize";
+    sage_check_shapes(q, k, v, kFn);
+    sage_check_cta_k(cta_k, kFn);
+    sage_quantize(q, k, v, q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, anchor_indices,
+                  input_dtype_code, cta_k, reinterpret_cast<hipStream_t>(stream_ptr), kFn);
+    check_hip_launch();
+}
+
+// Attention half of the split API, over the packed layouts sage_sdpa_quantize
+// produced. No floating-point q, k or v is retained or reconstructed.
+void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndarray<> v_int8,
+                            nb::ndarray<> o, nb::ndarray<> q_scale, nb::ndarray<> k_scale,
+                            nb::ndarray<> v_scale, int cta_k, float sm_scale,
+                            int output_dtype_code, uintptr_t stream_ptr,
+                            OptArray attn_mask = std::nullopt) {
+    constexpr const char* kFn = "sage_sdpa_prequantized";
+    if (q_int8.ndim() != 4 || k_int8.ndim() != 4 || o.ndim() != 4 || v_int8.ndim() != 2) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": q, k and o must be 4D and packed v must be 2D");
+    }
+    sage_check_cta_k(cta_k, kFn);
+    const int batch = static_cast<int>(q_int8.shape(0));
+    const int q_heads = static_cast<int>(q_int8.shape(1));
+    const int qo_len = static_cast<int>(q_int8.shape(2));
+    const int head_dim = static_cast<int>(q_int8.shape(3));
+    const int kv_heads = static_cast<int>(k_int8.shape(1));
+    const int kv_len = static_cast<int>(k_int8.shape(2));
+    if (head_dim != 64 && head_dim != 128 && head_dim != 256) {
+        throw std::runtime_error(std::string(kFn) + ": head_dim must be 64, 128 or 256, got " +
+                                 std::to_string(head_dim));
+    }
+    if (batch == 0 || q_heads == 0 || kv_heads == 0 || qo_len == 0 || kv_len == 0) {
+        throw std::runtime_error(
+            std::string(kFn) + ": batch, head counts and sequence lengths must be positive");
+    }
+    if (static_cast<int>(k_int8.shape(0)) != batch ||
+        static_cast<int>(k_int8.shape(3)) != head_dim || q_heads % kv_heads != 0) {
+        throw std::runtime_error(std::string(kFn) + ": incompatible quantized tensor shapes");
+    }
+    sage_check_quantized(q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, batch, q_heads,
+                         kv_heads, qo_len, kv_len, head_dim, cta_k, kFn);
+    // V is packed as [B * H_kv * D, padded_k], and padded_k follows cta_k. Element
+    // count alone cannot tell a buffer packed against a different cta_k from a
+    // correct one, and the kernel would read shifted rows rather than fail.
+    if (v_int8.shape(1) != static_cast<size_t>(sage_padded_k(kv_len, cta_k))) {
+        throw std::runtime_error(std::string(kFn) + ": packed v row width " +
+                                 std::to_string(v_int8.shape(1)) + " does not match cta_k " +
+                                 std::to_string(cta_k));
+    }
+
+    sage_attend(q_int8, k_int8, v_int8, o, q_scale, k_scale, v_scale, attn_mask, batch, q_heads,
+                kv_heads, qo_len, kv_len, head_dim, cta_k, sm_scale, output_dtype_code,
+                reinterpret_cast<hipStream_t>(stream_ptr), kFn);
+}
+
 NB_MODULE(_C, m) {
     m.doc() = "ComfyKitchen HIP backend native operations (RDNA2-RDNA4, WMMA on gfx11/gfx12)";
     m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8);
@@ -1033,6 +1367,19 @@ NB_MODULE(_C, m) {
     m.def("w4a8_requant_max_k", &w4a8_requant_max_k_kernel);
     m.def("w4a8_int8_gemm_chunked", &w4a8_int8_gemm_chunked);
     m.def("na3d", &na3d);
+    m.def("sage_sdpa", &sage_sdpa, nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("o"),
+          nb::arg("q_int8"), nb::arg("q_scale"), nb::arg("k_int8"), nb::arg("k_scale"),
+          nb::arg("v_int8"), nb::arg("v_scale"), nb::arg("anchor_indices"), nb::arg("sm_scale"),
+          nb::arg("cta_k"), nb::arg("input_dtype_code"), nb::arg("output_dtype_code"),
+          nb::arg("stream_ptr"), nb::arg("attn_mask") = nb::none());
+    m.def("sage_sdpa_quantize", &sage_sdpa_quantize, nb::arg("q"), nb::arg("k"), nb::arg("v"),
+          nb::arg("q_int8"), nb::arg("q_scale"), nb::arg("k_int8"), nb::arg("k_scale"),
+          nb::arg("v_int8"), nb::arg("v_scale"), nb::arg("anchor_indices"), nb::arg("cta_k"),
+          nb::arg("input_dtype_code"), nb::arg("stream_ptr"));
+    m.def("sage_sdpa_prequantized", &sage_sdpa_prequantized, nb::arg("q_int8"), nb::arg("k_int8"),
+          nb::arg("v_int8"), nb::arg("o"), nb::arg("q_scale"), nb::arg("k_scale"),
+          nb::arg("v_scale"), nb::arg("cta_k"), nb::arg("sm_scale"),
+          nb::arg("output_dtype_code"), nb::arg("stream_ptr"), nb::arg("attn_mask") = nb::none());
     m.def("adaln", &adaln);
     m.def("rms_adaln", &rms_adaln);
     m.def("apply_rope", &apply_rope);

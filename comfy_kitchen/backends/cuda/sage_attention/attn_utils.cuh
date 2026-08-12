@@ -613,7 +613,17 @@ __device__ __forceinline__ uint32_t pack_u8x4(float a, float b, float c,
   asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qb) : "f"(b));
   asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qc) : "f"(c));
   asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qd) : "f"(d));
-  return qa | (qb << 8) | (qc << 16) | (qd << 24);
+  uint32_t qab, qcd, packed;
+  asm volatile("prmt.b32 %0, %1, %2, 0x5410;"
+               : "=r"(qab)
+               : "r"(qa), "r"(qb));
+  asm volatile("prmt.b32 %0, %1, %2, 0x5410;"
+               : "=r"(qcd)
+               : "r"(qc), "r"(qd));
+  asm volatile("prmt.b32 %0, %1, %2, 0x6420;"
+               : "=r"(packed)
+               : "r"(qab), "r"(qcd));
+  return packed;
 }
 
 struct PackedU8RowSum {
@@ -633,10 +643,10 @@ pack_scaled_exp2_u8x4(const int32_t a, const int32_t b, const int32_t c,
       math::ptx_exp2(fmaf(__int2float_rz(c), scale, negative_m));
   const float probability_d =
       math::ptx_exp2(fmaf(__int2float_rz(d), scale, negative_m));
-  return {pack_u8x4(probability_a, probability_b, probability_c,
-                    probability_d),
-          (probability_a + probability_b) +
-              (probability_c + probability_d)};
+  const uint32_t probabilities = pack_u8x4(
+      probability_a, probability_b, probability_c, probability_d);
+  const uint32_t denominator = __dp4a(probabilities, 0x01010101u, 0u);
+  return {probabilities, __uint2float_rn(denominator)};
 }
 
 template <uint32_t num_tiles_q, uint32_t num_tiles_k,

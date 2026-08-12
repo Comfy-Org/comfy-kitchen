@@ -65,7 +65,11 @@ __all__ = [
     "dequantize_w4a8_int8_weight",
     "has_wmma",
     "int8_linear",
+    "int8_attention_is_available",
     "is_available",
+    "sage_int8_attend",
+    "sage_int8_quantize",
+    "sage_int8_sdpa",
     "quantize_and_rotate_rowwise",
     "quantize_convrot_w4a4_weight",
     "quantize_int8_convrot_weight",
@@ -2006,6 +2010,179 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         constraints = {k: v for k, v in constraints.items() if k not in _WMMA_ONLY_OPS}
 
     return constraints
+
+
+# ---------------------------------------------------------------------------
+# INT8 attention
+#
+# The public entry points live in comfy_kitchen/sage_attention.py, which
+# validates and pads the head dimension; everything below owns the packed
+# layouts, which are not the same as the CUDA backend. See
+# sage_attention/quant_qk_int8.hip for why the scale granularity differs.
+# ---------------------------------------------------------------------------
+
+# Must match kCtaQ and the key tiles in sage_attention/int8_attn.hip.
+_SAGE_CTA_Q = 128
+_SAGE_CTA_K = 64
+_SAGE_LARGE_CTA_K = 128
+_SAGE_KEY_GROUP = 16
+_SAGE_HEAD_DIMS = (64, 128, 256)
+
+
+def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool) -> int:
+    """Keys per attention iteration.
+
+    Always 64. The CUDA backend widens this to 128 for long unmasked keys; the
+    wide tile is implemented here too and measures slower on RDNA, where V is
+    staged transposed and the tile doubles both LDS allocations at once. Kept as
+    a function because the choice belongs with the buffer padding it decides.
+    """
+    del head_dim, kv_length, has_mask
+    return _SAGE_CTA_K
+
+
+def int8_attention_is_available() -> bool:
+    """Whether the INT8 attention kernels can run here.
+
+    Stricter than is_available(): the kernel is built on the matrix cores, so
+    RDNA2 declines it the way it declines the GEMMs.
+    """
+    return has_wmma()
+
+
+def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
+    batch, q_heads, q_length, head_dim = q.shape
+    _, kv_heads, kv_length, _ = k.shape
+    if head_dim not in _SAGE_HEAD_DIMS:
+        raise ValueError(f"int8 attention head_dim must be one of {_SAGE_HEAD_DIMS}")
+
+    padded_q = -(-q_length // _SAGE_CTA_Q) * _SAGE_CTA_Q
+    padded_k = -(-kv_length // cta_k) * cta_k
+    device = q.device
+
+    buffers = {
+        "q_int8": torch.empty(q.shape, dtype=torch.int8, device=device),
+        "k_int8": torch.empty(k.shape, dtype=torch.int8, device=device),
+        # One scale per query row and one per 16 adjacent keys; the padding exists
+        # so the kernel can read a scale for every lane of its last tile.
+        "q_scale": torch.empty(batch, q_heads, padded_q, dtype=torch.float32, device=device),
+        "k_scale": torch.empty(
+            batch, kv_heads, padded_k // _SAGE_KEY_GROUP, dtype=torch.float32, device=device
+        ),
+        # V is stored transposed, [B * H * D, padded_K], with the tail zero filled.
+        "v_int8": torch.empty(
+            batch * kv_heads * head_dim, padded_k, dtype=torch.int8, device=device
+        ),
+        "v_scale": torch.empty(batch * kv_heads * head_dim, dtype=torch.float32, device=device),
+    }
+
+    # One key index per batch and KV head, written by the stabilization detector
+    # and read by the K quantizer. It is scratch, not part of the packed form, so
+    # it stays out of the buffers the split API hands back.
+    anchor_indices = torch.empty(batch, kv_heads, dtype=torch.int32, device=device)
+    return buffers, anchor_indices
+
+
+def sage_int8_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    attention_scale: float,
+    attn_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Quantize and attend in one call. q, k and v are already padded to a
+    supported head dimension; the output keeps that width."""
+    batch, q_heads, q_length, head_dim = q.shape
+    output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
+    output = torch.empty(
+        batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q.device
+    )
+
+    cta_k = _sage_cta_k(head_dim, k.shape[2], attn_mask is not None)
+    buffers, anchor_indices = _sage_buffers(q, k, cta_k)
+    _C.sage_sdpa(
+        _dl(q),
+        _dl(k),
+        _dl(v),
+        _dl(output),
+        _dl(buffers["q_int8"]),
+        _dl(buffers["q_scale"]),
+        _dl(buffers["k_int8"]),
+        _dl(buffers["k_scale"]),
+        _dl(buffers["v_int8"]),
+        _dl(buffers["v_scale"]),
+        _dl(anchor_indices),
+        float(attention_scale),
+        cta_k,
+        DTYPE_TO_CODE[q.dtype],
+        DTYPE_TO_CODE[output_dtype],
+        _stream(q),
+        None if attn_mask is None else _dl(attn_mask),
+    )
+    return output
+
+
+def sage_int8_quantize(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cta_k: int = _SAGE_CTA_K,
+) -> dict:
+    """Quantize q, k and v without allocating the attention output."""
+    buffers, anchor_indices = _sage_buffers(q, k, cta_k)
+    _C.sage_sdpa_quantize(
+        _dl(q),
+        _dl(k),
+        _dl(v),
+        _dl(buffers["q_int8"]),
+        _dl(buffers["q_scale"]),
+        _dl(buffers["k_int8"]),
+        _dl(buffers["k_scale"]),
+        _dl(buffers["v_int8"]),
+        _dl(buffers["v_scale"]),
+        _dl(anchor_indices),
+        cta_k,
+        DTYPE_TO_CODE[q.dtype],
+        _stream(q),
+    )
+    return buffers
+
+
+def sage_int8_attend(
+    q_int8: torch.Tensor,
+    k_int8: torch.Tensor,
+    v_int8: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    *,
+    attention_scale: float,
+    attn_mask: torch.Tensor | None,
+    output_dtype: torch.dtype,
+    cta_k: int = _SAGE_CTA_K,
+) -> torch.Tensor:
+    """Attend over the packed layouts sage_int8_quantize produced."""
+    batch, q_heads, q_length, head_dim = q_int8.shape
+    output = torch.empty(
+        batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q_int8.device
+    )
+    _C.sage_sdpa_prequantized(
+        _dl(q_int8),
+        _dl(k_int8),
+        _dl(v_int8),
+        _dl(output),
+        _dl(q_scale),
+        _dl(k_scale),
+        _dl(v_scale),
+        cta_k,
+        float(attention_scale),
+        DTYPE_TO_CODE[output_dtype],
+        _stream(q_int8),
+        None if attn_mask is None else _dl(attn_mask),
+    )
+    return output
 
 
 def _register():

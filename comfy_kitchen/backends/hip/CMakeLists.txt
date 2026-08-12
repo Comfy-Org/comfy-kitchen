@@ -160,6 +160,9 @@ set(HIP_SOURCES
     ops/convrot_w4a4.hip
     ops/adaln.hip
     ops/na3d.hip
+    sage_attention/quant_qk_int8.hip
+    sage_attention/quant_v_int8.hip
+    sage_attention/int8_attn.hip
     ops/apply_rope.hip
     ops/rms_rope.hip
     ops/gemv_awq.hip
@@ -188,6 +191,7 @@ if(COMFY_ENABLE_LINEINFO OR CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 target_include_directories(comfy_kitchen_hip_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/sage_attention
     ${_CK_HIP_GENERATED_INCLUDE_DIR}
 )
 target_link_libraries(comfy_kitchen_hip_kernels PRIVATE hip::host)

@@ -13,6 +13,11 @@ from torch.nn import functional
 from .backends import cuda as _cuda_backend
 from .backends.eager.quantization import DTYPE_TO_CODE
 
+if getattr(torch.version, "hip", None):
+    from .backends import hip as _hip_backend
+else:
+    _hip_backend = None
+
 CTA_K = 64
 LARGE_CTA_K = 128
 _SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
@@ -61,6 +66,12 @@ def is_available(device: torch.device | int | None = None) -> bool:
     """Return whether the compiled INT8 attention kernel supports this GPU."""
     if not torch.cuda.is_available():
         return False
+    if _hip_backend is not None:
+        # torch.cuda is the ROCm API here, and get_device_capability reports
+        # something SM-shaped for a gfx part, so the compute capability test
+        # below would wave AMD hardware through to a CUDA extension that never
+        # loaded. Ask the HIP backend instead.
+        return _hip_backend.int8_attention_is_available()
     capability = torch.cuda.get_device_capability(device)
     return capability >= _NATIVE_MINIMUM_CAPABILITY and _cuda_backend._EXT_AVAILABLE
 
@@ -83,7 +94,8 @@ def _validate_inputs(
         raise ValueError("q, k, and v must be on the same CUDA device")
     if not is_available(q.device):
         raise RuntimeError(
-            "INT8 attention requires the comfy-kitchen CUDA extension on SM75 or newer"
+            "INT8 attention requires the comfy-kitchen CUDA extension on SM75 or newer, "
+            "or the HIP extension on an AMD device with matrix cores (RDNA3 or newer)"
         )
 
     batch, q_heads, q_length, head_dim = q.shape
@@ -147,6 +159,17 @@ def _int8_attention_cuda(
     attention_scale = original_head_dim**-0.5 if scale is None else float(scale)
     if not math.isfinite(attention_scale):
         raise ValueError(f"scale must be finite, got {attention_scale}")
+
+    if _hip_backend is not None:
+        output = _hip_backend.sage_int8_sdpa(
+            q,
+            k,
+            v,
+            attention_scale=attention_scale,
+            attn_mask=attn_mask,
+        )
+        output = output[..., :original_head_dim]
+        return output.float() if q.dtype == torch.float32 else output
 
     batch, q_heads, q_length, _ = q.shape
     _, kv_heads, kv_length, _ = k.shape
@@ -276,6 +299,28 @@ def prequantize_int8_attention(
     if not math.isfinite(attention_scale):
         raise ValueError(f"scale must be finite, got {attention_scale}")
 
+    if _hip_backend is not None:
+        # The packed V row width follows this cta_k, so the value that packed the
+        # buffers is the one that has to come back to attend over them. Taking the
+        # CUDA-side constant here would only agree with the HIP choice by accident.
+        hip_cta_k = _hip_backend._sage_cta_k(
+            kernel_head_dim, k.shape[2], attn_mask is not None
+        )
+        packed = _hip_backend.sage_int8_quantize(q, k, v, cta_k=hip_cta_k)
+        return PrequantizedInt8Attention(
+            q=packed["q_int8"],
+            k=packed["k_int8"],
+            v=packed["v_int8"],
+            q_scale=packed["q_scale"],
+            k_scale=packed["k_scale"],
+            v_scale=packed["v_scale"],
+            original_head_dim=original_head_dim,
+            input_dtype=input_dtype,
+            attention_scale=attention_scale,
+            cta_k=hip_cta_k,
+            attn_mask=attn_mask,
+        )
+
     batch, q_heads, q_length, _ = q.shape
     _, kv_heads, kv_length, _ = k.shape
     cta_k = _select_cta_k(
@@ -376,13 +421,31 @@ def int8_attention_from_prequantized(
         raise ValueError("attn_mask must be on the same CUDA device as the packed tensors")
     if not is_available(quantized.q.device):
         raise RuntimeError(
-            "INT8 attention requires the comfy-kitchen CUDA extension on SM75 or newer"
+            "INT8 attention requires the comfy-kitchen CUDA extension on SM75 or newer, "
+            "or the HIP extension on an AMD device with matrix cores (RDNA3 or newer)"
         )
 
     batch, q_heads, q_length, kernel_head_dim = quantized.q.shape
     output_dtype = (
         torch.bfloat16 if quantized.input_dtype == torch.float32 else quantized.input_dtype
     )
+
+    if _hip_backend is not None:
+        output = _hip_backend.sage_int8_attend(
+            quantized.q,
+            quantized.k,
+            quantized.v,
+            quantized.q_scale,
+            quantized.k_scale,
+            quantized.v_scale,
+            attention_scale=quantized.attention_scale,
+            attn_mask=quantized.attn_mask,
+            output_dtype=output_dtype,
+            cta_k=quantized.cta_k,
+        )
+        output = output[..., : quantized.original_head_dim]
+        return output.float() if quantized.input_dtype == torch.float32 else output
+
     output = torch.empty(
         batch,
         q_heads,

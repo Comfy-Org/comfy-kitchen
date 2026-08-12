@@ -100,6 +100,16 @@ __forceinline__ __device__ v4i load_frag_b128(const void* lds, int row, int kbyt
     return r;
 }
 
+// Same, for a row the caller guarantees is 16-byte aligned: one LDS instruction
+// instead of four. gfx11 hands every lane the whole 16-byte K-step, so this is
+// the difference between one ds_load_b128 and four ds_load_b32 on every single
+// fragment read in an attention inner loop.
+__forceinline__ __device__ v4i load_frag_b128_aligned(const void* lds, int row, int kbyte,
+                                                      int stride) {
+    const char* p = static_cast<const char*>(lds) + row * stride + kbyte;
+    return *reinterpret_cast<const v4i*>(p);
+}
+
 // 16 fp8 bytes of a row -> the 16 bf16 lanes of one gfx11 K-step.
 template <bool E5M2>
 __forceinline__ __device__ v16bf load_frag_fp8_as_bf16(const void* lds, int row, int kbyte,
@@ -174,12 +184,20 @@ struct MmaInt8 {
         return load_frag_b64(lds, row, kbyte + 8 * (lane / 16), stride);
     }
     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+    static __forceinline__ __device__ Frag load_aligned(const void* lds, int row, int kbyte,
+                                                        int stride, int lane) {
+        return load_frag_b64(lds, row, kbyte + 8 * (lane / 16), stride);
+    }
     static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
         return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, false);
     }
     // Signedness is an instruction immediate, so an unsigned A needs its own entry.
     static __forceinline__ __device__ Acc mma_ua(Frag a, Frag b, Acc c) {
         return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, true, b, c, false);
+    }
+    // ... and so does an unsigned B, which is the P operand of int8 attention.
+    static __forceinline__ __device__ Acc mma_ub(Frag a, Frag b, Acc c) {
+        return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, false, b, c, false);
     }
     static __forceinline__ __device__ float get(Acc c, int e) { return static_cast<float>(c[e]); }
 };
@@ -273,11 +291,18 @@ struct MmaInt8 {
         return load_frag_b128(lds, row, kbyte, stride);
     }
     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+    static __forceinline__ __device__ Frag load_aligned(const void* lds, int row, int kbyte,
+                                                        int stride, int) {
+        return load_frag_b128_aligned(lds, row, kbyte, stride);
+    }
     static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
         return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
     }
     static __forceinline__ __device__ Acc mma_ua(Frag a, Frag b, Acc c) {
         return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, a, true, b, c, false);
+    }
+    static __forceinline__ __device__ Acc mma_ub(Frag a, Frag b, Acc c) {
+        return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, false, b, c, false);
     }
     static __forceinline__ __device__ float get(Acc c, int e) { return static_cast<float>(c[e]); }
 };
@@ -356,8 +381,12 @@ struct MmaInt8 {
     static constexpr int kStepBytes = 16;
     static __forceinline__ __device__ Frag load(const void*, int, int, int, int) { return Frag{}; }
     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+    static __forceinline__ __device__ Frag load_aligned(const void*, int, int, int, int) {
+        return Frag{};
+    }
     static __forceinline__ __device__ Acc mma(Frag, Frag, Acc c) { COMFY_MMA_STUB_BODY }
     static __forceinline__ __device__ Acc mma_ua(Frag, Frag, Acc c) { COMFY_MMA_STUB_BODY }
+    static __forceinline__ __device__ Acc mma_ub(Frag, Frag, Acc c) { COMFY_MMA_STUB_BODY }
     static __forceinline__ __device__ float get(Acc c, int e) { return static_cast<float>(c[e]); }
 };
 

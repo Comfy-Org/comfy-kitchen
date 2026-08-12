@@ -74,10 +74,29 @@ def test_prequantized_attention_rejects_cpu_tensors():
     ],
 )
 def test_int8_attention_capability_dispatch(monkeypatch, capability, expected):
+    if getattr(torch.version, "hip", None):
+        pytest.skip("compute capability does not gate the HIP path")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
     monkeypatch.setattr(sage_attention_module._cuda_backend, "_EXT_AVAILABLE", True)
     assert sage_attention_module.is_available() is expected
+
+
+@pytest.mark.parametrize("has_wmma", [True, False])
+def test_int8_attention_hip_dispatch_follows_matrix_cores(monkeypatch, has_wmma):
+    """On ROCm the gate is matrix cores, not a compute capability.
+
+    torch.cuda is the ROCm API there and reports an SM-shaped capability for a
+    gfx part, so the CUDA test above would wave RDNA2 through to a kernel built
+    on WMMA. RDNA2 has none and must decline.
+    """
+    if not getattr(torch.version, "hip", None):
+        pytest.skip("requires a ROCm PyTorch runtime")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        sage_attention_module._hip_backend, "has_wmma", lambda: has_wmma
+    )
+    assert sage_attention_module.is_available() is has_wmma
 
 
 @requires_int8_attention
