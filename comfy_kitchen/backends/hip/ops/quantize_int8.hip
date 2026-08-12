@@ -177,6 +177,110 @@ __global__ __launch_bounds__(256) void dequantize_int8_convrot_weight_kernel(
 
 }  // namespace comfy::hip_backend
 
+// Global spill buffers for convrot quant when K exceeds convrot_fused_lds_max_k() in
+// hadamard.h. hipMalloc lives in this translation unit; kernels stay header-only.
+namespace {
+
+// Process-lifetime workspace passed to launch_convrot_quant_global() in hadamard.h.
+struct ConvrotGlobalWorkspace {
+    void* rotated = nullptr;         // M x K rotated row (input element size)
+    void* partial_absmax = nullptr;  // M x (K / 256) per-group absmax (float)
+    size_t rotated_bytes = 0;
+    size_t partials_bytes = 0;
+};
+
+ConvrotGlobalWorkspace g_convrot_global_ws;
+
+// Grow-only: realloc when a larger (M, K) appears; never shrinks between calls.
+void ensure_convrot_global_workspace(size_t rotated_bytes, size_t partials_bytes) {
+    if (rotated_bytes > g_convrot_global_ws.rotated_bytes) {
+        if (g_convrot_global_ws.rotated != nullptr) {
+            hipFree(g_convrot_global_ws.rotated);
+        }
+        hipError_t err = hipMalloc(&g_convrot_global_ws.rotated, rotated_bytes);
+        if (err != hipSuccess) {
+            throw std::runtime_error(
+                std::string("convrot global: rotated workspace alloc failed: ") +
+                hipGetErrorString(err));
+        }
+        g_convrot_global_ws.rotated_bytes = rotated_bytes;
+    }
+    if (partials_bytes > g_convrot_global_ws.partials_bytes) {
+        if (g_convrot_global_ws.partial_absmax != nullptr) {
+            hipFree(g_convrot_global_ws.partial_absmax);
+        }
+        hipError_t err = hipMalloc(&g_convrot_global_ws.partial_absmax, partials_bytes);
+        if (err != hipSuccess) {
+            throw std::runtime_error(
+                std::string("convrot global: partial absmax alloc failed: ") +
+                hipGetErrorString(err));
+        }
+        g_convrot_global_ws.partials_bytes = partials_bytes;
+    }
+}
+
+}  // namespace
+
+namespace comfy::hip_backend {
+
+template <int ACT>
+struct LaunchConvrotQuantGlobalManaged {
+    const void* x;
+    int in_dtype;
+    int8_t* qout;
+    float* scaleout;
+    int M;
+    int K;
+    hipStream_t stream;
+    void* rotated;
+    void* partial_absmax;
+
+    template <typename RowT>
+    void operator()() const {
+        launch_convrot_quant_global<RowT, ACT>(
+            x, in_dtype, qout, scaleout, M, K,
+            static_cast<RowT*>(rotated),
+            static_cast<float*>(partial_absmax), stream);
+    }
+};
+
+// Host wrapper: size global buffers, then run rotate + quantize kernels from hadamard.h.
+template <int ACT>
+void launch_convrot_quant_global_managed(
+    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
+    hipStream_t stream) {
+    const size_t elem_size = convrot_row_element_size(in_dtype);
+    if (elem_size == 0) {
+        throw std::runtime_error("convrot global: unsupported input dtype code");
+    }
+    const size_t rotated_bytes = static_cast<size_t>(M) * static_cast<size_t>(K) * elem_size;
+    const size_t partials_bytes =
+        static_cast<size_t>(M) * static_cast<size_t>(K / kConvRotGroup256) * sizeof(float);
+    ensure_convrot_global_workspace(rotated_bytes, partials_bytes);
+
+    dispatch_convrot_row_type(
+        in_dtype,
+        LaunchConvrotQuantGlobalManaged<ACT>{
+            x,
+            in_dtype,
+            qout,
+            scaleout,
+            M,
+            K,
+            stream,
+            g_convrot_global_ws.rotated,
+            g_convrot_global_ws.partial_absmax});
+}
+
+template void launch_convrot_quant_global_managed<kActNone>(
+    const void*, int, int8_t*, float*, int, int, hipStream_t);
+template void launch_convrot_quant_global_managed<kActGeluTanh>(
+    const void*, int, int8_t*, float*, int, int, hipStream_t);
+template void launch_convrot_quant_global_managed<kActSwiGLU>(
+    const void*, int, int8_t*, float*, int, int, hipStream_t);
+
+}  // namespace comfy::hip_backend
+
 extern "C" void launch_quantize_int8_rowwise_kernel(
     const void* x, int in_code, void* q, void* scales, int M, int K, hipStream_t stream) {
 
@@ -196,7 +300,7 @@ extern "C" void launch_quantize_int8_convrot_kernel(
 
     using namespace comfy::hip_backend;
     check_convrot_group_size(group_size);
-    check_convrot_k(K, group_size, in_code);
+    check_convrot_k(K, group_size, in_code, /*int8_quant=*/true);
     check_convrot_act(act_code);
     if (M == 0) {
         return;  // a zero-block launch is hipErrorInvalidConfiguration

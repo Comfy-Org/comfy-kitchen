@@ -512,22 +512,23 @@ _convrot_max_k: dict[tuple[int, torch.dtype], int] = {}
 
 
 def _convrot_supported(
-    k: int, group_size: int, device: torch.device, dtype: torch.dtype
+    k: int, group_size: int, device: torch.device, dtype: torch.dtype,
+    *, int8_global_spill: bool = False,
 ) -> bool:
-    """Whether the fused rotation can take a row of this width on ``device``.
+    """Whether the HIP ConvRot quantizer can handle a row of this width on ``device``.
 
-    It stages the whole row in LDS, which bounds K per device, and it rotates K/G
-    whole groups while reading back all K entries, so a partial trailing group
-    would quantize uninitialized LDS.
-
-    The budget is read for the operand's own device, not the process-current one:
-    the kernels launch on the operand's stream, so in a multi-GPU process the two
-    can be different cards with different budgets.
+    INT8 G=256 with ``int8_global_spill`` uses fused LDS or global spill; K need only
+    divide the group size. Other paths stage the whole row in LDS (K bounded per device).
+    The kernel rotates K/G whole groups; a partial trailing group would quantize
+    uninitialized LDS. The LDS budget is read for the operand's device, not the
+    process-current one.
     """
     if group_size not in (16, 64, 256) or k % group_size != 0:
         return False
     if dtype not in (torch.float32, torch.float16, torch.bfloat16):
         return False
+    if group_size == 256 and int8_global_spill:
+        return True
 
     index = device.index if device.index is not None else torch.cuda.current_device()
     key = (index, dtype)
@@ -570,7 +571,7 @@ def quantize_and_rotate_rowwise(
     argument is accepted and unused.
     """
     if stochastic_rounding or not _convrot_supported(
-        x.shape[-1], group_size, x.device, x.dtype
+        x.shape[-1], group_size, x.device, x.dtype, int8_global_spill=True
     ):
         return _eager.quantize_and_rotate_rowwise(
             x, h, group_size, stochastic_rounding=stochastic_rounding
@@ -591,7 +592,7 @@ def quantize_int8_convrot_weight(
     Uses the same fused kernel as the activation path.
     """
     if stochastic_rounding or not _convrot_supported(
-        weight.shape[-1], group_size, weight.device, weight.dtype
+        weight.shape[-1], group_size, weight.device, weight.dtype, int8_global_spill=True
     ):
         return _eager.quantize_int8_convrot_weight(
             weight, group_size, stochastic_rounding=stochastic_rounding
@@ -646,7 +647,9 @@ def int8_linear(
             raise ValueError(
                 f"ConvRot group size {convrot_groupsize} does not divide input features {k}"
             )
-        if not _convrot_supported(k, convrot_groupsize, x.device, x.dtype):
+        if not _convrot_supported(
+            k, convrot_groupsize, x.device, x.dtype, int8_global_spill=True
+        ):
             return _eager.int8_linear(
                 x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
                 input_act=input_act,
@@ -1004,10 +1007,12 @@ def w4a8_int8_linear(
         )
         return torch.nn.functional.linear(x, weight, bias).to(out_dtype)
 
-    # The layout allows any ConvRot group that divides K; the fused activation
-    # quantizer takes only the three it has butterfly stages for, and its LDS
-    # budget bounds K. int8_linear applies the same test before its own fast path.
-    if not _convrot_supported(x.shape[-1], convrot_groupsize, x.device, x.dtype):
+    # The layout allows any ConvRot group that divides K; INT8 G=256 can spill to
+    # global memory when K exceeds the fused LDS budget. int8_linear applies the
+    # same test before its own fast path.
+    if not _convrot_supported(
+        x.shape[-1], convrot_groupsize, x.device, x.dtype, int8_global_spill=True
+    ):
         int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
         return _eager.int8_linear(
             x, int8_weight, s_channel, bias, out_dtype, True, convrot_groupsize

@@ -7,13 +7,15 @@
 // factors into log4(G) radix-4 butterfly stages over the base-4 digits of the
 // index, matching the eager _rotate_activation reference.
 //
-// One block per row: transform each G-group in LDS, track the row absmax, then
-// quantize. INT4 output packs two nibbles per byte (low nibble = even index),
-// which is the layout the iu4 A-fragment consumes directly.
+// INT8 G=256: fused single-kernel path when K fits in LDS, otherwise a global
+// rotate + quantize split. Legacy G=16/64 and int4 paths stage the whole row in
+// LDS (one block per row). INT4 output packs two nibbles per byte (low nibble =
+// even index), which is the layout the iu4 A-fragment consumes directly.
 #pragma once
 
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -29,8 +31,8 @@ inline void check_convrot_group_size(int group_size) {
     }
 }
 
-// The kernel's static LDS: the g[256] and red[256] reductions below.
-constexpr size_t kConvrotStaticLds = 2 * 256 * sizeof(float);
+// The kernel's static LDS: butterfly workspace + row absmax reduction (up to 1024 threads).
+constexpr size_t kConvrotStaticLds = 2 * 1024 * sizeof(float);
 
 // convrot_quant_kernel stages the whole rotated row in dynamic LDS, preserving
 // the input dtype's rounding contract. K is therefore bounded by both the
@@ -62,17 +64,82 @@ inline int convrot_max_k(int in_dtype) {
                             element_size);
 }
 
-inline void check_convrot_k(int k, int group_size, int in_dtype) {
+// Max K for INT8 G=256 fused quant in LDS; larger K uses the global spill path.
+// 0 if the device LDS budget is unknown or too small (dtype-independent: fused widens to float).
+inline int convrot_fused_lds_max_k() {
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) {
+        return 0;
+    }
+    int lds = 0;
+    if (hipDeviceGetAttribute(&lds, hipDeviceAttributeMaxSharedMemoryPerBlock, device) !=
+            hipSuccess ||
+        lds <= 0) {
+        return 0;
+    }
+    // Fused path uses 1024-thread blocks for most shapes (including K=3840); that block
+    // size has the largest tmp footprint.
+    constexpr int kBlockThreads = 1024;
+    constexpr int kWarps = kBlockThreads / 32;
+    const size_t static_lds = kWarps * sizeof(float) + sizeof(float);
+    if (static_cast<size_t>(lds) <= static_lds) {
+        return 0;
+    }
+    const size_t budget = static_cast<size_t>(lds) - static_lds;
+    const int groups_in_flight = kBlockThreads / 64;
+    const size_t overhead = static_cast<size_t>(groups_in_flight) * 2 * 256 * sizeof(float);
+    if (budget <= overhead) {
+        return 0;
+    }
+    return static_cast<int>((budget - overhead) / sizeof(float));
+}
+
+inline void check_convrot_k(int k, int group_size, int in_dtype, bool int8_quant = false) {
     // The kernel rotates K/G whole groups but reads back all K entries of the row
     // buffer, so a partial trailing group would quantize uninitialized LDS.
     if (group_size <= 0 || k % group_size != 0) {
         throw std::runtime_error("convrot: K=" + std::to_string(k) +
                                  " is not divisible by group_size=" + std::to_string(group_size));
     }
+    // INT8 G=256 uses fused LDS or global spill; int4 and G=16/64 still stage the
+    // whole row in dynamic LDS and are bounded by convrot_max_k().
+    if (int8_quant && group_size == 256) {
+        return;
+    }
     const int max_k = convrot_max_k(in_dtype);
     if (max_k <= 0 || k > max_k) {
         throw std::runtime_error("convrot: K=" + std::to_string(k) +
                                  " does not fit in LDS (max " + std::to_string(max_k) + ")");
+    }
+}
+
+// Runtime in_dtype (0/1/2) -> RowT template dispatch for convrot launchers.
+template <typename Fn>
+inline void dispatch_convrot_row_type(int in_dtype, Fn fn) {
+    if (in_dtype == 0) {
+        fn.template operator()<float>();
+    } else if (in_dtype == 1) {
+        fn.template operator()<__half>();
+    } else if (in_dtype == 2) {
+        fn.template operator()<__bf16>();
+    } else {
+        throw std::runtime_error("convrot: unsupported input dtype code");
+    }
+}
+
+// Pick fused-kernel block width from convrot_quant_fused_block_threads().
+template <typename Fn>
+inline void dispatch_convrot_fused_block_threads(int block_threads, Fn fn) {
+    if (block_threads == 64) {
+        fn.template operator()<64>();
+    } else if (block_threads == 512) {
+        fn.template operator()<512>();
+    } else if (block_threads == 640) {
+        fn.template operator()<640>();
+    } else if (block_threads == 768) {
+        fn.template operator()<768>();
+    } else {
+        fn.template operator()<1024>();
     }
 }
 
@@ -121,6 +188,17 @@ __forceinline__ __device__ float load_input_act(
     }
 }
 
+__forceinline__ __device__ void load_input_act4_bf16(
+    const void* x, int64_t in_row, int col, float& o0, float& o1, float& o2, float& o3) {
+    const __bf16* row = static_cast<const __bf16*>(x) + in_row + col;
+    const uint64_t pack = *reinterpret_cast<const uint64_t*>(row);
+    const __bf16* elems = reinterpret_cast<const __bf16*>(&pack);
+    o0 = static_cast<float>(elems[0]);
+    o1 = static_cast<float>(elems[1]);
+    o2 = static_cast<float>(elems[2]);
+    o3 = static_cast<float>(elems[3]);
+}
+
 template <typename RowT>
 __forceinline__ __device__ RowT store_row_value(float v) {
     return static_cast<RowT>(v);
@@ -141,15 +219,426 @@ __forceinline__ __device__ float load_row_value<__half>(__half v) {
     return __half2float(v);
 }
 
-template <typename RowT, bool PACK_INT4, int ACT = kActNone>
-__global__ __launch_bounds__(256) void convrot_quant_kernel(
+constexpr int kConvRotGroup256 = 256;
+constexpr int kWarpSize = 32;
+
+__forceinline__ __device__ float warp_reduce_max(float v) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v = fmaxf(v, __shfl_down(v, offset));
+    }
+    return v;
+}
+
+template <int NUM_WARPS>
+__forceinline__ __device__ float block_reduce_max(float v, float* warp_smem, float* block_smem) {
+    const int lane = threadIdx.x & (kWarpSize - 1);
+    const int wid = threadIdx.x >> 5;
+    v = warp_reduce_max(v);
+    if (lane == 0) {
+        warp_smem[wid] = v;
+    }
+    __syncthreads();
+    if (wid == 0) {
+        float total = lane < NUM_WARPS ? warp_smem[lane] : 0.0f;
+        total = warp_reduce_max(total);
+        if (lane == 0) {
+            *block_smem = total;
+        }
+    }
+    __syncthreads();
+    return *block_smem;
+}
+
+template <int S>
+__forceinline__ __device__ void convrot_fht_stage64(
+    const float* __restrict__ src, float* __restrict__ dst, int lane) {
+    const int base = (lane % S) + (lane / S) * (4 * S);
+    const float x0 = src[base];
+    const float x1 = src[base + S];
+    const float x2 = src[base + 2 * S];
+    const float x3 = src[base + 3 * S];
+    dst[base] = 0.5f * (x0 + x1 + x2 - x3);
+    dst[base + S] = 0.5f * (x0 + x1 - x2 + x3);
+    dst[base + 2 * S] = 0.5f * (x0 - x1 + x2 + x3);
+    dst[base + 3 * S] = 0.5f * (-x0 + x1 + x2 + x3);
+}
+
+template <int S>
+__forceinline__ __device__ float convrot_fht_stage64_store_absmax(
+    const float* __restrict__ src, float* __restrict__ row_buf, int lane) {
+    const int base = (lane % S) + (lane / S) * (4 * S);
+    const float x0 = src[base];
+    const float x1 = src[base + S];
+    const float x2 = src[base + 2 * S];
+    const float x3 = src[base + 3 * S];
+    const float y0 = 0.5f * (x0 + x1 + x2 - x3);
+    const float y1 = 0.5f * (x0 + x1 - x2 + x3);
+    const float y2 = 0.5f * (x0 - x1 + x2 + x3);
+    const float y3 = 0.5f * (-x0 + x1 + x2 + x3);
+    row_buf[base] = y0;
+    row_buf[base + S] = y1;
+    row_buf[base + 2 * S] = y2;
+    row_buf[base + 3 * S] = y3;
+    return fmaxf(fmaxf(fabsf(y0), fabsf(y1)), fmaxf(fabsf(y2), fabsf(y3)));
+}
+
+template <int S, typename RowT>
+__forceinline__ __device__ float convrot_fht_stage64_store_absmax_typed(
+    const float* __restrict__ src, RowT* __restrict__ output, int lane) {
+    const int base = (lane % S) + (lane / S) * (4 * S);
+    const float x0 = src[base];
+    const float x1 = src[base + S];
+    const float x2 = src[base + 2 * S];
+    const float x3 = src[base + 3 * S];
+    const float y0 = 0.5f * (x0 + x1 + x2 - x3);
+    const float y1 = 0.5f * (x0 + x1 - x2 + x3);
+    const float y2 = 0.5f * (x0 - x1 + x2 + x3);
+    const float y3 = 0.5f * (-x0 + x1 + x2 + x3);
+    output[base] = store_row_value<RowT>(y0);
+    output[base + S] = store_row_value<RowT>(y1);
+    output[base + 2 * S] = store_row_value<RowT>(y2);
+    output[base + 3 * S] = store_row_value<RowT>(y3);
+    return fmaxf(fmaxf(fabsf(y0), fabsf(y1)), fmaxf(fabsf(y2), fabsf(y3)));
+}
+
+template <typename RowT>
+__forceinline__ __device__ float finite_absmax_for_quant(float abs_max) {
+    if constexpr (std::is_same_v<RowT, __bf16>) {
+        return fminf(abs_max, 3.38953139e38f);
+    }
+    if constexpr (std::is_same_v<RowT, __half>) {
+        return fminf(abs_max, 65504.0f);
+    }
+    return abs_max;
+}
+
+constexpr int kConvrotGlobalGroupsPerBlock = 8;
+constexpr int kConvrotGlobalBlockThreads = kConvrotGlobalGroupsPerBlock * 64;
+constexpr size_t kConvrotGlobalSmemBytes =
+    static_cast<size_t>(kConvrotGlobalGroupsPerBlock) * 2 * kConvRotGroup256 * sizeof(float);
+
+// Large K: rotate 8 groups/block into global memory, record per-group absmax, then
+// quantize in a second kernel. Fixed 16 KiB LDS regardless of K.
+template <int GROUPS_PER_BLOCK, typename RowT, int ACT>
+__global__ __launch_bounds__(GROUPS_PER_BLOCK* 64) void convrot_rotate_groups64_amax_kernel(
+    const void* __restrict__ x, int in_dtype, RowT* __restrict__ rotated,
+    float* __restrict__ partial_absmax, int K) {
+    constexpr int kGroupThreads = 64;
+    extern __shared__ float smem[];
+
+    const int sub = threadIdx.x / kGroupThreads;
+    const int lane = threadIdx.x % kGroupThreads;
+    const int group = static_cast<int>(blockIdx.y) * GROUPS_PER_BLOCK + sub;
+    const int64_t row = blockIdx.x;
+    const int n_groups = K / kConvRotGroup256;
+    const bool active = group < n_groups;
+    const int64_t row_offset = row * K;
+    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
+    const int64_t in_row_offset = row_offset * kInWidth;
+    const int group_col = group * kConvRotGroup256;
+
+    float* buf0 = smem + sub * (2 * kConvRotGroup256);
+    float* buf1 = buf0 + kConvRotGroup256;
+
+    const int base = lane * 4;
+    const int col = group_col + base;
+    float xv0 = 0.0f;
+    float xv1 = 0.0f;
+    float xv2 = 0.0f;
+    float xv3 = 0.0f;
+    if (active) {
+        if constexpr (ACT == kActNone) {
+            if (in_dtype == 2) {
+                load_input_act4_bf16(x, in_row_offset, col, xv0, xv1, xv2, xv3);
+            } else {
+                xv0 = load_input_act<ACT>(x, in_row_offset, col, K, in_dtype);
+                xv1 = load_input_act<ACT>(x, in_row_offset, col + 1, K, in_dtype);
+                xv2 = load_input_act<ACT>(x, in_row_offset, col + 2, K, in_dtype);
+                xv3 = load_input_act<ACT>(x, in_row_offset, col + 3, K, in_dtype);
+            }
+        } else {
+            xv0 = load_input_act<ACT>(x, in_row_offset, col, K, in_dtype);
+            xv1 = load_input_act<ACT>(x, in_row_offset, col + 1, K, in_dtype);
+            xv2 = load_input_act<ACT>(x, in_row_offset, col + 2, K, in_dtype);
+            xv3 = load_input_act<ACT>(x, in_row_offset, col + 3, K, in_dtype);
+        }
+    }
+    buf1[base] = 0.5f * (xv0 + xv1 + xv2 - xv3);
+    buf1[base + 1] = 0.5f * (xv0 + xv1 - xv2 + xv3);
+    buf1[base + 2] = 0.5f * (xv0 - xv1 + xv2 + xv3);
+    buf1[base + 3] = 0.5f * (-xv0 + xv1 + xv2 + xv3);
+    __syncthreads();
+
+    convrot_fht_stage64<4>(buf1, buf0, lane);
+    __syncthreads();
+    convrot_fht_stage64<16>(buf0, buf1, lane);
+    __syncthreads();
+
+    float local_max = 0.0f;
+    if (active) {
+        local_max = convrot_fht_stage64_store_absmax_typed<64, RowT>(
+            buf1, rotated + row_offset + group_col, lane);
+    }
+    buf0[lane] = local_max;
+    __syncthreads();
+
+    if (lane < 32) {
+        float v = fmaxf(buf0[lane], buf0[lane + 32]);
+        v = warp_reduce_max(v);
+        if (lane == 0 && active) {
+            partial_absmax[static_cast<int64_t>(row) * n_groups + group] = v;
+        }
+    }
+}
+
+// Global spill pass 2: fold per-group absmax into the row scale, then quantize the
+// rotated row already in global memory (pass 1 is convrot_rotate_groups64_amax_kernel).
+template <typename RowT, int BLOCK_THREADS>
+__global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_from_partials_kernel(
+    const RowT* __restrict__ rotated, const float* __restrict__ partial_absmax,
+    int8_t* __restrict__ qout, float* __restrict__ scaleout, int K) {
+    constexpr int kWarps = BLOCK_THREADS / kWarpSize;
+    __shared__ float warp_smem[kWarps];
+    __shared__ float block_smem;
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int n_groups = K / kConvRotGroup256;
+    const int64_t row_offset = static_cast<int64_t>(row) * K;
+    const float* row_partials = partial_absmax + static_cast<int64_t>(row) * n_groups;
+
+    float abs_max = 0.0f;
+    for (int g = tid; g < n_groups; g += BLOCK_THREADS) {
+        abs_max = fmaxf(abs_max, row_partials[g]);
+    }
+    abs_max = block_reduce_max<kWarps>(abs_max, warp_smem, &block_smem);
+    const float rowmax = fmaxf(finite_absmax_for_quant<RowT>(abs_max), 1e-10f);
+    const float scale = rowmax / 127.0f;
+    const float inv = 127.0f / rowmax;
+    if (tid == 0) {
+        scaleout[row] = scale;
+    }
+
+    for (int col = tid; col < K; col += BLOCK_THREADS) {
+        const float v = load_row_value<RowT>(rotated[row_offset + col]);
+        int q = static_cast<int>(rintf(v * inv));
+        q = q < -127 ? -127 : (q > 127 ? 127 : q);
+        qout[row_offset + col] = static_cast<int8_t>(q);
+    }
+}
+
+template <typename RowT, int ACT>
+inline void launch_convrot_quant_global(
+    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
+    RowT* rotated, float* partial_absmax, hipStream_t stream) {
+    const int n_groups = K / kConvRotGroup256;
+    const int group_blocks =
+        (n_groups + kConvrotGlobalGroupsPerBlock - 1) / kConvrotGlobalGroupsPerBlock;
+    const dim3 rotate_grid(static_cast<unsigned int>(M), static_cast<unsigned int>(group_blocks));
+    convrot_rotate_groups64_amax_kernel<kConvrotGlobalGroupsPerBlock, RowT, ACT>
+        <<<rotate_grid, kConvrotGlobalBlockThreads, kConvrotGlobalSmemBytes, stream>>>(
+            x, in_dtype, rotated, partial_absmax, K);
+
+    const int quant_threads = K >= 4096 ? 512 : 256;
+    if (quant_threads == 512) {
+        convrot_quant_from_partials_kernel<RowT, 512>
+            <<<M, 512, 0, stream>>>(rotated, partial_absmax, qout, scaleout, K);
+    } else {
+        convrot_quant_from_partials_kernel<RowT, 256>
+            <<<M, 256, 0, stream>>>(rotated, partial_absmax, qout, scaleout, K);
+    }
+}
+
+template <int ACT>
+void launch_convrot_quant_global_managed(
+    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K, hipStream_t stream);
+
+// Fused single-kernel path: FHT in LDS, vectorized loads, warp-shuffle absmax.
+// One block per row; the rotated row stays in shared memory as float.
+template <typename RowT, int BLOCK_THREADS, int ACT>
+__global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
+    const void* __restrict__ x, int in_dtype, int8_t* __restrict__ qout,
+    float* __restrict__ scaleout, int M, int K) {
+
+    constexpr int kGroupThreads = 64;
+    constexpr int kGroupsInFlight = BLOCK_THREADS / kGroupThreads;
+    constexpr int kWarps = BLOCK_THREADS / kWarpSize;
+
+    extern __shared__ float smem[];
+    float* row_buf = smem;
+    float* tmp = smem + K;
+
+    __shared__ float warp_smem[kWarps];
+    __shared__ float block_smem;
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int sub = tid / kGroupThreads;
+    const int lane = tid % kGroupThreads;
+    const int64_t row_offset = static_cast<int64_t>(row) * K;
+    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
+    const int64_t in_row_offset = row_offset * kInWidth;
+    const int n_groups = K / kConvRotGroup256;
+
+    float* buf0 = tmp + sub * (2 * kConvRotGroup256);
+    float* buf1 = buf0 + kConvRotGroup256;
+    float abs_max = 0.0f;
+
+    const int iters = (n_groups + kGroupsInFlight - 1) / kGroupsInFlight;
+    for (int it = 0; it < iters; ++it) {
+        const int group = it * kGroupsInFlight + sub;
+        const bool active = group < n_groups;
+        const int base = lane * 4;
+        const int group_col = group * kConvRotGroup256;
+        const int col = group_col + base;
+
+        float xv0 = 0.0f;
+        float xv1 = 0.0f;
+        float xv2 = 0.0f;
+        float xv3 = 0.0f;
+        if (active) {
+            if constexpr (ACT == kActNone) {
+                if (in_dtype == 2) {
+                    load_input_act4_bf16(x, in_row_offset, col, xv0, xv1, xv2, xv3);
+                } else {
+                    xv0 = load_input_act<ACT>(x, in_row_offset, col, K, in_dtype);
+                    xv1 = load_input_act<ACT>(x, in_row_offset, col + 1, K, in_dtype);
+                    xv2 = load_input_act<ACT>(x, in_row_offset, col + 2, K, in_dtype);
+                    xv3 = load_input_act<ACT>(x, in_row_offset, col + 3, K, in_dtype);
+                }
+            } else {
+                xv0 = load_input_act<ACT>(x, in_row_offset, col, K, in_dtype);
+                xv1 = load_input_act<ACT>(x, in_row_offset, col + 1, K, in_dtype);
+                xv2 = load_input_act<ACT>(x, in_row_offset, col + 2, K, in_dtype);
+                xv3 = load_input_act<ACT>(x, in_row_offset, col + 3, K, in_dtype);
+            }
+        }
+        buf1[base] = 0.5f * (xv0 + xv1 + xv2 - xv3);
+        buf1[base + 1] = 0.5f * (xv0 + xv1 - xv2 + xv3);
+        buf1[base + 2] = 0.5f * (xv0 - xv1 + xv2 + xv3);
+        buf1[base + 3] = 0.5f * (-xv0 + xv1 + xv2 + xv3);
+        __syncthreads();
+
+        convrot_fht_stage64<4>(buf1, buf0, lane);
+        __syncthreads();
+        convrot_fht_stage64<16>(buf0, buf1, lane);
+        __syncthreads();
+
+        if (active) {
+            abs_max = fmaxf(
+                abs_max, convrot_fht_stage64_store_absmax<64>(buf1, row_buf + group_col, lane));
+        }
+        __syncthreads();
+    }
+
+    abs_max = block_reduce_max<kWarps>(abs_max, warp_smem, &block_smem);
+    const float rowmax = fmaxf(finite_absmax_for_quant<RowT>(abs_max), 1e-10f);
+    const float scale = rowmax / 127.0f;
+    const float inv = 127.0f / rowmax;
+    if (tid == 0) {
+        scaleout[row] = scale;
+    }
+
+    for (int col = tid; col < K; col += BLOCK_THREADS) {
+        const float v = row_buf[col];
+        int q = static_cast<int>(rintf(v * inv));
+        q = q < -127 ? -127 : (q > 127 ? 127 : q);
+        qout[row_offset + col] = static_cast<int8_t>(q);
+    }
+}
+
+inline int convrot_quant_fused_block_threads(int M, int K) {
+    if (M == 1) {
+        return 512;
+    }
+    if (K == kConvRotGroup256) {
+        return 64;
+    }
+    if (K == 2560) {
+        return 640;
+    }
+    if (K == 6144) {
+        return 768;
+    }
+    return 1024;
+}
+
+template <typename RowT, int ACT, int BLOCK_THREADS>
+inline void launch_convrot_quant_fused_impl(
+    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
+    hipStream_t stream) {
+    const int groups_in_flight = BLOCK_THREADS / 64;
+    const size_t shmem =
+        (static_cast<size_t>(K) + static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256) *
+        sizeof(float);
+    auto kernel = convrot_quant_fused_kernel<RowT, BLOCK_THREADS, ACT>;
+    const hipError_t attr_err = hipFuncSetAttribute(
+        reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(shmem));
+    if (attr_err != hipSuccess) {
+        throw std::runtime_error(
+            std::string("convrot fused: shared memory request (") + std::to_string(shmem) +
+            " bytes) failed: " + hipGetErrorString(attr_err));
+    }
+    kernel<<<M, BLOCK_THREADS, shmem, stream>>>(x, in_dtype, qout, scaleout, M, K);
+}
+
+template <typename RowT, int ACT>
+struct LaunchConvrotQuantFusedForBlock {
+    const void* x;
+    int in_dtype;
+    int8_t* qout;
+    float* scaleout;
+    int M;
+    int K;
+    hipStream_t stream;
+
+    template <int BLOCK_THREADS>
+    void operator()() const {
+        launch_convrot_quant_fused_impl<RowT, ACT, BLOCK_THREADS>(
+            x, in_dtype, qout, scaleout, M, K, stream);
+    }
+};
+
+template <int ACT>
+struct LaunchConvrotQuantFusedForRow {
+    const void* x;
+    int in_dtype;
+    int8_t* qout;
+    float* scaleout;
+    int M;
+    int K;
+    hipStream_t stream;
+    int block_threads;
+
+    template <typename RowT>
+    void operator()() const {
+        dispatch_convrot_fused_block_threads(
+            block_threads,
+            LaunchConvrotQuantFusedForBlock<RowT, ACT>{x, in_dtype, qout, scaleout, M, K, stream});
+    }
+};
+
+template <int ACT>
+inline void launch_convrot_quant_fused(
+    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
+    hipStream_t stream) {
+    const int block_threads = convrot_quant_fused_block_threads(M, K);
+    dispatch_convrot_row_type(
+        in_dtype,
+        LaunchConvrotQuantFusedForRow<ACT>{x, in_dtype, qout, scaleout, M, K, stream, block_threads});
+}
+
+template <typename RowT, bool PACK_INT4, int ACT, int BLOCK_THREADS>
+__global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_kernel(
     const void* __restrict__ x, int in_dtype,
     int8_t* __restrict__ qout, float* __restrict__ scaleout,
     int M, int K, int G) {
 
     const float h4[4][4] = {{1, 1, 1, -1}, {1, 1, -1, 1}, {1, -1, 1, 1}, {-1, 1, 1, 1}};
-    __shared__ float g[256];
-    __shared__ float red[256];
+    __shared__ float g[1024];
+    __shared__ float red[1024];
     extern __shared__ unsigned char rowbuf_raw[];
     RowT* rowbuf = reinterpret_cast<RowT*>(rowbuf_raw);  // K entries: the rotated row
 
@@ -159,9 +648,9 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
     int nstages = 0;
     while ((1 << (2 * nstages)) < G) nstages++;  // log4(G)
 
-    const int gpw = 256 / G;      // groups handled per pass
-    const int glocal = t / G;     // this thread's group within the pass
-    const int e = t % G;          // element within the group
+    const int gpw = BLOCK_THREADS / G;           // groups handled per pass
+    const int glocal = t / G;                    // this thread's group within the pass
+    const int e = t % G;                         // element within the group
     const int gbase_idx = glocal * G;
     const float norm = rsqrtf(static_cast<float>(G));
     const int ngrp = K / G;
@@ -198,7 +687,7 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
 
     red[t] = lmax;
     __syncthreads();
-    for (int s = 128; s > 0; s >>= 1) {
+    for (int s = BLOCK_THREADS / 2; s > 0; s >>= 1) {
         if (t < s) red[t] = fmaxf(red[t], red[t + s]);
         __syncthreads();
     }
@@ -211,7 +700,7 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
 
     if constexpr (PACK_INT4) {
         const int Kp = K / 2;
-        for (int jb = t; jb < Kp; jb += 256) {
+        for (int jb = t; jb < Kp; jb += BLOCK_THREADS) {
             const float a = load_row_value(rowbuf[2 * jb]);
             const float b = load_row_value(rowbuf[2 * jb + 1]);
             int qa = static_cast<int>(rintf(a * inv));
@@ -222,7 +711,7 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
                 static_cast<int8_t>(((qa & 0xF) | ((qb & 0xF) << 4)) & 0xFF);
         }
     } else {
-        for (int j = t; j < K; j += 256) {
+        for (int j = t; j < K; j += BLOCK_THREADS) {
             const float v = load_row_value(rowbuf[j]);
             int q = static_cast<int>(rintf(v * inv));
             q = q < -127 ? -127 : (q > 127 ? 127 : q);
@@ -231,23 +720,69 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
     }
 }
 
+template <typename RowT, bool PACK_INT4, int ACT, int BLOCK_THREADS>
+inline void launch_convrot_quant_impl(
+    const void* x, int in_dtype, int8_t* qout, float* scaleout,
+    int M, int K, int group_size, hipStream_t stream) {
+
+    const size_t shmem = static_cast<size_t>(K) * convrot_row_element_size(in_dtype);
+    convrot_quant_kernel<RowT, PACK_INT4, ACT, BLOCK_THREADS><<<M, BLOCK_THREADS, shmem, stream>>>(
+        x, in_dtype, qout, scaleout, M, K, group_size);
+}
+
+template <bool PACK_INT4, int ACT, int BLOCK_THREADS>
+struct LaunchConvrotQuantLegacyForBlock {
+    const void* x;
+    int in_dtype;
+    int8_t* qout;
+    float* scaleout;
+    int M;
+    int K;
+    int group_size;
+    hipStream_t stream;
+
+    template <typename RowT>
+    void operator()() const {
+        launch_convrot_quant_impl<RowT, PACK_INT4, ACT, BLOCK_THREADS>(
+            x, in_dtype, qout, scaleout, M, K, group_size, stream);
+    }
+};
+
+template <bool PACK_INT4, int ACT, int BLOCK_THREADS>
+inline void launch_convrot_quant_for_block(
+    const void* x, int in_dtype, int8_t* qout, float* scaleout,
+    int M, int K, int group_size, hipStream_t stream) {
+    dispatch_convrot_row_type(
+        in_dtype,
+        LaunchConvrotQuantLegacyForBlock<PACK_INT4, ACT, BLOCK_THREADS>{
+            x, in_dtype, qout, scaleout, M, K, group_size, stream});
+}
+
 template <bool PACK_INT4, int ACT = kActNone>
 inline void launch_convrot_quant(
     const void* x, int in_dtype, int8_t* qout, float* scaleout,
     int M, int K, int group_size, hipStream_t stream) {
 
-    const size_t shmem = static_cast<size_t>(K) * convrot_row_element_size(in_dtype);
-    if (in_dtype == 0) {
-        convrot_quant_kernel<float, PACK_INT4, ACT><<<M, 256, shmem, stream>>>(
-            x, in_dtype, qout, scaleout, M, K, group_size);
-    } else if (in_dtype == 1) {
-        convrot_quant_kernel<__half, PACK_INT4, ACT><<<M, 256, shmem, stream>>>(
-            x, in_dtype, qout, scaleout, M, K, group_size);
-    } else if (in_dtype == 2) {
-        convrot_quant_kernel<__bf16, PACK_INT4, ACT><<<M, 256, shmem, stream>>>(
-            x, in_dtype, qout, scaleout, M, K, group_size);
+    // INT8 G=256: fused single-kernel quant when K fits in LDS, else global spill.
+    if (!PACK_INT4 && group_size == 256) {
+        if (K > convrot_fused_lds_max_k()) {
+            launch_convrot_quant_global_managed<ACT>(
+                x, in_dtype, qout, scaleout, M, K, stream);
+        } else {
+            launch_convrot_quant_fused<ACT>(x, in_dtype, qout, scaleout, M, K, stream);
+        }
+        return;
+    }
+
+    // G=256 with K>=512: 1024-thread blocks process 4 Hadamard groups/pass (15->4
+    // passes at K=3840). Smaller configs keep 256 threads for occupancy on narrow K.
+    const int block_threads = (group_size == 256 && K >= 512) ? 1024 : 256;
+    if (block_threads == 1024) {
+        launch_convrot_quant_for_block<PACK_INT4, ACT, 1024>(
+            x, in_dtype, qout, scaleout, M, K, group_size, stream);
     } else {
-        throw std::runtime_error("convrot: unsupported input dtype code");
+        launch_convrot_quant_for_block<PACK_INT4, ACT, 256>(
+            x, in_dtype, qout, scaleout, M, K, group_size, stream);
     }
 }
 

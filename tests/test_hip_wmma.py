@@ -146,6 +146,27 @@ def test_int8_linear_convrot_matches_eager():
     assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
 
 
+@needs_wmma
+@pytest.mark.parametrize("k", [3840, 10240])
+def test_int8_linear_convrot_large_k_matches_eager(k):
+    """G=256 INT8 convrot: fused LDS (3840) and global spill (10240) vs eager."""
+    torch.manual_seed(k)
+    m, n = 64, 256
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16)
+    wq, ws = ck.quantize_int8_rowwise(w)
+
+    with ck.use_backend("hip"):
+        out = ck.int8_linear(x, wq, ws.reshape(-1), None, torch.bfloat16, convrot=True,
+                             convrot_groupsize=256)
+    with ck.use_backend("eager"):
+        ref = ck.int8_linear(x, wq, ws.reshape(-1), None, torch.bfloat16, convrot=True,
+                             convrot_groupsize=256)
+
+    scale = ref.float().abs().max().item()
+    assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
+
+
 def _offset_copy(t: torch.Tensor) -> torch.Tensor:
     """A contiguous copy of ``t`` deliberately based off a 16-byte boundary."""
     flat = t.reshape(-1)
