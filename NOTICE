@@ -41,6 +41,15 @@ Website: https://github.com/wjakob/nanobind
 nanobind is used at build time to create Python bindings for C++/CUDA code.
 
 --------------------------------------------------------------------------------
+FlashAttention
+--------------------------------------------------------------------------------
+Copyright (c) 2022, the respective contributors, as shown by the AUTHORS file.
+License: BSD-3-Clause
+Website: https://github.com/Dao-AILab/flash-attention
+
+The fixed-cache decode kernel uses FlashAttention 2.7.4.
+
+--------------------------------------------------------------------------------
 PyTorch AO (torchao)
 --------------------------------------------------------------------------------
 Copyright (c) Meta Platforms, Inc. and affiliates.
