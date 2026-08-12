@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
+import inspect
 import weakref
 
 import pytest
@@ -97,6 +98,49 @@ def test_int8_attention_hip_dispatch_follows_matrix_cores(monkeypatch, has_wmma)
         sage_attention_module._hip_backend, "has_wmma", lambda: has_wmma
     )
     assert sage_attention_module.is_available() is has_wmma
+
+
+def test_int8_attention_hip_branch_returns_before_cuda_sage_sdpa():
+    """gfx1151 is RDNA3.5, so has_wmma() is true and the HIP branch returns first.
+
+    Editing the CUDA ``sage_sdpa(..., cta_k=cta_k)`` call sites cannot fix a HIP
+    ABI error: those lines never run when the HIP backend is loaded.
+    """
+    source = inspect.getsource(sage_attention_module._int8_attention_cuda)
+    hip_idx = source.index("if _hip_backend is not None:")
+    cuda_idx = source.index("_cuda_backend._C.sage_sdpa")
+    assert hip_idx < cuda_idx
+    assert "return " in source[hip_idx:cuda_idx]
+
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_int8_attention_hip_path_does_not_call_cuda_sage_sdpa(monkeypatch, masked):
+    q = torch.randn(1, 2, 8, 64)
+    k = torch.randn(1, 2, 8, 64)
+    v = torch.randn(1, 2, 8, 64)
+    mask = torch.ones(1, 2, 8, 8, dtype=torch.bool) if masked else None
+    hip_calls = []
+
+    class FakeHip:
+        def sage_int8_sdpa(self, q, k, v, *, attention_scale, attn_mask):
+            hip_calls.append(attn_mask)
+            return torch.empty_like(q)
+
+    def cuda_sage_sdpa(*args, **kwargs):
+        raise AssertionError("CUDA sage_sdpa must not run when the HIP backend is loaded")
+
+    monkeypatch.setattr(sage_attention_module, "_hip_backend", FakeHip())
+    monkeypatch.setattr(sage_attention_module, "_validate_inputs", lambda *_args, **_kwargs: mask)
+    monkeypatch.setattr(
+        sage_attention_module._cuda_backend,
+        "_C",
+        type("FakeCudaC", (), {"sage_sdpa": staticmethod(cuda_sage_sdpa)})(),
+    )
+
+    output = sage_attention_module._int8_attention_cuda(q, k, v, attn_mask=mask)
+    assert len(hip_calls) == 1
+    assert hip_calls[0] is mask
+    assert output.shape == q.shape
 
 
 @requires_int8_attention

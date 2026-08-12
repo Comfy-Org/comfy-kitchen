@@ -2083,6 +2083,26 @@ def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
     return buffers, anchor_indices
 
 
+def _sage_native(name: str, *args):
+    """Call a HIP sage_sdpa entry point, naming a stale extension on TypeError.
+
+    CUDA and HIP both export ``sage_sdpa`` with different layouts. nanobind's
+    ``incompatible function arguments`` error does not say which ``_C`` module
+    rejected the call, so a checkout whose ``.pyd``/``.so`` predates this
+    wrapper is easy to misread as a keyword-binding bug.
+    """
+    fn = getattr(_C, name)
+    try:
+        return fn(*args)
+    except TypeError as error:
+        raise TypeError(
+            f"HIP {name} rejected its arguments. The installed extension is "
+            f"{getattr(_C, '__file__', None)}; its signature is "
+            f"{getattr(fn, '__doc__', None)!r}. Rebuild backends/hip/_C so it "
+            "matches this checkout."
+        ) from error
+
+
 def sage_int8_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2101,7 +2121,8 @@ def sage_int8_sdpa(
 
     cta_k = _sage_cta_k(head_dim, k.shape[2], attn_mask is not None)
     buffers, anchor_indices = _sage_buffers(q, k, cta_k)
-    _C.sage_sdpa(
+    _sage_native(
+        "sage_sdpa",
         _dl(q),
         _dl(k),
         _dl(v),
@@ -2132,7 +2153,8 @@ def sage_int8_quantize(
 ) -> dict:
     """Quantize q, k and v without allocating the attention output."""
     buffers, anchor_indices = _sage_buffers(q, k, cta_k)
-    _C.sage_sdpa_quantize(
+    _sage_native(
+        "sage_sdpa_quantize",
         _dl(q),
         _dl(k),
         _dl(v),
@@ -2168,7 +2190,8 @@ def sage_int8_attend(
     output = torch.empty(
         batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q_int8.device
     )
-    _C.sage_sdpa_prequantized(
+    _sage_native(
+        "sage_sdpa_prequantized",
         _dl(q_int8),
         _dl(k_int8),
         _dl(v_int8),

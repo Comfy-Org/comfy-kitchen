@@ -11,6 +11,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import types
 
 import pytest
 import torch
@@ -142,6 +143,82 @@ def test_hip_declines_when_an_arch_cannot_be_read():
 def test_hip_wmma_capability(arches, expected):
     """Only an all-matrix-core process may advertise the GEMMs."""
     assert hip_backend._has_wmma(arches) is expected
+
+
+def _record_sage_sdpa(monkeypatch):
+    recorded = []
+
+    def fake_sage_sdpa(*args, **kwargs):
+        recorded.append((args, kwargs))
+
+    fake_c = types.SimpleNamespace(
+        __file__="/tmp/comfy_kitchen/backends/hip/_C.pyd",
+        sage_sdpa=fake_sage_sdpa,
+    )
+    monkeypatch.setattr(hip_backend, "_C", fake_c)
+    monkeypatch.setattr(hip_backend, "_dl", lambda tensor: tensor)
+    monkeypatch.setattr(hip_backend, "_stream", lambda _tensor: 0)
+    return recorded
+
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_hip_sage_sdpa_uses_the_hip_positional_layout(monkeypatch, masked):
+    """HIP sage_sdpa is a different module from CUDA sage_sdpa.
+
+    ``anchor_indices`` is a tensor at position 11, ``cta_k`` is at position 13,
+    and ``attn_mask`` is last. Passing CUDA's ``cta_k=`` keyword at the CUDA
+    call sites does not reach this entry point.
+    """
+    recorded = _record_sage_sdpa(monkeypatch)
+    q = torch.randn(1, 2, 8, 64)
+    k = torch.randn(1, 2, 8, 64)
+    v = torch.randn(1, 2, 8, 64)
+    mask = torch.ones(1, 2, 8, 8, dtype=torch.bool) if masked else None
+
+    output = hip_backend.sage_int8_sdpa(q, k, v, attention_scale=0.125, attn_mask=mask)
+
+    assert output.shape == q.shape
+    assert len(recorded) == 1
+    args, kwargs = recorded[0]
+    assert kwargs == {}
+    assert len(args) == 17
+    # 1-based positions: 11 = anchor_indices, 13 = cta_k, last = attn_mask.
+    assert args[10].shape == (1, 2) and args[10].dtype == torch.int32
+    assert args[12] == hip_backend._SAGE_CTA_K
+    assert args[-1] is mask
+
+
+def test_hip_sage_sdpa_typeerror_names_the_installed_extension(monkeypatch):
+    def fake_sage_sdpa(*args, **kwargs):
+        raise TypeError("sage_sdpa(): incompatible function arguments")
+
+    fake_sage_sdpa.__doc__ = (
+        "sage_sdpa(q, k, v, o, q_int8, q_scale, k_int8, k_scale, v_int8, "
+        "v_scale, anchor_indices, sm_scale, cta_k, input_dtype_code, "
+        "output_dtype_code, stream_ptr, attn_mask=None)"
+    )
+    monkeypatch.setattr(
+        hip_backend,
+        "_C",
+        types.SimpleNamespace(
+            __file__="/tmp/comfy_kitchen/backends/hip/_C.pyd",
+            sage_sdpa=fake_sage_sdpa,
+        ),
+    )
+    monkeypatch.setattr(hip_backend, "_dl", lambda tensor: tensor)
+    monkeypatch.setattr(hip_backend, "_stream", lambda _tensor: 0)
+
+    q = torch.randn(1, 2, 8, 64)
+    k = torch.randn(1, 2, 8, 64)
+    v = torch.randn(1, 2, 8, 64)
+    with pytest.raises(TypeError, match="HIP sage_sdpa rejected") as info:
+        hip_backend.sage_int8_sdpa(q, k, v, attention_scale=0.125, attn_mask=None)
+
+    message = str(info.value)
+    assert "/tmp/comfy_kitchen/backends/hip/_C.pyd" in message
+    assert "anchor_indices" in message
+    assert info.value.__cause__ is not None
+    assert "incompatible function arguments" in str(info.value.__cause__)
 
 
 def test_hip_drops_gemms_without_matrix_cores():
