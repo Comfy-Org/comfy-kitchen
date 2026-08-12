@@ -23,6 +23,39 @@ _LOG2E = 1.4426950408889634
 _MAX_SCORE_BYTES = 4 * 2**30
 
 
+def _normalize_key_bias(key_bias, batch, t, device):
+    """Accept SDPA-mask-like forms and reduce them to (B, T) float log-bias.
+
+    Shapes: (T,), (B, T), or broadcastable 4-D (B-or-1, 1, 1, T) -- the
+    key-only slice of the standard attn_mask contract. Bool masks follow SDPA
+    semantics: True = attend (bias 0), False = masked (bias -inf). Anything
+    varying over heads or queries is not expressible here and is rejected.
+
+    The device check is not optional politeness: a host pointer handed to the
+    CUDA preprocess is an asynchronous illegal-memory-access that poisons the
+    context on some LATER call.
+    """
+    if key_bias.device != device:
+        raise ValueError(
+            f"sol_attn: key_bias must be on {device}, got {key_bias.device}")
+    if key_bias.dim() == 4:
+        if key_bias.shape[1] != 1 or key_bias.shape[2] != 1:
+            raise ValueError(
+                "sol_attn: key_bias must be key-only; a mask varying over "
+                f"heads or queries ({tuple(key_bias.shape)}) cannot be "
+                "expressed by this op -- use a dense attention for those calls")
+        key_bias = key_bias[:, 0, 0, :]
+    if key_bias.dim() == 1:
+        key_bias = key_bias.unsqueeze(0)
+    if key_bias.dim() != 2 or key_bias.shape[-1] != t or key_bias.shape[0] not in (1, batch):
+        raise ValueError(
+            f"sol_attn: key_bias must be (T,), (B, T) or (B, 1, 1, T), got "
+            f"{tuple(key_bias.shape)} for T={t}, B={batch}")
+    if key_bias.dtype == torch.bool:
+        key_bias = torch.where(key_bias, 0.0, float("-inf"))
+    return key_bias.float()
+
+
 def _pool(x: torch.Tensor, n_blocks: int, reduce: str) -> torch.Tensor:
     """(B, T, H, D) -> (B, N, H, D), block mean or sum, ragged tail handled."""
     b, t, h, d = x.shape
@@ -46,6 +79,8 @@ def sol_attn(
     scale: float | None = None,
     sink_blocks: list[int] | None = None,
     sink_q: list[int] | None = None,
+    centroid_tail: bool = True,
+    key_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn over ``(B, T, H, D)`` tensors. See the module docstring."""
     b, t, h, d = q.shape
@@ -93,6 +128,13 @@ def sol_attn(
     vch = vc.permute(0, 2, 1, 3)
 
     s_tok = (qh @ kh.transpose(-1, -2)) * log2s                     # (B, H, T, T)
+    if key_bias is not None:
+        # Additive logit bias per KEY (natural-log units, like an SDPA mask or
+        # LTX's log(strength)). Applied to the exact branch only: the pooled
+        # tail cannot see per-token bias, so blocks holding nonzero bias must
+        # be covered by sink_blocks (routed exact) for the bias to be honoured.
+        kb = _normalize_key_bias(key_bias, b, t, q.device)
+        s_tok = s_tok + (kb * _LOG2E).reshape(-1, 1, 1, t)
     s_blk = (qh @ kch.transpose(-1, -2)) * log2s                    # (B, H, T, N)
 
     # A block is routed if its mean score over the query block clears the
@@ -114,6 +156,12 @@ def sol_attn(
     keep_tok = ex_tok.repeat_interleave(BLOCK, dim=-1)[..., :t]
     neg = torch.finfo(s_tok.dtype).min
     s_tok = s_tok.masked_fill(~keep_tok, neg)
+    if centroid_tail:
+        # The tail is evaluated at the query-block centroid -- colmean IS the
+        # centroid score, the same quantity the routing decision thresholds --
+        # so every row of a query block shares its tail. Costs ~5e-4 cosine vs
+        # the per-row tail; buys the fused routing pass a 64x smaller problem.
+        s_blk = colmean.gather(2, qblk.view(1, 1, t, 1).expand(b, h, t, n))
     s_blk = s_blk.masked_fill(ex_tok | ~valid_blk, neg)
 
     # One softmax over both branches. A pooled term carries its block's length in
@@ -152,10 +200,13 @@ def _op_sol_attn(
     sink_blocks: list[int],
     sink_q: list[int],
     max_blocks: int,
+    centroid_tail: bool,
+    key_bias: torch.Tensor | None,
 ) -> torch.Tensor:
     kwargs = {
         "q": q, "k": k, "v": v, "tau": tau, "scale": scale,
         "sink_blocks": sink_blocks, "sink_q": sink_q,
+        "centroid_tail": centroid_tail, "key_bias": key_bias,
     }
     impl = registry.get_implementation("sol_attn", kwargs=kwargs)
     if _accepts_max_blocks(impl):
@@ -164,7 +215,8 @@ def _op_sol_attn(
 
 
 @_op_sol_attn.register_fake
-def _op_sol_attn_fake(q, k, v, tau, scale, sink_blocks, sink_q, max_blocks):
+def _op_sol_attn_fake(q, k, v, tau, scale, sink_blocks, sink_q, max_blocks,
+                      centroid_tail, key_bias):
     # Contiguous, NOT empty_like(v): both real implementations return
     # contiguous, and for a strided v, empty_like would promise a layout
     # downstream compiled ops never get.

@@ -81,7 +81,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     const __nv_bfloat16* __restrict__ o_part, const float* __restrict__ m_part,
     const float* __restrict__ l_part,
     __nv_bfloat16* __restrict__ out,
-    int T, int Tp, int H, int max_blk, float scale_log2)
+    int T, int Tp, int H, int max_blk, float scale_log2, int centroid_tail)
 {
 #if SOL_SM80
     extern __shared__ __align__(16) char smem_raw[];
@@ -124,11 +124,28 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     const uint16_t* my_idx = blk_idx + (int64_t)(bh * gridDim.x + q_block) * max_blk;
     const int n_blocks = blk_cnt[bh * gridDim.x + q_block];
 
-    // Resume the online softmax where the routing pass left it. o_part aliases
-    // `out`: each element is read here and rewritten by the SAME thread.
+    // Resume the online softmax where the routing pass left it. Default
+    // (centroid_tail): the tail is evaluated at the query-block centroid, so
+    // all rows share ONE state and o_part/m_part/l_part are per (b, h, query
+    // block). Fallback (per-row tail, selectable for quality A/B): the state
+    // is per row and o_part aliases `out` -- each element is read here and
+    // rewritten by the SAME thread in the epilogue.
     float o_acc[NT][4];
-    float m_r[2] = {NEG, NEG}, l_r[2] = {0.f, 0.f};
-    {
+    float m_r[2], l_r[2];
+    if (centroid_tail) {
+        const int64_t qb_s = (int64_t)bh * gridDim.x + q_block;
+        const __nv_bfloat16* orow = o_part + qb_s * HD;
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            const int c = nt * 8 + qd * 2;
+            const float v0 = __bfloat162float(orow[c]);
+            const float v1 = __bfloat162float(orow[c + 1]);
+            o_acc[nt][0] = v0; o_acc[nt][2] = v0;
+            o_acc[nt][1] = v1; o_acc[nt][3] = v1;
+        }
+        m_r[0] = m_r[1] = m_part[qb_s];
+        l_r[0] = l_r[1] = l_part[qb_s];
+    } else {
         #pragma unroll
         for (int rr = 0; rr < 2; ++rr) {
             const int r = min(q_row0 + rr * 8, T - 1);
@@ -222,39 +239,50 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         const float alpha1 = exp2f(m_r[1] - m_new[1]);
         m_r[0] = m_new[0]; m_r[1] = m_new[1];
 
-        // The INT8 P scale folds into the exponent (exp2(x) * 127 ==
-        // exp2(x + log2 127)); l and the accumulator carry the same 127 and
-        // the epilogue division cancels it exactly.
-        const float m_off[2] = {m_new[0] - 6.98868969f, m_new[1] - 6.98868969f};
-        float l_add[2] = {0.f, 0.f};
+        // The P scale folds into the exponent (exp2(x) * 255 == exp2(x +
+        // log2 255)); l and the accumulator carry the same 255 and the
+        // epilogue division cancels it exactly. 255 rather than 127 because P
+        // is non-negative and rides the u8 side of a u8 x s8 MMA -- double the
+        // resolution of the old s8 packing for free.
+        const float m_off[2] = {m_new[0] - 7.99435344f, m_new[1] - 7.99435344f};
         #pragma unroll
         for (int nt = 0; nt < NKT; ++nt) {
             #pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const int row = e >> 1;
-                const float p = exp2f(p_val[nt][e] - m_off[row]);
-                p_val[nt][e] = p;
-                l_add[row] += p;
-            }
+            for (int e = 0; e < 4; ++e)
+                p_val[nt][e] = exp2f(p_val[nt][e] - m_off[e >> 1]);
         }
-        #pragma unroll
-        for (int off = 1; off <= 2; off <<= 1) {
-            l_add[0] += __shfl_xor_sync(0xffffffffu, l_add[0], off);
-            l_add[1] += __shfl_xor_sync(0xffffffffu, l_add[1], off);
-        }
-        l_r[0] = l_r[0] * alpha0 + l_add[0];
-        l_r[1] = l_r[1] * alpha1 + l_add[1];
 
         // Free repack: n-tiles (4kk, 4kk+1) give logical keys 32kk+4q..+3.
         uint32_t pa[PKC][4];
         #pragma unroll
         for (int kk = 0; kk < PKC; ++kk) {
             const int b0 = 4 * kk, b1 = b0 + 1, b2 = b0 + 2, b3 = b0 + 3;
-            pa[kk][0] = pack4i8(p_val[b0][0], p_val[b0][1], p_val[b1][0], p_val[b1][1]);
-            pa[kk][1] = pack4i8(p_val[b0][2], p_val[b0][3], p_val[b1][2], p_val[b1][3]);
-            pa[kk][2] = pack4i8(p_val[b2][0], p_val[b2][1], p_val[b3][0], p_val[b3][1]);
-            pa[kk][3] = pack4i8(p_val[b2][2], p_val[b2][3], p_val[b3][2], p_val[b3][3]);
+            pa[kk][0] = pack4u8(p_val[b0][0], p_val[b0][1], p_val[b1][0], p_val[b1][1]);
+            pa[kk][1] = pack4u8(p_val[b0][2], p_val[b0][3], p_val[b1][2], p_val[b1][3]);
+            pa[kk][2] = pack4u8(p_val[b2][0], p_val[b2][1], p_val[b3][0], p_val[b3][1]);
+            pa[kk][3] = pack4u8(p_val[b2][2], p_val[b2][3], p_val[b3][2], p_val[b3][3]);
         }
+
+        // l from the PACKED bytes (dp4a with 1,1,1,1), not the pre-quantization
+        // floats: the accumulator sums round(p), so the denominator must sum
+        // the same values or the P rounding error fails to cancel in the
+        // epilogue division. Same trick upstream applies in its int8 kernel.
+        // pa[kk][0]/[2] hold row r, [1]/[3] hold row r+8.
+        uint32_t li[2] = {0, 0};
+        #pragma unroll
+        for (int kk = 0; kk < PKC; ++kk) {
+            li[0] = __dp4a(pa[kk][0], 0x01010101u, li[0]);
+            li[0] = __dp4a(pa[kk][2], 0x01010101u, li[0]);
+            li[1] = __dp4a(pa[kk][1], 0x01010101u, li[1]);
+            li[1] = __dp4a(pa[kk][3], 0x01010101u, li[1]);
+        }
+        #pragma unroll
+        for (int off = 1; off <= 2; off <<= 1) {
+            li[0] += __shfl_xor_sync(0xffffffffu, li[0], off);
+            li[1] += __shfl_xor_sync(0xffffffffu, li[1], off);
+        }
+        l_r[0] = l_r[0] * alpha0 + (float)li[0];
+        l_r[1] = l_r[1] * alpha1 + (float)li[1];
 
         #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {
@@ -267,7 +295,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
                 const uint2 vb = *reinterpret_cast<const uint2*>(
                     vcol + (((kk * 2 + qhi2) ^ swv) << 4));
                 uint32_t vbf[2] = {vb.x, vb.y};
-                mma_s8(d, pa[kk], vbf);
+                mma_u8s8(d, pa[kk], vbf);
             }
             o_acc[nt][0] = fmaf(o_acc[nt][0], alpha0, (float)d[0]);
             o_acc[nt][1] = fmaf(o_acc[nt][1], alpha0, (float)d[1]);
@@ -310,7 +338,7 @@ extern "C" void launch_sol_exact(
     const void* blk_idx, const void* blk_cnt,
     const void* o_part, const void* m_part, const void* l_part, void* out,
     int B, int T, int Tp, int H, int NQ, int max_blk,
-    float scale_log2, cudaStream_t stream)
+    float scale_log2, int centroid_tail, cudaStream_t stream)
 {
     const size_t SMEM = (size_t)NSTAGE * BK * LDK + (size_t)NSTAGE * HD * LDV;
     // Per (function, device): caching behind a process-wide flag would skip
@@ -322,6 +350,6 @@ extern "C" void launch_sol_exact(
         (const int8_t*)vTi, (const float*)vsc,
         (const uint16_t*)blk_idx, (const int32_t*)blk_cnt,
         (const __nv_bfloat16*)o_part, (const float*)m_part, (const float*)l_part,
-        (__nv_bfloat16*)out, T, Tp, H, max_blk, scale_log2);
+        (__nv_bfloat16*)out, T, Tp, H, max_blk, scale_log2, centroid_tail);
 }
 

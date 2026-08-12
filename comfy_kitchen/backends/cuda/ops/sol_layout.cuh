@@ -90,6 +90,18 @@ __device__ __forceinline__ void mma_s8(int32_t* d, const uint32_t* a, const uint
 #endif
 }
 
+// P is a probability -- non-negative -- so packing it s8 wastes the sign bit:
+// 127 levels where 255 are free. u8 A x s8 B is a legal MMA signedness mix, so
+// the extra bit of P resolution costs nothing. The 255 scale folds into the
+// exp2 exponent exactly like 127 did, and l carries the same factor, so the
+// epilogue division cancels it.
+__device__ __forceinline__ void mma_u8s8(int32_t* d, const uint32_t* a, const uint32_t* b) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32.u8.s8.s32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
 __device__ __forceinline__ void mma_bf16(float* d, const uint32_t* a, const uint32_t* b) {
 #if SOL_SM80
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -108,6 +120,18 @@ __device__ __forceinline__ uint32_t pack_bf2(float lo, float hi) {
 // is a plain round-and-pack. cvt.pack (two F2IP) beats the mask-and-shift form
 // (~7 instr) in the exact kernel's inner loop, and .sat clamps where a mask
 // would wrap. The high byte pair is packed first and fed back in as c.
+__device__ __forceinline__ uint32_t pack4u8(float a, float b, float c, float d) {
+    uint32_t qa, qb, qc, qd, ab, cd, packed;
+    asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qa) : "f"(a));
+    asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qb) : "f"(b));
+    asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qc) : "f"(c));
+    asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qd) : "f"(d));
+    asm volatile("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(ab) : "r"(qa), "r"(qb));
+    asm volatile("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(cd) : "r"(qc), "r"(qd));
+    asm volatile("prmt.b32 %0, %1, %2, 0x6420;" : "=r"(packed) : "r"(ab), "r"(cd));
+    return packed;
+}
+
 __device__ __forceinline__ uint32_t pack4i8(float a, float b, float c, float d) {
     uint32_t hi, out;
     asm("cvt.pack.sat.s8.s32.b32 %0, %1, %2, 0;"

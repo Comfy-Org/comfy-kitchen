@@ -2325,6 +2325,8 @@ def sol_attn(
     sink_q: list[int] | None = None,
     max_blocks: int = 0,
     workspace: torch.Tensor | None = None,
+    centroid_tail: bool = True,
+    key_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 tensors.
     See ops/sol_attn.cu."""
@@ -2351,6 +2353,16 @@ def sol_attn(
                     f"sol_attn: {name} stride({dim}) = {x.stride(dim)} elements "
                     f"is not a multiple of 8, so the 16-byte staging loads would "
                     f"be misaligned; call .contiguous() on it")
+    # Per-key additive logit bias (natural-log units, LTX guide-strength
+    # style). Converted once to log2 and broadcast to (B, T); the kernel adds
+    # it in the exact branch via the per-key (scale, bias) slot. Blocks with
+    # nonzero bias must be covered by sink_blocks -- the pooled tail cannot
+    # see per-token bias.
+    kb = None
+    if key_bias is not None:
+        from ..eager.sol_attn import _normalize_key_bias
+        key_bias = _normalize_key_bias(key_bias, batch, t, q.device)
+        kb = (key_bias * 1.4426950408889634).expand(batch, t).contiguous()
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     need = _C.sol_attn_workspace(batch, t, h, max_blocks)
     if workspace is None:
@@ -2373,6 +2385,8 @@ def sol_attn(
         int(sb[0]), int(sb[1]), int(sq[0]), int(sq[1]),
         list(q.stride()[:3]), list(k.stride()[:3]), list(v.stride()[:3]),
         stream_ptr,
+        centroid_tail=centroid_tail,
+        key_bias_ptr=0 if kb is None else kb.data_ptr(),
     )
     return out
 

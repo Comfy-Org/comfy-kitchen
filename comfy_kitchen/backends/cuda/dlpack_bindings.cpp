@@ -267,7 +267,7 @@ extern "C" {
     void launch_sol_attn(
         const void* q, const void* k, const void* v, void* out, void* workspace,
         int batch, int seq_len, int num_heads, int head_dim, int max_blocks,
-        float tau, float scale,
+        float tau, float scale, int centroid_tail, const void* key_bias,
         int sink_start, int sink_end, int sink_q_start, int sink_q_end,
         int64_t qs_b, int64_t qs_t, int64_t qs_h,
         int64_t ks_b, int64_t ks_t, int64_t ks_h,
@@ -1490,13 +1490,16 @@ void sol_attn(
     int64_t sink_start, int64_t sink_end, int64_t sink_q_start, int64_t sink_q_end,
     std::vector<int64_t> q_strides, std::vector<int64_t> k_strides,
     std::vector<int64_t> v_strides,
-    uintptr_t stream_ptr)
+    uintptr_t stream_ptr,
+    bool centroid_tail,
+    uintptr_t key_bias_ptr)
 {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_sol_attn(
         q.data(), k.data(), v.data(), out.data(), workspace.data(),
         (int)batch, (int)seq_len, (int)num_heads, (int)head_dim, (int)max_blocks,
-        tau, scale,
+        tau, scale, centroid_tail ? 1 : 0,
+        reinterpret_cast<const void*>(key_bias_ptr),
         (int)sink_start, (int)sink_end, (int)sink_q_start, (int)sink_q_end,
         q_strides[0], q_strides[1], q_strides[2],
         k_strides[0], k_strides[1], k_strides[2],
@@ -3710,7 +3713,9 @@ NB_MODULE(_C, m) {
           nb::arg("sink_start"), nb::arg("sink_end"),
           nb::arg("sink_q_start"), nb::arg("sink_q_end"),
           nb::arg("q_strides"), nb::arg("k_strides"), nb::arg("v_strides"),
-          nb::arg("stream_ptr"));
+          nb::arg("stream_ptr"),
+          nb::arg("centroid_tail") = true,
+          nb::arg("key_bias_ptr") = 0);
 
     m.def("adaln", &adaln,
           "Fused AdaLN: layernorm(x) * (1 + scale) + shift",

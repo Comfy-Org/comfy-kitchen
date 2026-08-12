@@ -145,10 +145,11 @@ __global__ void prep_pooled_quant(const float* __restrict__ kc,
 __global__ void prep_q(const __nv_bfloat16* __restrict__ q, const float* __restrict__ kcvar,
                        int8_t* __restrict__ qiP, float* __restrict__ qs,
                        float* __restrict__ thr,
+                       int8_t* __restrict__ cen8, float* __restrict__ cens,
                        int T, int Tp, int H, int NQ, float tau, float log2s,
                        int64_t sb, int64_t st, int64_t sh) {
     __shared__ __nv_bfloat16 sQ[BLK * LDQ];
-    __shared__ float sred[HD];
+    __shared__ __align__(16) float sred[HD];
     const int qb = blockIdx.x, bh = blockIdx.y;
     const int batch = bh / H, head = bh % H, tid = threadIdx.x;
     const int t0 = qb * BLK, len = min(BLK, T - t0);
@@ -196,11 +197,33 @@ __global__ void prep_q(const __nv_bfloat16* __restrict__ q, const float* __restr
     }
     if (d == 0)
         thr[(size_t)bh * NQ + qb] = tau * sqrtf(sred[0] * log2s * log2s + 1e-6f);
+
+    // The routing pass consumes this centroid directly (its tail is evaluated
+    // at centroid granularity), so quantize it like a pseudo-row: same perm_d
+    // as the pooled keys, so their dot needs no unpermute.
+    __syncthreads();
+    sred[d] = fabsf(c);
+    __syncthreads();
+    for (int w = 64; w; w >>= 1) {
+        if (d < w) sred[d] = fmaxf(sred[d], sred[d + w]);
+        __syncthreads();
+    }
+    const float csc = fmaxf(sred[0] / 127.0f, 1e-8f);
+    __syncthreads();                       // sred is reused as a byte buffer
+    char* s8 = reinterpret_cast<char*>(sred);
+    s8[perm_d(d)] = (char)q8d(c, 1.f / csc);
+    __syncthreads();
+    const size_t cbase = ((size_t)bh * NQ + qb) * HD;
+    if (d < HD / 16)
+        reinterpret_cast<uint4*>(cen8 + cbase)[d] =
+            reinterpret_cast<const uint4*>(s8)[d];
+    if (d == 0) cens[(size_t)bh * NQ + qb] = csc;
 }
 
 // ---- pass 5: centre + quantize K into the permuted layout ----
 __global__ void prep_k(const __nv_bfloat16* __restrict__ k, const float* __restrict__ kmean,
                        int8_t* __restrict__ kiP, float2* __restrict__ ksb,
+                       const float* __restrict__ kbias,   // [B, T] log2 units, or null
                        int T, int Tp, int H, int NTB,
                        int64_t sb, int64_t st, int64_t sh) {
     __shared__ __nv_bfloat16 sK[BLK * LDQ];
@@ -227,7 +250,11 @@ __global__ void prep_k(const __nv_bfloat16* __restrict__ k, const float* __restr
         for (int d = 0; d < HD; ++d)
             a = fmaxf(a, fabsf(__bfloat162float(sK[s * LDQ + d]) - kmean[(size_t)bh * HD + d]));
         const float sc = fmaxf(a / 127.0f, 1e-8f);
-        ksb[dst] = make_float2(live ? sc : 0.f, live ? 0.f : NEG);
+        // The bias slot doubles as the per-key additive logit bias (LTX-style
+        // guide strength). Only the exact branch reads ksb, so blocks holding
+        // nonzero bias must be sink-routed for the bias to be honoured.
+        const float bias = (kbias && live) ? kbias[(size_t)batch * T + t0 + s] : 0.f;
+        ksb[dst] = make_float2(live ? sc : 0.f, live ? bias : NEG);
         const float inv = 1.f / sc;
         int8_t out[HD];
         #pragma unroll
@@ -246,8 +273,9 @@ __global__ void prep_k(const __nv_bfloat16* __restrict__ k, const float* __restr
 extern "C" void launch_sol_preprocess(
     const void* q, const void* k, const void* v,
     void* qiP, void* qs, void* kiP, void* ksb, void* kciP, void* kcs,
-    void* vcT, void* threshold, void* vsc,
+    void* vcT, void* threshold, void* cen8, void* cens, void* vsc,
     void* scratch,           // B*H*NPAD*HD + 2 * B*H*HD floats
+    const void* key_bias,    // [B, T] f32 in log2 units, or nullptr
     int B, int T, int Tp, int H, int NTB, int NPAD, int NQ,
     int64_t qs_b, int64_t qs_t, int64_t qs_h,
     int64_t ks_b, int64_t ks_t, int64_t ks_h,
@@ -270,10 +298,11 @@ extern "C" void launch_sol_preprocess(
         kc, kmean, (int8_t*)kciP, (float*)kcs, NTB, NPAD);
     prep_q<<<dim3(NQ, B * H), HD, 0, stream>>>(
         (const __nv_bfloat16*)q, kcvar, (int8_t*)qiP, (float*)qs, (float*)threshold,
+        (int8_t*)cen8, (float*)cens,
         T, Tp, H, NQ, tau, scale_log2, qs_b, qs_t, qs_h);
     prep_k<<<dim3(NTB, B * H), HD, 0, stream>>>(
-        (const __nv_bfloat16*)k, kmean, (int8_t*)kiP, (float2*)ksb, T, Tp, H, NTB,
-        ks_b, ks_t, ks_h);
+        (const __nv_bfloat16*)k, kmean, (int8_t*)kiP, (float2*)ksb,
+        (const float*)key_bias, T, Tp, H, NTB, ks_b, ks_t, ks_h);
 }
 
 extern "C" size_t sol_preprocess_scratch_bytes(int B, int H, int NPAD) {

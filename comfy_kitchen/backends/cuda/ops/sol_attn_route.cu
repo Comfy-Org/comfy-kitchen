@@ -15,19 +15,30 @@
  * limitations under the License.
  */
 
-// Sol-Attn routing + approximate pass: decides which key blocks each query
-// block attends exactly, and carries the approximate correction for the rest.
+// Sol-Attn routing + approximate pass, CUDA.
 //
-// Emits per (batch, head, query block): blk_idx/blk_cnt (the routed list) and
-// o_part/m_part/l_part, the online-softmax state the exact kernel resumes from.
-// o_part is bf16: the approximate branch is the low-mass tail by construction
-// and merges into an fp32 accumulator immediately.
+// The routing decision has always been a centroid quantity: the column sum it
+// thresholds is sum_i q_i . kc = len * (centroid(Q_block) . kc). This kernel
+// extends that to the approximate branch's VALUES: all rows of a query block
+// share their centroid's tail. Measured on the eager reference the change
+// costs -0.0005 cosine, flat across tau and length; what it buys is this pass
+// shrinking from [T rows x N pooled blocks] to [N x N] -- 64x less math -- and
+// the handover state (o_part, m_part, l_part) shrinking 64x, which also
+// retires the trick of aliasing o_part onto the caller's output that the
+// per-row state needed.
 //
-// Structurally this is attention with the pooled keys as the key axis:
-// [BQ] x [N pooled blocks] x [HD]. QK runs INT8; the approximate PV stays BF16
-// (the score tile feeds m16n8k16 directly, so no key relabelling here). The
-// routing decision needs a *column* sum of the score tile: a stride-4 lane
-// shuffle within each warp, then a cross-warp pass in smem.
+// One warp per 64-token query block; the routing mask itself stays per-64.
+// Lanes cover 32 pooled blocks per chunk for the scores and the decision (one
+// int8 dp4a dot each, the old kernel's precision), and 4 channels each for the
+// tail accumulation. Pooled tiles are staged to shared memory once per CTA and
+// shared by all 8 warps.
+//
+// Emits per (batch, head, query block):
+//   blk_idx / blk_cnt        the routed list the exact kernel walks
+//   o_part, m_part, l_part   ONE online-softmax state per query block, in the
+//                            exact kernel's units: o pre-divided by the
+//                            per-channel V scale and, like l, pre-multiplied
+//                            by 255 (the u8 P scale) (keeps the scale out of its inner loop).
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -36,6 +47,183 @@
 #include "sol_layout.cuh"
 
 namespace {
+using namespace sol;
+
+constexpr int HD  = HEAD_DIM;
+constexpr int WPB = 8;               // warps (= query blocks) per CTA
+constexpr int NTHREADS = WPB * 32;
+constexpr int CH  = 32;              // pooled blocks staged per chunk
+// sVc row stride in halves. The tail reads sVc[(4*lane+i)*LDV2 + jj], so the
+// bank a lane lands on advances by (2*LDV2 mod 32) per lane: 40 puts every
+// lane on one of TWO banks (16-way conflict, measured as the kernel's
+// bottleneck); 34 spreads them over 8 (4-way), the best an even stride can do.
+// 34 halves is only 4-byte aligned, so staging uses uint32, not uint4.
+constexpr int LDV2 = CH + 2;
+
+// cen8:[B*H*NQ,HD] int8 perm_d   cens:[B*H*NQ] f32
+// kciP:[B*H,NPAD,HD] int8 perm_d (centred)   kcs:[B*H,NPAD] f32
+// vcT:[B*H,HD,NPAD] bf16   vsc:[B*H,HD] f32   threshold:[B*H,NQ] f32
+__global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
+    const int8_t* __restrict__ cen8, const float* __restrict__ cens,
+    const int8_t* __restrict__ kciP, const float* __restrict__ kcs,
+    const __nv_bfloat16* __restrict__ vcT, const float* __restrict__ vsc,
+    const float* __restrict__ threshold,
+    uint16_t* __restrict__ blk_idx, int32_t* __restrict__ blk_cnt,
+    __nv_bfloat16* __restrict__ o_part, float* __restrict__ m_part,
+    float* __restrict__ l_part,
+    int T, int H, int NTB, int NPAD, int NQ, int max_blk,
+    int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2)
+{
+#if SOL_SM80
+    // No smem staging for the pooled keys: each lane dots its own 128 B row,
+    // and any row-major smem tile puts all 32 lanes on the same bank for every
+    // operand load (32-way conflict, measured). The rows come from global
+    // instead -- a 4 KB chunk reused by all 8 warps, so it lives in L1.
+    __shared__ float  sKs[CH];
+    __shared__ __nv_bfloat16 sVc[HD * LDV2];
+
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int bh = blockIdx.y;
+    const int qb = blockIdx.x * WPB + warp;
+    const bool live = qb < NQ;
+    const size_t qs_ = (size_t)bh * NQ + (live ? qb : 0);
+
+    // The whole centroid lives in registers: each lane dots all 128 dims
+    // against its own staged pooled key. perm_d cancels between the two.
+    uint32_t cq[HD / 4];
+    float cqs = 0.f, thr = 0.f;
+    bool q_in_sink = false;
+    if (live) {
+        const uint4* crow = reinterpret_cast<const uint4*>(cen8 + qs_ * HD);
+        #pragma unroll
+        for (int i = 0; i < HD / 16; ++i) {
+            const uint4 w4 = crow[i];
+            cq[i * 4 + 0] = w4.x; cq[i * 4 + 1] = w4.y;
+            cq[i * 4 + 2] = w4.z; cq[i * 4 + 3] = w4.w;
+        }
+        cqs = cens[qs_] * scale_log2;
+        thr = threshold[qs_];
+        q_in_sink = (qb >= sink_qs) && (qb < sink_qe);
+    }
+    const int tail_len = T - (NTB - 1) * BLOCK;
+
+    float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+    float m_r = NEG, l_r = 0.f;
+    int cnt = 0;
+
+    for (int c0 = 0; c0 < NTB; c0 += CH) {
+        __syncthreads();
+        // NPAD is a multiple of 64, so a 32-wide chunk never reads past it and
+        // the copies are unconditional; padded blocks are masked as invalid.
+        if (tid < CH) sKs[tid] = kcs[(size_t)bh * NPAD + c0 + tid];
+        for (int idx = tid; idx < HD * (CH / 2); idx += NTHREADS) {
+            const int d = idx / (CH / 2), part = (idx % (CH / 2)) * 2;
+            *reinterpret_cast<uint32_t*>(sVc + d * LDV2 + part) =
+                *reinterpret_cast<const uint32_t*>(
+                    vcT + ((size_t)bh * HD + d) * NPAD + c0 + part);
+        }
+        __syncthreads();
+        if (!live) continue;
+
+        // --- score: lane owns pooled block j ---
+        const int j = c0 + lane;
+        const bool valid = j < NTB;
+        int32_t acc = 0;
+        const uint4* krow = reinterpret_cast<const uint4*>(
+            kciP + ((size_t)bh * NPAD + c0 + lane) * HD);
+        #pragma unroll
+        for (int i = 0; i < HD / 16; ++i) {
+            const uint4 kw = krow[i];
+            acc = __dp4a((int)cq[i * 4 + 0], (int)kw.x, acc);
+            acc = __dp4a((int)cq[i * 4 + 1], (int)kw.y, acc);
+            acc = __dp4a((int)cq[i * 4 + 2], (int)kw.z, acc);
+            acc = __dp4a((int)cq[i * 4 + 3], (int)kw.w, acc);
+        }
+        const float s = valid ? (float)acc * cqs * sKs[lane] : NEG;
+
+        // --- routing decision, in block order so the list stays sorted ---
+        const bool sink_kv = (j >= sink_s) && (j < sink_e);
+        const bool diag = (j >= qb - 1) && (j <= qb + 1);
+        const bool routed = ((s > thr) || diag || sink_kv) && valid;
+        const bool exact = q_in_sink ? valid : routed;
+        const uint32_t m = __ballot_sync(0xffffffffu, exact);
+        const int rank = __popc(m & ((1u << lane) - 1u));
+        // The slot must be bounded (a sink_q block routes everything); a
+        // truncated block falls through to the tail below, so its mass is
+        // approximated rather than deleted.
+        const bool kept = exact && (cnt + rank) < max_blk;
+        if (kept)
+            blk_idx[qs_ * max_blk + cnt + rank] = (uint16_t)j;
+        cnt = min(cnt + __popc(m), max_blk);
+
+        // --- tail: everything valid and not kept ---
+        const bool tail = valid && !kept;
+        const float st = tail ? s : NEG;
+        float mn = fmaxf(m_r, st);
+        #pragma unroll
+        for (int off = 16; off; off >>= 1)
+            mn = fmaxf(mn, __shfl_xor_sync(0xffffffffu, mn, off));
+        const float alpha = exp2f(m_r - mn);
+        m_r = mn;
+        const float p = tail ? exp2f(st - mn) : 0.f;
+        // vc is a SUM over its block, so l carries the block length.
+        float ladd = p * ((j == NTB - 1) ? (float)tail_len : (float)BLOCK);
+        #pragma unroll
+        for (int off = 16; off; off >>= 1)
+            ladd += __shfl_xor_sync(0xffffffffu, ladd, off);
+        l_r = l_r * alpha + ladd;
+
+        o0 *= alpha; o1 *= alpha; o2 *= alpha; o3 *= alpha;
+        if (__ballot_sync(0xffffffffu, p > 0.f)) {
+            const int d0 = lane * 4;
+            // Pairs of adjacent jj share a 4-byte word, so half2 reads halve
+            // the shared-memory transactions on the hot path.
+            #pragma unroll 4
+            for (int jj = 0; jj < CH; jj += 2) {
+                const float pa = __shfl_sync(0xffffffffu, p, jj);
+                const float pb = __shfl_sync(0xffffffffu, p, jj + 1);
+                if (pa == 0.f && pb == 0.f) continue;
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const __nv_bfloat162 vv =
+                        *reinterpret_cast<const __nv_bfloat162*>(
+                            sVc + (d0 + i) * LDV2 + jj);
+                    float oi = (i == 0) ? o0 : (i == 1) ? o1 : (i == 2) ? o2 : o3;
+                    oi = fmaf(pa, __bfloat162float(vv.x), oi);
+                    oi = fmaf(pb, __bfloat162float(vv.y), oi);
+                    if (i == 0) o0 = oi; else if (i == 1) o1 = oi;
+                    else if (i == 2) o2 = oi; else o3 = oi;
+                }
+            }
+        }
+    }
+
+    if (!live) return;
+    if (lane == 0) {
+        blk_cnt[qs_] = cnt;
+        m_part[qs_] = m_r;
+        l_part[qs_] = l_r * 255.0f;
+    }
+    // Hand over in the exact kernel's units (see its epilogue).
+    __nv_bfloat16* orow = o_part + qs_ * HD;
+    const float* vrow = vsc + (size_t)bh * HD;
+    const int d0 = lane * 4;
+    orow[d0 + 0] = __float2bfloat16(o0 * (255.0f / vrow[d0 + 0]));
+    orow[d0 + 1] = __float2bfloat16(o1 * (255.0f / vrow[d0 + 1]));
+    orow[d0 + 2] = __float2bfloat16(o2 * (255.0f / vrow[d0 + 2]));
+    orow[d0 + 3] = __float2bfloat16(o3 * (255.0f / vrow[d0 + 3]));
+#endif  // SOL_SM80
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Per-row tail (the pre-centroid behaviour), kept selectable behind
+// centroid_tail=false so the two can be A/B'd on real workloads without a
+// rebuild. Emits per-ROW (o_part, m_part, l_part); o_part aliases the caller's
+// output, as before. ~2.6 ms slower per call at T=37k/H=56.
+// ---------------------------------------------------------------------------
+namespace perrow {
 using namespace sol;
 
 constexpr int HD = HEAD_DIM, BQ = BLOCK;   // from the layout contract
@@ -53,7 +241,7 @@ constexpr int LDV = BN + 8;     // 72 halves = 144 B; bank = (4C + kk*8 + q) % 3
 // qi:[B,T,H,D] int8 (d-axis permuted)  qs:[B,T,H] f32  -- T, not Tp: see below
 // kciP:[B*H,NPAD,D] int8 (d-axis permuted)  kcs:[B*H,NPAD] f32
 // vcT:[B*H,D,NPAD] bf16
-__global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
+__global__ void __launch_bounds__(NTHREADS) sol_route_perrow_kernel(
     const int8_t* __restrict__ qi, const float* __restrict__ qs,
     const int8_t* __restrict__ kciP, const float* __restrict__ kcs,
     const __nv_bfloat16* __restrict__ vcT,
@@ -304,20 +492,20 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
         #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {
             const int c = nt * 8 + qd * 2;
-            orow[c]     = __float2bfloat16(o_acc[nt][rr * 2]     * (127.0f / vsrow[c]));
-            orow[c + 1] = __float2bfloat16(o_acc[nt][rr * 2 + 1] * (127.0f / vsrow[c + 1]));
+            orow[c]     = __float2bfloat16(o_acc[nt][rr * 2]     * (255.0f / vsrow[c]));
+            orow[c + 1] = __float2bfloat16(o_acc[nt][rr * 2 + 1] * (255.0f / vsrow[c + 1]));
         }
         if (qd == 0) {
             m_part[bh_s + (int64_t)r * H] = m_r[rr];
-            l_part[bh_s + (int64_t)r * H] = l_r[rr] * 127.0f;
+            l_part[bh_s + (int64_t)r * H] = l_r[rr] * 255.0f;
         }
     }
 #endif  // SOL_SM80 (INT8/BF16 mma + cp.async; dispatch constraints require sm80+)
 }
 
-}  // namespace
+}  // namespace perrow
 
-extern "C" void launch_sol_route(
+extern "C" void launch_sol_route_perrow(
     const void* qi, const void* qs, const void* kciP, const void* kcs,
     const void* vcT, const void* vsc, const void* threshold,
     void* blk_idx, void* blk_cnt, void* o_part, void* m_part, void* l_part,
@@ -327,8 +515,8 @@ extern "C" void launch_sol_route(
     int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2,
     cudaStream_t stream)
 {
-    dim3 grid(NQ, B * H);
-    sol_route_kernel<<<grid, NTHREADS, 0, stream>>>(
+    dim3 grid(NQ, B * H);   // one CTA per (query block, head), 4 warps
+    perrow::sol_route_perrow_kernel<<<grid, perrow::NTHREADS, 0, stream>>>(
         (const int8_t*)qi, (const float*)qs, (const int8_t*)kciP, (const float*)kcs,
         (const __nv_bfloat16*)vcT, (const float*)vsc, (const float*)threshold,
         (uint16_t*)blk_idx, (int32_t*)blk_cnt, (__nv_bfloat16*)o_part,
@@ -336,3 +524,24 @@ extern "C" void launch_sol_route(
         T, H, NTB, NPAD, max_blk, sink_s, sink_e, sink_qs, sink_qe, scale_log2);
 }
 
+
+extern "C" void launch_sol_route(
+    const void* cen8, const void* cens, const void* kciP, const void* kcs,
+    const void* vcT, const void* vsc, const void* threshold,
+    void* blk_idx, void* blk_cnt, void* o_part, void* m_part, void* l_part,
+    // NQ is the query-block count and NTB the key-block count; they coincide
+    // only because this is self-attention, so they stay separate parameters.
+    int B, int T, int H, int NTB, int NPAD, int NQ, int max_blk,
+    int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2,
+    cudaStream_t stream)
+{
+    dim3 grid((NQ + WPB - 1) / WPB, B * H);
+    sol_route_kernel<<<grid, NTHREADS, 0, stream>>>(
+        (const int8_t*)cen8, (const float*)cens, (const int8_t*)kciP,
+        (const float*)kcs, (const __nv_bfloat16*)vcT, (const float*)vsc,
+        (const float*)threshold,
+        (uint16_t*)blk_idx, (int32_t*)blk_cnt, (__nv_bfloat16*)o_part,
+        (float*)m_part, (float*)l_part,
+        T, H, NTB, NPAD, NQ, max_blk, sink_s, sink_e, sink_qs, sink_qe,
+        scale_log2);
+}

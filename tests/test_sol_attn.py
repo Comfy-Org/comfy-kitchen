@@ -165,6 +165,27 @@ def test_rejects_noncontiguous_last_dim():
         cuda_backend.sol_attn(bad, k, v, tau=1.4)
 
 
+@pytest.mark.parametrize("centroid_tail", [True, False])
+def test_tail_mode_matches_its_eager(centroid_tail):
+    """Both tail modes must match their eager counterpart. centroid_tail=False
+    is the pre-centroid per-row tail, kept selectable for quality A/B on real
+    workloads; the two modes differ slightly by construction."""
+    q, k, v = _qkv(1, 2048, 4)
+    got = ck.sol_attn(q, k, v, tau=1.4, centroid_tail=centroid_tail)
+    ref = sol_attn_eager(q, k, v, tau=1.4, centroid_tail=centroid_tail)
+    assert _cos(got, ref) > 0.998
+
+
+def test_tail_modes_differ():
+    """The switch must actually switch: identical outputs would mean the flag
+    is being dropped somewhere in the dispatch chain."""
+    q, k, v = _qkv(1, 2048, 4)
+    a = ck.sol_attn(q, k, v, tau=1.4, centroid_tail=True)
+    b = ck.sol_attn(q, k, v, tau=1.4, centroid_tail=False)
+    assert not torch.equal(a, b)
+    assert _cos(a, b) > 0.995
+
+
 def test_tau_monotonicity():
     """Higher tau routes fewer blocks exactly, so it can only move away from
     dense attention."""
@@ -204,8 +225,11 @@ def test_output_strides_agree_across_backends():
     eager_strides = eager_impl(v.float(), v.float(), v.float(), tau=1.4).stride()
     with FakeTensorMode():
         fv = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+        # kwargs, not positional: this call has broken on every parameter
+        # addition when written positionally.
         fake_strides = torch.ops.comfy_kitchen.sol_attn(
-            fv, fv, fv, 1.4, None, [0, 0], [0, 0], 0).stride()
+            fv, fv, fv, tau=1.4, scale=None, sink_blocks=[0, 0], sink_q=[0, 0],
+            max_blocks=0, centroid_tail=True, key_bias=None).stride()
     assert cuda_strides == eager_strides == fake_strides
 
 
@@ -268,3 +292,55 @@ def test_head_dim_constraint():
     q, k, v = (torch.randn(1, 256, 4, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3))
     with pytest.raises(NoCapableBackendError, match="head_dim must be 128"):
         ck.sol_attn(q, k, v, tau=1.4)
+
+
+@pytest.mark.parametrize("centroid_tail", [True, False])
+def test_key_bias_matches_eager(centroid_tail):
+    """LTX-style guide-strength bias: per-key additive logit bias, honoured by
+    the exact branch in BOTH tail modes. Guide blocks must be sink-covered (the
+    pooled tail cannot see per-token bias), which the node does automatically."""
+    import math
+    q, k, v = _qkv(1, 2048, 4)
+    bias = torch.zeros(1, 2048, device="cuda")
+    bias[:, -128:-64] = math.log(0.3)
+    bias[:, -64:] = math.log(2.0)
+    sinks = [2048 // 64 - 2, 2048 // 64]
+    got = ck.sol_attn(q, k, v, tau=1.4, key_bias=bias, sink_blocks=sinks,
+                      centroid_tail=centroid_tail)
+    ref = sol_attn_eager(q, k, v, tau=1.4, key_bias=bias, sink_blocks=sinks,
+                         centroid_tail=centroid_tail)
+    assert _cos(got, ref) > 0.998
+    # and the bias must actually do something
+    plain = ck.sol_attn(q, k, v, tau=1.4, sink_blocks=sinks,
+                        centroid_tail=centroid_tail)
+    assert not torch.equal(got, plain)
+
+
+def test_key_bias_inf_masks_out_keys():
+    """w=0 (a hard spatial-mask hole) is log(0) = -inf; those keys must vanish
+    without poisoning the output."""
+    q, k, v = _qkv(1, 1024, 4)
+    bias = torch.zeros(1, 1024, device="cuda")
+    bias[:, -32:] = float("-inf")
+    sinks = [1024 // 64 - 1, 1024 // 64]
+    got = ck.sol_attn(q, k, v, tau=1.4, key_bias=bias, sink_blocks=sinks)
+    assert torch.isfinite(got.float()).all()
+    ref = sol_attn_eager(q, k, v, tau=1.4, key_bias=bias, sink_blocks=sinks)
+    assert _cos(got, ref) > 0.998
+
+
+def test_key_bias_bad_shape_rejected():
+    from comfy_kitchen.backends import cuda as cuda_backend
+    q, k, v = _qkv(1, 256, 4)
+    with pytest.raises(ValueError, match="key_bias"):
+        cuda_backend.sol_attn(q, k, v, tau=1.4,
+                              key_bias=torch.zeros(1, 128, device="cuda"))
+
+
+def test_key_bias_wrong_device_rejected():
+    """A host tensor's data_ptr handed to the preprocess is an asynchronous
+    illegal memory access that poisons the CUDA context on some LATER call --
+    it must be rejected before launch, not discovered downstream."""
+    q, k, v = _qkv(1, 256, 4)
+    with pytest.raises((ValueError, RuntimeError), match="key_bias"):
+        ck.sol_attn(q, k, v, tau=1.4, key_bias=torch.zeros(256))

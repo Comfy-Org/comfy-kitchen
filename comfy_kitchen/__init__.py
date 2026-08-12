@@ -132,6 +132,8 @@ def sol_attn(
     sink_blocks: list[int] | None = None,
     sink_q: list[int] | None = None,
     max_blocks: int = 0,
+    centroid_tail: bool = True,
+    key_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn training-free sparse attention (arXiv 2607.24027).
 
@@ -162,6 +164,8 @@ def sol_attn(
         [0, 0] if sink_blocks is None else list(sink_blocks),
         [0, 0] if sink_q is None else list(sink_q),
         int(max_blocks),
+        bool(centroid_tail),
+        key_bias,
     )
 
 

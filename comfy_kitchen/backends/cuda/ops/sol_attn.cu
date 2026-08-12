@@ -35,7 +35,8 @@
 
 extern "C" {
 void launch_sol_preprocess(const void*, const void*, const void*, void*, void*, void*,
-                           void*, void*, void*, void*, void*, void*, void*,
+                           void*, void*, void*, void*, void*, void*, void*, void*, void*,
+                           const void*,
                            int, int, int, int, int, int, int,
                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                            int64_t, int64_t, int64_t, float, float, cudaStream_t);
@@ -46,9 +47,13 @@ void launch_sol_route(const void*, const void*, const void*, const void*, const 
                       const void*, const void*, void*, void*, void*, void*, void*,
                       int, int, int, int, int, int, int, int, int, int, int,
                       float, cudaStream_t);
+void launch_sol_route_perrow(const void*, const void*, const void*, const void*,
+                      const void*, const void*, const void*, void*, void*, void*,
+                      void*, void*, int, int, int, int, int, int, int, int, int,
+                      int, int, float, cudaStream_t);
 void launch_sol_exact(const void*, const void*, const void*, const void*, const void*,
                       const void*, const void*, const void*, const void*, const void*,
-                      const void*, void*, int, int, int, int, int, int, float,
+                      const void*, void*, int, int, int, int, int, int, float, int,
                       cudaStream_t);
 }
 
@@ -62,8 +67,8 @@ inline size_t align16(size_t n) { return (n + 15u) & ~(size_t)15u; }
 // Workspace carve-up; a pure function of the shape (see sol_attn_workspace_bytes).
 struct Plan {
     int Tp, NTB, NPAD, NQ, MAXB;
-    size_t qiP, qs, kiP, ksb, vTi, vsc, kciP, kcs, vcT, thr;
-    size_t idx, cnt, mPart, lPart, scratch, total;
+    size_t qiP, qs, kiP, ksb, vTi, vsc, kciP, kcs, vcT, thr, cen8, cens;
+    size_t idx, cnt, oPart, mPart, lPart, mPartRow, lPartRow, scratch, total;
 
     Plan(int B, int T, int H, int max_blk) {
         NTB = (T + BLK - 1) / BLK;
@@ -90,11 +95,22 @@ struct Plan {
         // halving it matters at video lengths.
         idx     = take(bh * NQ * MAXB * sizeof(uint16_t));
         cnt     = take(bh * NQ * sizeof(int32_t));
-        // o_part is NOT allocated: route writes the handover into the caller's
-        // `out`, which exact reads in its prologue and overwrites in its
-        // epilogue -- each (query block, head) touches only its own rows.
-        mPart   = take(tok * sizeof(float));
-        lPart   = take(tok * sizeof(float));
+        cen8    = take(bh * NQ * HD);
+        cens    = take(bh * NQ * sizeof(float));
+        // The handover state is per (b, h, query block), not per row: the
+        // approximate tail is evaluated at the query-block centroid, so all 64
+        // rows of a block share one (o, m, l). 64x smaller than the per-row
+        // state this replaced -- small enough to allocate outright, which
+        // retired the trick of aliasing o_part onto the caller's output.
+        oPart   = take(bh * NQ * HD * sizeof(uint16_t));
+        mPart   = take(bh * NQ * sizeof(float));
+        lPart   = take(bh * NQ * sizeof(float));
+        // Per-ROW state for the centroid_tail=false fallback (its o_part
+        // aliases the caller's `out`, so only m/l are carried). Reserved
+        // unconditionally so the workspace size does not depend on the flag
+        // and cached buffers stay valid across a switch.
+        mPartRow = take(tok * sizeof(float));
+        lPartRow = take(tok * sizeof(float));
         scratch = take(sol_preprocess_scratch_bytes(B, H, NPAD));
         total = o;
     }
@@ -109,7 +125,7 @@ extern "C" size_t sol_attn_workspace_bytes(int batch, int seq_len, int num_heads
 extern "C" void launch_sol_attn(
     const void* q, const void* k, const void* v, void* out, void* workspace,
     int batch, int seq_len, int num_heads, int head_dim, int max_blocks,
-    float tau, float scale,
+    float tau, float scale, int centroid_tail, const void* key_bias,
     int sink_start, int sink_end, int sink_q_start, int sink_q_end,
     int64_t qs_b, int64_t qs_t, int64_t qs_h,
     int64_t ks_b, int64_t ks_t, int64_t ks_h,
@@ -129,21 +145,37 @@ extern "C" void launch_sol_attn(
     const float scale_log2 = scale * 1.4426950408889634f;
 
     launch_sol_preprocess(q, k, v, w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb,
-                          w + p.kciP, w + p.kcs, w + p.vcT, w + p.thr, w + p.vsc,
-                          w + p.scratch,
+                          w + p.kciP, w + p.kcs, w + p.vcT, w + p.thr,
+                          w + p.cen8, w + p.cens, w + p.vsc, w + p.scratch,
+                          key_bias,
                           batch, seq_len, p.Tp, num_heads, p.NTB, p.NPAD, p.NQ,
                           qs_b, qs_t, qs_h, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h,
                           tau, scale_log2, stream);
     launch_sol_vtranspose(v, w + p.vsc, w + p.vTi, batch, seq_len, p.Tp, num_heads,
                           vs_b, vs_t, vs_h, stream);
-    launch_sol_route(w + p.qiP, w + p.qs, w + p.kciP, w + p.kcs, w + p.vcT, w + p.vsc,
-                     w + p.thr, w + p.idx, w + p.cnt, out, w + p.mPart, w + p.lPart,
-                     batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ, p.MAXB,
-                     sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
-    launch_sol_exact(w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb, w + p.vTi, w + p.vsc,
-                     w + p.idx, w + p.cnt, out, w + p.mPart, w + p.lPart, out,
-                     batch, seq_len, p.Tp, num_heads, p.NQ, p.MAXB,
-                     scale_log2, stream);
+    if (centroid_tail) {
+        launch_sol_route(w + p.cen8, w + p.cens, w + p.kciP, w + p.kcs, w + p.vcT, w + p.vsc,
+                         w + p.thr, w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart,
+                         batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ, p.MAXB,
+                         sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
+        launch_sol_exact(w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb, w + p.vTi, w + p.vsc,
+                         w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart, out,
+                         batch, seq_len, p.Tp, num_heads, p.NQ, p.MAXB,
+                         scale_log2, 1, stream);
+    } else {
+        // Per-row tail: the pre-centroid behaviour, kept selectable for
+        // quality A/B. Its handover writes straight into `out`, which the
+        // exact stage reads back in its prologue and overwrites.
+        launch_sol_route_perrow(w + p.qiP, w + p.qs, w + p.kciP, w + p.kcs, w + p.vcT,
+                         w + p.vsc, w + p.thr, w + p.idx, w + p.cnt, out,
+                         w + p.mPartRow, w + p.lPartRow,
+                         batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ, p.MAXB,
+                         sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
+        launch_sol_exact(w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb, w + p.vTi, w + p.vsc,
+                         w + p.idx, w + p.cnt, out, w + p.mPartRow, w + p.lPartRow, out,
+                         batch, seq_len, p.Tp, num_heads, p.NQ, p.MAXB,
+                         scale_log2, 0, stream);
+    }
 
     // A rejected launch would silently leave route's handover values in `out`.
     // One check covers all four stages: the first failure latches until read.
