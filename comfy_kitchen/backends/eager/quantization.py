@@ -993,6 +993,45 @@ def _dequantized_int8_linear(
     return torch.nn.functional.linear(x, dequantized_weight, bias).to(out_dtype)
 
 
+def _mps_int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    convrot: bool,
+    convrot_groupsize: int,
+) -> torch.Tensor:
+    """Use Metal 4 fused kernels when supported, otherwise widen to floating point."""
+    if x.dtype == torch.bfloat16 and out_dtype == torch.bfloat16:
+        from .mps_int8 import FusedMPSUnsupportedError, int8_linear_bf16
+
+        if convrot:
+            h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+            x = _rotate_activation(x, h, convrot_groupsize)
+        try:
+            return int8_linear_bf16(x, weight, weight_scale, bias)
+        except FusedMPSUnsupportedError:
+            return _dequantized_int8_linear(
+                x,
+                weight,
+                weight_scale,
+                bias,
+                out_dtype,
+                False,
+                convrot_groupsize,
+            )
+    return _dequantized_int8_linear(
+        x,
+        weight,
+        weight_scale,
+        bias,
+        out_dtype,
+        convrot,
+        convrot_groupsize,
+    )
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1039,11 +1078,10 @@ def int8_linear(
             f"ConvRot group size {convrot_groupsize} does not divide input features {x.shape[-1]}"
         )
 
-    # MPS does not implement aten::_int_mm. Widen the stored INT8 weight only for
-    # this operation and use the activation dtype, which is normally BF16 in
-    # ComfyUI. This keeps model storage quantized and avoids a CPU round-trip.
+    # Prefer Metal 4's cooperative INT8 tensor operations on Apple silicon. The
+    # helper retains the floating-point widening path for older MPS runtimes.
     if x.device.type == "mps":
-        return _dequantized_int8_linear(
+        return _mps_int8_linear(
             x,
             weight,
             weight_scale,
