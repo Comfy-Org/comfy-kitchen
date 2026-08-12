@@ -62,7 +62,72 @@ kernel void quantize_rowwise_bf16(
   }
 }
 
-kernel void int8_linear_mpp_bf16(
+kernel void int8_linear_mpp_bf16_large(
+    device int8_t* activation [[buffer(0)]],
+    device int8_t* weight [[buffer(1)]],
+    device float* row_scale [[buffer(2)]],
+    device float* weight_scale [[buffer(3)]],
+    device bfloat* output [[buffer(4)]],
+    device bfloat* bias [[buffer(5)]],
+    constant int& rows [[buffer(6)]],
+    constant int& inner [[buffer(7)]],
+    constant int& columns [[buffer(8)]],
+    constant int& scale_count [[buffer(9)]],
+    constant int& has_bias [[buffer(10)]],
+    uint2 tgid [[threadgroup_position_in_grid]]) {
+  constexpr int BM = 32;
+  constexpr int BN = 256;
+  constexpr auto descriptor = mpp::tensor_ops::matmul2d_descriptor(
+      BM,
+      BN,
+      static_cast<int>(dynamic_extent),
+      false,
+      true,
+      false,
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+  mpp::tensor_ops::matmul2d<descriptor, execution_simdgroups<4>> op;
+
+  tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> a(
+      activation,
+      dextents<int32_t, 2>(inner, rows),
+      array<int32_t, 2>{1, inner});
+  tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> b(
+      weight,
+      dextents<int32_t, 2>(inner, columns),
+      array<int32_t, 2>{1, inner});
+
+  auto a_tile = a.slice(0, tgid.y * BM);
+  auto b_tile = b.slice(0, tgid.x * BN);
+  auto accum = op.get_destination_cooperative_tensor<decltype(a_tile), decltype(b_tile), int32_t>();
+
+  #pragma clang loop unroll(full)
+  for (uint16_t i = 0; i < accum.get_capacity(); ++i) {
+    if (accum.is_valid_element(i)) {
+      accum[i] = 0;
+    }
+  }
+
+  op.run(a_tile, b_tile, accum);
+
+  #pragma clang loop unroll(full)
+  for (uint16_t i = 0; i < accum.get_capacity(); ++i) {
+    if (accum.is_valid_element(i)) {
+      auto index = accum.get_multidimensional_index(i);
+      int column = int(tgid.x) * BN + index[0];
+      int row = int(tgid.y) * BM + index[1];
+      if (row < rows && column < columns) {
+        float scale = row_scale[row] * weight_scale[scale_count == 1 ? 0 : column];
+        bfloat value = bfloat(float(accum[i]) * scale);
+        if (has_bias != 0) {
+          value = bfloat(value + bias[column]);
+        }
+        output[row * columns + column] = value;
+      }
+    }
+  }
+}
+
+kernel void int8_linear_mpp_bf16_small(
     device int8_t* activation [[buffer(0)]],
     device int8_t* weight [[buffer(1)]],
     device float* row_scale [[buffer(2)]],
@@ -130,11 +195,11 @@ kernel void int8_linear_mpp_bf16(
 
 
 _compile_lock = threading.Lock()
-_kernels: tuple[object, object] | None = None
+_kernels: tuple[object, object, object] | None = None
 _compile_error: Exception | None = None
 
 
-def _get_kernels() -> tuple[object, object]:
+def _get_kernels() -> tuple[object, object, object]:
     global _kernels, _compile_error
     if _kernels is not None:
         return _kernels
@@ -145,7 +210,11 @@ def _get_kernels() -> tuple[object, object]:
             return _kernels
         try:
             library = torch.mps.compile_shader(_SHADER)
-            _kernels = (library.quantize_rowwise_bf16, library.int8_linear_mpp_bf16)
+            _kernels = (
+                library.quantize_rowwise_bf16,
+                library.int8_linear_mpp_bf16_large,
+                library.int8_linear_mpp_bf16_small,
+            )
         except Exception as error:
             _compile_error = error
             raise FusedMPSUnsupportedError("Metal 4 fused kernels failed to compile") from error
@@ -194,7 +263,7 @@ def int8_linear_bf16(
     if bias_mps is not None and bias_mps.numel() != columns:
         raise ValueError(f"bias must have {columns} values, got {bias_mps.numel()}")
 
-    quantize_kernel, linear_kernel = _get_kernels()
+    quantize_kernel, large_linear_kernel, small_linear_kernel = _get_kernels()
     quantized = torch.empty_like(x_2d, dtype=torch.int8)
     row_scale = torch.empty((rows, 1), device=x.device, dtype=torch.float32)
     output = torch.empty((rows, columns), device=x.device, dtype=torch.bfloat16)
@@ -210,7 +279,13 @@ def int8_linear_bf16(
         arg_casts={3: "int32", 4: "int32"},
     )
 
-    group_width = 4 * linear_kernel.thread_execution_width
+    if rows >= 32 and columns >= 256:
+        linear_kernel = large_linear_kernel
+        tile_rows, tile_columns, simdgroups = 32, 256, 4
+    else:
+        linear_kernel = small_linear_kernel
+        tile_rows, tile_columns, simdgroups = 64, 32, 4
+    group_width = simdgroups * linear_kernel.thread_execution_width
     linear_kernel(
         quantized,
         weight_mps,
@@ -223,7 +298,10 @@ def int8_linear_bf16(
         columns,
         scale_mps.numel(),
         int(bias_mps is not None),
-        threads=(math.ceil(columns / 32) * group_width, math.ceil(rows / 64)),
+        threads=(
+            math.ceil(columns / tile_columns) * group_width,
+            math.ceil(rows / tile_rows),
+        ),
         group_size=(group_width, 1),
         arg_casts={6: "int32", 7: "int32", 8: "int32", 9: "int32", 10: "int32"},
     )
