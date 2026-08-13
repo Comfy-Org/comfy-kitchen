@@ -2331,6 +2331,21 @@ def sol_attn(
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 tensors.
     See ops/sol_attn.cu."""
     batch, t, h, d = q.shape
+    # Direct entry: run the same shared rule as the registry path, or bad
+    # inputs launch anyway and return plausible garbage.
+    if q.dtype != torch.bfloat16:
+        raise ValueError(f"sol_attn: q/k/v must be bfloat16, got {q.dtype}")
+    # Against q.device, not the registry gate (which caches the CURRENT
+    # device): sub-sm_80 cubins are stubs that run and return garbage.
+    cap = torch.cuda.get_device_capability(q.device)
+    if cap < (8, 0):
+        raise RuntimeError(
+            f"sol_attn: requires sm_80+ (cp.async, INT8 MMA); {q.device} is "
+            f"sm_{cap[0]}{cap[1]}")
+    check = sol_attn_common_call_rule(
+        {"q": q, "k": k, "v": v, "sink_blocks": sink_blocks, "sink_q": sink_q})
+    if not check.success:
+        raise ValueError(f"sol_attn: {check.failed_param}: {check.failure_reason}")
     if scale is None:
         scale = d ** -0.5
     # Only the last dim must be contiguous (the staging loads are 16 B), so a
@@ -2353,11 +2368,8 @@ def sol_attn(
                     f"sol_attn: {name} stride({dim}) = {x.stride(dim)} elements "
                     f"is not a multiple of 8, so the 16-byte staging loads would "
                     f"be misaligned; call .contiguous() on it")
-    # Per-key additive logit bias (natural-log units, LTX guide-strength
-    # style). Converted once to log2 and broadcast to (B, T); the kernel adds
-    # it in the exact branch via the per-key (scale, bias) slot. Blocks with
-    # nonzero bias must be covered by sink_blocks -- the pooled tail cannot
-    # see per-token bias.
+    # Per-key logit bias (natural log), folded into the exact branch's
+    # (scale, bias) slot; biased blocks must be sink-covered.
     kb = None
     if key_bias is not None:
         from ..eager.sol_attn import _normalize_key_bias
@@ -2371,8 +2383,30 @@ def sol_attn(
         raise ValueError(
             f"sol_attn workspace too small: {workspace.numel() * workspace.element_size()} "
             f"< {need} bytes; size it with sol_attn_workspace_bytes()")
+    elif workspace.device != q.device:
+        raise ValueError(
+            f"sol_attn: workspace on {workspace.device}, inputs on {q.device}")
+    elif not workspace.is_contiguous():
+        # The kernels address it as one linear byte range from data_ptr().
+        raise ValueError("sol_attn: workspace must be contiguous")
+    elif workspace.data_ptr() % 16:
+        # Plan offsets are 16-byte aligned relative to the BASE; a view with an
+        # odd storage_offset passes the byte-count check and then faults with a
+        # context-poisoning misaligned address inside the kernels.
+        raise ValueError(
+            "sol_attn: workspace base must be 16-byte aligned "
+            "(avoid storage_offset slices; allocate it directly)")
     sb = [0, 0] if sink_blocks is None else list(sink_blocks)
     sq = [0, 0] if sink_q is None else list(sink_q)
+    if max_blocks > 0:
+        n_blk = (t + 63) // 64
+        n_sink = max(0, min(sb[1], n_blk) - sb[0])
+        if n_sink > max_blocks:
+            raise ValueError(
+                f"sol_attn: max_blocks={max_blocks} is smaller than the "
+                f"{n_sink}-block sink range {sb}; sinks are never truncated, "
+                f"so both constraints cannot hold -- raise max_blocks or "
+                f"shrink the sink range")
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
     _C.sol_attn(
         _wrap_for_dlpack(q),
@@ -2386,7 +2420,7 @@ def sol_attn(
         list(q.stride()[:3]), list(k.stride()[:3]), list(v.stride()[:3]),
         stream_ptr,
         centroid_tail=centroid_tail,
-        key_bias_ptr=0 if kb is None else kb.data_ptr(),
+        key_bias=None if kb is None else _wrap_for_dlpack(kb),
     )
     return out
 

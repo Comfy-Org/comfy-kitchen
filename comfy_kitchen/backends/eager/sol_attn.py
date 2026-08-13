@@ -24,16 +24,9 @@ _MAX_SCORE_BYTES = 4 * 2**30
 
 
 def _normalize_key_bias(key_bias, batch, t, device):
-    """Accept SDPA-mask-like forms and reduce them to (B, T) float log-bias.
-
-    Shapes: (T,), (B, T), or broadcastable 4-D (B-or-1, 1, 1, T) -- the
-    key-only slice of the standard attn_mask contract. Bool masks follow SDPA
-    semantics: True = attend (bias 0), False = masked (bias -inf). Anything
-    varying over heads or queries is not expressible here and is rejected.
-
-    The device check is not optional politeness: a host pointer handed to the
-    CUDA preprocess is an asynchronous illegal-memory-access that poisons the
-    context on some LATER call.
+    """Reduce SDPA-mask-like forms -- (T,), (B, T), (B|1, 1, 1, T), bool or
+    float -- to (B, T) float log-bias. Rejects head/query-varying masks and
+    wrong-device tensors (a host pointer would poison the CUDA context).
     """
     if key_bias.device != device:
         raise ValueError(
@@ -129,10 +122,8 @@ def sol_attn(
 
     s_tok = (qh @ kh.transpose(-1, -2)) * log2s                     # (B, H, T, T)
     if key_bias is not None:
-        # Additive logit bias per KEY (natural-log units, like an SDPA mask or
-        # LTX's log(strength)). Applied to the exact branch only: the pooled
-        # tail cannot see per-token bias, so blocks holding nonzero bias must
-        # be covered by sink_blocks (routed exact) for the bias to be honoured.
+        # Per-key logit bias (natural log). Exact branch only: biased blocks
+        # must be sink-covered, the pooled tail cannot see per-token bias.
         kb = _normalize_key_bias(key_bias, b, t, q.device)
         s_tok = s_tok + (kb * _LOG2E).reshape(-1, 1, 1, t)
     s_blk = (qh @ kch.transpose(-1, -2)) * log2s                    # (B, H, T, N)
@@ -157,10 +148,8 @@ def sol_attn(
     neg = torch.finfo(s_tok.dtype).min
     s_tok = s_tok.masked_fill(~keep_tok, neg)
     if centroid_tail:
-        # The tail is evaluated at the query-block centroid -- colmean IS the
-        # centroid score, the same quantity the routing decision thresholds --
-        # so every row of a query block shares its tail. Costs ~5e-4 cosine vs
-        # the per-row tail; buys the fused routing pass a 64x smaller problem.
+        # Every row shares its query-block centroid's tail (colmean IS the
+        # centroid score); ~5e-4 cosine vs per-row, 64x less routing work.
         s_blk = colmean.gather(2, qblk.view(1, 1, t, 1).expand(b, h, t, n))
     s_blk = s_blk.masked_fill(ex_tok | ~valid_blk, neg)
 

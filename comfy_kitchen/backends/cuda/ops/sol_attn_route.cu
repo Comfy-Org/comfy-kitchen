@@ -15,30 +15,16 @@
  * limitations under the License.
  */
 
-// Sol-Attn routing + approximate pass, CUDA.
+// Sol-Attn routing + approximate pass. One warp per 64-token query block.
 //
-// The routing decision has always been a centroid quantity: the column sum it
-// thresholds is sum_i q_i . kc = len * (centroid(Q_block) . kc). This kernel
-// extends that to the approximate branch's VALUES: all rows of a query block
-// share their centroid's tail. Measured on the eager reference the change
-// costs -0.0005 cosine, flat across tau and length; what it buys is this pass
-// shrinking from [T rows x N pooled blocks] to [N x N] -- 64x less math -- and
-// the handover state (o_part, m_part, l_part) shrinking 64x, which also
-// retires the trick of aliasing o_part onto the caller's output that the
-// per-row state needed.
-//
-// One warp per 64-token query block; the routing mask itself stays per-64.
-// Lanes cover 32 pooled blocks per chunk for the scores and the decision (one
-// int8 dp4a dot each, the old kernel's precision), and 4 channels each for the
-// tail accumulation. Pooled tiles are staged to shared memory once per CTA and
-// shared by all 8 warps.
+// Both the routing decision and the tail VALUES are centroid quantities (the
+// thresholded column sum is len * centroid.kc), so this is an [N x N] problem,
+// not [T x N]; all rows of a query block share one tail (~5e-4 cosine).
 //
 // Emits per (batch, head, query block):
 //   blk_idx / blk_cnt        the routed list the exact kernel walks
-//   o_part, m_part, l_part   ONE online-softmax state per query block, in the
-//                            exact kernel's units: o pre-divided by the
-//                            per-channel V scale and, like l, pre-multiplied
-//                            by 255 (the u8 P scale) (keeps the scale out of its inner loop).
+//   o_part, m_part, l_part   ONE softmax state per query block, in the exact
+//                            kernel's units: o / vsc, and o and l both x255.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -53,11 +39,9 @@ constexpr int HD  = HEAD_DIM;
 constexpr int WPB = 8;               // warps (= query blocks) per CTA
 constexpr int NTHREADS = WPB * 32;
 constexpr int CH  = 32;              // pooled blocks staged per chunk
-// sVc row stride in halves. The tail reads sVc[(4*lane+i)*LDV2 + jj], so the
-// bank a lane lands on advances by (2*LDV2 mod 32) per lane: 40 puts every
-// lane on one of TWO banks (16-way conflict, measured as the kernel's
-// bottleneck); 34 spreads them over 8 (4-way), the best an even stride can do.
-// 34 halves is only 4-byte aligned, so staging uses uint32, not uint4.
+// Tail reads hit banks advancing by (2*LDV2 mod 32) per lane: 34 gives 4-way
+// conflicts, the even-stride optimum (40 gave 16-way). Only 4B-aligned, so
+// staging must use uint32, not uint4.
 constexpr int LDV2 = CH + 2;
 
 // cen8:[B*H*NQ,HD] int8 perm_d   cens:[B*H*NQ] f32
@@ -75,10 +59,8 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
     int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2)
 {
 #if SOL_SM80
-    // No smem staging for the pooled keys: each lane dots its own 128 B row,
-    // and any row-major smem tile puts all 32 lanes on the same bank for every
-    // operand load (32-way conflict, measured). The rows come from global
-    // instead -- a 4 KB chunk reused by all 8 warps, so it lives in L1.
+    // Pooled keys are read from global (L1-resident, 8-warp reuse): a
+    // row-major smem tile is a 32-way bank conflict on every operand load.
     __shared__ float  sKs[CH];
     __shared__ __nv_bfloat16 sVc[HD * LDV2];
 
@@ -109,12 +91,17 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
 
     float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
     float m_r = NEG, l_r = 0.f;
-    int cnt = 0;
+    // Sinks are unconditionally exact and need no score: emit them first so
+    // the cap can never truncate them into the tail (which ignores key_bias).
+    // The host rejects sink_count > max_blocks, so this always fits.
+    const int S = live ? max(0, min(sink_e, NTB) - sink_s) : 0;
+    for (int i = lane; i < S; i += 32)
+        blk_idx[qs_ * max_blk + i] = (uint16_t)(sink_s + i);
+    int cnt = S;
 
     for (int c0 = 0; c0 < NTB; c0 += CH) {
         __syncthreads();
-        // NPAD is a multiple of 64, so a 32-wide chunk never reads past it and
-        // the copies are unconditional; padded blocks are masked as invalid.
+        // Unconditional: NPAD is a multiple of 64, so chunks never overrun.
         if (tid < CH) sKs[tid] = kcs[(size_t)bh * NPAD + c0 + tid];
         for (int idx = tid; idx < HD * (CH / 2); idx += NTHREADS) {
             const int d = idx / (CH / 2), part = (idx % (CH / 2)) * 2;
@@ -141,18 +128,16 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
         }
         const float s = valid ? (float)acc * cqs * sKs[lane] : NEG;
 
-        // --- routing decision, in block order so the list stays sorted ---
-        const bool sink_kv = (j >= sink_s) && (j < sink_e);
+        // --- routing decision; non-sinks compete for the remaining budget ---
+        const bool pre_kept = (j >= sink_s) && (j < sink_e) && valid;
         const bool diag = (j >= qb - 1) && (j <= qb + 1);
-        const bool routed = ((s > thr) || diag || sink_kv) && valid;
-        const bool exact = q_in_sink ? valid : routed;
-        const uint32_t m = __ballot_sync(0xffffffffu, exact);
+        const bool routed = ((s > thr) || diag) && valid;
+        const bool cand = (q_in_sink ? valid : routed) && !pre_kept;
+        const uint32_t m = __ballot_sync(0xffffffffu, cand);
         const int rank = __popc(m & ((1u << lane) - 1u));
-        // The slot must be bounded (a sink_q block routes everything); a
-        // truncated block falls through to the tail below, so its mass is
-        // approximated rather than deleted.
-        const bool kept = exact && (cnt + rank) < max_blk;
-        if (kept)
+        // A capped-out block falls to the tail: approximated, never deleted.
+        const bool kept = pre_kept || (cand && (cnt + rank) < max_blk);
+        if (!pre_kept && kept)
             blk_idx[qs_ * max_blk + cnt + rank] = (uint16_t)j;
         cnt = min(cnt + __popc(m), max_blk);
 
@@ -218,17 +203,14 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Per-row tail (the pre-centroid behaviour), kept selectable behind
-// centroid_tail=false so the two can be A/B'd on real workloads without a
-// rebuild. Emits per-ROW (o_part, m_part, l_part); o_part aliases the caller's
-// output, as before. ~2.6 ms slower per call at T=37k/H=56.
+// Per-row tail (centroid_tail=false): per-ROW state, o_part aliasing `out`.
+// Kept for quality A/B without a rebuild; ~2.6 ms slower at T=37k/H=56.
 // ---------------------------------------------------------------------------
 namespace perrow {
 using namespace sol;
 
 constexpr int HD = HEAD_DIM, BQ = BLOCK;   // from the layout contract
-// BN is this kernel's staging tile, not a contract constant. 64 is the measured
-// optimum (32 costs 38%, 96 costs 8% via occupancy, 128 exceeds 48 KB smem).
+// Staging tile, not a contract constant; 64 is the measured optimum.
 constexpr int BN = 64;                     // pooled blocks staged per pass
 constexpr int NWARP = BQ / 16, NTHREADS = NWARP * 32;
 constexpr int KC  = HD / 32;    // int8 k-chunks for scores = Q . Kc^T
@@ -274,7 +256,14 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_perrow_kernel(
     // dead rows must weigh zero or a ragged tail over-counts the last row.
     const float w_row0 = (q_row0 < T) ? 1.f : 0.f;
     const float w_row1 = (q_row0 + 8 < T) ? 1.f : 0.f;
-    int cnt = 0;   // warp 0 only: routed blocks emitted so far, kept in a register
+    // Sink blocks are pre-emitted (never truncated by the cap -- see the
+    // centroid kernel for why); non-sinks compete for the remaining budget.
+    const int S = max(0, min(sink_e, NTB) - sink_s);
+    if (warp == 0)
+        for (int i = lane; i < S; i += 32)
+            blk_idx[((int64_t)(bh * gridDim.x + q_block)) * max_blk + i] =
+                (uint16_t)(sink_s + i);
+    int cnt = S;   // warp 0 only: routed blocks emitted so far, kept in a register
 
     uint32_t qa[KC][4];
     float qsc[2];
@@ -382,17 +371,16 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_perrow_kernel(
                 #pragma unroll
                 for (int w = 0; w < NWARP; ++w) colsum += sCol[w][c];
                 const bool valid = b < NTB;
-                const bool sink_kv = (b >= sink_s) && (b < sink_e);
-                const bool routed = ((colsum / q_len > thr) || (abs(q_block - b) <= 1)
-                                     || sink_kv) && valid;
-                const bool exact = (q_in_sink ? valid : routed);
-                const uint32_t m = __ballot_sync(0xffffffffu, exact);
+                const bool pre_kept = (b >= sink_s) && (b < sink_e) && valid;
+                const bool routed = ((colsum / q_len > thr) || (abs(q_block - b) <= 1)) && valid;
+                const bool cand = (q_in_sink ? valid : routed) && !pre_kept;
+                const uint32_t m = __ballot_sync(0xffffffffu, cand);
                 // compact in order: this lane's rank among set bits below it.
                 // The slot MUST be bounded -- a sink_q query block routes every
                 // block, so an unbounded write runs into the next block's region.
                 const int rank = __popc(m & ((1u << lane) - 1u));
-                const bool kept = exact && (cnt + rank) < max_blk;
-                if (kept)
+                const bool kept = pre_kept || (cand && (cnt + rank) < max_blk);
+                if (!pre_kept && kept)
                     blk_idx[((int64_t)(bh * gridDim.x + q_block)) * max_blk + cnt + rank] =
                         (uint16_t)b;   // block ids, not tokens: < 65536 for T < 4.2M
                 // Ballot `kept`, NOT `exact`: sMask must name the blocks the

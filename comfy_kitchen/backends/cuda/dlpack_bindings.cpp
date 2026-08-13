@@ -1492,14 +1492,14 @@ void sol_attn(
     std::vector<int64_t> v_strides,
     uintptr_t stream_ptr,
     bool centroid_tail,
-    uintptr_t key_bias_ptr)
+    std::optional<nb::ndarray<nb::device::cuda>> key_bias = std::nullopt)
 {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_sol_attn(
         q.data(), k.data(), v.data(), out.data(), workspace.data(),
         (int)batch, (int)seq_len, (int)num_heads, (int)head_dim, (int)max_blocks,
         tau, scale, centroid_tail ? 1 : 0,
-        reinterpret_cast<const void*>(key_bias_ptr),
+        key_bias ? key_bias->data() : nullptr,
         (int)sink_start, (int)sink_end, (int)sink_q_start, (int)sink_q_end,
         q_strides[0], q_strides[1], q_strides[2],
         k_strides[0], k_strides[1], k_strides[2],
@@ -3715,7 +3715,7 @@ NB_MODULE(_C, m) {
           nb::arg("q_strides"), nb::arg("k_strides"), nb::arg("v_strides"),
           nb::arg("stream_ptr"),
           nb::arg("centroid_tail") = true,
-          nb::arg("key_bias_ptr") = 0);
+          nb::arg("key_bias") = nb::none());
 
     m.def("adaln", &adaln,
           "Fused AdaLN: layernorm(x) * (1 + scale) + shift",

@@ -17,7 +17,7 @@
 
 // Sol-Attn exact branch. Each query block walks its routed key-block list,
 // resuming the online softmax (o/m/l) from the routing pass's handover so the
-// two stages compose exactly; o_part aliases the caller's `out`.
+// two stages compose exactly.
 //
 // All-INT8 MMA (QK and PV): sm_120 is issue-rate bound, so int8 m16n8k32 packs
 // the most MACs into one full-rate instruction and INT8 PV halves both the PV
@@ -34,7 +34,7 @@
 // contiguous bytes, one L1-resident LDG.128 per score n-tile, keeping smem at
 // 32768 B = 3 blocks/SM. cp.async double-buffers the staging; inputs are
 // padded to Tp so the copies run unconditionally. Per-channel V scale and the
-// 1/127 P scale are constant across key blocks, so they commute with the
+// 1/255 P scale are constant across key blocks, so they commute with the
 // online-softmax rescale and fold into the epilogue.
 
 #include <cuda_runtime.h>
@@ -124,12 +124,9 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     const uint16_t* my_idx = blk_idx + (int64_t)(bh * gridDim.x + q_block) * max_blk;
     const int n_blocks = blk_cnt[bh * gridDim.x + q_block];
 
-    // Resume the online softmax where the routing pass left it. Default
-    // (centroid_tail): the tail is evaluated at the query-block centroid, so
-    // all rows share ONE state and o_part/m_part/l_part are per (b, h, query
-    // block). Fallback (per-row tail, selectable for quality A/B): the state
-    // is per row and o_part aliases `out` -- each element is read here and
-    // rewritten by the SAME thread in the epilogue.
+    // Resume from the routing pass. centroid_tail: one state per (b, h,
+    // query block), shared by all rows. Fallback: per-row state, o_part
+    // aliasing `out` (each element read and rewritten by the same thread).
     float o_acc[NT][4];
     float m_r[2], l_r[2];
     if (centroid_tail) {
@@ -239,11 +236,8 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         const float alpha1 = exp2f(m_r[1] - m_new[1]);
         m_r[0] = m_new[0]; m_r[1] = m_new[1];
 
-        // The P scale folds into the exponent (exp2(x) * 255 == exp2(x +
-        // log2 255)); l and the accumulator carry the same 255 and the
-        // epilogue division cancels it exactly. 255 rather than 127 because P
-        // is non-negative and rides the u8 side of a u8 x s8 MMA -- double the
-        // resolution of the old s8 packing for free.
+        // The u8 P scale folds into the exponent: exp2(x)*255 = exp2(x +
+        // log2 255). l and the accumulator carry the same 255; it cancels.
         const float m_off[2] = {m_new[0] - 7.99435344f, m_new[1] - 7.99435344f};
         #pragma unroll
         for (int nt = 0; nt < NKT; ++nt) {
@@ -263,11 +257,8 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
             pa[kk][3] = pack4u8(p_val[b2][2], p_val[b2][3], p_val[b3][2], p_val[b3][3]);
         }
 
-        // l from the PACKED bytes (dp4a with 1,1,1,1), not the pre-quantization
-        // floats: the accumulator sums round(p), so the denominator must sum
-        // the same values or the P rounding error fails to cancel in the
-        // epilogue division. Same trick upstream applies in its int8 kernel.
-        // pa[kk][0]/[2] hold row r, [1]/[3] hold row r+8.
+        // l sums the PACKED bytes so num and den quantize identically.
+        // pa[kk][0]/[2] hold row r, [1]/[3] row r+8.
         uint32_t li[2] = {0, 0};
         #pragma unroll
         for (int kk = 0; kk < PKC; ++kk) {

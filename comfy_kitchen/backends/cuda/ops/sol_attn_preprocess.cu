@@ -198,9 +198,8 @@ __global__ void prep_q(const __nv_bfloat16* __restrict__ q, const float* __restr
     if (d == 0)
         thr[(size_t)bh * NQ + qb] = tau * sqrtf(sred[0] * log2s * log2s + 1e-6f);
 
-    // The routing pass consumes this centroid directly (its tail is evaluated
-    // at centroid granularity), so quantize it like a pseudo-row: same perm_d
-    // as the pooled keys, so their dot needs no unpermute.
+    // Centroid for the routing pass, quantized like a pseudo-row (same
+    // perm_d as the pooled keys, so their dot needs no unpermute).
     __syncthreads();
     sred[d] = fabsf(c);
     __syncthreads();
@@ -250,9 +249,8 @@ __global__ void prep_k(const __nv_bfloat16* __restrict__ k, const float* __restr
         for (int d = 0; d < HD; ++d)
             a = fmaxf(a, fabsf(__bfloat162float(sK[s * LDQ + d]) - kmean[(size_t)bh * HD + d]));
         const float sc = fmaxf(a / 127.0f, 1e-8f);
-        // The bias slot doubles as the per-key additive logit bias (LTX-style
-        // guide strength). Only the exact branch reads ksb, so blocks holding
-        // nonzero bias must be sink-routed for the bias to be honoured.
+        // Per-key additive logit bias; only the exact branch reads ksb, so
+        // biased blocks must be sink-routed.
         const float bias = (kbias && live) ? kbias[(size_t)batch * T + t0 + s] : 0.f;
         ksb[dst] = make_float2(live ? sc : 0.f, live ? bias : NEG);
         const float inv = 1.f / sc;

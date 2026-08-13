@@ -97,18 +97,13 @@ struct Plan {
         cnt     = take(bh * NQ * sizeof(int32_t));
         cen8    = take(bh * NQ * HD);
         cens    = take(bh * NQ * sizeof(float));
-        // The handover state is per (b, h, query block), not per row: the
-        // approximate tail is evaluated at the query-block centroid, so all 64
-        // rows of a block share one (o, m, l). 64x smaller than the per-row
-        // state this replaced -- small enough to allocate outright, which
-        // retired the trick of aliasing o_part onto the caller's output.
+        // Handover state: one (o, m, l) per (b, h, query block) -- the
+        // centroid tail is shared by all rows of a block.
         oPart   = take(bh * NQ * HD * sizeof(uint16_t));
         mPart   = take(bh * NQ * sizeof(float));
         lPart   = take(bh * NQ * sizeof(float));
-        // Per-ROW state for the centroid_tail=false fallback (its o_part
-        // aliases the caller's `out`, so only m/l are carried). Reserved
-        // unconditionally so the workspace size does not depend on the flag
-        // and cached buffers stay valid across a switch.
+        // Per-row m/l for the centroid_tail=false fallback (its o_part
+        // aliases `out`). Always reserved so the size ignores the flag.
         mPartRow = take(tok * sizeof(float));
         lPartRow = take(tok * sizeof(float));
         scratch = take(sol_preprocess_scratch_bytes(B, H, NPAD));

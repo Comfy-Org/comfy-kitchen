@@ -344,3 +344,75 @@ def test_key_bias_wrong_device_rejected():
     q, k, v = _qkv(1, 256, 4)
     with pytest.raises((ValueError, RuntimeError), match="key_bias"):
         ck.sol_attn(q, k, v, tau=1.4, key_bias=torch.zeros(256))
+
+
+@pytest.mark.parametrize("centroid_tail", [True, False])
+def test_cap_never_unmasks_sinked_biased_keys(centroid_tail):
+    """Sinks are pre-emitted into the routed list and exempt from max_blocks
+    truncation. Before that, the ascending-order cap could fill before reaching
+    sequence-end sink blocks and drop them into the pooled tail -- which
+    ignores key_bias, so keys masked with -inf leaked into the output
+    (canary sensitivity 1.01 where zero means the mask holds)."""
+    q, k, v = _qkv(1, 2048, 4)
+    n = 2048 // 64
+    bias = torch.zeros(1, 2048, device="cuda")
+    bias[:, -128:] = float("-inf")
+
+    def run(canary):
+        v2 = v.clone()
+        v2[:, -128:] = canary
+        return ck.sol_attn(q, k, v2, tau=0.05, key_bias=bias,
+                           sink_blocks=[n - 2, n], max_blocks=8,
+                           centroid_tail=centroid_tail)
+
+    assert torch.equal(run(8.0), run(-8.0))
+
+
+def test_cap_smaller_than_sink_range_rejected():
+    """Sinks are never truncated, so a cap below the sink-range size cannot
+    honour both knobs and must refuse rather than silently pick one."""
+    q, k, v = _qkv(1, 2048, 4)
+    with pytest.raises(ValueError, match="sink range"):
+        ck.sol_attn(q, k, v, tau=1.4, sink_blocks=[0, 10], max_blocks=4)
+
+
+def test_direct_backend_validates_like_the_public_path():
+    """The backend-direct entry (the workspace-reusing path) must run the same
+    shared rule as the registry: fp16 once ran silently to plausible garbage
+    (bytes reinterpreted as bf16) and a shorter k read out of bounds."""
+    from comfy_kitchen.backends import cuda as cuda_backend
+    q, k, v = _qkv(1, 512, 4)
+    with pytest.raises(ValueError, match="bfloat16"):
+        cuda_backend.sol_attn(q.half(), k.half(), v.half(), tau=1.4)
+    with pytest.raises(ValueError, match="shape"):
+        cuda_backend.sol_attn(q, k[:, :256].contiguous(), v, tau=1.4)
+
+
+def test_workspace_must_be_aligned_and_contiguous():
+    """A workspace view with an odd storage_offset passes the byte-count check
+    and then faults with a context-poisoning misaligned address; a strided view
+    lies about its extent. Both must be rejected before launch."""
+    from comfy_kitchen.backends import cuda as cuda_backend
+    q, k, v = _qkv(1, 512, 4)
+    need = cuda_backend.sol_attn_workspace_bytes(1, 512, 4)
+    big = torch.empty(need + 32, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="aligned"):
+        cuda_backend.sol_attn(q, k, v, tau=1.4, workspace=big[1:need + 1])
+    with pytest.raises(ValueError, match="contiguous"):
+        cuda_backend.sol_attn(q, k, v, tau=1.4,
+                              workspace=torch.empty((need, 2), dtype=torch.uint8,
+                                                    device="cuda")[:, 0])
+
+
+def test_sub_sm80_rejected_at_the_wrapper(monkeypatch):
+    """The sm_75 cubins in a full-arch build compile the guarded kernel bodies
+    to a bare EXIT (verified in SASS), and the unguarded preprocess still runs,
+    so a Turing launch returns UNINITIALIZED memory rather than failing. The
+    registry gate reads (and caches) the CURRENT device's capability, so on a
+    mixed-arch machine it can wave such a call through -- the wrapper must
+    check q.device itself."""
+    from comfy_kitchen.backends import cuda as cuda_backend
+    q, k, v = _qkv(1, 256, 4)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (7, 5))
+    with pytest.raises(RuntimeError, match="sm_80"):
+        cuda_backend.sol_attn(q, k, v, tau=1.4)

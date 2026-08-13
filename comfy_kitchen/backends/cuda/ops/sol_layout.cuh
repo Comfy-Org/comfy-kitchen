@@ -90,11 +90,8 @@ __device__ __forceinline__ void mma_s8(int32_t* d, const uint32_t* a, const uint
 #endif
 }
 
-// P is a probability -- non-negative -- so packing it s8 wastes the sign bit:
-// 127 levels where 255 are free. u8 A x s8 B is a legal MMA signedness mix, so
-// the extra bit of P resolution costs nothing. The 255 scale folds into the
-// exp2 exponent exactly like 127 did, and l carries the same factor, so the
-// epilogue division cancels it.
+// P is non-negative, so it rides the u8 side of a u8 x s8 MMA: 255 levels
+// instead of s8's 127, for free.
 __device__ __forceinline__ void mma_u8s8(int32_t* d, const uint32_t* a, const uint32_t* b) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32.u8.s8.s32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
