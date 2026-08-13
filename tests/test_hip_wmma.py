@@ -147,9 +147,9 @@ def test_int8_linear_convrot_matches_eager():
 
 
 @needs_wmma
-@pytest.mark.parametrize("k", [3840, 10240])
+@pytest.mark.parametrize("k", [3840, 10240, 17408])
 def test_int8_linear_convrot_large_k_matches_eager(k):
-    """G=256 INT8 convrot: fused LDS (3840) and global spill (10240) vs eager."""
+    """G=256 INT8 convrot: fused LDS (3840), large K (10240), global spill (17408) vs eager."""
     torch.manual_seed(k)
     m, n = 64, 256
     x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
@@ -2137,7 +2137,7 @@ def test_convrot_falls_back_to_eager_past_the_lds_bound(hip, dtype):
     sb = torch.zeros(2, dtype=torch.float32, device=DEV)
     with pytest.raises(RuntimeError, match="LDS"):
         hip._C.quantize_int8_convrot(
-            hip._dl(x), hip._dl(qb), hip._dl(sb), 2, k, 64, 0, hip._stream(x)
+            hip._dl(x), hip._dl(qb), hip._dl(sb), None, None, 2, k, 64, 0, hip._stream(x)
         )
 
 

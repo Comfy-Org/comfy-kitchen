@@ -177,50 +177,6 @@ __global__ __launch_bounds__(256) void dequantize_int8_convrot_weight_kernel(
 
 }  // namespace comfy::hip_backend
 
-// Global spill buffers for convrot quant when K exceeds convrot_fused_lds_max_k() in
-// hadamard.h. hipMalloc lives in this translation unit; kernels stay header-only.
-namespace {
-
-// Process-lifetime workspace passed to launch_convrot_quant_global() in hadamard.h.
-struct ConvrotGlobalWorkspace {
-    void* rotated = nullptr;         // M x K rotated row (input element size)
-    void* partial_absmax = nullptr;  // M x (K / 256) per-group absmax (float)
-    size_t rotated_bytes = 0;
-    size_t partials_bytes = 0;
-};
-
-ConvrotGlobalWorkspace g_convrot_global_ws;
-
-// Grow-only: realloc when a larger (M, K) appears; never shrinks between calls.
-void ensure_convrot_global_workspace(size_t rotated_bytes, size_t partials_bytes) {
-    if (rotated_bytes > g_convrot_global_ws.rotated_bytes) {
-        if (g_convrot_global_ws.rotated != nullptr) {
-            hipFree(g_convrot_global_ws.rotated);
-        }
-        hipError_t err = hipMalloc(&g_convrot_global_ws.rotated, rotated_bytes);
-        if (err != hipSuccess) {
-            throw std::runtime_error(
-                std::string("convrot global: rotated workspace alloc failed: ") +
-                hipGetErrorString(err));
-        }
-        g_convrot_global_ws.rotated_bytes = rotated_bytes;
-    }
-    if (partials_bytes > g_convrot_global_ws.partials_bytes) {
-        if (g_convrot_global_ws.partial_absmax != nullptr) {
-            hipFree(g_convrot_global_ws.partial_absmax);
-        }
-        hipError_t err = hipMalloc(&g_convrot_global_ws.partial_absmax, partials_bytes);
-        if (err != hipSuccess) {
-            throw std::runtime_error(
-                std::string("convrot global: partial absmax alloc failed: ") +
-                hipGetErrorString(err));
-        }
-        g_convrot_global_ws.partials_bytes = partials_bytes;
-    }
-}
-
-}  // namespace
-
 namespace comfy::hip_backend {
 
 template <int ACT>
@@ -232,31 +188,25 @@ struct LaunchConvrotQuantGlobalManaged {
     int M;
     int K;
     hipStream_t stream;
-    void* rotated;
-    void* partial_absmax;
+    void* spill_rotated;
+    void* spill_partials;
 
     template <typename RowT>
     void operator()() const {
         launch_convrot_quant_global<RowT, ACT>(
             x, in_dtype, qout, scaleout, M, K,
-            static_cast<RowT*>(rotated),
-            static_cast<float*>(partial_absmax), stream);
+            static_cast<RowT*>(spill_rotated),
+            static_cast<float*>(spill_partials), stream);
     }
 };
 
-// Host wrapper: size global buffers, then run rotate + quantize kernels from hadamard.h.
 template <int ACT>
 void launch_convrot_quant_global_managed(
-    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
-    hipStream_t stream) {
-    const size_t elem_size = convrot_row_element_size(in_dtype);
-    if (elem_size == 0) {
-        throw std::runtime_error("convrot global: unsupported input dtype code");
+    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K, hipStream_t stream,
+    void* spill_rotated, void* spill_partials) {
+    if (spill_rotated == nullptr || spill_partials == nullptr) {
+        throw std::runtime_error("convrot global spill requires caller-provided workspace buffers");
     }
-    const size_t rotated_bytes = static_cast<size_t>(M) * static_cast<size_t>(K) * elem_size;
-    const size_t partials_bytes =
-        static_cast<size_t>(M) * static_cast<size_t>(K / kConvRotGroup256) * sizeof(float);
-    ensure_convrot_global_workspace(rotated_bytes, partials_bytes);
 
     dispatch_convrot_row_type(
         in_dtype,
@@ -268,16 +218,16 @@ void launch_convrot_quant_global_managed(
             M,
             K,
             stream,
-            g_convrot_global_ws.rotated,
-            g_convrot_global_ws.partial_absmax});
+            spill_rotated,
+            spill_partials});
 }
 
 template void launch_convrot_quant_global_managed<kActNone>(
-    const void*, int, int8_t*, float*, int, int, hipStream_t);
+    const void*, int, int8_t*, float*, int, int, hipStream_t, void*, void*);
 template void launch_convrot_quant_global_managed<kActGeluTanh>(
-    const void*, int, int8_t*, float*, int, int, hipStream_t);
+    const void*, int, int8_t*, float*, int, int, hipStream_t, void*, void*);
 template void launch_convrot_quant_global_managed<kActSwiGLU>(
-    const void*, int, int8_t*, float*, int, int, hipStream_t);
+    const void*, int, int8_t*, float*, int, int, hipStream_t, void*, void*);
 
 }  // namespace comfy::hip_backend
 
@@ -295,7 +245,7 @@ extern "C" void launch_quantize_int8_rowwise_kernel(
 // Fused ConvRot rotation + rowwise int8 quantize. act_code: 0 none, 1 gelu tanh,
 // 2 swiglu. K is the activated (written) width; swiglu reads a row twice as wide.
 extern "C" void launch_quantize_int8_convrot_kernel(
-    const void* x, int in_code, void* q, void* scales,
+    const void* x, int in_code, void* q, void* scales, void* spill_rotated, void* spill_partials,
     int M, int K, int group_size, int act_code, hipStream_t stream) {
 
     using namespace comfy::hip_backend;
@@ -308,15 +258,15 @@ extern "C" void launch_quantize_int8_convrot_kernel(
     if (act_code == kActGeluTanh) {
         launch_convrot_quant<false, kActGeluTanh>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
-            M, K, group_size, stream);
+            M, K, group_size, stream, spill_rotated, spill_partials);
     } else if (act_code == kActSwiGLU) {
         launch_convrot_quant<false, kActSwiGLU>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
-            M, K, group_size, stream);
+            M, K, group_size, stream, spill_rotated, spill_partials);
     } else {
         launch_convrot_quant<false, kActNone>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
-            M, K, group_size, stream);
+            M, K, group_size, stream, spill_rotated, spill_partials);
     }
 }
 

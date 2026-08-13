@@ -48,8 +48,8 @@ void launch_convrot_w4a4_gemm_kernel(const void*, const void*, void*, const void
                                      const void*, int, int, int, int, int, hipStream_t);
 
 void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, hipStream_t);
-void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, int, int, int, int,
-                                         hipStream_t);
+void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
+                                         int, int, hipStream_t);
 void launch_quantize_int8_tensorwise_kernel(const void*, int, void*, void*, void*, int64_t,
                                             hipStream_t);
 void launch_dequantize_int8_simple_kernel(const void*, const void*, void*, int64_t, int64_t, int,
@@ -401,7 +401,8 @@ void quantize_int8_rowwise(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
 }
 
 // act_code folds an elementwise activation into the rotation's load.
-void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales, int M, int K,
+void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales,
+                           nb::object spill_rotated, nb::object spill_partials, int M, int K,
                            int group_size, int act_code, uintptr_t stream_ptr) {
     constexpr const char* kFn = "quantize_int8_convrot";
     require_nonneg(M, kFn, "M");
@@ -415,8 +416,29 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
 
+    void* spill_rotated_ptr = nullptr;
+    void* spill_partials_ptr = nullptr;
+    if (!spill_rotated.is_none()) {
+        auto rotated = nb::cast<nb::ndarray<>>(spill_rotated);
+        require_dtype(rotated, 0, 2, kFn, "spill_rotated");
+        require_len(rotated, static_cast<int64_t>(M) * K, kFn, "spill_rotated");
+        spill_rotated_ptr = rotated.data();
+    }
+    if (!spill_partials.is_none()) {
+        auto partials = nb::cast<nb::ndarray<>>(spill_partials);
+        require_dtype(partials, 0, 0, kFn, "spill_partials");
+        require_len(partials, static_cast<int64_t>(M) * (K / 256), kFn, "spill_partials");
+        spill_partials_ptr = partials.data();
+    }
+    if (group_size == 256 && (spill_rotated_ptr == nullptr || spill_partials_ptr == nullptr)) {
+        throw std::runtime_error(
+            std::string(kFn) +
+            ": spill_rotated and spill_partials are required for group_size=256");
+    }
+
     launch_quantize_int8_convrot_kernel(x.data(), map_dtype_to_code(x.dtype()), q.data(),
-                                        scales.data(), M, K, group_size, act_code,
+                                        scales.data(), spill_rotated_ptr, spill_partials_ptr, M, K,
+                                        group_size, act_code,
                                         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }

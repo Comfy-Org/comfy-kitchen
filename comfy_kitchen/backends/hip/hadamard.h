@@ -31,8 +31,9 @@ inline void check_convrot_group_size(int group_size) {
     }
 }
 
-// The kernel's static LDS: butterfly workspace + row absmax reduction (up to 1024 threads).
-constexpr size_t kConvrotStaticLds = 2 * 1024 * sizeof(float);
+// Legacy convrot_quant_kernel static LDS: butterfly workspace + row absmax reduction.
+// Sized for 256-thread blocks; the kernel uses g[BLOCK_THREADS] / red[BLOCK_THREADS].
+constexpr size_t kConvrotStaticLds = 2 * 256 * sizeof(float);
 constexpr int kConvRotGroup256 = 256;
 
 // convrot_quant_kernel stages the whole rotated row in dynamic LDS, preserving
@@ -81,16 +82,33 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
     return 1024;
 }
 
+inline int convrot_device_lds_limit() {
+    static int cached_device = -1;
+    static int cached_lds = 0;
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) {
+        return 0;
+    }
+    if (device != cached_device) {
+        int lds = 0;
+        if (hipDeviceGetAttribute(&lds, hipDeviceAttributeMaxSharedMemoryPerBlock, device) !=
+                hipSuccess ||
+            lds <= 0) {
+            cached_lds = 0;
+        } else {
+            cached_lds = lds;
+        }
+        cached_device = device;
+    }
+    return cached_lds;
+}
+
 inline bool convrot_fused_lds_fits(int K, int block_threads) {
     if (block_threads <= 0 || (block_threads % 64) != 0) {
         return false;
     }
-    int device = 0;
-    int lds = 0;
-    if (hipGetDevice(&device) != hipSuccess ||
-        hipDeviceGetAttribute(&lds, hipDeviceAttributeMaxSharedMemoryPerBlock, device) !=
-            hipSuccess ||
-        lds <= 0) {
+    const int lds = convrot_device_lds_limit();
+    if (lds <= 0) {
         return false;
     }
     const int groups_in_flight = block_threads / 64;
@@ -109,7 +127,7 @@ inline int convrot_pick_fused_block_threads(int M, int K) {
     }
     static constexpr int kFallbackBlocks[] = {768, 640, 512, 64};
     for (int block_threads : kFallbackBlocks) {
-        if (block_threads != preferred && convrot_fused_lds_fits(K, block_threads)) {
+        if (block_threads < preferred && convrot_fused_lds_fits(K, block_threads)) {
             return block_threads;
         }
     }
@@ -473,7 +491,8 @@ inline void launch_convrot_quant_global(
 
 template <int ACT>
 void launch_convrot_quant_global_managed(
-    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K, hipStream_t stream);
+    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K, hipStream_t stream,
+    void* spill_rotated, void* spill_partials);
 
 // Fused single-kernel path: FHT in LDS, vectorized loads, warp-shuffle absmax.
 // One block per row; the rotated row stays in shared memory as float.
@@ -570,7 +589,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
 }
 
 template <typename RowT, int ACT, int BLOCK_THREADS>
-inline void launch_convrot_quant_fused_impl(
+inline bool launch_convrot_quant_fused_impl(
     const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
     hipStream_t stream) {
     const int groups_in_flight = BLOCK_THREADS / 64;
@@ -582,11 +601,10 @@ inline void launch_convrot_quant_fused_impl(
         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(shmem));
     if (attr_err != hipSuccess) {
-        throw std::runtime_error(
-            std::string("convrot fused: shared memory request (") + std::to_string(shmem) +
-            " bytes) failed: " + hipGetErrorString(attr_err));
+        return false;
     }
     kernel<<<M, BLOCK_THREADS, shmem, stream>>>(x, in_dtype, qout, scaleout, M, K);
+    return hipGetLastError() == hipSuccess;
 }
 
 template <typename RowT, int ACT>
@@ -598,10 +616,11 @@ struct LaunchConvrotQuantFusedForBlock {
     int M;
     int K;
     hipStream_t stream;
+    bool* launched;
 
     template <int BLOCK_THREADS>
     void operator()() const {
-        launch_convrot_quant_fused_impl<RowT, ACT, BLOCK_THREADS>(
+        *launched = launch_convrot_quant_fused_impl<RowT, ACT, BLOCK_THREADS>(
             x, in_dtype, qout, scaleout, M, K, stream);
     }
 };
@@ -616,24 +635,16 @@ struct LaunchConvrotQuantFusedForRow {
     int K;
     hipStream_t stream;
     int block_threads;
+    bool* launched;
 
     template <typename RowT>
     void operator()() const {
         dispatch_convrot_fused_block_threads(
             block_threads,
-            LaunchConvrotQuantFusedForBlock<RowT, ACT>{x, in_dtype, qout, scaleout, M, K, stream});
+            LaunchConvrotQuantFusedForBlock<RowT, ACT>{
+                x, in_dtype, qout, scaleout, M, K, stream, launched});
     }
 };
-
-template <int ACT>
-inline void launch_convrot_quant_fused(
-    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
-    hipStream_t stream) {
-    const int block_threads = convrot_quant_fused_block_threads(M, K);
-    dispatch_convrot_row_type(
-        in_dtype,
-        LaunchConvrotQuantFusedForRow<ACT>{x, in_dtype, qout, scaleout, M, K, stream, block_threads});
-}
 
 template <typename RowT, bool PACK_INT4, int ACT, int BLOCK_THREADS>
 __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_kernel(
@@ -642,8 +653,8 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_kernel(
     int M, int K, int G) {
 
     const float h4[4][4] = {{1, 1, 1, -1}, {1, 1, -1, 1}, {1, -1, 1, 1}, {-1, 1, 1, 1}};
-    __shared__ float g[1024];
-    __shared__ float red[1024];
+    __shared__ float g[BLOCK_THREADS];
+    __shared__ float red[BLOCK_THREADS];
     extern __shared__ unsigned char rowbuf_raw[];
     RowT* rowbuf = reinterpret_cast<RowT*>(rowbuf_raw);  // K entries: the rotated row
 
@@ -766,25 +777,34 @@ inline void launch_convrot_quant_for_block(
 template <bool PACK_INT4, int ACT = kActNone>
 inline void launch_convrot_quant(
     const void* x, int in_dtype, int8_t* qout, float* scaleout,
-    int M, int K, int group_size, hipStream_t stream) {
+    int M, int K, int group_size, hipStream_t stream,
+    void* spill_rotated = nullptr, void* spill_partials = nullptr) {
 
-    // INT8 G=256: fused when (M, K) fits in LDS, else global spill.
+    // INT8 G=256: fused when (M, K) fits in LDS, else caller-owned global spill.
     if (!PACK_INT4 && group_size == 256) {
         const int block_threads = convrot_pick_fused_block_threads(M, K);
         if (block_threads > 0) {
+            bool launched = false;
             dispatch_convrot_row_type(
                 in_dtype,
                 LaunchConvrotQuantFusedForRow<ACT>{
-                    x, in_dtype, qout, scaleout, M, K, stream, block_threads});
-        } else {
-            launch_convrot_quant_global_managed<ACT>(
-                x, in_dtype, qout, scaleout, M, K, stream);
+                    x, in_dtype, qout, scaleout, M, K, stream, block_threads, &launched});
+            if (launched) {
+                return;
+            }
         }
+        if (spill_rotated == nullptr || spill_partials == nullptr) {
+            throw std::runtime_error(
+                "convrot global spill requires caller-provided workspace buffers");
+        }
+        launch_convrot_quant_global_managed<ACT>(
+            x, in_dtype, qout, scaleout, M, K, stream, spill_rotated, spill_partials);
         return;
     }
 
-    // G=256 with K>=512: 1024-thread blocks process 4 Hadamard groups/pass (15->4
-    // passes at K=3840). Smaller configs keep 256 threads for occupancy on narrow K.
+    // INT4 G=256 with K>=512: 1024-thread blocks process 4 Hadamard groups/pass
+    // (15->4 passes at K=3840). INT8 G=256 returns above. Smaller configs keep
+    // 256 threads for occupancy on narrow K.
     const int block_threads = (group_size == 256 && K >= 512) ? 1024 : 256;
     if (block_threads == 1024) {
         launch_convrot_quant_for_block<PACK_INT4, ACT, 1024>(
