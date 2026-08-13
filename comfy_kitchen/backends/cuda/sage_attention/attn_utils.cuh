@@ -609,20 +609,20 @@ RS_32_to_8(float RS[][num_tiles_k][8], uint32_t RS_8[][num_tiles_k / 2][4]) {
 __device__ __forceinline__ uint32_t pack_u8x4(float a, float b, float c,
                                               float d) {
   uint32_t qa, qb, qc, qd;
-  asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qa) : "f"(a));
-  asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qb) : "f"(b));
-  asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qc) : "f"(c));
-  asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qd) : "f"(d));
-  uint32_t qab, qcd, packed;
-  asm volatile("prmt.b32 %0, %1, %2, 0x5410;"
-               : "=r"(qab)
-               : "r"(qa), "r"(qb));
-  asm volatile("prmt.b32 %0, %1, %2, 0x5410;"
-               : "=r"(qcd)
-               : "r"(qc), "r"(qd));
-  asm volatile("prmt.b32 %0, %1, %2, 0x6420;"
+  // Keep the FP32-to-integer conversions adjacent to the two packed U8
+  // conversions. ptxas recognizes each pair as one F2IP instruction on
+  // Ampere and newer, instead of emitting four scalar F2IP plus two I2IP.
+  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qa) : "f"(a));
+  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qb) : "f"(b));
+  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qc) : "f"(c));
+  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qd) : "f"(d));
+  uint32_t qdc, packed;
+  asm volatile("cvt.pack.sat.u8.s32.b32 %0, %1, %2, 0;"
+               : "=r"(qdc)
+               : "r"(qd), "r"(qc));
+  asm volatile("cvt.pack.sat.u8.s32.b32 %0, %1, %2, %3;"
                : "=r"(packed)
-               : "r"(qab), "r"(qcd));
+               : "r"(qb), "r"(qa), "r"(qdc));
   return packed;
 }
 

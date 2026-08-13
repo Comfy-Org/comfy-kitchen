@@ -13,6 +13,8 @@ from .exceptions import (
     BackendNotImplementedError,
     NoCapableBackendError,
 )
+from .flash_attention import flash_attention_decode
+from .flash_attention import is_available as flash_attention_decode_is_available
 from .float_utils import from_blocked, swap_nibbles, to_blocked
 from .registry import registry
 from .sage_attention import (
@@ -56,6 +58,8 @@ __all__ = [
     "int8_attention_from_prequantized",
     "int8_attention_is_available",
     "prequantize_int8_attention",
+    "flash_attention_decode",
+    "flash_attention_decode_is_available",
     "na2d",
     "na3d",
     # Quantization / dequantization

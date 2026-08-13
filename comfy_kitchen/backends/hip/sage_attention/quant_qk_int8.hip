@@ -468,16 +468,22 @@ extern "C" void launch_sage_quant_qk_int8(const void* q, void* q_int8, void* q_s
     }
 
     // The quantizers read four elements at a time from every row, so the base
-    // pointer and all three strides have to keep that group aligned.
+    // pointer and all three strides have to keep that group aligned. An extent of
+    // one is exempt: its index is always zero, so the stride never reaches the
+    // address, and PyTorch rewrites such a stride to 1 on the way through DLPack
+    // (ATen/DLConvertor.cpp, gh-83069), which no caller can prevent.
     const size_t element_size = input_dtype_code == 0 ? sizeof(float) : sizeof(__half);
     const size_t vector_size = 4 * element_size;
-    const auto vector_aligned = [vector_size](const void* p, int64_t sb, int64_t sh, int64_t sn) {
-        return sb > 0 && sh > 0 && sn > 0 &&
-               reinterpret_cast<uintptr_t>(p) % vector_size == 0 && sb % 4 == 0 && sh % 4 == 0 &&
-               sn % 4 == 0;
+    const auto stride_ok = [](int64_t stride, int extent) {
+        return extent < 2 || (stride > 0 && stride % 4 == 0);
     };
-    if (!vector_aligned(q, q_stride_b, q_stride_h, q_stride_n) ||
-        !vector_aligned(k, k_stride_b, k_stride_h, k_stride_n)) {
+    const auto vector_aligned = [vector_size, &stride_ok](const void* p, int64_t sb, int64_t sh,
+                                                          int64_t sn, int nb, int nh, int nn) {
+        return reinterpret_cast<uintptr_t>(p) % vector_size == 0 && stride_ok(sb, nb) &&
+               stride_ok(sh, nh) && stride_ok(sn, nn);
+    };
+    if (!vector_aligned(q, q_stride_b, q_stride_h, q_stride_n, B, H_q, Lq) ||
+        !vector_aligned(k, k_stride_b, k_stride_h, k_stride_n, B, H_kv, Lk)) {
         throw std::runtime_error(
             "sage int8 attention: Q/K base pointers and B/H/N strides must preserve 4-element "
             "alignment");

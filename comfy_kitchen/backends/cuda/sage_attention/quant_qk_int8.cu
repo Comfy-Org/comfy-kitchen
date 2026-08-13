@@ -710,17 +710,25 @@ extern "C" void launch_quant_qk_per_thread_int8(
     throw std::runtime_error(
         "quant_qk_per_thread_int8: anchor_indices scratch is required");
   }
+  // An extent of one is exempt: its index is always zero, so the stride never
+  // reaches an address, and PyTorch rewrites such a stride to 1 on the way
+  // through DLPack (ATen/DLConvertor.cpp, gh-83069) on 2.9 and older, which no
+  // caller can prevent.
   const size_t element_size = input_dtype_code == 0 ? sizeof(float) : sizeof(half);
   const size_t vector_size = 4 * element_size;
-  const auto is_vector_aligned = [vector_size](const void *ptr, int64_t stride_b,
-                                                int64_t stride_h,
-                                                int64_t stride_n) {
-    return stride_b > 0 && stride_h > 0 && stride_n > 0 &&
-           reinterpret_cast<uintptr_t>(ptr) % vector_size == 0 &&
-           stride_b % 4 == 0 && stride_h % 4 == 0 && stride_n % 4 == 0;
+  const auto stride_ok = [](int64_t stride, int extent) {
+    return extent < 2 || (stride > 0 && stride % 4 == 0);
   };
-  if (!is_vector_aligned(q, q_stride_b, q_stride_h, q_stride_n) ||
-      !is_vector_aligned(k, k_stride_b, k_stride_h, k_stride_n)) {
+  const auto is_vector_aligned = [vector_size, &stride_ok](const void *ptr, int64_t stride_b,
+                                                            int64_t stride_h, int64_t stride_n,
+                                                            int extent_b, int extent_h,
+                                                            int extent_n) {
+    return reinterpret_cast<uintptr_t>(ptr) % vector_size == 0 &&
+           stride_ok(stride_b, extent_b) && stride_ok(stride_h, extent_h) &&
+           stride_ok(stride_n, extent_n);
+  };
+  if (!is_vector_aligned(q, q_stride_b, q_stride_h, q_stride_n, B, H_q, Lq) ||
+      !is_vector_aligned(k, k_stride_b, k_stride_h, k_stride_n, B, H_kv, Lk)) {
     throw std::runtime_error(
         "quant_qk_per_thread_int8: Q/K base pointers and B/H/N strides must preserve 4-element alignment");
   }
