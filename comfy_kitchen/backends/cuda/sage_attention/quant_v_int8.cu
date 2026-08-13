@@ -177,11 +177,16 @@ extern "C" void launch_quant_v_int8_kernel(const void *v, void *out, void *scale
                                           int padded_N, int64_t sb, int64_t sh,
                                           int64_t sn, int input_dtype_code,
                                           cudaStream_t stream) {
+  // An extent of one forms no offset, and PyTorch rewrites such a stride to 1 on
+  // the way through DLPack (ATen/DLConvertor.cpp, gh-83069) on 2.9 and older, so
+  // policing it would reject a tensor the caller has no way to hand over
+  // differently.
   const size_t element_size = input_dtype_code == 0 ? sizeof(float) : sizeof(half);
-  if (reinterpret_cast<uintptr_t>(v) % 16 != 0 ||
-      (static_cast<size_t>(sb) * element_size) % 16 != 0 ||
-      (static_cast<size_t>(sh) * element_size) % 16 != 0 ||
-      (static_cast<size_t>(sn) * element_size) % 16 != 0) {
+  const auto stride_ok = [element_size](int64_t stride, int extent) {
+    return extent < 2 || (static_cast<size_t>(stride) * element_size) % 16 == 0;
+  };
+  if (reinterpret_cast<uintptr_t>(v) % 16 != 0 || !stride_ok(sb, B) ||
+      !stride_ok(sh, H) || !stride_ok(sn, N)) {
     throw std::runtime_error(
         "quant_v_int8: V base pointer and B/H/N strides must be 16-byte aligned");
   }

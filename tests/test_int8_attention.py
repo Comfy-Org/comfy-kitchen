@@ -422,3 +422,31 @@ def test_rotation_handles_outliers():
     actual = ck.int8_attention(q, k, v)
 
     assert _nrmse(actual, expected) < 0.03
+
+
+@requires_int8_attention
+def test_int8_attention_accepts_dlpack_normalized_batch_stride():
+    """A size-one extent carries no address, so its stride must not be policed.
+
+    PyTorch rewrites the stride of any size-one dimension to 1 on the way out
+    through DLPack (ATen/DLConvertor.cpp, gh-83069), so a batch-one attention
+    input arrives with stride 1 no matter what the caller built.
+    """
+    torch.manual_seed(0)
+    length, heads, head_dim = 372, 8, 128
+    packed = [
+        torch.randn(length, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+        for _ in range(3)
+    ]
+    reported = [t.transpose(0, 1).unsqueeze(0) for t in packed]
+    normalized = [
+        torch.as_strided(t, (1, heads, length, head_dim), (1, head_dim, heads * head_dim, 1))
+        for t in packed
+    ]
+    assert normalized[0].stride(0) == 1
+    assert torch.equal(reported[0], normalized[0])
+
+    expected = ck.int8_attention_from_prequantized(ck.prequantize_int8_attention(*reported))
+    actual = ck.int8_attention_from_prequantized(ck.prequantize_int8_attention(*normalized))
+
+    assert torch.equal(actual, expected)

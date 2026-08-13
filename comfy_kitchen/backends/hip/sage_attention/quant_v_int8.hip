@@ -163,12 +163,16 @@ extern "C" void launch_sage_quant_v_int8(const void* v, void* out, void* scale, 
                                          int64_t stride_h, int64_t stride_n, int input_dtype_code,
                                          hipStream_t stream) {
     // The kernel loads V 16 bytes at a time, so the base pointer and every row
-    // offset it can form have to be 16-byte aligned.
+    // offset it can form have to be 16-byte aligned. An extent of one forms no
+    // offset, and PyTorch rewrites such a stride to 1 on the way through DLPack
+    // (ATen/DLConvertor.cpp, gh-83069), so policing it would reject a tensor the
+    // caller has no way to hand over differently.
     const size_t element_size = input_dtype_code == 0 ? sizeof(float) : sizeof(__half);
-    if (reinterpret_cast<uintptr_t>(v) % 16 != 0 ||
-        (static_cast<size_t>(stride_b) * element_size) % 16 != 0 ||
-        (static_cast<size_t>(stride_h) * element_size) % 16 != 0 ||
-        (static_cast<size_t>(stride_n) * element_size) % 16 != 0) {
+    const auto stride_ok = [element_size](int64_t stride, int extent) {
+        return extent < 2 || (static_cast<size_t>(stride) * element_size) % 16 == 0;
+    };
+    if (reinterpret_cast<uintptr_t>(v) % 16 != 0 || !stride_ok(stride_b, B) ||
+        !stride_ok(stride_h, H) || !stride_ok(stride_n, N)) {
         throw std::runtime_error(
             "sage int8 attention: V base pointer and B/H/N strides must be 16-byte aligned");
     }
