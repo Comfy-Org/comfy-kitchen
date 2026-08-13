@@ -158,7 +158,7 @@ def test_rejects_noncontiguous_last_dim():
     """The staging loads are 16 B wide, so a strided last dim would read
     neighbouring channels rather than fail."""
     from comfy_kitchen.backends import cuda as cuda_backend
-    q, k, v = _qkv(1, 256, 4)
+    _q, k, v = _qkv(1, 256, 4)
     bad = torch.empty(1, 256, 4, HD * 2, device="cuda", dtype=torch.bfloat16)[..., ::2]
     assert bad.stride(-1) != 1
     with pytest.raises(ValueError, match="contiguous last dim"):
