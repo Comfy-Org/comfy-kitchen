@@ -551,12 +551,12 @@ def _rotate_quant_int8(
     x_arg = _operand(x2d, x2d.device, "x2d")
     spill_rotated = None
     spill_partials = None
-    if group_size == 256:
-        spill_rotated = torch.empty((m, k), dtype=x2d.dtype, device=x2d.device)
-        spill_partials = torch.empty((m, k // 256), dtype=torch.float32, device=x2d.device)
     # check_convrot_k queries the current device's LDS budget, so pin it to the
     # operand's device rather than trusting the caller thread's current device.
     with torch.cuda.device(x2d.device):
+        if group_size == 256 and _C.convrot_int8_needs_spill(m, k):
+            spill_rotated = torch.empty((m, k), dtype=x2d.dtype, device=x2d.device)
+            spill_partials = torch.empty((m, k // 256), dtype=torch.float32, device=x2d.device)
         _C.quantize_int8_convrot(
             _dl(x_arg),
             _dl(q),

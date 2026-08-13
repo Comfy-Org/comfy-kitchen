@@ -105,15 +105,18 @@ def _bench_hip_convrot_quant(
     m, k = x.shape
     q = torch.empty((m, k), dtype=torch.int8, device=x.device)
     scales = torch.empty((m,), dtype=torch.float32, device=x.device)
-    spill_rotated = torch.empty((m, k), dtype=x.dtype, device=x.device)
-    spill_partials = torch.empty((m, k // 256), dtype=torch.float32, device=x.device)
+    spill_rotated = None
+    spill_partials = None
+    if hip._C.convrot_int8_needs_spill(m, k):
+        spill_rotated = torch.empty((m, k), dtype=x.dtype, device=x.device)
+        spill_partials = torch.empty((m, k // 256), dtype=torch.float32, device=x.device)
     for _ in range(warmup):
         hip._C.quantize_int8_convrot(
             hip._dl(x),
             hip._dl(q),
             hip._dl(scales),
-            hip._dl(spill_rotated),
-            hip._dl(spill_partials),
+            None if spill_rotated is None else hip._dl(spill_rotated),
+            None if spill_partials is None else hip._dl(spill_partials),
             m,
             k,
             group_size,
@@ -128,8 +131,8 @@ def _bench_hip_convrot_quant(
             hip._dl(x),
             hip._dl(q),
             hip._dl(scales),
-            hip._dl(spill_rotated),
-            hip._dl(spill_partials),
+            None if spill_rotated is None else hip._dl(spill_rotated),
+            None if spill_partials is None else hip._dl(spill_partials),
             m,
             k,
             group_size,

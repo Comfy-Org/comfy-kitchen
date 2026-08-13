@@ -2141,6 +2141,29 @@ def test_convrot_falls_back_to_eager_past_the_lds_bound(hip, dtype):
         )
 
 
+def test_convrot_spill_rotated_dtype_must_match_x(hip):
+    """spill_rotated is written as RowT derived from x; dtype must match."""
+    m, k = 2, 256
+    x = torch.randn(m, k, device=DEV, dtype=torch.float32)
+    q = torch.zeros(m, k, dtype=torch.int8, device=DEV)
+    scales = torch.zeros(m, dtype=torch.float32, device=DEV)
+    spill_rotated = torch.empty(m, k, dtype=torch.bfloat16, device=DEV)
+    spill_partials = torch.empty(m, k // 256, dtype=torch.float32, device=DEV)
+    with pytest.raises(RuntimeError, match="spill_rotated dtype must match x"):
+        hip._C.quantize_int8_convrot(
+            hip._dl(x),
+            hip._dl(q),
+            hip._dl(scales),
+            hip._dl(spill_rotated),
+            hip._dl(spill_partials),
+            m,
+            k,
+            256,
+            0,
+            hip._stream(x),
+        )
+
+
 def test_convrot_lds_bound_accounts_for_row_dtype(hip):
     max_fp32 = hip._C.convrot_max_k(hip.DTYPE_TO_CODE[torch.float32])
     max_fp16 = hip._C.convrot_max_k(hip.DTYPE_TO_CODE[torch.float16])
