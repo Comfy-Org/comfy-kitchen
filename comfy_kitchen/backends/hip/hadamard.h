@@ -33,6 +33,7 @@ inline void check_convrot_group_size(int group_size) {
 
 // The kernel's static LDS: butterfly workspace + row absmax reduction (up to 1024 threads).
 constexpr size_t kConvrotStaticLds = 2 * 1024 * sizeof(float);
+constexpr int kConvRotGroup256 = 256;
 
 // convrot_quant_kernel stages the whole rotated row in dynamic LDS, preserving
 // the input dtype's rounding contract. K is therefore bounded by both the
@@ -64,34 +65,55 @@ inline int convrot_max_k(int in_dtype) {
                             element_size);
 }
 
-// Max K for INT8 G=256 fused quant in LDS; larger K uses the global spill path.
-// 0 if the device LDS budget is unknown or too small (dtype-independent: fused widens to float).
-inline int convrot_fused_lds_max_k() {
-    int device = 0;
-    if (hipGetDevice(&device) != hipSuccess) {
-        return 0;
+inline int convrot_quant_fused_block_threads(int M, int K) {
+    if (M == 1) {
+        return 512;
     }
+    if (K == kConvRotGroup256) {
+        return 64;
+    }
+    if (K == 2560) {
+        return 640;
+    }
+    if (K == 6144) {
+        return 768;
+    }
+    return 1024;
+}
+
+inline bool convrot_fused_lds_fits(int K, int block_threads) {
+    if (block_threads <= 0 || (block_threads % 64) != 0) {
+        return false;
+    }
+    int device = 0;
     int lds = 0;
-    if (hipDeviceGetAttribute(&lds, hipDeviceAttributeMaxSharedMemoryPerBlock, device) !=
+    if (hipGetDevice(&device) != hipSuccess ||
+        hipDeviceGetAttribute(&lds, hipDeviceAttributeMaxSharedMemoryPerBlock, device) !=
             hipSuccess ||
         lds <= 0) {
-        return 0;
+        return false;
     }
-    // Fused path uses 1024-thread blocks for most shapes (including K=3840); that block
-    // size has the largest tmp footprint.
-    constexpr int kBlockThreads = 1024;
-    constexpr int kWarps = kBlockThreads / 32;
-    const size_t static_lds = kWarps * sizeof(float) + sizeof(float);
-    if (static_cast<size_t>(lds) <= static_lds) {
-        return 0;
+    const int groups_in_flight = block_threads / 64;
+    const size_t need =
+        (static_cast<size_t>(block_threads / 32) + 1) * sizeof(float) +
+        (static_cast<size_t>(K) + static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256) *
+            sizeof(float);
+    return need <= static_cast<size_t>(lds);
+}
+
+// Heuristic block first, then narrower blocks before global spill. Returns 0 to spill.
+inline int convrot_pick_fused_block_threads(int M, int K) {
+    const int preferred = convrot_quant_fused_block_threads(M, K);
+    if (convrot_fused_lds_fits(K, preferred)) {
+        return preferred;
     }
-    const size_t budget = static_cast<size_t>(lds) - static_lds;
-    const int groups_in_flight = kBlockThreads / 64;
-    const size_t overhead = static_cast<size_t>(groups_in_flight) * 2 * 256 * sizeof(float);
-    if (budget <= overhead) {
-        return 0;
+    static constexpr int kFallbackBlocks[] = {768, 640, 512, 64};
+    for (int block_threads : kFallbackBlocks) {
+        if (block_threads != preferred && convrot_fused_lds_fits(K, block_threads)) {
+            return block_threads;
+        }
     }
-    return static_cast<int>((budget - overhead) / sizeof(float));
+    return 0;
 }
 
 inline void check_convrot_k(int k, int group_size, int in_dtype, bool int8_quant = false) {
@@ -219,7 +241,6 @@ __forceinline__ __device__ float load_row_value<__half>(__half v) {
     return __half2float(v);
 }
 
-constexpr int kConvRotGroup256 = 256;
 constexpr int kWarpSize = 32;
 
 __forceinline__ __device__ float warp_reduce_max(float v) {
@@ -548,22 +569,6 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     }
 }
 
-inline int convrot_quant_fused_block_threads(int M, int K) {
-    if (M == 1) {
-        return 512;
-    }
-    if (K == kConvRotGroup256) {
-        return 64;
-    }
-    if (K == 2560) {
-        return 640;
-    }
-    if (K == 6144) {
-        return 768;
-    }
-    return 1024;
-}
-
 template <typename RowT, int ACT, int BLOCK_THREADS>
 inline void launch_convrot_quant_fused_impl(
     const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
@@ -763,13 +768,17 @@ inline void launch_convrot_quant(
     const void* x, int in_dtype, int8_t* qout, float* scaleout,
     int M, int K, int group_size, hipStream_t stream) {
 
-    // INT8 G=256: fused single-kernel quant when K fits in LDS, else global spill.
+    // INT8 G=256: fused when (M, K) fits in LDS, else global spill.
     if (!PACK_INT4 && group_size == 256) {
-        if (K > convrot_fused_lds_max_k()) {
+        const int block_threads = convrot_pick_fused_block_threads(M, K);
+        if (block_threads > 0) {
+            dispatch_convrot_row_type(
+                in_dtype,
+                LaunchConvrotQuantFusedForRow<ACT>{
+                    x, in_dtype, qout, scaleout, M, K, stream, block_threads});
+        } else {
             launch_convrot_quant_global_managed<ACT>(
                 x, in_dtype, qout, scaleout, M, K, stream);
-        } else {
-            launch_convrot_quant_fused<ACT>(x, in_dtype, qout, scaleout, M, K, stream);
         }
         return;
     }
