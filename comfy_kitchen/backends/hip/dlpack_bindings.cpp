@@ -403,7 +403,7 @@ void quantize_int8_rowwise(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
 
 // act_code folds an elementwise activation into the rotation's load.
 void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales,
-                           nb::object spill_rotated, nb::object spill_partials, int M, int K,
+                           OptArray spill_rotated, OptArray spill_partials, int M, int K,
                            int group_size, int act_code, uintptr_t stream_ptr) {
     constexpr const char* kFn = "quantize_int8_convrot";
     require_nonneg(M, kFn, "M");
@@ -419,20 +419,18 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
 
     void* spill_rotated_ptr = nullptr;
     void* spill_partials_ptr = nullptr;
-    if (!spill_rotated.is_none()) {
-        auto rotated = nb::cast<nb::ndarray<>>(spill_rotated);
-        require_dtype(rotated, 0, 2, kFn, "spill_rotated");
-        require_len(rotated, static_cast<int64_t>(M) * K, kFn, "spill_rotated");
-        if (map_dtype_to_code(rotated.dtype()) != map_dtype_to_code(x.dtype())) {
+    if (spill_rotated.has_value()) {
+        require_dtype(*spill_rotated, 0, 2, kFn, "spill_rotated");
+        require_len(*spill_rotated, static_cast<int64_t>(M) * K, kFn, "spill_rotated");
+        if (map_dtype_to_code(spill_rotated->dtype()) != map_dtype_to_code(x.dtype())) {
             throw std::runtime_error(std::string(kFn) + ": spill_rotated dtype must match x");
         }
-        spill_rotated_ptr = rotated.data();
+        spill_rotated_ptr = spill_rotated->data();
     }
-    if (!spill_partials.is_none()) {
-        auto partials = nb::cast<nb::ndarray<>>(spill_partials);
-        require_dtype(partials, 0, 0, kFn, "spill_partials");
-        require_len(partials, static_cast<int64_t>(M) * (K / 256), kFn, "spill_partials");
-        spill_partials_ptr = partials.data();
+    if (spill_partials.has_value()) {
+        require_dtype(*spill_partials, 0, 0, kFn, "spill_partials");
+        require_len(*spill_partials, static_cast<int64_t>(M) * (K / 256), kFn, "spill_partials");
+        spill_partials_ptr = spill_partials->data();
     }
 
     launch_quantize_int8_convrot_kernel(x.data(), map_dtype_to_code(x.dtype()), q.data(),

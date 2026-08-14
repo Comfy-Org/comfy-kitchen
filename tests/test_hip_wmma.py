@@ -380,20 +380,23 @@ def test_convrot_quantizer_folds_the_activation_in(hip):
     assert fused_s.shape == (x.shape[0],)
 
 
+@pytest.mark.parametrize("group_size", [16, 256])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_convrot_int8_preserves_input_dtype_precision(hip, dtype):
-    """The fused row buffer must not introduce a BF16-only rounding stage."""
-    group = 16
-    x = torch.zeros(2, 64, device=DEV, dtype=dtype)
+def test_convrot_int8_preserves_input_dtype_precision(hip, dtype, group_size):
+    """The fused row buffer must round to the input dtype before absmax, like legacy."""
+    k = group_size if group_size == 256 else group_size * 4
+    idx1 = group_size if group_size == 16 else group_size // 4
+    norm = (1.0 / float(group_size)) ** 0.5
+    x = torch.zeros(2, k, device=DEV, dtype=dtype)
     x[0, 0] = 1.001
-    x[1, 16] = 3.141
-    h = _build_hadamard(group, device=DEV, dtype=dtype)
+    x[1, idx1] = 3.141
+    h = _build_hadamard(group_size, device=DEV, dtype=dtype)
 
-    q_hip, scales_hip = hip.quantize_and_rotate_rowwise(x, h, group)
-    q_eager, scales_eager = eager_quantize_and_rotate_rowwise(x, h, group)
+    q_hip, scales_hip = hip.quantize_and_rotate_rowwise(x, h, group_size)
+    q_eager, scales_eager = eager_quantize_and_rotate_rowwise(x, h, group_size)
 
-    values = torch.stack((x[0, 0], x[1, 16]))
-    expected_rowmax = (values.float() * 0.25).to(dtype).float().abs()
+    values = torch.stack((x[0, 0], x[1, idx1]))
+    expected_rowmax = (values.float() * norm).to(dtype).float().abs()
     torch.testing.assert_close(scales_hip.reshape(-1) * 127.0, expected_rowmax, rtol=1e-6, atol=0)
     torch.testing.assert_close(scales_hip, scales_eager, rtol=1e-6, atol=0)
     assert (q_hip.int() - q_eager.int()).abs().max().item() <= 1

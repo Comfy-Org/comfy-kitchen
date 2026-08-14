@@ -338,7 +338,11 @@ __forceinline__ __device__ float convrot_fht_stage64_store_absmax_typed(
     output[base + S] = store_row_value<RowT>(y1);
     output[base + 2 * S] = store_row_value<RowT>(y2);
     output[base + 3 * S] = store_row_value<RowT>(y3);
-    return fmaxf(fmaxf(fabsf(y0), fabsf(y1)), fmaxf(fabsf(y2), fabsf(y3)));
+    const float a0 = fabsf(load_row_value(output[base]));
+    const float a1 = fabsf(load_row_value(output[base + S]));
+    const float a2 = fabsf(load_row_value(output[base + 2 * S]));
+    const float a3 = fabsf(load_row_value(output[base + 3 * S]));
+    return fmaxf(fmaxf(a0, a1), fmaxf(a2, a3));
 }
 
 template <typename RowT>
@@ -495,7 +499,7 @@ void launch_convrot_quant_global_managed(
     void* spill_rotated, void* spill_partials);
 
 // Fused single-kernel path: FHT in LDS, vectorized loads, warp-shuffle absmax.
-// One block per row; the rotated row stays in shared memory as float.
+// One block per row; the rotated row stays in shared memory as RowT.
 template <typename RowT, int BLOCK_THREADS, int ACT>
 __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     const void* __restrict__ x, int in_dtype, int8_t* __restrict__ qout,
@@ -505,9 +509,9 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     constexpr int kGroupsInFlight = BLOCK_THREADS / kGroupThreads;
     constexpr int kWarps = BLOCK_THREADS / kWarpSize;
 
-    extern __shared__ float smem[];
-    float* row_buf = smem;
-    float* tmp = smem + K;
+    extern __shared__ unsigned char smem_raw[];
+    RowT* row_buf = reinterpret_cast<RowT*>(smem_raw);
+    float* tmp = reinterpret_cast<float*>(smem_raw + static_cast<size_t>(K) * sizeof(RowT));
 
     __shared__ float warp_smem[kWarps];
     __shared__ float block_smem;
@@ -567,7 +571,9 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
 
         if (active) {
             abs_max = fmaxf(
-                abs_max, convrot_fht_stage64_store_absmax<64>(buf1, row_buf + group_col, lane));
+                abs_max,
+                convrot_fht_stage64_store_absmax_typed<64, RowT>(
+                    buf1, row_buf + group_col, lane));
         }
         __syncthreads();
     }
@@ -581,7 +587,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     }
 
     for (int col = tid; col < K; col += BLOCK_THREADS) {
-        const float v = row_buf[col];
+        const float v = load_row_value(row_buf[col]);
         int q = static_cast<int>(rintf(v * inv));
         q = q < -127 ? -127 : (q > 127 ? 127 : q);
         qout[row_offset + col] = static_cast<int8_t>(q);
@@ -594,8 +600,8 @@ inline bool launch_convrot_quant_fused_impl(
     hipStream_t stream) {
     const int groups_in_flight = BLOCK_THREADS / 64;
     const size_t shmem =
-        (static_cast<size_t>(K) + static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256) *
-        sizeof(float);
+        static_cast<size_t>(K) * sizeof(RowT) +
+        static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256 * sizeof(float);
     auto kernel = convrot_quant_fused_kernel<RowT, BLOCK_THREADS, ACT>;
     const hipError_t attr_err = hipFuncSetAttribute(
         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize,
