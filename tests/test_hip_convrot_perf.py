@@ -105,40 +105,42 @@ def _bench_hip_convrot_quant(
     m, k = x.shape
     q = torch.empty((m, k), dtype=torch.int8, device=x.device)
     scales = torch.empty((m,), dtype=torch.float32, device=x.device)
-    spill_rotated = None
-    spill_partials = None
-    if hip._C.convrot_int8_needs_spill(m, k):
-        spill_rotated = torch.empty((m, k), dtype=x.dtype, device=x.device)
-        spill_partials = torch.empty((m, k // 256), dtype=torch.float32, device=x.device)
-    for _ in range(warmup):
-        hip._C.quantize_int8_convrot(
-            hip._dl(x),
-            hip._dl(q),
-            hip._dl(scales),
-            None if spill_rotated is None else hip._dl(spill_rotated),
-            None if spill_partials is None else hip._dl(spill_partials),
-            m,
-            k,
-            group_size,
-            0,
-            hip._stream(x),
-        )
+    with torch.cuda.device(x.device):
+        spill_rotated = None
+        spill_partials = None
+        if hip._C.convrot_int8_needs_spill(m, k):
+            spill_rotated = torch.empty((m, k), dtype=x.dtype, device=x.device)
+            spill_partials = torch.empty((m, k // 256), dtype=torch.float32, device=x.device)
+        for _ in range(warmup):
+            hip._C.quantize_int8_convrot(
+                hip._dl(x),
+                hip._dl(q),
+                hip._dl(scales),
+                None if spill_rotated is None else hip._dl(spill_rotated),
+                None if spill_partials is None else hip._dl(spill_partials),
+                m,
+                k,
+                group_size,
+                0,
+                hip._stream(x),
+            )
     _sync(x.device)
     times: list[float] = []
     for _ in range(iters):
         t0 = time.perf_counter()
-        hip._C.quantize_int8_convrot(
-            hip._dl(x),
-            hip._dl(q),
-            hip._dl(scales),
-            None if spill_rotated is None else hip._dl(spill_rotated),
-            None if spill_partials is None else hip._dl(spill_partials),
-            m,
-            k,
-            group_size,
-            0,
-            hip._stream(x),
-        )
+        with torch.cuda.device(x.device):
+            hip._C.quantize_int8_convrot(
+                hip._dl(x),
+                hip._dl(q),
+                hip._dl(scales),
+                None if spill_rotated is None else hip._dl(spill_rotated),
+                None if spill_partials is None else hip._dl(spill_partials),
+                m,
+                k,
+                group_size,
+                0,
+                hip._stream(x),
+            )
         _sync(x.device)
         times.append(time.perf_counter() - t0)
     return _mean_ms(times)
