@@ -416,3 +416,23 @@ def test_sub_sm80_rejected_at_the_wrapper(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (7, 5))
     with pytest.raises(RuntimeError, match="sm_80"):
         cuda_backend.sol_attn(q, k, v, tau=1.4)
+
+
+@pytest.mark.parametrize("centroid_tail", [True, False])
+def test_reuse_qkv_memory_matches_and_uses_fused_storage(centroid_tail):
+    """reuse_qkv_memory=True writes `out` into the inputs' storage. Modeled on H3:
+    q/k/v are chunk views of one fused qkv buffer that the model discards
+    after attention, so on one stream the region is free once the preprocess
+    (the only reader of the originals) is done."""
+    from comfy_kitchen.backends import cuda as cuda_backend
+    g = torch.Generator(device="cuda").manual_seed(0)
+    fused = torch.randn(1, 2048, 3 * 4 * HD, device="cuda", dtype=torch.bfloat16,
+                        generator=g) * 0.5
+    q, k, v = (x.view(1, 2048, 4, HD) for x in fused.split(4 * HD, dim=-1))
+    ref = cuda_backend.sol_attn(q.clone().contiguous(), k.clone().contiguous(),
+                                v.clone().contiguous(), tau=1.4,
+                                centroid_tail=centroid_tail)
+    got = cuda_backend.sol_attn(q, k, v, tau=1.4, centroid_tail=centroid_tail,
+                                reuse_qkv_memory=True)
+    assert torch.equal(got, ref)
+    assert got.untyped_storage().data_ptr() == fused.untyped_storage().data_ptr()

@@ -2327,6 +2327,7 @@ def sol_attn(
     workspace: torch.Tensor | None = None,
     centroid_tail: bool = True,
     key_bias: torch.Tensor | None = None,
+    reuse_qkv_memory: bool = False,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 tensors.
     See ops/sol_attn.cu."""
@@ -2375,7 +2376,22 @@ def sol_attn(
         from ..eager.sol_attn import _normalize_key_bias
         key_bias = _normalize_key_bias(key_bias, batch, t, q.device)
         kb = (key_bias * 1.4426950408889634).expand(batch, t).contiguous()
-    out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    if reuse_qkv_memory:
+        # q/k/v are read only by the preprocess, and `out` is written only by
+        # later kernels on the same stream, so their storage can hold the
+        # output. Raw-storage reuse, so fused qkv chunk views work too. The
+        # caller must not touch q/k/v afterwards -- their contents are gone.
+        need_out = batch * t * h * d * q.element_size()
+        for cand in (q, k, v):
+            storage = cand.untyped_storage()
+            if storage.nbytes() >= need_out:
+                out = torch.empty(0, dtype=q.dtype, device=q.device)
+                out.set_(storage, 0, (batch, t, h, d))
+                break
+        else:  # unreachable: q alone is exactly need_out bytes
+            raise ValueError("sol_attn: no input storage large enough for out")
+    else:
+        out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     need = _C.sol_attn_workspace(batch, t, h, max_blocks)
     if workspace is None:
         workspace = torch.empty(need, dtype=torch.uint8, device=q.device)
