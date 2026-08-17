@@ -149,7 +149,7 @@ def test_int8_linear_convrot_matches_eager():
 @needs_wmma
 @pytest.mark.parametrize("k", [3840, 10240, 17408])
 def test_int8_linear_convrot_large_k_matches_eager(k):
-    """G=256 INT8 convrot: fused LDS (3840), large K (10240), global spill (17408) vs eager."""
+    """G=256 INT8 convrot: fused (3840, 10240), global spill (17408) vs eager."""
     torch.manual_seed(k)
     m, n = 64, 256
     x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
@@ -2165,6 +2165,14 @@ def test_convrot_spill_rotated_dtype_must_match_x(hip):
             0,
             hip._stream(x),
         )
+
+
+@needs_wmma
+def test_convrot_int8_needs_spill_probe(hip):
+    in_code = hip.DTYPE_TO_CODE[torch.bfloat16]
+    with torch.cuda.device(DEV):
+        assert not hip._C.convrot_int8_needs_spill(4128, 10240, in_code)
+        assert hip._C.convrot_int8_needs_spill(4128, 17408, in_code)
 
 
 def test_convrot_lds_bound_accounts_for_row_dtype(hip):

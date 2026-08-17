@@ -31,9 +31,11 @@ inline void check_convrot_group_size(int group_size) {
     }
 }
 
-// Legacy convrot_quant_kernel static LDS: butterfly workspace + row absmax reduction.
-// Sized for 256-thread blocks; the kernel uses g[BLOCK_THREADS] / red[BLOCK_THREADS].
-constexpr size_t kConvrotStaticLds = 2 * 256 * sizeof(float);
+// Legacy convrot_quant_kernel static LDS: g[BLOCK_THREADS] + red[BLOCK_THREADS].
+inline size_t convrot_static_lds_bytes(int block_threads) {
+    return 2 * static_cast<size_t>(block_threads) * sizeof(float);
+}
+
 constexpr int kConvRotGroup256 = 256;
 
 // convrot_quant_kernel stages the whole rotated row in dynamic LDS, preserving
@@ -47,9 +49,9 @@ inline size_t convrot_row_element_size(int in_dtype) {
     return 0;
 }
 
-inline int convrot_max_k(int in_dtype) {
+inline int convrot_max_k(int in_dtype, int block_threads = 256) {
     const size_t element_size = convrot_row_element_size(in_dtype);
-    if (element_size == 0) {
+    if (element_size == 0 || block_threads <= 0) {
         return 0;
     }
     int device = 0;
@@ -58,12 +60,14 @@ inline int convrot_max_k(int in_dtype) {
     }
     int lds = 0;
     if (hipDeviceGetAttribute(&lds, hipDeviceAttributeMaxSharedMemoryPerBlock, device) !=
-            hipSuccess ||
-        lds <= static_cast<int>(kConvrotStaticLds)) {
+            hipSuccess) {
         return 0;
     }
-    return static_cast<int>((static_cast<size_t>(lds) - kConvrotStaticLds) /
-                            element_size);
+    const size_t static_lds = convrot_static_lds_bytes(block_threads);
+    if (lds <= static_cast<int>(static_lds)) {
+        return 0;
+    }
+    return static_cast<int>((static_cast<size_t>(lds) - static_lds) / element_size);
 }
 
 inline int convrot_quant_fused_block_threads(int M, int K) {
@@ -87,24 +91,17 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
 }
 
 inline int convrot_device_lds_limit() {
-    static int cached_device = -1;
-    static int cached_lds = 0;
     int device = 0;
     if (hipGetDevice(&device) != hipSuccess) {
         return 0;
     }
-    if (device != cached_device) {
-        int lds = 0;
-        if (hipDeviceGetAttribute(&lds, hipDeviceAttributeMaxSharedMemoryPerBlock, device) !=
-                hipSuccess ||
-            lds <= 0) {
-            cached_lds = 0;
-        } else {
-            cached_lds = lds;
-        }
-        cached_device = device;
+    int lds = 0;
+    if (hipDeviceGetAttribute(&lds, hipDeviceAttributeMaxSharedMemoryPerBlock, device) !=
+            hipSuccess ||
+        lds <= 0) {
+        return 0;
     }
-    return cached_lds;
+    return lds;
 }
 
 inline bool convrot_fused_lds_fits(int K, int block_threads, int in_dtype) {
@@ -142,6 +139,18 @@ inline int convrot_pick_fused_block_threads(int M, int K, int in_dtype) {
     return 0;
 }
 
+// Mirrors launch_convrot_quant() spill fallback for Python buffer allocation.
+inline bool convrot_int8_needs_spill_buffers(int M, int K, int in_dtype) {
+    if (M <= 0 || K <= 0 || (K % kConvRotGroup256) != 0) {
+        return false;
+    }
+    if (convrot_row_element_size(in_dtype) == 0 || convrot_device_lds_limit() <= 0) {
+        return true;
+    }
+    const int block = convrot_pick_fused_block_threads(M, K, in_dtype);
+    return block == 0 || !convrot_fused_lds_fits(K, block, in_dtype);
+}
+
 inline void check_convrot_k(int k, int group_size, int in_dtype, bool int8_quant = false) {
     // The kernel rotates K/G whole groups but reads back all K entries of the row
     // buffer, so a partial trailing group would quantize uninitialized LDS.
@@ -154,7 +163,8 @@ inline void check_convrot_k(int k, int group_size, int in_dtype, bool int8_quant
     if (int8_quant && group_size == 256) {
         return;
     }
-    const int max_k = convrot_max_k(in_dtype);
+    const int legacy_bt = (group_size == 256 && k >= 512) ? 1024 : 256;
+    const int max_k = convrot_max_k(in_dtype, legacy_bt);
     if (max_k <= 0 || k > max_k) {
         throw std::runtime_error("convrot: K=" + std::to_string(k) +
                                  " does not fit in LDS (max " + std::to_string(max_k) + ")");
