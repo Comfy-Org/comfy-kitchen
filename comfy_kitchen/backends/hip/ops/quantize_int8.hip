@@ -270,13 +270,13 @@ extern "C" void launch_quantize_int8_convrot_kernel(
     }
 }
 
-// Returns 1 when INT8 G=256 must use the global spill path for (M, K) on this device.
-extern "C" int convrot_int8_needs_spill_host(int M, int K) {
+// Returns 1 when INT8 G=256 must use the global spill path for (M, K, in_dtype).
+extern "C" int convrot_int8_needs_spill_host(int M, int K, int in_code) {
     using namespace comfy::hip_backend;
     if (M <= 0 || K <= 0 || (K % kConvRotGroup256) != 0) {
         return 0;
     }
-    return convrot_pick_fused_block_threads(M, K) == 0 ? 1 : 0;
+    return convrot_pick_fused_block_threads(M, K, in_code) == 0 ? 1 : 0;
 }
 
 // scratch is a 4-byte device buffer, pre-zeroed by the caller.

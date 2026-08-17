@@ -59,7 +59,7 @@ void launch_dequantize_int8_convrot_weight_kernel(const void*, const void*, void
 void launch_convrot_quant_int4_kernel(const void*, int, void*, void*, int, int, int, hipStream_t);
 void launch_unpack_int4_kernel(const void*, void*, int64_t, hipStream_t);
 int convrot_max_k_host(int);
-int convrot_int8_needs_spill_host(int, int);
+int convrot_int8_needs_spill_host(int, int, int);
 
 void launch_quantize_w4a8_convrot_kernel(const void*, const void*, void*, void*, void*, int64_t,
                                          int64_t, int, bool, uint64_t, hipStream_t);
@@ -1380,7 +1380,8 @@ NB_MODULE(_C, m) {
     m.def("dequantize_int8_convrot_weight", &dequantize_int8_convrot_weight);
     m.def("convrot_quant_int4", &convrot_quant_int4);
     m.def("convrot_max_k", &convrot_max_k_host);
-    m.def("convrot_int8_needs_spill", &convrot_int8_needs_spill_host);
+    m.def("convrot_int8_needs_spill", &convrot_int8_needs_spill_host, nb::arg("m"),
+          nb::arg("k"), nb::arg("in_code"));
     m.def("unpack_int4", &unpack_int4);
     m.def("dequant_int4_grouped_to_int8", &dequant_int4_grouped_to_int8);
     m.def("quantize_w4a8_convrot", &quantize_w4a8_convrot);

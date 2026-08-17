@@ -79,6 +79,10 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
     if (K == 6144) {
         return 768;
     }
+    // Empirical block-size tuning for K=10240 (640 over default).
+    if (K == 10240) {
+        return 640;
+    }
     return 1024;
 }
 
@@ -103,8 +107,12 @@ inline int convrot_device_lds_limit() {
     return cached_lds;
 }
 
-inline bool convrot_fused_lds_fits(int K, int block_threads) {
+inline bool convrot_fused_lds_fits(int K, int block_threads, int in_dtype) {
     if (block_threads <= 0 || (block_threads % 64) != 0) {
+        return false;
+    }
+    const size_t row_element_size = convrot_row_element_size(in_dtype);
+    if (row_element_size == 0) {
         return false;
     }
     const int lds = convrot_device_lds_limit();
@@ -114,20 +122,20 @@ inline bool convrot_fused_lds_fits(int K, int block_threads) {
     const int groups_in_flight = block_threads / 64;
     const size_t need =
         (static_cast<size_t>(block_threads / 32) + 1) * sizeof(float) +
-        (static_cast<size_t>(K) + static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256) *
-            sizeof(float);
+        static_cast<size_t>(K) * row_element_size +
+        static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256 * sizeof(float);
     return need <= static_cast<size_t>(lds);
 }
 
 // Heuristic block first, then narrower blocks before global spill. Returns 0 to spill.
-inline int convrot_pick_fused_block_threads(int M, int K) {
+inline int convrot_pick_fused_block_threads(int M, int K, int in_dtype) {
     const int preferred = convrot_quant_fused_block_threads(M, K);
-    if (convrot_fused_lds_fits(K, preferred)) {
+    if (convrot_fused_lds_fits(K, preferred, in_dtype)) {
         return preferred;
     }
     static constexpr int kFallbackBlocks[] = {768, 640, 512, 64};
     for (int block_threads : kFallbackBlocks) {
-        if (block_threads < preferred && convrot_fused_lds_fits(K, block_threads)) {
+        if (block_threads < preferred && convrot_fused_lds_fits(K, block_threads, in_dtype)) {
             return block_threads;
         }
     }
@@ -788,7 +796,7 @@ inline void launch_convrot_quant(
 
     // INT8 G=256: fused when (M, K) fits in LDS, else caller-owned global spill.
     if (!PACK_INT4 && group_size == 256) {
-        const int block_threads = convrot_pick_fused_block_threads(M, K);
+        const int block_threads = convrot_pick_fused_block_threads(M, K, in_dtype);
         if (block_threads > 0) {
             bool launched = false;
             dispatch_convrot_row_type(

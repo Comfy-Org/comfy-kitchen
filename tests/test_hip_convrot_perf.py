@@ -14,6 +14,9 @@ import pytest
 import torch
 
 from comfy_kitchen.backends.eager.quantization import (
+    DTYPE_TO_CODE,
+)
+from comfy_kitchen.backends.eager.quantization import (
     quantize_and_rotate_rowwise as eager_quantize_and_rotate_rowwise,
 )
 from comfy_kitchen.tensor.int8_utils import _build_hadamard
@@ -107,7 +110,7 @@ def _bench_hip_convrot_quant(
     with torch.cuda.device(x.device):
         spill_rotated = None
         spill_partials = None
-        if hip._C.convrot_int8_needs_spill(m, k):
+        if hip._C.convrot_int8_needs_spill(m, k, DTYPE_TO_CODE[x.dtype]):
             spill_rotated = torch.empty((m, k), dtype=x.dtype, device=x.device)
             spill_partials = torch.empty((m, k // 256), dtype=torch.float32, device=x.device)
         for _ in range(warmup):
