@@ -137,6 +137,7 @@ set(CUDA_SOURCES
     ops/awq_w4a16.cu
     ops/w4a8_gemm.cu
     ops/adaln.cu
+    attention/sol_attention.cu
     ops/flash_decode.cu
     sage_attention/quant_v_int8.cu
     sage_attention/quant_qk_int8.cu

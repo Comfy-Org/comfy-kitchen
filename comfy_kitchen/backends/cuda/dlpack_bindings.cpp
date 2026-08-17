@@ -171,6 +171,12 @@ extern "C" {
         int input_dtype_code,
         cudaStream_t stream);
 
+    void launch_sol_attention_bf16(
+        const void* q, const void* k, const void* v, void* output,
+        void* kc, void* vc, void* key_mean, void* key_variance,
+        void* threshold, int batch, int heads, int sequence_length,
+        float tau, float scale, cudaStream_t stream);
+
     // SageAttention kernel launchers
     void launch_quant_qk_per_thread_int8(
         const void* q, void* q_int8, void* q_scale,
@@ -834,6 +840,100 @@ void rms_rope1(nb::ndarray<nb::device::cuda> q,
       epsilon, input_dtype_code,
       freqs_dtype_code, scale_dtype_code, false, split_half,
       reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+// Fused SOL preprocessing + BF16 attention. All tensors are contiguous BHND.
+void sol_attention_bf16(
+    nb::ndarray<nb::device::cuda> q,
+    nb::ndarray<nb::device::cuda> k,
+    nb::ndarray<nb::device::cuda> v,
+    nb::ndarray<nb::device::cuda> output,
+    nb::ndarray<nb::device::cuda> kc,
+    nb::ndarray<nb::device::cuda> vc,
+    nb::ndarray<nb::device::cuda> key_mean,
+    nb::ndarray<nb::device::cuda> key_variance,
+    nb::ndarray<nb::device::cuda> threshold,
+    float tau,
+    float scale,
+    uintptr_t stream_ptr)
+{
+    if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || output.ndim() != 4) {
+        throw std::runtime_error("sol_attention_bf16: q, k, v, and output must be [B,H,N,D]");
+    }
+    if (map_dtype_to_code(q.dtype()) != 2 ||
+        map_dtype_to_code(k.dtype()) != 2 ||
+        map_dtype_to_code(v.dtype()) != 2 ||
+        map_dtype_to_code(output.dtype()) != 2) {
+        throw std::runtime_error("sol_attention_bf16: q, k, v, and output must be bfloat16");
+    }
+
+    const int batch = static_cast<int>(q.shape(0));
+    const int heads = static_cast<int>(q.shape(1));
+    const int sequence_length = static_cast<int>(q.shape(2));
+    constexpr int head_dim = 128;
+    const int num_blocks = sequence_length / 64;
+    if (q.shape(3) != head_dim || k.shape(0) != q.shape(0) ||
+        k.shape(1) != q.shape(1) || k.shape(2) != q.shape(2) ||
+        k.shape(3) != q.shape(3) || v.shape(0) != q.shape(0) ||
+        v.shape(1) != q.shape(1) || v.shape(2) != q.shape(2) ||
+        v.shape(3) != q.shape(3) || output.shape(0) != q.shape(0) ||
+        output.shape(1) != q.shape(1) || output.shape(2) != q.shape(2) ||
+        output.shape(3) != q.shape(3)) {
+        throw std::runtime_error("sol_attention_bf16: q, k, v, and output shapes must match with D=128");
+    }
+    if (sequence_length <= 0 || sequence_length % 64 != 0) {
+        throw std::runtime_error("sol_attention_bf16: sequence length must be positive and divisible by 64");
+    }
+    if (num_blocks > 64 * head_dim) {
+        throw std::runtime_error("sol_attention_bf16: sequence length exceeds routing scratch capacity");
+    }
+
+    const auto contiguous_bhnd = [](const auto &tensor) {
+        int64_t expected_stride = 1;
+        for (int dimension = 3; dimension >= 0; --dimension) {
+            if (tensor.shape(dimension) > 1 &&
+                tensor.stride(dimension) != expected_stride) {
+                return false;
+            }
+            expected_stride *= static_cast<int64_t>(tensor.shape(dimension));
+        }
+        return true;
+    };
+    if (!contiguous_bhnd(q) || !contiguous_bhnd(k) ||
+        !contiguous_bhnd(v) || !contiguous_bhnd(output)) {
+        throw std::runtime_error("sol_attention_bf16: q, k, v, and output must be contiguous");
+    }
+
+    if (kc.ndim() != 4 || vc.ndim() != 4 ||
+        kc.shape(0) != q.shape(0) || kc.shape(1) != q.shape(1) ||
+        kc.shape(2) != static_cast<size_t>(num_blocks) || kc.shape(3) != 128 ||
+        vc.shape(0) != kc.shape(0) || vc.shape(1) != kc.shape(1) ||
+        vc.shape(2) != kc.shape(2) || vc.shape(3) != kc.shape(3) ||
+        map_dtype_to_code(kc.dtype()) != 2 || map_dtype_to_code(vc.dtype()) != 2) {
+        throw std::runtime_error("sol_attention_bf16: invalid BF16 block-summary scratch");
+    }
+    if (key_mean.ndim() != 3 || key_variance.ndim() != 3 ||
+        key_mean.shape(0) != q.shape(0) || key_mean.shape(1) != q.shape(1) ||
+        key_mean.shape(2) != 128 ||
+        key_variance.shape(0) != key_mean.shape(0) ||
+        key_variance.shape(1) != key_mean.shape(1) ||
+        key_variance.shape(2) != key_mean.shape(2) ||
+        map_dtype_to_code(key_mean.dtype()) != 0 ||
+        map_dtype_to_code(key_variance.dtype()) != 0) {
+        throw std::runtime_error("sol_attention_bf16: invalid FP32 centroid-stat scratch");
+    }
+    if (threshold.ndim() != 3 || threshold.shape(0) != q.shape(0) ||
+        threshold.shape(1) != q.shape(1) ||
+        threshold.shape(2) != static_cast<size_t>(num_blocks) ||
+        map_dtype_to_code(threshold.dtype()) != 0) {
+        throw std::runtime_error("sol_attention_bf16: invalid FP32 threshold scratch");
+    }
+
+    launch_sol_attention_bf16(
+        q.data(), k.data(), v.data(), output.data(), kc.data(), vc.data(),
+        key_mean.data(), key_variance.data(), threshold.data(), batch, heads,
+        sequence_length, tau, scale,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper: signed INT8 V quantization
@@ -3559,6 +3659,21 @@ NB_MODULE(_C, m) {
           nb::arg("output"),
           nb::arg("block_scales"),
           nb::arg("pad_32x") = false,
+          nb::arg("stream_ptr"));
+
+    m.def("sol_attention_bf16", &sol_attention_bf16,
+          "Fused block-summary preprocessing and BF16 SOL attention",
+          nb::arg("q"),
+          nb::arg("k"),
+          nb::arg("v"),
+          nb::arg("output"),
+          nb::arg("kc"),
+          nb::arg("vc"),
+          nb::arg("key_mean"),
+          nb::arg("key_variance"),
+          nb::arg("threshold"),
+          nb::arg("tau"),
+          nb::arg("scale"),
           nb::arg("stream_ptr"));
 
     m.def("_quant_v_int8", &quant_v_int8,

@@ -37,6 +37,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "attention/mma.cuh"
+
 namespace {
 
 constexpr int BK = 32;         // keys per inner tile (4 n8 mma tiles)
@@ -59,35 +61,7 @@ __device__ inline void axis_window(int i, int k, int len, bool causal, int& lo, 
     }
 }
 
-template <typename T> struct MmaTraits;
-
-template <> struct MmaTraits<__half> {
-    static __device__ inline void mma(float* d, const uint32_t* a, const uint32_t* b) {
-        asm volatile(
-            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-    }
-    static __device__ inline uint32_t pack(float lo, float hi) {
-        __half2 p = __floats2half2_rn(lo, hi);
-        return *reinterpret_cast<uint32_t*>(&p);
-    }
-};
-
-template <> struct MmaTraits<__nv_bfloat16> {
-    static __device__ inline void mma(float* d, const uint32_t* a, const uint32_t* b) {
-        asm volatile(
-            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-    }
-    static __device__ inline uint32_t pack(float lo, float hi) {
-        __nv_bfloat162 p = __floats2bfloat162_rn(lo, hi);
-        return *reinterpret_cast<uint32_t*>(&p);
-    }
-};
+using comfy::attention::MmaTraits;
 
 // mma.m16n8k16 fragment maps (PTX ISA), lane = g*4 + q (g = lane>>2, q = lane&3):
 //   A (16x16):  a0=(g, 2q..2q+1) a1=(g+8, 2q..2q+1) a2=(g, 2q+8..2q+9) a3=(g+8, 2q+8..2q+9)

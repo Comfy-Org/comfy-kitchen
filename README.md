@@ -20,6 +20,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `na3d`                      | ✓     | ✓    | ✓      | ✓   |
 | `na2d`                      | ✓     | ✓    | ✓      | ✓   |
 | `int8_attention`            |       | ✓    |        | ✓   |
+| `sol_attention`             |       | ✓    |        |     |
 | `apply_rope`                | ✓     | ✓    | ✓      | ✓   |
 | `apply_rope1`               | ✓     | ✓    | ✓      | ✓   |
 | `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   |
@@ -44,6 +45,25 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 
 Each of the eight rope entries also has an in-place form (`apply_rope_`,
 `rms_rope_split_half1_`, ...) with the same backend coverage as the row above.
+
+## SOL attention
+
+`sol_attention` provides BF16 block-sparse self-attention on NVIDIA SM80 and
+newer GPUs. It keeps the standard `[batch, heads, sequence, head_dim]` layout,
+builds 64-token K/V summaries internally, and routes locally important blocks
+through exact attention while approximating the remaining blocks.
+
+```python
+import comfy_kitchen as ck
+
+if ck.sol_attention_is_available():
+    output = ck.sol_attention(query, key, value, tau=1.0)
+```
+
+The initial kernel supports BF16 Q/K/V with matching shapes, head dimension
+128, and sequence lengths divisible by 64. `tau` controls routing sparsity:
+larger values generally select fewer exact blocks. `scale` defaults to
+`head_dim ** -0.5` and can be supplied explicitly.
 
 ## HIP backend (AMD RDNA2 / RDNA3 / RDNA3.5 / RDNA4)
 

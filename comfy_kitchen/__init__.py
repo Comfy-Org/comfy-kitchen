@@ -24,6 +24,8 @@ from .sage_attention import (
     prequantize_int8_attention,
 )
 from .sage_attention import is_available as int8_attention_is_available
+from .sol_attention import is_available as sol_attention_is_available
+from .sol_attention import sol_attention
 from .tensor.convrot_w4a4 import (
     convrot_w4a4_linear,
     dequantize_convrot_w4a4_weight,
@@ -58,6 +60,8 @@ __all__ = [
     "int8_attention_from_prequantized",
     "int8_attention_is_available",
     "prequantize_int8_attention",
+    "sol_attention",
+    "sol_attention_is_available",
     "flash_attention_decode",
     "flash_attention_decode_is_available",
     "na2d",
