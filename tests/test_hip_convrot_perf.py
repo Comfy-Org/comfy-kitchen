@@ -17,7 +17,6 @@ from comfy_kitchen.backends.eager.quantization import (
     quantize_and_rotate_rowwise as eager_quantize_and_rotate_rowwise,
 )
 from comfy_kitchen.tensor.int8_utils import _build_hadamard
-
 from tests.test_hip_wmma import DEV, _unavailable_reason, needs_wmma
 
 _UNAVAILABLE = _unavailable_reason()
