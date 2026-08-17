@@ -34,7 +34,7 @@ pytestmark = [
 # Z-Image Turbo INT8 activation quant shapes (G=256 bf16).
 ZIMAGE_FUSED_SHAPE = (4128, 3840)       # fused LDS path on RDNA4
 ZIMAGE_LARGE_K_SHAPE = (4128, 10240)    # large K; often still fused on dGPU (64 KB LDS)
-ZIMAGE_SPILL_SHAPE = (4128, 17408)      # K above fused LDS ceiling -> global spill
+ZIMAGE_SPILL_SHAPE = (4128, 32768)      # K above any fused fallback on 64 KiB LDS
 
 COL_FUSED_GLOBAL = "Fused/global"
 COL_EAGER_CONVROT = "Eager ConvRot"
@@ -180,9 +180,9 @@ def hip():
     [
         (ZIMAGE_FUSED_SHAPE, "fused_k3840"),
         (ZIMAGE_LARGE_K_SHAPE, "large_k10240"),
-        (ZIMAGE_SPILL_SHAPE, "spill_k17408"),
+        (ZIMAGE_SPILL_SHAPE, "spill_k32768"),
     ],
-    ids=["fused_k3840", "large_k10240", "spill_k17408"],
+    ids=["fused_k3840", "large_k10240", "spill_k32768"],
 )
 def test_convrot_quant_hip_faster_than_eager(hip, shape, label):
     """HIP fused/global ConvRot quant should beat the eager Python path on Z-Image shapes."""
