@@ -3,7 +3,7 @@
 // BF16 SOL attention: fused summary preprocessing, block routing, approximate
 // centroid attention, and exact attention for locally important blocks.
 
-#include "attention/sol_common.cuh"
+#include "sage_attention/sol_common.cuh"
 
 #include <float.h>
 #include <stdint.h>

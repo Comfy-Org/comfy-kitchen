@@ -37,7 +37,7 @@
 #include <stdexcept>
 #include <string>
 
-#include "attention/mma.cuh"
+#include "sage_attention/mma.cuh"
 
 namespace {
 
@@ -61,7 +61,7 @@ __device__ inline void axis_window(int i, int k, int len, bool causal, int& lo, 
     }
 }
 
-using comfy::attention::MmaTraits;
+using mma::MmaTraits;
 
 // mma.m16n8k16 fragment maps (PTX ISA), lane = g*4 + q (g = lane>>2, q = lane&3):
 //   A (16x16):  a0=(g, 2q..2q+1) a1=(g+8, 2q..2q+1) a2=(g, 2q+8..2q+9) a3=(g+8, 2q+8..2q+9)

@@ -10,8 +10,8 @@
 
 #include <cstdint>
 
-#include "attention/mma.cuh"
 #include "sage_attention/cp_async.cuh"
+#include "sage_attention/mma.cuh"
 
 namespace comfy::sol_attention {
 
@@ -83,17 +83,21 @@ copy_bf16_tile_masked(uint32_t destination, const nv_bfloat16 *source,
 
 __device__ __forceinline__ void ldmatrix_x4(uint32_t *registers,
                                             uint32_t address) {
-  comfy::attention::ldmatrix_x4(registers, address);
+  mma::ldmatrix_m8n8x4(
+      registers,
+      static_cast<nv_bfloat16 *>(__cvta_shared_to_generic(address)));
 }
 
 __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t *registers,
                                                   uint32_t address) {
-  comfy::attention::ldmatrix_x4_trans(registers, address);
+  mma::ldmatrix_m8n8x4_trans(
+      registers,
+      static_cast<nv_bfloat16 *>(__cvta_shared_to_generic(address)));
 }
 
 __device__ __forceinline__ void mma_bf16(uint32_t *a, uint32_t *b,
                                          float *accumulator) {
-  comfy::attention::MmaTraits<nv_bfloat16>::mma(accumulator, a, b);
+  mma::MmaTraits<nv_bfloat16>::mma(accumulator, a, b);
 }
 
 } // namespace comfy::sol_attention

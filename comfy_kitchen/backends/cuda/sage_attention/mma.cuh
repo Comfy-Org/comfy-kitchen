@@ -1,7 +1,9 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // Derived from SageAttention (https://github.com/thu-ml/SageAttention), commit
 // d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5. Modified to compose its SM80
-// m16n8k32 INT8 fragments from SM75 m8n8k16 instructions on Turing.
+// m16n8k32 INT8 fragments from SM75 m8n8k16 instructions on Turing and to
+// share typed FP16/BF16 m16n8k16 primitives with Comfy attention kernels.
 
 /*
  * Adapted from Flashinfer,
@@ -34,6 +36,7 @@ namespace mma {
 #if (__CUDACC_VER_MAJOR__ >= 11)
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 800))
 #define MMA_F16F16F32_M16N8K16_ENABLED
+#define MMA_BF16BF16F32_M16N8K16_ENABLED
 #define MMA_F16F16F16_M16N8K16_ENABLED
 #define MMA_S8S8S32_M16N8K32_ENABLED
 #define MMA_S4S4S32_M16N8K64_ENABLED
@@ -804,5 +807,62 @@ __device__ __forceinline__ void rowsum_f8f8f32(float *d, uint32_t *s) {
   RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
 #endif
 }
+
+/*!
+ * \brief Wrapper of the mma m16n8k16 instruction for row-major and
+ * column-major BF16 matrix multiplication, accumulated in FP32.
+ */
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void
+mma_sync_m16n8k16_row_col_bf16bf16f32(float *C, uint32_t *A, uint32_t *B) {
+#ifdef MMA_BF16BF16F32_M16N8K16_ENABLED
+  if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+                 "{%10, %11, %12, %13};\n"
+                 : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+                 : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                   "r"(B[0]), "r"(B[1]), "f"(C[0]), "f"(C[1]),
+                   "f"(C[2]), "f"(C[3]));
+  } else {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+                 "{%10, %11, %12, %13};\n"
+                 : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+                 : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                   "r"(B[0]), "r"(B[1]), "f"(0.f), "f"(0.f), "f"(0.f),
+                   "f"(0.f));
+  }
+#else
+  RUNTIME_ASSERT("Unsupported CUDA architecture for BF16 mma instruction");
+#endif
+}
+
+// Shared typed adapter for kernels that support FP16 and BF16 fragments.
+template <typename T> struct MmaTraits;
+
+template <> struct MmaTraits<__half> {
+  static __device__ __forceinline__ void mma(float *C, uint32_t *A,
+                                              uint32_t *B) {
+    mma_sync_m16n8k16_row_col_f16f16f32(C, A, B);
+  }
+
+  static __device__ __forceinline__ uint32_t pack(float lo, float hi) {
+    __half2 packed = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<uint32_t *>(&packed);
+  }
+};
+
+template <> struct MmaTraits<__nv_bfloat16> {
+  static __device__ __forceinline__ void mma(float *C, uint32_t *A,
+                                              uint32_t *B) {
+    mma_sync_m16n8k16_row_col_bf16bf16f32(C, A, B);
+  }
+
+  static __device__ __forceinline__ uint32_t pack(float lo, float hi) {
+    __nv_bfloat162 packed = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<uint32_t *>(&packed);
+  }
+};
 
 } // namespace mma
