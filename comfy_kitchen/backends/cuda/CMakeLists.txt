@@ -157,6 +157,7 @@ target_compile_options(comfy_kitchen_cuda_kernels PRIVATE
 )
 target_include_directories(comfy_kitchen_cuda_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}/sage_attention
     ${CMAKE_CURRENT_SOURCE_DIR}/flash_compat
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/flash-attention/csrc/flash_attn/src

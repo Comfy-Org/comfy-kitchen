@@ -24,6 +24,7 @@
 
 #include "cublaslt_runtime.h"
 #include "input_act_codes.h"
+#include "tensor.h"
 
 namespace nb = nanobind;
 
@@ -42,6 +43,28 @@ int map_dtype_to_code(const nb::dlpack::dtype& dtype) {
         return 4;  // int8
     }
     return -1;  // unsupported
+}
+
+using comfy::tensor::DType;
+using comfy::tensor::TensorArg;
+
+template <std::size_t Rank, typename... Args>
+TensorArg<Rank> make_tensor_arg(const nb::ndarray<Args...>& array) {
+    if (array.ndim() != Rank) {
+        throw std::runtime_error("unexpected tensor rank");
+    }
+    const int dtype_code = map_dtype_to_code(array.dtype());
+    if (dtype_code < 0) {
+        throw std::runtime_error("unsupported tensor dtype");
+    }
+    TensorArg<Rank> arg{};
+    arg.data = const_cast<void*>(static_cast<const void*>(array.data()));
+    arg.meta.dtype = static_cast<DType>(dtype_code);
+    for (std::size_t axis = 0; axis < Rank; ++axis) {
+        arg.meta.sizes[axis] = static_cast<std::int64_t>(array.shape(axis));
+        arg.meta.strides[axis] = array.stride(axis);
+    }
+    return arg;
 }
 
 // Forward declarations of CUDA kernel wrappers
@@ -81,32 +104,8 @@ extern "C" {
         cudaStream_t stream);
 
     void launch_apply_rope_kernel(
-        const void* xq,
-        const void* xk,
-        const void* freqs,
-        void* xq_out,
-        void* xk_out,
-        int64_t batch,
-        int64_t dim1,
-        int64_t dim2,
-        int64_t head_dim,
-        int64_t freqs_batch,
-        int64_t freqs_dim1,
-        int64_t freqs_dim2,
-        int64_t q_s0, int64_t q_s1, int64_t q_s2, int64_t q_s3,
-        int64_t k_s0, int64_t k_s1, int64_t k_s2, int64_t k_s3,
-        int64_t qo_s0, int64_t qo_s1, int64_t qo_s2, int64_t qo_s3,
-        int64_t ko_s0, int64_t ko_s1, int64_t ko_s2, int64_t ko_s3,
-        int64_t stride_freqs_batch,
-        int64_t stride_freqs_dim1,
-        int64_t stride_freqs_dim2,
-        int64_t stride_freqs_dim,
-        int64_t stride_freqs_rot,
-        int64_t stride_freqs_pair,
-        int input_dtype_code,
-        int freqs_dtype_code,
-        bool has_k,
-        bool split_half,
+        TensorArg<4> q, TensorArg<4> k, TensorArg<6> freqs,
+        TensorArg<4> q_out, TensorArg<4> k_out, bool has_k, bool split_half,
         cudaStream_t stream);
 
     void launch_quantize_nvfp4_kernel(
@@ -124,30 +123,10 @@ extern "C" {
         cudaStream_t stream);
 
     void launch_rms_rope_kernel(
-        const void* q,
-        const void* k,
-        const void* freqs,
-        const void* q_scale,
-        const void* k_scale,
-        void* q_out,
-        void* k_out,
-        int64_t batch, int64_t dim1, int64_t dim2, int64_t head_dim,
-        int64_t rot_dim,
-        int64_t freqs_batch, int64_t freqs_dim1, int64_t freqs_dim2,
-        int64_t q_s0, int64_t q_s1, int64_t q_s2, int64_t q_s3,
-        int64_t k_s0, int64_t k_s1, int64_t k_s2, int64_t k_s3,
-        int64_t qo_s0, int64_t qo_s1, int64_t qo_s2, int64_t qo_s3,
-        int64_t ko_s0, int64_t ko_s1, int64_t ko_s2, int64_t ko_s3,
-        int64_t f_s0, int64_t f_s1, int64_t f_s2, int64_t f_s3,
-        int64_t f_s4, int64_t f_s5, int64_t qs_stride,
-        int64_t ks_stride,
-        float epsilon,
-        int input_dtype_code,
-        int freqs_dtype_code,
-        int scale_dtype_code,
-        bool has_k,
-        bool split_half,
-        cudaStream_t stream);
+        TensorArg<4> q, TensorArg<4> k, TensorArg<6> freqs,
+        TensorArg<1> q_scale, TensorArg<1> k_scale, TensorArg<4> q_out,
+        TensorArg<4> k_out, int64_t rot_dim, float epsilon, bool has_k,
+        bool split_half, cudaStream_t stream);
 
     void launch_dequantize_nvfp4_kernel(
         const void* input,
@@ -591,10 +570,8 @@ void apply_rope(
         throw std::runtime_error("xk and xk_out must both be provided or both be None");
     }
     
-    void* xk_data = nullptr;
-    void* xk_out_data = nullptr;
-    int64_t k_s0 = 0, k_s1 = 0, k_s2 = 0, k_s3 = 0;
-    int64_t ko_s0 = 0, ko_s1 = 0, ko_s2 = 0, ko_s3 = 0;
+    TensorArg<4> xk_arg{};
+    TensorArg<4> xk_out_arg{};
     
     if (has_xk) {
         auto xk = nb::cast<nb::ndarray<nb::device::cuda>>(xk_obj);
@@ -612,12 +589,8 @@ void apply_rope(
             throw std::runtime_error("xk_out shape must match xq shape");
         }
         
-        xk_data = xk.data();
-        xk_out_data = xk_out.data();
-        k_s0 = xk.stride(0); k_s1 = xk.stride(1);
-        k_s2 = xk.stride(2); k_s3 = xk.stride(3);
-        ko_s0 = xk_out.stride(0); ko_s1 = xk_out.stride(1);
-        ko_s2 = xk_out.stride(2); ko_s3 = xk_out.stride(3);
+        xk_arg = make_tensor_arg<4>(xk);
+        xk_out_arg = make_tensor_arg<4>(xk_out);
         if (map_dtype_to_code(xk.dtype()) != map_dtype_to_code(xq.dtype()) ||
             map_dtype_to_code(xk_out.dtype()) != map_dtype_to_code(xq.dtype())) {
             throw std::runtime_error("apply_rope inputs and outputs must share dtype");
@@ -640,46 +613,10 @@ void apply_rope(
             "apply_rope frequencies must be FP32, FP16, or BF16");
     }
 
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-
-    // Get strides (nanobind provides strides in elements, not bytes)
-    int64_t stride_freqs_batch = freqs.stride(0);
-    int64_t stride_freqs_dim1 = freqs.stride(1);
-    int64_t stride_freqs_dim2 = freqs.stride(2);
-    int64_t stride_freqs_dim = freqs.stride(3);
-    int64_t stride_freqs_rot = freqs.stride(4);
-    int64_t stride_freqs_pair = freqs.stride(5);
-
-    // Launch kernel
     launch_apply_rope_kernel(
-        xq.data(),
-        xk_data,
-        freqs.data(),
-        xq_out.data(),
-        xk_out_data,
-        batch,
-        dim1,
-        dim2,
-        head_dim,
-        freqs_batch,
-        freqs_dim1,
-        freqs_dim2,
-        xq.stride(0), xq.stride(1), xq.stride(2), xq.stride(3),
-        k_s0, k_s1, k_s2, k_s3,
-        xq_out.stride(0), xq_out.stride(1), xq_out.stride(2), xq_out.stride(3),
-        ko_s0, ko_s1, ko_s2, ko_s3,
-        stride_freqs_batch,
-        stride_freqs_dim1,
-        stride_freqs_dim2,
-        stride_freqs_dim,
-        stride_freqs_rot,
-        stride_freqs_pair,
-        input_dtype_code,
-        freqs_dtype_code,
-        has_xk,
-        split_half,
-        stream
-    );
+        make_tensor_arg<4>(xq), xk_arg, make_tensor_arg<6>(freqs),
+        make_tensor_arg<4>(xq_out), xk_out_arg, has_xk, split_half,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for paired fused RMSNorm + RoPE.
@@ -755,18 +692,10 @@ void rms_rope(nb::ndarray<nb::device::cuda> q, nb::ndarray<nb::device::cuda> k,
   }
 
   launch_rms_rope_kernel(
-      q.data(), k.data(), freqs.data(), q_scale.data(), k_scale.data(),
-      q_out.data(), k_out.data(), batch, dim1, dim2, head_dim, rot,
-      freqs.shape(0), freqs.shape(1), freqs.shape(2),
-      q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-      k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-      q_out.stride(0), q_out.stride(1), q_out.stride(2), q_out.stride(3),
-      k_out.stride(0), k_out.stride(1), k_out.stride(2), k_out.stride(3),
-      freqs.stride(0), freqs.stride(1), freqs.stride(2), freqs.stride(3),
-      freqs.stride(4), freqs.stride(5), q_scale.stride(0),
-      k_scale.stride(0), epsilon, input_dtype_code,
-      freqs_dtype_code, scale_dtype_code, true, split_half,
-      reinterpret_cast<cudaStream_t>(stream_ptr));
+      make_tensor_arg<4>(q), make_tensor_arg<4>(k), make_tensor_arg<6>(freqs),
+      make_tensor_arg<1>(q_scale), make_tensor_arg<1>(k_scale),
+      make_tensor_arg<4>(q_out), make_tensor_arg<4>(k_out), rot, epsilon, true,
+      split_half, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for single-tensor fused RMSNorm + RoPE.
@@ -822,18 +751,9 @@ void rms_rope1(nb::ndarray<nb::device::cuda> q,
   }
 
   launch_rms_rope_kernel(
-      q.data(), nullptr, freqs.data(), q_scale.data(), nullptr, q_out.data(),
-      nullptr, batch, dim1, dim2, head_dim, head_dim,
-      freqs.shape(0), freqs.shape(1), freqs.shape(2),
-      q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-      0, 0, 0, 0,
-      q_out.stride(0), q_out.stride(1), q_out.stride(2), q_out.stride(3),
-      0, 0, 0, 0,
-      freqs.stride(0), freqs.stride(1), freqs.stride(2), freqs.stride(3),
-      freqs.stride(4), freqs.stride(5), q_scale.stride(0), 0,
-      epsilon, input_dtype_code,
-      freqs_dtype_code, scale_dtype_code, false, split_half,
-      reinterpret_cast<cudaStream_t>(stream_ptr));
+      make_tensor_arg<4>(q), {}, make_tensor_arg<6>(freqs),
+      make_tensor_arg<1>(q_scale), {}, make_tensor_arg<4>(q_out), {}, head_dim,
+      epsilon, false, split_half, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper: signed INT8 V quantization
