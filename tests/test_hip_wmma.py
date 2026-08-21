@@ -927,6 +927,21 @@ def test_quantize_int8_rowwise_matches_eager():
     assert (q.int() - qe.int()).abs().max().item() <= 1
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("k", [8, 9], ids=["vector-width", "ragged"])
+def test_quantize_int8_rowwise_offset_matches_aligned(dtype, k):
+    torch.manual_seed(k)
+    aligned = torch.randn(17, k, device=DEV, dtype=dtype)
+    offset = _offset_copy(aligned)
+
+    with ck.use_backend("hip"):
+        aligned_q, aligned_scale = ck.quantize_int8_rowwise(aligned)
+        offset_q, offset_scale = ck.quantize_int8_rowwise(offset)
+
+    assert torch.equal(offset_q, aligned_q)
+    assert torch.equal(offset_scale, aligned_scale)
+
+
 def test_quantize_int8_tensorwise_matches_eager():
     torch.manual_seed(0)
     x = torch.randn(64, 512, device=DEV, dtype=torch.bfloat16)
