@@ -9,6 +9,7 @@ import comfy_kitchen as ck
 def pytest_configure(config):
     config.addinivalue_line("markers", "cuda: mark test as requiring CUDA")
     config.addinivalue_line("markers", "slow: mark test as slow running")
+    config.addinivalue_line("markers", "performance: mark test as a GPU timing benchmark")
     config.addinivalue_line("markers", "cupy: mark test as requiring CuPy")
 
 

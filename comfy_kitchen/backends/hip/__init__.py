@@ -66,6 +66,8 @@ __all__ = [
     "has_wmma",
     "int8_linear",
     "int8_attention_is_available",
+    "flash_attention_decode_is_available",
+    "flash_decode",
     "is_available",
     "sage_int8_attend",
     "sage_int8_quantize",
@@ -512,22 +514,23 @@ _convrot_max_k: dict[tuple[int, torch.dtype], int] = {}
 
 
 def _convrot_supported(
-    k: int, group_size: int, device: torch.device, dtype: torch.dtype
+    k: int, group_size: int, device: torch.device, dtype: torch.dtype,
+    *, int8_global_spill: bool = False,
 ) -> bool:
-    """Whether the fused rotation can take a row of this width on ``device``.
+    """Whether the HIP ConvRot quantizer can handle a row of this width on ``device``.
 
-    It stages the whole row in LDS, which bounds K per device, and it rotates K/G
-    whole groups while reading back all K entries, so a partial trailing group
-    would quantize uninitialized LDS.
-
-    The budget is read for the operand's own device, not the process-current one:
-    the kernels launch on the operand's stream, so in a multi-GPU process the two
-    can be different cards with different budgets.
+    INT8 G=256 with ``int8_global_spill`` uses fused LDS or global spill; K need only
+    divide the group size. Other paths stage the whole row in LDS (K bounded per device).
+    The kernel rotates K/G whole groups; a partial trailing group would quantize
+    uninitialized LDS. The LDS budget is read for the operand's device, not the
+    process-current one.
     """
     if group_size not in (16, 64, 256) or k % group_size != 0:
         return False
     if dtype not in (torch.float32, torch.float16, torch.bfloat16):
         return False
+    if group_size == 256 and int8_global_spill:
+        return True
 
     index = device.index if device.index is not None else torch.cuda.current_device()
     key = (index, dtype)
@@ -547,12 +550,26 @@ def _rotate_quant_int8(
     k = k_in // _input_act_width(input_act)
     q = torch.empty((m, k), dtype=torch.int8, device=x2d.device)
     scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
+    x_arg = _operand(x2d, x2d.device, "x2d")
+    spill_rotated = None
+    spill_partials = None
     # check_convrot_k queries the current device's LDS budget, so pin it to the
     # operand's device rather than trusting the caller thread's current device.
     with torch.cuda.device(x2d.device):
+        if group_size == 256 and _C.convrot_int8_needs_spill(m, k, DTYPE_TO_CODE[x2d.dtype]):
+            spill_rotated = torch.empty((m, k), dtype=x2d.dtype, device=x2d.device)
+            spill_partials = torch.empty((m, k // 256), dtype=torch.float32, device=x2d.device)
         _C.quantize_int8_convrot(
-            _dl(x2d), _dl(q), _dl(scales), m, k, group_size,
-            _input_act_code(input_act), _stream(x2d),
+            _dl(x_arg),
+            _dl(q),
+            _dl(scales),
+            None if spill_rotated is None else _dl(spill_rotated),
+            None if spill_partials is None else _dl(spill_partials),
+            m,
+            k,
+            group_size,
+            _input_act_code(input_act),
+            _stream(x2d),
         )
     return q, scales
 
@@ -570,7 +587,7 @@ def quantize_and_rotate_rowwise(
     argument is accepted and unused.
     """
     if stochastic_rounding or not _convrot_supported(
-        x.shape[-1], group_size, x.device, x.dtype
+        x.shape[-1], group_size, x.device, x.dtype, int8_global_spill=True
     ):
         return _eager.quantize_and_rotate_rowwise(
             x, h, group_size, stochastic_rounding=stochastic_rounding
@@ -591,7 +608,7 @@ def quantize_int8_convrot_weight(
     Uses the same fused kernel as the activation path.
     """
     if stochastic_rounding or not _convrot_supported(
-        weight.shape[-1], group_size, weight.device, weight.dtype
+        weight.shape[-1], group_size, weight.device, weight.dtype, int8_global_spill=True
     ):
         return _eager.quantize_int8_convrot_weight(
             weight, group_size, stochastic_rounding=stochastic_rounding
@@ -646,7 +663,9 @@ def int8_linear(
             raise ValueError(
                 f"ConvRot group size {convrot_groupsize} does not divide input features {k}"
             )
-        if not _convrot_supported(k, convrot_groupsize, x.device, x.dtype):
+        if not _convrot_supported(
+            k, convrot_groupsize, x.device, x.dtype, int8_global_spill=True
+        ):
             return _eager.int8_linear(
                 x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
                 input_act=input_act,
@@ -1004,10 +1023,12 @@ def w4a8_int8_linear(
         )
         return torch.nn.functional.linear(x, weight, bias).to(out_dtype)
 
-    # The layout allows any ConvRot group that divides K; the fused activation
-    # quantizer takes only the three it has butterfly stages for, and its LDS
-    # budget bounds K. int8_linear applies the same test before its own fast path.
-    if not _convrot_supported(x.shape[-1], convrot_groupsize, x.device, x.dtype):
+    # The layout allows any ConvRot group that divides K; INT8 G=256 can spill to
+    # global memory when K exceeds the fused LDS budget. int8_linear applies the
+    # same test before its own fast path.
+    if not _convrot_supported(
+        x.shape[-1], convrot_groupsize, x.device, x.dtype, int8_global_spill=True
+    ):
         int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
         return _eager.int8_linear(
             x, int8_weight, s_channel, bias, out_dtype, True, convrot_groupsize
@@ -2048,6 +2069,49 @@ def int8_attention_is_available() -> bool:
     RDNA2 declines it the way it declines the GEMMs.
     """
     return has_wmma()
+
+
+def flash_attention_decode_is_available() -> bool:
+    """Whether the BF16 decode attention kernel can run here.
+
+    The kernel uses no matrix cores, so is_available() would be the natural
+    gate, but RDNA2 has no bf16 and a caller that asks it to run there builds
+    the KV cache in another dtype, which this kernel declines. has_wmma() marks
+    the line where bf16 arrives, the same line the CUDA backend draws at SM80.
+    The attribute test catches an extension built before the kernel existed,
+    which is otherwise an AttributeError at dispatch.
+    """
+    return has_wmma() and hasattr(_C, "flash_attention_decode")
+
+
+def flash_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_lengths: torch.Tensor,
+    output: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    softmax_lse_accum: torch.Tensor,
+    output_accum: torch.Tensor,
+    num_splits: int,
+) -> None:
+    """Decode attention into ``output``. See ops/flash_decode.hip.
+
+    The caller owns the reshaping and the split workspace; this is the raw
+    launch so both backends can share comfy_kitchen/flash_attention.py.
+    """
+    _C.flash_attention_decode(
+        _dl(q),
+        _dl(k),
+        _dl(v),
+        _dl(kv_lengths),
+        _dl(output),
+        _dl(softmax_lse),
+        _dl(softmax_lse_accum),
+        _dl(output_accum),
+        num_splits,
+        _stream(q),
+    )
 
 
 def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):

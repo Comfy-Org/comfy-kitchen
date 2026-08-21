@@ -239,7 +239,7 @@ python setup.py build_ext --debug-build --lineinfo bdist_wheel
 ### Requirements
 
 - **Python**: ≥3.10
-- **PyTorch**: ≥2.5.0
+- **PyTorch**: ≥2.7.0
 - **CUDA Runtime** (for CUDA wheels): ≥13.0
   - Pre-built wheels require NVIDIA Driver r580+
   - Building from source requires CUDA Toolkit ≥12.8 and `CUDA_HOME` environment variable

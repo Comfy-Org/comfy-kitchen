@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+#include <cstdint>
 #include <cstring>
 #include <optional>
 #include <stdexcept>
@@ -48,8 +49,8 @@ void launch_convrot_w4a4_gemm_kernel(const void*, const void*, void*, const void
                                      const void*, int, int, int, int, int, hipStream_t);
 
 void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, hipStream_t);
-void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, int, int, int, int,
-                                         hipStream_t);
+void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
+                                         int, int, hipStream_t);
 void launch_quantize_int8_tensorwise_kernel(const void*, int, void*, void*, void*, int64_t,
                                             hipStream_t);
 void launch_dequantize_int8_simple_kernel(const void*, const void*, void*, int64_t, int64_t, int,
@@ -59,6 +60,7 @@ void launch_dequantize_int8_convrot_weight_kernel(const void*, const void*, void
 void launch_convrot_quant_int4_kernel(const void*, int, void*, void*, int, int, int, hipStream_t);
 void launch_unpack_int4_kernel(const void*, void*, int64_t, hipStream_t);
 int convrot_max_k_host(int);
+int convrot_int8_needs_spill_host(int, int, int);
 
 void launch_quantize_w4a8_convrot_kernel(const void*, const void*, void*, void*, void*, int64_t,
                                          int64_t, int, bool, uint64_t, hipStream_t);
@@ -401,7 +403,8 @@ void quantize_int8_rowwise(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
 }
 
 // act_code folds an elementwise activation into the rotation's load.
-void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales, int M, int K,
+void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales,
+                           OptArray spill_rotated, OptArray spill_partials, int M, int K,
                            int group_size, int act_code, uintptr_t stream_ptr) {
     constexpr const char* kFn = "quantize_int8_convrot";
     require_nonneg(M, kFn, "M");
@@ -415,8 +418,25 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
 
+    void* spill_rotated_ptr = nullptr;
+    void* spill_partials_ptr = nullptr;
+    if (spill_rotated.has_value()) {
+        require_dtype(*spill_rotated, 0, 2, kFn, "spill_rotated");
+        require_len(*spill_rotated, static_cast<int64_t>(M) * K, kFn, "spill_rotated");
+        if (map_dtype_to_code(spill_rotated->dtype()) != map_dtype_to_code(x.dtype())) {
+            throw std::runtime_error(std::string(kFn) + ": spill_rotated dtype must match x");
+        }
+        spill_rotated_ptr = spill_rotated->data();
+    }
+    if (spill_partials.has_value()) {
+        require_dtype(*spill_partials, 0, 0, kFn, "spill_partials");
+        require_len(*spill_partials, static_cast<int64_t>(M) * (K / 256), kFn, "spill_partials");
+        spill_partials_ptr = spill_partials->data();
+    }
+
     launch_quantize_int8_convrot_kernel(x.data(), map_dtype_to_code(x.dtype()), q.data(),
-                                        scales.data(), M, K, group_size, act_code,
+                                        scales.data(), spill_rotated_ptr, spill_partials_ptr, M, K,
+                                        group_size, act_code,
                                         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
@@ -1346,6 +1366,134 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
                 reinterpret_cast<hipStream_t>(stream_ptr), kFn);
 }
 
+
+// BF16 decode attention. Every extent below is derived from the operands rather
+// than taken from the caller, and the kernel indexes with the strides passed
+// here, so a mismatch is an out-of-bounds device access. Mirrors the checks in
+// the CUDA binding and adds the two the HIP kernel needs: it reads four
+// elements at a time, and it addresses the output with q's strides.
+void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
+                            nb::ndarray<> kv_lengths, nb::ndarray<> output,
+                            nb::ndarray<> softmax_lse, nb::ndarray<> softmax_lse_accum,
+                            nb::ndarray<> output_accum, int num_splits, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "flash_attention_decode";
+    constexpr int kHeadDim = 128;
+    constexpr int kElemsPerLoad = 4;
+    if (q.ndim() != 3 || k.ndim() != 4 || v.ndim() != 4 || output.ndim() != 3 ||
+        kv_lengths.ndim() != 1) {
+        throw std::runtime_error(std::string(kFn) + ": operand rank mismatch");
+    }
+    const int batch = static_cast<int>(k.shape(0));
+    const int kv_capacity = static_cast<int>(k.shape(1));
+    const int heads = static_cast<int>(k.shape(2));
+    require_positive(batch, kFn, "batch");
+    require_positive(kv_capacity, kFn, "kv_capacity");
+    require_positive(heads, kFn, "heads");
+    const int query_length = static_cast<int>(q.shape(0)) / batch;
+    require_positive(query_length, kFn, "query_length");
+    if (static_cast<int64_t>(q.shape(0)) != static_cast<int64_t>(batch) * query_length ||
+        static_cast<int>(q.shape(1)) != heads || static_cast<int>(q.shape(2)) != kHeadDim ||
+        static_cast<int>(k.shape(3)) != kHeadDim) {
+        throw std::runtime_error(std::string(kFn) + ": invalid q/k dimensions");
+    }
+    if (static_cast<int>(v.shape(0)) != batch || static_cast<int>(v.shape(1)) != kv_capacity ||
+        static_cast<int>(v.shape(2)) != heads || static_cast<int>(v.shape(3)) != kHeadDim) {
+        throw std::runtime_error(std::string(kFn) + ": k/v shape mismatch");
+    }
+    if (output.shape(0) != q.shape(0) || static_cast<int>(output.shape(1)) != heads ||
+        static_cast<int>(output.shape(2)) != kHeadDim ||
+        kv_lengths.size() != static_cast<size_t>(batch)) {
+        throw std::runtime_error(std::string(kFn) + ": output or length shape mismatch");
+    }
+    require_dtype(q, 2, 2, kFn, "q");
+    require_dtype(k, 2, 2, kFn, "k");
+    require_dtype(v, 2, 2, kFn, "v");
+    require_dtype(output, 2, 2, kFn, "output");
+    if (map_dtype_to_code(kv_lengths.dtype()) != -1 ||
+        kv_lengths.dtype().code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) ||
+        kv_lengths.dtype().bits != 32) {
+        throw std::runtime_error(std::string(kFn) + ": kv_lengths must be int32");
+    }
+
+    const size_t lse_size = static_cast<size_t>(batch) * heads * query_length;
+    if (softmax_lse.size() != lse_size || num_splits < 1 || num_splits > 32 ||
+        (num_splits > 1 &&
+         (softmax_lse_accum.size() != lse_size * num_splits ||
+          output_accum.size() != lse_size * kHeadDim * num_splits))) {
+        throw std::runtime_error(std::string(kFn) + ": invalid split workspace");
+    }
+    require_dtype(softmax_lse, 0, 0, kFn, "softmax_lse");
+    // The lengths and the split workspace are indexed linearly off their base
+    // pointers, so a strided view of the right size is read as though packed.
+    require_packed_contiguous(kv_lengths, kFn, "kv_lengths");
+    require_packed_contiguous(softmax_lse, kFn, "softmax_lse");
+    if (num_splits > 1) {
+        require_dtype(softmax_lse_accum, 0, 0, kFn, "softmax_lse_accum");
+        require_dtype(output_accum, 0, 0, kFn, "output_accum");
+        require_packed_contiguous(softmax_lse_accum, kFn, "softmax_lse_accum");
+        require_packed_contiguous(output_accum, kFn, "output_accum");
+    }
+
+    if (k.stride(0) != v.stride(0) || k.stride(1) != v.stride(1) || k.stride(2) != v.stride(2) ||
+        k.stride(3) != 1 || v.stride(3) != 1 || q.stride(2) != 1 || output.stride(2) != 1) {
+        throw std::runtime_error(std::string(kFn) + ": unsupported tensor strides");
+    }
+    // The kernel writes the output off q's strides, the way the CUDA launcher
+    // does. Here that is checked rather than assumed.
+    if (output.stride(0) != q.stride(0) || output.stride(1) != q.stride(1)) {
+        throw std::runtime_error(std::string(kFn) + ": output strides must match q");
+    }
+    // Rows are read four elements at a time, so every row start has to stay on
+    // that boundary.
+    const int64_t vectored[] = {q.stride(0), q.stride(1), k.stride(0), k.stride(1), k.stride(2)};
+    for (int64_t stride : vectored) {
+        if (stride % kElemsPerLoad != 0) {
+            throw std::runtime_error(std::string(kFn) + ": strides must be a multiple of 4");
+        }
+    }
+    // A view carries a byte offset, so operands with aligned strides can still
+    // begin off the boundary the four-element load needs.
+    constexpr uintptr_t kLoadBytes = kElemsPerLoad * sizeof(uint16_t);
+    const void* row_starts[] = {q.data(), k.data(), v.data(), output.data()};
+    for (const void* base : row_starts) {
+        if (reinterpret_cast<uintptr_t>(base) % kLoadBytes != 0) {
+            throw std::runtime_error(std::string(kFn) + ": q, k, v and output must be 8-byte aligned");
+        }
+    }
+    // The launcher takes raw pointers, so anything but ROCm device memory would
+    // be dereferenced on the device as though it were. The CUDA binding gets
+    // this from its nb::device::cuda operand types; this one takes plain
+    // ndarrays and has to ask. Testing for "not kDLCPU" is not enough: pinned
+    // host memory reports kDLCUDAHost and is still a host pointer.
+    constexpr int kDeviceRocm = nb::device::rocm::value;
+    const nb::ndarray<>* operands[] = {&q,      &k,          &v,
+                                       &output, &kv_lengths, &softmax_lse};
+    for (const nb::ndarray<>* t : operands) {
+        if (t->device_type() != kDeviceRocm || t->device_id() != q.device_id()) {
+            throw std::runtime_error(std::string(kFn) +
+                                     ": every operand must be ROCm device memory on q's device");
+        }
+    }
+    if (num_splits > 1 &&
+        (softmax_lse_accum.device_type() != kDeviceRocm ||
+         output_accum.device_type() != kDeviceRocm ||
+         softmax_lse_accum.device_id() != q.device_id() ||
+         output_accum.device_id() != q.device_id())) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": split workspace must be ROCm device memory on q's device");
+    }
+
+    launch_flash_decode(
+        q.data(), k.data(), v.data(), static_cast<const int*>(kv_lengths.data()), output.data(),
+        static_cast<float*>(softmax_lse.data()),
+        num_splits > 1 ? static_cast<float*>(output_accum.data()) : nullptr,
+        num_splits > 1 ? static_cast<float*>(softmax_lse_accum.data()) : nullptr, batch,
+        query_length, heads, kv_capacity, num_splits, q.stride(0) * query_length, q.stride(0),
+        q.stride(1), k.stride(0), k.stride(1), k.stride(2),
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
 NB_MODULE(_C, m) {
     m.doc() = "ComfyKitchen HIP backend native operations (RDNA2-RDNA4, WMMA on gfx11/gfx12)";
     m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8);
@@ -1361,12 +1509,18 @@ NB_MODULE(_C, m) {
     m.def("dequantize_int8_convrot_weight", &dequantize_int8_convrot_weight);
     m.def("convrot_quant_int4", &convrot_quant_int4);
     m.def("convrot_max_k", &convrot_max_k_host);
+    m.def("convrot_int8_needs_spill", &convrot_int8_needs_spill_host, nb::arg("m"),
+          nb::arg("k"), nb::arg("in_code"));
     m.def("unpack_int4", &unpack_int4);
     m.def("dequant_int4_grouped_to_int8", &dequant_int4_grouped_to_int8);
     m.def("quantize_w4a8_convrot", &quantize_w4a8_convrot);
     m.def("w4a8_requant_max_k", &w4a8_requant_max_k_kernel);
     m.def("w4a8_int8_gemm_chunked", &w4a8_int8_gemm_chunked);
     m.def("na3d", &na3d);
+    m.def("flash_attention_decode", &flash_attention_decode, nb::arg("q"), nb::arg("k"),
+          nb::arg("v"), nb::arg("kv_lengths"), nb::arg("output"), nb::arg("softmax_lse"),
+          nb::arg("softmax_lse_accum"), nb::arg("output_accum"), nb::arg("num_splits"),
+          nb::arg("stream_ptr"));
     m.def("sage_sdpa", &sage_sdpa, nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("o"),
           nb::arg("q_int8"), nb::arg("q_scale"), nb::arg("k_int8"), nb::arg("k_scale"),
           nb::arg("v_int8"), nb::arg("v_scale"), nb::arg("anchor_indices"), nb::arg("sm_scale"),

@@ -164,6 +164,7 @@ set(HIP_SOURCES
     sage_attention/quant_v_int8.hip
     sage_attention/int8_attn.hip
     ops/apply_rope.hip
+    ops/flash_decode.hip
     ops/rms_rope.hip
     ops/gemv_awq.hip
     ops/svdquant_w4a4.hip

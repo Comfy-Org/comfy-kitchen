@@ -146,6 +146,27 @@ def test_int8_linear_convrot_matches_eager():
     assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
 
 
+@needs_wmma
+@pytest.mark.parametrize("k", [3840, 10240, 32768])
+def test_int8_linear_convrot_large_k_matches_eager(k):
+    """G=256 INT8 convrot: fused (3840, 10240), global spill (32768) vs eager."""
+    torch.manual_seed(k)
+    m, n = 64, 256
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16)
+    wq, ws = ck.quantize_int8_rowwise(w)
+
+    with ck.use_backend("hip"):
+        out = ck.int8_linear(x, wq, ws.reshape(-1), None, torch.bfloat16, convrot=True,
+                             convrot_groupsize=256)
+    with ck.use_backend("eager"):
+        ref = ck.int8_linear(x, wq, ws.reshape(-1), None, torch.bfloat16, convrot=True,
+                             convrot_groupsize=256)
+
+    scale = ref.float().abs().max().item()
+    assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
+
+
 def _offset_copy(t: torch.Tensor) -> torch.Tensor:
     """A contiguous copy of ``t`` deliberately based off a 16-byte boundary."""
     flat = t.reshape(-1)
@@ -359,20 +380,23 @@ def test_convrot_quantizer_folds_the_activation_in(hip):
     assert fused_s.shape == (x.shape[0],)
 
 
+@pytest.mark.parametrize("group_size", [16, 256])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_convrot_int8_preserves_input_dtype_precision(hip, dtype):
-    """The fused row buffer must not introduce a BF16-only rounding stage."""
-    group = 16
-    x = torch.zeros(2, 64, device=DEV, dtype=dtype)
+def test_convrot_int8_preserves_input_dtype_precision(hip, dtype, group_size):
+    """The fused row buffer must round to the input dtype before absmax, like legacy."""
+    k = group_size if group_size == 256 else group_size * 4
+    idx1 = group_size if group_size == 16 else group_size // 4
+    norm = (1.0 / float(group_size)) ** 0.5
+    x = torch.zeros(2, k, device=DEV, dtype=dtype)
     x[0, 0] = 1.001
-    x[1, 16] = 3.141
-    h = _build_hadamard(group, device=DEV, dtype=dtype)
+    x[1, idx1] = 3.141
+    h = _build_hadamard(group_size, device=DEV, dtype=dtype)
 
-    q_hip, scales_hip = hip.quantize_and_rotate_rowwise(x, h, group)
-    q_eager, scales_eager = eager_quantize_and_rotate_rowwise(x, h, group)
+    q_hip, scales_hip = hip.quantize_and_rotate_rowwise(x, h, group_size)
+    q_eager, scales_eager = eager_quantize_and_rotate_rowwise(x, h, group_size)
 
-    values = torch.stack((x[0, 0], x[1, 16]))
-    expected_rowmax = (values.float() * 0.25).to(dtype).float().abs()
+    values = torch.stack((x[0, 0], x[1, idx1]))
+    expected_rowmax = (values.float() * norm).to(dtype).float().abs()
     torch.testing.assert_close(scales_hip.reshape(-1) * 127.0, expected_rowmax, rtol=1e-6, atol=0)
     torch.testing.assert_close(scales_hip, scales_eager, rtol=1e-6, atol=0)
     assert (q_hip.int() - q_eager.int()).abs().max().item() <= 1
@@ -2116,8 +2140,39 @@ def test_convrot_falls_back_to_eager_past_the_lds_bound(hip, dtype):
     sb = torch.zeros(2, dtype=torch.float32, device=DEV)
     with pytest.raises(RuntimeError, match="LDS"):
         hip._C.quantize_int8_convrot(
-            hip._dl(x), hip._dl(qb), hip._dl(sb), 2, k, 64, 0, hip._stream(x)
+            hip._dl(x), hip._dl(qb), hip._dl(sb), None, None, 2, k, 64, 0, hip._stream(x)
         )
+
+
+def test_convrot_spill_rotated_dtype_must_match_x(hip):
+    """spill_rotated is written as RowT derived from x; dtype must match."""
+    m, k = 2, 256
+    x = torch.randn(m, k, device=DEV, dtype=torch.float32)
+    q = torch.zeros(m, k, dtype=torch.int8, device=DEV)
+    scales = torch.zeros(m, dtype=torch.float32, device=DEV)
+    spill_rotated = torch.empty(m, k, dtype=torch.bfloat16, device=DEV)
+    spill_partials = torch.empty(m, k // 256, dtype=torch.float32, device=DEV)
+    with pytest.raises(RuntimeError, match="spill_rotated dtype must match x"):
+        hip._C.quantize_int8_convrot(
+            hip._dl(x),
+            hip._dl(q),
+            hip._dl(scales),
+            hip._dl(spill_rotated),
+            hip._dl(spill_partials),
+            m,
+            k,
+            256,
+            0,
+            hip._stream(x),
+        )
+
+
+@needs_wmma
+def test_convrot_int8_needs_spill_probe(hip):
+    in_code = hip.DTYPE_TO_CODE[torch.bfloat16]
+    with torch.cuda.device(DEV):
+        assert not hip._C.convrot_int8_needs_spill(4128, 10240, in_code)
+        assert hip._C.convrot_int8_needs_spill(4128, 32768, in_code)
 
 
 def test_convrot_lds_bound_accounts_for_row_dtype(hip):

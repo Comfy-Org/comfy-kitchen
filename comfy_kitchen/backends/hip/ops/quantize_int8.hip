@@ -177,6 +177,60 @@ __global__ __launch_bounds__(256) void dequantize_int8_convrot_weight_kernel(
 
 }  // namespace comfy::hip_backend
 
+namespace comfy::hip_backend {
+
+template <int ACT>
+struct LaunchConvrotQuantGlobalManaged {
+    const void* x;
+    int in_dtype;
+    int8_t* qout;
+    float* scaleout;
+    int M;
+    int K;
+    hipStream_t stream;
+    void* spill_rotated;
+    void* spill_partials;
+
+    template <typename RowT>
+    void operator()() const {
+        launch_convrot_quant_global<RowT, ACT>(
+            x, in_dtype, qout, scaleout, M, K,
+            static_cast<RowT*>(spill_rotated),
+            static_cast<float*>(spill_partials), stream);
+    }
+};
+
+template <int ACT>
+void launch_convrot_quant_global_managed(
+    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K, hipStream_t stream,
+    void* spill_rotated, void* spill_partials) {
+    if (spill_rotated == nullptr || spill_partials == nullptr) {
+        throw std::runtime_error("convrot global spill requires caller-provided workspace buffers");
+    }
+
+    dispatch_convrot_row_type(
+        in_dtype,
+        LaunchConvrotQuantGlobalManaged<ACT>{
+            x,
+            in_dtype,
+            qout,
+            scaleout,
+            M,
+            K,
+            stream,
+            spill_rotated,
+            spill_partials});
+}
+
+template void launch_convrot_quant_global_managed<kActNone>(
+    const void*, int, int8_t*, float*, int, int, hipStream_t, void*, void*);
+template void launch_convrot_quant_global_managed<kActGeluTanh>(
+    const void*, int, int8_t*, float*, int, int, hipStream_t, void*, void*);
+template void launch_convrot_quant_global_managed<kActSwiGLU>(
+    const void*, int, int8_t*, float*, int, int, hipStream_t, void*, void*);
+
+}  // namespace comfy::hip_backend
+
 extern "C" void launch_quantize_int8_rowwise_kernel(
     const void* x, int in_code, void* q, void* scales, int M, int K, hipStream_t stream) {
 
@@ -191,12 +245,12 @@ extern "C" void launch_quantize_int8_rowwise_kernel(
 // Fused ConvRot rotation + rowwise int8 quantize. act_code: 0 none, 1 gelu tanh,
 // 2 swiglu. K is the activated (written) width; swiglu reads a row twice as wide.
 extern "C" void launch_quantize_int8_convrot_kernel(
-    const void* x, int in_code, void* q, void* scales,
+    const void* x, int in_code, void* q, void* scales, void* spill_rotated, void* spill_partials,
     int M, int K, int group_size, int act_code, hipStream_t stream) {
 
     using namespace comfy::hip_backend;
     check_convrot_group_size(group_size);
-    check_convrot_k(K, group_size, in_code);
+    check_convrot_k(K, group_size, in_code, /*int8_quant=*/true);
     check_convrot_act(act_code);
     if (M == 0) {
         return;  // a zero-block launch is hipErrorInvalidConfiguration
@@ -204,16 +258,22 @@ extern "C" void launch_quantize_int8_convrot_kernel(
     if (act_code == kActGeluTanh) {
         launch_convrot_quant<false, kActGeluTanh>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
-            M, K, group_size, stream);
+            M, K, group_size, stream, spill_rotated, spill_partials);
     } else if (act_code == kActSwiGLU) {
         launch_convrot_quant<false, kActSwiGLU>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
-            M, K, group_size, stream);
+            M, K, group_size, stream, spill_rotated, spill_partials);
     } else {
         launch_convrot_quant<false, kActNone>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
-            M, K, group_size, stream);
+            M, K, group_size, stream, spill_rotated, spill_partials);
     }
+}
+
+// Returns 1 when INT8 G=256 must use the global spill path for (M, K, in_dtype).
+extern "C" int convrot_int8_needs_spill_host(int M, int K, int in_code) {
+    using namespace comfy::hip_backend;
+    return convrot_int8_needs_spill_buffers(M, K, in_code) ? 1 : 0;
 }
 
 // scratch is a 4-byte device buffer, pre-zeroed by the caller.
