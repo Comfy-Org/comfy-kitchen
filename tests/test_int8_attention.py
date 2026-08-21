@@ -8,6 +8,9 @@ import torch
 
 import comfy_kitchen as ck
 import comfy_kitchen.sage_attention as sage_attention_module
+from .conftest import (
+    skip_unless_gfx12_wmma,
+)
 
 _CUDA_READY = torch.cuda.is_available() and ck.int8_attention_is_available()
 requires_int8_attention = pytest.mark.skipif(
@@ -288,6 +291,127 @@ def test_int8_attention_stabilization_is_deterministic():
     second = ck.int8_attention(q, k, v)
 
     assert torch.equal(first, second)
+
+
+@requires_int8_attention
+def test_gfx12_split_direct_p_matches_bf16_concatenation():
+    skip_unless_gfx12_wmma()
+
+    torch.manual_seed(29)
+    heads = 2
+    segment_lengths = (137, 888)  # crosses both the K16 and V64 tile boundaries
+    q_parts = tuple(
+        torch.randn(1, length, heads, 128, device="cuda", dtype=torch.bfloat16)
+        .transpose(1, 2)
+        for length in segment_lengths
+    )
+    k_parts = tuple(torch.randn_like(part) for part in q_parts)
+    v_parts = tuple(
+        torch.randn(1, length, heads, 128, device="cuda", dtype=torch.bfloat16)
+        .transpose(1, 2)
+        for length in segment_lengths
+    )
+
+    reference = ck.hip_int8_attention(
+        torch.cat(q_parts, dim=2),
+        torch.cat(k_parts, dim=2),
+        torch.cat(v_parts, dim=2),
+    )
+    candidate = ck.hip_int8_attention_split(q_parts, k_parts, v_parts)
+
+    assert ck.hip_int8_attention_split_is_supported(
+        q_parts, k_parts, v_parts
+    )
+    assert torch.equal(candidate, reference)
+
+
+@requires_int8_attention
+def test_gfx12_bf16_attention_handles_long_rectangular_lengths():
+    skip_unless_gfx12_wmma()
+
+    torch.manual_seed(37)
+    q = torch.randn(1, 1025, 4, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    k = torch.randn(1, 1033, 4, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    v = torch.randn(1, 1033, 4, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    actual = ck.hip_attention(q, k, v)
+
+    assert ck.hip_attention_is_supported(q, k, v)
+    assert actual.dtype is torch.bfloat16
+    assert actual.shape == q.shape
+    assert actual.stride() == q.stride()
+    assert (actual.float() - expected.float()).abs().max() <= 0.00390625
+
+
+@requires_int8_attention
+def test_gfx12_bf16_full_k_tile_route_is_shape_generic():
+    skip_unless_gfx12_wmma()
+
+    torch.manual_seed(39)
+    # Deliberately differs from every captured model contract: seven heads,
+    # rectangular attention, and a one-row query tail. K/V is the only exact
+    # tile requirement of this schedule.
+    q = torch.randn(1, 7, 1025, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 7, 1056, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 7, 1056, 128, device="cuda", dtype=torch.bfloat16)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    actual = ck.hip_attention(q, k, v)
+
+    assert ck.hip_attention_is_supported(q, k, v)
+    assert actual.stride() == q.stride()
+    assert (actual.float() - expected.float()).abs().max() <= 0.00390625
+
+
+@requires_int8_attention
+def test_gfx12_short_attention_capability_is_dimensional():
+    skip_unless_gfx12_wmma()
+
+    def supported(batch, heads, length, *, dtype=torch.bfloat16):
+        tensors = tuple(
+            torch.empty(batch, heads, length, 128, device="cuda", dtype=dtype)
+            for _ in range(3)
+        )
+        return ck.hip_attention_is_supported(*tensors)
+
+    assert not supported(1, 4, 127)
+    assert supported(1, 4, 128)
+    assert supported(1, 56, 388)
+    assert not supported(2, 4, 16)
+    assert supported(64, 16, 16)
+    assert not supported(1, 4, 160, dtype=torch.float16)
+    unaligned = tuple(
+        torch.empty(1, 4, 128, 129, device="cuda", dtype=torch.bfloat16)[..., 1:]
+        for _ in range(3)
+    )
+    assert not ck.hip_attention_is_supported(*unaligned)
+    long_fp16 = tuple(
+        torch.empty(1, 4, 1024, 128, device="cuda", dtype=torch.float16)
+        for _ in range(3)
+    )
+    assert ck.hip_int8_attention_is_supported(*long_fp16)
+    assert not ck.hip_attention_is_supported(*long_fp16)
+
+
+@requires_int8_attention
+def test_gfx12_compact_batched_attention_matches_sdpa():
+    skip_unless_gfx12_wmma()
+
+    torch.manual_seed(41)
+    q, k, v = (
+        torch.randn(64, 16, 12, 128, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    bf16 = ck.hip_attention(q, k, v)
+    int8_mode = ck.hip_int8_attention(q, k, v)
+
+    assert ck.hip_attention_is_supported(q, k, v)
+    assert ck.hip_int8_attention_is_supported(q, k, v)
+    assert torch.equal(int8_mode, bf16)
+    assert bf16.stride() == q.stride()
+    assert (bf16.float() - expected.float()).abs().max() <= 0.00390625
 
 
 @requires_int8_attention

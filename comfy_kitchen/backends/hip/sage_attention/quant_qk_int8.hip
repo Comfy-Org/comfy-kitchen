@@ -86,6 +86,30 @@ __forceinline__ __device__ void store_row(int8_t* __restrict__ dst, int lane_in_
     }
 }
 
+// A logical sequence assembled from two independently allocated BHND tensors.
+// This is the producer-side equivalent of torch.cat(..., dim=2): every output
+// row keeps the same logical index, but the BF16 intermediate is never written.
+// The attention consumer still receives its contiguous packed workspace.
+template <typename T>
+struct TwoSegmentRows {
+    const T* first;
+    const T* second;
+    int first_rows;
+    int64_t first_stride_h;
+    int64_t first_stride_n;
+    int64_t second_stride_h;
+    int64_t second_stride_n;
+
+    __forceinline__ __device__ const T* row(int head, int index) const {
+        if (index < first_rows) {
+            return first + static_cast<int64_t>(head) * first_stride_h +
+                   static_cast<int64_t>(index) * first_stride_n;
+        }
+        return second + static_cast<int64_t>(head) * second_stride_h +
+               static_cast<int64_t>(index - first_rows) * second_stride_n;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Q: one scale per query row, so a row never leaves its lane group and the
 // reduction is a lane-group shuffle. Each block sweeps kRowIters batches of
@@ -140,12 +164,50 @@ __global__ __launch_bounds__(kQuantWaves * 32) void quant_q_int8_kernel(
     }
 }
 
+template <typename T, int HD, int Rotation>
+__global__ __launch_bounds__(kQuantWaves * 32) void quant_q_int8_two_segment_kernel(
+    TwoSegmentRows<T> input, int8_t* __restrict__ q_out,
+    float* __restrict__ q_scale, int Lq, int Lq_padded, int H_q) {
+
+    using Tile = RowTile<HD>;
+    constexpr int kRowsPerBatch = kQuantWaves * Tile::kRowsPerWave;
+
+    const int lane = threadIdx.x & 31;
+    const int wave = threadIdx.x >> 5;
+    const int lane_in_row = lane % Tile::kLanesPerRow;
+    const int row_in_wave = lane / Tile::kLanesPerRow;
+    const int h = blockIdx.y;
+    const int64_t scale_base = static_cast<int64_t>(h) * Lq_padded;
+    int8_t* out_head = q_out + static_cast<int64_t>(h) * Lq * HD;
+
+    const int block_first = blockIdx.x * (kRowsPerBatch * kRowIters);
+#pragma unroll
+    for (int it = 0; it < kRowIters; ++it) {
+        const int row = block_first + it * kRowsPerBatch +
+                        wave * Tile::kRowsPerWave + row_in_wave;
+        if (row >= Lq_padded) continue;
+        if (row >= Lq) {
+            if (lane_in_row == 0) q_scale[scale_base + row] = 1.0f;
+            continue;
+        }
+
+        float vals[Tile::kValsPerLane];
+        load_row<HD, T>(input.row(h, row), lane_in_row, vals);
+        const float mx =
+            row_reduce_fmax<Tile::kLanesPerRow>(rotate_row<HD, Rotation>(vals));
+        const float scale = mx / kInt8Max + 1e-7f;
+        if (lane_in_row == 0) q_scale[scale_base + row] = scale;
+        store_row<HD, T>(out_head + static_cast<int64_t>(row) * HD,
+                         lane_in_row, vals, 1.0f / scale);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // K: one scale per 16 adjacent keys. A whole scale group lives in one wave, so
 // the reduction never leaves it and the kernel needs no barrier at all. The
-// group is read twice rather than held: 16 rows of registers is affordable at
-// D64 and D128 but not at D256, and the second read is cheaper than the
-// occupancy the widest case would lose.
+// D128 retains the 16-row group in registers so each key is read once. D256
+// keeps the two-pass path because retaining a group there is too register-heavy;
+// D64 stays on the existing path until its short-attention schedule is settled.
 // ---------------------------------------------------------------------------
 
 constexpr int kKeyGroupsPerBlock = kQuantWaves;
@@ -153,7 +215,8 @@ constexpr int kKeyGroupsPerBlock = kQuantWaves;
 template <typename T, int HD, int Rotation>
 __global__ __launch_bounds__(kQuantWaves * 32) void quant_k_int8_kernel(
     const T* __restrict__ k, int8_t* __restrict__ k_out, float* __restrict__ k_scale,
-    const int* __restrict__ anchor_indices, int Lk, int H_kv, int groups_per_head,
+    const int* __restrict__ anchor_indices, int Lk, int Lk_storage, int H_kv,
+    int groups_per_head,
     int64_t stride_b, int64_t stride_h, int64_t stride_n) {
 
     using Tile = RowTile<HD>;
@@ -185,33 +248,119 @@ __global__ __launch_bounds__(kQuantWaves * 32) void quant_k_int8_kernel(
         for (int i = 0; i < Tile::kValsPerLane; ++i) bias[i] = 0.0f;
     }
 
-    float vals[Tile::kValsPerLane];
+    if constexpr (HD == 128) {
+        float rows[kRowPasses][Tile::kValsPerLane];
+        float mx = 0.0f;
+#pragma unroll
+        for (int pass = 0; pass < kRowPasses; ++pass) {
+            const int key = key0 + pass * Tile::kRowsPerWave + row_in_wave;
+            if (key < Lk) {
+                load_row<HD, T>(head + static_cast<int64_t>(key) * stride_n,
+                                lane_in_row, rows[pass]);
+#pragma unroll
+                for (int i = 0; i < Tile::kValsPerLane; ++i) rows[pass][i] -= bias[i];
+                mx = fmaxf(mx, rotate_row<HD, Rotation>(rows[pass]));
+            }
+        }
+
+        mx = row_reduce_fmax<32>(mx);
+        const float scale = mx / kInt8Max + 1e-7f;
+        const float inv_scale = 1.0f / scale;
+        if (lane == 0) k_scale[bh * groups_per_head + group] = scale;
+
+#pragma unroll
+        for (int pass = 0; pass < kRowPasses; ++pass) {
+            const int key = key0 + pass * Tile::kRowsPerWave + row_in_wave;
+            if (key < Lk) {
+                store_row<HD, T>(k_out + (bh * Lk_storage + key) * HD,
+                                 lane_in_row, rows[pass], inv_scale);
+            }
+        }
+    } else {
+        float vals[Tile::kValsPerLane];
+        float mx = 0.0f;
+#pragma unroll
+        for (int pass = 0; pass < kRowPasses; ++pass) {
+            const int key = key0 + pass * Tile::kRowsPerWave + row_in_wave;
+            if (key < Lk) {
+                load_row<HD, T>(head + static_cast<int64_t>(key) * stride_n, lane_in_row, vals);
+#pragma unroll
+                for (int i = 0; i < Tile::kValsPerLane; ++i) vals[i] -= bias[i];
+                mx = fmaxf(mx, rotate_row<HD, Rotation>(vals));
+            }
+        }
+
+        mx = row_reduce_fmax<32>(mx);
+        const float scale = mx / kInt8Max + 1e-7f;
+        const float inv_scale = 1.0f / scale;
+        if (lane == 0) k_scale[bh * groups_per_head + group] = scale;
+
+#pragma unroll
+        for (int pass = 0; pass < kRowPasses; ++pass) {
+            const int key = key0 + pass * Tile::kRowsPerWave + row_in_wave;
+            if (key < Lk) {
+                load_row<HD, T>(head + static_cast<int64_t>(key) * stride_n, lane_in_row, vals);
+#pragma unroll
+                for (int i = 0; i < Tile::kValsPerLane; ++i) vals[i] -= bias[i];
+                rotate_row<HD, Rotation>(vals);
+                store_row<HD, T>(k_out + (bh * Lk_storage + key) * HD,
+                                 lane_in_row, vals, inv_scale);
+            }
+        }
+    }
+}
+
+// The optimized consumer uses D128/rotation128. Keep the segmented producer
+// separate so the mature one-buffer path retains identical code generation.
+template <typename T>
+__global__ __launch_bounds__(kQuantWaves * 32) void quant_k_int8_two_segment_d128_kernel(
+    TwoSegmentRows<T> input, int8_t* __restrict__ k_out,
+    float* __restrict__ k_scale, const int* __restrict__ anchor_indices,
+    int Lk, int Lk_storage, int H_kv, int groups_per_head) {
+
+    using Tile = RowTile<128>;
+    constexpr int kRowPasses = 16 / Tile::kRowsPerWave;
+    const int lane = threadIdx.x & 31;
+    const int lane_in_row = lane % Tile::kLanesPerRow;
+    const int row_in_wave = lane / Tile::kLanesPerRow;
+    const int group = blockIdx.x * kKeyGroupsPerBlock + (threadIdx.x >> 5);
+    if (group >= groups_per_head) return;
+
+    const int h = blockIdx.y;
+    const int key0 = group * 16;
+    const int anchor_index = anchor_indices[h];
+    float bias[Tile::kValsPerLane];
+    if (anchor_index >= 0) {
+        load_row<128, T>(input.row(h, anchor_index), lane_in_row, bias);
+    } else {
+#pragma unroll
+        for (int i = 0; i < Tile::kValsPerLane; ++i) bias[i] = 0.0f;
+    }
+
+    float rows[kRowPasses][Tile::kValsPerLane];
     float mx = 0.0f;
 #pragma unroll
     for (int pass = 0; pass < kRowPasses; ++pass) {
         const int key = key0 + pass * Tile::kRowsPerWave + row_in_wave;
         if (key < Lk) {
-            load_row<HD, T>(head + static_cast<int64_t>(key) * stride_n, lane_in_row, vals);
+            load_row<128, T>(input.row(h, key), lane_in_row, rows[pass]);
 #pragma unroll
-            for (int i = 0; i < Tile::kValsPerLane; ++i) vals[i] -= bias[i];
-            mx = fmaxf(mx, rotate_row<HD, Rotation>(vals));
+            for (int i = 0; i < Tile::kValsPerLane; ++i) rows[pass][i] -= bias[i];
+            mx = fmaxf(mx, rotate_row<128, 128>(rows[pass]));
         }
     }
 
     mx = row_reduce_fmax<32>(mx);
     const float scale = mx / kInt8Max + 1e-7f;
     const float inv_scale = 1.0f / scale;
-    if (lane == 0) k_scale[bh * groups_per_head + group] = scale;
-
+    if (lane == 0) k_scale[static_cast<int64_t>(h) * groups_per_head + group] = scale;
 #pragma unroll
     for (int pass = 0; pass < kRowPasses; ++pass) {
         const int key = key0 + pass * Tile::kRowsPerWave + row_in_wave;
         if (key < Lk) {
-            load_row<HD, T>(head + static_cast<int64_t>(key) * stride_n, lane_in_row, vals);
-#pragma unroll
-            for (int i = 0; i < Tile::kValsPerLane; ++i) vals[i] -= bias[i];
-            rotate_row<HD, Rotation>(vals);
-            store_row<HD, T>(k_out + (bh * Lk + key) * HD, lane_in_row, vals, inv_scale);
+            store_row<128, T>(
+                k_out + (static_cast<int64_t>(h) * Lk_storage + key) * 128,
+                lane_in_row, rows[pass], inv_scale);
         }
     }
 }
@@ -361,6 +510,126 @@ __global__ __launch_bounds__(kAnchorThreads) void detect_k_anchor_kernel(
     }
 }
 
+template <typename T>
+__global__ __launch_bounds__(kAnchorThreads) void detect_k_anchor_two_segment_kernel(
+    TwoSegmentRows<T> input, int* __restrict__ anchor_indices, int Lk, int C) {
+
+    const int h = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wave = tid >> 5;
+
+    __shared__ float samples[kAnchorSamples * kAnchorMaxChannels];
+    __shared__ float wave_original_energy[kAnchorWaves];
+    __shared__ float wave_original_max[kAnchorWaves];
+    __shared__ float wave_candidate_distance[kAnchorSamples][kAnchorWaves];
+    __shared__ float wave_best_energy[kAnchorWaves];
+    __shared__ float wave_best_max[kAnchorWaves];
+    __shared__ int selected_candidate;
+
+    for (int index = tid; index < kAnchorSamples * C; index += kAnchorThreads) {
+        const int sample = index / C;
+        const int channel = index - sample * C;
+        const int row = sample * (Lk - 1) / (kAnchorSamples - 1);
+        samples[index] = to_float<T>(input.row(h, row)[channel]);
+    }
+    __syncthreads();
+
+    float original_energy = 0.0f;
+    float original_max = 0.0f;
+    float candidate_distance[kAnchorSamples];
+#pragma unroll
+    for (int c = 0; c < kAnchorSamples; ++c) candidate_distance[c] = 0.0f;
+    for (int channel = tid; channel < C; channel += kAnchorThreads) {
+        float channel_sum = 0.0f;
+#pragma unroll
+        for (int sample = 0; sample < kAnchorSamples; ++sample) {
+            const float value = samples[sample * C + channel];
+            original_energy = fmaf(value, value, original_energy);
+            original_max = fmaxf(original_max, fabsf(value));
+            channel_sum += value;
+        }
+#pragma unroll
+        for (int c = 0; c < kAnchorSamples; ++c) {
+            const float distance = kAnchorSamples * samples[c * C + channel] - channel_sum;
+            candidate_distance[c] = fmaf(distance, distance, candidate_distance[c]);
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        original_energy += __shfl_down(original_energy, off, 32);
+        original_max = fmaxf(original_max, __shfl_down(original_max, off, 32));
+#pragma unroll
+        for (int c = 0; c < kAnchorSamples; ++c)
+            candidate_distance[c] += __shfl_down(candidate_distance[c], off, 32);
+    }
+    if (lane == 0) {
+        wave_original_energy[wave] = original_energy;
+        wave_original_max[wave] = original_max;
+#pragma unroll
+        for (int c = 0; c < kAnchorSamples; ++c)
+            wave_candidate_distance[c][wave] = candidate_distance[c];
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int best_candidate = 0;
+        float best_distance = 3.402823466e+38F;
+#pragma unroll
+        for (int c = 0; c < kAnchorSamples; ++c) {
+            float distance = 0.0f;
+#pragma unroll
+            for (int w = 0; w < kAnchorWaves; ++w)
+                distance += wave_candidate_distance[c][w];
+            if (distance < best_distance) {
+                best_candidate = c;
+                best_distance = distance;
+            }
+        }
+        selected_candidate = best_candidate;
+    }
+    __syncthreads();
+
+    float best_energy = 0.0f;
+    float best_max = 0.0f;
+    for (int channel = tid; channel < C; channel += kAnchorThreads) {
+        const float anchor = samples[selected_candidate * C + channel];
+#pragma unroll
+        for (int sample = 0; sample < kAnchorSamples; ++sample) {
+            const float residual = samples[sample * C + channel] - anchor;
+            best_energy = fmaf(residual, residual, best_energy);
+            best_max = fmaxf(best_max, fabsf(residual));
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        best_energy += __shfl_down(best_energy, off, 32);
+        best_max = fmaxf(best_max, __shfl_down(best_max, off, 32));
+    }
+    if (lane == 0) {
+        wave_best_energy[wave] = best_energy;
+        wave_best_max[wave] = best_max;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float total_original_energy = 0.0f;
+        float total_original_max = 0.0f;
+        float total_best_energy = 0.0f;
+        float total_best_max = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kAnchorWaves; ++w) {
+            total_original_energy += wave_original_energy[w];
+            total_original_max = fmaxf(total_original_max, wave_original_max[w]);
+            total_best_energy += wave_best_energy[w];
+            total_best_max = fmaxf(total_best_max, wave_best_max[w]);
+        }
+        const bool improves_range = total_best_energy < total_original_energy &&
+                                    total_best_max <= total_original_max * 1.125f;
+        anchor_indices[h] = improves_range
+            ? selected_candidate * (Lk - 1) / (kAnchorSamples - 1)
+            : -1;
+    }
+}
+
 template <typename T, int HD, int Rotation>
 void launch_typed(const void* q, void* q_int8, void* q_scale, const void* k, void* k_int8,
                   void* k_scale, const int* anchor_indices, int B, int H_q, int Lq, int Lq_padded,
@@ -379,7 +648,8 @@ void launch_typed(const void* q, void* q_int8, void* q_scale, const void* k, voi
     const dim3 k_grid((groups_per_head + kKeyGroupsPerBlock - 1) / kKeyGroupsPerBlock, H_kv, B);
     quant_k_int8_kernel<T, HD, Rotation><<<k_grid, kQuantWaves * 32, 0, stream>>>(
         static_cast<const T*>(k), static_cast<int8_t*>(k_int8), static_cast<float*>(k_scale),
-        anchor_indices, Lk, H_kv, groups_per_head, k_stride_b, k_stride_h, k_stride_n);
+        anchor_indices, Lk, Lk, H_kv, groups_per_head,
+        k_stride_b, k_stride_h, k_stride_n);
 }
 
 // Only the rotations the caller can actually select are instantiated: short keys
@@ -435,10 +705,147 @@ void launch_anchor(const void* k, int* anchor_indices, int B, int H_kv, int Lk, 
         static_cast<const T*>(k), anchor_indices, Lk, C, H_kv, stride_b, stride_h, stride_n);
 }
 
+template <typename T>
+void launch_gfx12_qk_quant_typed(
+    const void* q, void* q_int8, void* q_scale,
+    const void* k, void* k_int8, void* k_scale, int* anchors,
+    int num_heads, int q_len, int kv_len, int padded_q, int padded_k,
+    int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
+    int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
+    hipStream_t stream) {
+    launch_anchor<T>(k, anchors, 1, num_heads, kv_len, 128,
+                     k_stride_b, k_stride_h, k_stride_n, stream);
+    constexpr int kRowsPerBlock =
+        kQuantWaves * RowTile<128>::kRowsPerWave * kRowIters;
+    const dim3 q_grid((padded_q + kRowsPerBlock - 1) / kRowsPerBlock,
+                      num_heads, 1);
+    quant_q_int8_kernel<T, 128, 128><<<q_grid, 256, 0, stream>>>(
+        static_cast<const T*>(q), static_cast<int8_t*>(q_int8),
+        static_cast<float*>(q_scale), q_len, padded_q, num_heads,
+        q_stride_b, q_stride_h, q_stride_n);
+    const int groups = padded_k / 16;
+    const dim3 k_grid((groups + kKeyGroupsPerBlock - 1) / kKeyGroupsPerBlock,
+                      num_heads, 1);
+    quant_k_int8_kernel<T, 128, 128><<<k_grid, 256, 0, stream>>>(
+        static_cast<const T*>(k), static_cast<int8_t*>(k_int8),
+        static_cast<float*>(k_scale), anchors, kv_len, padded_k, num_heads,
+        groups, k_stride_b, k_stride_h, k_stride_n);
+}
+
+template <typename T>
+void launch_gfx12_qk_quant_split_typed(
+    const void* q0, const void* q1, void* q_int8, void* q_scale,
+    const void* k0, const void* k1, void* k_int8, void* k_scale,
+    int* anchors, int num_heads, int q0_len, int q1_len,
+    int k0_len, int k1_len, int padded_q, int padded_k,
+    int64_t q0_stride_h, int64_t q0_stride_n,
+    int64_t q1_stride_h, int64_t q1_stride_n,
+    int64_t k0_stride_h, int64_t k0_stride_n,
+    int64_t k1_stride_h, int64_t k1_stride_n, hipStream_t stream) {
+    const int q_len = q0_len + q1_len;
+    const int kv_len = k0_len + k1_len;
+    const TwoSegmentRows<T> q_input{
+        static_cast<const T*>(q0), static_cast<const T*>(q1), q0_len,
+        q0_stride_h, q0_stride_n, q1_stride_h, q1_stride_n};
+    const TwoSegmentRows<T> k_input{
+        static_cast<const T*>(k0), static_cast<const T*>(k1), k0_len,
+        k0_stride_h, k0_stride_n, k1_stride_h, k1_stride_n};
+    detect_k_anchor_two_segment_kernel<T>
+        <<<dim3(num_heads), kAnchorThreads, 0, stream>>>(
+            k_input, anchors, kv_len, 128);
+    constexpr int kRowsPerBlock =
+        kQuantWaves * RowTile<128>::kRowsPerWave * kRowIters;
+    const dim3 q_grid((padded_q + kRowsPerBlock - 1) / kRowsPerBlock,
+                      num_heads, 1);
+    quant_q_int8_two_segment_kernel<T, 128, 128><<<q_grid, 256, 0, stream>>>(
+        q_input, static_cast<int8_t*>(q_int8), static_cast<float*>(q_scale),
+        q_len, padded_q, num_heads);
+    const int groups = padded_k / 16;
+    const dim3 k_grid((groups + kKeyGroupsPerBlock - 1) / kKeyGroupsPerBlock,
+                      num_heads, 1);
+    quant_k_int8_two_segment_d128_kernel<T><<<k_grid, 256, 0, stream>>>(
+        k_input, static_cast<int8_t*>(k_int8), static_cast<float*>(k_scale),
+        anchors, kv_len, padded_k, num_heads, groups);
+}
+
 }  // namespace
 }  // namespace comfy::hip_backend::sage
 
 using namespace comfy::hip_backend::sage;
+
+extern "C" void launch_gfx12_qk_quant(
+    const void* q, void* q_int8, void* q_scale,
+    const void* k, void* k_int8, void* k_scale, void* anchor_indices,
+    int num_heads, int q_len, int kv_len, int padded_q, int padded_k,
+    int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
+    int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
+    int input_dtype_code, hipStream_t stream) {
+    if (num_heads <= 0 || q_len <= 0 || kv_len <= 0) {
+        throw std::runtime_error(
+            "gfx12 Q/K quantization requires positive heads and lengths");
+    }
+    if (padded_q < q_len || padded_q % 128 != 0 ||
+        padded_k < kv_len || padded_k % 64 != 0) {
+        throw std::runtime_error(
+            "gfx12 Q/K workspaces have invalid padding");
+    }
+    auto* anchors = static_cast<int*>(anchor_indices);
+    if (input_dtype_code == 1) {
+        launch_gfx12_qk_quant_typed<__half>(
+            q, q_int8, q_scale, k, k_int8, k_scale, anchors, num_heads,
+            q_len, kv_len, padded_q, padded_k, q_stride_b, q_stride_h,
+            q_stride_n, k_stride_b, k_stride_h, k_stride_n, stream);
+    } else if (input_dtype_code == 2) {
+        launch_gfx12_qk_quant_typed<__bf16>(
+            q, q_int8, q_scale, k, k_int8, k_scale, anchors, num_heads,
+            q_len, kv_len, padded_q, padded_k, q_stride_b, q_stride_h,
+            q_stride_n, k_stride_b, k_stride_h, k_stride_n, stream);
+    } else {
+        throw std::runtime_error(
+            "gfx12 Q/K quantization supports float16 and bfloat16");
+    }
+}
+
+extern "C" void launch_gfx12_qk_quant_split(
+    const void* q0, const void* q1, void* q_int8, void* q_scale,
+    const void* k0, const void* k1, void* k_int8, void* k_scale,
+    void* anchor_indices, int num_heads, int q0_len, int q1_len,
+    int k0_len, int k1_len, int padded_q, int padded_k,
+    int64_t q0_stride_h, int64_t q0_stride_n,
+    int64_t q1_stride_h, int64_t q1_stride_n,
+    int64_t k0_stride_h, int64_t k0_stride_n,
+    int64_t k1_stride_h, int64_t k1_stride_n, int input_dtype_code,
+    hipStream_t stream) {
+
+    const int q_len = q0_len + q1_len;
+    const int kv_len = k0_len + k1_len;
+    if (num_heads <= 0 || q0_len <= 0 || q1_len <= 0 ||
+        k0_len <= 0 || k1_len <= 0) {
+        throw std::runtime_error(
+            "gfx12 split Q/K quantization requires positive heads and segment lengths");
+    }
+    if (padded_q < q_len || padded_q % 128 != 0 ||
+        padded_k < kv_len || padded_k % 64 != 0) {
+        throw std::runtime_error("gfx12 split Q/K workspaces have invalid padding");
+    }
+    auto* anchors = static_cast<int*>(anchor_indices);
+    if (input_dtype_code == 1) {
+        launch_gfx12_qk_quant_split_typed<__half>(
+            q0, q1, q_int8, q_scale, k0, k1, k_int8, k_scale, anchors,
+            num_heads, q0_len, q1_len, k0_len, k1_len, padded_q, padded_k,
+            q0_stride_h, q0_stride_n, q1_stride_h, q1_stride_n,
+            k0_stride_h, k0_stride_n, k1_stride_h, k1_stride_n, stream);
+    } else if (input_dtype_code == 2) {
+        launch_gfx12_qk_quant_split_typed<__bf16>(
+            q0, q1, q_int8, q_scale, k0, k1, k_int8, k_scale, anchors,
+            num_heads, q0_len, q1_len, k0_len, k1_len, padded_q, padded_k,
+            q0_stride_h, q0_stride_n, q1_stride_h, q1_stride_n,
+            k0_stride_h, k0_stride_n, k1_stride_h, k1_stride_n, stream);
+    } else {
+        throw std::runtime_error(
+            "gfx12 split Q/K quantization supports float16 and bfloat16");
+    }
+}
 
 // rotation is 4, 64, 128 or 129; the caller picks it the same way the CUDA
 // backend does, and Q and K must agree or their dot products change.

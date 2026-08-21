@@ -13,6 +13,16 @@
 
 extern "C" {
 
+// Native unmasked BF16 attention. This dimensional entry accepts B>1 and GQA.
+void launch_bf16_sdpa_hip(
+    const void* q, const void* k, const void* v, void* output,
+    int batch, int q_heads, int kv_heads, int q_len, int kv_len, int head_dim,
+    int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
+    int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
+    int64_t v_stride_b, int64_t v_stride_h, int64_t v_stride_n,
+    int64_t o_stride_b, int64_t o_stride_h, int64_t o_stride_n,
+    float sm_scale, hipStream_t stream);
+
 // Fused 3D neighborhood attention over contiguous (B, T, H, W, NH, HD) tensors.
 // dtype_code is a DTYPE_TO_CODE value: 1 float16, 2 bfloat16. See ops/na3d.hip.
 void launch_na3d_kernel(const void* q, const void* k, const void* v, void* out, int batch,
@@ -31,12 +41,97 @@ void launch_flash_decode(const void* q, const void* k, const void* v, const int*
                          int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
                          hipStream_t stream);
 
+// Quantized D=128 attention. Q uses a per-row scale, K a per-16-row scale,
+// and V is [head, tile64, D, 64].
+void launch_gfx12_int8_attention(
+    const void* q, const void* k, const void* v, void* o,
+    const void* q_descale, const void* k_descale, const void* v_descale,
+    int num_heads, int qo_len, int kv_len, int padded_q, int padded_k,
+    int k_groups_per_head,
+    int64_t output_stride_h, int64_t output_stride_n,
+    float sm_scale, int output_dtype_code, hipStream_t stream);
+void launch_gfx12_tile_channel_v_quant(
+    const void* v, void* output, void* descale, int num_heads,
+    int n_ctx, int tiles,
+    int64_t stride_h, int64_t stride_n, int input_dtype_code,
+    hipStream_t stream);
+void launch_gfx12_tile_channel_v_quant_split(
+    const void* v0, const void* v1, void* output, void* descale,
+    int num_heads, int v0_len, int v1_len, int tiles,
+    int64_t v0_stride_h, int64_t v0_stride_n,
+    int64_t v1_stride_h, int64_t v1_stride_n, int input_dtype_code,
+    hipStream_t stream);
+void launch_gfx12_qk_quant(
+    const void* q, void* q_int8, void* q_scale,
+    const void* k, void* k_int8, void* k_scale, void* anchor_indices,
+    int num_heads, int q_len, int kv_len, int padded_q, int padded_k,
+    int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
+    int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
+    int input_dtype_code, hipStream_t stream);
+void launch_gfx12_qk_quant_split(
+    const void* q0, const void* q1, void* q_int8, void* q_scale,
+    const void* k0, const void* k1, void* k_int8, void* k_scale,
+    void* anchor_indices, int num_heads, int q0_len, int q1_len,
+    int k0_len, int k1_len, int padded_q, int padded_k,
+    int64_t q0_stride_h, int64_t q0_stride_n,
+    int64_t q1_stride_h, int64_t q1_stride_n,
+    int64_t k0_stride_h, int64_t k0_stride_n,
+    int64_t k1_stride_h, int64_t k1_stride_n, int input_dtype_code,
+    hipStream_t stream);
+
 // ldc is c's row stride, so a caller writing an N-column slice of a wider output
 // passes that output's width; a whole GEMM passes N.
 void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* scale_a,
                              const void* scale_b, int scale_b_stride, const void* bias,
                              int bias_code, int M, int N, int K, int ldc, int out_code,
                              hipStream_t stream);
+
+// B is physically [N / 128, K / tile_k, 128, tile_k]. The private entry is
+// generic over divisible M/N/K so exact-shape gates can select single- or
+// dual-M ownership without reintroducing row-stride partition camping.
+void launch_int8_gemm_b_tiled_kernel(
+    const void* a, const void* b, void* c, const void* scale_a,
+    const void* scale_b, int scale_b_stride, const void* bias,
+    int bias_code, int M, int N, int K, int ldc, int out_code,
+    int tile_k, bool dual_m, hipStream_t stream);
+
+// Same tiled-B GEMM with an exact BF16 materialization followed by
+// residual + gate * linear in the writeback epilogue. Gate is broadcast over M.
+void launch_int8_gemm_b_tiled_gated_residual_kernel(
+    const void* a, const void* b, void* c, const void* scale_a,
+    const void* scale_b, int scale_b_stride, const void* bias,
+    int bias_code, const void* residual, const void* gate,
+    int M, int N, int K, int ldc, int tile_k, bool dual_m,
+    hipStream_t stream);
+
+// Two equal-width row-major GEMMs sharing activation staging.
+void launch_int8_gemm_pair_kernel(
+    const void* a, const void* b0, const void* b1, void* c0, void* c1,
+    const void* scale_a, const void* scale_b0, int scale_b_stride0,
+    const void* scale_b1, int scale_b_stride1, const void* bias0,
+    int bias_code0, const void* bias1, int bias_code1, int M, int N, int K,
+    int ldc, int out_code, hipStream_t stream);
+
+// A is physically [M_tile, K_tile, 128, 128]; B remains row-major.
+void launch_int8_gemm_a_tiled128_down_kernel(
+    const void* a, const void* b, void* c, const void* scale_a,
+    const void* scale_b, int scale_b_stride, const void* bias,
+    int bias_code, int M, int N, int K, int ldc, int out_code,
+    hipStream_t stream);
+
+// A is physically [M_tile, K_tile, 128, 128] and B is physically
+// [N / 128, K / 128, 128, 128].
+void launch_int8_gemm_a_tiled128_b_tiled128_down_kernel(
+    const void* a, const void* b, void* c, const void* scale_a,
+    const void* scale_b, int scale_b_stride, const void* bias,
+    int bias_code, int M, int N, int K, int ldc, int out_code,
+    hipStream_t stream);
+
+// Exact BF16 RMSNorm followed by gate multiplication and residual add.
+void launch_rms_gated_residual_bf16_kernel(
+    const void* activation, const void* norm_weight, const void* residual,
+    const void* gate, void* output, int rows, int width, float eps,
+    hipStream_t stream);
 
 // scale_code is a DTYPE_TO_CODE value: 0 float32, 5 e4m3 (passed as raw bytes).
 // codebook is 16 floats, or null for the uniform levels.

@@ -22,7 +22,11 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _HIP_DIR = _ROOT / "comfy_kitchen" / "backends" / "hip"
 _HIP_CMAKE = _HIP_DIR / "CMakeLists.txt"
 _HIP_ARCH_MANIFEST = _HIP_DIR / "architectures.json"
-_HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12")
+_HIP_ARCH_GROUP_NAMES = (
+    "elementwise_only",
+    "wmma_gfx11",
+    "wmma_gfx12",
+)
 
 
 def _architecture_groups() -> dict[str, list[str]]:
@@ -273,6 +277,9 @@ def test_architecture_manifest_is_unique_and_shared_by_setup_and_runtime():
     assert set(groups["elementwise_only"]) == hip_backend._ARCH_ELEMENTWISE_ONLY
     assert set(groups["wmma_gfx11"]) == hip_backend._ARCH_WMMA_GFX11
     assert set(groups["wmma_gfx12"]) == hip_backend._ARCH_WMMA_GFX12
+    assert "gfx1200" in groups["wmma_gfx12"]
+    assert "gfx1201" in groups["wmma_gfx12"]
+    assert hip_backend._ARCH_WMMA_GFX12 <= hip_backend._ARCH_WMMA_NONDUPLICATED
     assert set(manifest_archs) == hip_backend._ARCH_SUPPORTED
 
 
@@ -294,6 +301,19 @@ def test_cmake_reads_and_validates_the_shared_architecture_manifest():
     assert "configure_file(" in text
     assert not re.search(r'"gfx\d', text)
 
+    read_groups = re.findall(r"_ck_read_arch_group\(\w+ (\w+)\)", text)
+    assert tuple(read_groups) == _HIP_ARCH_GROUP_NAMES
+
+
+def test_cmake_uses_only_gfx12_group_for_gfx12_wmma_policy():
+    text = _HIP_CMAKE.read_text(encoding="utf-8")
+
+    gfx12_condition = re.search(
+        r"_ck_make_arch_condition\(COMFY_HIP_GFX12_CONDITION(.*?)\)", text, re.DOTALL
+    )
+    assert gfx12_condition is not None
+    assert "COMFY_HIP_WMMA_GFX12_ARCHS" in gfx12_condition.group(1)
+
 
 def test_mma_architecture_macros_are_generated_from_the_manifest():
     mma = (_HIP_DIR / "mma.h").read_text(encoding="utf-8")
@@ -312,7 +332,11 @@ def test_sdist_rules_include_every_hip_build_input():
     assert "include comfy_kitchen/backends/hip/CMakeLists.txt" in manifest
     assert "recursive-include comfy_kitchen/backends/hip *.cpp *.h *.hip *.in *.json" in manifest
     assert "include-package-data = false" in pyproject
-    assert '"comfy_kitchen.backends.hip" = ["architectures.json"]' in pyproject
+    assert (
+        '"comfy_kitchen.backends.hip" = '
+        '["architectures.json"]'
+        in pyproject
+    )
 
 
 def test_hip_kernels_are_independent_of_the_python_extension_target():

@@ -24,6 +24,186 @@ namespace {
 
 constexpr int kDTile = 8;
 
+template <typename T>
+struct TwoSegmentVRows {
+    const T* first;
+    const T* second;
+    int first_rows;
+    int64_t first_stride_h;
+    int64_t first_stride_n;
+    int64_t second_stride_h;
+    int64_t second_stride_n;
+
+    __forceinline__ __device__ const T* row(int head, int index) const {
+        if (index < first_rows) {
+            return first + static_cast<int64_t>(head) * first_stride_h +
+                   static_cast<int64_t>(index) * first_stride_n;
+        }
+        return second + static_cast<int64_t>(head) * second_stride_h +
+               static_cast<int64_t>(index - first_rows) * second_stride_n;
+    }
+};
+
+// Optimized producer: one scale per (head, 64-key tile, channel), with
+// the quantized bytes written directly as [head, tile, D, 64].  A synchronous
+// BF16 LDS tile keeps both the physical-NHD input loads and tile-major output
+// stores vectorized; this kernel family has no global-to-LDS async/direct path.
+template <typename T>
+__global__ __launch_bounds__(256) void gfx12_tile_channel_v_quant_kernel(
+    const T* __restrict__ v, int8_t* __restrict__ output,
+    float* __restrict__ descale, int n_ctx, int tiles,
+    int64_t stride_h, int64_t stride_n) {
+    constexpr int kTileN = 64;
+    constexpr int kD = 128;
+    constexpr int kStageStride = kD + 8;
+    __shared__ __align__(16) T staged[kTileN * kStageStride];
+    __shared__ float multiplier[kD];
+
+    const int tid = threadIdx.x;
+    const int tile = blockIdx.x;
+    const int head = blockIdx.y;
+    const int n0 = tile * kTileN;
+
+    // 64*128 BF16 values = 1024 aligned 16-byte chunks, four per thread.
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int chunk = tid + i * 256;
+        const int row = chunk >> 4;
+        const int d8 = (chunk & 15) << 3;
+        uint4 value = make_uint4(0, 0, 0, 0);
+        if (n0 + row < n_ctx) {
+            value = *reinterpret_cast<const uint4*>(
+                v + static_cast<int64_t>(head) * stride_h +
+                static_cast<int64_t>(n0 + row) * stride_n + d8);
+        }
+        *reinterpret_cast<uint4*>(staged + row * kStageStride + d8) = value;
+    }
+    __syncthreads();
+
+    if (tid < kD) {
+        float maximum = 0.0f;
+#pragma unroll
+        for (int row = 0; row < kTileN; ++row) {
+            maximum = fmaxf(maximum, fabsf(to_float(
+                staged[row * kStageStride + tid])));
+        }
+        if (maximum == 0.0f) maximum = 1.0e-8f;
+        descale[(static_cast<int64_t>(head) * tiles + tile) * kD + tid] =
+            maximum * (1.0f / 127.0f);
+        multiplier[tid] = __builtin_amdgcn_rcpf(maximum) * 127.0f;
+    }
+    __syncthreads();
+
+    // 128 rows of 64 output bytes = 512 uint4 chunks, two per thread.
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int chunk = tid + i * 256;
+        const int d = chunk >> 2;
+        const int n16 = (chunk & 3) << 4;
+        uint4 packed = make_uint4(0, 0, 0, 0);
+        uint32_t* words = reinterpret_cast<uint32_t*>(&packed);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const uint32_t code = static_cast<uint8_t>(float_to_int8_rn(
+                to_float(staged[(n16 + j) * kStageStride + d]) *
+                multiplier[d]));
+            words[j >> 2] |= code << (8 * (j & 3));
+        }
+        *reinterpret_cast<uint4*>(
+            output + static_cast<int64_t>(head) * tiles * kD * kTileN +
+            static_cast<int64_t>(tile) * kD * kTileN + d * kTileN + n16) = packed;
+    }
+}
+
+// Identical tile/channel quantization from two logical sequence segments. The
+// tile crossing the segment boundary reads each row from its owning tensor and
+// therefore produces the same bytes/scales as concatenating BF16 first.
+template <typename T>
+__global__ __launch_bounds__(256) void gfx12_tile_channel_v_quant_two_segment_kernel(
+    TwoSegmentVRows<T> input, int8_t* __restrict__ output,
+    float* __restrict__ descale, int n_ctx, int tiles) {
+    constexpr int kTileN = 64;
+    constexpr int kD = 128;
+    constexpr int kStageStride = kD + 8;
+    __shared__ __align__(16) T staged[kTileN * kStageStride];
+    __shared__ float multiplier[kD];
+
+    const int tid = threadIdx.x;
+    const int tile = blockIdx.x;
+    const int head = blockIdx.y;
+    const int n0 = tile * kTileN;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int chunk = tid + i * 256;
+        const int row = chunk >> 4;
+        const int d8 = (chunk & 15) << 3;
+        uint4 value = make_uint4(0, 0, 0, 0);
+        if (n0 + row < n_ctx) {
+            value = *reinterpret_cast<const uint4*>(input.row(head, n0 + row) + d8);
+        }
+        *reinterpret_cast<uint4*>(staged + row * kStageStride + d8) = value;
+    }
+    __syncthreads();
+
+    if (tid < kD) {
+        float maximum = 0.0f;
+#pragma unroll
+        for (int row = 0; row < kTileN; ++row) {
+            maximum = fmaxf(maximum, fabsf(to_float(
+                staged[row * kStageStride + tid])));
+        }
+        if (maximum == 0.0f) maximum = 1.0e-8f;
+        descale[(static_cast<int64_t>(head) * tiles + tile) * kD + tid] =
+            maximum * (1.0f / 127.0f);
+        multiplier[tid] = __builtin_amdgcn_rcpf(maximum) * 127.0f;
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int chunk = tid + i * 256;
+        const int d = chunk >> 2;
+        const int n16 = (chunk & 3) << 4;
+        uint4 packed = make_uint4(0, 0, 0, 0);
+        uint32_t* words = reinterpret_cast<uint32_t*>(&packed);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const uint32_t code = static_cast<uint8_t>(float_to_int8_rn(
+                to_float(staged[(n16 + j) * kStageStride + d]) *
+                multiplier[d]));
+            words[j >> 2] |= code << (8 * (j & 3));
+        }
+        *reinterpret_cast<uint4*>(
+            output + static_cast<int64_t>(head) * tiles * kD * kTileN +
+            static_cast<int64_t>(tile) * kD * kTileN + d * kTileN + n16) = packed;
+    }
+}
+
+template <typename T>
+void launch_gfx12_tile_channel_v_quant(
+    const T* v, int8_t* output, float* descale,
+    int num_heads, int n_ctx, int tiles,
+    int64_t stride_h, int64_t stride_n,
+    hipStream_t stream) {
+    gfx12_tile_channel_v_quant_kernel<T><<<dim3(tiles, num_heads), 256, 0, stream>>>(
+        v, output, descale, n_ctx, tiles, stride_h, stride_n);
+}
+
+template <typename T>
+void launch_gfx12_tile_channel_v_quant_split(
+    const void* v0, const void* v1, void* output, void* descale,
+    int num_heads, int v0_len, int v1_len, int tiles,
+    int64_t v0_stride_h, int64_t v0_stride_n,
+    int64_t v1_stride_h, int64_t v1_stride_n, hipStream_t stream) {
+    const TwoSegmentVRows<T> input{
+        static_cast<const T*>(v0), static_cast<const T*>(v1), v0_len,
+        v0_stride_h, v0_stride_n, v1_stride_h, v1_stride_n};
+    gfx12_tile_channel_v_quant_two_segment_kernel<T>
+        <<<dim3(tiles, num_heads), 256, 0, stream>>>(
+            input, static_cast<int8_t*>(output), static_cast<float*>(descale),
+            v0_len + v1_len, tiles);
+}
+
 // Eight adjacent channels: 32 bytes for fp32, 16 for the 16-bit types.
 template <typename T>
 __forceinline__ __device__ void load8(const T* p, float* out) {
@@ -157,6 +337,64 @@ void launch_typed(const void* v, void* out, void* scale, int B, int H, int N, in
 }  // namespace comfy::hip_backend::sage
 
 using namespace comfy::hip_backend::sage;
+
+extern "C" void launch_gfx12_tile_channel_v_quant(
+    const void* v, void* output, void* descale, int num_heads,
+    int n_ctx, int tiles,
+    int64_t stride_h, int64_t stride_n, int input_dtype_code,
+    hipStream_t stream) {
+    if (num_heads <= 0 || n_ctx <= 0) {
+        throw std::runtime_error(
+            "gfx12 tile-channel V quantization requires positive heads and length");
+    }
+    if (tiles != (n_ctx + 63) / 64) {
+        throw std::runtime_error(
+            "gfx12 tile-channel V quantization received an invalid tile count");
+    }
+    if (input_dtype_code == 1) {
+        launch_gfx12_tile_channel_v_quant(
+            static_cast<const __half*>(v), static_cast<int8_t*>(output),
+            static_cast<float*>(descale), num_heads, n_ctx, tiles,
+            stride_h, stride_n, stream);
+    } else if (input_dtype_code == 2) {
+        launch_gfx12_tile_channel_v_quant(
+            static_cast<const __bf16*>(v), static_cast<int8_t*>(output),
+            static_cast<float*>(descale), num_heads, n_ctx, tiles,
+            stride_h, stride_n, stream);
+    } else {
+        throw std::runtime_error(
+            "gfx12 tile-channel V quantization supports float16 and bfloat16");
+    }
+}
+
+extern "C" void launch_gfx12_tile_channel_v_quant_split(
+    const void* v0, const void* v1, void* output, void* descale,
+    int num_heads, int v0_len, int v1_len, int tiles,
+    int64_t v0_stride_h, int64_t v0_stride_n,
+    int64_t v1_stride_h, int64_t v1_stride_n, int input_dtype_code,
+    hipStream_t stream) {
+    const int n_ctx = v0_len + v1_len;
+    if (num_heads <= 0 || v0_len <= 0 || v1_len <= 0) {
+        throw std::runtime_error(
+            "gfx12 split V quantization requires positive heads and segment lengths");
+    }
+    if (tiles != (n_ctx + 63) / 64) {
+        throw std::runtime_error(
+            "gfx12 split V quantization received an invalid tile count");
+    }
+    if (input_dtype_code == 1) {
+        launch_gfx12_tile_channel_v_quant_split<__half>(
+            v0, v1, output, descale, num_heads, v0_len, v1_len, tiles,
+            v0_stride_h, v0_stride_n, v1_stride_h, v1_stride_n, stream);
+    } else if (input_dtype_code == 2) {
+        launch_gfx12_tile_channel_v_quant_split<__bf16>(
+            v0, v1, output, descale, num_heads, v0_len, v1_len, tiles,
+            v0_stride_h, v0_stride_n, v1_stride_h, v1_stride_n, stream);
+    } else {
+        throw std::runtime_error(
+            "gfx12 split V quantization supports float16 and bfloat16");
+    }
+}
 
 extern "C" void launch_sage_quant_v_int8(const void* v, void* out, void* scale, int B, int H,
                                          int N, int D, int padded_N, int64_t stride_b,
