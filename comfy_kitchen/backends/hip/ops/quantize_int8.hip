@@ -47,6 +47,56 @@ __global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel(
     }
 }
 
+template <typename InputT>
+struct RowwiseVectorTraits {
+    static constexpr int kElements = sizeof(uint4) / sizeof(InputT);
+};
+
+template <typename InputT>
+__global__ __launch_bounds__(256) void quantize_int8_rowwise_vectorized_kernel(
+    const InputT* __restrict__ x, int8_t* __restrict__ q,
+    float* __restrict__ scales, int M, int K) {
+
+    constexpr int kElements = RowwiseVectorTraits<InputT>::kElements;
+    __shared__ float red[256];
+    const int row = blockIdx.x;
+    const int t = threadIdx.x;
+    const int chunks = K / kElements;
+    const int64_t row_offset = static_cast<int64_t>(row) * K;
+
+    float lmax = 0.0f;
+    for (int chunk_idx = t; chunk_idx < chunks; chunk_idx += 256) {
+        const uint4 raw = *reinterpret_cast<const uint4*>(
+            x + row_offset + static_cast<int64_t>(chunk_idx) * kElements);
+        const InputT* values = reinterpret_cast<const InputT*>(&raw);
+#pragma unroll
+        for (int i = 0; i < kElements; ++i) {
+            lmax = fmaxf(lmax, fabsf(load_row_value<InputT>(values[i])));
+        }
+    }
+
+    red[t] = lmax;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (t < s) red[t] = fmaxf(red[t], red[t + s]);
+        __syncthreads();
+    }
+
+    const float scale = fmaxf(red[0] / kInt8Max, 1e-30f);
+    if (t == 0) scales[row] = scale;
+    const float inv = 1.0f / scale;
+
+    for (int chunk_idx = t; chunk_idx < chunks; chunk_idx += 256) {
+        const int64_t base = row_offset + static_cast<int64_t>(chunk_idx) * kElements;
+        const uint4 raw = *reinterpret_cast<const uint4*>(x + base);
+        const InputT* values = reinterpret_cast<const InputT*>(&raw);
+#pragma unroll
+        for (int i = 0; i < kElements; ++i) {
+            q[base + i] = quant_round(load_row_value<InputT>(values[i]), inv);
+        }
+    }
+}
+
 __global__ void absmax_kernel(const void* __restrict__ x, int in_code,
                               unsigned int* __restrict__ out, int64_t numel) {
     __shared__ float red[256];
@@ -238,8 +288,26 @@ extern "C" void launch_quantize_int8_rowwise_kernel(
     if (M == 0) {
         return;  // a zero-block launch is hipErrorInvalidConfiguration
     }
-    quantize_int8_rowwise_kernel<<<M, 256, 0, stream>>>(
-        x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales), M, K);
+    const bool vector_aligned = reinterpret_cast<uintptr_t>(x) % sizeof(uint4) == 0;
+    if (in_code == 0 && vector_aligned &&
+        K % RowwiseVectorTraits<float>::kElements == 0) {
+        quantize_int8_rowwise_vectorized_kernel<float><<<M, 256, 0, stream>>>(
+            static_cast<const float*>(x), static_cast<int8_t*>(q),
+            static_cast<float*>(scales), M, K);
+    } else if (in_code == 1 && vector_aligned &&
+               K % RowwiseVectorTraits<__half>::kElements == 0) {
+        quantize_int8_rowwise_vectorized_kernel<__half><<<M, 256, 0, stream>>>(
+            static_cast<const __half*>(x), static_cast<int8_t*>(q),
+            static_cast<float*>(scales), M, K);
+    } else if (in_code == 2 && vector_aligned &&
+               K % RowwiseVectorTraits<__bf16>::kElements == 0) {
+        quantize_int8_rowwise_vectorized_kernel<__bf16><<<M, 256, 0, stream>>>(
+            static_cast<const __bf16*>(x), static_cast<int8_t*>(q),
+            static_cast<float*>(scales), M, K);
+    } else {
+        quantize_int8_rowwise_kernel<<<M, 256, 0, stream>>>(
+            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales), M, K);
+    }
 }
 
 // Fused ConvRot rotation + rowwise int8 quantize. act_code: 0 none, 1 gelu tanh,
