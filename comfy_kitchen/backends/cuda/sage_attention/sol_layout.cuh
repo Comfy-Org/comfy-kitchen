@@ -25,6 +25,8 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 
+#include "mma.cuh"
+
 // The MMA/cp.async forms are sm_80+ but the build also targets sm_75, so device
 // bodies compile out below sm_80 (as ops/na3d.cu does); dispatch constraints
 // pin sol_attn to 8.0+, so the stubs are unreachable at runtime.
@@ -111,31 +113,6 @@ __device__ __forceinline__ void mma_bf16(float* d, const uint32_t* a, const uint
 __device__ __forceinline__ uint32_t pack_bf2(float lo, float hi) {
     __nv_bfloat162 p = __floats2bfloat162_rn(lo, hi);
     return *reinterpret_cast<uint32_t*>(&p);
-}
-
-// P is non-negative and pre-scaled to [0, 127] via the exp2 exponent, so this
-// is a plain round-and-pack. cvt.pack (two F2IP) beats the mask-and-shift form
-// (~7 instr) in the exact kernel's inner loop, and .sat clamps where a mask
-// would wrap. The high byte pair is packed first and fed back in as c.
-__device__ __forceinline__ uint32_t pack4u8(float a, float b, float c, float d) {
-    uint32_t qa, qb, qc, qd, ab, cd, packed;
-    asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qa) : "f"(a));
-    asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qb) : "f"(b));
-    asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qc) : "f"(c));
-    asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qd) : "f"(d));
-    asm volatile("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(ab) : "r"(qa), "r"(qb));
-    asm volatile("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(cd) : "r"(qc), "r"(qd));
-    asm volatile("prmt.b32 %0, %1, %2, 0x6420;" : "=r"(packed) : "r"(ab), "r"(cd));
-    return packed;
-}
-
-__device__ __forceinline__ uint32_t pack4i8(float a, float b, float c, float d) {
-    uint32_t hi, out;
-    asm("cvt.pack.sat.s8.s32.b32 %0, %1, %2, 0;"
-        : "=r"(hi) : "r"(__float2int_rn(d)), "r"(__float2int_rn(c)));
-    asm("cvt.pack.sat.s8.s32.b32 %0, %1, %2, %3;"
-        : "=r"(out) : "r"(__float2int_rn(b)), "r"(__float2int_rn(a)), "r"(hi));
-    return out;
 }
 
 // ---------------------------------------------------------------------------

@@ -109,18 +109,17 @@ __global__ void prep_pooled_stats(const float* __restrict__ kc,
                                   float* __restrict__ kmean, float* __restrict__ vsc,
                                   float* __restrict__ kcvar, int NTB, int NPAD) {
     const int bh = blockIdx.x, d = threadIdx.x;
-    float sm = 0.f;
-    for (int n = 0; n < NTB; ++n) sm += kc[((size_t)bh * NPAD + n) * HD + d];
+    float sm = 0.f, ss = 0.f;
+    for (int n = 0; n < NTB; ++n) {
+        const float x = kc[((size_t)bh * NPAD + n) * HD + d];
+        sm += x;
+        ss = fmaf(x, x, ss);
+    }
     const float m = sm / (float)NTB;
     kmean[(size_t)bh * HD + d] = m;
     // vsc currently holds the atomically-reduced |max| from pass 1.
     vsc[(size_t)bh * HD + d] = fmaxf(vsc[(size_t)bh * HD + d] / 127.0f, 1e-8f);
-    float var = 0.f;
-    for (int n = 0; n < NTB; ++n) {
-        const float x = kc[((size_t)bh * NPAD + n) * HD + d] - m;
-        var += x * x;
-    }
-    kcvar[(size_t)bh * HD + d] = var / (float)NTB;
+    kcvar[(size_t)bh * HD + d] = fmaxf(ss / (float)NTB - m * m, 0.f);
 }
 
 // ---- pass 3: centre + quantize the pooled keys; transpose the pooled values ----

@@ -262,7 +262,7 @@ extern "C" {
         int causal_t, int causal_h, int causal_w,
         float scale, int dtype_code, cudaStream_t stream);
 
-    // Sol-Attn sparse attention — see ops/sol_attn.cu.
+    // Sol-Attn sparse attention — see sage_attention/sol_attn.cu.
     size_t sol_attn_workspace_bytes(int batch, int seq_len, int num_heads, int max_blocks);
     void launch_sol_attn(
         const void* q, const void* k, const void* v, void* out, void* workspace,

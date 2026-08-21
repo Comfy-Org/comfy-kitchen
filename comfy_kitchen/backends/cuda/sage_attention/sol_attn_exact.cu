@@ -251,10 +251,14 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         #pragma unroll
         for (int kk = 0; kk < PKC; ++kk) {
             const int b0 = 4 * kk, b1 = b0 + 1, b2 = b0 + 2, b3 = b0 + 3;
-            pa[kk][0] = pack4u8(p_val[b0][0], p_val[b0][1], p_val[b1][0], p_val[b1][1]);
-            pa[kk][1] = pack4u8(p_val[b0][2], p_val[b0][3], p_val[b1][2], p_val[b1][3]);
-            pa[kk][2] = pack4u8(p_val[b2][0], p_val[b2][1], p_val[b3][0], p_val[b3][1]);
-            pa[kk][3] = pack4u8(p_val[b2][2], p_val[b2][3], p_val[b3][2], p_val[b3][3]);
+            pa[kk][0] = mma::pack_u8x4(
+                p_val[b0][0], p_val[b0][1], p_val[b1][0], p_val[b1][1]);
+            pa[kk][1] = mma::pack_u8x4(
+                p_val[b0][2], p_val[b0][3], p_val[b1][2], p_val[b1][3]);
+            pa[kk][2] = mma::pack_u8x4(
+                p_val[b2][0], p_val[b2][1], p_val[b3][0], p_val[b3][1]);
+            pa[kk][3] = mma::pack_u8x4(
+                p_val[b2][2], p_val[b2][3], p_val[b3][2], p_val[b3][3]);
         }
 
         // l sums the PACKED bytes so num and den quantize identically.

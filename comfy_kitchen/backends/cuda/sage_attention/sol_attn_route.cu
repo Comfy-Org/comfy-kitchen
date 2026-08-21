@@ -32,22 +32,17 @@
 
 #include "sol_layout.cuh"
 
-namespace {
+// Tensor-core centroid tail. Batch 64 query centroids per CTA so proxy QK and
+// pooled PV use the same MMA layouts as the per-row fallback.
+namespace centroid_tc {
 using namespace sol;
 
-constexpr int HD  = HEAD_DIM;
-constexpr int WPB = 8;               // warps (= query blocks) per CTA
-constexpr int NTHREADS = WPB * 32;
-constexpr int CH  = 32;              // pooled blocks staged per chunk
-// Tail reads hit banks advancing by (2*LDV2 mod 32) per lane: 34 gives 4-way
-// conflicts, the even-stride optimum (40 gave 16-way). Only 4B-aligned, so
-// staging must use uint32, not uint4.
-constexpr int LDV2 = CH + 2;
+constexpr int HD = HEAD_DIM, BQ = BLOCK, BN = 64;
+constexpr int NWARP = BQ / 16, NTHREADS = NWARP * 32;
+constexpr int KC = HD / 32, NKT = BN / 8, NT = HD / 8, PKC = BN / 16;
+constexpr int LDK = HD, LDV = BN + 8;
 
-// cen8:[B*H*NQ,HD] int8 perm_d   cens:[B*H*NQ] f32
-// kciP:[B*H,NPAD,HD] int8 perm_d (centred)   kcs:[B*H,NPAD] f32
-// vcT:[B*H,HD,NPAD] bf16   vsc:[B*H,HD] f32   threshold:[B*H,NQ] f32
-__global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
+__global__ void __launch_bounds__(NTHREADS) sol_route_tc_kernel(
     const int8_t* __restrict__ cen8, const float* __restrict__ cens,
     const int8_t* __restrict__ kciP, const float* __restrict__ kcs,
     const __nv_bfloat16* __restrict__ vcT, const float* __restrict__ vsc,
@@ -56,151 +51,219 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
     __nv_bfloat16* __restrict__ o_part, float* __restrict__ m_part,
     float* __restrict__ l_part,
     int T, int H, int NTB, int NPAD, int NQ, int max_blk,
-    int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2)
-{
+    int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2) {
 #if SOL_SM80
-    // Pooled keys are read from global (L1-resident, 8-warp reuse): a
-    // row-major smem tile is a 32-way bank conflict on every operand load.
-    __shared__ float  sKs[CH];
-    __shared__ __nv_bfloat16 sVc[HD * LDV2];
+    __shared__ int8_t sKc[BN * LDK];
+    __shared__ __nv_bfloat16 sVcT[HD * LDV];
 
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int g = lane >> 2, qd = lane & 3;
     const int bh = blockIdx.y;
-    const int qb = blockIdx.x * WPB + warp;
-    const bool live = qb < NQ;
-    const size_t qs_ = (size_t)bh * NQ + (live ? qb : 0);
+    const int q0 = blockIdx.x * BQ + warp * 16 + g;
+    const int qr[2] = {q0, q0 + 8};
+    const bool live[2] = {qr[0] < NQ, qr[1] < NQ};
 
-    // The whole centroid lives in registers: each lane dots all 128 dims
-    // against its own staged pooled key. perm_d cancels between the two.
-    uint32_t cq[HD / 4];
-    float cqs = 0.f, thr = 0.f;
-    bool q_in_sink = false;
-    if (live) {
-        const uint4* crow = reinterpret_cast<const uint4*>(cen8 + qs_ * HD);
+    uint32_t qa[KC][4];
+    float qsc[2], thr[2];
+    bool q_in_sink[2];
+    {
+        const int r0 = min(qr[0], NQ - 1), r1 = min(qr[1], NQ - 1);
+        const int8_t* p0 = cen8 + ((size_t)bh * NQ + r0) * HD;
+        const int8_t* p1 = cen8 + ((size_t)bh * NQ + r1) * HD;
         #pragma unroll
-        for (int i = 0; i < HD / 16; ++i) {
-            const uint4 w4 = crow[i];
-            cq[i * 4 + 0] = w4.x; cq[i * 4 + 1] = w4.y;
-            cq[i * 4 + 2] = w4.z; cq[i * 4 + 3] = w4.w;
+        for (int kc = 0; kc < KC; ++kc) {
+            const int c0 = kc * 32 + qd * 8;
+            const uint2 a0 = *reinterpret_cast<const uint2*>(p0 + c0);
+            const uint2 a1 = *reinterpret_cast<const uint2*>(p1 + c0);
+            qa[kc][0] = a0.x; qa[kc][2] = a0.y;
+            qa[kc][1] = a1.x; qa[kc][3] = a1.y;
         }
-        cqs = cens[qs_] * scale_log2;
-        thr = threshold[qs_];
-        q_in_sink = (qb >= sink_qs) && (qb < sink_qe);
+        qsc[0] = live[0] ? cens[(size_t)bh * NQ + r0] * scale_log2 : 0.f;
+        qsc[1] = live[1] ? cens[(size_t)bh * NQ + r1] * scale_log2 : 0.f;
+        thr[0] = live[0] ? threshold[(size_t)bh * NQ + r0] : 0.f;
+        thr[1] = live[1] ? threshold[(size_t)bh * NQ + r1] : 0.f;
+        q_in_sink[0] = live[0] && qr[0] >= sink_qs && qr[0] < sink_qe;
+        q_in_sink[1] = live[1] && qr[1] >= sink_qs && qr[1] < sink_qe;
     }
+
+    const int S = max(0, min(sink_e, NTB) - sink_s);
+    int cnt[2] = {live[0] ? S : 0, live[1] ? S : 0};
+    #pragma unroll
+    for (int rr = 0; rr < 2; ++rr) {
+        if (live[rr]) {
+            uint16_t* row = blk_idx + ((size_t)bh * NQ + qr[rr]) * max_blk;
+            for (int i = qd; i < S; i += 4) row[i] = (uint16_t)(sink_s + i);
+        }
+    }
+
+    float o_acc[NT][4];
+    #pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+        o_acc[nt][0] = 0.f; o_acc[nt][1] = 0.f;
+        o_acc[nt][2] = 0.f; o_acc[nt][3] = 0.f;
+    }
+    float m_r[2] = {NEG, NEG}, l_r[2] = {0.f, 0.f};
     const int tail_len = T - (NTB - 1) * BLOCK;
 
-    float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
-    float m_r = NEG, l_r = 0.f;
-    // Sinks are unconditionally exact and need no score: emit them first so
-    // the cap can never truncate them into the tail (which ignores key_bias).
-    // The host rejects sink_count > max_blocks, so this always fits.
-    const int S = live ? max(0, min(sink_e, NTB) - sink_s) : 0;
-    for (int i = lane; i < S; i += 32)
-        blk_idx[qs_ * max_blk + i] = (uint16_t)(sink_s + i);
-    int cnt = S;
-
-    for (int c0 = 0; c0 < NTB; c0 += CH) {
+    for (int gs = 0; gs < NTB; gs += BN) {
         __syncthreads();
-        // Unconditional: NPAD is a multiple of 64, so chunks never overrun.
-        if (tid < CH) sKs[tid] = kcs[(size_t)bh * NPAD + c0 + tid];
-        for (int idx = tid; idx < HD * (CH / 2); idx += NTHREADS) {
-            const int d = idx / (CH / 2), part = (idx % (CH / 2)) * 2;
-            *reinterpret_cast<uint32_t*>(sVc + d * LDV2 + part) =
-                *reinterpret_cast<const uint32_t*>(
-                    vcT + ((size_t)bh * HD + d) * NPAD + c0 + part);
+        for (int idx = tid; idx < BN * (HD / 16); idx += NTHREADS) {
+            const int p = idx / (HD / 16), c16 = idx % (HD / 16);
+            cp_async16_ca(sKc + p * LDK + ((c16 ^ swz_k(p)) << 4),
+                          kciP + ((int64_t)bh * NPAD + gs + p) * HD + c16 * 16);
         }
+        for (int idx = tid; idx < HD * (BN / 8); idx += NTHREADS) {
+            const int c = idx / (BN / 8), part = idx % (BN / 8);
+            cp_async16_ca(sVcT + c * LDV + part * 8,
+                          vcT + ((int64_t)bh * HD + c) * NPAD + gs + part * 8);
+        }
+        cp_commit();
+        cp_wait<0>();
         __syncthreads();
-        if (!live) continue;
 
-        // --- score: lane owns pooled block j ---
-        const int j = c0 + lane;
-        const bool valid = j < NTB;
-        int32_t acc = 0;
-        const uint4* krow = reinterpret_cast<const uint4*>(
-            kciP + ((size_t)bh * NPAD + c0 + lane) * HD);
+        int32_t s_acc[NKT][4];
         #pragma unroll
-        for (int i = 0; i < HD / 16; ++i) {
-            const uint4 kw = krow[i];
-            acc = __dp4a((int)cq[i * 4 + 0], (int)kw.x, acc);
-            acc = __dp4a((int)cq[i * 4 + 1], (int)kw.y, acc);
-            acc = __dp4a((int)cq[i * 4 + 2], (int)kw.z, acc);
-            acc = __dp4a((int)cq[i * 4 + 3], (int)kw.w, acc);
+        for (int nt = 0; nt < NKT; ++nt) {
+            s_acc[nt][0] = 0; s_acc[nt][1] = 0;
+            s_acc[nt][2] = 0; s_acc[nt][3] = 0;
+            const int R = nt * 8 + g;
+            const int8_t* krow = sKc + R * LDK + ((qd & 1) << 3);
+            const int swk = swz_k(R), qhi = qd >> 1;
+            #pragma unroll
+            for (int kc = 0; kc < KC; ++kc) {
+                const uint2 kb = *reinterpret_cast<const uint2*>(
+                    krow + (((kc * 2 + qhi) ^ swk) << 4));
+                uint32_t kbf[2] = {kb.x, kb.y};
+                mma_s8(s_acc[nt], qa[kc], kbf);
+            }
         }
-        const float s = valid ? (float)acc * cqs * sKs[lane] : NEG;
 
-        // --- routing decision; non-sinks compete for the remaining budget ---
-        const bool pre_kept = (j >= sink_s) && (j < sink_e) && valid;
-        const bool diag = (j >= qb - 1) && (j <= qb + 1);
-        const bool routed = ((s > thr) || diag) && valid;
-        const bool cand = (q_in_sink ? valid : routed) && !pre_kept;
-        const uint32_t m = __ballot_sync(0xffffffffu, cand);
-        const int rank = __popc(m & ((1u << lane) - 1u));
-        // A capped-out block falls to the tail: approximated, never deleted.
-        const bool kept = pre_kept || (cand && (cnt + rank) < max_blk);
-        if (!pre_kept && kept)
-            blk_idx[qs_ * max_blk + cnt + rank] = (uint16_t)j;
-        cnt = min(cnt + __popc(m), max_blk);
-
-        // --- tail: everything valid and not kept ---
-        const bool tail = valid && !kept;
-        const float st = tail ? s : NEG;
-        float mn = fmaxf(m_r, st);
+        float pv[NKT][4];
         #pragma unroll
-        for (int off = 16; off; off >>= 1)
-            mn = fmaxf(mn, __shfl_xor_sync(0xffffffffu, mn, off));
-        const float alpha = exp2f(m_r - mn);
-        m_r = mn;
-        const float p = tail ? exp2f(st - mn) : 0.f;
-        // vc is a SUM over its block, so l carries the block length.
-        float ladd = p * ((j == NTB - 1) ? (float)tail_len : (float)BLOCK);
-        #pragma unroll
-        for (int off = 16; off; off >>= 1)
-            ladd += __shfl_xor_sync(0xffffffffu, ladd, off);
-        l_r = l_r * alpha + ladd;
-
-        o0 *= alpha; o1 *= alpha; o2 *= alpha; o3 *= alpha;
-        if (__ballot_sync(0xffffffffu, p > 0.f)) {
-            const int d0 = lane * 4;
-            // Pairs of adjacent jj share a 4-byte word, so half2 reads halve
-            // the shared-memory transactions on the hot path.
-            #pragma unroll 4
-            for (int jj = 0; jj < CH; jj += 2) {
-                const float pa = __shfl_sync(0xffffffffu, p, jj);
-                const float pb = __shfl_sync(0xffffffffu, p, jj + 1);
-                if (pa == 0.f && pb == 0.f) continue;
+        for (int nt = 0; nt < NKT; ++nt) {
+            const int c0 = nt * 8 + qd * 2;
+            const float ks0 = kcs[(int64_t)bh * NPAD + gs + c0];
+            const float ks1 = kcs[(int64_t)bh * NPAD + gs + c0 + 1];
+            #pragma unroll
+            for (int rr = 0; rr < 2; ++rr) {
+                bool cand[2], pre[2], valid[2];
+                float score[2];
                 #pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    const __nv_bfloat162 vv =
-                        *reinterpret_cast<const __nv_bfloat162*>(
-                            sVc + (d0 + i) * LDV2 + jj);
-                    float oi = (i == 0) ? o0 : (i == 1) ? o1 : (i == 2) ? o2 : o3;
-                    oi = fmaf(pa, __bfloat162float(vv.x), oi);
-                    oi = fmaf(pb, __bfloat162float(vv.y), oi);
-                    if (i == 0) o0 = oi; else if (i == 1) o1 = oi;
-                    else if (i == 2) o2 = oi; else o3 = oi;
+                for (int cc = 0; cc < 2; ++cc) {
+                    const int b = gs + c0 + cc;
+                    valid[cc] = live[rr] && b < NTB;
+                    pre[cc] = valid[cc] && b >= sink_s && b < sink_e;
+                    score[cc] = valid[cc]
+                        ? (float)s_acc[nt][rr * 2 + cc] * qsc[rr] * (cc ? ks1 : ks0)
+                        : NEG;
+                    const bool routed = valid[cc] &&
+                        ((score[cc] > thr[rr]) || abs(qr[rr] - b) <= 1);
+                    cand[cc] = !pre[cc] && (q_in_sink[rr] ? valid[cc] : routed);
                 }
+
+                int prefix = (int)cand[0] + (int)cand[1];
+                int x = __shfl_up_sync(0xffffffffu, prefix, 1, 4);
+                if (qd >= 1) prefix += x;
+                x = __shfl_up_sync(0xffffffffu, prefix, 2, 4);
+                if (qd >= 2) prefix += x;
+                const int before = prefix - (int)cand[0] - (int)cand[1];
+                const int total = __shfl_sync(0xffffffffu, prefix, 3, 4);
+                const int slot0 = cnt[rr] + before;
+                const int slot1 = slot0 + (int)cand[0];
+                const bool keep0 = cand[0] && slot0 < max_blk;
+                const bool keep1 = cand[1] && slot1 < max_blk;
+                if (live[rr]) {
+                    uint16_t* row = blk_idx + ((size_t)bh * NQ + qr[rr]) * max_blk;
+                    if (keep0) row[slot0] = (uint16_t)(gs + c0);
+                    if (keep1) row[slot1] = (uint16_t)(gs + c0 + 1);
+                }
+                cnt[rr] = min(cnt[rr] + total, max_blk);
+                pv[nt][rr * 2] = valid[0] && !(pre[0] || keep0) ? score[0] : NEG;
+                pv[nt][rr * 2 + 1] = valid[1] && !(pre[1] || keep1) ? score[1] : NEG;
+            }
+        }
+
+        float m_new[2] = {m_r[0], m_r[1]};
+        #pragma unroll
+        for (int nt = 0; nt < NKT; ++nt) {
+            #pragma unroll
+            for (int e = 0; e < 4; ++e)
+                m_new[e >> 1] = fmaxf(m_new[e >> 1], pv[nt][e]);
+        }
+        #pragma unroll
+        for (int off = 1; off <= 2; off <<= 1) {
+            m_new[0] = fmaxf(m_new[0], __shfl_xor_sync(0xffffffffu, m_new[0], off));
+            m_new[1] = fmaxf(m_new[1], __shfl_xor_sync(0xffffffffu, m_new[1], off));
+        }
+        const float alpha0 = exp2f(m_r[0] - m_new[0]);
+        const float alpha1 = exp2f(m_r[1] - m_new[1]);
+        m_r[0] = m_new[0]; m_r[1] = m_new[1];
+
+        float l_add[2] = {0.f, 0.f};
+        #pragma unroll
+        for (int nt = 0; nt < NKT; ++nt) {
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int rr = e >> 1;
+                const int b = gs + nt * 8 + qd * 2 + (e & 1);
+                const float p = pv[nt][e] <= NEG ? 0.f : exp2f(pv[nt][e] - m_new[rr]);
+                pv[nt][e] = p;
+                l_add[rr] += p * ((b == NTB - 1) ? (float)tail_len : (float)BLOCK);
+            }
+        }
+        #pragma unroll
+        for (int off = 1; off <= 2; off <<= 1) {
+            l_add[0] += __shfl_xor_sync(0xffffffffu, l_add[0], off);
+            l_add[1] += __shfl_xor_sync(0xffffffffu, l_add[1], off);
+        }
+        l_r[0] = l_r[0] * alpha0 + l_add[0];
+        l_r[1] = l_r[1] * alpha1 + l_add[1];
+
+        uint32_t pa[PKC][4];
+        #pragma unroll
+        for (int kk = 0; kk < PKC; ++kk) {
+            pa[kk][0] = pack_bf2(pv[2 * kk][0], pv[2 * kk][1]);
+            pa[kk][1] = pack_bf2(pv[2 * kk][2], pv[2 * kk][3]);
+            pa[kk][2] = pack_bf2(pv[2 * kk + 1][0], pv[2 * kk + 1][1]);
+            pa[kk][3] = pack_bf2(pv[2 * kk + 1][2], pv[2 * kk + 1][3]);
+        }
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            o_acc[nt][0] *= alpha0; o_acc[nt][1] *= alpha0;
+            o_acc[nt][2] *= alpha1; o_acc[nt][3] *= alpha1;
+            const __nv_bfloat16* vcol = sVcT + (nt * 8 + g) * LDV;
+            #pragma unroll
+            for (int kk = 0; kk < PKC; ++kk) {
+                uint32_t vb[2];
+                vb[0] = *reinterpret_cast<const uint32_t*>(vcol + kk * 16 + qd * 2);
+                vb[1] = *reinterpret_cast<const uint32_t*>(vcol + kk * 16 + qd * 2 + 8);
+                mma_bf16(o_acc[nt], pa[kk], vb);
             }
         }
     }
 
-    if (!live) return;
-    if (lane == 0) {
-        blk_cnt[qs_] = cnt;
-        m_part[qs_] = m_r;
-        l_part[qs_] = l_r * 255.0f;
+    #pragma unroll
+    for (int rr = 0; rr < 2; ++rr) {
+        if (!live[rr]) continue;
+        const size_t qs = (size_t)bh * NQ + qr[rr];
+        if (qd == 0) {
+            blk_cnt[qs] = cnt[rr];
+            m_part[qs] = m_r[rr];
+            l_part[qs] = l_r[rr] * 255.0f;
+        }
+        __nv_bfloat16* orow = o_part + qs * HD;
+        const float* vsrow = vsc + (size_t)bh * HD;
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            const int c = nt * 8 + qd * 2;
+            orow[c] = __float2bfloat16(o_acc[nt][rr * 2] * (255.0f / vsrow[c]));
+            orow[c + 1] = __float2bfloat16(o_acc[nt][rr * 2 + 1] * (255.0f / vsrow[c + 1]));
+        }
     }
-    // Hand over in the exact kernel's units (see its epilogue).
-    __nv_bfloat16* orow = o_part + qs_ * HD;
-    const float* vrow = vsc + (size_t)bh * HD;
-    const int d0 = lane * 4;
-    orow[d0 + 0] = __float2bfloat16(o0 * (255.0f / vrow[d0 + 0]));
-    orow[d0 + 1] = __float2bfloat16(o1 * (255.0f / vrow[d0 + 1]));
-    orow[d0 + 2] = __float2bfloat16(o2 * (255.0f / vrow[d0 + 2]));
-    orow[d0 + 3] = __float2bfloat16(o3 * (255.0f / vrow[d0 + 3]));
-#endif  // SOL_SM80
+#endif
 }
 
-}  // namespace
+}  // namespace centroid_tc
 
 // ---------------------------------------------------------------------------
 // Per-row tail (centroid_tail=false): per-ROW state, o_part aliasing `out`.
@@ -523,8 +586,8 @@ extern "C" void launch_sol_route(
     int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2,
     cudaStream_t stream)
 {
-    dim3 grid((NQ + WPB - 1) / WPB, B * H);
-    sol_route_kernel<<<grid, NTHREADS, 0, stream>>>(
+    dim3 grid((NQ + centroid_tc::BQ - 1) / centroid_tc::BQ, B * H);
+    centroid_tc::sol_route_tc_kernel<<<grid, centroid_tc::NTHREADS, 0, stream>>>(
         (const int8_t*)cen8, (const float*)cens, (const int8_t*)kciP,
         (const float*)kcs, (const __nv_bfloat16*)vcT, (const float*)vsc,
         (const float*)threshold,

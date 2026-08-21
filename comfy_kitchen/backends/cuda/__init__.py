@@ -2330,7 +2330,7 @@ def sol_attn(
     reuse_qkv_memory: bool = False,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 tensors.
-    See ops/sol_attn.cu."""
+    See sage_attention/sol_attn.cu."""
     batch, t, h, d = q.shape
     # Direct entry: run the same shared rule as the registry path, or bad
     # inputs launch anyway and return plausible garbage.

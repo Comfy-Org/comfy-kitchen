@@ -132,11 +132,11 @@ set(CUDA_SOURCES
     ops/turing_int4.cu
     ops/rms_rope.cu
     ops/na3d.cu
-    ops/sol_attn.cu
-    ops/sol_attn_preprocess.cu
-    ops/sol_attn_vtranspose.cu
-    ops/sol_attn_route.cu
-    ops/sol_attn_exact.cu
+    sage_attention/sol_attn.cu
+    sage_attention/sol_attn_preprocess.cu
+    sage_attention/sol_attn_vtranspose.cu
+    sage_attention/sol_attn_route.cu
+    sage_attention/sol_attn_exact.cu
     ops/quantize_svdquant_w4a4.cu
     ops/scaled_mm_svdquant_w4a4.cu
     ops/awq_w4a16.cu
