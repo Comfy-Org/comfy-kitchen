@@ -55,7 +55,12 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
         gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
         return;
     }
-    if (M >= 512 && N >= 128 && K > N) {
+    if (M >= 512 && N >= 128 && K >= 2 * N) {
+        constexpr int BM = 256, BN = 128, BKB = 128;
+        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+        gemm_wmma_kernel<MmaInt8, EpiRowwise, OutT, BM, BN, BKB, 4, 2, 4, 4>
+            <<<grid, 256, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
+    } else if (M >= 512 && N >= 128 && K > N) {
         constexpr int BM = 256, BN = 128, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
         gemm_wmma_kernel<MmaInt8, EpiRowwise, OutT, BM, BN, BKB, 4, 2, 4, 4>
