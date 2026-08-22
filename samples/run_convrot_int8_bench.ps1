@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$CKRoot,
+    [string]$Python = 'python',
     [ValidateSet('all', 'qkv', 'mlp_up', 'mlp_down', 'attn_out')]
     [string]$Shape = 'all',
     [int]$Rows = 3802,
@@ -9,7 +10,6 @@ param(
     [switch]$Check
 )
 
-$python = 'C:\Users\HarutoWatanabe\AppData\Local\Programs\Python\Python313\python.exe'
 $env:PYTHONPATH = $CKRoot
 $arguments = @(
     "$PSScriptRoot\convrot_int8_bench.py",
@@ -23,5 +23,5 @@ if ($Check) {
     $arguments += '--check'
 }
 
-& $python @arguments
+& $Python @arguments
 exit $LASTEXITCODE
