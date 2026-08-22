@@ -1975,13 +1975,11 @@ def test_svdquant_validates_its_operands(hip):
     assert torch.isfinite(out).all()
 
 
-@needs_wmma
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("rank", [1, 7, 16, 17, 32, 33, 64, 65, 96, 128, 192, 256])
-def test_svdquant_lora_down_matches_fp32_reference(hip, dtype, rank):
-    """The WMMA LoRA-down path handles partial M/R tiles and accumulates in fp32."""
-    torch.manual_seed(rank)
-    m, k = 19, 128
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_svdquant_lora_down_matches_torch_mm(hip, dtype):
+    """LoRA-down uses the backend matmul and preserves padded zero rows."""
+    torch.manual_seed(0)
+    m, k, rank = 19, 128, 17
     x = torch.randn(m, k, device=DEV, dtype=dtype)
     smooth = torch.ones(k, device=DEV, dtype=dtype)
     lora_down = torch.randn(k, rank, device=DEV, dtype=dtype)
@@ -1989,62 +1987,10 @@ def test_svdquant_lora_down_matches_fp32_reference(hip, dtype, rank):
     _, _, lora_act = hip.quantize_svdquant_w4a4(
         x, smooth, lora_down, pad_size=16
     )
-    ref = x.float() @ lora_down.float()
+    ref = torch.mm(x, lora_down).float()
 
-    torch.testing.assert_close(
-        lora_act[:m], ref, rtol=2e-3, atol=2e-3
-    )
+    torch.testing.assert_close(lora_act[:m], ref)
     assert torch.count_nonzero(lora_act[m:]) == 0
-
-
-def test_svdquant_lora_down_scalar_fallback(hip, monkeypatch):
-    """Devices without matrix cores retain the scalar LoRA-down path."""
-    torch.manual_seed(0)
-    m, k, rank = 5, 64, 7
-    x = torch.randn(m, k, device=DEV, dtype=torch.float16)
-    smooth = torch.ones(k, device=DEV, dtype=torch.float16)
-    lora_down = torch.randn(k, rank, device=DEV, dtype=torch.float16)
-    monkeypatch.setattr(hip, "has_wmma", lambda: False)
-
-    _, _, lora_act = hip.quantize_svdquant_w4a4(
-        x, smooth, lora_down, pad_size=16
-    )
-    ref = x.float() @ lora_down.float()
-
-    torch.testing.assert_close(lora_act[:m], ref, rtol=2e-3, atol=2e-3)
-    assert torch.count_nonzero(lora_act[m:]) == 0
-
-
-@needs_wmma
-def test_svdquant_lora_down_wmma_entry_falls_back_for_fp32(hip):
-    """Float32 operands take the scalar path inside the WMMA launcher."""
-    torch.manual_seed(0)
-    m, k, rank = 19, 128, 17
-    x = torch.randn(m, k, device=DEV, dtype=torch.float32)
-    smooth = torch.ones(k, device=DEV, dtype=torch.float32)
-    lora_down = torch.randn(k, rank, device=DEV, dtype=torch.float32)
-
-    _, _, lora_act = hip.quantize_svdquant_w4a4(
-        x, smooth, lora_down, pad_size=16
-    )
-    ref = x @ lora_down
-
-    torch.testing.assert_close(lora_act[:m], ref, rtol=2e-3, atol=2e-3)
-    assert torch.count_nonzero(lora_act[m:]) == 0
-
-
-def test_svdquant_lora_down_wmma_reports_entry_point(hip):
-    """Validation errors identify the WMMA binding rather than the scalar binding."""
-    m, k, rank = 1, 64, 1
-    x = torch.zeros(m, k, device=DEV, dtype=torch.float16)
-    lora_down = torch.zeros(k, rank, device=DEV, dtype=torch.float16)
-    bad_lora_act = torch.zeros(m, rank, device=DEV, dtype=torch.float16)
-
-    with pytest.raises(RuntimeError, match="svdquant_lora_down_wmma: lora_act"):
-        hip._C.svdquant_lora_down_wmma(
-            hip._dl(x), hip._dl(lora_down), hip._dl(bad_lora_act),
-            m, k, rank, hip._stream(x),
-        )
 
 
 @pytest.mark.parametrize("k", [128, 1088])

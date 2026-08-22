@@ -1246,8 +1246,8 @@ def quantize_svdquant_w4a4(
     r = lora_down.shape[1]
     m_pad = -(-m // pad_size) * pad_size
 
-    # The kernels take M, K and R with no bounds of their own, so every operand
-    # has to match those extents and sit on x's device.
+    # The quantizer takes raw pointers, so its operands must be contiguous and
+    # live on x's device.
     xc = x.contiguous()
     # The kernel decodes smooth with the same dtype code it uses for ascales, which
     # is allocated from x.dtype, so a smooth of any other dtype would be read as
@@ -1266,11 +1266,12 @@ def quantize_svdquant_w4a4(
         _dl(xc), _dl(smooth), _dl(q), _dl(ascales),
         m, m_pad, k, act_unsigned, _stream(x),
     )
-    lora_down_op = _C.svdquant_lora_down_wmma if has_wmma() else _C.svdquant_lora_down
-    lora_down_op(
-        _dl(lora_src), _dl(lora_down), _dl(lora_act[:m]),
-        m, k, r, _stream(x),
-    )
+    if m > 0:
+        lora_act_rows = lora_act[:m]
+        if lora_act_rows.dtype == lora_src.dtype and lora_act_rows.is_contiguous():
+            torch.mm(lora_src, lora_down, out=lora_act_rows)
+        else:
+            lora_act_rows.copy_(lora_src @ lora_down, non_blocking=True)
     return q, ascales, lora_act
 
 
