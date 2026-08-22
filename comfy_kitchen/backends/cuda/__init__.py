@@ -2315,6 +2315,31 @@ def na3d(
     return out
 
 
+def _topk_threshold(q, k, topk_ratio, scale):
+    """Routing threshold that turns the route kernels' ``s > thr`` into
+    per-query-block top-k: the (k+1)-th largest pooled score per row. Computed
+    in fp32 from the same pooled/centred quantities the kernel scores with, so
+    the kept set matches exact top-k up to int8 rounding at the boundary."""
+    b, t, h, d = q.shape
+    n = (t + 63) // 64
+
+    def block_mean(x):
+        # fp32 accumulation without materialising an fp32 copy of x
+        full = (t // 64) * 64
+        m = x[:, :full].view(b, -1, 64, h, d).sum(2, dtype=torch.float32) / 64.0
+        if full != t:
+            tail = x[:, full:].sum(1, keepdim=True, dtype=torch.float32) / (t - full)
+            m = torch.cat([m, tail], dim=1)
+        return m
+
+    cen = block_mean(q)
+    kc = block_mean(k)
+    kc = kc - kc.mean(dim=1, keepdim=True)
+    s = torch.einsum("bnhd,bmhd->bhnm", cen, kc) * (scale * 1.4426950408889634)
+    kk = max(1, min(n - 1, round(topk_ratio * n)))
+    return s.topk(kk + 1, dim=-1).values[..., -1].contiguous()
+
+
 def sol_attn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2327,10 +2352,16 @@ def sol_attn(
     workspace: torch.Tensor | None = None,
     centroid_tail: bool = True,
     key_bias: torch.Tensor | None = None,
+    topk_ratio: float = 0.0,
     reuse_qkv_memory: bool = False,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 tensors.
-    See sage_attention/sol_attn.cu."""
+    See sage_attention/sol_attn.cu.
+
+    ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
+    per-query-block top-k: keep that fraction of key blocks per query block
+    (sinks and the diagonal still ride on top). tau is ignored then.
+    """
     batch, t, h, d = q.shape
     # Direct entry: run the same shared rule as the registry path, or bad
     # inputs launch anyway and return plausible garbage.
@@ -2371,6 +2402,11 @@ def sol_attn(
                     f"be misaligned; call .contiguous() on it")
     # Per-key logit bias (natural log), folded into the exact branch's
     # (scale, bias) slot; biased blocks must be sink-covered.
+    thr = None
+    if topk_ratio:
+        if not 0.0 < topk_ratio < 1.0:
+            raise ValueError(f"sol_attn: topk_ratio must be in (0, 1), got {topk_ratio}")
+        thr = _topk_threshold(q, k, topk_ratio, scale)
     kb = None
     if key_bias is not None:
         from ..eager.sol_attn import _normalize_key_bias
@@ -2437,6 +2473,7 @@ def sol_attn(
         stream_ptr,
         centroid_tail=centroid_tail,
         key_bias=None if kb is None else _wrap_for_dlpack(kb),
+        threshold=None if thr is None else _wrap_for_dlpack(thr),
     )
     return out
 

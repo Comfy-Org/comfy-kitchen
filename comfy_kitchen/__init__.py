@@ -138,6 +138,7 @@ def sol_attn(
     max_blocks: int = 0,
     centroid_tail: bool = True,
     key_bias: torch.Tensor | None = None,
+    topk_ratio: float = 0.0,
 ) -> torch.Tensor:
     """Sol-Attn training-free sparse attention (arXiv 2607.24027).
 
@@ -159,6 +160,9 @@ def sol_attn(
             array. 0 means no cap. Capping DROPS routed blocks beyond it, so it
             trades quality for memory; a query inside ``sink_q`` routes every
             block and is truncated by any cap.
+        topk_ratio: > 0 selects SLA-style top-k instead of the tau threshold:
+            keep this fraction of key blocks per query block (the selection the
+            lightx2v SLA LoRAs were distilled against). tau is ignored then.
 
     Returns:
         ``(B, T, H, 128)`` attention output.
@@ -170,6 +174,7 @@ def sol_attn(
         int(max_blocks),
         bool(centroid_tail),
         key_bias,
+        float(topk_ratio),
     )
 
 

@@ -121,6 +121,7 @@ extern "C" void launch_sol_attn(
     const void* q, const void* k, const void* v, void* out, void* workspace,
     int batch, int seq_len, int num_heads, int head_dim, int max_blocks,
     float tau, float scale, int centroid_tail, const void* key_bias,
+    const void* ext_threshold,
     int sink_start, int sink_end, int sink_q_start, int sink_q_end,
     int64_t qs_b, int64_t qs_t, int64_t qs_h,
     int64_t ks_b, int64_t ks_t, int64_t ks_h,
@@ -138,6 +139,9 @@ extern "C" void launch_sol_attn(
     const Plan p(batch, seq_len, num_heads, max_blocks);
     char* w = reinterpret_cast<char*>(workspace);
     const float scale_log2 = scale * 1.4426950408889634f;
+    // Top-k selection is a per-row threshold the caller computed (the k-th
+    // largest pooled score); the kernels don't know the difference.
+    const void* thr = ext_threshold ? ext_threshold : (const void*)(w + p.thr);
 
     launch_sol_preprocess(q, k, v, w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb,
                           w + p.kciP, w + p.kcs, w + p.vcT, w + p.thr,
@@ -150,7 +154,7 @@ extern "C" void launch_sol_attn(
                           vs_b, vs_t, vs_h, stream);
     if (centroid_tail) {
         launch_sol_route(w + p.cen8, w + p.cens, w + p.kciP, w + p.kcs, w + p.vcT, w + p.vsc,
-                         w + p.thr, w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart,
+                         thr, w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart,
                          batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ, p.MAXB,
                          sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
         launch_sol_exact(w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb, w + p.vTi, w + p.vsc,
@@ -162,7 +166,7 @@ extern "C" void launch_sol_attn(
         // quality A/B. Its handover writes straight into `out`, which the
         // exact stage reads back in its prologue and overwrites.
         launch_sol_route_perrow(w + p.qiP, w + p.qs, w + p.kciP, w + p.kcs, w + p.vcT,
-                         w + p.vsc, w + p.thr, w + p.idx, w + p.cnt, out,
+                         w + p.vsc, thr, w + p.idx, w + p.cnt, out,
                          w + p.mPartRow, w + p.lPartRow,
                          batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ, p.MAXB,
                          sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);

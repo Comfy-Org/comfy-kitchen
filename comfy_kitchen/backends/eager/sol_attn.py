@@ -74,8 +74,13 @@ def sol_attn(
     sink_q: list[int] | None = None,
     centroid_tail: bool = True,
     key_bias: torch.Tensor | None = None,
+    topk_ratio: float = 0.0,
 ) -> torch.Tensor:
-    """Sol-Attn over ``(B, T, H, D)`` tensors. See the module docstring."""
+    """Sol-Attn over ``(B, T, H, D)`` tensors. See the module docstring.
+
+    ``topk_ratio`` > 0 selects SLA-style per-query-block top-k instead of the
+    tau threshold (sinks and diagonal still forced exact); tau is ignored.
+    """
     b, t, h, d = q.shape
     n = (t + BLOCK - 1) // BLOCK
     if scale is None:
@@ -136,7 +141,12 @@ def sol_attn(
     colmean.scatter_add_(2, qblk.view(1, 1, t, 1).expand(b, h, t, n), s_blk)
     colmean = colmean / lengths.view(1, 1, n, 1)
     idx = torch.arange(n, device=q.device)
-    exact = colmean > thr.permute(0, 2, 1).unsqueeze(-1)            # (B, H, NQ, N)
+    if topk_ratio:
+        kk = max(1, min(n - 1, round(topk_ratio * n)))
+        row_thr = colmean.topk(kk + 1, dim=-1).values[..., -1:]
+        exact = colmean > row_thr
+    else:
+        exact = colmean > thr.permute(0, 2, 1).unsqueeze(-1)            # (B, H, NQ, N)
     exact |= ((idx.view(1, -1) - idx.view(-1, 1)).abs() <= 1).view(1, 1, n, n)
     exact |= ((idx >= sink_kv0) & (idx < sink_kv1)).view(1, 1, 1, n)
     exact |= ((idx >= sink_q0) & (idx < sink_q1)).view(1, 1, n, 1)
@@ -191,11 +201,13 @@ def _op_sol_attn(
     max_blocks: int,
     centroid_tail: bool,
     key_bias: torch.Tensor | None,
+    topk_ratio: float,
 ) -> torch.Tensor:
     kwargs = {
         "q": q, "k": k, "v": v, "tau": tau, "scale": scale,
         "sink_blocks": sink_blocks, "sink_q": sink_q,
         "centroid_tail": centroid_tail, "key_bias": key_bias,
+        "topk_ratio": topk_ratio,
     }
     impl = registry.get_implementation("sol_attn", kwargs=kwargs)
     if _accepts_max_blocks(impl):
@@ -205,7 +217,7 @@ def _op_sol_attn(
 
 @_op_sol_attn.register_fake
 def _op_sol_attn_fake(q, k, v, tau, scale, sink_blocks, sink_q, max_blocks,
-                      centroid_tail, key_bias):
+                      centroid_tail, key_bias, topk_ratio):
     # Contiguous, NOT empty_like(v): both real implementations return
     # contiguous, and for a strided v, empty_like would promise a layout
     # downstream compiled ops never get.

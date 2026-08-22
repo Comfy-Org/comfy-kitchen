@@ -229,7 +229,8 @@ def test_output_strides_agree_across_backends():
         # addition when written positionally.
         fake_strides = torch.ops.comfy_kitchen.sol_attn(
             fv, fv, fv, tau=1.4, scale=None, sink_blocks=[0, 0], sink_q=[0, 0],
-            max_blocks=0, centroid_tail=True, key_bias=None).stride()
+            max_blocks=0, centroid_tail=True, key_bias=None,
+            topk_ratio=0.0).stride()
     assert cuda_strides == eager_strides == fake_strides
 
 
@@ -436,3 +437,58 @@ def test_reuse_qkv_memory_matches_and_uses_fused_storage(centroid_tail):
                                 reuse_qkv_memory=True)
     assert torch.equal(got, ref)
     assert got.untyped_storage().data_ptr() == fused.untyped_storage().data_ptr()
+
+
+@pytest.mark.parametrize("t", [4096, 1000, 3137])
+@pytest.mark.parametrize("centroid_tail", [True, False])
+def test_topk_matches_eager(t, centroid_tail):
+    """SLA-style top-k selection: the CUDA path implements it as a per-row
+    threshold at the (k+1)-th pooled score, so int8 rounding can flip blocks
+    right at the boundary -- hence a slightly looser bar than tau parity.
+    Ragged tails exercise the fp32 threshold's tail-block pooling."""
+    q, k, v = _qkv(1, t, 4)
+    got = ck.sol_attn(q, k, v, topk_ratio=0.2, centroid_tail=centroid_tail)
+    ref = sol_attn_eager(q, k, v, topk_ratio=0.2, centroid_tail=centroid_tail)
+    assert _cos(got, ref) > 0.995
+    # selection changes with the budget
+    assert not torch.equal(got, ck.sol_attn(q, k, v, topk_ratio=0.5,
+                                            centroid_tail=centroid_tail))
+
+
+def test_topk_strided_inputs():
+    """The fp32 threshold pools q/k via a dim-splitting view, which must accept
+    the BHND-transposed views the tau path supports."""
+    g = torch.Generator(device="cuda").manual_seed(3)
+    qh, kh, vh = (torch.randn(1, 4, 1024, HD, device="cuda",
+                              dtype=torch.bfloat16, generator=g) * 0.5
+                  for _ in range(3))
+    q, k, v = (x.transpose(1, 2) for x in (qh, kh, vh))
+    got = ck.sol_attn(q, k, v, topk_ratio=0.2)
+    ref = ck.sol_attn(q.contiguous(), k.contiguous(), v.contiguous(),
+                      topk_ratio=0.2)
+    assert torch.equal(got, ref)
+
+
+def test_topk_budget_moves_toward_dense():
+    """A bigger top-k budget can only move the output toward dense attention."""
+    q, k, v = _qkv(1, 4096, 2)
+    ref = _dense(q, k, v)
+    cs = [_cos(sol_attn_eager(q, k, v, topk_ratio=r), ref)
+          for r in (0.05, 0.2, 0.6)]
+    assert cs[0] < cs[1] < cs[2]
+
+
+def test_topk_keeps_sinks_exact():
+    """Sinks ride on top of the top-k budget, exactly as in tau mode."""
+    q, k, v = _qkv(1, 2048, 2)
+    sinks = [0, 4]
+    got = ck.sol_attn(q, k, v, topk_ratio=0.1, sink_blocks=sinks)
+    ref = sol_attn_eager(q, k, v, topk_ratio=0.1, sink_blocks=sinks)
+    assert _cos(got, ref) > 0.995
+
+
+def test_topk_ratio_validation():
+    from comfy_kitchen.backends import cuda as cuda_backend
+    q, k, v = _qkv(1, 1024, 1)
+    with pytest.raises(ValueError, match="topk_ratio"):
+        cuda_backend.sol_attn(q, k, v, topk_ratio=1.5)
