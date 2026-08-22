@@ -1266,8 +1266,10 @@ def quantize_svdquant_w4a4(
         _dl(xc), _dl(smooth), _dl(q), _dl(ascales),
         m, m_pad, k, act_unsigned, _stream(x),
     )
-    _C.svdquant_lora_down(
-        _dl(lora_src), _dl(lora_down), _dl(lora_act[:m]), m, k, r, _stream(x)
+    lora_down_op = _C.svdquant_lora_down_wmma if has_wmma() else _C.svdquant_lora_down
+    lora_down_op(
+        _dl(lora_src), _dl(lora_down), _dl(lora_act[:m]),
+        m, k, r, _stream(x),
     )
     return q, ascales, lora_act
 

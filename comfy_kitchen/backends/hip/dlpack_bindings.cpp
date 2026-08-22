@@ -85,6 +85,8 @@ void launch_gemv_awq_kernel(const void*, const void*, const void*, const void*, 
                             int, int, int, int, int, int, int, int, hipStream_t);
 void launch_svdquant_lora_down_kernel(const void*, const void*, void*, int, int, int, int, int,
                                       hipStream_t);
+void launch_svdquant_lora_down_wmma_kernel(const void*, const void*, void*, int, int, int, int, int,
+                                           hipStream_t);
 void launch_svdquant_quant_kernel(const void*, const void*, void*, void*, int, int, int, int, int,
                                   bool, hipStream_t);
 void launch_svdquant_gemm_kernel(const void*, const void*, void*, const void*, const void*,
@@ -947,8 +949,8 @@ void gemv_awq_w4a16(nb::ndarray<> x, nb::ndarray<> qweight, nb::ndarray<> wscale
     check_hip_launch();
 }
 
-void svdquant_lora_down(nb::ndarray<> x, nb::ndarray<> lora_down, nb::ndarray<> lora_act, int M,
-                        int K, int R, uintptr_t stream_ptr) {
+void svdquant_lora_down_impl(nb::ndarray<> x, nb::ndarray<> lora_down, nb::ndarray<> lora_act,
+                             int M, int K, int R, uintptr_t stream_ptr, bool use_wmma) {
     constexpr const char* kFn = "svdquant_lora_down";
     require_nonneg(M, kFn, "M");
     require_nonneg(K, kFn, "K");
@@ -961,11 +963,28 @@ void svdquant_lora_down(nb::ndarray<> x, nb::ndarray<> lora_down, nb::ndarray<> 
     require_len(lora_down, static_cast<int64_t>(K) * R, kFn, "lora_down");
     require_len(lora_act, static_cast<int64_t>(M) * R, kFn, "lora_act");
 
-    launch_svdquant_lora_down_kernel(x.data(), lora_down.data(), lora_act.data(), M, K, R,
-                                     map_dtype_to_code(x.dtype()),
-                                     map_dtype_to_code(lora_down.dtype()),
-                                     reinterpret_cast<hipStream_t>(stream_ptr));
+    const int x_code = map_dtype_to_code(x.dtype());
+    const int d_code = map_dtype_to_code(lora_down.dtype());
+    if (use_wmma) {
+        launch_svdquant_lora_down_wmma_kernel(
+            x.data(), lora_down.data(), lora_act.data(), M, K, R, x_code, d_code,
+            reinterpret_cast<hipStream_t>(stream_ptr));
+    } else {
+        launch_svdquant_lora_down_kernel(
+            x.data(), lora_down.data(), lora_act.data(), M, K, R, x_code, d_code,
+            reinterpret_cast<hipStream_t>(stream_ptr));
+    }
     check_hip_launch();
+}
+
+void svdquant_lora_down(nb::ndarray<> x, nb::ndarray<> lora_down, nb::ndarray<> lora_act, int M,
+                        int K, int R, uintptr_t stream_ptr) {
+    svdquant_lora_down_impl(x, lora_down, lora_act, M, K, R, stream_ptr, false);
+}
+
+void svdquant_lora_down_wmma(nb::ndarray<> x, nb::ndarray<> lora_down, nb::ndarray<> lora_act,
+                             int M, int K, int R, uintptr_t stream_ptr) {
+    svdquant_lora_down_impl(x, lora_down, lora_act, M, K, R, stream_ptr, true);
 }
 
 void svdquant_quantize(nb::ndarray<> x, nb::ndarray<> smooth, nb::ndarray<> q,
@@ -1540,6 +1559,7 @@ NB_MODULE(_C, m) {
     m.def("rms_rope", &rms_rope);
     m.def("gemv_awq_w4a16", &gemv_awq_w4a16);
     m.def("svdquant_lora_down", &svdquant_lora_down);
+    m.def("svdquant_lora_down_wmma", &svdquant_lora_down_wmma);
     m.def("svdquant_quantize", &svdquant_quantize);
     m.def("svdquant_gemm", &svdquant_gemm);
 }

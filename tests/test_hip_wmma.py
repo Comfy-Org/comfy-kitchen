@@ -1975,6 +1975,72 @@ def test_svdquant_validates_its_operands(hip):
     assert torch.isfinite(out).all()
 
 
+@needs_wmma
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("rank", [1, 7, 16, 17, 32, 33, 64, 65, 96, 128, 192, 256])
+def test_svdquant_lora_down_matches_fp32_reference(hip, dtype, rank):
+    """The WMMA LoRA-down path handles partial M/R tiles and accumulates in fp32."""
+    torch.manual_seed(rank)
+    m, k = 19, 128
+    x = torch.randn(m, k, device=DEV, dtype=dtype)
+    smooth = torch.ones(k, device=DEV, dtype=dtype)
+    lora_down = torch.randn(k, rank, device=DEV, dtype=dtype)
+
+    _, _, lora_act = hip.quantize_svdquant_w4a4(
+        x, smooth, lora_down, pad_size=16
+    )
+    ref = x.float() @ lora_down.float()
+
+    torch.testing.assert_close(
+        lora_act[:m], ref, rtol=2e-3, atol=2e-3
+    )
+    assert torch.count_nonzero(lora_act[m:]) == 0
+
+
+def test_svdquant_lora_down_scalar_fallback(hip, monkeypatch):
+    """Devices without matrix cores retain the scalar LoRA-down path."""
+    torch.manual_seed(0)
+    m, k, rank = 5, 64, 7
+    x = torch.randn(m, k, device=DEV, dtype=torch.float16)
+    smooth = torch.ones(k, device=DEV, dtype=torch.float16)
+    lora_down = torch.randn(k, rank, device=DEV, dtype=torch.float16)
+    monkeypatch.setattr(hip, "has_wmma", lambda: False)
+
+    _, _, lora_act = hip.quantize_svdquant_w4a4(
+        x, smooth, lora_down, pad_size=16
+    )
+    ref = x.float() @ lora_down.float()
+
+    torch.testing.assert_close(lora_act[:m], ref, rtol=2e-3, atol=2e-3)
+    assert torch.count_nonzero(lora_act[m:]) == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("act_unsigned", [False, True])
+def test_svdquant_activation_quantizer_group_layout(hip, dtype, act_unsigned):
+    """Each 16-thread group preserves nibble order and transposed scales."""
+    from comfy_kitchen.backends.eager.svdquant import _pack_int4_row_major
+
+    m, k = 3, 128
+    values = torch.arange(k, device=DEV).repeat(m, 1)
+    if act_unsigned:
+        values = values.remainder(16)
+    else:
+        values = values.remainder(15) - 7
+    x = values.to(dtype)
+    smooth = torch.ones(k, device=DEV, dtype=dtype)
+    lora_down = torch.zeros(k, 1, device=DEV, dtype=dtype)
+
+    q, ascales, _ = hip.quantize_svdquant_w4a4(
+        x, smooth, lora_down, pad_size=16, act_unsigned=act_unsigned
+    )
+
+    assert torch.equal(q[:m], _pack_int4_row_major(values))
+    assert torch.count_nonzero(q[m:]) == 0
+    assert torch.equal(ascales[:, :m], torch.ones_like(ascales[:, :m]))
+    assert torch.count_nonzero(ascales[:, m:]) == 0
+
+
 def test_stochastic_rounding_rejects_non_contiguous_rng(hip):
     """The kernel writes the result into rng, which a copy would silently discard."""
     x = torch.randn(8, 16, device=DEV, dtype=torch.bfloat16)
