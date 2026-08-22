@@ -27,5 +27,11 @@ if ($Check) {
     $arguments += '--check'
 }
 
-& $Python @arguments
+$pythonCommand = Get-Command -Name $Python -CommandType Application -ErrorAction SilentlyContinue
+if ($null -eq $pythonCommand) {
+    Write-Error "Python executable not found: $Python"
+    exit 1
+}
+
+& $pythonCommand.Source @arguments
 exit $LASTEXITCODE
