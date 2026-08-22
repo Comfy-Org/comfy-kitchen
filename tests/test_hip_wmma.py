@@ -2015,13 +2015,46 @@ def test_svdquant_lora_down_scalar_fallback(hip, monkeypatch):
     assert torch.count_nonzero(lora_act[m:]) == 0
 
 
+@needs_wmma
+def test_svdquant_lora_down_wmma_entry_falls_back_for_fp32(hip):
+    """Float32 operands take the scalar path inside the WMMA launcher."""
+    torch.manual_seed(0)
+    m, k, rank = 19, 128, 17
+    x = torch.randn(m, k, device=DEV, dtype=torch.float32)
+    smooth = torch.ones(k, device=DEV, dtype=torch.float32)
+    lora_down = torch.randn(k, rank, device=DEV, dtype=torch.float32)
+
+    _, _, lora_act = hip.quantize_svdquant_w4a4(
+        x, smooth, lora_down, pad_size=16
+    )
+    ref = x @ lora_down
+
+    torch.testing.assert_close(lora_act[:m], ref, rtol=2e-3, atol=2e-3)
+    assert torch.count_nonzero(lora_act[m:]) == 0
+
+
+def test_svdquant_lora_down_wmma_reports_entry_point(hip):
+    """Validation errors identify the WMMA binding rather than the scalar binding."""
+    m, k, rank = 1, 64, 1
+    x = torch.zeros(m, k, device=DEV, dtype=torch.float16)
+    lora_down = torch.zeros(k, rank, device=DEV, dtype=torch.float16)
+    bad_lora_act = torch.zeros(m, rank, device=DEV, dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="svdquant_lora_down_wmma: lora_act"):
+        hip._C.svdquant_lora_down_wmma(
+            hip._dl(x), hip._dl(lora_down), hip._dl(bad_lora_act),
+            m, k, rank, hip._stream(x),
+        )
+
+
+@pytest.mark.parametrize("k", [128, 1088])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("act_unsigned", [False, True])
-def test_svdquant_activation_quantizer_group_layout(hip, dtype, act_unsigned):
+def test_svdquant_activation_quantizer_group_layout(hip, dtype, act_unsigned, k):
     """Each 16-thread group preserves nibble order and transposed scales."""
     from comfy_kitchen.backends.eager.svdquant import _pack_int4_row_major
 
-    m, k = 3, 128
+    m = 3
     values = torch.arange(k, device=DEV).repeat(m, 1)
     if act_unsigned:
         values = values.remainder(16)
