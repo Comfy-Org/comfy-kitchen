@@ -87,10 +87,24 @@ def benchmark(name, n, k):
     qact = torch.empty((m, k), device="cuda", dtype=torch.int8)
     act_scale = torch.empty(m, device="cuda", dtype=torch.float32)
     out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    spill_rotated = None
+    spill_partials = None
+    if hip._C.convrot_int8_needs_spill(m, k, 2):
+        spill_rotated = torch.empty((m, k), device="cuda", dtype=torch.bfloat16)
+        spill_partials = torch.empty((m, k // 256), device="cuda", dtype=torch.float32)
 
     def quantize():
         hip._C.quantize_int8_convrot(
-            hip._dl(x), hip._dl(qact), hip._dl(act_scale), m, k, 256, 0, hip._stream(x)
+            hip._dl(x),
+            hip._dl(qact),
+            hip._dl(act_scale),
+            None if spill_rotated is None else hip._dl(spill_rotated),
+            None if spill_partials is None else hip._dl(spill_partials),
+            m,
+            k,
+            256,
+            0,
+            hip._stream(x),
         )
 
     def gemm():
