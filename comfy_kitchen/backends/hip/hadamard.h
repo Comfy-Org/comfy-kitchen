@@ -20,6 +20,8 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "rope_math.h"
+
 namespace comfy::hip_backend {
 
 // convrot_quant_kernel handles 256/G groups per pass and rotates in log4(G)
@@ -237,10 +239,20 @@ template <int ACT>
 __forceinline__ __device__ float load_input_act(
     const void* x, int64_t in_row, int col, int K, int code) {
     if constexpr (ACT == kActSwiGLU) {
-        // Matches torch silu(gate) * up.
+        // Match F.silu(gate) * up in the storage dtype. See the CUDA
+        // load_input_act comment: an fp32 product changes the row absmax.
         const float gate = load_in(x, in_row + col, code);
         const float up = load_in(x, in_row + K + col, code);
-        return (gate / (1.0f + expf(-gate))) * up;
+        const float silu = gate / (1.0f + expf(-gate));
+        if (code == 0) {
+            return silu * up;
+        }
+        if (code == 1) {
+            const float silu_r = round_fp16(silu);
+            return round_fp16(silu_r * up);
+        }
+        const float silu_r = round_bf16(silu);
+        return round_bf16(silu_r * up);
     } else {
         return apply_input_act<ACT>(load_in(x, in_row + col, code));
     }
