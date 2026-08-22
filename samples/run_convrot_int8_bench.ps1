@@ -10,7 +10,11 @@ param(
     [switch]$Check
 )
 
-$env:PYTHONPATH = $CKRoot
+$env:PYTHONPATH = if ([string]::IsNullOrEmpty($env:PYTHONPATH)) {
+    $CKRoot
+} else {
+    "$CKRoot$([IO.Path]::PathSeparator)$env:PYTHONPATH"
+}
 $arguments = @(
     "$PSScriptRoot\convrot_int8_bench.py",
     '--ck-root', $CKRoot,

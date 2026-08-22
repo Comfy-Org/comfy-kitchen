@@ -18,13 +18,20 @@ SHAPES = {
 }
 
 
+def positive_int(value):
+    result = int(value)
+    if result < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return result
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ck-root", type=Path, required=True)
     parser.add_argument("--shape", choices=["all", *SHAPES], default="all")
     parser.add_argument("--rows", type=int, default=3802)
     parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--iterations", type=int, default=11)
+    parser.add_argument("--iterations", type=positive_int, default=11)
     parser.add_argument("--check", action="store_true")
     return parser.parse_args()
 
