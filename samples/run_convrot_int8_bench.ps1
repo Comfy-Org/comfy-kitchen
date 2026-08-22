@@ -16,7 +16,7 @@ $env:PYTHONPATH = if ([string]::IsNullOrEmpty($env:PYTHONPATH)) {
     "$CKRoot$([IO.Path]::PathSeparator)$env:PYTHONPATH"
 }
 $arguments = @(
-    "$PSScriptRoot\convrot_int8_bench.py",
+    (Join-Path $PSScriptRoot 'convrot_int8_bench.py'),
     '--ck-root', $CKRoot,
     '--shape', $Shape,
     '--rows', $Rows,

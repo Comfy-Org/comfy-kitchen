@@ -41,8 +41,16 @@ ck_root = args.ck_root.resolve()
 
 if ck_root not in Path(ck.__file__).resolve().parents:
     raise RuntimeError(f"Imported comfy_kitchen from {ck.__file__}, expected {ck_root}")
-if torch.version.hip is None or torch.cuda.get_device_properties(0).gcnArchName < "gfx1150":
+if torch.version.hip is None:
     raise RuntimeError("This benchmark requires a gfx1150-or-newer ROCm device")
+
+arch = torch.cuda.get_device_properties(0).gcnArchName.partition(":")[0]
+arch_number = arch[3:] if arch.startswith("gfx") else ""
+if not (
+    arch_number.isdigit()
+    and (arch_number.startswith("115") or arch_number.startswith("12"))
+):
+    raise RuntimeError("This benchmark requires a gfx115x or gfx12xx ROCm device")
 
 
 def check_linear():
