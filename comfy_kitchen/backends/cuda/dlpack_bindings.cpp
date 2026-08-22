@@ -17,8 +17,10 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/vector.h>
 #include <cuda_runtime.h>
 #include <climits>
+#include <vector>
 #include <cstring>
 #include <optional>
 
@@ -259,6 +261,19 @@ extern "C" {
         int kt, int kh, int kw,
         int causal_t, int causal_h, int causal_w,
         float scale, int dtype_code, cudaStream_t stream);
+
+    // Sol-Attn sparse attention — see sage_attention/sol_attn.cu.
+    size_t sol_attn_workspace_bytes(int batch, int seq_len, int num_heads, int max_blocks);
+    void launch_sol_attn(
+        const void* q, const void* k, const void* v, void* out, void* workspace,
+        int batch, int seq_len, int num_heads, int head_dim, int max_blocks,
+        float tau, float scale, int centroid_tail, const void* key_bias,
+        const void* ext_threshold,
+        int sink_start, int sink_end, int sink_q_start, int sink_q_end,
+        int64_t qs_b, int64_t qs_t, int64_t qs_h,
+        int64_t ks_b, int64_t ks_t, int64_t ks_h,
+        int64_t vs_b, int64_t vs_t, int64_t vs_h,
+        cudaStream_t stream);
 
     // Fused AdaLN — see ops/adaln.cu. subtract_mean selects LayerNorm (true)
     // or RMSNorm (false) statistics.
@@ -1454,6 +1469,46 @@ void na3d(
         (int)batch, (int)t_size, (int)h_size, (int)w_size, (int)num_heads, (int)head_dim,
         (int)kt, (int)kh, (int)kw, causal_t, causal_h, causal_w,
         scale, dtype_code, stream);
+}
+
+// Nanobind wrappers for Sol-Attn sparse attention
+int64_t sol_attn_workspace(int64_t batch, int64_t seq_len, int64_t num_heads,
+                           int64_t max_blocks)
+{
+    return (int64_t)sol_attn_workspace_bytes((int)batch, (int)seq_len, (int)num_heads,
+                                             (int)max_blocks);
+}
+
+void sol_attn(
+    nb::ndarray<nb::device::cuda> q,
+    nb::ndarray<nb::device::cuda> k,
+    nb::ndarray<nb::device::cuda> v,
+    nb::ndarray<nb::device::cuda> out,
+    nb::ndarray<nb::device::cuda> workspace,
+    int64_t batch, int64_t seq_len, int64_t num_heads, int64_t head_dim,
+    int64_t max_blocks,
+    float tau, float scale,
+    int64_t sink_start, int64_t sink_end, int64_t sink_q_start, int64_t sink_q_end,
+    std::vector<int64_t> q_strides, std::vector<int64_t> k_strides,
+    std::vector<int64_t> v_strides,
+    uintptr_t stream_ptr,
+    bool centroid_tail,
+    std::optional<nb::ndarray<nb::device::cuda>> key_bias = std::nullopt,
+    std::optional<nb::ndarray<nb::device::cuda>> threshold = std::nullopt)
+{
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
+        throw std::runtime_error("sol_attn: threshold must have B*H*ceil(T/64) elements");
+    launch_sol_attn(
+        q.data(), k.data(), v.data(), out.data(), workspace.data(),
+        (int)batch, (int)seq_len, (int)num_heads, (int)head_dim, (int)max_blocks,
+        tau, scale, centroid_tail ? 1 : 0,
+        key_bias ? key_bias->data() : nullptr,
+        threshold ? threshold->data() : nullptr,
+        (int)sink_start, (int)sink_end, (int)sink_q_start, (int)sink_q_end,
+        q_strides[0], q_strides[1], q_strides[2],
+        k_strides[0], k_strides[1], k_strides[2],
+        v_strides[0], v_strides[1], v_strides[2], stream);
 }
 
 // Nanobind wrapper for fused AdaLN (LayerNorm statistics)
@@ -3699,6 +3754,26 @@ NB_MODULE(_C, m) {
           nb::arg("kt"), nb::arg("kh"), nb::arg("kw"),
           nb::arg("causal_t"), nb::arg("causal_h"), nb::arg("causal_w"),
           nb::arg("scale"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
+
+    m.def("sol_attn_workspace", &sol_attn_workspace,
+          "Workspace bytes required by sol_attn for this shape",
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
+          nb::arg("max_blocks"));
+
+    m.def("sol_attn", &sol_attn,
+          "Sol-Attn training-free sparse attention (BF16 in/out, head_dim 128)",
+          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("out"),
+          nb::arg("workspace"),
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
+          nb::arg("head_dim"), nb::arg("max_blocks"),
+          nb::arg("tau"), nb::arg("scale"),
+          nb::arg("sink_start"), nb::arg("sink_end"),
+          nb::arg("sink_q_start"), nb::arg("sink_q_end"),
+          nb::arg("q_strides"), nb::arg("k_strides"), nb::arg("v_strides"),
+          nb::arg("stream_ptr"),
+          nb::arg("centroid_tail") = true,
+          nb::arg("key_bias") = nb::none(),
+          nb::arg("threshold") = nb::none());
 
     m.def("flash_attention_decode", &flash_attention_decode,
           "Flash Attention decode over a fixed-capacity variable-length KV cache",

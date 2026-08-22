@@ -606,26 +606,6 @@ RS_32_to_8(float RS[][num_tiles_k][8], uint32_t RS_8[][num_tiles_k / 2][4]) {
   }
 }
 
-__device__ __forceinline__ uint32_t pack_u8x4(float a, float b, float c,
-                                              float d) {
-  uint32_t qa, qb, qc, qd;
-  // Keep the FP32-to-integer conversions adjacent to the two packed U8
-  // conversions. ptxas recognizes each pair as one F2IP instruction on
-  // Ampere and newer, instead of emitting four scalar F2IP plus two I2IP.
-  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qa) : "f"(a));
-  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qb) : "f"(b));
-  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qc) : "f"(c));
-  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qd) : "f"(d));
-  uint32_t qdc, packed;
-  asm volatile("cvt.pack.sat.u8.s32.b32 %0, %1, %2, 0;"
-               : "=r"(qdc)
-               : "r"(qd), "r"(qc));
-  asm volatile("cvt.pack.sat.u8.s32.b32 %0, %1, %2, %3;"
-               : "=r"(packed)
-               : "r"(qb), "r"(qa), "r"(qdc));
-  return packed;
-}
-
 struct PackedU8RowSum {
   uint32_t probabilities;
   float denominator;
@@ -643,7 +623,7 @@ pack_scaled_exp2_u8x4(const int32_t a, const int32_t b, const int32_t c,
       math::ptx_exp2(fmaf(__int2float_rz(c), scale, negative_m));
   const float probability_d =
       math::ptx_exp2(fmaf(__int2float_rz(d), scale, negative_m));
-  const uint32_t probabilities = pack_u8x4(
+  const uint32_t probabilities = mma::pack_u8x4(
       probability_a, probability_b, probability_c, probability_d);
   const uint32_t denominator = __dp4a(probabilities, 0x01010101u, 0u);
   return {probabilities, __uint2float_rn(denominator)};
@@ -721,16 +701,16 @@ RS_to_u8(T RS[][num_tiles_k][8], uint32_t RS_u8[][num_tiles_k / 2][4]) {
 #pragma unroll
     for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++) {
       RS_u8[fq][fk][0] =
-          pack_u8x4(RS[fq][fk * 2][0], RS[fq][fk * 2][1],
+          mma::pack_u8x4(RS[fq][fk * 2][0], RS[fq][fk * 2][1],
                     RS[fq][fk * 2][4], RS[fq][fk * 2][5]);
       RS_u8[fq][fk][1] =
-          pack_u8x4(RS[fq][fk * 2][2], RS[fq][fk * 2][3],
+          mma::pack_u8x4(RS[fq][fk * 2][2], RS[fq][fk * 2][3],
                     RS[fq][fk * 2][6], RS[fq][fk * 2][7]);
       RS_u8[fq][fk][2] =
-          pack_u8x4(RS[fq][fk * 2 + 1][0], RS[fq][fk * 2 + 1][1],
+          mma::pack_u8x4(RS[fq][fk * 2 + 1][0], RS[fq][fk * 2 + 1][1],
                     RS[fq][fk * 2 + 1][4], RS[fq][fk * 2 + 1][5]);
       RS_u8[fq][fk][3] =
-          pack_u8x4(RS[fq][fk * 2 + 1][2], RS[fq][fk * 2 + 1][3],
+          mma::pack_u8x4(RS[fq][fk * 2 + 1][2], RS[fq][fk * 2 + 1][3],
                     RS[fq][fk * 2 + 1][6], RS[fq][fk * 2 + 1][7]);
     }
   }

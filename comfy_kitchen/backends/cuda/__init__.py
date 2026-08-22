@@ -28,6 +28,7 @@ from comfy_kitchen._rope_utils import (
 
 __all__ = [
     "na3d",
+    "sol_attn",
     "adaln",
     "rms_adaln",
     "apply_rope",
@@ -192,6 +193,7 @@ from comfy_kitchen.constraints import (  # noqa: E402
     ParamConstraint,
     ValidationResult,
     na3d_common_call_rule,
+    sol_attn_common_call_rule,
 )
 from comfy_kitchen.float_utils import roundup  # noqa: E402
 from comfy_kitchen.registry import registry  # noqa: E402
@@ -2313,6 +2315,176 @@ def na3d(
     return out
 
 
+def _topk_threshold(q, k, topk_ratio, scale):
+    """Routing threshold that turns the route kernels' ``s > thr`` into
+    per-query-block top-k: the (k+1)-th largest pooled score per row. Computed
+    in fp32 from the same pooled/centred quantities the kernel scores with, so
+    the kept set matches exact top-k up to int8 rounding at the boundary."""
+    b, t, h, d = q.shape
+    n = (t + 63) // 64
+
+    def block_mean(x):
+        # fp32 accumulation without materialising an fp32 copy of x
+        full = (t // 64) * 64
+        m = x[:, :full].view(b, -1, 64, h, d).sum(2, dtype=torch.float32) / 64.0
+        if full != t:
+            tail = x[:, full:].sum(1, keepdim=True, dtype=torch.float32) / (t - full)
+            m = torch.cat([m, tail], dim=1)
+        return m
+
+    cen = block_mean(q)
+    kc = block_mean(k)
+    kc = kc - kc.mean(dim=1, keepdim=True)
+    s = torch.einsum("bnhd,bmhd->bhnm", cen, kc) * (scale * 1.4426950408889634)
+    kk = max(1, min(n - 1, round(topk_ratio * n)))
+    return s.topk(kk + 1, dim=-1).values[..., -1].contiguous()
+
+
+def sol_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tau: float = 1.0,
+    scale: float | None = None,
+    sink_blocks: list[int] | None = None,
+    sink_q: list[int] | None = None,
+    max_blocks: int = 0,
+    workspace: torch.Tensor | None = None,
+    centroid_tail: bool = True,
+    key_bias: torch.Tensor | None = None,
+    topk_ratio: float = 0.0,
+    reuse_qkv_memory: bool = False,
+) -> torch.Tensor:
+    """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 tensors.
+    See sage_attention/sol_attn.cu.
+
+    ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
+    per-query-block top-k: keep that fraction of key blocks per query block
+    (sinks and the diagonal still ride on top). tau is ignored then.
+    """
+    batch, t, h, d = q.shape
+    # Direct entry: run the same shared rule as the registry path, or bad
+    # inputs launch anyway and return plausible garbage.
+    if q.dtype != torch.bfloat16:
+        raise ValueError(f"sol_attn: q/k/v must be bfloat16, got {q.dtype}")
+    # Against q.device, not the registry gate (which caches the CURRENT
+    # device): sub-sm_80 cubins are stubs that run and return garbage.
+    cap = torch.cuda.get_device_capability(q.device)
+    if cap < (8, 0):
+        raise RuntimeError(
+            f"sol_attn: requires sm_80+ (cp.async, INT8 MMA); {q.device} is "
+            f"sm_{cap[0]}{cap[1]}")
+    check = sol_attn_common_call_rule(
+        {"q": q, "k": k, "v": v, "sink_blocks": sink_blocks, "sink_q": sink_q})
+    if not check.success:
+        raise ValueError(f"sol_attn: {check.failed_param}: {check.failure_reason}")
+    if scale is None:
+        scale = d ** -0.5
+    # Only the last dim must be contiguous (the staging loads are 16 B), so a
+    # BHND view goes in as-is; full contiguity would copy all three inputs.
+    for name, x in (("q", q), ("k", k), ("v", v)):
+        if x.stride(-1) != 1:
+            raise ValueError(f"sol_attn: {name} must have a contiguous last dim")
+        # A misaligned 16 B load faults asynchronously and poisons the CUDA
+        # context, so reject it here: the base pointer and every leading stride
+        # must be 16-byte aligned. Size-1 dims never contribute to an offset,
+        # so their (arbitrary) strides are exempt.
+        if x.data_ptr() % 16:
+            raise ValueError(
+                f"sol_attn: {name} must be 16-byte aligned (storage_offset "
+                f"{x.storage_offset()} leaves it at +{x.data_ptr() % 16}); "
+                f"call .contiguous() on it")
+        for dim in range(3):
+            if x.shape[dim] > 1 and x.stride(dim) % 8:
+                raise ValueError(
+                    f"sol_attn: {name} stride({dim}) = {x.stride(dim)} elements "
+                    f"is not a multiple of 8, so the 16-byte staging loads would "
+                    f"be misaligned; call .contiguous() on it")
+    # Per-key logit bias (natural log), folded into the exact branch's
+    # (scale, bias) slot; biased blocks must be sink-covered.
+    thr = None
+    if topk_ratio:
+        if not 0.0 < topk_ratio < 1.0:
+            raise ValueError(f"sol_attn: topk_ratio must be in (0, 1), got {topk_ratio}")
+        thr = _topk_threshold(q, k, topk_ratio, scale)
+    kb = None
+    if key_bias is not None:
+        from ..eager.sol_attn import _normalize_key_bias
+        key_bias = _normalize_key_bias(key_bias, batch, t, q.device)
+        kb = (key_bias * 1.4426950408889634).expand(batch, t).contiguous()
+    if reuse_qkv_memory:
+        # q/k/v are read only by the preprocess, and `out` is written only by
+        # later kernels on the same stream, so their storage can hold the
+        # output. Raw-storage reuse, so fused qkv chunk views work too. The
+        # caller must not touch q/k/v afterwards -- their contents are gone.
+        need_out = batch * t * h * d * q.element_size()
+        for cand in (q, k, v):
+            storage = cand.untyped_storage()
+            if storage.nbytes() >= need_out:
+                out = torch.empty(0, dtype=q.dtype, device=q.device)
+                out.set_(storage, 0, (batch, t, h, d))
+                break
+        else:  # unreachable: q alone is exactly need_out bytes
+            raise ValueError("sol_attn: no input storage large enough for out")
+    else:
+        out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    need = _C.sol_attn_workspace(batch, t, h, max_blocks)
+    if workspace is None:
+        workspace = torch.empty(need, dtype=torch.uint8, device=q.device)
+    elif workspace.numel() * workspace.element_size() < need:
+        raise ValueError(
+            f"sol_attn workspace too small: {workspace.numel() * workspace.element_size()} "
+            f"< {need} bytes; size it with sol_attn_workspace_bytes()")
+    elif workspace.device != q.device:
+        raise ValueError(
+            f"sol_attn: workspace on {workspace.device}, inputs on {q.device}")
+    elif not workspace.is_contiguous():
+        # The kernels address it as one linear byte range from data_ptr().
+        raise ValueError("sol_attn: workspace must be contiguous")
+    elif workspace.data_ptr() % 16:
+        # Plan offsets are 16-byte aligned relative to the BASE; a view with an
+        # odd storage_offset passes the byte-count check and then faults with a
+        # context-poisoning misaligned address inside the kernels.
+        raise ValueError(
+            "sol_attn: workspace base must be 16-byte aligned "
+            "(avoid storage_offset slices; allocate it directly)")
+    sb = [0, 0] if sink_blocks is None else list(sink_blocks)
+    sq = [0, 0] if sink_q is None else list(sink_q)
+    if max_blocks > 0:
+        n_blk = (t + 63) // 64
+        n_sink = max(0, min(sb[1], n_blk) - sb[0])
+        if n_sink > max_blocks:
+            raise ValueError(
+                f"sol_attn: max_blocks={max_blocks} is smaller than the "
+                f"{n_sink}-block sink range {sb}; sinks are never truncated, "
+                f"so both constraints cannot hold -- raise max_blocks or "
+                f"shrink the sink range")
+    stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
+    _C.sol_attn(
+        _wrap_for_dlpack(q),
+        _wrap_for_dlpack(k),
+        _wrap_for_dlpack(v),
+        _wrap_for_dlpack(out),
+        _wrap_for_dlpack(workspace),
+        batch, t, h, d, int(max_blocks),
+        float(tau), float(scale),
+        int(sb[0]), int(sb[1]), int(sq[0]), int(sq[1]),
+        list(q.stride()[:3]), list(k.stride()[:3]), list(v.stride()[:3]),
+        stream_ptr,
+        centroid_tail=centroid_tail,
+        key_bias=None if kb is None else _wrap_for_dlpack(kb),
+        threshold=None if thr is None else _wrap_for_dlpack(thr),
+    )
+    return out
+
+
+def sol_attn_workspace_bytes(batch: int, seq_len: int, num_heads: int,
+                             max_blocks: int = 0) -> int:
+    """Workspace bytes ``sol_attn`` needs for this shape. Reuse one buffer across
+    calls to avoid re-allocating ~1 GB at video lengths."""
+    return _C.sol_attn_workspace(batch, seq_len, num_heads, max_blocks)
+
+
 def _adaln_impl(kernel, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float):
     orig_shape = x.shape
     d = x.shape[-1]
@@ -3012,6 +3184,25 @@ def _build_constraints() -> dict:
     cuda_devices = frozenset({"cuda"})
 
     constraints = {
+        "sol_attn": FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "k": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "v": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
+            call_rules=(sol_attn_common_call_rule,),
+        ),
         "na3d": FunctionConstraints(
             params={
                 "q": ParamConstraint(

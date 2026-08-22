@@ -62,6 +62,7 @@ __all__ = [
     "flash_attention_decode_is_available",
     "na2d",
     "na3d",
+    "sol_attn",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -124,6 +125,57 @@ __all__ = [
 # =============================================================================
 # Public API Functions
 # =============================================================================
+
+
+def sol_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tau: float = 1.0,
+    scale: float | None = None,
+    sink_blocks: list[int] | None = None,
+    sink_q: list[int] | None = None,
+    max_blocks: int = 0,
+    centroid_tail: bool = True,
+    key_bias: torch.Tensor | None = None,
+    topk_ratio: float = 0.0,
+) -> torch.Tensor:
+    """Sol-Attn training-free sparse attention (arXiv 2607.24027).
+
+    Each 64-token query block attends a routed subset of key blocks exactly and
+    covers the rest with one pooled term per block, so the full sequence still
+    contributes to the softmax denominator. The win grows with sequence length;
+    below roughly 12k tokens dense or a fused attention is usually faster.
+
+    Args:
+        q, k, v: ``(B, T, H, 128)`` tensors, same shape and dtype. The CUDA
+            backend requires bfloat16; head_dim is fixed at 128.
+        tau: Routing threshold in sigmas of the proxy row. Higher routes fewer
+            blocks exactly: cheaper and less accurate.
+        scale: Score scale; None means ``head_dim ** -0.5``.
+        sink_blocks: ``[start, end)`` key blocks always attended exactly by every
+            query -- conditioning rows, typically.
+        sink_q: ``[start, end)`` query blocks that attend everything exactly.
+        max_blocks: Cap on routed blocks per query block, to bound the index
+            array. 0 means no cap. Capping DROPS routed blocks beyond it, so it
+            trades quality for memory; a query inside ``sink_q`` routes every
+            block and is truncated by any cap.
+        topk_ratio: > 0 selects SLA-style top-k instead of the tau threshold:
+            keep this fraction of key blocks per query block (the selection the
+            lightx2v SLA LoRAs were distilled against). tau is ignored then.
+
+    Returns:
+        ``(B, T, H, 128)`` attention output.
+    """
+    return torch.ops.comfy_kitchen.sol_attn(
+        q, k, v, tau, scale,
+        [0, 0] if sink_blocks is None else list(sink_blocks),
+        [0, 0] if sink_q is None else list(sink_q),
+        int(max_blocks),
+        bool(centroid_tail),
+        key_bias,
+        float(topk_ratio),
+    )
 
 
 def na3d(
