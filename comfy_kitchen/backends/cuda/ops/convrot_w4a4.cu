@@ -4,6 +4,7 @@
 // with row/column dequant scales.
 #include "dtype_dispatch.cuh"
 #include "svdquant_utils.cuh"
+#include "../tensor.h"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -1867,16 +1868,18 @@ __global__ void unpack_int4_to_int8_vec8_kernel(
 extern "C" {
 
 void launch_quantize_int4_rowwise_kernel(
-    const void* input,
-    void* output,
-    void* scales,
-    int64_t M,
-    int64_t K,
-    int input_dtype_code,
+    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> output_arg,
+    comfy::tensor::TensorArg<2> scales_arg,
     bool stochastic,
     uint64_t seed,
     cudaStream_t stream)
 {
+    const void* input = input_arg.data;
+    void* output = output_arg.data;
+    void* scales = scales_arg.data;
+    const int64_t M = input_arg.meta.sizes[0];
+    const int64_t K = input_arg.meta.sizes[1];
+    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
     if (K % comfy::svdquant::kGroupSize != 0) return;
     constexpr int kThreads = 256;
     const dim3 grid(static_cast<unsigned int>(M));
@@ -1938,17 +1941,18 @@ void launch_quantize_int4_rowwise_kernel(
 }
 
 void launch_quantize_int4_rowwise_convrot64_kernel(
-    const void* input,
-    void* output,
-    void* scales,
-    int64_t M,
-    int64_t K,
-    int group_size,
-    int input_dtype_code,
+    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> output_arg,
+    comfy::tensor::TensorArg<2> scales_arg, int group_size,
     bool stochastic,
     uint64_t seed,
     cudaStream_t stream)
 {
+    const void* input = input_arg.data;
+    void* output = output_arg.data;
+    void* scales = scales_arg.data;
+    const int64_t M = input_arg.meta.sizes[0];
+    const int64_t K = input_arg.meta.sizes[1];
+    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
     if ((group_size != 16 && group_size != 64 && group_size != kConvRotGroup) || K % group_size != 0) return;
     constexpr int block_threads_multi = 1024;
     constexpr int block_threads_15360 = 640;
@@ -2173,17 +2177,18 @@ void launch_quantize_int4_rowwise_convrot64_kernel(
 }
 
 void launch_quantize_int4_rowwise_convrot64_to_int8_kernel(
-    const void* input,
-    void* output,
-    void* scales,
-    int64_t M,
-    int64_t K,
-    int group_size,
-    int input_dtype_code,
+    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> output_arg,
+    comfy::tensor::TensorArg<2> scales_arg, int group_size,
     bool stochastic,
     uint64_t seed,
     cudaStream_t stream)
 {
+    const void* input = input_arg.data;
+    void* output = output_arg.data;
+    void* scales = scales_arg.data;
+    const int64_t M = input_arg.meta.sizes[0];
+    const int64_t K = input_arg.meta.sizes[1];
+    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
     if (group_size != kConvRotGroup || K % kConvRotGroup != 0) return;
     constexpr int block_threads_multi = 1024;
     constexpr int block_threads_15360 = 640;
@@ -2332,16 +2337,17 @@ void launch_quantize_int4_rowwise_convrot64_to_int8_kernel(
 }
 
 void launch_dequantize_int4_convrot64_kernel(
-    const void* input,
-    const void* scales,
-    void* output,
-    int64_t num_rows,
-    int64_t num_cols,
-    int64_t scale_size,
-    int group_size,
-    int output_dtype_code,
+    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<1> scales_arg,
+    comfy::tensor::TensorArg<2> output_arg, int group_size,
     cudaStream_t stream)
 {
+    const void* input = input_arg.data;
+    const void* scales = scales_arg.data;
+    void* output = output_arg.data;
+    const int64_t num_rows = output_arg.meta.sizes[0];
+    const int64_t num_cols = output_arg.meta.sizes[1];
+    const int64_t scale_size = scales_arg.meta.sizes[0];
+    const int output_dtype_code = static_cast<int>(output_arg.meta.dtype);
     if (num_rows == 0 || num_cols == 0) return;
     if ((group_size != 16 && group_size != 64 && group_size != kConvRotGroup) || num_cols % group_size != 0) return;
 
@@ -2774,12 +2780,13 @@ void launch_int4_linear_kernel(
 }
 
 void launch_unpack_int4_to_int8_kernel(
-    const void* input,
-    void* output,
-    int64_t rows,
-    int64_t K_half,
+    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> output_arg,
     cudaStream_t stream)
 {
+    const void* input = input_arg.data;
+    void* output = output_arg.data;
+    const int64_t rows = input_arg.meta.sizes[0];
+    const int64_t K_half = input_arg.meta.sizes[1];
     if (rows == 0 || K_half == 0) return;
     const int64_t total_packed = rows * K_half;
     constexpr int block_threads = 256;

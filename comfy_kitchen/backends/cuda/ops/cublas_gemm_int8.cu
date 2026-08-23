@@ -16,6 +16,7 @@
  */
 #include <cublasLt.h>
 #include <cublas_v2.h>
+#include "../tensor.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
@@ -228,23 +229,19 @@ void cublas_gemm_int8_impl(
 extern "C" {
 
 void launch_cublas_gemm_int8_kernel(
-    const void* A_ptr,
-    const void* B_ptr,
-    void* C_ptr,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    void* workspace_ptr,
-    int64_t workspace_size,
+    comfy::tensor::TensorArg<2> a, comfy::tensor::TensorArg<2> b,
+    comfy::tensor::TensorArg<2> c, comfy::tensor::TensorArg<1> workspace,
     cudaStream_t stream) {
-  
+  const int64_t M = a.meta.sizes[0];
+  const int64_t N = b.meta.sizes[0];
+  const int64_t K = a.meta.sizes[1];
   comfy::cublas_gemm_int8_impl(
-      static_cast<const int8_t*>(A_ptr),
-      static_cast<const int8_t*>(B_ptr),
-      static_cast<int32_t*>(C_ptr),
+      static_cast<const int8_t*>(a.data),
+      static_cast<const int8_t*>(b.data),
+      static_cast<int32_t*>(c.data),
       M, N, K,
-      workspace_ptr,
-      workspace_size,
+      workspace.data,
+      workspace.meta.sizes[0],
       stream);
 }
 

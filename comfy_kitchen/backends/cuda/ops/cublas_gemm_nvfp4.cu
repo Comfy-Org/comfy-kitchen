@@ -16,6 +16,7 @@
  */
 #include <cublasLt.h>
 #include <cublas_v2.h>
+#include "../tensor.h"
 #include <cuda.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -293,20 +294,17 @@ void cublas_gemm_blockwise_fp4_impl(
 extern "C" {
 
 void launch_cublas_gemm_blockwise_fp4_kernel(
-    const void* B_ptr,
-    const void* B_decode_scale_ptr,
-    const void* A_ptr,
-    const void* A_decode_scale_ptr,
-    void* D_ptr,
-    const void* bias_ptr,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    const float* alpha_device_ptr,
-    int out_dtype_code,  // 0=float32, 1=float16, 2=bfloat16
-    void* workspace_ptr,
+    comfy::tensor::TensorArg<2> b, comfy::tensor::TensorArg<2> b_scale,
+    comfy::tensor::TensorArg<2> a, comfy::tensor::TensorArg<2> a_scale,
+    comfy::tensor::TensorArg<2> out, comfy::tensor::TensorArg<1> bias,
+    comfy::tensor::TensorArg<1> alpha, comfy::tensor::TensorArg<1> workspace,
     bool accumulate,
     cudaStream_t stream) {
+  const int64_t M = a.meta.sizes[0];
+  const int64_t N = b.meta.sizes[0];
+  const int64_t K = a.meta.sizes[1] * 2;
+  const void* bias_ptr = bias.meta.sizes[0] == 0 ? nullptr : bias.data;
+  const int out_dtype_code = static_cast<int>(out.meta.dtype);
   
   // Note: cuBLAS uses column-major layout, but PyTorch uses row-major
   // So we swap A and B to match cuBLAS conventions
@@ -314,11 +312,11 @@ void launch_cublas_gemm_blockwise_fp4_kernel(
   // In cuBLAS column-major: B^T @ A^T = D^T
   
   comfy::cublas_gemm_blockwise_fp4_impl(
-      B_ptr,                // weight data (was A_ptr=activation)
-      B_decode_scale_ptr,   // weight scale
-      A_ptr,                // activation data (was B_ptr=weight)
-      A_decode_scale_ptr,   // activation scale
-      D_ptr,
+      b.data,                // weight data (was A_ptr=activation)
+      b_scale.data,   // weight scale
+      a.data,                // activation data (was B_ptr=weight)
+      a_scale.data,   // activation scale
+      out.data,
       bias_ptr,
       N,  // A_rows (weight rows in column-major)
       K / 2,  // A_cols (K is doubled for FP4 packing)
@@ -331,11 +329,11 @@ void launch_cublas_gemm_blockwise_fp4_kernel(
       true,   // transa (transpose A)
       false,  // transb (don't transpose B)
       false,  // grad
-      workspace_ptr,
-      workspace_ptr ? 32 * 1024 * 1024 : 0,  // workspace_size (32MB default)
+      workspace.data,
+      workspace.data ? 32 * 1024 * 1024 : 0,  // workspace_size (32MB default)
       accumulate,
       0,  // math_sm_count
-      alpha_device_ptr,
+      static_cast<const float*>(alpha.data),
       stream);
 }
 

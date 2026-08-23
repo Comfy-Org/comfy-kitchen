@@ -53,6 +53,7 @@
 // fusion uses warp-level bf16/fp16 m16n8k16 MMA over 16-rank slices and adds
 // the low-rank correction before the final global store.
 #include "svdquant_utils.cuh"
+#include "../tensor.h"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -670,26 +671,27 @@ __global__ void svdquant_scaled_mm_w4a4_kernel(
 extern "C" {
 
 void launch_svdquant_scaled_mm_w4a4_kernel(
-    const void* act,
-    const void* wgt,
-    const void* ascales,
-    const void* wscales,
-    const void* lora_act_in,
-    const void* lora_up,
-    const void* bias,
-    void* out,
-    int M,
-    int N,
-    int K,
-    int R,
+    comfy::tensor::TensorArg<2> act,
+    comfy::tensor::TensorArg<1> wgt,
+    comfy::tensor::TensorArg<2> ascales,
+    comfy::tensor::TensorArg<1> wscales,
+    comfy::tensor::TensorArg<2> lora_act_in,
+    comfy::tensor::TensorArg<1> lora_up,
+    comfy::tensor::TensorArg<1> bias,
+    comfy::tensor::TensorArg<2> out,
     int act_unsigned,
-    int out_dtype_code,
     int tile_packed,
     int fast_accum,
     int shared_scale,
     int fuse_lora,
     cudaStream_t stream)
 {
+    const int M = static_cast<int>(act.meta.sizes[0]);
+    const int N = static_cast<int>(out.meta.sizes[1]);
+    const int K = static_cast<int>(act.meta.sizes[1]) * 2;
+    const int R = static_cast<int>(lora_act_in.meta.sizes[1]);
+    const int out_dtype_code = static_cast<int>(out.meta.dtype);
+    const void* bias_ptr = bias.meta.sizes[0] == 0 ? nullptr : bias.data;
     if (K % comfy::svdquant::kGroupSize != 0) return;
 
     const dim3 grid((N + kBlockN - 1) / kBlockN, (M + kBlockM - 1) / kBlockM);
@@ -699,14 +701,14 @@ void launch_svdquant_scaled_mm_w4a4_kernel(
         svdquant_scaled_mm_w4a4_kernel<                                                     \
             OutType, Unsigned, TilePacked, FastAccum, SharedScale, FuseLora>                \
             <<<grid, block, 0, stream>>>(                                                   \
-            reinterpret_cast<const int8_t*>(act),                                           \
-            reinterpret_cast<const int8_t*>(wgt),                                           \
-            reinterpret_cast<const OutType*>(ascales),                                      \
-            reinterpret_cast<const OutType*>(wscales),                                      \
-            reinterpret_cast<const OutType*>(lora_act_in),                                  \
-            reinterpret_cast<const OutType*>(lora_up),                                      \
-            reinterpret_cast<const OutType*>(bias),                                         \
-            reinterpret_cast<OutType*>(out),                                                \
+            reinterpret_cast<const int8_t*>(act.data),                                           \
+            reinterpret_cast<const int8_t*>(wgt.data),                                           \
+            reinterpret_cast<const OutType*>(ascales.data),                                      \
+            reinterpret_cast<const OutType*>(wscales.data),                                      \
+            reinterpret_cast<const OutType*>(lora_act_in.data),                                  \
+            reinterpret_cast<const OutType*>(lora_up.data),                                      \
+            reinterpret_cast<const OutType*>(bias_ptr),                                         \
+            reinterpret_cast<OutType*>(out.data),                                                \
             M, N, K, R)
 
     #define DISPATCH_SHARED_SCALE(OutType, Unsigned, TilePacked, FastAccum)                  \

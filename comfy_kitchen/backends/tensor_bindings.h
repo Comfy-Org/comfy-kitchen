@@ -27,8 +27,11 @@ inline DType dtype_from_dlpack(const nanobind::dlpack::dtype& dtype) {
         return DType::BFloat16;
     } else if (code == DTypeCode::UInt && dtype.bits == 8) {
         return DType::UInt8;
-    } else if (code == DTypeCode::Int && dtype.bits == 8) {
-        return DType::Int8;
+    } else if (code == DTypeCode::Int) {
+        if (dtype.bits == 8) return DType::Int8;
+        if (dtype.bits == 32) return DType::Int32;
+    } else if (code == DTypeCode::Bool) {
+        return DType::Bool;
     } else if (dtype.code == kDLFloat8E4M3FN) {
         return DType::Float8E4M3;
     } else if (dtype.code == kDLFloat8E5M2) {

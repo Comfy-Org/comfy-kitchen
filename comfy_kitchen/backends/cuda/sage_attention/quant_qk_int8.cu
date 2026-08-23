@@ -17,6 +17,7 @@
 //
 #include "dtype_dispatch.cuh"
 #include "float_utils.cuh"
+#include "../tensor.h"
 
 #include <cstdint>
 #include <cuda_bf16.h>
@@ -689,12 +690,30 @@ __global__ __launch_bounds__(128, 3) void quant_qk_fused(
 } // namespace
 
 extern "C" void launch_quant_qk_per_thread_int8(
-    const void *q, void *q_int8, void *q_scale, const void *k, void *k_int8,
-    void *k_scale, int B, int H_q, int Lq, int H_kv, int Lk, int C, int BLKQ,
-    int WARPQ, int BLKK, int WARPK, int64_t q_stride_b, int64_t q_stride_h,
-    int64_t q_stride_n, int64_t k_stride_b, int64_t k_stride_h,
-    int64_t k_stride_n, int input_dtype_code, void *anchor_indices,
+    comfy::tensor::TensorArg<4> q_arg, comfy::tensor::TensorArg<4> q_int8_arg,
+    comfy::tensor::TensorArg<3> q_scale_arg, comfy::tensor::TensorArg<4> k_arg,
+    comfy::tensor::TensorArg<4> k_int8_arg, comfy::tensor::TensorArg<3> k_scale_arg,
+    int BLKQ, int WARPQ, int BLKK, int WARPK, void *anchor_indices,
     cudaStream_t stream) {
+  const void* q = q_arg.data;
+  void* q_int8 = q_int8_arg.data;
+  void* q_scale = q_scale_arg.data;
+  const void* k = k_arg.data;
+  void* k_int8 = k_int8_arg.data;
+  void* k_scale = k_scale_arg.data;
+  const int B = static_cast<int>(q_arg.meta.sizes[0]);
+  const int H_q = static_cast<int>(q_arg.meta.sizes[1]);
+  const int Lq = static_cast<int>(q_arg.meta.sizes[2]);
+  const int H_kv = static_cast<int>(k_arg.meta.sizes[1]);
+  const int Lk = static_cast<int>(k_arg.meta.sizes[2]);
+  const int C = static_cast<int>(q_arg.meta.sizes[3]);
+  const int64_t q_stride_b = q_arg.meta.strides[0];
+  const int64_t q_stride_h = q_arg.meta.strides[1];
+  const int64_t q_stride_n = q_arg.meta.strides[2];
+  const int64_t k_stride_b = k_arg.meta.strides[0];
+  const int64_t k_stride_h = k_arg.meta.strides[1];
+  const int64_t k_stride_n = k_arg.meta.strides[2];
+  const int input_dtype_code = static_cast<int>(q_arg.meta.dtype);
   if (C != 64 && C != 128 && C != 256) {
     throw std::runtime_error(
         "quant_qk_per_thread_int8: padded head_dim must be 64, 128, or 256");

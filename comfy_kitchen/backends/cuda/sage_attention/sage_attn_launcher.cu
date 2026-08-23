@@ -8,7 +8,9 @@
 // state. V scaling is fused and LSE is not returned.
 
 #include "qk_int_sv_i8_cuda.cuh"
+#include "../tensor.h"
 #include <algorithm>
+#include <climits>
 #include <stdexcept>
 #include <string>
 
@@ -76,16 +78,79 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
 } // anonymous namespace
 
 extern "C" void launch_sage_attn_kernel(
-    const void *q, const void *k, const void *v, void *o, const void *q_scale,
-    const void *k_scale, const void *v_scale, const void *mask,
-    int64_t mask_stride_b, int64_t mask_stride_h, int64_t mask_stride_q,
-    int64_t mask_stride_k, int mask_dtype_code, int cta_k, int batch_size,
-    int qo_len,
-    int kv_len, int num_qo_heads, int num_kv_heads, int head_dim,
-    int stride_bz_q, int stride_seq_q, int stride_h_q, int stride_bz_k,
-    int stride_seq_k, int stride_h_k, int stride_bz_v, int stride_h_v,
-    int stride_d_v, int stride_bz_o, int stride_seq_o, int stride_h_o,
-    float sm_scale, int output_dtype_code, cudaStream_t stream) {
+    comfy::tensor::TensorArg<4> q_arg, comfy::tensor::TensorArg<4> k_arg,
+    comfy::tensor::TensorArg<4> v_arg, comfy::tensor::TensorArg<4> o_arg,
+    comfy::tensor::TensorArg<1> q_scale_arg,
+    comfy::tensor::TensorArg<1> k_scale_arg,
+    comfy::tensor::TensorArg<1> v_scale_arg,
+    comfy::tensor::TensorArg<4> mask_arg, int cta_k, float sm_scale, cudaStream_t stream) {
+  const void* q = q_arg.data;
+  const void* k = k_arg.data;
+  const void* v = v_arg.data;
+  void* o = o_arg.data;
+  const void* q_scale = q_scale_arg.data;
+  const void* k_scale = k_scale_arg.data;
+  const void* v_scale = v_scale_arg.data;
+  const void* mask = mask_arg.data;
+  const int batch_size = static_cast<int>(q_arg.meta.sizes[0]);
+  const int num_qo_heads = static_cast<int>(q_arg.meta.sizes[1]);
+  const int qo_len = static_cast<int>(q_arg.meta.sizes[2]);
+  const int head_dim = static_cast<int>(q_arg.meta.sizes[3]);
+  const int num_kv_heads = static_cast<int>(k_arg.meta.sizes[1]);
+  const int kv_len = static_cast<int>(k_arg.meta.sizes[2]);
+  if (q_arg.meta.dtype != comfy::tensor::DType::Int8 ||
+      k_arg.meta.dtype != comfy::tensor::DType::Int8 ||
+      v_arg.meta.dtype != comfy::tensor::DType::Int8 ||
+      q_scale_arg.meta.dtype != comfy::tensor::DType::Float32 ||
+      k_scale_arg.meta.dtype != comfy::tensor::DType::Float32 ||
+      v_scale_arg.meta.dtype != comfy::tensor::DType::Float32 ||
+      (o_arg.meta.dtype != comfy::tensor::DType::Float16 &&
+       o_arg.meta.dtype != comfy::tensor::DType::BFloat16)) {
+    throw std::runtime_error("sage_attn: incompatible tensor dtypes");
+  }
+  if (k_arg.meta.sizes[0] != batch_size || k_arg.meta.sizes[3] != head_dim ||
+      o_arg.meta.sizes[0] != batch_size ||
+      o_arg.meta.sizes[1] != num_qo_heads || o_arg.meta.sizes[2] != qo_len ||
+      o_arg.meta.sizes[3] != head_dim ||
+      v_arg.meta.sizes[0] != batch_size ||
+      v_arg.meta.sizes[1] != num_kv_heads ||
+      v_arg.meta.sizes[2] != head_dim) {
+    throw std::runtime_error("sage_attn: incompatible tensor shapes");
+  }
+  if (mask && mask_arg.meta.dtype != comfy::tensor::DType::Bool &&
+      mask_arg.meta.dtype != comfy::tensor::DType::Float16 &&
+      mask_arg.meta.dtype != comfy::tensor::DType::BFloat16 &&
+      mask_arg.meta.dtype != comfy::tensor::DType::Float32) {
+    throw std::runtime_error("sage_attn: unsupported attention mask dtype");
+  }
+  const auto stride32 = [](int64_t value) {
+    if (value < INT_MIN || value > INT_MAX) {
+      throw std::overflow_error("sage_attn: tensor stride exceeds int32 range");
+    }
+    return static_cast<int>(value);
+  };
+  const int stride_bz_q = stride32(q_arg.meta.strides[0]);
+  const int stride_seq_q = stride32(q_arg.meta.strides[2]);
+  const int stride_h_q = stride32(q_arg.meta.strides[1]);
+  const int stride_bz_k = stride32(k_arg.meta.strides[0]);
+  const int stride_seq_k = stride32(k_arg.meta.strides[2]);
+  const int stride_h_k = stride32(k_arg.meta.strides[1]);
+  const int stride_bz_v = stride32(v_arg.meta.strides[0]);
+  const int stride_h_v = stride32(v_arg.meta.strides[1]);
+  const int stride_d_v = stride32(v_arg.meta.strides[2]);
+  const int stride_bz_o = stride32(o_arg.meta.strides[0]);
+  const int stride_seq_o = stride32(o_arg.meta.strides[2]);
+  const int stride_h_o = stride32(o_arg.meta.strides[1]);
+  const int64_t mask_stride_b = mask_arg.meta.strides[0];
+  const int64_t mask_stride_h = mask_arg.meta.strides[1];
+  const int64_t mask_stride_q = mask_arg.meta.strides[2];
+  const int64_t mask_stride_k = mask_arg.meta.strides[3];
+  const int output_dtype_code = static_cast<int>(o_arg.meta.dtype);
+  int mask_dtype_code = -1;
+  if (mask) {
+    if (mask_arg.meta.dtype == comfy::tensor::DType::Bool) mask_dtype_code = 3;
+    else mask_dtype_code = static_cast<int>(mask_arg.meta.dtype);
+  }
   if (cta_k != 64 && cta_k != 128) {
     throw std::runtime_error("sage_attn: cta_k must be 64 or 128");
   }

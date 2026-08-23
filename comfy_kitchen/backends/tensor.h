@@ -17,6 +17,8 @@ enum class DType : std::int32_t {
     Int8 = 4,
     Float8E4M3 = 5,
     Float8E5M2 = 6,
+    Bool = 7,
+    Int32 = 8,
 };
 
 template <std::size_t Rank>
