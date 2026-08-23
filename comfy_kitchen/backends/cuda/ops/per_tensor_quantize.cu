@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "utils.cuh"
+#include "tensor.h"
 #include "float_utils.cuh"
 #include "dtype_dispatch.cuh"
 
@@ -168,19 +169,19 @@ __global__ void stochastic_round_fp8_kernel(
 extern "C" {
 
 void launch_quantize_fp8_kernel(
-    const void* input, 
-    void* output, 
-    const void* scale, 
-    int64_t numel,
-    int input_dtype_code, 
+    comfy::tensor::TensorArg<1> input,
+    comfy::tensor::TensorArg<1> scale,
+    comfy::tensor::TensorArg<1> output,
     int output_dtype_code,
     cudaStream_t stream) {
+    const int64_t numel = input.meta.sizes[0];
+    const int input_dtype_code = static_cast<int>(input.meta.dtype);
   
     if (numel == 0) {
         return;
     }
 
-    const float* scale_f = static_cast<const float*>(scale);
+    const float* scale_f = static_cast<const float*>(scale.data);
     
     constexpr int vals_per_thread = comfy::kE4M3Alignment;
     constexpr int vals_per_block = vals_per_thread * comfy::kQMaxKernelThreads;
@@ -195,8 +196,8 @@ void launch_quantize_fp8_kernel(
         InputType, OutputType, [&] {
             comfy::quantize_fp8_tensor_kernel<InputType, OutputType>
                 <<<blocks, comfy::kQMaxKernelThreads, 0, stream>>>(
-                    static_cast<const InputType*>(input),
-                    static_cast<OutputType*>(output),
+                    static_cast<const InputType*>(input.data),
+                    static_cast<OutputType*>(output.data),
                     scale_f,
                     numel);
         });
@@ -209,19 +210,19 @@ void launch_quantize_fp8_kernel(
 }
 
 void launch_dequantize_fp8_kernel(
-    const void* input,
-    void* output,
-    const void* scale,
-    int64_t numel,
+    comfy::tensor::TensorArg<1> input,
+    comfy::tensor::TensorArg<1> scale,
+    comfy::tensor::TensorArg<1> output,
     int input_dtype_code,
-    int output_dtype_code,
     cudaStream_t stream) {
+    const int64_t numel = input.meta.sizes[0];
+    const int output_dtype_code = static_cast<int>(output.meta.dtype);
 
     if (numel == 0) {
         return;
     }
 
-    const float* scale_f = static_cast<const float*>(scale);
+    const float* scale_f = static_cast<const float*>(scale.data);
 
     constexpr int vals_per_thread = 8;
     constexpr int vals_per_block = vals_per_thread * comfy::kQMaxKernelThreads;
@@ -235,8 +236,8 @@ void launch_dequantize_fp8_kernel(
         InputType, OutputType, [&] {
             comfy::dequantize_fp8_tensor_kernel<InputType, OutputType>
                 <<<blocks, comfy::kQMaxKernelThreads, 0, stream>>>(
-                    static_cast<const InputType*>(input),
-                    static_cast<OutputType*>(output),
+                    static_cast<const InputType*>(input.data),
+                    static_cast<OutputType*>(output.data),
                     scale_f,
                     numel);
         });
@@ -249,20 +250,15 @@ void launch_dequantize_fp8_kernel(
 }
 
 void launch_stochastic_round_fp8_kernel(
-    void* rng_and_output,
-    const void* input,
-    int64_t numel,
-    int rng_dtype_code,
-    int input_dtype_code,
+    comfy::tensor::TensorArg<1> rng_and_output,
+    comfy::tensor::TensorArg<1> input,
     int output_dtype_code,
     cudaStream_t stream) {
+    const int64_t numel = input.meta.sizes[0];
+    const int input_dtype_code = static_cast<int>(input.meta.dtype);
 
     if (numel == 0) {
         return;
-    }
-
-    if (rng_dtype_code != 3) {
-        throw std::runtime_error("stochastic_round_fp8 requires uint8 RNG storage");
     }
 
     constexpr int vals_per_thread = 1;
@@ -274,8 +270,8 @@ void launch_stochastic_round_fp8_kernel(
         InputType, OutputType, [&] {
             comfy::stochastic_round_fp8_kernel<InputType, OutputType>
                 <<<blocks, comfy::kQMaxKernelThreads, 0, stream>>>(
-                    static_cast<uint8_t*>(rng_and_output),
-                    static_cast<const InputType*>(input),
+                    static_cast<uint8_t*>(rng_and_output.data),
+                    static_cast<const InputType*>(input.data),
                     numel);
         });
 

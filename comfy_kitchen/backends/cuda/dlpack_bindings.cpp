@@ -31,42 +31,28 @@ namespace nb = nanobind;
 // Helper: Map nanobind dtype to internal dtype code
 // Returns: 0=float32, 1=float16, 2=bfloat16, 3=uint8, 4=int8, 5=float8_e4m3fn, 6=float8_e5m2
 int map_dtype_to_code(const nb::dlpack::dtype& dtype) {
-    if (dtype.code == (uint8_t)nb::dlpack::dtype_code::Float) {
-        if (dtype.bits == 32) return 0;  // float32
-        if (dtype.bits == 16) return 1;  // float16
-        if (dtype.bits == 8) return 5;   // float8_e4m3fn (default)
-    } else if (dtype.code == (uint8_t)nb::dlpack::dtype_code::Bfloat && dtype.bits == 16) {
-        return 2;  // bfloat16
-    } else if (dtype.code == (uint8_t)nb::dlpack::dtype_code::UInt && dtype.bits == 8) {
-        return 3;  // uint8
-    } else if (dtype.code == (uint8_t)nb::dlpack::dtype_code::Int && dtype.bits == 8) {
-        return 4;  // int8
-    }
-    return -1;  // unsupported
+    return static_cast<int>(comfy::tensor::dtype_from_dlpack(dtype));
 }
 
+using comfy::tensor::DType;
 using comfy::tensor::TensorArg;
+using comfy::tensor::make_contiguous_tensor_arg;
+using comfy::tensor::make_flat_tensor_arg;
 using comfy::tensor::make_tensor_arg;
 
 // Forward declarations of CUDA kernel wrappers
 extern "C" {
-    void launch_quantize_fp8_kernel(const void* input, void* output, 
-                                    const void* scale, int64_t numel,
-                                    int input_dtype_code, int output_dtype_code,
-                                    cudaStream_t stream);
+    void launch_quantize_fp8_kernel(
+        TensorArg<1> input, TensorArg<1> scale, TensorArg<1> output,
+        int output_dtype_code, cudaStream_t stream);
     
-    void launch_dequantize_fp8_kernel(const void* input, void* output,
-                                      const void* scale, int64_t numel,
-                                      int input_dtype_code, int output_dtype_code,
-                                      cudaStream_t stream);
+    void launch_dequantize_fp8_kernel(
+        TensorArg<1> input, TensorArg<1> scale, TensorArg<1> output,
+        int input_dtype_code, cudaStream_t stream);
 
-    void launch_stochastic_round_fp8_kernel(void* rng_and_output,
-                                            const void* input,
-                                            int64_t numel,
-                                            int rng_dtype_code,
-                                            int input_dtype_code,
-                                            int output_dtype_code,
-                                            cudaStream_t stream);
+    void launch_stochastic_round_fp8_kernel(
+        TensorArg<1> rng_and_output, TensorArg<1> input,
+        int output_dtype_code, cudaStream_t stream);
 
     void launch_cublas_gemm_blockwise_fp4_kernel(
         const void* B_ptr,
@@ -90,17 +76,8 @@ extern "C" {
         cudaStream_t stream);
 
     void launch_quantize_nvfp4_kernel(
-        const void* input,
-        const void* global_scale,
-        void* output,
-        void* block_scales,
-        int64_t num_rows,
-        int64_t num_cols,
-        int64_t orig_rows,
-        int64_t orig_cols,
-        float epsilon,
-        int input_dtype_code,
-        bool hi_first,
+        TensorArg<2> input, TensorArg<1> global_scale, TensorArg<2> output,
+        TensorArg<2> block_scales, float epsilon, bool hi_first,
         cudaStream_t stream);
 
     void launch_rms_rope_kernel(
@@ -110,25 +87,12 @@ extern "C" {
         bool split_half, cudaStream_t stream);
 
     void launch_dequantize_nvfp4_kernel(
-        const void* input,
-        const void* global_scale,
-        const void* block_scales,
-        void* output,
-        int64_t num_rows,
-        int64_t num_cols,
-        int output_dtype_code,
-        bool hi_first,
+        TensorArg<2> input, TensorArg<1> global_scale,
+        TensorArg<2> block_scales, TensorArg<2> output, bool hi_first,
         cudaStream_t stream);
 
     void launch_quantize_mxfp8_kernel(
-        const void* input,
-        void* output,
-        void* block_scales,
-        int64_t num_rows,
-        int64_t num_cols,
-        int64_t orig_rows,
-        int64_t orig_cols,
-        int input_dtype_code,
+        TensorArg<2> input, TensorArg<2> output, TensorArg<2> block_scales,
         cudaStream_t stream);
 
     // SageAttention kernel launchers
@@ -214,27 +178,16 @@ extern "C" {
 
     // Fused 3D neighborhood attention — see ops/na3d.cu.
     void launch_na3d_kernel(
-        const void* q, const void* k, const void* v, void* out,
-        int batch, int t_size, int h_size, int w_size, int num_heads, int head_dim,
-        int kt, int kh, int kw,
-        int causal_t, int causal_h, int causal_w,
-        float scale, int dtype_code, cudaStream_t stream);
+        TensorArg<6> q, TensorArg<6> k, TensorArg<6> v, TensorArg<6> out,
+        int kt, int kh, int kw, int causal_t, int causal_h, int causal_w,
+        float scale, cudaStream_t stream);
 
     // Fused AdaLN — see ops/adaln.cu. subtract_mean selects LayerNorm (true)
     // or RMSNorm (false) statistics.
     void launch_adaln_kernel(
-        const void* x,
-        const void* scale,
-        const void* shift,
-        void*       out,
-        int64_t     N,
-        int64_t     D,
-        int64_t     scale_group,
-        int64_t     shift_group,
-        float       eps,
-        int         dtype_code,
-        bool        subtract_mean,
-        cudaStream_t stream);
+        TensorArg<2> x, TensorArg<2> scale, TensorArg<2> shift,
+        TensorArg<2> out, int64_t scale_group, int64_t shift_group, float eps,
+        bool subtract_mean, cudaStream_t stream);
 }
 
 // Nanobind wrapper for quantize_per_tensor_fp8
@@ -246,20 +199,26 @@ void quantize_per_tensor_fp8(
     int output_dtype_code,
     int64_t numel,
     uintptr_t stream_ptr) {
-    
-    // Validate input dtype code (0=float32, 1=float16, 2=bfloat16)
-    if (input_dtype_code < 0 || input_dtype_code > 2) {
+    auto input_arg = make_flat_tensor_arg(input);
+    auto scale_arg = make_flat_tensor_arg(scale);
+    auto output_arg = make_flat_tensor_arg(output);
+    if (input_dtype_code < 0 || input_dtype_code > 2 ||
+        input_dtype_code != static_cast<int>(input_arg.meta.dtype)) {
         throw std::runtime_error("Unsupported input dtype for quantize_per_tensor_fp8");
     }
-    
-    // Validate output dtype code (5=e4m3fn, 6=e5m2)
     if (output_dtype_code < 5 || output_dtype_code > 6) {
         throw std::runtime_error("Unsupported output dtype for quantize_per_tensor_fp8");
     }
-    
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    launch_quantize_fp8_kernel(input.data(), output.data(), scale.data(), 
-                              numel, input_dtype_code, output_dtype_code, stream);
+    if (numel < 0 || input_arg.meta.sizes[0] < numel ||
+        output_arg.meta.sizes[0] < numel || scale_arg.meta.sizes[0] < 1 ||
+        scale_arg.meta.dtype != DType::Float32 ||
+        output_arg.meta.dtype != DType::UInt8) {
+        throw std::runtime_error("Invalid tensor layout for quantize_per_tensor_fp8");
+    }
+    input_arg.meta.sizes[0] = numel;
+    launch_quantize_fp8_kernel(
+        input_arg, scale_arg, output_arg, output_dtype_code,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for dequantize_per_tensor_fp8
@@ -271,20 +230,26 @@ void dequantize_per_tensor_fp8(
     int output_dtype_code,
     int64_t numel,
     uintptr_t stream_ptr) {
-    
-    // Validate input dtype code (5=float8_e4m3fn, 6=float8_e5m2)
+    auto input_arg = make_flat_tensor_arg(input);
+    auto scale_arg = make_flat_tensor_arg(scale);
+    auto output_arg = make_flat_tensor_arg(output);
     if (input_dtype_code != 5 && input_dtype_code != 6) {
         throw std::runtime_error("Unsupported input dtype code for dequantize_per_tensor_fp8 (must be 5 or 6)");
     }
-    
-    // Validate output dtype code (0=float32, 1=float16, 2=bfloat16)
-    if (output_dtype_code < 0 || output_dtype_code > 2) {
+    if (output_dtype_code < 0 || output_dtype_code > 2 ||
+        output_dtype_code != static_cast<int>(output_arg.meta.dtype)) {
         throw std::runtime_error("Unsupported output dtype for dequantize_per_tensor_fp8 (must be float32, float16, or bfloat16)");
     }
-    
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    launch_dequantize_fp8_kernel(input.data(), output.data(), scale.data(),
-                                 numel, input_dtype_code, output_dtype_code, stream);
+    if (numel < 0 || input_arg.meta.sizes[0] < numel ||
+        output_arg.meta.sizes[0] < numel || scale_arg.meta.sizes[0] < 1 ||
+        scale_arg.meta.dtype != DType::Float32 ||
+        input_arg.meta.dtype != DType::UInt8) {
+        throw std::runtime_error("Invalid tensor layout for dequantize_per_tensor_fp8");
+    }
+    input_arg.meta.sizes[0] = numel;
+    launch_dequantize_fp8_kernel(
+        input_arg, scale_arg, output_arg, input_dtype_code,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 void stochastic_round_fp8(
@@ -293,30 +258,26 @@ void stochastic_round_fp8(
     int output_dtype_code,
     int64_t numel,
     uintptr_t stream_ptr) {
-
-    int rng_dtype_code = map_dtype_to_code(rng_and_output.dtype());
-    if (rng_dtype_code != 3) {
+    auto rng_arg = make_flat_tensor_arg(rng_and_output);
+    auto input_arg = make_flat_tensor_arg(input);
+    if (rng_arg.meta.dtype != DType::UInt8) {
         throw std::runtime_error("stochastic_round_fp8 requires uint8 RNG storage");
     }
-
-    int input_dtype_code = map_dtype_to_code(input.dtype());
+    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
     if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error("Unsupported input dtype for stochastic_round_fp8");
     }
-
     if (output_dtype_code < 5 || output_dtype_code > 6) {
         throw std::runtime_error("Unsupported output dtype for stochastic_round_fp8");
     }
-
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (numel < 0 || input_arg.meta.sizes[0] < numel ||
+        rng_arg.meta.sizes[0] < numel) {
+        throw std::runtime_error("Invalid tensor layout for stochastic_round_fp8");
+    }
+    input_arg.meta.sizes[0] = numel;
     launch_stochastic_round_fp8_kernel(
-        rng_and_output.data(),
-        input.data(),
-        numel,
-        rng_dtype_code,
-        input_dtype_code,
-        output_dtype_code,
-        stream);
+        rng_arg, input_arg, output_dtype_code,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for cublas_gemm_blockwise_fp4
@@ -389,41 +350,31 @@ void quantize_nvfp4(
     bool pad_16x,
     bool hi_first,
     uintptr_t stream_ptr) {
-
-    // Get input dimensions (orig_rows, orig_cols)
-    int64_t orig_rows = input.shape(0);
-    int64_t orig_cols = input.shape(1);
-
-    // Calculate effective padded dimensions
-    int64_t num_rows = orig_rows;
-    int64_t num_cols = orig_cols;
-    
-    if (pad_16x) {
-        // Round up to nearest multiple of 16
-        num_rows = (orig_rows + 15) / 16 * 16;
-        num_cols = (orig_cols + 15) / 16 * 16;
-    }
-
-    // Get input dtype code
-    int input_dtype_code = map_dtype_to_code(input.dtype());
+    auto input_arg = make_contiguous_tensor_arg<2>(input);
+    auto global_scale_arg = make_flat_tensor_arg(global_scale);
+    auto output_arg = make_contiguous_tensor_arg<2>(output);
+    auto block_scales_arg = make_contiguous_tensor_arg<2>(block_scales);
+    const int64_t num_rows =
+        pad_16x ? (input_arg.meta.sizes[0] + 15) / 16 * 16
+                : input_arg.meta.sizes[0];
+    const int64_t num_cols =
+        pad_16x ? (input_arg.meta.sizes[1] + 15) / 16 * 16
+                : input_arg.meta.sizes[1];
+    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
     if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error("Unsupported input dtype for FP4 quantization (must be float32, float16, or bfloat16)");
     }
-
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (output_arg.meta.sizes[0] != num_rows ||
+        output_arg.meta.sizes[1] * 2 != num_cols ||
+        output_arg.meta.dtype != DType::UInt8 ||
+        block_scales_arg.meta.dtype != DType::UInt8 ||
+        global_scale_arg.meta.sizes[0] < 1 ||
+        global_scale_arg.meta.dtype != DType::Float32) {
+        throw std::runtime_error("Invalid tensor layout for FP4 quantization");
+    }
     launch_quantize_nvfp4_kernel(
-        input.data(),
-        global_scale.data(),
-        output.data(),
-        block_scales.data(),
-        num_rows,
-        num_cols,
-        orig_rows,
-        orig_cols,
-        epsilon,
-        input_dtype_code,
-        hi_first,
-        stream);
+        input_arg, global_scale_arg, output_arg, block_scales_arg, epsilon,
+        hi_first, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for dequantize_nvfp4
@@ -435,27 +386,25 @@ void dequantize_nvfp4(
     int output_dtype_code,
     bool hi_first,
     uintptr_t stream_ptr) {
-
-    // Get output dimensions (should match input logical dimensions)
-    int64_t num_rows = output.shape(0);
-    int64_t num_cols = output.shape(1);
-
-    // Validate output dtype code (0=float32, 1=float16, 2=bfloat16)
-    if (output_dtype_code < 0 || output_dtype_code > 2) {
+    auto input_arg = make_contiguous_tensor_arg<2>(input);
+    auto global_scale_arg = make_flat_tensor_arg(global_scale);
+    auto block_scales_arg = make_contiguous_tensor_arg<2>(block_scales);
+    auto output_arg = make_contiguous_tensor_arg<2>(output);
+    if (output_dtype_code < 0 || output_dtype_code > 2 ||
+        output_dtype_code != static_cast<int>(output_arg.meta.dtype)) {
         throw std::runtime_error("Unsupported output dtype for FP4 dequantization (must be float32, float16, or bfloat16)");
     }
-
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (input_arg.meta.sizes[0] != output_arg.meta.sizes[0] ||
+        input_arg.meta.sizes[1] * 2 != output_arg.meta.sizes[1] ||
+        input_arg.meta.dtype != DType::UInt8 ||
+        block_scales_arg.meta.dtype != DType::UInt8 ||
+        global_scale_arg.meta.sizes[0] < 1 ||
+        global_scale_arg.meta.dtype != DType::Float32) {
+        throw std::runtime_error("Invalid tensor layout for FP4 dequantization");
+    }
     launch_dequantize_nvfp4_kernel(
-        input.data(),
-        global_scale.data(),
-        block_scales.data(),
-        output.data(),
-        num_rows,
-        num_cols,
-        output_dtype_code,
-        hi_first,
-        stream);
+        input_arg, global_scale_arg, block_scales_arg, output_arg, hi_first,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for quantize_mxfp8
@@ -465,38 +414,28 @@ void quantize_mxfp8(
     nb::ndarray<nb::device::cuda> block_scales,
     bool pad_32x,
     uintptr_t stream_ptr) {
-
-    // Get input dimensions (orig_rows, orig_cols)
-    int64_t orig_rows = input.shape(0);
-    int64_t orig_cols = input.shape(1);
-
-    // Calculate effective padded dimensions
-    int64_t num_rows = orig_rows;
-    int64_t num_cols = orig_cols;
-
-    if (pad_32x) {
-        // Round up to nearest multiple of 32
-        num_rows = (orig_rows + 31) / 32 * 32;
-        num_cols = (orig_cols + 31) / 32 * 32;
-    }
-
-    // Get input dtype code
-    int input_dtype_code = map_dtype_to_code(input.dtype());
+    auto input_arg = make_contiguous_tensor_arg<2>(input);
+    auto output_arg = make_contiguous_tensor_arg<2>(output);
+    auto block_scales_arg = make_contiguous_tensor_arg<2>(block_scales);
+    const int64_t num_rows =
+        pad_32x ? (input_arg.meta.sizes[0] + 31) / 32 * 32
+                : input_arg.meta.sizes[0];
+    const int64_t num_cols =
+        pad_32x ? (input_arg.meta.sizes[1] + 31) / 32 * 32
+                : input_arg.meta.sizes[1];
+    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
     if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error("Unsupported input dtype for MXFP8 quantization (must be float32, float16, or bfloat16)");
     }
-
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (output_arg.meta.sizes[0] != num_rows ||
+        output_arg.meta.sizes[1] != num_cols ||
+        output_arg.meta.dtype != DType::Float8E4M3 ||
+        block_scales_arg.meta.dtype != DType::UInt8) {
+        throw std::runtime_error("Invalid tensor layout for MXFP8 quantization");
+    }
     launch_quantize_mxfp8_kernel(
-        input.data(),
-        output.data(),
-        block_scales.data(),
-        num_rows,
-        num_cols,
-        orig_rows,
-        orig_cols,
-        input_dtype_code,
-        stream);
+        input_arg, output_arg, block_scales_arg,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for apply_rope (handles both single tensor and q/k pair)
@@ -1349,12 +1288,30 @@ void na3d(
     int dtype_code,
     uintptr_t stream_ptr)
 {
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    auto q_arg = make_contiguous_tensor_arg<6>(q);
+    auto k_arg = make_contiguous_tensor_arg<6>(k);
+    auto v_arg = make_contiguous_tensor_arg<6>(v);
+    auto out_arg = make_contiguous_tensor_arg<6>(out);
+    const int64_t expected[6] = {
+        batch, t_size, h_size, w_size, num_heads, head_dim};
+    for (int axis = 0; axis < 6; ++axis) {
+        if (q_arg.meta.sizes[axis] != expected[axis] ||
+            k_arg.meta.sizes[axis] != expected[axis] ||
+            v_arg.meta.sizes[axis] != expected[axis] ||
+            out_arg.meta.sizes[axis] != expected[axis]) {
+            throw std::runtime_error("Invalid tensor shape for na3d");
+        }
+    }
+    if (static_cast<int>(q_arg.meta.dtype) != dtype_code ||
+        k_arg.meta.dtype != q_arg.meta.dtype ||
+        v_arg.meta.dtype != q_arg.meta.dtype ||
+        out_arg.meta.dtype != q_arg.meta.dtype) {
+        throw std::runtime_error("Invalid tensor dtype for na3d");
+    }
     launch_na3d_kernel(
-        q.data(), k.data(), v.data(), out.data(),
-        (int)batch, (int)t_size, (int)h_size, (int)w_size, (int)num_heads, (int)head_dim,
-        (int)kt, (int)kh, (int)kw, causal_t, causal_h, causal_w,
-        scale, dtype_code, stream);
+        q_arg, k_arg, v_arg, out_arg, static_cast<int>(kt),
+        static_cast<int>(kh), static_cast<int>(kw), causal_t, causal_h,
+        causal_w, scale, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for fused AdaLN (LayerNorm statistics)
@@ -1371,10 +1328,22 @@ void adaln(
     int     dtype_code,
     uintptr_t stream_ptr)
 {
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    auto x_arg = make_contiguous_tensor_arg<2>(x);
+    auto scale_arg = make_contiguous_tensor_arg<2>(scale);
+    auto shift_arg = make_contiguous_tensor_arg<2>(shift);
+    auto out_arg = make_contiguous_tensor_arg<2>(out);
+    if (x_arg.meta.sizes[0] != N || x_arg.meta.sizes[1] != D ||
+        out_arg.meta.sizes[0] != N || out_arg.meta.sizes[1] != D ||
+        scale_arg.meta.sizes[1] != D || shift_arg.meta.sizes[1] != D ||
+        static_cast<int>(x_arg.meta.dtype) != dtype_code ||
+        scale_arg.meta.dtype != x_arg.meta.dtype ||
+        shift_arg.meta.dtype != x_arg.meta.dtype ||
+        out_arg.meta.dtype != x_arg.meta.dtype) {
+        throw std::runtime_error("Invalid tensor contract for adaln");
+    }
     launch_adaln_kernel(
-        x.data(), scale.data(), shift.data(), out.data(),
-        N, D, scale_group, shift_group, eps, dtype_code, /*subtract_mean=*/true, stream);
+        x_arg, scale_arg, shift_arg, out_arg, scale_group, shift_group, eps,
+        true, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for fused AdaLN with RMSNorm statistics
@@ -1391,10 +1360,22 @@ void rms_adaln(
     int     dtype_code,
     uintptr_t stream_ptr)
 {
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    auto x_arg = make_contiguous_tensor_arg<2>(x);
+    auto scale_arg = make_contiguous_tensor_arg<2>(scale);
+    auto shift_arg = make_contiguous_tensor_arg<2>(shift);
+    auto out_arg = make_contiguous_tensor_arg<2>(out);
+    if (x_arg.meta.sizes[0] != N || x_arg.meta.sizes[1] != D ||
+        out_arg.meta.sizes[0] != N || out_arg.meta.sizes[1] != D ||
+        scale_arg.meta.sizes[1] != D || shift_arg.meta.sizes[1] != D ||
+        static_cast<int>(x_arg.meta.dtype) != dtype_code ||
+        scale_arg.meta.dtype != x_arg.meta.dtype ||
+        shift_arg.meta.dtype != x_arg.meta.dtype ||
+        out_arg.meta.dtype != x_arg.meta.dtype) {
+        throw std::runtime_error("Invalid tensor contract for rms_adaln");
+    }
     launch_adaln_kernel(
-        x.data(), scale.data(), shift.data(), out.data(),
-        N, D, scale_group, shift_group, eps, dtype_code, /*subtract_mean=*/false, stream);
+        x_arg, scale_arg, shift_arg, out_arg, scale_group, shift_group, eps,
+        false, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Python module definition

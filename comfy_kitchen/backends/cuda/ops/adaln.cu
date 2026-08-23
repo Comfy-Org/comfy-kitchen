@@ -41,6 +41,7 @@
 #include "dtype_dispatch.cuh"
 
 #include <limits>
+#include "tensor.h"
 #include <stdexcept>
 
 namespace comfy {
@@ -254,19 +255,19 @@ __global__ void adaln_warp_kernel(
 extern "C" {
 
 void launch_adaln_kernel(
-    const void* x,
-    const void* scale,
-    const void* shift,
-    void*       out,
-    int64_t     N,
-    int64_t     D,
-    int64_t     scale_group,
-    int64_t     shift_group,
-    float       eps,
-    int         dtype_code,
-    bool        subtract_mean,
+    comfy::tensor::TensorArg<2> x,
+    comfy::tensor::TensorArg<2> scale,
+    comfy::tensor::TensorArg<2> shift,
+    comfy::tensor::TensorArg<2> out,
+    int64_t scale_group,
+    int64_t shift_group,
+    float eps,
+    bool subtract_mean,
     cudaStream_t stream)
 {
+    const int64_t N = x.meta.sizes[0];
+    const int64_t D = x.meta.sizes[1];
+    const int dtype_code = static_cast<int>(x.meta.dtype);
     if (N > std::numeric_limits<int>::max() ||
         D > std::numeric_limits<int>::max() ||
         scale_group > std::numeric_limits<int>::max() ||
@@ -284,10 +285,10 @@ void launch_adaln_kernel(
                     static_cast<unsigned int>((N + comfy::kAdaLNRowsPerWarpBlock - 1) /
                                               comfy::kAdaLNRowsPerWarpBlock));
                 comfy::adaln_warp_kernel<T, kSubtractMean><<<warp_grid, block, 0, stream>>>(
-                    static_cast<const T*>(x),
-                    static_cast<const T*>(scale),
-                    static_cast<const T*>(shift),
-                    static_cast<T*>(out),
+                    static_cast<const T*>(x.data),
+                    static_cast<const T*>(scale.data),
+                    static_cast<const T*>(shift.data),
+                    static_cast<T*>(out.data),
                     static_cast<int>(N),
                     static_cast<int>(D),
                     static_cast<int>(scale_group),
@@ -295,10 +296,10 @@ void launch_adaln_kernel(
                     eps);
             } else {
                 comfy::adaln_kernel<T, kSubtractMean><<<grid, block, 0, stream>>>(
-                    static_cast<const T*>(x),
-                    static_cast<const T*>(scale),
-                    static_cast<const T*>(shift),
-                    static_cast<T*>(out),
+                    static_cast<const T*>(x.data),
+                    static_cast<const T*>(scale.data),
+                    static_cast<const T*>(shift.data),
+                    static_cast<T*>(out.data),
                     static_cast<int>(D),
                     static_cast<int>(scale_group),
                     static_cast<int>(shift_group),

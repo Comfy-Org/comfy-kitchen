@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "utils.cuh"
+#include "tensor.h"
 #include "float_utils.cuh"
 #include "dtype_dispatch.cuh"
 
@@ -146,15 +147,15 @@ __global__ void quantize_mxfp8_kernel(
 extern "C" {
 
 void launch_quantize_mxfp8_kernel(
-    const void* input,
-    void* output,
-    void* block_scales,
-    int64_t num_rows,
-    int64_t num_cols,
-    int64_t orig_rows,
-    int64_t orig_cols,
-    int input_dtype_code,
+    comfy::tensor::TensorArg<2> input,
+    comfy::tensor::TensorArg<2> output,
+    comfy::tensor::TensorArg<2> block_scales,
     cudaStream_t stream) {
+    const int64_t orig_rows = input.meta.sizes[0];
+    const int64_t orig_cols = input.meta.sizes[1];
+    const int64_t num_rows = output.meta.sizes[0];
+    const int64_t num_cols = output.meta.sizes[1];
+    const int input_dtype_code = static_cast<int>(input.meta.dtype);
     
     if (num_rows == 0 || num_cols == 0) {
         return;
@@ -180,9 +181,9 @@ void launch_quantize_mxfp8_kernel(
         if (misaligned) {
             comfy::quantize_mxfp8_kernel<InputType, __nv_fp8_e4m3, true>
                 <<<blocks, threads_per_block, 0, stream>>>(
-                    static_cast<const InputType*>(input),
-                    static_cast<__nv_fp8_e4m3*>(output),
-                    static_cast<uint8_t*>(block_scales),
+                    static_cast<const InputType*>(input.data),
+                    static_cast<__nv_fp8_e4m3*>(output.data),
+                    static_cast<uint8_t*>(block_scales.data),
                     num_cols,
                     num_rows,
                     orig_rows,
@@ -190,9 +191,9 @@ void launch_quantize_mxfp8_kernel(
         } else {
             comfy::quantize_mxfp8_kernel<InputType, __nv_fp8_e4m3, false>
                 <<<blocks, threads_per_block, 0, stream>>>(
-                    static_cast<const InputType*>(input),
-                    static_cast<__nv_fp8_e4m3*>(output),
-                    static_cast<uint8_t*>(block_scales),
+                    static_cast<const InputType*>(input.data),
+                    static_cast<__nv_fp8_e4m3*>(output.data),
+                    static_cast<uint8_t*>(block_scales.data),
                     num_cols,
                     num_rows,
                     orig_rows,
