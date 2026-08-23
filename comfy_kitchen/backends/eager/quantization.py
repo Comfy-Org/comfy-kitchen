@@ -749,6 +749,8 @@ def _round_up(value: int, alignment: int) -> int:
 def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Multiply INT8 matrices and return INT32 accumulators."""
     def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        if getattr(torch.version, "hip", None):
+            return (lhs.to(torch.float32) @ rhs.to(torch.float32)).to(torch.int32)
         if hasattr(torch, "int8_mm"):
             return torch.int8_mm(lhs, rhs)
         return torch._int_mm(lhs, rhs)
