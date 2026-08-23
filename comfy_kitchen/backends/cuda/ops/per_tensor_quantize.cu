@@ -172,10 +172,10 @@ void launch_quantize_fp8_kernel(
     comfy::tensor::TensorArg<1> input,
     comfy::tensor::TensorArg<1> scale,
     comfy::tensor::TensorArg<1> output,
-    int output_dtype_code,
     cudaStream_t stream) {
     const int64_t numel = input.meta.sizes[0];
     const int input_dtype_code = static_cast<int>(input.meta.dtype);
+    const int output_dtype_code = static_cast<int>(output.meta.dtype);
   
     if (numel == 0) {
         return;
@@ -213,9 +213,9 @@ void launch_dequantize_fp8_kernel(
     comfy::tensor::TensorArg<1> input,
     comfy::tensor::TensorArg<1> scale,
     comfy::tensor::TensorArg<1> output,
-    int input_dtype_code,
     cudaStream_t stream) {
     const int64_t numel = input.meta.sizes[0];
+    const int input_dtype_code = static_cast<int>(input.meta.dtype);
     const int output_dtype_code = static_cast<int>(output.meta.dtype);
 
     if (numel == 0) {
@@ -252,10 +252,10 @@ void launch_dequantize_fp8_kernel(
 void launch_stochastic_round_fp8_kernel(
     comfy::tensor::TensorArg<1> rng_and_output,
     comfy::tensor::TensorArg<1> input,
-    int output_dtype_code,
     cudaStream_t stream) {
     const int64_t numel = input.meta.sizes[0];
     const int input_dtype_code = static_cast<int>(input.meta.dtype);
+    const int output_dtype_code = static_cast<int>(rng_and_output.meta.dtype);
 
     if (numel == 0) {
         return;

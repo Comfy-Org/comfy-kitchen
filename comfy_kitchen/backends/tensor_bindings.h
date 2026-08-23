@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 
 #include <nanobind/ndarray.h>
@@ -96,5 +97,17 @@ TensorArg<1> make_flat_tensor_arg(const nanobind::ndarray<Args...>& array) {
     arg.meta.strides[0] = 1;
     arg.meta.dtype = dtype;
     return arg;
+}
+
+template <typename... Args>
+TensorArg<1> make_optional_flat_tensor_arg(const nanobind::ndarray<Args...>& array) {
+    if (array.size() == 0) return {};
+    return make_flat_tensor_arg(array);
+}
+
+template <typename Array>
+TensorArg<1> make_optional_flat_tensor_arg(const std::optional<Array>& array) {
+    if (!array.has_value()) return {};
+    return make_flat_tensor_arg(*array);
 }
 }  // namespace comfy::tensor

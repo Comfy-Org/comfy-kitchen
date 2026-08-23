@@ -5,6 +5,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "../tensor.h"
 
 #include <climits>
 #include <cstdint>
@@ -313,19 +314,22 @@ bool dispatch_scale_mode(
 #endif
 
 extern "C" bool launch_cutlass_turing_int8_dequant(
-    const void* activation,
-    const void* weight,
-    const void* activation_scale,
-    const void* weight_scale,
-    const void* bias,
-    void* output,
-    int64_t m,
-    int64_t n,
-    int64_t k,
-    int output_dtype_code,
-    bool scalar_weight_scale,
+    comfy::tensor::TensorArg<2> activation_arg, comfy::tensor::TensorArg<2> weight_arg,
+    comfy::tensor::TensorArg<1> activation_scale_arg, comfy::tensor::TensorArg<1> weight_scale_arg,
+    comfy::tensor::TensorArg<1> bias_arg, comfy::tensor::TensorArg<2> output_arg,
     cudaStream_t stream) {
 #ifdef COMFY_HAVE_CUTLASS
+    const void* activation = activation_arg.data;
+    const void* weight = weight_arg.data;
+    const void* activation_scale = activation_scale_arg.data;
+    const void* weight_scale = weight_scale_arg.data;
+    const void* bias = bias_arg.data;
+    void* output = output_arg.data;
+    const int64_t m = activation_arg.meta.sizes[0];
+    const int64_t n = weight_arg.meta.sizes[0];
+    const int64_t k = activation_arg.meta.sizes[1];
+    const int output_dtype_code = static_cast<int>(output_arg.meta.dtype);
+    const bool scalar_weight_scale = weight_scale_arg.meta.sizes[0] == 1;
     if (m == 0 || n == 0 || k == 0) return true;
     if (k % 16 != 0 || m > INT_MAX || n > INT_MAX || k > INT_MAX) return false;
     const auto* a = static_cast<const int8_t*>(activation);
@@ -351,17 +355,12 @@ extern "C" bool launch_cutlass_turing_int8_dequant(
             return false;
     }
 #else
-    (void)activation;
-    (void)weight;
-    (void)activation_scale;
-    (void)weight_scale;
-    (void)bias;
-    (void)output;
-    (void)m;
-    (void)n;
-    (void)k;
-    (void)output_dtype_code;
-    (void)scalar_weight_scale;
+    (void)activation_arg;
+    (void)weight_arg;
+    (void)activation_scale_arg;
+    (void)weight_scale_arg;
+    (void)bias_arg;
+    (void)output_arg;
     (void)stream;
     return false;
 #endif

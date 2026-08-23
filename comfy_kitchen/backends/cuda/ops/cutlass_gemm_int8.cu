@@ -11,6 +11,7 @@
  * Falls back to cuBLAS when CUTLASS is unavailable or no config can run.
  */
 #include <cuda_runtime.h>
+#include "../tensor.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <climits>
@@ -611,9 +612,21 @@ bool dispatch_fused_no_bias_strided(
 
 extern "C" {
 bool launch_cutlass_int8_dequant(
-    const void* A, const void* B, const void* xs, const void* ws, const void* bias,
-    void* D, int64_t M, int64_t N, int64_t K, int out_dtype_code, cudaStream_t stream)
+    comfy::tensor::TensorArg<2> a_arg, comfy::tensor::TensorArg<2> b_arg,
+    comfy::tensor::TensorArg<1> xs_arg, comfy::tensor::TensorArg<1> ws_arg,
+    comfy::tensor::TensorArg<1> bias_arg, comfy::tensor::TensorArg<2> output_arg,
+    cudaStream_t stream)
 {
+    const void* A = a_arg.data;
+    const void* B = b_arg.data;
+    const void* xs = xs_arg.data;
+    const void* ws = ws_arg.data;
+    const void* bias = bias_arg.data;
+    void* D = output_arg.data;
+    const int64_t M = a_arg.meta.sizes[0];
+    const int64_t N = b_arg.meta.sizes[0];
+    const int64_t K = a_arg.meta.sizes[1];
+    const int out_dtype_code = static_cast<int>(output_arg.meta.dtype);
     if (M == 0 || N == 0 || K == 0) return true;
     const int8_t* a = static_cast<const int8_t*>(A);
     const int8_t* b = static_cast<const int8_t*>(B);
@@ -637,10 +650,22 @@ bool launch_cutlass_int8_dequant(
 }
 
 bool launch_cutlass_int8_dequant_strided(
-    const void* A, const void* B, const void* xs, const void* ws, const void* bias,
-    void* D, int64_t M, int64_t N, int64_t K, int64_t output_stride, int out_dtype_code,
+    comfy::tensor::TensorArg<2> a_arg, comfy::tensor::TensorArg<2> b_arg,
+    comfy::tensor::TensorArg<1> xs_arg, comfy::tensor::TensorArg<1> ws_arg,
+    comfy::tensor::TensorArg<1> bias_arg, comfy::tensor::TensorArg<2> output_arg,
     cudaStream_t stream)
 {
+    const void* A = a_arg.data;
+    const void* B = b_arg.data;
+    const void* xs = xs_arg.data;
+    const void* ws = ws_arg.data;
+    const void* bias = bias_arg.data;
+    void* D = output_arg.data;
+    const int64_t M = a_arg.meta.sizes[0];
+    const int64_t N = b_arg.meta.sizes[0];
+    const int64_t K = a_arg.meta.sizes[1];
+    const int64_t output_stride = output_arg.meta.strides[0];
+    const int out_dtype_code = static_cast<int>(output_arg.meta.dtype);
     if (M == 0 || N == 0 || K == 0) return true;
     if (output_stride < N) return false;
     const int8_t* a = static_cast<const int8_t*>(A);
@@ -665,10 +690,19 @@ bool launch_cutlass_int8_dequant_strided(
 }
 
 bool launch_cutlass_int8_dequant_config(
-    const void* A, const void* B, const void* xs, const void* ws, void* D,
-    int64_t M, int64_t N, int64_t K, int out_dtype_code, int config,
-    cudaStream_t stream)
+    comfy::tensor::TensorArg<2> a_arg, comfy::tensor::TensorArg<2> b_arg,
+    comfy::tensor::TensorArg<1> xs_arg, comfy::tensor::TensorArg<1> ws_arg,
+    comfy::tensor::TensorArg<2> output_arg, int config, cudaStream_t stream)
 {
+    const void* A = a_arg.data;
+    const void* B = b_arg.data;
+    const void* xs = xs_arg.data;
+    const void* ws = ws_arg.data;
+    void* D = output_arg.data;
+    const int64_t M = a_arg.meta.sizes[0];
+    const int64_t N = b_arg.meta.sizes[0];
+    const int64_t K = a_arg.meta.sizes[1];
+    const int out_dtype_code = static_cast<int>(output_arg.meta.dtype);
     if (M == 0 || N == 0 || K == 0) return true;
     const int8_t* a = static_cast<const int8_t*>(A);
     const int8_t* b = static_cast<const int8_t*>(B);
@@ -685,20 +719,23 @@ bool launch_cutlass_int8_dequant_config(
 #else  // !COMFY_HAVE_CUTLASS -- stub; caller falls back to cuBLAS + separate dequant.
 
 extern "C" bool launch_cutlass_int8_dequant(
-    const void*, const void*, const void*, const void*, const void*,
-    void*, int64_t, int64_t, int64_t, int, cudaStream_t) {
+    comfy::tensor::TensorArg<2>, comfy::tensor::TensorArg<2>,
+    comfy::tensor::TensorArg<1>, comfy::tensor::TensorArg<1>,
+    comfy::tensor::TensorArg<1>, comfy::tensor::TensorArg<2>, cudaStream_t) {
     return false;
 }
 
 extern "C" bool launch_cutlass_int8_dequant_strided(
-    const void*, const void*, const void*, const void*, const void*,
-    void*, int64_t, int64_t, int64_t, int64_t, int, cudaStream_t) {
+    comfy::tensor::TensorArg<2>, comfy::tensor::TensorArg<2>,
+    comfy::tensor::TensorArg<1>, comfy::tensor::TensorArg<1>,
+    comfy::tensor::TensorArg<1>, comfy::tensor::TensorArg<2>, cudaStream_t) {
     return false;
 }
 
 extern "C" bool launch_cutlass_int8_dequant_config(
-    const void*, const void*, const void*, const void*, void*,
-    int64_t, int64_t, int64_t, int, int, cudaStream_t) {
+    comfy::tensor::TensorArg<2>, comfy::tensor::TensorArg<2>,
+    comfy::tensor::TensorArg<1>, comfy::tensor::TensorArg<1>,
+    comfy::tensor::TensorArg<2>, int, cudaStream_t) {
     return false;
 }
 
