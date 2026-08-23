@@ -14,17 +14,25 @@ namespace comfy::tensor {
 
 inline DType dtype_from_dlpack(const nanobind::dlpack::dtype& dtype) {
     using DTypeCode = nanobind::dlpack::dtype_code;
+    constexpr std::uint8_t kDLFloat8E4M3FN = 10;
+    constexpr std::uint8_t kDLFloat8E5M2 = 12;
+
+    if (dtype.lanes != 1) return DType::Unknown;
+
     const auto code = static_cast<DTypeCode>(dtype.code);
     if (code == DTypeCode::Float) {
         if (dtype.bits == 32) return DType::Float32;
         if (dtype.bits == 16) return DType::Float16;
-        if (dtype.bits == 8) return DType::Float8E4M3;
     } else if (code == DTypeCode::Bfloat && dtype.bits == 16) {
         return DType::BFloat16;
     } else if (code == DTypeCode::UInt && dtype.bits == 8) {
         return DType::UInt8;
     } else if (code == DTypeCode::Int && dtype.bits == 8) {
         return DType::Int8;
+    } else if (dtype.code == kDLFloat8E4M3FN) {
+        return DType::Float8E4M3;
+    } else if (dtype.code == kDLFloat8E5M2) {
+        return DType::Float8E5M2;
     }
     return DType::Unknown;
 }
