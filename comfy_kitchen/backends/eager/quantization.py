@@ -750,7 +750,14 @@ def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Multiply INT8 matrices and return INT32 accumulators."""
     def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
         if getattr(torch.version, "hip", None):
-            return (lhs.to(torch.float32) @ rhs.to(torch.float32)).to(torch.int32)
+            k = lhs.size(1)
+            chunk_size = 512
+            if k <= chunk_size:
+                return (lhs.to(torch.float32) @ rhs.to(torch.float32)).to(torch.int32)
+            res = (lhs[:, :chunk_size].to(torch.float32) @ rhs[:chunk_size, :].to(torch.float32)).to(torch.int32)
+            for i in range(chunk_size, k, chunk_size):
+                res += (lhs[:, i:i+chunk_size].to(torch.float32) @ rhs[i:i+chunk_size, :].to(torch.float32)).to(torch.int32)
+            return res
         if hasattr(torch, "int8_mm"):
             return torch.int8_mm(lhs, rhs)
         return torch._int_mm(lhs, rhs)
