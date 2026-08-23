@@ -6,7 +6,6 @@
 #include "utils.cuh"
 #include "dtype_dispatch.cuh"
 #include "input_act_codes.h"
-#include "../tensor.h"
 
 #include <cmath>
 #include <cfloat>
@@ -1034,15 +1033,16 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
 extern "C" {
 
 void launch_quantize_int8_rowwise_kernel(
-    comfy::tensor::TensorArg<2> input, comfy::tensor::TensorArg<2> output,
-    comfy::tensor::TensorArg<2> scales,
+    const void* input,
+    void* output,
+    void* scales,
+    int64_t num_rows,
+    int64_t num_cols,
+    int input_dtype_code,
     bool stochastic,
     uint64_t seed,
     cudaStream_t stream)
 {
-    const int64_t num_rows = input.meta.sizes[0];
-    const int64_t num_cols = input.meta.sizes[1];
-    const int input_dtype_code = static_cast<int>(input.meta.dtype);
     if (num_rows == 0 || num_cols == 0) {
         return;
     }
@@ -1053,9 +1053,9 @@ void launch_quantize_int8_rowwise_kernel(
     DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
         auto launch = [&](auto kernel, int block_threads) {
             kernel<<<static_cast<unsigned int>(num_rows), block_threads, 0, stream>>>(
-                static_cast<const InputType*>(input.data),
-                static_cast<int8_t*>(output.data),
-                static_cast<float*>(scales.data),
+                static_cast<const InputType*>(input),
+                static_cast<int8_t*>(output),
+                static_cast<float*>(scales),
                 static_cast<int>(num_cols),
                 seed);
         };
@@ -1084,18 +1084,17 @@ void launch_quantize_int8_rowwise_kernel(
 }
 
 void launch_quantize_int8_rowwise_convrot_kernel(
-    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> output_arg,
-    comfy::tensor::TensorArg<2> scales_arg, int group_size,
+    const void* input,
+    void* output,
+    void* scales,
+    int64_t num_rows,
+    int64_t num_cols,
+    int group_size,
+    int input_dtype_code,
     bool stochastic,
     uint64_t seed,
     cudaStream_t stream)
 {
-    const void* input = input_arg.data;
-    void* output = output_arg.data;
-    void* scales = scales_arg.data;
-    const int64_t num_rows = input_arg.meta.sizes[0];
-    const int64_t num_cols = input_arg.meta.sizes[1];
-    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
     if (num_rows == 0 || num_cols == 0) {
         return;
     }
@@ -1158,16 +1157,15 @@ void launch_quantize_int8_rowwise_convrot_kernel(
 }
 
 void launch_rotate_int8_convrot_weight_kernel(
-    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> output_arg,
+    const void* input,
+    void* output,
+    int64_t num_rows,
+    int64_t num_cols,
     int group_size,
+    int input_dtype_code,
+    int output_dtype_code,
     cudaStream_t stream)
 {
-    const void* input = input_arg.data;
-    void* output = output_arg.data;
-    const int64_t num_rows = input_arg.meta.sizes[0];
-    const int64_t num_cols = input_arg.meta.sizes[1];
-    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
-    const int output_dtype_code = static_cast<int>(output_arg.meta.dtype);
     if (num_rows == 0 || num_cols == 0) {
         return;
     }
@@ -1207,23 +1205,20 @@ void launch_rotate_int8_convrot_weight_kernel(
 }
 
 void launch_quantize_int8_convrot_staged_kernel(
-    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> rotated_arg,
-    comfy::tensor::TensorArg<2> partial_absmax_arg,
-    comfy::tensor::TensorArg<2> output_arg, comfy::tensor::TensorArg<2> scales_arg,
+    const void* input,
+    void* rotated,
+    void* partial_absmax,
+    void* output,
+    void* scales,
+    int64_t num_rows,
+    int64_t num_cols,
     int group_size,
+    int input_dtype_code,
+    int rotated_dtype_code,
     bool stochastic,
     uint64_t seed,
     cudaStream_t stream)
 {
-    const void* input = input_arg.data;
-    void* rotated = rotated_arg.data;
-    void* partial_absmax = partial_absmax_arg.data;
-    void* output = output_arg.data;
-    void* scales = scales_arg.data;
-    const int64_t num_rows = input_arg.meta.sizes[0];
-    const int64_t num_cols = input_arg.meta.sizes[1];
-    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
-    const int rotated_dtype_code = static_cast<int>(rotated_arg.meta.dtype);
     if (num_rows == 0 || num_cols == 0) {
         return;
     }
@@ -1298,19 +1293,18 @@ void launch_quantize_int8_convrot_staged_kernel(
 }
 
 void launch_quantize_int8_rowwise_convrot64_kernel(
-    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> output_arg,
-    comfy::tensor::TensorArg<2> scales_arg, int group_size,
+    const void* input,
+    void* output,
+    void* scales,
+    int64_t num_rows,
+    int64_t num_cols,
+    int group_size,
+    int input_dtype_code,
     bool stochastic,
     int act_code,
     uint64_t seed,
     cudaStream_t stream)
 {
-    const void* input = input_arg.data;
-    void* output = output_arg.data;
-    void* scales = scales_arg.data;
-    const int64_t num_rows = input_arg.meta.sizes[0];
-    const int64_t num_cols = output_arg.meta.sizes[1];
-    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
     if (num_rows == 0 || num_cols == 0) {
         return;
     }
@@ -1399,22 +1393,19 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
 }
 
 void launch_dequantize_int8_linear_kernel(
-    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> x_scales_arg,
-    comfy::tensor::TensorArg<1> weight_scales_arg, comfy::tensor::TensorArg<1> bias_arg,
-    comfy::tensor::TensorArg<2> output_arg,
+    const void* input,
+    const void* x_scales,
+    const void* weight_scales,
+    const void* bias,
+    void* output,
+    int64_t num_rows,
+    int64_t num_cols,
+    int64_t weight_scale_size,
+    bool has_bias,
+    int output_dtype_code,
+    int bias_dtype_code,
     cudaStream_t stream)
 {
-    const void* input = input_arg.data;
-    const void* x_scales = x_scales_arg.data;
-    const void* weight_scales = weight_scales_arg.data;
-    const void* bias = bias_arg.data;
-    void* output = output_arg.data;
-    const int64_t num_rows = input_arg.meta.sizes[0];
-    const int64_t num_cols = input_arg.meta.sizes[1];
-    const int64_t weight_scale_size = weight_scales_arg.meta.sizes[0];
-    const bool has_bias = bias_arg.meta.sizes[0] > 0;
-    const int output_dtype_code = static_cast<int>(output_arg.meta.dtype);
-    const int bias_dtype_code = has_bias ? static_cast<int>(bias_arg.meta.dtype) : output_dtype_code;
     if (num_rows == 0 || num_cols == 0) {
         return;
     }
@@ -1481,24 +1472,20 @@ void launch_dequantize_int8_linear_kernel(
 }
 
 void launch_int8_gemv_dequant_kernel(
-    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> weight_arg,
-    comfy::tensor::TensorArg<2> x_scales_arg,
-    comfy::tensor::TensorArg<1> weight_scales_arg, comfy::tensor::TensorArg<1> bias_arg,
-    comfy::tensor::TensorArg<2> output_arg,
+    const void* input,
+    const void* weight,
+    const void* x_scales,
+    const void* weight_scales,
+    const void* bias,
+    void* output,
+    int64_t num_cols,
+    int64_t K,
+    int64_t weight_scale_size,
+    bool has_bias,
+    int output_dtype_code,
+    int bias_dtype_code,
     cudaStream_t stream)
 {
-    const void* input = input_arg.data;
-    const void* weight = weight_arg.data;
-    const void* x_scales = x_scales_arg.data;
-    const void* weight_scales = weight_scales_arg.data;
-    const void* bias = bias_arg.data;
-    void* output = output_arg.data;
-    const int64_t num_cols = weight_arg.meta.sizes[0];
-    const int64_t K = weight_arg.meta.sizes[1];
-    const int64_t weight_scale_size = weight_scales_arg.meta.sizes[0];
-    const bool has_bias = bias_arg.meta.sizes[0] > 0;
-    const int output_dtype_code = static_cast<int>(output_arg.meta.dtype);
-    const int bias_dtype_code = has_bias ? static_cast<int>(bias_arg.meta.dtype) : output_dtype_code;
     if (num_cols == 0 || K == 0) {
         return;
     }
@@ -1586,12 +1573,15 @@ void launch_int8_gemv_dequant_kernel(
 }
 
 void launch_dequantize_int8_simple_kernel(
-    comfy::tensor::TensorArg<1> input, comfy::tensor::TensorArg<1> scales,
-    comfy::tensor::TensorArg<1> output, int64_t inner_dim, int scale_mode,
+    const void* input,
+    const void* scales,
+    void* output,
+    int64_t total,
+    int64_t inner_dim,
+    int scale_mode,
+    int output_dtype_code,
     cudaStream_t stream)
 {
-    const int64_t total = input.meta.sizes[0];
-    const int output_dtype_code = static_cast<int>(output.meta.dtype);
     if (total == 0) {
         return;
     }
@@ -1613,9 +1603,9 @@ void launch_dequantize_int8_simple_kernel(
             DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
                 comfy::dequantize_int8_rowwise_vec4_2d_kernel<OutputType>
                     <<<grid, block_threads, 0, stream>>>(
-                        static_cast<const int8_t*>(input.data),
-                        static_cast<const float*>(scales.data),
-                        static_cast<OutputType*>(output.data),
+                        static_cast<const int8_t*>(input),
+                        static_cast<const float*>(scales),
+                        static_cast<OutputType*>(output),
                         static_cast<int>(rows),
                         inner_dim_vec4);
             });
@@ -1631,9 +1621,9 @@ void launch_dequantize_int8_simple_kernel(
         DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
             comfy::dequantize_int8_simple_vec4_kernel<OutputType>
                 <<<blocks, comfy::kInt8Threads, 0, stream>>>(
-                    static_cast<const int8_t*>(input.data),
-                    static_cast<const float*>(scales.data),
-                    static_cast<OutputType*>(output.data),
+                    static_cast<const int8_t*>(input),
+                    static_cast<const float*>(scales),
+                    static_cast<OutputType*>(output),
                     total_vec4,
                     static_cast<int>(inner_dim / 4),
                     scale_mode);
@@ -1655,9 +1645,9 @@ void launch_dequantize_int8_simple_kernel(
         DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
             comfy::dequantize_int8_simple_vec4_kernel<OutputType>
                 <<<blocks, block_threads, 0, stream>>>(
-                    static_cast<const int8_t*>(input.data),
-                    static_cast<const float*>(scales.data),
-                    static_cast<OutputType*>(output.data),
+                    static_cast<const int8_t*>(input),
+                    static_cast<const float*>(scales),
+                    static_cast<OutputType*>(output),
                     total_vec4,
                     1,
                     scale_mode);
@@ -1674,9 +1664,9 @@ void launch_dequantize_int8_simple_kernel(
     DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
         comfy::dequantize_int8_simple_kernel<OutputType>
             <<<blocks, comfy::kInt8Threads, 0, stream>>>(
-                static_cast<const int8_t*>(input.data),
-                static_cast<const float*>(scales.data),
-                static_cast<OutputType*>(output.data),
+                static_cast<const int8_t*>(input),
+                static_cast<const float*>(scales),
+                static_cast<OutputType*>(output),
                 total,
                 static_cast<int>(inner_dim),
                 scale_mode);
@@ -1689,17 +1679,16 @@ void launch_dequantize_int8_simple_kernel(
 }
 
 void launch_dequantize_int8_convrot_kernel(
-    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<1> scales_arg,
-    comfy::tensor::TensorArg<2> output_arg, int group_size,
+    const void* input,
+    const void* scales,
+    void* output,
+    int64_t num_rows,
+    int64_t num_cols,
+    int64_t scale_size,
+    int group_size,
+    int output_dtype_code,
     cudaStream_t stream)
 {
-    const void* input = input_arg.data;
-    const void* scales = scales_arg.data;
-    void* output = output_arg.data;
-    const int64_t num_rows = input_arg.meta.sizes[0];
-    const int64_t num_cols = input_arg.meta.sizes[1];
-    const int64_t scale_size = scales_arg.meta.sizes[0];
-    const int output_dtype_code = static_cast<int>(output_arg.meta.dtype);
     if (num_rows == 0 || num_cols == 0) {
         return;
     }

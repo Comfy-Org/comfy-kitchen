@@ -67,10 +67,9 @@ void launch_flash_decode_typed(Flash_fwd_params& params, cudaStream_t stream) {
 
 extern "C" void launch_flash_decode(
     comfy::tensor::TensorArg<3> q, comfy::tensor::TensorArg<4> k,
-    comfy::tensor::TensorArg<4> v, comfy::tensor::TensorArg<1> kv_lengths,
-    comfy::tensor::TensorArg<3> output, comfy::tensor::TensorArg<1> softmax_lse,
-    comfy::tensor::TensorArg<1> softmax_lse_accum,
-    comfy::tensor::TensorArg<1> output_accum, int num_splits,
+    comfy::tensor::TensorArg<4> v, int* kv_lengths,
+    comfy::tensor::TensorArg<3> output, float* softmax_lse,
+    float* softmax_lse_accum, float* output_accum, int num_splits,
     cudaStream_t stream) {
     const int batch = static_cast<int>(k.meta.sizes[0]);
     const int kv_capacity = static_cast<int>(k.meta.sizes[1]);
@@ -79,11 +78,7 @@ extern "C" void launch_flash_decode(
     if (q.meta.dtype != comfy::tensor::DType::BFloat16 ||
         k.meta.dtype != comfy::tensor::DType::BFloat16 ||
         v.meta.dtype != comfy::tensor::DType::BFloat16 ||
-        output.meta.dtype != comfy::tensor::DType::BFloat16 ||
-        kv_lengths.meta.dtype != comfy::tensor::DType::Int32 ||
-        softmax_lse.meta.dtype != comfy::tensor::DType::Float32 ||
-        softmax_lse_accum.meta.dtype != comfy::tensor::DType::Float32 ||
-        output_accum.meta.dtype != comfy::tensor::DType::Float32) {
+        output.meta.dtype != comfy::tensor::DType::BFloat16) {
         throw std::runtime_error("Flash Attention decode tensor dtype mismatch");
     }
     flash::Flash_fwd_params params{};
@@ -91,9 +86,9 @@ extern "C" void launch_flash_decode(
     params.k_ptr = k.data;
     params.v_ptr = v.data;
     params.o_ptr = output.data;
-    params.softmax_lse_ptr = static_cast<float*>(softmax_lse.data);
-    params.softmax_lseaccum_ptr = num_splits > 1 ? static_cast<float*>(softmax_lse_accum.data) : nullptr;
-    params.oaccum_ptr = num_splits > 1 ? static_cast<float*>(output_accum.data) : nullptr;
+    params.softmax_lse_ptr = softmax_lse;
+    params.softmax_lseaccum_ptr = num_splits > 1 ? softmax_lse_accum : nullptr;
+    params.oaccum_ptr = num_splits > 1 ? output_accum : nullptr;
     params.q_batch_stride = q.meta.strides[0] * query_length;
     params.q_row_stride = q.meta.strides[0];
     params.q_head_stride = q.meta.strides[1];
@@ -106,7 +101,7 @@ extern "C" void launch_flash_decode(
     params.v_row_stride = v.meta.strides[1];
     params.k_head_stride = k.meta.strides[2];
     params.v_head_stride = v.meta.strides[2];
-    params.seqused_k = static_cast<int*>(kv_lengths.data);
+    params.seqused_k = kv_lengths;
     params.b = batch;
     params.h = params.h_k = heads;
     params.h_h_k_ratio = 1;

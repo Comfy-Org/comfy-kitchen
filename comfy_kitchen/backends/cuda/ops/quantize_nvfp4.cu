@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 #include "utils.cuh"
-#include "tensor.h"
 #include "float_utils.cuh"
 #include "dtype_dispatch.cuh"
 
@@ -322,18 +321,18 @@ __global__ void dequantize_nvfp4_kernel(
 extern "C" {
 
 void launch_quantize_nvfp4_kernel(
-    comfy::tensor::TensorArg<2> input,
-    comfy::tensor::TensorArg<1> global_scale,
-    comfy::tensor::TensorArg<2> output,
-    comfy::tensor::TensorArg<2> block_scales,
+    const void* input,
+    const void* global_scale,
+    void* output,
+    void* block_scales,
+    int64_t num_rows,
+    int64_t num_cols,
+    int64_t orig_rows,
+    int64_t orig_cols,
     float epsilon,
+    int input_dtype_code,
     bool hi_first,
     cudaStream_t stream) {
-    const int64_t orig_rows = input.meta.sizes[0];
-    const int64_t orig_cols = input.meta.sizes[1];
-    const int64_t num_rows = output.meta.sizes[0];
-    const int64_t num_cols = output.meta.sizes[1] * 2;
-    const int input_dtype_code = static_cast<int>(input.meta.dtype);
     
     if (num_rows == 0 || num_cols == 0) {
         return;
@@ -348,7 +347,7 @@ void launch_quantize_nvfp4_kernel(
     const bool misaligned = (orig_rows != num_rows) || (orig_cols != num_cols);
     
     const int64_t numel = num_rows * num_cols;
-    const float* scale_f = static_cast<const float*>(global_scale.data);
+    const float* scale_f = static_cast<const float*>(global_scale);
     
     // Each thread processes kValsPerThread values (same for both aligned and misaligned paths)
     constexpr int threads_per_block = 128;  // CUDA block size
@@ -359,10 +358,10 @@ void launch_quantize_nvfp4_kernel(
     #define LAUNCH_QUANT_KERNEL(MISALIGNED, HI_FIRST) \
         comfy::quantize_nvfp4_kernel<InputType, __nv_fp4x2_e2m1, __nv_fp8_e4m3, MISALIGNED, HI_FIRST> \
             <<<blocks, threads_per_block, 0, stream>>>( \
-                static_cast<const InputType*>(input.data), \
+                static_cast<const InputType*>(input), \
                 scale_f, \
-                static_cast<__nv_fp4x2_e2m1*>(output.data), \
-                static_cast<__nv_fp8_e4m3*>(block_scales.data), \
+                static_cast<__nv_fp4x2_e2m1*>(output), \
+                static_cast<__nv_fp8_e4m3*>(block_scales), \
                 num_cols, num_rows, orig_rows, orig_cols, epsilon)
 
     DISPATCH_HALF_DTYPE(input_dtype_code, InputType, [&] {
@@ -385,15 +384,15 @@ void launch_quantize_nvfp4_kernel(
 }
 
 void launch_dequantize_nvfp4_kernel(
-    comfy::tensor::TensorArg<2> input,
-    comfy::tensor::TensorArg<1> global_scale,
-    comfy::tensor::TensorArg<2> block_scales,
-    comfy::tensor::TensorArg<2> output,
+    const void* input,
+    const void* global_scale,
+    const void* block_scales,
+    void* output,
+    int64_t num_rows,
+    int64_t num_cols,
+    int output_dtype_code,
     bool hi_first,
     cudaStream_t stream) {
-    const int64_t num_rows = output.meta.sizes[0];
-    const int64_t num_cols = output.meta.sizes[1];
-    const int output_dtype_code = static_cast<int>(output.meta.dtype);
 
     if (num_rows == 0 || num_cols == 0) {
         return;
@@ -405,7 +404,7 @@ void launch_dequantize_nvfp4_kernel(
     }
     
     const int64_t numel = num_rows * num_cols;
-    const float* scale_f = static_cast<const float*>(global_scale.data);
+    const float* scale_f = static_cast<const float*>(global_scale);
     
     // Each thread processes kValsPerThread values
     constexpr int threads_per_block = 128;
@@ -415,10 +414,10 @@ void launch_dequantize_nvfp4_kernel(
     #define LAUNCH_DEQUANT_KERNEL(HI_FIRST) \
         comfy::dequantize_nvfp4_kernel<__nv_fp4x2_e2m1, OutputType, __nv_fp8_e4m3, HI_FIRST> \
             <<<blocks, threads_per_block, 0, stream>>>( \
-                static_cast<const __nv_fp4x2_e2m1*>(input.data), \
+                static_cast<const __nv_fp4x2_e2m1*>(input), \
                 scale_f, \
-                static_cast<const __nv_fp8_e4m3*>(block_scales.data), \
-                static_cast<OutputType*>(output.data), \
+                static_cast<const __nv_fp8_e4m3*>(block_scales), \
+                static_cast<OutputType*>(output), \
                 num_cols, num_rows)
 
     DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {

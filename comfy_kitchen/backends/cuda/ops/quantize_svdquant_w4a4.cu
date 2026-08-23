@@ -21,7 +21,6 @@
 // No shift: callers that need non-negative x (e.g., post-GELU+shift) pre-shift
 // at the layer level — see comfy_kitchen/tensor/svdquant_w4a4.py::_w4a4_forward.
 #include "svdquant_utils.cuh"
-#include "../tensor.h"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -142,19 +141,20 @@ __global__ void svdquant_quantize_w4a4_kernel(
 extern "C" {
 
 void launch_svdquant_quantize_w4a4_kernel(
-    comfy::tensor::TensorArg<2> x,
-    comfy::tensor::TensorArg<1> smooth,
-    comfy::tensor::TensorArg<2> lora_down,
-    comfy::tensor::TensorArg<2> q_x,
-    comfy::tensor::TensorArg<2> ascales,
-    comfy::tensor::TensorArg<2> lora_act,
+    const void* x,
+    const void* smooth,
+    const void* lora_down,
+    void* q_x,
+    void* ascales,
+    void* lora_act,
+    int M,
+    int M_pad,
+    int K,
+    int R,
+    int input_dtype_code,
     int act_unsigned,      // 0: signed [-7,7] + scale=max/7; 1: unsigned [0,15] + scale=max/15
     cudaStream_t stream)
 {
-    const int M = static_cast<int>(x.meta.sizes[0]);
-    const int K = static_cast<int>(x.meta.sizes[1]);
-    const int M_pad = static_cast<int>(q_x.meta.sizes[0]);
-    const int R = static_cast<int>(lora_down.meta.sizes[1]);
     if (K % comfy::svdquant::kGroupSize != 0) return;
     // No rank cap: LoRA-down matmul is external, Python wrapper picks cuBLAS
     // bf16 path which handles any R efficiently (benched at R={16..256}).
@@ -165,18 +165,18 @@ void launch_svdquant_quantize_w4a4_kernel(
 
     #define LAUNCH_QUANTIZE(InType, Unsigned)                                               \
         svdquant_quantize_w4a4_kernel<InType, Unsigned><<<grid, block, 0, stream>>>(        \
-            reinterpret_cast<const InType*>(x.data),                                             \
-            reinterpret_cast<const InType*>(smooth.data),                                        \
-            reinterpret_cast<const InType*>(lora_down.data),                                     \
-            reinterpret_cast<int8_t*>(q_x.data),                                                 \
-            reinterpret_cast<InType*>(ascales.data),                                             \
-            reinterpret_cast<float*>(lora_act.data),                                             \
+            reinterpret_cast<const InType*>(x),                                             \
+            reinterpret_cast<const InType*>(smooth),                                        \
+            reinterpret_cast<const InType*>(lora_down),                                     \
+            reinterpret_cast<int8_t*>(q_x),                                                 \
+            reinterpret_cast<InType*>(ascales),                                             \
+            reinterpret_cast<float*>(lora_act),                                             \
             M, M_pad, K, R)
 
-    if (x.meta.dtype == comfy::tensor::DType::BFloat16) {
+    if (input_dtype_code == 2) {
         if (act_unsigned) LAUNCH_QUANTIZE(__nv_bfloat16, true);
         else              LAUNCH_QUANTIZE(__nv_bfloat16, false);
-    } else if (x.meta.dtype == comfy::tensor::DType::Float16) {
+    } else if (input_dtype_code == 1) {
         if (act_unsigned) LAUNCH_QUANTIZE(__half, true);
         else              LAUNCH_QUANTIZE(__half, false);
     }

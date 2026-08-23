@@ -690,18 +690,12 @@ __global__ __launch_bounds__(128, 3) void quant_qk_fused(
 } // namespace
 
 extern "C" void launch_quant_qk_per_thread_int8(
-    comfy::tensor::TensorArg<4> q_arg, comfy::tensor::TensorArg<4> q_int8_arg,
-    comfy::tensor::TensorArg<3> q_scale_arg, comfy::tensor::TensorArg<4> k_arg,
-    comfy::tensor::TensorArg<4> k_int8_arg, comfy::tensor::TensorArg<3> k_scale_arg,
-    int BLKQ, int WARPQ, int BLKK, int WARPK,
-    comfy::tensor::TensorArg<1> anchor_indices_arg,
+    comfy::tensor::TensorArg<4> q_arg, int8_t* q_int8, float* q_scale,
+    comfy::tensor::TensorArg<4> k_arg, int8_t* k_int8, float* k_scale,
+    int BLKQ, int WARPQ, int BLKK, int WARPK, int* anchor_indices,
     cudaStream_t stream) {
   const void* q = q_arg.data;
-  void* q_int8 = q_int8_arg.data;
-  void* q_scale = q_scale_arg.data;
   const void* k = k_arg.data;
-  void* k_int8 = k_int8_arg.data;
-  void* k_scale = k_scale_arg.data;
   const int B = static_cast<int>(q_arg.meta.sizes[0]);
   const int H_q = static_cast<int>(q_arg.meta.sizes[1]);
   const int Lq = static_cast<int>(q_arg.meta.sizes[2]);
@@ -726,7 +720,7 @@ extern "C" void launch_quant_qk_per_thread_int8(
     throw std::runtime_error(
         "quant_qk_per_thread_int8: unsupported block/warp configuration");
   }
-  if (!anchor_indices_arg.data) {
+  if (!anchor_indices) {
     throw std::runtime_error(
         "quant_qk_per_thread_int8: anchor_indices scratch is required");
   }
@@ -757,7 +751,7 @@ extern "C" void launch_quant_qk_per_thread_int8(
   const int k_oblk = (Lk + BLKK - 1) / BLKK * (BLKK / WARPK);
   const int q_sc_per_h = q_oblk * 8;
   const int k_sc_per_h = k_oblk * 4;
-  auto *anchor_ptr = static_cast<int *>(anchor_indices_arg.data);
+  auto *anchor_ptr = anchor_indices;
   dim3 gd(H_kv, B);
   DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
     detect_k_anchor<T><<<gd, CENTER_DETECT_THREADS, 0, stream>>>(

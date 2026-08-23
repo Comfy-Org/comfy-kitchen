@@ -80,17 +80,12 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
 extern "C" void launch_sage_attn_kernel(
     comfy::tensor::TensorArg<4> q_arg, comfy::tensor::TensorArg<4> k_arg,
     comfy::tensor::TensorArg<4> v_arg, comfy::tensor::TensorArg<4> o_arg,
-    comfy::tensor::TensorArg<1> q_scale_arg,
-    comfy::tensor::TensorArg<1> k_scale_arg,
-    comfy::tensor::TensorArg<1> v_scale_arg,
+    const float* q_scale, const float* k_scale, const float* v_scale,
     comfy::tensor::TensorArg<4> mask_arg, int cta_k, float sm_scale, cudaStream_t stream) {
   const void* q = q_arg.data;
   const void* k = k_arg.data;
   const void* v = v_arg.data;
   void* o = o_arg.data;
-  const void* q_scale = q_scale_arg.data;
-  const void* k_scale = k_scale_arg.data;
-  const void* v_scale = v_scale_arg.data;
   const void* mask = mask_arg.data;
   const int batch_size = static_cast<int>(q_arg.meta.sizes[0]);
   const int num_qo_heads = static_cast<int>(q_arg.meta.sizes[1]);
@@ -101,9 +96,6 @@ extern "C" void launch_sage_attn_kernel(
   if (q_arg.meta.dtype != comfy::tensor::DType::Int8 ||
       k_arg.meta.dtype != comfy::tensor::DType::Int8 ||
       v_arg.meta.dtype != comfy::tensor::DType::Int8 ||
-      q_scale_arg.meta.dtype != comfy::tensor::DType::Float32 ||
-      k_scale_arg.meta.dtype != comfy::tensor::DType::Float32 ||
-      v_scale_arg.meta.dtype != comfy::tensor::DType::Float32 ||
       (o_arg.meta.dtype != comfy::tensor::DType::Float16 &&
        o_arg.meta.dtype != comfy::tensor::DType::BFloat16)) {
     throw std::runtime_error("sage_attn: incompatible tensor dtypes");
@@ -165,9 +157,9 @@ extern "C" void launch_sage_attn_kernel(
   auto q_ = const_cast<int8_t *>(static_cast<const int8_t *>(q));
   auto k_ = const_cast<int8_t *>(static_cast<const int8_t *>(k));
   auto v_ = const_cast<int8_t *>(static_cast<const int8_t *>(v));
-  auto qs_ = const_cast<float *>(static_cast<const float *>(q_scale));
-  auto ks_ = const_cast<float *>(static_cast<const float *>(k_scale));
-  auto vs_ = const_cast<float *>(static_cast<const float *>(v_scale));
+  auto qs_ = const_cast<float *>(q_scale);
+  auto ks_ = const_cast<float *>(k_scale);
+  auto vs_ = const_cast<float *>(v_scale);
 
 #define LAUNCH(HD, CK, MM, DT, FUSE_FP32)                                     \
   launch_impl<HD, CK, MM, DT, FUSE_FP32>(                                    \

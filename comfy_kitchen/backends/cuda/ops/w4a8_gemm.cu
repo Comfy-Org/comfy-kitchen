@@ -12,7 +12,6 @@
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#include "../tensor.h"
 #include <cstdint>
 
 // Grouped int4 -> int8 dequant for the int8-GEMM W4A8 path: out[n,k] =
@@ -95,16 +94,9 @@ __global__ void dequant_int4_grouped_to_int8_kernel(
 
 // codebook: 16 floats (non-uniform levels) or nullptr for uniform (q-8).
 extern "C" void launch_dequant_int4_grouped_to_int8(
-    comfy::tensor::TensorArg<2> weight_arg, comfy::tensor::TensorArg<2> scale_arg,
-    comfy::tensor::TensorArg<1> codebook_arg, comfy::tensor::TensorArg<2> output_arg,
-    int64_t G, cudaStream_t stream)
+    const void* qw, const void* s_rel, const void* codebook, void* out,
+    int64_t N, int64_t K, int64_t G, cudaStream_t stream)
 {
-    const void* qw = weight_arg.data;
-    const void* s_rel = scale_arg.data;
-    const void* codebook = codebook_arg.data;
-    void* out = output_arg.data;
-    const int64_t N = output_arg.meta.sizes[0];
-    const int64_t K = output_arg.meta.sizes[1];
     const int Khalf = K / 2;
     const long n_vec = (long)N * Khalf / 8;
     const int block = 256;
@@ -117,16 +109,9 @@ extern "C" void launch_dequant_int4_grouped_to_int8(
 
 // fp8 (e4m3) per-group scale variant; s_rel passed as raw uint8 bits.
 extern "C" void launch_dequant_int4_grouped_to_int8_e4m3(
-    comfy::tensor::TensorArg<2> weight_arg, comfy::tensor::TensorArg<2> scale_arg,
-    comfy::tensor::TensorArg<1> codebook_arg, comfy::tensor::TensorArg<2> output_arg,
-    int64_t G, cudaStream_t stream)
+    const void* qw, const void* s_rel, const void* codebook, void* out,
+    int64_t N, int64_t K, int64_t G, cudaStream_t stream)
 {
-    const void* qw = weight_arg.data;
-    const void* s_rel = scale_arg.data;
-    const void* codebook = codebook_arg.data;
-    void* out = output_arg.data;
-    const int64_t N = output_arg.meta.sizes[0];
-    const int64_t K = output_arg.meta.sizes[1];
     const int Khalf = K / 2;
     const long n_vec = (long)N * Khalf / 8;
     const int block = 256;
@@ -143,65 +128,38 @@ extern "C" void launch_dequant_int4_grouped_to_int8_e4m3(
 // chunking trick, run at our group-16 codebook quality). Returns false if the
 // strided GEMM rejects a chunk config -> caller falls back to the 2-pass path.
 extern "C" bool launch_cutlass_int8_dequant_strided(
-    comfy::tensor::TensorArg<2> a, comfy::tensor::TensorArg<2> b,
-    comfy::tensor::TensorArg<1> xs, comfy::tensor::TensorArg<1> ws,
-    comfy::tensor::TensorArg<1> bias, comfy::tensor::TensorArg<2> output,
+    const void* A, const void* B, const void* xs, const void* ws, const void* bias,
+    void* D, int64_t M, int64_t N, int64_t K, int64_t output_stride, int out_dtype_code,
     cudaStream_t stream);
 
 extern "C" bool launch_w4a8_codebook_gemm_chunked(
-    comfy::tensor::TensorArg<2> activation_arg, comfy::tensor::TensorArg<2> weight_arg,
-    comfy::tensor::TensorArg<2> scale_arg, comfy::tensor::TensorArg<1> codebook_arg,
-    comfy::tensor::TensorArg<1> channel_scale_arg, comfy::tensor::TensorArg<1> activation_scale_arg,
-    comfy::tensor::TensorArg<1> bias_arg, comfy::tensor::TensorArg<2> workspace_arg,
-    comfy::tensor::TensorArg<2> output_arg, int64_t G, int64_t chunk_cols,
-    cudaStream_t stream)
+    const void* xq,        // [M, K] int8 activation
+    const void* weight,    // [N, K/2] packed uint4
+    const void* s_rel,     // [N, K/G] fp8 (e4m3) per-group scale
+    const void* codebook,  // [16] fp32 or nullptr
+    const void* s_channel, // [N] fp32 per-channel scale
+    const void* xs,        // [M] fp32 per-row activation scale
+    const void* bias,      // [N] fp32 or nullptr
+    void* workspace,       // [chunk_cols, K] int8 scratch (preallocated, reused)
+    void* out,             // [M, N] output (out_dtype)
+    int64_t M, int64_t N, int64_t K, int64_t G, int64_t chunk_cols,
+    int out_dtype_code, cudaStream_t stream)
 {
-    const int64_t M = activation_arg.meta.sizes[0];
-    const int64_t N = weight_arg.meta.sizes[0];
-    const int64_t K = activation_arg.meta.sizes[1];
-    const int out_dtype_code = static_cast<int>(output_arg.meta.dtype);
     // A non-positive chunk stride never advances n0 -> would loop forever; a non-positive
     // K/G would divide by zero below. Bail so the caller uses the 2-pass path.
     if (chunk_cols <= 0 || K <= 0 || G <= 0) return false;
     const int64_t Khalf = K / 2, KG = K / G, osz = (out_dtype_code == 0) ? 4 : 2;
     for (int64_t n0 = 0; n0 < N; n0 += chunk_cols) {
         const int64_t cols = (chunk_cols < N - n0) ? chunk_cols : (N - n0);
-        auto weight_chunk_arg = weight_arg;
-        weight_chunk_arg.data = static_cast<int8_t*>(weight_arg.data) + n0 * Khalf;
-        weight_chunk_arg.meta.sizes[0] = cols;
-
-        auto scale_chunk_arg = scale_arg;
-        scale_chunk_arg.data = static_cast<uint8_t*>(scale_arg.data) + n0 * KG;
-        scale_chunk_arg.meta.sizes[0] = cols;
-
-        auto workspace_chunk_arg = workspace_arg;
-        workspace_chunk_arg.meta.sizes[0] = cols;
-        workspace_chunk_arg.meta.sizes[1] = K;
-        workspace_chunk_arg.meta.strides[0] = K;
-        workspace_chunk_arg.meta.strides[1] = 1;
         launch_dequant_int4_grouped_to_int8_e4m3(
-            weight_chunk_arg, scale_chunk_arg, codebook_arg, workspace_chunk_arg, G, stream);
-
-        auto channel_scale_chunk_arg = channel_scale_arg;
-        channel_scale_chunk_arg.data = static_cast<float*>(channel_scale_arg.data) + n0;
-        channel_scale_chunk_arg.meta.sizes[0] = cols;
-
-        comfy::tensor::TensorArg<1> bias_chunk_arg{};
-        if (bias_arg.data != nullptr) {
-            bias_chunk_arg = bias_arg;
-            bias_chunk_arg.data = static_cast<float*>(bias_arg.data) + n0;
-            bias_chunk_arg.meta.sizes[0] = cols;
-        }
-
-        auto output_chunk_arg = output_arg;
-        output_chunk_arg.data = static_cast<char*>(output_arg.data) + n0 * osz;
-        output_chunk_arg.meta.sizes[0] = M;
-        output_chunk_arg.meta.sizes[1] = cols;
-        output_chunk_arg.meta.strides[0] = N;
-        output_chunk_arg.meta.strides[1] = 1;
+            static_cast<const int8_t*>(weight) + n0 * Khalf,
+            static_cast<const uint8_t*>(s_rel) + n0 * KG,
+            codebook, workspace, cols, K, G, stream);
+        const void* bias_chunk = bias ? static_cast<const float*>(bias) + n0 : nullptr;
+        void* out_chunk = static_cast<char*>(out) + n0 * osz;
         if (!launch_cutlass_int8_dequant_strided(
-                activation_arg, workspace_chunk_arg, activation_scale_arg,
-                channel_scale_chunk_arg, bias_chunk_arg, output_chunk_arg, stream))
+                xq, workspace, xs, static_cast<const float*>(s_channel) + n0, bias_chunk,
+                out_chunk, M, cols, K, N /*output_stride*/, out_dtype_code, stream))
             return false;
     }
     return true;
@@ -350,19 +308,9 @@ __global__ void quantize_w4a8_convrot_kernel(
 // Returns false (caller must fall back / raise) if the group-scale shared memory won't fit
 // or the launch is rejected, so uninitialized outputs are never mistaken for a result.
 extern "C" bool launch_quantize_w4a8_convrot(
-    comfy::tensor::TensorArg<2> rotated_arg, comfy::tensor::TensorArg<1> codebook_arg,
-    comfy::tensor::TensorArg<2> packed_arg, comfy::tensor::TensorArg<2> scale_arg,
-    comfy::tensor::TensorArg<1> channel_scale_arg, bool stochastic, uint64_t seed,
-    cudaStream_t stream)
+    const void* rotated, const void* codebook, void* packed, void* s_rel, void* s_channel,
+    int64_t N, int64_t K, int in_dtype_code, bool stochastic, uint64_t seed, cudaStream_t stream)
 {
-    const void* rotated = rotated_arg.data;
-    const void* codebook = codebook_arg.data;
-    void* packed = packed_arg.data;
-    void* s_rel = scale_arg.data;
-    void* s_channel = channel_scale_arg.data;
-    const int64_t N = rotated_arg.meta.sizes[0];
-    const int64_t K = rotated_arg.meta.sizes[1];
-    const int in_dtype_code = static_cast<int>(rotated_arg.meta.dtype);
     const int threads = 256;
     const size_t shmem = static_cast<size_t>(K / 16) * sizeof(float);
     // Static shared is cb[16] + warp_max[32] = 192 bytes; bail if static+dynamic won't fit.

@@ -29,8 +29,6 @@
 // Requires sm80+ (bf16 mma / f32 accumulators). head_dim in {16,32,48,64}.
 // Layout: q/k/v/out are contiguous (B, T, H, W, NH, HD).
 
-#include "tensor.h"
-
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -402,24 +400,18 @@ void launch_na3d_typed(
 }  // namespace
 
 extern "C" void launch_na3d_kernel(
-    comfy::tensor::TensorArg<6> q, comfy::tensor::TensorArg<6> k,
-    comfy::tensor::TensorArg<6> v, comfy::tensor::TensorArg<6> out,
-    int kt, int kh, int kw, int causal_t, int causal_h, int causal_w,
-    float scale, cudaStream_t stream)
+    const void* q, const void* k, const void* v, void* out,
+    int batch, int t_size, int h_size, int w_size, int num_heads, int head_dim,
+    int kt, int kh, int kw,
+    int causal_t, int causal_h, int causal_w,
+    float scale, int dtype_code, cudaStream_t stream)
 {
-    const int batch = static_cast<int>(q.meta.sizes[0]);
-    const int t_size = static_cast<int>(q.meta.sizes[1]);
-    const int h_size = static_cast<int>(q.meta.sizes[2]);
-    const int w_size = static_cast<int>(q.meta.sizes[3]);
-    const int num_heads = static_cast<int>(q.meta.sizes[4]);
-    const int head_dim = static_cast<int>(q.meta.sizes[5]);
-    const int dtype_code = static_cast<int>(q.meta.dtype);
     // Contiguous (B, T, H, W, NH, HD) strides.
-    const int64_t s_n = q.meta.strides[4];
-    const int64_t s_w = q.meta.strides[3];
-    const int64_t s_h = q.meta.strides[2];
-    const int64_t s_t = q.meta.strides[1];
-    const int64_t s_b = q.meta.strides[0];
+    const int64_t s_n = head_dim;
+    const int64_t s_w = (int64_t)num_heads * head_dim;
+    const int64_t s_h = (int64_t)w_size * s_w;
+    const int64_t s_t = (int64_t)h_size * s_h;
+    const int64_t s_b = (int64_t)t_size * s_t;
 
     // Non-causal kernels clamp to the axis length (NATTEN would reject this).
     const int ckt = causal_t ? kt : imin(kt, t_size);
@@ -427,11 +419,11 @@ extern "C" void launch_na3d_kernel(
     const int ckw = causal_w ? kw : imin(kw, w_size);
 
     if (dtype_code == 1) {
-        launch_na3d_typed<__half>(q.data, k.data, v.data, out.data, t_size, h_size, w_size, num_heads, head_dim,
+        launch_na3d_typed<__half>(q, k, v, out, t_size, h_size, w_size, num_heads, head_dim,
                                   s_b, s_t, s_h, s_w, s_n, ckt, ckh, ckw,
                                   causal_t != 0, causal_h != 0, causal_w != 0, scale, batch, stream);
     } else if (dtype_code == 2) {
-        launch_na3d_typed<__nv_bfloat16>(q.data, k.data, v.data, out.data, t_size, h_size, w_size, num_heads, head_dim,
+        launch_na3d_typed<__nv_bfloat16>(q, k, v, out, t_size, h_size, w_size, num_heads, head_dim,
                                          s_b, s_t, s_h, s_w, s_n, ckt, ckh, ckw,
                                          causal_t != 0, causal_h != 0, causal_w != 0, scale, batch, stream);
     } else {

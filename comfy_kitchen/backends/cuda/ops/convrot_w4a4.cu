@@ -4,7 +4,6 @@
 // with row/column dequant scales.
 #include "dtype_dispatch.cuh"
 #include "svdquant_utils.cuh"
-#include "../tensor.h"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -28,14 +27,28 @@
 #endif
 
 extern "C" void launch_cublas_gemm_int8_kernel(
-    comfy::tensor::TensorArg<2> a, comfy::tensor::TensorArg<2> b,
-    comfy::tensor::TensorArg<2> c, comfy::tensor::TensorArg<1> workspace,
+    const void* A_ptr,
+    const void* B_ptr,
+    void* C_ptr,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    void* workspace_ptr,
+    int64_t workspace_size,
     cudaStream_t stream);
 
 extern "C" bool launch_cutlass_int8_dequant_strided(
-    comfy::tensor::TensorArg<2> a, comfy::tensor::TensorArg<2> b,
-    comfy::tensor::TensorArg<1> xs, comfy::tensor::TensorArg<1> ws,
-    comfy::tensor::TensorArg<1> bias, comfy::tensor::TensorArg<2> output,
+    const void* A,
+    const void* B,
+    const void* xs,
+    const void* ws,
+    const void* bias,
+    void* D,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t output_stride,
+    int out_dtype_code,
     cudaStream_t stream);
 
 namespace {
@@ -1854,18 +1867,16 @@ __global__ void unpack_int4_to_int8_vec8_kernel(
 extern "C" {
 
 void launch_quantize_int4_rowwise_kernel(
-    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> output_arg,
-    comfy::tensor::TensorArg<2> scales_arg,
+    const void* input,
+    void* output,
+    void* scales,
+    int64_t M,
+    int64_t K,
+    int input_dtype_code,
     bool stochastic,
     uint64_t seed,
     cudaStream_t stream)
 {
-    const void* input = input_arg.data;
-    void* output = output_arg.data;
-    void* scales = scales_arg.data;
-    const int64_t M = input_arg.meta.sizes[0];
-    const int64_t K = input_arg.meta.sizes[1];
-    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
     if (K % comfy::svdquant::kGroupSize != 0) return;
     constexpr int kThreads = 256;
     const dim3 grid(static_cast<unsigned int>(M));
@@ -1927,18 +1938,17 @@ void launch_quantize_int4_rowwise_kernel(
 }
 
 void launch_quantize_int4_rowwise_convrot64_kernel(
-    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> output_arg,
-    comfy::tensor::TensorArg<2> scales_arg, int group_size,
+    const void* input,
+    void* output,
+    void* scales,
+    int64_t M,
+    int64_t K,
+    int group_size,
+    int input_dtype_code,
     bool stochastic,
     uint64_t seed,
     cudaStream_t stream)
 {
-    const void* input = input_arg.data;
-    void* output = output_arg.data;
-    void* scales = scales_arg.data;
-    const int64_t M = input_arg.meta.sizes[0];
-    const int64_t K = input_arg.meta.sizes[1];
-    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
     if ((group_size != 16 && group_size != 64 && group_size != kConvRotGroup) || K % group_size != 0) return;
     constexpr int block_threads_multi = 1024;
     constexpr int block_threads_15360 = 640;
@@ -2163,18 +2173,17 @@ void launch_quantize_int4_rowwise_convrot64_kernel(
 }
 
 void launch_quantize_int4_rowwise_convrot64_to_int8_kernel(
-    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> output_arg,
-    comfy::tensor::TensorArg<2> scales_arg, int group_size,
+    const void* input,
+    void* output,
+    void* scales,
+    int64_t M,
+    int64_t K,
+    int group_size,
+    int input_dtype_code,
     bool stochastic,
     uint64_t seed,
     cudaStream_t stream)
 {
-    const void* input = input_arg.data;
-    void* output = output_arg.data;
-    void* scales = scales_arg.data;
-    const int64_t M = input_arg.meta.sizes[0];
-    const int64_t K = input_arg.meta.sizes[1];
-    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
     if (group_size != kConvRotGroup || K % kConvRotGroup != 0) return;
     constexpr int block_threads_multi = 1024;
     constexpr int block_threads_15360 = 640;
@@ -2323,17 +2332,16 @@ void launch_quantize_int4_rowwise_convrot64_to_int8_kernel(
 }
 
 void launch_dequantize_int4_convrot64_kernel(
-    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<1> scales_arg,
-    comfy::tensor::TensorArg<2> output_arg, int group_size,
+    const void* input,
+    const void* scales,
+    void* output,
+    int64_t num_rows,
+    int64_t num_cols,
+    int64_t scale_size,
+    int group_size,
+    int output_dtype_code,
     cudaStream_t stream)
 {
-    const void* input = input_arg.data;
-    const void* scales = scales_arg.data;
-    void* output = output_arg.data;
-    const int64_t num_rows = output_arg.meta.sizes[0];
-    const int64_t num_cols = output_arg.meta.sizes[1];
-    const int64_t scale_size = scales_arg.meta.sizes[0];
-    const int output_dtype_code = static_cast<int>(output_arg.meta.dtype);
     if (num_rows == 0 || num_cols == 0) return;
     if ((group_size != 16 && group_size != 64 && group_size != kConvRotGroup) || num_cols % group_size != 0) return;
 
@@ -2717,23 +2725,20 @@ void launch_dequantize_int4_convrot64_kernel(
 }
 
 void launch_int4_linear_kernel(
-    comfy::tensor::TensorArg<2> act_arg, comfy::tensor::TensorArg<2> weight_arg,
-    comfy::tensor::TensorArg<1> x_scales_arg, comfy::tensor::TensorArg<1> weight_scales_arg,
-    comfy::tensor::TensorArg<1> bias_arg, comfy::tensor::TensorArg<2> output_arg,
+    const void* act,
+    const void* weight,
+    const void* x_scales,
+    const void* weight_scales,
+    const void* bias,
+    void* output,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    bool has_bias,
+    int output_dtype_code,
+    int bias_dtype_code,
     cudaStream_t stream)
 {
-    const void* act = act_arg.data;
-    const void* weight = weight_arg.data;
-    const void* x_scales = x_scales_arg.data;
-    const void* weight_scales = weight_scales_arg.data;
-    const void* bias = bias_arg.data;
-    void* output = output_arg.data;
-    const int64_t M = act_arg.meta.sizes[0];
-    const int64_t N = weight_arg.meta.sizes[0];
-    const int64_t K = act_arg.meta.sizes[1] * 2;
-    const bool has_bias = bias != nullptr;
-    const int output_dtype_code = static_cast<int>(output_arg.meta.dtype);
-    const int bias_dtype_code = has_bias ? static_cast<int>(bias_arg.meta.dtype) : output_dtype_code;
     if (K % comfy::svdquant::kGroupSize != 0) return;
     const dim3 grid(static_cast<unsigned int>((N + kBlockN - 1) / kBlockN),
                     static_cast<unsigned int>((M + kBlockM - 1) / kBlockM));
@@ -2769,13 +2774,12 @@ void launch_int4_linear_kernel(
 }
 
 void launch_unpack_int4_to_int8_kernel(
-    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> output_arg,
+    const void* input,
+    void* output,
+    int64_t rows,
+    int64_t K_half,
     cudaStream_t stream)
 {
-    const void* input = input_arg.data;
-    void* output = output_arg.data;
-    const int64_t rows = input_arg.meta.sizes[0];
-    const int64_t K_half = input_arg.meta.sizes[1];
     if (rows == 0 || K_half == 0) return;
     const int64_t total_packed = rows * K_half;
     constexpr int block_threads = 256;
@@ -2787,24 +2791,21 @@ void launch_unpack_int4_to_int8_kernel(
 }
 
 void launch_int4_weight_int8_act_gemv_dequant_kernel(
-    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> weight_arg,
-    comfy::tensor::TensorArg<2> x_scales_arg, comfy::tensor::TensorArg<1> weight_scales_arg,
-    comfy::tensor::TensorArg<1> bias_arg, comfy::tensor::TensorArg<2> output_arg,
+    const void* input,
+    const void* weight,
+    const void* x_scales,
+    const void* weight_scales,
+    const void* bias,
+    void* output,
+    int64_t num_rows,
+    int64_t num_cols,
+    int64_t K,
+    int64_t weight_scale_size,
+    bool has_bias,
+    int output_dtype_code,
+    int bias_dtype_code,
     cudaStream_t stream)
 {
-    const void* input = input_arg.data;
-    const void* weight = weight_arg.data;
-    const void* x_scales = x_scales_arg.data;
-    const void* weight_scales = weight_scales_arg.data;
-    const void* bias = bias_arg.data;
-    void* output = output_arg.data;
-    const int64_t num_rows = input_arg.meta.sizes[0];
-    const int64_t num_cols = weight_arg.meta.sizes[0];
-    const int64_t K = input_arg.meta.sizes[1];
-    const int64_t weight_scale_size = weight_scales_arg.meta.sizes[0];
-    const bool has_bias = bias != nullptr;
-    const int output_dtype_code = static_cast<int>(output_arg.meta.dtype);
-    const int bias_dtype_code = has_bias ? static_cast<int>(bias_arg.meta.dtype) : output_dtype_code;
     if (num_cols == 0 || K == 0) return;
     if ((K & 3) != 0) {
         throw std::runtime_error("int4_weight_int8_act_gemv_dequant requires K divisible by 4");
@@ -2865,27 +2866,27 @@ void launch_int4_weight_int8_act_gemv_dequant_kernel(
 }
 
 void launch_int4_weight_int8_act_gemm_dequant_chunked_kernel(
-    comfy::tensor::TensorArg<2> input_arg, comfy::tensor::TensorArg<2> weight_arg,
-    comfy::tensor::TensorArg<2> x_scales_arg, comfy::tensor::TensorArg<1> weight_scales_arg,
-    comfy::tensor::TensorArg<1> bias_arg, comfy::tensor::TensorArg<2> output_arg,
-    comfy::tensor::TensorArg<2> weight_workspace_arg, comfy::tensor::TensorArg<2> acc_workspace_arg,
-    comfy::tensor::TensorArg<1> cublas_workspace_arg, int64_t chunk_cols,
-    bool allow_sm80_cutlass, cudaStream_t stream)
+    const void* input,
+    const void* weight,
+    const void* x_scales,
+    const void* weight_scales,
+    const void* bias,
+    void* output,
+    void* weight_workspace,
+    void* acc_workspace,
+    void* cublas_workspace,
+    int64_t cublas_workspace_size,
+    int64_t num_rows,
+    int64_t num_cols,
+    int64_t K,
+    int64_t weight_scale_size,
+    int64_t chunk_cols,
+    bool allow_sm80_cutlass,
+    bool has_bias,
+    int output_dtype_code,
+    int bias_dtype_code,
+    cudaStream_t stream)
 {
-    const void* weight = weight_arg.data;
-    const void* x_scales = x_scales_arg.data;
-    const void* weight_scales = weight_scales_arg.data;
-    const void* bias = bias_arg.data;
-    void* output = output_arg.data;
-    void* weight_workspace = weight_workspace_arg.data;
-    void* acc_workspace = acc_workspace_arg.data;
-    const int64_t num_rows = input_arg.meta.sizes[0];
-    const int64_t num_cols = weight_arg.meta.sizes[0];
-    const int64_t K = input_arg.meta.sizes[1];
-    const int64_t weight_scale_size = weight_scales_arg.meta.sizes[0];
-    const bool has_bias = bias != nullptr;
-    const int output_dtype_code = static_cast<int>(output_arg.meta.dtype);
-    const int bias_dtype_code = has_bias ? static_cast<int>(bias_arg.meta.dtype) : output_dtype_code;
     if (num_rows == 0 || num_cols == 0 || K == 0) return;
     if ((K & 1) != 0) {
         throw std::runtime_error("int4_weight_int8_act_gemm_dequant_chunked requires K divisible by 2");
@@ -2916,39 +2917,9 @@ void launch_int4_weight_int8_act_gemm_dequant_chunked_kernel(
             static_cast<int8_t*>(weight_workspace),
             total_packed);
 
-        auto weight_chunk_arg = weight_workspace_arg;
-        weight_chunk_arg.meta.sizes[0] = cols;
-        weight_chunk_arg.meta.sizes[1] = K;
-        weight_chunk_arg.meta.strides[0] = K;
-        weight_chunk_arg.meta.strides[1] = 1;
-
-        comfy::tensor::TensorArg<1> x_scale_arg{};
-        x_scale_arg.data = x_scales_arg.data;
-        x_scale_arg.meta.sizes[0] = num_rows;
-        x_scale_arg.meta.strides[0] = 1;
-        x_scale_arg.meta.dtype = x_scales_arg.meta.dtype;
-
-        auto weight_scale_arg = weight_scales_arg;
-        weight_scale_arg.data = static_cast<float*>(weight_scales_arg.data)
-            + (weight_scale_size == 1 ? 0 : n0);
-        weight_scale_arg.meta.sizes[0] = weight_scale_size == 1 ? 1 : cols;
-
-        comfy::tensor::TensorArg<1> chunk_bias_arg{};
-        if (has_bias) {
-            chunk_bias_arg = bias_arg;
-            chunk_bias_arg.data = static_cast<char*>(bias_arg.data)
-                + n0 * fp_dtype_size_bytes(bias_dtype_code);
-            chunk_bias_arg.meta.sizes[0] = cols;
-        }
-
-        auto output_chunk_arg = output_arg;
-        output_chunk_arg.data = static_cast<char*>(output_arg.data)
-            + n0 * fp_dtype_size_bytes(output_dtype_code);
-        output_chunk_arg.meta.sizes[0] = num_rows;
-        output_chunk_arg.meta.sizes[1] = cols;
-        output_chunk_arg.meta.strides[0] = num_cols;
-        output_chunk_arg.meta.strides[1] = 1;
-
+        const float* chunk_weight_scales = static_cast<const float*>(weight_scales) + (weight_scale_size == 1 ? 0 : n0);
+        const void* chunk_bias = has_bias ? static_cast<const char*>(bias) + n0 * fp_dtype_size_bytes(bias_dtype_code) : nullptr;
+        void* chunk_output = static_cast<char*>(output) + n0 * fp_dtype_size_bytes(output_dtype_code);
         const bool used_cutlass = (
             allow_sm80_cutlass
             && num_rows >= 1024
@@ -2956,19 +2927,32 @@ void launch_int4_weight_int8_act_gemm_dequant_chunked_kernel(
             && weight_scale_size != 1
             && (!has_bias || bias_dtype_code == 0)
             && launch_cutlass_int8_dequant_strided(
-                input_arg, weight_chunk_arg, x_scale_arg, weight_scale_arg,
-                chunk_bias_arg, output_chunk_arg, stream));
+                input,
+                weight_workspace,
+                x_scales,
+                chunk_weight_scales,
+                chunk_bias,
+                chunk_output,
+                num_rows,
+                cols,
+                K,
+                num_cols,
+                output_dtype_code,
+                stream));
         if (used_cutlass) {
             continue;
         }
 
-        auto acc_chunk_arg = acc_workspace_arg;
-        acc_chunk_arg.meta.sizes[0] = num_rows;
-        acc_chunk_arg.meta.sizes[1] = cols;
-        acc_chunk_arg.meta.strides[0] = cols;
-        acc_chunk_arg.meta.strides[1] = 1;
         launch_cublas_gemm_int8_kernel(
-            input_arg, weight_chunk_arg, acc_chunk_arg, cublas_workspace_arg, stream);
+            input,
+            weight_workspace,
+            acc_workspace,
+            num_rows,
+            cols,
+            K,
+            cublas_workspace,
+            cublas_workspace_size,
+            stream);
 
         const int64_t total = num_rows * cols;
         const int64_t dequant_blocks = (total + dequant_threads - 1) / dequant_threads;
@@ -3015,22 +2999,19 @@ void launch_int4_weight_int8_act_gemm_dequant_chunked_kernel(
 }
 
 bool launch_cutlass_int4_dequant(
-    comfy::tensor::TensorArg<2> a_arg, comfy::tensor::TensorArg<2> b_arg,
-    comfy::tensor::TensorArg<1> xs_arg, comfy::tensor::TensorArg<1> ws_arg,
-    comfy::tensor::TensorArg<1> bias_arg, comfy::tensor::TensorArg<2> output_arg,
+    const void* A,
+    const void* B,
+    const void* xs,
+    const void* ws,
+    const void* bias,
+    void* D,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int out_dtype_code,
     cudaStream_t stream)
 {
 #ifdef COMFY_HAVE_CUTLASS
-    const void* A = a_arg.data;
-    const void* B = b_arg.data;
-    const void* xs = xs_arg.data;
-    const void* ws = ws_arg.data;
-    const void* bias = bias_arg.data;
-    void* D = output_arg.data;
-    const int64_t M = a_arg.meta.sizes[0];
-    const int64_t N = b_arg.meta.sizes[0];
-    const int64_t K = a_arg.meta.sizes[1] * 2;
-    const int out_dtype_code = static_cast<int>(output_arg.meta.dtype);
     if (M == 0 || N == 0 || K == 0) return true;
     if (K % comfy::svdquant::kGroupSize != 0) return false;
     const int8_t* a = static_cast<const int8_t*>(A);

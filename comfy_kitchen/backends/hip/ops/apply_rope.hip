@@ -13,34 +13,25 @@
 
 #include "../hadamard.h"    // load_in / dtype codes
 #include "../rope_math.h"   // rope_combine / rope_store
-#include "tensor.h"
 
 namespace comfy::hip_backend {
 
 constexpr int kRopeThreads = 256;
 
-using TensorArg4 = tensor::TensorArg<4>;
-using TensorArg6 = tensor::TensorArg<6>;
-
 template <typename T>
 __global__ void apply_rope_kernel(
-    TensorArg4 xq_arg, TensorArg4 xk_arg, TensorArg6 freqs_arg,
-    TensorArg4 xq_out_arg, TensorArg4 xk_out_arg, bool has_k,
-    bool split_half) {
-
-    const void* xq = xq_arg.data;
-    const void* xk = xk_arg.data;
-    const void* freqs = freqs_arg.data;
-    T* xq_out = static_cast<T*>(xq_out_arg.data);
-    T* xk_out = static_cast<T*>(xk_out_arg.data);
-    const int64_t dim1 = xq_arg.meta.sizes[1];
-    const int64_t dim2 = xq_arg.meta.sizes[2];
-    const int64_t head_dim = xq_arg.meta.sizes[3];
-    const int x_code = static_cast<int>(xq_arg.meta.dtype);
-    const int f_code = static_cast<int>(freqs_arg.meta.dtype);
+    const void* __restrict__ xq, const void* __restrict__ xk,
+    const void* __restrict__ freqs, T* __restrict__ xq_out, T* __restrict__ xk_out,
+    int64_t batch, int64_t dim1, int64_t dim2, int64_t head_dim,
+    int64_t fb, int64_t fd1, int64_t fd2,
+    int64_t sx_b, int64_t sx_d1, int64_t sx_d2, int64_t sx_d,
+    int64_t so_b, int64_t so_d1, int64_t so_d2, int64_t so_d,
+    int64_t sf_b, int64_t sf_d1, int64_t sf_d2, int64_t sf_d, int64_t sf_rot,
+    int64_t sf_pair,
+    int x_code, int f_code, bool split_half) {
 
     const int64_t n_pairs = head_dim / 2;
-    const int64_t total = xq_arg.meta.sizes[0] * dim1 * dim2 * n_pairs;
+    const int64_t total = batch * dim1 * dim2 * n_pairs;
     const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) return;
 
@@ -53,38 +44,29 @@ __global__ void apply_rope_kernel(
 
     // Inputs keep their own strides so a qkv slice is read in place; the outputs
     // are freshly allocated, so they carry their own set.
-    const int64_t xoff = b * xq_arg.meta.strides[0] +
-                         d1 * xq_arg.meta.strides[1] +
-                         d2 * xq_arg.meta.strides[2];
-    const int64_t ooff = b * xq_out_arg.meta.strides[0] +
-                         d1 * xq_out_arg.meta.strides[1] +
-                         d2 * xq_out_arg.meta.strides[2];
+    const int64_t xoff = b * sx_b + d1 * sx_d1 + d2 * sx_d2;
+    const int64_t ooff = b * so_b + d1 * so_d1 + d2 * so_d2;
     const int64_t ia = split_half ? k : 2 * k;
     const int64_t ib = split_half ? k + n_pairs : 2 * k + 1;
-    const int64_t ia_in = xoff + ia * xq_arg.meta.strides[3];
-    const int64_t ib_in = xoff + ib * xq_arg.meta.strides[3];
-    const int64_t ia_out = ooff + ia * xq_out_arg.meta.strides[3];
-    const int64_t ib_out = ooff + ib * xq_out_arg.meta.strides[3];
+    const int64_t ia_in = xoff + ia * sx_d;
+    const int64_t ib_in = xoff + ib * sx_d;
+    const int64_t ia_out = ooff + ia * so_d;
+    const int64_t ib_out = ooff + ib * so_d;
 
-    const int64_t foff =
-        (freqs_arg.meta.sizes[0] == 1 ? 0 : b) * freqs_arg.meta.strides[0] +
-        (freqs_arg.meta.sizes[1] == 1 ? 0 : d1) * freqs_arg.meta.strides[1] +
-        (freqs_arg.meta.sizes[2] == 1 ? 0 : d2) * freqs_arg.meta.strides[2] +
-        k * freqs_arg.meta.strides[3];
+    const int64_t foff = (fb == 1 ? 0 : b) * sf_b + (fd1 == 1 ? 0 : d1) * sf_d1 +
+                         (fd2 == 1 ? 0 : d2) * sf_d2 + k * sf_d;
 
     const float f00 = load_in(freqs, foff, f_code);
-    const float f01 = load_in(freqs, foff + freqs_arg.meta.strides[5], f_code);
-    const float f10 = load_in(freqs, foff + freqs_arg.meta.strides[4], f_code);
-    const float f11 = load_in(
-        freqs, foff + freqs_arg.meta.strides[4] + freqs_arg.meta.strides[5],
-        f_code);
+    const float f01 = load_in(freqs, foff + sf_pair, f_code);
+    const float f10 = load_in(freqs, foff + sf_rot, f_code);
+    const float f11 = load_in(freqs, foff + sf_rot + sf_pair, f_code);
 
     const float qa = load_in(xq, ia_in, x_code);
     const float qb = load_in(xq, ib_in, x_code);
     rope_store<T>(xq_out, ia_out, rope_combine(f00, qa, f01, qb, f_code, split_half));
     rope_store<T>(xq_out, ib_out, rope_combine(f10, qa, f11, qb, f_code, split_half));
 
-    if (has_k) {
+    if (xk != nullptr) {
         const float ka = load_in(xk, ia_in, x_code);
         const float kb = load_in(xk, ib_in, x_code);
         rope_store<T>(xk_out, ia_out, rope_combine(f00, ka, f01, kb, f_code, split_half));
@@ -95,27 +77,31 @@ __global__ void apply_rope_kernel(
 }  // namespace comfy::hip_backend
 
 extern "C" void launch_apply_rope_kernel(
-    comfy::tensor::TensorArg<4> xq, comfy::tensor::TensorArg<4> xk,
-    comfy::tensor::TensorArg<6> freqs, comfy::tensor::TensorArg<4> xq_out,
-    comfy::tensor::TensorArg<4> xk_out, bool has_k, bool split_half,
-    hipStream_t stream) {
+    const void* xq, const void* xk, const void* freqs, void* xq_out, void* xk_out,
+    int64_t batch, int64_t dim1, int64_t dim2, int64_t head_dim,
+    int64_t fb, int64_t fd1, int64_t fd2,
+    int64_t sx_b, int64_t sx_d1, int64_t sx_d2, int64_t sx_d,
+    int64_t so_b, int64_t so_d1, int64_t so_d2, int64_t so_d,
+    int64_t sf_b, int64_t sf_d1, int64_t sf_d2, int64_t sf_d, int64_t sf_rot, int64_t sf_pair,
+    int x_code, int f_code, bool split_half, hipStream_t stream) {
 
     using namespace comfy::hip_backend;
 
-    const int64_t total = xq.meta.sizes[0] * xq.meta.sizes[1] *
-                          xq.meta.sizes[2] * (xq.meta.sizes[3] / 2);
+    const int64_t total = batch * dim1 * dim2 * (head_dim / 2);
     const int blocks = static_cast<int>((total + kRopeThreads - 1) / kRopeThreads);
     if (blocks == 0) return;
 
-#define CK_ROPE_LAUNCH(T)                                                   \
-    apply_rope_kernel<T><<<blocks, kRopeThreads, 0, stream>>>(              \
-        xq, xk, freqs, xq_out, xk_out, has_k, split_half)
+#define CK_ROPE_LAUNCH(T)                                                                  \
+    apply_rope_kernel<T><<<blocks, kRopeThreads, 0, stream>>>(                             \
+        xq, xk, freqs, static_cast<T*>(xq_out), static_cast<T*>(xk_out), batch, dim1, dim2, \
+        head_dim, fb, fd1, fd2, sx_b, sx_d1, sx_d2, sx_d, so_b, so_d1, so_d2, so_d, sf_b,   \
+        sf_d1, sf_d2, sf_d, sf_rot, sf_pair, x_code, f_code, split_half)
 
-    if (xq.meta.dtype == comfy::tensor::DType::Float32) {
+    if (x_code == 0) {
         CK_ROPE_LAUNCH(float);
-    } else if (xq.meta.dtype == comfy::tensor::DType::Float16) {
+    } else if (x_code == 1) {
         CK_ROPE_LAUNCH(__half);
-    } else if (xq.meta.dtype == comfy::tensor::DType::BFloat16) {
+    } else if (x_code == 2) {
         CK_ROPE_LAUNCH(__bf16);
     } else {
         throw std::runtime_error("apply_rope: unsupported input dtype");

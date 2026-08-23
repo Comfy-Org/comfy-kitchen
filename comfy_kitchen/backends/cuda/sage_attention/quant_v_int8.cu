@@ -174,8 +174,7 @@ quant_v_int8_kernel(const T *__restrict__ v, int8_t *__restrict__ out,
 } // namespace
 
 extern "C" void launch_quant_v_int8_kernel(
-    comfy::tensor::TensorArg<4> v, comfy::tensor::TensorArg<2> out,
-    comfy::tensor::TensorArg<1> scale, int padded_N,
+    comfy::tensor::TensorArg<4> v, int8_t* out, float* scale, int padded_N,
     cudaStream_t stream) {
   const int B = static_cast<int>(v.meta.sizes[0]);
   const int H = static_cast<int>(v.meta.sizes[1]);
@@ -207,12 +206,12 @@ extern "C" void launch_quant_v_int8_kernel(
   DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
     if (N <= 256) {
       quant_v_int8_kernel<T, 128><<<blocks, 128, 0, stream>>>(
-          static_cast<const T *>(v.data), static_cast<int8_t *>(out.data),
-          static_cast<float *>(scale.data), N, padded_N, H, D, sb, sh, sn);
+          static_cast<const T *>(v.data), out,
+          scale, N, padded_N, H, D, sb, sh, sn);
     } else {
       quant_v_int8_kernel<T, 512><<<blocks, 512, 0, stream>>>(
-          static_cast<const T *>(v.data), static_cast<int8_t *>(out.data),
-          static_cast<float *>(scale.data), N, padded_N, H, D, sb, sh, sn);
+          static_cast<const T *>(v.data), out,
+          scale, N, padded_N, H, D, sb, sh, sn);
     }
   });
 

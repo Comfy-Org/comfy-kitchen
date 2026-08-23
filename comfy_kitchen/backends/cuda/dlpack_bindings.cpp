@@ -21,7 +21,6 @@
 #include <climits>
 #include <cstring>
 #include <optional>
-#include <string>
 
 #include "cublaslt_runtime.h"
 #include "input_act_codes.h"
@@ -32,26 +31,32 @@ namespace nb = nanobind;
 // Helper: Map nanobind dtype to internal dtype code
 // Returns: 0=float32, 1=float16, 2=bfloat16, 3=uint8, 4=int8, 5=float8_e4m3fn, 6=float8_e5m2
 int map_dtype_to_code(const nb::dlpack::dtype& dtype) {
-    return static_cast<int>(comfy::tensor::dtype_from_dlpack(dtype));
-}
-
-template <typename... Args>
-void validate_fp_dtype_code(
-    const nb::ndarray<Args...>& array, int dtype_code, const char* operation) {
-    if (dtype_code < 0 || dtype_code > 2 || map_dtype_to_code(array.dtype()) != dtype_code) {
-        throw std::runtime_error(
-            std::string(operation) + ": dtype code must match an FP32, FP16, or BF16 tensor");
+    if (dtype.code == (uint8_t)nb::dlpack::dtype_code::Float) {
+        if (dtype.bits == 32) return 0;  // float32
+        if (dtype.bits == 16) return 1;  // float16
+        if (dtype.bits == 8) return 5;   // float8_e4m3fn (default)
+    } else if (dtype.code == (uint8_t)nb::dlpack::dtype_code::Bfloat && dtype.bits == 16) {
+        return 2;  // bfloat16
+    } else if (dtype.code == (uint8_t)nb::dlpack::dtype_code::UInt && dtype.bits == 8) {
+        return 3;  // uint8
+    } else if (dtype.code == (uint8_t)nb::dlpack::dtype_code::Int && dtype.bits == 8) {
+        return 4;  // int8
     }
+    return -1;  // unsupported
 }
 
-comfy::tensor::TensorArg<4> make_packed_sage_v_arg(
+using comfy::tensor::TensorArg;
+using comfy::tensor::make_tensor_arg;
+
+TensorArg<4> make_packed_sage_v_arg(
     const nb::ndarray<nb::device::cuda>& array, int64_t batch, int64_t heads,
     int64_t head_dim, int64_t padded_length) {
-    auto flat = comfy::tensor::make_flat_tensor_arg(array);
-    if (flat.meta.sizes[0] != batch * heads * head_dim * padded_length) {
+    auto flat = make_tensor_arg<2>(array);
+    if (flat.meta.sizes[0] * flat.meta.sizes[1] !=
+        batch * heads * head_dim * padded_length) {
         throw std::runtime_error("packed SageAttention V has an invalid size");
     }
-    comfy::tensor::TensorArg<4> arg{};
+    TensorArg<4> arg{};
     arg.data = flat.data;
     arg.meta.dtype = flat.meta.dtype;
     arg.meta.sizes[0] = batch;
@@ -65,39 +70,39 @@ comfy::tensor::TensorArg<4> make_packed_sage_v_arg(
     return arg;
 }
 
-comfy::tensor::TensorArg<1> make_int32_scratch_arg(uintptr_t pointer, int64_t size) {
-    comfy::tensor::TensorArg<1> arg{};
-    arg.data = reinterpret_cast<void*>(pointer);
-    arg.meta.sizes[0] = size;
-    arg.meta.strides[0] = 1;
-    arg.meta.dtype = comfy::tensor::DType::Int32;
-    return arg;
-}
-
-using comfy::tensor::DType;
-using comfy::tensor::TensorArg;
-using comfy::tensor::make_contiguous_tensor_arg;
-using comfy::tensor::make_flat_tensor_arg;
-using comfy::tensor::make_optional_flat_tensor_arg;
-using comfy::tensor::make_tensor_arg;
-
 // Forward declarations of CUDA kernel wrappers
 extern "C" {
-    void launch_quantize_fp8_kernel(
-        TensorArg<1> input, TensorArg<1> scale, TensorArg<1> output,
-        cudaStream_t stream);
+    void launch_quantize_fp8_kernel(const void* input, void* output, 
+                                    const void* scale, int64_t numel,
+                                    int input_dtype_code, int output_dtype_code,
+                                    cudaStream_t stream);
     
-    void launch_dequantize_fp8_kernel(
-        TensorArg<1> input, TensorArg<1> scale, TensorArg<1> output,
-        cudaStream_t stream);
+    void launch_dequantize_fp8_kernel(const void* input, void* output,
+                                      const void* scale, int64_t numel,
+                                      int input_dtype_code, int output_dtype_code,
+                                      cudaStream_t stream);
 
-    void launch_stochastic_round_fp8_kernel(
-        TensorArg<1> rng_and_output, TensorArg<1> input, cudaStream_t stream);
+    void launch_stochastic_round_fp8_kernel(void* rng_and_output,
+                                            const void* input,
+                                            int64_t numel,
+                                            int rng_dtype_code,
+                                            int input_dtype_code,
+                                            int output_dtype_code,
+                                            cudaStream_t stream);
 
     void launch_cublas_gemm_blockwise_fp4_kernel(
-        TensorArg<2> b, TensorArg<2> b_scale, TensorArg<2> a,
-        TensorArg<2> a_scale, TensorArg<2> out, TensorArg<1> bias,
-        TensorArg<1> alpha, void* workspace, int64_t workspace_size,
+        const void* B_ptr,
+        const void* B_decode_scale_ptr,
+        const void* A_ptr,
+        const void* A_decode_scale_ptr,
+        void* D_ptr,
+        const void* bias_ptr,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        const float* alpha_device_ptr,
+        int out_dtype_code,
+        void* workspace_ptr,
         bool accumulate,
         cudaStream_t stream);
 
@@ -107,8 +112,17 @@ extern "C" {
         cudaStream_t stream);
 
     void launch_quantize_nvfp4_kernel(
-        TensorArg<2> input, TensorArg<1> global_scale, TensorArg<2> output,
-        TensorArg<2> block_scales, float epsilon, bool hi_first,
+        const void* input,
+        const void* global_scale,
+        void* output,
+        void* block_scales,
+        int64_t num_rows,
+        int64_t num_cols,
+        int64_t orig_rows,
+        int64_t orig_cols,
+        float epsilon,
+        int input_dtype_code,
+        bool hi_first,
         cudaStream_t stream);
 
     void launch_rms_rope_kernel(
@@ -118,42 +132,74 @@ extern "C" {
         bool split_half, cudaStream_t stream);
 
     void launch_dequantize_nvfp4_kernel(
-        TensorArg<2> input, TensorArg<1> global_scale,
-        TensorArg<2> block_scales, TensorArg<2> output, bool hi_first,
+        const void* input,
+        const void* global_scale,
+        const void* block_scales,
+        void* output,
+        int64_t num_rows,
+        int64_t num_cols,
+        int output_dtype_code,
+        bool hi_first,
         cudaStream_t stream);
 
     void launch_quantize_mxfp8_kernel(
-        TensorArg<2> input, TensorArg<2> output, TensorArg<2> block_scales,
+        const void* input,
+        void* output,
+        void* block_scales,
+        int64_t num_rows,
+        int64_t num_cols,
+        int64_t orig_rows,
+        int64_t orig_cols,
+        int input_dtype_code,
         cudaStream_t stream);
 
     // SageAttention kernel launchers
     void launch_quant_qk_per_thread_int8(
-        TensorArg<4> q, TensorArg<4> q_int8, TensorArg<3> q_scale,
-        TensorArg<4> k, TensorArg<4> k_int8, TensorArg<3> k_scale,
-        int BLKQ, int WARPQ, int BLKK, int WARPK, TensorArg<1> anchor_indices,
-        cudaStream_t stream);
+        TensorArg<4> q, int8_t* q_int8, float* q_scale, TensorArg<4> k,
+        int8_t* k_int8, float* k_scale, int BLKQ, int WARPQ, int BLKK,
+        int WARPK, int* anchor_indices, cudaStream_t stream);
 
     void launch_quant_v_int8_kernel(
-        TensorArg<4> v, TensorArg<2> out, TensorArg<1> scale, int padded_N, cudaStream_t stream);
+        TensorArg<4> v, int8_t* out, float* scale, int padded_N,
+        cudaStream_t stream);
 
     void launch_sage_attn_kernel(
-        TensorArg<4> q, TensorArg<4> k, TensorArg<4> v, TensorArg<4> o,
-        TensorArg<1> q_scale, TensorArg<1> k_scale, TensorArg<1> v_scale,
+        TensorArg<4> q, TensorArg<4> k, TensorArg<4> v, TensorArg<4> output,
+        const float* q_scale, const float* k_scale, const float* v_scale,
         TensorArg<4> mask, int cta_k, float sm_scale, cudaStream_t stream);
 
     // SVDQuant W4A4 — see ops/quantize_svdquant_w4a4.cu
     void launch_svdquant_quantize_w4a4_kernel(
-        TensorArg<2> x, TensorArg<1> smooth, TensorArg<2> lora_down,
-        TensorArg<2> q_x, TensorArg<2> ascales, TensorArg<2> lora_act,
+        const void* x,
+        const void* smooth,
+        const void* lora_down,
+        void* q_x,
+        void* ascales,
+        void* lora_act,
+        int M,
+        int M_pad,
+        int K,
+        int R,
+        int input_dtype_code,
         int act_unsigned,
         cudaStream_t stream);
 
     // SVDQuant W4A4 — see ops/scaled_mm_svdquant_w4a4.cu
     void launch_svdquant_scaled_mm_w4a4_kernel(
-        TensorArg<2> act, TensorArg<1> wgt, TensorArg<2> ascales,
-        TensorArg<1> wscales, TensorArg<2> lora_act_in,
-        TensorArg<1> lora_up, TensorArg<1> bias, TensorArg<2> out,
+        const void* act,
+        const void* wgt,
+        const void* ascales,
+        const void* wscales,
+        const void* lora_act_in,
+        const void* lora_up,
+        const void* bias,
+        void* out,
+        int M,
+        int N,
+        int K,
+        int R,
         int act_unsigned,
+        int out_dtype_code,
         int tile_packed,
         int fast_accum,
         int shared_scale,
@@ -163,22 +209,41 @@ extern "C" {
     // AWQ W4A16 — see ops/awq_w4a16.cu. Internal M-routing picks
     // gemv (M ≤ 8) vs gemm path; bias / LoRA-up are applied externally.
     void launch_awq_w4a16_kernel(
-        TensorArg<2> x, TensorArg<2> qweight, TensorArg<2> wscales,
-        TensorArg<2> wzeros, TensorArg<2> out, int G,
+        const void* x,
+        const void* qweight,
+        const void* wscales,
+        const void* wzeros,
+        void* out,
+        int M,
+        int N,
+        int K,
+        int G,
+        int dtype_code,
         cudaStream_t stream);
 
     // Fused 3D neighborhood attention — see ops/na3d.cu.
     void launch_na3d_kernel(
-        TensorArg<6> q, TensorArg<6> k, TensorArg<6> v, TensorArg<6> out,
-        int kt, int kh, int kw, int causal_t, int causal_h, int causal_w,
-        float scale, cudaStream_t stream);
+        const void* q, const void* k, const void* v, void* out,
+        int batch, int t_size, int h_size, int w_size, int num_heads, int head_dim,
+        int kt, int kh, int kw,
+        int causal_t, int causal_h, int causal_w,
+        float scale, int dtype_code, cudaStream_t stream);
 
     // Fused AdaLN — see ops/adaln.cu. subtract_mean selects LayerNorm (true)
     // or RMSNorm (false) statistics.
     void launch_adaln_kernel(
-        TensorArg<2> x, TensorArg<2> scale, TensorArg<2> shift,
-        TensorArg<2> out, int64_t scale_group, int64_t shift_group, float eps,
-        bool subtract_mean, cudaStream_t stream);
+        const void* x,
+        const void* scale,
+        const void* shift,
+        void*       out,
+        int64_t     N,
+        int64_t     D,
+        int64_t     scale_group,
+        int64_t     shift_group,
+        float       eps,
+        int         dtype_code,
+        bool        subtract_mean,
+        cudaStream_t stream);
 }
 
 // Nanobind wrapper for quantize_per_tensor_fp8
@@ -190,27 +255,20 @@ void quantize_per_tensor_fp8(
     int output_dtype_code,
     int64_t numel,
     uintptr_t stream_ptr) {
-    auto input_arg = make_flat_tensor_arg(input);
-    auto scale_arg = make_flat_tensor_arg(scale);
-    auto output_arg = make_flat_tensor_arg(output);
-    if (input_dtype_code < 0 || input_dtype_code > 2 ||
-        input_dtype_code != static_cast<int>(input_arg.meta.dtype)) {
+    
+    // Validate input dtype code (0=float32, 1=float16, 2=bfloat16)
+    if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error("Unsupported input dtype for quantize_per_tensor_fp8");
     }
+    
+    // Validate output dtype code (5=e4m3fn, 6=e5m2)
     if (output_dtype_code < 5 || output_dtype_code > 6) {
         throw std::runtime_error("Unsupported output dtype for quantize_per_tensor_fp8");
     }
-    if (numel < 0 || input_arg.meta.sizes[0] < numel ||
-        output_arg.meta.sizes[0] < numel || scale_arg.meta.sizes[0] < 1 ||
-        scale_arg.meta.dtype != DType::Float32 ||
-        output_arg.meta.dtype != DType::UInt8) {
-        throw std::runtime_error("Invalid tensor layout for quantize_per_tensor_fp8");
-    }
-    input_arg.meta.sizes[0] = numel;
-    output_arg.meta.dtype = static_cast<DType>(output_dtype_code);
-    launch_quantize_fp8_kernel(
-        input_arg, scale_arg, output_arg,
-        reinterpret_cast<cudaStream_t>(stream_ptr));
+    
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quantize_fp8_kernel(input.data(), output.data(), scale.data(), 
+                              numel, input_dtype_code, output_dtype_code, stream);
 }
 
 // Nanobind wrapper for dequantize_per_tensor_fp8
@@ -222,27 +280,20 @@ void dequantize_per_tensor_fp8(
     int output_dtype_code,
     int64_t numel,
     uintptr_t stream_ptr) {
-    auto input_arg = make_flat_tensor_arg(input);
-    auto scale_arg = make_flat_tensor_arg(scale);
-    auto output_arg = make_flat_tensor_arg(output);
+    
+    // Validate input dtype code (5=float8_e4m3fn, 6=float8_e5m2)
     if (input_dtype_code != 5 && input_dtype_code != 6) {
         throw std::runtime_error("Unsupported input dtype code for dequantize_per_tensor_fp8 (must be 5 or 6)");
     }
-    if (output_dtype_code < 0 || output_dtype_code > 2 ||
-        output_dtype_code != static_cast<int>(output_arg.meta.dtype)) {
+    
+    // Validate output dtype code (0=float32, 1=float16, 2=bfloat16)
+    if (output_dtype_code < 0 || output_dtype_code > 2) {
         throw std::runtime_error("Unsupported output dtype for dequantize_per_tensor_fp8 (must be float32, float16, or bfloat16)");
     }
-    if (numel < 0 || input_arg.meta.sizes[0] < numel ||
-        output_arg.meta.sizes[0] < numel || scale_arg.meta.sizes[0] < 1 ||
-        scale_arg.meta.dtype != DType::Float32 ||
-        input_arg.meta.dtype != DType::UInt8) {
-        throw std::runtime_error("Invalid tensor layout for dequantize_per_tensor_fp8");
-    }
-    input_arg.meta.sizes[0] = numel;
-    input_arg.meta.dtype = static_cast<DType>(input_dtype_code);
-    launch_dequantize_fp8_kernel(
-        input_arg, scale_arg, output_arg,
-        reinterpret_cast<cudaStream_t>(stream_ptr));
+    
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_dequantize_fp8_kernel(input.data(), output.data(), scale.data(),
+                                 numel, input_dtype_code, output_dtype_code, stream);
 }
 
 void stochastic_round_fp8(
@@ -251,27 +302,30 @@ void stochastic_round_fp8(
     int output_dtype_code,
     int64_t numel,
     uintptr_t stream_ptr) {
-    auto rng_arg = make_flat_tensor_arg(rng_and_output);
-    auto input_arg = make_flat_tensor_arg(input);
-    if (rng_arg.meta.dtype != DType::UInt8) {
+
+    int rng_dtype_code = map_dtype_to_code(rng_and_output.dtype());
+    if (rng_dtype_code != 3) {
         throw std::runtime_error("stochastic_round_fp8 requires uint8 RNG storage");
     }
-    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
+
+    int input_dtype_code = map_dtype_to_code(input.dtype());
     if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error("Unsupported input dtype for stochastic_round_fp8");
     }
+
     if (output_dtype_code < 5 || output_dtype_code > 6) {
         throw std::runtime_error("Unsupported output dtype for stochastic_round_fp8");
     }
-    if (numel < 0 || input_arg.meta.sizes[0] < numel ||
-        rng_arg.meta.sizes[0] < numel) {
-        throw std::runtime_error("Invalid tensor layout for stochastic_round_fp8");
-    }
-    input_arg.meta.sizes[0] = numel;
-    rng_arg.meta.dtype = static_cast<DType>(output_dtype_code);
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_stochastic_round_fp8_kernel(
-        rng_arg, input_arg,
-        reinterpret_cast<cudaStream_t>(stream_ptr));
+        rng_and_output.data(),
+        input.data(),
+        numel,
+        rng_dtype_code,
+        input_dtype_code,
+        output_dtype_code,
+        stream);
 }
 
 // Nanobind wrapper for cublas_gemm_blockwise_fp4
@@ -283,7 +337,7 @@ void cublas_gemm_blockwise_fp4(
     nb::ndarray<nb::device::cuda> out,
     int out_dtype_code,
     nb::ndarray<nb::device::cuda> bias,
-    nb::ndarray<uint8_t, nb::device::cuda> workspace,
+    nb::ndarray<nb::device::cuda> workspace,
     bool accumulate,
     nb::ndarray<float, nb::device::cuda> alpha,
     uintptr_t stream_ptr) {
@@ -293,34 +347,45 @@ void cublas_gemm_blockwise_fp4(
         throw std::runtime_error("cuBLASLt not available: " + runtime.error_message());
     }
 
-    auto b_arg = make_contiguous_tensor_arg<2>(b);
-    auto b_scale_arg = make_contiguous_tensor_arg<2>(block_scale_b);
-    auto a_arg = make_contiguous_tensor_arg<2>(a);
-    auto a_scale_arg = make_contiguous_tensor_arg<2>(block_scale_a);
-    auto out_arg = make_contiguous_tensor_arg<2>(out);
-    auto bias_arg = make_flat_tensor_arg(bias);
-    auto alpha_arg = make_flat_tensor_arg(alpha);
-    if (!comfy::tensor::is_contiguous(workspace)) {
-        throw std::runtime_error("cuBLAS workspace must be contiguous");
-    }
+    // Get dimensions: B is (N, K_b), A is (M, K_a) in packed format
+    int64_t N = b.shape(0);
+    int64_t K_b = b.shape(1);
+    int64_t M = a.shape(0);
+    int64_t K_a = a.shape(1);
 
-    if (a_arg.meta.sizes[1] != b_arg.meta.sizes[1]) {
+    if (K_a != K_b) {
         throw std::runtime_error("Matrix dimensions do not match");
     }
 
+    // K is the number of FP4 elements (2 per uint8)
+    int64_t K = 2 * K_a;
 
     // Validate output dtype code (0=float32, 1=float16, 2=bfloat16)
-    if (out_dtype_code < 0 || out_dtype_code > 2 ||
-        out_dtype_code != static_cast<int>(out_arg.meta.dtype)) {
+    if (out_dtype_code < 0 || out_dtype_code > 2) {
         throw std::runtime_error("Invalid output dtype code");
     }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
+    // Handle optional bias (check if pointer is null or size is 0)
+    const void* bias_ptr = (bias.data() && bias.size() > 0) ? bias.data() : nullptr;
+
+    // Call the kernel
     launch_cublas_gemm_blockwise_fp4_kernel(
-        b_arg, b_scale_arg, a_arg, a_scale_arg, out_arg, bias_arg,
-        alpha_arg, workspace.size() == 0 ? nullptr : workspace.data(),
-        static_cast<int64_t>(workspace.size()), accumulate, stream);
+        b.data(),
+        block_scale_b.data(),
+        a.data(),
+        block_scale_a.data(),
+        out.data(),
+        bias_ptr,
+        M,
+        N,
+        K,
+        static_cast<const float*>(alpha.data()),
+        out_dtype_code,
+        workspace.data(),
+        accumulate,
+        stream);
 }
 
 // Nanobind wrapper for quantize_nvfp4
@@ -333,31 +398,41 @@ void quantize_nvfp4(
     bool pad_16x,
     bool hi_first,
     uintptr_t stream_ptr) {
-    auto input_arg = make_contiguous_tensor_arg<2>(input);
-    auto global_scale_arg = make_flat_tensor_arg(global_scale);
-    auto output_arg = make_contiguous_tensor_arg<2>(output);
-    auto block_scales_arg = make_contiguous_tensor_arg<2>(block_scales);
-    const int64_t num_rows =
-        pad_16x ? (input_arg.meta.sizes[0] + 15) / 16 * 16
-                : input_arg.meta.sizes[0];
-    const int64_t num_cols =
-        pad_16x ? (input_arg.meta.sizes[1] + 15) / 16 * 16
-                : input_arg.meta.sizes[1];
-    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
+
+    // Get input dimensions (orig_rows, orig_cols)
+    int64_t orig_rows = input.shape(0);
+    int64_t orig_cols = input.shape(1);
+
+    // Calculate effective padded dimensions
+    int64_t num_rows = orig_rows;
+    int64_t num_cols = orig_cols;
+    
+    if (pad_16x) {
+        // Round up to nearest multiple of 16
+        num_rows = (orig_rows + 15) / 16 * 16;
+        num_cols = (orig_cols + 15) / 16 * 16;
+    }
+
+    // Get input dtype code
+    int input_dtype_code = map_dtype_to_code(input.dtype());
     if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error("Unsupported input dtype for FP4 quantization (must be float32, float16, or bfloat16)");
     }
-    if (output_arg.meta.sizes[0] != num_rows ||
-        output_arg.meta.sizes[1] * 2 != num_cols ||
-        output_arg.meta.dtype != DType::UInt8 ||
-        block_scales_arg.meta.dtype != DType::UInt8 ||
-        global_scale_arg.meta.sizes[0] < 1 ||
-        global_scale_arg.meta.dtype != DType::Float32) {
-        throw std::runtime_error("Invalid tensor layout for FP4 quantization");
-    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_nvfp4_kernel(
-        input_arg, global_scale_arg, output_arg, block_scales_arg, epsilon,
-        hi_first, reinterpret_cast<cudaStream_t>(stream_ptr));
+        input.data(),
+        global_scale.data(),
+        output.data(),
+        block_scales.data(),
+        num_rows,
+        num_cols,
+        orig_rows,
+        orig_cols,
+        epsilon,
+        input_dtype_code,
+        hi_first,
+        stream);
 }
 
 // Nanobind wrapper for dequantize_nvfp4
@@ -369,25 +444,27 @@ void dequantize_nvfp4(
     int output_dtype_code,
     bool hi_first,
     uintptr_t stream_ptr) {
-    auto input_arg = make_contiguous_tensor_arg<2>(input);
-    auto global_scale_arg = make_flat_tensor_arg(global_scale);
-    auto block_scales_arg = make_contiguous_tensor_arg<2>(block_scales);
-    auto output_arg = make_contiguous_tensor_arg<2>(output);
-    if (output_dtype_code < 0 || output_dtype_code > 2 ||
-        output_dtype_code != static_cast<int>(output_arg.meta.dtype)) {
+
+    // Get output dimensions (should match input logical dimensions)
+    int64_t num_rows = output.shape(0);
+    int64_t num_cols = output.shape(1);
+
+    // Validate output dtype code (0=float32, 1=float16, 2=bfloat16)
+    if (output_dtype_code < 0 || output_dtype_code > 2) {
         throw std::runtime_error("Unsupported output dtype for FP4 dequantization (must be float32, float16, or bfloat16)");
     }
-    if (input_arg.meta.sizes[0] != output_arg.meta.sizes[0] ||
-        input_arg.meta.sizes[1] * 2 != output_arg.meta.sizes[1] ||
-        input_arg.meta.dtype != DType::UInt8 ||
-        block_scales_arg.meta.dtype != DType::UInt8 ||
-        global_scale_arg.meta.sizes[0] < 1 ||
-        global_scale_arg.meta.dtype != DType::Float32) {
-        throw std::runtime_error("Invalid tensor layout for FP4 dequantization");
-    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_dequantize_nvfp4_kernel(
-        input_arg, global_scale_arg, block_scales_arg, output_arg, hi_first,
-        reinterpret_cast<cudaStream_t>(stream_ptr));
+        input.data(),
+        global_scale.data(),
+        block_scales.data(),
+        output.data(),
+        num_rows,
+        num_cols,
+        output_dtype_code,
+        hi_first,
+        stream);
 }
 
 // Nanobind wrapper for quantize_mxfp8
@@ -397,28 +474,38 @@ void quantize_mxfp8(
     nb::ndarray<nb::device::cuda> block_scales,
     bool pad_32x,
     uintptr_t stream_ptr) {
-    auto input_arg = make_contiguous_tensor_arg<2>(input);
-    auto output_arg = make_contiguous_tensor_arg<2>(output);
-    auto block_scales_arg = make_contiguous_tensor_arg<2>(block_scales);
-    const int64_t num_rows =
-        pad_32x ? (input_arg.meta.sizes[0] + 31) / 32 * 32
-                : input_arg.meta.sizes[0];
-    const int64_t num_cols =
-        pad_32x ? (input_arg.meta.sizes[1] + 31) / 32 * 32
-                : input_arg.meta.sizes[1];
-    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
+
+    // Get input dimensions (orig_rows, orig_cols)
+    int64_t orig_rows = input.shape(0);
+    int64_t orig_cols = input.shape(1);
+
+    // Calculate effective padded dimensions
+    int64_t num_rows = orig_rows;
+    int64_t num_cols = orig_cols;
+
+    if (pad_32x) {
+        // Round up to nearest multiple of 32
+        num_rows = (orig_rows + 31) / 32 * 32;
+        num_cols = (orig_cols + 31) / 32 * 32;
+    }
+
+    // Get input dtype code
+    int input_dtype_code = map_dtype_to_code(input.dtype());
     if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error("Unsupported input dtype for MXFP8 quantization (must be float32, float16, or bfloat16)");
     }
-    if (output_arg.meta.sizes[0] != num_rows ||
-        output_arg.meta.sizes[1] != num_cols ||
-        output_arg.meta.dtype != DType::Float8E4M3 ||
-        block_scales_arg.meta.dtype != DType::UInt8) {
-        throw std::runtime_error("Invalid tensor layout for MXFP8 quantization");
-    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_mxfp8_kernel(
-        input_arg, output_arg, block_scales_arg,
-        reinterpret_cast<cudaStream_t>(stream_ptr));
+        input.data(),
+        output.data(),
+        block_scales.data(),
+        num_rows,
+        num_cols,
+        orig_rows,
+        orig_cols,
+        input_dtype_code,
+        stream);
 }
 
 // Nanobind wrapper for apply_rope (handles both single tensor and q/k pair)
@@ -671,14 +758,13 @@ void quant_v_int8(
     if (v.ndim() != 4) {
         throw std::runtime_error("quant_v_int8: v must be 4D [B,H,N,D]");
     }
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     auto v_arg = make_tensor_arg<4>(v);
-    if (input_dtype_code != static_cast<int>(v_arg.meta.dtype)) {
-        throw std::runtime_error("quant_v_int8: input dtype code does not match v");
+    if (static_cast<int>(v_arg.meta.dtype) != input_dtype_code) {
+        throw std::runtime_error("quant_v_int8: input dtype code mismatch");
     }
     launch_quant_v_int8_kernel(
-        v_arg, make_contiguous_tensor_arg<2>(out),
-        make_contiguous_tensor_arg<1>(scale), padded_n, stream);
+        v_arg, static_cast<int8_t*>(out.data()), static_cast<float*>(scale.data()),
+        padded_n, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper: stabilized INT8 Q/K per-thread quant (contiguous HND layout)
@@ -697,20 +783,18 @@ void quant_qk_per_thread_int8(
     if (q.ndim() != 4 || k.ndim() != 4) {
         throw std::runtime_error("quant_qk_per_thread_int8: q and k must be 4D [B,H,L,D]");
     }
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     auto q_arg = make_tensor_arg<4>(q);
     auto k_arg = make_tensor_arg<4>(k);
-    if (input_dtype_code != static_cast<int>(q_arg.meta.dtype) ||
+    if (static_cast<int>(q_arg.meta.dtype) != input_dtype_code ||
         k_arg.meta.dtype != q_arg.meta.dtype) {
         throw std::runtime_error("quant_qk_per_thread_int8: input dtype mismatch");
     }
     launch_quant_qk_per_thread_int8(
-        q_arg, make_contiguous_tensor_arg<4>(q_int8),
-        make_contiguous_tensor_arg<3>(q_scale), k_arg,
-        make_contiguous_tensor_arg<4>(k_int8),
-        make_contiguous_tensor_arg<3>(k_scale), BLKQ, WARPQ, BLKK, WARPK,
-        make_int32_scratch_arg(anchor_indices_ptr,
-            q_arg.meta.sizes[0] * k_arg.meta.sizes[1]), stream);
+        q_arg, static_cast<int8_t*>(q_int8.data()),
+        static_cast<float*>(q_scale.data()), k_arg,
+        static_cast<int8_t*>(k_int8.data()), static_cast<float*>(k_scale.data()),
+        BLKQ, WARPQ, BLKK, WARPK, reinterpret_cast<int*>(anchor_indices_ptr),
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Quantization half of the split INT8 SDPA API.  This deliberately launches
@@ -777,18 +861,25 @@ void sage_sdpa_quantize(
 
     constexpr int BLKQ = 128;
     const int WARPQ = D == 256 ? 16 : 32;
+    auto q_arg = make_tensor_arg<4>(q);
+    auto k_arg = make_tensor_arg<4>(k);
+    auto v_arg = make_tensor_arg<4>(v);
+    if (static_cast<int>(q_arg.meta.dtype) != input_dtype_code ||
+        k_arg.meta.dtype != q_arg.meta.dtype || v_arg.meta.dtype != q_arg.meta.dtype) {
+        throw std::runtime_error("sage_sdpa_quantize: input dtype mismatch");
+    }
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
     launch_quant_qk_per_thread_int8(
-        make_tensor_arg<4>(q), make_contiguous_tensor_arg<4>(q_int8),
-        make_contiguous_tensor_arg<3>(q_scale), make_tensor_arg<4>(k),
-        make_contiguous_tensor_arg<4>(k_int8),
-        make_contiguous_tensor_arg<3>(k_scale), BLKQ, WARPQ, cta_k, cta_k,
-        make_int32_scratch_arg(anchor_indices_ptr, B * H_kv), stream);
+        q_arg, static_cast<int8_t*>(q_int8.data()),
+        static_cast<float*>(q_scale.data()), k_arg,
+        static_cast<int8_t*>(k_int8.data()), static_cast<float*>(k_scale.data()),
+        BLKQ, WARPQ, cta_k, cta_k, reinterpret_cast<int*>(anchor_indices_ptr),
+        stream);
 
     launch_quant_v_int8_kernel(
-        make_tensor_arg<4>(v), make_contiguous_tensor_arg<2>(v_int8),
-        make_contiguous_tensor_arg<1>(v_scale), padded_Lk, stream);
+        v_arg, static_cast<int8_t*>(v_int8.data()),
+        static_cast<float*>(v_scale.data()), padded_Lk, stream);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -869,26 +960,24 @@ void sage_sdpa_prequantized(
                 "sage_sdpa_prequantized: attention mask must be expanded to [B,H_q,Lq,Lk]");
         }
         mask_arg = make_tensor_arg<4>(mask);
-        if (mask_arg.meta.dtype != DType::Bool &&
-            mask_arg.meta.dtype != DType::Float16 &&
-            mask_arg.meta.dtype != DType::BFloat16 &&
-            mask_arg.meta.dtype != DType::Float32) {
+        if (mask_arg.meta.dtype != comfy::tensor::DType::Bool &&
+            mask_arg.meta.dtype != comfy::tensor::DType::Float16 &&
+            mask_arg.meta.dtype != comfy::tensor::DType::BFloat16 &&
+            mask_arg.meta.dtype != comfy::tensor::DType::Float32) {
             throw std::runtime_error(
                 "sage_sdpa_prequantized: attention mask must be bool, float16, bfloat16, or float32");
         }
     }
 
-    auto o_arg = make_contiguous_tensor_arg<4>(o);
-    if (output_dtype_code != static_cast<int>(o_arg.meta.dtype)) {
-        throw std::runtime_error("sage_sdpa_prequantized: output dtype mismatch");
-    }
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_sage_attn_kernel(
-        make_contiguous_tensor_arg<4>(q_int8),
-        make_contiguous_tensor_arg<4>(k_int8),
-        make_packed_sage_v_arg(v_int8, B, H_kv, D, padded_Lk), o_arg,
-        make_flat_tensor_arg(q_scale), make_flat_tensor_arg(k_scale),
-        make_flat_tensor_arg(v_scale), mask_arg, cta_k, sm_scale, stream);
+        make_tensor_arg<4>(q_int8), make_tensor_arg<4>(k_int8),
+        make_packed_sage_v_arg(v_int8, B, H_kv, D, padded_Lk),
+        make_tensor_arg<4>(o),
+        static_cast<const float*>(q_scale.data()),
+        static_cast<const float*>(k_scale.data()),
+        static_cast<const float*>(v_scale.data()),
+        mask_arg, cta_k, sm_scale, stream);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -927,15 +1016,12 @@ void sage_attn(
             "sage_attn: packed V sequence extent must cover K and be a multiple of 64");
     }
 
-    auto o_arg = make_tensor_arg<4>(o);
-    if (output_dtype_code != static_cast<int>(o_arg.meta.dtype)) {
-        throw std::runtime_error("sage_attn: output dtype mismatch");
-    }
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_sage_attn_kernel(
         make_tensor_arg<4>(q), make_tensor_arg<4>(k), make_tensor_arg<4>(v),
-        o_arg, make_flat_tensor_arg(q_scale), make_flat_tensor_arg(k_scale),
-        make_flat_tensor_arg(v_scale), TensorArg<4>{}, CTA_K, sm_scale, stream);
+        make_tensor_arg<4>(o), static_cast<const float*>(q_scale.data()),
+        static_cast<const float*>(k_scale.data()),
+        static_cast<const float*>(v_scale.data()), {}, CTA_K, sm_scale, stream);
 }
 
 // Fused SageAttention SDPA: quant_qk + quant_v + sage_attn in one C++ call.
@@ -979,10 +1065,10 @@ void sage_sdpa(
                 "sage_sdpa: attention mask must be expanded to [B,H_q,Lq,Lk]");
         }
         mask_arg = make_tensor_arg<4>(mask);
-        if (mask_arg.meta.dtype != DType::Bool &&
-            mask_arg.meta.dtype != DType::Float16 &&
-            mask_arg.meta.dtype != DType::BFloat16 &&
-            mask_arg.meta.dtype != DType::Float32) {
+        if (mask_arg.meta.dtype != comfy::tensor::DType::Bool &&
+            mask_arg.meta.dtype != comfy::tensor::DType::Float16 &&
+            mask_arg.meta.dtype != comfy::tensor::DType::BFloat16 &&
+            mask_arg.meta.dtype != comfy::tensor::DType::Float32) {
             throw std::runtime_error(
                 "sage_sdpa: attention mask must be bool, float16, bfloat16, or float32");
         }
@@ -1016,30 +1102,35 @@ void sage_sdpa(
     const int BLKK = cta_k;
     const int WARPK = cta_k;
     const int padded_Lk = ((Lk + cta_k - 1) / cta_k) * cta_k;
+    auto q_arg = make_tensor_arg<4>(q);
+    auto k_arg = make_tensor_arg<4>(k);
+    auto v_arg = make_tensor_arg<4>(v);
+    if (static_cast<int>(q_arg.meta.dtype) != input_dtype_code ||
+        k_arg.meta.dtype != q_arg.meta.dtype || v_arg.meta.dtype != q_arg.meta.dtype) {
+        throw std::runtime_error("sage_sdpa: input dtype mismatch");
+    }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
     launch_quant_qk_per_thread_int8(
-        make_tensor_arg<4>(q), make_contiguous_tensor_arg<4>(q_int8),
-        make_contiguous_tensor_arg<3>(q_scale), make_tensor_arg<4>(k),
-        make_contiguous_tensor_arg<4>(k_int8),
-        make_contiguous_tensor_arg<3>(k_scale), BLKQ, WARPQ, BLKK, WARPK,
-        make_int32_scratch_arg(anchor_indices_ptr, B * H_kv), stream);
+        q_arg, static_cast<int8_t*>(q_int8.data()),
+        static_cast<float*>(q_scale.data()), k_arg,
+        static_cast<int8_t*>(k_int8.data()), static_cast<float*>(k_scale.data()),
+        BLKQ, WARPQ, BLKK, WARPK, reinterpret_cast<int*>(anchor_indices_ptr),
+        stream);
 
     launch_quant_v_int8_kernel(
-        make_tensor_arg<4>(v), make_contiguous_tensor_arg<2>(v_int8),
-        make_contiguous_tensor_arg<1>(v_scale), padded_Lk, stream);
+        v_arg, static_cast<int8_t*>(v_int8.data()),
+        static_cast<float*>(v_scale.data()), padded_Lk, stream);
 
-    auto o_arg = make_contiguous_tensor_arg<4>(o);
-    if (output_dtype_code != static_cast<int>(o_arg.meta.dtype)) {
-        throw std::runtime_error("sage_sdpa: output dtype mismatch");
-    }
     launch_sage_attn_kernel(
-        make_contiguous_tensor_arg<4>(q_int8),
-        make_contiguous_tensor_arg<4>(k_int8),
-        make_packed_sage_v_arg(v_int8, B, H_kv, D, padded_Lk), o_arg,
-        make_flat_tensor_arg(q_scale), make_flat_tensor_arg(k_scale),
-        make_flat_tensor_arg(v_scale), mask_arg, cta_k, sm_scale, stream);
+        make_tensor_arg<4>(q_int8), make_tensor_arg<4>(k_int8),
+        make_packed_sage_v_arg(v_int8, B, H_kv, D, padded_Lk),
+        make_tensor_arg<4>(o),
+        static_cast<const float*>(q_scale.data()),
+        static_cast<const float*>(k_scale.data()),
+        static_cast<const float*>(v_scale.data()),
+        mask_arg, cta_k, sm_scale, stream);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -1069,25 +1160,17 @@ void svdquant_quantize_w4a4(
     bool act_unsigned,
     uintptr_t stream_ptr)
 {
-    auto x_arg = make_contiguous_tensor_arg<2>(x);
-    auto smooth_arg = make_contiguous_tensor_arg<1>(smooth);
-    auto lora_down_arg = make_contiguous_tensor_arg<2>(lora_down);
-    auto q_x_arg = make_contiguous_tensor_arg<2>(q_x);
-    auto ascales_arg = make_contiguous_tensor_arg<2>(ascales);
-    auto lora_act_arg = make_contiguous_tensor_arg<2>(lora_act);
-    if ((x_arg.meta.dtype != DType::Float16 && x_arg.meta.dtype != DType::BFloat16) ||
-        smooth_arg.meta.dtype != x_arg.meta.dtype ||
-        lora_down_arg.meta.dtype != x_arg.meta.dtype ||
-        ascales_arg.meta.dtype != x_arg.meta.dtype ||
-        q_x_arg.meta.dtype != DType::UInt8 ||
-        (lora_act_arg.meta.dtype != x_arg.meta.dtype &&
-         lora_act_arg.meta.dtype != DType::Float32)) {
-        throw std::runtime_error("svdquant_quantize_w4a4: incompatible tensor dtypes");
-    }
+    int M = static_cast<int>(x.shape(0));
+    int K = static_cast<int>(x.shape(1));
+    int M_pad = static_cast<int>(q_x.shape(0));
+    int R = static_cast<int>(lora_down.shape(1));
+    int input_code = svdquant_dtype_code(x.dtype());
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_svdquant_quantize_w4a4_kernel(
-        x_arg, smooth_arg, lora_down_arg, q_x_arg, ascales_arg, lora_act_arg,
+        x.data(), smooth.data(), lora_down.data(),
+        q_x.data(), ascales.data(), lora_act.data(),
+        M, M_pad, K, R, input_code,
         static_cast<int>(act_unsigned), stream);
 }
 
@@ -1106,25 +1189,13 @@ void svdquant_scaled_mm_w4a4(
     bool fuse_lora,
     uintptr_t stream_ptr)
 {
-    auto act_arg = make_contiguous_tensor_arg<2>(act);
-    auto wgt_arg = make_flat_tensor_arg(wgt);
-    auto ascales_arg = make_contiguous_tensor_arg<2>(ascales);
-    auto wscales_arg = make_flat_tensor_arg(wscales);
-    auto lora_act_arg = make_contiguous_tensor_arg<2>(lora_act_in);
-    auto lora_up_arg = make_flat_tensor_arg(lora_up);
-    auto bias_arg = make_flat_tensor_arg(bias);
-    auto out_arg = make_contiguous_tensor_arg<2>(out);
-    const int K = static_cast<int>(act_arg.meta.sizes[1]) * 2;
+    int M = static_cast<int>(act.shape(0));
+    int K = static_cast<int>(act.shape(1)) * 2;
     const bool tile_packed = (wgt.ndim() == 4);
-    if (act_arg.meta.dtype != DType::UInt8 || wgt_arg.meta.dtype != DType::UInt8 ||
-        (out_arg.meta.dtype != DType::Float16 && out_arg.meta.dtype != DType::BFloat16) ||
-        ascales_arg.meta.dtype != out_arg.meta.dtype ||
-        wscales_arg.meta.dtype != out_arg.meta.dtype ||
-        lora_up_arg.meta.dtype != out_arg.meta.dtype ||
-        (bias_arg.meta.sizes[0] > 0 && bias_arg.meta.dtype != out_arg.meta.dtype)) {
-        throw std::runtime_error("svdquant_scaled_mm_w4a4: incompatible tensor dtypes");
-    }
-    if (fuse_lora && lora_act_arg.meta.dtype != out_arg.meta.dtype) {
+    int N = tile_packed ? static_cast<int>(wgt.shape(0)) * 128 : static_cast<int>(wgt.shape(0));
+    int R = static_cast<int>(lora_act_in.shape(1));
+    int out_code = svdquant_dtype_code(out.dtype());
+    if (fuse_lora && svdquant_dtype_code(lora_act_in.dtype()) != out_code) {
         throw std::runtime_error(
             "svdquant_scaled_mm_w4a4: fused LoRA-up requires lora_act_in dtype "
             "to match output/lora_up dtype");
@@ -1144,11 +1215,15 @@ void svdquant_scaled_mm_w4a4(
         }
     }
 
+    const void* bias_ptr = (bias.data() != nullptr && bias.size() > 0) ? bias.data() : nullptr;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_svdquant_scaled_mm_w4a4_kernel(
-        act_arg, wgt_arg, ascales_arg, wscales_arg,
-        lora_act_arg, lora_up_arg, bias_arg, out_arg,
-        static_cast<int>(act_unsigned),
+        act.data(), wgt.data(),
+        ascales.data(), wscales.data(),
+        lora_act_in.data(), lora_up.data(), bias_ptr,
+        out.data(),
+        M, N, K, R,
+        static_cast<int>(act_unsigned), out_code,
         static_cast<int>(tile_packed), static_cast<int>(fast_accum),
         static_cast<int>(shared_scale), static_cast<int>(fuse_lora), stream);
 }
@@ -1165,24 +1240,17 @@ void awq_w4a16(
     int group_size,
     uintptr_t stream_ptr)
 {
-    auto x_arg = make_contiguous_tensor_arg<2>(x);
-    auto qweight_arg = make_contiguous_tensor_arg<2>(qweight);
-    auto wscales_arg = make_contiguous_tensor_arg<2>(wscales);
-    auto wzeros_arg = make_contiguous_tensor_arg<2>(wzeros);
-    auto out_arg = make_contiguous_tensor_arg<2>(out);
-    if (x_arg.meta.dtype != DType::Float16 && x_arg.meta.dtype != DType::BFloat16) {
-        throw std::runtime_error("awq_w4a16: only fp16 and bf16 activations supported");
-    }
-    if (qweight_arg.meta.dtype != DType::UInt8 ||
-        wscales_arg.meta.dtype != x_arg.meta.dtype ||
-        wzeros_arg.meta.dtype != x_arg.meta.dtype ||
-        out_arg.meta.dtype != x_arg.meta.dtype) {
-        throw std::runtime_error("awq_w4a16: incompatible tensor dtypes");
+    const int M = static_cast<int>(x.shape(0));
+    const int K = static_cast<int>(x.shape(1));
+    const int N = static_cast<int>(qweight.shape(0));
+    const int dtype_code = svdquant_dtype_code(x.dtype());
+    if (dtype_code != 1 && dtype_code != 2) {
+        throw std::runtime_error("awq_w4a16: only fp16 (1) and bf16 (2) activations supported");
     }
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_awq_w4a16_kernel(
-        x_arg, qweight_arg, wscales_arg, wzeros_arg, out_arg,
-        group_size, stream);
+        x.data(), qweight.data(), wscales.data(), wzeros.data(), out.data(),
+        M, N, K, group_size, dtype_code, stream);
 }
 
 // Nanobind wrapper for fused 3D neighborhood attention
@@ -1199,30 +1267,12 @@ void na3d(
     int dtype_code,
     uintptr_t stream_ptr)
 {
-    auto q_arg = make_contiguous_tensor_arg<6>(q);
-    auto k_arg = make_contiguous_tensor_arg<6>(k);
-    auto v_arg = make_contiguous_tensor_arg<6>(v);
-    auto out_arg = make_contiguous_tensor_arg<6>(out);
-    const int64_t expected[6] = {
-        batch, t_size, h_size, w_size, num_heads, head_dim};
-    for (int axis = 0; axis < 6; ++axis) {
-        if (q_arg.meta.sizes[axis] != expected[axis] ||
-            k_arg.meta.sizes[axis] != expected[axis] ||
-            v_arg.meta.sizes[axis] != expected[axis] ||
-            out_arg.meta.sizes[axis] != expected[axis]) {
-            throw std::runtime_error("Invalid tensor shape for na3d");
-        }
-    }
-    if (static_cast<int>(q_arg.meta.dtype) != dtype_code ||
-        k_arg.meta.dtype != q_arg.meta.dtype ||
-        v_arg.meta.dtype != q_arg.meta.dtype ||
-        out_arg.meta.dtype != q_arg.meta.dtype) {
-        throw std::runtime_error("Invalid tensor dtype for na3d");
-    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_na3d_kernel(
-        q_arg, k_arg, v_arg, out_arg, static_cast<int>(kt),
-        static_cast<int>(kh), static_cast<int>(kw), causal_t, causal_h,
-        causal_w, scale, reinterpret_cast<cudaStream_t>(stream_ptr));
+        q.data(), k.data(), v.data(), out.data(),
+        (int)batch, (int)t_size, (int)h_size, (int)w_size, (int)num_heads, (int)head_dim,
+        (int)kt, (int)kh, (int)kw, causal_t, causal_h, causal_w,
+        scale, dtype_code, stream);
 }
 
 // Nanobind wrapper for fused AdaLN (LayerNorm statistics)
@@ -1239,22 +1289,10 @@ void adaln(
     int     dtype_code,
     uintptr_t stream_ptr)
 {
-    auto x_arg = make_contiguous_tensor_arg<2>(x);
-    auto scale_arg = make_contiguous_tensor_arg<2>(scale);
-    auto shift_arg = make_contiguous_tensor_arg<2>(shift);
-    auto out_arg = make_contiguous_tensor_arg<2>(out);
-    if (x_arg.meta.sizes[0] != N || x_arg.meta.sizes[1] != D ||
-        out_arg.meta.sizes[0] != N || out_arg.meta.sizes[1] != D ||
-        scale_arg.meta.sizes[1] != D || shift_arg.meta.sizes[1] != D ||
-        static_cast<int>(x_arg.meta.dtype) != dtype_code ||
-        scale_arg.meta.dtype != x_arg.meta.dtype ||
-        shift_arg.meta.dtype != x_arg.meta.dtype ||
-        out_arg.meta.dtype != x_arg.meta.dtype) {
-        throw std::runtime_error("Invalid tensor contract for adaln");
-    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_adaln_kernel(
-        x_arg, scale_arg, shift_arg, out_arg, scale_group, shift_group, eps,
-        true, reinterpret_cast<cudaStream_t>(stream_ptr));
+        x.data(), scale.data(), shift.data(), out.data(),
+        N, D, scale_group, shift_group, eps, dtype_code, /*subtract_mean=*/true, stream);
 }
 
 // Nanobind wrapper for fused AdaLN with RMSNorm statistics
@@ -1271,174 +1309,363 @@ void rms_adaln(
     int     dtype_code,
     uintptr_t stream_ptr)
 {
-    auto x_arg = make_contiguous_tensor_arg<2>(x);
-    auto scale_arg = make_contiguous_tensor_arg<2>(scale);
-    auto shift_arg = make_contiguous_tensor_arg<2>(shift);
-    auto out_arg = make_contiguous_tensor_arg<2>(out);
-    if (x_arg.meta.sizes[0] != N || x_arg.meta.sizes[1] != D ||
-        out_arg.meta.sizes[0] != N || out_arg.meta.sizes[1] != D ||
-        scale_arg.meta.sizes[1] != D || shift_arg.meta.sizes[1] != D ||
-        static_cast<int>(x_arg.meta.dtype) != dtype_code ||
-        scale_arg.meta.dtype != x_arg.meta.dtype ||
-        shift_arg.meta.dtype != x_arg.meta.dtype ||
-        out_arg.meta.dtype != x_arg.meta.dtype) {
-        throw std::runtime_error("Invalid tensor contract for rms_adaln");
-    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_adaln_kernel(
-        x_arg, scale_arg, shift_arg, out_arg, scale_group, shift_group, eps,
-        false, reinterpret_cast<cudaStream_t>(stream_ptr));
+        x.data(), scale.data(), shift.data(), out.data(),
+        N, D, scale_group, shift_group, eps, dtype_code, /*subtract_mean=*/false, stream);
 }
 
 // Python module definition
 extern "C" {
     void launch_cublas_gemm_int8_kernel(
-        TensorArg<2> a, TensorArg<2> b, TensorArg<2> c, void* workspace,
-        int64_t workspace_size, cudaStream_t stream);
+        const void* A_ptr,
+        const void* B_ptr,
+        void* C_ptr,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        void* workspace_ptr,
+        int64_t workspace_size,
+        cudaStream_t stream);
 
     void launch_quantize_int8_rowwise_kernel(
-        TensorArg<2> input, TensorArg<2> output, TensorArg<2> scales,
+        const void* input,
+        void* output,
+        void* scales,
+        int64_t num_rows,
+        int64_t num_cols,
+        int input_dtype_code,
         bool stochastic,
         uint64_t seed,
         cudaStream_t stream);
 
     void launch_quantize_int4_rowwise_kernel(
-        TensorArg<2> input, TensorArg<2> output, TensorArg<2> scales,
+        const void* input,
+        void* output,
+        void* scales,
+        int64_t M,
+        int64_t K,
+        int input_dtype_code,
         bool stochastic,
         uint64_t seed,
         cudaStream_t stream);
 
     void launch_quantize_int4_rowwise_convrot64_kernel(
-        TensorArg<2> input, TensorArg<2> output, TensorArg<2> scales,
+        const void* input,
+        void* output,
+        void* scales,
+        int64_t M,
+        int64_t K,
         int group_size,
+        int input_dtype_code,
         bool stochastic,
         uint64_t seed,
         cudaStream_t stream);
 
     void launch_quantize_int4_rowwise_convrot64_to_int8_kernel(
-        TensorArg<2> input, TensorArg<2> output, TensorArg<2> scales,
+        const void* input,
+        void* output,
+        void* scales,
+        int64_t M,
+        int64_t K,
         int group_size,
+        int input_dtype_code,
         bool stochastic,
         uint64_t seed,
         cudaStream_t stream);
 
     void launch_dequantize_int4_convrot64_kernel(
-        TensorArg<2> input, TensorArg<1> scales, TensorArg<2> output,
+        const void* input,
+        const void* scales,
+        void* output,
+        int64_t M,
+        int64_t K,
+        int64_t scale_size,
         int group_size,
+        int output_dtype_code,
         cudaStream_t stream);
 
     void launch_int4_linear_kernel(
-        TensorArg<2> act, TensorArg<2> weight, TensorArg<1> x_scales,
-        TensorArg<1> weight_scales, TensorArg<1> bias, TensorArg<2> output,
+        const void* act,
+        const void* weight,
+        const void* x_scales,
+        const void* weight_scales,
+        const void* bias,
+        void* output,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        bool has_bias,
+        int output_dtype_code,
+        int bias_dtype_code,
         cudaStream_t stream);
 
     void launch_unpack_int4_to_int8_kernel(
-        TensorArg<2> input, TensorArg<2> output,
+        const void* input,
+        void* output,
+        int64_t rows,
+        int64_t K_half,
         cudaStream_t stream);
 
     void launch_int4_weight_int8_act_gemv_dequant_kernel(
-        TensorArg<2> input, TensorArg<2> weight, TensorArg<2> x_scales,
-        TensorArg<1> weight_scales, TensorArg<1> bias, TensorArg<2> output,
+        const void* input,
+        const void* weight,
+        const void* x_scales,
+        const void* weight_scales,
+        const void* bias,
+        void* output,
+        int64_t num_rows,
+        int64_t num_cols,
+        int64_t K,
+        int64_t weight_scale_size,
+        bool has_bias,
+        int output_dtype_code,
+        int bias_dtype_code,
         cudaStream_t stream);
 
     void launch_int4_weight_int8_act_gemm_dequant_chunked_kernel(
-        TensorArg<2> input, TensorArg<2> weight, TensorArg<2> x_scales,
-        TensorArg<1> weight_scales, TensorArg<1> bias, TensorArg<2> output,
-        TensorArg<2> weight_workspace, TensorArg<2> acc_workspace,
-        TensorArg<1> cublas_workspace, int64_t chunk_cols,
-        bool allow_sm80_cutlass, cudaStream_t stream);
+        const void* input,
+        const void* weight,
+        const void* x_scales,
+        const void* weight_scales,
+        const void* bias,
+        void* output,
+        void* weight_workspace,
+        void* acc_workspace,
+        void* cublas_workspace,
+        int64_t cublas_workspace_size,
+        int64_t num_rows,
+        int64_t num_cols,
+        int64_t K,
+        int64_t weight_scale_size,
+        int64_t chunk_cols,
+        bool allow_sm80_cutlass,
+        bool has_bias,
+        int output_dtype_code,
+        int bias_dtype_code,
+        cudaStream_t stream);
 
     bool launch_cutlass_int8_dequant(
-        TensorArg<2> a, TensorArg<2> b, TensorArg<1> xs, TensorArg<1> ws,
-        TensorArg<1> bias, TensorArg<2> output, cudaStream_t stream);
+        const void* A,
+        const void* B,
+        const void* xs,
+        const void* ws,
+        const void* bias,
+        void* D,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int out_dtype_code,
+        cudaStream_t stream);
 
     bool launch_cutlass_int8_dequant_config(
-        TensorArg<2> a, TensorArg<2> b, TensorArg<1> xs, TensorArg<1> ws,
-        TensorArg<2> output, int config, cudaStream_t stream);
+        const void* A,
+        const void* B,
+        const void* xs,
+        const void* ws,
+        void* D,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int out_dtype_code,
+        int config,
+        cudaStream_t stream);
 
     bool launch_cutlass_turing_int8_dequant(
-        TensorArg<2> a, TensorArg<2> b, TensorArg<1> xs, TensorArg<1> ws,
-        TensorArg<1> bias, TensorArg<2> output, cudaStream_t stream);
+        const void* A,
+        const void* B,
+        const void* xs,
+        const void* ws,
+        const void* bias,
+        void* D,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int out_dtype_code,
+        bool scalar_weight_scale,
+        cudaStream_t stream);
 
     bool launch_cutlass_int4_dequant(
-        TensorArg<2> a, TensorArg<2> b, TensorArg<1> xs, TensorArg<1> ws,
-        TensorArg<1> bias, TensorArg<2> output, cudaStream_t stream);
+        const void* A,
+        const void* B,
+        const void* xs,
+        const void* ws,
+        const void* bias,
+        void* D,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int out_dtype_code,
+        cudaStream_t stream);
 
     bool launch_cutlass_turing_int4_dequant(
-        TensorArg<2> a, TensorArg<2> b, TensorArg<1> xs, TensorArg<1> ws,
-        TensorArg<1> bias, TensorArg<2> output, cudaStream_t stream);
+        const void* A,
+        const void* B,
+        const void* xs,
+        const void* ws,
+        const void* bias,
+        void* D,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int out_dtype_code,
+        cudaStream_t stream);
 
     void launch_dequant_int4_grouped_to_int8(
-        TensorArg<2> weight, TensorArg<2> scale, TensorArg<1> codebook,
-        TensorArg<2> output, int64_t group_size, cudaStream_t stream);
+        const void* qw,
+        const void* s_rel,
+        const void* codebook,
+        void* out,
+        int64_t N,
+        int64_t K,
+        int64_t G,
+        cudaStream_t stream);
 
     void launch_dequant_int4_grouped_to_int8_e4m3(
-        TensorArg<2> weight, TensorArg<2> scale, TensorArg<1> codebook,
-        TensorArg<2> output, int64_t group_size, cudaStream_t stream);
+        const void* qw,
+        const void* s_rel,
+        const void* codebook,
+        void* out,
+        int64_t N,
+        int64_t K,
+        int64_t G,
+        cudaStream_t stream);
 
     bool launch_quantize_w4a8_convrot(
-        TensorArg<2> rotated, TensorArg<1> codebook, TensorArg<2> packed,
-        TensorArg<2> scale, TensorArg<1> channel_scale, bool stochastic,
-        uint64_t seed, cudaStream_t stream);
+        const void* rotated,
+        const void* codebook,
+        void* packed,
+        void* s_rel,
+        void* s_channel,
+        int64_t N,
+        int64_t K,
+        int in_dtype_code,
+        bool stochastic,
+        uint64_t seed,
+        cudaStream_t stream);
 
     bool launch_w4a8_codebook_gemm_chunked(
-        TensorArg<2> activation, TensorArg<2> weight, TensorArg<2> scale,
-        TensorArg<1> codebook, TensorArg<1> channel_scale,
-        TensorArg<1> activation_scale, TensorArg<1> bias, TensorArg<2> workspace,
-        TensorArg<2> output, int64_t group_size, int64_t chunk_cols,
+        const void* xq,
+        const void* weight,
+        const void* s_rel,
+        const void* codebook,
+        const void* s_channel,
+        const void* xs,
+        const void* bias,
+        void* workspace,
+        void* out,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int64_t G,
+        int64_t chunk_cols,
+        int out_dtype_code,
         cudaStream_t stream);
 
     void launch_quantize_int8_rowwise_convrot_kernel(
-        TensorArg<2> input, TensorArg<2> output, TensorArg<2> scales,
+        const void* input,
+        void* output,
+        void* scales,
+        int64_t num_rows,
+        int64_t num_cols,
         int group_size,
+        int input_dtype_code,
         bool stochastic,
         uint64_t seed,
         cudaStream_t stream);
 
     void launch_rotate_int8_convrot_weight_kernel(
-        TensorArg<2> input, TensorArg<2> output, int group_size,
+        const void* input,
+        void* output,
+        int64_t num_rows,
+        int64_t num_cols,
+        int group_size,
+        int input_dtype_code,
+        int output_dtype_code,
         cudaStream_t stream);
 
     void launch_quantize_int8_convrot_staged_kernel(
-        TensorArg<2> input, TensorArg<2> rotated, TensorArg<2> partial_absmax,
-        TensorArg<2> output, TensorArg<2> scales, int group_size,
+        const void* input,
+        void* rotated,
+        void* partial_absmax,
+        void* output,
+        void* scales,
+        int64_t num_rows,
+        int64_t num_cols,
+        int group_size,
+        int input_dtype_code,
+        int rotated_dtype_code,
         bool stochastic,
         uint64_t seed,
         cudaStream_t stream);
 
     void launch_quantize_int8_rowwise_convrot64_kernel(
-        TensorArg<2> input, TensorArg<2> output, TensorArg<2> scales,
+        const void* input,
+        void* output,
+        void* scales,
+        int64_t num_rows,
+        int64_t num_cols,
         int group_size,
+        int input_dtype_code,
         bool stochastic,
         int act_code,
         uint64_t seed,
         cudaStream_t stream);
 
     void launch_dequantize_int8_linear_kernel(
-        TensorArg<2> input, TensorArg<2> x_scales, TensorArg<1> weight_scales,
-        TensorArg<1> bias, TensorArg<2> output,
+        const void* input,
+        const void* x_scales,
+        const void* weight_scales,
+        const void* bias,
+        void* output,
+        int64_t num_rows,
+        int64_t num_cols,
+        int64_t weight_scale_size,
+        bool has_bias,
+        int output_dtype_code,
+        int bias_dtype_code,
         cudaStream_t stream);
 
     void launch_int8_gemv_dequant_kernel(
-        TensorArg<2> input, TensorArg<2> weight, TensorArg<2> x_scales,
-        TensorArg<1> weight_scales, TensorArg<1> bias, TensorArg<2> output,
+        const void* input,
+        const void* weight,
+        const void* x_scales,
+        const void* weight_scales,
+        const void* bias,
+        void* output,
+        int64_t num_cols,
+        int64_t K,
+        int64_t weight_scale_size,
+        bool has_bias,
+        int output_dtype_code,
+        int bias_dtype_code,
         cudaStream_t stream);
 
     void launch_dequantize_int8_simple_kernel(
-        TensorArg<1> input, TensorArg<1> scales, TensorArg<1> output,
-        int64_t inner_dim, int scale_mode,
+        const void* input,
+        const void* scales,
+        void* output,
+        int64_t total,
+        int64_t inner_dim,
+        int scale_mode,
+        int output_dtype_code,
         cudaStream_t stream);
 
     void launch_dequantize_int8_convrot_kernel(
-        TensorArg<2> input, TensorArg<1> scales, TensorArg<2> output,
+        const void* input,
+        const void* scales,
+        void* output,
+        int64_t num_rows,
+        int64_t num_cols,
+        int64_t scale_size,
         int group_size,
+        int output_dtype_code,
         cudaStream_t stream);
 
     void launch_flash_decode(
-        TensorArg<3> q, TensorArg<4> k, TensorArg<4> v,
-        TensorArg<1> kv_lengths, TensorArg<3> output,
-        TensorArg<1> softmax_lse, TensorArg<1> softmax_lse_accum,
-        TensorArg<1> output_accum, int num_splits,
-        cudaStream_t stream);
+        TensorArg<3> q, TensorArg<4> k, TensorArg<4> v, int* kv_lengths,
+        TensorArg<3> output, float* softmax_lse, float* softmax_lse_accum,
+        float* output_accum, int num_splits, cudaStream_t stream);
 
 }
 
@@ -1447,7 +1674,7 @@ void cublas_gemm_int8(
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> a,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> b,
     nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> c,
-    nb::ndarray<uint8_t, nb::device::cuda> workspace,
+    nb::ndarray<nb::device::cuda> workspace,
     uintptr_t stream_ptr) {
 
     auto& runtime = comfy::CublasLtRuntime::instance();
@@ -1469,17 +1696,16 @@ void cublas_gemm_int8(
         throw std::runtime_error("Output matrix C shape does not match");
     }
 
-    if (!comfy::tensor::is_contiguous(workspace)) {
-        throw std::runtime_error("cuBLAS workspace must be contiguous");
-    }
-
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
     launch_cublas_gemm_int8_kernel(
-        make_contiguous_tensor_arg<2>(a), make_contiguous_tensor_arg<2>(b),
-        make_contiguous_tensor_arg<2>(c),
-        workspace.size() == 0 ? nullptr : workspace.data(),
-        static_cast<int64_t>(workspace.size()), stream);
+        a.data(),
+        b.data(),
+        c.data(),
+        M, N, K,
+        workspace.data(),
+        workspace.size() > 0 ? (int64_t)workspace.size() : 0,
+        stream);
 }
 
 void quantize_int8_rowwise(
@@ -1490,26 +1716,31 @@ void quantize_int8_rowwise(
     uint64_t seed,
     uintptr_t stream_ptr) {
 
-    auto input_arg = make_contiguous_tensor_arg<2>(input);
-    auto output_arg = make_contiguous_tensor_arg<2>(output);
-    auto scales_arg = make_contiguous_tensor_arg<2>(scales);
-    const int64_t M = input_arg.meta.sizes[0];
-    const int64_t K = input_arg.meta.sizes[1];
+    const int64_t M = input.shape(0);
+    const int64_t K = input.shape(1);
 
-    if (output_arg.meta.sizes[0] != M || output_arg.meta.sizes[1] != K) {
+    if (output.shape(0) != M || output.shape(1) != K) {
         throw std::runtime_error("INT8 rowwise quantization output shape mismatch");
     }
     if (scales.shape(0) != M || scales.shape(1) != 1) {
         throw std::runtime_error("INT8 rowwise quantization scale shape mismatch");
     }
-    const int input_dtype_code = static_cast<int>(input_arg.meta.dtype);
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
     if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error("Unsupported input dtype for INT8 rowwise quantization");
     }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_int8_rowwise_kernel(
-        input_arg, output_arg, scales_arg, stochastic, seed, stream);
+        input.data(),
+        output.data(),
+        scales.data(),
+        M,
+        K,
+        input_dtype_code,
+        stochastic,
+        seed,
+        stream);
 }
 
 void quantize_int4_rowwise(
@@ -1538,9 +1769,15 @@ void quantize_int4_rowwise(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_int4_rowwise_kernel(
-        make_contiguous_tensor_arg<2>(input),
-        make_contiguous_tensor_arg<2>(output),
-        make_contiguous_tensor_arg<2>(scales), stochastic, seed, stream);
+        input.data(),
+        output.data(),
+        scales.data(),
+        M,
+        K,
+        input_dtype_code,
+        stochastic,
+        seed,
+        stream);
 }
 
 void quantize_int4_rowwise_convrot64(
@@ -1573,9 +1810,16 @@ void quantize_int4_rowwise_convrot64(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_int4_rowwise_convrot64_kernel(
-        make_contiguous_tensor_arg<2>(input),
-        make_contiguous_tensor_arg<2>(output),
-        make_contiguous_tensor_arg<2>(scales), group_size, stochastic, seed, stream);
+        input.data(),
+        output.data(),
+        scales.data(),
+        M,
+        K,
+        group_size,
+        input_dtype_code,
+        stochastic,
+        seed,
+        stream);
 }
 
 void quantize_int4_rowwise_convrot64_to_int8(
@@ -1605,10 +1849,13 @@ void quantize_int4_rowwise_convrot64_to_int8(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_int4_rowwise_convrot64_to_int8_kernel(
-        make_contiguous_tensor_arg<2>(input),
-        make_contiguous_tensor_arg<2>(output),
-        make_contiguous_tensor_arg<2>(scales),
-        group_size,
+        input.data(),
+        output.data(),
+        scales.data(),
+        M,
+        K,
+        static_cast<int>(group_size),
+        input_dtype_code,
         stochastic,
         seed,
         stream);
@@ -1642,10 +1889,14 @@ void dequantize_int4_convrot64(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_dequantize_int4_convrot64_kernel(
-        make_contiguous_tensor_arg<2>(input),
-        make_flat_tensor_arg(scales),
-        make_contiguous_tensor_arg<2>(output),
+        input.data(),
+        scales.data(),
+        output.data(),
+        M,
+        K,
+        static_cast<int64_t>(scales.size()),
         group_size,
+        output_dtype_code,
         stream);
 }
 
@@ -1687,11 +1938,12 @@ void int4_linear(
     }
 
     const bool has_bias = bias.size() > 0;
+    int bias_dtype_code = output_dtype_code;
     if (has_bias) {
         if (bias.size() != static_cast<size_t>(N)) {
             throw std::runtime_error("INT4 linear bias shape mismatch");
         }
-        const int bias_dtype_code = map_dtype_to_code(bias.dtype());
+        bias_dtype_code = map_dtype_to_code(bias.dtype());
         if (bias_dtype_code < 0 || bias_dtype_code > 2) {
             throw std::runtime_error("Unsupported bias dtype for INT4 linear");
         }
@@ -1699,9 +1951,18 @@ void int4_linear(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_int4_linear_kernel(
-        make_contiguous_tensor_arg<2>(act), make_contiguous_tensor_arg<2>(weight),
-        make_flat_tensor_arg(x_scales), make_flat_tensor_arg(weight_scales),
-        make_optional_flat_tensor_arg(bias), make_contiguous_tensor_arg<2>(output),
+        act.data(),
+        weight.data(),
+        x_scales.data(),
+        weight_scales.data(),
+        has_bias ? bias.data() : nullptr,
+        output.data(),
+        M,
+        N,
+        K,
+        has_bias,
+        output_dtype_code,
+        bias_dtype_code,
         stream);
 }
 
@@ -1716,7 +1977,7 @@ void unpack_int4_to_int8(
         throw std::runtime_error("unpack_int4_to_int8 output shape mismatch");
     }
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    launch_unpack_int4_to_int8_kernel(make_contiguous_tensor_arg<2>(input), make_contiguous_tensor_arg<2>(output), stream);
+    launch_unpack_int4_to_int8_kernel(input.data(), output.data(), rows, K_half, stream);
 }
 
 void int4_weight_int8_act_gemv_dequant(
@@ -1746,11 +2007,12 @@ void int4_weight_int8_act_gemv_dequant(
     }
 
     const bool has_bias = bias.data() && bias.size() > 0;
+    int bias_dtype_code = output_dtype_code;
     if (has_bias) {
         if (bias.shape(0) != N) {
             throw std::runtime_error("packed INT4 weight GEMV bias shape mismatch");
         }
-        const int bias_dtype_code = map_dtype_to_code(bias.dtype());
+        bias_dtype_code = map_dtype_to_code(bias.dtype());
         if (bias_dtype_code < 0 || bias_dtype_code > 2) {
             throw std::runtime_error("Unsupported bias dtype for packed INT4 weight GEMV");
         }
@@ -1758,9 +2020,19 @@ void int4_weight_int8_act_gemv_dequant(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_int4_weight_int8_act_gemv_dequant_kernel(
-        make_contiguous_tensor_arg<2>(input), make_contiguous_tensor_arg<2>(weight),
-        make_contiguous_tensor_arg<2>(x_scales), make_flat_tensor_arg(weight_scales),
-        make_optional_flat_tensor_arg(bias), make_contiguous_tensor_arg<2>(output),
+        input.data(),
+        weight.data(),
+        x_scales.data(),
+        weight_scales.data(),
+        has_bias ? bias.data() : nullptr,
+        output.data(),
+        M,
+        N,
+        K,
+        static_cast<int64_t>(weight_scales.size()),
+        has_bias,
+        output_dtype_code,
+        bias_dtype_code,
         stream);
 }
 
@@ -1809,11 +2081,12 @@ void int4_weight_int8_act_gemm_dequant_chunked(
     }
 
     const bool has_bias = bias.data() && bias.size() > 0;
+    int bias_dtype_code = output_dtype_code;
     if (has_bias) {
         if (bias.shape(0) != N) {
             throw std::runtime_error("chunked INT4 weight GEMM bias shape mismatch");
         }
-        const int bias_dtype_code = map_dtype_to_code(bias.dtype());
+        bias_dtype_code = map_dtype_to_code(bias.dtype());
         if (bias_dtype_code < 0 || bias_dtype_code > 2) {
             throw std::runtime_error("Unsupported bias dtype for chunked INT4 weight GEMM");
         }
@@ -1821,12 +2094,26 @@ void int4_weight_int8_act_gemm_dequant_chunked(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_int4_weight_int8_act_gemm_dequant_chunked_kernel(
-        make_contiguous_tensor_arg<2>(input), make_contiguous_tensor_arg<2>(weight),
-        make_contiguous_tensor_arg<2>(x_scales), make_flat_tensor_arg(weight_scales),
-        make_optional_flat_tensor_arg(bias), make_contiguous_tensor_arg<2>(output),
-        make_contiguous_tensor_arg<2>(weight_workspace),
-        make_contiguous_tensor_arg<2>(acc_workspace), make_flat_tensor_arg(cublas_workspace),
-        chunk_cols, allow_sm80_cutlass, stream);
+        input.data(),
+        weight.data(),
+        x_scales.data(),
+        weight_scales.data(),
+        has_bias ? bias.data() : nullptr,
+        output.data(),
+        weight_workspace.data(),
+        acc_workspace.data(),
+        cublas_workspace.data(),
+        static_cast<int64_t>(cublas_workspace.size()),
+        M,
+        N,
+        K,
+        static_cast<int64_t>(weight_scales.size()),
+        chunk_cols,
+        allow_sm80_cutlass,
+        has_bias,
+        output_dtype_code,
+        bias_dtype_code,
+        stream);
 }
 
 // INT8 GEMM + fused dequant (D = acc * xs[m] * ws[n] + bias[n]) via CUTLASS.
@@ -1853,12 +2140,14 @@ bool cutlass_int8_dequant(
     if (static_cast<int64_t>(ws.size()) != N) throw std::runtime_error("cutlass_int8_dequant: ws must be a length-N vector");
     if (bias.size() != 0 && static_cast<int64_t>(bias.size()) != N)
         throw std::runtime_error("cutlass_int8_dequant: bias must be empty or a length-N vector");
-    validate_fp_dtype_code(d, out_dtype_code, "cutlass_int8_dequant");
+    if (out_dtype_code < 0 || out_dtype_code > 2)  // allow-list: the launch only supports these
+        throw std::runtime_error("cutlass_int8_dequant: out_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
+    if (map_dtype_to_code(d.dtype()) != out_dtype_code)
+        throw std::runtime_error("cutlass_int8_dequant: output dtype does not match out_dtype_code (0=fp32, 1=fp16, 2=bf16)");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    return launch_cutlass_int8_dequant(
-        make_contiguous_tensor_arg<2>(a), make_contiguous_tensor_arg<2>(b),
-        make_flat_tensor_arg(xs), make_flat_tensor_arg(ws),
-        make_optional_flat_tensor_arg(bias), make_contiguous_tensor_arg<2>(d), stream);
+    const void* bias_ptr = bias.size() > 0 ? bias.data() : nullptr;
+    return launch_cutlass_int8_dequant(a.data(), b.data(), xs.data(), ws.data(),
+                                       bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
 }
 
 bool cutlass_int8_dequant_config(
@@ -1877,12 +2166,10 @@ bool cutlass_int8_dequant_config(
     if (d.shape(0) != M || d.shape(1) != N) {
         throw std::runtime_error("cutlass_int8_dequant_config: D shape mismatch");
     }
-    validate_fp_dtype_code(d, out_dtype_code, "cutlass_int8_dequant_config");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     return launch_cutlass_int8_dequant_config(
-        make_contiguous_tensor_arg<2>(a), make_contiguous_tensor_arg<2>(b),
-        make_flat_tensor_arg(xs), make_flat_tensor_arg(ws),
-        make_contiguous_tensor_arg<2>(d), config, stream);
+        a.data(), b.data(), xs.data(), ws.data(), d.data(), M, N, K,
+        out_dtype_code, config, stream);
 }
 
 float benchmark_cutlass_int8_dequant_config(
@@ -1910,13 +2197,7 @@ float benchmark_cutlass_int8_dequant_config(
         throw std::runtime_error(
             "benchmark_cutlass_int8_dequant_config: D shape mismatch");
     }
-    validate_fp_dtype_code(d, out_dtype_code, "benchmark_cutlass_int8_dequant_config");
 
-    const auto a_arg = make_contiguous_tensor_arg<2>(a);
-    const auto b_arg = make_contiguous_tensor_arg<2>(b);
-    const auto xs_arg = make_flat_tensor_arg(xs);
-    const auto ws_arg = make_flat_tensor_arg(ws);
-    const auto output_arg = make_contiguous_tensor_arg<2>(d);
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     cudaEvent_t start;
     cudaEvent_t end;
@@ -1925,7 +2206,8 @@ float benchmark_cutlass_int8_dequant_config(
     cudaEventRecord(start, stream);
     for (int iteration = 0; iteration < iterations; ++iteration) {
         if (!launch_cutlass_int8_dequant_config(
-                a_arg, b_arg, xs_arg, ws_arg, output_arg, config, stream)) {
+                a.data(), b.data(), xs.data(), ws.data(), d.data(), M, N, K,
+                out_dtype_code, config, stream)) {
             cudaEventDestroy(start);
             cudaEventDestroy(end);
             return -1.f;
@@ -1954,16 +2236,15 @@ bool cutlass_turing_int8_dequant(
     const int64_t N = b.shape(0);
     if (b.shape(1) != K) throw std::runtime_error("cutlass_turing_int8_dequant: K mismatch");
     if (d.shape(0) != M || d.shape(1) != N) throw std::runtime_error("cutlass_turing_int8_dequant: D shape mismatch");
-    validate_fp_dtype_code(d, out_dtype_code, "cutlass_turing_int8_dequant");
     if (xs.size() != static_cast<size_t>(M)) throw std::runtime_error("cutlass_turing_int8_dequant: xs shape mismatch");
     if (ws.size() != 1 && ws.size() != static_cast<size_t>(N)) {
         throw std::runtime_error("cutlass_turing_int8_dequant: ws shape mismatch");
     }
+    const void* bias_ptr = bias.size() > 0 ? bias.data() : nullptr;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     return launch_cutlass_turing_int8_dequant(
-        make_contiguous_tensor_arg<2>(a), make_contiguous_tensor_arg<2>(b),
-        make_flat_tensor_arg(xs), make_flat_tensor_arg(ws),
-        make_optional_flat_tensor_arg(bias), make_contiguous_tensor_arg<2>(d), stream);
+        a.data(), b.data(), xs.data(), ws.data(), bias_ptr, d.data(), M, N, K,
+        out_dtype_code, ws.size() == 1, stream);
 }
 
 // INT4 GEMM + fused dequant via CUTLASS. A and B are packed signed int4 in int8 storage.
@@ -1982,16 +2263,14 @@ bool cutlass_int4_dequant(
     const int64_t N = b.shape(0);
     if (b.shape(1) != K_half) throw std::runtime_error("cutlass_int4_dequant: K mismatch");
     if (d.shape(0) != M || d.shape(1) != N) throw std::runtime_error("cutlass_int4_dequant: D shape mismatch");
-    validate_fp_dtype_code(d, out_dtype_code, "cutlass_int4_dequant");
     if (xs.size() != static_cast<size_t>(M)) throw std::runtime_error("cutlass_int4_dequant: xs shape mismatch");
     if (ws.size() != static_cast<size_t>(N)) throw std::runtime_error("cutlass_int4_dequant: ws shape mismatch");
     const int64_t K = K_half * 2;
     if (K % 64 != 0) throw std::runtime_error("cutlass_int4_dequant: K must be divisible by 64");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    return launch_cutlass_int4_dequant(
-        make_contiguous_tensor_arg<2>(a), make_contiguous_tensor_arg<2>(b),
-        make_flat_tensor_arg(xs), make_flat_tensor_arg(ws),
-        make_optional_flat_tensor_arg(bias), make_contiguous_tensor_arg<2>(d), stream);
+    const void* bias_ptr = bias.size() > 0 ? bias.data() : nullptr;
+    return launch_cutlass_int4_dequant(a.data(), b.data(), xs.data(), ws.data(),
+                                       bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
 }
 
 bool cutlass_turing_int4_dequant(
@@ -2008,15 +2287,13 @@ bool cutlass_turing_int4_dequant(
     const int64_t N = b.shape(0);
     if (b.shape(1) != K_half) throw std::runtime_error("cutlass_turing_int4_dequant: K mismatch");
     if (d.shape(0) != M || d.shape(1) != N) throw std::runtime_error("cutlass_turing_int4_dequant: D shape mismatch");
-    validate_fp_dtype_code(d, out_dtype_code, "cutlass_turing_int4_dequant");
     if (xs.size() != static_cast<size_t>(M)) throw std::runtime_error("cutlass_turing_int4_dequant: xs shape mismatch");
     if (ws.size() != static_cast<size_t>(N)) throw std::runtime_error("cutlass_turing_int4_dequant: ws shape mismatch");
     const int64_t K = K_half * 2;
+    const void* bias_ptr = bias.size() > 0 ? bias.data() : nullptr;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     return launch_cutlass_turing_int4_dequant(
-        make_contiguous_tensor_arg<2>(a), make_contiguous_tensor_arg<2>(b),
-        make_flat_tensor_arg(xs), make_flat_tensor_arg(ws),
-        make_optional_flat_tensor_arg(bias), make_contiguous_tensor_arg<2>(d), stream);
+        a.data(), b.data(), xs.data(), ws.data(), bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
 }
 
 // Grouped int4 -> int8 dequant (group scale folded; per-channel scale applied in GEMM).
@@ -2040,10 +2317,8 @@ void dequant_int4_grouped_to_int8(
     if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != 16)
         throw std::runtime_error("dequant_int4_grouped: codebook must be [16]");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    launch_dequant_int4_grouped_to_int8(
-        make_contiguous_tensor_arg<2>(qw), make_contiguous_tensor_arg<2>(s_rel),
-        make_optional_flat_tensor_arg(codebook), make_contiguous_tensor_arg<2>(out),
-        G, stream);
+    const void* cb = codebook.has_value() ? codebook->data() : nullptr;
+    launch_dequant_int4_grouped_to_int8(qw.data(), s_rel.data(), cb, out.data(), N, K, G, stream);
 }
 
 // fp8 (e4m3) per-group scale: s_rel passed as raw uint8 bits.
@@ -2067,10 +2342,8 @@ void dequant_int4_grouped_to_int8_e4m3(
     if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != 16)
         throw std::runtime_error("dequant_int4_grouped: codebook must be [16]");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    launch_dequant_int4_grouped_to_int8_e4m3(
-        make_contiguous_tensor_arg<2>(qw), make_contiguous_tensor_arg<2>(s_rel),
-        make_optional_flat_tensor_arg(codebook), make_contiguous_tensor_arg<2>(out),
-        G, stream);
+    const void* cb = codebook.has_value() ? codebook->data() : nullptr;
+    launch_dequant_int4_grouped_to_int8_e4m3(qw.data(), s_rel.data(), cb, out.data(), N, K, G, stream);
 }
 
 // Fused W4A8 requantize (group_size=16): rotated weight [N,K] -> packed int4
@@ -2099,9 +2372,8 @@ void quantize_w4a8_convrot(
         throw std::runtime_error("quantize_w4a8_convrot: codebook must be [16]");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     if (!launch_quantize_w4a8_convrot(
-            make_contiguous_tensor_arg<2>(rotated), make_flat_tensor_arg(codebook),
-            make_contiguous_tensor_arg<2>(packed), make_contiguous_tensor_arg<2>(s_rel),
-            make_flat_tensor_arg(s_channel), stochastic, seed, stream))
+            rotated.data(), codebook.data(), packed.data(), s_rel.data(), s_channel.data(),
+            N, K, in_code, stochastic, seed, stream))
         throw std::runtime_error(
             "quantize_w4a8_convrot: launch failed (group scales exceed shared memory, or "
             "invalid launch config)");
@@ -2174,12 +2446,11 @@ bool w4a8_codebook_gemm_chunked(
         out.shape(0), out.shape(1), out.dtype(),
         G, chunk_cols, out_dtype_code);
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    const void* cb = codebook.has_value() ? codebook->data() : nullptr;
+    const void* bs = bias.has_value() ? bias->data() : nullptr;
     return launch_w4a8_codebook_gemm_chunked(
-        make_contiguous_tensor_arg<2>(xq), make_contiguous_tensor_arg<2>(weight),
-        make_contiguous_tensor_arg<2>(s_rel), make_optional_flat_tensor_arg(codebook),
-        make_flat_tensor_arg(s_channel), make_flat_tensor_arg(xs),
-        make_optional_flat_tensor_arg(bias), make_contiguous_tensor_arg<2>(workspace),
-        make_contiguous_tensor_arg<2>(out), G, chunk_cols, stream);
+        xq.data(), weight.data(), s_rel.data(), cb, s_channel.data(), xs.data(), bs,
+        workspace.data(), out.data(), M, N, K, G, chunk_cols, out_dtype_code, stream);
 }
 
 // Common W4A8 inference path: online ConvRot activation quantization followed by the
@@ -2232,15 +2503,14 @@ bool w4a8_codebook_linear_chunked(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_int8_rowwise_convrot_kernel(
-        make_contiguous_tensor_arg<2>(input), make_contiguous_tensor_arg<2>(xq),
-        make_contiguous_tensor_arg<2>(xs), static_cast<int>(convrot_group_size),
+        input.data(), xq.data(), xs.data(), M, K,
+        static_cast<int>(convrot_group_size), input_dtype_code,
         false, 0, stream);
+    const void* cb = codebook.has_value() ? codebook->data() : nullptr;
+    const void* bs = bias.has_value() ? bias->data() : nullptr;
     return launch_w4a8_codebook_gemm_chunked(
-        make_contiguous_tensor_arg<2>(xq), make_contiguous_tensor_arg<2>(weight),
-        make_contiguous_tensor_arg<2>(s_rel), make_optional_flat_tensor_arg(codebook),
-        make_flat_tensor_arg(s_channel), make_flat_tensor_arg(xs),
-        make_optional_flat_tensor_arg(bias), make_contiguous_tensor_arg<2>(workspace),
-        make_contiguous_tensor_arg<2>(out), G, chunk_cols, stream);
+        xq.data(), weight.data(), s_rel.data(), cb, s_channel.data(), xs.data(), bs,
+        workspace.data(), out.data(), M, N, K, G, chunk_cols, out_dtype_code, stream);
 }
 
 void quantize_int8_rowwise_convrot(
@@ -2268,10 +2538,16 @@ void quantize_int8_rowwise_convrot(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_int8_rowwise_convrot_kernel(
-        make_contiguous_tensor_arg<2>(input),
-        make_contiguous_tensor_arg<2>(output),
-        make_contiguous_tensor_arg<2>(scales), static_cast<int>(group_size),
-        stochastic, seed, stream);
+        input.data(),
+        output.data(),
+        scales.data(),
+        M,
+        K,
+        static_cast<int>(group_size),
+        input_dtype_code,
+        stochastic,
+        seed,
+        stream);
 }
 
 void rotate_int8_convrot_weight(
@@ -2294,8 +2570,14 @@ void rotate_int8_convrot_weight(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_rotate_int8_convrot_weight_kernel(
-        make_contiguous_tensor_arg<2>(input),
-        make_contiguous_tensor_arg<2>(output), static_cast<int>(group_size), stream);
+        input.data(),
+        output.data(),
+        M,
+        K,
+        static_cast<int>(group_size),
+        input_dtype_code,
+        output_dtype_code,
+        stream);
 }
 
 void quantize_int8_convrot_staged(
@@ -2332,12 +2614,19 @@ void quantize_int8_convrot_staged(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_int8_convrot_staged_kernel(
-        make_contiguous_tensor_arg<2>(input),
-        make_contiguous_tensor_arg<2>(rotated),
-        make_contiguous_tensor_arg<2>(partial_absmax),
-        make_contiguous_tensor_arg<2>(output),
-        make_contiguous_tensor_arg<2>(scales), static_cast<int>(group_size),
-        stochastic, seed, stream);
+        input.data(),
+        rotated.data(),
+        partial_absmax.data(),
+        output.data(),
+        scales.data(),
+        M,
+        K,
+        static_cast<int>(group_size),
+        input_dtype_code,
+        rotated_dtype_code,
+        stochastic,
+        seed,
+        stream);
 }
 
 void quantize_int8_rowwise_convrot64(
@@ -2369,10 +2658,17 @@ void quantize_int8_rowwise_convrot64(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_int8_rowwise_convrot64_kernel(
-        make_contiguous_tensor_arg<2>(input),
-        make_contiguous_tensor_arg<2>(output),
-        make_contiguous_tensor_arg<2>(scales), static_cast<int>(group_size),
-        stochastic, static_cast<int>(act_code), seed, stream);
+        input.data(),
+        output.data(),
+        scales.data(),
+        M,
+        K,
+        static_cast<int>(group_size),
+        input_dtype_code,
+        stochastic,
+        static_cast<int>(act_code),
+        seed,
+        stream);
 }
 
 void dequantize_int8_linear(
@@ -2398,11 +2694,12 @@ void dequantize_int8_linear(
     }
 
     const bool has_bias = bias.data() && bias.size() > 0;
+    int bias_dtype_code = output_dtype_code;
     if (has_bias) {
         if (bias.shape(0) != N) {
             throw std::runtime_error("INT8 linear bias shape mismatch");
         }
-        const int bias_dtype_code = map_dtype_to_code(bias.dtype());
+        bias_dtype_code = map_dtype_to_code(bias.dtype());
         if (bias_dtype_code < 0 || bias_dtype_code > 2) {
             throw std::runtime_error("Unsupported bias dtype for INT8 linear");
         }
@@ -2410,9 +2707,18 @@ void dequantize_int8_linear(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_dequantize_int8_linear_kernel(
-        make_contiguous_tensor_arg<2>(input),
-        make_contiguous_tensor_arg<2>(x_scales), make_flat_tensor_arg(weight_scales),
-        make_optional_flat_tensor_arg(bias), make_contiguous_tensor_arg<2>(output), stream);
+        input.data(),
+        x_scales.data(),
+        weight_scales.data(),
+        has_bias ? bias.data() : nullptr,
+        output.data(),
+        M,
+        N,
+        static_cast<int64_t>(weight_scales.size()),
+        has_bias,
+        output_dtype_code,
+        bias_dtype_code,
+        stream);
 }
 
 void int8_gemv_dequant(
@@ -2445,11 +2751,12 @@ void int8_gemv_dequant(
     }
 
     const bool has_bias = bias.data() && bias.size() > 0;
+    int bias_dtype_code = output_dtype_code;
     if (has_bias) {
         if (bias.shape(0) != N) {
             throw std::runtime_error("INT8 GEMV bias shape mismatch");
         }
-        const int bias_dtype_code = map_dtype_to_code(bias.dtype());
+        bias_dtype_code = map_dtype_to_code(bias.dtype());
         if (bias_dtype_code < 0 || bias_dtype_code > 2) {
             throw std::runtime_error("Unsupported bias dtype for INT8 GEMV");
         }
@@ -2457,10 +2764,19 @@ void int8_gemv_dequant(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_int8_gemv_dequant_kernel(
-        make_contiguous_tensor_arg<2>(input),
-        make_contiguous_tensor_arg<2>(weight),
-        make_contiguous_tensor_arg<2>(x_scales), make_flat_tensor_arg(weight_scales),
-        make_optional_flat_tensor_arg(bias), make_contiguous_tensor_arg<2>(output), stream);
+        input.data(),
+        weight.data(),
+        x_scales.data(),
+        weight_scales.data(),
+        has_bias ? bias.data() : nullptr,
+        output.data(),
+        N,
+        K,
+        static_cast<int64_t>(weight_scales.size()),
+        has_bias,
+        output_dtype_code,
+        bias_dtype_code,
+        stream);
 }
 
 void int8_linear_m1(
@@ -2507,11 +2823,12 @@ void int8_linear_m1(
     }
 
     const bool has_bias = bias.data() && bias.size() > 0;
+    int bias_dtype_code = output_dtype_code;
     if (has_bias) {
         if (bias.shape(0) != N) {
             throw std::runtime_error("INT8 M=1 linear bias shape mismatch");
         }
-        const int bias_dtype_code = map_dtype_to_code(bias.dtype());
+        bias_dtype_code = map_dtype_to_code(bias.dtype());
         if (bias_dtype_code < 0 || bias_dtype_code > 2) {
             throw std::runtime_error("Unsupported bias dtype for INT8 M=1 linear");
         }
@@ -2520,21 +2837,43 @@ void int8_linear_m1(
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     if (convrot) {
         launch_quantize_int8_rowwise_convrot64_kernel(
-            make_contiguous_tensor_arg<2>(input),
-            make_contiguous_tensor_arg<2>(q_scratch),
-            make_contiguous_tensor_arg<2>(x_scales), group_size, false,
-            /*act_code=*/0, 0, stream);
+            input.data(),
+            q_scratch.data(),
+            x_scales.data(),
+            M,
+            K,
+            group_size,
+            input_dtype_code,
+            false,
+            /*act_code=*/0,
+            0,
+            stream);
     } else {
         launch_quantize_int8_rowwise_kernel(
-            make_contiguous_tensor_arg<2>(input),
-            make_contiguous_tensor_arg<2>(q_scratch),
-            make_contiguous_tensor_arg<2>(x_scales), false, 0, stream);
+            input.data(),
+            q_scratch.data(),
+            x_scales.data(),
+            M,
+            K,
+            input_dtype_code,
+            false,
+            0,
+            stream);
     }
     launch_int8_gemv_dequant_kernel(
-        make_contiguous_tensor_arg<2>(q_scratch),
-        make_contiguous_tensor_arg<2>(weight),
-        make_contiguous_tensor_arg<2>(x_scales), make_flat_tensor_arg(weight_scales),
-        make_optional_flat_tensor_arg(bias), make_contiguous_tensor_arg<2>(output), stream);
+        q_scratch.data(),
+        weight.data(),
+        x_scales.data(),
+        weight_scales.data(),
+        has_bias ? bias.data() : nullptr,
+        output.data(),
+        N,
+        K,
+        static_cast<int64_t>(weight_scales.size()),
+        has_bias,
+        output_dtype_code,
+        bias_dtype_code,
+        stream);
 }
 
 void dequantize_int8_simple(
@@ -2557,17 +2896,21 @@ void dequantize_int8_simple(
     if (scale_mode == 2 && (inner_dim <= 0 || input.size() % inner_dim != 0 || scale.size() != input.size() / inner_dim)) {
         throw std::runtime_error("INT8 simple dequantization rowwise scale shape mismatch");
     }
-    auto input_arg = make_flat_tensor_arg(input);
-    auto scale_arg = make_flat_tensor_arg(scale);
-    auto output_arg = make_flat_tensor_arg(output);
-    const int output_dtype_code = static_cast<int>(output_arg.meta.dtype);
+    const int output_dtype_code = map_dtype_to_code(output.dtype());
     if (output_dtype_code < 0 || output_dtype_code > 2) {
         throw std::runtime_error("Unsupported output dtype for INT8 simple dequantization");
     }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_dequantize_int8_simple_kernel(
-        input_arg, scale_arg, output_arg, inner_dim, scale_mode, stream);
+        input.data(),
+        scale.data(),
+        output.data(),
+        static_cast<int64_t>(input.size()),
+        inner_dim,
+        scale_mode,
+        output_dtype_code,
+        stream);
 }
 
 void dequantize_int8_convrot_weight(
@@ -2592,8 +2935,15 @@ void dequantize_int8_convrot_weight(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_dequantize_int8_convrot_kernel(
-        make_contiguous_tensor_arg<2>(input), make_flat_tensor_arg(scale),
-        make_contiguous_tensor_arg<2>(output), static_cast<int>(group_size), stream);
+        input.data(),
+        scale.data(),
+        output.data(),
+        M,
+        K,
+        static_cast<int64_t>(scale.size()),
+        static_cast<int>(group_size),
+        output_dtype_code,
+        stream);
 }
 
 void flash_attention_decode(
@@ -2627,16 +2977,15 @@ void flash_attention_decode(
     if (softmax_lse.size() != lse_size || num_splits < 1 || num_splits > 32 || (num_splits > 1 && (softmax_lse_accum.size() != lse_size * num_splits || output_accum.size() != lse_size * 128 * num_splits))) {
         throw std::runtime_error("Invalid Flash Attention split workspace");
     }
-    if (k.stride(3) != 1 || v.stride(3) != 1 ||
-        q.stride(2) != 1 || output.stride(2) != 1) {
+    if (k.stride(0) != v.stride(0) || k.stride(1) != v.stride(1) || k.stride(2) != v.stride(2) || k.stride(3) != 1 || v.stride(3) != 1 || q.stride(2) != 1 || output.stride(2) != 1) {
         throw std::runtime_error("Unsupported Flash Attention tensor strides");
     }
 
     launch_flash_decode(
         make_tensor_arg<3>(q), make_tensor_arg<4>(k), make_tensor_arg<4>(v),
-        make_contiguous_tensor_arg<1>(kv_lengths), make_tensor_arg<3>(output),
-        make_flat_tensor_arg(softmax_lse), make_flat_tensor_arg(softmax_lse_accum),
-        make_flat_tensor_arg(output_accum), num_splits,
+        kv_lengths.data(), make_tensor_arg<3>(output), softmax_lse.data(),
+        num_splits > 1 ? softmax_lse_accum.data() : nullptr,
+        num_splits > 1 ? output_accum.data() : nullptr, num_splits,
         reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 

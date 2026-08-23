@@ -193,7 +193,6 @@ target_include_directories(comfy_kitchen_hip_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/sage_attention
     ${_CK_HIP_GENERATED_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 target_link_libraries(comfy_kitchen_hip_kernels PRIVATE hip::host)
 
@@ -219,7 +218,6 @@ target_compile_definitions(_C PRIVATE NB_STATIC)
 
 target_include_directories(_C PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${_CK_HIP_GENERATED_INCLUDE_DIR}
 )
 

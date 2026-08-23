@@ -11,7 +11,6 @@
 #include <nanobind/stl/optional.h>
 
 #include "launchers.h"
-#include "tensor_bindings.h"
 
 namespace nb = nanobind;
 
@@ -35,9 +34,6 @@ int map_dtype_to_code(const nb::dlpack::dtype& dtype) {
     }
     return -1;
 }
-
-using comfy::tensor::TensorArg;
-using comfy::tensor::make_tensor_arg;
 
 extern "C" {
 void launch_quantize_per_tensor_fp8_kernel(const void*, const void*, void*, int64_t, int, int,
@@ -92,11 +88,15 @@ void launch_svdquant_quant_kernel(const void*, const void*, void*, void*, int, i
 void launch_svdquant_gemm_kernel(const void*, const void*, void*, const void*, const void*,
                                  const void*, const void*, const void*, int, int, int, int, int,
                                  int, int, int, int, int, bool, hipStream_t);
-void launch_apply_rope_kernel(TensorArg<4>, TensorArg<4>, TensorArg<6>, TensorArg<4>,
-                              TensorArg<4>, bool, bool, hipStream_t);
-void launch_rms_rope_kernel(TensorArg<4>, TensorArg<4>, TensorArg<6>, TensorArg<1>,
-                            TensorArg<1>, TensorArg<4>, TensorArg<4>, int64_t, float, bool, bool,
-                            hipStream_t);
+void launch_apply_rope_kernel(const void*, const void*, const void*, void*, void*, int64_t, int64_t,
+                              int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                              int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                              int64_t, int64_t, int64_t, int, int, bool, hipStream_t);
+void launch_rms_rope_kernel(const void*, const void*, const void*, const void*, const void*, void*,
+                            void*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int, int,
+                            int, float, bool, hipStream_t);
 }
 
 static void check_hip_launch() {
@@ -820,23 +820,22 @@ void apply_rope(nb::ndarray<> xq, OptArray xk, nb::ndarray<> freqs, nb::ndarray<
     }
 
     launch_apply_rope_kernel(
-        make_tensor_arg<4>(xq), xk ? make_tensor_arg<4>(*xk) : TensorArg<4>{},
-        make_tensor_arg<6>(freqs), make_tensor_arg<4>(xq_out),
-        xk_out ? make_tensor_arg<4>(*xk_out) : TensorArg<4>{}, xk.has_value(),
-        split_half, reinterpret_cast<hipStream_t>(stream_ptr));
+        xq.data(), xk.has_value() ? xk->data() : nullptr, freqs.data(), xq_out.data(),
+        xk_out.has_value() ? xk_out->data() : nullptr,
+        static_cast<int64_t>(xq.shape(0)), static_cast<int64_t>(xq.shape(1)),
+        static_cast<int64_t>(xq.shape(2)), static_cast<int64_t>(xq.shape(3)),
+        static_cast<int64_t>(freqs.shape(0)), static_cast<int64_t>(freqs.shape(1)),
+        static_cast<int64_t>(freqs.shape(2)),
+        static_cast<int64_t>(xq.stride(0)), static_cast<int64_t>(xq.stride(1)),
+        static_cast<int64_t>(xq.stride(2)), static_cast<int64_t>(xq.stride(3)),
+        static_cast<int64_t>(xq_out.stride(0)), static_cast<int64_t>(xq_out.stride(1)),
+        static_cast<int64_t>(xq_out.stride(2)), static_cast<int64_t>(xq_out.stride(3)),
+        static_cast<int64_t>(freqs.stride(0)), static_cast<int64_t>(freqs.stride(1)),
+        static_cast<int64_t>(freqs.stride(2)), static_cast<int64_t>(freqs.stride(3)),
+        static_cast<int64_t>(freqs.stride(4)), static_cast<int64_t>(freqs.stride(5)),
+        map_dtype_to_code(xq.dtype()), map_dtype_to_code(freqs.dtype()), split_half,
+        reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
-}
-
-// The HIP kernel indexes scales as dense arrays. Python normalizes public calls,
-// while this guard keeps direct _C calls from silently producing wrong results.
-static void require_rms_rope_scale(const nb::ndarray<>& scale, int64_t head_dim,
-                                   const char* fn, const char* name) {
-    require_dtype(scale, 0, 2, fn, name);
-    if (scale.ndim() != 1 || static_cast<int64_t>(scale.shape(0)) != head_dim ||
-        (head_dim > 1 && scale.stride(0) != 1)) {
-        throw std::runtime_error(std::string(fn) + ": " + name +
-                                 " must be a contiguous 1D tensor of length head_dim");
-    }
 }
 
 // Fused RMSNorm + RoPE. Same operand layout as apply_rope, plus a per-head_dim
@@ -860,20 +859,32 @@ void rms_rope(nb::ndarray<> q, OptArray k, nb::ndarray<> freqs, nb::ndarray<> q_
     // The weight is indexed by element within the row, so it needs one entry per
     // head_dim, decoded with a single code shared by both weights.
     const int64_t head_dim = static_cast<int64_t>(q.shape(3));
-    require_rms_rope_scale(q_scale, head_dim, kFn, "q_scale");
+    require_dtype(q_scale, 0, 2, kFn, "q_scale");
+    require_len(q_scale, head_dim, kFn, "q_scale");
     if (k_scale.has_value()) {
         if (k_scale->dtype() != q_scale.dtype()) {
             throw std::runtime_error("rms_rope expects k_scale to have q_scale's dtype");
         }
-        require_rms_rope_scale(*k_scale, head_dim, kFn, "k_scale");
+        require_len(*k_scale, head_dim, kFn, "k_scale");
     }
 
     launch_rms_rope_kernel(
-        make_tensor_arg<4>(q), k ? make_tensor_arg<4>(*k) : TensorArg<4>{},
-        make_tensor_arg<6>(freqs), make_tensor_arg<1>(q_scale),
-        k_scale ? make_tensor_arg<1>(*k_scale) : TensorArg<1>{},
-        make_tensor_arg<4>(q_out), k_out ? make_tensor_arg<4>(*k_out) : TensorArg<4>{},
-        rot, epsilon, k.has_value(), split_half,
+        q.data(), k.has_value() ? k->data() : nullptr, freqs.data(), q_scale.data(),
+        k_scale.has_value() ? k_scale->data() : nullptr, q_out.data(),
+        k_out.has_value() ? k_out->data() : nullptr,
+        static_cast<int64_t>(q.shape(0)), static_cast<int64_t>(q.shape(1)),
+        static_cast<int64_t>(q.shape(2)), head_dim, rot,
+        static_cast<int64_t>(freqs.shape(0)), static_cast<int64_t>(freqs.shape(1)),
+        static_cast<int64_t>(freqs.shape(2)),
+        static_cast<int64_t>(q.stride(0)), static_cast<int64_t>(q.stride(1)),
+        static_cast<int64_t>(q.stride(2)), static_cast<int64_t>(q.stride(3)),
+        static_cast<int64_t>(q_out.stride(0)), static_cast<int64_t>(q_out.stride(1)),
+        static_cast<int64_t>(q_out.stride(2)), static_cast<int64_t>(q_out.stride(3)),
+        static_cast<int64_t>(freqs.stride(0)), static_cast<int64_t>(freqs.stride(1)),
+        static_cast<int64_t>(freqs.stride(2)), static_cast<int64_t>(freqs.stride(3)),
+        static_cast<int64_t>(freqs.stride(4)), static_cast<int64_t>(freqs.stride(5)),
+        map_dtype_to_code(q.dtype()), map_dtype_to_code(freqs.dtype()),
+        map_dtype_to_code(q_scale.dtype()), epsilon, split_half,
         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
