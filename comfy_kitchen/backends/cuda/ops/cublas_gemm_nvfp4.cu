@@ -297,8 +297,8 @@ void launch_cublas_gemm_blockwise_fp4_kernel(
     comfy::tensor::TensorArg<2> b, comfy::tensor::TensorArg<2> b_scale,
     comfy::tensor::TensorArg<2> a, comfy::tensor::TensorArg<2> a_scale,
     comfy::tensor::TensorArg<2> out, comfy::tensor::TensorArg<1> bias,
-    comfy::tensor::TensorArg<1> alpha, comfy::tensor::TensorArg<1> workspace,
-    bool accumulate,
+    comfy::tensor::TensorArg<1> alpha, void* workspace,
+    int64_t workspace_size, bool accumulate,
     cudaStream_t stream) {
   const int64_t M = a.meta.sizes[0];
   const int64_t N = b.meta.sizes[0];
@@ -329,8 +329,8 @@ void launch_cublas_gemm_blockwise_fp4_kernel(
       true,   // transa (transpose A)
       false,  // transb (don't transpose B)
       false,  // grad
-      workspace.data,
-      workspace.data ? 32 * 1024 * 1024 : 0,  // workspace_size (32MB default)
+      workspace,
+      workspace_size,
       accumulate,
       0,  // math_sm_count
       static_cast<const float*>(alpha.data),

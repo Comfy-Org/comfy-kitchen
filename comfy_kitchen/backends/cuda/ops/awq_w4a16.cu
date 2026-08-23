@@ -41,6 +41,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <stdexcept>
 #include <type_traits>
 
 namespace {
@@ -602,6 +603,17 @@ extern "C" void launch_awq_w4a16_kernel(
     const int M = static_cast<int>(x.meta.sizes[0]);
     const int N = static_cast<int>(out.meta.sizes[1]);
     const int K = static_cast<int>(x.meta.sizes[1]);
+    if (G <= 0 || G % 2 != 0 || K % G != 0) {
+        throw std::runtime_error(
+            "awq_w4a16: group size must be positive, even, and divide K");
+    }
+    if (out.meta.sizes[0] != M || qweight.meta.sizes[0] != N ||
+        qweight.meta.sizes[1] != K / 2 || wscales.meta.sizes[0] != K / G ||
+        wscales.meta.sizes[1] != N || wzeros.meta.sizes[0] != K / G ||
+        wzeros.meta.sizes[1] != N) {
+        throw std::runtime_error("awq_w4a16: incompatible tensor shapes");
+    }
+    if (M == 0 || N == 0 || K == 0) return;
     // M ≤ kGemvMThreshold: the naive 1-thread-per-output kernel keeps weight
     // re-reads minimal (M is small, so global qweight reads happen ~M times
     // per (N, K) cell, which is fine for tiny M and avoids tile-launch
@@ -615,7 +627,7 @@ extern "C" void launch_awq_w4a16_kernel(
     cudaGetDevice(&device);
     cudaGetDeviceProperties(&prop, device);
     const bool supports_mma = prop.major >= 8;
-    const bool use_mma = supports_mma && (M > kGemvMThreshold);
+    const bool use_mma = supports_mma && M > kGemvMThreshold && G == 64;
 
     if (x.meta.dtype == comfy::tensor::DType::BFloat16) {        // bfloat16
         if (use_mma) launch_mma<__nv_bfloat16>(x.data, qweight.data, wscales.data, wzeros.data, out.data, M, N, K, G, stream);

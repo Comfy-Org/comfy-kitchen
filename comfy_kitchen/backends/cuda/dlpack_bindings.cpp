@@ -97,7 +97,7 @@ extern "C" {
     void launch_cublas_gemm_blockwise_fp4_kernel(
         TensorArg<2> b, TensorArg<2> b_scale, TensorArg<2> a,
         TensorArg<2> a_scale, TensorArg<2> out, TensorArg<1> bias,
-        TensorArg<1> alpha, TensorArg<1> workspace,
+        TensorArg<1> alpha, void* workspace, int64_t workspace_size,
         bool accumulate,
         cudaStream_t stream);
 
@@ -283,7 +283,7 @@ void cublas_gemm_blockwise_fp4(
     nb::ndarray<nb::device::cuda> out,
     int out_dtype_code,
     nb::ndarray<nb::device::cuda> bias,
-    nb::ndarray<nb::device::cuda> workspace,
+    nb::ndarray<uint8_t, nb::device::cuda> workspace,
     bool accumulate,
     nb::ndarray<float, nb::device::cuda> alpha,
     uintptr_t stream_ptr) {
@@ -300,7 +300,9 @@ void cublas_gemm_blockwise_fp4(
     auto out_arg = make_contiguous_tensor_arg<2>(out);
     auto bias_arg = make_flat_tensor_arg(bias);
     auto alpha_arg = make_flat_tensor_arg(alpha);
-    auto workspace_arg = make_flat_tensor_arg(workspace);
+    if (!comfy::tensor::is_contiguous(workspace)) {
+        throw std::runtime_error("cuBLAS workspace must be contiguous");
+    }
 
     if (a_arg.meta.sizes[1] != b_arg.meta.sizes[1]) {
         throw std::runtime_error("Matrix dimensions do not match");
@@ -317,7 +319,8 @@ void cublas_gemm_blockwise_fp4(
 
     launch_cublas_gemm_blockwise_fp4_kernel(
         b_arg, b_scale_arg, a_arg, a_scale_arg, out_arg, bias_arg,
-        alpha_arg, workspace_arg, accumulate, stream);
+        alpha_arg, workspace.size() == 0 ? nullptr : workspace.data(),
+        static_cast<int64_t>(workspace.size()), accumulate, stream);
 }
 
 // Nanobind wrapper for quantize_nvfp4
@@ -1289,8 +1292,8 @@ void rms_adaln(
 // Python module definition
 extern "C" {
     void launch_cublas_gemm_int8_kernel(
-        TensorArg<2> a, TensorArg<2> b, TensorArg<2> c, TensorArg<1> workspace,
-        cudaStream_t stream);
+        TensorArg<2> a, TensorArg<2> b, TensorArg<2> c, void* workspace,
+        int64_t workspace_size, cudaStream_t stream);
 
     void launch_quantize_int8_rowwise_kernel(
         TensorArg<2> input, TensorArg<2> output, TensorArg<2> scales,
@@ -1444,7 +1447,7 @@ void cublas_gemm_int8(
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> a,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> b,
     nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> c,
-    nb::ndarray<nb::device::cuda> workspace,
+    nb::ndarray<uint8_t, nb::device::cuda> workspace,
     uintptr_t stream_ptr) {
 
     auto& runtime = comfy::CublasLtRuntime::instance();
@@ -1466,11 +1469,17 @@ void cublas_gemm_int8(
         throw std::runtime_error("Output matrix C shape does not match");
     }
 
+    if (!comfy::tensor::is_contiguous(workspace)) {
+        throw std::runtime_error("cuBLAS workspace must be contiguous");
+    }
+
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
     launch_cublas_gemm_int8_kernel(
         make_contiguous_tensor_arg<2>(a), make_contiguous_tensor_arg<2>(b),
-        make_contiguous_tensor_arg<2>(c), make_flat_tensor_arg(workspace), stream);
+        make_contiguous_tensor_arg<2>(c),
+        workspace.size() == 0 ? nullptr : workspace.data(),
+        static_cast<int64_t>(workspace.size()), stream);
 }
 
 void quantize_int8_rowwise(

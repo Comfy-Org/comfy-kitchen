@@ -230,8 +230,8 @@ extern "C" {
 
 void launch_cublas_gemm_int8_kernel(
     comfy::tensor::TensorArg<2> a, comfy::tensor::TensorArg<2> b,
-    comfy::tensor::TensorArg<2> c, comfy::tensor::TensorArg<1> workspace,
-    cudaStream_t stream) {
+    comfy::tensor::TensorArg<2> c, void* workspace,
+    int64_t workspace_size, cudaStream_t stream) {
   const int64_t M = a.meta.sizes[0];
   const int64_t N = b.meta.sizes[0];
   const int64_t K = a.meta.sizes[1];
@@ -240,8 +240,8 @@ void launch_cublas_gemm_int8_kernel(
       static_cast<const int8_t*>(b.data),
       static_cast<int32_t*>(c.data),
       M, N, K,
-      workspace.data,
-      workspace.meta.sizes[0],
+      workspace,
+      workspace_size,
       stream);
 }
 
