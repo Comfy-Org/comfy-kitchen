@@ -11,7 +11,7 @@
 #include <nanobind/stl/optional.h>
 
 #include "launchers.h"
-#include "tensor.h"
+#include "tensor_bindings.h"
 
 namespace nb = nanobind;
 
@@ -36,27 +36,8 @@ int map_dtype_to_code(const nb::dlpack::dtype& dtype) {
     return -1;
 }
 
-using comfy::tensor::DType;
 using comfy::tensor::TensorArg;
-
-template <std::size_t Rank, typename... Args>
-TensorArg<Rank> make_tensor_arg(const nb::ndarray<Args...>& array) {
-    if (array.ndim() != Rank) {
-        throw std::runtime_error("unexpected tensor rank");
-    }
-    const int dtype_code = map_dtype_to_code(array.dtype());
-    if (dtype_code < 0) {
-        throw std::runtime_error("unsupported tensor dtype");
-    }
-    TensorArg<Rank> arg{};
-    arg.data = const_cast<void*>(static_cast<const void*>(array.data()));
-    arg.meta.dtype = static_cast<DType>(dtype_code);
-    for (std::size_t axis = 0; axis < Rank; ++axis) {
-        arg.meta.sizes[axis] = static_cast<std::int64_t>(array.shape(axis));
-        arg.meta.strides[axis] = array.stride(axis);
-    }
-    return arg;
-}
+using comfy::tensor::make_tensor_arg;
 
 extern "C" {
 void launch_quantize_per_tensor_fp8_kernel(const void*, const void*, void*, int64_t, int, int,
@@ -846,6 +827,18 @@ void apply_rope(nb::ndarray<> xq, OptArray xk, nb::ndarray<> freqs, nb::ndarray<
     check_hip_launch();
 }
 
+// The HIP kernel indexes scales as dense arrays. Python normalizes public calls,
+// while this guard keeps direct _C calls from silently producing wrong results.
+static void require_rms_rope_scale(const nb::ndarray<>& scale, int64_t head_dim,
+                                   const char* fn, const char* name) {
+    require_dtype(scale, 0, 2, fn, name);
+    if (scale.ndim() != 1 || static_cast<int64_t>(scale.shape(0)) != head_dim ||
+        (head_dim > 1 && scale.stride(0) != 1)) {
+        throw std::runtime_error(std::string(fn) + ": " + name +
+                                 " must be a contiguous 1D tensor of length head_dim");
+    }
+}
+
 // Fused RMSNorm + RoPE. Same operand layout as apply_rope, plus a per-head_dim
 // weight for each input.
 void rms_rope(nb::ndarray<> q, OptArray k, nb::ndarray<> freqs, nb::ndarray<> q_scale,
@@ -867,13 +860,12 @@ void rms_rope(nb::ndarray<> q, OptArray k, nb::ndarray<> freqs, nb::ndarray<> q_
     // The weight is indexed by element within the row, so it needs one entry per
     // head_dim, decoded with a single code shared by both weights.
     const int64_t head_dim = static_cast<int64_t>(q.shape(3));
-    require_dtype(q_scale, 0, 2, kFn, "q_scale");
-    require_len(q_scale, head_dim, kFn, "q_scale");
+    require_rms_rope_scale(q_scale, head_dim, kFn, "q_scale");
     if (k_scale.has_value()) {
         if (k_scale->dtype() != q_scale.dtype()) {
             throw std::runtime_error("rms_rope expects k_scale to have q_scale's dtype");
         }
-        require_len(*k_scale, head_dim, kFn, "k_scale");
+        require_rms_rope_scale(*k_scale, head_dim, kFn, "k_scale");
     }
 
     launch_rms_rope_kernel(

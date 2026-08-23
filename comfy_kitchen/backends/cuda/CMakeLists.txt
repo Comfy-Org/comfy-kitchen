@@ -204,6 +204,7 @@ target_compile_definitions(_C PRIVATE NB_STATIC)
 # Include directories
 target_include_directories(_C PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 

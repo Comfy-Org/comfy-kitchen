@@ -24,7 +24,7 @@
 
 #include "cublaslt_runtime.h"
 #include "input_act_codes.h"
-#include "tensor.h"
+#include "tensor_bindings.h"
 
 namespace nb = nanobind;
 
@@ -45,27 +45,8 @@ int map_dtype_to_code(const nb::dlpack::dtype& dtype) {
     return -1;  // unsupported
 }
 
-using comfy::tensor::DType;
 using comfy::tensor::TensorArg;
-
-template <std::size_t Rank, typename... Args>
-TensorArg<Rank> make_tensor_arg(const nb::ndarray<Args...>& array) {
-    if (array.ndim() != Rank) {
-        throw std::runtime_error("unexpected tensor rank");
-    }
-    const int dtype_code = map_dtype_to_code(array.dtype());
-    if (dtype_code < 0) {
-        throw std::runtime_error("unsupported tensor dtype");
-    }
-    TensorArg<Rank> arg{};
-    arg.data = const_cast<void*>(static_cast<const void*>(array.data()));
-    arg.meta.dtype = static_cast<DType>(dtype_code);
-    for (std::size_t axis = 0; axis < Rank; ++axis) {
-        arg.meta.sizes[axis] = static_cast<std::int64_t>(array.shape(axis));
-        arg.meta.strides[axis] = array.stride(axis);
-    }
-    return arg;
-}
+using comfy::tensor::make_tensor_arg;
 
 // Forward declarations of CUDA kernel wrappers
 extern "C" {
