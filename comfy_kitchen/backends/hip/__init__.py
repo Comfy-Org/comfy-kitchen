@@ -1179,6 +1179,34 @@ def convrot_w4a4_linear(
 # AWQ W4A16 and SVDQuant W4A4
 # ---------------------------------------------------------------------------
 
+# Above this limit, materialize the weight and use the tuned PyTorch matmul.
+_AWQ_W4A16_MMA_M_LIMIT = 2048
+
+
+def _awq_w4a16_dequant_then_matmul(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    wscales: torch.Tensor,
+    wzeros: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    """Dequantize the packed weight and use PyTorch matmul for large M."""
+    n, k_half = qweight.shape
+    k = k_half * 2
+    compute_dtype = wscales.dtype
+
+    packed = qweight.to(torch.int32)
+    lo = (packed & 0xF).to(torch.int8)
+    hi = ((packed >> 4) & 0xF).to(torch.int8)
+    values = torch.stack((lo, hi), dim=-1).reshape(n, k).to(compute_dtype)
+    weight = (
+        (values.view(n, k // group_size, group_size) - 8.0)
+        * wscales.t().unsqueeze(-1)
+        + wzeros.t().unsqueeze(-1)
+    ).view(n, k)
+    return x.to(compute_dtype).matmul(weight.t())
+
+
 def gemv_awq_w4a16(
     x: torch.Tensor,
     qweight: torch.Tensor,
@@ -1212,12 +1240,18 @@ def gemv_awq_w4a16(
         bias = _bias_operand(bias, n, x.device)
 
     out_dtype = wscales.dtype
-    out = torch.empty((m, n), dtype=out_dtype, device=x.device)
-    _C.gemv_awq_w4a16(
-        _dl(x2d), _dl(qw), _dl(wscales), _dl(wzeros),
-        None if bias is None else _dl(bias), _dl(out),
-        m, n, k, group_size, _stream(x),
-    )
+    if m > _AWQ_W4A16_MMA_M_LIMIT:
+        out = _awq_w4a16_dequant_then_matmul(x2d, qw, wscales, wzeros, group_size)
+        if bias is not None:
+            out.add_(bias)
+    else:
+        out = torch.empty((m, n), dtype=out_dtype, device=x.device)
+        use_wmma = has_wmma() and x2d.data_ptr() % 16 == 0
+        _C.gemv_awq_w4a16(
+            _dl(x2d), _dl(qw), _dl(wscales), _dl(wzeros),
+            None if bias is None else _dl(bias), _dl(out),
+            m, n, k, group_size, use_wmma, _stream(x),
+        )
     return out.reshape(*orig_shape[:-1], n)
 
 
