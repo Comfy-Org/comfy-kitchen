@@ -2073,6 +2073,38 @@ extern "C" {
         int out_dtype_code,
         cudaStream_t stream);
 
+    bool launch_gated_delta_decode(
+        const void* q,
+        const void* k,
+        const void* v,
+        const void* beta,
+        const void* g,
+        void* state,
+        void* out,
+        void* snapshots,
+        int64_t B,
+        int64_t H,
+        int64_t S,
+        int64_t DK,
+        int64_t DV,
+        cudaStream_t stream);
+
+    bool launch_w4a8_codebook_gemv(
+        const void* xq,
+        const void* weight,
+        const void* s_rel,
+        const void* codebook,
+        const void* s_channel,
+        const void* xs,
+        const void* bias,
+        void* out,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int64_t G,
+        int out_dtype_code,
+        cudaStream_t stream);
+
     void launch_quantize_int8_rowwise_convrot_kernel(
         const void* input,
         void* output,
@@ -3124,6 +3156,64 @@ bool w4a8_codebook_linear_chunked(
         workspace.data(), out.data(), M, N, K, G, chunk_cols, out_dtype_code, stream);
 }
 
+bool w4a8_codebook_gemv(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,             // [M, K] fp32/fp16/bf16
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> xq,       // [M, K]
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> xs,        // [M, 1]
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> weight,   // [N, K/2]
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> s_rel,   // [N, K/G]
+    std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> codebook,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> s_channel, // [N]
+    std::optional<nb::ndarray<nb::ndim<1>, nb::device::cuda>> bias,  // [N] in out_dtype, or None
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> out,
+    int64_t convrot_group_size, int64_t G,
+    int out_dtype_code, uintptr_t stream_ptr) {
+    const int64_t M = input.shape(0);
+    const int64_t K = input.shape(1);
+    const int64_t N = weight.shape(0);
+    if (xq.shape(0) != M || xq.shape(1) != K || xs.shape(0) != M || xs.shape(1) != 1)
+        throw std::runtime_error("w4a8_codebook_gemv: xq must be [M, K] and xs [M, 1]");
+    if (input.stride(1) != 1 || input.stride(0) != K
+            || xq.stride(1) != 1 || xq.stride(0) != K
+            || xs.stride(1) != 1 || xs.stride(0) != 1)
+        throw std::runtime_error("w4a8_codebook_gemv: input, xq, and xs must be contiguous");
+    if (weight.stride(1) != 1 || weight.stride(0) != weight.shape(1)
+            || s_rel.stride(1) != 1 || s_rel.stride(0) != s_rel.shape(1)
+            || s_channel.stride(0) != 1
+            || out.stride(1) != 1 || out.stride(0) != out.shape(1)
+            || (codebook.has_value() && codebook->stride(0) != 1)
+            || (bias.has_value() && bias->stride(0) != 1))
+        throw std::runtime_error("w4a8_codebook_gemv: weight metadata and out must be contiguous");
+    if (G < 16 || (G % 16) != 0)
+        throw std::runtime_error("w4a8_codebook_gemv: G must be a multiple of 16");
+    validate_w4a8_codebook_gemm_contract(
+        M, N, K,
+        weight.shape(1),
+        s_rel.shape(0), s_rel.shape(1),
+        s_channel.size(), xs.size(),
+        codebook.has_value() ? static_cast<int64_t>(codebook->size()) : -1,
+        bias.has_value() ? static_cast<int64_t>(bias->size()) : -1,
+        bias.has_value() ? map_dtype_to_code(bias->dtype()) : out_dtype_code,
+        /*workspace_rows=*/0, /*workspace_cols=*/0,
+        out.shape(0), out.shape(1), out.dtype(),
+        G, /*chunk_cols=*/0, out_dtype_code);
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
+    if (input_dtype_code < 0 || input_dtype_code > 2)
+        throw std::runtime_error("w4a8_codebook_gemv: input must be fp32, fp16, or bf16");
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_quantize_int8_rowwise_convrot_kernel(
+        input.data(), xq.data(), xs.data(), M, K,
+        static_cast<int>(convrot_group_size), input_dtype_code,
+        false, 0, stream);
+    return launch_w4a8_codebook_gemv(
+        xq.data(), weight.data(), s_rel.data(),
+        codebook.has_value() ? codebook->data() : nullptr,
+        s_channel.data(), xs.data(),
+        bias.has_value() ? bias->data() : nullptr,
+        out.data(), M, N, K, G, out_dtype_code, stream);
+}
+
 void quantize_int8_rowwise_convrot(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
@@ -3616,6 +3706,50 @@ void flash_attention_decode(
         k.stride(0), k.stride(1), k.stride(2), reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
+bool gated_delta_decode(
+    nb::ndarray<float, nb::ndim<4>, nb::device::cuda> q,       // [B, S, H, DK]
+    nb::ndarray<float, nb::ndim<4>, nb::device::cuda> k,       // [B, S, H, DK]
+    nb::ndarray<float, nb::ndim<4>, nb::device::cuda> v,       // [B, S, H, DV]
+    nb::ndarray<float, nb::ndim<3>, nb::device::cuda> beta,    // [B, S, H]
+    nb::ndarray<float, nb::ndim<3>, nb::device::cuda> g,       // [B, S, H]
+    nb::ndarray<float, nb::ndim<4>, nb::device::cuda> state,   // [B, H, DK, DV]
+    nb::ndarray<float, nb::ndim<4>, nb::device::cuda> out,     // [B, S, H, DV]
+    std::optional<nb::ndarray<float, nb::ndim<5>, nb::device::cuda>> snapshots,  // [S-1, B, H, DK, DV]
+    uintptr_t stream_ptr) {
+    const int64_t B = q.shape(0), S = q.shape(1), H = q.shape(2), DK = q.shape(3);
+    const int64_t DV = v.shape(3);
+    if (k.shape(0) != B || k.shape(1) != S || k.shape(2) != H || k.shape(3) != DK
+        || v.shape(0) != B || v.shape(1) != S || v.shape(2) != H
+        || beta.shape(0) != B || beta.shape(1) != S || beta.shape(2) != H
+        || g.shape(0) != B || g.shape(1) != S || g.shape(2) != H
+        || state.shape(0) != B || state.shape(1) != H || state.shape(2) != DK || state.shape(3) != DV
+        || out.shape(0) != B || out.shape(1) != S || out.shape(2) != H || out.shape(3) != DV)
+        throw std::runtime_error("gated_delta_decode: shape mismatch");
+    if (snapshots.has_value() && S > 1) {
+        auto& sn = *snapshots;
+        if (sn.shape(0) < S - 1 || sn.shape(1) != B || sn.shape(2) != H || sn.shape(3) != DK || sn.shape(4) != DV)
+            throw std::runtime_error("gated_delta_decode: snapshot shape mismatch");
+        if (sn.stride(4) != 1 || sn.stride(3) != DV || sn.stride(2) != DK * DV || sn.stride(1) != H * DK * DV)
+            throw std::runtime_error("gated_delta_decode: snapshots must be contiguous");
+    }
+    auto check_contig4 = [](auto& t, const char* name) {
+        if (t.stride(3) != 1 || t.stride(2) != t.shape(3) || t.stride(1) != t.shape(2) * t.shape(3)
+            || t.stride(0) != t.shape(1) * t.shape(2) * t.shape(3))
+            throw std::runtime_error(std::string("gated_delta_decode: ") + name + " must be contiguous");
+    };
+    check_contig4(q, "q");
+    check_contig4(k, "k");
+    check_contig4(v, "v");
+    check_contig4(state, "state");
+    check_contig4(out, "out");
+    if (beta.stride(2) != 1 || g.stride(2) != 1)
+        throw std::runtime_error("gated_delta_decode: beta/g must be contiguous");
+    return launch_gated_delta_decode(
+        q.data(), k.data(), v.data(), beta.data(), g.data(), state.data(), out.data(),
+        (snapshots.has_value() && S > 1) ? snapshots->data() : nullptr,
+        B, H, S, DK, DV, reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
 NB_MODULE(_C, m) {
     m.doc() = "comfy_kitchen CUDA kernels - nanobind + DLPack interface (NO PyTorch C++ dependencies)";
     
@@ -3889,6 +4023,14 @@ NB_MODULE(_C, m) {
           nb::arg("s_rel"), nb::arg("codebook").none(), nb::arg("s_channel"),
           nb::arg("bias").none(), nb::arg("workspace"), nb::arg("out"),
           nb::arg("convrot_group_size"), nb::arg("g"), nb::arg("chunk_cols"),
+          nb::arg("out_dtype_code"), nb::arg("stream_ptr"));
+
+    m.def("w4a8_codebook_gemv", &w4a8_codebook_gemv,
+          "Fused W4A8 decode GEMV (M<=4): in-register int4+codebook dequant, no workspace",
+          nb::arg("input"), nb::arg("xq"), nb::arg("xs"), nb::arg("weight"),
+          nb::arg("s_rel"), nb::arg("codebook").none(), nb::arg("s_channel"),
+          nb::arg("bias").none(), nb::arg("out"),
+          nb::arg("convrot_group_size"), nb::arg("g"),
           nb::arg("out_dtype_code"), nb::arg("stream_ptr"));
 
     m.def("quantize_int8_rowwise_convrot", &quantize_int8_rowwise_convrot,
@@ -4180,6 +4322,12 @@ NB_MODULE(_C, m) {
           nb::arg("kt"), nb::arg("kh"), nb::arg("kw"),
           nb::arg("causal_t"), nb::arg("causal_h"), nb::arg("causal_w"),
           nb::arg("scale"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
+
+    m.def("gated_delta_decode", &gated_delta_decode,
+          "Fused GatedDeltaNet decode chain for short sequences",
+          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("beta"), nb::arg("g"),
+          nb::arg("state"), nb::arg("out"), nb::arg("snapshots") = nb::none(),
+          nb::arg("stream_ptr"));
 
     m.def("sol_attn_plan", &sol_attn_plan_py,
           "Workspace dims, slot byte offsets and total bytes for this shape and token budget",

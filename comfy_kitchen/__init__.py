@@ -17,6 +17,8 @@ from .exceptions import (
 )
 from .flash_attention import flash_attention_decode
 from .flash_attention import is_available as flash_attention_decode_is_available
+from .gated_delta import gated_delta_decode
+from .gated_delta import is_available as gated_delta_decode_is_available
 from .float_utils import from_blocked, swap_nibbles, to_blocked
 from .registry import registry
 from .sage_attention import (
@@ -64,6 +66,8 @@ __all__ = [
     "int8_attention_is_available",
     "prequantize_int8_attention",
     "flash_attention_decode",
+    "gated_delta_decode",
+    "gated_delta_decode_is_available",
     "flash_attention_decode_is_available",
     "na2d",
     "na3d",
