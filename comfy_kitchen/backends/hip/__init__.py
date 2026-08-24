@@ -1240,7 +1240,7 @@ def gemv_awq_w4a16(
         bias = _bias_operand(bias, n, x.device)
 
     out_dtype = wscales.dtype
-    if m > _AWQ_W4A16_MMA_M_LIMIT:
+    if m > _AWQ_W4A16_MMA_M_LIMIT and x2d.dtype == wscales.dtype:
         out = _awq_w4a16_dequant_then_matmul(x2d, qw, wscales, wzeros, group_size)
         if bias is not None:
             out.add_(bias)
