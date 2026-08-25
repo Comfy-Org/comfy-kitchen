@@ -31,6 +31,7 @@ __global__ __launch_bounds__(128) void gemm_awq_w4a16_kernel(
     constexpr int BM = 16;
     constexpr int BN = 128;
     constexpr int BK = kAwqGroupSize;
+    // Pad each LDS row by eight elements (16 bytes).
     constexpr int kStride = BK + 8;
     constexpr int kNTiles = 2;
 

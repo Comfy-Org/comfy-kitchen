@@ -1179,8 +1179,9 @@ def convrot_w4a4_linear(
 # AWQ W4A16 and SVDQuant W4A4
 # ---------------------------------------------------------------------------
 
-# Above this limit, materialize the weight and use the tuned PyTorch matmul.
-_AWQ_W4A16_MMA_M_LIMIT = 2048
+# Benchmarks on gfx1151 and gfx1200 place the BF16 crossover between M=1536
+# and M=2048. Above this limit, materialize the weight and use PyTorch matmul.
+_AWQ_W4A16_MMA_M_LIMIT = 1536
 
 
 def _awq_w4a16_dequant_then_matmul(
@@ -1204,7 +1205,7 @@ def _awq_w4a16_dequant_then_matmul(
         * wscales.t().unsqueeze(-1)
         + wzeros.t().unsqueeze(-1)
     ).view(n, k)
-    return x.to(compute_dtype).matmul(weight.t())
+    return x.matmul(weight.t())
 
 
 def gemv_awq_w4a16(
@@ -1234,13 +1235,15 @@ def gemv_awq_w4a16(
     wscales = _operand(wscales, x.device, "wscales", shape=(k // group_size, n))
     if wscales.dtype not in _EPILOGUE_DTYPES:
         raise ValueError(f"wscales dtype {wscales.dtype} is not supported")
+    # Match the eager and CUDA compute dtype before selecting an execution path.
+    x2d = x2d.to(wscales.dtype)
     wzeros = _operand(wzeros, x.device, "wzeros", shape=(k // group_size, n)).to(wscales.dtype)
     qw = _operand(qweight, x.device, "qweight", shape=(n, k // 2))
     if bias is not None:
         bias = _bias_operand(bias, n, x.device)
 
     out_dtype = wscales.dtype
-    if m > _AWQ_W4A16_MMA_M_LIMIT and x2d.dtype == wscales.dtype:
+    if m > _AWQ_W4A16_MMA_M_LIMIT:
         out = _awq_w4a16_dequant_then_matmul(x2d, qw, wscales, wzeros, group_size)
         if bias is not None:
             out.add_(bias)
