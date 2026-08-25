@@ -1917,7 +1917,7 @@ void bf16_sdpa_hip(
     const int kv_len = static_cast<int>(k.shape(2));
     if (batch <= 0 || q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0 ||
         q_len <= 0 || kv_len <= 0 ||
-        (head_dim != 64 && head_dim != 80 && head_dim != 128) ||
+        (head_dim != 128) ||
         k.shape(0) != q.shape(0) || k.shape(3) != q.shape(3) ||
         v.shape(0) != q.shape(0) || v.shape(1) != k.shape(1) ||
         v.shape(2) != k.shape(2) || v.shape(3) != q.shape(3) ||

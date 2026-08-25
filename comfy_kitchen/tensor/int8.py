@@ -225,7 +225,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
             return 0
         tile_k = (
             128
-            if (n, k) in ((3840, 3840), (3840, 10240)) or n < k < 4 * n
+            if (n, k) == (3840, 3840) or n < k < 4 * n
             else 64
         )
         cls.pack_wmma_weight_(qtensor, tile_k=tile_k, tile_n=128)

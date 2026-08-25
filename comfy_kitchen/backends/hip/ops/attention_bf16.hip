@@ -67,7 +67,7 @@ __forceinline__ __device__ void store_bf16_acc(
 }
 
 template <int HD, int BLOCK_M, int BLOCK_N, bool DIRECT_GLOBAL, bool NO_KV_TAIL = false,
-          bool GLOBAL_TRANSPOSE_V = false, int SCORE_SPLITS = 1>
+          bool GLOBAL_TRANSPOSE_V = false>
 __global__ __launch_bounds__(BLOCK_M * 2)
 void bf16_attention_kernel(
     const __bf16* __restrict__ q, const __bf16* __restrict__ k,
@@ -82,7 +82,6 @@ void bf16_attention_kernel(
     using Shape = Bf16AttentionShape<HD, BLOCK_M, BLOCK_N>;
     constexpr int DT = Shape::kDimTiles;
     constexpr int KT = Shape::kKeyTiles;
-    static_assert(DT % SCORE_SPLITS == 0);
 
     __shared__ __align__(16) __bf16 staged_k[
         DIRECT_GLOBAL ? 1 : 2 * BLOCK_N * Shape::kKStride];
@@ -228,13 +227,10 @@ void bf16_attention_kernel(
         const __bf16* const current_v = staged_v +
             (tile & 1) * HD * Shape::kVStride;
 
-        MmaBf16::Acc score_split[KT][SCORE_SPLITS];
+        MmaBf16::Acc score[KT];
 #pragma unroll
         for (int kt = 0; kt < KT; ++kt) {
-#pragma unroll
-            for (int split = 0; split < SCORE_SPLITS; ++split) {
-                score_split[kt][split] = MmaBf16::zero();
-            }
+            score[kt] = MmaBf16::zero();
         }
 #pragma unroll
         for (int dt = 0; dt < DT; ++dt) {
@@ -253,21 +249,7 @@ void bf16_attention_kernel(
                         current_k + (kt * 16 + frag_row(lane)) * Shape::kKStride + dt * 16,
                         lane);
                 }
-                score_split[kt][dt % SCORE_SPLITS] = MmaBf16::mma(
-                    k_fragment, q_fragment[dt], score_split[kt][dt % SCORE_SPLITS]);
-            }
-        }
-
-        MmaBf16::Acc score[KT];
-#pragma unroll
-        for (int kt = 0; kt < KT; ++kt) {
-            score[kt] = score_split[kt][0];
-#pragma unroll
-            for (int split = 1; split < SCORE_SPLITS; ++split) {
-#pragma unroll
-                for (int e = 0; e < 8; ++e) {
-                    score[kt][e] += score_split[kt][split][e];
-                }
+                score[kt] = MmaBf16::mma(k_fragment, q_fragment[dt], score[kt]);
             }
         }
 
@@ -416,7 +398,7 @@ void bf16_attention_kernel(
 }
 
 template <int HD, int BLOCK_M, int BLOCK_N, bool DIRECT_GLOBAL, bool NO_KV_TAIL = false,
-          bool GLOBAL_TRANSPOSE_V = false, int SCORE_SPLITS = 1>
+          bool GLOBAL_TRANSPOSE_V = false>
 void launch_bf16_attention_shape(
     const void* q, const void* k, const void* v, void* output,
     int batch, int q_heads, int kv_heads, int q_len, int kv_len,
@@ -427,7 +409,7 @@ void launch_bf16_attention_shape(
     float sm_scale, hipStream_t stream) {
     const dim3 grid((q_len + BLOCK_M - 1) / BLOCK_M, q_heads, batch);
     bf16_attention_kernel<HD, BLOCK_M, BLOCK_N, DIRECT_GLOBAL, NO_KV_TAIL,
-                          GLOBAL_TRANSPOSE_V, SCORE_SPLITS>
+                          GLOBAL_TRANSPOSE_V>
         <<<grid, Bf16AttentionShape<HD, BLOCK_M, BLOCK_N>::kThreads, 0, stream>>>(
             static_cast<const __bf16*>(q), static_cast<const __bf16*>(k),
             static_cast<const __bf16*>(v), static_cast<__bf16*>(output),
@@ -459,7 +441,7 @@ void dispatch_bf16_attention(
             q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h,
             k_stride_n, v_stride_b, v_stride_h, v_stride_n, o_stride_b,
             o_stride_h, o_stride_n, sm_scale, stream);
-    } else if constexpr (HD == 128) {
+    } else {
         if (kv_len % 48 == 0) {
             launch_bf16_attention_shape<HD, 192, 48, false, true, true>(
                 q, k, v, output, batch, q_heads, kv_heads, q_len, kv_len,
@@ -468,20 +450,6 @@ void dispatch_bf16_attention(
                 o_stride_h, o_stride_n, sm_scale, stream);
         } else {
             launch_bf16_attention_shape<HD, 192, 48, false, false, true>(
-                q, k, v, output, batch, q_heads, kv_heads, q_len, kv_len,
-                q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h,
-                k_stride_n, v_stride_b, v_stride_h, v_stride_n, o_stride_b,
-                o_stride_h, o_stride_n, sm_scale, stream);
-        }
-    } else {
-        if (kv_len % 32 == 0) {
-            launch_bf16_attention_shape<HD, 320, 32, false, true>(
-                q, k, v, output, batch, q_heads, kv_heads, q_len, kv_len,
-                q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h,
-                k_stride_n, v_stride_b, v_stride_h, v_stride_n, o_stride_b,
-                o_stride_h, o_stride_n, sm_scale, stream);
-        } else {
-            launch_bf16_attention_shape<HD, 320, 32, false>(
                 q, k, v, output, batch, q_heads, kv_heads, q_len, kv_len,
                 q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h,
                 k_stride_n, v_stride_b, v_stride_h, v_stride_n, o_stride_b,
@@ -515,12 +483,10 @@ extern "C" void launch_bf16_sdpa_hip(
         sm_scale, stream)
 
     switch (head_dim) {
-        case 64: COMFY_BF16_ATTN_CASE(64); break;
-        case 80: COMFY_BF16_ATTN_CASE(80); break;
         case 128: COMFY_BF16_ATTN_CASE(128); break;
         default:
             throw std::runtime_error(
-                "BF16 HIP attention supports head dimensions 64, 80, and 128, got " +
+                "BF16 HIP attention supports head dimension 128, got " +
                 std::to_string(head_dim));
     }
 #undef COMFY_BF16_ATTN_CASE
