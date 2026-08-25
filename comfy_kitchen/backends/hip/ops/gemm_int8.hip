@@ -118,10 +118,11 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
                              4, 2, 2, 4>
                 <<<grid, 256, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
         } else {
-            // gfx11 and other WMMA targets: occupancy-aware tile selection
-            // from upstream #122.
-            launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(
-                Au, Bu, C, M, N, K, ldc, epi, stream);
+            // Portable starting geometry for other WMMA targets.
+            constexpr int BM = 128, BN = 128, BKB = 128;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<MmaInt8, EpiRowwise, OutT, BM, BN, BKB, 4, 2, 2, 4>
+                <<<grid, 256, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
         }
     } else {
         constexpr int BM = 64, BN = 64, BKB = 64;
