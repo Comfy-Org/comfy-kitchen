@@ -168,7 +168,10 @@ class TensorWiseINT8Layout(QuantizedLayout):
                 ready = torch.cuda.Event()
                 ready.record(torch.cuda.current_stream(packed.device))
                 ready.synchronize()
-            qtensor._qdata = packed
+            if qtensor._qdata.untyped_storage().resizable():
+                qtensor._qdata = packed
+            else:
+                qtensor._qdata.copy_(packed)
             qtensor._params = dataclasses.replace(
                 params, wmma_tile_n=tile_n, wmma_tile_k=tile_k
             )
@@ -213,14 +216,18 @@ class TensorWiseINT8Layout(QuantizedLayout):
         n, k = params.orig_shape
         if input_tensor.shape[-1] != k:
             return 0
-        # Tiled-A down (Lumina/Z-Image SwiGLU w2: 10240 -> 3840) consumes
-        # row-major B. Packing this weight as tiled-B makes HIP reject the call.
-        if n == 3840 and k == 10240:
+        # These projection families use row-major kernels. Packing either weight
+        # as tiled-B selects an incompatible HIP path.
+        if (n, k) in ((3840, 10240), (10240, 3840)):
             return 0
         m = input_tensor.numel() // k
         if m < 512 or n % 128 or k % 256:
             return 0
-        tile_k = 128 if n < k < 4 * n else 64
+        tile_k = (
+            128
+            if (n, k) in ((3840, 3840), (3840, 10240)) or n < k < 4 * n
+            else 64
+        )
         cls.pack_wmma_weight_(qtensor, tile_k=tile_k, tile_n=128)
         return tile_k
 
@@ -247,7 +254,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
         m = input_tensor.numel() // input_tensor.shape[-1]
         return (
             input_tensor.shape[-1] == k
-            and not (n == 3840 and k == 10240)
+            and (n, k) not in ((3840, 10240), (10240, 3840))
             and m >= 96
             and n % tile_n == 0
             and k % tile_k == 0
