@@ -33,8 +33,8 @@ struct Bf16AttentionShape {
     static constexpr int kThreads = kWaves * 32;
     static constexpr int kDimTiles = HD / 16;
     static constexpr int kKeyTiles = BLOCK_N / 16;
-    static constexpr int kKStride = HD + 8;
-    static constexpr int kVStride = BLOCK_N + 8;
+    static constexpr int kKStride = HD + 4;
+    static constexpr int kVStride = BLOCK_N + 4;
 };
 
 template <typename T>
@@ -66,7 +66,8 @@ __forceinline__ __device__ void store_bf16_acc(
 #endif
 }
 
-template <int HD, int BLOCK_M, int BLOCK_N, bool DIRECT_GLOBAL>
+template <int HD, int BLOCK_M, int BLOCK_N, bool DIRECT_GLOBAL, bool NO_KV_TAIL = false,
+          bool GLOBAL_TRANSPOSE_V = false, int SCORE_SPLITS = 1>
 __global__ __launch_bounds__(BLOCK_M * 2)
 void bf16_attention_kernel(
     const __bf16* __restrict__ q, const __bf16* __restrict__ k,
@@ -81,11 +82,12 @@ void bf16_attention_kernel(
     using Shape = Bf16AttentionShape<HD, BLOCK_M, BLOCK_N>;
     constexpr int DT = Shape::kDimTiles;
     constexpr int KT = Shape::kKeyTiles;
+    static_assert(DT % SCORE_SPLITS == 0);
 
     __shared__ __align__(16) __bf16 staged_k[
-        DIRECT_GLOBAL ? 1 : BLOCK_N * Shape::kKStride];
+        DIRECT_GLOBAL ? 1 : 2 * BLOCK_N * Shape::kKStride];
     __shared__ __align__(16) __bf16 staged_v[
-        DIRECT_GLOBAL ? 1 : HD * Shape::kVStride];
+        DIRECT_GLOBAL || GLOBAL_TRANSPOSE_V ? 1 : 2 * HD * Shape::kVStride];
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -126,31 +128,114 @@ void bf16_attention_kernel(
     float row_max = -FLT_MAX;
     float row_sum = 1.0f;
     const float score_scale = sm_scale * kAttentionLog2e;
-    const int key_tiles = (kv_len + BLOCK_N - 1) / BLOCK_N;
+    const int key_tiles = NO_KV_TAIL
+        ? kv_len / BLOCK_N
+        : (kv_len + BLOCK_N - 1) / BLOCK_N;
+
+    constexpr int kPackElems = 8;
+    constexpr int kPacksPerRow = HD / kPackElems;
+    constexpr int kPacksPerTile = BLOCK_N * kPacksPerRow;
+    constexpr int kKStageItems = GLOBAL_TRANSPOSE_V
+        ? (kPacksPerTile + Shape::kThreads - 1) / Shape::kThreads
+        : 1;
+    static_assert(DIRECT_GLOBAL || GLOBAL_TRANSPOSE_V ||
+                  kPacksPerTile <= Shape::kThreads);
+    const int pack = tid;
+    const int key_in_tile = pack / kPacksPerRow;
+    const int pack_d =
+        (pack - key_in_tile * kPacksPerRow) * kPackElems;
+    if constexpr (!DIRECT_GLOBAL) {
+        if constexpr (GLOBAL_TRANSPOSE_V) {
+#pragma unroll
+            for (int item = 0; item < kKStageItems; ++item) {
+                const int item_pack = tid + item * Shape::kThreads;
+                if (item_pack >= kPacksPerTile) continue;
+                const int item_key = item_pack / kPacksPerRow;
+                const int item_d =
+                    (item_pack - item_key * kPacksPerRow) * kPackElems;
+                v8bf k_value{};
+                if constexpr (NO_KV_TAIL) {
+                    k_value = *reinterpret_cast<const v8bf*>(
+                        k_head + static_cast<int64_t>(item_key) * k_stride_n + item_d);
+                } else if (item_key < kv_len) {
+                    k_value = *reinterpret_cast<const v8bf*>(
+                        k_head + static_cast<int64_t>(item_key) * k_stride_n + item_d);
+                }
+                *reinterpret_cast<v8bf*>(
+                    staged_k + item_key * Shape::kKStride + item_d) = k_value;
+            }
+        } else if (pack < kPacksPerTile) {
+            v8bf k_value{};
+            v8bf v_value{};
+            if constexpr (NO_KV_TAIL) {
+                k_value = *reinterpret_cast<const v8bf*>(
+                    k_head + static_cast<int64_t>(key_in_tile) * k_stride_n + pack_d);
+                v_value = *reinterpret_cast<const v8bf*>(
+                    v_head + static_cast<int64_t>(key_in_tile) * v_stride_n + pack_d);
+            } else if (key_in_tile < kv_len) {
+                k_value = *reinterpret_cast<const v8bf*>(
+                    k_head + static_cast<int64_t>(key_in_tile) * k_stride_n + pack_d);
+                v_value = *reinterpret_cast<const v8bf*>(
+                    v_head + static_cast<int64_t>(key_in_tile) * v_stride_n + pack_d);
+            }
+            *reinterpret_cast<v8bf*>(
+                staged_k + key_in_tile * Shape::kKStride + pack_d) = k_value;
+#pragma unroll
+            for (int e = 0; e < kPackElems; ++e) {
+                staged_v[(pack_d + e) * Shape::kVStride + key_in_tile] = v_value[e];
+            }
+        }
+        __syncthreads();
+    }
 
     for (int tile = 0; tile < key_tiles; ++tile) {
         const int key0 = tile * BLOCK_N;
+        const bool has_next_tile = tile + 1 < key_tiles;
+        const int next_key_index = key0 + BLOCK_N + key_in_tile;
+        const int next_buffer = (tile + 1) & 1;
+        v8bf next_k[kKStageItems]{};
         if constexpr (!DIRECT_GLOBAL) {
-            if (tile != 0) __syncthreads();
-            for (int index = tid; index < BLOCK_N * HD; index += Shape::kThreads) {
-                const int key_in_tile = index / HD;
-                const int d = index - key_in_tile * HD;
-                const int key_index = key0 + key_in_tile;
-                __bf16 k_value = static_cast<__bf16>(0.0f);
-                __bf16 v_value = static_cast<__bf16>(0.0f);
-                if (key_index < kv_len) {
-                    k_value = k_head[static_cast<int64_t>(key_index) * k_stride_n + d];
-                    v_value = v_head[static_cast<int64_t>(key_index) * v_stride_n + d];
+            if constexpr (GLOBAL_TRANSPOSE_V) {
+#pragma unroll
+                for (int item = 0; item < kKStageItems; ++item) {
+                    const int item_pack = tid + item * Shape::kThreads;
+                    if (!has_next_tile || item_pack >= kPacksPerTile) continue;
+                    const int item_key = item_pack / kPacksPerRow;
+                    const int item_d =
+                        (item_pack - item_key * kPacksPerRow) * kPackElems;
+                    const int next_key = key0 + BLOCK_N + item_key;
+                    if constexpr (NO_KV_TAIL) {
+                        next_k[item] = *reinterpret_cast<const v8bf*>(
+                            k_head + static_cast<int64_t>(next_key) * k_stride_n + item_d);
+                    } else if (next_key < kv_len) {
+                        next_k[item] = *reinterpret_cast<const v8bf*>(
+                            k_head + static_cast<int64_t>(next_key) * k_stride_n + item_d);
+                    }
                 }
-                staged_k[key_in_tile * Shape::kKStride + d] = k_value;
-                staged_v[d * Shape::kVStride + key_in_tile] = v_value;
+            } else if (has_next_tile && pack < kPacksPerTile) {
+                if constexpr (NO_KV_TAIL) {
+                    next_k[0] = *reinterpret_cast<const v8bf*>(
+                        k_head + static_cast<int64_t>(next_key_index) * k_stride_n + pack_d);
+                } else if (next_key_index < kv_len) {
+                    next_k[0] = *reinterpret_cast<const v8bf*>(
+                        k_head + static_cast<int64_t>(next_key_index) * k_stride_n + pack_d);
+                }
             }
-            __syncthreads();
         }
 
-        MmaBf16::Acc score[KT];
+        const __bf16* const current_k = staged_k +
+            (tile & 1) * BLOCK_N * Shape::kKStride;
+        const __bf16* const current_v = staged_v +
+            (tile & 1) * HD * Shape::kVStride;
+
+        MmaBf16::Acc score_split[KT][SCORE_SPLITS];
 #pragma unroll
-        for (int kt = 0; kt < KT; ++kt) score[kt] = MmaBf16::zero();
+        for (int kt = 0; kt < KT; ++kt) {
+#pragma unroll
+            for (int split = 0; split < SCORE_SPLITS; ++split) {
+                score_split[kt][split] = MmaBf16::zero();
+            }
+        }
 #pragma unroll
         for (int dt = 0; dt < DT; ++dt) {
 #pragma unroll
@@ -165,10 +250,57 @@ void bf16_attention_kernel(
                     }
                 } else {
                     k_fragment = load_frag_16bit<MmaBf16>(
-                        staged_k + (kt * 16 + frag_row(lane)) * Shape::kKStride + dt * 16,
+                        current_k + (kt * 16 + frag_row(lane)) * Shape::kKStride + dt * 16,
                         lane);
                 }
-                score[kt] = MmaBf16::mma(k_fragment, q_fragment[dt], score[kt]);
+                score_split[kt][dt % SCORE_SPLITS] = MmaBf16::mma(
+                    k_fragment, q_fragment[dt], score_split[kt][dt % SCORE_SPLITS]);
+            }
+        }
+
+        MmaBf16::Acc score[KT];
+#pragma unroll
+        for (int kt = 0; kt < KT; ++kt) {
+            score[kt] = score_split[kt][0];
+#pragma unroll
+            for (int split = 1; split < SCORE_SPLITS; ++split) {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    score[kt][e] += score_split[kt][split][e];
+                }
+            }
+        }
+
+        if constexpr (!DIRECT_GLOBAL) {
+            if constexpr (GLOBAL_TRANSPOSE_V) {
+#pragma unroll
+                for (int item = 0; item < kKStageItems; ++item) {
+                    const int item_pack = tid + item * Shape::kThreads;
+                    if (!has_next_tile || item_pack >= kPacksPerTile) continue;
+                    const int item_key = item_pack / kPacksPerRow;
+                    const int item_d =
+                        (item_pack - item_key * kPacksPerRow) * kPackElems;
+                    *reinterpret_cast<v8bf*>(
+                        staged_k + next_buffer * BLOCK_N * Shape::kKStride +
+                        item_key * Shape::kKStride + item_d) = next_k[item];
+                }
+            } else if (has_next_tile && pack < kPacksPerTile) {
+                *reinterpret_cast<v8bf*>(
+                    staged_k + next_buffer * BLOCK_N * Shape::kKStride +
+                    key_in_tile * Shape::kKStride + pack_d) = next_k[0];
+            }
+        }
+
+        v8bf next_v{};
+        if constexpr (!DIRECT_GLOBAL && !GLOBAL_TRANSPOSE_V) {
+            if (has_next_tile && pack < kPacksPerTile) {
+                if constexpr (NO_KV_TAIL) {
+                    next_v = *reinterpret_cast<const v8bf*>(
+                        v_head + static_cast<int64_t>(next_key_index) * v_stride_n + pack_d);
+                } else if (next_key_index < kv_len) {
+                    next_v = *reinterpret_cast<const v8bf*>(
+                        v_head + static_cast<int64_t>(next_key_index) * v_stride_n + pack_d);
+                }
             }
         }
 
@@ -179,7 +311,9 @@ void bf16_attention_kernel(
             for (int e = 0; e < 8; ++e) {
                 float value = score[kt][e] * score_scale;
                 const int key_index = key0 + kt * 16 + acc_row(lane, e);
-                if (key_index >= kv_len) value = -FLT_MAX;
+                if constexpr (!NO_KV_TAIL) {
+                    if (key_index >= kv_len) value = -FLT_MAX;
+                }
                 score[kt][e] = value;
                 local_max = fmaxf(local_max, value);
             }
@@ -195,26 +329,52 @@ void bf16_attention_kernel(
             for (int e = 0; e < 8; ++e) output_acc[dt][e] *= alpha;
         }
 
-        MmaBf16::Frag probability[KT];
+        if constexpr (!DIRECT_GLOBAL && !GLOBAL_TRANSPOSE_V) {
+            if (has_next_tile && pack < kPacksPerTile) {
+#pragma unroll
+                for (int e = 0; e < kPackElems; ++e) {
+                    staged_v[next_buffer * HD * Shape::kVStride +
+                             (pack_d + e) * Shape::kVStride + key_in_tile] = next_v[e];
+                }
+            }
+        }
+
         float tile_sum = 0.0f;
 #pragma unroll
         for (int kt = 0; kt < KT; ++kt) {
+            MmaBf16::Frag probability;
             v8f p;
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
                 p[e] = __builtin_amdgcn_exp2f(score[kt][e] - next_max);
-                probability[kt][e] = static_cast<__bf16>(p[e]);
+                probability[e] = static_cast<__bf16>(p[e]);
             }
             tile_sum += sum8_balanced(p);
-        }
-        row_sum += tile_sum;
-
 #pragma unroll
-        for (int dt = 0; dt < DT; ++dt) {
-#pragma unroll
-            for (int kt = 0; kt < KT; ++kt) {
+            for (int dt = 0; dt < DT; ++dt) {
                 MmaBf16::Frag v_fragment{};
-                if constexpr (DIRECT_GLOBAL) {
+                if constexpr (GLOBAL_TRANSPOSE_V) {
+                    const int tile_key = key0 + kt * 16;
+                    if (tile_key + 16 <= kv_len) {
+                        const int source_key = ((lane >> 4) << 3) + (lane & 7);
+                        const int source_half = (lane >> 3) & 1;
+                        const v8bf* const source = reinterpret_cast<const v8bf*>(
+                            v_head + static_cast<int64_t>(tile_key + source_key) * v_stride_n +
+                            dt * 16 + source_half * 8);
+                        v_fragment = __builtin_amdgcn_global_load_tr_b128_v8bf16(
+                            const_cast<v8bf*>(source));
+                    } else if (tile_key < kv_len) {
+                        const int d = dt * 16 + frag_row(lane);
+#pragma unroll
+                        for (int i = 0; i < MmaBf16::kFragElems; ++i) {
+                            const int key_index = tile_key + MmaBf16::frag_base(lane) + i;
+                            if (key_index < kv_len) {
+                                v_fragment[i] = v_head[
+                                    static_cast<int64_t>(key_index) * v_stride_n + d];
+                            }
+                        }
+                    }
+                } else if constexpr (DIRECT_GLOBAL) {
                     const int d = dt * 16 + frag_row(lane);
 #pragma unroll
                     for (int i = 0; i < MmaBf16::kFragElems; ++i) {
@@ -227,12 +387,17 @@ void bf16_attention_kernel(
                     }
                 } else {
                     v_fragment = load_frag_16bit<MmaBf16>(
-                        staged_v + (dt * 16 + frag_row(lane)) * Shape::kVStride + kt * 16,
+                        current_v + (dt * 16 + frag_row(lane)) * Shape::kVStride + kt * 16,
                         lane);
                 }
                 output_acc[dt] = MmaBf16::mma(
-                    v_fragment, probability[kt], output_acc[dt]);
+                    v_fragment, probability, output_acc[dt]);
             }
+        }
+        row_sum += tile_sum;
+
+        if constexpr (!DIRECT_GLOBAL) {
+            if (has_next_tile) __syncthreads();
         }
     }
 
@@ -250,7 +415,8 @@ void bf16_attention_kernel(
     }
 }
 
-template <int HD, int BLOCK_M, int BLOCK_N, bool DIRECT_GLOBAL>
+template <int HD, int BLOCK_M, int BLOCK_N, bool DIRECT_GLOBAL, bool NO_KV_TAIL = false,
+          bool GLOBAL_TRANSPOSE_V = false, int SCORE_SPLITS = 1>
 void launch_bf16_attention_shape(
     const void* q, const void* k, const void* v, void* output,
     int batch, int q_heads, int kv_heads, int q_len, int kv_len,
@@ -260,7 +426,8 @@ void launch_bf16_attention_shape(
     int64_t o_stride_b, int64_t o_stride_h, int64_t o_stride_n,
     float sm_scale, hipStream_t stream) {
     const dim3 grid((q_len + BLOCK_M - 1) / BLOCK_M, q_heads, batch);
-    bf16_attention_kernel<HD, BLOCK_M, BLOCK_N, DIRECT_GLOBAL>
+    bf16_attention_kernel<HD, BLOCK_M, BLOCK_N, DIRECT_GLOBAL, NO_KV_TAIL,
+                          GLOBAL_TRANSPOSE_V, SCORE_SPLITS>
         <<<grid, Bf16AttentionShape<HD, BLOCK_M, BLOCK_N>::kThreads, 0, stream>>>(
             static_cast<const __bf16*>(q), static_cast<const __bf16*>(k),
             static_cast<const __bf16*>(v), static_cast<__bf16*>(output),
@@ -292,12 +459,34 @@ void dispatch_bf16_attention(
             q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h,
             k_stride_n, v_stride_b, v_stride_h, v_stride_n, o_stride_b,
             o_stride_h, o_stride_n, sm_scale, stream);
+    } else if constexpr (HD == 128) {
+        if (kv_len % 48 == 0) {
+            launch_bf16_attention_shape<HD, 192, 48, false, true, true>(
+                q, k, v, output, batch, q_heads, kv_heads, q_len, kv_len,
+                q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h,
+                k_stride_n, v_stride_b, v_stride_h, v_stride_n, o_stride_b,
+                o_stride_h, o_stride_n, sm_scale, stream);
+        } else {
+            launch_bf16_attention_shape<HD, 192, 48, false, false, true>(
+                q, k, v, output, batch, q_heads, kv_heads, q_len, kv_len,
+                q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h,
+                k_stride_n, v_stride_b, v_stride_h, v_stride_n, o_stride_b,
+                o_stride_h, o_stride_n, sm_scale, stream);
+        }
     } else {
-        launch_bf16_attention_shape<HD, 64, 32, false>(
-            q, k, v, output, batch, q_heads, kv_heads, q_len, kv_len,
-            q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h,
-            k_stride_n, v_stride_b, v_stride_h, v_stride_n, o_stride_b,
-            o_stride_h, o_stride_n, sm_scale, stream);
+        if (kv_len % 32 == 0) {
+            launch_bf16_attention_shape<HD, 320, 32, false, true>(
+                q, k, v, output, batch, q_heads, kv_heads, q_len, kv_len,
+                q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h,
+                k_stride_n, v_stride_b, v_stride_h, v_stride_n, o_stride_b,
+                o_stride_h, o_stride_n, sm_scale, stream);
+        } else {
+            launch_bf16_attention_shape<HD, 320, 32, false>(
+                q, k, v, output, batch, q_heads, kv_heads, q_len, kv_len,
+                q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h,
+                k_stride_n, v_stride_b, v_stride_h, v_stride_n, o_stride_b,
+                o_stride_h, o_stride_n, sm_scale, stream);
+        }
     }
 }
 

@@ -2472,13 +2472,6 @@ def hip_attention_is_supported(
 ) -> bool:
     if not _attention_inputs_are_supported(q, k, v):
         return False
-    if (
-        _has_nonduplicated_wmma(q.device)
-        and q.shape[0] == 1
-        and q.shape[2] >= 1024
-        and q.shape[3] == 128
-    ):
-        return False
     return q.dtype is torch.bfloat16
 
 
@@ -2538,7 +2531,11 @@ def hip_attention(
     """
     if q.dtype is not torch.bfloat16:
         raise RuntimeError("HIP native attention is BF16")
-    output = torch.empty_strided(q.shape, q.stride(), device=q.device, dtype=q.dtype)
+    output = torch.empty(
+        (q.shape[0], q.shape[2], q.shape[1], q.shape[3]),
+        device=q.device,
+        dtype=q.dtype,
+    ).movedim(1, 2)
     resolved_scale = float(scale if scale is not None else 1.0 / math.sqrt(q.shape[3]))
     _C.bf16_sdpa_hip(
         _dl(q), _dl(k), _dl(v), _dl(output), resolved_scale, _stream(q)
@@ -2551,30 +2548,15 @@ def _int8_attention_workspace(reference: torch.Tensor, q_len: int, kv_len: int):
     padded_q = -(-q_len // 128) * 128
     padded_k = -(-kv_len // 64) * 64
     tiles = padded_k // 64
-    specs = (
-        ((1, heads, q_len, 128), torch.int8, 1),
-        ((1, heads, padded_k, 128), torch.int8, 1),
-        ((1, heads, tiles, 128, 64), torch.int8, 1),
-        ((heads, padded_q), torch.float32, 4),
-        ((heads, padded_k // 16), torch.float32, 4),
-        ((heads, tiles, 128), torch.float32, 4),
-        ((1, heads), torch.int32, 4),
-    )
-    offsets = []
-    total_bytes = 0
-    for shape, _dtype, item_size in specs:
-        total_bytes = -(-total_bytes // item_size) * item_size
-        offsets.append(total_bytes)
-        total_bytes += math.prod(shape) * item_size
-
-    # A single short-lived allocation avoids seven allocator/VBAR interactions
-    # per attention call without retaining a private VRAM cache.
-    storage = torch.empty(total_bytes, dtype=torch.uint8, device=reference.device)
-    return tuple(
-        storage[offset : offset + math.prod(shape) * dtype_size]
-        .view(dtype)
-        .view(shape)
-        for (shape, dtype, dtype_size), offset in zip(specs, offsets)
+    tensor = functools.partial(torch.empty, device=reference.device)
+    return (
+        tensor((1, heads, q_len, 128), dtype=torch.int8),
+        tensor((1, heads, padded_k, 128), dtype=torch.int8),
+        tensor((1, heads, tiles, 128, 64), dtype=torch.int8),
+        tensor((heads, padded_q), dtype=torch.float32),
+        tensor((heads, padded_k // 16), dtype=torch.float32),
+        tensor((heads, tiles, 128), dtype=torch.float32),
+        tensor((1, heads), dtype=torch.int32),
     )
 
 

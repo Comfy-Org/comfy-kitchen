@@ -74,7 +74,20 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
     }
     const bool tuned = use_nonduplicated_int8_schedule();
     if (M >= 96 && N >= 96) {
-        if (tuned && M >= 512 && K == 3840 &&
+        if (tuned && M >= 512 && K == 3840 && N == 10240) {
+            constexpr int BM = 128, BN = 128, BKB = 64;
+            dim3 grid((N + BN - 1) / BN, (M + 2 * BM - 1) / (2 * BM));
+            if (epi.bias == nullptr && epi.scale_b_stride == 1) {
+                EpiRowwiseNoBias no_bias{epi.scale_a, epi.scale_b};
+                gemm_wmma_dual_m_kernel<MmaInt8, EpiRowwiseNoBias, OutT,
+                                        BM, BN, BKB, 4, 2, 2, 4, true>
+                    <<<grid, 512, 0, stream>>>(Au, Bu, C, M, N, K, ldc, no_bias);
+            } else {
+                gemm_wmma_dual_m_kernel<MmaInt8, EpiRowwise, OutT,
+                                        BM, BN, BKB, 4, 2, 2, 4, true>
+                    <<<grid, 512, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
+            }
+        } else if (tuned && M >= 512 && K == 3840 &&
             (N == 3840 || N == 11520)) {
             // Reuse each staged B tile across two adjacent M tiles for the
             // measured square and packed-QKV projection families.
@@ -92,12 +105,10 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
                     <<<grid, 512, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
             }
         } else if (tuned && M >= 512 && N >= 128 && K > N) {
-            // Deep-K projections benefit from a 256-row tile, a 128-byte K
-            // stage, and cooperative global-to-register-to-LDS staging.
-            constexpr int BM = 256, BN = 128, BKB = 128;
+            constexpr int BM = 128, BN = 128, BKB = 64;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
             gemm_wmma_kernel<MmaInt8, EpiRowwise, OutT, BM, BN, BKB,
-                             4, 2, 4, 4, true>
+                             4, 2, 2, 4, true>
                 <<<grid, 256, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
         } else if (tuned) {
             // Non-duplicated WMMA operands favor the lower-LDS stage.
@@ -290,7 +301,7 @@ static void launch_int8_pair(
     if (use_nonduplicated_int8_schedule() &&
         epi0.bias == nullptr && epi1.bias == nullptr &&
         epi0.scale_b_stride == 1 && epi1.scale_b_stride == 1) {
-        constexpr int BKB = 64;
+        constexpr int BKB = 128;
         EpiRowwiseNoBias no_bias0{epi0.scale_a, epi0.scale_b};
         EpiRowwiseNoBias no_bias1{epi1.scale_a, epi1.scale_b};
         gemm_wmma_pair_kernel<MmaInt8, EpiRowwiseNoBias, OutT,
@@ -298,7 +309,7 @@ static void launch_int8_pair(
             <<<grid, 512, 0, stream>>>(
                 A, B0, B1, C0, C1, M, N, K, ldc, no_bias0, no_bias1);
     } else {
-        constexpr int BKB = 64;
+        constexpr int BKB = 128;
         gemm_wmma_pair_kernel<MmaInt8, EpiRowwise, OutT,
                               BM, BN, BKB, 4, 2, 2, 4>
             <<<grid, 512, 0, stream>>>(
@@ -349,20 +360,20 @@ extern "C" void launch_int8_gemm_pair_kernel(
     }
 }
 
-template <typename OutT>
+template <typename OutT, typename Epi>
 static void launch_int8_tiled_a_down(
     const uint8_t* A, const uint8_t* B, OutT* C,
-    int M, int N, int K, int ldc, comfy::hip_backend::EpiRowwise epi,
+    int M, int N, int K, int ldc, Epi epi,
     bool tiled_b, hipStream_t stream) {
     using namespace comfy::hip_backend;
     constexpr int BM = 128, BN = 128, BKB = 128;
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
     if (tiled_b) {
-        gemm_wmma_kernel<MmaInt8, EpiRowwise, OutT, BM, BN, BKB,
-                         4, 2, 2, 4, true, true, false, false, true>
+        gemm_wmma_kernel<MmaInt8, Epi, OutT, BM, BN, BKB,
+                         4, 2, 2, 4, false, true, false, false, true>
             <<<grid, 256, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
     } else {
-        gemm_wmma_kernel<MmaInt8, EpiRowwise, OutT, BM, BN, BKB,
+        gemm_wmma_kernel<MmaInt8, Epi, OutT, BM, BN, BKB,
                          4, 2, 2, 4, true, true>
             <<<grid, 256, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
     }
@@ -387,8 +398,14 @@ extern "C" void launch_int8_gemm_a_tiled128_down_kernel(
     const uint8_t* A = static_cast<const uint8_t*>(a);
     const uint8_t* B = static_cast<const uint8_t*>(b);
     if (out_code == kBF16) {
-        launch_int8_tiled_a_down(
-            A, B, static_cast<__bf16*>(c), M, N, K, ldc, epi, false, stream);
+        if (epi.bias == nullptr && epi.scale_b_stride == 1) {
+            EpiRowwiseNoBias no_bias{epi.scale_a, epi.scale_b};
+            launch_int8_tiled_a_down(
+                A, B, static_cast<__bf16*>(c), M, N, K, ldc, no_bias, false, stream);
+        } else {
+            launch_int8_tiled_a_down(
+                A, B, static_cast<__bf16*>(c), M, N, K, ldc, epi, false, stream);
+        }
     } else if (out_code == kF16) {
         launch_int8_tiled_a_down(
             A, B, static_cast<__half*>(c), M, N, K, ldc, epi, false, stream);
@@ -420,8 +437,14 @@ extern "C" void launch_int8_gemm_a_tiled128_b_tiled128_down_kernel(
     const uint8_t* A = static_cast<const uint8_t*>(a);
     const uint8_t* B = static_cast<const uint8_t*>(b);
     if (out_code == kBF16) {
-        launch_int8_tiled_a_down(
-            A, B, static_cast<__bf16*>(c), M, N, K, ldc, epi, true, stream);
+        if (epi.bias == nullptr && epi.scale_b_stride == 1) {
+            EpiRowwiseNoBias no_bias{epi.scale_a, epi.scale_b};
+            launch_int8_tiled_a_down(
+                A, B, static_cast<__bf16*>(c), M, N, K, ldc, no_bias, true, stream);
+        } else {
+            launch_int8_tiled_a_down(
+                A, B, static_cast<__bf16*>(c), M, N, K, ldc, epi, true, stream);
+        }
     } else if (out_code == kF16) {
         launch_int8_tiled_a_down(
             A, B, static_cast<__half*>(c), M, N, K, ldc, epi, true, stream);

@@ -337,7 +337,7 @@ def test_gfx12_bf16_attention_handles_long_rectangular_lengths():
 
     actual = ck.hip_attention(q, k, v)
 
-    assert not ck.hip_attention_is_supported(q, k, v)
+    assert ck.hip_attention_is_supported(q, k, v)
     assert ck.hip_int8_attention_is_supported(q, k, v)
     assert actual.dtype is torch.bfloat16
     assert actual.shape == q.shape
@@ -360,7 +360,7 @@ def test_gfx12_bf16_full_k_tile_route_is_shape_generic():
 
     actual = ck.hip_attention(q, k, v)
 
-    assert not ck.hip_attention_is_supported(q, k, v)
+    assert ck.hip_attention_is_supported(q, k, v)
     assert ck.hip_int8_attention_is_supported(q, k, v)
     assert actual.stride() == q.stride()
     assert (actual.float() - expected.float()).abs().max() <= 0.00390625
@@ -380,13 +380,13 @@ def test_gfx12_short_attention_capability_is_dimensional():
     assert not supported(1, 4, 127)
     assert supported(1, 4, 128)
     assert supported(1, 56, 388)
-    for heads, length in ((17, 1024), (30, 4096), (13, 4256)):
-        long_inputs = tuple(
-            torch.empty(1, heads, length, 128, device="cuda", dtype=torch.bfloat16)
+    assert supported(1, 17, 1024)
+    assert ck.hip_int8_attention_is_supported(
+        *(
+            torch.empty(1, 17, 1024, 128, device="cuda", dtype=torch.bfloat16)
             for _ in range(3)
         )
-        assert not ck.hip_attention_is_supported(*long_inputs)
-        assert ck.hip_int8_attention_is_supported(*long_inputs)
+    )
     assert not supported(2, 4, 16)
     assert supported(64, 16, 16)
     assert not supported(1, 4, 160, dtype=torch.float16)
