@@ -175,6 +175,52 @@ def test_int8_linear_convrot_large_k_matches_eager(k):
     assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
 
 
+@needs_wmma
+def test_int8_linear_h3_swiglu_convrot_matches_eager(hip):
+    torch.manual_seed(0)
+    properties = torch.cuda.get_device_properties(DEV)
+    m, k = 512, 14336
+    n = ((properties.multi_processor_count + 1) // 2) * 128
+    blocks_256x128 = ((m + 255) // 256) * ((n + 127) // 128)
+    assert blocks_256x128 >= properties.multi_processor_count
+    assert blocks_256x128 % properties.multi_processor_count == 0
+    x = torch.randn(m, 2 * k, device=DEV, dtype=torch.bfloat16)
+    assert hip._convrot_supported(k, 256, x.device, x.dtype, int8_global_spill=True)
+    wq = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
+    ws = torch.rand(n, device=DEV, dtype=torch.float32) * 0.01 + 0.001
+
+    kwargs = {"convrot": True, "convrot_groupsize": 256, "input_act": "swiglu"}
+    with ck.use_backend("hip"):
+        out = ck.int8_linear(x, wq, ws, None, torch.bfloat16, **kwargs)
+    with ck.use_backend("eager"):
+        ref = ck.int8_linear(x, wq, ws, None, torch.bfloat16, **kwargs)
+
+    scale = ref.float().abs().max().item()
+    assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
+
+
+@needs_wmma
+def test_int8_linear_deep_k_tail_matches_eager():
+    torch.manual_seed(0)
+    properties = torch.cuda.get_device_properties(DEV)
+    m, k = 512, 14400
+    n = ((properties.multi_processor_count + 1) // 2) * 128
+    blocks_256x128 = ((m + 255) // 256) * ((n + 127) // 128)
+    assert blocks_256x128 >= properties.multi_processor_count
+    assert blocks_256x128 % properties.multi_processor_count == 0
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    wq = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
+    ws = torch.rand(n, device=DEV, dtype=torch.float32) * 0.01 + 0.001
+
+    with ck.use_backend("hip"):
+        out = ck.int8_linear(x, wq, ws, None, torch.bfloat16, convrot=False)
+    with ck.use_backend("eager"):
+        ref = ck.int8_linear(x, wq, ws, None, torch.bfloat16, convrot=False)
+
+    scale = ref.float().abs().max().item()
+    assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
+
+
 def _offset_copy(t: torch.Tensor) -> torch.Tensor:
     """A contiguous copy of ``t`` deliberately based off a 16-byte boundary."""
     flat = t.reshape(-1)

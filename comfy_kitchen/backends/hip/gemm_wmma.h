@@ -19,6 +19,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstring>
 
 #include "mma.h"
 
@@ -224,26 +225,55 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
 // Tile selection, shared by the fp8 and int8 launchers.
 // ---------------------------------------------------------------------------
 
+struct WmmaDeviceInfo {
+    int gfx_arch;
+    int wgps;
+};
+
 // hipDeviceAttributeMultiprocessorCount reports WGPs on RDNA, not CUs (32 on a
 // 64-CU gfx1201), and a workgroup schedules onto a WGP, so WGPs are the unit the
-// grid-coverage test needs. Cached per ordinal to keep the query off the launch
-// path; the fallback only mis-sizes that test, never a result.
-inline int device_wgp_count() {
+// grid-coverage test needs. Derive both values from the allocation device so a
+// launch cannot inspect a different process-current device. Cached per ordinal;
+// the fallback only affects tile selection, never a result.
+inline WmmaDeviceInfo wmma_device_info(const void* ptr) {
     constexpr int kMaxDevices = 16;
     // A GEMM can be launched from several host threads at once. Racing threads
     // write the same value and nothing is published through the cache, so relaxed.
-    static std::atomic<int> cache[kMaxDevices] = {};
-    int dev = 0;
-    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDevices) return 16;
-    int n = cache[dev].load(std::memory_order_relaxed);
-    if (n == 0) {
-        if (hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess ||
-            n <= 0) {
-            n = 16;
-        }
-        cache[dev].store(n, std::memory_order_relaxed);
+    static std::atomic<int> arch_cache[kMaxDevices] = {};
+    static std::atomic<int> wgp_cache[kMaxDevices] = {};
+    hipPointerAttribute_t attributes{};
+    if (hipPointerGetAttributes(&attributes, ptr) != hipSuccess ||
+        attributes.device < 0 || attributes.device >= kMaxDevices) {
+        return {-1, 16};
     }
-    return n;
+
+    const int dev = attributes.device;
+    int gfx_arch = arch_cache[dev].load(std::memory_order_relaxed);
+    int wgps = wgp_cache[dev].load(std::memory_order_relaxed);
+    if (gfx_arch == 0 || wgps == 0) {
+        hipDeviceProp_t props{};
+        gfx_arch = -1;
+        if (hipGetDeviceProperties(&props, dev) == hipSuccess) {
+            if (std::strncmp(props.gcnArchName, "gfx", 3) == 0) {
+                const char* digit = props.gcnArchName + 3;
+                int parsed = 0;
+                while (*digit >= '0' && *digit <= '9') {
+                    parsed = parsed * 10 + (*digit - '0');
+                    ++digit;
+                }
+                if (parsed > 0) gfx_arch = parsed;
+            }
+            if (props.multiProcessorCount > 0) {
+                wgps = props.multiProcessorCount;
+            }
+        }
+        if (wgps == 0) {
+            wgps = 16;
+        }
+        arch_cache[dev].store(gfx_arch, std::memory_order_relaxed);
+        wgp_cache[dev].store(wgps, std::memory_order_relaxed);
+    }
+    return {gfx_arch, wgps};
 }
 
 // Pick and launch a tile for C[M, N] = A[M, K] @ B[N, K]^T, selecting on grid
@@ -258,7 +288,7 @@ void launch_gemm_wmma(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N,
                       int ldc, Epi epi, hipStream_t stream) {
     const int blocks_128 = ((M + 127) / 128) * ((N + 127) / 128);
 
-    const int wgps = device_wgp_count();
+    const int wgps = wmma_device_info(A).wgps;
 
     // Zero padding the block count cannot see: at M <= 64 the 128-row tile is at
     // least half empty, and the finer 64x64 grid recovers the wasted MMAs.
