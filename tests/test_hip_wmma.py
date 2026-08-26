@@ -1560,15 +1560,16 @@ def test_gemv_awq_w4a16_scalar_fallback_matches_eager():
     m, n, k, g = 17, 129, 512, 32
     x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
     qw = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device=DEV).view(torch.int8)
-    ws = torch.randn(k // g, n, device=DEV, dtype=torch.float32).abs() * 0.01
-    wz = torch.randn(k // g, n, device=DEV, dtype=torch.float32) * 0.01
+    ws = torch.randn(k // g, n, device=DEV, dtype=torch.bfloat16).abs() * 0.01
+    wz = torch.randn(k // g, n, device=DEV, dtype=torch.bfloat16) * 0.01
 
     with ck.use_backend("hip"):
         out = ck.gemv_awq_w4a16(x, qw, ws, wz, group_size=g)
     with ck.use_backend("eager"):
         ref = ck.gemv_awq_w4a16(x, qw, ws, wz, group_size=g)
 
-    torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+    rel = (out.float() - ref.float()).norm() / ref.float().norm()
+    assert rel < 1e-2
 
 
 def test_gemv_awq_w4a16_misaligned_input_uses_scalar_path(hip, monkeypatch):
@@ -1634,11 +1635,13 @@ def test_gemv_awq_w4a16_aligned_input_uses_wmma(hip, monkeypatch):
         (torch.bfloat16, torch.float16),
     ],
 )
+@pytest.mark.parametrize("g", [32, 64, 128])
 def test_gemv_awq_w4a16_large_m_uses_torch_matmul(
-    hip, monkeypatch, x_dtype, scale_dtype
+    hip, monkeypatch, x_dtype, scale_dtype, g
 ):
     torch.manual_seed(0)
-    m, n, k, g = hip._AWQ_W4A16_MMA_M_LIMIT + 1, 17, 64, 64
+    m = hip._AWQ_W4A16_MMA_M_LIMITS[scale_dtype] + 1
+    n, k = 17, 128
     x = torch.randn(m, k, device=DEV, dtype=x_dtype)
     qw = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device=DEV).view(torch.int8)
     ws = torch.rand(k // g, n, device=DEV, dtype=scale_dtype) * 0.01
@@ -1653,7 +1656,14 @@ def test_gemv_awq_w4a16_large_m_uses_torch_matmul(
     with ck.use_backend("eager"):
         ref = ck.gemv_awq_w4a16(x, qw, ws, wz, bias, g)
 
-    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+def test_gemv_awq_w4a16_uses_dtype_specific_large_m_limits(hip):
+    assert (
+        hip._AWQ_W4A16_MMA_M_LIMITS[torch.bfloat16]
+        < hip._AWQ_W4A16_MMA_M_LIMITS[torch.float16]
+    )
 
 
 @pytest.mark.parametrize("act_unsigned", [False, True])
@@ -2048,6 +2058,8 @@ def test_gemv_awq_validates_its_memory_contract(hip):
         hip.gemv_awq_w4a16(x, qw, ws.reshape(-1), wz, None, g)
     with pytest.raises(ValueError, match="bias must be 1D"):
         hip.gemv_awq_w4a16(x, qw, ws, wz, torch.randn(8, device=DEV, dtype=torch.bfloat16), g)
+    with pytest.raises(ValueError, match="wscales dtype"):
+        hip.gemv_awq_w4a16(x, qw, ws.float(), wz.float(), None, g)
 
     assert hip.gemv_awq_w4a16(x, qw, ws, wz, None, g).shape == (1, n)
 
