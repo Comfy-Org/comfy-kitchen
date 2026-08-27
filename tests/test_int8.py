@@ -13,6 +13,7 @@ from .conftest import (
     assert_values_close,
     cuda_backend_available,
     get_capable_backends,
+    skip_unless_gfx12_wmma,
 )
 
 COMFYUI_NVIDIA_16_SERIES = (
@@ -367,6 +368,65 @@ class TestTensorWiseINT8Layout:
         assert set(sd.keys()) == {"", "_scale"}
         assert sd[""].dtype == torch.int8
         assert sd["_scale"].numel() == 1
+
+    @pytest.mark.parametrize("tile_k", [64, 128])
+    def test_wmma_weight_pack_is_lossless_and_serializes_row_major(
+        self, seed, tile_k
+    ):
+        """Runtime tiling must not leak into a checkpoint or dequantization."""
+        from comfy_kitchen.tensor import QuantizedTensor, TensorWiseINT8Layout
+
+        w = torch.randn(128, 1024, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(
+            w, "TensorWiseINT8Layout", per_channel=True
+        )
+        row_major = qt._qdata.clone()
+        dequantized = qt.dequantize()
+
+        TensorWiseINT8Layout.pack_wmma_weight_(qt, tile_k=tile_k)
+
+        assert qt._params.wmma_tile_n == 128
+        assert qt._params.wmma_tile_k == tile_k
+        assert torch.equal(qt.dequantize(), dequantized)
+        assert torch.equal(qt.state_dict()[""], row_major)
+
+    @pytest.mark.parametrize(
+        ("n", "k", "expected_tile_k"),
+        [(128, 1024, 64), (512, 1024, 128), (1024, 1024, 64), (11520, 3840, 0)],
+    )
+    def test_linear_lazily_uses_dimensional_tiled_weight_exactly(
+        self, seed, n, k, expected_tile_k
+    ):
+        """The ordinary TensorWise linear owns dimensional packing exactly."""
+        import comfy_kitchen as ck
+        from comfy_kitchen.tensor import QuantizedTensor, TensorWiseINT8Layout
+
+        skip_unless_gfx12_wmma()
+        x = torch.randn(512, k, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(
+            w, "TensorWiseINT8Layout", per_channel=True
+        )
+        row_major, scale = TensorWiseINT8Layout.get_plain_tensors(qt)
+
+        with torch.inference_mode():
+            reference = ck.int8_linear(
+                x, row_major.clone(), scale, out_dtype=x.dtype
+            )
+            candidate = torch.nn.functional.linear(x, qt)
+
+        assert qt._params.wmma_tile_k == expected_tile_k
+        assert torch.equal(candidate, reference)
+
+        # A later short call cannot use the tiled native contract. Its
+        # dequantized fallback remains correct rather than reading packed bytes
+        # as a row-major matrix.
+        if expected_tile_k:
+            short = x[:32]
+            with torch.inference_mode():
+                short_out = torch.nn.functional.linear(short, qt)
+                short_reference = torch.nn.functional.linear(short, qt.dequantize())
+            assert torch.equal(short_out, short_reference)
 
     def test_supports_fast_matmul(self):
         """supports_fast_matmul returns True on CUDA SM >= 7.5."""
@@ -869,6 +929,27 @@ class TestTensorWisePublicAPI:
 
         assert out.shape == (4, 64)
         assert out.dtype == torch.bfloat16
+
+    def test_public_api_int8_linear_gated_residual(self, seed, device):
+        """The portable API exposes the original linear/addcmul semantics."""
+        import comfy_kitchen as ck
+        from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
+
+        x = torch.randn(4, 128, device=device, dtype=torch.bfloat16)
+        w = torch.randn(64, 128, device=device, dtype=torch.bfloat16)
+        w_int8, w_scale = quantize_int8_tensorwise(w)
+        bias = torch.randn(64, device=device, dtype=torch.bfloat16)
+        residual = torch.randn(4, 64, device=device, dtype=torch.bfloat16)
+        gate = torch.randn(64, device=device, dtype=torch.bfloat16)
+
+        with ck.registry.use_backend("eager"):
+            projected = ck.int8_linear(x, w_int8, w_scale, bias)
+            reference = torch.addcmul(residual, gate, projected)
+            candidate = ck.int8_linear_gated_residual(
+                x, w_int8, w_scale, residual, gate, bias
+            )
+
+        assert torch.equal(candidate, reference)
 
     def test_eager_int8_linear_single_row(self, seed, device):
         """Eager int8_linear supports single-row batches."""

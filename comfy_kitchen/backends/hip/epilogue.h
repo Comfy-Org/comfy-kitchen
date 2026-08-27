@@ -67,4 +67,49 @@ struct EpiRowwise {
     }
 };
 
+// out = residual + gate[col] * bf16(linear)
+//
+// The explicit BF16 conversion is observable: ComfyUI materializes the INT8
+// linear output before torch.addcmul consumes it.  Keeping that rounding point
+// makes this a traffic/dispatch fusion rather than a numerical approximation.
+struct EpiRowwiseGatedResidual {
+    const float* scale_a;
+    const float* scale_b;
+    int scale_b_stride;
+    const void* bias;
+    int bias_code;
+    const __bf16* residual;
+    const __bf16* gate;
+    int residual_stride;
+
+    __forceinline__ __device__ void init() {}
+
+    __forceinline__ __device__ float operator()(int row, int col, float acc) const {
+        #pragma clang fp contract(off)
+        #pragma clang fp reassociate(off)
+        float linear = acc * scale_a[row];
+        linear *= scale_b[col * scale_b_stride];
+        if (bias) linear += load_scalar(bias, bias_code, col);
+        const __bf16 rounded = static_cast<__bf16>(linear);
+        return fmaf(
+            static_cast<float>(gate[col]), static_cast<float>(rounded),
+            static_cast<float>(residual[static_cast<int64_t>(row) * residual_stride + col]));
+    }
+};
+
+// Pair-only specialization for the bias-free ConvRot FeedForward projections.
+// Keeping the same left-to-right scale expression preserves EpiRowwise's BF16
+// result while removing the runtime bias pointer/dtype branches from every
+// unrolled output element.
+struct EpiRowwiseNoBias {
+    const float* scale_a;
+    const float* scale_b;
+
+    __forceinline__ __device__ void init() {}
+
+    __forceinline__ __device__ float operator()(int row, int col, float acc) const {
+        return acc * scale_a[row] * scale_b[col];
+    }
+};
+
 }  // namespace comfy::hip_backend

@@ -310,7 +310,11 @@ def get_cuda_path() -> tuple[pathlib.Path, pathlib.Path] | None:
 # Keep build-time, CMake, and runtime architecture policy in one package resource.
 # Exact membership is intentional: accepting an unreviewed gfx11xx/gfx12xx target
 # can compile the no-WMMA trap stubs into an otherwise successful wheel.
-HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12")
+HIP_ARCH_GROUP_NAMES = (
+    "elementwise_only",
+    "wmma_gfx11",
+    "wmma_gfx12",
+)
 HIP_ARCH_MANIFEST_PATH = (
     pathlib.Path(__file__).resolve().parent
     / "comfy_kitchen"
