@@ -512,6 +512,14 @@ void rms_gated_residual_bf16(
     require_len(residual, numel, kFn, "residual");
     require_len(gate, width, kFn, "gate");
     require_len(output, numel, kFn, "output");
+    const nb::ndarray<>* vector_operands[] = {
+        &activation, &norm_weight, &residual, &gate, &output};
+    for (const nb::ndarray<>* operand : vector_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
 
     launch_rms_gated_residual_bf16_kernel(
         activation.data(), norm_weight.data(), residual.data(), gate.data(),
@@ -1854,6 +1862,16 @@ void bf16_sdpa_hip(
     require_supported_layout(k, "k");
     require_supported_layout(v, "v");
     require_supported_layout(output, "output");
+    constexpr int kDeviceRocm = nb::device::rocm::value;
+    const nb::ndarray<>* operands[] = {&q, &k, &v, &output};
+    for (const nb::ndarray<>* operand : operands) {
+        if (operand->device_type() != kDeviceRocm ||
+            operand->device_id() != q.device_id()) {
+            throw std::runtime_error(
+                std::string(kFn) +
+                ": every operand must be ROCm device memory on q's device");
+        }
+    }
 
     launch_bf16_sdpa_hip(
         q.data(), k.data(), v.data(), output.data(), batch, q_heads, kv_heads,
@@ -1945,6 +1963,20 @@ void hip_int8_attention(
         anchor_indices.size() < static_cast<size_t>(heads)) {
         throw std::runtime_error(
             std::string(kFn) + ": anchor_indices must contain H int32s");
+    }
+    constexpr int kDeviceRocm = nb::device::rocm::value;
+    const nb::ndarray<>* operands[] = {
+        &q,         &k,          &v,          &output,
+        &q_int8,    &k_int8,     &v_int8,     &q_descale,
+        &k_descale, &v_descale,  &anchor_indices,
+    };
+    for (const nb::ndarray<>* operand : operands) {
+        if (operand->device_type() != kDeviceRocm ||
+            operand->device_id() != q.device_id()) {
+            throw std::runtime_error(
+                std::string(kFn) +
+                ": every operand must be ROCm device memory on q's device");
+        }
     }
 
     // Keeping all three producers and the consumer on this stream preserves

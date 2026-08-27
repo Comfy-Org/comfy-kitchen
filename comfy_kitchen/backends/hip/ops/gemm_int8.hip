@@ -3,6 +3,7 @@
 //
 // INT8 GEMM on WMMA (v_wmma_i32_16x16x16_iu8), gfx11 and gfx12. See mma.h.
 // C[M, N] = (A[M, K] @ B[N, K]^T) * scale_a[row] * scale_b[col] + bias
+#include <atomic>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -16,17 +17,24 @@ namespace comfy::hip_backend {
 inline bool use_nonduplicated_int8_schedule() {
     // The launch contract stays dimensional. Only the hardware choice is
     // architecture-specific, and it remains private to this translation unit.
-    static const bool selected = [] {
-        int device = 0;
+    constexpr int kMaxDevices = 16;
+    static std::atomic<int> cache[kMaxDevices] = {};
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) return false;
+
+    auto select = [device] {
         hipDeviceProp_t properties{};
-        if (hipGetDevice(&device) == hipSuccess &&
-            hipGetDeviceProperties(&properties, device) == hipSuccess &&
-            std::strncmp(properties.gcnArchName, "gfx12", 5) == 0) {
-            return true;
-        }
-        return false;
-    }();
-    return selected;
+        return hipGetDeviceProperties(&properties, device) == hipSuccess &&
+            std::strncmp(properties.gcnArchName, "gfx12", 5) == 0;
+    };
+    if (device < 0 || device >= kMaxDevices) return select();
+
+    int selected = cache[device].load(std::memory_order_relaxed);
+    if (selected == 0) {
+        selected = select() ? 2 : 1;
+        cache[device].store(selected, std::memory_order_relaxed);
+    }
+    return selected == 2;
 }
 
 // Small-M path: reduce K across the wave, one wave per output column.
@@ -83,12 +91,12 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
             if (epi.bias == nullptr && epi.scale_b_stride == 1) {
                 EpiRowwiseNoBias no_bias{epi.scale_a, epi.scale_b};
                 gemm_wmma_dual_m_kernel<MmaInt8, EpiRowwiseNoBias, OutT,
-                                        BM, BN, BKB, 4, 2, 2, 4, true>
+                                        BM, BN, BKB, 4, 2, 2, 4>
                     <<<grid, 512, 0, stream>>>(
                         Au, Bu, C, M, N, K, ldc, no_bias);
             } else {
                 gemm_wmma_dual_m_kernel<MmaInt8, EpiRowwise, OutT,
-                                        BM, BN, BKB, 4, 2, 2, 4, true>
+                                        BM, BN, BKB, 4, 2, 2, 4>
                     <<<grid, 512, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
             }
         } else if (tuned && M >= 512 && N >= 128 && K > N) {
@@ -254,6 +262,10 @@ extern "C" void launch_int8_gemm_b_tiled_gated_residual_kernel(
         throw std::runtime_error(
             "int8_gemm_b_tiled_gated_residual: requires M>=96, N divisible "
             "by 128, K divisible by tile_k, tile_k in {64,128}, and ldc>=N");
+    }
+    if (residual == nullptr || gate == nullptr) {
+        throw std::runtime_error(
+            "int8_gemm_b_tiled_gated_residual: residual and gate are required");
     }
     EpiRowwiseGatedResidual epi{
         static_cast<const float*>(scale_a), static_cast<const float*>(scale_b),

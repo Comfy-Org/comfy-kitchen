@@ -252,6 +252,15 @@ extern "C" void launch_gfx12_tile_channel_v_quant(
         throw std::runtime_error(
             "gfx12 tile-channel V quantization received an invalid tile count");
     }
+    const auto stride_ok = [](int64_t stride, int extent) {
+        return extent < 2 ||
+            (stride > 0 && (static_cast<size_t>(stride) * sizeof(__half)) % 16 == 0);
+    };
+    if (reinterpret_cast<uintptr_t>(v) % 16 != 0 ||
+        !stride_ok(stride_h, num_heads) || !stride_ok(stride_n, n_ctx)) {
+        throw std::runtime_error(
+            "gfx12 V base pointer and H/N strides must be 16-byte aligned");
+    }
     if (input_dtype_code == 1) {
         launch_gfx12_tile_channel_v_quant(
             static_cast<const __half*>(v), static_cast<int8_t*>(output),

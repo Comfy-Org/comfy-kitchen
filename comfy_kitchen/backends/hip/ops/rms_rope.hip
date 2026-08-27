@@ -245,6 +245,9 @@ __global__ __launch_bounds__(ROWS_PER_BLOCK * 32) void rms_rope_wave32_128_kerne
                              (fd1 == 1 ? 0 : d1) * sf_d1 +
                              (fd2 == 1 ? 0 : d2) * sf_d2;
 
+    if constexpr (STATIC_BF16_TYPES) {
+        if (split_half) __builtin_trap();
+    }
     const int n_pairs = rot_dim / 2;
     for (int p = lane; p < n_pairs; p += 32) {
         const int64_t ia = STATIC_BF16_TYPES ? 2 * p : (split_half ? p : 2 * p);

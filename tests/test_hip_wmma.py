@@ -224,6 +224,20 @@ def test_int8_linear_pair_reuses_exact_convrot_quantization():
 
 
 @needs_wmma
+def test_gfx12_swiglu_silu_exceptions_match_torch():
+    skip_unless_gfx12_wmma()
+
+    values = torch.tensor(
+        [5.9375, -87.5, -88.0, -88.5],
+        device=DEV,
+        dtype=torch.bfloat16,
+    )
+    result_bits = torch.nn.functional.silu(values).view(torch.uint16).cpu().tolist()
+
+    assert result_bits == [0x40BD, 0x8395, 0x8335, 0x82DD]
+
+
+@needs_wmma
 def test_gfx12_split_swiglu_down_is_exact(hip):
     skip_unless_gfx12_wmma()
 
@@ -1752,6 +1766,26 @@ def test_rms_rope_matches_eager(split_half, freqs_dtype, shape, freqs_shape):
     torch.testing.assert_close(out_k.float(), ref_k.float(), rtol=2e-2, atol=2e-2)
     # The fused and single-tensor entries are the same launch with k dropped.
     assert torch.equal(out_one, out_q)
+
+
+def test_rms_rope_static_bf16_types_matches_eager(hip):
+    torch.manual_seed(1)
+    shape = (2, 8, 128, 128)
+    q = torch.randn(shape, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(shape, device=DEV, dtype=torch.bfloat16)
+    freqs = torch.randn(
+        (1, 1, 128, 64, 2, 2), device=DEV, dtype=torch.float32
+    )
+    q_scale = torch.randn(128, device=DEV, dtype=torch.bfloat16)
+    k_scale = torch.randn(128, device=DEV, dtype=torch.bfloat16)
+
+    with ck.use_backend("hip"):
+        out_q, out_k = ck.rms_rope(q, k, freqs, q_scale, k_scale)
+    with ck.use_backend("eager"):
+        ref_q, ref_k = ck.rms_rope(q, k, freqs, q_scale, k_scale)
+
+    torch.testing.assert_close(out_q.float(), ref_q.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(out_k.float(), ref_k.float(), rtol=2e-2, atol=2e-2)
 
 
 def _partial_rotary_reference(x, freqs, scale, epsilon, rot_dim):

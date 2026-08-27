@@ -66,6 +66,13 @@ __forceinline__ __device__ float sum8_balanced(const v8f& value) {
     return (sum01 + sum23) + (sum45 + sum67);
 }
 
+__forceinline__ __device__ void store_bf16x8_padded(
+    __bf16* __restrict__ destination, v8bf value) {
+    const uint4 words = __builtin_bit_cast(uint4, value);
+    *reinterpret_cast<uint2*>(destination) = make_uint2(words.x, words.y);
+    *reinterpret_cast<uint2*>(destination + 4) = make_uint2(words.z, words.w);
+}
+
 __forceinline__ __device__ void store_bf16_acc(
     __bf16* __restrict__ row, int d_base, const v8f& value, int lane) {
 #if defined(COMFY_MMA_GFX12)
@@ -167,8 +174,8 @@ void bf16_attention_kernel(
                 k_value = *reinterpret_cast<const v8bf*>(
                     k_head + static_cast<int64_t>(item_key) * k_stride_n + item_d);
             }
-            *reinterpret_cast<v8bf*>(
-                staged_k + item_key * Shape::kKStride + item_d) = k_value;
+            store_bf16x8_padded(
+                staged_k + item_key * Shape::kKStride + item_d, k_value);
         }
         __syncthreads();
     }
@@ -271,16 +278,23 @@ void bf16_attention_kernel(
                 if constexpr (!DIRECT_GLOBAL) {
                     const int tile_key = key0 + kt * 16;
                     if (tile_key + 16 <= kv_len) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(COMFY_MMA_GFX12)
                         const int source_key = ((lane >> 4) << 3) + (lane & 7);
                         const int source_half = (lane >> 3) & 1;
                         const v8bf* const source = reinterpret_cast<const v8bf*>(
                             v_head + static_cast<int64_t>(tile_key + source_key) * v_stride_n +
                             dt * 16 + source_half * 8);
-#if defined(__HIP_DEVICE_COMPILE__)
                         v_fragment = __builtin_amdgcn_global_load_tr_b128_v8bf16(
                             const_cast<v8bf*>(source));
 #else
-                        v_fragment = *source;
+                        const int d = dt * 16 + frag_row(lane);
+#pragma unroll
+                        for (int i = 0; i < MmaBf16::kFragElems; ++i) {
+                            const int key_index =
+                                tile_key + MmaBf16::frag_base(lane) + i;
+                            v_fragment[i] = v_head[
+                                static_cast<int64_t>(key_index) * v_stride_n + d];
+                        }
 #endif
                     } else if (tile_key < kv_len) {
                         const int d = dt * 16 + frag_row(lane);
@@ -319,9 +333,9 @@ void bf16_attention_kernel(
                 const int item_key = item_pack / kPacksPerRow;
                 const int item_d =
                     (item_pack - item_key * kPacksPerRow) * kPackElems;
-                *reinterpret_cast<v8bf*>(
+                store_bf16x8_padded(
                     staged_k + next_buffer * BLOCK_N * Shape::kKStride +
-                    item_key * Shape::kKStride + item_d) = next_k[item];
+                    item_key * Shape::kKStride + item_d, next_k[item]);
             }
             if (has_next_tile) __syncthreads();
         }

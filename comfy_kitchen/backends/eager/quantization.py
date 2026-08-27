@@ -1071,7 +1071,9 @@ def int8_linear_gated_residual(
     dual_m: bool = False,
 ) -> torch.Tensor:
     """Portable ``residual + gate * int8_linear(...)`` reference."""
-    del weight_tile_k, dual_m
+    if weight_tile_k:
+        raise ValueError("The eager backend does not support WMMA-tiled INT8 weights")
+    del dual_m
     projected = int8_linear(
         x, weight, weight_scale, bias, out_dtype, convrot,
         convrot_groupsize, input_act,

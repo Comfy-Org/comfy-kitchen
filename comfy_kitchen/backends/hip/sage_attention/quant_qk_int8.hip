@@ -174,6 +174,8 @@ __global__ __launch_bounds__(kQuantWaves * 32) void quant_k_int8_kernel(
     const T* head = k + static_cast<int64_t>(b) * stride_b + static_cast<int64_t>(h) * stride_h;
     const int key0 = group * 16;
 
+    // Rows [Lk, Lk_storage) intentionally remain unwritten. The gfx12
+    // attention consumer masks their scores before the softmax.
     // A negative index means the detector found no anchor worth subtracting. The
     // subtraction stays unconditional either way, with a zero bias standing in,
     // so the anchor never has to be reached through a pointer.
@@ -515,6 +517,35 @@ extern "C" void launch_gfx12_qk_quant(
         padded_k < kv_len || padded_k % 64 != 0) {
         throw std::runtime_error(
             "gfx12 Q/K workspaces have invalid padding");
+    }
+    if (anchor_indices == nullptr) {
+        throw std::runtime_error(
+            "gfx12 Q/K quantization requires anchor_indices scratch");
+    }
+    const size_t element_size = sizeof(__half);
+    const size_t vector_size = 4 * element_size;
+    const auto stride_ok = [](int64_t stride, int extent) {
+        return extent < 2 || (stride > 0 && stride % 4 == 0);
+    };
+    const auto vector_aligned = [vector_size, &stride_ok](
+        const void* pointer, int64_t stride_b, int64_t stride_h,
+        int64_t stride_n, int batches, int heads, int length) {
+        return reinterpret_cast<uintptr_t>(pointer) % vector_size == 0 &&
+            stride_ok(stride_b, batches) && stride_ok(stride_h, heads) &&
+            stride_ok(stride_n, length);
+    };
+    if (!vector_aligned(
+            q, q_stride_b, q_stride_h, q_stride_n, 1, num_heads, q_len) ||
+        !vector_aligned(
+            k, k_stride_b, k_stride_h, k_stride_n, 1, num_heads, kv_len)) {
+        throw std::runtime_error(
+            "gfx12 Q/K base pointers and B/H/N strides must preserve "
+            "4-element alignment");
+    }
+    if (reinterpret_cast<uintptr_t>(q_int8) % 4 != 0 ||
+        reinterpret_cast<uintptr_t>(k_int8) % 4 != 0) {
+        throw std::runtime_error(
+            "gfx12 quantized Q/K base pointers must be 4-byte aligned");
     }
     auto* anchors = static_cast<int*>(anchor_indices);
     if (input_dtype_code == 1) {

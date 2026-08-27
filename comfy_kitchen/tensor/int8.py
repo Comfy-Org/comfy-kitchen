@@ -28,6 +28,11 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 _WMMA_WEIGHT_PACK_LOCK = threading.RLock()
+_WMMA_ROW_MAJOR_ONLY_SHAPES = frozenset({
+    (11520, 3840),
+    (3840, 10240),
+    (10240, 3840),
+})
 
 _INT8_DEQUANT_DTYPE_TO_CODE = {
     torch.float32: 0,
@@ -44,11 +49,11 @@ def _dtype_code(dtype: torch.dtype) -> int:
 
 
 def _uses_nonduplicated_wmma(device: torch.device) -> bool:
-    try:
-        arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
-    except (AttributeError, RuntimeError):
+    if not getattr(torch.version, "hip", None):
         return False
-    return arch.startswith("gfx12")
+    from comfy_kitchen.backends import hip
+
+    return hip._has_nonduplicated_wmma(device)
 
 
 class TensorWiseINT8Layout(QuantizedLayout):
@@ -165,10 +170,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
                 ready = torch.cuda.Event()
                 ready.record(torch.cuda.current_stream(packed.device))
                 ready.synchronize()
-            if qtensor._qdata.untyped_storage().resizable():
-                qtensor._qdata = packed
-            else:
-                qtensor._qdata.copy_(packed)
+            qtensor._qdata = packed
             qtensor._params = dataclasses.replace(
                 params, wmma_tile_n=tile_n, wmma_tile_k=tile_k
             )
@@ -215,7 +217,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
             return 0
         m = input_tensor.numel() // k
         # Compound QKV and FFN operations consume row-major weights.
-        if (n, k) in ((11520, 3840), (3840, 10240), (10240, 3840)):
+        if (n, k) in _WMMA_ROW_MAJOR_ONLY_SHAPES:
             return 0
         if m < 512 or n % 128 or k % 256:
             return 0
@@ -250,7 +252,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
         m = input_tensor.numel() // input_tensor.shape[-1]
         return (
             input_tensor.shape[-1] == k
-            and (n, k) not in ((11520, 3840), (3840, 10240), (10240, 3840))
+            and (n, k) not in _WMMA_ROW_MAJOR_ONLY_SHAPES
             and m >= 96
             and n % tile_n == 0
             and k % tile_k == 0
@@ -729,9 +731,12 @@ def _handle_int8_linear_tensorwise(qt, args, kwargs):
         weight, input_tensor
     )
     if tile_n and not tiled_supported:
-        return torch.nn.functional.linear(*dequantize_args(args), **dequantize_args(kwargs))
-
-    weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+        weight_qdata = TensorWiseINT8Layout._unpack_wmma_weight(
+            weight._qdata, weight._params
+        )
+        weight_scale = weight._params.scale
+    else:
+        weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
     out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
 
     convrot = getattr(weight._params, "convrot", False)

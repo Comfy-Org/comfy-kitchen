@@ -885,7 +885,16 @@ def rms_gated_residual(
     eps: float = 1.0e-5,
 ) -> torch.Tensor:
     """Compute exact RMSNorm followed by a visible gate product and residual add."""
-    return _call_backend("rms_gated_residual", locals())
+    return _call_backend(
+        "rms_gated_residual",
+        {
+            "activation": activation,
+            "norm_weight": norm_weight,
+            "residual": residual,
+            "gate": gate,
+            "eps": eps,
+        },
+    )
 
 
 def int8_linear(
@@ -950,7 +959,23 @@ def int8_linear_gated_residual(
     """INT8 linear with an exact BF16 gated-residual writeback."""
     if out_dtype is None:
         out_dtype = torch.bfloat16
-    return _call_backend("int8_linear_gated_residual", locals())
+    return _call_backend(
+        "int8_linear_gated_residual",
+        {
+            "x": x,
+            "weight": weight,
+            "weight_scale": weight_scale,
+            "residual": residual,
+            "gate": gate,
+            "bias": bias,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+            "input_act": input_act,
+            "weight_tile_k": weight_tile_k,
+            "dual_m": dual_m,
+        },
+    )
 
 
 def int8_linear_modulated(
@@ -969,7 +994,22 @@ def int8_linear_modulated(
     """Batch-one affine modulation with fused INT8 quantization."""
     if out_dtype is None:
         out_dtype = torch.bfloat16
-    return _call_backend("int8_linear_modulated", locals())
+    return _call_backend(
+        "int8_linear_modulated",
+        {
+            "x": x,
+            "modulation_scale": modulation_scale,
+            "weight": weight,
+            "weight_scale": weight_scale,
+            "bias": bias,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+            "weight_tiled_b": weight_tiled_b,
+            "modulation_shift": modulation_shift,
+            "weight_tile_k": weight_tile_k,
+        },
+    )
 
 
 def int8_linear_rms_modulated(
@@ -988,7 +1028,22 @@ def int8_linear_rms_modulated(
     """INT8 projection with RMSNorm and batch-one modulation in its producer."""
     if out_dtype is None:
         out_dtype = torch.bfloat16
-    return _call_backend("int8_linear_rms_modulated", locals())
+    return _call_backend(
+        "int8_linear_rms_modulated",
+        {
+            "x": x,
+            "norm_weight": norm_weight,
+            "norm_eps": norm_eps,
+            "modulation_scale": modulation_scale,
+            "weight": weight,
+            "weight_scale": weight_scale,
+            "bias": bias,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+            "weight_tiled_b": weight_tiled_b,
+        },
+    )
 
 
 def int8_linear_pair(
@@ -1007,7 +1062,22 @@ def int8_linear_pair(
     """Two equal-width INT8 linears sharing activation quantization when supported."""
     if out_dtype is None:
         out_dtype = torch.bfloat16
-    return _call_backend("int8_linear_pair", locals())
+    return _call_backend(
+        "int8_linear_pair",
+        {
+            "x": x,
+            "weight0": weight0,
+            "weight1": weight1,
+            "weight_scale0": weight_scale0,
+            "weight_scale1": weight_scale1,
+            "bias0": bias0,
+            "bias1": bias1,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+            "weight_tile_k": weight_tile_k,
+        },
+    )
 
 
 def int8_linear_pair_modulated(
@@ -1028,7 +1098,24 @@ def int8_linear_pair_modulated(
     """Two batch-one affine-modulated linears sharing INT8 quantization."""
     if out_dtype is None:
         out_dtype = torch.bfloat16
-    return _call_backend("int8_linear_pair_modulated", locals())
+    return _call_backend(
+        "int8_linear_pair_modulated",
+        {
+            "x": x,
+            "modulation_scale": modulation_scale,
+            "weight0": weight0,
+            "weight1": weight1,
+            "weight_scale0": weight_scale0,
+            "weight_scale1": weight_scale1,
+            "bias0": bias0,
+            "bias1": bias1,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+            "modulation_shift": modulation_shift,
+            "weight_tile_k": weight_tile_k,
+        },
+    )
 
 
 def int8_linear_triple_modulated(
@@ -1052,7 +1139,27 @@ def int8_linear_triple_modulated(
     """Three affine-modulated INT8 linears sharing one activation quantization."""
     if out_dtype is None:
         out_dtype = torch.bfloat16
-    return _call_backend("int8_linear_triple_modulated", locals())
+    return _call_backend(
+        "int8_linear_triple_modulated",
+        {
+            "x": x,
+            "modulation_scale": modulation_scale,
+            "weight0": weight0,
+            "weight1": weight1,
+            "weight2": weight2,
+            "weight_scale0": weight_scale0,
+            "weight_scale1": weight_scale1,
+            "weight_scale2": weight_scale2,
+            "bias0": bias0,
+            "bias1": bias1,
+            "bias2": bias2,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+            "modulation_shift": modulation_shift,
+            "weight_tile_k": weight_tile_k,
+        },
+    )
 
 
 def int8_linear_pair_rms_modulated(
@@ -1073,7 +1180,24 @@ def int8_linear_pair_rms_modulated(
     """Paired INT8 projections sharing RMSNorm, modulation, and quantization."""
     if out_dtype is None:
         out_dtype = torch.bfloat16
-    return _call_backend("int8_linear_pair_rms_modulated", locals())
+    return _call_backend(
+        "int8_linear_pair_rms_modulated",
+        {
+            "x": x,
+            "norm_weight": norm_weight,
+            "norm_eps": norm_eps,
+            "modulation_scale": modulation_scale,
+            "weight0": weight0,
+            "weight1": weight1,
+            "weight_scale0": weight_scale0,
+            "weight_scale1": weight_scale1,
+            "bias0": bias0,
+            "bias1": bias1,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+        },
+    )
 
 
 def int8_linear_swiglu_split(
@@ -1091,7 +1215,21 @@ def int8_linear_swiglu_split(
     """INT8 down projection that may absorb split BF16 SwiGLU inputs."""
     if out_dtype is None:
         out_dtype = torch.bfloat16
-    return _call_backend("int8_linear_swiglu_split", locals())
+    return _call_backend(
+        "int8_linear_swiglu_split",
+        {
+            "gate": gate,
+            "up": up,
+            "weight": weight,
+            "weight_scale": weight_scale,
+            "bias": bias,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+            "weight_tiled_b": weight_tiled_b,
+            "weight_tile_k": weight_tile_k,
+        },
+    )
 
 
 # =============================================================================

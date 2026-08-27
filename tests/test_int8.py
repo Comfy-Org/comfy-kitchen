@@ -390,6 +390,32 @@ class TestTensorWiseINT8Layout:
         assert torch.equal(qt.dequantize(), dequantized)
         assert torch.equal(qt.state_dict()[""], row_major)
 
+    def test_wmma_weight_pack_replaces_non_resizable_storage(self):
+        from comfy_kitchen.tensor import QuantizedTensor, TensorWiseINT8Layout
+
+        n, k = 256, 128
+        qdata = torch.frombuffer(bytearray(n * k), dtype=torch.int8).reshape(n, k)
+        qdata.copy_(
+            (torch.arange(n * k, dtype=torch.int16) % 251 - 125)
+            .to(torch.int8)
+            .reshape(n, k)
+        )
+        params = TensorWiseINT8Layout.Params(
+            scale=torch.ones(1, dtype=torch.float32),
+            orig_dtype=torch.bfloat16,
+            orig_shape=(n, k),
+        )
+        qt = QuantizedTensor(qdata, "TensorWiseINT8Layout", params)
+        original_storage = qt._qdata
+        row_major = original_storage.clone()
+        assert not original_storage.untyped_storage().resizable()
+
+        TensorWiseINT8Layout.pack_wmma_weight_(qt, tile_k=64)
+
+        assert qt._qdata.data_ptr() != original_storage.data_ptr()
+        assert torch.equal(original_storage, row_major)
+        assert torch.equal(qt.state_dict()[""], row_major)
+
     @pytest.mark.parametrize(
         ("n", "k", "expected_tile_k"),
         [(128, 1024, 64), (512, 1024, 128), (1024, 1024, 64), (11520, 3840, 0)],
@@ -418,14 +444,15 @@ class TestTensorWiseINT8Layout:
         assert qt._params.wmma_tile_k == expected_tile_k
         assert torch.equal(candidate, reference)
 
-        # A later short call cannot use the tiled native contract. Its
-        # dequantized fallback remains correct rather than reading packed bytes
-        # as a row-major matrix.
+        # A later short call cannot use the tiled native contract. Unpack to the
+        # ordinary INT8 path rather than dequantizing the full weight.
         if expected_tile_k:
             short = x[:32]
             with torch.inference_mode():
                 short_out = torch.nn.functional.linear(short, qt)
-                short_reference = torch.nn.functional.linear(short, qt.dequantize())
+                short_reference = ck.int8_linear(
+                    short, row_major, scale, out_dtype=short.dtype
+                )
             assert torch.equal(short_out, short_reference)
 
     def test_supports_fast_matmul(self):

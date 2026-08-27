@@ -16,31 +16,6 @@ namespace comfy::hip_backend {
 
 typedef __bf16 RmsResidualBf16x4 __attribute__((ext_vector_type(4)));
 
-extern "C" __device__ float __ocml_rsqrt_f32(float);
-
-__forceinline__ __device__ float rms_residual_ieee_div_f32(
-    float numerator, float denominator) {
-    bool denominator_scale = false;
-    bool scale = false;
-    const float scaled_denominator = __builtin_amdgcn_div_scalef(
-        numerator, denominator, false, &denominator_scale);
-    const float scaled_numerator = __builtin_amdgcn_div_scalef(
-        numerator, denominator, true, &scale);
-    float reciprocal = __builtin_amdgcn_rcpf(scaled_denominator);
-    const float reciprocal_error =
-        fmaf(-scaled_denominator, reciprocal, 1.0f);
-    reciprocal = fmaf(reciprocal_error, reciprocal, reciprocal);
-    float quotient = scaled_numerator * reciprocal;
-    float remainder =
-        fmaf(-scaled_denominator, quotient, scaled_numerator);
-    quotient = fmaf(remainder, reciprocal, quotient);
-    remainder = fmaf(-scaled_denominator, quotient, scaled_numerator);
-    quotient = __builtin_amdgcn_div_fmasf(
-        remainder, reciprocal, quotient, scale);
-    return __builtin_amdgcn_div_fixupf(
-        quotient, denominator, numerator);
-}
-
 __forceinline__ __device__ __bf16 rms_gated_residual_value(
     __bf16 raw, __bf16 norm_weight, float rstd,
     __bf16 residual, __bf16 gate) {
@@ -113,7 +88,7 @@ __global__ __launch_bounds__(256) void rms_gated_residual_bf16_kernel(
                 merged += __shfl_down(merged, offset, 32);
             }
             if (lane == 0) {
-                const float mean_square = rms_residual_ieee_div_f32(
+                const float mean_square = ieee_div_f32(
                     merged, static_cast<float>(kWidth));
                 wave_sums[0] = __ocml_rsqrt_f32(mean_square + eps);
             }
@@ -139,7 +114,7 @@ __global__ __launch_bounds__(256) void rms_gated_residual_bf16_kernel(
         }
 
         if (thread == 0) {
-            const float mean_square = rms_residual_ieee_div_f32(
+            const float mean_square = ieee_div_f32(
                 sum_sq, static_cast<float>(kWidth));
             wave_sums[0] = __ocml_rsqrt_f32(mean_square + eps);
         }

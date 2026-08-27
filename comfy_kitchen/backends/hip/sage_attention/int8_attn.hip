@@ -198,7 +198,7 @@ struct LongKVTileRegs {
 
     __forceinline__ __device__ void load(const int8_t* __restrict__ k_head,
                                          const int8_t* __restrict__ v_head,
-                                         int padded_k, int tile) {
+                                         int tile) {
         const int tid = threadIdx.x;
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
@@ -305,14 +305,14 @@ void gfx12_int8_attention_kernel(
     LongKVTileRegs next;
     int kv_buf = 0;
     long_stage_q_tile<NoQueryTail>(q_head, qs, query_block * kLongBlockM, qo_len);
-    next.load(k_head, v_head, padded_k, 0);
+    next.load(k_head, v_head, 0);
     next.store(ks[kv_buf], vs[kv_buf]);
     __syncthreads();
 
     for (int tile = 0; tile < tiles; ++tile) {
         const bool has_next = tile + 1 < tiles;
         if (has_next) {
-            next.load(k_head, v_head, padded_k, tile + 1);
+            next.load(k_head, v_head, tile + 1);
         }
 
         // Tail workgroups still need every wave for cooperative K/V staging

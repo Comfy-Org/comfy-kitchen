@@ -21,7 +21,7 @@ extern "C" void launch_quantize_int8_convrot_rms_modulated_fused_stats_kernel(
     check_convrot_k(K, group_size, 2);
     if (M == 0) return;
 
-    if (use_convrot_packed_elements()) {
+    if (use_convrot_packed_schedule()) {
         convrot_quant_512x2_bf16_kernel<
             kActNone, false, false, true, true, true, true, true>
             <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(

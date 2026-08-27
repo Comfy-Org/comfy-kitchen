@@ -13,6 +13,7 @@
 // even index), which is the layout the iu4 A-fragment consumes directly.
 #pragma once
 
+#include <atomic>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -28,31 +29,6 @@ namespace comfy::hip_backend {
 
 typedef __bf16 convrot_bf16x2 __attribute__((ext_vector_type(2)));
 typedef __bf16 convrot_bf16x4 __attribute__((ext_vector_type(4)));
-
-extern "C" __device__ float __ocml_rsqrt_f32(float);
-
-__forceinline__ __device__ float ieee_div_f32(
-    float numerator, float denominator) {
-    bool denominator_scale = false;
-    bool scale = false;
-    const float scaled_denominator = __builtin_amdgcn_div_scalef(
-        numerator, denominator, false, &denominator_scale);
-    const float scaled_numerator = __builtin_amdgcn_div_scalef(
-        numerator, denominator, true, &scale);
-    float reciprocal = __builtin_amdgcn_rcpf(scaled_denominator);
-    const float reciprocal_error =
-        fmaf(-scaled_denominator, reciprocal, 1.0f);
-    reciprocal = fmaf(reciprocal_error, reciprocal, reciprocal);
-    float quotient = scaled_numerator * reciprocal;
-    float remainder =
-        fmaf(-scaled_denominator, quotient, scaled_numerator);
-    quotient = fmaf(remainder, reciprocal, quotient);
-    remainder = fmaf(-scaled_denominator, quotient, scaled_numerator);
-    quotient = __builtin_amdgcn_div_fmasf(
-        remainder, reciprocal, quotient, scale);
-    return __builtin_amdgcn_div_fixupf(
-        quotient, denominator, numerator);
-}
 
 // convrot_quant_kernel handles 256/G groups per pass and rotates in log4(G)
 // stages, so a G outside this set either divides to a zero-width pass or is not
@@ -924,7 +900,9 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
         {-1, 1, 1, 1},
     };
 
-    __shared__ float stage[2][kThreads * kGroupsPerThread];
+    __shared__ float stage_storage[2 * kThreads * kGroupsPerThread];
+    float (*stage)[kThreads * kGroupsPerThread] =
+        reinterpret_cast<float (*)[kThreads * kGroupsPerThread]>(stage_storage);
     __shared__ float wave_max[kThreads / 32];
     extern __shared__ unsigned char rowbuf_raw[];
     __bf16* rowbuf = reinterpret_cast<__bf16*>(rowbuf_raw);
@@ -1009,7 +987,7 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
         constexpr int kPackedElements = 4;
         constexpr int kPackedThreadsPerGroup = kGroup / kPackedElements;
         constexpr int kPackedGroupsPerPass = kThreads / kPackedThreadsPerGroup;
-        float* packed_stage = &stage[0][0];
+        float* packed_stage = stage_storage;
         const int packed_local_group = t / kPackedThreadsPerGroup;
         const int packed_thread = t % kPackedThreadsPerGroup;
         const int element_base = packed_thread * kPackedElements;
@@ -1359,26 +1337,30 @@ inline bool convrot_512x2_supported(int K) {
         static_cast<size_t>(lds_bytes);
 }
 
-inline bool use_convrot_packed_quant() {
-    return convrot_wave32_512_supported();
-}
-
-inline bool use_convrot_packed_elements() {
+inline bool use_convrot_packed_schedule() {
     return convrot_wave32_512_supported();
 }
 
 inline bool use_gfx12_convrot_packed_none() {
-    static const bool selected = [] {
-        int device = 0;
+    constexpr int kMaxDevices = 16;
+    static std::atomic<int> cache[kMaxDevices] = {};
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) return false;
+
+    auto select = [device] {
         hipDeviceProp_t properties{};
-        if (hipGetDevice(&device) != hipSuccess ||
-            hipGetDeviceProperties(&properties, device) != hipSuccess ||
-            std::strncmp(properties.gcnArchName, "gfx12", 5) != 0) {
-            return false;
-        }
-        return use_convrot_packed_elements();
-    }();
-    return selected;
+        return hipGetDeviceProperties(&properties, device) == hipSuccess &&
+            std::strncmp(properties.gcnArchName, "gfx12", 5) == 0 &&
+            properties.warpSize == 32 && properties.maxThreadsPerBlock >= 512;
+    };
+    if (device < 0 || device >= kMaxDevices) return select();
+
+    int selected = cache[device].load(std::memory_order_relaxed);
+    if (selected == 0) {
+        selected = select() ? 2 : 1;
+        cache[device].store(selected, std::memory_order_relaxed);
+    }
+    return selected == 2;
 }
 
 template <int ACT>
@@ -1395,7 +1377,7 @@ inline void launch_convrot_quant_512x2_bf16(
             return;
         }
     }
-    if (use_convrot_packed_quant()) {
+    if (use_convrot_packed_schedule()) {
         convrot_quant_512x2_bf16_kernel<ACT, false, false, false, true>
             <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
                 x, nullptr, in_dtype, qout, scaleout, M, K);
@@ -1409,7 +1391,7 @@ inline void launch_convrot_quant_512x2_bf16(
 inline void launch_convrot_quant_512x2_bf16_swiglu_split_tiled128(
     const void* gate, const void* up, int8_t* qout, float* scaleout,
     int M, int K, hipStream_t stream) {
-    if (use_convrot_packed_elements()) {
+    if (use_convrot_packed_schedule()) {
         convrot_quant_512x2_bf16_kernel<
             kActSwiGLU, true, true, false, true, false, false, true>
             <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
@@ -1424,7 +1406,7 @@ inline void launch_convrot_quant_512x2_bf16_swiglu_split_tiled128(
 inline void launch_convrot_quant_512x2_bf16_modulated(
     const void* x, const void* modulation_scale,
     int8_t* qout, float* scaleout, int M, int K, hipStream_t stream) {
-    if (use_convrot_packed_quant()) {
+    if (use_convrot_packed_schedule()) {
         convrot_quant_512x2_bf16_kernel<kActNone, false, false, true, true>
             <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
                 x, modulation_scale, 2, qout, scaleout, M, K);

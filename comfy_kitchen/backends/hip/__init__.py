@@ -927,6 +927,11 @@ def rms_gated_residual(
     eps: float = 1.0e-5,
 ) -> torch.Tensor:
     """Exact BF16 RMSNorm, gate multiplication, and residual add."""
+    width = activation.shape[-1] if activation.ndim else 0
+    max_k = 0
+    if activation.dtype == torch.bfloat16 and activation.device.type == "cuda":
+        with torch.cuda.device(activation.device):
+            max_k = _C.convrot_max_k(DTYPE_TO_CODE[activation.dtype])
     use_fused = (
         activation.dtype == torch.bfloat16
         and norm_weight.dtype == torch.bfloat16
@@ -936,11 +941,11 @@ def rms_gated_residual(
         and activation.ndim == 3
         and activation.shape[0] == 1
         and activation.shape == residual.shape
-        and activation.shape[-1] > 0
-        and activation.shape[-1] % 4 == 0
-        and activation.shape[-1] <= _C.convrot_max_k(DTYPE_TO_CODE[activation.dtype])
-        and norm_weight.numel() == activation.shape[-1]
-        and gate.numel() == activation.shape[-1]
+        and width > 0
+        and width % 4 == 0
+        and width <= max_k
+        and norm_weight.numel() == width
+        and gate.numel() == width
     )
     if not use_fused:
         return _eager.rms_gated_residual(
@@ -948,7 +953,6 @@ def rms_gated_residual(
         )
 
     shape = activation.shape
-    width = activation.shape[-1]
     activation_2d = activation.reshape(-1, width).contiguous()
     norm_weight_1d = norm_weight.reshape(-1).contiguous()
     residual_2d = residual.reshape(-1, width).contiguous()
@@ -1223,6 +1227,10 @@ def _int8_linear_pair_impl(
             "tiled-B INT8 pair requires non-duplicated WMMA BF16, M>=96, "
             "N divisible by 128, and K divisible by tile_k"
         )
+    if modulation_shift is not None and norm_weight is not None:
+        raise ValueError(
+            "modulation_shift and norm_weight are mutually exclusive"
+        )
 
     if convrot:
         if convrot_groupsize not in (16, 64, 256):
@@ -1233,7 +1241,9 @@ def _int8_linear_pair_impl(
             raise ValueError(
                 f"ConvRot group size {convrot_groupsize} does not divide input features {k}"
             )
-        if not _convrot_supported(k, convrot_groupsize, x.device, x.dtype):
+        if not _convrot_supported(
+            k, convrot_groupsize, x.device, x.dtype, int8_global_spill=True
+        ):
             return _eager.int8_linear_pair(
                 x, weight0, weight1, weight_scale0, weight_scale1,
                 bias0, bias1, out_dtype, convrot, convrot_groupsize,
