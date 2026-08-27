@@ -2317,9 +2317,12 @@ def na3d(
 
 def _topk_threshold(q, k, topk_ratio, scale):
     """Routing threshold that turns the route kernels' ``s > thr`` into
-    per-query-block top-k: the (k+1)-th largest pooled score per row. Computed
-    in fp32 from the same pooled/centred quantities the kernel scores with, so
-    the kept set matches exact top-k up to int8 rounding at the boundary."""
+    per-query-block top-k: the (k+1)-th largest pooled score per row.
+
+    Scores are computed through the SAME int8 quantization the route kernel
+    uses (integer dot in exact fp32, scaled in the kernel's operation order):
+    an fp32 threshold against int8-quantized kernel scores lands inside the
+    coarse boundary cluster and inflates the kept budget ~15%."""
     b, t, h, d = q.shape
     n = (t + 63) // 64
 
@@ -2332,12 +2335,48 @@ def _topk_threshold(q, k, topk_ratio, scale):
             m = torch.cat([m, tail], dim=1)
         return m
 
-    cen = block_mean(q)
+    cen = block_mean(q)                                       # (B, N, H, D)
     kc = block_mean(k)
     kc = kc - kc.mean(dim=1, keepdim=True)
-    s = torch.einsum("bnhd,bmhd->bhnm", cen, kc) * (scale * 1.4426950408889634)
+    # prep_q / prep_pool_quant quantization, exactly
+    csc = (cen.abs().amax(-1, True) / 127.0).clamp_min(1e-8)
+    ksc = (kc.abs().amax(-1, True) / 127.0).clamp_min(1e-12)
+    c8 = torch.round(cen / csc).clamp_(-127, 127)
+    k8 = torch.round(kc / ksc).clamp_(-127, 127)
+    # integer dot: |sum| < 128*127^2 < 2^24, exact in fp32
+    s = torch.einsum("bnhd,bmhd->bhnm", c8, k8)
+    s = s * (csc.squeeze(-1) * (scale * 1.4426950408889634)).permute(0, 2, 1).unsqueeze(-1)
+    s = s * ksc.squeeze(-1).permute(0, 2, 1).unsqueeze(-2)
     kk = max(1, min(n - 1, round(topk_ratio * n)))
-    return s.topk(kk + 1, dim=-1).values[..., -1].contiguous()
+    return s.topk(kk + 1, dim=-1, sorted=False).values.min(-1).values.contiguous()
+
+
+_ROPE_FAB_CACHE = {}
+
+
+def _packed_rope_fab(freqs, t, rot):
+    """[..., T, 1, rot/2, 2, 2] -> [T, rot, 2] per-channel (self, partner)
+    coefficients, so each lane reads only its own 32 B. Cached per freqs
+    tensor: H3 shares one freqs across every layer of a step. The cache holds
+    a strong reference and keys on identity -- a data_ptr key is unsound once
+    the tensor is freed and the allocator reuses the address. No _version in
+    the key: inference tensors don't track version counters."""
+    key = (id(freqs), t, rot)
+    hit = _ROPE_FAB_CACHE.get(key)
+    if hit is not None:
+        return hit[1]
+    f = freqs.reshape(-1, rot // 2, 2, 2)
+    if f.shape[0] != t:
+        raise ValueError(f"sol_attn: rope_freqs covers {f.shape[0]} tokens, T={t}")
+    f = f.float()
+    fab = torch.empty(t, rot, 2, device=freqs.device, dtype=torch.float32)
+    fab[:, :rot // 2, 0] = f[:, :, 0, 0]
+    fab[:, :rot // 2, 1] = f[:, :, 0, 1]
+    fab[:, rot // 2:, 0] = f[:, :, 1, 1]
+    fab[:, rot // 2:, 1] = f[:, :, 1, 0]
+    _ROPE_FAB_CACHE.clear()   # one live entry: freqs change per step/shape
+    _ROPE_FAB_CACHE[key] = (freqs, fab)   # keep freqs alive so its id stays unique
+    return fab
 
 
 def sol_attn(
@@ -2350,10 +2389,11 @@ def sol_attn(
     sink_q: list[int] | None = None,
     max_blocks: int = 0,
     workspace: torch.Tensor | None = None,
-    centroid_tail: bool = True,
     key_bias: torch.Tensor | None = None,
     topk_ratio: float = 0.0,
-    reuse_qkv_memory: bool = False,
+    rope_freqs: torch.Tensor | None = None,
+    qk_norm_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
+    rope_eps: float = 1e-6,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 tensors.
     See sage_attention/sol_attn.cu.
@@ -2361,6 +2401,13 @@ def sol_attn(
     ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
     per-query-block top-k: keep that fraction of key blocks per query block
     (sinks and the diagonal still ride on top). tau is ignored then.
+
+    ``rope_freqs`` fuses per-head RMSNorm + split-half RoPE into the
+    preprocess: pass PRE-norm/rope q/k plus ``qk_norm_weights=(qw, kw)`` and
+    the model's freqs ``[..., T, 1, rot/2, 2, 2]`` fp32; q/k are read once and
+    never written back (saves the separate rms_rope round trip). Matches
+    applying ``rms_rope_split_half_`` first to reduction-order ulps. Not
+    compatible with ``topk_ratio`` (its pooling would run pre-rope).
     """
     batch, t, h, d = q.shape
     # Direct entry: run the same shared rule as the registry path, or bad
@@ -2402,6 +2449,21 @@ def sol_attn(
                     f"be misaligned; call .contiguous() on it")
     # Per-key logit bias (natural log), folded into the exact branch's
     # (scale, bias) slot; biased blocks must be sink-covered.
+    rf = qw = kw = None
+    rot_dim = 0
+    if rope_freqs is not None:
+        if qk_norm_weights is None:
+            raise ValueError("sol_attn: rope_freqs requires qk_norm_weights=(qw, kw)")
+        if topk_ratio:
+            raise ValueError("sol_attn: topk_ratio with rope_freqs is not supported "
+                             "(the top-k pooling would run on pre-rope values)")
+        rot_dim = rope_freqs.shape[-3] * 2
+        if rot_dim % 8 or (rot_dim // 2) % 4:
+            raise ValueError(f"sol_attn: unsupported rot_dim {rot_dim}")
+        rf = _packed_rope_fab(rope_freqs, t, rot_dim)
+        qw, kw = qk_norm_weights
+        qw = qw.to(device=q.device, dtype=torch.bfloat16).contiguous()
+        kw = kw.to(device=q.device, dtype=torch.bfloat16).contiguous()
     thr = None
     if topk_ratio:
         if not 0.0 < topk_ratio < 1.0:
@@ -2412,22 +2474,7 @@ def sol_attn(
         from ..eager.sol_attn import _normalize_key_bias
         key_bias = _normalize_key_bias(key_bias, batch, t, q.device)
         kb = (key_bias * 1.4426950408889634).expand(batch, t).contiguous()
-    if reuse_qkv_memory:
-        # q/k/v are read only by the preprocess, and `out` is written only by
-        # later kernels on the same stream, so their storage can hold the
-        # output. Raw-storage reuse, so fused qkv chunk views work too. The
-        # caller must not touch q/k/v afterwards -- their contents are gone.
-        need_out = batch * t * h * d * q.element_size()
-        for cand in (q, k, v):
-            storage = cand.untyped_storage()
-            if storage.nbytes() >= need_out:
-                out = torch.empty(0, dtype=q.dtype, device=q.device)
-                out.set_(storage, 0, (batch, t, h, d))
-                break
-        else:  # unreachable: q alone is exactly need_out bytes
-            raise ValueError("sol_attn: no input storage large enough for out")
-    else:
-        out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     need = _C.sol_attn_workspace(batch, t, h, max_blocks)
     if workspace is None:
         workspace = torch.empty(need, dtype=torch.uint8, device=q.device)
@@ -2471,11 +2518,187 @@ def sol_attn(
         int(sb[0]), int(sb[1]), int(sq[0]), int(sq[1]),
         list(q.stride()[:3]), list(k.stride()[:3]), list(v.stride()[:3]),
         stream_ptr,
-        centroid_tail=centroid_tail,
         key_bias=None if kb is None else _wrap_for_dlpack(kb),
         threshold=None if thr is None else _wrap_for_dlpack(thr),
+        rope_freqs=None if rf is None else _wrap_for_dlpack(rf),
+        q_norm_w=None if qw is None else _wrap_for_dlpack(qw),
+        k_norm_w=None if kw is None else _wrap_for_dlpack(kw),
+        rope_eps=float(rope_eps),
+        rot_dim=rot_dim,
     )
     return out
+
+
+def sol_attn_chunked(
+    qkv_chunks,
+    t: int,
+    h: int,
+    rope_freqs: torch.Tensor,
+    qk_norm_weights: tuple[torch.Tensor, torch.Tensor],
+    kmean: torch.Tensor | None = None,
+    vscale: torch.Tensor | None = None,
+    tau: float = 1.0,
+    topk_ratio: float = 0.0,
+    scale: float | None = None,
+    sink_blocks: list[int] | None = None,
+    sink_q: list[int] | None = None,
+    threshold: torch.Tensor | None = None,
+    rope_eps: float = 1e-6,
+    vscale_margin: float = 1.1,
+    return_stats: bool = True,
+):
+    """Chunked-producer Sol-Attn: consume fused qkv projection output in
+    token-major chunks ([M, 3*H*128] bf16, 64-aligned starts, B=1) without
+    ever materialising full Q/K/V.
+
+    ``qkv_chunks``: an iterable of chunks or a zero-arg callable returning
+    one. ``kmean``/``vscale`` are LAST step's statistics ([H,128] f32); when
+    None the call bootstraps by running the producer twice -- pass one
+    harvests the scale-independent statistics, pass two quantizes with them
+    -- so pass a callable for true streaming on the first call (an iterable
+    is materialised to a list to allow the second pass).
+
+    Returns ``(out[1,T,H,128] bf16, kmean_next, vscale_next)``."""
+    d = 128
+    if scale is None:
+        scale = d ** -0.5
+    rot = rope_freqs.shape[-3] * 2
+    fab = _packed_rope_fab(rope_freqs, t, rot)
+    qw, kw = qk_norm_weights
+    dev = fab.device
+    qw = qw.to(device=dev, dtype=torch.bfloat16).contiguous()
+    kw = kw.to(device=dev, dtype=torch.bfloat16).contiguous()
+    factory = qkv_chunks if callable(qkv_chunks) else None
+    if factory is None and (kmean is None or vscale is None):
+        qkv_chunks = list(qkv_chunks)          # need two passes over it
+        factory = lambda: iter(qkv_chunks)     # noqa: E731
+    need = _C.sol_attn_workspace(1, t, h, 0)
+    ws = torch.empty(need, dtype=torch.uint8, device=dev)
+    stream = torch.cuda.current_stream(dev).cuda_stream
+
+    def produce(km, vsc):
+        _C.sol_producer_begin(_wrap_for_dlpack(ws), 1, t, h, 0, stream)
+        t0 = 0
+        for chunk in (factory() if factory is not None else qkv_chunks):
+            m = chunk.shape[-2]
+            if t0 % 64 and m:
+                raise ValueError("sol_attn_chunked: chunk starts must be 64-aligned")
+            _C.sol_producer_chunk(
+                _wrap_for_dlpack(ws), _wrap_for_dlpack(chunk.contiguous()),
+                _wrap_for_dlpack(fab), _wrap_for_dlpack(qw), _wrap_for_dlpack(kw),
+                _wrap_for_dlpack(km.contiguous()), _wrap_for_dlpack(vsc.contiguous()),
+                float(rope_eps), rot, t0, m, 1, t, h, 0, stream)
+            t0 += m
+        if t0 != t:
+            raise ValueError(f"sol_attn_chunked: chunks cover {t0} tokens, T={t}")
+
+    if kmean is None or vscale is None:
+        # Bootstrap: one producer pass with dummy scales just to harvest the
+        # scale-INDEPENDENT statistics (post-rope K sums, V absmax) from the
+        # workspace, then re-produce with real ones. Blind scales are not
+        # "loose", they are garbage when activations are far from unit range.
+        produce(torch.zeros(h, d, device=dev),
+                torch.ones(h, d, device=dev))
+        offs, ntb, npad, _nq = _ws_offsets(1, t, h)
+        ksums = ws[offs["scratch"]:offs["scratch"] + h * npad * d * 4] \
+            .view(torch.float32).view(h, npad, d)[:, :ntb]
+        kmean = (ksums.sum(1) / float(t)).contiguous()
+        vamax = ws[offs["statsV"]:offs["statsV"] + h * d * 4] \
+            .view(torch.float32).view(h, d)
+        vscale = (vamax / 127.0 * vscale_margin).clamp_min(1e-8).contiguous()
+    produce(kmean, vscale)
+    if topk_ratio and threshold is None:
+        threshold = _topk_threshold_from_workspace(ws, 1, t, h, topk_ratio, scale)
+    out = torch.empty(1, t, h, d, dtype=torch.bfloat16, device=dev)
+    kmean_next = torch.empty(h, d, device=dev, dtype=torch.float32) if return_stats else None
+    vamax = torch.empty(h, d, device=dev, dtype=torch.float32) if return_stats else None
+    sb = [0, 0] if sink_blocks is None else list(sink_blocks)
+    sq = [0, 0] if sink_q is None else list(sink_q)
+    _seed_vsc(ws, vscale, 1, t, h)
+    _C.sol_attn_core(
+        _wrap_for_dlpack(ws), _wrap_for_dlpack(out), 1, t, h, 0,
+        float(tau), float(scale), int(sb[0]), int(sb[1]), int(sq[0]), int(sq[1]),
+        stream,
+        threshold=None if threshold is None else _wrap_for_dlpack(threshold),
+        kmean_next=None if kmean_next is None else _wrap_for_dlpack(kmean_next),
+        vamax_out=None if vamax is None else _wrap_for_dlpack(vamax))
+    if not return_stats:
+        return out, None, None
+    vscale_next = (vamax / 127.0 * vscale_margin).clamp_min(1e-8)
+    return out, kmean_next, vscale_next
+
+
+def _perm_d_index(device):
+    d = torch.arange(128)
+    kc, rem = d >> 5, d & 31
+    h, r2 = rem >> 4, rem & 15
+    return (kc * 32 + 8 * (r2 >> 2) + 4 * h + (r2 & 3)).to(device)
+
+
+def _ws_offsets(b, t, h):
+    """Mirror of the C++ Plan for the slots python reads (cen8/cens and the
+    pooled K sums in scratch)."""
+    d = 128
+    ntb = (t + 63) // 64
+    tp, npad = ntb * 64, ((ntb + 63) // 64) * 64
+    nq, tok, bh = ntb, b * t * h, b * h
+
+    def a16(x):
+        return (x + 15) & ~15
+    o = 0
+    offs = {}
+    for name, nbytes in (
+            ("qiP", tok * d), ("qs", tok * 4), ("kiP", bh * tp * d),
+            ("ksb", bh * tp * 8), ("vTi", bh * d * tp), ("vsc", bh * d * 4),
+            ("kciP", bh * npad * d), ("kcs", bh * npad * 4),
+            ("vcT", bh * d * npad * 2), ("thr", bh * nq * 4),
+            ("idx", bh * nq * ntb * 2), ("cnt", bh * nq * 4),
+            ("cen8", bh * nq * d), ("cens", bh * nq * 4),
+            ("oPart", bh * nq * d * 2), ("mPart", bh * nq * 4),
+            ("lPart", bh * nq * 4), ("statsV", bh * d * 4),
+            ("scratch", 0)):
+        offs[name] = o
+        o = a16(o + nbytes)
+    return offs, ntb, npad, nq
+
+
+def _topk_threshold_from_workspace(ws, b, t, h, topk_ratio, scale):
+    """Producer-path top-k: the (k+1)-th kernel-space routing score per query
+    block, from the producer's own pooled outputs (post-rope, exact int8
+    emulation of finish's pooled quant). No q/k reads at all."""
+    d = 128
+    offs, ntb, npad, nq = _ws_offsets(b, t, h)
+    bh = b * h
+    cen8 = ws[offs["cen8"]:offs["cen8"] + bh * nq * d].view(torch.int8) \
+        .view(bh, nq, d).float()
+    cens = ws[offs["cens"]:offs["cens"] + bh * nq * 4].view(torch.float32) \
+        .view(bh, nq)
+    ksums = ws[offs["scratch"]:offs["scratch"] + bh * npad * d * 4] \
+        .view(torch.float32).view(bh, npad, d)[:, :ntb].clone()
+    lens = torch.full((ntb,), 64.0, device=ws.device)
+    if ntb * 64 > t:
+        lens[-1] = float(t - (ntb - 1) * 64)
+    kc = ksums / lens.view(1, -1, 1)
+    kc = kc - kc.mean(dim=1, keepdim=True)
+    ksc = (kc.abs().amax(-1, True) / 127.0).clamp_min(1e-12)
+    k8 = torch.round(kc / ksc).clamp_(-127, 127)
+    # cen8 is stored perm_d'd (slot j holds channel d with perm_d(d)=j, so
+    # gathering AT perm_d recovers channel order); perm_d is NOT an involution,
+    # so unpermute the centroid rather than permuting k8.
+    cen8 = cen8[:, :, _perm_d_index(ws.device)]
+    s = torch.bmm(cen8, k8.transpose(1, 2))          # exact int dot in fp32
+    log2s = scale * 1.4426950408889634
+    s = s * (cens * log2s).unsqueeze(-1) * ksc.squeeze(-1).unsqueeze(-2)
+    kk = max(1, min(ntb - 1, round(topk_ratio * ntb)))
+    return s.topk(kk + 1, dim=-1, sorted=False).values.min(-1).values.contiguous()
+
+
+def _seed_vsc(ws, vscale, b, t, h):
+    """Write stale_vscale * 127 into the workspace vsc slot (finish's stats
+    kernel divides it back down)."""
+    o = _ws_offsets(b, t, h)[0]["vsc"]
+    vsc = ws[o:o + b * h * 128 * 4].view(torch.float32).view(h, 128)
+    vsc.copy_(vscale * 127.0)
 
 
 def sol_attn_workspace_bytes(batch: int, seq_len: int, num_heads: int,

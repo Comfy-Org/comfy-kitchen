@@ -134,6 +134,7 @@ set(CUDA_SOURCES
     ops/na3d.cu
     sage_attention/sol_attn.cu
     sage_attention/sol_attn_preprocess.cu
+    sage_attention/sol_attn_producer.cu
     sage_attention/sol_attn_vtranspose.cu
     sage_attention/sol_attn_route.cu
     sage_attention/sol_attn_exact.cu

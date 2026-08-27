@@ -37,23 +37,28 @@ extern "C" {
 void launch_sol_preprocess(const void*, const void*, const void*, void*, void*, void*,
                            void*, void*, void*, void*, void*, void*, void*, void*, void*,
                            const void*,
+                           const void*, const void*, const void*, float, int,
                            int, int, int, int, int, int, int,
                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                            int64_t, int64_t, int64_t, float, float, cudaStream_t);
 size_t sol_preprocess_scratch_bytes(int, int, int);
+void launch_sol_producer(const void*, const void*, const void*, const void*,
+                         const void*, const void*, void*, void*, void*, void*,
+                         void*, void*, void*, void*, void*, void*,
+                         float, int, int, int, int, int, int, int, int,
+                         cudaStream_t);
+void launch_sol_finish(void*, void*, void*, void*, void*, const void*,
+                       const void*, void*, void*, int, int, int, int, int, int,
+                       float, float, cudaStream_t);
 void launch_sol_vtranspose(const void*, const void*, void*, int, int, int, int,
                            int64_t, int64_t, int64_t, cudaStream_t);
 void launch_sol_route(const void*, const void*, const void*, const void*, const void*,
                       const void*, const void*, void*, void*, void*, void*, void*,
                       int, int, int, int, int, int, int, int, int, int, int,
                       float, cudaStream_t);
-void launch_sol_route_perrow(const void*, const void*, const void*, const void*,
-                      const void*, const void*, const void*, void*, void*, void*,
-                      void*, void*, int, int, int, int, int, int, int, int, int,
-                      int, int, float, cudaStream_t);
 void launch_sol_exact(const void*, const void*, const void*, const void*, const void*,
                       const void*, const void*, const void*, const void*, const void*,
-                      const void*, void*, int, int, int, int, int, int, float, int,
+                      const void*, void*, int, int, int, int, int, int, float,
                       cudaStream_t);
 }
 
@@ -68,7 +73,7 @@ inline size_t align16(size_t n) { return (n + 15u) & ~(size_t)15u; }
 struct Plan {
     int Tp, NTB, NPAD, NQ, MAXB;
     size_t qiP, qs, kiP, ksb, vTi, vsc, kciP, kcs, vcT, thr, cen8, cens;
-    size_t idx, cnt, oPart, mPart, lPart, mPartRow, lPartRow, scratch, total;
+    size_t idx, cnt, oPart, mPart, lPart, statsV, scratch, total;
 
     Plan(int B, int T, int H, int max_blk) {
         NTB = (T + BLK - 1) / BLK;
@@ -102,10 +107,7 @@ struct Plan {
         oPart   = take(bh * NQ * HD * sizeof(uint16_t));
         mPart   = take(bh * NQ * sizeof(float));
         lPart   = take(bh * NQ * sizeof(float));
-        // Per-row m/l for the centroid_tail=false fallback (its o_part
-        // aliases `out`). Always reserved so the size ignores the flag.
-        mPartRow = take(tok * sizeof(float));
-        lPartRow = take(tok * sizeof(float));
+        statsV  = take(bh * HD * sizeof(float));   // producer vamax accumulator
         scratch = take(sol_preprocess_scratch_bytes(B, H, NPAD));
         total = o;
     }
@@ -117,11 +119,75 @@ extern "C" size_t sol_attn_workspace_bytes(int batch, int seq_len, int num_heads
     return Plan(batch, seq_len, num_heads, max_blocks).total;
 }
 
+// ---- chunked producer path ----
+extern "C" void sol_producer_begin(void* workspace, int batch, int seq_len,
+                                   int num_heads, int max_blocks,
+                                   cudaStream_t stream) {
+    const Plan p(batch, seq_len, num_heads, max_blocks);
+    char* w = reinterpret_cast<char*>(workspace);
+    const size_t bh = (size_t)batch * num_heads;
+    // pooled sums live in the scratch kc slot; vcT pad + vamax start at zero
+    cudaMemsetAsync(w + p.scratch, 0, bh * p.NPAD * HD * sizeof(float), stream);
+    cudaMemsetAsync(w + p.vcT, 0, bh * HD * p.NPAD * sizeof(uint16_t), stream);
+    cudaMemsetAsync(w + p.statsV, 0, bh * HD * sizeof(float), stream);
+}
+
+extern "C" void sol_producer_chunk(
+    void* workspace, const void* qkv, const void* fab,
+    const void* qw, const void* kw, const void* kmean, const void* vscale,
+    float rope_eps, int rot_dim, int t0, int M,
+    int batch, int seq_len, int num_heads, int max_blocks, cudaStream_t stream)
+{
+    const Plan p(batch, seq_len, num_heads, max_blocks);
+    char* w = reinterpret_cast<char*>(workspace);
+    launch_sol_producer(qkv, fab, qw, kw, kmean, vscale,
+                        w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb,
+                        w + p.vTi, w + p.vcT, w + p.scratch,
+                        w + p.cen8, w + p.cens, w + p.statsV,
+                        rope_eps, rot_dim, t0, M, seq_len, p.Tp, num_heads,
+                        p.NPAD, p.NQ, stream);
+}
+
+extern "C" void launch_sol_attn_core(
+    void* workspace, void* out, void* kmean_next, void* vamax_out,
+    int batch, int seq_len, int num_heads, int max_blocks,
+    float tau, float scale, const void* ext_threshold,
+    int sink_start, int sink_end, int sink_q_start, int sink_q_end,
+    cudaStream_t stream)
+{
+    const Plan p(batch, seq_len, num_heads, max_blocks);
+    char* w = reinterpret_cast<char*>(workspace);
+    const float scale_log2 = scale * 1.4426950408889634f;
+    // finish uses the tail of scratch (past the kc sums) for kmean/kcvar
+    char* stats_scratch = w + p.scratch +
+        (size_t)batch * num_heads * p.NPAD * HD * sizeof(float);
+    launch_sol_finish(w + p.scratch, w + p.kciP, w + p.kcs, w + p.vsc,
+                      w + p.thr, w + p.cen8, w + p.cens, kmean_next,
+                      stats_scratch,
+                      batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ,
+                      tau, scale_log2, stream);
+    const void* thr = ext_threshold ? ext_threshold : (const void*)(w + p.thr);
+    launch_sol_route(w + p.cen8, w + p.cens, w + p.kciP, w + p.kcs, w + p.vcT, w + p.vsc,
+                     thr, w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart,
+                     batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ, p.MAXB,
+                     sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
+    launch_sol_exact(w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb, w + p.vTi, w + p.vsc,
+                     w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart, out,
+                     batch, seq_len, p.Tp, num_heads, p.NQ, p.MAXB,
+                     scale_log2, stream);
+    if (vamax_out)
+        cudaMemcpyAsync(vamax_out, w + p.statsV,
+                        (size_t)batch * num_heads * HD * sizeof(float),
+                        cudaMemcpyDeviceToDevice, stream);
+}
+
 extern "C" void launch_sol_attn(
     const void* q, const void* k, const void* v, void* out, void* workspace,
     int batch, int seq_len, int num_heads, int head_dim, int max_blocks,
-    float tau, float scale, int centroid_tail, const void* key_bias,
+    float tau, float scale, const void* key_bias,
     const void* ext_threshold,
+    const void* rope_freqs, const void* q_norm_w, const void* k_norm_w,
+    float rope_eps, int rot_dim,
     int sink_start, int sink_end, int sink_q_start, int sink_q_end,
     int64_t qs_b, int64_t qs_t, int64_t qs_h,
     int64_t ks_b, int64_t ks_t, int64_t ks_h,
@@ -147,34 +213,20 @@ extern "C" void launch_sol_attn(
                           w + p.kciP, w + p.kcs, w + p.vcT, w + p.thr,
                           w + p.cen8, w + p.cens, w + p.vsc, w + p.scratch,
                           key_bias,
+                          rope_freqs, q_norm_w, k_norm_w, rope_eps, rot_dim,
                           batch, seq_len, p.Tp, num_heads, p.NTB, p.NPAD, p.NQ,
                           qs_b, qs_t, qs_h, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h,
                           tau, scale_log2, stream);
     launch_sol_vtranspose(v, w + p.vsc, w + p.vTi, batch, seq_len, p.Tp, num_heads,
                           vs_b, vs_t, vs_h, stream);
-    if (centroid_tail) {
-        launch_sol_route(w + p.cen8, w + p.cens, w + p.kciP, w + p.kcs, w + p.vcT, w + p.vsc,
-                         thr, w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart,
-                         batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ, p.MAXB,
-                         sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
-        launch_sol_exact(w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb, w + p.vTi, w + p.vsc,
-                         w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart, out,
-                         batch, seq_len, p.Tp, num_heads, p.NQ, p.MAXB,
-                         scale_log2, 1, stream);
-    } else {
-        // Per-row tail: the pre-centroid behaviour, kept selectable for
-        // quality A/B. Its handover writes straight into `out`, which the
-        // exact stage reads back in its prologue and overwrites.
-        launch_sol_route_perrow(w + p.qiP, w + p.qs, w + p.kciP, w + p.kcs, w + p.vcT,
-                         w + p.vsc, thr, w + p.idx, w + p.cnt, out,
-                         w + p.mPartRow, w + p.lPartRow,
-                         batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ, p.MAXB,
-                         sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
-        launch_sol_exact(w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb, w + p.vTi, w + p.vsc,
-                         w + p.idx, w + p.cnt, out, w + p.mPartRow, w + p.lPartRow, out,
-                         batch, seq_len, p.Tp, num_heads, p.NQ, p.MAXB,
-                         scale_log2, 0, stream);
-    }
+    launch_sol_route(w + p.cen8, w + p.cens, w + p.kciP, w + p.kcs, w + p.vcT, w + p.vsc,
+                     thr, w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart,
+                     batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ, p.MAXB,
+                     sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
+    launch_sol_exact(w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb, w + p.vTi, w + p.vsc,
+                     w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart, out,
+                     batch, seq_len, p.Tp, num_heads, p.NQ, p.MAXB,
+                     scale_log2, stream);
 
     // A rejected launch would silently leave route's handover values in `out`.
     // One check covers all four stages: the first failure latches until read.

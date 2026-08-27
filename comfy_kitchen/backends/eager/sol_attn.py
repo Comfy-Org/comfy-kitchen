@@ -9,9 +9,6 @@ vs INT8 there -- expect cos ~0.999, not bitwise), and materialises the scores
 densely, so memory is O(T^2).
 """
 
-import functools
-import inspect
-
 import torch
 
 from ...registry import registry
@@ -72,7 +69,7 @@ def sol_attn(
     scale: float | None = None,
     sink_blocks: list[int] | None = None,
     sink_q: list[int] | None = None,
-    centroid_tail: bool = True,
+    max_blocks: int = 0,
     key_bias: torch.Tensor | None = None,
     topk_ratio: float = 0.0,
 ) -> torch.Tensor:
@@ -80,6 +77,8 @@ def sol_attn(
 
     ``topk_ratio`` > 0 selects SLA-style per-query-block top-k instead of the
     tau threshold (sinks and diagonal still forced exact); tau is ignored.
+    ``max_blocks`` is accepted for signature parity and ignored: the cap is a
+    CUDA memory bound, and this reference materialises densely regardless.
     """
     b, t, h, d = q.shape
     n = (t + BLOCK - 1) // BLOCK
@@ -116,8 +115,9 @@ def sol_attn(
     if n * BLOCK - t:
         lengths[-1] = float(t - (n - 1) * BLOCK)
     centroid = _pool(fq, n, "mean")                                 # (B, N, H, D)
-    var = (centroid.pow(2) * kc_var.unsqueeze(1)).sum(-1)          # (B, N, H)
-    thr = tau * torch.sqrt(var * log2s * log2s + 1e-6)
+    if not topk_ratio:
+        var = (centroid.pow(2) * kc_var.unsqueeze(1)).sum(-1)      # (B, N, H)
+        thr = tau * torch.sqrt(var * log2s * log2s + 1e-6)
 
     qh = fq.permute(0, 2, 1, 3)                                     # (B, H, T, D)
     kh = (fk - k_mean.squeeze(1).unsqueeze(1)).permute(0, 2, 1, 3)
@@ -157,10 +157,9 @@ def sol_attn(
     keep_tok = ex_tok.repeat_interleave(BLOCK, dim=-1)[..., :t]
     neg = torch.finfo(s_tok.dtype).min
     s_tok = s_tok.masked_fill(~keep_tok, neg)
-    if centroid_tail:
-        # Every row shares its query-block centroid's tail (colmean IS the
-        # centroid score); ~5e-4 cosine vs per-row, 64x less routing work.
-        s_blk = colmean.gather(2, qblk.view(1, 1, t, 1).expand(b, h, t, n))
+    # Every row shares its query-block centroid's tail (colmean IS the
+    # centroid score); ~5e-4 cosine vs per-row, 64x less routing work.
+    s_blk = colmean.gather(2, qblk.view(1, 1, t, 1).expand(b, h, t, n))
     s_blk = s_blk.masked_fill(ex_tok | ~valid_blk, neg)
 
     # One softmax over both branches. A pooled term carries its block's length in
@@ -176,19 +175,6 @@ def sol_attn(
     return out.contiguous()
 
 
-@functools.cache
-def _accepts_max_blocks(impl) -> bool:
-    """Whether this backend's ``sol_attn`` takes the routed-block cap.
-
-    Asked of the signature, not the module name, so it survives registry
-    refactors; cached because it sits in the per-call path.
-    """
-    try:
-        return "max_blocks" in inspect.signature(impl).parameters
-    except (TypeError, ValueError):
-        return False
-
-
 @torch.library.custom_op("comfy_kitchen::sol_attn", mutates_args=())
 def _op_sol_attn(
     q: torch.Tensor,
@@ -199,25 +185,22 @@ def _op_sol_attn(
     sink_blocks: list[int],
     sink_q: list[int],
     max_blocks: int,
-    centroid_tail: bool,
     key_bias: torch.Tensor | None,
     topk_ratio: float,
 ) -> torch.Tensor:
     kwargs = {
         "q": q, "k": k, "v": v, "tau": tau, "scale": scale,
         "sink_blocks": sink_blocks, "sink_q": sink_q,
-        "centroid_tail": centroid_tail, "key_bias": key_bias,
-        "topk_ratio": topk_ratio,
+        "max_blocks": max_blocks,
+        "key_bias": key_bias, "topk_ratio": topk_ratio,
     }
     impl = registry.get_implementation("sol_attn", kwargs=kwargs)
-    if _accepts_max_blocks(impl):
-        kwargs["max_blocks"] = max_blocks
     return impl(**kwargs)
 
 
 @_op_sol_attn.register_fake
 def _op_sol_attn_fake(q, k, v, tau, scale, sink_blocks, sink_q, max_blocks,
-                      centroid_tail, key_bias, topk_ratio):
+                      key_bias, topk_ratio):
     # Contiguous, NOT empty_like(v): both real implementations return
     # contiguous, and for a strided v, empty_like would promise a layout
     # downstream compiled ops never get.

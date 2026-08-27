@@ -60,7 +60,7 @@ constexpr int LDV = BK;        // 64 B, XOR-swizzled (see header)
 #define NSTAGE 2   // measured optimum: occupancy beats depth
 #endif
 
-// qi:  [B,T,H,D] int8 (T, not Tp -- the o_part/out alias depends on it)
+// qi:  [B,T,H,D] int8
 // qs:  [B,T,H] f32
 // kiP: [B*H,Tp,D] int8 (perm_key + perm_d)   ksb: [B*H,Tp] float2 = (ks, bias)
 // vTi: [B*H,D,Tp] int8 (transposed, logical key order)   vsc: [B*H,D] f32
@@ -81,7 +81,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     const __nv_bfloat16* __restrict__ o_part, const float* __restrict__ m_part,
     const float* __restrict__ l_part,
     __nv_bfloat16* __restrict__ out,
-    int T, int Tp, int H, int max_blk, float scale_log2, int centroid_tail)
+    int T, int Tp, int H, int max_blk, float scale_log2)
 {
 #if SOL_SM80
     extern __shared__ __align__(16) char smem_raw[];
@@ -124,12 +124,11 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     const uint16_t* my_idx = blk_idx + (int64_t)(bh * gridDim.x + q_block) * max_blk;
     const int n_blocks = blk_cnt[bh * gridDim.x + q_block];
 
-    // Resume from the routing pass. centroid_tail: one state per (b, h,
-    // query block), shared by all rows. Fallback: per-row state, o_part
-    // aliasing `out` (each element read and rewritten by the same thread).
+    // Resume from the routing pass: one state per (b, h, query block), the
+    // centroid tail shared by all rows of the block.
     float o_acc[NT][4];
     float m_r[2], l_r[2];
-    if (centroid_tail) {
+    {
         const int64_t qb_s = (int64_t)bh * gridDim.x + q_block;
         const __nv_bfloat16* orow = o_part + qb_s * HD;
         #pragma unroll
@@ -142,20 +141,6 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         }
         m_r[0] = m_r[1] = m_part[qb_s];
         l_r[0] = l_r[1] = l_part[qb_s];
-    } else {
-        #pragma unroll
-        for (int rr = 0; rr < 2; ++rr) {
-            const int r = min(q_row0 + rr * 8, T - 1);
-            const __nv_bfloat16* orow = o_part + bh_base + (int64_t)r * H * HD;
-            #pragma unroll
-            for (int nt = 0; nt < NT; ++nt) {
-                const int c = nt * 8 + qd * 2;
-                o_acc[nt][rr * 2]     = __bfloat162float(orow[c]);
-                o_acc[nt][rr * 2 + 1] = __bfloat162float(orow[c + 1]);
-            }
-            m_r[rr] = m_part[bh_s + (int64_t)r * H];
-            l_r[rr] = l_part[bh_s + (int64_t)r * H];
-        }
     }
 
 #define SOLX_STAGE(kbi, buf)                                               \
@@ -333,7 +318,7 @@ extern "C" void launch_sol_exact(
     const void* blk_idx, const void* blk_cnt,
     const void* o_part, const void* m_part, const void* l_part, void* out,
     int B, int T, int Tp, int H, int NQ, int max_blk,
-    float scale_log2, int centroid_tail, cudaStream_t stream)
+    float scale_log2, cudaStream_t stream)
 {
     const size_t SMEM = (size_t)NSTAGE * BK * LDK + (size_t)NSTAGE * HD * LDV;
     // Per (function, device): caching behind a process-wide flag would skip
@@ -345,6 +330,6 @@ extern "C" void launch_sol_exact(
         (const int8_t*)vTi, (const float*)vsc,
         (const uint16_t*)blk_idx, (const int32_t*)blk_cnt,
         (const __nv_bfloat16*)o_part, (const float*)m_part, (const float*)l_part,
-        (__nv_bfloat16*)out, T, Tp, H, max_blk, scale_log2, centroid_tail);
+        (__nv_bfloat16*)out, T, Tp, H, max_blk, scale_log2);
 }
 

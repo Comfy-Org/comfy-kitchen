@@ -27,9 +27,7 @@
 
 #include "mma.cuh"
 
-// The MMA/cp.async forms are sm_80+ but the build also targets sm_75, so device
-// bodies compile out below sm_80 (as ops/na3d.cu does); dispatch constraints
-// pin sol_attn to 8.0+, so the stubs are unreachable at runtime.
+// Device bodies compile out below sm_80; dispatch pins sol_attn to sm_80+.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 #define SOL_SM80 1
 #else
@@ -46,41 +44,84 @@ constexpr float NEG    = -3.0e38f;   // finite, so NEG - NEG == 0 (unlike -inf)
 // Permutations. Both are applied by the preprocess and assumed by the kernels.
 // ---------------------------------------------------------------------------
 
-// Contraction-axis permutation: makes the two MMA operand words (16 B apart)
-// adjacent, so one 8-byte load fetches both. Free -- permuting both sides of a
-// contraction identically leaves the product unchanged.
-//   applied to: Q's d axis, K's d axis, V^T's key axis, pooled keys' d axis
+// Contraction-axis permutation: makes each lane's two MMA operand words one
+// 8-byte load. Applied to Q/K/pooled-K d axes and V^T's key axis.
 __host__ __device__ __forceinline__ int perm_d(int d) {
     const int kc = d >> 5, rem = d & 31, h = rem >> 4, r2 = rem & 15;
     return kc * 32 + 8 * (r2 >> 2) + 4 * h + (r2 & 3);
 }
 
-// Key relabelling inside a 64-key block: gives each lane the 4 consecutive keys
-// the INT8 PV A operand wants without cross-lane shuffles -- free, because
-// attention is permutation-invariant over keys.
-//   applied to: K's row axis and its per-token scales, within each block
-// NOT applied to V^T: the PV B operand wants consecutive *logical* keys.
+// Key relabelling per 64-block so the INT8 PV A operand needs no shuffles.
+// Applied to K rows + their scales; NOT to V^T (wants logical key order).
 __host__ __device__ __forceinline__ int perm_key(int p) {
     return 16 * (p >> 4) + 4 * ((p & 7) >> 1) + 2 * ((p >> 3) & 1) + (p & 1);
 }
 
 // ---------------------------------------------------------------------------
-// Shared-memory swizzles. Padding would cost 6 KB = one block of occupancy.
-// Verify any change by enumerating both 16-lane LDS.64 phases against 32 banks.
+// Shared-memory swizzles (padding would cost a block of occupancy). Verify any
+// change by enumerating both 16-lane LDS.64 phases against 32 banks.
 // ---------------------------------------------------------------------------
 
-// K tile, 64 rows x 128 B. `c16 ^ (r & 7)` is conflict-free for 32-bit reads but
-// COLLIDES once reads are 64-bit; this form does not.
+// K tile, 64 x 128 B. The naive c16 ^ (r & 7) collides for 64-bit reads.
 __device__ __forceinline__ int swz_k(int row) { return (row & 3) * 2; }
 
-// V^T tile, 128 rows x 64 B -- only 4 granules, so two swizzle bits cannot
-// separate 8 g-values: rows g and g+4 collide under the naive `c16 ^ (C & 3)`.
-// Folding in C>>2 separates them.
+// V^T tile, 128 x 64 B. Naive c16 ^ (C & 3) collides rows g and g+4.
 __device__ __forceinline__ int swz_v(int col) { return ((col >> 2) ^ col) & 3; }
 
+// Fused per-head RMSNorm + split-half RoPE on a staged bf16 tile, in place.
+// Matches ops/rms_rope.cu bit-for-bit, including its bf16 rounding between
+// norm and rotation. One warp per token; lane owns channels 4*lane..+3.
+__device__ __forceinline__ void norm_rope_rows(
+    __nv_bfloat16* tile, int ld, int len, const float* __restrict__ fab_t0,
+    const __nv_bfloat16* __restrict__ w, float eps, int rot)
+{
+    // fab [T, rot, 2] is per-channel: out[c] = f.x*n[c] + f.y*n[partner(c)]
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    const int nw = (int)(blockDim.x >> 5), c0 = lane * 4;
+    float wreg[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) wreg[i] = __bfloat162float(w[c0 + i]);
+    for (int t = wp; t < len; t += nw) {
+        __nv_bfloat16* row = tile + t * ld;
+        float x[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) x[i] = __bfloat162float(row[c0 + i]);
+        float ss = x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3];
+        #pragma unroll
+        for (int off = 16; off; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
+        const float rrms = rsqrtf(ss / (float)HEAD_DIM + eps);
+        float n[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+            n[i] = __bfloat162float(__float2bfloat16(x[i] * rrms * wreg[i]));
+        // Explicit source lane: a shfl_xor butterfly is only correct for
+        // power-of-two offsets, and rot/8 need not be one (H3 rot=96 -> 12).
+        const int poff = rot >> 3;
+        const int src = (c0 < (rot >> 1)) ? lane + poff
+                        : (c0 < rot ? lane - poff : lane);
+        float p[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) p[i] = __shfl_sync(0xffffffffu, n[i], src);
+        float out[4];
+        if (c0 < rot) {
+            const float* fr = fab_t0 + (int64_t)t * (rot * 2) + c0 * 2;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 f = *reinterpret_cast<const float2*>(fr + i * 2);
+                out[i] = f.x * n[i] + f.y * p[i];
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) out[i] = n[i];
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) row[c0 + i] = __float2bfloat16(out[i]);
+    }
+}
+
 // ---------------------------------------------------------------------------
-// MMA wrappers. sm_120 is issue-rate bound and f32-accumulate forms issue at
-// half rate, so INT8 m16n8k32 (4096 MACs, full rate) beats every alternative.
+// MMA wrappers. INT8 m16n8k32 issues at full rate on sm_120; f32-accumulate
+// forms issue at half rate.
 // ---------------------------------------------------------------------------
 
 __device__ __forceinline__ void mma_s8(int32_t* d, const uint32_t* a, const uint32_t* b) {
@@ -92,8 +133,7 @@ __device__ __forceinline__ void mma_s8(int32_t* d, const uint32_t* a, const uint
 #endif
 }
 
-// P is non-negative, so it rides the u8 side of a u8 x s8 MMA: 255 levels
-// instead of s8's 127, for free.
+// P is non-negative: the u8 side gives it 255 levels instead of 127.
 __device__ __forceinline__ void mma_u8s8(int32_t* d, const uint32_t* a, const uint32_t* b) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32.u8.s8.s32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -117,7 +157,6 @@ __device__ __forceinline__ uint32_t pack_bf2(float lo, float hi) {
 
 // ---------------------------------------------------------------------------
 // cp.async. Pipeline depth 2 is the measured optimum: occupancy beats depth.
-// The driver reserves ~1 KB smem per block on top of the request.
 // ---------------------------------------------------------------------------
 
 __device__ __forceinline__ void cp_async16(void* dst, const void* src) {
@@ -126,8 +165,7 @@ __device__ __forceinline__ void cp_async16(void* dst, const void* src) {
                  :: "r"((uint32_t)__cvta_generic_to_shared(dst)), "l"(src));
 #endif
 }
-// .ca keeps the line in L1. Only worthwhile where the source is reused (the
-// pooled arrays in routing); the exact pass streams far past L1 and pays there.
+// .ca keeps the line in L1 -- only for reused sources (routing's pooled arrays).
 __device__ __forceinline__ void cp_async16_ca(void* dst, const void* src) {
 #if SOL_SM80
     asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"

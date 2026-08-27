@@ -165,27 +165,6 @@ def test_rejects_noncontiguous_last_dim():
         cuda_backend.sol_attn(bad, k, v, tau=1.4)
 
 
-@pytest.mark.parametrize("centroid_tail", [True, False])
-def test_tail_mode_matches_its_eager(centroid_tail):
-    """Both tail modes must match their eager counterpart. centroid_tail=False
-    is the pre-centroid per-row tail, kept selectable for quality A/B on real
-    workloads; the two modes differ slightly by construction."""
-    q, k, v = _qkv(1, 2048, 4)
-    got = ck.sol_attn(q, k, v, tau=1.4, centroid_tail=centroid_tail)
-    ref = sol_attn_eager(q, k, v, tau=1.4, centroid_tail=centroid_tail)
-    assert _cos(got, ref) > 0.998
-
-
-def test_tail_modes_differ():
-    """The switch must actually switch: identical outputs would mean the flag
-    is being dropped somewhere in the dispatch chain."""
-    q, k, v = _qkv(1, 2048, 4)
-    a = ck.sol_attn(q, k, v, tau=1.4, centroid_tail=True)
-    b = ck.sol_attn(q, k, v, tau=1.4, centroid_tail=False)
-    assert not torch.equal(a, b)
-    assert _cos(a, b) > 0.995
-
-
 def test_tau_monotonicity():
     """Higher tau routes fewer blocks exactly, so it can only move away from
     dense attention."""
@@ -229,7 +208,7 @@ def test_output_strides_agree_across_backends():
         # addition when written positionally.
         fake_strides = torch.ops.comfy_kitchen.sol_attn(
             fv, fv, fv, tau=1.4, scale=None, sink_blocks=[0, 0], sink_q=[0, 0],
-            max_blocks=0, centroid_tail=True, key_bias=None,
+            max_blocks=0, key_bias=None,
             topk_ratio=0.0).stride()
     assert cuda_strides == eager_strides == fake_strides
 
@@ -295,8 +274,7 @@ def test_head_dim_constraint():
         ck.sol_attn(q, k, v, tau=1.4)
 
 
-@pytest.mark.parametrize("centroid_tail", [True, False])
-def test_key_bias_matches_eager(centroid_tail):
+def test_key_bias_matches_eager():
     """LTX-style guide-strength bias: per-key additive logit bias, honoured by
     the exact branch in BOTH tail modes. Guide blocks must be sink-covered (the
     pooled tail cannot see per-token bias), which the node does automatically."""
@@ -306,14 +284,11 @@ def test_key_bias_matches_eager(centroid_tail):
     bias[:, -128:-64] = math.log(0.3)
     bias[:, -64:] = math.log(2.0)
     sinks = [2048 // 64 - 2, 2048 // 64]
-    got = ck.sol_attn(q, k, v, tau=1.4, key_bias=bias, sink_blocks=sinks,
-                      centroid_tail=centroid_tail)
-    ref = sol_attn_eager(q, k, v, tau=1.4, key_bias=bias, sink_blocks=sinks,
-                         centroid_tail=centroid_tail)
+    got = ck.sol_attn(q, k, v, tau=1.4, key_bias=bias, sink_blocks=sinks)
+    ref = sol_attn_eager(q, k, v, tau=1.4, key_bias=bias, sink_blocks=sinks)
     assert _cos(got, ref) > 0.998
     # and the bias must actually do something
-    plain = ck.sol_attn(q, k, v, tau=1.4, sink_blocks=sinks,
-                        centroid_tail=centroid_tail)
+    plain = ck.sol_attn(q, k, v, tau=1.4, sink_blocks=sinks)
     assert not torch.equal(got, plain)
 
 
@@ -347,8 +322,7 @@ def test_key_bias_wrong_device_rejected():
         ck.sol_attn(q, k, v, tau=1.4, key_bias=torch.zeros(256))
 
 
-@pytest.mark.parametrize("centroid_tail", [True, False])
-def test_cap_never_unmasks_sinked_biased_keys(centroid_tail):
+def test_cap_never_unmasks_sinked_biased_keys():
     """Sinks are pre-emitted into the routed list and exempt from max_blocks
     truncation. Before that, the ascending-order cap could fill before reaching
     sequence-end sink blocks and drop them into the pooled tail -- which
@@ -363,8 +337,7 @@ def test_cap_never_unmasks_sinked_biased_keys(centroid_tail):
         v2 = v.clone()
         v2[:, -128:] = canary
         return ck.sol_attn(q, k, v2, tau=0.05, key_bias=bias,
-                           sink_blocks=[n - 2, n], max_blocks=8,
-                           centroid_tail=centroid_tail)
+                           sink_blocks=[n - 2, n], max_blocks=8)
 
     assert torch.equal(run(8.0), run(-8.0))
 
@@ -419,40 +392,18 @@ def test_sub_sm80_rejected_at_the_wrapper(monkeypatch):
         cuda_backend.sol_attn(q, k, v, tau=1.4)
 
 
-@pytest.mark.parametrize("centroid_tail", [True, False])
-def test_reuse_qkv_memory_matches_and_uses_fused_storage(centroid_tail):
-    """reuse_qkv_memory=True writes `out` into the inputs' storage. Modeled on H3:
-    q/k/v are chunk views of one fused qkv buffer that the model discards
-    after attention, so on one stream the region is free once the preprocess
-    (the only reader of the originals) is done."""
-    from comfy_kitchen.backends import cuda as cuda_backend
-    g = torch.Generator(device="cuda").manual_seed(0)
-    fused = torch.randn(1, 2048, 3 * 4 * HD, device="cuda", dtype=torch.bfloat16,
-                        generator=g) * 0.5
-    q, k, v = (x.view(1, 2048, 4, HD) for x in fused.split(4 * HD, dim=-1))
-    ref = cuda_backend.sol_attn(q.clone().contiguous(), k.clone().contiguous(),
-                                v.clone().contiguous(), tau=1.4,
-                                centroid_tail=centroid_tail)
-    got = cuda_backend.sol_attn(q, k, v, tau=1.4, centroid_tail=centroid_tail,
-                                reuse_qkv_memory=True)
-    assert torch.equal(got, ref)
-    assert got.untyped_storage().data_ptr() == fused.untyped_storage().data_ptr()
-
-
 @pytest.mark.parametrize("t", [4096, 1000, 3137])
-@pytest.mark.parametrize("centroid_tail", [True, False])
-def test_topk_matches_eager(t, centroid_tail):
+def test_topk_matches_eager(t):
     """SLA-style top-k selection: the CUDA path implements it as a per-row
     threshold at the (k+1)-th pooled score, so int8 rounding can flip blocks
     right at the boundary -- hence a slightly looser bar than tau parity.
     Ragged tails exercise the fp32 threshold's tail-block pooling."""
     q, k, v = _qkv(1, t, 4)
-    got = ck.sol_attn(q, k, v, topk_ratio=0.2, centroid_tail=centroid_tail)
-    ref = sol_attn_eager(q, k, v, topk_ratio=0.2, centroid_tail=centroid_tail)
+    got = ck.sol_attn(q, k, v, topk_ratio=0.2)
+    ref = sol_attn_eager(q, k, v, topk_ratio=0.2)
     assert _cos(got, ref) > 0.995
     # selection changes with the budget
-    assert not torch.equal(got, ck.sol_attn(q, k, v, topk_ratio=0.5,
-                                            centroid_tail=centroid_tail))
+    assert not torch.equal(got, ck.sol_attn(q, k, v, topk_ratio=0.5))
 
 
 def test_topk_strided_inputs():
@@ -492,3 +443,103 @@ def test_topk_ratio_validation():
     q, k, v = _qkv(1, 1024, 1)
     with pytest.raises(ValueError, match="topk_ratio"):
         cuda_backend.sol_attn(q, k, v, topk_ratio=1.5)
+
+
+@pytest.mark.parametrize("rot", [64, 96])
+def test_fused_rope_matches_separate_pass(rot):
+    """rope_freqs fuses RMSNorm+RoPE into the preprocess; it must match
+    running rms_rope_split_half_ first. rot=96 is H3's REAL rot_dim -- the
+    partner shuffle must not assume a power-of-two lane offset (that bug
+    shipped and broke a real generation)."""
+    from comfy_kitchen.backends import cuda as cuda_backend
+    g = torch.Generator(device="cuda").manual_seed(5)
+    T, H, D = 2048, 4, HD
+    qkv = torch.randn(1, T, H * D * 3, device="cuda", dtype=torch.bfloat16,
+                      generator=g) * 0.5
+    freqs = torch.randn(1, T, 1, rot // 2, 2, 2, device="cuda", generator=g)
+    qw = torch.randn(D, device="cuda", dtype=torch.bfloat16, generator=g)
+    kw = torch.randn(D, device="cuda", dtype=torch.bfloat16, generator=g)
+    q = qkv[..., :H * D].view(1, T, H, D)
+    k = qkv[..., H * D:2 * H * D].view(1, T, H, D)
+    v = qkv[..., 2 * H * D:].view(1, T, H, D)
+    q2, k2 = q.clone(), k.clone()
+    ck.rms_rope_split_half_(q2, k2, freqs, qw, kw, epsilon=1e-6, rot_dim=rot)
+    ref = cuda_backend.sol_attn(q2, k2, v, tau=1.4)
+    got = cuda_backend.sol_attn(q, k, v, tau=1.4, rope_freqs=freqs,
+                                qk_norm_weights=(qw, kw))
+    assert _cos(got, ref) > 0.9999
+    with pytest.raises(ValueError, match="topk_ratio"):
+        cuda_backend.sol_attn(q, k, v, topk_ratio=0.1, rope_freqs=freqs,
+                              qk_norm_weights=(qw, kw))
+    with pytest.raises(ValueError, match="qk_norm_weights"):
+        cuda_backend.sol_attn(q, k, v, tau=1.4, rope_freqs=freqs)
+
+
+def test_chunked_producer_matches_fused():
+    """The chunked QKV producer path (projection output consumed in 64-aligned
+    chunks, carriers emitted directly, stale-stats centering) must match the
+    fused single-call path. Warm stats close most of the bootstrap gap."""
+    from comfy_kitchen.backends import cuda as cuda_backend
+    g = torch.Generator(device="cuda").manual_seed(11)
+    T, H, D = 4096 + 128, 4, HD          # ragged tail across chunk boundary
+    rot = D // 2
+    qkv = torch.randn(T, 3 * H * D, device="cuda", dtype=torch.bfloat16,
+                      generator=g) * 0.5
+    qkv[:, 2 * H * D:] *= 0.02   # realistic small V: blind bootstrap scales
+                                 # quantized this to garbage (broke a real run)
+    freqs = torch.randn(1, T, 1, rot // 2, 2, 2, device="cuda", generator=g)
+    qw = torch.randn(D, device="cuda", dtype=torch.bfloat16, generator=g)
+    kw = torch.randn(D, device="cuda", dtype=torch.bfloat16, generator=g)
+    q = qkv[:, :H * D].view(1, T, H, D)
+    k = qkv[:, H * D:2 * H * D].view(1, T, H, D)
+    v = qkv[:, 2 * H * D:].view(1, T, H, D)
+    ref = cuda_backend.sol_attn(q, k, v, tau=1.4, rope_freqs=freqs,
+                                qk_norm_weights=(qw, kw), sink_blocks=[0, 2])
+    chunks = list(qkv.split(1024))
+    out1, km, vs = cuda_backend.sol_attn_chunked(
+        chunks, T, H, freqs, (qw, kw), tau=1.4, sink_blocks=[0, 2])
+    out2, _, _ = cuda_backend.sol_attn_chunked(
+        chunks, T, H, freqs, (qw, kw), kmean=km, vscale=vs,
+        tau=1.4, sink_blocks=[0, 2])
+    assert _cos(out1, ref) > 0.995       # bootstrap self-measures, no blind scales
+    assert _cos(out2, ref) > 0.995
+    # ComfyUI runs under inference_mode: no ._version access anywhere
+    with torch.inference_mode():
+        f2 = freqs.clone()
+        out3, _, _ = cuda_backend.sol_attn_chunked(
+            chunks, T, H, f2, (qw, kw), kmean=km, vscale=vs,
+            tau=1.4, sink_blocks=[0, 2])
+    assert _cos(out3, ref) > 0.995
+    # chunk coverage is validated
+    with pytest.raises(ValueError, match="chunks cover"):
+        cuda_backend.sol_attn_chunked(chunks[:-1], T, H, freqs, (qw, kw))
+
+
+def test_chunked_producer_topk():
+    """Producer-path top-k: the threshold comes from the workspace's own
+    pooled outputs (post-rope, kernel-exact quantization) and must match the
+    separate-rope top-k path. perm_d is not an involution -- the centroid is
+    the side that gets unpermuted."""
+    from comfy_kitchen.backends import cuda as cuda_backend
+    g = torch.Generator(device="cuda").manual_seed(13)
+    T, H, D = 4096 + 128, 4, HD
+    rot = D // 2
+    qkv = torch.randn(T, 3 * H * D, device="cuda", dtype=torch.bfloat16,
+                      generator=g) * 0.5
+    freqs = torch.randn(1, T, 1, rot // 2, 2, 2, device="cuda", generator=g)
+    qw = torch.randn(D, device="cuda", dtype=torch.bfloat16, generator=g)
+    kw = torch.randn(D, device="cuda", dtype=torch.bfloat16, generator=g)
+    q = qkv[:, :H * D].view(1, T, H, D).clone()
+    k = qkv[:, H * D:2 * H * D].view(1, T, H, D).clone()
+    v = qkv[:, 2 * H * D:].view(1, T, H, D)
+    ck.rms_rope_split_half_(q, k, freqs, qw, kw, epsilon=1e-6, rot_dim=rot)
+    ref = cuda_backend.sol_attn(q, k, v, topk_ratio=0.2, sink_blocks=[0, 2])
+    chunks = list(qkv.split(1024))
+    _, km, vs = cuda_backend.sol_attn_chunked(
+        chunks, T, H, freqs, (qw, kw), topk_ratio=0.2, sink_blocks=[0, 2])
+    out, _, _ = cuda_backend.sol_attn_chunked(
+        chunks, T, H, freqs, (qw, kw), kmean=km, vscale=vs,
+        topk_ratio=0.2, sink_blocks=[0, 2])
+    assert _cos(out, ref) > 0.995
+
+
