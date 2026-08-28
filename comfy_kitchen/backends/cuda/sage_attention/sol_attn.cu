@@ -15,21 +15,14 @@
  * limitations under the License.
  */
 
-// Sol-Attn: training-free sparse attention for video diffusion (arXiv 2607.24027).
-// Stages orchestrated over one workspace the caller allocates:
-//
-//   preprocess  quantize Q/K/V, pool K/V per block, derive the routing threshold
+// Sol-Attn (arXiv 2607.24027) orchestration over one caller-allocated workspace:
+//   preprocess  quantize Q/K/V, pool K/V per block, routing threshold
 //   vtranspose  INT8 V^T for the exact stage's PV operand
-//   route       decide the routed blocks; carry the approximate correction
+//   route       choose the routed blocks; approximate tail from the centroids
 //   exact       walk each routed list, resuming route's online softmax
-//
-// Two entry paths fill the workspace: `launch_sol_attn` from post-rope
-// q/k/v (preprocess + vtranspose), or the chunked producer
-// (`sol_producer_begin` / `sol_producer_chunk` over qkv-projection chunks,
-// then `launch_sol_attn_core`). Both end in route + exact.
-//
-// Layout contract (permutations, swizzles, MMA choice): sol_layout.cuh.
-// Requires sm_80+ (tuned for sm_120); q/k/v/out are (B, T, H, 128) bf16.
+// Entry paths: `launch_sol_attn` (post-rope q/k/v) or the chunked producer
+// (`sol_producer_begin/chunk`, then `launch_sol_attn_core`). sm_80+, tuned
+// for sm_120; tensors are (B, T, H, 128) bf16.
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -38,9 +31,8 @@
 
 #include "sol_layout.cuh"
 
-// Launchers defined in the sibling TUs. C++ linkage on purpose: a prototype
-// that drifts from its definition fails to link instead of corrupting at
-// runtime.
+// Sibling-TU launchers. C++ linkage on purpose: a drifted prototype fails to
+// link instead of corrupting at runtime.
 void launch_sol_preprocess(const void*, const void*, const void*, void*, void*, void*,
                            void*, void*, void*, void*, void*, void*, void*, void*, void*,
                            const void*,
@@ -73,8 +65,7 @@ constexpr int BLK = sol::BLOCK;
 
 inline size_t align16(size_t n) { return (n + 15u) & ~(size_t)15u; }
 
-// Workspace carve-up; a pure function of the shape. `sol_attn_plan` exports it
-// so the Python side reads slots from this definition rather than a mirror.
+// Workspace carve-up, a pure function of the shape; exported by sol_attn_plan.
 struct Plan {
     int Tp, NTB, NPAD, NQ;
     size_t qiP, qs, kiP, ksb, vTi, vsc, kciP, kcs, vcT, thr, cen8, cens;
@@ -98,18 +89,15 @@ struct Plan {
         kcs     = take(bh * NPAD * sizeof(float));
         vcT     = take(bh * HD * NPAD * sizeof(uint16_t));
         thr     = take(bh * NQ * sizeof(float));
-        // uint16 block ids; the only T^2 term
-        idx     = take(bh * NQ * NTB * sizeof(uint16_t));
+        idx     = take(bh * NQ * NTB * sizeof(uint16_t));   // the only T^2 term
         cnt     = take(bh * NQ * sizeof(int32_t));
         cen8    = take(bh * NQ * HD);
         cens    = take(bh * NQ * sizeof(float));
-        // Handover state: one (o, m, l) per (b, h, query block) -- the
-        // centroid tail is shared by all rows of a block.
+        // route -> exact handover: one (o, m, l) per (b, h, query block)
         oPart   = take(bh * NQ * HD * sizeof(uint16_t));
         mPart   = take(bh * NQ * sizeof(float));
         lPart   = take(bh * NQ * sizeof(float));
         statsV  = take(bh * HD * sizeof(float));   // producer vamax accumulator
-        // pooled K means (block sums in the producer path), kmean, kcvar
         scratch = take(sol_preprocess_scratch_bytes(B, H, NPAD));
         total = o;
     }
@@ -123,17 +111,15 @@ void validate_shape(int batch, int seq_len, int num_heads) {
         throw std::runtime_error("sol_attn: batch * num_heads exceeds the 65535 grid limit");
 }
 
-// route + exact over a populated workspace. One cudaGetLastError afterwards
-// covers every stage launched before it (the first failure latches until
-// read); without it a rejected launch would silently leave route's handover
-// values in `out`.
+// route + exact over a populated workspace. The cudaGetLastError covers every
+// stage launched before it; without it a rejected launch leaves route's
+// handover values in `out`.
 void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* out,
                      int batch, int seq_len, int num_heads,
                      int sink_start, int sink_end, int sink_q_start, int sink_q_end,
                      float scale_log2, cudaStream_t stream)
 {
-    // Top-k selection is a per-query-block threshold the caller computed (the
-    // (k+1)-th largest pooled score); the kernels don't know the difference.
+    // top-k mode: the caller supplies the per-query-block threshold
     const void* thr = ext_threshold ? ext_threshold : (const void*)(w + p.thr);
     launch_sol_route(w + p.cen8, w + p.cens, w + p.kciP, w + p.kcs, w + p.vcT, w + p.vsc,
                      thr, w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart,
@@ -151,17 +137,15 @@ void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* ou
 
 }  // namespace
 
-extern "C" size_t sol_attn_workspace_bytes(int batch, int seq_len, int num_heads) {
-    return Plan(batch, seq_len, num_heads).total;
-}
-
 // Plan dims and slot offsets, in the order sol_attn_plan_names lists them.
 extern "C" const char* const sol_attn_plan_names[] = {
     "Tp", "NTB", "NPAD", "NQ",
     "qiP", "qs", "kiP", "ksb", "vTi", "vsc", "kciP", "kcs", "vcT", "thr", "cen8", "cens",
     "idx", "cnt", "oPart", "mPart", "lPart", "statsV", "scratch", "total", nullptr,
 };
-extern "C" void sol_attn_plan(int batch, int seq_len, int num_heads, int64_t* out) {
+// Writes the values into out[0..count) and returns count; writes nothing if
+// cap < count, so a caller with a fixed buffer can detect a grown Plan.
+extern "C" int sol_attn_plan(int batch, int seq_len, int num_heads, int64_t* out, int cap) {
     const Plan p(batch, seq_len, num_heads);
     const int64_t v[] = {
         p.Tp, p.NTB, p.NPAD, p.NQ,
@@ -171,7 +155,10 @@ extern "C" void sol_attn_plan(int batch, int seq_len, int num_heads, int64_t* ou
         (int64_t)p.mPart, (int64_t)p.lPart, (int64_t)p.statsV, (int64_t)p.scratch,
         (int64_t)p.total,
     };
-    for (size_t i = 0; i < sizeof(v) / sizeof(v[0]); ++i) out[i] = v[i];
+    const int count = (int)(sizeof(v) / sizeof(v[0]));
+    if (cap >= count)
+        for (int i = 0; i < count; ++i) out[i] = v[i];
+    return count;
 }
 
 // ---- chunked producer path ----
@@ -181,7 +168,7 @@ extern "C" void sol_producer_begin(void* workspace, int batch, int seq_len,
     const Plan p(batch, seq_len, num_heads);
     char* w = reinterpret_cast<char*>(workspace);
     const size_t bh = (size_t)batch * num_heads;
-    // vcT's pad columns are read by route; statsV is an atomicMax accumulator.
+    // route reads vcT's pad columns; statsV is an atomicMax accumulator
     cudaMemsetAsync(w + p.vcT, 0, bh * HD * p.NPAD * sizeof(uint16_t), stream);
     cudaMemsetAsync(w + p.statsV, 0, bh * HD * sizeof(float), stream);
 }
@@ -202,8 +189,8 @@ extern "C" void sol_producer_chunk(
                         p.NPAD, p.NQ, stream);
 }
 
-// vscale is the [B*H, HD] f32 scale the producer quantized V with; kmean_next
-// and vamax_out ([B*H, HD] f32) receive this step's statistics.
+// vscale: the [B*H, HD] f32 scale the producer quantized V with.
+// kmean_next / vamax_out ([B*H, HD] f32) receive this step's statistics.
 extern "C" void launch_sol_attn_core(
     void* workspace, void* out, const void* vscale, void* kmean_next, void* vamax_out,
     int batch, int seq_len, int num_heads,

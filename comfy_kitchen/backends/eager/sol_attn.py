@@ -95,8 +95,6 @@ def sol_attn(
     sink_kv0, sink_kv1 = (sink_blocks or [0, 0])[:2]
     sink_q0, sink_q1 = (sink_q or [0, 0])[:2]
 
-    # Anything routed here by accident (fp16/fp32 input at video length) would
-    # otherwise die in the allocator with nothing pointing at the cause.
     score_bytes = b * h * t * t * 4
     if score_bytes > _MAX_SCORE_BYTES:
         raise RuntimeError(
@@ -111,8 +109,7 @@ def sol_attn(
     kc = _pool(fk, n, "mean")                       # (B, N, H, D) summary keys
     vc = _pool(fv, n, "sum")                        # (B, N, H, D) summed values
 
-    # Centring K by the pooled mean shifts every score in a row by a constant,
-    # leaving the softmax unchanged; it only shrinks the INT8 dynamic range.
+    # centring K shifts every score in a row by a constant: softmax-invariant
     k_mean = kc.mean(dim=1, keepdim=True)           # (B, 1, H, D)
     kcc = kc - k_mean
     kc_var = kcc.pow(2).mean(dim=1)                 # (B, H, D)
@@ -134,9 +131,8 @@ def sol_attn(
         s_tok = s_tok + (kb * _LOG2E).reshape(-1, 1, 1, t)
     s_blk = (qh @ kch.transpose(-1, -2)) * log2s                    # (B, H, T, N)
 
-    # A block is routed if its mean score over the query block clears the
-    # threshold; the diagonal and its neighbours, and any sink block, are always
-    # exact, and every block is exact for a query inside the sink range.
+    # routed = column mean over the query block clears the threshold; the
+    # diagonal +-1, sink blocks and sink_q rows are always exact
     qblk = torch.arange(t, device=q.device) // BLOCK
     colmean = torch.zeros(b, h, n, n, device=q.device, dtype=s_blk.dtype)
     colmean.scatter_add_(2, qblk.view(1, 1, t, 1).expand(b, h, t, n), s_blk)
@@ -159,21 +155,18 @@ def sol_attn(
     keep_tok = ex_tok.repeat_interleave(BLOCK, dim=-1)[..., :t]
     neg = torch.finfo(s_tok.dtype).min
     s_tok = s_tok.masked_fill(~keep_tok, neg)
-    # Every row shares its query-block centroid's tail (colmean IS the
-    # centroid score); ~5e-4 cosine vs per-row, 64x less routing work.
+    # every row shares its query block's tail (colmean IS the centroid score)
     s_blk = colmean.gather(2, qblk.view(1, 1, t, 1).expand(b, h, t, n))
     s_blk = s_blk.masked_fill(ex_tok, neg)
 
-    # One softmax over both branches. A pooled term carries its block's length in
-    # the denominator because vc is a sum, not a mean.
+    # one softmax over both branches; a pooled term weighs its block length (vc is a sum)
     logits = torch.cat([s_tok, s_blk], dim=-1)
     p = torch.exp2(logits - logits.amax(dim=-1, keepdim=True))
     p = p.masked_fill(logits <= neg, 0.0)
     num = p[..., :t] @ vh + p[..., t:] @ vch
     den = p[..., :t].sum(-1) + (p[..., t:] * lengths.view(1, 1, 1, n)).sum(-1)
     out = (num / den.clamp_min(1e-30).unsqueeze(-1)).permute(0, 2, 1, 3).to(v.dtype)
-    # Contiguous to match the CUDA backend and register_fake (torch.compile
-    # plans downstream ops against the fake's strides).
+    # contiguous, matching the CUDA backend and register_fake
     return out.contiguous()
 
 
@@ -201,7 +194,5 @@ def _op_sol_attn(
 @_op_sol_attn.register_fake
 def _op_sol_attn_fake(q, k, v, tau, scale, sink_blocks, sink_q,
                       key_bias, topk_ratio):
-    # Contiguous, NOT empty_like(v): both real implementations return
-    # contiguous, and for a strided v, empty_like would promise a layout
-    # downstream compiled ops never get.
+    # contiguous, NOT empty_like(v): both real implementations return contiguous
     return torch.empty(v.shape, dtype=v.dtype, device=v.device)

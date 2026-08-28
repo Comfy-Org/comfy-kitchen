@@ -15,23 +15,14 @@
  * limitations under the License.
  */
 
-// Sol-Attn chunked QKV producer: consumes a token-major slice of the fused
-// qkv projection output ([M, 3*H*HD] bf16, B=1) and emits the attention
-// carriers for those tokens directly -- RMSNorm + split-half RoPE applied
-// once per token, never written back, so the full bf16 Q/K/V round trip
-// (and its residency) disappears.
+// Sol-Attn chunked QKV producer: a token-major slice of the fused qkv
+// projection ([M, 3*H*HD] bf16, B=1) -> the workspace carriers for those
+// tokens, with RMSNorm + RoPE applied in-tile, so full bf16 Q/K/V never exist.
 //
-// K centering and V channel scaling need global statistics, so the caller
-// provides LAST STEP's kmean / V scale: both are range optimisations, not
-// correctness requirements (the per-token K scale absorbs any centering
-// vector; the V scale carries a clip margin). Fresh statistics for the next
-// step come out of `launch_sol_finish` (kmean from the pooled sums) and the
-// vamax atomics here.
-//
-// Emits, per chunk: qiP/qs, kiP/ksb (perm_key + perm_d), vTi (transposed
-// int8), vcT (block value sums), ksumP (block K sums, post-rope), cen8/cens
-// (quantized query-block centroids). launch_sol_finish (sol_attn_preprocess.cu)
-// turns the pooled sums into kciP/kcs/threshold before route + exact run.
+// K centering and V scaling use LAST step's kmean / V scale (range
+// optimisations only: the per-token K scale absorbs any centering vector, the
+// V scale carries a clip margin). Next-step statistics come from the pooled
+// K sums (launch_sol_finish) and the vamax atomics here.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -44,9 +35,8 @@ using namespace sol;
 
 constexpr int HD = HEAD_DIM, BLK = BLOCK;
 
-// One CTA per (64-token block, head); q, k, v processed sequentially through
-// one staged tile. qkv rows are 3*H*HD bf16; q at column h*HD, k at
-// (H + h)*HD, v at (2H + h)*HD.
+// One CTA per (64-token block, head); q, k, v pass through one staged tile.
+// qkv row = [q | k | v], each H*HD wide.
 __global__ void sol_producer_kernel(
     const __nv_bfloat16* __restrict__ qkv,   // [M, 3*H*HD], chunk at token t0
     const float* __restrict__ fab,           // [T, rot, 2] packed rope coeffs
@@ -90,7 +80,7 @@ __global__ void sol_producer_kernel(
     norm_rope_rows(sT, LD_TILE, len, fab_t0, kw, rope_eps, rot);
     __syncthreads();
     {
-        // block K sums (post-rope, uncentered) for the pooled route tensors
+        // block K sums (post-rope, uncentered) for the pooled tensors
         float sk = 0.f;
         for (int t = 0; t < len; ++t) sk += __bfloat162float(sT[t * LD_TILE + tid]);
         ksumP[((size_t)h * NPAD + nblk) * HD + tid] = sk;
@@ -106,8 +96,7 @@ __global__ void sol_producer_kernel(
         const int d = tid;
         const float inv = 1.f / vscale[(size_t)h * HD + d];
         float sv = 0.f, av = 0.f;
-        // vTi: raw channel rows, KEY axis takes perm_d per 64-block (the
-        // exact kernel's PV repack depends on it -- see sol_attn_vtranspose.cu).
+        // vTi: raw channel rows, perm_d on the KEY axis per 64-block
         int8_t col[BLK];
         for (int t = 0; t < BLK; ++t) {
             const float x = (t < len) ? __bfloat162float(sT[t * LD_TILE + d]) : 0.f;

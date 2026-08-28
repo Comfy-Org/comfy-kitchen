@@ -15,27 +15,17 @@
  * limitations under the License.
  */
 
-// Sol-Attn exact branch. Each query block walks its routed key-block list,
-// resuming the online softmax (o/m/l) from the routing pass's handover so the
-// two stages compose exactly.
+// Sol-Attn exact branch: each query block walks its routed key-block list,
+// resuming the online softmax (o/m/l) from route's handover.
 //
-// All-INT8 MMA (QK and PV): sm_120 is issue-rate bound, so int8 m16n8k32 packs
-// the most MACs into one full-rate instruction and INT8 PV halves both the PV
-// MMA count and the V smem loads. The PV A operand wants 4 consecutive keys per
-// lane where the score tile's C layout hands each lane 2; sol::perm_key
-// relabels keys inside each 64-block (host-side, on K and its scales) so the
-// repack is free -- score n-tiles (4kk, 4kk+1) give lane q logical keys
-// 32kk+4q..+3. sK and the K scales are indexed by PHYSICAL slot, sVt by
-// LOGICAL key. Fragment loads are 64-bit via sol::perm_d; smem uses the XOR
-// swizzles derived in sol_layout.cuh instead of padding (padding cost a block
-// of occupancy).
-//
-// K scales/bias are not staged: (ks, bias) for an adjacent column pair is 16
-// contiguous bytes, one L1-resident LDG.128 per score n-tile, keeping smem at
-// 32768 B = 3 blocks/SM. cp.async double-buffers the staging; inputs are
-// padded to Tp so the copies run unconditionally. Per-channel V scale and the
-// 1/255 P scale are constant across key blocks, so they commute with the
-// online-softmax rescale and fold into the epilogue.
+// All-INT8 MMA. The PV A operand wants 4 consecutive keys per lane where the
+// score C layout gives 2; sol::perm_key (applied host-side to K and its
+// scales) makes the repack free: score n-tiles (4kk, 4kk+1) hold lane q's
+// logical keys 32kk+4q..+3. sK and the K scales are indexed by PHYSICAL slot,
+// sVt by LOGICAL key. K scales/bias are read straight from global ((ks, bias)
+// of an adjacent column pair is one aligned 16 B load). Inputs are padded to
+// Tp so the cp.async copies run unconditionally. The V scale and the 1/255 P
+// scale are constant across key blocks and fold into the epilogue.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -46,25 +36,21 @@
 namespace {
 using namespace sol;
 
-// Tied to the layout contract: the fragment maps and swizzles below are
-// derived from these, so they must not drift from sol_layout.cuh.
 constexpr int HD = HEAD_DIM, BQ = BLOCK, BK = BLOCK;
 constexpr int NWARP = BQ / 16, NTHREADS = NWARP * 32;
 constexpr int KC  = HD / 32;   // int8 k-chunks for S = Q.K^T
 constexpr int NKT = BK / 8;    // score n8 tiles
 constexpr int NT  = HD / 8;    // output n8 tiles
 constexpr int PKC = BK / 32;   // int8 k-chunks for O += P.V
-constexpr int LDK = HD;        // 128 B, XOR-swizzled (see header)
-constexpr int LDV = BK;        // 64 B, XOR-swizzled (see header)
-constexpr int NSTAGE = 2;      // measured optimum: occupancy beats depth
+constexpr int LDK = HD;        // 128 B, XOR-swizzled
+constexpr int LDV = BK;        // 64 B, XOR-swizzled
+constexpr int NSTAGE = 2;      // pipeline depth; occupancy beats depth here
 
 // qi:  [B,T,H,D] int8
 // qs:  [B,T,H] f32
 // kiP: [B*H,Tp,D] int8 (perm_key + perm_d)   ksb: [B*H,Tp] float2 = (ks, bias)
 // vTi: [B*H,D,Tp] int8 (transposed; perm_d on keys, no perm_key)   vsc: [B*H,D] f32
-// Occupancy bound is arch-specific: sm_120 reaches 168 registers spill-free, so
-// 3 blocks/SM is free (worth 1.07x); sm_89 cannot hit that without spilling,
-// and a spill in this loop is worse than one fewer block, so Ada is unbounded.
+// sm_120 fits 3 blocks/SM without spilling; sm_89 would spill, so Ada is unbounded.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
 #define SOL_EXACT_BOUNDS __launch_bounds__(NTHREADS, 3)
 #else
@@ -82,9 +68,8 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     int T, int Tp, int H, int NTB, float scale_log2)
 {
 #if SOL_SM80
-    extern __shared__ __align__(16) char smem_raw[];
-    int8_t* const sK   = reinterpret_cast<int8_t*>(smem_raw);
-    int8_t* const sVt  = sK + (size_t)NSTAGE * BK * LDK;
+    __shared__ __align__(16) int8_t sK[NSTAGE * BK * LDK];
+    __shared__ __align__(16) int8_t sVt[NSTAGE * HD * LDV];
 #define SK(b)   (sK   + (size_t)(b) * BK * LDK)
 #define SVT(b)  (sVt  + (size_t)(b) * HD * LDV)
 
@@ -122,8 +107,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     const uint16_t* my_idx = blk_idx + (int64_t)(bh * gridDim.x + q_block) * NTB;
     const int n_blocks = blk_cnt[bh * gridDim.x + q_block];
 
-    // Resume from the routing pass: one state per (b, h, query block), the
-    // centroid tail shared by all rows of the block.
+    // resume route's state: one (o, m, l) per (b, h, query block)
     float o_acc[NT][4];
     float m_r[2], l_r[2];
     {
@@ -197,8 +181,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         #pragma unroll
         for (int nt = 0; nt < NKT; ++nt) {
             const int c0 = nt * 8 + qd * 2;
-            // (ks,bias) for columns c0 and c0+1 = 16 contiguous bytes; c0 is
-            // always even, so the float4 is 16-byte aligned.
+            // (ks, bias) x 2 columns = one aligned float4 (c0 is even)
             const float4 kb4 = *reinterpret_cast<const float4*>(ksb + kp_base + cur_k0 + c0);
             const float k0s = kb4.x, m0 = kb4.y, k1s = kb4.z, m1 = kb4.w;
             #pragma unroll
@@ -219,8 +202,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         const float alpha1 = exp2f(m_r[1] - m_new[1]);
         m_r[0] = m_new[0]; m_r[1] = m_new[1];
 
-        // The u8 P scale folds into the exponent: exp2(x)*255 = exp2(x +
-        // log2 255). l and the accumulator carry the same 255; it cancels.
+        // u8 P scale folded into the exponent (+log2 255); l carries it too
         const float m_off[2] = {m_new[0] - 7.99435344f, m_new[1] - 7.99435344f};
         #pragma unroll
         for (int nt = 0; nt < NKT; ++nt) {
@@ -229,7 +211,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
                 p_val[nt][e] = exp2f(p_val[nt][e] - m_off[e >> 1]);
         }
 
-        // Free repack: n-tiles (4kk, 4kk+1) give logical keys 32kk+4q..+3.
+        // free repack (see header): n-tiles (4kk, 4kk+1) -> keys 32kk+4q..+3
         uint32_t pa[PKC][4];
         #pragma unroll
         for (int kk = 0; kk < PKC; ++kk) {
@@ -244,8 +226,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
                 p_val[b2][2], p_val[b2][3], p_val[b3][2], p_val[b3][3]);
         }
 
-        // l sums the PACKED bytes so num and den quantize identically.
-        // pa[kk][0]/[2] hold row r, [1]/[3] row r+8.
+        // l sums the PACKED bytes so num and den quantize identically
         uint32_t li[2] = {0, 0};
         #pragma unroll
         for (int kk = 0; kk < PKC; ++kk) {
@@ -280,14 +261,11 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
             o_acc[nt][2] = fmaf(o_acc[nt][2], alpha1, (float)d[2]);
             o_acc[nt][3] = fmaf(o_acc[nt][3], alpha1, (float)d[3]);
         }
-        // Depth 2 refills cur next iteration, so the barrier is still required.
-        __syncthreads();
+        __syncthreads();   // next iteration refills `cur`
     }
 #undef SOLX_STAGE
 
-    // An empty routed list leaves l_r at the resumed l_part, so the division
-    // still normalises the approximate branch. l is zero only when a row got
-    // no mass from either branch, and zeros are the right output there.
+    // l is zero only when a row got no mass from either branch; zeros are right there
     const float inv0 = 1.f / fmaxf(l_r[0], 1e-30f);
     const float inv1 = 1.f / fmaxf(l_r[1], 1e-30f);
     #pragma unroll
@@ -303,7 +281,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
             orow[c + 1] = __float2bfloat16(o_acc[nt][rr * 2 + 1] * inv * vsc[vsc_base + c + 1]);
         }
     }
-#endif  // SOL_SM80 (INT8 mma + cp.async; dispatch constraints require sm80+)
+#endif  // SOL_SM80
 }
 
 }  // namespace
@@ -316,12 +294,8 @@ void launch_sol_exact(
     int B, int T, int Tp, int H, int NQ, int NTB,
     float scale_log2, cudaStream_t stream)
 {
-    const size_t SMEM = (size_t)NSTAGE * BK * LDK + (size_t)NSTAGE * HD * LDV;
-    // Per (function, device): caching behind a process-wide flag would skip
-    // the opt-in on every device after the first.
-    cudaFuncSetAttribute(sol_exact_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
     dim3 grid(NQ, B * H);
-    sol_exact_kernel<<<grid, NTHREADS, SMEM, stream>>>(
+    sol_exact_kernel<<<grid, NTHREADS, 0, stream>>>(
         (const int8_t*)qi, (const float*)qs, (const int8_t*)kiP, (const float2*)ksb,
         (const int8_t*)vTi, (const float*)vsc,
         (const uint16_t*)blk_idx, (const int32_t*)blk_cnt,

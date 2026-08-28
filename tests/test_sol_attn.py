@@ -2,9 +2,9 @@
 
 The CUDA backend runs INT8 internally, so tests assert cosine similarity (not
 bitwise equality) against the full-precision eager reference, plus the
-invariants that have actually broken in development: batch > 1, sinks,
-ragged tails, strided inputs, and the real model's constants (rot_dim,
-activation scales, inference mode).
+layout and validation invariants: batch > 1, sinks, ragged tails, strided
+inputs, and the real model's constants (rot_dim, activation scales,
+inference mode).
 """
 
 import math
@@ -83,9 +83,7 @@ def test_matches_eager_reference(t, tau):
 
 @pytest.mark.parametrize("t", [2048 + 1, 2048 + 4, 2048 + 32])
 def test_ragged_tail_routes_like_the_reference(t):
-    """The TAIL query block must route on the mean over its LIVE rows: clamped
-    dead rows once inflated the column mean 64x at a 1-token tail, routing the
-    wrong blocks. Invisible in a whole-tensor cosine, so check the tail alone."""
+    """The tail query block must route on the mean over its LIVE rows."""
     q, k, v = _qkv(1, t, 4, seed=7)
     tail = slice(t - (t % 64), t)
     got = ck.sol_attn(q, k, v, tau=1.4)
@@ -95,8 +93,7 @@ def test_ragged_tail_routes_like_the_reference(t):
 
 @pytest.mark.parametrize("b", [2, 3])
 def test_batch(b):
-    """Every batch must match the same input run alone -- a missing batch offset
-    in one kernel silently made every batch read batch 0's values."""
+    """Every batch must match the same input run alone."""
     q, k, v = _qkv(b, 1024, 4)
     got = ck.sol_attn(q, k, v, tau=1.4)
     for i in range(b):
@@ -128,10 +125,7 @@ def test_sink_q_attends_everything():
 @pytest.mark.parametrize("b", [1, 2])
 @pytest.mark.parametrize("select", [{"tau": 1.4}, {"topk_ratio": 0.2}])
 def test_strided_inputs(b, select):
-    """Only the last dim must be contiguous, so a BHND view goes in as-is. The
-    kernels take explicit strides and the top-k threshold pools through a
-    dim-splitting view; nothing else in the suite would notice if either
-    stopped honouring them."""
+    """A BHND view (last dim contiguous) must match its contiguous copy exactly."""
     q, k, v = _bhnd_views(b, 1024, 4)
     got = ck.sol_attn(q, k, v, **select)
     ref = ck.sol_attn(q.contiguous(), k.contiguous(), v.contiguous(), **select)
@@ -139,8 +133,7 @@ def test_strided_inputs(b, select):
 
 
 def test_rejects_noncontiguous_last_dim():
-    """The staging loads are 16 B wide, so a strided last dim would read
-    neighbouring channels rather than fail."""
+    """A strided last dim would read neighbouring channels rather than fail."""
     _q, k, v = _qkv(1, 256, 4)
     bad = torch.empty(1, 256, 4, HD * 2, device="cuda", dtype=torch.bfloat16)[..., ::2]
     assert bad.stride(-1) != 1
@@ -158,9 +151,7 @@ def test_tau_monotonicity():
 
 
 def test_output_strides_agree_across_backends():
-    """register_fake, CUDA and eager must return the SAME layout: torch.compile
-    plans downstream ops against the fake, which used to promise a BHND-viewed
-    v's strides while both real implementations return contiguous."""
+    """register_fake, CUDA and eager must return the same layout."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     qh = torch.randn(1, 4, 1024, HD, device="cuda", dtype=torch.bfloat16)
@@ -171,8 +162,6 @@ def test_output_strides_agree_across_backends():
     eager_strides = sol_attn_eager(v.float(), v.float(), v.float(), tau=1.4).stride()
     with FakeTensorMode():
         fv = torch.empty(v.shape, dtype=v.dtype, device=v.device)
-        # kwargs, not positional: this call has broken on every parameter
-        # addition when written positionally.
         fake_strides = torch.ops.comfy_kitchen.sol_attn(
             fv, fv, fv, tau=1.4, scale=None, sink_blocks=[0, 0], sink_q=[0, 0],
             key_bias=None,
@@ -181,8 +170,7 @@ def test_output_strides_agree_across_backends():
 
 
 def test_unaligned_input_is_rejected():
-    """An odd storage_offset passes the contiguous-last-dim test but faults the
-    16 B staging loads with a context-poisoning misaligned address."""
+    """An odd storage_offset would fault the 16 B staging loads."""
     n = 1 * 256 * 4 * HD
     base = torch.randn(n + 8, device="cuda", dtype=torch.bfloat16)
     bad = base[1:1 + n].view(1, 256, 4, HD)
@@ -192,8 +180,7 @@ def test_unaligned_input_is_rejected():
 
 
 def test_misaligned_stride_is_rejected():
-    """An aligned base is not enough: a padded-row layout (a 132-wide buffer
-    sliced back to 128) puts rows at +264 B, misaligning the 16 B loads."""
+    """A padded-row layout (132-wide sliced to 128) misaligns the 16 B loads."""
     base = torch.randn(1, 256, 4, HD + 4, device="cuda", dtype=torch.bfloat16)
     bad = base[..., :HD]
     assert bad.stride(-1) == 1 and bad.data_ptr() % 16 == 0 and bad.stride(2) % 8
@@ -202,8 +189,7 @@ def test_misaligned_stride_is_rejected():
 
 
 def test_eager_refuses_video_length_rather_than_oom():
-    """fp16 lands on the O(T^2) reference; at video length it must say so
-    instead of dying in the allocator."""
+    """The O(T^2) reference must refuse video length, not die in the allocator."""
     q, k, v = (torch.empty(1, 37296, 56, HD, device="meta", dtype=torch.float16)
                for _ in range(3))
     with pytest.raises(RuntimeError, match="O\\(T\\^2\\)"):
@@ -212,33 +198,28 @@ def test_eager_refuses_video_length_rather_than_oom():
 
 @pytest.mark.parametrize("sink", [[3], [0, 1, 2], [2, 1], [-5, 2]])
 def test_bad_sink_range_is_rejected(sink):
-    """Sinks are [start, end) pairs; bad shapes must fail validation, not
-    IndexError deep in a backend or get silently truncated."""
+    """Sinks are [start, end) pairs; bad shapes must fail validation."""
     q, k, v = _qkv(1, 256, 4)
     with pytest.raises(NoCapableBackendError):
         ck.sol_attn(q, k, v, tau=1.4, sink_blocks=sink)
 
 
 def test_mismatched_dtype_is_rejected():
-    """The call rule cross-checks k/v against q; without it a bf16 q with an
-    fp16 k silently fell through to the dense reference."""
+    """The call rule cross-checks k/v against q."""
     q, k, v = _qkv(1, 256, 4)
     with pytest.raises(NoCapableBackendError, match="dtype"):
         ck.sol_attn(q, k.half(), v, tau=1.4)
 
 
 def test_head_dim_constraint():
-    """Both backends derive their layout from head_dim 128, so neither can take
-    the call and the registry finds nothing capable."""
+    """head_dim 128 is baked into both backends."""
     q, k, v = (torch.randn(1, 256, 4, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3))
     with pytest.raises(NoCapableBackendError, match="head_dim must be 128"):
         ck.sol_attn(q, k, v, tau=1.4)
 
 
 def test_key_bias_matches_eager():
-    """LTX-style guide-strength bias: per-key additive logit bias, honoured by
-    the exact branch. Guide blocks must be sink-covered (the pooled tail cannot
-    see per-token bias), which the node does automatically."""
+    """Per-key logit bias, honoured by the exact branch; biased blocks are sink-covered."""
     q, k, v = _qkv(1, 2048, 4)
     bias = torch.zeros(1, 2048, device="cuda")
     bias[:, -128:-64] = math.log(0.3)
@@ -253,8 +234,7 @@ def test_key_bias_matches_eager():
 
 
 def test_key_bias_inf_masks_out_keys():
-    """w=0 (a hard spatial-mask hole) is log(0) = -inf; those keys must vanish
-    without poisoning the output."""
+    """-inf bias must remove keys without poisoning the output."""
     q, k, v = _qkv(1, 1024, 4)
     bias = torch.zeros(1, 1024, device="cuda")
     bias[:, -32:] = float("-inf")
@@ -273,18 +253,14 @@ def test_key_bias_bad_shape_rejected():
 
 
 def test_key_bias_wrong_device_rejected():
-    """A host tensor's data_ptr handed to the preprocess is an asynchronous
-    illegal memory access that poisons the CUDA context on some LATER call --
-    it must be rejected before launch, not discovered downstream."""
+    """A host tensor must be rejected before launch (it would poison the context)."""
     q, k, v = _qkv(1, 256, 4)
     with pytest.raises((ValueError, RuntimeError), match="key_bias"):
         ck.sol_attn(q, k, v, tau=1.4, key_bias=torch.zeros(256))
 
 
 def test_direct_backend_validates_like_the_public_path():
-    """The backend-direct entry must run the same shared rule as the registry:
-    fp16 once ran silently to plausible garbage (bytes reinterpreted as bf16)
-    and a shorter k read out of bounds."""
+    """The backend-direct entry runs the same shared rule as the registry."""
     q, k, v = _qkv(1, 512, 4)
     with pytest.raises(ValueError, match="bfloat16"):
         cuda_backend.sol_attn(q.half(), k.half(), v.half(), tau=1.4)
@@ -293,11 +269,8 @@ def test_direct_backend_validates_like_the_public_path():
 
 
 def test_sub_sm80_rejected_at_the_wrapper(monkeypatch):
-    """The sm_75 cubins in a full-arch build compile the guarded kernel bodies
-    to a bare EXIT (verified in SASS), so a Turing launch would return
-    UNINITIALIZED memory rather than fail. The registry gate reads (and
-    caches) the CURRENT device's capability, so on a mixed-arch machine it can
-    wave such a call through -- the wrapper must check q.device itself."""
+    """Sub-sm_80 cubins are stubs returning uninitialised memory; the wrapper
+    must check q.device itself since the registry gate caches one device."""
     q, k, v = _qkv(1, 256, 4)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (7, 5))
     with pytest.raises(RuntimeError, match="sm_80"):
@@ -306,10 +279,7 @@ def test_sub_sm80_rejected_at_the_wrapper(monkeypatch):
 
 @pytest.mark.parametrize("t", [4096, 1000, 3137])
 def test_topk_matches_eager(t):
-    """SLA-style top-k selection: the CUDA path implements it as a per-block
-    threshold at the (k+1)-th pooled score, so int8 rounding can flip blocks
-    right at the boundary -- hence a slightly looser bar than tau parity.
-    Ragged tails exercise the host-side threshold's tail-block pooling."""
+    """Top-k parity; int8 rounding can flip boundary blocks, hence the looser bar."""
     q, k, v = _qkv(1, t, 4)
     got = ck.sol_attn(q, k, v, topk_ratio=0.2)
     ref = sol_attn_eager(q, k, v, topk_ratio=0.2)
@@ -347,12 +317,8 @@ def test_topk_ratio_validation():
 
 @pytest.mark.parametrize("rot", [64, 96])
 def test_chunked_producer_matches_separate_rope(rot):
-    """The chunked QKV producer (projection output consumed in 64-aligned
-    chunks, carriers emitted directly, norm+rope fused, stale-stats centering)
-    must match rms_rope_split_half_ + sol_attn. rot=96 is H3's real rot_dim:
-    the rope partner shuffle must not assume a power-of-two lane offset. V is
-    scaled down to realistic size: blind bootstrap scales quantized it to
-    garbage (broke a real run)."""
+    """Chunked producer vs rms_rope_split_half_ + sol_attn. rot=96 is H3's real
+    rot_dim (non-power-of-two lane offset); V is scaled to realistic size."""
     c = _chunked_case(seed=11, rot=rot, v_scale=0.02)
     ref = cuda_backend.sol_attn(c["q"], c["k"], c["v"], tau=1.4, sink_blocks=[0, 2])
     out1, km, vs = cuda_backend.sol_attn_chunked(
@@ -371,8 +337,7 @@ def test_chunked_producer_matches_separate_rope(rot):
 
 
 def test_chunked_producer_validates():
-    """Chunks reach the producer as bare pointers, so coverage, width and
-    device are checked up front; the selection arguments run the shared rule."""
+    """Coverage, width and device are checked before any launch."""
     c = _chunked_case(seed=11, rot=64)
     with pytest.raises(ValueError, match="chunks cover"):
         cuda_backend.sol_attn_chunked(c["chunks"][:-1], c["t"], c["h"], c["freqs"], c["norm"])
@@ -388,10 +353,7 @@ def test_chunked_producer_validates():
 
 
 def test_chunked_producer_topk():
-    """Producer-path top-k: the threshold comes from the workspace's own
-    pooled outputs (post-rope, kernel-exact quantization) and must match the
-    separate-rope top-k path. perm_d is not an involution -- the centroid is
-    the side that gets unpermuted."""
+    """Producer-path top-k (threshold from the workspace) vs the separate-rope path."""
     c = _chunked_case(seed=13, rot=64)
     ref = cuda_backend.sol_attn(c["q"], c["k"], c["v"], topk_ratio=0.2, sink_blocks=[0, 2])
     _, km, vs = cuda_backend.sol_attn_chunked(

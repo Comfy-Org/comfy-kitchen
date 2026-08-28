@@ -702,16 +702,16 @@ RS_to_u8(T RS[][num_tiles_k][8], uint32_t RS_u8[][num_tiles_k / 2][4]) {
     for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++) {
       RS_u8[fq][fk][0] =
           mma::pack_u8x4(RS[fq][fk * 2][0], RS[fq][fk * 2][1],
-                    RS[fq][fk * 2][4], RS[fq][fk * 2][5]);
+                         RS[fq][fk * 2][4], RS[fq][fk * 2][5]);
       RS_u8[fq][fk][1] =
           mma::pack_u8x4(RS[fq][fk * 2][2], RS[fq][fk * 2][3],
-                    RS[fq][fk * 2][6], RS[fq][fk * 2][7]);
+                         RS[fq][fk * 2][6], RS[fq][fk * 2][7]);
       RS_u8[fq][fk][2] =
           mma::pack_u8x4(RS[fq][fk * 2 + 1][0], RS[fq][fk * 2 + 1][1],
-                    RS[fq][fk * 2 + 1][4], RS[fq][fk * 2 + 1][5]);
+                         RS[fq][fk * 2 + 1][4], RS[fq][fk * 2 + 1][5]);
       RS_u8[fq][fk][3] =
           mma::pack_u8x4(RS[fq][fk * 2 + 1][2], RS[fq][fk * 2 + 1][3],
-                    RS[fq][fk * 2 + 1][6], RS[fq][fk * 2 + 1][7]);
+                         RS[fq][fk * 2 + 1][6], RS[fq][fk * 2 + 1][7]);
     }
   }
 }

@@ -261,9 +261,8 @@ extern "C" {
         float scale, int dtype_code, cudaStream_t stream);
 
     // Sol-Attn sparse attention — see sage_attention/sol_attn.cu.
-    size_t sol_attn_workspace_bytes(int batch, int seq_len, int num_heads);
     extern const char* const sol_attn_plan_names[];   // null-terminated
-    void sol_attn_plan(int batch, int seq_len, int num_heads, int64_t* out);
+    int sol_attn_plan(int batch, int seq_len, int num_heads, int64_t* out, int cap);
     void sol_producer_begin(void* workspace, int batch, int seq_len,
                             int num_heads, cudaStream_t stream);
     void sol_producer_chunk(
@@ -1485,16 +1484,14 @@ void na3d(
 }
 
 // Nanobind wrappers for Sol-Attn sparse attention
-int64_t sol_attn_workspace(int64_t batch, int64_t seq_len, int64_t num_heads) {
-    return (int64_t)sol_attn_workspace_bytes((int)batch, (int)seq_len, (int)num_heads);
-}
-
 // Workspace dims and slot byte offsets, from the C++ Plan (the one definition).
 nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads) {
     int64_t v[32];
-    sol_attn_plan((int)batch, (int)seq_len, (int)num_heads, v);
+    const int n = sol_attn_plan((int)batch, (int)seq_len, (int)num_heads, v, 32);
+    if (n > 32)
+        throw std::runtime_error("sol_attn_plan: Plan grew past the binding's buffer");
     nb::dict d;
-    for (int i = 0; sol_attn_plan_names[i]; ++i) d[sol_attn_plan_names[i]] = v[i];
+    for (int i = 0; i < n && sol_attn_plan_names[i]; ++i) d[sol_attn_plan_names[i]] = v[i];
     return d;
 }
 
@@ -3816,11 +3813,8 @@ NB_MODULE(_C, m) {
           nb::arg("causal_t"), nb::arg("causal_h"), nb::arg("causal_w"),
           nb::arg("scale"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
 
-    m.def("sol_attn_workspace", &sol_attn_workspace,
-          "Workspace bytes required by sol_attn for this shape",
-          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"));
     m.def("sol_attn_plan", &sol_attn_plan_py,
-          "Workspace dims and slot byte offsets for this shape",
+          "Workspace dims, slot byte offsets and total bytes for this shape",
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"));
 
     m.def("sol_attn", &sol_attn,

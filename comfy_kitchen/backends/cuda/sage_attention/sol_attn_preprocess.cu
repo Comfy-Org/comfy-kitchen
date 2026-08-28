@@ -15,31 +15,17 @@
  * limitations under the License.
  */
 
-// Sol-Attn preprocess, CUDA.
-//
-// Produces everything the route and exact kernels consume, in the layouts
-// sol_layout.cuh defines:
+// Sol-Attn preprocess: post-rope q/k/v -> the workspace carriers
 //   qiP  [B,T,H,D] int8   (perm_d)            qs   [B,T,H] f32
 //   kiP  [B*H,Tp,D] int8  (perm_key + perm_d) ksb  [B*H,Tp] float2 = (ks, bias)
 //   vTi  [B*H,D,Tp] int8  (perm_d on keys)    vsc  [B*H,D] f32  -- sol_attn_vtranspose.cu
 //   kciP [B*H,NPAD,D] int8 (perm_d)           kcs  [B*H,NPAD] f32
 //   vcT  [B*H,D,NPAD] bf16                    threshold [B*H,NQ] f32
 //   cen8 [B*H,NQ,D] int8  (perm_d)            cens [B*H,NQ] f32
-//
-// Q-side tensors (qiP, qs) are sized and indexed by T, NOT Tp; only the K/V
-// layouts pad to Tp. The route and exact kernels index per-token state the same
-// way, which is what lets the caller's `out` alias o_part.
-//
-// q/k/v are read through explicit strides (last dim contiguous -- the staging
-// loads uint4), so a BHND view goes in without a copy.
-//
-// Five passes -- K twice, V twice, Q once: K's smoothing mean and V's
-// per-channel scale are global reductions that must complete before their
-// quantization, and neither folds into one pass without a grid-wide sync.
-//
-// The chunked producer (sol_attn_producer.cu) emits the same carriers from
-// projection chunks; `launch_sol_finish` below is its second half (pooled
-// sums -> means, pooled stats/quant, threshold).
+// Q-side carriers are indexed by T, K/V-side by Tp. Inputs are read through
+// explicit strides (last dim contiguous). K's mean and V's scale are global
+// reductions, hence the separate passes. `launch_sol_finish` is the chunked
+// producer's second half (pooled sums -> means, pooled quant, threshold).
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -53,8 +39,7 @@ using namespace sol;
 
 constexpr int HD = HEAD_DIM, BLK = BLOCK;
 
-// Scratch carve-up: pooled K block means (block sums in the producer path),
-// then the per-channel kmean and kcvar derived from them.
+// Scratch: pooled K block means (sums in the producer path), kmean, kcvar.
 struct Scratch { float* kc; float* kmean; float* kcvar; };
 inline Scratch carve_scratch(void* scratch, int B, int H, int NPAD) {
     Scratch s;
@@ -64,9 +49,13 @@ inline Scratch carve_scratch(void* scratch, int B, int H, int NPAD) {
     return s;
 }
 
-// ---- pass 1: K and V block reductions, plus V's per-channel |max| ----
-// One CUDA block per (bh, pooled block); thread == channel, so each step of the
-// token loop is a fully coalesced 256-byte read.
+// routing threshold: tau sigma of the proxy row, from the centroid's proxy variance
+__device__ __forceinline__ float thr_of(float var, float tau, float log2s) {
+    return tau * sqrtf(var * log2s * log2s + 1e-6f);
+}
+
+// ---- pass 1: K/V block reductions + V's per-channel |max| ----
+// One block per (bh, pooled block), thread == channel.
 __global__ void prep_reduce_kv(const __nv_bfloat16* __restrict__ k,
                                const __nv_bfloat16* __restrict__ v,
                                float* __restrict__ kc, __nv_bfloat16* __restrict__ vcT,
@@ -92,16 +81,14 @@ __global__ void prep_reduce_kv(const __nv_bfloat16* __restrict__ k,
         sk += kk; sv += vv; av = fmaxf(av, fabsf(vv));
     }
     kc[o] = sk / (float)len;    // block MEAN of K
-    // Block SUMS of V, written transposed to skip an f32 staging copy; the
-    // per-channel |max| reduces by atomic instead of a per-block array.
-    vcT[((size_t)bh * HD + d) * NPAD + n] = __float2bfloat16(sv);
+    vcT[((size_t)bh * HD + d) * NPAD + n] = __float2bfloat16(sv);   // block SUM of V
     atomicMax(reinterpret_cast<unsigned int*>(&vamax[(size_t)bh * HD + d]),
               __float_as_uint(av));   // av >= 0, so the bit pattern orders correctly
 }
 
-// ---- pass 2: reductions over the pooled tensors (small) ----
-// vamax (pass 1's atomic |max|, or null in the producer path where the caller
-// supplies the V scale directly) becomes the per-channel V scale; may alias vsc.
+// ---- pass 2: reductions over the pooled tensors ----
+// vamax (pass 1's |max|; null in the producer path, whose caller supplies the
+// V scale) becomes the per-channel V scale; may alias vsc.
 __global__ void prep_pooled_stats(const float* __restrict__ kc,
                                   float* __restrict__ kmean,
                                   const float* vamax, float* vsc,
@@ -119,7 +106,7 @@ __global__ void prep_pooled_stats(const float* __restrict__ kc,
     kcvar[(size_t)bh * HD + d] = fmaxf(ss / (float)NTB - m * m, 0.f);
 }
 
-// ---- pass 3: centre + quantize the pooled keys; transpose the pooled values ----
+// ---- pass 3: centre + quantize the pooled keys ----
 __global__ void prep_pooled_quant(const float* __restrict__ kc,
                                   const float* __restrict__ kmean,
                                   int8_t* __restrict__ kciP, float* __restrict__ kcs,
@@ -134,9 +121,7 @@ __global__ void prep_pooled_quant(const float* __restrict__ kc,
     kciP[((size_t)bh * NPAD + n) * HD + perm_d(d)] = live ? q8(x, 1.f / sc) : (int8_t)0;
 }
 
-// ---- pass 4: quantize Q and derive the routing threshold, from one read ----
-// The per-token scale is a reduction over channels and the routing centroid is a
-// reduction over tokens, so the tile is staged once and read both ways.
+// ---- pass 4: quantize Q, centroid, routing threshold from one staged tile ----
 __global__ void prep_q(const __nv_bfloat16* __restrict__ q, const float* __restrict__ kcvar,
                        int8_t* __restrict__ qiP, float* __restrict__ qs,
                        float* __restrict__ thr,
@@ -157,10 +142,8 @@ __global__ void prep_q(const __nv_bfloat16* __restrict__ q, const float* __restr
     const size_t qrow = (size_t)bh * NQ + qb;
     const float c = centroid_quant(sQ, len, sred, cen8 + qrow * HD, cens + qrow);
     __syncthreads();                       // sred held the centroid bytes
-
-    // routing threshold: sigma of the proxy row, from the query centroid
     const float var = block_sum128(c * c * kcvar[(size_t)bh * HD + threadIdx.x], sred);
-    if (threadIdx.x == 0) thr[qrow] = tau * sqrtf(var * log2s * log2s + 1e-6f);
+    if (threadIdx.x == 0) thr[qrow] = thr_of(var, tau, log2s);
 }
 
 // ---- pass 5: centre + quantize K into the permuted layout ----
@@ -209,14 +192,13 @@ __global__ void prep_thr_from_cen(const int8_t* __restrict__ cen8,
     const float c = (float)cen8[((size_t)bh * NQ + qb) * HD + perm_d(d)] *
                     cens[(size_t)bh * NQ + qb];
     const float var = block_sum128(c * c * kcvar[(size_t)bh * HD + d], sred);
-    if (d == 0) thr[(size_t)bh * NQ + qb] = tau * sqrtf(var * log2s * log2s + 1e-6f);
+    if (d == 0) thr[(size_t)bh * NQ + qb] = thr_of(var, tau, log2s);
 }
 
 }  // namespace
 
-// Producer path: the block K sums launch_sol_producer left in scratch become
-// means, pooled stats/quant and the routing threshold. The V scale is the one
-// the producer quantized with; the caller places it in the vsc slot itself.
+// Producer path: block K sums left in scratch -> means, pooled quant,
+// threshold. The caller places the V scale it quantized with in the vsc slot.
 void launch_sol_finish(
     void* scratch, void* kciP, void* kcs, void* threshold,
     const void* cen8, const void* cens, void* kmean_next,
@@ -248,7 +230,7 @@ void launch_sol_preprocess(
 {
     const Scratch s = carve_scratch(scratch, B, H, NPAD);
 
-    // vsc accumulates V's per-channel |max| by atomicMax in pass 1, so start at 0.
+    // pass 1 accumulates V's |max| into vsc by atomicMax
     cudaMemsetAsync(vsc, 0, (size_t)B * H * HD * sizeof(float), stream);
     prep_reduce_kv<<<dim3(NPAD, B * H), HD, 0, stream>>>(
         (const __nv_bfloat16*)k, (const __nv_bfloat16*)v, s.kc, (__nv_bfloat16*)vcT,

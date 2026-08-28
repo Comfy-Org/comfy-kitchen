@@ -15,16 +15,12 @@
  * limitations under the License.
  */
 
-// Sol-Attn routing + approximate pass. One warp per 64-token query block.
-//
-// Both the routing decision and the tail VALUES are centroid quantities (the
-// thresholded column sum is len * centroid.kc), so this is an [N x N] problem,
-// not [T x N]; all rows of a query block share one tail (~5e-4 cosine).
-//
-// Emits per (batch, head, query block):
+// Sol-Attn routing + approximate tail. Both the routing decision and the tail
+// are centroid quantities, so this is an [N x N] problem and all rows of a
+// query block share one tail. Emits per (batch, head, query block):
 //   blk_idx / blk_cnt        the routed list the exact kernel walks
-//   o_part, m_part, l_part   ONE softmax state per query block, in the exact
-//                            kernel's units: o / vsc, and o and l both x255.
+//   o_part, m_part, l_part   one softmax state, in the exact kernel's units
+//                            (o / vsc; o and l both x255)
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -32,9 +28,8 @@
 
 #include "sol_layout.cuh"
 
-// Tensor-core centroid tail: 64 query centroids per CTA, proxy QK on int8
-// MMA, pooled PV on bf16 MMA.
-namespace centroid_tc {
+// 64 query centroids per CTA; proxy QK on int8 MMA, pooled PV on bf16 MMA.
+namespace {
 using namespace sol;
 
 constexpr int HD = HEAD_DIM, BQ = BLOCK, BN = 64;
@@ -42,7 +37,7 @@ constexpr int NWARP = BQ / 16, NTHREADS = NWARP * 32;
 constexpr int KC = HD / 32, NKT = BN / 8, NT = HD / 8, PKC = BN / 16;
 constexpr int LDK = HD, LDV = BN + 8;
 
-__global__ void __launch_bounds__(NTHREADS) sol_route_tc_kernel(
+__global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
     const int8_t* __restrict__ cen8, const float* __restrict__ cens,
     const int8_t* __restrict__ kciP, const float* __restrict__ kcs,
     const __nv_bfloat16* __restrict__ vcT, const float* __restrict__ vsc,
@@ -170,16 +165,15 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_tc_kernel(
                 const int total = __shfl_sync(0xffffffffu, prefix, 3, 4);
                 const int slot0 = cnt[rr] + before;
                 const int slot1 = slot0 + (int)cand[0];
-                const bool keep0 = cand[0];
-                const bool keep1 = cand[1];
                 if (live[rr]) {
                     uint16_t* row = blk_idx + ((size_t)bh * NQ + qr[rr]) * NTB;
-                    if (keep0) row[slot0] = (uint16_t)(gs + c0);
-                    if (keep1) row[slot1] = (uint16_t)(gs + c0 + 1);
+                    if (cand[0]) row[slot0] = (uint16_t)(gs + c0);
+                    if (cand[1]) row[slot1] = (uint16_t)(gs + c0 + 1);
                 }
                 cnt[rr] += total;
-                pv[nt][rr * 2] = valid[0] && !(pre[0] || keep0) ? score[0] : NEG;
-                pv[nt][rr * 2 + 1] = valid[1] && !(pre[1] || keep1) ? score[1] : NEG;
+                // exact-routed and sink blocks leave the tail; score is NEG when !valid
+                pv[nt][rr * 2] = (pre[0] || cand[0]) ? NEG : score[0];
+                pv[nt][rr * 2 + 1] = (pre[1] || cand[1]) ? NEG : score[1];
             }
         }
 
@@ -263,20 +257,20 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_tc_kernel(
 #endif
 }
 
-}  // namespace centroid_tc
+}  // namespace
 
 void launch_sol_route(
     const void* cen8, const void* cens, const void* kciP, const void* kcs,
     const void* vcT, const void* vsc, const void* threshold,
     void* blk_idx, void* blk_cnt, void* o_part, void* m_part, void* l_part,
-    // NQ is the query-block count and NTB the key-block count; they coincide
-    // only because this is self-attention, so they stay separate parameters.
+    // NQ (query blocks) and NTB (key blocks) coincide today; kept separate so
+    // a query prefix (LTX-2 guide attention) needs no kernel change
     int B, int T, int H, int NTB, int NPAD, int NQ,
     int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2,
     cudaStream_t stream)
 {
-    dim3 grid((NQ + centroid_tc::BQ - 1) / centroid_tc::BQ, B * H);
-    centroid_tc::sol_route_tc_kernel<<<grid, centroid_tc::NTHREADS, 0, stream>>>(
+    dim3 grid((NQ + BQ - 1) / BQ, B * H);
+    sol_route_kernel<<<grid, NTHREADS, 0, stream>>>(
         (const int8_t*)cen8, (const float*)cens, (const int8_t*)kciP,
         (const float*)kcs, (const __nv_bfloat16*)vcT, (const float*)vsc,
         (const float*)threshold,
