@@ -382,7 +382,7 @@ def dequantize_args(args):
         return args.dequantize()
     elif isinstance(args, dict):
         return {k: dequantize_args(v) for k, v in args.items()}
-    elif isinstance(args, (list, tuple)):
+    elif isinstance(args, list | tuple):
         return type(args)(dequantize_args(a) for a in args)
     return args
 
@@ -518,7 +518,7 @@ def _get_layout_from_args(args) -> type[QuantizedLayout] | None:
     for arg in args:
         if isinstance(arg, QuantizedTensor):
             return get_layout_class(arg._layout_cls)
-        elif isinstance(arg, (list, tuple)):
+        elif isinstance(arg, list | tuple):
             for item in arg:
                 if isinstance(item, QuantizedTensor):
                     return get_layout_class(item._layout_cls)

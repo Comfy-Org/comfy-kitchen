@@ -453,15 +453,15 @@ def test_fused_rope_matches_separate_pass(rot):
     shipped and broke a real generation)."""
     from comfy_kitchen.backends import cuda as cuda_backend
     g = torch.Generator(device="cuda").manual_seed(5)
-    T, H, D = 2048, 4, HD
-    qkv = torch.randn(1, T, H * D * 3, device="cuda", dtype=torch.bfloat16,
+    t, h, d = 2048, 4, HD
+    qkv = torch.randn(1, t, h * d * 3, device="cuda", dtype=torch.bfloat16,
                       generator=g) * 0.5
-    freqs = torch.randn(1, T, 1, rot // 2, 2, 2, device="cuda", generator=g)
-    qw = torch.randn(D, device="cuda", dtype=torch.bfloat16, generator=g)
-    kw = torch.randn(D, device="cuda", dtype=torch.bfloat16, generator=g)
-    q = qkv[..., :H * D].view(1, T, H, D)
-    k = qkv[..., H * D:2 * H * D].view(1, T, H, D)
-    v = qkv[..., 2 * H * D:].view(1, T, H, D)
+    freqs = torch.randn(1, t, 1, rot // 2, 2, 2, device="cuda", generator=g)
+    qw = torch.randn(d, device="cuda", dtype=torch.bfloat16, generator=g)
+    kw = torch.randn(d, device="cuda", dtype=torch.bfloat16, generator=g)
+    q = qkv[..., :h * d].view(1, t, h, d)
+    k = qkv[..., h * d:2 * h * d].view(1, t, h, d)
+    v = qkv[..., 2 * h * d:].view(1, t, h, d)
     q2, k2 = q.clone(), k.clone()
     ck.rms_rope_split_half_(q2, k2, freqs, qw, kw, epsilon=1e-6, rot_dim=rot)
     ref = cuda_backend.sol_attn(q2, k2, v, tau=1.4)
@@ -481,25 +481,25 @@ def test_chunked_producer_matches_fused():
     fused single-call path. Warm stats close most of the bootstrap gap."""
     from comfy_kitchen.backends import cuda as cuda_backend
     g = torch.Generator(device="cuda").manual_seed(11)
-    T, H, D = 4096 + 128, 4, HD          # ragged tail across chunk boundary
-    rot = D // 2
-    qkv = torch.randn(T, 3 * H * D, device="cuda", dtype=torch.bfloat16,
+    t, h, d = 4096 + 128, 4, HD          # ragged tail across chunk boundary
+    rot = d // 2
+    qkv = torch.randn(t, 3 * h * d, device="cuda", dtype=torch.bfloat16,
                       generator=g) * 0.5
-    qkv[:, 2 * H * D:] *= 0.02   # realistic small V: blind bootstrap scales
+    qkv[:, 2 * h * d:] *= 0.02   # realistic small V: blind bootstrap scales
                                  # quantized this to garbage (broke a real run)
-    freqs = torch.randn(1, T, 1, rot // 2, 2, 2, device="cuda", generator=g)
-    qw = torch.randn(D, device="cuda", dtype=torch.bfloat16, generator=g)
-    kw = torch.randn(D, device="cuda", dtype=torch.bfloat16, generator=g)
-    q = qkv[:, :H * D].view(1, T, H, D)
-    k = qkv[:, H * D:2 * H * D].view(1, T, H, D)
-    v = qkv[:, 2 * H * D:].view(1, T, H, D)
+    freqs = torch.randn(1, t, 1, rot // 2, 2, 2, device="cuda", generator=g)
+    qw = torch.randn(d, device="cuda", dtype=torch.bfloat16, generator=g)
+    kw = torch.randn(d, device="cuda", dtype=torch.bfloat16, generator=g)
+    q = qkv[:, :h * d].view(1, t, h, d)
+    k = qkv[:, h * d:2 * h * d].view(1, t, h, d)
+    v = qkv[:, 2 * h * d:].view(1, t, h, d)
     ref = cuda_backend.sol_attn(q, k, v, tau=1.4, rope_freqs=freqs,
                                 qk_norm_weights=(qw, kw), sink_blocks=[0, 2])
     chunks = list(qkv.split(1024))
     out1, km, vs = cuda_backend.sol_attn_chunked(
-        chunks, T, H, freqs, (qw, kw), tau=1.4, sink_blocks=[0, 2])
+        chunks, t, h, freqs, (qw, kw), tau=1.4, sink_blocks=[0, 2])
     out2, _, _ = cuda_backend.sol_attn_chunked(
-        chunks, T, H, freqs, (qw, kw), kmean=km, vscale=vs,
+        chunks, t, h, freqs, (qw, kw), kmean=km, vscale=vs,
         tau=1.4, sink_blocks=[0, 2])
     assert _cos(out1, ref) > 0.995       # bootstrap self-measures, no blind scales
     assert _cos(out2, ref) > 0.995
@@ -507,12 +507,12 @@ def test_chunked_producer_matches_fused():
     with torch.inference_mode():
         f2 = freqs.clone()
         out3, _, _ = cuda_backend.sol_attn_chunked(
-            chunks, T, H, f2, (qw, kw), kmean=km, vscale=vs,
+            chunks, t, h, f2, (qw, kw), kmean=km, vscale=vs,
             tau=1.4, sink_blocks=[0, 2])
     assert _cos(out3, ref) > 0.995
     # chunk coverage is validated
     with pytest.raises(ValueError, match="chunks cover"):
-        cuda_backend.sol_attn_chunked(chunks[:-1], T, H, freqs, (qw, kw))
+        cuda_backend.sol_attn_chunked(chunks[:-1], t, h, freqs, (qw, kw))
 
 
 def test_chunked_producer_topk():
@@ -522,23 +522,23 @@ def test_chunked_producer_topk():
     the side that gets unpermuted."""
     from comfy_kitchen.backends import cuda as cuda_backend
     g = torch.Generator(device="cuda").manual_seed(13)
-    T, H, D = 4096 + 128, 4, HD
-    rot = D // 2
-    qkv = torch.randn(T, 3 * H * D, device="cuda", dtype=torch.bfloat16,
+    t, h, d = 4096 + 128, 4, HD
+    rot = d // 2
+    qkv = torch.randn(t, 3 * h * d, device="cuda", dtype=torch.bfloat16,
                       generator=g) * 0.5
-    freqs = torch.randn(1, T, 1, rot // 2, 2, 2, device="cuda", generator=g)
-    qw = torch.randn(D, device="cuda", dtype=torch.bfloat16, generator=g)
-    kw = torch.randn(D, device="cuda", dtype=torch.bfloat16, generator=g)
-    q = qkv[:, :H * D].view(1, T, H, D).clone()
-    k = qkv[:, H * D:2 * H * D].view(1, T, H, D).clone()
-    v = qkv[:, 2 * H * D:].view(1, T, H, D)
+    freqs = torch.randn(1, t, 1, rot // 2, 2, 2, device="cuda", generator=g)
+    qw = torch.randn(d, device="cuda", dtype=torch.bfloat16, generator=g)
+    kw = torch.randn(d, device="cuda", dtype=torch.bfloat16, generator=g)
+    q = qkv[:, :h * d].view(1, t, h, d).clone()
+    k = qkv[:, h * d:2 * h * d].view(1, t, h, d).clone()
+    v = qkv[:, 2 * h * d:].view(1, t, h, d)
     ck.rms_rope_split_half_(q, k, freqs, qw, kw, epsilon=1e-6, rot_dim=rot)
     ref = cuda_backend.sol_attn(q, k, v, topk_ratio=0.2, sink_blocks=[0, 2])
     chunks = list(qkv.split(1024))
     _, km, vs = cuda_backend.sol_attn_chunked(
-        chunks, T, H, freqs, (qw, kw), topk_ratio=0.2, sink_blocks=[0, 2])
+        chunks, t, h, freqs, (qw, kw), topk_ratio=0.2, sink_blocks=[0, 2])
     out, _, _ = cuda_backend.sol_attn_chunked(
-        chunks, T, H, freqs, (qw, kw), kmean=km, vscale=vs,
+        chunks, t, h, freqs, (qw, kw), kmean=km, vscale=vs,
         topk_ratio=0.2, sink_blocks=[0, 2])
     assert _cos(out, ref) > 0.995
 
