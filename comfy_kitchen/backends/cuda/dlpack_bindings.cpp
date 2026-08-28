@@ -263,27 +263,25 @@ extern "C" {
         float scale, int dtype_code, cudaStream_t stream);
 
     // Sol-Attn sparse attention — see sage_attention/sol_attn.cu.
-    size_t sol_attn_workspace_bytes(int batch, int seq_len, int num_heads, int max_blocks);
+    size_t sol_attn_workspace_bytes(int batch, int seq_len, int num_heads);
     void sol_producer_begin(void* workspace, int batch, int seq_len,
-                            int num_heads, int max_blocks, cudaStream_t stream);
+                            int num_heads, cudaStream_t stream);
     void sol_producer_chunk(
         void* workspace, const void* qkv, const void* fab,
         const void* qw, const void* kw, const void* kmean, const void* vscale,
         float rope_eps, int rot_dim, int t0, int M,
-        int batch, int seq_len, int num_heads, int max_blocks, cudaStream_t stream);
+        int batch, int seq_len, int num_heads, cudaStream_t stream);
     void launch_sol_attn_core(
         void* workspace, void* out, void* kmean_next, void* vamax_out,
-        int batch, int seq_len, int num_heads, int max_blocks,
+        int batch, int seq_len, int num_heads,
         float tau, float scale, const void* ext_threshold,
         int sink_start, int sink_end, int sink_q_start, int sink_q_end,
         cudaStream_t stream);
     void launch_sol_attn(
         const void* q, const void* k, const void* v, void* out, void* workspace,
-        int batch, int seq_len, int num_heads, int head_dim, int max_blocks,
+        int batch, int seq_len, int num_heads, int head_dim,
         float tau, float scale, const void* key_bias,
         const void* ext_threshold,
-        const void* rope_freqs, const void* q_norm_w, const void* k_norm_w,
-        float rope_eps, int rot_dim,
         int sink_start, int sink_end, int sink_q_start, int sink_q_end,
         int64_t qs_b, int64_t qs_t, int64_t qs_h,
         int64_t ks_b, int64_t ks_t, int64_t ks_h,
@@ -1487,11 +1485,8 @@ void na3d(
 }
 
 // Nanobind wrappers for Sol-Attn sparse attention
-int64_t sol_attn_workspace(int64_t batch, int64_t seq_len, int64_t num_heads,
-                           int64_t max_blocks)
-{
-    return (int64_t)sol_attn_workspace_bytes((int)batch, (int)seq_len, (int)num_heads,
-                                             (int)max_blocks);
+int64_t sol_attn_workspace(int64_t batch, int64_t seq_len, int64_t num_heads) {
+    return (int64_t)sol_attn_workspace_bytes((int)batch, (int)seq_len, (int)num_heads);
 }
 
 void sol_attn(
@@ -1501,35 +1496,23 @@ void sol_attn(
     nb::ndarray<nb::device::cuda> out,
     nb::ndarray<nb::device::cuda> workspace,
     int64_t batch, int64_t seq_len, int64_t num_heads, int64_t head_dim,
-    int64_t max_blocks,
     float tau, float scale,
     int64_t sink_start, int64_t sink_end, int64_t sink_q_start, int64_t sink_q_end,
     std::vector<int64_t> q_strides, std::vector<int64_t> k_strides,
     std::vector<int64_t> v_strides,
     uintptr_t stream_ptr,
     std::optional<nb::ndarray<nb::device::cuda>> key_bias = std::nullopt,
-    std::optional<nb::ndarray<nb::device::cuda>> threshold = std::nullopt,
-    std::optional<nb::ndarray<nb::device::cuda>> rope_freqs = std::nullopt,
-    std::optional<nb::ndarray<nb::device::cuda>> q_norm_w = std::nullopt,
-    std::optional<nb::ndarray<nb::device::cuda>> k_norm_w = std::nullopt,
-    float rope_eps = 1e-6f,
-    int64_t rot_dim = 0)
+    std::optional<nb::ndarray<nb::device::cuda>> threshold = std::nullopt)
 {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
         throw std::runtime_error("sol_attn: threshold must have B*H*ceil(T/64) elements");
-    if (rope_freqs && (!q_norm_w || !k_norm_w))
-        throw std::runtime_error("sol_attn: rope_freqs requires q_norm_w and k_norm_w");
     launch_sol_attn(
         q.data(), k.data(), v.data(), out.data(), workspace.data(),
-        (int)batch, (int)seq_len, (int)num_heads, (int)head_dim, (int)max_blocks,
+        (int)batch, (int)seq_len, (int)num_heads, (int)head_dim,
         tau, scale,
         key_bias ? key_bias->data() : nullptr,
         threshold ? threshold->data() : nullptr,
-        rope_freqs ? rope_freqs->data() : nullptr,
-        q_norm_w ? q_norm_w->data() : nullptr,
-        k_norm_w ? k_norm_w->data() : nullptr,
-        rope_eps, (int)rot_dim,
         (int)sink_start, (int)sink_end, (int)sink_q_start, (int)sink_q_end,
         q_strides[0], q_strides[1], q_strides[2],
         k_strides[0], k_strides[1], k_strides[2],
@@ -1538,10 +1521,9 @@ void sol_attn(
 
 void sol_producer_begin_py(nb::ndarray<nb::device::cuda> workspace,
                            int64_t batch, int64_t seq_len, int64_t num_heads,
-                           int64_t max_blocks, uintptr_t stream_ptr) {
+                           uintptr_t stream_ptr) {
     sol_producer_begin(workspace.data(), (int)batch, (int)seq_len,
-                       (int)num_heads, (int)max_blocks,
-                       reinterpret_cast<cudaStream_t>(stream_ptr));
+                       (int)num_heads, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 void sol_producer_chunk_py(
@@ -1550,18 +1532,18 @@ void sol_producer_chunk_py(
     nb::ndarray<nb::device::cuda> kw, nb::ndarray<nb::device::cuda> kmean,
     nb::ndarray<nb::device::cuda> vscale,
     float rope_eps, int64_t rot_dim, int64_t t0, int64_t m,
-    int64_t batch, int64_t seq_len, int64_t num_heads, int64_t max_blocks,
+    int64_t batch, int64_t seq_len, int64_t num_heads,
     uintptr_t stream_ptr) {
     sol_producer_chunk(workspace.data(), qkv.data(), fab.data(), qw.data(),
                        kw.data(), kmean.data(), vscale.data(),
                        rope_eps, (int)rot_dim, (int)t0, (int)m,
-                       (int)batch, (int)seq_len, (int)num_heads, (int)max_blocks,
+                       (int)batch, (int)seq_len, (int)num_heads,
                        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 void sol_attn_core_py(
     nb::ndarray<nb::device::cuda> workspace, nb::ndarray<nb::device::cuda> out,
-    int64_t batch, int64_t seq_len, int64_t num_heads, int64_t max_blocks,
+    int64_t batch, int64_t seq_len, int64_t num_heads,
     float tau, float scale,
     int64_t sink_start, int64_t sink_end, int64_t sink_q_start, int64_t sink_q_end,
     uintptr_t stream_ptr,
@@ -1572,7 +1554,7 @@ void sol_attn_core_py(
         workspace.data(), out.data(),
         kmean_next ? kmean_next->data() : nullptr,
         vamax_out ? vamax_out->data() : nullptr,
-        (int)batch, (int)seq_len, (int)num_heads, (int)max_blocks,
+        (int)batch, (int)seq_len, (int)num_heads,
         tau, scale, threshold ? threshold->data() : nullptr,
         (int)sink_start, (int)sink_end, (int)sink_q_start, (int)sink_q_end,
         reinterpret_cast<cudaStream_t>(stream_ptr));
@@ -3824,40 +3806,34 @@ NB_MODULE(_C, m) {
 
     m.def("sol_attn_workspace", &sol_attn_workspace,
           "Workspace bytes required by sol_attn for this shape",
-          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
-          nb::arg("max_blocks"));
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"));
 
     m.def("sol_attn", &sol_attn,
           "Sol-Attn training-free sparse attention (BF16 in/out, head_dim 128)",
           nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("out"),
           nb::arg("workspace"),
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
-          nb::arg("head_dim"), nb::arg("max_blocks"),
+          nb::arg("head_dim"),
           nb::arg("tau"), nb::arg("scale"),
           nb::arg("sink_start"), nb::arg("sink_end"),
           nb::arg("sink_q_start"), nb::arg("sink_q_end"),
           nb::arg("q_strides"), nb::arg("k_strides"), nb::arg("v_strides"),
           nb::arg("stream_ptr"),
           nb::arg("key_bias") = nb::none(),
-          nb::arg("threshold") = nb::none(),
-          nb::arg("rope_freqs") = nb::none(),
-          nb::arg("q_norm_w") = nb::none(),
-          nb::arg("k_norm_w") = nb::none(),
-          nb::arg("rope_eps") = 1e-6f,
-          nb::arg("rot_dim") = 0);
+          nb::arg("threshold") = nb::none());
 
     m.def("sol_producer_begin", &sol_producer_begin_py,
           nb::arg("workspace"), nb::arg("batch"), nb::arg("seq_len"),
-          nb::arg("num_heads"), nb::arg("max_blocks"), nb::arg("stream_ptr"));
+          nb::arg("num_heads"), nb::arg("stream_ptr"));
     m.def("sol_producer_chunk", &sol_producer_chunk_py,
           nb::arg("workspace"), nb::arg("qkv"), nb::arg("fab"), nb::arg("qw"),
           nb::arg("kw"), nb::arg("kmean"), nb::arg("vscale"),
           nb::arg("rope_eps"), nb::arg("rot_dim"), nb::arg("t0"), nb::arg("m"),
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
-          nb::arg("max_blocks"), nb::arg("stream_ptr"));
+          nb::arg("stream_ptr"));
     m.def("sol_attn_core", &sol_attn_core_py,
           nb::arg("workspace"), nb::arg("out"), nb::arg("batch"),
-          nb::arg("seq_len"), nb::arg("num_heads"), nb::arg("max_blocks"),
+          nb::arg("seq_len"), nb::arg("num_heads"),
           nb::arg("tau"), nb::arg("scale"),
           nb::arg("sink_start"), nb::arg("sink_end"),
           nb::arg("sink_q_start"), nb::arg("sink_q_end"), nb::arg("stream_ptr"),

@@ -135,7 +135,6 @@ def sol_attn(
     scale: float | None = None,
     sink_blocks: list[int] | None = None,
     sink_q: list[int] | None = None,
-    max_blocks: int = 0,
     key_bias: torch.Tensor | None = None,
     topk_ratio: float = 0.0,
 ) -> torch.Tensor:
@@ -155,10 +154,6 @@ def sol_attn(
         sink_blocks: ``[start, end)`` key blocks always attended exactly by every
             query -- conditioning rows, typically.
         sink_q: ``[start, end)`` query blocks that attend everything exactly.
-        max_blocks: Cap on routed blocks per query block, to bound the index
-            array. 0 means no cap. Capping DROPS routed blocks beyond it, so it
-            trades quality for memory; a query inside ``sink_q`` routes every
-            block and is truncated by any cap.
         topk_ratio: > 0 selects SLA-style top-k instead of the tau threshold:
             keep this fraction of key blocks per query block (the selection the
             lightx2v SLA LoRAs were distilled against). tau is ignored then.
@@ -170,7 +165,6 @@ def sol_attn(
         q, k, v, tau, scale,
         [0, 0] if sink_blocks is None else list(sink_blocks),
         [0, 0] if sink_q is None else list(sink_q),
-        int(max_blocks),
         key_bias,
         float(topk_ratio),
     )

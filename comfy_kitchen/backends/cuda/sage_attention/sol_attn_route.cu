@@ -50,7 +50,7 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_tc_kernel(
     uint16_t* __restrict__ blk_idx, int32_t* __restrict__ blk_cnt,
     __nv_bfloat16* __restrict__ o_part, float* __restrict__ m_part,
     float* __restrict__ l_part,
-    int T, int H, int NTB, int NPAD, int NQ, int max_blk,
+    int T, int H, int NTB, int NPAD, int NQ,
     int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2) {
 #if SOL_SM80
     __shared__ int8_t sKc[BN * LDK];
@@ -91,7 +91,7 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_tc_kernel(
     #pragma unroll
     for (int rr = 0; rr < 2; ++rr) {
         if (live[rr]) {
-            uint16_t* row = blk_idx + ((size_t)bh * NQ + qr[rr]) * max_blk;
+            uint16_t* row = blk_idx + ((size_t)bh * NQ + qr[rr]) * NTB;
             for (int i = qd; i < S; i += 4) row[i] = (uint16_t)(sink_s + i);
         }
     }
@@ -170,14 +170,14 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_tc_kernel(
                 const int total = __shfl_sync(0xffffffffu, prefix, 3, 4);
                 const int slot0 = cnt[rr] + before;
                 const int slot1 = slot0 + (int)cand[0];
-                const bool keep0 = cand[0] && slot0 < max_blk;
-                const bool keep1 = cand[1] && slot1 < max_blk;
+                const bool keep0 = cand[0];
+                const bool keep1 = cand[1];
                 if (live[rr]) {
-                    uint16_t* row = blk_idx + ((size_t)bh * NQ + qr[rr]) * max_blk;
+                    uint16_t* row = blk_idx + ((size_t)bh * NQ + qr[rr]) * NTB;
                     if (keep0) row[slot0] = (uint16_t)(gs + c0);
                     if (keep1) row[slot1] = (uint16_t)(gs + c0 + 1);
                 }
-                cnt[rr] = min(cnt[rr] + total, max_blk);
+                cnt[rr] += total;
                 pv[nt][rr * 2] = valid[0] && !(pre[0] || keep0) ? score[0] : NEG;
                 pv[nt][rr * 2 + 1] = valid[1] && !(pre[1] || keep1) ? score[1] : NEG;
             }
@@ -271,7 +271,7 @@ extern "C" void launch_sol_route(
     void* blk_idx, void* blk_cnt, void* o_part, void* m_part, void* l_part,
     // NQ is the query-block count and NTB the key-block count; they coincide
     // only because this is self-attention, so they stay separate parameters.
-    int B, int T, int H, int NTB, int NPAD, int NQ, int max_blk,
+    int B, int T, int H, int NTB, int NPAD, int NQ,
     int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2,
     cudaStream_t stream)
 {
@@ -282,6 +282,6 @@ extern "C" void launch_sol_route(
         (const float*)threshold,
         (uint16_t*)blk_idx, (int32_t*)blk_cnt, (__nv_bfloat16*)o_part,
         (float*)m_part, (float*)l_part,
-        T, H, NTB, NPAD, NQ, max_blk, sink_s, sink_e, sink_qs, sink_qe,
+        T, H, NTB, NPAD, NQ, sink_s, sink_e, sink_qs, sink_qe,
         scale_log2);
 }

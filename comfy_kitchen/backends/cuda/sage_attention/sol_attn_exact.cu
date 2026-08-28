@@ -81,7 +81,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     const __nv_bfloat16* __restrict__ o_part, const float* __restrict__ m_part,
     const float* __restrict__ l_part,
     __nv_bfloat16* __restrict__ out,
-    int T, int Tp, int H, int max_blk, float scale_log2)
+    int T, int Tp, int H, int NTB, float scale_log2)
 {
 #if SOL_SM80
     extern __shared__ __align__(16) char smem_raw[];
@@ -121,7 +121,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         qsc[1] = qs[bh_s + (int64_t)r1 * H] * scale_log2;
     }
 
-    const uint16_t* my_idx = blk_idx + (int64_t)(bh * gridDim.x + q_block) * max_blk;
+    const uint16_t* my_idx = blk_idx + (int64_t)(bh * gridDim.x + q_block) * NTB;
     const int n_blocks = blk_cnt[bh * gridDim.x + q_block];
 
     // Resume from the routing pass: one state per (b, h, query block), the
@@ -317,7 +317,7 @@ extern "C" void launch_sol_exact(
     const void* vTi, const void* vsc,
     const void* blk_idx, const void* blk_cnt,
     const void* o_part, const void* m_part, const void* l_part, void* out,
-    int B, int T, int Tp, int H, int NQ, int max_blk,
+    int B, int T, int Tp, int H, int NQ, int NTB,
     float scale_log2, cudaStream_t stream)
 {
     const size_t SMEM = (size_t)NSTAGE * BK * LDK + (size_t)NSTAGE * HD * LDV;
@@ -330,6 +330,6 @@ extern "C" void launch_sol_exact(
         (const int8_t*)vTi, (const float*)vsc,
         (const uint16_t*)blk_idx, (const int32_t*)blk_cnt,
         (const __nv_bfloat16*)o_part, (const float*)m_part, (const float*)l_part,
-        (__nv_bfloat16*)out, T, Tp, H, max_blk, scale_log2);
+        (__nv_bfloat16*)out, T, Tp, H, NTB, scale_log2);
 }
 

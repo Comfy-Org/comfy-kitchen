@@ -75,13 +75,9 @@ __global__ void prep_reduce_kv(const __nv_bfloat16* __restrict__ k,
                                const __nv_bfloat16* __restrict__ v,
                                float* __restrict__ kc, __nv_bfloat16* __restrict__ vcT,
                                float* __restrict__ vamax,
-                               const float* __restrict__ freqs,
-                               const __nv_bfloat16* __restrict__ kw,
-                               float rope_eps, int rot,
                                int T, int H, int NTB, int NPAD,
                                int64_t sb, int64_t st, int64_t sh,
                                int64_t vb, int64_t vt, int64_t vh) {
-    __shared__ __nv_bfloat16 sK[BLK * LDQ];
     const int n = blockIdx.x, bh = blockIdx.y;
     const int batch = bh / H, head = bh % H, d = threadIdx.x;
     const size_t o = ((size_t)bh * NPAD + n) * HD + d;
@@ -92,27 +88,10 @@ __global__ void prep_reduce_kv(const __nv_bfloat16* __restrict__ k,
     }
 
     const int t0 = n * BLK, len = min(BLK, T - t0);
-    // The fused path needs the POST-norm+rope K for pooling, so K stages
-    // through smem and transforms in place; V streams from global as before.
-    if (freqs) {
-        for (int idx = d; idx < BLK * (HD / 8); idx += HD) {
-            const int t = idx / (HD / 8), c8 = (idx % (HD / 8)) * 8;
-            uint4 val = make_uint4(0u, 0u, 0u, 0u);
-            if (t < len)
-                val = *reinterpret_cast<const uint4*>(
-                    k + batch * sb + (int64_t)(t0 + t) * st + head * sh + c8);
-            *reinterpret_cast<uint4*>(sK + t * LDQ + c8) = val;
-        }
-        __syncthreads();
-        norm_rope_rows(sK, LDQ, len, freqs + (int64_t)t0 * (rot * 2), kw, rope_eps, rot);
-        __syncthreads();
-    }
-
     float sk = 0.f, sv = 0.f, av = 0.f;
     for (int i = 0; i < len; ++i) {
         const int64_t voff = batch * vb + (int64_t)(t0 + i) * vt + head * vh + d;
-        const float kk = freqs ? __bfloat162float(sK[i * LDQ + d])
-                               : __bfloat162float(k[batch * sb + (int64_t)(t0 + i) * st + head * sh + d]);
+        const float kk = __bfloat162float(k[batch * sb + (int64_t)(t0 + i) * st + head * sh + d]);
         const float vv = __bfloat162float(v[voff]);
         sk += kk; sv += vv; av = fmaxf(av, fabsf(vv));
     }
@@ -165,9 +144,6 @@ __global__ void prep_q(const __nv_bfloat16* __restrict__ q, const float* __restr
                        int8_t* __restrict__ qiP, float* __restrict__ qs,
                        float* __restrict__ thr,
                        int8_t* __restrict__ cen8, float* __restrict__ cens,
-                       const float* __restrict__ freqs,
-                       const __nv_bfloat16* __restrict__ qw,
-                       float rope_eps, int rot,
                        int T, int Tp, int H, int NQ, float tau, float log2s,
                        int64_t sb, int64_t st, int64_t sh) {
     __shared__ __nv_bfloat16 sQ[BLK * LDQ];
@@ -185,10 +161,6 @@ __global__ void prep_q(const __nv_bfloat16* __restrict__ q, const float* __restr
         *reinterpret_cast<uint4*>(sQ + t * LDQ + c8) = val;
     }
     __syncthreads();
-    if (freqs) {
-        norm_rope_rows(sQ, LDQ, len, freqs + (int64_t)t0 * (rot * 2), qw, rope_eps, rot);
-        __syncthreads();
-    }
 
     // per-token scale + quantized store; one thread per token, channels in-thread
     for (int t = tid; t < len; t += HD) {
@@ -249,9 +221,6 @@ __global__ void prep_q(const __nv_bfloat16* __restrict__ q, const float* __restr
 __global__ void prep_k(const __nv_bfloat16* __restrict__ k, const float* __restrict__ kmean,
                        int8_t* __restrict__ kiP, float2* __restrict__ ksb,
                        const float* __restrict__ kbias,   // [B, T] log2 units, or null
-                       const float* __restrict__ freqs,
-                       const __nv_bfloat16* __restrict__ kw,
-                       float rope_eps, int rot,
                        int T, int Tp, int H, int NTB,
                        int64_t sb, int64_t st, int64_t sh) {
     __shared__ __nv_bfloat16 sK[BLK * LDQ];
@@ -268,10 +237,6 @@ __global__ void prep_k(const __nv_bfloat16* __restrict__ k, const float* __restr
         *reinterpret_cast<uint4*>(sK + t * LDQ + c8) = val;
     }
     __syncthreads();
-    if (freqs) {
-        norm_rope_rows(sK, LDQ, len, freqs + (int64_t)t0 * (rot * 2), kw, rope_eps, rot);
-        __syncthreads();
-    }
 
     // destination row p takes source row perm_key(p); the smem read absorbs it
     for (int p = tid; p < BLK; p += HD) {
@@ -365,9 +330,6 @@ extern "C" void launch_sol_preprocess(
     void* vcT, void* threshold, void* cen8, void* cens, void* vsc,
     void* scratch,           // B*H*NPAD*HD + 2 * B*H*HD floats
     const void* key_bias,    // [B, T] f32 in log2 units, or nullptr
-    const void* rope_freqs,  // [T, rot/2, 2, 2] f32, or nullptr (fused norm+rope)
-    const void* q_norm_w, const void* k_norm_w,   // [HD] bf16
-    float rope_eps, int rot_dim,
     int B, int T, int Tp, int H, int NTB, int NPAD, int NQ,
     int64_t qs_b, int64_t qs_t, int64_t qs_h,
     int64_t ks_b, int64_t ks_t, int64_t ks_h,
@@ -384,22 +346,17 @@ extern "C" void launch_sol_preprocess(
     cudaMemsetAsync(vsc, 0, (size_t)B * H * HD * sizeof(float), stream);
     prep_reduce_kv<<<dim3(NPAD, B * H), HD, 0, stream>>>(
         (const __nv_bfloat16*)k, (const __nv_bfloat16*)v, kc, (__nv_bfloat16*)vcT,
-        (float*)vsc,
-        (const float*)rope_freqs, (const __nv_bfloat16*)k_norm_w, rope_eps, rot_dim,
-        T, H, NTB, NPAD, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h);
+        (float*)vsc, T, H, NTB, NPAD, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h);
     prep_pooled_stats<<<B * H, HD, 0, stream>>>(kc, kmean, (float*)vsc, kcvar, NTB, NPAD);
     prep_pooled_quant<<<dim3(NPAD, B * H), HD, 0, stream>>>(
         kc, kmean, (int8_t*)kciP, (float*)kcs, NTB, NPAD);
     prep_q<<<dim3(NQ, B * H), HD, 0, stream>>>(
         (const __nv_bfloat16*)q, kcvar, (int8_t*)qiP, (float*)qs, (float*)threshold,
         (int8_t*)cen8, (float*)cens,
-        (const float*)rope_freqs, (const __nv_bfloat16*)q_norm_w, rope_eps, rot_dim,
         T, Tp, H, NQ, tau, scale_log2, qs_b, qs_t, qs_h);
     prep_k<<<dim3(NTB, B * H), HD, 0, stream>>>(
         (const __nv_bfloat16*)k, kmean, (int8_t*)kiP, (float2*)ksb,
-        (const float*)key_bias,
-        (const float*)rope_freqs, (const __nv_bfloat16*)k_norm_w, rope_eps, rot_dim,
-        T, Tp, H, NTB, ks_b, ks_t, ks_h);
+        (const float*)key_bias, T, Tp, H, NTB, ks_b, ks_t, ks_h);
 }
 
 extern "C" size_t sol_preprocess_scratch_bytes(int B, int H, int NPAD) {

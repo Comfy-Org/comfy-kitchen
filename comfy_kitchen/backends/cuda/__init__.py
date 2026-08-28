@@ -2387,13 +2387,9 @@ def sol_attn(
     scale: float | None = None,
     sink_blocks: list[int] | None = None,
     sink_q: list[int] | None = None,
-    max_blocks: int = 0,
     workspace: torch.Tensor | None = None,
     key_bias: torch.Tensor | None = None,
     topk_ratio: float = 0.0,
-    rope_freqs: torch.Tensor | None = None,
-    qk_norm_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
-    rope_eps: float = 1e-6,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 tensors.
     See sage_attention/sol_attn.cu.
@@ -2401,13 +2397,6 @@ def sol_attn(
     ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
     per-query-block top-k: keep that fraction of key blocks per query block
     (sinks and the diagonal still ride on top). tau is ignored then.
-
-    ``rope_freqs`` fuses per-head RMSNorm + split-half RoPE into the
-    preprocess: pass PRE-norm/rope q/k plus ``qk_norm_weights=(qw, kw)`` and
-    the model's freqs ``[..., T, 1, rot/2, 2, 2]`` fp32; q/k are read once and
-    never written back (saves the separate rms_rope round trip). Matches
-    applying ``rms_rope_split_half_`` first to reduction-order ulps. Not
-    compatible with ``topk_ratio`` (its pooling would run pre-rope).
     """
     batch, t, h, d = q.shape
     # Direct entry: run the same shared rule as the registry path, or bad
@@ -2449,21 +2438,6 @@ def sol_attn(
                     f"be misaligned; call .contiguous() on it")
     # Per-key logit bias (natural log), folded into the exact branch's
     # (scale, bias) slot; biased blocks must be sink-covered.
-    rf = qw = kw = None
-    rot_dim = 0
-    if rope_freqs is not None:
-        if qk_norm_weights is None:
-            raise ValueError("sol_attn: rope_freqs requires qk_norm_weights=(qw, kw)")
-        if topk_ratio:
-            raise ValueError("sol_attn: topk_ratio with rope_freqs is not supported "
-                             "(the top-k pooling would run on pre-rope values)")
-        rot_dim = rope_freqs.shape[-3] * 2
-        if rot_dim % 8 or (rot_dim // 2) % 4:
-            raise ValueError(f"sol_attn: unsupported rot_dim {rot_dim}")
-        rf = _packed_rope_fab(rope_freqs, t, rot_dim)
-        qw, kw = qk_norm_weights
-        qw = qw.to(device=q.device, dtype=torch.bfloat16).contiguous()
-        kw = kw.to(device=q.device, dtype=torch.bfloat16).contiguous()
     thr = None
     if topk_ratio:
         if not 0.0 < topk_ratio < 1.0:
@@ -2475,7 +2449,7 @@ def sol_attn(
         key_bias = _normalize_key_bias(key_bias, batch, t, q.device)
         kb = (key_bias * 1.4426950408889634).expand(batch, t).contiguous()
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    need = _C.sol_attn_workspace(batch, t, h, max_blocks)
+    need = _C.sol_attn_workspace(batch, t, h)
     if workspace is None:
         workspace = torch.empty(need, dtype=torch.uint8, device=q.device)
     elif workspace.numel() * workspace.element_size() < need:
@@ -2497,15 +2471,6 @@ def sol_attn(
             "(avoid storage_offset slices; allocate it directly)")
     sb = [0, 0] if sink_blocks is None else list(sink_blocks)
     sq = [0, 0] if sink_q is None else list(sink_q)
-    if max_blocks > 0:
-        n_blk = (t + 63) // 64
-        n_sink = max(0, min(sb[1], n_blk) - sb[0])
-        if n_sink > max_blocks:
-            raise ValueError(
-                f"sol_attn: max_blocks={max_blocks} is smaller than the "
-                f"{n_sink}-block sink range {sb}; sinks are never truncated, "
-                f"so both constraints cannot hold -- raise max_blocks or "
-                f"shrink the sink range")
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
     _C.sol_attn(
         _wrap_for_dlpack(q),
@@ -2513,18 +2478,13 @@ def sol_attn(
         _wrap_for_dlpack(v),
         _wrap_for_dlpack(out),
         _wrap_for_dlpack(workspace),
-        batch, t, h, d, int(max_blocks),
+        batch, t, h, d,
         float(tau), float(scale),
         int(sb[0]), int(sb[1]), int(sq[0]), int(sq[1]),
         list(q.stride()[:3]), list(k.stride()[:3]), list(v.stride()[:3]),
         stream_ptr,
         key_bias=None if kb is None else _wrap_for_dlpack(kb),
         threshold=None if thr is None else _wrap_for_dlpack(thr),
-        rope_freqs=None if rf is None else _wrap_for_dlpack(rf),
-        q_norm_w=None if qw is None else _wrap_for_dlpack(qw),
-        k_norm_w=None if kw is None else _wrap_for_dlpack(kw),
-        rope_eps=float(rope_eps),
-        rot_dim=rot_dim,
     )
     return out
 
@@ -2572,12 +2532,12 @@ def sol_attn_chunked(
     if factory is None and (kmean is None or vscale is None):
         qkv_chunks = list(qkv_chunks)          # need two passes over it
         factory = lambda: iter(qkv_chunks)     # noqa: E731
-    need = _C.sol_attn_workspace(1, t, h, 0)
+    need = _C.sol_attn_workspace(1, t, h)
     ws = torch.empty(need, dtype=torch.uint8, device=dev)
     stream = torch.cuda.current_stream(dev).cuda_stream
 
     def produce(km, vsc):
-        _C.sol_producer_begin(_wrap_for_dlpack(ws), 1, t, h, 0, stream)
+        _C.sol_producer_begin(_wrap_for_dlpack(ws), 1, t, h, stream)
         t0 = 0
         for chunk in (factory() if factory is not None else qkv_chunks):
             m = chunk.shape[-2]
@@ -2587,7 +2547,7 @@ def sol_attn_chunked(
                 _wrap_for_dlpack(ws), _wrap_for_dlpack(chunk.contiguous()),
                 _wrap_for_dlpack(fab), _wrap_for_dlpack(qw), _wrap_for_dlpack(kw),
                 _wrap_for_dlpack(km.contiguous()), _wrap_for_dlpack(vsc.contiguous()),
-                float(rope_eps), rot, t0, m, 1, t, h, 0, stream)
+                float(rope_eps), rot, t0, m, 1, t, h, stream)
             t0 += m
         if t0 != t:
             raise ValueError(f"sol_attn_chunked: chunks cover {t0} tokens, T={t}")
@@ -2616,7 +2576,7 @@ def sol_attn_chunked(
     sq = [0, 0] if sink_q is None else list(sink_q)
     _seed_vsc(ws, vscale, 1, t, h)
     _C.sol_attn_core(
-        _wrap_for_dlpack(ws), _wrap_for_dlpack(out), 1, t, h, 0,
+        _wrap_for_dlpack(ws), _wrap_for_dlpack(out), 1, t, h,
         float(tau), float(scale), int(sb[0]), int(sb[1]), int(sq[0]), int(sq[1]),
         stream,
         threshold=None if threshold is None else _wrap_for_dlpack(threshold),
@@ -2701,11 +2661,10 @@ def _seed_vsc(ws, vscale, b, t, h):
     vsc.copy_(vscale * 127.0)
 
 
-def sol_attn_workspace_bytes(batch: int, seq_len: int, num_heads: int,
-                             max_blocks: int = 0) -> int:
+def sol_attn_workspace_bytes(batch: int, seq_len: int, num_heads: int) -> int:
     """Workspace bytes ``sol_attn`` needs for this shape. Reuse one buffer across
     calls to avoid re-allocating ~1 GB at video lengths."""
-    return _C.sol_attn_workspace(batch, seq_len, num_heads, max_blocks)
+    return _C.sol_attn_workspace(batch, seq_len, num_heads)
 
 
 def _adaln_impl(kernel, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float):

@@ -100,43 +100,6 @@ def test_sink_q_attends_everything():
     assert _cos(got[:, :64], ref[:, :64]) > 0.999
 
 
-def test_max_blocks_cap_is_safe():
-    """The cap truncates the routed list. It must stay in bounds even when a
-    sink_q block routes every block -- this was an out-of-bounds write."""
-    q, k, v = _qkv(1, 2048, 4)
-    for cap in (4, 8, 16):
-        got = ck.sol_attn(q, k, v, tau=1.4, sink_q=[0, 2], max_blocks=cap)
-        assert torch.isfinite(got.float()).all()
-
-
-@pytest.mark.parametrize("cap", [4, 8, 16])
-def test_cap_never_falls_below_the_no_exact_blocks_floor(cap):
-    """A truncated block must fall back to its pooled term, not vanish.
-
-    Raising tau until nothing routes exactly is the sparsest CORRECT
-    configuration (every block still contributes a pooled term), so no cap can
-    legitimately score below that floor. Deleting mass can, and did: the
-    routing ballot once masked truncated blocks out of BOTH branches."""
-    q, k, v = _qkv(1, 4096, 4)
-    ref = _dense(q, k, v)
-    floor = _cos(ck.sol_attn(q, k, v, tau=100.0), ref)
-    got = _cos(ck.sol_attn(q, k, v, tau=0.5, max_blocks=cap), ref)
-    assert got >= floor - 2e-3, f"cap={cap} scored {got:.6f}, below the {floor:.6f} floor"
-
-
-def test_max_blocks_reaches_the_kernel():
-    """A silently dropped cap still returns a finite, plausible result, so a
-    tight cap must visibly change the output and shrink the workspace."""
-    q, k, v = _qkv(1, 4096, 4)
-    uncapped = ck.sol_attn(q, k, v, tau=0.5)
-    capped = ck.sol_attn(q, k, v, tau=0.5, max_blocks=2)
-    assert not torch.equal(uncapped, capped)
-
-    from comfy_kitchen.backends import cuda as cuda_backend
-    assert (cuda_backend.sol_attn_workspace_bytes(1, 4096, 4, 2)
-            < cuda_backend.sol_attn_workspace_bytes(1, 4096, 4))
-
-
 @pytest.mark.parametrize("b", [1, 2])
 def test_strided_inputs(b):
     """Only the last dim must be contiguous, so a BHND view goes in as-is. The
@@ -208,7 +171,7 @@ def test_output_strides_agree_across_backends():
         # addition when written positionally.
         fake_strides = torch.ops.comfy_kitchen.sol_attn(
             fv, fv, fv, tau=1.4, scale=None, sink_blocks=[0, 0], sink_q=[0, 0],
-            max_blocks=0, key_bias=None,
+            key_bias=None,
             topk_ratio=0.0).stride()
     assert cuda_strides == eager_strides == fake_strides
 
@@ -322,34 +285,6 @@ def test_key_bias_wrong_device_rejected():
         ck.sol_attn(q, k, v, tau=1.4, key_bias=torch.zeros(256))
 
 
-def test_cap_never_unmasks_sinked_biased_keys():
-    """Sinks are pre-emitted into the routed list and exempt from max_blocks
-    truncation. Before that, the ascending-order cap could fill before reaching
-    sequence-end sink blocks and drop them into the pooled tail -- which
-    ignores key_bias, so keys masked with -inf leaked into the output
-    (canary sensitivity 1.01 where zero means the mask holds)."""
-    q, k, v = _qkv(1, 2048, 4)
-    n = 2048 // 64
-    bias = torch.zeros(1, 2048, device="cuda")
-    bias[:, -128:] = float("-inf")
-
-    def run(canary):
-        v2 = v.clone()
-        v2[:, -128:] = canary
-        return ck.sol_attn(q, k, v2, tau=0.05, key_bias=bias,
-                           sink_blocks=[n - 2, n], max_blocks=8)
-
-    assert torch.equal(run(8.0), run(-8.0))
-
-
-def test_cap_smaller_than_sink_range_rejected():
-    """Sinks are never truncated, so a cap below the sink-range size cannot
-    honour both knobs and must refuse rather than silently pick one."""
-    q, k, v = _qkv(1, 2048, 4)
-    with pytest.raises(ValueError, match="sink range"):
-        ck.sol_attn(q, k, v, tau=1.4, sink_blocks=[0, 10], max_blocks=4)
-
-
 def test_direct_backend_validates_like_the_public_path():
     """The backend-direct entry (the workspace-reusing path) must run the same
     shared rule as the registry: fp16 once ran silently to plausible garbage
@@ -446,43 +381,14 @@ def test_topk_ratio_validation():
 
 
 @pytest.mark.parametrize("rot", [64, 96])
-def test_fused_rope_matches_separate_pass(rot):
-    """rope_freqs fuses RMSNorm+RoPE into the preprocess; it must match
-    running rms_rope_split_half_ first. rot=96 is H3's REAL rot_dim -- the
-    partner shuffle must not assume a power-of-two lane offset (that bug
-    shipped and broke a real generation)."""
-    from comfy_kitchen.backends import cuda as cuda_backend
-    g = torch.Generator(device="cuda").manual_seed(5)
-    t, h, d = 2048, 4, HD
-    qkv = torch.randn(1, t, h * d * 3, device="cuda", dtype=torch.bfloat16,
-                      generator=g) * 0.5
-    freqs = torch.randn(1, t, 1, rot // 2, 2, 2, device="cuda", generator=g)
-    qw = torch.randn(d, device="cuda", dtype=torch.bfloat16, generator=g)
-    kw = torch.randn(d, device="cuda", dtype=torch.bfloat16, generator=g)
-    q = qkv[..., :h * d].view(1, t, h, d)
-    k = qkv[..., h * d:2 * h * d].view(1, t, h, d)
-    v = qkv[..., 2 * h * d:].view(1, t, h, d)
-    q2, k2 = q.clone(), k.clone()
-    ck.rms_rope_split_half_(q2, k2, freqs, qw, kw, epsilon=1e-6, rot_dim=rot)
-    ref = cuda_backend.sol_attn(q2, k2, v, tau=1.4)
-    got = cuda_backend.sol_attn(q, k, v, tau=1.4, rope_freqs=freqs,
-                                qk_norm_weights=(qw, kw))
-    assert _cos(got, ref) > 0.9999
-    with pytest.raises(ValueError, match="topk_ratio"):
-        cuda_backend.sol_attn(q, k, v, topk_ratio=0.1, rope_freqs=freqs,
-                              qk_norm_weights=(qw, kw))
-    with pytest.raises(ValueError, match="qk_norm_weights"):
-        cuda_backend.sol_attn(q, k, v, tau=1.4, rope_freqs=freqs)
-
-
-def test_chunked_producer_matches_fused():
-    """The chunked QKV producer path (projection output consumed in 64-aligned
-    chunks, carriers emitted directly, stale-stats centering) must match the
-    fused single-call path. Warm stats close most of the bootstrap gap."""
+def test_chunked_producer_matches_separate_rope(rot):
+    """The chunked QKV producer (projection output consumed in 64-aligned
+    chunks, carriers emitted directly, norm+rope fused, stale-stats centering)
+    must match rms_rope_split_half_ + sol_attn. rot=96 is H3's real rot_dim:
+    the rope partner shuffle must not assume a power-of-two lane offset."""
     from comfy_kitchen.backends import cuda as cuda_backend
     g = torch.Generator(device="cuda").manual_seed(11)
     t, h, d = 4096 + 128, 4, HD          # ragged tail across chunk boundary
-    rot = d // 2
     qkv = torch.randn(t, 3 * h * d, device="cuda", dtype=torch.bfloat16,
                       generator=g) * 0.5
     qkv[:, 2 * h * d:] *= 0.02   # realistic small V: blind bootstrap scales
@@ -490,11 +396,11 @@ def test_chunked_producer_matches_fused():
     freqs = torch.randn(1, t, 1, rot // 2, 2, 2, device="cuda", generator=g)
     qw = torch.randn(d, device="cuda", dtype=torch.bfloat16, generator=g)
     kw = torch.randn(d, device="cuda", dtype=torch.bfloat16, generator=g)
-    q = qkv[:, :h * d].view(1, t, h, d)
-    k = qkv[:, h * d:2 * h * d].view(1, t, h, d)
+    q = qkv[:, :h * d].view(1, t, h, d).clone()
+    k = qkv[:, h * d:2 * h * d].view(1, t, h, d).clone()
     v = qkv[:, 2 * h * d:].view(1, t, h, d)
-    ref = cuda_backend.sol_attn(q, k, v, tau=1.4, rope_freqs=freqs,
-                                qk_norm_weights=(qw, kw), sink_blocks=[0, 2])
+    ck.rms_rope_split_half_(q, k, freqs, qw, kw, epsilon=1e-6, rot_dim=rot)
+    ref = cuda_backend.sol_attn(q, k, v, tau=1.4, sink_blocks=[0, 2])
     chunks = list(qkv.split(1024))
     out1, km, vs = cuda_backend.sol_attn_chunked(
         chunks, t, h, freqs, (qw, kw), tau=1.4, sink_blocks=[0, 2])

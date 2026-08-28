@@ -69,7 +69,6 @@ def sol_attn(
     scale: float | None = None,
     sink_blocks: list[int] | None = None,
     sink_q: list[int] | None = None,
-    max_blocks: int = 0,
     key_bias: torch.Tensor | None = None,
     topk_ratio: float = 0.0,
 ) -> torch.Tensor:
@@ -77,8 +76,6 @@ def sol_attn(
 
     ``topk_ratio`` > 0 selects SLA-style per-query-block top-k instead of the
     tau threshold (sinks and diagonal still forced exact); tau is ignored.
-    ``max_blocks`` is accepted for signature parity and ignored: the cap is a
-    CUDA memory bound, and this reference materialises densely regardless.
     """
     b, t, h, d = q.shape
     n = (t + BLOCK - 1) // BLOCK
@@ -184,14 +181,12 @@ def _op_sol_attn(
     scale: float | None,
     sink_blocks: list[int],
     sink_q: list[int],
-    max_blocks: int,
     key_bias: torch.Tensor | None,
     topk_ratio: float,
 ) -> torch.Tensor:
     kwargs = {
         "q": q, "k": k, "v": v, "tau": tau, "scale": scale,
         "sink_blocks": sink_blocks, "sink_q": sink_q,
-        "max_blocks": max_blocks,
         "key_bias": key_bias, "topk_ratio": topk_ratio,
     }
     impl = registry.get_implementation("sol_attn", kwargs=kwargs)
@@ -199,7 +194,7 @@ def _op_sol_attn(
 
 
 @_op_sol_attn.register_fake
-def _op_sol_attn_fake(q, k, v, tau, scale, sink_blocks, sink_q, max_blocks,
+def _op_sol_attn_fake(q, k, v, tau, scale, sink_blocks, sink_q,
                       key_bias, topk_ratio):
     # Contiguous, NOT empty_like(v): both real implementations return
     # contiguous, and for a strided v, empty_like would promise a layout
