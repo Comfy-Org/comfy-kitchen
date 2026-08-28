@@ -39,11 +39,6 @@ constexpr int HD = HEAD_DIM;
 constexpr int NTHREADS = 256;
 constexpr int LDS_PAD = HD + 16;   // must be a multiple of 16: phase 1 writes uint4
 
-__device__ __forceinline__ int8_t q8(float x, float inv) {
-    const int v = __float2int_rn(x * inv);
-    return (int8_t)max(-127, min(127, v));
-}
-
 // Transposing quantizer; phase 2 is a 4x4 byte register transpose.
 template <int TT>
 __global__ void vquant_transpose(const __nv_bfloat16* __restrict__ v,
@@ -106,7 +101,7 @@ __global__ void vquant_transpose(const __nv_bfloat16* __restrict__ v,
 
 }  // namespace
 
-extern "C" void launch_sol_vtranspose(const void* v, const void* vsc, void* vT,
+void launch_sol_vtranspose(const void* v, const void* vsc, void* vT,
                                       int B, int T, int Tp, int H,
                                       int64_t sb, int64_t st, int64_t sh,
                                       cudaStream_t stream) {

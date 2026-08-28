@@ -154,6 +154,10 @@ def sol_attn(
         sink_blocks: ``[start, end)`` key blocks always attended exactly by every
             query -- conditioning rows, typically.
         sink_q: ``[start, end)`` query blocks that attend everything exactly.
+        key_bias: Per-key additive logit bias in natural log, ``(T,)``,
+            ``(B, T)`` or an SDPA-style ``(B|1, 1, 1, T)`` float or bool mask.
+            Honoured by the exact branch only, so biased blocks must be
+            covered by ``sink_blocks``.
         topk_ratio: > 0 selects SLA-style top-k instead of the tau threshold:
             keep this fraction of key blocks per query block (the selection the
             lightx2v SLA LoRAs were distilled against). tau is ignored then.

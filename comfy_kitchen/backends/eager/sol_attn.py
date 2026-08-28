@@ -46,6 +46,19 @@ def _normalize_key_bias(key_bias, batch, t, device):
     return key_bias.float()
 
 
+def _block_lengths(t: int, n: int, device) -> torch.Tensor:
+    """Live tokens per block: 64 everywhere except a ragged last block."""
+    lengths = torch.full((n,), float(BLOCK), device=device)
+    if n * BLOCK > t:
+        lengths[-1] = float(t - (n - 1) * BLOCK)
+    return lengths
+
+
+def _topk_count(n: int, ratio: float) -> int:
+    """Key blocks a query block keeps under top-k: ratio * n, clamped to [1, n-1]."""
+    return max(1, min(n - 1, round(ratio * n)))
+
+
 def _pool(x: torch.Tensor, n_blocks: int, reduce: str) -> torch.Tensor:
     """(B, T, H, D) -> (B, N, H, D), block mean or sum, ragged tail handled."""
     b, t, h, d = x.shape
@@ -55,10 +68,7 @@ def _pool(x: torch.Tensor, n_blocks: int, reduce: str) -> torch.Tensor:
     blocks = x.reshape(b, n_blocks, BLOCK, h, d)
     if reduce == "sum":
         return blocks.sum(dim=2)
-    lengths = x.new_full((n_blocks,), float(BLOCK))
-    if pad:
-        lengths[-1] = float(BLOCK - pad)
-    return blocks.sum(dim=2) / lengths.view(1, -1, 1, 1)
+    return blocks.sum(dim=2) / _block_lengths(t, n_blocks, x.device).view(1, -1, 1, 1)
 
 
 def sol_attn(
@@ -107,17 +117,11 @@ def sol_attn(
     kcc = kc - k_mean
     kc_var = kcc.pow(2).mean(dim=1)                 # (B, H, D)
 
-    # Routing threshold: tau sigma of the proxy row, from the query-block centroid.
-    lengths = fq.new_full((n,), float(BLOCK))
-    if n * BLOCK - t:
-        lengths[-1] = float(t - (n - 1) * BLOCK)
+    lengths = _block_lengths(t, n, q.device)
     centroid = _pool(fq, n, "mean")                                 # (B, N, H, D)
-    if not topk_ratio:
-        var = (centroid.pow(2) * kc_var.unsqueeze(1)).sum(-1)      # (B, N, H)
-        thr = tau * torch.sqrt(var * log2s * log2s + 1e-6)
 
     qh = fq.permute(0, 2, 1, 3)                                     # (B, H, T, D)
-    kh = (fk - k_mean.squeeze(1).unsqueeze(1)).permute(0, 2, 1, 3)
+    kh = (fk - k_mean).permute(0, 2, 1, 3)
     vh = fv.permute(0, 2, 1, 3)
     kch = kcc.permute(0, 2, 1, 3)                                   # (B, H, N, D)
     vch = vc.permute(0, 2, 1, 3)
@@ -139,16 +143,17 @@ def sol_attn(
     colmean = colmean / lengths.view(1, 1, n, 1)
     idx = torch.arange(n, device=q.device)
     if topk_ratio:
-        kk = max(1, min(n - 1, round(topk_ratio * n)))
+        kk = _topk_count(n, topk_ratio)
         row_thr = colmean.topk(kk + 1, dim=-1).values[..., -1:]
         exact = colmean > row_thr
     else:
+        # tau sigma of the proxy row, from the query-block centroid
+        var = (centroid.pow(2) * kc_var.unsqueeze(1)).sum(-1)      # (B, N, H)
+        thr = tau * torch.sqrt(var * log2s * log2s + 1e-6)
         exact = colmean > thr.permute(0, 2, 1).unsqueeze(-1)            # (B, H, NQ, N)
     exact |= ((idx.view(1, -1) - idx.view(-1, 1)).abs() <= 1).view(1, 1, n, n)
     exact |= ((idx >= sink_kv0) & (idx < sink_kv1)).view(1, 1, 1, n)
     exact |= ((idx >= sink_q0) & (idx < sink_q1)).view(1, 1, n, 1)
-    valid_blk = (idx * BLOCK < t).view(1, 1, 1, n)
-    exact &= valid_blk
 
     ex_tok = exact.gather(2, qblk.view(1, 1, t, 1).expand(b, h, t, n))   # (B,H,T,N)
     keep_tok = ex_tok.repeat_interleave(BLOCK, dim=-1)[..., :t]
@@ -157,7 +162,7 @@ def sol_attn(
     # Every row shares its query-block centroid's tail (colmean IS the
     # centroid score); ~5e-4 cosine vs per-row, 64x less routing work.
     s_blk = colmean.gather(2, qblk.view(1, 1, t, 1).expand(b, h, t, n))
-    s_blk = s_blk.masked_fill(ex_tok | ~valid_blk, neg)
+    s_blk = s_blk.masked_fill(ex_tok, neg)
 
     # One softmax over both branches. A pooled term carries its block's length in
     # the denominator because vc is a sum, not a mean.

@@ -290,6 +290,10 @@ def sol_attn_common_call_rule(kwargs):
             return ValidationResult.fail(name, f"entries must be non-negative, got {list(value)}")
         if end < start:
             return ValidationResult.fail(name, f"must be [start, end) with end >= start, got {list(value)}")
+    # 0 means "tau threshold"; anything else is a fraction of the key blocks.
+    topk_ratio = kwargs.get("topk_ratio")
+    if topk_ratio and not 0.0 < topk_ratio < 1.0:
+        return ValidationResult.fail("topk_ratio", f"must be 0 or in (0, 1), got {topk_ratio}")
     return ValidationResult.ok()
 
 

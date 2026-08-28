@@ -56,14 +56,12 @@ constexpr int NT  = HD / 8;    // output n8 tiles
 constexpr int PKC = BK / 32;   // int8 k-chunks for O += P.V
 constexpr int LDK = HD;        // 128 B, XOR-swizzled (see header)
 constexpr int LDV = BK;        // 64 B, XOR-swizzled (see header)
-#ifndef NSTAGE
-#define NSTAGE 2   // measured optimum: occupancy beats depth
-#endif
+constexpr int NSTAGE = 2;      // measured optimum: occupancy beats depth
 
 // qi:  [B,T,H,D] int8
 // qs:  [B,T,H] f32
 // kiP: [B*H,Tp,D] int8 (perm_key + perm_d)   ksb: [B*H,Tp] float2 = (ks, bias)
-// vTi: [B*H,D,Tp] int8 (transposed, logical key order)   vsc: [B*H,D] f32
+// vTi: [B*H,D,Tp] int8 (transposed; perm_d on keys, no perm_key)   vsc: [B*H,D] f32
 // Occupancy bound is arch-specific: sm_120 reaches 168 registers spill-free, so
 // 3 blocks/SM is free (worth 1.07x); sm_89 cannot hit that without spilling,
 // and a spill in this loop is worse than one fewer block, so Ada is unbounded.
@@ -111,7 +109,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         const int8_t* p1 = qi + bh_base + (int64_t)r1 * H * HD;
         #pragma unroll
         for (int kc = 0; kc < KC; ++kc) {
-            const int c0 = kc * 32 + qd * 8;      // pi put a0 and a2 side by side
+            const int c0 = kc * 32 + qd * 8;      // perm_d put a0 and a2 side by side
             const uint2 a0 = *reinterpret_cast<const uint2*>(p0 + c0);
             const uint2 a1 = *reinterpret_cast<const uint2*>(p1 + c0);
             qa[kc][0] = a0.x; qa[kc][2] = a0.y;
@@ -282,10 +280,8 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
             o_acc[nt][2] = fmaf(o_acc[nt][2], alpha1, (float)d[2]);
             o_acc[nt][3] = fmaf(o_acc[nt][3], alpha1, (float)d[3]);
         }
-#if NSTAGE < 3
         // Depth 2 refills cur next iteration, so the barrier is still required.
         __syncthreads();
-#endif
     }
 #undef SOLX_STAGE
 
@@ -312,7 +308,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
 
 }  // namespace
 
-extern "C" void launch_sol_exact(
+void launch_sol_exact(
     const void* qi, const void* qs, const void* kiP, const void* ksb,
     const void* vTi, const void* vsc,
     const void* blk_idx, const void* blk_cnt,

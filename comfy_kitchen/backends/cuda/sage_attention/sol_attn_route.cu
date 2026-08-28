@@ -50,7 +50,7 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_tc_kernel(
     uint16_t* __restrict__ blk_idx, int32_t* __restrict__ blk_cnt,
     __nv_bfloat16* __restrict__ o_part, float* __restrict__ m_part,
     float* __restrict__ l_part,
-    int T, int H, int NTB, int NPAD, int NQ,
+    int T, int NTB, int NPAD, int NQ,
     int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2) {
 #if SOL_SM80
     __shared__ int8_t sKc[BN * LDK];
@@ -265,7 +265,7 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_tc_kernel(
 
 }  // namespace centroid_tc
 
-extern "C" void launch_sol_route(
+void launch_sol_route(
     const void* cen8, const void* cens, const void* kciP, const void* kcs,
     const void* vcT, const void* vsc, const void* threshold,
     void* blk_idx, void* blk_cnt, void* o_part, void* m_part, void* l_part,
@@ -282,6 +282,6 @@ extern "C" void launch_sol_route(
         (const float*)threshold,
         (uint16_t*)blk_idx, (int32_t*)blk_cnt, (__nv_bfloat16*)o_part,
         (float*)m_part, (float*)l_part,
-        T, H, NTB, NPAD, NQ, sink_s, sink_e, sink_qs, sink_qe,
+        T, NTB, NPAD, NQ, sink_s, sink_e, sink_qs, sink_qe,
         scale_log2);
 }

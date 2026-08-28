@@ -17,10 +17,8 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
-#include <nanobind/stl/vector.h>
 #include <cuda_runtime.h>
 #include <climits>
-#include <vector>
 #include <cstring>
 #include <optional>
 
@@ -264,6 +262,8 @@ extern "C" {
 
     // Sol-Attn sparse attention — see sage_attention/sol_attn.cu.
     size_t sol_attn_workspace_bytes(int batch, int seq_len, int num_heads);
+    extern const char* const sol_attn_plan_names[];   // null-terminated
+    void sol_attn_plan(int batch, int seq_len, int num_heads, int64_t* out);
     void sol_producer_begin(void* workspace, int batch, int seq_len,
                             int num_heads, cudaStream_t stream);
     void sol_producer_chunk(
@@ -272,7 +272,7 @@ extern "C" {
         float rope_eps, int rot_dim, int t0, int M,
         int batch, int seq_len, int num_heads, cudaStream_t stream);
     void launch_sol_attn_core(
-        void* workspace, void* out, void* kmean_next, void* vamax_out,
+        void* workspace, void* out, const void* vscale, void* kmean_next, void* vamax_out,
         int batch, int seq_len, int num_heads,
         float tau, float scale, const void* ext_threshold,
         int sink_start, int sink_end, int sink_q_start, int sink_q_end,
@@ -1489,6 +1489,15 @@ int64_t sol_attn_workspace(int64_t batch, int64_t seq_len, int64_t num_heads) {
     return (int64_t)sol_attn_workspace_bytes((int)batch, (int)seq_len, (int)num_heads);
 }
 
+// Workspace dims and slot byte offsets, from the C++ Plan (the one definition).
+nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads) {
+    int64_t v[32];
+    sol_attn_plan((int)batch, (int)seq_len, (int)num_heads, v);
+    nb::dict d;
+    for (int i = 0; sol_attn_plan_names[i]; ++i) d[sol_attn_plan_names[i]] = v[i];
+    return d;
+}
+
 void sol_attn(
     nb::ndarray<nb::device::cuda> q,
     nb::ndarray<nb::device::cuda> k,
@@ -1498,8 +1507,6 @@ void sol_attn(
     int64_t batch, int64_t seq_len, int64_t num_heads, int64_t head_dim,
     float tau, float scale,
     int64_t sink_start, int64_t sink_end, int64_t sink_q_start, int64_t sink_q_end,
-    std::vector<int64_t> q_strides, std::vector<int64_t> k_strides,
-    std::vector<int64_t> v_strides,
     uintptr_t stream_ptr,
     std::optional<nb::ndarray<nb::device::cuda>> key_bias = std::nullopt,
     std::optional<nb::ndarray<nb::device::cuda>> threshold = std::nullopt)
@@ -1507,6 +1514,7 @@ void sol_attn(
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
         throw std::runtime_error("sol_attn: threshold must have B*H*ceil(T/64) elements");
+    // Explicit strides: only the last dim must be contiguous (BHND views go in as-is).
     launch_sol_attn(
         q.data(), k.data(), v.data(), out.data(), workspace.data(),
         (int)batch, (int)seq_len, (int)num_heads, (int)head_dim,
@@ -1514,9 +1522,9 @@ void sol_attn(
         key_bias ? key_bias->data() : nullptr,
         threshold ? threshold->data() : nullptr,
         (int)sink_start, (int)sink_end, (int)sink_q_start, (int)sink_q_end,
-        q_strides[0], q_strides[1], q_strides[2],
-        k_strides[0], k_strides[1], k_strides[2],
-        v_strides[0], v_strides[1], v_strides[2], stream);
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2), stream);
 }
 
 void sol_producer_begin_py(nb::ndarray<nb::device::cuda> workspace,
@@ -1543,17 +1551,21 @@ void sol_producer_chunk_py(
 
 void sol_attn_core_py(
     nb::ndarray<nb::device::cuda> workspace, nb::ndarray<nb::device::cuda> out,
+    nb::ndarray<nb::device::cuda> vscale, nb::ndarray<nb::device::cuda> kmean_next,
+    nb::ndarray<nb::device::cuda> vamax_out,
     int64_t batch, int64_t seq_len, int64_t num_heads,
     float tau, float scale,
     int64_t sink_start, int64_t sink_end, int64_t sink_q_start, int64_t sink_q_end,
     uintptr_t stream_ptr,
-    std::optional<nb::ndarray<nb::device::cuda>> threshold = std::nullopt,
-    std::optional<nb::ndarray<nb::device::cuda>> kmean_next = std::nullopt,
-    std::optional<nb::ndarray<nb::device::cuda>> vamax_out = std::nullopt) {
+    std::optional<nb::ndarray<nb::device::cuda>> threshold = std::nullopt) {
+    const int64_t stats = batch * num_heads * 128;
+    if ((int64_t)vscale.size() != stats || (int64_t)kmean_next.size() != stats ||
+        (int64_t)vamax_out.size() != stats)
+        throw std::runtime_error("sol_attn_core: vscale/kmean_next/vamax_out must have B*H*128 elements");
+    if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
+        throw std::runtime_error("sol_attn_core: threshold must have B*H*ceil(T/64) elements");
     launch_sol_attn_core(
-        workspace.data(), out.data(),
-        kmean_next ? kmean_next->data() : nullptr,
-        vamax_out ? vamax_out->data() : nullptr,
+        workspace.data(), out.data(), vscale.data(), kmean_next.data(), vamax_out.data(),
         (int)batch, (int)seq_len, (int)num_heads,
         tau, scale, threshold ? threshold->data() : nullptr,
         (int)sink_start, (int)sink_end, (int)sink_q_start, (int)sink_q_end,
@@ -3807,6 +3819,9 @@ NB_MODULE(_C, m) {
     m.def("sol_attn_workspace", &sol_attn_workspace,
           "Workspace bytes required by sol_attn for this shape",
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"));
+    m.def("sol_attn_plan", &sol_attn_plan_py,
+          "Workspace dims and slot byte offsets for this shape",
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"));
 
     m.def("sol_attn", &sol_attn,
           "Sol-Attn training-free sparse attention (BF16 in/out, head_dim 128)",
@@ -3817,7 +3832,6 @@ NB_MODULE(_C, m) {
           nb::arg("tau"), nb::arg("scale"),
           nb::arg("sink_start"), nb::arg("sink_end"),
           nb::arg("sink_q_start"), nb::arg("sink_q_end"),
-          nb::arg("q_strides"), nb::arg("k_strides"), nb::arg("v_strides"),
           nb::arg("stream_ptr"),
           nb::arg("key_bias") = nb::none(),
           nb::arg("threshold") = nb::none());
@@ -3832,14 +3846,13 @@ NB_MODULE(_C, m) {
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
           nb::arg("stream_ptr"));
     m.def("sol_attn_core", &sol_attn_core_py,
-          nb::arg("workspace"), nb::arg("out"), nb::arg("batch"),
-          nb::arg("seq_len"), nb::arg("num_heads"),
+          nb::arg("workspace"), nb::arg("out"), nb::arg("vscale"),
+          nb::arg("kmean_next"), nb::arg("vamax_out"),
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
           nb::arg("tau"), nb::arg("scale"),
           nb::arg("sink_start"), nb::arg("sink_end"),
           nb::arg("sink_q_start"), nb::arg("sink_q_end"), nb::arg("stream_ptr"),
-          nb::arg("threshold") = nb::none(),
-          nb::arg("kmean_next") = nb::none(),
-          nb::arg("vamax_out") = nb::none());
+          nb::arg("threshold") = nb::none());
 
     m.def("flash_attention_decode", &flash_attention_decode,
           "Flash Attention decode over a fixed-capacity variable-length KV cache",

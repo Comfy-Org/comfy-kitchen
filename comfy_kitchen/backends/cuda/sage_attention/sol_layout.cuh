@@ -15,9 +15,11 @@
  * limitations under the License.
  */
 
-// Shared layout contract for the CUDA Sol-Attn kernels. The producer
-// (preprocess) and consumers (route, exact) must agree exactly on permutations
-// and swizzles; a drift is invisible to either side's own test.
+// Shared layout contract for the CUDA Sol-Attn kernels. Both producers of the
+// workspace carriers (preprocess, chunked producer) and the consumers (route,
+// exact) must agree exactly on permutations and swizzles; a drift is invisible
+// to either side's own test. The per-tile quantization helpers below are the
+// single definition of how Q/K rows and query centroids become int8.
 
 #pragma once
 
@@ -67,6 +69,139 @@ __device__ __forceinline__ int swz_k(int row) { return (row & 3) * 2; }
 
 // V^T tile, 128 x 64 B. Naive c16 ^ (C & 3) collides rows g and g+4.
 __device__ __forceinline__ int swz_v(int col) { return ((col >> 2) ^ col) & 3; }
+
+// ---------------------------------------------------------------------------
+// Tile quantization, shared by the preprocess and the chunked producer. All of
+// it assumes a 128-thread CTA working on one staged 64 x 128 bf16 tile.
+// ---------------------------------------------------------------------------
+
+// Row stride of a staged tile, in bf16; x2 bytes stays a multiple of 16 for
+// the uint4 staging stores.
+constexpr int LD_TILE = HEAD_DIM + 8;
+
+__device__ __forceinline__ int8_t q8(float x, float inv) {
+    return (int8_t)max(-127, min(127, __float2int_rn(x * inv)));
+}
+
+// Block-wide reductions over 128 threads (one per channel); every thread gets
+// the result, and `s` is free for reuse on return.
+__device__ __forceinline__ float block_max128(float x, float* s) {
+    const int d = threadIdx.x;
+    s[d] = x;
+    __syncthreads();
+    for (int w = 64; w; w >>= 1) {
+        if (d < w) s[d] = fmaxf(s[d], s[d + w]);
+        __syncthreads();
+    }
+    const float r = s[0];
+    __syncthreads();
+    return r;
+}
+__device__ __forceinline__ float block_sum128(float x, float* s) {
+    const int d = threadIdx.x;
+    s[d] = x;
+    __syncthreads();
+    for (int w = 64; w; w >>= 1) {
+        if (d < w) s[d] += s[d + w];
+        __syncthreads();
+    }
+    const float r = s[0];
+    __syncthreads();
+    return r;
+}
+
+// Stage rows 0..len-1 of a (token, channel) bf16 source into the tile, zero
+// past len. Row t is read from src + t * stride (16 B loads, so the last dim
+// must be contiguous and 16 B aligned).
+__device__ __forceinline__ void stage_tile64(
+    __nv_bfloat16* tile, const __nv_bfloat16* __restrict__ src, int64_t stride, int len)
+{
+    for (int idx = threadIdx.x; idx < BLOCK * (HEAD_DIM / 8); idx += HEAD_DIM) {
+        const int t = idx / (HEAD_DIM / 8), c8 = (idx % (HEAD_DIM / 8)) * 8;
+        uint4 val = make_uint4(0u, 0u, 0u, 0u);
+        if (t < len)
+            val = *reinterpret_cast<const uint4*>(src + (int64_t)t * stride + c8);
+        *reinterpret_cast<uint4*>(tile + t * LD_TILE + c8) = val;
+    }
+}
+
+// Per-token absmax scale + perm_d'd int8 row, one thread per token. qiP / qs
+// point at (this tile's first token, this head): row t lands at +t*H*HEAD_DIM
+// and +t*H. The permuted row is built in registers and stored as uint4s;
+// writing qiP[perm_d(d)] directly costs 128 scattered byte stores per token.
+__device__ __forceinline__ void quant_q_rows(
+    const __nv_bfloat16* tile, int len, int8_t* __restrict__ qiP, float* __restrict__ qs, int H)
+{
+    for (int t = threadIdx.x; t < len; t += HEAD_DIM) {
+        const __nv_bfloat16* row = tile + t * LD_TILE;
+        float a = 0.f;
+        for (int d = 0; d < HEAD_DIM; ++d) a = fmaxf(a, fabsf(__bfloat162float(row[d])));
+        const float sc = fmaxf(a / 127.0f, 1e-8f);
+        qs[(size_t)t * H] = sc;
+        const float inv = 1.f / sc;
+        int8_t out[HEAD_DIM];
+        #pragma unroll
+        for (int d = 0; d < HEAD_DIM; ++d) out[perm_d(d)] = q8(__bfloat162float(row[d]), inv);
+        int8_t* dst = qiP + (size_t)t * H * HEAD_DIM;
+        #pragma unroll
+        for (int c = 0; c < HEAD_DIM; c += 16)
+            *reinterpret_cast<uint4*>(dst + c) = *reinterpret_cast<const uint4*>(out + c);
+    }
+}
+
+// Query-block centroid (channel mean over the live rows), quantized like a
+// pseudo-row with the pooled keys' perm_d so their dot needs no unpermute.
+// One thread per channel; returns this thread's channel mean. `sred` holds
+// bytes on return -- the caller must sync before reusing it.
+__device__ __forceinline__ float centroid_quant(
+    const __nv_bfloat16* tile, int len, float* sred,
+    int8_t* __restrict__ cen8, float* __restrict__ cens)
+{
+    const int d = threadIdx.x;
+    float c = 0.f;
+    for (int t = 0; t < len; ++t) c += __bfloat162float(tile[t * LD_TILE + d]);
+    c /= (float)len;
+    const float csc = fmaxf(block_max128(fabsf(c), sred) / 127.0f, 1e-8f);
+    char* s8 = reinterpret_cast<char*>(sred);
+    s8[perm_d(d)] = (char)q8(c, 1.f / csc);
+    __syncthreads();
+    if (d < HEAD_DIM / 16)
+        reinterpret_cast<uint4*>(cen8)[d] = reinterpret_cast<const uint4*>(s8)[d];
+    if (d == 0) *cens = csc;
+    return c;
+}
+
+// Centred per-key scale + perm_d'd int8 row, one thread per destination row p,
+// which takes SOURCE row perm_key(p) (the smem read absorbs the relabelling).
+// kmean is this head's [HEAD_DIM] centering vector; kbias (log2 units, or
+// null) is indexed by source row -- only the exact branch reads it, so biased
+// blocks must be sink-routed. kiP / ksb point at destination row 0 of the
+// block; dead rows get a zero scale, NEG bias and zero bytes.
+__device__ __forceinline__ void quant_k_rows(
+    const __nv_bfloat16* tile, int len, const float* __restrict__ kmean,
+    const float* __restrict__ kbias, int8_t* __restrict__ kiP, float2* __restrict__ ksb)
+{
+    for (int p = threadIdx.x; p < BLOCK; p += HEAD_DIM) {
+        const int s = perm_key(p);
+        const bool live = s < len;
+        const __nv_bfloat16* row = tile + s * LD_TILE;
+        float a = 0.f;
+        for (int d = 0; d < HEAD_DIM; ++d)
+            a = fmaxf(a, fabsf(__bfloat162float(row[d]) - kmean[d]));
+        const float sc = fmaxf(a / 127.0f, 1e-8f);
+        const float bias = (kbias && live) ? kbias[s] : 0.f;
+        ksb[p] = make_float2(live ? sc : 0.f, live ? bias : NEG);
+        const float inv = 1.f / sc;
+        int8_t out[HEAD_DIM];
+        #pragma unroll
+        for (int d = 0; d < HEAD_DIM; ++d)
+            out[perm_d(d)] = live ? q8(__bfloat162float(row[d]) - kmean[d], inv) : (int8_t)0;
+        #pragma unroll
+        for (int c = 0; c < HEAD_DIM; c += 16)
+            *reinterpret_cast<uint4*>(kiP + (size_t)p * HEAD_DIM + c) =
+                *reinterpret_cast<const uint4*>(out + c);
+    }
+}
 
 // Fused per-head RMSNorm + split-half RoPE on a staged bf16 tile, in place.
 // Matches ops/rms_rope.cu bit-for-bit, including its bf16 rounding between
@@ -135,10 +270,12 @@ __device__ __forceinline__ void mma_s8(int32_t* d, const uint32_t* a, const uint
 
 // P is non-negative: the u8 side gives it 255 levels instead of 127.
 __device__ __forceinline__ void mma_u8s8(int32_t* d, const uint32_t* a, const uint32_t* b) {
+#if SOL_SM80
     asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32.u8.s8.s32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
 }
 
 __device__ __forceinline__ void mma_bf16(float* d, const uint32_t* a, const uint32_t* b) {
