@@ -427,7 +427,7 @@ def test_no_tail_matches_eager():
 def _coarse_reference(q, k, v, valid, block_len, gate, scale=HD ** -0.5):
     """Independent per-block loop: masked dense attention plus gate * coarse term."""
     from comfy_kitchen.backends.eager.sol_attn import _block_lengths
-    b, t, h, d = q.shape
+    t = q.shape[1]
     n = (t + 63) // 64
     lengths = _block_lengths(t, n, "cuda", block_len)
     x = [xx.float() * valid.view(1, -1, 1, 1) for xx in (q, k, v)]
