@@ -171,9 +171,9 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
                     if (cand[1]) row[slot1] = (uint16_t)(gs + c0 + 1);
                 }
                 cnt[rr] += total;
-                // exact-routed and sink blocks leave the tail; score is NEG when !valid
-                pv[nt][rr * 2] = (pre[0] || cand[0]) ? NEG : score[0];
-                pv[nt][rr * 2 + 1] = (pre[1] || cand[1]) ? NEG : score[1];
+                // exact-routed and sink blocks leave the tail (this form costs 3 fewer regs)
+                pv[nt][rr * 2] = valid[0] && !(pre[0] || cand[0]) ? score[0] : NEG;
+                pv[nt][rr * 2 + 1] = valid[1] && !(pre[1] || cand[1]) ? score[1] : NEG;
             }
         }
 

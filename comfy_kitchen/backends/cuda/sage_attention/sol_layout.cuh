@@ -116,6 +116,7 @@ __device__ __forceinline__ void quant_q_rows(
     for (int t = threadIdx.x; t < len; t += HEAD_DIM) {
         const __nv_bfloat16* row = tile + t * LD_TILE;
         float a = 0.f;
+        #pragma unroll 8   // unbounded, nvcc hoists all 128 loads: 168 regs in the producer
         for (int d = 0; d < HEAD_DIM; ++d) a = fmaxf(a, fabsf(__bfloat162float(row[d])));
         const float sc = fmaxf(a / 127.0f, 1e-8f);
         qs[(size_t)t * H] = sc;
