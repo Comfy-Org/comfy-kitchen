@@ -278,6 +278,21 @@ def sol_attn_common_call_rule(kwargs):
                 )
         if q.shape[-1] != 128:
             return ValidationResult.fail("q", "head_dim must be 128")
+        block_len = kwargs.get("block_len")
+        if block_len is not None:
+            n = (q.shape[1] + 63) // 64
+            if block_len.dtype != torch.int32 or block_len.dim() != 1 or block_len.numel() != n:
+                return ValidationResult.fail(
+                    "block_len", f"must be int32 of shape ({n},), got {block_len.dtype} {tuple(block_len.shape)}")
+            if block_len.device != q.device:
+                return ValidationResult.fail("block_len", f"must be on {q.device}, got {block_len.device}")
+        coarse_gate = kwargs.get("coarse_gate")
+        if coarse_gate is not None:
+            if tuple(coarse_gate.shape) != tuple(q.shape):
+                return ValidationResult.fail(
+                    "coarse_gate", f"must have q's shape {tuple(q.shape)}, got {tuple(coarse_gate.shape)}")
+            if coarse_gate.device != q.device:
+                return ValidationResult.fail("coarse_gate", f"must be on {q.device}, got {coarse_gate.device}")
     # Both sinks are half-open [start, end) block ranges.
     for name in ("sink_blocks", "sink_q"):
         value = kwargs.get(name)

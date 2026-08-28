@@ -46,12 +46,54 @@ def _normalize_key_bias(key_bias, batch, t, device):
     return key_bias.float()
 
 
-def _block_lengths(t: int, n: int, device) -> torch.Tensor:
-    """Live tokens per block: 64 everywhere except a ragged last block."""
+def _block_lengths(t: int, n: int, device, block_len=None) -> torch.Tensor:
+    """Live tokens per block: the caller's table (zero-padded tiles) or 64
+    everywhere except a ragged last block."""
+    tail = t - (n - 1) * BLOCK
+    if block_len is not None:   # clamped like the kernels (block_len_of)
+        lengths = block_len.to(device=device, dtype=torch.float32).clamp(1, BLOCK)
+        if tail < BLOCK:
+            lengths = lengths.clone()
+            lengths[-1] = lengths[-1].clamp(max=tail)
+        return lengths
     lengths = torch.full((n,), float(BLOCK), device=device)
-    if n * BLOCK > t:
-        lengths[-1] = float(t - (n - 1) * BLOCK)
+    if tail < BLOCK:
+        lengths[-1] = float(tail)
     return lengths
+
+
+def _sink_count(n, s0, s1):
+    """Sink blocks inside [0, n): they are always exact, so the top-k budget
+    counts the others only."""
+    return max(0, min(s1, n) - min(s0, n))
+
+
+def _valid_rows(t: int, lengths: torch.Tensor) -> torch.Tensor:
+    """(T,) bool: token t is live iff it sits in the first len rows of its block."""
+    pos = torch.arange(t, device=lengths.device)
+    return (pos % BLOCK) < lengths[pos // BLOCK]
+
+
+def coarse_output(qm, km, vm, scale):
+    """VSA coarse branch: dense attention over the block means. qm/km/vm are
+    ``[BH, N, D]`` fp32; returns ``[BH, N, D]`` fp32."""
+    s = torch.bmm(qm, km.transpose(1, 2)) * scale
+    return torch.bmm(torch.softmax(s, dim=-1), vm)
+
+
+def add_coarse_(out, oc, gate):
+    """out += gate * oc[block(t)], in place (one rounding: addcmul_ promotes
+    internally). out/gate ``(B, T, H, D)``; oc ``[BH, N, D]`` fp32."""
+    b, t, h, d = out.shape
+    oc = oc.view(b, h, -1, d).permute(0, 2, 1, 3)   # (B, N, H, D)
+    gate = gate.contiguous()
+    nfull = t // BLOCK
+    if nfull:
+        out[:, :nfull * BLOCK].view(b, nfull, BLOCK, h, d).addcmul_(
+            gate[:, :nfull * BLOCK].view(b, nfull, BLOCK, h, d), oc[:, :nfull, None])
+    if t % BLOCK:
+        out[:, nfull * BLOCK:].addcmul_(gate[:, nfull * BLOCK:], oc[:, nfull:nfull + 1])
+    return out
 
 
 def _topk_count(n: int, ratio: float) -> int:
@@ -59,16 +101,19 @@ def _topk_count(n: int, ratio: float) -> int:
     return max(1, min(n - 1, round(ratio * n)))
 
 
-def _pool(x: torch.Tensor, n_blocks: int, reduce: str) -> torch.Tensor:
-    """(B, T, H, D) -> (B, N, H, D), block mean or sum, ragged tail handled."""
+def _pool(x: torch.Tensor, n_blocks: int, reduce: str, lengths=None) -> torch.Tensor:
+    """(B, T, H, D) -> (B, N, H, D), block mean or sum over the live rows."""
     b, t, h, d = x.shape
+    if lengths is None:
+        lengths = _block_lengths(t, n_blocks, x.device)
+    x = x * _valid_rows(t, lengths).view(1, -1, 1, 1)
     pad = n_blocks * BLOCK - t
     if pad:
         x = torch.cat([x, x.new_zeros(b, pad, h, d)], dim=1)
     blocks = x.reshape(b, n_blocks, BLOCK, h, d)
     if reduce == "sum":
         return blocks.sum(dim=2)
-    return blocks.sum(dim=2) / _block_lengths(t, n_blocks, x.device).view(1, -1, 1, 1)
+    return blocks.sum(dim=2) / lengths.view(1, -1, 1, 1)
 
 
 def sol_attn(
@@ -81,11 +126,19 @@ def sol_attn(
     sink_q: list[int] | None = None,
     key_bias: torch.Tensor | None = None,
     topk_ratio: float = 0.0,
+    tail: bool = True,
+    block_len: torch.Tensor | None = None,
+    coarse_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn over ``(B, T, H, D)`` tensors. See the module docstring.
 
     ``topk_ratio`` > 0 selects SLA-style per-query-block top-k instead of the
     tau threshold (sinks and diagonal still forced exact); tau is ignored.
+    ``tail=False`` drops the pooled term (softmax over routed blocks only),
+    ``block_len`` marks the live rows at the front of each 64-block (values
+    clamped to [1, rows in the block]; dead rows are never keys and their
+    output rows are unspecified), and ``coarse_gate`` adds VSA's gated coarse
+    branch: ``gate * softmax(q_mean k_mean^T * scale) v_mean`` per block.
     """
     b, t, h, d = q.shape
     n = (t + BLOCK - 1) // BLOCK
@@ -106,16 +159,16 @@ def sol_attn(
         )
 
     fq, fk, fv = q.float(), k.float(), v.float()
-    kc = _pool(fk, n, "mean")                       # (B, N, H, D) summary keys
-    vc = _pool(fv, n, "sum")                        # (B, N, H, D) summed values
+    lengths = _block_lengths(t, n, q.device, block_len)
+    kc = _pool(fk, n, "mean", lengths)              # (B, N, H, D) summary keys
+    vc = _pool(fv, n, "sum", lengths)               # (B, N, H, D) summed values
 
     # centring K shifts every score in a row by a constant: softmax-invariant
     k_mean = kc.mean(dim=1, keepdim=True)           # (B, 1, H, D)
     kcc = kc - k_mean
     kc_var = kcc.pow(2).mean(dim=1)                 # (B, H, D)
 
-    lengths = _block_lengths(t, n, q.device)
-    centroid = _pool(fq, n, "mean")                                 # (B, N, H, D)
+    centroid = _pool(fq, n, "mean", lengths)                        # (B, N, H, D)
 
     qh = fq.permute(0, 2, 1, 3)                                     # (B, H, T, D)
     kh = (fk - k_mean).permute(0, 2, 1, 3)
@@ -124,6 +177,9 @@ def sol_attn(
     vch = vc.permute(0, 2, 1, 3)
 
     s_tok = (qh @ kh.transpose(-1, -2)) * log2s                     # (B, H, T, T)
+    if block_len is not None:
+        s_tok = s_tok.masked_fill(~_valid_rows(t, lengths).view(1, 1, 1, t),
+                                  torch.finfo(s_tok.dtype).min)
     if key_bias is not None:
         # Per-key logit bias (natural log). Exact branch only: biased blocks
         # must be sink-covered, the pooled tail cannot see per-token bias.
@@ -134,14 +190,19 @@ def sol_attn(
     # routed = column mean over the query block clears the threshold; the
     # diagonal +-1, sink blocks and sink_q rows are always exact
     qblk = torch.arange(t, device=q.device) // BLOCK
+    if block_len is not None:   # dead query rows must not enter the block's mean
+        s_blk = s_blk * _valid_rows(t, lengths).view(1, 1, t, 1)
     colmean = torch.zeros(b, h, n, n, device=q.device, dtype=s_blk.dtype)
     colmean.scatter_add_(2, qblk.view(1, 1, t, 1).expand(b, h, t, n), s_blk)
     colmean = colmean / lengths.view(1, 1, n, 1)
     idx = torch.arange(n, device=q.device)
     if topk_ratio:
-        kk = _topk_count(n, topk_ratio)
-        row_thr = colmean.topk(kk + 1, dim=-1).values[..., -1:]
-        exact = colmean > row_thr
+        # sink blocks are always exact, so they neither count toward nor consume the budget
+        ranked = colmean.clone()
+        ranked[..., sink_kv0:sink_kv1] = float("-inf")
+        kk = _topk_count(n - _sink_count(n, sink_kv0, sink_kv1), topk_ratio)
+        row_thr = ranked.topk(kk + 1, dim=-1).values[..., -1:]
+        exact = ranked > row_thr
     else:
         # tau sigma of the proxy row, from the query-block centroid
         var = (centroid.pow(2) * kc_var.unsqueeze(1)).sum(-1)      # (B, N, H)
@@ -158,6 +219,8 @@ def sol_attn(
     # every row shares its query block's tail (colmean IS the centroid score)
     s_blk = colmean.gather(2, qblk.view(1, 1, t, 1).expand(b, h, t, n))
     s_blk = s_blk.masked_fill(ex_tok, neg)
+    if not tail:
+        s_blk = torch.full_like(s_blk, neg)
 
     # one softmax over both branches; a pooled term weighs its block length (vc is a sum)
     logits = torch.cat([s_tok, s_blk], dim=-1)
@@ -167,7 +230,12 @@ def sol_attn(
     den = p[..., :t].sum(-1) + (p[..., t:] * lengths.view(1, 1, 1, n)).sum(-1)
     out = (num / den.clamp_min(1e-30).unsqueeze(-1)).permute(0, 2, 1, 3).to(v.dtype)
     # contiguous, matching the CUDA backend and register_fake
-    return out.contiguous()
+    out = out.contiguous()
+    if coarse_gate is not None:
+        flat = lambda p: p.permute(0, 2, 1, 3).reshape(b * h, n, d)  # noqa: E731
+        oc = coarse_output(flat(centroid), flat(kc), flat(vc / lengths.view(1, -1, 1, 1)), scale)
+        add_coarse_(out, oc, coarse_gate)
+    return out
 
 
 @torch.library.custom_op("comfy_kitchen::sol_attn", mutates_args=())
@@ -181,11 +249,15 @@ def _op_sol_attn(
     sink_q: list[int],
     key_bias: torch.Tensor | None,
     topk_ratio: float,
+    tail: bool,
+    block_len: torch.Tensor | None,
+    coarse_gate: torch.Tensor | None,
 ) -> torch.Tensor:
     kwargs = {
         "q": q, "k": k, "v": v, "tau": tau, "scale": scale,
         "sink_blocks": sink_blocks, "sink_q": sink_q,
         "key_bias": key_bias, "topk_ratio": topk_ratio,
+        "tail": tail, "block_len": block_len, "coarse_gate": coarse_gate,
     }
     impl = registry.get_implementation("sol_attn", kwargs=kwargs)
     return impl(**kwargs)
@@ -193,6 +265,6 @@ def _op_sol_attn(
 
 @_op_sol_attn.register_fake
 def _op_sol_attn_fake(q, k, v, tau, scale, sink_blocks, sink_q,
-                      key_bias, topk_ratio):
+                      key_bias, topk_ratio, tail, block_len, coarse_gate):
     # contiguous, NOT empty_like(v): both real implementations return contiguous
     return torch.empty(v.shape, dtype=v.dtype, device=v.device)

@@ -58,6 +58,14 @@ __host__ __device__ __forceinline__ int perm_key(int p) {
 __device__ __forceinline__ int swz_k(int row) { return (row & 3) * 2; }
 __device__ __forceinline__ int swz_v(int col) { return ((col >> 2) ^ col) & 3; }
 
+// Valid tokens at the FRONT of 64-block n: the caller's per-block table
+// (zero-padded tiles, clamped to [1, rows that exist]) or the plain ragged
+// tail. Rows past it are dead.
+__device__ __forceinline__ int block_len_of(const int32_t* blen, int n, int T) {
+    const int rem = min(BLOCK, T - n * BLOCK);
+    return blen ? min(rem, max(1, blen[n])) : rem;
+}
+
 // ---- Tile quantization: one 128-thread CTA per staged 64 x 128 bf16 tile ----
 
 constexpr int LD_TILE = HEAD_DIM + 8;   // bf16 row stride; keeps uint4 stores aligned
@@ -108,19 +116,23 @@ __device__ __forceinline__ void stage_tile64(
 }
 
 // Per-token absmax scale + perm_d'd int8 row, one thread per token. qiP / qs
-// point at (this tile's first token, this head). The permuted row is built in
-// registers: scattered byte stores cost 128 per token.
+// point at (this tile's first token, this head). Rows [len, nrows) exist in
+// memory but are dead (zero-padded tiles) and get zeros; rows past nrows do
+// not exist. The permuted row is built in registers: scattered byte stores
+// cost 128 per token.
 __device__ __forceinline__ void quant_q_rows(
-    const __nv_bfloat16* tile, int len, int8_t* __restrict__ qiP, float* __restrict__ qs, int H)
+    const __nv_bfloat16* tile, int len, int nrows,
+    int8_t* __restrict__ qiP, float* __restrict__ qs, int H)
 {
-    for (int t = threadIdx.x; t < len; t += HEAD_DIM) {
-        const __nv_bfloat16* row = tile + t * LD_TILE;
+    for (int t = threadIdx.x; t < nrows; t += HEAD_DIM) {
+        const __nv_bfloat16* row = tile + t * LD_TILE;   // zero-staged past len
+        const bool live = t < len;
         float a = 0.f;
         #pragma unroll 8   // unbounded, nvcc hoists all 128 loads: 168 regs in the producer
         for (int d = 0; d < HEAD_DIM; ++d) a = fmaxf(a, fabsf(__bfloat162float(row[d])));
-        const float sc = fmaxf(a / 127.0f, 1e-8f);
+        const float sc = live ? fmaxf(a / 127.0f, 1e-8f) : 0.f;   // dead rows: deterministic zeros
         qs[(size_t)t * H] = sc;
-        const float inv = 1.f / sc;
+        const float inv = live ? 1.f / sc : 0.f;
         int8_t out[HEAD_DIM];
         #pragma unroll
         for (int d = 0; d < HEAD_DIM; ++d) out[perm_d(d)] = q8(__bfloat162float(row[d]), inv);

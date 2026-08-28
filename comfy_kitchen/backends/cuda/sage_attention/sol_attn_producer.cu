@@ -48,7 +48,9 @@ __global__ void sol_producer_kernel(
     int8_t* __restrict__ vTi, __nv_bfloat16* __restrict__ vcT,
     float* __restrict__ ksumP,               // [H, NPAD, HD] block K sums (post-rope)
     int8_t* __restrict__ cen8, float* __restrict__ cens,
+    float* __restrict__ qmean,               // [H, NPAD, HD] f32 block means (post-rope)
     float* __restrict__ vamax_next,          // [H, HD] atomicMax accumulator
+    const int32_t* __restrict__ blen,        // [NTB] valid tokens per block, or null
     float rope_eps, int rot,
     int t0, int M, int T, int Tp, int H, int NPAD, int NQ)
 {
@@ -56,9 +58,11 @@ __global__ void sol_producer_kernel(
     __shared__ __align__(16) float sred[HD];
     const int blk_local = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
     const int tb0 = t0 + blk_local * BLK;              // absolute token start
-    const int len = min(BLK, min(M - blk_local * BLK, T - tb0));
-    if (len <= 0) return;
+    if (tb0 >= T) return;
     const int nblk = tb0 / BLK;                        // global 64-block index
+    const int nrows = min(BLK, min(M - blk_local * BLK, T - tb0));   // rows that exist
+    const int len = min(block_len_of(blen, nblk, T), nrows);         // rows that are live
+    if (len <= 0) return;
     const int64_t row_stride = (int64_t)3 * H * HD;
     const __nv_bfloat16* rows = qkv + (int64_t)(blk_local * BLK) * row_stride;
     const float* fab_t0 = fab + (int64_t)tb0 * (rot * 2);
@@ -68,10 +72,11 @@ __global__ void sol_producer_kernel(
     __syncthreads();
     norm_rope_rows(sT, LD_TILE, len, fab_t0, qw, rope_eps, rot);
     __syncthreads();
-    quant_q_rows(sT, len, qiP + ((size_t)tb0 * H + h) * HD, qs + (size_t)tb0 * H + h, H);
+    quant_q_rows(sT, len, nrows, qiP + ((size_t)tb0 * H + h) * HD, qs + (size_t)tb0 * H + h, H);
     __syncthreads();
     const size_t qrow = (size_t)h * NQ + nblk;
-    centroid_quant(sT, len, sred, cen8 + qrow * HD, cens + qrow);
+    const float c = centroid_quant(sT, len, sred, cen8 + qrow * HD, cens + qrow);
+    qmean[((size_t)h * NPAD + nblk) * HD + tid] = c;
     __syncthreads();
 
     // ---------------- K phase ----------------
@@ -119,8 +124,8 @@ void launch_sol_producer(
     const void* qkv, const void* fab, const void* qw, const void* kw,
     const void* kmean, const void* vscale,
     void* qiP, void* qs, void* kiP, void* ksb, void* vTi, void* vcT,
-    void* ksumP, void* cen8, void* cens, void* vamax_next,
-    float rope_eps, int rot,
+    void* ksumP, void* cen8, void* cens, void* qmean, void* vamax_next,
+    const void* blen, float rope_eps, int rot,
     int t0, int M, int T, int Tp, int H, int NPAD, int NQ,
     cudaStream_t stream)
 {
@@ -131,6 +136,6 @@ void launch_sol_producer(
         (const float*)kmean, (const float*)vscale,
         (int8_t*)qiP, (float*)qs, (int8_t*)kiP, (float2*)ksb,
         (int8_t*)vTi, (__nv_bfloat16*)vcT, (float*)ksumP,
-        (int8_t*)cen8, (float*)cens, (float*)vamax_next,
-        rope_eps, rot, t0, M, T, Tp, H, NPAD, NQ);
+        (int8_t*)cen8, (float*)cens, (float*)qmean, (float*)vamax_next,
+        (const int32_t*)blen, rope_eps, rot, t0, M, T, Tp, H, NPAD, NQ);
 }

@@ -137,6 +137,9 @@ def sol_attn(
     sink_q: list[int] | None = None,
     key_bias: torch.Tensor | None = None,
     topk_ratio: float = 0.0,
+    tail: bool = True,
+    block_len: torch.Tensor | None = None,
+    coarse_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn training-free sparse attention (arXiv 2607.24027).
 
@@ -161,6 +164,14 @@ def sol_attn(
         topk_ratio: > 0 selects SLA-style top-k instead of the tau threshold:
             keep this fraction of key blocks per query block (the selection the
             lightx2v SLA LoRAs were distilled against). tau is ignored then.
+        tail: False drops the pooled term so the softmax runs over the routed
+            blocks only (VSA / SLA fine stage).
+        block_len: int32 ``(ceil(T/64),)`` live tokens at the front of each
+            64-token block, for zero-padded tiles. Values are clamped to
+            ``[1, rows in the block]``; dead rows are never keys and their
+            output rows are unspecified.
+        coarse_gate: ``(B, T, H, 128)`` per-token gate for VSA's coarse branch:
+            ``gate * softmax(q_mean k_mean^T * scale) v_mean`` is added per block.
 
     Returns:
         ``(B, T, H, 128)`` attention output.
@@ -171,6 +182,9 @@ def sol_attn(
         [0, 0] if sink_q is None else list(sink_q),
         key_bias,
         float(topk_ratio),
+        bool(tail),
+        block_len,
+        coarse_gate,
     )
 
 

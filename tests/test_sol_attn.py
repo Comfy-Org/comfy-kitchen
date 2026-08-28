@@ -164,8 +164,8 @@ def test_output_strides_agree_across_backends():
         fv = torch.empty(v.shape, dtype=v.dtype, device=v.device)
         fake_strides = torch.ops.comfy_kitchen.sol_attn(
             fv, fv, fv, tau=1.4, scale=None, sink_blocks=[0, 0], sink_q=[0, 0],
-            key_bias=None,
-            topk_ratio=0.0).stride()
+            key_bias=None, topk_ratio=0.0, tail=True, block_len=None,
+            coarse_gate=None).stride()
     assert cuda_strides == eager_strides == fake_strides
 
 
@@ -362,3 +362,169 @@ def test_chunked_producer_topk():
         c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], kmean=km, vscale=vs,
         topk_ratio=0.2, sink_blocks=[0, 2])
     assert _cos(out, ref) > 0.995
+
+
+# ---- VSA-style pieces: padded tiles, no tail, gated coarse branch ----
+
+def _padded_case(t=64 * 40, h=4, seed=21, b=1):
+    """Random live-row counts per block (the last entry may exceed the ragged
+    tail and gets clamped); dead rows hold garbage the kernel must ignore."""
+    from comfy_kitchen.backends.eager.sol_attn import _block_lengths
+    q, k, v = _qkv(b, t, h, seed=seed)
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    n = (t + 63) // 64
+    block_len = torch.randint(1, 65, (n,), device="cuda", generator=g).to(torch.int32)
+    lengths = _block_lengths(t, n, "cuda", block_len)
+    valid = (torch.arange(t, device="cuda") % 64) < lengths.repeat_interleave(64)[:t]
+    return q, k, v, block_len, valid
+
+
+def _cos_rows(a, b, valid):
+    return _cos(a[:, valid], b[:, valid])
+
+
+@pytest.mark.parametrize("t", [64 * 40, 1000])   # 1000: ragged tail, block_len[-1] clamped
+@pytest.mark.parametrize("select", [{"tau": 1.4}, {"topk_ratio": 0.2}])
+def test_block_len_matches_eager(t, select):
+    """Zero-padded tiles: only the first block_len rows of each block are keys,
+    and the pooled means use the live counts."""
+    q, k, v, block_len, valid = _padded_case(t=t)
+    got = ck.sol_attn(q, k, v, block_len=block_len, **select)
+    ref = sol_attn_eager(q, k, v, block_len=block_len, **select)
+    assert torch.isfinite(got[:, valid].float()).all()
+    assert _cos_rows(got, ref, valid) > (0.995 if "topk_ratio" in select else 0.998)
+    # dead rows really are excluded from keys, values and means: perturbing
+    # them changes nothing on the live rows
+    q2, k2, v2 = (x.clone() for x in (q, k, v))
+    for x in (q2, k2, v2):
+        x[:, ~valid] = torch.randn_like(x[:, ~valid]) * 3
+    assert torch.equal(ck.sol_attn(q2, k2, v2, block_len=block_len, **select)[:, valid],
+                       got[:, valid])
+
+
+def _masked_dense(q, k, v, valid):
+    qq, kk, vv = (x.permute(0, 2, 1, 3).float() for x in (q, k, v))
+    mask = torch.zeros(1, 1, 1, q.shape[1], device="cuda")
+    mask[..., ~valid] = float("-inf")
+    out = torch.nn.functional.scaled_dot_product_attention(qq, kk, vv, attn_mask=mask, scale=HD ** -0.5)
+    return out.permute(0, 2, 1, 3)
+
+
+def test_no_tail_matches_eager():
+    """tail=False: softmax over the routed blocks only (the SLA / VSA fine stage).
+    Against the fp32 reference the bar is loose because without the tail every
+    int8-vs-fp32 block-selection flip shows in full; with every block routed
+    (sink_q over all query blocks) it must equal dense attention."""
+    q, k, v = _qkv(1, 4096, 4)
+    got = ck.sol_attn(q, k, v, topk_ratio=0.2, tail=False)
+    assert _cos(got, sol_attn_eager(q, k, v, topk_ratio=0.2, tail=False)) > 0.99
+    assert not torch.equal(got, ck.sol_attn(q, k, v, topk_ratio=0.2))
+    q, k, v, block_len, valid = _padded_case(t=64 * 30)
+    dense = ck.sol_attn(q, k, v, tau=1.4, tail=False, block_len=block_len, sink_q=[0, 30])
+    assert _cos_rows(dense, _masked_dense(q, k, v, valid), valid) > 0.9999
+
+
+def _coarse_reference(q, k, v, valid, block_len, gate, scale=HD ** -0.5):
+    """Independent per-block loop: masked dense attention plus gate * coarse term."""
+    from comfy_kitchen.backends.eager.sol_attn import _block_lengths
+    b, t, h, d = q.shape
+    n = (t + 63) // 64
+    lengths = _block_lengths(t, n, "cuda", block_len)
+    x = [xx.float() * valid.view(1, -1, 1, 1) for xx in (q, k, v)]
+    means = [torch.stack([xx[:, 64 * i:64 * i + 64].sum(1) / lengths[i] for i in range(n)], 1)
+             for xx in x]                                            # 3 x (B, N, H, D)
+    qm, km, vm = (m.permute(0, 2, 1, 3) for m in means)              # (B, H, N, D)
+    oc = torch.softmax(qm @ km.transpose(-1, -2) * scale, -1) @ vm   # (B, H, N, D)
+    out = _masked_dense(q, k, v, valid).float()
+    for i in range(n):
+        rows = slice(64 * i, min(64 * i + 64, t))
+        out[:, rows] += gate[:, rows].float() * oc[:, :, i].unsqueeze(1)
+    return out
+
+
+def test_coarse_gate_matches_eager():
+    """VSA's coarse branch: gate * softmax(q_mean k_mean^T) v_mean per block,
+    checked with every block routed so selection cannot blur it, against both
+    the shared eager path and an independent per-block reference."""
+    t = 64 * 30 + 17                     # ragged tail
+    q, k, v, block_len, valid = _padded_case(t=t)
+    n = (t + 63) // 64
+    gate = torch.randn(q.shape, device="cuda", dtype=torch.bfloat16) * 0.5
+    kw = {"tau": 1.4, "tail": False, "block_len": block_len, "sink_q": [0, n], "coarse_gate": gate}
+    got = ck.sol_attn(q, k, v, **kw)
+    assert _cos_rows(got, sol_attn_eager(q, k, v, **kw), valid) > 0.9999
+    assert _cos_rows(got, _coarse_reference(q, k, v, valid, block_len, gate), valid) > 0.9999
+    assert _cos_rows(got, _masked_dense(q, k, v, valid), valid) < 0.999   # the gate did something
+
+
+def test_coarse_gate_batch():
+    """The [B*H] ordering of the coarse means: each batch must equal itself run alone."""
+    q, k, v, block_len, valid = _padded_case(t=64 * 20, b=2, seed=8)
+    gate = torch.randn(q.shape, device="cuda", dtype=torch.bfloat16) * 0.5
+    kw = {"topk_ratio": 0.3, "tail": False, "block_len": block_len, "coarse_gate": gate}
+    got = ck.sol_attn(q, k, v, **kw)
+    for i in range(2):
+        alone = ck.sol_attn(q[i:i + 1].contiguous(), k[i:i + 1].contiguous(), v[i:i + 1].contiguous(),
+                            **{**kw, "coarse_gate": gate[i:i + 1].contiguous()})
+        assert _cos_rows(got[i:i + 1], alone, valid) > 0.9999
+
+
+def test_topk_budget_excludes_sinks():
+    """Sink blocks are always exact, so the top-k budget ranks and counts only
+    the other blocks; a sink range running past n counts only what exists."""
+    from comfy_kitchen.backends.cuda import _topk_from_pooled
+    from comfy_kitchen.backends.eager.sol_attn import _topk_count
+    g = torch.Generator(device="cuda").manual_seed(2)
+    n, bh, d = 32, 3, HD
+    c8 = torch.randint(-127, 128, (bh, n, d), device="cuda", generator=g).float()
+    csc = torch.rand(bh, n, device="cuda", generator=g) + 0.5
+    kc = torch.randn(bh, n, d, device="cuda", generator=g)
+    for sinks, n_eff in (((0, 16), 16), ((28, 40), 28), ((0, 0), 32)):
+        thr = _topk_from_pooled(c8, csc, kc, 0.2, 1.0, sinks)
+        # recompute the kernel-space scores independently
+        ksc = (kc.abs().amax(-1, True) / 127.0).clamp_min(1e-12)
+        s = torch.bmm(c8, torch.round(kc / ksc).clamp(-127, 127).transpose(1, 2))
+        s = s * csc.unsqueeze(-1) * ksc.squeeze(-1).unsqueeze(-2)
+        s[..., sinks[0]:sinks[1]] = float("-inf")
+        kk = _topk_count(n_eff, 0.2)
+        expect = s.topk(kk + 1, dim=-1).values[..., -1]
+        assert torch.equal(thr, expect), sinks
+        assert (s > thr.unsqueeze(-1)).sum(-1).eq(kk).all(), sinks   # exactly kk non-sink blocks kept
+
+
+def test_chunked_vsa_mode():
+    """The producer path with block_len + no tail + coarse gate must match the
+    direct path on the same post-rope q/k/v (means come from the workspace)."""
+    c = _chunked_case(seed=17, rot=96)
+    t, h = c["t"], c["h"]
+    g = torch.Generator(device="cuda").manual_seed(5)
+    block_len = torch.randint(32, 65, ((t + 63) // 64,), device="cuda", generator=g).to(torch.int32)
+    block_len[-1] = min(int(block_len[-1]), (t - 1) % 64 + 1)   # ragged last block
+    valid = (torch.arange(t, device="cuda") % 64) < block_len.repeat_interleave(64)[:t]
+    gate = torch.randn(1, t, h, HD, device="cuda", dtype=torch.bfloat16) * 0.5
+    kw = {"topk_ratio": 0.2, "tail": False, "block_len": block_len, "coarse_gate": gate,
+          "sink_blocks": [0, 2]}
+    ref = cuda_backend.sol_attn(c["q"], c["k"], c["v"], **kw)
+    _, km, vs = cuda_backend.sol_attn_chunked(c["chunks"], t, h, c["freqs"], c["norm"], **kw)
+    out, _, _ = cuda_backend.sol_attn_chunked(c["chunks"], t, h, c["freqs"], c["norm"],
+                                              kmean=km, vscale=vs, **kw)
+    assert torch.isfinite(out.float()).all()
+    assert _cos_rows(out, ref, valid) > 0.995
+
+
+def test_block_len_validation():
+    """block_len / coarse_gate are checked by the shared rule (every entry) and
+    again by the chunked entry, which has no q."""
+    q, k, v = _qkv(1, 512, 4)
+    bad_n = torch.ones(7, dtype=torch.int32, device="cuda")
+    bad_dtype = torch.ones(8, dtype=torch.int64, device="cuda")
+    bad_gate = torch.zeros(1, 256, 4, HD, device="cuda")
+    for bad in ({"block_len": bad_n}, {"block_len": bad_dtype}, {"coarse_gate": bad_gate}):
+        name = next(iter(bad))
+        with pytest.raises(ValueError, match=name):
+            cuda_backend.sol_attn(q, k, v, tau=1.4, **bad)
+        with pytest.raises(NoCapableBackendError, match=name):
+            ck.sol_attn(q, k, v, tau=1.4, **bad)
+    c = _chunked_case(seed=11, rot=64)
+    with pytest.raises(ValueError, match="block_len"):
+        cuda_backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], block_len=bad_dtype)

@@ -45,11 +45,13 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
     uint16_t* __restrict__ blk_idx, int32_t* __restrict__ blk_cnt,
     __nv_bfloat16* __restrict__ o_part, float* __restrict__ m_part,
     float* __restrict__ l_part,
+    const int32_t* __restrict__ blen, int tail,
     int T, int NTB, int NPAD, int NQ,
     int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2) {
 #if SOL_SM80
     __shared__ int8_t sKc[BN * LDK];
     __shared__ __nv_bfloat16 sVcT[HD * LDV];
+    __shared__ float sLen[BN];
 
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int g = lane >> 2, qd = lane & 3;
@@ -98,7 +100,6 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
         o_acc[nt][2] = 0.f; o_acc[nt][3] = 0.f;
     }
     float m_r[2] = {NEG, NEG}, l_r[2] = {0.f, 0.f};
-    const int tail_len = T - (NTB - 1) * BLOCK;
 
     for (int gs = 0; gs < NTB; gs += BN) {
         __syncthreads();
@@ -112,6 +113,7 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
             cp_async16_ca(sVcT + c * LDV + part * 8,
                           vcT + ((int64_t)bh * HD + c) * NPAD + gs + part * 8);
         }
+        if (tid < BN) sLen[tid] = (gs + tid < NTB) ? (float)block_len_of(blen, gs + tid, T) : 0.f;
         cp_commit();
         cp_wait<0>();
         __syncthreads();
@@ -171,9 +173,10 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
                     if (cand[1]) row[slot1] = (uint16_t)(gs + c0 + 1);
                 }
                 cnt[rr] += total;
-                // exact-routed and sink blocks leave the tail (this form costs 3 fewer regs)
-                pv[nt][rr * 2] = valid[0] && !(pre[0] || cand[0]) ? score[0] : NEG;
-                pv[nt][rr * 2 + 1] = valid[1] && !(pre[1] || cand[1]) ? score[1] : NEG;
+                // exact-routed and sink blocks leave the tail (this form costs 3 fewer regs);
+                // tail == 0 hands the exact kernel an empty state (softmax over routed only)
+                pv[nt][rr * 2] = tail && valid[0] && !(pre[0] || cand[0]) ? score[0] : NEG;
+                pv[nt][rr * 2 + 1] = tail && valid[1] && !(pre[1] || cand[1]) ? score[1] : NEG;
             }
         }
 
@@ -202,7 +205,7 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
                 const int b = gs + nt * 8 + qd * 2 + (e & 1);
                 const float p = pv[nt][e] <= NEG ? 0.f : exp2f(pv[nt][e] - m_new[rr]);
                 pv[nt][e] = p;
-                l_add[rr] += p * ((b == NTB - 1) ? (float)tail_len : (float)BLOCK);
+                l_add[rr] += p * sLen[b - gs];
             }
         }
         #pragma unroll
@@ -213,6 +216,7 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
         l_r[0] = l_r[0] * alpha0 + l_add[0];
         l_r[1] = l_r[1] * alpha1 + l_add[1];
 
+        if (!tail) continue;
         uint32_t pa[PKC][4];
         #pragma unroll
         for (int kk = 0; kk < PKC; ++kk) {
@@ -265,6 +269,7 @@ void launch_sol_route(
     void* blk_idx, void* blk_cnt, void* o_part, void* m_part, void* l_part,
     // NQ (query blocks) and NTB (key blocks) coincide today; kept separate so
     // a query prefix (LTX-2 guide attention) needs no kernel change
+    const void* blen, int tail,
     int B, int T, int H, int NTB, int NPAD, int NQ,
     int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2,
     cudaStream_t stream)
@@ -275,7 +280,7 @@ void launch_sol_route(
         (const float*)kcs, (const __nv_bfloat16*)vcT, (const float*)vsc,
         (const float*)threshold,
         (uint16_t*)blk_idx, (int32_t*)blk_cnt, (__nv_bfloat16*)o_part,
-        (float*)m_part, (float*)l_part,
+        (float*)m_part, (float*)l_part, (const int32_t*)blen, tail,
         T, NTB, NPAD, NQ, sink_s, sink_e, sink_qs, sink_qe,
         scale_log2);
 }

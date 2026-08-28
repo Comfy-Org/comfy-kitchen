@@ -59,7 +59,7 @@ __device__ __forceinline__ float thr_of(float var, float tau, float log2s) {
 __global__ void prep_reduce_kv(const __nv_bfloat16* __restrict__ k,
                                const __nv_bfloat16* __restrict__ v,
                                float* __restrict__ kc, __nv_bfloat16* __restrict__ vcT,
-                               float* __restrict__ vamax,
+                               float* __restrict__ vamax, const int32_t* __restrict__ blen,
                                int T, int H, int NTB, int NPAD,
                                int64_t sb, int64_t st, int64_t sh,
                                int64_t vb, int64_t vt, int64_t vh) {
@@ -72,7 +72,7 @@ __global__ void prep_reduce_kv(const __nv_bfloat16* __restrict__ k,
         return;
     }
 
-    const int t0 = n * BLK, len = min(BLK, T - t0);
+    const int t0 = n * BLK, len = block_len_of(blen, n, T);
     float sk = 0.f, sv = 0.f, av = 0.f;
     for (int i = 0; i < len; ++i) {
         const int64_t voff = batch * vb + (int64_t)(t0 + i) * vt + head * vh + d;
@@ -126,21 +126,24 @@ __global__ void prep_q(const __nv_bfloat16* __restrict__ q, const float* __restr
                        int8_t* __restrict__ qiP, float* __restrict__ qs,
                        float* __restrict__ thr,
                        int8_t* __restrict__ cen8, float* __restrict__ cens,
-                       int T, int H, int NQ, float tau, float log2s,
+                       float* __restrict__ qmean,   // [B*H, NPAD, HD] f32 block means
+                       const int32_t* __restrict__ blen,
+                       int T, int H, int NQ, int NPAD, float tau, float log2s,
                        int64_t sb, int64_t st, int64_t sh) {
     __shared__ __nv_bfloat16 sQ[BLK * LD_TILE];
     __shared__ __align__(16) float sred[HD];
     const int qb = blockIdx.x, bh = blockIdx.y;
     const int batch = bh / H, head = bh % H;
-    const int t0 = qb * BLK, len = min(BLK, T - t0);
+    const int t0 = qb * BLK, len = block_len_of(blen, qb, T), nrows = min(BLK, T - t0);
 
     stage_tile64(sQ, q + batch * sb + (int64_t)t0 * st + head * sh, st, len);
     __syncthreads();
     const size_t tok0 = (size_t)batch * T + t0;
-    quant_q_rows(sQ, len, qiP + (tok0 * H + head) * HD, qs + tok0 * H + head, H);
+    quant_q_rows(sQ, len, nrows, qiP + (tok0 * H + head) * HD, qs + tok0 * H + head, H);
     __syncthreads();
     const size_t qrow = (size_t)bh * NQ + qb;
     const float c = centroid_quant(sQ, len, sred, cen8 + qrow * HD, cens + qrow);
+    qmean[((size_t)bh * NPAD + qb) * HD + threadIdx.x] = c;
     __syncthreads();                       // sred held the centroid bytes
     const float var = block_sum128(c * c * kcvar[(size_t)bh * HD + threadIdx.x], sred);
     if (threadIdx.x == 0) thr[qrow] = thr_of(var, tau, log2s);
@@ -150,12 +153,13 @@ __global__ void prep_q(const __nv_bfloat16* __restrict__ q, const float* __restr
 __global__ void prep_k(const __nv_bfloat16* __restrict__ k, const float* __restrict__ kmean,
                        int8_t* __restrict__ kiP, float2* __restrict__ ksb,
                        const float* __restrict__ kbias,   // [B, T] log2 units, or null
+                       const int32_t* __restrict__ blen,
                        int T, int Tp, int H,
                        int64_t sb, int64_t st, int64_t sh) {
     __shared__ __nv_bfloat16 sK[BLK * LD_TILE];
     const int n = blockIdx.x, bh = blockIdx.y;
     const int batch = bh / H, head = bh % H;
-    const int t0 = n * BLK, len = min(BLK, T - t0);
+    const int t0 = n * BLK, len = block_len_of(blen, n, T);
 
     stage_tile64(sK, k + batch * sb + (int64_t)t0 * st + head * sh, st, len);
     __syncthreads();
@@ -168,17 +172,20 @@ __global__ void prep_k(const __nv_bfloat16* __restrict__ k, const float* __restr
 // ---- producer-path finish: pooled sums -> means, next-step kmean ----
 __global__ void prep_sums_to_means(float* __restrict__ kc,
                                    float* __restrict__ kmean_next,
+                                   const int32_t* __restrict__ blen,
                                    int T, int NTB, int NPAD) {
     const int bh = blockIdx.x, d = threadIdx.x;
     float total = 0.f;
+    int tokens = 0;
     for (int n = 0; n < NTB; ++n) {
         const size_t o = ((size_t)bh * NPAD + n) * HD + d;
         const float sum = kc[o];
         total += sum;
-        const int len = min(BLK, T - n * BLK);
+        const int len = block_len_of(blen, n, T);
+        tokens += len;
         kc[o] = sum / (float)len;
     }
-    kmean_next[(size_t)bh * HD + d] = total / (float)T;
+    kmean_next[(size_t)bh * HD + d] = total / (float)tokens;
 }
 
 // ---- producer-path threshold from the quantized centroid ----
@@ -201,12 +208,13 @@ __global__ void prep_thr_from_cen(const int8_t* __restrict__ cen8,
 // threshold. The caller places the V scale it quantized with in the vsc slot.
 void launch_sol_finish(
     void* scratch, void* kciP, void* kcs, void* threshold,
-    const void* cen8, const void* cens, void* kmean_next,
+    const void* cen8, const void* cens, void* kmean_next, const void* blen,
     int B, int T, int H, int NTB, int NPAD, int NQ,
     float tau, float scale_log2, cudaStream_t stream)
 {
     const Scratch s = carve_scratch(scratch, B, H, NPAD);
-    prep_sums_to_means<<<B * H, HD, 0, stream>>>(s.kc, (float*)kmean_next, T, NTB, NPAD);
+    prep_sums_to_means<<<B * H, HD, 0, stream>>>(
+        s.kc, (float*)kmean_next, (const int32_t*)blen, T, NTB, NPAD);
     prep_pooled_stats<<<B * H, HD, 0, stream>>>(
         s.kc, s.kmean, nullptr, nullptr, s.kcvar, NTB, NPAD);
     prep_pooled_quant<<<dim3(NPAD, B * H), HD, 0, stream>>>(
@@ -219,9 +227,10 @@ void launch_sol_finish(
 void launch_sol_preprocess(
     const void* q, const void* k, const void* v,
     void* qiP, void* qs, void* kiP, void* ksb, void* kciP, void* kcs,
-    void* vcT, void* threshold, void* cen8, void* cens, void* vsc,
+    void* vcT, void* threshold, void* cen8, void* cens, void* vsc, void* qmean,
     void* scratch,           // sol_preprocess_scratch_bytes
     const void* key_bias,    // [B, T] f32 in log2 units, or nullptr
+    const void* blen,        // [NTB] int32 valid tokens per block, or nullptr
     int B, int T, int Tp, int H, int NTB, int NPAD, int NQ,
     int64_t qs_b, int64_t qs_t, int64_t qs_h,
     int64_t ks_b, int64_t ks_t, int64_t ks_h,
@@ -234,18 +243,18 @@ void launch_sol_preprocess(
     cudaMemsetAsync(vsc, 0, (size_t)B * H * HD * sizeof(float), stream);
     prep_reduce_kv<<<dim3(NPAD, B * H), HD, 0, stream>>>(
         (const __nv_bfloat16*)k, (const __nv_bfloat16*)v, s.kc, (__nv_bfloat16*)vcT,
-        (float*)vsc, T, H, NTB, NPAD, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h);
+        (float*)vsc, (const int32_t*)blen, T, H, NTB, NPAD, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h);
     prep_pooled_stats<<<B * H, HD, 0, stream>>>(
         s.kc, s.kmean, (const float*)vsc, (float*)vsc, s.kcvar, NTB, NPAD);
     prep_pooled_quant<<<dim3(NPAD, B * H), HD, 0, stream>>>(
         s.kc, s.kmean, (int8_t*)kciP, (float*)kcs, NTB, NPAD);
     prep_q<<<dim3(NQ, B * H), HD, 0, stream>>>(
         (const __nv_bfloat16*)q, s.kcvar, (int8_t*)qiP, (float*)qs, (float*)threshold,
-        (int8_t*)cen8, (float*)cens,
-        T, H, NQ, tau, scale_log2, qs_b, qs_t, qs_h);
+        (int8_t*)cen8, (float*)cens, (float*)qmean, (const int32_t*)blen,
+        T, H, NQ, NPAD, tau, scale_log2, qs_b, qs_t, qs_h);
     prep_k<<<dim3(NTB, B * H), HD, 0, stream>>>(
         (const __nv_bfloat16*)k, s.kmean, (int8_t*)kiP, (float2*)ksb,
-        (const float*)key_bias, T, Tp, H, ks_b, ks_t, ks_h);
+        (const float*)key_bias, (const int32_t*)blen, T, Tp, H, ks_b, ks_t, ks_h);
 }
 
 size_t sol_preprocess_scratch_bytes(int B, int H, int NPAD) {

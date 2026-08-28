@@ -35,22 +35,24 @@
 // link instead of corrupting at runtime.
 void launch_sol_preprocess(const void*, const void*, const void*, void*, void*, void*,
                            void*, void*, void*, void*, void*, void*, void*, void*, void*,
-                           const void*,
+                           void*, const void*, const void*,
                            int, int, int, int, int, int, int,
                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                            int64_t, int64_t, int64_t, float, float, cudaStream_t);
 size_t sol_preprocess_scratch_bytes(int, int, int);
 void launch_sol_producer(const void*, const void*, const void*, const void*,
                          const void*, const void*, void*, void*, void*, void*,
-                         void*, void*, void*, void*, void*, void*,
-                         float, int, int, int, int, int, int, int, int,
+                         void*, void*, void*, void*, void*, void*, void*,
+                         const void*, float, int, int, int, int, int, int, int, int,
                          cudaStream_t);
 void launch_sol_finish(void*, void*, void*, void*, const void*, const void*, void*,
-                       int, int, int, int, int, int, float, float, cudaStream_t);
+                       const void*, int, int, int, int, int, int, float, float,
+                       cudaStream_t);
 void launch_sol_vtranspose(const void*, const void*, void*, int, int, int, int,
                            int64_t, int64_t, int64_t, cudaStream_t);
 void launch_sol_route(const void*, const void*, const void*, const void*, const void*,
                       const void*, const void*, void*, void*, void*, void*, void*,
+                      const void*, int,
                       int, int, int, int, int, int, int, int, int, int,
                       float, cudaStream_t);
 void launch_sol_exact(const void*, const void*, const void*, const void*, const void*,
@@ -69,7 +71,7 @@ inline size_t align16(size_t n) { return (n + 15u) & ~(size_t)15u; }
 struct Plan {
     int Tp, NTB, NPAD, NQ;
     size_t qiP, qs, kiP, ksb, vTi, vsc, kciP, kcs, vcT, thr, cen8, cens;
-    size_t idx, cnt, oPart, mPart, lPart, statsV, scratch, total;
+    size_t idx, cnt, oPart, mPart, lPart, statsV, qmean, scratch, total;
 
     Plan(int B, int T, int H) {
         NTB = (T + BLK - 1) / BLK;
@@ -98,6 +100,7 @@ struct Plan {
         mPart   = take(bh * NQ * sizeof(float));
         lPart   = take(bh * NQ * sizeof(float));
         statsV  = take(bh * HD * sizeof(float));   // producer vamax accumulator
+        qmean   = take(bh * NPAD * HD * sizeof(float));   // f32 query-block means (coarse branch)
         scratch = take(sol_preprocess_scratch_bytes(B, H, NPAD));
         total = o;
     }
@@ -115,6 +118,7 @@ void validate_shape(int batch, int seq_len, int num_heads) {
 // stage launched before it; without it a rejected launch leaves route's
 // handover values in `out`.
 void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* out,
+                     const void* blen, int tail,
                      int batch, int seq_len, int num_heads,
                      int sink_start, int sink_end, int sink_q_start, int sink_q_end,
                      float scale_log2, cudaStream_t stream)
@@ -123,7 +127,7 @@ void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* ou
     const void* thr = ext_threshold ? ext_threshold : (const void*)(w + p.thr);
     launch_sol_route(w + p.cen8, w + p.cens, w + p.kciP, w + p.kcs, w + p.vcT, w + p.vsc,
                      thr, w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart,
-                     batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ,
+                     blen, tail, batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ,
                      sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
     launch_sol_exact(w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb, w + p.vTi, w + p.vsc,
                      w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart, out,
@@ -141,7 +145,7 @@ void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* ou
 extern "C" const char* const sol_attn_plan_names[] = {
     "Tp", "NTB", "NPAD", "NQ",
     "qiP", "qs", "kiP", "ksb", "vTi", "vsc", "kciP", "kcs", "vcT", "thr", "cen8", "cens",
-    "idx", "cnt", "oPart", "mPart", "lPart", "statsV", "scratch", "total", nullptr,
+    "idx", "cnt", "oPart", "mPart", "lPart", "statsV", "qmean", "scratch", "total", nullptr,
 };
 // Writes the values into out[0..count) and returns count; writes nothing if
 // cap < count, so a caller with a fixed buffer can detect a grown Plan.
@@ -152,8 +156,8 @@ extern "C" int sol_attn_plan(int batch, int seq_len, int num_heads, int64_t* out
         (int64_t)p.qiP, (int64_t)p.qs, (int64_t)p.kiP, (int64_t)p.ksb, (int64_t)p.vTi,
         (int64_t)p.vsc, (int64_t)p.kciP, (int64_t)p.kcs, (int64_t)p.vcT, (int64_t)p.thr,
         (int64_t)p.cen8, (int64_t)p.cens, (int64_t)p.idx, (int64_t)p.cnt, (int64_t)p.oPart,
-        (int64_t)p.mPart, (int64_t)p.lPart, (int64_t)p.statsV, (int64_t)p.scratch,
-        (int64_t)p.total,
+        (int64_t)p.mPart, (int64_t)p.lPart, (int64_t)p.statsV, (int64_t)p.qmean,
+        (int64_t)p.scratch, (int64_t)p.total,
     };
     const int count = (int)(sizeof(v) / sizeof(v[0]));
     if (cap >= count)
@@ -176,7 +180,7 @@ extern "C" void sol_producer_begin(void* workspace, int batch, int seq_len,
 extern "C" void sol_producer_chunk(
     void* workspace, const void* qkv, const void* fab,
     const void* qw, const void* kw, const void* kmean, const void* vscale,
-    float rope_eps, int rot_dim, int t0, int M,
+    const void* blen, float rope_eps, int rot_dim, int t0, int M,
     int batch, int seq_len, int num_heads, cudaStream_t stream)
 {
     const Plan p(batch, seq_len, num_heads);
@@ -184,8 +188,8 @@ extern "C" void sol_producer_chunk(
     launch_sol_producer(qkv, fab, qw, kw, kmean, vscale,
                         w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb,
                         w + p.vTi, w + p.vcT, w + p.scratch,
-                        w + p.cen8, w + p.cens, w + p.statsV,
-                        rope_eps, rot_dim, t0, M, seq_len, p.Tp, num_heads,
+                        w + p.cen8, w + p.cens, w + p.qmean, w + p.statsV,
+                        blen, rope_eps, rot_dim, t0, M, seq_len, p.Tp, num_heads,
                         p.NPAD, p.NQ, stream);
 }
 
@@ -193,6 +197,7 @@ extern "C" void sol_producer_chunk(
 // kmean_next / vamax_out ([B*H, HD] f32) receive this step's statistics.
 extern "C" void launch_sol_attn_core(
     void* workspace, void* out, const void* vscale, void* kmean_next, void* vamax_out,
+    const void* blen, int tail,
     int batch, int seq_len, int num_heads,
     float tau, float scale, const void* ext_threshold,
     int sink_start, int sink_end, int sink_q_start, int sink_q_end,
@@ -205,10 +210,10 @@ extern "C" void launch_sol_attn_core(
     const size_t stats_bytes = (size_t)batch * num_heads * HD * sizeof(float);
     cudaMemcpyAsync(w + p.vsc, vscale, stats_bytes, cudaMemcpyDeviceToDevice, stream);
     launch_sol_finish(w + p.scratch, w + p.kciP, w + p.kcs, w + p.thr,
-                      w + p.cen8, w + p.cens, kmean_next,
+                      w + p.cen8, w + p.cens, kmean_next, blen,
                       batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ,
                       tau, scale_log2, stream);
-    run_route_exact(p, w, ext_threshold, out, batch, seq_len, num_heads,
+    run_route_exact(p, w, ext_threshold, out, blen, tail, batch, seq_len, num_heads,
                     sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
     cudaMemcpyAsync(vamax_out, w + p.statsV, stats_bytes, cudaMemcpyDeviceToDevice, stream);
 }
@@ -217,7 +222,7 @@ extern "C" void launch_sol_attn(
     const void* q, const void* k, const void* v, void* out, void* workspace,
     int batch, int seq_len, int num_heads, int head_dim,
     float tau, float scale, const void* key_bias,
-    const void* ext_threshold,
+    const void* ext_threshold, const void* blen, int tail,
     int sink_start, int sink_end, int sink_q_start, int sink_q_end,
     int64_t qs_b, int64_t qs_t, int64_t qs_h,
     int64_t ks_b, int64_t ks_t, int64_t ks_h,
@@ -233,13 +238,13 @@ extern "C" void launch_sol_attn(
     const float scale_log2 = scale * 1.4426950408889634f;
     launch_sol_preprocess(q, k, v, w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb,
                           w + p.kciP, w + p.kcs, w + p.vcT, w + p.thr,
-                          w + p.cen8, w + p.cens, w + p.vsc, w + p.scratch,
-                          key_bias,
+                          w + p.cen8, w + p.cens, w + p.vsc, w + p.qmean, w + p.scratch,
+                          key_bias, blen,
                           batch, seq_len, p.Tp, num_heads, p.NTB, p.NPAD, p.NQ,
                           qs_b, qs_t, qs_h, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h,
                           tau, scale_log2, stream);
     launch_sol_vtranspose(v, w + p.vsc, w + p.vTi, batch, seq_len, p.Tp, num_heads,
                           vs_b, vs_t, vs_h, stream);
-    run_route_exact(p, w, ext_threshold, out, batch, seq_len, num_heads,
+    run_route_exact(p, w, ext_threshold, out, blen, tail, batch, seq_len, num_heads,
                     sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
 }
