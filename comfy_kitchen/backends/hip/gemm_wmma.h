@@ -18,6 +18,8 @@
 // registers before the current tile's math.
 #pragma once
 
+#include <atomic>
+
 #include "mma.h"
 
 namespace comfy::hip_backend {
@@ -215,6 +217,82 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
                 crow[col] = static_cast<OutT>(epi(r, col, Mma::get(acc[i][j], e)));
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tile selection, shared by the fp8 and int8 launchers.
+// ---------------------------------------------------------------------------
+
+// hipDeviceAttributeMultiprocessorCount reports WGPs on RDNA, not CUs (32 on a
+// 64-CU gfx1201), and a workgroup schedules onto a WGP, so WGPs are the unit the
+// grid-coverage test needs. Cached per ordinal to keep the query off the launch
+// path; the fallback only mis-sizes that test, never a result.
+inline int device_wgp_count() {
+    constexpr int kMaxDevices = 16;
+    // A GEMM can be launched from several host threads at once. Racing threads
+    // write the same value and nothing is published through the cache, so relaxed.
+    static std::atomic<int> cache[kMaxDevices] = {};
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDevices) return 16;
+    int n = cache[dev].load(std::memory_order_relaxed);
+    if (n == 0) {
+        if (hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess ||
+            n <= 0) {
+            n = 16;
+        }
+        cache[dev].store(n, std::memory_order_relaxed);
+    }
+    return n;
+}
+
+// Pick and launch a tile for C[M, N] = A[M, K] @ B[N, K]^T, selecting on grid
+// coverage, K depth and warp grid. 128x128 has the best arithmetic intensity but
+// wastes the device when it yields fewer blocks than there are WGPs; BKB=128
+// halves the LDS round trips per K element once K amortizes the coarser tail.
+// The thresholds are tuned on RDNA4 and govern tile choice only, never
+// correctness. kbytes is bytes of K, equal to K only for the 8-bit policies, so
+// an int4 caller passing K/2 fires at twice the K these read as.
+template <typename Mma, typename Epi, typename OutT>
+void launch_gemm_wmma(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int kbytes,
+                      int ldc, Epi epi, hipStream_t stream) {
+    const int blocks_128 = ((M + 127) / 128) * ((N + 127) / 128);
+
+    const int wgps = device_wgp_count();
+
+    // Zero padding the block count cannot see: at M <= 64 the 128-row tile is at
+    // least half empty, and the finer 64x64 grid recovers the wasted MMAs.
+    const bool skinny = (M <= 64 || N <= 64);
+
+    if (!skinny && blocks_128 >= wgps) {
+        if (kbytes >= 4096) {
+            constexpr int BM = 128, BN = 128, BKB = 128;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            // With few blocks per WGP there is nothing to interleave across, so
+            // the 16-wave grid hides latency within a block instead.
+            if (blocks_128 <= 4 * wgps) {
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2>
+                    <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+            } else {
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4>
+                    <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+            }
+        } else {
+            constexpr int BM = 128, BN = 128, BKB = 64;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4>
+                <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        }
+    } else if (kbytes >= 2048) {
+        constexpr int BM = 64, BN = 64, BKB = 128;
+        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2>
+            <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+    } else {
+        constexpr int BM = 64, BN = 64, BKB = 64;
+        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2>
+            <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
     }
 }
 

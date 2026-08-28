@@ -17,6 +17,22 @@ namespace comfy::hip_backend {
 // dtype codes match comfy_kitchen.backends.eager.quantization.DTYPE_TO_CODE
 constexpr int kFp8E4M3Code = 5;
 
+// Enough elements per thread for a lane to move a whole 16-byte fp8 chunk, so a
+// wave writes 512 contiguous bytes rather than 32.
+constexpr int kVecElems = 16;
+
+// The alignment is what lets the accesses widen to dwordx4.
+template <typename T>
+struct alignas(16) VecChunk {
+    T v[kVecElems];
+};
+
+// A contiguous tensor can still be a mid-buffer view, whose base carries the
+// offset and is not 16-byte aligned.
+__forceinline__ __host__ __device__ bool vec_aligned(const void* p) {
+    return (reinterpret_cast<uintptr_t>(p) & 15u) == 0;
+}
+
 __forceinline__ __device__ float fp8_clamp(float v, float lo, float hi) {
     return fminf(hi, fmaxf(lo, v));
 }
