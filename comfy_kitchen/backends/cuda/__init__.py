@@ -2505,7 +2505,8 @@ def sol_attn(
         kb = _normalize_key_bias(key_bias, batch, t, q.device)
         kb = (kb * _LOG2E).expand(batch, t).contiguous()
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    workspace = torch.empty(_C.sol_attn_plan(batch, t, h)["total"], dtype=torch.uint8, device=q.device)
+    p = _C.sol_attn_plan(batch, t, h)
+    workspace = torch.empty(p["total"], dtype=torch.uint8, device=q.device)
     _C.sol_attn(
         _wrap_for_dlpack(q),
         _wrap_for_dlpack(k),
@@ -2522,9 +2523,8 @@ def sol_attn(
         tail=bool(tail),
     )
     if coarse_gate is not None:
-        oc = coarse_output(_block_means(q, mean_lengths, valid), _block_means(k, mean_lengths, valid),
-                           _block_means(v, mean_lengths, valid), scale)
-        add_coarse_(out, oc, coarse_gate)
+        add_coarse_(out, coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale),
+                    coarse_gate)
     return out
 
 
@@ -2611,7 +2611,7 @@ def sol_attn_chunked(
     vscale = vscale.to(device=dev, dtype=torch.float32).contiguous()
     produce(kmean, vscale)
     sb, sq = _sink_pair(sink_blocks), _sink_pair(sink_q)
-    threshold = (_topk_threshold_from_workspace(ws, p, t, h, topk_ratio, scale, lengths, sb)
+    threshold = (_topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sb)
                  if topk_ratio else None)
     out = torch.empty(1, t, h, d, dtype=torch.bfloat16, device=dev)
     kmean_next = torch.empty(h, d, device=dev, dtype=torch.float32)
@@ -2623,14 +2623,7 @@ def sol_attn_chunked(
         threshold=None if threshold is None else _wrap_for_dlpack(threshold),
         block_len=None if block_len is None else _wrap_for_dlpack(block_len), tail=bool(tail))
     if coarse_gate is not None:
-        # block means the producer/finish left in the workspace: q (qmean slot),
-        # K (scratch, sums -> means after finish), V (vcT holds sums)
-        ntb, npad = p["NTB"], p["NPAD"]
-        qm = ws[p["qmean"]:p["qmean"] + h * npad * d * 4].view(torch.float32).view(h, npad, d)[:, :ntb]
-        km = _ws_ksums(ws, p, h)                 # means now: finish converted the sums in place
-        vm = ws[p["vcT"]:p["vcT"] + h * d * npad * 2].view(torch.bfloat16).view(h, d, npad)[:, :, :ntb]
-        vm = vm.transpose(1, 2).float() / lengths.view(1, -1, 1)
-        add_coarse_(out, coarse_output(qm, km, vm, scale), coarse_gate)
+        add_coarse_(out, coarse_output(*_ws_block_means(ws, p, h, lengths), scale), coarse_gate)
     return out, kmean_next, vscale_of(vamax)
 
 
@@ -2641,15 +2634,25 @@ def _perm_d_index(device):
     return (kc * 32 + 8 * (r2 >> 2) + 4 * h + (r2 & 3)).to(device)
 
 
-def _ws_ksums(ws, p, h):
-    """The producer's post-rope block K sums, [H, NTB, 128] f32 view into
-    scratch (block MEANS once sol_attn_core has run)."""
+def _ws_ksums(ws, p, bh):
+    """The producer's post-rope block K sums, [BH, NTB, 128] f32 view into
+    scratch (block MEANS on the direct path, and once sol_attn_core has run)."""
     d = _SOL_HD
-    return ws[p["scratch"]:p["scratch"] + h * p["NPAD"] * d * 4] \
-        .view(torch.float32).view(h, p["NPAD"], d)[:, :p["NTB"]]
+    return ws[p["scratch"]:p["scratch"] + bh * p["NPAD"] * d * 4] \
+        .view(torch.float32).view(bh, p["NPAD"], d)[:, :p["NTB"]]
 
 
-def _topk_threshold_from_workspace(ws, p, t, h, topk_ratio, scale, lengths, sinks):
+def _ws_block_means(ws, p, bh, lengths):
+    """(qm, km, vm) ``[BH, NTB, 128]`` fp32 block means over live rows, read
+    from what the kernels already left in the workspace: the qmean slot, K
+    means in scratch, V sums in vcT (bf16)."""
+    ntb, npad, d = p["NTB"], p["NPAD"], _SOL_HD
+    qm = ws[p["qmean"]:p["qmean"] + bh * npad * d * 4].view(torch.float32).view(bh, npad, d)[:, :ntb]
+    vm = ws[p["vcT"]:p["vcT"] + bh * d * npad * 2].view(torch.bfloat16).view(bh, d, npad)[:, :, :ntb]
+    return qm, _ws_ksums(ws, p, bh), vm.transpose(1, 2).float() / lengths.view(1, -1, 1)
+
+
+def _topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sinks):
     """Producer-path top-k threshold from the workspace's own pooled outputs."""
     ntb, d = p["NTB"], _SOL_HD
     cen8 = ws[p["cen8"]:p["cen8"] + h * ntb * d].view(torch.int8).view(h, ntb, d).float()
