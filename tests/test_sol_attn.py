@@ -346,6 +346,32 @@ def test_chunked_producer_matches_separate_rope(rot):
     assert _cos(out3, ref) > 0.995
 
 
+def test_bindings_check_buffer_sizes():
+    """The _C entries take bare pointers sized from integers; each must reject
+    an undersized buffer itself, not rely on the Python wrappers."""
+    from comfy_kitchen.backends.cuda import _C
+    from comfy_kitchen.backends.cuda import _wrap_for_dlpack as w
+    t, h = 256, 2
+    q, k, v = _qkv(1, t, h)
+    ws = torch.empty(_C.sol_attn_plan(1, t, h)["total"], dtype=torch.uint8, device="cuda")
+    stream = torch.cuda.current_stream().cuda_stream
+    args = (1, t, h, HD, 1.0, HD ** -0.5, 0, 0, 0, 0, stream)
+    with pytest.raises(RuntimeError, match="out"):
+        _C.sol_attn(w(q), w(k), w(v), w(q[:, :128].contiguous()), w(ws), *args)
+    with pytest.raises(RuntimeError, match="workspace"):
+        _C.sol_attn(w(q), w(k), w(v), w(torch.empty_like(q)), w(ws[:-1]), *args)
+    with pytest.raises(RuntimeError, match="\\(B, T, H, D\\)"):
+        _C.sol_attn(w(q.view(t, h, HD)), w(k), w(v), w(torch.empty_like(q)), w(ws), *args)
+    stats = torch.empty(h, HD, device="cuda")
+    with pytest.raises(RuntimeError, match="out"):
+        _C.sol_attn_core(w(ws), w(q[:, :128].contiguous()), w(stats), w(stats), w(stats),
+                         1, t, h, 1.0, HD ** -0.5, 0, 0, 0, 0, stream)
+    with pytest.raises(RuntimeError, match="qkv"):
+        _C.sol_producer_chunk(w(ws), w(torch.empty(64, 3 * h * HD - 8, device="cuda", dtype=torch.bfloat16)),
+                              w(torch.empty(t, 64, 2, device="cuda")), w(stats[0]), w(stats[0]),
+                              w(stats), w(stats), 1e-6, 64, 0, 64, 1, t, h, stream)
+
+
 def test_chunked_producer_validates():
     """Coverage, width and device are checked before any launch."""
     c = _chunked_case(seed=11, rot=64)

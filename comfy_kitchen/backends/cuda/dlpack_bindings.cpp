@@ -1491,6 +1491,26 @@ static void check_block_len(const nb::ndarray<nb::device::cuda>& b, int64_t seq_
         throw std::runtime_error(std::string(who) + ": block_len must be a contiguous 1-D int32 array of ceil(T/64) elements");
 }
 
+static void need_elems(const nb::ndarray<nb::device::cuda>& a, int64_t n, const char* who, const char* what) {
+    if ((int64_t)a.size() != n)
+        throw std::runtime_error(std::string(who) + ": " + what + " must have " + std::to_string(n)
+                                 + " elements, got " + std::to_string(a.size()));
+}
+static void need_workspace(const nb::ndarray<nb::device::cuda>& ws, int64_t batch, int64_t seq_len,
+                           int64_t num_heads, const char* who) {
+    int64_t v[32];
+    const int n = sol_attn_plan((int)batch, (int)seq_len, (int)num_heads, v, 32);
+    if (n > 32 || (int64_t)ws.size() < v[n - 1])   // last slot is "total"
+        throw std::runtime_error(std::string(who) + ": workspace too small for this shape");
+}
+static void need_bthd(const nb::ndarray<nb::device::cuda>& a, int64_t b, int64_t t, int64_t h, int64_t d,
+                      const char* who, const char* what) {
+    const bool bf16 = a.dtype().code == (uint8_t)nb::dlpack::dtype_code::Bfloat && a.dtype().bits == 16;
+    if (a.ndim() != 4 || !bf16 ||
+        a.shape(0) != (size_t)b || a.shape(1) != (size_t)t || a.shape(2) != (size_t)h || a.shape(3) != (size_t)d)
+        throw std::runtime_error(std::string(who) + ": " + what + " must be a (B, T, H, D) bfloat16 array");
+}
+
 // Workspace dims and slot byte offsets, from the C++ Plan (the one definition).
 nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads) {
     int64_t v[32];
@@ -1521,6 +1541,12 @@ void sol_attn(
     if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
         throw std::runtime_error("sol_attn: threshold must have B*H*ceil(T/64) elements");
     if (block_len) check_block_len(*block_len, seq_len, "sol_attn");
+    need_bthd(q, batch, seq_len, num_heads, head_dim, "sol_attn", "q");
+    need_bthd(k, batch, seq_len, num_heads, head_dim, "sol_attn", "k");
+    need_bthd(v, batch, seq_len, num_heads, head_dim, "sol_attn", "v");
+    need_bthd(out, batch, seq_len, num_heads, head_dim, "sol_attn", "out");
+    need_workspace(workspace, batch, seq_len, num_heads, "sol_attn");
+    if (key_bias) need_elems(*key_bias, batch * seq_len, "sol_attn", "key_bias");
     // Explicit strides: only the last dim must be contiguous (BHND views go in as-is).
     launch_sol_attn(
         q.data(), k.data(), v.data(), out.data(), workspace.data(),
@@ -1552,6 +1578,13 @@ void sol_producer_chunk_py(
     uintptr_t stream_ptr,
     std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt) {
     if (block_len) check_block_len(*block_len, seq_len, "sol_producer_chunk");
+    need_workspace(workspace, batch, seq_len, num_heads, "sol_producer_chunk");
+    need_elems(qkv, m * 3 * num_heads * 128, "sol_producer_chunk", "qkv");
+    need_elems(fab, seq_len * rot_dim * 2, "sol_producer_chunk", "fab");
+    need_elems(qw, 128, "sol_producer_chunk", "qw");
+    need_elems(kw, 128, "sol_producer_chunk", "kw");
+    need_elems(kmean, batch * num_heads * 128, "sol_producer_chunk", "kmean");
+    need_elems(vscale, batch * num_heads * 128, "sol_producer_chunk", "vscale");
     sol_producer_chunk(workspace.data(), qkv.data(), fab.data(), qw.data(),
                        kw.data(), kmean.data(), vscale.data(),
                        block_len ? block_len->data() : nullptr,
@@ -1578,6 +1611,8 @@ void sol_attn_core_py(
     if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
         throw std::runtime_error("sol_attn_core: threshold must have B*H*ceil(T/64) elements");
     if (block_len) check_block_len(*block_len, seq_len, "sol_attn_core");
+    need_workspace(workspace, batch, seq_len, num_heads, "sol_attn_core");
+    need_elems(out, batch * seq_len * num_heads * 128, "sol_attn_core", "out");
     launch_sol_attn_core(
         workspace.data(), out.data(), vscale.data(), kmean_next.data(), vamax_out.data(),
         block_len ? block_len->data() : nullptr, tail ? 1 : 0,
