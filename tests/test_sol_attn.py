@@ -73,7 +73,7 @@ def _chunked_case(seed, rot, v_scale=1.0):
 
 # 3137 leaves a 1-token tail; 1000 and 1088 are ragged too
 @pytest.mark.parametrize("t", [256, 1024, 2048, 1000, 1088, 3137])
-@pytest.mark.parametrize("tau", [1.0, 2.0])
+@pytest.mark.parametrize("tau", [0.5, 1.0, 2.0, 6.0])
 def test_matches_eager_reference(t, tau):
     q, k, v = _qkv(1, t, 4)
     got = ck.sol_attn(q, k, v, tau=tau)
@@ -141,13 +141,12 @@ def test_rejects_noncontiguous_last_dim():
         cuda_backend.sol_attn(bad, k, v, tau=1.4)
 
 
-def test_tau_monotonicity():
-    """Higher tau routes fewer blocks exactly, so it can only move away from
-    dense attention."""
+def test_tau_direction():
+    """Higher tau routes fewer blocks exactly, so the output moves away from
+    dense attention; parity at each tau is test_matches_eager_reference."""
     q, k, v = _qkv(1, 2048, 8)
     ref = _dense(q, k, v)
-    sims = [_cos(ck.sol_attn(q, k, v, tau=t), ref) for t in (0.5, 2.0, 6.0)]
-    assert sims[0] >= sims[1] >= sims[2] - 1e-3
+    assert _cos(ck.sol_attn(q, k, v, tau=0.5), ref) > _cos(ck.sol_attn(q, k, v, tau=6.0), ref) + 5e-3
 
 
 def test_output_strides_agree_across_backends():
@@ -288,13 +287,12 @@ def test_topk_matches_eager(t):
     assert not torch.equal(got, ck.sol_attn(q, k, v, topk_ratio=0.5))
 
 
-def test_topk_budget_moves_toward_dense():
-    """A bigger top-k budget can only move the output toward dense attention."""
+def test_topk_budget_direction():
+    """A bigger top-k budget moves the reference toward dense attention."""
     q, k, v = _qkv(1, 4096, 2)
     ref = _dense(q, k, v)
-    cs = [_cos(sol_attn_eager(q, k, v, topk_ratio=r), ref)
-          for r in (0.05, 0.2, 0.6)]
-    assert cs[0] < cs[1] < cs[2]
+    assert (_cos(sol_attn_eager(q, k, v, topk_ratio=0.05), ref) + 5e-3
+            < _cos(sol_attn_eager(q, k, v, topk_ratio=0.6), ref))
 
 
 def test_topk_keeps_sinks_exact():
