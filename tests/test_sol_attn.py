@@ -56,7 +56,7 @@ def _chunked_case(seed, rot, v_scale=1.0):
     """A qkv-projection tensor plus everything both attention paths need from
     it: the separate-rope reference inputs and the producer's chunk list."""
     g = torch.Generator(device="cuda").manual_seed(seed)
-    t, h, d = 4096 + 128, 4, HD          # ragged tail across chunk boundary
+    t, h, d = 4096 + 100, 4, HD          # last chunk is 100 tokens: ragged at the chunk AND 64-block level
     qkv = torch.randn(t, 3 * h * d, device="cuda", dtype=torch.bfloat16,
                       generator=g) * 0.5
     qkv[:, 2 * h * d:] *= v_scale
