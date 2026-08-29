@@ -1510,6 +1510,23 @@ static void need_bthd(const nb::ndarray<nb::device::cuda>& a, int64_t b, int64_t
         a.shape(0) != (size_t)b || a.shape(1) != (size_t)t || a.shape(2) != (size_t)h || a.shape(3) != (size_t)d)
         throw std::runtime_error(std::string(who) + ": " + what + " must be a (B, T, H, D) bfloat16 array");
 }
+// The kernels stage rows with 16-byte loads: unit last stride, 16 B base, and
+// leading strides (of non-singleton dims) that keep every row 16 B aligned.
+static void need_staging_layout(const nb::ndarray<nb::device::cuda>& a, const char* who, const char* what) {
+    bool ok = a.stride(3) == 1 && reinterpret_cast<uintptr_t>(a.data()) % 16 == 0;
+    for (int i = 0; i < 3; ++i) ok = ok && (a.shape(i) <= 1 || a.stride(i) % 8 == 0);
+    if (!ok)
+        throw std::runtime_error(std::string(who) + ": " + what
+            + " must have a contiguous last dim, a 16-byte aligned base and leading strides that are multiples of 8");
+}
+static void need_contiguous(const nb::ndarray<nb::device::cuda>& a, const char* who, const char* what) {
+    int64_t expect = 1;
+    for (int i = (int)a.ndim() - 1; i >= 0; --i) {
+        if (a.shape(i) > 1 && a.stride(i) != expect)
+            throw std::runtime_error(std::string(who) + ": " + what + " must be contiguous");
+        expect *= (int64_t)a.shape(i);
+    }
+}
 
 // Workspace dims and slot byte offsets, from the C++ Plan (the one definition).
 nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads) {
@@ -1545,6 +1562,10 @@ void sol_attn(
     need_bthd(k, batch, seq_len, num_heads, head_dim, "sol_attn", "k");
     need_bthd(v, batch, seq_len, num_heads, head_dim, "sol_attn", "v");
     need_bthd(out, batch, seq_len, num_heads, head_dim, "sol_attn", "out");
+    need_staging_layout(q, "sol_attn", "q");
+    need_staging_layout(k, "sol_attn", "k");
+    need_staging_layout(v, "sol_attn", "v");
+    need_contiguous(out, "sol_attn", "out");
     need_workspace(workspace, batch, seq_len, num_heads, "sol_attn");
     if (key_bias) need_elems(*key_bias, batch * seq_len, "sol_attn", "key_bias");
     // Explicit strides: only the last dim must be contiguous (BHND views go in as-is).

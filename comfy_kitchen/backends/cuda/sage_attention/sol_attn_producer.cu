@@ -102,7 +102,7 @@ __global__ void sol_producer_kernel(
         const float inv = 1.f / vscale[(size_t)h * HD + d];
         float sv = 0.f, av = 0.f;
         // vTi: raw channel rows, perm_d on the KEY axis per 64-block
-        int8_t col[BLK];
+        __align__(16) int8_t col[BLK];
         for (int t = 0; t < BLK; ++t) {
             const float x = (t < len) ? __bfloat162float(sT[t * LD_TILE + d]) : 0.f;
             sv += x; av = fmaxf(av, fabsf(x));

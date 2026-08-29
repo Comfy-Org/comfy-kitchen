@@ -360,6 +360,17 @@ def test_bindings_check_buffer_sizes():
         _C.sol_attn(w(q), w(k), w(v), w(torch.empty_like(q)), w(ws[:-1]), *args)
     with pytest.raises(RuntimeError, match="\\(B, T, H, D\\)"):
         _C.sol_attn(w(q.view(t, h, HD)), w(k), w(v), w(torch.empty_like(q)), w(ws), *args)
+    # staging-load layout contract, checked at the binding too
+    base = torch.randn(1, t, h, HD + 4, device="cuda", dtype=torch.bfloat16)   # row stride 132: not a multiple of 8
+    off = torch.randn(t * h * HD + 8, device="cuda", dtype=torch.bfloat16)
+    wide = torch.randn(1, t, h, 2 * HD, device="cuda", dtype=torch.bfloat16)
+    bad_layouts = (wide[..., ::2], off[1:1 + t * h * HD].view(1, t, h, HD), base[..., :HD])
+    for bad in bad_layouts:
+        with pytest.raises(RuntimeError, match="16-byte aligned base"):
+            _C.sol_attn(w(bad), w(k), w(v), w(torch.empty_like(q)), w(ws), *args)
+    with pytest.raises(RuntimeError, match="out must be contiguous"):
+        _C.sol_attn(w(q), w(k), w(v), w(torch.empty(1, h, t, HD, device="cuda", dtype=torch.bfloat16).transpose(1, 2)),
+                    w(ws), *args)
     stats = torch.empty(h, HD, device="cuda")
     with pytest.raises(RuntimeError, match="out"):
         _C.sol_attn_core(w(ws), w(q[:, :128].contiguous()), w(stats), w(stats), w(stats),
