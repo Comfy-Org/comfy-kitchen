@@ -97,8 +97,9 @@ def add_coarse_(out, oc, gate):
 
 
 def _topk_count(n: int, ratio: float) -> int:
-    """Key blocks a query block keeps under top-k: ratio * n, clamped to [1, n-1]."""
-    return max(1, min(n - 1, round(ratio * n)))
+    """Key blocks a query block keeps under top-k: ratio * n, clamped to
+    [1, n-1]; 0 when n <= 1 (the threshold trick needs k+1 <= n columns)."""
+    return max(0, min(n - 1, max(1, round(ratio * n))))
 
 
 def _pool(x: torch.Tensor, n_blocks: int, reduce: str, lengths=None) -> torch.Tensor:

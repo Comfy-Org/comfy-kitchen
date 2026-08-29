@@ -306,6 +306,16 @@ def test_topk_keeps_sinks_exact():
     assert _cos(got, ref) > 0.995
 
 
+@pytest.mark.parametrize("t", [64, 40])
+def test_topk_single_key_block(t):
+    """n == 1 must not crash the (k+1)-th-score threshold; the diagonal makes
+    the result dense in both backends."""
+    q, k, v = _qkv(1, t, 2)
+    got = ck.sol_attn(q, k, v, topk_ratio=0.2)
+    assert _cos(got, _dense(q, k, v)) > 0.999
+    assert _cos(sol_attn_eager(q, k, v, topk_ratio=0.2), _dense(q, k, v)) > 0.9999
+
+
 def test_topk_ratio_validation():
     """The range lives in the shared rule, so every entry rejects it."""
     q, k, v = _qkv(1, 1024, 1)
