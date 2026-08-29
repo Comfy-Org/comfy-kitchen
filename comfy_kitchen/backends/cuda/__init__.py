@@ -2347,7 +2347,9 @@ def _topk_from_pooled(c8, csc, kc, topk_ratio, log2s, sinks):
     if s1 > s0:
         s[..., s0:s1] = float("-inf")
     kk = _topk_count(n - _sink_count(n, s0, s1), topk_ratio)
-    kth = s.topk(max(kk, 1), dim=-1, sorted=False).values.min(-1).values
+    if kk == 0:   # nothing beyond the forced blocks: a threshold no finite score clears
+        return torch.full(s.shape[:-1], float("inf"), device=s.device, dtype=s.dtype)
+    kth = s.topk(kk, dim=-1, sorted=False).values.min(-1).values
     # backed off a few ulps: this replica of the kernel's scores is not bit-exact
     return (kth - kth.abs() * 1e-5).contiguous()
 

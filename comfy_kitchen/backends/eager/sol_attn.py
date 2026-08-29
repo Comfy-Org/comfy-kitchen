@@ -203,8 +203,11 @@ def sol_attn(
         ranked[..., sink_kv0:sink_kv1] = float("-inf")
         kk = _topk_count(n - _sink_count(n, sink_kv0, sink_kv1), topk_ratio)
         # >= the k-th score: a tied group at the boundary is kept, not dropped
-        row_thr = ranked.topk(max(kk, 1), dim=-1).values[..., -1:]
-        exact = ranked >= row_thr
+        if kk:
+            row_thr = ranked.topk(kk, dim=-1).values[..., -1:]
+            exact = ranked >= row_thr
+        else:
+            exact = torch.zeros_like(ranked, dtype=torch.bool)
     else:
         # tau sigma of the proxy row, from the query-block centroid
         var = (centroid.pow(2) * kc_var.unsqueeze(1)).sum(-1)      # (B, N, H)

@@ -544,6 +544,18 @@ def test_topk_budget_excludes_sinks():
         assert (s >= thr.unsqueeze(-1)).sum(-1).eq(kk).all(), sinks   # exactly kk non-sink blocks kept
 
 
+def test_topk_zero_budget_routes_nothing():
+    """One selectable block after sink exclusion is a zero budget (the n-1
+    clamp never routes everything): block 4 must go to the tail, so with
+    tail=False query blocks 0..2 see only the sink keys."""
+    q, k, v = _qkv(1, 320, 2)                              # n = 5
+    kw = {"topk_ratio": 0.5, "sink_blocks": [0, 4], "tail": False}
+    valid = torch.arange(320, device="cuda") < 256           # keys of blocks 0..3
+    ref = _masked_dense(q, k, v, valid)
+    assert _cos(sol_attn_eager(q, k, v, **kw)[:, :192], ref[:, :192]) > 0.9999
+    assert _cos(ck.sol_attn(q, k, v, **kw)[:, :192], ref[:, :192]) > 0.999
+
+
 def test_topk_ties_over_select():
     """A tied group straddling the budget must be kept whole. Blocks 8..31 are
     identical and score highest for every query block, so with k = 8 the
