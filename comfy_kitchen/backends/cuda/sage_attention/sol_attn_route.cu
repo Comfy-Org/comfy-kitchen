@@ -49,8 +49,8 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
     int T, int NTB, int NPAD, int NQ,
     int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2) {
 #if SOL_SM80
-    __shared__ int8_t sKc[BN * LDK];
-    __shared__ __nv_bfloat16 sVcT[HD * LDV];
+    __shared__ __align__(16) int8_t sKc[BN * LDK];
+    __shared__ __align__(16) __nv_bfloat16 sVcT[HD * LDV];
     __shared__ float sLen[BN];
 
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;

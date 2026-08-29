@@ -133,7 +133,7 @@ __device__ __forceinline__ void quant_q_rows(
         const float sc = live ? fmaxf(a / 127.0f, 1e-8f) : 0.f;   // dead rows: deterministic zeros
         qs[(size_t)t * H] = sc;
         const float inv = live ? 1.f / sc : 0.f;
-        int8_t out[HEAD_DIM];
+        __align__(16) int8_t out[HEAD_DIM];
         #pragma unroll
         for (int d = 0; d < HEAD_DIM; ++d) out[perm_d(d)] = q8(__bfloat162float(row[d]), inv);
         int8_t* dst = qiP + (size_t)t * H * HEAD_DIM;
@@ -183,7 +183,7 @@ __device__ __forceinline__ void quant_k_rows(
         const float bias = (kbias && live) ? kbias[s] : 0.f;
         ksb[p] = make_float2(live ? sc : 0.f, live ? bias : NEG);
         const float inv = 1.f / sc;
-        int8_t out[HEAD_DIM];
+        __align__(16) int8_t out[HEAD_DIM];
         #pragma unroll
         for (int d = 0; d < HEAD_DIM; ++d)
             out[perm_d(d)] = live ? q8(__bfloat162float(row[d]) - kmean[d], inv) : (int8_t)0;

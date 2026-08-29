@@ -2611,7 +2611,8 @@ def sol_attn_chunked(
         kmean = _ws_ksums(ws, p, h).sum(1) / lengths.sum()   # live tokens, like prep_sums_to_means
         vscale = vscale_of(ws[p["statsV"]:p["statsV"] + h * d * 4].view(torch.float32))
     kmean = kmean.to(device=dev, dtype=torch.float32).contiguous()
-    vscale = vscale.to(device=dev, dtype=torch.float32).contiguous()
+    # a zero scale is 1/0 in the producer and 255/0 in route: clamp like vscale_of
+    vscale = vscale.to(device=dev, dtype=torch.float32).clamp_min(1e-8).contiguous()
     produce(kmean, vscale)
     sb, sq = _sink_pair(sink_blocks), _sink_pair(sink_q)
     threshold = (_topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sb)

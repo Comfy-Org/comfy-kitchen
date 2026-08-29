@@ -38,14 +38,14 @@ __global__ void vquant_transpose(const __nv_bfloat16* __restrict__ v,
                                  int8_t* __restrict__ vT,
                                  int T, int Tp, int H,
                                  int64_t sb, int64_t st, int64_t sh) {
-    __shared__ int8_t sV[TT * LDS_PAD];
+    __shared__ __align__(16) int8_t sV[TT * LDS_PAD];
     const int bh = blockIdx.y, head = bh % H, batch = bh / H;
     const int t0 = blockIdx.x * TT;
 
     // phase 1: coalesced read (D contiguous) -> smem rows
     for (int idx = threadIdx.x; idx < TT * (HD / 16); idx += NTHREADS) {
         const int t = idx / (HD / 16), c16 = (idx % (HD / 16)) * 16;
-        int8_t out[16];
+        __align__(16) int8_t out[16];
         if (t0 + t < T) {
             const __nv_bfloat16* src =
                 v + batch * sb + (int64_t)(t0 + t) * st + head * sh + c16;

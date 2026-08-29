@@ -54,7 +54,7 @@ __global__ void sol_producer_kernel(
     float rope_eps, int rot,
     int t0, int M, int T, int Tp, int H, int NPAD, int NQ)
 {
-    __shared__ __nv_bfloat16 sT[BLK * LD_TILE];
+    __shared__ __align__(16) __nv_bfloat16 sT[BLK * LD_TILE];
     __shared__ __align__(16) float sred[HD];
     const int blk_local = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
     const int tb0 = t0 + blk_local * BLK;              // absolute token start

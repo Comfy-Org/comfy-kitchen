@@ -130,7 +130,7 @@ __global__ void prep_q(const __nv_bfloat16* __restrict__ q, const float* __restr
                        const int32_t* __restrict__ blen,
                        int T, int H, int NQ, int NPAD, float tau, float log2s,
                        int64_t sb, int64_t st, int64_t sh) {
-    __shared__ __nv_bfloat16 sQ[BLK * LD_TILE];
+    __shared__ __align__(16) __nv_bfloat16 sQ[BLK * LD_TILE];
     __shared__ __align__(16) float sred[HD];
     const int qb = blockIdx.x, bh = blockIdx.y;
     const int batch = bh / H, head = bh % H;
@@ -156,7 +156,7 @@ __global__ void prep_k(const __nv_bfloat16* __restrict__ k, const float* __restr
                        const int32_t* __restrict__ blen,
                        int T, int Tp, int H,
                        int64_t sb, int64_t st, int64_t sh) {
-    __shared__ __nv_bfloat16 sK[BLK * LD_TILE];
+    __shared__ __align__(16) __nv_bfloat16 sK[BLK * LD_TILE];
     const int n = blockIdx.x, bh = blockIdx.y;
     const int batch = bh / H, head = bh % H;
     const int t0 = n * BLK, len = block_len_of(blen, n, T);

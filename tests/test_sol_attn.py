@@ -362,6 +362,20 @@ def test_chunked_producer_validates():
             c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], sink_blocks=[3, 1])
 
 
+def test_chunked_zero_vscale_is_clamped():
+    """A caller-supplied all-zero V scale must not poison the run (1/0 in the
+    producer, 255/0 in route); it is clamped like the internal bootstrap."""
+    c = _chunked_case(seed=11, rot=64)
+    ref = cuda_backend.sol_attn(c["q"], c["k"], c["v"], tau=1.4)
+    zeros = torch.zeros(c["h"], HD, device="cuda")
+    out, km, vs = cuda_backend.sol_attn_chunked(
+        c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], kmean=zeros, vscale=zeros, tau=1.4)
+    assert torch.isfinite(out.float()).all()          # that step's V is sign-quantized: finite is the bar
+    out, _, _ = cuda_backend.sol_attn_chunked(
+        c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], kmean=km, vscale=vs, tau=1.4)
+    assert _cos(out, ref) > 0.995                      # and its statistics recover the next step
+
+
 def test_chunked_producer_topk():
     """Producer-path top-k (threshold from the workspace) vs the separate-rope path."""
     c = _chunked_case(seed=13, rot=64)
