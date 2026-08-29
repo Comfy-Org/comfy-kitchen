@@ -308,7 +308,7 @@ def test_topk_keeps_sinks_exact():
 
 @pytest.mark.parametrize("t", [64, 40])
 def test_topk_single_key_block(t):
-    """n == 1 must not crash the (k+1)-th-score threshold; the diagonal makes
+    """n == 1 must not crash the k-th-score threshold; the diagonal makes
     the result dense in both backends."""
     q, k, v = _qkv(1, t, 2)
     got = ck.sol_attn(q, k, v, topk_ratio=0.2)
@@ -497,9 +497,21 @@ def test_topk_budget_excludes_sinks():
         s = s * csc.unsqueeze(-1) * ksc.squeeze(-1).unsqueeze(-2)
         s[..., sinks[0]:sinks[1]] = float("-inf")
         kk = _topk_count(n_eff, 0.2)
-        expect = s.topk(kk + 1, dim=-1).values[..., -1]
-        assert torch.equal(thr, expect), sinks
-        assert (s > thr.unsqueeze(-1)).sum(-1).eq(kk).all(), sinks   # exactly kk non-sink blocks kept
+        expect = s.topk(kk, dim=-1).values[..., -1]
+        assert torch.allclose(thr, expect, rtol=2e-5), sinks
+        assert (s >= thr.unsqueeze(-1)).sum(-1).eq(kk).all(), sinks   # exactly kk non-sink blocks kept
+
+
+def test_topk_ties_over_select():
+    """A tied group straddling the budget must be kept whole. Blocks 8..31 are
+    identical and score highest for every query block, so with k = 8 the
+    boundary is always inside the group; CUDA must agree with eager."""
+    q, k, v = _qkv(1, 64 * 32, 2)
+    u = q.mean(dim=1, keepdim=True) * 640           # scores highest for every query block
+    k = k.clone()
+    k[:, 8 * 64:] = u
+    kw = {"topk_ratio": 0.25, "tail": False}
+    assert _cos(ck.sol_attn(q, k, v, **kw), sol_attn_eager(q, k, v, **kw)) > 0.99
 
 
 def test_chunked_vsa_mode():

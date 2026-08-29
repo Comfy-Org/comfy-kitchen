@@ -154,7 +154,7 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
                         ? (float)s_acc[nt][rr * 2 + cc] * qsc[rr] * (cc ? ks1 : ks0)
                         : NEG;
                     const bool routed = valid[cc] &&
-                        ((score[cc] > thr[rr]) || abs(qr[rr] - b) <= 1);
+                        ((score[cc] >= thr[rr]) || abs(qr[rr] - b) <= 1);
                     cand[cc] = !pre[cc] && (q_in_sink[rr] ? valid[cc] : routed);
                 }
 

@@ -98,7 +98,7 @@ def add_coarse_(out, oc, gate):
 
 def _topk_count(n: int, ratio: float) -> int:
     """Key blocks a query block keeps under top-k: ratio * n, clamped to
-    [1, n-1]; 0 when n <= 1 (the threshold trick needs k+1 <= n columns)."""
+    [1, n-1]; 0 when n <= 1 (nothing to select beyond the forced blocks)."""
     return max(0, min(n - 1, max(1, round(ratio * n))))
 
 
@@ -202,8 +202,9 @@ def sol_attn(
         ranked = colmean.clone()
         ranked[..., sink_kv0:sink_kv1] = float("-inf")
         kk = _topk_count(n - _sink_count(n, sink_kv0, sink_kv1), topk_ratio)
-        row_thr = ranked.topk(kk + 1, dim=-1).values[..., -1:]
-        exact = ranked > row_thr
+        # >= the k-th score: a tied group at the boundary is kept, not dropped
+        row_thr = ranked.topk(max(kk, 1), dim=-1).values[..., -1:]
+        exact = ranked >= row_thr
     else:
         # tau sigma of the proxy row, from the query-block centroid
         var = (centroid.pow(2) * kc_var.unsqueeze(1)).sum(-1)      # (B, N, H)

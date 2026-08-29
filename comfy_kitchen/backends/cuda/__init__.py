@@ -2331,7 +2331,8 @@ _SOL_VSCALE_MARGIN = 1.1   # clip headroom on last step's V absmax
 
 
 def _topk_from_pooled(c8, csc, kc, topk_ratio, log2s, sinks):
-    """Per-query-block top-k as a threshold: the (k+1)-th largest pooled score.
+    """Per-query-block top-k as a threshold: the k-th largest pooled score
+    (the kernel keeps score >= threshold, so ties over-select).
     ``c8``/``csc`` are the quantized centroids ``[BH, N, D]``/``[BH, N]``, ``kc``
     the centred pooled keys. Scores are computed through the route kernel's own
     int8 quantization and operation order; an fp32 threshold against int8
@@ -2346,7 +2347,9 @@ def _topk_from_pooled(c8, csc, kc, topk_ratio, log2s, sinks):
     if s1 > s0:
         s[..., s0:s1] = float("-inf")
     kk = _topk_count(n - _sink_count(n, s0, s1), topk_ratio)
-    return s.topk(kk + 1, dim=-1, sorted=False).values.min(-1).values.contiguous()
+    kth = s.topk(max(kk, 1), dim=-1, sorted=False).values.min(-1).values
+    # backed off a few ulps: this replica of the kernel's scores is not bit-exact
+    return (kth - kth.abs() * 1e-5).contiguous()
 
 
 def _block_means(x, lengths=None, valid=None):
