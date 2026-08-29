@@ -127,7 +127,7 @@ jobs:
           CIBW_BEFORE_BUILD: |
             python --version
             ccache --show-stats
-            pip install 'nanobind<3' cmake setuptools wheel
+            pip install nanobind cmake setuptools wheel
 
           # Repair wheel for manylinux compliance, excluding GPU runtime libs.
           # Users must have the matching CUDA or ROCm runtime installed locally.
@@ -309,7 +309,7 @@ jobs:
           CIBW_BEFORE_BUILD: |
             python --version
             ccache --show-stats
-            pip install 'nanobind<3' cmake setuptools wheel
+            pip install nanobind cmake setuptools wheel
 
           # Repair wheel for manylinux compliance, excluding CUDA runtime libs
           # Users must have CUDA installed on their system
@@ -440,7 +440,7 @@ jobs:
           python -m pip install --upgrade pip
           # ninja: CMake's default Windows generator is Visual Studio, which has no
           # HIP language support, so setup.py drives the HIP build with Ninja.
-          pip install build setuptools wheel 'nanobind<3' ninja
+          pip install build setuptools wheel nanobind ninja
 
       - name: Install ROCm HIP SDK (Windows)
         shell: bash
@@ -891,7 +891,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install build setuptools wheel 'nanobind<3'
+          pip install build setuptools wheel nanobind
           python -c "import sys, platform; print(sys.version); print(platform.platform()); print(platform.machine())"
 
       - name: Build CUDA abi3 wheel
