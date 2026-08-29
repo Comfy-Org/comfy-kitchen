@@ -1577,6 +1577,12 @@ void sol_producer_chunk_py(
     int64_t batch, int64_t seq_len, int64_t num_heads,
     uintptr_t stream_ptr,
     std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt) {
+    if (batch != 1)
+        throw std::runtime_error("sol_producer_chunk: the producer path is B=1 only");
+    if (rot_dim <= 0 || rot_dim > 128 || rot_dim % 8)
+        throw std::runtime_error("sol_producer_chunk: rot_dim must be a multiple of 8 in (0, 128]");
+    if (t0 < 0 || m < 0 || t0 + m > seq_len || (m && t0 % 64))
+        throw std::runtime_error("sol_producer_chunk: chunk [t0, t0 + m) must lie in [0, seq_len] with a 64-aligned start");
     if (block_len) check_block_len(*block_len, seq_len, "sol_producer_chunk");
     need_workspace(workspace, batch, seq_len, num_heads, "sol_producer_chunk");
     need_elems(qkv, m * 3 * num_heads * 128, "sol_producer_chunk", "qkv");

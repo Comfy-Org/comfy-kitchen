@@ -368,6 +368,19 @@ def test_bindings_check_buffer_sizes():
         _C.sol_producer_chunk(w(ws), w(torch.empty(64, 3 * h * HD - 8, device="cuda", dtype=torch.bfloat16)),
                               w(torch.empty(t, 64, 2, device="cuda")), w(stats[0]), w(stats[0]),
                               w(stats), w(stats), 1e-6, 64, 0, 64, 1, t, h, stream)
+    # producer metadata: rot_dim, batch, and the chunk range are checked before launch
+    chunk, fab = torch.empty(64, 3 * h * HD, device="cuda", dtype=torch.bfloat16), torch.empty(t, 64, 2, device="cuda")
+
+    def produce(rot=64, t0=0, m=64, batch=1):
+        _C.sol_producer_chunk(w(ws), w(chunk), w(fab), w(stats[0]), w(stats[0]), w(stats), w(stats),
+                              1e-6, rot, t0, m, batch, t, h, stream)
+    with pytest.raises(RuntimeError, match="rot_dim"):
+        produce(rot=12)
+    with pytest.raises(RuntimeError, match="B=1"):
+        produce(batch=2)
+    for t0, m in ((-64, 64), (32, 64), (t, 64), (t - 32, 64)):
+        with pytest.raises(RuntimeError, match="64-aligned"):
+            produce(t0=t0, m=m)
 
 
 def test_chunked_producer_validates():
