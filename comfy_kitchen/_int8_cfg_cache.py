@@ -6,7 +6,7 @@ current (M, N, K, out_dtype).
 
 Cache source precedence:
   1. Path in COMFY_KITCHEN_INT8_CFG_CACHE env var, if set.
-  2. `<repo_root>/a6000_int8_cfg_table.json` if present.
+  2. `a6000_int8_cfg_table.json` inside the package (shipped in wheels) if present.
   3. Otherwise empty; the existing heuristic in C++ wins.
 
 The JSON schema matches what `int8_autotune_sweep.py` writes:
@@ -53,10 +53,13 @@ def _default_cache_path() -> Path | None:
         _logger.warning("COMFY_KITCHEN_INT8_CFG_CACHE=%s not found", p)
         return None
 
-    # Walk up from this file's location to the package's parent (the repo
-    # root in dev layout) — that's where int8_autotune_sweep.py writes.
+    # Look inside the package first (this path ships in wheels), then beside
+    # the package (dev checkouts, where int8_autotune_sweep.py writes).
     here = Path(__file__).resolve().parent
-    for candidate in (here.parent / "a6000_int8_cfg_table.json",):
+    for candidate in (
+        here / "a6000_int8_cfg_table.json",
+        here.parent / "a6000_int8_cfg_table.json",
+    ):
         if candidate.is_file():
             return candidate
     return None
@@ -142,11 +145,12 @@ def get_cfg(m: int, n: int, k: int, out_dtype_code: int, device_index: int = 0) 
 
 def reset() -> None:
     """Drop the loaded cache (for tests)."""
-    global _loaded, _load_attempted, _loaded_from, _range_warning_emitted
+    global _loaded, _load_attempted, _loaded_from, _cache_sm, _range_warning_emitted
     global _m_min_swept, _m_max_swept
     _loaded = {}
     _load_attempted = False
     _loaded_from = None
+    _cache_sm = None
     _range_warning_emitted = set()
     _m_min_swept = None
     _m_max_swept = None

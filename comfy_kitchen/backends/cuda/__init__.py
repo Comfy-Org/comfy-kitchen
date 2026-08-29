@@ -20,13 +20,13 @@ import os
 import sys
 
 import torch
-
-from comfy_kitchen import _int8_cfg_cache
 from comfy_kitchen._rope_utils import (
     check_rope_inplace,
     detect_rms_rope_bnhd,
     trim_rope_freqs,
 )
+
+from comfy_kitchen import _int8_cfg_cache
 
 __all__ = [
     "na3d",
@@ -946,7 +946,7 @@ def _int4_linear_via_int8_values(
     ):
         cached_cfg = (
             _int8_cfg_cache.get_cfg(m, n, k, DTYPE_TO_CODE[out_dtype], x_int8.get_device())
-            if bias_arg is None
+            if bias is None
             else None
         )
         if cached_cfg is not None:

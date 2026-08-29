@@ -403,32 +403,56 @@ struct FusedInt8GemmNoBias {
     }
 };
 
+namespace {
+
+// Parse an exact small non-negative integer from an env value; -1 when unset,
+// empty, or anything but digits (rejects "1junk" / " 1" / "1,2").
+int parse_forced_config_env() {
+    const char* v = std::getenv("COMFY_KITCHEN_FORCE_CUTLASS_INT8_CONFIG");
+    if (v == nullptr || *v == '\0') return -1;
+    int i = 0;
+    for (const char* p = v; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9' || i > 999) return -1;
+        i = i * 10 + (*p - '0');
+    }
+    return (i >= 0 && i <= 13) ? i : -1;
+}
+
+// Whether the given CUDA device is sm86 (GA102 consumer Ampere, e.g. RTX 3090 /
+// A6000 / A40). Cached per device: a multi-GPU box may mix arches, so the
+// first query must not decide for all of them.
+bool device_is_sm86() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    static bool cached[16] = {false};
+    static bool known[16] = {false};
+    if (dev < 0 || dev >= 16) {
+        cudaDeviceProp props;
+        return cudaGetDeviceProperties(&props, dev) == cudaSuccess
+            && props.major == 8 && props.minor == 6;
+    }
+    if (!known[dev]) {
+        cudaDeviceProp props;
+        cached[dev] = cudaGetDeviceProperties(&props, dev) == cudaSuccess
+            && props.major == 8 && props.minor == 6;
+        known[dev] = true;
+    }
+    return cached[dev];
+}
+
+}  // namespace
+
 int select_fused_int8_config(int m, int n, int k) {
     // COMFY_KITCHEN_FORCE_CUTLASS_INT8_CONFIG=<int> forces a config index for
-    // benchmarking. Has no effect when unset or out of range.
-    static const int kForceConfig = [] {
-        const char* v = std::getenv("COMFY_KITCHEN_FORCE_CUTLASS_INT8_CONFIG");
-        if (v == nullptr) return -1;
-        const int i = std::atoi(v);
-        return (i >= 0 && i <= 13) ? i : -1;
-    }();
+    // benchmarking. Has no effect when unset or not an exact 0-13 integer.
+    static const int kForceConfig = parse_forced_config_env();
     if (kForceConfig >= 0) return kForceConfig;
 
     if (k % 16 != 0) return 9;
 
-    // Detect sm86 (GA102 consumer Ampere, e.g. RTX 3090 / A6000 / A40). These are
-    // the only sm8x parts with 84 SMs, 6MB L2, and GDDR6(X) — the combination
-    // that makes StreamK lose at large M and the Ada/Blackwell thresholds below
-    // pick the wrong tile. Cache once.
-    static const bool kIsSm86 = [] {
-        int dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess) return false;
-        cudaDeviceProp props;
-        if (cudaGetDeviceProperties(&props, dev) != cudaSuccess) return false;
-        return props.major == 8 && props.minor == 6;
-    }();
-
-    if (kIsSm86) {
+    // sm86 is the combination (84 SMs, 6MB L2, GDDR6) that makes StreamK lose
+    // at large M, and the Ada/Blackwell thresholds below pick the wrong tile.
+    if (device_is_sm86()) {
         // sm86 heuristic fitted from a 14-cfg sweep on A6000 (300W PL, 84 SMs,
         // 6 MB L2, 768 GB/s GDDR6) against 21 shapes spanning LTX 2.5
         // (M=274..25900) and MiniMax H3 (M=80666); see int8_autotune_sweep.py
@@ -535,12 +559,7 @@ bool launch_fused_int8_heuristic(int m, int n, int k, Launch launch) {
     if (launch(selected)) return true;
     // When a config is forced, do NOT silently fall back to a different tile; let
     // the caller see the failure so benchmarks are honest.
-    static const bool kForceConfig = [] {
-        const char* v = std::getenv("COMFY_KITCHEN_FORCE_CUTLASS_INT8_CONFIG");
-        if (v == nullptr) return false;
-        const int i = std::atoi(v);
-        return i >= 0 && i <= 13;
-    }();
+    static const bool kForceConfig = parse_forced_config_env() >= 0;
     if (kForceConfig) return false;
 
     static constexpr int aligned_fallbacks[] = {2, 12, 0, 13, 1, 6, 8, 7, 3, 4, 5};
