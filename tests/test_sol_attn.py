@@ -384,6 +384,10 @@ def test_chunked_producer_validates():
     with pytest.raises(ValueError, match="sink_blocks"):
         cuda_backend.sol_attn_chunked(
             c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], sink_blocks=[3, 1])
+    # rot 12: a lane's four channels would straddle rot/2 and need two partner lanes
+    bad_freqs = torch.randn(1, c["t"], 1, 6, 2, 2, device="cuda")
+    with pytest.raises(ValueError, match="rot_dim"):
+        cuda_backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], bad_freqs, c["norm"])
 
 
 def test_chunked_zero_vscale_is_clamped():

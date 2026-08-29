@@ -2559,6 +2559,9 @@ def sol_attn_chunked(
     on the first call. Returns ``(out[1,T,H,128] bf16, kmean_next, vscale_next)``."""
     d = _SOL_HD
     rot = rope_freqs.shape[-3] * 2
+    # the fused rope pairs channels across lanes of 4: rot/2 must be lane-aligned
+    if rot % 8 or not 0 < rot <= d:
+        raise ValueError(f"sol_attn_chunked: rot_dim must be a multiple of 8 in (0, {d}], got {rot}")
     fab = _packed_rope_fab(rope_freqs, t, rot)
     dev = fab.device
     _check_sol_args(dev, sink_blocks, sink_q, topk_ratio)
