@@ -15,11 +15,13 @@
 import contextlib
 import ctypes
 import importlib.util
+import logging
 import os
 import sys
 
 import torch
 
+from comfy_kitchen import _int8_cfg_cache
 from comfy_kitchen._rope_utils import (
     check_rope_inplace,
     detect_rms_rope_bnhd,
@@ -936,11 +938,44 @@ def _int4_linear_via_int8_values(
         k,
         x_int8.get_device(),
     )
+    _int8_cfg_cache.check_m_in_swept_range(m)
     if (
         not prefer_cublas_fallback
         and not _DISABLE_CUTLASS_INT8
         and _cuda_device_supports_cutlass_int8_dequant(x_int8)
     ):
+        cached_cfg = (
+            _int8_cfg_cache.get_cfg(m, n, k, DTYPE_TO_CODE[out_dtype], x_int8.get_device())
+            if bias_arg is None
+            else None
+        )
+        if cached_cfg is not None:
+            # Per-shape benchmarked winner from int8_autotune_sweep.py. The
+            # _config entry point is no-bias only, so this branch is taken
+            # iff bias_arg is None.
+            out_dtype_code = DTYPE_TO_CODE[out_dtype]
+            if out_dtype_code == 2:  # cache was swept against bf16
+                used_cutlass = _C.cutlass_int8_dequant_config(
+                    _wrap_for_dlpack(x_int8),
+                    _wrap_for_dlpack(weight_int8),
+                    _wrap_for_dlpack(x_scale_arg.reshape(m, 1)),
+                    _wrap_for_dlpack(
+                        weight_scale_arg
+                        if weight_scale_arg.numel() == n
+                        else weight_scale_arg.expand(n).contiguous()
+                    ),
+                    _wrap_for_dlpack(output),
+                    out_dtype_code,
+                    cached_cfg,
+                    torch.cuda.current_stream(x_int8.device).cuda_stream,
+                )
+                if used_cutlass:
+                    _log_int8_path_once(
+                        ("cutlass_int8_dequant_cached", m, n, k, cached_cfg),
+                        f"CUTLASS fused INT8 GEMM (cached cfg={cached_cfg}): M={m} N={n} K={k}",
+                    )
+                    return output
+        # Heuristic path (no bias or no cache hit).
         ws_cutlass = weight_scale_arg if weight_scale_arg.numel() == n else weight_scale_arg.expand(n).contiguous()
         bias_f32 = bias_arg.to(torch.float32).contiguous() if bias is not None else bias_arg
         used_cutlass = _C.cutlass_int8_dequant(
@@ -954,7 +989,17 @@ def _int4_linear_via_int8_values(
             torch.cuda.current_stream(x_int8.device).cuda_stream,
         )
     if used_cutlass:
+        _log_int8_path_once(
+            ("cutlass_int8_dequant", m, n, k),
+            f"CUTLASS fused INT8 GEMM: M={m} N={n} K={k}",
+        )
         return output
+
+    _log_int8_path_once(
+        ("cublas_fallback", m, n, k),
+        f"cuBLAS fake-quant fallback (int8 tensor cores NOT used): M={m} N={n} K={k} "
+        f"cutlass_disabled={_DISABLE_CUTLASS_INT8} sm_major={torch.cuda.get_device_capability(x_int8.get_device())[0]}",
+    )
 
     if _cuda_device_is_turing(x_int8.get_device()):
         padded_k = _round_up(k, 16)
@@ -1524,6 +1569,26 @@ _CONVROT_FUSED_MAX_K = 16384
 # dequant path (for benchmarking against the CUTLASS fused kernel).
 _DISABLE_CUTLASS_INT8 = os.environ.get("COMFY_KITCHEN_DISABLE_CUTLASS", "0") == "1"
 
+# COMFY_KITCHEN_LOG_INT8_PATH=1 enables one-line-per-unique-shape logs so you can
+# see which INT8 GEMM path actually runs on your GPU (fused CUTLASS vs cuBLAS
+# fake-quant fallback vs separate quant+gemv). Falls silent by default. This is
+# the observability the "no speedup on sm_86" reports were missing: on Ampere,
+# hitting the cuBLAS fallback means int8 tensor cores never execute, so s/it is
+# bf16-identical.
+_LOG_INT8_PATH = os.environ.get("COMFY_KITCHEN_LOG_INT8_PATH", "0") == "1"
+_logger = logging.getLogger("comfy_kitchen.backends.cuda")
+_int8_path_logged: set[tuple] = set()
+
+
+def _log_int8_path_once(key: tuple, message: str) -> None:
+    """Log one line per unique call-site shape so 200 layers don't flood stderr."""
+    if not _LOG_INT8_PATH:
+        return
+    if key in _int8_path_logged:
+        return
+    _int8_path_logged.add(key)
+    _logger.warning("[int8_path] %s", message)
+
 
 def quantize_int8_tensorwise(
     x: torch.Tensor,
@@ -1931,6 +1996,10 @@ def int8_linear(
         # 5120 < K < 8192 band loses to the rotate-matmul path on both, so skip
         # it. (Real model hidden dims avoid that band anyway.)
         if _fused_convrot_ok:
+            _log_int8_path_once(
+                ("convrot64", m, k, input_act),
+                f"int8 quantize fused convrot64 kernel: M={m} K={k} input_act={input_act}",
+            )
             x_qdata = torch.empty((m, k), dtype=torch.int8, device=x.device)
             x_scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
             _C.quantize_int8_rowwise_convrot64(
@@ -1944,9 +2013,17 @@ def int8_linear(
                 stream_ptr,
             )
         elif _should_use_convrot_fused_kernel(x_2d, k, convrot_groupsize):
+            _log_int8_path_once(
+                ("convrot_fused", m, k),
+                f"int8 quantize fused convrot kernel: M={m} K={k}",
+            )
             # Fused single-kernel rotation + row-wise quant (no bf16 HBM round-trip).
             x_qdata, x_scale = quantize_int8_rowwise_convrot(x_2d, convrot_groupsize)
         else:
+            _log_int8_path_once(
+                ("convrot_matmul_fallback", m, k),
+                f"int8 quantize convrot rotate-matmul fallback (extra HBM round-trip): M={m} K={k}",
+            )
             # Fallback: standalone rotation matmul, then row-wise quant.
             h = _build_hadamard(convrot_groupsize, device=x_2d.device, dtype=x_2d.dtype)
             x_qdata, x_scale = quantize_and_rotate_rowwise(x_2d, h, convrot_groupsize)
@@ -2009,25 +2086,58 @@ def int8_linear(
         k,
         x_qdata.get_device(),
     )
+    _int8_cfg_cache.check_m_in_swept_range(m)
     if (
         not prefer_cublas_fallback
         and not _DISABLE_CUTLASS_INT8
         and _cuda_device_supports_cutlass_int8_dequant(x_qdata)
     ):
-        ws_cutlass = weight_scale if weight_scale.numel() == n else weight_scale.expand(n).contiguous()
-        bias_f32 = bias_arg.to(torch.float32).contiguous() if bias is not None else bias_arg
-        used_cutlass = _C.cutlass_int8_dequant(
-            _wrap_for_dlpack(x_qdata),
-            _wrap_for_dlpack(weight),
-            _wrap_for_dlpack(x_scale),
-            _wrap_for_dlpack(ws_cutlass),
-            _wrap_for_dlpack(bias_f32),
-            _wrap_for_dlpack(out),
-            output_dtype_code,
-            stream_ptr,
-        )
+        # Cache hit path: per-shape benchmarked cfg (no-bias only).
+        if bias is None and output_dtype_code == 2:
+            cached_cfg = _int8_cfg_cache.get_cfg(m, n, k, output_dtype_code, x_qdata.get_device())
+            if cached_cfg is not None:
+                ws_cutlass = weight_scale if weight_scale.numel() == n else weight_scale.expand(n).contiguous()
+                used_cutlass = _C.cutlass_int8_dequant_config(
+                    _wrap_for_dlpack(x_qdata),
+                    _wrap_for_dlpack(weight),
+                    _wrap_for_dlpack(x_scale),
+                    _wrap_for_dlpack(ws_cutlass),
+                    _wrap_for_dlpack(out),
+                    output_dtype_code,
+                    cached_cfg,
+                    stream_ptr,
+                )
+                if used_cutlass:
+                    _log_int8_path_once(
+                        ("cutlass_int8_dequant_cached_i8linear", m, n, k, cached_cfg, convrot),
+                        f"int8_linear CUTLASS cached cfg={cached_cfg}: M={m} N={n} K={k} convrot={convrot}",
+                    )
+        if not used_cutlass:
+            ws_cutlass = weight_scale if weight_scale.numel() == n else weight_scale.expand(n).contiguous()
+            bias_f32 = bias_arg.to(torch.float32).contiguous() if bias is not None else bias_arg
+            used_cutlass = _C.cutlass_int8_dequant(
+                _wrap_for_dlpack(x_qdata),
+                _wrap_for_dlpack(weight),
+                _wrap_for_dlpack(x_scale),
+                _wrap_for_dlpack(ws_cutlass),
+                _wrap_for_dlpack(bias_f32),
+                _wrap_for_dlpack(out),
+                output_dtype_code,
+                stream_ptr,
+            )
+            if used_cutlass:
+                _log_int8_path_once(
+                    ("cutlass_int8_dequant_i8linear", m, n, k, convrot),
+                    f"int8_linear CUTLASS fused INT8 GEMM: M={m} N={n} K={k} convrot={convrot}",
+                )
     if not used_cutlass:
         # Fallback: cuBLAS int8 GEMM (int32) + separate dequant kernel.
+        _log_int8_path_once(
+            ("cublas_fallback_i8linear", m, n, k, convrot),
+            f"int8_linear cuBLAS fake-quant fallback (int8 tensor cores NOT used): "
+            f"M={m} N={n} K={k} convrot={convrot} "
+            f"cutlass_disabled={_DISABLE_CUTLASS_INT8}",
+        )
         use_turing_padding = x_qdata.is_cuda and _cuda_device_is_turing(x_qdata.get_device())
         if use_turing_padding:
             padded_k = _round_up(k, 16)

@@ -15,6 +15,7 @@
 #include <cuda_fp16.h>
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 #ifdef COMFY_HAVE_CUTLASS
@@ -403,7 +404,115 @@ struct FusedInt8GemmNoBias {
 };
 
 int select_fused_int8_config(int m, int n, int k) {
+    // COMFY_KITCHEN_FORCE_CUTLASS_INT8_CONFIG=<int> forces a config index for
+    // benchmarking. Has no effect when unset or out of range.
+    static const int kForceConfig = [] {
+        const char* v = std::getenv("COMFY_KITCHEN_FORCE_CUTLASS_INT8_CONFIG");
+        if (v == nullptr) return -1;
+        const int i = std::atoi(v);
+        return (i >= 0 && i <= 13) ? i : -1;
+    }();
+    if (kForceConfig >= 0) return kForceConfig;
+
     if (k % 16 != 0) return 9;
+
+    // Detect sm86 (GA102 consumer Ampere, e.g. RTX 3090 / A6000 / A40). These are
+    // the only sm8x parts with 84 SMs, 6MB L2, and GDDR6(X) — the combination
+    // that makes StreamK lose at large M and the Ada/Blackwell thresholds below
+    // pick the wrong tile. Cache once.
+    static const bool kIsSm86 = [] {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        cudaDeviceProp props;
+        if (cudaGetDeviceProperties(&props, dev) != cudaSuccess) return false;
+        return props.major == 8 && props.minor == 6;
+    }();
+
+    if (kIsSm86) {
+        // sm86 heuristic fitted from a 14-cfg sweep on A6000 (300W PL, 84 SMs,
+        // 6 MB L2, 768 GB/s GDDR6) against 21 shapes spanning LTX 2.5
+        // (M=274..25900) and MiniMax H3 (M=80666); see int8_autotune_sweep.py
+        // and a6000_int8_cfg_table.json. Margins in parentheses are
+        // (runner_up / best_ms).
+        //
+        // Sweep winners used to fit this table:
+        //     M        N      K    best  runner-up / margin
+        //     274    2048   2048    cfg9  cfg2  (1.031x)
+        //     274    8192   2048    cfg3  cfg2  (1.035x)
+        //     274    2048   8192    cfg2  cfg7  (1.160x)
+        //    1024    2048   2048    cfg0  cfg1  (1.073x)
+        //    1024    4096   4096    cfg12 cfg0  (1.097x)
+        //    1024    8192   2048    cfg1  cfg12 (1.001x; within noise)
+        //    1024   16384   4096    cfg12 cfg1  (1.002x; within noise)
+        //    1024    4096  16384    cfg12 cfg0  (1.121x)
+        //    1024    2048   8192    cfg13 cfg12 (1.004x; within noise)
+        //    2048    4096   4096    cfg1  cfg12 (1.033x)
+        //    2048   16384   4096    cfg0  cfg13 (1.022x)
+        //    4096    4096   4096    cfg13 cfg0  (1.000x; exact tie)
+        //    4096   16384   4096    cfg0  cfg13 (1.035x)
+        //    8192    4096   4096    cfg13 cfg0  (1.032x)
+        //    8192   16384   4096    cfg0  cfg13 (1.446x)
+        //   16384    4096   4096    cfg13 cfg0  (1.122x)
+        //   16384   16384   4096    cfg0  cfg13 (1.447x)
+        //   25900    2048   4096    cfg13 cfg0  (1.058x)
+        //   25900    4096   4096    cfg13 cfg0  (1.053x)
+        //   25900    4096   2048    cfg13 cfg0  (1.009x; within noise)
+        //   25900   16384   4096    cfg0  cfg13 (1.506x)
+        //   80666    5376  14336    cfg0  cfg13 (1.009x)
+        //   80666   21504   5376    cfg0  cfg13 (1.469x)
+        //   80666   28672   5376    cfg0  cfg13 (1.465x)
+        //
+        // Patterns used to fit (avg regret vs the 21-point sweep: 0.02%):
+        //   * Tiny M (m <= 512): cfg2/3/9 (small tiles) win outright;
+        //     between them the winner depends on K. cfg9 for K<=4096 aligned;
+        //     cfg2 for K>4096 (taller K stages); cfg3 for the wide-N low-K
+        //     corner. No need to consider cfg0/1/12/13 here, they are 1.4-3x worse.
+        //   * M=1024: split on K first. K<=2048: cfg1 when N>=8192 (limited
+        //     work per SM) else cfg0 (the smallest 128x256 case where it still
+        //     wins). K>=4096: cfg12 StreamK 128x128 wins everywhere measured.
+        //   * M=2048: cfg1 at n=4096 k=4096 (boundary case where the
+        //     128x128 classic tile fills the grid but StreamK doesn't pay
+        //     off), cfg0 at wide N (k=4096 measured). K>4096 with narrow N
+        //     at this band is unmeasured — pick cfg12 conservatively.
+        //   * M>2048, wide N (n>4096): cfg0 dominates (StreamK's
+        //     partial-sum atomics saturate the 6 MB L2 once N is wide; this
+        //     is the 44-50% band).
+        //   * M>2048, narrow N: StreamK 128x256 (cfg13) up to m=32768 where
+        //     the grid is finally large enough that cfg0 catches up. The
+        //     one tall-K caveat: at m>=16384 & k>=16384 (measured at
+        //     25900x4096x16384) cfg0 wins by 3.7%; treat tall-K as a
+        //     cfg0-boosting modifier.
+
+        // --- Tiny-M band ------------------------------------------------
+        if (m <= 512) {
+            if (n >= 8192 && k <= 4096) return 3;   // small-M, wide-N, low-K
+            return k <= 4096 ? 9 : 2;               // small-M generic
+        }
+
+        // --- Small-M band (M <= 2048) -------------------------------------
+        if (m <= 1024) {
+            if (k <= 2048) {
+                if (n >= 8192) return 1;   // 1024x8192x2048 measured
+                return 0;                  // 1024x2048x2048 measured
+            }
+            return 12;                     // 1024 with K>=4096: StreamK 128x128
+        }
+        if (m <= 2048) {
+            if (n > 4096) return 0;        // 2048x16384x4096 measured
+            if (k <= 4096) return 1;       // 2048x4096x4096 measured
+            return 12;                     // K>4096 narrow-N unmeasured at m=2048
+        }
+
+        // --- Mid/large-M (M > 2048) ---------------------------------------
+        if (n > 4096) return 0;            // wide-N: cfg0 dominates for m>2048
+
+        // narrow-N:
+        //  - at m>=16384 with k>=16384, measured cfg0 (+3.7% over cfg13)
+        //  - otherwise StreamK 128x256 (cfg13) up to m=32768, cfg0 beyond
+        if (m >= 16384 && k >= 16384) return 0;
+        if (m < 32768) return 13;
+        return 0;
+    }
 
     const int64_t mn = int64_t(m) * n;
     if (n <= 24832) {
@@ -424,6 +533,15 @@ template <typename Launch>
 bool launch_fused_int8_heuristic(int m, int n, int k, Launch launch) {
     const int selected = select_fused_int8_config(m, n, k);
     if (launch(selected)) return true;
+    // When a config is forced, do NOT silently fall back to a different tile; let
+    // the caller see the failure so benchmarks are honest.
+    static const bool kForceConfig = [] {
+        const char* v = std::getenv("COMFY_KITCHEN_FORCE_CUTLASS_INT8_CONFIG");
+        if (v == nullptr) return false;
+        const int i = std::atoi(v);
+        return i >= 0 && i <= 13;
+    }();
+    if (kForceConfig) return false;
 
     static constexpr int aligned_fallbacks[] = {2, 12, 0, 13, 1, 6, 8, 7, 3, 4, 5};
     static constexpr int low_alignment_fallbacks[] = {9, 10, 11};
