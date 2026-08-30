@@ -988,6 +988,9 @@ def _device_has_int8_mm(device_type: str) -> bool:
         return False
 
 
+_FALLBACK_CHUNK_BYTES = 256 * 1024 * 1024  # bound on the fallback's per-slice temporaries
+
+
 def _int8_linear_dequant(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1002,10 +1005,12 @@ def _int8_linear_dequant(
     Mirrors the INT8 path's math on a float GEMM: ConvRot rotates the *activations*,
     exactly as the INT8 path does (the stored weight is already in the rotated
     basis); the INT8 weight values are cast to x's dtype for the GEMM (exact:
-    |q| <= 127 is representable in bf16/fp16/fp32); and the weight scale is applied
-    to the output in float32. The weight stays INT8 in memory — no weight-sized
-    float temporaries and no weight rotation. Activations are not quantized on this
-    path, so the result is slightly more accurate than the INT8 path, not less.
+    |q| <= 127 is representable in bf16/fp16/fp32) one output-channel slice at a
+    time, bounded so neither the cast weight slice nor the float32 output slice
+    exceeds ~256 MB; and the weight scale is applied to the output in float32. The
+    weight stays INT8 in memory — no full-weight float copy and no weight rotation.
+    Activations are not quantized on this path, so the result is slightly more
+    accurate than the INT8 path, not less.
     """
     if convrot:
         if x.shape[-1] % convrot_groupsize != 0:
@@ -1014,22 +1019,29 @@ def _int8_linear_dequant(
             )
         h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
         x = _rotate_activation(x, h, convrot_groupsize)
-    y = torch.nn.functional.linear(x, weight.to(dtype=x.dtype))
-    # Apply the weight scale (scalar or per-output-channel) to the output in float32,
-    # chunked over rows like the native path so the float32 temporary stays bounded,
-    # and rank-preserving (a 1-D input yields a 1-D output).
-    out_shape = y.shape
-    y2 = y.reshape(-1, out_shape[-1])
-    out = torch.empty_like(y2, dtype=out_dtype)
+    n, k = weight.shape
+    x2 = x.reshape(-1, k)
+    out = torch.empty(x2.shape[0], n, device=x.device, dtype=out_dtype)
     if bias is not None:
-        bias = bias.to(device=y2.device, dtype=torch.float32)
-    chunk = max(1, min(y2.shape[0], 256 * 1024 * 1024 // (y2.shape[1] * 4)))
-    for i in range(0, y2.shape[0], chunk):
-        part = y2[i:i + chunk].float().mul_(weight_scale)
+        bias = bias.to(device=x.device, dtype=torch.float32)
+    # One output-channel slice at a time: bounds both the cast weight slice
+    # [chunk, K] (x.dtype) and the float32 output slice [rows, chunk].
+    chunk = max(
+        1,
+        min(
+            n,
+            _FALLBACK_CHUNK_BYTES // max(1, k * x.element_size()),
+            _FALLBACK_CHUNK_BYTES // max(1, x2.shape[0] * 4),
+        ),
+    )
+    for i in range(0, n, chunk):
+        w = weight[i:i + chunk].to(dtype=x.dtype)
+        y = torch.nn.functional.linear(x2, w).float()
+        y *= weight_scale if weight_scale.numel() == 1 else weight_scale[i:i + chunk]
         if bias is not None:
-            part += bias
-        out[i:i + chunk] = part.to(out_dtype)
-    return out.reshape(out_shape)
+            y += bias[i:i + chunk]
+        out[:, i:i + chunk] = y.to(out_dtype)
+    return out.reshape(x.shape[:-1] + (n,))
 
 
 def int8_linear(
