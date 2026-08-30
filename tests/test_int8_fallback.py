@@ -145,6 +145,26 @@ def test_fallback_preserves_input_rank(monkeypatch):
     assert out3.shape == (2, 8, N)
 
 
+@pytest.mark.parametrize("convrot", [False, True])
+def test_fallback_chunks_match_single_pass(monkeypatch, convrot):
+    """A tiny chunk budget (forcing many weight slices) must give the same answer."""
+    _forbid_int_mm(monkeypatch)
+    qt = _quantized_weight(convrot, seed=7)
+    x = torch.randn(8, K, dtype=torch.bfloat16)
+    bias = torch.randn(N, dtype=torch.bfloat16)
+
+    def run():
+        return ck.int8_linear(
+            x, qt._qdata, qt._params.scale, bias, torch.bfloat16,
+            convrot=convrot, convrot_groupsize=256,
+        )
+
+    single = run()
+    monkeypatch.setattr(quantization, "_FALLBACK_CHUNK_BYTES", K * 2 * 7)  # ~7 rows per slice
+    chunked = run()
+    torch.testing.assert_close(chunked, single, rtol=0, atol=0)
+
+
 def test_native_path_untouched_when_int_mm_exists(monkeypatch):
     """CPU has ``_int_mm``: the fallback must not engage there."""
     calls = []
