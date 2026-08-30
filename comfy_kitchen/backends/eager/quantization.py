@@ -1015,11 +1015,21 @@ def _int8_linear_dequant(
         h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
         x = _rotate_activation(x, h, convrot_groupsize)
     y = torch.nn.functional.linear(x, weight.to(dtype=x.dtype))
-    # weight_scale is scalar or per-output-channel; broadcast over [..., N] in float32.
-    y = y.float() * weight_scale.reshape(1, -1)
+    # Apply the weight scale (scalar or per-output-channel) to the output in float32,
+    # chunked over rows like the native path so the float32 temporary stays bounded,
+    # and rank-preserving (a 1-D input yields a 1-D output).
+    out_shape = y.shape
+    y2 = y.reshape(-1, out_shape[-1])
+    out = torch.empty_like(y2, dtype=out_dtype)
     if bias is not None:
-        y = y + bias.to(device=y.device, dtype=torch.float32).reshape(1, -1)
-    return y.to(out_dtype)
+        bias = bias.to(device=y2.device, dtype=torch.float32)
+    chunk = max(1, min(y2.shape[0], 256 * 1024 * 1024 // (y2.shape[1] * 4)))
+    for i in range(0, y2.shape[0], chunk):
+        part = y2[i:i + chunk].float().mul_(weight_scale)
+        if bias is not None:
+            part += bias
+        out[i:i + chunk] = part.to(out_dtype)
+    return out.reshape(out_shape)
 
 
 def int8_linear(

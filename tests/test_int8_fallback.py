@@ -130,6 +130,21 @@ def test_fallback_math_is_exact_in_float32(monkeypatch):
     assert_values_close(out, torch.nn.functional.linear(x, w_ref), rtol=1e-3, atol=1e-3)
 
 
+def test_fallback_preserves_input_rank(monkeypatch):
+    """A 1-D input must yield a 1-D output (and 3-D stays 3-D), matching the native path."""
+    _forbid_int_mm(monkeypatch)
+    qt = _quantized_weight(convrot=False, seed=6)
+    bias = torch.randn(N, dtype=torch.bfloat16)
+    out1 = ck.int8_linear(
+        torch.randn(K, dtype=torch.bfloat16), qt._qdata, qt._params.scale, bias, torch.bfloat16
+    )
+    out3 = ck.int8_linear(
+        torch.randn(2, 8, K, dtype=torch.bfloat16), qt._qdata, qt._params.scale, None, torch.bfloat16
+    )
+    assert out1.shape == (N,)
+    assert out3.shape == (2, 8, N)
+
+
 def test_native_path_untouched_when_int_mm_exists(monkeypatch):
     """CPU has ``_int_mm``: the fallback must not engage there."""
     calls = []
