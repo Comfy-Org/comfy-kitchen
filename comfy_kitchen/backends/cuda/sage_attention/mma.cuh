@@ -765,6 +765,26 @@ mma_sync_m16n16k32_row_col_f8f8f32(float *C, uint32_t *A, uint32_t *B) {
 #endif
 }
 
+/*! \brief Round and saturate four FP32 values into one packed U8 word. */
+__device__ __forceinline__ uint32_t pack_u8x4(float a, float b, float c,
+                                              float d) {
+  uint32_t qa, qb, qc, qd;
+  // Keeping the conversions adjacent lets ptxas combine each pair into one
+  // F2IP instruction on Ampere and newer.
+  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qa) : "f"(a));
+  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qb) : "f"(b));
+  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qc) : "f"(c));
+  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qd) : "f"(d));
+  uint32_t qdc, packed;
+  asm volatile("cvt.pack.sat.u8.s32.b32 %0, %1, %2, 0;"
+               : "=r"(qdc)
+               : "r"(qd), "r"(qc));
+  asm volatile("cvt.pack.sat.u8.s32.b32 %0, %1, %2, %3;"
+               : "=r"(packed)
+               : "r"(qb), "r"(qa), "r"(qdc));
+  return packed;
+}
+
 /*!
  * \brief Use mma instructions to compute rowsum.
  */

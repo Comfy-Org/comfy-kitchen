@@ -67,6 +67,7 @@ __all__ = [
     "hip_attention_is_supported",
     "hip_int8_attention",
     "hip_int8_attention_is_supported",
+    "sol_attn",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -197,6 +198,65 @@ def hip_int8_attention(
         raise RuntimeError("INT8 HIP attention requires the HIP backend")
     resolved_scale = float(scale if scale is not None else q.shape[-1] ** -0.5)
     return _hip_backend.hip_int8_attention(q, k, v, resolved_scale)
+def sol_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tau: float = 1.0,
+    scale: float | None = None,
+    sink_blocks: list[int] | None = None,
+    sink_q: list[int] | None = None,
+    key_bias: torch.Tensor | None = None,
+    topk_ratio: float = 0.0,
+    tail: bool = True,
+    block_len: torch.Tensor | None = None,
+    coarse_gate: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sol-Attn training-free sparse attention (arXiv 2607.24027).
+
+    Each 64-token query block attends a routed subset of key blocks exactly and
+    covers the rest with one pooled term per block, so the full sequence still
+    contributes to the softmax denominator. The win grows with sequence length;
+    below roughly 12k tokens dense or a fused attention is usually faster.
+
+    Args:
+        q, k, v: ``(B, T, H, 128)`` tensors, same shape and dtype. The CUDA
+            backend requires bfloat16; head_dim is fixed at 128.
+        tau: Routing threshold in sigmas of the proxy row. Higher routes fewer
+            blocks exactly: cheaper and less accurate.
+        scale: Score scale; None means ``head_dim ** -0.5``.
+        sink_blocks: ``[start, end)`` key blocks always attended exactly by every
+            query -- conditioning rows, typically.
+        sink_q: ``[start, end)`` query blocks that attend everything exactly.
+        key_bias: Per-key additive logit bias in natural log, ``(T,)``,
+            ``(B, T)`` or an SDPA-style ``(B|1, 1, 1, T)`` float or bool mask.
+            Honoured by the exact branch only, so biased blocks must be
+            covered by ``sink_blocks``.
+        topk_ratio: > 0 selects SLA-style top-k instead of the tau threshold:
+            keep this fraction of key blocks per query block (the selection the
+            lightx2v SLA LoRAs were distilled against). tau is ignored then.
+        tail: False drops the pooled term so the softmax runs over the routed
+            blocks only (VSA / SLA fine stage).
+        block_len: int32 ``(ceil(T/64),)`` live tokens at the front of each
+            64-token block, for zero-padded tiles. Values are clamped to
+            ``[1, rows in the block]``; dead rows are never keys and their
+            output rows are unspecified.
+        coarse_gate: ``(B, T, H, 128)`` per-token gate for VSA's coarse branch:
+            ``gate * softmax(q_mean k_mean^T * scale) v_mean`` is added per block.
+
+    Returns:
+        ``(B, T, H, 128)`` attention output.
+    """
+    return torch.ops.comfy_kitchen.sol_attn(
+        q, k, v, tau, scale,
+        [0, 0] if sink_blocks is None else list(sink_blocks),
+        [0, 0] if sink_q is None else list(sink_q),
+        key_bias,
+        float(topk_ratio),
+        bool(tail),
+        block_len,
+        coarse_gate,
+    )
 
 
 def na3d(

@@ -260,6 +260,34 @@ extern "C" {
         int causal_t, int causal_h, int causal_w,
         float scale, int dtype_code, cudaStream_t stream);
 
+    // Sol-Attn sparse attention — see sage_attention/sol_attn.cu.
+    extern const char* const sol_attn_plan_names[];   // null-terminated
+    int sol_attn_plan(int batch, int seq_len, int num_heads, int64_t* out, int cap);
+    void sol_producer_begin(void* workspace, int batch, int seq_len,
+                            int num_heads, cudaStream_t stream);
+    void sol_producer_chunk(
+        void* workspace, const void* qkv, const void* fab,
+        const void* qw, const void* kw, const void* kmean, const void* vscale,
+        const void* blen, float rope_eps, int rot_dim, int t0, int M,
+        int batch, int seq_len, int num_heads, cudaStream_t stream);
+    void launch_sol_attn_core(
+        void* workspace, void* out, const void* vscale, void* kmean_next, void* vamax_out,
+        const void* blen, int tail,
+        int batch, int seq_len, int num_heads,
+        float tau, float scale, const void* ext_threshold,
+        int sink_start, int sink_end, int sink_q_start, int sink_q_end,
+        cudaStream_t stream);
+    void launch_sol_attn(
+        const void* q, const void* k, const void* v, void* out, void* workspace,
+        int batch, int seq_len, int num_heads, int head_dim,
+        float tau, float scale, const void* key_bias,
+        const void* ext_threshold, const void* blen, int tail,
+        int sink_start, int sink_end, int sink_q_start, int sink_q_end,
+        int64_t qs_b, int64_t qs_t, int64_t qs_h,
+        int64_t ks_b, int64_t ks_t, int64_t ks_h,
+        int64_t vs_b, int64_t vs_t, int64_t vs_h,
+        cudaStream_t stream);
+
     // Fused AdaLN — see ops/adaln.cu. subtract_mean selects LayerNorm (true)
     // or RMSNorm (false) statistics.
     void launch_adaln_kernel(
@@ -1454,6 +1482,171 @@ void na3d(
         (int)batch, (int)t_size, (int)h_size, (int)w_size, (int)num_heads, (int)head_dim,
         (int)kt, (int)kh, (int)kw, causal_t, causal_h, causal_w,
         scale, dtype_code, stream);
+}
+
+// Nanobind wrappers for Sol-Attn sparse attention
+static void check_block_len(const nb::ndarray<nb::device::cuda>& b, int64_t seq_len, const char* who) {
+    if (b.dtype() != nb::dtype<int32_t>() || b.ndim() != 1 || b.stride(0) != 1 ||
+        (int64_t)b.size() != (seq_len + 63) / 64)
+        throw std::runtime_error(std::string(who) + ": block_len must be a contiguous 1-D int32 array of ceil(T/64) elements");
+}
+
+static void need_elems(const nb::ndarray<nb::device::cuda>& a, int64_t n, const char* who, const char* what) {
+    if ((int64_t)a.size() != n)
+        throw std::runtime_error(std::string(who) + ": " + what + " must have " + std::to_string(n)
+                                 + " elements, got " + std::to_string(a.size()));
+}
+static void need_workspace(const nb::ndarray<nb::device::cuda>& ws, int64_t batch, int64_t seq_len,
+                           int64_t num_heads, const char* who) {
+    int64_t v[32];
+    const int n = sol_attn_plan((int)batch, (int)seq_len, (int)num_heads, v, 32);
+    if (n > 32 || (int64_t)ws.size() < v[n - 1])   // last slot is "total"
+        throw std::runtime_error(std::string(who) + ": workspace too small for this shape");
+}
+static void need_bthd(const nb::ndarray<nb::device::cuda>& a, int64_t b, int64_t t, int64_t h, int64_t d,
+                      const char* who, const char* what) {
+    const bool bf16 = a.dtype().code == (uint8_t)nb::dlpack::dtype_code::Bfloat && a.dtype().bits == 16;
+    if (a.ndim() != 4 || !bf16 ||
+        a.shape(0) != (size_t)b || a.shape(1) != (size_t)t || a.shape(2) != (size_t)h || a.shape(3) != (size_t)d)
+        throw std::runtime_error(std::string(who) + ": " + what + " must be a (B, T, H, D) bfloat16 array");
+}
+// The kernels stage rows with 16-byte loads: unit last stride, 16 B base, and
+// leading strides (of non-singleton dims) that keep every row 16 B aligned.
+static void need_staging_layout(const nb::ndarray<nb::device::cuda>& a, const char* who, const char* what) {
+    bool ok = a.stride(3) == 1 && reinterpret_cast<uintptr_t>(a.data()) % 16 == 0;
+    for (int i = 0; i < 3; ++i) ok = ok && (a.shape(i) <= 1 || a.stride(i) % 8 == 0);
+    if (!ok)
+        throw std::runtime_error(std::string(who) + ": " + what
+            + " must have a contiguous last dim, a 16-byte aligned base and leading strides that are multiples of 8");
+}
+static void need_contiguous(const nb::ndarray<nb::device::cuda>& a, const char* who, const char* what) {
+    int64_t expect = 1;
+    for (int i = (int)a.ndim() - 1; i >= 0; --i) {
+        if (a.shape(i) > 1 && a.stride(i) != expect)
+            throw std::runtime_error(std::string(who) + ": " + what + " must be contiguous");
+        expect *= (int64_t)a.shape(i);
+    }
+}
+
+// Workspace dims and slot byte offsets, from the C++ Plan (the one definition).
+nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads) {
+    int64_t v[32];
+    const int n = sol_attn_plan((int)batch, (int)seq_len, (int)num_heads, v, 32);
+    if (n > 32)
+        throw std::runtime_error("sol_attn_plan: Plan grew past the binding's buffer");
+    nb::dict d;
+    for (int i = 0; i < n && sol_attn_plan_names[i]; ++i) d[sol_attn_plan_names[i]] = v[i];
+    return d;
+}
+
+void sol_attn(
+    nb::ndarray<nb::device::cuda> q,
+    nb::ndarray<nb::device::cuda> k,
+    nb::ndarray<nb::device::cuda> v,
+    nb::ndarray<nb::device::cuda> out,
+    nb::ndarray<nb::device::cuda> workspace,
+    int64_t batch, int64_t seq_len, int64_t num_heads, int64_t head_dim,
+    float tau, float scale,
+    int64_t sink_start, int64_t sink_end, int64_t sink_q_start, int64_t sink_q_end,
+    uintptr_t stream_ptr,
+    std::optional<nb::ndarray<nb::device::cuda>> key_bias = std::nullopt,
+    std::optional<nb::ndarray<nb::device::cuda>> threshold = std::nullopt,
+    std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt,
+    bool tail = true)
+{
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
+        throw std::runtime_error("sol_attn: threshold must have B*H*ceil(T/64) elements");
+    if (block_len) check_block_len(*block_len, seq_len, "sol_attn");
+    need_bthd(q, batch, seq_len, num_heads, head_dim, "sol_attn", "q");
+    need_bthd(k, batch, seq_len, num_heads, head_dim, "sol_attn", "k");
+    need_bthd(v, batch, seq_len, num_heads, head_dim, "sol_attn", "v");
+    need_bthd(out, batch, seq_len, num_heads, head_dim, "sol_attn", "out");
+    need_staging_layout(q, "sol_attn", "q");
+    need_staging_layout(k, "sol_attn", "k");
+    need_staging_layout(v, "sol_attn", "v");
+    need_contiguous(out, "sol_attn", "out");
+    need_workspace(workspace, batch, seq_len, num_heads, "sol_attn");
+    if (key_bias) need_elems(*key_bias, batch * seq_len, "sol_attn", "key_bias");
+    // Explicit strides: only the last dim must be contiguous (BHND views go in as-is).
+    launch_sol_attn(
+        q.data(), k.data(), v.data(), out.data(), workspace.data(),
+        (int)batch, (int)seq_len, (int)num_heads, (int)head_dim,
+        tau, scale,
+        key_bias ? key_bias->data() : nullptr,
+        threshold ? threshold->data() : nullptr,
+        block_len ? block_len->data() : nullptr, tail ? 1 : 0,
+        (int)sink_start, (int)sink_end, (int)sink_q_start, (int)sink_q_end,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2), stream);
+}
+
+void sol_producer_begin_py(nb::ndarray<nb::device::cuda> workspace,
+                           int64_t batch, int64_t seq_len, int64_t num_heads,
+                           uintptr_t stream_ptr) {
+    sol_producer_begin(workspace.data(), (int)batch, (int)seq_len,
+                       (int)num_heads, reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void sol_producer_chunk_py(
+    nb::ndarray<nb::device::cuda> workspace, nb::ndarray<nb::device::cuda> qkv,
+    nb::ndarray<nb::device::cuda> fab, nb::ndarray<nb::device::cuda> qw,
+    nb::ndarray<nb::device::cuda> kw, nb::ndarray<nb::device::cuda> kmean,
+    nb::ndarray<nb::device::cuda> vscale,
+    float rope_eps, int64_t rot_dim, int64_t t0, int64_t m,
+    int64_t batch, int64_t seq_len, int64_t num_heads,
+    uintptr_t stream_ptr,
+    std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt) {
+    if (batch != 1)
+        throw std::runtime_error("sol_producer_chunk: the producer path is B=1 only");
+    if (rot_dim <= 0 || rot_dim > 128 || rot_dim % 8)
+        throw std::runtime_error("sol_producer_chunk: rot_dim must be a multiple of 8 in (0, 128]");
+    if (t0 < 0 || m < 0 || t0 + m > seq_len || (m && t0 % 64))
+        throw std::runtime_error("sol_producer_chunk: chunk [t0, t0 + m) must lie in [0, seq_len] with a 64-aligned start");
+    if (block_len) check_block_len(*block_len, seq_len, "sol_producer_chunk");
+    need_workspace(workspace, batch, seq_len, num_heads, "sol_producer_chunk");
+    need_elems(qkv, m * 3 * num_heads * 128, "sol_producer_chunk", "qkv");
+    need_elems(fab, seq_len * rot_dim * 2, "sol_producer_chunk", "fab");
+    need_elems(qw, 128, "sol_producer_chunk", "qw");
+    need_elems(kw, 128, "sol_producer_chunk", "kw");
+    need_elems(kmean, batch * num_heads * 128, "sol_producer_chunk", "kmean");
+    need_elems(vscale, batch * num_heads * 128, "sol_producer_chunk", "vscale");
+    sol_producer_chunk(workspace.data(), qkv.data(), fab.data(), qw.data(),
+                       kw.data(), kmean.data(), vscale.data(),
+                       block_len ? block_len->data() : nullptr,
+                       rope_eps, (int)rot_dim, (int)t0, (int)m,
+                       (int)batch, (int)seq_len, (int)num_heads,
+                       reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void sol_attn_core_py(
+    nb::ndarray<nb::device::cuda> workspace, nb::ndarray<nb::device::cuda> out,
+    nb::ndarray<nb::device::cuda> vscale, nb::ndarray<nb::device::cuda> kmean_next,
+    nb::ndarray<nb::device::cuda> vamax_out,
+    int64_t batch, int64_t seq_len, int64_t num_heads,
+    float tau, float scale,
+    int64_t sink_start, int64_t sink_end, int64_t sink_q_start, int64_t sink_q_end,
+    uintptr_t stream_ptr,
+    std::optional<nb::ndarray<nb::device::cuda>> threshold = std::nullopt,
+    std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt,
+    bool tail = true) {
+    const int64_t stats = batch * num_heads * 128;
+    if ((int64_t)vscale.size() != stats || (int64_t)kmean_next.size() != stats ||
+        (int64_t)vamax_out.size() != stats)
+        throw std::runtime_error("sol_attn_core: vscale/kmean_next/vamax_out must have B*H*128 elements");
+    if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
+        throw std::runtime_error("sol_attn_core: threshold must have B*H*ceil(T/64) elements");
+    if (block_len) check_block_len(*block_len, seq_len, "sol_attn_core");
+    need_workspace(workspace, batch, seq_len, num_heads, "sol_attn_core");
+    need_elems(out, batch * seq_len * num_heads * 128, "sol_attn_core", "out");
+    launch_sol_attn_core(
+        workspace.data(), out.data(), vscale.data(), kmean_next.data(), vamax_out.data(),
+        block_len ? block_len->data() : nullptr, tail ? 1 : 0,
+        (int)batch, (int)seq_len, (int)num_heads,
+        tau, scale, threshold ? threshold->data() : nullptr,
+        (int)sink_start, (int)sink_end, (int)sink_q_start, (int)sink_q_end,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for fused AdaLN (LayerNorm statistics)
@@ -3699,6 +3892,45 @@ NB_MODULE(_C, m) {
           nb::arg("kt"), nb::arg("kh"), nb::arg("kw"),
           nb::arg("causal_t"), nb::arg("causal_h"), nb::arg("causal_w"),
           nb::arg("scale"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
+
+    m.def("sol_attn_plan", &sol_attn_plan_py,
+          "Workspace dims, slot byte offsets and total bytes for this shape",
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"));
+
+    m.def("sol_attn", &sol_attn,
+          "Sol-Attn training-free sparse attention (BF16 in/out, head_dim 128)",
+          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("out"),
+          nb::arg("workspace"),
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
+          nb::arg("head_dim"),
+          nb::arg("tau"), nb::arg("scale"),
+          nb::arg("sink_start"), nb::arg("sink_end"),
+          nb::arg("sink_q_start"), nb::arg("sink_q_end"),
+          nb::arg("stream_ptr"),
+          nb::arg("key_bias") = nb::none(),
+          nb::arg("threshold") = nb::none(),
+          nb::arg("block_len") = nb::none(),
+          nb::arg("tail") = true);
+
+    m.def("sol_producer_begin", &sol_producer_begin_py,
+          nb::arg("workspace"), nb::arg("batch"), nb::arg("seq_len"),
+          nb::arg("num_heads"), nb::arg("stream_ptr"));
+    m.def("sol_producer_chunk", &sol_producer_chunk_py,
+          nb::arg("workspace"), nb::arg("qkv"), nb::arg("fab"), nb::arg("qw"),
+          nb::arg("kw"), nb::arg("kmean"), nb::arg("vscale"),
+          nb::arg("rope_eps"), nb::arg("rot_dim"), nb::arg("t0"), nb::arg("m"),
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
+          nb::arg("stream_ptr"), nb::arg("block_len") = nb::none());
+    m.def("sol_attn_core", &sol_attn_core_py,
+          nb::arg("workspace"), nb::arg("out"), nb::arg("vscale"),
+          nb::arg("kmean_next"), nb::arg("vamax_out"),
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
+          nb::arg("tau"), nb::arg("scale"),
+          nb::arg("sink_start"), nb::arg("sink_end"),
+          nb::arg("sink_q_start"), nb::arg("sink_q_end"), nb::arg("stream_ptr"),
+          nb::arg("threshold") = nb::none(),
+          nb::arg("block_len") = nb::none(),
+          nb::arg("tail") = true);
 
     m.def("flash_attention_decode", &flash_attention_decode,
           "Flash Attention decode over a fixed-capacity variable-length KV cache",
