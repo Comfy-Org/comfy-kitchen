@@ -1350,7 +1350,8 @@ inline bool use_gfx12_convrot_packed_none() {
     auto select = [device] {
         hipDeviceProp_t properties{};
         return hipGetDeviceProperties(&properties, device) == hipSuccess &&
-            std::strncmp(properties.gcnArchName, "gfx12", 5) == 0 &&
+            (std::strcmp(properties.gcnArchName, "gfx1170") == 0 ||
+             std::strncmp(properties.gcnArchName, "gfx12", 5) == 0) &&
             properties.warpSize == 32 && properties.maxThreadsPerBlock >= 512;
     };
     if (device < 0 || device >= kMaxDevices) return select();

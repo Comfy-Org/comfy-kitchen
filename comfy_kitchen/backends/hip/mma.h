@@ -18,7 +18,7 @@
 //          free. Fragment width is the K-step: 16B iu8, 8B iu4, 32B bf16 for fp8.
 //
 // Accumulators are v8f/v8i on both, column lane % 16, but the row differs:
-// gfx12 gives each half-wave a contiguous block, D[e + 8 * (lane / 16)]; gfx11
+// gfx12/gfx117 give each half-wave a contiguous block, D[e + 8 * (lane / 16)]; gfx11
 // interleaves the halves, D[2 * e + (lane / 16)]. See acc_row. rocWMMA's "padded
 // acc" gfx11 quirk applies to the 16-bit accumulators, not these.
 //
@@ -144,7 +144,7 @@ __forceinline__ __device__ typename Mma::Frag load_frag_16bit(const typename Mma
 // Policies
 // ---------------------------------------------------------------------------
 
-#if defined(COMFY_MMA_GFX12)
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX117)
 
 struct MmaFp8 {
     using Acc = v8f;

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""HIP backend for AMD RDNA2, RDNA3/3.5 and RDNA4.
+"""HIP backend for AMD RDNA2, RDNA3/3.5, RDNA4 and gfx117x.
 
 Every matmul is a WMMA kernel compiled from the sources in this directory; the
 backend does not link or call hipBLAS/hipBLASLt.
@@ -183,8 +183,8 @@ def _visible_gfx_arches() -> tuple[str | None, ...]:
     return tuple(_gfx_arch(i) for i in range(torch.cuda.device_count()))
 
 
-# RDNA2 has no matrix cores; RDNA3/3.5 and RDNA4 do. This exact manifest is also
-# consumed by setup.py and CMake. Never infer support from a gfx prefix: a new
+# RDNA2 has no matrix cores; RDNA3/3.5, gfx117x and RDNA4 do. This exact manifest
+# is also consumed by setup.py and CMake. Never infer support from a gfx prefix: a new
 # compiler-recognized target needs its WMMA policy reviewed before it is safe.
 _ARCH_MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "architectures.json")
 _ARCH_GROUPS = json.loads(
@@ -192,14 +192,17 @@ _ARCH_GROUPS = json.loads(
 )
 _ARCH_ELEMENTWISE_ONLY = frozenset(_ARCH_GROUPS["elementwise_only"])
 _ARCH_WMMA_GFX11 = frozenset(_ARCH_GROUPS["wmma_gfx11"])
+_ARCH_WMMA_GFX117 = frozenset(_ARCH_GROUPS.get("wmma_gfx117", []))
 _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
-_ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
+_ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX117 | _ARCH_WMMA_GFX12
 _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
+
+_GFX117_WMMA_POLICIES_READY = True
 
 
 def _has_nonduplicated_wmma(device: torch.device | int | None = None) -> bool:
     """Whether WMMA operands use the gfx12 128-bit layout."""
-    return _gfx_arch(device) in _ARCH_WMMA_GFX12
+    return _gfx_arch(device) in (_ARCH_WMMA_GFX12 | _ARCH_WMMA_GFX117)
 
 # The GEMMs, and only the GEMMs, need matrix cores. Everything else is elementwise
 # or a scalar reduction and runs on any supported architecture. This set names the
@@ -247,7 +250,13 @@ def _has_wmma(arches: Sequence[str | None]) -> bool:
     the capability set has to be the intersection over the visible devices: one
     RDNA2 card in an otherwise RDNA4 box means no GEMM is safe to advertise.
     """
-    return bool(arches) and all(a in _ARCH_WMMA for a in arches)
+    if not arches or any(a is None for a in arches):
+        return False
+    if not all(a in _ARCH_WMMA for a in arches):
+        return False
+    if any(a in _ARCH_WMMA_GFX117 for a in arches) and not _GFX117_WMMA_POLICIES_READY:
+        return False
+    return True
 
 
 def is_available() -> bool:

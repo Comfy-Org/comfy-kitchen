@@ -25,7 +25,8 @@ inline bool use_nonduplicated_int8_schedule() {
     auto select = [device] {
         hipDeviceProp_t properties{};
         return hipGetDeviceProperties(&properties, device) == hipSuccess &&
-            std::strncmp(properties.gcnArchName, "gfx12", 5) == 0;
+            (std::strcmp(properties.gcnArchName, "gfx1170") == 0 ||
+             std::strncmp(properties.gcnArchName, "gfx12", 5) == 0);
     };
     if (device < 0 || device >= kMaxDevices) return select();
 
