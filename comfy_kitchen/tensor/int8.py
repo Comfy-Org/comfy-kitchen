@@ -442,10 +442,11 @@ class TensorWiseINT8Layout(QuantizedLayout):
     @classmethod
     def is_fusion_weight(cls, weight: torch.Tensor) -> bool:
         """Whether ``weight`` has the logical layout compound ops require."""
+        if not isinstance(weight, QuantizedTensor) or weight._layout_cls != cls.__name__:
+            return False
+        _, params = _wmma_storage(weight)
         return (
-            isinstance(weight, QuantizedTensor)
-            and weight._layout_cls == cls.__name__
-            and not getattr(weight._params, "transposed", False)
+            not getattr(params, "transposed", False)
         )
 
     @classmethod
@@ -707,16 +708,17 @@ def _handle_int8_transpose(qt, args, kwargs):
     if not isinstance(input_tensor, QuantizedTensor):
         return torch.ops.aten.t.default(*args, **kwargs)
 
-    if getattr(input_tensor._params, "wmma_tile_n", 0):
+    qdata, params = _wmma_storage(input_tensor)
+    if getattr(params, "wmma_tile_n", 0):
         return input_tensor.dequantize().t()
 
-    old = input_tensor._params
+    old = params
     new_params = dataclasses.replace(
         old,
         orig_shape=(old.orig_shape[1], old.orig_shape[0]),
         transposed=not old.transposed,
     )
-    return QuantizedTensor(input_tensor._qdata, "TensorWiseINT8Layout", new_params)
+    return QuantizedTensor(qdata, "TensorWiseINT8Layout", new_params)
 
 
 @register_layout_op(torch.ops.aten.linear.default, TensorWiseINT8Layout)

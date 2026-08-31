@@ -47,6 +47,29 @@ def test_int8_attention_cta_k_selection():
     assert select(128, 1025, has_mask=True) == 64
 
 
+@pytest.mark.parametrize(
+    ("scale", "expected"),
+    [(0.5, 0.5), (2, 2.0), (torch.tensor(0.5), 0.5), (torch.tensor([0.5]), 0.5)],
+)
+def test_attention_scale_accepts_numeric_scalars(scale, expected):
+    assert sage_attention_module._validate_attention_scale(scale, 1.0) == expected
+
+
+@pytest.mark.parametrize(
+    ("scale", "error"),
+    [
+        (torch.ones(2), ValueError),
+        ("0.5", TypeError),
+        (True, TypeError),
+        (float("nan"), ValueError),
+        (torch.tensor(float("inf")), ValueError),
+    ],
+)
+def test_attention_scale_rejects_invalid_values(scale, error):
+    with pytest.raises(error, match="scale"):
+        sage_attention_module._validate_attention_scale(scale, 1.0)
+
+
 def test_prequantized_attention_rejects_cpu_tensors():
     packed = sage_attention_module.PrequantizedInt8Attention(
         q=torch.empty(1, 1, 1, 64, dtype=torch.int8),

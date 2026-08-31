@@ -19,6 +19,7 @@ from .float_utils import from_blocked, swap_nibbles, to_blocked
 from .registry import registry
 from .sage_attention import (
     PrequantizedInt8Attention,
+    _validate_attention_scale,
     int8_attention,
     int8_attention_from_prequantized,
     prequantize_int8_attention,
@@ -179,6 +180,7 @@ def hip_attention(
         bool(getattr(torch.version, "hip", None)) and registry.is_available("hip")
     ):
         raise RuntimeError("HIP attention requires the HIP backend")
+    scale = _validate_attention_scale(scale, 1.0 / (q.shape[-1] ** 0.5))
     return _hip_backend.hip_attention(q, k, v, scale)
 
 
@@ -196,7 +198,7 @@ def hip_int8_attention(
         bool(getattr(torch.version, "hip", None)) and registry.is_available("hip")
     ):
         raise RuntimeError("INT8 HIP attention requires the HIP backend")
-    resolved_scale = float(scale if scale is not None else q.shape[-1] ** -0.5)
+    resolved_scale = _validate_attention_scale(scale, q.shape[-1] ** -0.5)
     return _hip_backend.hip_int8_attention(q, k, v, resolved_scale)
 def sol_attn(
     q: torch.Tensor,

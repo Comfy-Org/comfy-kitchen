@@ -18,12 +18,35 @@ import importlib.util
 import json
 import logging
 import math
+import numbers
 import os
 import pathlib
 import sys
 from collections.abc import Sequence
 
 import torch
+
+
+def _validate_attention_scale(scale: object, default: float) -> float:
+    """Normalize the public HIP attention scale contract."""
+    if scale is None:
+        return default
+    if isinstance(scale, torch.Tensor):
+        if scale.numel() != 1:
+            raise ValueError(f"scale must be a scalar, got shape {tuple(scale.shape)}")
+        if scale.is_complex():
+            raise TypeError(f"scale must be a real numeric scalar, got {scale.dtype}")
+        try:
+            value = float(scale.item())
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise TypeError(f"scale must be a real numeric scalar, got {scale.dtype}") from error
+    elif isinstance(scale, numbers.Real) and not isinstance(scale, bool):
+        value = float(scale)
+    else:
+        raise TypeError(f"scale must be a real numeric scalar, got {type(scale).__name__}")
+    if not math.isfinite(value):
+        raise ValueError(f"scale must be finite, got {value}")
+    return value
 
 from comfy_kitchen._rope_utils import check_rope_inplace, trim_rope_freqs
 from comfy_kitchen.backends import eager as _eager
@@ -2484,7 +2507,7 @@ def hip_attention(
         device=q.device,
         dtype=q.dtype,
     ).movedim(1, 2)
-    resolved_scale = float(scale if scale is not None else 1.0 / math.sqrt(q.shape[3]))
+    resolved_scale = _validate_attention_scale(scale, 1.0 / math.sqrt(q.shape[3]))
     _C.bf16_sdpa_hip(
         _dl(q), _dl(k), _dl(v), _dl(output), resolved_scale, _stream(q)
     )
@@ -2515,6 +2538,7 @@ def hip_int8_attention(
     scale: float,
 ) -> torch.Tensor:
     """Run INT8 attention, retaining BF16 for overhead-bound short calls."""
+    scale = _validate_attention_scale(scale, 1.0 / math.sqrt(q.shape[3]))
     # Capability is checked by the public caller; any supported sub-1024 or
     # multi-batch contract is one of the measured BF16 short routes.
     if q.shape[0] > 1 or q.shape[2] < 1024:
@@ -3388,6 +3412,7 @@ def sage_int8_sdpa(
 ) -> torch.Tensor:
     """Quantize and attend in one call. q, k and v are already padded to a
     supported head dimension; the output keeps that width."""
+    attention_scale = _validate_attention_scale(attention_scale, 1.0)
     batch, q_heads, q_length, head_dim = q.shape
     output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
     output = torch.empty(
@@ -3459,6 +3484,7 @@ def sage_int8_attend(
     cta_k: int = _SAGE_CTA_K,
 ) -> torch.Tensor:
     """Attend over the packed layouts sage_int8_quantize produced."""
+    attention_scale = _validate_attention_scale(attention_scale, 1.0)
     batch, q_heads, q_length, head_dim = q_int8.shape
     output = torch.empty(
         batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q_int8.device
