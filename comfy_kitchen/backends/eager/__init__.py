@@ -80,7 +80,6 @@ from .convrot_w4a4 import (
     quantize_convrot_w4a4_weight,
 )
 from .na import na3d
-from .residual import rms_gated_residual
 from .quantization import (
     dequantize_int8_convrot_weight,
     dequantize_int8_convrot_weight_dtype,
@@ -93,12 +92,12 @@ from .quantization import (
     int8_linear,
     int8_linear_gated_residual,
     int8_linear_modulated,
-    int8_linear_rms_modulated,
     int8_linear_pair,
     int8_linear_pair_modulated,
-    int8_linear_triple_modulated,
     int8_linear_pair_rms_modulated,
+    int8_linear_rms_modulated,
     int8_linear_swiglu_split,
+    int8_linear_triple_modulated,
     quantize_and_rotate_rowwise,
     quantize_int8_convrot_weight,
     quantize_int8_rowwise,
@@ -111,6 +110,7 @@ from .quantization import (
     scaled_mm_nvfp4,
     stochastic_rounding_fp8,
 )
+from .residual import rms_gated_residual
 from .rope import (
     apply_rope,
     apply_rope1,

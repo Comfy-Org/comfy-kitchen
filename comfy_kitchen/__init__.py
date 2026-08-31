@@ -40,7 +40,7 @@ from .tensor.w4a8_int8 import (
 # ROCm PyTorch build so CUDA/CPU processes do not pay the import cost or acquire
 # an unrelated GPU runtime merely because a combined wheel contains the module.
 if getattr(torch.version, "hip", None):
-    from .backends import hip as _hip_backend  # noqa: F401
+    from .backends import hip as _hip_backend
 
     # The HIP backend registers only on a supported AMD device (RDNA2/3/3.5/4),
     # and advertises only the ops that device can run; prefer it where it registers.

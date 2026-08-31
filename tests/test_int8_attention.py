@@ -8,6 +8,7 @@ import torch
 
 import comfy_kitchen as ck
 import comfy_kitchen.sage_attention as sage_attention_module
+
 from .conftest import (
     skip_unless_gfx12_wmma,
 )

@@ -26,6 +26,22 @@ from collections.abc import Sequence
 
 import torch
 
+from comfy_kitchen._rope_utils import check_rope_inplace, trim_rope_freqs
+from comfy_kitchen.backends import eager as _eager
+from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
+from comfy_kitchen.backends._activations import input_act_code as _input_act_code
+from comfy_kitchen.backends._activations import input_act_width as _input_act_width
+from comfy_kitchen.backends.eager import rope as _eager_rope
+from comfy_kitchen.backends.eager.quantization import DTYPE_CODE_TO_DTYPE, DTYPE_TO_CODE
+from comfy_kitchen.backends.eager.w4a8_int8 import (
+    _QUANT_ROW_ELEM_BUDGET,
+    _decide_codebook,
+    _dequantize_w4a8_int8_weight_from_int8,
+    _quantize_w4a8_chunked,
+    validate_w4a8_operands,
+    validate_w4a8_weight_shape,
+)
+
 
 def _validate_attention_scale(scale: object, default: float) -> float:
     """Normalize the public HIP attention scale contract."""
@@ -48,21 +64,6 @@ def _validate_attention_scale(scale: object, default: float) -> float:
         raise ValueError(f"scale must be finite, got {value}")
     return value
 
-from comfy_kitchen._rope_utils import check_rope_inplace, trim_rope_freqs
-from comfy_kitchen.backends import eager as _eager
-from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
-from comfy_kitchen.backends._activations import input_act_code as _input_act_code
-from comfy_kitchen.backends._activations import input_act_width as _input_act_width
-from comfy_kitchen.backends.eager import rope as _eager_rope
-from comfy_kitchen.backends.eager.quantization import DTYPE_CODE_TO_DTYPE, DTYPE_TO_CODE
-from comfy_kitchen.backends.eager.w4a8_int8 import (
-    _QUANT_ROW_ELEM_BUDGET,
-    _decide_codebook,
-    _dequantize_w4a8_int8_weight_from_int8,
-    _quantize_w4a8_chunked,
-    validate_w4a8_operands,
-    validate_w4a8_weight_shape,
-)
 
 logger = logging.getLogger("comfy_kitchen.hip")
 
@@ -852,13 +853,14 @@ def int8_linear(
                 convrot_groupsize, input_act, _weight_tile_k, _dual_m,
             )
             return torch.addcmul(_residual, _gate, projected)
-    if _weight_tile_k:
-        if (not _tiled_b_supported(x, m, n, k, out_dtype, _weight_tile_k)
-                or input_act is not None):
-            raise ValueError(
-                "tiled-B INT8 linear requires non-duplicated WMMA BF16, M>=96, "
-                "N divisible by 128, K divisible by tile_k, and no input activation"
-            )
+    if _weight_tile_k and (
+        not _tiled_b_supported(x, m, n, k, out_dtype, _weight_tile_k)
+        or input_act is not None
+    ):
+        raise ValueError(
+            "tiled-B INT8 linear requires non-duplicated WMMA BF16, M>=96, "
+            "N divisible by 128, K divisible by tile_k, and no input activation"
+        )
     # The WMMA K-step and the small-M GEMV both read a row 16 bytes at a time.
     if k % 16 != 0:
         raise ValueError(f"int8_linear requires K divisible by 16, got {k}")

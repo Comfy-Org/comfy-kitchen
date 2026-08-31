@@ -8,7 +8,6 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
-from .conftest import skip_unless_gfx12_wmma
 from comfy_kitchen.backends.eager import w4a8_int8 as eager_w4a8
 from comfy_kitchen.backends.eager.convrot_w4a4 import _unpack_int4_row_major
 from comfy_kitchen.backends.eager.quantization import (
@@ -25,6 +24,8 @@ from comfy_kitchen.tensor import (
     TensorWiseINT8Layout,
 )
 from comfy_kitchen.tensor.int8_utils import _build_hadamard
+
+from .conftest import skip_unless_gfx12_wmma
 
 
 def _unavailable_reason() -> str | None:
@@ -210,7 +211,9 @@ def test_int8_linear_pair_reuses_exact_convrot_quantization():
                 x, weight_q, weight_scale.reshape(-1), bias,
                 torch.bfloat16, convrot=True, convrot_groupsize=256,
             )
-            for (weight_q, weight_scale), bias in zip(quantized, biases)
+            for (weight_q, weight_scale), bias in zip(
+                quantized, biases, strict=True
+            )
         )
         outputs = ck.int8_linear_pair(
             x,
