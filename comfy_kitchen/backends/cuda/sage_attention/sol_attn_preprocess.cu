@@ -128,7 +128,8 @@ __global__ void prep_q(const __nv_bfloat16* __restrict__ q, const float* __restr
                        int8_t* __restrict__ cen8, float* __restrict__ cens,
                        float* __restrict__ qmean,   // [B*H, NPAD, HD] f32 block means
                        const int32_t* __restrict__ blen,
-                       int T, int H, int NQ, int NPAD, float tau, float log2s,
+                       int T, int H, int NQ, int NPAD, int emit_sol_carriers,
+                       float tau, float log2s,
                        int64_t sb, int64_t st, int64_t sh) {
     __shared__ __align__(16) __nv_bfloat16 sQ[BLK * LD_TILE];
     __shared__ __align__(16) float sred[HD];
@@ -139,7 +140,9 @@ __global__ void prep_q(const __nv_bfloat16* __restrict__ q, const float* __restr
     stage_tile64(sQ, q + batch * sb + (int64_t)t0 * st + head * sh, st, len);
     __syncthreads();
     const size_t tok0 = (size_t)batch * T + t0;
-    quant_q_rows(sQ, len, nrows, qiP + (tok0 * H + head) * HD, qs + tok0 * H + head, H);
+    if (emit_sol_carriers)
+        quant_q_rows(sQ, len, nrows, qiP + (tok0 * H + head) * HD,
+                     qs + tok0 * H + head, H);
     __syncthreads();
     const size_t qrow = (size_t)bh * NQ + qb;
     const float c = centroid_quant(sQ, len, sred, cen8 + qrow * HD, cens + qrow);
@@ -232,6 +235,7 @@ void launch_sol_preprocess(
     const void* key_bias,    // [B, T] f32 in log2 units, or nullptr
     const void* blen,        // [NTB] int32 valid tokens per block, or nullptr
     int B, int T, int Tp, int H, int NTB, int NPAD, int NQ,
+    int emit_sol_carriers,
     int64_t qs_b, int64_t qs_t, int64_t qs_h,
     int64_t ks_b, int64_t ks_t, int64_t ks_h,
     int64_t vs_b, int64_t vs_t, int64_t vs_h,
@@ -251,10 +255,12 @@ void launch_sol_preprocess(
     prep_q<<<dim3(NQ, B * H), HD, 0, stream>>>(
         (const __nv_bfloat16*)q, s.kcvar, (int8_t*)qiP, (float*)qs, (float*)threshold,
         (int8_t*)cen8, (float*)cens, (float*)qmean, (const int32_t*)blen,
-        T, H, NQ, NPAD, tau, scale_log2, qs_b, qs_t, qs_h);
-    prep_k<<<dim3(NTB, B * H), HD, 0, stream>>>(
-        (const __nv_bfloat16*)k, s.kmean, (int8_t*)kiP, (float2*)ksb,
-        (const float*)key_bias, (const int32_t*)blen, T, Tp, H, ks_b, ks_t, ks_h);
+        T, H, NQ, NPAD, emit_sol_carriers, tau, scale_log2, qs_b, qs_t, qs_h);
+    if (emit_sol_carriers)
+        prep_k<<<dim3(NTB, B * H), HD, 0, stream>>>(
+            (const __nv_bfloat16*)k, s.kmean, (int8_t*)kiP, (float2*)ksb,
+            (const float*)key_bias, (const int32_t*)blen, T, Tp, H,
+            ks_b, ks_t, ks_h);
 }
 
 size_t sol_preprocess_scratch_bytes(int B, int H, int NPAD) {
