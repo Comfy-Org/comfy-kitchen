@@ -539,6 +539,14 @@ _convrot_max_k: dict[tuple[int, torch.dtype], int] = {}
 _CONVROT_SPILL_WORKSPACE_BYTES = 32 << 20
 
 
+def _convrot_int8_needs_spill(
+    m: int, k: int, input_dtype_code: int, device: torch.device
+) -> bool:
+    """Query the ConvRot capability for the operand's device."""
+    with torch.cuda.device(device):
+        return bool(_C.convrot_int8_needs_spill(m, k, input_dtype_code))
+
+
 def _convrot_supported(
     k: int, group_size: int, device: torch.device, dtype: torch.dtype,
     *, int8_global_spill: bool = False,
@@ -580,8 +588,8 @@ def _rotate_quant_int8(
     # check_convrot_k queries the current device's LDS budget, so pin it to the
     # operand's device rather than trusting the caller thread's current device.
     with torch.cuda.device(x2d.device):
-        if group_size != 256 or not _C.convrot_int8_needs_spill(
-            m, k, DTYPE_TO_CODE[x2d.dtype]
+        if group_size != 256 or not _convrot_int8_needs_spill(
+            m, k, DTYPE_TO_CODE[x2d.dtype], x2d.device
         ):
             _C.quantize_int8_convrot(
                 _dl(_aligned(x_arg)), _dl(_aligned(q)), _dl(_aligned(scales)),
@@ -1029,7 +1037,9 @@ def int8_linear_modulated(
         and out_dtype == torch.bfloat16
         and convrot
         and convrot_groupsize == 256
-        and not _C.convrot_int8_needs_spill(m, k, DTYPE_TO_CODE[x2d.dtype])
+        and not _convrot_int8_needs_spill(
+            m, k, DTYPE_TO_CODE[x2d.dtype], x2d.device
+        )
     )
     use_scale_fused = (
         modulation_shift is None
@@ -1405,7 +1415,9 @@ def int8_linear_pair_modulated(
         and out_dtype == torch.bfloat16
         and convrot
         and convrot_groupsize == 256
-        and not _C.convrot_int8_needs_spill(m, k, DTYPE_TO_CODE[x.dtype])
+        and not _convrot_int8_needs_spill(
+            m, k, DTYPE_TO_CODE[x.dtype], x.device
+        )
     )
     use_scale_fused = (
         modulation_shift is None
@@ -1505,7 +1517,9 @@ def int8_linear_triple_modulated(
         and out_dtype == torch.bfloat16
         and convrot
         and convrot_groupsize == 256
-        and not _C.convrot_int8_needs_spill(m, k, DTYPE_TO_CODE[x2d.dtype])
+        and not _convrot_int8_needs_spill(
+            m, k, DTYPE_TO_CODE[x2d.dtype], x2d.device
+        )
     )
     if not use_fused:
         if weight_tile_k:

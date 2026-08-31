@@ -178,6 +178,9 @@ class QuantizedTensor(torch.Tensor):
         self._qdata = qdata
         self._layout_cls = layout_cls
         self._params = params
+        # Keep the physical storage and its metadata together.  WMMA packing
+        # replaces both references as one immutable operation snapshot.
+        self._wmma_state = (qdata, params)
 
     def __repr__(self) -> str:
         return (
@@ -226,6 +229,10 @@ class QuantizedTensor(torch.Tensor):
     @property
     def params(self) -> Any:
         return self._params
+
+    def _state_snapshot(self) -> tuple[torch.Tensor, Any]:
+        """Return matching quantized storage and metadata for one operation."""
+        return self._wmma_state
 
     # ==================== Factory Methods ====================
 
@@ -296,7 +303,8 @@ class QuantizedTensor(torch.Tensor):
         return full
 
     def state_dict(self, prefix: str = "") -> dict[str, torch.Tensor]:
-        tensors = self.layout_cls.state_dict_tensors(self._qdata, self._params)
+        qdata, params = self._state_snapshot()
+        tensors = self.layout_cls.state_dict_tensors(qdata, params)
         return {f"{prefix}{suffix}": tensor for suffix, tensor in tensors.items()}
 
     def requantize_from_float(self, tensor: torch.Tensor, **kwargs) -> QuantizedTensor:
@@ -311,12 +319,13 @@ class QuantizedTensor(torch.Tensor):
     # ==================== Flatten/Unflatten Protocol ====================
 
     def __tensor_flatten__(self):
+        _, params = self._state_snapshot()
         inner_tensors = ["_qdata"]
         tensor_fields = {}
         non_tensor_fields = {}
 
-        for field in dataclasses.fields(self._params):
-            value = getattr(self._params, field.name)
+        for field in dataclasses.fields(params):
+            value = getattr(params, field.name)
             if isinstance(value, torch.Tensor):
                 attr_name = f"_param_{field.name}"
                 object.__setattr__(self, attr_name, value)
@@ -463,6 +472,7 @@ def _handle_copy_(qt, args, kwargs):
     dst._qdata.copy_(src._qdata, non_blocking=non_blocking)
     dst._params.copy_from(src._params, non_blocking=non_blocking)
     dst._params = dataclasses.replace(dst._params, orig_dtype=dst_orig_dtype)
+    dst._wmma_state = (dst._qdata, dst._params)
     return dst
 
 

@@ -36,10 +36,7 @@ _WMMA_ROW_MAJOR_ONLY_SHAPES = frozenset({
 
 def _wmma_storage(qtensor: QuantizedTensor):
     """Atomically snapshot runtime WMMA storage and its matching parameters."""
-    state = getattr(qtensor, "_wmma_state", None)
-    if state is not None:
-        return state
-    return qtensor._qdata, qtensor._params
+    return qtensor._state_snapshot()
 
 _INT8_DEQUANT_DTYPE_TO_CODE = {
     torch.float32: 0,
@@ -145,7 +142,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
         """
         if not isinstance(qtensor, QuantizedTensor) or qtensor._layout_cls != cls.__name__:
             raise TypeError("pack_wmma_weight_ requires a TensorWiseINT8Layout tensor")
-        params = qtensor._params
+        _, params = _wmma_storage(qtensor)
         if not getattr(params, "is_weight", True):
             raise ValueError("Only INT8 weights can use WMMA-tiled storage")
         if getattr(params, "transposed", False) or len(params.orig_shape) != 2:
@@ -203,7 +200,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
         """
         if not isinstance(qtensor, QuantizedTensor) or qtensor._layout_cls != cls.__name__:
             return 0
-        params = qtensor._params
+        _, params = _wmma_storage(qtensor)
         existing = getattr(params, "wmma_tile_k", 0)
         if existing:
             return existing
@@ -218,8 +215,9 @@ class TensorWiseINT8Layout(QuantizedLayout):
                 return 0
         except (AttributeError, RuntimeError):
             return 0
+        qdata, _ = _wmma_storage(qtensor)
         if (not _uses_nonduplicated_wmma(input_tensor.device)
-                or qtensor._qdata.device != input_tensor.device):
+                or qdata.device != input_tensor.device):
             return 0
         if len(params.orig_shape) != 2 or input_tensor.ndim == 0:
             return 0
@@ -247,14 +245,15 @@ class TensorWiseINT8Layout(QuantizedLayout):
         """Whether this call can consume an already tiled physical weight."""
         if not isinstance(qtensor, QuantizedTensor) or qtensor._layout_cls != cls.__name__:
             return False
-        params = qtensor._params
+        _, params = _wmma_storage(qtensor)
         tile_n = getattr(params, "wmma_tile_n", 0)
         tile_k = getattr(params, "wmma_tile_k", 0)
         if tile_n != 128 or tile_k not in (64, 128):
             return False
         if input_tensor.dtype != torch.bfloat16 or input_tensor.device.type != "cuda":
             return False
-        if qtensor._qdata.device != input_tensor.device or input_tensor.ndim == 0:
+        qdata, _ = _wmma_storage(qtensor)
+        if qdata.device != input_tensor.device or input_tensor.ndim == 0:
             return False
         if (not _uses_nonduplicated_wmma(input_tensor.device)
                 or len(params.orig_shape) != 2):
@@ -389,7 +388,8 @@ class TensorWiseINT8Layout(QuantizedLayout):
         Returns:
             Tuple of (quantized_data, scale).
         """
-        return qtensor._qdata, qtensor._params.scale
+        qdata, params = _wmma_storage(qtensor)
+        return qdata, params.scale
 
     @classmethod
     def _fusion_operand(
@@ -402,16 +402,16 @@ class TensorWiseINT8Layout(QuantizedLayout):
         """Resolve private storage needed by compound INT8 operations."""
         if not isinstance(weight, QuantizedTensor) or weight._layout_cls != cls.__name__:
             return None
-        params = weight._params
+        qdata, params = _wmma_storage(weight)
         if getattr(params, "transposed", False):
             return None
         if prepare:
             cls.prepare_wmma_weight_(weight, x)
-            params = weight._params
+            qdata, params = _wmma_storage(weight)
         tile_k = int(getattr(params, "wmma_tile_k", 0))
         if tile_k and not cls.wmma_weight_is_supported(weight, x):
             return None
-        qdata, scale = cls.get_plain_tensors(weight)
+        scale = params.scale
         return (
             qdata.contiguous(),
             scale,
@@ -676,7 +676,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
     @classmethod
     def requantize_kwargs(cls, qtensor: QuantizedTensor) -> dict[str, object]:
         """Return INT8 quantization options needed to preserve this layout."""
-        params = qtensor._params
+        _, params = _wmma_storage(qtensor)
         is_weight = getattr(params, "is_weight", True)
         convrot = getattr(params, "convrot", False)
         return {
@@ -780,20 +780,20 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
     # Usually mm is called with weight as the second argument
     if not isinstance(weight, QuantizedTensor) or weight._layout_cls != "TensorWiseINT8Layout":
         return torch.mm(*dequantize_args(args), **dequantize_args(kwargs))
-    if getattr(weight._params, "wmma_tile_n", 0):
+    weight_qdata, weight_params = _wmma_storage(weight)
+    if getattr(weight_params, "wmma_tile_n", 0):
         return torch.mm(*dequantize_args(args), **dequantize_args(kwargs))
 
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    weight_qdata, weight_params = _wmma_storage(weight)
     weight_scale = weight_params.scale
     out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
 
     convrot = getattr(weight_params, "convrot", False)
     convrot_groupsize = getattr(weight_params, "convrot_groupsize", 256)
 
-    if getattr(weight._params, "transposed", False):
+    if getattr(weight_params, "transposed", False):
         # Common decomposition: linear(x, W) -> mm(x, W.t()). Storage is still
         # W [N, K], and logical RHS is W.T [K, N].
         int8_weight = weight_qdata.contiguous()
@@ -826,20 +826,20 @@ def _handle_int8_addmm_tensorwise(qt, args, kwargs):
 
     if not isinstance(weight, QuantizedTensor) or weight._layout_cls != "TensorWiseINT8Layout":
         return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
-    if getattr(weight._params, "wmma_tile_n", 0):
+    weight_qdata, weight_params = _wmma_storage(weight)
+    if getattr(weight_params, "wmma_tile_n", 0):
         return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
 
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    weight_qdata, weight_params = _wmma_storage(weight)
     weight_scale = weight_params.scale
     out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
 
-    convrot = getattr(weight._params, "convrot", False)
-    convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
+    convrot = getattr(weight_params, "convrot", False)
+    convrot_groupsize = getattr(weight_params, "convrot_groupsize", 256)
 
-    if getattr(weight._params, "transposed", False):
+    if getattr(weight_params, "transposed", False):
         int8_weight = weight_qdata.contiguous()
     elif weight_scale.numel() == 1 and not convrot:
         int8_weight = weight_qdata.t().contiguous()
