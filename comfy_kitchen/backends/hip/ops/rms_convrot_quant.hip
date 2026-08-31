@@ -22,12 +22,15 @@ extern "C" void launch_quantize_int8_convrot_rms_modulated_fused_stats_kernel(
     if (M == 0) return;
 
     if (use_convrot_packed_schedule()) {
+        // <ACT, SWIGLU, PACK_QUANT, PACKED_ELEMENT_SCHEDULE, RMS, MODULATE, ...>
+        // This path enables both packed quantization and packed element loads.
         convrot_quant_512x2_bf16_kernel<
             kActNone, false, false, true, true, true, true, true>
             <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
                 x, modulation_scale, 2, static_cast<int8_t*>(q),
                 static_cast<float*>(scales), M, K, norm_weight, eps);
     } else {
+        // The fallback keeps PACK_QUANT enabled but disables the packed element schedule.
         convrot_quant_512x2_bf16_kernel<
             kActNone, false, false, true, false, true, true>
             <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(

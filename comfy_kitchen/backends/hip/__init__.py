@@ -584,7 +584,8 @@ def _rotate_quant_int8(
             m, k, DTYPE_TO_CODE[x2d.dtype]
         ):
             _C.quantize_int8_convrot(
-                _dl(x_arg), _dl(q), _dl(scales), None, None, m, k,
+                _dl(_aligned(x_arg)), _dl(_aligned(q)), _dl(_aligned(scales)),
+                None, None, m, k,
                 group_size, _input_act_code(input_act), _stream(x2d),
             )
             return q, scales
@@ -609,9 +610,9 @@ def _rotate_quant_int8(
             rows = m // chunk_count + (chunk < m % chunk_count)
             end = start + rows
             _C.quantize_int8_convrot(
-                _dl(x_arg[start:end]),
-                _dl(q[start:end]),
-                _dl(scales[start:end]),
+                _dl(_aligned(x_arg[start:end])),
+                _dl(_aligned(q[start:end])),
+                _dl(_aligned(scales[start:end])),
                 _dl(spill_rotated),
                 _dl(spill_partials),
                 rows,
@@ -633,7 +634,8 @@ def _rotate_quant_int8_modulated(
     scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
     with torch.cuda.device(x2d.device):
         _C.quantize_int8_convrot_modulated(
-            _dl(x2d), _dl(modulation_scale), _dl(q), _dl(scales),
+            _dl(_aligned(x2d)), _dl(_aligned(modulation_scale)),
+            _dl(_aligned(q)), _dl(_aligned(scales)),
             m, k, group_size, _stream(x2d),
         )
     return q, scales
@@ -651,8 +653,9 @@ def _rotate_quant_int8_affine(
     scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
     with torch.cuda.device(x2d.device):
         _C.quantize_int8_convrot_affine(
-            _dl(x2d), _dl(modulation_scale), _dl(modulation_shift),
-            _dl(q), _dl(scales), m, k, group_size, _stream(x2d),
+            _dl(_aligned(x2d)), _dl(_aligned(modulation_scale)),
+            _dl(_aligned(modulation_shift)), _dl(_aligned(q)),
+            _dl(_aligned(scales)), m, k, group_size, _stream(x2d),
         )
     return q, scales
 
@@ -670,8 +673,9 @@ def _rotate_quant_int8_rms_modulated(
     scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
     with torch.cuda.device(x2d.device):
         _C.quantize_int8_convrot_rms_modulated_fused_stats(
-            _dl(x2d), _dl(norm_weight), _dl(modulation_scale),
-            _dl(q), _dl(scales), m, k, group_size, norm_eps, _stream(x2d),
+            _dl(_aligned(x2d)), _dl(_aligned(norm_weight)),
+            _dl(_aligned(modulation_scale)), _dl(_aligned(q)),
+            _dl(_aligned(scales)), m, k, group_size, norm_eps, _stream(x2d),
         )
     return q, scales
 
@@ -686,7 +690,8 @@ def _rotate_quant_int8_swiglu_split_tiled128(
     scales = torch.empty((m,), dtype=torch.float32, device=gate2d.device)
     with torch.cuda.device(gate2d.device):
         _C.quantize_int8_convrot_swiglu_split_tiled128(
-            _dl(gate2d), _dl(up2d), _dl(q), _dl(scales),
+            _dl(_aligned(gate2d)), _dl(_aligned(up2d)),
+            _dl(_aligned(q)), _dl(_aligned(scales)),
             m, k, group_size, _stream(gate2d),
         )
     return q, scales
@@ -801,6 +806,7 @@ def int8_linear(
             raise ValueError(f"gate must contain N={n} elements")
         native_gated = (
             _weight_tile_k in (64, 128)
+            and _tiled_b_supported(x, m, n, k, out_dtype, _weight_tile_k)
             and input_act is None
             and out_dtype == torch.bfloat16
             and x.dtype == torch.bfloat16
@@ -959,8 +965,9 @@ def rms_gated_residual(
     gate_1d = gate.reshape(-1).contiguous()
     output = torch.empty_like(activation_2d)
     _C.rms_gated_residual_bf16(
-        _dl(activation_2d), _dl(norm_weight_1d), _dl(residual_2d),
-        _dl(gate_1d), _dl(output), activation_2d.shape[0], width,
+        _dl(_aligned(activation_2d)), _dl(_aligned(norm_weight_1d)),
+        _dl(_aligned(residual_2d)), _dl(_aligned(gate_1d)), _dl(output),
+        activation_2d.shape[0], width,
         float(eps), _stream(activation),
     )
     return output.reshape(shape)
@@ -1244,6 +1251,12 @@ def _int8_linear_pair_impl(
         if not _convrot_supported(
             k, convrot_groupsize, x.device, x.dtype, int8_global_spill=True
         ):
+            if any(value is not None for value in (
+                modulation_scale, modulation_shift, norm_weight
+            )):
+                raise ValueError(
+                    "Unsupported ConvRot pair fallback does not support modulation"
+                )
             return _eager.int8_linear_pair(
                 x, weight0, weight1, weight_scale0, weight_scale1,
                 bias0, bias1, out_dtype, convrot, convrot_groupsize,

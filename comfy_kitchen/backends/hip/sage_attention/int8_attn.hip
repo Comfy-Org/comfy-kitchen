@@ -892,6 +892,10 @@ extern "C" void launch_gfx12_int8_attention(
         throw std::runtime_error(
             "gfx12 INT8 attention received invalid Q or K/V padding");
     }
+    if (k_groups_per_head != padded_k / 16) {
+        throw std::runtime_error(
+            "gfx12 INT8 attention received invalid K scale grouping");
+    }
     if (reinterpret_cast<uintptr_t>(q) % 16 != 0 ||
         reinterpret_cast<uintptr_t>(k) % 16 != 0 ||
         reinterpret_cast<uintptr_t>(v) % 16 != 0 ||

@@ -34,6 +34,13 @@ _WMMA_ROW_MAJOR_ONLY_SHAPES = frozenset({
     (10240, 3840),
 })
 
+def _wmma_storage(qtensor: QuantizedTensor):
+    """Atomically snapshot runtime WMMA storage and its matching parameters."""
+    state = getattr(qtensor, "_wmma_state", None)
+    if state is not None:
+        return state
+    return qtensor._qdata, qtensor._params
+
 _INT8_DEQUANT_DTYPE_TO_CODE = {
     torch.float32: 0,
     torch.float16: 1,
@@ -151,17 +158,18 @@ class TensorWiseINT8Layout(QuantizedLayout):
         with _WMMA_WEIGHT_PACK_LOCK:
             # Another inference thread may have packed this wrapper while the
             # caller was checking eligibility.
-            params = qtensor._params
+            _, params = _wmma_storage(qtensor)
             old_tile_n = getattr(params, "wmma_tile_n", 0)
             old_tile_k = getattr(params, "wmma_tile_k", 0)
             if (old_tile_n, old_tile_k) == (tile_n, tile_k):
                 return qtensor
-            row_major = cls._unpack_wmma_weight(qtensor._qdata, params)
+            qdata, params = _wmma_storage(qtensor)
+            row_major = cls._unpack_wmma_weight(qdata, params)
             packed = (
                 row_major.reshape(n // tile_n, tile_n, k // tile_k, tile_k)
                 .permute(0, 2, 1, 3)
                 .contiguous()
-                .reshape_as(qtensor._qdata)
+                .reshape_as(qdata)
             )
             # Publish the new layout only after its asynchronous device copy is
             # complete. This makes first-use packing safe across inference
@@ -170,10 +178,13 @@ class TensorWiseINT8Layout(QuantizedLayout):
                 ready = torch.cuda.Event()
                 ready.record(torch.cuda.current_stream(packed.device))
                 ready.synchronize()
-            qtensor._qdata = packed
-            qtensor._params = dataclasses.replace(
+            new_params = dataclasses.replace(
                 params, wmma_tile_n=tile_n, wmma_tile_k=tile_k
             )
+            # A single reference publishes the matching data and metadata.
+            qtensor._wmma_state = (packed, new_params)
+            qtensor._qdata = packed
+            qtensor._params = new_params
         return qtensor
 
     @classmethod
@@ -584,6 +595,8 @@ class TensorWiseINT8Layout(QuantizedLayout):
         if operand is None:
             return NotImplemented
         qdata, scale, convrot, group_size, tile_k, _ = operand
+        if tile_k:
+            return NotImplemented
         from comfy_kitchen import int8_linear_rms_modulated
 
         return int8_linear_rms_modulated(
@@ -716,7 +729,8 @@ def _handle_int8_linear_tensorwise(qt, args, kwargs):
     # Fast path: weight is a TensorWiseINT8Layout QuantizedTensor
     if not isinstance(weight, QuantizedTensor) or weight._layout_cls != "TensorWiseINT8Layout":
         return torch.nn.functional.linear(*dequantize_args(args), **dequantize_args(kwargs))
-    if getattr(weight._params, "transposed", False):
+    weight_qdata, weight_params = _wmma_storage(weight)
+    if getattr(weight_params, "transposed", False):
         return torch.nn.functional.linear(*dequantize_args(args), **dequantize_args(kwargs))
 
     # If input is already quantized, dequantize it (TensorWise needs dynamic row-wise quant)
@@ -724,23 +738,24 @@ def _handle_int8_linear_tensorwise(qt, args, kwargs):
         input_tensor = input_tensor.dequantize()
 
     TensorWiseINT8Layout.prepare_wmma_weight_(weight, input_tensor)
-    tile_n = getattr(weight._params, "wmma_tile_n", 0)
-    tile_k = getattr(weight._params, "wmma_tile_k", 0)
+    weight_qdata, weight_params = _wmma_storage(weight)
+    tile_n = getattr(weight_params, "wmma_tile_n", 0)
+    tile_k = getattr(weight_params, "wmma_tile_k", 0)
     m = input_tensor.numel() // input_tensor.shape[-1]
     tiled_supported = TensorWiseINT8Layout.wmma_weight_is_supported(
         weight, input_tensor
     )
     if tile_n and not tiled_supported:
         weight_qdata = TensorWiseINT8Layout._unpack_wmma_weight(
-            weight._qdata, weight._params
+            weight_qdata, weight_params
         )
-        weight_scale = weight._params.scale
+        weight_scale = weight_params.scale
     else:
-        weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+        weight_scale = weight_params.scale
     out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
 
-    convrot = getattr(weight._params, "convrot", False)
-    convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
+    convrot = getattr(weight_params, "convrot", False)
+    convrot_groupsize = getattr(weight_params, "convrot_groupsize", 256)
 
     op = (
         torch.ops.comfy_kitchen.int8_linear_tiled_b
@@ -771,11 +786,12 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    weight_qdata, weight_params = _wmma_storage(weight)
+    weight_scale = weight_params.scale
     out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
 
-    convrot = getattr(weight._params, "convrot", False)
-    convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
+    convrot = getattr(weight_params, "convrot", False)
+    convrot_groupsize = getattr(weight_params, "convrot_groupsize", 256)
 
     if getattr(weight._params, "transposed", False):
         # Common decomposition: linear(x, W) -> mm(x, W.t()). Storage is still
@@ -816,7 +832,8 @@ def _handle_int8_addmm_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    weight_qdata, weight_params = _wmma_storage(weight)
+    weight_scale = weight_params.scale
     out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
 
     convrot = getattr(weight._params, "convrot", False)

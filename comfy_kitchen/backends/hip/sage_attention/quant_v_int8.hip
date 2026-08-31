@@ -256,7 +256,9 @@ extern "C" void launch_gfx12_tile_channel_v_quant(
         return extent < 2 ||
             (stride > 0 && (static_cast<size_t>(stride) * sizeof(__half)) % 16 == 0);
     };
-    if (reinterpret_cast<uintptr_t>(v) % 16 != 0 ||
+    if (v == nullptr || output == nullptr ||
+        reinterpret_cast<uintptr_t>(v) % 16 != 0 ||
+        reinterpret_cast<uintptr_t>(output) % 16 != 0 ||
         !stride_ok(stride_h, num_heads) || !stride_ok(stride_n, n_ctx)) {
         throw std::runtime_error(
             "gfx12 V base pointer and H/N strides must be 16-byte aligned");

@@ -644,6 +644,13 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
     require_len(x, static_cast<int64_t>(M) * K * in_width, kFn, "x");
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    const nb::ndarray<>* aligned_operands[] = {&x, &q, &scales};
+    for (const nb::ndarray<>* operand : aligned_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
 
     void* spill_rotated_ptr = nullptr;
     void* spill_partials_ptr = nullptr;
@@ -685,6 +692,13 @@ void quantize_int8_convrot_swiglu_split_tiled128(
         (static_cast<int64_t>(M) + 127) / 128 * 128;
     require_len(q, padded_m * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    const nb::ndarray<>* aligned_operands[] = {&gate, &up, &q, &scales};
+    for (const nb::ndarray<>* operand : aligned_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
 
     launch_quantize_int8_convrot_swiglu_split_tiled128_kernel(
         gate.data(), up.data(), q.data(), scales.data(), M, K, group_size,
@@ -707,6 +721,14 @@ void quantize_int8_convrot_modulated(
                 "modulation_scale");
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    const nb::ndarray<>* aligned_operands[] = {
+        &x, &modulation_scale, &q, &scales};
+    for (const nb::ndarray<>* operand : aligned_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
 
     launch_quantize_int8_convrot_modulated_kernel(
         x.data(), modulation_scale.data(), q.data(), scales.data(),
@@ -733,6 +755,14 @@ void quantize_int8_convrot_affine(
                 "modulation_shift");
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    const nb::ndarray<>* aligned_operands[] = {
+        &x, &modulation_scale, &modulation_shift, &q, &scales};
+    for (const nb::ndarray<>* operand : aligned_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
 
     launch_quantize_int8_convrot_affine_kernel(
         x.data(), modulation_scale.data(), modulation_shift.data(),
@@ -758,6 +788,14 @@ void quantize_int8_convrot_rms_modulated_fused_stats(
     require_len(modulation_scale, K, kFn, "modulation_scale");
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    const nb::ndarray<>* aligned_operands[] = {
+        &x, &norm_weight, &modulation_scale, &q, &scales};
+    for (const nb::ndarray<>* operand : aligned_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
     launch_quantize_int8_convrot_rms_modulated_fused_stats_kernel(
         x.data(), norm_weight.data(), modulation_scale.data(), q.data(),
         scales.data(), M, K, group_size, eps,
