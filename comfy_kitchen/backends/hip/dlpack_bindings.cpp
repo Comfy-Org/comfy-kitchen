@@ -167,6 +167,8 @@ static void require_dtype(const nb::ndarray<>& t, int lo, int hi, const char* fn
     }
 }
 
+static void require_packed_contiguous(const nb::ndarray<>& t, const char* fn, const char* name);
+
 // Mirrors kSvdGroup in ops/svdquant_w4a4.hip: one scale per 64-element group.
 constexpr int kSvdGroup = 64;
 
@@ -644,6 +646,9 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
     require_len(x, static_cast<int64_t>(M) * K * in_width, kFn, "x");
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(q, kFn, "q");
+    require_packed_contiguous(scales, kFn, "scales");
     const nb::ndarray<>* aligned_operands[] = {&x, &q, &scales};
     for (const nb::ndarray<>* operand : aligned_operands) {
         if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
@@ -660,11 +665,13 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
         if (map_dtype_to_code(spill_rotated->dtype()) != map_dtype_to_code(x.dtype())) {
             throw std::runtime_error(std::string(kFn) + ": spill_rotated dtype must match x");
         }
+        require_packed_contiguous(*spill_rotated, kFn, "spill_rotated");
         spill_rotated_ptr = spill_rotated->data();
     }
     if (spill_partials.has_value()) {
         require_dtype(*spill_partials, 0, 0, kFn, "spill_partials");
         require_len(*spill_partials, static_cast<int64_t>(M) * (K / 256), kFn, "spill_partials");
+        require_packed_contiguous(*spill_partials, kFn, "spill_partials");
         spill_partials_ptr = spill_partials->data();
     }
 
@@ -692,6 +699,10 @@ void quantize_int8_convrot_swiglu_split_tiled128(
         (static_cast<int64_t>(M) + 127) / 128 * 128;
     require_len(q, padded_m * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    require_packed_contiguous(gate, kFn, "gate");
+    require_packed_contiguous(up, kFn, "up");
+    require_packed_contiguous(q, kFn, "q");
+    require_packed_contiguous(scales, kFn, "scales");
     const nb::ndarray<>* aligned_operands[] = {&gate, &up, &q, &scales};
     for (const nb::ndarray<>* operand : aligned_operands) {
         if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
@@ -721,6 +732,10 @@ void quantize_int8_convrot_modulated(
                 "modulation_scale");
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(modulation_scale, kFn, "modulation_scale");
+    require_packed_contiguous(q, kFn, "q");
+    require_packed_contiguous(scales, kFn, "scales");
     const nb::ndarray<>* aligned_operands[] = {
         &x, &modulation_scale, &q, &scales};
     for (const nb::ndarray<>* operand : aligned_operands) {
@@ -755,6 +770,11 @@ void quantize_int8_convrot_affine(
                 "modulation_shift");
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(modulation_scale, kFn, "modulation_scale");
+    require_packed_contiguous(modulation_shift, kFn, "modulation_shift");
+    require_packed_contiguous(q, kFn, "q");
+    require_packed_contiguous(scales, kFn, "scales");
     const nb::ndarray<>* aligned_operands[] = {
         &x, &modulation_scale, &modulation_shift, &q, &scales};
     for (const nb::ndarray<>* operand : aligned_operands) {
