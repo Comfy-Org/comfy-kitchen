@@ -15,6 +15,7 @@
 #include <string>
 #include <type_traits>
 
+#include "../mma.h"
 #include "architecture_config.h"
 
 namespace comfy::hip_backend::sage {
@@ -226,6 +227,116 @@ __forceinline__ __device__ void convrot(float* v) {
     } else if constexpr (Rotation == 4) {
         convrot4(v);
     }
+}
+
+// ---------------------------------------------------------------------------
+// WMMA fragment plumbing shared by the int8 attention kernels
+// ---------------------------------------------------------------------------
+
+// Round to nearest even and saturate, matching cvt.rni.sat.u8.f32 in the CUDA
+// backend's pack_u8x4.
+__forceinline__ __device__ uint32_t prob_to_u8(float p) {
+    return static_cast<uint32_t>(fminf(255.0f, fmaxf(0.0f, rintf(p))));
+}
+
+// The eight probabilities a lane holds, packed into the P operand of the PV
+// matmul. gfx12 element e is key 8 * (lane / 16) + e, which is already the
+// fragment's K slice. gfx11 element e is key 2e + lane / 16, so a lane holds
+// every other key and trades with its partner to rebuild the whole 16-key step.
+__forceinline__ __device__ MmaInt8::Frag pack_prob_frag(const uint32_t p[8], int lane) {
+    const uint32_t lo = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
+    const uint32_t hi = p[4] | (p[5] << 8) | (p[6] << 16) | (p[7] << 24);
+#if !defined(COMFY_MMA_GFX11)
+    // gfx12, and the no-matrix-core stub, whose Frag is this narrow too.
+    (void)lane;
+    MmaInt8::Frag f;
+    f[0] = static_cast<int>(lo);
+    f[1] = static_cast<int>(hi);
+    return f;
+#else
+    const uint32_t partner_lo = swap_half_wave_b32(lo);
+    const uint32_t partner_hi = swap_half_wave_b32(hi);
+    const bool even_half = lane < 16;
+    const uint32_t even0 = even_half ? lo : partner_lo;  // keys 0, 2, 4, 6
+    const uint32_t odd0 = even_half ? partner_lo : lo;   // keys 1, 3, 5, 7
+    const uint32_t even1 = even_half ? hi : partner_hi;  // keys 8, 10, 12, 14
+    const uint32_t odd1 = even_half ? partner_hi : hi;   // keys 9, 11, 13, 15
+    // v_perm_b32 selector bytes index {src0, src1} with src1 in bytes 0..3.
+    MmaInt8::Frag f;
+    f[0] = static_cast<int>(__builtin_amdgcn_perm(odd0, even0, 0x05010400u));
+    f[1] = static_cast<int>(__builtin_amdgcn_perm(odd0, even0, 0x07030602u));
+    f[2] = static_cast<int>(__builtin_amdgcn_perm(odd1, even1, 0x05010400u));
+    f[3] = static_cast<int>(__builtin_amdgcn_perm(odd1, even1, 0x07030602u));
+    return f;
+#endif
+}
+
+// The same repack for a BF16 P operand, which the Sol-Attn routing kernel needs
+// for its pooled PV. gfx12's K slice is the accumulator order again; gfx11 rebuilds
+// the 16-key step from the two half-waves, exchanging four packed dwords instead of
+// eight floats.
+__forceinline__ __device__ MmaBf16::Frag pack_prob_frag_bf16(const float p[8], int lane) {
+    MmaBf16::Frag f;
+#if !defined(COMFY_MMA_GFX11)
+    (void)lane;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) f[e] = static_cast<__bf16>(p[e]);
+#else
+    union {
+        uint32_t w[4];
+        __bf16 e[8];
+    } own, partner;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) own.e[e] = static_cast<__bf16>(p[e]);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) partner.w[i] = swap_half_wave_b32(own.w[i]);
+    const bool even_half = lane < 16;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        f[2 * e] = even_half ? own.e[e] : partner.e[e];
+        f[2 * e + 1] = even_half ? partner.e[e] : own.e[e];
+    }
+#endif
+    return f;
+}
+
+// vals[e] belongs to channel d_base + acc_row(lane, e). gfx12 makes those eight
+// channels contiguous, so the row goes out in one 16-byte store; gfx11
+// interleaves them with the partner lane's and needs eight.
+template <typename OutT>
+__forceinline__ __device__ void store_o_tile(OutT* __restrict__ row, int d_base,
+                                             const float* vals, int lane) {
+#if defined(COMFY_MMA_GFX12)
+    // Aligned because the 16-byte store below reinterprets it.
+    __attribute__((aligned(16))) OutT packed[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) packed[e] = static_cast<OutT>(vals[e]);
+    *reinterpret_cast<uint4*>(row + d_base + 8 * (lane / 16)) =
+        *reinterpret_cast<const uint4*>(packed);
+#else
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        row[d_base + acc_row(lane, e)] = static_cast<OutT>(vals[e]);
+    }
+#endif
+}
+
+// The read side of store_o_tile, for a handover the next kernel resumes from.
+template <typename InT>
+__forceinline__ __device__ void load_o_tile(const InT* __restrict__ row, int d_base, float* vals,
+                                            int lane) {
+#if defined(COMFY_MMA_GFX12)
+    __attribute__((aligned(16))) InT packed[8];
+    *reinterpret_cast<uint4*>(packed) =
+        *reinterpret_cast<const uint4*>(row + d_base + 8 * (lane / 16));
+#pragma unroll
+    for (int e = 0; e < 8; ++e) vals[e] = static_cast<float>(packed[e]);
+#else
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        vals[e] = static_cast<float>(row[d_base + acc_row(lane, e)]);
+    }
+#endif
 }
 
 }  // namespace comfy::hip_backend::sage

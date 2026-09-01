@@ -227,7 +227,7 @@ class TestRegistryConstraintValidation:
         }
         backend = ck.registry.get_capable_backend("quantize_per_tensor_fp8", kwargs)
         assert backend is not None
-        assert backend in ["cuda", "triton", "eager"]
+        assert backend in ["hip", "cuda", "triton", "eager"]
 
     def test_get_capable_backend_no_match(self, device):
         """Test NoCapableBackendError when no backend can handle the call."""

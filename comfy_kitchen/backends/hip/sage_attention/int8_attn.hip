@@ -61,43 +61,6 @@ struct Shape {
     static constexpr int kDimTiles = HD / 16;
 };
 
-// Round to nearest even and saturate, matching cvt.rni.sat.u8.f32 in the CUDA
-// backend's pack_u8x4.
-__forceinline__ __device__ uint32_t prob_to_u8(float p) {
-    return static_cast<uint32_t>(fminf(255.0f, fmaxf(0.0f, rintf(p))));
-}
-
-// The eight probabilities a lane holds, packed into the P operand of the PV
-// matmul. gfx12 element e is key 8 * (lane / 16) + e, which is already the
-// fragment's K slice. gfx11 element e is key 2e + lane / 16, so a lane holds
-// every other key and trades with its partner to rebuild the whole 16-key step.
-__forceinline__ __device__ MmaInt8::Frag pack_prob_frag(const uint32_t p[8], int lane) {
-    const uint32_t lo = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
-    const uint32_t hi = p[4] | (p[5] << 8) | (p[6] << 16) | (p[7] << 24);
-#if defined(COMFY_MMA_GFX12)
-    (void)lane;
-    MmaInt8::Frag f;
-    f[0] = static_cast<int>(lo);
-    f[1] = static_cast<int>(hi);
-    return f;
-#else
-    const uint32_t partner_lo = swap_half_wave_b32(lo);
-    const uint32_t partner_hi = swap_half_wave_b32(hi);
-    const bool even_half = lane < 16;
-    const uint32_t even0 = even_half ? lo : partner_lo;  // keys 0, 2, 4, 6
-    const uint32_t odd0 = even_half ? partner_lo : lo;   // keys 1, 3, 5, 7
-    const uint32_t even1 = even_half ? hi : partner_hi;  // keys 8, 10, 12, 14
-    const uint32_t odd1 = even_half ? partner_hi : hi;   // keys 9, 11, 13, 15
-    // v_perm_b32 selector bytes index {src0, src1} with src1 in bytes 0..3.
-    MmaInt8::Frag f;
-    f[0] = static_cast<int>(__builtin_amdgcn_perm(odd0, even0, 0x05010400u));
-    f[1] = static_cast<int>(__builtin_amdgcn_perm(odd0, even0, 0x07030602u));
-    f[2] = static_cast<int>(__builtin_amdgcn_perm(odd1, even1, 0x05010400u));
-    f[3] = static_cast<int>(__builtin_amdgcn_perm(odd1, even1, 0x07030602u));
-    return f;
-#endif
-}
-
 // Reads one mask element as raw bits. -ffast-math folds isfinite() away, so the
 // non-finite test that decides whether an additive bias means "drop this key"
 // has to be an exponent bit test on the value as loaded, never a float compare.

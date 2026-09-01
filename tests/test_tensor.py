@@ -1394,12 +1394,20 @@ class TestINT8LinearOperations:
 
         result = torch.nn.functional.linear(x, qt_w, bias)
 
-        # Reference: same quantized math through the eager backend.
+        # Reference: the same quantized weight through the eager backend.
         with ck.registry.use_backend("eager"):
             expected = torch.nn.functional.linear(x, qt_w, bias)
 
         assert result.shape == expected.shape
-        assert torch.allclose(result, expected, rtol=1e-2, atol=1e-1)
+        # Not the same arithmetic: eager dequantizes and multiplies in floating
+        # point, a fused backend accumulates INT32 exactly and scales once. On an
+        # element where the sum nearly cancels they differ by far more than a
+        # relative tolerance allows, so both are checked against the exact product
+        # of the dequantized operands, which is what each one approximates.
+        truth = x.float() @ qt_w.dequantize().float().t() + bias.float()
+        limit = 0.05 * truth.abs().max()
+        for name, got in (("fused", result), ("eager", expected)):
+            assert (got.float() - truth).abs().max() < limit, name
 
     def test_int8_mm(self):
         import comfy_kitchen as ck
@@ -1416,4 +1424,8 @@ class TestINT8LinearOperations:
             expected = torch.mm(a, qt_b.t())
 
         assert result.shape == expected.shape
-        assert torch.allclose(result, expected, rtol=1e-2, atol=1e-1)
+        # See test_int8_linear_weight_quantized on why this is not an allclose.
+        truth = a.float() @ qt_b.dequantize().float().t()
+        limit = 0.05 * truth.abs().max()
+        for name, got in (("fused", result), ("eager", expected)):
+            assert (got.float() - truth).abs().max() < limit, name
