@@ -673,6 +673,25 @@ def test_int8_tiled_b_gated_residual_is_exact(
     assert torch.equal(candidate, reference)
 
 
+@pytest.mark.parametrize("gate_shape", [(128, 1), (2, 64)])
+def test_int8_linear_gated_residual_rejects_same_numel_non_channel_gate(
+    hip, gate_shape
+):
+    """Flattening a same-numel gate must not change its broadcast axis."""
+    torch.manual_seed(211)
+    m, n, k = 128, 128, 256
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    weight = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
+    weight_scale = torch.rand(n, device=DEV, dtype=torch.float32) + 0.25
+    residual = torch.randn(m, n, device=DEV, dtype=torch.bfloat16)
+    gate = torch.randn(gate_shape, device=DEV, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="broadcastable row ending"):
+        hip.int8_linear_gated_residual(
+            x, weight, weight_scale, residual, gate
+        )
+
+
 def _offset_copy(t: torch.Tensor) -> torch.Tensor:
     """A contiguous copy of ``t`` deliberately based off a 16-byte boundary."""
     flat = t.reshape(-1)
@@ -2711,6 +2730,51 @@ def test_convrot_spill_rotated_must_match_input_dtype(hip):
         )
 
 
+@pytest.mark.parametrize(
+    "operand_name",
+    ["x", "norm_weight", "modulation_scale", "q", "scales"],
+)
+def test_rms_modulated_convrot_binding_rejects_noncontiguous_operand(
+    hip, operand_name
+):
+    """The raw-pointer kernel accepts only the packed layout it indexes."""
+    m, k = 2, 256
+    operands = {
+        "x": torch.empty(m, k, device=DEV, dtype=torch.bfloat16),
+        "norm_weight": torch.empty(k, device=DEV, dtype=torch.bfloat16),
+        "modulation_scale": torch.empty(k, device=DEV, dtype=torch.bfloat16),
+        "q": torch.empty(m, k, device=DEV, dtype=torch.int8),
+        "scales": torch.empty(m, device=DEV, dtype=torch.float32),
+    }
+    operand = operands[operand_name]
+    if operand.ndim == 1:
+        operand = torch.empty(
+            operand.numel() * 2, device=DEV, dtype=operand.dtype
+        )[::2]
+    else:
+        operand = torch.empty(
+            operand.shape[0], operand.shape[1] * 2,
+            device=DEV, dtype=operand.dtype,
+        )[:, ::2]
+    assert operand.shape == operands[operand_name].shape
+    assert not operand.is_contiguous()
+    operands[operand_name] = operand
+
+    with pytest.raises(RuntimeError, match=f"{operand_name} must be contiguous"):
+        hip._C.quantize_int8_convrot_rms_modulated_fused_stats(
+            hip._dl(operands["x"]),
+            hip._dl(operands["norm_weight"]),
+            hip._dl(operands["modulation_scale"]),
+            hip._dl(operands["q"]),
+            hip._dl(operands["scales"]),
+            m,
+            k,
+            256,
+            1.0e-5,
+            hip._stream(operands["x"]),
+        )
+
+
 @needs_wmma
 def test_convrot_int8_needs_spill_probe(hip):
     in_code = hip.DTYPE_TO_CODE[torch.bfloat16]
@@ -2774,6 +2838,28 @@ def test_convrot_wide_spill_chunks_are_exact(hip, monkeypatch):
 
     assert torch.equal(actual_q, expected_q)
     assert torch.equal(actual_scales, expected_scales)
+
+
+def test_convrot_spill_rebalancing_preserves_workspace_cap(hip, monkeypatch):
+    """A 96-row rebalance cannot merge two capacity-safe chunks into one."""
+    m, k = 96, 256
+    x = torch.empty(m, k, device=DEV, dtype=torch.bfloat16)
+    workspace_per_row = x.element_size() * k + 4 * (k // 256)
+    workspace_bytes = 95 * workspace_per_row
+    launched_rows = []
+
+    monkeypatch.setattr(hip, "_CONVROT_SPILL_WORKSPACE_BYTES", workspace_bytes)
+    monkeypatch.setattr(hip, "_convrot_int8_needs_spill", lambda *_: True)
+    monkeypatch.setattr(
+        hip._C,
+        "quantize_int8_convrot",
+        lambda *args: launched_rows.append(args[5]),
+    )
+
+    hip._rotate_quant_int8(x, 256)
+
+    assert sum(launched_rows) == m
+    assert max(launched_rows) * workspace_per_row <= workspace_bytes
 
 
 def test_convrot_lds_bound_accounts_for_row_dtype(hip):

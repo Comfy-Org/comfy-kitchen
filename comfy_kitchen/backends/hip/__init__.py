@@ -267,9 +267,10 @@ def _has_wmma(arches: Sequence[str | None]) -> bool:
         return False
     if not all(a in _ARCH_WMMA for a in arches):
         return False
-    if any(a in _ARCH_WMMA_GFX117 for a in arches) and not _GFX117_WMMA_POLICIES_READY:
-        return False
-    return True
+    return not (
+        any(a in _ARCH_WMMA_GFX117 for a in arches)
+        and not _GFX117_WMMA_POLICIES_READY
+    )
 
 
 def is_available() -> bool:
@@ -646,12 +647,21 @@ def _rotate_quant_int8(
 
         workspace_per_row = x_arg.element_size() * k + 4 * (k // 256)
         row_cap = max(1, _CONVROT_SPILL_WORKSPACE_BYTES // workspace_per_row)
-        chunk_count = (m + row_cap - 1) // row_cap
+        capacity_chunk_count = (m + row_cap - 1) // row_cap
         # The native policy chooses the exact global implementation for wide
         # chunks of at least 96 rows. Balance chunks so a short final slice does
         # not switch to the otherwise-equivalent one-wave LDS schedule, whose
-        # activation rounding can differ at quantization boundaries.
-        chunk_count = min(chunk_count, max(1, m // 96))
+        # activation rounding can differ at quantization boundaries. Keep the
+        # capacity-safe count when rebalancing would exceed the workspace cap.
+        balanced_chunk_count = min(capacity_chunk_count, max(1, m // 96))
+        balanced_chunk_rows = (
+            m + balanced_chunk_count - 1
+        ) // balanced_chunk_count
+        chunk_count = (
+            balanced_chunk_count
+            if balanced_chunk_rows <= row_cap
+            else capacity_chunk_count
+        )
         chunk_rows = (m + chunk_count - 1) // chunk_count
         spill_rotated = torch.empty(
             (chunk_rows, k), dtype=x_arg.dtype, device=x2d.device
@@ -856,8 +866,18 @@ def int8_linear(
             raise ValueError(
                 f"residual shape must be {expected}, got {tuple(_residual.shape)}"
             )
-        if _gate.numel() != n:
-            raise ValueError(f"gate must contain N={n} elements")
+        gate_shape = tuple(_gate.shape)
+        if (
+            not gate_shape
+            or gate_shape[-1] != n
+            or _gate.numel() != n
+            or len(gate_shape) > len(expected)
+            or any(size != 1 for size in gate_shape[:-1])
+        ):
+            raise ValueError(
+                f"gate must be one broadcastable row ending in N={n}, "
+                f"got {gate_shape}"
+            )
         native_gated = (
             _weight_tile_k in (64, 128)
             and _tiled_b_supported(x, m, n, k, out_dtype, _weight_tile_k)

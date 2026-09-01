@@ -808,6 +808,11 @@ void quantize_int8_convrot_rms_modulated_fused_stats(
     require_len(modulation_scale, K, kFn, "modulation_scale");
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(norm_weight, kFn, "norm_weight");
+    require_packed_contiguous(modulation_scale, kFn, "modulation_scale");
+    require_packed_contiguous(q, kFn, "q");
+    require_packed_contiguous(scales, kFn, "scales");
     const nb::ndarray<>* aligned_operands[] = {
         &x, &norm_weight, &modulation_scale, &q, &scales};
     for (const nb::ndarray<>* operand : aligned_operands) {
@@ -2054,6 +2059,9 @@ void hip_int8_attention(
         kv_len, padded_q, padded_k, padded_k / 16,
         output.stride(1), output.stride(2),
         sm_scale, input_dtype_code, stream);
+    check_hip_launch();
+}
+
 // ---------------------------------------------------------------------------
 // Sol-Attn sparse attention
 // ---------------------------------------------------------------------------
