@@ -64,7 +64,7 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
       mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q,
       stride_seq_q, stride_h_q, stride_bz_k, stride_seq_k, stride_h_k,
       stride_bz_v, stride_h_v, stride_d_v, stride_bz_o, stride_seq_o,
-      stride_h_o, sm_scale);
+      stride_h_o, sm_scale, 0, 0, nullptr, nullptr, 0);
 
   error = cudaGetLastError();
   if (error != cudaSuccess) {

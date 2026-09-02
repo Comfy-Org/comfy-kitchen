@@ -16,8 +16,8 @@
  */
 
 // Sol-Attn (arXiv 2607.24027) orchestration over one caller-allocated workspace:
-//   preprocess  quantize Q/K/V, pool K/V per block, routing threshold
-//   vtranspose  INT8 V^T for the exact stage's PV operand
+//   preprocess  pool K/V per block, routing threshold, Sol Q/K carriers as needed
+//   carriers    Sol V transpose, or the existing Sage INT8 Q/K/V quantizers
 //   route       choose the routed blocks; approximate tail from the centroids
 //   exact       walk each routed list, resuming route's online softmax
 // Entry paths: `launch_sol_attn` (post-rope q/k/v) or the chunked producer
@@ -36,7 +36,7 @@
 void launch_sol_preprocess(const void*, const void*, const void*, void*, void*, void*,
                            void*, void*, void*, void*, void*, void*, void*, void*, void*,
                            void*, const void*, const void*,
-                           int, int, int, int, int, int, int,
+                           int, int, int, int, int, int, int, int,
                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                            int64_t, int64_t, int64_t, float, float, cudaStream_t);
 size_t sol_preprocess_scratch_bytes(int, int, int);
@@ -59,11 +59,24 @@ void launch_sol_exact(const void*, const void*, const void*, const void*, const 
                       const void*, const void*, const void*, const void*, const void*,
                       const void*, void*, int, int, int, int, int, int, float,
                       cudaStream_t);
+extern "C" void launch_quant_qk_per_thread_int8(
+    const void*, void*, void*, const void*, void*, void*,
+    int, int, int, int, int, int, int, int, int, int,
+    int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int, void*, cudaStream_t);
+extern "C" void launch_quant_v_int8_kernel(
+    const void*, void*, void*, int, int, int, int, int,
+    int64_t, int64_t, int64_t, int, cudaStream_t);
+void launch_sage_attn_sparse64_kernel(
+    const void*, const void*, const void*, void*, const void*, const void*,
+    const void*, const void*, const void*, int, int, int, int, int, int,
+    float, cudaStream_t);
 
 namespace {
 
 constexpr int HD = sol::HEAD_DIM;
 constexpr int BLK = sol::BLOCK;
+constexpr int SAGE_EXACT_MIN_SEQUENCE = 4096;
 
 inline size_t align16(size_t n) { return (n + 15u) & ~(size_t)15u; }
 
@@ -118,10 +131,10 @@ void validate_shape(int batch, int seq_len, int num_heads) {
 // stage launched before it; without it a rejected launch leaves route's
 // handover values in `out`.
 void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* out,
-                     const void* blen, int tail,
+                     const void* blen, int tail, bool sage_exact,
                      int batch, int seq_len, int num_heads,
                      int sink_start, int sink_end, int sink_q_start, int sink_q_end,
-                     float scale_log2, cudaStream_t stream)
+                     float scale, float scale_log2, cudaStream_t stream)
 {
     // top-k mode: the caller supplies the per-query-block threshold
     const void* thr = ext_threshold ? ext_threshold : (const void*)(w + p.thr);
@@ -129,10 +142,19 @@ void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* ou
                      thr, w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart,
                      blen, tail, batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ,
                      sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
-    launch_sol_exact(w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb, w + p.vTi, w + p.vsc,
-                     w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart, out,
-                     batch, seq_len, p.Tp, num_heads, p.NQ, p.NTB,
-                     scale_log2, stream);
+    if (sage_exact) {
+        const int q_scale_stride_h = ((seq_len + 127) / 128) * 32;
+        launch_sage_attn_sparse64_kernel(
+            w + p.qiP, w + p.kiP, w + p.vTi, out,
+            w + p.qs, w + p.ksb, w + p.vsc, w + p.idx, w + p.cnt,
+            batch, seq_len, num_heads, p.Tp,
+            num_heads * q_scale_stride_h, q_scale_stride_h, scale, stream);
+    } else {
+        launch_sol_exact(w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb, w + p.vTi, w + p.vsc,
+                         w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart, out,
+                         batch, seq_len, p.Tp, num_heads, p.NQ, p.NTB,
+                         scale_log2, stream);
+    }
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
         throw std::runtime_error(std::string("sol_attn: kernel launch failed: ")
@@ -213,8 +235,9 @@ extern "C" void launch_sol_attn_core(
                       w + p.cen8, w + p.cens, kmean_next, blen,
                       batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ,
                       tau, scale_log2, stream);
-    run_route_exact(p, w, ext_threshold, out, blen, tail, batch, seq_len, num_heads,
-                    sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
+    run_route_exact(p, w, ext_threshold, out, blen, tail, false,
+                    batch, seq_len, num_heads, sink_start, sink_end,
+                    sink_q_start, sink_q_end, scale, scale_log2, stream);
     cudaMemcpyAsync(vamax_out, w + p.statsV, stats_bytes, cudaMemcpyDeviceToDevice, stream);
 }
 
@@ -236,15 +259,33 @@ extern "C" void launch_sol_attn(
     const Plan p(batch, seq_len, num_heads);
     char* w = reinterpret_cast<char*>(workspace);
     const float scale_log2 = scale * 1.4426950408889634f;
+    // The alternate carrier setup only amortizes at video lengths. A zero-based
+    // sink prefix also keeps the route sorted, so a ragged KV tail remains last.
+    const bool sage_exact = seq_len >= SAGE_EXACT_MIN_SEQUENCE && !tail &&
+                            key_bias == nullptr && blen == nullptr && sink_start == 0;
     launch_sol_preprocess(q, k, v, w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb,
                           w + p.kciP, w + p.kcs, w + p.vcT, w + p.thr,
                           w + p.cen8, w + p.cens, w + p.vsc, w + p.qmean, w + p.scratch,
                           key_bias, blen,
                           batch, seq_len, p.Tp, num_heads, p.NTB, p.NPAD, p.NQ,
+                          sage_exact ? 0 : 1,
                           qs_b, qs_t, qs_h, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h,
                           tau, scale_log2, stream);
-    launch_sol_vtranspose(v, w + p.vsc, w + p.vTi, batch, seq_len, p.Tp, num_heads,
-                          vs_b, vs_t, vs_h, stream);
-    run_route_exact(p, w, ext_threshold, out, blen, tail, batch, seq_len, num_heads,
-                    sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
+    if (sage_exact) {
+        launch_quant_qk_per_thread_int8(
+            q, w + p.qiP, w + p.qs, k, w + p.kiP, w + p.ksb,
+            batch, num_heads, seq_len, num_heads, seq_len, HD,
+            128, 32, 64, 64,
+            qs_b, qs_h, qs_t, ks_b, ks_h, ks_t,
+            2, w + p.statsV, stream);
+        launch_quant_v_int8_kernel(
+            v, w + p.vTi, w + p.vsc, batch, num_heads, seq_len, HD, p.Tp,
+            vs_b, vs_h, vs_t, 2, stream);
+    } else {
+        launch_sol_vtranspose(v, w + p.vsc, w + p.vTi, batch, seq_len, p.Tp, num_heads,
+                              vs_b, vs_t, vs_h, stream);
+    }
+    run_route_exact(p, w, ext_threshold, out, blen, tail, sage_exact,
+                    batch, seq_len, num_heads, sink_start, sink_end,
+                    sink_q_start, sink_q_end, scale, scale_log2, stream);
 }

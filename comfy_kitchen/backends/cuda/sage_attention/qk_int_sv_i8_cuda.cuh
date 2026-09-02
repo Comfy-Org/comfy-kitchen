@@ -56,7 +56,7 @@ template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K,
           MaskMode mask_mode = MaskMode::kNone, bool return_lse = false,
           bool fuse_v_scale = false, bool fuse_v_mean = false,
           bool use_pv_fp16_accu = false,
-          bool fuse_fp32_probabilities = true>
+          bool fuse_fp32_probabilities = true, bool use_sparse_kv = false>
 __global__ void qk_int_sv_i8_attn_kernel(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
@@ -71,7 +71,10 @@ __global__ void qk_int_sv_i8_attn_kernel(
     const uint32_t stride_seq_k, const uint32_t stride_h_k,
     const uint32_t stride_bz_v, const uint32_t stride_h_v,
     const uint32_t stride_d_v, const uint32_t stride_bz_o,
-    const uint32_t stride_seq_o, const uint32_t stride_h_o, float sm_scale) {
+    const uint32_t stride_seq_o, const uint32_t stride_h_o, float sm_scale,
+    const uint32_t stride_bz_q_scale, const uint32_t stride_h_q_scale,
+    const uint16_t *__restrict__ BlockLut,
+    const int32_t *__restrict__ ValidBlockNum, const uint32_t lut_stride) {
   // compile time check
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4,
                 "DTypeQK must be int8 or int4");
@@ -93,6 +96,14 @@ __global__ void qk_int_sv_i8_attn_kernel(
                 "DTypeOut must be half or nv_bfloat16");
   static_assert(CTA_K % 64 == 0);
   static_assert(CTA_Q / CTA_K <= 2); // for efficient causal implementation
+  static_assert(!use_sparse_kv || mask_mode == MaskMode::kNone,
+                "the sparse traversal takes no attention mask");
+  static_assert(!use_sparse_kv ||
+                    (CTA_Q == 64 && CTA_K == 64 && WARP_Q == 16 &&
+                     WARP_K == 64 && head_dim == 128 &&
+                     Q_GRAN == QuantGranularity::kPerThread &&
+                     K_GRAN == QuantGranularity::kPerThread),
+                "the sparse traversal is fixed to Sol's 64Q x 64KV geometry");
 
   constexpr uint32_t num_warps_q = CTA_Q / WARP_Q;
   constexpr uint32_t num_warps_k = CTA_K / WARP_K;
@@ -158,11 +169,17 @@ __global__ void qk_int_sv_i8_attn_kernel(
   } else if constexpr (Q_GRAN == QuantGranularity::kPerThread) {
     if constexpr (head_dim == 128 && WARP_Q == 16) {
       constexpr uint32_t quant_warps_q = CTA_Q / 32;
-      const uint32_t num_warp_block_q = gridDim.x * quant_warps_q;
-      q_scale_idx =
-          batch_id * num_qo_heads * (num_warp_block_q * 8) +
-          head_id * (num_warp_block_q * 8) + bx * (quant_warps_q * 8) +
-          (get_warp_idx_q<num_warps_q, num_warps_k>() / 2) * 8 + lane_id / 4;
+      if constexpr (use_sparse_kv) {
+        q_scale_idx = batch_id * stride_bz_q_scale +
+            head_id * stride_h_q_scale + bx * (quant_warps_q * 8) +
+            (get_warp_idx_q<num_warps_q, num_warps_k>() / 2) * 8 + lane_id / 4;
+      } else {
+        const uint32_t num_warp_block_q = gridDim.x * quant_warps_q;
+        q_scale_idx =
+            batch_id * num_qo_heads * (num_warp_block_q * 8) +
+            head_id * (num_warp_block_q * 8) + bx * (quant_warps_q * 8) +
+            (get_warp_idx_q<num_warps_q, num_warps_k>() / 2) * 8 + lane_id / 4;
+      }
     } else {
       const uint32_t num_warp_block_q = gridDim.x * num_warps_q;
       q_scale_idx =
@@ -323,9 +340,36 @@ __global__ void qk_int_sv_i8_attn_kernel(
   uint32_t K_load_idx_lane_base =
       CTA_K / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK;
 
-  const uint32_t num_iterations = div_ceil(
-      mask_mode == MaskMode::kCausal ? min(kv_len, (bx + 1) * CTA_Q) : kv_len,
-      CTA_K);
+  const uint32_t route_idx =
+      (batch_id * num_qo_heads + head_id) * gridDim.x + bx;
+  const uint16_t *__restrict__ lut_row =
+      use_sparse_kv ? BlockLut + static_cast<int64_t>(route_idx) * lut_stride
+                    : nullptr;
+  uint32_t num_iterations;
+  uint32_t load_block = 0;
+  if constexpr (use_sparse_kv) {
+    // Sol always forces the diagonal neighbourhood, so every route is non-empty.
+    num_iterations = static_cast<uint32_t>(ValidBlockNum[route_idx]);
+    load_block = static_cast<uint32_t>(lut_row[0]);
+  } else {
+    num_iterations = div_ceil(
+        mask_mode == MaskMode::kCausal ? min(kv_len, (bx + 1) * CTA_Q) : kv_len,
+        CTA_K);
+  }
+
+  int8_t *const K_lane_origin = K_lane_base_ptr;
+  int8_t *const V_lane_origin = V_lane_base_ptr;
+  const uint32_t K_load_idx_origin = K_load_idx_lane_base;
+  const uint32_t K_idx_origin = K_idx_lane_base;
+  auto seek_kv_block = [&](uint32_t block) {
+    K_lane_base_ptr =
+        K_lane_origin + static_cast<int64_t>(block) * CTA_K * stride_seq_k;
+    V_lane_base_ptr = V_lane_origin + static_cast<int64_t>(block) * CTA_K;
+    K_load_idx_lane_base = K_load_idx_origin + block * CTA_K;
+  };
+
+  if constexpr (use_sparse_kv)
+    seek_kv_block(load_block);
 
   // load Q with predicate
   load_global_to_share<global_to_shared_line_lanes_QK,
@@ -361,7 +405,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
 
   float original_sm_scale = sm_scale;
   float dequant_scale =
-      q_scale * K_scale[k_scale_idx + 0 * k_scale_advance_offset];
+      q_scale * K_scale[k_scale_idx + load_block * k_scale_advance_offset];
 
   sm_scale = original_sm_scale * dequant_scale;
 
@@ -374,7 +418,8 @@ __global__ void qk_int_sv_i8_attn_kernel(
       &V_lane_base_ptr, V_smem_offset_load, stride_d_v, smem_V);
   cp_async::commit_group();
 
-  K_load_idx_lane_base += CTA_K;
+  if constexpr (!use_sparse_kv)
+    K_load_idx_lane_base += CTA_K;
 
 #pragma unroll
   for (uint32_t iter = 1; iter < num_iterations - 1; iter++) {
@@ -442,20 +487,32 @@ __global__ void qk_int_sv_i8_attn_kernel(
           RS[fq][0][k] = __float_as_int(pv_scale[fq][k]);
       }
     }
-    K_idx_lane_base += CTA_K;
+    if constexpr (!use_sparse_kv)
+      K_idx_lane_base += CTA_K;
 
     __syncthreads();
 
-    // load K without predicate
-    load_global_to_share<global_to_shared_line_lanes_QK,
-                         global_to_shared_copy_lines_per_warp_QK,
-                         QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK,
-                         QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
-        &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K);
+    if constexpr (use_sparse_kv) {
+      load_block = static_cast<uint32_t>(lut_row[iter]);
+      seek_kv_block(load_block);
+      load_global_to_share<global_to_shared_line_lanes_QK,
+                           global_to_shared_copy_lines_per_warp_QK,
+                           QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK,
+                           QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
+          &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K,
+          K_load_idx_lane_base, kv_len);
+    } else {
+      load_global_to_share<global_to_shared_line_lanes_QK,
+                           global_to_shared_copy_lines_per_warp_QK,
+                           QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK,
+                           QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
+          &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K);
+    }
     cp_async::commit_group();
 
-    dequant_scale =
-        q_scale * K_scale[k_scale_idx + iter * k_scale_advance_offset];
+    const uint32_t scale_block = use_sparse_kv ? load_block : iter;
+    dequant_scale = q_scale *
+        K_scale[k_scale_idx + scale_block * k_scale_advance_offset];
     sm_scale = original_sm_scale * dequant_scale;
 
     // ensure V is ready
@@ -474,7 +531,8 @@ __global__ void qk_int_sv_i8_attn_kernel(
         &V_lane_base_ptr, V_smem_offset_load, stride_d_v, smem_V);
     cp_async::commit_group();
 
-    K_load_idx_lane_base += CTA_K;
+    if constexpr (!use_sparse_kv)
+      K_load_idx_lane_base += CTA_K;
   }
 
   // second last iter, apply causal mask
@@ -548,10 +606,15 @@ __global__ void qk_int_sv_i8_attn_kernel(
           RS[fq][0][k] = __float_as_int(pv_scale[fq][k]);
       }
     }
-    K_idx_lane_base += CTA_K;
+    if constexpr (!use_sparse_kv)
+      K_idx_lane_base += CTA_K;
 
     __syncthreads();
 
+    if constexpr (use_sparse_kv) {
+      load_block = static_cast<uint32_t>(lut_row[num_iterations - 1]);
+      seek_kv_block(load_block);
+    }
     // load K with predicate
     load_global_to_share<global_to_shared_line_lanes_QK,
                          global_to_shared_copy_lines_per_warp_QK,
@@ -561,9 +624,10 @@ __global__ void qk_int_sv_i8_attn_kernel(
         K_load_idx_lane_base, kv_len);
     cp_async::commit_group();
 
-    dequant_scale =
-        q_scale *
-        K_scale[k_scale_idx + (num_iterations - 1) * k_scale_advance_offset];
+    const uint32_t scale_block =
+        use_sparse_kv ? load_block : num_iterations - 1;
+    dequant_scale = q_scale *
+        K_scale[k_scale_idx + scale_block * k_scale_advance_offset];
     sm_scale = original_sm_scale * dequant_scale;
 
     // ensure V is ready
@@ -582,7 +646,8 @@ __global__ void qk_int_sv_i8_attn_kernel(
         V_SMEM_STRIDE / PACK_SIZE_V, CTA_K>(
         &V_lane_base_ptr, V_smem_offset_load, stride_d_v, smem_V);
     cp_async::commit_group();
-    K_load_idx_lane_base += CTA_K;
+    if constexpr (!use_sparse_kv)
+      K_load_idx_lane_base += CTA_K;
   }
 
   // last iter, apply causal mask and out of bound mask
@@ -634,6 +699,8 @@ __global__ void qk_int_sv_i8_attn_kernel(
           mask_stride_h, mask_stride_k, batch_id, head_id, kv_len,
           mask_dtype_code, 1.0f);
     }
+    if constexpr (use_sparse_kv)
+      K_idx_lane_base = K_idx_origin + load_block * CTA_K;
     apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(
         K_idx_lane_base, RS_soft, kv_len,
         pre_scale_scores ? -50000.0f : -1.0e30f);
@@ -654,7 +721,8 @@ __global__ void qk_int_sv_i8_attn_kernel(
       for (uint32_t k = 0; k < 2; k++)
         RS[fq][0][k] = __float_as_int(pv_scale[fq][k]);
     }
-    K_idx_lane_base += CTA_K;
+    if constexpr (!use_sparse_kv)
+      K_idx_lane_base += CTA_K;
 
     // ensure V is ready
     cp_async::wait_group<0>();

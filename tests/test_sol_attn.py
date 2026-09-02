@@ -637,6 +637,17 @@ def test_no_tail_matches_eager():
     assert _cos_rows(dense, _masked_dense(q, k, v, valid), valid) > 0.9999
 
 
+def test_no_tail_sage_exact_ragged_and_strided():
+    """The long-sequence exact branch must preserve arbitrary BTHD strides and
+    mask the final partial KV tile after following its sparse route."""
+    q, k, v = _bhnd_views(1, 4096 + 31, 2, seed=19)
+    kw = {"topk_ratio": 0.2, "tail": False}
+    got = ck.sol_attn(q, k, v, **kw)
+    contiguous = ck.sol_attn(q.contiguous(), k.contiguous(), v.contiguous(), **kw)
+    assert torch.equal(got, contiguous)
+    assert _cos(got, sol_attn_eager(q, k, v, **kw)) > 0.99
+
+
 def _coarse_reference(q, k, v, valid, block_len, gate, scale=HD ** -0.5):
     """Independent per-block loop: masked dense attention plus gate * coarse term."""
     from comfy_kitchen.backends.eager.sol_attn import _block_lengths

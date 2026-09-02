@@ -147,6 +147,7 @@ set(CUDA_SOURCES
     sage_attention/quant_v_int8.cu
     sage_attention/quant_qk_int8.cu
     sage_attention/sage_attn_launcher.cu
+    sage_attention/sage_attn_sparse_launcher.cu
 )
 
 set(CPP_SOURCES
