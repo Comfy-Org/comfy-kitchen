@@ -1911,10 +1911,13 @@ void bf16_sdpa_hip(
     require_dtype(v, 2, 2, kFn, "v");
     require_dtype(output, 2, 2, kFn, "output");
     auto require_supported_layout = [&](const nb::ndarray<>& tensor, const char* name) {
-        if (tensor.stride(3) != 1 || tensor.stride(2) % 8 != 0) {
+        if (tensor.stride(3) != 1 || tensor.stride(2) % 8 != 0 ||
+            (tensor.shape(0) > 1 && tensor.stride(0) % 8 != 0) ||
+            (tensor.shape(1) > 1 && tensor.stride(1) % 8 != 0)) {
             throw std::runtime_error(
                 std::string(kFn) + ": " + name +
-                " must have a contiguous head dimension and 16-byte-aligned rows");
+                " must have a contiguous head dimension and 16-byte-aligned rows "
+                "across every batch and head");
         }
         if (reinterpret_cast<uintptr_t>(tensor.data()) % 16 != 0) {
             throw std::runtime_error(

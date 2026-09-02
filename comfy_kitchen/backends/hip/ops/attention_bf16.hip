@@ -12,6 +12,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <atomic>
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
@@ -27,29 +28,46 @@ constexpr float kAttentionLog2e = 1.4426950408889634f;
 
 inline bool use_gfx12_attention_schedule() {
     // COMFY_MMA_GFX12 is device-pass only; query the runtime arch for host dispatch.
-    static const bool selected = [] {
-        int device = 0;
+    constexpr int kMaxDevices = 16;
+    static std::atomic<int> cache[kMaxDevices] = {};
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) return false;
+
+    auto select = [device] {
         hipDeviceProp_t properties{};
-        if (hipGetDevice(&device) == hipSuccess &&
-            hipGetDeviceProperties(&properties, device) == hipSuccess &&
+        return hipGetDeviceProperties(&properties, device) == hipSuccess &&
             (std::strncmp(properties.gcnArchName, "gfx1170", 7) == 0 ||
-             std::strncmp(properties.gcnArchName, "gfx12", 5) == 0)) {
-            return true;
-        }
-        return false;
-    }();
-    return selected;
+             std::strncmp(properties.gcnArchName, "gfx12", 5) == 0);
+    };
+    if (device < 0 || device >= kMaxDevices) return select();
+
+    int selected = cache[device].load(std::memory_order_relaxed);
+    if (selected == 0) {
+        selected = select() ? 2 : 1;
+        cache[device].store(selected, std::memory_order_relaxed);
+    }
+    return selected == 2;
 }
 
 inline bool use_gfx1170_attention_schedule() {
-    static const bool selected = [] {
-        int device = 0;
+    constexpr int kMaxDevices = 16;
+    static std::atomic<int> cache[kMaxDevices] = {};
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) return false;
+
+    auto select = [device] {
         hipDeviceProp_t properties{};
-        return hipGetDevice(&device) == hipSuccess &&
-            hipGetDeviceProperties(&properties, device) == hipSuccess &&
+        return hipGetDeviceProperties(&properties, device) == hipSuccess &&
             std::strncmp(properties.gcnArchName, "gfx1170", 7) == 0;
-    }();
-    return selected;
+    };
+    if (device < 0 || device >= kMaxDevices) return select();
+
+    int selected = cache[device].load(std::memory_order_relaxed);
+    if (selected == 0) {
+        selected = select() ? 2 : 1;
+        cache[device].store(selected, std::memory_order_relaxed);
+    }
+    return selected == 2;
 }
 
 template <int HD, int BLOCK_M, int BLOCK_N>

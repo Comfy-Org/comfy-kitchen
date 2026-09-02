@@ -2474,6 +2474,18 @@ def _attention_device_is_supported(tensor: torch.Tensor) -> bool:
     return bool(tensor.is_cuda and _has_nonduplicated_wmma(tensor.device))
 
 
+def _attention_layout_is_supported(tensor: torch.Tensor) -> bool:
+    return (
+        tensor.stride(3) == 1
+        and tensor.stride(2) % 8 == 0
+        and all(
+            tensor.shape[dim] <= 1 or tensor.stride(dim) % 8 == 0
+            for dim in (0, 1)
+        )
+        and tensor.data_ptr() % 16 == 0
+    )
+
+
 def _attention_inputs_are_supported(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2494,9 +2506,7 @@ def _attention_inputs_are_supported(
         and q_shape[2] > 0
         and k_shape[2] == v_shape[2] > 0
         and q_shape[3] == k_shape[3] == v_shape[3] == 128
-        and q.stride(3) == k.stride(3) == v.stride(3) == 1
-        and q.stride(2) % 8 == k.stride(2) % 8 == v.stride(2) % 8 == 0
-        and q.data_ptr() % 16 == k.data_ptr() % 16 == v.data_ptr() % 16 == 0
+        and all(_attention_layout_is_supported(tensor) for tensor in (q, k, v))
     ):
         return False
     long = q_shape[0] == 1 and q_shape[2] >= 1024
