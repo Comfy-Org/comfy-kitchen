@@ -32,7 +32,7 @@ inline bool use_gfx12_attention_schedule() {
         hipDeviceProp_t properties{};
         if (hipGetDevice(&device) == hipSuccess &&
             hipGetDeviceProperties(&properties, device) == hipSuccess &&
-            (std::strcmp(properties.gcnArchName, "gfx1170") == 0 ||
+            (std::strncmp(properties.gcnArchName, "gfx1170", 7) == 0 ||
              std::strncmp(properties.gcnArchName, "gfx12", 5) == 0)) {
             return true;
         }
@@ -47,7 +47,7 @@ inline bool use_gfx1170_attention_schedule() {
         hipDeviceProp_t properties{};
         return hipGetDevice(&device) == hipSuccess &&
             hipGetDeviceProperties(&properties, device) == hipSuccess &&
-            std::strcmp(properties.gcnArchName, "gfx1170") == 0;
+            std::strncmp(properties.gcnArchName, "gfx1170", 7) == 0;
     }();
     return selected;
 }
