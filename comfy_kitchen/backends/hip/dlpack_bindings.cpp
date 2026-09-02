@@ -1928,6 +1928,11 @@ void bf16_sdpa_hip(
     require_supported_layout(k, "k");
     require_supported_layout(v, "v");
     require_supported_layout(output, "output");
+    if (q_len > 1 && output.stride(2) < head_dim) {
+        throw std::runtime_error(
+            std::string(kFn) +
+            ": output row stride must be at least the head dimension");
+    }
     constexpr int kDeviceRocm = nb::device::rocm::value;
     const nb::ndarray<>* operands[] = {&q, &k, &v, &output};
     for (const nb::ndarray<>* operand : operands) {

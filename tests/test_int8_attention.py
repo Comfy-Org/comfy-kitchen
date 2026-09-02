@@ -393,7 +393,6 @@ def test_gfx12_short_attention_capability_is_dimensional():
     assert not ck.hip_attention_is_supported(*long_fp16)
 
 
-@requires_int8_attention
 def test_gfx12_bf16_attention_rejects_misaligned_head_stride():
     skip_unless_gfx12_wmma()
 
@@ -418,6 +417,35 @@ def test_gfx12_bf16_attention_rejects_misaligned_head_stride():
     assert not ck.hip_attention_is_supported(q, k, v)
     with pytest.raises(RuntimeError, match="16-byte-aligned rows"):
         ck.hip_attention(q, k, v)
+
+
+@pytest.mark.parametrize("row_stride", [0, 64])
+def test_gfx12_bf16_attention_rejects_overlapping_output_rows(row_stride):
+    skip_unless_gfx12_wmma()
+    from comfy_kitchen.backends import hip
+
+    heads, length, head_dim = 4, 128, 128
+    head_stride = length * head_dim
+    storage = torch.empty(
+        heads * head_stride, device="cuda", dtype=torch.bfloat16
+    )
+    output = torch.as_strided(
+        storage,
+        (1, heads, length, head_dim),
+        (heads * head_stride, head_stride, row_stride, 1),
+    )
+    q, k, v = (
+        torch.randn(
+            1, heads, length, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        for _ in range(3)
+    )
+
+    with pytest.raises(RuntimeError, match="output row stride"):
+        hip._C.bf16_sdpa_hip(
+            hip._dl(q), hip._dl(k), hip._dl(v), hip._dl(output),
+            head_dim**-0.5, hip._stream(q),
+        )
 
 
 @requires_int8_attention
