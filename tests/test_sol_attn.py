@@ -401,9 +401,10 @@ def test_exact_branch_quantization_error():
 
 
 def test_chunked_producer_public_entry():
-    """comfy_kitchen.sol_attn_chunked is the CUDA backend's function."""
+    """comfy_kitchen.sol_attn_chunked is the registered backend's function."""
+    expected = hip_backend if ck.registry.is_available("hip") else cuda_backend
     assert "sol_attn_chunked" in ck.__all__
-    assert ck.sol_attn_chunked is cuda_backend.sol_attn_chunked
+    assert ck.sol_attn_chunked is expected.sol_attn_chunked
 
 
 def test_bindings_check_buffer_sizes():
