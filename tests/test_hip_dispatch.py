@@ -39,7 +39,7 @@ def _manifest_archs() -> list[str]:
 
 
 @pytest.mark.parametrize("value", [False, True])
-def test_hip_attention_scale_rejects_boolean_tensor(value):
+def test_hip_int8_attention_scale_rejects_boolean_tensor(value):
     q = torch.empty(1, 1, 1, 128)
     with pytest.raises(TypeError, match="scale"):
         hip_backend.hip_int8_attention(q, None, None, torch.tensor(value))
