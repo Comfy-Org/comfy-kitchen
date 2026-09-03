@@ -419,29 +419,41 @@ def test_gfx12_bf16_attention_rejects_misaligned_head_stride():
         ck.hip_attention(q, k, v)
 
 
-@pytest.mark.parametrize("row_stride", [0, 64])
-def test_gfx12_bf16_attention_rejects_overlapping_output_rows(row_stride):
+@pytest.mark.parametrize(
+    ("dimension", "bad_stride"),
+    [
+        ("batch", 0),
+        ("batch", 64),
+        ("head", 0),
+        ("head", 64),
+        ("row", 0),
+        ("row", 64),
+    ],
+)
+def test_gfx12_bf16_attention_rejects_overlapping_output_spans(
+    dimension, bad_stride
+):
     skip_unless_gfx12_wmma()
     from comfy_kitchen.backends import hip
 
-    heads, length, head_dim = 4, 128, 128
-    head_stride = length * head_dim
-    storage = torch.empty(
-        heads * head_stride, device="cuda", dtype=torch.bfloat16
-    )
+    batch, heads, length, head_dim = 2, 4, 128, 128
+    shape = (batch, heads, length, head_dim)
+    strides = [length * heads * head_dim, head_dim, heads * head_dim, 1]
+    strides[{"batch": 0, "head": 1, "row": 2}[dimension]] = bad_stride
+    storage = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
     output = torch.as_strided(
         storage,
-        (1, heads, length, head_dim),
-        (heads * head_stride, head_stride, row_stride, 1),
+        shape,
+        strides,
     )
     q, k, v = (
         torch.randn(
-            1, heads, length, head_dim, device="cuda", dtype=torch.bfloat16
+            shape, device="cuda", dtype=torch.bfloat16
         )
         for _ in range(3)
     )
 
-    with pytest.raises(RuntimeError, match="output row stride"):
+    with pytest.raises(RuntimeError, match="non-overlapping layout"):
         hip._C.bf16_sdpa_hip(
             hip._dl(q), hip._dl(k), hip._dl(v), hip._dl(output),
             head_dim**-0.5, hip._stream(q),
@@ -465,6 +477,35 @@ def test_gfx12_compact_batched_attention_matches_sdpa():
     assert ck.hip_int8_attention_is_supported(q, k, v)
     assert torch.equal(int8_mode, bf16)
     assert (bf16.float() - expected.float()).abs().max() <= 0.00390625
+
+
+@requires_int8_attention
+def test_gfx12_int8_attention_does_not_inherit_overlapping_q_strides():
+    skip_unless_gfx12_wmma()
+
+    torch.manual_seed(43)
+    heads, length, head_dim = 2, 1024, 128
+    q_storage = torch.randn(
+        length * heads * head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    q = torch.as_strided(
+        q_storage,
+        (1, heads, length, head_dim),
+        (length * heads * head_dim, 64, heads * head_dim, 1),
+    )
+    k, v = (
+        torch.randn(
+            1, heads, length, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        for _ in range(2)
+    )
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    actual = ck.hip_int8_attention(q, k, v)
+
+    assert 0 < q.stride(1) < head_dim
+    assert actual.stride(1) > 0
+    assert _nrmse(actual, expected) < 0.03
 
 
 @requires_int8_attention

@@ -2599,7 +2599,11 @@ def hip_int8_attention(
         return hip_attention(q, k, v, scale)
     q_len = int(q.shape[2])
     kv_len = int(k.shape[2])
-    output = torch.empty_strided(q.shape, q.stride(), device=q.device, dtype=q.dtype)
+    output = torch.empty(
+        (q.shape[0], q.shape[2], q.shape[1], q.shape[3]),
+        device=q.device,
+        dtype=q.dtype,
+    ).movedim(1, 2)
     workspaces = _int8_attention_workspace(q, q_len, kv_len)
     _C.hip_int8_attention(
         _dl(q),

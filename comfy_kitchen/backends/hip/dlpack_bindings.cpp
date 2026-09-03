@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1506,6 +1507,49 @@ static void require_packed_contiguous(const nb::ndarray<>& t, const char* fn, co
     }
 }
 
+static void require_non_overlapping_rows(
+    const nb::ndarray<>& output, int row_axis, uint64_t row_width,
+    const char* fn, const char* name) {
+    struct ActiveDimension {
+        uint64_t extent;
+        uint64_t stride;
+    };
+    ActiveDimension active_dimensions[3]{};
+    int active_count = 0;
+    for (int dim = 0; dim < row_axis; ++dim) {
+        if (output.shape(dim) <= 1) {
+            continue;
+        }
+        if (output.stride(dim) <= 0) {
+            throw std::runtime_error(
+                std::string(fn) + ": " + name + " must have a non-overlapping layout");
+        }
+        ActiveDimension current{
+            static_cast<uint64_t>(output.shape(dim)),
+            static_cast<uint64_t>(output.stride(dim))};
+        int insertion = active_count;
+        while (insertion > 0 &&
+               active_dimensions[insertion - 1].stride > current.stride) {
+            active_dimensions[insertion] = active_dimensions[insertion - 1];
+            --insertion;
+        }
+        active_dimensions[insertion] = current;
+        ++active_count;
+    }
+
+    uint64_t span = row_width;
+    for (int index = 0; index < active_count; ++index) {
+        const auto [extent, stride] = active_dimensions[index];
+        const uint64_t repeats = extent - 1;
+        if (stride < span ||
+            repeats > (std::numeric_limits<uint64_t>::max() - span) / stride) {
+            throw std::runtime_error(
+                std::string(fn) + ": " + name + " must have a non-overlapping layout");
+        }
+        span += repeats * stride;
+    }
+}
+
 static void sage_check_quantized(const nb::ndarray<>& q_int8, const nb::ndarray<>& q_scale,
                                  const nb::ndarray<>& k_int8, const nb::ndarray<>& k_scale,
                                  const nb::ndarray<>& v_int8, const nb::ndarray<>& v_scale,
@@ -1928,11 +1972,7 @@ void bf16_sdpa_hip(
     require_supported_layout(k, "k");
     require_supported_layout(v, "v");
     require_supported_layout(output, "output");
-    if (q_len > 1 && output.stride(2) < head_dim) {
-        throw std::runtime_error(
-            std::string(kFn) +
-            ": output row stride must be at least the head dimension");
-    }
+    require_non_overlapping_rows(output, 3, head_dim, kFn, "output");
     constexpr int kDeviceRocm = nb::device::rocm::value;
     const nb::ndarray<>* operands[] = {&q, &k, &v, &output};
     for (const nb::ndarray<>* operand : operands) {
@@ -2024,6 +2064,7 @@ void hip_int8_attention(
         throw std::runtime_error(
             std::string(kFn) + ": output head dimension must be contiguous");
     }
+    require_non_overlapping_rows(output, 3, 128, kFn, "output");
     require_packed_contiguous(q_int8, kFn, "q_int8");
     require_packed_contiguous(k_int8, kFn, "k_int8");
     require_packed_contiguous(v_int8, kFn, "v_int8");
