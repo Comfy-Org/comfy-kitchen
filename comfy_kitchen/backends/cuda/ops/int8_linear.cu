@@ -930,10 +930,15 @@ __device__ __forceinline__ float load_input_act(
     const InputType* __restrict__ x, int64_t in_row, int col, int K)
 {
     if constexpr (ACT == kActSwiGLU) {
-        // Matches torch silu(gate) * up.
+        // Match F.silu(gate) * up in the storage dtype. Leaving the product in
+        // fp32 changes the ConvRot row absmax versus the eager chain, which
+        // materializes silu and the multiply before quantization. One LSB of
+        // scale moves the whole INT8 row.
         const float gate = to_float(x[in_row + col]);
         const float up = to_float(x[in_row + K + col]);
-        return (gate / (1.0f + expf(-gate))) * up;
+        const float silu = gate / (1.0f + expf(-gate));
+        const float silu_r = to_float(from_float<InputType>(silu));
+        return to_float(from_float<InputType>(silu_r * up));
     } else {
         return apply_input_act<ACT>(to_float(x[in_row + col]));
     }
