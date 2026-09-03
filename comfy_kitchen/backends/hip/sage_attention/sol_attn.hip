@@ -8,7 +8,8 @@
 //   exact       walk each routed list, resuming route's online softmax
 // Entry paths: `launch_sol_attn` (post-rope q/k/v) or the chunked producer
 // (`sol_producer_begin/chunk`, then `launch_sol_attn_core`). Tensors are
-// (B, T, H, 128) bf16 and the kernels need WMMA, so gfx11 and gfx12 only.
+// (B, T, H, 128) bf16 or fp16 (the chunked producer takes bf16 only) and the
+// kernels need WMMA, so gfx11 and gfx12 only.
 //
 // The workspace carve-up matches the CUDA backend's sol_attn.cu slot for slot, so
 // the Python layer reads the same plan. What the slots CONTAIN differs by the two
@@ -28,7 +29,7 @@ void launch_sol_preprocess(const void*, const void*, const void*, void*, void*, 
                            void*, void*, void*, void*, void*, void*, void*, void*, void*,
                            const void*, const void*, int, int, int, int, int, int, int, int64_t,
                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                           float, float, hipStream_t);
+                           float, float, int, hipStream_t);
 size_t sol_preprocess_scratch_bytes(int, int, int);
 void launch_sol_producer(const void*, const void*, const void*, const void*, const void*,
                          const void*, void*, void*, void*, void*, void*, void*, void*, void*,
@@ -37,13 +38,13 @@ void launch_sol_producer(const void*, const void*, const void*, const void*, con
 void launch_sol_finish(void*, void*, void*, void*, const void*, const void*, void*, const void*,
                        int, int, int, int, int, int, float, float, hipStream_t);
 void launch_sol_vtranspose(const void*, const void*, void*, int, int, int, int, int64_t, int64_t,
-                           int64_t, hipStream_t);
+                           int64_t, int, hipStream_t);
 void launch_sol_route(const void*, const void*, const void*, const void*, const void*, const void*,
                       const void*, void*, void*, void*, void*, void*, const void*, int, int, int,
                       int, int, int, int, int, int, int, int, float, hipStream_t);
 void launch_sol_exact(const void*, const void*, const void*, const void*, const void*,
                       const void*, const void*, const void*, const void*, const void*,
-                      const void*, void*, int, int, int, int, int, int, float, hipStream_t);
+                      const void*, void*, int, int, int, int, int, int, float, int, hipStream_t);
 
 namespace {
 
@@ -109,7 +110,7 @@ void validate_shape(int batch, int seq_len, int num_heads) {
 void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* out,
                      const void* blen, int tail, int batch, int seq_len, int num_heads,
                      int sink_start, int sink_end, int sink_q_start, int sink_q_end,
-                     float scale_log2, hipStream_t stream) {
+                     float scale_log2, int elem, hipStream_t stream) {
     // top-k mode: the caller supplies the per-query-block threshold
     const void* thr = ext_threshold ? ext_threshold : static_cast<const void*>(w + p.thr);
     launch_sol_route(w + p.cen8, w + p.cens, w + p.kciP, w + p.kcs, w + p.vcT, w + p.vsc, thr,
@@ -118,7 +119,7 @@ void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* ou
                      sink_q_start, sink_q_end, scale_log2, stream);
     launch_sol_exact(w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb, w + p.vTi, w + p.vsc, w + p.idx,
                      w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart, out, batch, seq_len, p.Tp,
-                     num_heads, p.NQ, p.NTB, scale_log2, stream);
+                     num_heads, p.NQ, p.NTB, scale_log2, elem, stream);
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
         throw std::runtime_error(std::string("sol_attn: kernel launch failed: ") +
@@ -202,14 +203,16 @@ extern "C" void launch_sol_attn_core(void* workspace, void* out, const void* vsc
                       kmean_next, blen, batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ, tau,
                       scale_log2, stream);
     run_route_exact(p, w, ext_threshold, out, blen, tail, batch, seq_len, num_heads, sink_start,
-                    sink_end, sink_q_start, sink_q_end, scale_log2, stream);
+                    sink_end, sink_q_start, sink_q_end, scale_log2,
+                    comfy::hip_backend::sol::kSolBf16, stream);
     sol_check(hipMemcpyAsync(vamax_out, w + p.statsV, stats_bytes, hipMemcpyDeviceToDevice, stream),
               "reading back the V absmax");
 }
 
 extern "C" void launch_sol_attn(const void* q, const void* k, const void* v, void* out,
                                 void* workspace, int batch, int seq_len, int num_heads,
-                                int head_dim, float tau, float scale, const void* key_bias,
+                                int head_dim, int elem, float tau, float scale,
+                                const void* key_bias,
                                 const void* ext_threshold, const void* blen, int tail,
                                 int sink_start, int sink_end, int sink_q_start, int sink_q_end,
                                 int64_t qs_b, int64_t qs_t, int64_t qs_h, int64_t ks_b,
@@ -226,9 +229,9 @@ extern "C" void launch_sol_attn(const void* q, const void* k, const void* v, voi
                           w + p.kcs, w + p.vcT, w + p.thr, w + p.cen8, w + p.cens, w + p.vsc,
                           w + p.qmean, w + p.scratch, key_bias, blen, batch, seq_len, p.Tp,
                           num_heads, p.NTB, p.NPAD, p.NQ, qs_b, qs_t, qs_h, ks_b, ks_t, ks_h,
-                          vs_b, vs_t, vs_h, tau, scale_log2, stream);
+                          vs_b, vs_t, vs_h, tau, scale_log2, elem, stream);
     launch_sol_vtranspose(v, w + p.vsc, w + p.vTi, batch, seq_len, p.Tp, num_heads, vs_b, vs_t,
-                          vs_h, stream);
+                          vs_h, elem, stream);
     run_route_exact(p, w, ext_threshold, out, blen, tail, batch, seq_len, num_heads, sink_start,
-                    sink_end, sink_q_start, sink_q_end, scale_log2, stream);
+                    sink_end, sink_q_start, sink_q_end, scale_log2, elem, stream);
 }

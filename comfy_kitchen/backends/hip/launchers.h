@@ -77,7 +77,7 @@ void launch_sol_attn_core(void* workspace, void* out, const void* vscale, void* 
                           int sink_start, int sink_end, int sink_q_start, int sink_q_end,
                           hipStream_t stream);
 void launch_sol_attn(const void* q, const void* k, const void* v, void* out, void* workspace,
-                     int batch, int seq_len, int num_heads, int head_dim, float tau, float scale,
+                     int batch, int seq_len, int num_heads, int head_dim, int elem, float tau, float scale,
                      const void* key_bias, const void* ext_threshold, const void* blen, int tail,
                      int sink_start, int sink_end, int sink_q_start, int sink_q_end, int64_t qs_b,
                      int64_t qs_t, int64_t qs_h, int64_t ks_b, int64_t ks_t, int64_t ks_h,

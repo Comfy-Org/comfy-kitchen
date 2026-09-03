@@ -41,7 +41,7 @@ constexpr int kBlock = 64;     // Sol-Attn's routing granularity, in tokens
 // sol::NEG, so both backends drop the same blocks.
 constexpr float kNeg = -3.0e38f;
 
-// bf16 row stride of a staged tile; keeps the 16-byte stores aligned.
+// 16-bit row stride of a staged tile; keeps the 16-byte stores aligned.
 constexpr int kLdTile = kHeadDim + 8;
 
 // The stage launchers are host code and throw, so a failed async copy is reported
@@ -96,9 +96,15 @@ __forceinline__ __device__ float block_sum128(float x, float* s) {
     return r;
 }
 
+// q/k/v/out element type: bf16 or fp16 (_Float16). Everything after the load
+// (tiles, scales, int8 carriers) is the same; only the loads and the final store
+// convert.
+enum SolElem : int { kSolBf16 = 0, kSolFp16 = 1 };
+
 // Stage rows 0..len-1 (row t at src + t * stride, 16-byte loads) into the tile,
 // zero past len.
-__forceinline__ __device__ void stage_tile64(__bf16* tile, const __bf16* __restrict__ src,
+template <typename T>
+__forceinline__ __device__ void stage_tile64(T* tile, const T* __restrict__ src,
                                              int64_t stride, int len) {
     for (int idx = threadIdx.x; idx < kBlock * (kHeadDim / 8); idx += kHeadDim) {
         const int t = idx / (kHeadDim / 8), c8 = (idx % (kHeadDim / 8)) * 8;
@@ -113,11 +119,12 @@ __forceinline__ __device__ void stage_tile64(__bf16* tile, const __bf16* __restr
 // Per-token absmax scale and INT8 row, one thread per token. qi / qs point at
 // (this tile's first token, this head). Rows [len, nrows) exist in memory but are
 // dead (zero-padded tiles) and get zeros; rows past nrows do not exist.
-__forceinline__ __device__ void quant_q_rows(const __bf16* tile, int len, int nrows,
+template <typename T>
+__forceinline__ __device__ void quant_q_rows(const T* tile, int len, int nrows,
                                              int8_t* __restrict__ qi, float* __restrict__ qs,
                                              int H) {
     for (int t = threadIdx.x; t < nrows; t += kHeadDim) {
-        const __bf16* row = tile + t * kLdTile;  // zero-staged past len
+        const T* row = tile + t * kLdTile;  // zero-staged past len
         const bool live = t < len;
         float a = 0.f;
 #pragma unroll 8
@@ -140,7 +147,8 @@ __forceinline__ __device__ void quant_q_rows(const __bf16* tile, int len, int nr
 // Query-block centroid, quantized like a pseudo-row. One thread per channel;
 // returns this thread's channel mean. `sred` holds bytes on return -- sync before
 // reusing it.
-__forceinline__ __device__ float centroid_quant(const __bf16* tile, int len, float* sred,
+template <typename T>
+__forceinline__ __device__ float centroid_quant(const T* tile, int len, float* sred,
                                                 int8_t* __restrict__ cen8,
                                                 float* __restrict__ cens) {
     const int d = threadIdx.x;
@@ -161,13 +169,14 @@ __forceinline__ __device__ float centroid_quant(const __bf16* tile, int len, flo
 // Centred per-key scale and INT8 row. kbias (log2 units, or null) only the exact
 // branch reads, so biased blocks must be sink-routed. Dead rows get a zero scale,
 // a kNeg bias and zero bytes.
-__forceinline__ __device__ void quant_k_rows(const __bf16* tile, int len,
+template <typename T>
+__forceinline__ __device__ void quant_k_rows(const T* tile, int len,
                                              const float* __restrict__ kmean,
                                              const float* __restrict__ kbias,
                                              int8_t* __restrict__ ki, float2* __restrict__ ksb) {
     for (int p = threadIdx.x; p < kBlock; p += kHeadDim) {
         const bool live = p < len;
-        const __bf16* row = tile + p * kLdTile;
+        const T* row = tile + p * kLdTile;
         float a = 0.f;
 #pragma unroll 8
         for (int d = 0; d < kHeadDim; ++d) {

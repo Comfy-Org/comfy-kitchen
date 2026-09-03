@@ -155,7 +155,7 @@ def sol_attn(
             f"sol_attn: the eager reference is O(T^2) and would need "
             f"{score_bytes / 2**30:.1f} GiB for the score tensor at "
             f"(B={b}, H={h}, T={t}). It was selected because no fused backend "
-            f"accepted these inputs -- the CUDA backend requires bfloat16 on CUDA "
+            f"accepted these inputs -- the fused backends take bfloat16 or float16 "
             f"with head_dim 128, and got {q.dtype} on {q.device.type}."
         )
 

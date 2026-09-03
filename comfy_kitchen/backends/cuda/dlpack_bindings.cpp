@@ -279,7 +279,7 @@ extern "C" {
         cudaStream_t stream);
     void launch_sol_attn(
         const void* q, const void* k, const void* v, void* out, void* workspace,
-        int batch, int seq_len, int num_heads, int head_dim,
+        int batch, int seq_len, int num_heads, int head_dim, int elem,
         float tau, float scale, const void* key_bias,
         const void* ext_threshold, const void* blen, int tail,
         int sink_start, int sink_end, int sink_q_start, int sink_q_end,
@@ -1503,12 +1503,19 @@ static void need_workspace(const nb::ndarray<nb::device::cuda>& ws, int64_t batc
     if (n > 32 || (int64_t)ws.size() < v[n - 1])   // last slot is "total"
         throw std::runtime_error(std::string(who) + ": workspace too small for this shape");
 }
+// q/k/v/out element code for launch_sol_attn: 0 = bfloat16, 1 = float16, -1 = neither
+static int sol_elem_code(const nb::ndarray<nb::device::cuda>& a) {
+    if (a.dtype().bits != 16) return -1;
+    if (a.dtype().code == (uint8_t)nb::dlpack::dtype_code::Bfloat) return 0;
+    if (a.dtype().code == (uint8_t)nb::dlpack::dtype_code::Float) return 1;
+    return -1;
+}
 static void need_bthd(const nb::ndarray<nb::device::cuda>& a, int64_t b, int64_t t, int64_t h, int64_t d,
-                      const char* who, const char* what) {
-    const bool bf16 = a.dtype().code == (uint8_t)nb::dlpack::dtype_code::Bfloat && a.dtype().bits == 16;
-    if (a.ndim() != 4 || !bf16 ||
+                      int elem, const char* who, const char* what) {
+    if (a.ndim() != 4 || sol_elem_code(a) != elem ||
         a.shape(0) != (size_t)b || a.shape(1) != (size_t)t || a.shape(2) != (size_t)h || a.shape(3) != (size_t)d)
-        throw std::runtime_error(std::string(who) + ": " + what + " must be a (B, T, H, D) bfloat16 array");
+        throw std::runtime_error(std::string(who) + ": " + what
+                                 + " must be a (B, T, H, D) array of q's dtype (bfloat16 or float16)");
 }
 // The kernels stage rows with 16-byte loads: unit last stride, 16 B base, and
 // leading strides (of non-singleton dims) that keep every row 16 B aligned.
@@ -1558,10 +1565,12 @@ void sol_attn(
     if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
         throw std::runtime_error("sol_attn: threshold must have B*H*ceil(T/64) elements");
     if (block_len) check_block_len(*block_len, seq_len, "sol_attn");
-    need_bthd(q, batch, seq_len, num_heads, head_dim, "sol_attn", "q");
-    need_bthd(k, batch, seq_len, num_heads, head_dim, "sol_attn", "k");
-    need_bthd(v, batch, seq_len, num_heads, head_dim, "sol_attn", "v");
-    need_bthd(out, batch, seq_len, num_heads, head_dim, "sol_attn", "out");
+    const int elem = sol_elem_code(q);
+    if (elem < 0) throw std::runtime_error("sol_attn: q must be bfloat16 or float16");
+    need_bthd(q, batch, seq_len, num_heads, head_dim, elem, "sol_attn", "q");
+    need_bthd(k, batch, seq_len, num_heads, head_dim, elem, "sol_attn", "k");
+    need_bthd(v, batch, seq_len, num_heads, head_dim, elem, "sol_attn", "v");
+    need_bthd(out, batch, seq_len, num_heads, head_dim, elem, "sol_attn", "out");
     need_staging_layout(q, "sol_attn", "q");
     need_staging_layout(k, "sol_attn", "k");
     need_staging_layout(v, "sol_attn", "v");
@@ -1571,7 +1580,7 @@ void sol_attn(
     // Explicit strides: only the last dim must be contiguous (BHND views go in as-is).
     launch_sol_attn(
         q.data(), k.data(), v.data(), out.data(), workspace.data(),
-        (int)batch, (int)seq_len, (int)num_heads, (int)head_dim,
+        (int)batch, (int)seq_len, (int)num_heads, (int)head_dim, elem,
         tau, scale,
         key_bias ? key_bias->data() : nullptr,
         threshold ? threshold->data() : nullptr,
@@ -3898,7 +3907,7 @@ NB_MODULE(_C, m) {
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"));
 
     m.def("sol_attn", &sol_attn,
-          "Sol-Attn training-free sparse attention (BF16 in/out, head_dim 128)",
+          "Sol-Attn training-free sparse attention (BF16 or FP16 in/out, head_dim 128)",
           nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("out"),
           nb::arg("workspace"),
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),

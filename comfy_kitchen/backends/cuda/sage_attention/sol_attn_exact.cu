@@ -57,6 +57,7 @@ constexpr int NSTAGE = 2;      // pipeline depth; occupancy beats depth here
 #define SOL_EXACT_BOUNDS __launch_bounds__(NTHREADS)
 #endif
 
+template <typename TOut>
 __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     const int8_t* __restrict__ qi, const float* __restrict__ qs,
     const int8_t* __restrict__ kiP, const float2* __restrict__ ksb,
@@ -64,7 +65,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     const uint16_t* __restrict__ blk_idx, const int32_t* __restrict__ blk_cnt,
     const __nv_bfloat16* __restrict__ o_part, const float* __restrict__ m_part,
     const float* __restrict__ l_part,
-    __nv_bfloat16* __restrict__ out,
+    TOut* __restrict__ out,
     int T, int Tp, int H, int NTB, float scale_log2)
 {
 #if SOL_SM80
@@ -278,12 +279,12 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         const int r = q_row0 + rr * 8;
         if (r >= T) continue;
         const float inv = rr ? inv1 : inv0;
-        __nv_bfloat16* orow = out + bh_base + (int64_t)r * H * HD;
+        TOut* orow = out + bh_base + (int64_t)r * H * HD;
         #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {
             const int c = nt * 8 + qd * 2;
-            orow[c]     = __float2bfloat16(o_acc[nt][rr * 2]     * inv * vsc[vsc_base + c]);
-            orow[c + 1] = __float2bfloat16(o_acc[nt][rr * 2 + 1] * inv * vsc[vsc_base + c + 1]);
+            orow[c]     = from_f32<TOut>(o_acc[nt][rr * 2]     * inv * vsc[vsc_base + c]);
+            orow[c + 1] = from_f32<TOut>(o_acc[nt][rr * 2 + 1] * inv * vsc[vsc_base + c + 1]);
         }
     }
 #endif  // SOL_SM80
@@ -297,14 +298,18 @@ void launch_sol_exact(
     const void* blk_idx, const void* blk_cnt,
     const void* o_part, const void* m_part, const void* l_part, void* out,
     int B, int T, int Tp, int H, int NQ, int NTB,
-    float scale_log2, cudaStream_t stream)
+    float scale_log2, int elem, cudaStream_t stream)
 {
     dim3 grid(NQ, B * H);
-    sol_exact_kernel<<<grid, NTHREADS, 0, stream>>>(
-        (const int8_t*)qi, (const float*)qs, (const int8_t*)kiP, (const float2*)ksb,
-        (const int8_t*)vTi, (const float*)vsc,
-        (const uint16_t*)blk_idx, (const int32_t*)blk_cnt,
-        (const __nv_bfloat16*)o_part, (const float*)m_part, (const float*)l_part,
-        (__nv_bfloat16*)out, T, Tp, H, NTB, scale_log2);
+#define SOLX_LAUNCH(TOut)                                                              \
+    sol_exact_kernel<TOut><<<grid, NTHREADS, 0, stream>>>(                             \
+        (const int8_t*)qi, (const float*)qs, (const int8_t*)kiP, (const float2*)ksb,   \
+        (const int8_t*)vTi, (const float*)vsc,                                         \
+        (const uint16_t*)blk_idx, (const int32_t*)blk_cnt,                             \
+        (const __nv_bfloat16*)o_part, (const float*)m_part, (const float*)l_part,     \
+        (TOut*)out, T, Tp, H, NTB, scale_log2)
+    if (elem == sol::SOL_FP16) SOLX_LAUNCH(__half);
+    else SOLX_LAUNCH(__nv_bfloat16);
+#undef SOLX_LAUNCH
 }
 

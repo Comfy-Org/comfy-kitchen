@@ -18,8 +18,8 @@ constexpr int HD = kHeadDim;
 constexpr int kThreads = 256;
 constexpr int kLdsPad = HD + 16;  // must be a multiple of 16: phase 1 writes 16 bytes
 
-template <int TT>
-__global__ __launch_bounds__(kThreads) void vquant_transpose(const __bf16* __restrict__ v,
+template <int TT, typename E>
+__global__ __launch_bounds__(kThreads) void vquant_transpose(const E* __restrict__ v,
                                                              const float* __restrict__ vsc,
                                                              int8_t* __restrict__ vT, int T,
                                                              int Tp, int H, int64_t sb, int64_t st,
@@ -33,7 +33,7 @@ __global__ __launch_bounds__(kThreads) void vquant_transpose(const __bf16* __res
         const int t = idx / (HD / 16), c16 = (idx % (HD / 16)) * 16;
         __attribute__((aligned(16))) int8_t out[16];
         if (t0 + t < T) {
-            const __bf16* src =
+            const E* src =
                 v + batch * sb + static_cast<int64_t>(t0 + t) * st + head * sh + c16;
 #pragma unroll
             for (int j = 0; j < 16; ++j) {
@@ -79,9 +79,15 @@ __global__ __launch_bounds__(kThreads) void vquant_transpose(const __bf16* __res
 using namespace comfy::hip_backend::sol;
 
 void launch_sol_vtranspose(const void* v, const void* vsc, void* vT, int B, int T, int Tp, int H,
-                           int64_t sb, int64_t st, int64_t sh, hipStream_t stream) {
+                           int64_t sb, int64_t st, int64_t sh, int elem, hipStream_t stream) {
     dim3 grid((T + 255) / 256, B * H);
-    vquant_transpose<256><<<grid, kThreads, 0, stream>>>(
-        static_cast<const __bf16*>(v), static_cast<const float*>(vsc), static_cast<int8_t*>(vT), T,
-        Tp, H, sb, st, sh);
+    if (elem == kSolFp16) {
+        vquant_transpose<256, _Float16><<<grid, kThreads, 0, stream>>>(
+            static_cast<const _Float16*>(v), static_cast<const float*>(vsc),
+            static_cast<int8_t*>(vT), T, Tp, H, sb, st, sh);
+    } else {
+        vquant_transpose<256, __bf16><<<grid, kThreads, 0, stream>>>(
+            static_cast<const __bf16*>(v), static_cast<const float*>(vsc),
+            static_cast<int8_t*>(vT), T, Tp, H, sb, st, sh);
+    }
 }

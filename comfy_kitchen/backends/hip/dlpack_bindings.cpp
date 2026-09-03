@@ -1573,13 +1573,18 @@ static void sol_need_workspace(const nb::ndarray<>& ws, int64_t batch, int64_t s
     }
 }
 
+// q/k/v/out element code for launch_sol_attn: 0 = bfloat16, 1 = float16, -1 = neither
+static int sol_elem_code(const nb::ndarray<>& a) {
+    const int code = map_dtype_to_code(a.dtype());
+    return code == 2 ? 0 : code == 1 ? 1 : -1;
+}
 static void sol_need_bthd(const nb::ndarray<>& a, int64_t b, int64_t t, int64_t h, int64_t d,
-                          const char* fn, const char* what) {
-    if (a.ndim() != 4 || map_dtype_to_code(a.dtype()) != 2 ||
+                          int elem, const char* fn, const char* what) {
+    if (a.ndim() != 4 || sol_elem_code(a) != elem ||
         a.shape(0) != static_cast<size_t>(b) || a.shape(1) != static_cast<size_t>(t) ||
         a.shape(2) != static_cast<size_t>(h) || a.shape(3) != static_cast<size_t>(d)) {
         throw std::runtime_error(std::string(fn) + ": " + what +
-                                 " must be a (B, T, H, D) bfloat16 array");
+                                 " must be a (B, T, H, D) array of q's dtype (bfloat16 or float16)");
     }
 }
 
@@ -1632,10 +1637,12 @@ void sol_attn(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> o
         sol_need_elems(*threshold, batch * num_heads * ((seq_len + 63) / 64), 0, kFn, "threshold");
     }
     if (block_len) sol_check_block_len(*block_len, seq_len, kFn);
-    sol_need_bthd(q, batch, seq_len, num_heads, head_dim, kFn, "q");
-    sol_need_bthd(k, batch, seq_len, num_heads, head_dim, kFn, "k");
-    sol_need_bthd(v, batch, seq_len, num_heads, head_dim, kFn, "v");
-    sol_need_bthd(out, batch, seq_len, num_heads, head_dim, kFn, "out");
+    const int elem = sol_elem_code(q);
+    if (elem < 0) throw std::runtime_error(std::string(kFn) + ": q must be bfloat16 or float16");
+    sol_need_bthd(q, batch, seq_len, num_heads, head_dim, elem, kFn, "q");
+    sol_need_bthd(k, batch, seq_len, num_heads, head_dim, elem, kFn, "k");
+    sol_need_bthd(v, batch, seq_len, num_heads, head_dim, elem, kFn, "v");
+    sol_need_bthd(out, batch, seq_len, num_heads, head_dim, elem, kFn, "out");
     sol_need_staging_layout(q, kFn, "q");
     sol_need_staging_layout(k, kFn, "k");
     sol_need_staging_layout(v, kFn, "v");
@@ -1645,7 +1652,7 @@ void sol_attn(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> o
     // Explicit strides: only the last dim must be contiguous (BHND views go in as-is).
     launch_sol_attn(q.data(), k.data(), v.data(), out.data(), workspace.data(),
                     static_cast<int>(batch), static_cast<int>(seq_len),
-                    static_cast<int>(num_heads), static_cast<int>(head_dim), tau, scale,
+                    static_cast<int>(num_heads), static_cast<int>(head_dim), elem, tau, scale,
                     opt_data(key_bias), opt_data(threshold), opt_data(block_len), tail ? 1 : 0,
                     static_cast<int>(sink_start), static_cast<int>(sink_end),
                     static_cast<int>(sink_q_start), static_cast<int>(sink_q_end), q.stride(0),
@@ -1732,7 +1739,7 @@ NB_MODULE(_C, m) {
           "Workspace dims, slot byte offsets and total bytes for this shape",
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"));
     m.def("sol_attn", &sol_attn,
-          "Sol-Attn training-free sparse attention (BF16 in/out, head_dim 128)",
+          "Sol-Attn training-free sparse attention (BF16 or FP16 in/out, head_dim 128)",
           nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("out"), nb::arg("workspace"),
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"), nb::arg("head_dim"),
           nb::arg("tau"), nb::arg("scale"), nb::arg("sink_start"), nb::arg("sink_end"),

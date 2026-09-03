@@ -290,7 +290,7 @@ def test_direct_backend_validates_like_the_public_path():
     """The backend-direct entry runs the same shared rule as the registry."""
     q, k, v = _qkv(1, 512, 4)
     with pytest.raises(ValueError, match="bfloat16"):
-        backend.sol_attn(q.half(), k.half(), v.half(), tau=1.4)
+        backend.sol_attn(q.float(), k.float(), v.float(), tau=1.4)
     with pytest.raises(ValueError, match="shape"):
         backend.sol_attn(q, k[:, :256].contiguous(), v, tau=1.4)
 
@@ -398,6 +398,43 @@ def test_exact_branch_quantization_error():
     ref = _dense(q, k, v)
     rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
     assert rel < 0.016, rel
+
+
+@pytest.mark.parametrize("t", [1024, 3137])
+def test_fp16_inputs_match_bf16(t):
+    """fp16 q/k/v go straight into the same int8 pipeline (only the loads and the
+    output store convert), so the two dtypes agree to output rounding."""
+    q, k, v = _qkv(1, t, 4)
+    q16, k16, v16 = (x.half() for x in (q, k, v))   # bf16 values are exact in fp16
+    ref = ck.sol_attn(q, k, v, tau=1.0)
+    got = ck.sol_attn(q16, k16, v16, tau=1.0)
+    assert got.dtype == torch.float16
+    rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
+    assert rel < 4e-3, rel
+    assert _cos(got, sol_attn_eager(q16, k16, v16, tau=1.0)) > 0.998
+
+
+def test_fp16_strided_inputs_and_mixed_dtype():
+    """BHND fp16 views go in as-is; the binding rejects out/k/v that differ from q."""
+    b, t, h = 2, 1000, 3
+    q, k, v = _qkv(b, t, h, seed=5)
+    q16, k16, v16 = (x.half().permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+                     for x in (q, k, v))
+    got = ck.sol_attn(q16, k16, v16, tau=1.0)
+    ref = ck.sol_attn(q, k, v, tau=1.0)
+    rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
+    assert rel < 4e-3, rel
+
+    ext, w = backend._C, _wrap
+    ws = torch.empty(ext.sol_attn_plan(1, 256, 1)["total"], dtype=torch.uint8, device="cuda")
+    q1, k1, v1 = _qkv(1, 256, 1)
+    stream = torch.cuda.current_stream().cuda_stream
+    args = (1, 256, 1, HD, 1.0, HD ** -0.5, 0, 0, 0, 0, stream)
+    with pytest.raises(RuntimeError, match="out"):
+        ext.sol_attn(w(q1), w(k1), w(v1), w(torch.empty_like(q1, dtype=torch.float16)), w(ws), *args)
+    with pytest.raises(RuntimeError, match="k must be"):
+        ext.sol_attn(w(q1.half()), w(k1), w(v1.half()), w(torch.empty_like(q1, dtype=torch.float16)),
+                     w(ws), *args)
 
 
 def test_chunked_producer_public_entry():

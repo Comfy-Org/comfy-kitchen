@@ -22,7 +22,8 @@
 //   exact       walk each routed list, resuming route's online softmax
 // Entry paths: `launch_sol_attn` (post-rope q/k/v) or the chunked producer
 // (`sol_producer_begin/chunk`, then `launch_sol_attn_core`). sm_80+, tuned
-// for sm_120; tensors are (B, T, H, 128) bf16.
+// for sm_120; tensors are (B, T, H, 128) bf16 or fp16 (the chunked producer
+// takes bf16 only).
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -38,7 +39,7 @@ void launch_sol_preprocess(const void*, const void*, const void*, void*, void*, 
                            void*, const void*, const void*,
                            int, int, int, int, int, int, int,
                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                           int64_t, int64_t, int64_t, float, float, cudaStream_t);
+                           int64_t, int64_t, int64_t, float, float, int, cudaStream_t);
 size_t sol_preprocess_scratch_bytes(int, int, int);
 void launch_sol_producer(const void*, const void*, const void*, const void*,
                          const void*, const void*, void*, void*, void*, void*,
@@ -49,7 +50,7 @@ void launch_sol_finish(void*, void*, void*, void*, const void*, const void*, voi
                        const void*, int, int, int, int, int, int, float, float,
                        cudaStream_t);
 void launch_sol_vtranspose(const void*, const void*, void*, int, int, int, int,
-                           int64_t, int64_t, int64_t, cudaStream_t);
+                           int64_t, int64_t, int64_t, int, cudaStream_t);
 void launch_sol_route(const void*, const void*, const void*, const void*, const void*,
                       const void*, const void*, void*, void*, void*, void*, void*,
                       const void*, int,
@@ -57,7 +58,7 @@ void launch_sol_route(const void*, const void*, const void*, const void*, const 
                       float, cudaStream_t);
 void launch_sol_exact(const void*, const void*, const void*, const void*, const void*,
                       const void*, const void*, const void*, const void*, const void*,
-                      const void*, void*, int, int, int, int, int, int, float,
+                      const void*, void*, int, int, int, int, int, int, float, int,
                       cudaStream_t);
 
 namespace {
@@ -121,7 +122,7 @@ void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* ou
                      const void* blen, int tail,
                      int batch, int seq_len, int num_heads,
                      int sink_start, int sink_end, int sink_q_start, int sink_q_end,
-                     float scale_log2, cudaStream_t stream)
+                     float scale_log2, int elem, cudaStream_t stream)
 {
     // top-k mode: the caller supplies the per-query-block threshold
     const void* thr = ext_threshold ? ext_threshold : (const void*)(w + p.thr);
@@ -132,7 +133,7 @@ void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* ou
     launch_sol_exact(w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb, w + p.vTi, w + p.vsc,
                      w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart, out,
                      batch, seq_len, p.Tp, num_heads, p.NQ, p.NTB,
-                     scale_log2, stream);
+                     scale_log2, elem, stream);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
         throw std::runtime_error(std::string("sol_attn: kernel launch failed: ")
@@ -214,13 +215,14 @@ extern "C" void launch_sol_attn_core(
                       batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ,
                       tau, scale_log2, stream);
     run_route_exact(p, w, ext_threshold, out, blen, tail, batch, seq_len, num_heads,
-                    sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
+                    sink_start, sink_end, sink_q_start, sink_q_end, scale_log2,
+                    sol::SOL_BF16, stream);
     cudaMemcpyAsync(vamax_out, w + p.statsV, stats_bytes, cudaMemcpyDeviceToDevice, stream);
 }
 
 extern "C" void launch_sol_attn(
     const void* q, const void* k, const void* v, void* out, void* workspace,
-    int batch, int seq_len, int num_heads, int head_dim,
+    int batch, int seq_len, int num_heads, int head_dim, int elem,
     float tau, float scale, const void* key_bias,
     const void* ext_threshold, const void* blen, int tail,
     int sink_start, int sink_end, int sink_q_start, int sink_q_end,
@@ -242,9 +244,9 @@ extern "C" void launch_sol_attn(
                           key_bias, blen,
                           batch, seq_len, p.Tp, num_heads, p.NTB, p.NPAD, p.NQ,
                           qs_b, qs_t, qs_h, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h,
-                          tau, scale_log2, stream);
+                          tau, scale_log2, elem, stream);
     launch_sol_vtranspose(v, w + p.vsc, w + p.vTi, batch, seq_len, p.Tp, num_heads,
-                          vs_b, vs_t, vs_h, stream);
+                          vs_b, vs_t, vs_h, elem, stream);
     run_route_exact(p, w, ext_threshold, out, blen, tail, batch, seq_len, num_heads,
-                    sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
+                    sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, elem, stream);
 }

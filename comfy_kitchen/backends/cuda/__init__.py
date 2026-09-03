@@ -2464,7 +2464,7 @@ def sol_attn(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 tensors.
+    """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
     See sage_attention/sol_attn.cu and the public docstring for ``tail``,
     ``block_len`` and ``coarse_gate``.
 
@@ -2473,8 +2473,8 @@ def sol_attn(
     (sinks and the diagonal still ride on top). tau is ignored then.
     """
     batch, t, h, d = q.shape
-    if q.dtype != torch.bfloat16:
-        raise ValueError(f"sol_attn: q/k/v must be bfloat16, got {q.dtype}")
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
     _check_sol_args(q.device, sink_blocks, sink_q, topk_ratio, q=q, k=k, v=v,
                     block_len=block_len, coarse_gate=coarse_gate)
     if scale is None:
@@ -3376,15 +3376,15 @@ def _build_constraints() -> dict:
         "sol_attn": FunctionConstraints(
             params={
                 "q": ParamConstraint(
-                    dtypes=frozenset({torch.bfloat16}),
+                    dtypes=frozenset({torch.bfloat16, torch.float16}),
                     shape_rules=(ExactDims(4),),
                 ),
                 "k": ParamConstraint(
-                    dtypes=frozenset({torch.bfloat16}),
+                    dtypes=frozenset({torch.bfloat16, torch.float16}),
                     shape_rules=(ExactDims(4),),
                 ),
                 "v": ParamConstraint(
-                    dtypes=frozenset({torch.bfloat16}),
+                    dtypes=frozenset({torch.bfloat16, torch.float16}),
                     shape_rules=(ExactDims(4),),
                 ),
             },

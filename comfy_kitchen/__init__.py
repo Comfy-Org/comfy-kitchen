@@ -152,8 +152,8 @@ def sol_attn(
     below roughly 12k tokens dense or a fused attention is usually faster.
 
     Args:
-        q, k, v: ``(B, T, H, 128)`` tensors, same shape and dtype. The CUDA
-            backend requires bfloat16; head_dim is fixed at 128.
+        q, k, v: ``(B, T, H, 128)`` tensors, same shape and dtype. The fused
+            backends take bfloat16 or float16; head_dim is fixed at 128.
         tau: Routing threshold in sigmas of the proxy row. Higher routes fewer
             blocks exactly: cheaper and less accurate.
         scale: Score scale; None means ``head_dim ** -0.5``.

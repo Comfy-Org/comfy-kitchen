@@ -23,6 +23,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cstdint>
 
 #include "mma.cuh"
@@ -66,9 +67,9 @@ __device__ __forceinline__ int block_len_of(const int32_t* blen, int n, int T) {
     return blen ? min(rem, max(1, blen[n])) : rem;
 }
 
-// ---- Tile quantization: one 128-thread CTA per staged 64 x 128 bf16 tile ----
+// ---- Tile quantization: one 128-thread CTA per staged 64 x 128 16-bit tile ----
 
-constexpr int LD_TILE = HEAD_DIM + 8;   // bf16 row stride; keeps uint4 stores aligned
+constexpr int LD_TILE = HEAD_DIM + 8;   // 16-bit row stride; keeps uint4 stores aligned
 
 __device__ __forceinline__ int8_t q8(float x, float inv) {
     return (int8_t)max(-127, min(127, __float2int_rn(x * inv)));
@@ -101,10 +102,21 @@ __device__ __forceinline__ float block_sum128(float x, float* s) {
     return r;
 }
 
+// q/k/v/out element type: bf16 or fp16. Everything after the load (tiles,
+// scales, int8 carriers) is the same; only the loads and the final store
+// convert.
+enum SolElem : int { SOL_BF16 = 0, SOL_FP16 = 1 };
+__device__ __forceinline__ float to_f32(__nv_bfloat16 x) { return __bfloat162float(x); }
+__device__ __forceinline__ float to_f32(__half x) { return __half2float(x); }
+template <typename T> __device__ __forceinline__ T from_f32(float x);
+template <> __device__ __forceinline__ __nv_bfloat16 from_f32<__nv_bfloat16>(float x) { return __float2bfloat16(x); }
+template <> __device__ __forceinline__ __half from_f32<__half>(float x) { return __float2half(x); }
+
 // Stage rows 0..len-1 (row t at src + t*stride, 16 B loads) into the tile,
 // zero past len.
+template <typename T>
 __device__ __forceinline__ void stage_tile64(
-    __nv_bfloat16* tile, const __nv_bfloat16* __restrict__ src, int64_t stride, int len)
+    T* tile, const T* __restrict__ src, int64_t stride, int len)
 {
     for (int idx = threadIdx.x; idx < BLOCK * (HEAD_DIM / 8); idx += HEAD_DIM) {
         const int t = idx / (HEAD_DIM / 8), c8 = (idx % (HEAD_DIM / 8)) * 8;
@@ -120,22 +132,23 @@ __device__ __forceinline__ void stage_tile64(
 // memory but are dead (zero-padded tiles) and get zeros; rows past nrows do
 // not exist. The permuted row is built in registers: scattered byte stores
 // cost 128 per token.
+template <typename T>
 __device__ __forceinline__ void quant_q_rows(
-    const __nv_bfloat16* tile, int len, int nrows,
+    const T* tile, int len, int nrows,
     int8_t* __restrict__ qiP, float* __restrict__ qs, int H)
 {
     for (int t = threadIdx.x; t < nrows; t += HEAD_DIM) {
-        const __nv_bfloat16* row = tile + t * LD_TILE;   // zero-staged past len
+        const T* row = tile + t * LD_TILE;   // zero-staged past len
         const bool live = t < len;
         float a = 0.f;
         #pragma unroll 8   // unbounded, nvcc hoists all 128 loads: 168 regs in the producer
-        for (int d = 0; d < HEAD_DIM; ++d) a = fmaxf(a, fabsf(__bfloat162float(row[d])));
+        for (int d = 0; d < HEAD_DIM; ++d) a = fmaxf(a, fabsf(to_f32(row[d])));
         const float sc = live ? fmaxf(a / 127.0f, 1e-8f) : 0.f;   // dead rows: deterministic zeros
         qs[(size_t)t * H] = sc;
         const float inv = live ? 1.f / sc : 0.f;
         __align__(16) int8_t out[HEAD_DIM];
         #pragma unroll
-        for (int d = 0; d < HEAD_DIM; ++d) out[perm_d(d)] = q8(__bfloat162float(row[d]), inv);
+        for (int d = 0; d < HEAD_DIM; ++d) out[perm_d(d)] = q8(to_f32(row[d]), inv);
         int8_t* dst = qiP + (size_t)t * H * HEAD_DIM;
         #pragma unroll
         for (int c = 0; c < HEAD_DIM; c += 16)
@@ -146,13 +159,14 @@ __device__ __forceinline__ void quant_q_rows(
 // Query-block centroid, quantized like a pseudo-row with the pooled keys'
 // perm_d. One thread per channel; returns this thread's channel mean. `sred`
 // holds bytes on return -- sync before reusing it.
+template <typename T>
 __device__ __forceinline__ float centroid_quant(
-    const __nv_bfloat16* tile, int len, float* sred,
+    const T* tile, int len, float* sred,
     int8_t* __restrict__ cen8, float* __restrict__ cens)
 {
     const int d = threadIdx.x;
     float c = 0.f;
-    for (int t = 0; t < len; ++t) c += __bfloat162float(tile[t * LD_TILE + d]);
+    for (int t = 0; t < len; ++t) c += to_f32(tile[t * LD_TILE + d]);
     c /= (float)len;
     const float csc = fmaxf(block_max128(fabsf(c), sred) / 127.0f, 1e-8f);
     char* s8 = reinterpret_cast<char*>(sred);
@@ -168,17 +182,18 @@ __device__ __forceinline__ float centroid_quant(
 // row perm_key(p). kbias (log2 units, or null) is indexed by source row and
 // only the exact branch reads it, so biased blocks must be sink-routed. Dead
 // rows get a zero scale, NEG bias and zero bytes.
+template <typename T>
 __device__ __forceinline__ void quant_k_rows(
-    const __nv_bfloat16* tile, int len, const float* __restrict__ kmean,
+    const T* tile, int len, const float* __restrict__ kmean,
     const float* __restrict__ kbias, int8_t* __restrict__ kiP, float2* __restrict__ ksb)
 {
     for (int p = threadIdx.x; p < BLOCK; p += HEAD_DIM) {
         const int s = perm_key(p);
         const bool live = s < len;
-        const __nv_bfloat16* row = tile + s * LD_TILE;
+        const T* row = tile + s * LD_TILE;
         float a = 0.f;
         for (int d = 0; d < HEAD_DIM; ++d)
-            a = fmaxf(a, fabsf(__bfloat162float(row[d]) - kmean[d]));
+            a = fmaxf(a, fabsf(to_f32(row[d]) - kmean[d]));
         const float sc = fmaxf(a / 127.0f, 1e-8f);
         const float bias = (kbias && live) ? kbias[s] : 0.f;
         ksb[p] = make_float2(live ? sc : 0.f, live ? bias : NEG);
@@ -186,7 +201,7 @@ __device__ __forceinline__ void quant_k_rows(
         __align__(16) int8_t out[HEAD_DIM];
         #pragma unroll
         for (int d = 0; d < HEAD_DIM; ++d)
-            out[perm_d(d)] = live ? q8(__bfloat162float(row[d]) - kmean[d], inv) : (int8_t)0;
+            out[perm_d(d)] = live ? q8(to_f32(row[d]) - kmean[d], inv) : (int8_t)0;
         #pragma unroll
         for (int c = 0; c < HEAD_DIM; c += 16)
             *reinterpret_cast<uint4*>(kiP + (size_t)p * HEAD_DIM + c) =

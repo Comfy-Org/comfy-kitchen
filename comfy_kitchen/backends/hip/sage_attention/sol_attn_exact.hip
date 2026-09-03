@@ -42,12 +42,13 @@ constexpr int kStrideV = BK + kLdsPad;
 // qi:  [B,T,H,D] int8                  qs:  [B,T,H] f32
 // ki:  [B*H,Tp,D] int8                 ksb: [B*H,Tp] float2 = (ks, bias)
 // vT:  [B*H,D,Tp] int8 (transposed)    vsc: [B*H,D] f32
+template <typename TOut>
 __global__ __launch_bounds__(kThreads) void sol_exact_kernel(
     const int8_t* __restrict__ qi, const float* __restrict__ qs, const int8_t* __restrict__ ki,
     const float2* __restrict__ ksb, const int8_t* __restrict__ vT, const float* __restrict__ vsc,
     const uint16_t* __restrict__ blk_idx, const int32_t* __restrict__ blk_cnt,
     const __bf16* __restrict__ o_part, const float* __restrict__ m_part,
-    const float* __restrict__ l_part, __bf16* __restrict__ out, int T, int Tp, int H, int NTB,
+    const float* __restrict__ l_part, TOut* __restrict__ out, int T, int Tp, int H, int NTB,
     float scale_log2) {
     __shared__ __attribute__((aligned(16))) int8_t sK[BK * kStrideK];
     __shared__ __attribute__((aligned(16))) int8_t sVt[HD * kStrideV];
@@ -173,7 +174,7 @@ __global__ __launch_bounds__(kThreads) void sol_exact_kernel(
     if (q_row >= T) return;
     // l is zero only when a row got no mass from either branch; zeros are right there
     const float inv = 1.f / fmaxf(l_r, 1e-30f);
-    __bf16* orow = out + bh_base + static_cast<int64_t>(q_row) * H * HD;
+    TOut* orow = out + bh_base + static_cast<int64_t>(q_row) * H * HD;
 #pragma unroll
     for (int nt = 0; nt < NT; ++nt) {
         float vals[8];
@@ -181,7 +182,7 @@ __global__ __launch_bounds__(kThreads) void sol_exact_kernel(
         for (int e = 0; e < 8; ++e) {
             vals[e] = o_acc[nt][e] * inv * vsc[vsc_base + nt * 16 + acc_row(lane, e)];
         }
-        store_o_tile<__bf16>(orow, nt * 16, vals, lane);
+        store_o_tile<TOut>(orow, nt * 16, vals, lane);
     }
 }
 
@@ -193,14 +194,21 @@ using namespace comfy::hip_backend::sol;
 void launch_sol_exact(const void* qi, const void* qs, const void* ki, const void* ksb,
                       const void* vT, const void* vsc, const void* blk_idx, const void* blk_cnt,
                       const void* o_part, const void* m_part, const void* l_part, void* out, int B,
-                      int T, int Tp, int H, int NQ, int NTB, float scale_log2,
+                      int T, int Tp, int H, int NQ, int NTB, float scale_log2, int elem,
                       hipStream_t stream) {
     dim3 grid(NQ, B * H);
-    sol_exact_kernel<<<grid, kThreads, 0, stream>>>(
-        static_cast<const int8_t*>(qi), static_cast<const float*>(qs),
-        static_cast<const int8_t*>(ki), static_cast<const float2*>(ksb),
-        static_cast<const int8_t*>(vT), static_cast<const float*>(vsc),
-        static_cast<const uint16_t*>(blk_idx), static_cast<const int32_t*>(blk_cnt),
-        static_cast<const __bf16*>(o_part), static_cast<const float*>(m_part),
-        static_cast<const float*>(l_part), static_cast<__bf16*>(out), T, Tp, H, NTB, scale_log2);
+#define SOLX_LAUNCH(TOut)                                                                    \
+    sol_exact_kernel<TOut><<<grid, kThreads, 0, stream>>>(                                   \
+        static_cast<const int8_t*>(qi), static_cast<const float*>(qs),                       \
+        static_cast<const int8_t*>(ki), static_cast<const float2*>(ksb),                     \
+        static_cast<const int8_t*>(vT), static_cast<const float*>(vsc),                      \
+        static_cast<const uint16_t*>(blk_idx), static_cast<const int32_t*>(blk_cnt),         \
+        static_cast<const __bf16*>(o_part), static_cast<const float*>(m_part),               \
+        static_cast<const float*>(l_part), static_cast<TOut*>(out), T, Tp, H, NTB, scale_log2)
+    if (elem == kSolFp16) {
+        SOLX_LAUNCH(_Float16);
+    } else {
+        SOLX_LAUNCH(__bf16);
+    }
+#undef SOLX_LAUNCH
 }
