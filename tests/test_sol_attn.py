@@ -390,6 +390,22 @@ def test_chunked_producer_matches_separate_rope(rot):
     assert _cos(out3, ref) > 0.995
 
 
+def test_exact_branch_quantization_error():
+    """Full-range per-block P quantization: with every block routed the exact
+    branch must sit well under the ~2%% relL2 of the running-max scheme."""
+    q, k, v = _qkv(1, 4096, 8)
+    out = ck.sol_attn(q, k, v, tau=-1e9)
+    ref = _dense(q, k, v)
+    rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
+    assert rel < 0.016, rel
+
+
+def test_chunked_producer_public_entry():
+    """comfy_kitchen.sol_attn_chunked is the CUDA backend's function."""
+    assert "sol_attn_chunked" in ck.__all__
+    assert ck.sol_attn_chunked is cuda_backend.sol_attn_chunked
+
+
 def test_bindings_check_buffer_sizes():
     """The _C entries take bare pointers sized from integers; each must reject
     an undersized buffer itself, not rely on the Python wrappers."""

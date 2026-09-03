@@ -86,7 +86,7 @@ __global__ __launch_bounds__(kThreads) void sol_exact_kernel(
 #pragma unroll
         for (int nt = 0; nt < NT; ++nt) load_o_tile<__bf16>(orow, nt * 16, o_acc[nt], lane);
     }
-    float m_r = m_part[qb_s], l_r = l_part[qb_s];
+    float m_r = m_part[qb_s], l_r = l_part[qb_s], c_r = m_r;   // c_r: scale o_acc / l_r are carried in
 
     for (int kb = 0; kb < n_blocks; ++kb) {
         const int64_t k0 = static_cast<int64_t>(my_idx[kb]) * BK;
@@ -118,7 +118,9 @@ __global__ __launch_bounds__(kThreads) void sol_exact_kernel(
         }
 
         float p_val[KT][8];
-        float m_new = m_r;
+        // P is quantized against the block max (floored 2^-20 under the running
+        // max) so every block gets the full u8 range
+        float bmax = m_r - 20.f;
 #pragma unroll
         for (int kt = 0; kt < KT; ++kt) {
 #pragma unroll
@@ -127,15 +129,16 @@ __global__ __launch_bounds__(kThreads) void sol_exact_kernel(
                 // A dead key carries a zero scale and a kNeg bias, so its score is kNeg.
                 const float s = fmaf(static_cast<float>(s_acc[kt][e]), qsc * kb2.x, kb2.y);
                 p_val[kt][e] = s;
-                m_new = fmaxf(m_new, s);
+                bmax = fmaxf(bmax, s);
             }
         }
-        m_new = fmaxf(m_new, swap_half_wave(m_new));
-        const float alpha = exp2f(m_r - m_new);
-        m_r = m_new;
+        bmax = fmaxf(bmax, swap_half_wave(bmax));
+        const float alpha = exp2f(c_r - bmax);
+        c_r = bmax;
+        m_r = fmaxf(m_r, bmax);
 
         // u8 P scale folded into the exponent (+log2 255); l carries it too
-        const float m_off = m_new - kProbU8Offset;
+        const float m_off = bmax - kProbU8Offset;
         typename MmaInt8::Frag p_frag[KT];
         uint32_t li = 0u;
 #pragma unroll
