@@ -38,6 +38,13 @@ def _manifest_archs() -> list[str]:
     return [arch for group_name in _HIP_ARCH_GROUP_NAMES for arch in groups[group_name]]
 
 
+@pytest.mark.parametrize("value", [False, True])
+def test_hip_attention_scale_rejects_boolean_tensor(value):
+    q = torch.empty(1, 1, 1, 128)
+    with pytest.raises(TypeError, match="scale"):
+        hip_backend.hip_int8_attention(q, None, None, torch.tensor(value))
+
+
 def test_non_rocm_runtime_does_not_import_hip_backend():
     """A combined wheel must not load the ROCm runtime in CUDA/CPU processes."""
     if getattr(torch.version, "hip", None):

@@ -62,6 +62,8 @@ def test_attention_scale_accepts_numeric_scalars(scale, expected):
         (torch.ones(2), ValueError),
         ("0.5", TypeError),
         (True, TypeError),
+        (torch.tensor(False), TypeError),
+        (torch.tensor(True), TypeError),
         (float("nan"), ValueError),
         (torch.tensor(float("inf")), ValueError),
     ],
@@ -69,6 +71,12 @@ def test_attention_scale_accepts_numeric_scalars(scale, expected):
 def test_attention_scale_rejects_invalid_values(scale, error):
     with pytest.raises(error, match="scale"):
         sage_attention_module._validate_attention_scale(scale, 1.0)
+
+
+@pytest.mark.parametrize("value", [False, True])
+def test_int8_attention_rejects_boolean_tensor_scale(value):
+    with pytest.raises(TypeError, match="scale"):
+        ck.int8_attention(None, None, None, scale=torch.tensor(value))
 
 
 def test_prequantized_attention_rejects_cpu_tensors():

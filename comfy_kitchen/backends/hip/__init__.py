@@ -60,6 +60,8 @@ def _validate_attention_scale(scale: object, default: float) -> float:
     if isinstance(scale, torch.Tensor):
         if scale.numel() != 1:
             raise ValueError(f"scale must be a scalar, got shape {tuple(scale.shape)}")
+        if scale.dtype == torch.bool:
+            raise TypeError(f"scale must be a real numeric scalar, got {scale.dtype}")
         if scale.is_complex():
             raise TypeError(f"scale must be a real numeric scalar, got {scale.dtype}")
         try:
