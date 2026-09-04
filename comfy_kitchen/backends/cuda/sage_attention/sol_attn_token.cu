@@ -54,7 +54,7 @@ __device__ __forceinline__ int hist_bin(float rel) {
 __device__ __forceinline__ float hist_edge(int b) {
     return b <= NB_FINE ? (float)b * HW : (float)NB_FINE * HW + (float)(b - NB_FINE) * HW_COARSE;
 }
-constexpr int P1_MAX_TILES = 1024;            // per pass-1 split, so a 16-bit bin cannot overflow
+constexpr int P1_MAX_TILES = 1023;            // per pass-1 split: 1023 x 64 counts stay below a 16-bit bin
 constexpr float MASKED = TILE_MASKED;         // scores at or below this are masked
 constexpr int HIST_STRIDE = 1;                // pass 1 walks every tile; exact counts keep the cap from binding
 
@@ -377,24 +377,23 @@ __global__ void SOL_TOKEN_BOUNDS sol_token_kernel(
 #endif  // SOL_SM80
 }
 
-// sort each list (n_tok is a power of two <= 256) so the exact kernel's order is deterministic
+// sort each list so the exact kernel's order is deterministic: a 256-lane bitonic
+// network padded with a max sentinel (n_tok need not be a power of two)
 __global__ void sol_token_sort_kernel(uint32_t* __restrict__ tok_idx, const int32_t* __restrict__ tok_cnt,
                                       int NQ, int n_tok) {
-    __shared__ uint32_t s[256];
+    __shared__ uint32_t s[NTOK_MAX];
     const size_t qs = (size_t)blockIdx.y * NQ + blockIdx.x;
     const int n = min(tok_cnt[qs], n_tok), t = threadIdx.x;
     uint32_t* row = tok_idx + qs * n_tok;
-    if (t < n_tok) s[t] = t < n ? row[t] : 0xffffffffu;
+    s[t] = t < n ? row[t] : 0xffffffffu;
     __syncthreads();
-    for (int k = 2; k <= n_tok; k <<= 1) {
+    for (int k = 2; k <= NTOK_MAX; k <<= 1) {
         for (int j = k >> 1; j > 0; j >>= 1) {
-            if (t < n_tok) {
-                const int p = t ^ j;
-                if (p > t) {
-                    const bool up = (t & k) == 0;
-                    const uint32_t a = s[t], b = s[p];
-                    if ((a > b) == up) { s[t] = b; s[p] = a; }
-                }
+            const int p = t ^ j;
+            if (p > t) {
+                const bool up = (t & k) == 0;
+                const uint32_t a = s[t], b = s[p];
+                if ((a > b) == up) { s[t] = b; s[p] = a; }
             }
             __syncthreads();
         }
@@ -476,7 +475,7 @@ void launch_sol_token(
     sol_token_kernel<1><<<grid1, NTHREADS, s1, stream>>>(SOLT_ARGS);
     sol_token_kernel<2><<<grid, NTHREADS, s2, stream>>>(SOLT_ARGS);
 #undef SOLT_ARGS
-    sol_token_sort_kernel<<<dim3(NG, B * H), 256, 0, stream>>>((uint32_t*)tok_idx, (const int32_t*)tok_cnt, NG, n_tok);
+    sol_token_sort_kernel<<<dim3(NG, B * H), NTOK_MAX, 0, stream>>>((uint32_t*)tok_idx, (const int32_t*)tok_cnt, NG, n_tok);
     sol_token_merge_kernel<<<dim3(NQ, B * H), HD, 0, stream>>>(
         (const __nv_bfloat16*)part_o, (const float*)part_m, (const float*)part_l,
         (__nv_bfloat16*)o_part, (float*)m_part, (float*)l_part, NQ, NG, nsplit);

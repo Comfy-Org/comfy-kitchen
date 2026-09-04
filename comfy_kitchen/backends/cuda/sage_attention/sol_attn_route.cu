@@ -178,16 +178,20 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
                     if (cand[1]) row[slot1] = (uint16_t)(gs + c0 + 1);
                 }
                 cnt[rr] += total;
-                if (valid[0] && !pre[0] && !cand[0]) refm[rr] = fmaxf(refm[rr], score[0]);
-                if (valid[1] && !pre[1] && !cand[1]) refm[rr] = fmaxf(refm[rr], score[1]);
-                // token routing: unrouted blocks go to the token passes instead of the pooled tail
+                // token routing: a block unrouted by this row AND by its TOK_GROUP partner
+                // (row q ^ 1, four lanes over) goes to the token passes instead of the
+                // pooled tail; a block the partner routed stays pooled here
                 bool ctok[2] = {false, false};
                 if (cand_bits) {
+                    const uint32_t unr = (valid[0] && !pre[0] && !cand[0] ? 1u : 0u)
+                                       | (valid[1] && !pre[1] && !cand[1] ? 2u : 0u);
+                    const uint32_t peer = __shfl_xor_sync(0xffffffffu, unr | (live[rr] ? 4u : 0u), 4);
+                    const uint32_t both = unr & ((peer & 4u) ? peer : 3u);   // no live partner: own bits
                     #pragma unroll
                     for (int cc = 0; cc < 2; ++cc) {
-                        ctok[cc] = valid[cc] && !pre[cc] && !cand[cc];
+                        ctok[cc] = (both >> cc) & 1u;
                         const int bit = c0 + cc;   // 0..63 within the group
-                        if (ctok[cc]) cbits[rr][bit >> 5] |= 1u << (bit & 31);
+                        if (ctok[cc]) { cbits[rr][bit >> 5] |= 1u << (bit & 31); refm[rr] = fmaxf(refm[rr], score[cc]); }
                     }
                 }
                 // exact-routed and sink blocks leave the tail (this form costs 3 fewer regs);

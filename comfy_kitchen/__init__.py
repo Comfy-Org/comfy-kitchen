@@ -209,7 +209,9 @@ def sol_attn_is_available(device: torch.device | int | None = None) -> bool:
         # only on WMMA parts, so its registration is the answer
         return registry.is_available("hip") and registry.get_constraints("hip", "sol_attn") is not None
     rules = registry.get_constraints("cuda", "sol_attn")
-    return (registry.is_available("cuda") and _cuda_backend._EXT_AVAILABLE and rules is not None
+    ext = getattr(_cuda_backend, "_C", None)
+    return (registry.is_available("cuda") and _cuda_backend._EXT_AVAILABLE and hasattr(ext, "sol_attn")
+            and rules is not None
             and torch.cuda.get_device_capability(device) >= rules.min_compute_capability)
 
 

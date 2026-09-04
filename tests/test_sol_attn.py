@@ -513,16 +513,18 @@ def test_token_aug_chunked_matches_direct():
 
 @cuda_only
 def test_token_aug_validation_and_no_tail():
-    """Bad budgets are rejected; flat scores admit nothing; dense rows are untouched;
-    the stage works without the tail."""
+    """Bad budgets are rejected; identical keys admit nothing (one score bin, over budget);
+    dense rows are untouched; the stage works without the tail and with a budget that is
+    not a power of two."""
     q, k, v = _qkv(1, 2048, 4)
     for bad in (100, 512, -64):
         with pytest.raises(NoCapableBackendError, match="token_aug"):
             ck.sol_attn(q, k, v, topk_ratio=0.2, token_aug=bad)
         with pytest.raises(RuntimeError, match="token_aug"):
             backend._C.sol_attn_plan(1, 2048, 4, token_aug=bad)
-    flat = ck.sol_attn(q, k, v, topk_ratio=0.2, tail=False, token_aug=256)
-    assert torch.equal(flat, ck.sol_attn(q, k, v, topk_ratio=0.2, tail=False))
+    kf = k[:, :1].expand_as(k).contiguous()
+    flat = ck.sol_attn(q, kf, v, topk_ratio=0.2, tail=False, token_aug=256)
+    assert torch.equal(flat, ck.sol_attn(q, kf, v, topk_ratio=0.2, tail=False))
     full = ck.sol_attn(q, k, v, tau=1.4, sink_q=[0, 32], token_aug=256)
     assert torch.equal(full, ck.sol_attn(q, k, v, tau=1.4, sink_q=[0, 32]))
     q, k, v = _token_routing_case(t=2048, h=4)
@@ -530,6 +532,10 @@ def test_token_aug_validation_and_no_tail():
     aug = ck.sol_attn(q, k, v, topk_ratio=0.2, tail=False, token_aug=256)
     assert torch.isfinite(aug.float()).all()
     assert _rel(aug, _dense(q, k, v)) < _rel(no_tail, _dense(q, k, v))
+    aug192 = ck.sol_attn(q, k, v, topk_ratio=0.2, tail=False, token_aug=192)
+    assert torch.isfinite(aug192.float()).all()
+    assert _rel(aug192, _dense(q, k, v)) < _rel(no_tail, _dense(q, k, v))
+    assert torch.equal(aug192, ck.sol_attn(q, k, v, topk_ratio=0.2, tail=False, token_aug=192))
 
 
 def test_chunked_producer_public_entry():
