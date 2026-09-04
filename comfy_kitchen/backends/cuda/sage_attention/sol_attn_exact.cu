@@ -38,12 +38,8 @@ using namespace sol;
 
 constexpr int HD = HEAD_DIM, BQ = BLOCK, BK = BLOCK;
 constexpr int NWARP = BQ / 16, NTHREADS = NWARP * 32;
-constexpr int KC  = HD / 32;   // int8 k-chunks for S = Q.K^T
-constexpr int NKT = BK / 8;    // score n8 tiles
-constexpr int NT  = HD / 8;    // output n8 tiles
-constexpr int PKC = BK / 32;   // int8 k-chunks for O += P.V
-constexpr int LDK = HD;        // 128 B, XOR-swizzled
-constexpr int LDV = BK;        // 64 B, XOR-swizzled
+constexpr int KC = TILE_KC, NKT = TILE_NKT, NT = TILE_NT;   // tile shapes: sol_layout.cuh
+constexpr int LDK = TILE_LDK, LDV = TILE_LDV;               // 128 B / 64 B rows, XOR-swizzled
 constexpr int NSTAGE = 2;      // pipeline depth; occupancy beats depth here
 
 // qi:  [B,T,H,D] int8
@@ -65,6 +61,8 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     const uint16_t* __restrict__ blk_idx, const int32_t* __restrict__ blk_cnt,
     const __nv_bfloat16* __restrict__ o_part, const float* __restrict__ m_part,
     const float* __restrict__ l_part,
+    const int8_t* __restrict__ vRow,          // [B*H,Tp,D] int8, row-major (token tiles)
+    const uint32_t* __restrict__ tok_idx, const int32_t* __restrict__ tok_cnt, int n_tok,
     TOut* __restrict__ out,
     int T, int Tp, int H, int NTB, float scale_log2)
 {
@@ -151,6 +149,16 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         cp_commit();
     }
 
+    auto compute_tile = [&](int cur, const float2* kb_src) {
+        int32_t s_acc[NKT][4];
+        tile_qk(SK(cur), qa, g, qd, s_acc);
+        float p_val[NKT][4];
+        float bmax[2] = {m_r[0] - 20.f, m_r[1] - 20.f};   // floor: 2^-20 under the running max
+        bool has[2] = {true, true};                         // routed blocks always hold live keys
+        tile_scores<true>(s_acc, kb_src, qsc, qd, p_val, bmax);
+        tile_softmax_pv<false>(p_val, bmax, has, SVT(cur), g, qd, m_r, l_r, c_r, o_acc);
+    };
+
     for (int kb = 0; kb < n_blocks; ++kb) {
         const int cur = kb % NSTAGE;
         const int64_t cur_k0 = (int64_t)my_idx[kb] * BK;
@@ -162,114 +170,63 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         cp_wait<NSTAGE - 1>();
         __syncthreads();
 
-        int32_t s_acc[NKT][4];
-        #pragma unroll
-        for (int nt = 0; nt < NKT; ++nt) {
-            s_acc[nt][0] = 0; s_acc[nt][1] = 0; s_acc[nt][2] = 0; s_acc[nt][3] = 0;
-            const int R = nt * 8 + g;
-            const int8_t* krow = SK(cur) + R * LDK + ((qd & 1) << 3);
-            const int swk = swz_k(R), qhi = qd >> 1;
-            #pragma unroll
-            for (int kc = 0; kc < KC; ++kc) {
-                const uint2 kb = *reinterpret_cast<const uint2*>(
-                    krow + (((kc * 2 + qhi) ^ swk) << 4));
-                uint32_t kbf[2] = {kb.x, kb.y};
-                mma_s8(s_acc[nt], qa[kc], kbf);
-            }
-        }
-
-        float p_val[NKT][4];
-        // P is quantized against the block max (floored 2^-20 under the running
-        // max) so every block gets the full u8 range
-        float bmax[2] = {m_r[0] - 20.f, m_r[1] - 20.f};
-        #pragma unroll
-        for (int nt = 0; nt < NKT; ++nt) {
-            const int c0 = nt * 8 + qd * 2;
-            // (ks, bias) x 2 columns = one aligned float4 (c0 is even)
-            const float4 kb4 = *reinterpret_cast<const float4*>(ksb + kp_base + cur_k0 + c0);
-            const float k0s = kb4.x, m0 = kb4.y, k1s = kb4.z, m1 = kb4.w;
-            #pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const int row = e >> 1;
-                const float s = (e & 1) ? fmaf((float)s_acc[nt][e], qsc[row] * k1s, m1)
-                                        : fmaf((float)s_acc[nt][e], qsc[row] * k0s, m0);
-                p_val[nt][e] = s;
-                bmax[row] = fmaxf(bmax[row], s);
-            }
-        }
-        #pragma unroll
-        for (int off = 1; off <= 2; off <<= 1) {
-            bmax[0] = fmaxf(bmax[0], __shfl_xor_sync(0xffffffffu, bmax[0], off));
-            bmax[1] = fmaxf(bmax[1], __shfl_xor_sync(0xffffffffu, bmax[1], off));
-        }
-        const float alpha0 = exp2f(c_r[0] - bmax[0]);
-        const float alpha1 = exp2f(c_r[1] - bmax[1]);
-        c_r[0] = bmax[0]; c_r[1] = bmax[1];
-        m_r[0] = fmaxf(m_r[0], bmax[0]);
-        m_r[1] = fmaxf(m_r[1], bmax[1]);
-
-        // u8 P scale folded into the exponent (+log2 255); l carries it too
-        const float m_off[2] = {bmax[0] - 7.99435344f, bmax[1] - 7.99435344f};
-        #pragma unroll
-        for (int nt = 0; nt < NKT; ++nt) {
-            #pragma unroll
-            for (int e = 0; e < 4; ++e)
-                p_val[nt][e] = exp2f(p_val[nt][e] - m_off[e >> 1]);
-        }
-
-        // free repack (see header): n-tiles (4kk, 4kk+1) -> keys 32kk+4q..+3
-        uint32_t pa[PKC][4];
-        #pragma unroll
-        for (int kk = 0; kk < PKC; ++kk) {
-            const int b0 = 4 * kk, b1 = b0 + 1, b2 = b0 + 2, b3 = b0 + 3;
-            pa[kk][0] = mma::pack_u8x4(
-                p_val[b0][0], p_val[b0][1], p_val[b1][0], p_val[b1][1]);
-            pa[kk][1] = mma::pack_u8x4(
-                p_val[b0][2], p_val[b0][3], p_val[b1][2], p_val[b1][3]);
-            pa[kk][2] = mma::pack_u8x4(
-                p_val[b2][0], p_val[b2][1], p_val[b3][0], p_val[b3][1]);
-            pa[kk][3] = mma::pack_u8x4(
-                p_val[b2][2], p_val[b2][3], p_val[b3][2], p_val[b3][3]);
-        }
-
-        // l sums the PACKED bytes so num and den quantize identically
-        uint32_t li[2] = {0, 0};
-        #pragma unroll
-        for (int kk = 0; kk < PKC; ++kk) {
-            li[0] = __dp4a(pa[kk][0], 0x01010101u, li[0]);
-            li[0] = __dp4a(pa[kk][2], 0x01010101u, li[0]);
-            li[1] = __dp4a(pa[kk][1], 0x01010101u, li[1]);
-            li[1] = __dp4a(pa[kk][3], 0x01010101u, li[1]);
-        }
-        #pragma unroll
-        for (int off = 1; off <= 2; off <<= 1) {
-            li[0] += __shfl_xor_sync(0xffffffffu, li[0], off);
-            li[1] += __shfl_xor_sync(0xffffffffu, li[1], off);
-        }
-        l_r[0] = l_r[0] * alpha0 + (float)li[0];
-        l_r[1] = l_r[1] * alpha1 + (float)li[1];
-
-        #pragma unroll
-        for (int nt = 0; nt < NT; ++nt) {
-            int32_t d[4] = {0, 0, 0, 0};
-            const int C = nt * 8 + g;
-            const int8_t* vcol = SVT(cur) + C * LDV + ((qd & 1) << 3);
-            const int swv = swz_v(C), qhi2 = qd >> 1;
-            #pragma unroll
-            for (int kk = 0; kk < PKC; ++kk) {
-                const uint2 vb = *reinterpret_cast<const uint2*>(
-                    vcol + (((kk * 2 + qhi2) ^ swv) << 4));
-                uint32_t vbf[2] = {vb.x, vb.y};
-                mma_u8s8(d, pa[kk], vbf);
-            }
-            o_acc[nt][0] = fmaf(o_acc[nt][0], alpha0, (float)d[0]);
-            o_acc[nt][1] = fmaf(o_acc[nt][1], alpha0, (float)d[1]);
-            o_acc[nt][2] = fmaf(o_acc[nt][2], alpha1, (float)d[2]);
-            o_acc[nt][3] = fmaf(o_acc[nt][3], alpha1, (float)d[3]);
-        }
+        compute_tile(cur, ksb + kp_base + cur_k0);
         __syncthreads();   // next iteration refills `cur`
     }
 #undef SOLX_STAGE
+
+    // token tiles: the listed tokens gathered into the block layout
+    if (n_tok > 0) {
+        cp_wait<0>();
+        __syncthreads();
+        // (scale, bias) go in the idle stage-1 V buffer: more static smem would cost a CTA/SM
+        float2* sKsb = reinterpret_cast<float2*>(SVT(1));
+        const int NG = (gridDim.x + TOK_GROUP - 1) / TOK_GROUP;   // one list per group
+        const int64_t qs_tok = (int64_t)bh * NG + q_block / TOK_GROUP;
+        const int n_sel = min(tok_cnt[qs_tok], n_tok);
+        const uint32_t* my_tok = tok_idx + qs_tok * n_tok;
+        constexpr int VEC = HD / 16;
+        for (int ti = 0; ti < (n_sel + BK - 1) / BK; ++ti) {
+            const int nvalid = min(BK, n_sel - ti * BK);
+            for (int idx = tid; idx < BK * VEC; idx += NTHREADS) {
+                const int p = idx / VEC, c16 = idx % VEC, jj = perm_key(p);
+                int8_t* dst = SK(0) + p * LDK + ((c16 ^ swz_k(p)) << 4);
+                if (jj < nvalid) {
+                    const uint32_t t = my_tok[ti * BK + jj];
+                    cp_async16(dst, kiP + kd_base + ((int64_t)(t >> 6) * BK + perm_key_inv(t & 63)) * HD + c16 * 16);
+                } else {
+                    *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
+                }
+            }
+            if (tid < BK) {
+                const int jj = perm_key(tid);
+                float2 kb = make_float2(0.f, NEG);
+                if (jj < nvalid) {
+                    const uint32_t t = my_tok[ti * BK + jj];
+                    kb = ksb[kp_base + (int64_t)(t >> 6) * BK + perm_key_inv(t & 63)];
+                }
+                sKsb[tid] = kb;
+            }
+            for (int idx = tid; idx < BK * VEC; idx += NTHREADS) {
+                const int j = idx / VEC, c16 = idx % VEC, kp = perm_d(j);
+                uint4 raw = make_uint4(0u, 0u, 0u, 0u);
+                if (j < nvalid)
+                    raw = *reinterpret_cast<const uint4*>(
+                        vRow + ((int64_t)bh * Tp + my_tok[ti * BK + j]) * HD + c16 * 16);
+                const uint8_t* b = reinterpret_cast<const uint8_t*>(&raw);
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    const int c = c16 * 16 + i;
+                    SVT(0)[c * LDV + (((kp >> 4) ^ swz_v(c)) << 4) + (kp & 15)] = (int8_t)b[i];
+                }
+            }
+            cp_commit();
+            cp_wait<0>();
+            __syncthreads();
+            compute_tile(0, sKsb);
+            __syncthreads();
+        }
+    }
 
     // l is zero only when a row got no mass from either branch; zeros are right there
     const float inv0 = 1.f / fmaxf(l_r[0], 1e-30f);
@@ -296,7 +253,8 @@ void launch_sol_exact(
     const void* qi, const void* qs, const void* kiP, const void* ksb,
     const void* vTi, const void* vsc,
     const void* blk_idx, const void* blk_cnt,
-    const void* o_part, const void* m_part, const void* l_part, void* out,
+    const void* o_part, const void* m_part, const void* l_part,
+    const void* vRow, const void* tok_idx, const void* tok_cnt, int n_tok, void* out,
     int B, int T, int Tp, int H, int NQ, int NTB,
     float scale_log2, int elem, cudaStream_t stream)
 {
@@ -307,6 +265,7 @@ void launch_sol_exact(
         (const int8_t*)vTi, (const float*)vsc,                                         \
         (const uint16_t*)blk_idx, (const int32_t*)blk_cnt,                             \
         (const __nv_bfloat16*)o_part, (const float*)m_part, (const float*)l_part,     \
+        (const int8_t*)vRow, (const uint32_t*)tok_idx, (const int32_t*)tok_cnt, n_tok, \
         (TOut*)out, T, Tp, H, NTB, scale_log2)
     if (elem == sol::SOL_FP16) SOLX_LAUNCH(__half);
     else SOLX_LAUNCH(__nv_bfloat16);

@@ -138,6 +138,7 @@ set(CUDA_SOURCES
     sage_attention/sol_attn_vtranspose.cu
     sage_attention/sol_attn_route.cu
     sage_attention/sol_attn_exact.cu
+    sage_attention/sol_attn_token.cu
     ops/quantize_svdquant_w4a4.cu
     ops/scaled_mm_svdquant_w4a4.cu
     ops/awq_w4a16.cu

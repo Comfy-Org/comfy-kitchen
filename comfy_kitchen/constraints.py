@@ -309,6 +309,10 @@ def sol_attn_common_call_rule(kwargs):
     topk_ratio = kwargs.get("topk_ratio")
     if topk_ratio and not 0.0 < topk_ratio < 1.0:
         return ValidationResult.fail("topk_ratio", f"must be 0 or in (0, 1), got {topk_ratio}")
+    # token routing budget: 64-token tiles, at most the kernels' list capacity
+    token_aug = kwargs.get("token_aug") or 0
+    if token_aug < 0 or token_aug > 256 or token_aug % 64:
+        return ValidationResult.fail("token_aug", f"must be 0 or a multiple of 64 up to 256, got {token_aug}")
     return ValidationResult.ok()
 
 

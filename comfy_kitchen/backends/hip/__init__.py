@@ -218,6 +218,16 @@ def is_available() -> bool:
     return _EXT_AVAILABLE and _unsupported_arch_reason(_visible_gfx_arches()) is None
 
 
+_token_aug_warned = False
+
+
+def _warn_token_aug_once() -> None:
+    global _token_aug_warned
+    if not _token_aug_warned:
+        _token_aug_warned = True
+        logger.warning("sol_attn: token_aug is not implemented on the HIP backend; running without it")
+
+
 def has_wmma() -> bool:
     """Whether the GEMM kernels can run: every visible device has matrix cores.
 
@@ -1867,6 +1877,7 @@ def sol_attn(
     tail: bool = True,
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
+    token_aug: int = 0,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
     See sage_attention/sol_attn.hip and the public docstring for ``tail``,
@@ -1876,6 +1887,8 @@ def sol_attn(
     per-query-block top-k: keep that fraction of key blocks per query block (sinks
     and the diagonal still ride on top). tau is ignored then.
     """
+    if token_aug:
+        _warn_token_aug_once()
     batch, t, h, d = q.shape
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
@@ -1950,6 +1963,7 @@ def sol_attn_chunked(
     tail: bool = True,
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
+    token_aug: int = 0,
 ):
     """Chunked-producer Sol-Attn over fused qkv projection chunks ([M, 3*H*128]
     bf16, 64-aligned starts, B=1); full Q/K/V are never materialised.
@@ -1959,6 +1973,8 @@ def sol_attn_chunked(
     ``kmean``/``vscale`` are LAST step's statistics ([H,128] f32); when None the
     producer runs twice (measure, then quantize), so pass a callable to stream on
     the first call. Returns ``(out[1,T,H,128] bf16, kmean_next, vscale_next)``."""
+    if token_aug:
+        _warn_token_aug_once()
     d = _SOL_HD
     rot = rope_freqs.shape[-3] * 2
     # the fused rope pairs channels across lanes of 4: rot/2 must be lane-aligned

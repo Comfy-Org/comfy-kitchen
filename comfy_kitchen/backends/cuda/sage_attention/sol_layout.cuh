@@ -40,6 +40,9 @@ namespace sol {
 constexpr int HEAD_DIM = 128;   // the only head_dim these kernels handle
 constexpr int BLOCK    = 64;    // Sol-Attn's routing granularity, in tokens
 constexpr float NEG    = -3.0e38f;   // finite, so NEG - NEG == 0 (unlike -inf)
+constexpr int NTOK_MAX = 256;        // token routing: largest token budget
+constexpr int TOK_HIST_BINS = 128;   // token routing: histogram bins per centroid
+constexpr int TOK_GROUP = 2;         // token routing: query blocks per centroid
 
 // Contraction-axis permutation: each lane's two MMA operand words become one
 // 8-byte load. Applied to Q/K/pooled-K d axes and V^T's key axis.
@@ -52,6 +55,10 @@ __host__ __device__ __forceinline__ int perm_d(int d) {
 // Applied to K rows + scales; NOT to V^T.
 __host__ __device__ __forceinline__ int perm_key(int p) {
     return 16 * (p >> 4) + 4 * ((p & 7) >> 1) + 2 * ((p >> 3) & 1) + (p & 1);
+}
+// Which stored row holds source token s of its block (perm_key's inverse).
+__host__ __device__ __forceinline__ int perm_key_inv(int s) {
+    return 16 * (s >> 4) + 8 * ((s >> 1) & 1) + 4 * ((s >> 3) & 1) + 2 * ((s >> 2) & 1) + (s & 1);
 }
 
 // Smem XOR swizzles (K tile 64 x 128 B, V^T tile 128 x 64 B). Verify any
@@ -288,6 +295,156 @@ __device__ __forceinline__ void mma_bf16(float* d, const uint32_t* a, const uint
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 #endif
+}
+
+// ---- Shared 64-key tile body (exact kernel and token passes) ----
+// Staged K tile (64 x 128 int8) and V^T tile (128 x 64 int8), XOR-swizzled 16-byte
+// chunks. One warp owns 16 rows: g = lane >> 2 picks rows g and g + 8, qd = lane & 3
+// the column pair, so every per-row array below is [2].
+
+constexpr int TILE_KC  = HEAD_DIM / 32;   // int8 k-chunks of S = Q.K^T
+constexpr int TILE_NKT = BLOCK / 8;       // score n8 tiles
+constexpr int TILE_NT  = HEAD_DIM / 8;    // output n8 tiles
+constexpr int TILE_PKC = BLOCK / 32;      // int8 k-chunks of O += P.V
+constexpr int TILE_LDK = HEAD_DIM;        // K tile row stride, bytes
+constexpr int TILE_LDV = BLOCK;           // V^T tile row stride, bytes
+constexpr float TILE_MASKED = -1.0e37f;   // scores at or below this are masked (NEG lands here)
+
+// S = Q.K^T: the warp's 16 rows against the tile's 64 keys, int32 accumulators.
+__device__ __forceinline__ void tile_qk(const int8_t* sK_tile, const uint32_t (&qa)[TILE_KC][4],
+                                        int g, int qd, int32_t (&s_acc)[TILE_NKT][4]) {
+    #pragma unroll
+    for (int nt = 0; nt < TILE_NKT; ++nt) {
+        s_acc[nt][0] = 0; s_acc[nt][1] = 0; s_acc[nt][2] = 0; s_acc[nt][3] = 0;
+        const int R = nt * 8 + g;
+        const int8_t* krow = sK_tile + R * TILE_LDK + ((qd & 1) << 3);
+        const int swk = swz_k(R), qhi = qd >> 1;
+        #pragma unroll
+        for (int kc = 0; kc < TILE_KC; ++kc) {
+            const uint2 kb = *reinterpret_cast<const uint2*>(krow + (((kc * 2 + qhi) ^ swk) << 4));
+            uint32_t kbf[2] = {kb.x, kb.y};
+            mma_s8(s_acc[nt], qa[kc], kbf);
+        }
+    }
+}
+
+// Scores in log2 units: (int dot) * qsc[row] * ks + bias, with the tile's 64
+// (ks, bias) pairs at kb_src. FOLD_MAX takes the row max in the same loop (the
+// exact kernel's shape; splitting it costs registers); otherwise call tile_rowmax.
+template <bool FOLD_MAX>
+__device__ __forceinline__ void tile_scores(const int32_t (&s_acc)[TILE_NKT][4], const float2* kb_src,
+                                            const float (&qsc)[2], int qd, float (&p_val)[TILE_NKT][4],
+                                            float (&bmax)[2]) {
+    #pragma unroll
+    for (int nt = 0; nt < TILE_NKT; ++nt) {
+        const int c0 = nt * 8 + qd * 2;
+        const float4 kb4 = *reinterpret_cast<const float4*>(kb_src + c0);
+        const float k0s = kb4.x, m0 = kb4.y, k1s = kb4.z, m1 = kb4.w;
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int row = e >> 1;
+            const float s = (e & 1) ? fmaf((float)s_acc[nt][e], qsc[row] * k1s, m1)
+                                    : fmaf((float)s_acc[nt][e], qsc[row] * k0s, m0);
+            p_val[nt][e] = s;
+            if (FOLD_MAX) bmax[row] = fmaxf(bmax[row], s);
+        }
+    }
+}
+
+// Row max over the tile's scores (<= TILE_MASKED masked), and whether any is live.
+__device__ __forceinline__ void tile_rowmax(const float (&p_val)[TILE_NKT][4], float (&bmax)[2], bool (&has)[2]) {
+    #pragma unroll
+    for (int nt = 0; nt < TILE_NKT; ++nt) {
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int row = e >> 1;
+            if (p_val[nt][e] > TILE_MASKED) { has[row] = true; bmax[row] = fmaxf(bmax[row], p_val[nt][e]); }
+        }
+    }
+}
+
+// Online softmax over the tile's scores (<= TILE_MASKED masked) and O += P.V.
+// P is u8 against the block max bmax; l sums the packed bytes so numerator and
+// denominator quantize identically. (m_r, l_r, c_r) is the row state, c_r the
+// scale of o_acc and l_r. GUARD: a row with no live score keeps its state
+// (alpha 1, P 0); the exact kernel only sees live tiles and skips it.
+template <bool GUARD>
+__device__ __forceinline__ void tile_softmax_pv(float (&p_val)[TILE_NKT][4], float (&bmax)[2], bool (&has)[2],
+                                                const int8_t* sVt_tile, int g, int qd,
+                                                float (&m_r)[2], float (&l_r)[2], float (&c_r)[2],
+                                                float (&o_acc)[TILE_NT][4]) {
+    #pragma unroll
+    for (int off = 1; off <= 2; off <<= 1) {
+        bmax[0] = fmaxf(bmax[0], __shfl_xor_sync(0xffffffffu, bmax[0], off));
+        bmax[1] = fmaxf(bmax[1], __shfl_xor_sync(0xffffffffu, bmax[1], off));
+        if (GUARD) {
+            has[0] |= __shfl_xor_sync(0xffffffffu, (int)has[0], off);
+            has[1] |= __shfl_xor_sync(0xffffffffu, (int)has[1], off);
+        }
+    }
+    if (GUARD) {
+        if (!has[0]) bmax[0] = c_r[0];
+        if (!has[1]) bmax[1] = c_r[1];
+    }
+    const float alpha0 = exp2f(c_r[0] - bmax[0]);
+    const float alpha1 = exp2f(c_r[1] - bmax[1]);
+    c_r[0] = bmax[0]; c_r[1] = bmax[1];
+    m_r[0] = fmaxf(m_r[0], bmax[0]);
+    m_r[1] = fmaxf(m_r[1], bmax[1]);
+
+    // u8 P scale folded into the exponent (+log2 255); l carries it too
+    const float m_off[2] = {GUARD && !has[0] ? 3.0e38f : bmax[0] - 7.99435344f,
+                            GUARD && !has[1] ? 3.0e38f : bmax[1] - 7.99435344f};
+    #pragma unroll
+    for (int nt = 0; nt < TILE_NKT; ++nt) {
+        #pragma unroll
+        for (int e = 0; e < 4; ++e)
+            p_val[nt][e] = exp2f(p_val[nt][e] - m_off[e >> 1]);
+    }
+
+    // free repack (see the header comment): n-tiles (4kk, 4kk+1) -> keys 32kk+4q..+3
+    uint32_t pa[TILE_PKC][4];
+    #pragma unroll
+    for (int kk = 0; kk < TILE_PKC; ++kk) {
+        const int b0 = 4 * kk, b1 = b0 + 1, b2 = b0 + 2, b3 = b0 + 3;
+        pa[kk][0] = mma::pack_u8x4(p_val[b0][0], p_val[b0][1], p_val[b1][0], p_val[b1][1]);
+        pa[kk][1] = mma::pack_u8x4(p_val[b0][2], p_val[b0][3], p_val[b1][2], p_val[b1][3]);
+        pa[kk][2] = mma::pack_u8x4(p_val[b2][0], p_val[b2][1], p_val[b3][0], p_val[b3][1]);
+        pa[kk][3] = mma::pack_u8x4(p_val[b2][2], p_val[b2][3], p_val[b3][2], p_val[b3][3]);
+    }
+    uint32_t li[2] = {0, 0};
+    #pragma unroll
+    for (int kk = 0; kk < TILE_PKC; ++kk) {
+        li[0] = __dp4a(pa[kk][0], 0x01010101u, li[0]);
+        li[0] = __dp4a(pa[kk][2], 0x01010101u, li[0]);
+        li[1] = __dp4a(pa[kk][1], 0x01010101u, li[1]);
+        li[1] = __dp4a(pa[kk][3], 0x01010101u, li[1]);
+    }
+    #pragma unroll
+    for (int off = 1; off <= 2; off <<= 1) {
+        li[0] += __shfl_xor_sync(0xffffffffu, li[0], off);
+        li[1] += __shfl_xor_sync(0xffffffffu, li[1], off);
+    }
+    l_r[0] = l_r[0] * alpha0 + (float)li[0];
+    l_r[1] = l_r[1] * alpha1 + (float)li[1];
+
+    #pragma unroll
+    for (int nt = 0; nt < TILE_NT; ++nt) {
+        int32_t d[4] = {0, 0, 0, 0};
+        const int C = nt * 8 + g;
+        const int8_t* vcol = sVt_tile + C * TILE_LDV + ((qd & 1) << 3);
+        const int swv = swz_v(C), qhi2 = qd >> 1;
+        #pragma unroll
+        for (int kk = 0; kk < TILE_PKC; ++kk) {
+            const uint2 vb = *reinterpret_cast<const uint2*>(vcol + (((kk * 2 + qhi2) ^ swv) << 4));
+            uint32_t vbf[2] = {vb.x, vb.y};
+            mma_u8s8(d, pa[kk], vbf);
+        }
+        o_acc[nt][0] = fmaf(o_acc[nt][0], alpha0, (float)d[0]);
+        o_acc[nt][1] = fmaf(o_acc[nt][1], alpha0, (float)d[1]);
+        o_acc[nt][2] = fmaf(o_acc[nt][2], alpha1, (float)d[2]);
+        o_acc[nt][3] = fmaf(o_acc[nt][3], alpha1, (float)d[3]);
+    }
 }
 
 __device__ __forceinline__ uint32_t pack_bf2(float lo, float hi) {

@@ -1,6 +1,6 @@
 import torch
 
-from .backends import cuda as _cuda_backend  # noqa: F401
+from .backends import cuda as _cuda_backend
 
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
@@ -66,6 +66,7 @@ __all__ = [
     "na3d",
     "sol_attn",
     "sol_attn_chunked",
+    "sol_attn_is_available",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -143,6 +144,7 @@ def sol_attn(
     tail: bool = True,
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
+    token_aug: int = 0,
 ) -> torch.Tensor:
     """Sol-Attn training-free sparse attention (arXiv 2607.24027).
 
@@ -175,6 +177,10 @@ def sol_attn(
             output rows are unspecified.
         coarse_gate: ``(B, T, H, 128)`` per-token gate for VSA's coarse branch:
             ``gate * softmax(q_mean k_mean^T * scale) v_mean`` is added per block.
+        token_aug: 0, or a multiple of 64 up to 256: up to that many tokens per
+            query block are routed individually, the highest-scoring ones outside
+            the routed blocks, and attended exactly. CUDA only; other backends
+            run without it.
 
     Returns:
         ``(B, T, H, 128)`` attention output.
@@ -188,7 +194,23 @@ def sol_attn(
         bool(tail),
         block_len,
         coarse_gate,
+        int(token_aug),
     )
+
+
+def sol_attn_is_available(device: torch.device | int | None = None) -> bool:
+    """Whether the compiled Sol-Attn kernels can run on ``device``: the CUDA
+    backend on sm_80+, or the HIP backend on a GPU with matrix cores. The
+    per-call rules (bf16/fp16, head_dim 128, matching q/k/v) still apply."""
+    if not torch.cuda.is_available():
+        return False
+    if getattr(torch.version, "hip", None):
+        # torch.cuda is the ROCm API here; the HIP backend advertises sol_attn
+        # only on WMMA parts, so its registration is the answer
+        return registry.is_available("hip") and registry.get_constraints("hip", "sol_attn") is not None
+    rules = registry.get_constraints("cuda", "sol_attn")
+    return (registry.is_available("cuda") and _cuda_backend._EXT_AVAILABLE and rules is not None
+            and torch.cuda.get_device_capability(device) >= rules.min_compute_capability)
 
 
 def na3d(

@@ -2463,6 +2463,7 @@ def sol_attn(
     tail: bool = True,
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
+    token_aug: int = 0,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
     See sage_attention/sol_attn.cu and the public docstring for ``tail``,
@@ -2471,6 +2472,14 @@ def sol_attn(
     ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
     per-query-block top-k: keep that fraction of key blocks per query block
     (sinks and the diagonal still ride on top). tau is ignored then.
+
+    ``token_aug`` (0, or a multiple of 64 up to 256): on top of the routed
+    blocks, every row attends up to ``token_aug`` unrouted tokens its query
+    block's centroid scores highest (whole histogram bins only, so the set
+    never depends on scheduling; a flat score profile may admit none), and the
+    remaining tail is exact for the centroid instead of pooled per block.
+    CUDA only: the HIP backend runs without it (one warning), the eager
+    reference ignores it.
     """
     batch, t, h, d = q.shape
     if q.dtype not in (torch.bfloat16, torch.float16):
@@ -2510,7 +2519,7 @@ def sol_attn(
         kb = _normalize_key_bias(key_bias, batch, t, q.device)
         kb = (kb * _LOG2E).expand(batch, t).contiguous()
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    p = _C.sol_attn_plan(batch, t, h)
+    p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug))
     workspace = torch.empty(p["total"], dtype=torch.uint8, device=q.device)
     _C.sol_attn(
         _wrap_for_dlpack(q),
@@ -2525,7 +2534,7 @@ def sol_attn(
         key_bias=None if kb is None else _wrap_for_dlpack(kb),
         threshold=None if thr is None else _wrap_for_dlpack(thr),
         block_len=None if block_len is None else _wrap_for_dlpack(block_len),
-        tail=bool(tail),
+        tail=bool(tail), token_aug=int(token_aug),
     )
     if coarse_gate is not None:
         add_coarse_(out, coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale),
@@ -2550,10 +2559,11 @@ def sol_attn_chunked(
     tail: bool = True,
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
+    token_aug: int = 0,
 ):
     """Chunked-producer Sol-Attn over fused qkv projection chunks ([M, 3*H*128]
     bf16, 64-aligned starts, B=1); full Q/K/V are never materialised.
-    ``tail`` / ``block_len`` / ``coarse_gate`` as in ``sol_attn``.
+    ``tail`` / ``block_len`` / ``coarse_gate`` / ``token_aug`` as in ``sol_attn``.
 
     ``qkv_chunks``: an iterable of chunks or a zero-arg callable returning one.
     ``kmean``/``vscale`` are LAST step's statistics ([H,128] f32); when None the
@@ -2579,13 +2589,13 @@ def sol_attn_chunked(
     if factory is None and (kmean is None or vscale is None):
         qkv_chunks = list(qkv_chunks)          # need two passes over it
         factory = lambda: iter(qkv_chunks)     # noqa: E731
-    p = _C.sol_attn_plan(1, t, h)
+    p = _C.sol_attn_plan(1, t, h, token_aug=int(token_aug))
     ws = torch.empty(p["total"], dtype=torch.uint8, device=dev)
     stream = torch.cuda.current_stream(dev).cuda_stream
     width = 3 * h * d
 
     def produce(km, vsc):
-        _C.sol_producer_begin(_wrap_for_dlpack(ws), 1, t, h, stream)
+        _C.sol_producer_begin(_wrap_for_dlpack(ws), 1, t, h, stream, token_aug=int(token_aug))
         t0 = 0
         for chunk in (factory() if factory is not None else qkv_chunks):
             m = chunk.shape[-2]
@@ -2601,7 +2611,8 @@ def sol_attn_chunked(
                 _wrap_for_dlpack(fab), _wrap_for_dlpack(qw), _wrap_for_dlpack(kw),
                 _wrap_for_dlpack(km), _wrap_for_dlpack(vsc),
                 float(rope_eps), rot, t0, m, 1, t, h, stream,
-                block_len=None if block_len is None else _wrap_for_dlpack(block_len))
+                block_len=None if block_len is None else _wrap_for_dlpack(block_len),
+                token_aug=int(token_aug))
             t0 += m
         if t0 != t:
             raise ValueError(f"sol_attn_chunked: chunks cover {t0} tokens, T={t}")
@@ -2630,7 +2641,7 @@ def sol_attn_chunked(
         _wrap_for_dlpack(kmean_next), _wrap_for_dlpack(vamax),
         1, t, h, float(tau), float(scale), sb[0], sb[1], sq[0], sq[1], stream,
         threshold=None if threshold is None else _wrap_for_dlpack(threshold),
-        block_len=None if block_len is None else _wrap_for_dlpack(block_len), tail=bool(tail))
+        block_len=None if block_len is None else _wrap_for_dlpack(block_len), tail=bool(tail), token_aug=int(token_aug))
     if coarse_gate is not None:
         add_coarse_(out, coarse_output(*_ws_block_means(ws, p, h, lengths), scale), coarse_gate)
     return out, kmean_next, vscale_of(vamax)
