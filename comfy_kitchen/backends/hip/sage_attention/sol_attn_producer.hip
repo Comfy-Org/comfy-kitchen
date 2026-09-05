@@ -29,7 +29,8 @@ __global__ __launch_bounds__(HD) void sol_producer_kernel(
     const float* __restrict__ kmean,   // [H, HD] stale (may be zeros)
     const float* __restrict__ vscale,  // [H, HD] stale V scale
     int8_t* __restrict__ qi, float* __restrict__ qs, int8_t* __restrict__ ki,
-    float2* __restrict__ ksb, int8_t* __restrict__ vT, __bf16* __restrict__ vcT,
+    float2* __restrict__ ksb, int8_t* __restrict__ vT, int8_t* __restrict__ vRow,
+    __bf16* __restrict__ vcT,
     float* __restrict__ ksum,  // [H, NPAD, HD] block K sums (post-rope)
     int8_t* __restrict__ cen8, float* __restrict__ cens,
     float* __restrict__ qmean,       // [H, NPAD, HD] f32 block means (post-rope)
@@ -99,6 +100,13 @@ __global__ __launch_bounds__(HD) void sol_producer_kernel(
                 col[j] = q8(x, inv);
             }
             *reinterpret_cast<uint4*>(vT + vbase + c0) = *reinterpret_cast<const uint4*>(col);
+            // row-major copy for the gathered token tiles (token routing)
+            if (vRow) {
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    vRow[(static_cast<size_t>(h) * Tp + nblk * BLK + c0 + j) * HD + d] = col[j];
+                }
+            }
         }
         vcT[(static_cast<size_t>(h) * HD + d) * NPAD + nblk] = static_cast<__bf16>(sv);
         atomicMax(reinterpret_cast<unsigned int*>(&vamax_next[static_cast<size_t>(h) * HD + d]),
@@ -113,7 +121,8 @@ using namespace comfy::hip_backend::sol;
 
 void launch_sol_producer(const void* qkv, const void* fab, const void* qw, const void* kw,
                          const void* kmean, const void* vscale, void* qi, void* qs, void* ki,
-                         void* ksb, void* vT, void* vcT, void* ksum, void* cen8, void* cens,
+                         void* ksb, void* vT, void* vRow, void* vcT, void* ksum, void* cen8,
+                         void* cens,
                          void* qmean, void* vamax_next, const void* blen, float rope_eps, int rot,
                          int t0, int M, int T, int Tp, int H, int NPAD, int NQ,
                          hipStream_t stream) {
@@ -124,7 +133,8 @@ void launch_sol_producer(const void* qkv, const void* fab, const void* qw, const
         static_cast<const __bf16*>(qw), static_cast<const __bf16*>(kw),
         static_cast<const float*>(kmean), static_cast<const float*>(vscale),
         static_cast<int8_t*>(qi), static_cast<float*>(qs), static_cast<int8_t*>(ki),
-        static_cast<float2*>(ksb), static_cast<int8_t*>(vT), static_cast<__bf16*>(vcT),
+        static_cast<float2*>(ksb), static_cast<int8_t*>(vT), static_cast<int8_t*>(vRow),
+        static_cast<__bf16*>(vcT),
         static_cast<float*>(ksum), static_cast<int8_t*>(cen8), static_cast<float*>(cens),
         static_cast<float*>(qmean), static_cast<float*>(vamax_next),
         static_cast<const int32_t*>(blen), rope_eps, rot, t0, M, T, Tp, H, NPAD, NQ);

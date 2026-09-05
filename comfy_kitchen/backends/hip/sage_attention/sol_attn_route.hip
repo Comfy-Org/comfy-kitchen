@@ -47,7 +47,11 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
     const __bf16* __restrict__ vcT, const float* __restrict__ vsc,
     const float* __restrict__ threshold, uint16_t* __restrict__ blk_idx,
     int32_t* __restrict__ blk_cnt, __bf16* __restrict__ o_part, float* __restrict__ m_part,
-    float* __restrict__ l_part, const int32_t* __restrict__ blen, int tail, int T, int NTB,
+    float* __restrict__ l_part,
+    // token routing, or null: the best pooled score this row left unrouted, and
+    // the [B*H, NQ, ceil(NTB/32)] bitmap of the blocks it left
+    float* __restrict__ tok_ref, uint32_t* __restrict__ cand_bits,
+    const int32_t* __restrict__ blen, int tail, int T, int NTB,
     int NPAD, int NQ, int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2) {
     __shared__ __attribute__((aligned(16))) int8_t sKc[BN * kStrideKc];
     __shared__ __attribute__((aligned(16))) __bf16 sVcT[HD * kStrideVc];
@@ -93,6 +97,8 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
 #pragma unroll
     for (int nt = 0; nt < NT; ++nt) o_acc[nt] = MmaBf16::zero();
     float m_r = kNeg, l_r = 0.f;
+    float refm = kNeg;
+    const int W = (NTB + 31) >> 5;
 
     for (int gs = 0; gs < NTB; gs += BN) {
         __syncthreads();
@@ -129,6 +135,9 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
         // Routing decision, and the pooled score of every block that stays in the tail.
         float pv[KT][8];
         uint32_t mask_lo = 0u, mask_hi = 0u;
+        // Blocks this row leaves unrouted, bit kt * 8 + e. A mask rather than 32
+        // live scores: the exchange below needs the whole tile before any is folded.
+        uint32_t unr = 0u;
 #pragma unroll
         for (int kt = 0; kt < KT; ++kt) {
 #pragma unroll
@@ -148,9 +157,48 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
                         mask_hi |= 1u << (slot - 32);
                     }
                 }
-                // exact-routed and sink blocks leave the tail; tail == 0 hands the
-                // exact kernel an empty state (softmax over the routed blocks only)
-                pv[kt][e] = (tail && valid && !(pre || cand)) ? score : kNeg;
+                if (valid && !pre && !cand) unr |= 1u << (kt * 8 + e);
+                pv[kt][e] = score;
+            }
+        }
+
+        // A block neither this row nor its kTokGroup partner routed goes to the
+        // token passes instead of the pooled tail. The partner is query block
+        // qb ^ 1, which is lane ^ 1 since qb's low bit is frag_row's. Every other
+        // kTokGroup use is generic arithmetic; this pairing is the one that is not.
+        static_assert(kTokGroup == 2, "the qb ^ 1 exchange covers a group of exactly two");
+        uint32_t tokb = 0u;
+        if (cand_bits) {
+            const uint32_t peer = __shfl_xor(unr, 1, 32);
+            const int peer_live = __shfl_xor(static_cast<int>(live), 1, 32);
+            tokb = unr & (peer_live ? peer : 0xffffffffu);
+        }
+        // exact-routed, sink and token-routed blocks leave the tail; tail == 0 hands
+        // the exact kernel an empty state (softmax over the routed blocks only)
+        const uint32_t keep = (tail ? unr : 0u) & ~tokb;
+        uint32_t cbits[2] = {0u, 0u};
+#pragma unroll
+        for (int kt = 0; kt < KT; ++kt) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const uint32_t bit = 1u << (kt * 8 + e);
+                if (tokb & bit) {
+                    refm = fmaxf(refm, pv[kt][e]);
+                    const int slot = kt * 16 + acc_row(lane, e);
+                    cbits[slot >> 5] |= 1u << (slot & 31);
+                }
+                if (!(keep & bit)) pv[kt][e] = kNeg;
+            }
+        }
+        if (cand_bits) {
+            // the half-wave partner holds this row's other 32 blocks of the group
+#pragma unroll
+            for (int wd = 0; wd < 2; ++wd) {
+                const uint32_t b = cbits[wd] | swap_half_wave_b32(cbits[wd]);
+                const int word = (gs >> 5) + wd;
+                if (half == 0 && live && word < W) {
+                    cand_bits[(static_cast<size_t>(bh) * NQ + qb) * W + word] = b;
+                }
             }
         }
 
@@ -212,10 +260,12 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
         }
     }
 
+    refm = fmaxf(refm, swap_half_wave(refm));
     if (!live) return;
     const size_t qs = static_cast<size_t>(bh) * NQ + qb;
     if (half == 0) {
         blk_cnt[qs] = cnt;
+        if (tok_ref) tok_ref[qs] = refm;
         m_part[qs] = m_r;
         l_part[qs] = l_r * 255.0f;
     }
@@ -241,7 +291,8 @@ using namespace comfy::hip_backend::sol;
 
 void launch_sol_route(const void* cen8, const void* cens, const void* kci, const void* kcs,
                       const void* vcT, const void* vsc, const void* threshold, void* blk_idx,
-                      void* blk_cnt, void* o_part, void* m_part, void* l_part,
+                      void* blk_cnt, void* o_part, void* m_part, void* l_part, void* tok_ref,
+                      void* cand_bits,
                       // NQ (query blocks) and NTB (key blocks) coincide today; kept
                       // separate so a query prefix needs no kernel change
                       const void* blen, int tail, int B, int T, int H, int NTB, int NPAD, int NQ,
@@ -254,6 +305,7 @@ void launch_sol_route(const void* cen8, const void* cens, const void* kci, const
         static_cast<const __bf16*>(vcT), static_cast<const float*>(vsc),
         static_cast<const float*>(threshold), static_cast<uint16_t*>(blk_idx),
         static_cast<int32_t*>(blk_cnt), static_cast<__bf16*>(o_part), static_cast<float*>(m_part),
-        static_cast<float*>(l_part), static_cast<const int32_t*>(blen), tail, T, NTB, NPAD, NQ,
-        sink_s, sink_e, sink_qs, sink_qe, scale_log2);
+        static_cast<float*>(l_part), static_cast<float*>(tok_ref),
+        static_cast<uint32_t*>(cand_bits), static_cast<const int32_t*>(blen), tail, T, NTB, NPAD,
+        NQ, sink_s, sink_e, sink_qs, sink_qe, scale_log2);
 }

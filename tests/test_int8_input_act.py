@@ -80,7 +80,7 @@ class TestInputActQuantizer:
 
 
 class TestInt8LinearInputAct:
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     def test_matches_eager_activation(self, backend, seed, cuda_available):
         """int8_linear(x, input_act=a) == int8_linear(a(x)) on every backend."""
         device = "cuda" if cuda_available else "cpu"
@@ -218,7 +218,7 @@ class TestSwiGLUInputAct:
         assert fused_q.dtype == torch.int8
         assert fused_s.shape == (m, 1)
 
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     def test_matches_eager_activation(self, backend, seed, cuda_available):
         """int8_linear(x, input_act="swiglu") == int8_linear(swiglu(x)) everywhere."""
         device = "cuda" if cuda_available else "cpu"

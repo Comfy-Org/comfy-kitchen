@@ -41,6 +41,18 @@ constexpr int kBlock = 64;     // Sol-Attn's routing granularity, in tokens
 // sol::NEG, so both backends drop the same blocks.
 constexpr float kNeg = -3.0e38f;
 
+// Scores at or below this are masked. kNeg lands here, and so does any score a
+// dead key produces (a zero scale and a kNeg bias). Same value as the CUDA
+// sol::TILE_MASKED.
+constexpr float kTileMasked = -1.0e37f;
+
+// Token routing, all mirroring the CUDA sol:: constants of the same name: the
+// largest token budget, the histogram bins one centroid scores into, and the
+// query blocks that share a centroid.
+constexpr int kNTokMax = 256;
+constexpr int kTokHistBins = 128;
+constexpr int kTokGroup = 2;
+
 // 16-bit row stride of a staged tile; keeps the 16-byte stores aligned.
 constexpr int kLdTile = kHeadDim + 8;
 

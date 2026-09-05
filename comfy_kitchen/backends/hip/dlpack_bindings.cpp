@@ -1557,11 +1557,11 @@ static void sol_check_block_len(const nb::ndarray<>& b, int64_t seq_len, const c
 }
 
 static void sol_need_workspace(const nb::ndarray<>& ws, int64_t batch, int64_t seq_len,
-                               int64_t num_heads, const char* fn) {
-    int64_t v[32];
+                               int64_t num_heads, int64_t token_aug, const char* fn) {
+    int64_t v[48];
     const int n = sol_attn_plan(static_cast<int>(batch), static_cast<int>(seq_len),
-                                static_cast<int>(num_heads), v, 32);
-    if (n > 32 || static_cast<int64_t>(ws.size()) < v[n - 1]) {  // last slot is "total"
+                                static_cast<int>(num_heads), static_cast<int>(token_aug), v, 48);
+    if (n > 48 || static_cast<int64_t>(ws.size()) < v[n - 1]) {  // last slot is "total"
         throw std::runtime_error(std::string(fn) + ": workspace too small for this shape");
     }
     // sol_attn_plan reports byte offsets and the Python layer slices the workspace
@@ -1612,11 +1612,12 @@ static void sol_need_contiguous(const nb::ndarray<>& a, const char* fn, const ch
 }
 
 // Workspace dims and slot byte offsets, from the C++ Plan (the one definition).
-nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads) {
-    int64_t v[32];
+nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads,
+                          int64_t token_aug = 0) {
+    int64_t v[48];
     const int n = sol_attn_plan(static_cast<int>(batch), static_cast<int>(seq_len),
-                                static_cast<int>(num_heads), v, 32);
-    if (n > 32) throw std::runtime_error("sol_attn_plan: Plan grew past the binding's buffer");
+                                static_cast<int>(num_heads), static_cast<int>(token_aug), v, 48);
+    if (n > 48) throw std::runtime_error("sol_attn_plan: Plan grew past the binding's buffer");
     nb::dict d;
     for (int i = 0; i < n && sol_attn_plan_names[i]; ++i) d[sol_attn_plan_names[i]] = v[i];
     return d;
@@ -1627,7 +1628,7 @@ void sol_attn(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> o
               int64_t head_dim, float tau, float scale, int64_t sink_start, int64_t sink_end,
               int64_t sink_q_start, int64_t sink_q_end, uintptr_t stream_ptr,
               OptArray key_bias = std::nullopt, OptArray threshold = std::nullopt,
-              OptArray block_len = std::nullopt, bool tail = true) {
+              OptArray block_len = std::nullopt, bool tail = true, int64_t token_aug = 0) {
     constexpr const char* kFn = "sol_attn";
     auto stream = reinterpret_cast<hipStream_t>(stream_ptr);
     sol_need_extents(batch, seq_len, num_heads, kFn);
@@ -1647,7 +1648,7 @@ void sol_attn(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> o
     sol_need_staging_layout(k, kFn, "k");
     sol_need_staging_layout(v, kFn, "v");
     sol_need_contiguous(out, kFn, "out");
-    sol_need_workspace(workspace, batch, seq_len, num_heads, kFn);
+    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, kFn);
     if (key_bias) sol_need_elems(*key_bias, batch * seq_len, 0, kFn, "key_bias");
     // Explicit strides: only the last dim must be contiguous (BHND views go in as-is).
     launch_sol_attn(q.data(), k.data(), v.data(), out.data(), workspace.data(),
@@ -1657,16 +1658,17 @@ void sol_attn(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> o
                     static_cast<int>(sink_start), static_cast<int>(sink_end),
                     static_cast<int>(sink_q_start), static_cast<int>(sink_q_end), q.stride(0),
                     q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
-                    v.stride(1), v.stride(2), stream);
+                    v.stride(1), v.stride(2), static_cast<int>(token_aug), stream);
     check_hip_launch();
 }
 
 void sol_producer_begin_py(nb::ndarray<> workspace, int64_t batch, int64_t seq_len,
-                           int64_t num_heads, uintptr_t stream_ptr) {
+                           int64_t num_heads, uintptr_t stream_ptr, int64_t token_aug = 0) {
     sol_need_extents(batch, seq_len, num_heads, "sol_producer_begin");
-    sol_need_workspace(workspace, batch, seq_len, num_heads, "sol_producer_begin");
+    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, "sol_producer_begin");
     sol_producer_begin(workspace.data(), static_cast<int>(batch), static_cast<int>(seq_len),
-                       static_cast<int>(num_heads), reinterpret_cast<hipStream_t>(stream_ptr));
+                       static_cast<int>(num_heads), static_cast<int>(token_aug),
+                       reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -1674,7 +1676,8 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
                            nb::ndarray<> qw, nb::ndarray<> kw, nb::ndarray<> kmean,
                            nb::ndarray<> vscale, float rope_eps, int64_t rot_dim, int64_t t0,
                            int64_t m, int64_t batch, int64_t seq_len, int64_t num_heads,
-                           uintptr_t stream_ptr, OptArray block_len = std::nullopt) {
+                           uintptr_t stream_ptr, OptArray block_len = std::nullopt,
+                           int64_t token_aug = 0) {
     constexpr const char* kFn = "sol_producer_chunk";
     sol_need_extents(batch, seq_len, num_heads, kFn);
     if (batch != 1) throw std::runtime_error(std::string(kFn) + ": the producer path is B=1 only");
@@ -1688,7 +1691,7 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
             ": chunk [t0, t0 + m) must lie in [0, seq_len] with a 64-aligned start");
     }
     if (block_len) sol_check_block_len(*block_len, seq_len, kFn);
-    sol_need_workspace(workspace, batch, seq_len, num_heads, kFn);
+    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, kFn);
     sol_need_elems(qkv, m * 3 * num_heads * 128, 2, kFn, "qkv");
     sol_need_elems(fab, seq_len * rot_dim * 2, 0, kFn, "fab");
     sol_need_elems(qw, 128, 2, kFn, "qw");
@@ -1699,7 +1702,8 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
                        kmean.data(), vscale.data(), opt_data(block_len), rope_eps,
                        static_cast<int>(rot_dim), static_cast<int>(t0), static_cast<int>(m),
                        static_cast<int>(batch), static_cast<int>(seq_len),
-                       static_cast<int>(num_heads), reinterpret_cast<hipStream_t>(stream_ptr));
+                       static_cast<int>(num_heads), static_cast<int>(token_aug),
+                       reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -1708,7 +1712,8 @@ void sol_attn_core_py(nb::ndarray<> workspace, nb::ndarray<> out, nb::ndarray<> 
                       int64_t seq_len, int64_t num_heads, float tau, float scale,
                       int64_t sink_start, int64_t sink_end, int64_t sink_q_start,
                       int64_t sink_q_end, uintptr_t stream_ptr, OptArray threshold = std::nullopt,
-                      OptArray block_len = std::nullopt, bool tail = true) {
+                      OptArray block_len = std::nullopt, bool tail = true,
+                      int64_t token_aug = 0) {
     constexpr const char* kFn = "sol_attn_core";
     sol_need_extents(batch, seq_len, num_heads, kFn);
     sol_need_sinks(sink_start, sink_end, kFn, "sink_blocks");
@@ -1721,7 +1726,7 @@ void sol_attn_core_py(nb::ndarray<> workspace, nb::ndarray<> out, nb::ndarray<> 
         sol_need_elems(*threshold, batch * num_heads * ((seq_len + 63) / 64), 0, kFn, "threshold");
     }
     if (block_len) sol_check_block_len(*block_len, seq_len, kFn);
-    sol_need_workspace(workspace, batch, seq_len, num_heads, kFn);
+    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, kFn);
     sol_need_elems(out, batch * seq_len * num_heads * 128, 2, kFn, "out");
     launch_sol_attn_core(workspace.data(), out.data(), vscale.data(), kmean_next.data(),
                          vamax_out.data(), opt_data(block_len), tail ? 1 : 0,
@@ -1729,6 +1734,7 @@ void sol_attn_core_py(nb::ndarray<> workspace, nb::ndarray<> out, nb::ndarray<> 
                          static_cast<int>(num_heads), tau, scale, opt_data(threshold),
                          static_cast<int>(sink_start), static_cast<int>(sink_end),
                          static_cast<int>(sink_q_start), static_cast<int>(sink_q_end),
+                         static_cast<int>(token_aug),
                          reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
@@ -1736,8 +1742,9 @@ void sol_attn_core_py(nb::ndarray<> workspace, nb::ndarray<> out, nb::ndarray<> 
 NB_MODULE(_C, m) {
     m.doc() = "ComfyKitchen HIP backend native operations (RDNA2-RDNA4, WMMA on gfx11/gfx12)";
     m.def("sol_attn_plan", &sol_attn_plan_py,
-          "Workspace dims, slot byte offsets and total bytes for this shape",
-          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"));
+          "Workspace dims, slot byte offsets and total bytes for this shape and token budget",
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
+          nb::arg("token_aug") = 0);
     m.def("sol_attn", &sol_attn,
           "Sol-Attn training-free sparse attention (BF16 or FP16 in/out, head_dim 128)",
           nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("out"), nb::arg("workspace"),
@@ -1745,22 +1752,24 @@ NB_MODULE(_C, m) {
           nb::arg("tau"), nb::arg("scale"), nb::arg("sink_start"), nb::arg("sink_end"),
           nb::arg("sink_q_start"), nb::arg("sink_q_end"), nb::arg("stream_ptr"),
           nb::arg("key_bias") = nb::none(), nb::arg("threshold") = nb::none(),
-          nb::arg("block_len") = nb::none(), nb::arg("tail") = true);
+          nb::arg("block_len") = nb::none(), nb::arg("tail") = true,
+          nb::arg("token_aug") = 0);
     m.def("sol_producer_begin", &sol_producer_begin_py,
           nb::arg("workspace"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
-          nb::arg("stream_ptr"));
+          nb::arg("stream_ptr"), nb::arg("token_aug") = 0);
     m.def("sol_producer_chunk", &sol_producer_chunk_py,
           nb::arg("workspace"), nb::arg("qkv"), nb::arg("fab"), nb::arg("qw"), nb::arg("kw"),
           nb::arg("kmean"), nb::arg("vscale"), nb::arg("rope_eps"), nb::arg("rot_dim"),
           nb::arg("t0"), nb::arg("m"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
-          nb::arg("stream_ptr"), nb::arg("block_len") = nb::none());
+          nb::arg("stream_ptr"), nb::arg("block_len") = nb::none(),
+          nb::arg("token_aug") = 0);
     m.def("sol_attn_core", &sol_attn_core_py,
           nb::arg("workspace"), nb::arg("out"), nb::arg("vscale"), nb::arg("kmean_next"),
           nb::arg("vamax_out"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
           nb::arg("tau"), nb::arg("scale"), nb::arg("sink_start"), nb::arg("sink_end"),
           nb::arg("sink_q_start"), nb::arg("sink_q_end"), nb::arg("stream_ptr"),
           nb::arg("threshold") = nb::none(), nb::arg("block_len") = nb::none(),
-          nb::arg("tail") = true);
+          nb::arg("tail") = true, nb::arg("token_aug") = 0);
     m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8);
     m.def("dequantize_per_tensor_fp8", &dequantize_per_tensor_fp8);
     m.def("stochastic_round_fp8", &stochastic_round_fp8);

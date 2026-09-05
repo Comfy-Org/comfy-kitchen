@@ -2478,8 +2478,7 @@ def sol_attn(
     block's centroid scores highest (whole histogram bins only, so the set
     never depends on scheduling; a flat score profile may admit none), and the
     remaining tail is exact for the centroid instead of pooled per block.
-    CUDA only: the HIP backend runs without it (one warning), the eager
-    reference ignores it.
+    The eager reference ignores it.
     """
     batch, t, h, d = q.shape
     if q.dtype not in (torch.bfloat16, torch.float16):

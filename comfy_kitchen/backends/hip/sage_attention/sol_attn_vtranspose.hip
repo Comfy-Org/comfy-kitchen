@@ -21,7 +21,8 @@ constexpr int kLdsPad = HD + 16;  // must be a multiple of 16: phase 1 writes 16
 template <int TT, typename E>
 __global__ __launch_bounds__(kThreads) void vquant_transpose(const E* __restrict__ v,
                                                              const float* __restrict__ vsc,
-                                                             int8_t* __restrict__ vT, int T,
+                                                             int8_t* __restrict__ vT,
+                                                             int8_t* __restrict__ vRow, int T,
                                                              int Tp, int H, int64_t sb, int64_t st,
                                                              int64_t sh) {
     __shared__ __attribute__((aligned(16))) int8_t sV[TT * kLdsPad];
@@ -42,6 +43,11 @@ __global__ __launch_bounds__(kThreads) void vquant_transpose(const E* __restrict
         } else {
 #pragma unroll
             for (int j = 0; j < 16; ++j) out[j] = 0;
+        }
+        // row-major copy for the gathered token tiles (token routing)
+        if (vRow && t0 + t < Tp) {
+            *reinterpret_cast<uint4*>(vRow + (static_cast<int64_t>(bh) * Tp + t0 + t) * HD + c16) =
+                *reinterpret_cast<uint4*>(out);
         }
         *reinterpret_cast<uint4*>(sV + t * kLdsPad + c16) = *reinterpret_cast<uint4*>(out);
     }
@@ -78,16 +84,17 @@ __global__ __launch_bounds__(kThreads) void vquant_transpose(const E* __restrict
 
 using namespace comfy::hip_backend::sol;
 
-void launch_sol_vtranspose(const void* v, const void* vsc, void* vT, int B, int T, int Tp, int H,
-                           int64_t sb, int64_t st, int64_t sh, int elem, hipStream_t stream) {
+void launch_sol_vtranspose(const void* v, const void* vsc, void* vT, void* vRow, int B, int T,
+                           int Tp, int H, int64_t sb, int64_t st, int64_t sh, int elem,
+                           hipStream_t stream) {
     dim3 grid((T + 255) / 256, B * H);
     if (elem == kSolFp16) {
         vquant_transpose<256, _Float16><<<grid, kThreads, 0, stream>>>(
             static_cast<const _Float16*>(v), static_cast<const float*>(vsc),
-            static_cast<int8_t*>(vT), T, Tp, H, sb, st, sh);
+            static_cast<int8_t*>(vT), static_cast<int8_t*>(vRow), T, Tp, H, sb, st, sh);
     } else {
         vquant_transpose<256, __bf16><<<grid, kThreads, 0, stream>>>(
             static_cast<const __bf16*>(v), static_cast<const float*>(vsc),
-            static_cast<int8_t*>(vT), T, Tp, H, sb, st, sh);
+            static_cast<int8_t*>(vT), static_cast<int8_t*>(vRow), T, Tp, H, sb, st, sh);
     }
 }

@@ -29,10 +29,15 @@ __forceinline__ __device__ float round_bf16(float x) {
     return __uint_as_float(u & 0xffff0000u);
 }
 
-// Round a finite fp32 to fp16 and widen back. __float2half_rn is an intrinsic
-// conversion, so unlike a __bf16 cast it is not folded under -ffast-math.
+// Round fp32 to fp16 (round to nearest, ties to even) and widen back.
+// `__half2float(__float2half_rn(x))` does not survive -ffast-math: clang sees
+// fpext(fptrunc(x)), drops the pair, then contracts the multiply it guarded into
+// the following add. Inline asm is opaque to that, the way round_bf16's integer
+// arithmetic is. These two converts are base VALU on every target built here.
 __forceinline__ __device__ float round_fp16(float x) {
-    return __half2float(__float2half_rn(x));
+    float r;
+    asm("v_cvt_f16_f32 %0, %1\n\tv_cvt_f32_f16 %0, %0" : "=v"(r) : "v"(x));
+    return r;
 }
 
 // Round to the storage type of T without storing. rms_rope needs this for the

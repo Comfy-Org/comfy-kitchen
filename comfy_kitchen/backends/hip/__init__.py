@@ -218,16 +218,6 @@ def is_available() -> bool:
     return _EXT_AVAILABLE and _unsupported_arch_reason(_visible_gfx_arches()) is None
 
 
-_token_aug_warned = False
-
-
-def _warn_token_aug_once() -> None:
-    global _token_aug_warned
-    if not _token_aug_warned:
-        _token_aug_warned = True
-        logger.warning("sol_attn: token_aug is not implemented on the HIP backend; running without it")
-
-
 def has_wmma() -> bool:
     """Whether the GEMM kernels can run: every visible device has matrix cores.
 
@@ -1886,9 +1876,12 @@ def sol_attn(
     ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
     per-query-block top-k: keep that fraction of key blocks per query block (sinks
     and the diagonal still ride on top). tau is ignored then.
+
+    ``token_aug`` (0, or a multiple of 64 up to 256): on top of the routed blocks,
+    every row attends up to that many unrouted tokens its query block's centroid
+    scores highest, and the remaining tail is exact for the centroid instead of
+    pooled per block.
     """
-    if token_aug:
-        _warn_token_aug_once()
     batch, t, h, d = q.shape
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
@@ -1927,7 +1920,7 @@ def sol_attn(
         kb = _normalize_key_bias(key_bias, batch, t, q.device)
         kb = (kb * _LOG2E).expand(batch, t).contiguous()
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    p = _C.sol_attn_plan(batch, t, h)
+    p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug))
     workspace = torch.empty(p["total"], dtype=torch.uint8, device=q.device)
     _C.sol_attn(
         _dl(q), _dl(k), _dl(v), _dl(out), _dl(workspace),
@@ -1938,7 +1931,7 @@ def sol_attn(
         key_bias=None if kb is None else _dl(kb),
         threshold=None if thr is None else _dl(thr),
         block_len=None if block_len is None else _dl(block_len),
-        tail=bool(tail),
+        tail=bool(tail), token_aug=int(token_aug),
     )
     if coarse_gate is not None:
         add_coarse_(out, coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale),
@@ -1967,14 +1960,12 @@ def sol_attn_chunked(
 ):
     """Chunked-producer Sol-Attn over fused qkv projection chunks ([M, 3*H*128]
     bf16, 64-aligned starts, B=1); full Q/K/V are never materialised.
-    ``tail`` / ``block_len`` / ``coarse_gate`` as in ``sol_attn``.
+    ``tail`` / ``block_len`` / ``coarse_gate`` / ``token_aug`` as in ``sol_attn``.
 
     ``qkv_chunks``: an iterable of chunks or a zero-arg callable returning one.
     ``kmean``/``vscale`` are LAST step's statistics ([H,128] f32); when None the
     producer runs twice (measure, then quantize), so pass a callable to stream on
     the first call. Returns ``(out[1,T,H,128] bf16, kmean_next, vscale_next)``."""
-    if token_aug:
-        _warn_token_aug_once()
     d = _SOL_HD
     rot = rope_freqs.shape[-3] * 2
     # the fused rope pairs channels across lanes of 4: rot/2 must be lane-aligned
@@ -1995,13 +1986,13 @@ def sol_attn_chunked(
     if factory is None and (kmean is None or vscale is None):
         qkv_chunks = list(qkv_chunks)          # need two passes over it
         factory = lambda: iter(qkv_chunks)     # noqa: E731
-    p = _C.sol_attn_plan(1, t, h)
+    p = _C.sol_attn_plan(1, t, h, token_aug=int(token_aug))
     ws = torch.empty(p["total"], dtype=torch.uint8, device=dev)
     stream = torch.cuda.current_stream(dev).cuda_stream
     width = 3 * h * d
 
     def produce(km, vsc):
-        _C.sol_producer_begin(_dl(ws), 1, t, h, stream)
+        _C.sol_producer_begin(_dl(ws), 1, t, h, stream, token_aug=int(token_aug))
         t0 = 0
         for chunk in (factory() if factory is not None else qkv_chunks):
             m = chunk.shape[-2]
@@ -2015,7 +2006,8 @@ def sol_attn_chunked(
             _C.sol_producer_chunk(
                 _dl(ws), _dl(chunk.contiguous()), _dl(fab), _dl(qw), _dl(kw), _dl(km), _dl(vsc),
                 float(rope_eps), rot, t0, m, 1, t, h, stream,
-                block_len=None if block_len is None else _dl(block_len))
+                block_len=None if block_len is None else _dl(block_len),
+                token_aug=int(token_aug))
             t0 += m
         if t0 != t:
             raise ValueError(f"sol_attn_chunked: chunks cover {t0} tokens, T={t}")
@@ -2043,7 +2035,8 @@ def sol_attn_chunked(
         _dl(ws), _dl(out), _dl(vscale), _dl(kmean_next), _dl(vamax),
         1, t, h, float(tau), float(scale), sb[0], sb[1], sq[0], sq[1], stream,
         threshold=None if threshold is None else _dl(threshold),
-        block_len=None if block_len is None else _dl(block_len), tail=bool(tail))
+        block_len=None if block_len is None else _dl(block_len), tail=bool(tail),
+        token_aug=int(token_aug))
     if coarse_gate is not None:
         add_coarse_(out, coarse_output(*_ws_block_means(ws, p, h, lengths), scale), coarse_gate)
     return out, kmean_next, vscale_of(vamax)

@@ -1129,8 +1129,11 @@ def test_rms_adaln_is_not_adaln(hip):
 
 
 @pytest.mark.parametrize("split_half", [False, True])
-@pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_rope_matches_eager(split_half, freqs_dtype):
+    """The kernel rotates in fp32 and rounds like eager, which evaluates in the
+    freqs dtype, so a narrow freqs dtype has to come out bit-identical. Loose
+    tolerances hid a folded round_fp16 that left the fp16 path a rounding short."""
     torch.manual_seed(0)
     batch, heads, seq, dim = 2, 8, 128, 64
     xq = torch.randn(batch, heads, seq, dim, device=DEV, dtype=torch.bfloat16)
@@ -1143,8 +1146,14 @@ def test_rope_matches_eager(split_half, freqs_dtype):
     with ck.use_backend("eager"):
         qr, kr = pair(xq, xk, freqs)
 
-    torch.testing.assert_close(q.float(), qr.float(), rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(k.float(), kr.float(), rtol=2e-2, atol=2e-2)
+    if freqs_dtype is torch.float32:
+        # -ffast-math contracts the split-half add into an fma, one rounding fewer
+        # than eager's separate products; immaterial at fp32 width
+        torch.testing.assert_close(q.float(), qr.float(), rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(k.float(), kr.float(), rtol=2e-2, atol=2e-2)
+    else:
+        assert torch.equal(q, qr)
+        assert torch.equal(k, kr)
 
 
 # (in-place name, functional sibling, takes a q/k pair, takes a norm weight)

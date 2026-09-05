@@ -179,8 +179,8 @@ def sol_attn(
             ``gate * softmax(q_mean k_mean^T * scale) v_mean`` is added per block.
         token_aug: 0, or a multiple of 64 up to 256: up to that many tokens per
             query block are routed individually, the highest-scoring ones outside
-            the routed blocks, and attended exactly. CUDA only; other backends
-            run without it.
+            the routed blocks, and attended exactly. The eager reference ignores
+            it.
 
     Returns:
         ``(B, T, H, 128)`` attention output.

@@ -169,6 +169,7 @@ set(HIP_SOURCES
     sage_attention/sol_attn_producer.hip
     sage_attention/sol_attn_route.hip
     sage_attention/sol_attn_exact.hip
+    sage_attention/sol_attn_token.hip
     ops/apply_rope.hip
     ops/flash_decode.hip
     ops/rms_rope.hip

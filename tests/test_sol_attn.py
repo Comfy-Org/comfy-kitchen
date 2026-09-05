@@ -467,10 +467,6 @@ def _token_routing_case(t=4096 + 5, h=8, seed=7):
     return tuple(x[None].to(torch.bfloat16) for x in (q, k, v))
 
 
-cuda_only = pytest.mark.skipif(backend is not cuda_backend, reason="token routing is a CUDA-backend stage")
-
-
-@cuda_only
 @pytest.mark.parametrize("mode", [{"tau": 1.4}, {"topk_ratio": 0.1}])
 def test_token_aug_improves_exactness(mode):
     """A larger token budget brings the output closer to dense and shrinks the DC bias."""
@@ -486,7 +482,6 @@ def test_token_aug_improves_exactness(mode):
     assert bias[256] < bias[0], bias
 
 
-@cuda_only
 def test_token_aug_is_deterministic():
     """Reruns and strided views are bit-identical."""
     q, k, v = _token_routing_case(seed=3)
@@ -497,7 +492,35 @@ def test_token_aug_is_deterministic():
     assert torch.equal(a, ck.sol_attn(qb, kb, vb, topk_ratio=0.1, token_aug=256))
 
 
-@cuda_only
+def test_token_aug_surplus_over_the_budget_stays_in_the_tail():
+    """A token the budget cannot list must stay pooled, not fall out of both branches.
+
+    Keys alternate +c*u / -c*u per block, so each block mean is zero and the pooled
+    score routing sees is ~0, while every token scores +-c^2*scale*log2e. That puts
+    half of every unrouted block into the clamped top histogram bin, whose count the
+    threshold walk cannot bound, so the reservation runs past n_tok (measured: 1952
+    reserved against 256). Dropping the surplus from the tail as well as the list
+    loses its mass and costs an order of magnitude of accuracy.
+    """
+    t, h, c = 4096, 2, 30.0
+    g = torch.Generator(device="cuda").manual_seed(0)
+    u = torch.randn(h, HD, device="cuda", generator=g)
+    u = u / u.norm(dim=-1, keepdim=True)
+    sign = torch.where(torch.arange(t, device="cuda") % 2 == 0, 1.0, -1.0)
+    q = (c * u)[None].expand(t, h, HD)
+    k = (c * u)[None] * sign[:, None, None]
+    v = torch.randn(t, h, HD, device="cuda", generator=g)
+    q, k, v = (x[None].to(torch.bfloat16).contiguous() for x in (q, k, v))
+
+    ref = _dense(q, k, v)
+    aug = ck.sol_attn(q, k, v, tau=4.0, token_aug=256)
+    assert torch.isfinite(aug.float()).all()
+    # measured: 4.64 for the pooled tail alone, 2.20 when the surplus is dropped,
+    # 0.13 when it is kept, so the cut sits an order of magnitude either side
+    no_aug = _rel(ck.sol_attn(q, k, v, tau=4.0), ref)
+    assert _rel(aug, ref) < 0.15 * no_aug, (_rel(aug, ref), no_aug)
+
+
 def test_token_aug_chunked_matches_direct():
     """The chunked path runs the same token stage."""
     c = _chunked_case(seed=13, rot=96, v_scale=0.02)
@@ -511,7 +534,6 @@ def test_token_aug_chunked_matches_direct():
     assert _rel(out, _dense(c["q"], c["k"], c["v"])) < _rel(plain, _dense(c["q"], c["k"], c["v"]))
 
 
-@cuda_only
 def test_token_aug_validation_and_no_tail():
     """Bad budgets are rejected; identical keys admit nothing (one score bin, over budget);
     dense rows are untouched; the stage works without the tail and with a budget that is
