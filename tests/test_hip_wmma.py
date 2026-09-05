@@ -1538,15 +1538,19 @@ def test_bias_that_requires_grad_is_exportable(hip):
     )
 
 
-@pytest.mark.parametrize(("m", "n", "k"), [(1, 512, 512), (8, 1024, 1024), (64, 1152, 1152)])
-def test_gemv_awq_w4a16_matches_eager(m, n, k):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("m", "n", "k"),
+    [(1, 512, 512), (8, 1024, 1024), (9, 129, 512), (17, 1100, 1024), (64, 1152, 1152)],
+)
+def test_gemv_awq_w4a16_matches_eager(m, n, k, dtype):
     torch.manual_seed(0)
     g = 64
-    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    x = torch.randn(m, k, device=DEV, dtype=dtype)
     qw = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device=DEV).view(torch.int8)
-    ws = torch.randn(k // g, n, device=DEV, dtype=torch.bfloat16).abs() * 0.01
-    wz = torch.randn(k // g, n, device=DEV, dtype=torch.bfloat16) * 0.01
-    bias = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    ws = torch.randn(k // g, n, device=DEV, dtype=dtype).abs() * 0.01
+    wz = torch.randn(k // g, n, device=DEV, dtype=dtype) * 0.01
+    bias = torch.randn(n, device=DEV, dtype=dtype)
 
     with ck.use_backend("hip"):
         out = ck.gemv_awq_w4a16(x, qw, ws, wz, bias, g)
@@ -1557,6 +1561,117 @@ def test_gemv_awq_w4a16_matches_eager(m, n, k):
     # Identical dequant math on both sides; only the accumulation order differs.
     rel = (out.float() - ref.float()).norm() / ref.float().norm()
     assert rel < 1e-2
+
+
+def test_gemv_awq_w4a16_scalar_fallback_matches_eager():
+    torch.manual_seed(0)
+    m, n, k, g = 17, 129, 512, 32
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    qw = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device=DEV).view(torch.int8)
+    ws = torch.randn(k // g, n, device=DEV, dtype=torch.bfloat16).abs() * 0.01
+    wz = torch.randn(k // g, n, device=DEV, dtype=torch.bfloat16) * 0.01
+
+    with ck.use_backend("hip"):
+        out = ck.gemv_awq_w4a16(x, qw, ws, wz, group_size=g)
+    with ck.use_backend("eager"):
+        ref = ck.gemv_awq_w4a16(x, qw, ws, wz, group_size=g)
+
+    rel = (out.float() - ref.float()).norm() / ref.float().norm()
+    assert rel < 1e-2
+
+
+def test_gemv_awq_w4a16_misaligned_input_uses_scalar_path(hip, monkeypatch):
+    torch.manual_seed(0)
+    m, n, k, g = 17, 129, 512, 64
+    storage = torch.randn(m * k + 1, device=DEV, dtype=torch.bfloat16)
+    x = storage[1:].view(m, k)
+    qw = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device=DEV).view(torch.int8)
+    ws = torch.rand(k // g, n, device=DEV, dtype=torch.bfloat16) * 0.01
+    wz = torch.rand_like(ws) * 0.01
+    original = hip._C.gemv_awq_w4a16
+    use_wmma = None
+
+    def capture(*args):
+        nonlocal use_wmma
+        use_wmma = args[-2]
+        return original(*args)
+
+    monkeypatch.setattr(hip._C, "gemv_awq_w4a16", capture)
+    out = hip.gemv_awq_w4a16(x, qw, ws, wz, group_size=g)
+    with ck.use_backend("eager"):
+        ref = ck.gemv_awq_w4a16(x, qw, ws, wz, group_size=g)
+
+    assert x.is_contiguous() and x.data_ptr() % 16 != 0
+    assert use_wmma is False
+    rel = (out.float() - ref.float()).norm() / ref.float().norm()
+    assert rel < 1e-2
+
+
+@needs_wmma
+def test_gemv_awq_w4a16_aligned_input_uses_wmma(hip, monkeypatch):
+    torch.manual_seed(0)
+    m, n, k, g = 17, 129, 512, 64
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    qw = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device=DEV).view(torch.int8)
+    ws = torch.rand(k // g, n, device=DEV, dtype=torch.bfloat16) * 0.01
+    wz = torch.rand_like(ws) * 0.01
+    original = hip._C.gemv_awq_w4a16
+    use_wmma = None
+
+    def capture(*args):
+        nonlocal use_wmma
+        use_wmma = args[-2]
+        return original(*args)
+
+    monkeypatch.setattr(hip._C, "gemv_awq_w4a16", capture)
+    out = hip.gemv_awq_w4a16(x, qw, ws, wz, group_size=g)
+    with ck.use_backend("eager"):
+        ref = ck.gemv_awq_w4a16(x, qw, ws, wz, group_size=g)
+
+    assert x.data_ptr() % 16 == 0
+    assert use_wmma is True
+    rel = (out.float() - ref.float()).norm() / ref.float().norm()
+    assert rel < 1e-2
+
+
+@pytest.mark.parametrize(
+    ("x_dtype", "scale_dtype"),
+    [
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float16, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+    ],
+)
+@pytest.mark.parametrize("g", [32, 64, 128])
+def test_gemv_awq_w4a16_large_m_uses_torch_matmul(
+    hip, monkeypatch, x_dtype, scale_dtype, g
+):
+    torch.manual_seed(0)
+    m = hip._AWQ_W4A16_MMA_M_LIMITS[scale_dtype] + 1
+    n, k = 17, 128
+    x = torch.randn(m, k, device=DEV, dtype=x_dtype)
+    qw = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device=DEV).view(torch.int8)
+    ws = torch.rand(k // g, n, device=DEV, dtype=scale_dtype) * 0.01
+    wz = torch.rand_like(ws) * 0.01
+    bias = torch.randn(n, device=DEV, dtype=scale_dtype)
+
+    def refuse_native(*_args):
+        raise AssertionError("native AWQ path used above the MMA M limit")
+
+    monkeypatch.setattr(hip._C, "gemv_awq_w4a16", refuse_native)
+    out = hip.gemv_awq_w4a16(x, qw, ws, wz, bias, g)
+    with ck.use_backend("eager"):
+        ref = ck.gemv_awq_w4a16(x, qw, ws, wz, bias, g)
+
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+def test_gemv_awq_w4a16_uses_dtype_specific_large_m_limits(hip):
+    assert (
+        hip._AWQ_W4A16_MMA_M_LIMITS[torch.bfloat16]
+        < hip._AWQ_W4A16_MMA_M_LIMITS[torch.float16]
+    )
 
 
 @pytest.mark.parametrize("act_unsigned", [False, True])
@@ -1969,6 +2084,8 @@ def test_gemv_awq_validates_its_memory_contract(hip):
         hip.gemv_awq_w4a16(x, qw, ws.reshape(-1), wz, None, g)
     with pytest.raises(ValueError, match="bias must be 1D"):
         hip.gemv_awq_w4a16(x, qw, ws, wz, torch.randn(8, device=DEV, dtype=torch.bfloat16), g)
+    with pytest.raises(ValueError, match="wscales dtype"):
+        hip.gemv_awq_w4a16(x, qw, ws.float(), wz.float(), None, g)
 
     assert hip.gemv_awq_w4a16(x, qw, ws, wz, None, g).shape == (1, n)
 

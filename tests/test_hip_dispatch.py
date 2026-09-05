@@ -166,6 +166,14 @@ def test_hip_drops_gemms_without_matrix_cores():
     assert "quantize_w4a8_int8_weight" in without
 
 
+def test_hip_awq_matches_cuda_operand_dtypes():
+    constraints = hip_backend._build_constraints(has_wmma=True)["gemv_awq_w4a16"]
+    half_floats = frozenset({torch.float16, torch.bfloat16})
+
+    for name in ("x", "wscales", "wzeros"):
+        assert constraints.params[name].dtypes == half_floats
+
+
 def test_hip_advertises_every_inplace_rope_entry():
     """A missing entry routes the in-place call to eager while the functional one
     stays on HIP: silently half the coverage rather than a failure."""

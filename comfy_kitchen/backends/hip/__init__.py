@@ -1202,6 +1202,38 @@ def convrot_w4a4_linear(
 # AWQ W4A16 and SVDQuant W4A4
 # ---------------------------------------------------------------------------
 
+# Cross-architecture benchmarks place the BF16 matmul crossover earlier than
+# FP16. Above these limits, materialize the weight and use matmul.
+_AWQ_W4A16_MMA_M_LIMITS = {
+    torch.bfloat16: 1280,
+    torch.float16: 2048,
+}
+
+
+def _awq_w4a16_dequant_then_matmul(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    wscales: torch.Tensor,
+    wzeros: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    """Dequantize the packed weight and use PyTorch matmul for large M."""
+    n, k_half = qweight.shape
+    k = k_half * 2
+    compute_dtype = wscales.dtype
+
+    values = torch.empty((n, k), dtype=compute_dtype, device=qweight.device)
+    values[:, 0::2].copy_(torch.bitwise_and(qweight, 0xF))
+    values[:, 1::2].copy_(
+        torch.bitwise_and(torch.bitwise_right_shift(qweight, 4), 0xF)
+    )
+    weight = values.view(n, k // group_size, group_size)
+    weight.sub_(8.0)
+    weight.mul_(wscales.t().unsqueeze(-1))
+    weight.add_(wzeros.t().unsqueeze(-1))
+    return x.matmul(values.t())
+
+
 def gemv_awq_w4a16(
     x: torch.Tensor,
     qweight: torch.Tensor,
@@ -1227,20 +1259,28 @@ def gemv_awq_w4a16(
     # The kernel decodes scales and zeros with a single dtype code, taken from
     # wscales; a wzeros of another dtype would be read as that one.
     wscales = _operand(wscales, x.device, "wscales", shape=(k // group_size, n))
-    if wscales.dtype not in _EPILOGUE_DTYPES:
+    if wscales.dtype not in _AWQ_W4A16_MMA_M_LIMITS:
         raise ValueError(f"wscales dtype {wscales.dtype} is not supported")
+    # Match the eager and CUDA compute dtype before selecting an execution path.
+    x2d = x2d.to(wscales.dtype)
     wzeros = _operand(wzeros, x.device, "wzeros", shape=(k // group_size, n)).to(wscales.dtype)
     qw = _operand(qweight, x.device, "qweight", shape=(n, k // 2))
     if bias is not None:
         bias = _bias_operand(bias, n, x.device)
 
     out_dtype = wscales.dtype
-    out = torch.empty((m, n), dtype=out_dtype, device=x.device)
-    _C.gemv_awq_w4a16(
-        _dl(x2d), _dl(qw), _dl(wscales), _dl(wzeros),
-        None if bias is None else _dl(bias), _dl(out),
-        m, n, k, group_size, _stream(x),
-    )
+    if m > _AWQ_W4A16_MMA_M_LIMITS[out_dtype]:
+        out = _awq_w4a16_dequant_then_matmul(x2d, qw, wscales, wzeros, group_size)
+        if bias is not None:
+            out.add_(bias)
+    else:
+        out = torch.empty((m, n), dtype=out_dtype, device=x.device)
+        use_wmma = has_wmma() and x2d.data_ptr() % 16 == 0
+        _C.gemv_awq_w4a16(
+            _dl(x2d), _dl(qw), _dl(wscales), _dl(wzeros),
+            None if bias is None else _dl(bias), _dl(out),
+            m, n, k, group_size, use_wmma, _stream(x),
+        )
     return out.reshape(*orig_shape[:-1], n)
 
 
@@ -2291,9 +2331,15 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         # fall through to eager.
         "gemv_awq_w4a16": FunctionConstraints(
             params={
-                "x": ParamConstraint(dtypes=floats),
+                "x": ParamConstraint(dtypes=half_floats),
                 "qweight": ParamConstraint(
                     dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)
+                ),
+                "wscales": ParamConstraint(
+                    dtypes=half_floats, shape_rules=(ExactDims(2),)
+                ),
+                "wzeros": ParamConstraint(
+                    dtypes=half_floats, shape_rules=(ExactDims(2),)
                 ),
             },
             default_devices=dev,
