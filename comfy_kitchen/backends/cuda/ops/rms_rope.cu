@@ -22,6 +22,7 @@
  */
 #include "dtype_dispatch.cuh"
 #include "rope_device.cuh"
+#include "tensor.h"
 #include "utils.cuh"
 
 #include <cstdint>
@@ -33,28 +34,35 @@ namespace {
 constexpr int kWarpsPerBlock = 4;
 constexpr int kThreads = kWarpsPerBlock * kThreadsPerWarp;
 
+using TensorArg1 = tensor::TensorArg<1>;
+using TensorArg4 = tensor::TensorArg<4>;
+using TensorArg6 = tensor::TensorArg<6>;
+
 template <typename InputType, typename FreqsType, typename ScaleType,
           bool HasRms, bool SplitHalf, bool HasK, bool InPlace, bool ContigHead>
 __global__ __launch_bounds__(kThreads) void rope_kernel(
-    const InputType *q, const InputType *k,
-    const FreqsType *__restrict__ freqs,
-    const ScaleType *__restrict__ q_scale,
-    const ScaleType *__restrict__ k_scale, InputType *q_out,
-    InputType *k_out, int64_t batch, int64_t dim1, int64_t dim2,
-    int head_dim, int rot_dim, int64_t freqs_batch, int64_t freqs_dim1,
-    int64_t freqs_dim2, int64_t q_s0, int64_t q_s1, int64_t q_s2,
-    int64_t q_s3, int64_t k_s0, int64_t k_s1, int64_t k_s2, int64_t k_s3,
-    int64_t qo_s0, int64_t qo_s1, int64_t qo_s2, int64_t qo_s3,
-    int64_t ko_s0, int64_t ko_s1, int64_t ko_s2, int64_t ko_s3,
-    int64_t f_s0, int64_t f_s1, int64_t f_s2, int64_t f_s3, int64_t f_s4,
-    int64_t f_s5, int64_t qs_stride, int64_t ks_stride, float epsilon) {
-  using ComputeType =
-      std::conditional_t<HasRms, float, FreqsType>;
+    TensorArg4 q_arg, TensorArg4 k_arg, TensorArg6 freqs_arg,
+    TensorArg1 q_scale_arg, TensorArg1 k_scale_arg, TensorArg4 q_out_arg,
+    TensorArg4 k_out_arg, int rot_dim, float epsilon) {
+  using ComputeType = std::conditional_t<HasRms, float, FreqsType>;
+
+  const auto *q = static_cast<const InputType *>(q_arg.data);
+  const auto *k = static_cast<const InputType *>(k_arg.data);
+  const auto *freqs = static_cast<const FreqsType *>(freqs_arg.data);
+  const auto *q_scale = static_cast<const ScaleType *>(q_scale_arg.data);
+  const auto *k_scale = static_cast<const ScaleType *>(k_scale_arg.data);
+  auto *q_out = static_cast<InputType *>(q_out_arg.data);
+  auto *k_out = static_cast<InputType *>(k_out_arg.data);
+
+  const int64_t dim1 = q_arg.meta.sizes[1];
+  const int64_t dim2 = q_arg.meta.sizes[2];
+  const int head_dim = static_cast<int>(q_arg.meta.sizes[3]);
 
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int64_t row = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
-  const int64_t rows = batch * dim1 * dim2;
+  const int64_t rows =
+      q_arg.meta.sizes[0] * q_arg.meta.sizes[1] * q_arg.meta.sizes[2];
   if (row >= rows) {
     return;
   }
@@ -63,34 +71,43 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
   const int64_t tmp = row / dim2;
   const int64_t i1 = tmp % dim1;
   const int64_t i0 = tmp / dim1;
-  const int64_t q_base = i0 * q_s0 + i1 * q_s1 + i2 * q_s2;
-  const int64_t qo_base =
-      InPlace ? q_base : i0 * qo_s0 + i1 * qo_s1 + i2 * qo_s2;
+  const int64_t q_base =
+      i0 * q_arg.meta.strides[0] + i1 * q_arg.meta.strides[1] +
+      i2 * q_arg.meta.strides[2];
+  const int64_t q_out_base =
+      InPlace ? q_base
+              : i0 * q_out_arg.meta.strides[0] +
+                    i1 * q_out_arg.meta.strides[1] +
+                    i2 * q_out_arg.meta.strides[2];
   int64_t k_base = 0;
-  int64_t ko_base = 0;
+  int64_t k_out_base = 0;
   if constexpr (HasK) {
-    k_base = i0 * k_s0 + i1 * k_s1 + i2 * k_s2;
-    ko_base =
-        InPlace ? k_base : i0 * ko_s0 + i1 * ko_s1 + i2 * ko_s2;
+    k_base = i0 * k_arg.meta.strides[0] + i1 * k_arg.meta.strides[1] +
+             i2 * k_arg.meta.strides[2];
+    k_out_base =
+        InPlace ? k_base
+                : i0 * k_out_arg.meta.strides[0] +
+                      i1 * k_out_arg.meta.strides[1] +
+                      i2 * k_out_arg.meta.strides[2];
   }
 
   float q_rrms = 1.0f;
   float k_rrms = 1.0f;
   if constexpr (HasRms) {
     const float q_sum =
-        rope::rms_sum<InputType, ContigHead>(q + q_base, head_dim, q_s3, lane);
+        rope::rms_sum<InputType, ContigHead>(q + q_base, head_dim, q_arg.meta.strides[3], lane);
     q_rrms = rsqrtf(q_sum / static_cast<float>(head_dim) + epsilon);
     if constexpr (HasK) {
       const float k_sum = rope::rms_sum<InputType, ContigHead>(
-          k + k_base, head_dim, k_s3, lane);
+          k + k_base, head_dim, k_arg.meta.strides[3], lane);
       k_rrms = rsqrtf(k_sum / static_cast<float>(head_dim) + epsilon);
     }
   }
 
-  const int64_t fi0 = freqs_batch == 1 ? 0 : i0;
-  const int64_t fi1 = freqs_dim1 == 1 ? 0 : i1;
-  const int64_t fi2 = freqs_dim2 == 1 ? 0 : i2;
-  const int64_t freq_row = fi0 * f_s0 + fi1 * f_s1 + fi2 * f_s2;
+  const int64_t freq_row =
+      (freqs_arg.meta.sizes[0] == 1 ? 0 : i0) * freqs_arg.meta.strides[0] +
+      (freqs_arg.meta.sizes[1] == 1 ? 0 : i1) * freqs_arg.meta.strides[1] +
+      (freqs_arg.meta.sizes[2] == 1 ? 0 : i2) * freqs_arg.meta.strides[2];
   // Rotation covers the first rot_dim dims (split-half pairs (i, i + rot_dim/2));
   // the RMS reduction above always spans the full head_dim.
   const int pairs = rot_dim / 2;
@@ -122,10 +139,10 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
       }
     } else {
       rope::load_head_pair<InputType, SplitHalf, ContigHead>(
-          q + q_base, pair_base, pairs, q_s3, q0_raw[0], q1_raw[0]);
+          q + q_base, pair_base, pairs, q_arg.meta.strides[3], q0_raw[0], q1_raw[0]);
       if constexpr (HasK) {
         rope::load_head_pair<InputType, SplitHalf, ContigHead>(
-            k + k_base, pair_base, pairs, k_s3, k0_raw[0], k1_raw[0]);
+            k + k_base, pair_base, pairs, k_arg.meta.strides[3], k0_raw[0], k1_raw[0]);
       }
     }
 
@@ -142,16 +159,19 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
         q0 = static_cast<float>(static_cast<InputType>(
             static_cast<float>(q0) * q_rrms *
             static_cast<float>(
-                q_scale[static_cast<int64_t>(first) * qs_stride])));
+                q_scale[static_cast<int64_t>(first) * q_scale_arg.meta.strides[0]])));
         q1 = static_cast<float>(static_cast<InputType>(
             static_cast<float>(q1) * q_rrms *
             static_cast<float>(
-                q_scale[static_cast<int64_t>(second) * qs_stride])));
+                q_scale[static_cast<int64_t>(second) * q_scale_arg.meta.strides[0]])));
       }
 
       FreqsType f00_raw, f01_raw, f10_raw, f11_raw;
-      rope::load_rotation(freqs, freq_row + static_cast<int64_t>(pair) * f_s3,
-                          f_s4, f_s5, f00_raw, f01_raw, f10_raw, f11_raw);
+      rope::load_rotation(
+          freqs,
+          freq_row + static_cast<int64_t>(pair) * freqs_arg.meta.strides[3],
+          freqs_arg.meta.strides[4], freqs_arg.meta.strides[5], f00_raw,
+          f01_raw, f10_raw, f11_raw);
       const ComputeType f00 = static_cast<ComputeType>(f00_raw);
       const ComputeType f01 = static_cast<ComputeType>(f01_raw);
       const ComputeType f10 = static_cast<ComputeType>(f10_raw);
@@ -168,11 +188,11 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
           k0 = static_cast<float>(static_cast<InputType>(
               static_cast<float>(k0) * k_rrms *
               static_cast<float>(
-                  k_scale[static_cast<int64_t>(first) * ks_stride])));
+                  k_scale[static_cast<int64_t>(first) * k_scale_arg.meta.strides[0]])));
           k1 = static_cast<float>(static_cast<InputType>(
               static_cast<float>(k1) * k_rrms *
               static_cast<float>(
-                  k_scale[static_cast<int64_t>(second) * ks_stride])));
+                  k_scale[static_cast<int64_t>(second) * k_scale_arg.meta.strides[0]])));
         }
         ComputeType ko0, ko1;
         rope::rotate(k0, k1, f00, f01, f10, f11, ko0, ko1);
@@ -182,48 +202,53 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
     }
 
     if constexpr (SplitHalf && ContigHead) {
-      *reinterpret_cast<rope::Pair<InputType> *>(q_out + qo_base + pair_base) =
-          {qo0_raw[0], qo0_raw[1]};
       *reinterpret_cast<rope::Pair<InputType> *>(
-          q_out + qo_base + pairs + pair_base) = {qo1_raw[0], qo1_raw[1]};
+          q_out + q_out_base + pair_base) = {qo0_raw[0], qo0_raw[1]};
+      *reinterpret_cast<rope::Pair<InputType> *>(
+          q_out + q_out_base + pairs + pair_base) = {qo1_raw[0], qo1_raw[1]};
       if constexpr (HasK) {
         *reinterpret_cast<rope::Pair<InputType> *>(
-            k_out + ko_base + pair_base) = {ko0_raw[0], ko0_raw[1]};
+            k_out + k_out_base + pair_base) = {ko0_raw[0], ko0_raw[1]};
         *reinterpret_cast<rope::Pair<InputType> *>(
-            k_out + ko_base + pairs + pair_base) = {ko1_raw[0], ko1_raw[1]};
+            k_out + k_out_base + pairs + pair_base) = {ko1_raw[0], ko1_raw[1]};
       }
     } else {
       rope::store_head_pair<InputType, SplitHalf, ContigHead>(
-          q_out + qo_base, pair_base, pairs, InPlace ? q_s3 : qo_s3,
+          q_out + q_out_base, pair_base, pairs,
+          InPlace ? q_arg.meta.strides[3] : q_out_arg.meta.strides[3],
           qo0_raw[0], qo1_raw[0]);
       if constexpr (HasK) {
         rope::store_head_pair<InputType, SplitHalf, ContigHead>(
-            k_out + ko_base, pair_base, pairs, InPlace ? k_s3 : ko_s3,
-            ko0_raw[0], ko1_raw[0]);
+            k_out + k_out_base, pair_base, pairs,
+            InPlace ? k_arg.meta.strides[3] : k_out_arg.meta.strides[3], ko0_raw[0], ko1_raw[0]);
       }
     }
   }
 
   // Norm-only tail: dims beyond rot_dim are normalized and scaled but never
   // rotated. Empty in the common rot_dim == head_dim case.
-  const int64_t qo_s3_eff = InPlace ? q_s3 : qo_s3;
-  const int64_t ko_s3_eff = InPlace ? k_s3 : ko_s3;
+  const int64_t q_out_stride =
+      InPlace ? q_arg.meta.strides[3] : q_out_arg.meta.strides[3];
+  const int64_t k_out_stride =
+      InPlace ? k_arg.meta.strides[3] : k_out_arg.meta.strides[3];
   for (int d = rot_dim + lane; d < head_dim; d += kThreadsPerWarp) {
-    InputType qv = q[q_base + static_cast<int64_t>(d) * q_s3];
+    InputType qv = q[q_base + static_cast<int64_t>(d) * q_arg.meta.strides[3]];
     if constexpr (HasRms) {
       qv = static_cast<InputType>(
           static_cast<float>(qv) * q_rrms *
-          static_cast<float>(q_scale[static_cast<int64_t>(d) * qs_stride]));
+          static_cast<float>(
+              q_scale[static_cast<int64_t>(d) * q_scale_arg.meta.strides[0]]));
     }
-    q_out[qo_base + static_cast<int64_t>(d) * qo_s3_eff] = qv;
+    q_out[q_out_base + static_cast<int64_t>(d) * q_out_stride] = qv;
     if constexpr (HasK) {
-      InputType kv = k[k_base + static_cast<int64_t>(d) * k_s3];
+      InputType kv = k[k_base + static_cast<int64_t>(d) * k_arg.meta.strides[3]];
       if constexpr (HasRms) {
         kv = static_cast<InputType>(
             static_cast<float>(kv) * k_rrms *
-            static_cast<float>(k_scale[static_cast<int64_t>(d) * ks_stride]));
+            static_cast<float>(
+                k_scale[static_cast<int64_t>(d) * k_scale_arg.meta.strides[0]]));
       }
-      k_out[ko_base + static_cast<int64_t>(d) * ko_s3_eff] = kv;
+      k_out[k_out_base + static_cast<int64_t>(d) * k_out_stride] = kv;
     }
   }
 }
@@ -237,18 +262,11 @@ bool pair_aligned(const T *ptr, int64_t s0, int64_t s1, int64_t s2) {
 template <typename InputType, typename FreqsType, typename ScaleType,
           bool HasRms, bool SplitHalf, bool HasK, bool InPlace, bool ContigHead>
 void launch_config(
-    const InputType *q, const InputType *k, const FreqsType *freqs,
-    const ScaleType *q_scale, const ScaleType *k_scale, InputType *q_out,
-    InputType *k_out, int64_t batch, int64_t dim1, int64_t dim2, int head_dim,
-    int rot_dim,
-    int64_t freqs_batch, int64_t freqs_dim1, int64_t freqs_dim2, int64_t q_s0,
-    int64_t q_s1, int64_t q_s2, int64_t q_s3, int64_t k_s0, int64_t k_s1,
-    int64_t k_s2, int64_t k_s3, int64_t qo_s0, int64_t qo_s1, int64_t qo_s2,
-    int64_t qo_s3, int64_t ko_s0, int64_t ko_s1, int64_t ko_s2, int64_t ko_s3,
-    int64_t f_s0, int64_t f_s1, int64_t f_s2, int64_t f_s3, int64_t f_s4,
-    int64_t f_s5, int64_t qs_stride, int64_t ks_stride, float epsilon,
-    cudaStream_t stream) {
-  const int64_t rows = batch * dim1 * dim2;
+    TensorArg4 q, TensorArg4 k, TensorArg6 freqs, TensorArg1 q_scale,
+    TensorArg1 k_scale, TensorArg4 q_out, TensorArg4 k_out, int rot_dim,
+    float epsilon, cudaStream_t stream) {
+  const int64_t rows =
+      q.meta.sizes[0] * q.meta.sizes[1] * q.meta.sizes[2];
   if (rows == 0) {
     return;
   }
@@ -256,49 +274,40 @@ void launch_config(
                                       kWarpsPerBlock);
   rope_kernel<InputType, FreqsType, ScaleType, HasRms, SplitHalf, HasK, InPlace,
               ContigHead><<<blocks, kThreads, 0, stream>>>(
-      q, k, freqs, q_scale, k_scale, q_out, k_out, batch, dim1, dim2, head_dim,
-      rot_dim,
-      freqs_batch, freqs_dim1, freqs_dim2, q_s0, q_s1, q_s2, q_s3, k_s0, k_s1,
-      k_s2, k_s3, qo_s0, qo_s1, qo_s2, qo_s3, ko_s0, ko_s1, ko_s2, ko_s3,
-      f_s0, f_s1, f_s2, f_s3, f_s4, f_s5, qs_stride, ks_stride, epsilon);
+      q, k, freqs, q_scale, k_scale, q_out, k_out, rot_dim, epsilon);
 }
 
 template <typename InputType, typename FreqsType, typename ScaleType,
           bool HasRms>
 void rope_launcher(
-    const InputType *q, const InputType *k, const FreqsType *freqs,
-    const ScaleType *q_scale, const ScaleType *k_scale, InputType *q_out,
-    InputType *k_out, int64_t batch, int64_t dim1, int64_t dim2, int head_dim,
-    int rot_dim,
-    int64_t freqs_batch, int64_t freqs_dim1, int64_t freqs_dim2, int64_t q_s0,
-    int64_t q_s1, int64_t q_s2, int64_t q_s3, int64_t k_s0, int64_t k_s1,
-    int64_t k_s2, int64_t k_s3, int64_t qo_s0, int64_t qo_s1, int64_t qo_s2,
-    int64_t qo_s3, int64_t ko_s0, int64_t ko_s1, int64_t ko_s2, int64_t ko_s3,
-    int64_t f_s0, int64_t f_s1, int64_t f_s2, int64_t f_s3, int64_t f_s4,
-    int64_t f_s5, int64_t qs_stride, int64_t ks_stride, float epsilon,
-    bool has_k, bool split_half, cudaStream_t stream) {
-  const bool inplace = q == q_out && (!has_k || k == k_out);
-  bool contig = q_s3 == 1 && qo_s3 == 1 &&
-                pair_aligned(q, q_s0, q_s1, q_s2) &&
-                pair_aligned(q_out, qo_s0, qo_s1, qo_s2);
+    TensorArg4 q, TensorArg4 k, TensorArg6 freqs, TensorArg1 q_scale,
+    TensorArg1 k_scale, TensorArg4 q_out, TensorArg4 k_out, int rot_dim,
+    float epsilon, bool has_k, bool split_half, cudaStream_t stream) {
+  const bool inplace =
+      q.data == q_out.data && (!has_k || k.data == k_out.data);
+  bool contig = q.meta.strides[3] == 1 && q_out.meta.strides[3] == 1 &&
+                pair_aligned(static_cast<const InputType *>(q.data),
+                             q.meta.strides[0], q.meta.strides[1],
+                             q.meta.strides[2]) &&
+                pair_aligned(static_cast<InputType *>(q_out.data),
+                             q_out.meta.strides[0],
+                             q_out.meta.strides[1], q_out.meta.strides[2]);
   if (has_k) {
-    contig = contig && k_s3 == 1 && ko_s3 == 1 &&
-             pair_aligned(k, k_s0, k_s1, k_s2) &&
-             pair_aligned(k_out, ko_s0, ko_s1, ko_s2);
+    contig = contig && k.meta.strides[3] == 1 &&
+             k_out.meta.strides[3] == 1 &&
+             pair_aligned(static_cast<const InputType *>(k.data),
+                          k.meta.strides[0], k.meta.strides[1], k.meta.strides[2]) &&
+             pair_aligned(static_cast<InputType *>(k_out.data),
+                          k_out.meta.strides[0],
+                          k_out.meta.strides[1], k_out.meta.strides[2]);
   }
-  // Split-half packs adjacent values independently in each half. Both half
-  // starts must therefore be pair-aligned (the rotated prefix for partial
-  // rotary).
-  contig = contig && (!split_half || (head_dim % 4 == 0 && rot_dim % 4 == 0));
+  contig = contig &&
+           (!split_half || (q.meta.sizes[3] % 4 == 0 && rot_dim % 4 == 0));
 
 #define LAUNCH(HAS_K, SPLIT, INPLACE, CONTIG)                                  \
   launch_config<InputType, FreqsType, ScaleType, HasRms, SPLIT, HAS_K,         \
-                INPLACE, CONTIG>(                                               \
-      q, k, freqs, q_scale, k_scale, q_out, k_out, batch, dim1, dim2, head_dim, \
-      rot_dim,                                                                  \
-      freqs_batch, freqs_dim1, freqs_dim2, q_s0, q_s1, q_s2, q_s3, k_s0, k_s1, \
-      k_s2, k_s3, qo_s0, qo_s1, qo_s2, qo_s3, ko_s0, ko_s1, ko_s2, ko_s3,      \
-      f_s0, f_s1, f_s2, f_s3, f_s4, f_s5, qs_stride, ks_stride, epsilon, stream)
+                INPLACE, CONTIG>(q, k, freqs, q_scale, k_scale, q_out, k_out,   \
+                                 rot_dim, epsilon, stream)
 #define DISPATCH_LAYOUT(HAS_K, SPLIT)                                           \
   if (inplace) {                                                                \
     if (contig) LAUNCH(HAS_K, SPLIT, true, true);                              \
@@ -327,57 +336,31 @@ void rope_launcher(
 } // namespace comfy
 
 extern "C" void launch_apply_rope_kernel(
-    const void *q, const void *k, const void *freqs, void *q_out, void *k_out,
-    int64_t batch, int64_t dim1, int64_t dim2, int64_t head_dim,
-    int64_t freqs_batch, int64_t freqs_dim1, int64_t freqs_dim2,
-    int64_t q_s0, int64_t q_s1, int64_t q_s2, int64_t q_s3, int64_t k_s0,
-    int64_t k_s1, int64_t k_s2, int64_t k_s3, int64_t qo_s0, int64_t qo_s1,
-    int64_t qo_s2, int64_t qo_s3, int64_t ko_s0, int64_t ko_s1, int64_t ko_s2,
-    int64_t ko_s3, int64_t f_s0, int64_t f_s1, int64_t f_s2, int64_t f_s3,
-    int64_t f_s4, int64_t f_s5, int input_dtype_code, int freqs_dtype_code,
-    bool has_k, bool split_half, cudaStream_t stream) {
-  DISPATCH_HALF_INPUT_FP_FREQS_DTYPES(input_dtype_code, freqs_dtype_code,
-                                      InputType, FreqsType, [&] {
+    comfy::tensor::TensorArg<4> q, comfy::tensor::TensorArg<4> k,
+    comfy::tensor::TensorArg<6> freqs, comfy::tensor::TensorArg<4> q_out,
+    comfy::tensor::TensorArg<4> k_out, bool has_k, bool split_half,
+    cudaStream_t stream) {
+  DISPATCH_HALF_INPUT_FP_FREQS_DTYPES(
+      static_cast<int>(q.meta.dtype), static_cast<int>(freqs.meta.dtype),
+      InputType, FreqsType, [&] {
     comfy::rope_launcher<InputType, FreqsType, float, false>(
-        static_cast<const InputType *>(q), static_cast<const InputType *>(k),
-        static_cast<const FreqsType *>(freqs), nullptr, nullptr,
-        static_cast<InputType *>(q_out), static_cast<InputType *>(k_out), batch,
-        dim1, dim2, static_cast<int>(head_dim), static_cast<int>(head_dim),
-        freqs_batch, freqs_dim1,
-        freqs_dim2, q_s0, q_s1, q_s2, q_s3, k_s0, k_s1, k_s2, k_s3, qo_s0,
-        qo_s1, qo_s2, qo_s3, ko_s0, ko_s1, ko_s2, ko_s3, f_s0, f_s1, f_s2,
-        f_s3, f_s4, f_s5, 0, 0, 0.0f, has_k, split_half, stream);
+        q, k, freqs, {}, {}, q_out, k_out,
+        static_cast<int>(q.meta.sizes[3]), 0.0f, has_k, split_half, stream);
   });
 }
 
 extern "C" void launch_rms_rope_kernel(
-    const void *q, const void *k, const void *freqs, const void *q_scale,
-    const void *k_scale, void *q_out, void *k_out, int64_t batch, int64_t dim1,
-    int64_t dim2, int64_t head_dim, int64_t rot_dim,
-    int64_t freqs_batch, int64_t freqs_dim1,
-    int64_t freqs_dim2, int64_t q_s0, int64_t q_s1, int64_t q_s2, int64_t q_s3,
-    int64_t k_s0, int64_t k_s1, int64_t k_s2, int64_t k_s3, int64_t qo_s0,
-    int64_t qo_s1, int64_t qo_s2, int64_t qo_s3, int64_t ko_s0, int64_t ko_s1,
-    int64_t ko_s2, int64_t ko_s3, int64_t f_s0, int64_t f_s1, int64_t f_s2,
-    int64_t f_s3, int64_t f_s4, int64_t f_s5, int64_t qs_stride,
-    int64_t ks_stride, float epsilon, int input_dtype_code,
-    int freqs_dtype_code, int scale_dtype_code, bool has_k, bool split_half,
-    cudaStream_t stream) {
-  DISPATCH_HALF_DTYPE(input_dtype_code, InputType, [&] {
-    DISPATCH_FP_DTYPE(freqs_dtype_code, FreqsType, [&] {
-      DISPATCH_FP_DTYPE(scale_dtype_code, ScaleType, [&] {
+    comfy::tensor::TensorArg<4> q, comfy::tensor::TensorArg<4> k,
+    comfy::tensor::TensorArg<6> freqs, comfy::tensor::TensorArg<1> q_scale,
+    comfy::tensor::TensorArg<1> k_scale, comfy::tensor::TensorArg<4> q_out,
+    comfy::tensor::TensorArg<4> k_out, int64_t rot_dim, float epsilon,
+    bool has_k, bool split_half, cudaStream_t stream) {
+  DISPATCH_HALF_DTYPE(static_cast<int>(q.meta.dtype), InputType, [&] {
+    DISPATCH_FP_DTYPE(static_cast<int>(freqs.meta.dtype), FreqsType, [&] {
+      DISPATCH_FP_DTYPE(static_cast<int>(q_scale.meta.dtype), ScaleType, [&] {
         comfy::rope_launcher<InputType, FreqsType, ScaleType, true>(
-            static_cast<const InputType *>(q), static_cast<const InputType *>(k),
-            static_cast<const FreqsType *>(freqs),
-            static_cast<const ScaleType *>(q_scale),
-            static_cast<const ScaleType *>(k_scale),
-            static_cast<InputType *>(q_out), static_cast<InputType *>(k_out),
-            batch, dim1, dim2, static_cast<int>(head_dim),
-            static_cast<int>(rot_dim), freqs_batch,
-            freqs_dim1, freqs_dim2, q_s0, q_s1, q_s2, q_s3, k_s0, k_s1, k_s2,
-            k_s3, qo_s0, qo_s1, qo_s2, qo_s3, ko_s0, ko_s1, ko_s2, ko_s3,
-            f_s0, f_s1, f_s2, f_s3, f_s4, f_s5, qs_stride, ks_stride, epsilon,
-            has_k, split_half, stream);
+            q, k, freqs, q_scale, k_scale, q_out, k_out,
+            static_cast<int>(rot_dim), epsilon, has_k, split_half, stream);
       });
     });
   });
