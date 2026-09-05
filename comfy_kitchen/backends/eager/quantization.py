@@ -968,6 +968,70 @@ def dequantize_int8_simple_dtype(q: torch.Tensor, scale: torch.Tensor, output_dt
     return dequantize_int8_simple(q, scale).to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
 
 
+def _dequantized_int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    convrot: bool,
+    convrot_groupsize: int,
+) -> torch.Tensor:
+    """Floating-point fallback for devices without INT8 accumulator matmul."""
+    if convrot:
+        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        x = _rotate_activation(x, h, convrot_groupsize)
+
+    dequantized_weight = weight.to(dtype=x.dtype)
+    scale = weight_scale.to(device=x.device, dtype=x.dtype)
+    if scale.numel() != 1:
+        scale = scale.reshape(-1, 1)
+    dequantized_weight.mul_(scale)
+
+    if bias is not None:
+        bias = bias.to(device=x.device, dtype=x.dtype)
+    return torch.nn.functional.linear(x, dequantized_weight, bias).to(out_dtype)
+
+
+def _mps_int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    convrot: bool,
+    convrot_groupsize: int,
+) -> torch.Tensor:
+    """Use Metal 4 fused kernels when supported, otherwise widen to floating point."""
+    if x.dtype == torch.bfloat16 and out_dtype == torch.bfloat16:
+        from .mps_int8 import FusedMPSUnsupportedError, int8_linear_bf16
+
+        if convrot:
+            h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+            x = _rotate_activation(x, h, convrot_groupsize)
+        try:
+            return int8_linear_bf16(x, weight, weight_scale, bias)
+        except FusedMPSUnsupportedError:
+            return _dequantized_int8_linear(
+                x,
+                weight,
+                weight_scale,
+                bias,
+                out_dtype,
+                False,
+                convrot_groupsize,
+            )
+    return _dequantized_int8_linear(
+        x,
+        weight,
+        weight_scale,
+        bias,
+        out_dtype,
+        convrot,
+        convrot_groupsize,
+    )
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1009,11 +1073,25 @@ def int8_linear(
             f"for weight shape {tuple(weight.shape)}"
         )
 
+    if convrot and x.shape[-1] % convrot_groupsize != 0:
+        raise ValueError(
+            f"ConvRot group size {convrot_groupsize} does not divide input features {x.shape[-1]}"
+        )
+
+    # Prefer Metal 4's cooperative INT8 tensor operations on Apple silicon. The
+    # helper retains the floating-point widening path for older MPS runtimes.
+    if x.device.type == "mps":
+        return _mps_int8_linear(
+            x,
+            weight,
+            weight_scale,
+            bias,
+            out_dtype,
+            convrot,
+            convrot_groupsize,
+        )
+
     if convrot:
-        if x.shape[-1] % convrot_groupsize != 0:
-            raise ValueError(
-                f"ConvRot group size {convrot_groupsize} does not divide input features {x.shape[-1]}"
-            )
         h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
         x = _rotate_activation(x, h, convrot_groupsize)
 
