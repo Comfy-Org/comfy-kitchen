@@ -55,6 +55,23 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
         gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
         return;
     }
+    // The 256-row tile wins on measured gfx1151 deep-K contractions and grids
+    // that divide evenly across WGPs. K=14336 is the MiniMax-H3 mlp_down depth;
+    // shallower shapes and unmeasured targets keep the shared selector.
+    if (M >= 512 && N >= 128 && K >= 14336) {
+        const WmmaDeviceInfo device = wmma_device_info(A);
+        const int blocks_256x128 = ((M + 255) / 256) * ((N + 127) / 128);
+        const bool deep_k_or_full_wgp_round =
+            K >= 2 * N || blocks_256x128 % device.wgps == 0;
+        if (device.gfx_arch == 1151 && blocks_256x128 >= device.wgps &&
+            deep_k_or_full_wgp_round) {
+            constexpr int BM = 256, BN = 128, BKB = 128;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<MmaInt8, EpiRowwise, OutT, BM, BN, BKB, 4, 2, 4, 4>
+                <<<grid, 256, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
+            return;
+        }
+    }
     launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
 }
 
