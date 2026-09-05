@@ -157,6 +157,129 @@ def dequantize_per_tensor_fp8(
 
 
 @triton.jit
+def stochastic_rounding_fp8_kernel_tl(
+    x_ptr,
+    rng_ptr,
+    output_ptr,
+    n_elements,
+    fp8_max: tl.constexpr,
+    exponent_max: tl.constexpr,
+    exponent_bias: tl.constexpr,
+    mantissa_bits: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    """Round values to FP8 using one random byte per element.
+
+    The RNG buffer is also the output buffer. Every lane consumes its byte before
+    replacing it with the encoded FP8 value, matching the native CUDA kernel.
+    """
+    # Keep address arithmetic valid for tensors with more than 2**31 elements.
+    pid = tl.program_id(0).to(tl.int64)
+    block_start = pid * block_size
+    offsets = block_start + tl.arange(0, block_size)
+    mask = offsets < n_elements
+
+    # Match native CUDA: round the input through FP16, then use FP32 arithmetic.
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float16).to(tl.float32)
+    random = tl.load(rng_ptr + offsets, mask=mask, other=0).to(tl.float32) / 256.0
+
+    # Split the magnitude into an FP8 exponent and a normal/subnormal mantissa.
+    abs_x = tl.abs(x)
+    sign = tl.where(x > 0.0, 1.0, tl.where(x < 0.0, -1.0, 0.0))
+    exponent = tl.floor(tl.log2(abs_x)) + exponent_bias
+    exponent = tl.maximum(tl.minimum(exponent, exponent_max), 0.0)
+    normal = exponent != 0.0
+
+    mantissa_levels = 2**mantissa_bits
+    exponent_scale = tl.exp2(exponent - exponent_bias)
+    normal_mantissa = (abs_x / exponent_scale - 1.0) * mantissa_levels
+    subnormal_mantissa = abs_x / (2.0 ** (-exponent_bias + 1 - mantissa_bits))
+
+    # Adding rng / 256 before floor selects the upper value with the fractional
+    # mantissa probability, without generating random numbers inside the kernel.
+    mantissa = tl.floor(tl.where(normal, normal_mantissa, subnormal_mantissa) + random)
+    mantissa /= mantissa_levels
+
+    # Reconstruct the rounded value, saturate it, and retain NaNs across targets
+    # whose min/max instructions otherwise replace NaN with a finite operand.
+    normal_value = exponent_scale * (1.0 + mantissa)
+    subnormal_value = (2.0 ** (-exponent_bias + 1)) * mantissa
+    rounded = sign * tl.where(normal, normal_value, subnormal_value)
+    rounded = tl.maximum(tl.minimum(rounded, fp8_max), -fp8_max)
+    rounded = tl.where(x != x, x, rounded)
+    tl.store(output_ptr + offsets, rounded, mask=mask)
+
+
+def stochastic_rounding_fp8(
+    x: torch.Tensor,
+    rng: torch.Tensor,
+    output_type: torch.dtype = torch.float8_e4m3fn,
+) -> torch.Tensor:
+    """Stochastically round x to FP8 using bytes from rng.
+
+    A contiguous RNG tensor is overwritten and returned as an FP8 view, avoiding
+    a separate output allocation. Non-contiguous inputs follow the CUDA wrapper
+    convention and are materialized before launch.
+    """
+    if output_type == torch.float8_e4m3fn:
+        fp8_max = F8_E4M3_MAX
+        exponent_max, exponent_bias, mantissa_bits = 15, 7, 3
+    elif output_type == torch.float8_e5m2:
+        fp8_max = F8_E5M2_MAX
+        exponent_max, exponent_bias, mantissa_bits = 31, 15, 2
+    else:
+        raise ValueError(
+            f"Unsupported output_type: {output_type}. Expected torch.float8_e4m3fn "
+            "or torch.float8_e5m2"
+        )
+
+    if x.device != rng.device:
+        raise ValueError(f"x and rng must be on the same device, got {x.device} and {rng.device}")
+    if x.shape != rng.shape:
+        raise ValueError(f"x and rng must have the same shape, got {x.shape} and {rng.shape}")
+    if rng.dtype != torch.uint8:
+        raise ValueError(f"rng must have dtype torch.uint8, got {rng.dtype}")
+
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not rng.is_contiguous():
+        rng = rng.contiguous()
+
+    orig_shape = x.shape
+    x_flat = x.flatten()
+    rng_flat = rng.flatten()
+    n_elements = x_flat.numel()
+    output = rng_flat.view(output_type)
+
+    if n_elements == 0:
+        return output.view(orig_shape)
+
+    if n_elements < 32768:  # < 32K elements
+        block_size = 128
+    elif n_elements < 131072:  # < 128K elements
+        block_size = 256
+    elif n_elements < 524288:  # < 512K elements
+        block_size = 512
+    else:
+        block_size = 1024
+
+    grid = (triton.cdiv(n_elements, block_size),)
+    stochastic_rounding_fp8_kernel_tl[grid](
+        x_flat,
+        rng_flat,
+        output,
+        n_elements,
+        fp8_max=fp8_max,
+        exponent_max=exponent_max,
+        exponent_bias=exponent_bias,
+        mantissa_bits=mantissa_bits,
+        block_size=block_size,
+    )
+
+    return output.view(orig_shape)
+
+
+@triton.jit
 def _compute_swizzled_scale_offset(
     in_row,
     in_col,

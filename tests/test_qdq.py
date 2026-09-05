@@ -130,6 +130,120 @@ class TestQuantizeFP8MisalignedView:
             assert torch.equal(out_view.view(torch.uint8), out_contig.view(torch.uint8))
 
 
+def _stochastic_rounding_fp8_reference(x, rng, output_dtype):
+    """Mirror the CUDA kernel's FP16 input conversion and FP32 arithmetic."""
+    if output_dtype == torch.float8_e4m3fn:
+        exponent_bits, mantissa_bits, exponent_bias = 4, 3, 7
+    else:
+        exponent_bits, mantissa_bits, exponent_bias = 5, 2, 15
+
+    x = x.half().float()
+    sign = torch.sign(x)
+    abs_x = x.abs()
+    sign = torch.where(abs_x == 0, 0, sign)
+    exponent = torch.clamp(
+        torch.floor(torch.log2(abs_x)) + exponent_bias,
+        0,
+        2**exponent_bits - 1,
+    )
+    normal = exponent != 0
+    mantissa_levels = 2**mantissa_bits
+    mantissa = torch.where(
+        normal,
+        (abs_x / torch.exp2(exponent - exponent_bias) - 1.0) * mantissa_levels,
+        abs_x / (2.0 ** (-exponent_bias + 1 - mantissa_bits)),
+    )
+    mantissa = torch.floor(mantissa + rng.float() / 256.0) / mantissa_levels
+    rounded = sign * torch.where(
+        normal,
+        torch.exp2(exponent - exponent_bias) * (1.0 + mantissa),
+        (2.0 ** (-exponent_bias + 1)) * mantissa,
+    )
+    info = torch.finfo(output_dtype)
+    return torch.clamp(rounded, min=info.min, max=info.max).to(output_dtype)
+
+
+class TestStochasticRoundingFP8:
+    @pytest.fixture
+    def triton_backend(self, device):
+        if "triton" not in get_capable_backends("stochastic_rounding_fp8", device):
+            pytest.skip(f"Triton stochastic_rounding_fp8 is not supported on {device}")
+        return "triton"
+
+    @pytest.mark.parametrize("input_dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("output_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    @pytest.mark.parametrize("numel", [17, 32769, 131073, 524289])
+    def test_matches_reference(self, triton_backend, device, seed, input_dtype, output_dtype, numel):
+        x = torch.randn(numel, device=device, dtype=input_dtype) * 10
+        rng = torch.randint(0, 256, x.shape, dtype=torch.uint8, device=device)
+
+        expected = _stochastic_rounding_fp8_reference(x, rng, output_dtype)
+        with ck.use_backend(triton_backend):
+            actual = ck.stochastic_rounding_fp8(x, rng.clone(), output_dtype)
+
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+    @pytest.mark.parametrize("input_dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("output_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    def test_edge_values(self, triton_backend, device, input_dtype, output_dtype):
+        values = [
+            float("nan"),
+            -float("nan"),
+            float("inf"),
+            -float("inf"),
+            1e30,
+            -1e30,
+            57344.0,
+            -57344.0,
+            448.0,
+            -448.0,
+            0.0,
+            -0.0,
+            1.0,
+            1e-9,
+        ]
+        x = torch.tensor(values, device=device, dtype=input_dtype)
+        rng = torch.arange(len(values), device=device, dtype=torch.uint8) * 17
+
+        expected = _stochastic_rounding_fp8_reference(x, rng, output_dtype)
+        with ck.use_backend(triton_backend):
+            actual = ck.stochastic_rounding_fp8(x, rng.clone(), output_dtype)
+
+        nan = torch.isnan(x.float())
+        assert torch.equal(actual.view(torch.uint8)[~nan], expected.view(torch.uint8)[~nan])
+        assert torch.isnan(actual.float()[nan]).all()
+
+    def test_noncontiguous_inputs_and_buffer_reuse(self, triton_backend, device, seed):
+        x = torch.randn(8, 32, device=device, dtype=torch.bfloat16)[:, ::2]
+        rng = torch.randint(0, 256, (8, 32), dtype=torch.uint8, device=device)[:, ::2]
+
+        expected = _stochastic_rounding_fp8_reference(
+            x.contiguous(), rng.contiguous(), torch.float8_e4m3fn
+        )
+        with ck.use_backend(triton_backend):
+            actual = ck.stochastic_rounding_fp8(x, rng, torch.float8_e4m3fn)
+
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+        contiguous_rng = rng.contiguous()
+        with ck.use_backend(triton_backend):
+            actual = ck.stochastic_rounding_fp8(
+                x.contiguous(), contiguous_rng, torch.float8_e4m3fn
+            )
+        assert actual.data_ptr() == contiguous_rng.data_ptr()
+
+    def test_empty_input(self, triton_backend, device):
+        x = torch.empty((0, 8), device=device, dtype=torch.float16)
+        rng = torch.empty_like(x, dtype=torch.uint8)
+
+        with ck.use_backend(triton_backend):
+            output = ck.stochastic_rounding_fp8(x, rng)
+
+        assert output.shape == x.shape
+        assert output.dtype == torch.float8_e4m3fn
+        assert output.data_ptr() == rng.data_ptr()
+
+
 class TestDequantizePerTensorFP8:
     """FP8 dequantization tests."""
 
