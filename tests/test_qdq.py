@@ -166,6 +166,8 @@ def _stochastic_rounding_fp8_reference(x, rng, output_dtype):
 class TestStochasticRoundingFP8:
     @pytest.fixture
     def triton_backend(self, device):
+        if device != "cuda" or torch.cuda.get_device_capability() < (8, 9):
+            pytest.skip("Triton stochastic_rounding_fp8 requires CUDA SM 8.9+")
         if "triton" not in get_capable_backends("stochastic_rounding_fp8", device):
             pytest.skip(f"Triton stochastic_rounding_fp8 is not supported on {device}")
         return "triton"
