@@ -1,5 +1,6 @@
 import torch
 
+from .backends import ascend as _ascend_backend  # noqa: F401
 from .backends import cuda as _cuda_backend  # noqa: F401
 
 # Import backends to trigger auto-registration
