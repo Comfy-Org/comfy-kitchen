@@ -61,6 +61,17 @@ requires_cuda_backend = pytest.mark.skipif(
 )
 
 
+def skip_unless_gfx12_wmma() -> None:
+    if not getattr(torch.version, "hip", None):
+        pytest.skip("requires HIP")
+    if not ck.list_backends().get("hip", {}).get("available", False):
+        pytest.skip("compiled HIP backend required")
+    from comfy_kitchen.backends import hip
+
+    if not hip._has_nonduplicated_wmma():
+        pytest.skip("requires gfx12-class WMMA (gfx120x)")
+
+
 @pytest.fixture(scope="session")
 def cuda_available():
     return torch.cuda.is_available()

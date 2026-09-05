@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -10,6 +11,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/string.h>
 
 #include "launchers.h"
 
@@ -51,6 +53,16 @@ void launch_convrot_w4a4_gemm_kernel(const void*, const void*, void*, const void
 void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, hipStream_t);
 void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
                                          int, int, hipStream_t);
+void launch_quantize_int8_convrot_swiglu_split_tiled128_kernel(
+    const void*, const void*, void*, void*, int, int, int, hipStream_t);
+void launch_quantize_int8_convrot_modulated_kernel(
+    const void*, const void*, void*, void*, int, int, int, hipStream_t);
+void launch_quantize_int8_convrot_affine_kernel(
+    const void*, const void*, const void*, void*, void*, int, int, int,
+    hipStream_t);
+void launch_quantize_int8_convrot_rms_modulated_fused_stats_kernel(
+    const void*, const void*, const void*, void*, void*, int, int, int,
+    float, hipStream_t);
 void launch_quantize_int8_tensorwise_kernel(const void*, int, void*, void*, void*, int64_t,
                                             hipStream_t);
 void launch_dequantize_int8_simple_kernel(const void*, const void*, void*, int64_t, int64_t, int,
@@ -61,12 +73,6 @@ void launch_convrot_quant_int4_kernel(const void*, int, void*, void*, int, int, 
 void launch_unpack_int4_kernel(const void*, void*, int64_t, hipStream_t);
 int convrot_max_k_host(int);
 int convrot_int8_needs_spill_host(int, int, int);
-
-void launch_quantize_w4a8_convrot_kernel(const void*, const void*, void*, void*, void*, int64_t,
-                                         int64_t, int, bool, uint64_t, hipStream_t);
-int w4a8_requant_max_k_kernel();
-void launch_na3d_kernel(const void*, const void*, const void*, void*, int, int, int, int, int, int,
-                        int, int, int, int, int, int, float, int, hipStream_t);
 
 void launch_sage_quant_qk_int8(const void*, void*, void*, const void*, void*, void*, void*, int,
                                int, int, int, int, int, int, int, int64_t, int64_t, int64_t,
@@ -161,6 +167,8 @@ static void require_dtype(const nb::ndarray<>& t, int lo, int hi, const char* fn
         throw std::runtime_error(std::string(fn) + ": " + name + " has an unsupported dtype");
     }
 }
+
+static void require_packed_contiguous(const nb::ndarray<>& t, const char* fn, const char* name);
 
 // Mirrors kSvdGroup in ops/svdquant_w4a4.hip: one scale per 64-element group.
 constexpr int kSvdGroup = 64;
@@ -339,6 +347,228 @@ void int8_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> 
     check_hip_launch();
 }
 
+void int8_gemm_b_tiled(
+    nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c,
+    nb::ndarray<> scale_a, nb::ndarray<> scale_b, int scale_b_stride,
+    OptArray bias, int M, int N, int K, int out_code, int tile_k,
+    bool dual_m, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "int8_gemm_b_tiled";
+    if (scale_b_stride != 0 && scale_b_stride != 1) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": scale_b_stride must be 0 or 1");
+    }
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    if (M != 0 && (M < 96 || N % 128 != 0 ||
+                   (tile_k != 64 && tile_k != 128) || K % tile_k != 0)) {
+        throw std::runtime_error(
+            std::string(kFn) +
+            ": requires M>=96, N divisible by 128, K divisible by "
+            "tile_k, and tile_k in {64,128}");
+    }
+    require_dtype(a, 4, 4, kFn, "a");
+    require_dtype(b, 4, 4, kFn, "b");
+    require_dtype(c, 0, 2, kFn, "c");
+    require_out_matches(c, out_code, kFn);
+    require_len(a, static_cast<int64_t>(M) * K, kFn, "a");
+    require_len(b, static_cast<int64_t>(N) * K, kFn, "b");
+    require_len(c, static_cast<int64_t>(M) * N, kFn, "c");
+    require_scale_len(scale_a, static_cast<size_t>(M), kFn, "scale_a");
+    require_scale_len(scale_b,
+                      scale_b_stride == 1 ? static_cast<size_t>(N) : 1,
+                      kFn, "scale_b");
+    require_bias(bias, N, kFn);
+
+    launch_int8_gemm_b_tiled_kernel(
+        a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(),
+        scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, N,
+        out_code, tile_k, dual_m,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void int8_gemm_b_tiled_gated_residual(
+    nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c,
+    nb::ndarray<> scale_a, nb::ndarray<> scale_b, int scale_b_stride,
+    OptArray bias, nb::ndarray<> residual, nb::ndarray<> gate,
+    int M, int N, int K, int tile_k, bool dual_m, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "int8_gemm_b_tiled_gated_residual";
+    if (scale_b_stride != 0 && scale_b_stride != 1) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": scale_b_stride must be 0 or 1");
+    }
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    if (M != 0 && (M < 96 || N % 128 != 0 ||
+                   (tile_k != 64 && tile_k != 128) || K % tile_k != 0)) {
+        throw std::runtime_error(
+            std::string(kFn) +
+            ": requires M>=96, N divisible by 128, K divisible by "
+            "tile_k, and tile_k in {64,128}");
+    }
+    require_dtype(a, 4, 4, kFn, "a");
+    require_dtype(b, 4, 4, kFn, "b");
+    require_dtype(c, 2, 2, kFn, "c");
+    require_dtype(residual, 2, 2, kFn, "residual");
+    require_dtype(gate, 2, 2, kFn, "gate");
+    require_len(a, static_cast<int64_t>(M) * K, kFn, "a");
+    require_len(b, static_cast<int64_t>(N) * K, kFn, "b");
+    require_len(c, static_cast<int64_t>(M) * N, kFn, "c");
+    require_len(residual, static_cast<int64_t>(M) * N, kFn, "residual");
+    require_len(gate, N, kFn, "gate");
+    require_scale_len(scale_a, static_cast<size_t>(M), kFn, "scale_a");
+    require_scale_len(scale_b,
+                      scale_b_stride == 1 ? static_cast<size_t>(N) : 1,
+                      kFn, "scale_b");
+    require_bias(bias, N, kFn);
+    if (residual.ndim() != 2 || residual.shape(0) != static_cast<size_t>(M) ||
+        residual.shape(1) != static_cast<size_t>(N) ||
+        residual.stride(0) != N || residual.stride(1) != 1 ||
+        gate.ndim() != 1 || gate.shape(0) != static_cast<size_t>(N) ||
+        gate.stride(0) != 1) {
+        throw std::runtime_error(
+            std::string(kFn) +
+            ": residual must be packed [M,N] and gate packed [N]");
+    }
+
+    launch_int8_gemm_b_tiled_gated_residual_kernel(
+        a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(),
+        scale_b_stride, opt_data(bias), opt_code(bias), residual.data(),
+        gate.data(), M, N, K, N, tile_k, dual_m,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void int8_gemm_pair(
+    nb::ndarray<> a, nb::ndarray<> b0, nb::ndarray<> b1,
+    nb::ndarray<> c0, nb::ndarray<> c1, nb::ndarray<> scale_a,
+    nb::ndarray<> scale_b0, int scale_b_stride0,
+    nb::ndarray<> scale_b1, int scale_b_stride1,
+    OptArray bias0, OptArray bias1, int M, int N, int K,
+    int out_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "int8_gemm_pair";
+    if ((scale_b_stride0 != 0 && scale_b_stride0 != 1) ||
+        (scale_b_stride1 != 0 && scale_b_stride1 != 1)) {
+        throw std::runtime_error(
+            std::string(kFn) + ": scale strides must be 0 or 1");
+    }
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    if (M != 0 && (M < 96 || N < 96 || K == 0 || K % 64 != 0)) {
+        throw std::runtime_error(
+            std::string(kFn) +
+            ": requires M,N>=96 and positive K divisible by 64");
+    }
+    require_dtype(a, 4, 4, kFn, "a");
+    require_dtype(b0, 4, 4, kFn, "b0");
+    require_dtype(b1, 4, 4, kFn, "b1");
+    require_dtype(c0, 0, 2, kFn, "c0");
+    require_dtype(c1, 0, 2, kFn, "c1");
+    require_out_matches(c0, out_code, kFn);
+    require_out_matches(c1, out_code, kFn);
+    require_len(a, static_cast<int64_t>(M) * K, kFn, "a");
+    require_len(b0, static_cast<int64_t>(N) * K, kFn, "b0");
+    require_len(b1, static_cast<int64_t>(N) * K, kFn, "b1");
+    require_len(c0, static_cast<int64_t>(M) * N, kFn, "c0");
+    require_len(c1, static_cast<int64_t>(M) * N, kFn, "c1");
+    require_scale_len(scale_a, static_cast<size_t>(M), kFn, "scale_a");
+    require_scale_len(
+        scale_b0, scale_b_stride0 == 1 ? static_cast<size_t>(N) : 1,
+        kFn, "scale_b0");
+    require_scale_len(
+        scale_b1, scale_b_stride1 == 1 ? static_cast<size_t>(N) : 1,
+        kFn, "scale_b1");
+    require_bias(bias0, N, kFn);
+    require_bias(bias1, N, kFn);
+
+    launch_int8_gemm_pair_kernel(
+        a.data(), b0.data(), b1.data(), c0.data(), c1.data(),
+        scale_a.data(), scale_b0.data(), scale_b_stride0,
+        scale_b1.data(), scale_b_stride1,
+        opt_data(bias0), opt_code(bias0), opt_data(bias1), opt_code(bias1),
+        M, N, K, N /*ldc*/, out_code,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void rms_gated_residual_bf16(
+    nb::ndarray<> activation, nb::ndarray<> norm_weight,
+    nb::ndarray<> residual, nb::ndarray<> gate, nb::ndarray<> output,
+    int rows, int width, float eps, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "rms_gated_residual_bf16";
+    require_nonneg(rows, kFn, "rows");
+    if (width <= 0 || width % 4 != 0) {
+        throw std::runtime_error(
+            std::string(kFn) + ": width must be positive and divisible by 4");
+    }
+    require_dtype(activation, 2, 2, kFn, "activation");
+    require_dtype(norm_weight, 2, 2, kFn, "norm_weight");
+    require_dtype(residual, 2, 2, kFn, "residual");
+    require_dtype(gate, 2, 2, kFn, "gate");
+    require_dtype(output, 2, 2, kFn, "output");
+    const int64_t numel = static_cast<int64_t>(rows) * width;
+    require_len(activation, numel, kFn, "activation");
+    require_len(norm_weight, width, kFn, "norm_weight");
+    require_len(residual, numel, kFn, "residual");
+    require_len(gate, width, kFn, "gate");
+    require_len(output, numel, kFn, "output");
+    const nb::ndarray<>* vector_operands[] = {
+        &activation, &norm_weight, &residual, &gate, &output};
+    for (const nb::ndarray<>* operand : vector_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
+
+    launch_rms_gated_residual_bf16_kernel(
+        activation.data(), norm_weight.data(), residual.data(), gate.data(),
+        output.data(), rows, width, eps,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void int8_gemm_a_tiled128_down(
+    nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c,
+    nb::ndarray<> scale_a, nb::ndarray<> scale_b, int scale_b_stride,
+    OptArray bias, int M, int N, int K, int out_code, bool tiled_b,
+    uintptr_t stream_ptr) {
+    constexpr const char* kFn = "int8_gemm_a_tiled128_down";
+    if (scale_b_stride != 0 && scale_b_stride != 1) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": scale_b_stride must be 0 or 1");
+    }
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    if (N <= 0 || K <= 0 || N % 128 != 0 || K % 128 != 0) {
+        throw std::runtime_error(
+            std::string(kFn) +
+            ": requires positive N and K divisible by 128");
+    }
+    require_dtype(a, 4, 4, kFn, "a");
+    require_dtype(b, 4, 4, kFn, "b");
+    require_dtype(c, 0, 2, kFn, "c");
+    require_out_matches(c, out_code, kFn);
+    const int64_t padded_m = (static_cast<int64_t>(M) + 127) / 128 * 128;
+    require_len(a, padded_m * K, kFn, "a");
+    require_len(b, static_cast<int64_t>(N) * K, kFn, "b");
+    require_len(c, static_cast<int64_t>(M) * N, kFn, "c");
+    require_scale_len(scale_a, static_cast<size_t>(M), kFn, "scale_a");
+    require_scale_len(scale_b, scale_b_stride == 1 ? static_cast<size_t>(N) : 1,
+                      kFn, "scale_b");
+    require_bias(bias, N, kFn);
+
+    launch_int8_gemm_a_tiled128_down_kernel(
+        a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(),
+        scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, N,
+        out_code, tiled_b, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
 void convrot_w4a4_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> x_scale,
                        nb::ndarray<> w_scale, OptArray bias, int M, int N, int K, int out_code,
                        uintptr_t stream_ptr) {
@@ -417,6 +647,16 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
     require_len(x, static_cast<int64_t>(M) * K * in_width, kFn, "x");
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(q, kFn, "q");
+    require_packed_contiguous(scales, kFn, "scales");
+    const nb::ndarray<>* aligned_operands[] = {&x, &q, &scales};
+    for (const nb::ndarray<>* operand : aligned_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
 
     void* spill_rotated_ptr = nullptr;
     void* spill_partials_ptr = nullptr;
@@ -426,11 +666,13 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
         if (map_dtype_to_code(spill_rotated->dtype()) != map_dtype_to_code(x.dtype())) {
             throw std::runtime_error(std::string(kFn) + ": spill_rotated dtype must match x");
         }
+        require_packed_contiguous(*spill_rotated, kFn, "spill_rotated");
         spill_rotated_ptr = spill_rotated->data();
     }
     if (spill_partials.has_value()) {
         require_dtype(*spill_partials, 0, 0, kFn, "spill_partials");
         require_len(*spill_partials, static_cast<int64_t>(M) * (K / 256), kFn, "spill_partials");
+        require_packed_contiguous(*spill_partials, kFn, "spill_partials");
         spill_partials_ptr = spill_partials->data();
     }
 
@@ -438,6 +680,152 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
                                         scales.data(), spill_rotated_ptr, spill_partials_ptr, M, K,
                                         group_size, act_code,
                                         reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void quantize_int8_convrot_swiglu_split_tiled128(
+    nb::ndarray<> gate, nb::ndarray<> up, nb::ndarray<> q,
+    nb::ndarray<> scales, int M, int K, int group_size,
+    uintptr_t stream_ptr) {
+    constexpr const char* kFn =
+        "quantize_int8_convrot_swiglu_split_tiled128";
+    require_nonneg(M, kFn, "M");
+    require_convrot_group(K, group_size, kFn);
+    require_dtype(gate, 2, 2, kFn, "gate");
+    require_dtype(up, 2, 2, kFn, "up");
+    require_dtype(q, 4, 4, kFn, "q");
+    require_len(gate, static_cast<int64_t>(M) * K, kFn, "gate");
+    require_len(up, static_cast<int64_t>(M) * K, kFn, "up");
+    const int64_t padded_m =
+        (static_cast<int64_t>(M) + 127) / 128 * 128;
+    require_len(q, padded_m * K, kFn, "q");
+    require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    require_packed_contiguous(gate, kFn, "gate");
+    require_packed_contiguous(up, kFn, "up");
+    require_packed_contiguous(q, kFn, "q");
+    require_packed_contiguous(scales, kFn, "scales");
+    const nb::ndarray<>* aligned_operands[] = {&gate, &up, &q, &scales};
+    for (const nb::ndarray<>* operand : aligned_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
+
+    launch_quantize_int8_convrot_swiglu_split_tiled128_kernel(
+        gate.data(), up.data(), q.data(), scales.data(), M, K, group_size,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void quantize_int8_convrot_modulated(
+    nb::ndarray<> x, nb::ndarray<> modulation_scale, nb::ndarray<> q,
+    nb::ndarray<> scales, int M, int K, int group_size,
+    uintptr_t stream_ptr) {
+    constexpr const char* kFn = "quantize_int8_convrot_modulated";
+    require_nonneg(M, kFn, "M");
+    require_convrot_group(K, group_size, kFn);
+    require_dtype(x, 2, 2, kFn, "x");
+    require_dtype(modulation_scale, 2, 2, kFn, "modulation_scale");
+    require_dtype(q, 4, 4, kFn, "q");
+    require_len(x, static_cast<int64_t>(M) * K, kFn, "x");
+    require_len(modulation_scale, static_cast<int64_t>(K), kFn,
+                "modulation_scale");
+    require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
+    require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(modulation_scale, kFn, "modulation_scale");
+    require_packed_contiguous(q, kFn, "q");
+    require_packed_contiguous(scales, kFn, "scales");
+    const nb::ndarray<>* aligned_operands[] = {
+        &x, &modulation_scale, &q, &scales};
+    for (const nb::ndarray<>* operand : aligned_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
+
+    launch_quantize_int8_convrot_modulated_kernel(
+        x.data(), modulation_scale.data(), q.data(), scales.data(),
+        M, K, group_size, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void quantize_int8_convrot_affine(
+    nb::ndarray<> x, nb::ndarray<> modulation_scale,
+    nb::ndarray<> modulation_shift, nb::ndarray<> q,
+    nb::ndarray<> scales, int M, int K, int group_size,
+    uintptr_t stream_ptr) {
+    constexpr const char* kFn = "quantize_int8_convrot_affine";
+    require_nonneg(M, kFn, "M");
+    require_convrot_group(K, group_size, kFn);
+    require_dtype(x, 2, 2, kFn, "x");
+    require_dtype(modulation_scale, 2, 2, kFn, "modulation_scale");
+    require_dtype(modulation_shift, 2, 2, kFn, "modulation_shift");
+    require_dtype(q, 4, 4, kFn, "q");
+    require_len(x, static_cast<int64_t>(M) * K, kFn, "x");
+    require_len(modulation_scale, static_cast<int64_t>(K), kFn,
+                "modulation_scale");
+    require_len(modulation_shift, static_cast<int64_t>(K), kFn,
+                "modulation_shift");
+    require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
+    require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(modulation_scale, kFn, "modulation_scale");
+    require_packed_contiguous(modulation_shift, kFn, "modulation_shift");
+    require_packed_contiguous(q, kFn, "q");
+    require_packed_contiguous(scales, kFn, "scales");
+    const nb::ndarray<>* aligned_operands[] = {
+        &x, &modulation_scale, &modulation_shift, &q, &scales};
+    for (const nb::ndarray<>* operand : aligned_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
+
+    launch_quantize_int8_convrot_affine_kernel(
+        x.data(), modulation_scale.data(), modulation_shift.data(),
+        q.data(), scales.data(), M, K, group_size,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void quantize_int8_convrot_rms_modulated_fused_stats(
+    nb::ndarray<> x, nb::ndarray<> norm_weight,
+    nb::ndarray<> modulation_scale, nb::ndarray<> q, nb::ndarray<> scales,
+    int M, int K, int group_size, float eps, uintptr_t stream_ptr) {
+    constexpr const char* kFn =
+        "quantize_int8_convrot_rms_modulated_fused_stats";
+    require_nonneg(M, kFn, "M");
+    require_convrot_group(K, group_size, kFn);
+    require_dtype(x, 2, 2, kFn, "x");
+    require_dtype(norm_weight, 2, 2, kFn, "norm_weight");
+    require_dtype(modulation_scale, 2, 2, kFn, "modulation_scale");
+    require_dtype(q, 4, 4, kFn, "q");
+    require_len(x, static_cast<int64_t>(M) * K, kFn, "x");
+    require_len(norm_weight, K, kFn, "norm_weight");
+    require_len(modulation_scale, K, kFn, "modulation_scale");
+    require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
+    require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(norm_weight, kFn, "norm_weight");
+    require_packed_contiguous(modulation_scale, kFn, "modulation_scale");
+    require_packed_contiguous(q, kFn, "q");
+    require_packed_contiguous(scales, kFn, "scales");
+    const nb::ndarray<>* aligned_operands[] = {
+        &x, &norm_weight, &modulation_scale, &q, &scales};
+    for (const nb::ndarray<>* operand : aligned_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
+    launch_quantize_int8_convrot_rms_modulated_fused_stats_kernel(
+        x.data(), norm_weight.data(), modulation_scale.data(), q.data(),
+        scales.data(), M, K, group_size, eps,
+        reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -1119,6 +1507,49 @@ static void require_packed_contiguous(const nb::ndarray<>& t, const char* fn, co
     }
 }
 
+static void require_non_overlapping_rows(
+    const nb::ndarray<>& output, int row_axis, uint64_t row_width,
+    const char* fn, const char* name) {
+    struct ActiveDimension {
+        uint64_t extent;
+        uint64_t stride;
+    };
+    ActiveDimension active_dimensions[3]{};
+    int active_count = 0;
+    for (int dim = 0; dim < row_axis; ++dim) {
+        if (output.shape(dim) <= 1) {
+            continue;
+        }
+        if (output.stride(dim) <= 0) {
+            throw std::runtime_error(
+                std::string(fn) + ": " + name + " must have a non-overlapping layout");
+        }
+        ActiveDimension current{
+            static_cast<uint64_t>(output.shape(dim)),
+            static_cast<uint64_t>(output.stride(dim))};
+        int insertion = active_count;
+        while (insertion > 0 &&
+               active_dimensions[insertion - 1].stride > current.stride) {
+            active_dimensions[insertion] = active_dimensions[insertion - 1];
+            --insertion;
+        }
+        active_dimensions[insertion] = current;
+        ++active_count;
+    }
+
+    uint64_t span = row_width;
+    for (int index = 0; index < active_count; ++index) {
+        const auto [extent, stride] = active_dimensions[index];
+        const uint64_t repeats = extent - 1;
+        if (stride < span ||
+            repeats > (std::numeric_limits<uint64_t>::max() - span) / stride) {
+            throw std::runtime_error(
+                std::string(fn) + ": " + name + " must have a non-overlapping layout");
+        }
+        span += repeats * stride;
+    }
+}
+
 static void sage_check_quantized(const nb::ndarray<>& q_int8, const nb::ndarray<>& q_scale,
                                  const nb::ndarray<>& k_int8, const nb::ndarray<>& k_scale,
                                  const nb::ndarray<>& v_int8, const nb::ndarray<>& v_scale,
@@ -1366,7 +1797,6 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
                 reinterpret_cast<hipStream_t>(stream_ptr), kFn);
 }
 
-
 // BF16 decode attention. Every extent below is derived from the operands rather
 // than taken from the caller, and the kernel indexes with the strides passed
 // here, so a mismatch is an out-of-bounds device access. Mirrors the checks in
@@ -1494,6 +1924,192 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
     check_hip_launch();
 }
 
+
+void bf16_sdpa_hip(
+    nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> output,
+    float sm_scale, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "bf16_sdpa_hip";
+    if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || output.ndim() != 4) {
+        throw std::runtime_error(std::string(kFn) + ": q, k, v and output must be 4D");
+    }
+    const int batch = static_cast<int>(q.shape(0));
+    const int q_heads = static_cast<int>(q.shape(1));
+    const int q_len = static_cast<int>(q.shape(2));
+    const int head_dim = static_cast<int>(q.shape(3));
+    const int kv_heads = static_cast<int>(k.shape(1));
+    const int kv_len = static_cast<int>(k.shape(2));
+    if (batch <= 0 || q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0 ||
+        q_len <= 0 || kv_len <= 0 ||
+        (head_dim != 128) ||
+        k.shape(0) != q.shape(0) || k.shape(3) != q.shape(3) ||
+        v.shape(0) != q.shape(0) || v.shape(1) != k.shape(1) ||
+        v.shape(2) != k.shape(2) || v.shape(3) != q.shape(3) ||
+        output.shape(0) != q.shape(0) || output.shape(1) != q.shape(1) ||
+        output.shape(2) != q.shape(2) || output.shape(3) != q.shape(3)) {
+        throw std::runtime_error(
+            std::string(kFn) +
+            ": incompatible BF16 [B,H,N,D] tensors or unsupported head dimension");
+    }
+    require_dtype(q, 2, 2, kFn, "q");
+    require_dtype(k, 2, 2, kFn, "k");
+    require_dtype(v, 2, 2, kFn, "v");
+    require_dtype(output, 2, 2, kFn, "output");
+    auto require_supported_layout = [&](const nb::ndarray<>& tensor, const char* name) {
+        if (tensor.stride(3) != 1 || tensor.stride(2) % 8 != 0 ||
+            (tensor.shape(0) > 1 && tensor.stride(0) % 8 != 0) ||
+            (tensor.shape(1) > 1 && tensor.stride(1) % 8 != 0)) {
+            throw std::runtime_error(
+                std::string(kFn) + ": " + name +
+                " must have a contiguous head dimension and 16-byte-aligned rows "
+                "across every batch and head");
+        }
+        if (reinterpret_cast<uintptr_t>(tensor.data()) % 16 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": " + name + " must be 16-byte aligned");
+        }
+    };
+    require_supported_layout(q, "q");
+    require_supported_layout(k, "k");
+    require_supported_layout(v, "v");
+    require_supported_layout(output, "output");
+    require_non_overlapping_rows(output, 3, head_dim, kFn, "output");
+    constexpr int kDeviceRocm = nb::device::rocm::value;
+    const nb::ndarray<>* operands[] = {&q, &k, &v, &output};
+    for (const nb::ndarray<>* operand : operands) {
+        if (operand->device_type() != kDeviceRocm ||
+            operand->device_id() != q.device_id()) {
+            throw std::runtime_error(
+                std::string(kFn) +
+                ": every operand must be ROCm device memory on q's device");
+        }
+    }
+
+    launch_bf16_sdpa_hip(
+        q.data(), k.data(), v.data(), output.data(), batch, q_heads, kv_heads,
+        q_len, kv_len, head_dim,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        output.stride(0), output.stride(1), output.stride(2), sm_scale,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void hip_int8_attention(
+    nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> output,
+    nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndarray<> v_int8,
+    nb::ndarray<> q_descale, nb::ndarray<> k_descale, nb::ndarray<> v_descale,
+    nb::ndarray<> anchor_indices, float sm_scale, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "hip_int8_attention";
+    if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 ||
+        q.shape(0) != 1 || q.shape(1) == 0 || q.shape(3) != 128 ||
+        k.shape(0) != 1 || k.shape(1) != q.shape(1) || k.shape(3) != 128 ||
+        v.shape(0) != 1 || v.shape(1) != q.shape(1) || v.shape(3) != 128 ||
+        k.shape(2) != v.shape(2)) {
+        throw std::runtime_error(
+            std::string(kFn) +
+            ": q must be [1, H, Q, 128] and k/v matching [1, H, K, 128]");
+    }
+    const int heads = static_cast<int>(q.shape(1));
+    const int q_len = static_cast<int>(q.shape(2));
+    const int kv_len = static_cast<int>(k.shape(2));
+    if (q_len <= 0 || kv_len <= 0) {
+        throw std::runtime_error(std::string(kFn) + ": Q and K/V lengths must be positive");
+    }
+    require_dtype(q, 1, 2, kFn, "q");
+    require_dtype(k, 1, 2, kFn, "k");
+    require_dtype(v, 1, 2, kFn, "v");
+    const int input_dtype_code = map_dtype_to_code(q.dtype());
+    if (map_dtype_to_code(k.dtype()) != input_dtype_code ||
+        map_dtype_to_code(v.dtype()) != input_dtype_code) {
+        throw std::runtime_error(std::string(kFn) + ": q, k, and v dtypes must match");
+    }
+    if (q.stride(3) != 1 || k.stride(3) != 1 || v.stride(3) != 1) {
+        throw std::runtime_error(std::string(kFn) + ": the head dimension must be contiguous");
+    }
+    const int padded_k = ((kv_len + 63) / 64) * 64;
+    const int padded_q = ((q_len + 127) / 128) * 128;
+    const int tiles = padded_k / 64;
+    const auto stream = reinterpret_cast<hipStream_t>(stream_ptr);
+
+    if (output.ndim() != 4 || output.shape(0) != 1 ||
+        output.shape(1) != static_cast<size_t>(heads) ||
+        output.shape(2) != static_cast<size_t>(q_len) || output.shape(3) != 128 ||
+        q_int8.ndim() != 4 || q_int8.shape(0) != 1 ||
+        q_int8.shape(1) != static_cast<size_t>(heads) ||
+        q_int8.shape(2) != static_cast<size_t>(q_len) || q_int8.shape(3) != 128 ||
+        k_int8.ndim() != 4 || k_int8.shape(0) != 1 ||
+        k_int8.shape(1) != static_cast<size_t>(heads) ||
+        k_int8.shape(2) != static_cast<size_t>(padded_k) || k_int8.shape(3) != 128 ||
+        v_int8.ndim() != 5 || v_int8.shape(0) != 1 ||
+        v_int8.shape(1) != static_cast<size_t>(heads) ||
+        v_int8.shape(2) != static_cast<size_t>(tiles) || v_int8.shape(3) != 128 ||
+        v_int8.shape(4) != 64) {
+        throw std::runtime_error(std::string(kFn) + ": incompatible packed workspace shapes");
+    }
+    require_dtype(output, 1, 2, kFn, "output");
+    if (map_dtype_to_code(output.dtype()) != input_dtype_code) {
+        throw std::runtime_error(std::string(kFn) + ": output dtype must match q");
+    }
+    require_dtype(q_int8, 4, 4, kFn, "q_int8");
+    require_dtype(k_int8, 4, 4, kFn, "k_int8");
+    require_dtype(v_int8, 4, 4, kFn, "v_int8");
+    require_scale_len(q_descale, static_cast<size_t>(heads) * padded_q,
+                      kFn, "q_descale");
+    require_scale_len(k_descale, static_cast<size_t>(heads) * (padded_k / 16),
+                      kFn, "k_descale");
+    require_scale_len(v_descale, static_cast<size_t>(heads) * tiles * 128,
+                      kFn, "v_descale");
+    if (output.stride(3) != 1) {
+        throw std::runtime_error(
+            std::string(kFn) + ": output head dimension must be contiguous");
+    }
+    require_non_overlapping_rows(output, 3, 128, kFn, "output");
+    require_packed_contiguous(q_int8, kFn, "q_int8");
+    require_packed_contiguous(k_int8, kFn, "k_int8");
+    require_packed_contiguous(v_int8, kFn, "v_int8");
+    require_packed_contiguous(q_descale, kFn, "q_descale");
+    require_packed_contiguous(k_descale, kFn, "k_descale");
+    require_packed_contiguous(v_descale, kFn, "v_descale");
+    if (anchor_indices.dtype().bits != 32 ||
+        anchor_indices.size() < static_cast<size_t>(heads)) {
+        throw std::runtime_error(
+            std::string(kFn) + ": anchor_indices must contain H int32s");
+    }
+    constexpr int kDeviceRocm = nb::device::rocm::value;
+    const nb::ndarray<>* operands[] = {
+        &q,         &k,          &v,          &output,
+        &q_int8,    &k_int8,     &v_int8,     &q_descale,
+        &k_descale, &v_descale,  &anchor_indices,
+    };
+    for (const nb::ndarray<>* operand : operands) {
+        if (operand->device_type() != kDeviceRocm ||
+            operand->device_id() != q.device_id()) {
+            throw std::runtime_error(
+                std::string(kFn) +
+                ": every operand must be ROCm device memory on q's device");
+        }
+    }
+
+    // Keeping all three producers and the consumer on this stream preserves
+    // the one-call API without host synchronization.
+    launch_gfx12_qk_quant(
+        q.data(), q_int8.data(), q_descale.data(),
+        k.data(), k_int8.data(), k_descale.data(), anchor_indices.data(),
+        heads, q_len, kv_len, padded_q, padded_k,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2), input_dtype_code, stream);
+    launch_gfx12_tile_channel_v_quant(
+        v.data(), v_int8.data(), v_descale.data(), heads, kv_len, tiles,
+        v.stride(1), v.stride(2), input_dtype_code, stream);
+    launch_gfx12_int8_attention(
+        q_int8.data(), k_int8.data(), v_int8.data(), output.data(),
+        q_descale.data(), k_descale.data(), v_descale.data(), heads, q_len,
+        kv_len, padded_q, padded_k, padded_k / 16,
+        output.stride(1), output.stride(2),
+        sm_scale, input_dtype_code, stream);
+    check_hip_launch();
+}
 
 // ---------------------------------------------------------------------------
 // Sol-Attn sparse attention
@@ -1766,9 +2382,25 @@ NB_MODULE(_C, m) {
     m.def("stochastic_round_fp8", &stochastic_round_fp8);
     m.def("scaled_mm_fp8", &scaled_mm_fp8);
     m.def("int8_gemm", &int8_gemm);
+    m.def("int8_gemm_b_tiled", &int8_gemm_b_tiled);
+    m.def("int8_gemm_b_tiled_gated_residual",
+          &int8_gemm_b_tiled_gated_residual);
+    m.def("int8_gemm_pair", &int8_gemm_pair);
+    m.def("rms_gated_residual_bf16", &rms_gated_residual_bf16);
+    m.def("int8_gemm_a_tiled128_down", &int8_gemm_a_tiled128_down);
     m.def("convrot_w4a4_gemm", &convrot_w4a4_gemm);
     m.def("quantize_int8_rowwise", &quantize_int8_rowwise);
-    m.def("quantize_int8_convrot", &quantize_int8_convrot);
+    m.def("quantize_int8_convrot", &quantize_int8_convrot,
+          nb::arg("x"), nb::arg("q"), nb::arg("scales"),
+          nb::arg("spill_rotated").none(), nb::arg("spill_partials").none(),
+          nb::arg("M"), nb::arg("K"), nb::arg("group_size"),
+          nb::arg("act_code"), nb::arg("stream_ptr"));
+    m.def("quantize_int8_convrot_swiglu_split_tiled128",
+          &quantize_int8_convrot_swiglu_split_tiled128);
+    m.def("quantize_int8_convrot_modulated", &quantize_int8_convrot_modulated);
+    m.def("quantize_int8_convrot_affine", &quantize_int8_convrot_affine);
+    m.def("quantize_int8_convrot_rms_modulated_fused_stats",
+          &quantize_int8_convrot_rms_modulated_fused_stats);
     m.def("quantize_int8_tensorwise", &quantize_int8_tensorwise);
     m.def("dequantize_int8_simple", &dequantize_int8_simple);
     m.def("dequantize_int8_convrot_weight", &dequantize_int8_convrot_weight);
@@ -1799,6 +2431,14 @@ NB_MODULE(_C, m) {
           nb::arg("v_int8"), nb::arg("o"), nb::arg("q_scale"), nb::arg("k_scale"),
           nb::arg("v_scale"), nb::arg("cta_k"), nb::arg("sm_scale"),
           nb::arg("output_dtype_code"), nb::arg("stream_ptr"), nb::arg("attn_mask") = nb::none());
+    m.def("bf16_sdpa_hip", &bf16_sdpa_hip,
+          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("output"),
+          nb::arg("sm_scale"), nb::arg("stream_ptr"));
+    m.def("hip_int8_attention", &hip_int8_attention,
+          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("output"),
+          nb::arg("q_int8"), nb::arg("k_int8"), nb::arg("v_int8"),
+          nb::arg("q_descale"), nb::arg("k_descale"), nb::arg("v_descale"),
+          nb::arg("anchor_indices"), nb::arg("sm_scale"), nb::arg("stream_ptr"));
     m.def("adaln", &adaln);
     m.def("rms_adaln", &rms_adaln);
     m.def("apply_rope", &apply_rope);

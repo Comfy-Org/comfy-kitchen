@@ -23,7 +23,7 @@ namespace comfy::hip_backend::sage {
 // Every kernel here indexes lanes with & 31, reduces with a width of 32 and packs
 // fragments per half wave. RDNA defaults to wave32, but -mwavefrontsize64 would
 // compile all of that into silently wrong scales rather than an error.
-#if defined(__AMDGCN_WAVEFRONT_SIZE__)
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN_WAVEFRONT_SIZE__)
 static_assert(__AMDGCN_WAVEFRONT_SIZE__ == 32,
               "the int8 attention kernels are wave32 only");
 #endif

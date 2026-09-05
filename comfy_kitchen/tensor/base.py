@@ -178,25 +178,43 @@ class QuantizedTensor(torch.Tensor):
         self._qdata = qdata
         self._layout_cls = layout_cls
         self._params = params
+        # Keep the physical storage and its metadata together.  WMMA packing
+        # replaces both references as one immutable operation snapshot.
+        self._wmma_state = (qdata, params)
+
+    def _state_snapshot(self) -> tuple[torch.Tensor, Any]:
+        """Return matching storage and metadata for one operation.
+
+        Older instances (including objects restored from older serialized
+        representations) may not have the WMMA state attribute.
+        """
+        return getattr(self, "_wmma_state", (self._qdata, self._params))
 
     def __repr__(self) -> str:
+        qdata, params = self._state_snapshot()
+        layout_cls = get_layout_class(self._layout_cls)
+        storage_shape = tuple(qdata.shape)
+        if hasattr(layout_cls, "get_logical_shape_from_storage"):
+            storage_shape = layout_cls.get_logical_shape_from_storage(storage_shape)
         return (
             f"QuantizedTensor(shape={tuple(self.shape)}, "
-            f"storage_shape={self.storage_shape}, "
+            f"storage_shape={storage_shape}, "
             f"layout={self._layout_cls}, "
-            f"dtype={self._params.orig_dtype})"
+            f"dtype={params.orig_dtype})"
         )
 
     # ==================== Properties ====================
 
     @property
     def storage_shape(self) -> tuple[int, ...]:
-        return tuple(self._qdata.shape)
+        qdata, _ = self._state_snapshot()
+        return tuple(qdata.shape)
 
     @property
     def storage_dtype(self) -> torch.dtype:
         """The dtype of the underlying quantized storage (e.g., float8_e4m3fn, uint8)."""
-        return self._qdata.dtype
+        qdata, _ = self._state_snapshot()
+        return qdata.dtype
 
     @property
     def nbytes(self) -> int:
@@ -206,7 +224,8 @@ class QuantizedTensor(torch.Tensor):
         not the logical size based on orig_dtype. For example, an FP8 quantized
         tensor with logical dtype bfloat16 returns the FP8 storage size.
         """
-        return self._qdata.nbytes
+        qdata, _ = self._state_snapshot()
+        return qdata.nbytes
 
     @property
     def padded_shape(self) -> tuple[int, ...]:
@@ -217,7 +236,12 @@ class QuantizedTensor(torch.Tensor):
 
     @property
     def is_padded(self) -> bool:
-        return self._params.orig_shape != self.padded_shape
+        qdata, params = self._state_snapshot()
+        layout_cls = get_layout_class(self._layout_cls)
+        storage_shape = tuple(qdata.shape)
+        if hasattr(layout_cls, "get_logical_shape_from_storage"):
+            storage_shape = layout_cls.get_logical_shape_from_storage(storage_shape)
+        return params.orig_shape != storage_shape
 
     @property
     def layout_cls(self) -> type[QuantizedLayout]:
@@ -225,7 +249,7 @@ class QuantizedTensor(torch.Tensor):
 
     @property
     def params(self) -> Any:
-        return self._params
+        return self._state_snapshot()[1]
 
     # ==================== Factory Methods ====================
 
@@ -253,10 +277,13 @@ class QuantizedTensor(torch.Tensor):
             clone_params: If True and params is None, clone self._params. Set to False
                 when you know params don't need cloning (e.g., they're already new).
         """
+        snapshot_qdata, snapshot_params = self._state_snapshot()
+        if qdata is None:
+            qdata = snapshot_qdata
         if params is None:
-            params = self._params.clone() if clone_params else self._params
+            params = snapshot_params.clone() if clone_params else snapshot_params
         return QuantizedTensor(
-            qdata if qdata is not None else self._qdata,
+            qdata,
             self._layout_cls,
             params,
         )
@@ -273,30 +300,32 @@ class QuantizedTensor(torch.Tensor):
         return self._qdata.storage()
 
     def dequantize(self) -> torch.Tensor:
+        qdata, params = self._state_snapshot()
         # Ensure qdata is contiguous - backends may not handle non-contiguous views
         # (e.g., after transpose/view operations)
-        qdata = self._qdata.contiguous() if not self._qdata.is_contiguous() else self._qdata
+        qdata = qdata.contiguous() if not qdata.is_contiguous() else qdata
 
         # Check if this is a logically transposed tensor (e.g., NVFP4 with deferred transpose)
-        is_transposed = getattr(self._params, "transposed", False)
+        is_transposed = getattr(params, "transposed", False)
 
         if is_transposed:
-            physical_shape = (self._params.orig_shape[1], self._params.orig_shape[0])
-            full = self.layout_cls.dequantize(qdata, self._params)
+            physical_shape = (params.orig_shape[1], params.orig_shape[0])
+            full = self.layout_cls.dequantize(qdata, params)
             if full.shape[:2] != physical_shape:
                 slices = tuple(slice(0, s) for s in physical_shape)
                 full = full[slices]
             return full.t()
 
-        full = self.layout_cls.dequantize(qdata, self._params)
-        orig = self._params.orig_shape
+        full = self.layout_cls.dequantize(qdata, params)
+        orig = params.orig_shape
         if full.shape != orig:
             slices = tuple(slice(0, s) for s in orig)
             return full[slices]
         return full
 
     def state_dict(self, prefix: str = "") -> dict[str, torch.Tensor]:
-        tensors = self.layout_cls.state_dict_tensors(self._qdata, self._params)
+        qdata, params = self._state_snapshot()
+        tensors = self.layout_cls.state_dict_tensors(qdata, params)
         return {f"{prefix}{suffix}": tensor for suffix, tensor in tensors.items()}
 
     def requantize_from_float(self, tensor: torch.Tensor, **kwargs) -> QuantizedTensor:
@@ -311,12 +340,14 @@ class QuantizedTensor(torch.Tensor):
     # ==================== Flatten/Unflatten Protocol ====================
 
     def __tensor_flatten__(self):
+        qdata, params = self._state_snapshot()
         inner_tensors = ["_qdata"]
+        object.__setattr__(self, "_qdata", qdata)
         tensor_fields = {}
         non_tensor_fields = {}
 
-        for field in dataclasses.fields(self._params):
-            value = getattr(self._params, field.name)
+        for field in dataclasses.fields(params):
+            value = getattr(params, field.name)
             if isinstance(value, torch.Tensor):
                 attr_name = f"_param_{field.name}"
                 object.__setattr__(self, attr_name, value)
@@ -407,28 +438,31 @@ def _parse_to_args(args, kwargs):
 
 
 def _handle_detach(qt, args, kwargs):
-    return qt._copy_with(qdata=qt._qdata.detach())
+    qdata, params = qt._state_snapshot()
+    return qt._copy_with(qdata=qdata.detach(), params=params.clone())
 
 
 def _handle_clone(qt, args, kwargs):
-    return qt._copy_with(qdata=qt._qdata.clone())
+    qdata, params = qt._state_snapshot()
+    return qt._copy_with(qdata=qdata.clone(), params=params.clone(), clone_params=False)
 
 
 def _handle_to(qt, args, kwargs, force_copy=False):
     target_device, target_dtype = _parse_to_args(args, kwargs)
+    qdata, params = qt._state_snapshot()
 
-    needs_device = target_device is not None and target_device != qt._qdata.device
-    needs_dtype = target_dtype is not None and target_dtype != qt._params.orig_dtype
+    needs_device = target_device is not None and target_device != qdata.device
+    needs_dtype = target_dtype is not None and target_dtype != params.orig_dtype
 
     if not needs_device and not needs_dtype and not force_copy:
         return qt
 
     if needs_device:
-        new_qdata = qt._qdata.to(device=target_device)
-        new_params = qt._params.to_device(target_device)
+        new_qdata = qdata.to(device=target_device)
+        new_params = params.to_device(target_device)
     else:
-        new_qdata = qt._qdata.clone() if force_copy else qt._qdata
-        new_params = qt._params.clone()
+        new_qdata = qdata.clone() if force_copy else qdata
+        new_params = params.clone()
 
     if needs_dtype:
         new_params = dataclasses.replace(new_params, orig_dtype=target_dtype)
@@ -441,13 +475,14 @@ def _handle_to_copy(qt, args, kwargs):
 
 
 def _handle_contiguous(qt, args, kwargs):
-    if qt._qdata.is_contiguous():
+    qdata, params = qt._state_snapshot()
+    if qdata.is_contiguous():
         return qt
-    return qt._copy_with(qdata=qt._qdata.contiguous())
+    return qt._copy_with(qdata=qdata.contiguous(), params=params.clone(), clone_params=False)
 
 
 def _handle_is_contiguous(qt, args, kwargs):
-    return qt._qdata.is_contiguous()
+    return qt._state_snapshot()[0].is_contiguous()
 
 
 def _handle_copy_(qt, args, kwargs):
@@ -457,21 +492,27 @@ def _handle_copy_(qt, args, kwargs):
     if dst._layout_cls != src._layout_cls:
         raise TypeError(f"Layout mismatch: {dst._layout_cls} vs {src._layout_cls}")
 
-    dst_orig_dtype = dst._params.orig_dtype
+    dst_qdata, dst_params = dst._state_snapshot()
+    src_qdata, src_params = src._state_snapshot()
+    dst_orig_dtype = dst_params.orig_dtype
     non_blocking = kwargs.get("non_blocking", len(args) >= 3)
 
-    dst._qdata.copy_(src._qdata, non_blocking=non_blocking)
-    dst._params.copy_from(src._params, non_blocking=non_blocking)
-    dst._params = dataclasses.replace(dst._params, orig_dtype=dst_orig_dtype)
+    dst_qdata.copy_(src_qdata, non_blocking=non_blocking)
+    dst_params.copy_from(src_params, non_blocking=non_blocking)
+    dst_params = dataclasses.replace(dst_params, orig_dtype=dst_orig_dtype)
+    dst._wmma_state = (dst_qdata, dst_params)
+    dst._qdata = dst_qdata
+    dst._params = dst_params
     return dst
 
 
 def _handle_empty_like(qt, args, kwargs):
     target_dtype = kwargs.pop("dtype", None)
     target_device = kwargs.get("device")
+    qdata, params = qt._state_snapshot()
 
-    new_qdata = torch.empty_like(qt._qdata, device=target_device)
-    new_params = qt._params.clone()
+    new_qdata = torch.empty_like(qdata, device=target_device)
+    new_params = params.clone()
 
     if target_device is not None:
         new_params = new_params.to_device(target_device)

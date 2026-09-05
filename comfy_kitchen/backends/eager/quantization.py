@@ -1056,6 +1056,254 @@ def int8_linear(
     return result.reshape(*orig_shape[:-1], weight.shape[0])
 
 
+def int8_linear_gated_residual(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+    input_act: str | None = None,
+    weight_tile_k: int = 0,
+    dual_m: bool = False,
+) -> torch.Tensor:
+    """Portable ``residual + gate * int8_linear(...)`` reference."""
+    if weight_tile_k:
+        raise ValueError("The eager backend does not support WMMA-tiled INT8 weights")
+    del dual_m
+    projected = int8_linear(
+        x, weight, weight_scale, bias, out_dtype, convrot,
+        convrot_groupsize, input_act,
+    )
+    return torch.addcmul(residual, gate, projected)
+
+
+def _modulate_int8_input(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Materialize the portable batch-one modulation contract once."""
+    k = x.shape[-1]
+    if scale.numel() != k:
+        raise ValueError(
+            f"modulation_scale must contain one batch-one row of {k} values, "
+            f"got {scale.numel()}"
+        )
+    shape = (1,) * (x.ndim - 1) + (k,)
+    factor = 1.0 + scale.reshape(shape)
+    if shift is None:
+        return x * factor
+    if shift.numel() != k:
+        raise ValueError(
+            f"modulation_shift must contain one batch-one row of {k} values, "
+            f"got {shift.numel()}"
+        )
+    return torch.addcmul(shift.reshape(shape), x, factor)
+
+
+def _int8_linear_group(x, projections, out_dtype, convrot, group_size):
+    return tuple(
+        int8_linear(
+            x, weight, scale, bias, out_dtype, convrot, group_size
+        )
+        for weight, scale, bias in projections
+    )
+
+
+def int8_linear_pair(
+    x: torch.Tensor,
+    weight0: torch.Tensor,
+    weight1: torch.Tensor,
+    weight_scale0: torch.Tensor,
+    weight_scale1: torch.Tensor,
+    bias0: torch.Tensor | None = None,
+    bias1: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+    weight_tile_k: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Portable reference for two equal-width INT8 projections."""
+    if weight_tile_k:
+        raise ValueError("The eager backend cannot consume WMMA-tiled weights")
+    if weight0.shape != weight1.shape:
+        raise ValueError(
+            f"paired INT8 weights must have the same shape, got "
+            f"{tuple(weight0.shape)} and {tuple(weight1.shape)}"
+        )
+    return _int8_linear_group(
+        x,
+        ((weight0, weight_scale0, bias0), (weight1, weight_scale1, bias1)),
+        out_dtype,
+        convrot,
+        convrot_groupsize,
+    )
+
+
+def int8_linear_modulated(
+    x: torch.Tensor,
+    modulation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+    weight_tiled_b: bool = False,
+    modulation_shift: torch.Tensor | None = None,
+    weight_tile_k: int = 0,
+) -> torch.Tensor:
+    """Portable batch-one affine-modulation reference for an INT8 projection."""
+    if weight_tiled_b or weight_tile_k:
+        raise ValueError("The eager backend cannot consume WMMA-tiled weights")
+    return int8_linear(
+        _modulate_int8_input(x, modulation_scale, modulation_shift),
+        weight, weight_scale, bias, out_dtype,
+        convrot, convrot_groupsize,
+    )
+
+
+def int8_linear_rms_modulated(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    modulation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+    weight_tiled_b: bool = False,
+) -> torch.Tensor:
+    """Portable RMSNorm plus batch-one modulation reference."""
+    if weight_tiled_b:
+        raise ValueError("The eager backend cannot consume WMMA-tiled weights")
+    normalized = torch.nn.functional.rms_norm(
+        x, (x.shape[-1],), norm_weight, norm_eps
+    )
+    return int8_linear_modulated(
+        normalized, modulation_scale, weight, weight_scale, bias, out_dtype,
+        convrot, convrot_groupsize, weight_tiled_b,
+    )
+
+
+def int8_linear_pair_modulated(
+    x: torch.Tensor,
+    modulation_scale: torch.Tensor,
+    weight0: torch.Tensor,
+    weight1: torch.Tensor,
+    weight_scale0: torch.Tensor,
+    weight_scale1: torch.Tensor,
+    bias0: torch.Tensor | None = None,
+    bias1: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+    modulation_shift: torch.Tensor | None = None,
+    weight_tile_k: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Portable batch-one affine-modulation reference for paired projections."""
+    if weight_tile_k:
+        raise ValueError("The eager backend cannot consume WMMA-tiled weights")
+    return int8_linear_pair(
+        _modulate_int8_input(x, modulation_scale, modulation_shift),
+        weight0, weight1, weight_scale0, weight_scale1,
+        bias0, bias1, out_dtype, convrot, convrot_groupsize,
+    )
+
+
+def int8_linear_triple_modulated(
+    x: torch.Tensor,
+    modulation_scale: torch.Tensor,
+    weight0: torch.Tensor,
+    weight1: torch.Tensor,
+    weight2: torch.Tensor,
+    weight_scale0: torch.Tensor,
+    weight_scale1: torch.Tensor,
+    weight_scale2: torch.Tensor,
+    bias0: torch.Tensor | None = None,
+    bias1: torch.Tensor | None = None,
+    bias2: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+    modulation_shift: torch.Tensor | None = None,
+    weight_tile_k: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Portable affine-modulation reference for three projections."""
+    if weight_tile_k:
+        raise ValueError("The eager backend cannot consume WMMA-tiled weights")
+    return _int8_linear_group(
+        _modulate_int8_input(x, modulation_scale, modulation_shift),
+        (
+            (weight0, weight_scale0, bias0),
+            (weight1, weight_scale1, bias1),
+            (weight2, weight_scale2, bias2),
+        ),
+        out_dtype,
+        convrot,
+        convrot_groupsize,
+    )
+
+
+def int8_linear_pair_rms_modulated(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    modulation_scale: torch.Tensor,
+    weight0: torch.Tensor,
+    weight1: torch.Tensor,
+    weight_scale0: torch.Tensor,
+    weight_scale1: torch.Tensor,
+    bias0: torch.Tensor | None = None,
+    bias1: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Portable paired RMSNorm plus batch-one modulation reference."""
+    normalized = torch.nn.functional.rms_norm(
+        x, (x.shape[-1],), norm_weight, norm_eps
+    )
+    return int8_linear_pair_modulated(
+        normalized, modulation_scale, weight0, weight1,
+        weight_scale0, weight_scale1, bias0, bias1, out_dtype,
+        convrot, convrot_groupsize,
+    )
+
+
+def int8_linear_swiglu_split(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+    weight_tiled_b: bool = False,
+    weight_tile_k: int = 0,
+) -> torch.Tensor:
+    """Portable reference for a down projection consuming split SwiGLU inputs."""
+    if weight_tiled_b or weight_tile_k:
+        raise ValueError("The eager backend cannot consume WMMA-tiled weights")
+    if gate.shape != up.shape:
+        raise ValueError(
+            f"split SwiGLU inputs must have the same shape, got "
+            f"{tuple(gate.shape)} and {tuple(up.shape)}"
+        )
+    activated = torch.nn.functional.silu(gate) * up
+    return int8_linear(
+        activated, weight, weight_scale, bias, out_dtype,
+        convrot, convrot_groupsize,
+    )
+
+
 # =============================================================================
 # torch.library Custom Op Definitions — INT8 Tensor-wise
 # =============================================================================
@@ -1233,3 +1481,43 @@ def _op_int8_linear_fake(x, weight, weight_scale, bias, output_dtype_code,
                          convrot=False, convrot_groupsize=256, input_act=None):
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     return torch.empty(*x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device)
+
+
+@torch.library.custom_op("comfy_kitchen::int8_linear_tiled_b", mutates_args=())
+def _op_int8_linear_tiled_b(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    output_dtype_code: int,
+    convrot: bool,
+    convrot_groupsize: int,
+    tile_k: int,
+    dual_m: bool,
+) -> torch.Tensor:
+    """Internal dispatch for physically tiled TensorWise INT8 weights."""
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "x": x,
+        "weight": weight,
+        "weight_scale": weight_scale,
+        "bias": bias,
+        "out_dtype": out_dtype,
+        "convrot": convrot,
+        "convrot_groupsize": convrot_groupsize,
+        "tile_k": tile_k,
+        "dual_m": dual_m,
+    }
+    impl = registry.get_implementation("int8_linear_tiled_b", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_int8_linear_tiled_b.register_fake
+def _op_int8_linear_tiled_b_fake(
+    x, weight, weight_scale, bias, output_dtype_code, convrot,
+    convrot_groupsize, tile_k, dual_m,
+):
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty(
+        *x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device
+    )

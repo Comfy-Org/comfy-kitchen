@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // INT8 quantization kernels for the WMMA int8 GEMM.
+#include <cstring>
 #include <stdexcept>
 
 #include "../hadamard.h"
@@ -9,6 +10,25 @@
 namespace comfy::hip_backend {
 
 constexpr float kInt8Max = 127.0f;
+
+inline bool use_convrot_512x2_bf16(int in_code, int K, int group_size) {
+    if (in_code != 2 || group_size != 256) {
+        return false;
+    }
+
+    // The packed-element schedule is exact and faster at these two measured
+    // widths. K=3072, 5120, 5376, and 6144 are slower and do not preserve the
+    // generic producer's rounding, so they retain that path.
+    if (K != 3840 && K != 10240) {
+        return false;
+    }
+
+    // Portable wave32 RDNA schedule: requires a 512-thread workgroup and
+    // enough LDS, but no arch-specific instruction or layout. Validated on
+    // gfx12; other supported devices retain the same exact fallback when
+    // these launch capabilities are absent.
+    return convrot_512x2_supported(K);
+}
 
 __forceinline__ __device__ int8_t quant_round(float v, float inv) {
     // rintf is round-half-to-even, matching torch.round.
@@ -211,15 +231,8 @@ void launch_convrot_quant_global_managed(
     dispatch_convrot_row_type(
         in_dtype,
         LaunchConvrotQuantGlobalManaged<ACT>{
-            x,
-            in_dtype,
-            qout,
-            scaleout,
-            M,
-            K,
-            stream,
-            spill_rotated,
-            spill_partials});
+            x, in_dtype, qout, scaleout, M, K, stream,
+            spill_rotated, spill_partials});
 }
 
 template void launch_convrot_quant_global_managed<kActNone>(
@@ -255,22 +268,109 @@ extern "C" void launch_quantize_int8_convrot_kernel(
     if (M == 0) {
         return;  // a zero-block launch is hipErrorInvalidConfiguration
     }
+    const bool schedule_512x2 =
+        use_convrot_512x2_bf16(in_code, K, group_size);
     if (act_code == kActGeluTanh) {
-        launch_convrot_quant<false, kActGeluTanh>(
-            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
-            M, K, group_size, stream, spill_rotated, spill_partials);
+        if (schedule_512x2) {
+            launch_convrot_quant_512x2_bf16<kActGeluTanh>(
+                x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
+                M, K, stream);
+        } else {
+            launch_convrot_quant<false, kActGeluTanh>(
+                x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
+                M, K, group_size, stream, spill_rotated, spill_partials);
+        }
     } else if (act_code == kActSwiGLU) {
-        launch_convrot_quant<false, kActSwiGLU>(
-            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
-            M, K, group_size, stream, spill_rotated, spill_partials);
+        if (schedule_512x2) {
+            launch_convrot_quant_512x2_bf16<kActSwiGLU>(
+                x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
+                M, K, stream);
+        } else {
+            launch_convrot_quant<false, kActSwiGLU>(
+                x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
+                M, K, group_size, stream, spill_rotated, spill_partials);
+        }
     } else {
-        launch_convrot_quant<false, kActNone>(
-            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
-            M, K, group_size, stream, spill_rotated, spill_partials);
+        if (schedule_512x2) {
+            launch_convrot_quant_512x2_bf16<kActNone>(
+                x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
+                M, K, stream);
+        } else {
+            launch_convrot_quant<false, kActNone>(
+                x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
+                M, K, group_size, stream, spill_rotated, spill_partials);
+        }
     }
 }
 
-// Returns 1 when INT8 G=256 must use the global spill path for (M, K, in_dtype).
+// Consume separate BF16 gate/up projections,
+// reproduce the exact standalone SwiGLU rounding contract, and emit the same
+// tile-major INT8 activation expected by the accepted down GEMM.
+extern "C" void launch_quantize_int8_convrot_swiglu_split_tiled128_kernel(
+    const void* gate, const void* up, void* q, void* scales,
+    int M, int K, int group_size, hipStream_t stream) {
+
+    using namespace comfy::hip_backend;
+    if (K <= 0 || K % 128 != 0 || group_size != 256 ||
+        !convrot_512x2_supported(K)) {
+        throw std::runtime_error(
+            "convrot split swiglu tiled128: requires K divisible by 128, "
+            "group_size=256, and sufficient wave32/LDS capacity");
+    }
+    check_convrot_k(K, group_size, 2);
+    if (M == 0) return;
+    launch_convrot_quant_512x2_bf16_swiglu_split_tiled128(
+        gate, up, static_cast<int8_t*>(q), static_cast<float*>(scales),
+        M, K, stream);
+}
+
+// Fold exact batch-one BF16 scale modulation into the row-major ConvRot
+// producer.
+extern "C" void launch_quantize_int8_convrot_modulated_kernel(
+    const void* x, const void* modulation_scale, void* q, void* scales,
+    int M, int K, int group_size, hipStream_t stream) {
+
+    using namespace comfy::hip_backend;
+    if (K <= 0 || group_size != 256 || !convrot_512x2_supported(K)) {
+        throw std::runtime_error(
+            "convrot modulated: requires positive K, group_size=256, and "
+            "sufficient wave32/LDS capacity");
+    }
+    check_convrot_k(K, group_size, 2);
+    if (M == 0) return;
+    launch_convrot_quant_512x2_bf16_modulated(
+        x, modulation_scale, static_cast<int8_t*>(q),
+        static_cast<float*>(scales), M, K, stream);
+}
+
+// Fold a materialized BF16 affine modulation into the generic fused
+// ConvRot producer.  The schedule is selected from dimensions and LDS
+// capacity, so the path applies to any compatible hidden width.
+extern "C" void launch_quantize_int8_convrot_affine_kernel(
+    const void* x, const void* modulation_scale,
+    const void* modulation_shift, void* q, void* scales,
+    int M, int K, int group_size, hipStream_t stream) {
+
+    using namespace comfy::hip_backend;
+    if (group_size != 256) {
+        throw std::runtime_error(
+            "convrot affine: requires group_size=256");
+    }
+    check_convrot_k(K, group_size, 2, /*int8_quant=*/true);
+    if (M == 0) return;
+    if (!launch_convrot_quant_affine_bf16(
+            x, modulation_scale, modulation_shift,
+            static_cast<int8_t*>(q), static_cast<float*>(scales),
+            M, K, stream)) {
+        throw std::runtime_error(
+            "convrot affine: row does not fit the fused LDS schedule");
+    }
+}
+
+// Returns 1 when INT8 G=256 must use the generic global-spill path for
+// this device. The specialized live shapes fit in LDS on capable wave32 RDNA
+// devices, so they do not allocate a workspace; generic and ultra-wide shapes
+// retain the generic capacity predicate.
 extern "C" int convrot_int8_needs_spill_host(int M, int K, int in_code) {
     using namespace comfy::hip_backend;
     return convrot_int8_needs_spill_buffers(M, K, in_code) ? 1 : 0;

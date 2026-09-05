@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import numbers
 from dataclasses import dataclass
 
 import torch
@@ -22,6 +23,30 @@ CTA_K = 64
 LARGE_CTA_K = 128
 _SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 _NATIVE_MINIMUM_CAPABILITY = (7, 5)
+
+
+def _validate_attention_scale(scale: object, default: float) -> float:
+    """Normalize an attention scale while keeping kernel inputs unambiguous."""
+    if scale is None:
+        return default
+    if isinstance(scale, torch.Tensor):
+        if scale.numel() != 1:
+            raise ValueError(f"scale must be a scalar, got shape {tuple(scale.shape)}")
+        if scale.dtype == torch.bool:
+            raise TypeError(f"scale must be a real numeric scalar, got {scale.dtype}")
+        if scale.is_complex():
+            raise TypeError(f"scale must be a real numeric scalar, got {scale.dtype}")
+        try:
+            value = float(scale.item())
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise TypeError(f"scale must be a real numeric scalar, got {scale.dtype}") from error
+    elif isinstance(scale, numbers.Real) and not isinstance(scale, bool):
+        value = float(scale)
+    else:
+        raise TypeError(f"scale must be a real numeric scalar, got {type(scale).__name__}")
+    if not math.isfinite(value):
+        raise ValueError(f"scale must be finite, got {value}")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,9 +181,7 @@ def _int8_attention_cuda(
         k = functional.pad(k, padding)
         v = functional.pad(v, padding)
 
-    attention_scale = original_head_dim**-0.5 if scale is None else float(scale)
-    if not math.isfinite(attention_scale):
-        raise ValueError(f"scale must be finite, got {attention_scale}")
+    attention_scale = _validate_attention_scale(scale, original_head_dim**-0.5)
 
     if _hip_backend is not None:
         output = _hip_backend.sage_int8_sdpa(
@@ -295,17 +318,12 @@ def prequantize_int8_attention(
         k = functional.pad(k, padding)
         v = functional.pad(v, padding)
 
-    attention_scale = original_head_dim**-0.5 if scale is None else float(scale)
-    if not math.isfinite(attention_scale):
-        raise ValueError(f"scale must be finite, got {attention_scale}")
+    attention_scale = _validate_attention_scale(scale, original_head_dim**-0.5)
 
     if _hip_backend is not None:
         # The packed V row width follows this cta_k, so the value that packed the
-        # buffers is the one that has to come back to attend over them. Taking the
-        # CUDA-side constant here would only agree with the HIP choice by accident.
-        hip_cta_k = _hip_backend._sage_cta_k(
-            kernel_head_dim, k.shape[2], attn_mask is not None
-        )
+        # buffers is the one that has to come back to attend over them.
+        hip_cta_k = _hip_backend._SAGE_CTA_K
         packed = _hip_backend.sage_int8_quantize(q, k, v, cta_k=hip_cta_k)
         return PrequantizedInt8Attention(
             q=packed["q_int8"],
@@ -561,6 +579,9 @@ def int8_attention(
     arithmetic is FP32. This path does not allocate FP8 tensors or execute FP8
     MMA instructions.
     """
+    # Validate before entering the custom op so every public path has the same
+    # scalar/type/finite-value contract (including CPU and fake dispatch).
+    scale = None if scale is None else _validate_attention_scale(scale, 0.0)
     if attn_mask is None:
         return torch.ops.comfy_kitchen.int8_attention(
             q,

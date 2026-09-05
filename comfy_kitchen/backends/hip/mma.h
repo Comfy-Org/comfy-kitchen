@@ -1,23 +1,24 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// WMMA policies for RDNA3 (gfx11) and RDNA4 (gfx12), wave32.
+// WMMA policies for duplicated 256-bit operands (gfx11.0/11.5) and
+// non-duplicated 128-bit operands (gfx12), wave32.
 //
 // A policy holds the operand fragment type, the bytes of a K-row one MMA consumes
 // (kStepBytes), the LDS read, and the MMA. The tile kernels stay byte-addressed;
 // only the policy changes per architecture.
 //
 // Operand layout differs:
-//   gfx12: K is split across the half-waves. A lane holds 8 bytes at byte offset
+//   128b:  K is split across the half-waves. A lane holds 8 bytes at byte offset
 //          8 * (lane / 16) of its row. Every type is a v2i, which is what lets one
 //          kernel serve fp8, iu8 and iu4.
-//   gfx11: no K split. A lane holds the whole K-step of its row and both
+//   256b:  no K split. A lane holds the whole K-step of its row and both
 //          half-waves hold the same data (rocWMMA calls it input duplication),
 //          which reading at row = lane % 16 with no half-wave offset gives for
 //          free. Fragment width is the K-step: 16B iu8, 8B iu4, 32B bf16 for fp8.
 //
 // Accumulators are v8f/v8i on both, column lane % 16, but the row differs:
-// gfx12 gives each half-wave a contiguous block, D[e + 8 * (lane / 16)]; gfx11
+// gfx12/gfx117 give each half-wave a contiguous block, D[e + 8 * (lane / 16)]; gfx11
 // interleaves the halves, D[2 * e + (lane / 16)]. See acc_row. rocWMMA's "padded
 // acc" gfx11 quirk applies to the 16-bit accumulators, not these.
 //
@@ -143,7 +144,7 @@ __forceinline__ __device__ typename Mma::Frag load_frag_16bit(const typename Mma
 // Policies
 // ---------------------------------------------------------------------------
 
-#if defined(COMFY_MMA_GFX12)
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX117)
 
 struct MmaFp8 {
     using Acc = v8f;
@@ -380,10 +381,10 @@ struct MmaInt8 {
     using Frag = v2i;
     static constexpr int kStepBytes = 16;
     static __forceinline__ __device__ Frag load(const void*, int, int, int, int) { return Frag{}; }
-    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
     static __forceinline__ __device__ Frag load_aligned(const void*, int, int, int, int) {
         return Frag{};
     }
+    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
     static __forceinline__ __device__ Acc mma(Frag, Frag, Acc c) { COMFY_MMA_STUB_BODY }
     static __forceinline__ __device__ Acc mma_ua(Frag, Frag, Acc c) { COMFY_MMA_STUB_BODY }
     static __forceinline__ __device__ Acc mma_ub(Frag, Frag, Acc c) { COMFY_MMA_STUB_BODY }
