@@ -4,47 +4,65 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 
 ## Backend Capabilities Matrix
 
-| Function                    | eager | cuda | triton | hip |
-|-----------------------------|-------|------|--------|-----|
-| `quantize_per_tensor_fp8`   | ✓     | ✓    | ✓      | ✓   |
-| `dequantize_per_tensor_fp8` | ✓     | ✓    | ✓      | ✓   |
-| `stochastic_rounding_fp8`   | ✓     | ✓    |        | ✓   |
-| `quantize_nvfp4`            | ✓     | ✓    | ✓      |     |
-| `dequantize_nvfp4`          | ✓     | ✓    | ✓      |     |
-| `scaled_mm_nvfp4`           | ✓     | ✓    |        |     |
-| `quantize_mxfp8`            | ✓     | ✓    | ✓      |     |
-| `dequantize_mxfp8`          | ✓     |      |        |     |
-| `scaled_mm_mxfp8`           | ✓     |      |        |     |
-| `adaln`                     | ✓     | ✓    | ✓      | ✓   |
-| `rms_adaln`                 | ✓     | ✓    | ✓      | ✓   |
-| `na3d`                      | ✓     | ✓    | ✓      | ✓   |
-| `na2d`                      | ✓     | ✓    | ✓      | ✓   |
-| `sol_attn`                  | ✓     | ✓    |        | ✓   |
-| `int8_attention`            |       | ✓    |        | ✓   |
-| `apply_rope`                | ✓     | ✓    | ✓      | ✓   |
-| `apply_rope1`               | ✓     | ✓    | ✓      | ✓   |
-| `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   |
-| `apply_rope_split_half1`    | ✓     | ✓    | ✓      | ✓   |
-| `rms_rope`                  | ✓     | ✓    | ✓      | ✓   |
-| `rms_rope1`                 | ✓     | ✓    | ✓      | ✓   |
-| `rms_rope_split_half`       | ✓     | ✓    | ✓      | ✓   |
-| `rms_rope_split_half1`      | ✓     | ✓    | ✓      | ✓   |
-| `quantize_int8_rowwise`     | ✓     | ✓    | ✓      | ✓   |
-| `quantize_int8_tensorwise`  | ✓     | ✓    |        | ✓   |
-| `quantize_and_rotate_rowwise` | ✓   | ✓    | ✓      | ✓   |
-| `quantize_int8_convrot_weight` | ✓  | ✓    |        | ✓   |
-| `dequantize_int8_simple_dtype` | ✓  | ✓    |        | ✓   |
-| `dequantize_int8_convrot_weight_dtype` | ✓ | ✓ |    | ✓   |
-| `int8_linear`               | ✓     | ✓    | ✓      | ✓   |
-| `gemv_awq_w4a16`            | ✓     | ✓    |        | ✓   |
-| `quantize_svdquant_w4a4`    | ✓     | ✓    |        | ✓   |
-| `scaled_mm_svdquant_w4a4`   | ✓     | ✓    |        | ✓   |
-| `convrot_w4a4_linear`       | ✓     | ✓    |        | ✓   |
-| `quantize_convrot_w4a4_weight` | ✓  | ✓    |        | ✓   |
-| `dequantize_convrot_w4a4_weight` | ✓ | ✓   |        | ✓   |
+| Function                    | eager | cuda | triton | hip | ascend |
+|-----------------------------|-------|------|--------|-----|-----|
+| `quantize_per_tensor_fp8`   | ✓     | ✓    | ✓      | ✓   |     |
+| `dequantize_per_tensor_fp8` | ✓     | ✓    | ✓      | ✓   |     |
+| `stochastic_rounding_fp8`   | ✓     | ✓    |        | ✓   |     |
+| `quantize_nvfp4`            | ✓     | ✓    | ✓      |     |     |
+| `dequantize_nvfp4`          | ✓     | ✓    | ✓      |     |     |
+| `scaled_mm_nvfp4`           | ✓     | ✓    |        |     |     |
+| `quantize_mxfp8`            | ✓     | ✓    | ✓      |     |     |
+| `dequantize_mxfp8`          | ✓     |      |        |     |     |
+| `scaled_mm_mxfp8`           | ✓     |      |        |     |     |
+| `adaln`                     | ✓     | ✓    | ✓      | ✓   |     |
+| `rms_adaln`                 | ✓     | ✓    | ✓      | ✓   |     |
+| `na3d`                      | ✓     | ✓    | ✓      | ✓   |     |
+| `na2d`                      | ✓     | ✓    | ✓      | ✓   |     |
+| `sol_attn`                  | ✓     | ✓    |        | ✓   |     |
+| `int8_attention`            |       | ✓    |        | ✓   |     |
+| `apply_rope`                | ✓     | ✓    | ✓      | ✓   |     |
+| `apply_rope1`               | ✓     | ✓    | ✓      | ✓   |     |
+| `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   |     |
+| `apply_rope_split_half1`    | ✓     | ✓    | ✓      | ✓   |     |
+| `rms_rope`                  | ✓     | ✓    | ✓      | ✓   |     |
+| `rms_rope1`                 | ✓     | ✓    | ✓      | ✓   |     |
+| `rms_rope_split_half`       | ✓     | ✓    | ✓      | ✓   |     |
+| `rms_rope_split_half1`      | ✓     | ✓    | ✓      | ✓   |     |
+| `quantize_int8_rowwise`     | ✓     | ✓    | ✓      | ✓   | ✓   |
+| `quantize_int8_tensorwise`  | ✓     | ✓    |        | ✓   | ✓   |
+| `quantize_and_rotate_rowwise` | ✓   | ✓    | ✓      | ✓   |     |
+| `quantize_int8_convrot_weight` | ✓  | ✓    |        | ✓   |     |
+| `dequantize_int8_simple`    | ✓     | ✓    |        | ✓   | ✓   |
+| `dequantize_int8_simple_dtype` | ✓  | ✓    |        | ✓   | ✓   |
+| `dequantize_int8_convrot_weight_dtype` | ✓ | ✓ |    | ✓   |     |
+| `int8_linear`               | ✓     | ✓    | ✓      | ✓   |     |
+| `gemv_awq_w4a16`            | ✓     | ✓    |        | ✓   |     |
+| `quantize_svdquant_w4a4`    | ✓     | ✓    |        | ✓   |     |
+| `scaled_mm_svdquant_w4a4`   | ✓     | ✓    |        | ✓   |     |
+| `convrot_w4a4_linear`       | ✓     | ✓    |        | ✓   |     |
+| `quantize_convrot_w4a4_weight` | ✓  | ✓    |        | ✓   |     |
+| `dequantize_convrot_w4a4_weight` | ✓ | ✓   |        | ✓   |     |
 
 Each of the eight rope entries also has an in-place form (`apply_rope_`,
 `rms_rope_split_half1_`, ...) with the same backend coverage as the row above.
+
+## Huawei Ascend backend
+
+The optional `ascend` backend uses torch-npu operators on Huawei Ascend NPU
+hardware. It is registered only when torch-npu and an Ascend device are
+available, so comfy-kitchen keeps importing normally on CPU, CUDA, HIP, and XPU
+installations. The PyTorch device type remains `npu`, as defined by torch-npu.
+
+The initial backend supports:
+
+- `quantize_int8_rowwise` through `torch_npu.npu_dynamic_quant`
+- `quantize_int8_tensorwise` through Ascend reduction operators and
+  `torch_npu.npu_quantize`
+- `dequantize_int8_simple` and `dequantize_int8_simple_dtype` on device
+
+Unsupported dtypes and stochastic rounding continue through another capable
+backend instead of copying tensors to the CPU.
 
 ## HIP backend (AMD RDNA2 / RDNA3 / RDNA3.5 / RDNA4)
 
