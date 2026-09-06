@@ -29,3 +29,12 @@ pytest tests/test_backends.py::TestBackendSystem::test_list_backends   # one tes
 
 - Backend selection is process-global; override per-call with `backend="..."` or `with ck.use_backend("triton"):`. `COMFY_KITCHEN_DISABLE_HIP=1` removes the HIP backend at runtime.
 - Debug dispatch decisions: `logging.getLogger("comfy_kitchen.dispatch").setLevel(logging.DEBUG)`.
+
+## Rules
+
+- **Build sequence, always in this order:** open MSVC x64 Native Tools Command Prompt → `cd` into repo → `venv\scripts\activate` → set `COMFY_HIP_ARCHS`/`COMFY_KITCHEN_BUILD_HIP` → then `pip install -e . --no-build-isolation -v`.
+- **`git push` always to my fork, never to `upstream`/`Comfy-Org/comfy-kitchen`.** Check `git remote -v` first if unsure which remote is which.
+- **Never commit/push directly to `main`.** Always a branch + PR.
+- **Never edit `backends/hip/architectures.json` just to force an unvalidated arch through.** Fail-closed is intentional — a rejected target means "not reviewed," not "add it to make the build pass."
+- **After any kernel/backend change, rebuild before claiming it's fixed.** A code edit without a rebuild is untested by definition.
+- **Run `ruff check .` on changed files before considering a task done**, not just `pytest`.
