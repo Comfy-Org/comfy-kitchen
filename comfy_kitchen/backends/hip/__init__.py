@@ -20,11 +20,13 @@ import logging
 import os
 import pathlib
 import sys
+import weakref
 from collections.abc import Sequence
 
 import torch
 
 from comfy_kitchen._rope_utils import check_rope_inplace, trim_rope_freqs
+from comfy_kitchen.allocation import allocation_context
 from comfy_kitchen.backends import eager as _eager
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
 from comfy_kitchen.backends._activations import input_act_code as _input_act_code
@@ -1811,23 +1813,22 @@ _ROPE_FAB_CACHE = {}
 def _packed_rope_fab(freqs, t, rot):
     """[..., T, 1, rot/2, 2, 2] -> [T, rot, 2] per-channel (self, partner)
     coefficients. Cached per freqs tensor (one attention step reuses one across
-    layers); keyed on id() with a strong ref, since data_ptr can be reused after
-    free and inference tensors have no _version."""
+    layers); the weak ref validates an id() hit without retaining freqs."""
     key = (id(freqs), t, rot)
     hit = _ROPE_FAB_CACHE.get(key)
-    if hit is not None:
+    if hit is not None and hit[0]() is freqs:
         return hit[1]
     f = freqs.reshape(-1, rot // 2, 2, 2)
     if f.shape[0] != t:
         raise ValueError(f"sol_attn: rope_freqs covers {f.shape[0]} tokens, T={t}")
-    f = f.float()
-    fab = torch.empty(t, rot, 2, device=freqs.device, dtype=torch.float32)
+    with allocation_context():
+        fab = torch.empty(t, rot, 2, device=freqs.device, dtype=torch.float32)
     fab[:, :rot // 2, 0] = f[:, :, 0, 0]
     fab[:, :rot // 2, 1] = f[:, :, 0, 1]
     fab[:, rot // 2:, 0] = f[:, :, 1, 1]
     fab[:, rot // 2:, 1] = f[:, :, 1, 0]
     _ROPE_FAB_CACHE.clear()   # one live entry
-    _ROPE_FAB_CACHE[key] = (freqs, fab)
+    _ROPE_FAB_CACHE[key] = (weakref.ref(freqs), fab)
     return fab
 
 

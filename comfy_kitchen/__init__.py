@@ -1,5 +1,6 @@
 import torch
 
+from .allocation import set_allocation_context
 from .backends import cuda as _cuda_backend
 
 # Import backends to trigger auto-registration
@@ -111,6 +112,7 @@ __all__ = [
     "swap_nibbles",
     "to_blocked",
     "from_blocked",
+    "set_allocation_context",
     # Backend configuration
     "list_backends",
     "set_backend_priority",
