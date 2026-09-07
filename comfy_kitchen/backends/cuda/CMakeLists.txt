@@ -89,6 +89,7 @@ set(CUDA_NVCC_FLAGS
     --expt-relaxed-constexpr
     --expt-extended-lambda
     --use_fast_math
+    --compress-mode=size
 )
 
 # Pass MSVC standard-conforming preprocessor flag to nvcc (required by CCCL 2.8+)
