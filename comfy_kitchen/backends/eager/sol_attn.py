@@ -152,11 +152,22 @@ def sol_attn(
     n = (t + BLOCK - 1) // BLOCK
     if blk_cnt is not None:
         # Direct callers bypass the registry, and copy_ would broadcast a wrong
-        # shape silently; validate here rather than trust the caller.
-        from comfy_kitchen.constraints import sol_attn_common_call_rule
-        check = sol_attn_common_call_rule({"q": q, "blk_cnt": blk_cnt})
-        if not check.success:
-            raise ValueError(f"sol_attn: {check.failed_param}: {check.failure_reason}")
+        # shape silently, so validate here rather than trust the caller.
+        #
+        # Checked inline rather than through `sol_attn_common_call_rule`, which
+        # also requires head_dim 128. That is a fused-kernel layout constraint,
+        # and THIS reference is what serves the shapes the fused backends
+        # refuse -- see the O(T^2) message below, which names head_dim 128 as
+        # their requirement. Borrowing their rule here would have made asking
+        # the reference for counts narrower than the reference itself.
+        want = (b, h, n)
+        if blk_cnt.dtype != torch.int32 or tuple(blk_cnt.shape) != want:
+            raise ValueError(f"sol_attn: blk_cnt must be int32 of shape {want}, "
+                             f"got {blk_cnt.dtype} {tuple(blk_cnt.shape)}")
+        if blk_cnt.device != q.device:
+            raise ValueError(f"sol_attn: blk_cnt must be on {q.device}, got {blk_cnt.device}")
+        if not blk_cnt.is_contiguous():
+            raise ValueError("sol_attn: blk_cnt must be contiguous")
     if scale is None:
         scale = d ** -0.5
     log2s = scale * _LOG2E

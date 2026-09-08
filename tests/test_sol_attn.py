@@ -1122,6 +1122,20 @@ def test_blk_cnt_rejected(bad):
         sol_attn_eager(q, k, v, tau=1.0, blk_cnt=cnt)
 
 
+def test_blk_cnt_eager_at_a_head_dim_the_fused_backends_refuse():
+    """The reference is what runs when the fused kernels decline the shape, so
+    asking it for counts must not import their head_dim-128 layout constraint.
+    Pins the regression the shared call rule would have introduced."""
+    t, h, d = 256, 2, 64
+    n = (t + 63) // 64
+    q, k, v = (torch.randn(1, t, h, d, device="cuda", dtype=torch.bfloat16)
+               for _ in range(3))
+    cnt = torch.empty(1, h, n, dtype=torch.int32, device="cuda")
+    out = sol_attn_eager(q, k, v, tau=1.0, blk_cnt=cnt)
+    assert out.shape == q.shape
+    assert 1 <= int(cnt.min()) and int(cnt.max()) <= n
+
+
 def test_blk_cnt_hip_refuses():
     """The HIP plan has the slot, but the slice is unverified on AMD; a loud
     refusal beats a silent wrong number."""
