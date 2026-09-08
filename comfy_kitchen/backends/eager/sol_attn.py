@@ -132,6 +132,7 @@ def sol_attn(
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,   # ignored: the reference is exact arithmetic over the same
                           # block selection, so there is no token routing stage to model
+    blk_cnt: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn over ``(B, T, H, D)`` tensors. See the module docstring.
 
@@ -142,9 +143,20 @@ def sol_attn(
     clamped to [1, rows in the block]; dead rows are never keys and their
     output rows are unspecified), and ``coarse_gate`` adds VSA's gated coarse
     branch: ``gate * softmax(q_mean k_mean^T * scale) v_mean`` per block.
+    ``blk_cnt`` (int32 ``(B, H, ceil(T/64))``) receives, per query block, how
+    many key blocks were exact: the routed set plus the forced sink and
+    diagonal pairs, with ``sink_q`` rows at ``ceil(T/64)``. Same contract as the
+    fused backends, computed from this reference's own route mask.
     """
     b, t, h, d = q.shape
     n = (t + BLOCK - 1) // BLOCK
+    if blk_cnt is not None:
+        # Direct callers bypass the registry, and copy_ would broadcast a wrong
+        # shape silently; validate here rather than trust the caller.
+        from comfy_kitchen.constraints import sol_attn_common_call_rule
+        check = sol_attn_common_call_rule({"q": q, "blk_cnt": blk_cnt})
+        if not check.success:
+            raise ValueError(f"sol_attn: {check.failed_param}: {check.failure_reason}")
     if scale is None:
         scale = d ** -0.5
     log2s = scale * _LOG2E
@@ -218,6 +230,8 @@ def sol_attn(
     exact |= ((idx.view(1, -1) - idx.view(-1, 1)).abs() <= 1).view(1, 1, n, n)
     exact |= ((idx >= sink_kv0) & (idx < sink_kv1)).view(1, 1, 1, n)
     exact |= ((idx >= sink_q0) & (idx < sink_q1)).view(1, 1, n, 1)
+    if blk_cnt is not None:
+        blk_cnt.copy_(exact.sum(-1, dtype=torch.int32))                 # (B, H, NQ)
 
     ex_tok = exact.gather(2, qblk.view(1, 1, t, 1).expand(b, h, t, n))   # (B,H,T,N)
     keep_tok = ex_tok.repeat_interleave(BLOCK, dim=-1)[..., :t]
@@ -245,7 +259,7 @@ def sol_attn(
     return out
 
 
-@torch.library.custom_op("comfy_kitchen::sol_attn", mutates_args=())
+@torch.library.custom_op("comfy_kitchen::sol_attn", mutates_args=("blk_cnt",))
 def _op_sol_attn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -260,6 +274,7 @@ def _op_sol_attn(
     block_len: torch.Tensor | None,
     coarse_gate: torch.Tensor | None,
     token_aug: int = 0,
+    blk_cnt: torch.Tensor | None = None,
 ) -> torch.Tensor:
     kwargs = {
         "q": q, "k": k, "v": v, "tau": tau, "scale": scale,
@@ -267,6 +282,7 @@ def _op_sol_attn(
         "key_bias": key_bias, "topk_ratio": topk_ratio,
         "tail": tail, "block_len": block_len, "coarse_gate": coarse_gate,
         "token_aug": token_aug,
+        "blk_cnt": blk_cnt,
     }
     impl = registry.get_implementation("sol_attn", kwargs=kwargs)
     return impl(**kwargs)
@@ -274,6 +290,7 @@ def _op_sol_attn(
 
 @_op_sol_attn.register_fake
 def _op_sol_attn_fake(q, k, v, tau, scale, sink_blocks, sink_q,
-                      key_bias, topk_ratio, tail, block_len, coarse_gate, token_aug=0):
+                      key_bias, topk_ratio, tail, block_len, coarse_gate,
+                      token_aug=0, blk_cnt=None):
     # contiguous, NOT empty_like(v): both real implementations return contiguous
     return torch.empty(v.shape, dtype=v.dtype, device=v.device)

@@ -943,3 +943,191 @@ def test_block_len_validation():
     c = _chunked_case(seed=11, rot=64)
     with pytest.raises(ValueError, match="block_len"):
         backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], block_len=bad_dtype)
+
+
+# ---------------------------------------------------------------------------
+# blk_cnt: the routed-block count from the same call that produced the output
+# ---------------------------------------------------------------------------
+
+def _counts(b, h, t, device="cuda"):
+    return torch.empty(b, h, (t + 63) // 64, dtype=torch.int32, device=device)
+
+
+def _forced_counts(n, sink_blocks=(0, 0), sink_q=(0, 0), device="cuda"):
+    """Closed form for a route where nothing clears the threshold: the sink
+    range (clamped to the blocks that exist) plus the diagonal blocks
+    {q-1, q, q+1} that exist and are not already sink, as a set; a query block
+    inside sink_q attends every block. What sol_attn_route.cu does when
+    `score >= thr` is false everywhere."""
+    s0 = max(0, min(sink_blocks[0], n))
+    s1 = max(s0, min(sink_blocks[1], n))
+    q = torch.arange(n, device=device)
+    forced = torch.full((n,), s1 - s0, dtype=torch.int32, device=device)
+    for off in (-1, 0, 1):
+        b = q + off
+        forced += ((b >= 0) & (b < n) & ~((b >= s0) & (b < s1))).to(torch.int32)
+    q0, q1 = max(0, min(sink_q[0], n)), max(0, min(sink_q[1], n))
+    forced[q0:q1] = n
+    return forced
+
+
+def test_blk_cnt_leaves_output_untouched():
+    """The count is read after the launch; asking for it must not change a bit
+    of the output, or an observed render is a different render."""
+    q, k, v = _qkv(1, 1024 + 40, 4)
+    for kw in ({"tau": 1.0}, {"topk_ratio": 0.2, "tail": False},
+               {"tau": 1.0, "sink_blocks": [0, 3], "sink_q": [5, 7]}):
+        ref = ck.sol_attn(q, k, v, **kw)
+        cnt = _counts(1, 4, 1024 + 40)
+        assert torch.equal(ck.sol_attn(q, k, v, blk_cnt=cnt, **kw), ref), kw
+
+
+@pytest.mark.parametrize("sinks", [((0, 0), (0, 0)), ((0, 3), (5, 7)), ((2, 40), (0, 2))])
+def test_blk_cnt_forced_pairs_exact(sinks):
+    """At a threshold no score clears, the count is exactly the forced pairs:
+    sink + diagonal as a set, sink_q rows at NTB, ranges clamped to the blocks
+    that exist. At a threshold every score clears, every row is NTB. Both are
+    equalities on the whole tensor, so a wrong workspace slice cannot pass.
+    The eager reference fills the same contract from its own route mask."""
+    sb, sq = sinks
+    t, h = 1024 + 40, 4
+    n = (t + 63) // 64
+    q, k, v = _qkv(1, t, h)
+    kw = {"sink_blocks": list(sb), "sink_q": list(sq)}
+    want = _forced_counts(n, sb, sq).view(1, 1, n).expand(1, h, n)
+    cnt, cnt_e = _counts(1, h, t), _counts(1, h, t)
+    ck.sol_attn(q, k, v, tau=1e9, blk_cnt=cnt, **kw)
+    sol_attn_eager(q, k, v, tau=1e9, blk_cnt=cnt_e, **kw)
+    assert torch.equal(cnt, want), (cnt[0, 0].tolist(), want[0, 0].tolist())
+    assert torch.equal(cnt_e, want)
+    ck.sol_attn(q, k, v, tau=-1e9, blk_cnt=cnt, **kw)
+    sol_attn_eager(q, k, v, tau=-1e9, blk_cnt=cnt_e, **kw)
+    assert bool((cnt == n).all()) and bool((cnt_e == n).all())
+
+
+def test_blk_cnt_monotone_in_tau():
+    """Higher tau can only drop blocks: the preprocess is identical, only the
+    threshold moves, so the count is non-increasing per (b, h, q) exactly, and
+    strictly somewhere on a nondegenerate input. A recorder returning a
+    constant legal tensor fails the strict half."""
+    t, h = 4096, 4
+    q, k, v = _qkv(1, t, h)
+    k = k.clone()
+    k[:, :64] += 2.0 * q[:, :64]        # give the router something to find
+    prev, strict = None, False
+    for tau in (0.5, 1.0, 1.5, 2.0):
+        cnt = _counts(1, h, t)
+        ck.sol_attn(q, k, v, tau=tau, blk_cnt=cnt)
+        n = cnt.shape[-1]
+        assert int(cnt.min()) >= 1 and int(cnt.max()) <= n
+        if prev is not None:
+            assert bool((cnt <= prev).all()), tau
+            strict |= bool((cnt < prev).any())
+        prev = cnt
+    assert strict
+
+
+def test_blk_cnt_batch_layout_matches_individual_calls():
+    """B=1 cannot expose a mistaken batch stride in the workspace slice.
+    A batched launch must return the same output and count tensor as the two
+    samples launched independently, including when their routes differ."""
+    b, t, h = 2, 1024 + 40, 4
+    q, k, v = _qkv(b, t, h)
+    n = (t + 63) // 64
+    kw = {"tau": 1.0, "sink_blocks": [0, 3], "sink_q": [5, 7]}
+
+    batched = _counts(b, h, t)
+    out_batched = ck.sol_attn(q, k, v, blk_cnt=batched, **kw)
+
+    individual, outputs = [], []
+    for i in range(b):
+        count = _counts(1, h, t)
+        outputs.append(ck.sol_attn(q[i:i + 1], k[i:i + 1], v[i:i + 1],
+                                   blk_cnt=count, **kw))
+        individual.append(count)
+
+    assert torch.equal(out_batched, torch.cat(outputs))
+    assert torch.equal(batched, torch.cat(individual))
+    assert bool((batched[0] != batched[1]).any()), (
+        "fixture did not distinguish the two batch slices")
+    assert batched.shape == (b, h, n)
+
+
+def test_blk_cnt_topk_lower_bound_and_ties():
+    """Top-k keeps at least k non-sink blocks per query block plus the sinks.
+    There is no universal upper bound: a tied group straddling the boundary is
+    kept whole (test_topk_ties_over_select), so the count can exceed k by far
+    more than the three diagonal blocks."""
+    from comfy_kitchen.backends.eager.sol_attn import _topk_count
+
+    t, h, n = 64 * 32, 2, 32
+    q, k, v = _qkv(1, t, h)
+    for sb in ((0, 0), (0, 4)):
+        kk = _topk_count(n - (sb[1] - sb[0]), 0.25)
+        cnt = _counts(1, h, t)
+        ck.sol_attn(q, k, v, topk_ratio=0.25, sink_blocks=list(sb), blk_cnt=cnt)
+        assert bool((cnt >= sb[1] - sb[0] + kk).all()), sb
+    # the tied fixture from test_topk_ties_over_select: blocks 8..31 identical.
+    # On a query block where that group scores highest, the boundary falls
+    # inside it and all 24 are kept; on one where it does not, the count is
+    # k plus the diagonal. Both happen here, so the spread is the evidence.
+    u = q.mean(dim=1, keepdim=True) * 640
+    kt = k.clone()
+    kt[:, 8 * 64:] = u
+    cnt = _counts(1, h, t)
+    ck.sol_attn(q, kt, v, topk_ratio=0.25, tail=False, blk_cnt=cnt)
+    kk = _topk_count(n, 0.25)
+    assert kk == 8 and bool((cnt >= kk).all())
+    assert int(cnt.max()) >= 24 > kk + 3                # a whole tie group kept: no [k, k+3] bound
+    assert int(cnt.min()) <= kk + 3                     # and a row where it was not on top
+
+
+def test_blk_cnt_mid_tau_eager_disagreement_is_reported_not_gated(capsys):
+    """Eager routes from float proxies, the kernel from int8 ones, so at an
+    ordinary tau they disagree near the threshold. That is reported here, not
+    asserted: a bound chosen after seeing the number would be decoration."""
+    t, h = 4096, 4
+    q, k, v = _qkv(1, t, h)
+    k = k.clone()
+    k[:, :64] += 2.0 * q[:, :64]
+    cnt, cnt_e = _counts(1, h, t), _counts(1, h, t)
+    ck.sol_attn(q, k, v, tau=1.0, blk_cnt=cnt)
+    sol_attn_eager(q, k, v, tau=1.0, blk_cnt=cnt_e)
+    n = cnt.shape[-1]
+    diff = (cnt - cnt_e).abs().float()
+    print(f"\nblk_cnt tau=1.0 cuda vs eager: mean |diff| {diff.mean():.3f} blocks, "
+          f"max {int(diff.max())}, rows equal {float((diff == 0).float().mean()):.3f}, "
+          f"mean density cuda {float(cnt.float().mean()) / n:.4f} eager "
+          f"{float(cnt_e.float().mean()) / n:.4f}")
+    assert 1 <= int(cnt.min()) and int(cnt.max()) <= n
+    assert 1 <= int(cnt_e.min()) and int(cnt_e.max()) <= n
+
+
+@pytest.mark.parametrize("bad", ["dtype", "shape", "device", "stride"])
+def test_blk_cnt_rejected(bad):
+    """A wrong buffer must raise, not be broadcast or truncated into."""
+    t, h, n = 512, 2, 8
+    q, k, v = _qkv(1, t, h)
+    if bad == "dtype":
+        cnt = torch.empty(1, h, n, dtype=torch.int64, device="cuda")
+    elif bad == "shape":
+        cnt = torch.empty(1, h, n + 1, dtype=torch.int32, device="cuda")
+    elif bad == "device":
+        cnt = torch.empty(1, h, n, dtype=torch.int32)
+    else:
+        cnt = torch.empty(1, h, 2 * n, dtype=torch.int32, device="cuda")[:, :, ::2]
+    with pytest.raises((ValueError, NoCapableBackendError)):
+        ck.sol_attn(q, k, v, tau=1.0, blk_cnt=cnt)
+    with pytest.raises(ValueError):
+        sol_attn_eager(q, k, v, tau=1.0, blk_cnt=cnt)
+
+
+def test_blk_cnt_hip_refuses():
+    """The HIP plan has the slot, but the slice is unverified on AMD; a loud
+    refusal beats a silent wrong number."""
+    if backend is not hip_backend:
+        pytest.skip("HIP backend only")
+    t, h = 512, 2
+    q, k, v = _qkv(1, t, h)
+    with pytest.raises(NotImplementedError):
+        hip_backend.sol_attn(q, k, v, tau=1.0, blk_cnt=_counts(1, h, t))

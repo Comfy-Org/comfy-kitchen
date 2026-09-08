@@ -2465,10 +2465,11 @@ def sol_attn(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    blk_cnt: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
     See sage_attention/sol_attn.cu and the public docstring for ``tail``,
-    ``block_len`` and ``coarse_gate``.
+    ``block_len``, ``coarse_gate`` and ``blk_cnt``.
 
     ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
     per-query-block top-k: keep that fraction of key blocks per query block
@@ -2485,7 +2486,7 @@ def sol_attn(
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
     _check_sol_args(q.device, sink_blocks, sink_q, topk_ratio, q=q, k=k, v=v,
-                    block_len=block_len, coarse_gate=coarse_gate)
+                    block_len=block_len, coarse_gate=coarse_gate, blk_cnt=blk_cnt)
     if scale is None:
         scale = d ** -0.5
     if block_len is not None:
@@ -2536,6 +2537,16 @@ def sol_attn(
         block_len=None if block_len is None else _wrap_for_dlpack(block_len),
         tail=bool(tail), token_aug=int(token_aug),
     )
+    if blk_cnt is not None:
+        # The route stage left one int32 per (b, h, query block) in the plan's
+        # `cnt` slot: how many key blocks that query block attends exactly --
+        # the sink range, the diagonal and the routed set (see
+        # sol_attn_route.cu). A device copy on the same stream, after the launch
+        # that produced `out`; no kernel reads the destination, so `out` is the
+        # same bytes with or without it, and None costs nothing.
+        n = batch * h * p["NQ"]
+        blk_cnt.copy_(workspace[p["cnt"]:p["cnt"] + 4 * n]
+                      .view(torch.int32).view(batch, h, p["NQ"]))
     if coarse_gate is not None:
         add_coarse_(out, coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale),
                     coarse_gate)
