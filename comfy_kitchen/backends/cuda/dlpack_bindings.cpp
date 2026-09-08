@@ -24,6 +24,7 @@
 
 #include "cublaslt_runtime.h"
 #include "input_act_codes.h"
+#include "tensor_bindings.h"
 
 namespace nb = nanobind;
 
@@ -42,6 +43,31 @@ int map_dtype_to_code(const nb::dlpack::dtype& dtype) {
         return 4;  // int8
     }
     return -1;  // unsupported
+}
+
+using comfy::tensor::TensorArg;
+using comfy::tensor::make_tensor_arg;
+
+TensorArg<4> make_packed_sage_v_arg(
+    const nb::ndarray<nb::device::cuda>& array, int64_t batch, int64_t heads,
+    int64_t head_dim, int64_t padded_length) {
+    auto flat = make_tensor_arg<2>(array);
+    if (flat.meta.sizes[0] * flat.meta.sizes[1] !=
+        batch * heads * head_dim * padded_length) {
+        throw std::runtime_error("packed SageAttention V has an invalid size");
+    }
+    TensorArg<4> arg{};
+    arg.data = flat.data;
+    arg.meta.dtype = flat.meta.dtype;
+    arg.meta.sizes[0] = batch;
+    arg.meta.sizes[1] = heads;
+    arg.meta.sizes[2] = head_dim;
+    arg.meta.sizes[3] = padded_length;
+    arg.meta.strides[0] = heads * head_dim * padded_length;
+    arg.meta.strides[1] = head_dim * padded_length;
+    arg.meta.strides[2] = padded_length;
+    arg.meta.strides[3] = 1;
+    return arg;
 }
 
 // Forward declarations of CUDA kernel wrappers
@@ -81,32 +107,8 @@ extern "C" {
         cudaStream_t stream);
 
     void launch_apply_rope_kernel(
-        const void* xq,
-        const void* xk,
-        const void* freqs,
-        void* xq_out,
-        void* xk_out,
-        int64_t batch,
-        int64_t dim1,
-        int64_t dim2,
-        int64_t head_dim,
-        int64_t freqs_batch,
-        int64_t freqs_dim1,
-        int64_t freqs_dim2,
-        int64_t q_s0, int64_t q_s1, int64_t q_s2, int64_t q_s3,
-        int64_t k_s0, int64_t k_s1, int64_t k_s2, int64_t k_s3,
-        int64_t qo_s0, int64_t qo_s1, int64_t qo_s2, int64_t qo_s3,
-        int64_t ko_s0, int64_t ko_s1, int64_t ko_s2, int64_t ko_s3,
-        int64_t stride_freqs_batch,
-        int64_t stride_freqs_dim1,
-        int64_t stride_freqs_dim2,
-        int64_t stride_freqs_dim,
-        int64_t stride_freqs_rot,
-        int64_t stride_freqs_pair,
-        int input_dtype_code,
-        int freqs_dtype_code,
-        bool has_k,
-        bool split_half,
+        TensorArg<4> q, TensorArg<4> k, TensorArg<6> freqs,
+        TensorArg<4> q_out, TensorArg<4> k_out, bool has_k, bool split_half,
         cudaStream_t stream);
 
     void launch_quantize_nvfp4_kernel(
@@ -124,30 +126,10 @@ extern "C" {
         cudaStream_t stream);
 
     void launch_rms_rope_kernel(
-        const void* q,
-        const void* k,
-        const void* freqs,
-        const void* q_scale,
-        const void* k_scale,
-        void* q_out,
-        void* k_out,
-        int64_t batch, int64_t dim1, int64_t dim2, int64_t head_dim,
-        int64_t rot_dim,
-        int64_t freqs_batch, int64_t freqs_dim1, int64_t freqs_dim2,
-        int64_t q_s0, int64_t q_s1, int64_t q_s2, int64_t q_s3,
-        int64_t k_s0, int64_t k_s1, int64_t k_s2, int64_t k_s3,
-        int64_t qo_s0, int64_t qo_s1, int64_t qo_s2, int64_t qo_s3,
-        int64_t ko_s0, int64_t ko_s1, int64_t ko_s2, int64_t ko_s3,
-        int64_t f_s0, int64_t f_s1, int64_t f_s2, int64_t f_s3,
-        int64_t f_s4, int64_t f_s5, int64_t qs_stride,
-        int64_t ks_stride,
-        float epsilon,
-        int input_dtype_code,
-        int freqs_dtype_code,
-        int scale_dtype_code,
-        bool has_k,
-        bool split_half,
-        cudaStream_t stream);
+        TensorArg<4> q, TensorArg<4> k, TensorArg<6> freqs,
+        TensorArg<1> q_scale, TensorArg<1> k_scale, TensorArg<4> q_out,
+        TensorArg<4> k_out, int64_t rot_dim, float epsilon, bool has_k,
+        bool split_half, cudaStream_t stream);
 
     void launch_dequantize_nvfp4_kernel(
         const void* input,
@@ -173,31 +155,18 @@ extern "C" {
 
     // SageAttention kernel launchers
     void launch_quant_qk_per_thread_int8(
-        const void* q, void* q_int8, void* q_scale,
-        const void* k, void* k_int8, void* k_scale,
-        int B, int H_q, int Lq, int H_kv, int Lk, int C,
-        int BLKQ, int WARPQ, int BLKK, int WARPK,
-        int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
-        int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
-        int input_dtype_code, void* anchor_indices, cudaStream_t stream);
+        TensorArg<4> q, int8_t* q_int8, float* q_scale, TensorArg<4> k,
+        int8_t* k_int8, float* k_scale, int BLKQ, int WARPQ, int BLKK,
+        int WARPK, int* anchor_indices, cudaStream_t stream);
 
     void launch_quant_v_int8_kernel(
-        const void* v, void* out, void* scale,
-        int B, int H, int N, int D, int padded_N,
-        int64_t sb, int64_t sh, int64_t sn,
-        int input_dtype_code, cudaStream_t stream);
+        TensorArg<4> v, int8_t* out, float* scale, int padded_N,
+        cudaStream_t stream);
 
     void launch_sage_attn_kernel(
-        const void* q, const void* k, const void* v, void* o,
-        const void* q_scale, const void* k_scale, const void* v_scale,
-        const void* mask, int64_t mask_stride_b, int64_t mask_stride_h,
-        int64_t mask_stride_q, int64_t mask_stride_k, int mask_dtype_code,
-        int cta_k, int B, int Lq, int Lk, int H_q, int H_kv, int D,
-        int q_st_bz, int q_st_n, int q_st_h,
-        int k_st_bz, int k_st_n, int k_st_h,
-        int v_st_bz, int v_st_h, int v_st_d,
-        int o_st_bz, int o_st_n, int o_st_h,
-        float sm_scale, int output_dtype_code, cudaStream_t stream);
+        TensorArg<4> q, TensorArg<4> k, TensorArg<4> v, TensorArg<4> output,
+        const float* q_scale, const float* k_scale, const float* v_scale,
+        TensorArg<4> mask, int cta_k, float sm_scale, cudaStream_t stream);
 
     // SVDQuant W4A4 — see ops/quantize_svdquant_w4a4.cu
     void launch_svdquant_quantize_w4a4_kernel(
@@ -619,10 +588,8 @@ void apply_rope(
         throw std::runtime_error("xk and xk_out must both be provided or both be None");
     }
     
-    void* xk_data = nullptr;
-    void* xk_out_data = nullptr;
-    int64_t k_s0 = 0, k_s1 = 0, k_s2 = 0, k_s3 = 0;
-    int64_t ko_s0 = 0, ko_s1 = 0, ko_s2 = 0, ko_s3 = 0;
+    TensorArg<4> xk_arg{};
+    TensorArg<4> xk_out_arg{};
     
     if (has_xk) {
         auto xk = nb::cast<nb::ndarray<nb::device::cuda>>(xk_obj);
@@ -640,12 +607,8 @@ void apply_rope(
             throw std::runtime_error("xk_out shape must match xq shape");
         }
         
-        xk_data = xk.data();
-        xk_out_data = xk_out.data();
-        k_s0 = xk.stride(0); k_s1 = xk.stride(1);
-        k_s2 = xk.stride(2); k_s3 = xk.stride(3);
-        ko_s0 = xk_out.stride(0); ko_s1 = xk_out.stride(1);
-        ko_s2 = xk_out.stride(2); ko_s3 = xk_out.stride(3);
+        xk_arg = make_tensor_arg<4>(xk);
+        xk_out_arg = make_tensor_arg<4>(xk_out);
         if (map_dtype_to_code(xk.dtype()) != map_dtype_to_code(xq.dtype()) ||
             map_dtype_to_code(xk_out.dtype()) != map_dtype_to_code(xq.dtype())) {
             throw std::runtime_error("apply_rope inputs and outputs must share dtype");
@@ -668,46 +631,10 @@ void apply_rope(
             "apply_rope frequencies must be FP32, FP16, or BF16");
     }
 
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-
-    // Get strides (nanobind provides strides in elements, not bytes)
-    int64_t stride_freqs_batch = freqs.stride(0);
-    int64_t stride_freqs_dim1 = freqs.stride(1);
-    int64_t stride_freqs_dim2 = freqs.stride(2);
-    int64_t stride_freqs_dim = freqs.stride(3);
-    int64_t stride_freqs_rot = freqs.stride(4);
-    int64_t stride_freqs_pair = freqs.stride(5);
-
-    // Launch kernel
     launch_apply_rope_kernel(
-        xq.data(),
-        xk_data,
-        freqs.data(),
-        xq_out.data(),
-        xk_out_data,
-        batch,
-        dim1,
-        dim2,
-        head_dim,
-        freqs_batch,
-        freqs_dim1,
-        freqs_dim2,
-        xq.stride(0), xq.stride(1), xq.stride(2), xq.stride(3),
-        k_s0, k_s1, k_s2, k_s3,
-        xq_out.stride(0), xq_out.stride(1), xq_out.stride(2), xq_out.stride(3),
-        ko_s0, ko_s1, ko_s2, ko_s3,
-        stride_freqs_batch,
-        stride_freqs_dim1,
-        stride_freqs_dim2,
-        stride_freqs_dim,
-        stride_freqs_rot,
-        stride_freqs_pair,
-        input_dtype_code,
-        freqs_dtype_code,
-        has_xk,
-        split_half,
-        stream
-    );
+        make_tensor_arg<4>(xq), xk_arg, make_tensor_arg<6>(freqs),
+        make_tensor_arg<4>(xq_out), xk_out_arg, has_xk, split_half,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for paired fused RMSNorm + RoPE.
@@ -783,18 +710,10 @@ void rms_rope(nb::ndarray<nb::device::cuda> q, nb::ndarray<nb::device::cuda> k,
   }
 
   launch_rms_rope_kernel(
-      q.data(), k.data(), freqs.data(), q_scale.data(), k_scale.data(),
-      q_out.data(), k_out.data(), batch, dim1, dim2, head_dim, rot,
-      freqs.shape(0), freqs.shape(1), freqs.shape(2),
-      q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-      k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-      q_out.stride(0), q_out.stride(1), q_out.stride(2), q_out.stride(3),
-      k_out.stride(0), k_out.stride(1), k_out.stride(2), k_out.stride(3),
-      freqs.stride(0), freqs.stride(1), freqs.stride(2), freqs.stride(3),
-      freqs.stride(4), freqs.stride(5), q_scale.stride(0),
-      k_scale.stride(0), epsilon, input_dtype_code,
-      freqs_dtype_code, scale_dtype_code, true, split_half,
-      reinterpret_cast<cudaStream_t>(stream_ptr));
+      make_tensor_arg<4>(q), make_tensor_arg<4>(k), make_tensor_arg<6>(freqs),
+      make_tensor_arg<1>(q_scale), make_tensor_arg<1>(k_scale),
+      make_tensor_arg<4>(q_out), make_tensor_arg<4>(k_out), rot, epsilon, true,
+      split_half, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for single-tensor fused RMSNorm + RoPE.
@@ -850,18 +769,9 @@ void rms_rope1(nb::ndarray<nb::device::cuda> q,
   }
 
   launch_rms_rope_kernel(
-      q.data(), nullptr, freqs.data(), q_scale.data(), nullptr, q_out.data(),
-      nullptr, batch, dim1, dim2, head_dim, head_dim,
-      freqs.shape(0), freqs.shape(1), freqs.shape(2),
-      q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-      0, 0, 0, 0,
-      q_out.stride(0), q_out.stride(1), q_out.stride(2), q_out.stride(3),
-      0, 0, 0, 0,
-      freqs.stride(0), freqs.stride(1), freqs.stride(2), freqs.stride(3),
-      freqs.stride(4), freqs.stride(5), q_scale.stride(0), 0,
-      epsilon, input_dtype_code,
-      freqs_dtype_code, scale_dtype_code, false, split_half,
-      reinterpret_cast<cudaStream_t>(stream_ptr));
+      make_tensor_arg<4>(q), {}, make_tensor_arg<6>(freqs),
+      make_tensor_arg<1>(q_scale), {}, make_tensor_arg<4>(q_out), {}, head_dim,
+      epsilon, false, split_half, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper: signed INT8 V quantization
@@ -876,16 +786,13 @@ void quant_v_int8(
     if (v.ndim() != 4) {
         throw std::runtime_error("quant_v_int8: v must be 4D [B,H,N,D]");
     }
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    auto v_arg = make_tensor_arg<4>(v);
+    if (static_cast<int>(v_arg.meta.dtype) != input_dtype_code) {
+        throw std::runtime_error("quant_v_int8: input dtype code mismatch");
+    }
     launch_quant_v_int8_kernel(
-        v.data(), out.data(), scale.data(),
-        static_cast<int>(v.shape(0)),
-        static_cast<int>(v.shape(1)),
-        static_cast<int>(v.shape(2)),
-        static_cast<int>(v.shape(3)),
-        padded_n,
-        v.stride(0), v.stride(1), v.stride(2),
-        input_dtype_code, stream);
+        v_arg, static_cast<int8_t*>(out.data()), static_cast<float*>(scale.data()),
+        padded_n, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper: stabilized INT8 Q/K per-thread quant (contiguous HND layout)
@@ -904,21 +811,18 @@ void quant_qk_per_thread_int8(
     if (q.ndim() != 4 || k.ndim() != 4) {
         throw std::runtime_error("quant_qk_per_thread_int8: q and k must be 4D [B,H,L,D]");
     }
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    auto q_arg = make_tensor_arg<4>(q);
+    auto k_arg = make_tensor_arg<4>(k);
+    if (static_cast<int>(q_arg.meta.dtype) != input_dtype_code ||
+        k_arg.meta.dtype != q_arg.meta.dtype) {
+        throw std::runtime_error("quant_qk_per_thread_int8: input dtype mismatch");
+    }
     launch_quant_qk_per_thread_int8(
-        q.data(), q_int8.data(), q_scale.data(),
-        k.data(), k_int8.data(), k_scale.data(),
-        static_cast<int>(q.shape(0)),
-        static_cast<int>(q.shape(1)),
-        static_cast<int>(q.shape(2)),
-        static_cast<int>(k.shape(1)),
-        static_cast<int>(k.shape(2)),
-        static_cast<int>(q.shape(3)),
-        BLKQ, WARPQ, BLKK, WARPK,
-        q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        input_dtype_code,
-        reinterpret_cast<void *>(anchor_indices_ptr), stream);
+        q_arg, static_cast<int8_t*>(q_int8.data()),
+        static_cast<float*>(q_scale.data()), k_arg,
+        static_cast<int8_t*>(k_int8.data()), static_cast<float*>(k_scale.data()),
+        BLKQ, WARPQ, BLKK, WARPK, reinterpret_cast<int*>(anchor_indices_ptr),
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Quantization half of the split INT8 SDPA API.  This deliberately launches
@@ -985,23 +889,25 @@ void sage_sdpa_quantize(
 
     constexpr int BLKQ = 128;
     const int WARPQ = D == 256 ? 16 : 32;
+    auto q_arg = make_tensor_arg<4>(q);
+    auto k_arg = make_tensor_arg<4>(k);
+    auto v_arg = make_tensor_arg<4>(v);
+    if (static_cast<int>(q_arg.meta.dtype) != input_dtype_code ||
+        k_arg.meta.dtype != q_arg.meta.dtype || v_arg.meta.dtype != q_arg.meta.dtype) {
+        throw std::runtime_error("sage_sdpa_quantize: input dtype mismatch");
+    }
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
     launch_quant_qk_per_thread_int8(
-        q.data(), q_int8.data(), q_scale.data(),
-        k.data(), k_int8.data(), k_scale.data(),
-        B, H_q, Lq, H_kv, Lk, D,
-        BLKQ, WARPQ, cta_k, cta_k,
-        q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        input_dtype_code,
-        reinterpret_cast<void *>(anchor_indices_ptr), stream);
+        q_arg, static_cast<int8_t*>(q_int8.data()),
+        static_cast<float*>(q_scale.data()), k_arg,
+        static_cast<int8_t*>(k_int8.data()), static_cast<float*>(k_scale.data()),
+        BLKQ, WARPQ, cta_k, cta_k, reinterpret_cast<int*>(anchor_indices_ptr),
+        stream);
 
     launch_quant_v_int8_kernel(
-        v.data(), v_int8.data(), v_scale.data(),
-        B, H_kv, Lk, D, padded_Lk,
-        v.stride(0), v.stride(1), v.stride(2),
-        input_dtype_code, stream);
+        v_arg, static_cast<int8_t*>(v_int8.data()),
+        static_cast<float*>(v_scale.data()), padded_Lk, stream);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -1073,12 +979,7 @@ void sage_sdpa_prequantized(
             "sage_sdpa_prequantized: quantized tensors and output must be contiguous");
     }
 
-    const void *mask_ptr = nullptr;
-    int64_t mask_stride_b = 0;
-    int64_t mask_stride_h = 0;
-    int64_t mask_stride_q = 0;
-    int64_t mask_stride_k = 0;
-    int mask_dtype_code = -1;
+    TensorArg<4> mask_arg{};
     if (attn_mask.has_value()) {
         const auto &mask = attn_mask.value();
         if (mask.ndim() != 4 || mask.shape(0) != B || mask.shape(1) != H_q ||
@@ -1086,55 +987,25 @@ void sage_sdpa_prequantized(
             throw std::runtime_error(
                 "sage_sdpa_prequantized: attention mask must be expanded to [B,H_q,Lq,Lk]");
         }
-        if (mask.dtype().code == (uint8_t)nb::dlpack::dtype_code::Bool) {
-            mask_dtype_code = 3;
-        } else {
-            mask_dtype_code = map_dtype_to_code(mask.dtype());
-        }
-        if (mask_dtype_code < 0 || mask_dtype_code > 3) {
+        mask_arg = make_tensor_arg<4>(mask);
+        if (mask_arg.meta.dtype != comfy::tensor::DType::Bool &&
+            mask_arg.meta.dtype != comfy::tensor::DType::Float16 &&
+            mask_arg.meta.dtype != comfy::tensor::DType::BFloat16 &&
+            mask_arg.meta.dtype != comfy::tensor::DType::Float32) {
             throw std::runtime_error(
                 "sage_sdpa_prequantized: attention mask must be bool, float16, bfloat16, or float32");
         }
-        mask_ptr = mask.data();
-        mask_stride_b = mask.stride(0);
-        mask_stride_h = mask.stride(1);
-        mask_stride_q = mask.stride(2);
-        mask_stride_k = mask.stride(3);
     }
-
-    const int64_t qi_st_bz64 = static_cast<int64_t>(H_q) * Lq * D;
-    const int64_t ki_st_bz64 = static_cast<int64_t>(H_kv) * Lk * D;
-    const int64_t v_st_bz64 = static_cast<int64_t>(H_kv) * D * padded_Lk;
-    if (qi_st_bz64 > INT_MAX || ki_st_bz64 > INT_MAX || v_st_bz64 > INT_MAX) {
-        throw std::overflow_error(
-            "sage_sdpa_prequantized: tensor strides exceed int32 range; reduce batch/seq/head dimensions");
-    }
-
-    const int qi_st_h = Lq * D;
-    const int qi_st_n = D;
-    const int qi_st_bz = static_cast<int>(qi_st_bz64);
-    const int ki_st_h = Lk * D;
-    const int ki_st_n = D;
-    const int ki_st_bz = static_cast<int>(ki_st_bz64);
-    const int v_st_d = padded_Lk;
-    const int v_st_h = D * padded_Lk;
-    const int v_st_bz = static_cast<int>(v_st_bz64);
-    const int o_st_h = Lq * D;
-    const int o_st_n = D;
-    const int o_st_bz = static_cast<int>(qi_st_bz64);
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_sage_attn_kernel(
-        q_int8.data(), k_int8.data(), v_int8.data(), o.data(),
-        q_scale.data(), k_scale.data(), v_scale.data(),
-        mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
-        mask_dtype_code, cta_k,
-        B, Lq, Lk, H_q, H_kv, D,
-        qi_st_bz, qi_st_n, qi_st_h,
-        ki_st_bz, ki_st_n, ki_st_h,
-        v_st_bz, v_st_h, v_st_d,
-        o_st_bz, o_st_n, o_st_h,
-        sm_scale, output_dtype_code, stream);
+        make_tensor_arg<4>(q_int8), make_tensor_arg<4>(k_int8),
+        make_packed_sage_v_arg(v_int8, B, H_kv, D, padded_Lk),
+        make_tensor_arg<4>(o),
+        static_cast<const float*>(q_scale.data()),
+        static_cast<const float*>(k_scale.data()),
+        static_cast<const float*>(v_scale.data()),
+        mask_arg, cta_k, sm_scale, stream);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -1173,33 +1044,12 @@ void sage_attn(
             "sage_attn: packed V sequence extent must cover K and be a multiple of 64");
     }
 
-    const int64_t st_q_bz = static_cast<int64_t>(q.stride(0));
-    const int64_t st_k_bz = static_cast<int64_t>(k.stride(0));
-    const int64_t st_v_bz = static_cast<int64_t>(v.stride(0));
-    const int64_t st_o_bz = static_cast<int64_t>(o.stride(0));
-    if (st_q_bz > INT_MAX || st_k_bz > INT_MAX ||
-        st_v_bz > INT_MAX || st_o_bz > INT_MAX) {
-        throw std::overflow_error(
-            "sage_attn: tensor strides exceed int32 range");
-    }
-
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_sage_attn_kernel(
-        q.data(), k.data(), v.data(), o.data(),
-        q_scale.data(), k_scale.data(), v_scale.data(),
-        nullptr, 0, 0, 0, 0, -1,
-        CTA_K,
-        static_cast<int>(q.shape(0)),
-        static_cast<int>(q.shape(2)),
-        static_cast<int>(k.shape(2)),
-        static_cast<int>(q.shape(1)),
-        static_cast<int>(k.shape(1)),
-        static_cast<int>(q.shape(3)),
-        q.stride(0), q.stride(2), q.stride(1),
-        k.stride(0), k.stride(2), k.stride(1),
-        v.stride(0), v.stride(1), v.stride(2),
-        o.stride(0), o.stride(2), o.stride(1),
-        sm_scale, output_dtype_code, stream);
+        make_tensor_arg<4>(q), make_tensor_arg<4>(k), make_tensor_arg<4>(v),
+        make_tensor_arg<4>(o), static_cast<const float*>(q_scale.data()),
+        static_cast<const float*>(k_scale.data()),
+        static_cast<const float*>(v_scale.data()), {}, CTA_K, sm_scale, stream);
 }
 
 // Fused SageAttention SDPA: quant_qk + quant_v + sage_attn in one C++ call.
@@ -1234,12 +1084,7 @@ void sage_sdpa(
     const int H_kv = static_cast<int>(k.shape(1));
     const int Lk = static_cast<int>(k.shape(2));
 
-    const void *mask_ptr = nullptr;
-    int64_t mask_stride_b = 0;
-    int64_t mask_stride_h = 0;
-    int64_t mask_stride_q = 0;
-    int64_t mask_stride_k = 0;
-    int mask_dtype_code = -1;
+    TensorArg<4> mask_arg{};
     if (attn_mask.has_value()) {
         const auto &mask = attn_mask.value();
         if (mask.ndim() != 4 || mask.shape(0) != B || mask.shape(1) != H_q ||
@@ -1247,20 +1092,14 @@ void sage_sdpa(
             throw std::runtime_error(
                 "sage_sdpa: attention mask must be expanded to [B,H_q,Lq,Lk]");
         }
-        if (mask.dtype().code == (uint8_t)nb::dlpack::dtype_code::Bool) {
-            mask_dtype_code = 3;
-        } else {
-            mask_dtype_code = map_dtype_to_code(mask.dtype());
-        }
-        if (mask_dtype_code < 0 || mask_dtype_code > 3) {
+        mask_arg = make_tensor_arg<4>(mask);
+        if (mask_arg.meta.dtype != comfy::tensor::DType::Bool &&
+            mask_arg.meta.dtype != comfy::tensor::DType::Float16 &&
+            mask_arg.meta.dtype != comfy::tensor::DType::BFloat16 &&
+            mask_arg.meta.dtype != comfy::tensor::DType::Float32) {
             throw std::runtime_error(
                 "sage_sdpa: attention mask must be bool, float16, bfloat16, or float32");
         }
-        mask_ptr = mask.data();
-        mask_stride_b = mask.stride(0);
-        mask_stride_h = mask.stride(1);
-        mask_stride_q = mask.stride(2);
-        mask_stride_k = mask.stride(3);
     }
 
     if (input_dtype_code < 0 || input_dtype_code > 2) {
@@ -1291,55 +1130,35 @@ void sage_sdpa(
     const int BLKK = cta_k;
     const int WARPK = cta_k;
     const int padded_Lk = ((Lk + cta_k - 1) / cta_k) * cta_k;
+    auto q_arg = make_tensor_arg<4>(q);
+    auto k_arg = make_tensor_arg<4>(k);
+    auto v_arg = make_tensor_arg<4>(v);
+    if (static_cast<int>(q_arg.meta.dtype) != input_dtype_code ||
+        k_arg.meta.dtype != q_arg.meta.dtype || v_arg.meta.dtype != q_arg.meta.dtype) {
+        throw std::runtime_error("sage_sdpa: input dtype mismatch");
+    }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
     launch_quant_qk_per_thread_int8(
-        q.data(), q_int8.data(), q_scale.data(),
-        k.data(), k_int8.data(), k_scale.data(),
-        B, H_q, Lq, H_kv, Lk, D,
-        BLKQ, WARPQ, BLKK, WARPK,
-        q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        input_dtype_code,
-        reinterpret_cast<void *>(anchor_indices_ptr), stream);
+        q_arg, static_cast<int8_t*>(q_int8.data()),
+        static_cast<float*>(q_scale.data()), k_arg,
+        static_cast<int8_t*>(k_int8.data()), static_cast<float*>(k_scale.data()),
+        BLKQ, WARPQ, BLKK, WARPK, reinterpret_cast<int*>(anchor_indices_ptr),
+        stream);
 
     launch_quant_v_int8_kernel(
-        v.data(), v_int8.data(), v_scale.data(),
-        B, H_kv, Lk, D, padded_Lk,
-        v.stride(0), v.stride(1), v.stride(2),
-        input_dtype_code, stream);
-
-    // int64_t arithmetic to detect overflow before narrowing to int.
-    const int64_t qi_st_bz64 = static_cast<int64_t>(H_q)  * Lq * D;
-    const int64_t ki_st_bz64 = static_cast<int64_t>(H_kv) * Lk * D;
-    const int64_t v_st_bz64  = static_cast<int64_t>(H_kv) * D * padded_Lk;
-
-    if (qi_st_bz64 > INT_MAX || ki_st_bz64 > INT_MAX || v_st_bz64 > INT_MAX) {
-        throw std::overflow_error(
-            "sage_sdpa: tensor strides exceed int32 range; reduce batch/seq/head dimensions");
-    }
-
-    const int qi_st_h = Lq * D, qi_st_n = D, qi_st_bz = static_cast<int>(qi_st_bz64);
-    const int ki_st_h = Lk * D, ki_st_n = D, ki_st_bz = static_cast<int>(ki_st_bz64);
-    const int o_st_h  = Lq * D, o_st_n  = D, o_st_bz  = static_cast<int>(qi_st_bz64);
-    // v_int8 is [B*H_kv*D, padded_Lk] (2D from quant kernel).
-    // Attention expects V as [B, H, D, padded_N].
-    const int v_st_d  = padded_Lk;
-    const int v_st_h  = D * padded_Lk;
-    const int v_st_bz = static_cast<int>(v_st_bz64);
+        v_arg, static_cast<int8_t*>(v_int8.data()),
+        static_cast<float*>(v_scale.data()), padded_Lk, stream);
 
     launch_sage_attn_kernel(
-        q_int8.data(), k_int8.data(), v_int8.data(), o.data(),
-        q_scale.data(), k_scale.data(), v_scale.data(),
-        mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
-        mask_dtype_code, cta_k,
-        B, Lq, Lk, H_q, H_kv, D,
-        qi_st_bz, qi_st_n, qi_st_h,
-        ki_st_bz, ki_st_n, ki_st_h,
-        v_st_bz, v_st_h, v_st_d,
-        o_st_bz, o_st_n, o_st_h,
-        sm_scale, output_dtype_code, stream);
+        make_tensor_arg<4>(q_int8), make_tensor_arg<4>(k_int8),
+        make_packed_sage_v_arg(v_int8, B, H_kv, D, padded_Lk),
+        make_tensor_arg<4>(o),
+        static_cast<const float*>(q_scale.data()),
+        static_cast<const float*>(k_scale.data()),
+        static_cast<const float*>(v_scale.data()),
+        mask_arg, cta_k, sm_scale, stream);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -2046,12 +1865,9 @@ extern "C" {
         cudaStream_t stream);
 
     void launch_flash_decode(
-        const void* q, const void* k, const void* v, const int* kv_lengths,
-        void* output, float* softmax_lse, float* softmax_lse_accum, float* output_accum,
-        int batch, int query_length, int heads, int kv_capacity, int num_splits,
-        int64_t q_batch_stride, int64_t q_row_stride, int64_t q_head_stride,
-        int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
-        cudaStream_t stream);
+        TensorArg<3> q, TensorArg<4> k, TensorArg<4> v, int* kv_lengths,
+        TensorArg<3> output, float* softmax_lse, float* softmax_lse_accum,
+        float* output_accum, int num_splits, cudaStream_t stream);
 
 }
 
@@ -3368,12 +3184,11 @@ void flash_attention_decode(
     }
 
     launch_flash_decode(
-        q.data(), k.data(), v.data(), kv_lengths.data(), output.data(), softmax_lse.data(),
+        make_tensor_arg<3>(q), make_tensor_arg<4>(k), make_tensor_arg<4>(v),
+        kv_lengths.data(), make_tensor_arg<3>(output), softmax_lse.data(),
         num_splits > 1 ? softmax_lse_accum.data() : nullptr,
-        num_splits > 1 ? output_accum.data() : nullptr,
-        batch, query_length, heads, kv_capacity, num_splits,
-        q.stride(0) * query_length, q.stride(0), q.stride(1),
-        k.stride(0), k.stride(1), k.stride(2), reinterpret_cast<cudaStream_t>(stream_ptr));
+        num_splits > 1 ? output_accum.data() : nullptr, num_splits,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 NB_MODULE(_C, m) {
