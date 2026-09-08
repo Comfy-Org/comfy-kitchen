@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import logging
 import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -133,6 +135,18 @@ def _validate_inputs(
         ) from error
 
 
+_LOG_INT8_PATH = os.environ.get("COMFY_KITCHEN_LOG_INT8_PATH", "0") == "1"
+_logger = logging.getLogger("comfy_kitchen.sage_attention")
+_attn_path_logged: set[tuple] = set()
+
+
+def _log_attn_once(key: tuple, message: str) -> None:
+    if not _LOG_INT8_PATH or key in _attn_path_logged:
+        return
+    _attn_path_logged.add(key)
+    _logger.warning("[int8_attn_path] %s", message)
+
+
 def _int8_attention_cuda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -177,6 +191,12 @@ def _int8_attention_cuda(
         kernel_head_dim,
         kv_length,
         has_mask=attn_mask is not None,
+    )
+    _log_attn_once(
+        (batch, q_heads, q_length, kv_length, kernel_head_dim, cta_k, attn_mask is not None),
+        f"int8_attention: B={batch} Hq={q_heads} Hkv={kv_heads} Sq={q_length} Skv={kv_length} "
+        f"D={original_head_dim} kernel_D={kernel_head_dim} cta_k={cta_k} has_mask={attn_mask is not None} "
+        f"cap={torch.cuda.get_device_capability(q.device)}",
     )
     padded_k_length = _pad_to_cta_k(kv_length, cta_k)
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
@@ -327,6 +347,12 @@ def prequantize_int8_attention(
         kernel_head_dim,
         kv_length,
         has_mask=attn_mask is not None,
+    )
+    _log_attn_once(
+        (batch, q_heads, q_length, kv_length, kernel_head_dim, cta_k, attn_mask is not None),
+        f"int8_attention: B={batch} Hq={q_heads} Hkv={kv_heads} Sq={q_length} Skv={kv_length} "
+        f"D={original_head_dim} kernel_D={kernel_head_dim} cta_k={cta_k} has_mask={attn_mask is not None} "
+        f"cap={torch.cuda.get_device_capability(q.device)}",
     )
     padded_k_length = _pad_to_cta_k(kv_length, cta_k)
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
