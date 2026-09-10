@@ -21,6 +21,8 @@ import torch.nn.functional as functional
 
 from comfy_kitchen.registry import registry
 
+from typing import List
+
 # Element budget for one tile's [Nq, Nk] attention mask (bounds the mask
 # allocation and, on CPU, the math-backend score materialization).
 NA_SCORE_BUDGET = 2 ** 25
@@ -89,8 +91,8 @@ def na3d(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    kernel_size: list[int],
-    is_causal: list[bool] | None = None,
+    kernel_size: List[int],
+    is_causal: List[bool] | None = None,
     scale: float | None = None,
 ) -> torch.Tensor:
     """3D neighborhood attention over ``(B, T, H, W, NH, HD)`` tensors."""
@@ -165,8 +167,8 @@ def _op_na3d(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    kernel_size: list[int],
-    is_causal: list[bool],
+    kernel_size: List[int],
+    is_causal: List[bool],
     scale: float | None,
 ) -> torch.Tensor:
     kwargs = {"q": q, "k": k, "v": v, "kernel_size": kernel_size, "is_causal": is_causal, "scale": scale}
