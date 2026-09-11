@@ -900,8 +900,9 @@ def _int8_matmul_dequant_kernel(
     pid_n = (pid % num_pid_in_group) // actual_group_size_m
 
     # 1. Prepare Pointers for A and B
-    offs_am = (pid_m * block_m + tl.arange(0, block_m)) % m
-    offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
+    # int64: stride_cm * offs_am overflows int32 once m * n >= 2**31 (#136).
+    offs_am = ((pid_m * block_m + tl.arange(0, block_m)) % m).to(tl.int64)
+    offs_bn = ((pid_n * block_n + tl.arange(0, block_n)) % n).to(tl.int64)
     offs_k = tl.arange(0, block_k)
 
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
@@ -982,8 +983,9 @@ def _int8_matmul_dequant_per_row_kernel(
     pid_n = (pid % num_pid_in_group) // actual_group_size_m
 
     # 1. Prepare Pointers for A and B
-    offs_am = (pid_m * block_m + tl.arange(0, block_m)) % m
-    offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
+    # int64: stride_cm * offs_am overflows int32 once m * n >= 2**31 (#136).
+    offs_am = ((pid_m * block_m + tl.arange(0, block_m)) % m).to(tl.int64)
+    offs_bn = ((pid_n * block_n + tl.arange(0, block_n)) % n).to(tl.int64)
     offs_k = tl.arange(0, block_k)
 
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
