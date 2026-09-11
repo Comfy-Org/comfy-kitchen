@@ -1677,7 +1677,7 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
                            nb::ndarray<> vscale, float rope_eps, int64_t rot_dim, int64_t t0,
                            int64_t m, int64_t batch, int64_t seq_len, int64_t num_heads,
                            uintptr_t stream_ptr, OptArray block_len = std::nullopt,
-                           int64_t token_aug = 0) {
+                           int64_t token_aug = 0, OptArray key_bias = std::nullopt) {
     constexpr const char* kFn = "sol_producer_chunk";
     sol_need_extents(batch, seq_len, num_heads, kFn);
     if (batch != 1) throw std::runtime_error(std::string(kFn) + ": the producer path is B=1 only");
@@ -1698,8 +1698,10 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
     sol_need_elems(kw, 128, 2, kFn, "kw");
     sol_need_elems(kmean, batch * num_heads * 128, 0, kFn, "kmean");
     sol_need_elems(vscale, batch * num_heads * 128, 0, kFn, "vscale");
+    if (key_bias) sol_need_elems(*key_bias, batch * seq_len, 0, kFn, "key_bias");
     sol_producer_chunk(workspace.data(), qkv.data(), fab.data(), qw.data(), kw.data(),
-                       kmean.data(), vscale.data(), opt_data(block_len), rope_eps,
+                       kmean.data(), vscale.data(), opt_data(key_bias), opt_data(block_len),
+                       rope_eps,
                        static_cast<int>(rot_dim), static_cast<int>(t0), static_cast<int>(m),
                        static_cast<int>(batch), static_cast<int>(seq_len),
                        static_cast<int>(num_heads), static_cast<int>(token_aug),
@@ -1762,7 +1764,7 @@ NB_MODULE(_C, m) {
           nb::arg("kmean"), nb::arg("vscale"), nb::arg("rope_eps"), nb::arg("rot_dim"),
           nb::arg("t0"), nb::arg("m"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
           nb::arg("stream_ptr"), nb::arg("block_len") = nb::none(),
-          nb::arg("token_aug") = 0);
+          nb::arg("token_aug") = 0, nb::arg("key_bias") = nb::none());
     m.def("sol_attn_core", &sol_attn_core_py,
           nb::arg("workspace"), nb::arg("out"), nb::arg("vscale"), nb::arg("kmean_next"),
           nb::arg("vamax_out"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),

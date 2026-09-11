@@ -68,9 +68,10 @@ int sol_attn_plan(int batch, int seq_len, int num_heads, int n_tok, int64_t* out
 void sol_producer_begin(void* workspace, int batch, int seq_len, int num_heads, int n_tok,
                         hipStream_t stream);
 void sol_producer_chunk(void* workspace, const void* qkv, const void* fab, const void* qw,
-                        const void* kw, const void* kmean, const void* vscale, const void* blen,
-                        float rope_eps, int rot_dim, int t0, int M, int batch, int seq_len,
-                        int num_heads, int n_tok, hipStream_t stream);
+                        const void* kw, const void* kmean, const void* vscale,
+                        const void* key_bias, const void* blen, float rope_eps, int rot_dim,
+                        int t0, int M, int batch, int seq_len, int num_heads, int n_tok,
+                        hipStream_t stream);
 void launch_sol_attn_core(void* workspace, void* out, const void* vscale, void* kmean_next,
                           void* vamax_out, const void* blen, int tail, int batch, int seq_len,
                           int num_heads, float tau, float scale, const void* ext_threshold,

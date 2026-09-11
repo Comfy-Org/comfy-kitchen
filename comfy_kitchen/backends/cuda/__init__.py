@@ -2560,10 +2560,14 @@ def sol_attn_chunked(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    *,
+    key_bias: torch.Tensor | None = None,
 ):
     """Chunked-producer Sol-Attn over fused qkv projection chunks ([M, 3*H*128]
     bf16, 64-aligned starts, B=1); full Q/K/V are never materialised.
     ``tail`` / ``block_len`` / ``coarse_gate`` / ``token_aug`` as in ``sol_attn``.
+    ``key_bias`` is natural-log per-key score bias and is consumed only by
+    exact blocks; every biased key block must therefore be sink-routed.
 
     ``qkv_chunks``: an iterable of chunks or a zero-arg callable returning one.
     ``kmean``/``vscale`` are LAST step's statistics ([H,128] f32); when None the
@@ -2593,6 +2597,11 @@ def sol_attn_chunked(
     ws = torch.empty(p["total"], dtype=torch.uint8, device=dev)
     stream = torch.cuda.current_stream(dev).cuda_stream
     width = 3 * h * d
+    kb = None
+    if key_bias is not None:
+        # exact branch only, in log2 units; biased blocks must be sink-covered
+        kb = _normalize_key_bias(key_bias, 1, t, dev)
+        kb = (kb * _LOG2E).expand(1, t).contiguous()
 
     def produce(km, vsc):
         _C.sol_producer_begin(_wrap_for_dlpack(ws), 1, t, h, stream, token_aug=int(token_aug))
@@ -2612,7 +2621,8 @@ def sol_attn_chunked(
                 _wrap_for_dlpack(km), _wrap_for_dlpack(vsc),
                 float(rope_eps), rot, t0, m, 1, t, h, stream,
                 block_len=None if block_len is None else _wrap_for_dlpack(block_len),
-                token_aug=int(token_aug))
+                token_aug=int(token_aug),
+                key_bias=None if kb is None else _wrap_for_dlpack(kb))
             t0 += m
         if t0 != t:
             raise ValueError(f"sol_attn_chunked: chunks cover {t0} tokens, T={t}")

@@ -369,6 +369,41 @@ def test_topk_ratio_validation():
         ck.sol_attn(q, k, v, topk_ratio=1.5)
 
 
+def test_chunked_key_bias_matches_separate_rope():
+    """Chunked fused-QKV carries natural-log key bias into exact K blocks."""
+    c = _chunked_case(seed=23, rot=96, v_scale=0.02)
+    bias = torch.zeros(c["t"], device="cuda")
+    bias[64:192] = math.log(0.37)
+    sinks = [1, 3]
+    ref = backend.sol_attn(
+        c["q"], c["k"], c["v"], tau=1.4, key_bias=bias, sink_blocks=sinks
+    )
+    cold, km, vs = backend.sol_attn_chunked(
+        c["chunks"], c["t"], c["h"], c["freqs"], c["norm"],
+        tau=1.4, key_bias=bias, sink_blocks=sinks
+    )
+    primed, _, _ = backend.sol_attn_chunked(
+        c["chunks"], c["t"], c["h"], c["freqs"], c["norm"],
+        kmean=km, vscale=vs, tau=1.4, key_bias=bias, sink_blocks=sinks
+    )
+    plain, _, _ = backend.sol_attn_chunked(
+        c["chunks"], c["t"], c["h"], c["freqs"], c["norm"],
+        kmean=km, vscale=vs, tau=1.4, sink_blocks=sinks
+    )
+    assert _cos(cold, ref) > 0.995
+    assert _cos(primed, ref) > 0.995
+    assert not torch.equal(primed, plain)
+
+
+def test_chunked_key_bias_bad_shape_rejected_before_production():
+    c = _chunked_case(seed=29, rot=96, v_scale=0.02)
+    with pytest.raises(ValueError, match="key_bias"):
+        backend.sol_attn_chunked(
+            c["chunks"], c["t"], c["h"], c["freqs"], c["norm"],
+            key_bias=torch.zeros(c["t"] - 1, device="cuda"), sink_blocks=[0, 1]
+        )
+
+
 @pytest.mark.parametrize("rot", [64, 96])
 def test_chunked_producer_matches_separate_rope(rot):
     """Chunked producer vs rms_rope_split_half_ + sol_attn. rot=96 is H3's real
