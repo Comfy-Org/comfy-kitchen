@@ -60,6 +60,27 @@ struct EpiRowwise {
 
     __forceinline__ __device__ void init() {}
 
+    __forceinline__ __device__ float row_scale(int row) const {
+        return scale_a[row];
+    }
+
+    __forceinline__ __device__ float col_scale(int col) const {
+        return scale_b[col * scale_b_stride];
+    }
+
+    __forceinline__ __device__ float bias_value(int col) const {
+        return bias ? load_scalar(bias, bias_code, col) : 0.0f;
+    }
+
+    __forceinline__ __device__ float apply_cached(
+        float acc, float sa, float sb, float b
+    ) const {
+        float v = acc * sa;
+        v *= sb;
+        v += b;
+        return v;
+    }
+
     __forceinline__ __device__ float operator()(int row, int col, float acc) const {
         float v = acc * scale_a[row] * scale_b[col * scale_b_stride];
         if (bias) v += load_scalar(bias, bias_code, col);
