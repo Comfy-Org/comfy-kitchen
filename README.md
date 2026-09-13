@@ -8,7 +8,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 |-----------------------------|-------|------|--------|-----|
 | `quantize_per_tensor_fp8`   | ✓     | ✓    | ✓      | ✓   |
 | `dequantize_per_tensor_fp8` | ✓     | ✓    | ✓      | ✓   |
-| `stochastic_rounding_fp8`   | ✓     | ✓    |        | ✓   |
+| `stochastic_rounding_fp8`   | ✓     | ✓    | ✓      | ✓   |
 | `quantize_nvfp4`            | ✓     | ✓    | ✓      |     |
 | `dequantize_nvfp4`          | ✓     | ✓    | ✓      |     |
 | `scaled_mm_nvfp4`           | ✓     | ✓    |        |     |
