@@ -77,7 +77,7 @@ struct EpiRowwise {
     ) const {
         float v = acc * sa;
         v *= sb;
-        v += b;
+        if (bias) v += b;
         return v;
     }
 
