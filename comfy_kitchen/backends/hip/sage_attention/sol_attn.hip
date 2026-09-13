@@ -34,9 +34,9 @@ void launch_sol_preprocess(const void*, const void*, const void*, void*, void*, 
                            float, float, int, hipStream_t);
 size_t sol_preprocess_scratch_bytes(int, int, int);
 void launch_sol_producer(const void*, const void*, const void*, const void*, const void*,
-                         const void*, void*, void*, void*, void*, void*, void*, void*, void*,
-                         void*, void*, void*, void*, const void*, float, int, int, int, int, int,
-                         int, int, int, hipStream_t);
+                         const void*, const void*, void*, void*, void*, void*, void*, void*,
+                         void*, void*, void*, void*, void*, void*, const void*, float, int, int,
+                         int, int, int, int, int, int, hipStream_t);
 void launch_sol_finish(void*, void*, void*, void*, const void*, const void*, void*, const void*,
                        int, int, int, int, int, int, float, float, hipStream_t);
 void launch_sol_vtranspose(const void*, const void*, void*, void*, int, int, int, int, int64_t,
@@ -240,14 +240,15 @@ extern "C" void sol_producer_begin(void* workspace, int batch, int seq_len, int 
 
 extern "C" void sol_producer_chunk(void* workspace, const void* qkv, const void* fab,
                                    const void* qw, const void* kw, const void* kmean,
-                                   const void* vscale, const void* blen, float rope_eps,
-                                   int rot_dim, int t0, int M, int batch, int seq_len,
-                                   int num_heads, int n_tok, hipStream_t stream) {
+                                   const void* vscale, const void* key_bias, const void* blen,
+                                   float rope_eps, int rot_dim, int t0, int M, int batch,
+                                   int seq_len, int num_heads, int n_tok, hipStream_t stream) {
     validate_token_aug(n_tok);
     const Plan p(batch, seq_len, num_heads, n_tok);
     char* w = reinterpret_cast<char*>(workspace);
-    launch_sol_producer(qkv, fab, qw, kw, kmean, vscale, w + p.qiP, w + p.qs, w + p.kiP,
-                        w + p.ksb, w + p.vTi, n_tok ? w + p.vRow : nullptr, w + p.vcT,
+    launch_sol_producer(qkv, fab, qw, kw, kmean, vscale, key_bias, w + p.qiP, w + p.qs,
+                        w + p.kiP, w + p.ksb, w + p.vTi,
+                        n_tok ? w + p.vRow : nullptr, w + p.vcT,
                         w + p.scratch, w + p.cen8, w + p.cens,
                         w + p.qmean, w + p.statsV, blen, rope_eps, rot_dim, t0, M, seq_len, p.Tp,
                         num_heads, p.NPAD, p.NQ, stream);

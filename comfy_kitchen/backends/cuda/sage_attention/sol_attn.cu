@@ -42,7 +42,7 @@ void launch_sol_preprocess(const void*, const void*, const void*, void*, void*, 
                            int64_t, int64_t, int64_t, float, float, int, cudaStream_t);
 size_t sol_preprocess_scratch_bytes(int, int, int);
 void launch_sol_producer(const void*, const void*, const void*, const void*,
-                         const void*, const void*, void*, void*, void*, void*,
+                         const void*, const void*, const void*, void*, void*, void*, void*,
                          void*, void*, void*, void*, void*, void*, void*, void*,
                          const void*, float, int, int, int, int, int, int, int, int,
                          cudaStream_t);
@@ -235,13 +235,13 @@ extern "C" void sol_producer_begin(void* workspace, int batch, int seq_len,
 extern "C" void sol_producer_chunk(
     void* workspace, const void* qkv, const void* fab,
     const void* qw, const void* kw, const void* kmean, const void* vscale,
-    const void* blen, float rope_eps, int rot_dim, int t0, int M,
+    const void* key_bias, const void* blen, float rope_eps, int rot_dim, int t0, int M,
     int batch, int seq_len, int num_heads, int n_tok, cudaStream_t stream)
 {
     validate_token_aug(n_tok);
     const Plan p(batch, seq_len, num_heads, n_tok);
     char* w = reinterpret_cast<char*>(workspace);
-    launch_sol_producer(qkv, fab, qw, kw, kmean, vscale,
+    launch_sol_producer(qkv, fab, qw, kw, kmean, vscale, key_bias,
                         w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb,
                         w + p.vTi, n_tok ? w + p.vRow : nullptr, w + p.vcT, w + p.scratch,
                         w + p.cen8, w + p.cens, w + p.qmean, w + p.statsV,

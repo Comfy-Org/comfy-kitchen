@@ -28,6 +28,7 @@ __global__ __launch_bounds__(HD) void sol_producer_kernel(
     const __bf16* __restrict__ qw, const __bf16* __restrict__ kw,
     const float* __restrict__ kmean,   // [H, HD] stale (may be zeros)
     const float* __restrict__ vscale,  // [H, HD] stale V scale
+    const float* __restrict__ key_bias,  // [T] log2 key bias, or null
     int8_t* __restrict__ qi, float* __restrict__ qs, int8_t* __restrict__ ki,
     float2* __restrict__ ksb, int8_t* __restrict__ vT, int8_t* __restrict__ vRow,
     __bf16* __restrict__ vcT,
@@ -75,8 +76,8 @@ __global__ __launch_bounds__(HD) void sol_producer_kernel(
         ksum[(static_cast<size_t>(h) * NPAD + nblk) * HD + tid] = sk;
     }
     const size_t dst0 = static_cast<size_t>(h) * Tp + nblk * BLK;
-    quant_k_rows(sT, len, kmean + static_cast<size_t>(h) * HD, nullptr, ki + dst0 * HD,
-                 ksb + dst0);
+    quant_k_rows(sT, len, kmean + static_cast<size_t>(h) * HD,
+                 key_bias ? key_bias + tb0 : nullptr, ki + dst0 * HD, ksb + dst0);
     __syncthreads();
 
     // ---------------- V phase ----------------
@@ -120,7 +121,8 @@ __global__ __launch_bounds__(HD) void sol_producer_kernel(
 using namespace comfy::hip_backend::sol;
 
 void launch_sol_producer(const void* qkv, const void* fab, const void* qw, const void* kw,
-                         const void* kmean, const void* vscale, void* qi, void* qs, void* ki,
+                         const void* kmean, const void* vscale, const void* key_bias,
+                         void* qi, void* qs, void* ki,
                          void* ksb, void* vT, void* vRow, void* vcT, void* ksum, void* cen8,
                          void* cens,
                          void* qmean, void* vamax_next, const void* blen, float rope_eps, int rot,
@@ -132,7 +134,8 @@ void launch_sol_producer(const void* qkv, const void* fab, const void* qw, const
         static_cast<const __bf16*>(qkv), static_cast<const float*>(fab),
         static_cast<const __bf16*>(qw), static_cast<const __bf16*>(kw),
         static_cast<const float*>(kmean), static_cast<const float*>(vscale),
-        static_cast<int8_t*>(qi), static_cast<float*>(qs), static_cast<int8_t*>(ki),
+        static_cast<const float*>(key_bias), static_cast<int8_t*>(qi),
+        static_cast<float*>(qs), static_cast<int8_t*>(ki),
         static_cast<float2*>(ksb), static_cast<int8_t*>(vT), static_cast<int8_t*>(vRow),
         static_cast<__bf16*>(vcT),
         static_cast<float*>(ksum), static_cast<int8_t*>(cen8), static_cast<float*>(cens),

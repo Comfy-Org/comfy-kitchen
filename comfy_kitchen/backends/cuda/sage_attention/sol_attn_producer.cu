@@ -43,6 +43,7 @@ __global__ void sol_producer_kernel(
     const __nv_bfloat16* __restrict__ qw, const __nv_bfloat16* __restrict__ kw,
     const float* __restrict__ kmean,         // [H, HD] stale (may be zeros)
     const float* __restrict__ vscale,        // [H, HD] stale V scale (may be ~0 -> margin)
+    const float* __restrict__ key_bias,      // [T] log2 key bias, or null
     int8_t* __restrict__ qiP, float* __restrict__ qs,
     int8_t* __restrict__ kiP, float2* __restrict__ ksb,
     int8_t* __restrict__ vTi, int8_t* __restrict__ vRow, __nv_bfloat16* __restrict__ vcT,
@@ -91,7 +92,8 @@ __global__ void sol_producer_kernel(
         ksumP[((size_t)h * NPAD + nblk) * HD + tid] = sk;
     }
     const size_t dst0 = (size_t)h * Tp + nblk * BLK;
-    quant_k_rows(sT, len, kmean + (size_t)h * HD, nullptr, kiP + dst0 * HD, ksb + dst0);
+    quant_k_rows(sT, len, kmean + (size_t)h * HD,
+                 key_bias ? key_bias + tb0 : nullptr, kiP + dst0 * HD, ksb + dst0);
     __syncthreads();
 
     // ---------------- V phase ----------------
@@ -123,7 +125,7 @@ __global__ void sol_producer_kernel(
 
 void launch_sol_producer(
     const void* qkv, const void* fab, const void* qw, const void* kw,
-    const void* kmean, const void* vscale,
+    const void* kmean, const void* vscale, const void* key_bias,
     void* qiP, void* qs, void* kiP, void* ksb, void* vTi, void* vRow, void* vcT,
     void* ksumP, void* cen8, void* cens, void* qmean, void* vamax_next,
     const void* blen, float rope_eps, int rot,
@@ -134,7 +136,7 @@ void launch_sol_producer(
     sol_producer_kernel<<<dim3(nblocks, H), HD, 0, stream>>>(
         (const __nv_bfloat16*)qkv, (const float*)fab,
         (const __nv_bfloat16*)qw, (const __nv_bfloat16*)kw,
-        (const float*)kmean, (const float*)vscale,
+        (const float*)kmean, (const float*)vscale, (const float*)key_bias,
         (int8_t*)qiP, (float*)qs, (int8_t*)kiP, (float2*)ksb,
         (int8_t*)vTi, (int8_t*)vRow, (__nv_bfloat16*)vcT, (float*)ksumP,
         (int8_t*)cen8, (float*)cens, (float*)qmean, (float*)vamax_next,
