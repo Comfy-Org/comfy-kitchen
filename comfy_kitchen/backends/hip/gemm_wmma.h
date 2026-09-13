@@ -19,6 +19,8 @@
 #pragma once
 
 #include <atomic>
+#include <cstring>
+#include <type_traits>
 
 #include "mma.h"
 
@@ -51,6 +53,27 @@ struct TileStager {
     __forceinline__ __device__ void load(const uint8_t* __restrict__ src, int row0, int rows_total,
                                          int kbyte0, int kbytes) {
         const int tid = threadIdx.x;
+
+        // Block-uniform fast path. Interior tiles need no per-chunk bounds
+        // checks; only edge M/N tiles or a partial final K tile use the fallback.
+        const bool full_tile =
+            row0 + ROWS <= rows_total &&
+            kbyte0 + BKB <= kbytes;
+
+        if (full_tile) {
+            #pragma unroll
+            for (int i = 0; i < kPerThread; ++i) {
+                const int c = tid * kPerThread + i;
+                const int grow = row0 + c / kChunksPerRow;
+                const int gk = kbyte0 + (c % kChunksPerRow) * 16;
+
+                regs[i] = *reinterpret_cast<const uint4*>(
+                    src + static_cast<int64_t>(grow) * kbytes + gk);
+            }
+            return;
+        }
+
+        // Generic edge path.
         #pragma unroll
         for (int i = 0; i < kPerThread; ++i) {
             const int c = tid * kPerThread + i;
@@ -108,7 +131,7 @@ struct GemmOperandA<const uint8_t*> {
 // Epi is a functor: float operator()(int row, int col, float acc) const.
 template <typename Mma, typename Epi, typename OutT,
           int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN,
-          typename ASrc = const uint8_t*>
+          typename ASrc = const uint8_t*, int GROUP_M = 4>
 __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
     typename GemmOperandA<ASrc>::type A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
     int M, int N, int kbytes, int ldc, Epi epi) {
@@ -142,7 +165,7 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
     // Grouped block ordering for L2 locality: consecutive blocks advance along M
     // within a group of kGroupM block-rows, so concurrently resident blocks share
     // the same B columns.
-    constexpr int kGroupM = 4;
+    constexpr int kGroupM = GROUP_M;
     const int blocks_n = gridDim.x;
     const int blocks_m = gridDim.y;
     const int bid = blockIdx.y * blocks_n + blockIdx.x;
@@ -229,21 +252,110 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
 
     epi.init();
 
-    // Row-major writeback: the TN column tiles of one accumulator row cover
-    // TN*16 consecutive columns, keeping the stores of an iteration contiguous.
+    // Row-major writeback.
     const int col_lane = acc_col(lane);
-    #pragma unroll
-    for (int i = 0; i < TM; ++i) {
+
+    if constexpr (requires {
+        epi.row_scale(0);
+        epi.col_scale(0);
+        epi.bias_value(0);
+        epi.apply_cached(0.0f, 0.0f, 0.0f, 0.0f);
+    }) {
+        // EpiRowwise: each thread reuses only TN distinct output columns
+        // and TM*8 distinct output rows. Cache column scale/bias once and
+        // row scale once per accumulator row instead of per output element.
+        float col_scale[TN];
+        float col_bias[TN];
+
         #pragma unroll
-        for (int e = 0; e < 8; ++e) {
-            const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
-            if (r >= M) continue;
-            OutT* crow = C + static_cast<int64_t>(r) * ldc;
+        for (int j = 0; j < TN; ++j) {
+            const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
+            if (col < N) {
+                col_scale[j] = epi.col_scale(col);
+                col_bias[j] = epi.bias_value(col);
+            }
+        }
+
+        const bool full_output_tile =
+            (m0 + BM <= M) &&
+            (n0 + BN <= N);
+
+        if (full_output_tile) {
             #pragma unroll
-            for (int j = 0; j < TN; ++j) {
-                const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
-                if (col >= N) continue;
-                crow[col] = static_cast<OutT>(epi(r, col, Mma::get(acc[i][j], e)));
+            for (int i = 0; i < TM; ++i) {
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int r =
+                        m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
+
+                    const float sa = epi.row_scale(r);
+                    OutT* crow =
+                        C + static_cast<int64_t>(r) * ldc;
+
+                    #pragma unroll
+                    for (int j = 0; j < TN; ++j) {
+                        const int col =
+                            n0 + wn * (TN * 16) + j * 16 + col_lane;
+
+                        const float v = epi.apply_cached(
+                            Mma::get(acc[i][j], e),
+                            sa,
+                            col_scale[j],
+                            col_bias[j]
+                        );
+
+                        crow[col] = static_cast<OutT>(v);
+                    }
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int r =
+                        m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
+
+                    if (r >= M) continue;
+
+                    const float sa = epi.row_scale(r);
+                    OutT* crow =
+                        C + static_cast<int64_t>(r) * ldc;
+
+                    #pragma unroll
+                    for (int j = 0; j < TN; ++j) {
+                        const int col =
+                            n0 + wn * (TN * 16) + j * 16 + col_lane;
+
+                        if (col >= N) continue;
+
+                        const float v = epi.apply_cached(
+                            Mma::get(acc[i][j], e),
+                            sa,
+                            col_scale[j],
+                            col_bias[j]
+                        );
+
+                        crow[col] = static_cast<OutT>(v);
+                    }
+                }
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < TM; ++i) {
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
+                if (r >= M) continue;
+                OutT* crow = C + static_cast<int64_t>(r) * ldc;
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
+                    if (col >= N) continue;
+                    crow[col] =
+                        static_cast<OutT>(epi(r, col, Mma::get(acc[i][j], e)));
+                }
             }
         }
     }
@@ -275,6 +387,28 @@ inline int device_wgp_count() {
     return n;
 }
 
+// The __gfx*__ macros used by architecture_config.h exist only during device
+// compilation, while tile selection runs on the host. Query the current device
+// instead and cache the result per ordinal. A failed query conservatively keeps
+// the existing cross-architecture tile policy.
+inline bool device_is_gfx12() {
+    constexpr int kMaxDevices = 16;
+    // 0 = unknown, 1 = other/query failed, 2 = gfx12.
+    static std::atomic<int> cache[kMaxDevices] = {};
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDevices) return false;
+    int state = cache[dev].load(std::memory_order_relaxed);
+    if (state == 0) {
+        hipDeviceProp_t props{};
+        const bool is_gfx12 =
+            hipGetDeviceProperties(&props, dev) == hipSuccess &&
+            std::strncmp(props.gcnArchName, "gfx12", 5) == 0;
+        state = is_gfx12 ? 2 : 1;
+        cache[dev].store(state, std::memory_order_relaxed);
+    }
+    return state == 2;
+}
+
 // Pick and launch a tile for C[M, N] = A[M, K] @ B[N, K]^T, selecting on grid
 // coverage, K depth and warp grid. 128x128 has the best arithmetic intensity but
 // wastes the device when it yields fewer blocks than there are WGPs; BKB=128
@@ -295,6 +429,21 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
 
     if (!skinny && blocks_128 >= wgps) {
         if (kbytes >= 4096) {
+            if constexpr (std::is_same_v<Mma, MmaInt8>) {
+                // RDNA4 INT8 deep-K: balanced 128x256 tile reduces operand
+                // LDS traffic while GroupM=8 improves B-tile L2 locality.
+                if (device_is_gfx12()) {
+                    constexpr int BM = 128, BN = 256, BKB = 64;
+                    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+
+                    gemm_wmma_kernel<Mma, Epi, OutT,
+                                     BM, BN, BKB,
+                                     2, 4, 4, 4, ASrc, 8>
+                        <<<grid, 256, 0, stream>>>(
+                            A, B, C, M, N, kbytes, ldc, epi);
+                    return;
+                }
+            }
             constexpr int BM = 128, BN = 128, BKB = 128;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
             // With few blocks per WGP there is nothing to interleave across, so
