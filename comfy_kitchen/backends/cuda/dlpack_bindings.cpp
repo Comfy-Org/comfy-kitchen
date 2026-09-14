@@ -1541,7 +1541,8 @@ static void need_staging_layout(const nb::ndarray<nb::device::cuda>& a, const ch
         throw std::runtime_error(std::string(who) + ": " + what
             + " must have a contiguous last dim, a 16-byte aligned base and leading strides that are multiples of 8");
 }
-static void need_contiguous(const nb::ndarray<nb::device::cuda>& a, const char* who, const char* what) {
+template <typename A>
+static void need_contiguous(const A& a, const char* who, const char* what) {
     int64_t expect = 1;
     for (int i = (int)a.ndim() - 1; i >= 0; --i) {
         if (a.shape(i) > 1 && a.stride(i) != expect)
@@ -2073,21 +2074,17 @@ extern "C" {
         int out_dtype_code,
         cudaStream_t stream);
 
-    bool launch_gated_delta_decode(
-        const void* q,
-        const void* k,
-        const void* v,
-        const void* beta,
-        const void* g,
-        void* state,
-        void* out,
-        void* snapshots,
-        int64_t B,
-        int64_t H,
-        int64_t S,
-        int64_t DK,
-        int64_t DV,
-        cudaStream_t stream);
+    bool launch_gated_delta_decode_fused(
+        const void* mixed_qkv, const void* x, const void* w_a, const void* w_b,
+        const void* dt_bias, const void* g_decay, void* state, void* out, void* snapshots,
+        const void* z, const void* norm_w, float eps,
+        int64_t B, int64_t Hv, int64_t Hk, int64_t S, int64_t DK, int64_t DV, int64_t C, int64_t Hd,
+        int64_t key_dim, float scale, int dtype_code, cudaStream_t stream);
+
+    bool launch_deltanet_conv_step(
+        const void* proj, void* conv_state, const void* conv_w, const void* conv_b,
+        void* conv_out, void* conv_snaps,
+        int64_t B, int64_t C, int64_t S, int64_t KS, int dtype_code, cudaStream_t stream);
 
     bool launch_w4a8_codebook_gemv(
         const void* xq,
@@ -3706,48 +3703,100 @@ void flash_attention_decode(
         k.stride(0), k.stride(1), k.stride(2), reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
-bool gated_delta_decode(
-    nb::ndarray<float, nb::ndim<4>, nb::device::cuda> q,       // [B, S, H, DK]
-    nb::ndarray<float, nb::ndim<4>, nb::device::cuda> k,       // [B, S, H, DK]
-    nb::ndarray<float, nb::ndim<4>, nb::device::cuda> v,       // [B, S, H, DV]
-    nb::ndarray<float, nb::ndim<3>, nb::device::cuda> beta,    // [B, S, H]
-    nb::ndarray<float, nb::ndim<3>, nb::device::cuda> g,       // [B, S, H]
-    nb::ndarray<float, nb::ndim<4>, nb::device::cuda> state,   // [B, H, DK, DV]
-    nb::ndarray<float, nb::ndim<4>, nb::device::cuda> out,     // [B, S, H, DV]
-    std::optional<nb::ndarray<float, nb::ndim<5>, nb::device::cuda>> snapshots,  // [S-1, B, H, DK, DV]
-    uintptr_t stream_ptr) {
-    const int64_t B = q.shape(0), S = q.shape(1), H = q.shape(2), DK = q.shape(3);
-    const int64_t DV = v.shape(3);
-    if (k.shape(0) != B || k.shape(1) != S || k.shape(2) != H || k.shape(3) != DK
-        || v.shape(0) != B || v.shape(1) != S || v.shape(2) != H
-        || beta.shape(0) != B || beta.shape(1) != S || beta.shape(2) != H
-        || g.shape(0) != B || g.shape(1) != S || g.shape(2) != H
-        || state.shape(0) != B || state.shape(1) != H || state.shape(2) != DK || state.shape(3) != DV
-        || out.shape(0) != B || out.shape(1) != S || out.shape(2) != H || out.shape(3) != DV)
-        throw std::runtime_error("gated_delta_decode: shape mismatch");
+bool gated_delta_decode_fused(
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> mixed_qkv,      // [B, C, S] conv+silu output
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> x,              // [B, S, Hd]
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> w_a,            // [Hv, Hd]
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> w_b,            // [Hv, Hd]
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> dt_bias, // [Hv]
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> g_decay, // [Hv]
+    nb::ndarray<float, nb::ndim<4>, nb::device::cuda> state,   // [B, Hv, DK, DV]
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> out,            // [B, S, Hv, DV]
+    std::optional<nb::ndarray<float, nb::ndim<5>, nb::device::cuda>> snapshots,  // [S-1, B, Hv, DK, DV]
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> z,              // [B, S, Hv*DV] norm gate
+    nb::ndarray<nb::ndim<1>, nb::device::cuda> norm_w,         // [DV]
+    double eps,
+    int64_t key_dim, int64_t num_key_heads, double scale, uintptr_t stream_ptr) {
+    const char* who = "gated_delta_decode_fused";
+    const int64_t B = mixed_qkv.shape(0), C = mixed_qkv.shape(1), S = mixed_qkv.shape(2);
+    const int64_t Hv = state.shape(1), DK = state.shape(2), DV = state.shape(3);
+    const int64_t Hd = x.shape(2);
+    const int dtype_code = map_dtype_to_code(mixed_qkv.dtype());
+    if (dtype_code < 0 || dtype_code > 2 || map_dtype_to_code(x.dtype()) != dtype_code
+        || map_dtype_to_code(w_a.dtype()) != dtype_code || map_dtype_to_code(w_b.dtype()) != dtype_code
+        || map_dtype_to_code(out.dtype()) != dtype_code || map_dtype_to_code(z.dtype()) != dtype_code
+        || map_dtype_to_code(norm_w.dtype()) != dtype_code)
+        throw std::runtime_error(std::string(who) + ": mixed_qkv, x, w_a, w_b, z, norm_w and out must share a fp32/fp16/bf16 dtype");
+    if (x.shape(0) != B || x.shape(1) != S || w_a.shape(0) != Hv || w_a.shape(1) != Hd
+        || w_b.shape(0) != Hv || w_b.shape(1) != Hd || dt_bias.shape(0) != Hv || g_decay.shape(0) != Hv
+        || state.shape(0) != B || out.shape(0) != B || out.shape(1) != S || out.shape(2) != Hv || out.shape(3) != DV
+        || z.shape(0) != B || z.shape(1) != S || z.shape(2) != Hv * DV || norm_w.shape(0) != DV
+        || num_key_heads <= 0 || Hv % num_key_heads != 0 || C < 2 * key_dim + Hv * DV
+        || key_dim != num_key_heads * DK)
+        throw std::runtime_error(std::string(who) + ": shape mismatch");
+    need_contiguous(mixed_qkv, who, "mixed_qkv");
+    need_contiguous(x, who, "x");
+    need_contiguous(w_a, who, "w_a");
+    need_contiguous(w_b, who, "w_b");
+    need_contiguous(dt_bias, who, "dt_bias");
+    need_contiguous(g_decay, who, "g_decay");
+    need_contiguous(state, who, "state");
+    need_contiguous(out, who, "out");
+    need_contiguous(z, who, "z");
+    need_contiguous(norm_w, who, "norm_w");
+    void* snap_ptr = nullptr;
     if (snapshots.has_value() && S > 1) {
         auto& sn = *snapshots;
-        if (sn.shape(0) < S - 1 || sn.shape(1) != B || sn.shape(2) != H || sn.shape(3) != DK || sn.shape(4) != DV)
-            throw std::runtime_error("gated_delta_decode: snapshot shape mismatch");
-        if (sn.stride(4) != 1 || sn.stride(3) != DV || sn.stride(2) != DK * DV || sn.stride(1) != H * DK * DV)
-            throw std::runtime_error("gated_delta_decode: snapshots must be contiguous");
+        if (sn.shape(0) < S - 1 || sn.shape(1) != B || sn.shape(2) != Hv || sn.shape(3) != DK || sn.shape(4) != DV)
+            throw std::runtime_error(std::string(who) + ": snapshot shape mismatch");
+        need_contiguous(sn, who, "snapshots");
+        snap_ptr = sn.data();
     }
-    auto check_contig4 = [](auto& t, const char* name) {
-        if (t.stride(3) != 1 || t.stride(2) != t.shape(3) || t.stride(1) != t.shape(2) * t.shape(3)
-            || t.stride(0) != t.shape(1) * t.shape(2) * t.shape(3))
-            throw std::runtime_error(std::string("gated_delta_decode: ") + name + " must be contiguous");
-    };
-    check_contig4(q, "q");
-    check_contig4(k, "k");
-    check_contig4(v, "v");
-    check_contig4(state, "state");
-    check_contig4(out, "out");
-    if (beta.stride(2) != 1 || g.stride(2) != 1)
-        throw std::runtime_error("gated_delta_decode: beta/g must be contiguous");
-    return launch_gated_delta_decode(
-        q.data(), k.data(), v.data(), beta.data(), g.data(), state.data(), out.data(),
-        (snapshots.has_value() && S > 1) ? snapshots->data() : nullptr,
-        B, H, S, DK, DV, reinterpret_cast<cudaStream_t>(stream_ptr));
+    return launch_gated_delta_decode_fused(
+        mixed_qkv.data(), x.data(), w_a.data(), w_b.data(), dt_bias.data(), g_decay.data(),
+        state.data(), out.data(), snap_ptr, z.data(), norm_w.data(), static_cast<float>(eps),
+        B, Hv, num_key_heads, S, DK, DV, C, Hd, key_dim, static_cast<float>(scale), dtype_code,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+bool deltanet_conv_step(
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> proj,        // [B, S, C]
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> conv_state,  // [B, C, KS-1] in/out
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> conv_w,      // [C, KS]
+    std::optional<nb::ndarray<nb::ndim<1>, nb::device::cuda>> conv_b,  // [C]
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> conv_out,    // [B, C, S]
+    std::optional<nb::ndarray<nb::ndim<4>, nb::device::cuda>> conv_snaps,  // [S-1, B, C, KS-1]
+    uintptr_t stream_ptr) {
+    const char* who = "deltanet_conv_step";
+    const int64_t B = proj.shape(0), S = proj.shape(1), C = proj.shape(2);
+    const int64_t L = conv_state.shape(2), KS = conv_w.shape(1);
+    const int dtype_code = map_dtype_to_code(proj.dtype());
+    if (dtype_code < 0 || dtype_code > 2 || map_dtype_to_code(conv_state.dtype()) != dtype_code
+        || map_dtype_to_code(conv_w.dtype()) != dtype_code || map_dtype_to_code(conv_out.dtype()) != dtype_code
+        || (conv_b.has_value() && map_dtype_to_code(conv_b->dtype()) != dtype_code))
+        throw std::runtime_error(std::string(who) + ": all tensors must share a fp32/fp16/bf16 dtype");
+    if (conv_state.shape(0) != B || conv_state.shape(1) != C || L != KS - 1 || conv_w.shape(0) != C
+        || conv_out.shape(0) != B || conv_out.shape(1) != C || conv_out.shape(2) != S
+        || (conv_b.has_value() && conv_b->shape(0) != C))
+        throw std::runtime_error(std::string(who) + ": shape mismatch");
+    need_contiguous(proj, who, "proj");
+    need_contiguous(conv_state, who, "conv_state");
+    need_contiguous(conv_w, who, "conv_w");
+    need_contiguous(conv_out, who, "conv_out");
+    if (conv_b.has_value())
+        need_contiguous(*conv_b, who, "conv_b");
+    void* snaps = nullptr;
+    if (conv_snaps.has_value() && S > 1) {
+        auto& sn = *conv_snaps;
+        if (map_dtype_to_code(sn.dtype()) != dtype_code || sn.shape(0) < S - 1 || sn.shape(1) != B
+            || sn.shape(2) != C || sn.shape(3) != L)
+            throw std::runtime_error(std::string(who) + ": snapshots must be [>=S-1, B, C, KS-1] in the activation dtype");
+        need_contiguous(sn, who, "conv_snaps");
+        snaps = sn.data();
+    }
+    return launch_deltanet_conv_step(
+        proj.data(), conv_state.data(), conv_w.data(), conv_b.has_value() ? conv_b->data() : nullptr,
+        conv_out.data(), snaps, B, C, S, KS, dtype_code, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 NB_MODULE(_C, m) {
@@ -4323,11 +4372,17 @@ NB_MODULE(_C, m) {
           nb::arg("causal_t"), nb::arg("causal_h"), nb::arg("causal_w"),
           nb::arg("scale"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
 
-    m.def("gated_delta_decode", &gated_delta_decode,
-          "Fused GatedDeltaNet decode chain for short sequences",
-          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("beta"), nb::arg("g"),
+    m.def("gated_delta_decode_fused", &gated_delta_decode_fused,
+          "GatedDeltaNet decode with gate projections, gate math and q/k normalization folded in",
+          nb::arg("mixed_qkv"), nb::arg("x"), nb::arg("w_a"), nb::arg("w_b"), nb::arg("dt_bias"), nb::arg("g_decay"),
           nb::arg("state"), nb::arg("out"), nb::arg("snapshots") = nb::none(),
-          nb::arg("stream_ptr"));
+          nb::arg("z"), nb::arg("norm_w"), nb::arg("eps"),
+          nb::arg("key_dim"), nb::arg("num_key_heads"), nb::arg("scale"), nb::arg("stream_ptr"));
+
+    m.def("deltanet_conv_step", &deltanet_conv_step,
+          "Depthwise causal conv decode step with silu, in-place state update and rollback snapshots",
+          nb::arg("proj"), nb::arg("conv_state"), nb::arg("conv_w"), nb::arg("conv_b") = nb::none(),
+          nb::arg("conv_out"), nb::arg("conv_snaps") = nb::none(), nb::arg("stream_ptr"));
 
     m.def("sol_attn_plan", &sol_attn_plan_py,
           "Workspace dims, slot byte offsets and total bytes for this shape and token budget",
