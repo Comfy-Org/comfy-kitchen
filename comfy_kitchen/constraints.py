@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 import torch
+
+from .anemoi import resolve_options
 
 __all__ = [
     "DivisibleBy",
@@ -313,6 +316,74 @@ def sol_attn_common_call_rule(kwargs):
     token_aug = kwargs.get("token_aug") or 0
     if token_aug < 0 or token_aug > 256 or token_aug % 64:
         return ValidationResult.fail("token_aug", f"must be 0 or a multiple of 64 up to 256, got {token_aug}")
+    return ValidationResult.ok()
+
+
+def anemoi_attention_common_call_rule(kwargs):
+    """Shared shape and algorithm contract for Anemoi attention."""
+    q = kwargs.get("q")
+    if q is not None:
+        for name in ("k", "v"):
+            other = kwargs.get(name)
+            if other is None:
+                continue
+            if tuple(other.shape) != tuple(q.shape):
+                return ValidationResult.fail(
+                    name,
+                    f"must have the same shape as q {tuple(q.shape)}, got {tuple(other.shape)}",
+                )
+            if other.dtype != q.dtype:
+                return ValidationResult.fail(
+                    name, f"must have the same dtype as q ({q.dtype}), got {other.dtype}"
+                )
+            if other.device != q.device:
+                return ValidationResult.fail(
+                    name, f"must be on the same device as q ({q.device}), got {other.device}"
+                )
+        if q.dim() == 4:
+            if q.shape[0] != 1:
+                return ValidationResult.fail("q", f"batch size must be 1, got {q.shape[0]}")
+            if q.shape[-1] not in (64, 128):
+                return ValidationResult.fail("q", f"head_dim must be 64 or 128, got {q.shape[-1]}")
+            if q.shape[1] <= 0 or q.shape[2] <= 0:
+                return ValidationResult.fail("q", "sequence length and head count must be positive")
+            if q.shape[2] > 65535:
+                return ValidationResult.fail(
+                    "q", f"head count must fit CUDA grid.y (<= 65535), got {q.shape[2]}"
+                )
+
+    video_shape = kwargs.get("video_shape")
+    if not isinstance(video_shape, (list, tuple)) or len(video_shape) != 3:
+        return ValidationResult.fail("video_shape", "must contain [frames, height, width]")
+    if any(type(value) is not int or value <= 0 for value in video_shape):
+        return ValidationResult.fail("video_shape", "entries must be positive built-in integers")
+
+    prefix_tokens = kwargs.get("prefix_tokens", 0)
+    if type(prefix_tokens) is not int or prefix_tokens < 0:
+        return ValidationResult.fail("prefix_tokens", "must be a nonnegative built-in integer")
+    if q is not None and q.dim() == 4:
+        video_tokens = math.prod(video_shape)
+        if prefix_tokens >= q.shape[1] or video_tokens != q.shape[1] - prefix_tokens:
+            return ValidationResult.fail(
+                "video_shape",
+                "product must equal q sequence length minus prefix_tokens",
+            )
+
+    sparsity_ratio = kwargs.get("sparsity_ratio", 0.8)
+    if (
+        isinstance(sparsity_ratio, bool)
+        or not isinstance(sparsity_ratio, (int, float))
+        or not math.isfinite(float(sparsity_ratio))
+        or not 0.0 <= float(sparsity_ratio) < 1.0
+    ):
+        return ValidationResult.fail("sparsity_ratio", "must be finite and in [0, 1)")
+    option_names = ("query_block_size", "nvfp4_ratio", "int8_ratio", "mxfp8_ratio", "fp16_ratio",
+                    "prefix_kv_precision", "prefix_query_precision", "draftmap_proxy", "diag_jensen",
+                    "maxpool_weight", "enable_anchors", "smooth_k", "nvfp4_scales", "prefix_tokens")
+    try:
+        resolve_options(architecture="reference", **{name: kwargs[name] for name in option_names if name in kwargs})
+    except (TypeError, ValueError) as exc:
+        return ValidationResult.fail("options", str(exc))
     return ValidationResult.ok()
 
 

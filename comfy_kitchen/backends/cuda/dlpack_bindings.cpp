@@ -3616,7 +3616,14 @@ void flash_attention_decode(
         k.stride(0), k.stride(1), k.stride(2), reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
+#ifdef COMFY_ANEMOI_SHARED
+void register_anemoi(nb::module_&);
+#endif
+
 NB_MODULE(_C, m) {
+#ifdef COMFY_ANEMOI_SHARED
+    register_anemoi(m);
+#endif
     m.doc() = "comfy_kitchen CUDA kernels - nanobind + DLPack interface (NO PyTorch C++ dependencies)";
     
     m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8,

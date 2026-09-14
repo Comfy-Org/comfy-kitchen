@@ -70,6 +70,8 @@ __all__ = [
     "sol_attn",
     "sol_attn_chunked",
     "sol_attn_is_available",
+    "anemoi_attention",
+    "anemoi_attention_is_available",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -134,6 +136,78 @@ __all__ = [
 # =============================================================================
 # Public API Functions
 # =============================================================================
+
+
+def anemoi_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    video_shape: tuple[int, int, int],
+    prefix_tokens: int = 0,
+    sparsity_ratio: float = 0.8,
+    query_block_size: int = 64,
+    nvfp4_ratio: float = 0.0,
+    int8_ratio: float = 1.0,
+    mxfp8_ratio: float = 0.0,
+    fp16_ratio: float = 0.0,
+    prefix_kv_precision: str = "auto",
+    prefix_query_precision: str = "auto",
+    draftmap_proxy: str = "mean",
+    diag_jensen: bool = False,
+    maxpool_weight: float = 0.0,
+    enable_anchors: bool = False,
+    smooth_k: bool = False,
+    nvfp4_scales: tuple[float, float, float] = (1.0, 1.0, 1.0),
+) -> torch.Tensor:
+    """Run Anemoi multi-precision DraftMap sparse self-attention.
+
+    Inputs are equal-shaped BTHD FP16/BF16 tensors with batch size one.
+    The SM89 kernel set (every capability from SM89 up to but excluding SM120)
+    supports head dimensions 64/128 with INT8-QK/E4M3-V plus FP16; SM120
+    supports head dimension 128 and NVFP4, INT8/E4M3, MXFP8, FP16.
+    Both support query blocks of 64 or 128 and physical K64 blocks.
+    INT8 and MXFP8 are alternative middle phases and cannot be combined.
+
+    ``video_shape=(frames,height,width)`` describes tokens after the prefix.
+    The retained global video-pair budget is apportioned by the four precision
+    ratios (nonnegative, summing to one); prefix K/V is always retained.
+    Prefix query precision and prefix K/V precision are selected independently.
+    K-tail R1/R2 is SM120 Q64 only. Smooth-K is SM89-only kernels.
+
+    Execution outside the native backends — CPU, accelerators without a native
+    implementation, GPUs without compiled kernels, or an explicit backend
+    override — is a full-precision reference, not a quantization emulator.
+    Use :func:`anemoi_attention_is_available` to check native availability.
+    """
+    return torch.ops.comfy_kitchen.anemoi_attention(
+        q,
+        k,
+        v,
+        list(video_shape),
+        prefix_tokens,
+        sparsity_ratio,
+        query_block_size,
+        nvfp4_ratio,
+        int8_ratio,
+        mxfp8_ratio,
+        fp16_ratio,
+        prefix_kv_precision,
+        prefix_query_precision,
+        draftmap_proxy,
+        diag_jensen,
+        maxpool_weight,
+        enable_anchors,
+        smooth_k,
+        list(nvfp4_scales),
+    )
+
+
+def anemoi_attention_is_available(device: torch.device | int | None = None) -> bool:
+    """Whether the complete native Anemoi backend is built for this GPU."""
+    from .backends.cuda import anemoi_attention_is_available as is_available
+
+    return registry.is_available("cuda") and is_available(device)
 
 
 def sol_attn(
