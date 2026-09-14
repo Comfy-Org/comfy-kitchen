@@ -40,14 +40,14 @@ std::vector<int64_t> sm120_q64_mxfp8_kernel_metadata() {
   constexpr int kDynamicSmemBytes = 32768;
   auto kernel =
       mpa::attention::mixed_attention_sm120_q64_kernel<128, true, true, false>;
-  C10_CUDA_CHECK(cudaFuncSetAttribute(
+  ANEMOI_SM120_CUDA_CHECK(cudaFuncSetAttribute(
       kernel,
       cudaFuncAttributeMaxDynamicSharedMemorySize,
       kDynamicSmemBytes));
   cudaFuncAttributes attributes{};
-  C10_CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
+  ANEMOI_SM120_CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
   int active_ctas = 0;
-  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+  ANEMOI_SM120_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &active_ctas,
       kernel,
       kThreads,

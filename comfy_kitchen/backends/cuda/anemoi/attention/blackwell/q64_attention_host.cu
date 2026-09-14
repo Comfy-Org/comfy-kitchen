@@ -10,8 +10,10 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <initializer_list>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 
 #include "attention_api.h"
 using namespace anemoi_sm120;
@@ -1030,19 +1032,28 @@ void three_phase_forward(
   static_assert(QueryBlock == 64 || QueryBlock == 128);
   for (const auto& item : {
            std::pair<const TensorView*, const char*>(&q4, "q4"),
-           {&q4_scale, "q4_scale"}, {&k4, "k4"},
-           {&k4_scale, "k4_scale"}, {&v4, "v4"},
-           {&v4_scale, "v4_scale"}, {&q8, "q8"},
-           {&q8_scale, "q8_scale"}, {&k8, "k8"},
-           {&k8_scale, "k8_scale"}, {&v8, "v8"},
-           {&v8_scale, "v8_scale"}, {&q16, "q16"},
-           {&k16, "k16"}, {&v16, "v16"},
-           {&block_ids, "block_ids"}, {&nvfp4_counts, "nvfp4_counts"},
-           {&middle_counts, "middle_counts"}, {&fp16_counts, "fp16_counts"},
-           {&valid_k_counts, "valid_k_counts"},
-           {&q_global_scale, "q_global_scale"},
-           {&k_global_scale, "k_global_scale"},
-           {&v_global_scale, "v_global_scale"}}) {
+           std::pair<const TensorView*, const char*>(&q4_scale, "q4_scale"),
+           std::pair<const TensorView*, const char*>(&k4, "k4"),
+           std::pair<const TensorView*, const char*>(&k4_scale, "k4_scale"),
+           std::pair<const TensorView*, const char*>(&v4, "v4"),
+           std::pair<const TensorView*, const char*>(&v4_scale, "v4_scale"),
+           std::pair<const TensorView*, const char*>(&q8, "q8"),
+           std::pair<const TensorView*, const char*>(&q8_scale, "q8_scale"),
+           std::pair<const TensorView*, const char*>(&k8, "k8"),
+           std::pair<const TensorView*, const char*>(&k8_scale, "k8_scale"),
+           std::pair<const TensorView*, const char*>(&v8, "v8"),
+           std::pair<const TensorView*, const char*>(&v8_scale, "v8_scale"),
+           std::pair<const TensorView*, const char*>(&q16, "q16"),
+           std::pair<const TensorView*, const char*>(&k16, "k16"),
+           std::pair<const TensorView*, const char*>(&v16, "v16"),
+           std::pair<const TensorView*, const char*>(&block_ids, "block_ids"),
+           std::pair<const TensorView*, const char*>(&nvfp4_counts, "nvfp4_counts"),
+           std::pair<const TensorView*, const char*>(&middle_counts, "middle_counts"),
+           std::pair<const TensorView*, const char*>(&fp16_counts, "fp16_counts"),
+           std::pair<const TensorView*, const char*>(&valid_k_counts, "valid_k_counts"),
+           std::pair<const TensorView*, const char*>(&q_global_scale, "q_global_scale"),
+           std::pair<const TensorView*, const char*>(&k_global_scale, "k_global_scale"),
+           std::pair<const TensorView*, const char*>(&v_global_scale, "v_global_scale")}) {
     check_cuda_contiguous(*item.first, item.second);
     check_same_device(*item.first, q16, item.second);
   }
