@@ -10,7 +10,6 @@ from functools import lru_cache
 from typing import Any
 
 import torch
-import torch._dynamo
 
 logger = logging.getLogger(__name__)
 
