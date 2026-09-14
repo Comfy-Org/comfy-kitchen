@@ -373,7 +373,7 @@ def test_native_availability_without_cuda():
         assert not ck.anemoi_attention_is_available()
 
 
-@pytest.mark.parametrize("capability", [(8, 9), (12, 0), (9, 0)])
+@pytest.mark.parametrize("capability", [(8, 8), (8, 9), (9, 0), (10, 0), (11, 8), (12, 0)])
 def test_availability_requires_native_plan_and_architecture(monkeypatch, capability):
     from types import SimpleNamespace
 
@@ -385,10 +385,10 @@ def test_availability_requires_native_plan_and_architecture(monkeypatch, capabil
     extension = SimpleNamespace(
         anemoi=object(),
         anemoi_plan=object(),
-        anemoi_supports_arch=lambda arch: arch in (89, 120),
+        anemoi_supports_arch=lambda arch: arch in (89, 90, 100, 118, 120),
     )
     monkeypatch.setattr(cuda, "_C", extension, raising=False)
-    assert cuda.anemoi_attention_is_available() == (capability in ((8, 9), (12, 0)))
+    assert cuda.anemoi_attention_is_available() == (capability >= (8, 9))
     del extension.anemoi_plan
     assert not cuda.anemoi_attention_is_available()
 
@@ -398,7 +398,7 @@ def test_availability_requires_native_plan_and_architecture(monkeypatch, capabil
 
 native = pytest.mark.skipif(
     not ck.anemoi_attention_is_available(),
-    reason="complete native Anemoi extension and SM89/SM120 GPU required",
+    reason="complete native Anemoi extension and an SM89-or-newer GPU required",
 )
 
 

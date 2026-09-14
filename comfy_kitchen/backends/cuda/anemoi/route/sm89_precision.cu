@@ -34,7 +34,7 @@ route_precision_impl(
     int64_t n4_value,
     std::optional<anemoi_native::Tensor> anchors,
     std::optional<anemoi_native::Tensor> anchor_ids,
-    int64_t anchor_count_value, int required_major, int required_minor) {
+    int64_t anchor_count_value) {
   ANEMOI_CHECK(
       probability.is_cuda() &&
           probability.is_contiguous() &&
@@ -101,8 +101,8 @@ route_precision_impl(
   const auto device_properties = assembly_route_draft_native::device_properties(probability.device());
   const cudaDeviceProp* properties = &device_properties;
   ANEMOI_CHECK(
-      properties->major == required_major && properties->minor == required_minor,
-      "native H3 route requires sm_", required_major, required_minor);
+      anemoi_native::ada_serves_device(properties),
+      "native H3 route serves SM89 to SM119");
 
   const int segment_items = static_cast<int>(segment_items_value);
   const int segments = static_cast<int>(segments_value);
@@ -297,7 +297,7 @@ sm89_h3_route_precision(
     std::optional<anemoi_native::Tensor> anchors,
     std::optional<anemoi_native::Tensor> anchor_ids, int64_t anchor_count) {
   return route_precision_impl(probability, n16, n8, n4, anchors, anchor_ids,
-                              anchor_count, 8, 9);
+                              anchor_count);
 }
 
 std::tuple<anemoi_native::Tensor, anemoi_native::Tensor, anemoi_native::Tensor, anemoi_native::Tensor>
@@ -308,8 +308,8 @@ sm89_h3_materialize_route(
     bool prefix_first, bool has_high) {
   assembly_route_draft_native::DeviceGuard device_guard(logical_ids.device());
   const auto properties = assembly_route_draft_native::device_properties(logical_ids.device());
-  ANEMOI_CHECK(properties.major == 8 && properties.minor == 9,
-               "native H3 materialization requires sm89");
+  ANEMOI_CHECK(anemoi_native::ada_serves_device(&properties),
+               "native H3 materialization serves SM89 to SM119");
   return materialize_route_impl<true>(logical_ids, low_counts, middle_counts,
       high_counts, query_block_size, prefix_blocks, prefix_phase, prefix_first, has_high);
 }
@@ -325,7 +325,7 @@ int64_t anemoi_native::sm89_route_workspace_bytes(
   ANEMOI_CHECK(segments <= kMaxSegments && items <= std::numeric_limits<int>::max(),
                "route geometry exceeds CUB int32 range");
   anemoi_native::cuda::CUDAGuard guard(device);
-  anemoi_native::require_sm89();
+  anemoi_native::require_ada_gpu();
   cub::DoubleBuffer<uint32_t> keys(nullptr, nullptr);
   cub::DoubleBuffer<int> values(nullptr, nullptr);
   size_t bytes = 0;

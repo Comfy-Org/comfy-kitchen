@@ -31,7 +31,7 @@ inline cudaDeviceProp device_properties(int device) {
   return *anemoi_native::cuda::deviceProperties(device);
 }
 inline bool shared_device(const cudaDeviceProp* p) {
-  return (p->major == 8 && p->minor == 9) ||
+  return anemoi_native::ada_serves_device(p) ||
          (p->major == 12 && p->minor == 0);
 }
 inline std::vector<int64_t> shape(const anemoi_native::Tensor& tensor) {

@@ -248,10 +248,16 @@ inline const cudaDeviceProp *getCurrentDeviceProperties() {
   return deviceProperties(d);
 }
 } // namespace cuda
-inline void require_sm89() {
-  auto p = cuda::getCurrentDeviceProperties();
-  check(p->major == 8 && p->minor == 9,
-        "Anemoi attention requires exact SM89 (8.9)");
+// The Ada (SM89) kernel set serves every capability in [89, 120); SM120+
+// devices use the Blackwell kernels.
+inline bool ada_serves_device(const cudaDeviceProp *properties) {
+  int architecture = properties->major * 10 + properties->minor;
+  return architecture >= 89 && architecture < 120;
+}
+inline void require_ada_gpu() {
+  auto properties = cuda::getCurrentDeviceProperties();
+  check(ada_serves_device(properties),
+        "Anemoi Ada kernels serve SM89 to SM119 (SM120+ uses the Blackwell kernels)");
 }
 } // namespace anemoi_native
 #define ANEMOI_CHECK(...) ::anemoi_native::check(__VA_ARGS__)

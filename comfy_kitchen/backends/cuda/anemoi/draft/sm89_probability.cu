@@ -116,8 +116,6 @@ anemoi_native::Tensor h3_draft_probability_impl(
     std::optional<anemoi_native::Tensor> q_max_pool_optional,
     std::optional<anemoi_native::Tensor> k_max_pool_optional,
     double maxpool_weight,
-    int required_major,
-    int required_minor,
     const char* operation_name) {
   ANEMOI_CHECK(
       std::isfinite(maxpool_weight) && maxpool_weight >= 0.0 &&
@@ -158,14 +156,9 @@ anemoi_native::Tensor h3_draft_probability_impl(
   const auto device_properties = assembly_route_draft_native::device_properties(q_pool.device());
   const cudaDeviceProp* properties = &device_properties;
   ANEMOI_CHECK(
-      properties->major == required_major && properties->minor == required_minor,
+      anemoi_native::ada_serves_device(properties),
       operation_name,
-      " requires sm_",
-      required_major,
-      required_minor,
-      ", found sm_",
-      properties->major,
-      properties->minor);
+      " serves SM89 to SM119 (SM120+ uses the Blackwell kernels)");
 
   const int64_t rows = q_pool.size(2);
   const int64_t output_head_stride = checked_positive_product(
@@ -241,5 +234,5 @@ anemoi_native::Tensor sm89_h3_draft_probability(
     double maxpool_weight) {
   return h3_draft_probability_impl(
       std::move(q_pool), std::move(k_pool), std::move(q_max_pool), std::move(k_max_pool),
-      maxpool_weight, 8, 9, "sm89_h3_draft_probability");
+      maxpool_weight, "sm89_h3_draft_probability");
 }

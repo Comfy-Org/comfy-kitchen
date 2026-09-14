@@ -578,8 +578,8 @@ quantize_permuted_v_fp8_h3_vpartials(
   const cudaDeviceProp* properties =
       anemoi_native::cuda::getCurrentDeviceProperties();
   ANEMOI_CHECK(
-      properties->major == 8 && properties->minor == 9,
-      "private H3 V-partial quantization requires SM89");
+      anemoi_native::ada_serves_device(properties),
+      "private H3 V-partial quantization serves SM89 to SM119");
   auto value_fp8 = anemoi_native::empty(
       permuted_value.sizes(),
       permuted_value.options().dtype(anemoi_native::ScalarType::Float8_e4m3fn));
@@ -638,8 +638,8 @@ quantize_packed_v_fp8_h3_vpartials(
   const cudaDeviceProp* properties =
       anemoi_native::cuda::getCurrentDeviceProperties();
   ANEMOI_CHECK(
-      properties->major == 8 && properties->minor == 9,
-      "private packed-H3 V-partial quantization requires SM89");
+      anemoi_native::ada_serves_device(properties),
+      "private packed-H3 V-partial quantization serves SM89 to SM119");
   auto value_fp8 = anemoi_native::empty(
       {kH3Batch, kH3Heads, kH3HeadDim, kH3VirtualTokens},
       packed_value.options().dtype(anemoi_native::ScalarType::Float8_e4m3fn));

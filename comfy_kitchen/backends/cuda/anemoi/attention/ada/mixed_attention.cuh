@@ -809,7 +809,7 @@ void MPA_ATTENTION_LAUNCH_ENTRY(
     uint32_t num_kv_heads,
     float softmax_scale,
     cudaStream_t stream) {
-  anemoi_native::require_sm89();
+  anemoi_native::require_ada_gpu();
   constexpr uint32_t low_smem_bytes =
       HasFp8 ? (mpa::attention::kCtaQ + 2 * mpa::attention::kCtaK) *
                    HeadDim
