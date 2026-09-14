@@ -101,7 +101,7 @@ cublasHandle_t draft_handle(cudaStream_t stream) {
   return handle;
 }
 
-template <int TailCount>
+template <int TailCount, int HeadDim>
 __global__ __launch_bounds__(kKTailThreads) void k_tail_descriptor_kernel(
     const half* __restrict__ k_pool,
     const half* __restrict__ packed_k,
@@ -114,10 +114,10 @@ __global__ __launch_bounds__(kKTailThreads) void k_tail_descriptor_kernel(
   const int64_t packed_blocks = prefix_blocks + blocks;
   const int64_t packed_block =
       (head_block / blocks) * packed_blocks + prefix_blocks + logical_block;
-  const int64_t mean_base = head_block * kKTailHeadDim;
-  const int64_t packed_base = packed_block * kKTailTokens * kKTailHeadDim;
+  const int64_t mean_base = head_block * HeadDim;
+  const int64_t packed_base = packed_block * kKTailTokens * HeadDim;
   const int64_t descriptor_base =
-      head_block * (TailCount + 1) * kKTailHeadDim;
+      head_block * (TailCount + 1) * HeadDim;
   const int count = valid_counts[logical_block];
   const int warp = threadIdx.x / kWarpSize;
   const int lane = threadIdx.x % kWarpSize;
@@ -130,10 +130,10 @@ __global__ __launch_bounds__(kKTailThreads) void k_tail_descriptor_kernel(
     float distance = 0.0f;
     if (token < count) {
 #pragma unroll
-      for (int element = 0; element < 4; ++element) {
-        const int channel = lane * 4 + element;
+      for (int element = 0; element < HeadDim / kWarpSize; ++element) {
+        const int channel = lane * (HeadDim / kWarpSize) + element;
         const float delta =
-            __half2float(packed_k[packed_base + token * kKTailHeadDim + channel]) -
+            __half2float(packed_k[packed_base + token * HeadDim + channel]) -
             __half2float(k_pool[mean_base + channel]);
         distance += delta * delta;
       }
@@ -173,14 +173,14 @@ __global__ __launch_bounds__(kKTailThreads) void k_tail_descriptor_kernel(
   }
   __syncthreads();
 
-  if (threadIdx.x < kKTailHeadDim) {
+  if (threadIdx.x < HeadDim) {
     const int channel = threadIdx.x;
     descriptors[descriptor_base + channel] = k_pool[mean_base + channel];
-    descriptors[descriptor_base + kKTailHeadDim + channel] =
-        packed_k[packed_base + extremes[0] * kKTailHeadDim + channel];
+    descriptors[descriptor_base + HeadDim + channel] =
+        packed_k[packed_base + extremes[0] * HeadDim + channel];
     if constexpr (TailCount == 2) {
-      descriptors[descriptor_base + 2 * kKTailHeadDim + channel] =
-          packed_k[packed_base + extremes[1] * kKTailHeadDim + channel];
+      descriptors[descriptor_base + 2 * HeadDim + channel] =
+          packed_k[packed_base + extremes[1] * HeadDim + channel];
     }
   }
 }
@@ -299,20 +299,20 @@ void launch_draft_gemm(
       query_rows, key_rows, head_dim, handle), "Draft cublasGemmStridedBatchedEx");
 }
 
-template <int TailCount>
+template <int TailCount, int HeadDim>
 void launch_k_tail_impl(
     const void* q, const void* k, const void* packed_k,
     const int32_t* valid_counts, void* out, void* descriptors,
     void* expanded_logits, int64_t B, int64_t Hq, int64_t Hkv,
     int64_t R, int64_t prefix, int64_t descriptor_blocks,
     int64_t probability_rows, cublasHandle_t handle, cudaStream_t stream) {
-  k_tail_descriptor_kernel<TailCount><<<
+  k_tail_descriptor_kernel<TailCount, HeadDim><<<
       static_cast<unsigned int>(descriptor_blocks), kKTailThreads, 0, stream>>>(
       static_cast<const half*>(k), static_cast<const half*>(packed_k),
       valid_counts, static_cast<half*>(descriptors), R, prefix);
   check_cuda(cudaGetLastError(), "K-tail descriptor kernel launch");
   launch_draft_gemm(q, descriptors, expanded_logits, B, Hq, Hkv,
-                    R, R * (TailCount + 1), kKTailHeadDim, handle);
+                    R, R * (TailCount + 1), HeadDim, handle);
   k_tail_probability_kernel<TailCount><<<
       static_cast<unsigned int>(probability_rows), kSoftmaxThreads, 0, stream>>>(
       static_cast<const half*>(expanded_logits), valid_counts,
@@ -360,12 +360,14 @@ void launch_k_tail_probability(
     const void* q, const void* k, const void* packed_k,
     const int32_t* valid_counts, void* out, void* descriptors,
     void* expanded_logits, int64_t B, int64_t Hq, int64_t Hkv,
-    int64_t R, int64_t prefix, int tail, cudaStream_t stream) {
+    int64_t R, int64_t prefix, int tail, int64_t head_dim, cudaStream_t stream) {
   require(tail == 1 || tail == 2, "K-tail tail must be 1 or 2");
   require(q && k && packed_k && valid_counts && out && descriptors && expanded_logits,
           "K-tail input/output/workspace pointers must be non-null");
+  require(head_dim == 64 || head_dim == 128,
+          "K-tail requires matching head dimensions in {64,128}");
   const int64_t expanded_rows = checked_positive_product(R, tail + 1, "K-tail expanded rows");
-  validate_gemm(B, Hq, Hkv, R, expanded_rows, kKTailHeadDim);
+  validate_gemm(B, Hq, Hkv, R, expanded_rows, head_dim);
   require(prefix >= 0 && prefix <= std::numeric_limits<int64_t>::max() - R,
           "K-tail prefix must be nonnegative and prefix+R must fit int64");
   const int64_t kv_heads = checked_positive_product(B, Hkv, "K-tail B*Hkv");
@@ -375,19 +377,27 @@ void launch_k_tail_probability(
   require(descriptor_blocks <= kMaxGridX && probability_rows <= kMaxGridX,
           "K-tail grid.x exceeds CUDA limit");
   const int64_t packed_tokens = checked_positive_product(prefix + R, kKTailTokens, "K-tail packed tokens");
-  check_half_extent(kv_heads, packed_tokens, kKTailHeadDim, "K-tail packed K bytes");
-  check_half_extent(kv_heads, R, kKTailHeadDim, "K-tail pooled K bytes");
+  check_half_extent(kv_heads, packed_tokens, head_dim, "K-tail packed K bytes");
+  check_half_extent(kv_heads, R, head_dim, "K-tail pooled K bytes");
   check_half_extent(q_heads, R, R, "K-tail probability bytes");
   checked_positive_product(R, sizeof(int32_t), "K-tail valid_counts bytes");
   const auto handle = draft_handle(stream);
-  if (tail == 1) {
-    launch_k_tail_impl<1>(q, k, packed_k, valid_counts, out, descriptors,
-                         expanded_logits, B, Hq, Hkv, R, prefix,
-                         descriptor_blocks, probability_rows, handle, stream);
+  const auto launch = [&](auto head_dim_tag) {
+    constexpr int HeadDim = decltype(head_dim_tag)::value;
+    if (tail == 1) {
+      launch_k_tail_impl<1, HeadDim>(q, k, packed_k, valid_counts, out, descriptors,
+                           expanded_logits, B, Hq, Hkv, R, prefix,
+                           descriptor_blocks, probability_rows, handle, stream);
+    } else {
+      launch_k_tail_impl<2, HeadDim>(q, k, packed_k, valid_counts, out, descriptors,
+                           expanded_logits, B, Hq, Hkv, R, prefix,
+                           descriptor_blocks, probability_rows, handle, stream);
+    }
+  };
+  if (head_dim == 64) {
+    launch(std::integral_constant<int, 64>{});
   } else {
-    launch_k_tail_impl<2>(q, k, packed_k, valid_counts, out, descriptors,
-                         expanded_logits, B, Hq, Hkv, R, prefix,
-                         descriptor_blocks, probability_rows, handle, stream);
+    launch(std::integral_constant<int, 128>{});
   }
 }
 

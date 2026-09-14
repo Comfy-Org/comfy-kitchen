@@ -11,3 +11,10 @@ template void launch_mixed_attention_sm120_q128_fp16<128, false, true, false>(
     int32_t*, int32_t*, int32_t*, int32_t*, uint8_t*, uint8_t*, uint8_t*,
     const int32_t*, float*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
     uint32_t, uint32_t, float, cudaStream_t);
+
+// D64 uses the same phase implementation with half the channels.
+template void launch_mixed_attention_sm120_q128_fp16<64, false, true, false>(
+    int8_t*, int8_t*, __nv_fp8_e4m3*, half*, half*, half*, half*, half*,
+    int32_t*, int32_t*, int32_t*, int32_t*, uint8_t*, uint8_t*, uint8_t*,
+    const int32_t*, float*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    uint32_t, uint32_t, float, cudaStream_t);

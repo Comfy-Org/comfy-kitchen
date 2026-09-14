@@ -1,6 +1,8 @@
 /* Project-owned Q64/Q128 NVFP4 preparation for already-packed FP16 QKV.
  * CUDA device code retained from the nested Anemoi repository at
- * 4e85afba741bdeaf2d9486cab19cb76d3e7985a4; allocation-free host port.
+ * 4e85afba741bdeaf2d9486cab19cb76d3e7985a4, updated through
+ * 1765573bea31159adba32165770d19171d5153bd (D64/D128 shared phase and
+ * preparation specializations); allocation-free host port.
  * Donor: csrc/attention/cuda/sm120/q128_microscaling_preparation.cu.
  */
 #include "preparation.h"
@@ -104,20 +106,21 @@ __device__ __forceinline__ uint8_t encode_e4m3(float value, uint8_t scale) {
       __fdiv_rn(value, dequant), __NV_SATFINITE, __NV_E4M3);
 }
 
+template <int HeadDim>
 __global__ void prepare_mxfp8_qk_kernel(
     const half* input, uint8_t* data, uint8_t* scales, int64_t rows) {
   const int64_t row = blockIdx.x;
   const int channel = threadIdx.x;
   if (row >= rows) return;
-  constexpr int head_dim = 128;
-  const float value = __half2float(input[row * head_dim + channel]);
+  const float value = __half2float(input[row * HeadDim + channel]);
   const uint8_t scale = encode_e8m0(subgroup_max32(fabsf(value)));
   if ((channel & 31) == 0) {
-    scales[row * (head_dim / 32) + channel / 32] = scale;
+    scales[row * (HeadDim / 32) + channel / 32] = scale;
   }
-  data[row * head_dim + channel] = encode_e4m3(value, scale);
+  data[row * HeadDim + channel] = encode_e4m3(value, scale);
 }
 
+template <int HeadDim>
 __global__ void prepare_mxfp8_v_kernel(
     const half* value,
     uint8_t* data,
@@ -128,13 +131,12 @@ __global__ void prepare_mxfp8_v_kernel(
   const int64_t head = blockIdx.y;
   const int64_t batch = blockIdx.z;
   const int channel = threadIdx.x;
-  constexpr int head_dim = 128;
   constexpr int stage_tokens = 64;
   const int64_t bh = batch * heads + head;
-  const half* source = value + bh * tokens * head_dim;
-  uint8_t* destination = data + (bh * head_dim + channel) * tokens;
+  const half* source = value + bh * tokens * HeadDim;
+  uint8_t* destination = data + (bh * HeadDim + channel) * tokens;
   uint8_t* scale_record = scales +
-      (bh * (tokens / stage_tokens) + stage) * (head_dim * 2);
+      (bh * (tokens / stage_tokens) + stage) * (HeadDim * 2);
 #pragma unroll
   for (int group = 0; group < 2; ++group) {
     half values[32];
@@ -142,7 +144,7 @@ __global__ void prepare_mxfp8_v_kernel(
 #pragma unroll
     for (int token = 0; token < 32; ++token) {
       const int row = stage * stage_tokens + group * 32 + token;
-      values[token] = source[row * head_dim + channel];
+      values[token] = source[row * HeadDim + channel];
       amax = fmaxf(amax, fabsf(__half2float(values[token])));
     }
     const uint8_t scale = encode_e8m0(amax);
@@ -165,7 +167,7 @@ __global__ void prepare_mxfp8_v_kernel(
 // Localized from SageAttention3 d1a57a5 scaled_fp4_quant_permute.  The
 // involutive K32 permutation makes QK C fragments directly usable as PV A
 // fragments; Q remains natural because Anemoi loads it straight into registers.
-template <bool PermuteTokens>
+template <bool PermuteTokens, int HeadDim>
 __global__ void prepare_nvfp4_qk_kernel(
     const half* input,
     uint8_t* data,
@@ -175,7 +177,6 @@ __global__ void prepare_nvfp4_qk_kernel(
   const int64_t row = blockIdx.x;
   const int channel = threadIdx.x * 2;
   if (row >= rows) return;
-  constexpr int head_dim = 128;
   int64_t source_row = row;
   if constexpr (PermuteTokens) {
     const int64_t local = row & 31;
@@ -183,18 +184,19 @@ __global__ void prepare_nvfp4_qk_kernel(
         ((local % 8) / 2) * 8 + local % 2;
   }
   const half2 values = *reinterpret_cast<const half2*>(
-      input + source_row * head_dim + channel);
+      input + source_row * HeadDim + channel);
   const float2 pair = __half22float2(values);
   const float amax = subgroup_max8(fmaxf(fabsf(pair.x), fabsf(pair.y)));
   const uint8_t scale = nv_scale_bits(amax, global_scale[0]);
   if ((threadIdx.x & 7) == 0) {
-    scales[row * (head_dim / 16) + channel / 16] = scale;
+    scales[row * (HeadDim / 16) + channel / 16] = scale;
   }
   const float dequant = decode_e4m3(scale) * global_scale[0];
-  data[row * (head_dim / 2) + threadIdx.x] =
+  data[row * (HeadDim / 2) + threadIdx.x] =
       encode_e2m1_pair(pair.x, pair.y, dequant);
 }
 
+template <int HeadDim>
 __global__ void prepare_nvfp4_v_kernel(
     const half* value,
     uint8_t* data,
@@ -206,15 +208,14 @@ __global__ void prepare_nvfp4_v_kernel(
   const int64_t head = blockIdx.y;
   const int64_t batch = blockIdx.z;
   const int channel = threadIdx.x;
-  constexpr int head_dim = 128;
   constexpr int stage_tokens = 64;
   constexpr int group_tokens = 16;
   const int64_t bh = batch * heads + head;
-  const half* source = value + bh * tokens * head_dim;
+  const half* source = value + bh * tokens * HeadDim;
   uint8_t* destination =
-      data + (bh * head_dim + channel) * (tokens / 2);
+      data + (bh * HeadDim + channel) * (tokens / 2);
   uint8_t* scale_record = scales +
-      (bh * (tokens / stage_tokens) + stage) * (head_dim * 4) +
+      (bh * (tokens / stage_tokens) + stage) * (HeadDim * 4) +
       channel * 4;
 #pragma unroll
   for (int group = 0; group < 4; ++group) {
@@ -223,7 +224,7 @@ __global__ void prepare_nvfp4_v_kernel(
 #pragma unroll
     for (int token = 0; token < group_tokens; ++token) {
       const int64_t row = stage * stage_tokens + group * group_tokens + token;
-      values[token] = source[row * head_dim + channel];
+      values[token] = source[row * HeadDim + channel];
       amax = fmaxf(
           amax, fabsf(__half2float(values[token])));
     }
@@ -271,7 +272,7 @@ __device__ __forceinline__ float subgroup_max(float value) {
   return __shfl_sync(0xffffffffU, value, 0, Group);
 }
 
-template <typename InputT, int QueryBlock, bool HasMaxPool>
+template <typename InputT, int QueryBlock, bool HasMaxPool, int HeadDim>
 __global__ void prepare_h3_qk_microscaling_kernel(
     const InputT* __restrict__ query,
     const InputT* __restrict__ key,
@@ -316,10 +317,9 @@ __global__ void prepare_h3_qk_microscaling_kernel(
     int64_t k_stride_head,
     int64_t k_stride_token) {
   static_assert(QueryBlock == 64 || QueryBlock == 128);
-  constexpr int HeadDim = 128;
   __shared__ int64_t staged_token_indices[128];
   __shared__ bool staged_slot_valid[128];
-  __shared__ float int8_warp_amax[2][4];
+  __shared__ float int8_warp_amax[2][HeadDim / 32];
   __shared__ float int8_scale[2];
 
   const int64_t task = blockIdx.x;
@@ -386,82 +386,85 @@ __global__ void prepare_h3_qk_microscaling_kernel(
   float pool_max = -CUDART_INF_F;
   float int8_amax[2] = {-1.0f, -1.0f};
 
+  // Q128 metadata still needs 128 threads when HeadDim is 64.
+  if (HeadDim == 128 || channel < HeadDim) {
 #pragma unroll 1
-  for (int token = 0; token < task_tokens; ++token) {
-    const bool token_valid = is_prefix
-        ? prefix_block * task_tokens + token < prefix_tokens
-        : staged_slot_valid[token];
-    const int64_t raw_token = is_prefix
-        ? prefix_block * task_tokens + token
-        : prefix_tokens + staged_token_indices[token];
-    half narrowed = __float2half_rn(0.0f);
-    if (token_valid) {
-      const int64_t raw_offset = batch * stride_batch + head * stride_head +
-          raw_token * stride_token + channel;
-      narrowed = load_narrowed_half(input, raw_offset);
-    }
-    if (!is_prefix) {
-      pool_sum += __half2float(narrowed);
-      if constexpr (HasMaxPool) {
-        if (token_valid) {
-          pool_max = fmaxf(pool_max, __half2float(narrowed));
+    for (int token = 0; token < task_tokens; ++token) {
+      const bool token_valid = is_prefix
+          ? prefix_block * task_tokens + token < prefix_tokens
+          : staged_slot_valid[token];
+      const int64_t raw_token = is_prefix
+          ? prefix_block * task_tokens + token
+          : prefix_tokens + staged_token_indices[token];
+      half narrowed = __float2half_rn(0.0f);
+      if (token_valid) {
+        const int64_t raw_offset = batch * stride_batch + head * stride_head +
+            raw_token * stride_token + channel;
+        narrowed = load_narrowed_half(input, raw_offset);
+      }
+      if (!is_prefix) {
+        pool_sum += __half2float(narrowed);
+        if constexpr (HasMaxPool) {
+          if (token_valid) {
+            pool_max = fmaxf(pool_max, __half2float(narrowed));
+          }
         }
       }
-    }
 
-    const int64_t natural_row = is_prefix_query
-        ? prefix_block * QueryBlock + token
-        : (is_video_query
-              ? logical_block * QueryBlock + token
-              : (is_video_key
-                    ? prefix_blocks * 64 + logical_block * QueryBlock + token
-                    : prefix_block * 64 + token));
-    const int64_t natural_element =
-        ((batch * heads + head) * output_tokens + natural_row) * HeadDim +
-        channel;
-    if (!is_prefix_query) packed[natural_element] = narrowed;
-    const float value = __half2float(narrowed);
+      const int64_t natural_row = is_prefix_query
+          ? prefix_block * QueryBlock + token
+          : (is_video_query
+                ? logical_block * QueryBlock + token
+                : (is_video_key
+                      ? prefix_blocks * 64 + logical_block * QueryBlock + token
+                      : prefix_block * 64 + token));
+      const int64_t natural_element =
+          ((batch * heads + head) * output_tokens + natural_row) * HeadDim +
+          channel;
+      if (!is_prefix_query) packed[natural_element] = narrowed;
+      const float value = __half2float(narrowed);
 
-    if (has_int8) {
-      const int group = !is_query && !is_prefix && QueryBlock == 128
-          ? token / 64
-          : 0;
-      int8_amax[group] = fmaxf(int8_amax[group], fabsf(value));
-    }
+      if (has_int8) {
+        const int group = !is_query && !is_prefix && QueryBlock == 128
+            ? token / 64
+            : 0;
+        int8_amax[group] = fmaxf(int8_amax[group], fabsf(value));
+      }
 
-    if (has_nvfp4 && !is_prefix_query) {
-      const float amax = subgroup_max<16>(fabsf(value));
-      const uint8_t scale = nv_scale_bits(amax, tensor_scale);
-      int64_t destination_row = natural_row;
-      if (!is_query) {
-        const int64_t local = natural_row & 31;
-        destination_row = natural_row - local + (local / 8) * 2 +
-            ((local % 8) / 2) * 8 + local % 2;
+      if (has_nvfp4 && !is_prefix_query) {
+        const float amax = subgroup_max<16>(fabsf(value));
+        const uint8_t scale = nv_scale_bits(amax, tensor_scale);
+        int64_t destination_row = natural_row;
+        if (!is_query) {
+          const int64_t local = natural_row & 31;
+          destination_row = natural_row - local + (local / 8) * 2 +
+              ((local % 8) / 2) * 8 + local % 2;
+        }
+        if (nv_lane == 0) {
+          nv_scales[
+              ((batch * heads + head) * output_tokens + destination_row) * (HeadDim / 16) +
+              channel / 16] = scale;
+        }
+        const float dequant = decode_e4m3(scale) * tensor_scale;
+        const float next_value = __shfl_down_sync(
+            0xffffffffU, value, 1, 16);
+        if ((nv_lane & 1) == 0) {
+          nv_data[
+              ((batch * heads + head) * output_tokens + destination_row) * (HeadDim / 2) +
+              channel / 2] = encode_e2m1_pair(value, next_value, dequant);
+        }
       }
-      if (nv_lane == 0) {
-        nv_scales[
-            ((batch * heads + head) * output_tokens + destination_row) * 8 +
-            channel / 16] = scale;
-      }
-      const float dequant = decode_e4m3(scale) * tensor_scale;
-      const float next_value = __shfl_down_sync(
-          0xffffffffU, value, 1, 16);
-      if ((nv_lane & 1) == 0) {
-        nv_data[
-            ((batch * heads + head) * output_tokens + destination_row) * 64 +
-            channel / 2] = encode_e2m1_pair(value, next_value, dequant);
-      }
-    }
 
-    if (has_mxfp8 && !is_prefix_query) {
-      const uint8_t scale = encode_e8m0(
-          subgroup_max<32>(fabsf(value)));
-      if (mx_lane == 0) {
-        mx_scales[
-            ((batch * heads + head) * output_tokens + natural_row) * 4 +
-            channel / 32] = scale;
+      if (has_mxfp8 && !is_prefix_query) {
+        const uint8_t scale = encode_e8m0(
+            subgroup_max<32>(fabsf(value)));
+        if (mx_lane == 0) {
+          mx_scales[
+              ((batch * heads + head) * output_tokens + natural_row) * (HeadDim / 32) +
+              channel / 32] = scale;
+        }
+        mx_data[natural_element] = encode_e4m3(value, scale);
       }
-      mx_data[natural_element] = encode_e4m3(value, scale);
     }
   }
 
@@ -470,7 +473,7 @@ __global__ void prepare_h3_qk_microscaling_kernel(
     const int warp = channel / 32;
 #pragma unroll
     for (int group = 0; group < 2; ++group) {
-      if (group < groups) {
+      if (group < groups && (HeadDim == 128 || channel < HeadDim)) {
         const float warp_amax = subgroup_max<32>(int8_amax[group]);
         if (mx_lane == 0) int8_warp_amax[group][warp] = warp_amax;
       }
@@ -479,7 +482,7 @@ __global__ void prepare_h3_qk_microscaling_kernel(
     if (channel < groups) {
       float amax = int8_warp_amax[channel][0];
 #pragma unroll
-      for (int warp_index = 1; warp_index < 4; ++warp_index) {
+      for (int warp_index = 1; warp_index < HeadDim / 32; ++warp_index) {
         amax = fmaxf(amax, int8_warp_amax[channel][warp_index]);
       }
       const float scale = amax / 127.0f + 1.0e-7f;
@@ -499,41 +502,43 @@ __global__ void prepare_h3_qk_microscaling_kernel(
     }
     __syncthreads();
 
+    if (HeadDim == 128 || channel < HeadDim) {
 #pragma unroll 1
-    for (int token = 0; token < task_tokens; ++token) {
-      const bool token_valid = is_prefix
-          ? prefix_block * task_tokens + token < prefix_tokens
-          : staged_slot_valid[token];
-      const int64_t raw_token = is_prefix
-          ? prefix_block * task_tokens + token
-          : prefix_tokens + staged_token_indices[token];
-      half narrowed = __float2half_rn(0.0f);
-      if (token_valid) {
-        const int64_t raw_offset = batch * stride_batch + head * stride_head +
-            raw_token * stride_token + channel;
-        narrowed = load_narrowed_half(input, raw_offset);
+      for (int token = 0; token < task_tokens; ++token) {
+        const bool token_valid = is_prefix
+            ? prefix_block * task_tokens + token < prefix_tokens
+            : staged_slot_valid[token];
+        const int64_t raw_token = is_prefix
+            ? prefix_block * task_tokens + token
+            : prefix_tokens + staged_token_indices[token];
+        half narrowed = __float2half_rn(0.0f);
+        if (token_valid) {
+          const int64_t raw_offset = batch * stride_batch + head * stride_head +
+              raw_token * stride_token + channel;
+          narrowed = load_narrowed_half(input, raw_offset);
+        }
+        const int64_t natural_row = is_prefix_query
+            ? prefix_block * QueryBlock + token
+            : (is_video_query
+                  ? logical_block * QueryBlock + token
+                  : (is_video_key
+                        ? prefix_blocks * 64 + logical_block * QueryBlock + token
+                        : prefix_block * 64 + token));
+        const int64_t natural_element =
+            ((batch * heads + head) * output_tokens + natural_row) * HeadDim +
+            channel;
+        const int group = !is_query && !is_prefix && QueryBlock == 128
+            ? token / 64
+            : 0;
+        float quantized = __half2float(narrowed) / int8_scale[group];
+        quantized += quantized >= 0.0f ? 0.5f : -0.5f;
+        int8_data[natural_element] =
+            static_cast<int8_t>(__float2int_rz(quantized));
       }
-      const int64_t natural_row = is_prefix_query
-          ? prefix_block * QueryBlock + token
-          : (is_video_query
-                ? logical_block * QueryBlock + token
-                : (is_video_key
-                      ? prefix_blocks * 64 + logical_block * QueryBlock + token
-                      : prefix_block * 64 + token));
-      const int64_t natural_element =
-          ((batch * heads + head) * output_tokens + natural_row) * HeadDim +
-          channel;
-      const int group = !is_query && !is_prefix && QueryBlock == 128
-          ? token / 64
-          : 0;
-      float quantized = __half2float(narrowed) / int8_scale[group];
-      quantized += quantized >= 0.0f ? 0.5f : -0.5f;
-      int8_data[natural_element] =
-          static_cast<int8_t>(__float2int_rz(quantized));
     }
   }
 
-  if (!is_prefix) {
+  if (!is_prefix && (HeadDim == 128 || channel < HeadDim)) {
     const int32_t valid_count = video_valid_counts[logical_block];
     const int64_t pool_offset =
         ((batch * heads + head) * video_blocks + logical_block) * HeadDim +
@@ -546,7 +551,7 @@ __global__ void prepare_h3_qk_microscaling_kernel(
   }
 }
 
-template <typename InputT>
+template <typename InputT, int HeadDim>
 __global__ void prepare_h3_v_microscaling_kernel(
     const InputT* __restrict__ value,
     const int64_t* __restrict__ video_token_indices,
@@ -568,7 +573,6 @@ __global__ void prepare_h3_v_microscaling_kernel(
     int64_t stride_batch,
     int64_t stride_head,
     int64_t stride_token) {
-  constexpr int HeadDim = 128;
   constexpr int value_stage_tokens = 32;
   constexpr int value_stages = 2;
   constexpr int shared_stride = HeadDim + 1;
@@ -709,6 +713,7 @@ __global__ void prepare_h3_v_microscaling_kernel(
 // second launch.  The donor producer supplies one exact K64-stage amax while
 // this consumer performs the retained Sage/Sparge token permutation and FP8
 // conversion without the old standalone transpose pass.
+template <int HeadDim>
 __global__ void prepare_h3_int8_v_from_partials_kernel(
     const half* __restrict__ packed_value,
     const float* __restrict__ stage_amax,
@@ -718,7 +723,6 @@ __global__ void prepare_h3_int8_v_from_partials_kernel(
     int64_t physical_stages,
     int64_t key_physical_tokens,
     int64_t padded_key_tokens) {
-  constexpr int HeadDim = 128;
   constexpr int StageTokens = 64;
   constexpr int Threads = 256;
   constexpr int ChannelTile = 32;
@@ -827,29 +831,36 @@ __global__ void prepare_h3_int8_v_from_partials_kernel(
     __syncthreads();
   }
 }
-
-
 } // namespace
 
 void prepare_mxfp8(TensorView query, TensorView key, TensorView value,
                    const SixOutputs& outputs, cudaStream_t stream) {
   const auto& [q8, q8_scale, k8, k8_scale, v8, v8_scale] = outputs;
-  const int64_t q_rows = query.numel() / 128;
-  const int64_t k_rows = key.numel() / 128;
-  prepare_mxfp8_qk_kernel<<<q_rows, 128, 0, stream>>>(
-      reinterpret_cast<const half*>(query.data_ptr<half>()),
-      q8.data_ptr<uint8_t>(), q8_scale.data_ptr<uint8_t>(), q_rows);
-  prepare_mxfp8_qk_kernel<<<k_rows, 128, 0, stream>>>(
-      reinterpret_cast<const half*>(key.data_ptr<half>()),
-      k8.data_ptr<uint8_t>(), k8_scale.data_ptr<uint8_t>(), k_rows);
-  const dim3 v_grid(
-      static_cast<uint32_t>(value.size(2) / 64),
-      static_cast<uint32_t>(value.size(1)),
-      static_cast<uint32_t>(value.size(0)));
-  prepare_mxfp8_v_kernel<<<v_grid, 128, 0, stream>>>(
-      reinterpret_cast<const half*>(value.data_ptr<half>()),
-      v8.data_ptr<uint8_t>(), v8_scale.data_ptr<uint8_t>(),
-      value.size(1), value.size(2));
+  const int64_t head_dim = query.size(3);
+  const int64_t q_rows = query.numel() / head_dim;
+  const int64_t k_rows = key.numel() / head_dim;
+  const auto launch = [&](auto head_dim_tag) {
+    constexpr int HeadDim = decltype(head_dim_tag)::value;
+    prepare_mxfp8_qk_kernel<HeadDim><<<q_rows, HeadDim, 0, stream>>>(
+        reinterpret_cast<const half*>(query.data_ptr<half>()),
+        q8.data_ptr<uint8_t>(), q8_scale.data_ptr<uint8_t>(), q_rows);
+    prepare_mxfp8_qk_kernel<HeadDim><<<k_rows, HeadDim, 0, stream>>>(
+        reinterpret_cast<const half*>(key.data_ptr<half>()),
+        k8.data_ptr<uint8_t>(), k8_scale.data_ptr<uint8_t>(), k_rows);
+    const dim3 v_grid(
+        static_cast<uint32_t>(value.size(2) / 64),
+        static_cast<uint32_t>(value.size(1)),
+        static_cast<uint32_t>(value.size(0)));
+    prepare_mxfp8_v_kernel<HeadDim><<<v_grid, HeadDim, 0, stream>>>(
+        reinterpret_cast<const half*>(value.data_ptr<half>()),
+        v8.data_ptr<uint8_t>(), v8_scale.data_ptr<uint8_t>(),
+        value.size(1), value.size(2));
+  };
+  if (head_dim == 64) {
+    launch(std::integral_constant<int, 64>{});
+  } else {
+    launch(std::integral_constant<int, 128>{});
+  }
   check_launch();
   check_launch();
 }
@@ -861,24 +872,33 @@ void prepare_nvfp4(TensorView query, TensorView key, TensorView value,
                   cudaStream_t stream) {
   static_assert(QueryBlock == 64 || QueryBlock == 128);
   const auto& [q4, q4_scale, k4, k4_scale, v4, v4_scale] = outputs;
-  const int64_t q_rows = query.numel() / 128;
-  const int64_t k_rows = key.numel() / 128;
-  prepare_nvfp4_qk_kernel<false><<<q_rows, 64, 0, stream>>>(
-      reinterpret_cast<const half*>(query.data_ptr<half>()),
-      q4.data_ptr<uint8_t>(), q4_scale.data_ptr<uint8_t>(),
-      q_global_scale.data_ptr<float>(), q_rows);
-  prepare_nvfp4_qk_kernel<true><<<k_rows, 64, 0, stream>>>(
-      reinterpret_cast<const half*>(key.data_ptr<half>()),
-      k4.data_ptr<uint8_t>(), k4_scale.data_ptr<uint8_t>(),
-      k_global_scale.data_ptr<float>(), k_rows);
-  const dim3 v_grid(
-      static_cast<uint32_t>(value.size(2) / 64),
-      static_cast<uint32_t>(value.size(1)),
-      static_cast<uint32_t>(value.size(0)));
-  prepare_nvfp4_v_kernel<<<v_grid, 128, 0, stream>>>(
-      reinterpret_cast<const half*>(value.data_ptr<half>()),
-      v4.data_ptr<uint8_t>(), v4_scale.data_ptr<uint8_t>(),
-      v_global_scale.data_ptr<float>(), value.size(1), value.size(2));
+  const int64_t head_dim = query.size(3);
+  const int64_t q_rows = query.numel() / head_dim;
+  const int64_t k_rows = key.numel() / head_dim;
+  const auto launch = [&](auto head_dim_tag) {
+    constexpr int HeadDim = decltype(head_dim_tag)::value;
+    prepare_nvfp4_qk_kernel<false, HeadDim><<<q_rows, HeadDim / 2, 0, stream>>>(
+        reinterpret_cast<const half*>(query.data_ptr<half>()),
+        q4.data_ptr<uint8_t>(), q4_scale.data_ptr<uint8_t>(),
+        q_global_scale.data_ptr<float>(), q_rows);
+    prepare_nvfp4_qk_kernel<true, HeadDim><<<k_rows, HeadDim / 2, 0, stream>>>(
+        reinterpret_cast<const half*>(key.data_ptr<half>()),
+        k4.data_ptr<uint8_t>(), k4_scale.data_ptr<uint8_t>(),
+        k_global_scale.data_ptr<float>(), k_rows);
+    const dim3 v_grid(
+        static_cast<uint32_t>(value.size(2) / 64),
+        static_cast<uint32_t>(value.size(1)),
+        static_cast<uint32_t>(value.size(0)));
+    prepare_nvfp4_v_kernel<HeadDim><<<v_grid, HeadDim, 0, stream>>>(
+        reinterpret_cast<const half*>(value.data_ptr<half>()),
+        v4.data_ptr<uint8_t>(), v4_scale.data_ptr<uint8_t>(),
+        v_global_scale.data_ptr<float>(), value.size(1), value.size(2));
+  };
+  if (head_dim == 64) {
+    launch(std::integral_constant<int, 64>{});
+  } else {
+    launch(std::integral_constant<int, 128>{});
+  }
   check_launch();
 }
 
@@ -937,14 +957,15 @@ void prepare_h3_sm120_operands(TensorView query, TensorView key, TensorView valu
   const int64_t qk_tasks = query.size(1) * (
       2 * video_blocks + prefix_blocks +
       (has_prefix_query_int8 ? prefix_query_blocks : 0));
-  const auto launch = [&](auto query_block_tag, auto* input_tag, auto max_tag) {
+  const auto launch = [&](auto head_dim_tag, auto query_block_tag, auto* input_tag, auto max_tag) {
+    constexpr int HeadDim = decltype(head_dim_tag)::value;
     constexpr int QueryBlock = decltype(query_block_tag)::value;
     using InputT = std::remove_pointer_t<decltype(input_tag)>;
     constexpr bool HasMaxPool = decltype(max_tag)::value;
     const dim3 qk_grid(
         static_cast<uint32_t>(qk_tasks),
         static_cast<uint32_t>(query.size(0)));
-    prepare_h3_qk_microscaling_kernel<InputT, QueryBlock, HasMaxPool><<<
+    prepare_h3_qk_microscaling_kernel<InputT, QueryBlock, HasMaxPool, HeadDim><<<
         qk_grid, 128, 0, stream>>>(
         reinterpret_cast<const InputT*>(query.data_ptr()),
         reinterpret_cast<const InputT*>(key.data_ptr()),
@@ -996,7 +1017,7 @@ void prepare_h3_sm120_operands(TensorView query, TensorView key, TensorView valu
         static_cast<uint32_t>(key_physical_tokens / 64),
         static_cast<uint32_t>(value.size(1)),
         static_cast<uint32_t>(value.size(0)));
-    prepare_h3_v_microscaling_kernel<InputT><<<v_grid, 128, 0, stream>>>(
+    prepare_h3_v_microscaling_kernel<InputT, HeadDim><<<v_grid, HeadDim, 0, stream>>>(
         reinterpret_cast<const InputT*>(value.data_ptr()),
         video_token_indices.data_ptr<int64_t>(),
         video_slot_valid.data_ptr<bool>(),
@@ -1019,12 +1040,12 @@ void prepare_h3_sm120_operands(TensorView query, TensorView key, TensorView valu
 
     if (has_int8) {
       constexpr int stage_stripes = 4;
-      constexpr int channel_tiles = 128 / 32;
+      constexpr int channel_tiles = HeadDim / 32;
       const dim3 int8_v_grid(
           channel_tiles * stage_stripes,
           static_cast<uint32_t>(value.size(1)),
           static_cast<uint32_t>(value.size(0)));
-      prepare_h3_int8_v_from_partials_kernel<<<
+      prepare_h3_int8_v_from_partials_kernel<HeadDim><<<
           int8_v_grid, 256, 0, stream>>>(
           reinterpret_cast<const half*>(packed_v.data_ptr<half>()),
           v_int8_stage_amax.data_ptr<float>(),
@@ -1037,25 +1058,32 @@ void prepare_h3_sm120_operands(TensorView query, TensorView key, TensorView valu
       check_launch();
     }
   };
-  const auto dispatch_input = [&](auto* input_tag) {
+  const auto dispatch_input = [&](auto head_dim_tag, auto* input_tag) {
     if (query_block_size == 64) {
       if (has_maxpool) {
-        launch(std::integral_constant<int, 64>{}, input_tag, std::true_type{});
+        launch(head_dim_tag, std::integral_constant<int, 64>{}, input_tag, std::true_type{});
       } else {
-        launch(std::integral_constant<int, 64>{}, input_tag, std::false_type{});
+        launch(head_dim_tag, std::integral_constant<int, 64>{}, input_tag, std::false_type{});
       }
     } else {
       if (has_maxpool) {
-        launch(std::integral_constant<int, 128>{}, input_tag, std::true_type{});
+        launch(head_dim_tag, std::integral_constant<int, 128>{}, input_tag, std::true_type{});
       } else {
-        launch(std::integral_constant<int, 128>{}, input_tag, std::false_type{});
+        launch(head_dim_tag, std::integral_constant<int, 128>{}, input_tag, std::false_type{});
       }
     }
   };
-  if (query.dtype == DType::F16) {
-    dispatch_input(static_cast<half*>(nullptr));
+  const auto dispatch_head_dim = [&](auto head_dim_tag) {
+    if (query.dtype == DType::F16) {
+      dispatch_input(head_dim_tag, static_cast<half*>(nullptr));
+    } else {
+      dispatch_input(head_dim_tag, static_cast<nv_bfloat16*>(nullptr));
+    }
+  };
+  if (query.size(3) == 64) {
+    dispatch_head_dim(std::integral_constant<int, 64>{});
   } else {
-    dispatch_input(static_cast<nv_bfloat16*>(nullptr));
+    dispatch_head_dim(std::integral_constant<int, 128>{});
   }
 
 }

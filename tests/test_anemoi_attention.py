@@ -435,8 +435,6 @@ def test_native_sparse_pipeline_matches_reference(tied, anchors_enabled):
 @pytest.mark.parametrize("prefix", [0, 7])
 @pytest.mark.parametrize("dim", [64, 128])
 def test_native_dense_fp16_matches_reference(block, dtype, prefix, dim):
-    if dim == 64 and torch.cuda.get_device_capability() == (12, 0):
-        pytest.skip("SM120 native head dimension is 128")
     gen = torch.Generator(device="cuda").manual_seed(12)
     q, k, v = (
         torch.randn(1, 130 + prefix, 2, dim, dtype=dtype, device="cuda", generator=gen)

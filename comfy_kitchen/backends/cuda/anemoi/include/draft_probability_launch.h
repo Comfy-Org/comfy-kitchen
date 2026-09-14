@@ -20,16 +20,17 @@ void launch_draft_probability(
     void* out, void* max_logits, int64_t B, int64_t Hq, int64_t Hkv,
     int64_t R, int64_t D, double weight, cudaStream_t stream);
 
-// D=128, tail=1 or 2. Q: [B,Hq,R,128]; K: [B,Hkv,R,128].
-// packed_k: [B,Hkv,(prefix+R)*64,128]; valid_counts: int32 [R], each
+// D=64 or D=128, tail=1 or 2. Q: [B,Hq,R,D]; K: [B,Hkv,R,D].
+// packed_k: [B,Hkv,(prefix+R)*64,D]; valid_counts: int32 [R], each
 // value in [1,64] (caller must ensure this device-data invariant).
-// out: [B,Hq,R,R]; descriptors: [B,Hkv,R*(tail+1),128];
+// out: [B,Hq,R,R]; descriptors: [B,Hkv,R*(tail+1),D];
 // expanded_logits: [B,Hq,R,R*(tail+1)]. All outputs/workspaces are supplied
 // by the caller, mutually non-overlapping and non-overlapping with inputs.
 void launch_k_tail_probability(
     const void* q, const void* k, const void* packed_k,
     const int32_t* valid_counts, void* out, void* descriptors,
     void* expanded_logits, int64_t B, int64_t Hq, int64_t Hkv,
-    int64_t R, int64_t prefix, int tail, cudaStream_t stream);
+    int64_t R, int64_t prefix, int tail, int64_t head_dim,
+    cudaStream_t stream);
 
 }  // namespace anemoi_sm120

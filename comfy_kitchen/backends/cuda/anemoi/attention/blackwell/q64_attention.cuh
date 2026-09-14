@@ -234,6 +234,19 @@ __device__ __forceinline__ void mma_m16n8k32_mxfp8(
         "r"(scale_b), "h"(byte_id_b), "h"(thread_id));
 }
 
+// D64 owns two E8M0 bytes per row; zero-extend that halfword instead of
+// reading the next row. MMA selects byte 0/1 for the two K32 groups.
+template <uint32_t HeadDim>
+__device__ __forceinline__ uint32_t load_mxfp8_scale_word(
+    const uint8_t* scales, uint32_t row) {
+  static_assert(HeadDim == 64 || HeadDim == 128);
+  if constexpr (HeadDim == 64) {
+    return *reinterpret_cast<const uint16_t*>(scales + row * 2);
+  } else {
+    return *reinterpret_cast<const uint32_t*>(scales + row * 4);
+  }
+}
+
 template <uint32_t HeadDim, uint32_t NumTilesQ, uint32_t NumTilesK>
 __device__ __forceinline__ void compute_mxfp8_qk(
     const LowQKSmem<HeadDim>& smem_q,
@@ -241,7 +254,7 @@ __device__ __forceinline__ void compute_mxfp8_qk(
     const uint8_t* q_scale,
     const uint8_t* k_scale,
     float (&scores)[NumTilesQ][NumTilesK][8]) {
-  static_assert(HeadDim == 128);
+  static_assert(HeadDim == 64 || HeadDim == 128);
   static_assert((NumTilesQ == 1 || NumTilesQ == 2) && NumTilesK == 4);
   constexpr uint32_t NumWarpsQ = kCtaQ / kWarpQ;
   constexpr uint32_t NumWarpsK = kCtaK / kWarpK;
@@ -267,7 +280,7 @@ __device__ __forceinline__ void compute_mxfp8_qk(
     if (thread_in_quad <= 1) {
       const uint32_t row =
           warp_q * kWarpQ + fq * 16 + group + thread_in_quad * 8;
-      sf_q[fq] = *reinterpret_cast<const uint32_t*>(q_scale + row * 4);
+      sf_q[fq] = load_mxfp8_scale_word<HeadDim>(q_scale, row);
     }
   }
 
@@ -288,10 +301,8 @@ __device__ __forceinline__ void compute_mxfp8_qk(
       uint32_t sf_k0 = 0U;
       uint32_t sf_k1 = 0U;
       if (thread_in_quad == 0) {
-        sf_k0 = *reinterpret_cast<const uint32_t*>(
-            k_scale + key_row0 * 4);
-        sf_k1 = *reinterpret_cast<const uint32_t*>(
-            k_scale + (key_row0 + 8) * 4);
+        sf_k0 = load_mxfp8_scale_word<HeadDim>(k_scale, key_row0);
+        sf_k1 = load_mxfp8_scale_word<HeadDim>(k_scale, key_row0 + 8);
       }
       const uint32_t k_offset = smem_k.get_permuted_offset(
           fk * 16 + lane % 8 + (lane / 16) * 8,
@@ -372,7 +383,7 @@ __device__ __forceinline__ void accumulate_prepared_mxfp8_pv(
     const MxProbabilityFragment& probability,
     const LowVSmem& smem_v,
     const uint8_t* v_scale) {
-  static_assert(HeadDim == 128 && NumTilesV == 8);
+  static_assert((HeadDim == 64 || HeadDim == 128) && NumTilesV == HeadDim / 16);
   const uint32_t lane = get_lane_id();
   const uint32_t group = lane >> 2;
   const uint32_t thread_in_quad = lane & 3;
@@ -467,7 +478,7 @@ __device__ __forceinline__ void load_nvfp4_query(
     const uint8_t* q_scale,
     uint32_t (&q_data)[NumTilesQ][HeadDim / 64][4],
     uint32_t (&scale_data)[NumTilesQ][HeadDim / 64]) {
-  static_assert(HeadDim == 128 && (NumTilesQ == 1 || NumTilesQ == 2));
+  static_assert((HeadDim == 64 || HeadDim == 128) && (NumTilesQ == 1 || NumTilesQ == 2));
   constexpr uint32_t data_stride = HeadDim / 2;
   constexpr uint32_t scale_stride = HeadDim / 16;
   constexpr uint32_t num_warps_q = kCtaQ / kWarpQ;
@@ -512,7 +523,7 @@ __device__ __forceinline__ void compute_nvfp4_qk(
     const uint8_t* k_scale,
     float (&scores)[NumTilesQ][NumTilesK][8]) {
   static_assert(
-      HeadDim == 128 && (NumTilesQ == 1 || NumTilesQ == 2) &&
+      (HeadDim == 64 || HeadDim == 128) && (NumTilesQ == 1 || NumTilesQ == 2) &&
       NumTilesK == 4);
   constexpr uint32_t data_stride = HeadDim / 2;
   constexpr uint32_t scale_stride = HeadDim / 16;
@@ -520,7 +531,7 @@ __device__ __forceinline__ void compute_nvfp4_qk(
   const uint32_t group = lane >> 2;
   const uint32_t k_base = nvfp4_swizzle<data_stride>(
       __cvta_generic_to_shared(k_smem) +
-      (lane % 8) * data_stride + (lane / 8) * 16);
+      (lane % 8) * data_stride + ((lane / 8) % (HeadDim / 32)) * 16);
 #pragma unroll
   for (uint32_t fq = 0; fq < NumTilesQ; ++fq) {
 #pragma unroll
@@ -534,14 +545,22 @@ __device__ __forceinline__ void compute_nvfp4_qk(
 #pragma unroll
   for (uint32_t tile = 0; tile < 8; ++tile) {
     const uint32_t key_row = tile * 8 + group;
-    uint32_t k_fragment[4];
+    uint32_t k_fragment[HeadDim / 32];
     const uint32_t address = k_base + tile * 8 * data_stride;
-    asm volatile(
+    if constexpr (HeadDim == 64) {
+      // Two matrices contain exactly one packed K64 group per key row.
+      asm volatile(
+          "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+          : "=r"(k_fragment[0]), "=r"(k_fragment[1])
+          : "r"(address));
+    } else {
+      asm volatile(
         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
         "{%0, %1, %2, %3}, [%4];"
         : "=r"(k_fragment[0]), "=r"(k_fragment[1]),
           "=r"(k_fragment[2]), "=r"(k_fragment[3])
         : "r"(address));
+    }
 #pragma unroll
     for (uint32_t d64 = 0; d64 < HeadDim / 64; ++d64) {
       const uint32_t k_data[2] = {
@@ -623,7 +642,7 @@ __device__ __forceinline__ void accumulate_nvfp4_pv(
     const NvProbabilityFragment& probability,
     const uint8_t* v_smem,
     const uint8_t* v_scale) {
-  static_assert(HeadDim == 128);
+  static_assert(HeadDim == 64 || HeadDim == 128);
   float (&ro)[HeadDim / 8][4] =
       *reinterpret_cast<float (*)[HeadDim / 8][4]>(current_ro);
   constexpr uint32_t v_stride = 64 / 2;

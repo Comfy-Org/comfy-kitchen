@@ -6,10 +6,8 @@
 
 #include <cstdint>
 
-// Q64 x K64 native SM120 attention.  The phase-list-shaped ABI is retained so
-// this debugging specialization can grow back into the mixed-precision MPA
-// family without changing its routing contract.  The current public wrapper
-// instantiates only <D128, FP16>.
+// Native SM120 D64/D128 attention. Q64/Q128 share the phase-list ABI and
+// compile-time head-dimension specializations without changing routing.
 template <uint32_t HeadDim, bool HasFp8, bool HasFp16, bool SmoothK>
 void launch_mixed_attention_sm120_q64(
     int8_t* q8,

@@ -1,7 +1,7 @@
   if constexpr (HasFp8) {
     // Phase: NVFP4
 #if MPA_LOW4_NVFP4
-    static_assert((kCtaQ == 64 || kCtaQ == 128) && HeadDim == 128);
+    static_assert((kCtaQ == 64 || kCtaQ == 128) && (HeadDim == 64 || HeadDim == 128));
     if (nv_iterations != 0) {
       constexpr uint32_t threads = num_warps * 32;
       constexpr uint32_t k_data_bytes = kCtaK * (HeadDim / 2);
@@ -539,7 +539,8 @@
           lane_id / qk_line_lanes;
       load_global_to_share<
           qk_line_lanes, qk_lines_per_warp, qk_smem_iters_row,
-          q_smem_iters_col, SwizzleMode::k128B, HeadDim / kPackInt8,
+          q_smem_iters_col, (HeadDim == 64 ? SwizzleMode::k64B : SwizzleMode::k128B),
+          HeadDim / kPackInt8,
           kCtaQ>(
           q_lane, q_smem_load, HeadDim, smem_q8, q_load_row, qo_len);
       cp_async::commit_group();

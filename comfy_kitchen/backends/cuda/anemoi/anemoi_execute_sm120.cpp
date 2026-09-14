@@ -74,8 +74,8 @@ struct Plan {
 
   explicit Plan(const Config &c) {
     validate(c);
-    check(c.architecture == 120 && c.dim == 128,
-          "SM120 executor requires architecture 120 and D128");
+    check(c.architecture == 120 && (c.dim == 64 || c.dim == 128),
+          "SM120 executor requires architecture 120 and head dim 64 or 128");
     check(!c.smooth_k, "SM120 has no native smooth-K specialization");
     prefix_blocks = (int64_t(c.prefix_tokens) + 63) / 64;
     prefix_qblocks = (int64_t(c.prefix_tokens) + c.query_block - 1) / c.query_block;
@@ -95,46 +95,47 @@ struct Plan {
     check(c.anchor_count <= lowest, "anchor_count exceeds lowest-precision budget");
 
     const int64_t b = c.batch, h = c.heads, r = c.video_blocks;
+    const int64_t d = c.dim;
     const auto add = [&](anemoi_native::IntArrayRef shape, DType type, bool enabled = true) {
       return workspace.add(enabled ? shape : anemoi_native::IntArrayRef{0}, type, c.device);
     };
-    const auto half_pool = [&] { return add({b,h,r,128}, DType::Half); };
+    const auto half_pool = [&] { return add({b,h,r,d}, DType::Half); };
     prepared[0] = half_pool(); prepared[1] = half_pool();
-    prepared[2] = add({b,h,qtokens,128}, DType::Half);
-    prepared[3] = add({b,h,ktokens,128}, DType::Half);
-    prepared[4] = add({b,h,ktokens,128}, DType::Half);
+    prepared[2] = add({b,h,qtokens,d}, DType::Half);
+    prepared[3] = add({b,h,ktokens,d}, DType::Half);
+    prepared[4] = add({b,h,ktokens,d}, DType::Half);
     // Microscaling Q/K payloads and scales; V is channel-major with physical K64 scales.
     for (int phase : {0, 2}) {
       const bool nv = phase == 0;
       const int base = nv ? 5 : 11;
-      const int width = nv ? 64 : 128, scale_width = nv ? 8 : 4;
+      const int width = nv ? d / 2 : d, scale_width = nv ? d / 16 : d / 32;
       prepared[base] = add({b,h,qtokens,width}, DType::Byte, active[phase]);
       prepared[base+1] = add({b,h,qtokens,scale_width}, DType::Byte, active[phase]);
       prepared[base+2] = add({b,h,ktokens,width}, DType::Byte, active[phase]);
       prepared[base+3] = add({b,h,ktokens,scale_width}, DType::Byte, active[phase]);
-      prepared[base+4] = add({b,h,128,nv ? ktokens/2 : ktokens}, DType::Byte, active[phase]);
-      prepared[base+5] = add({b,h,kblocks,nv ? 512 : 256}, DType::Byte, active[phase]);
+      prepared[base+4] = add({b,h,d,nv ? ktokens/2 : ktokens}, DType::Byte, active[phase]);
+      prepared[base+5] = add({b,h,kblocks,nv ? d * 4 : d * 2}, DType::Byte, active[phase]);
     }
-    prepared[17] = add({b,h,qtokens,128}, DType::Char, active[1]);
+    prepared[17] = add({b,h,qtokens,d}, DType::Char, active[1]);
     prepared[18] = add({b,h,r}, DType::Float, active[1]);
-    prepared[19] = add({b,h,ktokens,128}, DType::Char, active[1]);
+    prepared[19] = add({b,h,ktokens,d}, DType::Char, active[1]);
     prepared[20] = add({b,h,kblocks}, DType::Float, active[1]);
-    prepared[21] = add({b,h,128,((ktokens+127)/128)*128}, DType::Float8_e4m3fn, active[1]);
-    prepared[22] = add({b,h,128}, DType::Float, active[1]);
-    prepared[23] = add({b,h,prefix_qblocks*c.query_block,128}, DType::Char, native_prefix);
+    prepared[21] = add({b,h,d,((ktokens+127)/128)*128}, DType::Float8_e4m3fn, active[1]);
+    prepared[22] = add({b,h,d}, DType::Float, active[1]);
+    prepared[23] = add({b,h,prefix_qblocks*c.query_block,d}, DType::Char, native_prefix);
     prepared[24] = add({b,h,prefix_qblocks}, DType::Float, native_prefix);
-    prepared[25] = add({b,h,r,128}, DType::Half, c.maxpool_weight != 0);
-    prepared[26] = add({b,h,r,128}, DType::Half, c.maxpool_weight != 0);
-    v_amax = add({b,h,kblocks,128}, DType::Float, active[1]);
+    prepared[25] = add({b,h,r,d}, DType::Half, c.maxpool_weight != 0);
+    prepared[26] = add({b,h,r,d}, DType::Half, c.maxpool_weight != 0);
+    v_amax = add({b,h,kblocks,d}, DType::Float, active[1]);
     for (auto &s : scales) s = add({1}, DType::Float, active[0]);
     valid_k = add({b,kblocks}, DType::Int);
     probability = add({b,h,r,r}, DType::Half);
     max_logits = add({b,h,r,r}, DType::Half, c.maxpool_weight > 0 && c.maxpool_weight < 1);
-    q_second = add({b,h,r,128}, DType::Half, c.jensen);
-    k_second = add({b,h,r,128}, DType::Half, c.jensen);
-    descriptors = add({b,h,r*(c.draft_proxy+1),128}, DType::Half, c.draft_proxy != 0);
+    q_second = add({b,h,r,d}, DType::Half, c.jensen);
+    k_second = add({b,h,r,d}, DType::Half, c.jensen);
+    descriptors = add({b,h,r*(c.draft_proxy+1),d}, DType::Half, c.draft_proxy != 0);
     tail_logits = add({b,h,r,r*(c.draft_proxy+1)}, DType::Half, c.draft_proxy != 0);
-    if (c.jensen) draft_bytes = draft_workspace_bytes(c.batch,c.heads,c.video_blocks,128,true);
+    if (c.jensen) draft_bytes = draft_workspace_bytes(c.batch,c.heads,c.video_blocks,c.dim,true);
     draft_scratch = add({int64_t(draft_bytes)}, DType::Byte);
     logical_ids = add({b,h,r,r}, DType::Int);
     precision = add({b,h,r,r}, DType::Byte);
@@ -149,8 +150,8 @@ struct Plan {
     physical_counts[0] = add({b,h,r}, DType::Int);
     physical_counts[1] = add({b,h,r}, DType::Int);
     physical_counts[2] = add({b,h,r}, DType::Int, active[3]);
-    video_output = add({b,h,qtokens,128}, DType::Half);
-    prefix_output = add({b,h,prefix_qblocks*c.query_block,128}, DType::Half, native_prefix);
+    video_output = add({b,h,qtokens,d}, DType::Half);
+    prefix_output = add({b,h,prefix_qblocks*c.query_block,d}, DType::Half, native_prefix);
   }
 };
 } // namespace
@@ -185,7 +186,7 @@ void execute_sm120(const Config &c, const Inputs &in, void *workspace,
   const Tensor valid = get(p.valid_k), probability = get(p.probability);
   valid_key_counts(c,in.counts,valid,stream);
   Tensor prefix = in.prefix_output;
-  const double scale = 1.0 / std::sqrt(128.0);
+  const double scale = 1.0 / std::sqrt(double(c.dim));
   if (p.native_prefix) {
     prefix = get(p.prefix_output);
     const auto function = c.query_block == 64 ? sm120_q64_prefix_int8_attention_forward
@@ -203,12 +204,12 @@ void execute_sm120(const Config &c, const Inputs &in, void *workspace,
   } else if (c.draft_proxy) {
     anemoi_sm120::launch_k_tail_probability(t[0].pointer,t[1].pointer,t[3].pointer,
         in.counts.data_ptr<int32_t>(),probability.pointer,get(p.descriptors).pointer,
-        get(p.tail_logits).pointer,c.batch,c.heads,c.heads,c.video_blocks,p.prefix_blocks,c.draft_proxy,stream);
+        get(p.tail_logits).pointer,c.batch,c.heads,c.heads,c.video_blocks,p.prefix_blocks,c.draft_proxy,c.dim,stream);
   } else {
     anemoi_sm120::launch_draft_probability(t[0].pointer,t[1].pointer,
         t[25].numel() ? t[25].pointer : nullptr,t[26].numel() ? t[26].pointer : nullptr,
         probability.pointer,get(p.max_logits).numel() ? get(p.max_logits).pointer : nullptr,
-        c.batch,c.heads,c.heads,c.video_blocks,128,c.maxpool_weight,stream);
+        c.batch,c.heads,c.heads,c.video_blocks,c.dim,c.maxpool_weight,stream);
   }
   const Tensor logical_ids = get(p.logical_ids), ids = get(p.physical_ids);
   std::array<Tensor, 3> logical, physical;

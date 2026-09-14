@@ -68,7 +68,7 @@ void validate(const Config &c) {
         "Anemoi requires SM89 or newer (SM120+ uses the Blackwell kernels)");
   check(c.device >= 0 && c.batch == 1 && c.tokens > 0 && c.heads > 0,
         "native Anemoi requires batch one and positive tensor dimensions");
-  check(c.dim == 128 || (c.dim == 64 && ada_serves(c.architecture)), "unsupported head dimension");
+  check(c.dim == 128 || c.dim == 64, "unsupported head dimension");
   check(c.query_block == 64 || c.query_block == 128, "query block must be 64 or 128");
   check(c.input_type == DType::Half || c.input_type == DType::BFloat16,
         "Anemoi input must be FP16 or BF16");
