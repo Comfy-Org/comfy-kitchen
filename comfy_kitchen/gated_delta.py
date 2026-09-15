@@ -23,7 +23,12 @@ def is_available(device: torch.device | int | None = None, key_head_dim: int = 1
         return False
     if key_head_dim != 128 or value_head_dim % 32 != 0 or not 0 < value_head_dim <= 512:
         return False
-    index = torch.device(device).index if device is not None else None
+    index = None
+    if device is not None:
+        device = torch.device(device)
+        if device.type != "cuda":
+            return False
+        index = device.index
     if index is None:
         index = torch.cuda.current_device()
     optin = _device_optin.get(index)
