@@ -150,6 +150,7 @@ def sol_attn(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    blk_cnt: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn training-free sparse attention (arXiv 2607.24027).
 
@@ -186,6 +187,14 @@ def sol_attn(
             query block are routed individually, the highest-scoring ones outside
             the routed blocks, and attended exactly. The eager reference ignores
             it.
+        blk_cnt: Optional int32 ``(B, H, ceil(T/64))`` on q's device, contiguous.
+            Filled in place with the number of key blocks each 64-token query
+            block attended exactly: the ``sink_blocks`` range, the diagonal
+            (``|q - k| <= 1``) and the routed set together; a query block
+            inside ``sink_q`` holds ``ceil(T/64)``. Taken from the same call
+            that produced the output, so it is what the exact stage actually
+            walked. None (the default) allocates, copies and synchronizes
+            nothing, and the output does not depend on it.
 
     Returns:
         ``(B, T, H, 128)`` attention output.
@@ -200,6 +209,7 @@ def sol_attn(
         block_len,
         coarse_gate,
         int(token_aug),
+        blk_cnt,
     )
 
 
