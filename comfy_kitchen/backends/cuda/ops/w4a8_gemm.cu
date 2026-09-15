@@ -356,7 +356,7 @@ extern "C" bool launch_quantize_w4a8_convrot(
     return cudaGetLastError() == cudaSuccess;
 }
 
-// Fused W4A8 GEMV for decode (M<=4): dequantize int4+codebook in registers and
+// Fused W4A8 GEMV for decode (M<=8): dequantize int4+codebook in registers and
 // dp4a against the int8 activation in one pass — no int8 workspace round-trip.
 // Bit-exact with the chunked path: same __float2int_rn(cb[c]*s_rel) int8 grid,
 // same acc*xs*s_channel(+bias) epilogue. Requires G>=16 and G%16==0 so one

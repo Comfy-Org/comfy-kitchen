@@ -4075,7 +4075,7 @@ NB_MODULE(_C, m) {
           nb::arg("out_dtype_code"), nb::arg("stream_ptr"));
 
     m.def("w4a8_codebook_gemv", &w4a8_codebook_gemv,
-          "Fused W4A8 decode GEMV (M<=4): in-register int4+codebook dequant, no workspace",
+          "Fused W4A8 decode GEMV (M<=8): in-register int4+codebook dequant, no workspace",
           nb::arg("input"), nb::arg("xq"), nb::arg("xs"), nb::arg("weight"),
           nb::arg("s_rel"), nb::arg("codebook").none(), nb::arg("s_channel"),
           nb::arg("bias").none(), nb::arg("out"),
