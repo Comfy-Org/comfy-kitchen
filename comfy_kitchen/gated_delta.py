@@ -46,15 +46,15 @@ def gated_delta_decode_fused(
     """S GatedDeltaNet decode steps from the conv output [B, C, S]; state [B, Hv, DK, DV] fp32 updated in place."""
     if not is_available(x.device):
         raise RuntimeError("gated_delta_decode_fused requires the CUDA extension")
-    B, C, S = mixed_qkv.shape
-    Hv, DK, DV = state.shape[1], state.shape[2], state.shape[3]
-    out = torch.empty((B, S, Hv, DV), dtype=x.dtype, device=x.device)
+    batch, _, seq = mixed_qkv.shape
+    heads, value_dim = state.shape[1], state.shape[3]
+    out = torch.empty((batch, seq, heads, value_dim), dtype=x.dtype, device=x.device)
     wrap = _cuda_backend._wrap_for_dlpack
     ok = _cuda_backend._C.gated_delta_decode_fused(
         wrap(mixed_qkv.contiguous()), wrap(x.contiguous()), wrap(w_a.contiguous()), wrap(w_b.contiguous()),
         wrap(dt_bias), wrap(g_decay), wrap(state), wrap(out),
         wrap(snapshots) if snapshots is not None else None,
-        wrap(z.reshape(B, S, Hv * DV).contiguous()), wrap(norm_weight.contiguous()), eps,
+        wrap(z.reshape(batch, seq, heads * value_dim).contiguous()), wrap(norm_weight.contiguous()), eps,
         key_dim, num_key_heads, scale,
         torch.cuda.current_stream(x.device).cuda_stream,
     )
@@ -73,11 +73,11 @@ def deltanet_conv_step(
     """Depthwise causal conv + silu over proj [B, S, C]; conv_state [B, C, KS-1] updated in place, returns [B, C, S]."""
     if not is_available(proj.device):
         raise RuntimeError("deltanet_conv_step requires the CUDA extension")
-    B, S, C = proj.shape
-    out = torch.empty((B, C, S), dtype=proj.dtype, device=proj.device)
+    batch, seq, channels = proj.shape
+    out = torch.empty((batch, channels, seq), dtype=proj.dtype, device=proj.device)
     wrap = _cuda_backend._wrap_for_dlpack
     ok = _cuda_backend._C.deltanet_conv_step(
-        wrap(proj.contiguous()), wrap(conv_state), wrap(conv_w.reshape(C, -1).contiguous()),
+        wrap(proj.contiguous()), wrap(conv_state), wrap(conv_w.reshape(channels, -1).contiguous()),
         wrap(conv_b.contiguous()) if conv_b is not None else None, wrap(out),
         wrap(snapshots) if snapshots is not None else None,
         torch.cuda.current_stream(proj.device).cuda_stream,
