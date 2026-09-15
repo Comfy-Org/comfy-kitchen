@@ -171,8 +171,10 @@ def _apply_rope(
             _apply_rope(x2, freqs_cis, split_half=split_half, inplace=inplace)[0],
         )
 
-    batch, dim1, dim2, head_dim = x1.shape
-    freqs_batch, freqs_dim1, freqs_dim2 = freqs_cis.shape[:3]
+    # Treat omitted leading dimensions as singleton axes, e.g. Trellis's (N, H, D).
+    batch, dim1, dim2, head_dim = (1,) * (4 - x1.ndim) + x1.shape
+    freqs_shape = (1,) * (6 - freqs_cis.ndim) + freqs_cis.shape
+    freqs_batch, freqs_dim1, freqs_dim2 = freqs_shape[:3]
     x1_out = x1 if inplace else torch.empty_like(x1)
     if x2 is None or inplace:
         x2_out = x2
@@ -189,8 +191,11 @@ def _apply_rope(
         block_size = 1024
     grid = (triton.cdiv(total_elements, block_size),)
 
-    stride_x_batch, stride_x_dim1, stride_x_dim2, stride_x_dim = x1.stride()
-    stride_freqs = freqs_cis.stride()
+    stride_x_batch, stride_x_dim1, stride_x_dim2, stride_x_dim = (
+        (0,) * (4 - x1.ndim) + x1.stride()
+    )
+    stride_out = (0,) * (4 - x1_out.ndim) + x1_out.stride()
+    stride_freqs = (0,) * (6 - freqs_cis.ndim) + freqs_cis.stride()
     dtype_map = {
         torch.float32: tl.float32,
         torch.float16: tl.float16,
@@ -214,10 +219,10 @@ def _apply_rope(
         stride_x_dim1,
         stride_x_dim2,
         stride_x_dim,
-        x1_out.stride(0),
-        x1_out.stride(1),
-        x1_out.stride(2),
-        x1_out.stride(3),
+        stride_out[0],
+        stride_out[1],
+        stride_out[2],
+        stride_out[3],
         stride_freqs[0],
         stride_freqs[1],
         stride_freqs[2],

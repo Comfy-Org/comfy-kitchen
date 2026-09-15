@@ -45,7 +45,7 @@ __global__ void sol_producer_kernel(
     const float* __restrict__ vscale,        // [H, HD] stale V scale (may be ~0 -> margin)
     int8_t* __restrict__ qiP, float* __restrict__ qs,
     int8_t* __restrict__ kiP, float2* __restrict__ ksb,
-    int8_t* __restrict__ vTi, __nv_bfloat16* __restrict__ vcT,
+    int8_t* __restrict__ vTi, int8_t* __restrict__ vRow, __nv_bfloat16* __restrict__ vcT,
     float* __restrict__ ksumP,               // [H, NPAD, HD] block K sums (post-rope)
     int8_t* __restrict__ cen8, float* __restrict__ cens,
     float* __restrict__ qmean,               // [H, NPAD, HD] f32 block means (post-rope)
@@ -107,6 +107,7 @@ __global__ void sol_producer_kernel(
             const float x = (t < len) ? __bfloat162float(sT[t * LD_TILE + d]) : 0.f;
             sv += x; av = fmaxf(av, fabsf(x));
             col[perm_d(t)] = q8(x, inv);
+            if (vRow) vRow[((size_t)h * Tp + nblk * BLK + t) * HD + d] = col[perm_d(t)];   // row-major copy (token routing)
         }
         const size_t vbase = ((size_t)h * HD + d) * Tp + nblk * BLK;
         #pragma unroll
@@ -123,7 +124,7 @@ __global__ void sol_producer_kernel(
 void launch_sol_producer(
     const void* qkv, const void* fab, const void* qw, const void* kw,
     const void* kmean, const void* vscale,
-    void* qiP, void* qs, void* kiP, void* ksb, void* vTi, void* vcT,
+    void* qiP, void* qs, void* kiP, void* ksb, void* vTi, void* vRow, void* vcT,
     void* ksumP, void* cen8, void* cens, void* qmean, void* vamax_next,
     const void* blen, float rope_eps, int rot,
     int t0, int M, int T, int Tp, int H, int NPAD, int NQ,
@@ -135,7 +136,7 @@ void launch_sol_producer(
         (const __nv_bfloat16*)qw, (const __nv_bfloat16*)kw,
         (const float*)kmean, (const float*)vscale,
         (int8_t*)qiP, (float*)qs, (int8_t*)kiP, (float2*)ksb,
-        (int8_t*)vTi, (__nv_bfloat16*)vcT, (float*)ksumP,
+        (int8_t*)vTi, (int8_t*)vRow, (__nv_bfloat16*)vcT, (float*)ksumP,
         (int8_t*)cen8, (float*)cens, (float*)qmean, (float*)vamax_next,
         (const int32_t*)blen, rope_eps, rot, t0, M, T, Tp, H, NPAD, NQ);
 }

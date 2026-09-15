@@ -45,7 +45,7 @@ def _scale_shift(shape, dtype, device):
 # ---------------------------------------------------------------------------
 
 class TestAdaLN:
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     @pytest.mark.parametrize("dtype", _DTYPES)
     @pytest.mark.parametrize("shape", _SHAPES)
     def test_forward(self, backend, dtype, shape, seed, cuda_available):
@@ -76,7 +76,7 @@ class TestAdaLN:
         assert_values_close(out.float(), ref.float(), rtol=rtol, atol=atol,
                             name=f"adaln[{backend}/{dtype}]")
 
-    @pytest.mark.parametrize("backend", ["cuda", "triton"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton"])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_vs_eager(self, backend, dtype, seed, cuda_available):
         """Non-eager backends must match the appropriate dtype reference."""
@@ -144,7 +144,7 @@ class TestAdaLN:
 
         assert_values_close(out, ref, rtol=1e-4, atol=1e-5, name="adaln[no-op scale/shift]")
 
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     def test_contiguous_output(self, backend, cuda_available):
         """Output must always be contiguous."""
         device = "cuda" if cuda_available else "cpu"
@@ -162,7 +162,7 @@ class TestAdaLN:
 
 
 class TestRMSAdaLN:
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     @pytest.mark.parametrize("dtype", _DTYPES)
     @pytest.mark.parametrize("shape", _SHAPES)
     def test_forward(self, backend, dtype, shape, seed, cuda_available):
@@ -193,7 +193,7 @@ class TestRMSAdaLN:
         assert_values_close(out.float(), ref.float(), rtol=rtol, atol=atol,
                             name=f"rms_adaln[{backend}/{dtype}]")
 
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     @pytest.mark.parametrize("batch", [1, 2, 3])
     def test_per_sample_modulation_broadcast(self, backend, batch, seed, cuda_available):
         """scale/shift of shape (B, 1, D) must broadcast per sample, not per row.
@@ -219,7 +219,7 @@ class TestRMSAdaLN:
         assert_values_close(out, ref, rtol=1e-4, atol=1e-5,
                             name=f"rms_adaln[{backend}/per-sample B={batch}]")
 
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     def test_per_token_modulation(self, backend, seed, cuda_available):
         """Fully materialized per-token scale/shift (no broadcast) must also work."""
         device = "cuda" if cuda_available else "cpu"
@@ -239,7 +239,7 @@ class TestRMSAdaLN:
         assert_values_close(out, ref, rtol=1e-4, atol=1e-5,
                             name=f"rms_adaln[{backend}/per-token]")
 
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     @pytest.mark.parametrize("dim", [1, 31, 129, 4096])
     def test_odd_and_large_dims(self, backend, dim, seed, cuda_available):
         """Non-vectorizable and large hidden dims take the scalar tail / block loop."""
@@ -259,7 +259,7 @@ class TestRMSAdaLN:
         assert_values_close(out, ref, rtol=1e-4, atol=1e-5,
                             name=f"rms_adaln[{backend}/D={dim}]")
 
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     @pytest.mark.parametrize("rows", [512, 2048])
     def test_warp_and_block_kernel_paths(self, backend, rows, seed, cuda_available):
         """The CUDA backend switches kernels at N == 1024; cover both sides."""
@@ -296,7 +296,7 @@ class TestRMSAdaLN:
         assert_values_close(rms_out, _ref_rms_adaln(x, scale, shift, 1e-6),
                             rtol=1e-4, atol=1e-5, name="rms_adaln[vs adaln]")
 
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     def test_contiguous_output(self, backend, cuda_available):
         device = "cuda" if cuda_available else "cpu"
         capable = get_capable_backends("rms_adaln", device)

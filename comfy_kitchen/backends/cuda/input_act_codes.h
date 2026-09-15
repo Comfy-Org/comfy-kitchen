@@ -9,7 +9,7 @@
 namespace comfy {
 
 // SwiGLU is the gated pair: the raw row is [gate | up] (2*K wide) and the
-// activated row silu(gate) * up is K wide; the others are elementwise.
-enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2 };
+// activated row silu(gate) * up is K wide. RmsNorm carries a weight pointer and eps.
+enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2, kActRmsNorm = 3 };
 
 }  // namespace comfy

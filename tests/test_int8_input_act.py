@@ -8,7 +8,7 @@ from torch.nn import functional
 
 import comfy_kitchen as ck
 from comfy_kitchen.tensor.int8_utils import _build_hadamard
-from tests.conftest import cuda_backend_available, get_capable_backends
+from tests.conftest import cuda_backend_available, get_capable_backends, rel_err
 
 _GROUP = 256
 
@@ -80,7 +80,7 @@ class TestInputActQuantizer:
 
 
 class TestInt8LinearInputAct:
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     def test_matches_eager_activation(self, backend, seed, cuda_available):
         """int8_linear(x, input_act=a) == int8_linear(a(x)) on every backend."""
         device = "cuda" if cuda_available else "cpu"
@@ -102,8 +102,7 @@ class TestInt8LinearInputAct:
                 convrot=True, convrot_groupsize=_GROUP, input_act="gelu_tanh",
             )
 
-        denom = ref.float().abs().max()
-        rel = ((got.float() - ref.float()).abs().max() / denom).item()
+        rel = rel_err(got, ref)
         # Both quantize to int8; they differ only by the intermediate rounding
         # the fused path avoids.
         assert rel < 0.05, f"{backend}: rel={rel:.3e}"
@@ -131,8 +130,7 @@ class TestInt8LinearInputAct:
         got = ck.int8_linear(
             h, weight, wscale, None, torch.bfloat16, input_act="gelu_tanh", **kwargs
         )
-        denom = ref.float().abs().max().clamp(min=1e-9)
-        rel = ((got.float() - ref.float()).abs().max() / denom).item()
+        rel = rel_err(got, ref)
         assert rel < 0.05, f"{tag}: rel={rel:.3e}"
 
     def test_none_is_identity(self, seed, cuda_available):
@@ -171,8 +169,7 @@ class TestInt8LinearInputAct:
         # Same metric as the 2D cases: an elementwise tolerance is meaningless
         # for int8 GEMM outputs, where a single-LSB difference in the quantized
         # activation shifts the whole accumulated sum for that output element.
-        denom = ref.float().abs().max()
-        rel = ((got.float() - ref.float()).abs().max() / denom).item()
+        rel = rel_err(got, ref)
         assert rel < 0.05, f"3d: rel={rel:.3e}"
 
 
@@ -218,7 +215,7 @@ class TestSwiGLUInputAct:
         assert fused_q.dtype == torch.int8
         assert fused_s.shape == (m, 1)
 
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     def test_matches_eager_activation(self, backend, seed, cuda_available):
         """int8_linear(x, input_act="swiglu") == int8_linear(swiglu(x)) everywhere."""
         device = "cuda" if cuda_available else "cpu"
@@ -241,8 +238,7 @@ class TestSwiGLUInputAct:
             )
 
         assert got.shape == (m, n)
-        denom = ref.float().abs().max()
-        rel = ((got.float() - ref.float()).abs().max() / denom).item()
+        rel = rel_err(got, ref)
         assert rel < 0.05, f"{backend}: rel={rel:.3e}"
 
     @pytest.mark.parametrize(
@@ -268,6 +264,120 @@ class TestSwiGLUInputAct:
         got = ck.int8_linear(
             h, weight, wscale, None, torch.bfloat16, input_act="swiglu", **kwargs
         )
-        denom = ref.float().abs().max().clamp(min=1e-9)
-        rel = ((got.float() - ref.float()).abs().max() / denom).item()
+        rel = rel_err(got, ref)
         assert rel < 0.05, f"{tag}: rel={rel:.3e}"
+
+
+_EPS = 1e-5
+
+
+def _rms_norm(x, w, eps=_EPS):
+    return functional.rms_norm(x, (x.shape[-1],), weight=w.to(x.dtype), eps=eps)
+
+
+class TestRmsNormInputAct:
+    """rms_norm folds a pre-norm block's ``linear(rms_norm(x))`` into the
+    quantizer; it carries a K-element weight and an eps alongside the code."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("shape", [(512, 256), (1024, 4096), (37, 2048), (256, 8192)])
+    def test_at_least_as_accurate_as_eager_chain(self, dtype, shape, seed, cuda_available):
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        m, k = shape
+        h = torch.randn((m, k), dtype=dtype, device="cuda") * 2.0
+        w = torch.randn((k,), dtype=dtype, device="cuda")
+
+        hd, wd = h.double(), w.double()
+        g = hd * torch.rsqrt(hd.pow(2).mean(-1, keepdim=True) + _EPS) * wd
+        mat = _build_hadamard(_GROUP, device=h.device, dtype=torch.float64)
+        rot = (g.reshape(-1, k // _GROUP, _GROUP) @ mat).reshape(-1, k)
+        scale = (rot.abs().amax(-1, keepdim=True) / 127.0).clamp(min=1e-30)
+        exact_q = (rot / scale).round().clamp(-128, 127)
+
+        chain_q, _ = cuda_backend.quantize_int8_rowwise_convrot64(
+            _rms_norm(h, w).contiguous(), _GROUP
+        )
+        fused_q, fused_s = cuda_backend.quantize_int8_rowwise_convrot64(
+            h, _GROUP, input_act="rms_norm", input_act_weight=w, input_act_eps=_EPS
+        )
+
+        err_chain = (chain_q.double() - exact_q).abs().mean().item()
+        err_fused = (fused_q.double() - exact_q).abs().mean().item()
+        assert err_fused <= max(err_chain * 1.05, 1e-4), (
+            f"fused ({err_fused:.6f}) less accurate than chain ({err_chain:.6f})"
+        )
+        assert fused_q.shape == (m, k)
+        assert fused_q.dtype == torch.int8
+        assert fused_s.shape == (m, 1)
+
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
+    def test_matches_eager_activation(self, backend, seed, cuda_available):
+        """int8_linear(x, input_act="rms_norm") == int8_linear(rms_norm(x))."""
+        device = "cuda" if cuda_available else "cpu"
+        if backend not in get_capable_backends("int8_linear", device):
+            pytest.skip(f"backend '{backend}' not capable")
+
+        m, k, n = 1024, 4096, 512
+        h = torch.randn(m, k, dtype=torch.bfloat16, device=device)
+        w = torch.randn(k, dtype=torch.bfloat16, device=device)
+        weight = torch.randint(-127, 127, (n, k), dtype=torch.int8, device=device)
+        wscale = torch.tensor(0.01, dtype=torch.float32, device=device)
+
+        with ck.use_backend(backend):
+            ref = ck.int8_linear(
+                _rms_norm(h, w), weight, wscale, None, torch.bfloat16,
+                convrot=True, convrot_groupsize=_GROUP,
+            )
+            got = ck.int8_linear(
+                h, weight, wscale, None, torch.bfloat16,
+                convrot=True, convrot_groupsize=_GROUP,
+                input_act="rms_norm", input_act_weight=w, input_act_eps=_EPS,
+            )
+
+        assert got.shape == (m, n)
+        rel = rel_err(got, ref)
+        assert rel < 0.05, f"{backend}: rel={rel:.3e}"
+
+    @pytest.mark.parametrize(
+        "tag,shape,kwargs",
+        [
+            ("no convrot", (1024, 4096), {"convrot": False}),
+            ("K over smem cap", (64, 256 * 72), {"convrot": True, "convrot_groupsize": 256}),
+            ("m == 1", (1, 4096), {"convrot": True, "convrot_groupsize": 256}),
+        ],
+    )
+    def test_fallback_paths_agree(self, tag, shape, kwargs, seed, cuda_available):
+        """Paths the fused kernel cannot serve must still apply the norm."""
+        if not cuda_available:
+            pytest.skip("CUDA required")
+
+        m, k = shape
+        h = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+        w = torch.randn(k, dtype=torch.bfloat16, device="cuda")
+        weight = torch.randint(-127, 127, (256, k), dtype=torch.int8, device="cuda")
+        wscale = torch.tensor(0.01, dtype=torch.float32, device="cuda")
+
+        ref = ck.int8_linear(_rms_norm(h, w), weight, wscale, None, torch.bfloat16, **kwargs)
+        got = ck.int8_linear(
+            h, weight, wscale, None, torch.bfloat16,
+            input_act="rms_norm", input_act_weight=w, input_act_eps=_EPS, **kwargs
+        )
+        rel = rel_err(got, ref)
+        assert rel < 0.05, f"{tag}: rel={rel:.3e}"
+
+    def test_requires_weight(self, cuda_available):
+        """rms_norm without a weight must raise, not silently skip the norm."""
+        if not cuda_available:
+            pytest.skip("CUDA required")
+
+        h = torch.randn(4, 4096, dtype=torch.bfloat16, device="cuda")
+        weight = torch.randint(-127, 127, (256, 4096), dtype=torch.int8, device="cuda")
+        wscale = torch.tensor(0.01, dtype=torch.float32, device="cuda")
+        with pytest.raises((ValueError, RuntimeError)):
+            ck.int8_linear(
+                h, weight, wscale, None, torch.bfloat16,
+                convrot=True, convrot_groupsize=_GROUP, input_act="rms_norm",
+            )

@@ -10,6 +10,7 @@ import torch
 import comfy_kitchen as ck
 from comfy_kitchen.backends.eager import w4a8_int8 as eager_w4a8
 from comfy_kitchen.backends.eager.convrot_w4a4 import _unpack_int4_row_major
+from comfy_kitchen.backends.eager.group_norm_pad3d import group_norm_silu_pad3d as _eager_group_norm
 from comfy_kitchen.backends.eager.quantization import (
     quantize_and_rotate_rowwise as eager_quantize_and_rotate_rowwise,
 )
@@ -844,6 +845,413 @@ def test_swiglu_quantizer_is_at_least_as_accurate_as_the_chain(hip):
     assert fused_s.shape == (m,)
 
 
+def _rms_norm(x, w, eps=1e-5):
+    return torch.nn.functional.rms_norm(x, (x.shape[-1],), weight=w.to(x.dtype), eps=eps)
+
+
+# rms_norm is folded only into the fused G=256 kernel; the spill and G=64 routes
+# apply it eagerly, so each route is pinned to the one it is meant to take.
+@needs_wmma
+@pytest.mark.parametrize(
+    ("tag", "shape", "kwargs", "fused"),
+    [
+        ("fused convrot", (256, 1024), {"convrot": True, "convrot_groupsize": 256}, True),
+        ("m == 1", (1, 1024), {"convrot": True, "convrot_groupsize": 256}, True),
+        ("global spill", (64, 32768), {"convrot": True, "convrot_groupsize": 256}, False),
+        ("group 64", (256, 1024), {"convrot": True, "convrot_groupsize": 64}, False),
+        ("no convrot", (256, 1024), {"convrot": False}, False),
+    ],
+)
+def test_int8_linear_rms_norm_matches_the_eager_chain(hip, tag, shape, kwargs, fused):
+    torch.manual_seed(0)
+    m, k = shape
+    n = 256
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    nw = torch.randn(k, device=DEV, dtype=torch.bfloat16)
+    wq, ws = ck.quantize_int8_rowwise(torch.randn(n, k, device=DEV, dtype=torch.bfloat16))
+    ws = ws.reshape(-1)
+    assert hip._fused_rms_norm_ok(
+        x, kwargs["convrot"], kwargs.get("convrot_groupsize", 256)) == fused, tag
+
+    with ck.use_backend("hip"):
+        ref = ck.int8_linear(_rms_norm(x, nw), wq, ws, None, torch.bfloat16, **kwargs)
+        out = ck.int8_linear(x, wq, ws, None, torch.bfloat16, input_act="rms_norm",
+                             input_act_weight=nw, input_act_eps=1e-5, **kwargs)
+
+    assert out.shape == (m, n), tag
+    scale = ref.float().abs().max().item()
+    assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale, tag
+
+
+@needs_wmma
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(("m", "k"), [(512, 256), (37, 2048), (1, 4096), (256, 8192)])
+def test_rms_norm_quantizer_is_at_least_as_accurate_as_the_chain(hip, dtype, m, k):
+    torch.manual_seed(0)
+    group = 256
+    x = torch.randn(m, k, device=DEV, dtype=dtype) * 2.0
+    nw = torch.randn(k, device=DEV, dtype=dtype)
+
+    xd, wd = x.double(), nw.double()
+    normed = xd * torch.rsqrt(xd.pow(2).mean(-1, keepdim=True) + 1e-5) * wd
+    mat = _build_hadamard(group, device=x.device, dtype=torch.float64)
+    rotated = (normed.reshape(-1, k // group, group) @ mat).reshape(-1, k)
+    scale = (rotated.abs().amax(-1, keepdim=True) / 127.0).clamp(min=1e-30)
+    exact = (rotated / scale).round().clamp(-128, 127)
+
+    chain_q, _ = hip._rotate_quant_int8(_rms_norm(x, nw).contiguous(), group)
+    fused_q, fused_s = hip._rotate_quant_int8(x, group, "rms_norm", nw, 1e-5)
+
+    err_chain = (chain_q.double() - exact).abs().mean().item()
+    err_fused = (fused_q.double() - exact).abs().mean().item()
+    assert err_fused <= max(err_chain * 1.05, 1e-4), (
+        f"fused ({err_fused:.6f}) less accurate than chain ({err_chain:.6f})"
+    )
+    assert fused_s.shape == (m,)
+
+
+@needs_wmma
+def test_int8_linear_rms_norm_requires_a_weight():
+    x = torch.randn(4, 1024, device=DEV, dtype=torch.bfloat16)
+    wq = torch.randint(-127, 127, (256, 1024), dtype=torch.int8, device=DEV)
+    ws = torch.tensor(0.01, device=DEV)
+    with ck.use_backend("hip"), pytest.raises(ValueError, match="rms_norm"):
+        ck.int8_linear(x, wq, ws, None, torch.bfloat16, convrot=True, input_act="rms_norm")
+
+
+def _gn_inputs(b, c, t, h, w, dtype, affine=True):
+    x = (torch.randn(b, c, t, h, w, device=DEV, dtype=dtype) * 3 + 0.5).contiguous(
+        memory_format=torch.channels_last_3d)
+    if not affine:
+        return x, None, None
+    return (x, torch.randn(c, device=DEV, dtype=dtype) * 0.5 + 1,
+            torch.randn(c, device=DEV, dtype=dtype) * 0.2)
+
+
+def _no_eager_group_norm(monkeypatch):
+    """The shapes below are all ones the kernel serves; an eager fallback would pass
+    against an eager reference without testing anything."""
+    from comfy_kitchen.backends import hip as hip_backend
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("group_norm_silu_pad3d fell back to eager")
+
+    monkeypatch.setattr(hip_backend._eager, "group_norm_silu_pad3d", _fail)
+
+
+# Batch and frames > 1, H*W over one 1024-row statistics chunk, C/8 from 1 to 256.
+@pytest.mark.parametrize(
+    ("b", "c", "t", "h", "w", "groups", "pad"),
+    [
+        (1, 128, 3, 40, 56, 32, (1, 1, 1, 1, 2)),
+        (2, 256, 2, 33, 17, 32, (1, 1, 1, 1, 2)),
+        (1, 512, 2, 9, 9, 32, (0, 1, 0, 1, 2)),
+        (1, 8, 1, 16, 16, 1, (1, 1, 1, 1, 0)),
+        (1, 2048, 1, 6, 5, 32, (1, 1, 1, 1, 1)),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("silu", [True, False])
+def test_group_norm_silu_pad3d_matches_eager(hip, monkeypatch, b, c, t, h, w, groups, pad, dtype,
+                                             silu):
+    torch.manual_seed(0)
+    x, weight, bias = _gn_inputs(b, c, t, h, w, dtype)
+    ref = _eager_group_norm(x, weight, bias, groups, 1e-6, list(pad), silu)
+    _no_eager_group_norm(monkeypatch)
+    got = hip.group_norm_silu_pad3d(x, weight, bias, groups, 1e-6, list(pad), silu)
+
+    assert got.shape == ref.shape and got.dtype == dtype
+    assert got.is_contiguous(memory_format=torch.channels_last_3d)
+    rel = ((got.float() - ref.float()).abs().max() / ref.float().abs().max()).item()
+    assert rel < 5 * torch.finfo(dtype).eps
+    if pad[4]:
+        assert torch.all(got[:, :, :pad[4]] == 0)
+
+
+@pytest.mark.parametrize("silu", [True, False])
+def test_group_norm_silu_pad3d_pad_only(hip, monkeypatch, silu):
+    """Without the norm the kernel is a reflect copy plus an optional SiLU; the copy
+    is exact, and the SiLU is evaluated in fp32 instead of fp16."""
+    torch.manual_seed(0)
+    x, _, _ = _gn_inputs(2, 128, 3, 31, 29, torch.float16, affine=False)
+    ref = _eager_group_norm(x, None, None, 1, 0.0, [0, 1, 0, 1, 2], silu)
+    _no_eager_group_norm(monkeypatch)
+    got = hip.group_norm_silu_pad3d(x, None, None, 1, 0.0, [0, 1, 0, 1, 2], silu)
+    if silu:
+        rel = ((got.float() - ref.float()).abs().max() / ref.float().abs().max()).item()
+        assert rel < 5 * torch.finfo(torch.float16).eps
+    else:
+        assert torch.equal(got, ref)
+
+
+def test_group_norm_silu_pad3d_fp32_affine_and_ncdhw_input(hip, monkeypatch):
+    torch.manual_seed(0)
+    x, weight, bias = _gn_inputs(1, 128, 2, 12, 12, torch.float16)
+    x = x.contiguous()
+    ref = _eager_group_norm(x, weight, bias, 32, 1e-6, [1, 1, 1, 1, 2], True)
+    _no_eager_group_norm(monkeypatch)
+    got = hip.group_norm_silu_pad3d(x, weight.float(), bias.float(), 32, 1e-6, [1, 1, 1, 1, 2], True)
+    assert got.dtype == torch.float16
+    rel = ((got.float() - ref.float()).abs().max() / ref.float().abs().max()).item()
+    assert rel < 5 * torch.finfo(torch.float16).eps
+
+
+@pytest.mark.parametrize("case", ["channels", "misaligned", "groups"])
+def test_group_norm_silu_pad3d_declined_shapes_fall_back(hip, case):
+    torch.manual_seed(0)
+    if case == "channels":
+        x, weight, bias = _gn_inputs(1, 96, 2, 12, 12, torch.float16)
+        groups = 32
+    elif case == "groups":
+        x, weight, bias = _gn_inputs(1, 2048, 1, 4, 4, torch.float16)
+        groups = 2048
+    else:
+        n = 128 * 2 * 12 * 12
+        base = torch.randn(n + 4, dtype=torch.float16, device=DEV)
+        x = base[4:4 + n].view(1, 2, 12, 12, 128).permute(0, 4, 1, 2, 3)
+        assert x.data_ptr() % 16 and x.is_contiguous(memory_format=torch.channels_last_3d)
+        weight = bias = None
+        groups = 1
+    ref = _eager_group_norm(x, weight, bias, groups, 1e-6, [1, 1, 1, 1, 2], True)
+    got = hip.group_norm_silu_pad3d(x, weight, bias, groups, 1e-6, [1, 1, 1, 1, 2], True)
+    assert torch.equal(got, ref)
+
+
+def _rel_err(got, ref) -> float:
+    got, ref = got.float(), ref.float()
+    return ((got - ref).abs().max() / ref.abs().max().clamp(min=1e-9)).item()
+
+
+def _served_fp16_linear(hip, monkeypatch):
+    """Fail the test if fp16_linear falls back to torch's linear."""
+    served = []
+    real = hip._C.fp16_gemm
+
+    def _spy(*args, **kwargs):
+        ok = real(*args, **kwargs)
+        served.append(ok)
+        return ok
+
+    monkeypatch.setattr(hip._C, "fp16_gemm", _spy)
+    return served
+
+
+# The kernel serves deep K only (the envelope comment in gemm_fp16.hip); these
+# shapes cover the tile paths it reaches and a shape it declines.
+@needs_wmma
+@pytest.mark.parametrize(
+    ("m", "n", "k", "served"),
+    [
+        (1797, 2048, 8192, True),
+        (512, 512, 8192, True),
+        (37, 264, 6144, True),
+        (1797, 6144, 2048, False),
+    ],
+)
+@pytest.mark.parametrize("with_bias", [True, False])
+@pytest.mark.parametrize("with_residual", [True, False])
+def test_fp16_linear_matches_fp32_reference(hip, monkeypatch, m, n, k, served, with_bias,
+                                             with_residual):
+    torch.manual_seed(0)
+    x = torch.randn(m, k, dtype=torch.float16, device=DEV)
+    w = torch.randn(n, k, dtype=torch.float16, device=DEV) * 0.02
+    b = torch.randn(n, dtype=torch.float16, device=DEV) if with_bias else None
+    r = torch.randn(m, n, dtype=torch.float16, device=DEV) if with_residual else None
+    rs = torch.randn(n, dtype=torch.float16, device=DEV) if with_residual else None
+    calls = _served_fp16_linear(hip, monkeypatch)
+
+    got = hip.fp16_linear(x, w, b, r, rs)
+    ref = torch.nn.functional.linear(x.float(), w.float(), None if b is None else b.float())
+    if with_residual:
+        ref = r.float() + rs.float() * ref
+
+    assert calls == [served]
+    assert got.dtype == torch.float16 and got.shape == (m, n)
+    # fp32 accumulation: only the fp16 operands and the stored result are rounded
+    assert _rel_err(got, ref) < 5e-3
+
+
+@needs_wmma
+def test_fp16_linear_3d_input(hip):
+    torch.manual_seed(0)
+    x = torch.randn(2, 512, 8192, dtype=torch.float16, device=DEV)
+    w = torch.randn(1024, 8192, dtype=torch.float16, device=DEV) * 0.02
+    b = torch.randn(1024, dtype=torch.float16, device=DEV)
+    r = torch.randn(2, 512, 1024, dtype=torch.float16, device=DEV)
+    rs = torch.randn(1024, dtype=torch.float16, device=DEV)
+    got = hip.fp16_linear(x, w, b, r, rs)
+    ref = torch.addcmul(r.float(), torch.nn.functional.linear(x.float(), w.float(), b.float()),
+                        rs.float())
+    assert got.shape == (2, 512, 1024)
+    assert _rel_err(got, ref) < 5e-3
+
+
+@needs_wmma
+@pytest.mark.parametrize("case", ["unaligned_k", "misaligned_input", "bf16"])
+def test_fp16_linear_unservable_inputs_fall_back(hip, case):
+    torch.manual_seed(0)
+    dtype = torch.bfloat16 if case == "bf16" else torch.float16
+    if case == "unaligned_k":
+        x = torch.randn(64, 8196, dtype=dtype, device=DEV)
+    elif case == "misaligned_input":
+        x = _offset_copy(torch.randn(64, 8192, dtype=dtype, device=DEV))
+    else:
+        x = torch.randn(64, 8192, dtype=dtype, device=DEV)
+    w = torch.randn(96, x.shape[1], dtype=dtype, device=DEV) * 0.02
+    got = hip.fp16_linear(x, w, None)
+    torch.cuda.synchronize()
+    assert torch.equal(got, torch.nn.functional.linear(x, w, None))
+
+
+@needs_wmma
+def test_fp16_linear_offset_vectors_and_scale_requirement(hip):
+    torch.manual_seed(0)
+    m, k, n = 512, 8192, 512
+    x = torch.randn(m, k, dtype=torch.float16, device=DEV)
+    w = torch.randn(n, k, dtype=torch.float16, device=DEV) * 0.02
+    b = torch.randn(n, dtype=torch.float16, device=DEV)
+    r = torch.randn(m, n, dtype=torch.float16, device=DEV)
+    rs = torch.randn(n, dtype=torch.float16, device=DEV)
+    ref = hip.fp16_linear(x, w, b, r, rs)
+    got = hip.fp16_linear(x, w, _offset_copy(b), _offset_copy(r), _offset_copy(rs))
+    torch.cuda.synchronize()
+    assert torch.equal(got, ref)
+    with pytest.raises(ValueError, match="residual"):
+        hip.fp16_linear(x, w, b, residual=r)
+
+
+def _conv_inputs(c, k, d, h, w, ksize, with_bias=True, with_residual=False, stride=(1, 1, 1)):
+    cl = torch.channels_last_3d
+    x = torch.randn(1, c, d, h, w, dtype=torch.float16, device=DEV).contiguous(memory_format=cl)
+    weight = (torch.randn(k, c, *ksize, dtype=torch.float16, device=DEV) * 0.02).contiguous(
+        memory_format=cl)
+    bias = torch.randn(k, dtype=torch.float16, device=DEV) if with_bias else None
+    residual = None
+    if with_residual:
+        oshape = (1, k, (d - ksize[0]) // stride[0] + 1, (h - ksize[1]) // stride[1] + 1,
+                  (w - ksize[2]) // stride[2] + 1)
+        residual = torch.randn(oshape, dtype=torch.float16, device=DEV).contiguous(memory_format=cl)
+    return x, weight, bias, residual
+
+
+def _conv_ref(x, weight, bias, residual, stride):
+    out = torch.nn.functional.conv3d(x.float(), weight.float(),
+                                     None if bias is None else bias.float(), stride=stride)
+    return out if residual is None else out + residual.float()
+
+
+# The CUDA suite's served shapes: 3x3x3 at 128 and 256 channels, the strided
+# downsample, the 1x1x1 shortcut, the deep small stage and the padded pixel input.
+@needs_wmma
+@pytest.mark.parametrize(
+    ("c", "k", "d", "h", "w", "ksize", "stride"),
+    [
+        (128, 128, 5, 130, 130, (3, 3, 3), (1, 1, 1)),
+        (256, 256, 5, 130, 130, (3, 3, 3), (1, 1, 1)),
+        (128, 128, 9, 129, 129, (3, 3, 3), (1, 2, 2)),
+        (128, 256, 5, 128, 128, (1, 1, 1), (1, 1, 1)),
+        (512, 512, 7, 18, 18, (3, 3, 3), (1, 1, 1)),
+        (3, 128, 5, 130, 130, (3, 3, 3), (1, 1, 1)),
+    ],
+)
+@pytest.mark.parametrize(("with_bias", "with_residual"), [(True, False), (False, False), (True, True)])
+def test_fp16_conv3d_matches_fp32_reference(hip, c, k, d, h, w, ksize, stride, with_bias,
+                                            with_residual):
+    torch.manual_seed(0)
+    x, weight, bias, residual = _conv_inputs(c, k, d, h, w, ksize, with_bias, with_residual, stride)
+    got = hip._wmma_fp16_conv3d(x, weight, bias, residual, list(stride))
+    assert got is not None, "the kernel declined a shape it should serve"
+    assert got.is_contiguous(memory_format=torch.channels_last_3d)
+    assert _rel_err(got, _conv_ref(x, weight, bias, residual, stride)) < 5e-3
+
+
+@needs_wmma
+def test_fp16_conv3d_declines_like_cuda(hip):
+    torch.manual_seed(0)
+    # a token launch, and a deep (C*T*R*S > 8192) launch large enough to fill the device
+    for shape in [(64, 64, 3, 6, 6), (512, 512, 5, 66, 66)]:
+        x, weight, bias, residual = _conv_inputs(*shape, (3, 3, 3), with_residual=True)
+        assert hip._wmma_fp16_conv3d(x, weight, bias, residual, [1, 1, 1]) is None
+        got = hip.fp16_conv3d(x, weight, bias, residual, [1, 1, 1])
+        assert _rel_err(got, _conv_ref(x, weight, bias, residual, (1, 1, 1))) < 5e-3
+    # a residual that does not match the output shape
+    x, weight, bias, residual = _conv_inputs(128, 128, 5, 130, 130, (3, 3, 3), with_residual=True)
+    assert hip._wmma_fp16_conv3d(x, weight, bias, residual[:, :64], [1, 1, 1]) is None
+
+
+@needs_wmma
+def test_fp16_epilogue_operands_follow_the_input_device(hip):
+    """bias and residual are read off raw pointers on x's stream, so host-side ones
+    must be moved rather than dereferenced as device memory."""
+    torch.manual_seed(0)
+    x = torch.randn(512, 8192, dtype=torch.float16, device=DEV)
+    w = torch.randn(512, 8192, dtype=torch.float16, device=DEV) * 0.02
+    r = torch.randn(512, 512, dtype=torch.float16)
+    rs = torch.randn(512, dtype=torch.float16)
+    ref = hip.fp16_linear(x, w, None, r.to(DEV), rs.to(DEV))
+    got = hip.fp16_linear(x, w, None, r, rs)
+    torch.cuda.synchronize()
+    assert torch.equal(got, ref)
+
+    # a shape the kernel declines takes the fallback, which must accept them too
+    x = torch.randn(64, 2048, dtype=torch.float16, device=DEV)
+    w = torch.randn(64, 2048, dtype=torch.float16, device=DEV) * 0.02
+    b = torch.randn(64, dtype=torch.float16)
+    r = torch.randn(64, 64, dtype=torch.float16)
+    rs = torch.randn(64, dtype=torch.float16)
+    ref = hip.fp16_linear(x, w, b.to(DEV), r.to(DEV), rs.to(DEV))
+    assert torch.equal(hip.fp16_linear(x, w, b, r, rs), ref)
+
+    # a misaligned input is unsupported before any operand is prepared
+    x = _offset_copy(torch.randn(64, 8192, dtype=torch.float16, device=DEV))
+    w = torch.randn(64, 8192, dtype=torch.float16, device=DEV) * 0.02
+    ref = hip.fp16_linear(x, w, b.to(DEV), r.to(DEV), rs.to(DEV))
+    assert torch.equal(hip.fp16_linear(x, w, b, r, rs), ref)
+
+    # served, then declined (a token launch)
+    for shape in [(128, 128, 5, 130, 130), (64, 64, 3, 6, 6)]:
+        xc, wc, bc, rc = _conv_inputs(*shape, (3, 3, 3), with_residual=True)
+        ref = hip.fp16_conv3d(xc, wc, bc, rc, [1, 1, 1])
+        got = hip.fp16_conv3d(xc, wc, bc.cpu(), rc.cpu(), [1, 1, 1])
+        torch.cuda.synchronize()
+        assert torch.equal(got, ref)
+
+
+def test_group_norm_silu_pad3d_pad_only_ignores_bias(hip, monkeypatch):
+    torch.manual_seed(0)
+    x, _, _ = _gn_inputs(1, 128, 2, 12, 12, torch.float16, affine=False)
+    bias = torch.randn(128, dtype=torch.float16, device=DEV)
+    ref = _eager_group_norm(x, None, bias, 1, 0.0, [1, 1, 1, 1, 2], True)
+    _no_eager_group_norm(monkeypatch)
+    got = hip.group_norm_silu_pad3d(x, None, bias, 1, 0.0, [1, 1, 1, 1, 2], True)
+    assert torch.equal(got, hip.group_norm_silu_pad3d(x, None, None, 1, 0.0, [1, 1, 1, 1, 2], True))
+    rel = ((got.float() - ref.float()).abs().max() / ref.float().abs().max()).item()
+    assert rel < 5 * torch.finfo(torch.float16).eps
+
+
+@pytest.mark.parametrize("side", ["left", "right", "top", "bottom", "front"])
+def test_group_norm_silu_pad3d_binding_rejects_negative_padding(hip, side):
+    """The extents are checked before they size the output buffer: a negative pad
+    of -W makes a zero-length out look long enough."""
+    x = torch.randn(1, 8, 2, 4, 4, dtype=torch.float16, device=DEV).contiguous(
+        memory_format=torch.channels_last_3d)
+    out = torch.empty(0, dtype=torch.float16, device=DEV)
+    pads = dict.fromkeys(("left", "right", "top", "bottom", "front"), 0)
+    pads[side] = -2 if side == "front" else -4
+    with pytest.raises(RuntimeError, match=f"{side} must be non-negative"):
+        hip._C.group_norm_silu_pad3d(
+            hip._dl(x), None, None, hip._dl(out), None, 1, 8, 2, 4, 4, 1, 0.0,
+            pads["left"], pads["right"], pads["top"], pads["bottom"], pads["front"], False,
+            hip._stream(x))
+
+
+@needs_wmma
+def test_fp16_conv3d_bad_stride_is_reported_by_torch(hip):
+    x, weight, bias, _ = _conv_inputs(16, 16, 4, 10, 10, (3, 3, 3))
+    with pytest.raises(RuntimeError):
+        hip.fp16_conv3d(x, weight, bias, None, [0, 1, 1])
+
+
 @needs_wmma
 def test_int8_linear_input_act_none_is_the_identity():
     """None and "none" must be bit-identical to omitting the argument."""
@@ -1646,8 +2054,11 @@ def test_rms_adaln_is_not_adaln(hip):
 
 
 @pytest.mark.parametrize("split_half", [False, True])
-@pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_rope_matches_eager(split_half, freqs_dtype):
+    """The kernel rotates in fp32 and rounds like eager, which evaluates in the
+    freqs dtype, so a narrow freqs dtype has to come out bit-identical. Loose
+    tolerances hid a folded round_fp16 that left the fp16 path a rounding short."""
     torch.manual_seed(0)
     batch, heads, seq, dim = 2, 8, 128, 64
     xq = torch.randn(batch, heads, seq, dim, device=DEV, dtype=torch.bfloat16)
@@ -1660,8 +2071,14 @@ def test_rope_matches_eager(split_half, freqs_dtype):
     with ck.use_backend("eager"):
         qr, kr = pair(xq, xk, freqs)
 
-    torch.testing.assert_close(q.float(), qr.float(), rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(k.float(), kr.float(), rtol=2e-2, atol=2e-2)
+    if freqs_dtype is torch.float32:
+        # -ffast-math contracts the split-half add into an fma, one rounding fewer
+        # than eager's separate products; immaterial at fp32 width
+        torch.testing.assert_close(q.float(), qr.float(), rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(k.float(), kr.float(), rtol=2e-2, atol=2e-2)
+    else:
+        assert torch.equal(q, qr)
+        assert torch.equal(k, kr)
 
 
 # (in-place name, functional sibling, takes a q/k pair, takes a norm weight)

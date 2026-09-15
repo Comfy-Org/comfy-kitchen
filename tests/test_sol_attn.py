@@ -290,7 +290,7 @@ def test_direct_backend_validates_like_the_public_path():
     """The backend-direct entry runs the same shared rule as the registry."""
     q, k, v = _qkv(1, 512, 4)
     with pytest.raises(ValueError, match="bfloat16"):
-        backend.sol_attn(q.half(), k.half(), v.half(), tau=1.4)
+        backend.sol_attn(q.float(), k.float(), v.float(), tau=1.4)
     with pytest.raises(ValueError, match="shape"):
         backend.sol_attn(q, k[:, :256].contiguous(), v, tau=1.4)
 
@@ -388,6 +388,183 @@ def test_chunked_producer_matches_separate_rope(rot):
             c["chunks"], c["t"], c["h"], c["freqs"].clone(), c["norm"], kmean=km, vscale=vs,
             tau=1.4, sink_blocks=[0, 2])
     assert _cos(out3, ref) > 0.995
+
+
+def test_exact_branch_quantization_error():
+    """Full-range per-block P quantization: with every block routed the exact
+    branch must sit well under the ~2%% relL2 of the running-max scheme."""
+    q, k, v = _qkv(1, 4096, 8)
+    out = ck.sol_attn(q, k, v, tau=-1e9)
+    ref = _dense(q, k, v)
+    rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
+    assert rel < 0.016, rel
+
+
+@pytest.mark.parametrize("t", [1024, 3137])
+def test_fp16_inputs_match_bf16(t):
+    """fp16 and bf16 inputs run the same int8 pipeline; only the loads and stores differ."""
+    q, k, v = _qkv(1, t, 4)
+    q16, k16, v16 = (x.half() for x in (q, k, v))
+    ref = ck.sol_attn(q, k, v, tau=1.0)
+    got = ck.sol_attn(q16, k16, v16, tau=1.0)
+    assert got.dtype == torch.float16
+    rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
+    assert rel < 4e-3, rel
+    assert _cos(got, sol_attn_eager(q16, k16, v16, tau=1.0)) > 0.998
+
+
+def test_fp16_strided_inputs_and_mixed_dtype():
+    """Strided fp16 views are accepted; mixed dtypes are rejected."""
+    b, t, h = 2, 1000, 3
+    q, k, v = _qkv(b, t, h, seed=5)
+    q16, k16, v16 = (x.half().permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+                     for x in (q, k, v))
+    got = ck.sol_attn(q16, k16, v16, tau=1.0)
+    ref = ck.sol_attn(q, k, v, tau=1.0)
+    rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
+    assert rel < 4e-3, rel
+
+    ext, w = backend._C, _wrap
+    ws = torch.empty(ext.sol_attn_plan(1, 256, 1)["total"], dtype=torch.uint8, device="cuda")
+    q1, k1, v1 = _qkv(1, 256, 1)
+    stream = torch.cuda.current_stream().cuda_stream
+    args = (1, 256, 1, HD, 1.0, HD ** -0.5, 0, 0, 0, 0, stream)
+    with pytest.raises(RuntimeError, match="out"):
+        ext.sol_attn(w(q1), w(k1), w(v1), w(torch.empty_like(q1, dtype=torch.float16)), w(ws), *args)
+    with pytest.raises(RuntimeError, match="k must be"):
+        ext.sol_attn(w(q1.half()), w(k1), w(v1.half()), w(torch.empty_like(q1, dtype=torch.float16)),
+                     w(ws), *args)
+
+
+def test_is_available_tracks_the_device(monkeypatch):
+    """True where a fused backend is built, false below the CUDA compute-capability floor."""
+    assert ck.sol_attn_is_available()
+    if backend is not cuda_backend:
+        pytest.skip("the compute-capability floor belongs to the CUDA backend")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (7, 5))
+    assert not ck.sol_attn_is_available()
+
+
+def _rel(a, b):
+    return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+
+def _token_routing_case(t=4096 + 5, h=8, seed=7):
+    """Queries share a direction per run of 4 blocks; a few keys aligned with it are
+    scattered over every block. Block routing misses them, token routing finds them."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    d, nb = HD, (t + 63) // 64
+    bases = torch.randn(8, h, d, device="cuda", generator=g)
+    bases = 4.0 * bases / bases.norm(dim=-1, keepdim=True)
+    base_of_block = (torch.arange(nb, device="cuda") // 4) % 8
+    q = bases[base_of_block].repeat_interleave(64, dim=0)[:t] + 0.5 * torch.randn(t, h, d, device="cuda", generator=g)
+    k = 0.5 * torch.randn(t, h, d, device="cuda", generator=g)
+    v = torch.randn(t, h, d, device="cuda", generator=g)
+    per_base = t // 32
+    idx = torch.randperm(t, generator=g, device="cuda")[:8 * per_base]
+    gain = torch.empty(8 * per_base, device="cuda").uniform_(1.0, 3.0, generator=g)
+    k[idx] = bases[torch.arange(8 * per_base, device="cuda") % 8] * gain[:, None, None] + 0.5 * k[idx]
+    return tuple(x[None].to(torch.bfloat16) for x in (q, k, v))
+
+
+@pytest.mark.parametrize("mode", [{"tau": 1.4}, {"topk_ratio": 0.1}])
+def test_token_aug_improves_exactness(mode):
+    """A larger token budget brings the output closer to dense and shrinks the DC bias."""
+    q, k, v = _token_routing_case()
+    ref = _dense(q, k, v)
+    errs, bias = {}, {}
+    for n in (0, 64, 256):
+        out = ck.sol_attn(q, k, v, sink_blocks=[0, 2], token_aug=n, **mode)
+        assert torch.isfinite(out.float()).all()
+        errs[n] = _rel(out, ref)
+        bias[n] = (out.float() - ref).mean(dim=1).norm().item()
+    assert errs[256] < errs[64] < 0.5 * errs[0], errs
+    assert bias[256] < bias[0], bias
+
+
+def test_token_aug_is_deterministic():
+    """Reruns and strided views are bit-identical."""
+    q, k, v = _token_routing_case(seed=3)
+    a = ck.sol_attn(q, k, v, topk_ratio=0.1, token_aug=256)
+    for _ in range(3):
+        assert torch.equal(a, ck.sol_attn(q, k, v, topk_ratio=0.1, token_aug=256))
+    qb, kb, vb = (x.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3) for x in (q, k, v))
+    assert torch.equal(a, ck.sol_attn(qb, kb, vb, topk_ratio=0.1, token_aug=256))
+
+
+def test_token_aug_surplus_over_the_budget_stays_in_the_tail():
+    """A token the budget cannot list must stay pooled, not fall out of both branches.
+
+    Keys alternate +c*u / -c*u per block, so each block mean is zero and the pooled
+    score routing sees is ~0, while every token scores +-c^2*scale*log2e. That puts
+    half of every unrouted block into the clamped top histogram bin, whose count the
+    threshold walk cannot bound, so the reservation runs past n_tok (measured: 1952
+    reserved against 256). Dropping the surplus from the tail as well as the list
+    loses its mass and costs an order of magnitude of accuracy.
+    """
+    t, h, c = 4096, 2, 30.0
+    g = torch.Generator(device="cuda").manual_seed(0)
+    u = torch.randn(h, HD, device="cuda", generator=g)
+    u = u / u.norm(dim=-1, keepdim=True)
+    sign = torch.where(torch.arange(t, device="cuda") % 2 == 0, 1.0, -1.0)
+    q = (c * u)[None].expand(t, h, HD)
+    k = (c * u)[None] * sign[:, None, None]
+    v = torch.randn(t, h, HD, device="cuda", generator=g)
+    q, k, v = (x[None].to(torch.bfloat16).contiguous() for x in (q, k, v))
+
+    ref = _dense(q, k, v)
+    aug = ck.sol_attn(q, k, v, tau=4.0, token_aug=256)
+    assert torch.isfinite(aug.float()).all()
+    # measured: 4.64 for the pooled tail alone, 2.20 when the surplus is dropped,
+    # 0.13 when it is kept, so the cut sits an order of magnitude either side
+    no_aug = _rel(ck.sol_attn(q, k, v, tau=4.0), ref)
+    assert _rel(aug, ref) < 0.15 * no_aug, (_rel(aug, ref), no_aug)
+
+
+def test_token_aug_chunked_matches_direct():
+    """The chunked path runs the same token stage."""
+    c = _chunked_case(seed=13, rot=96, v_scale=0.02)
+    ref = backend.sol_attn(c["q"], c["k"], c["v"], tau=1.4, sink_blocks=[0, 2], token_aug=256)
+    out, km, vs = backend.sol_attn_chunked(
+        c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], tau=1.4, sink_blocks=[0, 2], token_aug=256)
+    # the two paths quantize K differently, so the token picks differ at the margin
+    assert _cos(out, ref) > 0.95
+    plain = backend.sol_attn_chunked(
+        c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], kmean=km, vscale=vs, tau=1.4, sink_blocks=[0, 2])[0]
+    assert _rel(out, _dense(c["q"], c["k"], c["v"])) < _rel(plain, _dense(c["q"], c["k"], c["v"]))
+
+
+def test_token_aug_validation_and_no_tail():
+    """Bad budgets are rejected; identical keys admit nothing (one score bin, over budget);
+    dense rows are untouched; the stage works without the tail and with a budget that is
+    not a power of two."""
+    q, k, v = _qkv(1, 2048, 4)
+    for bad in (100, 512, -64):
+        with pytest.raises(NoCapableBackendError, match="token_aug"):
+            ck.sol_attn(q, k, v, topk_ratio=0.2, token_aug=bad)
+        with pytest.raises(RuntimeError, match="token_aug"):
+            backend._C.sol_attn_plan(1, 2048, 4, token_aug=bad)
+    kf = k[:, :1].expand_as(k).contiguous()
+    flat = ck.sol_attn(q, kf, v, topk_ratio=0.2, tail=False, token_aug=256)
+    assert torch.equal(flat, ck.sol_attn(q, kf, v, topk_ratio=0.2, tail=False))
+    full = ck.sol_attn(q, k, v, tau=1.4, sink_q=[0, 32], token_aug=256)
+    assert torch.equal(full, ck.sol_attn(q, k, v, tau=1.4, sink_q=[0, 32]))
+    q, k, v = _token_routing_case(t=2048, h=4)
+    no_tail = ck.sol_attn(q, k, v, topk_ratio=0.2, tail=False)
+    aug = ck.sol_attn(q, k, v, topk_ratio=0.2, tail=False, token_aug=256)
+    assert torch.isfinite(aug.float()).all()
+    assert _rel(aug, _dense(q, k, v)) < _rel(no_tail, _dense(q, k, v))
+    aug192 = ck.sol_attn(q, k, v, topk_ratio=0.2, tail=False, token_aug=192)
+    assert torch.isfinite(aug192.float()).all()
+    assert _rel(aug192, _dense(q, k, v)) < _rel(no_tail, _dense(q, k, v))
+    assert torch.equal(aug192, ck.sol_attn(q, k, v, topk_ratio=0.2, tail=False, token_aug=192))
+
+
+def test_chunked_producer_public_entry():
+    """comfy_kitchen.sol_attn_chunked is the registered backend's function."""
+    expected = hip_backend if ck.registry.is_available("hip") else cuda_backend
+    assert "sol_attn_chunked" in ck.__all__
+    assert ck.sol_attn_chunked is expected.sol_attn_chunked
 
 
 def test_bindings_check_buffer_sizes():

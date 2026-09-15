@@ -37,6 +37,7 @@ extern "C" void launch_cublas_gemm_int8_kernel(
     int64_t workspace_size,
     cudaStream_t stream);
 
+// bias is read in the OUTPUT dtype (cutlass_gemm_int8.cu); callers gate on it.
 extern "C" bool launch_cutlass_int8_dequant_strided(
     const void* A,
     const void* B,
@@ -136,7 +137,8 @@ struct FusedInt4Gemm {
     using Accum = cutlass::epilogue::threadblock::VisitorAccFetch;
     using XScale = cutlass::epilogue::threadblock::VisitorColBroadcast<ThreadMap, ElementCompute, cute::Stride<cute::_1, cute::_0, int32_t>>;
     using WScale = cutlass::epilogue::threadblock::VisitorRowBroadcast<ThreadMap, ElementCompute, cute::Stride<cute::_0, cute::_1, int32_t>>;
-    using Bias = cutlass::epilogue::threadblock::VisitorRowBroadcast<ThreadMap, ElementCompute, cute::Stride<cute::_0, cute::_1, int32_t>>;
+    // bias is read in the output dtype and converted in-register, like the int8 kernels
+    using Bias = cutlass::epilogue::threadblock::VisitorRowBroadcast<ThreadMap, ElementOutput, cute::Stride<cute::_0, cute::_1, int32_t>>;
     using Mul0 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementCompute, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
     using EVT0 = cutlass::epilogue::threadblock::Sm80EVT<Mul0, Accum, XScale>;
     using Mul1 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementCompute, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
@@ -158,12 +160,12 @@ struct FusedInt4Gemm {
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
     static bool run(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
-                    const float* bias, ElementOutput* D, int M, int N, int K, cudaStream_t stream) {
+                    const ElementOutput* bias, ElementOutput* D, int M, int N, int K, cudaStream_t stream) {
         cutlass::gemm::GemmCoord problem(M, N, K);
         typename EVTD::Arguments cb{
             { {  { {}, {const_cast<float*>(xs), 0.f, {cute::_1{}, cute::_0{}, M}}, {} },
                  {const_cast<float*>(ws), 0.f, {cute::_0{}, cute::_1{}, N}}, {} },
-              {const_cast<float*>(bias), 0.f, {cute::_0{}, cute::_1{}, N}}, {} },
+              {const_cast<ElementOutput*>(bias), ElementOutput(0), {cute::_0{}, cute::_1{}, N}}, {} },
             {D, {N, cute::_1{}, M * N}} };
         typename Gemm::Arguments args(
             cutlass::gemm::GemmUniversalMode::kGemm, problem, 1, cb,
@@ -245,8 +247,8 @@ struct FusedInt4GemmNoBias {
 
 template <typename OutT>
 bool dispatch_fused_int4(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
-                         const float* bias, OutT* D, int M, int N, int K, cudaStream_t stream) {
-    using Fn = bool (*)(const int8_t*, const int8_t*, const float*, const float*, const float*, OutT*, int, int, int, cudaStream_t);
+                         const OutT* bias, OutT* D, int M, int N, int K, cudaStream_t stream) {
+    using Fn = bool (*)(const int8_t*, const int8_t*, const float*, const float*, const OutT*, OutT*, int, int, int, cudaStream_t);
     static const Fn runners[] = {
         &FusedInt4Gemm<OutT, 128, 256, 128, 64, 64, 128, 3>::run,
         &FusedInt4Gemm<OutT, 128, 256, 256, 64, 64, 256, 3>::run,
@@ -2925,7 +2927,8 @@ void launch_int4_weight_int8_act_gemm_dequant_chunked_kernel(
             && num_rows >= 1024
             && (cols >= 4096 || (num_cols == 2560 && cols == 2560))
             && weight_scale_size != 1
-            && (!has_bias || bias_dtype_code == 0)
+            // the strided GEMM reads bias in the output dtype
+            && (!has_bias || bias_dtype_code == output_dtype_code)
             && launch_cutlass_int8_dequant_strided(
                 input,
                 weight_workspace,
@@ -3018,8 +3021,7 @@ bool launch_cutlass_int4_dequant(
     const int8_t* b = static_cast<const int8_t*>(B);
     const float* x = static_cast<const float*>(xs);
     const float* w = static_cast<const float*>(ws);
-    const float* bs = static_cast<const float*>(bias);
-    if (bs == nullptr) {
+    if (bias == nullptr) {
         switch (out_dtype_code) {
             case 0: return dispatch_fused_int4_no_bias<float>(a, b, x, w, static_cast<float*>(D), M, N, K, stream);
             case 1: return dispatch_fused_int4_no_bias<cutlass::half_t>(a, b, x, w, static_cast<cutlass::half_t*>(D), M, N, K, stream);
@@ -3027,10 +3029,11 @@ bool launch_cutlass_int4_dequant(
             default: return false;
         }
     }
+    // bias is in the output dtype (the binding checks it)
     switch (out_dtype_code) {
-        case 0: return dispatch_fused_int4<float>(a, b, x, w, bs, static_cast<float*>(D), M, N, K, stream);
-        case 1: return dispatch_fused_int4<cutlass::half_t>(a, b, x, w, bs, static_cast<cutlass::half_t*>(D), M, N, K, stream);
-        case 2: return dispatch_fused_int4<cutlass::bfloat16_t>(a, b, x, w, bs, static_cast<cutlass::bfloat16_t*>(D), M, N, K, stream);
+        case 0: return dispatch_fused_int4<float>(a, b, x, w, static_cast<const float*>(bias), static_cast<float*>(D), M, N, K, stream);
+        case 1: return dispatch_fused_int4<cutlass::half_t>(a, b, x, w, static_cast<const cutlass::half_t*>(bias), static_cast<cutlass::half_t*>(D), M, N, K, stream);
+        case 2: return dispatch_fused_int4<cutlass::bfloat16_t>(a, b, x, w, static_cast<const cutlass::bfloat16_t*>(bias), static_cast<cutlass::bfloat16_t*>(D), M, N, K, stream);
         default: return false;
     }
 #else

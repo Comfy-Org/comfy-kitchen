@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Sol-Attn exact branch: each query block walks its routed key-block list,
-// resuming the online softmax (o / m / l) from route's handover.
+// Sol-Attn exact branch: each query block walks its routed key-block list, then
+// the token list sol_attn_token.hip left for its group, resuming the online
+// softmax (o / m / l) from the handover.
 //
 // All-INT8, and transposed like int8_attn.hip: S^T = K @ Q^T puts one query on a
 // lane with eight keys in its accumulator, so the softmax is scalar per lane and
@@ -42,13 +43,16 @@ constexpr int kStrideV = BK + kLdsPad;
 // qi:  [B,T,H,D] int8                  qs:  [B,T,H] f32
 // ki:  [B*H,Tp,D] int8                 ksb: [B*H,Tp] float2 = (ks, bias)
 // vT:  [B*H,D,Tp] int8 (transposed)    vsc: [B*H,D] f32
+template <typename TOut>
 __global__ __launch_bounds__(kThreads) void sol_exact_kernel(
     const int8_t* __restrict__ qi, const float* __restrict__ qs, const int8_t* __restrict__ ki,
     const float2* __restrict__ ksb, const int8_t* __restrict__ vT, const float* __restrict__ vsc,
     const uint16_t* __restrict__ blk_idx, const int32_t* __restrict__ blk_cnt,
     const __bf16* __restrict__ o_part, const float* __restrict__ m_part,
-    const float* __restrict__ l_part, __bf16* __restrict__ out, int T, int Tp, int H, int NTB,
-    float scale_log2) {
+    const float* __restrict__ l_part,
+    const int8_t* __restrict__ vRow,  // [B*H, Tp, D] int8, row-major (gathered token tiles)
+    const uint32_t* __restrict__ tok_idx, const int32_t* __restrict__ tok_cnt, int n_tok,
+    TOut* __restrict__ out, int T, int Tp, int H, int NTB, float scale_log2) {
     __shared__ __attribute__((aligned(16))) int8_t sK[BK * kStrideK];
     __shared__ __attribute__((aligned(16))) int8_t sVt[HD * kStrideV];
     __shared__ float2 sKsb[BK];
@@ -86,25 +90,10 @@ __global__ __launch_bounds__(kThreads) void sol_exact_kernel(
 #pragma unroll
         for (int nt = 0; nt < NT; ++nt) load_o_tile<__bf16>(orow, nt * 16, o_acc[nt], lane);
     }
-    float m_r = m_part[qb_s], l_r = l_part[qb_s];
+    float m_r = m_part[qb_s], l_r = l_part[qb_s], c_r = m_r;   // c_r: scale o_acc / l_r are carried in
 
-    for (int kb = 0; kb < n_blocks; ++kb) {
-        const int64_t k0 = static_cast<int64_t>(my_idx[kb]) * BK;
-
-        __syncthreads();
-        for (int idx = tid; idx < BK * (HD / 8); idx += kThreads) {
-            const int p = idx / (HD / 8), c8 = (idx % (HD / 8)) * 8;
-            *reinterpret_cast<uint2*>(sK + p * kStrideK + c8) =
-                *reinterpret_cast<const uint2*>(ki + kd_base + (k0 + p) * HD + c8);
-        }
-        for (int idx = tid; idx < HD * (BK / 8); idx += kThreads) {
-            const int c = idx / (BK / 8), part = (idx % (BK / 8)) * 8;
-            *reinterpret_cast<uint2*>(sVt + c * kStrideV + part) = *reinterpret_cast<const uint2*>(
-                vT + vT_base + static_cast<int64_t>(c) * Tp + k0 + part);
-        }
-        for (int idx = tid; idx < BK; idx += kThreads) sKsb[idx] = ksb[kp_base + k0 + idx];
-        __syncthreads();
-
+    // A staged tile is the same shape either way, so both walks end in this body.
+    auto compute_tile = [&]() {
         typename MmaInt8::Acc s_acc[KT];
 #pragma unroll
         for (int kt = 0; kt < KT; ++kt) {
@@ -118,7 +107,9 @@ __global__ __launch_bounds__(kThreads) void sol_exact_kernel(
         }
 
         float p_val[KT][8];
-        float m_new = m_r;
+        // P is quantized against the block max (floored 2^-20 under the running
+        // max) so every block gets the full u8 range
+        float bmax = m_r - 20.f;
 #pragma unroll
         for (int kt = 0; kt < KT; ++kt) {
 #pragma unroll
@@ -127,15 +118,16 @@ __global__ __launch_bounds__(kThreads) void sol_exact_kernel(
                 // A dead key carries a zero scale and a kNeg bias, so its score is kNeg.
                 const float s = fmaf(static_cast<float>(s_acc[kt][e]), qsc * kb2.x, kb2.y);
                 p_val[kt][e] = s;
-                m_new = fmaxf(m_new, s);
+                bmax = fmaxf(bmax, s);
             }
         }
-        m_new = fmaxf(m_new, swap_half_wave(m_new));
-        const float alpha = exp2f(m_r - m_new);
-        m_r = m_new;
+        bmax = fmaxf(bmax, swap_half_wave(bmax));
+        const float alpha = exp2f(c_r - bmax);
+        c_r = bmax;
+        m_r = fmaxf(m_r, bmax);
 
         // u8 P scale folded into the exponent (+log2 255); l carries it too
-        const float m_off = m_new - kProbU8Offset;
+        const float m_off = bmax - kProbU8Offset;
         typename MmaInt8::Frag p_frag[KT];
         uint32_t li = 0u;
 #pragma unroll
@@ -165,12 +157,71 @@ __global__ __launch_bounds__(kThreads) void sol_exact_kernel(
                 o_acc[nt][e] = fmaf(o_acc[nt][e], alpha, static_cast<float>(partial[e]));
             }
         }
+    };
+
+    for (int kb = 0; kb < n_blocks; ++kb) {
+        const int64_t k0 = static_cast<int64_t>(my_idx[kb]) * BK;
+
+        __syncthreads();
+        for (int idx = tid; idx < BK * (HD / 8); idx += kThreads) {
+            const int p = idx / (HD / 8), c8 = (idx % (HD / 8)) * 8;
+            *reinterpret_cast<uint2*>(sK + p * kStrideK + c8) =
+                *reinterpret_cast<const uint2*>(ki + kd_base + (k0 + p) * HD + c8);
+        }
+        for (int idx = tid; idx < HD * (BK / 8); idx += kThreads) {
+            const int c = idx / (BK / 8), part = (idx % (BK / 8)) * 8;
+            *reinterpret_cast<uint2*>(sVt + c * kStrideV + part) = *reinterpret_cast<const uint2*>(
+                vT + vT_base + static_cast<int64_t>(c) * Tp + k0 + part);
+        }
+        for (int idx = tid; idx < BK; idx += kThreads) sKsb[idx] = ksb[kp_base + k0 + idx];
+        __syncthreads();
+        compute_tile();
+    }
+
+    // No perm_key here, so a listed token id indexes ki / ksb / vRow directly.
+    if (n_tok > 0) {
+        const int NG = (gridDim.x + kTokGroup - 1) / kTokGroup;   // one list per group
+        const size_t qs_tok = static_cast<size_t>(bh) * NG + q_block / kTokGroup;
+        const int n_sel = imin(tok_cnt[qs_tok], n_tok);
+        const uint32_t* my_tok = tok_idx + qs_tok * n_tok;
+        for (int ti = 0; ti < (n_sel + BK - 1) / BK; ++ti) {
+            const int nvalid = imin(BK, n_sel - ti * BK);
+            __syncthreads();
+            for (int idx = tid; idx < BK * (HD / 8); idx += kThreads) {
+                const int p = idx / (HD / 8), c8 = (idx % (HD / 8)) * 8;
+                uint2 val = make_uint2(0u, 0u);
+                if (p < nvalid) {
+                    val = *reinterpret_cast<const uint2*>(
+                        ki + kd_base + static_cast<int64_t>(my_tok[ti * BK + p]) * HD + c8);
+                }
+                *reinterpret_cast<uint2*>(sK + p * kStrideK + c8) = val;
+            }
+            // a padded slot carries a zero scale and a kNeg bias, like a dead key
+            for (int idx = tid; idx < BK; idx += kThreads) {
+                sKsb[idx] = idx < nvalid ? ksb[kp_base + my_tok[ti * BK + idx]]
+                                         : make_float2(0.f, kNeg);
+            }
+            // V^T wants keys contiguous per channel, so an arbitrary token set has
+            // to come from the row-major copy and be scattered byte by byte
+            for (int idx = tid; idx < (HD / 16) * BK; idx += kThreads) {
+                const int c16 = (idx / BK) * 16, p = idx % BK;
+                __attribute__((aligned(16))) int8_t raw[16] = {0};
+                if (p < nvalid) {
+                    *reinterpret_cast<uint4*>(raw) = *reinterpret_cast<const uint4*>(
+                        vRow + (static_cast<int64_t>(bh) * Tp + my_tok[ti * BK + p]) * HD + c16);
+                }
+#pragma unroll
+                for (int i = 0; i < 16; ++i) sVt[(c16 + i) * kStrideV + p] = raw[i];
+            }
+            __syncthreads();
+            compute_tile();
+        }
     }
 
     if (q_row >= T) return;
     // l is zero only when a row got no mass from either branch; zeros are right there
     const float inv = 1.f / fmaxf(l_r, 1e-30f);
-    __bf16* orow = out + bh_base + static_cast<int64_t>(q_row) * H * HD;
+    TOut* orow = out + bh_base + static_cast<int64_t>(q_row) * H * HD;
 #pragma unroll
     for (int nt = 0; nt < NT; ++nt) {
         float vals[8];
@@ -178,7 +229,7 @@ __global__ __launch_bounds__(kThreads) void sol_exact_kernel(
         for (int e = 0; e < 8; ++e) {
             vals[e] = o_acc[nt][e] * inv * vsc[vsc_base + nt * 16 + acc_row(lane, e)];
         }
-        store_o_tile<__bf16>(orow, nt * 16, vals, lane);
+        store_o_tile<TOut>(orow, nt * 16, vals, lane);
     }
 }
 
@@ -189,15 +240,25 @@ using namespace comfy::hip_backend::sol;
 
 void launch_sol_exact(const void* qi, const void* qs, const void* ki, const void* ksb,
                       const void* vT, const void* vsc, const void* blk_idx, const void* blk_cnt,
-                      const void* o_part, const void* m_part, const void* l_part, void* out, int B,
-                      int T, int Tp, int H, int NQ, int NTB, float scale_log2,
-                      hipStream_t stream) {
+                      const void* o_part, const void* m_part, const void* l_part,
+                      const void* vRow, const void* tok_idx, const void* tok_cnt, int n_tok,
+                      void* out, int B, int T, int Tp, int H, int NQ, int NTB, float scale_log2,
+                      int elem, hipStream_t stream) {
     dim3 grid(NQ, B * H);
-    sol_exact_kernel<<<grid, kThreads, 0, stream>>>(
-        static_cast<const int8_t*>(qi), static_cast<const float*>(qs),
-        static_cast<const int8_t*>(ki), static_cast<const float2*>(ksb),
-        static_cast<const int8_t*>(vT), static_cast<const float*>(vsc),
-        static_cast<const uint16_t*>(blk_idx), static_cast<const int32_t*>(blk_cnt),
-        static_cast<const __bf16*>(o_part), static_cast<const float*>(m_part),
-        static_cast<const float*>(l_part), static_cast<__bf16*>(out), T, Tp, H, NTB, scale_log2);
+#define SOLX_LAUNCH(TOut)                                                                    \
+    sol_exact_kernel<TOut><<<grid, kThreads, 0, stream>>>(                                   \
+        static_cast<const int8_t*>(qi), static_cast<const float*>(qs),                       \
+        static_cast<const int8_t*>(ki), static_cast<const float2*>(ksb),                     \
+        static_cast<const int8_t*>(vT), static_cast<const float*>(vsc),                      \
+        static_cast<const uint16_t*>(blk_idx), static_cast<const int32_t*>(blk_cnt),         \
+        static_cast<const __bf16*>(o_part), static_cast<const float*>(m_part),               \
+        static_cast<const float*>(l_part), static_cast<const int8_t*>(vRow),                 \
+        static_cast<const uint32_t*>(tok_idx), static_cast<const int32_t*>(tok_cnt), n_tok,  \
+        static_cast<TOut*>(out), T, Tp, H, NTB, scale_log2)
+    if (elem == kSolFp16) {
+        SOLX_LAUNCH(_Float16);
+    } else {
+        SOLX_LAUNCH(__bf16);
+    }
+#undef SOLX_LAUNCH
 }

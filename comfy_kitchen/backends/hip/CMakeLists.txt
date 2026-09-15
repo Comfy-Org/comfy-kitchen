@@ -159,9 +159,12 @@ set(HIP_SOURCES
     ops/rms_gated_residual.hip
     ops/gemm_fp8.hip
     ops/gemm_int8.hip
+    ops/gemm_fp16.hip
+    ops/conv3d_fp16.hip
     ops/convrot_w4a4.hip
     ops/adaln.hip
     ops/rms_convrot_quant.hip
+    ops/group_norm_pad3d.hip
     ops/na3d.hip
     sage_attention/quant_qk_int8.hip
     sage_attention/quant_v_int8.hip
@@ -172,6 +175,7 @@ set(HIP_SOURCES
     sage_attention/sol_attn_producer.hip
     sage_attention/sol_attn_route.hip
     sage_attention/sol_attn_exact.hip
+    sage_attention/sol_attn_token.hip
     ops/apply_rope.hip
     ops/flash_decode.hip
     ops/rms_rope.hip
@@ -189,9 +193,13 @@ set(CPP_SOURCES
 # consume HIP and project headers only, so a compiler cache can reuse their
 # objects across CPython wheel builds.
 add_library(comfy_kitchen_hip_kernels OBJECT ${HIP_SOURCES})
+# The kernels index lanes and reduce warps at a width of 32. The wavefront size is
+# not a constant expression, so no kernel can assert it; the last flag wins, and
+# these follow CMAKE_HIP_FLAGS.
 target_compile_options(comfy_kitchen_hip_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3>
     $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
+    $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64>
 )
 # The quantized attention specialization preserves ordered FP32 softmax and
 # normalization arithmetic; contraction or reassociation changes its BF16

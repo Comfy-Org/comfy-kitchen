@@ -51,8 +51,9 @@ __forceinline__ __device__ void atomic_max_pos(float* dst, float v) {
 
 // ---- pass 1: K/V block reductions plus V's per-channel |max| ----
 // One block per (bh, pooled block), thread == channel.
+template <typename E>
 __global__ __launch_bounds__(HD) void prep_reduce_kv(
-    const __bf16* __restrict__ k, const __bf16* __restrict__ v, float* __restrict__ kc,
+    const E* __restrict__ k, const E* __restrict__ v, float* __restrict__ kc,
     __bf16* __restrict__ vcT, float* __restrict__ vamax, const int32_t* __restrict__ blen, int T,
     int H, int NTB, int NPAD, int64_t sb, int64_t st, int64_t sh, int64_t vb, int64_t vt,
     int64_t vh) {
@@ -123,7 +124,8 @@ __global__ __launch_bounds__(HD) void prep_pooled_quant(const float* __restrict_
 }
 
 // ---- pass 4: quantize Q, the centroid and the routing threshold from one tile ----
-__global__ __launch_bounds__(HD) void prep_q(const __bf16* __restrict__ q,
+template <typename E>
+__global__ __launch_bounds__(HD) void prep_q(const E* __restrict__ q,
                                              const float* __restrict__ kcvar,
                                              int8_t* __restrict__ qi, float* __restrict__ qs,
                                              float* __restrict__ thr, int8_t* __restrict__ cen8,
@@ -132,7 +134,7 @@ __global__ __launch_bounds__(HD) void prep_q(const __bf16* __restrict__ q,
                                              const int32_t* __restrict__ blen, int T, int H,
                                              int NQ, int NPAD, float tau, float log2s, int64_t sb,
                                              int64_t st, int64_t sh) {
-    __shared__ __attribute__((aligned(16))) __bf16 sQ[BLK * kLdTile];
+    __shared__ __attribute__((aligned(16))) E sQ[BLK * kLdTile];
     __shared__ __attribute__((aligned(16))) float sred[HD];
     const int qb = blockIdx.x, bh = blockIdx.y;
     const int batch = bh / H, head = bh % H;
@@ -152,13 +154,14 @@ __global__ __launch_bounds__(HD) void prep_q(const __bf16* __restrict__ q,
 }
 
 // ---- pass 5: centre and quantize K ----
-__global__ __launch_bounds__(HD) void prep_k(const __bf16* __restrict__ k,
+template <typename E>
+__global__ __launch_bounds__(HD) void prep_k(const E* __restrict__ k,
                                              const float* __restrict__ kmean,
                                              int8_t* __restrict__ ki, float2* __restrict__ ksb,
                                              const float* __restrict__ kbias,  // [B, T] log2 units
                                              const int32_t* __restrict__ blen, int T, int Tp,
                                              int H, int64_t sb, int64_t st, int64_t sh) {
-    __shared__ __attribute__((aligned(16))) __bf16 sK[BLK * kLdTile];
+    __shared__ __attribute__((aligned(16))) E sK[BLK * kLdTile];
     const int n = blockIdx.x, bh = blockIdx.y;
     const int batch = bh / H, head = bh % H;
     const int t0 = n * BLK, len = block_len_of(blen, n, T);
@@ -227,7 +230,8 @@ void launch_sol_finish(void* scratch, void* kci, void* kcs, void* threshold, con
         static_cast<float*>(threshold), NQ, tau, scale_log2);
 }
 
-void launch_sol_preprocess(const void* q, const void* k, const void* v, void* qi, void* qs,
+template <typename E>
+static void preprocess_launch(const void* q, const void* k, const void* v, void* qi, void* qs,
                            void* ki, void* ksb, void* kci, void* kcs, void* vcT, void* threshold,
                            void* cen8, void* cens, void* vsc, void* qmean,
                            void* scratch,          // sol_preprocess_scratch_bytes
@@ -242,23 +246,37 @@ void launch_sol_preprocess(const void* q, const void* k, const void* v, void* qi
     // pass 1 accumulates V's |max| into vsc by atomicMax
     sol_check(hipMemsetAsync(vsc, 0, static_cast<size_t>(B) * H * HD * sizeof(float), stream),
               "clearing the V absmax accumulator");
-    prep_reduce_kv<<<dim3(NPAD, B * H), HD, 0, stream>>>(
-        static_cast<const __bf16*>(k), static_cast<const __bf16*>(v), s.kc,
+    prep_reduce_kv<E><<<dim3(NPAD, B * H), HD, 0, stream>>>(
+        static_cast<const E*>(k), static_cast<const E*>(v), s.kc,
         static_cast<__bf16*>(vcT), static_cast<float*>(vsc), static_cast<const int32_t*>(blen), T,
         H, NTB, NPAD, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h);
     prep_pooled_stats<<<B * H, HD, 0, stream>>>(s.kc, s.kmean, static_cast<const float*>(vsc),
                                                 static_cast<float*>(vsc), s.kcvar, NTB, NPAD);
     prep_pooled_quant<<<dim3(NPAD, B * H), HD, 0, stream>>>(
         s.kc, s.kmean, static_cast<int8_t*>(kci), static_cast<float*>(kcs), NTB, NPAD);
-    prep_q<<<dim3(NQ, B * H), HD, 0, stream>>>(
-        static_cast<const __bf16*>(q), s.kcvar, static_cast<int8_t*>(qi), static_cast<float*>(qs),
+    prep_q<E><<<dim3(NQ, B * H), HD, 0, stream>>>(
+        static_cast<const E*>(q), s.kcvar, static_cast<int8_t*>(qi), static_cast<float*>(qs),
         static_cast<float*>(threshold), static_cast<int8_t*>(cen8), static_cast<float*>(cens),
         static_cast<float*>(qmean), static_cast<const int32_t*>(blen), T, H, NQ, NPAD, tau,
         scale_log2, qs_b, qs_t, qs_h);
-    prep_k<<<dim3(NTB, B * H), HD, 0, stream>>>(
-        static_cast<const __bf16*>(k), s.kmean, static_cast<int8_t*>(ki),
+    prep_k<E><<<dim3(NTB, B * H), HD, 0, stream>>>(
+        static_cast<const E*>(k), s.kmean, static_cast<int8_t*>(ki),
         static_cast<float2*>(ksb), static_cast<const float*>(key_bias),
         static_cast<const int32_t*>(blen), T, Tp, H, ks_b, ks_t, ks_h);
+}
+
+void launch_sol_preprocess(const void* q, const void* k, const void* v, void* qi, void* qs,
+                           void* ki, void* ksb, void* kci, void* kcs, void* vcT, void* threshold,
+                           void* cen8, void* cens, void* vsc, void* qmean, void* scratch,
+                           const void* key_bias, const void* blen, int B, int T, int Tp, int H,
+                           int NTB, int NPAD, int NQ, int64_t qs_b, int64_t qs_t, int64_t qs_h,
+                           int64_t ks_b, int64_t ks_t, int64_t ks_h, int64_t vs_b, int64_t vs_t,
+                           int64_t vs_h, float tau, float scale_log2, int elem,
+                           hipStream_t stream) {
+    auto fn = elem == kSolFp16 ? preprocess_launch<_Float16> : preprocess_launch<__bf16>;
+    fn(q, k, v, qi, qs, ki, ksb, kci, kcs, vcT, threshold, cen8, cens, vsc, qmean, scratch,
+       key_bias, blen, B, T, Tp, H, NTB, NPAD, NQ, qs_b, qs_t, qs_h, ks_b, ks_t, ks_h, vs_b,
+       vs_t, vs_h, tau, scale_log2, stream);
 }
 
 size_t sol_preprocess_scratch_bytes(int B, int H, int NPAD) {

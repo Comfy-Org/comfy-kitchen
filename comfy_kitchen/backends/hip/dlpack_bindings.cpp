@@ -49,10 +49,15 @@ void launch_scaled_mm_fp8_kernel(const void*, const void*, void*, const void*, c
                                  const void*, int, int, int, int, int, hipStream_t);
 void launch_convrot_w4a4_gemm_kernel(const void*, const void*, void*, const void*, const void*,
                                      const void*, int, int, int, int, int, hipStream_t);
+bool launch_fp16_gemm_kernel(const void*, const void*, void*, const void*, const void*,
+                             const void*, int, int, int, hipStream_t);
+bool launch_fp16_conv3d_kernel(const void*, const void*, const void*, const void*, void*, int, int,
+                               int, int, int, int, int, int, int, int, int, int, int, int, int,
+                               hipStream_t);
 
 void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, hipStream_t);
 void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
-                                         int, int, hipStream_t);
+                                         int, int, const void*, float, hipStream_t);
 void launch_quantize_int8_convrot_swiglu_split_tiled128_kernel(
     const void*, const void*, void*, void*, int, int, int, hipStream_t);
 void launch_quantize_int8_convrot_modulated_kernel(
@@ -87,6 +92,9 @@ void launch_sage_int8_attn(const void*, const void*, const void*, void*, const v
 
 void launch_adaln_kernel(const void*, const void*, const void*, void*, int, int, int, int, float,
                          int, int, int, bool, hipStream_t);
+void launch_group_norm_silu_pad3d(const void*, const void*, const void*, void*, void*, int, int,
+                                  int, int, int, int, float, int, int, int, int, int, bool, int,
+                                  hipStream_t);
 void launch_gemv_awq_kernel(const void*, const void*, const void*, const void*, const void*, void*,
                             int, int, int, int, int, int, int, int, hipStream_t);
 void launch_svdquant_lora_down_kernel(const void*, const void*, void*, int, int, int, int, int,
@@ -598,6 +606,85 @@ void convrot_w4a4_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::nd
     check_hip_launch();
 }
 
+static void require_fp16(const nb::ndarray<>& t, const char* fn, const char* name) {
+    require_dtype(t, 1, 1, fn, name);
+}
+
+// D = A @ B^T + bias, or resid + rscale * (that). Every operand is fp16; false means
+// the caller serves the shape.
+bool fp16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias, OptArray rscale,
+               OptArray resid, int M, int N, int K, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "fp16_gemm";
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_fp16(a, kFn, "a");
+    require_fp16(b, kFn, "b");
+    require_fp16(d, kFn, "d");
+    require_len(a, static_cast<int64_t>(M) * K, kFn, "a");
+    require_len(b, static_cast<int64_t>(N) * K, kFn, "b");
+    require_len(d, static_cast<int64_t>(M) * N, kFn, "d");
+    if (bias.has_value()) {
+        require_fp16(*bias, kFn, "bias");
+        require_len(*bias, N, kFn, "bias");
+    }
+    if (rscale.has_value() != resid.has_value()) {
+        throw std::runtime_error(std::string(kFn) + ": rscale and resid must be given together");
+    }
+    if (resid.has_value()) {
+        require_fp16(*rscale, kFn, "rscale");
+        require_fp16(*resid, kFn, "resid");
+        require_len(*rscale, N, kFn, "rscale");
+        require_len(*resid, static_cast<int64_t>(M) * N, kFn, "resid");
+    }
+    const bool served = launch_fp16_gemm_kernel(
+        a.data(), b.data(), d.data(), opt_data(bias), opt_data(rscale), opt_data(resid), M, N, K,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return served;
+}
+
+// NDHWC conv3d, zero padding, x [N, D, H, W, C] and w [K, T, R, S, C] fp16 in that
+// memory order; out and resid are [N, Z, P, Q, K]. false means the caller serves it.
+bool fp16_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, OptArray resid,
+                 nb::ndarray<> out, int N, int D, int H, int W, int C, int K, int T, int R, int S,
+                 int sd, int sh, int sw, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "fp16_conv3d";
+    require_nonneg(N, kFn, "N");
+    require_positive(C, kFn, "C");
+    require_nonneg(K, kFn, "K");
+    require_positive(T, kFn, "T");
+    require_positive(R, kFn, "R");
+    require_positive(S, kFn, "S");
+    require_positive(sd, kFn, "sd");
+    require_positive(sh, kFn, "sh");
+    require_positive(sw, kFn, "sw");
+    if (D < T || H < R || W < S) {
+        throw std::runtime_error(std::string(kFn) + ": input smaller than the filter");
+    }
+    const int Z = (D - T) / sd + 1, P = (H - R) / sh + 1, Q = (W - S) / sw + 1;
+    const int64_t outs = static_cast<int64_t>(N) * Z * P * Q * K;
+    require_fp16(x, kFn, "x");
+    require_fp16(w, kFn, "w");
+    require_fp16(out, kFn, "out");
+    require_len(x, static_cast<int64_t>(N) * D * H * W * C, kFn, "x");
+    require_len(w, static_cast<int64_t>(K) * T * R * S * C, kFn, "w");
+    require_len(out, outs, kFn, "out");
+    if (bias.has_value()) {
+        require_fp16(*bias, kFn, "bias");
+        require_len(*bias, K, kFn, "bias");
+    }
+    if (resid.has_value()) {
+        require_fp16(*resid, kFn, "resid");
+        require_len(*resid, outs, kFn, "resid");
+    }
+    const bool served = launch_fp16_conv3d_kernel(
+        x.data(), w.data(), opt_data(bias), opt_data(resid), out.data(), N, D, H, W, C, K, T, R, S,
+        Z, P, Q, sd, sh, sw, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return served;
+}
+
 // The int4 quantizers pack two nibbles per byte, so the packed row is K / 2 bytes
 // and an odd K would round it down and drop the tail.
 static void require_convrot_group(int k, int group_size, const char* fn) {
@@ -632,10 +719,12 @@ void quantize_int8_rowwise(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
     check_hip_launch();
 }
 
-// act_code folds an elementwise activation into the rotation's load.
+// act_code folds an activation into the rotation's load. rms_norm (code 3) reads a
+// K-element act_weight in x's dtype and act_eps.
 void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales,
                            OptArray spill_rotated, OptArray spill_partials, int M, int K,
-                           int group_size, int act_code, uintptr_t stream_ptr) {
+                           int group_size, int act_code, uintptr_t stream_ptr,
+                           OptArray act_weight = std::nullopt, float act_eps = 0.0f) {
     constexpr const char* kFn = "quantize_int8_convrot";
     require_nonneg(M, kFn, "M");
     require_convrot_group(K, group_size, kFn);
@@ -675,10 +764,20 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
         require_packed_contiguous(*spill_partials, kFn, "spill_partials");
         spill_partials_ptr = spill_partials->data();
     }
+    if (act_code == 3) {
+        if (!act_weight.has_value()) {
+            throw std::runtime_error(std::string(kFn) + ": rms_norm requires act_weight");
+        }
+        if (map_dtype_to_code(act_weight->dtype()) != map_dtype_to_code(x.dtype())) {
+            throw std::runtime_error(std::string(kFn) + ": act_weight dtype must match x");
+        }
+        require_len(*act_weight, K, kFn, "act_weight");
+    }
 
     launch_quantize_int8_convrot_kernel(x.data(), map_dtype_to_code(x.dtype()), q.data(),
                                         scales.data(), spill_rotated_ptr, spill_partials_ptr, M, K,
                                         group_size, act_code,
+                                        act_code == 3 ? act_weight->data() : nullptr, act_eps,
                                         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
@@ -1089,6 +1188,58 @@ static void adaln_impl(const char* kFn, nb::ndarray<>& x, nb::ndarray<>& scale,
                         shift_group, eps, map_dtype_to_code(x.dtype()),
                         map_dtype_to_code(scale.dtype()), map_dtype_to_code(shift.dtype()),
                         subtract_mean, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// Per-frame GroupNorm + SiLU + causal conv padding over NDHWC storage. weight and
+// bias absent -> pad only, and the workspace is not read.
+void group_norm_silu_pad3d(nb::ndarray<> x, OptArray weight, OptArray bias, nb::ndarray<> out,
+                           OptArray workspace, int B, int C, int T, int H, int W, int num_groups,
+                           float eps, int left, int right, int top, int bottom, int front,
+                           bool silu, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "group_norm_silu_pad3d";
+    require_nonneg(B, kFn, "B");
+    require_positive(C, kFn, "C");
+    require_nonneg(T, kFn, "T");
+    require_nonneg(H, kFn, "H");
+    require_nonneg(W, kFn, "W");
+    require_nonneg(left, kFn, "left");
+    require_nonneg(right, kFn, "right");
+    require_nonneg(top, kFn, "top");
+    require_nonneg(bottom, kFn, "bottom");
+    require_nonneg(front, kFn, "front");
+    const int code = map_dtype_to_code(x.dtype());
+    if (code != 1 && code != 2) {
+        throw std::runtime_error(std::string(kFn) + ": x must be float16 or bfloat16");
+    }
+    require_dtype(out, code, code, kFn, "out");
+    require_len(x, static_cast<int64_t>(B) * C * T * H * W, kFn, "x");
+    require_len(out,
+                static_cast<int64_t>(B) * C * (T + static_cast<int64_t>(front)) *
+                    (H + static_cast<int64_t>(top) + bottom) *
+                    (W + static_cast<int64_t>(left) + right),
+                kFn, "out");
+    if (weight.has_value() != bias.has_value()) {
+        throw std::runtime_error(std::string(kFn) + ": weight and bias must be given together");
+    }
+    if (weight.has_value()) {
+        require_positive(num_groups, kFn, "num_groups");
+        require_dtype(*weight, code, code, kFn, "weight");
+        require_dtype(*bias, code, code, kFn, "bias");
+        require_len(*weight, C, kFn, "weight");
+        require_len(*bias, C, kFn, "bias");
+        if (!workspace.has_value()) {
+            throw std::runtime_error(std::string(kFn) + ": the norm needs a workspace");
+        }
+        require_dtype(*workspace, 0, 0, kFn, "workspace");
+        const int64_t chunks = (static_cast<int64_t>(H) * W + 1023) / 1024;
+        require_len(*workspace, 2 * static_cast<int64_t>(B) * T * (chunks * C + num_groups), kFn,
+                    "workspace");
+    }
+    launch_group_norm_silu_pad3d(x.data(), opt_data(weight), opt_data(bias), out.data(),
+                                 weight.has_value() ? workspace->data() : nullptr, B, C, T, H, W,
+                                 num_groups, eps, left, right, top, bottom, front, silu, code,
+                                 reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -2173,11 +2324,11 @@ static void sol_check_block_len(const nb::ndarray<>& b, int64_t seq_len, const c
 }
 
 static void sol_need_workspace(const nb::ndarray<>& ws, int64_t batch, int64_t seq_len,
-                               int64_t num_heads, const char* fn) {
-    int64_t v[32];
+                               int64_t num_heads, int64_t token_aug, const char* fn) {
+    int64_t v[48];
     const int n = sol_attn_plan(static_cast<int>(batch), static_cast<int>(seq_len),
-                                static_cast<int>(num_heads), v, 32);
-    if (n > 32 || static_cast<int64_t>(ws.size()) < v[n - 1]) {  // last slot is "total"
+                                static_cast<int>(num_heads), static_cast<int>(token_aug), v, 48);
+    if (n > 48 || static_cast<int64_t>(ws.size()) < v[n - 1]) {  // last slot is "total"
         throw std::runtime_error(std::string(fn) + ": workspace too small for this shape");
     }
     // sol_attn_plan reports byte offsets and the Python layer slices the workspace
@@ -2189,13 +2340,18 @@ static void sol_need_workspace(const nb::ndarray<>& ws, int64_t batch, int64_t s
     }
 }
 
+// q/k/v/out element code for launch_sol_attn: 0 = bfloat16, 1 = float16, -1 = neither
+static int sol_elem_code(const nb::ndarray<>& a) {
+    const int code = map_dtype_to_code(a.dtype());
+    return code == 2 ? 0 : code == 1 ? 1 : -1;
+}
 static void sol_need_bthd(const nb::ndarray<>& a, int64_t b, int64_t t, int64_t h, int64_t d,
-                          const char* fn, const char* what) {
-    if (a.ndim() != 4 || map_dtype_to_code(a.dtype()) != 2 ||
+                          int elem, const char* fn, const char* what) {
+    if (a.ndim() != 4 || sol_elem_code(a) != elem ||
         a.shape(0) != static_cast<size_t>(b) || a.shape(1) != static_cast<size_t>(t) ||
         a.shape(2) != static_cast<size_t>(h) || a.shape(3) != static_cast<size_t>(d)) {
         throw std::runtime_error(std::string(fn) + ": " + what +
-                                 " must be a (B, T, H, D) bfloat16 array");
+                                 " must be a (B, T, H, D) array of q's dtype (bfloat16 or float16)");
     }
 }
 
@@ -2223,11 +2379,12 @@ static void sol_need_contiguous(const nb::ndarray<>& a, const char* fn, const ch
 }
 
 // Workspace dims and slot byte offsets, from the C++ Plan (the one definition).
-nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads) {
-    int64_t v[32];
+nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads,
+                          int64_t token_aug = 0) {
+    int64_t v[48];
     const int n = sol_attn_plan(static_cast<int>(batch), static_cast<int>(seq_len),
-                                static_cast<int>(num_heads), v, 32);
-    if (n > 32) throw std::runtime_error("sol_attn_plan: Plan grew past the binding's buffer");
+                                static_cast<int>(num_heads), static_cast<int>(token_aug), v, 48);
+    if (n > 48) throw std::runtime_error("sol_attn_plan: Plan grew past the binding's buffer");
     nb::dict d;
     for (int i = 0; i < n && sol_attn_plan_names[i]; ++i) d[sol_attn_plan_names[i]] = v[i];
     return d;
@@ -2238,7 +2395,7 @@ void sol_attn(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> o
               int64_t head_dim, float tau, float scale, int64_t sink_start, int64_t sink_end,
               int64_t sink_q_start, int64_t sink_q_end, uintptr_t stream_ptr,
               OptArray key_bias = std::nullopt, OptArray threshold = std::nullopt,
-              OptArray block_len = std::nullopt, bool tail = true) {
+              OptArray block_len = std::nullopt, bool tail = true, int64_t token_aug = 0) {
     constexpr const char* kFn = "sol_attn";
     auto stream = reinterpret_cast<hipStream_t>(stream_ptr);
     sol_need_extents(batch, seq_len, num_heads, kFn);
@@ -2248,34 +2405,37 @@ void sol_attn(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> o
         sol_need_elems(*threshold, batch * num_heads * ((seq_len + 63) / 64), 0, kFn, "threshold");
     }
     if (block_len) sol_check_block_len(*block_len, seq_len, kFn);
-    sol_need_bthd(q, batch, seq_len, num_heads, head_dim, kFn, "q");
-    sol_need_bthd(k, batch, seq_len, num_heads, head_dim, kFn, "k");
-    sol_need_bthd(v, batch, seq_len, num_heads, head_dim, kFn, "v");
-    sol_need_bthd(out, batch, seq_len, num_heads, head_dim, kFn, "out");
+    const int elem = sol_elem_code(q);
+    if (elem < 0) throw std::runtime_error(std::string(kFn) + ": q must be bfloat16 or float16");
+    sol_need_bthd(q, batch, seq_len, num_heads, head_dim, elem, kFn, "q");
+    sol_need_bthd(k, batch, seq_len, num_heads, head_dim, elem, kFn, "k");
+    sol_need_bthd(v, batch, seq_len, num_heads, head_dim, elem, kFn, "v");
+    sol_need_bthd(out, batch, seq_len, num_heads, head_dim, elem, kFn, "out");
     sol_need_staging_layout(q, kFn, "q");
     sol_need_staging_layout(k, kFn, "k");
     sol_need_staging_layout(v, kFn, "v");
     sol_need_contiguous(out, kFn, "out");
-    sol_need_workspace(workspace, batch, seq_len, num_heads, kFn);
+    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, kFn);
     if (key_bias) sol_need_elems(*key_bias, batch * seq_len, 0, kFn, "key_bias");
     // Explicit strides: only the last dim must be contiguous (BHND views go in as-is).
     launch_sol_attn(q.data(), k.data(), v.data(), out.data(), workspace.data(),
                     static_cast<int>(batch), static_cast<int>(seq_len),
-                    static_cast<int>(num_heads), static_cast<int>(head_dim), tau, scale,
+                    static_cast<int>(num_heads), static_cast<int>(head_dim), elem, tau, scale,
                     opt_data(key_bias), opt_data(threshold), opt_data(block_len), tail ? 1 : 0,
                     static_cast<int>(sink_start), static_cast<int>(sink_end),
                     static_cast<int>(sink_q_start), static_cast<int>(sink_q_end), q.stride(0),
                     q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
-                    v.stride(1), v.stride(2), stream);
+                    v.stride(1), v.stride(2), static_cast<int>(token_aug), stream);
     check_hip_launch();
 }
 
 void sol_producer_begin_py(nb::ndarray<> workspace, int64_t batch, int64_t seq_len,
-                           int64_t num_heads, uintptr_t stream_ptr) {
+                           int64_t num_heads, uintptr_t stream_ptr, int64_t token_aug = 0) {
     sol_need_extents(batch, seq_len, num_heads, "sol_producer_begin");
-    sol_need_workspace(workspace, batch, seq_len, num_heads, "sol_producer_begin");
+    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, "sol_producer_begin");
     sol_producer_begin(workspace.data(), static_cast<int>(batch), static_cast<int>(seq_len),
-                       static_cast<int>(num_heads), reinterpret_cast<hipStream_t>(stream_ptr));
+                       static_cast<int>(num_heads), static_cast<int>(token_aug),
+                       reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -2283,7 +2443,8 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
                            nb::ndarray<> qw, nb::ndarray<> kw, nb::ndarray<> kmean,
                            nb::ndarray<> vscale, float rope_eps, int64_t rot_dim, int64_t t0,
                            int64_t m, int64_t batch, int64_t seq_len, int64_t num_heads,
-                           uintptr_t stream_ptr, OptArray block_len = std::nullopt) {
+                           uintptr_t stream_ptr, OptArray block_len = std::nullopt,
+                           int64_t token_aug = 0) {
     constexpr const char* kFn = "sol_producer_chunk";
     sol_need_extents(batch, seq_len, num_heads, kFn);
     if (batch != 1) throw std::runtime_error(std::string(kFn) + ": the producer path is B=1 only");
@@ -2297,7 +2458,7 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
             ": chunk [t0, t0 + m) must lie in [0, seq_len] with a 64-aligned start");
     }
     if (block_len) sol_check_block_len(*block_len, seq_len, kFn);
-    sol_need_workspace(workspace, batch, seq_len, num_heads, kFn);
+    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, kFn);
     sol_need_elems(qkv, m * 3 * num_heads * 128, 2, kFn, "qkv");
     sol_need_elems(fab, seq_len * rot_dim * 2, 0, kFn, "fab");
     sol_need_elems(qw, 128, 2, kFn, "qw");
@@ -2308,7 +2469,8 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
                        kmean.data(), vscale.data(), opt_data(block_len), rope_eps,
                        static_cast<int>(rot_dim), static_cast<int>(t0), static_cast<int>(m),
                        static_cast<int>(batch), static_cast<int>(seq_len),
-                       static_cast<int>(num_heads), reinterpret_cast<hipStream_t>(stream_ptr));
+                       static_cast<int>(num_heads), static_cast<int>(token_aug),
+                       reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -2317,7 +2479,8 @@ void sol_attn_core_py(nb::ndarray<> workspace, nb::ndarray<> out, nb::ndarray<> 
                       int64_t seq_len, int64_t num_heads, float tau, float scale,
                       int64_t sink_start, int64_t sink_end, int64_t sink_q_start,
                       int64_t sink_q_end, uintptr_t stream_ptr, OptArray threshold = std::nullopt,
-                      OptArray block_len = std::nullopt, bool tail = true) {
+                      OptArray block_len = std::nullopt, bool tail = true,
+                      int64_t token_aug = 0) {
     constexpr const char* kFn = "sol_attn_core";
     sol_need_extents(batch, seq_len, num_heads, kFn);
     sol_need_sinks(sink_start, sink_end, kFn, "sink_blocks");
@@ -2330,7 +2493,7 @@ void sol_attn_core_py(nb::ndarray<> workspace, nb::ndarray<> out, nb::ndarray<> 
         sol_need_elems(*threshold, batch * num_heads * ((seq_len + 63) / 64), 0, kFn, "threshold");
     }
     if (block_len) sol_check_block_len(*block_len, seq_len, kFn);
-    sol_need_workspace(workspace, batch, seq_len, num_heads, kFn);
+    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, kFn);
     sol_need_elems(out, batch * seq_len * num_heads * 128, 2, kFn, "out");
     launch_sol_attn_core(workspace.data(), out.data(), vscale.data(), kmean_next.data(),
                          vamax_out.data(), opt_data(block_len), tail ? 1 : 0,
@@ -2338,6 +2501,7 @@ void sol_attn_core_py(nb::ndarray<> workspace, nb::ndarray<> out, nb::ndarray<> 
                          static_cast<int>(num_heads), tau, scale, opt_data(threshold),
                          static_cast<int>(sink_start), static_cast<int>(sink_end),
                          static_cast<int>(sink_q_start), static_cast<int>(sink_q_end),
+                         static_cast<int>(token_aug),
                          reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
@@ -2345,31 +2509,34 @@ void sol_attn_core_py(nb::ndarray<> workspace, nb::ndarray<> out, nb::ndarray<> 
 NB_MODULE(_C, m) {
     m.doc() = "ComfyKitchen HIP backend native operations (RDNA2-RDNA4, WMMA on gfx11/gfx12)";
     m.def("sol_attn_plan", &sol_attn_plan_py,
-          "Workspace dims, slot byte offsets and total bytes for this shape",
-          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"));
+          "Workspace dims, slot byte offsets and total bytes for this shape and token budget",
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
+          nb::arg("token_aug") = 0);
     m.def("sol_attn", &sol_attn,
-          "Sol-Attn training-free sparse attention (BF16 in/out, head_dim 128)",
+          "Sol-Attn training-free sparse attention (BF16 or FP16 in/out, head_dim 128)",
           nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("out"), nb::arg("workspace"),
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"), nb::arg("head_dim"),
           nb::arg("tau"), nb::arg("scale"), nb::arg("sink_start"), nb::arg("sink_end"),
           nb::arg("sink_q_start"), nb::arg("sink_q_end"), nb::arg("stream_ptr"),
           nb::arg("key_bias") = nb::none(), nb::arg("threshold") = nb::none(),
-          nb::arg("block_len") = nb::none(), nb::arg("tail") = true);
+          nb::arg("block_len") = nb::none(), nb::arg("tail") = true,
+          nb::arg("token_aug") = 0);
     m.def("sol_producer_begin", &sol_producer_begin_py,
           nb::arg("workspace"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
-          nb::arg("stream_ptr"));
+          nb::arg("stream_ptr"), nb::arg("token_aug") = 0);
     m.def("sol_producer_chunk", &sol_producer_chunk_py,
           nb::arg("workspace"), nb::arg("qkv"), nb::arg("fab"), nb::arg("qw"), nb::arg("kw"),
           nb::arg("kmean"), nb::arg("vscale"), nb::arg("rope_eps"), nb::arg("rot_dim"),
           nb::arg("t0"), nb::arg("m"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
-          nb::arg("stream_ptr"), nb::arg("block_len") = nb::none());
+          nb::arg("stream_ptr"), nb::arg("block_len") = nb::none(),
+          nb::arg("token_aug") = 0);
     m.def("sol_attn_core", &sol_attn_core_py,
           nb::arg("workspace"), nb::arg("out"), nb::arg("vscale"), nb::arg("kmean_next"),
           nb::arg("vamax_out"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
           nb::arg("tau"), nb::arg("scale"), nb::arg("sink_start"), nb::arg("sink_end"),
           nb::arg("sink_q_start"), nb::arg("sink_q_end"), nb::arg("stream_ptr"),
           nb::arg("threshold") = nb::none(), nb::arg("block_len") = nb::none(),
-          nb::arg("tail") = true);
+          nb::arg("tail") = true, nb::arg("token_aug") = 0);
     m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8);
     m.def("dequantize_per_tensor_fp8", &dequantize_per_tensor_fp8);
     m.def("stochastic_round_fp8", &stochastic_round_fp8);
@@ -2382,12 +2549,18 @@ NB_MODULE(_C, m) {
     m.def("rms_gated_residual_bf16", &rms_gated_residual_bf16);
     m.def("int8_gemm_a_tiled128_down", &int8_gemm_a_tiled128_down);
     m.def("convrot_w4a4_gemm", &convrot_w4a4_gemm);
+    m.def("fp16_gemm", &fp16_gemm, nb::arg("a"), nb::arg("b"), nb::arg("d"),
+          nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),
+          nb::arg("N"), nb::arg("K"), nb::arg("stream_ptr"));
+    m.def("fp16_conv3d", &fp16_conv3d, nb::arg("x"), nb::arg("w"), nb::arg("bias").none(),
+          nb::arg("resid").none(), nb::arg("out"), nb::arg("N"), nb::arg("D"), nb::arg("H"),
+          nb::arg("W"), nb::arg("C"), nb::arg("K"), nb::arg("T"), nb::arg("R"), nb::arg("S"),
+          nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("stream_ptr"));
     m.def("quantize_int8_rowwise", &quantize_int8_rowwise);
-    m.def("quantize_int8_convrot", &quantize_int8_convrot,
-          nb::arg("x"), nb::arg("q"), nb::arg("scales"),
-          nb::arg("spill_rotated").none(), nb::arg("spill_partials").none(),
-          nb::arg("M"), nb::arg("K"), nb::arg("group_size"),
-          nb::arg("act_code"), nb::arg("stream_ptr"));
+    m.def("quantize_int8_convrot", &quantize_int8_convrot, nb::arg("x"), nb::arg("q"),
+          nb::arg("scales"), nb::arg("spill_rotated").none(), nb::arg("spill_partials").none(),
+          nb::arg("M"), nb::arg("K"), nb::arg("group_size"), nb::arg("act_code"),
+          nb::arg("stream_ptr"), nb::arg("act_weight") = nb::none(), nb::arg("act_eps") = 0.0f);
     m.def("quantize_int8_convrot_swiglu_split_tiled128",
           &quantize_int8_convrot_swiglu_split_tiled128);
     m.def("quantize_int8_convrot_modulated", &quantize_int8_convrot_modulated);
@@ -2434,6 +2607,11 @@ NB_MODULE(_C, m) {
           nb::arg("anchor_indices"), nb::arg("sm_scale"), nb::arg("stream_ptr"));
     m.def("adaln", &adaln);
     m.def("rms_adaln", &rms_adaln);
+    m.def("group_norm_silu_pad3d", &group_norm_silu_pad3d, nb::arg("x"), nb::arg("weight").none(),
+          nb::arg("bias").none(), nb::arg("out"), nb::arg("workspace").none(), nb::arg("B"),
+          nb::arg("C"), nb::arg("T"), nb::arg("H"), nb::arg("W"), nb::arg("num_groups"),
+          nb::arg("eps"), nb::arg("left"), nb::arg("right"), nb::arg("top"), nb::arg("bottom"),
+          nb::arg("front"), nb::arg("silu"), nb::arg("stream_ptr"));
     m.def("apply_rope", &apply_rope);
     m.def("rms_rope", &rms_rope);
     m.def("gemv_awq_w4a16", &gemv_awq_w4a16);

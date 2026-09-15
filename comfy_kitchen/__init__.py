@@ -1,10 +1,12 @@
 import torch
 
-from .backends import cuda as _cuda_backend  # noqa: F401
+from .allocation import set_allocation_context
+from .backends import cuda as _cuda_backend
 
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
+from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
 from .exceptions import (
@@ -46,6 +48,7 @@ if getattr(torch.version, "hip", None):
     # and advertises only the ops that device can run; prefer it where it registers.
     if registry.is_available("hip"):
         registry.set_priority(["hip", "cuda", "triton", "eager"])
+        sol_attn_chunked = _hip_backend.sol_attn_chunked
 else:
     registry.mark_unavailable("hip", "PyTorch ROCm/HIP runtime not available")
 
@@ -53,6 +56,8 @@ __all__ = [
     # Normalization
     "adaln",
     "rms_gated_residual",
+    "fp16_conv3d",
+    "group_norm_silu_pad3d",
     "rms_adaln",
     # Attention
     "PrequantizedInt8Attention",
@@ -69,6 +74,8 @@ __all__ = [
     "hip_int8_attention",
     "hip_int8_attention_is_supported",
     "sol_attn",
+    "sol_attn_chunked",
+    "sol_attn_is_available",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -90,6 +97,7 @@ __all__ = [
     "dequantize_convrot_w4a4_weight",
     "dequantize_w4a8_int8_weight",
     "gemv_awq_w4a16",
+    "fp16_linear",
     "int8_linear",
     "int8_linear_gated_residual",
     "int8_linear_modulated",
@@ -121,6 +129,7 @@ __all__ = [
     "swap_nibbles",
     "to_blocked",
     "from_blocked",
+    "set_allocation_context",
     # Backend configuration
     "list_backends",
     "set_backend_priority",
@@ -213,6 +222,7 @@ def sol_attn(
     tail: bool = True,
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
+    token_aug: int = 0,
 ) -> torch.Tensor:
     """Sol-Attn training-free sparse attention (arXiv 2607.24027).
 
@@ -222,8 +232,8 @@ def sol_attn(
     below roughly 12k tokens dense or a fused attention is usually faster.
 
     Args:
-        q, k, v: ``(B, T, H, 128)`` tensors, same shape and dtype. The CUDA
-            backend requires bfloat16; head_dim is fixed at 128.
+        q, k, v: ``(B, T, H, 128)`` tensors, same shape and dtype. The fused
+            backends take bfloat16 or float16; head_dim is fixed at 128.
         tau: Routing threshold in sigmas of the proxy row. Higher routes fewer
             blocks exactly: cheaper and less accurate.
         scale: Score scale; None means ``head_dim ** -0.5``.
@@ -245,6 +255,10 @@ def sol_attn(
             output rows are unspecified.
         coarse_gate: ``(B, T, H, 128)`` per-token gate for VSA's coarse branch:
             ``gate * softmax(q_mean k_mean^T * scale) v_mean`` is added per block.
+        token_aug: 0, or a multiple of 64 up to 256: up to that many tokens per
+            query block are routed individually, the highest-scoring ones outside
+            the routed blocks, and attended exactly. The eager reference ignores
+            it.
 
     Returns:
         ``(B, T, H, 128)`` attention output.
@@ -258,7 +272,25 @@ def sol_attn(
         bool(tail),
         block_len,
         coarse_gate,
+        int(token_aug),
     )
+
+
+def sol_attn_is_available(device: torch.device | int | None = None) -> bool:
+    """Whether the compiled Sol-Attn kernels can run on ``device``: the CUDA
+    backend on sm_80+, or the HIP backend on a GPU with matrix cores. The
+    per-call rules (bf16/fp16, head_dim 128, matching q/k/v) still apply."""
+    if not torch.cuda.is_available():
+        return False
+    if getattr(torch.version, "hip", None):
+        # torch.cuda is the ROCm API here; the HIP backend advertises sol_attn
+        # only on WMMA parts, so its registration is the answer
+        return registry.is_available("hip") and registry.get_constraints("hip", "sol_attn") is not None
+    rules = registry.get_constraints("cuda", "sol_attn")
+    ext = getattr(_cuda_backend, "_C", None)
+    return (registry.is_available("cuda") and _cuda_backend._EXT_AVAILABLE and hasattr(ext, "sol_attn")
+            and rules is not None
+            and torch.cuda.get_device_capability(device) >= rules.min_compute_capability)
 
 
 def na3d(
@@ -345,6 +377,39 @@ def adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
+
+
+def fp16_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+    stride: int | tuple[int, int, int] = 1,
+) -> torch.Tensor:
+    """fp16-accumulate conv3d with bias and residual fused into the epilogue.
+
+    x [N, C, D, H, W], weight [K, C, T, R, S], zero padding only. Same opt-in
+    numerics as fp16_linear; shapes the kernel declines run torch's conv.
+    """
+    stride = [stride] * 3 if isinstance(stride, int) else list(stride)
+    return torch.ops.comfy_kitchen.fp16_conv3d(x, weight, bias, residual, stride)
+
+
+def group_norm_silu_pad3d(
+    x: torch.Tensor,
+    weight: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    num_groups: int = 32,
+    eps: float = 1e-6,
+    pad: tuple[int, int, int, int, int] = (0, 0, 0, 0, 0),
+    silu: bool = True,
+) -> torch.Tensor:
+    """Per-frame GroupNorm, SiLU and causal conv3d padding in one pass.
+
+    x [B, C, T, H, W]; pad is (left, right, top, bottom, front): reflect in space,
+    zero frames in front. weight=None is pad-only. Output is channels_last_3d.
+    """
+    return torch.ops.comfy_kitchen.group_norm_silu_pad3d(x, weight, bias, num_groups, eps, list(pad), silu)
 
 
 def rms_adaln(
@@ -957,6 +1022,45 @@ def rms_gated_residual(
             "eps": eps,
         },
     )
+def fp16_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """fp16-accumulate linear, optionally with ``residual + residual_scale * out`` fused.
+
+    Same numerics as ``torch.backends.cuda.matmul.allow_fp16_accumulation``, so
+    route here only when the user opted into that mode.
+    """
+    if not _fp16_linear_fills_gpu(x.shape[:-1].numel(), weight.shape[0], weight.shape[1]):
+        # cuBLAS (already fp16-accumulate when the caller opted in) wins outright
+        # below these sizes, and the dispatch alone would cost more than the call
+        out = torch.nn.functional.linear(x, weight, bias)
+        if residual is None:
+            return out
+        if residual_scale is None:
+            raise ValueError("fp16_linear: residual requires residual_scale")
+        return torch.addcmul(residual.to(out.dtype), out, residual_scale.to(out.dtype))
+    kwargs = {
+        "x": x,
+        "weight": weight,
+        "bias": bias,
+        "residual": residual,
+        "residual_scale": residual_scale,
+    }
+    impl = registry.get_implementation("fp16_linear", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def _fp16_linear_fills_gpu(m: int, n: int, k: int) -> bool:
+    """Mirror of the launcher's tile gate (cutlass_gemm_fp16.cu), so small
+    launches skip the dispatch entirely."""
+    if k > 4096:
+        return ((m + 127) // 128) * ((n + 127) // 128) >= 32
+    tile_n = 256 if n <= 3072 or n > 8192 else 128
+    return ((m + 127) // 128) * ((n + tile_n - 1) // tile_n) >= 96
 
 
 def int8_linear(
@@ -968,6 +1072,10 @@ def int8_linear(
     convrot: bool = False,
     convrot_groupsize: int = 256,
     input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """INT8 linear layer dynamically quantized.
 
@@ -979,11 +1087,18 @@ def int8_linear(
         out_dtype: Output dtype.
         convrot: If True, apply online activation rotation.
         convrot_groupsize: Group size for Hadamard rotation.
-        input_act: Optional elementwise activation applied to x before
-            quantization ("gelu_tanh", or None). When the fused ConvRot
-            quantizer handles the shape it is folded in, so an MLP's
-            ``linear(act(proj(x)))`` never writes act's output to HBM; every
-            other path applies it eagerly for identical results.
+        input_act: Optional activation applied to x before quantization
+            ("gelu_tanh", "swiglu", "rms_norm", or None). When
+            the fused ConvRot quantizer handles the shape it is folded in, so
+            an MLP's ``linear(act(proj(x)))`` or a pre-norm block's
+            ``linear(rms_norm(x))`` never writes the intermediate to HBM;
+            every other path applies it eagerly for identical results.
+        input_act_weight: K-element norm weight, required for "rms_norm".
+        input_act_eps: Norm eps for "rms_norm".
+        residual: Optional [..., N] tensor; the result becomes
+            ``residual + residual_scale * linear(x)`` (a pre-norm block's
+            addcmul), fused into the GEMM epilogue where supported.
+        residual_scale: Per-channel [N] scale for the residual form.
 
     Returns:
         Result tensor.
@@ -999,6 +1114,10 @@ def int8_linear(
         "convrot": convrot,
         "convrot_groupsize": convrot_groupsize,
         "input_act": input_act,
+        "input_act_weight": input_act_weight,
+        "input_act_eps": input_act_eps,
+        "residual": residual,
+        "residual_scale": residual_scale,
     }
     impl = registry.get_implementation("int8_linear", kwargs=kwargs)
     return impl(**kwargs)

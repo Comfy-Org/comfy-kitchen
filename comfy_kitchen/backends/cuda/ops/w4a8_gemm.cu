@@ -127,6 +127,7 @@ extern "C" void launch_dequant_int4_grouped_to_int8_e4m3(
 // L2-resident instead of the full [N,K] round-tripping global (the convrot_w4a4
 // chunking trick, run at our group-16 codebook quality). Returns false if the
 // strided GEMM rejects a chunk config -> caller falls back to the 2-pass path.
+// bias is read in the OUTPUT dtype (cutlass_gemm_int8.cu); never pass fp32 here.
 extern "C" bool launch_cutlass_int8_dequant_strided(
     const void* A, const void* B, const void* xs, const void* ws, const void* bias,
     void* D, int64_t M, int64_t N, int64_t K, int64_t output_stride, int out_dtype_code,
@@ -139,7 +140,7 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
     const void* codebook,  // [16] fp32 or nullptr
     const void* s_channel, // [N] fp32 per-channel scale
     const void* xs,        // [M] fp32 per-row activation scale
-    const void* bias,      // [N] fp32 or nullptr
+    const void* bias,      // [N] in out_dtype, or nullptr
     void* workspace,       // [chunk_cols, K] int8 scratch (preallocated, reused)
     void* out,             // [M, N] output (out_dtype)
     int64_t M, int64_t N, int64_t K, int64_t G, int64_t chunk_cols,
@@ -155,7 +156,9 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
             static_cast<const int8_t*>(weight) + n0 * Khalf,
             static_cast<const uint8_t*>(s_rel) + n0 * KG,
             codebook, workspace, cols, K, G, stream);
-        const void* bias_chunk = bias ? static_cast<const float*>(bias) + n0 : nullptr;
+        // bias is in the output dtype (the strided GEMM's contract), so it
+        // advances by the same element size as the output.
+        const void* bias_chunk = bias ? static_cast<const char*>(bias) + n0 * osz : nullptr;
         void* out_chunk = static_cast<char*>(out) + n0 * osz;
         if (!launch_cutlass_int8_dequant_strided(
                 xq, workspace, xs, static_cast<const float*>(s_channel) + n0, bias_chunk,

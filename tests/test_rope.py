@@ -3,6 +3,7 @@ import torch
 
 import comfy_kitchen as ck
 from comfy_kitchen._rope_utils import check_rope_inplace
+from comfy_kitchen.backends.eager import rope as eager_rope
 
 from .conftest import assert_values_close, get_capable_backends
 
@@ -28,7 +29,7 @@ def _reference_apply_rope(
 class TestApplyRope:
     """RoPE (Rotary Position Embedding) tests."""
     @pytest.mark.parametrize("op_name", ["apply_rope", "apply_rope1"])
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
     @pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float16, torch.bfloat16], ids=["freqs_fp32", "freqs_fp16", "freqs_bf16"])
     @pytest.mark.parametrize("config_name,layout,config", [
@@ -93,7 +94,7 @@ class TestApplyRopeSplitHalf:
     """Tests for apply_rope_split_half and apply_rope_split_half1."""
 
     @pytest.mark.parametrize("op_name", ["apply_rope_split_half", "apply_rope_split_half1"])
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
     @pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float16, torch.bfloat16], ids=["freqs_fp32", "freqs_fp16", "freqs_bf16"])
     @pytest.mark.parametrize("config_name,layout,config", [
@@ -159,7 +160,119 @@ def _max_mismatch(freqs_dtype, dtype):
     return 1e-5
 
 
-@pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["BHND", "NHD"])
+@pytest.mark.parametrize("broadcast_pairs", [False, True])
+def test_eager_split_half_mixed_dtypes_and_broadcasting(
+    dtype, freqs_dtype, layout, broadcast_pairs, device, seed
+):
+    if layout == "BHND":
+        x = torch.randn(2, 5, 6, 16, device=device, dtype=dtype).transpose(1, 2)[..., ::2]
+        prefix = (2, 1, 5)
+    else:
+        x = torch.randn(5, 6, 16, device=device, dtype=dtype)[..., ::2]
+        prefix = (1, 5, 1)  # An extra leading singleton must not change the output shape.
+    pairs = 1 if broadcast_pairs else 4
+    freqs = torch.randn(*prefix, pairs, 2, 2, device=device, dtype=freqs_dtype)
+    original = x.clone()
+    reference = _reference_apply_rope(x, freqs, split_half=True)
+
+    with ck.use_backend("eager"):
+        actual = ck.apply_rope_split_half1(x, freqs)
+
+    tolerance = 4 * max(torch.finfo(dtype).eps, torch.finfo(freqs_dtype).eps)
+    torch.testing.assert_close(actual, reference, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
+    assert actual.data_ptr() != x.data_ptr()
+
+
+@pytest.mark.parametrize("freqs_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("freqs_shape", [(2, 2), (1, 2, 2), (1, 1, 1, 1, 2, 2)])
+def test_eager_split_half_rounds_input_to_frequency_dtype(freqs_dtype, freqs_shape, device, seed):
+    x = torch.randn(2, 3, 5, 8, device=device, dtype=torch.float32)
+    freqs = torch.eye(2, device=device, dtype=freqs_dtype).reshape(freqs_shape)
+
+    with ck.use_backend("eager"):
+        actual = ck.apply_rope_split_half1(x, freqs)
+
+    torch.testing.assert_close(actual, x.to(freqs_dtype).float(), rtol=0, atol=0)
+
+
+def test_eager_split_half_gradients(device, seed):
+    x = torch.randn(2, 3, 5, 8, device=device, dtype=torch.float64, requires_grad=True)
+    freqs = torch.randn(1, 1, 5, 4, 2, 2, device=device, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn_like(x)
+    reference = _reference_apply_rope(x, freqs, split_half=True)
+    actual = eager_rope.apply_rope_split_half1(x, freqs)
+
+    expected_grads = torch.autograd.grad(reference, (x, freqs), weight)
+    actual_grads = torch.autograd.grad(actual, (x, freqs), weight)
+
+    torch.testing.assert_close(actual, reference)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+
+@pytest.mark.parametrize("backend", ["triton", "eager"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["NHD", "BNHD"])
+@pytest.mark.parametrize("different_strides", [False, True])
+@pytest.mark.parametrize(
+    "op_name",
+    [
+        "apply_rope",
+        "apply_rope1",
+        "apply_rope_",
+        "apply_rope1_",
+        "apply_rope_split_half",
+        "apply_rope_split_half1",
+        "apply_rope_split_half_",
+        "apply_rope_split_half1_",
+    ],
+)
+def test_apply_rope_trellis_layouts(
+    backend, dtype, layout, different_strides, op_name, device, seed
+):
+    if backend not in get_capable_backends(op_name, device):
+        pytest.skip(f"{backend} does not support {op_name} on {device}")
+
+    prefix = (17,) if layout == "NHD" else (2, 17)
+    qkv = torch.randn(*prefix, 3, 3, 64, device=device, dtype=dtype)
+    q, k, v = qkv.unbind(dim=-3)
+    if different_strides:
+        k = k.contiguous()
+    original_qkv = qkv.clone()
+
+    phases = torch.randn(17, 32, device=device, dtype=torch.float32)
+    cos, sin = phases.cos(), phases.sin()
+    freqs = torch.stack((cos, -sin, sin, cos), dim=-1).reshape(17, 1, 32, 2, 2)
+    if layout == "BNHD":
+        freqs = freqs.unsqueeze(0)
+
+    paired = "1" not in op_name
+    inputs = (q, k) if paired else (q,)
+    references = tuple(
+        _reference_apply_rope(x, freqs, split_half="split_half" in op_name)
+        for x in inputs
+    )
+    pointers = tuple(x.data_ptr() for x in inputs)
+    strides = tuple(x.stride() for x in inputs)
+    with ck.use_backend(backend):
+        result = getattr(ck, op_name)(*inputs, freqs)
+    outputs = result if paired else (result,)
+
+    for actual, expected in zip(outputs, references, strict=True):
+        torch.testing.assert_close(actual, expected)
+    if op_name.endswith("_"):
+        assert tuple(x.data_ptr() for x in outputs) == pointers
+        assert tuple(x.stride() for x in outputs) == strides
+    else:
+        torch.testing.assert_close(qkv, original_qkv, rtol=0, atol=0)
+    torch.testing.assert_close(v, original_qkv.select(-3, 2), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
 @pytest.mark.parametrize("split_half", [False, True])
 def test_apply_rope_broadcasts_single_frequency(backend, split_half, device):
     op_name = "apply_rope_split_half1" if split_half else "apply_rope1"
@@ -174,7 +287,7 @@ def test_apply_rope_broadcasts_single_frequency(backend, split_half, device):
     torch.testing.assert_close(actual, reference, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+@pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
 @pytest.mark.parametrize(
     "q_seq_len,k_seq_len",
     [(3, 3), (3, 5)],
@@ -201,7 +314,7 @@ def test_apply_rope_trims_excess_sequence_frequencies(
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+@pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
 @pytest.mark.parametrize("split_half", [False, True])
 @pytest.mark.parametrize("last_dim_strided", [False, True])
 def test_apply_rope_strided_views(backend, split_half, last_dim_strided, device):
@@ -248,7 +361,7 @@ def test_apply_rope_triton_expanded_input(device):
         "apply_rope_split_half_",
     ],
 )
-@pytest.mark.parametrize("backend", ["cuda", "triton"])
+@pytest.mark.parametrize("backend", ["cuda", "hip", "triton"])
 @pytest.mark.parametrize("layout", ["BHND", "BNHD"])
 def test_apply_rope_gqa_different_qk_shapes(op_name, backend, layout, device):
     if backend not in get_capable_backends(op_name, device):
@@ -293,7 +406,7 @@ def test_apply_rope_gqa_different_qk_shapes(op_name, backend, layout, device):
         "apply_rope_split_half_",
     ],
 )
-@pytest.mark.parametrize("backend", ["cuda", "triton"])
+@pytest.mark.parametrize("backend", ["cuda", "hip", "triton"])
 def test_apply_rope_paired_different_strides(op_name, backend, device):
     if backend not in get_capable_backends(op_name, device):
         pytest.skip(f"{backend} does not support {op_name} on {device}")
@@ -330,7 +443,7 @@ def test_apply_rope_paired_different_strides(op_name, backend, device):
         "apply_rope_split_half1_",
     ],
 )
-@pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+@pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
 def test_apply_rope_inplace_storage(op_name, backend, device):
     if backend not in get_capable_backends(op_name, device):
         pytest.skip(f"{backend} does not support {op_name} on {device}")
@@ -356,7 +469,7 @@ def test_apply_rope_inplace_storage(op_name, backend, device):
 
 
 @pytest.mark.parametrize("op_name", ["apply_rope1_", "rms_rope1_"])
-@pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+@pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
 def test_inplace_backends_reject_autograd(op_name, backend, device):
     if backend not in get_capable_backends(op_name, device):
         pytest.skip(f"{backend} does not support {op_name} on {device}")

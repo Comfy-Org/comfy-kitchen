@@ -226,11 +226,12 @@ __forceinline__ __device__ float load_in(const void* x, int64_t idx, int code) {
 
 // Codes match comfy_kitchen.backends._activations.INPUT_ACT_TO_CODE. SwiGLU is
 // the gated pair: the raw row is [gate | up] (2*K wide) and the activated row
-// silu(gate) * up is K wide; the others are elementwise.
-enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2 };
+// silu(gate) * up is K wide. RmsNorm is row-wise, carries a K-element weight and
+// eps, and only the fused INT8 G=256 kernel implements it.
+enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2, kActRmsNorm = 3 };
 
 inline void check_convrot_act(int act) {
-    if (act != kActNone && act != kActGeluTanh && act != kActSwiGLU) {
+    if (act != kActNone && act != kActGeluTanh && act != kActSwiGLU && act != kActRmsNorm) {
         throw std::runtime_error("convrot: unsupported input activation code");
     }
 }
@@ -293,11 +294,13 @@ __forceinline__ __device__ float load_row_value<__half>(__half v) {
     return __half2float(v);
 }
 
+// The build pins wave32 (CMakeLists.txt); there is no compile-time wavefront
+// constant to assert on.
 constexpr int kWarpSize = 32;
 
 __forceinline__ __device__ float warp_reduce_max(float v) {
 #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
         v = fmaxf(v, __shfl_down(v, offset));
     }
     return v;
@@ -306,7 +309,7 @@ __forceinline__ __device__ float warp_reduce_max(float v) {
 template <int NUM_WARPS>
 __forceinline__ __device__ float block_reduce_max(float v, float* warp_smem, float* block_smem) {
     const int lane = threadIdx.x & (kWarpSize - 1);
-    const int wid = threadIdx.x >> 5;
+    const int wid = threadIdx.x / kWarpSize;
     v = warp_reduce_max(v);
     if (lane == 0) {
         warp_smem[wid] = v;
@@ -315,6 +318,35 @@ __forceinline__ __device__ float block_reduce_max(float v, float* warp_smem, flo
     if (wid == 0) {
         float total = lane < NUM_WARPS ? warp_smem[lane] : 0.0f;
         total = warp_reduce_max(total);
+        if (lane == 0) {
+            *block_smem = total;
+        }
+    }
+    __syncthreads();
+    return *block_smem;
+}
+
+// Only lane 0 is read back, and it never sees a lane shuffled in from past the warp.
+__forceinline__ __device__ float warp_reduce_sum(float v) {
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        v += __shfl_down(v, offset);
+    }
+    return v;
+}
+
+template <int NUM_WARPS>
+__forceinline__ __device__ float block_reduce_sum(float v, float* warp_smem, float* block_smem) {
+    const int lane = threadIdx.x & (kWarpSize - 1);
+    const int wid = threadIdx.x / kWarpSize;
+    v = warp_reduce_sum(v);
+    if (lane == 0) {
+        warp_smem[wid] = v;
+    }
+    __syncthreads();
+    if (wid == 0) {
+        float total = lane < NUM_WARPS ? warp_smem[lane] : 0.0f;
+        total = warp_reduce_sum(total);
         if (lane == 0) {
             *block_smem = total;
         }
@@ -553,8 +585,8 @@ void launch_convrot_quant_global_managed(
 template <typename RowT, int BLOCK_THREADS, int ACT, bool AFFINE_MODULATE = false>
 __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     const void* __restrict__ x, int in_dtype, int8_t* __restrict__ qout,
-    float* __restrict__ scaleout, int M, int K,
-    const void* __restrict__ modulation_scale = nullptr,
+    float* __restrict__ scaleout, int M, int K, const void* __restrict__ act_weight,
+    float act_eps, const void* __restrict__ modulation_scale = nullptr,
     const void* __restrict__ modulation_shift = nullptr) {
 
     static_assert(!AFFINE_MODULATE || std::is_same_v<RowT, __bf16>);
@@ -584,6 +616,18 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     float* buf1 = buf0 + kConvRotGroup256;
     float abs_max = 0.0f;
 
+    // RmsNorm needs the row's mean square before the first group.
+    float rstd = 1.0f;
+    if constexpr (ACT == kActRmsNorm) {
+        float sum_sq = 0.0f;
+        for (int c = tid; c < K; c += BLOCK_THREADS) {
+            const float v = load_row_value(static_cast<const RowT*>(x)[row_offset + c]);
+            sum_sq += v * v;
+        }
+        sum_sq = block_reduce_sum<kWarps>(sum_sq, warp_smem, &block_smem);
+        rstd = rsqrtf(sum_sq / static_cast<float>(K) + act_eps);
+    }
+
     const int iters = (n_groups + kGroupsInFlight - 1) / kGroupsInFlight;
     for (int it = 0; it < iters; ++it) {
         const int group = it * kGroupsInFlight + sub;
@@ -610,6 +654,13 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
                 xv3 = load_affine_modulated_bf16(
                     x, modulation_scale, modulation_shift,
                     in_row_offset + col + 3, col + 3);
+            } else if constexpr (ACT == kActRmsNorm) {
+                const RowT* xr = static_cast<const RowT*>(x) + in_row_offset;
+                const RowT* wr = static_cast<const RowT*>(act_weight);
+                xv0 = load_row_value(xr[col]) * rstd * load_row_value(wr[col]);
+                xv1 = load_row_value(xr[col + 1]) * rstd * load_row_value(wr[col + 1]);
+                xv2 = load_row_value(xr[col + 2]) * rstd * load_row_value(wr[col + 2]);
+                xv3 = load_row_value(xr[col + 3]) * rstd * load_row_value(wr[col + 3]);
             } else if constexpr (ACT == kActNone) {
                 if (in_dtype == 2) {
                     load_input_act4_bf16(x, in_row_offset, col, xv0, xv1, xv2, xv3);
@@ -665,7 +716,8 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
 template <typename RowT, int ACT, int BLOCK_THREADS, bool AFFINE_MODULATE = false>
 inline bool launch_convrot_quant_fused_impl(
     const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
-    hipStream_t stream, const void* modulation_scale = nullptr,
+    const void* act_weight, float act_eps, hipStream_t stream,
+    const void* modulation_scale = nullptr,
     const void* modulation_shift = nullptr) {
     const int groups_in_flight = BLOCK_THREADS / 64;
     const size_t shmem =
@@ -680,7 +732,7 @@ inline bool launch_convrot_quant_fused_impl(
         return false;
     }
     kernel<<<M, BLOCK_THREADS, shmem, stream>>>(
-        x, in_dtype, qout, scaleout, M, K,
+        x, in_dtype, qout, scaleout, M, K, act_weight, act_eps,
         modulation_scale, modulation_shift);
     return hipGetLastError() == hipSuccess;
 }
@@ -693,13 +745,15 @@ struct LaunchConvrotQuantFusedForBlock {
     float* scaleout;
     int M;
     int K;
+    const void* act_weight;
+    float act_eps;
     hipStream_t stream;
     bool* launched;
 
     template <int BLOCK_THREADS>
     void operator()() const {
         *launched = launch_convrot_quant_fused_impl<RowT, ACT, BLOCK_THREADS>(
-            x, in_dtype, qout, scaleout, M, K, stream);
+            x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream);
     }
 };
 
@@ -710,7 +764,7 @@ inline bool launch_convrot_quant_affine_fused_impl(
     int M, int K, hipStream_t stream) {
     return launch_convrot_quant_fused_impl<
         __bf16, kActNone, BLOCK_THREADS, true>(
-            x, 2, qout, scaleout, M, K, stream,
+            x, 2, qout, scaleout, M, K, nullptr, 0.0f, stream,
             modulation_scale, modulation_shift);
 }
 
@@ -758,6 +812,8 @@ struct LaunchConvrotQuantFusedForRow {
     float* scaleout;
     int M;
     int K;
+    const void* act_weight;
+    float act_eps;
     hipStream_t stream;
     int block_threads;
     bool* launched;
@@ -767,7 +823,7 @@ struct LaunchConvrotQuantFusedForRow {
         dispatch_convrot_fused_block_threads(
             block_threads,
             LaunchConvrotQuantFusedForBlock<RowT, ACT>{
-                x, in_dtype, qout, scaleout, M, K, stream, launched});
+                x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream, launched});
     }
 };
 
@@ -1470,7 +1526,8 @@ inline void launch_convrot_quant(
             dispatch_convrot_row_type(
                 in_dtype,
                 LaunchConvrotQuantFusedForRow<ACT>{
-                    x, in_dtype, qout, scaleout, M, K, stream, block_threads, &launched});
+                    x, in_dtype, qout, scaleout, M, K, nullptr, 0.0f, stream, block_threads,
+                    &launched});
             if (launched) {
                 return;
             }
@@ -1494,6 +1551,29 @@ inline void launch_convrot_quant(
     } else {
         launch_convrot_quant_for_block<PACK_INT4, ACT, 256>(
             x, in_dtype, qout, scaleout, M, K, group_size, stream);
+    }
+}
+
+// INT8 G=256 with the row's RMSNorm folded in. Only the fused kernel implements it;
+// the Python layer applies the norm eagerly wherever convrot_int8_needs_spill says
+// that kernel will not run.
+inline void launch_convrot_quant_rms_norm(
+    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
+    const void* act_weight, float act_eps, hipStream_t stream) {
+    if (act_weight == nullptr) {
+        throw std::runtime_error("convrot: rms_norm activation requires a weight");
+    }
+    const int block_threads = convrot_pick_fused_block_threads(M, K, in_dtype);
+    bool launched = false;
+    if (block_threads > 0) {
+        dispatch_convrot_row_type(
+            in_dtype,
+            LaunchConvrotQuantFusedForRow<kActRmsNorm>{
+                x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream, block_threads,
+                &launched});
+    }
+    if (!launched) {
+        throw std::runtime_error("convrot: rms_norm activation needs the fused G=256 kernel");
     }
 }
 

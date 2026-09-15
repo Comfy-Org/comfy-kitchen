@@ -17,6 +17,7 @@ import ctypes
 import importlib.util
 import os
 import sys
+import weakref
 
 import torch
 
@@ -25,12 +26,15 @@ from comfy_kitchen._rope_utils import (
     detect_rms_rope_bnhd,
     trim_rope_freqs,
 )
+from comfy_kitchen.allocation import allocation_context
 
 __all__ = [
     "na3d",
     "sol_attn",
     "sol_attn_chunked",
     "adaln",
+    "fp16_conv3d",
+    "group_norm_silu_pad3d",
     "rms_adaln",
     "apply_rope",
     "apply_rope_",
@@ -56,6 +60,7 @@ __all__ = [
     "dequantize_int8_convrot_weight_dtype",
     "dequantize_convrot_w4a4_weight",
     "dequantize_w4a8_int8_weight",
+    "fp16_linear",
     "int8_linear",
     "w4a8_int8_linear",
     "int4_linear",
@@ -154,6 +159,9 @@ from comfy_kitchen.backends._activations import (  # noqa: E402
     apply_input_act as _apply_input_act,
 )
 from comfy_kitchen.backends._activations import (  # noqa: E402
+    apply_residual as _apply_residual,
+)
+from comfy_kitchen.backends._activations import (  # noqa: E402
     input_act_code as _input_act_code,
 )
 from comfy_kitchen.backends._activations import (  # noqa: E402
@@ -161,6 +169,9 @@ from comfy_kitchen.backends._activations import (  # noqa: E402
 )
 from comfy_kitchen.backends._modulation import adaln_prep_modulation  # noqa: E402
 from comfy_kitchen.backends.eager import rope as _eager_rope  # noqa: E402
+from comfy_kitchen.backends.eager.group_norm_pad3d import (  # noqa: E402
+    group_norm_silu_pad3d as _eager_group_norm_silu_pad3d,
+)
 from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
     DTYPE_CODE_TO_DTYPE,
     DTYPE_TO_CODE,
@@ -482,6 +493,19 @@ def _empty_cuda_tensor(device: torch.device, dtype: torch.dtype) -> torch.Tensor
         empty = torch.empty(0, dtype=dtype, device=device)
         _empty_cuda_tensors[key] = empty
     return empty
+
+
+def _aligned16(t: torch.Tensor) -> bool:
+    return t.data_ptr() % 16 == 0
+
+
+def _gemm_vector_arg(v: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """A per-channel vector as the CUTLASS epilogues read it: on device, in dtype,
+    contiguous and 16-byte aligned (the row-broadcast visitors load 16-byte vectors)."""
+    if v.device == device and v.dtype == dtype and v.is_contiguous() and _aligned16(v):
+        return v
+    v = v.to(device=device, dtype=dtype).contiguous()
+    return v if _aligned16(v) else v.clone()
 
 
 def _int8_weight_scale_arg(weight_scale: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -863,9 +887,9 @@ def _int4_weight_int8_act_gemm_dequant_chunked(
     weight_scale_arg = weight_scale.to(device=x_int8.device, dtype=torch.float32).reshape(-1).contiguous()
     if weight_scale_arg.numel() != n:
         raise ValueError(f"chunked INT4 weight GEMM weight_scale must have {n} values, got {weight_scale_arg.numel()}")
-    bias_arg = bias if bias is not None else _empty_cuda_tensor(x_int8.device, out_dtype)
-    if bias is not None:
-        bias_arg = bias.to(device=x_int8.device, dtype=torch.float32).contiguous()
+    # the strided CUTLASS route reads bias in the output dtype; the hand kernel takes any
+    bias_arg = (_gemm_vector_arg(bias, x_int8.device, out_dtype) if bias is not None
+                else _empty_cuda_tensor(x_int8.device, out_dtype))
 
     stream_ptr = torch.cuda.current_stream(x_int8.device).cuda_stream
     _C.int4_weight_int8_act_gemm_dequant_chunked(
@@ -908,9 +932,8 @@ def _int4_linear_via_int8_values(
         raise ValueError(f"INT4 fallback x_scale must have {m} values, got {x_scale_arg.numel()}")
     if weight_scale_arg.numel() != n:
         raise ValueError(f"INT4 fallback weight_scale must have {n} values, got {weight_scale_arg.numel()}")
-    bias_arg = bias if bias is not None else _empty_cuda_tensor(x_int8.device, out_dtype)
-    if bias is not None and (bias.device != x_int8.device or bias.dtype != out_dtype or not bias.is_contiguous()):
-        bias_arg = bias.to(device=x_int8.device, dtype=out_dtype).contiguous()
+    bias_arg = (_gemm_vector_arg(bias, x_int8.device, out_dtype) if bias is not None
+                else _empty_cuda_tensor(x_int8.device, out_dtype))
 
     stream_ptr = torch.cuda.current_stream(x_int8.device).cuda_stream
     if m == 1 and k % 4 == 0 and hasattr(_C, "int8_gemv_dequant"):
@@ -955,13 +978,12 @@ def _int4_linear_via_int8_values(
         and _cuda_device_supports_cutlass_int8_dequant(x_int8)
     ):
         ws_cutlass = weight_scale_arg if weight_scale_arg.numel() == n else weight_scale_arg.expand(n).contiguous()
-        bias_f32 = bias_arg.to(torch.float32).contiguous() if bias is not None else bias_arg
         used_cutlass = _C.cutlass_int8_dequant(
             _wrap_for_dlpack(x_int8),
             _wrap_for_dlpack(weight_int8),
             _wrap_for_dlpack(x_scale_arg.reshape(m, 1)),
             _wrap_for_dlpack(ws_cutlass),
-            _wrap_for_dlpack(bias_f32),
+            _wrap_for_dlpack(bias_arg),
             _wrap_for_dlpack(output),
             DTYPE_TO_CODE[out_dtype],
             torch.cuda.current_stream(x_int8.device).cuda_stream,
@@ -1112,9 +1134,8 @@ def int4_linear(
         raise ValueError(f"INT4 x_scale must have {m} values, got {x_scale_arg.numel()}")
     if weight_scale_arg.numel() != n:
         raise ValueError(f"INT4 weight_scale must have {n} values, got {weight_scale_arg.numel()}")
-    bias_arg = bias if bias is not None else _empty_cuda_tensor(x_qdata.device, out_dtype)
-    if bias is not None and (bias.device != x_qdata.device or not bias.is_contiguous()):
-        bias_arg = bias.to(device=x_qdata.device).contiguous()
+    bias_arg = (_gemm_vector_arg(bias, x_qdata.device, out_dtype) if bias is not None
+                else _empty_cuda_tensor(x_qdata.device, out_dtype))
     stream_ptr = torch.cuda.current_stream(x_qdata.device).cuda_stream
     if _should_use_turing_int4(x_qdata):
         turing_output = _int4_linear_turing(
@@ -1143,13 +1164,12 @@ def int4_linear(
         and _cuda_device_supports_cutlass_int8_dequant(x_qdata)
         and hasattr(_C, "cutlass_int4_dequant")
     ):
-        bias_f32 = bias_arg.to(torch.float32).contiguous() if bias is not None else bias_arg
         used_cutlass = _C.cutlass_int4_dequant(
             _wrap_for_dlpack(x_qdata.contiguous()),
             _wrap_for_dlpack(weight.contiguous()),
             _wrap_for_dlpack(x_scale_arg),
             _wrap_for_dlpack(weight_scale_arg),
-            _wrap_for_dlpack(bias_f32),
+            _wrap_for_dlpack(bias_arg),
             _wrap_for_dlpack(output),
             DTYPE_TO_CODE[out_dtype],
             stream_ptr,
@@ -1500,19 +1520,24 @@ def quantize_int8_rowwise_convrot64(
     group_size: int,
     stochastic_rounding: int | None = 0,
     input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused ConvRot row-wise INT8 quantization using 64-lane groups.
 
     input_act applies an activation on the way in, so an MLP's
     `linear(act(proj(x)))` never materializes act's output in bf16. For the
     gated "swiglu" pair the input rows are [gate | up] and the quantized rows
-    are half as wide.
+    are half as wide. "rms_norm" normalizes each row with input_act_weight
+    (K elements) and input_act_eps before rotating.
     """
     q_2d = torch.empty(
         (weight_2d.shape[0], weight_2d.shape[1] // _input_act_width(input_act)),
         dtype=torch.int8, device=weight_2d.device)
     scales_2d = torch.empty((weight_2d.shape[0], 1), dtype=torch.float32, device=weight_2d.device)
     stream_ptr = torch.cuda.current_stream(weight_2d.device).cuda_stream
+    act_weight_arg = _act_weight_arg(
+        input_act, input_act_weight, weight_2d.device, weight_2d.dtype)
     _C.quantize_int8_rowwise_convrot64(
         _wrap_for_dlpack(weight_2d),
         _wrap_for_dlpack(q_2d),
@@ -1521,6 +1546,8 @@ def quantize_int8_rowwise_convrot64(
         stochastic_rounding is not None and stochastic_rounding > 0,
         _input_act_code(input_act),
         int(stochastic_rounding or 0),
+        _wrap_for_dlpack(act_weight_arg),
+        float(input_act_eps),
         stream_ptr,
     )
     return q_2d, scales_2d
@@ -1862,6 +1889,79 @@ def scaled_mm_nvfp4(
     return out
 
 
+def fp16_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """CUTLASS fp16-accumulate GEMM with fused bias/residual; cuBLAS when the
+    kernel cannot serve the shape.
+    """
+    if residual is not None and residual_scale is None:
+        raise ValueError("fp16_linear: residual requires residual_scale")
+
+    orig_shape = x.shape
+    x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
+    m = x_2d.shape[0]
+    n = weight.shape[0]
+
+    supported = (
+        x.dtype == torch.float16
+        and weight.dtype == torch.float16
+        and weight.is_cuda
+        and weight.device == x.device
+        # the kernels issue 16-byte vector loads; misaligned views must fall back
+        and _aligned16(x_2d)
+        and _aligned16(weight)
+        and (bias is None or bias.dtype == torch.float16)
+        and (residual is None or (residual.dtype == torch.float16
+                                  and residual_scale.dtype == torch.float16
+                                  and _aligned16(residual)))
+    )
+    if not supported:
+        out = torch.nn.functional.linear(x, weight, bias)
+        return _apply_residual(out, residual, residual_scale)
+
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    out = torch.empty((m, n), dtype=torch.float16, device=x.device)
+    bias_arg = (_gemm_vector_arg(bias, x.device, torch.float16) if bias is not None
+                else _empty_cuda_tensor(x.device, torch.float16))
+    resid_2d = None if residual is None else residual.reshape(m, n).contiguous()
+    if resid_2d is None or not _C.cutlass_fp16_linear_residual(
+        _wrap_for_dlpack(x_2d),
+        _wrap_for_dlpack(weight),
+        _wrap_for_dlpack(bias_arg),
+        _wrap_for_dlpack(_gemm_vector_arg(residual_scale, x.device, torch.float16)),
+        _wrap_for_dlpack(resid_2d),
+        _wrap_for_dlpack(out),
+        stream_ptr,
+    ):
+        ok = _C.cutlass_fp16_linear(
+            _wrap_for_dlpack(x_2d),
+            _wrap_for_dlpack(weight),
+            _wrap_for_dlpack(bias_arg),
+            _wrap_for_dlpack(out),
+            stream_ptr,
+        )
+        if not ok:
+            out = torch.nn.functional.linear(x_2d, weight, bias)
+        out = _apply_residual(out, resid_2d, residual_scale)
+
+    return out if len(orig_shape) == 2 else out.reshape(*orig_shape[:-1], n)
+
+
+def _act_weight_arg(input_act, input_act_weight, device, dtype: torch.dtype) -> torch.Tensor:
+    """The fused quantizer's act-weight operand: the norm weight for acts
+    that carry one, the empty placeholder otherwise."""
+    if input_act == "rms_norm" and input_act_weight is not None:
+        return input_act_weight.to(device=device, dtype=dtype).contiguous()
+    return _empty_cuda_tensor(device, dtype)
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1871,7 +1971,13 @@ def int8_linear(
     convrot: bool = False,
     convrot_groupsize: int = 256,
     input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if residual is not None and residual_scale is None:
+        raise ValueError("int8_linear: residual requires residual_scale")
     orig_shape = x.shape
     x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
     if not weight.is_contiguous():
@@ -1890,7 +1996,7 @@ def int8_linear(
         and _convrot_fused_shared_memory_fits(x_2d, k_act, convrot_groupsize)
     )
     if input_act not in (None, "none") and not (_fused_convrot_ok and x_2d.shape[0] > 1):
-        x_2d = _apply_input_act(x_2d, input_act)
+        x_2d = _apply_input_act(x_2d, input_act, input_act_weight, input_act_eps)
         input_act = None
 
     m = x_2d.shape[0]
@@ -1901,6 +2007,17 @@ def int8_linear(
     out_dtype = out_dtype or x.dtype
     output_dtype_code = DTYPE_TO_CODE[out_dtype]
     is_2d_output = len(orig_shape) == 2
+
+    # The residual is fused into the CUTLASS epilogue when that path runs;
+    # every other route applies it eagerly here so all paths agree.
+    fused_residual_done = False
+
+    def _finish(o):
+        if not fused_residual_done:
+            o = _apply_residual(o, None if residual is None else residual.reshape(o.shape),
+                                residual_scale)
+        return o if is_2d_output else o.reshape(*orig_shape[:-1], n)
+
     convrot_m1_supported = (
         m == 1
         and convrot
@@ -1936,7 +2053,7 @@ def int8_linear(
             convrot_groupsize,
             stream_ptr,
         )
-        return out if is_2d_output else out.reshape(*orig_shape[:-1], n)
+        return _finish(out)
 
     # cuBLAS INT8 GEMM requires row-wise quantized activations and tensor-wise quantized weights.
     if convrot:
@@ -1946,6 +2063,8 @@ def int8_linear(
         if _fused_convrot_ok:
             x_qdata = torch.empty((m, k), dtype=torch.int8, device=x.device)
             x_scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+            act_weight_arg = _act_weight_arg(
+                input_act, input_act_weight, x.device, x_2d.dtype)
             _C.quantize_int8_rowwise_convrot64(
                 _wrap_for_dlpack(x_2d),
                 _wrap_for_dlpack(x_qdata),
@@ -1954,6 +2073,8 @@ def int8_linear(
                 False,
                 _input_act_code(input_act),
                 0,
+                _wrap_for_dlpack(act_weight_arg),
+                float(input_act_eps),
                 stream_ptr,
             )
         elif _should_use_convrot_fused_kernel(x_2d, k, convrot_groupsize):
@@ -1991,13 +2112,12 @@ def int8_linear(
             output_dtype_code,
             stream_ptr,
         )
-        return out if is_2d_output else out.reshape(*orig_shape[:-1], n)
+        return _finish(out)
 
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
     weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
-    bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
-    if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
-        bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
+    bias_arg = (_gemm_vector_arg(bias, x.device, out_dtype) if bias is not None
+                else _empty_cuda_tensor(x.device, out_dtype))
 
     if (
         _prefer_turing_fused_int8(m, n, k)
@@ -2013,7 +2133,7 @@ def int8_linear(
             out_dtype,
         )
         if turing_out is not None:
-            return turing_out if is_2d_output else turing_out.reshape(*orig_shape[:-1], n)
+            return _finish(turing_out)
 
     used_cutlass = False
     prefer_cublas_fallback = _prefer_cublas_int8_fallback(
@@ -2028,17 +2148,38 @@ def int8_linear(
         and _cuda_device_supports_cutlass_int8_dequant(x_qdata)
     ):
         ws_cutlass = weight_scale if weight_scale.numel() == n else weight_scale.expand(n).contiguous()
-        bias_f32 = bias_arg.to(torch.float32).contiguous() if bias is not None else bias_arg
-        used_cutlass = _C.cutlass_int8_dequant(
-            _wrap_for_dlpack(x_qdata),
-            _wrap_for_dlpack(weight),
-            _wrap_for_dlpack(x_scale),
-            _wrap_for_dlpack(ws_cutlass),
-            _wrap_for_dlpack(bias_f32),
-            _wrap_for_dlpack(out),
-            output_dtype_code,
-            stream_ptr,
-        )
+        # the residual is fused only in the output dtype and 16-byte aligned
+        # (the epilogue's vector loads); the per-channel scale is realigned instead
+        resid_2d = None
+        if residual is not None and residual.dtype == out_dtype and residual_scale.dtype == out_dtype:
+            resid_2d = residual.reshape(m, n).contiguous()
+            if not _aligned16(resid_2d):
+                resid_2d = None
+        if resid_2d is not None:
+            used_cutlass = _C.cutlass_int8_dequant_residual(
+                _wrap_for_dlpack(x_qdata),
+                _wrap_for_dlpack(weight),
+                _wrap_for_dlpack(x_scale),
+                _wrap_for_dlpack(ws_cutlass),
+                _wrap_for_dlpack(bias_arg),
+                _wrap_for_dlpack(_gemm_vector_arg(residual_scale, x.device, out_dtype)),
+                _wrap_for_dlpack(resid_2d),
+                _wrap_for_dlpack(out),
+                output_dtype_code,
+                stream_ptr,
+            )
+            fused_residual_done = used_cutlass
+        if not used_cutlass:
+            used_cutlass = _C.cutlass_int8_dequant(
+                _wrap_for_dlpack(x_qdata),
+                _wrap_for_dlpack(weight),
+                _wrap_for_dlpack(x_scale),
+                _wrap_for_dlpack(ws_cutlass),
+                _wrap_for_dlpack(bias_arg),
+                _wrap_for_dlpack(out),
+                output_dtype_code,
+                stream_ptr,
+            )
     if not used_cutlass:
         # Fallback: cuBLAS int8 GEMM (int32) + separate dequant kernel.
         use_turing_padding = x_qdata.is_cuda and _cuda_device_is_turing(x_qdata.get_device())
@@ -2072,7 +2213,7 @@ def int8_linear(
             stream_ptr,
         )
 
-    return out if is_2d_output else out.reshape(*orig_shape[:-1], n)
+    return _finish(out)
 
 
 def dequantize_w4a8_int8_weight(
@@ -2168,7 +2309,8 @@ def w4a8_int8_linear(
     xq = torch.empty(m, k, dtype=torch.int8, device=x.device)
     xs = torch.empty(m, 1, dtype=torch.float32, device=x.device)
     out = torch.empty(m, n, dtype=out_dtype, device=x.device)
-    bias_float = bias.float().contiguous() if bias is not None else None
+    # both the chunked kernels and the 2-pass CUTLASS fallback read bias in the output dtype
+    bias_arg = _gemm_vector_arg(bias, x.device, out_dtype) if bias is not None else None
 
     chunked = (
         _W4A8_CHUNKED
@@ -2189,7 +2331,7 @@ def w4a8_int8_linear(
                 _wrap_for_dlpack(s_rel.view(torch.uint8)),
                 wrap_codebook(),
                 _wrap_for_dlpack(s_channel),
-                _wrap_for_dlpack(bias_float) if bias_float is not None else None,
+                _wrap_for_dlpack(bias_arg) if bias_arg is not None else None,
                 _wrap_for_dlpack(workspace),
                 _wrap_for_dlpack(out),
                 convrot_groupsize,
@@ -2215,7 +2357,7 @@ def w4a8_int8_linear(
                 wrap_codebook(),
                 _wrap_for_dlpack(s_channel),
                 _wrap_for_dlpack(xs.reshape(m)),
-                _wrap_for_dlpack(bias_float) if bias_float is not None else None,
+                _wrap_for_dlpack(bias_arg) if bias_arg is not None else None,
                 _wrap_for_dlpack(workspace),
                 _wrap_for_dlpack(out),
                 group_size,
@@ -2256,17 +2398,12 @@ def w4a8_int8_linear(
             stream_ptr,
         )
 
-    bias_arg = (
-        bias_float
-        if bias_float is not None
-        else _empty_cuda_tensor(x.device, torch.float32)
-    )
     used = _C.cutlass_int8_dequant(
         _wrap_for_dlpack(xq),
         _wrap_for_dlpack(int8_weight),
         _wrap_for_dlpack(xs),
         _wrap_for_dlpack(s_channel),
-        _wrap_for_dlpack(bias_arg),
+        _wrap_for_dlpack(bias_arg if bias_arg is not None else _empty_cuda_tensor(x.device, out_dtype)),
         _wrap_for_dlpack(out),
         output_dtype_code,
         stream_ptr,
@@ -2411,23 +2548,22 @@ _ROPE_FAB_CACHE = {}
 def _packed_rope_fab(freqs, t, rot):
     """[..., T, 1, rot/2, 2, 2] -> [T, rot, 2] per-channel (self, partner)
     coefficients. Cached per freqs tensor (H3 reuses one across a step's
-    layers); keyed on id() with a strong ref, since data_ptr can be reused
-    after free and inference tensors have no _version."""
+    layers); the weak ref validates an id() hit without retaining freqs."""
     key = (id(freqs), t, rot)
     hit = _ROPE_FAB_CACHE.get(key)
-    if hit is not None:
+    if hit is not None and hit[0]() is freqs:
         return hit[1]
     f = freqs.reshape(-1, rot // 2, 2, 2)
     if f.shape[0] != t:
         raise ValueError(f"sol_attn: rope_freqs covers {f.shape[0]} tokens, T={t}")
-    f = f.float()
-    fab = torch.empty(t, rot, 2, device=freqs.device, dtype=torch.float32)
+    with allocation_context():
+        fab = torch.empty(t, rot, 2, device=freqs.device, dtype=torch.float32)
     fab[:, :rot // 2, 0] = f[:, :, 0, 0]
     fab[:, :rot // 2, 1] = f[:, :, 0, 1]
     fab[:, rot // 2:, 0] = f[:, :, 1, 1]
     fab[:, rot // 2:, 1] = f[:, :, 1, 0]
     _ROPE_FAB_CACHE.clear()   # one live entry
-    _ROPE_FAB_CACHE[key] = (freqs, fab)
+    _ROPE_FAB_CACHE[key] = (weakref.ref(freqs), fab)
     return fab
 
 
@@ -2463,18 +2599,26 @@ def sol_attn(
     tail: bool = True,
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
+    token_aug: int = 0,
 ) -> torch.Tensor:
-    """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 tensors.
+    """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
     See sage_attention/sol_attn.cu and the public docstring for ``tail``,
     ``block_len`` and ``coarse_gate``.
 
     ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
     per-query-block top-k: keep that fraction of key blocks per query block
     (sinks and the diagonal still ride on top). tau is ignored then.
+
+    ``token_aug`` (0, or a multiple of 64 up to 256): on top of the routed
+    blocks, every row attends up to ``token_aug`` unrouted tokens its query
+    block's centroid scores highest (whole histogram bins only, so the set
+    never depends on scheduling; a flat score profile may admit none), and the
+    remaining tail is exact for the centroid instead of pooled per block.
+    The eager reference ignores it.
     """
     batch, t, h, d = q.shape
-    if q.dtype != torch.bfloat16:
-        raise ValueError(f"sol_attn: q/k/v must be bfloat16, got {q.dtype}")
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
     _check_sol_args(q.device, sink_blocks, sink_q, topk_ratio, q=q, k=k, v=v,
                     block_len=block_len, coarse_gate=coarse_gate)
     if scale is None:
@@ -2510,7 +2654,7 @@ def sol_attn(
         kb = _normalize_key_bias(key_bias, batch, t, q.device)
         kb = (kb * _LOG2E).expand(batch, t).contiguous()
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    p = _C.sol_attn_plan(batch, t, h)
+    p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug))
     workspace = torch.empty(p["total"], dtype=torch.uint8, device=q.device)
     _C.sol_attn(
         _wrap_for_dlpack(q),
@@ -2525,7 +2669,7 @@ def sol_attn(
         key_bias=None if kb is None else _wrap_for_dlpack(kb),
         threshold=None if thr is None else _wrap_for_dlpack(thr),
         block_len=None if block_len is None else _wrap_for_dlpack(block_len),
-        tail=bool(tail),
+        tail=bool(tail), token_aug=int(token_aug),
     )
     if coarse_gate is not None:
         add_coarse_(out, coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale),
@@ -2550,10 +2694,11 @@ def sol_attn_chunked(
     tail: bool = True,
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
+    token_aug: int = 0,
 ):
     """Chunked-producer Sol-Attn over fused qkv projection chunks ([M, 3*H*128]
     bf16, 64-aligned starts, B=1); full Q/K/V are never materialised.
-    ``tail`` / ``block_len`` / ``coarse_gate`` as in ``sol_attn``.
+    ``tail`` / ``block_len`` / ``coarse_gate`` / ``token_aug`` as in ``sol_attn``.
 
     ``qkv_chunks``: an iterable of chunks or a zero-arg callable returning one.
     ``kmean``/``vscale`` are LAST step's statistics ([H,128] f32); when None the
@@ -2579,13 +2724,13 @@ def sol_attn_chunked(
     if factory is None and (kmean is None or vscale is None):
         qkv_chunks = list(qkv_chunks)          # need two passes over it
         factory = lambda: iter(qkv_chunks)     # noqa: E731
-    p = _C.sol_attn_plan(1, t, h)
+    p = _C.sol_attn_plan(1, t, h, token_aug=int(token_aug))
     ws = torch.empty(p["total"], dtype=torch.uint8, device=dev)
     stream = torch.cuda.current_stream(dev).cuda_stream
     width = 3 * h * d
 
     def produce(km, vsc):
-        _C.sol_producer_begin(_wrap_for_dlpack(ws), 1, t, h, stream)
+        _C.sol_producer_begin(_wrap_for_dlpack(ws), 1, t, h, stream, token_aug=int(token_aug))
         t0 = 0
         for chunk in (factory() if factory is not None else qkv_chunks):
             m = chunk.shape[-2]
@@ -2601,7 +2746,8 @@ def sol_attn_chunked(
                 _wrap_for_dlpack(fab), _wrap_for_dlpack(qw), _wrap_for_dlpack(kw),
                 _wrap_for_dlpack(km), _wrap_for_dlpack(vsc),
                 float(rope_eps), rot, t0, m, 1, t, h, stream,
-                block_len=None if block_len is None else _wrap_for_dlpack(block_len))
+                block_len=None if block_len is None else _wrap_for_dlpack(block_len),
+                token_aug=int(token_aug))
             t0 += m
         if t0 != t:
             raise ValueError(f"sol_attn_chunked: chunks cover {t0} tokens, T={t}")
@@ -2630,7 +2776,7 @@ def sol_attn_chunked(
         _wrap_for_dlpack(kmean_next), _wrap_for_dlpack(vamax),
         1, t, h, float(tau), float(scale), sb[0], sb[1], sq[0], sq[1], stream,
         threshold=None if threshold is None else _wrap_for_dlpack(threshold),
-        block_len=None if block_len is None else _wrap_for_dlpack(block_len), tail=bool(tail))
+        block_len=None if block_len is None else _wrap_for_dlpack(block_len), tail=bool(tail), token_aug=int(token_aug))
     if coarse_gate is not None:
         add_coarse_(out, coarse_output(*_ws_block_means(ws, p, h, lengths), scale), coarse_gate)
     return out, kmean_next, vscale_of(vamax)
@@ -2713,6 +2859,120 @@ def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float 
 
 def rms_adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return _adaln_impl(_C.rms_adaln, x, scale, shift, eps)
+
+
+_ZERO_VECTORS: dict[tuple, torch.Tensor] = {}
+
+
+def _zero_vector(n: int, device: torch.device, dtype: torch.dtype = torch.float16) -> torch.Tensor:
+    """A cached length-n zero vector: the "no bias" / "no residual" operand of
+    the fused kernels, which read a vector unconditionally."""
+    key = (n, device.type, device.index, dtype)
+    vec = _ZERO_VECTORS.get(key)
+    if vec is None:
+        vec = _ZERO_VECTORS[key] = torch.zeros(n, dtype=dtype, device=device)
+    return vec
+
+
+def _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-1):
+    """The fused kernel, or None when it does not apply to this call.
+    config forces a tile config (benchmarking); -1 selects by shape."""
+    n, c, d, h, w = x.shape
+    k, _, t, r, s = weight.shape
+    sd, sh, sw = stride
+    if min(sd, sh, sw) < 1:
+        return None  # torch's conv reports the bad stride
+    z, p, q = (d - t) // sd + 1, (h - r) // sh + 1, (w - s) // sw + 1
+    supported = (
+        x.dtype == torch.float16 and weight.dtype == torch.float16
+        and x.is_cuda and weight.device == x.device and weight.shape[1] == c
+        and (c % 8 == 0 or c < 8) and k % 8 == 0 and d >= t and h >= r and w >= s
+        and (bias is None or (bias.dtype == torch.float16 and bias.shape == (k,)))
+        and (residual is None or (residual.dtype == torch.float16 and residual.shape == (n, k, z, p, q)))
+    )
+    if not supported:
+        return None
+    if c < 8:
+        # zero-pad pixel-sized channel counts (conv_in) to the kernel's 8-channel vector width
+        x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, 0, 0, 8 - c))
+        weight = torch.nn.functional.pad(weight, (0, 0, 0, 0, 0, 0, 0, 8 - c))
+        c = 8
+    x = x.contiguous(memory_format=torch.channels_last_3d)
+    weight = weight.contiguous(memory_format=torch.channels_last_3d)
+    bias = bias.contiguous() if bias is not None else _zero_vector(k, x.device)
+    residual = (residual.contiguous(memory_format=torch.channels_last_3d) if residual is not None
+                else _zero_vector(k, x.device))
+    if not (_aligned16(x) and _aligned16(weight) and _aligned16(bias) and _aligned16(residual)):
+        return None
+    out = torch.empty((n, k, z, p, q), dtype=torch.float16, device=x.device, memory_format=torch.channels_last_3d)
+    ok = _C.cutlass_fp16_conv3d(
+        _wrap_for_dlpack(x), _wrap_for_dlpack(weight), _wrap_for_dlpack(bias),
+        _wrap_for_dlpack(residual), _wrap_for_dlpack(out),
+        n, d, h, w, c, k, t, r, s, sd, sh, sw,
+        torch.cuda.current_stream(x.device).cuda_stream, config,
+    )
+    return out if ok else None
+
+
+def fp16_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    stride: list[int],
+) -> torch.Tensor:
+    """fp16-accumulate conv3d with fused bias/residual, channels_last_3d in and out;
+    torch's conv when the kernel declines the shape."""
+    out = _cutlass_fp16_conv3d(x, weight, bias, residual, stride)
+    if out is not None:
+        return out
+    out = torch.nn.functional.conv3d(x, weight, bias, stride=stride).contiguous(memory_format=torch.channels_last_3d)
+    return out if residual is None else out + residual
+
+
+def group_norm_silu_pad3d(
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    num_groups: int,
+    eps: float,
+    pad: list[int],
+    silu: bool,
+) -> torch.Tensor:
+    """Per-frame GroupNorm + SiLU + causal conv padding in one pass; the result
+    is channels_last_3d (NDHWC), the layout cuDNN runs fp16/bf16 convs in."""
+    b, c, t, h, w = x.shape
+    left, right, top, bottom, front = pad
+    # the affine params may be fp32 (the registry admits it); every path,
+    # including torch's group_norm on the fallbacks, wants them in x's dtype
+    if min(pad) < 0:
+        raise ValueError("group_norm_silu_pad3d: padding must be non-negative")
+    if weight is not None:
+        weight = weight.to(x.dtype).contiguous()
+        bias = _zero_vector(c, x.device, x.dtype) if bias is None else bias.to(x.dtype).contiguous()
+    if (c % 8 or 256 % (c // 8) or (weight is not None and (c % num_groups or num_groups > 1024))
+            or max(left, right) >= w or max(top, bottom) >= h or b * (t + front) > 65535):
+        return _eager_group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu)
+
+    x = x.contiguous(memory_format=torch.channels_last_3d)
+    if not _aligned16(x):  # the kernels issue 16-byte vector loads
+        return _eager_group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu)
+    out = torch.empty((b, c, t + front, h + top + bottom, w + left + right),
+                      dtype=x.dtype, device=x.device, memory_format=torch.channels_last_3d)
+    placeholder = _empty_cuda_tensor(x.device, torch.float32)
+    if weight is not None:
+        chunks = -(-(h * w) // 1024)
+        workspace = torch.empty(2 * b * t * (chunks * c + num_groups), dtype=torch.float32, device=x.device)
+    else:
+        weight = bias = workspace = placeholder
+
+    _C.group_norm_silu_pad3d(
+        _wrap_for_dlpack(x), _wrap_for_dlpack(weight), _wrap_for_dlpack(bias),
+        _wrap_for_dlpack(out), _wrap_for_dlpack(workspace),
+        b, c, t, h, w, num_groups, eps, left, right, top, bottom, front, silu,
+        DTYPE_TO_CODE[x.dtype], torch.cuda.current_stream(x.device).cuda_stream,
+    )
+    return out
 
 
 def _apply_rope1_cuda(
@@ -3376,15 +3636,15 @@ def _build_constraints() -> dict:
         "sol_attn": FunctionConstraints(
             params={
                 "q": ParamConstraint(
-                    dtypes=frozenset({torch.bfloat16}),
+                    dtypes=frozenset({torch.bfloat16, torch.float16}),
                     shape_rules=(ExactDims(4),),
                 ),
                 "k": ParamConstraint(
-                    dtypes=frozenset({torch.bfloat16}),
+                    dtypes=frozenset({torch.bfloat16, torch.float16}),
                     shape_rules=(ExactDims(4),),
                 ),
                 "v": ParamConstraint(
-                    dtypes=frozenset({torch.bfloat16}),
+                    dtypes=frozenset({torch.bfloat16, torch.float16}),
                     shape_rules=(ExactDims(4),),
                 ),
             },
@@ -3434,6 +3694,30 @@ def _build_constraints() -> dict:
                 ),
                 "shift": ParamConstraint(
                     dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "fp16_conv3d": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(5),)),
+                "weight": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(5),)),
+                "bias": ParamConstraint(dtypes=frozenset({torch.float16, type(None)})),
+                "residual": ParamConstraint(dtypes=frozenset({torch.float16, type(None)})),
+            },
+            default_devices=cuda_devices,
+        ),
+        "group_norm_silu_pad3d": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(5),),
+                ),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16, type(None)}),
+                ),
+                "bias": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16, type(None)}),
                 ),
             },
             default_devices=cuda_devices,
@@ -3967,6 +4251,24 @@ def _build_constraints() -> dict:
             min_compute_capability=(8, 0),
         ),
     }
+
+    constraints["fp16_linear"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(
+                dtypes=frozenset({torch.float16}),
+                shape_rules=(MinDims(2),),
+            ),
+            "weight": ParamConstraint(
+                dtypes=frozenset({torch.float16}),
+                shape_rules=(ExactDims(2),),
+            ),
+            "bias": ParamConstraint(dtypes=frozenset({torch.float16})),
+            "residual": ParamConstraint(dtypes=frozenset({torch.float16})),
+            "residual_scale": ParamConstraint(dtypes=frozenset({torch.float16})),
+        },
+        default_devices=cuda_devices,
+        min_compute_capability=(8, 0),
+    )
 
     if _CUBLASLT_AVAILABLE:
         constraints["int8_linear"] = FunctionConstraints(

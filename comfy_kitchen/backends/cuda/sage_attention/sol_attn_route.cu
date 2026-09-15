@@ -45,6 +45,8 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
     uint16_t* __restrict__ blk_idx, int32_t* __restrict__ blk_cnt,
     __nv_bfloat16* __restrict__ o_part, float* __restrict__ m_part,
     float* __restrict__ l_part,
+    float* __restrict__ tok_ref,       // token routing: best unrouted pooled score per query block, or null
+    uint32_t* __restrict__ cand_bits,  // token routing: [B*H, NQ, ceil(NTB/32)] unrouted-block bitmap, or null
     const int32_t* __restrict__ blen, int tail,
     int T, int NTB, int NPAD, int NQ,
     int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2) {
@@ -100,8 +102,11 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
         o_acc[nt][2] = 0.f; o_acc[nt][3] = 0.f;
     }
     float m_r[2] = {NEG, NEG}, l_r[2] = {0.f, 0.f};
+    float refm[2] = {NEG, NEG};
+    const int W = (NTB + 31) >> 5;
 
     for (int gs = 0; gs < NTB; gs += BN) {
+        uint32_t cbits[2][2] = {{0u, 0u}, {0u, 0u}};   // this thread's candidate flags in the 64-block group
         __syncthreads();
         for (int idx = tid; idx < BN * (HD / 16); idx += NTHREADS) {
             const int p = idx / (HD / 16), c16 = idx % (HD / 16);
@@ -173,13 +178,44 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
                     if (cand[1]) row[slot1] = (uint16_t)(gs + c0 + 1);
                 }
                 cnt[rr] += total;
+                // token routing: a block unrouted by this row AND by its TOK_GROUP partner
+                // (row q ^ 1, four lanes over) goes to the token passes instead of the
+                // pooled tail; a block the partner routed stays pooled here
+                bool ctok[2] = {false, false};
+                if (cand_bits) {
+                    const uint32_t unr = (valid[0] && !pre[0] && !cand[0] ? 1u : 0u)
+                                       | (valid[1] && !pre[1] && !cand[1] ? 2u : 0u);
+                    const uint32_t peer = __shfl_xor_sync(0xffffffffu, unr | (live[rr] ? 4u : 0u), 4);
+                    const uint32_t both = unr & ((peer & 4u) ? peer : 3u);   // no live partner: own bits
+                    #pragma unroll
+                    for (int cc = 0; cc < 2; ++cc) {
+                        ctok[cc] = (both >> cc) & 1u;
+                        const int bit = c0 + cc;   // 0..63 within the group
+                        if (ctok[cc]) { cbits[rr][bit >> 5] |= 1u << (bit & 31); refm[rr] = fmaxf(refm[rr], score[cc]); }
+                    }
+                }
                 // exact-routed and sink blocks leave the tail (this form costs 3 fewer regs);
                 // tail == 0 hands the exact kernel an empty state (softmax over routed only)
-                pv[nt][rr * 2] = tail && valid[0] && !(pre[0] || cand[0]) ? score[0] : NEG;
-                pv[nt][rr * 2 + 1] = tail && valid[1] && !(pre[1] || cand[1]) ? score[1] : NEG;
+                pv[nt][rr * 2] = tail && valid[0] && !(pre[0] || cand[0] || ctok[0]) ? score[0] : NEG;
+                pv[nt][rr * 2 + 1] = tail && valid[1] && !(pre[1] || cand[1] || ctok[1]) ? score[1] : NEG;
             }
         }
 
+        if (cand_bits) {
+            // the four lanes of a row hold disjoint bits: OR them and let one lane store
+            #pragma unroll
+            for (int rr = 0; rr < 2; ++rr) {
+                #pragma unroll
+                for (int wd = 0; wd < 2; ++wd) {
+                    uint32_t b = cbits[rr][wd];
+                    b |= __shfl_xor_sync(0xffffffffu, b, 1);
+                    b |= __shfl_xor_sync(0xffffffffu, b, 2);
+                    const int word = (gs >> 5) + wd;
+                    if (qd == 0 && live[rr] && word < W)
+                        cand_bits[((size_t)bh * NQ + qr[rr]) * W + word] = b;
+                }
+            }
+        }
         float m_new[2] = {m_r[0], m_r[1]};
         #pragma unroll
         for (int nt = 0; nt < NKT; ++nt) {
@@ -241,11 +277,17 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
     }
 
     #pragma unroll
+    for (int off = 1; off <= 2; off <<= 1) {
+        refm[0] = fmaxf(refm[0], __shfl_xor_sync(0xffffffffu, refm[0], off));
+        refm[1] = fmaxf(refm[1], __shfl_xor_sync(0xffffffffu, refm[1], off));
+    }
+    #pragma unroll
     for (int rr = 0; rr < 2; ++rr) {
         if (!live[rr]) continue;
         const size_t qs = (size_t)bh * NQ + qr[rr];
         if (qd == 0) {
             blk_cnt[qs] = cnt[rr];
+            if (tok_ref) tok_ref[qs] = refm[rr];
             m_part[qs] = m_r[rr];
             l_part[qs] = l_r[rr] * 255.0f;
         }
@@ -266,7 +308,7 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
 void launch_sol_route(
     const void* cen8, const void* cens, const void* kciP, const void* kcs,
     const void* vcT, const void* vsc, const void* threshold,
-    void* blk_idx, void* blk_cnt, void* o_part, void* m_part, void* l_part,
+    void* blk_idx, void* blk_cnt, void* o_part, void* m_part, void* l_part, void* tok_ref, void* cand_bits,
     // NQ (query blocks) and NTB (key blocks) coincide today; kept separate so
     // a query prefix (LTX-2 guide attention) needs no kernel change
     const void* blen, int tail,
@@ -280,7 +322,7 @@ void launch_sol_route(
         (const float*)kcs, (const __nv_bfloat16*)vcT, (const float*)vsc,
         (const float*)threshold,
         (uint16_t*)blk_idx, (int32_t*)blk_cnt, (__nv_bfloat16*)o_part,
-        (float*)m_part, (float*)l_part, (const int32_t*)blen, tail,
+        (float*)m_part, (float*)l_part, (float*)tok_ref, (uint32_t*)cand_bits, (const int32_t*)blen, tail,
         T, NTB, NPAD, NQ, sink_s, sink_e, sink_qs, sink_qe,
         scale_log2);
 }

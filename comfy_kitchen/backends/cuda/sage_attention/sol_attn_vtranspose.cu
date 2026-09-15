@@ -32,10 +32,10 @@ constexpr int HD = HEAD_DIM;
 constexpr int NTHREADS = 256;
 constexpr int LDS_PAD = HD + 16;   // must be a multiple of 16: phase 1 writes uint4
 
-template <int TT>
-__global__ void vquant_transpose(const __nv_bfloat16* __restrict__ v,
+template <int TT, typename E>
+__global__ void vquant_transpose(const E* __restrict__ v,
                                  const float* __restrict__ vsc,
-                                 int8_t* __restrict__ vT,
+                                 int8_t* __restrict__ vT, int8_t* __restrict__ vRow,
                                  int T, int Tp, int H,
                                  int64_t sb, int64_t st, int64_t sh) {
     __shared__ __align__(16) int8_t sV[TT * LDS_PAD];
@@ -47,15 +47,17 @@ __global__ void vquant_transpose(const __nv_bfloat16* __restrict__ v,
         const int t = idx / (HD / 16), c16 = (idx % (HD / 16)) * 16;
         __align__(16) int8_t out[16];
         if (t0 + t < T) {
-            const __nv_bfloat16* src =
+            const E* src =
                 v + batch * sb + (int64_t)(t0 + t) * st + head * sh + c16;
             #pragma unroll
             for (int j = 0; j < 16; ++j)
-                out[j] = q8(__bfloat162float(src[j]), 1.f / vsc[bh * HD + c16 + j]);
+                out[j] = q8(to_f32(src[j]), 1.f / vsc[bh * HD + c16 + j]);
         } else {
             #pragma unroll
             for (int j = 0; j < 16; ++j) out[j] = 0;
         }
+        if (vRow && t0 + t < Tp)   // row-major copy for the gathered token tiles (token routing)
+            *reinterpret_cast<uint4*>(vRow + ((int64_t)bh * Tp + t0 + t) * HD + c16) = *reinterpret_cast<uint4*>(out);
         // perm_d on the key axis, per 64-block
         const int tp = (t / 64) * 64 + perm_d(t % 64);
         *reinterpret_cast<uint4*>(sV + tp * LDS_PAD + c16) = *reinterpret_cast<uint4*>(out);
@@ -88,12 +90,16 @@ __global__ void vquant_transpose(const __nv_bfloat16* __restrict__ v,
 
 }  // namespace
 
-void launch_sol_vtranspose(const void* v, const void* vsc, void* vT,
+void launch_sol_vtranspose(const void* v, const void* vsc, void* vT, void* vRow,
                            int B, int T, int Tp, int H,
                            int64_t sb, int64_t st, int64_t sh,
-                           cudaStream_t stream) {
+                           int elem, cudaStream_t stream) {
     dim3 grid((T + 255) / 256, B * H);
-    vquant_transpose<256><<<grid, NTHREADS, 0, stream>>>(
-        (const __nv_bfloat16*)v, (const float*)vsc, (int8_t*)vT, T, Tp, H, sb, st, sh);
+    if (elem == sol::SOL_FP16)
+        vquant_transpose<256, __half><<<grid, NTHREADS, 0, stream>>>(
+            (const __half*)v, (const float*)vsc, (int8_t*)vT, (int8_t*)vRow, T, Tp, H, sb, st, sh);
+    else
+        vquant_transpose<256, __nv_bfloat16><<<grid, NTHREADS, 0, stream>>>(
+            (const __nv_bfloat16*)v, (const float*)vsc, (int8_t*)vT, (int8_t*)vRow, T, Tp, H, sb, st, sh);
 }
 

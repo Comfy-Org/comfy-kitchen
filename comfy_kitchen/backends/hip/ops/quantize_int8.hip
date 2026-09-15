@@ -256,21 +256,30 @@ extern "C" void launch_quantize_int8_rowwise_kernel(
 }
 
 // Fused ConvRot rotation + rowwise int8 quantize. act_code: 0 none, 1 gelu tanh,
-// 2 swiglu. K is the activated (written) width; swiglu reads a row twice as wide.
+// 2 swiglu, 3 rms_norm (G=256 only, weight in the input dtype). K is the activated
+// (written) width; swiglu reads a row twice as wide.
 extern "C" void launch_quantize_int8_convrot_kernel(
     const void* x, int in_code, void* q, void* scales, void* spill_rotated, void* spill_partials,
-    int M, int K, int group_size, int act_code, hipStream_t stream) {
+    int M, int K, int group_size, int act_code, const void* act_weight, float act_eps,
+    hipStream_t stream) {
 
     using namespace comfy::hip_backend;
     check_convrot_group_size(group_size);
     check_convrot_k(K, group_size, in_code, /*int8_quant=*/true);
     check_convrot_act(act_code);
+    if (act_code == kActRmsNorm && group_size != 256) {
+        throw std::runtime_error("convrot: rms_norm activation requires group_size 256");
+    }
     if (M == 0) {
         return;  // a zero-block launch is hipErrorInvalidConfiguration
     }
     const bool schedule_512x2 =
         use_convrot_512x2_bf16(in_code, K, group_size);
-    if (act_code == kActGeluTanh) {
+    if (act_code == kActRmsNorm) {
+        launch_convrot_quant_rms_norm(
+            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
+            M, K, act_weight, act_eps, stream);
+    } else if (act_code == kActGeluTanh) {
         if (schedule_512x2) {
             launch_convrot_quant_512x2_bf16<kActGeluTanh>(
                 x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
