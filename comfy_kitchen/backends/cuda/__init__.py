@@ -2312,6 +2312,34 @@ def w4a8_int8_linear(
     # both the chunked kernels and the 2-pass CUTLASS fallback read bias in the output dtype
     bias_arg = _gemm_vector_arg(bias, x.device, out_dtype) if bias is not None else None
 
+    # Decode fast path: fused in-register dequant GEMV, no int8 workspace round-trip.
+    # Bit-exact with the chunked path (same rounded int8 grid and epilogue).
+    if (
+        _W4A8_CHUNKED
+        and m <= 8
+        and correction is None
+        and s_rel.dtype == torch.float8_e4m3fn
+        and group_size >= 16
+        and group_size % 16 == 0
+    ):
+        used = _C.w4a8_codebook_gemv(
+            _wrap_for_dlpack(x_2d),
+            _wrap_for_dlpack(xq),
+            _wrap_for_dlpack(xs),
+            _wrap_for_dlpack(qdata),
+            _wrap_for_dlpack(s_rel.view(torch.uint8)),
+            wrap_codebook(),
+            _wrap_for_dlpack(s_channel),
+            _wrap_for_dlpack(bias_arg) if bias_arg is not None else None,
+            _wrap_for_dlpack(out),
+            convrot_groupsize,
+            group_size,
+            output_dtype_code,
+            stream_ptr,
+        )
+        if used:
+            return out.reshape(*x.shape[:-1], n)
+
     chunked = (
         _W4A8_CHUNKED
         and correction is None
@@ -4358,3 +4386,4 @@ def _register():
 
 
 _register()
+
