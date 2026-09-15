@@ -14,6 +14,31 @@
 
 namespace comfy::hip_backend {
 
+extern "C" __device__ float __ocml_rsqrt_f32(float);
+
+__forceinline__ __device__ float ieee_div_f32(
+    float numerator, float denominator) {
+    bool denominator_scale = false;
+    bool scale = false;
+    const float scaled_denominator = __builtin_amdgcn_div_scalef(
+        numerator, denominator, false, &denominator_scale);
+    const float scaled_numerator = __builtin_amdgcn_div_scalef(
+        numerator, denominator, true, &scale);
+    float reciprocal = __builtin_amdgcn_rcpf(scaled_denominator);
+    const float reciprocal_error =
+        fmaf(-scaled_denominator, reciprocal, 1.0f);
+    reciprocal = fmaf(reciprocal_error, reciprocal, reciprocal);
+    float quotient = scaled_numerator * reciprocal;
+    float remainder =
+        fmaf(-scaled_denominator, quotient, scaled_numerator);
+    quotient = fmaf(remainder, reciprocal, quotient);
+    remainder = fmaf(-scaled_denominator, quotient, scaled_numerator);
+    quotient = __builtin_amdgcn_div_fmasf(
+        remainder, reciprocal, quotient, scale);
+    return __builtin_amdgcn_div_fixupf(
+        quotient, denominator, numerator);
+}
+
 // Round fp32 to bf16 (round to nearest, ties to even) and widen back.
 // Both callers build with -ffast-math, under which the native __bf16 type carries
 // excess precision: casting fp32 -> __bf16 -> fp32 is folded away and the

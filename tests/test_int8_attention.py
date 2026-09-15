@@ -9,6 +9,10 @@ import torch
 import comfy_kitchen as ck
 import comfy_kitchen.sage_attention as sage_attention_module
 
+from .conftest import (
+    skip_unless_gfx12_wmma,
+)
+
 _CUDA_READY = torch.cuda.is_available() and ck.int8_attention_is_available()
 requires_int8_attention = pytest.mark.skipif(
     not _CUDA_READY,
@@ -42,6 +46,37 @@ def test_int8_attention_cta_k_selection():
     assert select(128, 1025, has_mask=False) == 128
     assert select(64, 1025, has_mask=False) == 64
     assert select(128, 1025, has_mask=True) == 64
+
+
+@pytest.mark.parametrize(
+    ("scale", "expected"),
+    [(0.5, 0.5), (2, 2.0), (torch.tensor(0.5), 0.5), (torch.tensor([0.5]), 0.5)],
+)
+def test_attention_scale_accepts_numeric_scalars(scale, expected):
+    assert sage_attention_module._validate_attention_scale(scale, 1.0) == expected
+
+
+@pytest.mark.parametrize(
+    ("scale", "error"),
+    [
+        (torch.ones(2), ValueError),
+        ("0.5", TypeError),
+        (True, TypeError),
+        (torch.tensor(False), TypeError),
+        (torch.tensor(True), TypeError),
+        (float("nan"), ValueError),
+        (torch.tensor(float("inf")), ValueError),
+    ],
+)
+def test_attention_scale_rejects_invalid_values(scale, error):
+    with pytest.raises(error, match="scale"):
+        sage_attention_module._validate_attention_scale(scale, 1.0)
+
+
+@pytest.mark.parametrize("value", [False, True])
+def test_int8_attention_rejects_boolean_tensor_scale(value):
+    with pytest.raises(TypeError, match="scale"):
+        ck.int8_attention(None, None, None, scale=torch.tensor(value))
 
 
 def test_prequantized_attention_rejects_cpu_tensors():
@@ -288,6 +323,197 @@ def test_int8_attention_stabilization_is_deterministic():
     second = ck.int8_attention(q, k, v)
 
     assert torch.equal(first, second)
+
+
+@requires_int8_attention
+def test_gfx12_bf16_attention_handles_long_rectangular_lengths():
+    skip_unless_gfx12_wmma()
+
+    torch.manual_seed(37)
+    q = torch.randn(1, 1025, 4, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    k = torch.randn(1, 1033, 4, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    v = torch.randn(1, 1033, 4, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    actual = ck.hip_attention(q, k, v)
+
+    assert ck.hip_attention_is_supported(q, k, v)
+    assert ck.hip_int8_attention_is_supported(q, k, v)
+    assert actual.dtype is torch.bfloat16
+    assert actual.shape == q.shape
+    assert (actual.float() - expected.float()).abs().max() <= 0.00390625
+
+
+@requires_int8_attention
+def test_gfx12_bf16_full_k_tile_route_is_shape_generic():
+    skip_unless_gfx12_wmma()
+
+    torch.manual_seed(39)
+    # Deliberately differs from every captured model contract: seven heads,
+    # rectangular attention, and a one-row query tail. K/V is the only exact
+    # tile requirement of this schedule.
+    q = torch.randn(1, 7, 1025, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 7, 1056, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 7, 1056, 128, device="cuda", dtype=torch.bfloat16)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    actual = ck.hip_attention(q, k, v)
+
+    assert ck.hip_attention_is_supported(q, k, v)
+    assert ck.hip_int8_attention_is_supported(q, k, v)
+    assert (actual.float() - expected.float()).abs().max() <= 0.00390625
+
+
+@requires_int8_attention
+def test_gfx12_short_attention_capability_is_dimensional():
+    skip_unless_gfx12_wmma()
+
+    def supported(batch, heads, length, *, dtype=torch.bfloat16):
+        tensors = tuple(
+            torch.empty(batch, heads, length, 128, device="cuda", dtype=dtype)
+            for _ in range(3)
+        )
+        return ck.hip_attention_is_supported(*tensors)
+
+    assert not supported(1, 4, 127)
+    assert supported(1, 4, 128)
+    assert supported(1, 56, 388)
+    assert supported(1, 17, 1024)
+    assert ck.hip_int8_attention_is_supported(
+        *(
+            torch.empty(1, 17, 1024, 128, device="cuda", dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+    )
+    assert not supported(2, 4, 16)
+    assert supported(64, 16, 16)
+    assert not supported(1, 4, 160, dtype=torch.float16)
+    unaligned = tuple(
+        torch.empty(1, 4, 128, 129, device="cuda", dtype=torch.bfloat16)[..., 1:]
+        for _ in range(3)
+    )
+    assert not ck.hip_attention_is_supported(*unaligned)
+    long_fp16 = tuple(
+        torch.empty(1, 4, 1024, 128, device="cuda", dtype=torch.float16)
+        for _ in range(3)
+    )
+    assert ck.hip_int8_attention_is_supported(*long_fp16)
+    assert not ck.hip_attention_is_supported(*long_fp16)
+
+
+def test_gfx12_bf16_attention_rejects_misaligned_head_stride():
+    skip_unless_gfx12_wmma()
+
+    heads, length, head_dim = 4, 128, 128
+    head_stride = length * head_dim + 1
+    storage = torch.empty(
+        heads * head_stride, device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.as_strided(
+        storage,
+        (1, heads, length, head_dim),
+        (heads * head_stride, head_stride, head_dim, 1),
+    )
+    q = torch.randn(
+        1, heads, length, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn_like(q)
+
+    assert k.data_ptr() % 16 == 0
+    assert k.stride(2) % 8 == 0
+    assert k.stride(1) % 8 != 0
+    assert not ck.hip_attention_is_supported(q, k, v)
+    with pytest.raises(RuntimeError, match="16-byte-aligned rows"):
+        ck.hip_attention(q, k, v)
+
+
+@pytest.mark.parametrize(
+    ("dimension", "bad_stride"),
+    [
+        ("batch", 0),
+        ("batch", 64),
+        ("head", 0),
+        ("head", 64),
+        ("row", 0),
+        ("row", 64),
+    ],
+)
+def test_gfx12_bf16_attention_rejects_overlapping_output_spans(
+    dimension, bad_stride
+):
+    skip_unless_gfx12_wmma()
+    from comfy_kitchen.backends import hip
+
+    batch, heads, length, head_dim = 2, 4, 128, 128
+    shape = (batch, heads, length, head_dim)
+    strides = [length * heads * head_dim, head_dim, heads * head_dim, 1]
+    strides[{"batch": 0, "head": 1, "row": 2}[dimension]] = bad_stride
+    storage = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+    output = torch.as_strided(
+        storage,
+        shape,
+        strides,
+    )
+    q, k, v = (
+        torch.randn(
+            shape, device="cuda", dtype=torch.bfloat16
+        )
+        for _ in range(3)
+    )
+
+    with pytest.raises(RuntimeError, match="non-overlapping layout"):
+        hip._C.bf16_sdpa_hip(
+            hip._dl(q), hip._dl(k), hip._dl(v), hip._dl(output),
+            head_dim**-0.5, hip._stream(q),
+        )
+
+
+@requires_int8_attention
+def test_gfx12_compact_batched_attention_matches_sdpa():
+    skip_unless_gfx12_wmma()
+
+    torch.manual_seed(41)
+    q, k, v = (
+        torch.randn(64, 16, 12, 128, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    bf16 = ck.hip_attention(q, k, v)
+    int8_mode = ck.hip_int8_attention(q, k, v)
+
+    assert ck.hip_attention_is_supported(q, k, v)
+    assert ck.hip_int8_attention_is_supported(q, k, v)
+    assert torch.equal(int8_mode, bf16)
+    assert (bf16.float() - expected.float()).abs().max() <= 0.00390625
+
+
+@requires_int8_attention
+def test_gfx12_int8_attention_does_not_inherit_overlapping_q_strides():
+    skip_unless_gfx12_wmma()
+
+    torch.manual_seed(43)
+    heads, length, head_dim = 2, 1024, 128
+    q_storage = torch.randn(
+        length * heads * head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    q = torch.as_strided(
+        q_storage,
+        (1, heads, length, head_dim),
+        (length * heads * head_dim, 64, heads * head_dim, 1),
+    )
+    k, v = (
+        torch.randn(
+            1, heads, length, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        for _ in range(2)
+    )
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    actual = ck.hip_int8_attention(q, k, v)
+
+    assert 0 < q.stride(1) < head_dim
+    assert actual.stride(1) > 0
+    assert _nrmse(actual, expected) < 0.03
 
 
 @requires_int8_attention
