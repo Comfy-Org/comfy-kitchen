@@ -3799,13 +3799,13 @@ bool deltanet_conv_step(
         conv_out.data(), snaps, B, C, S, KS, dtype_code, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
-#ifdef COMFY_ANEMOI_SHARED
-void register_anemoi(nb::module_&);
+#ifdef COMFY_DRAFT_SHARED
+void register_draft(nb::module_&);
 #endif
 
 NB_MODULE(_C, m) {
-#ifdef COMFY_ANEMOI_SHARED
-    register_anemoi(m);
+#ifdef COMFY_DRAFT_SHARED
+    register_draft(m);
 #endif
     m.doc() = "comfy_kitchen CUDA kernels - nanobind + DLPack interface (NO PyTorch C++ dependencies)";
     

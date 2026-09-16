@@ -4,7 +4,7 @@ __all__ = [
     "group_norm_silu_pad3d",
     "na3d",
     "sol_attn",
-    "anemoi_attention",
+    "draft_attention",
     "rms_adaln",
     "apply_rope",
     "apply_rope_",
@@ -61,14 +61,14 @@ from comfy_kitchen.constraints import (
     ExactDims,
     FunctionConstraints,
     ParamConstraint,
-    anemoi_attention_common_call_rule,
+    draft_attention_common_call_rule,
     na3d_common_call_rule,
     sol_attn_common_call_rule,
 )
 from comfy_kitchen.registry import registry
 
 from .adaln import adaln, rms_adaln
-from .anemoi import anemoi_attention
+from .draft import draft_attention
 from .awq import gemv_awq_w4a16
 from .conv3d import fp16_conv3d
 from .convrot_w4a4 import (
@@ -618,7 +618,7 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
-    out["anemoi_attention"] = FunctionConstraints(
+    out["draft_attention"] = FunctionConstraints(
         params={
             "q": ParamConstraint(
                 dtypes=frozenset({torch.float16, torch.bfloat16}),
@@ -638,7 +638,7 @@ def _build_constraints() -> dict:
         # GPUs the registry still prefers the native kernels; the reference only
         # runs there under an explicit use_backend("eager") override.
         default_devices=all_devices,
-        call_rules=(anemoi_attention_common_call_rule,),
+        call_rules=(draft_attention_common_call_rule,),
     )
     out["sol_attn"] = FunctionConstraints(
         params={

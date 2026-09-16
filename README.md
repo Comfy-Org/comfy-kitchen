@@ -20,7 +20,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `na3d`                      | ✓     | ✓    | ✓      | ✓   |
 | `na2d`                      | ✓     | ✓    | ✓      | ✓   |
 | `sol_attn`                  | ✓     | ✓    |        | ✓   |
-| `anemoi_attention`          | ✓     | ✓    |        |     |
+| `draft_attention`           | ✓     | ✓    |        |     |
 | `int8_attention`            |       | ✓    |        | ✓   |
 | `apply_rope`                | ✓     | ✓    | ✓      | ✓   |
 | `apply_rope1`               | ✓     | ✓    | ✓      | ✓   |

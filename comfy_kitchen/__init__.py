@@ -75,8 +75,8 @@ __all__ = [
     "sol_attn",
     "sol_attn_chunked",
     "sol_attn_is_available",
-    "anemoi_attention",
-    "anemoi_attention_is_available",
+    "draft_attention",
+    "draft_attention_is_available",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -143,7 +143,7 @@ __all__ = [
 # =============================================================================
 
 
-def anemoi_attention(
+def draft_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -165,7 +165,7 @@ def anemoi_attention(
     smooth_k: bool = False,
     nvfp4_scales: tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> torch.Tensor:
-    """Run Anemoi multi-precision DraftMap sparse self-attention.
+    """Run Draft multi-precision DraftMap sparse self-attention.
 
     Inputs are equal-shaped BTHD FP16/BF16 tensors with batch size one.
     The SM89 kernel set (every capability from SM89 up to but excluding SM120)
@@ -183,9 +183,9 @@ def anemoi_attention(
     Execution outside the native backends — CPU, accelerators without a native
     implementation, GPUs without compiled kernels, or an explicit backend
     override — is a full-precision reference, not a quantization emulator.
-    Use :func:`anemoi_attention_is_available` to check native availability.
+    Use :func:`draft_attention_is_available` to check native availability.
     """
-    return torch.ops.comfy_kitchen.anemoi_attention(
+    return torch.ops.comfy_kitchen.draft_attention(
         q,
         k,
         v,
@@ -208,9 +208,9 @@ def anemoi_attention(
     )
 
 
-def anemoi_attention_is_available(device: torch.device | int | None = None) -> bool:
-    """Whether the complete native Anemoi backend is built for this GPU."""
-    from .backends.cuda import anemoi_attention_is_available as is_available
+def draft_attention_is_available(device: torch.device | int | None = None) -> bool:
+    """Whether the complete native Draft backend is built for this GPU."""
+    from .backends.cuda import draft_attention_is_available as is_available
 
     return registry.is_available("cuda") and is_available(device)
 

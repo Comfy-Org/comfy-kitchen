@@ -27,14 +27,14 @@ from comfy_kitchen._rope_utils import (
     trim_rope_freqs,
 )
 from comfy_kitchen.allocation import allocation_context
-from comfy_kitchen.anemoi import materialize_layout, resolve_options
+from comfy_kitchen.draft import materialize_layout, resolve_options
 
 __all__ = [
     "na3d",
     "sol_attn",
     "sol_attn_chunked",
-    "anemoi_attention",
-    "anemoi_attention_is_available",
+    "draft_attention",
+    "draft_attention_is_available",
     "adaln",
     "fp16_conv3d",
     "group_norm_silu_pad3d",
@@ -217,7 +217,7 @@ from comfy_kitchen.constraints import (  # noqa: E402
     MinDims,
     ParamConstraint,
     ValidationResult,
-    anemoi_attention_common_call_rule,
+    draft_attention_common_call_rule,
     na3d_common_call_rule,
     sol_attn_common_call_rule,
 )
@@ -3650,34 +3650,34 @@ def gemv_awq_w4a16(
     return out2d.reshape(*orig_shape[:-1], n)
 
 
-def anemoi_attention_is_available(device=None) -> bool:
+def draft_attention_is_available(device=None) -> bool:
     """Whether this extension contains the native plan/executor for the GPU."""
     if not _EXT_AVAILABLE or not torch.cuda.is_available() or torch.version.hip:
         return False
-    if not all(hasattr(_C, name) for name in ("anemoi_plan", "anemoi", "anemoi_supports_arch")):
+    if not all(hasattr(_C, name) for name in ("draft_plan", "draft", "draft_supports_arch")):
         return False
     major, minor = torch.cuda.get_device_capability(device)
-    return bool(_C.anemoi_supports_arch(major * 10 + minor))
+    return bool(_C.draft_supports_arch(major * 10 + minor))
 
 
-def anemoi_attention(
+def draft_attention(
     q, k, v, *, video_shape, prefix_tokens=0, sparsity_ratio=0.8,
     query_block_size=64, nvfp4_ratio=0.0, int8_ratio=1.0, mxfp8_ratio=0.0,
     fp16_ratio=0.0, prefix_kv_precision="auto", prefix_query_precision="auto",
     draftmap_proxy="mean", diag_jensen=False, maxpool_weight=0.0,
     enable_anchors=False, smooth_k=False, nvfp4_scales=(1.0, 1.0, 1.0),
 ):
-    """Launch one native Anemoi plan with caller-owned output and workspace."""
-    check = anemoi_attention_common_call_rule({
+    """Launch one native Draft plan with caller-owned output and workspace."""
+    check = draft_attention_common_call_rule({
         "q": q, "k": k, "v": v, "video_shape": video_shape,
         "prefix_tokens": prefix_tokens, "sparsity_ratio": sparsity_ratio,
     })
     if not check.success:
-        raise ValueError(f"anemoi_attention: {check.failed_param}: {check.failure_reason}")
+        raise ValueError(f"draft_attention: {check.failed_param}: {check.failure_reason}")
     if q.device.type != "cuda" or q.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("anemoi_attention requires FP16/BF16 CUDA inputs")
-    if not anemoi_attention_is_available(q.device):
-        raise RuntimeError("No native Anemoi executor was built for this GPU")
+        raise ValueError("draft_attention requires FP16/BF16 CUDA inputs")
+    if not draft_attention_is_available(q.device):
+        raise RuntimeError("No native Draft executor was built for this GPU")
     major, minor = torch.cuda.get_device_capability(q.device)
     options = resolve_options(
         architecture="sm120" if (major, minor) == (12, 0) else "sm89", query_block_size=query_block_size,
@@ -3703,7 +3703,7 @@ def anemoi_attention(
         q, k, v = normalized
         batch, tokens, heads, dim = q.shape
         layout = materialize_layout(q.device, tuple(video_shape), options.query_block_size, options.enable_anchors)
-        plan = _C.anemoi_plan(
+        plan = _C.draft_plan(
             q.device.index, batch, tokens, heads, dim, options.query_block_size,
             prefix_tokens, layout.counts.numel(), layout.anchor_count, q.dtype == torch.bfloat16,
             float(sparsity_ratio), options.ratios, precision[options.prefix_kv_precision],
@@ -3723,13 +3723,13 @@ def anemoi_attention(
         workspace = torch.empty((plan.workspace_bytes,), device=q.device, dtype=torch.uint8)
         operands = (q, k, v, layout.indices, layout.slot_valid, layout.counts, layout.inverse,
                     layout.anchors, layout.anchor_ids, prefix_output, output, workspace)
-        _C.anemoi(plan, *(None if x is None else _wrap_for_dlpack(x) for x in operands), stream.cuda_stream)
+        _C.draft(plan, *(None if x is None else _wrap_for_dlpack(x) for x in operands), stream.cuda_stream)
         return output
 
 
 def _build_constraints() -> dict:
-    def _anemoi_call_rule(kwargs):
-        common = anemoi_attention_common_call_rule(kwargs)
+    def _draft_call_rule(kwargs):
+        common = draft_attention_common_call_rule(kwargs)
         if not common.success:
             return common
         q = kwargs.get("q")
@@ -3740,8 +3740,8 @@ def _build_constraints() -> dict:
                     "q", "device must have compute capability >= 8.9 (Ada kernels) or 12.0")
             if capability == (12, 0) and q.shape[-1] != 128:
                 return ValidationResult.fail("q", "SM120 requires head_dim=128")
-            if not anemoi_attention_is_available(q.device):
-                return ValidationResult.fail("q", "native Anemoi executor was not compiled for this device")
+            if not draft_attention_is_available(q.device):
+                return ValidationResult.fail("q", "native Draft executor was not compiled for this device")
             names = ("query_block_size", "nvfp4_ratio", "int8_ratio", "mxfp8_ratio", "fp16_ratio",
                      "prefix_kv_precision", "prefix_query_precision", "draftmap_proxy", "diag_jensen",
                      "maxpool_weight", "enable_anchors", "smooth_k", "nvfp4_scales", "prefix_tokens")
@@ -3768,7 +3768,7 @@ def _build_constraints() -> dict:
     cuda_devices = frozenset({"cuda"})
 
     constraints = {
-        "anemoi_attention": FunctionConstraints(
+        "draft_attention": FunctionConstraints(
             params={
                 "q": ParamConstraint(
                     dtypes=frozenset({torch.bfloat16, torch.float16}),
@@ -3784,7 +3784,7 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
-            call_rules=(_anemoi_call_rule,),
+            call_rules=(_draft_call_rule,),
         ),
         "sol_attn": FunctionConstraints(
             params={

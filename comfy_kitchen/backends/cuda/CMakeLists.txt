@@ -176,9 +176,9 @@ target_include_directories(comfy_kitchen_cuda_kernels PRIVATE
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
-# Full Anemoi architecture-specific kernels and shared packing/assembly.
-include("${CMAKE_CURRENT_SOURCE_DIR}/anemoi/CMakeLists.txt")
-list(APPEND CPP_SOURCES ${ANEMOI_BINDINGS})
+# Full Draft architecture-specific kernels and shared packing/assembly.
+include("${CMAKE_CURRENT_SOURCE_DIR}/draft/CMakeLists.txt")
+list(APPEND CPP_SOURCES ${DRAFT_BINDINGS})
 
 # CUTLASS (header-only) for the near-peak INT8 GEMM. Vendored at
 # third_party/cutlass (or pass -DCOMFY_CUTLASS_DIR). Optional: without it the
@@ -214,11 +214,11 @@ endif()
 
 target_sources(_C PRIVATE
     $<TARGET_OBJECTS:comfy_kitchen_cuda_kernels>
-    ${ANEMOI_OBJECTS}
+    ${DRAFT_OBJECTS}
 )
 
-target_compile_definitions(_C PRIVATE NB_STATIC ${ANEMOI_DEFINITIONS})
-if(ANEMOI_OBJECTS)
+target_compile_definitions(_C PRIVATE NB_STATIC ${DRAFT_DEFINITIONS})
+if(DRAFT_OBJECTS)
     target_link_libraries(_C PRIVATE CUDA::cuda_driver)
 endif()
 

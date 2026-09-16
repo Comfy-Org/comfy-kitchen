@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from .anemoi import resolve_options
+from .draft import resolve_options
 
 __all__ = [
     "DivisibleBy",
@@ -319,8 +319,8 @@ def sol_attn_common_call_rule(kwargs):
     return ValidationResult.ok()
 
 
-def anemoi_attention_common_call_rule(kwargs):
-    """Shared shape and algorithm contract for Anemoi attention."""
+def draft_attention_common_call_rule(kwargs):
+    """Shared shape and algorithm contract for Draft attention."""
     q = kwargs.get("q")
     if q is not None:
         for name in ("k", "v"):
