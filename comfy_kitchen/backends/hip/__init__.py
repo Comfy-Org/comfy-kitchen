@@ -2155,7 +2155,8 @@ def sol_attn(
         tail=bool(tail), token_aug=int(token_aug),
     )
     if coarse_gate is not None:
-        add_coarse_(out, coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale),
+        add_coarse_(out, coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale,
+                                       query_chunk=64),
                     coarse_gate)
     return out
 
@@ -2259,7 +2260,8 @@ def sol_attn_chunked(
         block_len=None if block_len is None else _dl(block_len), tail=bool(tail),
         token_aug=int(token_aug))
     if coarse_gate is not None:
-        add_coarse_(out, coarse_output(*_ws_block_means(ws, p, h, lengths), scale), coarse_gate)
+        add_coarse_(out, coarse_output(*_ws_block_means(ws, p, h, lengths), scale,
+                                       query_chunk=64), coarse_gate)
     return out, kmean_next, vscale_of(vamax)
 
 
