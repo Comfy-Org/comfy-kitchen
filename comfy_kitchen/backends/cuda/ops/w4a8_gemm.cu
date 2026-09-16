@@ -14,6 +14,8 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 
+#include "float_utils.cuh"
+
 // Grouped int4 -> int8 dequant for the int8-GEMM W4A8 path: out[n,k] =
 // round((q_u[n,k]-8) * s_rel[n, k/G]), q_u packed uint4 (even col=low nibble).
 // s_rel = per-group scale / per-channel scale (so the int8 range is used). The
@@ -25,6 +27,35 @@ template <typename ScaleT> __device__ __forceinline__ float load_scale(ScaleT v)
 template <> __device__ __forceinline__ float load_scale<float>(float v) { return v; }
 template <> __device__ __forceinline__ float load_scale<uint8_t>(uint8_t v) {
     return __half2float(__nv_cvt_fp8_to_halfraw(v, __NV_E4M3));
+}
+
+// Decode one uint2 (8 packed bytes = 16 int4 codes, low nibble = even col) to
+// 16 int8 on the __float2int_rn(level * scale) grid shared by every W4A8 path.
+// cb is the 16-entry level table or nullptr for the uniform (q-8) levels.
+// sc0..sc3 are the up-to-4 distinct group scales the 16 cols can span; all
+// four are equal when G >= 16.
+__device__ __forceinline__ void dequant16_int4_to_int8(
+    uint2 pk, const float* __restrict__ cb,
+    float sc0, float sc1, float sc2, float sc3, int G, char4 out4[4])
+{
+    const unsigned words[2] = {pk.x, pk.y};
+    #pragma unroll
+    for (int w = 0; w < 2; ++w) {
+        #pragma unroll
+        for (int bi = 0; bi < 4; ++bi) {
+            const int oo = w * 4 + bi;             // 0..7 -> cols oo*2, oo*2+1
+            const int lg = (G >= 16) ? 0 : ((oo * 2) / G);  // local group in the vec
+            const float s = (lg == 0) ? sc0 : (lg == 1 ? sc1 : (lg == 2 ? sc2 : sc3));
+            const unsigned byte = (words[w] >> (bi * 8)) & 0xFF;
+            const unsigned c0 = byte & 0xF, c1 = (byte >> 4) & 0xF;
+            const float v0 = cb ? cb[c0] : (static_cast<float>(c0) - 8.0f);
+            const float v1 = cb ? cb[c1] : (static_cast<float>(c1) - 8.0f);
+            reinterpret_cast<int8_t*>(&out4[oo / 2])[(oo % 2) * 2]     =
+                static_cast<int8_t>(max(-127, min(127, __float2int_rn(v0 * s))));
+            reinterpret_cast<int8_t*>(&out4[oo / 2])[(oo % 2) * 2 + 1] =
+                static_cast<int8_t>(max(-127, min(127, __float2int_rn(v1 * s))));
+        }
+    }
 }
 
 // Each thread: 8 packed bytes (uint2) -> 16 int8 (uint4 store). The 16 output
@@ -56,7 +87,6 @@ __global__ void dequant_int4_grouped_to_int8_kernel(
     const int nG = K / G;
     const long srow = (long)n * nG;
     const uint2 pk = *reinterpret_cast<const uint2*>(&qw[(long)n * Khalf + kh]);
-    const unsigned words[2] = {pk.x, pk.y};
     // The 16-col vec spans 1 group (G>=16, the common case), 2 (G=8), or 4 (G=4).
     // Load+decode each distinct group scale ONCE instead of per output pair.
     const int base_g = k0 / G;
@@ -70,24 +100,7 @@ __global__ void dequant_int4_grouped_to_int8_kernel(
         }
     }
     char4 o4[4];
-    #pragma unroll
-    for (int w = 0; w < 2; ++w) {
-        const unsigned bb = words[w];
-        #pragma unroll
-        for (int bi = 0; bi < 4; ++bi) {
-            const int oo = w * 4 + bi;             // 0..7 -> cols oo*2, oo*2+1
-            const int lg = (G >= 16) ? 0 : ((oo * 2) / G);  // local group in the vec
-            const float s = (lg == 0) ? sc0 : (lg == 1 ? sc1 : (lg == 2 ? sc2 : sc3));
-            const unsigned byte = (bb >> (bi * 8)) & 0xFF;
-            const unsigned c0 = byte & 0xF, c1 = (byte >> 4) & 0xF;
-            const float v0 = codebook ? cb[c0] : (static_cast<float>(c0) - 8.0f);
-            const float v1 = codebook ? cb[c1] : (static_cast<float>(c1) - 8.0f);
-            reinterpret_cast<int8_t*>(&o4[oo / 2])[(oo % 2) * 2]     =
-                static_cast<int8_t>(max(-127, min(127, __float2int_rn(v0 * s))));
-            reinterpret_cast<int8_t*>(&o4[oo / 2])[(oo % 2) * 2 + 1] =
-                static_cast<int8_t>(max(-127, min(127, __float2int_rn(v1 * s))));
-        }
-    }
+    dequant16_int4_to_int8(pk, codebook ? cb : nullptr, sc0, sc1, sc2, sc3, G, o4);
     *reinterpret_cast<uint4*>(&out[(long)n * K + k0]) = *reinterpret_cast<uint4*>(o4);
 }
 }  // namespace
@@ -340,5 +353,101 @@ extern "C" bool launch_quantize_w4a8_convrot(
     else if (in_dtype_code == 1) RQ_LAUNCH(__half);
     else RQ_LAUNCH(__nv_bfloat16);
 #undef RQ_LAUNCH
+    return cudaGetLastError() == cudaSuccess;
+}
+
+// Fused W4A8 GEMV for decode (M<=8): dequantize int4+codebook in registers and
+// dp4a against the int8 activation in one pass — no int8 workspace round-trip.
+// Bit-exact with the chunked path: same __float2int_rn(cb[c]*s_rel) int8 grid,
+// same acc*xs*s_channel(+bias) epilogue. Requires G>=16 and G%16==0 so one
+// 16-col vec never spans two groups.
+namespace {
+
+constexpr int kGemvMaxM = 8;  // sizes acc[] below and gates the launcher
+
+template <int WARPS_PER_BLOCK, typename OutT>
+__global__ void w4a8_codebook_gemv_kernel(
+    const int8_t* __restrict__ xq,        // (M, K) int8 rotated+quantized activation
+    const int8_t* __restrict__ qw,        // (N, K/2) packed uint4
+    const uint8_t* __restrict__ s_rel,    // (N, K/G) e4m3 raw
+    const float* __restrict__ codebook,   // 16 floats or nullptr
+    const float* __restrict__ s_channel,  // (N)
+    const float* __restrict__ xs,         // (M)
+    const OutT* __restrict__ bias,        // (N) in the output dtype, or nullptr
+    OutT* __restrict__ out,               // (M, N)
+    int M, int N, int K, int G)
+{
+    __shared__ float cb[16];
+    if (threadIdx.x < 16)
+        cb[threadIdx.x] = codebook ? codebook[threadIdx.x] : (static_cast<float>(threadIdx.x) - 8.0f);
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int n = static_cast<int>(blockIdx.x) * WARPS_PER_BLOCK + warp;
+    if (n >= N)
+        return;
+
+    const int Khalf = K >> 1;
+    const int nvec = Khalf >> 3;                  // 16-col vecs per row
+    const int nG = K / G;
+    const int8_t* __restrict__ wrow = qw + static_cast<int64_t>(n) * Khalf;
+    const uint8_t* __restrict__ srow = s_rel + static_cast<int64_t>(n) * nG;
+
+    // one weight pass shared across all M rows (M <= kGemvMaxM)
+    int acc[kGemvMaxM] = {};
+    for (int v = lane; v < nvec; v += 32) {
+        const uint2 pk = *reinterpret_cast<const uint2*>(wrow + v * 8);
+        const int k0 = v * 16;
+        const float s = load_scale<uint8_t>(srow[k0 / G]);
+        char4 w4[4];
+        dequant16_int4_to_int8(pk, cb, s, s, s, s, G, w4);
+        const int kw = k0 >> 2;
+        for (int m = 0; m < M; ++m) {
+            const int* __restrict__ x4 = reinterpret_cast<const int*>(xq + static_cast<int64_t>(m) * K);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j)
+                acc[m] = __dp4a(x4[kw + j], *reinterpret_cast<const int*>(&w4[j]), acc[m]);
+        }
+    }
+
+    for (int m = 0; m < M; ++m) {
+        int a = acc[m];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            a += __shfl_down_sync(0xffffffffu, a, offset);
+        if (lane == 0) {
+            float value = static_cast<float>(a) * xs[m] * s_channel[n];
+            if (bias)
+                value += static_cast<float>(bias[n]);
+            out[static_cast<int64_t>(m) * N + n] = comfy::from_float<OutT>(value);
+        }
+    }
+}
+
+}  // namespace
+
+extern "C" bool launch_w4a8_codebook_gemv(
+    const void* xq, const void* weight, const void* s_rel, const void* codebook,
+    const void* s_channel, const void* xs, const void* bias, void* out,
+    int64_t M, int64_t N, int64_t K, int64_t G,
+    int out_dtype_code, cudaStream_t stream)
+{
+    if (M < 1 || M > kGemvMaxM)
+        return false;
+    constexpr int kWarps = 4;
+    dim3 block(kWarps * 32);
+    dim3 grid((N + kWarps - 1) / kWarps);
+#define GEMV_LAUNCH(OT)                                                                            \
+    w4a8_codebook_gemv_kernel<kWarps, OT><<<grid, block, 0, stream>>>(                             \
+        static_cast<const int8_t*>(xq), static_cast<const int8_t*>(weight),                        \
+        static_cast<const uint8_t*>(s_rel), static_cast<const float*>(codebook),                   \
+        static_cast<const float*>(s_channel), static_cast<const float*>(xs),                       \
+        static_cast<const OT*>(bias), static_cast<OT*>(out),                                       \
+        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), static_cast<int>(G))
+    if (out_dtype_code == 0) GEMV_LAUNCH(float);
+    else if (out_dtype_code == 1) GEMV_LAUNCH(__half);
+    else GEMV_LAUNCH(__nv_bfloat16);
+#undef GEMV_LAUNCH
     return cudaGetLastError() == cudaSuccess;
 }

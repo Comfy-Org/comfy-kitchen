@@ -59,7 +59,10 @@ __all__ = [
     "adaln",
     "na3d",
     "rms_adaln",
+    "fp16_conv3d",
+    "fp16_linear",
     "gemv_awq_w4a16",
+    "group_norm_silu_pad3d",
     "quantize_svdquant_w4a4",
     "scaled_mm_svdquant_w4a4",
     "apply_rope",
@@ -182,6 +185,8 @@ _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 # GEMM is not among them because it is reached through scaled_mm_v2's _hip_fp8_gemm,
 # which gates on has_wmma() itself rather than through the registry.
 _WMMA_ONLY_OPS = frozenset({
+    "fp16_conv3d",
+    "fp16_linear",
     "int8_linear",
     "na3d",
     "sol_attn",
@@ -559,7 +564,8 @@ def _convrot_supported(
 
 
 def _rotate_quant_int8(
-    x2d: torch.Tensor, group_size: int, input_act: str | None = None
+    x2d: torch.Tensor, group_size: int, input_act: str | None = None,
+    act_weight: torch.Tensor | None = None, act_eps: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     m, k_in = x2d.shape
     # swiglu halves the row: the [gate | up] input is twice the quantized width.
@@ -586,8 +592,23 @@ def _rotate_quant_int8(
             group_size,
             _input_act_code(input_act),
             _stream(x2d),
+            None if act_weight is None else _dl(act_weight),
+            float(act_eps),
         )
     return q, scales
+
+
+def _fused_rms_norm_ok(x: torch.Tensor, convrot: bool, group_size: int) -> bool:
+    """Whether int8_linear's quantizer will run the fused G=256 kernel, the only
+    one that implements rms_norm; the global spill and G=16/64 paths do not."""
+    k = x.shape[-1]
+    m = x.numel() // k if k else 0
+    if not (convrot and group_size == 256 and m > 0 and k % 256 == 0
+            and _convrot_supported(k, group_size, x.device, x.dtype, int8_global_spill=True)):
+        return False
+    # the spill answer reads the current device's LDS budget, as in _rotate_quant_int8
+    with torch.cuda.device(x.device):
+        return not _C.convrot_int8_needs_spill(m, k, DTYPE_TO_CODE[x.dtype])
 
 
 def quantize_and_rotate_rowwise(
@@ -635,8 +656,73 @@ def quantize_int8_convrot_weight(
     return q.reshape(weight.shape), scales.reshape(*weight.shape[:-1], 1)
 
 
+def _vector_operand(v: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """A per-channel epilogue vector on ``device`` in ``dtype``, contiguous."""
+    return v.to(device=device, dtype=dtype).reshape(-1).contiguous()
+
+
+def fp16_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """FP16 WMMA GEMM with bias and an optional ``residual + residual_scale * out``
+    fused into the epilogue; torch's linear where the kernel declines the shape."""
+    if residual is not None and residual_scale is None:
+        raise ValueError("fp16_linear: residual requires residual_scale")
+
+    orig_shape = x.shape
+    x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
+    m = x_2d.shape[0]
+    n, k = weight.shape
+
+    supported = (
+        x.dtype == torch.float16
+        and weight.dtype == torch.float16
+        and weight.device == x.device
+        and x_2d.shape[1] == k
+        # the tile stager issues 16-byte row loads; a misaligned view falls back, as on CUDA
+        and x_2d.data_ptr() % 16 == 0
+        and (bias is None or bias.dtype == torch.float16)
+        and (residual is None or (residual.dtype == torch.float16
+                                  and residual_scale.dtype == torch.float16))
+    )
+    if supported:
+        weight = weight if weight.is_contiguous() else weight.contiguous()
+        supported = weight.data_ptr() % 16 == 0
+    if not supported:
+        # the kernel path takes bias and residual from any device, so the fallback must too
+        bias = None if bias is None else bias.to(device=x.device)
+        if residual is not None:
+            residual = residual.to(device=x.device)
+            residual_scale = residual_scale.to(device=x.device)
+        out = torch.nn.functional.linear(x, weight, bias)
+        return _apply_residual(out, residual, residual_scale)
+
+    out = torch.empty((m, n), dtype=torch.float16, device=x.device)
+    bias_arg = None if bias is None else _vector_operand(bias, x.device, torch.float16)
+    resid_arg = rscale_arg = None
+    if residual is not None:
+        resid_arg = residual.to(device=x.device).reshape(m, n).contiguous()
+        rscale_arg = _vector_operand(residual_scale, x.device, torch.float16)
+    served = _C.fp16_gemm(
+        _dl(x_2d), _dl(weight), _dl(out),
+        None if bias_arg is None else _dl(bias_arg),
+        None if rscale_arg is None else _dl(rscale_arg),
+        None if resid_arg is None else _dl(resid_arg),
+        m, n, k, _stream(x),
+    )
+    if not served:
+        out = _apply_residual(torch.nn.functional.linear(x_2d, weight, bias_arg), resid_arg,
+                              rscale_arg)
+    return out if len(orig_shape) == 2 else out.reshape(*orig_shape[:-1], n)
+
+
 # Acts the HIP fused quantizer implements; anything else is applied eagerly so
-# new act codes degrade gracefully instead of erroring in the kernel.
+# new act codes degrade gracefully instead of erroring in the kernel. rms_norm is
+# folded as well, but only where _fused_rms_norm_ok holds.
 _HIP_FUSED_ACTS = (None, "none", "gelu_tanh", "swiglu")
 
 
@@ -657,7 +743,17 @@ def int8_linear(
     """INT8 linear with dynamic row-wise activation quantization, on WMMA."""
     # Rejected here so every route fails the same way, not just the fused one.
     _input_act_code(input_act)
-    if input_act not in _HIP_FUSED_ACTS:
+    act_weight = None
+    if input_act == "rms_norm":
+        if input_act_weight is None:
+            raise ValueError("input_act 'rms_norm' requires act_weight")
+        if (
+            input_act_weight.numel() == x.shape[-1]
+            and _fused_rms_norm_ok(x, convrot, convrot_groupsize)
+        ):
+            act_weight = _operand(
+                input_act_weight.reshape(-1).to(dtype=x.dtype), x.device, "input_act_weight")
+    if input_act not in _HIP_FUSED_ACTS and act_weight is None:
         x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
         input_act = None
     # k_act is the activated (quantized) row width: swiglu halves the raw row.
@@ -699,7 +795,8 @@ def int8_linear(
                 input_act=input_act, residual=residual, residual_scale=residual_scale,
             )
         # The only route that absorbs the activation; the rest apply it eagerly.
-        q, x_scale = _rotate_quant_int8(x2d, convrot_groupsize, input_act)
+        q, x_scale = _rotate_quant_int8(
+            x2d, convrot_groupsize, input_act, act_weight, input_act_eps)
     else:
         x2d = _apply_input_act(x2d, input_act)
         q = torch.empty((m, k), dtype=torch.int8, device=x.device)
@@ -717,6 +814,9 @@ def int8_linear(
         None if bias is None else _dl(bias),
         m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
     )
+    # Unlike CUDA, the residual is not folded into the epilogue: the per-element
+    # residual reads there cost more than a separate addcmul at the output widths
+    # pre-norm blocks apply it to.
     return _apply_residual(out.reshape(*orig_shape[:-1], n), residual, residual_scale)
 
 
@@ -1440,6 +1540,113 @@ def rms_adaln(
     return _adaln_impl(_C.rms_adaln, x, scale, shift, eps)
 
 
+def _wmma_fp16_conv3d(x, weight, bias, residual, stride):
+    """The fused kernel's result, or None when it does not apply to this call."""
+    n, c, d, h, w = x.shape
+    k, _, t, r, s = weight.shape
+    sd, sh, sw = stride
+    if min(sd, sh, sw) < 1:
+        return None  # torch's conv reports the bad stride
+    z, p, q = (d - t) // sd + 1, (h - r) // sh + 1, (w - s) // sw + 1
+    supported = (
+        x.dtype == torch.float16 and weight.dtype == torch.float16
+        and weight.device == x.device and weight.shape[1] == c
+        and (c % 8 == 0 or c < 8) and k % 8 == 0 and d >= t and h >= r and w >= s
+        and (bias is None or (bias.dtype == torch.float16 and bias.shape == (k,)))
+        and (residual is None or (residual.dtype == torch.float16
+                                  and residual.shape == (n, k, z, p, q)))
+    )
+    if not supported:
+        return None
+    if c < 8:
+        # zero-pad pixel-sized channel counts (conv_in) to the 8-channel register width
+        x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, 0, 0, 8 - c))
+        weight = torch.nn.functional.pad(weight, (0, 0, 0, 0, 0, 0, 0, 8 - c))
+        c = 8
+    cl = torch.channels_last_3d
+    x = x.contiguous(memory_format=cl)
+    weight = weight.contiguous(memory_format=cl)
+    # the epilogue reads both off raw pointers on x's stream
+    bias = None if bias is None else bias.to(device=x.device).contiguous()
+    residual = (None if residual is None
+                else residual.to(device=x.device).contiguous(memory_format=cl))
+    # the tile stager issues 16-byte loads from x and the weight
+    if x.data_ptr() % 16 or weight.data_ptr() % 16:
+        return None
+    out = torch.empty((n, k, z, p, q), dtype=torch.float16, device=x.device, memory_format=cl)
+    served = _C.fp16_conv3d(
+        _dl(x), _dl(weight), None if bias is None else _dl(bias),
+        None if residual is None else _dl(residual), _dl(out),
+        n, d, h, w, c, k, t, r, s, sd, sh, sw, _stream(x),
+    )
+    return out if served else None
+
+
+def fp16_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    stride: list[int],
+) -> torch.Tensor:
+    """FP16 conv3d with fused bias/residual, channels_last_3d in and out; torch's
+    conv when the kernel declines the shape."""
+    out = _wmma_fp16_conv3d(x, weight, bias, residual, stride)
+    if out is not None:
+        return out
+    # the kernel path takes bias and residual from any device, so the fallback must too
+    bias = None if bias is None else bias.to(device=x.device)
+    residual = None if residual is None else residual.to(device=x.device)
+    out = torch.nn.functional.conv3d(x, weight, bias, stride=stride).contiguous(
+        memory_format=torch.channels_last_3d)
+    return out if residual is None else out + residual
+
+
+def group_norm_silu_pad3d(
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    num_groups: int,
+    eps: float,
+    pad: list[int],
+    silu: bool,
+) -> torch.Tensor:
+    """Per-frame GroupNorm + SiLU + causal conv padding in one pass; the result is
+    channels_last_3d, like the CUDA kernel. Shapes it declines run the eager op."""
+    b, c, t, h, w = x.shape
+    left, right, top, bottom, front = pad
+    if min(pad) < 0:
+        raise ValueError("group_norm_silu_pad3d: padding must be non-negative")
+    # the affine params may be fp32 (the registry admits it); every path wants x's dtype
+    if weight is not None:
+        weight = weight.to(device=x.device, dtype=x.dtype).contiguous()
+        bias = (torch.zeros(c, dtype=x.dtype, device=x.device) if bias is None
+                else bias.to(device=x.device, dtype=x.dtype).contiguous())
+    else:
+        bias = None  # pad-only ignores bias, as eager and CUDA do
+    if (c % 8 or 256 % (c // 8) or (weight is not None and (c % num_groups or num_groups > 1024))
+            or max(left, right) >= w or max(top, bottom) >= h or b * (t + front) > 65535):
+        return _eager.group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu)
+
+    x = x.contiguous(memory_format=torch.channels_last_3d)
+    # the kernel loads whole 16-byte registers; a misaligned view takes eager, as on CUDA
+    if x.data_ptr() % 16:
+        return _eager.group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu)
+    out = torch.empty((b, c, t + front, h + top + bottom, w + left + right),
+                      dtype=x.dtype, device=x.device, memory_format=torch.channels_last_3d)
+    workspace = None
+    if weight is not None:
+        chunks = -(-(h * w) // 1024)
+        workspace = torch.empty(2 * b * t * (chunks * c + num_groups), dtype=torch.float32,
+                                device=x.device)
+    _C.group_norm_silu_pad3d(
+        _dl(x), None if weight is None else _dl(weight), None if bias is None else _dl(bias),
+        _dl(out), None if workspace is None else _dl(workspace),
+        b, c, t, h, w, num_groups, eps, left, right, top, bottom, front, silu, _stream(x),
+    )
+    return out
+
+
 def _effective_strides(t: torch.Tensor) -> tuple[int, ...]:
     """Strides of the axes the kernels walk: a length-1 axis is only indexed at 0."""
     return tuple(s for s, n in zip(t.stride(), t.shape, strict=True) if n != 1)
@@ -2095,6 +2302,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         DivisibleBy,
         ExactDims,
         FunctionConstraints,
+        MinDims,
         ParamConstraint,
         ValidationResult,
         na3d_common_call_rule,
@@ -2341,6 +2549,44 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 "x": ParamConstraint(dtypes=floats),
                 "scale": ParamConstraint(dtypes=floats),
                 "shift": ParamConstraint(dtypes=floats),
+            },
+            default_devices=dev,
+        ),
+        "fp16_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(MinDims(2),)),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(2),)
+                ),
+                "bias": ParamConstraint(dtypes=frozenset({torch.float16})),
+                "residual": ParamConstraint(dtypes=frozenset({torch.float16})),
+                "residual_scale": ParamConstraint(dtypes=frozenset({torch.float16})),
+            },
+            default_devices=dev,
+        ),
+        "fp16_conv3d": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(5),)),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(5),)
+                ),
+                "bias": ParamConstraint(dtypes=frozenset({torch.float16, type(None)})),
+                "residual": ParamConstraint(dtypes=frozenset({torch.float16, type(None)})),
+            },
+            default_devices=dev,
+        ),
+        "group_norm_silu_pad3d": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(5),),
+                ),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16, type(None)}),
+                ),
+                "bias": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16, type(None)}),
+                ),
             },
             default_devices=dev,
         ),

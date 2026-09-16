@@ -149,6 +149,7 @@ set(CUDA_SOURCES
     ops/w4a8_gemm.cu
     ops/adaln.cu
     ops/flash_decode.cu
+    ops/gated_delta.cu
     sage_attention/quant_v_int8.cu
     sage_attention/quant_qk_int8.cu
     sage_attention/sage_attn_launcher.cu

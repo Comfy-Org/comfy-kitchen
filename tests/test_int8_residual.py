@@ -52,7 +52,7 @@ class TestResidualEpilogue:
         rel = rel_err(got, ref)
         assert rel < 1e-2, f"rel={rel:.3e}"
 
-    @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+    @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
     def test_backends_agree(self, backend, seed, cuda_available):
         device = "cuda" if cuda_available else "cpu"
         if backend not in get_capable_backends("int8_linear", device):

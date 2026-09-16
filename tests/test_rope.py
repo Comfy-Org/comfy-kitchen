@@ -3,6 +3,7 @@ import torch
 
 import comfy_kitchen as ck
 from comfy_kitchen._rope_utils import check_rope_inplace
+from comfy_kitchen.backends.eager import rope as eager_rope
 
 from .conftest import assert_values_close, get_capable_backends
 
@@ -157,6 +158,60 @@ def _max_mismatch(freqs_dtype, dtype):
     if freqs_dtype == torch.float16 or dtype == torch.bfloat16:
         return 0.05
     return 1e-5
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["BHND", "NHD"])
+@pytest.mark.parametrize("broadcast_pairs", [False, True])
+def test_eager_split_half_mixed_dtypes_and_broadcasting(
+    dtype, freqs_dtype, layout, broadcast_pairs, device, seed
+):
+    if layout == "BHND":
+        x = torch.randn(2, 5, 6, 16, device=device, dtype=dtype).transpose(1, 2)[..., ::2]
+        prefix = (2, 1, 5)
+    else:
+        x = torch.randn(5, 6, 16, device=device, dtype=dtype)[..., ::2]
+        prefix = (1, 5, 1)  # An extra leading singleton must not change the output shape.
+    pairs = 1 if broadcast_pairs else 4
+    freqs = torch.randn(*prefix, pairs, 2, 2, device=device, dtype=freqs_dtype)
+    original = x.clone()
+    reference = _reference_apply_rope(x, freqs, split_half=True)
+
+    with ck.use_backend("eager"):
+        actual = ck.apply_rope_split_half1(x, freqs)
+
+    tolerance = 4 * max(torch.finfo(dtype).eps, torch.finfo(freqs_dtype).eps)
+    torch.testing.assert_close(actual, reference, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
+    assert actual.data_ptr() != x.data_ptr()
+
+
+@pytest.mark.parametrize("freqs_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("freqs_shape", [(2, 2), (1, 2, 2), (1, 1, 1, 1, 2, 2)])
+def test_eager_split_half_rounds_input_to_frequency_dtype(freqs_dtype, freqs_shape, device, seed):
+    x = torch.randn(2, 3, 5, 8, device=device, dtype=torch.float32)
+    freqs = torch.eye(2, device=device, dtype=freqs_dtype).reshape(freqs_shape)
+
+    with ck.use_backend("eager"):
+        actual = ck.apply_rope_split_half1(x, freqs)
+
+    torch.testing.assert_close(actual, x.to(freqs_dtype).float(), rtol=0, atol=0)
+
+
+def test_eager_split_half_gradients(device, seed):
+    x = torch.randn(2, 3, 5, 8, device=device, dtype=torch.float64, requires_grad=True)
+    freqs = torch.randn(1, 1, 5, 4, 2, 2, device=device, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn_like(x)
+    reference = _reference_apply_rope(x, freqs, split_half=True)
+    actual = eager_rope.apply_rope_split_half1(x, freqs)
+
+    expected_grads = torch.autograd.grad(reference, (x, freqs), weight)
+    actual_grads = torch.autograd.grad(actual, (x, freqs), weight)
+
+    torch.testing.assert_close(actual, reference)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad)
 
 
 @pytest.mark.parametrize("backend", ["triton", "eager"])

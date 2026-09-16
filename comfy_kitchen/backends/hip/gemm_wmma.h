@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Tiled WMMA GEMM core, shared by the fp8, int8 and int4 paths on both gfx11 and
-// gfx12.
+// Tiled WMMA GEMM core, shared by the fp8, int8, int4 and fp16 paths and the fp16
+// conv3d on both gfx11 and gfx12.
 //
 // Computes C[M, N] = epilogue(A[M, K] @ B[N, K]^T). The B operand is the weight
 // in its natural (N, K) row-major form, matching torch linear. C is written with
@@ -64,6 +64,23 @@ struct TileStager {
         }
     }
 
+    // Same, for an operand whose rows are gathered rather than stored contiguously:
+    // Src::chunk(row, kbyte) returns those 16 bytes, and neither is out of range.
+    template <typename Src>
+    __forceinline__ __device__ void load(const Src& src, int row0, int rows_total, int kbyte0,
+                                         int kbytes) {
+        const int tid = threadIdx.x;
+        #pragma unroll
+        for (int i = 0; i < kPerThread; ++i) {
+            const int c = tid * kPerThread + i;
+            const int grow = row0 + c / kChunksPerRow;
+            const int gk = kbyte0 + (c % kChunksPerRow) * 16;
+
+            regs[i] = (grow < rows_total && gk < kbytes) ? src.chunk(grow, gk)
+                                                         : make_uint4(0, 0, 0, 0);
+        }
+    }
+
     __forceinline__ __device__ void store(uint8_t* __restrict__ lds) const {
         const int tid = threadIdx.x;
         #pragma unroll
@@ -77,11 +94,23 @@ struct TileStager {
     }
 };
 
+// A is the raw operand rows, or a TileStager source that gathers them. Only the
+// pointer form carries __restrict__.
+template <typename T>
+struct GemmOperandA {
+    using type = T;
+};
+template <>
+struct GemmOperandA<const uint8_t*> {
+    using type = const uint8_t* __restrict__;
+};
+
 // Epi is a functor: float operator()(int row, int col, float acc) const.
 template <typename Mma, typename Epi, typename OutT,
-          int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN>
+          int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN,
+          typename ASrc = const uint8_t*>
 __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
-    const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
+    typename GemmOperandA<ASrc>::type A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
     int M, int N, int kbytes, int ldc, Epi epi) {
 
     constexpr int kThreads = WARPS_M * WARPS_N * kWave;
@@ -253,8 +282,8 @@ inline int device_wgp_count() {
 // The thresholds are tuned on RDNA4 and govern tile choice only, never
 // correctness. kbytes is bytes of K, equal to K only for the 8-bit policies, so
 // an int4 caller passing K/2 fires at twice the K these read as.
-template <typename Mma, typename Epi, typename OutT>
-void launch_gemm_wmma(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int kbytes,
+template <typename Mma, typename Epi, typename OutT, typename ASrc = const uint8_t*>
+void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbytes,
                       int ldc, Epi epi, hipStream_t stream) {
     const int blocks_128 = ((M + 127) / 128) * ((N + 127) / 128);
 
@@ -271,27 +300,27 @@ void launch_gemm_wmma(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N,
             // With few blocks per WGP there is nothing to interleave across, so
             // the 16-wave grid hides latency within a block instead.
             if (blocks_128 <= 4 * wgps) {
-                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2>
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
                     <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
             } else {
-                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4>
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>
                     <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
             }
         } else {
             constexpr int BM = 128, BN = 128, BKB = 64;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4>
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>
                 <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
         }
     } else if (kbytes >= 2048) {
         constexpr int BM = 64, BN = 64, BKB = 128;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2>
+        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
             <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
     } else {
         constexpr int BM = 64, BN = 64, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2>
+        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
             <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
     }
 }

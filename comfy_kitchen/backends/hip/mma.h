@@ -242,7 +242,15 @@ struct MmaF16 {
     using Frag = v8h;
     using Elem = _Float16;
     static constexpr int kFragElems = 8;
+    // The GEMM core's byte-addressed view: 16 fp16 elements are 32 bytes.
+    static constexpr int kStepBytes = 32;
     static __forceinline__ __device__ int frag_base(int lane) { return 8 * (lane / 16); }
+    static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
+                                                int lane) {
+        return load_frag_16bit<MmaF16>(
+            reinterpret_cast<const _Float16*>(static_cast<const char*>(lds) + row * stride + kbyte),
+            lane);
+    }
     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
     static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
         return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
@@ -345,7 +353,14 @@ struct MmaF16 {
     using Frag = v16h;
     using Elem = _Float16;
     static constexpr int kFragElems = 16;
+    static constexpr int kStepBytes = 32;
     static __forceinline__ __device__ int frag_base(int) { return 0; }
+    static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
+                                                int lane) {
+        return load_frag_16bit<MmaF16>(
+            reinterpret_cast<const _Float16*>(static_cast<const char*>(lds) + row * stride + kbyte),
+            lane);
+    }
     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
     static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
         return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
@@ -408,7 +423,9 @@ struct MmaF16 {
     using Frag = v8h;
     using Elem = _Float16;
     static constexpr int kFragElems = 8;
+    static constexpr int kStepBytes = 32;
     static __forceinline__ __device__ int frag_base(int) { return 0; }
+    static __forceinline__ __device__ Frag load(const void*, int, int, int, int) { return Frag{}; }
     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
     static __forceinline__ __device__ Acc mma(Frag, Frag, Acc c) { COMFY_MMA_STUB_BODY }
     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }

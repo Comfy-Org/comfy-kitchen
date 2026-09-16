@@ -157,8 +157,11 @@ set(HIP_SOURCES
     ops/quantize_int8.hip
     ops/gemm_fp8.hip
     ops/gemm_int8.hip
+    ops/gemm_fp16.hip
+    ops/conv3d_fp16.hip
     ops/convrot_w4a4.hip
     ops/adaln.hip
+    ops/group_norm_pad3d.hip
     ops/na3d.hip
     sage_attention/quant_qk_int8.hip
     sage_attention/quant_v_int8.hip
@@ -187,9 +190,13 @@ set(CPP_SOURCES
 # consume HIP and project headers only, so a compiler cache can reuse their
 # objects across CPython wheel builds.
 add_library(comfy_kitchen_hip_kernels OBJECT ${HIP_SOURCES})
+# The kernels index lanes and reduce warps at a width of 32. The wavefront size is
+# not a constant expression, so no kernel can assert it; the last flag wins, and
+# these follow CMAKE_HIP_FLAGS.
 target_compile_options(comfy_kitchen_hip_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3>
     $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
+    $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64>
 )
 if(COMFY_ENABLE_LINEINFO OR CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_options(
