@@ -3205,8 +3205,7 @@ def flash_attention_decode_is_available() -> bool:
 def _require_sage_wave32() -> None:
     if not has_wmma():
         raise RuntimeError(
-            "sage int8 attention requires wave32 RDNA3 or newer matrix cores; "
-            "gfx90c uses wave64"
+            "sage int8 attention requires a wave32 RDNA3 or newer matrix-core device"
         )
 
 
