@@ -1,5 +1,7 @@
 {
   "elementwise_only": [
+    "gfx90c",
+    "gfx1010",
     "gfx1030",
     "gfx1031",
     "gfx1032",
