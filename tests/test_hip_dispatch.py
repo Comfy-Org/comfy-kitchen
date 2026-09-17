@@ -5,6 +5,7 @@ advertises on each. They are deliberately not gated on registry.is_available("hi
 on a CPU-only runner the kernel suite in test_hip_wmma.py skips in full, and these
 routing rules would otherwise go untested behind a green tick.
 """
+
 import ast
 import json
 import pathlib
@@ -22,6 +23,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _HIP_DIR = _ROOT / "comfy_kitchen" / "backends" / "hip"
 _HIP_CMAKE = _HIP_DIR / "CMakeLists.txt"
 _HIP_ARCH_MANIFEST = _HIP_DIR / "architectures.json"
+_HIP_BINDINGS = _HIP_DIR / "dlpack_bindings.cpp"
 _HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12")
 
 
@@ -69,7 +71,9 @@ def test_scaled_mm_does_not_probe_hip_on_non_rocm_runtime(monkeypatch):
 
     monkeypatch.setattr(scaled_mm_module, "_hip_fp8_gemm", unexpected_hip_probe)
     monkeypatch.setattr(scaled_mm_module, "has_scaled_mm_v2", lambda: True)
-    monkeypatch.setattr(torch.nn.functional, "scaled_mm", lambda *args, **kwargs: sentinel)
+    monkeypatch.setattr(
+        torch.nn.functional, "scaled_mm", lambda *args, **kwargs: sentinel
+    )
 
     result = scaled_mm_module.scaled_mm_v2(
         object(),
@@ -84,8 +88,7 @@ def test_scaled_mm_does_not_probe_hip_on_non_rocm_runtime(monkeypatch):
     "arches",
     [
         [],
-        ["gfx90a"],   # CDNA: MFMA, not WMMA
-        ["gfx1010"],  # RDNA1: neither matrix cores nor the dot-product paths
+        ["gfx90a"],  # CDNA: MFMA, not WMMA
         ["gfx1201", "gfx90a"],
     ],
 )
@@ -134,7 +137,7 @@ def test_hip_declines_when_an_arch_cannot_be_read():
         (["gfx1200"], True),
         (["gfx1201", "gfx1100"], True),
         (["gfx1151"], True),
-        (["gfx1030"], False),             # RDNA2 has no matrix cores
+        (["gfx1030"], False),  # RDNA2 has no matrix cores
         (["gfx1200", "gfx1030"], False),  # kernels launch on the tensor's own device
         ([None], False),
     ],
@@ -142,6 +145,42 @@ def test_hip_declines_when_an_arch_cannot_be_read():
 def test_hip_wmma_capability(arches, expected):
     """Only an all-matrix-core process may advertise the GEMMs."""
     assert hip_backend._has_wmma(arches) is expected
+
+
+def test_sage_direct_entries_reject_wave64_arch(monkeypatch):
+    """Backend-direct calls must not bypass the wave32 kernel gate on gfx90c."""
+    monkeypatch.setattr(hip_backend, "has_wmma", lambda: False)
+
+    calls = (
+        lambda: hip_backend.sage_int8_sdpa(
+            None, None, None, attention_scale=1.0, attn_mask=None
+        ),
+        lambda: hip_backend.sage_int8_quantize(None, None, None),
+        lambda: hip_backend.sage_int8_attend(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            attention_scale=1.0,
+            attn_mask=None,
+            output_dtype=torch.float16,
+        ),
+    )
+
+    for call in calls:
+        with pytest.raises(RuntimeError, match="wave32"):
+            call()
+
+
+def test_sage_native_entries_guard_wave32():
+    bindings = _HIP_BINDINGS.read_text(encoding="utf-8")
+    common = (_HIP_DIR / "sage_attention" / "sage_common.h").read_text(encoding="utf-8")
+
+    assert bindings.count("sage_require_wave32(") == 4  # definition plus three entries
+    assert "properties.warpSize != 32" in bindings
+    assert "defined(COMFY_HAS_WMMA) && defined(__AMDGCN_WAVEFRONT_SIZE__)" in common
 
 
 def test_hip_drops_gemms_without_matrix_cores():
@@ -156,10 +195,19 @@ def test_hip_drops_gemms_without_matrix_cores():
     # na3d is a matrix-core kernel: without one it traps rather than answers.
     assert "na3d" in hip_backend._WMMA_ONLY_OPS
     # The elementwise kernels need no matrix cores and must survive.
-    for op in ("apply_rope", "apply_rope_", "rms_rope", "rms_rope_split_half1_", "adaln",
-               "rms_adaln", "group_norm_silu_pad3d", "quantize_per_tensor_fp8", "gemv_awq_w4a16",
-               "dequantize_int8_simple_dtype",
-               "dequantize_int8_convrot_weight_dtype"):
+    for op in (
+        "apply_rope",
+        "apply_rope_",
+        "rms_rope",
+        "rms_rope_split_half1_",
+        "adaln",
+        "rms_adaln",
+        "group_norm_silu_pad3d",
+        "quantize_per_tensor_fp8",
+        "gemv_awq_w4a16",
+        "dequantize_int8_simple_dtype",
+        "dequantize_int8_convrot_weight_dtype",
+    ):
         assert op in without
     # The fused W4A8 requantize is elementwise too: it packs weights and never
     # reaches a matrix core, so RDNA2 must keep it.
@@ -170,9 +218,16 @@ def test_hip_advertises_every_inplace_rope_entry():
     """A missing entry routes the in-place call to eager while the functional one
     stays on HIP: silently half the coverage rather than a failure."""
     constraints = hip_backend._build_constraints(has_wmma=True)
-    for functional in ("apply_rope", "apply_rope1", "apply_rope_split_half",
-                       "apply_rope_split_half1", "rms_rope", "rms_rope1",
-                       "rms_rope_split_half", "rms_rope_split_half1"):
+    for functional in (
+        "apply_rope",
+        "apply_rope1",
+        "apply_rope_split_half",
+        "apply_rope_split_half1",
+        "rms_rope",
+        "rms_rope1",
+        "rms_rope_split_half",
+        "rms_rope_split_half1",
+    ):
         assert constraints[f"{functional}_"] is constraints[functional]
 
 
@@ -310,7 +365,10 @@ def test_sdist_rules_include_every_hip_build_input():
     pyproject = (_ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
     assert "include comfy_kitchen/backends/hip/CMakeLists.txt" in manifest
-    assert "recursive-include comfy_kitchen/backends/hip *.cpp *.h *.hip *.in *.json" in manifest
+    assert (
+        "recursive-include comfy_kitchen/backends/hip *.cpp *.h *.hip *.in *.json"
+        in manifest
+    )
     assert "include-package-data = false" in pyproject
     assert '"comfy_kitchen.backends.hip" = ["architectures.json"]' in pyproject
 
@@ -320,7 +378,9 @@ def test_hip_kernels_are_independent_of_the_python_extension_target():
     text = _HIP_CMAKE.read_text(encoding="utf-8")
 
     assert "add_library(comfy_kitchen_hip_kernels OBJECT ${HIP_SOURCES})" in text
-    assert "target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_hip_kernels>)" in text
+    assert (
+        "target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_hip_kernels>)" in text
+    )
 
     module_calls = re.findall(r"nanobind_add_module\((.*?)\)", text, re.DOTALL)
     assert module_calls

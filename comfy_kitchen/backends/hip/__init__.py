@@ -3202,6 +3202,14 @@ def flash_attention_decode_is_available() -> bool:
     return has_wmma() and hasattr(_C, "flash_attention_decode")
 
 
+def _require_sage_wave32() -> None:
+    if not has_wmma():
+        raise RuntimeError(
+            "sage int8 attention requires wave32 RDNA3 or newer matrix cores; "
+            "gfx90c uses wave64"
+        )
+
+
 # ---------------------------------------------------------------------------
 # GatedDeltaNet decode
 #
@@ -3396,6 +3404,7 @@ def sage_int8_sdpa(
 ) -> torch.Tensor:
     """Quantize and attend in one call. q, k and v are already padded to a
     supported head dimension; the output keeps that width."""
+    _require_sage_wave32()
     batch, q_heads, q_length, head_dim = q.shape
     output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
     output = torch.empty(
@@ -3434,6 +3443,7 @@ def sage_int8_quantize(
     cta_k: int = _SAGE_CTA_K,
 ) -> dict:
     """Quantize q, k and v without allocating the attention output."""
+    _require_sage_wave32()
     buffers, anchor_indices = _sage_buffers(q, k, cta_k)
     _C.sage_sdpa_quantize(
         _dl(q),
@@ -3467,6 +3477,7 @@ def sage_int8_attend(
     cta_k: int = _SAGE_CTA_K,
 ) -> torch.Tensor:
     """Attend over the packed layouts sage_int8_quantize produced."""
+    _require_sage_wave32()
     batch, q_heads, q_length, head_dim = q_int8.shape
     output = torch.empty(
         batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q_int8.device
