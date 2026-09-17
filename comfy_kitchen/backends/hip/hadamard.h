@@ -13,6 +13,7 @@
 // even index), which is the layout the iu4 A-fragment consumes directly.
 #pragma once
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -285,27 +286,46 @@ __forceinline__ __device__ void load_input_swiglu4_bf16(
     const __bf16* row =
         static_cast<const __bf16*>(x) + in_row + col;
 
-    const uint64_t gate_pack =
-        *reinterpret_cast<const uint64_t*>(row);
+    float g0, g1, g2, g3;
+    float u0, u1, u2, u3;
 
-    const uint64_t up_pack =
-        *reinterpret_cast<const uint64_t*>(row + K);
+    const std::uintptr_t gate_addr = reinterpret_cast<std::uintptr_t>(row);
+    const std::uintptr_t up_addr = reinterpret_cast<std::uintptr_t>(row + K);
 
-    const __bf16* gate =
-        reinterpret_cast<const __bf16*>(&gate_pack);
+    if (((gate_addr | up_addr) & 7u) == 0) {
+        const uint64_t gate_pack =
+            *reinterpret_cast<const uint64_t*>(row);
+        const uint64_t up_pack =
+            *reinterpret_cast<const uint64_t*>(row + K);
 
-    const __bf16* up =
-        reinterpret_cast<const __bf16*>(&up_pack);
+        const __bf16* gate =
+            reinterpret_cast<const __bf16*>(&gate_pack);
+        const __bf16* up =
+            reinterpret_cast<const __bf16*>(&up_pack);
 
-    const float g0 = static_cast<float>(gate[0]);
-    const float g1 = static_cast<float>(gate[1]);
-    const float g2 = static_cast<float>(gate[2]);
-    const float g3 = static_cast<float>(gate[3]);
+        g0 = static_cast<float>(gate[0]);
+        g1 = static_cast<float>(gate[1]);
+        g2 = static_cast<float>(gate[2]);
+        g3 = static_cast<float>(gate[3]);
 
-    const float u0 = static_cast<float>(up[0]);
-    const float u1 = static_cast<float>(up[1]);
-    const float u2 = static_cast<float>(up[2]);
-    const float u3 = static_cast<float>(up[3]);
+        u0 = static_cast<float>(up[0]);
+        u1 = static_cast<float>(up[1]);
+        u2 = static_cast<float>(up[2]);
+        u3 = static_cast<float>(up[3]);
+    } else {
+        // DLPack/direct-binding callers may supply a contiguous BF16 view whose
+        // logical data pointer is only 2-byte aligned. Keep those accesses
+        // alignment-safe without penalizing the normal packed path.
+        g0 = static_cast<float>(row[0]);
+        g1 = static_cast<float>(row[1]);
+        g2 = static_cast<float>(row[2]);
+        g3 = static_cast<float>(row[3]);
+
+        u0 = static_cast<float>(row[K + 0]);
+        u1 = static_cast<float>(row[K + 1]);
+        u2 = static_cast<float>(row[K + 2]);
+        u3 = static_cast<float>(row[K + 3]);
+    }
 
     // Exactly the same SwiGLU formula as load_input_act<kActSwiGLU>.
     o0 = (g0 / (1.0f + expf(-g0))) * u0;
