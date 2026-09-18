@@ -28,6 +28,16 @@ from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
 from triton.language.extra import libdevice
 
 
+def _is_gfx10(tensor: torch.Tensor) -> bool:
+    if not getattr(torch.version, "hip", None):
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(tensor.device).gcnArchName.split(":")[0]
+    except (AttributeError, RuntimeError):
+        return False
+    return arch.startswith("gfx10")
+
+
 @triton.jit
 def quantize_fp8_kernel_tl(
     x_ptr,
@@ -55,6 +65,13 @@ def quantize_fp8_kernel_tl(
 def quantize_per_tensor_fp8(
     x: torch.Tensor, scale: torch.Tensor, output_type: torch.dtype = torch.float8_e4m3fn
 ) -> torch.Tensor:
+    if _is_gfx10(x):
+        from comfy_kitchen.backends.eager.quantization import (
+            quantize_per_tensor_fp8 as eager_quantize,
+        )
+
+        return eager_quantize(x, scale, output_type)
+
     if output_type == torch.float8_e4m3fn:
         lp_max = F8_E4M3_MAX
     elif output_type == torch.float8_e5m2:
@@ -72,7 +89,6 @@ def quantize_per_tensor_fp8(
     n_elements = x_flat.numel()
 
     output = torch.empty_like(x_flat, dtype=output_type)
-
 
     if n_elements < 32768:  # < 32K elements
         block_size = 128
@@ -124,6 +140,13 @@ def dequantize_fp8_kernel_tl(
 def dequantize_per_tensor_fp8(
     x: torch.Tensor, scale: torch.Tensor, output_type: torch.dtype = torch.bfloat16
 ) -> torch.Tensor:
+    if _is_gfx10(x):
+        from comfy_kitchen.backends.eager.quantization import (
+            dequantize_per_tensor_fp8 as eager_dequantize,
+        )
+
+        return eager_dequantize(x, scale, output_type)
+
     if not x.is_contiguous():
         x = x.contiguous()
 
@@ -297,8 +320,12 @@ def quantize_nvfp4_kernel_tl(
 
             # Extract even and odd elements using one-hot selection
             indices = tl.arange(0, block_size)
-            f32_even = tl.sum(tl.where(indices == even_idx[:, None], data_scaled, 0), axis=1)
-            f32_odd = tl.sum(tl.where(indices == odd_idx[:, None], data_scaled, 0), axis=1)
+            f32_even = tl.sum(
+                tl.where(indices == even_idx[:, None], data_scaled, 0), axis=1
+            )
+            f32_odd = tl.sum(
+                tl.where(indices == odd_idx[:, None], data_scaled, 0), axis=1
+            )
 
             # cvt.rn.satfinite.e2m1x2.f32 packs $1 into the high nibble, $2 into the low nibble.
             if hi_first:
@@ -338,6 +365,13 @@ def quantize_nvfp4(
     pad_16x: bool = False,
     hi_first: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if _is_gfx10(x):
+        from comfy_kitchen.backends.eager.quantization import (
+            quantize_nvfp4 as eager_quantize,
+        )
+
+        return eager_quantize(x, per_tensor_scale, epsilon, pad_16x, hi_first)
+
     # Note: epsilon is accepted for API compatibility but not currently used
     orig_shape = x.shape
 
@@ -376,7 +410,7 @@ def quantize_nvfp4(
     swizzled_scales = torch.zeros(
         (padded_scale_rows, padded_scale_cols),
         dtype=torch.float8_e4m3fn,
-        device=x.device
+        device=x.device,
     )
 
     # Determine blocks per program based on tensor size for better occupancy
@@ -483,10 +517,16 @@ def dequantize_nvfp4_kernel_tl(
         pack=4,
     )
     val_low = (
-        (x_f16x2_packed & 0xFFFF).cast(tl.uint16).cast(tl.float16, bitcast=True).cast(tl.float32)
+        (x_f16x2_packed & 0xFFFF)
+        .cast(tl.uint16)
+        .cast(tl.float16, bitcast=True)
+        .cast(tl.float32)
     )
     val_high = (
-        (x_f16x2_packed >> 16).cast(tl.uint16).cast(tl.float16, bitcast=True).cast(tl.float32)
+        (x_f16x2_packed >> 16)
+        .cast(tl.uint16)
+        .cast(tl.float16, bitcast=True)
+        .cast(tl.float32)
     )
 
     # Calculate output positions for both values
@@ -545,6 +585,15 @@ def dequantize_nvfp4(
     output_type: torch.dtype = torch.bfloat16,
     hi_first: bool = True,
 ) -> torch.Tensor:
+    if _is_gfx10(qx):
+        from comfy_kitchen.backends.eager.quantization import (
+            dequantize_nvfp4 as eager_dequantize,
+        )
+
+        return eager_dequantize(
+            qx, per_tensor_scale, block_scales, output_type, hi_first
+        )
+
     # Triton backend: fused kernel with inline SM100 cvt.rn.f16x2.e2m1x2 instruction
     block_size = 16
     tile_size = 128
@@ -581,6 +630,7 @@ def dequantize_nvfp4(
     )
 
     return output
+
 
 @triton.jit
 def quantize_mxfp8_kernel_tl(
@@ -647,7 +697,7 @@ def quantize_mxfp8_kernel_tl(
             scale_ratio = max_abs / fp8_max
             # Clamp to avoid log2(0) and ensure valid E8M0 range
             scale_ratio = tl.maximum(scale_ratio, 2.0 ** (-127))  # min E8M0 value
-            scale_ratio = tl.minimum(scale_ratio, 2.0 ** 127)     # max E8M0 value
+            scale_ratio = tl.minimum(scale_ratio, 2.0**127)  # max E8M0 value
 
             # Compute exponent: round up to next power of 2
             log2_ratio = tl.log2(scale_ratio)
@@ -699,6 +749,13 @@ def quantize_mxfp8(
     Returns:
         Tuple of (quantized_fp8_tensor, block_scales_e8m0)
     """
+    if _is_gfx10(x):
+        from comfy_kitchen.backends.eager.quantization import (
+            quantize_mxfp8 as eager_quantize,
+        )
+
+        return eager_quantize(x, pad_32x)
+
     block_size = 32
 
     # Handle padding
@@ -729,7 +786,7 @@ def quantize_mxfp8(
     swizzled_scales = torch.zeros(
         (padded_scale_rows, padded_scale_cols),
         dtype=torch.uint8,  # E8M0 stored as uint8
-        device=x.device
+        device=x.device,
     )
 
     # Determine blocks per program
@@ -762,18 +819,21 @@ def quantize_mxfp8(
     swizzled_scales = swizzled_scales.view(torch.float8_e8m0fnu)
 
     return output, swizzled_scales
+
+
 # =============================================================================
 # INT8 Tensor-wise Quantization (from dxqb/OneTrainer & ComfyUI-Flux2-INT8)
 # =============================================================================
 # Single scale per tensor + per-row activation scaling.
 # Fuses dequantization and bias addition.
 
+
 @triton.jit
 def _quantize_rowwise_kernel(
-    x_ptr,      # Input pointer (FP16/BF16)
-    y_ptr,      # Output pointer (INT8)
-    s_ptr,      # Scale pointer (FP32)
-    n_elements, # Number of columns
+    x_ptr,  # Input pointer (FP16/BF16)
+    y_ptr,  # Output pointer (INT8)
+    s_ptr,  # Scale pointer (FP32)
+    n_elements,  # Number of columns
     block_size: tl.constexpr,
     input_dtype_code: tl.constexpr,
 ):
@@ -815,16 +875,24 @@ def _quantize_rowwise_kernel(
     tl.store(y_row_ptr + offsets, q_i.to(tl.int8), mask=mask)
     tl.store(s_ptr + row_idx, scale.to(tl.float32))
 
+
 def triton_quantize_rowwise(x: torch.Tensor):
     """
     Input: [Batch, Dim] (float16/bfloat16/float32)
     Output: [Batch, Dim] (int8), [Batch, 1] (float32)
     """
+    if _is_gfx10(x):
+        from comfy_kitchen.backends.eager.quantization import quantize_int8_rowwise
+
+        return quantize_int8_rowwise(x)
+
     rows, cols = x.shape
     y = torch.empty_like(x, dtype=torch.int8)
     s = torch.empty((rows, 1), device=x.device, dtype=torch.float32)
 
-    input_dtype_code = 1 if x.dtype == torch.float16 else 2 if x.dtype == torch.bfloat16 else 0
+    input_dtype_code = (
+        1 if x.dtype == torch.float16 else 2 if x.dtype == torch.bfloat16 else 0
+    )
 
     # Heuristic for block size
     block_size = triton.next_power_of_2(cols)
@@ -843,7 +911,9 @@ def triton_quantize_rowwise(x: torch.Tensor):
     return y, s
 
 
-def triton_quantize_and_rotate_rowwise(x: torch.Tensor, h: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+def triton_quantize_and_rotate_rowwise(
+    x: torch.Tensor, h: torch.Tensor, group_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Decoupled online activation rotation + row-wise quantization.
 
     Args:
@@ -860,30 +930,65 @@ def triton_quantize_and_rotate_rowwise(x: torch.Tensor, h: torch.Tensor, group_s
 
 @triton.autotune(
     configs=[
-        triton.Config({'block_m': 128, 'block_n': 256, 'block_k': 64, 'group_size_m': 8}, num_stages=3, num_warps=8),
-        triton.Config({'block_m': 64,  'block_n': 256, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 128, 'block_n': 128, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 128, 'block_n': 64,  'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 64,  'block_n': 128, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 128, 'block_n': 32,  'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
+        triton.Config(
+            {"block_m": 128, "block_n": 256, "block_k": 64, "group_size_m": 8},
+            num_stages=3,
+            num_warps=8,
+        ),
+        triton.Config(
+            {"block_m": 64, "block_n": 256, "block_k": 32, "group_size_m": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"block_m": 128, "block_n": 128, "block_k": 32, "group_size_m": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"block_m": 128, "block_n": 64, "block_k": 32, "group_size_m": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"block_m": 64, "block_n": 128, "block_k": 32, "group_size_m": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"block_m": 128, "block_n": 32, "block_k": 32, "group_size_m": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
     ],
-    key=['m', 'n', 'k'],
+    key=["m", "n", "k"],
 )
 @triton.jit
 def _int8_matmul_dequant_kernel(
     # Pointers
-    a_ptr, b_ptr, c_ptr,
-    a_scale_ptr, b_scale_ptr, bias_ptr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    bias_ptr,
     # Matrix Dimensions
-    m, n, k,
+    m,
+    n,
+    k,
     # Strides
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
     # Meta-parameters
-    block_m: tl.constexpr, block_n: tl.constexpr, block_k: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
     group_size_m: tl.constexpr,
-    has_bias: tl.constexpr
+    has_bias: tl.constexpr,
 ):
     """
     Computes: C = ((A * B) * (scale_a * scale_b)) + bias
@@ -924,7 +1029,7 @@ def _int8_matmul_dequant_kernel(
         b_ptrs += block_k * stride_bk
 
     # 3. Fused Epilogue (Dequantize & Bias)
-    scale_a = tl.load(a_scale_ptr + offs_am) # Vector [BLOCK_M]
+    scale_a = tl.load(a_scale_ptr + offs_am)  # Vector [BLOCK_M]
     scale_b = tl.load(b_scale_ptr)
 
     c = accumulator.to(tl.float32)
@@ -932,7 +1037,7 @@ def _int8_matmul_dequant_kernel(
     c = c * total_scale
 
     if has_bias:
-        bias = tl.load(bias_ptr + offs_bn) # Vector [BLOCK_N]
+        bias = tl.load(bias_ptr + offs_bn)  # Vector [BLOCK_N]
         c = c + bias[None, :]
 
     # 4. Store Result
@@ -940,32 +1045,68 @@ def _int8_matmul_dequant_kernel(
     c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
     tl.store(c_ptrs, c, mask=c_mask)
 
+
 @triton.autotune(
     configs=[
-        triton.Config({'block_m': 128, 'block_n': 256, 'block_k': 64, 'group_size_m': 8}, num_stages=3, num_warps=8),
-        triton.Config({'block_m': 64,  'block_n': 256, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 128, 'block_n': 128, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 128, 'block_n': 64,  'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 64,  'block_n': 128, 'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
-        triton.Config({'block_m': 128, 'block_n': 32,  'block_k': 32, 'group_size_m': 8}, num_stages=4, num_warps=4),
+        triton.Config(
+            {"block_m": 128, "block_n": 256, "block_k": 64, "group_size_m": 8},
+            num_stages=3,
+            num_warps=8,
+        ),
+        triton.Config(
+            {"block_m": 64, "block_n": 256, "block_k": 32, "group_size_m": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"block_m": 128, "block_n": 128, "block_k": 32, "group_size_m": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"block_m": 128, "block_n": 64, "block_k": 32, "group_size_m": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"block_m": 64, "block_n": 128, "block_k": 32, "group_size_m": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"block_m": 128, "block_n": 32, "block_k": 32, "group_size_m": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
     ],
-    key=['m', 'n', 'k'],
+    key=["m", "n", "k"],
 )
 @triton.jit
 def _int8_matmul_dequant_per_row_kernel(
     # Pointers
-    a_ptr, b_ptr, c_ptr,
-    a_scale_ptr, b_scale_ptr, bias_ptr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    bias_ptr,
     # Matrix Dimensions
-    m, n, k,
+    m,
+    n,
+    k,
     # Strides
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
     # Meta-parameters
-    block_m: tl.constexpr, block_n: tl.constexpr, block_k: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
     group_size_m: tl.constexpr,
-    has_bias: tl.constexpr
+    has_bias: tl.constexpr,
 ):
     """
     Computes: C = ((A * B) * (scale_a[:, None] * scale_b[None, :])) + bias
@@ -1016,6 +1157,7 @@ def _int8_matmul_dequant_per_row_kernel(
     c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
     c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
     tl.store(c_ptrs, c, mask=c_mask)
+
 
 def int8_linear(
     x: torch.Tensor,
@@ -1072,7 +1214,9 @@ def int8_linear(
 
     is_per_channel = False
     if not isinstance(weight_scale, torch.Tensor):
-        weight_scale = torch.tensor([weight_scale], device=x.device, dtype=torch.float32)
+        weight_scale = torch.tensor(
+            [weight_scale], device=x.device, dtype=torch.float32
+        )
     elif weight_scale.numel() == 1:
         weight_scale = weight_scale.reshape(1)
     else:
@@ -1093,11 +1237,16 @@ def int8_linear(
             a_scale_ptr=x_scale,
             b_scale_ptr=weight_scale,
             bias_ptr=bias_ptr,
-            m=m, n=n, k=k,
-            stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
-            stride_bk=weight.stride(1), stride_bn=weight.stride(0),
-            stride_cm=output.stride(0), stride_cn=output.stride(1),
-            has_bias=has_bias
+            m=m,
+            n=n,
+            k=k,
+            stride_am=x_int8.stride(0),
+            stride_ak=x_int8.stride(1),
+            stride_bk=weight.stride(1),
+            stride_bn=weight.stride(0),
+            stride_cm=output.stride(0),
+            stride_cn=output.stride(1),
+            has_bias=has_bias,
         )
     else:
         _int8_matmul_dequant_kernel[grid](
@@ -1107,11 +1256,18 @@ def int8_linear(
             a_scale_ptr=x_scale,
             b_scale_ptr=weight_scale,
             bias_ptr=bias_ptr,
-            m=m, n=n, k=k,
-            stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
-            stride_bk=weight.stride(1), stride_bn=weight.stride(0),
-            stride_cm=output.stride(0), stride_cn=output.stride(1),
-            has_bias=has_bias
+            m=m,
+            n=n,
+            k=k,
+            stride_am=x_int8.stride(0),
+            stride_ak=x_int8.stride(1),
+            stride_bk=weight.stride(1),
+            stride_bn=weight.stride(0),
+            stride_cm=output.stride(0),
+            stride_cn=output.stride(1),
+            has_bias=has_bias,
         )
 
-    return _apply_residual(output.reshape(*orig_shape[:-1], n), residual, residual_scale)
+    return _apply_residual(
+        output.reshape(*orig_shape[:-1], n), residual, residual_scale
+    )

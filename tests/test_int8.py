@@ -64,8 +64,12 @@ def test_nvidia_16_series_list_matches_comfyui():
 def test_turing_devices_without_tensor_cores_keep_fallback(device_name, monkeypatch):
     cuda._turing_device_cache.clear()
     cuda._nvidia_16_series_device_cache.clear()
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device_index: (7, 5))
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device_index: f"NVIDIA {device_name}")
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda _device_index: (7, 5)
+    )
+    monkeypatch.setattr(
+        torch.cuda, "get_device_name", lambda _device_index: f"NVIDIA {device_name}"
+    )
 
     assert cuda._cuda_device_is_turing(0)
     assert cuda._cuda_device_is_nvidia_16_series(0)
@@ -85,8 +89,12 @@ def test_turing_devices_without_tensor_cores_keep_fallback(device_name, monkeypa
 def test_turing_tensor_core_devices_use_native_kernels(device_name, monkeypatch):
     cuda._turing_device_cache.clear()
     cuda._nvidia_16_series_device_cache.clear()
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device_index: (7, 5))
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device_index: device_name)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda _device_index: (7, 5)
+    )
+    monkeypatch.setattr(
+        torch.cuda, "get_device_name", lambda _device_index: device_name
+    )
 
     assert not cuda._cuda_device_is_nvidia_16_series(0)
     assert cuda._cuda_device_should_use_turing_kernels(0)
@@ -99,7 +107,9 @@ def test_turing_tensor_core_devices_use_native_kernels(device_name, monkeypatch)
 def test_non_turing_devices_never_use_turing_kernels(capability, monkeypatch):
     cuda._turing_device_cache.clear()
     cuda._nvidia_16_series_device_cache.clear()
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device_index: capability)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda _device_index: capability
+    )
 
     assert not cuda._cuda_device_is_turing(0)
     assert not cuda._cuda_device_should_use_turing_kernels(0)
@@ -236,9 +246,15 @@ def test_eager_int8_stochastic_rounding_tensorwise(seed):
     scale = torch.tensor(1.0, dtype=torch.float32)
 
     with ck.registry.use_backend("eager"):
-        q1, params = TensorWiseINT8Layout.quantize(weight, scale=scale, stochastic_rounding=123)
-        q2, _ = TensorWiseINT8Layout.quantize(weight, scale=scale, stochastic_rounding=123)
-        q3, _ = TensorWiseINT8Layout.quantize(weight, scale=scale, stochastic_rounding=124)
+        q1, params = TensorWiseINT8Layout.quantize(
+            weight, scale=scale, stochastic_rounding=123
+        )
+        q2, _ = TensorWiseINT8Layout.quantize(
+            weight, scale=scale, stochastic_rounding=123
+        )
+        q3, _ = TensorWiseINT8Layout.quantize(
+            weight, scale=scale, stochastic_rounding=124
+        )
 
     assert q1.dtype == torch.int8
     assert params.scale.item() == 1.0
@@ -354,7 +370,9 @@ class TestTensorWiseINT8Layout:
         dq = qt.dequantize()
 
         rel_err = (w.float() - dq.float()).abs() / (w.float().abs().max() + 1e-8)
-        assert rel_err.mean().item() < 0.02, f"Mean relative error too high: {rel_err.mean():.4f}"
+        assert (
+            rel_err.mean().item() < 0.02
+        ), f"Mean relative error too high: {rel_err.mean():.4f}"
 
     def test_state_dict_tensors_keys(self, seed):
         """state_dict_tensors returns '' and '_scale' keys."""
@@ -374,6 +392,11 @@ class TestTensorWiseINT8Layout:
 
         result = TensorWiseINT8Layout.supports_fast_matmul()
         assert isinstance(result, bool)
+        if getattr(torch.version, "hip", None):
+            assert result == (
+                ck.registry.get_constraints("hip", "int8_linear") is not None
+            )
+            return
         sm = torch.cuda.get_device_capability()
         if sm >= (7, 5):
             assert result is True
@@ -471,14 +494,23 @@ class TestTensorWiseINT8Layout:
         w_int8, w_scale = quantize_int8_tensorwise(w)
 
         with ck.registry.use_backend("eager"):
-            ref_out = ck.int8_linear(x, w_int8, w_scale, bias=bias, out_dtype=torch.float16)
+            ref_out = ck.int8_linear(
+                x, w_int8, w_scale, bias=bias, out_dtype=torch.float16
+            )
 
         with ck.registry.use_backend(backend):
             out = ck.int8_linear(x, w_int8, w_scale, bias=bias, out_dtype=torch.float16)
 
         # cuBLAS INT8 GEMM output compared to eager may have slight differences due to rounding
         # However, eager vs triton vs cuda should be very close.
-        assert_values_close(out, ref_out, rtol=1e-2, atol=1e-2, name=f"int8_linear_{backend}", max_mismatch_ratio=0.01)
+        assert_values_close(
+            out,
+            ref_out,
+            rtol=1e-2,
+            atol=1e-2,
+            name=f"int8_linear_{backend}",
+            max_mismatch_ratio=0.01,
+        )
 
     def test_int8_linear_cuda_single_row_gemv(self, seed):
         """CUDA int8_linear uses the single-row GEMV path correctly."""
@@ -493,14 +525,25 @@ class TestTensorWiseINT8Layout:
         w_int8, w_scale = quantize_int8_tensorwise(w)
 
         with ck.registry.use_backend("eager"):
-            ref_out = ck.int8_linear(x, w_int8, w_scale, bias=bias, out_dtype=torch.bfloat16)
+            ref_out = ck.int8_linear(
+                x, w_int8, w_scale, bias=bias, out_dtype=torch.bfloat16
+            )
 
         with ck.registry.use_backend("cuda"):
-            out = ck.int8_linear(x, w_int8, w_scale, bias=bias, out_dtype=torch.bfloat16)
+            out = ck.int8_linear(
+                x, w_int8, w_scale, bias=bias, out_dtype=torch.bfloat16
+            )
 
         assert out.shape == (1, 384)
         assert out.dtype == torch.bfloat16
-        assert_values_close(out, ref_out, rtol=1e-2, atol=1e-2, name="int8_linear_cuda_single_row_gemv", max_mismatch_ratio=0.01)
+        assert_values_close(
+            out,
+            ref_out,
+            rtol=1e-2,
+            atol=1e-2,
+            name="int8_linear_cuda_single_row_gemv",
+            max_mismatch_ratio=0.01,
+        )
 
     def test_public_api_quantize_tensorwise(self, seed):
         """comfy_kitchen.quantize_int8_tensorwise op is reachable."""
@@ -535,7 +578,9 @@ class TestTensorWiseINT8Layout:
         assert dq.dtype == torch.float32
         assert dq.shape == x.shape
 
-    @pytest.mark.parametrize("backend", get_capable_backends("dequantize_int8_simple", "cuda"))
+    @pytest.mark.parametrize(
+        "backend", get_capable_backends("dequantize_int8_simple", "cuda")
+    )
     def test_dequantize_simple_backend_correctness(self, seed, backend):
         """CUDA INT8 dequantize matches eager for scalar and rowwise scales."""
         import comfy_kitchen as ck
@@ -552,8 +597,12 @@ class TestTensorWiseINT8Layout:
             out_scalar = ck.dequantize_int8_simple(q_scalar, scale_scalar)
             out_row = ck.dequantize_int8_simple(q_row, scale_row)
 
-        assert_values_close(out_scalar, ref_scalar, rtol=0, atol=0, name=f"dequant_scalar_{backend}")
-        assert_values_close(out_row, ref_row, rtol=0, atol=0, name=f"dequant_rowwise_{backend}")
+        assert_values_close(
+            out_scalar, ref_scalar, rtol=0, atol=0, name=f"dequant_scalar_{backend}"
+        )
+        assert_values_close(
+            out_row, ref_row, rtol=0, atol=0, name=f"dequant_rowwise_{backend}"
+        )
 
     def test_dequantize_direct_output_dtype_matches_final_cast(self, seed):
         """Direct fp16/bf16 dequant output matches the prior float32-then-cast behavior."""
@@ -566,12 +615,20 @@ class TestTensorWiseINT8Layout:
         with ck.registry.use_backend("cuda"):
             q_row, scale_row = ck.quantize_int8_rowwise(x)
             ref_row = torch.ops.comfy_kitchen.dequantize_int8_simple(q_row, scale_row)
-            q_conv, scale_conv = torch.ops.comfy_kitchen.quantize_int8_convrot_weight(x, 256)
-            ref_conv = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight(q_conv, scale_conv, 256)
+            q_conv, scale_conv = torch.ops.comfy_kitchen.quantize_int8_convrot_weight(
+                x, 256
+            )
+            ref_conv = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight(
+                q_conv, scale_conv, 256
+            )
 
             for dtype, code in ((torch.float16, 1), (torch.bfloat16, 2)):
-                out_row = torch.ops.comfy_kitchen.dequantize_int8_simple_dtype(q_row, scale_row, code)
-                out_conv = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight_dtype(q_conv, scale_conv, 256, code)
+                out_row = torch.ops.comfy_kitchen.dequantize_int8_simple_dtype(
+                    q_row, scale_row, code
+                )
+                out_conv = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight_dtype(
+                    q_conv, scale_conv, 256, code
+                )
 
                 assert out_row.dtype == dtype
                 assert out_conv.dtype == dtype
@@ -608,7 +665,9 @@ class TestTensorWiseINT8Layout:
 
         # Test invalid sizes
         for size in [2, 8, 32, 128, 500]:
-            with pytest.raises(ValueError, match="Regular Hadamard size must be a power of 4"):
+            with pytest.raises(
+                ValueError, match="Regular Hadamard size must be a power of 4"
+            ):
                 _build_hadamard(size, device="cuda")
 
     def test_convrot_param_validation(self):
@@ -618,12 +677,18 @@ class TestTensorWiseINT8Layout:
         w = torch.randn(64, 256, device="cuda", dtype=torch.float16)
 
         # 1. convrot with is_weight=False -> ValueError
-        with pytest.raises(ValueError, match="convrot is only supported when is_weight is True"):
+        with pytest.raises(
+            ValueError, match="convrot is only supported when is_weight is True"
+        ):
             TensorWiseINT8Layout.quantize(w, is_weight=False, convrot=True)
 
         # 2. convrot with per_channel=False -> ValueError
-        with pytest.raises(ValueError, match="convrot is only supported when per_channel is True"):
-            TensorWiseINT8Layout.quantize(w, is_weight=True, per_channel=False, convrot=True)
+        with pytest.raises(
+            ValueError, match="convrot is only supported when per_channel is True"
+        ):
+            TensorWiseINT8Layout.quantize(
+                w, is_weight=True, per_channel=False, convrot=True
+            )
 
     def test_convrot_weight_roundtrip(self, seed):
         """Verify weight roundtrip (quantize -> dequantize) with convrot=True preserves values."""
@@ -632,7 +697,11 @@ class TestTensorWiseINT8Layout:
         w = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
         # Using default convrot_groupsize=256
         qt = QuantizedTensor.from_float(
-            w, "TensorWiseINT8Layout", per_channel=True, convrot=True, convrot_groupsize=256
+            w,
+            "TensorWiseINT8Layout",
+            per_channel=True,
+            convrot=True,
+            convrot_groupsize=256,
         )
 
         assert qt._params.convrot is True
@@ -671,7 +740,11 @@ class TestTensorWiseINT8Layout:
 
         w = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(
-            w, "TensorWiseINT8Layout", per_channel=True, convrot=True, convrot_groupsize=256
+            w,
+            "TensorWiseINT8Layout",
+            per_channel=True,
+            convrot=True,
+            convrot_groupsize=256,
         )
 
         dq = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight(
@@ -721,7 +794,11 @@ class TestTensorWiseINT8Layout:
         w = torch.randn(64, 250, device="cuda", dtype=torch.bfloat16)
         with pytest.raises(ValueError, match="not divisible by group_size"):
             QuantizedTensor.from_float(
-                w, "TensorWiseINT8Layout", per_channel=True, convrot=True, convrot_groupsize=256
+                w,
+                "TensorWiseINT8Layout",
+                per_channel=True,
+                convrot=True,
+                convrot_groupsize=256,
             )
 
     def test_convrot_linear_mm_addmm_dispatch(self, seed):
@@ -742,7 +819,11 @@ class TestTensorWiseINT8Layout:
 
         # Active rotation version
         qt_w_rot = QuantizedTensor.from_float(
-            w, "TensorWiseINT8Layout", per_channel=True, convrot=True, convrot_groupsize=group_size
+            w,
+            "TensorWiseINT8Layout",
+            per_channel=True,
+            convrot=True,
+            convrot_groupsize=group_size,
         )
         out_linear_rot = torch.nn.functional.linear(x, qt_w_rot, bias)
 
@@ -752,7 +833,9 @@ class TestTensorWiseINT8Layout:
 
         # Result with and without ConvRot should be extremely close (it is mathematically equivalent under exact math)
         # allowing for expected tiny differences in quantization noise.
-        rel_err_linear = (out_linear_rot.float() - out_linear_normal.float()).abs() / (out_linear_normal.float().abs().max() + 1e-8)
+        rel_err_linear = (out_linear_rot.float() - out_linear_normal.float()).abs() / (
+            out_linear_normal.float().abs().max() + 1e-8
+        )
         assert rel_err_linear.mean().item() < 0.02
 
         # Test mm dispatch through the common linear decomposition shape:
@@ -760,7 +843,11 @@ class TestTensorWiseINT8Layout:
         x_mm = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
         w_mm = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
         qt_w_mm_rot = QuantizedTensor.from_float(
-            w_mm, "TensorWiseINT8Layout", per_channel=True, convrot=True, convrot_groupsize=group_size
+            w_mm,
+            "TensorWiseINT8Layout",
+            per_channel=True,
+            convrot=True,
+            convrot_groupsize=group_size,
         )
         out_mm_rot = torch.mm(x_mm, qt_w_mm_rot.t())
         assert out_mm_rot.shape == (4, 64)
@@ -778,6 +865,9 @@ class TestTensorWiseINT8Layout:
         import comfy_kitchen as ck
         from comfy_kitchen.tensor import QuantizedTensor
 
+        if "triton" not in get_capable_backends("int8_linear", "cuda"):
+            pytest.skip("triton does not support int8_linear on cuda")
+
         group_size = 64
         x = torch.randn(32, 128, device="cuda", dtype=torch.float16)
         w = torch.randn(64, 128, device="cuda", dtype=torch.float16)
@@ -785,29 +875,47 @@ class TestTensorWiseINT8Layout:
 
         # Quantize weight with convrot
         qt_w = QuantizedTensor.from_float(
-            w, "TensorWiseINT8Layout", per_channel=True, convrot=True, convrot_groupsize=group_size
+            w,
+            "TensorWiseINT8Layout",
+            per_channel=True,
+            convrot=True,
+            convrot_groupsize=group_size,
         )
         weight_qdata, weight_scale = qt_w._qdata, qt_w._params.scale
 
         # Run with Eager backend
         with ck.registry.use_backend("eager"):
             out_eager = ck.int8_linear(
-                x, weight_qdata, weight_scale, bias=bias, out_dtype=torch.float16,
-                convrot=True, convrot_groupsize=group_size
+                x,
+                weight_qdata,
+                weight_scale,
+                bias=bias,
+                out_dtype=torch.float16,
+                convrot=True,
+                convrot_groupsize=group_size,
             )
 
         # Run with Triton backend
         with ck.registry.use_backend("triton"):
             out_triton = ck.int8_linear(
-                x, weight_qdata, weight_scale, bias=bias, out_dtype=torch.float16,
-                convrot=True, convrot_groupsize=group_size
+                x,
+                weight_qdata,
+                weight_scale,
+                bias=bias,
+                out_dtype=torch.float16,
+                convrot=True,
+                convrot_groupsize=group_size,
             )
 
         # Triton and Eager outputs must be extremely close
-        assert_values_close(out_triton, out_eager, rtol=1.0e-1, atol=1.0e-1, name="convrot_triton_vs_eager", max_mismatch_ratio=0.02)
-
-
-
+        assert_values_close(
+            out_triton,
+            out_eager,
+            rtol=1.0e-1,
+            atol=1.0e-1,
+            name="convrot_triton_vs_eager",
+            max_mismatch_ratio=0.02,
+        )
 
 
 class TestTensorWisePublicAPI:
@@ -886,6 +994,21 @@ class TestTensorWisePublicAPI:
 
         assert out.shape == (1, 64)
         assert out.dtype == torch.bfloat16
+
+    def test_eager_int8_matmul_float_fallback(self, monkeypatch):
+        from comfy_kitchen.backends.eager import quantization
+
+        a = torch.randint(-128, 128, (4, 16), dtype=torch.int8)
+        b = torch.randint(-128, 128, (16, 8), dtype=torch.int8)
+        expected = a.to(torch.int32) @ b.to(torch.int32)
+        monkeypatch.setattr(
+            quantization, "_requires_float_int8_mm", lambda tensor: True
+        )
+
+        result = quantization._int8_matmul_accumulate(a, b)
+
+        assert result.dtype == torch.int32
+        assert torch.equal(result, expected)
 
     def test_eager_int8_linear_pads_k_to_int8_mm_tile(self, seed, device):
         """Eager int8_linear pads K to int8 matmul's tile size."""

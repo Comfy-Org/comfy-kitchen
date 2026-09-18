@@ -2,6 +2,7 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
+from comfy_kitchen.backends import triton as triton_backend
 from comfy_kitchen.constraints import (
     DivisibleBy,
     ExactDims,
@@ -208,7 +209,9 @@ class TestRegistryConstraintValidation:
     def test_validate_backend_wrong_dtype(self, device):
         """Test validation fails for wrong dtype."""
         kwargs = {
-            "x": torch.randint(0, 10, (10,), dtype=torch.int32, device=device),  # Wrong dtype
+            "x": torch.randint(
+                0, 10, (10,), dtype=torch.int32, device=device
+            ),  # Wrong dtype
             "scale": torch.tensor([1.0], dtype=torch.float32, device=device),
             "output_type": torch.float8_e4m3fn,
         }
@@ -338,6 +341,22 @@ class TestIntegrationWithBackends:
 class TestINT8Constraints:
     """Tests for INT8 specific constraints."""
 
+    def test_triton_int8_linear_rejects_rocm_without_matrix_cores(self, monkeypatch):
+        monkeypatch.setattr(torch.version, "hip", "6.0")
+        monkeypatch.setattr(
+            torch.cuda,
+            "get_device_properties",
+            lambda device: type("Properties", (), {"gcnArchName": "gfx1010:xnack-"})(),
+        )
+        constraints = triton_backend._build_constraints()["int8_linear"]
+
+        result = constraints.call_rules[0](
+            {"x": type("Input", (), {"device": "cuda"})()}
+        )
+
+        assert result.success is False
+        assert "gfx1010" in str(result.failure_reason)
+
     def test_int8_linear_shape_constraint(self, device):
         """Test that int8_linear requires at least 2D input on CUDA backend."""
         if device != "cuda":
@@ -346,7 +365,9 @@ class TestINT8Constraints:
         backends = ck.list_backends()
         cuda_status = backends.get("cuda", {})
         if not cuda_status.get("available", False):
-            pytest.skip(f"CUDA backend is unavailable: {cuda_status.get('unavailable_reason')}")
+            pytest.skip(
+                f"CUDA backend is unavailable: {cuda_status.get('unavailable_reason')}"
+            )
 
         x_1d = torch.randn(32, dtype=torch.float16, device=device)
         weight = torch.randint(-128, 127, (64, 32), dtype=torch.int8, device=device)
@@ -355,7 +376,12 @@ class TestINT8Constraints:
         result = ck.registry.validate_backend_for_call(
             "cuda",
             "int8_linear",
-            {"x": x_1d, "weight": weight, "weight_scale": scale, "out_dtype": torch.float16},
+            {
+                "x": x_1d,
+                "weight": weight,
+                "weight_scale": scale,
+                "out_dtype": torch.float16,
+            },
         )
 
         assert result.success is False

@@ -10,28 +10,35 @@ from comfy_kitchen.backends._modulation import adaln_prep_modulation
 
 @triton.jit
 def _adaln_fwd_kernel(
-    x_ptr, scale_ptr, shift_ptr, y_ptr,
+    x_ptr,
+    scale_ptr,
+    shift_ptr,
+    y_ptr,
     d,
-    scale_group, shift_group,
-    stride_xr, stride_sr, stride_shr, stride_yr,
+    scale_group,
+    shift_group,
+    stride_xr,
+    stride_sr,
+    stride_shr,
+    stride_yr,
     eps,
     block_d: tl.constexpr,
     dtype: tl.constexpr,
     subtract_mean: tl.constexpr,
 ):
     row = tl.program_id(0)
-    x_base  = row * stride_xr
+    x_base = row * stride_xr
     # scale/shift are passed in distinct-row form and broadcast over contiguous
     # blocks of `*_group` output rows, mirroring the CUDA kernel (row / group).
-    s_base  = (row // scale_group) * stride_sr
+    s_base = (row // scale_group) * stride_sr
     sh_base = (row // shift_group) * stride_shr
-    y_base  = row * stride_yr
+    y_base = row * stride_yr
 
     # Pass 1: mean + variance in one pass (accumulate sum and sum-of-squares),
     # so a single reduction yields both — matching the fused CUDA kernel.
     # RMSNorm (subtract_mean=False) pins the mean to 0, so the normalize pass
     # below is shared: it is LayerNorm with mean == 0.
-    sum_acc   = tl.zeros([block_d], dtype=tl.float32)
+    sum_acc = tl.zeros([block_d], dtype=tl.float32)
     sumsq_acc = tl.zeros([block_d], dtype=tl.float32)
     for off in range(0, d, block_d):
         cols = off + tl.arange(0, block_d)
@@ -44,7 +51,7 @@ def _adaln_fwd_kernel(
         mean = tl.sum(sum_acc) / d
         # var = E[x^2] - mean^2, clamped against tiny negative rounding for
         # (near-)constant rows before the rsqrt.
-        var  = tl.sum(sumsq_acc) / d - mean * mean
+        var = tl.sum(sumsq_acc) / d - mean * mean
         rstd = tl.rsqrt(tl.maximum(var, 0.0) + eps)
     else:
         mean = 0.0
@@ -54,15 +61,34 @@ def _adaln_fwd_kernel(
     for off in range(0, d, block_d):
         cols = off + tl.arange(0, block_d)
         mask = cols < d
-        x  = tl.load(x_ptr + x_base + cols, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_ptr + x_base + cols, mask=mask, other=0.0).to(tl.float32)
         sc = tl.load(scale_ptr + s_base + cols, mask=mask, other=0.0).to(tl.float32)
         sh = tl.load(shift_ptr + sh_base + cols, mask=mask, other=0.0).to(tl.float32)
         out = (x - mean) * rstd * (1.0 + sc) + sh
         tl.store(y_ptr + y_base + cols, out.to(dtype), mask=mask)
 
 
-def _adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float,
-           subtract_mean: bool) -> torch.Tensor:
+def _adaln(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float,
+    subtract_mean: bool,
+) -> torch.Tensor:
+    if getattr(torch.version, "hip", None):
+        try:
+            arch = torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0]
+        except (AttributeError, RuntimeError):
+            arch = None
+        if arch is not None and arch.startswith("gfx10"):
+            x_float = x.float()
+            normalized = (
+                torch.nn.functional.layer_norm(x_float, (x.shape[-1],), eps=eps)
+                if subtract_mean
+                else torch.nn.functional.rms_norm(x_float, (x.shape[-1],), eps=eps)
+            )
+            return (normalized * (1 + scale.float()) + shift.float()).to(x.dtype)
+
     orig_shape = x.shape
     d = x.shape[-1]
     n = x.numel() // d
@@ -87,10 +113,17 @@ def _adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float
     dtype = dtype_map.get(x.dtype, tl.bfloat16)
 
     _adaln_fwd_kernel[(n,)](
-        x_flat, scale_flat, shift_flat, out,
+        x_flat,
+        scale_flat,
+        shift_flat,
+        out,
         d,
-        scale_group, shift_group,
-        x_flat.stride(0), scale_flat.stride(0), shift_flat.stride(0), out.stride(0),
+        scale_group,
+        shift_group,
+        x_flat.stride(0),
+        scale_flat.stride(0),
+        shift_flat.stride(0),
+        out.stride(0),
         eps,
         block_d=block_d,
         dtype=dtype,
@@ -99,11 +132,15 @@ def _adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float
     return out.reshape(orig_shape)
 
 
-def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def adaln(
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
     """layernorm(x) * (1 + scale) + shift"""
     return _adaln(x, scale, shift, eps, subtract_mean=True)
 
 
-def rms_adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def rms_adaln(
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
     """rmsnorm(x) * (1 + scale) + shift"""
     return _adaln(x, scale, shift, eps, subtract_mean=False)
