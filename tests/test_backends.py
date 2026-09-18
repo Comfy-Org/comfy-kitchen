@@ -19,6 +19,7 @@ class TestBackendSystem:
         assert "eager" in backends
         assert "cuda" in backends
         assert "triton" in backends
+        assert "ascend" in backends
 
         # Eager backend should always be available
         assert backends["eager"]["available"] is True
@@ -46,6 +47,7 @@ class TestBackendSystem:
     def test_int8_capabilities_listed(self):
         """Test that int8 operations are listed in backend capabilities."""
         import comfy_kitchen as ck
+
         backends = ck.list_backends()
 
         # Check eager
@@ -59,6 +61,24 @@ class TestBackendSystem:
         if backends["cuda"]["available"]:
             cuda_caps = backends["cuda"]["capabilities"]
             assert "int8_linear" in cuda_caps
+
+        if backends["ascend"]["available"]:
+            import torch_npu
+
+            ascend_caps = backends["ascend"]["capabilities"]
+            expected_ascend_caps = [
+                "dequantize_int8_simple",
+                "dequantize_int8_simple_dtype",
+                "quantize_int8_rowwise",
+                "quantize_int8_tensorwise",
+            ]
+            if hasattr(torch_npu, "npu_quant_matmul"):
+                expected_ascend_caps.insert(2, "int8_linear")
+            if hasattr(torch_npu, "npu_rotate_quant"):
+                expected_ascend_caps.insert(-2, "quantize_and_rotate_rowwise")
+            if hasattr(torch_npu, "npu_quant_matmul"):
+                expected_ascend_caps.insert(0, "convrot_w4a4_linear")
+            assert ascend_caps == expected_ascend_caps
 
     def test_backend_context_manager_override(self, small_tensor):
         """Test that use_backend context manager correctly overrides backend selection."""
@@ -78,8 +98,10 @@ class TestBackendExceptions:
 
     def test_backend_not_found_error_unregistered(self):
         """Test BackendNotFoundError when requesting unregistered backend."""
-        with pytest.raises(BackendNotFoundError, match="not_a_real_backend"), \
-             ck.use_backend("not_a_real_backend"):
+        with (
+            pytest.raises(BackendNotFoundError, match="not_a_real_backend"),
+            ck.use_backend("not_a_real_backend"),
+        ):
             pass
 
     def test_backend_not_found_error_disabled(self):
@@ -87,8 +109,7 @@ class TestBackendExceptions:
         # Disable eager backend temporarily
         ck.disable_backend("eager")
         try:
-            with pytest.raises(BackendNotFoundError, match="disabled"), \
-                 ck.use_backend("eager"):
+            with pytest.raises(BackendNotFoundError, match="disabled"), ck.use_backend("eager"):
                 pass
         finally:
             # Re-enable for other tests
