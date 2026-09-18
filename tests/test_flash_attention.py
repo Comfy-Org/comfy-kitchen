@@ -6,7 +6,7 @@ import comfy_kitchen.flash_attention as flash_attention_module
 
 requires_flash_decode = pytest.mark.skipif(
     not ck.flash_attention_decode_is_available(),
-    reason="requires the CUDA extension on SM80 or newer",
+    reason="requires a supported CUDA or HIP flash decode kernel",
 )
 
 # The HIP binding takes plain ndarrays rather than device-typed ones, so it has
@@ -16,19 +16,22 @@ requires_hip_flash_decode = pytest.mark.skipif(
     reason="requires the HIP flash decode kernel",
 )
 
+HEAD_DIMS = [128, 256]
 
-def _decode_operands(batch=2, capacity=256, kv_heads=2, groups=4):
+
+def _decode_operands(batch=2, capacity=256, kv_heads=2, groups=4, head_dim=128):
     heads = kv_heads * groups
-    q = torch.randn(batch, 1, heads, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch, capacity, kv_heads, 128, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(batch, 1, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, capacity, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
     lengths = torch.full((batch,), capacity, device="cuda", dtype=torch.int32)
     return q, k, v, lengths
 
 
 @requires_hip_flash_decode
-def test_flash_attention_decode_rejects_host_lengths():
-    q, k, v, lengths = _decode_operands()
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+def test_flash_attention_decode_rejects_host_lengths(head_dim):
+    q, k, v, lengths = _decode_operands(head_dim=head_dim)
     with pytest.raises(RuntimeError, match="must be ROCm device memory"):
         ck.flash_attention_decode(q, k, v, lengths.cpu())
     # The rejection must leave the context usable.
@@ -36,7 +39,8 @@ def test_flash_attention_decode_rejects_host_lengths():
 
 
 @requires_hip_flash_decode
-def test_flash_attention_decode_rejects_pinned_host_memory():
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+def test_flash_attention_decode_rejects_pinned_host_memory(head_dim):
     # Pinned host memory reports kDLCUDAHost rather than kDLCPU, so a check for
     # "not the CPU device" would wave these host pointers through. The launch
     # goes through _C directly because the Python wrapper's stream lookup
@@ -45,11 +49,11 @@ def test_flash_attention_decode_rejects_pinned_host_memory():
 
     batch, capacity, kv_heads, groups = 2, 128, 2, 4
     pinned = [
-        torch.randn(batch * groups, kv_heads, 128, dtype=torch.bfloat16).pin_memory(),
-        torch.randn(batch, capacity, kv_heads, 128, dtype=torch.bfloat16).pin_memory(),
-        torch.randn(batch, capacity, kv_heads, 128, dtype=torch.bfloat16).pin_memory(),
+        torch.randn(batch * groups, kv_heads, head_dim, dtype=torch.bfloat16).pin_memory(),
+        torch.randn(batch, capacity, kv_heads, head_dim, dtype=torch.bfloat16).pin_memory(),
+        torch.randn(batch, capacity, kv_heads, head_dim, dtype=torch.bfloat16).pin_memory(),
         torch.full((batch,), capacity, dtype=torch.int32).pin_memory(),
-        torch.empty(batch * groups, kv_heads, 128, dtype=torch.bfloat16).pin_memory(),
+        torch.empty(batch * groups, kv_heads, head_dim, dtype=torch.bfloat16).pin_memory(),
         torch.empty(batch * kv_heads * groups, dtype=torch.float32).pin_memory(),
     ]
     assert pinned[0].__dlpack_device__()[0] != 1
@@ -60,10 +64,11 @@ def test_flash_attention_decode_rejects_pinned_host_memory():
 
 
 @requires_hip_flash_decode
-def test_flash_attention_decode_rejects_strided_lengths():
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+def test_flash_attention_decode_rejects_strided_lengths(head_dim):
     # Read linearly off the base pointer, so a strided view of the right size
     # would silently be taken as packed.
-    q, k, v, lengths = _decode_operands()
+    q, k, v, lengths = _decode_operands(head_dim=head_dim)
     strided = torch.stack([lengths, torch.zeros_like(lengths)], dim=1).flatten()[::2]
     assert not strided.is_contiguous() and strided.numel() == lengths.numel()
     with pytest.raises(RuntimeError, match="must be contiguous"):
@@ -71,14 +76,25 @@ def test_flash_attention_decode_rejects_strided_lengths():
 
 
 @requires_hip_flash_decode
-def test_flash_attention_decode_rejects_misaligned_operand():
-    q, k, v, lengths = _decode_operands()
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+def test_flash_attention_decode_rejects_misaligned_operand(head_dim):
+    q, k, v, lengths = _decode_operands(head_dim=head_dim)
     elements = k.numel()
     storage = torch.randn(elements + 8, device="cuda", dtype=torch.bfloat16)
     misaligned = storage[1 : 1 + elements].view_as(k)
     assert misaligned.is_contiguous() and misaligned.data_ptr() % 8
     with pytest.raises(RuntimeError, match="8-byte aligned"):
         ck.flash_attention_decode(q, misaligned, v, lengths)
+
+
+@requires_hip_flash_decode
+def test_flash_attention_decode_256_with_eight_byte_alignment():
+    q, k, v, lengths = _decode_operands(head_dim=256)
+    storage = torch.randn(k.numel() + 4, device="cuda", dtype=torch.bfloat16)
+    k = storage[4:].view_as(k)
+    assert k.data_ptr() % 16 == 8
+    actual = ck.flash_attention_decode(q, k, v, lengths)
+    torch.testing.assert_close(actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
 
 
 
@@ -149,26 +165,34 @@ def test_flash_attention_decode_hip_gate_follows_bf16_arch(monkeypatch, has_wmma
 
 
 @requires_flash_decode
-def test_flash_attention_decode():
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize(("heads", "kv_heads"), [(4, 4), (8, 2), (24, 4), (32, 4)])
+@pytest.mark.parametrize("capacity", [257, 32768])
+@pytest.mark.parametrize("transposed_cache", [False, True])
+def test_flash_attention_decode(head_dim, heads, kv_heads, capacity, transposed_cache):
     torch.manual_seed(0)
-    q = torch.randn(3, 1, 8, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(3, 257, 2, 128, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(3, 1, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(3, capacity, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    lengths = torch.tensor([1, 73, 257], device="cuda", dtype=torch.int32)
+    if transposed_cache:
+        k = k.transpose(1, 2).contiguous().transpose(1, 2)
+        v = v.transpose(1, 2).contiguous().transpose(1, 2)
+    lengths = torch.tensor([1, 73, capacity], device="cuda", dtype=torch.int32)
     actual = ck.flash_attention_decode(q, k, v, lengths)
     torch.testing.assert_close(actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
 
 
 @requires_flash_decode
-@pytest.mark.parametrize("num_splits", [1, 2, 5, 32])
-def test_flash_attention_decode_split_counts(monkeypatch, num_splits):
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("num_splits", [1, 2, 5, 8, 16, 32])
+def test_flash_attention_decode_split_counts(monkeypatch, num_splits, head_dim):
     # num_splits comes from a heuristic over multi_processor_count, so on a wide
     # enough GPU it returns 1 and the split accumulators, the combine pass and
     # its row decomposition never run. Pin it instead of hoping.
     monkeypatch.setattr(flash_attention_module, "_num_splits", lambda *_, **__: num_splits)
     torch.manual_seed(0)
-    q = torch.randn(3, 1, 8, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(3, 257, 2, 128, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(3, 1, 24, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(3, 257, 4, head_dim, device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
     lengths = torch.tensor([1, 73, 257], device="cuda", dtype=torch.int32)
     actual = ck.flash_attention_decode(q, k, v, lengths)
@@ -176,9 +200,10 @@ def test_flash_attention_decode_split_counts(monkeypatch, num_splits):
 
 
 @requires_flash_decode
-def test_flash_attention_decode_cuda_graph_dynamic_lengths():
-    q = torch.randn(2, 1, 8, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(2, 512, 2, 128, device="cuda", dtype=torch.bfloat16)
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+def test_flash_attention_decode_cuda_graph_dynamic_lengths(head_dim):
+    q = torch.randn(2, 1, 24, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(2, 512, 4, head_dim, device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
     lengths = torch.tensor([128, 512], device="cuda", dtype=torch.int32)
     stream = torch.cuda.Stream()
@@ -189,6 +214,21 @@ def test_flash_attention_decode_cuda_graph_dynamic_lengths():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         actual = ck.flash_attention_decode(q, k, v, lengths)
-    lengths.copy_(torch.tensor([17, 333], device="cuda", dtype=torch.int32))
-    graph.replay()
-    torch.testing.assert_close(actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
+    for current_lengths in [[17, 333], [511, 1], [129, 257]]:
+        lengths.copy_(torch.tensor(current_lengths, device="cuda", dtype=torch.int32))
+        graph.replay()
+        torch.testing.assert_close(actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
+
+
+@requires_flash_decode
+@pytest.mark.parametrize(
+    ("q_dim", "k_dim", "v_dim"),
+    [(64, 64, 64), (192, 192, 192), (256, 128, 128), (128, 256, 256), (256, 256, 128)],
+)
+def test_flash_attention_decode_rejects_invalid_dimensions(q_dim, k_dim, v_dim):
+    q = torch.randn(1, 1, 24, q_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 257, 4, k_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 257, 4, v_dim, device="cuda", dtype=torch.bfloat16)
+    lengths = torch.tensor([257], device="cuda", dtype=torch.int32)
+    with pytest.raises(RuntimeError, match=r"dimensions|k/v shape mismatch"):
+        ck.flash_attention_decode(q, k, v, lengths)

@@ -1580,7 +1580,6 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
                             nb::ndarray<> softmax_lse, nb::ndarray<> softmax_lse_accum,
                             nb::ndarray<> output_accum, int num_splits, uintptr_t stream_ptr) {
     constexpr const char* kFn = "flash_attention_decode";
-    constexpr int kHeadDim = 128;
     constexpr int kElemsPerLoad = 4;
     if (q.ndim() != 3 || k.ndim() != 4 || v.ndim() != 4 || output.ndim() != 3 ||
         kv_lengths.ndim() != 1) {
@@ -1593,18 +1592,19 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
     require_positive(kv_capacity, kFn, "kv_capacity");
     require_positive(heads, kFn, "heads");
     const int query_length = static_cast<int>(q.shape(0)) / batch;
+    const int head_dim = static_cast<int>(q.shape(2));
     require_positive(query_length, kFn, "query_length");
     if (static_cast<int64_t>(q.shape(0)) != static_cast<int64_t>(batch) * query_length ||
-        static_cast<int>(q.shape(1)) != heads || static_cast<int>(q.shape(2)) != kHeadDim ||
-        static_cast<int>(k.shape(3)) != kHeadDim) {
+        static_cast<int>(q.shape(1)) != heads || (head_dim != 128 && head_dim != 256) ||
+        static_cast<int>(k.shape(3)) != head_dim) {
         throw std::runtime_error(std::string(kFn) + ": invalid q/k dimensions");
     }
     if (static_cast<int>(v.shape(0)) != batch || static_cast<int>(v.shape(1)) != kv_capacity ||
-        static_cast<int>(v.shape(2)) != heads || static_cast<int>(v.shape(3)) != kHeadDim) {
+        static_cast<int>(v.shape(2)) != heads || static_cast<int>(v.shape(3)) != head_dim) {
         throw std::runtime_error(std::string(kFn) + ": k/v shape mismatch");
     }
     if (output.shape(0) != q.shape(0) || static_cast<int>(output.shape(1)) != heads ||
-        static_cast<int>(output.shape(2)) != kHeadDim ||
+        static_cast<int>(output.shape(2)) != head_dim ||
         kv_lengths.size() != static_cast<size_t>(batch)) {
         throw std::runtime_error(std::string(kFn) + ": output or length shape mismatch");
     }
@@ -1622,7 +1622,7 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
     if (softmax_lse.size() != lse_size || num_splits < 1 || num_splits > 32 ||
         (num_splits > 1 &&
          (softmax_lse_accum.size() != lse_size * num_splits ||
-          output_accum.size() != lse_size * kHeadDim * num_splits))) {
+          output_accum.size() != lse_size * head_dim * num_splits))) {
         throw std::runtime_error(std::string(kFn) + ": invalid split workspace");
     }
     require_dtype(softmax_lse, 0, 0, kFn, "softmax_lse");
@@ -1691,7 +1691,7 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
         static_cast<float*>(softmax_lse.data()),
         num_splits > 1 ? static_cast<float*>(output_accum.data()) : nullptr,
         num_splits > 1 ? static_cast<float*>(softmax_lse_accum.data()) : nullptr, batch,
-        query_length, heads, kv_capacity, num_splits, q.stride(0) * query_length, q.stride(0),
+        query_length, heads, head_dim, kv_capacity, num_splits, q.stride(0) * query_length, q.stride(0),
         q.stride(1), k.stride(0), k.stride(1), k.stride(2),
         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();

@@ -2208,7 +2208,7 @@ extern "C" {
     void launch_flash_decode(
         const void* q, const void* k, const void* v, const int* kv_lengths,
         void* output, float* softmax_lse, float* softmax_lse_accum, float* output_accum,
-        int batch, int query_length, int heads, int kv_capacity, int num_splits,
+        int batch, int query_length, int heads, int head_dim, int kv_capacity, int num_splits,
         int64_t q_batch_stride, int64_t q_row_stride, int64_t q_head_stride,
         int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
         cudaStream_t stream);
@@ -3677,20 +3677,21 @@ void flash_attention_decode(
     const int kv_capacity = k.shape(1);
     const int heads = k.shape(2);
     const int query_length = q.shape(0) / batch;
-    if (batch <= 0 || kv_capacity <= 0 || heads <= 0 || query_length <= 0 || q.shape(0) != batch * query_length || q.shape(1) != heads || q.shape(2) != 128) {
+    const int head_dim = q.shape(2);
+    if (batch <= 0 || kv_capacity <= 0 || heads <= 0 || query_length <= 0 || q.shape(0) != batch * query_length || q.shape(1) != heads || (head_dim != 128 && head_dim != 256)) {
         throw std::runtime_error("Invalid Flash Attention decode dimensions");
     }
-    if (v.shape(0) != batch || v.shape(1) != kv_capacity || v.shape(2) != heads || v.shape(3) != 128 || k.shape(3) != 128) {
+    if (v.shape(0) != batch || v.shape(1) != kv_capacity || v.shape(2) != heads || v.shape(3) != head_dim || k.shape(3) != head_dim) {
         throw std::runtime_error("Flash Attention k/v shape mismatch");
     }
-    if (output.shape(0) != q.shape(0) || output.shape(1) != heads || output.shape(2) != 128 || kv_lengths.size() != static_cast<size_t>(batch)) {
+    if (output.shape(0) != q.shape(0) || output.shape(1) != heads || output.shape(2) != head_dim || kv_lengths.size() != static_cast<size_t>(batch)) {
         throw std::runtime_error("Flash Attention output or length shape mismatch");
     }
     if (map_dtype_to_code(q.dtype()) != 2 || map_dtype_to_code(k.dtype()) != 2 || map_dtype_to_code(v.dtype()) != 2 || map_dtype_to_code(output.dtype()) != 2) {
         throw std::runtime_error("Flash Attention tensors must have bfloat16 dtype");
     }
     const size_t lse_size = static_cast<size_t>(batch) * heads * query_length;
-    if (softmax_lse.size() != lse_size || num_splits < 1 || num_splits > 32 || (num_splits > 1 && (softmax_lse_accum.size() != lse_size * num_splits || output_accum.size() != lse_size * 128 * num_splits))) {
+    if (softmax_lse.size() != lse_size || num_splits < 1 || num_splits > 32 || (num_splits > 1 && (softmax_lse_accum.size() != lse_size * num_splits || output_accum.size() != lse_size * head_dim * num_splits))) {
         throw std::runtime_error("Invalid Flash Attention split workspace");
     }
     if (k.stride(0) != v.stride(0) || k.stride(1) != v.stride(1) || k.stride(2) != v.stride(2) || k.stride(3) != 1 || v.stride(3) != 1 || q.stride(2) != 1 || output.stride(2) != 1) {
@@ -3701,7 +3702,7 @@ void flash_attention_decode(
         q.data(), k.data(), v.data(), kv_lengths.data(), output.data(), softmax_lse.data(),
         num_splits > 1 ? softmax_lse_accum.data() : nullptr,
         num_splits > 1 ? output_accum.data() : nullptr,
-        batch, query_length, heads, kv_capacity, num_splits,
+        batch, query_length, heads, head_dim, kv_capacity, num_splits,
         q.stride(0) * query_length, q.stride(0), q.stride(1),
         k.stride(0), k.stride(1), k.stride(2), reinterpret_cast<cudaStream_t>(stream_ptr));
 }

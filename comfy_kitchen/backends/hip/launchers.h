@@ -22,11 +22,11 @@ void launch_na3d_kernel(const void* q, const void* k, const void* v, void* out, 
 
 // BF16 decode attention over a fixed-capacity KV cache. query_length is the GQA
 // group count folded into the query sequence dimension by the Python layer, and
-// head_dim is fixed at 128. out_accum and lse_accum are read only when
+// head_dim is 128 or 256. out_accum and lse_accum are read only when
 // num_splits > 1. See ops/flash_decode.hip.
 void launch_flash_decode(const void* q, const void* k, const void* v, const int* kv_lengths,
                          void* out, float* softmax_lse, float* out_accum, float* lse_accum,
-                         int batch, int query_length, int heads, int kv_capacity, int num_splits,
+                         int batch, int query_length, int heads, int head_dim, int kv_capacity, int num_splits,
                          int64_t q_batch_stride, int64_t q_row_stride, int64_t q_head_stride,
                          int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
                          hipStream_t stream);
