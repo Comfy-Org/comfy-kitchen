@@ -865,6 +865,9 @@ class TestTensorWiseINT8Layout:
         import comfy_kitchen as ck
         from comfy_kitchen.tensor import QuantizedTensor
 
+        if "triton" not in get_capable_backends("int8_linear", "cuda"):
+            pytest.skip("triton does not support int8_linear on cuda")
+
         group_size = 64
         x = torch.randn(32, 128, device="cuda", dtype=torch.float16)
         w = torch.randn(64, 128, device="cuda", dtype=torch.float16)

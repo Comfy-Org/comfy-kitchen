@@ -387,6 +387,17 @@ def _register():
         )
         return
 
+    if getattr(torch.version, "hip", None) and has_cuda:
+        architectures = {
+            torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+            for device in range(torch.cuda.device_count())
+        }
+        if "gfx90c" in architectures:
+            registry.mark_unavailable(
+                "triton", "Triton is unsupported on ROCm architecture gfx90c"
+            )
+            return
+
     registry.register(
         name="triton",
         module=__import__(__name__, fromlist=__all__),

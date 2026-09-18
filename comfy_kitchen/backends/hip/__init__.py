@@ -1972,7 +1972,7 @@ def _rope(xq, xk, freqs_cis, split_half, inplace=False):
         split_half
         and freqs_cis.dtype != torch.float32
         and arch is not None
-        and arch.startswith("gfx10")
+        and (arch == "gfx90c" or arch.startswith("gfx10"))
     ):
         xq_result = _eager_rope.apply_rope_split_half1(xq, freqs_cis)
         xk_result = (
