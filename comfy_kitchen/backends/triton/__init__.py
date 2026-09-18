@@ -23,6 +23,7 @@ __all__ = [
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
+    "stochastic_rounding_fp8",
     "int8_linear",
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
@@ -62,6 +63,7 @@ try:
         quantize_mxfp8,
         quantize_nvfp4,
         quantize_per_tensor_fp8,
+        stochastic_rounding_fp8,
     )
     from .quantization import (
         triton_quantize_and_rotate_rowwise as _triton_quantize_and_rotate_rowwise,
@@ -167,6 +169,17 @@ def _build_constraints() -> dict:
                 "output_type": ParamConstraint(dtypes=standard_floats),
             },
             default_devices=triton_devices,
+        ),
+        "stochastic_rounding_fp8": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "rng": ParamConstraint(dtypes=frozenset({torch.uint8})),
+                "output_type": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn, torch.float8_e5m2}),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 9),  # Native FP8 conversion requires Ada or newer.
         ),
         "quantize_nvfp4": FunctionConstraints(
             params={
