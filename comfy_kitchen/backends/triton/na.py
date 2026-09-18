@@ -19,14 +19,30 @@ _NEG_INF = tl.constexpr(-3.0e38)
 
 @triton.jit
 def _na3d_kernel(
-    q_ptr, k_ptr, v_ptr, out_ptr,
-    t_size, h_size, w_size, num_heads,
-    s_b, s_t, s_h, s_w, s_n,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    out_ptr,
+    t_size,
+    h_size,
+    w_size,
+    num_heads,
+    s_b,
+    s_t,
+    s_h,
+    s_w,
+    s_n,
     scale,
-    kt: tl.constexpr, kh: tl.constexpr, kw: tl.constexpr,
-    causal_t: tl.constexpr, causal_h: tl.constexpr, causal_w: tl.constexpr,
-    hd: tl.constexpr, hd_pad: tl.constexpr,
-    block_q: tl.constexpr, block_k: tl.constexpr,
+    kt: tl.constexpr,
+    kh: tl.constexpr,
+    kw: tl.constexpr,
+    causal_t: tl.constexpr,
+    causal_h: tl.constexpr,
+    causal_w: tl.constexpr,
+    hd: tl.constexpr,
+    hd_pad: tl.constexpr,
+    block_q: tl.constexpr,
+    block_k: tl.constexpr,
     is_fp32: tl.constexpr,
 ):
     pid_w = tl.program_id(0)
@@ -42,7 +58,9 @@ def _na3d_kernel(
     d_off = tl.arange(0, hd_pad)
     d_mask = d_off < hd
 
-    q_ptrs = q_ptr + base + t_q * s_t + h_q * s_h + w_off[:, None] * s_w + d_off[None, :]
+    q_ptrs = (
+        q_ptr + base + t_q * s_t + h_q * s_h + w_off[:, None] * s_w + d_off[None, :]
+    )
     q_blk = tl.load(q_ptrs, mask=w_valid[:, None] & d_mask[None, :], other=0.0)
 
     # Scalar T/H windows for the whole block.
@@ -93,7 +111,11 @@ def _na3d_kernel(
                     s = tl.dot(q_blk, tl.trans(k_blk), input_precision="ieee") * scale
                 else:
                     s = tl.dot(q_blk, tl.trans(k_blk)) * scale
-                vis = (wk[None, :] >= w_start[:, None]) & (wk[None, :] < w_end[:, None]) & kmask[None, :]
+                vis = (
+                    (wk[None, :] >= w_start[:, None])
+                    & (wk[None, :] < w_end[:, None])
+                    & kmask[None, :]
+                )
                 s = tl.where(vis, s, _NEG_INF)
                 # No fully-masked-row guard: such a row would hold m_i at _NEG_INF
                 # and give p = exp(0) = 1. Safe only because block_k >= block_q.
@@ -103,14 +125,22 @@ def _na3d_kernel(
                 l_i = l_i * alpha + tl.sum(p, 1)
                 v_blk = tl.load(v_ptr + kv_ptrs, mask=kv_mask, other=0.0)
                 if is_fp32:
-                    acc = acc * alpha[:, None] + tl.dot(p, v_blk, input_precision="ieee")
+                    acc = acc * alpha[:, None] + tl.dot(
+                        p, v_blk, input_precision="ieee"
+                    )
                 else:
                     acc = acc * alpha[:, None] + tl.dot(p.to(v_blk.dtype), v_blk)
                 m_i = m_new
 
     out = acc / tl.maximum(l_i, 1e-30)[:, None]
-    out_ptrs = out_ptr + base + t_q * s_t + h_q * s_h + w_off[:, None] * s_w + d_off[None, :]
-    tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty), mask=w_valid[:, None] & d_mask[None, :])
+    out_ptrs = (
+        out_ptr + base + t_q * s_t + h_q * s_h + w_off[:, None] * s_w + d_off[None, :]
+    )
+    tl.store(
+        out_ptrs,
+        out.to(out_ptr.dtype.element_ty),
+        mask=w_valid[:, None] & d_mask[None, :],
+    )
 
 
 def na3d(
@@ -122,11 +152,24 @@ def na3d(
     scale: float | None = None,
 ) -> torch.Tensor:
     """3D neighborhood attention over ``(B, t_size, h_size, w_size, num_heads, HD)`` tensors."""
+    if getattr(torch.version, "hip", None):
+        try:
+            arch = torch.cuda.get_device_properties(q.device).gcnArchName.split(":")[0]
+        except (AttributeError, RuntimeError):
+            arch = None
+        if arch is not None and arch.startswith("gfx10"):
+            from comfy_kitchen.backends.eager.na import na3d as eager_na3d
+
+            return eager_na3d(q, k, v, kernel_size, is_causal, scale)
+
     batch, t, h, w, nh, hd = q.shape
     causal = [False, False, False] if is_causal is None else list(is_causal)
-    kt, kh, kw = (k_ if c else min(k_, d) for k_, c, d in zip(kernel_size, causal, (t, h, w), strict=True))
+    kt, kh, kw = (
+        k_ if c else min(k_, d)
+        for k_, c, d in zip(kernel_size, causal, (t, h, w), strict=True)
+    )
     if scale is None:
-        scale = hd ** -0.5
+        scale = hd**-0.5
 
     q = q.contiguous()
     k = k.contiguous()
@@ -141,14 +184,30 @@ def na3d(
 
     grid = (triton.cdiv(w, block_q), t * h, batch * nh)
     _na3d_kernel[grid](
-        q, k, v, out,
-        t, h, w, nh,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3), q.stride(4),
+        q,
+        k,
+        v,
+        out,
+        t,
+        h,
+        w,
+        nh,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        q.stride(4),
         scale,
-        kt=kt, kh=kh, kw=kw,
-        causal_t=causal[0], causal_h=causal[1], causal_w=causal[2],
-        hd=hd, hd_pad=hd_p,
-        block_q=block_q, block_k=block_k,
+        kt=kt,
+        kh=kh,
+        kw=kw,
+        causal_t=causal[0],
+        causal_h=causal[1],
+        causal_w=causal[2],
+        hd=hd,
+        hd_pad=hd_p,
+        block_q=block_q,
+        block_k=block_k,
         is_fp32=q.dtype == torch.float32,
         num_warps=4,
     )

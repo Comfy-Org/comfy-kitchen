@@ -96,12 +96,15 @@ except ImportError as e:
 
 
 if _TRITON_AVAILABLE:
+
     def quantize_int8_rowwise(
         x: torch.Tensor,
         stochastic_rounding: int | None = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if stochastic_rounding is not None and stochastic_rounding > 0:
-            return _eager_quantize_int8_rowwise(x, stochastic_rounding=stochastic_rounding)
+            return _eager_quantize_int8_rowwise(
+                x, stochastic_rounding=stochastic_rounding
+            )
         return _triton_quantize_int8_rowwise(x)
 
     def quantize_and_rotate_rowwise(
@@ -124,7 +127,25 @@ def _build_constraints() -> dict:
             return common
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
-            return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+            return ValidationResult.fail(
+                "q", "head_dim > 128 not supported by triton na3d"
+            )
+        return ValidationResult.ok()
+
+    def _int8_linear_call_rule(kwargs):
+        x = kwargs.get("x")
+        if x is None or not getattr(torch.version, "hip", None):
+            return ValidationResult.ok()
+        try:
+            arch = torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0]
+        except (AttributeError, RuntimeError):
+            return ValidationResult.fail(
+                "__hardware__", "could not determine ROCm GPU architecture"
+            )
+        if arch == "gfx90c" or arch.startswith("gfx10"):
+            return ValidationResult.fail(
+                "__hardware__", f"Triton INT8 dot is unsupported on {arch}"
+            )
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -248,15 +269,27 @@ def _build_constraints() -> dict:
             },
             default_devices=triton_devices,
             min_compute_capability=(8, 0),  # Required for Triton INT8 dot
+            call_rules=(_int8_linear_call_rule,),
         ),
         "w4a8_int8_linear": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
-                "qdata": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
-                "s_rel": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn, torch.float32}), shape_rules=(ExactDims(2),)),
-                "s_channel": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)),
-                "codebook": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)),
-                "correction": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+                "qdata": ParamConstraint(
+                    dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)
+                ),
+                "s_rel": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn, torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "s_channel": ParamConstraint(
+                    dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)
+                ),
+                "codebook": ParamConstraint(
+                    dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)
+                ),
+                "correction": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(2),)
+                ),
                 "bias": ParamConstraint(dtypes=standard_floats),
                 "group_size": ParamConstraint(dtypes=frozenset({int})),
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
@@ -349,7 +382,9 @@ def _register():
     has_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
 
     if not has_cuda and not has_xpu:
-        registry.mark_unavailable("triton", "Neither CUDA nor XPU available on this system")
+        registry.mark_unavailable(
+            "triton", "Neither CUDA nor XPU available on this system"
+        )
         return
 
     registry.register(

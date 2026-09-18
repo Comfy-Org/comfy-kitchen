@@ -1,4 +1,5 @@
 """Base classes for quantized tensors with typed layout parameters."""
+
 from __future__ import annotations
 
 import contextlib
@@ -27,15 +28,17 @@ def get_layout_class(name: str):
 
 # ==================== Capability Utilities ====================
 
+
 @lru_cache(maxsize=1)
 def get_cuda_capability() -> tuple[int, int] | None:
     """Get CUDA compute capability (SM version), cached."""
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or getattr(torch.version, "hip", None):
         return None
     return torch.cuda.get_device_capability()
 
 
 # ==================== Base Params Dataclass ====================
+
 
 @dataclass(frozen=True)
 class BaseLayoutParams:
@@ -44,6 +47,7 @@ class BaseLayoutParams:
     Subclasses should define additional fields and override _tensor_fields()
     if they have additional tensor fields beyond 'scale'.
     """
+
     scale: torch.Tensor
     orig_dtype: torch.dtype
     orig_shape: tuple[int, ...]
@@ -113,7 +117,9 @@ class QuantizedLayout(ABC):
 
     @classmethod
     @abstractmethod
-    def state_dict_tensors(cls, qdata: torch.Tensor, params: Any) -> dict[str, torch.Tensor]:
+    def state_dict_tensors(
+        cls, qdata: torch.Tensor, params: Any
+    ) -> dict[str, torch.Tensor]:
         raise NotImplementedError
 
     @classmethod
@@ -275,7 +281,9 @@ class QuantizedTensor(torch.Tensor):
     def dequantize(self) -> torch.Tensor:
         # Ensure qdata is contiguous - backends may not handle non-contiguous views
         # (e.g., after transpose/view operations)
-        qdata = self._qdata.contiguous() if not self._qdata.is_contiguous() else self._qdata
+        qdata = (
+            self._qdata.contiguous() if not self._qdata.is_contiguous() else self._qdata
+        )
 
         # Check if this is a logically transposed tensor (e.g., NVFP4 with deferred transpose)
         is_transposed = getattr(self._params, "transposed", False)
@@ -362,7 +370,9 @@ class QuantizedTensor(torch.Tensor):
                     return op_handlers[parent_cls](qt, args, kwargs)
 
         # Step 3: Fallback to dequantization
-        logger.debug(f"Unhandled op {func} for {layout_cls.__name__ if layout_cls else 'unknown'}, dequantizing")
+        logger.debug(
+            f"Unhandled op {func} for {layout_cls.__name__ if layout_cls else 'unknown'}, dequantizing"
+        )
         return cls._dequant_and_fallback(func, args, kwargs)
 
     @classmethod
@@ -371,6 +381,7 @@ class QuantizedTensor(torch.Tensor):
 
 
 # ==================== Dispatch Utilities ====================
+
 
 def dequantize_args(args):
     """Recursively dequantize QuantizedTensors in args/kwargs.
@@ -388,6 +399,7 @@ def dequantize_args(args):
 
 
 # ==================== Dispatch Handlers ====================
+
 
 def _parse_to_args(args, kwargs):
     """Extract device and dtype from .to() arguments."""
@@ -505,11 +517,13 @@ def register_layout_op(torch_op: Any, layout_cls: type[QuantizedLayout]):
         torch_op: PyTorch operation (e.g., torch.ops.aten.linear.default)
         layout_cls: Layout class (e.g., TensorCoreFP8Layout)
     """
+
     def decorator(handler_func):
         if torch_op not in _LAYOUT_DISPATCH_TABLE:
             _LAYOUT_DISPATCH_TABLE[torch_op] = {}
         _LAYOUT_DISPATCH_TABLE[torch_op][layout_cls] = handler_func
         return handler_func
+
     return decorator
 
 

@@ -174,11 +174,15 @@ def test_sage_direct_entries_reject_wave64_arch(monkeypatch):
             call()
 
 
-def test_sage_native_entries_guard_wave32():
+def test_sage_native_entries_require_validated_wmma_wave32():
     bindings = _HIP_BINDINGS.read_text(encoding="utf-8")
     common = (_HIP_DIR / "sage_attention" / "sage_common.h").read_text(encoding="utf-8")
+    groups = _architecture_groups()
 
-    assert bindings.count("sage_require_wave32(") == 4  # definition plus three entries
+    assert "gfx1010" in groups["elementwise_only"]
+    assert all("gfx1010" not in groups[group] for group in ("wmma_gfx11", "wmma_gfx12"))
+    assert bindings.count("sage_require_wmma_wave32(") == 4  # definition plus entries
+    assert "!sage_is_wmma_arch(properties.gcnArchName)" in bindings
     assert "properties.warpSize != 32" in bindings
     assert "defined(COMFY_HAS_WMMA) && defined(__AMDGCN_WAVEFRONT_SIZE__)" in common
 

@@ -78,12 +78,17 @@ endfunction()
 
 _ck_make_arch_condition(COMFY_HIP_GFX11_CONDITION ${COMFY_HIP_WMMA_GFX11_ARCHS})
 _ck_make_arch_condition(COMFY_HIP_GFX12_CONDITION ${COMFY_HIP_WMMA_GFX12_ARCHS})
+set(_CK_HIP_WMMA_ARCHS
+    ${COMFY_HIP_WMMA_GFX11_ARCHS}
+    ${COMFY_HIP_WMMA_GFX12_ARCHS}
+)
+list(JOIN _CK_HIP_WMMA_ARCHS "\", \"" _CK_HIP_WMMA_ARCH_NAMES_JOINED)
+set(COMFY_HIP_WMMA_ARCH_NAMES "\"${_CK_HIP_WMMA_ARCH_NAMES_JOINED}\"")
 set(_CK_HIP_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${_CK_HIP_GENERATED_INCLUDE_DIR}")
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/architecture_config.h.in"
     "${_CK_HIP_GENERATED_INCLUDE_DIR}/architecture_config.h"
-    @ONLY
 )
 
 # A pip-installed rocm-sdk places the device bitcode under

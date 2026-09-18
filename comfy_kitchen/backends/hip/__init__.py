@@ -1967,6 +1967,24 @@ def _rope(xq, xk, freqs_cis, split_half, inplace=False):
         if xk.dtype != xq.dtype:
             raise ValueError("xq and xk must have the same dtype")
 
+    arch = _gfx_arch(xq.device)
+    if (
+        split_half
+        and freqs_cis.dtype != torch.float32
+        and arch is not None
+        and arch.startswith("gfx10")
+    ):
+        xq_result = _eager_rope.apply_rope_split_half1(xq, freqs_cis)
+        xk_result = (
+            None if xk is None else _eager_rope.apply_rope_split_half1(xk, freqs_cis)
+        )
+        if inplace:
+            xq.copy_(xq_result)
+            if xk is not None:
+                xk.copy_(xk_result)
+            return xq, xk
+        return xq_result, xk_result
+
     if inplace:
         # Each thread owns one (a, b) pair and loads both before storing either,
         # so rotating a view where it lies is well defined. _rope_rows must not
