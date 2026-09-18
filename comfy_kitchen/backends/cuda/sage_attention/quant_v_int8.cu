@@ -18,6 +18,7 @@
 
 #include "dtype_dispatch.cuh"
 #include "float_utils.cuh"
+#include "../tensor.h"
 
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -172,11 +173,17 @@ quant_v_int8_kernel(const T *__restrict__ v, int8_t *__restrict__ out,
 
 } // namespace
 
-extern "C" void launch_quant_v_int8_kernel(const void *v, void *out, void *scale,
-                                          int B, int H, int N, int D,
-                                          int padded_N, int64_t sb, int64_t sh,
-                                          int64_t sn, int input_dtype_code,
-                                          cudaStream_t stream) {
+extern "C" void launch_quant_v_int8_kernel(
+    comfy::tensor::TensorArg<4> v, int8_t* out, float* scale, int padded_N,
+    cudaStream_t stream) {
+  const int B = static_cast<int>(v.meta.sizes[0]);
+  const int H = static_cast<int>(v.meta.sizes[1]);
+  const int N = static_cast<int>(v.meta.sizes[2]);
+  const int D = static_cast<int>(v.meta.sizes[3]);
+  const int64_t sb = v.meta.strides[0];
+  const int64_t sh = v.meta.strides[1];
+  const int64_t sn = v.meta.strides[2];
+  const int input_dtype_code = static_cast<int>(v.meta.dtype);
   // An extent of one forms no offset, and PyTorch rewrites such a stride to 1 on
   // the way through DLPack (ATen/DLConvertor.cpp, gh-83069) on 2.9 and older, so
   // policing it would reject a tensor the caller has no way to hand over
@@ -185,7 +192,7 @@ extern "C" void launch_quant_v_int8_kernel(const void *v, void *out, void *scale
   const auto stride_ok = [element_size](int64_t stride, int extent) {
     return extent < 2 || (static_cast<size_t>(stride) * element_size) % 16 == 0;
   };
-  if (reinterpret_cast<uintptr_t>(v) % 16 != 0 || !stride_ok(sb, B) ||
+  if (reinterpret_cast<uintptr_t>(v.data) % 16 != 0 || !stride_ok(sb, B) ||
       !stride_ok(sh, H) || !stride_ok(sn, N)) {
     throw std::runtime_error(
         "quant_v_int8: V base pointer and B/H/N strides must be 16-byte aligned");
@@ -199,12 +206,12 @@ extern "C" void launch_quant_v_int8_kernel(const void *v, void *out, void *scale
   DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
     if (N <= 256) {
       quant_v_int8_kernel<T, 128><<<blocks, 128, 0, stream>>>(
-          static_cast<const T *>(v), static_cast<int8_t *>(out),
-          static_cast<float *>(scale), N, padded_N, H, D, sb, sh, sn);
+          static_cast<const T *>(v.data), out,
+          scale, N, padded_N, H, D, sb, sh, sn);
     } else {
       quant_v_int8_kernel<T, 512><<<blocks, 512, 0, stream>>>(
-          static_cast<const T *>(v), static_cast<int8_t *>(out),
-          static_cast<float *>(scale), N, padded_N, H, D, sb, sh, sn);
+          static_cast<const T *>(v.data), out,
+          scale, N, padded_N, H, D, sb, sh, sn);
     }
   });
 

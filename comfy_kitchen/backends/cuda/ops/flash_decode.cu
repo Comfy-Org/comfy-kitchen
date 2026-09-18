@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include <cuda_runtime.h>
+#include "../tensor.h"
 
 #include "utils.cuh"
 
@@ -65,30 +66,42 @@ void launch_flash_decode_typed(Flash_fwd_params& params, cudaStream_t stream) {
 } // namespace flash
 
 extern "C" void launch_flash_decode(
-    const void* q, const void* k, const void* v, const int* kv_lengths,
-    void* output, float* softmax_lse, float* softmax_lse_accum, float* output_accum,
-    int batch, int query_length, int heads, int kv_capacity, int num_splits,
-    int64_t q_batch_stride, int64_t q_row_stride, int64_t q_head_stride,
-    int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
+    comfy::tensor::TensorArg<3> q, comfy::tensor::TensorArg<4> k,
+    comfy::tensor::TensorArg<4> v, int* kv_lengths,
+    comfy::tensor::TensorArg<3> output, float* softmax_lse,
+    float* softmax_lse_accum, float* output_accum, int num_splits,
     cudaStream_t stream) {
+    const int batch = static_cast<int>(k.meta.sizes[0]);
+    const int kv_capacity = static_cast<int>(k.meta.sizes[1]);
+    const int heads = static_cast<int>(k.meta.sizes[2]);
+    const int query_length = static_cast<int>(q.meta.sizes[0] / batch);
+    if (q.meta.dtype != comfy::tensor::DType::BFloat16 ||
+        k.meta.dtype != comfy::tensor::DType::BFloat16 ||
+        v.meta.dtype != comfy::tensor::DType::BFloat16 ||
+        output.meta.dtype != comfy::tensor::DType::BFloat16) {
+        throw std::runtime_error("Flash Attention decode tensor dtype mismatch");
+    }
     flash::Flash_fwd_params params{};
-    params.q_ptr = const_cast<void*>(q);
-    params.k_ptr = const_cast<void*>(k);
-    params.v_ptr = const_cast<void*>(v);
-    params.o_ptr = output;
+    params.q_ptr = q.data;
+    params.k_ptr = k.data;
+    params.v_ptr = v.data;
+    params.o_ptr = output.data;
     params.softmax_lse_ptr = softmax_lse;
-    params.softmax_lseaccum_ptr = softmax_lse_accum;
-    params.oaccum_ptr = output_accum;
-    params.q_batch_stride = q_batch_stride;
-    params.q_row_stride = q_row_stride;
-    params.q_head_stride = q_head_stride;
-    params.o_batch_stride = q_batch_stride;
-    params.o_row_stride = q_row_stride;
-    params.o_head_stride = q_head_stride;
-    params.k_batch_stride = params.v_batch_stride = k_batch_stride;
-    params.k_row_stride = params.v_row_stride = k_row_stride;
-    params.k_head_stride = params.v_head_stride = k_head_stride;
-    params.seqused_k = const_cast<int*>(kv_lengths);
+    params.softmax_lseaccum_ptr = num_splits > 1 ? softmax_lse_accum : nullptr;
+    params.oaccum_ptr = num_splits > 1 ? output_accum : nullptr;
+    params.q_batch_stride = q.meta.strides[0] * query_length;
+    params.q_row_stride = q.meta.strides[0];
+    params.q_head_stride = q.meta.strides[1];
+    params.o_batch_stride = output.meta.strides[0] * query_length;
+    params.o_row_stride = output.meta.strides[0];
+    params.o_head_stride = output.meta.strides[1];
+    params.k_batch_stride = k.meta.strides[0];
+    params.v_batch_stride = v.meta.strides[0];
+    params.k_row_stride = k.meta.strides[1];
+    params.v_row_stride = v.meta.strides[1];
+    params.k_head_stride = k.meta.strides[2];
+    params.v_head_stride = v.meta.strides[2];
+    params.seqused_k = kv_lengths;
     params.b = batch;
     params.h = params.h_k = heads;
     params.h_h_k_ratio = 1;
