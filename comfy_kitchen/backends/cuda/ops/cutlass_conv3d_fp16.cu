@@ -9,6 +9,14 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 
+// Element strides (w, h, d, n) for the activation and the output; all zero means packed
+// NDHWC. Non-packed strides let a tile be a view of a larger padded activation and write its
+// result into a view of the full output, so tiled convolutions need no per-tile copies.
+struct Conv3dStrides {
+    int xw, xh, xd, xn;
+    int ow, oh, od, on;
+};
+
 struct Conv3dDims {
     int N, D, H, W, C;      // input NDHWC
     int K, T, R, S;         // filter KTRSC
@@ -53,7 +61,7 @@ struct Conv3dFp16 {
 
     static bool run(const half_t* x, const half_t* w, const half_t* bias,
                     const half_t* resid, bool resid_full, half_t* out,
-                    const Conv3dDims& d, cudaStream_t stream) {
+                    const Conv3dDims& d, const Conv3dStrides& st, cudaStream_t stream) {
         const cutlass::Tensor5DCoord in_size(d.N, d.D, d.H, d.W, d.C);
         const cutlass::Tensor5DCoord filter_size(d.K, d.T, d.R, d.S, d.C);
         const cutlass::Tensor5DCoord out_size(d.N, d.Z, d.P, d.Q, d.K);
@@ -61,10 +69,13 @@ struct Conv3dFp16 {
             in_size, filter_size,
             cutlass::make_Coord(0, 0, 0), cutlass::make_Coord(d.sd, d.sh, d.sw), cutlass::make_Coord(1, 1, 1),
             out_size, cutlass::conv::Mode::kCrossCorrelation, 1, 1);
-        const Layout lx = Layout::packed(in_size);
+        const Layout lx = st.xh ? Layout(cutlass::make_Coord(st.xw, st.xh, st.xd, st.xn))
+                                : Layout::packed(in_size);
         const Layout lw = Layout::packed(filter_size);
-        const Layout lo = Layout::packed(out_size);
-        const Layout lr = resid_full ? lo : Layout(0, 0, 0, 0);  // every output row reads resid[0:K]
+        const Layout lo = st.oh ? Layout(cutlass::make_Coord(st.ow, st.oh, st.od, st.on))
+                                : Layout::packed(out_size);
+        // the residual is always a packed tensor (Python makes it contiguous)
+        const Layout lr = resid_full ? Layout::packed(out_size) : Layout(0, 0, 0, 0);  // every output row reads resid[0:K]
 
         // TensorRef holds non-const pointers; the kernel only reads x/w/resid.
         typename Op::Arguments args(
@@ -91,7 +102,10 @@ using Conv0 = Conv3dFp16<128, 256, 64, 64, 3, half_t>;
 using Conv1 = Conv3dFp16<128, 128, 64, 64, 4, half_t>;
 using Conv2 = Conv3dFp16<64, 64, 32, 32, 4, float>;
 constexpr int kConvConfigCount = 3;
-constexpr int64_t kMaxFp16Depth = 8192;   // the decoder's verified depth
+// 512 channels x 27 taps = 13824. At that depth fp16 accumulation costs the SeedVR2 decoder
+// 65.5 -> 57.8 dB against an fp32 reference and buys 11-13% of decode time; the 8192 gate
+// (the depth the kernel was first verified at) only reached the 128/256-channel stages.
+constexpr int64_t kMaxFp16Depth = 16384;
 constexpr int64_t kMinTiles = 128;
 // conv_out (K=48) has 20 threadblocks at 64x64 and still beats cuDNN 2x
 constexpr int64_t kMinTilesSmall = 16;
@@ -101,9 +115,13 @@ int64_t conv_tiles(int64_t m, int k) {
     return ((m + Cfg::kM - 1) / Cfg::kM) * ((k + Cfg::kN - 1) / Cfg::kN);
 }
 
+// Deep-K launches too small for the 128-row tiles go to the 64-row fp32 config, where tile fit
+// beats cuDNN 2x; shallow small launches stay on cuDNN, which is faster there.
+constexpr int64_t kDeepK = 8192;
+
 int select_conv_config(int64_t m, int k, int64_t depth) {
-    if (depth > kMaxFp16Depth) {
-        const bool small_launch = conv_tiles<Conv1>(m, k) < kMinTiles;
+    const bool small_launch = conv_tiles<Conv1>(m, k) < kMinTiles;
+    if (depth > kMaxFp16Depth || (small_launch && depth > kDeepK)) {
         return small_launch && conv_tiles<Conv2>(m, k) >= kMinTilesSmall ? 2 : -1;
     }
     if (k >= 256 && conv_tiles<Conv0>(m, k) >= kMinTiles) return 0;
@@ -117,8 +135,11 @@ int select_conv_config(int64_t m, int k, int64_t depth) {
 extern "C" bool launch_cutlass_fp16_conv3d(
     const void* x, const void* w, const void* bias, const void* resid, bool resid_full, void* out,
     int N, int D, int H, int W, int C, int K, int T, int R, int S, int Z, int P, int Q,
-    int sd, int sh, int sw, int config, cudaStream_t stream) {
+    int sd, int sh, int sw, int config,
+    int xs_w, int xs_h, int xs_d, int xs_n, int os_w, int os_h, int os_d, int os_n,
+    cudaStream_t stream) {
     const Conv3dDims d{N, D, H, W, C, K, T, R, S, Z, P, Q, sd, sh, sw};
+    const Conv3dStrides st{xs_w, xs_h, xs_d, xs_n, os_w, os_h, os_d, os_n};
     if (d.C % 8 != 0 || d.K % 8 != 0 || config >= kConvConfigCount) return false;
     const int64_t m = static_cast<int64_t>(d.N) * d.Z * d.P * d.Q;
     if (config < 0) config = select_conv_config(m, d.K, static_cast<int64_t>(d.C) * d.T * d.R * d.S);
@@ -129,9 +150,9 @@ extern "C" bool launch_cutlass_fp16_conv3d(
     const auto rp = static_cast<const half_t*>(resid);
     const auto op = static_cast<half_t*>(out);
     switch (config) {
-        case 0: return Conv0::run(xp, wp, bp, rp, resid_full, op, d, stream);
-        case 1: return Conv1::run(xp, wp, bp, rp, resid_full, op, d, stream);
-        default: return Conv2::run(xp, wp, bp, rp, resid_full, op, d, stream);
+        case 0: return Conv0::run(xp, wp, bp, rp, resid_full, op, d, st, stream);
+        case 1: return Conv1::run(xp, wp, bp, rp, resid_full, op, d, st, stream);
+        default: return Conv2::run(xp, wp, bp, rp, resid_full, op, d, st, stream);
     }
 }
 
@@ -139,7 +160,8 @@ extern "C" bool launch_cutlass_fp16_conv3d(
 
 extern "C" bool launch_cutlass_fp16_conv3d(
     const void*, const void*, const void*, const void*, bool, void*,
-    int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, cudaStream_t) {
+    int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int,
+    int, int, int, int, int, int, int, int, cudaStream_t) {
     return false;
 }
 

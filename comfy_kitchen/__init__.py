@@ -317,14 +317,22 @@ def fp16_conv3d(
     bias: torch.Tensor | None = None,
     residual: torch.Tensor | None = None,
     stride: int | tuple[int, int, int] = 1,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """fp16-accumulate conv3d with bias and residual fused into the epilogue.
 
     x [N, C, D, H, W], weight [K, C, T, R, S], zero padding only. Same opt-in
     numerics as fp16_linear; shapes the kernel declines run torch's conv.
+
+    x may be a spatial or temporal window of a larger channels_last_3d tensor and out a
+    matching window of the full output: the CUDA kernel reads and writes the views' strides,
+    so a convolution tiled for memory needs no per-tile copies. out is returned.
     """
     stride = [stride] * 3 if isinstance(stride, int) else list(stride)
-    return torch.ops.comfy_kitchen.fp16_conv3d(x, weight, bias, residual, stride)
+    if out is None:
+        return torch.ops.comfy_kitchen.fp16_conv3d(x, weight, bias, residual, stride)
+    torch.ops.comfy_kitchen.fp16_conv3d_out(x, weight, bias, residual, stride, out)
+    return out
 
 
 def group_norm_silu_pad3d(
@@ -335,13 +343,25 @@ def group_norm_silu_pad3d(
     eps: float = 1e-6,
     pad: tuple[int, int, int, int, int] = (0, 0, 0, 0, 0),
     silu: bool = True,
+    zero_pad: bool = False,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-frame GroupNorm, SiLU and causal conv3d padding in one pass.
 
-    x [B, C, T, H, W]; pad is (left, right, top, bottom, front): reflect in space,
-    zero frames in front. weight=None is pad-only. Output is channels_last_3d.
+    x [B, C, T, H, W]; pad is (left, right, top, bottom, front). The spatial border
+    reflects, or is zero when zero_pad, for models whose convolutions pad with zeros;
+    the front frames are always zero. weight=None is pad-only. Output is channels_last_3d.
+
+    out, if given, receives the result and is returned. For a batch of one it may be a
+    frame-offset view of a longer buffer, which is how a caller keeps room in front for a
+    real temporal halo where the kernel would otherwise put zero frames.
     """
-    return torch.ops.comfy_kitchen.group_norm_silu_pad3d(x, weight, bias, num_groups, eps, list(pad), silu)
+    if out is None:
+        return torch.ops.comfy_kitchen.group_norm_silu_pad3d(
+            x, weight, bias, num_groups, eps, list(pad), silu, zero_pad)
+    torch.ops.comfy_kitchen.group_norm_silu_pad3d_out(
+        x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, out)
+    return out
 
 
 def rms_adaln(

@@ -22,6 +22,37 @@ def fp16_conv3d(
     return out.contiguous(memory_format=torch.channels_last_3d)  # like the CUDA backend and the fake
 
 
+def fp16_conv3d_out(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor | None,
+    residual: Tensor | None,
+    stride: list[int],
+    out: Tensor,
+) -> None:
+    """fp16_conv3d written into ``out``, an NDHWC-ordered tensor or view of the output shape."""
+    out.copy_(fp16_conv3d(x, weight, bias, residual, stride))
+
+
+@torch.library.custom_op("comfy_kitchen::fp16_conv3d_out", mutates_args=("out",))
+def _op_fp16_conv3d_out(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    stride: list[int],
+    out: torch.Tensor,
+) -> None:
+    kwargs = {"x": x, "weight": weight, "bias": bias, "residual": residual, "stride": stride, "out": out}
+    impl = registry.get_implementation("fp16_conv3d_out", kwargs=kwargs)
+    impl(**kwargs)
+
+
+@_op_fp16_conv3d_out.register_fake
+def _op_fp16_conv3d_out_fake(x, weight, bias, residual, stride, out):
+    return None
+
+
 @torch.library.custom_op("comfy_kitchen::fp16_conv3d", mutates_args=())
 def _op_fp16_conv3d(
     x: torch.Tensor,
