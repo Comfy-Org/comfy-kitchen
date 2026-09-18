@@ -13,6 +13,7 @@
 // even index), which is the layout the iu4 A-fragment consumes directly.
 #pragma once
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -87,6 +88,10 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
     if (K == 10240) {
         return 640;
     }
+    // RDNA4 H3 tuned fused ConvRot widths.
+    if (K == 5376) return 192;
+    if (K == 7168) return 384;
+    if (K == 14336) return 640;
     return 1024;
 }
 
@@ -120,7 +125,7 @@ inline bool convrot_fused_lds_fits(int K, int block_threads, int in_dtype) {
     const size_t need =
         (static_cast<size_t>(block_threads / 32) + 1) * sizeof(float) +
         static_cast<size_t>(K) * row_element_size +
-        static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256 * sizeof(float);
+        static_cast<size_t>(groups_in_flight) * kConvRotGroup256 * sizeof(float);
     return need <= static_cast<size_t>(lds);
 }
 
@@ -190,10 +195,26 @@ template <typename Fn>
 inline void dispatch_convrot_fused_block_threads(int block_threads, Fn fn) {
     if (block_threads == 64) {
         fn.template operator()<64>();
+    } else if (block_threads == 128) {
+        fn.template operator()<128>();
+    } else if (block_threads == 192) {
+        fn.template operator()<192>();
+    } else if (block_threads == 256) {
+        fn.template operator()<256>();
+    } else if (block_threads == 320) {
+        fn.template operator()<320>();
+    } else if (block_threads == 384) {
+        fn.template operator()<384>();
+    } else if (block_threads == 448) {
+        fn.template operator()<448>();
     } else if (block_threads == 512) {
         fn.template operator()<512>();
+    } else if (block_threads == 576) {
+        fn.template operator()<576>();
     } else if (block_threads == 640) {
         fn.template operator()<640>();
+    } else if (block_threads == 704) {
+        fn.template operator()<704>();
     } else if (block_threads == 768) {
         fn.template operator()<768>();
     } else {
@@ -256,6 +277,61 @@ __forceinline__ __device__ void load_input_act4_bf16(
     o1 = static_cast<float>(elems[1]);
     o2 = static_cast<float>(elems[2]);
     o3 = static_cast<float>(elems[3]);
+}
+
+__forceinline__ __device__ void load_input_swiglu4_bf16(
+    const void* x, int64_t in_row, int col, int K,
+    float& o0, float& o1, float& o2, float& o3) {
+
+    const __bf16* row =
+        static_cast<const __bf16*>(x) + in_row + col;
+
+    float g0, g1, g2, g3;
+    float u0, u1, u2, u3;
+
+    const std::uintptr_t gate_addr = reinterpret_cast<std::uintptr_t>(row);
+    const std::uintptr_t up_addr = reinterpret_cast<std::uintptr_t>(row + K);
+
+    if (((gate_addr | up_addr) & 7u) == 0) {
+        const uint64_t gate_pack =
+            *reinterpret_cast<const uint64_t*>(row);
+        const uint64_t up_pack =
+            *reinterpret_cast<const uint64_t*>(row + K);
+
+        const __bf16* gate =
+            reinterpret_cast<const __bf16*>(&gate_pack);
+        const __bf16* up =
+            reinterpret_cast<const __bf16*>(&up_pack);
+
+        g0 = static_cast<float>(gate[0]);
+        g1 = static_cast<float>(gate[1]);
+        g2 = static_cast<float>(gate[2]);
+        g3 = static_cast<float>(gate[3]);
+
+        u0 = static_cast<float>(up[0]);
+        u1 = static_cast<float>(up[1]);
+        u2 = static_cast<float>(up[2]);
+        u3 = static_cast<float>(up[3]);
+    } else {
+        // DLPack/direct-binding callers may supply a contiguous BF16 view whose
+        // logical data pointer is only 2-byte aligned. Keep those accesses
+        // alignment-safe without penalizing the normal packed path.
+        g0 = static_cast<float>(row[0]);
+        g1 = static_cast<float>(row[1]);
+        g2 = static_cast<float>(row[2]);
+        g3 = static_cast<float>(row[3]);
+
+        u0 = static_cast<float>(row[K + 0]);
+        u1 = static_cast<float>(row[K + 1]);
+        u2 = static_cast<float>(row[K + 2]);
+        u3 = static_cast<float>(row[K + 3]);
+    }
+
+    // Exactly the same SwiGLU formula as load_input_act<kActSwiGLU>.
+    o0 = (g0 / (1.0f + expf(-g0))) * u0;
+    o1 = (g1 / (1.0f + expf(-g1))) * u1;
+    o2 = (g2 / (1.0f + expf(-g2))) * u2;
+    o3 = (g3 / (1.0f + expf(-g3))) * u3;
 }
 
 template <typename RowT>
@@ -576,8 +652,8 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     const int64_t in_row_offset = row_offset * kInWidth;
     const int n_groups = K / kConvRotGroup256;
 
-    float* buf0 = tmp + sub * (2 * kConvRotGroup256);
-    float* buf1 = buf0 + kConvRotGroup256;
+    // S4/S16 stay in registers; only the S16->S64 handoff needs LDS.
+    float* buf1 = tmp + sub * kConvRotGroup256;
     float abs_max = 0.0f;
 
     // RmsNorm needs the row's mean square before the first group.
@@ -622,21 +698,194 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
                     xv3 = load_input_act<ACT>(x, in_row_offset, col + 3, K, in_dtype);
                 }
             } else {
-                xv0 = load_input_act<ACT>(x, in_row_offset, col, K, in_dtype);
-                xv1 = load_input_act<ACT>(x, in_row_offset, col + 1, K, in_dtype);
-                xv2 = load_input_act<ACT>(x, in_row_offset, col + 2, K, in_dtype);
-                xv3 = load_input_act<ACT>(x, in_row_offset, col + 3, K, in_dtype);
+                if constexpr (ACT == kActSwiGLU) {
+                    if constexpr (std::is_same_v<RowT, __bf16>) {
+                        load_input_swiglu4_bf16(
+                            x, in_row_offset, col, K,
+                            xv0, xv1, xv2, xv3);
+                    } else {
+                        xv0 = load_input_act<ACT>(x, in_row_offset, col, K, in_dtype);
+                        xv1 = load_input_act<ACT>(x, in_row_offset, col + 1, K, in_dtype);
+                        xv2 = load_input_act<ACT>(x, in_row_offset, col + 2, K, in_dtype);
+                        xv3 = load_input_act<ACT>(x, in_row_offset, col + 3, K, in_dtype);
+                    }
+                } else {
+                    xv0 = load_input_act<ACT>(x, in_row_offset, col, K, in_dtype);
+                    xv1 = load_input_act<ACT>(x, in_row_offset, col + 1, K, in_dtype);
+                    xv2 = load_input_act<ACT>(x, in_row_offset, col + 2, K, in_dtype);
+                    xv3 = load_input_act<ACT>(x, in_row_offset, col + 3, K, in_dtype);
+                }
             }
         }
-        buf1[base] = 0.5f * (xv0 + xv1 + xv2 - xv3);
-        buf1[base + 1] = 0.5f * (xv0 + xv1 - xv2 + xv3);
-        buf1[base + 2] = 0.5f * (xv0 - xv1 + xv2 + xv3);
-        buf1[base + 3] = 0.5f * (-xv0 + xv1 + xv2 + xv3);
-        __syncthreads();
+        // Prevent fast-math reassociation across SwiGLU -> Hadamard boundary.
+        __asm__ __volatile__(
+            "" :
+            "+v"(xv0), "+v"(xv1), "+v"(xv2), "+v"(xv3));
 
-        convrot_fht_stage64<4>(buf1, buf0, lane);
-        __syncthreads();
-        convrot_fht_stage64<16>(buf0, buf1, lane);
+        // First radix-4 result remains in registers.
+        float a0 = 0.5f * (xv0 + xv1 + xv2 - xv3);
+        float a1 = 0.5f * (xv0 + xv1 - xv2 + xv3);
+        float a2 = 0.5f * (xv0 - xv1 + xv2 + xv3);
+        float a3 = 0.5f * (-xv0 + xv1 + xv2 + xv3);
+
+        // Preserve the old LDS store/load arithmetic boundary.
+        __asm__ __volatile__(
+            "" :
+            "+v"(a0), "+v"(a1), "+v"(a2), "+v"(a3));
+
+        // 4x4 register transpose inside each 4-lane subgroup.
+        //
+        // Stage 1 swaps lane bit 0 with component bit 0.
+        const float p0 = __shfl_xor(a0, 1, 4);
+        const float p1 = __shfl_xor(a1, 1, 4);
+        const float p2 = __shfl_xor(a2, 1, 4);
+        const float p3 = __shfl_xor(a3, 1, 4);
+
+        float b0, b1, b2, b3;
+        if ((lane & 1) == 0) {
+            b0 = a0;
+            b1 = p0;
+            b2 = a2;
+            b3 = p2;
+        } else {
+            b0 = p1;
+            b1 = a1;
+            b2 = p3;
+            b3 = a3;
+        }
+
+        // Stage 2 swaps lane bit 1 with component bit 1.
+        const float q0 = __shfl_xor(b0, 2, 4);
+        const float q1 = __shfl_xor(b1, 2, 4);
+        const float q2 = __shfl_xor(b2, 2, 4);
+        const float q3 = __shfl_xor(b3, 2, 4);
+
+        float x0, x1, x2, x3;
+        if ((lane & 2) == 0) {
+            x0 = b0;
+            x1 = b1;
+            x2 = q0;
+            x3 = q1;
+        } else {
+            x0 = q2;
+            x1 = q3;
+            x2 = b2;
+            x3 = b3;
+        }
+
+        // Match the former S=4 LDS-load boundary under -ffast-math.
+        __asm__ __volatile__(
+            "" :
+            "+v"(x0), "+v"(x1), "+v"(x2), "+v"(x3));
+
+        // Keep the exact original S=4 arithmetic, but keep its outputs
+        // in registers instead of round-tripping through LDS.
+        float c0 = 0.5f * (x0 + x1 + x2 - x3);
+        float c1 = 0.5f * (x0 + x1 - x2 + x3);
+        float c2 = 0.5f * (x0 - x1 + x2 + x3);
+        float c3 = 0.5f * (-x0 + x1 + x2 + x3);
+
+        // Preserve the former S=4 LDS store/load compiler boundary.
+        __asm__ __volatile__(
+            "" :
+            "+v"(c0), "+v"(c1), "+v"(c2), "+v"(c3));
+
+        // S=16 needs a second 4x4 transpose.
+        // This time the four producer lanes are spaced 4 lanes apart:
+        // r, r+4, r+8, r+12 inside each 16-lane subgroup.
+
+        const float s16_p0 = __shfl_xor(c0, 4, 16);
+        const float s16_p1 = __shfl_xor(c1, 4, 16);
+        const float s16_p2 = __shfl_xor(c2, 4, 16);
+        const float s16_p3 = __shfl_xor(c3, 4, 16);
+
+        float d0, d1, d2, d3;
+
+        if ((lane & 4) == 0) {
+            d0 = c0;
+            d1 = s16_p0;
+            d2 = c2;
+            d3 = s16_p2;
+        } else {
+            d0 = s16_p1;
+            d1 = c1;
+            d2 = s16_p3;
+            d3 = c3;
+        }
+
+        const float s16_q0 = __shfl_xor(d0, 8, 16);
+        const float s16_q1 = __shfl_xor(d1, 8, 16);
+        const float s16_q2 = __shfl_xor(d2, 8, 16);
+        const float s16_q3 = __shfl_xor(d3, 8, 16);
+
+        float u0, u1, u2, u3;
+
+        if ((lane & 8) == 0) {
+            u0 = d0;
+            u1 = d1;
+            u2 = s16_q0;
+            u3 = s16_q1;
+        } else {
+            u0 = s16_q2;
+            u1 = s16_q3;
+            u2 = d2;
+            u3 = d3;
+        }
+
+        // Match the former S=16 LDS-load arithmetic boundary.
+        __asm__ __volatile__(
+            "" :
+            "+v"(u0), "+v"(u1), "+v"(u2), "+v"(u3));
+
+        const int s16_base =
+            (lane % 16) + (lane / 16) * 64;
+
+        // Force the original left-to-right FP operation order.
+        // Empty +v asm barriers prevent -ffast-math reassociation
+        // inside each H4 expression without changing the data path.
+
+        float s16_t00 = u0 + u1;
+        __asm__ __volatile__("" : "+v"(s16_t00));
+        float s16_t01 = s16_t00 + u2;
+
+        float s16_t02 = s16_t01 - u3;
+
+        float s16_y0 = 0.5f * s16_t02;
+
+        float s16_t10 = u0 + u1;
+        __asm__ __volatile__("" : "+v"(s16_t10));
+        float s16_t11 = s16_t10 - u2;
+        __asm__ __volatile__("" : "+v"(s16_t11));
+
+        float s16_t12 = s16_t11 + u3;
+
+        float s16_y1 = 0.5f * s16_t12;
+
+        float s16_t20 = u0 - u1;
+        __asm__ __volatile__("" : "+v"(s16_t20));
+        float s16_t21 = s16_t20 + u2;
+
+        float s16_t22 = s16_t21 + u3;
+
+        float s16_y2 = 0.5f * s16_t22;
+
+        float s16_t30 = -u0;
+        __asm__ __volatile__("" : "+v"(s16_t30));
+        float s16_t31 = s16_t30 + u1;
+        __asm__ __volatile__("" : "+v"(s16_t31));
+        float s16_t32 = s16_t31 + u2;
+
+        float s16_t33 = s16_t32 + u3;
+
+        float s16_y3 = 0.5f * s16_t33;
+
+        buf1[s16_base]      = s16_y0;
+        buf1[s16_base + 16] = s16_y1;
+        buf1[s16_base + 32] = s16_y2;
+        buf1[s16_base + 48] = s16_y3;
+
+        // S=64 consumes values produced by both waves of the 64-thread
+        // subgroup, so this one must remain a full-block barrier.
         __syncthreads();
 
         if (active) {
@@ -671,7 +920,7 @@ inline bool launch_convrot_quant_fused_impl(
     const int groups_in_flight = BLOCK_THREADS / 64;
     const size_t shmem =
         static_cast<size_t>(K) * sizeof(RowT) +
-        static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256 * sizeof(float);
+        static_cast<size_t>(groups_in_flight) * kConvRotGroup256 * sizeof(float);
     auto kernel = convrot_quant_fused_kernel<RowT, BLOCK_THREADS, ACT>;
     const hipError_t attr_err = hipFuncSetAttribute(
         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize,

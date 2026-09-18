@@ -269,6 +269,51 @@ def _swiglu(x):
     return torch.nn.functional.silu(gate) * up
 
 
+def test_swiglu_convrot_direct_binding_handles_bf16_offset_input(hip):
+    """The low-level binding must also accept a contiguous BF16 view whose
+    logical data pointer is not 8-byte aligned.
+
+    The public wrapper realigns such inputs, so call the binding directly to
+    exercise the packed-load fallback itself.
+    """
+    torch.manual_seed(0)
+    m, k, group = 17, 1024, 256
+
+    aligned = torch.randn(m, 2 * k, device=DEV, dtype=torch.bfloat16)
+    offset = _offset_copy(aligned)
+
+    assert aligned.is_contiguous()
+    assert offset.is_contiguous()
+    assert aligned.data_ptr() % 8 == 0
+    assert offset.data_ptr() % 8 != 0
+
+    def run(x):
+        q = torch.empty((m, k), dtype=torch.int8, device=x.device)
+        scales = torch.empty((m,), dtype=torch.float32, device=x.device)
+        hip._C.quantize_int8_convrot(
+            hip._dl(x),
+            hip._dl(q),
+            hip._dl(scales),
+            None,
+            None,
+            m,
+            k,
+            group,
+            2,  # kActSwiGLU
+            hip._stream(x),
+            None,
+            0.0,
+        )
+        torch.cuda.synchronize()
+        return q, scales
+
+    q_aligned, s_aligned = run(aligned)
+    q_offset, s_offset = run(offset)
+
+    assert torch.equal(q_offset, q_aligned)
+    assert torch.equal(s_offset, s_aligned)
+
+
 # swiglu is the gated pair: the input row is [gate | up] and the quantized row is
 # half as wide, so the shapes below give the raw (2 * K) width.
 @needs_wmma
