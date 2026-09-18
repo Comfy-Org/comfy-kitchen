@@ -2122,6 +2122,7 @@ def sol_attn(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    blk_cnt: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
     See sage_attention/sol_attn.hip and the public docstring for ``tail``,
@@ -2135,7 +2136,14 @@ def sol_attn(
     every row attends up to that many unrouted tokens its query block's centroid
     scores highest, and the remaining tail is exact for the centroid instead of
     pooled per block.
+    ``blk_cnt`` is accepted for signature parity with the CUDA backend and
+    refused when given: the HIP plan carries the same ``cnt`` slot, but the
+    slice has not been verified on an AMD device and a wrong slice would be a
+    silent wrong number rather than an error.
     """
+    if blk_cnt is not None:
+        raise NotImplementedError(
+            "sol_attn: blk_cnt is not implemented on the HIP backend yet; pass None")
     batch, t, h, d = q.shape
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
@@ -2211,15 +2219,22 @@ def sol_attn_chunked(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    *,
+    blk_cnt: torch.Tensor | None = None,
 ):
     """Chunked-producer Sol-Attn over fused qkv projection chunks ([M, 3*H*128]
     bf16, 64-aligned starts, B=1); full Q/K/V are never materialised.
     ``tail`` / ``block_len`` / ``coarse_gate`` / ``token_aug`` as in ``sol_attn``.
+    ``blk_cnt`` (keyword-only) is accepted for signature parity with the CUDA
+    backend and refused when given, as ``sol_attn`` refuses it here.
 
     ``qkv_chunks``: an iterable of chunks or a zero-arg callable returning one.
     ``kmean``/``vscale`` are LAST step's statistics ([H,128] f32); when None the
     producer runs twice (measure, then quantize), so pass a callable to stream on
     the first call. Returns ``(out[1,T,H,128] bf16, kmean_next, vscale_next)``."""
+    if blk_cnt is not None:
+        raise NotImplementedError(
+            "sol_attn_chunked: blk_cnt is not implemented on the HIP backend yet; pass None")
     d = _SOL_HD
     rot = rope_freqs.shape[-3] * 2
     # the fused rope pairs channels across lanes of 4: rot/2 must be lane-aligned
