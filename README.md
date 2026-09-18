@@ -46,7 +46,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 Each of the eight rope entries also has an in-place form (`apply_rope_`,
 `rms_rope_split_half1_`, ...) with the same backend coverage as the row above.
 
-## HIP backend (AMD RDNA2 / RDNA3 / RDNA3.5 / RDNA4)
+## HIP backend (AMD Vega APU / RDNA1 RDNA2 / RDNA3 / RDNA3.5 / RDNA4)
 
 The `hip` backend implements the quantized paths with its own kernels: WMMA
 matrix-core GEMMs on RDNA3/RDNA3.5/RDNA4, and non-WMMA kernels (quantizers,
@@ -73,8 +73,8 @@ What a GPU gets depends on whether it has matrix cores:
 | RDNA3.5    | `gfx1150`-`gfx1153`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
 | RDNA3      | `gfx1100`-`gfx1103`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
 | RDNA2      | `gfx1030`-`gfx1036`         | none         | Non-WMMA kernels incl. AWQ GEMV; WMMA GEMMs decline |
-| RDNA1     | `gfx1010`         | none         | Non-WMMA kernels incl. AWQ GEMV; WMMA GEMMs decline |
-| Vega (APU)      | `gfx90c`         | none         | Non-WMMA kernels incl. AWQ GEMV; WMMA GEMMs decline |
+| RDNA1      | `gfx1010`                   | none         | Non-WMMA kernels incl. AWQ GEMV; WMMA GEMMs decline |
+| Vega (APU) | `gfx90c`                    | none         | Non-WMMA kernels incl. AWQ GEMV; WMMA GEMMs decline |
 
 fp8, int8 and int4 share one byte-addressed tile kernel (`gemm_wmma.h`). RDNA3
 and RDNA4 spread a WMMA operand across the wave differently and RDNA3 has no fp8
