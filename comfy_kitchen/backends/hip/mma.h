@@ -275,6 +275,27 @@ struct MmaF16 {
     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
 };
 
+// BF16 GEMM policy for gfx12, mirroring MmaF16's half-wave K split.
+struct MmaBf16G {
+    using Acc = v8f;
+    using Frag = v8bf;
+    using Elem = __bf16;
+    static constexpr int kFragElems = 8;
+    static constexpr int kStepBytes = 32;
+    static __forceinline__ __device__ int frag_base(int lane) { return 8 * (lane / 16); }
+    static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
+                                                int lane) {
+        return load_frag_16bit<MmaBf16G>(
+            reinterpret_cast<const __bf16*>(static_cast<const char*>(lds) + row * stride + kbyte),
+            lane);
+    }
+    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+    static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
+        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
+    }
+    static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
+};
+
 #elif defined(COMFY_MMA_GFX11)
 
 struct MmaFp8 {
@@ -365,6 +386,28 @@ struct MmaBf16 {
     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
 };
 
+// BF16 policy for the tiled GEMM core: unlike MmaBf16 (the fp8-widening path),
+// a bf16 GEMM consumes 32 bytes of a row per 16-element K-step, same as MmaF16.
+struct MmaBf16G {
+    using Acc = v8f;
+    using Frag = v16bf;
+    using Elem = __bf16;
+    static constexpr int kFragElems = 16;
+    static constexpr int kStepBytes = 32;
+    static __forceinline__ __device__ int frag_base(int) { return 0; }
+    static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
+                                                int lane) {
+        return load_frag_16bit<MmaBf16G>(
+            reinterpret_cast<const __bf16*>(static_cast<const char*>(lds) + row * stride + kbyte),
+            lane);
+    }
+    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+    static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
+        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
+    }
+    static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
+};
+
 struct MmaF16 {
     using Acc = v8f;
     using Frag = v16h;
@@ -433,6 +476,11 @@ struct MmaBf16 {
     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
     static __forceinline__ __device__ Acc mma(Frag, Frag, Acc c) { COMFY_MMA_STUB_BODY }
     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
+};
+
+struct MmaBf16G : MmaBf16 {
+    static constexpr int kStepBytes = 32;
+    static __forceinline__ __device__ Frag load(const void*, int, int, int, int) { return Frag{}; }
 };
 
 struct MmaF16 {

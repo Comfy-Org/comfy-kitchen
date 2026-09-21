@@ -426,6 +426,40 @@ bool fp16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias,
     return served;
 }
 
+// Same envelope as fp16_gemm, every operand bf16 (bias/rscale/resid stay fp16:
+// the Python layer converts them). false means the caller serves the shape.
+bool bf16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias, OptArray rscale,
+               OptArray resid, int M, int N, int K, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "bf16_gemm";
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_dtype(a, 2, 2, kFn, "a");
+    require_dtype(b, 2, 2, kFn, "b");
+    require_dtype(d, 2, 2, kFn, "d");
+    require_len(a, static_cast<int64_t>(M) * K, kFn, "a");
+    require_len(b, static_cast<int64_t>(N) * K, kFn, "b");
+    require_len(d, static_cast<int64_t>(M) * N, kFn, "d");
+    if (bias.has_value()) {
+        require_fp16(*bias, kFn, "bias");
+        require_len(*bias, N, kFn, "bias");
+    }
+    if (rscale.has_value() != resid.has_value()) {
+        throw std::runtime_error(std::string(kFn) + ": rscale and resid must be given together");
+    }
+    if (resid.has_value()) {
+        require_fp16(*rscale, kFn, "rscale");
+        require_fp16(*resid, kFn, "resid");
+        require_len(*rscale, N, kFn, "rscale");
+        require_len(*resid, static_cast<int64_t>(M) * N, kFn, "resid");
+    }
+    const bool served = launch_bf16_gemm_kernel(
+        a.data(), b.data(), d.data(), opt_data(bias), opt_data(rscale), opt_data(resid), M, N, K,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return served;
+}
+
 // NDHWC conv3d, zero padding, x [N, D, H, W, C] and w [K, T, R, S, C] fp16 in that
 // memory order; out and resid are [N, Z, P, Q, K]. false means the caller serves it.
 bool fp16_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, OptArray resid,
@@ -2110,6 +2144,9 @@ NB_MODULE(_C, m) {
     m.def("int8_gemm", &int8_gemm);
     m.def("convrot_w4a4_gemm", &convrot_w4a4_gemm);
     m.def("fp16_gemm", &fp16_gemm, nb::arg("a"), nb::arg("b"), nb::arg("d"),
+          nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),
+          nb::arg("N"), nb::arg("K"), nb::arg("stream_ptr"));
+    m.def("bf16_gemm", &bf16_gemm, nb::arg("a"), nb::arg("b"), nb::arg("d"),
           nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),
           nb::arg("N"), nb::arg("K"), nb::arg("stream_ptr"));
     m.def("fp16_conv3d", &fp16_conv3d, nb::arg("x"), nb::arg("w"), nb::arg("bias").none(),

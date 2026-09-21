@@ -671,7 +671,7 @@ def fp16_linear(
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """FP16 WMMA GEMM with bias and an optional ``residual + residual_scale * out``
+    """FP16/BF16 WMMA GEMM with bias and an optional ``residual + residual_scale * out``
     fused into the epilogue; torch's linear where the kernel declines the shape."""
     if residual is not None and residual_scale is None:
         raise ValueError("fp16_linear: residual requires residual_scale")
@@ -682,8 +682,8 @@ def fp16_linear(
     n, k = weight.shape
 
     supported = (
-        x.dtype == torch.float16
-        and weight.dtype == torch.float16
+        x.dtype in (torch.float16, torch.bfloat16)
+        and weight.dtype == x.dtype
         and weight.device == x.device
         and x_2d.shape[1] == k
         # the tile stager issues 16-byte row loads; a misaligned view falls back, as on CUDA
@@ -704,19 +704,28 @@ def fp16_linear(
         out = torch.nn.functional.linear(x, weight, bias)
         return _apply_residual(out, residual, residual_scale)
 
-    out = torch.empty((m, n), dtype=torch.float16, device=x.device)
+    out = torch.empty((m, n), dtype=x.dtype, device=x.device)
     bias_arg = None if bias is None else _vector_operand(bias, x.device, torch.float16)
     resid_arg = rscale_arg = None
     if residual is not None:
         resid_arg = residual.to(device=x.device).reshape(m, n).contiguous()
         rscale_arg = _vector_operand(residual_scale, x.device, torch.float16)
-    served = _C.fp16_gemm(
-        _dl(x_2d), _dl(weight), _dl(out),
-        None if bias_arg is None else _dl(bias_arg),
-        None if rscale_arg is None else _dl(rscale_arg),
-        None if resid_arg is None else _dl(resid_arg),
-        m, n, k, _stream(x),
-    )
+    if x.dtype == torch.float16:
+        served = _C.fp16_gemm(
+            _dl(x_2d), _dl(weight), _dl(out),
+            None if bias_arg is None else _dl(bias_arg),
+            None if rscale_arg is None else _dl(rscale_arg),
+            None if resid_arg is None else _dl(resid_arg),
+            m, n, k, _stream(x),
+        )
+    else:
+        served = _C.bf16_gemm(
+            _dl(x_2d), _dl(weight), _dl(out),
+            None if bias_arg is None else _dl(bias_arg),
+            None if rscale_arg is None else _dl(rscale_arg),
+            None if resid_arg is None else _dl(resid_arg),
+            m, n, k, _stream(x),
+        )
     if not served:
         out = _apply_residual(torch.nn.functional.linear(x_2d, weight, bias_arg), resid_arg,
                               rscale_arg)
@@ -2587,9 +2596,11 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ),
         "fp16_linear": FunctionConstraints(
             params={
-                "x": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(MinDims(2),)),
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}), shape_rules=(MinDims(2),)
+                ),
                 "weight": ParamConstraint(
-                    dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(2),)
+                    dtypes=frozenset({torch.float16, torch.bfloat16}), shape_rules=(ExactDims(2),)
                 ),
                 "bias": ParamConstraint(dtypes=frozenset({torch.float16})),
                 "residual": ParamConstraint(dtypes=frozenset({torch.float16})),

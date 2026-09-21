@@ -371,13 +371,22 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
 
     // Low-WGP devices (integrated GPUs: 6 WGPs on a 780M, 8 on a 680M) have too
     // few workgroup processors to interleave many small blocks, so a 16-wave
-    // 512-thread block that hides WMMA latency within the block wins for K >= 2048
-    // (measured 2-18% faster than the RDNA4-tuned heuristic on the Anima/SDXL
-    // int8 shapes). Shallow K regressed with the fat blocks, so those keep the
-    // 8-warp BKB=64 shape. The env override (COMFY_KITCHEN_WMMA_TILE) forces any
-    // mode.
+    // 512-thread block that hides WMMA latency within the block wins. Deeper K
+    // amortizes the BKB=128 tile's LDS round trips; shallower K runs faster with
+    // BKB=64 on the 512-thread grid (measured on the 6-WGP 780M: the
+    // Anima/SDXL K<=2048..2880 shapes prefer 128x128 BKB64 16w, while K=8192
+    // likes BKB=128). The env override (COMFY_KITCHEN_WMMA_TILE) forces any mode.
     if (!skinny && wgps <= 8 && mode != 10) {
-        if (kbytes >= 2048) {
+        // 32-byte K-steps (fp16/bf16) halve the K-steps per tile versus 8-bit
+        // operands, so the deeper BKB=128 tile wins even at shallow K (measured
+        // on the 6-WGP 780M: fp16 prefers 128x128 BKB128 16w on every
+        // Anima/SDXL shape).
+        if (Mma::kStepBytes >= 32) {
+            constexpr int BM = 128, BN = 128, BKB = 128;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
+                <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        } else if (kbytes >= 4096) {
             constexpr int BM = 128, BN = 128, BKB = 128;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
             gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
@@ -385,8 +394,8 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
         } else if (blocks_128 >= wgps) {
             constexpr int BM = 128, BN = 128, BKB = 64;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>
-                <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
+                <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
         } else {
             constexpr int BM = 64, BN = 64, BKB = 64;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
