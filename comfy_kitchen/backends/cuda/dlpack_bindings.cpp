@@ -172,6 +172,15 @@ extern "C" {
         int input_dtype_code,
         cudaStream_t stream);
 
+    void launch_dequantize_mxfp8_kernel(
+        const void* input,
+        void* output,
+        const void* block_scales,
+        int64_t num_rows,
+        int64_t num_cols,
+        int output_dtype_code,
+        cudaStream_t stream);
+
     // SageAttention kernel launchers
     void launch_quant_qk_per_thread_int8(
         const void* q, void* q_int8, void* q_scale,
