@@ -137,6 +137,40 @@ __global__ void quantize_mxfp8_kernel(
     // Store output - FP8 is 1 byte per value, so kMXFP8ValsPerThread=8 uses float2 (8 bytes)
     *reinterpret_cast<float2*>(output + global_elem_idx) = *reinterpret_cast<float2*>(vals_output);
 }
+__device__ float e8m0_to_f32(uint8_t e){
+    if(e==0)return 0.0f;
+    return exp2f(static_cast<float>(e)-127.0f);
+}
+template <typename OType>
+__global__ void dequantize_mxfp8_kernel(
+    const __nv_fp8_e4m3* __restrict__ input,
+    const uint8_t* __restrict__ block_scales,  // E8M0 stored as uint8
+    OType* __restrict__ output,
+    const size_t num_cols,
+    const size_t num_rows) {
+
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t global_elem_idx = static_cast<size_t>(idx) * kMXFP8ValsPerThread;
+
+    // Early exit for threads beyond data (reduces divergence)
+    if (global_elem_idx >= num_rows * num_cols) return;
+
+    const size_t group_number = global_elem_idx / kMXFP8BlockSize;
+    const size_t groups_per_row = num_cols / kMXFP8BlockSize;
+    const size_t group_in_row = group_number % groups_per_row;
+
+    const size_t row_idx = group_number/groups_per_row;
+    const size_t scale_idx=scale_factor_swizzled_offset(row_idx,group_in_row,groups_per_row);
+
+    const float scale_value=e8m0_to_f32(block_scales[scale_idx]);
+
+    for(unsigned int i=0;i<kMXFP8ValsPerThread;i++){
+        const float input_value = static_cast<float>(input[global_elem_idx + i]);
+        output[global_elem_idx+i]=static_cast<OType>(input_value*scale_value);
+    }
+
+
+}
 
 } // namespace
 
