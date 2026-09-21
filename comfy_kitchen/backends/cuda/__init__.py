@@ -79,6 +79,7 @@ __all__ = [
     "quantize_and_rotate_rowwise",
     "gemv_awq_w4a16",
     "quantize_mxfp8",
+    "dequantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
     "quantize_svdquant_w4a4",
@@ -1761,7 +1762,30 @@ def quantize_mxfp8(
 
     return qx, sx
 
+def dequantize_mxfp8(qx: torch.Tensor,
+                    block_scales: torch.Tensor,
+                    output_type: torch.dtype = torch.bfloat16,
 
+)-> torch.Tensor:
+
+    assert qx.is_contiguous(), "Input tensor must be contiguous"
+    
+    num_rows, num_cols = qx.shape
+    block_scales_uint8 = block_scales.view(torch.uint8)
+    output = torch.empty((num_rows, num_cols), device=qx.device, dtype=output_type)
+
+    output_dtype_code = DTYPE_TO_CODE[output_type]
+
+    stream_ptr = torch.cuda.current_stream(qx.device).cuda_stream
+    _C.dequantize_mxfp8(
+        _wrap_for_dlpack(qx),
+        _wrap_for_dlpack(output),
+        _wrap_for_dlpack(block_scales_uint8),
+        output_dtype_code,
+        stream_ptr,
+    )
+    return output
+    
 def scaled_mm_nvfp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -3814,6 +3838,18 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
         ),
+        "dequantize_mxfp8":FunctionConstraints(
+                params={
+                    "qx": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "block_scales": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu}),
+                    ),
+                    "output_type": ParamConstraint(dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16})),
+                },
+                default_devices=cuda_devices),
         "dequantize_nvfp4": FunctionConstraints(
             params={
                 "qx": ParamConstraint(
