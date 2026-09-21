@@ -18,6 +18,11 @@ __forceinline__ __device__ int8_t quant_round(float v, float inv) {
 }
 
 // One block per row: block-reduce the row absmax, then quantize the row.
+// Reads x once when the row fits the per-thread register budget (K <= 12288),
+// which on a bandwidth-limited iGPU saves a full second global read of x; the
+// two-pass fallback covers arbitrarily long rows.
+constexpr int kQuantMaxStaged = 48;  // floats per thread, K / 256 <= 48
+
 __global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel(
     const void* __restrict__ x, int in_code, int8_t* __restrict__ q,
     float* __restrict__ scales, int M, int K) {
@@ -25,10 +30,39 @@ __global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel(
     __shared__ float red[256];
     const int row = blockIdx.x;
     const int t = threadIdx.x;
+    const int64_t base = static_cast<int64_t>(row) * K;
+
+    if ((K + 255) / 256 <= kQuantMaxStaged) {
+        float vals[kQuantMaxStaged];
+        float lmax = 0.0f;
+        int cnt = 0;
+        for (int j = t; j < K; j += 256) {
+            const float v = load_in(x, base + j, in_code);
+            vals[cnt++] = v;
+            lmax = fmaxf(lmax, fabsf(v));
+        }
+
+        red[t] = lmax;
+        __syncthreads();
+        for (int s = 128; s > 0; s >>= 1) {
+            if (t < s) red[t] = fmaxf(red[t], red[t + s]);
+            __syncthreads();
+        }
+
+        const float scale = fmaxf(red[0] / kInt8Max, 1e-30f);
+        if (t == 0) scales[row] = scale;
+        const float inv = 1.0f / scale;
+
+        int j = t;
+        for (int i = 0; i < cnt; ++i, j += 256) {
+            q[base + j] = quant_round(vals[i], inv);
+        }
+        return;
+    }
 
     float lmax = 0.0f;
     for (int j = t; j < K; j += 256)
-        lmax = fmaxf(lmax, fabsf(load_in(x, static_cast<int64_t>(row) * K + j, in_code)));
+        lmax = fmaxf(lmax, fabsf(load_in(x, base + j, in_code)));
 
     red[t] = lmax;
     __syncthreads();
@@ -42,8 +76,8 @@ __global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel(
     const float inv = 1.0f / scale;
 
     for (int j = t; j < K; j += 256) {
-        const float v = load_in(x, static_cast<int64_t>(row) * K + j, in_code);
-        q[static_cast<int64_t>(row) * K + j] = quant_round(v, inv);
+        const float v = load_in(x, base + j, in_code);
+        q[base + j] = quant_round(v, inv);
     }
 }
 
