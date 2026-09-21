@@ -591,6 +591,32 @@ void quantize_mxfp8(
         stream);
 }
 
+void dequantize_mxfp8(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<nb::device::cuda> output,
+    nb::ndarray<nb::device::cuda> block_scales,
+    int output_dtype_code,
+    uintptr_t stream_ptr){
+
+    // Get input dimensions
+    int64_t num_rows = input.shape(0);
+    int64_t num_cols = input.shape(1);
+
+    // Validate output dtype code (0=float32, 1=float16, 2=bfloat16)
+    if (output_dtype_code < 0 || output_dtype_code > 2) {
+        throw std::runtime_error("Unsupported output dtype for MXFP8 dequantization (must be float32, float16, or bfloat16)");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_dequantize_mxfp8_kernel(
+        input.data(),
+        output.data(),
+        block_scales.data(),
+        num_rows,
+        num_cols,
+        output_dtype_code,
+        stream);
+}
 // Nanobind wrapper for apply_rope (handles both single tensor and q/k pair)
 void apply_rope(
     nb::ndarray<nb::device::cuda> xq,
@@ -4243,6 +4269,14 @@ NB_MODULE(_C, m) {
           nb::arg("output"),
           nb::arg("block_scales"),
           nb::arg("pad_32x") = false,
+          nb::arg("stream_ptr"));
+
+    m.def("dequantize_mxfp8", &dequantize_mxfp8,
+          "Dequantize FP8 E4M3 with E8M0 block scales using cuBLAS tiled layout",
+          nb::arg("input"),
+          nb::arg("output"),
+          nb::arg("block_scales"),
+          nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"));
 
     m.def("_quant_v_int8", &quant_v_int8,
