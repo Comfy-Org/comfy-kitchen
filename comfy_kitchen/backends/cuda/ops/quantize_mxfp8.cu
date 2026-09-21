@@ -241,5 +241,47 @@ void launch_quantize_mxfp8_kernel(
     }
 }
 
-} // extern "C"
+void launch_dequantize_mxfp8_kernel(
+    const void* input,
+    void* output,
+    const void* block_scales,
+    int64_t num_rows,
+    int64_t num_cols,
+    int output_dtype_code,
+    cudaStream_t stream) {
 
+        if (num_rows == 0 || num_cols == 0)
+        return;
+
+        // Each row must contain complete 32-value groups.
+        if (num_cols % comfy::kMXFP8BlockSize != 0) {
+            throw std::runtime_error("num_cols must be divisible by 32 for MXFP8 block dequantization");
+    }
+    const int64_t numel = num_rows * num_cols;
+
+    // Each thread processes kMXFP8ValsPerThread values
+    constexpr int threads_per_block = 128;
+    const int64_t total_threads_needed = numel / comfy::kMXFP8ValsPerThread;
+    const int blocks = static_cast<int>((total_threads_needed + threads_per_block - 1) / threads_per_block);
+
+    DISPATCH_FP_DTYPE(output_dtype_code, OType, [&] {
+        comfy::dequantize_mxfp8_kernel<OType>
+        <<<blocks, threads_per_block, 0, stream>>>(
+            static_cast<const __nv_fp8_e4m3*>(input),
+            static_cast<const uint8_t*>(block_scales),
+            static_cast<OType*>(output),
+            num_cols,
+            num_rows
+        );
+    });
+
+    // Check for kernel launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA kernel launch failed: ") + cudaGetErrorString(err));
+    }
+
+    }
+
+
+} // extern "C"
