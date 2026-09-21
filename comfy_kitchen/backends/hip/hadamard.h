@@ -656,11 +656,56 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
         scaleout[row] = scale;
     }
 
-    for (int col = tid; col < K; col += BLOCK_THREADS) {
-        const float v = load_row_value(row_buf[col]);
-        int q = static_cast<int>(rintf(v * inv));
-        q = q < -127 ? -127 : (q > 127 ? 127 : q);
-        qout[row_offset + col] = static_cast<int8_t>(q);
+    // Quantize the rotated row out of LDS with 8-wide (16-bit rows) or 4-wide
+    // (fp32 rows) vector chunks, packing the int8 into one 8/4-byte store so a
+    // warp writes 256B of a row per instruction instead of 64B.
+    constexpr int kVec = sizeof(RowT) == 2 ? 8 : 4;
+    const bool vec_ok = (K % kVec) == 0;
+    if (vec_ok) {
+        const int chunks = K / kVec;
+        for (int c = tid; c < chunks; c += BLOCK_THREADS) {
+            const int col = c * kVec;
+            const RowT* rp = row_buf + col;
+            uint4 v;
+            if constexpr (sizeof(RowT) == 2) {
+                v = *reinterpret_cast<const uint4*>(rp);
+            } else {
+                const float4 f = *reinterpret_cast<const float4*>(rp);
+                v.x = __float_as_uint(f.x);
+                v.y = __float_as_uint(f.y);
+                v.z = __float_as_uint(f.z);
+                v.w = __float_as_uint(f.w);
+            }
+            if constexpr (sizeof(RowT) == 2) {
+                const RowT* elems = reinterpret_cast<const RowT*>(&v);
+                int64_t pack = 0;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float fv = load_row_value(elems[i]);
+                    int q = static_cast<int>(rintf(fv * inv));
+                    q = q < -127 ? -127 : (q > 127 ? 127 : q);
+                    pack |= static_cast<int64_t>(static_cast<uint8_t>(q)) << (8 * i);
+                }
+                *reinterpret_cast<int64_t*>(qout + row_offset + col) = pack;
+            } else {
+                const float* fp = reinterpret_cast<const float*>(&v);
+                int32_t pack = 0;
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    int q = static_cast<int>(rintf(fp[i] * inv));
+                    q = q < -127 ? -127 : (q > 127 ? 127 : q);
+                    pack |= static_cast<int32_t>(static_cast<uint8_t>(q)) << (8 * i);
+                }
+                *reinterpret_cast<int32_t*>(qout + row_offset + col) = pack;
+            }
+        }
+    } else {
+        for (int col = tid; col < K; col += BLOCK_THREADS) {
+            const float v = load_row_value(row_buf[col]);
+            int q = static_cast<int>(rintf(v * inv));
+            q = q < -127 ? -127 : (q > 127 ? 127 : q);
+            qout[row_offset + col] = static_cast<int8_t>(q);
+        }
     }
 }
 
