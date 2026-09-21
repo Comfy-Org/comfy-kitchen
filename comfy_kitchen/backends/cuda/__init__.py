@@ -1762,15 +1762,23 @@ def quantize_mxfp8(
 
     return qx, sx
 
-def dequantize_mxfp8(qx: torch.Tensor,
-                    block_scales: torch.Tensor,
-                    output_type: torch.dtype = torch.bfloat16,
-
-)-> torch.Tensor:
+def dequantize_mxfp8(
+    qx: torch.Tensor,
+    block_scales: torch.Tensor,
+    output_type: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
 
     assert qx.is_contiguous(), "Input tensor must be contiguous"
+    assert qx.dtype == torch.float8_e4m3fn, "Input must use float8_e4m3fn"
+    assert block_scales.is_contiguous(), "Block scales must be contiguous"
+    assert block_scales.device == qx.device, "Block scales must be on the same device as input"
+    assert block_scales.dtype == torch.float8_e8m0fnu, "Block scales must use float8_e8m0fnu"
 
     num_rows, num_cols = qx.shape
+    expected_scale_shape = (roundup(num_rows, 128), roundup(num_cols // 32, 4))
+    assert tuple(block_scales.shape) == expected_scale_shape, (
+        f"Expected block scales shape {expected_scale_shape}, got {tuple(block_scales.shape)}"
+    )
     block_scales_uint8 = block_scales.view(torch.uint8)
     output = torch.empty((num_rows, num_cols), device=qx.device, dtype=output_type)
 
