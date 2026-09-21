@@ -1769,7 +1769,7 @@ def dequantize_mxfp8(qx: torch.Tensor,
 )-> torch.Tensor:
 
     assert qx.is_contiguous(), "Input tensor must be contiguous"
-    
+
     num_rows, num_cols = qx.shape
     block_scales_uint8 = block_scales.view(torch.uint8)
     output = torch.empty((num_rows, num_cols), device=qx.device, dtype=output_type)
@@ -1785,7 +1785,6 @@ def dequantize_mxfp8(qx: torch.Tensor,
         stream_ptr,
     )
     return output
-    
 def scaled_mm_nvfp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -4425,4 +4424,3 @@ def _register():
 
 
 _register()
-

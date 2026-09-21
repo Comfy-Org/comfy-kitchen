@@ -518,7 +518,8 @@ class TestDequantizeMXFP8:
             qx, scales = ck.quantize_mxfp8(x)
             expected = ck.dequantize_mxfp8(qx, scales, output_type=torch.bfloat16)
 
-        actual = cuda_backend.dequantize_mxfp8(qx, scales, output_type=torch.bfloat16)
+        with ck.use_backend("cuda"):
+            actual = ck.dequantize_mxfp8(qx, scales, output_type=torch.bfloat16)
 
         assert_values_close(
             actual.float(),
