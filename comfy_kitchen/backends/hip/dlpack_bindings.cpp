@@ -1381,7 +1381,7 @@ static void sage_check_quantized(const nb::ndarray<>& q_int8, const nb::ndarray<
     }
     require_len(q_int8, static_cast<int64_t>(batch) * q_heads * qo_len * head_dim, fn, "q_int8");
     require_len(k_int8, static_cast<int64_t>(batch) * kv_heads * kv_len * head_dim, fn, "k_int8");
-    require_len(v_int8, static_cast<int64_t>(batch) * kv_heads * head_dim * padded_k, fn,
+    require_len(v_int8, static_cast<int64_t>(batch) * kv_heads * head_dim * padded_k * 2, fn,
                 "v_int8");
     require_scale_len(q_scale, static_cast<size_t>(batch) * q_heads * padded_q, fn, "q_scale");
     require_scale_len(k_scale, static_cast<size_t>(batch) * kv_heads * (padded_k / kSageKeyGroup),
@@ -1698,7 +1698,7 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
     // V is packed as [B * H_kv * D, padded_k], and padded_k follows cta_k. Element
     // count alone cannot tell a buffer packed against a different cta_k from a
     // correct one, and the kernel would read shifted rows rather than fail.
-    if (v_int8.shape(1) != static_cast<size_t>(sage_padded_k(kv_len, cta_k))) {
+    if (v_int8.shape(1) != static_cast<size_t>(sage_padded_k(kv_len, cta_k)) * 2) {
         throw std::runtime_error(std::string(kFn) + ": packed v row width " +
                                  std::to_string(v_int8.shape(1)) + " does not match cta_k " +
                                  std::to_string(cta_k));

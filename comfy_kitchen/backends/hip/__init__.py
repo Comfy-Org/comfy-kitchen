@@ -2943,10 +2943,13 @@ def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
         # V is stored transposed, [B * H * D, padded_K], in its own dtype (the
         # int8-QK / bf16-fp16-SV path keeps V unquantized), with the tail zero
         # filled. The buffer key keeps the legacy name; its dtype is q's.
-        # V is quantized and stored transposed, [B * H * D, padded_K], with the
-        # tail zero filled (pure-int8 path).
+        # V is stored transposed, [B * H * D, padded_K], with the tail zero
+        # filled (pure-int8 path). The buffer is twice the int8 width: the
+        # int8 kernels read the first padded_K columns (int8 stride), while the
+        # short-key direct path writes the fp16 transposed V over the full
+        # 2*padded_K byte width — a bare int8 buffer would overrun by 2x.
         "v_int8": torch.empty(
-            batch * kv_heads * head_dim, padded_k, dtype=torch.int8, device=device
+            batch * kv_heads * head_dim, padded_k * 2, dtype=torch.int8, device=device
         ),
         "v_scale": torch.empty(batch * kv_heads * head_dim, dtype=torch.float32, device=device),
     }
