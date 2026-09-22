@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""HIP backend for AMD RDNA2, RDNA3/3.5 and RDNA4.
+"""HIP backend for AMD Vega, RDNA, RDNA2, RDNA3/3.5 and RDNA4.
 
 Every matmul is a WMMA kernel compiled from the sources in this directory; the
 backend does not link or call hipBLAS/hipBLASLt.
@@ -9,9 +9,9 @@ RDNA3 (gfx11xx) and RDNA4 (gfx12xx) have matrix cores and get everything. Their
 fragment layouts differ, and RDNA3 has no fp8 WMMA, so it widens fp8 to bf16;
 see mma.h.
 
-Vega/GCN 5 (gfx90c), RDNA (gfx101x) and RDNA2 (gfx103x) have no matrix cores. They run the elementwise kernels (RoPE,
-AdaLN and RMS-AdaLN, the quantizers, stochastic rounding, the AWQ GEMV) and
-decline the GEMMs, which fall through to triton/eager.
+Vega/GCN 5 (gfx90c), RDNA (gfx101x) and RDNA2 (gfx103x) emulate the same tile
+contract with vector arithmetic; gfx103x uses its packed int8 dot product. The
+attention kernels still require native WMMA fragment support.
 """
 
 import functools
@@ -81,6 +81,8 @@ __all__ = [
     "dequantize_per_tensor_fp8",
     "dequantize_w4a8_int8_weight",
     "has_wmma",
+    "has_native_wmma",
+    "offload_weight",
     "int8_linear",
     "int8_attention_is_available",
     "flash_attention_decode_is_available",
@@ -188,16 +190,10 @@ _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 # registry-dispatched GEMMs so _build_constraints can drop them on RDNA2; the fp8
 # GEMM is not among them because it is reached through scaled_mm_v2's _hip_fp8_gemm,
 # which gates on has_wmma() itself rather than through the registry.
-_WMMA_ONLY_OPS = frozenset(
+_TILED_ATTENTION_OPS = frozenset(
     {
-        "fp16_conv3d",
-        "fp16_linear",
-        "int8_linear",
         "na3d",
         "sol_attn",
-        "convrot_w4a4_linear",
-        "scaled_mm_svdquant_w4a4",
-        "w4a8_int8_linear",
     }
 )
 
@@ -219,12 +215,14 @@ def _unsupported_arch_reason(arches: Sequence[str | None]) -> str | None:
 
 
 def _has_wmma(arches: Sequence[str | None]) -> bool:
-    """Whether every visible device has matrix cores.
+    """Whether every visible device implements the 16x16 tile contract.
 
-    Registration is per-process while kernels launch on the tensor's own device, so
-    the capability set has to be the intersection over the visible devices: one
-    RDNA2 card in an otherwise RDNA4 box means no GEMM is safe to advertise.
+    gfx11+ uses native WMMA; validated gfx9/gfx10 targets use the software policy.
     """
+    return bool(arches) and all(a in _ARCH_SUPPORTED for a in arches)
+
+
+def _has_native_wmma(arches: Sequence[str | None]) -> bool:
     return bool(arches) and all(a in _ARCH_WMMA for a in arches)
 
 
@@ -233,18 +231,25 @@ def is_available() -> bool:
 
 
 def has_wmma() -> bool:
-    """Whether the GEMM kernels can run: every visible device has matrix cores.
-
-    is_available() is true on RDNA2 as well, where only the elementwise kernels
-    exist, so callers that reach a GEMM without going through the registry (see
-    scaled_mm_v2) have to test this instead. One arch snapshot per call: this sits
-    on the per-GEMM dispatch path.
-    """
+    """Whether every visible device can run the tiled GEMM kernels."""
     arches = _visible_gfx_arches()
     return (
         _EXT_AVAILABLE
         and _unsupported_arch_reason(arches) is None
         and _has_wmma(arches)
+    )
+
+
+def has_native_wmma() -> bool:
+    """Whether every visible device has native gfx11+ WMMA instructions.
+
+    Attention kernels use native fragment layouts and must use this stricter gate.
+    """
+    arches = _visible_gfx_arches()
+    return (
+        _EXT_AVAILABLE
+        and _unsupported_arch_reason(arches) is None
+        and _has_native_wmma(arches)
     )
 
 
@@ -263,6 +268,38 @@ def _aligned(t: torch.Tensor) -> torch.Tensor:
     allocation is the only way to move the base.
     """
     return t.clone() if t.data_ptr() % 16 else t
+
+
+def offload_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Copy a weight to mapped pinned host memory for direct HIP kernel reads.
+
+    The ROCm driver decides whether those pages reside in ordinary host RAM or
+    an APU's GTT aperture. Pageable CPU tensors are intentionally not accepted by
+    GEMM entry points because a device cannot safely dereference them.
+    """
+    source = weight.detach().contiguous().cpu()
+    result = torch.empty_like(source, device="cpu", pin_memory=True)
+    result.copy_(source)
+    return result
+
+
+def _weight_operand(
+    weight: torch.Tensor, device: torch.device, name: str, shape=None
+) -> torch.Tensor:
+    if shape is not None and tuple(weight.shape) != tuple(shape):
+        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(weight.shape)}")
+    if weight.device.type != "cpu":
+        return _operand(weight, device, name, shape)
+    if not weight.is_pinned():
+        raise ValueError(
+            f"{name} on CPU must be mapped pinned memory; use hip.offload_weight()"
+        )
+    weight = weight.contiguous()
+    if weight.data_ptr() % 16:
+        aligned = torch.empty_like(weight, pin_memory=True)
+        aligned.copy_(weight)
+        weight = aligned
+    return weight
 
 
 def _operand(
@@ -423,7 +460,7 @@ def scaled_mm_fp8(
             f"scaled_mm_fp8 requires float8_e4m3fn operands, got a={a.dtype}, b={b.dtype}"
         )
     a = _aligned(a.contiguous())
-    b_nk = _aligned(_weight_as_nk(b).to(device=a.device))
+    b_nk = _weight_operand(_weight_as_nk(b), a.device, "b")
 
     m, k = a.shape
     n = b_nk.shape[0]
@@ -751,7 +788,7 @@ def fp16_linear(
     supported = (
         x.dtype == torch.float16
         and weight.dtype == torch.float16
-        and weight.device == x.device
+        and (weight.device == x.device or (weight.device.type == "cpu" and weight.is_pinned()))
         and x_2d.shape[1] == k
         # the tile stager issues 16-byte row loads; a misaligned view falls back, as on CUDA
         and x_2d.data_ptr() % 16 == 0
@@ -765,7 +802,7 @@ def fp16_linear(
         )
     )
     if supported:
-        weight = weight if weight.is_contiguous() else weight.contiguous()
+        weight = _weight_operand(weight, x.device, "weight")
         supported = weight.data_ptr() % 16 == 0
     if not supported:
         # the kernel path takes bias and residual from any device, so the fallback must too
@@ -795,8 +832,11 @@ def fp16_linear(
         _stream(x),
     )
     if not served:
+        fallback_weight = weight.to(device=x.device)
         out = _apply_residual(
-            torch.nn.functional.linear(x_2d, weight, bias_arg), resid_arg, rscale_arg
+            torch.nn.functional.linear(x_2d, fallback_weight, bias_arg),
+            resid_arg,
+            rscale_arg,
         )
     return out if len(orig_shape) == 2 else out.reshape(*orig_shape[:-1], n)
 
@@ -846,7 +886,7 @@ def int8_linear(
             f"Input and weight inner dimensions must match, got {k_act} and {weight.shape[-1]}"
         )
 
-    weight = _aligned(weight.to(device=x.device).contiguous())
+    weight = _weight_operand(weight, x.device, "weight")
     weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1)
     if weight_scale.numel() not in (1, weight.shape[0]):
         raise ValueError(
@@ -1476,7 +1516,7 @@ def convrot_w4a4_linear(
         raise ValueError(f"wscales must have {n} entries, got {wscales.numel()}")
     if bias is not None:
         bias = _bias_operand(bias, n, x.device)
-    qw = _operand(qweight, x.device, "qweight", shape=(n, k // 2))
+    qw = _weight_operand(qweight, x.device, "qweight", shape=(n, k // 2))
 
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
     _C.convrot_w4a4_gemm(
@@ -2418,7 +2458,7 @@ def _check_sol_args(sink_blocks, sink_q, topk_ratio, **tensors):
 
     if not has_wmma():
         raise RuntimeError(
-            "sol_attn: requires RDNA3 or newer matrix cores (WMMA); this device has none"
+            "sol_attn: requires a validated HIP tiled-attention architecture"
         )
     check = sol_attn_common_call_rule(
         {
@@ -3161,10 +3201,9 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         constraints[inplace_name] = constraints[functional_name]
 
     if not has_wmma:
-        # RDNA2: the GEMM kernels are compiled but trap, so they must not be
-        # advertised. Dropping them here routes those ops to triton/eager while the
-        # elementwise kernels below still dispatch to HIP.
-        constraints = {k: v for k, v in constraints.items() if k not in _WMMA_ONLY_OPS}
+        constraints = {
+            k: v for k, v in constraints.items() if k not in _TILED_ATTENTION_OPS
+        }
 
     return constraints
 
@@ -3201,8 +3240,7 @@ def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool) -> int:
 def int8_attention_is_available() -> bool:
     """Whether the INT8 attention kernels can run here.
 
-    Stricter than is_available(): the kernel is built on the matrix cores, so
-    RDNA2 declines it the way it declines the GEMMs.
+    Native WMMA and software tile policies implement the same fragment contract.
     """
     return has_wmma()
 
@@ -3217,13 +3255,13 @@ def flash_attention_decode_is_available() -> bool:
     The attribute test catches an extension built before the kernel existed,
     which is otherwise an AttributeError at dispatch.
     """
-    return has_wmma() and hasattr(_C, "flash_attention_decode")
+    return has_native_wmma() and hasattr(_C, "flash_attention_decode")
 
 
-def _require_sage_wave32() -> None:
+def _require_sage_attention() -> None:
     if not has_wmma():
         raise RuntimeError(
-            "sage int8 attention requires a wave32 RDNA3 or newer matrix-core device"
+            "sage int8 attention requires a validated HIP tiled-attention architecture"
         )
 
 
@@ -3251,7 +3289,7 @@ def gated_delta_decode_is_available(
     throughout, so they draw the line where has_wmma() does, as the decode
     attention kernel next door does.
     """
-    if not has_wmma() or not hasattr(_C, "gated_delta_decode_fused"):
+    if not has_native_wmma() or not hasattr(_C, "gated_delta_decode_fused"):
         return False
     if key_head_dim != _DELTA_KEY_DIM or value_head_dim <= 0 or value_head_dim > 512:
         return False
@@ -3421,7 +3459,7 @@ def sage_int8_sdpa(
 ) -> torch.Tensor:
     """Quantize and attend in one call. q, k and v are already padded to a
     supported head dimension; the output keeps that width."""
-    _require_sage_wave32()
+    _require_sage_attention()
     batch, q_heads, q_length, head_dim = q.shape
     output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
     output = torch.empty(
@@ -3460,7 +3498,7 @@ def sage_int8_quantize(
     cta_k: int = _SAGE_CTA_K,
 ) -> dict:
     """Quantize q, k and v without allocating the attention output."""
-    _require_sage_wave32()
+    _require_sage_attention()
     buffers, anchor_indices = _sage_buffers(q, k, cta_k)
     _C.sage_sdpa_quantize(
         _dl(q),
@@ -3494,7 +3532,7 @@ def sage_int8_attend(
     cta_k: int = _SAGE_CTA_K,
 ) -> torch.Tensor:
     """Attend over the packed layouts sage_int8_quantize produced."""
-    _require_sage_wave32()
+    _require_sage_attention()
     batch, q_heads, q_length, head_dim = q_int8.shape
     output = torch.empty(
         batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q_int8.device
@@ -3540,6 +3578,7 @@ def _register():
         return
 
     has_wmma = _has_wmma(arches)
+    has_native_wmma = _has_native_wmma(arches)
     registry.register(
         name="hip",
         module=sys.modules[__name__],
@@ -3548,7 +3587,7 @@ def _register():
     logger.debug(
         "registered HIP backend for %s (%s)",
         ", ".join(sorted({a for a in arches if a})),
-        "with WMMA" if has_wmma else "elementwise only, no matrix cores",
+        "with native WMMA" if has_native_wmma else "with software tile GEMM",
     )
 
 

@@ -1,8 +1,8 @@
 """Correctness tests for the HIP backend.
 
 Skipped unless the backend registered, which requires an RDNA2/3/4 device and the
-compiled extension. The GEMM tests need matrix cores on top of that, so they are
-skipped on RDNA2, which has none; see needs_wmma.
+compiled extension. Tiled GEMMs use software policies on pre-WMMA devices, while
+NA3D and GEMMs share the native-or-software tile contract; see needs_wmma.
 """
 import pytest
 import torch
@@ -52,10 +52,9 @@ def _has_wmma() -> bool:
 
 HAS_WMMA = _has_wmma()
 
-# The GEMMs compile on RDNA2 but trap: it has no matrix cores, and the backend
-# does not advertise them there. An absent backend reports why instead.
+
 needs_wmma = pytest.mark.skipif(
-    not HAS_WMMA, reason=_UNAVAILABLE or "GEMM kernels need matrix cores (RDNA3/RDNA4)"
+    not HAS_WMMA, reason=_UNAVAILABLE or "tiled GEMM kernels are unavailable"
 )
 
 DEV = "cuda"

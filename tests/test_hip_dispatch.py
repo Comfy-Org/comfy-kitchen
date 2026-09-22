@@ -137,18 +137,37 @@ def test_hip_declines_when_an_arch_cannot_be_read():
         (["gfx1200"], True),
         (["gfx1201", "gfx1100"], True),
         (["gfx1151"], True),
-        (["gfx1030"], False),  # RDNA2 has no matrix cores
-        (["gfx1200", "gfx1030"], False),  # kernels launch on the tensor's own device
+        (["gfx1030"], True),  # RDNA2 uses the software tile policy
+        (["gfx1200", "gfx1030"], True),
         ([None], False),
     ],
 )
 def test_hip_wmma_capability(arches, expected):
-    """Only an all-matrix-core process may advertise the GEMMs."""
+    """Every validated target implements the tiled GEMM contract."""
     assert hip_backend._has_wmma(arches) is expected
 
 
-def test_sage_direct_entries_reject_wave64_arch(monkeypatch):
-    """Backend-direct calls must not bypass the wave32 kernel gate on gfx90c."""
+@pytest.mark.parametrize(
+    ("arches", "expected"),
+    [
+        (["gfx1200"], True),
+        (["gfx1100", "gfx1151"], True),
+        (["gfx1030"], False),
+        (["gfx90c"], False),
+        (["gfx1200", "gfx1030"], False),
+    ],
+)
+def test_hip_native_wmma_capability(arches, expected):
+    assert hip_backend._has_native_wmma(arches) is expected
+
+
+def test_pageable_host_weight_is_rejected_before_launch():
+    weight = torch.empty((4, 16), dtype=torch.int8)
+    with pytest.raises(ValueError, match="offload_weight"):
+        hip_backend._weight_operand(weight, torch.device("cuda"), "weight")
+
+
+def test_sage_direct_entries_require_tiled_attention(monkeypatch):
     monkeypatch.setattr(hip_backend, "has_wmma", lambda: False)
 
     calls = (
@@ -170,34 +189,34 @@ def test_sage_direct_entries_reject_wave64_arch(monkeypatch):
     )
 
     for call in calls:
-        with pytest.raises(RuntimeError, match="wave32"):
+        with pytest.raises(RuntimeError, match="tiled-attention"):
             call()
 
 
-def test_sage_native_entries_require_validated_wmma_wave32():
+def test_sage_native_entries_accept_validated_software_tile_arches():
     bindings = _HIP_BINDINGS.read_text(encoding="utf-8")
     common = (_HIP_DIR / "sage_attention" / "sage_common.h").read_text(encoding="utf-8")
     groups = _architecture_groups()
 
     assert "gfx1010" in groups["elementwise_only"]
     assert all("gfx1010" not in groups[group] for group in ("wmma_gfx11", "wmma_gfx12"))
-    assert bindings.count("sage_require_wmma_wave32(") == 4  # definition plus entries
-    assert "!sage_is_wmma_arch(properties.gcnArchName)" in bindings
-    assert "properties.warpSize != 32" in bindings
-    assert "defined(COMFY_HAS_WMMA) && defined(__AMDGCN_WAVEFRONT_SIZE__)" in common
+    assert (
+        bindings.count("sage_require_supported_arch(") == 4
+    )  # definition plus entries
+    assert "!sage_is_supported_arch(properties.gcnArchName)" in bindings
+    assert "COMFY_HIP_SUPPORTED_ARCH_NAMES" in bindings
+    assert "properties.warpSize != 32" not in bindings
+    assert "independent logical partitions" in common
 
 
-def test_hip_drops_gemms_without_matrix_cores():
-    """RDNA2 keeps the elementwise kernels and hands the GEMMs back to triton/eager."""
+def test_hip_advertises_attention_with_any_tile_policy():
     with_wmma = hip_backend._build_constraints(has_wmma=True)
     without = hip_backend._build_constraints(has_wmma=False)
 
-    # Every WMMA-only op must be advertised with matrix cores; an intersection
-    # would pass while any single one was missing from the constraints.
-    assert set(with_wmma) >= hip_backend._WMMA_ONLY_OPS
-    assert not (hip_backend._WMMA_ONLY_OPS & set(without))
-    # na3d is a matrix-core kernel: without one it traps rather than answers.
-    assert "na3d" in hip_backend._WMMA_ONLY_OPS
+    assert set(with_wmma) >= hip_backend._TILED_ATTENTION_OPS
+    assert not (hip_backend._TILED_ATTENTION_OPS & set(without))
+    for op in ("fp16_linear", "int8_linear", "convrot_w4a4_linear"):
+        assert op in without
     # The elementwise kernels need no matrix cores and must survive.
     for op in (
         "apply_rope",

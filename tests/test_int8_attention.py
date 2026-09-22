@@ -17,13 +17,15 @@ requires_int8_attention = pytest.mark.skipif(
 
 
 def _qkv(batch, q_heads, kv_heads, q_length, kv_length, head_dim, dtype=torch.bfloat16):
-    q = torch.randn(batch, q_length, q_heads, head_dim, device="cuda", dtype=dtype).transpose(1, 2)
-    k = torch.randn(batch, kv_length, kv_heads, head_dim, device="cuda", dtype=dtype).transpose(
-        1, 2
-    )
-    v = torch.randn(batch, kv_length, kv_heads, head_dim, device="cuda", dtype=dtype).transpose(
-        1, 2
-    )
+    q = torch.randn(
+        batch, q_length, q_heads, head_dim, device="cuda", dtype=dtype
+    ).transpose(1, 2)
+    k = torch.randn(
+        batch, kv_length, kv_heads, head_dim, device="cuda", dtype=dtype
+    ).transpose(1, 2)
+    v = torch.randn(
+        batch, kv_length, kv_heads, head_dim, device="cuda", dtype=dtype
+    ).transpose(1, 2)
     return q, k, v
 
 
@@ -84,11 +86,10 @@ def test_int8_attention_capability_dispatch(monkeypatch, capability, expected):
 
 @pytest.mark.parametrize("has_wmma", [True, False])
 def test_int8_attention_hip_dispatch_follows_matrix_cores(monkeypatch, has_wmma):
-    """On ROCm the gate is matrix cores, not a compute capability.
+    """On ROCm the gate is the native-or-software tile contract.
 
     torch.cuda is the ROCm API there and reports an SM-shaped capability for a
-    gfx part, so the CUDA test above would wave RDNA2 through to a kernel built
-    on WMMA. RDNA2 has none and must decline.
+    gfx part, so the CUDA compute-capability test does not decide HIP support.
     """
     if not getattr(torch.version, "hip", None):
         pytest.skip("requires a ROCm PyTorch runtime")
@@ -253,9 +254,7 @@ def test_int8_attention_fully_masked_key_broadcast_is_zero(mask_dtype):
     if mask_dtype == torch.bool:
         mask = torch.zeros(1, 1, 1, 97, dtype=torch.bool, device="cuda")
     else:
-        mask = torch.full(
-            (1, 1, 1, 97), -torch.inf, dtype=mask_dtype, device="cuda"
-        )
+        mask = torch.full((1, 1, 1, 97), -torch.inf, dtype=mask_dtype, device="cuda")
 
     actual = ck.int8_attention(q, k, v, attn_mask=mask)
 
@@ -266,9 +265,7 @@ def test_int8_attention_fully_masked_key_broadcast_is_zero(mask_dtype):
 def test_int8_attention_stabilizes_large_common_key_component():
     torch.manual_seed(7)
     q, k, v = _qkv(1, 16, 16, 513, 513, 128)
-    common_key = torch.randn(
-        1, 16, 1, 128, device="cuda", dtype=torch.float32
-    )
+    common_key = torch.randn(1, 16, 1, 128, device="cuda", dtype=torch.float32)
     common_key.mul_(40.0 / common_key.square().mean(-1, keepdim=True).sqrt())
     k.add_(common_key.to(k.dtype))
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
@@ -440,13 +437,19 @@ def test_int8_attention_accepts_dlpack_normalized_batch_stride():
     ]
     reported = [t.transpose(0, 1).unsqueeze(0) for t in packed]
     normalized = [
-        torch.as_strided(t, (1, heads, length, head_dim), (1, head_dim, heads * head_dim, 1))
+        torch.as_strided(
+            t, (1, heads, length, head_dim), (1, head_dim, heads * head_dim, 1)
+        )
         for t in packed
     ]
     assert normalized[0].stride(0) == 1
     assert torch.equal(reported[0], normalized[0])
 
-    expected = ck.int8_attention_from_prequantized(ck.prequantize_int8_attention(*reported))
-    actual = ck.int8_attention_from_prequantized(ck.prequantize_int8_attention(*normalized))
+    expected = ck.int8_attention_from_prequantized(
+        ck.prequantize_int8_attention(*reported)
+    )
+    actual = ck.int8_attention_from_prequantized(
+        ck.prequantize_int8_attention(*normalized)
+    )
 
     assert torch.equal(actual, expected)

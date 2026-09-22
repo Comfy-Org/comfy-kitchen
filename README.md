@@ -46,13 +46,12 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 Each of the eight rope entries also has an in-place form (`apply_rope_`,
 `rms_rope_split_half1_`, ...) with the same backend coverage as the row above.
 
-## HIP backend (AMD Vega APU / RDNA1 RDNA2 / RDNA3 / RDNA3.5 / RDNA4)
+## HIP backend (AMD Vega APU / RDNA1 / RDNA2 / RDNA3 / RDNA3.5 / RDNA4)
 
-The `hip` backend implements the quantized paths with its own kernels: WMMA
-matrix-core GEMMs on RDNA3/RDNA3.5/RDNA4, and non-WMMA kernels (quantizers,
-INT8 dequantizers, RoPE and the fused RMSNorm+RoPE, AdaLN and RMS-AdaLN, the AWQ
-GEMV) that also run on RDNA2. It does not link or call hipBLAS/hipBLASLt; every
-matmul is compiled from the sources in `comfy_kitchen/backends/hip/`.
+The `hip` backend implements the quantized paths with its own kernels: native
+WMMA on RDNA3/RDNA3.5/RDNA4 and a software 16x16 tile policy on Vega, RDNA1 and
+RDNA2. It does not link or call hipBLAS/hipBLASLt; every matmul is compiled from
+the sources in `comfy_kitchen/backends/hip/`.
 
 Both rope kernels address their inputs through the tensor's own strides, so a q/k
 pair permuted or sliced out of a packed qkv is read where it lies rather than
@@ -72,20 +71,36 @@ What a GPU gets depends on whether it has matrix cores:
 | RDNA4      | `gfx1200`, `gfx1201`        | WMMA + fp8   | All HIP-supported kernels, fp8 native   |
 | RDNA3.5    | `gfx1150`-`gfx1153`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
 | RDNA3      | `gfx1100`-`gfx1103`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
-| RDNA2      | `gfx1030`-`gfx1036`         | none         | Non-WMMA kernels incl. AWQ GEMV; WMMA GEMMs decline |
-| RDNA1      | `gfx1010`                   | none         | Non-WMMA kernels incl. AWQ GEMV; WMMA GEMMs decline |
-| Vega (APU) | `gfx90c`                    | none         | Non-WMMA kernels incl. AWQ GEMV; WMMA GEMMs decline |
+| RDNA2      | `gfx1030`-`gfx1036`         | `sdot4`      | Software tile GEMMs, NA3D, Sage INT8 and Sol attention |
+| RDNA1      | `gfx1010`                   | vector ALU   | Software tile GEMMs, NA3D, Sage INT8 and Sol attention |
+| Vega (APU) | `gfx90c`                    | vector ALU   | Software tile GEMMs, NA3D, Sage INT8 and Sol attention |
 
 fp8, int8 and int4 share one byte-addressed tile kernel (`gemm_wmma.h`). RDNA3
 and RDNA4 spread a WMMA operand across the wave differently and RDNA3 has no fp8
 WMMA (it widens to bf16, which is exact), so each has its own set of `Mma`
 policies in `mma.h`; the tile kernel itself is shared.
 
-RDNA2 has no matrix cores. It runs the kernels that do not need them (RoPE,
-AdaLN and RMS-AdaLN, the quantizers, stochastic rounding, the AWQ GEMV) and does
-not advertise the GEMMs, which fall through to triton/eager. In a process with a
-mix of GPUs the capability set is the intersection, since kernels launch on the
-tensor's own device.
+On pre-WMMA devices, each logical 32-lane wave partition computes the same
+16x16 accumulator layout with row broadcasts and vector dot products. RDNA2
+uses native packed `sdot4`; RDNA1 and Vega use compiler-generated arithmetic.
+NA3D, Sage INT8 attention and Sol attention use the same fragment contract and
+run on either policy. Flash decode does not use this tile path and remains
+limited to its native-WMMA/BF16 hardware envelope.
+
+Large linear weights can stay in mapped pinned host memory instead of consuming
+VRAM:
+
+```python
+from comfy_kitchen.backends import hip
+
+host_weight = hip.offload_weight(weight)
+output = hip.int8_linear(x, host_weight, weight_scale)
+```
+
+Activations, outputs and scales remain on the executing GPU. ROCm and the kernel
+driver choose whether pinned pages use ordinary system RAM or an APU GTT aperture;
+HIP does not expose a portable API to force Vega GTT placement or a peer-SDMA
+route. Pageable CPU tensors are rejected rather than dereferenced by a kernel.
 
 A request outside a kernel's domain (swizzled operands, scaling other than
 tensor-wise, a K that is not a multiple of 16) falls back to torch or eager.

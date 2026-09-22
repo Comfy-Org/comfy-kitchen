@@ -20,13 +20,9 @@
 
 namespace comfy::hip_backend::sage {
 
-// Every kernel here indexes lanes with & 31, reduces with a width of 32 and
-// packs fragments per half wave. RDNA defaults to wave32, but -mwavefrontsize64
-// would compile all of that into silently wrong scales rather than an error.
-#if defined(COMFY_HAS_WMMA) && defined(__AMDGCN_WAVEFRONT_SIZE__)
-static_assert(__AMDGCN_WAVEFRONT_SIZE__ == 32,
-              "the int8 attention kernels are wave32 only");
-#endif
+// Every kernel indexes logical lanes with & 31 and gives shuffles an explicit
+// width of 32. On Vega wave64, each physical wave therefore executes as two
+// independent logical partitions matching the software MMA fragment contract.
 
 // Softmax probabilities are unsigned int8, so the online maximum is shifted far
 // enough that exp2 fills the whole range: exp2(7.9943534) rounds to 255.
@@ -254,12 +250,21 @@ __forceinline__ __device__ MmaInt8::Frag pack_prob_frag(const uint32_t p[8],
                                                         int lane) {
   const uint32_t lo = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
   const uint32_t hi = p[4] | (p[5] << 8) | (p[6] << 16) | (p[7] << 24);
-#if !defined(COMFY_MMA_GFX11)
-  // gfx12, and the no-matrix-core stub, whose Frag is this narrow too.
+#if defined(COMFY_MMA_GFX12)
   (void)lane;
   MmaInt8::Frag f;
   f[0] = static_cast<int>(lo);
   f[1] = static_cast<int>(hi);
+  return f;
+#elif !defined(COMFY_MMA_GFX11)
+  const uint32_t partner_lo = swap_half_wave_b32(lo);
+  const uint32_t partner_hi = swap_half_wave_b32(hi);
+  const bool low_half = (lane & 31) < 16;
+  MmaInt8::Frag f;
+  f[0] = static_cast<int>(low_half ? lo : partner_lo);
+  f[1] = static_cast<int>(low_half ? hi : partner_hi);
+  f[2] = static_cast<int>(low_half ? partner_lo : lo);
+  f[3] = static_cast<int>(low_half ? partner_hi : hi);
   return f;
 #else
   const uint32_t partner_lo = swap_half_wave_b32(lo);
@@ -286,11 +291,28 @@ __forceinline__ __device__ MmaInt8::Frag pack_prob_frag(const uint32_t p[8],
 __forceinline__ __device__ MmaBf16::Frag pack_prob_frag_bf16(const float p[8],
                                                              int lane) {
   MmaBf16::Frag f;
-#if !defined(COMFY_MMA_GFX11)
+#if defined(COMFY_MMA_GFX12)
   (void)lane;
 #pragma unroll
   for (int e = 0; e < 8; ++e)
     f[e] = static_cast<__bf16>(p[e]);
+#elif !defined(COMFY_MMA_GFX11)
+  union {
+    uint32_t w[4];
+    __bf16 e[8];
+  } own, partner;
+#pragma unroll
+  for (int e = 0; e < 8; ++e)
+    own.e[e] = static_cast<__bf16>(p[e]);
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+    partner.w[i] = swap_half_wave_b32(own.w[i]);
+  const bool low_half = (lane & 31) < 16;
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    f[e] = low_half ? own.e[e] : partner.e[e];
+    f[8 + e] = low_half ? partner.e[e] : own.e[e];
+  }
 #else
   union {
     uint32_t w[4];
