@@ -153,11 +153,117 @@ void launch_typed(const void* v, void* out, void* scale, int B, int H, int N, in
     }
 }
 
+// Transpose-only V: same [B*H*D, padded_N] output layout as the quantizer, but
+// in V's own dtype with no scale — the bf16/fp16-SV attention path (int8 QK,
+// unquantized V) reads its PV fragments straight from here, matching the
+// SageAttention gfx110x kernels. InT/OutT may differ for fp32 input: the
+// bf16/fp16 WMMA PV needs 16-bit V, so fp32 is downcast to bf16 here (the
+// whole path runs 16-bit for fp32 inputs, as the Python layer's output dtype
+// already does).
+template <typename InT, typename OutT, int Threads>
+__global__ __launch_bounds__(Threads) void transpose_v_kernel(
+    const InT* __restrict__ v, OutT* __restrict__ out, int N, int padded_N, int H, int D,
+    int64_t stride_b, int64_t stride_h, int64_t stride_n) {
+
+    constexpr int kWaves = Threads / 32;
+    const int d_tiles = D / kDTile;
+    const int d_tile = blockIdx.x % d_tiles;
+    const int bh = blockIdx.x / d_tiles;
+    const int h = bh % H;
+    const int b = bh / H;
+    const int d0 = d_tile * kDTile;
+
+    const InT* base = v + static_cast<int64_t>(b) * stride_b + static_cast<int64_t>(h) * stride_h +
+                      d0;
+    const int64_t out_row = (static_cast<int64_t>(b) * H + h) * D + d0;
+
+    for (int src = static_cast<int>(threadIdx.x); src < N; src += Threads) {
+        float t[kDTile];
+        load8<InT>(base + static_cast<int64_t>(src) * stride_n, t);
+#pragma unroll
+        for (int i = 0; i < kDTile; ++i) {
+            out[(out_row + i) * padded_N + src] = static_cast<OutT>(t[i]);
+        }
+    }
+    for (int src = N + static_cast<int>(threadIdx.x); src < padded_N; src += Threads) {
+#pragma unroll
+        for (int i = 0; i < kDTile; ++i) out[(out_row + i) * padded_N + src] = OutT{0};
+    }
+}
+
+template <typename InT, typename OutT>
+void launch_transpose_typed(const void* v, void* out, int B, int H, int N, int D, int padded_N,
+                            int64_t stride_b, int64_t stride_h, int64_t stride_n,
+                            hipStream_t stream) {
+    const int blocks = B * H * (D / kDTile);
+    if (N <= 256) {
+        transpose_v_kernel<InT, OutT, 128><<<blocks, 128, 0, stream>>>(
+            static_cast<const InT*>(v), static_cast<OutT*>(out), N, padded_N, H, D, stride_b,
+            stride_h, stride_n);
+    } else {
+        transpose_v_kernel<InT, OutT, 512><<<blocks, 512, 0, stream>>>(
+            static_cast<const InT*>(v), static_cast<OutT*>(out), N, padded_N, H, D, stride_b,
+            stride_h, stride_n);
+    }
+}
+
 }  // namespace
 }  // namespace comfy::hip_backend::sage
 
 using namespace comfy::hip_backend::sage;
 
+extern "C" void launch_sage_transpose_v(const void* v, void* out, int B, int H, int N, int D,
+                                        int padded_N, int64_t stride_b, int64_t stride_h,
+                                        int64_t stride_n, int input_dtype_code,
+                                        hipStream_t stream) {
+    const size_t element_size = input_dtype_code == 0 ? sizeof(float) : sizeof(__half);
+    const auto stride_ok = [element_size](int64_t stride, int extent) {
+        return extent < 2 || (static_cast<size_t>(stride) * element_size) % 16 == 0;
+    };
+    if (reinterpret_cast<uintptr_t>(v) % 16 != 0 || !stride_ok(stride_b, B) ||
+        !stride_ok(stride_h, H) || !stride_ok(stride_n, N)) {
+        throw std::runtime_error(
+            "sage int8 attention: V base pointer and B/H/N strides must be 16-byte aligned");
+    }
+    if (D <= 0 || D % kDTile != 0) {
+        throw std::runtime_error(
+            "sage int8 attention: head_dim must be a positive multiple of 8");
+    }
+    if (N < 0 || padded_N < N) {
+        throw std::runtime_error(
+            "sage int8 attention: padded key length must be at least the key length");
+    }
+
+    switch (input_dtype_code) {
+        // The attention path runs fp16 SV (like the reference sageattn library,
+        // which downcasts V to fp16 in its transpose); fp32 and bf16 inputs are
+        // converted here.
+        case 0:
+            launch_transpose_typed<float, __half>(v, out, B, H, N, D, padded_N, stride_b, stride_h,
+                                                  stride_n, stream);
+            break;
+        case 1:
+            launch_transpose_typed<__half, __half>(v, out, B, H, N, D, padded_N, stride_b,
+                                                   stride_h, stride_n, stream);
+            break;
+        case 2:
+            launch_transpose_typed<__bf16, __half>(v, out, B, H, N, D, padded_N, stride_b,
+                                                   stride_h, stride_n, stream);
+            break;
+        default:
+            throw std::runtime_error(
+                "sage int8 attention: input dtype must be fp32, fp16 or bf16");
+    }
+
+    const hipError_t error = hipGetLastError();
+    if (error != hipSuccess) {
+        throw std::runtime_error(std::string("sage int8 V transpose kernel launch failed: ") +
+                                 hipGetErrorString(error));
+    }
+}
+
+// The quantizing V path (legacy pure-int8 attention): fused int8 + scale +
+// transpose to [B*H*D, padded_N].
 extern "C" void launch_sage_quant_v_int8(const void* v, void* out, void* scale, int B, int H,
                                          int N, int D, int padded_N, int64_t stride_b,
                                          int64_t stride_h, int64_t stride_n, int input_dtype_code,

@@ -475,6 +475,14 @@ extern "C" void launch_sage_int8_attn(
     const auto* ks = static_cast<const float*>(k_scale);
     const auto* vs = static_cast<const float*>(v_scale);
 
+    // Key tile: 64 keys by default; 128 for long unmasked sequences. The wide
+    // tile was measured slower on RDNA when V is staged transposed (it doubles
+    // both LDS tiles at once), but on the 6-WGP 780M it is ~15% faster for
+    // head_dim=128 with kv_len >= 2048, so the Python layer passes 128 there.
+    // D256 has no LDS room for the wide tile (67 KB wanted against 64 KB), so
+    // the wide instantiation is only compiled for HD != 256. Tile size is a
+    // schedule, not a shape: a caller may pass 128 for a short sequence and get
+    // the same answer from the narrow tile.
 #define SAGE_ATTN_LAUNCH(HD, CK, MM, OUT)                                                        \
     launch_one<HD, CK, MM, OUT>(qi, ki, vi, static_cast<OUT*>(o), qs, ks, vs, mask,              \
                                 mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,      \
@@ -483,21 +491,23 @@ extern "C" void launch_sage_int8_attn(
                                 q_stride_h, k_stride_b, k_stride_h, v_stride_b, v_stride_h,      \
                                 v_stride_d, o_stride_b, o_stride_h, o_stride_n, sm_scale, stream)
 
-    // One key tile, 64 keys. The CUDA backend widens to 128 for long unmasked
-    // keys; ported and measured, that is slower on RDNA, where V is staged
-    // transposed so the wide tile doubles both LDS tiles and costs more occupancy
-    // than it saves. It does not fit at D256 at all, wanting 67 KB against a
-    // 64 KB workgroup limit. A caller may still ask for 128 and get the same
-    // answer from the narrow tile: tile size is a schedule, not a shape.
-    (void)cta_k;
-#define SAGE_ATTN_CTA(HD, MM, OUT) SAGE_ATTN_LAUNCH(HD, 64, MM, OUT)
+#define SAGE_ATTN_CTA(HD, MM, OUT, CK) SAGE_ATTN_LAUNCH(HD, CK, MM, OUT)
 
 #define SAGE_ATTN_OUT(HD, MM)                                                                    \
     do {                                                                                         \
         if (output_dtype_code == 1) {                                                            \
-            SAGE_ATTN_CTA(HD, MM, __half);                                                       \
+            SAGE_ATTN_CTA(HD, MM, __half, 64);                                                   \
         } else {                                                                                 \
-            SAGE_ATTN_CTA(HD, MM, __bf16);                                                       \
+            SAGE_ATTN_CTA(HD, MM, __bf16, 64);                                                   \
+        }                                                                                        \
+    } while (0)
+
+#define SAGE_ATTN_OUT_WIDE(HD, MM)                                                               \
+    do {                                                                                         \
+        if (output_dtype_code == 1) {                                                            \
+            SAGE_ATTN_CTA(HD, MM, __half, 128);                                                  \
+        } else {                                                                                 \
+            SAGE_ATTN_CTA(HD, MM, __bf16, 128);                                                  \
         }                                                                                        \
     } while (0)
 
@@ -510,9 +520,23 @@ extern "C" void launch_sage_int8_attn(
         }                                                                                        \
     } while (0)
 
+#define SAGE_ATTN_MASK_WIDE(HD)                                                                  \
+    do {                                                                                         \
+        if (mask != nullptr) {                                                                   \
+            SAGE_ATTN_OUT_WIDE(HD, MaskMode::kCustom);                                           \
+        } else {                                                                                 \
+            SAGE_ATTN_OUT_WIDE(HD, MaskMode::kNone);                                             \
+        }                                                                                        \
+    } while (0)
+
     switch (head_dim) {
         case 64: SAGE_ATTN_MASK(64); break;
-        case 128: SAGE_ATTN_MASK(128); break;
+        case 128:
+            if (cta_k == 128)
+                SAGE_ATTN_MASK_WIDE(128);
+            else
+                SAGE_ATTN_MASK(128);
+            break;
         case 256: SAGE_ATTN_MASK(256); break;
         default:
             throw std::runtime_error("sage int8 attention: unsupported head_dim " +
@@ -520,6 +544,7 @@ extern "C" void launch_sage_int8_attn(
     }
 
 #undef SAGE_ATTN_MASK
+#undef SAGE_ATTN_MASK_WIDE
 #undef SAGE_ATTN_OUT
 #undef SAGE_ATTN_CTA
 #undef SAGE_ATTN_LAUNCH

@@ -87,6 +87,12 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
     if (K == 10240) {
         return 640;
     }
+    // K <= 4096: a 512-thread block (8 groups in flight) beats the 1024-thread
+    // default on the 6-WGP 780M, which halves occupancy on K=2048/2880 rows and
+    // leaves half the subgroups idle.
+    if (K <= 4096) {
+        return 512;
+    }
     return 1024;
 }
 

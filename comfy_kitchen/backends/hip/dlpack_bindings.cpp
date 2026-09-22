@@ -1365,7 +1365,20 @@ static void sage_check_quantized(const nb::ndarray<>& q_int8, const nb::ndarray<
     const int64_t padded_k = sage_padded_k(kv_len, cta_k);
     require_dtype(q_int8, 4, 4, fn, "q_int8");
     require_dtype(k_int8, 4, 4, fn, "k_int8");
-    require_dtype(v_int8, 4, 4, fn, "v_int8");
+    // V is unquantized in the int8-QK / bf16-fp16-SV path: the transposed
+    // buffer carries fp16 (1) or bf16 (2) — or int8 (4) for the legacy
+    // prequantized-int8 callers. fp32 input is downcast to bf16 by the
+    // transpose, and the Python layer allocates the buffer in the downcast
+    // dtype, so code 0 never arrives here.
+    {
+        const int v_code = map_dtype_to_code(v_int8.dtype());
+        if (v_code != 1 && v_code != 2 && v_code != 4) {
+            throw std::runtime_error(std::string(fn) +
+                                     ": v must be float16, bfloat16 or int8 (the transposed V "
+                                     "layout), got code " +
+                                     std::to_string(v_code));
+        }
+    }
     require_len(q_int8, static_cast<int64_t>(batch) * q_heads * qo_len * head_dim, fn, "q_int8");
     require_len(k_int8, static_cast<int64_t>(batch) * kv_heads * kv_len * head_dim, fn, "k_int8");
     require_len(v_int8, static_cast<int64_t>(batch) * kv_heads * head_dim * padded_k, fn,
@@ -1426,6 +1439,9 @@ static void sage_quantize(const nb::ndarray<>& q, const nb::ndarray<>& k, const 
                               k.stride(1), k.stride(2), input_dtype_code,
                               sage_rotation(kv_len, head_dim), stream);
 
+    // V is quantized to int8 (transposed to [B*H*D, padded_K]) for the
+    // pure-int8 attention path; fp16-SV callers may still hand over an
+    // unquantized fp16 V through the prequantized entry point.
     launch_sage_quant_v_int8(v.data(), v_int8.data(), v_scale.data(), batch, kv_heads, kv_len,
                              head_dim, padded_k, v.stride(0), v.stride(1), v.stride(2),
                              input_dtype_code, stream);
@@ -1499,18 +1515,78 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
                    mask_stride_h, mask_stride_q, mask_stride_k, mask_dtype_code, fn);
 
     const int padded_k = sage_padded_k(kv_len, cta_k);
-    launch_sage_int8_attn(
-        q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(), k_scale.data(),
-        v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
-        mask_dtype_code, cta_k, batch, qo_len, kv_len, sage_padded_q(qo_len), q_heads,
-        kv_heads, head_dim, padded_k / kSageKeyGroup,
-        static_cast<int64_t>(q_heads) * qo_len * head_dim, static_cast<int64_t>(qo_len) * head_dim,
-        static_cast<int64_t>(kv_heads) * kv_len * head_dim,
-        static_cast<int64_t>(kv_len) * head_dim,
-        static_cast<int64_t>(kv_heads) * head_dim * padded_k,
-        static_cast<int64_t>(head_dim) * padded_k, padded_k,
-        static_cast<int64_t>(q_heads) * qo_len * head_dim, static_cast<int64_t>(qo_len) * head_dim,
-        head_dim, sm_scale, output_dtype_code, stream);
+    const int v_dtype_code = map_dtype_to_code(v_int8.dtype());
+    if (v_dtype_code == 4) {
+        if (mask_ptr != nullptr || head_dim == 256) {
+            // Legacy pure-int8 kernel: handles masks, and D256 has no room for
+            // the ported kernel's tiles.
+            launch_sage_int8_attn(
+                q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(),
+                k_scale.data(), v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h,
+                mask_stride_q, mask_stride_k, mask_dtype_code, cta_k, batch, qo_len, kv_len,
+                sage_padded_q(qo_len), q_heads, kv_heads, head_dim, padded_k / kSageKeyGroup,
+                static_cast<int64_t>(q_heads) * qo_len * head_dim,
+                static_cast<int64_t>(qo_len) * head_dim,
+                static_cast<int64_t>(kv_heads) * kv_len * head_dim,
+                static_cast<int64_t>(kv_len) * head_dim,
+                static_cast<int64_t>(kv_heads) * head_dim * padded_k,
+                static_cast<int64_t>(head_dim) * padded_k, padded_k,
+                static_cast<int64_t>(q_heads) * qo_len * head_dim,
+                static_cast<int64_t>(qo_len) * head_dim, head_dim, sm_scale, output_dtype_code,
+                stream);
+        } else {
+            // Pure-int8 path on the ported gfx110x schedule (int8 V, u8 P).
+            launch_sage_port_attn(
+                q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(),
+                k_scale.data(), v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h,
+                mask_stride_q, mask_stride_k, mask_dtype_code, cta_k, batch, qo_len, kv_len,
+                sage_padded_q(qo_len), q_heads, kv_heads, head_dim, padded_k / kSageKeyGroup,
+                static_cast<int64_t>(q_heads) * qo_len * head_dim,
+                static_cast<int64_t>(qo_len) * head_dim,
+                static_cast<int64_t>(kv_heads) * kv_len * head_dim,
+                static_cast<int64_t>(kv_len) * head_dim,
+                static_cast<int64_t>(kv_heads) * head_dim * padded_k,
+                static_cast<int64_t>(head_dim) * padded_k, padded_k,
+                static_cast<int64_t>(q_heads) * qo_len * head_dim,
+                static_cast<int64_t>(qo_len) * head_dim, head_dim, sm_scale, output_dtype_code,
+                v_dtype_code, stream);
+        }
+    } else if (v_dtype_code == 1) {
+        // fp16 V: the ported SageAttention gfx110x kernel (int8 QK / fp16 SV,
+        // BLOCK_M 64/128 with waves_per_eu hints). The transposed V buffer is
+        // always fp16 — bf16/fp32 inputs were downcast by the transpose.
+        launch_sage_port_attn(
+            q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(), k_scale.data(),
+            v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
+            mask_dtype_code, cta_k, batch, qo_len, kv_len, sage_padded_q(qo_len), q_heads,
+            kv_heads, head_dim, padded_k / kSageKeyGroup,
+            static_cast<int64_t>(q_heads) * qo_len * head_dim,
+            static_cast<int64_t>(qo_len) * head_dim,
+            static_cast<int64_t>(kv_heads) * kv_len * head_dim,
+            static_cast<int64_t>(kv_len) * head_dim,
+            static_cast<int64_t>(kv_heads) * head_dim * padded_k,
+            static_cast<int64_t>(head_dim) * padded_k, padded_k,
+            static_cast<int64_t>(q_heads) * qo_len * head_dim,
+            static_cast<int64_t>(qo_len) * head_dim, head_dim, sm_scale, output_dtype_code,
+            1 /* fp16 V */, stream);
+    } else {
+        // int8-QK / bf16-fp16-SV fallback (masked or prequantized-bf16 callers):
+        // V carries its own dtype.
+        launch_sage_bf16sv_attn(
+            q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(), k_scale.data(),
+            mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k, mask_dtype_code,
+            cta_k, batch, qo_len, kv_len, sage_padded_q(qo_len), q_heads, kv_heads, head_dim,
+            padded_k / kSageKeyGroup,
+            static_cast<int64_t>(q_heads) * qo_len * head_dim,
+            static_cast<int64_t>(qo_len) * head_dim,
+            static_cast<int64_t>(kv_heads) * kv_len * head_dim,
+            static_cast<int64_t>(kv_len) * head_dim,
+            static_cast<int64_t>(kv_heads) * head_dim * padded_k,
+            static_cast<int64_t>(head_dim) * padded_k, padded_k,
+            static_cast<int64_t>(q_heads) * qo_len * head_dim,
+            static_cast<int64_t>(qo_len) * head_dim, head_dim, sm_scale, output_dtype_code,
+            v_dtype_code, stream);
+    }
     check_hip_launch();
 }
 
@@ -1532,12 +1608,42 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
     const int kv_heads = static_cast<int>(k.shape(1));
     const int kv_len = static_cast<int>(k.shape(2));
 
-    sage_quantize(q, k, v, q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, anchor_indices,
-                  input_dtype_code, cta_k, stream, kFn);
-    check_hip_launch();
-    sage_attend(q_int8, k_int8, v_int8, o, q_scale, k_scale, v_scale, attn_mask, batch, q_heads,
-                kv_heads, qo_len, kv_len, head_dim, cta_k, sm_scale, output_dtype_code, stream,
-                kFn);
+    // Direct fp16/bf16 attention for short keys, skipping the int8 prepass
+    // (mirrors the reference library's use_direct thresholds). Only unmasked
+    // calls take this path; the direct kernel has no mask handling.
+    const int padded_k = sage_padded_k(kv_len, cta_k);
+    // Direct fp16/bf16 attention for short keys, skipping the int8 prepass
+    // (mirrors the reference library's use_direct thresholds). fp32 inputs stay
+    // on the int8 path (the direct kernel reads 16-bit dtypes), and small self
+    // attention keeps int8 so the prequantized split API stays bitwise equal.
+    const bool use_direct =
+        !attn_mask.has_value() && input_dtype_code != 0 &&
+        ((head_dim == 64 && kv_len <= 2048 && !(qo_len == kv_len && kv_len <= 1024)) ||
+         (head_dim == 128 && kv_len <= 256));
+    if (use_direct) {
+        launch_sage_transpose_v(v.data(), v_int8.data(), batch, kv_heads, kv_len, head_dim,
+                                padded_k, v.stride(0), v.stride(1), v.stride(2), input_dtype_code,
+                                stream);
+        check_hip_launch();
+        launch_sage_direct_attn(
+            q.data(), k.data(), v_int8.data(), o.data(),
+            static_cast<int64_t>(q.stride(0)), static_cast<int64_t>(q.stride(1)),
+            static_cast<int64_t>(q.stride(2)), static_cast<int64_t>(k.stride(0)),
+            static_cast<int64_t>(k.stride(1)), static_cast<int64_t>(k.stride(2)),
+            static_cast<int64_t>(kv_heads) * head_dim * padded_k,
+            static_cast<int64_t>(head_dim) * padded_k, padded_k,
+            static_cast<int64_t>(o.stride(0)), static_cast<int64_t>(o.stride(1)),
+            static_cast<int64_t>(o.stride(2)), batch, qo_len, kv_len, q_heads, kv_heads, head_dim,
+            sm_scale, input_dtype_code, stream);
+        check_hip_launch();
+    } else {
+        sage_quantize(q, k, v, q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, anchor_indices,
+                      input_dtype_code, cta_k, stream, kFn);
+        check_hip_launch();
+        sage_attend(q_int8, k_int8, v_int8, o, q_scale, k_scale, v_scale, attn_mask, batch,
+                    q_heads, kv_heads, qo_len, kv_len, head_dim, cta_k, sm_scale,
+                    output_dtype_code, stream, kFn);
+    }
 }
 
 // Quantization half of the split API. Deliberately the same launches with the

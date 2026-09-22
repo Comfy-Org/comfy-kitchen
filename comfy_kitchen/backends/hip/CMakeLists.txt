@@ -166,6 +166,8 @@ set(HIP_SOURCES
     sage_attention/quant_qk_int8.hip
     sage_attention/quant_v_int8.hip
     sage_attention/int8_attn.hip
+    sage_attention/int8_bf16sv.hip
+    sage_attention/sage_attn_port.hip
     sage_attention/sol_attn.hip
     sage_attention/sol_attn_preprocess.hip
     sage_attention/sol_attn_vtranspose.hip

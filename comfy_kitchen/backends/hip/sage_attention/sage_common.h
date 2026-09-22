@@ -300,6 +300,32 @@ __forceinline__ __device__ MmaBf16::Frag pack_prob_frag_bf16(const float p[8], i
     return f;
 }
 
+// The FP16 twin of pack_prob_frag_bf16, for the fp16-SV attention path.
+__forceinline__ __device__ MmaF16::Frag pack_prob_frag_f16(const float p[8], int lane) {
+    MmaF16::Frag f;
+#if !defined(COMFY_MMA_GFX11)
+    (void)lane;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) f[e] = static_cast<_Float16>(p[e]);
+#else
+    union {
+        uint32_t w[4];
+        _Float16 e[8];
+    } own, partner;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) own.e[e] = static_cast<_Float16>(p[e]);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) partner.w[i] = swap_half_wave_b32(own.w[i]);
+    const bool even_half = lane < 16;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        f[2 * e] = even_half ? own.e[e] : partner.e[e];
+        f[2 * e + 1] = even_half ? partner.e[e] : own.e[e];
+    }
+#endif
+    return f;
+}
+
 // vals[e] belongs to channel d_base + acc_row(lane, e). gfx12 makes those eight
 // channels contiguous, so the row goes out in one 16-byte store; gfx11
 // interleaves them with the partner lane's and needs eight.

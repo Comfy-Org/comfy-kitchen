@@ -70,6 +70,51 @@ void launch_w4a8_int8_gemm_chunked_kernel(const void* xq, const void* qw, const 
                                           int K, int group_size, int chunk_cols, int out_code,
                                           hipStream_t stream);
 
+// INT8-QK + bf16/fp16-SV attention (the SageAttention-style path): Q/K int8,
+// V unquantized and transposed by launch_sage_transpose_v. See
+// ops/.../sage_attention/int8_bf16sv.hip.
+void launch_sage_bf16sv_attn(const void* q, const void* k, const void* v, void* o,
+                             const void* q_scale, const void* k_scale, const void* mask,
+                             int64_t mask_stride_b, int64_t mask_stride_h, int64_t mask_stride_q,
+                             int64_t mask_stride_k, int mask_dtype_code, int cta_k, int batch,
+                             int qo_len, int kv_len, int qo_len_padded, int num_qo_heads,
+                             int num_kv_heads, int head_dim, int k_groups_per_head,
+                             int64_t q_stride_b, int64_t q_stride_h, int64_t k_stride_b,
+                             int64_t k_stride_h, int64_t v_stride_b, int64_t v_stride_h,
+                             int64_t v_stride_d, int64_t o_stride_b, int64_t o_stride_h,
+                             int64_t o_stride_n, float sm_scale, int output_dtype_code,
+                             int input_dtype_code, hipStream_t stream);
+void launch_sage_transpose_v(const void* v, void* out, int B, int H, int N, int D, int padded_N,
+                             int64_t stride_b, int64_t stride_h, int64_t stride_n,
+                             int input_dtype_code, hipStream_t stream);
+
+// Direct fp16/bf16 attention (no int8 quantization) for short keys, mirroring
+// the reference library's use_direct path. v is the fp16-transposed buffer.
+void launch_sage_direct_attn(const void* q, const void* k, const void* v, void* o,
+                             int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
+                             int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
+                             int64_t v_stride_b, int64_t v_stride_h, int64_t v_stride_d,
+                             int64_t o_stride_b, int64_t o_stride_h, int64_t o_stride_n,
+                             int batch, int qo_len, int kv_len, int num_qo_heads,
+                             int num_kv_heads, int head_dim, float sm_scale, int dtype_code,
+                             hipStream_t stream);
+
+// Port of the SageAttention gfx110x kernel (BLOCK_M 64/128, waves_per_eu 2).
+// v_dtype_code selects the PV: 4 = int8 V + u8 probabilities (pure-int8 path),
+// 1 = fp16 V (fp16 SV, like the reference library). Masked or D256 calls fall
+// back to launch_sage_bf16sv_attn (int8+mask is handled by the binding).
+void launch_sage_port_attn(const void* q, const void* k, const void* v, void* o,
+                           const void* q_scale, const void* k_scale, const void* v_scale,
+                           const void* mask, int64_t mask_stride_b, int64_t mask_stride_h,
+                           int64_t mask_stride_q, int64_t mask_stride_k, int mask_dtype_code,
+                           int cta_k, int batch, int qo_len, int kv_len, int qo_len_padded,
+                           int num_qo_heads, int num_kv_heads, int head_dim, int k_groups_per_head,
+                           int64_t q_stride_b, int64_t q_stride_h, int64_t k_stride_b,
+                           int64_t k_stride_h, int64_t v_stride_b, int64_t v_stride_h,
+                           int64_t v_stride_d, int64_t o_stride_b, int64_t o_stride_h,
+                           int64_t o_stride_n, float sm_scale, int output_dtype_code,
+                           int v_dtype_code, hipStream_t stream);
+
 // Sol-Attn sparse attention -- see sage_attention/sol_attn.hip. The whole pipeline
 // runs over one caller-allocated workspace whose carve-up sol_attn_plan reports.
 extern const char* const sol_attn_plan_names[];  // null-terminated

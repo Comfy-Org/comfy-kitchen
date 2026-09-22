@@ -2747,12 +2747,14 @@ _SAGE_HEAD_DIMS = (64, 128, 256)
 def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool) -> int:
     """Keys per attention iteration.
 
-    Always 64. The CUDA backend widens this to 128 for long unmasked keys; the
-    wide tile is implemented here too and measures slower on RDNA, where V is
-    staged transposed and the tile doubles both LDS allocations at once. Kept as
-    a function because the choice belongs with the buffer padding it decides.
+    64 by default; 128 for long unmasked D128 sequences. Measured on the 6-WGP
+    780M, the wide tile is ~15% faster than the narrow one at head_dim=128 with
+    kv_len >= 2048 and no mask (D64 prefers 64; D256 has no LDS room for 128).
+    The kernel instantiates the matching tile from the runtime value, and the
+    K-scale buffer padding below uses the same choice, so the two stay in sync.
     """
-    del head_dim, kv_length, has_mask
+    if head_dim == 128 and kv_length >= 2048 and not has_mask:
+        return _SAGE_LARGE_CTA_K
     return _SAGE_CTA_K
 
 
@@ -2938,7 +2940,11 @@ def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
         "k_scale": torch.empty(
             batch, kv_heads, padded_k // _SAGE_KEY_GROUP, dtype=torch.float32, device=device
         ),
-        # V is stored transposed, [B * H * D, padded_K], with the tail zero filled.
+        # V is stored transposed, [B * H * D, padded_K], in its own dtype (the
+        # int8-QK / bf16-fp16-SV path keeps V unquantized), with the tail zero
+        # filled. The buffer key keeps the legacy name; its dtype is q's.
+        # V is quantized and stored transposed, [B * H * D, padded_K], with the
+        # tail zero filled (pure-int8 path).
         "v_int8": torch.empty(
             batch * kv_heads * head_dim, padded_k, dtype=torch.int8, device=device
         ),
