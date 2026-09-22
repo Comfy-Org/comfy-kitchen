@@ -10,6 +10,22 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstring>
+
+// True on the small RDNA3 iGPU (Radeon 780M, gfx1103) that the kernel-tuning
+// changes in this tree were measured on. dGPUs keep the upstream defaults:
+// several block-size and dispatch choices tuned against 6 WGPs are a
+// regression on 60-96 CU parts. Host-safe (no device intrinsics), so both the
+// .hip kernels and the dlpack bindings can consult it.
+inline bool comfy_small_igpu() {
+    static const bool v = [] {
+        int device = 0;
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
+        return std::strstr(prop.gcnArchName, "gfx1103") != nullptr;
+    }();
+    return v;
+}
 
 extern "C" {
 

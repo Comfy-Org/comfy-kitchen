@@ -13,6 +13,7 @@
 // even index), which is the layout the iu4 A-fragment consumes directly.
 #pragma once
 
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -70,6 +71,12 @@ inline int convrot_max_k(int in_dtype, int block_threads = 256) {
     return static_cast<int>((static_cast<size_t>(lds) - static_lds) / element_size);
 }
 
+// True on the small RDNA3 iGPU (Radeon 780M, gfx1103) that the kernel-tuning
+// changes in this tree were measured on. dGPUs keep the upstream defaults:
+// several block-size and dispatch choices tuned against 6 WGPs are a
+// regression on 60-96 CU parts. Defined in launchers.h.
+#include "../launchers.h"
+
 inline int convrot_quant_fused_block_threads(int M, int K) {
     if (M == 1) {
         return 512;
@@ -89,8 +96,8 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
     }
     // K <= 4096: a 512-thread block (8 groups in flight) beats the 1024-thread
     // default on the 6-WGP 780M, which halves occupancy on K=2048/2880 rows and
-    // leaves half the subgroups idle.
-    if (K <= 4096) {
+    // leaves half the subgroups idle. dGPUs keep 1024.
+    if (comfy_small_igpu() && K <= 4096) {
         return 512;
     }
     return 1024;

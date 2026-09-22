@@ -154,6 +154,15 @@ def _gfx_arch(device: torch.device | int | None = None) -> str | None:
 
 
 @functools.lru_cache(maxsize=1)
+def _is_small_igpu() -> bool:
+    """True on the small RDNA3 iGPU (Radeon 780M, gfx1103) whose 6-WGP tuning
+    this tree carries. dGPUs keep the upstream schedules: several block-size
+    and dispatch choices measured here are a regression on 60-96 CU parts."""
+    arch = _gfx_arch()
+    return arch is not None and arch == "gfx1103"
+
+
+@functools.lru_cache(maxsize=1)
 def _visible_gfx_arches() -> tuple[str | None, ...]:
     """One entry per visible device; None where the architecture could not be read.
 
@@ -682,7 +691,7 @@ def fp16_linear(
     n, k = weight.shape
 
     supported = (
-        x.dtype in (torch.float16, torch.bfloat16)
+        x.dtype in (torch.float16, torch.bfloat16 if _is_small_igpu() else torch.float16)
         and weight.dtype == x.dtype
         and weight.device == x.device
         and x_2d.shape[1] == k
@@ -2753,7 +2762,7 @@ def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool) -> int:
     The kernel instantiates the matching tile from the runtime value, and the
     K-scale buffer padding below uses the same choice, so the two stay in sync.
     """
-    if head_dim == 128 and kv_length >= 2048 and not has_mask:
+    if _is_small_igpu() and head_dim == 128 and kv_length >= 2048 and not has_mask:
         return _SAGE_LARGE_CTA_K
     return _SAGE_CTA_K
 
@@ -2944,12 +2953,16 @@ def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
         # int8-QK / bf16-fp16-SV path keeps V unquantized), with the tail zero
         # filled. The buffer key keeps the legacy name; its dtype is q's.
         # V is stored transposed, [B * H * D, padded_K], with the tail zero
-        # filled (pure-int8 path). The buffer is twice the int8 width: the
-        # int8 kernels read the first padded_K columns (int8 stride), while the
-        # short-key direct path writes the fp16 transposed V over the full
-        # 2*padded_K byte width — a bare int8 buffer would overrun by 2x.
+        # filled (pure-int8 path). On the gfx1103 iGPU the buffer is twice the
+        # int8 width: the int8 kernels read the first padded_K columns (int8
+        # stride), while the short-key direct path writes the fp16 transposed V
+        # over the full 2*padded_K byte width. dGPUs allocate the upstream
+        # single-width buffer (no direct path there).
         "v_int8": torch.empty(
-            batch * kv_heads * head_dim, padded_k * 2, dtype=torch.int8, device=device
+            batch * kv_heads * head_dim,
+            padded_k * (2 if _is_small_igpu() else 1),
+            dtype=torch.int8,
+            device=device,
         ),
         "v_scale": torch.empty(batch * kv_heads * head_dim, dtype=torch.float32, device=device),
     }

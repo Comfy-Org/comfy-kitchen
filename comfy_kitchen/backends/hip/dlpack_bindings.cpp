@@ -11,7 +11,7 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 
-#include "launchers.h"
+#include "launchers.h"  // comfy_small_igpu
 
 namespace nb = nanobind;
 
@@ -1381,8 +1381,11 @@ static void sage_check_quantized(const nb::ndarray<>& q_int8, const nb::ndarray<
     }
     require_len(q_int8, static_cast<int64_t>(batch) * q_heads * qo_len * head_dim, fn, "q_int8");
     require_len(k_int8, static_cast<int64_t>(batch) * kv_heads * kv_len * head_dim, fn, "k_int8");
-    require_len(v_int8, static_cast<int64_t>(batch) * kv_heads * head_dim * padded_k * 2, fn,
-                "v_int8");
+    // The V scratch is 2x the int8 width on the gfx1103 iGPU (fp16 direct path
+    // fills the full width); dGPUs keep the upstream single width.
+    require_len(v_int8, static_cast<int64_t>(batch) * kv_heads * head_dim * padded_k *
+                            (comfy_small_igpu() ? 2 : 1),
+                fn, "v_int8");
     require_scale_len(q_scale, static_cast<size_t>(batch) * q_heads * padded_q, fn, "q_scale");
     require_scale_len(k_scale, static_cast<size_t>(batch) * kv_heads * (padded_k / kSageKeyGroup),
                       fn, "k_scale");
@@ -1517,9 +1520,10 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
     const int padded_k = sage_padded_k(kv_len, cta_k);
     const int v_dtype_code = map_dtype_to_code(v_int8.dtype());
     if (v_dtype_code == 4) {
-        if (mask_ptr != nullptr || head_dim == 256) {
-            // Legacy pure-int8 kernel: handles masks, and D256 has no room for
-            // the ported kernel's tiles.
+        if (mask_ptr != nullptr || head_dim == 256 || !comfy_small_igpu()) {
+            // Legacy pure-int8 kernel: handles masks, D256 has no room for the
+            // ported kernel's tiles, and dGPUs keep the upstream implementation
+            // (the ported schedule is tuned against the 6-WGP 780M).
             launch_sage_int8_attn(
                 q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(),
                 k_scale.data(), v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h,
@@ -1554,7 +1558,12 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
     } else if (v_dtype_code == 1) {
         // fp16 V: the ported SageAttention gfx110x kernel (int8 QK / fp16 SV,
         // BLOCK_M 64/128 with waves_per_eu hints). The transposed V buffer is
-        // always fp16 — bf16/fp32 inputs were downcast by the transpose.
+        // always fp16 — bf16/fp32 inputs were downcast by the transpose. This
+        // is an iGPU-only extension of the upstream API.
+        if (!comfy_small_igpu()) {
+            throw std::runtime_error(
+                "fp16-V prequantized attention requires the gfx1103 iGPU backend");
+        }
         launch_sage_port_attn(
             q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(), k_scale.data(),
             v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
@@ -1616,8 +1625,9 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
     // (mirrors the reference library's use_direct thresholds). fp32 inputs stay
     // on the int8 path (the direct kernel reads 16-bit dtypes), and small self
     // attention keeps int8 so the prequantized split API stays bitwise equal.
+    // The direct kernel is an iGPU extension of the upstream API.
     const bool use_direct =
-        !attn_mask.has_value() && input_dtype_code != 0 &&
+        comfy_small_igpu() && !attn_mask.has_value() && input_dtype_code != 0 &&
         ((head_dim == 64 && kv_len <= 2048 && !(qo_len == kv_len && kv_len <= 1024)) ||
          (head_dim == 128 && kv_len <= 256));
     if (use_direct) {
@@ -1698,7 +1708,8 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
     // V is packed as [B * H_kv * D, padded_k], and padded_k follows cta_k. Element
     // count alone cannot tell a buffer packed against a different cta_k from a
     // correct one, and the kernel would read shifted rows rather than fail.
-    if (v_int8.shape(1) != static_cast<size_t>(sage_padded_k(kv_len, cta_k)) * 2) {
+    if (v_int8.shape(1) !=
+        static_cast<size_t>(sage_padded_k(kv_len, cta_k)) * (comfy_small_igpu() ? 2 : 1)) {
         throw std::runtime_error(std::string(kFn) + ": packed v row width " +
                                  std::to_string(v_int8.shape(1)) + " does not match cta_k " +
                                  std::to_string(cta_k));

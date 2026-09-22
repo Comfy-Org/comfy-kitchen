@@ -25,6 +25,7 @@
 
 #include "../mma.h"
 #include "sage_common.h"
+#include "../launchers.h"  // comfy_small_igpu
 
 namespace comfy::hip_backend::sage {
 
@@ -532,7 +533,8 @@ extern "C" void launch_sage_int8_attn(
     switch (head_dim) {
         case 64: SAGE_ATTN_MASK(64); break;
         case 128:
-            if (cta_k == 128)
+            // The wide 128-key tile is a 6-WGP 780M tuning win; dGPUs keep 64.
+            if (comfy_small_igpu() && cta_k == 128)
                 SAGE_ATTN_MASK_WIDE(128);
             else
                 SAGE_ATTN_MASK(128);

@@ -323,9 +323,11 @@ extern "C" void launch_rms_rope_kernel(
 
     // Fast path: contiguous rows whose 16-byte chunks stay aligned, head_dim a
     // whole number of chunks within the LDS budget. Everything else (strided
-    // views, odd head_dim, huge rows) takes the re-read kernel.
+    // views, odd head_dim, huge rows) takes the re-read kernel. The 32-thread
+    // warp-per-row schedule was tuned on the 6-WGP 780M; dGPUs keep the
+    // upstream 64-thread kernel.
     const int64_t kVec = x_code == 0 ? 4 : 8;
-    const bool fast = sx_d == 1 && so_d == 1 && head_dim <= kMaxStagedHd &&
+    const bool fast = comfy_small_igpu() && sx_d == 1 && so_d == 1 && head_dim <= kMaxStagedHd &&
                       head_dim % kVec == 0 && sx_b % kVec == 0 && sx_d1 % kVec == 0 &&
                       sx_d2 % kVec == 0 && so_b % kVec == 0 && so_d1 % kVec == 0 &&
                       so_d2 % kVec == 0;
