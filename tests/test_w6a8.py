@@ -71,7 +71,7 @@ class TestStorage:
 
 class TestQuantizer:
     def test_six_bit_is_uniform_symmetric_and_much_cleaner_than_four(self, weight):
-        q4, s4, c4, corr4, cb4 = eager_w4a8.quantize_w4a8_int8_weight(weight, bits=4)
+        q4, s4, c4, _corr4, cb4 = eager_w4a8.quantize_w4a8_int8_weight(weight, bits=4)
         q6, s6, c6, corr6, cb6 = eager_w4a8.quantize_w4a8_int8_weight(weight, bits=6)
         assert q4.shape == (384, 512) and q6.shape == (384, 768)
         assert cb6 is None and corr6 is None and s6.dtype == torch.float8_e4m3fn
@@ -153,7 +153,7 @@ class TestTritonBackend:
     def test_dequant_is_bit_exact_with_eager(self, weight):
         triton_mod = pytest.importorskip("comfy_kitchen.backends.triton.w4a8_int8")
         for bits in (4, 6):
-            q, s, c, _, cb = eager_w4a8.quantize_w4a8_int8_weight(weight, bits=bits)
+            q, s, _c, _, cb = eager_w4a8.quantize_w4a8_int8_weight(weight, bits=bits)
             got = triton_mod._dequant_int4_grouped_to_int8(q, s, cb, 16)
             ref = eager_w4a8._dequant_int4_grouped_to_int8(q, s, cb, 16)
             assert torch.equal(got, ref), bits
