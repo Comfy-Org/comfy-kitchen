@@ -2031,6 +2031,7 @@ extern "C" {
         int64_t N,
         int64_t K,
         int64_t G,
+        int64_t bits,
         cudaStream_t stream);
 
     void launch_dequant_int4_grouped_to_int8_e4m3(
@@ -2041,6 +2042,7 @@ extern "C" {
         int64_t N,
         int64_t K,
         int64_t G,
+        int64_t bits,
         cudaStream_t stream);
 
     bool launch_quantize_w4a8_convrot(
@@ -2071,6 +2073,7 @@ extern "C" {
         int64_t K,
         int64_t G,
         int64_t chunk_cols,
+        int64_t bits,
         int out_dtype_code,
         cudaStream_t stream);
 
@@ -2099,6 +2102,7 @@ extern "C" {
         int64_t N,
         int64_t K,
         int64_t G,
+        int64_t bits,
         int out_dtype_code,
         cudaStream_t stream);
 
@@ -2934,16 +2938,29 @@ bool cutlass_turing_int4_dequant(
         a.data(), b.data(), xs.data(), ws.data(), bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
 }
 
-// Grouped int4 -> int8 dequant (group scale folded; per-channel scale applied in GEMM).
+// Code width implied by the packed row: K/2 bytes at 4 bits, 3K/4 at 6. The 6-bit layout
+// is uniform (no codebook) and needs K % 32 so its rows and high plane stay 8-byte aligned.
+static int64_t w4a8_bits_from_width(int64_t cols, int64_t K, bool has_codebook, const char* who) {
+    const int64_t bits = (K > 0) ? (cols * 8) / K : 0;
+    if ((bits != 4 && bits != 6) || cols * 8 != K * bits)
+        throw std::runtime_error(std::string(who) + ": packed width must be K/2 (4-bit) or 3K/4 (6-bit)");
+    if (bits == 6 && K % 32 != 0)
+        throw std::runtime_error(std::string(who) + ": K must be a multiple of 32 at 6 bits");
+    if (bits == 6 && has_codebook)
+        throw std::runtime_error(std::string(who) + ": 6-bit storage has no codebook");
+    return bits;
+}
+
+// Grouped int4/int6 -> int8 dequant (group scale folded; per-channel scale applied in GEMM).
 void dequant_int4_grouped_to_int8(
-    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> qw,     // [N, K/2]
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> qw,     // [N, K*bits/8]
     nb::ndarray<float, nb::ndim<2>, nb::device::cuda> s_rel,   // [N, K/G]
     std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> codebook,  // [16] or None
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> out,    // [N, K]
     int64_t G, uintptr_t stream_ptr) {
     const int64_t N = qw.shape(0);
     const int64_t K = out.shape(1);
-    if (qw.shape(1) != K / 2) throw std::runtime_error("dequant_int4_grouped: K/2 mismatch");
+    const int64_t bits = w4a8_bits_from_width(qw.shape(1), K, codebook.has_value(), "dequant_int4_grouped");
     if (K % 16 != 0) throw std::runtime_error("dequant_int4_grouped: K must be a multiple of 16");
     if (G < 4 || (16 % G != 0 && G % 16 != 0))
         throw std::runtime_error("dequant_int4_grouped: G must be >=4 and divide 16 or be a multiple of 16");
@@ -2956,19 +2973,19 @@ void dequant_int4_grouped_to_int8(
         throw std::runtime_error("dequant_int4_grouped: codebook must be [16]");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const void* cb = codebook.has_value() ? codebook->data() : nullptr;
-    launch_dequant_int4_grouped_to_int8(qw.data(), s_rel.data(), cb, out.data(), N, K, G, stream);
+    launch_dequant_int4_grouped_to_int8(qw.data(), s_rel.data(), cb, out.data(), N, K, G, bits, stream);
 }
 
 // fp8 (e4m3) per-group scale: s_rel passed as raw uint8 bits.
 void dequant_int4_grouped_to_int8_e4m3(
-    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> qw,     // [N, K/2]
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> qw,     // [N, K*bits/8]
     nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> s_rel, // [N, K/G] e4m3 bits
     std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> codebook,  // [16] or None
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> out,    // [N, K]
     int64_t G, uintptr_t stream_ptr) {
     const int64_t N = qw.shape(0);
     const int64_t K = out.shape(1);
-    if (qw.shape(1) != K / 2) throw std::runtime_error("dequant_int4_grouped: K/2 mismatch");
+    const int64_t bits = w4a8_bits_from_width(qw.shape(1), K, codebook.has_value(), "dequant_int4_grouped");
     if (K % 16 != 0) throw std::runtime_error("dequant_int4_grouped: K must be a multiple of 16");
     if (G < 4 || (16 % G != 0 && G % 16 != 0))
         throw std::runtime_error("dequant_int4_grouped: G must be >=4 and divide 16 or be a multiple of 16");
@@ -2981,7 +2998,7 @@ void dequant_int4_grouped_to_int8_e4m3(
         throw std::runtime_error("dequant_int4_grouped: codebook must be [16]");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const void* cb = codebook.has_value() ? codebook->data() : nullptr;
-    launch_dequant_int4_grouped_to_int8_e4m3(qw.data(), s_rel.data(), cb, out.data(), N, K, G, stream);
+    launch_dequant_int4_grouped_to_int8_e4m3(qw.data(), s_rel.data(), cb, out.data(), N, K, G, bits, stream);
 }
 
 // Fused W4A8 requantize (group_size=16): rotated weight [N,K] -> packed int4
@@ -3017,9 +3034,10 @@ void quantize_w4a8_convrot(
             "invalid launch config)");
 }
 
-static void validate_w4a8_codebook_gemm_contract(
+// Returns the code width (4 or 6) implied by the packed weight row.
+static int64_t validate_w4a8_codebook_gemm_contract(
     int64_t M, int64_t N, int64_t K,
-    int64_t weight_khalf,
+    int64_t weight_cols,
     int64_t s_rel_n, int64_t s_rel_groups,
     int64_t s_channel_size, int64_t xs_size,
     int64_t codebook_size, int64_t bias_size, int bias_dtype_code,
@@ -3027,8 +3045,7 @@ static void validate_w4a8_codebook_gemm_contract(
     int64_t out_rows, int64_t out_cols,
     const nb::dlpack::dtype& out_dtype,
     int64_t G, int64_t chunk_cols, int out_dtype_code) {
-    if (weight_khalf != K / 2)
-        throw std::runtime_error("w4a8_codebook_gemm: K/2 mismatch");
+    const int64_t bits = w4a8_bits_from_width(weight_cols, K, codebook_size >= 0, "w4a8_codebook_gemm");
     if (K % 16 != 0)
         throw std::runtime_error("w4a8_codebook_gemm: K must be a multiple of 16");
     if (G < 4 || (16 % G != 0 && G % 16 != 0))
@@ -3057,6 +3074,7 @@ static void validate_w4a8_codebook_gemm_contract(
         if (workspace_cols != K || workspace_rows < required_rows)
             throw std::runtime_error("w4a8_codebook_gemm: workspace must be [>=min(chunk_cols,N), K] int8");
     }
+    return bits;
 }
 
 // Chunked fused W4A8: per-chunk (codebook+s_rel) dequant -> L2-hot int8 -> strided int8 GEMM.
@@ -3074,7 +3092,7 @@ bool w4a8_codebook_gemm_chunked(
     const int64_t M = xq.shape(0);
     const int64_t K = xq.shape(1);
     const int64_t N = weight.shape(0);
-    validate_w4a8_codebook_gemm_contract(
+    const int64_t bits = validate_w4a8_codebook_gemm_contract(
         M, N, K,
         weight.shape(1),
         s_rel.shape(0), s_rel.shape(1),
@@ -3090,7 +3108,7 @@ bool w4a8_codebook_gemm_chunked(
     const void* bs = bias.has_value() ? bias->data() : nullptr;
     return launch_w4a8_codebook_gemm_chunked(
         xq.data(), weight.data(), s_rel.data(), cb, s_channel.data(), xs.data(), bs,
-        workspace.data(), out.data(), M, N, K, G, chunk_cols, out_dtype_code, stream);
+        workspace.data(), out.data(), M, N, K, G, chunk_cols, bits, out_dtype_code, stream);
 }
 
 // Common W4A8 inference path: online ConvRot activation quantization followed by the
@@ -3130,7 +3148,7 @@ bool w4a8_codebook_linear_chunked(
     const int input_dtype_code = map_dtype_to_code(input.dtype());
     if (input_dtype_code < 0 || input_dtype_code > 2)
         throw std::runtime_error("w4a8_codebook_linear: input must be fp32, fp16, or bf16");
-    validate_w4a8_codebook_gemm_contract(
+    const int64_t bits = validate_w4a8_codebook_gemm_contract(
         M, N, K,
         weight.shape(1),
         s_rel.shape(0), s_rel.shape(1),
@@ -3151,7 +3169,7 @@ bool w4a8_codebook_linear_chunked(
     const void* bs = bias.has_value() ? bias->data() : nullptr;
     return launch_w4a8_codebook_gemm_chunked(
         xq.data(), weight.data(), s_rel.data(), cb, s_channel.data(), xs.data(), bs,
-        workspace.data(), out.data(), M, N, K, G, chunk_cols, out_dtype_code, stream);
+        workspace.data(), out.data(), M, N, K, G, chunk_cols, bits, out_dtype_code, stream);
 }
 
 bool w4a8_codebook_gemv(
@@ -3184,7 +3202,7 @@ bool w4a8_codebook_gemv(
         throw std::runtime_error("w4a8_codebook_gemv: weight metadata and out must be contiguous");
     if (G < 16 || (G % 16) != 0)
         throw std::runtime_error("w4a8_codebook_gemv: G must be a multiple of 16");
-    validate_w4a8_codebook_gemm_contract(
+    const int64_t bits = validate_w4a8_codebook_gemm_contract(
         M, N, K,
         weight.shape(1),
         s_rel.shape(0), s_rel.shape(1),
@@ -3209,7 +3227,7 @@ bool w4a8_codebook_gemv(
         codebook.has_value() ? codebook->data() : nullptr,
         s_channel.data(), xs.data(),
         bias.has_value() ? bias->data() : nullptr,
-        out.data(), M, N, K, G, out_dtype_code, stream);
+        out.data(), M, N, K, G, bits, out_dtype_code, stream);
 }
 
 void quantize_int8_rowwise_convrot(
@@ -4048,12 +4066,12 @@ NB_MODULE(_C, m) {
           nb::arg("stream_ptr"));
 
     m.def("dequant_int4_grouped_to_int8", &dequant_int4_grouped_to_int8,
-          "Grouped int4 -> int8 dequant (group scale folded into int8); optional 16-entry codebook",
+          "Grouped int4/int6 -> int8 dequant (group scale folded into int8); optional 16-entry codebook (4-bit)",
           nb::arg("qw"), nb::arg("s_rel"), nb::arg("codebook").none(), nb::arg("out"),
           nb::arg("g"), nb::arg("stream_ptr"));
 
     m.def("dequant_int4_grouped_to_int8_e4m3", &dequant_int4_grouped_to_int8_e4m3,
-          "Grouped int4 -> int8 dequant with fp8 e4m3 per-group scale; optional 16-entry codebook",
+          "Grouped int4/int6 -> int8 dequant with fp8 e4m3 per-group scale; optional 16-entry codebook (4-bit)",
           nb::arg("qw"), nb::arg("s_rel"), nb::arg("codebook").none(), nb::arg("out"),
           nb::arg("g"), nb::arg("stream_ptr"));
 

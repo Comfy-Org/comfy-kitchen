@@ -49,8 +49,12 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (
     _decide_codebook,
     _dequantize_w4a8_int8_weight_from_int8,
     _quantize_w4a8_chunked,
+    _w4a8_geometry,
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
+)
+from comfy_kitchen.backends.eager.w4a8_int8 import (
+    _dequant_int4_grouped_to_int8 as _eager_dequant_grouped_to_int8,
 )
 
 logger = logging.getLogger("comfy_kitchen.hip")
@@ -834,8 +838,9 @@ def _dequant_int4_grouped_to_int8(
     group_size: int,
 ) -> torch.Tensor:
     """Decode packed INT4 weights to the grouped INT8 grid the GEMM consumes."""
-    n, k_half = qdata.shape
-    k = k_half * 2
+    n, k, bits = _w4a8_geometry(qdata, s_rel, group_size)
+    if bits != 4:  # the HIP decode kernels are 4-bit only; eager is bit-exact with them
+        return _eager_dequant_grouped_to_int8(qdata, s_rel, codebook, group_size)
     device = qdata.device
     qdata_arg = _operand(qdata, device, "qdata")
     scale_code = DTYPE_TO_CODE[s_rel.dtype]
@@ -934,8 +939,7 @@ def _w4a8_int8_linear_chunked(
     convrot_groupsize: int,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    n, k_half = qdata.shape
-    k = k_half * 2
+    n, k, _bits = _w4a8_geometry(qdata, s_rel, group_size)  # caller routes non-4-bit away
     device = x.device
     orig_shape = x.shape
     x2d = x.reshape(-1, k).contiguous()
@@ -1081,6 +1085,8 @@ def quantize_w4a8_int8_weight(
     codebook: bool = True,
     codebook_tensor: torch.Tensor | None = None,
     stochastic_rounding: int = 0,
+    bits: int = 4,
+    scale_search: bool = True,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1088,12 +1094,13 @@ def quantize_w4a8_int8_weight(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Prepare W4A8 weights with the fused HIP requantize and eager ConvRot."""
-    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize)
-    # The fused kernel covers the default codebook layout only. Asymmetric, uniform,
-    # fp32-scale and other group sizes stay on the chunked eager path.
+    """Prepare W4A8/W6A8 weights with the fused HIP requantize and eager ConvRot."""
+    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
+    # The fused kernel covers the default 4-bit codebook layout only. Asymmetric, uniform,
+    # fp32-scale, other group sizes and 6-bit stay on the chunked eager path.
     if (
-        symmetric
+        bits == 4
+        and symmetric
         and codebook
         and group_size == 16
         and scale_dtype == torch.float8_e4m3fn
@@ -1117,6 +1124,8 @@ def quantize_w4a8_int8_weight(
         codebook=codebook,
         codebook_override=codebook_tensor,
         stochastic_rounding=stochastic_rounding,
+        bits=bits,
+        scale_search=scale_search,
     )
 
 
@@ -1163,11 +1172,11 @@ def w4a8_int8_linear(
     packed weight itself, so a few rows take a GEMV that dequantizes in registers
     and never writes the INT8 weight at all.
     """
-    validate_w4a8_operands(
+    _n, k, bits = validate_w4a8_operands(
         qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize
     )
-    if x.shape[-1] != qdata.shape[-1] * 2:
-        raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={qdata.shape[-1] * 2}")
+    if x.shape[-1] != k:
+        raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={k}")
 
     # The asymmetric zero-point correction is a rank-one term the INT8 epilogue
     # cannot express, so that layout runs off the dequantized weight instead.
@@ -1186,8 +1195,9 @@ def w4a8_int8_linear(
 
     # The layout allows any ConvRot group that divides K; INT8 G=256 can spill to
     # global memory when K exceeds the fused LDS budget. int8_linear applies the
-    # same test before its own fast path.
-    if not _convrot_supported(
+    # same test before its own fast path. 6-bit rows have no HIP decode kernel yet,
+    # so they take the eager decode into the same INT8 GEMM.
+    if bits != 4 or not _convrot_supported(
         x.shape[-1], convrot_groupsize, x.device, x.dtype, int8_global_spill=True
     ):
         int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
