@@ -322,11 +322,8 @@ def fp16_conv3d(
     """fp16-accumulate conv3d with bias and residual fused into the epilogue.
 
     x [N, C, D, H, W], weight [K, C, T, R, S], zero padding only. Same opt-in
-    numerics as fp16_linear; shapes the kernel declines run torch's conv.
-
-    x may be a spatial or temporal window of a larger channels_last_3d tensor and out a
-    matching window of the full output: the CUDA kernel reads and writes the views' strides,
-    so a convolution tiled for memory needs no per-tile copies. out is returned.
+    numerics as fp16_linear; shapes the kernel declines run torch's conv. x and out may be
+    NDHWC-ordered views of larger tensors, so a tiled conv needs no per-tile copies.
     """
     stride = [stride] * 3 if isinstance(stride, int) else list(stride)
     if out is None:
@@ -349,12 +346,9 @@ def group_norm_silu_pad3d(
     """Per-frame GroupNorm, SiLU and causal conv3d padding in one pass.
 
     x [B, C, T, H, W]; pad is (left, right, top, bottom, front). The spatial border
-    reflects, or is zero when zero_pad, for models whose convolutions pad with zeros;
-    the front frames are always zero. weight=None is pad-only. Output is channels_last_3d.
-
-    out, if given, receives the result and is returned. For a batch of one it may be a
-    frame-offset view of a longer buffer, which is how a caller keeps room in front for a
-    real temporal halo where the kernel would otherwise put zero frames.
+    reflects, or is zero when zero_pad; the front frames are always zero. weight=None is
+    pad-only. Output is channels_last_3d, into out when given, which is returned; for a
+    batch of one out may be a frame-offset view, leaving room for a caller's real halo.
     """
     if out is None:
         return torch.ops.comfy_kitchen.group_norm_silu_pad3d(
