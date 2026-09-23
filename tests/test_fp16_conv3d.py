@@ -162,6 +162,20 @@ class TestStridedViews:
         ck.fp16_conv3d(x[:, :, :, :18, :], weight, bias, out=window)
         assert rel_err(window.float(), full[:, :, :, :16, :].float()) < fp16_accum_tol(128 * 27)
 
+    def test_batch_of_two_frame_window_out(self, seed, cuda_available):
+        """The epilogue packs rows across batches, so an N>1 frame window must decline rather than
+        write batch 1 over batch 0's other frames."""
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        x = torch.randn(2, 128, 6, 66, 130, dtype=torch.float16, device="cuda").contiguous(memory_format=CL3D)
+        weight = (torch.randn(128, 128, 3, 3, 3, dtype=torch.float16, device="cuda") * 0.02).contiguous(memory_format=CL3D)
+        big = torch.full((2, 128, 4, 64, 128), 7.0, dtype=torch.float16, device="cuda").contiguous(memory_format=CL3D)
+        window = big[:, :, 0:2]
+        ck.fp16_conv3d(x[:, :, 0:4], weight, None, out=window)
+        ref = _ref(x[:, :, 0:4], weight, None, None, (1, 1, 1))
+        assert rel_err(window.float(), ref) < fp16_accum_tol(128 * 27)
+        assert bool((big[:, :, 2:] == 7.0).all()), "frames outside the window were overwritten"
+
     def test_deep_k_large_launch_fp16_accumulates(self, seed, cuda_available):
         """512 channels x 27 taps, the depth the gate was raised to admit."""
         if not cuda_backend_available():

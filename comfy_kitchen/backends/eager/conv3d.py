@@ -43,6 +43,12 @@ def _op_fp16_conv3d_out(
     stride: list[int],
     out: torch.Tensor,
 ) -> None:
+    # copy_ would broadcast or cast into a mismatched buffer instead of failing
+    n, _, d, h, w = x.shape
+    k, _, t, r, s = weight.shape
+    shape = (n, k, (d - t) // stride[0] + 1, (h - r) // stride[1] + 1, (w - s) // stride[2] + 1)
+    if out.shape != shape or out.dtype != x.dtype or out.device != x.device:
+        raise ValueError(f"fp16_conv3d: out must be {shape} {x.dtype} on {x.device}")
     kwargs = {"x": x, "weight": weight, "bias": bias, "residual": residual, "stride": stride, "out": out}
     impl = registry.get_implementation("fp16_conv3d_out", kwargs=kwargs)
     impl(**kwargs)

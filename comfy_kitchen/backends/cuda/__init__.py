@@ -2988,9 +2988,10 @@ def _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-1, out=None)
         if out.is_contiguous(memory_format=torch.channels_last_3d):
             os = (0, 0, 0, 0)
         else:
-            # the epilogue writes a packed 2-D [N*Z*P*Q, K] matrix, so only a frame window fits
+            # the epilogue writes a packed 2-D [N*Z*P*Q, K] matrix, so only a frame window of a
+            # single batch fits; anything else falls back to torch and a copy
             os = _ndhwc_strides(out)
-            if os is None or os[:3] != (k, q * k, p * q * k):
+            if os is None or os != (k, q * k, p * q * k, 0 if n == 1 else z * p * q * k):
                 return None
     if not (_aligned16(x) and _aligned16(weight) and _aligned16(bias) and _aligned16(residual) and _aligned16(out)):
         return None
@@ -3100,11 +3101,6 @@ def _writes_packed_ndhwc(out: torch.Tensor) -> bool:
 
 def group_norm_silu_pad3d_out(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out) -> None:
     """group_norm_silu_pad3d into ``out``; a frame-offset view leaves room for a caller's halo."""
-    b, c, t, h, w = x.shape
-    left, right, top, bottom, front = pad
-    shape = (b, c, t + front, h + top + bottom, w + left + right)
-    if out.shape != shape or out.dtype != x.dtype or out.device != x.device:
-        raise ValueError(f"group_norm_silu_pad3d_out: out must be {shape} {x.dtype} on x's device")
     group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out=out)
 
 
