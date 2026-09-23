@@ -2938,14 +2938,16 @@ bool cutlass_turing_int4_dequant(
         a.data(), b.data(), xs.data(), ws.data(), bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
 }
 
-// Code width implied by the packed row: K/2 bytes at 4 bits, 3K/4 at 6. The 6-bit layout
-// is uniform (no codebook) and needs K % 32 so its rows and high plane stay 8-byte aligned.
-static int64_t w4a8_bits_from_width(int64_t cols, int64_t K, bool has_codebook, const char* who) {
+// Code width implied by the packed row: K/2 bytes at 4 bits, 3K/4 at 6. The 6-bit layout is
+// uniform (no codebook), needs K % 32 so its rows and high plane stay 8-byte aligned, and
+// G a multiple of 16 because its decoder applies one scale per 16-col vector (the C++ twin
+// of the eager _check_six_bit_layout rule).
+static int64_t w4a8_bits_from_width(int64_t cols, int64_t K, int64_t G, bool has_codebook, const char* who) {
     const int64_t bits = (K > 0) ? (cols * 8) / K : 0;
     if ((bits != 4 && bits != 6) || cols * 8 != K * bits)
         throw std::runtime_error(std::string(who) + ": packed width must be K/2 (4-bit) or 3K/4 (6-bit)");
-    if (bits == 6 && K % 32 != 0)
-        throw std::runtime_error(std::string(who) + ": K must be a multiple of 32 at 6 bits");
+    if (bits == 6 && (K % 32 != 0 || G < 16 || G % 16 != 0))
+        throw std::runtime_error(std::string(who) + ": 6-bit storage needs K % 32 == 0 and G a multiple of 16");
     if (bits == 6 && has_codebook)
         throw std::runtime_error(std::string(who) + ": 6-bit storage has no codebook");
     return bits;
@@ -2960,7 +2962,7 @@ void dequant_int4_grouped_to_int8(
     int64_t G, uintptr_t stream_ptr) {
     const int64_t N = qw.shape(0);
     const int64_t K = out.shape(1);
-    const int64_t bits = w4a8_bits_from_width(qw.shape(1), K, codebook.has_value(), "dequant_int4_grouped");
+    const int64_t bits = w4a8_bits_from_width(qw.shape(1), K, G, codebook.has_value(), "dequant_int4_grouped");
     if (K % 16 != 0) throw std::runtime_error("dequant_int4_grouped: K must be a multiple of 16");
     if (G < 4 || (16 % G != 0 && G % 16 != 0))
         throw std::runtime_error("dequant_int4_grouped: G must be >=4 and divide 16 or be a multiple of 16");
@@ -2985,7 +2987,7 @@ void dequant_int4_grouped_to_int8_e4m3(
     int64_t G, uintptr_t stream_ptr) {
     const int64_t N = qw.shape(0);
     const int64_t K = out.shape(1);
-    const int64_t bits = w4a8_bits_from_width(qw.shape(1), K, codebook.has_value(), "dequant_int4_grouped");
+    const int64_t bits = w4a8_bits_from_width(qw.shape(1), K, G, codebook.has_value(), "dequant_int4_grouped");
     if (K % 16 != 0) throw std::runtime_error("dequant_int4_grouped: K must be a multiple of 16");
     if (G < 4 || (16 % G != 0 && G % 16 != 0))
         throw std::runtime_error("dequant_int4_grouped: G must be >=4 and divide 16 or be a multiple of 16");
@@ -3045,7 +3047,7 @@ static int64_t validate_w4a8_codebook_gemm_contract(
     int64_t out_rows, int64_t out_cols,
     const nb::dlpack::dtype& out_dtype,
     int64_t G, int64_t chunk_cols, int out_dtype_code) {
-    const int64_t bits = w4a8_bits_from_width(weight_cols, K, codebook_size >= 0, "w4a8_codebook_gemm");
+    const int64_t bits = w4a8_bits_from_width(weight_cols, K, G, codebook_size >= 0, "w4a8_codebook_gemm");
     if (K % 16 != 0)
         throw std::runtime_error("w4a8_codebook_gemm: K must be a multiple of 16");
     if (G < 4 || (16 % G != 0 && G % 16 != 0))
