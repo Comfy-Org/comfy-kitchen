@@ -123,7 +123,7 @@ class TestCudaBackend:
         ref = eager_w4a8.dequantize_w4a8_int8_weight(q, s, c, group_size=group_size, output_dtype=torch.float32)
         assert rel_l2(got, ref) < 1e-5
 
-    @pytest.mark.parametrize("m", [1, 8, 9, 256])  # gemv (<=8), chunked GEMM
+    @pytest.mark.parametrize("m", [1, 8, 9, 256, 1024])  # gemv (<=8), chunked GEMM, fast act-quant (>=512)
     @pytest.mark.parametrize("with_bias", [False, True])
     def test_linear_matches_eager(self, weight, m, with_bias):
         q, s, c, _, _ = eager_w4a8.quantize_w4a8_int8_weight(weight, bits=6)

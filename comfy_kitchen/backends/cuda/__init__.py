@@ -2368,7 +2368,34 @@ def w4a8_int8_linear(
         workspace = torch.empty(
             min(chunk_cols, n), k, dtype=torch.int8, device=x.device
         )
-        if hasattr(_C, "w4a8_codebook_linear_chunked"):
+        # Quantize the activation with the same 64-lane ConvRot kernel int8_linear uses
+        # (~2x faster than the one inside the fused binding); at small M the extra launch
+        # costs more than it saves.
+        fast_act = (
+            m >= 512
+            and convrot_groupsize == 256
+            and k % 256 == 0
+            and 256 <= k <= _CONVROT_FUSED_MAX_K
+            and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
+        )
+        if fast_act:
+            xq, xs = quantize_int8_rowwise_convrot64(x_2d, convrot_groupsize)
+            used = _C.w4a8_codebook_gemm_chunked(
+                _wrap_for_dlpack(xq),
+                _wrap_for_dlpack(qdata),
+                _wrap_for_dlpack(s_rel.view(torch.uint8)),
+                wrap_codebook(),
+                _wrap_for_dlpack(s_channel),
+                _wrap_for_dlpack(xs.reshape(m)),
+                _wrap_for_dlpack(bias_arg) if bias_arg is not None else None,
+                _wrap_for_dlpack(workspace),
+                _wrap_for_dlpack(out),
+                group_size,
+                chunk_cols,
+                output_dtype_code,
+                stream_ptr,
+            )
+        elif hasattr(_C, "w4a8_codebook_linear_chunked"):
             used = _C.w4a8_codebook_linear_chunked(
                 _wrap_for_dlpack(x_2d),
                 _wrap_for_dlpack(xq),
