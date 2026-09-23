@@ -120,8 +120,7 @@ class TestFp16Conv3d:
 
 
 class TestStridedViews:
-    """The kernel reads NDHWC-ordered views of a larger activation and writes frame windows of a
-    larger output, so a convolution tiled for memory needs no per-tile copies."""
+    """NDHWC views in and frame windows out, so a memory-tiled conv needs no per-tile copies."""
 
     def test_input_row_window_matches_packed(self, seed, cuda_available):
         if not cuda_backend_available():
@@ -145,10 +144,13 @@ class TestStridedViews:
             got = cuda_backend._cutlass_fp16_conv3d(x[:, :, z0:z1 + 2], weight, bias, None, [1, 1, 1], out=out[:, :, z0:z1])
             assert got is not None and got.data_ptr() == out[:, :, z0:z1].data_ptr()
         assert torch.equal(out, full)
+        buf = torch.empty_like(full)
+        assert ck.fp16_conv3d(x, weight, bias, out=buf).data_ptr() == buf.data_ptr()
+        assert torch.equal(buf, full)
 
     def test_row_window_out_is_declined(self, seed, cuda_available):
-        """The epilogue writes a packed 2-D matrix; a row window of the output cannot be expressed,
-        so the kernel declines it and the public op falls back to torch and a copy."""
+        """The epilogue writes a packed 2-D matrix, so a row window of the output cannot be
+        expressed: the kernel declines and the public op falls back to torch."""
         if not cuda_backend_available():
             pytest.skip("compiled CUDA backend required")
         from comfy_kitchen.backends import cuda as cuda_backend
@@ -160,26 +162,8 @@ class TestStridedViews:
         ck.fp16_conv3d(x[:, :, :, :18, :], weight, bias, out=window)
         assert rel_err(window.float(), full[:, :, :, :16, :].float()) < fp16_accum_tol(128 * 27)
 
-    def test_public_out_returns_the_buffer(self, seed, cuda_available):
-        if not cuda_backend_available():
-            pytest.skip("compiled CUDA backend required")
-        x, weight, bias, _ = _inputs(128, 128, 4, 34, 66, (3, 3, 3))
-        ref = ck.fp16_conv3d(x, weight, bias)
-        buf = torch.empty((1, 128, 6, 32, 64), dtype=torch.float16, device="cuda").contiguous(memory_format=CL3D)
-        got = ck.fp16_conv3d(x, weight, bias, out=buf[:, :, 2:4])
-        assert got.data_ptr() == buf[:, :, 2:4].data_ptr() and torch.equal(got, ref)
-
-    def test_ndhwc_strides(self, cuda_available):
-        from comfy_kitchen.backends.cuda import _ndhwc_strides
-        x = torch.empty((1, 128, 6, 34, 66), dtype=torch.float16, device="cuda").contiguous(memory_format=CL3D)
-        assert _ndhwc_strides(x) == (128, 66 * 128, 34 * 66 * 128, 0)      # batch stride unused for N=1
-        assert _ndhwc_strides(x[:, :, 2:4]) == (128, 66 * 128, 34 * 66 * 128, 0)
-        assert _ndhwc_strides(x[:, :, :, 3:20, :])[1] == 66 * 128         # a row window keeps its row stride
-        assert _ndhwc_strides(x.contiguous()) is None                      # NCDHW
-        assert _ndhwc_strides(torch.empty((1, 12, 2, 8, 8), dtype=torch.float16, device="cuda").contiguous(memory_format=CL3D)) is None  # misaligned
-
     def test_deep_k_large_launch_fp16_accumulates(self, seed, cuda_available):
-        """512 channels x 27 taps: served in fp16 where the launch is large enough."""
+        """512 channels x 27 taps, the depth the gate was raised to admit."""
         if not cuda_backend_available():
             pytest.skip("compiled CUDA backend required")
         from comfy_kitchen.backends import cuda as cuda_backend

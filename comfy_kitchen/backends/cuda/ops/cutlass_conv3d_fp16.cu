@@ -9,9 +9,8 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 
-// Element strides (w, h, d, n) for the activation and the output; all zero means packed
-// NDHWC. Non-packed strides let a tile be a view of a larger padded activation and write its
-// result into a view of the full output, so tiled convolutions need no per-tile copies.
+// Element strides (w, h, d, n) for activation and output; all zero means packed NDHWC.
+// Non-packed strides let a tile be a view, so tiled convolutions need no per-tile copies.
 struct Conv3dStrides {
     int xw, xh, xd, xn;
     int ow, oh, od, on;
@@ -103,8 +102,7 @@ using Conv1 = Conv3dFp16<128, 128, 64, 64, 4, half_t>;
 using Conv2 = Conv3dFp16<64, 64, 32, 32, 4, float>;
 constexpr int kConvConfigCount = 3;
 // 512 channels x 27 taps = 13824. At that depth fp16 accumulation costs the SeedVR2 decoder
-// 65.5 -> 57.8 dB against an fp32 reference and buys 11-13% of decode time; the 8192 gate
-// (the depth the kernel was first verified at) only reached the 128/256-channel stages.
+// 65.5 -> 57.8 dB against fp32 and buys 11-13% of decode time.
 constexpr int64_t kMaxFp16Depth = 16384;
 constexpr int64_t kMinTiles = 128;
 // conv_out (K=48) has 20 threadblocks at 64x64 and still beats cuDNN 2x
@@ -115,8 +113,8 @@ int64_t conv_tiles(int64_t m, int k) {
     return ((m + Cfg::kM - 1) / Cfg::kM) * ((k + Cfg::kN - 1) / Cfg::kN);
 }
 
-// Deep-K launches too small for the 128-row tiles go to the 64-row fp32 config, where tile fit
-// beats cuDNN 2x; shallow small launches stay on cuDNN, which is faster there.
+// Deep-K launches too small for the 128-row tiles take the 64-row fp32 config; shallow small
+// launches stay on cuDNN, which is faster there.
 constexpr int64_t kDeepK = 8192;
 
 int select_conv_config(int64_t m, int k, int64_t depth) {

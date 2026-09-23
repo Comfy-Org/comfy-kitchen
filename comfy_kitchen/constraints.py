@@ -354,6 +354,6 @@ def na3d_common_call_rule(kwargs):
 
 
 def with_out_param(base: FunctionConstraints) -> FunctionConstraints:
-    """The ``_out`` form of an op: the base constraints plus a 5-D ``out`` in x's dtypes."""
+    """The ``_out`` form of an op: base constraints plus a 5-D ``out`` in x's dtypes."""
     out = ParamConstraint(dtypes=base.params["x"].dtypes, shape_rules=(ExactDims(5),))
     return replace(base, params={**base.params, "out": out})

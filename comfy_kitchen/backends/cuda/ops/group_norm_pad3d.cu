@@ -140,8 +140,7 @@ apply_kernel(const T* __restrict__ x, const float2* __restrict__ stats,
     const int y0 = orow / W_out - top;
     const int x0 = orow % W_out - left;
     if (kZeroPad && (y0 < 0 || y0 >= H || x0 < 0 || x0 >= W)) {
-        // Zero border, like the front frames above: models whose convolutions pad with zeros
-        // rather than reflecting need the same values a constant F.pad would have produced.
+        // zero border, for models whose convolutions pad with zeros rather than reflecting
         *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
         return;
     }
@@ -217,7 +216,7 @@ extern "C" void launch_group_norm_silu_pad3d(
     if (left < 0 || right < 0 || top < 0 || bottom < 0 || front < 0) {
         throw std::runtime_error("group_norm_silu_pad3d: padding must be non-negative");
     }
-    // Reflection reads a mirrored row, so it needs one to exist; a zero border reads nothing.
+    // reflection needs a row to mirror; a zero border reads nothing
     if (!zero_pad && (left >= W || right >= W || top >= H || bottom >= H)) {
         throw std::runtime_error("group_norm_silu_pad3d: reflect padding must be smaller than the input");
     }

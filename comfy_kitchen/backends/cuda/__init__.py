@@ -2933,15 +2933,14 @@ def _zero_vector(n: int, device: torch.device, dtype: torch.dtype = torch.float1
 
 
 def _ndhwc_strides(t: torch.Tensor):
-    """(w, h, d, n) element strides when ``t`` is an NDHWC-ordered view with a dense channel
-    row -- a spatial or temporal window of a larger channels_last_3d tensor -- else None.
-    Every stride must keep the kernel's 16-byte vector accesses aligned."""
+    """(w, h, d, n) element strides of an NDHWC-ordered view with a dense channel row, else None.
+    Strides must keep the kernel's 16-byte vector accesses aligned."""
     n, c = t.shape[0], t.shape[1]
     st = t.stride()
     if t.dim() != 5 or st[1] != 1 or st[4] != c:
         return None
-    # the batch stride is never applied for a batch of one, and a frame window of a large
-    # activation carries the whole tensor's, which may not fit the kernel's 32-bit strides
+    # never applied for a batch of one, and a frame window carries the whole tensor's, which
+    # may not fit the kernel's 32-bit strides
     strides = (st[4], st[3], st[2], 0 if n == 1 else st[0])
     if any(s % 8 for s in strides) or any(s > 2**31 - 1 for s in strides):
         return None
@@ -2950,11 +2949,8 @@ def _ndhwc_strides(t: torch.Tensor):
 
 def _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-1, out=None):
     """The fused kernel, or None when it does not apply to this call.
-    config forces a tile config (benchmarking); -1 selects by shape.
-
-    x may be an NDHWC-ordered view of a larger tensor (a padded activation's tile), and out an
-    NDHWC-ordered view to write into (the full output's matching tile): the kernel takes the
-    strides, so a tiled convolution runs without per-tile copies."""
+    config forces a tile config (benchmarking); -1 selects by shape. x and out may be
+    NDHWC-ordered views of larger tensors, so a tiled convolution needs no per-tile copies."""
     n, c, d, h, w = x.shape
     k, _, t, r, s = weight.shape
     sd, sh, sw = stride
@@ -2992,9 +2988,7 @@ def _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-1, out=None)
         if out.is_contiguous(memory_format=torch.channels_last_3d):
             os = (0, 0, 0, 0)
         else:
-            # The epilogue writes rows as a packed 2-D [N*Z*P*Q, K] matrix, so only a frame window
-            # (packed but for the batch stride) can be written in place; anything else, or a
-            # stride past the kernel's 32-bit range, goes to the caller's fallback.
+            # the epilogue writes a packed 2-D [N*Z*P*Q, K] matrix, so only a frame window fits
             os = _ndhwc_strides(out)
             if os is None or os[:3] != (k, q * k, p * q * k):
                 return None
@@ -3033,8 +3027,7 @@ def fp16_conv3d_out(
     stride: list[int],
     out: torch.Tensor,
 ) -> None:
-    """fp16_conv3d into ``out``; the kernel writes strided views directly, so a tile of the
-    output costs no copy. torch's conv plus a copy when the kernel declines the shape."""
+    """fp16_conv3d into ``out``; torch's conv plus a copy when the kernel declines the shape."""
     if _cutlass_fp16_conv3d(x, weight, bias, residual, stride, out=out) is not None:
         return
     res = torch.nn.functional.conv3d(x, weight, bias, stride=stride)
@@ -3052,9 +3045,8 @@ def group_norm_silu_pad3d(
     zero_pad: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Per-frame GroupNorm + SiLU + causal conv padding in one pass; the result is
-    channels_last_3d. ``out`` is written in place when the kernel can index it as packed
-    NDHWC (packed, or a frame-offset view for a batch of one), else copied into."""
+    """Per-frame GroupNorm + SiLU + causal conv padding in one pass, channels_last_3d out.
+    ``out`` is written in place where the kernel can index it, else copied into."""
     b, c, t, h, w = x.shape
     left, right, top, bottom, front = pad
     if min(pad) < 0:
@@ -3098,8 +3090,7 @@ def group_norm_silu_pad3d(
 
 
 def _writes_packed_ndhwc(out: torch.Tensor) -> bool:
-    """Packed channels_last_3d, or for a batch of one a frame-offset view of a longer buffer
-    (only the batch stride differs, and it is never used)."""
+    """Packed channels_last_3d, or for a batch of one a frame-offset view of a longer buffer."""
     if out.is_contiguous(memory_format=torch.channels_last_3d):
         return True
     b, c, t, h, w = out.shape
@@ -3108,8 +3099,7 @@ def _writes_packed_ndhwc(out: torch.Tensor) -> bool:
 
 
 def group_norm_silu_pad3d_out(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out) -> None:
-    """group_norm_silu_pad3d into ``out``; a frame-offset view leaves room in front for a caller's
-    real temporal halo where the kernel would put zero frames."""
+    """group_norm_silu_pad3d into ``out``; a frame-offset view leaves room for a caller's halo."""
     b, c, t, h, w = x.shape
     left, right, top, bottom, front = pad
     shape = (b, c, t + front, h + top + bottom, w + left + right)
