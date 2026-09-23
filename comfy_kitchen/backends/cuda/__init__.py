@@ -3093,7 +3093,7 @@ def _writes_packed_ndhwc(out: torch.Tensor) -> bool:
     """Packed channels_last_3d, or for a batch of one a frame-offset view of a longer buffer."""
     if out.is_contiguous(memory_format=torch.channels_last_3d):
         return True
-    b, c, t, h, w = out.shape
+    b, c, _, h, w = out.shape
     st = out.stride()
     return b == 1 and st[1] == 1 and st[4] == c and st[3] == w * c and st[2] == h * w * c
 
