@@ -1704,8 +1704,14 @@ def dequantize_int8_convrot_weight_dtype(
         )
         return output
 
-    h = _build_hadamard(group_size, device=q_2d.device, dtype=output_dtype)
-    return _rotate_weight(dequantize_int8_simple_dtype(q_2d, scale, output_dtype_code), h, group_size)
+    if output_dtype == torch.float16:
+        # The rotation is linear and the scale per row: rotate the int8 codes, exact in fp16, then
+        # scale in fp32. Dequantizing first would underflow tiny q * scale before they are summed.
+        h = _build_hadamard(group_size, device=q_2d.device, dtype=output_dtype)
+        rotated = _rotate_weight(q_2d.to(output_dtype), h, group_size)
+        return rotated.mul_(scale.to(device=q_2d.device, dtype=torch.float32).reshape(-1, 1))
+    h = _build_hadamard(group_size, device=q_2d.device, dtype=torch.float32)
+    return _rotate_weight(dequantize_int8_simple(q_2d, scale), h, group_size).to(output_dtype)
 
 
 def int8_gemv_dequant(
