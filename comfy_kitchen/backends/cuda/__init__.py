@@ -27,11 +27,14 @@ from comfy_kitchen._rope_utils import (
     trim_rope_freqs,
 )
 from comfy_kitchen.allocation import allocation_context
+from comfy_kitchen.draft import materialize_layout, resolve_options
 
 __all__ = [
     "na3d",
     "sol_attn",
     "sol_attn_chunked",
+    "draft_attention",
+    "draft_attention_is_available",
     "adaln",
     "fp16_conv3d",
     "group_norm_silu_pad3d",
@@ -215,6 +218,7 @@ from comfy_kitchen.constraints import (  # noqa: E402
     MinDims,
     ParamConstraint,
     ValidationResult,
+    draft_attention_common_call_rule,
     na3d_common_call_rule,
     sol_attn_common_call_rule,
 )
@@ -2626,6 +2630,8 @@ def _sink_pair(value):
     return [0, 0] if value is None else [int(value[0]), int(value[1])]
 
 
+
+
 def _check_sol_args(device, sink_blocks, sink_q, topk_ratio, **tensors):
     """Shared by both CUDA entries (callers may bypass the registry): the
     registry rule plus a per-device sm_80 check -- the registry gate caches the
@@ -3671,7 +3677,108 @@ def gemv_awq_w4a16(
     return out2d.reshape(*orig_shape[:-1], n)
 
 
+def draft_attention_is_available(device=None) -> bool:
+    """Whether this extension contains the native plan/executor for the GPU."""
+    if not _EXT_AVAILABLE or not torch.cuda.is_available() or torch.version.hip:
+        return False
+    if not all(hasattr(_C, name) for name in ("draft_plan", "draft", "draft_supports_arch")):
+        return False
+    major, minor = torch.cuda.get_device_capability(device)
+    return bool(_C.draft_supports_arch(major * 10 + minor))
+
+
+def draft_attention(
+    q, k, v, *, video_shape, prefix_tokens=0, sparsity_ratio=0.8,
+    query_block_size=64, nvfp4_ratio=0.0, int8_ratio=1.0, mxfp8_ratio=0.0,
+    fp16_ratio=0.0, prefix_kv_precision="auto", prefix_query_precision="auto",
+    draftmap_proxy="mean", diag_jensen=False, maxpool_weight=0.0,
+    enable_anchors=False, smooth_k=False, nvfp4_scales=(1.0, 1.0, 1.0),
+):
+    """Launch one native Draft plan with caller-owned output and workspace."""
+    check = draft_attention_common_call_rule({
+        "q": q, "k": k, "v": v, "video_shape": video_shape,
+        "prefix_tokens": prefix_tokens, "sparsity_ratio": sparsity_ratio,
+    })
+    if not check.success:
+        raise ValueError(f"draft_attention: {check.failed_param}: {check.failure_reason}")
+    if q.device.type != "cuda" or q.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("draft_attention requires FP16/BF16 CUDA inputs")
+    if not draft_attention_is_available(q.device):
+        raise RuntimeError("No native Draft executor was built for this GPU")
+    major, minor = torch.cuda.get_device_capability(q.device)
+    options = resolve_options(
+        architecture="sm120" if (major, minor) == (12, 0) else "sm89", query_block_size=query_block_size,
+        nvfp4_ratio=nvfp4_ratio, int8_ratio=int8_ratio, mxfp8_ratio=mxfp8_ratio,
+        fp16_ratio=fp16_ratio, prefix_kv_precision=prefix_kv_precision,
+        prefix_query_precision=prefix_query_precision, draftmap_proxy=draftmap_proxy,
+        diag_jensen=diag_jensen, maxpool_weight=maxpool_weight, enable_anchors=enable_anchors,
+        smooth_k=smooth_k, nvfp4_scales=nvfp4_scales, prefix_tokens=prefix_tokens,
+    )
+    precision = {"auto": -1, "nvfp4": 0, "int8": 1, "mxfp8": 2, "fp16": 3}
+    with torch.cuda.device(q.device):
+        stream = torch.cuda.current_stream(q.device)
+        # Keep both supported physical layouts without copying ordinary BHSD
+        # views. Preserve borrowed storage until this stream finishes its reads.
+        normalized = []
+        for tensor in (q, k, v):
+            tensor.record_stream(stream)
+            if not tensor.is_contiguous() and not tensor.transpose(1, 2).is_contiguous():
+                tensor = tensor.contiguous()
+            if tensor.data_ptr() % 16:
+                tensor = tensor.clone(memory_format=torch.contiguous_format)
+            normalized.append(tensor)
+        q, k, v = normalized
+        batch, tokens, heads, dim = q.shape
+        layout = materialize_layout(q.device, tuple(video_shape), options.query_block_size, options.enable_anchors)
+        plan = _C.draft_plan(
+            q.device.index, batch, tokens, heads, dim, options.query_block_size,
+            prefix_tokens, layout.counts.numel(), layout.anchor_count, q.dtype == torch.bfloat16,
+            float(sparsity_ratio), options.ratios, precision[options.prefix_kv_precision],
+            precision[options.prefix_query_precision], {"mean": 0, "k_tail_r1": 1, "k_tail_r2": 2}[options.draftmap_proxy],
+            options.diag_jensen, options.maxpool_weight, options.enable_anchors,
+            options.smooth_k, options.nvfp4_scales,
+        )
+        prefix_output = torch.empty((batch, heads, 0, dim), device=q.device, dtype=q.dtype)
+        if prefix_tokens and not plan.native_prefix:
+            # Keep the donor's original-dtype dense prefix semantics; all sparse
+            # preparation, routing and mixed-precision execution is native.
+            prefix_output = torch.nn.functional.scaled_dot_product_attention(
+                q[:, :prefix_tokens].transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                dropout_p=0.0, is_causal=False,
+            )
+        output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+        workspace = torch.empty((plan.workspace_bytes,), device=q.device, dtype=torch.uint8)
+        operands = (q, k, v, layout.indices, layout.slot_valid, layout.counts, layout.inverse,
+                    layout.anchors, layout.anchor_ids, prefix_output, output, workspace)
+        _C.draft(plan, *(None if x is None else _wrap_for_dlpack(x) for x in operands), stream.cuda_stream)
+        return output
+
+
 def _build_constraints() -> dict:
+    def _draft_call_rule(kwargs):
+        common = draft_attention_common_call_rule(kwargs)
+        if not common.success:
+            return common
+        q = kwargs.get("q")
+        if q is not None:
+            capability = torch.cuda.get_device_capability(q.device)
+            if capability < (8, 9):
+                return ValidationResult.fail(
+                    "q", "device must have compute capability >= 8.9 (Ada kernels) or 12.0")
+            if capability == (12, 0) and q.shape[-1] != 128:
+                return ValidationResult.fail("q", "SM120 requires head_dim=128")
+            if not draft_attention_is_available(q.device):
+                return ValidationResult.fail("q", "native Draft executor was not compiled for this device")
+            names = ("query_block_size", "nvfp4_ratio", "int8_ratio", "mxfp8_ratio", "fp16_ratio",
+                     "prefix_kv_precision", "prefix_query_precision", "draftmap_proxy", "diag_jensen",
+                     "maxpool_weight", "enable_anchors", "smooth_k", "nvfp4_scales", "prefix_tokens")
+            try:
+                resolve_options(architecture="sm120" if capability == (12, 0) else "sm89",
+                                **{name: kwargs[name] for name in names if name in kwargs})
+            except (TypeError, ValueError) as exc:
+                return ValidationResult.fail("options", str(exc))
+        return ValidationResult.ok()
+
     def _na3d_call_rule(kwargs):
         common = na3d_common_call_rule(kwargs)
         if not common.success:
@@ -3688,6 +3795,24 @@ def _build_constraints() -> dict:
     cuda_devices = frozenset({"cuda"})
 
     constraints = {
+        "draft_attention": FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16, torch.float16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "k": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16, torch.float16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+                "v": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16, torch.float16}),
+                    shape_rules=(ExactDims(4),),
+                ),
+            },
+            default_devices=cuda_devices,
+            call_rules=(_draft_call_rule,),
+        ),
         "sol_attn": FunctionConstraints(
             params={
                 "q": ParamConstraint(
