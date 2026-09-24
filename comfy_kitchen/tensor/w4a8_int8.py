@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Grouped W4A8 weights executed through the shared INT8 linear operation.
+"""Grouped W4A8 / W6A8 weights executed through the shared INT8 linear operation.
 
-Weights are ConvRot-rotated and quantized per ``group_size``. The default uses
-a symmetric Lloyd-Max codebook and FP8 group scales. The tensor layout owns
-only metadata and operator routing; eager, CUDA, and Triton backends own the
-operation implementations.
+Weights are ConvRot-rotated and quantized per ``group_size``. The default (``bits=4``)
+uses a symmetric Lloyd-Max codebook and FP8 group scales; ``bits=6`` stores uniform
+6-bit codes (no codebook) in a 3K/4-byte row, at ~3x lower weight error for 1.5x the
+bytes. The bit depth is implied by the packed row width, so one layout class and one
+checkpoint format cover both. The tensor layout owns only metadata and operator
+routing; eager, CUDA, and Triton backends own the operation implementations.
 """
 
 from __future__ import annotations
@@ -35,6 +37,8 @@ def quantize_w4a8_int8_weight(
     codebook: bool = True,
     codebook_tensor: torch.Tensor | None = None,
     stochastic_rounding: int = 0,
+    bits: int = 4,
+    scale_search: bool = True,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -42,12 +46,14 @@ def quantize_w4a8_int8_weight(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Rotate and prepare a floating weight for grouped W4A8 storage.
+    """Rotate and prepare a floating weight for grouped W4A8 (or W6A8) storage.
 
     ``codebook_tensor`` reuses a previously decided table (e.g. on LoRA requantize) so the
     codebook decision -- kurtosis probe and any k-means -- is skipped. ``stochastic_rounding``
     > 0 seeds stochastic rounding of the level assignment so a merged LoRA below the int4 step
-    is preserved instead of rounded away.
+    is preserved instead of rounded away. ``bits=6`` selects uniform, codebook-free 6-bit
+    storage; ``scale_search`` (6-bit only) runs the grid-aware group-scale search at quantize
+    time, which the requantize path skips.
     """
     if scale_dtype not in (torch.float32, torch.float8_e4m3fn):
         raise ValueError(f"scale_dtype must be float32 or float8_e4m3fn, got {scale_dtype}")
@@ -60,6 +66,8 @@ def quantize_w4a8_int8_weight(
         "codebook": codebook,
         "codebook_tensor": codebook_tensor,
         "stochastic_rounding": stochastic_rounding,
+        "bits": bits,
+        "scale_search": scale_search,
     }
     impl = registry.get_implementation("quantize_w4a8_int8_weight", kwargs=kwargs)
     return impl(**kwargs)
@@ -120,7 +128,7 @@ def w4a8_int8_linear(
 
 
 class AsymW4A8Int8Layout(QuantizedLayout):
-    """Grouped W4A8 weights run through the selected INT8 backend."""
+    """Grouped W4A8 (or uniform W6A8) weights run through the selected INT8 backend."""
 
     MIN_SM_VERSION = (8, 0)
     QUANTIZES_INPUT = False
@@ -190,6 +198,8 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         codebook: bool = True,
         codebook_tensor: torch.Tensor | None = None,
         stochastic_rounding: int = 0,
+        bits: int = 4,
+        scale_search: bool = True,
         **kwargs,
     ) -> tuple[torch.Tensor, Params]:
         qdata, s_rel, s_channel, correction, codebook_tensor = quantize_w4a8_int8_weight(
@@ -201,6 +211,8 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             codebook=codebook,
             codebook_tensor=codebook_tensor,
             stochastic_rounding=stochastic_rounding,
+            bits=bits,
+            scale_search=scale_search,
         )
         params = cls.Params(
             scale=s_rel,
@@ -261,6 +273,14 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         return out
 
     @classmethod
+    def bits(cls, qtensor: QuantizedTensor) -> int:
+        """Code width implied by the packed row: K/2 bytes at 4 bits, 3K/4 at 6."""
+        from comfy_kitchen.backends.eager.w4a8_int8 import _w4a8_geometry
+
+        params = qtensor._params
+        return _w4a8_geometry(qtensor._qdata, params.scale, params.group_size)[2]
+
+    @classmethod
     def requantize_kwargs(cls, qtensor: QuantizedTensor) -> dict[str, object]:
         params = qtensor._params
         return {
@@ -270,6 +290,9 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             "codebook": params.codebook is not None,
             "codebook_tensor": params.codebook,
             "scale_dtype": params.scale.dtype,
+            "bits": cls.bits(qtensor),
+            # requantize reruns per layer under VRAM offload; the search is quantize-time only
+            "scale_search": False,
         }
 
 

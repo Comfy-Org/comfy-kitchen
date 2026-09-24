@@ -422,6 +422,49 @@ def test_rotation_handles_outliers():
 
 
 @requires_int8_attention
+@pytest.mark.parametrize("scale", [None, 0.0, -(128**-0.5)])
+def test_int8_attention_long_sequence_and_partial_tile(scale):
+    torch.manual_seed(31)
+    q, k, v = _qkv(1, 4, 4, 129, 8193, 128)
+    actual = ck.int8_attention(q, k, v, scale=scale)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=scale)
+
+    assert torch.isfinite(actual).all()
+    assert _nrmse(actual, expected) < 0.03
+
+
+@requires_int8_attention
+def test_int8_attention_long_sequence_preserves_constant_values():
+    torch.manual_seed(32)
+    q, k, v = _qkv(1, 4, 4, 129, 8193, 128)
+    constant = torch.linspace(-3, 3, 128, device="cuda", dtype=v.dtype)
+    constant[0] = 0
+    v.copy_(constant)
+
+    actual = ck.int8_attention(q, k, v)
+
+    # Backends that sum probabilities before U8 rounding can introduce a small
+    # normalization error; zero-valued channels must still remain exactly zero.
+    torch.testing.assert_close(actual, constant.expand_as(actual), rtol=0.005, atol=0)
+
+
+@requires_int8_attention
+def test_int8_attention_rescales_across_large_increases_in_logits():
+    torch.manual_seed(33)
+    q, k, v = _qkv(1, 4, 4, 129, 1025, 128)
+    direction = q[:, :, :1].clone()
+    q.copy_(direction)
+    steps = (torch.arange(1025, device="cuda") // 64).to(torch.float32) * 8
+    k.add_((direction.float() * steps[:, None] / (128**0.5)).to(k.dtype))
+
+    actual = ck.int8_attention(q, k, v)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    assert torch.isfinite(actual).all()
+    assert _nrmse(actual, expected) < 0.03
+
+
+@requires_int8_attention
 def test_int8_attention_accepts_dlpack_normalized_batch_stride():
     """A size-one extent carries no address, so its stride must not be policed.
 

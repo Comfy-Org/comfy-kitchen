@@ -201,6 +201,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     _decide_codebook,
     _dequantize_w4a8_int8_weight_from_int8,
     _quantize_w4a8_chunked,
+    _w4a8_geometry,
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
@@ -1451,6 +1452,8 @@ def quantize_w4a8_int8_weight(
     codebook: bool = True,
     codebook_tensor: torch.Tensor | None = None,
     stochastic_rounding: int = 0,
+    bits: int = 4,
+    scale_search: bool = True,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1458,12 +1461,13 @@ def quantize_w4a8_int8_weight(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Prepare W4A8 weights using native CUDA ConvRot and eager packing math."""
-    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize)
-    # Fused CUDA requant for the default codebook layout (group_size 16, fp8 scales);
-    # asym / uniform / fp32-scale / other group sizes use the chunked eager path.
+    """Prepare W4A8/W6A8 weights using native CUDA ConvRot and eager packing math."""
+    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
+    # Fused CUDA requant for the default codebook layout (4-bit, group_size 16, fp8 scales);
+    # asym / uniform / fp32-scale / other group sizes / 6-bit use the chunked eager path.
     if (
         _W4A8_FUSED_QUANT
+        and bits == 4
         and symmetric
         and codebook
         and group_size == 16
@@ -1486,6 +1490,8 @@ def quantize_w4a8_int8_weight(
         codebook=codebook,
         codebook_override=codebook_tensor,
         stochastic_rounding=stochastic_rounding,
+        bits=bits,
+        scale_search=scale_search,
     )
 
 
@@ -2219,6 +2225,41 @@ def int8_linear(
     return _finish(out)
 
 
+def _dequant_int4_grouped_to_int8(
+    qdata: torch.Tensor,
+    s_rel: torch.Tensor,
+    codebook: torch.Tensor | None,
+    group_size: int,
+) -> torch.Tensor:
+    """Native decode of packed INT4/INT6 storage to the grouped INT8 grid the GEMM consumes
+    (bit-exact with the eager decode). Shared by dequantize and the 2-pass linear."""
+    qdata = qdata.contiguous()
+    s_rel = s_rel.contiguous()
+    n, k, _bits = _w4a8_geometry(qdata, s_rel, group_size)
+    out = torch.empty(n, k, dtype=torch.int8, device=qdata.device)
+    codebook_arg = _wrap_for_dlpack(codebook.contiguous()) if codebook is not None else None
+    stream_ptr = torch.cuda.current_stream(qdata.device).cuda_stream
+    if s_rel.dtype == torch.float8_e4m3fn:
+        _C.dequant_int4_grouped_to_int8_e4m3(
+            _wrap_for_dlpack(qdata),
+            _wrap_for_dlpack(s_rel.view(torch.uint8)),
+            codebook_arg,
+            _wrap_for_dlpack(out),
+            group_size,
+            stream_ptr,
+        )
+    else:
+        _C.dequant_int4_grouped_to_int8(
+            _wrap_for_dlpack(qdata),
+            _wrap_for_dlpack(s_rel),
+            codebook_arg,
+            _wrap_for_dlpack(out),
+            group_size,
+            stream_ptr,
+        )
+    return out
+
+
 def dequantize_w4a8_int8_weight(
     qdata: torch.Tensor,
     s_rel: torch.Tensor,
@@ -2239,31 +2280,7 @@ def dequantize_w4a8_int8_weight(
         group_size,
         convrot_groupsize,
     )
-    qdata_arg = qdata.contiguous()
-    s_rel_arg = s_rel.contiguous()
-    codebook_arg = codebook.contiguous() if codebook is not None else None
-    n, k_half = qdata_arg.shape
-    int8_weight = torch.empty(n, k_half * 2, dtype=torch.int8, device=qdata.device)
-    stream_ptr = torch.cuda.current_stream(qdata.device).cuda_stream
-    wrapped_codebook = _wrap_for_dlpack(codebook_arg) if codebook_arg is not None else None
-    if s_rel_arg.dtype == torch.float8_e4m3fn:
-        _C.dequant_int4_grouped_to_int8_e4m3(
-            _wrap_for_dlpack(qdata_arg),
-            _wrap_for_dlpack(s_rel_arg.view(torch.uint8)),
-            wrapped_codebook,
-            _wrap_for_dlpack(int8_weight),
-            group_size,
-            stream_ptr,
-        )
-    else:
-        _C.dequant_int4_grouped_to_int8(
-            _wrap_for_dlpack(qdata_arg),
-            _wrap_for_dlpack(s_rel_arg),
-            wrapped_codebook,
-            _wrap_for_dlpack(int8_weight),
-            group_size,
-            stream_ptr,
-        )
+    int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
     weight_rotated = _dequantize_w4a8_int8_weight_from_int8(
         int8_weight,
         s_channel,
@@ -2286,8 +2303,8 @@ def w4a8_int8_linear(
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """CUDA W4A8 linear using chunked INT4 decode and the tuned INT8 GEMM."""
-    validate_w4a8_operands(
+    """CUDA W4A8/W6A8 linear using chunked INT4/INT6 decode and the tuned INT8 GEMM."""
+    n, k, _bits = validate_w4a8_operands(
         qdata,
         s_rel,
         s_channel,
@@ -2296,8 +2313,6 @@ def w4a8_int8_linear(
         group_size,
         convrot_groupsize,
     )
-    n, k_half = qdata.shape
-    k = k_half * 2
     if x.shape[-1] != k:
         raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={k}")
     groups = k // group_size
@@ -2353,7 +2368,34 @@ def w4a8_int8_linear(
         workspace = torch.empty(
             min(chunk_cols, n), k, dtype=torch.int8, device=x.device
         )
-        if hasattr(_C, "w4a8_codebook_linear_chunked"):
+        # Quantize the activation with the same 64-lane ConvRot kernel int8_linear uses
+        # (~2x faster than the one inside the fused binding); at small M the extra launch
+        # costs more than it saves.
+        fast_act = (
+            m >= 512
+            and convrot_groupsize == 256
+            and k % 256 == 0
+            and 256 <= k <= _CONVROT_FUSED_MAX_K
+            and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
+        )
+        if fast_act:
+            xq, xs = quantize_int8_rowwise_convrot64(x_2d, convrot_groupsize)
+            used = _C.w4a8_codebook_gemm_chunked(
+                _wrap_for_dlpack(xq),
+                _wrap_for_dlpack(qdata),
+                _wrap_for_dlpack(s_rel.view(torch.uint8)),
+                wrap_codebook(),
+                _wrap_for_dlpack(s_channel),
+                _wrap_for_dlpack(xs.reshape(m)),
+                _wrap_for_dlpack(bias_arg) if bias_arg is not None else None,
+                _wrap_for_dlpack(workspace),
+                _wrap_for_dlpack(out),
+                group_size,
+                chunk_cols,
+                output_dtype_code,
+                stream_ptr,
+            )
+        elif hasattr(_C, "w4a8_codebook_linear_chunked"):
             used = _C.w4a8_codebook_linear_chunked(
                 _wrap_for_dlpack(x_2d),
                 _wrap_for_dlpack(xq),
@@ -2409,25 +2451,7 @@ def w4a8_int8_linear(
             stream_ptr,
         )
 
-    int8_weight = torch.empty(n, k, dtype=torch.int8, device=x.device)
-    if s_rel.dtype == torch.float8_e4m3fn:
-        _C.dequant_int4_grouped_to_int8_e4m3(
-            _wrap_for_dlpack(qdata),
-            _wrap_for_dlpack(s_rel.view(torch.uint8)),
-            wrap_codebook(),
-            _wrap_for_dlpack(int8_weight),
-            group_size,
-            stream_ptr,
-        )
-    else:
-        _C.dequant_int4_grouped_to_int8(
-            _wrap_for_dlpack(qdata),
-            _wrap_for_dlpack(s_rel),
-            wrap_codebook(),
-            _wrap_for_dlpack(int8_weight),
-            group_size,
-            stream_ptr,
-        )
+    int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
 
     used = _C.cutlass_int8_dequant(
         _wrap_for_dlpack(xq),

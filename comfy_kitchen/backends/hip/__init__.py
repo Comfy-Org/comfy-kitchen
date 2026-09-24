@@ -50,6 +50,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (
     _decide_codebook,
     _dequantize_w4a8_int8_weight_from_int8,
     _quantize_w4a8_chunked,
+    _w4a8_geometry,
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
@@ -287,7 +288,9 @@ def _weight_operand(
     weight: torch.Tensor, device: torch.device, name: str, shape=None
 ) -> torch.Tensor:
     if shape is not None and tuple(weight.shape) != tuple(shape):
-        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(weight.shape)}")
+        raise ValueError(
+            f"{name} must have shape {tuple(shape)}, got {tuple(weight.shape)}"
+        )
     if weight.device.type != "cpu":
         return _operand(weight, device, name, shape)
     if not weight.is_pinned():
@@ -788,7 +791,10 @@ def fp16_linear(
     supported = (
         x.dtype == torch.float16
         and weight.dtype == torch.float16
-        and (weight.device == x.device or (weight.device.type == "cpu" and weight.is_pinned()))
+        and (
+            weight.device == x.device
+            or (weight.device.type == "cpu" and weight.is_pinned())
+        )
         and x_2d.shape[1] == k
         # the tile stager issues 16-byte row loads; a misaligned view falls back, as on CUDA
         and x_2d.data_ptr() % 16 == 0
@@ -973,9 +979,8 @@ def _dequant_int4_grouped_to_int8(
     codebook: torch.Tensor | None,
     group_size: int,
 ) -> torch.Tensor:
-    """Decode packed INT4 weights to the grouped INT8 grid the GEMM consumes."""
-    n, k_half = qdata.shape
-    k = k_half * 2
+    """Decode packed INT4/INT6 weights to the grouped INT8 grid the GEMM consumes."""
+    n, k, _bits = _w4a8_geometry(qdata, s_rel, group_size)
     device = qdata.device
     qdata_arg = _operand(qdata, device, "qdata")
     scale_code = DTYPE_TO_CODE[s_rel.dtype]
@@ -1077,8 +1082,7 @@ def _w4a8_int8_linear_chunked(
     convrot_groupsize: int,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    n, k_half = qdata.shape
-    k = k_half * 2
+    n, k, _bits = _w4a8_geometry(qdata, s_rel, group_size)
     device = x.device
     orig_shape = x.shape
     x2d = x.reshape(-1, k).contiguous()
@@ -1228,6 +1232,8 @@ def quantize_w4a8_int8_weight(
     codebook: bool = True,
     codebook_tensor: torch.Tensor | None = None,
     stochastic_rounding: int = 0,
+    bits: int = 4,
+    scale_search: bool = True,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1235,12 +1241,13 @@ def quantize_w4a8_int8_weight(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Prepare W4A8 weights with the fused HIP requantize and eager ConvRot."""
-    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize)
-    # The fused kernel covers the default codebook layout only. Asymmetric, uniform,
-    # fp32-scale and other group sizes stay on the chunked eager path.
+    """Prepare W4A8/W6A8 weights with the fused HIP requantize and eager ConvRot."""
+    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
+    # The fused kernel covers the default 4-bit codebook layout only. Asymmetric, uniform,
+    # fp32-scale, other group sizes and 6-bit stay on the chunked eager path.
     if (
-        symmetric
+        bits == 4
+        and symmetric
         and codebook
         and group_size == 16
         and scale_dtype == torch.float8_e4m3fn
@@ -1264,6 +1271,8 @@ def quantize_w4a8_int8_weight(
         codebook=codebook,
         codebook_override=codebook_tensor,
         stochastic_rounding=stochastic_rounding,
+        bits=bits,
+        scale_search=scale_search,
     )
 
 
@@ -1304,7 +1313,7 @@ def w4a8_int8_linear(
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """``x @ W.T + bias`` via the HIP INT4 decode feeding the WMMA INT8 GEMM.
+    """``x @ W.T + bias`` via the HIP INT4/INT6 decode feeding the WMMA INT8 GEMM.
 
     The weight is decoded a column chunk at a time so a chunk is still cached when
     the GEMM reads it back, instead of the whole [N, K] INT8 weight round-tripping
@@ -1312,13 +1321,11 @@ def w4a8_int8_linear(
     packed weight itself, so a few rows take a GEMV that dequantizes in registers
     and never writes the INT8 weight at all.
     """
-    validate_w4a8_operands(
+    _n, k, _bits = validate_w4a8_operands(
         qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize
     )
-    if x.shape[-1] != qdata.shape[-1] * 2:
-        raise ValueError(
-            f"Input K={x.shape[-1]} does not match qdata K={qdata.shape[-1] * 2}"
-        )
+    if x.shape[-1] != k:
+        raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={k}")
 
     # The asymmetric zero-point correction is a rank-one term the INT8 epilogue
     # cannot express, so that layout runs off the dequantized weight instead.

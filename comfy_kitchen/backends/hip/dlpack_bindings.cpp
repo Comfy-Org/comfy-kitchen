@@ -11,7 +11,6 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 
-#include "architecture_config.h"
 #include "launchers.h"
 
 namespace nb = nanobind;
@@ -177,24 +176,6 @@ static const void *opt_data(const OptArray &t) {
 
 static int opt_code(const OptArray &t) {
   return t.has_value() ? map_dtype_to_code(t->dtype()) : 0;
-}
-
-static const void *gemm_weight_data(const nb::ndarray<> &weight,
-                                    const char *fn, const char *name) {
-  if (weight.device_type() == nb::device::rocm::value) {
-    return weight.data();
-  }
-
-  void *device_ptr = nullptr;
-  const hipError_t error = hipHostGetDevicePointer(
-      &device_ptr, const_cast<void *>(weight.data()), 0);
-  if (error != hipSuccess) {
-    throw std::runtime_error(
-        std::string(fn) + ": " + name +
-        " must be ROCm device memory or mapped pinned host memory (" +
-        hipGetErrorString(error) + ")");
-  }
-  return device_ptr;
 }
 
 // _C is importable, so these entry points cannot assume the Python layer put
@@ -400,7 +381,7 @@ void scaled_mm_fp8(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c,
   require_scale_len(scale_b, 1, kFn, "scale_b");
   require_bias(bias, N, kFn);
 
-  launch_scaled_mm_fp8_kernel(a.data(), gemm_weight_data(b, kFn, "b"), c.data(), scale_a.data(),
+  launch_scaled_mm_fp8_kernel(a.data(), b.data(), c.data(), scale_a.data(),
                               scale_b.data(), opt_data(bias), opt_code(bias), M,
                               N, K, out_code,
                               reinterpret_cast<hipStream_t>(stream_ptr));
@@ -435,7 +416,7 @@ void int8_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c,
                     kFn, "scale_b");
   require_bias(bias, N, kFn);
 
-  launch_int8_gemm_kernel(a.data(), gemm_weight_data(b, kFn, "b"), c.data(), scale_a.data(),
+  launch_int8_gemm_kernel(a.data(), b.data(), c.data(), scale_a.data(),
                           scale_b.data(), scale_b_stride, opt_data(bias),
                           opt_code(bias), M, N, K, N /*ldc*/, out_code,
                           reinterpret_cast<hipStream_t>(stream_ptr));
@@ -468,7 +449,7 @@ void convrot_w4a4_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c,
   require_scale_len(w_scale, static_cast<size_t>(N), kFn, "w_scale");
   require_bias(bias, N, kFn);
 
-  launch_convrot_w4a4_gemm_kernel(a.data(), gemm_weight_data(b, kFn, "b"), c.data(), x_scale.data(),
+  launch_convrot_w4a4_gemm_kernel(a.data(), b.data(), c.data(), x_scale.data(),
                                   w_scale.data(), opt_data(bias),
                                   opt_code(bias), M, N, K, out_code,
                                   reinterpret_cast<hipStream_t>(stream_ptr));
@@ -510,7 +491,7 @@ bool fp16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias,
     require_len(*resid, static_cast<int64_t>(M) * N, kFn, "resid");
   }
   const bool served = launch_fp16_gemm_kernel(
-      a.data(), gemm_weight_data(b, kFn, "b"), d.data(), opt_data(bias), opt_data(rscale),
+      a.data(), b.data(), d.data(), opt_data(bias), opt_data(rscale),
       opt_data(resid), M, N, K, reinterpret_cast<hipStream_t>(stream_ptr));
   check_hip_launch();
   return served;
@@ -824,6 +805,38 @@ void quantize_w4a8_convrot(nb::ndarray<> rotated, nb::ndarray<> codebook,
       s_channel.data(), N, K, map_dtype_to_code(rotated.dtype()), stochastic,
       seed, reinterpret_cast<hipStream_t>(stream_ptr));
   check_hip_launch();
+}
+
+// Code width implied by the packed [N, K * bits / 8] row: K/2 bytes at 4 bits,
+// 3K/4 at 6. The length checks only bound the buffer from below, so the width
+// is read from the shape rather than inferred from the element count. 6-bit
+// storage is uniform, needs K % 32 so rows and the high plane stay aligned, and
+// a group a multiple of 16 so one scale covers each decode vector.
+static int w4a8_bits(const nb::ndarray<> &qdata, int N, int K, int group_size,
+                     bool has_codebook, const char *fn) {
+  if (qdata.ndim() != 2 || static_cast<int64_t>(qdata.shape(0)) != N) {
+    throw std::runtime_error(std::string(fn) +
+                             ": qdata must be [N, K * bits / 8]");
+  }
+  const int64_t cols = static_cast<int64_t>(qdata.shape(1));
+  if (K == 0) {
+    return 4;
+  }
+  const int64_t bits = cols * 8 / K;
+  if ((bits != 4 && bits != 6) || cols * 8 != static_cast<int64_t>(K) * bits) {
+    throw std::runtime_error(
+        std::string(fn) + ": packed width must be K/2 (4-bit) or 3K/4 (6-bit)");
+  }
+  if (bits == 6 && (K % 32 != 0 || group_size < 16 || group_size % 16 != 0)) {
+    throw std::runtime_error(
+        std::string(fn) + ": 6-bit storage needs K % 32 == 0 and group_size a "
+                          "multiple of 16");
+  }
+  if (bits == 6 && has_codebook) {
+    throw std::runtime_error(std::string(fn) +
+                             ": 6-bit storage has no codebook");
+  }
+  return static_cast<int>(bits);
 }
 
 void dequant_int4_grouped_to_int8(nb::ndarray<> qdata, nb::ndarray<> s_rel,
@@ -1446,20 +1459,7 @@ constexpr int kSageCtaQ = 128;
 constexpr int kSageCtaK = 64;
 constexpr int kSageKeyGroup = 16;
 
-static bool sage_is_supported_arch(const char *gcn_arch_name) {
-  static constexpr const char *kSupportedArchNames[] = {
-      COMFY_HIP_SUPPORTED_ARCH_NAMES};
-  const std::string arch(gcn_arch_name);
-  const std::string base_arch = arch.substr(0, arch.find(':'));
-  for (const char *validated_arch : kSupportedArchNames) {
-    if (base_arch == validated_arch)
-      return true;
-  }
-  return false;
-}
-
-static void sage_require_supported_arch(const nb::ndarray<> &tensor,
-                                        const char *fn) {
+static void sage_require_wave32(const nb::ndarray<> &tensor, const char *fn) {
   hipDeviceProp_t properties{};
   const hipError_t err =
       hipGetDeviceProperties(&properties, tensor.device_id());
@@ -1468,11 +1468,10 @@ static void sage_require_supported_arch(const nb::ndarray<> &tensor,
         std::string(fn) +
         ": could not query HIP device properties: " + hipGetErrorString(err));
   }
-    if (!sage_is_supported_arch(properties.gcnArchName)) {
+  if (properties.warpSize != 32) {
     throw std::runtime_error(
-        std::string(fn) +
-      ": requires a validated HIP attention architecture; device is " +
-        properties.gcnArchName);
+        std::string(fn) + ": requires wave32; device reports wavefront size " +
+        std::to_string(properties.warpSize));
   }
 }
 
@@ -1746,7 +1745,7 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
                int input_dtype_code, int output_dtype_code,
                uintptr_t stream_ptr, OptArray attn_mask = std::nullopt) {
   constexpr const char *kFn = "sage_sdpa";
-  sage_require_supported_arch(q, kFn);
+  sage_require_wave32(q, kFn);
   sage_check_shapes(q, k, v, kFn);
   sage_check_cta_k(cta_k, kFn);
   const auto stream = reinterpret_cast<hipStream_t>(stream_ptr);
@@ -1775,7 +1774,7 @@ void sage_sdpa_quantize(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
                         nb::ndarray<> anchor_indices, int cta_k,
                         int input_dtype_code, uintptr_t stream_ptr) {
   constexpr const char *kFn = "sage_sdpa_quantize";
-  sage_require_supported_arch(q, kFn);
+  sage_require_wave32(q, kFn);
   sage_check_shapes(q, k, v, kFn);
   sage_check_cta_k(cta_k, kFn);
   sage_quantize(q, k, v, q_int8, q_scale, k_int8, k_scale, v_int8, v_scale,
@@ -1793,7 +1792,7 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8,
                             int output_dtype_code, uintptr_t stream_ptr,
                             OptArray attn_mask = std::nullopt) {
   constexpr const char *kFn = "sage_sdpa_prequantized";
-  sage_require_supported_arch(q_int8, kFn);
+  sage_require_wave32(q_int8, kFn);
   if (q_int8.ndim() != 4 || k_int8.ndim() != 4 || o.ndim() != 4 ||
       v_int8.ndim() != 2) {
     throw std::runtime_error(std::string(kFn) +
