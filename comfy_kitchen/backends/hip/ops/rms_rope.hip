@@ -5,10 +5,9 @@
 // reduces over head_dim, the last axis in both the BHND and BNHD layouts, so the
 // kernel never has to know which of dim1/dim2 is the sequence.
 //
-// One block per row, as in ops/adaln.hip, but sized to one row rather than
-// adaln's 256 threads: rows are short and numerous, so a wider block would idle.
-// The row is re-read for the rotation rather than held in registers, which keeps
-// head_dim unbounded.
+// The general kernel uses one block per row. The head_dim=64 path processes four
+// rows per block with four independent 32-lane subgroups. Rows are re-read for
+// rotation rather than held in registers, which keeps the general path unbounded.
 //
 // The normalized value is rounded to x's dtype before the rotation reads it back.
 // That is the unfused contract, which every other backend matches.
@@ -20,15 +19,17 @@
 namespace comfy::hip_backend {
 
 constexpr int kRmsRopeThreads = 64;
+constexpr int kRmsRopeSubgroupSize = 32;
+constexpr int kRmsRopeRowsPerBlock = 4;
 
 // q_scale and k_scale need not share x's dtype, so they carry their own code.
 // k is optional: rms_rope1 passes nullptr for it.
-template <typename T>
-__global__ __launch_bounds__(kRmsRopeThreads) void rms_rope_kernel(
+template <typename T, int Threads, int RowsPerBlock>
+__global__ __launch_bounds__(Threads) void rms_rope_kernel(
     const void* __restrict__ q, const void* __restrict__ k,
     const void* __restrict__ freqs, const void* __restrict__ q_scale,
     const void* __restrict__ k_scale, T* __restrict__ q_out, T* __restrict__ k_out,
-    int64_t dim1, int64_t dim2, int head_dim, int rot_dim,
+    int64_t rows, int64_t dim1, int64_t dim2, int head_dim, int rot_dim,
     int64_t fb, int64_t fd1, int64_t fd2,
     int64_t sx_b, int64_t sx_d1, int64_t sx_d2, int64_t sx_d,
     int64_t so_b, int64_t so_d1, int64_t so_d2, int64_t so_d,
@@ -36,11 +37,14 @@ __global__ __launch_bounds__(kRmsRopeThreads) void rms_rope_kernel(
     int64_t sf_pair,
     int x_code, int f_code, int s_code, float epsilon, bool split_half) {
 
-    __shared__ float red_q[kRmsRopeThreads];
-    __shared__ float red_k[kRmsRopeThreads];
+    __shared__ float red_q[RowsPerBlock == 1 ? Threads : 1];
+    __shared__ float red_k[RowsPerBlock == 1 ? Threads : 1];
 
-    const int t = threadIdx.x;
-    const int64_t row = blockIdx.x;
+    const int t = RowsPerBlock == 1 ? threadIdx.x : threadIdx.x % kRmsRopeSubgroupSize;
+    constexpr int kThreadsPerRow = RowsPerBlock == 1 ? kRmsRopeThreads : kRmsRopeSubgroupSize;
+    const int row_in_block = RowsPerBlock == 1 ? 0 : threadIdx.x / kRmsRopeSubgroupSize;
+    const int64_t row = static_cast<int64_t>(blockIdx.x) * RowsPerBlock + row_in_block;
+    const bool valid_row = row < rows;
     const int64_t d2 = row % dim2;
     const int64_t d1 = (row / dim2) % dim1;
     const int64_t b = row / (dim2 * dim1);
@@ -53,29 +57,59 @@ __global__ __launch_bounds__(kRmsRopeThreads) void rms_rope_kernel(
 
     float sq_q = 0.0f;
     float sq_k = 0.0f;
-    for (int i = t; i < head_dim; i += kRmsRopeThreads) {
-        const float v = load_in(q, xoff + i * sx_d, x_code);
-        sq_q += v * v;
-        if (has_k) {
-            const float w = load_in(k, xoff + i * sx_d, x_code);
-            sq_k += w * w;
+    if constexpr (RowsPerBlock == kRmsRopeRowsPerBlock) {
+        if (valid_row) {
+            const float q0 = load_in(q, xoff + t * sx_d, x_code);
+            const float q1 = load_in(q, xoff + (t + 32) * sx_d, x_code);
+            sq_q = __fmul_rn(q0, q0) + __fmul_rn(q1, q1);
+            if (has_k) {
+                const float k0 = load_in(k, xoff + t * sx_d, x_code);
+                const float k1 = load_in(k, xoff + (t + 32) * sx_d, x_code);
+                sq_k = __fmul_rn(k0, k0) + __fmul_rn(k1, k1);
+            }
         }
-    }
+        for (int s = 16; s > 0; s >>= 1) {
+            const float q_other = __shfl_down(sq_q, s, 32);
+            const float k_other = __shfl_down(sq_k, s, 32);
+            if (t < s) {
+                sq_q += q_other;
+                sq_k += k_other;
+            }
+        }
+        sq_q = __shfl(sq_q, 0, 32);
+        sq_k = __shfl(sq_k, 0, 32);
+    } else {
+        for (int i = t; i < head_dim; i += kRmsRopeThreads) {
+            const float v = load_in(q, xoff + i * sx_d, x_code);
+            sq_q += v * v;
+            if (has_k) {
+                const float w = load_in(k, xoff + i * sx_d, x_code);
+                sq_k += w * w;
+            }
+        }
 
-    red_q[t] = sq_q;
-    red_k[t] = sq_k;
-    __syncthreads();
-    for (int s = kRmsRopeThreads / 2; s > 0; s >>= 1) {
-        if (t < s) {
-            red_q[t] += red_q[t + s];
-            red_k[t] += red_k[t + s];
-        }
+        red_q[t] = sq_q;
+        red_k[t] = sq_k;
         __syncthreads();
+        for (int s = kRmsRopeThreads / 2; s > 0; s >>= 1) {
+            if (t < s) {
+                red_q[t] += red_q[t + s];
+                red_k[t] += red_k[t + s];
+            }
+            __syncthreads();
+        }
+        sq_q = red_q[0];
+        sq_k = red_k[0];
     }
 
     const float inv_d = 1.0f / static_cast<float>(head_dim);
-    const float rrms_q = rsqrtf(red_q[0] * inv_d + epsilon);
-    const float rrms_k = has_k ? rsqrtf(red_k[0] * inv_d + epsilon) : 0.0f;
+    const float rrms_q = rsqrtf(sq_q * inv_d + epsilon);
+    const float rrms_k = has_k ? rsqrtf(sq_k * inv_d + epsilon) : 0.0f;
+    // Every row's inputs must be read before any in-place output writes begin.
+    if constexpr (RowsPerBlock == kRmsRopeRowsPerBlock) {
+        __syncthreads();
+    }
+    if (!valid_row) return;
 
     const int64_t foff_row = (fb == 1 ? 0 : b) * sf_b + (fd1 == 1 ? 0 : d1) * sf_d1 +
                              (fd2 == 1 ? 0 : d2) * sf_d2;
@@ -83,7 +117,7 @@ __global__ __launch_bounds__(kRmsRopeThreads) void rms_rope_kernel(
     // Rotation covers the first rot_dim dims, in split-half pairs (p, p + rot_dim/2);
     // the reduction above always spans the full head_dim.
     const int n_pairs = rot_dim / 2;
-    for (int p = t; p < n_pairs; p += kRmsRopeThreads) {
+    for (int p = t; p < n_pairs; p += kThreadsPerRow) {
         const int64_t ia = split_half ? p : 2 * p;
         const int64_t ib = split_half ? p + n_pairs : 2 * p + 1;
         const int64_t ia_in = xoff + ia * sx_d;
@@ -117,7 +151,7 @@ __global__ __launch_bounds__(kRmsRopeThreads) void rms_rope_kernel(
     // Dims past rot_dim are normalized and scaled but never rotated. The store
     // rounds to T, which is the single rounding eager's rms_norm applies. Empty
     // when rot_dim == head_dim.
-    for (int d = rot_dim + t; d < head_dim; d += kRmsRopeThreads) {
+    for (int d = rot_dim + t; d < head_dim; d += kThreadsPerRow) {
         const int64_t in = xoff + d * sx_d;
         const int64_t out = ooff + d * so_d;
         rope_store<T>(q_out, out, load_in(q, in, x_code) * rrms_q * load_in(q_scale, d, s_code));
@@ -145,7 +179,7 @@ extern "C" void launch_rms_rope_kernel(
     // A zero-block launch is hipErrorInvalidConfiguration, and head_dim == 0 would
     // divide by zero in the reduction.
     if (rows == 0 || head_dim == 0) return;
-    // One block per row, and gridDim.x is 32-bit.
+    // GridDim.x is 32-bit for both launch geometries.
     if (rows > 0xffffffffLL) {
         throw std::runtime_error("rms_rope: too many rows for a single grid");
     }
@@ -156,12 +190,27 @@ extern "C" void launch_rms_rope_kernel(
     }
 
 #define CK_RMS_ROPE_LAUNCH(T)                                                                  \
-    rms_rope_kernel<T><<<static_cast<unsigned int>(rows), kRmsRopeThreads, 0, stream>>>(       \
-        q, k, freqs, q_scale, k_scale, static_cast<T*>(q_out), static_cast<T*>(k_out), dim1,   \
+    if (head_dim == 64) {                                                                      \
+        const int64_t blocks = (rows + kRmsRopeRowsPerBlock - 1) / kRmsRopeRowsPerBlock;       \
+        rms_rope_kernel<T, kRmsRopeSubgroupSize * kRmsRopeRowsPerBlock, kRmsRopeRowsPerBlock> \
+            <<<static_cast<unsigned int>(blocks), kRmsRopeSubgroupSize * kRmsRopeRowsPerBlock, \
+               0,                                                                             \
+               stream>>>(                                                                     \
+                q, k, freqs, q_scale, k_scale, static_cast<T*>(q_out), static_cast<T*>(k_out), \
+                rows, dim1, dim2, static_cast<int>(head_dim), static_cast<int>(rot), fb, fd1, \
+                fd2,                                                                          \
+                sx_b, sx_d1, sx_d2, sx_d, so_b, so_d1, so_d2, so_d, sf_b, sf_d1, sf_d2,      \
+                sf_d, sf_rot, sf_pair, x_code, f_code, s_code, epsilon, split_half);           \
+    } else {                                                                                   \
+        rms_rope_kernel<T, kRmsRopeThreads, 1><<<static_cast<unsigned int>(rows),             \
+                                                  kRmsRopeThreads, 0, stream>>>(               \
+        q, k, freqs, q_scale, k_scale, static_cast<T*>(q_out), static_cast<T*>(k_out), rows,  \
+        dim1,                                                                                  \
         dim2, static_cast<int>(head_dim), static_cast<int>(rot), fb, fd1, fd2, sx_b, sx_d1,    \
         sx_d2, sx_d, so_b, so_d1,                                                              \
         so_d2, so_d, sf_b, sf_d1, sf_d2, sf_d, sf_rot, sf_pair, x_code, f_code, s_code,        \
-        epsilon, split_half)
+        epsilon, split_half);                                                                 \
+    }
 
     if (x_code == 0) {
         CK_RMS_ROPE_LAUNCH(float);
