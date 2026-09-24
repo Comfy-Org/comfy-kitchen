@@ -350,6 +350,8 @@ class TestTensorWiseINT8Layout:
     def test_convrot_dequant_kernel_matches_float32_reference(self, seed, group_size, dtype):
         """The fused ConvRot dequant rotates in float32 and rounds to the output dtype once, like the
         float32 rotate-then-cast reference, including rows whose scale is near zero."""
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
         from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_weight
 
         rows, k = 257, 3 * group_size
