@@ -1704,8 +1704,8 @@ def dequantize_int8_convrot_weight_dtype(
         )
         return output
 
-    h = _build_hadamard(group_size, device=q_2d.device, dtype=torch.float32)
-    return _rotate_weight(dequantize_int8_simple(q_2d, scale), h, group_size).to(output_dtype)
+    h = _build_hadamard(group_size, device=q_2d.device, dtype=output_dtype)
+    return _rotate_weight(dequantize_int8_simple_dtype(q_2d, scale, output_dtype_code), h, group_size)
 
 
 def int8_gemv_dequant(
