@@ -261,6 +261,14 @@ class TestRegistryConstraintValidation:
         assert "x" in constraints.params
         assert torch.float32 in constraints.params["x"].dtypes
 
+    def test_triton_stochastic_fp8_requires_native_fp8_support(self):
+        """Triton FP8 conversion starts with Ada (SM89)."""
+        pytest.importorskip("triton")
+        from comfy_kitchen.backends.triton import _build_constraints
+
+        constraints = _build_constraints()["stochastic_rounding_fp8"]
+        assert constraints.min_compute_capability == (8, 9)
+
 
 class TestIntegrationWithBackends:
     """Integration tests for constraint validation with actual backends."""
