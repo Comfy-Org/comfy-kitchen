@@ -293,6 +293,18 @@ def sol_attn_common_call_rule(kwargs):
                     "coarse_gate", f"must have q's shape {tuple(q.shape)}, got {tuple(coarse_gate.shape)}")
             if coarse_gate.device != q.device:
                 return ValidationResult.fail("coarse_gate", f"must be on {q.device}, got {coarse_gate.device}")
+        blk_cnt = kwargs.get("blk_cnt")
+        if blk_cnt is not None:
+            # An out-parameter: exact shape and dtype, or a copy_ into it would
+            # broadcast or truncate silently and the counts would look plausible.
+            want = (q.shape[0], q.shape[2], (q.shape[1] + 63) // 64)
+            if blk_cnt.dtype != torch.int32 or tuple(blk_cnt.shape) != want:
+                return ValidationResult.fail(
+                    "blk_cnt", f"must be int32 of shape {want}, got {blk_cnt.dtype} {tuple(blk_cnt.shape)}")
+            if blk_cnt.device != q.device:
+                return ValidationResult.fail("blk_cnt", f"must be on {q.device}, got {blk_cnt.device}")
+            if not blk_cnt.is_contiguous():
+                return ValidationResult.fail("blk_cnt", "must be contiguous")
     # Both sinks are half-open [start, end) block ranges.
     for name in ("sink_blocks", "sink_q"):
         value = kwargs.get(name)

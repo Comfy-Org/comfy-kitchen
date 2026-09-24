@@ -2655,10 +2655,11 @@ def sol_attn(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    blk_cnt: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
     See sage_attention/sol_attn.cu and the public docstring for ``tail``,
-    ``block_len`` and ``coarse_gate``.
+    ``block_len``, ``coarse_gate`` and ``blk_cnt``.
 
     ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
     per-query-block top-k: keep that fraction of key blocks per query block
@@ -2675,7 +2676,7 @@ def sol_attn(
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
     _check_sol_args(q.device, sink_blocks, sink_q, topk_ratio, q=q, k=k, v=v,
-                    block_len=block_len, coarse_gate=coarse_gate)
+                    block_len=block_len, coarse_gate=coarse_gate, blk_cnt=blk_cnt)
     if scale is None:
         scale = d ** -0.5
     if block_len is not None:
@@ -2726,6 +2727,16 @@ def sol_attn(
         block_len=None if block_len is None else _wrap_for_dlpack(block_len),
         tail=bool(tail), token_aug=int(token_aug),
     )
+    if blk_cnt is not None:
+        # The route stage left one int32 per (b, h, query block) in the plan's
+        # `cnt` slot: how many key blocks that query block attends exactly --
+        # the sink range, the diagonal and the routed set (see
+        # sol_attn_route.cu). A device copy on the same stream, after the launch
+        # that produced `out`; no kernel reads the destination, so `out` is the
+        # same bytes with or without it, and None costs nothing.
+        n = batch * h * p["NQ"]
+        blk_cnt.copy_(workspace[p["cnt"]:p["cnt"] + 4 * n]
+                      .view(torch.int32).view(batch, h, p["NQ"]))
     if coarse_gate is not None:
         add_coarse_(out, coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale),
                     coarse_gate)
@@ -2750,10 +2761,17 @@ def sol_attn_chunked(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    *,
+    blk_cnt: torch.Tensor | None = None,
 ):
     """Chunked-producer Sol-Attn over fused qkv projection chunks ([M, 3*H*128]
     bf16, 64-aligned starts, B=1); full Q/K/V are never materialised.
     ``tail`` / ``block_len`` / ``coarse_gate`` / ``token_aug`` as in ``sol_attn``.
+
+    ``blk_cnt`` (keyword-only): optional int32 ``(1, H, ceil(T/64))`` on the
+    device, filled from the same launch with the routed-block count per query
+    block (sinks and the diagonal included, sink_q rows at ceil(T/64)), as
+    ``sol_attn`` does.
 
     ``qkv_chunks``: an iterable of chunks or a zero-arg callable returning one.
     ``kmean``/``vscale`` are LAST step's statistics ([H,128] f32); when None the
@@ -2780,6 +2798,13 @@ def sol_attn_chunked(
         qkv_chunks = list(qkv_chunks)          # need two passes over it
         factory = lambda: iter(qkv_chunks)     # noqa: E731
     p = _C.sol_attn_plan(1, t, h, token_aug=int(token_aug))
+    if blk_cnt is not None:
+        want = (1, h, p["NQ"])
+        if blk_cnt.dtype != torch.int32 or tuple(blk_cnt.shape) != want:
+            raise ValueError(f"sol_attn_chunked: blk_cnt must be int32 of shape {want}, "
+                             f"got {blk_cnt.dtype} {tuple(blk_cnt.shape)}")
+        if blk_cnt.device != dev or not blk_cnt.is_contiguous():
+            raise ValueError(f"sol_attn_chunked: blk_cnt must be contiguous on {dev}")
     ws = torch.empty(p["total"], dtype=torch.uint8, device=dev)
     stream = torch.cuda.current_stream(dev).cuda_stream
     width = 3 * h * d
@@ -2832,6 +2857,9 @@ def sol_attn_chunked(
         1, t, h, float(tau), float(scale), sb[0], sb[1], sq[0], sq[1], stream,
         threshold=None if threshold is None else _wrap_for_dlpack(threshold),
         block_len=None if block_len is None else _wrap_for_dlpack(block_len), tail=bool(tail), token_aug=int(token_aug))
+    if blk_cnt is not None:
+        n = h * p["NQ"]
+        blk_cnt.copy_(ws[p["cnt"]:p["cnt"] + 4 * n].view(torch.int32).view(1, h, p["NQ"]))
     if coarse_gate is not None:
         add_coarse_(out, coarse_output(*_ws_block_means(ws, p, h, lengths), scale), coarse_gate)
     return out, kmean_next, vscale_of(vamax)
