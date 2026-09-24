@@ -5,9 +5,10 @@
 // reduces over head_dim, the last axis in both the BHND and BNHD layouts, so the
 // kernel never has to know which of dim1/dim2 is the sequence.
 //
-// The general kernel uses one block per row. The head_dim=64 path processes four
-// rows per block with four independent 32-lane subgroups. Rows are re-read for
-// rotation rather than held in registers, which keeps the general path unbounded.
+// The general kernel uses one block per row. On wave32 devices, the head_dim=64
+// path processes four rows per block with four independent 32-lane subgroups.
+// Rows are re-read for rotation rather than held in registers, which keeps the
+// general path unbounded.
 //
 // The normalized value is rounded to x's dtype before the rotation reads it back.
 // That is the unfused contract, which every other backend matches.
@@ -189,8 +190,19 @@ extern "C" void launch_rms_rope_kernel(
         throw std::runtime_error("rms_rope: rot_dim must be even and <= head_dim");
     }
 
+    bool use_wave32_path = false;
+    if (head_dim == 64) {
+        hipDevice_t device;
+        if (hipStreamGetDevice(stream, &device) == hipSuccess) {
+            int wave_size = 0;
+            use_wave32_path = hipDeviceGetAttribute(
+                                  &wave_size, hipDeviceAttributeWarpSize, device) == hipSuccess &&
+                              wave_size == kRmsRopeSubgroupSize;
+        }
+    }
+
 #define CK_RMS_ROPE_LAUNCH(T)                                                                  \
-    if (head_dim == 64) {                                                                      \
+    if (use_wave32_path) {                                                                      \
         const int64_t blocks = (rows + kRmsRopeRowsPerBlock - 1) / kRmsRopeRowsPerBlock;       \
         rms_rope_kernel<T, kRmsRopeSubgroupSize * kRmsRopeRowsPerBlock, kRmsRopeRowsPerBlock> \
             <<<static_cast<unsigned int>(blocks), kRmsRopeSubgroupSize * kRmsRopeRowsPerBlock, \
