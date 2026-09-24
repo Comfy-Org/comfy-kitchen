@@ -978,6 +978,52 @@ __global__ void dequantize_int8_convrot_groups64_kernel(
     }
 }
 
+// 64-wide ConvRot groups: 16 threads per group, four elements each, the same butterfly one stage
+// shorter. Groups are flattened across rows so narrow rows (K = 128: two groups) still fill a block.
+template<int GROUPS_PER_BLOCK, typename OutputType>
+__global__ void dequantize_int8_convrot_g64_kernel(
+    const int8_t* __restrict__ q,
+    const float* __restrict__ scales,
+    OutputType* __restrict__ output,
+    int64_t num_groups,
+    int K,
+    int scale_size)
+{
+    constexpr int kGroup = 64;
+    constexpr int kGroupThreads = kGroup / 4;
+    __shared__ float smem[GROUPS_PER_BLOCK * 2 * kGroup];
+
+    const int sub = threadIdx.x / kGroupThreads;
+    const int lane = threadIdx.x % kGroupThreads;
+    const int64_t group = static_cast<int64_t>(blockIdx.x) * GROUPS_PER_BLOCK + sub;
+    const bool active = group < num_groups;
+    const int groups_per_row = K / kGroup;
+    const int64_t row = active ? group / groups_per_row : 0;
+    const int64_t offset = row * K + (active ? group % groups_per_row : 0) * kGroup;
+    const float scale = scales[scale_size == 1 ? 0 : row];
+
+    float* buf0 = smem + sub * (2 * kGroup);
+    float* buf1 = buf0 + kGroup;
+
+    const int base = lane * 4;
+    const float x0 = active ? static_cast<float>(q[offset + base]) * scale : 0.0f;
+    const float x1 = active ? static_cast<float>(q[offset + base + 1]) * scale : 0.0f;
+    const float x2 = active ? static_cast<float>(q[offset + base + 2]) * scale : 0.0f;
+    const float x3 = active ? static_cast<float>(q[offset + base + 3]) * scale : 0.0f;
+    buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
+    buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
+    buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
+    buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+    __syncthreads();
+
+    convrot_fht_stage64<4>(buf1, buf0, lane);
+    __syncthreads();
+
+    if (active) {
+        convrot_fht_stage64_store<16, OutputType>(buf0, output + offset, lane);
+    }
+}
+
 template<int GROUPS_PER_BLOCK, typename InputType, typename OutputType>
 __global__ void rotate_int8_convrot_groups64_amax_kernel(
     const InputType* __restrict__ x,
@@ -2002,17 +2048,36 @@ void launch_dequantize_int8_convrot_kernel(
     if (num_rows == 0 || num_cols == 0) {
         return;
     }
-    if (group_size != comfy::kConvRotGroup) {
-        throw std::runtime_error("convrot dequant kernel only supports group_size 256");
+    if (group_size != comfy::kConvRotGroup && group_size != 64) {
+        throw std::runtime_error("convrot dequant kernel only supports group_size 64 or 256");
     }
-    if (num_cols % comfy::kConvRotGroup != 0) {
-        throw std::runtime_error("convrot dequant kernel requires K divisible by 256");
+    if (num_cols % group_size != 0) {
+        throw std::runtime_error("convrot dequant kernel requires K divisible by group_size");
     }
     if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("convrot dequant kernel only supports K <= INT_MAX");
     }
     if (scale_size != 1 && scale_size != num_rows) {
         throw std::runtime_error("convrot dequant scale must be scalar or per-row");
+    }
+
+    if (group_size == 64) {
+        const int64_t num_groups = num_rows * (num_cols / 64);
+        const unsigned int blocks = static_cast<unsigned int>((num_groups + 15) / 16);
+        DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+            comfy::dequantize_int8_convrot_g64_kernel<16, OutputType><<<blocks, 16 * 16, 0, stream>>>(
+                static_cast<const int8_t*>(input),
+                static_cast<const float*>(scales),
+                static_cast<OutputType*>(output),
+                num_groups,
+                static_cast<int>(num_cols),
+                static_cast<int>(scale_size));
+        });
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            throw std::runtime_error(std::string("CUDA INT8 convrot dequantization failed: ") + cudaGetErrorString(err));
+        }
+        return;
     }
 
     if (num_cols >= comfy::kConvRotGroup) {

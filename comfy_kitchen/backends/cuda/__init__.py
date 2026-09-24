@@ -464,9 +464,9 @@ def _should_use_convrot_fused_kernel(x: torch.Tensor, k: int, group_size: int) -
 
 
 def _should_use_convrot_dequant_kernel(x: torch.Tensor, k: int, group_size: int) -> bool:
-    # Dequant rotates each 256-wide group independently, so it does not need the
+    # Dequant rotates each group independently, so it does not need the
     # whole row staged in shared memory like ConvRot quantization does.
-    return group_size == 256 and k % 256 == 0 and k <= _CONVROT_FUSED_MAX_K
+    return group_size in (64, 256) and k % group_size == 0 and k <= _CONVROT_FUSED_MAX_K
 
 
 def get_cublas_workspace_size_bytes() -> int:
@@ -1704,12 +1704,6 @@ def dequantize_int8_convrot_weight_dtype(
         )
         return output
 
-    if output_dtype == torch.float16:
-        # The rotation is linear and the scale per row: rotate the int8 codes, exact in fp16, then
-        # scale in fp32. Dequantizing first would underflow tiny q * scale before they are summed.
-        h = _build_hadamard(group_size, device=q_2d.device, dtype=output_dtype)
-        rotated = _rotate_weight(q_2d.to(output_dtype), h, group_size)
-        return rotated.mul_(scale.to(device=q_2d.device, dtype=torch.float32).reshape(-1, 1))
     h = _build_hadamard(group_size, device=q_2d.device, dtype=torch.float32)
     return _rotate_weight(dequantize_int8_simple(q_2d, scale), h, group_size).to(output_dtype)
 
