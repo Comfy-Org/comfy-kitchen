@@ -14,9 +14,9 @@ else:
 _MINIMUM_CAPABILITY = (8, 0)
 
 
-def is_available(device: torch.device | str | int | None = None) -> bool:
+def is_available(device: torch.device | None = None) -> bool:
     """Return whether flash attention decode is available on the requested device."""
-    if isinstance(device, (str, torch.device)) and torch.device(device).type != "cuda":
+    if device is not None and device.type != "cuda":
         return False
     if not torch.cuda.is_available():
         return False

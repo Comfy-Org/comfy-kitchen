@@ -208,10 +208,12 @@ def sol_attn(
     )
 
 
-def sol_attn_is_available(device: torch.device | int | None = None) -> bool:
+def sol_attn_is_available(device: torch.device | None = None) -> bool:
     """Whether the compiled Sol-Attn kernels can run on ``device``: the CUDA
     backend on sm_80+, or the HIP backend on a GPU with matrix cores. The
     per-call rules (bf16/fp16, head_dim 128, matching q/k/v) still apply."""
+    if device is not None and device.type != "cuda":
+        return False
     if not torch.cuda.is_available():
         return False
     if getattr(torch.version, "hip", None):

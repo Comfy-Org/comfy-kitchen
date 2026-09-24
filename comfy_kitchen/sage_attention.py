@@ -62,8 +62,10 @@ def _select_cta_k(
     return CTA_K
 
 
-def is_available(device: torch.device | int | None = None) -> bool:
+def is_available(device: torch.device | None = None) -> bool:
     """Return whether the compiled INT8 attention kernel supports this GPU."""
+    if device is not None and device.type != "cuda":
+        return False
     if not torch.cuda.is_available():
         return False
     if _hip_backend is not None:
