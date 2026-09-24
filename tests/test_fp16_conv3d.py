@@ -107,8 +107,10 @@ class TestFp16Conv3d:
         if not cuda_available:
             pytest.skip("CUDA required")
         x, weight, bias, _ = _inputs(16, 16, 4, 10, 10, (3, 3, 3))
-        with pytest.raises(RuntimeError):
-            ck.fp16_conv3d(x, weight, bias, stride=(0, 1, 1))
+        out = torch.empty((1, 16, 2, 8, 8), dtype=torch.float16, device="cuda")
+        for kwargs in ({}, {"out": out}):
+            with pytest.raises(RuntimeError):
+                ck.fp16_conv3d(x, weight, bias, stride=(0, 1, 1), **kwargs)
 
     def test_residual_shape_mismatch_falls_back(self, seed, cuda_available):
         if not cuda_backend_available():

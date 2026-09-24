@@ -97,8 +97,9 @@ class TestGroupNormSiluPad3d:
             pytest.skip("CUDA required")
         x = torch.randn(1, 64, 3, 8, 8, dtype=torch.float16, device="cuda")
         for backend in ("cuda", "eager"):
-            with ck.use_backend(backend), pytest.raises(ValueError):
-                ck.group_norm_silu_pad3d(x, None, None, 1, 0.0, (0, 0, 0, 0, -1), silu=False)
+            for kwargs in ({}, {"out": torch.empty_like(x)}):
+                with ck.use_backend(backend), pytest.raises(ValueError, match="non-negative"):
+                    ck.group_norm_silu_pad3d(x, None, None, 1, 0.0, (0, 0, 0, 0, -1), silu=False, **kwargs)
 
     def test_misaligned_input_falls_back(self, seed, cuda_available):
         """A 16-byte-misaligned view must not reach the vectorized kernel."""

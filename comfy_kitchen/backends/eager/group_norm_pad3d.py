@@ -74,11 +74,12 @@ def _op_group_norm_silu_pad3d_out(
     out: torch.Tensor,
 ) -> None:
     # copy_ would broadcast or cast into a mismatched buffer instead of failing
-    b, c, t, h, w = x.shape
-    left, right, top, bottom, front = pad
-    shape = (b, c, t + front, h + top + bottom, w + left + right)
-    if out.shape != shape or out.dtype != x.dtype or out.device != x.device:
-        raise ValueError(f"group_norm_silu_pad3d: out must be {shape} {x.dtype} on {x.device}")
+    if min(pad) >= 0:
+        b, c, t, h, w = x.shape
+        left, right, top, bottom, front = pad
+        shape = (b, c, t + front, h + top + bottom, w + left + right)
+        if out.shape != shape or out.dtype != x.dtype or out.device != x.device:
+            raise ValueError(f"group_norm_silu_pad3d: out must be {shape} {x.dtype} on {x.device}")
     kwargs = {"x": x, "weight": weight, "bias": bias, "num_groups": num_groups, "eps": eps,
               "pad": pad, "silu": silu, "zero_pad": zero_pad, "out": out}
     impl = registry.get_implementation("group_norm_silu_pad3d_out", kwargs=kwargs)
