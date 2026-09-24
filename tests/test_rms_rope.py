@@ -568,6 +568,12 @@ def test_rms_rope_hip_bf16_head64_multirow(rows, rot_dim, device, seed):
         assert_values_close(k[:, row], k_expected[:, row], rtol=1e-3, atol=1e-3,
                             max_mismatch_ratio=max_mismatch_ratio,
                             name=f"HIP BF16 multi-row k row {row}")
+        torch.testing.assert_close(q[:, row, ..., :rot_dim], q_expected[:, row, ..., :rot_dim],
+                                   rtol=1.6e-2, atol=1e-2,
+                                   msg=f"HIP BF16 multi-row q rotary prefix row {row}")
+        torch.testing.assert_close(k[:, row, ..., :rot_dim], k_expected[:, row, ..., :rot_dim],
+                                   rtol=1.6e-2, atol=1e-2,
+                                   msg=f"HIP BF16 multi-row k rotary prefix row {row}")
     assert torch.equal(v, v_ref)
 
 
