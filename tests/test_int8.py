@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
-from comfy_kitchen.backends import cuda
+from comfy_kitchen.backends import cuda, triton
 from comfy_kitchen.tensor import TensorWiseINT8Layout
 
 from .conftest import (
@@ -577,6 +577,49 @@ class TestTensorWiseINT8Layout:
                 assert out_conv.dtype == dtype
                 assert torch.equal(out_row, ref_row.to(dtype))
                 assert torch.equal(out_conv, ref_conv.to(dtype))
+
+    @pytest.mark.parametrize("scale_shape", [(), (3, 4, 32), (3, 4, 1)])
+    @pytest.mark.parametrize(
+        ("output_dtype_code", "output_dtype"),
+        [(0, torch.float32), (1, torch.float16), (2, torch.bfloat16)],
+    )
+    def test_triton_dequantize_int8_simple_dtype_matches_eager(
+        self, seed, scale_shape, output_dtype_code, output_dtype
+    ):
+        q = torch.randint(-128, 128, (3, 4, 32), dtype=torch.int8, device="cuda")
+        scale = torch.rand(scale_shape, dtype=torch.bfloat16, device="cuda") * 0.02
+
+        out = triton.dequantize_int8_simple_dtype(q, scale, output_dtype_code)
+        ref = (q.float() * scale).to(output_dtype)
+
+        assert out.dtype == output_dtype
+        assert torch.equal(out, ref)
+
+    def test_triton_dequantize_int8_simple_dtype_does_not_fall_back_to_eager(
+        self, seed, monkeypatch
+    ):
+        import comfy_kitchen.backends.triton.quantization as triton_quantization
+
+        def unexpected_eager(*args, **kwargs):
+            raise AssertionError("supported INT8 dequantization fell back to eager")
+
+        monkeypatch.setattr(triton_quantization, "eager_dequantize_int8_simple", unexpected_eager)
+        q = torch.randint(-128, 128, (3, 4, 32), dtype=torch.int8, device="cuda")
+        scale = torch.rand((3, 4, 1), dtype=torch.float32, device="cuda") * 0.02
+
+        out = triton.dequantize_int8_simple_dtype(q, scale, 2)
+
+        assert out.shape == q.shape
+        assert out.dtype == torch.bfloat16
+
+    def test_triton_dequantize_int8_simple_dtype_empty_input(self, seed):
+        q = torch.empty((0, 32), dtype=torch.int8, device="cuda")
+        scale = torch.empty((0, 1), dtype=torch.float32, device="cuda")
+
+        out = triton.dequantize_int8_simple_dtype(q, scale, 2)
+
+        assert out.shape == q.shape
+        assert out.dtype == torch.bfloat16
 
     def test_public_api_int8_linear(self, seed):
         """comfy_kitchen.int8_linear op is reachable."""
