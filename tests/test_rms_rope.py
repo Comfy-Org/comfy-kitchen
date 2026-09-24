@@ -560,12 +560,14 @@ def test_rms_rope_hip_bf16_head64_multirow(rows, rot_dim, device, seed):
     with ck.use_backend("hip"):
         ck.rms_rope_split_half_(q, k, freqs, scale, scale, epsilon=1e-5, rot_dim=rot_dim)
 
-    assert_values_close(q, q_expected, rtol=1e-3, atol=1e-3,
-                        max_mismatch_ratio=_max_mismatch(torch.bfloat16, torch.bfloat16),
-                        name="HIP BF16 multi-row q")
-    assert_values_close(k, k_expected, rtol=1e-3, atol=1e-3,
-                        max_mismatch_ratio=_max_mismatch(torch.bfloat16, torch.bfloat16),
-                        name="HIP BF16 multi-row k")
+    max_mismatch_ratio = _max_mismatch(torch.bfloat16, torch.bfloat16)
+    for row in range(rows):
+        assert_values_close(q[:, row], q_expected[:, row], rtol=1e-3, atol=1e-3,
+                            max_mismatch_ratio=max_mismatch_ratio,
+                            name=f"HIP BF16 multi-row q row {row}")
+        assert_values_close(k[:, row], k_expected[:, row], rtol=1e-3, atol=1e-3,
+                            max_mismatch_ratio=max_mismatch_ratio,
+                            name=f"HIP BF16 multi-row k row {row}")
     assert torch.equal(v, v_ref)
 
 
