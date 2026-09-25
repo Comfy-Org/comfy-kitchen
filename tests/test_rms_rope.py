@@ -538,3 +538,95 @@ class TestPartialRotary:
         assert torch.equal(q, q_ref) and torch.equal(k, k_ref)
         assert not torch.equal(q, q_orig), "q buffer was never written in place"
         assert not torch.equal(k, k_orig), "k buffer was never written in place"
+
+
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("rot_dim", [2, 48, 64])
+def test_rms_rope_hip_bf16_head64_multirow(rows, rot_dim, device, seed):
+    if "hip" not in get_capable_backends("rms_rope_split_half_", device):
+        pytest.skip(f"HIP does not support rms_rope_split_half_ on {device}")
+
+    head_dim = 64
+    qkv = torch.randn(1, rows, 1, 3, head_dim, dtype=torch.bfloat16, device=device)
+    qkv_ref = qkv.clone()
+    q, k, v = qkv.unbind(dim=3)
+    q_ref, k_ref, v_ref = qkv_ref.unbind(dim=3)
+    freqs = torch.randn(1, rows, 1, rot_dim // 2, 2, 2, dtype=torch.bfloat16, device=device)
+    scale = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
+
+    with ck.use_backend("eager"):
+        q_expected, k_expected = ck.rms_rope_split_half(
+            q_ref, k_ref, freqs, scale, scale, epsilon=1e-5, rot_dim=rot_dim)
+    with ck.use_backend("hip"):
+        ck.rms_rope_split_half_(q, k, freqs, scale, scale, epsilon=1e-5, rot_dim=rot_dim)
+
+    max_mismatch_ratio = _max_mismatch(torch.bfloat16, torch.bfloat16)
+    for row in range(rows):
+        assert_values_close(q[:, row], q_expected[:, row], rtol=1e-3, atol=1e-3,
+                            max_mismatch_ratio=max_mismatch_ratio,
+                            name=f"HIP BF16 multi-row q row {row}")
+        assert_values_close(k[:, row], k_expected[:, row], rtol=1e-3, atol=1e-3,
+                            max_mismatch_ratio=max_mismatch_ratio,
+                            name=f"HIP BF16 multi-row k row {row}")
+        torch.testing.assert_close(q[:, row, ..., :rot_dim], q_expected[:, row, ..., :rot_dim],
+                                   rtol=1.6e-2, atol=1e-2,
+                                   msg=f"HIP BF16 multi-row q rotary prefix row {row}")
+        torch.testing.assert_close(k[:, row, ..., :rot_dim], k_expected[:, row, ..., :rot_dim],
+                                   rtol=1.6e-2, atol=1e-2,
+                                   msg=f"HIP BF16 multi-row k rotary prefix row {row}")
+    assert torch.equal(v, v_ref)
+
+
+@pytest.mark.parametrize(
+    "op_name,dtype,paired,inplace,last_dim_stride",
+    [
+        ("rms_rope1_", torch.float16, False, True, 2),
+        ("rms_rope", torch.float16, True, False, 1),
+        ("rms_rope_split_half1", torch.float32, False, False, 1),
+    ],
+    ids=["fp16-q-inplace-strided", "fp16-paired-out-of-place", "fp32-split-half-q"],
+)
+def test_rms_rope_hip_head64_other_contracts(
+    op_name, dtype, paired, inplace, last_dim_stride, device, seed, monkeypatch
+):
+    if "hip" not in get_capable_backends(op_name, device):
+        pytest.skip(f"HIP does not support {op_name} on {device}")
+
+    rows, heads, head_dim, epsilon = 5, 2, 64, 0.125
+    freqs = torch.randn(1, rows, 1, head_dim // 2, 2, 2, dtype=torch.float32, device=device)
+    scale = torch.randn(head_dim, dtype=torch.float32, device=device)
+    if paired:
+        q = torch.randn(1, rows, heads, head_dim, dtype=dtype, device=device)
+        k = torch.randn_like(q)
+        originals = q.clone(), k.clone()
+        source_originals = originals
+        args = (q, k, freqs, scale, scale, epsilon)
+        reference_args = (originals[0].clone(), originals[1].clone(), freqs, scale, scale, epsilon)
+    else:
+        storage = torch.randn(
+            1, rows, heads, head_dim * last_dim_stride, dtype=dtype, device=device)
+        x = storage[..., ::last_dim_stride]
+        original = x.clone()
+        source_originals = (original,)
+        args = (x, freqs, scale, epsilon)
+        reference_args = (original.clone(), freqs, scale, epsilon)
+
+    functional_name = op_name[:-1] if inplace else op_name
+    expected = _run_backend(functional_name, "eager", reference_args, monkeypatch)
+    pointer_and_strides = None if paired or not inplace else (x.data_ptr(), x.stride())
+    actual = _run_backend(op_name, "hip", args, monkeypatch)
+    actuals = actual if paired else (actual,)
+    inputs = (q, k) if paired else (x,)
+    references = expected if paired else (expected,)
+    for result, source, reference, source_original in zip(
+        actuals, inputs, references, source_originals, strict=True
+    ):
+        assert_values_close(
+            result, reference, rtol=2e-3, atol=2e-3,
+            max_mismatch_ratio=_max_mismatch(torch.float32, dtype),
+            name=f"HIP {op_name} {dtype}")
+        if paired or not inplace:
+            assert torch.equal(source, source_original)
+            assert result.data_ptr() != source.data_ptr()
+        else:
+            assert (result.data_ptr(), result.stride()) == pointer_and_strides
