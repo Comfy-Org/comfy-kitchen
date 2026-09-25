@@ -101,6 +101,7 @@ ignore = [
     "N802",  # Function name should be lowercase (ComfyUI Nodes)
     "RUF022",
     "SIM108",
+    "I001",
 ]
 
 # Allow autofix for all enabled rules
