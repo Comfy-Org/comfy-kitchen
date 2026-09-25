@@ -262,21 +262,21 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
 //   7 64x128 BKB128 8w,   8 128x64 BKB128 8w, 9 128x128 BKB192 8w,
 //   10 legacy auto (the pre-tune RDNA4 heuristic, for A/B comparisons)
 inline int wmma_tile_mode() {
-    static const int mode = [] {
-        // MSVC's ucrt marks getenv deprecated; the clang build with MSVC headers
-        // then warns on every TU that includes this header. The portable stdlib
-        // read is the right tool here, so silence that one diagnostic locally.
+    // Read per call, not once per process: a tile sweep has to interleave modes
+    // in a single process, because absolute timings on this iGPU drift with the
+    // clock between processes. getenv+strtol is ~100 ns against a multi-ms GEMM.
+    // MSVC's ucrt marks getenv deprecated; the clang build with MSVC headers
+    // then warns on every TU that includes this header. The portable stdlib
+    // read is the right tool here, so silence that one diagnostic locally.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        const char* s = getenv("COMFY_KITCHEN_WMMA_TILE");
+    const char* s = getenv("COMFY_KITCHEN_WMMA_TILE");
 #pragma clang diagnostic pop
-        if (s == nullptr || *s == '\0') return 0;
-        char* end = nullptr;
-        long v = std::strtol(s, &end, 10);
-        if (end == s || v < 0 || v > 10) return 0;
-        return static_cast<int>(v);
-    }();
-    return mode;
+    if (s == nullptr || *s == '\0') return 0;
+    char* end = nullptr;
+    long v = std::strtol(s, &end, 10);
+    if (end == s || v < 0 || v > 10) return 0;
+    return static_cast<int>(v);
 }
 
 // hipDeviceAttributeMultiprocessorCount reports WGPs on RDNA, not CUs (32 on a
@@ -377,15 +377,28 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
     // Anima/SDXL K<=2048..2880 shapes prefer 128x128 BKB64 16w, while K=8192
     // likes BKB=128). The env override (COMFY_KITCHEN_WMMA_TILE) forces any mode.
     if (!skinny && wgps <= 8 && mode != 10) {
-        // 32-byte K-steps (fp16/bf16) halve the K-steps per tile versus 8-bit
-        // operands, so the deeper BKB=128 tile wins even at shallow K (measured
-        // on the 6-WGP 780M: fp16 prefers 128x128 BKB128 16w on every
-        // Anima/SDXL shape).
         if (Mma::kStepBytes >= 32) {
-            constexpr int BM = 128, BN = 128, BKB = 128;
-            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
-                <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+            // 32-byte K-steps (fp16/bf16) halve the K-steps per tile versus 8-bit
+            // operands. Re-measured on the 6-WGP 780M across ten Anima/SDXL/conv
+            // shapes (ck_tools/sweep_gemm_fp.py, same-process interleaved): for a
+            // moderate K the 64x64 BKB128 4-wave tile beats 128x128 by 3-27% -- it
+            // yields 4x the blocks to interleave and its smaller LDS footprint
+            // keeps more of them resident -- while deep K (mlp2, K=8192) and very
+            // shallow K (adaln2, K=256) both want 128x128 back. kbytes is 2*K here,
+            // so the 1024..4096 window is K in [512, 2048]; every measured shape
+            // inside it agreed, and conv320 (kbytes 5760) plus adaln2 (512)
+            // regress outside it.
+            if (kbytes >= 1024 && kbytes <= 4096) {
+                constexpr int BM = 64, BN = 64, BKB = 128;
+                dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
+                    <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+            } else {
+                constexpr int BM = 128, BN = 128, BKB = 128;
+                dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
+                    <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+            }
         } else if (kbytes >= 4096) {
             constexpr int BM = 128, BN = 128, BKB = 128;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);

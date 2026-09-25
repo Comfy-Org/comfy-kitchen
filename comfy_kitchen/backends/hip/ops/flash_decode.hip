@@ -177,8 +177,8 @@ __global__ __launch_bounds__(kBlockThreads) void flash_decode_kernel(
                 // probability zero rather than exp2(0).
                 const float score = valid ? dot : kNegInf;
                 const float m_new = fmaxf(m_run[i], score);
-                const float rescale = exp2f(m_run[i] - m_new);
-                const float p = valid ? exp2f(score - m_new) : 0.0f;
+                const float rescale = hw_exp2(m_run[i] - m_new);
+                const float p = valid ? hw_exp2(score - m_new) : 0.0f;
                 d_run[i] = fmaf(d_run[i], rescale, p);
 #pragma unroll
                 for (int d = 0; d < kDimPerLane; ++d) {
@@ -217,7 +217,7 @@ __global__ __launch_bounds__(kBlockThreads) void flash_decode_kernel(
         v4f accum = zero4();
 #pragma unroll
         for (int w = 0; w < kWavesPerBlock; ++w) {
-            const float rescale = exp2f(s_max[w][i] - m);
+            const float rescale = hw_exp2(s_max[w][i] - m);
             denominator = fmaf(s_denominator[w][i], rescale, denominator);
 #pragma unroll
             for (int d = 0; d < kDimPerLane; ++d) {
@@ -270,7 +270,7 @@ __global__ __launch_bounds__(kCombineThreads) void flash_decode_combine_kernel(
     float numerator = 0.0f;
     for (int s = 0; s < num_splits; ++s) {
         const int64_t slot = static_cast<int64_t>(s) * rows + row;
-        const float weight = exp2f(lse_accum[slot] - m);
+        const float weight = hw_exp2(lse_accum[slot] - m);
         denominator += weight;
         numerator = fmaf(weight, out_accum[slot * kHeadDim + d], numerator);
     }

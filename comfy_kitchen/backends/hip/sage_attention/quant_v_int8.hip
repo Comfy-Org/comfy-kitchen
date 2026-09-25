@@ -22,27 +22,34 @@
 namespace comfy::hip_backend::sage {
 namespace {
 
-constexpr int kDTile = 8;
+// Channels per thread. The read strides a whole row (256 bytes at D128) between
+// consecutive keys, so the per-thread vector width sets the sector efficiency:
+// 8 channels is 16 bytes of a 32-byte sector (half wasted unless a neighbouring
+// d-tile block catches it in L2), 16 channels is a full sector. Pass 1 drops to
+// 2x unrolling at 16 to keep the live temporary count down.
+constexpr int kDTile = 32;
+constexpr int kUnroll = (kDTile >= 32) ? 1 : ((kDTile >= 16) ? 2 : 4);
 
-// Eight adjacent channels: 32 bytes for fp32, 16 for the 16-bit types.
+// kDTile adjacent channels: 32 bytes per 8 channels for the 16-bit types.
 template <typename T>
 __forceinline__ __device__ void load8(const T* p, float* out) {
     if constexpr (std::is_same_v<T, float>) {
-        const float4 lo = *reinterpret_cast<const float4*>(p);
-        const float4 hi = *reinterpret_cast<const float4*>(p + 4);
-        out[0] = lo.x;
-        out[1] = lo.y;
-        out[2] = lo.z;
-        out[3] = lo.w;
-        out[4] = hi.x;
-        out[5] = hi.y;
-        out[6] = hi.z;
-        out[7] = hi.w;
-    } else {
-        const uint4 raw = *reinterpret_cast<const uint4*>(p);
-        const T* vals = reinterpret_cast<const T*>(&raw);
 #pragma unroll
-        for (int i = 0; i < kDTile; ++i) out[i] = to_float(vals[i]);
+        for (int i = 0; i < kDTile / 4; ++i) {
+            const float4 raw = *reinterpret_cast<const float4*>(p + 4 * i);
+            out[4 * i + 0] = raw.x;
+            out[4 * i + 1] = raw.y;
+            out[4 * i + 2] = raw.z;
+            out[4 * i + 3] = raw.w;
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < kDTile / 8; ++i) {
+            const uint4 raw = *reinterpret_cast<const uint4*>(p + 8 * i);
+            const T* vals = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) out[8 * i + j] = to_float(vals[j]);
+        }
     }
 }
 
@@ -67,20 +74,21 @@ __global__ __launch_bounds__(Threads) void quant_v_int8_kernel(
 #pragma unroll
     for (int i = 0; i < kDTile; ++i) mx[i] = 0.0f;
 
-    // Four independent loads per iteration so the memory system has something to
-    // overlap; this block is the only one touching these channels.
+    // kUnroll independent loads per iteration so the memory system has something
+    // to overlap; this block is the only one touching these channels.
     int n = threadIdx.x;
-    const int n_body = N - 3 * Threads;
-    for (; n < n_body; n += 4 * Threads) {
-        float t0[kDTile], t1[kDTile], t2[kDTile], t3[kDTile];
-        load8<T>(base + static_cast<int64_t>(n) * stride_n, t0);
-        load8<T>(base + static_cast<int64_t>(n + Threads) * stride_n, t1);
-        load8<T>(base + static_cast<int64_t>(n + 2 * Threads) * stride_n, t2);
-        load8<T>(base + static_cast<int64_t>(n + 3 * Threads) * stride_n, t3);
+    const int n_body = N - (kUnroll - 1) * Threads;
+    for (; n < n_body; n += kUnroll * Threads) {
+        float t[kUnroll][kDTile];
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u)
+            load8<T>(base + static_cast<int64_t>(n + u * Threads) * stride_n, t[u]);
 #pragma unroll
         for (int i = 0; i < kDTile; ++i) {
-            mx[i] = fmaxf(mx[i], fmaxf(fmaxf(fabsf(t0[i]), fabsf(t1[i])),
-                                       fmaxf(fabsf(t2[i]), fabsf(t3[i]))));
+            float m = fabsf(t[0][i]);
+#pragma unroll
+            for (int u = 1; u < kUnroll; ++u) m = fmaxf(m, fabsf(t[u][i]));
+            mx[i] = fmaxf(mx[i], m);
         }
     }
     for (; n < N; n += Threads) {
@@ -226,8 +234,8 @@ extern "C" void launch_sage_transpose_v(const void* v, void* out, int B, int H, 
             "sage int8 attention: V base pointer and B/H/N strides must be 16-byte aligned");
     }
     if (D <= 0 || D % kDTile != 0) {
-        throw std::runtime_error(
-            "sage int8 attention: head_dim must be a positive multiple of 8");
+        throw std::runtime_error("sage int8 attention: head_dim must be a positive multiple of " +
+                                 std::to_string(kDTile));
     }
     if (N < 0 || padded_N < N) {
         throw std::runtime_error(
@@ -283,8 +291,8 @@ extern "C" void launch_sage_quant_v_int8(const void* v, void* out, void* scale, 
             "sage int8 attention: V base pointer and B/H/N strides must be 16-byte aligned");
     }
     if (D <= 0 || D % kDTile != 0) {
-        throw std::runtime_error(
-            "sage int8 attention: head_dim must be a positive multiple of 8");
+        throw std::runtime_error("sage int8 attention: head_dim must be a positive multiple of " +
+                                 std::to_string(kDTile));
     }
     // Rows are padded_N wide and the quantize pass writes columns up to N, so a
     // short pad would run every row past its end.

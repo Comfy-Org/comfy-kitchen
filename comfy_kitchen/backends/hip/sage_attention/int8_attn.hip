@@ -334,7 +334,7 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
             tile_m -= kProbU8Offset;
 
             const float m_prev = m_run[fq];
-            const float smaller = exp2f(-fabsf(m_prev - tile_m));
+            const float smaller = hw_exp2(-fabsf(m_prev - tile_m));
             const float o_scale = m_prev < tile_m ? smaller : 1.0f;
             const float tile_scale = tile_m < m_prev ? smaller : 1.0f;
             m_run[fq] = fmaxf(m_prev, tile_m);
@@ -356,8 +356,8 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
                 for (int e = 0; e < 8; ++e) {
                     const float p =
                         kBoundary
-                            ? exp2f(prob[kBoundary ? fk : 0][e] + negative_m)
-                            : exp2f(fmaf(static_cast<float>(s_acc[fk][e]), tile_scale_k[fk],
+                            ? hw_exp2(prob[kBoundary ? fk : 0][e] + negative_m)
+                            : hw_exp2(fmaf(static_cast<float>(s_acc[fk][e]), tile_scale_k[fk],
                                          negative_m));
                     tile_sum += p;
                     packed[e] = prob_to_u8(p);

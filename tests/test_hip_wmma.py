@@ -505,6 +505,23 @@ def _rel_err(got, ref) -> float:
     return ((got - ref).abs().max() / ref.abs().max().clamp(min=1e-9)).item()
 
 
+def _fp16_shape_served(m, n, k) -> bool:
+    """Mirror fp16_shape_served() in backends/hip/ops/gemm_fp16.hip.
+
+    The envelope is device-dependent: a part with more than 8 WGPs (a dGPU)
+    hands shallow-K and huge-M shapes to the vendor GEMM, while a 6-WGP iGPU
+    keeps them on WMMA, which is measurably faster there. The launcher reports
+    hipDeviceAttributeMultiprocessorCount, which TheRock reports as the WGP
+    count on gfx1103.
+    """
+    if k % 8 != 0 or n % 8 != 0:
+        return False
+    wgp = torch.cuda.get_device_properties(0).multi_processor_count
+    if wgp > 8 and (k <= 4096 or m > 8192):
+        return False
+    return True
+
+
 def _served_fp16_linear(hip, monkeypatch):
     """Fail the test if fp16_linear falls back to torch's linear."""
     served = []
@@ -523,17 +540,18 @@ def _served_fp16_linear(hip, monkeypatch):
 # shapes cover the tile paths it reaches and a shape it declines.
 @needs_wmma
 @pytest.mark.parametrize(
-    ("m", "n", "k", "served"),
+    ("m", "n", "k"),
     [
-        (1797, 2048, 8192, True),
-        (512, 512, 8192, True),
-        (37, 264, 6144, True),
-        (1797, 6144, 2048, False),
+        (1797, 2048, 8192),
+        (512, 512, 8192),
+        (37, 264, 6144),
+        (1797, 6144, 2048),
+        (1797, 6140, 2048),
     ],
 )
 @pytest.mark.parametrize("with_bias", [True, False])
 @pytest.mark.parametrize("with_residual", [True, False])
-def test_fp16_linear_matches_fp32_reference(hip, monkeypatch, m, n, k, served, with_bias,
+def test_fp16_linear_matches_fp32_reference(hip, monkeypatch, m, n, k, with_bias,
                                              with_residual):
     torch.manual_seed(0)
     x = torch.randn(m, k, dtype=torch.float16, device=DEV)
@@ -548,7 +566,7 @@ def test_fp16_linear_matches_fp32_reference(hip, monkeypatch, m, n, k, served, w
     if with_residual:
         ref = r.float() + rs.float() * ref
 
-    assert calls == [served]
+    assert calls == [_fp16_shape_served(m, n, k)]
     assert got.dtype == torch.float16 and got.shape == (m, n)
     # fp32 accumulation: only the fp16 operands and the stored result are rounded
     assert _rel_err(got, ref) < 5e-3

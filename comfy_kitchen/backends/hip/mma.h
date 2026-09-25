@@ -49,6 +49,24 @@ typedef _Float16 v16h __attribute__((ext_vector_type(16)));
 
 constexpr int kWave = 32;
 
+// 2^x for the softmax paths. Under -ffast-math clang lowers exp2f to a
+// range-reduction sequence (compare, two selects, add, v_exp_f32, ldexp): about
+// five VALU instructions per call, and every attention kernel here calls it once
+// per score element. On gfx11 the hardware instruction computes 2^x directly and
+// is bit-identical to exp2f over [-150, 10], which covers every argument these
+// kernels produce (a score minus a running max, so <= 0, plus the small
+// probability offset). Attention is issue-bound with WMMA and VALU sharing one
+// port, so the substitution is a direct cut of the non-WMMA VALU work: the D64
+// int8 key-tile loop drops 1759 -> 1474 instructions. gfx12 keeps exp2f; the
+// equivalence is only verified on gfx11.
+__device__ __forceinline__ float hw_exp2(float x) {
+#if defined(COMFY_MMA_GFX11)
+    return __builtin_amdgcn_exp2f(x);
+#else
+    return exp2f(x);
+#endif
+}
+
 // architecture_config.h is generated from architectures.json. __gfx*__ is
 // defined only in device passes; the host pass falls through to the stubs below.
 

@@ -21,6 +21,7 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 
+#include <cfloat>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -37,7 +38,11 @@ typedef float v8f __attribute__((ext_vector_type(8)));
 typedef __bf16 v16bf __attribute__((ext_vector_type(16)));
 typedef _Float16 v16h __attribute__((ext_vector_type(16)));
 
-__device__ __forceinline__ float fast_exp2(float x) { return exp2f(x); }
+// 2^x for the softmax. See hw_exp2 in ../mma.h for why the hardware
+// instruction replaces exp2f here.
+__device__ __forceinline__ float fast_exp2(float x) {
+    return comfy::hip_backend::hw_exp2(x);
+}
 
 __device__ __forceinline__ _Float16 f16_from_bits(unsigned bits) {
     _Float16 r;
@@ -859,6 +864,15 @@ __device__ __forceinline__ void attn_kernel_impl_t(
 
     constexpr int VVecsPerTile = (HeadDim * BLOCK_N) / 16;
 
+    // Loop-invariant address bases. Rebuilding these int64 expressions per
+    // element left the D64 key-tile loop carrying ~556 scalar instructions (see
+    // the ISA histogram in the optimization log); factoring them out lets the
+    // compiler strength-reduce the per-element offsets to constant adds.
+    const int64_t k_base = b * k_stride_b + hkv * k_stride_h;
+    const int64_t ks_base = b * ks_stride_b + hkv * ks_stride_h;
+    const int64_t v_head_base = (b * num_kv_heads + hkv) * HeadDim;
+    const int64_t v_row_base = v_head_base + m_row;
+
     for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BLOCK_N) {
         const int64_t next_base = kb_base + BLOCK_N;
         const bool has_next = (next_base < kv_limit);
@@ -872,8 +886,7 @@ __device__ __forceinline__ void attn_kernel_impl_t(
                     const int d = (vec - n * KVecsPerRow) * 16;
                     const int64_t k_idx = next_base + n;
                     if (k_idx < kv_len) {
-                        const int64_t k_off =
-                            b * k_stride_b + hkv * k_stride_h + k_idx * k_stride_n + d;
+                        const int64_t k_off = k_base + k_idx * k_stride_n + d;
                         k_prefetch[i] = *reinterpret_cast<const uint4*>(k + k_off);
                     } else {
                         k_prefetch[i] = make_uint4(0, 0, 0, 0);
@@ -894,14 +907,24 @@ __device__ __forceinline__ void attn_kernel_impl_t(
             }
             const int64_t k_col_start = kb_base + ct * kBK;
             const int k_scale_idx = static_cast<int>(k_col_start / kMinBlkK);
-            const float ks_val = k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+            const float ks_val = k_scale[ks_base + k_scale_idx];
             const float score_scale = qs_lane * ks_val * sm_scale;
+            if (k_col_start + kBK <= kv_len) {
+                // Whole 16-key group is in bounds, which is every tile but the
+                // last for the aligned key lengths the models use: skip the
+                // per-element mask compare and select.
 #pragma unroll
-            for (int e = 0; e < 8; ++e) {
-                const int col = static_cast<int>(k_col_start) + 2 * e + hw;
-                float s = static_cast<float>(score_acc[e]) * score_scale;
-                if (col >= kv_len) s = -FLT_MAX * 0.5f;
-                score_cache[ct][e] = s;
+                for (int e = 0; e < 8; ++e) {
+                    score_cache[ct][e] = static_cast<float>(score_acc[e]) * score_scale;
+                }
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int col = static_cast<int>(k_col_start) + 2 * e + hw;
+                    float s = static_cast<float>(score_acc[e]) * score_scale;
+                    if (col >= kv_len) s = -FLT_MAX * 0.5f;
+                    score_cache[ct][e] = s;
+                }
             }
         }
 
@@ -910,8 +933,7 @@ __device__ __forceinline__ void attn_kernel_impl_t(
             for (int i = tid; i < VVecsPerTile; i += THREADS) {
                 const int d = i / (BLOCK_N / kBK);
                 const int c16 = i % (BLOCK_N / kBK);
-                const int64_t v_off =
-                    ((b * num_kv_heads + hkv) * HeadDim + d) * v_t_n + (kb_base + c16 * kBK);
+                const int64_t v_off = (v_head_base + d) * v_t_n + (kb_base + c16 * kBK);
                 if constexpr (INT8_PV) {
                     *reinterpret_cast<uint4*>(v_tile + d * VTileStride + c16 * kBK) =
                         *reinterpret_cast<const uint4*>(v + v_off);
@@ -993,6 +1015,10 @@ __device__ __forceinline__ void attn_kernel_impl_t(
                 }
             }
         } else {
+            // V straight from the transposed global buffer. The row base is
+            // hoisted out of the ct loop so the per-MMA address is a constant
+            // add instead of an int64 multiply chain.
+            const auto* v_row_ptr = v + v_row_base * v_t_n + kb_base;
 #pragma unroll
             for (int ct = 0; ct < ColTiles; ++ct) {
                 float p_vals[8];
@@ -1002,21 +1028,16 @@ __device__ __forceinline__ void attn_kernel_impl_t(
                     const int32_t_v4 p_frag = assemble_p_frag_u8(p_vals, hw);
 #pragma unroll
                     for (int dt = 0; dt < DTiles; ++dt) {
-                        const int64_t vt_off =
-                            ((b * num_kv_heads + hkv) * HeadDim + (dt * kBK + m_row)) * v_t_n +
-                            (kb_base + ct * kBK);
-                        const int32_t_v4 v_frag =
-                            *reinterpret_cast<const int32_t_v4*>(v + vt_off);
+                        const int32_t_v4 v_frag = *reinterpret_cast<const int32_t_v4*>(
+                            v_row_ptr + (dt * kBK) * v_t_n + ct * kBK);
                         out_acc[dt] = wmma_i32_iu8_ub(v_frag, p_frag, out_acc[dt]);
                     }
                 } else {
                     const v16h p_frag = assemble_p_frag(p_vals, hw);
 #pragma unroll
                     for (int dt = 0; dt < DTiles; ++dt) {
-                        const int64_t vt_off =
-                            ((b * num_kv_heads + hkv) * HeadDim + (dt * kBK + m_row)) * v_t_n +
-                            (kb_base + ct * kBK);
-                        const v16h v_frag_t = *reinterpret_cast<const v16h*>(v + vt_off);
+                        const v16h v_frag_t = *reinterpret_cast<const v16h*>(
+                            v_row_ptr + (dt * kBK) * v_t_n + ct * kBK);
                         out_acc[dt] = wmma_f32_f16(v_frag_t, p_frag, out_acc[dt]);
                     }
                 }
@@ -1291,19 +1312,21 @@ extern "C" void launch_sage_port_attn(
     const int64_t ks_stride_h = k_groups_per_head;
 
     // Shape-differentiated dispatch. Environment overrides (SAGE_PORT_WPE /
-    // SAGE_PORT_BM / SAGE_PORT_BN) force one config for sweeping; the defaults
-    // encode the measured best per shape class.
-    static const int env_wpe = [] {
+    // SAGE_PORT_BM / SAGE_PORT_BN / SAGE_PORT_T32) force one config for sweeping;
+    // the defaults encode the measured best per shape class. Read per call, not
+    // once per process, so a sweep can interleave configs in a single process
+    // (cross-process timing on this iGPU drifts with the clock).
+    const int env_wpe = [] {
         const char* s = getenv("SAGE_PORT_WPE");
         return s ? atoi(s) : 0;
     }();
-    static const int env_bm = [] {
+    const int env_bm = [] {
         const char* s = getenv("SAGE_PORT_BM");
         return s ? atoi(s) : 0;
     }();
-    static const int env_t32 = [] { const char* s = getenv("SAGE_PORT_T32"); return s ? atoi(s) : -1; }();
+    const int env_t32 = [] { const char* s = getenv("SAGE_PORT_T32"); return s ? atoi(s) : -1; }();
     const bool use_t32 = (env_t32 == 1 || (env_t32 == -1 && head_dim != 64));
-    static const int env_bn = [] {
+    const int env_bn = [] {
         const char* s = getenv("SAGE_PORT_BN");
         return s ? atoi(s) : 0;
     }();

@@ -106,16 +106,16 @@ __global__ __launch_bounds__(kRmsRopeThreads) void rms_rope_kernel(
         const float sb = load_in(q_scale, ib, s_code);
         const float qa = round_to<T>(load_in(q, ia_in, x_code) * rrms_q * sa);
         const float qb = round_to<T>(load_in(q, ib_in, x_code) * rrms_q * sb);
-        rope_store<T>(q_out, ia_out, rope_combine(f00, qa, f01, qb, f_code, split_half));
-        rope_store<T>(q_out, ib_out, rope_combine(f10, qa, f11, qb, f_code, split_half));
+        rope_store<T>(q_out, ia_out, rope_combine(f00, qa, f01, qb, f_code));
+        rope_store<T>(q_out, ib_out, rope_combine_b(f10, qa, f11, qb, f_code, split_half));
 
         if (has_k) {
             const float ta = load_in(k_scale, ia, s_code);
             const float tb = load_in(k_scale, ib, s_code);
             const float ka = round_to<T>(load_in(k, ia_in, x_code) * rrms_k * ta);
             const float kb = round_to<T>(load_in(k, ib_in, x_code) * rrms_k * tb);
-            rope_store<T>(k_out, ia_out, rope_combine(f00, ka, f01, kb, f_code, split_half));
-            rope_store<T>(k_out, ib_out, rope_combine(f10, ka, f11, kb, f_code, split_half));
+            rope_store<T>(k_out, ia_out, rope_combine(f00, ka, f01, kb, f_code));
+            rope_store<T>(k_out, ib_out, rope_combine_b(f10, ka, f11, kb, f_code, split_half));
         }
     }
 
@@ -271,16 +271,16 @@ __global__ __launch_bounds__(kRmsRopeThreads) void rms_rope_kernel_fast(
         const float sb = load_in(q_scale, ib, s_code);
         const float qa = round_to<T>(qs[ia] * rrms_q * sa);
         const float qb = round_to<T>(qs[ib] * rrms_q * sb);
-        rope_store<T>(q_out, ia_out, rope_combine(f00, qa, f01, qb, f_code, split_half));
-        rope_store<T>(q_out, ib_out, rope_combine(f10, qa, f11, qb, f_code, split_half));
+        rope_store<T>(q_out, ia_out, rope_combine(f00, qa, f01, qb, f_code));
+        rope_store<T>(q_out, ib_out, rope_combine_b(f10, qa, f11, qb, f_code, split_half));
 
         if (has_k) {
             const float ta = load_in(k_scale, ia, s_code);
             const float tb = load_in(k_scale, ib, s_code);
             const float ka = round_to<T>(ks[ia] * rrms_k * ta);
             const float kb = round_to<T>(ks[ib] * rrms_k * tb);
-            rope_store<T>(k_out, ia_out, rope_combine(f00, ka, f01, kb, f_code, split_half));
-            rope_store<T>(k_out, ib_out, rope_combine(f10, ka, f11, kb, f_code, split_half));
+            rope_store<T>(k_out, ia_out, rope_combine(f00, ka, f01, kb, f_code));
+            rope_store<T>(k_out, ib_out, rope_combine_b(f10, ka, f11, kb, f_code, split_half));
         }
     }
 

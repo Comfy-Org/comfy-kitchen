@@ -276,7 +276,7 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_qk_bf16sv_kernel(
             tile_m = fmaxf(tile_m, swap_half_wave(tile_m));
 
             const float m_prev = m_run[fq];
-            const float smaller = exp2f(-fabsf(m_prev - tile_m));
+            const float smaller = hw_exp2(-fabsf(m_prev - tile_m));
             const float o_scale = m_prev < tile_m ? smaller : 1.0f;
             const float tile_scale = tile_m < m_prev ? smaller : 1.0f;
             m_run[fq] = fmaxf(m_prev, tile_m);
@@ -297,8 +297,8 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_qk_bf16sv_kernel(
                 for (int e = 0; e < 8; ++e) {
                     const float p =
                         kBoundary
-                            ? exp2f(prob[kBoundary ? fk : 0][e] + negative_m)
-                            : exp2f(fmaf(static_cast<float>(s_acc[fk][e]), tile_scale_k[fk],
+                            ? hw_exp2(prob[kBoundary ? fk : 0][e] + negative_m)
+                            : hw_exp2(fmaf(static_cast<float>(s_acc[fk][e]), tile_scale_k[fk],
                                          negative_m));
                     p_vals[e] = p;
                     tile_sum += p;
@@ -312,7 +312,7 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_qk_bf16sv_kernel(
 
 #pragma unroll
             for (int dt = 0; dt < DT; ++dt) {
-                PV_Mma::Acc partial = PV_Mma::zero();
+                typename PV_Mma::Acc partial = PV_Mma::zero();
 #pragma unroll
                 for (int fk = 0; fk < KT; ++fk) {
                     // Element-addressed fragment read, the same shape Sol-Attn's
