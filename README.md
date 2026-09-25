@@ -49,7 +49,9 @@ Each of the eight rope entries also has an in-place form (`apply_rope_`,
 
 \* Ascend support for `quantize_and_rotate_rowwise` requires
 `torch_npu.npu_rotate_quant`; `int8_linear` requires
-`torch_npu.npu_quant_matmul`. These capabilities are registered only when the
+`torch_npu.npu_dynamic_quant` and `torch_npu.npu_quant_matmul`, while
+`convrot_w4a4_linear` requires only `torch_npu.npu_quant_matmul`.
+These capabilities are registered only when the
 corresponding operator is available.
 
 ## Huawei Ascend backend
@@ -90,6 +92,13 @@ backend instead of copying tensors to the CPU.
 The RoPE implementations support four-dimensional BNSD and BSND tensors,
 including packed-QKV views whose final dimension is contiguous. Unsupported
 broadcast patterns and layouts continue through another capable backend.
+
+RoPE capability detection is independent of quantization: it requires a
+`npu_rotary_mul` schema with `rotary_mode`; RMS-RoPE additionally requires
+`npu_rms_norm`. The quantization capability checks for `npu_quantize` with
+`div_mode`. Missing optional operators do not disable unrelated capabilities.
+INT8 linear accepts the current input RMSNorm and residual arguments through
+the shared device-side helpers; those operations are not fused into its GEMM.
 
 ## HIP backend (AMD RDNA2 / RDNA3 / RDNA3.5 / RDNA4)
 
