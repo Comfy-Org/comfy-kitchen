@@ -1559,7 +1559,14 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
     const int padded_k = sage_padded_k(kv_len, cta_k);
     const int v_dtype_code = map_dtype_to_code(v_int8.dtype());
     if (v_dtype_code == 4) {
-        if (mask_ptr != nullptr || head_dim == 256 || !comfy_small_igpu()) {
+        // The fork's ported gfx110x kernel has a partial-last-key-tile bug in its
+        // wide (cta_k==128) tile: it mishandles the tail when kv_len is not a
+        // multiple of cta_k (kv=4097/8128/8193 break, aligned lengths are fine).
+        // Upstream's legacy int8_attn.hip handles partial tiles correctly, so
+        // route those shapes to it (mainline) and keep the ported kernel only
+        // for the tile-aligned cases it was tuned for.
+        const bool port_partial_tile_ok = (kv_len % cta_k) == 0;
+        if (mask_ptr != nullptr || head_dim == 256 || !comfy_small_igpu() || !port_partial_tile_ok) {
             // Legacy pure-int8 kernel: handles masks, D256 has no room for the
             // ported kernel's tiles, and dGPUs keep the upstream implementation
             // (the ported schedule is tuned against the 6-WGP 780M).
