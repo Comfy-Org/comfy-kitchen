@@ -21,14 +21,14 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `na2d`                      | ✓     | ✓    | ✓      | ✓   |     |
 | `sol_attn`                  | ✓     | ✓    |        | ✓   |     |
 | `int8_attention`            |       | ✓    |        | ✓   |     |
-| `apply_rope`                | ✓     | ✓    | ✓      | ✓   | ✓   |
-| `apply_rope1`               | ✓     | ✓    | ✓      | ✓   | ✓   |
-| `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   | ✓   |
-| `apply_rope_split_half1`    | ✓     | ✓    | ✓      | ✓   | ✓   |
-| `rms_rope`                  | ✓     | ✓    | ✓      | ✓   | ✓   |
-| `rms_rope1`                 | ✓     | ✓    | ✓      | ✓   | ✓   |
-| `rms_rope_split_half`       | ✓     | ✓    | ✓      | ✓   | ✓   |
-| `rms_rope_split_half1`      | ✓     | ✓    | ✓      | ✓   | ✓   |
+| `apply_rope`                | ✓     | ✓    | ✓      | ✓   | ✓*  |
+| `apply_rope1`               | ✓     | ✓    | ✓      | ✓   | ✓*  |
+| `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   | ✓*  |
+| `apply_rope_split_half1`    | ✓     | ✓    | ✓      | ✓   | ✓*  |
+| `rms_rope`                  | ✓     | ✓    | ✓      | ✓   | ✓*  |
+| `rms_rope1`                 | ✓     | ✓    | ✓      | ✓   | ✓*  |
+| `rms_rope_split_half`       | ✓     | ✓    | ✓      | ✓   | ✓*  |
+| `rms_rope_split_half1`      | ✓     | ✓    | ✓      | ✓   | ✓*  |
 | `quantize_int8_rowwise`     | ✓     | ✓    | ✓      | ✓   | ✓   |
 | `quantize_int8_tensorwise`  | ✓     | ✓    |        | ✓   | ✓   |
 | `quantize_and_rotate_rowwise` | ✓   | ✓    | ✓      | ✓   | ✓*  |
@@ -47,7 +47,9 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 Each of the eight rope entries also has an in-place form (`apply_rope_`,
 `rms_rope_split_half1_`, ...) with the same backend coverage as the row above.
 
-\* Ascend support for `quantize_and_rotate_rowwise` requires
+\* Ascend RoPE support requires a `torch_npu.npu_rotary_mul` schema with
+`rotary_mode`; RMS-RoPE additionally requires `torch_npu.npu_rms_norm`.
+Ascend support for `quantize_and_rotate_rowwise` requires
 `torch_npu.npu_rotate_quant`; `int8_linear` requires
 `torch_npu.npu_dynamic_quant` and `torch_npu.npu_quant_matmul`, while
 `convrot_w4a4_linear` requires only `torch_npu.npu_quant_matmul`.
@@ -79,7 +81,8 @@ The backend supports:
 - `dequantize_int8_simple` and `dequantize_int8_simple_dtype` on device
 - `quantize_and_rotate_rowwise` through `torch_npu.npu_rotate_quant`, when
   available
-- `int8_linear` through `torch_npu.npu_quant_matmul`, when available; ConvRot
+- `int8_linear` through `torch_npu.npu_dynamic_quant` and
+  `torch_npu.npu_quant_matmul`, when available; ConvRot
   uses `torch_npu.npu_rotate_quant` when supported and otherwise keeps the
   separate rotation and dynamic-quantization path
 - interleaved and split-half RoPE through `torch_npu.npu_rotary_mul`
