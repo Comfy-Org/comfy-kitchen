@@ -29,6 +29,7 @@ from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
 __all__ = [
     "dequantize_int8_simple",
     "dequantize_int8_simple_dtype",
+    "quantize_and_rotate_rowwise",
     "quantize_int8_rowwise",
     "quantize_int8_tensorwise",
     "int8_linear",
@@ -36,6 +37,7 @@ __all__ = [
 
 _ASCEND_AVAILABLE = False
 _ASCEND_QUANT_MATMUL_AVAILABLE = False
+_ASCEND_ROTATE_QUANT_AVAILABLE = False
 _ASCEND_ERROR: str | None = None
 
 try:
@@ -50,6 +52,7 @@ try:
     else:
         _ASCEND_AVAILABLE = True
         _ASCEND_QUANT_MATMUL_AVAILABLE = hasattr(torch_npu, "npu_quant_matmul")
+        _ASCEND_ROTATE_QUANT_AVAILABLE = hasattr(torch_npu, "npu_rotate_quant")
 except ImportError as exc:
     _ASCEND_ERROR = f"torch-npu is not installed: {exc}"
 except Exception as exc:
@@ -61,6 +64,10 @@ _DTYPE_CODE_TO_DTYPE = {
     1: torch.float16,
     2: torch.bfloat16,
 }
+
+_ROTATE_QUANT_DST_DTYPE_INT8 = 1
+_ROTATE_QUANT_MIN_FEATURES = 128
+_ROTATE_QUANT_MIN_GROUP_SIZE = 16
 
 
 def _validate_deterministic_quantization(kwargs) -> ValidationResult:
@@ -98,6 +105,76 @@ def _safe_scale(scale: torch.Tensor) -> torch.Tensor:
     # npu_dynamic_quant returns zero for an all-zero row. Comfy Kitchen's
     # quantization contract uses a small positive scale instead.
     return scale.clamp_min_(1e-30)
+
+
+def _validate_rotate_quant(kwargs) -> ValidationResult:
+    result = _validate_deterministic_quantization(kwargs)
+    if not result.success:
+        return result
+
+    x = kwargs.get("x")
+    h = kwargs.get("H", kwargs.get("h"))
+    group_size = kwargs.get("group_size")
+    if not isinstance(group_size, int) or group_size < _ROTATE_QUANT_MIN_GROUP_SIZE:
+        return ValidationResult.fail(
+            "group_size",
+            f"must be an integer greater than or equal to {_ROTATE_QUANT_MIN_GROUP_SIZE}",
+        )
+    if group_size % 8 != 0:
+        return ValidationResult.fail("group_size", "must be divisible by 8")
+    if not isinstance(x, torch.Tensor) or not isinstance(h, torch.Tensor):
+        return ValidationResult.ok()
+    if x.numel() == 0:
+        return ValidationResult.fail("x", "empty tensors are not supported by npu_rotate_quant")
+    if x.shape[-1] < _ROTATE_QUANT_MIN_FEATURES:
+        return ValidationResult.fail(
+            "x",
+            f"last dimension must be at least {_ROTATE_QUANT_MIN_FEATURES}",
+        )
+    if x.shape[-1] > _ROTATE_QUANT_MAX_FEATURES:
+        return ValidationResult.fail(
+            "x",
+            f"last dimension must not exceed {_ROTATE_QUANT_MAX_FEATURES}",
+        )
+    if x.shape[-1] % group_size != 0:
+        return ValidationResult.fail(
+            "group_size", f"{group_size} does not divide input features {x.shape[-1]}"
+        )
+    if h.shape != (group_size, group_size):
+        return ValidationResult.fail(
+            "H", f"must have shape ({group_size}, {group_size}), got {tuple(h.shape)}"
+        )
+    if h.device != x.device:
+        return ValidationResult.fail("H", "must be on the same device as x")
+    if h.dtype != x.dtype:
+        return ValidationResult.fail("H", "must have the same dtype as x")
+    return ValidationResult.ok()
+
+
+def _can_use_rotate_quant(x: torch.Tensor, h: torch.Tensor, group_size: int) -> bool:
+    if not _ASCEND_ROTATE_QUANT_AVAILABLE:
+        return False
+    return _validate_rotate_quant(
+        {
+            "x": x,
+            "H": h,
+            "group_size": group_size,
+            "stochastic_rounding": 0,
+        }
+    ).success
+
+
+def _npu_rotate_quant(x: torch.Tensor, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch_npu.npu_rotate_quant(
+        x,
+        h,
+        dst_dtype=_ROTATE_QUANT_DST_DTYPE_INT8,
+        axis=-1,
+        round_mode="rint",
+        scale_alg=0,
+        dst_type_max=0.0,
+        transpose_y=False,
+    )
 
 
 def _validate_int8_linear(kwargs) -> ValidationResult:
@@ -165,11 +242,18 @@ def quantize_int8_tensorwise(
     if scale is None or (isinstance(scale, str) and scale == "recalculate"):
         abs_max = x.abs().max()
         output_scale = (abs_max.float() / 127.0).clamp(min=1e-30)
+        quantization_scale = output_scale
     else:
         output_scale = torch.as_tensor(scale, dtype=torch.float32, device=x.device)
+        scale_min = torch.finfo(x.dtype).tiny
+        quantization_scale = torch.where(
+            output_scale == 0,
+            torch.full_like(output_scale, scale_min),
+            output_scale,
+        )
     quantized = torch_npu.npu_quantize(
         x,
-        output_scale.reshape(1),
+        quantization_scale.reshape(1),
         zero_points=None,
         dtype=torch.qint8,
         axis=-1,
@@ -186,6 +270,24 @@ def quantize_int8_rowwise(
     del stochastic_rounding
     quantized, scale = torch_npu.npu_dynamic_quant(x)
     return quantized, _safe_scale(scale).unsqueeze(-1)
+
+
+def quantize_and_rotate_rowwise(
+    x: torch.Tensor,
+    h: torch.Tensor,
+    group_size: int,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse grouped activation rotation and row-wise INT8 quantization."""
+    del stochastic_rounding
+    original_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    quantized, scale = _npu_rotate_quant(x_2d, h.contiguous())
+    scale = _safe_scale(scale)
+    return (
+        quantized.reshape(original_shape),
+        scale.reshape(*original_shape[:-1], 1),
+    )
 
 
 def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -232,6 +334,7 @@ def int8_linear(
             f"got {tuple(weight_scale.shape)} for weight shape {tuple(weight.shape)}"
         )
 
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     if convrot:
         if x.shape[-1] % convrot_groupsize != 0:
             raise ValueError(
@@ -239,10 +342,13 @@ def int8_linear(
                 f"input features {x.shape[-1]}"
             )
         hadamard = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
-        x = _rotate_activation(x, hadamard, convrot_groupsize)
-
-    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-    quantized_x, activation_scale = torch_npu.npu_dynamic_quant(x_2d)
+        if _can_use_rotate_quant(x_2d, hadamard, convrot_groupsize):
+            quantized_x, activation_scale = _npu_rotate_quant(x_2d, hadamard.contiguous())
+        else:
+            x_2d = _rotate_activation(x_2d, hadamard, convrot_groupsize)
+            quantized_x, activation_scale = torch_npu.npu_dynamic_quant(x_2d)
+    else:
+        quantized_x, activation_scale = torch_npu.npu_dynamic_quant(x_2d)
     npu_bias = None
     if bias is not None:
         npu_bias = bias.to(device=x.device, dtype=out_dtype).reshape(-1).contiguous()
@@ -263,7 +369,7 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
     ascend_floats = frozenset({torch.float16, torch.bfloat16})
     scale_values = frozenset({torch.float16, torch.bfloat16, torch.float32, float, int, str})
 
-    return {
+    constraints = {
         "quantize_int8_tensorwise": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=ascend_floats),
@@ -316,6 +422,19 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
             call_rules=(_validate_int8_linear,),
         ),
     }
+
+    if _ASCEND_ROTATE_QUANT_AVAILABLE:
+        constraints["quantize_and_rotate_rowwise"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=ascend_floats, shape_rules=(MinDims(2),)),
+                "H": ParamConstraint(dtypes=ascend_floats, shape_rules=(ExactDims(2),)),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+            },
+            default_devices=ascend_devices,
+            call_rules=(_validate_rotate_quant,),
+        )
+    return constraints
 
 
 if _ASCEND_AVAILABLE:

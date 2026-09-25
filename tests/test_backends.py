@@ -73,6 +73,8 @@ class TestBackendSystem:
             ]
             if hasattr(torch_npu, "npu_quant_matmul"):
                 expected_ascend_caps.insert(2, "int8_linear")
+            if hasattr(torch_npu, "npu_rotate_quant"):
+                expected_ascend_caps.insert(-2, "quantize_and_rotate_rowwise")
             assert ascend_caps == expected_ascend_caps
 
     def test_backend_context_manager_override(self, small_tensor):

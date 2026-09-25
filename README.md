@@ -31,12 +31,12 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `rms_rope_split_half1`      | ✓     | ✓    | ✓      | ✓   |     |
 | `quantize_int8_rowwise`     | ✓     | ✓    | ✓      | ✓   | ✓   |
 | `quantize_int8_tensorwise`  | ✓     | ✓    |        | ✓   | ✓   |
-| `quantize_and_rotate_rowwise` | ✓   | ✓    | ✓      | ✓   |     |
+| `quantize_and_rotate_rowwise` | ✓   | ✓    | ✓      | ✓   | ✓*  |
 | `quantize_int8_convrot_weight` | ✓  | ✓    |        | ✓   |     |
 | `dequantize_int8_simple`    | ✓     | ✓    |        | ✓   | ✓   |
 | `dequantize_int8_simple_dtype` | ✓  | ✓    |        | ✓   | ✓   |
 | `dequantize_int8_convrot_weight_dtype` | ✓ | ✓ |    | ✓   |     |
-| `int8_linear`               | ✓     | ✓    | ✓      | ✓   |     |
+| `int8_linear`               | ✓     | ✓    | ✓      | ✓   | ✓*  |
 | `gemv_awq_w4a16`            | ✓     | ✓    |        | ✓   |     |
 | `quantize_svdquant_w4a4`    | ✓     | ✓    |        | ✓   |     |
 | `scaled_mm_svdquant_w4a4`   | ✓     | ✓    |        | ✓   |     |
@@ -46,6 +46,11 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 
 Each of the eight rope entries also has an in-place form (`apply_rope_`,
 `rms_rope_split_half1_`, ...) with the same backend coverage as the row above.
+
+\* Ascend support for `quantize_and_rotate_rowwise` requires
+`torch_npu.npu_rotate_quant`; `int8_linear` requires
+`torch_npu.npu_quant_matmul`. These capabilities are registered only when the
+corresponding operator is available.
 
 ## Huawei Ascend backend
 
@@ -60,6 +65,11 @@ The initial backend supports:
 - `quantize_int8_tensorwise` through Ascend reduction operators and
   `torch_npu.npu_quantize`
 - `dequantize_int8_simple` and `dequantize_int8_simple_dtype` on device
+- `quantize_and_rotate_rowwise` through `torch_npu.npu_rotate_quant`, when
+  available
+- `int8_linear` through `torch_npu.npu_quant_matmul`, when available; ConvRot
+  uses `torch_npu.npu_rotate_quant` when supported and otherwise keeps the
+  separate rotation and dynamic-quantization path
 
 Unsupported dtypes and stochastic rounding continue through another capable
 backend instead of copying tensors to the CPU.
