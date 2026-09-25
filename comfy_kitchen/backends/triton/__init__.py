@@ -394,13 +394,11 @@ def _register():
             for device in range(torch.cuda.device_count())
         }
         unsupported_architectures = architectures & _TRITON_UNSUPPORTED_HIP_ARCHS
-        if unsupported_architectures or any(
-            arch.startswith("gfx10") for arch in architectures
-        ):
+        if unsupported_architectures:
             registry.mark_unavailable(
                 "triton",
                 "Triton is unsupported on ROCm architecture "
-                f"{sorted(unsupported_architectures or architectures)[0]}",
+                f"{sorted(unsupported_architectures)[0]}",
             )
             return
 

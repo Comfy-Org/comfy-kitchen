@@ -392,16 +392,23 @@ class TestTensorWiseINT8Layout:
         """Roundtrip error stays within INT8 quantization tolerance."""
         from comfy_kitchen.tensor import QuantizedTensor
 
-        if (
-            "gfx90c" in architectures
-            or "gfx900" in architectures
-            or "gfx906" in architectures
-        ):
-            registry.mark_unavailable(
-                "triton",
-                "Triton is unsupported on ROCm architectures gfx90c, gfx900, and gfx906",
-            )
-            return
+        if getattr(torch.version, "hip", None):
+            architectures = {
+                torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+                for device in range(torch.cuda.device_count())
+            }
+            unsupported_architectures = architectures & {"gfx900", "gfx906", "gfx90c"}
+            if unsupported_architectures:
+                pytest.skip(
+                    "Triton is unsupported on ROCm architecture "
+                    f"{sorted(unsupported_architectures)[0]}"
+                )
+
+        w = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(w, "TensorWiseINT8Layout")
+        dq = qt.dequantize()
+        rel_err = (w.float() - dq.float()).abs() / (w.float().abs().max() + 1e-8)
+
         assert (
             rel_err.mean().item() < 0.02
         ), f"Mean relative error too high: {rel_err.mean():.4f}"

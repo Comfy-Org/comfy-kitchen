@@ -813,6 +813,7 @@ def fp16_linear(
         supported = weight.data_ptr() % 16 == 0
     if not supported:
         # the kernel path takes bias and residual from any device, so the fallback must too
+        weight = weight.to(device=x.device)
         bias = None if bias is None else bias.to(device=x.device)
         if residual is not None:
             residual = residual.to(device=x.device)
