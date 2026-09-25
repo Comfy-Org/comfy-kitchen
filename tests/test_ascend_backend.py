@@ -494,6 +494,75 @@ def test_int8_linear_supports_batched_input(ascend_device):
 
 
 @requires_npu_quant_matmul
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("convrot", [False, True])
+def test_int8_linear_supports_norm_and_residual_arguments(ascend_device, dtype, convrot):
+    from comfy_kitchen.backends._activations import apply_input_act, apply_residual
+
+    x = torch.randn(2, 3, 128, device=ascend_device, dtype=dtype)
+    weight = torch.randint(-127, 128, (64, 128), device=ascend_device, dtype=torch.int8)
+    weight_scale = torch.rand(64, device=ascend_device) / 127
+    norm_weight = torch.randn(128, device=ascend_device)
+    residual = torch.randn(2, 3, 64, device=ascend_device)
+    residual_scale = torch.randn(64, device=ascend_device)
+    normalized = apply_input_act(x, "rms_norm", norm_weight, 1e-5)
+
+    with ck.use_backend("ascend"):
+        plain = ck.int8_linear(
+            normalized,
+            weight,
+            weight_scale,
+            out_dtype=dtype,
+            convrot=convrot,
+            convrot_groupsize=64,
+        )
+        actual = ck.int8_linear(
+            x,
+            weight,
+            weight_scale,
+            out_dtype=dtype,
+            convrot=convrot,
+            convrot_groupsize=64,
+            input_act="rms_norm",
+            input_act_weight=norm_weight,
+            input_act_eps=1e-5,
+            residual=residual,
+            residual_scale=residual_scale,
+        )
+    expected = apply_residual(plain, residual, residual_scale)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "flag,absent,present",
+    [
+        ("_ASCEND_QUANT_AVAILABLE", "quantize_int8_rowwise", "apply_rope1"),
+        ("_ASCEND_QUANT_MATMUL_AVAILABLE", "int8_linear", "apply_rope1"),
+        ("_ASCEND_ROTATE_QUANT_AVAILABLE", "quantize_and_rotate_rowwise", "int8_linear"),
+    ],
+)
+def test_ascend_capabilities_are_independent(monkeypatch, flag, absent, present):
+    if not ascend_backend._ASCEND_ROPE_AVAILABLE:
+        pytest.skip("compatible rotary operator required")
+    monkeypatch.setattr(ascend_backend, "_ASCEND_QUANT_MATMUL_AVAILABLE", True)
+    monkeypatch.setattr(ascend_backend, flag, False)
+    capabilities = ascend_backend._build_constraints()
+    assert absent not in capabilities
+    assert present in capabilities
+
+
+def test_missing_dynamic_quant_keeps_w4a4_and_rope(monkeypatch):
+    if not ascend_backend._ASCEND_ROPE_AVAILABLE:
+        pytest.skip("compatible rotary operator required")
+    monkeypatch.setattr(ascend_backend, "_ASCEND_QUANT_MATMUL_AVAILABLE", True)
+    monkeypatch.delattr(torch_npu, "npu_dynamic_quant", raising=False)
+    capabilities = ascend_backend._build_constraints()
+    assert "int8_linear" not in capabilities
+    assert "convrot_w4a4_linear" in capabilities
+    assert "apply_rope1" in capabilities
+
+
+@requires_npu_quant_matmul
 @pytest.mark.parametrize("input_act", [None, "gelu_tanh", "swiglu"])
 def test_convrot_int8_linear_matches_reference(ascend_device, input_act):
     from comfy_kitchen.backends._activations import apply_input_act

@@ -14,6 +14,9 @@ from comfy_kitchen.backends._activations import (
     apply_input_act as _apply_input_act,
 )
 from comfy_kitchen.backends._activations import (
+    apply_residual as _apply_residual,
+)
+from comfy_kitchen.backends._activations import (
     input_act_width as _input_act_width,
 )
 from comfy_kitchen.backends.eager.convrot_w4a4 import quantize_signed_int4_rowwise
@@ -269,7 +272,7 @@ def _validate_int8_linear(kwargs) -> ValidationResult:
     bias = kwargs.get("bias")
     input_act = kwargs.get("input_act")
 
-    if input_act not in (None, "none", "gelu_tanh", "swiglu"):
+    if input_act not in (None, "none", "gelu_tanh", "swiglu", "rms_norm"):
         return ValidationResult.fail("input_act", f"unsupported value {input_act!r}")
     if not isinstance(x, torch.Tensor) or not isinstance(weight, torch.Tensor):
         return ValidationResult.ok()
@@ -277,6 +280,14 @@ def _validate_int8_linear(kwargs) -> ValidationResult:
         return ValidationResult.fail("x", "empty tensors are not supported by npu_quant_matmul")
 
     input_features = x.shape[-1]
+    if input_act == "rms_norm":
+        norm_weight = kwargs.get("input_act_weight")
+        if not isinstance(norm_weight, torch.Tensor) or norm_weight.shape != (input_features,):
+            return ValidationResult.fail(
+                "input_act_weight", "rms_norm requires a one-dimensional input-channel weight"
+            )
+    if kwargs.get("residual") is not None and kwargs.get("residual_scale") is None:
+        return ValidationResult.fail("residual_scale", "required when residual is provided")
     width = _input_act_width(input_act)
     if input_features % width != 0:
         return ValidationResult.fail(
@@ -461,6 +472,10 @@ def int8_linear(
     convrot: bool = False,
     convrot_groupsize: int = 256,
     input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run dynamically quantized INT8 linear on Ascend NPU.
 
@@ -469,7 +484,7 @@ def int8_linear(
     a full weight copy on every forward pass.
     """
     orig_shape = x.shape
-    x = _apply_input_act(x, input_act)
+    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
     if x.shape[-1] != weight.shape[-1]:
         raise ValueError(
             "Input and weight inner dimensions must match, "
@@ -511,7 +526,8 @@ def int8_linear(
         bias=npu_bias,
         output_dtype=out_dtype,
     )
-    return result.reshape(*orig_shape[:-1], weight.shape[0])
+    result = result.reshape(*orig_shape[:-1], weight.shape[0])
+    return _apply_residual(result, residual, residual_scale)
 
 
 def convrot_w4a4_linear(
@@ -600,6 +616,10 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
                 "convrot": ParamConstraint(dtypes=frozenset({bool})),
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
                 "input_act": ParamConstraint(dtypes=frozenset({str})),
+                "input_act_weight": ParamConstraint(dtypes=ascend_linear_floats),
+                "input_act_eps": ParamConstraint(dtypes=frozenset({float, int})),
+                "residual": ParamConstraint(dtypes=ascend_linear_floats),
+                "residual_scale": ParamConstraint(dtypes=ascend_linear_floats),
             },
             default_devices=ascend_devices,
             call_rules=(_validate_int8_linear,),
