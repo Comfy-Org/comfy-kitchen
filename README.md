@@ -21,14 +21,14 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `na2d`                      | ✓     | ✓    | ✓      | ✓   |     |
 | `sol_attn`                  | ✓     | ✓    |        | ✓   |     |
 | `int8_attention`            |       | ✓    |        | ✓   |     |
-| `apply_rope`                | ✓     | ✓    | ✓      | ✓   |     |
-| `apply_rope1`               | ✓     | ✓    | ✓      | ✓   |     |
-| `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   |     |
-| `apply_rope_split_half1`    | ✓     | ✓    | ✓      | ✓   |     |
-| `rms_rope`                  | ✓     | ✓    | ✓      | ✓   |     |
-| `rms_rope1`                 | ✓     | ✓    | ✓      | ✓   |     |
-| `rms_rope_split_half`       | ✓     | ✓    | ✓      | ✓   |     |
-| `rms_rope_split_half1`      | ✓     | ✓    | ✓      | ✓   |     |
+| `apply_rope`                | ✓     | ✓    | ✓      | ✓   | ✓   |
+| `apply_rope1`               | ✓     | ✓    | ✓      | ✓   | ✓   |
+| `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   | ✓   |
+| `apply_rope_split_half1`    | ✓     | ✓    | ✓      | ✓   | ✓   |
+| `rms_rope`                  | ✓     | ✓    | ✓      | ✓   | ✓   |
+| `rms_rope1`                 | ✓     | ✓    | ✓      | ✓   | ✓   |
+| `rms_rope_split_half`       | ✓     | ✓    | ✓      | ✓   | ✓   |
+| `rms_rope_split_half1`      | ✓     | ✓    | ✓      | ✓   | ✓   |
 | `quantize_int8_rowwise`     | ✓     | ✓    | ✓      | ✓   | ✓   |
 | `quantize_int8_tensorwise`  | ✓     | ✓    |        | ✓   | ✓   |
 | `quantize_and_rotate_rowwise` | ✓   | ✓    | ✓      | ✓   | ✓*  |
@@ -59,7 +59,7 @@ hardware. It is registered only when torch-npu and an Ascend device are
 available, so comfy-kitchen keeps importing normally on CPU, CUDA, HIP, and XPU
 installations. The PyTorch device type remains `npu`, as defined by torch-npu.
 
-The initial backend supports:
+The backend supports:
 
 - `quantize_int8_rowwise` through `torch_npu.npu_dynamic_quant`
 - `quantize_int8_tensorwise` through Ascend reduction operators and
@@ -70,9 +70,16 @@ The initial backend supports:
 - `int8_linear` through `torch_npu.npu_quant_matmul`, when available; ConvRot
   uses `torch_npu.npu_rotate_quant` when supported and otherwise keeps the
   separate rotation and dynamic-quantization path
+- interleaved and split-half RoPE through `torch_npu.npu_rotary_mul`
+- RMS-RoPE through `torch_npu.npu_rms_norm` followed by
+  `torch_npu.npu_rotary_mul`
 
 Unsupported dtypes and stochastic rounding continue through another capable
 backend instead of copying tensors to the CPU.
+
+The RoPE implementations support four-dimensional BNSD and BSND tensors,
+including packed-QKV views whose final dimension is contiguous. Unsupported
+broadcast patterns and layouts continue through another capable backend.
 
 ## HIP backend (AMD RDNA2 / RDNA3 / RDNA3.5 / RDNA4)
 
