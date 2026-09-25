@@ -2,12 +2,16 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
-from comfy_kitchen.exceptions import NoCapableBackendError
+from comfy_kitchen.exceptions import BackendNotImplementedError, NoCapableBackendError
 from comfy_kitchen.registry import registry
 
 from .conftest import get_supported_devices
 
 torch_npu = pytest.importorskip("torch_npu")
+requires_npu_quant_matmul = pytest.mark.skipif(
+    not hasattr(torch_npu, "npu_quant_matmul"),
+    reason="torch-npu with npu_quant_matmul is required",
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.npu.is_available(), reason="Huawei Ascend device required"
@@ -102,6 +106,22 @@ def test_ascend_is_selected_automatically(ascend_device):
     )
     assert selected == "ascend"
 
+    linear_call = {
+        "x": x,
+        "weight": torch.ones(16, 32, device=ascend_device, dtype=torch.int8),
+        "weight_scale": torch.ones(16, device=ascend_device),
+        "out_dtype": torch.bfloat16,
+    }
+    if not hasattr(torch_npu, "npu_quant_matmul"):
+        with pytest.raises(BackendNotImplementedError):
+            registry.get_implementation(
+                "int8_linear", backend="ascend", kwargs=linear_call
+            )
+        return
+
+    selected = registry.get_capable_backend("int8_linear", linear_call)
+    assert selected == "ascend"
+
 
 def test_get_supported_devices_includes_torch_npu_device_type():
     assert "npu" in get_supported_devices("quantize_int8_rowwise")
@@ -135,3 +155,114 @@ def test_unsupported_dtype_uses_device_side_eager_fallback(ascend_device):
     q, scale = ck.quantize_int8_rowwise(x)
     assert q.device.type == "npu"
     assert scale.device.type == "npu"
+
+
+def _int8_linear_reference(x, weight, weight_scale, bias=None):
+    quantized_x, activation_scale = torch_npu.npu_dynamic_quant(x)
+    output = torch.matmul(quantized_x.float(), weight.t().float())
+    output *= activation_scale.reshape(-1, 1)
+    output *= weight_scale.reshape(1, -1)
+    if bias is not None:
+        output += bias.reshape(1, -1)
+    return output
+
+
+@requires_npu_quant_matmul
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("scalar_weight_scale", [False, True])
+def test_int8_linear_matches_reference(ascend_device, dtype, with_bias, scalar_weight_scale):
+    m, n, k = 17, 64, 128
+    x = torch.randn(m, k, device=ascend_device, dtype=dtype)
+    weight = torch.randint(-127, 128, (n, k), device=ascend_device, dtype=torch.int8)
+    scale_shape = (1,) if scalar_weight_scale else (n,)
+    weight_scale = torch.rand(scale_shape, device=ascend_device, dtype=torch.float32) / 127
+    bias = torch.randn(n, device=ascend_device, dtype=torch.float32) if with_bias else None
+
+    expected = _int8_linear_reference(x, weight, weight_scale, bias).to(dtype)
+    with ck.use_backend("ascend"):
+        actual = ck.int8_linear(x, weight, weight_scale, bias=bias, out_dtype=dtype)
+
+    assert actual.device.type == "npu"
+    assert actual.shape == (m, n)
+    assert actual.dtype == dtype
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@requires_npu_quant_matmul
+def test_int8_linear_supports_batched_input(ascend_device):
+    x = torch.randn(2, 3, 128, device=ascend_device, dtype=torch.bfloat16)
+    weight = torch.randint(-127, 128, (64, 128), device=ascend_device, dtype=torch.int8)
+    weight_scale = torch.rand(64, 1, device=ascend_device, dtype=torch.float32) / 127
+
+    with ck.use_backend("ascend"):
+        output = ck.int8_linear(x, weight, weight_scale)
+
+    assert output.shape == (2, 3, 64)
+    assert output.device.type == "npu"
+
+
+@requires_npu_quant_matmul
+@pytest.mark.parametrize("input_act", [None, "gelu_tanh", "swiglu"])
+def test_convrot_int8_linear_matches_reference(ascend_device, input_act):
+    from comfy_kitchen.backends._activations import apply_input_act
+    from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
+
+    m, n, k = 9, 64, 128
+    raw_k = k * 2 if input_act == "swiglu" else k
+    x = torch.randn(m, raw_k, device=ascend_device, dtype=torch.bfloat16)
+    weight = torch.randint(-127, 128, (n, k), device=ascend_device, dtype=torch.int8)
+    weight_scale = torch.rand(n, device=ascend_device, dtype=torch.float32) / 127
+    bias = torch.randn(n, device=ascend_device, dtype=torch.bfloat16)
+
+    activated = apply_input_act(x, input_act)
+    hadamard = _build_hadamard(64, device=ascend_device, dtype=x.dtype)
+    rotated = _rotate_activation(activated, hadamard, 64)
+    expected = _int8_linear_reference(rotated, weight, weight_scale, bias).bfloat16()
+
+    with ck.use_backend("ascend"):
+        actual = ck.int8_linear(
+            x,
+            weight,
+            weight_scale,
+            bias=bias,
+            convrot=True,
+            convrot_groupsize=64,
+            input_act=input_act,
+        )
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@requires_npu_quant_matmul
+@pytest.mark.parametrize(
+    "kwargs,failed_param",
+    [
+        ({"weight_scale_size": 3}, "weight_scale"),
+        ({"bias_size": 3}, "bias"),
+        ({"weight_k": 64}, "weight"),
+        ({"convrot": True, "convrot_groupsize": 32}, "convrot_groupsize"),
+        ({"input_act": "silu"}, "input_act"),
+    ],
+)
+def test_int8_linear_declines_unsupported_contracts(ascend_device, kwargs, failed_param):
+    x = torch.randn(4, 128, device=ascend_device, dtype=torch.bfloat16)
+    weight = torch.ones(64, kwargs.get("weight_k", 128), device=ascend_device, dtype=torch.int8)
+    weight_scale = torch.ones(
+        kwargs.get("weight_scale_size", 64), device=ascend_device, dtype=torch.float32
+    )
+    bias = torch.ones(kwargs.get("bias_size", 64), device=ascend_device, dtype=torch.bfloat16)
+    call = {
+        "x": x,
+        "weight": weight,
+        "weight_scale": weight_scale,
+        "bias": bias,
+        "out_dtype": torch.bfloat16,
+        "convrot": kwargs.get("convrot", False),
+        "convrot_groupsize": kwargs.get("convrot_groupsize", 64),
+        "input_act": kwargs.get("input_act"),
+    }
+
+    result = registry.validate_backend_for_call("ascend", "int8_linear", call)
+    assert not result.success
+    assert result.failed_param == failed_param

@@ -10,22 +10,32 @@ from __future__ import annotations
 
 import torch
 
+from comfy_kitchen.backends._activations import (
+    apply_input_act as _apply_input_act,
+)
+from comfy_kitchen.backends._activations import (
+    input_act_width as _input_act_width,
+)
 from comfy_kitchen.constraints import (
+    ExactDims,
     FunctionConstraints,
     MinDims,
     ParamConstraint,
     ValidationResult,
 )
 from comfy_kitchen.registry import registry
+from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
 
 __all__ = [
     "dequantize_int8_simple",
     "dequantize_int8_simple_dtype",
     "quantize_int8_rowwise",
     "quantize_int8_tensorwise",
+    "int8_linear",
 ]
 
 _ASCEND_AVAILABLE = False
+_ASCEND_QUANT_MATMUL_AVAILABLE = False
 _ASCEND_ERROR: str | None = None
 
 try:
@@ -39,6 +49,7 @@ try:
         _ASCEND_ERROR = "torch-npu does not provide npu_quantize"
     else:
         _ASCEND_AVAILABLE = True
+        _ASCEND_QUANT_MATMUL_AVAILABLE = hasattr(torch_npu, "npu_quant_matmul")
 except ImportError as exc:
     _ASCEND_ERROR = f"torch-npu is not installed: {exc}"
 except Exception as exc:
@@ -89,6 +100,60 @@ def _safe_scale(scale: torch.Tensor) -> torch.Tensor:
     return scale.clamp_min_(1e-30)
 
 
+def _validate_int8_linear(kwargs) -> ValidationResult:
+    x = kwargs.get("x")
+    weight = kwargs.get("weight")
+    weight_scale = kwargs.get("weight_scale")
+    bias = kwargs.get("bias")
+    input_act = kwargs.get("input_act")
+
+    if input_act not in (None, "none", "gelu_tanh", "swiglu"):
+        return ValidationResult.fail("input_act", f"unsupported value {input_act!r}")
+    if not isinstance(x, torch.Tensor) or not isinstance(weight, torch.Tensor):
+        return ValidationResult.ok()
+    if x.numel() == 0 or weight.numel() == 0:
+        return ValidationResult.fail("x", "empty tensors are not supported by npu_quant_matmul")
+
+    input_features = x.shape[-1]
+    width = _input_act_width(input_act)
+    if input_features % width != 0:
+        return ValidationResult.fail(
+            "x", f"last dimension {input_features} is not divisible by activation width {width}"
+        )
+    activated_features = input_features // width
+    if activated_features != weight.shape[-1]:
+        return ValidationResult.fail(
+            "weight",
+            f"input features {activated_features} do not match weight features {weight.shape[-1]}",
+        )
+    if weight_scale is not None and weight_scale.numel() not in (1, weight.shape[0]):
+        return ValidationResult.fail(
+            "weight_scale",
+            f"must be scalar or contain {weight.shape[0]} per-output-channel values",
+        )
+    if bias is not None and bias.numel() != weight.shape[0]:
+        return ValidationResult.fail(
+            "bias", f"must contain {weight.shape[0]} output-channel values"
+        )
+
+    if kwargs.get("convrot"):
+        group_size = kwargs.get("convrot_groupsize", 256)
+        is_power_of_four = (
+            isinstance(group_size, int)
+            and group_size >= 4
+            and (group_size & (group_size - 1)) == 0
+            and (group_size.bit_length() - 1) % 2 == 0
+        )
+        if not is_power_of_four:
+            return ValidationResult.fail("convrot_groupsize", "must be a positive power of four")
+        if activated_features % group_size != 0:
+            return ValidationResult.fail(
+                "convrot_groupsize",
+                f"{group_size} does not divide input features {activated_features}",
+            )
+    return ValidationResult.ok()
+
+
 def quantize_int8_tensorwise(
     x: torch.Tensor,
     scale: torch.Tensor | float | str | None = None,
@@ -135,6 +200,64 @@ def dequantize_int8_simple_dtype(
     return dequantize_int8_simple(q, scale).to(_DTYPE_CODE_TO_DTYPE[output_dtype_code])
 
 
+def int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+    input_act: str | None = None,
+) -> torch.Tensor:
+    """Run dynamically quantized INT8 linear on Ascend NPU.
+
+    Comfy Kitchen stores weights as ``[N, K]``. ``npu_quant_matmul`` accepts
+    the resulting non-contiguous ``[K, N]`` transpose view directly, avoiding
+    a full weight copy on every forward pass.
+    """
+    orig_shape = x.shape
+    x = _apply_input_act(x, input_act)
+    if x.shape[-1] != weight.shape[-1]:
+        raise ValueError(
+            "Input and weight inner dimensions must match, "
+            f"got {x.shape[-1]} and {weight.shape[-1]}"
+        )
+
+    weight = weight.to(device=x.device).contiguous()
+    weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1)
+    if weight_scale.numel() not in (1, weight.shape[0]):
+        raise ValueError(
+            "INT8 weight scale must be scalar or per-output-channel, "
+            f"got {tuple(weight_scale.shape)} for weight shape {tuple(weight.shape)}"
+        )
+
+    if convrot:
+        if x.shape[-1] % convrot_groupsize != 0:
+            raise ValueError(
+                f"ConvRot group size {convrot_groupsize} does not divide "
+                f"input features {x.shape[-1]}"
+            )
+        hadamard = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        x = _rotate_activation(x, hadamard, convrot_groupsize)
+
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    quantized_x, activation_scale = torch_npu.npu_dynamic_quant(x_2d)
+    npu_bias = None
+    if bias is not None:
+        npu_bias = bias.to(device=x.device, dtype=out_dtype).reshape(-1).contiguous()
+
+    result = torch_npu.npu_quant_matmul(
+        quantized_x,
+        weight.t(),
+        weight_scale.contiguous(),
+        pertoken_scale=activation_scale.reshape(-1).contiguous(),
+        bias=npu_bias,
+        output_dtype=out_dtype,
+    )
+    return result.reshape(*orig_shape[:-1], weight.shape[0])
+
+
 def _build_constraints() -> dict[str, FunctionConstraints]:
     ascend_devices = frozenset({"npu"})
     ascend_floats = frozenset({torch.float16, torch.bfloat16})
@@ -174,14 +297,35 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
             default_devices=ascend_devices,
             call_rules=(_validate_output_dtype,),
         ),
+        "int8_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=ascend_floats, shape_rules=(MinDims(2),)),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)
+                ),
+                "weight_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "bias": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16, torch.float32})
+                ),
+                "out_dtype": ParamConstraint(dtypes=ascend_floats),
+                "convrot": ParamConstraint(dtypes=frozenset({bool})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "input_act": ParamConstraint(dtypes=frozenset({str})),
+            },
+            default_devices=ascend_devices,
+            call_rules=(_validate_int8_linear,),
+        ),
     }
 
 
 if _ASCEND_AVAILABLE:
+    capabilities = _build_constraints()
+    if not _ASCEND_QUANT_MATMUL_AVAILABLE:
+        capabilities.pop("int8_linear")
     registry.register(
         name="ascend",
         module=__import__(__name__, fromlist=__all__),
-        capabilities=_build_constraints(),
+        capabilities=capabilities,
     )
 else:
     registry.mark_unavailable("ascend", _ASCEND_ERROR or "Huawei Ascend backend is unavailable")
