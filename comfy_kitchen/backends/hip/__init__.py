@@ -21,6 +21,7 @@ import logging
 import os
 import pathlib
 import sys
+import threading
 import weakref
 from collections.abc import Sequence
 
@@ -259,6 +260,7 @@ def _stream(t: torch.Tensor) -> int:
     return torch.cuda.current_stream(t.device).cuda_stream
 
 
+_pending_host_operands_lock = threading.Lock()
 _pending_host_operands: list[tuple[torch.cuda.Event, torch.Tensor]] = []
 
 
@@ -266,15 +268,16 @@ def _retain_host_operands_until_stream_complete(
     operands: list[torch.Tensor], device: torch.device
 ) -> None:
     """Keep temporary mapped host operands alive until their launch finishes."""
-    _pending_host_operands[:] = [
-        (event, operand)
-        for event, operand in _pending_host_operands
-        if not event.query()
-    ]
-    if operands:
-        event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream(device))
-        _pending_host_operands.extend((event, operand) for operand in operands)
+    with _pending_host_operands_lock:
+        _pending_host_operands[:] = [
+            (event, operand)
+            for event, operand in _pending_host_operands
+            if not event.query()
+        ]
+        if operands:
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(device))
+            _pending_host_operands.extend((event, operand) for operand in operands)
 
 
 # The epilogues read a scalar per element with one dtype code.
@@ -1522,7 +1525,13 @@ def convrot_w4a4_linear(
         )
     if not _convrot_supported(x.shape[-1], convrot_groupsize, x.device, x.dtype):
         return _eager.convrot_w4a4_linear(
-            x, qweight, wscales, bias, convrot_groupsize, quant_group_size, linear_dtype
+            x,
+            qweight.to(device=x.device),
+            wscales,
+            bias,
+            convrot_groupsize,
+            quant_group_size,
+            linear_dtype,
         )
 
     if linear_dtype == "int8":
