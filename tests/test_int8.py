@@ -363,7 +363,9 @@ class TestTensorWiseINT8Layout:
 
     @pytest.mark.parametrize("group_size", [64, 256])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-    def test_convrot_dequant_kernel_matches_float32_reference(self, seed, group_size, dtype):
+    def test_convrot_dequant_kernel_matches_float32_reference(
+        self, seed, group_size, dtype
+    ):
         """The fused ConvRot dequant rotates in float32 and rounds to the output dtype once, like the
         float32 rotate-then-cast reference, including rows whose scale is near zero."""
         if not cuda_backend_available():
@@ -375,7 +377,9 @@ class TestTensorWiseINT8Layout:
         scale = torch.rand(rows, 1, device="cuda") * 1e-2
         scale[0] = 1e-9
         assert cuda._should_use_convrot_dequant_kernel(q, k, group_size)
-        out = cuda.dequantize_int8_convrot_weight_dtype(q, scale, group_size, cuda.DTYPE_TO_CODE[dtype])
+        out = cuda.dequantize_int8_convrot_weight_dtype(
+            q, scale, group_size, cuda.DTYPE_TO_CODE[dtype]
+        )
         h = _build_hadamard(group_size, device="cuda", dtype=torch.float32)
         ref = _rotate_weight(q.float() * scale, h, group_size)
         assert out.dtype == dtype
@@ -1031,6 +1035,25 @@ class TestTensorWisePublicAPI:
         result = quantization._int8_matmul_accumulate(a, b)
 
         assert result.dtype == torch.int32
+        assert torch.equal(result, expected)
+
+    @pytest.mark.parametrize("arch", ("gfx90c", "gfx1030"))
+    def test_eager_int8_matmul_float_fallback_is_exact_for_large_k(
+        self, monkeypatch, arch
+    ):
+        from comfy_kitchen.backends.eager import quantization
+
+        a = torch.full((1, 2049), 127, dtype=torch.int8)
+        b = torch.full((2049, 1), 127, dtype=torch.int8)
+        expected = a.to(torch.int32) @ b.to(torch.int32)
+        monkeypatch.setattr(
+            quantization,
+            "_requires_float_int8_mm",
+            lambda tensor: arch == "gfx90c" or arch.startswith("gfx10"),
+        )
+
+        result = quantization._int8_matmul_accumulate(a, b)
+
         assert torch.equal(result, expected)
 
     def test_eager_int8_linear_pads_k_to_int8_mm_tile(self, seed, device):

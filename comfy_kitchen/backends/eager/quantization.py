@@ -837,7 +837,14 @@ def _requires_float_int8_mm(tensor: torch.Tensor) -> bool:
 def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Multiply INT8 matrices and return INT32 accumulators."""
     if _requires_float_int8_mm(a):
-        return torch.matmul(a.float(), b.float()).round().to(torch.int32)
+        # 1024 * 128**2 is 2**24, so every partial dot product is exact in float32.
+        chunk_size = 1024
+        result = torch.zeros((a.size(0), b.size(1)), device=a.device, dtype=torch.int32)
+        for start in range(0, a.size(1), chunk_size):
+            end = start + chunk_size
+            partial = torch.matmul(a[:, start:end].float(), b[start:end].float())
+            result.add_(partial.round().to(torch.int32))
+        return result
 
     def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
         if hasattr(torch, "int8_mm"):
@@ -912,8 +919,8 @@ def _int8_stochastic_rng(x: torch.Tensor, seed: int) -> torch.Tensor:
 
 
 def _int8_scale_for_math(scale: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    scale = scale.to(device=x.device, dtype=x.dtype)
-    scale_min = torch.finfo(x.dtype).tiny
+    scale = scale.to(device=x.device, dtype=torch.float32)
+    scale_min = torch.finfo(torch.float32).tiny
     return torch.where(scale == 0, torch.full_like(scale, scale_min), scale)
 
 

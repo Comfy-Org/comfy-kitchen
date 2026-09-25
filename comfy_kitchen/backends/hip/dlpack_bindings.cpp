@@ -11,6 +11,7 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 
+#include "architecture_config.h"
 #include "launchers.h"
 
 namespace nb = nanobind;
@@ -1463,7 +1464,20 @@ constexpr int kSageCtaQ = 128;
 constexpr int kSageCtaK = 64;
 constexpr int kSageKeyGroup = 16;
 
-static void sage_require_wave32(const nb::ndarray<> &tensor, const char *fn) {
+static bool sage_is_supported_arch(const char *gcn_arch_name) {
+  static constexpr const char *kSupportedArchNames[] = {
+      COMFY_HIP_SUPPORTED_ARCH_NAMES};
+  const std::string arch(gcn_arch_name);
+  const std::string base_arch = arch.substr(0, arch.find(':'));
+  for (const char *validated_arch : kSupportedArchNames) {
+    if (base_arch == validated_arch)
+      return true;
+  }
+  return false;
+}
+
+static void sage_require_supported_arch(const nb::ndarray<> &tensor,
+                                        const char *fn) {
   hipDeviceProp_t properties{};
   const hipError_t err =
       hipGetDeviceProperties(&properties, tensor.device_id());
@@ -1472,10 +1486,11 @@ static void sage_require_wave32(const nb::ndarray<> &tensor, const char *fn) {
         std::string(fn) +
         ": could not query HIP device properties: " + hipGetErrorString(err));
   }
-  if (properties.warpSize != 32) {
+  if (!sage_is_supported_arch(properties.gcnArchName)) {
     throw std::runtime_error(
-        std::string(fn) + ": requires wave32; device reports wavefront size " +
-        std::to_string(properties.warpSize));
+        std::string(fn) +
+        ": requires a validated HIP attention architecture; device is " +
+        properties.gcnArchName);
   }
 }
 
@@ -1749,7 +1764,7 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
                int input_dtype_code, int output_dtype_code,
                uintptr_t stream_ptr, OptArray attn_mask = std::nullopt) {
   constexpr const char *kFn = "sage_sdpa";
-  sage_require_wave32(q, kFn);
+  sage_require_supported_arch(q, kFn);
   sage_check_shapes(q, k, v, kFn);
   sage_check_cta_k(cta_k, kFn);
   const auto stream = reinterpret_cast<hipStream_t>(stream_ptr);
@@ -1778,7 +1793,7 @@ void sage_sdpa_quantize(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
                         nb::ndarray<> anchor_indices, int cta_k,
                         int input_dtype_code, uintptr_t stream_ptr) {
   constexpr const char *kFn = "sage_sdpa_quantize";
-  sage_require_wave32(q, kFn);
+  sage_require_supported_arch(q, kFn);
   sage_check_shapes(q, k, v, kFn);
   sage_check_cta_k(cta_k, kFn);
   sage_quantize(q, k, v, q_int8, q_scale, k_int8, k_scale, v_int8, v_scale,
@@ -1796,7 +1811,7 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8,
                             int output_dtype_code, uintptr_t stream_ptr,
                             OptArray attn_mask = std::nullopt) {
   constexpr const char *kFn = "sage_sdpa_prequantized";
-  sage_require_wave32(q_int8, kFn);
+  sage_require_supported_arch(q_int8, kFn);
   if (q_int8.ndim() != 4 || k_int8.ndim() != 4 || o.ndim() != 4 ||
       v_int8.ndim() != 2) {
     throw std::runtime_error(std::string(kFn) +
