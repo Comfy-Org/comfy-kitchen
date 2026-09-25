@@ -3,6 +3,7 @@ import torch
 
 import comfy_kitchen as ck
 from comfy_kitchen.backends import ascend as ascend_backend
+from comfy_kitchen.backends.eager import convrot_w4a4 as eager_convrot
 from comfy_kitchen.backends.eager.convrot_w4a4 import quantize_signed_int4_rowwise
 from comfy_kitchen.backends.eager.quantization import (
     quantize_and_rotate_rowwise as eager_quantize_and_rotate_rowwise,
@@ -168,6 +169,17 @@ def test_convrot_w4a4_linear_preserves_codes_and_accumulator(ascend_device, monk
     x = torch.randn(7, 256, device=ascend_device, dtype=torch.float32)
     h = _build_hadamard(64, device=x.device, dtype=x.dtype)
     qref, _ = quantize_signed_int4_rowwise(_rotate_activation(x, h, 64))
+    original_unpack = ascend_backend._unpack_int4_row_major
+    unpacked_inputs = []
+
+    def weight_only_unpack(packed):
+        # No activation pack/unpack should remain in the Ascend path.
+        assert packed.data_ptr() == qweight.data_ptr()
+        unpacked_inputs.append(packed)
+        return original_unpack(packed)
+
+    def reject_activation_pack(*args, **kwargs):
+        raise AssertionError("Ascend W4A4 must not pack activation codes")
 
     def counted_quant_matmul(x1, x2, scale, **kwargs):
         assert x1.dtype == x2.dtype == torch.int8
@@ -185,6 +197,8 @@ def test_convrot_w4a4_linear_preserves_codes_and_accumulator(ascend_device, monk
 
     monkeypatch.delattr(torch_npu, "npu_rotate_quant", raising=False)
     monkeypatch.setattr(torch_npu, "npu_quant_matmul", counted_quant_matmul)
+    monkeypatch.setattr(ascend_backend, "_unpack_int4_row_major", weight_only_unpack)
+    monkeypatch.setattr(eager_convrot, "_pack_int4_row_major", reject_activation_pack)
     wscales = torch.rand(128, device=ascend_device, dtype=torch.float32) / 7
 
     with ck.use_backend("ascend"):
@@ -197,6 +211,7 @@ def test_convrot_w4a4_linear_preserves_codes_and_accumulator(ascend_device, monk
 
     assert output.shape == (7, 128)
     assert calls == [True]
+    assert len(unpacked_inputs) == 1
     torch.testing.assert_close(qweight, original_weight, rtol=0, atol=0)
 
 
