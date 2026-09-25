@@ -959,7 +959,8 @@ def quantize_int8_tensorwise(
     else:
         scale = scale.to(device=x.device, dtype=torch.float32)
     q = _round_int8(
-        x / _int8_scale_for_math(scale, x), stochastic_rounding=stochastic_rounding
+        x.float() / _int8_scale_for_math(scale, x),
+        stochastic_rounding=stochastic_rounding,
     )
     return q, scale
 

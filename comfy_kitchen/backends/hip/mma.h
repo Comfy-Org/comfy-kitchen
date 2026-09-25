@@ -463,8 +463,8 @@ __forceinline__ __device__ Frag broadcast_frag(Frag value, int source_lane) {
   const int physical_source = source_lane + (physical_lane & 32);
 #pragma unroll
   for (int i = 0; i < sizeof(Frag) / sizeof(int); ++i) {
-    reinterpret_cast<int *>(&result)[i] = __builtin_amdgcn_readlane(
-        reinterpret_cast<const int *>(&value)[i], physical_source);
+    reinterpret_cast<int *>(&result)[i] =
+        __shfl(reinterpret_cast<const int *>(&value)[i], physical_source, 64);
   }
 #else
 #pragma unroll

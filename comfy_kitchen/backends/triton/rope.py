@@ -222,8 +222,15 @@ def _apply_rope(
                 if split_half
                 else _eager_rope.apply_rope1
             )
-            x1_out = eager_fn(x1, freqs_cis)
-            x2_out = None if x2 is None else eager_fn(x2, freqs_cis)
+            eager_freqs = freqs_cis
+            if (
+                not split_half
+                and freqs_cis.ndim > 1
+                and freqs_cis.shape[1] > x1.shape[1]
+            ):
+                eager_freqs = freqs_cis[:, : x1.shape[1]]
+            x1_out = eager_fn(x1, eager_freqs)
+            x2_out = None if x2 is None else eager_fn(x2, eager_freqs)
             if inplace:
                 x1.copy_(x1_out)
                 if x2 is not None:

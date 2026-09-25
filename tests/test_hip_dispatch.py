@@ -18,6 +18,7 @@ import torch
 
 import comfy_kitchen.scaled_mm_v2 as scaled_mm_module
 from comfy_kitchen.backends import hip as hip_backend
+from comfy_kitchen.constraints import validate_function_call
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _HIP_DIR = _ROOT / "comfy_kitchen" / "backends" / "hip"
@@ -167,6 +168,35 @@ def test_pageable_host_weight_is_rejected_before_launch():
         hip_backend._weight_operand(weight, torch.device("cuda"), "weight")
 
 
+def test_temporary_host_operands_are_retained_until_the_launch_completes(monkeypatch):
+    class FakeEvent:
+        complete = False
+
+        def record(self, stream):
+            self.stream = stream
+
+        def query(self):
+            return self.complete
+
+    event = FakeEvent()
+    stream = object()
+    monkeypatch.setattr(hip_backend, "_pending_host_operands", [])
+    monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
+
+    operand = torch.empty(1)
+    hip_backend._retain_host_operands_until_stream_complete(
+        [operand], torch.device("cuda")
+    )
+
+    assert event.stream is stream
+    assert hip_backend._pending_host_operands == [(event, operand)]
+
+    event.complete = True
+    hip_backend._retain_host_operands_until_stream_complete([], torch.device("cuda"))
+    assert not hip_backend._pending_host_operands
+
+
 def test_sage_direct_entries_require_tiled_attention(monkeypatch):
     monkeypatch.setattr(hip_backend, "has_wmma", lambda: False)
 
@@ -235,6 +265,35 @@ def test_hip_advertises_attention_with_any_tile_policy():
     # The fused W4A8 requantize is elementwise too: it packs weights and never
     # reaches a matrix core, so RDNA2 must keep it.
     assert "quantize_w4a8_int8_weight" in without
+
+
+@pytest.mark.parametrize(
+    ("operation", "weight_name", "weight_dtype", "input_width"),
+    (
+        ("fp16_linear", "weight", torch.float16, 32),
+        ("int8_linear", "weight", torch.int8, 16),
+        ("convrot_w4a4_linear", "qweight", torch.int8, 32),
+    ),
+)
+def test_hip_linear_constraints_require_pinned_cpu_weights(
+    monkeypatch, operation, weight_name, weight_dtype, input_width
+):
+    constraints = hip_backend._build_constraints()[operation]
+    kwargs = {
+        weight_name: torch.empty(input_width, input_width, dtype=weight_dtype),
+    }
+
+    pageable = validate_function_call(constraints, kwargs)
+    assert pageable.failed_param == weight_name
+    assert pageable.failure_reason == "CPU weights must be mapped pinned memory"
+
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
+    assert validate_function_call(constraints, kwargs).success
+
+    cpu_input = validate_function_call(
+        constraints, {"x": torch.empty(1, input_width, dtype=torch.float16)}
+    )
+    assert cpu_input.failed_param == "x"
 
 
 def test_hip_advertises_every_inplace_rope_entry():

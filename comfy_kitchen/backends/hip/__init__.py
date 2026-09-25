@@ -259,6 +259,24 @@ def _stream(t: torch.Tensor) -> int:
     return torch.cuda.current_stream(t.device).cuda_stream
 
 
+_pending_host_operands: list[tuple[torch.cuda.Event, torch.Tensor]] = []
+
+
+def _retain_host_operands_until_stream_complete(
+    operands: list[torch.Tensor], device: torch.device
+) -> None:
+    """Keep temporary mapped host operands alive until their launch finishes."""
+    _pending_host_operands[:] = [
+        (event, operand)
+        for event, operand in _pending_host_operands
+        if not event.query()
+    ]
+    if operands:
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(device))
+        _pending_host_operands.extend((event, operand) for operand in operands)
+
+
 # The epilogues read a scalar per element with one dtype code.
 _EPILOGUE_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
@@ -286,7 +304,11 @@ def offload_weight(weight: torch.Tensor) -> torch.Tensor:
 
 
 def _weight_operand(
-    weight: torch.Tensor, device: torch.device, name: str, shape=None
+    weight: torch.Tensor,
+    device: torch.device,
+    name: str,
+    shape=None,
+    temporary_host_operands: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if shape is not None and tuple(weight.shape) != tuple(shape):
         raise ValueError(
@@ -302,6 +324,8 @@ def _weight_operand(
     if weight.data_ptr() % 16:
         aligned = torch.empty_like(weight, pin_memory=True)
         aligned.copy_(weight)
+        if temporary_host_operands is not None:
+            temporary_host_operands.append(aligned)
         weight = aligned
     return weight
 
@@ -464,7 +488,10 @@ def scaled_mm_fp8(
             f"scaled_mm_fp8 requires float8_e4m3fn operands, got a={a.dtype}, b={b.dtype}"
         )
     a = _aligned(a.contiguous())
-    b_nk = _weight_operand(_weight_as_nk(b), a.device, "b")
+    temporary_host_operands: list[torch.Tensor] = []
+    b_nk = _weight_operand(
+        _weight_as_nk(b), a.device, "b", temporary_host_operands=temporary_host_operands
+    )
 
     m, k = a.shape
     n = b_nk.shape[0]
@@ -495,6 +522,7 @@ def scaled_mm_fp8(
         DTYPE_TO_CODE[out_dtype],
         _stream(a),
     )
+    _retain_host_operands_until_stream_complete(temporary_host_operands, a.device)
     return out
 
 
@@ -808,8 +836,11 @@ def fp16_linear(
             )
         )
     )
+    temporary_host_operands: list[torch.Tensor] = []
     if supported:
-        weight = _weight_operand(weight, x.device, "weight")
+        weight = _weight_operand(
+            weight, x.device, "weight", temporary_host_operands=temporary_host_operands
+        )
         supported = weight.data_ptr() % 16 == 0
     if not supported:
         # the kernel path takes bias and residual from any device, so the fallback must too
@@ -839,6 +870,7 @@ def fp16_linear(
         k,
         _stream(x),
     )
+    _retain_host_operands_until_stream_complete(temporary_host_operands, x.device)
     if not served:
         fallback_weight = weight.to(device=x.device)
         out = _apply_residual(
@@ -894,7 +926,10 @@ def int8_linear(
             f"Input and weight inner dimensions must match, got {k_act} and {weight.shape[-1]}"
         )
 
-    weight = _weight_operand(weight, x.device, "weight")
+    temporary_host_operands: list[torch.Tensor] = []
+    weight = _weight_operand(
+        weight, x.device, "weight", temporary_host_operands=temporary_host_operands
+    )
     weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1)
     if weight_scale.numel() not in (1, weight.shape[0]):
         raise ValueError(
@@ -964,6 +999,7 @@ def int8_linear(
         DTYPE_TO_CODE[out_dtype],
         _stream(x),
     )
+    _retain_host_operands_until_stream_complete(temporary_host_operands, x.device)
     # Unlike CUDA, the residual is not folded into the epilogue: the per-element
     # residual reads there cost more than a separate addcmul at the output widths
     # pre-norm blocks apply it to.
@@ -1525,7 +1561,14 @@ def convrot_w4a4_linear(
         raise ValueError(f"wscales must have {n} entries, got {wscales.numel()}")
     if bias is not None:
         bias = _bias_operand(bias, n, x.device)
-    qw = _weight_operand(qweight, x.device, "qweight", shape=(n, k // 2))
+    temporary_host_operands: list[torch.Tensor] = []
+    qw = _weight_operand(
+        qweight,
+        x.device,
+        "qweight",
+        shape=(n, k // 2),
+        temporary_host_operands=temporary_host_operands,
+    )
 
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
     _C.convrot_w4a4_gemm(
@@ -1541,6 +1584,7 @@ def convrot_w4a4_linear(
         DTYPE_TO_CODE[x.dtype],
         _stream(x),
     )
+    _retain_host_operands_until_stream_complete(temporary_host_operands, x.device)
     return out.reshape(*orig_shape[:-1], n)
 
 
@@ -2827,10 +2871,24 @@ def _build_constraints(has_wmma: bool = True) -> dict:
 
     # PyTorch exposes ROCm tensors with device type "cuda".
     dev = frozenset({"cuda", "hip"})
+    cpu_weight_devices = dev | frozenset({"cpu"})
     floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
     half_floats = frozenset({torch.float16, torch.bfloat16})
     fp8s = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
     out_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
+
+    def _pinned_cpu_weight_call_rule(kwargs):
+        for name in ("weight", "qweight"):
+            weight = kwargs.get(name)
+            if (
+                isinstance(weight, torch.Tensor)
+                and weight.device.type == "cpu"
+                and not weight.is_pinned()
+            ):
+                return ValidationResult.fail(
+                    name, "CPU weights must be mapped pinned memory"
+                )
+        return ValidationResult.ok()
 
     def _na3d_call_rule(kwargs):
         common = na3d_common_call_rule(kwargs)
@@ -2941,10 +2999,13 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         "int8_linear": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=floats, shape_rules=(DivisibleBy(-1, 16),)),
-                "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}), devices=cpu_weight_devices
+                ),
                 "out_dtype": ParamConstraint(dtypes=out_floats),
             },
             default_devices=dev,
+            call_rules=(_pinned_cpu_weight_call_rule,),
         ),
         "quantize_w4a8_int8_weight": FunctionConstraints(
             params={
@@ -3024,9 +3085,12 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         "convrot_w4a4_linear": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=floats, shape_rules=(DivisibleBy(-1, 32),)),
-                "qweight": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "qweight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}), devices=cpu_weight_devices
+                ),
             },
             default_devices=dev,
+            call_rules=(_pinned_cpu_weight_call_rule,),
         ),
         # 2D only: the tile-packed weight/scale variants have no HIP kernel and
         # fall through to eager.
@@ -3086,13 +3150,16 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                     dtypes=frozenset({torch.float16}), shape_rules=(MinDims(2),)
                 ),
                 "weight": ParamConstraint(
-                    dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(2),)
+                    dtypes=frozenset({torch.float16}),
+                    devices=cpu_weight_devices,
+                    shape_rules=(ExactDims(2),),
                 ),
                 "bias": ParamConstraint(dtypes=frozenset({torch.float16})),
                 "residual": ParamConstraint(dtypes=frozenset({torch.float16})),
                 "residual_scale": ParamConstraint(dtypes=frozenset({torch.float16})),
             },
             default_devices=dev,
+            call_rules=(_pinned_cpu_weight_call_rule,),
         ),
         "fp16_conv3d": FunctionConstraints(
             params={
