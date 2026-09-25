@@ -20,6 +20,7 @@ __all__ = [
     "rms_rope_split_half1_",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
+    "dequantize_int8_simple_dtype",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
@@ -56,6 +57,7 @@ try:
     from .adaln import adaln, rms_adaln
     from .na import na3d
     from .quantization import (
+        dequantize_int8_simple_dtype,
         dequantize_nvfp4,
         dequantize_per_tensor_fp8,
         int8_linear,
@@ -155,6 +157,16 @@ def _build_constraints() -> dict:
                 "output_type": ParamConstraint(
                     dtypes=frozenset({torch.float8_e4m3fn, torch.float8_e5m2}),
                 ),
+            },
+            default_devices=triton_devices,
+        ),
+        "dequantize_int8_simple_dtype": FunctionConstraints(
+            params={
+                "q": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "scale": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16})
+                ),
+                "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=triton_devices,
         ),
