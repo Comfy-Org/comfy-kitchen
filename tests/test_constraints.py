@@ -341,12 +341,17 @@ class TestIntegrationWithBackends:
 class TestINT8Constraints:
     """Tests for INT8 specific constraints."""
 
-    def test_triton_int8_linear_rejects_rocm_without_matrix_cores(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "arch", ("gfx900", "gfx906", "gfx90c", "gfx1010", "gfx1011", "gfx1012")
+    )
+    def test_triton_int8_linear_rejects_legacy_rocm_architectures(
+        self, monkeypatch, arch
+    ):
         monkeypatch.setattr(torch.version, "hip", "6.0")
         monkeypatch.setattr(
             torch.cuda,
             "get_device_properties",
-            lambda device: type("Properties", (), {"gcnArchName": "gfx1010:xnack-"})(),
+            lambda device: type("Properties", (), {"gcnArchName": f"{arch}:xnack-"})(),
         )
         constraints = triton_backend._build_constraints()["int8_linear"]
 
@@ -355,7 +360,25 @@ class TestINT8Constraints:
         )
 
         assert result.success is False
-        assert "gfx1010" in str(result.failure_reason)
+        assert arch in str(result.failure_reason)
+
+    @pytest.mark.parametrize("arch", ("gfx908", "gfx90a", "gfx942", "gfx950"))
+    def test_triton_int8_linear_keeps_cdna_architectures_eligible(
+        self, monkeypatch, arch
+    ):
+        monkeypatch.setattr(torch.version, "hip", "6.0")
+        monkeypatch.setattr(
+            torch.cuda,
+            "get_device_properties",
+            lambda device: type("Properties", (), {"gcnArchName": arch})(),
+        )
+        constraints = triton_backend._build_constraints()["int8_linear"]
+
+        result = constraints.call_rules[0](
+            {"x": type("Input", (), {"device": "cuda"})()}
+        )
+
+        assert result.success is True
 
     def test_int8_linear_shape_constraint(self, device):
         """Test that int8_linear requires at least 2D input on CUDA backend."""

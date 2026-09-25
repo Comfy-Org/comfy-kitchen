@@ -77,7 +77,8 @@ __forceinline__ __device__ float wave_sum(float v) {
   v = dpp_add<0x4E>(v);
   v = dpp_add<0x141>(v);
   v = dpp_add<0x140>(v);
-#if defined(__gfx90c__)
+#if defined(__gfx90c__) || defined(__gfx900__) || defined(__gfx906__) ||       \
+    defined(__gfx90a__)
   return v + __shfl_xor(v, 16, kWave);
 #else
   const int bits = __builtin_bit_cast(int, v);

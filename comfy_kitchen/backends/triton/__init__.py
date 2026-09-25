@@ -43,6 +43,7 @@ from comfy_kitchen.registry import registry
 
 _TRITON_AVAILABLE = True
 _TRITON_ERROR = None
+_TRITON_UNSUPPORTED_HIP_ARCHS = frozenset({"gfx900", "gfx906", "gfx90c"})
 
 try:
     import triton  # noqa: F401
@@ -142,7 +143,7 @@ def _build_constraints() -> dict:
             return ValidationResult.fail(
                 "__hardware__", "could not determine ROCm GPU architecture"
             )
-        if arch == "gfx90c" or arch.startswith("gfx10"):
+        if arch in _TRITON_UNSUPPORTED_HIP_ARCHS or arch.startswith("gfx10"):
             return ValidationResult.fail(
                 "__hardware__", f"Triton INT8 dot is unsupported on {arch}"
             )
@@ -392,9 +393,14 @@ def _register():
             torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
             for device in range(torch.cuda.device_count())
         }
-        if "gfx90c" in architectures:
+        unsupported_architectures = architectures & _TRITON_UNSUPPORTED_HIP_ARCHS
+        if unsupported_architectures or any(
+            arch.startswith("gfx10") for arch in architectures
+        ):
             registry.mark_unavailable(
-                "triton", "Triton is unsupported on ROCm architecture gfx90c"
+                "triton",
+                "Triton is unsupported on ROCm architecture "
+                f"{sorted(unsupported_architectures or architectures)[0]}",
             )
             return
 
