@@ -10,39 +10,133 @@ from __future__ import annotations
 
 import torch
 
+from comfy_kitchen.backends._activations import (
+    apply_input_act as _apply_input_act,
+)
+from comfy_kitchen.backends._activations import (
+    apply_residual as _apply_residual,
+)
+from comfy_kitchen.backends._activations import (
+    input_act_width as _input_act_width,
+)
+from comfy_kitchen.backends.eager.convrot_w4a4 import quantize_signed_int4_rowwise
+from comfy_kitchen.backends.eager.svdquant import _unpack_int4_row_major
 from comfy_kitchen.constraints import (
+    ExactDims,
     FunctionConstraints,
     MinDims,
     ParamConstraint,
     ValidationResult,
 )
 from comfy_kitchen.registry import registry
+from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
 
 __all__ = [
+    "convrot_w4a4_linear",
     "dequantize_int8_simple",
     "dequantize_int8_simple_dtype",
+    "quantize_and_rotate_rowwise",
     "quantize_int8_rowwise",
     "quantize_int8_tensorwise",
+    "int8_linear",
 ]
 
-_ASCEND_AVAILABLE = False
+_ASCEND_DEVICE_AVAILABLE = False
+_ASCEND_QUANT_MATMUL_AVAILABLE = False
+_ASCEND_ROTATE_QUANT_AVAILABLE = False
 _ASCEND_ERROR: str | None = None
+
+
+def _operator_has_parameter(operator: object, parameter: str) -> bool:
+    """Return whether the default torch operator schema contains a parameter."""
+    try:
+        arguments = operator.default._schema.arguments  # type: ignore[attr-defined]
+    except (AttributeError, RuntimeError):
+        return False
+    return any(argument.name == parameter for argument in arguments)
+
 
 try:
     import torch_npu
 
     if not torch.npu.is_available():
         _ASCEND_ERROR = "torch-npu is installed, but no Huawei Ascend device is available"
-    elif not hasattr(torch_npu, "npu_dynamic_quant"):
-        _ASCEND_ERROR = "torch-npu does not provide npu_dynamic_quant"
-    elif not hasattr(torch_npu, "npu_quantize"):
-        _ASCEND_ERROR = "torch-npu does not provide npu_quantize"
     else:
-        _ASCEND_AVAILABLE = True
+        _ASCEND_DEVICE_AVAILABLE = True
+        _ASCEND_QUANT_MATMUL_AVAILABLE = hasattr(torch_npu, "npu_quant_matmul")
+        _ASCEND_ROTATE_QUANT_AVAILABLE = hasattr(torch_npu, "npu_rotate_quant")
 except ImportError as exc:
     _ASCEND_ERROR = f"torch-npu is not installed: {exc}"
 except Exception as exc:
     _ASCEND_ERROR = f"torch-npu initialization failed: {exc}"
+
+
+_ASCEND_QUANT_AVAILABLE = (
+    _ASCEND_DEVICE_AVAILABLE
+    and hasattr(torch_npu, "npu_dynamic_quant")
+    and hasattr(torch_npu, "npu_quantize")
+    and _operator_has_parameter(torch_npu.npu_quantize, "div_mode")
+)
+_ASCEND_ROPE_AVAILABLE = (
+    _ASCEND_DEVICE_AVAILABLE
+    and hasattr(torch_npu, "npu_rotary_mul")
+    and _operator_has_parameter(torch_npu.npu_rotary_mul, "rotary_mode")
+)
+_ASCEND_RMS_ROPE_AVAILABLE = _ASCEND_ROPE_AVAILABLE and hasattr(torch_npu, "npu_rms_norm")
+
+if _ASCEND_ROPE_AVAILABLE:
+    from .rope import (
+        apply_rope,
+        apply_rope1,
+        apply_rope1_,
+        apply_rope_,
+        apply_rope_split_half,
+        apply_rope_split_half1,
+        apply_rope_split_half1_,
+        apply_rope_split_half_,
+        validate_apply_rope,
+        validate_apply_rope1,
+        validate_apply_rope_split_half,
+        validate_apply_rope_split_half1,
+    )
+
+    __all__ += [
+        "apply_rope",
+        "apply_rope1",
+        "apply_rope1_",
+        "apply_rope_",
+        "apply_rope_split_half",
+        "apply_rope_split_half1",
+        "apply_rope_split_half1_",
+        "apply_rope_split_half_",
+    ]
+
+if _ASCEND_RMS_ROPE_AVAILABLE:
+    from .rope import (
+        rms_rope,
+        rms_rope1,
+        rms_rope1_,
+        rms_rope_,
+        rms_rope_split_half,
+        rms_rope_split_half1,
+        rms_rope_split_half1_,
+        rms_rope_split_half_,
+        validate_rms_rope,
+        validate_rms_rope1,
+        validate_rms_rope_split_half,
+        validate_rms_rope_split_half1,
+    )
+
+    __all__ += [
+        "rms_rope",
+        "rms_rope1",
+        "rms_rope1_",
+        "rms_rope_",
+        "rms_rope_split_half",
+        "rms_rope_split_half1",
+        "rms_rope_split_half1_",
+        "rms_rope_split_half_",
+    ]
 
 
 _DTYPE_CODE_TO_DTYPE = {
@@ -50,6 +144,14 @@ _DTYPE_CODE_TO_DTYPE = {
     1: torch.float16,
     2: torch.bfloat16,
 }
+
+_ROTATE_QUANT_DST_DTYPE_INT8 = 1
+_ROTATE_QUANT_MIN_FEATURES = 128
+_ROTATE_QUANT_MAX_FEATURES = 16000
+_ROTATE_QUANT_MIN_GROUP_SIZE = 16
+_INT4_QUANT_GROUP_SIZE = 64
+# Signed A4 is clamped to [-7, 7]; packed W4 can contain -8.
+_INT4_MAX_ACCUMULATION_FEATURES = torch.iinfo(torch.int32).max // (7 * 8)
 
 
 def _validate_deterministic_quantization(kwargs) -> ValidationResult:
@@ -89,6 +191,207 @@ def _safe_scale(scale: torch.Tensor) -> torch.Tensor:
     return scale.clamp_min_(1e-30)
 
 
+def _validate_rotate_quant(kwargs) -> ValidationResult:
+    result = _validate_deterministic_quantization(kwargs)
+    if not result.success:
+        return result
+
+    x = kwargs.get("x")
+    h = kwargs.get("H", kwargs.get("h"))
+    group_size = kwargs.get("group_size")
+    if not isinstance(group_size, int) or group_size < _ROTATE_QUANT_MIN_GROUP_SIZE:
+        return ValidationResult.fail(
+            "group_size",
+            f"must be an integer greater than or equal to {_ROTATE_QUANT_MIN_GROUP_SIZE}",
+        )
+    if group_size % 8 != 0:
+        return ValidationResult.fail("group_size", "must be divisible by 8")
+    if not isinstance(x, torch.Tensor) or not isinstance(h, torch.Tensor):
+        return ValidationResult.ok()
+    if x.numel() == 0:
+        return ValidationResult.fail("x", "empty tensors are not supported by npu_rotate_quant")
+    if x.shape[-1] < _ROTATE_QUANT_MIN_FEATURES:
+        return ValidationResult.fail(
+            "x",
+            f"last dimension must be at least {_ROTATE_QUANT_MIN_FEATURES}",
+        )
+    if x.shape[-1] > _ROTATE_QUANT_MAX_FEATURES:
+        return ValidationResult.fail(
+            "x",
+            f"last dimension must not exceed {_ROTATE_QUANT_MAX_FEATURES}",
+        )
+    if x.shape[-1] % group_size != 0:
+        return ValidationResult.fail(
+            "group_size", f"{group_size} does not divide input features {x.shape[-1]}"
+        )
+    if h.shape != (group_size, group_size):
+        return ValidationResult.fail(
+            "H", f"must have shape ({group_size}, {group_size}), got {tuple(h.shape)}"
+        )
+    if h.device != x.device:
+        return ValidationResult.fail("H", "must be on the same device as x")
+    if h.dtype != x.dtype:
+        return ValidationResult.fail("H", "must have the same dtype as x")
+    return ValidationResult.ok()
+
+
+def _can_use_rotate_quant(x: torch.Tensor, h: torch.Tensor, group_size: int) -> bool:
+    if not _ASCEND_ROTATE_QUANT_AVAILABLE:
+        return False
+    return _validate_rotate_quant(
+        {
+            "x": x,
+            "H": h,
+            "group_size": group_size,
+            "stochastic_rounding": 0,
+        }
+    ).success
+
+
+def _npu_rotate_quant(
+    x: torch.Tensor,
+    h: torch.Tensor,
+    dst_dtype: int = _ROTATE_QUANT_DST_DTYPE_INT8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch_npu.npu_rotate_quant(
+        x,
+        h,
+        dst_dtype=dst_dtype,
+        axis=-1,
+        round_mode="rint",
+        scale_alg=0,
+        dst_type_max=0.0,
+        transpose_y=False,
+    )
+
+
+def _validate_int8_linear(kwargs) -> ValidationResult:
+    x = kwargs.get("x")
+    weight = kwargs.get("weight")
+    weight_scale = kwargs.get("weight_scale")
+    bias = kwargs.get("bias")
+    input_act = kwargs.get("input_act")
+
+    if input_act not in (None, "none", "gelu_tanh", "swiglu", "rms_norm"):
+        return ValidationResult.fail("input_act", f"unsupported value {input_act!r}")
+    if not isinstance(x, torch.Tensor) or not isinstance(weight, torch.Tensor):
+        return ValidationResult.ok()
+    if x.numel() == 0 or weight.numel() == 0:
+        return ValidationResult.fail("x", "empty tensors are not supported by npu_quant_matmul")
+
+    input_features = x.shape[-1]
+    if input_act == "rms_norm":
+        norm_weight = kwargs.get("input_act_weight")
+        if not isinstance(norm_weight, torch.Tensor) or norm_weight.shape != (input_features,):
+            return ValidationResult.fail(
+                "input_act_weight", "rms_norm requires a one-dimensional input-channel weight"
+            )
+    if kwargs.get("residual") is not None and kwargs.get("residual_scale") is None:
+        return ValidationResult.fail("residual_scale", "required when residual is provided")
+    width = _input_act_width(input_act)
+    if input_features % width != 0:
+        return ValidationResult.fail(
+            "x", f"last dimension {input_features} is not divisible by activation width {width}"
+        )
+    activated_features = input_features // width
+    if activated_features != weight.shape[-1]:
+        return ValidationResult.fail(
+            "weight",
+            f"input features {activated_features} do not match weight features {weight.shape[-1]}",
+        )
+    if weight_scale is not None and weight_scale.numel() not in (1, weight.shape[0]):
+        return ValidationResult.fail(
+            "weight_scale",
+            f"must be scalar or contain {weight.shape[0]} per-output-channel values",
+        )
+    if bias is not None and bias.numel() != weight.shape[0]:
+        return ValidationResult.fail(
+            "bias", f"must contain {weight.shape[0]} output-channel values"
+        )
+
+    if kwargs.get("convrot"):
+        group_size = kwargs.get("convrot_groupsize", 256)
+        is_power_of_four = (
+            isinstance(group_size, int)
+            and group_size >= 4
+            and (group_size & (group_size - 1)) == 0
+            and (group_size.bit_length() - 1) % 2 == 0
+        )
+        if not is_power_of_four:
+            return ValidationResult.fail("convrot_groupsize", "must be a positive power of four")
+        if activated_features % group_size != 0:
+            return ValidationResult.fail(
+                "convrot_groupsize",
+                f"{group_size} does not divide input features {activated_features}",
+            )
+    return ValidationResult.ok()
+
+
+def _validate_convrot_w4a4_linear(kwargs) -> ValidationResult:
+    x = kwargs.get("x")
+    qweight = kwargs.get("qweight")
+    wscales = kwargs.get("wscales")
+    bias = kwargs.get("bias")
+    convrot_groupsize = kwargs.get("convrot_groupsize", 256)
+    quant_group_size = kwargs.get("quant_group_size", _INT4_QUANT_GROUP_SIZE)
+    linear_dtype = kwargs.get("linear_dtype", "int4")
+
+    if linear_dtype != "int4":
+        return ValidationResult.fail("linear_dtype", "Ascend A4W4 requires 'int4'")
+    if quant_group_size != _INT4_QUANT_GROUP_SIZE:
+        return ValidationResult.fail(
+            "quant_group_size",
+            f"Ascend A4W4 requires {_INT4_QUANT_GROUP_SIZE}",
+        )
+    is_power_of_four = (
+        isinstance(convrot_groupsize, int)
+        and convrot_groupsize >= _ROTATE_QUANT_MIN_GROUP_SIZE
+        and (convrot_groupsize & (convrot_groupsize - 1)) == 0
+        and (convrot_groupsize.bit_length() - 1) % 2 == 0
+    )
+    if not is_power_of_four:
+        return ValidationResult.fail(
+            "convrot_groupsize", "must be a power of four greater than or equal to 16"
+        )
+    if not isinstance(x, torch.Tensor) or not isinstance(qweight, torch.Tensor):
+        return ValidationResult.ok()
+    if x.numel() == 0 or qweight.numel() == 0:
+        return ValidationResult.fail("x", "empty tensors are not supported by Ascend A4W4")
+
+    input_features = x.shape[-1]
+    output_features = qweight.shape[0]
+    if input_features > _INT4_MAX_ACCUMULATION_FEATURES:
+        return ValidationResult.fail("x", "feature width can overflow the INT32 accumulator")
+    if input_features != qweight.shape[-1] * 2:
+        return ValidationResult.fail(
+            "qweight",
+            f"input features {input_features} do not match packed weight "
+            f"features {qweight.shape[-1] * 2}",
+        )
+    if input_features < _ROTATE_QUANT_MIN_FEATURES:
+        return ValidationResult.fail(
+            "x", f"last dimension must be at least {_ROTATE_QUANT_MIN_FEATURES}"
+        )
+    if input_features % convrot_groupsize != 0:
+        return ValidationResult.fail(
+            "convrot_groupsize",
+            f"{convrot_groupsize} does not divide input features {input_features}",
+        )
+    if input_features % 8 != 0 or output_features % 8 != 0:
+        return ValidationResult.fail(
+            "qweight", "Ascend A4W4 requires input and output features divisible by 8"
+        )
+    if wscales is not None and wscales.numel() != output_features:
+        return ValidationResult.fail(
+            "wscales", f"must contain {output_features} per-output-channel values"
+        )
+    if bias is not None and bias.numel() != output_features:
+        return ValidationResult.fail(
+            "bias", f"must contain {output_features} output-channel values"
+        )
+    return ValidationResult.ok()
+
+
 def quantize_int8_tensorwise(
     x: torch.Tensor,
     scale: torch.Tensor | float | str | None = None,
@@ -100,11 +403,18 @@ def quantize_int8_tensorwise(
     if scale is None or (isinstance(scale, str) and scale == "recalculate"):
         abs_max = x.abs().max()
         output_scale = (abs_max.float() / 127.0).clamp(min=1e-30)
+        quantization_scale = output_scale
     else:
         output_scale = torch.as_tensor(scale, dtype=torch.float32, device=x.device)
+        scale_min = torch.finfo(x.dtype).tiny
+        quantization_scale = torch.where(
+            output_scale == 0,
+            torch.full_like(output_scale, scale_min),
+            output_scale,
+        )
     quantized = torch_npu.npu_quantize(
         x,
-        output_scale.reshape(1),
+        quantization_scale.reshape(1),
         zero_points=None,
         dtype=torch.qint8,
         axis=-1,
@@ -123,6 +433,24 @@ def quantize_int8_rowwise(
     return quantized, _safe_scale(scale).unsqueeze(-1)
 
 
+def quantize_and_rotate_rowwise(
+    x: torch.Tensor,
+    h: torch.Tensor,
+    group_size: int,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse grouped activation rotation and row-wise INT8 quantization."""
+    del stochastic_rounding
+    original_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    quantized, scale = _npu_rotate_quant(x_2d, h.contiguous())
+    scale = _safe_scale(scale)
+    return (
+        quantized.reshape(original_shape),
+        scale.reshape(*original_shape[:-1], 1),
+    )
+
+
 def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Dequantize INT8 data on Ascend without transferring it to the host."""
     return q.float() * scale
@@ -135,29 +463,129 @@ def dequantize_int8_simple_dtype(
     return dequantize_int8_simple(q, scale).to(_DTYPE_CODE_TO_DTYPE[output_dtype_code])
 
 
+def int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run dynamically quantized INT8 linear on Ascend NPU.
+
+    Comfy Kitchen stores weights as ``[N, K]``. ``npu_quant_matmul`` accepts
+    the resulting non-contiguous ``[K, N]`` transpose view directly, avoiding
+    a full weight copy on every forward pass.
+    """
+    orig_shape = x.shape
+    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    if x.shape[-1] != weight.shape[-1]:
+        raise ValueError(
+            "Input and weight inner dimensions must match, "
+            f"got {x.shape[-1]} and {weight.shape[-1]}"
+        )
+
+    weight = weight.to(device=x.device).contiguous()
+    weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1)
+    if weight_scale.numel() not in (1, weight.shape[0]):
+        raise ValueError(
+            "INT8 weight scale must be scalar or per-output-channel, "
+            f"got {tuple(weight_scale.shape)} for weight shape {tuple(weight.shape)}"
+        )
+
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    if convrot:
+        if x.shape[-1] % convrot_groupsize != 0:
+            raise ValueError(
+                f"ConvRot group size {convrot_groupsize} does not divide "
+                f"input features {x.shape[-1]}"
+            )
+        hadamard = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        if _can_use_rotate_quant(x_2d, hadamard, convrot_groupsize):
+            quantized_x, activation_scale = _npu_rotate_quant(x_2d, hadamard.contiguous())
+        else:
+            x_2d = _rotate_activation(x_2d, hadamard, convrot_groupsize)
+            quantized_x, activation_scale = torch_npu.npu_dynamic_quant(x_2d)
+    else:
+        quantized_x, activation_scale = torch_npu.npu_dynamic_quant(x_2d)
+    npu_bias = None
+    if bias is not None:
+        npu_bias = bias.to(device=x.device, dtype=out_dtype).reshape(-1).contiguous()
+
+    result = torch_npu.npu_quant_matmul(
+        quantized_x,
+        weight.t(),
+        weight_scale.contiguous(),
+        pertoken_scale=activation_scale.reshape(-1).contiguous(),
+        bias=npu_bias,
+        output_dtype=out_dtype,
+    )
+    result = result.reshape(*orig_shape[:-1], weight.shape[0])
+    return _apply_residual(result, residual, residual_scale)
+
+
+def convrot_w4a4_linear(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    wscales: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    convrot_groupsize: int = 256,
+    quant_group_size: int = _INT4_QUANT_GROUP_SIZE,
+    linear_dtype: str = "int4",
+) -> torch.Tensor:
+    """Run ConvRot W4A4 with reference preprocessing and integer accumulation.
+
+    Do not cast FP32 activations before rotation/quantization: even small
+    perturbations change the rounded A4 codes. The scaled packed-A4W4 kernel
+    also narrows output to FP16/BF16. Instead, unpack the same A4/W4 codes to
+    INT8 and request an INT32 accumulator without per-token scaling, then
+    reproduce eager's cast, scale and bias order. This intentionally trades
+    packed-kernel performance for the reference's numerical behavior.
+    """
+    if linear_dtype != "int4":
+        raise ValueError(f"Ascend A4W4 requires linear_dtype='int4', got {linear_dtype!r}")
+    if quant_group_size != _INT4_QUANT_GROUP_SIZE:
+        raise ValueError(f"Ascend A4W4 requires quant_group_size {_INT4_QUANT_GROUP_SIZE}")
+
+    original_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    qweight = qweight.to(device=x.device).contiguous()
+    hadamard = _build_hadamard(
+        convrot_groupsize,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    rotated = _rotate_activation(x_2d, hadamard, convrot_groupsize)
+    packed_x, activation_scale = quantize_signed_int4_rowwise(rotated)
+    quantized_x = _unpack_int4_row_major(packed_x).contiguous()
+    quantized_weight = _unpack_int4_row_major(qweight).contiguous()
+    result = torch_npu.npu_quant_matmul(
+        quantized_x,
+        quantized_weight.t(),
+        torch.ones(qweight.shape[0], device=x.device, dtype=torch.float32),
+        output_dtype=torch.int32,
+    )
+    result = result.to(x.dtype)
+    result = result * activation_scale.to(x.dtype).reshape(-1, 1)
+    result = result * wscales.to(device=x.device, dtype=x.dtype).reshape(1, -1)
+    if bias is not None:
+        result = result + bias.to(device=x.device, dtype=x.dtype).reshape(1, -1)
+    return result.reshape(*original_shape[:-1], qweight.shape[0])
+
+
 def _build_constraints() -> dict[str, FunctionConstraints]:
     ascend_devices = frozenset({"npu"})
     ascend_floats = frozenset({torch.float16, torch.bfloat16})
+    ascend_linear_floats = frozenset({torch.float16, torch.bfloat16, torch.float32})
     scale_values = frozenset({torch.float16, torch.bfloat16, torch.float32, float, int, str})
 
-    return {
-        "quantize_int8_tensorwise": FunctionConstraints(
-            params={
-                "x": ParamConstraint(dtypes=ascend_floats),
-                "scale": ParamConstraint(dtypes=scale_values),
-                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
-            },
-            default_devices=ascend_devices,
-            call_rules=(_validate_tensorwise_scale,),
-        ),
-        "quantize_int8_rowwise": FunctionConstraints(
-            params={
-                "x": ParamConstraint(dtypes=ascend_floats, shape_rules=(MinDims(2),)),
-                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
-            },
-            default_devices=ascend_devices,
-            call_rules=(_validate_deterministic_quantization,),
-        ),
+    constraints = {
         "dequantize_int8_simple": FunctionConstraints(
             params={
                 "q": ParamConstraint(dtypes=frozenset({torch.int8})),
@@ -174,10 +602,199 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
             default_devices=ascend_devices,
             call_rules=(_validate_output_dtype,),
         ),
+        "int8_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=ascend_floats, shape_rules=(MinDims(2),)),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)
+                ),
+                "weight_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "bias": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16, torch.float32})
+                ),
+                "out_dtype": ParamConstraint(dtypes=ascend_floats),
+                "convrot": ParamConstraint(dtypes=frozenset({bool})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "input_act": ParamConstraint(dtypes=frozenset({str})),
+                "input_act_weight": ParamConstraint(dtypes=ascend_linear_floats),
+                "input_act_eps": ParamConstraint(dtypes=frozenset({float, int})),
+                "residual": ParamConstraint(dtypes=ascend_linear_floats),
+                "residual_scale": ParamConstraint(dtypes=ascend_linear_floats),
+            },
+            default_devices=ascend_devices,
+            call_rules=(_validate_int8_linear,),
+        ),
     }
 
+    if _ASCEND_ROTATE_QUANT_AVAILABLE:
+        constraints["quantize_and_rotate_rowwise"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=ascend_floats, shape_rules=(MinDims(2),)),
+                "H": ParamConstraint(dtypes=ascend_floats, shape_rules=(ExactDims(2),)),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+            },
+            default_devices=ascend_devices,
+            call_rules=(_validate_rotate_quant,),
+        )
+    if not (_ASCEND_QUANT_MATMUL_AVAILABLE and hasattr(torch_npu, "npu_dynamic_quant")):
+        constraints.pop("int8_linear")
 
-if _ASCEND_AVAILABLE:
+    if _ASCEND_QUANT_AVAILABLE:
+        constraints.update(
+            {
+                "quantize_int8_tensorwise": FunctionConstraints(
+                    params={
+                        "x": ParamConstraint(dtypes=ascend_floats),
+                        "scale": ParamConstraint(dtypes=scale_values),
+                        "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+                    },
+                    default_devices=ascend_devices,
+                    call_rules=(_validate_tensorwise_scale,),
+                ),
+                "quantize_int8_rowwise": FunctionConstraints(
+                    params={
+                        "x": ParamConstraint(dtypes=ascend_floats, shape_rules=(MinDims(2),)),
+                        "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
+                    },
+                    default_devices=ascend_devices,
+                    call_rules=(_validate_deterministic_quantization,),
+                ),
+            }
+        )
+
+    rope_tensors = {
+        "freqs_cis": ParamConstraint(
+            dtypes=frozenset({torch.float16, torch.bfloat16, torch.float32}),
+            shape_rules=(ExactDims(6),),
+        )
+    }
+    if _ASCEND_ROPE_AVAILABLE:
+        constraints.update(
+            {
+                "apply_rope1": FunctionConstraints(
+                    params={
+                        "x": ParamConstraint(dtypes=ascend_floats, shape_rules=(ExactDims(4),)),
+                        **rope_tensors,
+                    },
+                    default_devices=ascend_devices,
+                    call_rules=(validate_apply_rope1,),
+                ),
+                "apply_rope": FunctionConstraints(
+                    params={
+                        "xq": ParamConstraint(dtypes=ascend_floats, shape_rules=(ExactDims(4),)),
+                        "xk": ParamConstraint(dtypes=ascend_floats, shape_rules=(ExactDims(4),)),
+                        **rope_tensors,
+                    },
+                    default_devices=ascend_devices,
+                    call_rules=(validate_apply_rope,),
+                ),
+                "apply_rope_split_half1": FunctionConstraints(
+                    params={
+                        "x": ParamConstraint(dtypes=ascend_floats, shape_rules=(ExactDims(4),)),
+                        **rope_tensors,
+                    },
+                    default_devices=ascend_devices,
+                    call_rules=(validate_apply_rope_split_half1,),
+                ),
+                "apply_rope_split_half": FunctionConstraints(
+                    params={
+                        "xq": ParamConstraint(dtypes=ascend_floats, shape_rules=(ExactDims(4),)),
+                        "xk": ParamConstraint(dtypes=ascend_floats, shape_rules=(ExactDims(4),)),
+                        **rope_tensors,
+                    },
+                    default_devices=ascend_devices,
+                    call_rules=(validate_apply_rope_split_half,),
+                ),
+            }
+        )
+
+    if _ASCEND_RMS_ROPE_AVAILABLE:
+        scale_constraint = ParamConstraint(
+            dtypes=frozenset({torch.float16, torch.bfloat16, torch.float32}),
+            shape_rules=(ExactDims(1),),
+        )
+        constraints.update(
+            {
+                "rms_rope1": FunctionConstraints(
+                    params={
+                        "x": ParamConstraint(dtypes=ascend_floats, shape_rules=(ExactDims(4),)),
+                        **rope_tensors,
+                        "scale": scale_constraint,
+                    },
+                    default_devices=ascend_devices,
+                    call_rules=(validate_rms_rope1,),
+                ),
+                "rms_rope": FunctionConstraints(
+                    params={
+                        "q": ParamConstraint(dtypes=ascend_floats, shape_rules=(ExactDims(4),)),
+                        "k": ParamConstraint(dtypes=ascend_floats, shape_rules=(ExactDims(4),)),
+                        **rope_tensors,
+                        "q_scale": scale_constraint,
+                        "k_scale": scale_constraint,
+                    },
+                    default_devices=ascend_devices,
+                    call_rules=(validate_rms_rope,),
+                ),
+                "rms_rope_split_half1": FunctionConstraints(
+                    params={
+                        "x": ParamConstraint(dtypes=ascend_floats, shape_rules=(ExactDims(4),)),
+                        **rope_tensors,
+                        "scale": scale_constraint,
+                    },
+                    default_devices=ascend_devices,
+                    call_rules=(validate_rms_rope_split_half1,),
+                ),
+                "rms_rope_split_half": FunctionConstraints(
+                    params={
+                        "q": ParamConstraint(dtypes=ascend_floats, shape_rules=(ExactDims(4),)),
+                        "k": ParamConstraint(dtypes=ascend_floats, shape_rules=(ExactDims(4),)),
+                        **rope_tensors,
+                        "q_scale": scale_constraint,
+                        "k_scale": scale_constraint,
+                        "rot_dim": ParamConstraint(dtypes=frozenset({int})),
+                    },
+                    default_devices=ascend_devices,
+                    call_rules=(validate_rms_rope_split_half,),
+                ),
+            }
+        )
+
+    for inplace_name, functional_name in {
+        "apply_rope_": "apply_rope",
+        "apply_rope1_": "apply_rope1",
+        "apply_rope_split_half_": "apply_rope_split_half",
+        "apply_rope_split_half1_": "apply_rope_split_half1",
+        "rms_rope_": "rms_rope",
+        "rms_rope1_": "rms_rope1",
+        "rms_rope_split_half_": "rms_rope_split_half",
+        "rms_rope_split_half1_": "rms_rope_split_half1",
+    }.items():
+        if functional_name in constraints:
+            constraints[inplace_name] = constraints[functional_name]
+    if _ASCEND_QUANT_MATMUL_AVAILABLE:
+        constraints["convrot_w4a4_linear"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=ascend_linear_floats, shape_rules=(MinDims(2),)),
+                "qweight": ParamConstraint(
+                    dtypes=frozenset({torch.int8, torch.uint8}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "wscales": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "bias": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16, torch.float32})
+                ),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
+                "linear_dtype": ParamConstraint(dtypes=frozenset({str})),
+            },
+            default_devices=ascend_devices,
+            call_rules=(_validate_convrot_w4a4_linear,),
+        )
+    return constraints
+
+
+if _ASCEND_DEVICE_AVAILABLE:
     registry.register(
         name="ascend",
         module=__import__(__name__, fromlist=__all__),
