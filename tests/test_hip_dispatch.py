@@ -168,6 +168,35 @@ def test_pageable_host_weight_is_rejected_before_launch():
         hip_backend._weight_operand(weight, torch.device("cuda"), "weight")
 
 
+def test_aligned_pinned_host_weight_is_retained_for_the_launch():
+    class PinnedWeight:
+        device = torch.device("cpu")
+        shape = (4, 16)
+
+        def is_pinned(self):
+            return True
+
+        def contiguous(self):
+            return self
+
+        def data_ptr(self):
+            return 16
+
+    weight = PinnedWeight()
+    temporary_host_operands = []
+
+    assert (
+        hip_backend._weight_operand(
+            weight,
+            torch.device("cuda"),
+            "weight",
+            temporary_host_operands=temporary_host_operands,
+        )
+        is weight
+    )
+    assert temporary_host_operands == [weight]
+
+
 def test_temporary_host_operands_are_retained_until_the_launch_completes(monkeypatch):
     class FakeEvent:
         complete = False

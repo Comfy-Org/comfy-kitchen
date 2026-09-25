@@ -327,9 +327,9 @@ def _weight_operand(
     if weight.data_ptr() % 16:
         aligned = torch.empty_like(weight, pin_memory=True)
         aligned.copy_(weight)
-        if temporary_host_operands is not None:
-            temporary_host_operands.append(aligned)
         weight = aligned
+    if temporary_host_operands is not None:
+        temporary_host_operands.append(weight)
     return weight
 
 
