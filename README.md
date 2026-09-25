@@ -125,10 +125,10 @@ What a GPU gets depends on whether it has matrix cores:
 | RDNA4      | `gfx1200`, `gfx1201`        | WMMA + fp8   | All HIP-supported kernels, fp8 native   |
 | RDNA3.5    | `gfx1150`-`gfx1153`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
 | RDNA3      | `gfx1100`-`gfx1103`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
-| RDNA2      | `gfx1030`-`gfx1036`         | `sdot4`      | Software tile GEMMs, NA3D, Sage INT8 and Sol attention |
-| RDNA1      | `gfx1010`- `gfx1012`        | vector ALU   | Software tile GEMMs, NA3D, Sage INT8 and Sol attention |
-| Vega (APU) | `gfx90c`                    | vector ALU   | Software tile GEMMs, NA3D, Sage INT8 and Sol attention |
-| Vega       | `gfx900`,`gfx906`           | vector ALU   | Software tile GEMMs, NA3D, Sage INT8 and Sol attention |
+| RDNA2      | `gfx1030`-`gfx1036`         | `sdot4`      | Software tile GEMMs; NA3D, Sage INT8 and Sol attention via software tiles |
+| RDNA1      | `gfx1010`- `gfx1012`        | vector ALU   | Software tile GEMMs; NA3D, Sage INT8 and Sol attention via software tiles |
+| Vega (APU) | `gfx90c`                    | vector ALU   | Software tile GEMMs; NA3D, Sage INT8 and Sol attention via software tiles |
+| Vega       | `gfx900`,`gfx906`           | vector ALU   | Software tile GEMMs; NA3D, Sage INT8 and Sol attention via software tiles |
 
 fp8, int8 and int4 share one byte-addressed tile kernel (`gemm_wmma.h`). RDNA3
 and RDNA4 spread a WMMA operand across the wave differently and RDNA3 has no fp8
@@ -139,8 +139,26 @@ On pre-WMMA devices, each logical 32-lane wave partition computes the same
 16x16 accumulator layout with row broadcasts and vector dot products. RDNA2
 uses native packed `sdot4`; RDNA1 and Vega use compiler-generated arithmetic.
 NA3D, Sage INT8 attention and Sol attention use the same fragment contract and
-run on either policy. Flash decode does not use this tile path and remains
-limited to its native-WMMA/BF16 hardware envelope.
+run on either policy. They are supported on the validated Vega and RDNA1 targets,
+but do not have matrix-core throughput. Flash decode does not use this tile path
+and is unavailable on those legacy architectures; it remains limited to its
+native-WMMA/BF16 hardware envelope.
+
+### Legacy attention memory behavior
+
+The software-tile policy changes throughput, not the fused attention algorithms'
+storage strategy. Sage INT8 attention quantizes Q/K/V into packed INT8 carriers,
+uses an online softmax, and stages only K/V tiles in LDS; it does not materialize
+a full attention-score matrix. NA3D likewise keeps its score, softmax, and output
+accumulators in registers, with only small V/probability tiles in LDS.
+
+Sol attention allocates a caller-owned packed workspace for quantized Q/K/V,
+pooled block summaries, routing state, and softmax partials. This avoids eager
+Sol attention's dense FP32 `(B, H, T, T)` score tensor, which is especially
+important at long sequence lengths. The route index is still block-quadratic
+(`O(B * H * ceil(T / 64)^2)`), so the memory reduction is substantial rather
+than strictly linear; `token_aug` adds further routing workspace. At short
+sequences, the packed carriers and workspace can outweigh the benefit.
 
 Large linear weights can stay in mapped pinned host memory instead of consuming
 VRAM:
