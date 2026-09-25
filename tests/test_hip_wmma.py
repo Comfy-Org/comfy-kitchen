@@ -508,16 +508,17 @@ def _rel_err(got, ref) -> float:
 def _fp16_shape_served(m, n, k) -> bool:
     """Mirror fp16_shape_served() in backends/hip/ops/gemm_fp16.hip.
 
-    The envelope is device-dependent: a part with more than 8 WGPs (a dGPU)
-    hands shallow-K and huge-M shapes to the vendor GEMM, while a 6-WGP iGPU
-    keeps them on WMMA, which is measurably faster there. The launcher reports
-    hipDeviceAttributeMultiprocessorCount, which TheRock reports as the WGP
-    count on gfx1103.
+    The envelope is architecture-dependent: only the gfx1103 iGPU keeps the
+    shallow-K and huge-M shapes on WMMA (the vendor GEMM loses there, measured
+    4.5-6 TF vs 7-10 TF on its 6 WGPs). Every other GPU keeps upstream's
+    envelope and hands those shapes to the vendor GEMM.
     """
     if k % 8 != 0 or n % 8 != 0:
         return False
-    wgp = torch.cuda.get_device_properties(0).multi_processor_count
-    if wgp > 8 and (k <= 4096 or m > 8192):
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if props.gcnArchName.split(":")[0] == "gfx1103":
+        return True
+    if k <= 4096 or m > 8192:
         return False
     return True
 

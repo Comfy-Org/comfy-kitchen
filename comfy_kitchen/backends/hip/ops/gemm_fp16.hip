@@ -10,15 +10,16 @@
 
 namespace comfy::hip_backend {
 
-// Both launchers share the shape envelope. On high-WGP (dGPU) devices the vendor
-// GEMM is preferred for shallow K and M > 8192 (CUDA's envelope; below the
-// deep-K boundary where CUDA moves to stream-K, and past M=8192 the vendor GEMM
-// wins). On low-WGP integrated GPUs the vendor fp16 GEMM is far slower than WMMA
-// (measured 4.5-6 TF vs 7-10 TF on a 6-WGP 780M), so those shapes are served by
-// WMMA instead.
+// Both launchers share the shape envelope. Every device but the gfx1103 iGPU
+// keeps upstream's: the vendor GEMM is preferred for shallow K and M > 8192
+// (CUDA's envelope; below the deep-K boundary where CUDA moves to stream-K, and
+// past M=8192 the vendor GEMM wins). On the gfx1103 iGPU the vendor fp16 GEMM is
+// far slower than WMMA (measured 4.5-6 TF vs 7-10 TF on its 6 WGPs), so those
+// shapes are served by WMMA instead.
 inline bool fp16_shape_served(int M, int N, int K) {
     if (K % 8 != 0 || N % 8 != 0) return false;
-    if (device_wgp_count() > 8 && (K <= 4096 || M > 8192)) return false;
+    if (comfy_small_igpu()) return true;
+    if (K <= 4096 || M > 8192) return false;
     return true;
 }
 

@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstdlib>
 
+#include "launchers.h"  // comfy_small_igpu
 #include "mma.h"
 
 namespace comfy::hip_backend {
@@ -369,14 +370,17 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
     // least half empty, and the finer 64x64 grid recovers the wasted MMAs.
     const bool skinny = (M <= 64 || N <= 64);
 
-    // Low-WGP devices (integrated GPUs: 6 WGPs on a 780M, 8 on a 680M) have too
-    // few workgroup processors to interleave many small blocks, so a 16-wave
+    // The gfx1103-only branch, keyed on the architecture rather than a WGP
+    // threshold: low-WGP devices (6 WGPs on a 780M, 8 on a 680M) have too few
+    // workgroup processors to interleave many small blocks, so a 16-wave
     // 512-thread block that hides WMMA latency within the block wins. Deeper K
     // amortizes the BKB=128 tile's LDS round trips; shallower K runs faster with
     // BKB=64 on the 512-thread grid (measured on the 6-WGP 780M: the
     // Anima/SDXL K<=2048..2880 shapes prefer 128x128 BKB64 16w, while K=8192
     // likes BKB=128). The env override (COMFY_KITCHEN_WMMA_TILE) forces any mode.
-    if (!skinny && wgps <= 8 && mode != 10) {
+    // Every other architecture falls through to the upstream heuristic below:
+    // the branch above was tuned against 6 WGPs and is a regression elsewhere.
+    if (!skinny && comfy_small_igpu() && mode != 10) {
         if (Mma::kStepBytes >= 32) {
             // 32-byte K-steps (fp16/bf16) halve the K-steps per tile versus 8-bit
             // operands. Re-measured on the 6-WGP 780M across ten Anima/SDXL/conv

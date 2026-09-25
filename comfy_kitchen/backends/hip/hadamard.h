@@ -672,6 +672,14 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     // Quantize the rotated row out of LDS with 8-wide (16-bit rows) or 4-wide
     // (fp32 rows) vector chunks, packing the int8 into one 8/4-byte store so a
     // warp writes 256B of a row per instruction instead of 64B.
+    //
+    // gfx1103 tuning (from the RMSNorm+RoPE rewrite). Device code cannot call
+    // the host-side comfy_small_igpu(), so the choice is the compile-time arch
+    // macro: __gfx1103__ is defined only in that target's device pass (the same
+    // way CMake spells its arch conditions), and every other target -- including
+    // the host pass of a gfx1103 build, which never emits this body -- takes the
+    // upstream scalar loop.
+#if defined(__gfx1103__)
     constexpr int kVec = sizeof(RowT) == 2 ? 8 : 4;
     const bool vec_ok = (K % kVec) == 0;
     if (vec_ok) {
@@ -720,6 +728,14 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
             qout[row_offset + col] = static_cast<int8_t>(q);
         }
     }
+#else
+    for (int col = tid; col < K; col += BLOCK_THREADS) {
+        const float v = load_row_value(row_buf[col]);
+        int q = static_cast<int>(rintf(v * inv));
+        q = q < -127 ? -127 : (q > 127 ? 127 : q);
+        qout[row_offset + col] = static_cast<int8_t>(q);
+    }
+#endif
 }
 
 template <typename RowT, int ACT, int BLOCK_THREADS>

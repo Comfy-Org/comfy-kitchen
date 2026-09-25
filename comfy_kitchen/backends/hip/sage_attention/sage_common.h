@@ -243,8 +243,12 @@ __forceinline__ __device__ void convrot(float* v) {
 // bytes clear, so the result is exactly the converted low byte -- verified on
 // gfx1103 over 300k inputs covering every exact .5 tie, the negative edge and
 // the saturation edge, with zero mismatches against the sequence below.
+//
+// The builtin is restricted to the gfx1103 device pass, matching hw_exp2 in
+// ../mma.h: the verification was done there, so every other target keeps the
+// scalar sequence upstream uses.
 __forceinline__ __device__ uint32_t prob_to_u8(float p) {
-#if defined(COMFY_MMA_GFX11)
+#if defined(__gfx1103__)
     return static_cast<uint32_t>(__builtin_amdgcn_cvt_pk_u8_f32(p, 0u, 0.0f));
 #else
     return static_cast<uint32_t>(fminf(255.0f, fmaxf(0.0f, rintf(p))));

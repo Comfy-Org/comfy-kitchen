@@ -78,6 +78,16 @@ __device__ __forceinline__ int32_t_v4 load_i8_frag(const void* lds, int row, int
     return r;
 }
 
+// The wave32 WMMA builtins below are gfx11-only: gfx10 (no WMMA at all) and
+// gfx12 (its WMMA builtins carry a _gfx12 suffix) reject them at compile time,
+// which would break any multi-arch build that includes those targets. The
+// runtime dispatch only ever launches this kernel on gfx1103
+// (comfy_small_igpu gates every path here), so the other targets get trap
+// stubs: they compile, they link, and -- reaching them at all -- fault loudly
+// instead of silently accumulating zeros. The host pass compiles the real body
+// regardless (device builtins are not target-checked there), keeping the
+// extern "C" launchers below defined for the binding.
+#if defined(COMFY_MMA_GFX11)
 __device__ __forceinline__ v8i wmma_i32_iu8(int32_t_v4 a, int32_t_v4 b, v8i c) {
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
 }
@@ -95,6 +105,24 @@ __device__ __forceinline__ v8f wmma_f32_f16(v16h a, v16h b, v8f c) {
 __device__ __forceinline__ v8f wmma_f32_bf16(v16bf a, v16bf b, v8f c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
 }
+#else
+__device__ __forceinline__ v8i wmma_i32_iu8(int32_t_v4, int32_t_v4, v8i c) {
+    __builtin_trap();  // unreachable: launch_sage_port_attn is gfx1103-only
+    return c;
+}
+__device__ __forceinline__ v8i wmma_i32_iu8_ub(int32_t_v4, int32_t_v4, v8i c) {
+    __builtin_trap();
+    return c;
+}
+__device__ __forceinline__ v8f wmma_f32_f16(v16h, v16h, v8f c) {
+    __builtin_trap();
+    return c;
+}
+__device__ __forceinline__ v8f wmma_f32_bf16(v16bf, v16bf, v8f c) {
+    __builtin_trap();
+    return c;
+}
+#endif
 
 // fp16 P B-fragment for the PV: the full 16-column row (L&15) of P^T. p_vals[e]
 // = P[L&15][2e+hw]; permlanex16 supplies the other parity's columns.

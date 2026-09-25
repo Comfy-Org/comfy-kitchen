@@ -153,12 +153,23 @@ def _gfx_arch(device: torch.device | int | None = None) -> str | None:
         return None
 
 
-@functools.lru_cache(maxsize=1)
 def _is_small_igpu() -> bool:
     """True on the small RDNA3 iGPU (Radeon 780M, gfx1103) whose 6-WGP tuning
     this tree carries. dGPUs keep the upstream schedules: several block-size
-    and dispatch choices measured here are a regression on 60-96 CU parts."""
-    arch = _gfx_arch()
+    and dispatch choices measured here are a regression on 60-96 CU parts.
+
+    Resolved for the current device and cached per device index (matching the
+    C++ comfy_small_igpu), so a mixed iGPU + dGPU box answers for the device in
+    use instead of whichever was current the first time this ran.
+    """
+    if not torch.cuda.is_available() or not getattr(torch.version, "hip", None):
+        return False
+    return _is_small_igpu_index(torch.cuda.current_device())
+
+
+@functools.lru_cache(maxsize=None)
+def _is_small_igpu_index(index: int) -> bool:
+    arch = _gfx_arch(index)
     return arch is not None and arch == "gfx1103"
 
 
@@ -2605,11 +2616,22 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ),
         "fp16_linear": FunctionConstraints(
             params={
+                # bf16 only on the gfx1103 iGPU, whose fp16_linear runs a bf16
+                # GEMM path; dGPUs declare the upstream fp16-only envelope so
+                # registry dispatch never routes bf16 here.
                 "x": ParamConstraint(
-                    dtypes=frozenset({torch.float16, torch.bfloat16}), shape_rules=(MinDims(2),)
+                    dtypes=frozenset(
+                        {torch.float16, torch.bfloat16} if _is_small_igpu()
+                        else {torch.float16}
+                    ),
+                    shape_rules=(MinDims(2),),
                 ),
                 "weight": ParamConstraint(
-                    dtypes=frozenset({torch.float16, torch.bfloat16}), shape_rules=(ExactDims(2),)
+                    dtypes=(
+                        frozenset({torch.float16, torch.bfloat16}) if _is_small_igpu()
+                        else frozenset({torch.float16})
+                    ),
+                    shape_rules=(ExactDims(2),)
                 ),
                 "bias": ParamConstraint(dtypes=frozenset({torch.float16})),
                 "residual": ParamConstraint(dtypes=frozenset({torch.float16})),
@@ -2949,9 +2971,6 @@ def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
         "k_scale": torch.empty(
             batch, kv_heads, padded_k // _SAGE_KEY_GROUP, dtype=torch.float32, device=device
         ),
-        # V is stored transposed, [B * H * D, padded_K], in its own dtype (the
-        # int8-QK / bf16-fp16-SV path keeps V unquantized), with the tail zero
-        # filled. The buffer key keeps the legacy name; its dtype is q's.
         # V is stored transposed, [B * H * D, padded_K], with the tail zero
         # filled (pure-int8 path). On the gfx1103 iGPU the buffer is twice the
         # int8 width: the int8 kernels read the first padded_K columns (int8

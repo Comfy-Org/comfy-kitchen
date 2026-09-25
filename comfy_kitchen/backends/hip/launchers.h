@@ -9,6 +9,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 
@@ -17,14 +18,29 @@
 // several block-size and dispatch choices tuned against 6 WGPs are a
 // regression on 60-96 CU parts. Host-safe (no device intrinsics), so both the
 // .hip kernels and the dlpack bindings can consult it.
+//
+// Resolved for the *current* device and cached per ordinal, not once per
+// process against device 0: a box with both an iGPU and a dGPU sees two
+// architectures, and hard-coding device 0 would hand the dGPU the iGPU's
+// tuning (or hide it from the iGPU) depending on enumeration order. The query
+// stays off the hot path the same way device_wgp_count keeps its own.
 inline bool comfy_small_igpu() {
-    static const bool v = [] {
-        int device = 0;
+    constexpr int kMaxDevices = 16;
+    // 0 unknown, 1 yes, 2 no. Racing threads write the same value and nothing
+    // else is published through the cache, so relaxed.
+    static std::atomic<int> cache[kMaxDevices] = {};
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDevices) return false;
+    int v = cache[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
         hipDeviceProp_t prop{};
-        if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
-        return std::strstr(prop.gcnArchName, "gfx1103") != nullptr;
-    }();
-    return v;
+        v = (hipGetDeviceProperties(&prop, dev) == hipSuccess &&
+             std::strstr(prop.gcnArchName, "gfx1103") != nullptr)
+                ? 1
+                : 2;
+        cache[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
 }
 
 extern "C" {

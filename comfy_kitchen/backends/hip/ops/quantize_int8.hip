@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "../hadamard.h"
+#include "../launchers.h"  // comfy_small_igpu
 
 namespace comfy::hip_backend {
 
@@ -69,7 +70,8 @@ __forceinline__ __device__ void quant_store_vec_rt(const float* vals, int8_t* q,
 }
 
 // One block per row: block-reduce the row absmax, then quantize the row.
-// Reads x once when the row fits the per-thread register budget (K <= 12288),
+// gfx1103 iGPU path (selected in launch_quantize_int8_rowwise_kernel): reads x
+// once when the row fits the per-thread register budget (K <= 12288),
 // which on a bandwidth-limited iGPU saves a full second global read of x; the
 // two-pass fallback covers arbitrarily long rows. Loads are 16-byte chunks
 // (8 bf16/fp16 or 4 fp32 per thread), so a warp covers 512 bytes of a row per
@@ -80,7 +82,7 @@ __forceinline__ __device__ void quant_store_vec_rt(const float* vals, int8_t* q,
 // below covers anything else.
 constexpr int kQuantMaxStaged = 48;  // floats per thread, K / 256 <= 48
 
-__global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel(
+__global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel_staged(
     const void* __restrict__ x, int in_code, int8_t* __restrict__ q,
     float* __restrict__ scales, int M, int K) {
 
@@ -191,6 +193,40 @@ __global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel(
             load_vec16_rt(v, tmp, in_code);
             quant_store_vec_rt(tmp, q + base + j, inv, 8);
         }
+    }
+}
+
+// Upstream implementation, kept for every architecture other than the gfx1103
+// iGPU: the register-staged rewrite above trades a second global read of x for
+// register pressure and was tuned against the 6-WGP 780M, where the re-read is
+// the more expensive side of the trade. This is the scalar two-pass original:
+// block-reduce the row absmax through LDS, then quantize with one strided pass.
+__global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel(
+    const void* __restrict__ x, int in_code, int8_t* __restrict__ q,
+    float* __restrict__ scales, int M, int K) {
+
+    __shared__ float red[256];
+    const int row = blockIdx.x;
+    const int t = threadIdx.x;
+
+    float lmax = 0.0f;
+    for (int j = t; j < K; j += 256)
+        lmax = fmaxf(lmax, fabsf(load_in(x, static_cast<int64_t>(row) * K + j, in_code)));
+
+    red[t] = lmax;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (t < s) red[t] = fmaxf(red[t], red[t + s]);
+        __syncthreads();
+    }
+
+    const float scale = fmaxf(red[0] / kInt8Max, 1e-30f);
+    if (t == 0) scales[row] = scale;
+    const float inv = 1.0f / scale;
+
+    for (int j = t; j < K; j += 256) {
+        const float v = load_in(x, static_cast<int64_t>(row) * K + j, in_code);
+        q[static_cast<int64_t>(row) * K + j] = quant_round(v, inv);
     }
 }
 
@@ -385,8 +421,15 @@ extern "C" void launch_quantize_int8_rowwise_kernel(
     if (M == 0) {
         return;  // a zero-block launch is hipErrorInvalidConfiguration
     }
-    quantize_int8_rowwise_kernel<<<M, 256, 0, stream>>>(
-        x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales), M, K);
+    // Architecture dispatch: the staged kernel is the gfx1103 iGPU tuning; every
+    // other GPU runs the upstream scalar kernel above.
+    if (comfy_small_igpu()) {
+        quantize_int8_rowwise_kernel_staged<<<M, 256, 0, stream>>>(
+            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales), M, K);
+    } else {
+        quantize_int8_rowwise_kernel<<<M, 256, 0, stream>>>(
+            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales), M, K);
+    }
 }
 
 // Fused ConvRot rotation + rowwise int8 quantize. act_code: 0 none, 1 gelu tanh,

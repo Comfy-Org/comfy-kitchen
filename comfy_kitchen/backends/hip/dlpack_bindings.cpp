@@ -1365,12 +1365,17 @@ static void sage_check_quantized(const nb::ndarray<>& q_int8, const nb::ndarray<
     const int64_t padded_k = sage_padded_k(kv_len, cta_k);
     require_dtype(q_int8, 4, 4, fn, "q_int8");
     require_dtype(k_int8, 4, 4, fn, "k_int8");
-    // V is unquantized in the int8-QK / bf16-fp16-SV path: the transposed
-    // buffer carries fp16 (1) or bf16 (2) — or int8 (4) for the legacy
-    // prequantized-int8 callers. fp32 input is downcast to bf16 by the
-    // transpose, and the Python layer allocates the buffer in the downcast
-    // dtype, so code 0 never arrives here.
-    {
+    if (!comfy_small_igpu()) {
+        // Upstream contract: the transposed V is int8. The unquantized-V paths
+        // (fp16/bf16 SV) are a gfx1103 iGPU extension and are rejected here so
+        // every other GPU keeps the mainline implementation end to end.
+        require_dtype(v_int8, 4, 4, fn, "v_int8");
+    } else {
+        // V is unquantized in the int8-QK / bf16-fp16-SV path: the transposed
+        // buffer carries fp16 (1) or bf16 (2) — or int8 (4) for the legacy
+        // prequantized-int8 callers. fp32 input is downcast by the transpose,
+        // and the Python layer allocates the buffer in the downcast dtype, so
+        // code 0 never arrives here.
         const int v_code = map_dtype_to_code(v_int8.dtype());
         if (v_code != 1 && v_code != 2 && v_code != 4) {
             throw std::runtime_error(std::string(fn) +
