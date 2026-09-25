@@ -225,6 +225,42 @@ def test_int8_linear_routes_turing_to_fused_kernel(seed, monkeypatch):
     assert calls == [True]
 
 
+@pytest.mark.slow
+@pytest.mark.parametrize("per_row_weight_scale", [False, True])
+def test_triton_int8_linear_output_offsets_past_int32(seed, per_row_weight_scale):
+    """Rows whose flat output offset is >= 2**31 are written in place (#136)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    pytest.importorskip("triton")
+    from comfy_kitchen.backends.triton import quantization as triton_quantization
+
+    # m * n = 2**31 + n, so the whole last row sits past the int32 range.
+    m, n, k = 32769, 65536, 16
+    dtype = torch.bfloat16
+    if torch.cuda.mem_get_info()[0] < 6 * 1024**3:
+        pytest.skip("needs ~6 GiB of free VRAM for a 4 GiB output")
+
+    x = torch.randn(m, k, device="cuda", dtype=dtype)
+    weight = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    weight_scale_shape = (n,) if per_row_weight_scale else ()
+    weight_scale = torch.rand(weight_scale_shape, device="cuda", dtype=torch.float32)
+
+    output = triton_quantization.int8_linear(x, weight, weight_scale, out_dtype=dtype)
+    torch.cuda.synchronize()
+
+    last_rows = slice(m - 2, m)
+    activation, activation_scale = triton_quantization.triton_quantize_rowwise(
+        x[last_rows].contiguous()
+    )
+    accumulator = activation.cpu().to(torch.int32) @ weight.cpu().to(torch.int32).T
+    expected = accumulator.to(device="cuda", dtype=torch.float32)
+    expected *= activation_scale.reshape(-1, 1) * weight_scale.reshape(1, -1)
+    expected = expected.to(dtype)
+
+    # Without the fix these rows are never written (or the launch faults).
+    assert_values_close(output[last_rows], expected, rtol=1e-2, atol=1e-2, name="rows past 2**31")
+
+
 # =============================================================================
 # INT8 Quantization Tests
 # =============================================================================
