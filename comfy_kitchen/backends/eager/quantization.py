@@ -831,7 +831,7 @@ def _requires_float_int8_mm(tensor: torch.Tensor) -> bool:
         arch = torch.cuda.get_device_properties(tensor.device).gcnArchName.split(":")[0]
     except (AttributeError, RuntimeError):
         return False
-    return arch == arch.startswith("gfx90") or arch.startswith("gfx10")
+    return arch.startswith("gfx90") or arch.startswith("gfx10")
 
 
 def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
