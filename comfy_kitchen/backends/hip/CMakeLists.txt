@@ -78,14 +78,20 @@ endfunction()
 
 _ck_make_arch_condition(COMFY_HIP_GFX11_CONDITION ${COMFY_HIP_WMMA_GFX11_ARCHS})
 _ck_make_arch_condition(COMFY_HIP_GFX12_CONDITION ${COMFY_HIP_WMMA_GFX12_ARCHS})
+set(_CK_HIP_WAVE64_VEGA_ARCHS)
 set(_CK_HIP_DOT4_ARCHS)
 
 foreach(_arch IN LISTS COMFY_HIP_ELEMENTWISE_ARCHS)
+    if(_arch MATCHES "^gfx90")
+        list(APPEND _CK_HIP_WAVE64_VEGA_ARCHS "${_arch}")
+    endif()
+
     if(_arch MATCHES "^gfx103")
         list(APPEND _CK_HIP_DOT4_ARCHS "${_arch}")
     endif()
 endforeach()
 
+_ck_make_arch_condition(COMFY_HIP_WAVE64_VEGA_CONDITION ${_CK_HIP_WAVE64_VEGA_ARCHS})
 _ck_make_arch_condition(COMFY_HIP_DOT4_CONDITION ${_CK_HIP_DOT4_ARCHS})
 set(_CK_HIP_WMMA_ARCHS
     ${COMFY_HIP_WMMA_GFX11_ARCHS}

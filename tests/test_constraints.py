@@ -344,8 +344,9 @@ class TestINT8Constraints:
     @pytest.mark.parametrize(
         "arch", ("gfx900", "gfx906", "gfx90c", "gfx1010", "gfx1011", "gfx1012")
     )
+    @pytest.mark.parametrize("operation", ("int8_linear", "w4a8_int8_linear"))
     def test_triton_int8_linear_rejects_legacy_rocm_architectures(
-        self, monkeypatch, arch
+        self, monkeypatch, arch, operation
     ):
         monkeypatch.setattr(torch.version, "hip", "6.0")
         monkeypatch.setattr(
@@ -353,7 +354,7 @@ class TestINT8Constraints:
             "get_device_properties",
             lambda device: type("Properties", (), {"gcnArchName": f"{arch}:xnack-"})(),
         )
-        constraints = triton_backend._build_constraints()["int8_linear"]
+        constraints = triton_backend._build_constraints()[operation]
 
         result = constraints.call_rules[0](
             {"x": type("Input", (), {"device": "cuda"})()}

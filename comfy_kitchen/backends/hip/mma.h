@@ -452,16 +452,27 @@ struct MmaF16 {
 
 // Vega, RDNA1 and RDNA2 have no WMMA instructions. Preserve the same 16x16
 // fragment contract in software: a lane owns one B row/output column and
-// broadcasts the A row needed by each of its eight accumulator elements. A
-// wave64 device executes this as two independent 32-lane partitions.
+// broadcasts the A row needed by each of its eight accumulator elements. Tile
+// scheduling stays in logical wave32 units on every target; Vega's physical
+// wave64 uses a dedicated broadcast that addresses all 64 lanes directly.
 template <typename Frag>
 __forceinline__ __device__ Frag broadcast_frag(Frag value, int source_lane) {
   Frag result;
+#if defined(COMFY_HIP_WAVE64_VEGA)
+  const int physical_lane = threadIdx.x & 63;
+  const int physical_source = source_lane + (physical_lane & 32);
+#pragma unroll
+  for (int i = 0; i < sizeof(Frag) / sizeof(int); ++i) {
+    reinterpret_cast<int *>(&result)[i] = __builtin_amdgcn_readlane(
+        reinterpret_cast<const int *>(&value)[i], physical_source);
+  }
+#else
 #pragma unroll
   for (int i = 0; i < sizeof(Frag) / sizeof(int); ++i) {
     reinterpret_cast<int *>(&result)[i] =
         __shfl(reinterpret_cast<const int *>(&value)[i], source_lane, kWave);
   }
+#endif
   return result;
 }
 

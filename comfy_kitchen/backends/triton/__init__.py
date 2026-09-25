@@ -298,6 +298,7 @@ def _build_constraints() -> dict:
             },
             default_devices=triton_devices,
             min_compute_capability=(8, 0),  # Required for Triton INT8 dot
+            call_rules=(_int8_linear_call_rule,),
         ),
         "quantize_int8_rowwise": FunctionConstraints(
             params={

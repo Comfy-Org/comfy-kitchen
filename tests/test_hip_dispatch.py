@@ -381,6 +381,7 @@ def test_mma_architecture_macros_are_generated_from_the_manifest():
     assert "defined(__gfx" not in mma
     assert "@COMFY_HIP_GFX11_CONDITION@" in template
     assert "@COMFY_HIP_GFX12_CONDITION@" in template
+    assert "@COMFY_HIP_WAVE64_VEGA_CONDITION@" in template
 
 
 def test_sdist_rules_include_every_hip_build_input():
