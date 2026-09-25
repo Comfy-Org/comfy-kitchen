@@ -100,7 +100,7 @@ RoPE capability detection is independent of quantization: it requires a
 INT8 linear accepts the current input RMSNorm and residual arguments through
 the shared device-side helpers; those operations are not fused into its GEMM.
 
-## HIP backend (AMD Vega APU / RDNA 1 / RDNA2 / RDNA3 / RDNA3.5 / RDNA4)
+## HIP backend (AMD Vega / RDNA 1 / RDNA2 / RDNA3 / RDNA3.5 / RDNA4)
 
 The `hip` backend implements the quantized paths with its own kernels: native
 WMMA on RDNA3/RDNA3.5/RDNA4 and a software 16x16 tile policy on Vega, RDNA1 and
