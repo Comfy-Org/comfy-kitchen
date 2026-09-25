@@ -40,7 +40,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `gemv_awq_w4a16`            | ✓     | ✓    |        | ✓   |     |
 | `quantize_svdquant_w4a4`    | ✓     | ✓    |        | ✓   |     |
 | `scaled_mm_svdquant_w4a4`   | ✓     | ✓    |        | ✓   |     |
-| `convrot_w4a4_linear`       | ✓     | ✓    |        | ✓   |     |
+| `convrot_w4a4_linear`       | ✓     | ✓    |        | ✓   | ✓*  |
 | `quantize_convrot_w4a4_weight` | ✓  | ✓    |        | ✓   |     |
 | `dequantize_convrot_w4a4_weight` | ✓ | ✓   |        | ✓   |     |
 
@@ -53,6 +53,16 @@ Each of the eight rope entries also has an in-place form (`apply_rope_`,
 corresponding operator is available.
 
 ## Huawei Ascend backend
+
+Ascend `convrot_w4a4_linear` requires `npu_quant_matmul`, not RotateQuant.
+It preserves the caller's FP32/FP16/BF16 precision during rotation and signed
+INT4 quantization. The packed codes are unpacked to INT8 for NPU INT32
+accumulation, then cast and scaled in eager's order. This is not a zero-copy
+packed A4W4 kernel: unpacking has a memory/runtime cost. It avoids silently
+rounding FP32 inputs to BF16 or narrowing FP32/BF16 results through FP16.
+It retains eager's intermediate arithmetic, including FP16 range limitations;
+it does not promise higher precision than the reference. Unsupported calls
+continue to use the existing eager fallback.
 
 The optional `ascend` backend uses torch-npu operators on Huawei Ascend NPU
 hardware. It is registered only when torch-npu and an Ascend device are
