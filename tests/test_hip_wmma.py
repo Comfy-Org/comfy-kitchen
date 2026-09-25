@@ -1428,6 +1428,122 @@ def test_w4a8_decode_launcher_rejects_an_unsupported_group_size(hip, group_size,
         )
 
 
+def _random_w6a8(n, k, group_size, scale_dtype):
+    """Arbitrary 6-bit storage: every code and high-plane bit pattern, not only the
+    ones a quantizer happens to emit."""
+    qdata = torch.randint(-128, 128, (n, k * 3 // 4), dtype=torch.int8, device=DEV)
+    s_rel = (torch.rand(n, k // group_size, device=DEV) * 3.5 + 0.25).to(scale_dtype)
+    return qdata, s_rel
+
+
+# K=96 and 1056 give 3K/4-byte rows that are 8- but not 16-byte aligned.
+@pytest.mark.parametrize(("k", "group_size"), [(512, 16), (512, 32), (1024, 64), (96, 32),
+                                               (1056, 16)])
+@pytest.mark.parametrize("scale_dtype", [torch.float8_e4m3fn, torch.float32])
+def test_w6a8_decode_is_bit_exact(hip, k, group_size, scale_dtype):
+    torch.manual_seed(0)
+    qdata, s_rel = _random_w6a8(96, k, group_size, scale_dtype)
+
+    out = hip._dequant_int4_grouped_to_int8(qdata, s_rel, None, group_size)
+    ref = eager_w4a8._dequant_int4_grouped_to_int8(qdata, s_rel, None, group_size)
+
+    assert out.shape == (96, k) and out.dtype == torch.int8
+    assert torch.equal(out, ref)
+
+
+# K=512 takes the GEMV's paired 16-byte loads, K=1056 its one-vector fallback.
+@pytest.mark.parametrize(("k", "convrot"), [(512, 256), (1056, 16)])
+@pytest.mark.parametrize("m", [1, 8, 192, 600])
+@pytest.mark.parametrize("scale_dtype", [torch.float8_e4m3fn, torch.float32])
+@needs_wmma
+def test_w6a8_linear_matches_int8_linear_on_the_decoded_weight(hip, monkeypatch, k, convrot, m,
+                                                               scale_dtype):
+    """Every W6A8 route decodes to the same int8 grid and runs the same activation
+    quantizer and epilogue as int8_linear, so the result has to be bit-identical to
+    int8_linear on the eagerly decoded weight."""
+    torch.manual_seed(0)
+    n = 384
+    _, (qdata, s_rel, s_channel, correction, cb) = _quantize_w4a8(
+        n, k, bits=6, convrot_groupsize=convrot, scale_dtype=scale_dtype
+    )
+    assert qdata.shape == (n, k * 3 // 4) and cb is None and correction is None
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    bias = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+
+    taken = []
+    launch = hip._C.w4a8_codebook_gemv
+
+    def record(*args):
+        taken.append(launch(*args))
+        return taken[-1]
+
+    monkeypatch.setattr(hip._C, "w4a8_codebook_gemv", record)
+    monkeypatch.setattr(hip, "_w4a8_chunk_cols", lambda *_: 128)
+    got = hip.w4a8_int8_linear(
+        x, qdata, s_rel, s_channel, bias=bias, convrot_groupsize=convrot
+    )
+    int8_weight = eager_w4a8._dequant_int4_grouped_to_int8(qdata, s_rel, None, 16)
+    ref = hip.int8_linear(x, int8_weight, s_channel, bias, torch.bfloat16, True, convrot)
+
+    gemv = m <= hip._W4A8_GEMV_MAX_ROWS and scale_dtype == torch.float8_e4m3fn
+    assert taken == ([True] if gemv else [])
+    assert torch.equal(got, ref)
+
+
+@pytest.mark.parametrize(
+    ("cols", "group_size", "codebook", "match"),
+    [(3 * 512 // 8, 16, False, "packed width"),
+     (3 * 512 // 4, 8, False, "6-bit storage needs"),
+     (3 * 512 // 4, 16, True, "no codebook")],
+    ids=["width", "group", "codebook"],
+)
+def test_w6a8_bindings_reject_what_the_layout_cannot_hold(hip, cols, group_size, codebook,
+                                                          match):
+    n, k = 8, 512
+    qdata = torch.zeros(n, cols, dtype=torch.int8, device=DEV)
+    s_rel = torch.ones(n, k // group_size, dtype=torch.float32, device=DEV)
+    out = torch.zeros(n, k, dtype=torch.int8, device=DEV)
+    cb = torch.zeros(16, dtype=torch.float32, device=DEV) if codebook else None
+
+    with pytest.raises(RuntimeError, match=match):
+        hip._C.dequant_int4_grouped_to_int8(
+            hip._dl(qdata), hip._dl(s_rel), 0, None if cb is None else hip._dl(cb),
+            hip._dl(out), n, k, group_size, hip._stream(qdata),
+        )
+
+
+@needs_wmma
+def test_w6a8_layout_linear_dispatches_to_hip():
+    torch.manual_seed(0)
+    w = torch.randn(256, 512, device=DEV, dtype=torch.bfloat16) * 0.02
+    qt = QuantizedTensor.from_float(w, "AsymW4A8Int8Layout", bits=6)
+    assert qt._qdata.shape == (256, 384)
+    x = torch.randn(32, 512, device=DEV, dtype=torch.bfloat16)
+    params = qt._params
+
+    impl = registry.get_implementation(
+        "w4a8_int8_linear",
+        kwargs={
+            "x": x,
+            "qdata": qt._qdata,
+            "s_rel": params.scale,
+            "s_channel": params.s_channel,
+            "codebook": params.codebook,
+            "correction": params.correction,
+            "bias": None,
+            "group_size": params.group_size,
+            "convrot_groupsize": params.convrot_groupsize,
+            "out_dtype": torch.bfloat16,
+        },
+    )
+    assert impl.__module__ == "comfy_kitchen.backends.hip"
+
+    out = torch.nn.functional.linear(x, qt)
+    ref = (x @ w.t()).float()
+    assert out.shape == (32, 256)
+    assert (out.float() - ref).norm() / ref.norm() < 0.04
+
+
 def test_quantize_int8_rowwise_matches_eager():
     torch.manual_seed(0)
     x = torch.randn(64, 512, device=DEV, dtype=torch.bfloat16)

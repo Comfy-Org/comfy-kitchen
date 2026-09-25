@@ -19,8 +19,10 @@ def _fused_shmem_bytes(key_head_dim: int, value_head_dim: int) -> int:
     return (key_head_dim * value_head_dim + 2 * _MAX_STEPS * key_head_dim + 4 * _MAX_STEPS * warps) * 4
 
 
-def is_available(device: torch.device | int | None = None, key_head_dim: int = 128, value_head_dim: int = 128) -> bool:
+def is_available(device: torch.device | None = None, key_head_dim: int = 128, value_head_dim: int = 128) -> bool:
     """Return whether the fused DeltaNet decode kernels can run on this device for these head dims."""
+    if device is not None and device.type != "cuda":
+        return False
     if not torch.cuda.is_available():
         return False
     if _hip_backend is not None:
@@ -30,20 +32,13 @@ def is_available(device: torch.device | int | None = None, key_head_dim: int = 1
         # flash_attention.py asks it to: its arch gate is the intersection over
         # every visible device. It sizes its own shared memory, so there is no
         # opt-in budget to check.
-        if device is not None and torch.device(device).type != "cuda":
-            return False
         return _hip_backend.gated_delta_decode_is_available(key_head_dim, value_head_dim)
     ext = _cuda_backend._C if _cuda_backend._EXT_AVAILABLE else None
     if ext is None or not hasattr(ext, "gated_delta_decode_fused") or not hasattr(ext, "deltanet_conv_step"):
         return False
     if key_head_dim != 128 or value_head_dim % 32 != 0 or not 0 < value_head_dim <= 512:
         return False
-    index = None
-    if device is not None:
-        device = torch.device(device)
-        if device.type != "cuda":
-            return False
-        index = device.index
+    index = device.index if device is not None else None
     if index is None:
         index = torch.cuda.current_device()
     optin = _device_optin.get(index)

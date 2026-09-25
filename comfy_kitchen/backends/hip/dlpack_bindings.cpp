@@ -72,7 +72,8 @@ void launch_quantize_w4a8_convrot_kernel(const void*, const void*, void*, void*,
 bool launch_w4a8_codebook_gemv_kernel(const void* xq, const void* qw, const void* s_rel,
                                       const void* codebook, const void* s_channel, const void* xs,
                                       const void* bias, int bias_code, void* out, int out_code,
-                                      int M, int N, int K, int group_size, hipStream_t stream);
+                                      int M, int N, int K, int group_size, int bits,
+                                      hipStream_t stream);
 bool launch_gated_delta_decode_fused_kernel(
     const void* mixed_qkv, const void* x, const void* w_a, const void* w_b, const void* dt_bias,
     const void* g_decay, void* state, void* out, void* snapshots, const void* z,
@@ -739,6 +740,36 @@ void quantize_w4a8_convrot(nb::ndarray<> rotated, nb::ndarray<> codebook, nb::nd
     check_hip_launch();
 }
 
+// Code width implied by the packed [N, K * bits / 8] row: K/2 bytes at 4 bits,
+// 3K/4 at 6. The length checks only bound the buffer from below, so the width is
+// read from the shape rather than inferred from the element count. 6-bit storage
+// is uniform, needs K % 32 so rows and the high plane stay aligned, and a group a
+// multiple of 16 so one scale covers each decode vector.
+static int w4a8_bits(const nb::ndarray<>& qdata, int N, int K, int group_size,
+                     bool has_codebook, const char* fn) {
+    if (qdata.ndim() != 2 || static_cast<int64_t>(qdata.shape(0)) != N) {
+        throw std::runtime_error(std::string(fn) + ": qdata must be [N, K * bits / 8]");
+    }
+    const int64_t cols = static_cast<int64_t>(qdata.shape(1));
+    if (K == 0) {
+        return 4;
+    }
+    const int64_t bits = cols * 8 / K;
+    if ((bits != 4 && bits != 6) || cols * 8 != static_cast<int64_t>(K) * bits) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": packed width must be K/2 (4-bit) or 3K/4 (6-bit)");
+    }
+    if (bits == 6 && (K % 32 != 0 || group_size < 16 || group_size % 16 != 0)) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": 6-bit storage needs K % 32 == 0 and group_size a "
+                                 "multiple of 16");
+    }
+    if (bits == 6 && has_codebook) {
+        throw std::runtime_error(std::string(fn) + ": 6-bit storage has no codebook");
+    }
+    return static_cast<int>(bits);
+}
+
 void dequant_int4_grouped_to_int8(nb::ndarray<> qdata, nb::ndarray<> s_rel, int scale_code,
                                   OptArray codebook, nb::ndarray<> out, int N, int K,
                                   int group_size, uintptr_t stream_ptr) {
@@ -755,7 +786,8 @@ void dequant_int4_grouped_to_int8(nb::ndarray<> qdata, nb::ndarray<> s_rel, int 
     require_dtype(qdata, 4, 4, kFn, "qdata");
     require_dtype(out, 4, 4, kFn, "out");
     require_dtype(s_rel, scale_code == 0 ? 0 : 3, scale_code == 0 ? 0 : 3, kFn, "s_rel");
-    require_len(qdata, static_cast<int64_t>(N) * (K / 2), kFn, "qdata");
+    const int bits = w4a8_bits(qdata, N, K, group_size, codebook.has_value(), kFn);
+    require_len(qdata, static_cast<int64_t>(N) * K * bits / 8, kFn, "qdata");
     require_len(out, static_cast<int64_t>(N) * K, kFn, "out");
     require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
     if (codebook.has_value()) {
@@ -764,7 +796,7 @@ void dequant_int4_grouped_to_int8(nb::ndarray<> qdata, nb::ndarray<> s_rel, int 
 
     launch_dequant_int4_grouped_to_int8_kernel(
         qdata.data(), s_rel.data(), scale_code, opt_data(codebook), out.data(), N, K, group_size,
-        reinterpret_cast<hipStream_t>(stream_ptr));
+        bits, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -795,7 +827,8 @@ void w4a8_int8_gemm_chunked(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<>
     require_out_matches(out, out_code, kFn);
     require_dtype(s_rel, scale_code == 0 ? 0 : 3, scale_code == 0 ? 0 : 3, kFn, "s_rel");
     require_len(xq, static_cast<int64_t>(M) * K, kFn, "xq");
-    require_len(qdata, static_cast<int64_t>(N) * (K / 2), kFn, "qdata");
+    const int bits = w4a8_bits(qdata, N, K, group_size, codebook.has_value(), kFn);
+    require_len(qdata, static_cast<int64_t>(N) * K * bits / 8, kFn, "qdata");
     require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
     require_len(out, static_cast<int64_t>(M) * N, kFn, "out");
     // Every chunk decodes into the same scratch, so it has to hold the widest one.
@@ -811,7 +844,7 @@ void w4a8_int8_gemm_chunked(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<>
     launch_w4a8_int8_gemm_chunked_kernel(
         xq.data(), qdata.data(), s_rel.data(), scale_code, opt_data(codebook), s_channel.data(),
         xs.data(), opt_data(bias), opt_code(bias), workspace.data(), out.data(), M, N, K,
-        group_size, chunk_cols, out_code, reinterpret_cast<hipStream_t>(stream_ptr));
+        group_size, chunk_cols, bits, out_code, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -839,7 +872,8 @@ bool w4a8_codebook_gemv(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<> s_r
     // the chunked path, which dispatches on scale_code.
     require_dtype(s_rel, 3, 3, kFn, "s_rel");
     require_len(xq, static_cast<int64_t>(M) * K, kFn, "xq");
-    require_len(qdata, static_cast<int64_t>(N) * (K / 2), kFn, "qdata");
+    const int bits = w4a8_bits(qdata, N, K, group_size, codebook.has_value(), kFn);
+    require_len(qdata, static_cast<int64_t>(N) * K * bits / 8, kFn, "qdata");
     require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
     require_len(out, static_cast<int64_t>(M) * N, kFn, "out");
     require_scale_len(s_channel, static_cast<size_t>(N), kFn, "s_channel");
@@ -851,7 +885,7 @@ bool w4a8_codebook_gemv(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<> s_r
 
     const bool used = launch_w4a8_codebook_gemv_kernel(
         xq.data(), qdata.data(), s_rel.data(), opt_data(codebook), s_channel.data(), xs.data(),
-        opt_data(bias), opt_code(bias), out.data(), out_code, M, N, K, group_size,
+        opt_data(bias), opt_code(bias), out.data(), out_code, M, N, K, group_size, bits,
         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
     return used;
@@ -1736,7 +1770,6 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
                             nb::ndarray<> softmax_lse, nb::ndarray<> softmax_lse_accum,
                             nb::ndarray<> output_accum, int num_splits, uintptr_t stream_ptr) {
     constexpr const char* kFn = "flash_attention_decode";
-    constexpr int kHeadDim = 128;
     constexpr int kElemsPerLoad = 4;
     if (q.ndim() != 3 || k.ndim() != 4 || v.ndim() != 4 || output.ndim() != 3 ||
         kv_lengths.ndim() != 1) {
@@ -1749,18 +1782,19 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
     require_positive(kv_capacity, kFn, "kv_capacity");
     require_positive(heads, kFn, "heads");
     const int query_length = static_cast<int>(q.shape(0)) / batch;
+    const int head_dim = static_cast<int>(q.shape(2));
     require_positive(query_length, kFn, "query_length");
     if (static_cast<int64_t>(q.shape(0)) != static_cast<int64_t>(batch) * query_length ||
-        static_cast<int>(q.shape(1)) != heads || static_cast<int>(q.shape(2)) != kHeadDim ||
-        static_cast<int>(k.shape(3)) != kHeadDim) {
+        static_cast<int>(q.shape(1)) != heads || (head_dim != 128 && head_dim != 256) ||
+        static_cast<int>(k.shape(3)) != head_dim) {
         throw std::runtime_error(std::string(kFn) + ": invalid q/k dimensions");
     }
     if (static_cast<int>(v.shape(0)) != batch || static_cast<int>(v.shape(1)) != kv_capacity ||
-        static_cast<int>(v.shape(2)) != heads || static_cast<int>(v.shape(3)) != kHeadDim) {
+        static_cast<int>(v.shape(2)) != heads || static_cast<int>(v.shape(3)) != head_dim) {
         throw std::runtime_error(std::string(kFn) + ": k/v shape mismatch");
     }
     if (output.shape(0) != q.shape(0) || static_cast<int>(output.shape(1)) != heads ||
-        static_cast<int>(output.shape(2)) != kHeadDim ||
+        static_cast<int>(output.shape(2)) != head_dim ||
         kv_lengths.size() != static_cast<size_t>(batch)) {
         throw std::runtime_error(std::string(kFn) + ": output or length shape mismatch");
     }
@@ -1778,7 +1812,7 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
     if (softmax_lse.size() != lse_size || num_splits < 1 || num_splits > 32 ||
         (num_splits > 1 &&
          (softmax_lse_accum.size() != lse_size * num_splits ||
-          output_accum.size() != lse_size * kHeadDim * num_splits))) {
+          output_accum.size() != lse_size * head_dim * num_splits))) {
         throw std::runtime_error(std::string(kFn) + ": invalid split workspace");
     }
     require_dtype(softmax_lse, 0, 0, kFn, "softmax_lse");
@@ -1847,7 +1881,7 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
         static_cast<float*>(softmax_lse.data()),
         num_splits > 1 ? static_cast<float*>(output_accum.data()) : nullptr,
         num_splits > 1 ? static_cast<float*>(softmax_lse_accum.data()) : nullptr, batch,
-        query_length, heads, kv_capacity, num_splits, q.stride(0) * query_length, q.stride(0),
+        query_length, heads, head_dim, kv_capacity, num_splits, q.stride(0) * query_length, q.stride(0),
         q.stride(1), k.stride(0), k.stride(1), k.stride(2),
         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();

@@ -25,7 +25,6 @@
 
 #include "../mma.h"
 #include "sage_common.h"
-#include "../launchers.h"  // comfy_small_igpu
 
 namespace comfy::hip_backend::sage {
 
@@ -48,6 +47,17 @@ constexpr int kLdsPad = 8;
 __forceinline__ __device__ int imin(int a, int b) { return a < b ? a : b; }
 
 constexpr int div_ceil_host(int a, int b) { return (a + b - 1) / b; }
+
+// Like CUDA's ex2.approx.ftz: probabilities this small already round to zero in
+// U8. exp2f also emits a subnormal correction around every hardware exponential.
+__forceinline__ __device__ float softmax_exp2(float value) {
+    return __builtin_amdgcn_exp2f(value);
+}
+
+// Reserve a factor of 256 in the FP32 normalization scale. This reduces how
+// often a new maximum rescales the entire running output; each tile still
+// quantizes its own probabilities over the full U8 range.
+constexpr float kSoftmaxHeadroom = 8.0f;
 
 // 16 queries per wave at every head_dim. The CUDA launcher widens D64 to 32 to
 // halve its shared-memory traffic; here the output accumulator is transposed, so
@@ -106,6 +116,22 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
     constexpr int kStrideK = HD + kLdsPad;
     constexpr int kStrideV = CTA_K + kLdsPad;
     constexpr bool kCustomMask = kMask == MaskMode::kCustom;
+#if defined(COMFY_MMA_GFX12)
+    constexpr bool kBiasPV = HD == 128 && !kCustomMask;
+#else
+    constexpr bool kBiasPV = false;
+#endif
+    // Adding a signed integer x to these bits gives the exact FP32 value
+    // 12582912 + x while |x| <= 2^22. A PV tile is bounded by
+    // CTA_K * 128 * 255, including the most negative signed INT8 value.
+    // Starting the integer MMA here lets its result feed an FP32 FMA by bitcast.
+    static_assert(CTA_K * 128 * 255 < (1 << 22));
+    constexpr int kIntBias = 0x4b400000;
+    constexpr float kFloatBias = 12582912.0f;
+    typename MmaInt8::Acc bias_acc = {
+        kIntBias, kIntBias, kIntBias, kIntBias, kIntBias, kIntBias, kIntBias, kIntBias};
+    // Materialize the shared MMA initializer once, outside the key loop.
+    if constexpr (kBiasPV) asm volatile("" : "+v"(bias_acc));
 
     __shared__ __attribute__((aligned(16))) int8_t smem_k[CTA_K * kStrideK];
     __shared__ __attribute__((aligned(16))) int8_t smem_v[HD * kStrideV];
@@ -158,6 +184,7 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
                     imin(q_idx, qo_len_padded - 1)];
     }
 
+    float o_bias[QT] = {};
     float o_val[QT][DT][8];
 #pragma unroll
     for (int fq = 0; fq < QT; ++fq) {
@@ -200,8 +227,8 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
         }
     }
 
-    constexpr int kUnitsK = HD / 8;
-    constexpr int kUnitsV = CTA_K / 8;
+    constexpr int kUnitsK = HD / 16;
+    constexpr int kUnitsV = CTA_K / 16;
 
     // `boundary` is a compile-time tag, so the interior instance carries no mask
     // test and no per-key bounds check at all.
@@ -210,28 +237,32 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
         const int kb0 = iter * CTA_K;
 
         __syncthreads();
-        // K tile: [key][d]. A row past the end is zeroed; its score is masked
-        // below. Staged straight to LDS: prefetching across the barrier was tried
-        // and loses, because this kernel waits on LDS, not on global.
+        // K tile: [key][d]. Load 16 bytes at a time, then split the LDS stores:
+        // gfx12's row padding guarantees only eight-byte alignment. A row past
+        // the end is zeroed; its score is masked below.
+#pragma unroll
         for (int idx = tid; idx < CTA_K * kUnitsK; idx += S::kThreads) {
             const int row = idx / kUnitsK;
             const int unit = idx % kUnitsK;
             const int key = kb0 + row;
-            uint2 val = {0u, 0u};
+            uint4 val = {0u, 0u, 0u, 0u};
             if (!kBoundary || key < kv_len) {
-                val = *reinterpret_cast<const uint2*>(k_head + static_cast<int64_t>(key) * HD +
-                                                      unit * 8);
+                val = *reinterpret_cast<const uint4*>(k_head + static_cast<int64_t>(key) * HD +
+                                                     unit * 16);
             }
-            *reinterpret_cast<uint2*>(smem_k + row * kStrideK + unit * 8) = val;
+            *reinterpret_cast<uint2*>(smem_k + row * kStrideK + unit * 16) = uint2{val.x, val.y};
+            *reinterpret_cast<uint2*>(smem_k + row * kStrideK + unit * 16 + 8) = uint2{val.z, val.w};
         }
         // V tile: [d][key], already transposed and zero padded by the quantizer,
         // so a whole CTA_K tile is always in bounds.
+#pragma unroll
         for (int idx = tid; idx < HD * kUnitsV; idx += S::kThreads) {
             const int row = idx / kUnitsV;
             const int unit = idx % kUnitsV;
-            *reinterpret_cast<uint2*>(smem_v + row * kStrideV + unit * 8) =
-                *reinterpret_cast<const uint2*>(v_head + static_cast<int64_t>(row) * v_stride_d +
-                                                kb0 + unit * 8);
+            const uint4 val = *reinterpret_cast<const uint4*>(
+                v_head + static_cast<int64_t>(row) * v_stride_d + kb0 + unit * 16);
+            *reinterpret_cast<uint2*>(smem_v + row * kStrideV + unit * 16) = uint2{val.x, val.y};
+            *reinterpret_cast<uint2*>(smem_v + row * kStrideV + unit * 16 + 8) = uint2{val.z, val.w};
         }
         __syncthreads();
 
@@ -259,6 +290,9 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
                         MmaInt8::load_aligned(smem_k, fk * 16 + r, dt * 16, kStrideK, lane), qf,
                         s_acc[fk]);
                 }
+                // Allow two independent matrix accumulators to overlap, while
+                // limiting the number of live K fragments and their registers.
+                if ((fk + 1) % 2 == 0) __builtin_amdgcn_sched_barrier(0);
             }
 
             const int q_idx = q_lane_idx[fq];
@@ -334,43 +368,76 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
             tile_m -= kProbU8Offset;
 
             const float m_prev = m_run[fq];
-            const float smaller = hw_exp2(-fabsf(m_prev - tile_m));
-            const float o_scale = m_prev < tile_m ? smaller : 1.0f;
-            const float tile_scale = tile_m < m_prev ? smaller : 1.0f;
-            m_run[fq] = fmaxf(m_prev, tile_m);
-            d_run[fq] *= o_scale;
-
+            const bool update_max = tile_m > m_prev;
+            const float next_m = update_max ? tile_m + kSoftmaxHeadroom : m_prev;
+            if (__any(update_max)) {
+                const float o_scale = softmax_exp2(m_prev - next_m);
+                d_run[fq] *= o_scale;
+                if constexpr (kBiasPV) o_bias[fq] *= o_scale;
 #pragma unroll
-            for (int dt = 0; dt < DT; ++dt) {
+                for (int dt = 0; dt < DT; ++dt) {
 #pragma unroll
-                for (int e = 0; e < 8; ++e) o_val[fq][dt][e] *= o_scale;
+                    for (int e = 0; e < 8; ++e) o_val[fq][dt][e] *= o_scale;
+                }
             }
+            const float tile_scale = softmax_exp2(tile_m - next_m);
+            m_run[fq] = next_m;
 
             typename MmaInt8::Frag p_frag[KT];
+#if defined(COMFY_MMA_GFX12)
+            uint32_t tile_sum_u32 = 0;
+#else
             float tile_sum = 0.0f;
+#endif
 #pragma unroll
             for (int fk = 0; fk < KT; ++fk) {
+#if defined(COMFY_MMA_GFX12)
+                uint32_t packed_lo = 0, packed_hi = 0;
+#else
                 uint32_t packed[8];
+#endif
                 const float negative_m = -tile_m;
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
                     const float p =
                         kBoundary
-                            ? hw_exp2(prob[kBoundary ? fk : 0][e] + negative_m)
-                            : hw_exp2(fmaf(static_cast<float>(s_acc[fk][e]), tile_scale_k[fk],
-                                         negative_m));
+                            ? softmax_exp2(prob[kBoundary ? fk : 0][e] + negative_m)
+                            : softmax_exp2(fmaf(static_cast<float>(s_acc[fk][e]),
+                                               tile_scale_k[fk], negative_m));
+#if defined(COMFY_MMA_GFX12)
+                    // Native conversion already rounds to nearest-even and
+                    // saturates to U8; a separate rint/clamp is redundant.
+                    if (e < 4) {
+                        packed_lo = __builtin_amdgcn_cvt_pk_u8_f32(p, e, packed_lo);
+                    } else {
+                        packed_hi = __builtin_amdgcn_cvt_pk_u8_f32(p, e - 4, packed_hi);
+                    }
+#else
                     tile_sum += p;
                     packed[e] = prob_to_u8(p);
+#endif
                 }
+#if defined(COMFY_MMA_GFX12)
+                p_frag[fk] =
+                    MmaInt8::Frag{static_cast<int>(packed_lo), static_cast<int>(packed_hi)};
+                // Normalize with the same quantized probabilities used by PV.
+                // The integer sum is exact and needs only one FP32 conversion.
+                tile_sum_u32 = __builtin_amdgcn_sad_u8(
+                    packed_hi, 0, __builtin_amdgcn_sad_u8(packed_lo, 0, tile_sum_u32));
+#else
                 p_frag[fk] = pack_prob_frag(packed, lane);
+#endif
             }
+#if defined(COMFY_MMA_GFX12)
+            const float tile_sum = static_cast<float>(tile_sum_u32);
+#endif
             d_run[fq] += tile_sum * tile_scale;
 
             // The INT32 partial covers one CTA_K tile, which is what keeps the
             // running output in FP32 without a second accumulator set per tile.
 #pragma unroll
             for (int dt = 0; dt < DT; ++dt) {
-                typename MmaInt8::Acc partial = MmaInt8::zero();
+                typename MmaInt8::Acc partial = kBiasPV ? bias_acc : MmaInt8::zero();
 #pragma unroll
                 for (int fk = 0; fk < KT; ++fk) {
                     partial = MmaInt8::mma_ub(
@@ -379,8 +446,24 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
                 }
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
-                    o_val[fq][dt][e] =
-                        fmaf(static_cast<float>(partial[e]), tile_scale, o_val[fq][dt][e]);
+                    const float value = kBiasPV ? __int_as_float(partial[e])
+                                               : static_cast<float>(partial[e]);
+                    o_val[fq][dt][e] = fmaf(value, tile_scale, o_val[fq][dt][e]);
+                }
+                if ((dt + 1) % 2 == 0) __builtin_amdgcn_sched_barrier(0);
+            }
+            if constexpr (kBiasPV) {
+                // Follow the same rescaling and FMA order as O. Cancel every
+                // eight tiles so the added bias cannot grow with sequence
+                // length and consume the precision of small output values.
+                o_bias[fq] = fmaf(kFloatBias, tile_scale, o_bias[fq]);
+                if ((iter & 7) == 7) {
+#pragma unroll
+                    for (int dt = 0; dt < DT; ++dt) {
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) o_val[fq][dt][e] -= o_bias[fq];
+                    }
+                    o_bias[fq] = 0.0f;
                 }
             }
         }
@@ -418,7 +501,8 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
                 const int d = dt * 16 + acc_row(lane, e);
-                vals[e] = o_val[fq][dt][e] * v_scale_head[d] * inv_d;
+                const float value = o_val[fq][dt][e] - (kBiasPV ? o_bias[fq] : 0.0f);
+                vals[e] = value * v_scale_head[d] * inv_d;
             }
             store_o_tile<OutT>(row, dt * 16, vals, lane);
         }
@@ -476,14 +560,6 @@ extern "C" void launch_sage_int8_attn(
     const auto* ks = static_cast<const float*>(k_scale);
     const auto* vs = static_cast<const float*>(v_scale);
 
-    // Key tile: 64 keys by default; 128 for long unmasked sequences. The wide
-    // tile was measured slower on RDNA when V is staged transposed (it doubles
-    // both LDS tiles at once), but on the 6-WGP 780M it is ~15% faster for
-    // head_dim=128 with kv_len >= 2048, so the Python layer passes 128 there.
-    // D256 has no LDS room for the wide tile (67 KB wanted against 64 KB), so
-    // the wide instantiation is only compiled for HD != 256. Tile size is a
-    // schedule, not a shape: a caller may pass 128 for a short sequence and get
-    // the same answer from the narrow tile.
 #define SAGE_ATTN_LAUNCH(HD, CK, MM, OUT)                                                        \
     launch_one<HD, CK, MM, OUT>(qi, ki, vi, static_cast<OUT*>(o), qs, ks, vs, mask,              \
                                 mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,      \
@@ -492,23 +568,21 @@ extern "C" void launch_sage_int8_attn(
                                 q_stride_h, k_stride_b, k_stride_h, v_stride_b, v_stride_h,      \
                                 v_stride_d, o_stride_b, o_stride_h, o_stride_n, sm_scale, stream)
 
-#define SAGE_ATTN_CTA(HD, MM, OUT, CK) SAGE_ATTN_LAUNCH(HD, CK, MM, OUT)
+    // One key tile, 64 keys. The CUDA backend widens to 128 for long unmasked
+    // keys; ported and measured, that is slower on RDNA, where V is staged
+    // transposed so the wide tile doubles both LDS tiles and costs more occupancy
+    // than it saves. It does not fit at D256 at all, wanting 67 KB against a
+    // 64 KB workgroup limit. A caller may still ask for 128 and get the same
+    // answer from the narrow tile: tile size is a schedule, not a shape.
+    (void)cta_k;
+#define SAGE_ATTN_CTA(HD, MM, OUT) SAGE_ATTN_LAUNCH(HD, 64, MM, OUT)
 
 #define SAGE_ATTN_OUT(HD, MM)                                                                    \
     do {                                                                                         \
         if (output_dtype_code == 1) {                                                            \
-            SAGE_ATTN_CTA(HD, MM, __half, 64);                                                   \
+            SAGE_ATTN_CTA(HD, MM, __half);                                                       \
         } else {                                                                                 \
-            SAGE_ATTN_CTA(HD, MM, __bf16, 64);                                                   \
-        }                                                                                        \
-    } while (0)
-
-#define SAGE_ATTN_OUT_WIDE(HD, MM)                                                               \
-    do {                                                                                         \
-        if (output_dtype_code == 1) {                                                            \
-            SAGE_ATTN_CTA(HD, MM, __half, 128);                                                  \
-        } else {                                                                                 \
-            SAGE_ATTN_CTA(HD, MM, __bf16, 128);                                                  \
+            SAGE_ATTN_CTA(HD, MM, __bf16);                                                       \
         }                                                                                        \
     } while (0)
 
@@ -521,24 +595,9 @@ extern "C" void launch_sage_int8_attn(
         }                                                                                        \
     } while (0)
 
-#define SAGE_ATTN_MASK_WIDE(HD)                                                                  \
-    do {                                                                                         \
-        if (mask != nullptr) {                                                                   \
-            SAGE_ATTN_OUT_WIDE(HD, MaskMode::kCustom);                                           \
-        } else {                                                                                 \
-            SAGE_ATTN_OUT_WIDE(HD, MaskMode::kNone);                                             \
-        }                                                                                        \
-    } while (0)
-
     switch (head_dim) {
         case 64: SAGE_ATTN_MASK(64); break;
-        case 128:
-            // The wide 128-key tile is a 6-WGP 780M tuning win; dGPUs keep 64.
-            if (comfy_small_igpu() && cta_k == 128)
-                SAGE_ATTN_MASK_WIDE(128);
-            else
-                SAGE_ATTN_MASK(128);
-            break;
+        case 128: SAGE_ATTN_MASK(128); break;
         case 256: SAGE_ATTN_MASK(256); break;
         default:
             throw std::runtime_error("sage int8 attention: unsupported head_dim " +
@@ -546,7 +605,6 @@ extern "C" void launch_sage_int8_attn(
     }
 
 #undef SAGE_ATTN_MASK
-#undef SAGE_ATTN_MASK_WIDE
 #undef SAGE_ATTN_OUT
 #undef SAGE_ATTN_CTA
 #undef SAGE_ATTN_LAUNCH

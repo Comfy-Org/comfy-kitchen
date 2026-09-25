@@ -100,7 +100,7 @@ __global__ void stats_finalize_kernel(const float2* __restrict__ partial, float2
                                        rsqrtf(static_cast<float>(var) + eps));
 }
 
-template <typename T, bool kNorm, bool kSilu>
+template <typename T, bool kNorm, bool kSilu, bool kZeroPad>
 __global__ void __launch_bounds__(kThreads)
 apply_kernel(const T* __restrict__ x, const float2* __restrict__ stats,
              const T* __restrict__ gamma, const T* __restrict__ beta, T* __restrict__ out,
@@ -137,8 +137,15 @@ apply_kernel(const T* __restrict__ x, const float2* __restrict__ stats,
 
     const int orow = static_cast<int>(idx / cv);
     const int c0 = static_cast<int>(idx % cv) * kVec;
-    const int y = reflect_index(orow / W_out - top, H);
-    const int xx = reflect_index(orow % W_out - left, W);
+    const int y0 = orow / W_out - top;
+    const int x0 = orow % W_out - left;
+    if (kZeroPad && (y0 < 0 || y0 >= H || x0 < 0 || x0 >= W)) {
+        // zero border, for models whose convolutions pad with zeros rather than reflecting
+        *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+        return;
+    }
+    const int y = kZeroPad ? y0 : reflect_index(y0, H);
+    const int xx = kZeroPad ? x0 : reflect_index(x0, W);
     const T* src = x + ((static_cast<int64_t>(iframe) * H + y) * W + xx) * C + c0;
 
     uint4 raw = *reinterpret_cast<const uint4*>(src);
@@ -156,7 +163,7 @@ apply_kernel(const T* __restrict__ x, const float2* __restrict__ stats,
 template <typename T>
 void launch_typed(const T* x, const T* gamma, const T* beta, T* out, float2* workspace,
                   int B, int C, int T_in, int H, int W, int G, float eps,
-                  int left, int right, int top, int bottom, int front, bool silu,
+                  int left, int right, int top, int bottom, int front, bool silu, bool zero_pad,
                   cudaStream_t stream) {
     const bool norm = gamma != nullptr;
     const int frames = B * T_in;
@@ -177,13 +184,20 @@ void launch_typed(const T* x, const T* gamma, const T* beta, T* out, float2* wor
     const int64_t out_vecs = static_cast<int64_t>(H_out) * W_out * (C / kVec);
     const dim3 grid(static_cast<unsigned>((out_vecs + kThreads - 1) / kThreads), B * T_out);
     const size_t smem = norm ? 2 * C * sizeof(float) : 0;
-#define LAUNCH_APPLY(N, S)                                                            \
-    apply_kernel<T, N, S><<<grid, kThreads, smem, stream>>>(                          \
+#define LAUNCH_APPLY(N, S, Z)                                                         \
+    apply_kernel<T, N, S, Z><<<grid, kThreads, smem, stream>>>(                       \
         x, stats, gamma, beta, out, T_in, H, W, C, G, T_out, H_out, W_out, left, top, front)
-    if (norm && silu) LAUNCH_APPLY(true, true);
-    else if (norm) LAUNCH_APPLY(true, false);
-    else if (silu) LAUNCH_APPLY(false, true);
-    else LAUNCH_APPLY(false, false);
+    if (zero_pad) {
+        if (norm && silu) LAUNCH_APPLY(true, true, true);
+        else if (norm) LAUNCH_APPLY(true, false, true);
+        else if (silu) LAUNCH_APPLY(false, true, true);
+        else LAUNCH_APPLY(false, false, true);
+    } else {
+        if (norm && silu) LAUNCH_APPLY(true, true, false);
+        else if (norm) LAUNCH_APPLY(true, false, false);
+        else if (silu) LAUNCH_APPLY(false, true, false);
+        else LAUNCH_APPLY(false, false, false);
+    }
 #undef LAUNCH_APPLY
 }
 
@@ -194,14 +208,17 @@ void launch_typed(const T* x, const T* gamma, const T* beta, T* out, float2* wor
 extern "C" void launch_group_norm_silu_pad3d(
     const void* x, const void* gamma, const void* beta, void* out, void* workspace,
     int B, int C, int T, int H, int W, int G, float eps,
-    int left, int right, int top, int bottom, int front, bool silu,
+    int left, int right, int top, int bottom, int front, bool silu, bool zero_pad,
     int dtype_code, cudaStream_t stream) {
     if (C % kVec != 0 || kThreads % (C / kVec) != 0 || (gamma != nullptr && (C % G != 0 || G > 1024))) {
         throw std::runtime_error("group_norm_silu_pad3d: unsupported channel/group count");
     }
-    if (left < 0 || right < 0 || top < 0 || bottom < 0 || front < 0
-        || left >= W || right >= W || top >= H || bottom >= H) {
-        throw std::runtime_error("group_norm_silu_pad3d: padding must be non-negative and smaller than the input");
+    if (left < 0 || right < 0 || top < 0 || bottom < 0 || front < 0) {
+        throw std::runtime_error("group_norm_silu_pad3d: padding must be non-negative");
+    }
+    // reflection needs a row to mirror; a zero border reads nothing
+    if (!zero_pad && (left >= W || right >= W || top >= H || bottom >= H)) {
+        throw std::runtime_error("group_norm_silu_pad3d: reflect padding must be smaller than the input");
     }
     // frames ride on grid.y; an oversize launch would fail silently and return `out` uninitialized
     if (static_cast<int64_t>(B) * (T + front) > 65535) {
@@ -212,13 +229,13 @@ extern "C" void launch_group_norm_silu_pad3d(
             launch_typed<half>(static_cast<const half*>(x), static_cast<const half*>(gamma),
                                static_cast<const half*>(beta), static_cast<half*>(out),
                                static_cast<float2*>(workspace), B, C, T, H, W, G, eps,
-                               left, right, top, bottom, front, silu, stream);
+                               left, right, top, bottom, front, silu, zero_pad, stream);
             break;
         case comfy::DTYPE_CODE_BFLOAT16:
             launch_typed<nv_bfloat16>(static_cast<const nv_bfloat16*>(x), static_cast<const nv_bfloat16*>(gamma),
                                       static_cast<const nv_bfloat16*>(beta), static_cast<nv_bfloat16*>(out),
                                       static_cast<float2*>(workspace), B, C, T, H, W, G, eps,
-                                      left, right, top, bottom, front, silu, stream);
+                                      left, right, top, bottom, front, silu, zero_pad, stream);
             break;
         default:
             throw std::runtime_error("group_norm_silu_pad3d: only float16 and bfloat16 are supported");

@@ -34,7 +34,9 @@ __all__ = [
     "sol_attn_chunked",
     "adaln",
     "fp16_conv3d",
+    "fp16_conv3d_out",
     "group_norm_silu_pad3d",
+    "group_norm_silu_pad3d_out",
     "rms_adaln",
     "apply_rope",
     "apply_rope_",
@@ -201,6 +203,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     _decide_codebook,
     _dequantize_w4a8_int8_weight_from_int8,
     _quantize_w4a8_chunked,
+    _w4a8_geometry,
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
@@ -216,6 +219,7 @@ from comfy_kitchen.constraints import (  # noqa: E402
     ValidationResult,
     na3d_common_call_rule,
     sol_attn_common_call_rule,
+    with_out_param,
 )
 from comfy_kitchen.float_utils import roundup  # noqa: E402
 from comfy_kitchen.registry import registry  # noqa: E402
@@ -460,9 +464,9 @@ def _should_use_convrot_fused_kernel(x: torch.Tensor, k: int, group_size: int) -
 
 
 def _should_use_convrot_dequant_kernel(x: torch.Tensor, k: int, group_size: int) -> bool:
-    # Dequant rotates each 256-wide group independently, so it does not need the
+    # Dequant rotates each group independently, so it does not need the
     # whole row staged in shared memory like ConvRot quantization does.
-    return group_size == 256 and k % 256 == 0 and k <= _CONVROT_FUSED_MAX_K
+    return group_size in (64, 256) and k % group_size == 0 and k <= _CONVROT_FUSED_MAX_K
 
 
 def get_cublas_workspace_size_bytes() -> int:
@@ -1451,6 +1455,8 @@ def quantize_w4a8_int8_weight(
     codebook: bool = True,
     codebook_tensor: torch.Tensor | None = None,
     stochastic_rounding: int = 0,
+    bits: int = 4,
+    scale_search: bool = True,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1458,12 +1464,13 @@ def quantize_w4a8_int8_weight(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Prepare W4A8 weights using native CUDA ConvRot and eager packing math."""
-    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize)
-    # Fused CUDA requant for the default codebook layout (group_size 16, fp8 scales);
-    # asym / uniform / fp32-scale / other group sizes use the chunked eager path.
+    """Prepare W4A8/W6A8 weights using native CUDA ConvRot and eager packing math."""
+    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
+    # Fused CUDA requant for the default codebook layout (4-bit, group_size 16, fp8 scales);
+    # asym / uniform / fp32-scale / other group sizes / 6-bit use the chunked eager path.
     if (
         _W4A8_FUSED_QUANT
+        and bits == 4
         and symmetric
         and codebook
         and group_size == 16
@@ -1486,6 +1493,8 @@ def quantize_w4a8_int8_weight(
         codebook=codebook,
         codebook_override=codebook_tensor,
         stochastic_rounding=stochastic_rounding,
+        bits=bits,
+        scale_search=scale_search,
     )
 
 
@@ -2219,6 +2228,41 @@ def int8_linear(
     return _finish(out)
 
 
+def _dequant_int4_grouped_to_int8(
+    qdata: torch.Tensor,
+    s_rel: torch.Tensor,
+    codebook: torch.Tensor | None,
+    group_size: int,
+) -> torch.Tensor:
+    """Native decode of packed INT4/INT6 storage to the grouped INT8 grid the GEMM consumes
+    (bit-exact with the eager decode). Shared by dequantize and the 2-pass linear."""
+    qdata = qdata.contiguous()
+    s_rel = s_rel.contiguous()
+    n, k, _bits = _w4a8_geometry(qdata, s_rel, group_size)
+    out = torch.empty(n, k, dtype=torch.int8, device=qdata.device)
+    codebook_arg = _wrap_for_dlpack(codebook.contiguous()) if codebook is not None else None
+    stream_ptr = torch.cuda.current_stream(qdata.device).cuda_stream
+    if s_rel.dtype == torch.float8_e4m3fn:
+        _C.dequant_int4_grouped_to_int8_e4m3(
+            _wrap_for_dlpack(qdata),
+            _wrap_for_dlpack(s_rel.view(torch.uint8)),
+            codebook_arg,
+            _wrap_for_dlpack(out),
+            group_size,
+            stream_ptr,
+        )
+    else:
+        _C.dequant_int4_grouped_to_int8(
+            _wrap_for_dlpack(qdata),
+            _wrap_for_dlpack(s_rel),
+            codebook_arg,
+            _wrap_for_dlpack(out),
+            group_size,
+            stream_ptr,
+        )
+    return out
+
+
 def dequantize_w4a8_int8_weight(
     qdata: torch.Tensor,
     s_rel: torch.Tensor,
@@ -2239,31 +2283,7 @@ def dequantize_w4a8_int8_weight(
         group_size,
         convrot_groupsize,
     )
-    qdata_arg = qdata.contiguous()
-    s_rel_arg = s_rel.contiguous()
-    codebook_arg = codebook.contiguous() if codebook is not None else None
-    n, k_half = qdata_arg.shape
-    int8_weight = torch.empty(n, k_half * 2, dtype=torch.int8, device=qdata.device)
-    stream_ptr = torch.cuda.current_stream(qdata.device).cuda_stream
-    wrapped_codebook = _wrap_for_dlpack(codebook_arg) if codebook_arg is not None else None
-    if s_rel_arg.dtype == torch.float8_e4m3fn:
-        _C.dequant_int4_grouped_to_int8_e4m3(
-            _wrap_for_dlpack(qdata_arg),
-            _wrap_for_dlpack(s_rel_arg.view(torch.uint8)),
-            wrapped_codebook,
-            _wrap_for_dlpack(int8_weight),
-            group_size,
-            stream_ptr,
-        )
-    else:
-        _C.dequant_int4_grouped_to_int8(
-            _wrap_for_dlpack(qdata_arg),
-            _wrap_for_dlpack(s_rel_arg),
-            wrapped_codebook,
-            _wrap_for_dlpack(int8_weight),
-            group_size,
-            stream_ptr,
-        )
+    int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
     weight_rotated = _dequantize_w4a8_int8_weight_from_int8(
         int8_weight,
         s_channel,
@@ -2286,8 +2306,8 @@ def w4a8_int8_linear(
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """CUDA W4A8 linear using chunked INT4 decode and the tuned INT8 GEMM."""
-    validate_w4a8_operands(
+    """CUDA W4A8/W6A8 linear using chunked INT4/INT6 decode and the tuned INT8 GEMM."""
+    n, k, _bits = validate_w4a8_operands(
         qdata,
         s_rel,
         s_channel,
@@ -2296,8 +2316,6 @@ def w4a8_int8_linear(
         group_size,
         convrot_groupsize,
     )
-    n, k_half = qdata.shape
-    k = k_half * 2
     if x.shape[-1] != k:
         raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={k}")
     groups = k // group_size
@@ -2353,7 +2371,34 @@ def w4a8_int8_linear(
         workspace = torch.empty(
             min(chunk_cols, n), k, dtype=torch.int8, device=x.device
         )
-        if hasattr(_C, "w4a8_codebook_linear_chunked"):
+        # Quantize the activation with the same 64-lane ConvRot kernel int8_linear uses
+        # (~2x faster than the one inside the fused binding); at small M the extra launch
+        # costs more than it saves.
+        fast_act = (
+            m >= 512
+            and convrot_groupsize == 256
+            and k % 256 == 0
+            and 256 <= k <= _CONVROT_FUSED_MAX_K
+            and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
+        )
+        if fast_act:
+            xq, xs = quantize_int8_rowwise_convrot64(x_2d, convrot_groupsize)
+            used = _C.w4a8_codebook_gemm_chunked(
+                _wrap_for_dlpack(xq),
+                _wrap_for_dlpack(qdata),
+                _wrap_for_dlpack(s_rel.view(torch.uint8)),
+                wrap_codebook(),
+                _wrap_for_dlpack(s_channel),
+                _wrap_for_dlpack(xs.reshape(m)),
+                _wrap_for_dlpack(bias_arg) if bias_arg is not None else None,
+                _wrap_for_dlpack(workspace),
+                _wrap_for_dlpack(out),
+                group_size,
+                chunk_cols,
+                output_dtype_code,
+                stream_ptr,
+            )
+        elif hasattr(_C, "w4a8_codebook_linear_chunked"):
             used = _C.w4a8_codebook_linear_chunked(
                 _wrap_for_dlpack(x_2d),
                 _wrap_for_dlpack(xq),
@@ -2409,25 +2454,7 @@ def w4a8_int8_linear(
             stream_ptr,
         )
 
-    int8_weight = torch.empty(n, k, dtype=torch.int8, device=x.device)
-    if s_rel.dtype == torch.float8_e4m3fn:
-        _C.dequant_int4_grouped_to_int8_e4m3(
-            _wrap_for_dlpack(qdata),
-            _wrap_for_dlpack(s_rel.view(torch.uint8)),
-            wrap_codebook(),
-            _wrap_for_dlpack(int8_weight),
-            group_size,
-            stream_ptr,
-        )
-    else:
-        _C.dequant_int4_grouped_to_int8(
-            _wrap_for_dlpack(qdata),
-            _wrap_for_dlpack(s_rel),
-            wrap_codebook(),
-            _wrap_for_dlpack(int8_weight),
-            group_size,
-            stream_ptr,
-        )
+    int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
 
     used = _C.cutlass_int8_dequant(
         _wrap_for_dlpack(xq),
@@ -2905,9 +2932,25 @@ def _zero_vector(n: int, device: torch.device, dtype: torch.dtype = torch.float1
     return vec
 
 
-def _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-1):
+def _ndhwc_strides(t: torch.Tensor):
+    """(w, h, d, n) element strides of an NDHWC-ordered view with a dense channel row, else None.
+    Strides must keep the kernel's 16-byte vector accesses aligned."""
+    n, c = t.shape[0], t.shape[1]
+    st = t.stride()
+    if t.dim() != 5 or st[1] != 1 or st[4] != c:
+        return None
+    # never applied for a batch of one, and a frame window carries the whole tensor's, which
+    # may not fit the kernel's 32-bit strides
+    strides = (st[4], st[3], st[2], 0 if n == 1 else st[0])
+    if any(s % 8 for s in strides) or any(s > 2**31 - 1 for s in strides):
+        return None
+    return strides
+
+
+def _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-1, out=None):
     """The fused kernel, or None when it does not apply to this call.
-    config forces a tile config (benchmarking); -1 selects by shape."""
+    config forces a tile config (benchmarking); -1 selects by shape. x and out may be
+    NDHWC-ordered views of larger tensors, so a tiled convolution needs no per-tile copies."""
     n, c, d, h, w = x.shape
     k, _, t, r, s = weight.shape
     sd, sh, sw = stride
@@ -2928,19 +2971,35 @@ def _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-1):
         x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, 0, 0, 8 - c))
         weight = torch.nn.functional.pad(weight, (0, 0, 0, 0, 0, 0, 0, 8 - c))
         c = 8
-    x = x.contiguous(memory_format=torch.channels_last_3d)
+    xs = _ndhwc_strides(x)
+    if xs is None or x.is_contiguous(memory_format=torch.channels_last_3d):
+        x = x.contiguous(memory_format=torch.channels_last_3d)
+        xs = (0, 0, 0, 0)
     weight = weight.contiguous(memory_format=torch.channels_last_3d)
     bias = bias.contiguous() if bias is not None else _zero_vector(k, x.device)
     residual = (residual.contiguous(memory_format=torch.channels_last_3d) if residual is not None
                 else _zero_vector(k, x.device))
-    if not (_aligned16(x) and _aligned16(weight) and _aligned16(bias) and _aligned16(residual)):
+    if out is None:
+        out = torch.empty((n, k, z, p, q), dtype=torch.float16, device=x.device, memory_format=torch.channels_last_3d)
+        os = (0, 0, 0, 0)
+    else:
+        if out.shape != (n, k, z, p, q) or out.dtype != torch.float16 or out.device != x.device:
+            raise ValueError("fp16_conv3d: out must be an fp16 [N, K, Z, P, Q] tensor on x's device")
+        if out.is_contiguous(memory_format=torch.channels_last_3d):
+            os = (0, 0, 0, 0)
+        else:
+            # the epilogue writes a packed 2-D [N*Z*P*Q, K] matrix, so only a frame window of a
+            # single batch fits; anything else falls back to torch and a copy
+            os = _ndhwc_strides(out)
+            if os is None or os != (k, q * k, p * q * k, 0 if n == 1 else z * p * q * k):
+                return None
+    if not (_aligned16(x) and _aligned16(weight) and _aligned16(bias) and _aligned16(residual) and _aligned16(out)):
         return None
-    out = torch.empty((n, k, z, p, q), dtype=torch.float16, device=x.device, memory_format=torch.channels_last_3d)
     ok = _C.cutlass_fp16_conv3d(
         _wrap_for_dlpack(x), _wrap_for_dlpack(weight), _wrap_for_dlpack(bias),
         _wrap_for_dlpack(residual), _wrap_for_dlpack(out),
         n, d, h, w, c, k, t, r, s, sd, sh, sw,
-        torch.cuda.current_stream(x.device).cuda_stream, config,
+        torch.cuda.current_stream(x.device).cuda_stream, config, *xs, *os,
     )
     return out if ok else None
 
@@ -2961,6 +3020,21 @@ def fp16_conv3d(
     return out if residual is None else out + residual
 
 
+def fp16_conv3d_out(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    stride: list[int],
+    out: torch.Tensor,
+) -> None:
+    """fp16_conv3d into ``out``; torch's conv plus a copy when the kernel declines the shape."""
+    if _cutlass_fp16_conv3d(x, weight, bias, residual, stride, out=out) is not None:
+        return
+    res = torch.nn.functional.conv3d(x, weight, bias, stride=stride)
+    out.copy_(res if residual is None else res + residual)
+
+
 def group_norm_silu_pad3d(
     x: torch.Tensor,
     weight: torch.Tensor | None,
@@ -2969,41 +3043,65 @@ def group_norm_silu_pad3d(
     eps: float,
     pad: list[int],
     silu: bool,
+    zero_pad: bool = False,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Per-frame GroupNorm + SiLU + causal conv padding in one pass; the result
-    is channels_last_3d (NDHWC), the layout cuDNN runs fp16/bf16 convs in."""
+    """Per-frame GroupNorm + SiLU + causal conv padding in one pass, channels_last_3d out.
+    ``out`` is written in place where the kernel can index it, else copied into."""
     b, c, t, h, w = x.shape
     left, right, top, bottom, front = pad
-    # the affine params may be fp32 (the registry admits it); every path,
-    # including torch's group_norm on the fallbacks, wants them in x's dtype
     if min(pad) < 0:
         raise ValueError("group_norm_silu_pad3d: padding must be non-negative")
-    if weight is not None:
+    if weight is not None:  # the affine params may be fp32; every path wants x's dtype
         weight = weight.to(x.dtype).contiguous()
         bias = _zero_vector(c, x.device, x.dtype) if bias is None else bias.to(x.dtype).contiguous()
-    if (c % 8 or 256 % (c // 8) or (weight is not None and (c % num_groups or num_groups > 1024))
-            or max(left, right) >= w or max(top, bottom) >= h or b * (t + front) > 65535):
-        return _eager_group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu)
+    served = not (c % 8 or 256 % (c // 8) or (weight is not None and (c % num_groups or num_groups > 1024))
+                  or (not zero_pad and (max(left, right) >= w or max(top, bottom) >= h))
+                  or b * (t + front) > 65535)
+    if served:
+        x = x.contiguous(memory_format=torch.channels_last_3d)
+        served = _aligned16(x)  # the kernels issue 16-byte vector loads
+    if not served:
+        res = _eager_group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad)
+        if out is None:
+            return res
+        out.copy_(res)
+        return out
 
-    x = x.contiguous(memory_format=torch.channels_last_3d)
-    if not _aligned16(x):  # the kernels issue 16-byte vector loads
-        return _eager_group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu)
-    out = torch.empty((b, c, t + front, h + top + bottom, w + left + right),
-                      dtype=x.dtype, device=x.device, memory_format=torch.channels_last_3d)
+    dst = out if out is not None and _writes_packed_ndhwc(out) and _aligned16(out) else None
+    if dst is None:
+        dst = torch.empty((b, c, t + front, h + top + bottom, w + left + right),
+                          dtype=x.dtype, device=x.device, memory_format=torch.channels_last_3d)
     placeholder = _empty_cuda_tensor(x.device, torch.float32)
     if weight is not None:
         chunks = -(-(h * w) // 1024)
         workspace = torch.empty(2 * b * t * (chunks * c + num_groups), dtype=torch.float32, device=x.device)
     else:
         weight = bias = workspace = placeholder
-
     _C.group_norm_silu_pad3d(
         _wrap_for_dlpack(x), _wrap_for_dlpack(weight), _wrap_for_dlpack(bias),
-        _wrap_for_dlpack(out), _wrap_for_dlpack(workspace),
-        b, c, t, h, w, num_groups, eps, left, right, top, bottom, front, silu,
+        _wrap_for_dlpack(dst), _wrap_for_dlpack(workspace),
+        b, c, t, h, w, num_groups, eps, left, right, top, bottom, front, silu, zero_pad,
         DTYPE_TO_CODE[x.dtype], torch.cuda.current_stream(x.device).cuda_stream,
     )
+    if out is None or dst is out:
+        return dst
+    out.copy_(dst)
     return out
+
+
+def _writes_packed_ndhwc(out: torch.Tensor) -> bool:
+    """Packed channels_last_3d, or for a batch of one a frame-offset view of a longer buffer."""
+    if out.is_contiguous(memory_format=torch.channels_last_3d):
+        return True
+    b, c, _, h, w = out.shape
+    st = out.stride()
+    return b == 1 and st[1] == 1 and st[4] == c and st[3] == w * c and st[2] == h * w * c
+
+
+def group_norm_silu_pad3d_out(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out) -> None:
+    """group_norm_silu_pad3d into ``out``; a frame-offset view leaves room for a caller's halo."""
+    group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out=out)
 
 
 def _apply_rope1_cuda(
@@ -4368,6 +4466,9 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         constraints[inplace_name] = constraints[functional_name]
+    for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
+        if name in constraints:
+            constraints[name + "_out"] = with_out_param(constraints[name])
     return constraints
 
 
