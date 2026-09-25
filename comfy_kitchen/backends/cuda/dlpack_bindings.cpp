@@ -294,13 +294,15 @@ extern "C" {
     bool launch_cutlass_fp16_conv3d(
         const void* x, const void* w, const void* bias, const void* resid, bool resid_full, void* out,
         int N, int D, int H, int W, int C, int K, int T, int R, int S, int Z, int P, int Q,
-        int sd, int sh, int sw, int config, cudaStream_t stream);
+        int sd, int sh, int sw, int config,
+        int xs_w, int xs_h, int xs_d, int xs_n, int os_w, int os_h, int os_d, int os_n,
+        cudaStream_t stream);
 
     // Per-frame GroupNorm + SiLU + causal conv padding in NDHWC — see ops/group_norm_pad3d.cu.
     void launch_group_norm_silu_pad3d(
         const void* x, const void* gamma, const void* beta, void* out, void* workspace,
         int B, int C, int T, int H, int W, int G, float eps,
-        int left, int right, int top, int bottom, int front, bool silu,
+        int left, int right, int top, int bottom, int front, bool silu, bool zero_pad,
         int dtype_code, cudaStream_t stream);
 
     // Fused AdaLN — see ops/adaln.cu. subtract_mean selects LayerNorm (true)
@@ -1725,8 +1727,14 @@ bool cutlass_fp16_conv3d(
     int64_t N, int64_t D, int64_t H, int64_t W, int64_t C,
     int64_t K, int64_t T, int64_t R, int64_t S,
     int64_t sd, int64_t sh, int64_t sw,
-    uintptr_t stream_ptr, int64_t config = -1)
+    uintptr_t stream_ptr, int64_t config = -1,
+    int64_t xs_w = 0, int64_t xs_h = 0, int64_t xs_d = 0, int64_t xs_n = 0,
+    int64_t os_w = 0, int64_t os_h = 0, int64_t os_d = 0, int64_t os_n = 0)
 {
+    // strides are element counts and index with int32 inside CUTLASS
+    for (int64_t s : {xs_w, xs_h, xs_d, xs_n, os_w, os_h, os_d, os_n}) {
+        if (s < 0 || s > INT32_MAX) throw std::invalid_argument("cutlass_fp16_conv3d: stride out of range");
+    }
     if (sd <= 0 || sh <= 0 || sw <= 0) {
         throw std::invalid_argument("cutlass_fp16_conv3d: strides must be positive");
     }
@@ -1749,7 +1757,10 @@ bool cutlass_fp16_conv3d(
         static_cast<int>(N), static_cast<int>(D), static_cast<int>(H), static_cast<int>(W), static_cast<int>(C),
         static_cast<int>(K), static_cast<int>(T), static_cast<int>(R), static_cast<int>(S),
         static_cast<int>(Z), static_cast<int>(P), static_cast<int>(Q),
-        static_cast<int>(sd), static_cast<int>(sh), static_cast<int>(sw), static_cast<int>(config), stream);
+        static_cast<int>(sd), static_cast<int>(sh), static_cast<int>(sw), static_cast<int>(config),
+        static_cast<int>(xs_w), static_cast<int>(xs_h), static_cast<int>(xs_d), static_cast<int>(xs_n),
+        static_cast<int>(os_w), static_cast<int>(os_h), static_cast<int>(os_d), static_cast<int>(os_n),
+        stream);
 }
 
 // Nanobind wrapper for the fused per-frame GroupNorm + SiLU + causal padding.
@@ -1765,6 +1776,7 @@ void group_norm_silu_pad3d(
     float eps,
     int64_t left, int64_t right, int64_t top, int64_t bottom, int64_t front,
     bool silu,
+    bool zero_pad,
     int dtype_code,
     uintptr_t stream_ptr)
 {
@@ -1787,7 +1799,7 @@ void group_norm_silu_pad3d(
         static_cast<int>(B), static_cast<int>(C), static_cast<int>(T), static_cast<int>(H), static_cast<int>(W),
         static_cast<int>(num_groups), eps,
         static_cast<int>(left), static_cast<int>(right), static_cast<int>(top), static_cast<int>(bottom),
-        static_cast<int>(front), silu, dtype_code, stream);
+        static_cast<int>(front), silu, zero_pad, dtype_code, stream);
 }
 
 // Python module definition
@@ -4458,7 +4470,9 @@ NB_MODULE(_C, m) {
           nb::arg("x"), nb::arg("w"), nb::arg("bias"), nb::arg("residual"), nb::arg("out"),
           nb::arg("N"), nb::arg("D"), nb::arg("H"), nb::arg("W"), nb::arg("C"),
           nb::arg("K"), nb::arg("T"), nb::arg("R"), nb::arg("S"),
-          nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("stream_ptr"), nb::arg("config") = -1);
+          nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("stream_ptr"), nb::arg("config") = -1,
+          nb::arg("xs_w") = 0, nb::arg("xs_h") = 0, nb::arg("xs_d") = 0, nb::arg("xs_n") = 0,
+          nb::arg("os_w") = 0, nb::arg("os_h") = 0, nb::arg("os_d") = 0, nb::arg("os_n") = 0);
 
     m.def("group_norm_silu_pad3d", &group_norm_silu_pad3d,
           "Per-frame GroupNorm + SiLU + causal conv padding, NDHWC",
@@ -4466,7 +4480,7 @@ NB_MODULE(_C, m) {
           nb::arg("B"), nb::arg("C"), nb::arg("T"), nb::arg("H"), nb::arg("W"),
           nb::arg("num_groups"), nb::arg("eps"),
           nb::arg("left"), nb::arg("right"), nb::arg("top"), nb::arg("bottom"), nb::arg("front"),
-          nb::arg("silu"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
+          nb::arg("silu"), nb::arg("zero_pad"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
 
     m.def("adaln", &adaln,
           "Fused AdaLN: layernorm(x) * (1 + scale) + shift",

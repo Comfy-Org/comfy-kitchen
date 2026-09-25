@@ -361,6 +361,29 @@ class TestTensorWiseINT8Layout:
             assert dq.dtype == dtype
             assert dq.shape == w.shape
 
+    @pytest.mark.parametrize("group_size", [64, 256])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    def test_convrot_dequant_kernel_matches_float32_reference(self, seed, group_size, dtype):
+        """The fused ConvRot dequant rotates in float32 and rounds to the output dtype once, like the
+        float32 rotate-then-cast reference, including rows whose scale is near zero."""
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
+        from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_weight
+
+        rows, k = 257, 3 * group_size
+        q = torch.randint(-127, 128, (rows, k), device="cuda", dtype=torch.int8)
+        scale = torch.rand(rows, 1, device="cuda") * 1e-2
+        scale[0] = 1e-9
+        assert cuda._should_use_convrot_dequant_kernel(q, k, group_size)
+        out = cuda.dequantize_int8_convrot_weight_dtype(q, scale, group_size, cuda.DTYPE_TO_CODE[dtype])
+        h = _build_hadamard(group_size, device="cuda", dtype=torch.float32)
+        ref = _rotate_weight(q.float() * scale, h, group_size)
+        assert out.dtype == dtype
+        # a single rounding of a value within float32 summation-order tolerance of the reference
+        tol = 8 * torch.finfo(torch.float32).eps * ref.abs().amax(dim=1, keepdim=True)
+        lo, hi = (ref - tol).to(dtype).float(), (ref + tol).to(dtype).float()
+        assert ((out.float() >= lo) & (out.float() <= hi)).all()
+
     def test_weight_roundtrip_error(self, seed):
         """Roundtrip error stays within INT8 quantization tolerance."""
         from comfy_kitchen.tensor import QuantizedTensor

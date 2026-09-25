@@ -62,9 +62,11 @@ __all__ = [
     "na3d",
     "rms_adaln",
     "fp16_conv3d",
+    "fp16_conv3d_out",
     "fp16_linear",
     "gemv_awq_w4a16",
     "group_norm_silu_pad3d",
+    "group_norm_silu_pad3d_out",
     "quantize_svdquant_w4a4",
     "scaled_mm_svdquant_w4a4",
     "apply_rope",
@@ -191,10 +193,17 @@ _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 # registry-dispatched GEMMs so _build_constraints can drop them on RDNA2; the fp8
 # GEMM is not among them because it is reached through scaled_mm_v2's _hip_fp8_gemm,
 # which gates on has_wmma() itself rather than through the registry.
-_TILED_ATTENTION_OPS = frozenset(
+_WMMA_ONLY_OPS = frozenset(
     {
+        "fp16_conv3d",
+        "fp16_conv3d_out",
+        "fp16_linear",
+        "int8_linear",
         "na3d",
         "sol_attn",
+        "convrot_w4a4_linear",
+        "scaled_mm_svdquant_w4a4",
+        "w4a8_int8_linear",
     }
 )
 
@@ -1909,6 +1918,18 @@ def fp16_conv3d(
     return out if residual is None else out + residual
 
 
+def fp16_conv3d_out(x, weight, bias, residual, stride, out) -> None:
+    out.copy_(fp16_conv3d(x, weight, bias, residual, stride))
+
+
+def group_norm_silu_pad3d_out(
+    x, weight, bias, num_groups, eps, pad, silu, zero_pad, out
+) -> None:
+    out.copy_(
+        group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad)
+    )
+
+
 def group_norm_silu_pad3d(
     x: torch.Tensor,
     weight: torch.Tensor | None,
@@ -1917,9 +1938,15 @@ def group_norm_silu_pad3d(
     eps: float,
     pad: list[int],
     silu: bool,
+    zero_pad: bool = False,
 ) -> torch.Tensor:
     """Per-frame GroupNorm + SiLU + causal conv padding in one pass; the result is
     channels_last_3d, like the CUDA kernel. Shapes it declines run the eager op."""
+    if zero_pad:
+        # The HIP kernel only reflects; eager is correct, just not fused.
+        return _eager.group_norm_silu_pad3d(
+            x, weight, bias, num_groups, eps, pad, silu, zero_pad
+        )
     b, c, t, h, w = x.shape
     left, right, top, bottom, front = pad
     if min(pad) < 0:
@@ -2802,6 +2829,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ValidationResult,
         na3d_common_call_rule,
         sol_attn_common_call_rule,
+        with_out_param,
     )
 
     # PyTorch exposes ROCm tensors with device type "cuda".
@@ -3212,6 +3240,9 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             k: v for k, v in constraints.items() if k not in _TILED_ATTENTION_OPS
         }
 
+    for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
+        if name in constraints:
+            constraints[name + "_out"] = with_out_param(constraints[name])
     return constraints
 
 

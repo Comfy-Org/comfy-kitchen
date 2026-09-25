@@ -34,7 +34,9 @@ __all__ = [
     "sol_attn_chunked",
     "adaln",
     "fp16_conv3d",
+    "fp16_conv3d_out",
     "group_norm_silu_pad3d",
+    "group_norm_silu_pad3d_out",
     "rms_adaln",
     "apply_rope",
     "apply_rope_",
@@ -217,6 +219,7 @@ from comfy_kitchen.constraints import (  # noqa: E402
     ValidationResult,
     na3d_common_call_rule,
     sol_attn_common_call_rule,
+    with_out_param,
 )
 from comfy_kitchen.float_utils import roundup  # noqa: E402
 from comfy_kitchen.registry import registry  # noqa: E402
@@ -461,9 +464,9 @@ def _should_use_convrot_fused_kernel(x: torch.Tensor, k: int, group_size: int) -
 
 
 def _should_use_convrot_dequant_kernel(x: torch.Tensor, k: int, group_size: int) -> bool:
-    # Dequant rotates each 256-wide group independently, so it does not need the
+    # Dequant rotates each group independently, so it does not need the
     # whole row staged in shared memory like ConvRot quantization does.
-    return group_size == 256 and k % 256 == 0 and k <= _CONVROT_FUSED_MAX_K
+    return group_size in (64, 256) and k % group_size == 0 and k <= _CONVROT_FUSED_MAX_K
 
 
 def get_cublas_workspace_size_bytes() -> int:
@@ -2929,9 +2932,25 @@ def _zero_vector(n: int, device: torch.device, dtype: torch.dtype = torch.float1
     return vec
 
 
-def _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-1):
+def _ndhwc_strides(t: torch.Tensor):
+    """(w, h, d, n) element strides of an NDHWC-ordered view with a dense channel row, else None.
+    Strides must keep the kernel's 16-byte vector accesses aligned."""
+    n, c = t.shape[0], t.shape[1]
+    st = t.stride()
+    if t.dim() != 5 or st[1] != 1 or st[4] != c:
+        return None
+    # never applied for a batch of one, and a frame window carries the whole tensor's, which
+    # may not fit the kernel's 32-bit strides
+    strides = (st[4], st[3], st[2], 0 if n == 1 else st[0])
+    if any(s % 8 for s in strides) or any(s > 2**31 - 1 for s in strides):
+        return None
+    return strides
+
+
+def _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-1, out=None):
     """The fused kernel, or None when it does not apply to this call.
-    config forces a tile config (benchmarking); -1 selects by shape."""
+    config forces a tile config (benchmarking); -1 selects by shape. x and out may be
+    NDHWC-ordered views of larger tensors, so a tiled convolution needs no per-tile copies."""
     n, c, d, h, w = x.shape
     k, _, t, r, s = weight.shape
     sd, sh, sw = stride
@@ -2952,19 +2971,35 @@ def _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-1):
         x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, 0, 0, 8 - c))
         weight = torch.nn.functional.pad(weight, (0, 0, 0, 0, 0, 0, 0, 8 - c))
         c = 8
-    x = x.contiguous(memory_format=torch.channels_last_3d)
+    xs = _ndhwc_strides(x)
+    if xs is None or x.is_contiguous(memory_format=torch.channels_last_3d):
+        x = x.contiguous(memory_format=torch.channels_last_3d)
+        xs = (0, 0, 0, 0)
     weight = weight.contiguous(memory_format=torch.channels_last_3d)
     bias = bias.contiguous() if bias is not None else _zero_vector(k, x.device)
     residual = (residual.contiguous(memory_format=torch.channels_last_3d) if residual is not None
                 else _zero_vector(k, x.device))
-    if not (_aligned16(x) and _aligned16(weight) and _aligned16(bias) and _aligned16(residual)):
+    if out is None:
+        out = torch.empty((n, k, z, p, q), dtype=torch.float16, device=x.device, memory_format=torch.channels_last_3d)
+        os = (0, 0, 0, 0)
+    else:
+        if out.shape != (n, k, z, p, q) or out.dtype != torch.float16 or out.device != x.device:
+            raise ValueError("fp16_conv3d: out must be an fp16 [N, K, Z, P, Q] tensor on x's device")
+        if out.is_contiguous(memory_format=torch.channels_last_3d):
+            os = (0, 0, 0, 0)
+        else:
+            # the epilogue writes a packed 2-D [N*Z*P*Q, K] matrix, so only a frame window of a
+            # single batch fits; anything else falls back to torch and a copy
+            os = _ndhwc_strides(out)
+            if os is None or os != (k, q * k, p * q * k, 0 if n == 1 else z * p * q * k):
+                return None
+    if not (_aligned16(x) and _aligned16(weight) and _aligned16(bias) and _aligned16(residual) and _aligned16(out)):
         return None
-    out = torch.empty((n, k, z, p, q), dtype=torch.float16, device=x.device, memory_format=torch.channels_last_3d)
     ok = _C.cutlass_fp16_conv3d(
         _wrap_for_dlpack(x), _wrap_for_dlpack(weight), _wrap_for_dlpack(bias),
         _wrap_for_dlpack(residual), _wrap_for_dlpack(out),
         n, d, h, w, c, k, t, r, s, sd, sh, sw,
-        torch.cuda.current_stream(x.device).cuda_stream, config,
+        torch.cuda.current_stream(x.device).cuda_stream, config, *xs, *os,
     )
     return out if ok else None
 
@@ -2985,6 +3020,21 @@ def fp16_conv3d(
     return out if residual is None else out + residual
 
 
+def fp16_conv3d_out(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    stride: list[int],
+    out: torch.Tensor,
+) -> None:
+    """fp16_conv3d into ``out``; torch's conv plus a copy when the kernel declines the shape."""
+    if _cutlass_fp16_conv3d(x, weight, bias, residual, stride, out=out) is not None:
+        return
+    res = torch.nn.functional.conv3d(x, weight, bias, stride=stride)
+    out.copy_(res if residual is None else res + residual)
+
+
 def group_norm_silu_pad3d(
     x: torch.Tensor,
     weight: torch.Tensor | None,
@@ -2993,41 +3043,65 @@ def group_norm_silu_pad3d(
     eps: float,
     pad: list[int],
     silu: bool,
+    zero_pad: bool = False,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Per-frame GroupNorm + SiLU + causal conv padding in one pass; the result
-    is channels_last_3d (NDHWC), the layout cuDNN runs fp16/bf16 convs in."""
+    """Per-frame GroupNorm + SiLU + causal conv padding in one pass, channels_last_3d out.
+    ``out`` is written in place where the kernel can index it, else copied into."""
     b, c, t, h, w = x.shape
     left, right, top, bottom, front = pad
-    # the affine params may be fp32 (the registry admits it); every path,
-    # including torch's group_norm on the fallbacks, wants them in x's dtype
     if min(pad) < 0:
         raise ValueError("group_norm_silu_pad3d: padding must be non-negative")
-    if weight is not None:
+    if weight is not None:  # the affine params may be fp32; every path wants x's dtype
         weight = weight.to(x.dtype).contiguous()
         bias = _zero_vector(c, x.device, x.dtype) if bias is None else bias.to(x.dtype).contiguous()
-    if (c % 8 or 256 % (c // 8) or (weight is not None and (c % num_groups or num_groups > 1024))
-            or max(left, right) >= w or max(top, bottom) >= h or b * (t + front) > 65535):
-        return _eager_group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu)
+    served = not (c % 8 or 256 % (c // 8) or (weight is not None and (c % num_groups or num_groups > 1024))
+                  or (not zero_pad and (max(left, right) >= w or max(top, bottom) >= h))
+                  or b * (t + front) > 65535)
+    if served:
+        x = x.contiguous(memory_format=torch.channels_last_3d)
+        served = _aligned16(x)  # the kernels issue 16-byte vector loads
+    if not served:
+        res = _eager_group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad)
+        if out is None:
+            return res
+        out.copy_(res)
+        return out
 
-    x = x.contiguous(memory_format=torch.channels_last_3d)
-    if not _aligned16(x):  # the kernels issue 16-byte vector loads
-        return _eager_group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu)
-    out = torch.empty((b, c, t + front, h + top + bottom, w + left + right),
-                      dtype=x.dtype, device=x.device, memory_format=torch.channels_last_3d)
+    dst = out if out is not None and _writes_packed_ndhwc(out) and _aligned16(out) else None
+    if dst is None:
+        dst = torch.empty((b, c, t + front, h + top + bottom, w + left + right),
+                          dtype=x.dtype, device=x.device, memory_format=torch.channels_last_3d)
     placeholder = _empty_cuda_tensor(x.device, torch.float32)
     if weight is not None:
         chunks = -(-(h * w) // 1024)
         workspace = torch.empty(2 * b * t * (chunks * c + num_groups), dtype=torch.float32, device=x.device)
     else:
         weight = bias = workspace = placeholder
-
     _C.group_norm_silu_pad3d(
         _wrap_for_dlpack(x), _wrap_for_dlpack(weight), _wrap_for_dlpack(bias),
-        _wrap_for_dlpack(out), _wrap_for_dlpack(workspace),
-        b, c, t, h, w, num_groups, eps, left, right, top, bottom, front, silu,
+        _wrap_for_dlpack(dst), _wrap_for_dlpack(workspace),
+        b, c, t, h, w, num_groups, eps, left, right, top, bottom, front, silu, zero_pad,
         DTYPE_TO_CODE[x.dtype], torch.cuda.current_stream(x.device).cuda_stream,
     )
+    if out is None or dst is out:
+        return dst
+    out.copy_(dst)
     return out
+
+
+def _writes_packed_ndhwc(out: torch.Tensor) -> bool:
+    """Packed channels_last_3d, or for a batch of one a frame-offset view of a longer buffer."""
+    if out.is_contiguous(memory_format=torch.channels_last_3d):
+        return True
+    b, c, _, h, w = out.shape
+    st = out.stride()
+    return b == 1 and st[1] == 1 and st[4] == c and st[3] == w * c and st[2] == h * w * c
+
+
+def group_norm_silu_pad3d_out(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out) -> None:
+    """group_norm_silu_pad3d into ``out``; a frame-offset view leaves room for a caller's halo."""
+    group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out=out)
 
 
 def _apply_rope1_cuda(
@@ -4392,6 +4466,9 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         constraints[inplace_name] = constraints[functional_name]
+    for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
+        if name in constraints:
+            constraints[name + "_out"] = with_out_param(constraints[name])
     return constraints
 
 
