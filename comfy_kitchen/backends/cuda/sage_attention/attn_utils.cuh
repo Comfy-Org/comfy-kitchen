@@ -692,7 +692,7 @@ __device__ __forceinline__ void update_mdo_i32_u8(
         RO[fq][fv][k * 2 + 5] *= o_scale;
       }
 
-      const float negative_m = (add_bias ? tile_bias : 0.0f) - tile_m;
+      const float negative_m = add_bias ? tile_bias - tile_m : -tile_m;
 #pragma unroll
       for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++) {
         const PackedU8RowSum probabilities_0 = pack_scaled_exp2_u8x4(
