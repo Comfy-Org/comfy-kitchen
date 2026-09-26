@@ -1771,6 +1771,7 @@ def test_quantize_int8_tensorwise_matches_eager():
         ("scalar", ()),
         ("elementwise", (3, 4, 32)),
         ("rowwise", (3, 4, 1)),
+        ("one_element_extra_dims", (1, 1, 1, 1)),
     ],
 )
 @pytest.mark.parametrize(

@@ -477,7 +477,7 @@ def dequantize_int8_simple_dtype(
     output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     inner_dim = q.shape[-1] if q.dim() > 0 else 1
 
-    if scale.numel() == 1:
+    if scale.numel() == 1 and scale.dim() <= q.dim():
         scale_mode = 0
     elif tuple(scale.shape) == tuple(q.shape):
         scale_mode = 1
