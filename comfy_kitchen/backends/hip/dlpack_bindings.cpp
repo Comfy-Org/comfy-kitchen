@@ -103,7 +103,7 @@ void launch_group_norm_silu_pad3d(const void*, const void*, const void*, void*, 
                                   int, int, int, int, float, int, int, int, int, int, bool, bool,
                                   int, hipStream_t);
 void launch_gemv_awq_kernel(const void*, const void*, const void*, const void*, const void*, void*,
-                            int, int, int, int, int, int, int, int, hipStream_t);
+                            int, int, int, int, int, int, int, int, bool, hipStream_t);
 void launch_svdquant_lora_down_kernel(const void*, const void*, void*, int, int, int, int, int,
                                       hipStream_t);
 void launch_svdquant_quant_kernel(const void*, const void*, void*, void*, int, int, int, int, int,
@@ -1157,7 +1157,7 @@ void rms_rope(nb::ndarray<> q, OptArray k, nb::ndarray<> freqs, nb::ndarray<> q_
 
 void gemv_awq_w4a16(nb::ndarray<> x, nb::ndarray<> qweight, nb::ndarray<> wscales,
                     nb::ndarray<> wzeros, OptArray bias, nb::ndarray<> out, int M, int N, int K,
-                    int group_size, uintptr_t stream_ptr) {
+                    int group_size, bool use_wmma, uintptr_t stream_ptr) {
     constexpr const char* kFn = "gemv_awq_w4a16";
     require_nonneg(M, kFn, "M");
     require_nonneg(N, kFn, "N");
@@ -1188,7 +1188,7 @@ void gemv_awq_w4a16(nb::ndarray<> x, nb::ndarray<> qweight, nb::ndarray<> wscale
     launch_gemv_awq_kernel(x.data(), qweight.data(), wscales.data(), wzeros.data(), opt_data(bias),
                            out.data(), M, N, K, group_size, map_dtype_to_code(x.dtype()),
                            map_dtype_to_code(wscales.dtype()), opt_code(bias),
-                           map_dtype_to_code(out.dtype()),
+                           map_dtype_to_code(out.dtype()), use_wmma,
                            reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
