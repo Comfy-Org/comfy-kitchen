@@ -112,21 +112,6 @@ void launch_na3d_kernel(const void *, const void *, const void *, void *, int,
                         int, int, int, int, int, int, int, int, int, int, int,
                         float, int, hipStream_t);
 
-void launch_sage_quant_qk_int8(const void *, void *, void *, const void *,
-                               void *, void *, void *, int, int, int, int, int,
-                               int, int, int, int64_t, int64_t, int64_t,
-                               int64_t, int64_t, int64_t, int, int,
-                               hipStream_t);
-void launch_sage_quant_v_int8(const void *, void *, void *, int, int, int, int,
-                              int, int64_t, int64_t, int64_t, int, hipStream_t);
-void launch_sage_int8_attn(const void *, const void *, const void *, void *,
-                           const void *, const void *, const void *,
-                           const void *, int64_t, int64_t, int64_t, int64_t,
-                           int, int, int, int, int, int, int, int, int, int,
-                           int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                           int64_t, int64_t, int64_t, int64_t, float, int,
-                           hipStream_t);
-
 void launch_adaln_kernel(const void *, const void *, const void *, void *, int,
                          int, int, int, float, int, int, int, bool,
                          hipStream_t);
