@@ -246,6 +246,30 @@ def has_native_wmma() -> bool:
     )
 
 
+@functools.cache
+def _device_has_native_wmma(index: int) -> bool:
+    """Whether device ``index`` has native WMMA, for per-launch routing.
+
+    has_native_wmma() is the intersection over every visible device; a launch only
+    needs the device its operands are on.
+    """
+    return _gfx_arch(index) in _ARCH_WMMA
+
+
+def _native_wmma_on(device: torch.device) -> bool:
+    return _device_has_native_wmma(
+        torch.cuda.current_device() if device.index is None else device.index)
+
+
+# Scratch the torch fallbacks for the fp16 kernels may take per launch. On devices
+# without WMMA, rocBLAS and MIOpen are 7x to 15x faster than the software fp16 tile,
+# but MIOpen lowers conv3d to an im2col workspace some 30x its output, and a pinned
+# host weight would be copied to the device whole. Chunking the torch calls to this
+# budget keeps the memory profile of the kernels they replace. On gfx1010 and gfx90c,
+# 16 MiB runs within 8% of 64 MiB chunks; 8 MiB costs up to 25%.
+_FALLBACK_SCRATCH_BYTES = 16 << 20
+
+
 def _stream(t: torch.Tensor) -> int:
     return torch.cuda.current_stream(t.device).cuda_stream
 
@@ -723,6 +747,41 @@ def _vector_operand(v: torch.Tensor, device: torch.device, dtype: torch.dtype) -
     return v.to(device=device, dtype=dtype).reshape(-1).contiguous()
 
 
+def _blas_linear(x_2d, weight, bias, residual, residual_scale, out_shape):
+    """``residual + residual_scale * (x_2d @ weight.T + bias)`` on rocBLAS, reshaped to
+    ``out_shape``, with no temporary beyond one staged weight chunk.
+
+    A weight on another device (an offloaded host weight) is copied over in row chunks
+    of at most _FALLBACK_SCRATCH_BYTES, each GEMM writing its column slice of the output
+    in place, so it costs one chunk of VRAM rather than the whole weight: the footprint
+    the kernel has when it reads the weight where it lies. The epilogue runs in place.
+    """
+    device = x_2d.device
+    m = x_2d.shape[0]
+    n, k = weight.shape
+    out = torch.empty((m, n), dtype=x_2d.dtype, device=device)
+    bias = None if bias is None else bias.to(device=device)
+    rows = n
+    if weight.device != device:
+        rows = max(1, _FALLBACK_SCRATCH_BYTES // max(1, k * weight.element_size()))
+    for n0 in range(0, n, rows):
+        n1 = min(n, n0 + rows)
+        w = weight[n0:n1].to(device=device, non_blocking=True)
+        if bias is None:
+            torch.mm(x_2d, w.t(), out=out[:, n0:n1])
+        else:
+            torch.addmm(bias[n0:n1], x_2d, w.t(), out=out[:, n0:n1])
+        # freed before the next chunk is staged, so the allocator hands its block back
+        # (stream-ordered: the copy into it queues behind this GEMM)
+        del w
+    out = out.view(out_shape)
+    if residual is not None:
+        # addcmul into its own input is elementwise, so it rounds exactly as out of place
+        torch.addcmul(residual.to(device=device, dtype=out.dtype), out,
+                      residual_scale.to(device=device, dtype=out.dtype), out=out)
+    return out
+
+
 def fp16_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -731,7 +790,8 @@ def fp16_linear(
     residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """FP16 WMMA GEMM with bias and an optional ``residual + residual_scale * out``
-    fused into the epilogue; torch's linear where the kernel declines the shape."""
+    fused into the epilogue. Devices without native WMMA, and shapes the kernel
+    declines, run rocBLAS through _blas_linear, which keeps the kernel's footprint."""
     if residual is not None and residual_scale is None:
         raise ValueError("fp16_linear: residual requires residual_scale")
 
@@ -739,9 +799,11 @@ def fp16_linear(
     x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
     m = x_2d.shape[0]
     n, k = weight.shape
+    out_shape = (*orig_shape[:-1], n)
 
     supported = (
-        x.dtype == torch.float16
+        _native_wmma_on(x.device)
+        and x.dtype == torch.float16
         and weight.dtype == torch.float16
         and (weight.device == x.device or (weight.device.type == "cpu" and weight.is_pinned()))
         and x_2d.shape[1] == k
@@ -759,13 +821,7 @@ def fp16_linear(
         supported = weight.data_ptr() % 16 == 0
     if not supported:
         # the kernel path takes bias and residual from any device, so the fallback must too
-        weight = weight.to(device=x.device)
-        bias = None if bias is None else bias.to(device=x.device)
-        if residual is not None:
-            residual = residual.to(device=x.device)
-            residual_scale = residual_scale.to(device=x.device)
-        out = torch.nn.functional.linear(x, weight, bias)
-        return _apply_residual(out, residual, residual_scale)
+        return _blas_linear(x_2d, weight, bias, residual, residual_scale, out_shape)
 
     out = torch.empty((m, n), dtype=torch.float16, device=x.device)
     bias_arg = None if bias is None else _vector_operand(bias, x.device, torch.float16)
@@ -780,12 +836,10 @@ def fp16_linear(
         None if resid_arg is None else _dl(resid_arg),
         m, n, k, _stream(x),
     )
-    _retain_host_operands_until_stream_complete(temporary_host_operands, x.device)
     if not served:
-        fallback_weight = weight.to(device=x.device)
-        out = _apply_residual(torch.nn.functional.linear(x_2d, fallback_weight, bias_arg),
-                              resid_arg, rscale_arg)
-    return out if len(orig_shape) == 2 else out.reshape(*orig_shape[:-1], n)
+        out = _blas_linear(x_2d, weight, bias_arg, resid_arg, rscale_arg, (m, n))
+    _retain_host_operands_until_stream_complete(temporary_host_operands, x.device)
+    return out if len(orig_shape) == 2 else out.reshape(out_shape)
 
 
 # Acts the HIP fused quantizer implements; anything else is applied eagerly so
@@ -1734,6 +1788,54 @@ def _wmma_fp16_conv3d(x, weight, bias, residual, stride, out=None):
     return out if served else None
 
 
+def _torch_conv3d(x, weight, bias, residual, stride, out=None):
+    """torch's conv3d plus residual, channels_last_3d, computed in output windows sized
+    so MIOpen's im2col workspace stays near _FALLBACK_SCRATCH_BYTES.
+
+    Unchunked, that workspace is the C*T*R*S patch row of every output pixel, some 30x
+    the output. Windows are whole output frames where one fits the budget and output
+    rows of a single frame otherwise; each reads its input window with the kernel halo
+    in place and is written straight into ``out``, which may be a caller's view.
+    """
+    # the kernel path takes bias and residual from any device, so the fallback must too
+    bias = None if bias is None else bias.to(device=x.device)
+    residual = None if residual is None else residual.to(device=x.device)
+    cl = torch.channels_last_3d
+    z = p = q = 0
+    if x.dim() == 5 and weight.dim() == 5 and min(stride) >= 1:
+        n, c, d, h, w = x.shape
+        k, _, t, r, s = weight.shape
+        sd, sh, sw = stride
+        z, p, q = (d - t) // sd + 1, (h - r) // sh + 1, (w - s) // sw + 1
+    if min(z, p, q) < 1:
+        # torch reports the bad argument
+        y = torch.nn.functional.conv3d(x, weight, bias, stride=stride).contiguous(memory_format=cl)
+        y = y if residual is None else y + residual
+        return y if out is None else out.copy_(y)
+    if out is None:
+        out = torch.empty((n, k, z, p, q), dtype=x.dtype, device=x.device, memory_format=cl)
+    elif out.shape != (n, k, z, p, q):
+        raise ValueError("fp16_conv3d: out must be an fp16 [N, K, Z, P, Q] tensor on x's device")
+    # a broadcast residual cannot be windowed; it is added over the whole output after
+    windowed = residual is not None and residual.shape == out.shape
+    row_bytes = n * q * (c * t * r * s + k) * x.element_size()
+    rows = max(1, _FALLBACK_SCRATCH_BYTES // row_bytes)
+    frames, rows = (max(1, rows // p), p) if rows >= p else (1, rows)
+    for z0 in range(0, z, frames):
+        z1 = min(z, z0 + frames)
+        for p0 in range(0, p, rows):
+            p1 = min(p, p0 + rows)
+            xw = x[:, :, z0 * sd:(z1 - 1) * sd + t, p0 * sh:(p1 - 1) * sh + r]
+            y = torch.nn.functional.conv3d(xw, weight, bias, stride=stride)
+            if windowed:
+                y.add_(residual[:, :, z0:z1, p0:p1])
+            out[:, :, z0:z1, p0:p1].copy_(y)
+            del y  # before the next window's conv allocates its own
+    if residual is not None and not windowed:
+        out.add_(residual)
+    return out
+
+
 def fp16_conv3d(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1741,17 +1843,14 @@ def fp16_conv3d(
     residual: torch.Tensor | None,
     stride: list[int],
 ) -> torch.Tensor:
-    """FP16 conv3d with fused bias/residual, channels_last_3d in and out; torch's
-    conv when the kernel declines the shape."""
-    out = _wmma_fp16_conv3d(x, weight, bias, residual, stride)
+    """FP16 conv3d with fused bias/residual, channels_last_3d in and out. Devices
+    without native WMMA, and shapes the kernel declines, run torch's conv through
+    _torch_conv3d, which bounds its workspace."""
+    out = (_wmma_fp16_conv3d(x, weight, bias, residual, stride)
+           if _native_wmma_on(x.device) else None)
     if out is not None:
         return out
-    # the kernel path takes bias and residual from any device, so the fallback must too
-    bias = None if bias is None else bias.to(device=x.device)
-    residual = None if residual is None else residual.to(device=x.device)
-    out = torch.nn.functional.conv3d(x, weight, bias, stride=stride).contiguous(
-        memory_format=torch.channels_last_3d)
-    return out if residual is None else out + residual
+    return _torch_conv3d(x, weight, bias, residual, stride)
 
 
 def fp16_conv3d_out(
@@ -1762,8 +1861,16 @@ def fp16_conv3d_out(
     stride: list[int],
     out: torch.Tensor,
 ) -> None:
-    """fp16_conv3d into ``out``; computed then copied when the kernel cannot index ``out``."""
-    if _wmma_fp16_conv3d(x, weight, bias, residual, stride, out=out) is not None:
+    """fp16_conv3d into ``out``; computed then copied when neither path can write it
+    in place."""
+    if (_native_wmma_on(x.device)
+            and _wmma_fp16_conv3d(x, weight, bias, residual, stride, out=out) is not None):
+        return
+    # windows written early must not be read by later ones
+    if (out.dtype == x.dtype and out.device == x.device and out.dim() == 5
+            and not any(t is not None and _tensors_overlap(out, t)
+                        for t in (x, weight, bias, residual))):
+        _torch_conv3d(x, weight, bias, residual, stride, out=out)
         return
     out.copy_(fp16_conv3d(x, weight, bias, residual, stride))
 
