@@ -104,8 +104,12 @@ the shared device-side helpers; those operations are not fused into its GEMM.
 
 The `hip` backend implements the quantized paths with its own kernels: native
 WMMA on RDNA3/RDNA3.5/RDNA4 and a software 16x16 tile policy on Vega, RDNA1 and
-RDNA2. It does not link or call hipBLAS/hipBLASLt; every matmul is compiled from
-the sources in `comfy_kitchen/backends/hip/`.
+RDNA2. Every quantized matmul (fp8, int8, int4) is compiled from the sources in
+`comfy_kitchen/backends/hip/` and never reaches hipBLAS/hipBLASLt. The only
+exception is the unquantized fp16 path: on GPUs without native WMMA, and for
+shapes its kernel declines, `fp16_linear` and `fp16_conv3d` run through torch
+(rocBLAS and MIOpen) in bounded chunks; see
+[Vega, RDNA1 and RDNA2](#vega-rdna1-and-rdna2-pre-wmma-gpus).
 
 Both rope kernels address their inputs through the tensor's own strides, so a q/k
 pair permuted or sliced out of a packed qkv is read where it lies rather than
@@ -125,10 +129,10 @@ What a GPU gets depends on whether it has matrix cores:
 | RDNA4      | `gfx1200`, `gfx1201`        | WMMA + fp8   | All HIP-supported kernels, fp8 native   |
 | RDNA3.5    | `gfx1150`-`gfx1153`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
 | RDNA3      | `gfx1100`-`gfx1103`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
-| RDNA2      | `gfx1030`-`gfx1036`         | `sdot4`      | Software tile GEMMs; NA3D, Sage INT8 and Sol attention via software tiles |
-| RDNA1      | `gfx1010`- `gfx1012`        | vector ALU   | Software tile GEMMs; NA3D, Sage INT8 and Sol attention via software tiles |
-| Vega (APU) | `gfx90c`                    | vector ALU   | Software tile GEMMs; NA3D, Sage INT8 and Sol attention via software tiles |
-| Vega       | `gfx900`,`gfx906`           | vector ALU   | Software tile GEMMs; NA3D, Sage INT8 and Sol attention via software tiles |
+| RDNA2      | `gfx1030`-`gfx1036`         | `sdot4`      | Software tile GEMMs and attention; fp16 GEMM/conv3d via chunked rocBLAS/MIOpen |
+| RDNA1      | `gfx1010`-`gfx1012`         | vector ALU   | Software tile GEMMs and attention; fp16 GEMM/conv3d via chunked rocBLAS/MIOpen |
+| Vega (APU) | `gfx90c`                    | vector ALU   | Software tile GEMMs and attention (wave64); fp16 GEMM/conv3d via chunked rocBLAS/MIOpen |
+| Vega       | `gfx900`, `gfx906`          | vector ALU   | Software tile GEMMs and attention (wave64); fp16 GEMM/conv3d via chunked rocBLAS/MIOpen |
 
 fp8, int8 and int4 share one byte-addressed tile kernel (`gemm_wmma.h`). RDNA3
 and RDNA4 spread a WMMA operand across the wave differently and RDNA3 has no fp8
@@ -143,6 +147,105 @@ run on either policy. They are supported on the validated Vega and RDNA1 targets
 but do not have matrix-core throughput. Flash decode does not use this tile path
 and is unavailable on those legacy architectures; it remains limited to its
 native-WMMA/BF16 hardware envelope.
+
+### Vega, RDNA1 and RDNA2 (pre-WMMA GPUs)
+
+These GPUs have no matrix cores, so the backend runs the same 16x16 tile
+contract as RDNA3/4 in software (see `mma.h`). Each lane owns one output column
+and broadcasts the A row it needs; RDNA2 (`gfx103x`) accumulates int8 with its
+packed `sdot4` instruction, RDNA1 (`gfx101x`) and Vega use plain integer and
+float arithmetic, and Vega (`gfx90x`) keeps logical wave32 tiles on its physical
+wave64 with a dedicated 64-lane broadcast. Because the fragment contract is
+shared, the tile kernels, epilogues and attention algorithms are the same
+source on every target.
+
+On these targets the backend supports:
+
+| Area | Functions | How it runs |
+|------|-----------|-------------|
+| FP8 quantization | `quantize_per_tensor_fp8`, `dequantize_per_tensor_fp8`, `stochastic_rounding_fp8` | Elementwise kernels; fp8 is a storage format only |
+| FP8 GEMM | `torch.nn.functional.linear` on `TensorCoreFP8Layout` tensors (via `scaled_mm_v2`) | Software tile, fp8 widened in registers; tensor-wise scales only |
+| INT8 quantization | `quantize_int8_rowwise`, `quantize_int8_tensorwise`, `quantize_and_rotate_rowwise`, `quantize_int8_convrot_weight`, `dequantize_int8_*` | Elementwise and row-reduction kernels |
+| INT8 GEMM | `int8_linear` (incl. ConvRot, `input_act`, fused RMSNorm and residual) | Software tile (`sdot4` on RDNA2) |
+| INT4 / W4A8 / W6A8 | `convrot_w4a4_linear`, `quantize/dequantize_convrot_w4a4_weight`, `quantize_svdquant_w4a4`, `scaled_mm_svdquant_w4a4`, `gemv_awq_w4a16`, `w4a8_int8_linear` | Software tile; packed codes decoded in registers |
+| FP16 GEMM / conv | `fp16_linear`, `fp16_conv3d` | torch (rocBLAS / MIOpen) in 16 MiB chunks, see below |
+| Normalization | `adaln`, `rms_adaln`, `group_norm_silu_pad3d` | Native kernels, same as RDNA3/4 |
+| RoPE | all `apply_rope*` and `rms_rope*` entries, including in-place | Native strided kernels, same as RDNA3/4 |
+| Attention | `na3d`, `na2d`, `sol_attn`, Sage INT8 attention (`int8_attention`) | Software tile; same memory behavior as on RDNA3/4 |
+
+Not available on these targets, so these fall through to another backend (or,
+for decode helpers, report unavailable through their `*_is_available()` check):
+
+- Flash decode attention (`flash_attention_decode_is_available()` is false):
+  RDNA2 and older have no bf16 arithmetic, and the kernel is written around it.
+- GatedDeltaNet fused decode (`gated_delta_decode_is_available()` is false),
+  for the same reason.
+- The native fp16 GEMM and conv3d kernels. Without matrix cores, the software
+  fp16 tile ran 7x to 15x slower than rocBLAS/MIOpen, so `fp16_linear` and
+  `fp16_conv3d` use torch there instead. The calls are chunked so their scratch
+  stays near 16 MiB: MIOpen's im2col workspace for an unchunked conv3d is about
+  30x the output, and a pinned host weight is staged one row block at a time
+  instead of being copied to VRAM whole. On `gfx1010` and `gfx90c`, 16 MiB
+  chunks run within 8% of 64 MiB ones. The fused bias and residual epilogue is
+  kept.
+- NVFP4 and MXFP8, as on every HIP target.
+
+Software tiles cost throughput compared with WMMA, so an RDNA2 card will not
+reach RDNA3 speeds on the same kernels. The benefit on these GPUs comes from
+memory footprint and from avoiding eager's slow paths, not from matrix-core
+speed.
+
+#### When to use `hip` instead of `eager` on these GPUs
+
+Dispatch prefers `hip` automatically when it is registered, so this is mainly
+about whether to build the extension for an older card and when not to force
+`backend="eager"`:
+
+- **INT8 models.** `torch._int_mm` is not usable on `gfx90x`/`gfx10xx`, so
+  eager's `int8_linear` widens both int8 operands to fp32 in 1024-wide K chunks
+  and runs an fp32 matmul. That costs 4x the operand memory and fp32 GEMM
+  throughput. The HIP kernel reads int8 directly (with `sdot4` on RDNA2) and
+  fuses activation quantization, ConvRot rotation, the input activation or
+  RMSNorm, the dequant scales, bias and residual into one launch.
+- **4-bit and FP8 checkpoints.** Eager's AWQ W4A16, ConvRot W4A4 and SVDQuant
+  W4A4 paths unpack the packed 4-bit weight into a full-width float tensor
+  before calling `matmul`, which temporarily needs about 4x the layer's
+  quantized size. The HIP kernels unpack in registers, so a quantized model that
+  barely fits in 4-8 GB of VRAM keeps fitting while it runs. FP8 layers
+  likewise run straight from the fp8 weight through the software tile.
+- **Weights larger than VRAM.** `hip.offload_weight` keeps a linear weight in
+  mapped pinned host memory, and the GEMM kernels read it over PCIe (or from
+  the APU's shared memory on `gfx90c`) without a VRAM copy. Eager can only
+  copy the weight to the device first. This matters most on APUs and 4 GB
+  cards such as the RX 5500 XT or RX 6500 XT.
+- **Long-sequence video and image attention.** Eager `sol_attn` materializes a
+  dense fp32 `(B, H, T, T)` score tensor, and eager `na3d` stacks copies of K
+  and V for each window geometry to feed batched SDPA calls. The HIP kernels
+  keep scores in registers with an online softmax and stage only small tiles in
+  LDS (see below), so sequence lengths that run out of memory on eager can run
+  on HIP. Sage INT8 attention has no eager implementation at all.
+- **Fused elementwise ops.** AdaLN, RMS-AdaLN, RMS-RoPE, GroupNorm+SiLU+pad
+  and the quantizers are each one kernel instead of a chain of torch ops, which
+  saves memory traffic on bandwidth-limited cards. The RoPE kernels also rotate
+  q/k slices of a packed qkv in place instead of copying them.
+- **Video VAEs in fp16.** `fp16_conv3d` bounds MIOpen's workspace to 16 MiB
+  windows. A direct `torch.nn.functional.conv3d` on a large video latent can
+  allocate an im2col buffer many times the size of its output.
+
+Eager is still the better choice when:
+
+- The inputs are on the CPU, or the op has no HIP implementation (NVFP4,
+  MXFP8, flash decode, GatedDeltaNet decode on these targets).
+- The shapes are outside a kernel's domain, such as K not a multiple of 16,
+  swizzled or non-tensor-wise fp8 scales, or head dimensions a kernel does not
+  support. Dispatch falls back automatically, so no action is needed.
+- You need a reference to check a HIP result against. The eager backend is
+  the implementation the HIP tests compare with.
+- Sequences are short. For Sol attention the packed Q/K/V carriers and routing
+  workspace can cost more than eager's dense scores.
+
+Set `COMFY_KITCHEN_DISABLE_HIP=1`, or pass `backend="eager"` per call, to
+compare the two on your own workload.
 
 ### Legacy attention memory behavior
 
@@ -226,7 +329,8 @@ $env:COMFY_HIP_ARCHS = "gfx1201"; pip install .
 ```
 
 `PYTORCH_ROCM_ARCH` and `GPU_ARCHS` are honoured too. When the build machine sees
-AMD GPUs but none is RDNA2/3/3.5/4 (CDNA has MFMA, not WMMA), the extension is
+AMD GPUs but none is in the architecture manifest (Vega, RDNA1-4; CDNA has MFMA,
+not WMMA, and is not covered), the extension is
 skipped rather than built (seeing no GPU at all falls back to the full target list
 above instead);
 `COMFY_KITCHEN_BUILD_HIP=1` requests HIP explicitly (and makes an unsupported
@@ -363,7 +467,7 @@ with ck.use_backend("triton"):
 The library supports multiple backends:
 - **eager**: Pure PyTorch implementation
 - **cuda**: Custom CUDA C kernels (CUDA only)
-- **hip**: Custom HIP kernels (WMMA GEMMs on RDNA3/3.5/4; non-WMMA kernels also on RDNA2)
+- **hip**: Custom HIP kernels (native WMMA on RDNA3/3.5/4; software tiles on Vega, RDNA1 and RDNA2)
 - **triton**: Triton JIT-compiled kernels
 
 ### Automatic Backend Selection
