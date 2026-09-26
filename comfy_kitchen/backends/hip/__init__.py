@@ -13,7 +13,6 @@ Vega/GCN 5 (gfx90c), RDNA (gfx101x) and RDNA2 (gfx103x) emulate the same tile
 contract with vector arithmetic; gfx103x uses its packed int8 dot product. The
 attention kernels still require native WMMA fragment support.
 """
-
 import functools
 import importlib.util
 import json
@@ -27,11 +26,7 @@ from collections.abc import Sequence
 
 import torch
 
-from comfy_kitchen._rope_utils import (
-    _tensors_overlap,
-    check_rope_inplace,
-    trim_rope_freqs,
-)
+from comfy_kitchen._rope_utils import _tensors_overlap, check_rope_inplace, trim_rope_freqs
 from comfy_kitchen.allocation import allocation_context
 from comfy_kitchen.backends import eager as _eager
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
@@ -139,9 +134,7 @@ try:
     if _module_path is None:
         _EXT_ERROR = "HIP extension not built (no _C module in backends/hip)"
     else:
-        _spec = importlib.util.spec_from_file_location(
-            "comfy_kitchen.backends.hip._C", _module_path
-        )
+        _spec = importlib.util.spec_from_file_location("comfy_kitchen.backends.hip._C", _module_path)
         _C = importlib.util.module_from_spec(_spec)
         sys.modules["comfy_kitchen.backends.hip._C"] = _C
         _spec.loader.exec_module(_C)
@@ -186,7 +179,9 @@ def _visible_gfx_arches() -> tuple[str | None, ...]:
 # consumed by setup.py and CMake. Never infer support from a gfx prefix: a new
 # compiler-recognized target needs its WMMA policy reviewed before it is safe.
 _ARCH_MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "architectures.json")
-_ARCH_GROUPS = json.loads(pathlib.Path(_ARCH_MANIFEST_PATH).read_text(encoding="utf-8"))
+_ARCH_GROUPS = json.loads(
+    pathlib.Path(_ARCH_MANIFEST_PATH).read_text(encoding="utf-8")
+)
 _ARCH_ELEMENTWISE_ONLY = frozenset(_ARCH_GROUPS["elementwise_only"])
 _ARCH_WMMA_GFX11 = frozenset(_ARCH_GROUPS["wmma_gfx11"])
 _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
@@ -197,12 +192,7 @@ _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 # implement that policy in software; gfx11/gfx12 use native WMMA. The fp8 GEMM
 # is reached through scaled_mm_v2's _hip_fp8_gemm, which gates on has_wmma()
 # itself rather than through the registry.
-_TILED_ATTENTION_OPS = frozenset(
-    {
-        "na3d",
-        "sol_attn",
-    }
-)
+_TILED_ATTENTION_OPS = frozenset({"na3d", "sol_attn"})
 
 
 def _unsupported_arch_reason(arches: Sequence[str | None]) -> str | None:
@@ -240,11 +230,7 @@ def is_available() -> bool:
 def has_wmma() -> bool:
     """Whether every visible device can run the tiled GEMM kernels."""
     arches = _visible_gfx_arches()
-    return (
-        _EXT_AVAILABLE
-        and _unsupported_arch_reason(arches) is None
-        and _has_wmma(arches)
-    )
+    return _EXT_AVAILABLE and _unsupported_arch_reason(arches) is None and _has_wmma(arches)
 
 
 def has_native_wmma() -> bool:
@@ -274,9 +260,7 @@ def _retain_host_operands_until_stream_complete(
     """Keep temporary mapped host operands alive until their launch finishes."""
     with _pending_host_operands_lock:
         _pending_host_operands[:] = [
-            (event, operand)
-            for event, operand in _pending_host_operands
-            if not event.query()
+            (event, operand) for event, operand in _pending_host_operands if not event.query()
         ]
         if operands:
             event = torch.cuda.Event()
@@ -318,15 +302,11 @@ def _weight_operand(
     temporary_host_operands: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if shape is not None and tuple(weight.shape) != tuple(shape):
-        raise ValueError(
-            f"{name} must have shape {tuple(shape)}, got {tuple(weight.shape)}"
-        )
+        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(weight.shape)}")
     if weight.device.type != "cpu":
         return _operand(weight, device, name, shape)
     if not weight.is_pinned():
-        raise ValueError(
-            f"{name} on CPU must be mapped pinned memory; use hip.offload_weight()"
-        )
+        raise ValueError(f"{name} on CPU must be mapped pinned memory; use hip.offload_weight()")
     weight = weight.contiguous()
     if weight.data_ptr() % 16:
         aligned = torch.empty_like(weight, pin_memory=True)
@@ -337,9 +317,7 @@ def _weight_operand(
     return weight
 
 
-def _operand(
-    t: torch.Tensor, device: torch.device, name: str, shape=None
-) -> torch.Tensor:
+def _operand(t: torch.Tensor, device: torch.device, name: str, shape=None) -> torch.Tensor:
     """A contiguous view of ``t`` on ``device``, since the kernels take raw pointers.
 
     Every launch uses one stream and one set of extents, so an operand left on
@@ -355,9 +333,7 @@ def _scale_operand(scale: torch.Tensor, device: torch.device) -> torch.Tensor:
     """The fp8 kernels read one float scale off a raw pointer on the launch stream."""
     scale = scale.reshape(-1)
     if scale.numel() != 1:
-        raise ValueError(
-            f"expected a single per-tensor scale, got {scale.numel()} elements"
-        )
+        raise ValueError(f"expected a single per-tensor scale, got {scale.numel()} elements")
     return scale.to(device=device, dtype=torch.float32).contiguous()
 
 
@@ -366,10 +342,8 @@ def _bias_operand(bias: torch.Tensor, n: int, device: torch.device) -> torch.Ten
     if bias.dim() != 1 or bias.numel() != n:
         raise ValueError(f"bias must be 1D of length {n}, got {tuple(bias.shape)}")
     if bias.dtype not in _EPILOGUE_DTYPES:
-        raise ValueError(
-            f"bias dtype {bias.dtype} is not supported, expected one of "
-            f"{[str(d) for d in _EPILOGUE_DTYPES]}"
-        )
+        raise ValueError(f"bias dtype {bias.dtype} is not supported, expected one of "
+                         f"{[str(d) for d in _EPILOGUE_DTYPES]}")
     return bias.to(device=device).contiguous()
 
 
@@ -387,7 +361,6 @@ def _dl(t: torch.Tensor):
 # FP8 elementwise
 # ---------------------------------------------------------------------------
 
-
 def quantize_per_tensor_fp8(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -398,13 +371,8 @@ def quantize_per_tensor_fp8(
 
     out = torch.empty(x.shape, dtype=torch.uint8, device=x.device)
     _C.quantize_per_tensor_fp8(
-        _dl(x),
-        _dl(scale),
-        _dl(out),
-        DTYPE_TO_CODE[x.dtype],
-        DTYPE_TO_CODE[output_type],
-        x.numel(),
-        _stream(x),
+        _dl(x), _dl(scale), _dl(out),
+        DTYPE_TO_CODE[x.dtype], DTYPE_TO_CODE[output_type], x.numel(), _stream(x),
     )
     return out.view(output_type)
 
@@ -419,13 +387,8 @@ def dequantize_per_tensor_fp8(
 
     out = torch.empty(x.shape, dtype=output_type, device=x.device)
     _C.dequantize_per_tensor_fp8(
-        _dl(x.view(torch.uint8)),
-        _dl(scale),
-        _dl(out),
-        DTYPE_TO_CODE[x.dtype],
-        DTYPE_TO_CODE[output_type],
-        x.numel(),
-        _stream(x),
+        _dl(x.view(torch.uint8)), _dl(scale), _dl(out),
+        DTYPE_TO_CODE[x.dtype], DTYPE_TO_CODE[output_type], x.numel(), _stream(x),
     )
     return out
 
@@ -451,11 +414,7 @@ def stochastic_rounding_fp8(
 
     x = x.contiguous()
     _C.stochastic_round_fp8(
-        _dl(rng),
-        _dl(x),
-        DTYPE_TO_CODE[output_type],
-        x.numel(),
-        _stream(x),
+        _dl(rng), _dl(x), DTYPE_TO_CODE[output_type], x.numel(), _stream(x),
     )
     return rng.view(output_type)
 
@@ -463,7 +422,6 @@ def stochastic_rounding_fp8(
 # ---------------------------------------------------------------------------
 # FP8 GEMM (v_wmma_f32_16x16x16_fp8_fp8)
 # ---------------------------------------------------------------------------
-
 
 def _weight_as_nk(b: torch.Tensor) -> torch.Tensor:
     """Return the weight as a contiguous (N, K) tensor.
@@ -517,17 +475,9 @@ def scaled_mm_fp8(
 
     out = torch.empty((m, n), dtype=out_dtype, device=a.device)
     _C.scaled_mm_fp8(
-        _dl(a.view(torch.uint8)),
-        _dl(b_nk.view(torch.uint8)),
-        _dl(out),
-        _dl(scale_a),
-        _dl(scale_b),
-        None if bias is None else _dl(bias),
-        m,
-        n,
-        k,
-        DTYPE_TO_CODE[out_dtype],
-        _stream(a),
+        _dl(a.view(torch.uint8)), _dl(b_nk.view(torch.uint8)), _dl(out),
+        _dl(scale_a), _dl(scale_b), None if bias is None else _dl(bias),
+        m, n, k, DTYPE_TO_CODE[out_dtype], _stream(a),
     )
     _retain_host_operands_until_stream_complete(temporary_host_operands, a.device)
     return out
@@ -536,7 +486,6 @@ def scaled_mm_fp8(
 # ---------------------------------------------------------------------------
 # INT8 quantization + GEMM (v_wmma_i32_16x16x16_iu8)
 # ---------------------------------------------------------------------------
-
 
 def quantize_int8_rowwise(
     x: torch.Tensor,
@@ -561,21 +510,14 @@ def quantize_int8_tensorwise(
     # A caller-supplied scale reduces to an elementwise quantize; only the
     # absmax-derived scale needs the fused reduction kernel.
     if stochastic_rounding or (scale is not None and not isinstance(scale, str)):
-        return _eager.quantize_int8_tensorwise(
-            x, scale=scale, stochastic_rounding=stochastic_rounding
-        )
+        return _eager.quantize_int8_tensorwise(x, scale=scale, stochastic_rounding=stochastic_rounding)
 
     xc = x.contiguous()
     q = torch.empty(xc.shape, dtype=torch.int8, device=x.device)
     out_scale = torch.empty((), dtype=torch.float32, device=x.device)
     scratch = torch.zeros((), dtype=torch.int32, device=x.device)
     _C.quantize_int8_tensorwise(
-        _dl(xc),
-        _dl(q),
-        _dl(out_scale.reshape(1)),
-        _dl(scratch.reshape(1)),
-        xc.numel(),
-        _stream(x),
+        _dl(xc), _dl(q), _dl(out_scale.reshape(1)), _dl(scratch.reshape(1)), xc.numel(), _stream(x)
     )
     return q, out_scale
 
@@ -655,12 +597,8 @@ _convrot_max_k: dict[tuple[int, torch.dtype], int] = {}
 
 
 def _convrot_supported(
-    k: int,
-    group_size: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    *,
-    int8_global_spill: bool = False,
+    k: int, group_size: int, device: torch.device, dtype: torch.dtype,
+    *, int8_global_spill: bool = False,
 ) -> bool:
     """Whether the HIP ConvRot quantizer can handle a row of this width on ``device``.
 
@@ -688,11 +626,8 @@ def _convrot_supported(
 
 
 def _rotate_quant_int8(
-    x2d: torch.Tensor,
-    group_size: int,
-    input_act: str | None = None,
-    act_weight: torch.Tensor | None = None,
-    act_eps: float = 0.0,
+    x2d: torch.Tensor, group_size: int, input_act: str | None = None,
+    act_weight: torch.Tensor | None = None, act_eps: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     m, k_in = x2d.shape
     # swiglu halves the row: the [gate | up] input is twice the quantized width.
@@ -705,13 +640,9 @@ def _rotate_quant_int8(
     # check_convrot_k queries the current device's LDS budget, so pin it to the
     # operand's device rather than trusting the caller thread's current device.
     with torch.cuda.device(x2d.device):
-        if group_size == 256 and _C.convrot_int8_needs_spill(
-            m, k, DTYPE_TO_CODE[x2d.dtype]
-        ):
+        if group_size == 256 and _C.convrot_int8_needs_spill(m, k, DTYPE_TO_CODE[x2d.dtype]):
             spill_rotated = torch.empty((m, k), dtype=x2d.dtype, device=x2d.device)
-            spill_partials = torch.empty(
-                (m, k // 256), dtype=torch.float32, device=x2d.device
-            )
+            spill_partials = torch.empty((m, k // 256), dtype=torch.float32, device=x2d.device)
         _C.quantize_int8_convrot(
             _dl(x_arg),
             _dl(q),
@@ -734,13 +665,8 @@ def _fused_rms_norm_ok(x: torch.Tensor, convrot: bool, group_size: int) -> bool:
     one that implements rms_norm; the global spill and G=16/64 paths do not."""
     k = x.shape[-1]
     m = x.numel() // k if k else 0
-    if not (
-        convrot
-        and group_size == 256
-        and m > 0
-        and k % 256 == 0
-        and _convrot_supported(k, group_size, x.device, x.dtype, int8_global_spill=True)
-    ):
+    if not (convrot and group_size == 256 and m > 0 and k % 256 == 0
+            and _convrot_supported(k, group_size, x.device, x.dtype, int8_global_spill=True)):
         return False
     # the spill answer reads the current device's LDS budget, as in _rotate_quant_int8
     with torch.cuda.device(x.device):
@@ -781,11 +707,7 @@ def quantize_int8_convrot_weight(
     Uses the same fused kernel as the activation path.
     """
     if stochastic_rounding or not _convrot_supported(
-        weight.shape[-1],
-        group_size,
-        weight.device,
-        weight.dtype,
-        int8_global_spill=True,
+        weight.shape[-1], group_size, weight.device, weight.dtype, int8_global_spill=True
     ):
         return _eager.quantize_int8_convrot_weight(
             weight, group_size, stochastic_rounding=stochastic_rounding
@@ -796,9 +718,7 @@ def quantize_int8_convrot_weight(
     return q.reshape(weight.shape), scales.reshape(*weight.shape[:-1], 1)
 
 
-def _vector_operand(
-    v: torch.Tensor, device: torch.device, dtype: torch.dtype
-) -> torch.Tensor:
+def _vector_operand(v: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """A per-channel epilogue vector on ``device`` in ``dtype``, contiguous."""
     return v.to(device=device, dtype=dtype).reshape(-1).contiguous()
 
@@ -816,32 +736,20 @@ def fp16_linear(
         raise ValueError("fp16_linear: residual requires residual_scale")
 
     orig_shape = x.shape
-    x_2d = (
-        x
-        if x.dim() == 2 and x.is_contiguous()
-        else x.reshape(-1, x.shape[-1]).contiguous()
-    )
+    x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
     m = x_2d.shape[0]
     n, k = weight.shape
 
     supported = (
         x.dtype == torch.float16
         and weight.dtype == torch.float16
-        and (
-            weight.device == x.device
-            or (weight.device.type == "cpu" and weight.is_pinned())
-        )
+        and (weight.device == x.device or (weight.device.type == "cpu" and weight.is_pinned()))
         and x_2d.shape[1] == k
         # the tile stager issues 16-byte row loads; a misaligned view falls back, as on CUDA
         and x_2d.data_ptr() % 16 == 0
         and (bias is None or bias.dtype == torch.float16)
-        and (
-            residual is None
-            or (
-                residual.dtype == torch.float16
-                and residual_scale.dtype == torch.float16
-            )
-        )
+        and (residual is None or (residual.dtype == torch.float16
+                                  and residual_scale.dtype == torch.float16))
     )
     temporary_host_operands: list[torch.Tensor] = []
     if supported:
@@ -866,25 +774,17 @@ def fp16_linear(
         resid_arg = residual.to(device=x.device).reshape(m, n).contiguous()
         rscale_arg = _vector_operand(residual_scale, x.device, torch.float16)
     served = _C.fp16_gemm(
-        _dl(x_2d),
-        _dl(weight),
-        _dl(out),
+        _dl(x_2d), _dl(weight), _dl(out),
         None if bias_arg is None else _dl(bias_arg),
         None if rscale_arg is None else _dl(rscale_arg),
         None if resid_arg is None else _dl(resid_arg),
-        m,
-        n,
-        k,
-        _stream(x),
+        m, n, k, _stream(x),
     )
     _retain_host_operands_until_stream_complete(temporary_host_operands, x.device)
     if not served:
         fallback_weight = weight.to(device=x.device)
-        out = _apply_residual(
-            torch.nn.functional.linear(x_2d, fallback_weight, bias_arg),
-            resid_arg,
-            rscale_arg,
-        )
+        out = _apply_residual(torch.nn.functional.linear(x_2d, fallback_weight, bias_arg),
+                              resid_arg, rscale_arg)
     return out if len(orig_shape) == 2 else out.reshape(*orig_shape[:-1], n)
 
 
@@ -915,14 +815,12 @@ def int8_linear(
     if input_act == "rms_norm":
         if input_act_weight is None:
             raise ValueError("input_act 'rms_norm' requires act_weight")
-        if input_act_weight.numel() == x.shape[-1] and _fused_rms_norm_ok(
-            x, convrot, convrot_groupsize
+        if (
+            input_act_weight.numel() == x.shape[-1]
+            and _fused_rms_norm_ok(x, convrot, convrot_groupsize)
         ):
             act_weight = _operand(
-                input_act_weight.reshape(-1).to(dtype=x.dtype),
-                x.device,
-                "input_act_weight",
-            )
+                input_act_weight.reshape(-1).to(dtype=x.dtype), x.device, "input_act_weight")
     if input_act not in _HIP_FUSED_ACTS and act_weight is None:
         x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
         input_act = None
@@ -955,9 +853,7 @@ def int8_linear(
 
     if convrot:
         if convrot_groupsize not in (16, 64, 256):
-            raise ValueError(
-                f"ConvRot group size must be 16, 64 or 256, got {convrot_groupsize}"
-            )
+            raise ValueError(f"ConvRot group size must be 16, 64 or 256, got {convrot_groupsize}")
         if k % convrot_groupsize != 0:
             raise ValueError(
                 f"ConvRot group size {convrot_groupsize} does not divide input features {k}"
@@ -966,21 +862,12 @@ def int8_linear(
             k, convrot_groupsize, x.device, x.dtype, int8_global_spill=True
         ):
             return _eager.int8_linear(
-                x,
-                weight,
-                weight_scale,
-                bias,
-                out_dtype,
-                convrot,
-                convrot_groupsize,
-                input_act=input_act,
-                residual=residual,
-                residual_scale=residual_scale,
+                x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
+                input_act=input_act, residual=residual, residual_scale=residual_scale,
             )
         # The only route that absorbs the activation; the rest apply it eagerly.
         q, x_scale = _rotate_quant_int8(
-            x2d, convrot_groupsize, input_act, act_weight, input_act_eps
-        )
+            x2d, convrot_groupsize, input_act, act_weight, input_act_eps)
     else:
         x2d = _apply_input_act(x2d, input_act)
         q = torch.empty((m, k), dtype=torch.int8, device=x.device)
@@ -993,18 +880,10 @@ def int8_linear(
 
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
     _C.int8_gemm(
-        _dl(q),
-        _dl(weight),
-        _dl(out),
-        _dl(x_scale),
-        _dl(weight_scale),
-        0 if weight_scale.numel() == 1 else 1,
+        _dl(q), _dl(weight), _dl(out),
+        _dl(x_scale), _dl(weight_scale), 0 if weight_scale.numel() == 1 else 1,
         None if bias is None else _dl(bias),
-        m,
-        n,
-        k,
-        DTYPE_TO_CODE[out_dtype],
-        _stream(x),
+        m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
     )
     _retain_host_operands_until_stream_complete(temporary_host_operands, x.device)
     # Unlike CUDA, the residual is not folded into the epilogue: the per-element
@@ -1016,7 +895,6 @@ def int8_linear(
 # ---------------------------------------------------------------------------
 # Grouped W4A8 over the INT8 GEMM
 # ---------------------------------------------------------------------------
-
 
 def _dequant_int4_grouped_to_int8(
     qdata: torch.Tensor,
@@ -1109,10 +987,7 @@ def _w4a8_chunk_cols(m: int, n: int, k: int, device: torch.device) -> int:
         _w4a8_l2_bytes[index] = budget
 
     # Rounded to the widest N tile, so a chunk boundary never splits one.
-    cols = min(
-        _W4A8_MAX_CHUNK_COLS,
-        max(_W4A8_MIN_CHUNK_COLS, budget // max(k, 1) // 128 * 128),
-    )
+    cols = min(_W4A8_MAX_CHUNK_COLS, max(_W4A8_MIN_CHUNK_COLS, budget // max(k, 1) // 128 * 128))
     return min(n, cols)
 
 
@@ -1145,9 +1020,7 @@ def _w4a8_int8_linear_chunked(
         if codebook is None
         else codebook.to(device=device, dtype=torch.float32).reshape(-1).contiguous()
     )
-    s_channel_arg = (
-        s_channel.to(device=device, dtype=torch.float32).reshape(-1).contiguous()
-    )
+    s_channel_arg = s_channel.to(device=device, dtype=torch.float32).reshape(-1).contiguous()
     bias_arg = None if bias is None else _bias_operand(bias, n, device)
 
     qdata_arg = _operand(qdata, device, "qdata")
@@ -1246,9 +1119,7 @@ def _fused_quantize_w4a8(
     block = max(1, _QUANT_ROW_ELEM_BUDGET // max(k, 1))
     for r0 in range(0, n, block):
         r1 = min(r0 + block, n)
-        rot = _eager.rotate_int8_convrot_weight(
-            weight[r0:r1].contiguous(), convrot_groupsize
-        )
+        rot = _eager.rotate_int8_convrot_weight(weight[r0:r1].contiguous(), convrot_groupsize)
         # Offset the seed by the row start so blocks decorrelate but a fixed block
         # size still reproduces.
         seed = stochastic_rounding + r0 if stochastic_rounding > 0 else 0
@@ -1341,9 +1212,7 @@ def dequantize_w4a8_int8_weight(
     )
     # Rotating back has no HIP kernel. Eager applies the same orthonormal ConvRot
     # transform the fused activation path uses, and it is its own inverse.
-    return _eager.rotate_int8_convrot_weight(weight_rotated, convrot_groupsize).to(
-        output_dtype
-    )
+    return _eager.rotate_int8_convrot_weight(weight_rotated, convrot_groupsize).to(output_dtype)
 
 
 def w4a8_int8_linear(
@@ -1399,15 +1268,7 @@ def w4a8_int8_linear(
         )
 
     return _w4a8_int8_linear_chunked(
-        x,
-        qdata,
-        s_rel,
-        s_channel,
-        codebook,
-        bias,
-        group_size,
-        convrot_groupsize,
-        out_dtype,
+        x, qdata, s_rel, s_channel, codebook, bias, group_size, convrot_groupsize, out_dtype
     )
 
 
@@ -1425,9 +1286,7 @@ def quantize_convrot_w4a4_weight(
     stochastic_rounding: int | None = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if quant_group_size != _INT4_GROUP_SIZE:
-        raise ValueError(
-            f"int4 MMA kernel requires quant_group_size {_INT4_GROUP_SIZE}"
-        )
+        raise ValueError(f"int4 MMA kernel requires quant_group_size {_INT4_GROUP_SIZE}")
     if stochastic_rounding or not _convrot_supported(
         weight.shape[-1], convrot_groupsize, weight.device, weight.dtype
     ):
@@ -1441,9 +1300,7 @@ def quantize_convrot_w4a4_weight(
     scales = torch.empty((n,), dtype=torch.float32, device=w.device)
     # Pin the current device so check_convrot_k reads this operand's LDS budget.
     with torch.cuda.device(w.device):
-        _C.convrot_quant_int4(
-            _dl(w), _dl(q), _dl(scales), n, k, convrot_groupsize, _stream(w)
-        )
+        _C.convrot_quant_int4(_dl(w), _dl(q), _dl(scales), n, k, convrot_groupsize, _stream(w))
     return q, scales
 
 
@@ -1456,23 +1313,16 @@ def dequantize_convrot_w4a4_weight(
 ) -> torch.Tensor:
     # Only the nibble unpack runs on device; the inverse rotation reuses the
     # eager Hadamard.
-    from comfy_kitchen.backends.eager.convrot_w4a4 import (
-        _build_hadamard,
-        _rotate_weight,
-    )
+    from comfy_kitchen.backends.eager.convrot_w4a4 import _build_hadamard, _rotate_weight
 
     if quant_group_size != _INT4_GROUP_SIZE:
-        raise ValueError(
-            f"int4 MMA kernel requires quant_group_size {_INT4_GROUP_SIZE}"
-        )
+        raise ValueError(f"int4 MMA kernel requires quant_group_size {_INT4_GROUP_SIZE}")
 
     n, kp = qdata.shape
     unpacked = torch.empty((n, kp * 2), dtype=torch.int8, device=qdata.device)
     _C.unpack_int4(_dl(qdata.contiguous()), _dl(unpacked), n * kp, _stream(qdata))
 
-    w_rot = unpacked.float() * scales.to(
-        device=qdata.device, dtype=torch.float32
-    ).reshape(-1, 1)
+    w_rot = unpacked.float() * scales.to(device=qdata.device, dtype=torch.float32).reshape(-1, 1)
     h = _build_hadamard(convrot_groupsize, device=qdata.device, dtype=torch.float32)
     return _rotate_weight(w_rot, h, convrot_groupsize).to(output_dtype)
 
@@ -1487,39 +1337,27 @@ def convrot_w4a4_linear(
     linear_dtype: str = "int4",
 ) -> torch.Tensor:
     if linear_dtype not in {"int4", "int8"}:
-        raise ValueError(
-            f"ConvRot W4A4 linear_dtype must be 'int4' or 'int8', got {linear_dtype!r}"
-        )
+        raise ValueError(f"ConvRot W4A4 linear_dtype must be 'int4' or 'int8', got {linear_dtype!r}")
     if quant_group_size != _INT4_GROUP_SIZE:
-        raise ValueError(
-            f"int4 MMA kernel requires quant_group_size {_INT4_GROUP_SIZE}"
-        )
+        raise ValueError(f"int4 MMA kernel requires quant_group_size {_INT4_GROUP_SIZE}")
     if x.shape[-1] != qweight.shape[-1] * 2:
-        raise ValueError(
-            f"Input K={x.shape[-1]} does not match qweight K={qweight.shape[-1] * 2}"
-        )
+        raise ValueError(f"Input K={x.shape[-1]} does not match qweight K={qweight.shape[-1] * 2}")
     # An empty output (zero rows, or zero output features) does no packed reads; the
     # launcher accepts it, so return before the alignment checks below rather than
     # tripping over them. A zero-K input is not empty: its output is a pure bias
     # broadcast (an empty contraction sums to zero), so build it here rather than
     # launch, and never leak uninitialized values through torch.empty.
     if 0 in x.shape[:-1] or qweight.shape[0] == 0:
-        return torch.empty(
-            (*x.shape[:-1], qweight.shape[0]), dtype=x.dtype, device=x.device
-        )
+        return torch.empty((*x.shape[:-1], qweight.shape[0]), dtype=x.dtype, device=x.device)
     if x.shape[-1] == 0:
-        out = torch.zeros(
-            (*x.shape[:-1], qweight.shape[0]), dtype=x.dtype, device=x.device
-        )
+        out = torch.zeros((*x.shape[:-1], qweight.shape[0]), dtype=x.dtype, device=x.device)
         if bias is not None:
             out = out + _bias_operand(bias, qweight.shape[0], x.device)
         return out
     # The tile loader reads the packed row (K/2 bytes) in 16-byte chunks. A group
     # size of 16 alone would allow a K that packs to a partial chunk.
     if x.shape[-1] % 32 != 0:
-        raise ValueError(
-            f"convrot_w4a4_linear requires K divisible by 32, got {x.shape[-1]}"
-        )
+        raise ValueError(f"convrot_w4a4_linear requires K divisible by 32, got {x.shape[-1]}")
     # A group size the kernel does not implement falls back to eager below rather
     # than raising here, so only the accepted sizes get the divisibility check.
     # Testing membership first also keeps a zero group size off the modulo.
@@ -1542,18 +1380,11 @@ def convrot_w4a4_linear(
         # As on CUDA: the int4 weight is unpacked to int8 values and the whole
         # linear runs on the int8 WMMA kernel with int8 activations.
         qw = _operand(qweight, x.device, "qweight")
-        w_int8 = torch.empty(
-            (qw.shape[0], qw.shape[1] * 2), dtype=torch.int8, device=x.device
-        )
+        w_int8 = torch.empty((qw.shape[0], qw.shape[1] * 2), dtype=torch.int8, device=x.device)
         _C.unpack_int4(_dl(qw), _dl(w_int8), qw.numel(), _stream(x))
         return int8_linear(
-            x,
-            w_int8,
-            wscales,
-            bias,
-            x.dtype,
-            convrot=True,
-            convrot_groupsize=convrot_groupsize,
+            x, w_int8, wscales, bias, x.dtype,
+            convrot=True, convrot_groupsize=convrot_groupsize,
         )
 
     orig_shape = x.shape
@@ -1565,9 +1396,7 @@ def convrot_w4a4_linear(
     x_scale = torch.empty((m,), dtype=torch.float32, device=x.device)
     # Pin the current device so check_convrot_k reads this operand's LDS budget.
     with torch.cuda.device(x.device):
-        _C.convrot_quant_int4(
-            _dl(x2d), _dl(qact), _dl(x_scale), m, k, convrot_groupsize, _stream(x)
-        )
+        _C.convrot_quant_int4(_dl(x2d), _dl(qact), _dl(x_scale), m, k, convrot_groupsize, _stream(x))
 
     wscales = wscales.to(device=x.device, dtype=torch.float32).reshape(-1)
     if wscales.numel() != n:
@@ -1585,17 +1414,9 @@ def convrot_w4a4_linear(
 
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
     _C.convrot_w4a4_gemm(
-        _dl(qact),
-        _dl(qw),
-        _dl(out),
-        _dl(x_scale),
-        _dl(wscales),
-        None if bias is None else _dl(bias),
-        m,
-        n,
-        k,
-        DTYPE_TO_CODE[x.dtype],
-        _stream(x),
+        _dl(qact), _dl(qw), _dl(out),
+        _dl(x_scale), _dl(wscales), None if bias is None else _dl(bias),
+        m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
     )
     _retain_host_operands_until_stream_complete(temporary_host_operands, x.device)
     return out.reshape(*orig_shape[:-1], n)
@@ -1604,7 +1425,6 @@ def convrot_w4a4_linear(
 # ---------------------------------------------------------------------------
 # AWQ W4A16 and SVDQuant W4A4
 # ---------------------------------------------------------------------------
-
 
 def gemv_awq_w4a16(
     x: torch.Tensor,
@@ -1622,9 +1442,7 @@ def gemv_awq_w4a16(
     # The inner loop decodes eight weights at a time and rescales the chunk once,
     # so a chunk must not straddle a group boundary.
     if group_size <= 0 or group_size % 8 != 0:
-        raise ValueError(
-            f"group_size must be a positive multiple of 8, got {group_size}"
-        )
+        raise ValueError(f"group_size must be a positive multiple of 8, got {group_size}")
     if k % group_size != 0:
         raise ValueError(f"K={k} not divisible by group_size={group_size}")
     if qweight.shape[1] * 2 != k:
@@ -1635,9 +1453,7 @@ def gemv_awq_w4a16(
     wscales = _operand(wscales, x.device, "wscales", shape=(k // group_size, n))
     if wscales.dtype not in _EPILOGUE_DTYPES:
         raise ValueError(f"wscales dtype {wscales.dtype} is not supported")
-    wzeros = _operand(wzeros, x.device, "wzeros", shape=(k // group_size, n)).to(
-        wscales.dtype
-    )
+    wzeros = _operand(wzeros, x.device, "wzeros", shape=(k // group_size, n)).to(wscales.dtype)
     qw = _operand(qweight, x.device, "qweight", shape=(n, k // 2))
     if bias is not None:
         bias = _bias_operand(bias, n, x.device)
@@ -1645,17 +1461,9 @@ def gemv_awq_w4a16(
     out_dtype = wscales.dtype
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
     _C.gemv_awq_w4a16(
-        _dl(x2d),
-        _dl(qw),
-        _dl(wscales),
-        _dl(wzeros),
-        None if bias is None else _dl(bias),
-        _dl(out),
-        m,
-        n,
-        k,
-        group_size,
-        _stream(x),
+        _dl(x2d), _dl(qw), _dl(wscales), _dl(wzeros),
+        None if bias is None else _dl(bias), _dl(out),
+        m, n, k, group_size, _stream(x),
     )
     return out.reshape(*orig_shape[:-1], n)
 
@@ -1694,9 +1502,7 @@ def quantize_svdquant_w4a4(
     smooth = _operand(smooth.reshape(-1).to(x.dtype), x.device, "smooth", shape=(k,))
     lora_down = _operand(lora_down, x.device, "lora_down", shape=(k, r))
     # The LoRA branch is defined on the un-shifted, un-smoothed activation.
-    lora_src = _operand(
-        lora_x if lora_x is not None else x, x.device, "lora_x", shape=(m, k)
-    )
+    lora_src = _operand(lora_x if lora_x is not None else x, x.device, "lora_x", shape=(m, k))
 
     # Padded rows stay zero: q = 0 and scale = 0 contribute nothing downstream.
     q = torch.zeros((m_pad, k // 2), dtype=torch.int8, device=x.device)
@@ -1704,15 +1510,8 @@ def quantize_svdquant_w4a4(
     lora_act = torch.zeros((m_pad, r), dtype=torch.float32, device=x.device)
 
     _C.svdquant_quantize(
-        _dl(xc),
-        _dl(smooth),
-        _dl(q),
-        _dl(ascales),
-        m,
-        m_pad,
-        k,
-        act_unsigned,
-        _stream(x),
+        _dl(xc), _dl(smooth), _dl(q), _dl(ascales),
+        m, m_pad, k, act_unsigned, _stream(x),
     )
     _C.svdquant_lora_down(
         _dl(lora_src), _dl(lora_down), _dl(lora_act[:m]), m, k, r, _stream(x)
@@ -1761,20 +1560,11 @@ def scaled_mm_svdquant_w4a4(
 
     out = torch.empty((m, n), dtype=wscales.dtype, device=dev)
     _C.svdquant_gemm(
-        _dl(act),
-        _dl(wgt),
-        _dl(out),
-        _dl(ascales),
-        _dl(wscales),
-        _dl(lora_act_in),
-        _dl(lora_up),
+        _dl(act), _dl(wgt), _dl(out),
+        _dl(ascales), _dl(wscales),
+        _dl(lora_act_in), _dl(lora_up),
         None if bias is None else _dl(bias),
-        m,
-        n,
-        k,
-        r,
-        act_unsigned,
-        _stream(act),
+        m, n, k, r, act_unsigned, _stream(act),
     )
     return out
 
@@ -1801,7 +1591,7 @@ def na3d(
     causal = (False, False, False) if is_causal is None else tuple(is_causal)
     batch, t, h, w, num_heads, head_dim = q.shape
     if scale is None:
-        scale = head_dim**-0.5
+        scale = head_dim ** -0.5
 
     q = q.contiguous()
     k = k.contiguous()
@@ -1845,16 +1635,8 @@ def _adaln_impl(kernel, x, scale, shift, eps) -> torch.Tensor:
 
     out = torch.empty_like(x_flat)
     kernel(
-        _dl(x_flat),
-        _dl(scale_flat),
-        _dl(shift_flat),
-        _dl(out),
-        n,
-        d,
-        scale_group,
-        shift_group,
-        eps,
-        _stream(x),
+        _dl(x_flat), _dl(scale_flat), _dl(shift_flat), _dl(out),
+        n, d, scale_group, shift_group, eps, _stream(x),
     )
     return out.reshape(orig_shape)
 
@@ -1904,20 +1686,12 @@ def _wmma_fp16_conv3d(x, weight, bias, residual, stride, out=None):
         return None  # torch's conv reports the bad stride
     z, p, q = (d - t) // sd + 1, (h - r) // sh + 1, (w - s) // sw + 1
     supported = (
-        x.dtype == torch.float16
-        and weight.dtype == torch.float16
-        and weight.device == x.device
-        and weight.shape[1] == c
-        and (c % 8 == 0 or c < 8)
-        and k % 8 == 0
-        and d >= t
-        and h >= r
-        and w >= s
+        x.dtype == torch.float16 and weight.dtype == torch.float16
+        and weight.device == x.device and weight.shape[1] == c
+        and (c % 8 == 0 or c < 8) and k % 8 == 0 and d >= t and h >= r and w >= s
         and (bias is None or (bias.dtype == torch.float16 and bias.shape == (k,)))
-        and (
-            residual is None
-            or (residual.dtype == torch.float16 and residual.shape == (n, k, z, p, q))
-        )
+        and (residual is None or (residual.dtype == torch.float16
+                                  and residual.shape == (n, k, z, p, q)))
     )
     if not supported:
         return None
@@ -1934,65 +1708,28 @@ def _wmma_fp16_conv3d(x, weight, bias, residual, stride, out=None):
     weight = weight.contiguous(memory_format=cl)
     # the epilogue reads both off raw pointers on x's stream
     bias = None if bias is None else bias.to(device=x.device).contiguous()
-    residual = (
-        None
-        if residual is None
-        else residual.to(device=x.device).contiguous(memory_format=cl)
-    )
+    residual = (None if residual is None
+                else residual.to(device=x.device).contiguous(memory_format=cl))
     if out is None:
-        out = torch.empty(
-            (n, k, z, p, q), dtype=torch.float16, device=x.device, memory_format=cl
-        )
+        out = torch.empty((n, k, z, p, q), dtype=torch.float16, device=x.device, memory_format=cl)
     else:
-        if (
-            out.shape != (n, k, z, p, q)
-            or out.dtype != torch.float16
-            or out.device != x.device
-        ):
-            raise ValueError(
-                "fp16_conv3d: out must be an fp16 [N, K, Z, P, Q] tensor on x's device"
-            )
+        if out.shape != (n, k, z, p, q) or out.dtype != torch.float16 or out.device != x.device:
+            raise ValueError("fp16_conv3d: out must be an fp16 [N, K, Z, P, Q] tensor on x's device")
         # the epilogue writes a packed [N*Z*P*Q, K] matrix, so besides a packed tensor only a
         # frame window of a single batch fits
         if not out.is_contiguous(memory_format=cl) and _ndhwc_strides(out) != (
-            k,
-            q * k,
-            p * q * k,
-            0 if n == 1 else z * p * q * k,
-        ):
+                k, q * k, p * q * k, 0 if n == 1 else z * p * q * k):
             return None
         # blocks read operands other blocks may already have overwritten
-        if any(
-            t is not None and _tensors_overlap(out, t)
-            for t in (x, weight, bias, residual)
-        ):
+        if any(t is not None and _tensors_overlap(out, t) for t in (x, weight, bias, residual)):
             return None
     # the tile stager issues 16-byte loads from x and the weight
     if x.data_ptr() % 16 or weight.data_ptr() % 16 or out.data_ptr() % 16:
         return None
-    out = torch.empty(
-        (n, k, z, p, q), dtype=torch.float16, device=x.device, memory_format=cl
-    )
     served = _C.fp16_conv3d(
-        _dl(x),
-        _dl(weight),
-        None if bias is None else _dl(bias),
-        None if residual is None else _dl(residual),
-        _dl(out),
-        n,
-        d,
-        h,
-        w,
-        c,
-        k,
-        t,
-        r,
-        s,
-        sd,
-        sh,
-        sw,
-        _stream(x),
-        *xs,
+        _dl(x), _dl(weight), None if bias is None else _dl(bias),
+        None if residual is None else _dl(residual), _dl(out),
+        n, d, h, w, c, k, t, r, s, sd, sh, sw, _stream(x), *xs,
     )
     return out if served else None
 
@@ -2013,8 +1750,7 @@ def fp16_conv3d(
     bias = None if bias is None else bias.to(device=x.device)
     residual = None if residual is None else residual.to(device=x.device)
     out = torch.nn.functional.conv3d(x, weight, bias, stride=stride).contiguous(
-        memory_format=torch.channels_last_3d
-    )
+        memory_format=torch.channels_last_3d)
     return out if residual is None else out + residual
 
 
@@ -2030,14 +1766,6 @@ def fp16_conv3d_out(
     if _wmma_fp16_conv3d(x, weight, bias, residual, stride, out=out) is not None:
         return
     out.copy_(fp16_conv3d(x, weight, bias, residual, stride))
-
-
-def group_norm_silu_pad3d_out(
-    x, weight, bias, num_groups, eps, pad, silu, zero_pad, out
-) -> None:
-    out.copy_(
-        group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad)
-    )
 
 
 def group_norm_silu_pad3d(
@@ -2059,86 +1787,47 @@ def group_norm_silu_pad3d(
     if min(pad) < 0:
         raise ValueError("group_norm_silu_pad3d: padding must be non-negative")
     oshape = (b, c, t + front, h + top + bottom, w + left + right)
-    if out is not None and (
-        out.shape != oshape or out.dtype != x.dtype or out.device != x.device
-    ):
-        raise ValueError(
-            f"group_norm_silu_pad3d: out must be {oshape} {x.dtype} on {x.device}"
-        )
+    if out is not None and (out.shape != oshape or out.dtype != x.dtype or out.device != x.device):
+        raise ValueError(f"group_norm_silu_pad3d: out must be {oshape} {x.dtype} on {x.device}")
     # the affine params may be fp32 (the registry admits it); every path wants x's dtype
     if weight is not None:
         weight = weight.to(device=x.device, dtype=x.dtype).contiguous()
-        bias = (
-            torch.zeros(c, dtype=x.dtype, device=x.device)
-            if bias is None
-            else bias.to(device=x.device, dtype=x.dtype).contiguous()
-        )
+        bias = (torch.zeros(c, dtype=x.dtype, device=x.device) if bias is None
+                else bias.to(device=x.device, dtype=x.dtype).contiguous())
     else:
         bias = None  # pad-only ignores bias, as eager and CUDA do
     # an empty frame still has a zero border to write, which the launcher skips
-    served = not (
-        c % 8
-        or 256 % (c // 8)
-        or h == 0
-        or w == 0
-        or (weight is not None and (c % num_groups or num_groups > 1024))
-        or (not zero_pad and (max(left, right) >= w or max(top, bottom) >= h))
-        or b * (t + front) > 65535
-    )
+    served = not (c % 8 or 256 % (c // 8) or h == 0 or w == 0
+                  or (weight is not None and (c % num_groups or num_groups > 1024))
+                  or (not zero_pad and (max(left, right) >= w or max(top, bottom) >= h))
+                  or b * (t + front) > 65535)
     if served:
         x = x.contiguous(memory_format=torch.channels_last_3d)
         # the kernel loads whole 16-byte registers; a misaligned view takes eager, as on CUDA
         served = x.data_ptr() % 16 == 0
     if not served:
-        res = _eager.group_norm_silu_pad3d(
-            x, weight, bias, num_groups, eps, pad, silu, zero_pad
-        )
+        res = _eager.group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad)
         if out is None:
             return res
         out.copy_(res)
         return out
 
     # frames are written in no particular order, so an out overlapping an operand goes via a copy
-    dst = (
-        out
-        if out is not None
-        and _writes_packed_ndhwc(out)
-        and out.data_ptr() % 16 == 0
-        and not any(
-            t is not None and _tensors_overlap(out, t) for t in (x, weight, bias)
-        )
-        else None
-    )
+    dst = (out if out is not None and _writes_packed_ndhwc(out) and out.data_ptr() % 16 == 0
+           and not any(t is not None and _tensors_overlap(out, t) for t in (x, weight, bias))
+           else None)
     if dst is None:
-        dst = torch.empty(
-            oshape, dtype=x.dtype, device=x.device, memory_format=torch.channels_last_3d
-        )
+        dst = torch.empty(oshape, dtype=x.dtype, device=x.device,
+                          memory_format=torch.channels_last_3d)
     workspace = None
     if weight is not None:
         chunks = -(-(h * w) // 1024)
-        workspace = torch.empty(
-            2 * b * t * (chunks * c + num_groups), dtype=torch.float32, device=x.device
-        )
+        workspace = torch.empty(2 * b * t * (chunks * c + num_groups), dtype=torch.float32,
+                                device=x.device)
     _C.group_norm_silu_pad3d(
-        _dl(x),
-        None if weight is None else _dl(weight),
-        None if bias is None else _dl(bias),
-        _dl(dst),
-        None if workspace is None else _dl(workspace),
-        b,
-        c,
-        t,
-        h,
-        w,
-        num_groups,
-        eps,
-        left,
-        right,
-        top,
-        bottom,
-        front,
-        silu,
-        zero_pad,
+        _dl(x), None if weight is None else _dl(weight), None if bias is None else _dl(bias),
+        _dl(dst), None if workspace is None else _dl(workspace),
+        b, c, t, h, w, num_groups, eps, left, right, top, bottom, front, silu, zero_pad,
         _stream(x),
     )
     if out is None or dst is out:
@@ -2153,18 +1842,12 @@ def _writes_packed_ndhwc(out: torch.Tensor) -> bool:
         return True
     b, c, _, h, w = out.shape
     st = out.stride()
-    return (
-        b == 1 and st[1] == 1 and st[4] == c and st[3] == w * c and st[2] == h * w * c
-    )
+    return b == 1 and st[1] == 1 and st[4] == c and st[3] == w * c and st[2] == h * w * c
 
 
-def group_norm_silu_pad3d_out(
-    x, weight, bias, num_groups, eps, pad, silu, zero_pad, out
-) -> None:
+def group_norm_silu_pad3d_out(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out) -> None:
     """group_norm_silu_pad3d into ``out``; a frame-offset view leaves room for a caller's halo."""
-    group_norm_silu_pad3d(
-        x, weight, bias, num_groups, eps, pad, silu, zero_pad, out=out
-    )
+    group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out=out)
 
 
 def _effective_strides(t: torch.Tensor) -> tuple[int, ...]:
@@ -2205,9 +1888,7 @@ def _rope(xq, xk, freqs_cis, split_half, inplace=False):
         and (arch == "gfx90c" or arch.startswith("gfx10"))
     ):
         xq_result = _eager_rope.apply_rope_split_half1(xq, freqs_cis)
-        xk_result = (
-            None if xk is None else _eager_rope.apply_rope_split_half1(xk, freqs_cis)
-        )
+        xk_result = None if xk is None else _eager_rope.apply_rope_split_half1(xk, freqs_cis)
         if inplace:
             xq.copy_(xq_result)
             if xk is not None:
@@ -2224,23 +1905,15 @@ def _rope(xq, xk, freqs_cis, split_half, inplace=False):
         # freqs_cis is indexed through its own strides, so a strided view is free.
         xq, xk = _rope_rows(xq, xk)
         xq_out = torch.empty(xq.shape, dtype=xq.dtype, device=xq.device)
-        xk_out = (
-            None
-            if xk is None
-            else torch.empty(xk.shape, dtype=xk.dtype, device=xk.device)
-        )
+        xk_out = None if xk is None else torch.empty(xk.shape, dtype=xk.dtype, device=xk.device)
 
     if not split_half:
         freqs_cis = trim_rope_freqs(xq, freqs_cis)
 
     _C.apply_rope(
-        _dl(xq),
-        None if xk is None else _dl(xk),
-        _dl(freqs_cis),
-        _dl(xq_out),
-        None if xk_out is None else _dl(xk_out),
-        split_half,
-        _stream(xq),
+        _dl(xq), None if xk is None else _dl(xk), _dl(freqs_cis),
+        _dl(xq_out), None if xk_out is None else _dl(xk_out),
+        split_half, _stream(xq),
     )
     return xq_out, xk_out
 
@@ -2315,17 +1988,13 @@ def _rms_rope_weight(scale: torch.Tensor, head_dim: int) -> torch.Tensor | None:
     return scale.contiguous()
 
 
-def _rms_rope(
-    q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=False, rot_dim=0
-):
+def _rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=False, rot_dim=0):
     if k is not None and k_scale is None:
         k_scale = q_scale
     # One dtype code and one stream are passed for the whole launch, so every
     # buffer has to agree on device, and q/k on dtype.
     if freqs_cis.device != q.device or q_scale.device != q.device:
-        raise ValueError(
-            "freqs_cis and the scales must be on the same device as the input"
-        )
+        raise ValueError("freqs_cis and the scales must be on the same device as the input")
     if k is not None:
         if k.device != q.device or k_scale.device != q.device:
             raise ValueError("q and k must be on the same device")
@@ -2341,13 +2010,7 @@ def _rms_rope(
             if rot_dim:
                 # Only the private eager helper takes rot_dim for a single tensor.
                 out = _eager_rope._rms_rope1(
-                    q,
-                    freqs_cis,
-                    q_scale,
-                    epsilon,
-                    split_half=split_half,
-                    rot_dim=rot_dim,
-                )
+                    q, freqs_cis, q_scale, epsilon, split_half=split_half, rot_dim=rot_dim)
             else:
                 impl = _eager.rms_rope_split_half1 if split_half else _eager.rms_rope1
                 out = impl(q, freqs_cis, q_scale, epsilon)
@@ -2369,29 +2032,19 @@ def _rms_rope(
         # freqs_cis is indexed through its own strides, so a strided view is free.
         q, k = _rope_rows(q, k)
         q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-        k_out = (
-            None if k is None else torch.empty(k.shape, dtype=k.dtype, device=k.device)
-        )
+        k_out = None if k is None else torch.empty(k.shape, dtype=k.dtype, device=k.device)
 
     _C.rms_rope(
-        _dl(q),
-        None if k is None else _dl(k),
-        _dl(freqs_cis),
-        _dl(q_weight),
-        None if k_weight is None else _dl(k_weight),
-        _dl(q_out),
-        None if k_out is None else _dl(k_out),
-        epsilon,
-        split_half,
-        _stream(q),
-        rot_dim,
+        _dl(q), None if k is None else _dl(k), _dl(freqs_cis),
+        _dl(q_weight), None if k_weight is None else _dl(k_weight),
+        _dl(q_out), None if k_out is None else _dl(k_out),
+        epsilon, split_half, _stream(q), rot_dim,
     )
     return q_out, k_out
 
 
-def _rms_rope_pair(
-    q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=False, rot_dim=0
-):
+def _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=False,
+                   rot_dim=0):
     if k_scale is None:
         k_scale = q_scale
     # One dtype code covers both inputs and one more both weights, so a difference
@@ -2403,16 +2056,12 @@ def _rms_rope_pair(
         or (inplace and _effective_strides(q) != _effective_strides(k))
     ):
         return (
-            _rms_rope(
-                q, None, freqs_cis, q_scale, None, epsilon, split_half, inplace, rot_dim
-            )[0],
-            _rms_rope(
-                k, None, freqs_cis, k_scale, None, epsilon, split_half, inplace, rot_dim
-            )[0],
+            _rms_rope(q, None, freqs_cis, q_scale, None, epsilon, split_half, inplace,
+                      rot_dim)[0],
+            _rms_rope(k, None, freqs_cis, k_scale, None, epsilon, split_half, inplace,
+                      rot_dim)[0],
         )
-    return _rms_rope(
-        q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace, rot_dim
-    )
+    return _rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace, rot_dim)
 
 
 def rms_rope1(
@@ -2456,9 +2105,7 @@ def rms_rope_(
     if k_scale is None:
         k_scale = q_scale
     check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
-    return _rms_rope_pair(
-        q, k, freqs_cis, q_scale, k_scale, epsilon, False, inplace=True
-    )
+    return _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, False, inplace=True)
 
 
 def rms_rope_split_half1(
@@ -2489,9 +2136,7 @@ def rms_rope_split_half(
     epsilon: float = 1e-6,
     rot_dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _rms_rope_pair(
-        q, k, freqs_cis, q_scale, k_scale, epsilon, True, rot_dim=rot_dim
-    )
+    return _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, True, rot_dim=rot_dim)
 
 
 def rms_rope_split_half_(
@@ -2506,9 +2151,9 @@ def rms_rope_split_half_(
     if k_scale is None:
         k_scale = q_scale
     check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
-    return _rms_rope_pair(
-        q, k, freqs_cis, q_scale, k_scale, epsilon, True, inplace=True, rot_dim=rot_dim
-    )
+    return _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, True, inplace=True,
+                          rot_dim=rot_dim)
+
 
 
 # ---------------------------------------------------------------------------
@@ -2523,7 +2168,7 @@ def rms_rope_split_half_(
 # ---------------------------------------------------------------------------
 
 _SOL_HD = 128
-_SOL_VSCALE_MARGIN = 1.1  # clip headroom on last step's V absmax
+_SOL_VSCALE_MARGIN = 1.1   # clip headroom on last step's V absmax
 
 
 def _topk_from_pooled(c8, csc, kc, topk_ratio, log2s, sinks):
@@ -2535,15 +2180,15 @@ def _topk_from_pooled(c8, csc, kc, topk_ratio, log2s, sinks):
     budget ~15%. Sink blocks are always kept, so they neither count toward nor
     consume the budget."""
     n = kc.shape[1]
-    ksc = (kc.abs().amax(-1, True) / 127.0).clamp_min(1e-12)  # prep_pooled_quant
+    ksc = (kc.abs().amax(-1, True) / 127.0).clamp_min(1e-12)     # prep_pooled_quant
     k8 = torch.round(kc / ksc).clamp_(-127, 127)
-    s = torch.bmm(c8, k8.transpose(1, 2))  # integer dot, exact in fp32
+    s = torch.bmm(c8, k8.transpose(1, 2))     # integer dot, exact in fp32
     s = s * (csc * log2s).unsqueeze(-1) * ksc.squeeze(-1).unsqueeze(-2)
     s0, s1 = sinks
     if s1 > s0:
         s[..., s0:s1] = float("-inf")
     kk = _topk_count(n - _sink_count(n, s0, s1), topk_ratio)
-    if kk == 0:  # nothing beyond the forced blocks: a threshold no finite score clears
+    if kk == 0:   # nothing beyond the forced blocks: a threshold no finite score clears
         return torch.full(s.shape[:-1], float("inf"), device=s.device, dtype=s.dtype)
     kth = s.topk(kk, dim=-1, sorted=False).values.min(-1).values
     # backed off a few ulps: this replica of the kernel's scores is not bit-exact
@@ -2567,9 +2212,7 @@ def _block_means(x, lengths=None, valid=None):
             x = x * valid.view(1, -1, 1, 1).to(x.dtype)
         m = x[:, :full].view(b, -1, 64, h, d).sum(2, dtype=torch.float32)
         if full != t:
-            m = torch.cat(
-                [m, x[:, full:].sum(1, keepdim=True, dtype=torch.float32)], dim=1
-            )
+            m = torch.cat([m, x[:, full:].sum(1, keepdim=True, dtype=torch.float32)], dim=1)
         m = m / lengths.view(1, -1, 1, 1)
     return m.permute(0, 2, 1, 3).reshape(b * h, -1, d)
 
@@ -2579,12 +2222,9 @@ def _check_block_len(block_len, t, device):
     if block_len.dtype != torch.int32 or block_len.dim() != 1 or block_len.numel() != n:
         raise ValueError(
             f"sol_attn: block_len must be int32 of shape ({n},), got {block_len.dtype} "
-            f"{tuple(block_len.shape)}"
-        )
+            f"{tuple(block_len.shape)}")
     if block_len.device != device:
-        raise ValueError(
-            f"sol_attn: block_len must be on {device}, got {block_len.device}"
-        )
+        raise ValueError(f"sol_attn: block_len must be on {device}, got {block_len.device}")
     return block_len.contiguous()
 
 
@@ -2592,8 +2232,7 @@ def _check_coarse_gate(coarse_gate, shape, device):
     if tuple(coarse_gate.shape) != tuple(shape) or coarse_gate.device != device:
         raise ValueError(
             f"sol_attn: coarse_gate must be {tuple(shape)} on {device}, got "
-            f"{tuple(coarse_gate.shape)} on {coarse_gate.device}"
-        )
+            f"{tuple(coarse_gate.shape)} on {coarse_gate.device}")
     return coarse_gate
 
 
@@ -2602,7 +2241,7 @@ def _topk_threshold(q, k, topk_ratio, scale, lengths, valid, sinks):
     cen = _block_means(q, lengths, valid)
     kc = _block_means(k, lengths, valid)
     kc = kc - kc.mean(dim=1, keepdim=True)
-    csc = (cen.abs().amax(-1, True) / 127.0).clamp_min(1e-8)  # prep_q
+    csc = (cen.abs().amax(-1, True) / 127.0).clamp_min(1e-8)      # prep_q
     c8 = torch.round(cen / csc).clamp_(-127, 127)
     return _topk_from_pooled(c8, csc.squeeze(-1), kc, topk_ratio, scale * _LOG2E, sinks)
 
@@ -2623,11 +2262,11 @@ def _packed_rope_fab(freqs, t, rot):
         raise ValueError(f"sol_attn: rope_freqs covers {f.shape[0]} tokens, T={t}")
     with allocation_context():
         fab = torch.empty(t, rot, 2, device=freqs.device, dtype=torch.float32)
-    fab[:, : rot // 2, 0] = f[:, :, 0, 0]
-    fab[:, : rot // 2, 1] = f[:, :, 0, 1]
-    fab[:, rot // 2 :, 0] = f[:, :, 1, 1]
-    fab[:, rot // 2 :, 1] = f[:, :, 1, 0]
-    _ROPE_FAB_CACHE.clear()  # one live entry
+    fab[:, :rot // 2, 0] = f[:, :, 0, 0]
+    fab[:, :rot // 2, 1] = f[:, :, 0, 1]
+    fab[:, rot // 2:, 0] = f[:, :, 1, 1]
+    fab[:, rot // 2:, 1] = f[:, :, 1, 0]
+    _ROPE_FAB_CACHE.clear()   # one live entry
     _ROPE_FAB_CACHE[key] = (weakref.ref(freqs), fab)
     return fab
 
@@ -2647,17 +2286,9 @@ def _check_sol_args(sink_blocks, sink_q, topk_ratio, **tensors):
     from comfy_kitchen.constraints import sol_attn_common_call_rule
 
     if not has_wmma():
-        raise RuntimeError(
-            "sol_attn: requires a validated HIP tiled-attention architecture"
-        )
+        raise RuntimeError("sol_attn: requires a validated HIP tiled-attention architecture")
     check = sol_attn_common_call_rule(
-        {
-            "sink_blocks": sink_blocks,
-            "sink_q": sink_q,
-            "topk_ratio": topk_ratio,
-            **tensors,
-        }
-    )
+        {"sink_blocks": sink_blocks, "sink_q": sink_q, "topk_ratio": topk_ratio, **tensors})
     if not check.success:
         raise ValueError(f"sol_attn: {check.failed_param}: {check.failure_reason}")
 
@@ -2693,25 +2324,15 @@ def sol_attn(
     batch, t, h, d = q.shape
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
-    _check_sol_args(
-        sink_blocks,
-        sink_q,
-        topk_ratio,
-        q=q,
-        k=k,
-        v=v,
-        block_len=block_len,
-        coarse_gate=coarse_gate,
-    )
+    _check_sol_args(sink_blocks, sink_q, topk_ratio, q=q, k=k, v=v,
+                    block_len=block_len, coarse_gate=coarse_gate)
     if scale is None:
-        scale = d**-0.5
+        scale = d ** -0.5
     if block_len is not None:
         block_len = block_len.contiguous()
     lengths = _block_lengths(t, (t + 63) // 64, q.device, block_len)
     valid = _valid_rows(t, lengths) if block_len is not None else None
-    mean_lengths = (
-        lengths if block_len is not None else None
-    )  # exact default arithmetic
+    mean_lengths = lengths if block_len is not None else None   # exact default arithmetic
     # Only the last dim must be contiguous (16-byte staging loads), so a BHND view
     # goes in as-is. A misaligned load faults asynchronously and poisons the
     # context, so base pointer and leading strides are checked here.
@@ -2722,21 +2343,16 @@ def sol_attn(
             raise ValueError(
                 f"sol_attn: {name} must be 16-byte aligned (storage_offset "
                 f"{x.storage_offset()} leaves it at +{x.data_ptr() % 16}); "
-                f"call .contiguous() on it"
-            )
+                f"call .contiguous() on it")
         for dim in range(3):
             if x.shape[dim] > 1 and x.stride(dim) % 8:
                 raise ValueError(
                     f"sol_attn: {name} stride({dim}) = {x.stride(dim)} elements "
                     f"is not a multiple of 8, so the 16-byte staging loads would "
-                    f"be misaligned; call .contiguous() on it"
-                )
+                    f"be misaligned; call .contiguous() on it")
     sb, sq = _sink_pair(sink_blocks), _sink_pair(sink_q)
-    thr = (
-        _topk_threshold(q, k, topk_ratio, scale, mean_lengths, valid, sb)
-        if topk_ratio
-        else None
-    )
+    thr = (_topk_threshold(q, k, topk_ratio, scale, mean_lengths, valid, sb)
+           if topk_ratio else None)
     kb = None
     if key_bias is not None:
         # exact branch only, in log2 units; biased blocks must be sink-covered
@@ -2746,34 +2362,19 @@ def sol_attn(
     p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug))
     workspace = torch.empty(p["total"], dtype=torch.uint8, device=q.device)
     _C.sol_attn(
-        _dl(q),
-        _dl(k),
-        _dl(v),
-        _dl(out),
-        _dl(workspace),
-        batch,
-        t,
-        h,
-        d,
-        float(tau),
-        float(scale),
-        sb[0],
-        sb[1],
-        sq[0],
-        sq[1],
+        _dl(q), _dl(k), _dl(v), _dl(out), _dl(workspace),
+        batch, t, h, d,
+        float(tau), float(scale),
+        sb[0], sb[1], sq[0], sq[1],
         _stream(q),
         key_bias=None if kb is None else _dl(kb),
         threshold=None if thr is None else _dl(thr),
         block_len=None if block_len is None else _dl(block_len),
-        tail=bool(tail),
-        token_aug=int(token_aug),
+        tail=bool(tail), token_aug=int(token_aug),
     )
     if coarse_gate is not None:
-        add_coarse_(
-            out,
-            coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale),
-            coarse_gate,
-        )
+        add_coarse_(out, coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale),
+                    coarse_gate)
     return out
 
 
@@ -2808,26 +2409,22 @@ def sol_attn_chunked(
     rot = rope_freqs.shape[-3] * 2
     # the fused rope pairs channels across lanes of 4: rot/2 must be lane-aligned
     if rot % 8 or not 0 < rot <= d:
-        raise ValueError(
-            f"sol_attn_chunked: rot_dim must be a multiple of 8 in (0, {d}], got {rot}"
-        )
+        raise ValueError(f"sol_attn_chunked: rot_dim must be a multiple of 8 in (0, {d}], got {rot}")
     fab = _packed_rope_fab(rope_freqs, t, rot)
     dev = fab.device
     _check_sol_args(sink_blocks, sink_q, topk_ratio)
     if scale is None:
-        scale = d**-0.5
+        scale = d ** -0.5
     if block_len is not None:
         block_len = _check_block_len(block_len, t, dev)
     if coarse_gate is not None:
         coarse_gate = _check_coarse_gate(coarse_gate, (1, t, h, d), dev)
     lengths = _block_lengths(t, (t + 63) // 64, dev, block_len)
-    qw, kw = (
-        w.to(device=dev, dtype=torch.bfloat16).contiguous() for w in qk_norm_weights
-    )
+    qw, kw = (w.to(device=dev, dtype=torch.bfloat16).contiguous() for w in qk_norm_weights)
     factory = qkv_chunks if callable(qkv_chunks) else None
     if factory is None and (kmean is None or vscale is None):
-        qkv_chunks = list(qkv_chunks)  # need two passes over it
-        factory = lambda: iter(qkv_chunks)  # noqa: E731
+        qkv_chunks = list(qkv_chunks)          # need two passes over it
+        factory = lambda: iter(qkv_chunks)     # noqa: E731
     p = _C.sol_attn_plan(1, t, h, token_aug=int(token_aug))
     ws = torch.empty(p["total"], dtype=torch.uint8, device=dev)
     stream = torch.cuda.current_stream(dev).cuda_stream
@@ -2841,34 +2438,15 @@ def sol_attn_chunked(
             if t0 % 64 and m:
                 raise ValueError("sol_attn_chunked: chunk starts must be 64-aligned")
             # bare pointers below: a wrong width reads OOB, a host tensor poisons the context
-            if (
-                chunk.shape[-1] != width
-                or chunk.dtype != torch.bfloat16
-                or chunk.device != dev
-            ):
+            if chunk.shape[-1] != width or chunk.dtype != torch.bfloat16 or chunk.device != dev:
                 raise ValueError(
                     f"sol_attn_chunked: chunks must be [M, {width}] bfloat16 on {dev}, "
-                    f"got {tuple(chunk.shape)} {chunk.dtype} on {chunk.device}"
-                )
+                    f"got {tuple(chunk.shape)} {chunk.dtype} on {chunk.device}")
             _C.sol_producer_chunk(
-                _dl(ws),
-                _dl(chunk.contiguous()),
-                _dl(fab),
-                _dl(qw),
-                _dl(kw),
-                _dl(km),
-                _dl(vsc),
-                float(rope_eps),
-                rot,
-                t0,
-                m,
-                1,
-                t,
-                h,
-                stream,
+                _dl(ws), _dl(chunk.contiguous()), _dl(fab), _dl(qw), _dl(kw), _dl(km), _dl(vsc),
+                float(rope_eps), rot, t0, m, 1, t, h, stream,
                 block_len=None if block_len is None else _dl(block_len),
-                token_aug=int(token_aug),
-            )
+                token_aug=int(token_aug))
             t0 += m
         if t0 != t:
             raise ValueError(f"sol_attn_chunked: chunks cover {t0} tokens, T={t}")
@@ -2880,50 +2458,26 @@ def sol_attn_chunked(
         # bootstrap: harvest the scale-independent statistics (post-rope K sums, V
         # absmax) with dummy scales, then produce for real
         produce(torch.zeros(h, d, device=dev), torch.ones(h, d, device=dev))
-        kmean = (
-            _ws_ksums(ws, p, h).sum(1) / lengths.sum()
-        )  # live tokens, like prep_sums_to_means
-        vscale = vscale_of(
-            ws[p["statsV"] : p["statsV"] + h * d * 4].view(torch.float32)
-        )
+        kmean = _ws_ksums(ws, p, h).sum(1) / lengths.sum()   # live tokens, like prep_sums_to_means
+        vscale = vscale_of(ws[p["statsV"]:p["statsV"] + h * d * 4].view(torch.float32))
     kmean = kmean.to(device=dev, dtype=torch.float32).contiguous()
     # a zero scale is 1/0 in the producer and 255/0 in route: clamp like vscale_of
     vscale = vscale.to(device=dev, dtype=torch.float32).clamp_min(1e-8).contiguous()
     produce(kmean, vscale)
     sb, sq = _sink_pair(sink_blocks), _sink_pair(sink_q)
-    threshold = (
-        _topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sb)
-        if topk_ratio
-        else None
-    )
+    threshold = (_topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sb)
+                 if topk_ratio else None)
     out = torch.empty(1, t, h, d, dtype=torch.bfloat16, device=dev)
     kmean_next = torch.empty(h, d, device=dev, dtype=torch.float32)
     vamax = torch.empty(h, d, device=dev, dtype=torch.float32)
     _C.sol_attn_core(
-        _dl(ws),
-        _dl(out),
-        _dl(vscale),
-        _dl(kmean_next),
-        _dl(vamax),
-        1,
-        t,
-        h,
-        float(tau),
-        float(scale),
-        sb[0],
-        sb[1],
-        sq[0],
-        sq[1],
-        stream,
+        _dl(ws), _dl(out), _dl(vscale), _dl(kmean_next), _dl(vamax),
+        1, t, h, float(tau), float(scale), sb[0], sb[1], sq[0], sq[1], stream,
         threshold=None if threshold is None else _dl(threshold),
-        block_len=None if block_len is None else _dl(block_len),
-        tail=bool(tail),
-        token_aug=int(token_aug),
-    )
+        block_len=None if block_len is None else _dl(block_len), tail=bool(tail),
+        token_aug=int(token_aug))
     if coarse_gate is not None:
-        add_coarse_(
-            out, coarse_output(*_ws_block_means(ws, p, h, lengths), scale), coarse_gate
-        )
+        add_coarse_(out, coarse_output(*_ws_block_means(ws, p, h, lengths), scale), coarse_gate)
     return out, kmean_next, vscale_of(vamax)
 
 
@@ -2931,11 +2485,8 @@ def _ws_ksums(ws, p, bh):
     """The producer's post-rope block K sums, [BH, NTB, 128] f32 view into scratch
     (block MEANS on the direct path, and once sol_attn_core has run)."""
     d = _SOL_HD
-    return (
-        ws[p["scratch"] : p["scratch"] + bh * p["NPAD"] * d * 4]
-        .view(torch.float32)
-        .view(bh, p["NPAD"], d)[:, : p["NTB"]]
-    )
+    return ws[p["scratch"]:p["scratch"] + bh * p["NPAD"] * d * 4] \
+        .view(torch.float32).view(bh, p["NPAD"], d)[:, :p["NTB"]]
 
 
 def _ws_block_means(ws, p, bh, lengths):
@@ -2943,16 +2494,8 @@ def _ws_block_means(ws, p, bh, lengths):
     what the kernels already left in the workspace: the qmean slot, K means in
     scratch, V sums in vcT (bf16)."""
     ntb, npad, d = p["NTB"], p["NPAD"], _SOL_HD
-    qm = (
-        ws[p["qmean"] : p["qmean"] + bh * npad * d * 4]
-        .view(torch.float32)
-        .view(bh, npad, d)[:, :ntb]
-    )
-    vm = (
-        ws[p["vcT"] : p["vcT"] + bh * d * npad * 2]
-        .view(torch.bfloat16)
-        .view(bh, d, npad)[:, :, :ntb]
-    )
+    qm = ws[p["qmean"]:p["qmean"] + bh * npad * d * 4].view(torch.float32).view(bh, npad, d)[:, :ntb]
+    vm = ws[p["vcT"]:p["vcT"] + bh * d * npad * 2].view(torch.bfloat16).view(bh, d, npad)[:, :, :ntb]
     return qm, _ws_ksums(ws, p, bh), vm.transpose(1, 2).float() / lengths.view(1, -1, 1)
 
 
@@ -2961,10 +2504,8 @@ def _topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sinks):
     HIP carriers are in channel order, so cen8 is read as stored -- the CUDA entry
     has to gather it at perm_d first."""
     ntb, d = p["NTB"], _SOL_HD
-    cen8 = (
-        ws[p["cen8"] : p["cen8"] + h * ntb * d].view(torch.int8).view(h, ntb, d).float()
-    )
-    cens = ws[p["cens"] : p["cens"] + h * ntb * 4].view(torch.float32).view(h, ntb)
+    cen8 = ws[p["cen8"]:p["cen8"] + h * ntb * d].view(torch.int8).view(h, ntb, d).float()
+    cens = ws[p["cens"]:p["cens"] + h * ntb * 4].view(torch.float32).view(h, ntb)
     kc = _ws_ksums(ws, p, h) / lengths.view(1, -1, 1)
     kc = kc - kc.mean(dim=1, keepdim=True)
     return _topk_from_pooled(cen8, cens, kc, topk_ratio, scale * _LOG2E, sinks)
@@ -2973,7 +2514,6 @@ def _topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sinks):
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
-
 
 def _build_constraints(has_wmma: bool = True) -> dict:
     from comfy_kitchen.constraints import (
@@ -3004,9 +2544,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 and weight.device.type == "cpu"
                 and not weight.is_pinned()
             ):
-                return ValidationResult.fail(
-                    name, "CPU weights must be mapped pinned memory"
-                )
+                return ValidationResult.fail(name, "CPU weights must be mapped pinned memory")
         return ValidationResult.ok()
 
     def _na3d_call_rule(kwargs):
@@ -3019,9 +2557,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             # The WMMA K-step is 16 wide and the output accumulators are held in
             # registers, one 16-column tile each.
             if head_dim % 16 != 0 or head_dim > 64:
-                return ValidationResult.fail(
-                    "q", "head_dim must be a multiple of 16 and <= 64"
-                )
+                return ValidationResult.fail("q", "head_dim must be a multiple of 16 and <= 64")
             if q.shape[1] * q.shape[2] > 65535 or q.shape[0] * q.shape[4] > 65535:
                 return ValidationResult.fail("q", "grid dims exceed HIP limits")
         return ValidationResult.ok()
@@ -3152,9 +2688,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 "codebook": ParamConstraint(
                     dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)
                 ),
-                "correction": ParamConstraint(
-                    dtypes=floats, shape_rules=(ExactDims(2),)
-                ),
+                "correction": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
                 "group_size": ParamConstraint(dtypes=frozenset({int})),
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
                 "output_dtype": ParamConstraint(dtypes=out_floats),
@@ -3179,9 +2713,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 "codebook": ParamConstraint(
                     dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)
                 ),
-                "correction": ParamConstraint(
-                    dtypes=floats, shape_rules=(ExactDims(2),)
-                ),
+                "correction": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
                 "bias": ParamConstraint(dtypes=floats),
                 "group_size": ParamConstraint(dtypes=frozenset({int})),
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
@@ -3190,11 +2722,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             default_devices=dev,
         ),
         "quantize_convrot_w4a4_weight": FunctionConstraints(
-            params={
-                "weight": ParamConstraint(
-                    dtypes=floats, shape_rules=(DivisibleBy(-1, 32),)
-                )
-            },
+            params={"weight": ParamConstraint(dtypes=floats, shape_rules=(DivisibleBy(-1, 32),))},
             default_devices=dev,
         ),
         "dequantize_convrot_w4a4_weight": FunctionConstraints(
@@ -3228,9 +2756,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                     dtypes=floats, shape_rules=(ExactDims(2), DivisibleBy(-1, 64))
                 ),
                 "smooth": ParamConstraint(dtypes=floats),
-                "lora_down": ParamConstraint(
-                    dtypes=floats, shape_rules=(ExactDims(2),)
-                ),
+                "lora_down": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
             },
             default_devices=dev,
         ),
@@ -3265,9 +2791,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ),
         "fp16_linear": FunctionConstraints(
             params={
-                "x": ParamConstraint(
-                    dtypes=frozenset({torch.float16}), shape_rules=(MinDims(2),)
-                ),
+                "x": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(MinDims(2),)),
                 "weight": ParamConstraint(
                     dtypes=frozenset({torch.float16}),
                     devices=cpu_weight_devices,
@@ -3282,16 +2806,12 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ),
         "fp16_conv3d": FunctionConstraints(
             params={
-                "x": ParamConstraint(
-                    dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(5),)
-                ),
+                "x": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(5),)),
                 "weight": ParamConstraint(
                     dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(5),)
                 ),
                 "bias": ParamConstraint(dtypes=frozenset({torch.float16, type(None)})),
-                "residual": ParamConstraint(
-                    dtypes=frozenset({torch.float16, type(None)})
-                ),
+                "residual": ParamConstraint(dtypes=frozenset({torch.float16, type(None)})),
             },
             default_devices=dev,
         ),
@@ -3302,14 +2822,10 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                     shape_rules=(ExactDims(5),),
                 ),
                 "weight": ParamConstraint(
-                    dtypes=frozenset(
-                        {torch.float32, torch.float16, torch.bfloat16, type(None)}
-                    ),
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16, type(None)}),
                 ),
                 "bias": ParamConstraint(
-                    dtypes=frozenset(
-                        {torch.float32, torch.float16, torch.bfloat16, type(None)}
-                    ),
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16, type(None)}),
                 ),
             },
             default_devices=dev,
@@ -3319,18 +2835,14 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             params={
                 "xq": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),)),
                 "xk": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),)),
-                "freqs_cis": ParamConstraint(
-                    dtypes=floats, shape_rules=(ExactDims(6),)
-                ),
+                "freqs_cis": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(6),)),
             },
             default_devices=dev,
         ),
         "apply_rope1": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),)),
-                "freqs_cis": ParamConstraint(
-                    dtypes=floats, shape_rules=(ExactDims(6),)
-                ),
+                "freqs_cis": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(6),)),
             },
             default_devices=dev,
         ),
@@ -3338,18 +2850,14 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             params={
                 "xq": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),)),
                 "xk": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),)),
-                "freqs_cis": ParamConstraint(
-                    dtypes=floats, shape_rules=(ExactDims(6),)
-                ),
+                "freqs_cis": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(6),)),
             },
             default_devices=dev,
         ),
         "apply_rope_split_half1": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),)),
-                "freqs_cis": ParamConstraint(
-                    dtypes=floats, shape_rules=(ExactDims(6),)
-                ),
+                "freqs_cis": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(6),)),
             },
             default_devices=dev,
         ),
@@ -3359,9 +2867,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             params={
                 "q": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),)),
                 "k": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),)),
-                "freqs_cis": ParamConstraint(
-                    dtypes=floats, shape_rules=(ExactDims(6),)
-                ),
+                "freqs_cis": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(6),)),
                 "q_scale": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(1),)),
                 "k_scale": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(1),)),
             },
@@ -3370,9 +2876,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         "rms_rope1": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),)),
-                "freqs_cis": ParamConstraint(
-                    dtypes=floats, shape_rules=(ExactDims(6),)
-                ),
+                "freqs_cis": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(6),)),
                 "scale": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(1),)),
             },
             default_devices=dev,
@@ -3381,9 +2885,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             params={
                 "q": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),)),
                 "k": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),)),
-                "freqs_cis": ParamConstraint(
-                    dtypes=floats, shape_rules=(ExactDims(6),)
-                ),
+                "freqs_cis": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(6),)),
                 "q_scale": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(1),)),
                 "k_scale": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(1),)),
             },
@@ -3392,9 +2894,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         "rms_rope_split_half1": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),)),
-                "freqs_cis": ParamConstraint(
-                    dtypes=floats, shape_rules=(ExactDims(6),)
-                ),
+                "freqs_cis": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(6),)),
                 "scale": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(1),)),
             },
             default_devices=dev,
@@ -3415,9 +2915,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         constraints[inplace_name] = constraints[functional_name]
 
     if not has_wmma:
-        constraints = {
-            k: v for k, v in constraints.items() if k not in _TILED_ATTENTION_OPS
-        }
+        constraints = {k: v for k, v in constraints.items() if k not in _TILED_ATTENTION_OPS}
 
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in constraints:
@@ -3497,9 +2995,7 @@ _DELTA_KEY_DIM = 128
 _DELTA_CONV_MAX_WINDOW = 16
 
 
-def gated_delta_decode_is_available(
-    key_head_dim: int = 128, value_head_dim: int = 128
-) -> bool:
+def gated_delta_decode_is_available(key_head_dim: int = 128, value_head_dim: int = 128) -> bool:
     """Whether the fused DeltaNet decode kernels can run here for these head dims.
 
     The kernels use no matrix cores, but they do use bf16 and fp16 arithmetic
@@ -3640,23 +3136,15 @@ def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
         "k_int8": torch.empty(k.shape, dtype=torch.int8, device=device),
         # One scale per query row and one per 16 adjacent keys; the padding exists
         # so the kernel can read a scale for every lane of its last tile.
-        "q_scale": torch.empty(
-            batch, q_heads, padded_q, dtype=torch.float32, device=device
-        ),
+        "q_scale": torch.empty(batch, q_heads, padded_q, dtype=torch.float32, device=device),
         "k_scale": torch.empty(
-            batch,
-            kv_heads,
-            padded_k // _SAGE_KEY_GROUP,
-            dtype=torch.float32,
-            device=device,
+            batch, kv_heads, padded_k // _SAGE_KEY_GROUP, dtype=torch.float32, device=device
         ),
         # V is stored transposed, [B * H * D, padded_K], with the tail zero filled.
         "v_int8": torch.empty(
             batch * kv_heads * head_dim, padded_k, dtype=torch.int8, device=device
         ),
-        "v_scale": torch.empty(
-            batch * kv_heads * head_dim, dtype=torch.float32, device=device
-        ),
+        "v_scale": torch.empty(batch * kv_heads * head_dim, dtype=torch.float32, device=device),
     }
 
     # One key index per batch and KV head, written by the stabilization detector

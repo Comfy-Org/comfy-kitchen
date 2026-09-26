@@ -6,9 +6,7 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
-from comfy_kitchen.backends.eager.group_norm_pad3d import (
-    group_norm_silu_pad3d as eager_ref,
-)
+from comfy_kitchen.backends.eager.group_norm_pad3d import group_norm_silu_pad3d as eager_ref
 from tests.conftest import rel_err
 
 CL3D = torch.channels_last_3d
@@ -68,9 +66,7 @@ class TestGroupNormSiluPad3d:
             pytest.skip("CUDA required")
         x, weight, bias = _inputs(256, 2, 20, 20, torch.float16)
         ref = eager_ref(x, weight, bias, 32, 1e-6, [1, 1, 1, 1, 0], False)
-        got = ck.group_norm_silu_pad3d(
-            x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), silu=False
-        )
+        got = ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), silu=False)
         assert rel_err(got.float(), ref.float()) < 5e-3
 
     def test_unsupported_channels_fall_back(self, seed, cuda_available):
@@ -78,9 +74,7 @@ class TestGroupNormSiluPad3d:
         if not cuda_available:
             pytest.skip("CUDA required")
         x = torch.randn(1, 3, 2, 12, 12, dtype=torch.float16, device="cuda")
-        got = ck.group_norm_silu_pad3d(
-            x, None, None, 1, 0.0, (1, 1, 1, 1, 2), silu=False
-        )
+        got = ck.group_norm_silu_pad3d(x, None, None, 1, 0.0, (1, 1, 1, 1, 2), silu=False)
         ref = eager_ref(x, None, None, 1, 0.0, [1, 1, 1, 1, 2], False)
         assert torch.equal(got, ref)
 
@@ -91,15 +85,11 @@ class TestGroupNormSiluPad3d:
             pytest.skip("CUDA required")
         x = torch.randn(1, 2048, 1, 4, 4, dtype=torch.float16, device="cuda")
         w = torch.ones(2048, dtype=torch.float16, device="cuda")
-        got = ck.group_norm_silu_pad3d(
-            x, w, None, 2048, 1e-6, (0, 0, 0, 0, 0), silu=False
-        )
+        got = ck.group_norm_silu_pad3d(x, w, None, 2048, 1e-6, (0, 0, 0, 0, 0), silu=False)
         ref = torch.nn.functional.group_norm(x, 2048, w, None, 1e-6)
         assert torch.allclose(got.float(), ref.float(), atol=1e-2)
         x = torch.randn(1, 8, 65536, 1, 1, dtype=torch.float16, device="cuda")
-        got = ck.group_norm_silu_pad3d(
-            x, None, None, 1, 0.0, (0, 0, 0, 0, 1), silu=False
-        )
+        got = ck.group_norm_silu_pad3d(x, None, None, 1, 0.0, (0, 0, 0, 0, 1), silu=False)
         assert got.shape[2] == 65537 and torch.equal(got[:, :, 1:].float(), x.float())
 
     def test_negative_padding_is_rejected(self, cuda_available):
@@ -108,13 +98,8 @@ class TestGroupNormSiluPad3d:
         x = torch.randn(1, 64, 3, 8, 8, dtype=torch.float16, device="cuda")
         for backend in ("cuda", "eager"):
             for kwargs in ({}, {"out": torch.empty_like(x)}):
-                with (
-                    ck.use_backend(backend),
-                    pytest.raises(ValueError, match="non-negative"),
-                ):
-                    ck.group_norm_silu_pad3d(
-                        x, None, None, 1, 0.0, (0, 0, 0, 0, -1), silu=False, **kwargs
-                    )
+                with ck.use_backend(backend), pytest.raises(ValueError, match="non-negative"):
+                    ck.group_norm_silu_pad3d(x, None, None, 1, 0.0, (0, 0, 0, 0, -1), silu=False, **kwargs)
 
     def test_misaligned_input_falls_back(self, seed, cuda_available):
         """A 16-byte-misaligned view must not reach the vectorized kernel."""
@@ -122,13 +107,9 @@ class TestGroupNormSiluPad3d:
             pytest.skip("CUDA required")
         n = 128 * 2 * 12 * 12
         base = torch.randn(n + 4, dtype=torch.float16, device="cuda")
-        x = (
-            base[4 : 4 + n].view(1, 2, 12, 12, 128).permute(0, 4, 1, 2, 3)
-        )  # NDHWC storage, misaligned
+        x = base[4:4 + n].view(1, 2, 12, 12, 128).permute(0, 4, 1, 2, 3)  # NDHWC storage, misaligned
         assert x.data_ptr() % 16 == 8 and x.is_contiguous(memory_format=CL3D)
-        got = ck.group_norm_silu_pad3d(
-            x, None, None, 1, 0.0, (1, 1, 1, 1, 2), silu=True
-        )
+        got = ck.group_norm_silu_pad3d(x, None, None, 1, 0.0, (1, 1, 1, 1, 2), silu=True)
         torch.cuda.synchronize()
         ref = eager_ref(x, None, None, 1, 0.0, [1, 1, 1, 1, 2], True)
         assert torch.equal(got, ref)
@@ -145,9 +126,7 @@ class TestGroupNormSiluPad3d:
         assert got.is_contiguous(memory_format=torch.channels_last_3d)
         assert rel_err(got.float(), ref.float()) < 5e-3
 
-    @pytest.mark.parametrize(
-        "c", [128, 96]
-    )  # 96: C/8 is not a power of two -> eager fallback
+    @pytest.mark.parametrize("c", [128, 96])  # 96: C/8 is not a power of two -> eager fallback
     def test_fp32_affine_params(self, c, seed, cuda_available):
         """The registry admits fp32 weight/bias with a half input (fp32 master
         norms); both the kernel and the fallback must cast rather than hand
@@ -156,9 +135,7 @@ class TestGroupNormSiluPad3d:
             pytest.skip("CUDA required")
         x, weight, bias = _inputs(c, 2, 12, 12, torch.float16)
         weight, bias = weight.float(), bias.float()
-        got = ck.group_norm_silu_pad3d(
-            x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 2), silu=True
-        )
+        got = ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 2), silu=True)
         ref = eager_ref(x, weight.half(), bias.half(), 32, 1e-6, [1, 1, 1, 1, 2], True)
         assert got.dtype == torch.float16
         assert rel_err(got.float(), ref.float()) < 5e-3
@@ -169,20 +146,11 @@ class TestGroupNormSiluPad3d:
         weight = torch.randn(64)
         bias = torch.randn(64)
         with ck.use_backend("eager"):
-            got = ck.group_norm_silu_pad3d(
-                x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 2), silu=False
-            )
+            got = ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 2), silu=False)
         per_frame = torch.stack(
-            [
-                torch.nn.functional.group_norm(x[:, :, i], 32, weight, bias, 1e-6)
-                for i in range(3)
-            ],
-            dim=2,
-        )
-        ref = torch.nn.functional.pad(
-            torch.nn.functional.pad(per_frame, (1, 1, 1, 1, 0, 0), mode="reflect"),
-            (0, 0, 0, 0, 2, 0),
-        )
+            [torch.nn.functional.group_norm(x[:, :, i], 32, weight, bias, 1e-6) for i in range(3)], dim=2)
+        ref = torch.nn.functional.pad(torch.nn.functional.pad(per_frame, (1, 1, 1, 1, 0, 0), mode="reflect"),
+                                      (0, 0, 0, 0, 2, 0))
         assert torch.allclose(got, ref, atol=1e-5)
 
 
@@ -191,13 +159,9 @@ class TestZeroPad:
 
     @staticmethod
     def _assert_matches_constant_pad(x, pad):
-        got = ck.group_norm_silu_pad3d(
-            x, None, None, 1, 0.0, pad, silu=False, zero_pad=True
-        )
+        got = ck.group_norm_silu_pad3d(x, None, None, 1, 0.0, pad, silu=False, zero_pad=True)
         left, right, top, bottom, front = pad
-        ref = torch.nn.functional.pad(
-            x, (left, right, top, bottom, front, 0), mode="constant", value=0.0
-        )
+        ref = torch.nn.functional.pad(x, (left, right, top, bottom, front, 0), mode="constant", value=0.0)
         assert got.shape == ref.shape
         torch.testing.assert_close(got, ref, rtol=0, atol=0)
 
@@ -216,9 +180,7 @@ class TestZeroPad:
             pytest.skip("CUDA required")
         x, weight, bias = _inputs(c, t, h, w, dtype)
         ref = eager_ref(x, weight, bias, 32, 1e-6, list(pad), True, True)
-        got = ck.group_norm_silu_pad3d(
-            x, weight, bias, 32, 1e-6, pad, silu=True, zero_pad=True
-        )
+        got = ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, pad, silu=True, zero_pad=True)
 
         assert got.shape == ref.shape
         assert got.is_contiguous(memory_format=CL3D)
@@ -229,11 +191,9 @@ class TestZeroPad:
         if not cuda_available:
             pytest.skip("CUDA required")
         x = torch.randn(1, 64, 2, 6, 6, dtype=torch.float16, device="cuda").contiguous(
-            memory_format=CL3D
-        )
-        got = ck.group_norm_silu_pad3d(
-            x, None, None, 1, 0.0, (1, 1, 1, 1, 0), silu=False, zero_pad=True
-        )
+            memory_format=CL3D)
+        got = ck.group_norm_silu_pad3d(x, None, None, 1, 0.0, (1, 1, 1, 1, 0),
+                                       silu=False, zero_pad=True)
         assert torch.count_nonzero(got[:, :, :, 0, :]) == 0
         assert torch.count_nonzero(got[:, :, :, -1, :]) == 0
         assert torch.count_nonzero(got[:, :, :, :, 0]) == 0
@@ -246,30 +206,20 @@ class TestZeroPad:
         if not cuda_available:
             pytest.skip("CUDA required")
         self._assert_matches_constant_pad(
-            torch.randn(1, 32, 3, 7, 5, dtype=torch.float16, device="cuda").contiguous(
-                memory_format=CL3D
-            ),
-            (2, 1, 1, 2, 2),
-        )
+            torch.randn(1, 32, 3, 7, 5, dtype=torch.float16, device="cuda").contiguous(memory_format=CL3D),
+            (2, 1, 1, 2, 2))
         self._assert_matches_constant_pad(
-            torch.randn(1, 32, 1, 2, 2, dtype=torch.float16, device="cuda").contiguous(
-                memory_format=CL3D
-            ),
-            (3, 3, 3, 3, 0),
-        )
+            torch.randn(1, 32, 1, 2, 2, dtype=torch.float16, device="cuda").contiguous(memory_format=CL3D),
+            (3, 3, 3, 3, 0))
 
     def test_reflect_is_still_the_default(self, seed, cuda_available):
         if not cuda_available:
             pytest.skip("CUDA required")
         x = torch.randn(1, 32, 1, 5, 5, dtype=torch.float16, device="cuda").contiguous(
-            memory_format=CL3D
-        )
-        reflected = ck.group_norm_silu_pad3d(
-            x, None, None, 1, 0.0, (1, 0, 0, 0, 0), silu=False
-        )
-        zeroed = ck.group_norm_silu_pad3d(
-            x, None, None, 1, 0.0, (1, 0, 0, 0, 0), silu=False, zero_pad=True
-        )
+            memory_format=CL3D)
+        reflected = ck.group_norm_silu_pad3d(x, None, None, 1, 0.0, (1, 0, 0, 0, 0), silu=False)
+        zeroed = ck.group_norm_silu_pad3d(x, None, None, 1, 0.0, (1, 0, 0, 0, 0),
+                                          silu=False, zero_pad=True)
         assert not torch.equal(reflected, zeroed)
         assert torch.count_nonzero(zeroed[:, :, :, :, 0]) == 0
 
@@ -282,36 +232,18 @@ class TestOutParameter:
         if not cuda_available:
             pytest.skip("CUDA required")
         x, weight, bias = _inputs(128, 3, 40, 56, torch.float16)
-        ref = ck.group_norm_silu_pad3d(
-            x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), True, zero_pad=True
-        )
+        ref = ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), True, zero_pad=True)
         out = torch.empty_like(ref).contiguous(memory_format=CL3D)
-        got = ck.group_norm_silu_pad3d(
-            x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), True, zero_pad=True, out=out
-        )
+        got = ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), True, zero_pad=True, out=out)
         assert got.data_ptr() == out.data_ptr() and torch.equal(out, ref)
 
     def test_frame_offset_view(self, seed, cuda_available):
         if not cuda_available:
             pytest.skip("CUDA required")
         x, weight, bias = _inputs(128, 3, 40, 56, torch.float16)
-        ref = ck.group_norm_silu_pad3d(
-            x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), True, zero_pad=True
-        )
-        buf = torch.full(
-            (1, 128, 5, 42, 58), 7.0, dtype=torch.float16, device="cuda"
-        ).contiguous(memory_format=CL3D)
-        ck.group_norm_silu_pad3d(
-            x,
-            weight,
-            bias,
-            32,
-            1e-6,
-            (1, 1, 1, 1, 0),
-            True,
-            zero_pad=True,
-            out=buf[:, :, 2:],
-        )
+        ref = ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), True, zero_pad=True)
+        buf = torch.full((1, 128, 5, 42, 58), 7.0, dtype=torch.float16, device="cuda").contiguous(memory_format=CL3D)
+        ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), True, zero_pad=True, out=buf[:, :, 2:])
         assert torch.equal(buf[:, :, 2:], ref) and bool((buf[:, :, :2] == 7.0).all())
 
     def test_wrong_shape_is_rejected(self, cuda_available):
@@ -319,14 +251,4 @@ class TestOutParameter:
             pytest.skip("CUDA required")
         x, weight, bias = _inputs(128, 2, 16, 16, torch.float16)
         with pytest.raises(ValueError):
-            ck.group_norm_silu_pad3d(
-                x,
-                weight,
-                bias,
-                32,
-                1e-6,
-                (1, 1, 1, 1, 0),
-                True,
-                zero_pad=True,
-                out=torch.empty_like(x),
-            )
+            ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), True, zero_pad=True, out=torch.empty_like(x))

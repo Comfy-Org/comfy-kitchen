@@ -1,5 +1,4 @@
 """Unit tests for comfy_kitchen.tensor module."""
-
 import pytest
 import torch
 
@@ -120,7 +119,7 @@ class TestQuantizedTensor:
         assert isinstance(qt, QuantizedTensor)
         assert qt.shape == (64, 64)
         assert qt.storage_shape == (64, 64)  # FP8 is not packed
-        assert qt.padded_shape == (64, 64)  # no packing to reverse
+        assert qt.padded_shape == (64, 64)   # no packing to reverse
         assert not qt.is_padded  # FP8 doesn't require padding
         assert qt.layout_cls is TensorCoreFP8Layout
 
@@ -138,7 +137,7 @@ class TestQuantizedTensor:
 
         assert qt.shape == (128, 256)
         assert qt.storage_shape == (128, 128)  # packed (cols / 2)
-        assert qt.padded_shape == (128, 256)  # logical shape (unpacked)
+        assert qt.padded_shape == (128, 256)   # logical shape (unpacked)
         assert not qt.is_padded  # no padding needed for 16-aligned dims
 
     def test_shape_vs_storage_shape_unaligned(self):
@@ -146,8 +145,8 @@ class TestQuantizedTensor:
         qt = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
 
         assert qt.shape == (129, 130)
-        assert qt.storage_shape == (144, 72)  # padded to 144x144, then packed
-        assert qt.padded_shape == (144, 144)  # logical shape after padding
+        assert qt.storage_shape == (144, 72)   # padded to 144x144, then packed
+        assert qt.padded_shape == (144, 144)   # logical shape after padding
         assert qt.is_padded  # padding was applied
 
     def test_dequantize_fp8(self):
@@ -417,6 +416,7 @@ class TestQuantizedTensorFlatten:
         assert "layout_cls" in ctx
 
 
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestCapabilityChecking:
     """Tests for hardware capability checking."""
@@ -449,9 +449,7 @@ class TestCapabilityChecking:
 
         assert reqs["layout"] == "TensorCoreFP8Layout"
         assert reqs["min_sm_version"] == (8, 9)
-        assert (reqs["current_sm_version"] is None) == bool(
-            getattr(torch.version, "hip", None)
-        )
+        assert (reqs["current_sm_version"] is None) == bool(getattr(torch.version, "hip", None))
         assert isinstance(reqs["fast_matmul_supported"], bool)
 
     def test_get_requirements_nvfp4(self):
@@ -459,17 +457,11 @@ class TestCapabilityChecking:
 
         assert reqs["layout"] == "TensorCoreNVFP4Layout"
         assert reqs["min_sm_version"] == (10, 0)
-        assert (reqs["current_sm_version"] is None) == bool(
-            getattr(torch.version, "hip", None)
-        )
+        assert (reqs["current_sm_version"] is None) == bool(getattr(torch.version, "hip", None))
         assert isinstance(reqs["fast_matmul_supported"], bool)
 
     def test_supports_fast_matmul_consistent_with_requirements(self):
-        for layout_cls in [
-            TensorCoreFP8Layout,
-            TensorCoreNVFP4Layout,
-            TensorCoreMXFP8Layout,
-        ]:
+        for layout_cls in [TensorCoreFP8Layout, TensorCoreNVFP4Layout, TensorCoreMXFP8Layout]:
             reqs = layout_cls.get_requirements()
             assert reqs["fast_matmul_supported"] == layout_cls.supports_fast_matmul()
 
@@ -498,6 +490,7 @@ class TestCopyValidation:
 
         with pytest.raises(TypeError, match="Layout mismatch"):
             qt1.copy_(qt2)
+
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -542,10 +535,7 @@ class TestBaseLayoutParams:
         assert torch.equal(params_clone.scale, params.scale)
         assert torch.equal(params_clone.block_scale, params.block_scale)
 
-    @pytest.mark.parametrize(
-        "layout_cls",
-        [TensorCoreFP8Layout, TensorCoreNVFP4Layout, TensorCoreMXFP8Layout],
-    )
+    @pytest.mark.parametrize("layout_cls", [TensorCoreFP8Layout, TensorCoreNVFP4Layout, TensorCoreMXFP8Layout])
     def test_params_inherits_from_base(self, layout_cls):
         assert issubclass(layout_cls.Params, BaseLayoutParams)
 
@@ -570,7 +560,6 @@ class TestParamsDtypeValidation:
         assert params.scale.dtype == torch.float32
         assert params.scale.device.type == "cuda"
         assert params.scale.item() == 1.0
-
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestFP8LinearOperations:
@@ -619,9 +608,7 @@ class TestFP8LinearOperations:
             pytest.skip("FP8 matmul not supported on this hardware")
 
         batch, seq_len, in_features, out_features = 4, 16, 64, 128
-        x = torch.randn(
-            batch, seq_len, in_features, device="cuda", dtype=torch.bfloat16
-        )
+        x = torch.randn(batch, seq_len, in_features, device="cuda", dtype=torch.bfloat16)
         w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
 
         qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
@@ -744,10 +731,7 @@ class TestFP8LinearOperations:
         batch, in_features, out_features = 16, 32, 64
         # Use different value ranges to get different scales
         x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16) * 10
-        w = (
-            torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
-            * 0.1
-        )
+        w = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16) * 0.1
 
         qt_x = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         qt_w = QuantizedTensor.from_float(w, "TensorCoreFP8Layout")
@@ -832,14 +816,11 @@ class TestFP8ViewOperations:
         assert qt_reshaped.shape == (32, 128)
         assert isinstance(qt_reshaped, QuantizedTensor)
 
-    @pytest.mark.parametrize(
-        "op_name,input_shape,op_args",
-        [
-            ("view", (64, 64), ((16, 256),)),
-            ("t", (32, 64), ()),
-            ("reshape", (4, 8, 16), ((32, 16),)),
-        ],
-    )
+    @pytest.mark.parametrize("op_name,input_shape,op_args", [
+        ("view", (64, 64), ((16, 256),)),
+        ("t", (32, 64), ()),
+        ("reshape", (4, 8, 16), ((32, 16),)),
+    ])
     def test_fp8_shape_op_dequantize_consistency(self, op_name, input_shape, op_args):
         """Test that shape op then dequantize matches dequantize then shape op."""
         x = torch.randn(*input_shape, device="cuda", dtype=torch.bfloat16)
@@ -913,9 +894,7 @@ class TestNVFP4LinearOperations:
     def test_nvfp4_linear_both_quantized(self):
         """Test NVFP4 linear with both input and weight quantized."""
         if not TensorCoreNVFP4Layout.supports_fast_matmul():
-            pytest.skip(
-                "NVFP4 matmul not supported on this hardware (requires SM >= 10.0)"
-            )
+            pytest.skip("NVFP4 matmul not supported on this hardware (requires SM >= 10.0)")
 
         batch, in_features, out_features = 32, 64, 128
         x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
@@ -1023,9 +1002,7 @@ class TestNVFP4LinearOperations:
     def test_nvfp4_mm_with_transposed_b(self):
         """Test NVFP4 mm with transposed b (the torch.compile linear decomposition case)."""
         if not TensorCoreNVFP4Layout.supports_fast_matmul():
-            pytest.skip(
-                "NVFP4 matmul not supported on this hardware (requires SM >= 10.0)"
-            )
+            pytest.skip("NVFP4 matmul not supported on this hardware (requires SM >= 10.0)")
 
         m, k, n = 32, 64, 128
         a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
@@ -1206,9 +1183,7 @@ class TestMXFP8LinearOperations:
 
     def test_mxfp8_linear_both_quantized(self):
         if not TensorCoreMXFP8Layout.supports_fast_matmul():
-            pytest.skip(
-                "MXFP8 matmul not supported on this hardware (requires SM >= 10.0)"
-            )
+            pytest.skip("MXFP8 matmul not supported on this hardware (requires SM >= 10.0)")
 
         batch, in_features, out_features = 32, 64, 128
         x = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16)
@@ -1288,9 +1263,7 @@ class TestMXFP8LinearOperations:
 
     def test_mxfp8_mm_with_transposed_b(self):
         if not TensorCoreMXFP8Layout.supports_fast_matmul():
-            pytest.skip(
-                "MXFP8 matmul not supported on this hardware (requires SM >= 10.0)"
-            )
+            pytest.skip("MXFP8 matmul not supported on this hardware (requires SM >= 10.0)")
 
         m, k, n = 32, 64, 128
         a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
@@ -1444,7 +1417,7 @@ class TestINT8LinearOperations:
 
         m, k, n = 64, 128, 256
         a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-        b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)  # (out, in)
+        b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) # (out, in)
 
         qt_b = QuantizedTensor.from_float(b, "TensorWiseINT8Layout")
 

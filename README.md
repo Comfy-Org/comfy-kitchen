@@ -241,6 +241,7 @@ Both extensions are built against the Python limited API on 3.12+, so a wheel
 carrying CUDA and HIP side by side keeps its `abi3` tag. At runtime only the
 extension matching PyTorch's CUDA or ROCm runtime is loaded.
 
+
 ## Quantized Tensors
 
 The library provides `QuantizedTensor`, a `torch.Tensor` subclass that transparently intercepts PyTorch operations and dispatches them to optimized quantized kernels when available.
@@ -264,6 +265,7 @@ output = torch.nn.functional.linear(qt, weight_qt)
 # Dequantize back to float
 dq = qt.dequantize()
 ```
+
 
 ## Installation
 
@@ -301,15 +303,15 @@ pip install -e . --no-build-isolation -v
 
 These options require using `setup.py` directly (not `pip install`):
 
-| Option | Command | Description | Default |
-| -------- | --------- | ------------- | ----------------------------------------------------------------------------- |
-| `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Disable CUDA; without `--hip`, build a CPU-only wheel | Enabled (build with CUDA) |
-| `--hip` | `python setup.py bdist_wheel --hip` | Add HIP explicitly (including to a CUDA build) | Auto only when CUDA is unavailable |
-| `--no-hip` | `python setup.py bdist_wheel --no-hip` | Disable HIP | Disabled |
-| `--hip-archs=...` | `python setup.py build_ext --hip-archs="gfx1200;gfx1201"` | HIP architectures to build for | Visible supported AMD GPUs, otherwise all supported targets |
+| Option | Command | Description | Default                                                                     |
+|--------|---------|-------------|-----------------------------------------------------------------------------|
+| `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Disable CUDA; without `--hip`, build a CPU-only wheel | Enabled (build with CUDA)                                                   |
+| `--hip` | `python setup.py bdist_wheel --hip` | Add HIP explicitly (including to a CUDA build) | Auto only when CUDA is unavailable                                          |
+| `--no-hip` | `python setup.py bdist_wheel --no-hip` | Disable HIP | Disabled                                                                    |
+| `--hip-archs=...` | `python setup.py build_ext --hip-archs="gfx1200;gfx1201"` | HIP architectures to build for | Visible supported AMD GPUs, otherwise all supported targets                 |
 | `--cuda-archs=...` | `python setup.py build_ext --cuda-archs="80;89"` | CUDA architectures to build for | `75-virtual;80;89;90a;100f;120f` (Linux), `75-virtual;80;89;120f` (Windows) |
-| `--debug-build` | `python setup.py build_ext --debug-build` | Build in debug mode with symbols | Disabled (Release) |
-| `--lineinfo` | `python setup.py build_ext --lineinfo` | Enable NVCC line info for profiling | Disabled |
+| `--debug-build` | `python setup.py build_ext --debug-build` | Build in debug mode with symbols | Disabled (Release)                                                          |
+| `--lineinfo` | `python setup.py build_ext --lineinfo` | Enable NVCC line info for profiling | Disabled                                                                    |
 
 ```bash
 # Build CPU-only wheel (pure Python, no CUDA required)
@@ -321,6 +323,8 @@ python setup.py build_ext --cuda-archs="80;89" bdist_wheel
 # Debug build with line info for profiling
 python setup.py build_ext --debug-build --lineinfo bdist_wheel
 ```
+
+
 
 ### Requirements
 
@@ -357,7 +361,6 @@ with ck.use_backend("triton"):
 ## Backend System
 
 The library supports multiple backends:
-
 - **eager**: Pure PyTorch implementation
 - **cuda**: Custom CUDA C kernels (CUDA only)
 - **hip**: Custom HIP kernels (WMMA GEMMs on RDNA3/3.5/4; non-WMMA kernels also on RDNA2)
@@ -380,7 +383,7 @@ result = ck.quantize_per_tensor_fp8(x, scale)
 Each backend declares constraints for its functions:
 
 | Constraint | Description |
-| ------------ | ------------- |
+|------------|-------------|
 | **Device** | Which device types are supported |
 | **Dtype** | Allowed input/output dtypes per parameter |
 | **Shape** | Shape requirements (e.g., 2D tensors, dimensions divisible by 16) |
@@ -393,6 +396,7 @@ The registry validates inputs against these constraints **before** calling the b
 import logging
 logging.getLogger("comfy_kitchen.dispatch").setLevel(logging.DEBUG)
 ```
+
 
 ## Testing
 

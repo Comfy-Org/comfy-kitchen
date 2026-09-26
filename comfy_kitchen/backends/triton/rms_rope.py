@@ -42,23 +42,17 @@ def rms_rope_kernel(
     offsets = tl.arange(0, block_size)
     mask = offsets < n_pairs
 
-    x_offset = (
-        batch_idx * stride_x_batch + head_idx * stride_x_head + seq_idx * stride_x_seq
-    )
+    x_offset = (batch_idx * stride_x_batch + head_idx * stride_x_head + seq_idx * stride_x_seq)
     x_base = x_ptr + x_offset
-    out_offset = (
-        batch_idx * stride_out_batch
-        + head_idx * stride_out_head
-        + seq_idx * stride_out_seq
-    )
+    out_offset = (batch_idx * stride_out_batch +
+                  head_idx * stride_out_head +
+                  seq_idx * stride_out_seq)
     out_base = out_ptr + out_offset
 
     full_offsets = tl.arange(0, block_size * 2)
     full_mask = full_offsets < head_dim
 
-    x_full = tl.load(
-        x_base + full_offsets * stride_x_dim, mask=full_mask, other=0.0
-    ).to(tl.float32)
+    x_full = tl.load(x_base + full_offsets * stride_x_dim, mask=full_mask, other=0.0).to(tl.float32)
 
     inv_rms = tl.math.rsqrt(tl.sum(x_full * x_full, axis=0) / head_dim + epsilon)
 
@@ -69,12 +63,8 @@ def rms_rope_kernel(
         dim_idx_0 = offsets * 2
         dim_idx_1 = offsets * 2 + 1
 
-    x_0 = tl.load(x_base + dim_idx_0 * stride_x_dim, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    x_1 = tl.load(x_base + dim_idx_1 * stride_x_dim, mask=mask, other=0.0).to(
-        tl.float32
-    )
+    x_0 = tl.load(x_base + dim_idx_0 * stride_x_dim, mask=mask, other=0.0).to(tl.float32)
+    x_1 = tl.load(x_base + dim_idx_1 * stride_x_dim, mask=mask, other=0.0).to(tl.float32)
 
     scale_0 = tl.load(scale_ptr + dim_idx_0, mask=mask, other=0.0).to(tl.float32)
     scale_1 = tl.load(scale_ptr + dim_idx_1, mask=mask, other=0.0).to(tl.float32)
@@ -85,26 +75,21 @@ def rms_rope_kernel(
 
     freqs_batch_idx = tl.where(freqs_batch == 1, 0, batch_idx)
     freqs_seq_idx = tl.where(freqs_seq == 1, 0, seq_idx)
-    freqs_base = (
-        freqs_ptr
-        + freqs_batch_idx * stride_freqs_batch
-        + freqs_seq_idx * stride_freqs_seq
-        + offsets * stride_freqs_dim
-    )
+    freqs_base = (freqs_ptr +
+                  freqs_batch_idx * stride_freqs_batch +
+                  freqs_seq_idx * stride_freqs_seq +
+                  offsets * stride_freqs_dim)
 
     freqs_00 = tl.load(freqs_base, mask=mask, other=0.0)
     freqs_01 = tl.load(freqs_base + stride_freqs_pair, mask=mask, other=0.0)
-    freqs_10 = tl.load(freqs_base + stride_freqs_rot, mask=mask, other=0.0)
-    freqs_11 = tl.load(
-        freqs_base + stride_freqs_rot + stride_freqs_pair, mask=mask, other=0.0
-    )
+    freqs_10 = tl.load(freqs_base + stride_freqs_rot, mask=mask, other=0.0 )
+    freqs_11 = tl.load(freqs_base + stride_freqs_rot + stride_freqs_pair, mask=mask, other=0.0)
 
     out_0 = freqs_00 * x_0 + freqs_01 * x_1
     out_1 = freqs_10 * x_0 + freqs_11 * x_1
 
     tl.store(out_base + dim_idx_0 * stride_out_dim, out_0, mask=mask)
     tl.store(out_base + dim_idx_1 * stride_out_dim, out_1, mask=mask)
-
 
 def _rms_rope(
     x: torch.Tensor,
@@ -117,11 +102,7 @@ def _rms_rope(
     if torch.version.hip is not None:
         arch = torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0]
         if arch.startswith("gfx10"):
-            eager_fn = (
-                _eager_rope.rms_rope_split_half1
-                if split_half
-                else _eager_rope.rms_rope1
-            )
+            eager_fn = _eager_rope.rms_rope_split_half1 if split_half else _eager_rope.rms_rope1
             out = eager_fn(x, freqs_cis, scale, epsilon)
             if inplace:
                 x.copy_(out)
@@ -272,8 +253,7 @@ def rms_rope_split_half(
     if rot_dim and rot_dim != q.shape[-1]:
         # partial rotary is not fused in the triton kernel
         return _eager_rope.rms_rope_split_half(
-            q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim
-        )
+            q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
     return (
         _rms_rope(q, freqs_cis, q_scale, epsilon, split_half=True),
         _rms_rope(k, freqs_cis, k_scale, epsilon, split_half=True),
@@ -294,8 +274,7 @@ def rms_rope_split_half_(
     if rot_dim and rot_dim != q.shape[-1]:
         # partial rotary is not fused in the triton kernel
         return _eager_rope.rms_rope_split_half_(
-            q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim
-        )
+            q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
     check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
     return (
         _rms_rope(q, freqs_cis, q_scale, epsilon, split_half=True, inplace=True),

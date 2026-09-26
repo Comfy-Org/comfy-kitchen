@@ -28,38 +28,16 @@ def _reference_apply_rope(
 
 class TestApplyRope:
     """RoPE (Rotary Position Embedding) tests."""
-
     @pytest.mark.parametrize("op_name", ["apply_rope", "apply_rope1"])
     @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
-    @pytest.mark.parametrize(
-        "dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"]
-    )
-    @pytest.mark.parametrize(
-        "freqs_dtype",
-        [torch.float32, torch.float16, torch.bfloat16],
-        ids=["freqs_fp32", "freqs_fp16", "freqs_bf16"],
-    )
-    @pytest.mark.parametrize(
-        "config_name,layout,config",
-        [
-            ("FLUX", "BHND", (1, 24, 4352, 128)),
-            ("LTX", "BHND", (2, 32, 4996, 64)),
-            ("ZIMAGE", "BNHD", (1, 4096, 30, 128)),
-        ],
-        ids=lambda cfg: f"{cfg[0]}",
-    )
-    def test_rope_ops(
-        self,
-        op_name,
-        backend,
-        device,
-        seed,
-        dtype,
-        freqs_dtype,
-        config_name,
-        layout,
-        config,
-    ):
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+    @pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float16, torch.bfloat16], ids=["freqs_fp32", "freqs_fp16", "freqs_bf16"])
+    @pytest.mark.parametrize("config_name,layout,config", [
+        ("FLUX", "BHND", (1, 24, 4352, 128)),
+        ("LTX", "BHND", (2, 32, 4996, 64)),
+        ("ZIMAGE", "BNHD", (1, 4096, 30, 128)),
+    ], ids=lambda cfg: f"{cfg[0]}")
+    def test_rope_ops(self, op_name, backend, device, seed, dtype, freqs_dtype, config_name, layout, config):
         """Test RoPE operations (apply_rope and apply_rope1) for a specific backend."""
         backends = get_capable_backends(op_name, device)
         if backend not in backends:
@@ -86,12 +64,8 @@ class TestApplyRope:
 
             ref_xq = _reference_apply_rope(xq, freqs_cis)
             ref_xk = _reference_apply_rope(xk, freqs_cis)
-            self._validate(
-                xq, xq_out, layout, dtype, freqs_dtype, config_name, backend, ref_xq
-            )
-            self._validate(
-                xk, xk_out, layout, dtype, freqs_dtype, config_name, backend, ref_xk
-            )
+            self._validate(xq, xq_out, layout, dtype, freqs_dtype, config_name, backend, ref_xq)
+            self._validate(xk, xk_out, layout, dtype, freqs_dtype, config_name, backend, ref_xk)
 
         else:  # apply_rope1
             x = torch.randn(x_shape, dtype=dtype, device=device)
@@ -100,13 +74,9 @@ class TestApplyRope:
                 x_out = ck.apply_rope1(x, freqs_cis)
 
             ref_x = _reference_apply_rope(x, freqs_cis)
-            self._validate(
-                x, x_out, layout, dtype, freqs_dtype, config_name, backend, ref_x
-            )
+            self._validate(x, x_out, layout, dtype, freqs_dtype, config_name, backend, ref_x)
 
-    def _validate(
-        self, x, x_out, layout, dtype, freqs_dtype, config_name, backend, ref_x
-    ):
+    def _validate(self, x, x_out, layout, dtype, freqs_dtype, config_name, backend, ref_x):
         assert x_out.shape == x.shape, f"{layout} shape mismatch"
         assert x_out.dtype == x.dtype, f"{layout} dtype mismatch"
         assert x_out.device == x.device
@@ -123,39 +93,16 @@ class TestApplyRope:
 class TestApplyRopeSplitHalf:
     """Tests for apply_rope_split_half and apply_rope_split_half1."""
 
-    @pytest.mark.parametrize(
-        "op_name", ["apply_rope_split_half", "apply_rope_split_half1"]
-    )
+    @pytest.mark.parametrize("op_name", ["apply_rope_split_half", "apply_rope_split_half1"])
     @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
-    @pytest.mark.parametrize(
-        "dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"]
-    )
-    @pytest.mark.parametrize(
-        "freqs_dtype",
-        [torch.float32, torch.float16, torch.bfloat16],
-        ids=["freqs_fp32", "freqs_fp16", "freqs_bf16"],
-    )
-    @pytest.mark.parametrize(
-        "config_name,layout,config",
-        [
-            ("WAN", "BNHD", (2, 12288, 16, 128)),
-            ("FLUX", "BHND", (1, 24, 4352, 128)),
-            ("LTX", "BHND", (2, 32, 4996, 64)),
-        ],
-        ids=lambda cfg: f"{cfg[0]}",
-    )
-    def test_apply_split_half_vs_reference(
-        self,
-        op_name,
-        backend,
-        device,
-        seed,
-        dtype,
-        freqs_dtype,
-        config_name,
-        layout,
-        config,
-    ):
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+    @pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float16, torch.bfloat16], ids=["freqs_fp32", "freqs_fp16", "freqs_bf16"])
+    @pytest.mark.parametrize("config_name,layout,config", [
+        ("WAN", "BNHD", (2, 12288, 16, 128)),
+        ("FLUX", "BHND", (1, 24, 4352, 128)),
+        ("LTX", "BHND", (2, 32, 4996, 64)),
+    ], ids=lambda cfg: f"{cfg[0]}")
+    def test_apply_split_half_vs_reference(self, op_name, backend, device, seed, dtype, freqs_dtype, config_name, layout, config):
         """Verify split-half backends match the Python reference formula."""
         backends = get_capable_backends(op_name, device)
         if backend not in backends:
@@ -182,12 +129,8 @@ class TestApplyRopeSplitHalf:
             ref_xq = _reference_apply_rope(xq, freqs_cis, split_half=True)
             ref_xk = _reference_apply_rope(xk, freqs_cis, split_half=True)
 
-            self._validate(
-                xq, xq_out, ref_xq, layout, dtype, freqs_dtype, config_name, backend
-            )
-            self._validate(
-                xk, xk_out, ref_xk, layout, dtype, freqs_dtype, config_name, backend
-            )
+            self._validate(xq, xq_out, ref_xq, layout, dtype, freqs_dtype, config_name, backend)
+            self._validate(xk, xk_out, ref_xk, layout, dtype, freqs_dtype, config_name, backend)
         else:  # apply_rope_split_half1
             x = torch.randn(x_shape, dtype=dtype, device=device)
 
@@ -195,25 +138,17 @@ class TestApplyRopeSplitHalf:
                 x_out = ck.apply_rope_split_half1(x, freqs_cis)
 
             ref_x = _reference_apply_rope(x, freqs_cis, split_half=True)
-            self._validate(
-                x, x_out, ref_x, layout, dtype, freqs_dtype, config_name, backend
-            )
+            self._validate(x, x_out, ref_x, layout, dtype, freqs_dtype, config_name, backend)
 
-    def _validate(
-        self, x, x_out, ref, layout, dtype, freqs_dtype, config_name, backend
-    ):
+    def _validate(self, x, x_out, ref, layout, dtype, freqs_dtype, config_name, backend):
         assert x_out.shape == x.shape, f"{config_name} {layout} shape mismatch"
         assert x_out.dtype == x.dtype, f"{config_name} {layout} dtype mismatch"
         assert x_out.device == x.device
 
         mm = _max_mismatch(freqs_dtype, dtype)
         assert_values_close(
-            x_out,
-            ref,
-            rtol=1e-3,
-            atol=1e-3,
-            max_mismatch_ratio=mm,
-            name=f"{config_name} {layout} ({backend} vs reference, freqs={freqs_dtype})",
+            x_out, ref, rtol=1e-3, atol=1e-3, max_mismatch_ratio=mm,
+            name=f"{config_name} {layout} ({backend} vs reference, freqs={freqs_dtype})"
         )
 
 
@@ -233,17 +168,11 @@ def test_eager_split_half_mixed_dtypes_and_broadcasting(
     dtype, freqs_dtype, layout, broadcast_pairs, device, seed
 ):
     if layout == "BHND":
-        x = torch.randn(2, 5, 6, 16, device=device, dtype=dtype).transpose(1, 2)[
-            ..., ::2
-        ]
+        x = torch.randn(2, 5, 6, 16, device=device, dtype=dtype).transpose(1, 2)[..., ::2]
         prefix = (2, 1, 5)
     else:
         x = torch.randn(5, 6, 16, device=device, dtype=dtype)[..., ::2]
-        prefix = (
-            1,
-            5,
-            1,
-        )  # An extra leading singleton must not change the output shape.
+        prefix = (1, 5, 1)  # An extra leading singleton must not change the output shape.
     pairs = 1 if broadcast_pairs else 4
     freqs = torch.randn(*prefix, pairs, 2, 2, device=device, dtype=freqs_dtype)
     original = x.clone()
@@ -260,9 +189,7 @@ def test_eager_split_half_mixed_dtypes_and_broadcasting(
 
 @pytest.mark.parametrize("freqs_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("freqs_shape", [(2, 2), (1, 2, 2), (1, 1, 1, 1, 2, 2)])
-def test_eager_split_half_rounds_input_to_frequency_dtype(
-    freqs_dtype, freqs_shape, device, seed
-):
+def test_eager_split_half_rounds_input_to_frequency_dtype(freqs_dtype, freqs_shape, device, seed):
     x = torch.randn(2, 3, 5, 8, device=device, dtype=torch.float32)
     freqs = torch.eye(2, device=device, dtype=freqs_dtype).reshape(freqs_shape)
 
@@ -274,9 +201,7 @@ def test_eager_split_half_rounds_input_to_frequency_dtype(
 
 def test_eager_split_half_gradients(device, seed):
     x = torch.randn(2, 3, 5, 8, device=device, dtype=torch.float64, requires_grad=True)
-    freqs = torch.randn(
-        1, 1, 5, 4, 2, 2, device=device, dtype=torch.float64, requires_grad=True
-    )
+    freqs = torch.randn(1, 1, 5, 4, 2, 2, device=device, dtype=torch.float64, requires_grad=True)
     weight = torch.randn_like(x)
     reference = _reference_apply_rope(x, freqs, split_half=True)
     actual = eager_rope.apply_rope_split_half1(x, freqs)
@@ -434,7 +359,9 @@ def test_apply_rope_triton_expanded_input(device):
     if "triton" not in get_capable_backends("apply_rope1", device):
         pytest.skip(f"triton does not support apply_rope1 on {device}")
 
-    x = torch.randn(1, 1, 1, 64, device=device, dtype=torch.float16).expand(2, 3, 5, 64)
+    x = torch.randn(1, 1, 1, 64, device=device, dtype=torch.float16).expand(
+        2, 3, 5, 64
+    )
     freqs = torch.randn(2, 1, 5, 32, 2, 2, device=device, dtype=torch.float32)
     reference = _reference_apply_rope(x, freqs)
 
@@ -546,9 +473,7 @@ def test_apply_rope_inplace_storage(op_name, backend, device):
     k = torch.randn_like(q)
     args = (q, k, freqs) if paired else (q, freqs)
     with ck.use_backend("eager"):
-        reference = getattr(ck, functional_name)(
-            *(tuple(a.clone() if torch.is_tensor(a) else a for a in args))
-        )
+        reference = getattr(ck, functional_name)(*(tuple(a.clone() if torch.is_tensor(a) else a for a in args)))
     pointers = tuple(x.data_ptr() for x in ((q, k) if paired else (q,)))
     strides = tuple(x.stride() for x in ((q, k) if paired else (q,)))
     with ck.use_backend(backend):
@@ -561,13 +486,16 @@ def test_apply_rope_inplace_storage(op_name, backend, device):
         torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
 
 
+
 @pytest.mark.parametrize("op_name", ["apply_rope1_", "rms_rope1_"])
 @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
 def test_inplace_backends_reject_autograd(op_name, backend, device):
     if backend not in get_capable_backends(op_name, device):
         pytest.skip(f"{backend} does not support {op_name} on {device}")
 
-    x = torch.randn(1, 1, 1, 64, device=device, dtype=torch.float16, requires_grad=True)
+    x = torch.randn(
+        1, 1, 1, 64, device=device, dtype=torch.float16, requires_grad=True
+    )
     freqs = torch.randn(1, 1, 1, 32, 2, 2, device=device, dtype=torch.float32)
     args = (x, freqs)
     if op_name == "rms_rope1_":

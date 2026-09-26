@@ -123,15 +123,9 @@ class TensorWiseINT8Layout(QuantizedLayout):
         if convrot:
             impl = registry.get_implementation(
                 "quantize_int8_convrot_weight",
-                kwargs={
-                    "weight": tensor,
-                    "group_size": convrot_groupsize,
-                    "stochastic_rounding": stochastic_rounding,
-                },
+                kwargs={"weight": tensor, "group_size": convrot_groupsize, "stochastic_rounding": stochastic_rounding},
             )
-            qdata, qscale = impl(
-                tensor, convrot_groupsize, stochastic_rounding=stochastic_rounding
-            )
+            qdata, qscale = impl(tensor, convrot_groupsize, stochastic_rounding=stochastic_rounding)
         elif is_weight:
             if per_channel:
                 impl = registry.get_implementation(
@@ -142,15 +136,9 @@ class TensorWiseINT8Layout(QuantizedLayout):
             else:
                 impl = registry.get_implementation(
                     "quantize_int8_tensorwise",
-                    kwargs={
-                        "x": tensor,
-                        "scale": scale,
-                        "stochastic_rounding": stochastic_rounding,
-                    },
+                    kwargs={"x": tensor, "scale": scale, "stochastic_rounding": stochastic_rounding},
                 )
-                qdata, qscale = impl(
-                    tensor, scale=scale, stochastic_rounding=stochastic_rounding
-                )
+                qdata, qscale = impl(tensor, scale=scale, stochastic_rounding=stochastic_rounding)
         else:
             impl = registry.get_implementation(
                 "quantize_int8_rowwise",
@@ -185,33 +173,25 @@ class TensorWiseINT8Layout(QuantizedLayout):
                 qdata, params.scale, params.convrot_groupsize, output_dtype_code
             )
         else:
-            result = torch.ops.comfy_kitchen.dequantize_int8_simple_dtype(
-                qdata, params.scale, output_dtype_code
-            )
+            result = torch.ops.comfy_kitchen.dequantize_int8_simple_dtype(qdata, params.scale, output_dtype_code)
         return result.to(params.orig_dtype)
 
     @classmethod
-    def dequantize_embedding(
-        cls, qdata: torch.Tensor, params: Params, indices: torch.Tensor
-    ) -> torch.Tensor:
+    def dequantize_embedding(cls, qdata: torch.Tensor, params: Params, indices: torch.Tensor) -> torch.Tensor:
         """Gather rows from an INT8 embedding table and dequantize only those rows.
 
         Embedding counterpart of ``dequantize``, which would materialize the whole ``[vocab, dim]``
         table to read a few rows. Un-rotates if ``params.convrot``. Returns ``[*indices.shape, dim]``.
         """
         output_dtype_code = _INT8_DEQUANT_DTYPE_TO_CODE.get(params.orig_dtype, 0)
-        group_size = (
-            params.convrot_groupsize if getattr(params, "convrot", False) else 0
-        )
+        group_size = params.convrot_groupsize if getattr(params, "convrot", False) else 0
         result = torch.ops.comfy_kitchen.dequantize_int8_embedding(
             qdata, params.scale, indices, group_size, output_dtype_code
         )
         return result.to(params.orig_dtype)
 
     @classmethod
-    def get_plain_tensors(
-        cls, qtensor: QuantizedTensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_plain_tensors(cls, qtensor: QuantizedTensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract raw tensors for computation.
 
         Args:
@@ -223,9 +203,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
         return qtensor._qdata, qtensor._params.scale
 
     @classmethod
-    def state_dict_tensors(
-        cls, qdata: torch.Tensor, params: Params
-    ) -> dict[str, torch.Tensor]:
+    def state_dict_tensors(cls, qdata: torch.Tensor, params: Params) -> dict[str, torch.Tensor]:
         """Return key suffix → tensor mapping for serialization.
 
         Args:
@@ -293,17 +271,10 @@ def _handle_int8_linear_tensorwise(qt, args, kwargs):
     bias = args[2] if len(args) > 2 else None
 
     # Fast path: weight is a TensorWiseINT8Layout QuantizedTensor
-    if (
-        not isinstance(weight, QuantizedTensor)
-        or weight._layout_cls != "TensorWiseINT8Layout"
-    ):
-        return torch.nn.functional.linear(
-            *dequantize_args(args), **dequantize_args(kwargs)
-        )
+    if not isinstance(weight, QuantizedTensor) or weight._layout_cls != "TensorWiseINT8Layout":
+        return torch.nn.functional.linear(*dequantize_args(args), **dequantize_args(kwargs))
     if getattr(weight._params, "transposed", False):
-        return torch.nn.functional.linear(
-            *dequantize_args(args), **dequantize_args(kwargs)
-        )
+        return torch.nn.functional.linear(*dequantize_args(args), **dequantize_args(kwargs))
 
     # If input is already quantized, dequantize it (TensorWise needs dynamic row-wise quant)
     if isinstance(input_tensor, QuantizedTensor):
@@ -333,10 +304,7 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
     weight = args[1]
 
     # Usually mm is called with weight as the second argument
-    if (
-        not isinstance(weight, QuantizedTensor)
-        or weight._layout_cls != "TensorWiseINT8Layout"
-    ):
+    if not isinstance(weight, QuantizedTensor) or weight._layout_cls != "TensorWiseINT8Layout":
         return torch.mm(*dequantize_args(args), **dequantize_args(kwargs))
 
     if isinstance(input_tensor, QuantizedTensor):
@@ -379,10 +347,7 @@ def _handle_int8_addmm_tensorwise(qt, args, kwargs):
     input_tensor = args[1]
     weight = args[2]
 
-    if (
-        not isinstance(weight, QuantizedTensor)
-        or weight._layout_cls != "TensorWiseINT8Layout"
-    ):
+    if not isinstance(weight, QuantizedTensor) or weight._layout_cls != "TensorWiseINT8Layout":
         return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
 
     if isinstance(input_tensor, QuantizedTensor):

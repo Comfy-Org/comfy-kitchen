@@ -10,7 +10,6 @@ Heavier parity against real nunchaku checkpoints lives outside the unit-test
 tree (kitchen is pure ops; model-checkpoint parity is a converter/integration
 concern).
 """
-
 from __future__ import annotations
 
 import pytest
@@ -47,28 +46,14 @@ def _pack_tile_packed_weight(w_int4: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"N={n} must be divisible by {_TILE_BN}")
     if k % _GROUP != 0:
         raise ValueError(f"K={k} must be divisible by {_GROUP}")
-    w = (
-        w_int4.view(
-            n // _TILE_BN,
-            _TILE_BN // _TILE_INTERLEAVE,
-            _TILE_INTERLEAVE,
-            k // _GROUP,
-            _GROUP,
-        )
-        .permute(0, 3, 1, 2, 4)
-        .contiguous()
-    )
+    w = w_int4.view(
+        n // _TILE_BN, _TILE_BN // _TILE_INTERLEAVE, _TILE_INTERLEAVE, k // _GROUP, _GROUP,
+    ).permute(0, 3, 1, 2, 4).contiguous()
     lo = w[..., 0::2].to(torch.int32) & 0x0F
     hi = (w[..., 1::2].to(torch.int32) & 0x0F) << 4
-    return (
-        (lo | hi)
-        .to(torch.int8)
-        .view(
-            n // _TILE_BN,
-            k // _GROUP,
-            _TILE_BN // _TILE_INTERLEAVE,
-            _TILE_INTERLEAVE * _GROUP // 2,
-        )
+    return (lo | hi).to(torch.int8).view(
+        n // _TILE_BN, k // _GROUP, _TILE_BN // _TILE_INTERLEAVE,
+        _TILE_INTERLEAVE * _GROUP // 2,
     )
 
 
@@ -146,10 +131,7 @@ class TestGroupedSplitQKV:
 
         with ck.use_backend("eager"):
             grouped = svdquant_w4a4_grouped_linear(
-                x,
-                weights,
-                biases,
-                validate_shared_quant=True,
+                x, weights, biases, validate_shared_quant=True,
             )
             expected = tuple(
                 functional.linear(x, weight, bias)
@@ -158,9 +140,7 @@ class TestGroupedSplitQKV:
 
         assert len(grouped) == 3
         for idx, (actual, ref) in enumerate(zip(grouped, expected, strict=True)):
-            assert_values_close(
-                actual, ref, rtol=0.0, atol=0.0, name=f"grouped qkv {idx}"
-            )
+            assert_values_close(actual, ref, rtol=0.0, atol=0.0, name=f"grouped qkv {idx}")
 
     def test_grouped_linear_can_trust_prevalidated_copies(self, seed):
         n, k, r = 128, 128, 16
@@ -209,27 +189,21 @@ class TestGroupedSplitQKV:
             biases.append(bias)
 
         fused_weight, fused_bias, splits = svdquant_w4a4_fuse_linear_weights(
-            weights,
-            biases,
-            validate_shared_quant=True,
+            weights, biases, validate_shared_quant=True,
         )
         assert splits == (n, n, n)
         assert fused_weight.shape == (3 * n, k)
         assert fused_bias.shape == (3 * n,)
 
         with ck.use_backend("eager"):
-            fused = svdquant_w4a4_fused_grouped_linear(
-                x, fused_weight, fused_bias, splits
-            )
+            fused = svdquant_w4a4_fused_grouped_linear(x, fused_weight, fused_bias, splits)
             expected = tuple(
                 functional.linear(x, weight, bias)
                 for weight, bias in zip(weights, biases, strict=True)
             )
 
         for idx, (actual, ref) in enumerate(zip(fused, expected, strict=True)):
-            assert_values_close(
-                actual, ref, rtol=1e-5, atol=1e-6, name=f"fused qkv {idx}"
-            )
+            assert_values_close(actual, ref, rtol=1e-5, atol=1e-6, name=f"fused qkv {idx}")
 
 
 # =============================================================================
@@ -262,11 +236,7 @@ class TestQuantizerClampContract:
 
         with ck.use_backend("eager"):
             q_packed, _, _ = ck.quantize_svdquant_w4a4(
-                x,
-                smooth,
-                lora_down,
-                pad_size=16,
-                act_unsigned=False,
+                x, smooth, lora_down, pad_size=16, act_unsigned=False,
             )
         q_vals = _unpack_int4_row_major(q_packed[:4])
         assert q_vals.min().item() >= -_INT4_MAX, (
@@ -289,17 +259,11 @@ class TestQuantizerClampContract:
 
         with ck.use_backend("eager"):
             q_packed, _, _ = ck.quantize_svdquant_w4a4(
-                x,
-                smooth,
-                lora_down,
-                pad_size=16,
-                act_unsigned=False,
+                x, smooth, lora_down, pad_size=16, act_unsigned=False,
             )
         q_vals = _unpack_int4_row_major(q_packed[:4])
         # Never -8 even on forced saturation
-        assert (
-            (q_vals != -8).all().item()
-        ), "eager emitted -8, regressed from absmax/7 contract"
+        assert (q_vals != -8).all().item(), "eager emitted -8, regressed from absmax/7 contract"
         assert q_vals.min().item() == -_INT4_MAX  # the outlier did saturate
 
     def test_no_neg8_at_scale(self, cuda_available, seed):
@@ -313,11 +277,7 @@ class TestQuantizerClampContract:
 
         with ck.use_backend("eager"):
             q_packed, _, _ = ck.quantize_svdquant_w4a4(
-                x,
-                smooth,
-                lora_down,
-                pad_size=256,
-                act_unsigned=False,
+                x, smooth, lora_down, pad_size=256, act_unsigned=False,
             )
         q_vals = _unpack_int4_row_major(q_packed[:256])
         neg8 = (q_vals == -8).sum().item()
@@ -335,11 +295,7 @@ class TestQuantizerClampContract:
 
         with ck.use_backend("eager"):
             q_packed, _, _ = ck.quantize_svdquant_w4a4(
-                x,
-                smooth,
-                lora_down,
-                pad_size=16,
-                act_unsigned=True,
+                x, smooth, lora_down, pad_size=16, act_unsigned=True,
             )
         q_vals = _unpack_uint4_row_major(q_packed[:4])
         assert q_vals.min().item() >= 0
@@ -369,12 +325,8 @@ class TestActUnsignedDispatch:
 
     def _run(self, act_unsigned):
         m, n, k, r = 16, 8, 64, 16
-        q_act = torch.full((m, k // 2), 0xFF, dtype=torch.uint8, device="cuda").view(
-            torch.int8
-        )
-        q_wgt = torch.full(
-            (n, k // 2), 0x11, dtype=torch.int8, device="cuda"
-        )  # two s4=1 per byte
+        q_act = torch.full((m, k // 2), 0xFF, dtype=torch.uint8, device="cuda").view(torch.int8)
+        q_wgt = torch.full((n, k // 2), 0x11, dtype=torch.int8, device="cuda")  # two s4=1 per byte
         asc = torch.ones(k // 64, m, dtype=torch.bfloat16, device="cuda")
         wsc = torch.ones(k // 64, n, dtype=torch.bfloat16, device="cuda")
         lai = torch.zeros(m, r, dtype=torch.float32, device="cuda")
@@ -382,14 +334,8 @@ class TestActUnsignedDispatch:
         b = torch.zeros(n, dtype=torch.bfloat16, device="cuda")
         with ck.use_backend("cuda"):
             return ck.scaled_mm_svdquant_w4a4(
-                act=q_act,
-                wgt=q_wgt,
-                ascales=asc,
-                wscales=wsc,
-                lora_act_in=lai,
-                lora_up=lu,
-                bias=b,
-                act_unsigned=act_unsigned,
+                act=q_act, wgt=q_wgt, ascales=asc, wscales=wsc,
+                lora_act_in=lai, lora_up=lu, bias=b, act_unsigned=act_unsigned,
             )
 
     def test_signed_mma_gives_minus_64(self, _cuda_required, seed):
@@ -441,11 +387,7 @@ class TestLoraXSeparation:
         with ck.use_backend(backend):
             q1, asc1, la1 = ck.quantize_svdquant_w4a4(x, smooth, lora_down, pad_size=16)
             q2, asc2, la2 = ck.quantize_svdquant_w4a4(
-                x,
-                smooth,
-                lora_down,
-                pad_size=16,
-                lora_x=x,
+                x, smooth, lora_down, pad_size=16, lora_x=x,
             )
         # Both main-path (quantize) outputs and LoRA outputs must be bit-identical
         # — same backend, same input, same code path.
@@ -477,24 +419,17 @@ class TestLoraXSeparation:
         with ck.use_backend(backend):
             # Correct: pre-shifted for main, raw for lora
             _, _, la_correct = ck.quantize_svdquant_w4a4(
-                shifted_x,
-                smooth,
-                lora_down,
-                pad_size=16,
-                lora_x=raw_x,
+                shifted_x, smooth, lora_down, pad_size=16, lora_x=raw_x,
             )
             la_correct = la_correct.clone()
             # Incorrect baseline: shifted used for both (what happens if caller
             # forgets lora_x). Used to prove the kwarg is live, not a pass-through.
             _, _, la_if_shifted = ck.quantize_svdquant_w4a4(
-                shifted_x,
-                smooth,
-                lora_down,
-                pad_size=16,
+                shifted_x, smooth, lora_down, pad_size=16,
             )
-        assert not torch.allclose(
-            la_correct, la_if_shifted
-        ), "lora_x had no effect — LoRA matmul is still using shifted input"
+        assert not torch.allclose(la_correct, la_if_shifted), (
+            "lora_x had no effect — LoRA matmul is still using shifted input"
+        )
 
         # Accuracy check against a fp32 reference. Tolerance is bf16-precision
         # because the CUDA wrapper uses a bf16 matmul (then upcasts to the fp32
@@ -504,10 +439,7 @@ class TestLoraXSeparation:
         # parity target.
         expected = raw_x.float() @ lora_down.float()
         assert_values_close(
-            la_correct[:4].float(),
-            expected,
-            rtol=5e-3,
-            atol=5e-3,
+            la_correct[:4].float(), expected, rtol=5e-3, atol=5e-3,
             name=f"{backend} lora_act vs fp32 reference (bf16 tolerance)",
         )
 
@@ -522,14 +454,11 @@ class TestSvdquantSmoke:
     reasonable outputs on matched random data (not a nunchaku bit-parity test —
     that's an integration concern)."""
 
-    @pytest.mark.parametrize(
-        "m,n,k,r",
-        [
-            (16, 8, 64, 16),  # one MMA
-            (64, 32, 128, 16),
-            (256, 128, 512, 32),
-        ],
-    )
+    @pytest.mark.parametrize("m,n,k,r", [
+        (16, 8, 64, 16),     # one MMA
+        (64, 32, 128, 16),
+        (256, 128, 512, 32),
+    ])
     def test_signed_forward_runs(self, cuda_available, seed, m, n, k, r):
         if not cuda_backend_available():
             pytest.skip("compiled CUDA backend required")
@@ -538,9 +467,7 @@ class TestSvdquantSmoke:
         smooth = torch.ones(k, dtype=torch.bfloat16, device=device) * 1.0
         proj_down = torch.randn(k, r, dtype=torch.bfloat16, device=device) * 0.05
         proj_up = torch.randn(n, r, dtype=torch.bfloat16, device=device) * 0.05
-        wscales = (
-            torch.rand(k // _GROUP, n, dtype=torch.bfloat16, device=device) * 0.5 + 0.1
-        )
+        wscales = torch.rand(k // _GROUP, n, dtype=torch.bfloat16, device=device) * 0.5 + 0.1
         # Signed wgt in [-7, 7]
         wgt_int = torch.randint(-7, 8, (n, k), dtype=torch.int8, device=device)
         lo = wgt_int[..., 0::2].to(torch.int32) & 0x0F
@@ -548,25 +475,17 @@ class TestSvdquantSmoke:
         wgt = (lo | (hi << 4)).to(torch.int8)
 
         with ck.use_backend("cuda"):
-            q_act, asc, la = ck.quantize_svdquant_w4a4(
-                x, smooth, proj_down, pad_size=256
-            )
+            q_act, asc, la = ck.quantize_svdquant_w4a4(x, smooth, proj_down, pad_size=256)
             out = ck.scaled_mm_svdquant_w4a4(
-                act=q_act,
-                wgt=wgt,
-                ascales=asc,
-                wscales=wscales,
-                lora_act_in=la,
-                lora_up=proj_up,
+                act=q_act, wgt=wgt, ascales=asc, wscales=wscales,
+                lora_act_in=la, lora_up=proj_up,
             )
         assert out.shape[0] >= m  # padded to pad_size
         assert out.shape[1] == n
         assert torch.isfinite(out).all()
 
     @pytest.mark.parametrize("fast_accum", [False, True])
-    def test_tile_packed_matches_natural_cuda(
-        self, cuda_available, seed, monkeypatch, fast_accum
-    ):
+    def test_tile_packed_matches_natural_cuda(self, cuda_available, seed, monkeypatch, fast_accum):
         """Tile-packed storage should be a layout-only change vs natural CUDA."""
         if not cuda_backend_available():
             pytest.skip("compiled CUDA backend required")
@@ -582,9 +501,7 @@ class TestSvdquantSmoke:
         proj_down = torch.randn(k, r, dtype=torch.bfloat16, device=device) * 0.05
         proj_up = torch.randn(n, r, dtype=torch.bfloat16, device=device) * 0.05
         bias = torch.randn(n, dtype=torch.bfloat16, device=device) * 0.01
-        wscales = (
-            torch.rand(k // _GROUP, n, dtype=torch.bfloat16, device=device) * 0.5 + 0.1
-        )
+        wscales = torch.rand(k // _GROUP, n, dtype=torch.bfloat16, device=device) * 0.5 + 0.1
 
         wgt_int = torch.randint(-7, 8, (n, k), dtype=torch.int8, device=device)
         lo = wgt_int[..., 0::2].to(torch.int32) & 0x0F
@@ -595,38 +512,22 @@ class TestSvdquantSmoke:
         proj_up_tile = _pack_n_interleaved(proj_up)
 
         with ck.use_backend("cuda"):
-            q_act, asc, la = ck.quantize_svdquant_w4a4(
-                x, smooth, proj_down, pad_size=64
-            )
+            q_act, asc, la = ck.quantize_svdquant_w4a4(x, smooth, proj_down, pad_size=64)
             out_natural = ck.scaled_mm_svdquant_w4a4(
-                act=q_act,
-                wgt=wgt_natural,
-                ascales=asc,
-                wscales=wscales,
-                lora_act_in=la,
-                lora_up=proj_up,
-                bias=bias,
+                act=q_act, wgt=wgt_natural, ascales=asc, wscales=wscales,
+                lora_act_in=la, lora_up=proj_up, bias=bias,
             )
             out_tile = ck.scaled_mm_svdquant_w4a4(
-                act=q_act,
-                wgt=wgt_tile,
-                ascales=asc,
-                wscales=wscales_tile,
-                lora_act_in=la,
-                lora_up=proj_up_tile,
-                bias=bias,
+                act=q_act, wgt=wgt_tile, ascales=asc, wscales=wscales_tile,
+                lora_act_in=la, lora_up=proj_up_tile, bias=bias,
             )
 
         assert out_tile.shape == out_natural.shape
-        assert_values_close(
-            out_tile, out_natural, rtol=0.0, atol=0.0, name="tile-packed vs natural"
-        )
+        assert_values_close(out_tile, out_natural, rtol=0.0, atol=0.0, name="tile-packed vs natural")
 
     @pytest.mark.parametrize("layout", ["natural", "tile"])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    def test_fused_lora_epilogue_matches_unfused_cuda(
-        self, cuda_available, seed, monkeypatch, layout, dtype
-    ):
+    def test_fused_lora_epilogue_matches_unfused_cuda(self, cuda_available, seed, monkeypatch, layout, dtype):
         """Fused LoRA-up should match the old cuBLAS addmm_ epilogue to output dtype precision."""
         if not cuda_backend_available():
             pytest.skip("compiled CUDA backend required")
@@ -651,37 +552,20 @@ class TestSvdquantSmoke:
         with ck.use_backend("cuda"):
             monkeypatch.setenv("COMFY_KITCHEN_SVDQUANT_FUSE_LORA_UP", "0")
             unfused = ck.scaled_mm_svdquant_w4a4(
-                q_act,
-                wgt,
-                asc,
-                wscales,
-                lora_act,
-                lora_up,
-                bias,
+                q_act, wgt, asc, wscales, lora_act, lora_up, bias,
             )
             monkeypatch.setenv("COMFY_KITCHEN_SVDQUANT_FUSE_LORA_UP", "1")
             fused = ck.scaled_mm_svdquant_w4a4(
-                q_act,
-                wgt,
-                asc,
-                wscales,
-                lora_act,
-                lora_up,
-                bias,
+                q_act, wgt, asc, wscales, lora_act, lora_up, bias,
             )
 
         atol = 1e-2 if dtype is torch.bfloat16 else 1.2e-3
         assert_values_close(
-            fused.float(),
-            unfused.float(),
-            rtol=0.0,
-            atol=atol,
+            fused.float(), unfused.float(), rtol=0.0, atol=atol,
             name=f"fused LoRA epilogue vs unfused ({layout}, {dtype})",
         )
 
-    def test_quantized_tensor_direct_cuda_survives_disabled_registry(
-        self, cuda_available, seed, monkeypatch
-    ):
+    def test_quantized_tensor_direct_cuda_survives_disabled_registry(self, cuda_available, seed, monkeypatch):
         """ComfyUI may globally disable comfy_kitchen's CUDA registry entry on
         older PyTorch CUDA wheels. SVDQuant QuantizedTensor forward should still
         call the locally built CUDA extension directly when it is available.

@@ -15,19 +15,16 @@ file(READ "${_CK_HIP_ARCH_MANIFEST}" _CK_HIP_ARCH_JSON)
 
 function(_ck_read_arch_group output group_name)
     string(JSON _group_length LENGTH "${_CK_HIP_ARCH_JSON}" "${group_name}")
-
     if(_group_length EQUAL 0)
         message(FATAL_ERROR "${_CK_HIP_ARCH_MANIFEST}: ${group_name} must not be empty")
     endif()
 
     math(EXPR _last_index "${_group_length} - 1")
     set(_group)
-
     foreach(_index RANGE 0 ${_last_index})
         string(JSON _arch GET "${_CK_HIP_ARCH_JSON}" "${group_name}" ${_index})
         list(APPEND _group "${_arch}")
     endforeach()
-
     set(${output} "${_group}" PARENT_SCOPE)
 endfunction()
 
@@ -42,7 +39,6 @@ set(COMFY_HIP_SUPPORTED_ARCHS
 list(LENGTH COMFY_HIP_SUPPORTED_ARCHS _arch_count)
 list(REMOVE_DUPLICATES COMFY_HIP_SUPPORTED_ARCHS)
 list(LENGTH COMFY_HIP_SUPPORTED_ARCHS _unique_arch_count)
-
 if(NOT _arch_count EQUAL _unique_arch_count)
     message(FATAL_ERROR "${_CK_HIP_ARCH_MANIFEST} contains duplicate targets")
 endif()
@@ -50,7 +46,6 @@ endif()
 if(NOT DEFINED COMFY_HIP_ARCHS OR COMFY_HIP_ARCHS STREQUAL "")
     set(COMFY_HIP_ARCHS ${COMFY_HIP_SUPPORTED_ARCHS})
 endif()
-
 foreach(_arch IN LISTS COMFY_HIP_ARCHS)
     if(NOT _arch IN_LIST COMFY_HIP_SUPPORTED_ARCHS)
         message(FATAL_ERROR
@@ -59,20 +54,16 @@ foreach(_arch IN LISTS COMFY_HIP_ARCHS)
         )
     endif()
 endforeach()
-
 set(CMAKE_HIP_ARCHITECTURES "${COMFY_HIP_ARCHS}")
 
 function(_ck_make_arch_condition output)
     set(_condition "")
-
     foreach(_arch IN ITEMS ${ARGN})
         if(NOT _condition STREQUAL "")
             string(APPEND _condition " || ")
         endif()
-
         string(APPEND _condition "defined(__${_arch}__)")
     endforeach()
-
     set(${output} "${_condition}" PARENT_SCOPE)
 endfunction()
 
@@ -80,17 +71,14 @@ _ck_make_arch_condition(COMFY_HIP_GFX11_CONDITION ${COMFY_HIP_WMMA_GFX11_ARCHS})
 _ck_make_arch_condition(COMFY_HIP_GFX12_CONDITION ${COMFY_HIP_WMMA_GFX12_ARCHS})
 set(_CK_HIP_WAVE64_VEGA_ARCHS)
 set(_CK_HIP_DOT4_ARCHS)
-
 foreach(_arch IN LISTS COMFY_HIP_ELEMENTWISE_ARCHS)
     if(_arch MATCHES "^gfx90")
         list(APPEND _CK_HIP_WAVE64_VEGA_ARCHS "${_arch}")
     endif()
-
     if(_arch MATCHES "^gfx103")
         list(APPEND _CK_HIP_DOT4_ARCHS "${_arch}")
     endif()
 endforeach()
-
 _ck_make_arch_condition(COMFY_HIP_WAVE64_VEGA_CONDITION ${_CK_HIP_WAVE64_VEGA_ARCHS})
 _ck_make_arch_condition(COMFY_HIP_DOT4_CONDITION ${_CK_HIP_DOT4_ARCHS})
 set(_CK_HIP_WMMA_ARCHS
@@ -106,6 +94,7 @@ file(MAKE_DIRECTORY "${_CK_HIP_GENERATED_INCLUDE_DIR}")
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/architecture_config.h.in"
     "${_CK_HIP_GENERATED_INCLUDE_DIR}/architecture_config.h"
+    @ONLY
 )
 
 # A pip-installed rocm-sdk places the device bitcode under
@@ -113,7 +102,6 @@ configure_file(
 # Must precede project(), which compiles a test program with these flags.
 if(DEFINED CMAKE_HIP_COMPILER_ROCM_ROOT)
     set(_ck_devlib "${CMAKE_HIP_COMPILER_ROCM_ROOT}/lib/llvm/amdgcn/bitcode")
-
     if(EXISTS "${_ck_devlib}" AND NOT EXISTS "${CMAKE_HIP_COMPILER_ROCM_ROOT}/amdgcn/bitcode")
         # Quote the path: a ROCm root with spaces would otherwise split into extra
         # compiler arguments and fail the project() HIP probe.
@@ -137,11 +125,9 @@ if(DEFINED COMFY_CXX_COMPILER_LAUNCHER)
     set(CMAKE_CXX_COMPILER_LAUNCHER "${COMFY_CXX_COMPILER_LAUNCHER}")
     message(STATUS "C++ compiler launcher: ${CMAKE_CXX_COMPILER_LAUNCHER}")
 endif()
-
 if(NOT DEFINED COMFY_HIP_COMPILER_LAUNCHER)
     set(COMFY_HIP_COMPILER_LAUNCHER "${COMFY_CXX_COMPILER_LAUNCHER}")
 endif()
-
 if(COMFY_HIP_COMPILER_LAUNCHER)
     set(CMAKE_HIP_COMPILER_LAUNCHER "${COMFY_HIP_COMPILER_LAUNCHER}")
     message(STATUS "HIP compiler launcher: ${CMAKE_HIP_COMPILER_LAUNCHER}")
@@ -226,7 +212,6 @@ set(CPP_SOURCES
 # consume HIP and project headers only, so a compiler cache can reuse their
 # objects across CPython wheel builds.
 add_library(comfy_kitchen_hip_kernels OBJECT ${HIP_SOURCES})
-
 # The kernels index lanes and reduce warps at a width of 32. The wavefront size is
 # not a constant expression, so no kernel can assert it; the last flag wins, and
 # these follow CMAKE_HIP_FLAGS.
@@ -234,14 +219,12 @@ target_compile_options(comfy_kitchen_hip_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3>
     $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
 )
-
 if(COMFY_ENABLE_LINEINFO OR CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_options(
         comfy_kitchen_hip_kernels PRIVATE
         $<$<COMPILE_LANGUAGE:HIP>:-gline-tables-only>
     )
 endif()
-
 target_include_directories(comfy_kitchen_hip_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/sage_attention
@@ -254,13 +237,11 @@ target_link_libraries(comfy_kitchen_hip_kernels PRIVATE hip::host)
 if(Python_VERSION VERSION_GREATER_EQUAL "3.12")
     message(STATUS "Python ${Python_VERSION} detected - enabling stable ABI (abi3)")
     nanobind_add_module(_C NB_STATIC STABLE_ABI LTO NOMINSIZE ${CPP_SOURCES})
-
     if(WIN32)
         set_target_properties(_C PROPERTIES SUFFIX ".abi3.pyd")
     else()
         set_target_properties(_C PROPERTIES SUFFIX ".abi3.so")
     endif()
-
     target_compile_definitions(_C PRIVATE Py_LIMITED_API=0x030C0000)
 else()
     message(STATUS "Python ${Python_VERSION} detected - building version-specific module")

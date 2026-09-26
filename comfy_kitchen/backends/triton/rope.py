@@ -99,30 +99,22 @@ def apply_rope_kernel(
         dim_idx_1 = pair_idx * 2 + 1
 
     # Calculate offsets for xq and xk using strides (layout-agnostic)
-    x_offset_0 = (
-        batch_idx * stride_x_batch
-        + dim1_idx * stride_x_dim1
-        + dim2_idx * stride_x_dim2
-        + dim_idx_0 * stride_x_dim
-    )
-    x_offset_1 = (
-        batch_idx * stride_x_batch
-        + dim1_idx * stride_x_dim1
-        + dim2_idx * stride_x_dim2
-        + dim_idx_1 * stride_x_dim
-    )
-    out_offset_0 = (
-        batch_idx * stride_out_batch
-        + dim1_idx * stride_out_dim1
-        + dim2_idx * stride_out_dim2
-        + dim_idx_0 * stride_out_dim
-    )
-    out_offset_1 = (
-        batch_idx * stride_out_batch
-        + dim1_idx * stride_out_dim1
-        + dim2_idx * stride_out_dim2
-        + dim_idx_1 * stride_out_dim
-    )
+    x_offset_0 = (batch_idx * stride_x_batch +
+                   dim1_idx * stride_x_dim1 +
+                   dim2_idx * stride_x_dim2 +
+                   dim_idx_0 * stride_x_dim)
+    x_offset_1 = (batch_idx * stride_x_batch +
+                   dim1_idx * stride_x_dim1 +
+                   dim2_idx * stride_x_dim2 +
+                   dim_idx_1 * stride_x_dim)
+    out_offset_0 = (batch_idx * stride_out_batch +
+                    dim1_idx * stride_out_dim1 +
+                    dim2_idx * stride_out_dim2 +
+                    dim_idx_0 * stride_out_dim)
+    out_offset_1 = (batch_idx * stride_out_batch +
+                    dim1_idx * stride_out_dim1 +
+                    dim2_idx * stride_out_dim2 +
+                    dim_idx_1 * stride_out_dim)
 
     # Handle broadcasting for freqs_cis (all spatial dimensions)
     freqs_batch_idx = tl.where(freqs_batch == 1, 0, batch_idx)
@@ -130,12 +122,10 @@ def apply_rope_kernel(
     freqs_dim2_idx = tl.where(freqs_dim2 == 1, 0, dim2_idx)
 
     # Calculate offsets for freqs_cis using its strides
-    freqs_base = (
-        freqs_batch_idx * stride_freqs_batch
-        + freqs_dim1_idx * stride_freqs_dim1
-        + freqs_dim2_idx * stride_freqs_dim2
-        + pair_idx * stride_freqs_dim
-    )
+    freqs_base = (freqs_batch_idx * stride_freqs_batch +
+                  freqs_dim1_idx * stride_freqs_dim1 +
+                  freqs_dim2_idx * stride_freqs_dim2 +
+                  pair_idx * stride_freqs_dim)
 
     # Load rotation matrix elements (shared for both xq and xk)
     freqs_00_offset = freqs_base + 0 * stride_freqs_rot + 0 * stride_freqs_pair
@@ -148,52 +138,12 @@ def apply_rope_kernel(
     freqs_10 = tl.load(freqs_ptr + freqs_10_offset, mask=mask, other=0.0)
     freqs_11 = tl.load(freqs_ptr + freqs_11_offset, mask=mask, other=0.0)
 
-    _apply_freq_tile(
-        xq_ptr,
-        xq_out_ptr,
-        mask,
-        freqs_00,
-        freqs_01,
-        freqs_10,
-        freqs_11,
-        x_offset_0,
-        x_offset_1,
-        out_offset_0,
-        out_offset_1,
-        compute_dtype,
-    )
+    _apply_freq_tile(xq_ptr, xq_out_ptr, mask, freqs_00, freqs_01, freqs_10, freqs_11, x_offset_0, x_offset_1, out_offset_0, out_offset_1, compute_dtype)
     if xk_ptr is not None:
-        _apply_freq_tile(
-            xk_ptr,
-            xk_out_ptr,
-            mask,
-            freqs_00,
-            freqs_01,
-            freqs_10,
-            freqs_11,
-            x_offset_0,
-            x_offset_1,
-            out_offset_0,
-            out_offset_1,
-            compute_dtype,
-        )
-
+        _apply_freq_tile(xk_ptr, xk_out_ptr, mask, freqs_00, freqs_01, freqs_10, freqs_11, x_offset_0, x_offset_1, out_offset_0, out_offset_1, compute_dtype)
 
 @triton.jit
-def _apply_freq_tile(
-    x_ptr,
-    x_out_ptr,
-    mask,
-    freqs_00,
-    freqs_01,
-    freqs_10,
-    freqs_11,
-    x_offset_0,
-    x_offset_1,
-    out_offset_0,
-    out_offset_1,
-    compute_dtype,
-):
+def _apply_freq_tile(x_ptr, x_out_ptr, mask, freqs_00, freqs_01, freqs_10, freqs_11, x_offset_0, x_offset_1, out_offset_0, out_offset_1, compute_dtype):
     # Load xq values and cast to computation dtype
     x_0 = tl.load(x_ptr + x_offset_0, mask=mask, other=0.0).to(compute_dtype)
     x_1 = tl.load(x_ptr + x_offset_1, mask=mask, other=0.0).to(compute_dtype)
@@ -217,17 +167,9 @@ def _apply_rope(
     if torch.version.hip is not None:
         arch = torch.cuda.get_device_properties(x1.device).gcnArchName.split(":")[0]
         if arch.startswith("gfx10"):
-            eager_fn = (
-                _eager_rope.apply_rope_split_half1
-                if split_half
-                else _eager_rope.apply_rope1
-            )
+            eager_fn = _eager_rope.apply_rope_split_half1 if split_half else _eager_rope.apply_rope1
             eager_freqs = freqs_cis
-            if (
-                not split_half
-                and freqs_cis.ndim > 1
-                and freqs_cis.shape[1] > x1.shape[1]
-            ):
+            if not split_half and freqs_cis.ndim > 1 and freqs_cis.shape[1] > x1.shape[1]:
                 eager_freqs = freqs_cis[:, : x1.shape[1]]
             x1_out = eager_fn(x1, eager_freqs)
             x2_out = None if x2 is None else eager_fn(x2, eager_freqs)
@@ -266,9 +208,9 @@ def _apply_rope(
         block_size = 1024
     grid = (triton.cdiv(total_elements, block_size),)
 
-    stride_x_batch, stride_x_dim1, stride_x_dim2, stride_x_dim = (0,) * (
-        4 - x1.ndim
-    ) + x1.stride()
+    stride_x_batch, stride_x_dim1, stride_x_dim2, stride_x_dim = (
+        (0,) * (4 - x1.ndim) + x1.stride()
+    )
     stride_out = (0,) * (4 - x1_out.ndim) + x1_out.stride()
     stride_freqs = (0,) * (6 - freqs_cis.ndim) + freqs_cis.stride()
     dtype_map = {
