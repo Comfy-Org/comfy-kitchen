@@ -19,28 +19,37 @@
 // regression on 60-96 CU parts. Host-safe (no device intrinsics), so both the
 // .hip kernels and the dlpack bindings can consult it.
 //
-// Resolved for the *current* device and cached per ordinal, not once per
-// process against device 0: a box with both an iGPU and a dGPU sees two
-// architectures, and hard-coding device 0 would hand the dGPU the iGPU's
-// tuning (or hide it from the iGPU) depending on enumeration order. The query
-// stays off the hot path the same way device_wgp_count keeps its own.
-inline bool comfy_small_igpu() {
+// Resolved for the given device ordinal and cached per ordinal, not once per
+// process against device 0 and not against the *current* device: a box with
+// both an iGPU and a dGPU sees two architectures, and the kernels run on the
+// stream of the tensor's device, so the gate must answer for that tensor's
+// device rather than whichever is current. The query stays off the hot path the
+// same way device_wgp_count keeps its own.
+inline bool comfy_small_igpu(int device) {
     constexpr int kMaxDevices = 16;
     // 0 unknown, 1 yes, 2 no. Racing threads write the same value and nothing
     // else is published through the cache, so relaxed.
     static std::atomic<int> cache[kMaxDevices] = {};
-    int dev = 0;
-    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDevices) return false;
-    int v = cache[dev].load(std::memory_order_relaxed);
+    if (device < 0 || device >= kMaxDevices) return false;
+    int v = cache[device].load(std::memory_order_relaxed);
     if (v == 0) {
         hipDeviceProp_t prop{};
-        v = (hipGetDeviceProperties(&prop, dev) == hipSuccess &&
+        v = (hipGetDeviceProperties(&prop, device) == hipSuccess &&
              std::strstr(prop.gcnArchName, "gfx1103") != nullptr)
                 ? 1
                 : 2;
-        cache[dev].store(v, std::memory_order_relaxed);
+        cache[device].store(v, std::memory_order_relaxed);
     }
     return v == 1;
+}
+
+// Current-device overload for the kernel-TU envelopes (hadamard, GEMM, rope,
+// quant), which run on the device a launch stream was set current for. The
+// bindings that can name the operand's device call the explicit-ordinal form.
+inline bool comfy_small_igpu() {
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) return false;
+    return comfy_small_igpu(dev);
 }
 
 extern "C" {

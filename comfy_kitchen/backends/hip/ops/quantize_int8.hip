@@ -96,6 +96,7 @@ __global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel_staged(
     const bool staged = ((K + 255) / 256 <= kQuantMaxStaged);
     const bool is_f32 = (in_code == 0);
     const bool vec = is_f32 ? (K % 4 == 0) : (K % 8 == 0);
+    const bool packed = staged && vec;
 
     float vals[kQuantMaxStaged];  // register-resident when staged
     float lmax = 0.0f;
@@ -104,10 +105,15 @@ __global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel_staged(
         for (int j = t; j < K; j += 256)
             lmax = fmaxf(lmax, fabsf(load_in(x, base + j, in_code)));
     } else if (is_f32) {
-        #pragma unroll
-        for (int c = 0; c < 12; ++c) {
-            const int j = t * 4 + c * 1024;
-            if (j >= K) break;
+        // One 16-byte chunk (4 floats) per lane per block-wide step of 1024
+        // elements. The loop is bounded by K, not by the register budget, so a
+        // row longer than the staged window still reduces every chunk — the
+        // absmax scale must span the whole row or the two-pass output below
+        // would quantize the tail with an incomplete scale. staged gates the
+        // vals[] write, so c stays within the array for staged rows (K <=
+        // 12*1024 = kQuantMaxStaged*256).
+        for (int j = t * 4; j < K; j += 1024) {
+            const int c = j / 1024;
             const uint4 v = *reinterpret_cast<const uint4*>(
                 static_cast<const char*>(x) + (base + j) * 4);
             float tmp[4];
@@ -119,10 +125,8 @@ __global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel_staged(
             }
         }
     } else {
-        #pragma unroll
-        for (int c = 0; c < 6; ++c) {
-            const int j = t * 8 + c * 2048;
-            if (j >= K) break;
+        for (int j = t * 8; j < K; j += 2048) {
+            const int c = j / 2048;
             const uint4 v = *reinterpret_cast<const uint4*>(
                 static_cast<const char*>(x) + (base + j) * 2);
             float tmp[8];
@@ -154,21 +158,16 @@ __global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel_staged(
     if (t == 0) scales[row] = scale;
     const float inv = 1.0f / scale;
 
-    if (staged) {
+    // Packed (staged and vectorizable) rows write out of the staged registers.
+    // Short non-vectorizable rows (K not a whole chunk) leave vals unfilled, so
+    // they fall through to the scalar second pass below.
+    if (packed) {
         if (is_f32) {
-            #pragma unroll
-            for (int c = 0; c < 12; ++c) {
-                const int j = t * 4 + c * 1024;
-                if (j >= K) break;
-                quant_store_vec_rt(vals + c * 4, q + base + j, inv, 4);
-            }
+            for (int j = t * 4; j < K; j += 1024)
+                quant_store_vec_rt(vals + (j / 1024) * 4, q + base + j, inv, 4);
         } else {
-            #pragma unroll
-            for (int c = 0; c < 6; ++c) {
-                const int j = t * 8 + c * 2048;
-                if (j >= K) break;
-                quant_store_vec_rt(vals + c * 8, q + base + j, inv, 8);
-            }
+            for (int j = t * 8; j < K; j += 2048)
+                quant_store_vec_rt(vals + (j / 2048) * 8, q + base + j, inv, 8);
         }
         return;
     }

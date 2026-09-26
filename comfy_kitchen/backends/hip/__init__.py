@@ -156,18 +156,27 @@ def _gfx_arch(device: torch.device | int | None = None) -> str | None:
         return None
 
 
-def _is_small_igpu() -> bool:
+def _is_small_igpu(device: torch.device | int | None = None) -> bool:
     """True on the small RDNA3 iGPU (Radeon 780M, gfx1103) whose 6-WGP tuning
     this tree carries. dGPUs keep the upstream schedules: several block-size
     and dispatch choices measured here are a regression on 60-96 CU parts.
 
-    Resolved for the current device and cached per device index (matching the
-    C++ comfy_small_igpu), so a mixed iGPU + dGPU box answers for the device in
-    use instead of whichever was current the first time this ran.
+    Resolved for ``device`` (defaulting to the current device) and cached per
+    device index (matching the C++ comfy_small_igpu), so a mixed iGPU + dGPU box
+    answers for the device a tensor actually lives on, not whichever was current
+    the first time this ran.
     """
     if not torch.cuda.is_available() or not getattr(torch.version, "hip", None):
         return False
-    return _is_small_igpu_index(torch.cuda.current_device())
+    if device is None:
+        index = torch.cuda.current_device()
+    elif isinstance(device, int):
+        index = device
+    else:
+        index = device.index
+        if index is None:
+            return False
+    return _is_small_igpu_index(index)
 
 
 @functools.lru_cache(maxsize=None)
@@ -706,7 +715,7 @@ def fp16_linear(
     n, k = weight.shape
 
     supported = (
-        x.dtype in (torch.float16, torch.bfloat16 if _is_small_igpu() else torch.float16)
+        x.dtype in (torch.float16, torch.bfloat16 if _is_small_igpu(x.device) else torch.float16)
         and weight.dtype == x.dtype
         and weight.device == x.device
         and x_2d.shape[1] == k
@@ -2869,7 +2878,8 @@ _SAGE_KEY_GROUP = 16
 _SAGE_HEAD_DIMS = (64, 128, 256)
 
 
-def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool) -> int:
+def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool,
+                device: torch.device | int | None = None) -> int:
     """Keys per attention iteration.
 
     64 by default; 128 for long unmasked D128 sequences. Measured on the 6-WGP
@@ -2878,7 +2888,7 @@ def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool) -> int:
     The kernel instantiates the matching tile from the runtime value, and the
     K-scale buffer padding below uses the same choice, so the two stay in sync.
     """
-    if _is_small_igpu() and head_dim == 128 and kv_length >= 2048 and not has_mask:
+    if _is_small_igpu(device) and head_dim == 128 and kv_length >= 2048 and not has_mask:
         return _SAGE_LARGE_CTA_K
     return _SAGE_CTA_K
 
@@ -3073,7 +3083,7 @@ def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
         # single-width buffer (no direct path there).
         "v_int8": torch.empty(
             batch * kv_heads * head_dim,
-            padded_k * (2 if _is_small_igpu() else 1),
+            padded_k * (2 if _is_small_igpu(q.device) else 1),
             dtype=torch.int8,
             device=device,
         ),
@@ -3103,7 +3113,7 @@ def sage_int8_sdpa(
         batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q.device
     )
 
-    cta_k = _sage_cta_k(head_dim, k.shape[2], attn_mask is not None)
+    cta_k = _sage_cta_k(head_dim, k.shape[2], attn_mask is not None, q.device)
     buffers, anchor_indices = _sage_buffers(q, k, cta_k)
     _C.sage_sdpa(
         _dl(q),

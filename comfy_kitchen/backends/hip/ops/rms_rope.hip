@@ -12,6 +12,7 @@
 //
 // The normalized value is rounded to x's dtype before the rotation reads it back.
 // That is the unfused contract, which every other backend matches.
+#include <cstdint>
 #include <stdexcept>
 #include <type_traits>
 
@@ -168,12 +169,17 @@ __global__ __launch_bounds__(kRmsRopeThreads) void rms_rope_kernel_fast(
     const bool has_k = k != nullptr;
 
     // Phase 1: 16-byte loads into LDS (floats), accumulating each lane's own
-    // partial sum. head_dim / kVec lanes load; the rest contribute zero.
+    // partial sum. Grid-stride over chunks (c = t; c < chunks; c += kWarp): a
+    // warp is 32 lanes but head_dim can hold far more 16-byte chunks than that,
+    // so a single if (t < chunks) would leave the tail of the row unstaged and
+    // unreduced — the rms would miss it and phase 3 would read uninitialized
+    // LDS. Every lane still lands on a distinct chunk, so the vector loads stay
+    // contiguous and coalesce.
     const int chunks = head_dim / kVec;
     float sq_q = 0.0f;
     float sq_k = 0.0f;
-    if (t < chunks) {
-        const int e0 = t * kVec;
+    for (int c = t; c < chunks; c += kWarp) {
+        const int e0 = c * kVec;
         const char* qp = static_cast<const char*>(q) + (xoff + e0) * sizeof(T);
         const uint4 v = *reinterpret_cast<const uint4*>(qp);
         if constexpr (sizeof(T) == 2) {
@@ -327,7 +333,9 @@ extern "C" void launch_rms_rope_kernel(
     // warp-per-row schedule was tuned on the 6-WGP 780M; dGPUs keep the
     // upstream 64-thread kernel.
     const int64_t kVec = x_code == 0 ? 4 : 8;
+    auto aligned16 = [](const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15u) == 0; };
     const bool fast = comfy_small_igpu() && sx_d == 1 && so_d == 1 && head_dim <= kMaxStagedHd &&
+                      aligned16(q) && (k == nullptr || aligned16(k)) &&
                       head_dim % kVec == 0 && sx_b % kVec == 0 && sx_d1 % kVec == 0 &&
                       sx_d2 % kVec == 0 && so_b % kVec == 0 && so_d1 % kVec == 0 &&
                       so_d2 % kVec == 0;

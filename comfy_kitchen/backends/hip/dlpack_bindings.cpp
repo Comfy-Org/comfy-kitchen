@@ -1401,12 +1401,12 @@ static void sage_check_quantized(const nb::ndarray<>& q_int8, const nb::ndarray<
                                  const nb::ndarray<>& k_int8, const nb::ndarray<>& k_scale,
                                  const nb::ndarray<>& v_int8, const nb::ndarray<>& v_scale,
                                  int batch, int q_heads, int kv_heads, int qo_len, int kv_len,
-                                 int head_dim, int cta_k, const char* fn) {
+                                 int head_dim, int cta_k, bool igpu, const char* fn) {
     const int64_t padded_q = sage_padded_q(qo_len);
     const int64_t padded_k = sage_padded_k(kv_len, cta_k);
     require_dtype(q_int8, 4, 4, fn, "q_int8");
     require_dtype(k_int8, 4, 4, fn, "k_int8");
-    if (!comfy_small_igpu()) {
+    if (!igpu) {
         // Upstream contract: the transposed V is int8. The unquantized-V paths
         // (fp16/bf16 SV) are a gfx1103 iGPU extension and are rejected here so
         // every other GPU keeps the mainline implementation end to end.
@@ -1430,7 +1430,7 @@ static void sage_check_quantized(const nb::ndarray<>& q_int8, const nb::ndarray<
     // The V scratch is 2x the int8 width on the gfx1103 iGPU (fp16 direct path
     // fills the full width); dGPUs keep the upstream single width.
     require_len(v_int8, static_cast<int64_t>(batch) * kv_heads * head_dim * padded_k *
-                            (comfy_small_igpu() ? 2 : 1),
+                            (igpu ? 2 : 1),
                 fn, "v_int8");
     require_scale_len(q_scale, static_cast<size_t>(batch) * q_heads * padded_q, fn, "q_scale");
     require_scale_len(k_scale, static_cast<size_t>(batch) * kv_heads * (padded_k / kSageKeyGroup),
@@ -1452,7 +1452,7 @@ static void sage_quantize(const nb::ndarray<>& q, const nb::ndarray<>& k, const 
                           const nb::ndarray<>& k_int8, const nb::ndarray<>& k_scale,
                           const nb::ndarray<>& v_int8, const nb::ndarray<>& v_scale,
                           const nb::ndarray<>& anchor_indices, int input_dtype_code, int cta_k,
-                          hipStream_t stream, const char* fn) {
+                          hipStream_t stream, bool igpu, const char* fn) {
     const int batch = static_cast<int>(q.shape(0));
     const int q_heads = static_cast<int>(q.shape(1));
     const int qo_len = static_cast<int>(q.shape(2));
@@ -1473,7 +1473,7 @@ static void sage_quantize(const nb::ndarray<>& q, const nb::ndarray<>& k, const 
                                  ": the last dimension of q, k and v must be contiguous");
     }
     sage_check_quantized(q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, batch, q_heads,
-                         kv_heads, qo_len, kv_len, head_dim, cta_k, fn);
+                         kv_heads, qo_len, kv_len, head_dim, cta_k, igpu, fn);
     // The detector writes one index per (batch, kv head); there is no int32 code
     // in map_dtype_to_code, so the width is what gets checked.
     if (anchor_indices.dtype().bits != 32) {
@@ -1541,7 +1541,7 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
                         const nb::ndarray<>& v_scale, const OptArray& attn_mask, int batch,
                         int q_heads, int kv_heads, int qo_len, int kv_len, int head_dim,
                         int cta_k, float sm_scale, int output_dtype_code, hipStream_t stream,
-                        const char* fn) {
+                        bool igpu, const char* fn) {
     if (output_dtype_code != 1 && output_dtype_code != 2) {
         throw std::runtime_error(std::string(fn) + ": output dtype must be float16 or bfloat16");
     }
@@ -1578,7 +1578,7 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
         // kernel is correct for tile-aligned D128 (and for all D64, where the
         // cta_k=64 padding always matches).
         const bool partial_tile = (kv_len % cta_k) != 0;
-        if (mask_ptr != nullptr || head_dim == 256 || !comfy_small_igpu() || partial_tile) {
+        if (mask_ptr != nullptr || head_dim == 256 || !igpu || partial_tile) {
             // Legacy pure-int8 kernel: handles masks, D256 has no room for the
             // ported kernel's tiles, dGPUs keep the upstream implementation
             // (the ported schedule is tuned against the 6-WGP 780M), and the
@@ -1619,7 +1619,7 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
         // BLOCK_M 64/128 with waves_per_eu hints). The transposed V buffer is
         // always fp16 — bf16/fp32 inputs were downcast by the transpose. This
         // is an iGPU-only extension of the upstream API.
-        if (!comfy_small_igpu()) {
+        if (!igpu) {
             throw std::runtime_error(
                 "fp16-V prequantized attention requires the gfx1103 iGPU backend");
         }
@@ -1669,6 +1669,7 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
     sage_check_shapes(q, k, v, kFn);
     sage_check_cta_k(cta_k, kFn);
     const auto stream = reinterpret_cast<hipStream_t>(stream_ptr);
+    const bool igpu = comfy_small_igpu(q.device_id());
     const int batch = static_cast<int>(q.shape(0));
     const int q_heads = static_cast<int>(q.shape(1));
     const int qo_len = static_cast<int>(q.shape(2));
@@ -1686,10 +1687,27 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
     // attention keeps int8 so the prequantized split API stays bitwise equal.
     // The direct kernel is an iGPU extension of the upstream API.
     const bool use_direct =
-        comfy_small_igpu() && !attn_mask.has_value() && input_dtype_code != 0 &&
+        igpu && !attn_mask.has_value() && input_dtype_code != 0 &&
         ((head_dim == 64 && kv_len <= 2048 && !(qo_len == kv_len && kv_len <= 1024)) ||
          (head_dim == 128 && kv_len <= 256));
     if (use_direct) {
+        // The direct kernel bypasses the int8 prepass, so the operand checks the
+        // int8 path runs in sage_quantize/sage_attend are skipped here. Re-run the
+        // ones the direct launches depend on: it reinterprets q/k as fp16/bf16 from
+        // input_dtype_code, reads 16 adjacent elements and K rows via uint4 (last
+        // dim must be contiguous), the transpose writes fp16 over the full V width
+        // (buffer must be the 2x-wide gfx1103 layout), and o is written with 16-byte
+        // stores.
+        require_dtype(q, input_dtype_code, input_dtype_code, kFn, "q");
+        require_dtype(k, input_dtype_code, input_dtype_code, kFn, "k");
+        require_dtype(v, input_dtype_code, input_dtype_code, kFn, "v");
+        require_dtype(o, input_dtype_code, input_dtype_code, kFn, "o");
+        if (q.stride(3) != 1 || k.stride(3) != 1 || v.stride(3) != 1 || o.stride(3) != 1) {
+            throw std::runtime_error(std::string(kFn) +
+                                     ": the last dimension of q, k, v and o must be contiguous");
+        }
+        require_len(v_int8, static_cast<int64_t>(batch) * kv_heads * head_dim * padded_k * 2,
+                    kFn, "v_int8");
         launch_sage_transpose_v(v.data(), v_int8.data(), batch, kv_heads, kv_len, head_dim,
                                 padded_k, v.stride(0), v.stride(1), v.stride(2), input_dtype_code,
                                 stream);
@@ -1707,11 +1725,11 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
         check_hip_launch();
     } else {
         sage_quantize(q, k, v, q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, anchor_indices,
-                      input_dtype_code, cta_k, stream, kFn);
+                      input_dtype_code, cta_k, stream, igpu, kFn);
         check_hip_launch();
         sage_attend(q_int8, k_int8, v_int8, o, q_scale, k_scale, v_scale, attn_mask, batch,
                     q_heads, kv_heads, qo_len, kv_len, head_dim, cta_k, sm_scale,
-                    output_dtype_code, stream, kFn);
+                    output_dtype_code, stream, igpu, kFn);
     }
 }
 
@@ -1727,7 +1745,8 @@ void sage_sdpa_quantize(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::n
     sage_check_shapes(q, k, v, kFn);
     sage_check_cta_k(cta_k, kFn);
     sage_quantize(q, k, v, q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, anchor_indices,
-                  input_dtype_code, cta_k, reinterpret_cast<hipStream_t>(stream_ptr), kFn);
+                  input_dtype_code, cta_k, reinterpret_cast<hipStream_t>(stream_ptr),
+                  comfy_small_igpu(q.device_id()), kFn);
     check_hip_launch();
 }
 
@@ -1744,6 +1763,7 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
                                  ": q, k and o must be 4D and packed v must be 2D");
     }
     sage_check_cta_k(cta_k, kFn);
+    const bool igpu = comfy_small_igpu(q_int8.device_id());
     const int batch = static_cast<int>(q_int8.shape(0));
     const int q_heads = static_cast<int>(q_int8.shape(1));
     const int qo_len = static_cast<int>(q_int8.shape(2));
@@ -1763,12 +1783,12 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
         throw std::runtime_error(std::string(kFn) + ": incompatible quantized tensor shapes");
     }
     sage_check_quantized(q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, batch, q_heads,
-                         kv_heads, qo_len, kv_len, head_dim, cta_k, kFn);
+                         kv_heads, qo_len, kv_len, head_dim, cta_k, igpu, kFn);
     // V is packed as [B * H_kv * D, padded_k], and padded_k follows cta_k. Element
     // count alone cannot tell a buffer packed against a different cta_k from a
     // correct one, and the kernel would read shifted rows rather than fail.
     if (v_int8.shape(1) !=
-        static_cast<size_t>(sage_padded_k(kv_len, cta_k)) * (comfy_small_igpu() ? 2 : 1)) {
+        static_cast<size_t>(sage_padded_k(kv_len, cta_k)) * (igpu ? 2 : 1)) {
         throw std::runtime_error(std::string(kFn) + ": packed v row width " +
                                  std::to_string(v_int8.shape(1)) + " does not match cta_k " +
                                  std::to_string(cta_k));
@@ -1776,7 +1796,7 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
 
     sage_attend(q_int8, k_int8, v_int8, o, q_scale, k_scale, v_scale, attn_mask, batch, q_heads,
                 kv_heads, qo_len, kv_len, head_dim, cta_k, sm_scale, output_dtype_code,
-                reinterpret_cast<hipStream_t>(stream_ptr), kFn);
+                reinterpret_cast<hipStream_t>(stream_ptr), igpu, kFn);
 }
 
 

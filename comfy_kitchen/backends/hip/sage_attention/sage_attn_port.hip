@@ -1251,9 +1251,15 @@ extern "C" void launch_sage_direct_attn(
     }
 
     if (dtype_code == 1) {  // fp16
+        // The sweep overrides are read once per process (static) and force a
+        // single fp16 config. They are only valid for head_dim == 64: a direct
+        // launch is templated on head_dim, and an override set while processing a
+        // head_dim-128 input would run the 64-channel kernel, write half of o and
+        // leave the rest uninitialized. With head_dim == 128 the overrides are
+        // ignored and the shape-differentiated dispatch below runs instead.
         static const int ebm = []{ const char* s = getenv("SAGE_DIRECT_BM"); return s ? atoi(s) : 0; }();
         static const int ebn = []{ const char* s = getenv("SAGE_DIRECT_BN"); return s ? atoi(s) : 0; }();
-        if (ebm != 0 && ebn != 0) {
+        if (ebm != 0 && ebn != 0 && head_dim == 64) {
             if (ebm == 128 && ebn == 64) {
                 LAUNCH_DIRECT(64, 128, 64, __half);
             } else if (ebm == 128 && ebn == 32) {
