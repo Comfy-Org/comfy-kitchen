@@ -1566,17 +1566,23 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
     const int padded_k = sage_padded_k(kv_len, cta_k);
     const int v_dtype_code = map_dtype_to_code(v_int8.dtype());
     if (v_dtype_code == 4) {
-        // The fork's ported gfx110x kernel has a partial-last-key-tile bug in its
-        // wide (cta_k==128) tile: it mishandles the tail when kv_len is not a
-        // multiple of cta_k (kv=4097/8128/8193 break, aligned lengths are fine).
-        // Upstream's legacy int8_attn.hip handles partial tiles correctly, so
-        // route those shapes to it (mainline) and keep the ported kernel only
-        // for the tile-aligned cases it was tuned for.
-        const bool port_partial_tile_ok = (kv_len % cta_k) == 0;
-        if (mask_ptr != nullptr || head_dim == 256 || !comfy_small_igpu() || !port_partial_tile_ok) {
+        // The ported gfx110x kernel's int8-PV path keeps its online-softmax
+        // accumulator in INT32 and truncates on every rescale between key tiles,
+        // so over a long partial sequence its normalization drifts off the exact
+        // sum the upstream bias-PV scheme preserves. The strict atol=0
+        // constant-preservation test (upstream) catches this, so any shape whose
+        // tail tile is partial routes to the upstream legacy kernel, which is
+        // bit-stable across every tile boundary. The v_stride_n fix in
+        // sage_attn_port.hip already removed the out-of-bounds V-row reads that
+        // used to make these shapes produce nrmse~1.3 garbage, so the ported
+        // kernel is correct for tile-aligned D128 (and for all D64, where the
+        // cta_k=64 padding always matches).
+        const bool partial_tile = (kv_len % cta_k) != 0;
+        if (mask_ptr != nullptr || head_dim == 256 || !comfy_small_igpu() || partial_tile) {
             // Legacy pure-int8 kernel: handles masks, D256 has no room for the
-            // ported kernel's tiles, and dGPUs keep the upstream implementation
-            // (the ported schedule is tuned against the 6-WGP 780M).
+            // ported kernel's tiles, dGPUs keep the upstream implementation
+            // (the ported schedule is tuned against the 6-WGP 780M), and the
+            // partial-key-tile shapes stay on the bit-stable upstream path.
             launch_sage_int8_attn(
                 q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(),
                 k_scale.data(), v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h,

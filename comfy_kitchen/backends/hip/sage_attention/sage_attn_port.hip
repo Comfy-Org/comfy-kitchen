@@ -263,7 +263,11 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
     float row_l = 0.0f;
 
     const int64_t kv_limit = kv_len;
-    const int64_t v_t_n = ((kv_len + 63) / 64) * 64;
+    // The transposed V buffer's row stride is padded_k (v_stride_n), not a local
+    // 64-rounding: the binding pads the key axis to cta_k (128 for the wide D128
+    // tile), and any other stride reads shifted rows once kv_len is not a
+    // multiple of 64.
+    const int64_t v_t_n = v_stride_n;
     constexpr int KVecsPerRow = HeadDim / 8;
     constexpr int KVecsTotal = BLOCK_N * KVecsPerRow;
     constexpr int KPrefetchPerThread = (KVecsTotal + THREADS - 1) / THREADS;
@@ -540,7 +544,7 @@ __device__ __forceinline__ void attn_kernel_impl_32_t(
     float row_l[2] = {0.0f, 0.0f};
 
     const int64_t kv_limit = kv_len;
-    const int64_t v_t_n = ((kv_len + 63) / 64) * 64;
+    const int64_t v_t_n = v_stride_n;
     constexpr int KVecsPerRow = HeadDim / 16;
     constexpr int KVecsTotal = BLOCK_N * KVecsPerRow;
     constexpr int KPrefetchPerThread = (KVecsTotal + THREADS - 1) / THREADS;
@@ -868,7 +872,7 @@ __device__ __forceinline__ void attn_kernel_impl_t(
     float row_l = 0.0f;
 
     const int64_t kv_limit = kv_len;
-    const int64_t v_t_n = ((kv_len + 63) / 64) * 64;
+    const int64_t v_t_n = v_stride_n;
     constexpr int KVecsPerRow = HeadDim / 16;
     constexpr int KVecsTotal = BLOCK_N * KVecsPerRow;
     constexpr int KPrefetchPerThread = (KVecsTotal + THREADS - 1) / THREADS;
