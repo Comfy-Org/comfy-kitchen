@@ -58,8 +58,9 @@ corresponding operator is available.
 
 Ascend `convrot_w4a4_linear` requires `npu_quant_matmul`, not RotateQuant.
 It preserves the caller's FP32/FP16/BF16 precision during rotation and signed
-INT4 quantization. The packed codes are unpacked to INT8 for NPU INT32
-accumulation, then cast and scaled in eager's order. This is not a zero-copy
+INT4 quantization. Activation codes stay in INT8 storage without an intermediate
+pack/unpack; packed weights are unpacked to INT8 for NPU INT32 accumulation.
+The result is then cast and scaled in eager's order. This is not a zero-copy
 packed A4W4 kernel: unpacking has a memory/runtime cost. It avoids silently
 rounding FP32 inputs to BF16 or narrowing FP32/BF16 results through FP16.
 It retains eager's intermediate arithmetic, including FP16 range limitations;

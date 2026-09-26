@@ -19,7 +19,7 @@ from comfy_kitchen.backends._activations import (
 from comfy_kitchen.backends._activations import (
     input_act_width as _input_act_width,
 )
-from comfy_kitchen.backends.eager.convrot_w4a4 import quantize_signed_int4_rowwise
+from comfy_kitchen.backends.eager.convrot_w4a4 import _quantize_signed_int4_rowwise_unpacked
 from comfy_kitchen.backends.eager.svdquant import _unpack_int4_row_major
 from comfy_kitchen.constraints import (
     ExactDims,
@@ -543,10 +543,11 @@ def convrot_w4a4_linear(
 
     Do not cast FP32 activations before rotation/quantization: even small
     perturbations change the rounded A4 codes. The scaled packed-A4W4 kernel
-    also narrows output to FP16/BF16. Instead, unpack the same A4/W4 codes to
-    INT8 and request an INT32 accumulator without per-token scaling, then
+    also narrows output to FP16/BF16. Instead, retain the same A4/W4 codes in
+    INT8 containers and request an INT32 accumulator without per-token scaling, then
     reproduce eager's cast, scale and bias order. This intentionally trades
-    packed-kernel performance for the reference's numerical behavior.
+    packed-kernel performance for the reference's numerical behavior. Activation
+    codes stay in INT8 storage; only the packed weights need unpacking.
     """
     if linear_dtype != "int4":
         raise ValueError(f"Ascend A4W4 requires linear_dtype='int4', got {linear_dtype!r}")
@@ -562,8 +563,10 @@ def convrot_w4a4_linear(
         dtype=x.dtype,
     )
     rotated = _rotate_activation(x_2d, hadamard, convrot_groupsize)
-    packed_x, activation_scale = quantize_signed_int4_rowwise(rotated)
-    quantized_x = _unpack_int4_row_major(packed_x).contiguous()
+    # The integer matmul consumes INT8 containers; avoid packing and immediately
+    # unpacking the activation's unchanged signed INT4 codes.
+    quantized_x, activation_scale = _quantize_signed_int4_rowwise_unpacked(rotated)
+    quantized_x = quantized_x.contiguous()
     quantized_weight = _unpack_int4_row_major(qweight).contiguous()
     result = torch_npu.npu_quant_matmul(
         quantized_x,
