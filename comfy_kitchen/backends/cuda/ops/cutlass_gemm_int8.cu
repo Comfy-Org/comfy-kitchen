@@ -372,6 +372,11 @@ int device_sm_count() {
 
 int wave_guard(int m, int n, int selected) {
     if (selected != 0 && selected != 1) return selected;
+    // The sm86 branch of select_fused_int8_config is a table of measured winners
+    // (wave quantization already priced in), so the estimate below must not
+    // re-decide it: on the 38 swept shapes it agrees everywhere except
+    // 1024x2048x2048, where it turns the measured cfg1 pick into cfg0 (+20%).
+    if (device_is_sm86()) return selected;
     const int sms = device_sm_count();
     auto cost = [&](int64_t tile_n, double per_tile) {
         const double waves = double(((m + 127) / 128) * ((n + tile_n - 1) / tile_n)) / sms;
