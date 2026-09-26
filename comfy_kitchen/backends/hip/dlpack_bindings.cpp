@@ -51,7 +51,7 @@ bool launch_fp16_gemm_kernel(const void*, const void*, void*, const void*, const
                              const void*, int, int, int, hipStream_t);
 bool launch_fp16_conv3d_kernel(const void*, const void*, const void*, const void*, void*, int, int,
                                int, int, int, int, int, int, int, int, int, int, int, int, int,
-                               hipStream_t);
+                               int, int, int, int, hipStream_t);
 
 void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, hipStream_t);
 void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
@@ -100,8 +100,8 @@ void launch_sage_int8_attn(const void*, const void*, const void*, void*, const v
 void launch_adaln_kernel(const void*, const void*, const void*, void*, int, int, int, int, float,
                          int, int, int, bool, hipStream_t);
 void launch_group_norm_silu_pad3d(const void*, const void*, const void*, void*, void*, int, int,
-                                  int, int, int, int, float, int, int, int, int, int, bool, int,
-                                  hipStream_t);
+                                  int, int, int, int, float, int, int, int, int, int, bool, bool,
+                                  int, hipStream_t);
 void launch_gemv_awq_kernel(const void*, const void*, const void*, const void*, const void*, void*,
                             int, int, int, int, int, int, int, int, hipStream_t);
 void launch_svdquant_lora_down_kernel(const void*, const void*, void*, int, int, int, int, int,
@@ -465,8 +465,14 @@ bool bf16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias,
 // memory order; out and resid are [N, Z, P, Q, K]. false means the caller serves it.
 bool fp16_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, OptArray resid,
                  nb::ndarray<> out, int N, int D, int H, int W, int C, int K, int T, int R, int S,
-                 int sd, int sh, int sw, uintptr_t stream_ptr) {
+                 int sd, int sh, int sw, uintptr_t stream_ptr, int64_t xs_w, int64_t xs_h,
+                 int64_t xs_d, int64_t xs_n) {
     constexpr const char* kFn = "fp16_conv3d";
+    for (int64_t st : {xs_w, xs_h, xs_d, xs_n}) {
+        if (st < 0 || st > INT32_MAX) {
+            throw std::runtime_error(std::string(kFn) + ": stride out of range");
+        }
+    }
     require_nonneg(N, kFn, "N");
     require_positive(C, kFn, "C");
     require_nonneg(K, kFn, "K");
@@ -497,7 +503,8 @@ bool fp16_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, OptArray resid
     }
     const bool served = launch_fp16_conv3d_kernel(
         x.data(), w.data(), opt_data(bias), opt_data(resid), out.data(), N, D, H, W, C, K, T, R, S,
-        Z, P, Q, sd, sh, sw, reinterpret_cast<hipStream_t>(stream_ptr));
+        Z, P, Q, sd, sh, sw, static_cast<int>(xs_w), static_cast<int>(xs_h),
+        static_cast<int>(xs_d), static_cast<int>(xs_n), reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
     return served;
 }
@@ -930,7 +937,7 @@ static void adaln_impl(const char* kFn, nb::ndarray<>& x, nb::ndarray<>& scale,
 void group_norm_silu_pad3d(nb::ndarray<> x, OptArray weight, OptArray bias, nb::ndarray<> out,
                            OptArray workspace, int B, int C, int T, int H, int W, int num_groups,
                            float eps, int left, int right, int top, int bottom, int front,
-                           bool silu, uintptr_t stream_ptr) {
+                           bool silu, bool zero_pad, uintptr_t stream_ptr) {
     constexpr const char* kFn = "group_norm_silu_pad3d";
     require_nonneg(B, kFn, "B");
     require_positive(C, kFn, "C");
@@ -972,8 +979,8 @@ void group_norm_silu_pad3d(nb::ndarray<> x, OptArray weight, OptArray bias, nb::
     }
     launch_group_norm_silu_pad3d(x.data(), opt_data(weight), opt_data(bias), out.data(),
                                  weight.has_value() ? workspace->data() : nullptr, B, C, T, H, W,
-                                 num_groups, eps, left, right, top, bottom, front, silu, code,
-                                 reinterpret_cast<hipStream_t>(stream_ptr));
+                                 num_groups, eps, left, right, top, bottom, front, silu, zero_pad,
+                                 code, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -2315,7 +2322,8 @@ NB_MODULE(_C, m) {
     m.def("fp16_conv3d", &fp16_conv3d, nb::arg("x"), nb::arg("w"), nb::arg("bias").none(),
           nb::arg("resid").none(), nb::arg("out"), nb::arg("N"), nb::arg("D"), nb::arg("H"),
           nb::arg("W"), nb::arg("C"), nb::arg("K"), nb::arg("T"), nb::arg("R"), nb::arg("S"),
-          nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("stream_ptr"));
+          nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("stream_ptr"), nb::arg("xs_w") = 0,
+          nb::arg("xs_h") = 0, nb::arg("xs_d") = 0, nb::arg("xs_n") = 0);
     m.def("quantize_int8_rowwise", &quantize_int8_rowwise);
     m.def("quantize_int8_convrot", &quantize_int8_convrot, nb::arg("x"), nb::arg("q"),
           nb::arg("scales"), nb::arg("spill_rotated").none(), nb::arg("spill_partials").none(),
@@ -2368,7 +2376,7 @@ NB_MODULE(_C, m) {
           nb::arg("bias").none(), nb::arg("out"), nb::arg("workspace").none(), nb::arg("B"),
           nb::arg("C"), nb::arg("T"), nb::arg("H"), nb::arg("W"), nb::arg("num_groups"),
           nb::arg("eps"), nb::arg("left"), nb::arg("right"), nb::arg("top"), nb::arg("bottom"),
-          nb::arg("front"), nb::arg("silu"), nb::arg("stream_ptr"));
+          nb::arg("front"), nb::arg("silu"), nb::arg("zero_pad"), nb::arg("stream_ptr"));
     m.def("apply_rope", &apply_rope);
     m.def("rms_rope", &rms_rope);
     m.def("gemv_awq_w4a16", &gemv_awq_w4a16);

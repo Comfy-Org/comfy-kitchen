@@ -670,8 +670,8 @@ def test_fp16_conv3d_matches_fp32_reference(hip, c, k, d, h, w, ksize, stride, w
 @needs_wmma
 def test_fp16_conv3d_declines_like_cuda(hip):
     torch.manual_seed(0)
-    # a token launch, and a deep (C*T*R*S > 8192) launch large enough to fill the device
-    for shape in [(64, 64, 3, 6, 6), (512, 512, 5, 66, 66)]:
+    # a token launch, and a deep (C*T*R*S > 16384) launch large enough to fill the device
+    for shape in [(64, 64, 3, 6, 6), (640, 640, 5, 66, 66)]:
         x, weight, bias, residual = _conv_inputs(*shape, (3, 3, 3), with_residual=True)
         assert hip._wmma_fp16_conv3d(x, weight, bias, residual, [1, 1, 1]) is None
         got = hip.fp16_conv3d(x, weight, bias, residual, [1, 1, 1])
@@ -743,7 +743,7 @@ def test_group_norm_silu_pad3d_binding_rejects_negative_padding(hip, side):
     with pytest.raises(RuntimeError, match=f"{side} must be non-negative"):
         hip._C.group_norm_silu_pad3d(
             hip._dl(x), None, None, hip._dl(out), None, 1, 8, 2, 4, 4, 1, 0.0,
-            pads["left"], pads["right"], pads["top"], pads["bottom"], pads["front"], False,
+            pads["left"], pads["right"], pads["top"], pads["bottom"], pads["front"], False, False,
             hip._stream(x))
 
 
@@ -752,6 +752,220 @@ def test_fp16_conv3d_bad_stride_is_reported_by_torch(hip):
     x, weight, bias, _ = _conv_inputs(16, 16, 4, 10, 10, (3, 3, 3))
     with pytest.raises(RuntimeError):
         hip.fp16_conv3d(x, weight, bias, None, [0, 1, 1])
+    out = torch.empty((1, 16, 2, 8, 8), dtype=torch.float16, device=DEV)
+    with pytest.raises(RuntimeError):
+        hip.fp16_conv3d_out(x, weight, bias, None, [0, 1, 1], out)
+
+
+@needs_wmma
+def test_fp16_conv3d_deep_large_launch_is_served(hip):
+    """512 channels x 27 taps, the depth CUDA's gate admits; HIP accumulates in fp32."""
+    torch.manual_seed(0)
+    x, weight, bias, residual = _conv_inputs(512, 512, 4, 66, 130, (3, 3, 3), with_residual=True)
+    got = hip._wmma_fp16_conv3d(x, weight, bias, residual, [1, 1, 1])
+    assert got is not None
+    assert _rel_err(got, _conv_ref(x, weight, bias, residual, (1, 1, 1))) < 5e-3
+
+
+@needs_wmma
+def test_fp16_conv3d_input_windows_match_packed(hip):
+    """Row and frame windows of x are read in place and are bit-identical to the packed run."""
+    torch.manual_seed(0)
+    x, weight, bias, _ = _conv_inputs(128, 128, 6, 130, 258, (3, 3, 3))
+    full = hip._wmma_fp16_conv3d(x, weight, bias, None, [1, 1, 1])
+    for h0, h1 in ((0, 64), (64, 128)):  # the input window carries the 2-row halo
+        view = x[:, :, :, h0:h1 + 2, :]
+        assert not view.is_contiguous(memory_format=torch.channels_last_3d)
+        assert hip._ndhwc_strides(view) is not None
+        tile = hip._wmma_fp16_conv3d(view, weight, bias, None, [1, 1, 1])
+        assert tile is not None and torch.equal(tile, full[:, :, :, h0:h1, :])
+    # a batch of two, so the batch stride is applied
+    x2 = torch.cat([x, x.flip(2)]).contiguous(memory_format=torch.channels_last_3d)
+    ref = hip._wmma_fp16_conv3d(x2[:, :, :, :66].contiguous(memory_format=torch.channels_last_3d),
+                                weight, bias, None, [1, 1, 1])
+    got = hip._wmma_fp16_conv3d(x2[:, :, :, :66], weight, bias, None, [1, 1, 1])
+    assert got is not None and torch.equal(got, ref)
+
+
+@needs_wmma
+def test_fp16_conv3d_broadcast_row_input(hip):
+    """A zero H stride is the kernel's packed marker, so an expanded view must be copied rather
+    than indexed as if it held H rows."""
+    torch.manual_seed(0)
+    x, weight, bias, _ = _conv_inputs(128, 128, 6, 1, 258, (3, 3, 3))
+    view = x.expand(-1, -1, -1, 130, -1)
+    assert view.stride()[3] == 0
+    assert hip._ndhwc_strides(view) is None
+    got = hip._wmma_fp16_conv3d(view, weight, bias, None, [1, 1, 1])
+    ref = hip._wmma_fp16_conv3d(view.contiguous(memory_format=torch.channels_last_3d), weight,
+                                bias, None, [1, 1, 1])
+    assert got is not None and torch.equal(got, ref)
+
+
+@needs_wmma
+def test_fp16_conv3d_frame_window_out(hip):
+    torch.manual_seed(0)
+    x, weight, bias, _ = _conv_inputs(128, 128, 6, 66, 130, (3, 3, 3))
+    full = hip._wmma_fp16_conv3d(x, weight, bias, None, [1, 1, 1])
+    out = torch.zeros_like(full).contiguous(memory_format=torch.channels_last_3d)
+    for z0, z1 in ((0, 2), (2, 4)):
+        window = out[:, :, z0:z1]
+        got = hip._wmma_fp16_conv3d(x[:, :, z0:z1 + 2], weight, bias, None, [1, 1, 1], out=window)
+        assert got is not None and got.data_ptr() == window.data_ptr()
+    assert torch.equal(out, full)
+    buf = torch.empty_like(full)
+    hip.fp16_conv3d_out(x, weight, bias, None, [1, 1, 1], buf)
+    assert torch.equal(buf, full)
+
+
+@needs_wmma
+def test_fp16_conv3d_out_the_kernel_cannot_index(hip):
+    """A row window of out, or a frame window across two batches, cannot be written as the
+    packed matrix the epilogue stores, so the kernel declines and the op copies into it
+    without touching the rest of the buffer."""
+    torch.manual_seed(0)
+    x, weight, bias, _ = _conv_inputs(128, 128, 4, 34, 130, (3, 3, 3))
+    full = hip.fp16_conv3d(x, weight, bias, None, [1, 1, 1])
+    out = torch.full_like(full, 7.0).contiguous(memory_format=torch.channels_last_3d)
+    window = out[:, :, :, :16, :]
+    assert hip._wmma_fp16_conv3d(x[:, :, :, :18, :], weight, bias, None, [1, 1, 1],
+                                 out=window) is None
+    hip.fp16_conv3d_out(x[:, :, :, :18, :], weight, bias, None, [1, 1, 1], window)
+    assert torch.equal(window, full[:, :, :, :16, :])
+    assert bool((out[:, :, :, 16:] == 7.0).all())
+
+    cl = torch.channels_last_3d
+    x = torch.randn(2, 128, 6, 66, 130, dtype=torch.float16, device=DEV).contiguous(memory_format=cl)
+    big = torch.full((2, 128, 4, 64, 128), 7.0, dtype=torch.float16, device=DEV).contiguous(
+        memory_format=cl)
+    window = big[:, :, 0:2]
+    assert hip._wmma_fp16_conv3d(x[:, :, 0:4], weight, None, None, [1, 1, 1], out=window) is None
+    hip.fp16_conv3d_out(x[:, :, 0:4], weight, None, None, [1, 1, 1], window)
+    assert _rel_err(window, _conv_ref(x[:, :, 0:4], weight, None, None, (1, 1, 1))) < 5e-3
+    assert bool((big[:, :, 2:] == 7.0).all())
+
+    with pytest.raises(ValueError, match="out must be"):
+        hip._wmma_fp16_conv3d(x, weight, None, None, [1, 1, 1], out=window)
+
+
+@needs_wmma
+def test_fp16_conv3d_binding_rejects_out_of_range_strides(hip):
+    x, weight, _, _ = _conv_inputs(16, 16, 4, 10, 10, (3, 3, 3))
+    out = torch.empty((1, 16, 2, 8, 8), dtype=torch.float16, device=DEV)
+    with pytest.raises(RuntimeError, match="stride out of range"):
+        hip._C.fp16_conv3d(hip._dl(x), hip._dl(weight), None, None, hip._dl(out),
+                           1, 4, 10, 10, 16, 16, 3, 3, 3, 1, 1, 1, hip._stream(x),
+                           16, 160, 2**31, 0)
+
+
+@pytest.mark.parametrize(
+    ("b", "c", "t", "h", "w", "pad"),
+    [
+        (1, 128, 3, 40, 56, (1, 1, 1, 1, 2)),
+        (2, 256, 2, 33, 17, (1, 1, 1, 1, 2)),
+        (1, 512, 2, 9, 9, (0, 1, 0, 1, 2)),
+        (1, 64, 2, 8, 8, (1, 1, 1, 1, 0)),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_group_norm_silu_pad3d_zero_pad_matches_eager(hip, monkeypatch, b, c, t, h, w, pad, dtype):
+    torch.manual_seed(0)
+    x, weight, bias = _gn_inputs(b, c, t, h, w, dtype)
+    ref = _eager_group_norm(x, weight, bias, 32, 1e-6, list(pad), True, True)
+    _no_eager_group_norm(monkeypatch)
+    got = hip.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, list(pad), True, True)
+    assert got.shape == ref.shape and got.is_contiguous(memory_format=torch.channels_last_3d)
+    assert _rel_err(got, ref) < 5 * torch.finfo(dtype).eps
+    left, right, top, bottom, _ = pad
+    interior = got[:, :, :, top:got.shape[3] - bottom, left:got.shape[4] - right]
+    assert torch.count_nonzero(got).item() == torch.count_nonzero(interior).item()
+
+
+def test_group_norm_silu_pad3d_zero_pad_wider_than_input(hip, monkeypatch):
+    """A zero border reads nothing, so it may exceed the input where reflection cannot."""
+    torch.manual_seed(0)
+    _no_eager_group_norm(monkeypatch)
+    for shape, pad in (((1, 32, 3, 7, 5), (2, 1, 1, 2, 2)), ((1, 32, 1, 2, 2), (3, 3, 3, 3, 0))):
+        x = torch.randn(shape, dtype=torch.float16, device=DEV).contiguous(
+            memory_format=torch.channels_last_3d)
+        got = hip.group_norm_silu_pad3d(x, None, None, 1, 0.0, list(pad), False, True)
+        left, right, top, bottom, front = pad
+        ref = torch.nn.functional.pad(x, (left, right, top, bottom, front, 0))
+        assert torch.equal(got, ref)
+
+
+def test_group_norm_silu_pad3d_zero_pad_empty_frame(hip):
+    """An empty frame has no rows to normalize but still a zero border to write."""
+    x = torch.randn(1, 64, 2, 0, 4, dtype=torch.float16, device=DEV).contiguous(
+        memory_format=torch.channels_last_3d)
+    out = torch.full((1, 64, 2, 2, 6), 7.0, dtype=torch.float16, device=DEV).contiguous(
+        memory_format=torch.channels_last_3d)
+    hip.group_norm_silu_pad3d(x, None, None, 1, 0.0, [1, 1, 1, 1, 0], False, True, out=out)
+    assert torch.count_nonzero(out).item() == 0
+
+
+def test_group_norm_silu_pad3d_out_overlapping_input(hip):
+    """Frames are written in no particular order, so an out that shares memory with x must
+    not be written in place: frame 2 below is both read and written."""
+    torch.manual_seed(0)
+    buf, weight, bias = _gn_inputs(1, 128, 5, 40, 56, torch.float16)
+    x = buf[:, :, 0:3]
+    ref = hip.group_norm_silu_pad3d(x.clone(memory_format=torch.channels_last_3d), weight, bias,
+                                    32, 1e-6, [0, 0, 0, 0, 0], True)
+    hip.group_norm_silu_pad3d_out(x, weight, bias, 32, 1e-6, [0, 0, 0, 0, 0], True, False,
+                                  buf[:, :, 2:5])
+    assert torch.equal(buf[:, :, 2:5], ref)
+
+
+@needs_wmma
+def test_fp16_conv3d_out_overlapping_input_is_declined(hip):
+    """Blocks read input rows other blocks may already have written, so an out laid over x
+    takes the copy path."""
+    torch.manual_seed(0)
+    x, weight, _, _ = _conv_inputs(128, 128, 6, 66, 130, (3, 3, 3))
+    ref = hip._wmma_fp16_conv3d(x.clone(memory_format=torch.channels_last_3d), weight, None,
+                                None, [1, 1, 1])
+    out = torch.as_strided(x, ref.shape, ref.stride(), x.storage_offset())
+    assert hip._wmma_fp16_conv3d(x, weight, None, None, [1, 1, 1], out=out) is None
+    hip.fp16_conv3d_out(x, weight, None, None, [1, 1, 1], out)
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("case", ["larger", "dtype", "device"])
+def test_group_norm_silu_pad3d_out_contract(hip, case):
+    """A direct backend call gets the same out checks as the public op: a larger packed out
+    would pass the binding's length check, and a host out would reach the kernel."""
+    x, weight, bias = _gn_inputs(1, 128, 2, 16, 16, torch.float16)
+    shape = (1, 128, 2, 18, 18)
+    out = {
+        "larger": torch.empty((1, 128, 3, 18, 18), dtype=torch.float16, device=DEV),
+        "dtype": torch.empty(shape, dtype=torch.bfloat16, device=DEV),
+        "device": torch.empty(shape, dtype=torch.float16),
+    }[case].contiguous(memory_format=torch.channels_last_3d)
+    with pytest.raises(ValueError, match="out must be"):
+        hip.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, [1, 1, 1, 1, 0], True, True, out=out)
+
+
+def test_group_norm_silu_pad3d_out(hip, monkeypatch):
+    """A packed out and a frame-offset view of a longer buffer are written in place."""
+    torch.manual_seed(0)
+    x, weight, bias = _gn_inputs(1, 128, 3, 40, 56, torch.float16)
+    pad = [1, 1, 1, 1, 0]
+    _no_eager_group_norm(monkeypatch)
+    ref = hip.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, pad, True, True)
+    out = torch.empty_like(ref)
+    assert hip.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, pad, True, True,
+                                     out=out).data_ptr() == out.data_ptr()
+    assert torch.equal(out, ref)
+    buf = torch.full((1, 128, 5, 42, 58), 7.0, dtype=torch.float16, device=DEV).contiguous(
+        memory_format=torch.channels_last_3d)
+    hip.group_norm_silu_pad3d_out(x, weight, bias, 32, 1e-6, pad, True, True, buf[:, :, 2:])
+    assert torch.equal(buf[:, :, 2:], ref) and bool((buf[:, :, :2] == 7.0).all())
+    # a row window cannot be indexed by the kernel and is copied into
+    buf = torch.full((1, 128, 3, 50, 58), 7.0, dtype=torch.float16, device=DEV).contiguous(
+        memory_format=torch.channels_last_3d)
+    hip.group_norm_silu_pad3d_out(x, weight, bias, 32, 1e-6, pad, True, True, buf[:, :, :, 4:46])
+    assert torch.equal(buf[:, :, :, 4:46], ref) and bool((buf[:, :, :, :4] == 7.0).all())
 
 
 @needs_wmma

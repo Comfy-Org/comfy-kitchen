@@ -6,7 +6,8 @@
 // (group_norm_pad3d.hip). Row m of the implicit A operand is the input patch under
 // output position m, gathered 8 channels at a time straight from x, so no im2col
 // buffer exists; B is the weight in its channels_last_3d (K, T, R, S, C) layout and
-// the output is written NZPQK. Accumulation is fp32.
+// the output is written NZPQK. Accumulation is fp32. x may be an NDHWC-ordered view of a
+// larger tensor, so a tiled convolution reads its tile in place.
 #include "../epilogue.h"
 #include "../gemm_wmma.h"
 
@@ -16,7 +17,8 @@ namespace comfy::hip_backend {
 struct ConvPatchSrc {
     const uint8_t* x;
     int zpq, pq, q_out;
-    int D, H, W, C;
+    int C;
+    int64_t xw, xh, xd, xn;  // element strides
     int rs, s_taps;
     int sd, sh, sw;
 
@@ -35,20 +37,19 @@ struct ConvPatchSrc {
         const int r = (tap - t * rs) / s_taps;
         const int s = tap - t * rs - r * s_taps;
 
-        const int64_t idx =
-            (((static_cast<int64_t>(n) * D + z * sd + t) * H + p * sh + r) * W + q * sw + s) * C +
-            c0;
+        const int64_t idx = n * xn + (z * sd + t) * xd + (p * sh + r) * xh + (q * sw + s) * xw + c0;
         return *reinterpret_cast<const uint4*>(x + 2 * idx);
     }
 };
 
 }  // namespace comfy::hip_backend
 
-// resid is the full NZPQK output-shaped residual, or null.
+// resid is the full NZPQK output-shaped residual, or null. xs_* are the element strides of
+// x; xs_h == 0 means packed NDHWC.
 extern "C" bool launch_fp16_conv3d_kernel(
     const void* x, const void* w, const void* bias, const void* resid, void* out, int N, int D,
     int H, int W, int C, int K, int T, int R, int S, int Z, int P, int Q, int sd, int sh, int sw,
-    hipStream_t stream) {
+    int xs_w, int xs_h, int xs_d, int xs_n, hipStream_t stream) {
 
     using namespace comfy::hip_backend;
 
@@ -66,17 +67,23 @@ extern "C" bool launch_fp16_conv3d_kernel(
     const int M = static_cast<int>(m64);
 
     // CUDA's envelope, in its own tile units: launches too small to fill the device
-    // run the framework conv, and past a reduction depth of 8192 only small launches
-    // are taken.
+    // run the framework conv, deep small launches are taken down to 16 of its 64x64
+    // tiles, and past a reduction depth of 16384 only those small launches are.
     auto tiles = [&](int64_t tm, int64_t tn) { return ((M + tm - 1) / tm) * ((K + tn - 1) / tn); };
-    const bool served = depth > 8192
-                            ? tiles(128, 128) < 128 && tiles(64, 64) >= 16
-                            : (K >= 256 && tiles(128, 256) >= 128) || tiles(128, 128) >= 128;
+    const bool small_launch = tiles(128, 128) < 128;
+    const bool served = depth > 16384 || (small_launch && depth > 8192)
+                            ? small_launch && tiles(64, 64) >= 16
+                            : !small_launch;
     if (!served) {
         return false;
     }
 
-    const ConvPatchSrc src{static_cast<const uint8_t*>(x), Z * P * Q, P * Q, Q, D, H, W, C,
+    const bool packed = xs_h == 0;
+    const int64_t xw = packed ? C : xs_w;
+    const int64_t xh = packed ? static_cast<int64_t>(W) * C : xs_h;
+    const int64_t xd = packed ? static_cast<int64_t>(H) * W * C : xs_d;
+    const int64_t xn = packed ? static_cast<int64_t>(D) * H * W * C : xs_n;
+    const ConvPatchSrc src{static_cast<const uint8_t*>(x), Z * P * Q, P * Q, Q, C, xw, xh, xd, xn,
                            R * S, S, sd, sh, sw};
     EpiFp16 epi{static_cast<const __half*>(bias), nullptr, static_cast<const __half*>(resid), K};
     launch_gemm_wmma<MmaF16, EpiFp16, __half, ConvPatchSrc>(
