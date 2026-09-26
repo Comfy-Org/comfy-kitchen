@@ -263,6 +263,46 @@ def test_int8_attention_fully_masked_key_broadcast_is_zero(mask_dtype):
 
 
 @requires_int8_attention
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("key_only", [False, True])
+def test_int8_attention_long_masked_sequence(head_dim, mask_dtype, key_only):
+    """Cover multiple K tiles, a partial tail, GQA, and noncontiguous masks."""
+    torch.manual_seed(177)
+    batch, heads, q_length, kv_length = 2, 4, 137, 1153
+    q, k, v = _qkv(batch, heads, 2, q_length, kv_length, head_dim)
+    mask_rows = 1 if key_only else q_length
+    bias = torch.randn(batch, heads, mask_rows, kv_length * 2, device="cuda")
+    if mask_dtype == torch.bool:
+        mask = bias > -0.5
+        masked_value = False
+    else:
+        mask = bias.to(mask_dtype)
+        masked_value = -torch.inf
+    mask = mask[..., ::2]
+    assert mask.stride(-1) == 2
+    # All-masked initial tiles must not pollute later valid keys. Also cover
+    # a fully masked head (or row), including the partial final tile.
+    mask[..., :128] = masked_value
+    mask[0, 1, 0, :] = masked_value
+    mask[..., -17:] = masked_value
+
+    actual = ck.int8_attention(q, k, v, attn_mask=mask)
+    packed = ck.prequantize_int8_attention(q, k, v, attn_mask=mask)
+    split = ck.int8_attention_from_prequantized(packed)
+    baseline_mask = mask if mask_dtype == torch.bool else mask.to(q.dtype)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q, k.repeat_interleave(2, dim=1), v.repeat_interleave(2, dim=1),
+        attn_mask=baseline_mask,
+    )
+
+    assert torch.equal(actual, split)
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual[0, 1] if key_only else actual[0, 1, 0]) == 0
+    assert _nrmse(actual, expected) < 0.03
+
+
+@requires_int8_attention
 def test_int8_attention_stabilizes_large_common_key_component():
     torch.manual_seed(7)
     q, k, v = _qkv(1, 16, 16, 513, 513, 128)
@@ -492,4 +532,124 @@ def test_int8_attention_accepts_dlpack_normalized_batch_stride():
     expected = ck.int8_attention_from_prequantized(ck.prequantize_int8_attention(*reported))
     actual = ck.int8_attention_from_prequantized(ck.prequantize_int8_attention(*normalized))
 
+    assert torch.equal(actual, expected)
+
+
+@requires_int8_attention
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("bias_kind", ["fade", "constant_tiles", "fully_masked"])
+@pytest.mark.parametrize("head_dim", [32, 64, 96, 128, 160, 256])
+def test_int8_attention_prepared_key_bias(dtype, bias_kind, head_dim):
+    torch.manual_seed(178)
+    q, k, v = _qkv(2, 4, 2, 129, 33601, head_dim, dtype)
+    keys = torch.arange(k.shape[2], device="cuda", dtype=torch.float32)
+    if bias_kind == "fade":
+        phase = ((keys / (k.shape[2] - 1) - 0.6) / 0.4).clamp(0, 1)
+        bias = ((1 + (phase * torch.pi).cos()) * 0.5).clamp_min(1e-4).log()
+    elif bias_kind == "constant_tiles":
+        # Different constants must affect the relative weights of tiles.
+        bias = ((keys // 128) % 7 - 3) * 2
+        bias[:128] = -torch.inf
+        bias[-129:] = -torch.inf
+    else:
+        bias = torch.full_like(keys, -torch.inf)
+    mask = bias.to(dtype).reshape(1, 1, 1, -1).expand(2, 4, q.shape[2], -1)
+
+    packed = ck.prequantize_int8_attention(q, k, v, attn_mask=mask)
+    actual = ck.int8_attention_from_prequantized(packed)
+    direct = ck.int8_attention(q, k, v, attn_mask=mask)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q, k.repeat_interleave(2, dim=1), v.repeat_interleave(2, dim=1),
+        attn_mask=mask,
+    )
+
+    if not getattr(torch.version, "hip", None):
+        assert packed.cta_k == (64 if head_dim <= 64 else 128)
+        assert packed.attn_mask.shape == (1, 1, 33928)
+    assert torch.equal(actual, direct)
+    assert torch.isfinite(actual).all()
+    if bias_kind == "fully_masked":
+        assert torch.count_nonzero(actual) == 0
+    else:
+        assert _nrmse(actual, expected) < 0.03
+
+
+@requires_int8_attention
+@pytest.mark.parametrize("head_dim", range(1, 257))
+def test_int8_attention_prepared_mask_all_head_dimensions(head_dim):
+    torch.manual_seed(179)
+    q, k, v = _qkv(2, 4, 2, 137, 1153, head_dim)
+    mask = torch.zeros(1, 1, 1, k.shape[2], dtype=q.dtype, device="cuda")
+    mask[..., 512:] = torch.linspace(-1, -4, k.shape[2] - 512, device="cuda")
+    mask[..., :128] = -torch.inf
+    packed = ck.prequantize_int8_attention(q, k, v, attn_mask=mask)
+    actual = ck.int8_attention_from_prequantized(packed)
+    direct = ck.int8_attention(q, k, v, attn_mask=mask)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q, k.repeat_interleave(2, dim=1), v.repeat_interleave(2, dim=1), attn_mask=mask,
+    )
+
+    if not getattr(torch.version, "hip", None):
+        assert packed.attn_mask.ndim == 3
+    assert actual.shape == q.shape
+    assert torch.isfinite(actual).all()
+    assert torch.equal(actual, direct)
+    assert _nrmse(actual, expected) < 0.03
+
+
+@requires_int8_attention
+def test_int8_attention_prepared_key_mask_compile_and_graph():
+    q, k, v = _qkv(1, 4, 2, 129, 1153, 128)
+    mask = torch.linspace(-3, 0, k.shape[2], device="cuda").reshape(1, 1, 1, -1)
+    compiled = torch.compile(ck.int8_attention, backend="eager", fullgraph=True)
+    expected = ck.int8_attention(q, k, v, attn_mask=mask)
+    torch.testing.assert_close(compiled(q, k, v, attn_mask=mask), expected)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        ck.int8_attention(q, k, v, attn_mask=mask)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = ck.int8_attention(q, k, v, attn_mask=mask)
+    graph.replay()
+    torch.testing.assert_close(actual, expected)
+    # Preparation must run again on replay, rather than cache stale mask data.
+    mask.fill_(-torch.inf)
+    graph.replay()
+    assert torch.count_nonzero(actual) == 0
+
+
+@requires_int8_attention
+def test_int8_attention_prepared_mask_nonfinite_entries():
+    q, k, v = _qkv(1, 4, 2, 65, 1153, 128)
+    mask = torch.zeros(1, 1, 1, 1153, device="cuda")
+    mask[..., :128] = torch.nan
+    mask[..., 256:384] = torch.inf
+    mask[..., -128:] = -torch.inf
+    sanitized = torch.where(torch.isfinite(mask), mask, -torch.inf)
+    actual = ck.int8_attention(q, k, v, attn_mask=mask)
+    expected = ck.int8_attention(q, k, v, attn_mask=sanitized)
+    assert torch.isfinite(actual).all()
+    assert torch.equal(actual, expected)
+
+
+@requires_int8_attention
+def test_int8_attention_prepared_mask_releases_original():
+    if getattr(torch.version, "hip", None):
+        pytest.skip("prepared key masks are CUDA-specific")
+    q, k, v = _qkv(1, 4, 2, 65, 1153, 128)
+    mask = torch.zeros(1, 1, 1, k.shape[2], device="cuda")
+    mask_ref = weakref.ref(mask)
+    packed = ck.prequantize_int8_attention(q, k, v, attn_mask=mask)
+    expected = ck.int8_attention(q, k, v, attn_mask=mask)
+
+    # The prequantized snapshot owns its prepared buffer, not the input mask.
+    mask.fill_(-torch.inf)
+    del mask
+    gc.collect()
+    assert mask_ref() is None
+    actual = ck.int8_attention_from_prequantized(packed)
+    assert torch.count_nonzero(actual) > 0
     assert torch.equal(actual, expected)

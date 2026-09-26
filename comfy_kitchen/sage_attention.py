@@ -29,7 +29,9 @@ class PrequantizedInt8Attention:
     """Packed Q/K/V and immutable launch metadata for split INT8 attention.
 
     Instances own only the quantized tensors, their scales, and an optional
-    attention mask. They never retain the floating-point Q, K, or V inputs.
+    attention mask in its active layout: expanded 4D values or a prepared 3D
+    buffer containing key values and tile metadata. Prepared masks replace the
+    original mask. Instances never retain the floating-point Q, K, or V inputs.
     Create instances with :func:`prequantize_int8_attention` rather than
     constructing them directly.
     """
@@ -60,6 +62,42 @@ def _select_cta_k(
     if not has_mask and kernel_head_dim >= 128 and kv_length > 1024:
         return LARGE_CTA_K
     return CTA_K
+
+
+def _prepare_attn_mask(
+    attn_mask: torch.Tensor | None,
+    attention_scale: float,
+) -> torch.Tensor | None:
+    """Keep the expanded 4D mask or replace it with a packed 3D key mask."""
+    # Preparation's extra allocation and launch usually lose on short key rows.
+    # Keep this conservative cutoff; large query batches can break even earlier.
+    # See samples/benchmark_int8_attention_mask_cutoff.py for the measured paths.
+    # Constant tiles of a per-key bias can share the unmasked integer softmax;
+    # varying tiles retain every bias value in FP32.
+    if (
+        attn_mask is None
+        or attn_mask.shape[-1] <= 1024
+        or attn_mask.stride(2) != 0
+        or attention_scale <= 0
+    ):
+        return attn_mask
+    mask_batch = 1 if attn_mask.stride(0) == 0 else attn_mask.shape[0]
+    mask_heads = 1 if attn_mask.stride(1) == 0 else attn_mask.shape[1]
+    compact_mask = attn_mask[:mask_batch, :mask_heads, :1, :]
+    tiles = (attn_mask.shape[-1] + LARGE_CTA_K - 1) // LARGE_CTA_K
+    # Align each packed row for float2 loads in the attention kernel.
+    packed_width = ((tiles * (LARGE_CTA_K + 1) + 3) // 4) * 4
+    packed = torch.empty(
+        (mask_batch, mask_heads, packed_width),
+        dtype=torch.float32,
+        device=attn_mask.device,
+    )
+    _cuda_backend._C.sage_prepare_key_mask(
+        _cuda_backend._wrap_for_dlpack(compact_mask),
+        _cuda_backend._wrap_for_dlpack(packed),
+        torch.cuda.current_stream(attn_mask.device).cuda_stream,
+    )
+    return packed
 
 
 def is_available(device: torch.device | None = None) -> bool:
@@ -175,10 +213,11 @@ def _int8_attention_cuda(
 
     batch, q_heads, q_length, _ = q.shape
     _, kv_heads, kv_length, _ = k.shape
+    attn_mask = _prepare_attn_mask(attn_mask, attention_scale)
     cta_k = _select_cta_k(
         kernel_head_dim,
         kv_length,
-        has_mask=attn_mask is not None,
+        has_mask=attn_mask is not None and attn_mask.ndim == 4,
     )
     padded_k_length = _pad_to_cta_k(kv_length, cta_k)
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
@@ -217,45 +256,25 @@ def _int8_attention_cuda(
     anchor_indices_ptr = anchor_indices.data_ptr()
 
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
-    if attn_mask is None:
-        _cuda_backend._C.sage_sdpa(
-            _cuda_backend._wrap_for_dlpack(q),
-            _cuda_backend._wrap_for_dlpack(k),
-            _cuda_backend._wrap_for_dlpack(v),
-            _cuda_backend._wrap_for_dlpack(output),
-            _cuda_backend._wrap_for_dlpack(q_int8),
-            _cuda_backend._wrap_for_dlpack(q_scale),
-            _cuda_backend._wrap_for_dlpack(k_int8),
-            _cuda_backend._wrap_for_dlpack(k_scale),
-            _cuda_backend._wrap_for_dlpack(v_int8),
-            _cuda_backend._wrap_for_dlpack(v_scale),
-            attention_scale,
-            DTYPE_TO_CODE[q.dtype],
-            DTYPE_TO_CODE[output_dtype],
-            stream_ptr,
-            anchor_indices_ptr,
-            cta_k=cta_k,
-        )
-    else:
-        _cuda_backend._C.sage_sdpa(
-            _cuda_backend._wrap_for_dlpack(q),
-            _cuda_backend._wrap_for_dlpack(k),
-            _cuda_backend._wrap_for_dlpack(v),
-            _cuda_backend._wrap_for_dlpack(output),
-            _cuda_backend._wrap_for_dlpack(q_int8),
-            _cuda_backend._wrap_for_dlpack(q_scale),
-            _cuda_backend._wrap_for_dlpack(k_int8),
-            _cuda_backend._wrap_for_dlpack(k_scale),
-            _cuda_backend._wrap_for_dlpack(v_int8),
-            _cuda_backend._wrap_for_dlpack(v_scale),
-            attention_scale,
-            DTYPE_TO_CODE[q.dtype],
-            DTYPE_TO_CODE[output_dtype],
-            stream_ptr,
-            anchor_indices_ptr,
-            _cuda_backend._wrap_for_dlpack(attn_mask),
-            cta_k=cta_k,
-        )
+    _cuda_backend._C.sage_sdpa(
+        _cuda_backend._wrap_for_dlpack(q),
+        _cuda_backend._wrap_for_dlpack(k),
+        _cuda_backend._wrap_for_dlpack(v),
+        _cuda_backend._wrap_for_dlpack(output),
+        _cuda_backend._wrap_for_dlpack(q_int8),
+        _cuda_backend._wrap_for_dlpack(q_scale),
+        _cuda_backend._wrap_for_dlpack(k_int8),
+        _cuda_backend._wrap_for_dlpack(k_scale),
+        _cuda_backend._wrap_for_dlpack(v_int8),
+        _cuda_backend._wrap_for_dlpack(v_scale),
+        attention_scale,
+        DTYPE_TO_CODE[q.dtype],
+        DTYPE_TO_CODE[output_dtype],
+        stream_ptr,
+        anchor_indices_ptr,
+        _cuda_backend._wrap_for_dlpack(attn_mask) if attn_mask is not None else None,
+        cta_k,
+    )
 
     output = output[..., :original_head_dim]
     return output.float() if q.dtype == torch.float32 else output
@@ -273,7 +292,9 @@ def prequantize_int8_attention(
 
     The returned object does not retain the floating-point inputs, so model
     code can delete those tensors before calling
-    :func:`int8_attention_from_prequantized`. Quantization and consumption use
+    :func:`int8_attention_from_prequantized`. Optimized key masks are prepared
+    as part of this snapshot; recreate it after changing the mask.
+    Quantization and consumption use
     the current CUDA stream and preserve normal PyTorch stream ordering; no
     host synchronization is introduced.
 
@@ -325,10 +346,11 @@ def prequantize_int8_attention(
 
     batch, q_heads, q_length, _ = q.shape
     _, kv_heads, kv_length, _ = k.shape
+    attn_mask = _prepare_attn_mask(attn_mask, attention_scale)
     cta_k = _select_cta_k(
         kernel_head_dim,
         kv_length,
-        has_mask=attn_mask is not None,
+        has_mask=attn_mask is not None and attn_mask.ndim == 4,
     )
     padded_k_length = _pad_to_cta_k(kv_length, cta_k)
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
@@ -458,7 +480,7 @@ def int8_attention_from_prequantized(
     )
 
     stream_ptr = torch.cuda.current_stream(quantized.q.device).cuda_stream
-    arguments = (
+    _cuda_backend._C.sage_sdpa_prequantized(
         _cuda_backend._wrap_for_dlpack(quantized.q),
         _cuda_backend._wrap_for_dlpack(quantized.k),
         _cuda_backend._wrap_for_dlpack(quantized.v),
@@ -470,14 +492,12 @@ def int8_attention_from_prequantized(
         quantized.attention_scale,
         DTYPE_TO_CODE[output_dtype],
         stream_ptr,
+        (
+            _cuda_backend._wrap_for_dlpack(quantized.attn_mask)
+            if quantized.attn_mask is not None
+            else None
+        ),
     )
-    if quantized.attn_mask is None:
-        _cuda_backend._C.sage_sdpa_prequantized(*arguments)
-    else:
-        _cuda_backend._C.sage_sdpa_prequantized(
-            *arguments,
-            _cuda_backend._wrap_for_dlpack(quantized.attn_mask),
-        )
 
     output = output[..., : quantized.original_head_dim]
     return output.float() if quantized.input_dtype == torch.float32 else output
