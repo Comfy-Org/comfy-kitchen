@@ -19,7 +19,9 @@
 #pragma once
 
 #include <atomic>
+#include <cstdlib>
 
+#include "launchers.h"  // comfy_small_igpu
 #include "mma.h"
 
 namespace comfy::hip_backend {
@@ -253,6 +255,31 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
 // Tile selection, shared by the fp8 and int8 launchers.
 // ---------------------------------------------------------------------------
 
+// Runtime tile-mode override, read once per process. "auto" (0, the default)
+// keeps the heuristic below; the numeric modes force a fixed tile for
+// device-family tuning (set COMFY_KITCHEN_WMMA_TILE):
+//   0 auto, 1 128x128 BKB128 16w, 2 128x128 BKB128 8w, 3 128x128 BKB64 16w,
+//   4 128x128 BKB64 8w,   5 64x64 BKB128 4w,  6 64x64 BKB64 4w,
+//   7 64x128 BKB128 8w,   8 128x64 BKB128 8w, 9 128x128 BKB192 8w,
+//   10 legacy auto (the pre-tune RDNA4 heuristic, for A/B comparisons)
+inline int wmma_tile_mode() {
+    // Read per call, not once per process: a tile sweep has to interleave modes
+    // in a single process, because absolute timings on this iGPU drift with the
+    // clock between processes. getenv+strtol is ~100 ns against a multi-ms GEMM.
+    // MSVC's ucrt marks getenv deprecated; the clang build with MSVC headers
+    // then warns on every TU that includes this header. The portable stdlib
+    // read is the right tool here, so silence that one diagnostic locally.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    const char* s = getenv("COMFY_KITCHEN_WMMA_TILE");
+#pragma clang diagnostic pop
+    if (s == nullptr || *s == '\0') return 0;
+    char* end = nullptr;
+    long v = std::strtol(s, &end, 10);
+    if (end == s || v < 0 || v > 10) return 0;
+    return static_cast<int>(v);
+}
+
 // hipDeviceAttributeMultiprocessorCount reports WGPs on RDNA, not CUs (32 on a
 // 64-CU gfx1201), and a workgroup schedules onto a WGP, so WGPs are the unit the
 // grid-coverage test needs. Cached per ordinal to keep the query off the launch
@@ -285,15 +312,114 @@ inline int device_wgp_count() {
 template <typename Mma, typename Epi, typename OutT, typename ASrc = const uint8_t*>
 void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbytes,
                       int ldc, Epi epi, hipStream_t stream) {
-    const int blocks_128 = ((M + 127) / 128) * ((N + 127) / 128);
-
     const int wgps = device_wgp_count();
+    const int mode = wmma_tile_mode();
+    if (mode != 0 && mode != 10) {
+        if (mode == 1) {
+            constexpr int BM = 128, BN = 128, BKB = 128;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
+                <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        } else if (mode == 2) {
+            constexpr int BM = 128, BN = 128, BKB = 128;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>
+                <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        } else if (mode == 3) {
+            constexpr int BM = 128, BN = 128, BKB = 64;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
+                <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        } else if (mode == 4) {
+            constexpr int BM = 128, BN = 128, BKB = 64;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>
+                <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        } else if (mode == 5) {
+            constexpr int BM = 64, BN = 64, BKB = 128;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
+                <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        } else if (mode == 6) {
+            constexpr int BM = 64, BN = 64, BKB = 64;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
+                <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        } else if (mode == 7) {
+            constexpr int BM = 64, BN = 128, BKB = 128;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 4, 2, 2, ASrc>
+                <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        } else if (mode == 8) {
+            constexpr int BM = 128, BN = 64, BKB = 128;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 2, ASrc>
+                <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        } else {
+            constexpr int BM = 128, BN = 128, BKB = 192;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>
+                <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        }
+        return;
+    }
+
+    const int blocks_128 = ((M + 127) / 128) * ((N + 127) / 128);
 
     // Zero padding the block count cannot see: at M <= 64 the 128-row tile is at
     // least half empty, and the finer 64x64 grid recovers the wasted MMAs.
     const bool skinny = (M <= 64 || N <= 64);
 
-    if (!skinny && blocks_128 >= wgps) {
+    // The gfx1103-only branch, keyed on the architecture rather than a WGP
+    // threshold: low-WGP devices (6 WGPs on a 780M, 8 on a 680M) have too few
+    // workgroup processors to interleave many small blocks, so a 16-wave
+    // 512-thread block that hides WMMA latency within the block wins. Deeper K
+    // amortizes the BKB=128 tile's LDS round trips; shallower K runs faster with
+    // BKB=64 on the 512-thread grid (measured on the 6-WGP 780M: the
+    // Anima/SDXL K<=2048..2880 shapes prefer 128x128 BKB64 16w, while K=8192
+    // likes BKB=128). The env override (COMFY_KITCHEN_WMMA_TILE) forces any mode.
+    // Every other architecture falls through to the upstream heuristic below:
+    // the branch above was tuned against 6 WGPs and is a regression elsewhere.
+    if (!skinny && comfy_small_igpu() && mode != 10) {
+        if (Mma::kStepBytes >= 32) {
+            // 32-byte K-steps (fp16/bf16) halve the K-steps per tile versus 8-bit
+            // operands. Re-measured on the 6-WGP 780M across ten Anima/SDXL/conv
+            // shapes (ck_tools/sweep_gemm_fp.py, same-process interleaved): for a
+            // moderate K the 64x64 BKB128 4-wave tile beats 128x128 by 3-27% -- it
+            // yields 4x the blocks to interleave and its smaller LDS footprint
+            // keeps more of them resident -- while deep K (mlp2, K=8192) and very
+            // shallow K (adaln2, K=256) both want 128x128 back. kbytes is 2*K here,
+            // so the 1024..4096 window is K in [512, 2048]; every measured shape
+            // inside it agreed, and conv320 (kbytes 5760) plus adaln2 (512)
+            // regress outside it.
+            if (kbytes >= 1024 && kbytes <= 4096) {
+                constexpr int BM = 64, BN = 64, BKB = 128;
+                dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
+                    <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+            } else {
+                constexpr int BM = 128, BN = 128, BKB = 128;
+                dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
+                    <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+            }
+        } else if (kbytes >= 4096) {
+            constexpr int BM = 128, BN = 128, BKB = 128;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
+                <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        } else if (blocks_128 >= wgps) {
+            constexpr int BM = 128, BN = 128, BKB = 64;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
+                <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        } else {
+            constexpr int BM = 64, BN = 64, BKB = 64;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
+                <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        }
+    } else if (!skinny && blocks_128 >= wgps) {
         if (kbytes >= 4096) {
             constexpr int BM = 128, BN = 128, BKB = 128;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);

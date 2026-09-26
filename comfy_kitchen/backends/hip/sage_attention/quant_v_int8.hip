@@ -10,101 +10,117 @@
 // fragment both index keys in natural order (see int8_attn.h), so keys are
 // written where they belong and the tail is zero filled.
 //
-// One block per (b, h, d_tile) of 8 channels. Pass 1 reduces the per-channel
-// absmax along N with 4x unrolled vector loads, pass 2 quantizes.
+// One block per (b, h, d_tile) of DTILE channels. Pass 1 reduces the per-channel
+// absmax along N with unrolled vector loads, pass 2 quantizes.
 #include <hip/hip_runtime.h>
 
 #include <stdexcept>
 #include <string>
 
+#include "../launchers.h"  // comfy_small_igpu
 #include "sage_common.h"
 
 namespace comfy::hip_backend::sage {
 namespace {
 
-constexpr int kDTile = 8;
+// Channels per thread, selected by architecture in the launchers below:
+//  32 on the gfx1103 iGPU. The read strides a whole row (256 bytes at D128)
+//    between consecutive keys, so the per-thread vector width sets the sector
+//    efficiency: 8 channels is 16 bytes of a 32-byte sector (half wasted unless
+//    a neighbouring d-tile block catches it in L2), 32 is a full sector run.
+//    Pass 1 drops to 1x unrolling to keep the live temporary count down.
+//   8 everywhere else -- the upstream tile, whose 4x unrolling was the schedule
+//    measured on 60-96 CU parts.
+constexpr int kDTileIGpu = 32;
+constexpr int kDTileUpstream = 8;
 
-// Eight adjacent channels: 32 bytes for fp32, 16 for the 16-bit types.
-template <typename T>
+template <int DTILE>
+constexpr int kUnrollFor = (DTILE >= 32) ? 1 : ((DTILE >= 16) ? 2 : 4);
+
+// DTILE adjacent channels: 32 bytes per 8 channels for the 16-bit types.
+template <typename T, int DTILE>
 __forceinline__ __device__ void load8(const T* p, float* out) {
     if constexpr (std::is_same_v<T, float>) {
-        const float4 lo = *reinterpret_cast<const float4*>(p);
-        const float4 hi = *reinterpret_cast<const float4*>(p + 4);
-        out[0] = lo.x;
-        out[1] = lo.y;
-        out[2] = lo.z;
-        out[3] = lo.w;
-        out[4] = hi.x;
-        out[5] = hi.y;
-        out[6] = hi.z;
-        out[7] = hi.w;
-    } else {
-        const uint4 raw = *reinterpret_cast<const uint4*>(p);
-        const T* vals = reinterpret_cast<const T*>(&raw);
 #pragma unroll
-        for (int i = 0; i < kDTile; ++i) out[i] = to_float(vals[i]);
+        for (int i = 0; i < DTILE / 4; ++i) {
+            const float4 raw = *reinterpret_cast<const float4*>(p + 4 * i);
+            out[4 * i + 0] = raw.x;
+            out[4 * i + 1] = raw.y;
+            out[4 * i + 2] = raw.z;
+            out[4 * i + 3] = raw.w;
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < DTILE / 8; ++i) {
+            const uint4 raw = *reinterpret_cast<const uint4*>(p + 8 * i);
+            const T* vals = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) out[8 * i + j] = to_float(vals[j]);
+        }
     }
 }
 
-template <typename T, int Threads>
+template <typename T, int DTILE, int Threads>
 __global__ __launch_bounds__(Threads) void quant_v_int8_kernel(
     const T* __restrict__ v, int8_t* __restrict__ out, float* __restrict__ scale_out, int N,
     int padded_N, int H, int D, int64_t stride_b, int64_t stride_h, int64_t stride_n) {
 
     constexpr int kWaves = Threads / 32;
+    constexpr int kUnroll = kUnrollFor<DTILE>;
 
-    const int d_tiles = D / kDTile;
+    const int d_tiles = D / DTILE;
     const int d_tile = blockIdx.x % d_tiles;
     const int bh = blockIdx.x / d_tiles;
     const int h = bh % H;
     const int b = bh / H;
-    const int d0 = d_tile * kDTile;
+    const int d0 = d_tile * DTILE;
 
     const T* base = v + static_cast<int64_t>(b) * stride_b + static_cast<int64_t>(h) * stride_h +
                     d0;
 
-    float mx[kDTile];
+    float mx[DTILE];
 #pragma unroll
-    for (int i = 0; i < kDTile; ++i) mx[i] = 0.0f;
+    for (int i = 0; i < DTILE; ++i) mx[i] = 0.0f;
 
-    // Four independent loads per iteration so the memory system has something to
-    // overlap; this block is the only one touching these channels.
+    // kUnroll independent loads per iteration so the memory system has something
+    // to overlap; this block is the only one touching these channels.
     int n = threadIdx.x;
-    const int n_body = N - 3 * Threads;
-    for (; n < n_body; n += 4 * Threads) {
-        float t0[kDTile], t1[kDTile], t2[kDTile], t3[kDTile];
-        load8<T>(base + static_cast<int64_t>(n) * stride_n, t0);
-        load8<T>(base + static_cast<int64_t>(n + Threads) * stride_n, t1);
-        load8<T>(base + static_cast<int64_t>(n + 2 * Threads) * stride_n, t2);
-        load8<T>(base + static_cast<int64_t>(n + 3 * Threads) * stride_n, t3);
+    const int n_body = N - (kUnroll - 1) * Threads;
+    for (; n < n_body; n += kUnroll * Threads) {
+        float t[kUnroll][DTILE];
 #pragma unroll
-        for (int i = 0; i < kDTile; ++i) {
-            mx[i] = fmaxf(mx[i], fmaxf(fmaxf(fabsf(t0[i]), fabsf(t1[i])),
-                                       fmaxf(fabsf(t2[i]), fabsf(t3[i]))));
+        for (int u = 0; u < kUnroll; ++u)
+            load8<T, DTILE>(base + static_cast<int64_t>(n + u * Threads) * stride_n, t[u]);
+#pragma unroll
+        for (int i = 0; i < DTILE; ++i) {
+            float m = fabsf(t[0][i]);
+#pragma unroll
+            for (int u = 1; u < kUnroll; ++u) m = fmaxf(m, fabsf(t[u][i]));
+            mx[i] = fmaxf(mx[i], m);
         }
     }
     for (; n < N; n += Threads) {
-        float t[kDTile];
-        load8<T>(base + static_cast<int64_t>(n) * stride_n, t);
+        float t[DTILE];
+        load8<T, DTILE>(base + static_cast<int64_t>(n) * stride_n, t);
 #pragma unroll
-        for (int i = 0; i < kDTile; ++i) mx[i] = fmaxf(mx[i], fabsf(t[i]));
+        for (int i = 0; i < DTILE; ++i) mx[i] = fmaxf(mx[i], fabsf(t[i]));
     }
 
     const int lane = threadIdx.x & 31;
     const int wave = threadIdx.x >> 5;
 
 #pragma unroll
-    for (int i = 0; i < kDTile; ++i) mx[i] = row_reduce_fmax<32>(mx[i]);
+    for (int i = 0; i < DTILE; ++i) mx[i] = row_reduce_fmax<32>(mx[i]);
 
-    __shared__ float wave_max[kDTile][kWaves];
-    __shared__ float inv_scale_shared[kDTile];
+    __shared__ float wave_max[DTILE][kWaves];
+    __shared__ float inv_scale_shared[DTILE];
     if (lane == 0) {
 #pragma unroll
-        for (int i = 0; i < kDTile; ++i) wave_max[i][wave] = mx[i];
+        for (int i = 0; i < DTILE; ++i) wave_max[i][wave] = mx[i];
     }
     __syncthreads();
 
-    if (threadIdx.x < kDTile) {
+    if (threadIdx.x < DTILE) {
         float val = 0.0f;
 #pragma unroll
         for (int w = 0; w < kWaves; ++w) val = fmaxf(val, wave_max[threadIdx.x][w]);
@@ -114,18 +130,18 @@ __global__ __launch_bounds__(Threads) void quant_v_int8_kernel(
     }
     __syncthreads();
 
-    float inv_scale[kDTile];
+    float inv_scale[DTILE];
 #pragma unroll
-    for (int i = 0; i < kDTile; ++i) inv_scale[i] = inv_scale_shared[i];
+    for (int i = 0; i < DTILE; ++i) inv_scale[i] = inv_scale_shared[i];
 
     const int64_t out_row = (static_cast<int64_t>(b) * H + h) * D + d0;
 
     // Descending so the tail of pass 1 is still in L2 when pass 2 starts.
     for (int src = N - 1 - static_cast<int>(threadIdx.x); src >= 0; src -= Threads) {
-        float t[kDTile];
-        load8<T>(base + static_cast<int64_t>(src) * stride_n, t);
+        float t[DTILE];
+        load8<T, DTILE>(base + static_cast<int64_t>(src) * stride_n, t);
 #pragma unroll
-        for (int i = 0; i < kDTile; ++i) {
+        for (int i = 0; i < DTILE; ++i) {
             out[(out_row + i) * padded_N + src] = float_to_int8_rn(t[i] * inv_scale[i]);
         }
     }
@@ -134,22 +150,90 @@ __global__ __launch_bounds__(Threads) void quant_v_int8_kernel(
     // real zero rather than whatever the allocator left behind.
     for (int src = N + static_cast<int>(threadIdx.x); src < padded_N; src += Threads) {
 #pragma unroll
-        for (int i = 0; i < kDTile; ++i) out[(out_row + i) * padded_N + src] = 0;
+        for (int i = 0; i < DTILE; ++i) out[(out_row + i) * padded_N + src] = 0;
     }
 }
 
-template <typename T>
+template <typename T, int DTILE>
 void launch_typed(const void* v, void* out, void* scale, int B, int H, int N, int D, int padded_N,
                   int64_t stride_b, int64_t stride_h, int64_t stride_n, hipStream_t stream) {
-    const int blocks = B * H * (D / kDTile);
+    const int blocks = B * H * (D / DTILE);
     if (N <= 256) {
-        quant_v_int8_kernel<T, 128><<<blocks, 128, 0, stream>>>(
+        quant_v_int8_kernel<T, DTILE, 128><<<blocks, 128, 0, stream>>>(
             static_cast<const T*>(v), static_cast<int8_t*>(out), static_cast<float*>(scale), N,
             padded_N, H, D, stride_b, stride_h, stride_n);
     } else {
-        quant_v_int8_kernel<T, 512><<<blocks, 512, 0, stream>>>(
+        quant_v_int8_kernel<T, DTILE, 512><<<blocks, 512, 0, stream>>>(
             static_cast<const T*>(v), static_cast<int8_t*>(out), static_cast<float*>(scale), N,
             padded_N, H, D, stride_b, stride_h, stride_n);
+    }
+}
+
+// Architecture dispatch: the 32-channel tile is the gfx1103 iGPU tuning; every
+// other GPU gets the upstream 8-channel tile with its 4x unrolling.
+template <typename T>
+void launch_quant_arch(const void* v, void* out, void* scale, int B, int H, int N, int D,
+                       int padded_N, int64_t stride_b, int64_t stride_h, int64_t stride_n,
+                       hipStream_t stream) {
+    if (comfy_small_igpu())
+        launch_typed<T, kDTileIGpu>(v, out, scale, B, H, N, D, padded_N, stride_b, stride_h,
+                                    stride_n, stream);
+    else
+        launch_typed<T, kDTileUpstream>(v, out, scale, B, H, N, D, padded_N, stride_b, stride_h,
+                                        stride_n, stream);
+}
+
+// Transpose-only V: same [B*H*D, padded_N] output layout as the quantizer, but
+// in V's own dtype with no scale — the bf16/fp16-SV attention path (int8 QK,
+// unquantized V) reads its PV fragments straight from here, matching the
+// SageAttention gfx110x kernels. InT/OutT may differ for fp32 input: the
+// bf16/fp16 WMMA PV needs 16-bit V, so fp32 is downcast to bf16 here (the
+// whole path runs 16-bit for fp32 inputs, as the Python layer's output dtype
+// already does).
+template <typename InT, typename OutT, int DTILE, int Threads>
+__global__ __launch_bounds__(Threads) void transpose_v_kernel(
+    const InT* __restrict__ v, OutT* __restrict__ out, int N, int padded_N, int H, int D,
+    int64_t stride_b, int64_t stride_h, int64_t stride_n) {
+
+    constexpr int kWaves = Threads / 32;
+    const int d_tiles = D / DTILE;
+    const int d_tile = blockIdx.x % d_tiles;
+    const int bh = blockIdx.x / d_tiles;
+    const int h = bh % H;
+    const int b = bh / H;
+    const int d0 = d_tile * DTILE;
+
+    const InT* base = v + static_cast<int64_t>(b) * stride_b + static_cast<int64_t>(h) * stride_h +
+                      d0;
+    const int64_t out_row = (static_cast<int64_t>(b) * H + h) * D + d0;
+
+    for (int src = static_cast<int>(threadIdx.x); src < N; src += Threads) {
+        float t[DTILE];
+        load8<InT, DTILE>(base + static_cast<int64_t>(src) * stride_n, t);
+#pragma unroll
+        for (int i = 0; i < DTILE; ++i) {
+            out[(out_row + i) * padded_N + src] = static_cast<OutT>(t[i]);
+        }
+    }
+    for (int src = N + static_cast<int>(threadIdx.x); src < padded_N; src += Threads) {
+#pragma unroll
+        for (int i = 0; i < DTILE; ++i) out[(out_row + i) * padded_N + src] = OutT{0};
+    }
+}
+
+template <typename InT, typename OutT, int DTILE>
+void launch_transpose_typed(const void* v, void* out, int B, int H, int N, int D, int padded_N,
+                            int64_t stride_b, int64_t stride_h, int64_t stride_n,
+                            hipStream_t stream) {
+    const int blocks = B * H * (D / DTILE);
+    if (N <= 256) {
+        transpose_v_kernel<InT, OutT, DTILE, 128><<<blocks, 128, 0, stream>>>(
+            static_cast<const InT*>(v), static_cast<OutT*>(out), N, padded_N, H, D, stride_b,
+            stride_h, stride_n);
+    } else {
+        transpose_v_kernel<InT, OutT, DTILE, 512><<<blocks, 512, 0, stream>>>(
+            static_cast<const InT*>(v), static_cast<OutT*>(out), N, padded_N, H, D, stride_b,
+            stride_h, stride_n);
     }
 }
 
@@ -158,6 +242,61 @@ void launch_typed(const void* v, void* out, void* scale, int B, int H, int N, in
 
 using namespace comfy::hip_backend::sage;
 
+extern "C" void launch_sage_transpose_v(const void* v, void* out, int B, int H, int N, int D,
+                                        int padded_N, int64_t stride_b, int64_t stride_h,
+                                        int64_t stride_n, int input_dtype_code,
+                                        hipStream_t stream) {
+    const size_t element_size = input_dtype_code == 0 ? sizeof(float) : sizeof(__half);
+    const auto stride_ok = [element_size](int64_t stride, int extent) {
+        return extent < 2 || (static_cast<size_t>(stride) * element_size) % 16 == 0;
+    };
+    if (reinterpret_cast<uintptr_t>(v) % 16 != 0 || !stride_ok(stride_b, B) ||
+        !stride_ok(stride_h, H) || !stride_ok(stride_n, N)) {
+        throw std::runtime_error(
+            "sage int8 attention: V base pointer and B/H/N strides must be 16-byte aligned");
+    }
+    // The transpose serves the gfx1103 iGPU's direct-attention path only (the
+    // binding gates the launch on comfy_small_igpu), so it stages the iGPU tile.
+    const int dtile = kDTileIGpu;
+    if (D <= 0 || D % dtile != 0) {
+        throw std::runtime_error("sage int8 attention: head_dim must be a positive multiple of " +
+                                 std::to_string(dtile));
+    }
+    if (N < 0 || padded_N < N) {
+        throw std::runtime_error(
+            "sage int8 attention: padded key length must be at least the key length");
+    }
+
+    switch (input_dtype_code) {
+        // The attention path runs fp16 SV (like the reference sageattn library,
+        // which downcasts V to fp16 in its transpose); fp32 and bf16 inputs are
+        // converted here.
+        case 0:
+            launch_transpose_typed<float, __half, kDTileIGpu>(
+                v, out, B, H, N, D, padded_N, stride_b, stride_h, stride_n, stream);
+            break;
+        case 1:
+            launch_transpose_typed<__half, __half, kDTileIGpu>(
+                v, out, B, H, N, D, padded_N, stride_b, stride_h, stride_n, stream);
+            break;
+        case 2:
+            launch_transpose_typed<__bf16, __half, kDTileIGpu>(
+                v, out, B, H, N, D, padded_N, stride_b, stride_h, stride_n, stream);
+            break;
+        default:
+            throw std::runtime_error(
+                "sage int8 attention: input dtype must be fp32, fp16 or bf16");
+    }
+
+    const hipError_t error = hipGetLastError();
+    if (error != hipSuccess) {
+        throw std::runtime_error(std::string("sage int8 V transpose kernel launch failed: ") +
+                                 hipGetErrorString(error));
+    }
+}
+
+// The quantizing V path (legacy pure-int8 attention): fused int8 + scale +
+// transpose to [B*H*D, padded_N].
 extern "C" void launch_sage_quant_v_int8(const void* v, void* out, void* scale, int B, int H,
                                          int N, int D, int padded_N, int64_t stride_b,
                                          int64_t stride_h, int64_t stride_n, int input_dtype_code,
@@ -176,9 +315,12 @@ extern "C" void launch_sage_quant_v_int8(const void* v, void* out, void* scale, 
         throw std::runtime_error(
             "sage int8 attention: V base pointer and B/H/N strides must be 16-byte aligned");
     }
-    if (D <= 0 || D % kDTile != 0) {
-        throw std::runtime_error(
-            "sage int8 attention: head_dim must be a positive multiple of 8");
+    // The tile actually staged below depends on the architecture; head_dim has
+    // to divide whichever one runs here.
+    const int dtile = comfy_small_igpu() ? kDTileIGpu : kDTileUpstream;
+    if (D <= 0 || D % dtile != 0) {
+        throw std::runtime_error("sage int8 attention: head_dim must be a positive multiple of " +
+                                 std::to_string(dtile));
     }
     // Rows are padded_N wide and the quantize pass writes columns up to N, so a
     // short pad would run every row past its end.
@@ -189,16 +331,16 @@ extern "C" void launch_sage_quant_v_int8(const void* v, void* out, void* scale, 
 
     switch (input_dtype_code) {
         case 0:
-            launch_typed<float>(v, out, scale, B, H, N, D, padded_N, stride_b, stride_h, stride_n,
-                                stream);
+            launch_quant_arch<float>(v, out, scale, B, H, N, D, padded_N, stride_b, stride_h,
+                                     stride_n, stream);
             break;
         case 1:
-            launch_typed<__half>(v, out, scale, B, H, N, D, padded_N, stride_b, stride_h, stride_n,
-                                 stream);
+            launch_quant_arch<__half>(v, out, scale, B, H, N, D, padded_N, stride_b, stride_h,
+                                      stride_n, stream);
             break;
         case 2:
-            launch_typed<__bf16>(v, out, scale, B, H, N, D, padded_N, stride_b, stride_h, stride_n,
-                                 stream);
+            launch_quant_arch<__bf16>(v, out, scale, B, H, N, D, padded_N, stride_b, stride_h,
+                                      stride_n, stream);
             break;
         default:
             throw std::runtime_error(

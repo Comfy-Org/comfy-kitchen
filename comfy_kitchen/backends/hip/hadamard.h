@@ -13,12 +13,19 @@
 // even index), which is the layout the iu4 A-fragment consumes directly.
 #pragma once
 
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+
+// True on the small RDNA3 iGPU (Radeon 780M, gfx1103) that the kernel-tuning
+// changes in this tree were measured on. dGPUs keep the upstream defaults:
+// several block-size and dispatch choices tuned against 6 WGPs are a
+// regression on 60-96 CU parts.
+#include "launchers.h"  // comfy_small_igpu
 
 namespace comfy::hip_backend {
 
@@ -86,6 +93,12 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
     // Empirical block-size tuning for K=10240 (640 over default).
     if (K == 10240) {
         return 640;
+    }
+    // K <= 4096: a 512-thread block (8 groups in flight) beats the 1024-thread
+    // default on the 6-WGP 780M, which halves occupancy on K=2048/2880 rows and
+    // leaves half the subgroups idle. dGPUs keep 1024.
+    if (comfy_small_igpu() && K <= 4096) {
+        return 512;
     }
     return 1024;
 }
@@ -656,12 +669,73 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
         scaleout[row] = scale;
     }
 
+    // Quantize the rotated row out of LDS with 8-wide (16-bit rows) or 4-wide
+    // (fp32 rows) vector chunks, packing the int8 into one 8/4-byte store so a
+    // warp writes 256B of a row per instruction instead of 64B.
+    //
+    // gfx1103 tuning (from the RMSNorm+RoPE rewrite). Device code cannot call
+    // the host-side comfy_small_igpu(), so the choice is the compile-time arch
+    // macro: __gfx1103__ is defined only in that target's device pass (the same
+    // way CMake spells its arch conditions), and every other target -- including
+    // the host pass of a gfx1103 build, which never emits this body -- takes the
+    // upstream scalar loop.
+#if defined(__gfx1103__)
+    constexpr int kVec = sizeof(RowT) == 2 ? 8 : 4;
+    const bool vec_ok = (K % kVec) == 0;
+    if (vec_ok) {
+        const int chunks = K / kVec;
+        for (int c = tid; c < chunks; c += BLOCK_THREADS) {
+            const int col = c * kVec;
+            const RowT* rp = row_buf + col;
+            uint4 v;
+            if constexpr (sizeof(RowT) == 2) {
+                v = *reinterpret_cast<const uint4*>(rp);
+            } else {
+                const float4 f = *reinterpret_cast<const float4*>(rp);
+                v.x = __float_as_uint(f.x);
+                v.y = __float_as_uint(f.y);
+                v.z = __float_as_uint(f.z);
+                v.w = __float_as_uint(f.w);
+            }
+            if constexpr (sizeof(RowT) == 2) {
+                const RowT* elems = reinterpret_cast<const RowT*>(&v);
+                int64_t pack = 0;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float fv = load_row_value(elems[i]);
+                    int q = static_cast<int>(rintf(fv * inv));
+                    q = q < -127 ? -127 : (q > 127 ? 127 : q);
+                    pack |= static_cast<int64_t>(static_cast<uint8_t>(q)) << (8 * i);
+                }
+                *reinterpret_cast<int64_t*>(qout + row_offset + col) = pack;
+            } else {
+                const float* fp = reinterpret_cast<const float*>(&v);
+                int32_t pack = 0;
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    int q = static_cast<int>(rintf(fp[i] * inv));
+                    q = q < -127 ? -127 : (q > 127 ? 127 : q);
+                    pack |= static_cast<int32_t>(static_cast<uint8_t>(q)) << (8 * i);
+                }
+                *reinterpret_cast<int32_t*>(qout + row_offset + col) = pack;
+            }
+        }
+    } else {
+        for (int col = tid; col < K; col += BLOCK_THREADS) {
+            const float v = load_row_value(row_buf[col]);
+            int q = static_cast<int>(rintf(v * inv));
+            q = q < -127 ? -127 : (q > 127 ? 127 : q);
+            qout[row_offset + col] = static_cast<int8_t>(q);
+        }
+    }
+#else
     for (int col = tid; col < K; col += BLOCK_THREADS) {
         const float v = load_row_value(row_buf[col]);
         int q = static_cast<int>(rintf(v * inv));
         q = q < -127 ? -127 : (q > 127 ? 127 : q);
         qout[row_offset + col] = static_cast<int8_t>(q);
     }
+#endif
 }
 
 template <typename RowT, int ACT, int BLOCK_THREADS>

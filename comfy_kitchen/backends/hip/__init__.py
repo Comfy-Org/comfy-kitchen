@@ -14,6 +14,7 @@ AdaLN and RMS-AdaLN, the quantizers, stochastic rounding, the AWQ GEMV) and
 declines the GEMMs, which fall through to triton/eager.
 """
 import functools
+import importlib.machinery
 import importlib.util
 import json
 import logging
@@ -122,9 +123,15 @@ _EXT_ERROR = None
 
 try:
     _dir = os.path.dirname(__file__)
+    # Only consider suffixes this interpreter can actually load. A stale
+    # cross-platform artifact (a Windows .pyd left in the tree by a cross build)
+    # is otherwise picked up by listdir order, and spec_from_file_location then
+    # returns None for it, which used to surface as a bare AttributeError below
+    # and left the backend silently disabled.
+    _ext_suffixes = tuple(importlib.machinery.EXTENSION_SUFFIXES)
     _module_path = None
-    for _fn in os.listdir(_dir):
-        if _fn.startswith("_C.") and _fn.endswith((".so", ".pyd")):
+    for _fn in sorted(os.listdir(_dir)):
+        if _fn.startswith("_C.") and _fn.endswith(_ext_suffixes):
             _module_path = os.path.join(_dir, _fn)
             break
 
@@ -132,6 +139,8 @@ try:
         _EXT_ERROR = "HIP extension not built (no _C module in backends/hip)"
     else:
         _spec = importlib.util.spec_from_file_location("comfy_kitchen.backends.hip._C", _module_path)
+        if _spec is None or _spec.loader is None:
+            raise ImportError(f"no extension loader for {_module_path}")
         _C = importlib.util.module_from_spec(_spec)
         sys.modules["comfy_kitchen.backends.hip._C"] = _C
         _spec.loader.exec_module(_C)
@@ -154,6 +163,35 @@ def _gfx_arch(device: torch.device | int | None = None) -> str | None:
         return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
     except Exception:
         return None
+
+
+def _is_small_igpu(device: torch.device | int | None = None) -> bool:
+    """True on the small RDNA3 iGPU (Radeon 780M, gfx1103) whose 6-WGP tuning
+    this tree carries. dGPUs keep the upstream schedules: several block-size
+    and dispatch choices measured here are a regression on 60-96 CU parts.
+
+    Resolved for ``device`` (defaulting to the current device) and cached per
+    device index (matching the C++ comfy_small_igpu), so a mixed iGPU + dGPU box
+    answers for the device a tensor actually lives on, not whichever was current
+    the first time this ran.
+    """
+    if not torch.cuda.is_available() or not getattr(torch.version, "hip", None):
+        return False
+    if device is None:
+        index = torch.cuda.current_device()
+    elif isinstance(device, int):
+        index = device
+    else:
+        index = device.index
+        if index is None:
+            return False
+    return _is_small_igpu_index(index)
+
+
+@functools.lru_cache(maxsize=None)
+def _is_small_igpu_index(index: int) -> bool:
+    arch = _gfx_arch(index)
+    return arch is not None and arch == "gfx1103"
 
 
 @functools.lru_cache(maxsize=1)
@@ -675,7 +713,7 @@ def fp16_linear(
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """FP16 WMMA GEMM with bias and an optional ``residual + residual_scale * out``
+    """FP16/BF16 WMMA GEMM with bias and an optional ``residual + residual_scale * out``
     fused into the epilogue; torch's linear where the kernel declines the shape."""
     if residual is not None and residual_scale is None:
         raise ValueError("fp16_linear: residual requires residual_scale")
@@ -686,8 +724,8 @@ def fp16_linear(
     n, k = weight.shape
 
     supported = (
-        x.dtype == torch.float16
-        and weight.dtype == torch.float16
+        x.dtype in (torch.float16, torch.bfloat16 if _is_small_igpu(x.device) else torch.float16)
+        and weight.dtype == x.dtype
         and weight.device == x.device
         and x_2d.shape[1] == k
         # the tile stager issues 16-byte row loads; a misaligned view falls back, as on CUDA
@@ -701,28 +739,44 @@ def fp16_linear(
         supported = weight.data_ptr() % 16 == 0
     if not supported:
         # the kernel path takes bias and residual from any device, so the fallback must too
-        bias = None if bias is None else bias.to(device=x.device)
+        # torch's linear needs the bias in the input dtype (addmm requires compatible
+        # operand dtypes), so cast a non-matching bias here; the kernel path keeps it
+        # as the caller's FP16.
+        bias = None if bias is None else bias.to(device=x.device, dtype=x.dtype)
         if residual is not None:
             residual = residual.to(device=x.device)
             residual_scale = residual_scale.to(device=x.device)
         out = torch.nn.functional.linear(x, weight, bias)
         return _apply_residual(out, residual, residual_scale)
 
-    out = torch.empty((m, n), dtype=torch.float16, device=x.device)
+    out = torch.empty((m, n), dtype=x.dtype, device=x.device)
     bias_arg = None if bias is None else _vector_operand(bias, x.device, torch.float16)
     resid_arg = rscale_arg = None
     if residual is not None:
         resid_arg = residual.to(device=x.device).reshape(m, n).contiguous()
         rscale_arg = _vector_operand(residual_scale, x.device, torch.float16)
-    served = _C.fp16_gemm(
-        _dl(x_2d), _dl(weight), _dl(out),
-        None if bias_arg is None else _dl(bias_arg),
-        None if rscale_arg is None else _dl(rscale_arg),
-        None if resid_arg is None else _dl(resid_arg),
-        m, n, k, _stream(x),
-    )
+    if x.dtype == torch.float16:
+        served = _C.fp16_gemm(
+            _dl(x_2d), _dl(weight), _dl(out),
+            None if bias_arg is None else _dl(bias_arg),
+            None if rscale_arg is None else _dl(rscale_arg),
+            None if resid_arg is None else _dl(resid_arg),
+            m, n, k, _stream(x),
+        )
+    else:
+        served = _C.bf16_gemm(
+            _dl(x_2d), _dl(weight), _dl(out),
+            None if bias_arg is None else _dl(bias_arg),
+            None if rscale_arg is None else _dl(rscale_arg),
+            None if resid_arg is None else _dl(resid_arg),
+            m, n, k, _stream(x),
+        )
     if not served:
-        out = _apply_residual(torch.nn.functional.linear(x_2d, weight, bias_arg), resid_arg,
+        # The GEMM declined the shape; torch's linear needs the bias in the input
+        # dtype (addmm requires compatible operand dtypes), so cast the FP16 bias
+        # here while keeping it FP16 on the kernel path.
+        bias_fb = None if bias_arg is None else bias_arg.to(dtype=x.dtype)
+        out = _apply_residual(torch.nn.functional.linear(x_2d, weight, bias_fb), resid_arg,
                               rscale_arg)
     return out if len(orig_shape) == 2 else out.reshape(*orig_shape[:-1], n)
 
@@ -2678,9 +2732,22 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ),
         "fp16_linear": FunctionConstraints(
             params={
-                "x": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(MinDims(2),)),
+                # bf16 only on the gfx1103 iGPU, whose fp16_linear runs a bf16
+                # GEMM path; dGPUs declare the upstream fp16-only envelope so
+                # registry dispatch never routes bf16 here.
+                "x": ParamConstraint(
+                    dtypes=frozenset(
+                        {torch.float16, torch.bfloat16} if _is_small_igpu()
+                        else {torch.float16}
+                    ),
+                    shape_rules=(MinDims(2),),
+                ),
                 "weight": ParamConstraint(
-                    dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(2),)
+                    dtypes=(
+                        frozenset({torch.float16, torch.bfloat16}) if _is_small_igpu()
+                        else frozenset({torch.float16})
+                    ),
+                    shape_rules=(ExactDims(2),)
                 ),
                 "bias": ParamConstraint(dtypes=frozenset({torch.float16})),
                 "residual": ParamConstraint(dtypes=frozenset({torch.float16})),
@@ -2827,15 +2894,18 @@ _SAGE_KEY_GROUP = 16
 _SAGE_HEAD_DIMS = (64, 128, 256)
 
 
-def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool) -> int:
+def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool,
+                device: torch.device | int | None = None) -> int:
     """Keys per attention iteration.
 
-    Always 64. The CUDA backend widens this to 128 for long unmasked keys; the
-    wide tile is implemented here too and measures slower on RDNA, where V is
-    staged transposed and the tile doubles both LDS allocations at once. Kept as
-    a function because the choice belongs with the buffer padding it decides.
+    64 by default; 128 for long unmasked D128 sequences. Measured on the 6-WGP
+    780M, the wide tile is ~15% faster than the narrow one at head_dim=128 with
+    kv_len >= 2048 and no mask (D64 prefers 64; D256 has no LDS room for 128).
+    The kernel instantiates the matching tile from the runtime value, and the
+    K-scale buffer padding below uses the same choice, so the two stay in sync.
     """
-    del head_dim, kv_length, has_mask
+    if _is_small_igpu(device) and head_dim == 128 and kv_length >= 2048 and not has_mask:
+        return _SAGE_LARGE_CTA_K
     return _SAGE_CTA_K
 
 
@@ -3021,9 +3091,17 @@ def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
         "k_scale": torch.empty(
             batch, kv_heads, padded_k // _SAGE_KEY_GROUP, dtype=torch.float32, device=device
         ),
-        # V is stored transposed, [B * H * D, padded_K], with the tail zero filled.
+        # V is stored transposed, [B * H * D, padded_K], with the tail zero
+        # filled (pure-int8 path). On the gfx1103 iGPU the buffer is twice the
+        # int8 width: the int8 kernels read the first padded_K columns (int8
+        # stride), while the short-key direct path writes the fp16 transposed V
+        # over the full 2*padded_K byte width. dGPUs allocate the upstream
+        # single-width buffer (no direct path there).
         "v_int8": torch.empty(
-            batch * kv_heads * head_dim, padded_k, dtype=torch.int8, device=device
+            batch * kv_heads * head_dim,
+            padded_k * (2 if _is_small_igpu(q.device) else 1),
+            dtype=torch.int8,
+            device=device,
         ),
         "v_scale": torch.empty(batch * kv_heads * head_dim, dtype=torch.float32, device=device),
     }
@@ -3051,7 +3129,7 @@ def sage_int8_sdpa(
         batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q.device
     )
 
-    cta_k = _sage_cta_k(head_dim, k.shape[2], attn_mask is not None)
+    cta_k = _sage_cta_k(head_dim, k.shape[2], attn_mask is not None, q.device)
     buffers, anchor_indices = _sage_buffers(q, k, cta_k)
     _C.sage_sdpa(
         _dl(q),
@@ -3098,6 +3176,23 @@ def sage_int8_quantize(
         cta_k,
         DTYPE_TO_CODE[q.dtype],
         _stream(q),
+    )
+    # _sage_buffers allocates the V scratch [B*H_kv*D, 2*padded_k] on the iGPU so
+    # _C.sage_sdpa's direct fp16 transpose has the doubled width. The V quantizer
+    # packs rows at padded_k stride, so the first B*H_kv*D*padded_k elements are
+    # the contiguous single-width int8 V that sage_attend reads with a padded_k
+    # stride. Hand that single-width view to the packed form: the prequantized
+    # contract is a padded_k-wide row, and presenting the wider scratch would make
+    # the attention kernel read the second half of one row as the next.
+    batch, _, _, head_dim = q.shape
+    kv_heads = k.shape[1]
+    padded_k = -(-k.shape[2] // cta_k) * cta_k
+    v_rows = batch * kv_heads * head_dim
+    v_need = v_rows * padded_k
+    buffers["v_int8"] = (
+        buffers["v_int8"].reshape(-1)[:v_need].reshape(v_rows, padded_k)
+        if buffers["v_int8"].numel() > v_need
+        else buffers["v_int8"]
     )
     return buffers
 

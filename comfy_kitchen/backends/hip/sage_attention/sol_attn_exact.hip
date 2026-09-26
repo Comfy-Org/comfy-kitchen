@@ -122,7 +122,7 @@ __global__ __launch_bounds__(kThreads) void sol_exact_kernel(
             }
         }
         bmax = fmaxf(bmax, swap_half_wave(bmax));
-        const float alpha = exp2f(c_r - bmax);
+        const float alpha = hw_exp2(c_r - bmax);
         c_r = bmax;
         m_r = fmaxf(m_r, bmax);
 
@@ -135,7 +135,7 @@ __global__ __launch_bounds__(kThreads) void sol_exact_kernel(
             uint32_t packed[8];
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                packed[e] = prob_to_u8(exp2f(p_val[kt][e] - m_off));
+                packed[e] = prob_to_u8(hw_exp2(p_val[kt][e] - m_off));
                 li += packed[e];
             }
             p_frag[kt] = pack_prob_frag(packed, lane);

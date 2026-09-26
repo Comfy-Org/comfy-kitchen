@@ -112,6 +112,7 @@ def test_int8_attention_allocates_only_integer_8bit_scratch(monkeypatch):
     monkeypatch.setattr(torch, "empty", recording_empty)
     ck.int8_attention(q, k, v)
 
+    # Pure-int8 path: Q, K and V all quantized to int8 (V transposed).
     assert allocated_dtypes.count(torch.int8) == 3
     assert allocated_dtypes.count(torch.int32) == 1
     assert torch.float8_e4m3fn not in allocated_dtypes
