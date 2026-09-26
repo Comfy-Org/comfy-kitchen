@@ -17,6 +17,7 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 
 #ifdef COMFY_HAVE_CUTLASS
 
@@ -182,8 +183,162 @@ struct FusedInt8GemmResidual {
     }
 };
 
+namespace {
+
+// Parse an exact small non-negative integer from an env value; -1 when unset,
+// empty, or anything but digits (rejects "1junk" / " 1" / "1,2").
+int parse_forced_config_env() {
+    const char* v = std::getenv("COMFY_KITCHEN_FORCE_CUTLASS_INT8_CONFIG");
+    if (v == nullptr || *v == '\0') return -1;
+    int i = 0;
+    for (const char* p = v; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9' || i > 999) return -1;
+        i = i * 10 + (*p - '0');
+    }
+    return (i >= 0 && i <= 13) ? i : -1;
+}
+
+// Whether the given CUDA device is sm86 (GA102 consumer Ampere, e.g. RTX 3090 /
+// A6000 / A40). Cached per device: a multi-GPU box may mix arches, so the
+// first query must not decide for all of them.
+bool device_is_sm86() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    static bool cached[16] = {false};
+    static bool known[16] = {false};
+    if (dev < 0 || dev >= 16) {
+        cudaDeviceProp props;
+        return cudaGetDeviceProperties(&props, dev) == cudaSuccess
+            && props.major == 8 && props.minor == 6;
+    }
+    if (!known[dev]) {
+        cudaDeviceProp props;
+        cached[dev] = cudaGetDeviceProperties(&props, dev) == cudaSuccess
+            && props.major == 8 && props.minor == 6;
+        known[dev] = true;
+    }
+    return cached[dev];
+}
+
+}  // namespace
+
 int select_fused_int8_config(int m, int n, int k) {
+    // COMFY_KITCHEN_FORCE_CUTLASS_INT8_CONFIG=<int> forces a config index for
+    // benchmarking. Has no effect when unset or not an exact 0-13 integer.
+    static const int kForceConfig = parse_forced_config_env();
+    if (kForceConfig >= 0) return kForceConfig;
+
     if (k % 16 != 0) return 9;
+
+    // sm86 is the combination (84 SMs, 6MB L2, GDDR6) that makes StreamK lose
+    // at large M, and the Ada/Blackwell thresholds below pick the wrong tile.
+    if (device_is_sm86()) {
+        // sm86 heuristic refit from the 2026-09-04 14-cfg sweep on A6000
+        // (300W PL, 84 SMs, 6 MB L2, 768 GB/s GDDR6) against 30 shapes
+        // spanning LTX 2.5 (M=274..25900) and MiniMax H3 (M=53730..80666);
+        // see int8_autotune_sweep.py and a6000_int8_cfg_table.json. Margins
+        // in parentheses are (runner_up / best_ms). Avg regret vs all 38
+        // merged sweep shapes (Sep 4 + Aug 29 mid-M series): < 0.4%; worst
+        // remaining misses are sub-6% same-config thermal drift on the
+        // 300W PL card (cfg0<->cfg13 coin-flip bands).
+        //
+        // Sweep winners used to fit this table:
+        //     M        N      K    best  runner-up / margin
+        //     274    2048   2048    cfg7  cfg2  (1.011x)
+        //     274    8192   2048    cfg3  cfg2  (1.151x)
+        //     274    2048   8192    cfg2  cfg7  (1.049x)
+        //    1024    2048   2048    cfg12 cfg1  (1.003x)
+        //    1024    4096   4096    cfg12 cfg13 (1.121x)
+        //    1024    8192   2048    cfg12 cfg1  (1.018x)
+        //    1024   16384   4096    cfg12 cfg0  (1.025x)
+        //    1024    2048   8192    cfg12 cfg13 (1.042x)
+        //    1024    4096  16384    cfg12 cfg0  (1.115x)
+        //    1797    2048   2048    cfg1  cfg3  (1.090x)
+        //    1797    6144   2048    cfg1  cfg12 (1.010x)
+        //    1797   16384   2048    cfg0  cfg1  (1.045x)
+        //    1797    2048   8192    cfg1  cfg13 (1.129x)
+        //   25900    2048   4096    cfg13 cfg0  (1.039x)
+        //   25900    4096   2048    cfg13 cfg0  (1.003x)
+        //   25900    4096   4096    cfg13 cfg0  (1.043x)
+        //   25900    4096  16384    cfg0  cfg13 (1.063x)
+        //   25900   16384   4096    cfg0  cfg3  (1.173x)
+        //   53730    5376   7168    cfg13 cfg0  (1.020x)
+        //   53730    5376  14336    cfg13 cfg0  (1.034x)
+        //   53730   21504   5376    cfg0  cfg3  (1.204x)
+        //   53730   28672   5376    cfg0  cfg3  (1.195x)
+        //   74977    5376   7168    cfg0  cfg13 (1.001x; within noise)
+        //   74977    5376  14336    cfg13 cfg0  (1.001x; within noise)
+        //   74977   21504   5376    cfg0  cfg3  (1.193x)
+        //   74977   28672   5376    cfg0  cfg3  (1.196x)
+        //   80666    5376   7168    cfg0  cfg13 (1.107x)
+        //   80666    5376  14336    cfg0  cfg13 (1.134x)
+        //   80666   21504   5376    cfg0  cfg3  (1.194x)
+        //   80666   28672   5376    cfg0  cfg3  (1.194x)
+        //
+        // Patterns used to fit (avg regret vs the 30-point sweep: 0.004%):
+        //   * Tiny M (m <= 512): cfg7 for K<=4096, cfg2 for taller K, cfg3
+        //     for the wide-N low-K corner. (An earlier fit picked cfg9 here;
+        //     the Sep 4 sweep has cfg7 ahead by 13% at 274x2048x2048.)
+        //   * M in (512, 1024]: cfg12 (StreamK 128x128) wins every measured
+        //     shape — all six 1024-row winners are cfg12. The previous
+        //     K<=2048 cfg0/cfg1 split was fitted on Aug-29 margins that
+        //     flipped in this sweep.
+        //   * M in (1024, 2048]: K<=2048 -> cfg1 (cfg0 at n>=16384); tall K
+        //     -> cfg0 for n>=8192, cfg12 for medium N (4096..8192, measured
+        //     2048x4096x4096), cfg1 for narrow N. The previous rule sent
+        //     narrow-N tall-K here to cfg12 — measured +62% wrong at
+        //     1797x2048x8192.
+        //   * M > 2048, wide N (n > 8192): cfg0 dominates. Note "wide"
+        //     starts at 8192, not 4096: n=5376 at mid-M wants cfg13
+        //     (53730x5376x7168/14336 are cfg13 wins).
+        //   * M > 2048, narrow N: tall-K (m>=16384 & k>=16384) boosts cfg0
+        //     (measured 25900x4096x16384, +6.3%); otherwise StreamK 128x256
+        //     (cfg13) through the 25900 / 53730 / 74977 bands, cfg0 from
+        //     80666. The 74977x5376 winners were cfg0<->cfg13 ties (0.1%) on
+        //     Sep 4 and cfg13 by 3-6% on 2026-09-26; 80666x5376 was cfg0 by
+        //     11-13% on Sep 4 and a tie on 2026-09-26 — power-cap dependent.
+        //   * 2026-09-26 revalidation (300 W cap hit in 99% of samples, SM clock
+        //     1135-1660 MHz): rule matches the winner on 34/38 shapes, avg
+        //     regret 1.0% on both an sm_80-cubin and an sm86-native build; the
+        //     two builds agree within noise on every shape.
+
+        // --- Tiny-M band ------------------------------------------------
+        if (m <= 512) {
+            if (n >= 8192 && k <= 4096) return 3;   // small-M, wide-N, low-K
+            return k <= 4096 ? 7 : 2;               // small-M generic
+        }
+
+        // --- Small-M band (M <= 2048) -------------------------------------
+        if (m <= 1024) {
+            // 1024x2048x2048: plain 128x128 (cfg1) beats StreamK cfg12 by 13-15% in the
+            // 2026-09-26 revalidation (sm_80-cubin and sm86-native builds agree; K is
+            // too short for StreamK's split to pay). It was a 0.3% tie on Sep 4.
+            if (n <= 2048 && k <= 2048) return 1;
+            return 12;                     // every other measured 1024-row shape: cfg12
+        }
+        if (m <= 2048) {
+            if (k <= 2048) return n >= 16384 ? 0 : 1;  // 1797x16384x2048 vs 1797x2048x2048
+            // tall K: genuinely wide N -> cfg0; medium N (4096..8192) ->
+            // cfg12 (2048x4096x4096, Aug-29 sweep +1.6%, re-validated +16.6%);
+            // narrow N -> cfg1 (1797x2048x8192, +62% over cfg12)
+            if (n >= 8192) return 0;
+            return n >= 4096 ? 12 : 1;
+        }
+
+        // --- Mid/large-M (M > 2048) ---------------------------------------
+        if (n > 8192) return 0;            // wide-N: cfg0 dominates for m>2048
+        // (n=5376 at mid-M wants cfg13 — wide starts at 8192, not 4096)
+
+        // narrow-N:
+        //  - tall-K at m>=16384 boosts cfg0 (25900x4096x16384, +6.3%)
+        //  - otherwise StreamK 128x256 (cfg13) through m=65536, cfg0 beyond
+        if (m >= 16384 && k >= 16384) return 0;
+        // 2026-09-26 revalidation: the 74977x5376 band (K=7168/14336) is cfg13 by 3-6%
+        // in both builds (a 0.1% tie on Sep 4), so StreamK runs through ~78k rows;
+        // 80666x5376 stays cfg0 (cfg0 by 11-13% on Sep 4, a tie today).
+        if (m <= 78000) return 13;
+        return 0;
+    }
 
     const int64_t mn = int64_t(m) * n;
     if (n <= 24832) {
@@ -229,6 +384,10 @@ template <typename Launch>
 bool launch_fused_int8_heuristic(int m, int n, int k, Launch launch) {
     const int selected = wave_guard(m, n, select_fused_int8_config(m, n, k));
     if (launch(selected)) return true;
+    // When a config is forced, do NOT silently fall back to a different tile; let
+    // the caller see the failure so benchmarks are honest.
+    static const bool kForceConfig = parse_forced_config_env() >= 0;
+    if (kForceConfig) return false;
 
     static constexpr int aligned_fallbacks[] = {2, 12, 0, 13, 1, 6, 8, 7, 3, 4, 5};
     static constexpr int low_alignment_fallbacks[] = {9, 10, 11};
