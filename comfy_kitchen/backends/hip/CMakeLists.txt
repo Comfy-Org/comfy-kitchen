@@ -69,6 +69,10 @@ endfunction()
 
 _ck_make_arch_condition(COMFY_HIP_GFX11_CONDITION ${COMFY_HIP_WMMA_GFX11_ARCHS})
 _ck_make_arch_condition(COMFY_HIP_GFX12_CONDITION ${COMFY_HIP_WMMA_GFX12_ARCHS})
+# The 6-WGP small iGPU (780M) tuning is a gfx1103-only subset of wmma_gfx11, so it
+# gets its own manifest-generated device-pass macro rather than a hardcoded
+# defined(__gfx1103__) scattered in the sources.
+_ck_make_arch_condition(COMFY_HIP_GFX1103_CONDITION gfx1103)
 set(_CK_HIP_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${_CK_HIP_GENERATED_INCLUDE_DIR}")
 configure_file(

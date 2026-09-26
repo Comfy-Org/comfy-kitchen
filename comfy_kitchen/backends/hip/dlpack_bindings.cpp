@@ -1686,8 +1686,12 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
     // on the int8 path (the direct kernel reads 16-bit dtypes), and small self
     // attention keeps int8 so the prequantized split API stays bitwise equal.
     // The direct kernel is an iGPU extension of the upstream API.
+    const bool direct_dtype =
+        (input_dtype_code == 1 || input_dtype_code == 2) &&
+        (output_dtype_code == 1 || output_dtype_code == 2) &&
+        input_dtype_code == output_dtype_code;
     const bool use_direct =
-        igpu && !attn_mask.has_value() && input_dtype_code != 0 &&
+        igpu && !attn_mask.has_value() && direct_dtype &&
         ((head_dim == 64 && kv_len <= 2048 && !(qo_len == kv_len && kv_len <= 1024)) ||
          (head_dim == 128 && kv_len <= 256));
     if (use_direct) {
@@ -1698,10 +1702,21 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
         // dim must be contiguous), the transpose writes fp16 over the full V width
         // (buffer must be the 2x-wide gfx1103 layout), and o is written with 16-byte
         // stores.
-        require_dtype(q, input_dtype_code, input_dtype_code, kFn, "q");
-        require_dtype(k, input_dtype_code, input_dtype_code, kFn, "k");
-        require_dtype(v, input_dtype_code, input_dtype_code, kFn, "v");
-        require_dtype(o, input_dtype_code, input_dtype_code, kFn, "o");
+        require_dtype(q, 1, 2, kFn, "q");
+        require_dtype(k, 1, 2, kFn, "k");
+        require_dtype(v, 1, 2, kFn, "v");
+        // o is written at output_dtype_code (16-bit, same as the input on the
+        // direct path), so validate it against the output argument rather than
+        // silently ignoring it.
+        require_dtype(o, output_dtype_code, output_dtype_code, kFn, "o");
+        // The direct kernel writes o for every Q row and head, so o must have the
+        // [B, H_q, Lq, D] extent and enough capacity; sage_attend does the same.
+        require_len(o, static_cast<int64_t>(batch) * q_heads * qo_len * head_dim, kFn, "o");
+        if (o.ndim() != 4 || static_cast<int>(o.shape(0)) != batch ||
+            static_cast<int>(o.shape(1)) != q_heads || static_cast<int>(o.shape(2)) != qo_len ||
+            static_cast<int>(o.shape(3)) != head_dim) {
+            throw std::runtime_error(std::string(kFn) + ": o must be [B, H_q, Lq, D]");
+        }
         if (q.stride(3) != 1 || k.stride(3) != 1 || v.stride(3) != 1 || o.stride(3) != 1) {
             throw std::runtime_error(std::string(kFn) +
                                      ": the last dimension of q, k, v and o must be contiguous");

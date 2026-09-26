@@ -59,14 +59,14 @@ constexpr int kWave = 32;
 // port, so the substitution is a direct cut of the non-WMMA VALU work: the D64
 // int8 key-tile loop drops 1759 -> 1474 instructions.
 //
-// Restricted to the gfx1103 device pass (__gfx1103__ is only defined when the
-// compiler targets that arch): the equivalence was verified on gfx1103, which is
-// where it was measured, so every other target -- gfx1100/1102 dGPUs, gfx115x,
-// gfx12 -- keeps upstream's exp2f. This is the same arch gate the host-side
-// comfy_small_igpu() applies, just resolved at compile time because the choice
-// sits in device code.
+// Restricted to the gfx1103 device pass (COMFY_MMA_GFX1103 is generated from the
+// architecture manifest and defined only when the compiler targets gfx1103): the
+// equivalence was verified on gfx1103, which is where it was measured, so every
+// other target -- gfx1100/1102 dGPUs, gfx115x, gfx12 -- keeps upstream's exp2f.
+// This is the same arch gate the host-side comfy_small_igpu() applies, just
+// resolved at compile time because the choice sits in device code.
 __device__ __forceinline__ float hw_exp2(float x) {
-#if defined(__gfx1103__)
+#if defined(COMFY_MMA_GFX1103)
     return __builtin_amdgcn_exp2f(x);
 #else
     return exp2f(x);

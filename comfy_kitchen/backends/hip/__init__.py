@@ -730,7 +730,10 @@ def fp16_linear(
         supported = weight.data_ptr() % 16 == 0
     if not supported:
         # the kernel path takes bias and residual from any device, so the fallback must too
-        bias = None if bias is None else bias.to(device=x.device)
+        # torch's linear needs the bias in the input dtype (addmm requires compatible
+        # operand dtypes), so cast a non-matching bias here; the kernel path keeps it
+        # as the caller's FP16.
+        bias = None if bias is None else bias.to(device=x.device, dtype=x.dtype)
         if residual is not None:
             residual = residual.to(device=x.device)
             residual_scale = residual_scale.to(device=x.device)
@@ -760,7 +763,11 @@ def fp16_linear(
             m, n, k, _stream(x),
         )
     if not served:
-        out = _apply_residual(torch.nn.functional.linear(x_2d, weight, bias_arg), resid_arg,
+        # The GEMM declined the shape; torch's linear needs the bias in the input
+        # dtype (addmm requires compatible operand dtypes), so cast the FP16 bias
+        # here while keeping it FP16 on the kernel path.
+        bias_fb = None if bias_arg is None else bias_arg.to(dtype=x.dtype)
+        out = _apply_residual(torch.nn.functional.linear(x_2d, weight, bias_fb), resid_arg,
                               rscale_arg)
     return out if len(orig_shape) == 2 else out.reshape(*orig_shape[:-1], n)
 
