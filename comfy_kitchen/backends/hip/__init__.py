@@ -2,16 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """HIP backend for AMD Vega, RDNA, RDNA2, RDNA3/3.5 and RDNA4.
 
-Every matmul is a WMMA kernel compiled from the sources in this directory; the
-backend does not link or call hipBLAS/hipBLASLt.
+Every quantized matmul (fp8, int8, int4) is a tile kernel compiled from the
+sources in this directory and never reaches hipBLAS/hipBLASLt. Only the fp16
+linear and conv3d fall back to torch (rocBLAS/MIOpen), on devices without native
+WMMA and for shapes their kernels decline, chunked to _FALLBACK_SCRATCH_BYTES.
 
 RDNA3 (gfx11xx) and RDNA4 (gfx12xx) have matrix cores and get everything. Their
 fragment layouts differ, and RDNA3 has no fp8 WMMA, so it widens fp8 to bf16;
 see mma.h.
 
-Vega/GCN 5 (gfx90c), RDNA (gfx101x) and RDNA2 (gfx103x) emulate the same tile
-contract with vector arithmetic; gfx103x uses its packed int8 dot product. The
-attention kernels still require native WMMA fragment support.
+Vega/GCN 5 (gfx900, gfx906, gfx90c), RDNA (gfx101x) and RDNA2 (gfx103x) emulate
+the same tile contract with vector arithmetic; gfx103x uses its packed int8 dot
+product and gfx90x runs the wave32 tiles on its wave64. The GEMMs, NA3D, Sage
+INT8 and Sol attention all run on that software policy. Flash decode and the
+GatedDeltaNet decode need bf16 arithmetic, so they stay on native-WMMA parts.
 """
 import functools
 import importlib.util
@@ -175,18 +179,19 @@ def _visible_gfx_arches() -> tuple[str | None, ...]:
     return tuple(_gfx_arch(i) for i in range(torch.cuda.device_count()))
 
 
-# RDNA2 has no matrix cores; RDNA3/3.5 and RDNA4 do. This exact manifest is also
+# Vega, RDNA1 and RDNA2 have no matrix cores; RDNA3/3.5 and RDNA4 do. This exact
+# manifest is also
 # consumed by setup.py and CMake. Never infer support from a gfx prefix: a new
 # compiler-recognized target needs its WMMA policy reviewed before it is safe.
 _ARCH_MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "architectures.json")
 _ARCH_GROUPS = json.loads(
     pathlib.Path(_ARCH_MANIFEST_PATH).read_text(encoding="utf-8")
 )
-_ARCH_ELEMENTWISE_ONLY = frozenset(_ARCH_GROUPS["elementwise_only"])
+_ARCH_SOFTWARE_TILE = frozenset(_ARCH_GROUPS["software_tile"])
 _ARCH_WMMA_GFX11 = frozenset(_ARCH_GROUPS["wmma_gfx11"])
 _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
 _ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
-_ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
+_ARCH_SUPPORTED = _ARCH_SOFTWARE_TILE | _ARCH_WMMA
 
 # The attention kernels need a tiled-MMA policy. Validated gfx9/gfx10 targets
 # implement that policy in software; gfx11/gfx12 use native WMMA. The fp8 GEMM
@@ -1987,12 +1992,13 @@ def _rope(xq, xk, freqs_cis, split_half, inplace=False):
         if xk.dtype != xq.dtype:
             raise ValueError("xq and xk must have the same dtype")
 
-    arch = _gfx_arch(xq.device)
+    # The split-half kernel with half-precision frequencies fails eager parity on
+    # the software tile targets, so they take eager's path. Keyed on the manifest
+    # group rather than a gfx prefix, so every Vega and RDNA1/2 target is covered.
     if (
         split_half
         and freqs_cis.dtype != torch.float32
-        and arch is not None
-        and (arch == "gfx90c" or arch.startswith("gfx10"))
+        and _gfx_arch(xq.device) in _ARCH_SOFTWARE_TILE
     ):
         xq_result = _eager_rope.apply_rope_split_half1(xq, freqs_cis)
         xk_result = None if xk is None else _eager_rope.apply_rope_split_half1(xk, freqs_cis)
@@ -2384,7 +2390,7 @@ def _sink_pair(value):
 
 def _check_sol_args(sink_blocks, sink_q, topk_ratio, **tensors):
     """Shared by both HIP entries, since a caller may bypass the registry: the
-    registry rule plus a matrix-core check.
+    registry rule plus a tile-policy check.
 
     No device argument, unlike the CUDA entry's per-device compute-capability
     test. has_wmma() is the intersection over every visible device, so it is
@@ -3071,9 +3077,11 @@ def flash_attention_decode_is_available() -> bool:
     """Whether the BF16 decode attention kernel can run here.
 
     The kernel uses no matrix cores, so is_available() would be the natural
-    gate, but RDNA2 has no bf16 and a caller that asks it to run there builds
-    the KV cache in another dtype, which this kernel declines. has_wmma() marks
-    the line where bf16 arrives, the same line the CUDA backend draws at SM80.
+    gate, but Vega, RDNA1 and RDNA2 have no bf16 and a caller that asks it to run
+    there builds the KV cache in another dtype, which this kernel declines.
+    has_native_wmma() marks the line where bf16 arrives, the same line the CUDA
+    backend draws at SM80; has_wmma() is too wide, since it admits the software
+    tile targets.
     The attribute test catches an extension built before the kernel existed,
     which is otherwise an AttributeError at dispatch.
     """
@@ -3106,8 +3114,8 @@ def gated_delta_decode_is_available(key_head_dim: int = 128, value_head_dim: int
     """Whether the fused DeltaNet decode kernels can run here for these head dims.
 
     The kernels use no matrix cores, but they do use bf16 and fp16 arithmetic
-    throughout, so they draw the line where has_wmma() does, as the decode
-    attention kernel next door does.
+    throughout, so they draw the line where has_native_wmma() does, as the
+    decode attention kernel next door does.
     """
     if not has_native_wmma() or not hasattr(_C, "gated_delta_decode_fused"):
         return False

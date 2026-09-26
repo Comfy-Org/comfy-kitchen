@@ -7,7 +7,7 @@ import torch
 
 import comfy_kitchen as ck
 from comfy_kitchen.backends.eager.group_norm_pad3d import group_norm_silu_pad3d as eager_ref
-from tests.conftest import rel_err
+from tests.conftest import get_capable_backends, rel_err
 
 CL3D = torch.channels_last_3d
 
@@ -96,7 +96,10 @@ class TestGroupNormSiluPad3d:
         if not cuda_available:
             pytest.skip("CUDA required")
         x = torch.randn(1, 64, 3, 8, 8, dtype=torch.float16, device="cuda")
-        for backend in ("cuda", "eager"):
+        # every backend that serves the op here: cuda on NVIDIA, hip on ROCm, and eager
+        backends = get_capable_backends("group_norm_silu_pad3d", "cuda")
+        assert "eager" in backends
+        for backend in backends:
             for kwargs in ({}, {"out": torch.empty_like(x)}):
                 with ck.use_backend(backend), pytest.raises(ValueError, match="non-negative"):
                     ck.group_norm_silu_pad3d(x, None, None, 1, 0.0, (0, 0, 0, 0, -1), silu=False, **kwargs)

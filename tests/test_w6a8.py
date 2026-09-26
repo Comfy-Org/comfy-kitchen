@@ -6,10 +6,12 @@ plane, row width 3K/4). Eager is the reference; CUDA and Triton must decode bit-
 import pytest
 import torch
 
+import comfy_kitchen as ck
 from comfy_kitchen.backends import cuda as cuda_backend
 from comfy_kitchen.backends.eager import w4a8_int8 as eager_w4a8
+from comfy_kitchen.constraints import validate_function_call
 from comfy_kitchen.tensor import AsymW4A8Int8Layout, QuantizedTensor
-from tests.conftest import requires_cuda_backend
+from tests.conftest import get_capable_backends, requires_cuda_backend
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -149,9 +151,30 @@ class TestCudaBackend:
         assert rel_l2(got, ref) < 1e-5
 
 
+def _require_triton_w4a8(weight):
+    """Skip unless dispatch would send a W4A8 linear on this device to Triton.
+
+    The dequant helper is private, so calling it skips the registry: on ROCm it compiles
+    for architectures the Triton backend declines (gfx90x is rejected by Triton itself, and
+    on gfx10 the kernel runs but writes nothing), and those must not fail this test.
+    """
+    if "triton" not in get_capable_backends("w4a8_int8_linear", "cuda"):
+        pytest.skip("triton backend does not serve w4a8_int8_linear here")
+    q, s, c, _, _ = eager_w4a8.quantize_w4a8_int8_weight(weight, bits=6)
+    x = torch.empty(1, weight.shape[1], device=weight.device, dtype=weight.dtype)
+    check = validate_function_call(
+        ck.registry.get_constraints("triton", "w4a8_int8_linear"),
+        {"x": x, "qdata": q, "s_rel": s, "s_channel": c, "out_dtype": weight.dtype},
+        torch.cuda.get_device_capability(weight.device),
+    )
+    if not check.success:
+        pytest.skip(f"triton declines w4a8_int8_linear here: {check.failure_reason}")
+
+
 class TestTritonBackend:
     def test_dequant_is_bit_exact_with_eager(self, weight):
         triton_mod = pytest.importorskip("comfy_kitchen.backends.triton.w4a8_int8")
+        _require_triton_w4a8(weight)
         for bits in (4, 6):
             q, s, _c, _, cb = eager_w4a8.quantize_w4a8_int8_weight(weight, bits=bits)
             got = triton_mod._dequant_int4_grouped_to_int8(q, s, cb, 16)

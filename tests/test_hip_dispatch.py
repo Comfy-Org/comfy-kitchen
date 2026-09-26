@@ -24,7 +24,7 @@ _HIP_DIR = _ROOT / "comfy_kitchen" / "backends" / "hip"
 _HIP_CMAKE = _HIP_DIR / "CMakeLists.txt"
 _HIP_ARCH_MANIFEST = _HIP_DIR / "architectures.json"
 _HIP_BINDINGS = _HIP_DIR / "dlpack_bindings.cpp"
-_HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12")
+_HIP_ARCH_GROUP_NAMES = ("software_tile", "wmma_gfx11", "wmma_gfx12")
 
 
 def _architecture_groups() -> dict[str, list[str]]:
@@ -91,7 +91,7 @@ def test_scaled_mm_does_not_probe_hip_on_non_rocm_runtime(monkeypatch):
     ],
 )
 def test_hip_declines_unsupported_arch(arches):
-    """The backend registers for RDNA2/3/4 and nothing else."""
+    """The backend registers for the manifest's Vega and RDNA1-4 targets and nothing else."""
     assert hip_backend._unsupported_arch_reason(arches) is not None
 
 
@@ -247,7 +247,7 @@ def test_sage_native_entries_accept_validated_software_tile_arches():
     common = (_HIP_DIR / "sage_attention" / "sage_common.h").read_text(encoding="utf-8")
     groups = _architecture_groups()
 
-    assert "gfx1010" in groups["elementwise_only"]
+    assert "gfx1010" in groups["software_tile"]
     assert all("gfx1010" not in groups[group] for group in ("wmma_gfx11", "wmma_gfx12"))
     assert bindings.count("sage_require_supported_arch(") == 4  # definition plus entries
     assert "!sage_is_supported_arch(properties.gcnArchName)" in bindings
@@ -271,8 +271,44 @@ def test_hip_advertises_attention_with_any_tile_policy():
                "dequantize_int8_convrot_weight_dtype"):
         assert op in without
     # The fused W4A8 requantize is elementwise too: it packs weights and never
-    # reaches a matrix core, so RDNA2 must keep it.
+    # reaches a matrix core, so the software tile targets must keep it.
     assert "quantize_w4a8_int8_weight" in without
+
+
+class _ReachedRopeKernelError(Exception):
+    pass
+
+
+@pytest.mark.parametrize("arch", sorted(hip_backend._ARCH_SUPPORTED))
+@pytest.mark.parametrize("freqs_dtype", (torch.bfloat16, torch.float32))
+def test_split_half_rope_eager_fallback_covers_every_software_tile_arch(
+    monkeypatch, arch, freqs_dtype
+):
+    """Every software tile target, Vega included, takes eager's split-half path with
+    half-precision frequencies; WMMA targets and fp32 frequencies reach the kernel."""
+    eager_calls = []
+
+    def eager(x, freqs):
+        eager_calls.append(x)
+        return x
+
+    def kernel_path(*args):
+        raise _ReachedRopeKernelError
+
+    monkeypatch.setattr(hip_backend, "_gfx_arch", lambda device=None: arch)
+    monkeypatch.setattr(hip_backend._eager_rope, "apply_rope_split_half1", eager)
+    monkeypatch.setattr(hip_backend, "_rope_rows", kernel_path)
+
+    xq = torch.zeros(1, 2, 4, 8)
+    freqs = torch.zeros(1, 1, 4, 4, 2, 2, dtype=freqs_dtype)
+    fallback = arch in hip_backend._ARCH_SOFTWARE_TILE and freqs_dtype != torch.float32
+    if fallback:
+        hip_backend._rope(xq, None, freqs, split_half=True)
+        assert eager_calls == [xq]
+    else:
+        with pytest.raises(_ReachedRopeKernelError):
+            hip_backend._rope(xq, None, freqs, split_half=True)
+        assert eager_calls == []
 
 
 @pytest.mark.parametrize(
@@ -406,7 +442,7 @@ def test_architecture_manifest_is_unique_and_shared_by_setup_and_runtime():
     assert len(manifest_archs) == len(set(manifest_archs))
     assert tuple(manifest_archs) == namespace["SUPPORTED_HIP_ARCHS"]
     assert manifest_archs == namespace["DEFAULT_HIP_ARCHS"].split(";")
-    assert set(groups["elementwise_only"]) == hip_backend._ARCH_ELEMENTWISE_ONLY
+    assert set(groups["software_tile"]) == hip_backend._ARCH_SOFTWARE_TILE
     assert set(groups["wmma_gfx11"]) == hip_backend._ARCH_WMMA_GFX11
     assert set(groups["wmma_gfx12"]) == hip_backend._ARCH_WMMA_GFX12
     assert set(manifest_archs) == hip_backend._ARCH_SUPPORTED

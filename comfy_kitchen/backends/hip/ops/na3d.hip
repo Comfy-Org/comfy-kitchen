@@ -7,7 +7,8 @@
 // positions centered on it, shifted inward at grid boundaries; per causal axis it
 // attends the min(i+1, kernel_size) nearest previous positions.
 //
-// Flash-attention-2 style on the 16x16x16 WMMA: one wave covers 16 queries along
+// Flash-attention-2 style on the 16x16x16 tile (native WMMA on gfx11/gfx12, the
+// software policy on Vega, RDNA1 and RDNA2): one wave covers 16 queries along
 // W at a fixed (t, h) and sweeps that block's key span 16 keys at a time. Scores,
 // softmax state and the output accumulator stay in registers; LDS holds only the
 // transposed V tile and the probability tile.

@@ -28,11 +28,11 @@ function(_ck_read_arch_group output group_name)
     set(${output} "${_group}" PARENT_SCOPE)
 endfunction()
 
-_ck_read_arch_group(COMFY_HIP_ELEMENTWISE_ARCHS elementwise_only)
+_ck_read_arch_group(COMFY_HIP_SOFTWARE_TILE_ARCHS software_tile)
 _ck_read_arch_group(COMFY_HIP_WMMA_GFX11_ARCHS wmma_gfx11)
 _ck_read_arch_group(COMFY_HIP_WMMA_GFX12_ARCHS wmma_gfx12)
 set(COMFY_HIP_SUPPORTED_ARCHS
-    ${COMFY_HIP_ELEMENTWISE_ARCHS}
+    ${COMFY_HIP_SOFTWARE_TILE_ARCHS}
     ${COMFY_HIP_WMMA_GFX11_ARCHS}
     ${COMFY_HIP_WMMA_GFX12_ARCHS}
 )
@@ -71,7 +71,7 @@ _ck_make_arch_condition(COMFY_HIP_GFX11_CONDITION ${COMFY_HIP_WMMA_GFX11_ARCHS})
 _ck_make_arch_condition(COMFY_HIP_GFX12_CONDITION ${COMFY_HIP_WMMA_GFX12_ARCHS})
 set(_CK_HIP_WAVE64_VEGA_ARCHS)
 set(_CK_HIP_DOT4_ARCHS)
-foreach(_arch IN LISTS COMFY_HIP_ELEMENTWISE_ARCHS)
+foreach(_arch IN LISTS COMFY_HIP_SOFTWARE_TILE_ARCHS)
     if(_arch MATCHES "^gfx90")
         list(APPEND _CK_HIP_WAVE64_VEGA_ARCHS "${_arch}")
     endif()

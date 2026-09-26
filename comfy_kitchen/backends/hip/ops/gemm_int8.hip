@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// INT8 GEMM on WMMA (v_wmma_i32_16x16x16_iu8), gfx11 and gfx12. See mma.h.
+// INT8 GEMM on WMMA (v_wmma_i32_16x16x16_iu8) on gfx11 and gfx12, and on the software
+// tile policy (sdot4 on gfx103x) on Vega, RDNA1 and RDNA2. See mma.h.
 // C[M, N] = (A[M, K] @ B[N, K]^T) * scale_a[row] * scale_b[col] + bias
 #include <stdexcept>
 #include <string>

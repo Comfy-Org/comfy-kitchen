@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// ConvRot W4A4 on WMMA (iu4: 16x16x32 on gfx12, 16x16x16 on gfx11). See mma.h.
+// ConvRot W4A4 on WMMA (iu4: 16x16x32 on gfx12, 16x16x16 on gfx11), and on the
+// software tile policy on Vega, RDNA1 and RDNA2. See mma.h.
 //
 // out = (Aq[M, K/2] @ Wq[N, K/2]^T) * x_scale[row] * w_scale[col] + bias
 //

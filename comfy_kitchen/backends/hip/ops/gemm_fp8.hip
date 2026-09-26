@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // FP8 scaled GEMM on WMMA (v_wmma_f32_16x16x16_fp8_fp8 on gfx12; gfx11 has no
-// fp8 WMMA and widens the operands to bf16). See mma.h.
+// fp8 WMMA and widens the operands to bf16), and on the software tile policy on
+// Vega, RDNA1 and RDNA2. See mma.h.
 // C[M, N] = (A[M, K] @ B[N, K]^T) * scale_a * scale_b + bias
 #include <stdexcept>
 #include <string>

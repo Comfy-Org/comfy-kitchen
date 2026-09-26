@@ -46,7 +46,7 @@ from .tensor.w4a8_int8 import (
 if getattr(torch.version, "hip", None):
     from .backends import hip as _hip_backend
 
-    # The HIP backend registers only on a supported AMD device (RDNA2/3/3.5/4),
+    # The HIP backend registers only on a supported AMD device (Vega, RDNA1-4),
     # and advertises only the ops that device can run; prefer it where it registers.
     if registry.is_available("hip"):
         registry.set_priority(["hip", "cuda", "triton", "eager"])
@@ -211,7 +211,7 @@ def sol_attn(
 
 def sol_attn_is_available(device: torch.device | None = None) -> bool:
     """Whether the compiled Sol-Attn kernels can run on ``device``: the CUDA
-    backend on sm_80+, or the HIP backend on a GPU with matrix cores. The
+    backend on sm_80+, or the HIP backend on any validated AMD target. The
     per-call rules (bf16/fp16, head_dim 128, matching q/k/v) still apply."""
     if device is not None and device.type != "cuda":
         return False
@@ -219,7 +219,8 @@ def sol_attn_is_available(device: torch.device | None = None) -> bool:
         return False
     if getattr(torch.version, "hip", None):
         # torch.cuda is the ROCm API here; the HIP backend advertises sol_attn
-        # only on WMMA parts, so its registration is the answer
+        # only where a native or software tile policy runs, so its registration
+        # is the answer
         return registry.is_available("hip") and registry.get_constraints("hip", "sol_attn") is not None
     rules = registry.get_constraints("cuda", "sol_attn")
     ext = getattr(_cuda_backend, "_C", None)

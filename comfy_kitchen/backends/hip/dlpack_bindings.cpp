@@ -2142,7 +2142,8 @@ bool deltanet_conv_step(nb::ndarray<> proj, nb::ndarray<> conv_state, nb::ndarra
 }
 
 NB_MODULE(_C, m) {
-    m.doc() = "ComfyKitchen HIP backend native operations (RDNA2-RDNA4, WMMA on gfx11/gfx12)";
+    m.doc() = "ComfyKitchen HIP backend native operations (Vega, RDNA1-RDNA4; WMMA on gfx11/gfx12, "
+              "software tiles on gfx9/gfx10)";
     m.def("sol_attn_plan", &sol_attn_plan_py,
           "Workspace dims, slot byte offsets and total bytes for this shape and token budget",
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),

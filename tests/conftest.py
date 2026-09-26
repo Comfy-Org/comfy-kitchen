@@ -62,6 +62,38 @@ requires_cuda_backend = pytest.mark.skipif(
 )
 
 
+_INDUCTOR_PROBES: dict[int, str | None] = {}
+
+
+def inductor_unusable_reason(device: torch.device | str = "cuda") -> str | None:
+    """Why inductor cannot compile for ``device``, or None when it can. Cached per device.
+
+    Inductor lowers to Triton, and Triton's ROCm backend does not serve every GPU
+    PyTorch runs on: on gfx90x it fails to build the kernel, and on gfx10 it has been
+    seen to build one that writes nothing. A probe finds both, where an architecture
+    list would go stale as Triton adds or fixes targets.
+    """
+    index = torch.device(device).index
+    index = torch.cuda.current_device() if index is None else index
+    if index not in _INDUCTOR_PROBES:
+        import torch._dynamo as dynamo
+
+        x = torch.arange(64, device=f"cuda:{index}", dtype=torch.float32)
+        try:
+            with torch.cuda.device(index):
+                got = torch.compile(lambda t: t * 2 + 1, backend="inductor")(x)
+                torch.cuda.synchronize()
+            ok = torch.equal(got, x * 2 + 1)
+            reason = None if ok else "inductor output is wrong"
+        except Exception as e:  # compile failures surface as assorted exception types
+            reason = f"inductor failed to compile: {type(e).__name__}"
+        finally:
+            dynamo.reset()
+        arch = getattr(torch.cuda.get_device_properties(index), "gcnArchName", "")
+        _INDUCTOR_PROBES[index] = reason and f"{reason} on {arch.split(':')[0] or f'cuda:{index}'}"
+    return _INDUCTOR_PROBES[index]
+
+
 @pytest.fixture(scope="session")
 def cuda_available():
     return torch.cuda.is_available()

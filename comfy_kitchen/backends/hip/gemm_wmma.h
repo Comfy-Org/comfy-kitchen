@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Tiled WMMA GEMM core, shared by the fp8, int8, int4 and fp16 paths and the fp16
-// conv3d on both gfx11 and gfx12.
+// conv3d on both gfx11 and gfx12, and by the quantized paths on the software tile
+// policy (Vega, RDNA1, RDNA2). The fp16 paths are routed to torch there instead.
 //
 // Computes C[M, N] = epilogue(A[M, K] @ B[N, K]^T). The B operand is the weight
 // in its natural (N, K) row-major form, matching torch linear. C is written with

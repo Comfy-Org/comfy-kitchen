@@ -10,8 +10,9 @@
 //   exact       walk each routed list, then the token list, resuming the softmax
 // Entry paths: `launch_sol_attn` (post-rope q/k/v) or the chunked producer
 // (`sol_producer_begin/chunk`, then `launch_sol_attn_core`). Tensors are
-// (B, T, H, 128) bf16 or fp16 (the chunked producer takes bf16 only) and the
-// kernels need WMMA, so gfx11 and gfx12 only.
+// (B, T, H, 128) bf16 or fp16 (the chunked producer takes bf16 only). The
+// kernels need the 16x16 tile contract: native WMMA on gfx11 and gfx12, the
+// software policy in mma.h on Vega, RDNA1 and RDNA2.
 //
 // The workspace carve-up matches the CUDA backend's sol_attn.cu slot for slot, so
 // the Python layer reads the same plan. What the slots CONTAIN differs by the two

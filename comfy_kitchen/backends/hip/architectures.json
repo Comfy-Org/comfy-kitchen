@@ -1,5 +1,5 @@
 {
-  "elementwise_only": [
+  "software_tile": [
     "gfx900",
     "gfx906",
     "gfx90c",

@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// WMMA policies for RDNA3 (gfx11) and RDNA4 (gfx12), wave32.
+// WMMA policies for RDNA3 (gfx11) and RDNA4 (gfx12), wave32, and a software policy
+// with the same fragment contract for Vega, RDNA1 and RDNA2; see the #else branch.
 //
 // A policy holds the operand fragment type, the bytes of a K-row one MMA
 // consumes (kStepBytes), the LDS read, and the MMA. The tile kernels stay
@@ -71,8 +72,9 @@ __forceinline__ __device__ T wave_reduce_sum(T v) {
 
 // Four int8 products accumulated into a 32-bit sum, the operands packed one per
 // byte. RDNA3/4 spell it v_dot4_i32_iu8 with both operands marked signed; RDNA2
-// has the older v_dot4c_i32_i8 under a different builtin, and the host pass has
-// neither, so both fall back to the arithmetic the instruction performs.
+// has the older sdot4 under a different builtin (software_dot4_i8 uses it for the
+// tile policy), and Vega, RDNA1 and the host pass have neither, so everything but
+// WMMA targets falls back here to the arithmetic the instruction performs.
 __forceinline__ __device__ int dot4_i8(int a, int b, int c) {
 #if defined(COMFY_HAS_WMMA)
     return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
@@ -487,9 +489,15 @@ struct MmaInt8 {
         return load_frag_b128(lds, row, kbyte, stride);
     }
     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+    // Callers pad their LDS rows by 8 bytes off gfx11, a pad sized for gfx12's 8-byte
+    // fragments, so the row is only 8-byte aligned here. One b128 read of it is
+    // misaligned, which gfx101x's LDS answers wrongly, and only now and then, in WGP
+    // mode (LLVM's lds-misaligned-bug); two b64 reads are always naturally aligned.
     static __forceinline__ __device__ Frag load_aligned(const void* lds, int row, int kbyte,
                                                         int stride, int) {
-        return load_frag_b128_aligned(lds, row, kbyte, stride);
+        const v2i lo = load_frag_b64(lds, row, kbyte, stride);
+        const v2i hi = load_frag_b64(lds, row, kbyte + 8, stride);
+        return Frag{lo[0], lo[1], hi[0], hi[1]};
     }
     static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
         return software_mma(a, b, c, [] __device__(Frag av, Frag bv, int sum) {
