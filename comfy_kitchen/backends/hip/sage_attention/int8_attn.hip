@@ -28,8 +28,8 @@
 
 namespace comfy::hip_backend::sage {
 
-// Mirrors MaskMode in the CUDA backend's attn_utils.cuh.
-enum class MaskMode { kNone = 0, kCustom = 2 };
+// Prepared masks use HIP's 64-key tiles, independently of CUDA's layout.
+enum class MaskMode { kNone = 0, kCustom = 2, kPreparedKey = 4 };
 
 namespace {
 
@@ -98,6 +98,35 @@ __forceinline__ __device__ bool mask_keep(const void* mask, int64_t offset, int 
     return true;
 }
 
+// Preprocess once per key row, rather than reloading and decoding the mask for
+// every query. A finite descriptor is a constant bias, -inf is an empty tile,
+// and +inf marks a mixed tile. Use bit tests: this TU enables fast-math.
+__global__ void prepare_key_mask_kernel(
+    const void* mask, float* packed, int kv_len, int64_t stride_b, int64_t stride_h,
+    int64_t stride_k, int dtype_code, int packed_width) {
+    constexpr int tile_k = 64;
+    __shared__ float biases[tile_k];
+    const int lane = threadIdx.x;
+    const int key = blockIdx.x * tile_k + lane;
+    const int tiles = gridDim.x;
+    const int64_t row = static_cast<int64_t>(blockIdx.z) * stride_b +
+                        static_cast<int64_t>(blockIdx.y) * stride_h;
+    float bias = 0.0f;
+    const bool keep = key < kv_len && mask_keep(mask, row + key * stride_k, dtype_code, bias);
+    bias = keep ? bias : __uint_as_float(0xff800000u);
+    biases[lane] = bias;
+    float* out = packed + (static_cast<int64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * packed_width;
+    out[key] = bias;
+    __syncthreads();
+    if (lane == 0) {
+        bool constant = true;
+        for (int i = 1; i < tile_k; ++i) {
+            constant = constant && __float_as_uint(biases[i]) == __float_as_uint(biases[0]);
+        }
+        out[tiles * tile_k + blockIdx.x] = constant ? biases[0] : __uint_as_float(0x7f800000u);
+    }
+}
+
 template <int HD, int CTA_K, MaskMode kMask, typename OutT>
 __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
     const int8_t* __restrict__ q, const int8_t* __restrict__ k, const int8_t* __restrict__ v,
@@ -115,7 +144,8 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
     constexpr int DT = S::kDimTiles;
     constexpr int kStrideK = HD + kLdsPad;
     constexpr int kStrideV = CTA_K + kLdsPad;
-    constexpr bool kCustomMask = kMask == MaskMode::kCustom;
+    constexpr bool kPreparedKey = kMask == MaskMode::kPreparedKey;
+    constexpr bool kCustomMask = kMask != MaskMode::kNone;
 #if defined(COMFY_MMA_GFX12)
     constexpr bool kBiasPV = HD == 128 && !kCustomMask;
 #else
@@ -146,6 +176,12 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
     const int batch = blockIdx.z;
     const int num_qo_heads = gridDim.y;
     const int kv_head = head / num_kv_groups;
+    const float* key_mask = nullptr;
+    if constexpr (kPreparedKey) {
+        key_mask = static_cast<const float*>(mask) +
+                   static_cast<int64_t>(batch) * mask_stride_b +
+                   static_cast<int64_t>(head) * mask_stride_h;
+    }
 
     const int8_t* q_head = q + static_cast<int64_t>(batch) * q_stride_b +
                            static_cast<int64_t>(head) * q_stride_h;
@@ -210,7 +246,7 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
     // An interior tile has every key in bounds, so nothing needs testing per
     // element: its maximum comes off the INT32 accumulator and exp2 reads the
     // accumulator too, which keeps a tile of scaled scores out of registers. A
-    // custom mask has no interior.
+    // general custom mask has no interior; prepared constant tiles recover it.
     const int num_iters = (kv_len + CTA_K - 1) / CTA_K;
 
     // D256 keeps one code path: its output accumulator is 128 live floats, and
@@ -232,7 +268,7 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
 
     // `boundary` is a compile-time tag, so the interior instance carries no mask
     // test and no per-key bounds check at all.
-    auto run_iter = [&](auto boundary_tag, int iter) {
+    auto run_iter = [&](auto boundary_tag, int iter, float tile_bias = 0.0f) {
         constexpr bool kBoundary = decltype(boundary_tag)::value;
         const int kb0 = iter * CTA_K;
 
@@ -311,11 +347,10 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
             if constexpr (kBoundary) {
                 // Hoisted: only the key term varies per element, and eight live
                 // 64-bit addresses in the inner loop cost registers this kernel
-                // does not have. A key-only mask needs no separate instantiation:
-                // it arrives with mask_stride_q at zero, so the query term drops
-                // out here at runtime and the two kernels were byte-identical.
+                // does not have. Raw key-only masks have a zero query stride;
+                // prepared key masks already have compact per-key addressing.
                 int64_t mask_row = 0;
-                if constexpr (kCustomMask) {
+                if constexpr (kCustomMask && !kPreparedKey) {
                     mask_row = static_cast<int64_t>(batch) * mask_stride_b +
                                static_cast<int64_t>(head) * mask_stride_h +
                                static_cast<int64_t>(imin(q_idx, qo_len - 1)) * mask_stride_q;
@@ -331,10 +366,14 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
                             keep = keep && q_idx < qo_len;
                             if (keep) {
                                 float bias;
-                                keep = mask_keep(
-                                    mask,
-                                    mask_row + static_cast<int64_t>(key) * mask_stride_k,
-                                    mask_dtype_code, bias);
+                                if constexpr (kPreparedKey) {
+                                    keep = mask_keep(key_mask, key, 0, bias);
+                                } else {
+                                    keep = mask_keep(
+                                        mask,
+                                        mask_row + static_cast<int64_t>(key) * mask_stride_k,
+                                        mask_dtype_code, bias);
+                                }
                                 score += bias * kLog2e;
                             }
                             row_valid[fq] = row_valid[fq] || keep;
@@ -349,6 +388,7 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
                     for (int e = 0; e < 8; ++e) tile_m = fmaxf(tile_m, prob[fk][e]);
                 }
             } else {
+                if constexpr (kPreparedKey) row_valid[fq] = true;
                 tile_m = kMaskedScore;
 #pragma unroll
                 for (int fk = 0; fk < KT; ++fk) {
@@ -359,6 +399,7 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
                     }
                     tile_m = fmaxf(tile_m, static_cast<float>(key_max) * tile_scale_k[fk]);
                 }
+                if constexpr (kPreparedKey) tile_m += tile_bias * kLog2e;
             }
 
             // The tile maximum is shifted so exp2 fills the unsigned INT8 range.
@@ -396,7 +437,8 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
 #else
                 uint32_t packed[8];
 #endif
-                const float negative_m = -tile_m;
+                const float negative_m = !kBoundary && kPreparedKey
+                                             ? tile_bias * kLog2e - tile_m : -tile_m;
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
                     const float p =
@@ -469,9 +511,24 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
         }
     };
 
-    int iter = 0;
-    for (; iter < interior_iters; ++iter) run_iter(std::false_type{}, iter);
-    for (; iter < num_iters; ++iter) run_iter(std::true_type{}, iter);
+    if constexpr (kPreparedKey) {
+        for (int iter = 0; iter < num_iters; ++iter) {
+            const float tile_bias = key_mask[num_iters * CTA_K + iter];
+            const uint32_t bits = __float_as_uint(tile_bias);
+            if (bits == 0xff800000u) continue;
+            if constexpr (kSplitLoop) {
+                if ((bits & 0x7f800000u) != 0x7f800000u && sm_scale >= 0.0f) {
+                    run_iter(std::false_type{}, iter, tile_bias);
+                    continue;
+                }
+            }
+            run_iter(std::true_type{}, iter);
+        }
+    } else {
+        int iter = 0;
+        for (; iter < interior_iters; ++iter) run_iter(std::false_type{}, iter);
+        for (; iter < num_iters; ++iter) run_iter(std::true_type{}, iter);
+    }
 
     // The two half-waves summed different keys of the same query.
 #pragma unroll
@@ -532,6 +589,14 @@ void launch_one(const int8_t* q, const int8_t* k, const int8_t* v, OutT* o, cons
 
 using namespace comfy::hip_backend::sage;
 
+extern "C" void launch_sage_prepare_key_mask(
+    const void* mask, float* packed, int batch, int heads, int kv_len, int64_t stride_b,
+    int64_t stride_h, int64_t stride_k, int dtype_code, int packed_width, hipStream_t stream) {
+    const dim3 grid(div_ceil_host(kv_len, 64), heads, batch);
+    prepare_key_mask_kernel<<<grid, 64, 0, stream>>>(
+        mask, packed, kv_len, stride_b, stride_h, stride_k, dtype_code, packed_width);
+}
+
 extern "C" void launch_sage_int8_attn(
     const void* q, const void* k, const void* v, void* o, const void* q_scale,
     const void* k_scale, const void* v_scale, const void* mask, int64_t mask_stride_b,
@@ -588,7 +653,9 @@ extern "C" void launch_sage_int8_attn(
 
 #define SAGE_ATTN_MASK(HD)                                                                       \
     do {                                                                                         \
-        if (mask != nullptr) {                                                                   \
+        if (mask != nullptr && mask_dtype_code == 4) {                                           \
+            SAGE_ATTN_OUT(HD, MaskMode::kPreparedKey);                                            \
+        } else if (mask != nullptr) {                                                            \
             SAGE_ATTN_OUT(HD, MaskMode::kCustom);                                                \
         } else {                                                                                 \
             SAGE_ATTN_OUT(HD, MaskMode::kNone);                                                  \

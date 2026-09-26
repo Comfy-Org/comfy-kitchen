@@ -71,7 +71,7 @@ def _prepare_attn_mask(
     """Keep the expanded 4D mask or replace it with a packed 3D key mask."""
     # Preparation's extra allocation and launch usually lose on short key rows.
     # Keep this conservative cutoff; large query batches can break even earlier.
-    # See samples/benchmark_int8_attention_mask_cutoff.py for the measured paths.
+    # HIP paired measurements: benchmarks/hip_mask_attention.py.
     # Constant tiles of a per-key bias can share the unmasked integer softmax;
     # varying tiles retain every bias value in FP32.
     if (
@@ -84,17 +84,21 @@ def _prepare_attn_mask(
     mask_batch = 1 if attn_mask.stride(0) == 0 else attn_mask.shape[0]
     mask_heads = 1 if attn_mask.stride(1) == 0 else attn_mask.shape[1]
     compact_mask = attn_mask[:mask_batch, :mask_heads, :1, :]
-    tiles = (attn_mask.shape[-1] + LARGE_CTA_K - 1) // LARGE_CTA_K
+    # HIP retains its 64-key schedule and has its own prepared-mask layout.
+    tile_k = _hip_backend._SAGE_CTA_K if _hip_backend is not None else LARGE_CTA_K
+    backend = _hip_backend if _hip_backend is not None else _cuda_backend
+    wrap = backend._dl if _hip_backend is not None else backend._wrap_for_dlpack
+    tiles = (attn_mask.shape[-1] + tile_k - 1) // tile_k
     # Align each packed row for float2 loads in the attention kernel.
-    packed_width = ((tiles * (LARGE_CTA_K + 1) + 3) // 4) * 4
+    packed_width = ((tiles * (tile_k + 1) + 3) // 4) * 4
     packed = torch.empty(
         (mask_batch, mask_heads, packed_width),
         dtype=torch.float32,
         device=attn_mask.device,
     )
-    _cuda_backend._C.sage_prepare_key_mask(
-        _cuda_backend._wrap_for_dlpack(compact_mask),
-        _cuda_backend._wrap_for_dlpack(packed),
+    backend._C.sage_prepare_key_mask(
+        wrap(compact_mask),
+        wrap(packed),
         torch.cuda.current_stream(attn_mask.device).cuda_stream,
     )
     return packed
@@ -200,6 +204,7 @@ def _int8_attention_cuda(
     if not math.isfinite(attention_scale):
         raise ValueError(f"scale must be finite, got {attention_scale}")
 
+    attn_mask = _prepare_attn_mask(attn_mask, attention_scale)
     if _hip_backend is not None:
         output = _hip_backend.sage_int8_sdpa(
             q,
@@ -213,7 +218,6 @@ def _int8_attention_cuda(
 
     batch, q_heads, q_length, _ = q.shape
     _, kv_heads, kv_length, _ = k.shape
-    attn_mask = _prepare_attn_mask(attn_mask, attention_scale)
     cta_k = _select_cta_k(
         kernel_head_dim,
         kv_length,
@@ -322,6 +326,7 @@ def prequantize_int8_attention(
     if not math.isfinite(attention_scale):
         raise ValueError(f"scale must be finite, got {attention_scale}")
 
+    attn_mask = _prepare_attn_mask(attn_mask, attention_scale)
     if _hip_backend is not None:
         # The packed V row width follows this cta_k, so the value that packed the
         # buffers is the one that has to come back to attend over them. Taking the
@@ -346,7 +351,6 @@ def prequantize_int8_attention(
 
     batch, q_heads, q_length, _ = q.shape
     _, kv_heads, kv_length, _ = k.shape
-    attn_mask = _prepare_attn_mask(attn_mask, attention_scale)
     cta_k = _select_cta_k(
         kernel_head_dim,
         kv_length,

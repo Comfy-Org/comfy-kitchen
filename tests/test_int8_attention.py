@@ -12,7 +12,7 @@ import comfy_kitchen.sage_attention as sage_attention_module
 _CUDA_READY = torch.cuda.is_available() and ck.int8_attention_is_available()
 requires_int8_attention = pytest.mark.skipif(
     not _CUDA_READY,
-    reason="requires the CUDA extension on an INT8-attention-capable GPU",
+    reason="requires a CUDA or HIP extension on an INT8-attention-capable GPU",
 )
 
 
@@ -566,6 +566,9 @@ def test_int8_attention_prepared_key_bias(dtype, bias_kind, head_dim):
     if not getattr(torch.version, "hip", None):
         assert packed.cta_k == (64 if head_dim <= 64 else 128)
         assert packed.attn_mask.shape == (1, 1, 33928)
+    else:
+        assert packed.cta_k == 64
+        assert packed.attn_mask.shape == (1, 1, 34192)
     assert torch.equal(actual, direct)
     assert torch.isfinite(actual).all()
     if bias_kind == "fully_masked":
@@ -589,8 +592,7 @@ def test_int8_attention_prepared_mask_all_head_dimensions(head_dim):
         q, k.repeat_interleave(2, dim=1), v.repeat_interleave(2, dim=1), attn_mask=mask,
     )
 
-    if not getattr(torch.version, "hip", None):
-        assert packed.attn_mask.ndim == 3
+    assert packed.attn_mask.ndim == 3
     assert actual.shape == q.shape
     assert torch.isfinite(actual).all()
     assert torch.equal(actual, direct)
@@ -622,9 +624,10 @@ def test_int8_attention_prepared_key_mask_compile_and_graph():
 
 
 @requires_int8_attention
-def test_int8_attention_prepared_mask_nonfinite_entries():
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_int8_attention_prepared_mask_nonfinite_entries(dtype):
     q, k, v = _qkv(1, 4, 2, 65, 1153, 128)
-    mask = torch.zeros(1, 1, 1, 1153, device="cuda")
+    mask = torch.zeros(1, 1, 1, 1153, device="cuda", dtype=dtype)
     mask[..., :128] = torch.nan
     mask[..., 256:384] = torch.inf
     mask[..., -128:] = -torch.inf
@@ -637,8 +640,6 @@ def test_int8_attention_prepared_mask_nonfinite_entries():
 
 @requires_int8_attention
 def test_int8_attention_prepared_mask_releases_original():
-    if getattr(torch.version, "hip", None):
-        pytest.skip("prepared key masks are CUDA-specific")
     q, k, v = _qkv(1, 4, 2, 65, 1153, 128)
     mask = torch.zeros(1, 1, 1, k.shape[2], device="cuda")
     mask_ref = weakref.ref(mask)
@@ -653,3 +654,108 @@ def test_int8_attention_prepared_mask_releases_original():
     actual = ck.int8_attention_from_prequantized(packed)
     assert torch.count_nonzero(actual) > 0
     assert torch.equal(actual, expected)
+
+
+@requires_int8_attention
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("mask_shape", [(2, 1), (1, 4), (2, 4)])
+def test_int8_attention_prepared_bias_batch_head_strides(head_dim, mask_shape):
+    """Compact batch/head rows must keep independent tile biases and empty rows."""
+    torch.manual_seed(180)
+    q, k, v = _qkv(2, 4, 2, 129, 1153, head_dim)
+    mask_batch, mask_heads = mask_shape
+    storage = torch.empty(mask_heads, mask_batch, 1, 2306, device="cuda")
+    mask = storage.transpose(0, 1)[..., ::2]
+    keys = torch.arange(1153, device="cuda")
+    for batch in range(mask_batch):
+        for head in range(mask_heads):
+            mask[batch, head, 0] = ((keys // 64 + batch + head) % 5 - 2) * 3
+    mask[0, 0] = -torch.inf
+    # Skip full tiles, then visit a mixed tile containing only the final key.
+    mask[-1, -1, :, :-1] = -torch.inf
+    packed = ck.prequantize_int8_attention(q, k, v, attn_mask=mask)
+    assert packed.attn_mask.ndim == 3
+    assert packed.attn_mask.shape[:2] == mask_shape
+    actual = ck.int8_attention_from_prequantized(packed)
+    direct = ck.int8_attention(q, k, v, attn_mask=mask)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.float(), k.float().repeat_interleave(2, dim=1),
+        v.float().repeat_interleave(2, dim=1), attn_mask=mask,
+    )
+    assert torch.equal(actual, direct)
+    assert torch.isfinite(actual).all()
+    assert _nrmse(actual, expected) < 0.03
+    assert torch.count_nonzero(actual.masked_select((expected == 0).all(-1, keepdim=True))) == 0
+
+
+@requires_int8_attention
+@pytest.mark.parametrize("scale", [0.0, -0.125])
+@pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float32])
+def test_int8_attention_key_mask_nonpositive_scale(scale, mask_dtype):
+    torch.manual_seed(181)
+    q, k, v = _qkv(1, 4, 2, 129, 1153, 128)
+    mask = torch.arange(1153, device="cuda").reshape(1, 1, 1, -1) >= 256
+    if mask_dtype != torch.bool:
+        mask = torch.where(mask, torch.linspace(-3, 2, 1153, device="cuda"), -torch.inf)
+    packed = ck.prequantize_int8_attention(q, k, v, scale=scale, attn_mask=mask)
+    assert packed.attn_mask.ndim == 4
+    actual = ck.int8_attention_from_prequantized(packed)
+    direct = ck.int8_attention(q, k, v, scale=scale, attn_mask=mask)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.float(), k.float().repeat_interleave(2, dim=1),
+        v.float().repeat_interleave(2, dim=1), scale=scale, attn_mask=mask,
+    )
+    assert torch.equal(actual, direct)
+    assert _nrmse(actual, expected) < 0.03
+
+
+@requires_int8_attention
+@pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
+@pytest.mark.parametrize("invalid", ["input_dtype", "output_dtype", "width", "stride", "cpu"])
+def test_hip_prepare_key_mask_rejects_invalid_buffers(invalid):
+    hip = sage_attention_module._hip_backend
+    mask = torch.zeros(1, 1, 1, 1153, device="cuda")
+    width = ((19 * 65 + 3) // 4) * 4
+    output = torch.full((1, 1, width), 17.0, device="cuda")
+    if invalid == "input_dtype":
+        mask = mask.to(torch.uint8)
+    elif invalid == "output_dtype":
+        output = output.to(torch.float16)
+    elif invalid == "width":
+        output = output[..., :-1]
+    elif invalid == "stride":
+        output = torch.full((1, 1, width * 2), 17.0, device="cuda")[..., ::2]
+    else:
+        mask = mask.cpu()
+        output = output.cpu()
+    with pytest.raises(RuntimeError, match="sage_prepare_key_mask"):
+        hip._C.sage_prepare_key_mask(
+            hip._dl(mask), hip._dl(output), torch.cuda.current_stream().cuda_stream
+        )
+    assert torch.all(output == 17)
+
+
+@requires_int8_attention
+@pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
+@pytest.mark.parametrize("invalid", ["dtype", "width", "stride", "heads", "cpu"])
+def test_hip_attention_rejects_invalid_prepared_mask(invalid):
+    q, k, v = _qkv(1, 4, 2, 129, 1153, 128)
+    mask = torch.zeros(1, 1, 1, 1153, device="cuda")
+    packed = ck.prequantize_int8_attention(q, k, v, attn_mask=mask)
+    mask = packed.attn_mask
+    if invalid == "dtype":
+        mask = mask.to(torch.float16)
+    elif invalid == "width":
+        mask = mask[..., :-1]
+    elif invalid == "stride":
+        mask = mask.repeat_interleave(2, dim=-1)[..., ::2]
+    elif invalid == "heads":
+        mask = mask.expand(1, 3, -1).contiguous()
+    else:
+        mask = mask.cpu()
+    with pytest.raises(RuntimeError, match=r"prepared key mask|mask must be on q's ROCm device"):
+        sage_attention_module._hip_backend.sage_int8_attend(
+            packed.q, packed.k, packed.v, packed.q_scale, packed.k_scale, packed.v_scale,
+            attention_scale=packed.attention_scale, attn_mask=mask,
+            output_dtype=torch.bfloat16, cta_k=packed.cta_k,
+        )
