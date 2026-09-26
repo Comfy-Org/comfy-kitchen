@@ -1036,7 +1036,7 @@ def _int4_linear_via_int8_values(
 
     _log_int8_path_once(
         ("cublas_fallback", m, n, k),
-        f"cuBLAS fake-quant fallback (int8 tensor cores NOT used): M={m} N={n} K={k} "
+        f"cuBLAS INT8 GEMM (int32) + separate dequant kernel, unfused epilogue: M={m} N={n} K={k} "
         f"cutlass_disabled={_DISABLE_CUTLASS_INT8} sm_major={torch.cuda.get_device_capability(x_int8.get_device())[0]}",
     )
 
@@ -1619,11 +1619,11 @@ _CONVROT_FUSED_MAX_K = 16384
 _DISABLE_CUTLASS_INT8 = os.environ.get("COMFY_KITCHEN_DISABLE_CUTLASS", "0") == "1"
 
 # COMFY_KITCHEN_LOG_INT8_PATH=1 enables one-line-per-unique-shape logs so you can
-# see which INT8 GEMM path actually runs on your GPU (fused CUTLASS vs cuBLAS
-# fake-quant fallback vs separate quant+gemv). Falls silent by default. This is
-# the observability the "no speedup on sm_86" reports were missing: on Ampere,
-# hitting the cuBLAS fallback means int8 tensor cores never execute, so s/it is
-# bf16-identical.
+# see which INT8 GEMM path actually runs on your GPU (fused CUTLASS vs the cuBLAS
+# INT8 GEMM + separate dequant kernel vs quant+gemv). Falls silent by default.
+# This is the observability the "no speedup on sm_86" reports were missing: the
+# unfused cuBLAS path writes an int32 [M, N] intermediate to HBM and reads it
+# back in a second kernel, which silently eats most of the INT8 win on GA102.
 _LOG_INT8_PATH = os.environ.get("COMFY_KITCHEN_LOG_INT8_PATH", "0") == "1"
 _logger = logging.getLogger("comfy_kitchen.backends.cuda")
 _int8_path_logged: set[tuple] = set()
@@ -2298,7 +2298,7 @@ def int8_linear(
         # Fallback: cuBLAS int8 GEMM (int32) + separate dequant kernel.
         _log_int8_path_once(
             ("cublas_fallback_i8linear", m, n, k, convrot),
-            f"int8_linear cuBLAS fake-quant fallback (int8 tensor cores NOT used): "
+            f"int8_linear cuBLAS INT8 GEMM (int32) + separate dequant kernel, unfused epilogue: "
             f"M={m} N={n} K={k} convrot={convrot} "
             f"cutlass_disabled={_DISABLE_CUTLASS_INT8}",
         )

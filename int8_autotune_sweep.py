@@ -11,7 +11,9 @@ another neutral cwd so the installed wheel is picked up:
 
     cd /tmp && CUDA_VISIBLE_DEVICES=1 python /path/to/int8_autotune_sweep.py
 
-Writes results to a6000_int8_cfg_table.json with the schema:
+Writes results to comfy_kitchen/a6000_int8_cfg_table.json — the copy the runtime
+loader reads first and the wheel ships, so a sweep is never left out of a build —
+with the schema:
   {
     "device": "NVIDIA RTX A6000",
     "sm_version": "8.6",
@@ -46,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -75,7 +78,8 @@ if _C is None:
     sys.exit(1)
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_OUT = REPO_ROOT / "a6000_int8_cfg_table.json"
+# The packaged copy is what _int8_cfg_cache loads first and what the wheel ships.
+DEFAULT_OUT = REPO_ROOT / "comfy_kitchen" / "a6000_int8_cfg_table.json"
 
 # ---------------------------------------------------------------------------
 # Shapes actually observed in the wild (see probe_cutlass_sm86.py)
@@ -286,21 +290,22 @@ def main() -> None:
         # warns once when ComfyUI dispatches an M outside this range so users
         # know their workload has drifted from the tuning set.
         m_vals = [r["m"] for r in results.values()]
-        with args.out.open("w") as f:
-            json.dump(
-                {
-                    "device": props.name,
-                    "sm_version": f"{cap[0]}.{cap[1]}",
-                    "total_memory_mib": props.total_memory // (1024 * 1024),
-                    "warmup_iters": args.warmup,
-                    "timed_iters": args.iters,
-                    "m_min_swept": min(m_vals) if m_vals else None,
-                    "m_max_swept": max(m_vals) if m_vals else None,
-                    "shapes": results,
-                },
-                f,
-                indent=2,
-            )
+        payload = {
+            "device": props.name,
+            "sm_version": f"{cap[0]}.{cap[1]}",
+            "total_memory_mib": props.total_memory // (1024 * 1024),
+            "warmup_iters": args.warmup,
+            "timed_iters": args.iters,
+            "m_min_swept": min(m_vals) if m_vals else None,
+            "m_max_swept": max(m_vals) if m_vals else None,
+            "shapes": results,
+        }
+        # Write-then-rename so a process loading the table mid-sweep never sees a
+        # half-written file (the loader is one-shot per process).
+        tmp = args.out.with_name(args.out.name + ".tmp")
+        with tmp.open("w") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, args.out)
 
     # Summary table at the end
     print("\n=== SUMMARY ===")

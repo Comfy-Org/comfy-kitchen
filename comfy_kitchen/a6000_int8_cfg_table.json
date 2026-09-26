@@ -97,7 +97,7 @@
         "13": 0.06273024082183838
       },
       "best_cfg": 1,
-      "best_ms": 0.0539009033203125,
+      "best_ms": 0.05998591899871826,
       "revalidated": {
         "date": "2026-09-26",
         "previous_best_cfg": 12,
@@ -111,7 +111,8 @@
           "12": 0.06085980224609375,
           "1": 0.05287096557617187,
           "13": 0.06364139404296874
-        }
+        },
+        "best_ms_note": "best_cfg comes from the 2026-09-26 revalidation (median_ms_* below); best_ms is that config's timing in the original sweep so it stays comparable with per_cfg_ms"
       }
     },
     "1024x8192x2048": {
@@ -572,7 +573,7 @@
         "13": 29.5014599609375
       },
       "best_cfg": 13,
-      "best_ms": 27.598611684945915,
+      "best_ms": 29.5014599609375,
       "revalidated": {
         "date": "2026-09-26",
         "previous_best_cfg": 0,
@@ -586,7 +587,8 @@
           "0": 29.100740872896633,
           "13": 28.20158973106971,
           "3": 34.846325214092545
-        }
+        },
+        "best_ms_note": "best_cfg comes from the 2026-09-26 revalidation (median_ms_* below); best_ms is that config's timing in the original sweep so it stays comparable with per_cfg_ms"
       }
     },
     "74977x28672x5376": {

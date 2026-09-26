@@ -83,22 +83,34 @@ def _load() -> None:
     sm = data.get("sm_version", "")
     _cache_sm = sm or None
     shapes = data.get("shapes", {})
+    if not isinstance(shapes, dict):
+        _logger.warning("INT8 cfg cache %s: 'shapes' is not an object; ignoring the file", path)
+        return
     count = 0
+    skipped = 0
     for key, entry in shapes.items():
-        if not isinstance(entry, dict):
-            continue
-        best = entry.get("best_cfg")
+        # A malformed entry must never reach the inference path: skip it, don't raise.
+        best = entry.get("best_cfg") if isinstance(entry, dict) else None
         if best is None:
             continue
         try:
             m_s, n_s, k_s = key.split("x")
             m, n, k = int(m_s), int(n_s), int(k_s)
-        except ValueError:
+            cfg = int(best)
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        if cfg < 0:
+            skipped += 1
             continue
         # The sweep was run against bf16 (out_dtype_code=2). If we ever sweep
         # other dtypes, distinguish in the cache key. For now assume bf16.
-        _loaded[(m, n, k, 2)] = int(best)
+        # An index beyond the compiled config list is declined by the extension
+        # at launch, and the caller then falls back to the heuristic.
+        _loaded[(m, n, k, 2)] = cfg
         count += 1
+    if skipped:
+        _logger.warning("INT8 cfg cache %s: skipped %d malformed entries", path, skipped)
 
     _m_min_swept = data.get("m_min_swept")
     _m_max_swept = data.get("m_max_swept")

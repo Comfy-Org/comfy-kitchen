@@ -149,6 +149,33 @@ def _log_attn_once(key: tuple, message: str) -> None:
     _logger.warning("[int8_attn_path] %s", message)
 
 
+def _log_attention_config(
+    path: str,
+    q: torch.Tensor,
+    *,
+    batch: int,
+    q_heads: int,
+    kv_heads: int,
+    q_length: int,
+    kv_length: int,
+    original_head_dim: int,
+    kernel_head_dim: int,
+    cta_k: int,
+    has_mask: bool,
+) -> None:
+    """One diagnostic line per distinct (path, device, configuration). The key carries every
+    field the message prints, so the direct and prequantized paths, or two configurations that
+    share a shape, never suppress each other's line."""
+    device_index = q.device.index if q.device.index is not None else torch.cuda.current_device()
+    _log_attn_once(
+        (path, device_index, batch, q_heads, kv_heads, q_length, kv_length, original_head_dim,
+         kernel_head_dim, cta_k, has_mask),
+        f"int8_attention[{path}] cuda:{device_index}: B={batch} Hq={q_heads} Hkv={kv_heads} "
+        f"Sq={q_length} Skv={kv_length} D={original_head_dim} kernel_D={kernel_head_dim} "
+        f"cta_k={cta_k} has_mask={has_mask} cap={torch.cuda.get_device_capability(q.device)}",
+    )
+
+
 def _int8_attention_cuda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -194,11 +221,10 @@ def _int8_attention_cuda(
         kv_length,
         has_mask=attn_mask is not None,
     )
-    _log_attn_once(
-        (batch, q_heads, q_length, kv_length, kernel_head_dim, cta_k, attn_mask is not None),
-        f"int8_attention: B={batch} Hq={q_heads} Hkv={kv_heads} Sq={q_length} Skv={kv_length} "
-        f"D={original_head_dim} kernel_D={kernel_head_dim} cta_k={cta_k} has_mask={attn_mask is not None} "
-        f"cap={torch.cuda.get_device_capability(q.device)}",
+    _log_attention_config(
+        "direct", q, batch=batch, q_heads=q_heads, kv_heads=kv_heads, q_length=q_length,
+        kv_length=kv_length, original_head_dim=original_head_dim, kernel_head_dim=kernel_head_dim,
+        cta_k=cta_k, has_mask=attn_mask is not None,
     )
     padded_k_length = _pad_to_cta_k(kv_length, cta_k)
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
@@ -350,11 +376,10 @@ def prequantize_int8_attention(
         kv_length,
         has_mask=attn_mask is not None,
     )
-    _log_attn_once(
-        (batch, q_heads, q_length, kv_length, kernel_head_dim, cta_k, attn_mask is not None),
-        f"int8_attention: B={batch} Hq={q_heads} Hkv={kv_heads} Sq={q_length} Skv={kv_length} "
-        f"D={original_head_dim} kernel_D={kernel_head_dim} cta_k={cta_k} has_mask={attn_mask is not None} "
-        f"cap={torch.cuda.get_device_capability(q.device)}",
+    _log_attention_config(
+        "prequantize", q, batch=batch, q_heads=q_heads, kv_heads=kv_heads, q_length=q_length,
+        kv_length=kv_length, original_head_dim=original_head_dim, kernel_head_dim=kernel_head_dim,
+        cta_k=cta_k, has_mask=attn_mask is not None,
     )
     padded_k_length = _pad_to_cta_k(kv_length, cta_k)
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)

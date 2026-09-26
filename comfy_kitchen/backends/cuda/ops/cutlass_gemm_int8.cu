@@ -234,7 +234,9 @@ int select_fused_int8_config(int m, int n, int k) {
     // at large M, and the Ada/Blackwell thresholds below pick the wrong tile.
     if (device_is_sm86()) {
         // sm86 heuristic refit from the 2026-09-04 14-cfg sweep on A6000
-        // (300W PL, 84 SMs, 6 MB L2, 768 GB/s GDDR6) against 30 shapes
+        // (300W PL, 84 SMs, 6 MB L2, 768 GB/s GDDR6) against 30 shapes.
+        // The sweep times the no-bias bf16 epilogue only; the bias, residual,
+        // fp16 and fp32 variants share these picks unmeasured. Shapes below:
         // spanning LTX 2.5 (M=274..25900) and MiniMax H3 (M=53730..80666);
         // see int8_autotune_sweep.py and a6000_int8_cfg_table.json. Margins
         // in parentheses are (runner_up / best_ms). Avg regret vs all 38
@@ -387,12 +389,15 @@ int wave_guard(int m, int n, int selected) {
 
 template <typename Launch>
 bool launch_fused_int8_heuristic(int m, int n, int k, Launch launch) {
-    const int selected = wave_guard(m, n, select_fused_int8_config(m, n, k));
+    // COMFY_KITCHEN_FORCE_CUTLASS_INT8_CONFIG wins outright: neither the wave guard
+    // nor the fallback list may substitute another tile, so a forced config is
+    // exactly what runs (or fails) and benchmarks stay honest.
+    static const int kForcedConfig = parse_forced_config_env();
+    const int selected = kForcedConfig >= 0
+        ? kForcedConfig
+        : wave_guard(m, n, select_fused_int8_config(m, n, k));
     if (launch(selected)) return true;
-    // When a config is forced, do NOT silently fall back to a different tile; let
-    // the caller see the failure so benchmarks are honest.
-    static const bool kForceConfig = parse_forced_config_env() >= 0;
-    if (kForceConfig) return false;
+    if (kForcedConfig >= 0) return false;
 
     static constexpr int aligned_fallbacks[] = {2, 12, 0, 13, 1, 6, 8, 7, 3, 4, 5};
     static constexpr int low_alignment_fallbacks[] = {9, 10, 11};
