@@ -601,6 +601,18 @@ class TestTensorWiseINT8Layout:
                 assert torch.equal(out_row, ref_row.to(dtype))
                 assert torch.equal(out_conv, ref_conv.to(dtype))
 
+    def test_dequantize_one_element_scale_with_extra_dims_matches_eager(self, seed):
+        """A one-element scale with more dims than q broadcasts like eager."""
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
+
+        q = torch.randint(-128, 128, (3, 4, 32), dtype=torch.int8, device="cuda")
+        scale = torch.rand((1, 1, 1, 1), device="cuda") * 0.02
+
+        out = cuda.dequantize_int8_simple_dtype(q, scale, 2)
+
+        assert torch.equal(out, (q.float() * scale).to(torch.bfloat16))
+
     def test_public_api_int8_linear(self, seed):
         """comfy_kitchen.int8_linear op is reachable."""
         import comfy_kitchen as ck

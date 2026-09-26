@@ -1595,7 +1595,7 @@ def dequantize_int8_simple_dtype(q: torch.Tensor, scale: torch.Tensor, output_dt
 
     scale_mode = -1
     inner_dim = q.shape[-1] if q.dim() > 0 else 1
-    if scale.numel() == 1:
+    if scale.numel() == 1 and scale.dim() <= q.dim():
         scale_mode = 0
     elif tuple(scale.shape) == tuple(q.shape):
         scale_mode = 1
