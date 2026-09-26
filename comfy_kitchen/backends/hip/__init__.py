@@ -3168,6 +3168,23 @@ def sage_int8_quantize(
         DTYPE_TO_CODE[q.dtype],
         _stream(q),
     )
+    # _sage_buffers allocates the V scratch [B*H_kv*D, 2*padded_k] on the iGPU so
+    # _C.sage_sdpa's direct fp16 transpose has the doubled width. The V quantizer
+    # packs rows at padded_k stride, so the first B*H_kv*D*padded_k elements are
+    # the contiguous single-width int8 V that sage_attend reads with a padded_k
+    # stride. Hand that single-width view to the packed form: the prequantized
+    # contract is a padded_k-wide row, and presenting the wider scratch would make
+    # the attention kernel read the second half of one row as the next.
+    batch, _, _, head_dim = q.shape
+    kv_heads = k.shape[1]
+    padded_k = -(-k.shape[2] // cta_k) * cta_k
+    v_rows = batch * kv_heads * head_dim
+    v_need = v_rows * padded_k
+    buffers["v_int8"] = (
+        buffers["v_int8"].reshape(-1)[:v_need].reshape(v_rows, padded_k)
+        if buffers["v_int8"].numel() > v_need
+        else buffers["v_int8"]
+    )
     return buffers
 
 

@@ -1437,15 +1437,13 @@ static void sage_check_quantized(const nb::ndarray<>& q_int8, const nb::ndarray<
     }
     require_len(q_int8, static_cast<int64_t>(batch) * q_heads * qo_len * head_dim, fn, "q_int8");
     require_len(k_int8, static_cast<int64_t>(batch) * kv_heads * kv_len * head_dim, fn, "k_int8");
-    // sage_quantize writes padded_k int8 values per V row and sage_attend reads
-    // rows with a padded_k stride, so the single int8 width covers the int8 V.
-    // An fp16/bf16 V carries padded_k 16-bit values per row, which the int8-typed
-    // scratch must back with 2*padded_k elements per row — the direct fp16
-    // transpose in sage_sdpa has its own require_len. Scale the element count by
-    // the V element width so neither an fp16 V is under-checked nor an int8 V
-    // over-checked.
-    const int64_t v_elem_per_row = (v_code == 4) ? padded_k : padded_k * 2;
-    require_len(v_int8, static_cast<int64_t>(batch) * kv_heads * head_dim * v_elem_per_row, fn,
+    // Count V capacity in the buffer's own element type: a packed V row is
+    // padded_k elements wide whether it is int8, fp16 or bf16, because the
+    // kernel reads rows with a padded_k stride. The doubled int8 width is only
+    // for the direct fp16 transpose in sage_sdpa, which has its own require_len,
+    // so an int8 V is not over-checked and a 16-bit V is not rejected for holding
+    // padded_k values per row.
+    require_len(v_int8, static_cast<int64_t>(batch) * kv_heads * head_dim * padded_k, fn,
                 "v_int8");
     require_scale_len(q_scale, static_cast<size_t>(batch) * q_heads * padded_q, fn, "q_scale");
     require_scale_len(k_scale, static_cast<size_t>(batch) * kv_heads * (padded_k / kSageKeyGroup),
@@ -1819,19 +1817,15 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
     // V is packed as [B * H_kv * D, padded_k], and padded_k follows cta_k. Element
     // count alone cannot tell a buffer packed against a different cta_k from a
     // correct one, and the kernel would read shifted rows rather than fail.
-    // sage_attend reads rows with a padded_k stride: an int8 V row is padded_k
-    // wide, while an fp16/bf16 V row is 2*padded_k int8 elements (padded_k 16-bit
-    // values). The Python layer's shared scratch is 2*padded_k wide even for an
-    // int8 V because it reserves room for the direct fp16 transpose, so an int8 V
-    // accepts either width on the iGPU; a single-width int8 V is the original,
-    // independently-suppliable layout and must not be rejected.
-    const int v_code = map_dtype_to_code(v_int8.dtype());
+    // sage_attend reads rows with a padded_k stride, so a V row must be padded_k
+    // elements wide in its own element type — int8, fp16 or bf16. A wider int8
+    // row is rejected: the kernel would read the second half of one row as the
+    // next row unless the caller actually supplied padded_k-stride data
+    // (the Python scratch is presented as a padded_k-wide view here).
+    // The direct fp16 transpose's doubled width lives only in sage_sdpa.
     const int64_t v_row = static_cast<int64_t>(v_int8.shape(1));
     const int64_t v_padded_k = sage_padded_k(kv_len, cta_k);
-    const bool row_ok =
-        (v_code == 4) ? (v_row == v_padded_k || (igpu && v_row == v_padded_k * 2))
-                      : (v_row == v_padded_k * 2);
-    if (!row_ok) {
+    if (v_row != v_padded_k) {
         throw std::runtime_error(std::string(kFn) + ": packed v row width " +
                                  std::to_string(v_int8.shape(1)) + " does not match cta_k " +
                                  std::to_string(cta_k));
