@@ -1401,37 +1401,52 @@ static void sage_check_quantized(const nb::ndarray<>& q_int8, const nb::ndarray<
                                  const nb::ndarray<>& k_int8, const nb::ndarray<>& k_scale,
                                  const nb::ndarray<>& v_int8, const nb::ndarray<>& v_scale,
                                  int batch, int q_heads, int kv_heads, int qo_len, int kv_len,
-                                 int head_dim, int cta_k, bool igpu, const char* fn) {
+                                 int head_dim, int cta_k, bool igpu, bool allow_16bit_v,
+                                 const char* fn) {
     const int64_t padded_q = sage_padded_q(qo_len);
     const int64_t padded_k = sage_padded_k(kv_len, cta_k);
     require_dtype(q_int8, 4, 4, fn, "q_int8");
     require_dtype(k_int8, 4, 4, fn, "k_int8");
+    const int v_code = map_dtype_to_code(v_int8.dtype());
     if (!igpu) {
         // Upstream contract: the transposed V is int8. The unquantized-V paths
         // (fp16/bf16 SV) are a gfx1103 iGPU extension and are rejected here so
         // every other GPU keeps the mainline implementation end to end.
         require_dtype(v_int8, 4, 4, fn, "v_int8");
-    } else {
-        // V is unquantized in the int8-QK / bf16-fp16-SV path: the transposed
-        // buffer carries fp16 (1) or bf16 (2) — or int8 (4) for the legacy
-        // prequantized-int8 callers. fp32 input is downcast by the transpose,
-        // and the Python layer allocates the buffer in the downcast dtype, so
-        // code 0 never arrives here.
-        const int v_code = map_dtype_to_code(v_int8.dtype());
+    } else if (allow_16bit_v) {
+        // Prequantized entry point (sage_sdpa_prequantized skips sage_quantize):
+        // the transposed V buffer carries fp16 (1), bf16 (2), or int8 (4) for the
+        // legacy prequantized-int8 callers, and sage_attend picks the kernel from
+        // this dtype. fp32 input is downcast by the transpose, and the Python
+        // layer allocates the buffer in the downcast dtype, so code 0 never
+        // arrives here.
         if (v_code != 1 && v_code != 2 && v_code != 4) {
             throw std::runtime_error(std::string(fn) +
                                      ": v must be float16, bfloat16 or int8 (the transposed V "
                                      "layout), got code " +
                                      std::to_string(v_code));
         }
+    } else {
+        // sage_quantize runs next and writes INT8 into v_int8; an fp16/bf16 buffer
+        // here would then be read by sage_attend as int8, mixing formats, so it
+        // must be int8 before the quantizer touches it.
+        if (v_code != 4) {
+            throw std::runtime_error(std::string(fn) + ": v_int8 must be int8 when quantizing, "
+                                     "got code " + std::to_string(v_code));
+        }
     }
     require_len(q_int8, static_cast<int64_t>(batch) * q_heads * qo_len * head_dim, fn, "q_int8");
     require_len(k_int8, static_cast<int64_t>(batch) * kv_heads * kv_len * head_dim, fn, "k_int8");
-    // The V scratch is 2x the int8 width on the gfx1103 iGPU (fp16 direct path
-    // fills the full width); dGPUs keep the upstream single width.
-    require_len(v_int8, static_cast<int64_t>(batch) * kv_heads * head_dim * padded_k *
-                            (igpu ? 2 : 1),
-                fn, "v_int8");
+    // sage_quantize writes padded_k int8 values per V row and sage_attend reads
+    // rows with a padded_k stride, so the single int8 width covers the int8 V.
+    // An fp16/bf16 V carries padded_k 16-bit values per row, which the int8-typed
+    // scratch must back with 2*padded_k elements per row — the direct fp16
+    // transpose in sage_sdpa has its own require_len. Scale the element count by
+    // the V element width so neither an fp16 V is under-checked nor an int8 V
+    // over-checked.
+    const int64_t v_elem_per_row = (v_code == 4) ? padded_k : padded_k * 2;
+    require_len(v_int8, static_cast<int64_t>(batch) * kv_heads * head_dim * v_elem_per_row, fn,
+                "v_int8");
     require_scale_len(q_scale, static_cast<size_t>(batch) * q_heads * padded_q, fn, "q_scale");
     require_scale_len(k_scale, static_cast<size_t>(batch) * kv_heads * (padded_k / kSageKeyGroup),
                       fn, "k_scale");
@@ -1473,7 +1488,8 @@ static void sage_quantize(const nb::ndarray<>& q, const nb::ndarray<>& k, const 
                                  ": the last dimension of q, k and v must be contiguous");
     }
     sage_check_quantized(q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, batch, q_heads,
-                         kv_heads, qo_len, kv_len, head_dim, cta_k, igpu, fn);
+                         kv_heads, qo_len, kv_len, head_dim, cta_k, igpu, /*allow_16bit_v=*/false,
+                         fn);
     // The detector writes one index per (batch, kv head); there is no int32 code
     // in map_dtype_to_code, so the width is what gets checked.
     if (anchor_indices.dtype().bits != 32) {
@@ -1798,12 +1814,24 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
         throw std::runtime_error(std::string(kFn) + ": incompatible quantized tensor shapes");
     }
     sage_check_quantized(q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, batch, q_heads,
-                         kv_heads, qo_len, kv_len, head_dim, cta_k, igpu, kFn);
+                         kv_heads, qo_len, kv_len, head_dim, cta_k, igpu, /*allow_16bit_v=*/true,
+                         kFn);
     // V is packed as [B * H_kv * D, padded_k], and padded_k follows cta_k. Element
     // count alone cannot tell a buffer packed against a different cta_k from a
     // correct one, and the kernel would read shifted rows rather than fail.
-    if (v_int8.shape(1) !=
-        static_cast<size_t>(sage_padded_k(kv_len, cta_k)) * (igpu ? 2 : 1)) {
+    // sage_attend reads rows with a padded_k stride: an int8 V row is padded_k
+    // wide, while an fp16/bf16 V row is 2*padded_k int8 elements (padded_k 16-bit
+    // values). The Python layer's shared scratch is 2*padded_k wide even for an
+    // int8 V because it reserves room for the direct fp16 transpose, so an int8 V
+    // accepts either width on the iGPU; a single-width int8 V is the original,
+    // independently-suppliable layout and must not be rejected.
+    const int v_code = map_dtype_to_code(v_int8.dtype());
+    const int64_t v_row = static_cast<int64_t>(v_int8.shape(1));
+    const int64_t v_padded_k = sage_padded_k(kv_len, cta_k);
+    const bool row_ok =
+        (v_code == 4) ? (v_row == v_padded_k || (igpu && v_row == v_padded_k * 2))
+                      : (v_row == v_padded_k * 2);
+    if (!row_ok) {
         throw std::runtime_error(std::string(kFn) + ": packed v row width " +
                                  std::to_string(v_int8.shape(1)) + " does not match cta_k " +
                                  std::to_string(cta_k));
