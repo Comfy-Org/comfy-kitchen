@@ -14,6 +14,7 @@ AdaLN and RMS-AdaLN, the quantizers, stochastic rounding, the AWQ GEMV) and
 declines the GEMMs, which fall through to triton/eager.
 """
 import functools
+import importlib.machinery
 import importlib.util
 import json
 import logging
@@ -122,9 +123,15 @@ _EXT_ERROR = None
 
 try:
     _dir = os.path.dirname(__file__)
+    # Only consider suffixes this interpreter can actually load. A stale
+    # cross-platform artifact (a Windows .pyd left in the tree by a cross build)
+    # is otherwise picked up by listdir order, and spec_from_file_location then
+    # returns None for it, which used to surface as a bare AttributeError below
+    # and left the backend silently disabled.
+    _ext_suffixes = tuple(importlib.machinery.EXTENSION_SUFFIXES)
     _module_path = None
-    for _fn in os.listdir(_dir):
-        if _fn.startswith("_C.") and _fn.endswith((".so", ".pyd")):
+    for _fn in sorted(os.listdir(_dir)):
+        if _fn.startswith("_C.") and _fn.endswith(_ext_suffixes):
             _module_path = os.path.join(_dir, _fn)
             break
 
@@ -132,6 +139,8 @@ try:
         _EXT_ERROR = "HIP extension not built (no _C module in backends/hip)"
     else:
         _spec = importlib.util.spec_from_file_location("comfy_kitchen.backends.hip._C", _module_path)
+        if _spec is None or _spec.loader is None:
+            raise ImportError(f"no extension loader for {_module_path}")
         _C = importlib.util.module_from_spec(_spec)
         sys.modules["comfy_kitchen.backends.hip._C"] = _C
         _spec.loader.exec_module(_C)
