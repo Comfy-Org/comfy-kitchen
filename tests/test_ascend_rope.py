@@ -13,6 +13,14 @@ torch_npu = pytest.importorskip("torch_npu")
 pytestmark = pytest.mark.skipif(
     not torch.npu.is_available(), reason="Huawei Ascend device required"
 )
+requires_rope = pytest.mark.skipif(
+    not ascend_backend._ASCEND_ROPE_AVAILABLE,
+    reason="compatible Ascend rotary operator required",
+)
+requires_rms_rope = pytest.mark.skipif(
+    not ascend_backend._ASCEND_RMS_ROPE_AVAILABLE,
+    reason="compatible Ascend RMS-RoPE operators required",
+)
 
 
 @pytest.fixture
@@ -29,10 +37,7 @@ def test_required_quantization_parameter_is_available():
     assert ascend_backend._operator_has_parameter(torch_npu.npu_quantize, "div_mode")
 
 
-@pytest.mark.skipif(
-    not ascend_backend._ASCEND_ROPE_AVAILABLE,
-    reason="compatible Ascend rotary operator required",
-)
+@requires_rope
 def test_required_rotary_parameter_is_available():
     assert ascend_backend._operator_has_parameter(torch_npu.npu_rotary_mul, "rotary_mode")
 
@@ -75,6 +80,7 @@ def _assert_close(actual, expected):
     torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-3, atol=1e-3)
 
 
+@requires_rope
 @pytest.mark.parametrize("layout", ["bsnd", "bnsd"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("split_half", [False, True])
@@ -122,6 +128,7 @@ def test_apply_rope_matches_eager_for_packed_views(
     torch.testing.assert_close(untouched, untouched_before)
 
 
+@requires_rms_rope
 @pytest.mark.parametrize("layout", ["bsnd", "bnsd"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("split_half", [False, True])
@@ -179,6 +186,7 @@ def test_rms_rope_matches_eager_for_packed_views(
     torch.testing.assert_close(untouched, untouched_before)
 
 
+@requires_rms_rope
 @pytest.mark.parametrize("inplace", [False, True])
 def test_rms_rope_split_half_partial_rotary_matches_eager(ascend_device, inplace):
     shape = (1, 11, 5, 128)
@@ -199,6 +207,7 @@ def test_rms_rope_split_half_partial_rotary_matches_eager(ascend_device, inplace
         _assert_close(result, expected_result)
 
 
+@requires_rope
 def test_apply_rope_supports_gqa_head_counts(ascend_device):
     q = torch.randn(1, 13, 16, 64, device=ascend_device, dtype=torch.bfloat16)
     k = torch.randn(1, 13, 4, 64, device=ascend_device, dtype=torch.bfloat16)
@@ -211,6 +220,7 @@ def test_apply_rope_supports_gqa_head_counts(ascend_device):
         _assert_close(result, expected_result)
 
 
+@requires_rope
 @pytest.mark.parametrize(
     "input_dtype,freqs_dtype",
     [
@@ -234,6 +244,7 @@ def test_apply_rope_preserves_eager_frequency_dtype_semantics(
     torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=4e-2)
 
 
+@requires_rope
 def test_ascend_inplace_rope_rejects_overlapping_inputs(ascend_device):
     q = torch.randn(1, 7, 3, 64, device=ascend_device, dtype=torch.bfloat16)
     k = q[..., :]
@@ -246,10 +257,10 @@ def test_ascend_inplace_rope_rejects_overlapping_inputs(ascend_device):
 @pytest.mark.parametrize(
     "case,failed_param",
     [
-        ("interleaved_batch_freqs", "freqs_cis"),
-        ("strided_last_dim", "x"),
-        ("oversized_rotary_dim", "x"),
-        ("bad_scale", "scale"),
+        pytest.param("interleaved_batch_freqs", "freqs_cis", marks=requires_rope),
+        pytest.param("strided_last_dim", "x", marks=requires_rope),
+        pytest.param("oversized_rotary_dim", "x", marks=requires_rope),
+        pytest.param("bad_scale", "scale", marks=requires_rms_rope),
     ],
 )
 def test_ascend_rope_declines_unsupported_contracts(ascend_device, case, failed_param):
@@ -286,6 +297,7 @@ def test_ascend_rope_declines_unsupported_contracts(ascend_device, case, failed_
     assert result.failed_param == failed_param
 
 
+@requires_rope
 def test_ascend_rope_is_selected_automatically(ascend_device):
     x = torch.randn(1, 7, 3, 64, device=ascend_device, dtype=torch.bfloat16)
     freqs = torch.randn(1, 7, 1, 32, 2, 2, device=ascend_device, dtype=torch.float32)
