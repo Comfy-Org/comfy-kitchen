@@ -1,8 +1,8 @@
 """Correctness tests for the HIP backend.
 
-Skipped unless the backend registered, which requires an RDNA2/3/4 device and the
-compiled extension. The GEMM tests need matrix cores on top of that, so they are
-skipped on RDNA2, which has none; see needs_wmma.
+Skipped unless the backend registered, which requires a Vega or RDNA1/2/3/4 device
+and the compiled extension. Tiled GEMMs use software policies on pre-WMMA devices, while
+NA3D and GEMMs share the native-or-software tile contract; see needs_wmma.
 """
 import pytest
 import torch
@@ -52,10 +52,9 @@ def _has_wmma() -> bool:
 
 HAS_WMMA = _has_wmma()
 
-# The GEMMs compile on RDNA2 but trap: it has no matrix cores, and the backend
-# does not advertise them there. An absent backend reports why instead.
+
 needs_wmma = pytest.mark.skipif(
-    not HAS_WMMA, reason=_UNAVAILABLE or "GEMM kernels need matrix cores (RDNA3/RDNA4)"
+    not HAS_WMMA, reason=_UNAVAILABLE or "tiled GEMM kernels are unavailable"
 )
 
 DEV = "cuda"
@@ -548,7 +547,8 @@ def test_fp16_linear_matches_fp32_reference(hip, monkeypatch, m, n, k, served, w
     if with_residual:
         ref = r.float() + rs.float() * ref
 
-    assert calls == [served]
+    # without native WMMA every shape runs rocBLAS and the kernel is never asked
+    assert calls == ([served] if hip._native_wmma_on(torch.device(DEV, 0)) else [])
     assert got.dtype == torch.float16 and got.shape == (m, n)
     # fp32 accumulation: only the fp16 operands and the stored result are rounded
     assert _rel_err(got, ref) < 5e-3
@@ -601,6 +601,77 @@ def test_fp16_linear_offset_vectors_and_scale_requirement(hip):
     assert torch.equal(got, ref)
     with pytest.raises(ValueError, match="residual"):
         hip.fp16_linear(x, w, b, residual=r)
+
+
+def _peak_extra(fn):
+    """fn's result and the device memory it allocated beyond what was live before it."""
+    torch.cuda.synchronize()
+    base = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    result = fn()
+    torch.cuda.synchronize()
+    return result, torch.cuda.max_memory_allocated() - base
+
+
+@needs_wmma
+def test_fp16_linear_fallback_stages_a_host_weight_in_chunks(hip, monkeypatch):
+    """rocBLAS cannot read an offloaded weight in place as the kernel does, so it is staged
+    a budget of rows at a time rather than copied to the device whole."""
+    torch.manual_seed(0)
+    m, n, k = 256, 1024, 2048  # K <= 4096: rocBLAS on every device
+    x = torch.randn(m, k, dtype=torch.float16, device=DEV)
+    w = torch.randn(n, k, dtype=torch.float16) * 0.02
+    b = torch.randn(n, dtype=torch.float16, device=DEV)
+    r = torch.randn(m, n, dtype=torch.float16, device=DEV)
+    rs = torch.randn(n, dtype=torch.float16, device=DEV)
+    host = hip.offload_weight(w)
+    chunk = 96 * k * 2  # a ragged last chunk
+    monkeypatch.setattr(hip, "_FALLBACK_SCRATCH_BYTES", chunk)
+    got, extra = _peak_extra(lambda: hip.fp16_linear(x, host, b, r, rs))
+    ref = torch.addcmul(r.float(), torch.nn.functional.linear(
+        x.float(), w.float().to(DEV), b.float()), rs.float())
+    assert _rel_err(got, ref) < 5e-3
+    # the output plus the chunk being consumed and the one being staged; the whole
+    # weight is 4 MiB
+    assert extra <= m * n * 2 + 2 * chunk
+
+
+@needs_wmma
+@pytest.mark.parametrize("window", ["frames", "rows"])
+@pytest.mark.parametrize("residual_shape", ["full", "broadcast", None])
+def test_fp16_conv3d_fallback_windows(hip, monkeypatch, window, residual_shape):
+    """The torch fallback in output windows matches an fp32 conv, whether a window holds
+    whole frames or rows of one, and with a residual it can or cannot window."""
+    torch.manual_seed(0)
+    c, k, stride = 32, 48, (1, 2, 2)
+    x, weight, bias, residual = _conv_inputs(c, k, 7, 21, 24, (3, 3, 3),
+                                             with_residual=residual_shape == "full",
+                                             stride=stride)
+    if residual_shape == "broadcast":
+        residual = torch.randn(1, k, 1, 1, 1, dtype=torch.float16, device=DEV)
+    p, q = (21 - 3) // 2 + 1, (24 - 3) // 2 + 1
+    row_bytes = q * (c * 27 + k) * 2
+    budget = 2 * p * row_bytes if window == "frames" else 3 * row_bytes
+    monkeypatch.setattr(hip, "_FALLBACK_SCRATCH_BYTES", budget)
+    got = hip._torch_conv3d(x, weight, bias, residual, stride)
+    assert got.is_contiguous(memory_format=torch.channels_last_3d)
+    assert _rel_err(got, _conv_ref(x, weight, bias, residual, stride)) < 5e-3
+    out = torch.zeros((1, k, 7, p + 2, q), dtype=torch.float16, device=DEV).contiguous(
+        memory_format=torch.channels_last_3d)[:, :, 2:7, 1:p + 1]
+    hip._torch_conv3d(x, weight, bias, residual, stride, out=out)
+    assert torch.equal(out, got)
+
+
+@needs_wmma
+def test_fp16_conv3d_fallback_bounds_the_miopen_workspace(hip, monkeypatch):
+    """Unwindowed, MIOpen's im2col workspace is some 30x this 4 MiB output."""
+    torch.manual_seed(0)
+    budget = 8 << 20
+    monkeypatch.setattr(hip, "_FALLBACK_SCRATCH_BYTES", budget)
+    x, weight, bias, residual = _conv_inputs(128, 128, 6, 66, 66, (3, 3, 3), with_residual=True)
+    got, extra = _peak_extra(lambda: hip._torch_conv3d(x, weight, bias, residual, [1, 1, 1]))
+    assert extra <= got.numel() * 2 + 2 * budget
+    assert _rel_err(got, _conv_ref(x, weight, bias, residual, (1, 1, 1))) < 5e-3
 
 
 def _conv_inputs(c, k, d, h, w, ksize, with_bias=True, with_residual=False, stride=(1, 1, 1)):
@@ -796,7 +867,8 @@ def test_fp16_conv3d_frame_window_out(hip):
     assert torch.equal(out, full)
     buf = torch.empty_like(full)
     hip.fp16_conv3d_out(x, weight, bias, None, [1, 1, 1], buf)
-    assert torch.equal(buf, full)
+    # the public op, which is the kernel only where the device has native WMMA
+    assert torch.equal(buf, hip.fp16_conv3d(x, weight, bias, None, [1, 1, 1]))
 
 
 @needs_wmma
@@ -908,6 +980,8 @@ def test_fp16_conv3d_out_overlapping_input_is_declined(hip):
                                 None, [1, 1, 1])
     out = torch.as_strided(x, ref.shape, ref.stride(), x.storage_offset())
     assert hip._wmma_fp16_conv3d(x, weight, None, None, [1, 1, 1], out=out) is None
+    ref = hip.fp16_conv3d(x.clone(memory_format=torch.channels_last_3d), weight, None, None,
+                          [1, 1, 1])
     hip.fp16_conv3d_out(x, weight, None, None, [1, 1, 1], out)
     assert torch.equal(out, ref)
 

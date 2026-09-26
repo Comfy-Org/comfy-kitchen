@@ -63,6 +63,18 @@ def _adaln_fwd_kernel(
 
 def _adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float,
            subtract_mean: bool) -> torch.Tensor:
+    if getattr(torch.version, "hip", None):
+        try:
+            arch = torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0]
+        except (AttributeError, RuntimeError):
+            arch = None
+        if arch is not None and arch.startswith("gfx10"):
+            x_float = x.float()
+            normalized = (torch.nn.functional.layer_norm(x_float, (x.shape[-1],), eps=eps)
+                          if subtract_mean
+                          else torch.nn.functional.rms_norm(x_float, (x.shape[-1],), eps=eps))
+            return (normalized * (1 + scale.float()) + shift.float()).to(x.dtype)
+
     orig_shape = x.shape
     d = x.shape[-1]
     n = x.numel() // d

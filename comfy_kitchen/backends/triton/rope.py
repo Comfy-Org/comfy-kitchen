@@ -18,6 +18,7 @@ import torch
 import triton
 import triton.language as tl
 from comfy_kitchen._rope_utils import check_rope_inplace
+from comfy_kitchen.backends.eager import rope as _eager_rope
 
 
 @triton.jit
@@ -163,6 +164,22 @@ def _apply_rope(
     split_half: bool = False,
     inplace: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if torch.version.hip is not None:
+        arch = torch.cuda.get_device_properties(x1.device).gcnArchName.split(":")[0]
+        if arch.startswith("gfx10"):
+            eager_fn = _eager_rope.apply_rope_split_half1 if split_half else _eager_rope.apply_rope1
+            eager_freqs = freqs_cis
+            if not split_half and freqs_cis.ndim > 1 and freqs_cis.shape[1] > x1.shape[1]:
+                eager_freqs = freqs_cis[:, : x1.shape[1]]
+            x1_out = eager_fn(x1, eager_freqs)
+            x2_out = None if x2 is None else eager_fn(x2, eager_freqs)
+            if inplace:
+                x1.copy_(x1_out)
+                if x2 is not None:
+                    x2.copy_(x2_out)
+                return x1, x2
+            return x1_out, x2_out
+
     # A paired launch shares one stride description. Use separate launches when
     # Q and K differ so each tensor retains its exact layout.
     if x2 is not None and (x1.shape != x2.shape or x1.stride() != x2.stride()):

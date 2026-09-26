@@ -122,6 +122,16 @@ def na3d(
     scale: float | None = None,
 ) -> torch.Tensor:
     """3D neighborhood attention over ``(B, t_size, h_size, w_size, num_heads, HD)`` tensors."""
+    if getattr(torch.version, "hip", None):
+        try:
+            arch = torch.cuda.get_device_properties(q.device).gcnArchName.split(":")[0]
+        except (AttributeError, RuntimeError):
+            arch = None
+        if arch is not None and arch.startswith("gfx10"):
+            from comfy_kitchen.backends.eager.na import na3d as eager_na3d
+
+            return eager_na3d(q, k, v, kernel_size, is_causal, scale)
+
     batch, t, h, w, nh, hd = q.shape
     causal = [False, False, False] if is_causal is None else list(is_causal)
     kt, kh, kw = (k_ if c else min(k_, d) for k_, c, d in zip(kernel_size, causal, (t, h, w), strict=True))

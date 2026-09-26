@@ -84,11 +84,10 @@ def test_int8_attention_capability_dispatch(monkeypatch, capability, expected):
 
 @pytest.mark.parametrize("has_wmma", [True, False])
 def test_int8_attention_hip_dispatch_follows_matrix_cores(monkeypatch, has_wmma):
-    """On ROCm the gate is matrix cores, not a compute capability.
+    """On ROCm the gate is the native-or-software tile contract.
 
     torch.cuda is the ROCm API there and reports an SM-shaped capability for a
-    gfx part, so the CUDA test above would wave RDNA2 through to a kernel built
-    on WMMA. RDNA2 has none and must decline.
+    gfx part, so the CUDA compute-capability test does not decide HIP support.
     """
     if not getattr(torch.version, "hip", None):
         pytest.skip("requires a ROCm PyTorch runtime")

@@ -99,6 +99,16 @@ def _rms_rope(
     split_half: bool,
     inplace: bool = False,
 ) -> torch.Tensor:
+    if torch.version.hip is not None:
+        arch = torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0]
+        if arch.startswith("gfx10"):
+            eager_fn = _eager_rope.rms_rope_split_half1 if split_half else _eager_rope.rms_rope1
+            out = eager_fn(x, freqs_cis, scale, epsilon)
+            if inplace:
+                x.copy_(out)
+                return x
+            return out
+
     if not scale.is_contiguous():
         scale = scale.contiguous()
 

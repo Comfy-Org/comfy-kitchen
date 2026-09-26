@@ -372,11 +372,23 @@ class TestTensorWiseINT8Layout:
         """Roundtrip error stays within INT8 quantization tolerance."""
         from comfy_kitchen.tensor import QuantizedTensor
 
+        if getattr(torch.version, "hip", None):
+            architectures = {
+                torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+                for device in range(torch.cuda.device_count())
+            }
+            unsupported_architectures = architectures & {"gfx900", "gfx906", "gfx90c"}
+            if unsupported_architectures:
+                pytest.skip(
+                    "Triton is unsupported on ROCm architecture "
+                    f"{sorted(unsupported_architectures)[0]}"
+                )
+
         w = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(w, "TensorWiseINT8Layout")
         dq = qt.dequantize()
-
         rel_err = (w.float() - dq.float()).abs() / (w.float().abs().max() + 1e-8)
+
         assert rel_err.mean().item() < 0.02, f"Mean relative error too high: {rel_err.mean():.4f}"
 
     def test_state_dict_tensors_keys(self, seed):
@@ -397,6 +409,9 @@ class TestTensorWiseINT8Layout:
 
         result = TensorWiseINT8Layout.supports_fast_matmul()
         assert isinstance(result, bool)
+        if getattr(torch.version, "hip", None):
+            assert result == (ck.registry.get_constraints("hip", "int8_linear") is not None)
+            return
         sm = torch.cuda.get_device_capability()
         if sm >= (7, 5):
             assert result is True
@@ -801,6 +816,9 @@ class TestTensorWiseINT8Layout:
         import comfy_kitchen as ck
         from comfy_kitchen.tensor import QuantizedTensor
 
+        if "triton" not in get_capable_backends("int8_linear", "cuda"):
+            pytest.skip("triton does not support int8_linear on cuda")
+
         group_size = 64
         x = torch.randn(32, 128, device="cuda", dtype=torch.float16)
         w = torch.randn(64, 128, device="cuda", dtype=torch.float16)
@@ -909,6 +927,36 @@ class TestTensorWisePublicAPI:
 
         assert out.shape == (1, 64)
         assert out.dtype == torch.bfloat16
+
+    def test_eager_int8_matmul_float_fallback(self, monkeypatch):
+        from comfy_kitchen.backends.eager import quantization
+
+        a = torch.randint(-128, 128, (4, 16), dtype=torch.int8)
+        b = torch.randint(-128, 128, (16, 8), dtype=torch.int8)
+        expected = a.to(torch.int32) @ b.to(torch.int32)
+        monkeypatch.setattr(quantization, "_requires_float_int8_mm", lambda tensor: True)
+
+        result = quantization._int8_matmul_accumulate(a, b)
+
+        assert result.dtype == torch.int32
+        assert torch.equal(result, expected)
+
+    @pytest.mark.parametrize("arch", ("gfx90c", "gfx1030"))
+    def test_eager_int8_matmul_float_fallback_is_exact_for_large_k(self, monkeypatch, arch):
+        from comfy_kitchen.backends.eager import quantization
+
+        a = torch.full((1, 2049), 127, dtype=torch.int8)
+        b = torch.full((2049, 1), 127, dtype=torch.int8)
+        expected = a.to(torch.int32) @ b.to(torch.int32)
+        monkeypatch.setattr(
+            quantization,
+            "_requires_float_int8_mm",
+            lambda tensor: arch.startswith("gfx90") or arch.startswith("gfx10"),
+        )
+
+        result = quantization._int8_matmul_accumulate(a, b)
+
+        assert torch.equal(result, expected)
 
     def test_eager_int8_linear_pads_k_to_int8_mm_tile(self, seed, device):
         """Eager int8_linear pads K to int8 matmul's tile size."""

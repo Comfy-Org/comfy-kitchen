@@ -747,8 +747,28 @@ def _round_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+def _requires_float_int8_mm(tensor: torch.Tensor) -> bool:
+    if not tensor.is_cuda or not getattr(torch.version, "hip", None):
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(tensor.device).gcnArchName.split(":")[0]
+    except (AttributeError, RuntimeError):
+        return False
+    return arch.startswith("gfx90") or arch.startswith("gfx10")
+
+
 def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Multiply INT8 matrices and return INT32 accumulators."""
+    if _requires_float_int8_mm(a):
+        # 1024 * 128**2 is 2**24, so every partial dot product is exact in float32.
+        chunk_size = 1024
+        result = torch.zeros((a.size(0), b.size(1)), device=a.device, dtype=torch.int32)
+        for start in range(0, a.size(1), chunk_size):
+            end = start + chunk_size
+            partial = torch.matmul(a[:, start:end].float(), b[start:end].float())
+            result.add_(partial.round().to(torch.int32))
+        return result
+
     def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
         if hasattr(torch, "int8_mm"):
             return torch.int8_mm(lhs, rhs)
@@ -814,8 +834,8 @@ def _int8_stochastic_rng(x: torch.Tensor, seed: int) -> torch.Tensor:
 
 
 def _int8_scale_for_math(scale: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    scale = scale.to(device=x.device, dtype=x.dtype)
-    scale_min = torch.finfo(x.dtype).tiny
+    scale = scale.to(device=x.device, dtype=torch.float32)
+    scale_min = torch.finfo(torch.float32).tiny
     return torch.where(scale == 0, torch.full_like(scale, scale_min), scale)
 
 
@@ -851,7 +871,9 @@ def quantize_int8_tensorwise(
         scale = torch.tensor(scale, device=x.device, dtype=torch.float32)
     else:
         scale = scale.to(device=x.device, dtype=torch.float32)
-    q = _round_int8(x / _int8_scale_for_math(scale, x), stochastic_rounding=stochastic_rounding)
+    q = _round_int8(
+        x.float() / _int8_scale_for_math(scale, x), stochastic_rounding=stochastic_rounding
+    )
     return q, scale
 
 

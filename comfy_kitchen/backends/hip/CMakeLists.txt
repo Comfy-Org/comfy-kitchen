@@ -69,6 +69,26 @@ endfunction()
 
 _ck_make_arch_condition(COMFY_HIP_GFX11_CONDITION ${COMFY_HIP_WMMA_GFX11_ARCHS})
 _ck_make_arch_condition(COMFY_HIP_GFX12_CONDITION ${COMFY_HIP_WMMA_GFX12_ARCHS})
+set(_CK_HIP_WAVE64_VEGA_ARCHS)
+set(_CK_HIP_DOT4_ARCHS)
+foreach(_arch IN LISTS COMFY_HIP_ELEMENTWISE_ARCHS)
+    if(_arch MATCHES "^gfx90")
+        list(APPEND _CK_HIP_WAVE64_VEGA_ARCHS "${_arch}")
+    endif()
+    if(_arch MATCHES "^gfx103")
+        list(APPEND _CK_HIP_DOT4_ARCHS "${_arch}")
+    endif()
+endforeach()
+_ck_make_arch_condition(COMFY_HIP_WAVE64_VEGA_CONDITION ${_CK_HIP_WAVE64_VEGA_ARCHS})
+_ck_make_arch_condition(COMFY_HIP_DOT4_CONDITION ${_CK_HIP_DOT4_ARCHS})
+set(_CK_HIP_WMMA_ARCHS
+    ${COMFY_HIP_WMMA_GFX11_ARCHS}
+    ${COMFY_HIP_WMMA_GFX12_ARCHS}
+)
+list(JOIN _CK_HIP_WMMA_ARCHS "\", \"" _CK_HIP_WMMA_ARCH_NAMES_JOINED)
+set(COMFY_HIP_WMMA_ARCH_NAMES "\"${_CK_HIP_WMMA_ARCH_NAMES_JOINED}\"")
+list(JOIN COMFY_HIP_SUPPORTED_ARCHS "\", \"" _CK_HIP_SUPPORTED_ARCH_NAMES_JOINED)
+set(COMFY_HIP_SUPPORTED_ARCH_NAMES "\"${_CK_HIP_SUPPORTED_ARCH_NAMES_JOINED}\"")
 set(_CK_HIP_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${_CK_HIP_GENERATED_INCLUDE_DIR}")
 configure_file(
@@ -198,7 +218,6 @@ add_library(comfy_kitchen_hip_kernels OBJECT ${HIP_SOURCES})
 target_compile_options(comfy_kitchen_hip_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3>
     $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
-    $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64>
 )
 if(COMFY_ENABLE_LINEINFO OR CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_options(

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""HIP backend for AMD RDNA2, RDNA3/3.5 and RDNA4.
+"""HIP backend for AMD Vega, RDNA, RDNA2, RDNA3/3.5 and RDNA4.
 
 Every matmul is a WMMA kernel compiled from the sources in this directory; the
 backend does not link or call hipBLAS/hipBLASLt.
@@ -9,9 +9,9 @@ RDNA3 (gfx11xx) and RDNA4 (gfx12xx) have matrix cores and get everything. Their
 fragment layouts differ, and RDNA3 has no fp8 WMMA, so it widens fp8 to bf16;
 see mma.h.
 
-RDNA2 (gfx103x) has no matrix cores. It runs the elementwise kernels (RoPE,
-AdaLN and RMS-AdaLN, the quantizers, stochastic rounding, the AWQ GEMV) and
-declines the GEMMs, which fall through to triton/eager.
+Vega/GCN 5 (gfx90c), RDNA (gfx101x) and RDNA2 (gfx103x) emulate the same tile
+contract with vector arithmetic; gfx103x uses its packed int8 dot product. The
+attention kernels still require native WMMA fragment support.
 """
 import functools
 import importlib.util
@@ -20,6 +20,7 @@ import logging
 import os
 import pathlib
 import sys
+import threading
 import weakref
 from collections.abc import Sequence
 
@@ -83,6 +84,8 @@ __all__ = [
     "dequantize_per_tensor_fp8",
     "dequantize_w4a8_int8_weight",
     "has_wmma",
+    "has_native_wmma",
+    "offload_weight",
     "int8_linear",
     "int8_attention_is_available",
     "flash_attention_decode_is_available",
@@ -185,22 +188,11 @@ _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
 _ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
 _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 
-# The GEMMs, and only the GEMMs, need matrix cores. Everything else is elementwise
-# or a scalar reduction and runs on any supported architecture. This set names the
-# registry-dispatched GEMMs so _build_constraints can drop them on RDNA2; the fp8
-# GEMM is not among them because it is reached through scaled_mm_v2's _hip_fp8_gemm,
-# which gates on has_wmma() itself rather than through the registry.
-_WMMA_ONLY_OPS = frozenset({
-    "fp16_conv3d",
-    "fp16_conv3d_out",
-    "fp16_linear",
-    "int8_linear",
-    "na3d",
-    "sol_attn",
-    "convrot_w4a4_linear",
-    "scaled_mm_svdquant_w4a4",
-    "w4a8_int8_linear",
-})
+# The attention kernels need a tiled-MMA policy. Validated gfx9/gfx10 targets
+# implement that policy in software; gfx11/gfx12 use native WMMA. The fp8 GEMM
+# is reached through scaled_mm_v2's _hip_fp8_gemm, which gates on has_wmma()
+# itself rather than through the registry.
+_TILED_ATTENTION_OPS = frozenset({"na3d", "sol_attn"})
 
 
 def _unsupported_arch_reason(arches: Sequence[str | None]) -> str | None:
@@ -220,12 +212,14 @@ def _unsupported_arch_reason(arches: Sequence[str | None]) -> str | None:
 
 
 def _has_wmma(arches: Sequence[str | None]) -> bool:
-    """Whether every visible device has matrix cores.
+    """Whether every visible device implements the 16x16 tile contract.
 
-    Registration is per-process while kernels launch on the tensor's own device, so
-    the capability set has to be the intersection over the visible devices: one
-    RDNA2 card in an otherwise RDNA4 box means no GEMM is safe to advertise.
+    gfx11+ uses native WMMA; validated gfx9/gfx10 targets use the software policy.
     """
+    return bool(arches) and all(a in _ARCH_SUPPORTED for a in arches)
+
+
+def _has_native_wmma(arches: Sequence[str | None]) -> bool:
     return bool(arches) and all(a in _ARCH_WMMA for a in arches)
 
 
@@ -234,23 +228,68 @@ def is_available() -> bool:
 
 
 def has_wmma() -> bool:
-    """Whether the GEMM kernels can run: every visible device has matrix cores.
+    """Whether every visible device can run the tiled GEMM kernels."""
+    arches = _visible_gfx_arches()
+    return _EXT_AVAILABLE and _unsupported_arch_reason(arches) is None and _has_wmma(arches)
 
-    is_available() is true on RDNA2 as well, where only the elementwise kernels
-    exist, so callers that reach a GEMM without going through the registry (see
-    scaled_mm_v2) have to test this instead. One arch snapshot per call: this sits
-    on the per-GEMM dispatch path.
+
+def has_native_wmma() -> bool:
+    """Whether every visible device has native gfx11+ WMMA instructions.
+
+    Attention kernels use native fragment layouts and must use this stricter gate.
     """
     arches = _visible_gfx_arches()
     return (
         _EXT_AVAILABLE
         and _unsupported_arch_reason(arches) is None
-        and _has_wmma(arches)
+        and _has_native_wmma(arches)
     )
+
+
+@functools.cache
+def _device_has_native_wmma(index: int) -> bool:
+    """Whether device ``index`` has native WMMA, for per-launch routing.
+
+    has_native_wmma() is the intersection over every visible device; a launch only
+    needs the device its operands are on.
+    """
+    return _gfx_arch(index) in _ARCH_WMMA
+
+
+def _native_wmma_on(device: torch.device) -> bool:
+    return _device_has_native_wmma(
+        torch.cuda.current_device() if device.index is None else device.index)
+
+
+# Scratch the torch fallbacks for the fp16 kernels may take per launch. On devices
+# without WMMA, rocBLAS and MIOpen are 7x to 15x faster than the software fp16 tile,
+# but MIOpen lowers conv3d to an im2col workspace some 30x its output, and a pinned
+# host weight would be copied to the device whole. Chunking the torch calls to this
+# budget keeps the memory profile of the kernels they replace. On gfx1010 and gfx90c,
+# 16 MiB runs within 8% of 64 MiB chunks; 8 MiB costs up to 25%.
+_FALLBACK_SCRATCH_BYTES = 16 << 20
 
 
 def _stream(t: torch.Tensor) -> int:
     return torch.cuda.current_stream(t.device).cuda_stream
+
+
+_pending_host_operands_lock = threading.Lock()
+_pending_host_operands: list[tuple[torch.cuda.Event, torch.Tensor]] = []
+
+
+def _retain_host_operands_until_stream_complete(
+    operands: list[torch.Tensor], device: torch.device
+) -> None:
+    """Keep temporary mapped host operands alive until their launch finishes."""
+    with _pending_host_operands_lock:
+        _pending_host_operands[:] = [
+            (event, operand) for event, operand in _pending_host_operands if not event.query()
+        ]
+        if operands:
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(device))
+            _pending_host_operands.extend((event, operand) for operand in operands)
 
 
 # The epilogues read a scalar per element with one dtype code.
@@ -264,6 +303,42 @@ def _aligned(t: torch.Tensor) -> torch.Tensor:
     allocation is the only way to move the base.
     """
     return t.clone() if t.data_ptr() % 16 else t
+
+
+def offload_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Copy a weight to mapped pinned host memory for direct HIP kernel reads.
+
+    The ROCm driver decides whether those pages reside in ordinary host RAM or
+    an APU's GTT aperture. Pageable CPU tensors are intentionally not accepted by
+    GEMM entry points because a device cannot safely dereference them.
+    """
+    source = weight.detach().contiguous().cpu()
+    result = torch.empty_like(source, device="cpu", pin_memory=True)
+    result.copy_(source)
+    return result
+
+
+def _weight_operand(
+    weight: torch.Tensor,
+    device: torch.device,
+    name: str,
+    shape=None,
+    temporary_host_operands: list[torch.Tensor] | None = None,
+) -> torch.Tensor:
+    if shape is not None and tuple(weight.shape) != tuple(shape):
+        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(weight.shape)}")
+    if weight.device.type != "cpu":
+        return _operand(weight, device, name, shape)
+    if not weight.is_pinned():
+        raise ValueError(f"{name} on CPU must be mapped pinned memory; use hip.offload_weight()")
+    weight = weight.contiguous()
+    if weight.data_ptr() % 16:
+        aligned = torch.empty_like(weight, pin_memory=True)
+        aligned.copy_(weight)
+        weight = aligned
+    if temporary_host_operands is not None:
+        temporary_host_operands.append(weight)
+    return weight
 
 
 def _operand(t: torch.Tensor, device: torch.device, name: str, shape=None) -> torch.Tensor:
@@ -402,7 +477,10 @@ def scaled_mm_fp8(
             f"scaled_mm_fp8 requires float8_e4m3fn operands, got a={a.dtype}, b={b.dtype}"
         )
     a = _aligned(a.contiguous())
-    b_nk = _aligned(_weight_as_nk(b).to(device=a.device))
+    temporary_host_operands: list[torch.Tensor] = []
+    b_nk = _weight_operand(
+        _weight_as_nk(b), a.device, "b", temporary_host_operands=temporary_host_operands
+    )
 
     m, k = a.shape
     n = b_nk.shape[0]
@@ -425,6 +503,7 @@ def scaled_mm_fp8(
         _dl(scale_a), _dl(scale_b), None if bias is None else _dl(bias),
         m, n, k, DTYPE_TO_CODE[out_dtype], _stream(a),
     )
+    _retain_host_operands_until_stream_complete(temporary_host_operands, a.device)
     return out
 
 
@@ -668,6 +747,41 @@ def _vector_operand(v: torch.Tensor, device: torch.device, dtype: torch.dtype) -
     return v.to(device=device, dtype=dtype).reshape(-1).contiguous()
 
 
+def _blas_linear(x_2d, weight, bias, residual, residual_scale, out_shape):
+    """``residual + residual_scale * (x_2d @ weight.T + bias)`` on rocBLAS, reshaped to
+    ``out_shape``, with no temporary beyond one staged weight chunk.
+
+    A weight on another device (an offloaded host weight) is copied over in row chunks
+    of at most _FALLBACK_SCRATCH_BYTES, each GEMM writing its column slice of the output
+    in place, so it costs one chunk of VRAM rather than the whole weight: the footprint
+    the kernel has when it reads the weight where it lies. The epilogue runs in place.
+    """
+    device = x_2d.device
+    m = x_2d.shape[0]
+    n, k = weight.shape
+    out = torch.empty((m, n), dtype=x_2d.dtype, device=device)
+    bias = None if bias is None else bias.to(device=device)
+    rows = n
+    if weight.device != device:
+        rows = max(1, _FALLBACK_SCRATCH_BYTES // max(1, k * weight.element_size()))
+    for n0 in range(0, n, rows):
+        n1 = min(n, n0 + rows)
+        w = weight[n0:n1].to(device=device, non_blocking=True)
+        if bias is None:
+            torch.mm(x_2d, w.t(), out=out[:, n0:n1])
+        else:
+            torch.addmm(bias[n0:n1], x_2d, w.t(), out=out[:, n0:n1])
+        # freed before the next chunk is staged, so the allocator hands its block back
+        # (stream-ordered: the copy into it queues behind this GEMM)
+        del w
+    out = out.view(out_shape)
+    if residual is not None:
+        # addcmul into its own input is elementwise, so it rounds exactly as out of place
+        torch.addcmul(residual.to(device=device, dtype=out.dtype), out,
+                      residual_scale.to(device=device, dtype=out.dtype), out=out)
+    return out
+
+
 def fp16_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -676,7 +790,8 @@ def fp16_linear(
     residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """FP16 WMMA GEMM with bias and an optional ``residual + residual_scale * out``
-    fused into the epilogue; torch's linear where the kernel declines the shape."""
+    fused into the epilogue. Devices without native WMMA, and shapes the kernel
+    declines, run rocBLAS through _blas_linear, which keeps the kernel's footprint."""
     if residual is not None and residual_scale is None:
         raise ValueError("fp16_linear: residual requires residual_scale")
 
@@ -684,11 +799,13 @@ def fp16_linear(
     x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
     m = x_2d.shape[0]
     n, k = weight.shape
+    out_shape = (*orig_shape[:-1], n)
 
     supported = (
-        x.dtype == torch.float16
+        _native_wmma_on(x.device)
+        and x.dtype == torch.float16
         and weight.dtype == torch.float16
-        and weight.device == x.device
+        and (weight.device == x.device or (weight.device.type == "cpu" and weight.is_pinned()))
         and x_2d.shape[1] == k
         # the tile stager issues 16-byte row loads; a misaligned view falls back, as on CUDA
         and x_2d.data_ptr() % 16 == 0
@@ -696,17 +813,15 @@ def fp16_linear(
         and (residual is None or (residual.dtype == torch.float16
                                   and residual_scale.dtype == torch.float16))
     )
+    temporary_host_operands: list[torch.Tensor] = []
     if supported:
-        weight = weight if weight.is_contiguous() else weight.contiguous()
+        weight = _weight_operand(
+            weight, x.device, "weight", temporary_host_operands=temporary_host_operands
+        )
         supported = weight.data_ptr() % 16 == 0
     if not supported:
         # the kernel path takes bias and residual from any device, so the fallback must too
-        bias = None if bias is None else bias.to(device=x.device)
-        if residual is not None:
-            residual = residual.to(device=x.device)
-            residual_scale = residual_scale.to(device=x.device)
-        out = torch.nn.functional.linear(x, weight, bias)
-        return _apply_residual(out, residual, residual_scale)
+        return _blas_linear(x_2d, weight, bias, residual, residual_scale, out_shape)
 
     out = torch.empty((m, n), dtype=torch.float16, device=x.device)
     bias_arg = None if bias is None else _vector_operand(bias, x.device, torch.float16)
@@ -722,9 +837,9 @@ def fp16_linear(
         m, n, k, _stream(x),
     )
     if not served:
-        out = _apply_residual(torch.nn.functional.linear(x_2d, weight, bias_arg), resid_arg,
-                              rscale_arg)
-    return out if len(orig_shape) == 2 else out.reshape(*orig_shape[:-1], n)
+        out = _blas_linear(x_2d, weight, bias_arg, resid_arg, rscale_arg, (m, n))
+    _retain_host_operands_until_stream_complete(temporary_host_operands, x.device)
+    return out if len(orig_shape) == 2 else out.reshape(out_shape)
 
 
 # Acts the HIP fused quantizer implements; anything else is applied eagerly so
@@ -770,7 +885,10 @@ def int8_linear(
             f"Input and weight inner dimensions must match, got {k_act} and {weight.shape[-1]}"
         )
 
-    weight = _aligned(weight.to(device=x.device).contiguous())
+    temporary_host_operands: list[torch.Tensor] = []
+    weight = _weight_operand(
+        weight, x.device, "weight", temporary_host_operands=temporary_host_operands
+    )
     weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1)
     if weight_scale.numel() not in (1, weight.shape[0]):
         raise ValueError(
@@ -821,6 +939,7 @@ def int8_linear(
         None if bias is None else _dl(bias),
         m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
     )
+    _retain_host_operands_until_stream_complete(temporary_host_operands, x.device)
     # Unlike CUDA, the residual is not folded into the epilogue: the per-element
     # residual reads there cost more than a separate addcmul at the output widths
     # pre-norm blocks apply it to.
@@ -1302,7 +1421,13 @@ def convrot_w4a4_linear(
         )
     if not _convrot_supported(x.shape[-1], convrot_groupsize, x.device, x.dtype):
         return _eager.convrot_w4a4_linear(
-            x, qweight, wscales, bias, convrot_groupsize, quant_group_size, linear_dtype
+            x,
+            qweight.to(device=x.device),
+            wscales,
+            bias,
+            convrot_groupsize,
+            quant_group_size,
+            linear_dtype,
         )
 
     if linear_dtype == "int8":
@@ -1332,7 +1457,14 @@ def convrot_w4a4_linear(
         raise ValueError(f"wscales must have {n} entries, got {wscales.numel()}")
     if bias is not None:
         bias = _bias_operand(bias, n, x.device)
-    qw = _operand(qweight, x.device, "qweight", shape=(n, k // 2))
+    temporary_host_operands: list[torch.Tensor] = []
+    qw = _weight_operand(
+        qweight,
+        x.device,
+        "qweight",
+        shape=(n, k // 2),
+        temporary_host_operands=temporary_host_operands,
+    )
 
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
     _C.convrot_w4a4_gemm(
@@ -1340,6 +1472,7 @@ def convrot_w4a4_linear(
         _dl(x_scale), _dl(wscales), None if bias is None else _dl(bias),
         m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
     )
+    _retain_host_operands_until_stream_complete(temporary_host_operands, x.device)
     return out.reshape(*orig_shape[:-1], n)
 
 
@@ -1598,7 +1731,8 @@ def _ndhwc_strides(t: torch.Tensor):
 
 def _wmma_fp16_conv3d(x, weight, bias, residual, stride, out=None):
     """The fused kernel's result, or None when it does not apply to this call. x and out may
-    be NDHWC-ordered views of larger tensors, so a tiled convolution needs no per-tile copies."""
+    be NDHWC-ordered views of larger tensors, so a tiled convolution needs no per-tile copies.
+    """
     n, c, d, h, w = x.shape
     k, _, t, r, s = weight.shape
     sd, sh, sw = stride
@@ -1654,6 +1788,54 @@ def _wmma_fp16_conv3d(x, weight, bias, residual, stride, out=None):
     return out if served else None
 
 
+def _torch_conv3d(x, weight, bias, residual, stride, out=None):
+    """torch's conv3d plus residual, channels_last_3d, computed in output windows sized
+    so MIOpen's im2col workspace stays near _FALLBACK_SCRATCH_BYTES.
+
+    Unchunked, that workspace is the C*T*R*S patch row of every output pixel, some 30x
+    the output. Windows are whole output frames where one fits the budget and output
+    rows of a single frame otherwise; each reads its input window with the kernel halo
+    in place and is written straight into ``out``, which may be a caller's view.
+    """
+    # the kernel path takes bias and residual from any device, so the fallback must too
+    bias = None if bias is None else bias.to(device=x.device)
+    residual = None if residual is None else residual.to(device=x.device)
+    cl = torch.channels_last_3d
+    z = p = q = 0
+    if x.dim() == 5 and weight.dim() == 5 and min(stride) >= 1:
+        n, c, d, h, w = x.shape
+        k, _, t, r, s = weight.shape
+        sd, sh, sw = stride
+        z, p, q = (d - t) // sd + 1, (h - r) // sh + 1, (w - s) // sw + 1
+    if min(z, p, q) < 1:
+        # torch reports the bad argument
+        y = torch.nn.functional.conv3d(x, weight, bias, stride=stride).contiguous(memory_format=cl)
+        y = y if residual is None else y + residual
+        return y if out is None else out.copy_(y)
+    if out is None:
+        out = torch.empty((n, k, z, p, q), dtype=x.dtype, device=x.device, memory_format=cl)
+    elif out.shape != (n, k, z, p, q):
+        raise ValueError("fp16_conv3d: out must be an fp16 [N, K, Z, P, Q] tensor on x's device")
+    # a broadcast residual cannot be windowed; it is added over the whole output after
+    windowed = residual is not None and residual.shape == out.shape
+    row_bytes = n * q * (c * t * r * s + k) * x.element_size()
+    rows = max(1, _FALLBACK_SCRATCH_BYTES // row_bytes)
+    frames, rows = (max(1, rows // p), p) if rows >= p else (1, rows)
+    for z0 in range(0, z, frames):
+        z1 = min(z, z0 + frames)
+        for p0 in range(0, p, rows):
+            p1 = min(p, p0 + rows)
+            xw = x[:, :, z0 * sd:(z1 - 1) * sd + t, p0 * sh:(p1 - 1) * sh + r]
+            y = torch.nn.functional.conv3d(xw, weight, bias, stride=stride)
+            if windowed:
+                y.add_(residual[:, :, z0:z1, p0:p1])
+            out[:, :, z0:z1, p0:p1].copy_(y)
+            del y  # before the next window's conv allocates its own
+    if residual is not None and not windowed:
+        out.add_(residual)
+    return out
+
+
 def fp16_conv3d(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1661,17 +1843,14 @@ def fp16_conv3d(
     residual: torch.Tensor | None,
     stride: list[int],
 ) -> torch.Tensor:
-    """FP16 conv3d with fused bias/residual, channels_last_3d in and out; torch's
-    conv when the kernel declines the shape."""
-    out = _wmma_fp16_conv3d(x, weight, bias, residual, stride)
+    """FP16 conv3d with fused bias/residual, channels_last_3d in and out. Devices
+    without native WMMA, and shapes the kernel declines, run torch's conv through
+    _torch_conv3d, which bounds its workspace."""
+    out = (_wmma_fp16_conv3d(x, weight, bias, residual, stride)
+           if _native_wmma_on(x.device) else None)
     if out is not None:
         return out
-    # the kernel path takes bias and residual from any device, so the fallback must too
-    bias = None if bias is None else bias.to(device=x.device)
-    residual = None if residual is None else residual.to(device=x.device)
-    out = torch.nn.functional.conv3d(x, weight, bias, stride=stride).contiguous(
-        memory_format=torch.channels_last_3d)
-    return out if residual is None else out + residual
+    return _torch_conv3d(x, weight, bias, residual, stride)
 
 
 def fp16_conv3d_out(
@@ -1682,8 +1861,16 @@ def fp16_conv3d_out(
     stride: list[int],
     out: torch.Tensor,
 ) -> None:
-    """fp16_conv3d into ``out``; computed then copied when the kernel cannot index ``out``."""
-    if _wmma_fp16_conv3d(x, weight, bias, residual, stride, out=out) is not None:
+    """fp16_conv3d into ``out``; computed then copied when neither path can write it
+    in place."""
+    if (_native_wmma_on(x.device)
+            and _wmma_fp16_conv3d(x, weight, bias, residual, stride, out=out) is not None):
+        return
+    # windows written early must not be read by later ones
+    if (out.dtype == x.dtype and out.device == x.device and out.dim() == 5
+            and not any(t is not None and _tensors_overlap(out, t)
+                        for t in (x, weight, bias, residual))):
+        _torch_conv3d(x, weight, bias, residual, stride, out=out)
         return
     out.copy_(fp16_conv3d(x, weight, bias, residual, stride))
 
@@ -1799,6 +1986,22 @@ def _rope(xq, xk, freqs_cis, split_half, inplace=False):
             raise ValueError("xq and xk must be on the same device")
         if xk.dtype != xq.dtype:
             raise ValueError("xq and xk must have the same dtype")
+
+    arch = _gfx_arch(xq.device)
+    if (
+        split_half
+        and freqs_cis.dtype != torch.float32
+        and arch is not None
+        and (arch == "gfx90c" or arch.startswith("gfx10"))
+    ):
+        xq_result = _eager_rope.apply_rope_split_half1(xq, freqs_cis)
+        xk_result = None if xk is None else _eager_rope.apply_rope_split_half1(xk, freqs_cis)
+        if inplace:
+            xq.copy_(xq_result)
+            if xk is not None:
+                xk.copy_(xk_result)
+            return xq, xk
+        return xq_result, xk_result
 
     if inplace:
         # Each thread owns one (a, b) pair and loads both before storing either,
@@ -2190,8 +2393,7 @@ def _check_sol_args(sink_blocks, sink_q, topk_ratio, **tensors):
     from comfy_kitchen.constraints import sol_attn_common_call_rule
 
     if not has_wmma():
-        raise RuntimeError(
-            "sol_attn: requires RDNA3 or newer matrix cores (WMMA); this device has none")
+        raise RuntimeError("sol_attn: requires a validated HIP tiled-attention architecture")
     check = sol_attn_common_call_rule(
         {"sink_blocks": sink_blocks, "sink_q": sink_q, "topk_ratio": topk_ratio, **tensors})
     if not check.success:
@@ -2435,10 +2637,22 @@ def _build_constraints(has_wmma: bool = True) -> dict:
 
     # PyTorch exposes ROCm tensors with device type "cuda".
     dev = frozenset({"cuda", "hip"})
+    cpu_weight_devices = dev | frozenset({"cpu"})
     floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
     half_floats = frozenset({torch.float16, torch.bfloat16})
     fp8s = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
     out_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
+
+    def _pinned_cpu_weight_call_rule(kwargs):
+        for name in ("weight", "qweight"):
+            weight = kwargs.get(name)
+            if (
+                isinstance(weight, torch.Tensor)
+                and weight.device.type == "cpu"
+                and not weight.is_pinned()
+            ):
+                return ValidationResult.fail(name, "CPU weights must be mapped pinned memory")
+        return ValidationResult.ok()
 
     def _na3d_call_rule(kwargs):
         common = na3d_common_call_rule(kwargs)
@@ -2547,10 +2761,13 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         "int8_linear": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=floats, shape_rules=(DivisibleBy(-1, 16),)),
-                "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}), devices=cpu_weight_devices
+                ),
                 "out_dtype": ParamConstraint(dtypes=out_floats),
             },
             default_devices=dev,
+            call_rules=(_pinned_cpu_weight_call_rule,),
         ),
         "quantize_w4a8_int8_weight": FunctionConstraints(
             params={
@@ -2622,9 +2839,12 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         "convrot_w4a4_linear": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=floats, shape_rules=(DivisibleBy(-1, 32),)),
-                "qweight": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "qweight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}), devices=cpu_weight_devices
+                ),
             },
             default_devices=dev,
+            call_rules=(_pinned_cpu_weight_call_rule,),
         ),
         # 2D only: the tile-packed weight/scale variants have no HIP kernel and
         # fall through to eager.
@@ -2680,13 +2900,16 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             params={
                 "x": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(MinDims(2),)),
                 "weight": ParamConstraint(
-                    dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(2),)
+                    dtypes=frozenset({torch.float16}),
+                    devices=cpu_weight_devices,
+                    shape_rules=(ExactDims(2),),
                 ),
                 "bias": ParamConstraint(dtypes=frozenset({torch.float16})),
                 "residual": ParamConstraint(dtypes=frozenset({torch.float16})),
                 "residual_scale": ParamConstraint(dtypes=frozenset({torch.float16})),
             },
             default_devices=dev,
+            call_rules=(_pinned_cpu_weight_call_rule,),
         ),
         "fp16_conv3d": FunctionConstraints(
             params={
@@ -2799,10 +3022,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         constraints[inplace_name] = constraints[functional_name]
 
     if not has_wmma:
-        # RDNA2: the GEMM kernels are compiled but trap, so they must not be
-        # advertised. Dropping them here routes those ops to triton/eager while the
-        # elementwise kernels below still dispatch to HIP.
-        constraints = {k: v for k, v in constraints.items() if k not in _WMMA_ONLY_OPS}
+        constraints = {k: v for k, v in constraints.items() if k not in _TILED_ATTENTION_OPS}
 
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in constraints:
@@ -2842,8 +3062,7 @@ def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool) -> int:
 def int8_attention_is_available() -> bool:
     """Whether the INT8 attention kernels can run here.
 
-    Stricter than is_available(): the kernel is built on the matrix cores, so
-    RDNA2 declines it the way it declines the GEMMs.
+    Native WMMA and software tile policies implement the same fragment contract.
     """
     return has_wmma()
 
@@ -2858,7 +3077,14 @@ def flash_attention_decode_is_available() -> bool:
     The attribute test catches an extension built before the kernel existed,
     which is otherwise an AttributeError at dispatch.
     """
-    return has_wmma() and hasattr(_C, "flash_attention_decode")
+    return has_native_wmma() and hasattr(_C, "flash_attention_decode")
+
+
+def _require_sage_attention() -> None:
+    if not has_wmma():
+        raise RuntimeError(
+            "sage int8 attention requires a validated HIP tiled-attention architecture"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2883,7 +3109,7 @@ def gated_delta_decode_is_available(key_head_dim: int = 128, value_head_dim: int
     throughout, so they draw the line where has_wmma() does, as the decode
     attention kernel next door does.
     """
-    if not has_wmma() or not hasattr(_C, "gated_delta_decode_fused"):
+    if not has_native_wmma() or not hasattr(_C, "gated_delta_decode_fused"):
         return False
     if key_head_dim != _DELTA_KEY_DIM or value_head_dim <= 0 or value_head_dim > 512:
         return False
@@ -3045,6 +3271,7 @@ def sage_int8_sdpa(
 ) -> torch.Tensor:
     """Quantize and attend in one call. q, k and v are already padded to a
     supported head dimension; the output keeps that width."""
+    _require_sage_attention()
     batch, q_heads, q_length, head_dim = q.shape
     output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
     output = torch.empty(
@@ -3083,6 +3310,7 @@ def sage_int8_quantize(
     cta_k: int = _SAGE_CTA_K,
 ) -> dict:
     """Quantize q, k and v without allocating the attention output."""
+    _require_sage_attention()
     buffers, anchor_indices = _sage_buffers(q, k, cta_k)
     _C.sage_sdpa_quantize(
         _dl(q),
@@ -3116,6 +3344,7 @@ def sage_int8_attend(
     cta_k: int = _SAGE_CTA_K,
 ) -> torch.Tensor:
     """Attend over the packed layouts sage_int8_quantize produced."""
+    _require_sage_attention()
     batch, q_heads, q_length, head_dim = q_int8.shape
     output = torch.empty(
         batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q_int8.device
@@ -3161,6 +3390,7 @@ def _register():
         return
 
     has_wmma = _has_wmma(arches)
+    has_native_wmma = _has_native_wmma(arches)
     registry.register(
         name="hip",
         module=sys.modules[__name__],
@@ -3169,7 +3399,7 @@ def _register():
     logger.debug(
         "registered HIP backend for %s (%s)",
         ", ".join(sorted({a for a in arches if a})),
-        "with WMMA" if has_wmma else "elementwise only, no matrix cores",
+        "with native WMMA" if has_native_wmma else "with software tile GEMM",
     )
 
 

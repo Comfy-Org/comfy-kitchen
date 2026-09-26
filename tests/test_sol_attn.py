@@ -304,12 +304,11 @@ def test_incapable_device_rejected_at_the_wrapper(monkeypatch):
     # about the gate.
     assert backend.sol_attn(q, k, v, tau=1.4).shape == q.shape
     if backend is hip_backend:
-        # RDNA2 compiles the WMMA kernels to a trap and reports no matrix cores.
         # The gate lives in the shared _check_sol_args, which sol_attn runs before
         # it plans a workspace; patching the module attribute is what the call
         # inside it resolves.
         monkeypatch.setattr(backend, "has_wmma", lambda: False)
-        match = "WMMA"
+        match = "tiled-attention"
     else:
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (7, 5))
         match = "sm_80"

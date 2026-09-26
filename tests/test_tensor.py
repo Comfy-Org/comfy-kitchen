@@ -423,6 +423,9 @@ class TestCapabilityChecking:
 
     def test_get_cuda_capability(self):
         cap = get_cuda_capability()
+        if getattr(torch.version, "hip", None):
+            assert cap is None
+            return
         assert cap is not None
         assert isinstance(cap, tuple)
         assert len(cap) == 2
@@ -446,7 +449,7 @@ class TestCapabilityChecking:
 
         assert reqs["layout"] == "TensorCoreFP8Layout"
         assert reqs["min_sm_version"] == (8, 9)
-        assert reqs["current_sm_version"] is not None
+        assert (reqs["current_sm_version"] is None) == bool(getattr(torch.version, "hip", None))
         assert isinstance(reqs["fast_matmul_supported"], bool)
 
     def test_get_requirements_nvfp4(self):
@@ -454,7 +457,7 @@ class TestCapabilityChecking:
 
         assert reqs["layout"] == "TensorCoreNVFP4Layout"
         assert reqs["min_sm_version"] == (10, 0)
-        assert reqs["current_sm_version"] is not None
+        assert (reqs["current_sm_version"] is None) == bool(getattr(torch.version, "hip", None))
         assert isinstance(reqs["fast_matmul_supported"], bool)
 
     def test_supports_fast_matmul_consistent_with_requirements(self):
