@@ -198,7 +198,12 @@ extern "C" {
         int k_st_bz, int k_st_n, int k_st_h,
         int v_st_bz, int v_st_h, int v_st_d,
         int o_st_bz, int o_st_n, int o_st_h,
-        float sm_scale, int output_dtype_code, cudaStream_t stream);
+        float sm_scale, int output_dtype_code, cudaStream_t stream, const float *mask_tile_bias = nullptr);
+
+    void launch_sage_prepare_key_mask(
+        const void *mask, float *packed, int batch, int heads, int length,
+        int64_t stride_b, int64_t stride_h, int64_t stride_k,
+        int dtype_code, cudaStream_t stream);
 
     // SVDQuant W4A4 — see ops/quantize_svdquant_w4a4.cu
     void launch_svdquant_quantize_w4a4_kernel(
@@ -1028,6 +1033,106 @@ void sage_sdpa_quantize(
     }
 }
 
+// Internal packed key masks are contiguous [mask_batch, mask_heads, width].
+// Singleton batch/head dimensions are broadcast by the attention launcher.
+void validate_prepared_key_mask(
+    const nb::ndarray<nb::device::cuda> &packed, int B, int H, int Lk)
+{
+    const int width = ((((Lk + 127) / 128) * 129 + 3) / 4) * 4;
+    if (packed.ndim() != 3 ||
+        (packed.shape(0) != 1 && packed.shape(0) != B) ||
+        (packed.shape(1) != 1 && packed.shape(1) != H) || packed.shape(2) != width ||
+        packed.dtype() != nb::dtype<float>() || packed.stride(2) != 1 ||
+        reinterpret_cast<uintptr_t>(packed.data()) % 8 != 0 ||
+        (packed.shape(1) > 1 && packed.stride(1) != width) ||
+        (packed.shape(0) > 1 && packed.stride(0) != packed.shape(1) * width)) {
+        throw std::runtime_error("sage_sdpa: incompatible prepared key mask");
+    }
+}
+
+void sage_prepare_key_mask(
+    nb::ndarray<nb::device::cuda> mask,
+    nb::ndarray<nb::device::cuda> packed, uintptr_t stream_ptr)
+{
+    if (mask.ndim() != 4 || mask.shape(2) != 1 || mask.shape(3) == 0 ||
+        mask.device_id() != packed.device_id()) {
+        throw std::runtime_error("sage_prepare_key_mask: expected [B,H,1,K] on the output device");
+    }
+    validate_prepared_key_mask(packed, mask.shape(0), mask.shape(1), mask.shape(3));
+    if (packed.shape(0) != mask.shape(0) || packed.shape(1) != mask.shape(1)) {
+        throw std::runtime_error("sage_prepare_key_mask: output batch/head dimensions must match");
+    }
+    const int dtype_code = mask.dtype().code == (uint8_t)nb::dlpack::dtype_code::Bool
+        ? 3 : map_dtype_to_code(mask.dtype());
+    launch_sage_prepare_key_mask(
+        mask.data(), static_cast<float *>(packed.data()),
+        mask.shape(0), mask.shape(1), mask.shape(3),
+        mask.stride(0), mask.stride(1), mask.stride(3), dtype_code,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+struct SageAttentionMask {
+    const void *data = nullptr;
+    int64_t stride_b = 0;
+    int64_t stride_h = 0;
+    int64_t stride_q = 0;
+    int64_t stride_k = 0;
+    int dtype_code = -1;
+    const float *tile_bias = nullptr;
+};
+
+SageAttentionMask parse_sage_attention_mask(
+    const std::optional<nb::ndarray<nb::device::cuda>> &attn_mask,
+    int B, int H, int Lq, int Lk, int D, int cta_k, int device_id)
+{
+    if (cta_k != 64 && cta_k != 128) {
+        throw std::runtime_error("sage_sdpa: cta_k must be 64 or 128");
+    }
+    if (cta_k == 128 && (D == 64 || (attn_mask.has_value() && attn_mask->ndim() != 3))) {
+        throw std::runtime_error(
+            "sage_sdpa: cta_k 128 requires unmasked head_dim 128/256 or a prepared key mask");
+    }
+    SageAttentionMask result;
+    if (!attn_mask.has_value()) {
+        return result;
+    }
+    const auto &mask = attn_mask.value();
+    if (mask.device_id() != device_id) {
+        throw std::runtime_error("sage_sdpa: attention mask must be on the input device");
+    }
+    // The frontend expands ordinary masks to 4D; only prepared buffers are 3D.
+    if (mask.ndim() == 3) {
+        if ((D != 64 && D != 128 && D != 256) || cta_k != (D == 64 ? 64 : 128)) {
+            throw std::runtime_error("sage_sdpa: incompatible head dimension or tile size for prepared mask");
+        }
+        validate_prepared_key_mask(mask, B, H, Lk);
+        result.data = mask.data();
+        result.stride_b = mask.shape(0) == 1 ? 0 : mask.stride(0);
+        result.stride_h = mask.shape(1) == 1 ? 0 : mask.stride(1);
+        result.stride_k = 1;
+        result.dtype_code = 0;
+        result.tile_bias = static_cast<const float *>(mask.data()) + ((Lk + 127) / 128) * 128;
+    } else {
+        if (mask.ndim() != 4 || mask.shape(0) != B || mask.shape(1) != H ||
+            mask.shape(2) != Lq || mask.shape(3) != Lk) {
+            throw std::runtime_error(
+                "sage_sdpa: attention mask must be expanded to [B,H_q,Lq,Lk]");
+        }
+        result.dtype_code = mask.dtype().code == (uint8_t)nb::dlpack::dtype_code::Bool
+            ? 3 : map_dtype_to_code(mask.dtype());
+        if (result.dtype_code < 0 || result.dtype_code > 3) {
+            throw std::runtime_error(
+                "sage_sdpa: attention mask must be bool, float16, bfloat16, or float32");
+        }
+        result.data = mask.data();
+        result.stride_b = mask.stride(0);
+        result.stride_h = mask.stride(1);
+        result.stride_q = mask.stride(2);
+        result.stride_k = mask.stride(3);
+    }
+    return result;
+}
+
 // Attention half of the split INT8 SDPA API.  The input tensors use the exact
 // packed layouts produced by sage_sdpa_quantize; no floating-point Q/K/V
 // tensor is retained or reconstructed.
@@ -1043,15 +1148,12 @@ void sage_sdpa_prequantized(
     float sm_scale,
     int output_dtype_code,
     uintptr_t stream_ptr,
-    std::optional<nb::ndarray<nb::device::cuda>> attn_mask = std::nullopt)
+    std::optional<nb::ndarray<nb::device::cuda>> attn_mask)
 {
     if (q_int8.ndim() != 4 || k_int8.ndim() != 4 ||
         v_int8.ndim() != 2 || o.ndim() != 4) {
         throw std::runtime_error(
             "sage_sdpa_prequantized: q/k/o must be 4D and packed v must be 2D");
-    }
-    if (cta_k != 64 && cta_k != 128) {
-        throw std::runtime_error("sage_sdpa_prequantized: cta_k must be 64 or 128");
     }
     if (output_dtype_code != 1 && output_dtype_code != 2) {
         throw std::runtime_error(
@@ -1064,12 +1166,9 @@ void sage_sdpa_prequantized(
     const int D = static_cast<int>(q_int8.shape(3));
     const int H_kv = static_cast<int>(k_int8.shape(1));
     const int Lk = static_cast<int>(k_int8.shape(2));
+    const auto mask = parse_sage_attention_mask(
+        attn_mask, B, H_q, Lq, Lk, D, cta_k, q_int8.device_id());
     const int padded_Lk = ((Lk + cta_k - 1) / cta_k) * cta_k;
-
-    if (cta_k == 128 && (D == 64 || attn_mask.has_value())) {
-        throw std::runtime_error(
-            "sage_sdpa_prequantized: cta_k 128 requires unmasked head_dim 128 or 256");
-    }
 
     if (k_int8.shape(0) != B || k_int8.shape(3) != D ||
         o.shape(0) != B || o.shape(1) != H_q || o.shape(2) != Lq ||
@@ -1088,35 +1187,6 @@ void sage_sdpa_prequantized(
         o.stride(1) != static_cast<int64_t>(Lq) * D) {
         throw std::runtime_error(
             "sage_sdpa_prequantized: quantized tensors and output must be contiguous");
-    }
-
-    const void *mask_ptr = nullptr;
-    int64_t mask_stride_b = 0;
-    int64_t mask_stride_h = 0;
-    int64_t mask_stride_q = 0;
-    int64_t mask_stride_k = 0;
-    int mask_dtype_code = -1;
-    if (attn_mask.has_value()) {
-        const auto &mask = attn_mask.value();
-        if (mask.ndim() != 4 || mask.shape(0) != B || mask.shape(1) != H_q ||
-            mask.shape(2) != Lq || mask.shape(3) != Lk) {
-            throw std::runtime_error(
-                "sage_sdpa_prequantized: attention mask must be expanded to [B,H_q,Lq,Lk]");
-        }
-        if (mask.dtype().code == (uint8_t)nb::dlpack::dtype_code::Bool) {
-            mask_dtype_code = 3;
-        } else {
-            mask_dtype_code = map_dtype_to_code(mask.dtype());
-        }
-        if (mask_dtype_code < 0 || mask_dtype_code > 3) {
-            throw std::runtime_error(
-                "sage_sdpa_prequantized: attention mask must be bool, float16, bfloat16, or float32");
-        }
-        mask_ptr = mask.data();
-        mask_stride_b = mask.stride(0);
-        mask_stride_h = mask.stride(1);
-        mask_stride_q = mask.stride(2);
-        mask_stride_k = mask.stride(3);
     }
 
     const int64_t qi_st_bz64 = static_cast<int64_t>(H_q) * Lq * D;
@@ -1141,17 +1211,18 @@ void sage_sdpa_prequantized(
     const int o_st_bz = static_cast<int>(qi_st_bz64);
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+
     launch_sage_attn_kernel(
         q_int8.data(), k_int8.data(), v_int8.data(), o.data(),
         q_scale.data(), k_scale.data(), v_scale.data(),
-        mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
-        mask_dtype_code, cta_k,
+        mask.data, mask.stride_b, mask.stride_h, mask.stride_q, mask.stride_k,
+        mask.dtype_code, cta_k,
         B, Lq, Lk, H_q, H_kv, D,
         qi_st_bz, qi_st_n, qi_st_h,
         ki_st_bz, ki_st_n, ki_st_h,
         v_st_bz, v_st_h, v_st_d,
         o_st_bz, o_st_n, o_st_h,
-        sm_scale, output_dtype_code, stream);
+        sm_scale, output_dtype_code, stream, mask.tile_bias);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -1237,8 +1308,8 @@ void sage_sdpa(
     int output_dtype_code,
     uintptr_t stream_ptr,
     uintptr_t anchor_indices_ptr,
-    std::optional<nb::ndarray<nb::device::cuda>> attn_mask = std::nullopt,
-    int cta_k = 0)
+    std::optional<nb::ndarray<nb::device::cuda>> attn_mask,
+    int cta_k)
 {
     if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || o.ndim() != 4) {
         throw std::runtime_error("sage_sdpa: q, k, v, o must be 4D [B,H,L,D]");
@@ -1251,34 +1322,8 @@ void sage_sdpa(
     const int H_kv = static_cast<int>(k.shape(1));
     const int Lk = static_cast<int>(k.shape(2));
 
-    const void *mask_ptr = nullptr;
-    int64_t mask_stride_b = 0;
-    int64_t mask_stride_h = 0;
-    int64_t mask_stride_q = 0;
-    int64_t mask_stride_k = 0;
-    int mask_dtype_code = -1;
-    if (attn_mask.has_value()) {
-        const auto &mask = attn_mask.value();
-        if (mask.ndim() != 4 || mask.shape(0) != B || mask.shape(1) != H_q ||
-            mask.shape(2) != Lq || mask.shape(3) != Lk) {
-            throw std::runtime_error(
-                "sage_sdpa: attention mask must be expanded to [B,H_q,Lq,Lk]");
-        }
-        if (mask.dtype().code == (uint8_t)nb::dlpack::dtype_code::Bool) {
-            mask_dtype_code = 3;
-        } else {
-            mask_dtype_code = map_dtype_to_code(mask.dtype());
-        }
-        if (mask_dtype_code < 0 || mask_dtype_code > 3) {
-            throw std::runtime_error(
-                "sage_sdpa: attention mask must be bool, float16, bfloat16, or float32");
-        }
-        mask_ptr = mask.data();
-        mask_stride_b = mask.stride(0);
-        mask_stride_h = mask.stride(1);
-        mask_stride_q = mask.stride(2);
-        mask_stride_k = mask.stride(3);
-    }
+    const auto mask = parse_sage_attention_mask(
+        attn_mask, B, H_q, Lq, Lk, D, cta_k, q.device_id());
 
     if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error("sage_sdpa: input_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
@@ -1286,18 +1331,6 @@ void sage_sdpa(
     if (output_dtype_code != 1 && output_dtype_code != 2) {
         throw std::runtime_error(
             "sage_sdpa: output_dtype_code must be 1 (fp16) or 2 (bf16)");
-    }
-    if (cta_k == 0) {
-        cta_k = !attn_mask.has_value() && D >= 128 && Lk > 1024
-            ? 128
-            : 64;
-    }
-    if (cta_k != 64 && cta_k != 128) {
-        throw std::runtime_error("sage_sdpa: cta_k must be 64 or 128");
-    }
-    if (cta_k == 128 && (D == 64 || attn_mask.has_value())) {
-        throw std::runtime_error(
-            "sage_sdpa: cta_k 128 requires unmasked head_dim 128 or 256");
     }
     if (!anchor_indices_ptr) {
         throw std::runtime_error(
@@ -1349,14 +1382,14 @@ void sage_sdpa(
     launch_sage_attn_kernel(
         q_int8.data(), k_int8.data(), v_int8.data(), o.data(),
         q_scale.data(), k_scale.data(), v_scale.data(),
-        mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
-        mask_dtype_code, cta_k,
+        mask.data, mask.stride_b, mask.stride_h, mask.stride_q, mask.stride_k,
+        mask.dtype_code, cta_k,
         B, Lq, Lk, H_q, H_kv, D,
         qi_st_bz, qi_st_n, qi_st_h,
         ki_st_bz, ki_st_n, ki_st_h,
         v_st_bz, v_st_h, v_st_d,
         o_st_bz, o_st_n, o_st_h,
-        sm_scale, output_dtype_code, stream);
+        sm_scale, output_dtype_code, stream, mask.tile_bias);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -4307,6 +4340,9 @@ NB_MODULE(_C, m) {
           nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"));
 
+    m.def("sage_prepare_key_mask", &sage_prepare_key_mask,
+          nb::arg("mask"), nb::arg("packed"), nb::arg("stream_ptr"));
+
     m.def("sage_sdpa_quantize", &sage_sdpa_quantize,
           "Prequantize Q/K/V for split pure-INT8 SDPA",
           nb::arg("q"),
@@ -4336,7 +4372,7 @@ NB_MODULE(_C, m) {
           nb::arg("sm_scale"),
           nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"),
-          nb::arg("attn_mask") = nb::none());
+          nb::arg("attn_mask"));
 
     m.def("sage_sdpa", &sage_sdpa,
           "Fused pure-INT8 SDPA: quant_qk + quant_v + attention in one call",
@@ -4355,8 +4391,8 @@ NB_MODULE(_C, m) {
           nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"),
           nb::arg("anchor_indices_ptr"),
-          nb::arg("attn_mask") = nb::none(),
-          nb::arg("cta_k") = 0);
+          nb::arg("attn_mask"),
+          nb::arg("cta_k"));
 
     m.def("svdquant_quantize_w4a4", &svdquant_quantize_w4a4,
           "SVDQuant W4A4: smooth + int4 quantize (LoRA-down is external). "

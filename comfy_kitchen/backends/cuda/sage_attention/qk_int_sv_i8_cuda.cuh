@@ -71,7 +71,8 @@ __global__ void qk_int_sv_i8_attn_kernel(
     const uint32_t stride_seq_k, const uint32_t stride_h_k,
     const uint32_t stride_bz_v, const uint32_t stride_h_v,
     const uint32_t stride_d_v, const uint32_t stride_bz_o,
-    const uint32_t stride_seq_o, const uint32_t stride_h_o, float sm_scale) {
+    const uint32_t stride_seq_o, const uint32_t stride_h_o, float sm_scale,
+    const float *__restrict__ MaskTileBias) {
   // compile time check
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4,
                 "DTypeQK must be int8 or int4");
@@ -104,7 +105,8 @@ __global__ void qk_int_sv_i8_attn_kernel(
                                               : (head_dim / 2 / MMA_QK_K);
   constexpr uint32_t num_tiles_v = head_dim / MMA_SV_N;
   constexpr bool custom_mask = mask_mode == MaskMode::kCustom ||
-                               mask_mode == MaskMode::kCustomKey;
+                               mask_mode == MaskMode::kCustomKey ||
+                               mask_mode == MaskMode::kPreparedKey;
   // For unmasked and causal FP32 kernels, retain raw scores until update_mdo
   // fuses score scaling, max subtraction, and conversion to the exp2 domain.
   // Custom masks keep pre-scaled scores so additive bias values retain their
@@ -134,6 +136,14 @@ __global__ void qk_int_sv_i8_attn_kernel(
   const uint32_t num_qo_heads = gridDim.y;
   const uint32_t head_id = blockIdx.y;
 
+  const float *key_mask = nullptr;
+  const float *key_tile_bias = nullptr;
+  if constexpr (mask_mode == MaskMode::kPreparedKey) {
+    const int64_t offset = batch_id * mask_stride_b + head_id * mask_stride_h;
+    key_mask = static_cast<const float *>(AttnMask) + offset;
+    key_tile_bias = MaskTileBias + offset;
+  }
+
   // transfer to base 2 instead of base e with better numerical efficiency
   sm_scale *= math::log2e;
 
@@ -156,7 +166,16 @@ __global__ void qk_int_sv_i8_attn_kernel(
                   head_id * num_warp_block_q + bx * num_warps_q +
                   get_warp_idx_q<num_warps_q, num_warps_k>();
   } else if constexpr (Q_GRAN == QuantGranularity::kPerThread) {
-    if constexpr (head_dim == 128 && WARP_Q == 16) {
+    if constexpr (mask_mode == MaskMode::kPreparedKey) {
+      // Q scales are packed in 128-row blocks even when attention uses
+      // smaller query tiles. D=128 also shares one scale across two warps.
+      constexpr uint32_t quant_warp_q = head_dim == 256 ? 16 : 32;
+      const uint32_t groups_per_head = div_ceil(qo_len, 128) * (128 / quant_warp_q);
+      const uint32_t query = bx * CTA_Q +
+          get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q;
+      q_scale_idx = ((batch_id * num_qo_heads + head_id) * groups_per_head +
+                     query / quant_warp_q) * 8 + lane_id / 4;
+    } else if constexpr (head_dim == 128 && WARP_Q == 16) {
       constexpr uint32_t quant_warps_q = CTA_Q / 32;
       const uint32_t num_warp_block_q = gridDim.x * quant_warps_q;
       q_scale_idx =
@@ -395,8 +414,31 @@ __global__ void qk_int_sv_i8_attn_kernel(
           smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
     }
     uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
-    if constexpr (use_fused_fp32_probabilities &&
-                  mask_mode == MaskMode::kNone) {
+    if constexpr (mask_mode == MaskMode::kPreparedKey) {
+      const float tile_bias = key_tile_bias[K_idx_lane_base / 128];
+      // The constant-tile branch pays off at D=128. A single FP32 path
+      // reduces register pressure and runs faster at D=64 and D=256.
+      if (head_dim == 128 && isfinite(tile_bias)) {
+        update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v, true>(
+            RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8, tile_bias * math::log2e);
+      } else {
+        auto &scores = reinterpret_cast<float (&)[num_tiles_q][num_tiles_k][8]>(RS);
+#pragma unroll
+        for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+          for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+#pragma unroll
+            for (uint32_t k = 0; k < 8; k++)
+              scores[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
+          }
+        }
+        apply_prepared_key_mask<num_tiles_q, num_tiles_k>(
+            K_idx_lane_base, scores, key_mask, sm_scale);
+        update_mdo_f32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
+            scores, RO, m, d, S_U8_OFFSET, RS_u8);
+      }
+    } else if constexpr (use_fused_fp32_probabilities &&
+                         mask_mode == MaskMode::kNone) {
       update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
           RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
     } else {
@@ -497,8 +539,29 @@ __global__ void qk_int_sv_i8_attn_kernel(
     }
 
     uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
-    if constexpr (use_fused_fp32_probabilities &&
-                  mask_mode == MaskMode::kNone) {
+    if constexpr (mask_mode == MaskMode::kPreparedKey) {
+      const float tile_bias = key_tile_bias[K_idx_lane_base / 128];
+      if (head_dim == 128 && isfinite(tile_bias)) {
+        update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v, true>(
+            RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8, tile_bias * math::log2e);
+      } else {
+        auto &scores = reinterpret_cast<float (&)[num_tiles_q][num_tiles_k][8]>(RS);
+#pragma unroll
+        for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+          for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+#pragma unroll
+            for (uint32_t k = 0; k < 8; k++)
+              scores[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
+          }
+        }
+        apply_prepared_key_mask<num_tiles_q, num_tiles_k>(
+            K_idx_lane_base, scores, key_mask, sm_scale);
+        update_mdo_f32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
+            scores, RO, m, d, S_U8_OFFSET, RS_u8);
+      }
+    } else if constexpr (use_fused_fp32_probabilities &&
+                         mask_mode == MaskMode::kNone) {
       update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
           RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
     } else {
@@ -604,55 +667,72 @@ __global__ void qk_int_sv_i8_attn_kernel(
           smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
     }
 
-    float RS_soft[num_tiles_q][num_tiles_k][8];
-    float pv_scale[num_tiles_q][2];
+    uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
+    if constexpr (mask_mode == MaskMode::kPreparedKey) {
+      auto &scores = reinterpret_cast<float (&)[num_tiles_q][num_tiles_k][8]>(RS);
 #pragma unroll
-    for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
-      for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+        for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
-        for (uint32_t k = 0; k < 8; k++) {
-          const float score = __int2float_rz(RS[fq][fk][k]);
-          RS_soft[fq][fk][k] =
-              pre_scale_scores ? score * sm_scale : score;
+          for (uint32_t k = 0; k < 8; k++)
+            scores[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
         }
       }
-    }
+      apply_prepared_key_mask<num_tiles_q, num_tiles_k>(
+          K_idx_lane_base, scores, key_mask, sm_scale);
+      update_mdo_f32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
+          scores, RO, m, d, S_U8_OFFSET, RS_u8);
+    } else {
+      float RS_soft[num_tiles_q][num_tiles_k][8];
+      float pv_scale[num_tiles_q][2];
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+        for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+#pragma unroll
+          for (uint32_t k = 0; k < 8; k++) {
+            const float score = __int2float_rz(RS[fq][fk][k]);
+            RS_soft[fq][fk][k] =
+                pre_scale_scores ? score * sm_scale : score;
+          }
+        }
+      }
 
-    if constexpr (mask_mode == MaskMode::kCausal) {
-      apply_causal_mask<num_tiles_q, num_tiles_k>(
-          Q_idx_lane_base, K_idx_lane_base, RS_soft,
+      if constexpr (mask_mode == MaskMode::kCausal) {
+        apply_causal_mask<num_tiles_q, num_tiles_k>(
+            Q_idx_lane_base, K_idx_lane_base, RS_soft,
+            pre_scale_scores ? -50000.0f : -1.0e30f);
+      } else if constexpr (mask_mode == MaskMode::kCustom) {
+        apply_custom_mask<num_tiles_q, num_tiles_k>(
+            Q_idx_lane_base, K_idx_lane_base, RS_soft, valid, AttnMask,
+            mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k, batch_id,
+            head_id, qo_len, kv_len, mask_dtype_code, 1.0f);
+      } else if constexpr (mask_mode == MaskMode::kCustomKey) {
+        apply_custom_key_mask<num_tiles_q, num_tiles_k>(
+            K_idx_lane_base, RS_soft, valid, AttnMask, mask_stride_b,
+            mask_stride_h, mask_stride_k, batch_id, head_id, kv_len,
+            mask_dtype_code, 1.0f);
+      }
+      apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(
+          K_idx_lane_base, RS_soft, kv_len,
           pre_scale_scores ? -50000.0f : -1.0e30f);
-    } else if constexpr (mask_mode == MaskMode::kCustom) {
-      apply_custom_mask<num_tiles_q, num_tiles_k>(
-          Q_idx_lane_base, K_idx_lane_base, RS_soft, valid, AttnMask,
-          mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k, batch_id,
-          head_id, qo_len, kv_len, mask_dtype_code, 1.0f);
-    } else if constexpr (mask_mode == MaskMode::kCustomKey) {
-      apply_custom_key_mask<num_tiles_q, num_tiles_k>(
-          K_idx_lane_base, RS_soft, valid, AttnMask, mask_stride_b,
-          mask_stride_h, mask_stride_k, batch_id, head_id, kv_len,
-          mask_dtype_code, 1.0f);
-    }
-    apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(
-        K_idx_lane_base, RS_soft, kv_len,
-        pre_scale_scores ? -50000.0f : -1.0e30f);
 
-    update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true,
-               pre_scale_scores>(RS_soft, RO, m, d, pv_scale, sm_scale,
-                                 S_U8_OFFSET);
+      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true,
+                 pre_scale_scores>(RS_soft, RO, m, d, pv_scale, sm_scale,
+                                   S_U8_OFFSET);
 
-    uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
-    RS_to_u8<num_tiles_q, num_tiles_k>(RS_soft, RS_u8);
+      RS_to_u8<num_tiles_q, num_tiles_k>(RS_soft, RS_u8);
 
-    if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore) {
-      accumulate_d<num_tiles_q, num_tiles_k>(RS_soft, d, pv_scale);
-    }
+      if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore) {
+        accumulate_d<num_tiles_q, num_tiles_k>(RS_soft, d, pv_scale);
+      }
 #pragma unroll
-    for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
-      for (uint32_t k = 0; k < 2; k++)
-        RS[fq][0][k] = __float_as_int(pv_scale[fq][k]);
+        for (uint32_t k = 0; k < 2; k++)
+          RS[fq][0][k] = __float_as_int(pv_scale[fq][k]);
+      }
     }
     K_idx_lane_base += CTA_K;
 
@@ -672,7 +752,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
 
   normalize_d<num_tiles_q, num_tiles_v, ComputeUnit::kCudaCore>(RO, m, d);
 
-  if constexpr (custom_mask) {
+  if constexpr (custom_mask && mask_mode != MaskMode::kPreparedKey) {
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll

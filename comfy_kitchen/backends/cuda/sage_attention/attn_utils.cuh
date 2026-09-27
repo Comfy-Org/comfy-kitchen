@@ -46,6 +46,7 @@ enum class MaskMode {
   kCausal = 1,
   kCustom = 2,
   kCustomKey = 3,
+  kPreparedKey = 4,
 };
 
 enum class DataType {
@@ -460,6 +461,27 @@ __device__ __forceinline__ void apply_custom_key_mask(
 }
 
 template <uint32_t num_tiles_q, uint32_t num_tiles_k>
+__device__ __forceinline__ void apply_prepared_key_mask(
+    const uint32_t K_idx_lane_base, float RS[][num_tiles_k][8],
+    const float *mask, const float score_scale) {
+#pragma unroll
+  for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+    const float2 bias_lo = *reinterpret_cast<const float2 *>(mask + K_idx_lane_base + fk * 16);
+    const float2 bias_hi = *reinterpret_cast<const float2 *>(mask + K_idx_lane_base + fk * 16 + 8);
+    const float bias[4] = {bias_lo.x * math::log2e, bias_lo.y * math::log2e,
+                           bias_hi.x * math::log2e, bias_hi.y * math::log2e};
+#pragma unroll
+    for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+      for (uint32_t k = 0; k < 8; k++) {
+        RS[fq][fk][k] = fmaf(RS[fq][fk][k], score_scale,
+                             bias[(k >> 2) * 2 + (k & 1)]);
+      }
+    }
+  }
+}
+
+template <uint32_t num_tiles_q, uint32_t num_tiles_k>
 __device__ __forceinline__ void
 apply_out_of_bound_mask(const uint32_t &K_idx_lane_base,
                         float RS[][num_tiles_k][8],
@@ -630,11 +652,11 @@ pack_scaled_exp2_u8x4(const int32_t a, const int32_t b, const int32_t c,
 }
 
 template <uint32_t num_tiles_q, uint32_t num_tiles_k,
-          uint32_t num_tiles_v>
+          uint32_t num_tiles_v, bool add_bias = false>
 __device__ __forceinline__ void update_mdo_i32_u8(
     int32_t RS[][num_tiles_k][8], float RO[][num_tiles_v][8],
     float m[][2], float d[][2], const float sm_scale, const float exp_offset_value,
-    uint32_t RS_u8[][num_tiles_k / 2][4]) {
+    uint32_t RS_u8[][num_tiles_k / 2][4], const float tile_bias = 0.0f) {
 #pragma unroll
   for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
@@ -651,6 +673,84 @@ __device__ __forceinline__ void update_mdo_i32_u8(
 
       float m_temp = fmaf(__int2float_rz(m_temp_i32), sm_scale,
                           -exp_offset_value);
+      if constexpr (add_bias) m_temp += tile_bias;
+      m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x1));
+      m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x2));
+      const float tile_m = m_temp;
+      m[fq][k] = max(m_prev, tile_m);
+
+      const float smaller_scale =
+          math::ptx_exp2(-fabsf(m_prev - tile_m));
+      const float o_scale = m_prev < tile_m ? smaller_scale : 1.0f;
+      const float tile_scale = tile_m < m_prev ? smaller_scale : 1.0f;
+      d[fq][k] *= o_scale;
+#pragma unroll
+      for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
+        RO[fq][fv][k * 2] *= o_scale;
+        RO[fq][fv][k * 2 + 1] *= o_scale;
+        RO[fq][fv][k * 2 + 4] *= o_scale;
+        RO[fq][fv][k * 2 + 5] *= o_scale;
+      }
+
+      const float negative_m = add_bias ? tile_bias - tile_m : -tile_m;
+#pragma unroll
+      for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++) {
+        const PackedU8RowSum probabilities_0 = pack_scaled_exp2_u8x4(
+            RS[fq][fk * 2][k * 2], RS[fq][fk * 2][k * 2 + 1],
+            RS[fq][fk * 2][k * 2 + 4], RS[fq][fk * 2][k * 2 + 5],
+            sm_scale, negative_m);
+        const PackedU8RowSum probabilities_1 = pack_scaled_exp2_u8x4(
+            RS[fq][fk * 2 + 1][k * 2],
+            RS[fq][fk * 2 + 1][k * 2 + 1],
+            RS[fq][fk * 2 + 1][k * 2 + 4],
+            RS[fq][fk * 2 + 1][k * 2 + 5], sm_scale, negative_m);
+        RS_u8[fq][fk][k] = probabilities_0.probabilities;
+        RS_u8[fq][fk][k + 2] = probabilities_1.probabilities;
+        d[fq][k] += probabilities_0.denominator * tile_scale;
+        d[fq][k] += probabilities_1.denominator * tile_scale;
+      }
+      // QK scores are dead after packing. Reuse their registers for the
+      // probability scale rather than extending the kernel's live state.
+      RS[fq][0][k] = __float_as_int(tile_scale);
+    }
+  }
+}
+
+// Pack each group immediately after exponentiation so masked attention does
+// not keep an entire tile of FP32 probabilities live through the P*V setup.
+// Sum the same rounded probabilities used by P*V, as in the unmasked path.
+__device__ __forceinline__ PackedU8RowSum
+pack_exp2_u8x4(const float a, const float b, const float c,
+              const float d, const float negative_m) {
+  const float pa = math::ptx_exp2(a + negative_m);
+  const float pb = math::ptx_exp2(b + negative_m);
+  const float pc = math::ptx_exp2(c + negative_m);
+  const float pd = math::ptx_exp2(d + negative_m);
+  const uint32_t packed = mma::pack_u8x4(pa, pb, pc, pd);
+  return {packed, __uint2float_rn(__dp4a(packed, 0x01010101u, 0u))};
+}
+
+template <uint32_t num_tiles_q, uint32_t num_tiles_k,
+          uint32_t num_tiles_v>
+__device__ __forceinline__ void update_mdo_f32_u8(
+    float RS[][num_tiles_k][8], float RO[][num_tiles_v][8],
+    float m[][2], float d[][2], const float exp_offset_value,
+    uint32_t RS_u8[][num_tiles_k / 2][4]) {
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+    for (uint32_t k = 0; k < 2; k++) {
+      const float m_prev = m[fq][k];
+      float m_temp_f32 = -50000.0f;
+#pragma unroll
+      for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+        const float m_local =
+            max(max(RS[fq][fk][k * 2], RS[fq][fk][k * 2 + 1]),
+                max(RS[fq][fk][k * 2 + 4], RS[fq][fk][k * 2 + 5]));
+        m_temp_f32 = max(m_temp_f32, m_local);
+      }
+
+      float m_temp = m_temp_f32 - exp_offset_value;
       m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x1));
       m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x2));
       const float tile_m = m_temp;
@@ -672,15 +772,15 @@ __device__ __forceinline__ void update_mdo_i32_u8(
       const float negative_m = -tile_m;
 #pragma unroll
       for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++) {
-        const PackedU8RowSum probabilities_0 = pack_scaled_exp2_u8x4(
+        const PackedU8RowSum probabilities_0 = pack_exp2_u8x4(
             RS[fq][fk * 2][k * 2], RS[fq][fk * 2][k * 2 + 1],
             RS[fq][fk * 2][k * 2 + 4], RS[fq][fk * 2][k * 2 + 5],
-            sm_scale, negative_m);
-        const PackedU8RowSum probabilities_1 = pack_scaled_exp2_u8x4(
+            negative_m);
+        const PackedU8RowSum probabilities_1 = pack_exp2_u8x4(
             RS[fq][fk * 2 + 1][k * 2],
             RS[fq][fk * 2 + 1][k * 2 + 1],
             RS[fq][fk * 2 + 1][k * 2 + 4],
-            RS[fq][fk * 2 + 1][k * 2 + 5], sm_scale, negative_m);
+            RS[fq][fk * 2 + 1][k * 2 + 5], negative_m);
         RS_u8[fq][fk][k] = probabilities_0.probabilities;
         RS_u8[fq][fk][k + 2] = probabilities_1.probabilities;
         d[fq][k] += probabilities_0.denominator * tile_scale;
@@ -688,7 +788,7 @@ __device__ __forceinline__ void update_mdo_i32_u8(
       }
       // QK scores are dead after packing. Reuse their registers for the
       // probability scale rather than extending the kernel's live state.
-      RS[fq][0][k] = __float_as_int(tile_scale);
+      RS[fq][0][k] = tile_scale;
     }
   }
 }
