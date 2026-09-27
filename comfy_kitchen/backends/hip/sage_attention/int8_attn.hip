@@ -14,14 +14,14 @@
 // element, so P never goes through LDS; gfx11 interleaves the accumulator rows
 // across half-waves and pays two shuffles and two byte permutes for it.
 //
-// Tiling: 128 queries per block, 16 per wave, 64 keys per iteration; LDS holds
-// only K and V. A wider query tile, a 128-key tile, staging the tiles through
-// registers across the barrier, and folding the mask into the score loop were
-// all tried and are all slower or spill. Do not re-try them blind.
+// Tiling: 16 queries per wave and 64 keys per iteration; LDS holds only K and V.
+// Dense masks at D64/D128 use 256-query blocks to reuse each K/V tile across
+// more waves. Other paths retain the 128-query schedule.
 #include <hip/hip_runtime.h>
 
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include "../mma.h"
 #include "sage_common.h"
@@ -29,11 +29,16 @@
 namespace comfy::hip_backend::sage {
 
 // Prepared masks use HIP's 64-key tiles, independently of CUDA's layout.
-enum class MaskMode { kNone = 0, kCustom = 2, kPreparedKey = 4 };
+enum class MaskMode {
+    kNone = 0, kCustom = 2, kPreparedKey = 4, kPreparedDense = 5, kDirectKey = 6,
+    kPreparedDenseBool = 7, kPreparedDenseBF16 = 8, kPreparedDenseF16 = 9,
+    kPreparedDenseBF16Short = 10, kPreparedDenseF16Short = 11
+};
 
 namespace {
 
 constexpr int kCtaQ = 128;
+constexpr int kMaxDirectKeyLength = 2048;
 // gfx11 reads a whole 16-byte K-step per lane, so a 16-byte row keeps that to one
 // LDS instruction; the wider pad costs a two-way bank conflict and buys back four
 // times the issue slots. gfx12 reads 8 bytes, where an 8-byte pad is already one
@@ -62,10 +67,14 @@ constexpr float kSoftmaxHeadroom = 8.0f;
 // 16 queries per wave at every head_dim. The CUDA launcher widens D64 to 32 to
 // halve its shared-memory traffic; here the output accumulator is transposed, so
 // a wider query tile grows the live FP32 set instead and spills on both families.
-template <int HD>
+template <int HD, MaskMode kMask = MaskMode::kNone>
 struct Shape {
+    static constexpr bool kWideDense = kMask == MaskMode::kPreparedDense ||
+        kMask == MaskMode::kPreparedDenseBool || kMask == MaskMode::kPreparedDenseBF16 ||
+        kMask == MaskMode::kPreparedDenseF16;
+    static constexpr int kBlockQ = kWideDense && HD <= 128 ? 256 : kCtaQ;
     static constexpr int kWarpQ = 16;
-    static constexpr int kWaves = kCtaQ / kWarpQ;
+    static constexpr int kWaves = kBlockQ / kWarpQ;
     static constexpr int kThreads = kWaves * 32;
     static constexpr int kQueryTiles = kWarpQ / 16;
     static constexpr int kDimTiles = HD / 16;
@@ -98,14 +107,14 @@ __forceinline__ __device__ bool mask_keep(const void* mask, int64_t offset, int 
     return true;
 }
 
-// Preprocess once per key row, rather than reloading and decoding the mask for
-// every query. A finite descriptor is a constant bias, -inf is an empty tile,
-// and +inf marks a mixed tile. Use bit tests: this TU enables fast-math.
+// Preprocess once per key row. Biases are in the base-two softmax domain;
+// nonfinite inputs and padding become -inf. The descriptor is -inf for an
+// empty tile and zero otherwise, so attention can skip empty tiles uniformly.
 __global__ void prepare_key_mask_kernel(
     const void* mask, float* packed, int kv_len, int64_t stride_b, int64_t stride_h,
     int64_t stride_k, int dtype_code, int packed_width) {
     constexpr int tile_k = 64;
-    __shared__ float biases[tile_k];
+    __shared__ int wave_valid[2];
     const int lane = threadIdx.x;
     const int key = blockIdx.x * tile_k + lane;
     const int tiles = gridDim.x;
@@ -113,22 +122,168 @@ __global__ void prepare_key_mask_kernel(
                         static_cast<int64_t>(blockIdx.y) * stride_h;
     float bias = 0.0f;
     const bool keep = key < kv_len && mask_keep(mask, row + key * stride_k, dtype_code, bias);
-    bias = keep ? bias : __uint_as_float(0xff800000u);
-    biases[lane] = bias;
+    bias = keep ? bias * kLog2e : __uint_as_float(0xff800000u);
     float* out = packed + (static_cast<int64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * packed_width;
     out[key] = bias;
+    const int any_valid = __any(keep);
+    if ((lane & 31) == 0) wave_valid[lane / 32] = any_valid;
     __syncthreads();
     if (lane == 0) {
-        bool constant = true;
-        for (int i = 1; i < tile_k; ++i) {
-            constant = constant && __float_as_uint(biases[i]) == __float_as_uint(biases[0]);
-        }
-        out[tiles * tile_k + blockIdx.x] = constant ? biases[0] : __uint_as_float(0x7f800000u);
+        out[tiles * tile_k + blockIdx.x] =
+            (wave_valid[0] | wave_valid[1]) ? 0.0f : __uint_as_float(0xff800000u);
     }
 }
 
+__global__ void prepare_dense_mask_kernel(
+    const void* mask, float* packed, int heads, int qo_len, int kv_len,
+    int64_t stride_b, int64_t stride_h, int64_t stride_q, int64_t stride_k, int dtype_code) {
+    const int head = blockIdx.z % heads;
+    const int batch = blockIdx.z / heads;
+    const int64_t out_tile =
+        ((static_cast<int64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x) * 1024;
+    const int first = threadIdx.x * 4;
+    const int first_query = blockIdx.y * 16 + (first / 8) % 16;
+    const int first_key = blockIdx.x * 64 + (first / 256) * 16 + ((first / 128) % 2) * 8 + first % 8;
+    if (dtype_code == 0 && stride_k == 1 && first_query < qo_len && first_key + 4 <= kv_len) {
+        uint4 bits;
+        const int64_t offset = batch * stride_b + head * stride_h + first_query * stride_q + first_key;
+        __builtin_memcpy(&bits, static_cast<const uint32_t*>(mask) + offset, sizeof(bits));
+        const uint32_t raw[4] = {bits.x, bits.y, bits.z, bits.w};
+        float values[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            values[e] = (raw[e] & 0x7f800000u) == 0x7f800000u
+                            ? __uint_as_float(0xff800000u) : __uint_as_float(raw[e]) * kLog2e;
+        }
+        *reinterpret_cast<float4*>(packed + out_tile + first) =
+            float4{values[0], values[1], values[2], values[3]};
+        return;
+    }
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const int index = threadIdx.x * 4 + e;
+        const int query = blockIdx.y * 16 + (index / 8) % 16;
+        const int key = blockIdx.x * 64 + (index / 256) * 16 + ((index / 128) % 2) * 8 + index % 8;
+        float bias = 0.0f;
+        const bool keep = query < qo_len && key < kv_len &&
+                          mask_keep(mask, batch * stride_b + head * stride_h +
+                                    query * stride_q + key * stride_k, dtype_code, bias);
+        packed[out_tile + index] = keep ? bias * kLog2e : __uint_as_float(0xff800000u);
+    }
+}
+
+// Native 16-bit inputs retain their exact finite bits. Biases stay in natural
+// units, avoiding overflow or an extra rounding from pre-multiplying by log2(e).
+template <typename PackedT>
+__global__ void prepare_dense_mask_16_kernel(
+    const void* mask, PackedT* packed, int heads, int qo_len, int kv_len,
+    int64_t stride_b, int64_t stride_h, int64_t stride_q, int64_t stride_k, int dtype_code) {
+    const int head = blockIdx.z % heads;
+    const int batch = blockIdx.z / heads;
+    const int64_t out_tile =
+        ((static_cast<int64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x) * 1024;
+    const int first = threadIdx.x * 4;
+    const int first_query = blockIdx.y * 16 + (first / 8) % 16;
+    const int first_key = blockIdx.x * 64 + (first / 256) * 16 + ((first / 128) % 2) * 8 + first % 8;
+    constexpr bool bf16_output = std::is_same_v<PackedT, __bf16>;
+    if (dtype_code == (bf16_output ? 2 : 1)) {
+        constexpr uint16_t exponent = bf16_output ? 0x7f80u : 0x7c00u;
+        uint16_t values[4];
+        const int64_t offset = batch * stride_b + head * stride_h + first_query * stride_q + first_key * stride_k;
+        if (stride_k == 1 && first_query < qo_len && first_key + 4 <= kv_len) {
+            __builtin_memcpy(values, static_cast<const uint16_t*>(mask) + offset, sizeof(values));
+        } else {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                values[e] = first_query < qo_len && first_key + e < kv_len
+                    ? static_cast<const uint16_t*>(mask)[offset + e * stride_k]
+                    : exponent | 0x8000u;
+            }
+        }
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            if ((values[e] & exponent) == exponent) values[e] = exponent | 0x8000u;
+        }
+        uint2 bits;
+        __builtin_memcpy(&bits, values, sizeof(bits));
+        *reinterpret_cast<uint2*>(packed + out_tile + first) = bits;
+        return;
+    }
+    if (dtype_code == 0 && stride_k == 1 && first_query < qo_len && first_key + 4 <= kv_len) {
+        uint4 bits;
+        const int64_t offset = batch * stride_b + head * stride_h + first_query * stride_q + first_key;
+        __builtin_memcpy(&bits, static_cast<const uint32_t*>(mask) + offset, sizeof(bits));
+        const uint32_t raw[4] = {bits.x, bits.y, bits.z, bits.w};
+        PackedT values[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            values[e] = (raw[e] & 0x7f800000u) == 0x7f800000u
+                            ? __uint_as_float(0xff800000u) : __uint_as_float(raw[e]);
+        }
+        uint2 out_bits;
+        __builtin_memcpy(&out_bits, values, sizeof(out_bits));
+        *reinterpret_cast<uint2*>(packed + out_tile + first) = out_bits;
+        return;
+    }
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const int index = threadIdx.x * 4 + e;
+        const int query = blockIdx.y * 16 + (index / 8) % 16;
+        const int key = blockIdx.x * 64 + (index / 256) * 16 + ((index / 128) % 2) * 8 + index % 8;
+        float bias = 0.0f;
+        const bool keep = query < qo_len && key < kv_len &&
+                          mask_keep(mask, batch * stride_b + head * stride_h +
+                                    query * stride_q + key * stride_k, dtype_code, bias);
+        packed[out_tile + index] = keep ? bias : __uint_as_float(0xff800000u);
+    }
+}
+
+// One word per gfx12 accumulator lane holds its 32 Boolean keys across a
+// 16-query, 64-key tile. Packing once also removes repeated byte-mask reads.
+template <int TilesPerBlock>
+__global__ void prepare_dense_bool_bits_kernel(
+    const void* mask, uint32_t* packed, int heads, int qo_len, int kv_len,
+    int64_t stride_b, int64_t stride_h, int64_t stride_q, int64_t stride_k) {
+    __shared__ uint32_t row_words[32 * TilesPerBlock];
+    const int tid = threadIdx.x;
+    const int head = blockIdx.z % heads;
+    const int batch = blockIdx.z / heads;
+    const int tiles = (kv_len + 63) / 64;
+#pragma unroll
+    for (int base = 0; base < 1024 * TilesPerBlock; base += 256) {
+        const int index = base + tid;
+        const int query = blockIdx.y * 16 + index / (64 * TilesPerBlock);
+        const int key = blockIdx.x * (64 * TilesPerBlock) + index % (64 * TilesPerBlock);
+        const int64_t offset = batch * stride_b + head * stride_h + query * stride_q + key * stride_k;
+        const bool keep = query < qo_len && key < kv_len && static_cast<const uint8_t*>(mask)[offset] != 0;
+        const uint32_t votes = static_cast<uint32_t>(__ballot(keep));
+        if ((tid & 31) == 0) row_words[index / 32] = votes;
+    }
+    __syncthreads();
+    for (int out_index = tid; out_index < 32 * TilesPerBlock; out_index += 256) {
+        const int sub = out_index / 32;
+        const int row = out_index % 16;
+        const uint32_t first = row_words[row * (2 * TilesPerBlock) + sub * 2];
+        const uint32_t second = row_words[row * (2 * TilesPerBlock) + sub * 2 + 1];
+        const uint32_t bits = __builtin_amdgcn_perm(second, first, (out_index % 32) < 16 ? 0x06040200u : 0x07050301u);
+        const int key_tile = blockIdx.x * TilesPerBlock + sub;
+        if (key_tile < tiles) {
+            const int64_t tile = (static_cast<int64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * tiles + key_tile;
+            packed[tile * 32 + out_index % 32] = bits;
+        }
+    }
+}
+
+__forceinline__ __device__ float bool_mask_bias(uint32_t keep_bits, int bit) {
+    int32_t dropped = static_cast<int32_t>((~keep_bits) << (31 - bit)) >> 31;
+    // Keep the sign extraction as an integer operation. Folding it to a
+    // compare/select adds an instruction and extends scalar predicate lifetimes.
+    asm volatile("" : "+v"(dropped));
+    return __uint_as_float(static_cast<uint32_t>(dropped) & 0xff800000u);
+}
+
 template <int HD, int CTA_K, MaskMode kMask, typename OutT>
-__global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
+__global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel(
     const int8_t* __restrict__ q, const int8_t* __restrict__ k, const int8_t* __restrict__ v,
     OutT* __restrict__ o, const float* __restrict__ q_scale, const float* __restrict__ k_scale,
     const float* __restrict__ v_scale, const void* __restrict__ mask, int64_t mask_stride_b,
@@ -138,16 +293,25 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
     int64_t v_stride_b, int64_t v_stride_h, int64_t v_stride_d, int64_t o_stride_b,
     int64_t o_stride_h, int64_t o_stride_n, float sm_scale) {
 
-    using S = Shape<HD>;
+    using S = Shape<HD, kMask>;
     constexpr int QT = S::kQueryTiles;
     constexpr int KT = CTA_K / 16;
     constexpr int DT = S::kDimTiles;
     constexpr int kStrideK = HD + kLdsPad;
     constexpr int kStrideV = CTA_K + kLdsPad;
     constexpr bool kPreparedKey = kMask == MaskMode::kPreparedKey;
+    constexpr bool kPreparedDenseBool = kMask == MaskMode::kPreparedDenseBool;
+    constexpr bool kPreparedDenseBF16 = kMask == MaskMode::kPreparedDenseBF16 || kMask == MaskMode::kPreparedDenseBF16Short;
+    constexpr bool kPreparedDenseF16 = kMask == MaskMode::kPreparedDenseF16 || kMask == MaskMode::kPreparedDenseF16Short;
+    constexpr bool kPreparedDense16 = kPreparedDenseBF16 || kPreparedDenseF16;
+    constexpr bool kPreparedDense = kMask == MaskMode::kPreparedDense || kPreparedDenseBool || kPreparedDense16;
+    constexpr bool kDirectKey = kMask == MaskMode::kDirectKey;
+    constexpr bool kPrepared = kPreparedKey || kPreparedDense || kDirectKey;
+    constexpr bool kDense = kPreparedDense;
     constexpr bool kCustomMask = kMask != MaskMode::kNone;
 #if defined(COMFY_MMA_GFX12)
-    constexpr bool kBiasPV = HD == 128 && !kCustomMask;
+    constexpr bool kBiasPV = (HD == 128 && (!kCustomMask || kPrepared)) ||
+                             (HD == 64 && (kPreparedKey || kDirectKey || kPreparedDense16));
 #else
     constexpr bool kBiasPV = false;
 #endif
@@ -165,19 +329,45 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
 
     __shared__ __attribute__((aligned(16))) int8_t smem_k[CTA_K * kStrideK];
     __shared__ __attribute__((aligned(16))) int8_t smem_v[HD * kStrideV];
+    __shared__ __attribute__((aligned(16))) float smem_mask[kDirectKey ? kMaxDirectKeyLength : 1];
+    __shared__ int smem_mask_valid[kDirectKey ? kMaxDirectKeyLength / 32 : 1];
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int wave = tid >> 5;
     const int r = frag_row(lane);
 
-    const int block_q = blockIdx.x * kCtaQ;
-    const int head = blockIdx.y;
+    int query_block = blockIdx.x;
+    int head = blockIdx.y;
+    if constexpr (kDense) {
+        // Keep a few query blocks adjacent within each head while reusing the
+        // same mask rows across heads before advancing to the next group.
+        constexpr int query_group = 4;
+        const int block = blockIdx.y * gridDim.x + blockIdx.x;
+        const int base_query = (block / (query_group * gridDim.y)) * query_group;
+        const int group_size = imin(query_group, gridDim.x - base_query);
+        const int within_group = block % (query_group * gridDim.y);
+        head = within_group / group_size;
+        query_block = base_query + within_group % group_size;
+    }
+    const int block_q = query_block * S::kBlockQ;
     const int batch = blockIdx.z;
     const int num_qo_heads = gridDim.y;
     const int kv_head = head / num_kv_groups;
     const float* key_mask = nullptr;
-    if constexpr (kPreparedKey) {
+    const uint32_t* dense_bool_mask = nullptr;
+    const uint16_t* dense_half_mask = nullptr;
+    if constexpr (kDirectKey) {
+        key_mask = smem_mask;
+    } else if constexpr (kPreparedDenseBool) {
+        dense_bool_mask = static_cast<const uint32_t*>(mask) +
+                          static_cast<int64_t>(batch) * mask_stride_b +
+                          static_cast<int64_t>(head) * mask_stride_h;
+    } else if constexpr (kPreparedDense16) {
+        dense_half_mask = static_cast<const uint16_t*>(mask) +
+                          static_cast<int64_t>(batch) * mask_stride_b +
+                          static_cast<int64_t>(head) * mask_stride_h;
+    } else if constexpr (kPrepared) {
         key_mask = static_cast<const float*>(mask) +
                    static_cast<int64_t>(batch) * mask_stride_b +
                    static_cast<int64_t>(head) * mask_stride_h;
@@ -188,10 +378,27 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
     const int8_t* k_head = k + static_cast<int64_t>(batch) * k_stride_b +
                            static_cast<int64_t>(kv_head) * k_stride_h;
     const int8_t* v_head = v + static_cast<int64_t>(batch) * v_stride_b +
-                           static_cast<int64_t>(kv_head) * v_stride_h;
+                            static_cast<int64_t>(kv_head) * v_stride_h;
 
-    // Base 2 throughout: the probabilities come out of exp2, not exp.
-    sm_scale *= kLog2e;
+    if constexpr (kDirectKey) {
+        // Short fused calls avoid a separate preparation launch. Read the mask
+        // once per block, then reuse its biases and empty-tile flags from LDS.
+        const int64_t row = static_cast<int64_t>(batch) * mask_stride_b +
+                            static_cast<int64_t>(head) * mask_stride_h;
+        for (int key = tid; key < kMaxDirectKeyLength; key += S::kThreads) {
+            float bias = 0.0f;
+            const bool keep = key < kv_len && mask_keep(
+                mask, row + static_cast<int64_t>(key) * mask_stride_k, mask_dtype_code, bias);
+            smem_mask[key] = keep ? bias * kLog2e : __uint_as_float(0xff800000u);
+            const int valid = __any(keep);
+            if (lane == 0) smem_mask_valid[key / 32] = valid;
+        }
+        __syncthreads();
+    }
+
+    // Native 16-bit masks keep scores in natural units through the maximum.
+    // Their probability calculation converts the centered scores to base two.
+    if constexpr (!kPreparedDense16) sm_scale *= kLog2e;
 
     // Q is loop invariant and worth holding in registers, but only while it fits:
     // gfx11 fragments are twice as wide, and 16 of them at D256 sit on top of an
@@ -246,7 +453,7 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
     // An interior tile has every key in bounds, so nothing needs testing per
     // element: its maximum comes off the INT32 accumulator and exp2 reads the
     // accumulator too, which keeps a tile of scaled scores out of registers. A
-    // general custom mask has no interior; prepared constant tiles recover it.
+    // custom mask always uses floating scores, including prepared masks.
     const int num_iters = (kv_len + CTA_K - 1) / CTA_K;
 
     // D256 keeps one code path: its output accumulator is 128 live floats, and
@@ -265,10 +472,11 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
 
     constexpr int kUnitsK = HD / 16;
     constexpr int kUnitsV = CTA_K / 16;
+    int bias_iters = 0;
 
     // `boundary` is a compile-time tag, so the interior instance carries no mask
     // test and no per-key bounds check at all.
-    auto run_iter = [&](auto boundary_tag, int iter, float tile_bias = 0.0f) {
+    auto run_iter = [&](auto boundary_tag, int iter) {
         constexpr bool kBoundary = decltype(boundary_tag)::value;
         const int kb0 = iter * CTA_K;
 
@@ -344,13 +552,94 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
             float prob[kBoundary ? KT : 1][8];
             float tile_m;
 
-            if constexpr (kBoundary) {
+            if constexpr (kBoundary && kPrepared) {
+                // Preparation supplies every padded key. Empty broadcast tiles
+                // are skipped before entering the loop; dense tiles detect an
+                // empty row from the reduced maximum below.
+                if constexpr (kPreparedKey || kDirectKey) row_valid[fq] = true;
+                uint32_t keep_bits = 0, keep_bits_hi = 0;
+                if constexpr (kPreparedDenseBool) {
+                    const int64_t tile =
+                        static_cast<int64_t>(imin(q_idx, qo_len - 1) / 16) * num_iters + iter;
+#if defined(COMFY_MMA_GFX12)
+                    keep_bits = dense_bool_mask[tile * 32 + lane];
+#else
+                    // gfx11 interleaves even/odd keys between the half-waves.
+                    // Shift their parity once, then extract constant bit offsets.
+                    keep_bits = dense_bool_mask[tile * 32 + r] >> (lane / 16);
+                    keep_bits_hi = dense_bool_mask[tile * 32 + r + 16] >> (lane / 16);
+#endif
+                }
+
+#pragma unroll
+                for (int fk = 0; fk < KT; ++fk) {
+#if defined(COMFY_MMA_GFX12)
+                    const int64_t mask_index = kPreparedDense
+                        ? (static_cast<int64_t>(imin(q_idx, qo_len - 1) / 16) * num_iters + iter) * 1024 +
+                          fk * 256 + (lane / 16) * 128 + r * 8
+                        : kb0 + fk * 16 + acc_row(lane, 0);
+                    float biases[8];
+                    if constexpr (kPreparedDenseBool) {
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) {
+                            biases[e] = bool_mask_bias(keep_bits, fk * 8 + e);
+                        }
+                    } else if constexpr (kPreparedDense16) {
+                        const uint4 words = *reinterpret_cast<const uint4*>(dense_half_mask + mask_index);
+                        const uint32_t packed_words[4] = {words.x, words.y, words.z, words.w};
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) {
+                            if constexpr (kPreparedDenseBF16) {
+                                biases[e] = __uint_as_float(e % 2 ? packed_words[e / 2] & 0xffff0000u : packed_words[e / 2] << 16);
+                            } else {
+                                const uint16_t bits = static_cast<uint16_t>(packed_words[e / 2] >> ((e % 2) * 16));
+                                biases[e] = __half2float(*reinterpret_cast<const __half*>(&bits));
+                            }
+                        }
+                    } else {
+                        const float4 lo = *reinterpret_cast<const float4*>(key_mask + mask_index);
+                        const float4 hi = *reinterpret_cast<const float4*>(key_mask + mask_index + 4);
+                        biases[0] = lo.x; biases[1] = lo.y; biases[2] = lo.z; biases[3] = lo.w;
+                        biases[4] = hi.x; biases[5] = hi.y; biases[6] = hi.z; biases[7] = hi.w;
+                    }
+#endif
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+#if defined(COMFY_MMA_GFX12)
+                        float bias = biases[e];
+#else
+                        const int key_row = acc_row(lane, e);
+                        const int64_t mask_index = kPreparedDense
+                            ? (static_cast<int64_t>(imin(q_idx, qo_len - 1) / 16) * num_iters + iter) * 1024 +
+                              fk * 256 + (key_row / 8) * 128 + r * 8 + key_row % 8
+                            : kb0 + fk * 16 + key_row;
+                        float bias;
+                        if constexpr (kPreparedDenseBool) {
+                            bias = bool_mask_bias(e < 4 ? keep_bits : keep_bits_hi, fk * 8 + 2 * (e % 4));
+                        } else if constexpr (kPreparedDense16) {
+                            const uint16_t bits = dense_half_mask[mask_index];
+                            if constexpr (kPreparedDenseBF16) bias = __uint_as_float(static_cast<uint32_t>(bits) << 16);
+                            else bias = __half2float(*reinterpret_cast<const __half*>(&bits));
+                        } else {
+                            bias = key_mask[mask_index];
+                        }
+#endif
+                        prob[fk][e] = fmaf(static_cast<float>(s_acc[fk][e]),
+                                           tile_scale_k[fk], bias);
+                    }
+                }
+                tile_m = prob[0][0];
+#pragma unroll
+                for (int fk = 0; fk < KT; ++fk) {
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) tile_m = fmaxf(tile_m, prob[fk][e]);
+                }
+            } else if constexpr (kBoundary) {
                 // Hoisted: only the key term varies per element, and eight live
                 // 64-bit addresses in the inner loop cost registers this kernel
-                // does not have. Raw key-only masks have a zero query stride;
-                // prepared key masks already have compact per-key addressing.
+                // does not have. A broadcast key mask has a zero query stride.
                 int64_t mask_row = 0;
-                if constexpr (kCustomMask && !kPreparedKey) {
+                if constexpr (kCustomMask) {
                     mask_row = static_cast<int64_t>(batch) * mask_stride_b +
                                static_cast<int64_t>(head) * mask_stride_h +
                                static_cast<int64_t>(imin(q_idx, qo_len - 1)) * mask_stride_q;
@@ -366,14 +655,9 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
                             keep = keep && q_idx < qo_len;
                             if (keep) {
                                 float bias;
-                                if constexpr (kPreparedKey) {
-                                    keep = mask_keep(key_mask, key, 0, bias);
-                                } else {
-                                    keep = mask_keep(
-                                        mask,
-                                        mask_row + static_cast<int64_t>(key) * mask_stride_k,
-                                        mask_dtype_code, bias);
-                                }
+                                keep = mask_keep(
+                                    mask, mask_row + static_cast<int64_t>(key) * mask_stride_k,
+                                    mask_dtype_code, bias);
                                 score += bias * kLog2e;
                             }
                             row_valid[fq] = row_valid[fq] || keep;
@@ -388,7 +672,6 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
                     for (int e = 0; e < 8; ++e) tile_m = fmaxf(tile_m, prob[fk][e]);
                 }
             } else {
-                if constexpr (kPreparedKey) row_valid[fq] = true;
                 tile_m = kMaskedScore;
 #pragma unroll
                 for (int fk = 0; fk < KT; ++fk) {
@@ -399,13 +682,21 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
                     }
                     tile_m = fmaxf(tile_m, static_cast<float>(key_max) * tile_scale_k[fk]);
                 }
-                if constexpr (kPreparedKey) tile_m += tile_bias * kLog2e;
             }
 
             // The tile maximum is shifted so exp2 fills the unsigned INT8 range.
             // Its gap to the running maximum rides on the accumulator side as
             // tile_scale, which underflows to zero for a fully masked tile.
             tile_m = fmaxf(tile_m, swap_half_wave(tile_m));
+            if constexpr (kDense) {
+                const bool valid_tile = (__float_as_uint(tile_m) & 0x7f800000u) != 0x7f800000u;
+                row_valid[fq] = row_valid[fq] || valid_tile;
+                tile_m = valid_tile ? tile_m : kMaskedScore;
+            }
+            // Subtract the maximum before converting natural scores to base two.
+            // Fusing score*log2(e)-rounded_max loses cancellation for large biases.
+            const float local_tile_m = tile_m;
+            if constexpr (kPreparedDense16) tile_m *= kLog2e;
             tile_m -= kProbU8Offset;
 
             const float m_prev = m_run[fq];
@@ -437,13 +728,14 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
 #else
                 uint32_t packed[8];
 #endif
-                const float negative_m = !kBoundary && kPreparedKey
-                                             ? tile_bias * kLog2e - tile_m : -tile_m;
+                const float negative_m = -tile_m;
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
                     const float p =
                         kBoundary
-                            ? softmax_exp2(prob[kBoundary ? fk : 0][e] + negative_m)
+                            ? softmax_exp2(kPreparedDense16
+                                ? fmaf(prob[kBoundary ? fk : 0][e] - local_tile_m, kLog2e, kProbU8Offset)
+                                : prob[kBoundary ? fk : 0][e] + negative_m)
                             : softmax_exp2(fmaf(static_cast<float>(s_acc[fk][e]),
                                                tile_scale_k[fk], negative_m));
 #if defined(COMFY_MMA_GFX12)
@@ -499,7 +791,7 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
                 // eight tiles so the added bias cannot grow with sequence
                 // length and consume the precision of small output values.
                 o_bias[fq] = fmaf(kFloatBias, tile_scale, o_bias[fq]);
-                if ((iter & 7) == 7) {
+                if ((((kPreparedKey || kDirectKey) ? bias_iters++ : iter) & 7) == 7) {
 #pragma unroll
                     for (int dt = 0; dt < DT; ++dt) {
 #pragma unroll
@@ -511,17 +803,15 @@ __global__ __launch_bounds__(Shape<HD>::kThreads) void int8_attn_kernel(
         }
     };
 
-    if constexpr (kPreparedKey) {
+    if constexpr (kDirectKey) {
         for (int iter = 0; iter < num_iters; ++iter) {
-            const float tile_bias = key_mask[num_iters * CTA_K + iter];
-            const uint32_t bits = __float_as_uint(tile_bias);
+            if (!(smem_mask_valid[iter * 2] | smem_mask_valid[iter * 2 + 1])) continue;
+            run_iter(std::true_type{}, iter);
+        }
+    } else if constexpr (kPreparedKey) {
+        for (int iter = 0; iter < num_iters; ++iter) {
+            const uint32_t bits = __float_as_uint(key_mask[num_iters * CTA_K + iter]);
             if (bits == 0xff800000u) continue;
-            if constexpr (kSplitLoop) {
-                if ((bits & 0x7f800000u) != 0x7f800000u && sm_scale >= 0.0f) {
-                    run_iter(std::false_type{}, iter, tile_bias);
-                    continue;
-                }
-            }
             run_iter(std::true_type{}, iter);
         }
     } else {
@@ -576,8 +866,8 @@ void launch_one(const int8_t* q, const int8_t* k, const int8_t* v, OutT* o, cons
                 int64_t v_stride_b, int64_t v_stride_h, int64_t v_stride_d, int64_t o_stride_b,
                 int64_t o_stride_h, int64_t o_stride_n, float sm_scale, hipStream_t stream) {
 
-    const dim3 grid(div_ceil_host(qo_len, kCtaQ), num_qo_heads, batch);
-    int8_attn_kernel<HD, CTA_K, kMask, OutT><<<grid, Shape<HD>::kThreads, 0, stream>>>(
+    const dim3 grid(div_ceil_host(qo_len, Shape<HD, kMask>::kBlockQ), num_qo_heads, batch);
+    int8_attn_kernel<HD, CTA_K, kMask, OutT><<<grid, Shape<HD, kMask>::kThreads, 0, stream>>>(
         q, k, v, o, q_scale, k_scale, v_scale, mask, mask_stride_b, mask_stride_h, mask_stride_q,
         mask_stride_k, mask_dtype_code, qo_len, kv_len, qo_len_padded, k_groups_per_head,
         num_kv_groups, q_stride_b, q_stride_h, k_stride_b, k_stride_h, v_stride_b, v_stride_h,
@@ -595,6 +885,38 @@ extern "C" void launch_sage_prepare_key_mask(
     const dim3 grid(div_ceil_host(kv_len, 64), heads, batch);
     prepare_key_mask_kernel<<<grid, 64, 0, stream>>>(
         mask, packed, kv_len, stride_b, stride_h, stride_k, dtype_code, packed_width);
+}
+
+extern "C" void launch_sage_prepare_dense_mask(
+    const void* mask, void* packed, int batch, int heads, int qo_len, int kv_len,
+    int64_t stride_b, int64_t stride_h, int64_t stride_q, int64_t stride_k,
+    int dtype_code, int output_code, hipStream_t stream) {
+    const dim3 grid(div_ceil_host(kv_len, 64), div_ceil_host(qo_len, 16), batch * heads);
+    if (output_code == 8) {
+        prepare_dense_mask_16_kernel<<<grid, 256, 0, stream>>>(
+            mask, static_cast<__bf16*>(packed), heads, qo_len, kv_len,
+            stride_b, stride_h, stride_q, stride_k, dtype_code);
+    } else if (output_code == 9) {
+        prepare_dense_mask_16_kernel<<<grid, 256, 0, stream>>>(
+            mask, static_cast<__half*>(packed), heads, qo_len, kv_len,
+            stride_b, stride_h, stride_q, stride_k, dtype_code);
+    } else if (output_code == 7) {
+        if (kv_len <= 2048) {
+            prepare_dense_bool_bits_kernel<1><<<grid, 256, 0, stream>>>(
+                mask, static_cast<uint32_t*>(packed), heads, qo_len, kv_len,
+                stride_b, stride_h, stride_q, stride_k);
+        } else {
+            // Amortize ballot/CTA overhead while preserving the same tile layout.
+            const dim3 bits_grid(div_ceil_host(kv_len, 1024), div_ceil_host(qo_len, 16), batch * heads);
+            prepare_dense_bool_bits_kernel<16><<<bits_grid, 256, 0, stream>>>(
+                mask, static_cast<uint32_t*>(packed), heads, qo_len, kv_len,
+                stride_b, stride_h, stride_q, stride_k);
+        }
+    } else {
+        prepare_dense_mask_kernel<<<grid, 256, 0, stream>>>(
+            mask, static_cast<float*>(packed), heads, qo_len, kv_len,
+            stride_b, stride_h, stride_q, stride_k, dtype_code);
+    }
 }
 
 extern "C" void launch_sage_int8_attn(
@@ -653,10 +975,25 @@ extern "C" void launch_sage_int8_attn(
 
 #define SAGE_ATTN_MASK(HD)                                                                       \
     do {                                                                                         \
-        if (mask != nullptr && mask_dtype_code == 4) {                                           \
+        if (mask != nullptr && mask_dtype_code == 8) {                                           \
+            if (qo_len <= 256) { SAGE_ATTN_OUT(HD, MaskMode::kPreparedDenseBF16Short); }           \
+            else { SAGE_ATTN_OUT(HD, MaskMode::kPreparedDenseBF16); }                                      \
+        } else if (mask != nullptr && mask_dtype_code == 9) {                                    \
+            if (qo_len <= 256) { SAGE_ATTN_OUT(HD, MaskMode::kPreparedDenseF16Short); }            \
+            else { SAGE_ATTN_OUT(HD, MaskMode::kPreparedDenseF16); }                                       \
+        } else if (mask != nullptr && mask_dtype_code == 7) {                                           \
+            SAGE_ATTN_OUT(HD, MaskMode::kPreparedDenseBool);                                      \
+        } else if (mask != nullptr && mask_dtype_code == 5) {                                    \
+            SAGE_ATTN_OUT(HD, MaskMode::kPreparedDense);                                          \
+        } else if (mask != nullptr && mask_dtype_code == 4) {                                    \
             SAGE_ATTN_OUT(HD, MaskMode::kPreparedKey);                                            \
         } else if (mask != nullptr) {                                                            \
-            SAGE_ATTN_OUT(HD, MaskMode::kCustom);                                                \
+            if (HD <= 128 && (mask_stride_q == 0 || qo_len == 1) && qo_len <= 256 &&              \
+                kv_len > 64 && kv_len <= kMaxDirectKeyLength) {                                 \
+                SAGE_ATTN_OUT(HD, MaskMode::kDirectKey);                                         \
+            } else {                                                                            \
+                SAGE_ATTN_OUT(HD, MaskMode::kCustom);                                            \
+            }                                                                                   \
         } else {                                                                                 \
             SAGE_ATTN_OUT(HD, MaskMode::kNone);                                                  \
         }                                                                                        \

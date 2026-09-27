@@ -23,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "dense_mask.h"
 #include "sage_common.h"
 
 namespace comfy::hip_backend::sage {
@@ -97,9 +98,10 @@ constexpr int kQuantWaves = 8;
 constexpr int kRowIters = 8;
 
 template <typename T, int HD, int Rotation>
-__global__ __launch_bounds__(kQuantWaves * 32) void quant_q_int8_kernel(
+__forceinline__ __device__ void quant_q_int8_block(
     const T* __restrict__ q, int8_t* __restrict__ q_out, float* __restrict__ q_scale, int Lq,
-    int Lq_padded, int H_q, int64_t stride_b, int64_t stride_h, int64_t stride_n) {
+    int Lq_padded, int H_q, int64_t stride_b, int64_t stride_h, int64_t stride_n,
+    int h, int b, int q_block) {
 
     using Tile = RowTile<HD>;
     constexpr int kRowsPerBatch = kQuantWaves * Tile::kRowsPerWave;
@@ -109,13 +111,11 @@ __global__ __launch_bounds__(kQuantWaves * 32) void quant_q_int8_kernel(
     const int lane_in_row = lane % Tile::kLanesPerRow;
     const int row_in_wave = lane / Tile::kLanesPerRow;
 
-    const int h = blockIdx.y;
-    const int b = blockIdx.z;
     const int64_t scale_base = (static_cast<int64_t>(b) * H_q + h) * Lq_padded;
     const T* head = q + static_cast<int64_t>(b) * stride_b + static_cast<int64_t>(h) * stride_h;
     int8_t* out_head = q_out + (static_cast<int64_t>(b) * H_q + h) * Lq * HD;
 
-    const int block_first = blockIdx.x * (kRowsPerBatch * kRowIters);
+    const int block_first = q_block * (kRowsPerBatch * kRowIters);
 #pragma unroll
     for (int it = 0; it < kRowIters; ++it) {
         const int row = block_first + it * kRowsPerBatch + wave * Tile::kRowsPerWave + row_in_wave;
@@ -138,6 +138,61 @@ __global__ __launch_bounds__(kQuantWaves * 32) void quant_q_int8_kernel(
         store_row<HD, T>(out_head + static_cast<int64_t>(row) * HD, lane_in_row, vals,
                          1.0f / scale);
     }
+}
+
+template <typename T, int HD, int Rotation>
+__global__ __launch_bounds__(kQuantWaves * 32) void quant_q_int8_kernel(
+    const T* __restrict__ q, int8_t* __restrict__ q_out, float* __restrict__ q_scale, int Lq,
+    int Lq_padded, int H_q, int64_t stride_b, int64_t stride_h, int64_t stride_n) {
+
+    quant_q_int8_block<T, HD, Rotation>(q, q_out, q_scale, Lq, Lq_padded, H_q,
+        stride_b, stride_h, stride_n, blockIdx.y, blockIdx.z, blockIdx.x);
+}
+
+template <typename T, int HD, int Rotation>
+__global__ __launch_bounds__(kQuantWaves * 32) void quant_q_mask_int8_kernel(
+    const T* __restrict__ q, int8_t* __restrict__ q_out, float* __restrict__ q_scale, int Lq,
+    int Lq_padded, int H_q, int64_t stride_b, int64_t stride_h, int64_t stride_n,
+    int q_blocks, int batches, SageDenseMask16 mask) {
+
+    // Separate blocks prepare the mask and quantize Q; their outputs are only
+    // consumed by later launches on this stream, so neither task waits on the other.
+    const int q_count = q_blocks * H_q * batches;
+    if (blockIdx.x >= q_count) {
+        const int kt = (mask.k + 63) / 64;
+        const int qt = (mask.q + 15) / 16;
+        const int tile = blockIdx.x - q_count;
+        const int key_tile = tile % kt;
+        const int query_tile = (tile / kt) % qt;
+        const int mh = (tile / (kt * qt)) % mask.heads;
+        const int mb = tile / (kt * qt * mask.heads);
+        const int first = threadIdx.x * 4;
+        const int query = query_tile * 16 + (first / 8) % 16;
+        const int key = key_tile * 64 + (first / 256) * 16 + ((first / 128) % 2) * 8 + first % 8;
+        const int64_t offset = mb * mask.sb + mh * mask.sh + query * mask.sq + key * mask.sk;
+        const uint16_t exponent = mask.dtype == 2 ? 0x7f80u : 0x7c00u;
+        uint16_t values[4];
+        if (mask.sk == 1 && query < mask.q && key + 4 <= mask.k) {
+            __builtin_memcpy(values, mask.data + offset, sizeof(values));
+        } else {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                values[e] = query < mask.q && key + e < mask.k
+                    ? mask.data[offset + e * mask.sk] : exponent | 0x8000u;
+            }
+        }
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            if ((values[e] & exponent) == exponent) values[e] = exponent | 0x8000u;
+        }
+        uint2 words;
+        __builtin_memcpy(&words, values, sizeof(words));
+        *reinterpret_cast<uint2*>(mask.packed + static_cast<int64_t>(tile) * 1024 + first) = words;
+        return;
+    }
+    quant_q_int8_block<T, HD, Rotation>(q, q_out, q_scale, Lq, Lq_padded, H_q,
+        stride_b, stride_h, stride_n, (blockIdx.x / q_blocks) % H_q,
+        blockIdx.x / (q_blocks * H_q), blockIdx.x % q_blocks);
 }
 
 // ---------------------------------------------------------------------------
@@ -366,15 +421,23 @@ void launch_typed(const void* q, void* q_int8, void* q_scale, const void* k, voi
                   void* k_scale, const int* anchor_indices, int B, int H_q, int Lq, int Lq_padded,
                   int H_kv, int Lk, int groups_per_head, int64_t q_stride_b, int64_t q_stride_h,
                   int64_t q_stride_n, int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
-                  hipStream_t stream) {
+                  hipStream_t stream, const SageDenseMask16& mask) {
 
     using Tile = RowTile<HD>;
     constexpr int kRowsPerBlock = kQuantWaves * Tile::kRowsPerWave * kRowIters;
 
     const dim3 q_grid((Lq_padded + kRowsPerBlock - 1) / kRowsPerBlock, H_q, B);
-    quant_q_int8_kernel<T, HD, Rotation><<<q_grid, kQuantWaves * 32, 0, stream>>>(
-        static_cast<const T*>(q), static_cast<int8_t*>(q_int8), static_cast<float*>(q_scale), Lq,
-        Lq_padded, H_q, q_stride_b, q_stride_h, q_stride_n);
+    if (mask.data != nullptr) {
+        const int count = q_grid.x * H_q * B +
+                          mask.batches * mask.heads * ((mask.q + 15) / 16) * ((mask.k + 63) / 64);
+        quant_q_mask_int8_kernel<T, HD, Rotation><<<count, kQuantWaves * 32, 0, stream>>>(
+            static_cast<const T*>(q), static_cast<int8_t*>(q_int8), static_cast<float*>(q_scale), Lq,
+            Lq_padded, H_q, q_stride_b, q_stride_h, q_stride_n, q_grid.x, B, mask);
+    } else {
+        quant_q_int8_kernel<T, HD, Rotation><<<q_grid, kQuantWaves * 32, 0, stream>>>(
+            static_cast<const T*>(q), static_cast<int8_t*>(q_int8), static_cast<float*>(q_scale), Lq,
+            Lq_padded, H_q, q_stride_b, q_stride_h, q_stride_n);
+    }
 
     const dim3 k_grid((groups_per_head + kKeyGroupsPerBlock - 1) / kKeyGroupsPerBlock, H_kv, B);
     quant_k_int8_kernel<T, HD, Rotation><<<k_grid, kQuantWaves * 32, 0, stream>>>(
@@ -390,12 +453,12 @@ void launch_dispatch_hd(int head_dim, int rotation, const void* q, void* q_int8,
                         int B, int H_q, int Lq, int Lq_padded, int H_kv, int Lk,
                         int groups_per_head, int64_t q_stride_b, int64_t q_stride_h,
                         int64_t q_stride_n, int64_t k_stride_b, int64_t k_stride_h,
-                        int64_t k_stride_n, hipStream_t stream) {
+                        int64_t k_stride_n, hipStream_t stream, const SageDenseMask16& mask) {
 
 #define SAGE_QK_CASE(HD, ROT)                                                                    \
     launch_typed<T, HD, ROT>(q, q_int8, q_scale, k, k_int8, k_scale, anchor_indices, B, H_q, Lq, \
                              Lq_padded, H_kv, Lk, groups_per_head, q_stride_b, q_stride_h,       \
-                             q_stride_n, k_stride_b, k_stride_h, k_stride_n, stream)
+                             q_stride_n, k_stride_b, k_stride_h, k_stride_n, stream, mask)
 
     switch (head_dim) {
         case 64:
@@ -450,7 +513,9 @@ extern "C" void launch_sage_quant_qk_int8(const void* q, void* q_int8, void* q_s
                                           int head_dim, int64_t q_stride_b, int64_t q_stride_h,
                                           int64_t q_stride_n, int64_t k_stride_b,
                                           int64_t k_stride_h, int64_t k_stride_n,
-                                          int input_dtype_code, int rotation, hipStream_t stream) {
+                                          int input_dtype_code, int rotation, hipStream_t stream,
+                                          const SageDenseMask16* dense_mask) {
+    const SageDenseMask16 mask = dense_mask == nullptr ? SageDenseMask16{} : *dense_mask;
 
     if (anchor_indices == nullptr) {
         throw std::runtime_error("sage int8 attention: anchor_indices scratch is required");
@@ -505,7 +570,7 @@ extern "C" void launch_sage_quant_qk_int8(const void* q, void* q_int8, void* q_s
         launch_dispatch_hd<T>(head_dim, rotation, q, q_int8, q_scale, k, k_int8, k_scale,        \
                               anchor_ptr, B, H_q, Lq, Lq_padded, H_kv, Lk, groups_per_head,      \
                               q_stride_b, q_stride_h, q_stride_n, k_stride_b, k_stride_h,        \
-                              k_stride_n, stream);                                                \
+                              k_stride_n, stream, mask);                                          \
     } while (0)
 
     switch (input_dtype_code) {

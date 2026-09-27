@@ -3035,6 +3035,31 @@ def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
     return buffers, anchor_indices
 
 
+def _sage_can_fuse_dense_mask(attn_mask: torch.Tensor | None) -> bool:
+    return (
+        attn_mask is not None
+        and attn_mask.ndim == 4
+        and attn_mask.dtype in (torch.float16, torch.bfloat16)
+        and 1 < attn_mask.shape[2] <= 256
+        and 64 < attn_mask.shape[3] <= 2048
+        and attn_mask.stride(2) != 0
+    )
+
+
+def _sage_dense_mask_buffer(attn_mask: torch.Tensor) -> torch.Tensor:
+    return torch.empty(
+        (
+            1 if attn_mask.stride(0) == 0 else attn_mask.shape[0],
+            1 if attn_mask.stride(1) == 0 else attn_mask.shape[1],
+            (attn_mask.shape[2] + 15) // 16,
+            (attn_mask.shape[3] + 63) // 64,
+            32 if attn_mask.dtype == torch.bool else 1024,
+        ),
+        dtype=torch.int32 if attn_mask.dtype == torch.bool else attn_mask.dtype,
+        device=attn_mask.device,
+    )
+
+
 def sage_int8_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3053,6 +3078,10 @@ def sage_int8_sdpa(
 
     cta_k = _sage_cta_k(head_dim, k.shape[2], attn_mask is not None)
     buffers, anchor_indices = _sage_buffers(q, k, cta_k)
+    raw_dense_mask = None
+    if head_dim <= 128 and _sage_can_fuse_dense_mask(attn_mask):
+        raw_dense_mask = attn_mask
+        attn_mask = _sage_dense_mask_buffer(raw_dense_mask)
     _C.sage_sdpa(
         _dl(q),
         _dl(k),
@@ -3071,6 +3100,7 @@ def sage_int8_sdpa(
         DTYPE_TO_CODE[output_dtype],
         _stream(q),
         None if attn_mask is None else _dl(attn_mask),
+        None if raw_dense_mask is None else _dl(raw_dense_mask),
     )
     return output
 

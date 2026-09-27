@@ -12,6 +12,7 @@
 #include <nanobind/stl/optional.h>
 
 #include "launchers.h"
+#include "sage_attention/dense_mask.h"
 
 namespace nb = nanobind;
 
@@ -88,11 +89,14 @@ void launch_na3d_kernel(const void*, const void*, const void*, void*, int, int, 
 
 void launch_sage_quant_qk_int8(const void*, void*, void*, const void*, void*, void*, void*, int,
                                int, int, int, int, int, int, int, int64_t, int64_t, int64_t,
-                               int64_t, int64_t, int64_t, int, int, hipStream_t);
+                               int64_t, int64_t, int64_t, int, int, hipStream_t,
+                               const SageDenseMask16*);
 void launch_sage_quant_v_int8(const void*, void*, void*, int, int, int, int, int, int64_t, int64_t,
                               int64_t, int, hipStream_t);
 void launch_sage_prepare_key_mask(const void*, float*, int, int, int, int64_t, int64_t,
                                   int64_t, int, int, hipStream_t);
+void launch_sage_prepare_dense_mask(const void*, void*, int, int, int, int, int64_t, int64_t,
+                                    int64_t, int64_t, int, int, hipStream_t);
 void launch_sage_int8_attn(const void*, const void*, const void*, void*, const void*, const void*,
                            const void*, const void*, int64_t, int64_t, int64_t, int64_t, int, int,
                            int, int, int, int, int, int, int, int, int64_t, int64_t, int64_t,
@@ -1399,7 +1403,8 @@ static void sage_quantize(const nb::ndarray<>& q, const nb::ndarray<>& k, const 
                           const nb::ndarray<>& k_int8, const nb::ndarray<>& k_scale,
                           const nb::ndarray<>& v_int8, const nb::ndarray<>& v_scale,
                           const nb::ndarray<>& anchor_indices, int input_dtype_code, int cta_k,
-                          hipStream_t stream, const char* fn) {
+                          hipStream_t stream, const char* fn,
+                          const SageDenseMask16* dense_mask = nullptr) {
     const int batch = static_cast<int>(q.shape(0));
     const int q_heads = static_cast<int>(q.shape(1));
     const int qo_len = static_cast<int>(q.shape(2));
@@ -1433,7 +1438,7 @@ static void sage_quantize(const nb::ndarray<>& q, const nb::ndarray<>& k, const 
                               sage_padded_q(qo_len), kv_heads, kv_len, padded_k / kSageKeyGroup,
                               head_dim, q.stride(0), q.stride(1), q.stride(2), k.stride(0),
                               k.stride(1), k.stride(2), input_dtype_code,
-                              sage_rotation(kv_len, head_dim), stream);
+                              sage_rotation(kv_len, head_dim), stream, dense_mask);
 
     launch_sage_quant_v_int8(v.data(), v_int8.data(), v_scale.data(), batch, kv_heads, kv_len,
                              head_dim, padded_k, v.stride(0), v.stride(1), v.stride(2),
@@ -1457,6 +1462,28 @@ static void sage_mask_info(const OptArray& attn_mask, int batch, int q_heads, in
     if (!attn_mask.has_value()) return;
 
     const auto& mask = attn_mask.value();
+    if (mask.ndim() == 5) {
+        const bool bit_packed =
+            mask.dtype().code == static_cast<uint8_t>(nb::dlpack::dtype_code::Int) &&
+            mask.dtype().bits == 32;
+        if ((mask.shape(0) != 1 && mask.shape(0) != batch) ||
+            (mask.shape(1) != 1 && mask.shape(1) != q_heads) ||
+            mask.shape(2) != (qo_len + 15) / 16 || mask.shape(3) != (kv_len + 63) / 64 ||
+            mask.shape(4) != (bit_packed ? 32 : 1024)) {
+            throw std::runtime_error(std::string(fn) + ": invalid prepared dense mask shape");
+        }
+        const int packed_dtype = map_dtype_to_code(mask.dtype());
+        if ((packed_dtype < 0 || packed_dtype > 2) && !bit_packed) {
+            throw std::runtime_error(std::string(fn) + ": prepared dense mask must be float32, float16, bfloat16 or int32");
+        }
+        require_packed_contiguous(mask, fn, "prepared dense mask");
+        ptr = mask.data();
+        stride_b = mask.shape(0) == 1 ? 0 : mask.stride(0);
+        stride_h = mask.shape(1) == 1 ? 0 : mask.stride(1);
+        stride_k = 1;
+        dtype_code = bit_packed ? 7 : (packed_dtype == 2 ? 8 : (packed_dtype == 1 ? 9 : 5));
+        return;
+    }
     if (mask.ndim() == 3) {
         if ((mask.shape(0) != 1 && mask.shape(0) != batch) ||
             (mask.shape(1) != 1 && mask.shape(1) != q_heads) ||
@@ -1523,6 +1550,35 @@ void sage_prepare_key_mask(nb::ndarray<> mask, nb::ndarray<> packed, uintptr_t s
     check_hip_launch();
 }
 
+void sage_prepare_dense_mask(nb::ndarray<> mask, nb::ndarray<> packed, uintptr_t stream_ptr) {
+    constexpr const char* fn = "sage_prepare_dense_mask";
+    if (mask.ndim() != 4 || mask.shape(0) == 0 || mask.shape(1) == 0 ||
+        mask.shape(2) == 0 || mask.shape(3) == 0 ||
+        mask.device_type() != nb::device::rocm::value ||
+        mask.device_type() != packed.device_type() || mask.device_id() != packed.device_id()) {
+        throw std::runtime_error(std::string(fn) + ": expected [B,H,Q,K] on the output device");
+    }
+    const void* ptr;
+    int64_t sb, sh, sq, sk;
+    int dtype;
+    const int batch = mask.shape(0), heads = mask.shape(1), qo_len = mask.shape(2), kv_len = mask.shape(3);
+    sage_mask_info(mask, batch, heads, qo_len, kv_len, ptr, sb, sh, sq, sk, dtype, fn);
+    const void* out_ptr;
+    int64_t ob, oh, oq, ok;
+    int out_dtype;
+    if (packed.ndim() != 5 || packed.shape(0) != batch || packed.shape(1) != heads) {
+        throw std::runtime_error(std::string(fn) + ": invalid prepared dense mask shape");
+    }
+    sage_mask_info(packed, batch, heads, qo_len, kv_len, out_ptr, ob, oh, oq, ok, out_dtype, fn);
+    if (out_dtype == 7 && dtype != 3) {
+        throw std::runtime_error(std::string(fn) + ": bit-packed preparation requires a Boolean mask");
+    }
+    launch_sage_prepare_dense_mask(ptr, packed.data(), batch, heads, qo_len, kv_len,
+                                  sb, sh, sq, sk, dtype, out_dtype,
+                                  reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
 static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8,
                         const nb::ndarray<>& v_int8, const nb::ndarray<>& o,
                         const nb::ndarray<>& q_scale, const nb::ndarray<>& k_scale,
@@ -1578,7 +1634,8 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
                nb::ndarray<> q_int8, nb::ndarray<> q_scale, nb::ndarray<> k_int8,
                nb::ndarray<> k_scale, nb::ndarray<> v_int8, nb::ndarray<> v_scale,
                nb::ndarray<> anchor_indices, float sm_scale, int cta_k, int input_dtype_code,
-               int output_dtype_code, uintptr_t stream_ptr, OptArray attn_mask = std::nullopt) {
+               int output_dtype_code, uintptr_t stream_ptr, OptArray attn_mask = std::nullopt,
+               OptArray raw_dense_mask = std::nullopt) {
     constexpr const char* kFn = "sage_sdpa";
     sage_check_shapes(q, k, v, kFn);
     sage_check_cta_k(cta_k, kFn);
@@ -1590,8 +1647,47 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
     const int kv_heads = static_cast<int>(k.shape(1));
     const int kv_len = static_cast<int>(k.shape(2));
 
+    SageDenseMask16 fused_mask;
+    if (raw_dense_mask.has_value()) {
+        const auto& raw = raw_dense_mask.value();
+        const auto fail = [kFn](const char* message) {
+            throw std::runtime_error(std::string(kFn) + ": fused dense mask " + message);
+        };
+        if (!attn_mask.has_value() || raw.ndim() != 4 ||
+            head_dim > 128 || qo_len <= 1 || qo_len > 256 || kv_len <= 64 || kv_len > 2048 ||
+            raw.stride(2) == 0) {
+            fail("requires a short dense input and a prepared output");
+        }
+        const auto& prepared = attn_mask.value();
+        if (raw.device_type() != nb::device::rocm::value ||
+            raw.device_type() != q.device_type() || raw.device_id() != q.device_id() ||
+            prepared.device_type() != q.device_type() || prepared.device_id() != q.device_id()) {
+            fail("buffers must be on the Q device");
+        }
+        const void* ptr;
+        const void* prepared_ptr;
+        int64_t sb, sh, sq, sk, pb, ph, pq, pk;
+        int code, prepared_code;
+        sage_mask_info(raw_dense_mask, batch, q_heads, qo_len, kv_len,
+                       ptr, sb, sh, sq, sk, code, kFn);
+        sage_mask_info(attn_mask, batch, q_heads, qo_len, kv_len,
+                       prepared_ptr, pb, ph, pq, pk, prepared_code, kFn);
+        if ((code != 1 && code != 2) || prepared_code != (code == 1 ? 9 : 8)) {
+            fail("input and output must have the same float16 or bfloat16 dtype");
+        }
+        const int mask_batch = sb == 0 ? 1 : batch;
+        const int mask_heads = sh == 0 ? 1 : q_heads;
+        if (prepared.shape(0) != mask_batch || prepared.shape(1) != mask_heads) {
+            fail("output must match the compact input batch and head counts");
+        }
+        if (reinterpret_cast<uintptr_t>(prepared.data()) % 8 != 0) {
+            fail("output must be eight-byte aligned");
+        }
+        fused_mask = {static_cast<const uint16_t*>(ptr), static_cast<uint16_t*>(prepared.data()),
+                      mask_batch, mask_heads, qo_len, kv_len, code, sb, sh, sq, sk};
+    }
     sage_quantize(q, k, v, q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, anchor_indices,
-                  input_dtype_code, cta_k, stream, kFn);
+                  input_dtype_code, cta_k, stream, kFn, &fused_mask);
     check_hip_launch();
     sage_attend(q_int8, k_int8, v_int8, o, q_scale, k_scale, v_scale, attn_mask, batch, q_heads,
                 kv_heads, qo_len, kv_len, head_dim, cta_k, sm_scale, output_dtype_code, stream,
@@ -2244,11 +2340,14 @@ NB_MODULE(_C, m) {
           nb::arg("stream_ptr"));
     m.def("sage_prepare_key_mask", &sage_prepare_key_mask,
           nb::arg("mask"), nb::arg("packed"), nb::arg("stream_ptr"));
+    m.def("sage_prepare_dense_mask", &sage_prepare_dense_mask,
+          nb::arg("mask"), nb::arg("packed"), nb::arg("stream_ptr"));
     m.def("sage_sdpa", &sage_sdpa, nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("o"),
           nb::arg("q_int8"), nb::arg("q_scale"), nb::arg("k_int8"), nb::arg("k_scale"),
           nb::arg("v_int8"), nb::arg("v_scale"), nb::arg("anchor_indices"), nb::arg("sm_scale"),
           nb::arg("cta_k"), nb::arg("input_dtype_code"), nb::arg("output_dtype_code"),
-          nb::arg("stream_ptr"), nb::arg("attn_mask") = nb::none());
+          nb::arg("stream_ptr"), nb::arg("attn_mask") = nb::none(),
+          nb::arg("raw_dense_mask") = nb::none());
     m.def("sage_sdpa_quantize", &sage_sdpa_quantize, nb::arg("q"), nb::arg("k"), nb::arg("v"),
           nb::arg("q_int8"), nb::arg("q_scale"), nb::arg("k_int8"), nb::arg("k_scale"),
           nb::arg("v_int8"), nb::arg("v_scale"), nb::arg("anchor_indices"), nb::arg("cta_k"),
