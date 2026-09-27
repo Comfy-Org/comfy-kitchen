@@ -159,15 +159,30 @@ wave64 with a dedicated 64-lane broadcast. Because the fragment contract is
 shared, the tile kernels, epilogues and attention algorithms are the same
 source on every target.
 
+On `gfx90c` and `gfx1010`, the int8, fp8 and int4 GEMMs skip that emulation
+and run a thread-level, register-blocked GEMM (`gemm_simt.h`) instead. Each
+thread computes an 8x8 block of the output from K-major LDS words, int8 and int4
+products are single `v_mad_i32_i24` instructions, and fp8 is re-encoded as fp16
+once per tile (exactly) so the inner loop is `v_fma_mix_f32` on `gfx1010` and
+fp32 FMAs on `gfx90c`. At M=4096, N=K=3072 this measured:
+
+| GPU | int8 | fp8 | int4 | rocBLAS fp16, for scale |
+|-----|------|-----|------|-------------------------|
+| `gfx1010` | 0.69 → 4.7 TOPS | 0.22 → 5.2 TOPS | 0.63 → 4.7 TOPS | 2.0 TFLOPS |
+| `gfx90c`  | 0.10 → 0.80 TOPS | 0.03 → 0.76 TOPS | 0.15 → 0.87 TOPS | 0.34 TFLOPS |
+
+The other pre-WMMA targets keep the software tile, since the kernel is only
+enabled where it has been measured and validated.
+
 On these targets the backend supports:
 
 | Area | Functions | How it runs |
 |------|-----------|-------------|
 | FP8 quantization | `quantize_per_tensor_fp8`, `dequantize_per_tensor_fp8`, `stochastic_rounding_fp8` | Elementwise kernels; fp8 is a storage format only |
-| FP8 GEMM | `torch.nn.functional.linear` on `TensorCoreFP8Layout` tensors (via `scaled_mm_v2`) | Software tile, fp8 widened in registers; tensor-wise scales only |
+| FP8 GEMM | `torch.nn.functional.linear` on `TensorCoreFP8Layout` tensors (via `scaled_mm_v2`) | Thread-level GEMM on `gfx90c`/`gfx1010`, software tile elsewhere; tensor-wise scales only |
 | INT8 quantization | `quantize_int8_rowwise`, `quantize_int8_tensorwise`, `quantize_and_rotate_rowwise`, `quantize_int8_convrot_weight`, `dequantize_int8_*` | Elementwise and row-reduction kernels |
-| INT8 GEMM | `int8_linear` (incl. ConvRot, `input_act`, fused RMSNorm and residual) | Software tile (`sdot4` on RDNA2) |
-| INT4 / W4A8 / W6A8 | `convrot_w4a4_linear`, `quantize/dequantize_convrot_w4a4_weight`, `quantize_svdquant_w4a4`, `scaled_mm_svdquant_w4a4`, `gemv_awq_w4a16`, `w4a8_int8_linear` | Software tile; packed codes decoded in registers |
+| INT8 GEMM | `int8_linear` (incl. ConvRot, `input_act`, fused RMSNorm and residual) | Thread-level GEMM on `gfx90c`/`gfx1010`, software tile elsewhere (`sdot4` on RDNA2) |
+| INT4 / W4A8 / W6A8 | `convrot_w4a4_linear`, `quantize/dequantize_convrot_w4a4_weight`, `quantize_svdquant_w4a4`, `scaled_mm_svdquant_w4a4`, `gemv_awq_w4a16`, `w4a8_int8_linear` | Packed codes decoded in registers; ConvRot W4A4 and the W4A8 GEMM use the thread-level GEMM on `gfx90c`/`gfx1010`, the rest the software tile |
 | FP16 GEMM / conv | `fp16_linear`, `fp16_conv3d` | torch (rocBLAS / MIOpen) in 16 MiB chunks, see below |
 | Normalization | `adaln`, `rms_adaln`, `group_norm_silu_pad3d` | Native kernels, same as RDNA3/4 |
 | RoPE | all `apply_rope*` and `rms_rope*` entries, including in-place | Native strided kernels, same as RDNA3/4 |
@@ -190,10 +205,12 @@ for decode helpers, report unavailable through their `*_is_available()` check):
   kept.
 - NVFP4 and MXFP8, as on every HIP target.
 
-Software tiles cost throughput compared with WMMA, so an RDNA2 card will not
-reach RDNA3 speeds on the same kernels. The benefit on these GPUs comes from
-memory footprint and from avoiding eager's slow paths, not from matrix-core
-speed.
+Without matrix cores these GPUs will not reach RDNA3 speeds on the same
+kernels. On `gfx90c` and `gfx1010` the quantized GEMMs still run 2.2-2.7x faster
+than an fp16 rocBLAS GEMM of the same shape, as well as using half or a quarter
+of the weight memory. On the other pre-WMMA targets the software tile is slower
+than rocBLAS fp16, and the benefit there is memory footprint and avoiding
+eager's slow paths.
 
 #### When to use `hip` instead of `eager` on these GPUs
 
@@ -204,7 +221,8 @@ about whether to build the extension for an older card and when not to force
 - **INT8 models.** `torch._int_mm` is not usable on `gfx90x`/`gfx10xx`, so
   eager's `int8_linear` widens both int8 operands to fp32 in 1024-wide K chunks
   and runs an fp32 matmul. That costs 4x the operand memory and fp32 GEMM
-  throughput. The HIP kernel reads int8 directly (with `sdot4` on RDNA2) and
+  throughput. The HIP kernel reads int8 directly (with `sdot4` on RDNA2, and
+  as the thread-level GEMM on `gfx90c`/`gfx1010`) and
   fuses activation quantization, ConvRot rotation, the input activation or
   RMSNorm, the dequant scales, bias and residual into one launch.
 - **4-bit and FP8 checkpoints.** Eager's AWQ W4A16, ConvRot W4A4 and SVDQuant
@@ -212,7 +230,7 @@ about whether to build the extension for an older card and when not to force
   before calling `matmul`, which temporarily needs about 4x the layer's
   quantized size. The HIP kernels unpack in registers, so a quantized model that
   barely fits in 4-8 GB of VRAM keeps fitting while it runs. FP8 layers
-  likewise run straight from the fp8 weight through the software tile.
+  likewise run straight from the fp8 weight.
 - **Weights larger than VRAM.** `hip.offload_weight` keeps a linear weight in
   mapped pinned host memory, and the GEMM kernels read it over PCIe (or from
   the APU's shared memory on `gfx90c`) without a VRAM copy. Eager can only
