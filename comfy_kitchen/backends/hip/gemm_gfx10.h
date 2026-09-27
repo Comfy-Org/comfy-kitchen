@@ -22,9 +22,23 @@
 #include <hip/hip_fp16.h>
 #include <cstdint>
 
+#include "arch_compat.h"  // __GFX10__
 #include "epilogue.h"
 
 namespace comfy::hip_backend {
+
+// The int8 kernels in this file need the gfx10 VALU dot instruction
+// v_dot4_i32_i8, which clang exposes as __builtin_amdgcn_sdot4 and rejects
+// with "needs target feature dot1-insts" on every other target: gfx11/gfx12
+// spell that instruction __builtin_amdgcn_sudot4 instead. They are therefore
+// compiled in the gfx103x device pass only (__GFX10__), the one pass that
+// runs them -- ops/gemm_int8.hip launches them behind comfy_is_gfx10().
+//
+// The other passes still need the symbols, because the launcher is host code
+// and a fat binary is linked per architecture: a kernel defined in no pass
+// leaves the host reference unresolved instead of declining to run. So each
+// pass gets a trapping definition, as mma.h does for the WMMA policies.
+#if defined(__GFX10__)
 
 // ===========================================================================
 // INT8 GEMM (triple-buffered): C[M, N] = A[M, K] @ B[N, K]^T
@@ -211,6 +225,18 @@ __global__ __launch_bounds__(256) void gemm_int8_valu_kernel(
         }
     }
 }
+
+#else  // !__GFX10__
+
+// No v_dot4_i32_i8 on this target. comfy_is_gfx10() keeps the launch off these
+// devices; trap rather than return a plausible wrong answer if it ever runs.
+template <typename OutT>
+__global__ __launch_bounds__(256) void gemm_int8_valu_kernel(
+    const int8_t*, const int8_t*, EpiRowwise, OutT*, int, int, int, int) {
+    __builtin_trap();
+}
+
+#endif  // __GFX10__
 
 // ===========================================================================
 // FP16 GEMM: C[M, N] = A[M, K] @ B[N, K]^T
@@ -409,6 +435,8 @@ __global__ __launch_bounds__(256) void gemm_fp16_valu_kernel(
 // Triple buffering hides DRAM latency by overlapping prefetch with compute.
 // ===========================================================================
 
+#if defined(__GFX10__)
+
 template <typename OutT>
 __global__ __launch_bounds__(256) void gemm_int8_persistent_kernel(
     const int8_t* __restrict__ A, const int8_t* __restrict__ B,
@@ -588,6 +616,18 @@ __global__ __launch_bounds__(256) void gemm_int8_persistent_kernel(
         }
     }
 }
+
+#else  // !__GFX10__
+
+// See the note at the top of this file: the launcher is host code, so every
+// device pass has to define the symbol even where the kernel cannot run.
+template <typename OutT>
+__global__ __launch_bounds__(256) void gemm_int8_persistent_kernel(
+    const int8_t*, const int8_t*, EpiRowwise, OutT*, int, int, int, int) {
+    __builtin_trap();
+}
+
+#endif  // __GFX10__
 
 // ===========================================================================
 // Persistent FP16 GEMM: 6 fixed blocks process tiles in a loop
