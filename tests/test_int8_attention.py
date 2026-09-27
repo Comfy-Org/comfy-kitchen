@@ -15,6 +15,25 @@ requires_int8_attention = pytest.mark.skipif(
     reason="requires the CUDA extension on an INT8-attention-capable GPU",
 )
 
+# RDNA2 (gfx103x) has no matrix cores, so it runs the ported SageAttention
+# RDNA2 kernel rather than the WMMA/CUDA implementation most of these tests
+# describe. The port covers only head_dim 64 and 128, takes no mask, and has no
+# prequantized packed layout, so the tests that pin WMMA-specific shapes,
+# scratch allocation, or masks must skip there.
+def _uses_gfx1035_port() -> bool:
+    return bool(
+        getattr(torch.version, "hip", None)
+        and sage_attention_module._gfx1035_sage is not None
+        and sage_attention_module._gfx1035_sage.is_available()
+    )
+
+
+GFX1035_PORT = _uses_gfx1035_port()
+skip_on_gfx1035_port = pytest.mark.skipif(
+    GFX1035_PORT,
+    reason="WMMA/CUDA-specific behaviour; RDNA2 uses the ported SageAttention kernel",
+)
+
 
 def _qkv(batch, q_heads, kv_heads, q_length, kv_length, head_dim, dtype=torch.bfloat16):
     q = torch.randn(batch, q_length, q_heads, head_dim, device="cuda", dtype=dtype).transpose(1, 2)
@@ -89,6 +108,9 @@ def test_int8_attention_hip_dispatch_follows_matrix_cores(monkeypatch, has_wmma)
     torch.cuda is the ROCm API there and reports an SM-shaped capability for a
     gfx part, so the CUDA test above would wave RDNA2 through to a kernel built
     on WMMA. RDNA2 has none and must decline.
+
+    The RDNA2 (gfx103x) SageAttention port is excluded here by mocking its gate
+    off: the WMMA decision it overrides is the subject of this test.
     """
     if not getattr(torch.version, "hip", None):
         pytest.skip("requires a ROCm PyTorch runtime")
@@ -96,10 +118,14 @@ def test_int8_attention_hip_dispatch_follows_matrix_cores(monkeypatch, has_wmma)
     monkeypatch.setattr(
         sage_attention_module._hip_backend, "has_wmma", lambda: has_wmma
     )
+    monkeypatch.setattr(
+        sage_attention_module._gfx1035_sage, "is_available", lambda _device: False
+    )
     assert sage_attention_module.is_available() is has_wmma
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_allocates_only_integer_8bit_scratch(monkeypatch):
     q, k, v = _qkv(1, 4, 4, 129, 129, 64)
     allocated_dtypes = []
@@ -119,6 +145,7 @@ def test_int8_attention_allocates_only_integer_8bit_scratch(monkeypatch):
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("head_dim", [1, 64, 96, 128, 192, 256])
 def test_int8_attention_matches_sdpa(dtype, head_dim):
@@ -151,6 +178,7 @@ def test_int8_attention_rejects_removed_options(option):
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_gqa_and_unequal_lengths():
     q, k, v = _qkv(1, 16, 4, 191, 257, 128)
     actual = ck.int8_attention(q, k, v, scale=0.07)
@@ -166,6 +194,7 @@ def test_int8_attention_gqa_and_unequal_lengths():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 @pytest.mark.parametrize("masked", [False, True])
 def test_int8_attention_batch_two_direct_and_prequantized(masked):
     q, k, v = _qkv(2, 8, 2, 193, 257, 128)
@@ -190,6 +219,7 @@ def test_int8_attention_batch_two_direct_and_prequantized(masked):
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float16, torch.bfloat16])
 def test_int8_attention_mask_gqa_broadcast_and_fully_masked_row(head_dim, mask_dtype):
@@ -219,6 +249,7 @@ def test_int8_attention_mask_gqa_broadcast_and_fully_masked_row(head_dim, mask_d
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 @pytest.mark.parametrize(
     "mask_dtype", [torch.bool, torch.float16, torch.bfloat16, torch.float32]
 )
@@ -248,6 +279,7 @@ def test_int8_attention_key_broadcast_mask(mask_dtype):
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.bfloat16])
 def test_int8_attention_fully_masked_key_broadcast_is_zero(mask_dtype):
     q, k, v = _qkv(1, 4, 4, 129, 97, 64)
@@ -264,6 +296,7 @@ def test_int8_attention_fully_masked_key_broadcast_is_zero(mask_dtype):
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_stabilizes_large_common_key_component():
     torch.manual_seed(7)
     q, k, v = _qkv(1, 16, 16, 513, 513, 128)
@@ -281,6 +314,7 @@ def test_int8_attention_stabilizes_large_common_key_component():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_stabilization_is_deterministic():
     torch.manual_seed(11)
     q, k, v = _qkv(1, 8, 8, 257, 257, 128)
@@ -292,6 +326,7 @@ def test_int8_attention_stabilization_is_deterministic():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 @pytest.mark.parametrize(
     "configuration",
     [
@@ -336,6 +371,7 @@ def test_prequantized_attention_is_bitwise_identical_to_fused(configuration):
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_prequantized_masked_attention_is_bitwise_identical_to_fused():
     q, k, v = _qkv(1, 8, 2, 193, 257, 128)
     mask = torch.linspace(-1, 1, 257, device="cuda", dtype=torch.float32).reshape(
@@ -356,6 +392,7 @@ def test_prequantized_masked_attention_is_bitwise_identical_to_fused():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_prequantized_attention_releases_float_inputs_before_execution():
     q, k, v = _qkv(1, 8, 2, 513, 769, 128)
     expected = ck.int8_attention(q, k, v)
@@ -381,6 +418,7 @@ def test_prequantized_attention_releases_float_inputs_before_execution():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_torch_compile_fullgraph():
     q, k, v = _qkv(1, 4, 4, 129, 129, 64)
     compiled = torch.compile(
@@ -394,6 +432,7 @@ def test_int8_attention_torch_compile_fullgraph():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_cuda_graph():
     q, k, v = _qkv(1, 4, 4, 129, 129, 64)
     warmup_stream = torch.cuda.Stream()
@@ -411,6 +450,7 @@ def test_int8_attention_cuda_graph():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_rotation_handles_outliers():
     torch.manual_seed(1)
     q, k, v = _qkv(1, 8, 8, 513, 513, 128)
@@ -426,6 +466,7 @@ def test_rotation_handles_outliers():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 @pytest.mark.parametrize("scale", [None, 0.0, -(128**-0.5)])
 def test_int8_attention_long_sequence_and_partial_tile(scale):
     torch.manual_seed(31)
@@ -438,6 +479,7 @@ def test_int8_attention_long_sequence_and_partial_tile(scale):
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_long_sequence_preserves_constant_values():
     torch.manual_seed(32)
     q, k, v = _qkv(1, 4, 4, 129, 8193, 128)
@@ -453,6 +495,7 @@ def test_int8_attention_long_sequence_preserves_constant_values():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_rescales_across_large_increases_in_logits():
     torch.manual_seed(33)
     q, k, v = _qkv(1, 4, 4, 129, 1025, 128)
@@ -469,6 +512,7 @@ def test_int8_attention_rescales_across_large_increases_in_logits():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_accepts_dlpack_normalized_batch_stride():
     """A size-one extent carries no address, so its stride must not be policed.
 

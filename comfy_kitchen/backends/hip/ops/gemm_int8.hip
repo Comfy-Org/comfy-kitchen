@@ -6,7 +6,10 @@
 #include <stdexcept>
 #include <string>
 
+#include "../arch_compat.h"
+
 #include "../epilogue.h"
+#include "../gemm_gfx10.h"
 #include "../gemm_wmma.h"
 #include "../launchers.h"
 
@@ -55,7 +58,27 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
         gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
         return;
     }
-    launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
+
+    if (comfy_is_gfx10()) {
+        // RDNA2: no matrix cores, use VALU v_dot4_i32_i8
+        constexpr int BM = 64;
+        constexpr int BN = 64;
+        const int num_tiles = ((N + BN - 1) / BN) * ((M + BM - 1) / BM);
+        if (num_tiles > 24) {
+            // Persistent kernel: 6 fixed blocks process tiles in a loop
+            dim3 block(256);
+            dim3 grid(6);
+            gemm_int8_persistent_kernel<OutT><<<grid, block, 0, stream>>>(
+                A, B, epi, C, M, N, K, ldc);
+        } else {
+            dim3 block(256);
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_int8_valu_kernel<OutT><<<grid, block, 0, stream>>>(
+                A, B, epi, C, M, N, K, ldc);
+        }
+    } else {
+        launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
+    }
 }
 
 }  // namespace comfy::hip_backend

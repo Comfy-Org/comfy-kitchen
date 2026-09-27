@@ -1,2 +1,3 @@
 include comfy_kitchen/backends/hip/CMakeLists.txt
+include comfy_kitchen/backends/hip/gfx1035/CMakeLists.txt
 recursive-include comfy_kitchen/backends/hip *.cpp *.h *.hip *.in *.json

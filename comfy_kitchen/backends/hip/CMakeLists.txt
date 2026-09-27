@@ -67,6 +67,7 @@ function(_ck_make_arch_condition output)
     set(${output} "${_condition}" PARENT_SCOPE)
 endfunction()
 
+_ck_make_arch_condition(COMFY_HIP_GFX10_CONDITION ${COMFY_HIP_ELEMENTWISE_ARCHS})
 _ck_make_arch_condition(COMFY_HIP_GFX11_CONDITION ${COMFY_HIP_WMMA_GFX11_ARCHS})
 _ck_make_arch_condition(COMFY_HIP_GFX12_CONDITION ${COMFY_HIP_WMMA_GFX12_ARCHS})
 # The 6-WGP small iGPU (780M) tuning is a gfx1103-only subset of wmma_gfx11, so it

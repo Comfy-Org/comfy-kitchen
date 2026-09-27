@@ -752,6 +752,11 @@ def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
         if hasattr(torch, "int8_mm"):
             return torch.int8_mm(lhs, rhs)
+        # On ROCm, torch._int_mm calls hipblasLt which can return
+        # HIPBLAS_STATUS_INVALID_VALUE for shapes its heuristic rejects.
+        # Fall back to int16 matmul, which is correct for int8 inputs.
+        if getattr(torch.version, "hip", None):
+            return lhs.to(torch.int16) @ rhs.to(torch.int16)
         return torch._int_mm(lhs, rhs)
 
     orig_m = a.size(0)

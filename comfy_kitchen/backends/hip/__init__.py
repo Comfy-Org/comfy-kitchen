@@ -223,16 +223,15 @@ _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
 _ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
 _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 
-# The GEMMs, and only the GEMMs, need matrix cores. Everything else is elementwise
-# or a scalar reduction and runs on any supported architecture. This set names the
-# registry-dispatched GEMMs so _build_constraints can drop them on RDNA2; the fp8
-# GEMM is not among them because it is reached through scaled_mm_v2's _hip_fp8_gemm,
-# which gates on has_wmma() itself rather than through the registry.
+# The GEMMs that need matrix cores and have no RDNA2 fallback. Everything else
+# either has a VALU path behind __GFX10__ (int8_linear, fp16_linear) or runs on
+# any supported architecture. This set names the registry-dispatched GEMMs that
+# _build_constraints drops on RDNA2; the fp8 GEMM is not among them because it
+# is reached through scaled_mm_v2's _hip_fp8_gemm, which gates on has_wmma()
+# itself rather than through the registry.
 _WMMA_ONLY_OPS = frozenset({
     "fp16_conv3d",
     "fp16_conv3d_out",
-    "fp16_linear",
-    "int8_linear",
     "na3d",
     "sol_attn",
     "convrot_w4a4_linear",

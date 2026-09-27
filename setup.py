@@ -59,11 +59,14 @@ def cmake_path(path: str | os.PathLike[str]) -> str:
 
 class CMakeExtension(Extension):
     def __init__(self, name: str, source_dir: str = "", backend: str = "cuda",
-                 hip_archs: str = ""):
+                 hip_archs: str = "", build_suffix: str = ""):
         super().__init__(name, sources=[])
         self.source_dir = os.path.abspath(source_dir) if source_dir else ""
         self.backend = backend
         self.hip_archs = hip_archs
+        # A second extension with the same backend needs its own build directory,
+        # otherwise CMake reuses the first one's cache and fails on the new source.
+        self.build_suffix = build_suffix
 
 
 class CMakeBuildExt(build_ext):
@@ -132,12 +135,19 @@ class CMakeBuildExt(build_ext):
         # different source dir ("does not match the source ... used to generate
         # cache"), so configuring the second one into the first one's directory fails.
         build_temp = pathlib.Path(self.build_temp).resolve() / ext.backend
+        if getattr(ext, "build_suffix", ""):
+            build_temp = build_temp / ext.build_suffix
         build_temp.mkdir(parents=True, exist_ok=True)
 
         # All options have been set in finalize_options with proper defaults
         config = "Debug" if self.debug_build else "Release"
         cuda_archs = self.cuda_archs
         enable_lineinfo = self.lineinfo
+
+        # CMake itself does not read the ROCm root from an argument alone, so
+        # backends that pull in torch's Caffe2 LoadHIP.cmake are handed it through
+        # the environment as well. See the ROCM_PATH note below.
+        cmake_env = os.environ.copy()
 
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={cmake_path(ext_dir)}",
@@ -183,6 +193,19 @@ class CMakeBuildExt(build_ext):
                 rocm_posix = pathlib.Path(rocm_home).as_posix()
                 cmake_args.append(f"-DCMAKE_PREFIX_PATH={rocm_posix}")
                 cmake_args.append(f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={rocm_posix}")
+
+                # torch's Caffe2 LoadHIP.cmake ignores both arguments above: it
+                # re-derives ROCM_PATH by running whichever `rocm-sdk` comes first
+                # on PATH, then overwrites CMAKE_HIP_COMPILER with that install's
+                # clang++. Two interpreters with rocm-sdk installed is enough to
+                # make it pick the other one. The overwrite lands after project()
+                # has already determined HIP, so CMake treats the compiler as
+                # changed, wipes the cache and re-configures -- and that re-run
+                # loses the CXX/RC compilers pinned above, dying in project() with
+                # "No CMAKE_CXX_COMPILER could be found". LoadHIP takes ROCM_PATH
+                # from the environment before probing anything, so pass the root
+                # that resolved the compiler here and the two agree.
+                cmake_env["ROCM_PATH"] = rocm_posix
 
             # --hip-archs beats the environment, which beats what setup_hip_extension
             # resolved from the visible devices. The CLI value is raw, so normalize it
@@ -266,6 +289,7 @@ class CMakeBuildExt(build_ext):
                 cwd=build_temp,
                 check=True,
                 capture_output=False,
+                env=cmake_env,
             )
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"CMake configuration failed for {ext.name}") from e
@@ -279,6 +303,7 @@ class CMakeBuildExt(build_ext):
                 cwd=build_temp,
                 check=True,
                 capture_output=False,
+                env=cmake_env,
             )
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"CMake build failed for {ext.name}") from e
@@ -595,6 +620,53 @@ def setup_hip_extension() -> CMakeExtension | None:
     )
 
 
+def setup_gfx1035_extension() -> CMakeExtension | None:
+    """Build the RDNA2 (gfx103x) SageAttention port, for RDNA2 devices only.
+
+    The main HIP backend's sage_attention sources are WMMA and do not build for
+    gfx103x, which has no matrix cores. This extension carries the ported
+    SageAttention RDNA2 kernels and is compiled for gfx103x targets only, so it
+    is dead weight on a gfx11xx/gfx12xx build rather than a second code path.
+    It is therefore gated on at least one visible RDNA2 device.
+    """
+    if BUILD_NO_HIP:
+        return None
+
+    # The extension is only useful on an RDNA2 device, so a machine with no
+    # gfx103x visible skips it rather than paying the compile cost.
+    archs = get_hip_archs_override()
+    if not archs:
+        archs = detect_hip_archs()
+    rdna2 = [
+        arch for arch in archs
+        if arch in HIP_ARCH_GROUPS["elementwise_only"]
+    ]
+    if not rdna2:
+        return None
+
+    rocm_home, hip_compiler = get_rocm_path()
+    if hip_compiler is None:
+        print("No ROCm compiler detected; skipping the gfx1035 extension")
+        return None
+
+    root_dir = pathlib.Path(__file__).resolve().parent
+    source_dir = root_dir / "comfy_kitchen" / "backends" / "hip" / "gfx1035"
+    if not source_dir.exists():
+        return None
+
+    print(
+        "Building gfx1035 SageAttention extension with CMake: "
+        "comfy_kitchen.backends.hip._qattn_gfx1035"
+    )
+    return CMakeExtension(
+        name="comfy_kitchen.backends.hip._qattn_gfx1035",
+        source_dir=str(source_dir),
+        backend="hip",
+        hip_archs=";".join(sorted(set(rdna2))),
+        build_suffix="gfx1035",
+    )
+
+
 def get_cuda_version() -> tuple[int, ...] | None:
     # get_cuda_path() returns None rather than a pair when nvcc is absent.
     cuda_paths = get_cuda_path()
@@ -721,6 +793,13 @@ def get_extensions() -> list[setuptools.Extension]:
         if hip_ext is not None:
             extensions.append(hip_ext)
 
+        # The gfx1035 port shares the ROCm toolchain and is only useful on an
+        # RDNA2 device, so it rides along with the HIP build rather than being
+        # gated separately.
+        gfx1035_ext = setup_gfx1035_extension()
+        if gfx1035_ext is not None:
+            extensions.append(gfx1035_ext)
+
     if not extensions:
         print("\n" + "=" * 80)
         print("Installing comfy_kitchen without a native backend")
@@ -804,7 +883,7 @@ if BUILD_NO_CUDA and not extensions:
     readme_path = pathlib.Path("README.md")
     if readme_path.exists():
         setup_kwargs.update({
-            "long_description": readme_path.read_text(),
+            "long_description": readme_path.read_text(encoding="utf-8"),
             "long_description_content_type": "text/markdown",
         })
 

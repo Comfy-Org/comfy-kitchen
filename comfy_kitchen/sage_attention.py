@@ -15,8 +15,10 @@ from .backends.eager.quantization import DTYPE_TO_CODE
 
 if getattr(torch.version, "hip", None):
     from .backends import hip as _hip_backend
+    from .backends.hip import gfx1035_sage as _gfx1035_sage
 else:
     _hip_backend = None
+    _gfx1035_sage = None
 
 CTA_K = 64
 LARGE_CTA_K = 128
@@ -73,6 +75,13 @@ def is_available(device: torch.device | None = None) -> bool:
         # something SM-shaped for a gfx part, so the compute capability test
         # below would wave AMD hardware through to a CUDA extension that never
         # loaded. Ask the HIP backend instead.
+        #
+        # RDNA2 (gfx103x) has no matrix cores, so the WMMA path declines it.
+        # The ported RDNA2 kernel covers gfx1035 instead; it is gated on the
+        # architecture in gfx1035_sage.is_available, so this cannot leak onto
+        # a gfx11xx/gfx12xx device.
+        if _gfx1035_sage is not None and _gfx1035_sage.is_available(device):
+            return True
         return _hip_backend.int8_attention_is_available()
     capability = torch.cuda.get_device_capability(device)
     return capability >= _NATIVE_MINIMUM_CAPABILITY and _cuda_backend._EXT_AVAILABLE
@@ -146,6 +155,37 @@ def _int8_attention_cuda(
     attn_mask = _validate_inputs(q, k, v, attn_mask)
 
     original_head_dim = q.shape[-1]
+    attention_scale = original_head_dim**-0.5 if scale is None else float(scale)
+
+    if _hip_backend is not None and _gfx1035_sage is not None:
+        # RDNA2 (gfx103x) has no matrix cores, so the WMMA sage attention below
+        # neither builds nor runs for it. gfx1035 instead takes the ported
+        # SageAttention RDNA2 kernel (INT8 Q·K^T + FP16 P·V on VALU), which is
+        # mask-free and covers only head_dim 64 and 128. That kernel is the only
+        # sage attention available on RDNA2, so an unsupported combination raises
+        # here rather than falling through to a WMMA path that cannot exist.
+        if _gfx1035_sage.is_available(q.device):
+            if attn_mask is not None:
+                raise NotImplementedError(
+                    "INT8 attention with attn_mask is not supported on RDNA2 "
+                    "(gfx103x): the ported kernel is mask-free."
+                )
+            if original_head_dim not in (64, 128):
+                raise NotImplementedError(
+                    "INT8 attention requires head_dim 64 or 128 on RDNA2 "
+                    f"(gfx103x), got {original_head_dim}."
+                )
+            output = _gfx1035_sage.sageattn(
+                q,
+                k,
+                v,
+                tensor_layout="HND",
+                is_causal=False,
+                sm_scale=attention_scale,
+            )
+            output = output[..., :original_head_dim]
+            return output.float() if q.dtype == torch.float32 else output
+
     if original_head_dim <= 64:
         kernel_head_dim = 64
     elif original_head_dim <= 128:
@@ -158,7 +198,6 @@ def _int8_attention_cuda(
         k = functional.pad(k, padding)
         v = functional.pad(v, padding)
 
-    attention_scale = original_head_dim**-0.5 if scale is None else float(scale)
     if not math.isfinite(attention_scale):
         raise ValueError(f"scale must be finite, got {attention_scale}")
 
@@ -282,6 +321,16 @@ def prequantize_int8_attention(
     needed.
     """
     attn_mask = _validate_inputs(q, k, v, attn_mask)
+
+    if (
+        _gfx1035_sage is not None
+        and _gfx1035_sage.is_available(q.device)
+    ):
+        raise NotImplementedError(
+            "prequantize_int8_attention is not supported on RDNA2 (gfx103x): the "
+            "ported kernel quantizes Q/K inside the attention pass and has no "
+            "prequantized packed layout. Use int8_attention instead."
+        )
 
     original_head_dim = q.shape[-1]
     input_dtype = q.dtype
@@ -425,6 +474,16 @@ def int8_attention_from_prequantized(
         raise RuntimeError(
             "INT8 attention requires the comfy-kitchen CUDA extension on SM75 or newer, "
             "or the HIP extension on an AMD device with matrix cores (RDNA3 or newer)"
+        )
+
+    if (
+        _gfx1035_sage is not None
+        and _gfx1035_sage.is_available(quantized.q.device)
+    ):
+        raise NotImplementedError(
+            "int8_attention_from_prequantized is not supported on RDNA2 (gfx103x): "
+            "the ported kernel has no prequantized packed layout. Use int8_attention "
+            "instead."
         )
 
     batch, q_heads, q_length, kernel_head_dim = quantized.q.shape

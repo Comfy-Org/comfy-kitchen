@@ -161,6 +161,10 @@ def test_hip_drops_gemms_without_matrix_cores():
                "dequantize_int8_simple_dtype",
                "dequantize_int8_convrot_weight_dtype"):
         assert op in without
+    # int8_linear and fp16_linear have VALU (v_dot4_i32_i8 / v_dot2_f32_f16)
+    # paths behind __GFX10__, so RDNA2 keeps them.
+    for op in ("int8_linear", "fp16_linear"):
+        assert op in without
     # The fused W4A8 requantize is elementwise too: it packs weights and never
     # reaches a matrix core, so RDNA2 must keep it.
     assert "quantize_w4a8_int8_weight" in without
@@ -214,6 +218,7 @@ def test_setup_builds_both_backends_only_when_hip_is_requested():
     namespace["BUILD_HIP"] = True
     namespace["setup_cuda_extension"] = lambda: cuda_extension
     namespace["setup_hip_extension"] = lambda: hip_extension
+    namespace["setup_gfx1035_extension"] = lambda: None
 
     assert namespace["get_extensions"]() == [cuda_extension, hip_extension]
 
@@ -257,6 +262,7 @@ def test_rocm_only_build_still_auto_selects_hip():
     namespace["get_rocm_path"] = lambda: ("/opt/rocm", object())
     namespace["get_torch_gpu_runtime"] = lambda: "hip"
     namespace["setup_hip_extension"] = lambda: hip_extension
+    namespace["setup_gfx1035_extension"] = lambda: None
 
     assert namespace["get_extensions"]() == [hip_extension]
 

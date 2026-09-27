@@ -52,6 +52,39 @@ inline bool comfy_small_igpu() {
     return comfy_small_igpu(dev);
 }
 
+// True on RDNA2 (gfx103x), which has no matrix cores. The GEMM kernels use
+// VALU v_dot4_i32_i8 and v_dot2_f32_f16 instead of WMMA on these devices.
+// Runtime check: CMAKE_HIP_ARCHITECTURES compiles for all targets, so the
+// host code never sees __gfx1035__; we must query the device at runtime.
+inline bool comfy_is_gfx10(int device) {
+    constexpr int kMaxDevices = 16;
+    static std::atomic<int> cache[kMaxDevices] = {};
+    if (device < 0 || device >= kMaxDevices) return false;
+    int v = cache[device].load(std::memory_order_relaxed);
+    if (v == 0) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, device) != hipSuccess) {
+            v = 2;
+        } else {
+            const char* n = prop.gcnArchName;
+            v = (std::strstr(n, "gfx1030") || std::strstr(n, "gfx1031") ||
+                 std::strstr(n, "gfx1032") || std::strstr(n, "gfx1033") ||
+                 std::strstr(n, "gfx1034") || std::strstr(n, "gfx1035") ||
+                 std::strstr(n, "gfx1036"))
+                    ? 1
+                    : 2;
+        }
+        cache[device].store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
+}
+
+inline bool comfy_is_gfx10() {
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) return false;
+    return comfy_is_gfx10(dev);
+}
+
 extern "C" {
 
 // Fused 3D neighborhood attention over contiguous (B, T, H, W, NH, HD) tensors.

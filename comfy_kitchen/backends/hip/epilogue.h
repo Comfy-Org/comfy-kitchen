@@ -6,6 +6,8 @@
 // scalar scales are loaded once rather than per output element.
 #pragma once
 
+#include "arch_compat.h"
+
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
