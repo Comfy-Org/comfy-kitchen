@@ -169,6 +169,31 @@ extern "C" void launch_sage_attn_kernel(
     LAUNCH_Q(HD, CK, MaskMode::kPreparedKey, nv_bfloat16, true, CQ);             \
   }
 
+  // Limit the smaller query tile to the measured image-size region.
+  // Other shapes retain the existing attention dispatch.
+  if (mask == nullptr && head_dim == 128 && cta_k == 128 &&
+      qo_len >= 4096 && qo_len <= 16896 && kv_len >= 4096 && kv_len <= 16896) {
+    int device = 0, major = 0, minor = 0;
+    cudaError_t error = cudaGetDevice(&device);
+    if (error == cudaSuccess)
+      error = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    if (error == cudaSuccess)
+      error = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+    if (error != cudaSuccess)
+      throw std::runtime_error(std::string("sage_attn device query failed: ") +
+                               cudaGetErrorString(error));
+    const bool smaller_tile = (major == 8 && minor == 9) ||
+        (major == 12 && qo_len <= 4608 && kv_len <= 4608 && num_qo_heads <= 32);
+    if (smaller_tile) {
+      if (output_dtype_code == 1) {
+        LAUNCH_Q(128, 128, MaskMode::kNone, half, true, 64);
+      } else {
+        LAUNCH_Q(128, 128, MaskMode::kNone, nv_bfloat16, true, 64);
+      }
+      return;
+    }
+  }
+
   if (mask_tile_bias != nullptr) {
     if ((head_dim != 64 && head_dim != 128 && head_dim != 256) ||
         cta_k != (head_dim == 64 ? 64 : 128)) {
@@ -182,18 +207,22 @@ extern "C" void launch_sage_attn_kernel(
       DISPATCH_PREPARED(256, 128, 128);
       return;
     }
-    // For D=128, Blackwell benefits from two 64-query CTAs per SM; Ada
-    // performs better with one 128-query CTA. Q scales retain 128-row groups.
-    int device, major;
+    // Q scales retain their original 128-row groups for either query tile.
+    int device, major, minor = 0;
     cudaError_t error = cudaGetDevice(&device);
     if (error == cudaSuccess) {
       error = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    }
+    if (error == cudaSuccess && major == 8) {
+      error = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
     }
     if (error != cudaSuccess) {
       throw std::runtime_error(std::string("sage_attn device query failed: ") +
                                cudaGetErrorString(error));
     }
-    if (major >= 10) {
+    const bool smaller_ada_tile = major == 8 && minor == 9 &&
+        qo_len >= 4096 && qo_len <= 16896 && kv_len >= 4096 && kv_len <= 16896;
+    if (major >= 10 || smaller_ada_tile) {
       DISPATCH_PREPARED(128, 128, 64);
     } else {
       DISPATCH_PREPARED(128, 128, 128);
