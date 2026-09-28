@@ -274,12 +274,36 @@ __global__ void prepare_dense_bool_bits_kernel(
     }
 }
 
+// A prepared dense mask may hold -inf for a dropped key, but the score math must
+// stay finite: every score runs through fma and exp2 before anything tests it,
+// and the tile-maximum finiteness test is on a computed value, so
+// -ffinite-math-only folds it away. Read the exponent off the loaded bits, where
+// the compiler cannot conclude the value is finite, and clamp to a sentinel with
+// the original sign, so +inf still means "strongly attend". The sentinel is
+// base-two because that is the domain tile_m is compared against m_run's start in.
+template <bool kBF16>
+__forceinline__ __device__ float dense16_mask_bias(uint16_t bits) {
+    const uint16_t inf = kBF16 ? 0x7f80u : 0x7c00u;
+    const float finite = kBF16 ? __uint_as_float(static_cast<uint32_t>(bits) << 16)
+                               : __half2float(*reinterpret_cast<const __half*>(&bits));
+    const float clamped = (bits & 0x8000u) != 0 ? kMaskedScoreBase2 : -kMaskedScoreBase2;
+    return (bits & inf) == inf ? clamped : finite;
+}
+
+__forceinline__ __device__ float dense32_mask_bias(float bias) {
+    const uint32_t bits = __float_as_uint(bias);
+    return (bits & 0x7f800000u) == 0x7f800000u
+        ? ((bits & 0x80000000u) != 0 ? kMaskedScoreBase2 : -kMaskedScoreBase2)
+        : bias;
+}
+
 __forceinline__ __device__ float bool_mask_bias(uint32_t keep_bits, int bit) {
     int32_t dropped = static_cast<int32_t>((~keep_bits) << (31 - bit)) >> 31;
-    // Keep the sign extraction as an integer operation. Folding it to a
-    // compare/select adds an instruction and extends scalar predicate lifetimes.
+    // Keep the sign extraction as an integer operation. The finite masked score
+    // is reached by a multiply rather than a compare/select, which would extend
+    // scalar predicate lifetimes.
     asm volatile("" : "+v"(dropped));
-    return __uint_as_float(static_cast<uint32_t>(dropped) & 0xff800000u);
+    return -kMaskedScoreBase2 * static_cast<float>(dropped);
 }
 
 template <int HD, int CTA_K, MaskMode kMask, typename OutT>
@@ -589,18 +613,16 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                         const uint32_t packed_words[4] = {words.x, words.y, words.z, words.w};
 #pragma unroll
                         for (int e = 0; e < 8; ++e) {
-                            if constexpr (kPreparedDenseBF16) {
-                                biases[e] = __uint_as_float(e % 2 ? packed_words[e / 2] & 0xffff0000u : packed_words[e / 2] << 16);
-                            } else {
-                                const uint16_t bits = static_cast<uint16_t>(packed_words[e / 2] >> ((e % 2) * 16));
-                                biases[e] = __half2float(*reinterpret_cast<const __half*>(&bits));
-                            }
+                            biases[e] = dense16_mask_bias<kPreparedDenseBF16>(
+                                static_cast<uint16_t>(packed_words[e / 2] >> ((e % 2) * 16)));
                         }
                     } else {
                         const float4 lo = *reinterpret_cast<const float4*>(key_mask + mask_index);
                         const float4 hi = *reinterpret_cast<const float4*>(key_mask + mask_index + 4);
-                        biases[0] = lo.x; biases[1] = lo.y; biases[2] = lo.z; biases[3] = lo.w;
-                        biases[4] = hi.x; biases[5] = hi.y; biases[6] = hi.z; biases[7] = hi.w;
+                        biases[0] = dense32_mask_bias(lo.x); biases[1] = dense32_mask_bias(lo.y);
+                        biases[2] = dense32_mask_bias(lo.z); biases[3] = dense32_mask_bias(lo.w);
+                        biases[4] = dense32_mask_bias(hi.x); biases[5] = dense32_mask_bias(hi.y);
+                        biases[6] = dense32_mask_bias(hi.z); biases[7] = dense32_mask_bias(hi.w);
                     }
 #endif
 #pragma unroll
@@ -617,11 +639,9 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                         if constexpr (kPreparedDenseBool) {
                             bias = bool_mask_bias(e < 4 ? keep_bits : keep_bits_hi, fk * 8 + 2 * (e % 4));
                         } else if constexpr (kPreparedDense16) {
-                            const uint16_t bits = dense_half_mask[mask_index];
-                            if constexpr (kPreparedDenseBF16) bias = __uint_as_float(static_cast<uint32_t>(bits) << 16);
-                            else bias = __half2float(*reinterpret_cast<const __half*>(&bits));
+                            bias = dense16_mask_bias<kPreparedDenseBF16>(dense_half_mask[mask_index]);
                         } else {
-                            bias = key_mask[mask_index];
+                            bias = dense32_mask_bias(key_mask[mask_index]);
                         }
 #endif
                         prob[fk][e] = fmaf(static_cast<float>(s_acc[fk][e]),

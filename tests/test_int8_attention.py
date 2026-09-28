@@ -34,6 +34,18 @@ skip_on_gfx1035_port = pytest.mark.skipif(
     reason="WMMA/CUDA-specific behaviour; RDNA2 uses the ported SageAttention kernel",
 )
 
+# The zero-copy layout="NHD" entry point is served by the HIP extension only. The
+# CUDA build raises NotImplementedError for it, so these tests must not run there
+# or they would assert behaviour the upstream implementation does not provide.
+def _serves_nhd_layout() -> bool:
+    return sage_attention_module._hip_backend is not None
+
+
+skip_without_nhd_layout = pytest.mark.skipif(
+    not _serves_nhd_layout(),
+    reason="layout='NHD' is served by the HIP extension; other builds expect [B, H, L, D]",
+)
+
 
 def _qkv(batch, q_heads, kv_heads, q_length, kv_length, head_dim, dtype=torch.bfloat16):
     q = torch.randn(batch, q_length, q_heads, head_dim, device="cuda", dtype=dtype).transpose(1, 2)
@@ -220,6 +232,61 @@ def test_int8_attention_batch_two_direct_and_prequantized(masked):
 
 @requires_int8_attention
 @skip_on_gfx1035_port
+@skip_without_nhd_layout
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_int8_attention_nhd_layout_matches_hnd(head_dim):
+    batch, heads, q_length, kv_length = 1, 8, 193, 257
+    q_nhd = torch.randn(batch, q_length, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k_nhd = torch.randn(batch, kv_length, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    v_nhd = torch.randn(batch, kv_length, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+
+    actual = ck.int8_attention(q_nhd, k_nhd, v_nhd, layout="NHD")
+    expected = ck.int8_attention(
+        q_nhd.transpose(1, 2), k_nhd.transpose(1, 2), v_nhd.transpose(1, 2)
+    ).transpose(1, 2)
+
+    # Same kernel over the same packed numbers, so the two layouts must agree bit
+    # for bit, and the returned view must present the HND result as NHD rather than
+    # re-copying it.
+    assert actual.shape == (batch, q_length, heads, head_dim)
+    assert actual.stride() == expected.stride()
+    assert torch.equal(actual, expected)
+    assert _nrmse(
+        actual,
+        torch.nn.functional.scaled_dot_product_attention(
+            q_nhd.transpose(1, 2), k_nhd.transpose(1, 2), v_nhd.transpose(1, 2)
+        ).transpose(1, 2),
+    ) < 0.03
+
+
+@requires_int8_attention
+@skip_on_gfx1035_port
+@skip_without_nhd_layout
+def test_int8_attention_nhd_layout_compiles_fullgraph():
+    q, k, v = _qkv(1, 4, 4, 129, 129, 64)
+    q_nhd, k_nhd, v_nhd = (t.transpose(1, 2).contiguous() for t in (q, k, v))
+    compiled = torch.compile(
+        lambda q_, k_, v_: ck.int8_attention(q_, k_, v_, layout="NHD"),
+        backend="eager",
+        fullgraph=True,
+    )
+    torch.testing.assert_close(
+        compiled(q_nhd, k_nhd, v_nhd), ck.int8_attention(q_nhd, k_nhd, v_nhd, layout="NHD")
+    )
+
+
+@requires_int8_attention
+def test_int8_attention_rejects_unsupported_layouts():
+    q, k, v = _qkv(1, 4, 4, 16, 16, 64)
+    with pytest.raises(ValueError, match="layout"):
+        ck.int8_attention(q, k, v, layout="nhd")
+    mask = torch.zeros(1, 4, 16, 16, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(NotImplementedError, match="layout='HND'"):
+        ck.int8_attention(q, k, v, attn_mask=mask, layout="NHD")
+
+
+@requires_int8_attention
+@skip_on_gfx1035_port
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float16, torch.bfloat16])
 def test_int8_attention_mask_gqa_broadcast_and_fully_masked_row(head_dim, mask_dtype):
@@ -293,6 +360,49 @@ def test_int8_attention_fully_masked_key_broadcast_is_zero(mask_dtype):
     actual = ck.int8_attention(q, k, v, attn_mask=mask)
 
     assert torch.count_nonzero(actual) == 0
+
+
+@requires_int8_attention
+@skip_on_gfx1035_port
+@pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("kv_length", [16, 32, 64])
+def test_int8_attention_unprepared_mask_zeroes_fully_masked_rows(mask_dtype, kv_length):
+    """kv_len <= 64 skips mask preparation and takes MaskMode::kCustom.
+
+    That mode clamps no bias: a dropped key carries kMaskedScore straight into the
+    score loop and never reaches the underflowing-tile_scale argument the prepared
+    dense modes rely on. A fully masked row is carried by row_valid, which only the
+    custom mode tracks against the actual keep test, so this is the one mask path
+    whose fully masked rows were never covered. Pin it.
+    """
+    q_length = 193
+    q, k, v = _qkv(1, 8, 2, q_length, kv_length, 64)
+    if mask_dtype == torch.bool:
+        mask = torch.ones(1, 1, q_length, kv_length, dtype=torch.bool, device="cuda")
+        mask[..., :, kv_length // 2:] = False
+        all_masked = torch.zeros_like(mask)
+    else:
+        mask = torch.zeros(1, 1, q_length, kv_length, dtype=mask_dtype, device="cuda")
+        mask[..., :, kv_length // 2:] = -torch.inf
+        all_masked = torch.full_like(mask, -torch.inf)
+    masked_row = 5
+    mask[..., masked_row, :] = False if mask_dtype == torch.bool else -torch.inf
+
+    actual = ck.int8_attention(q, k, v, attn_mask=mask)
+    baseline = mask
+    if mask.dtype != torch.bool and mask.dtype != q.dtype:
+        baseline = mask.to(q.dtype)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        k.repeat_interleave(4, dim=1),
+        v.repeat_interleave(4, dim=1),
+        attn_mask=baseline,
+    )
+
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual[..., masked_row, :]) == 0
+    assert _nrmse(actual, expected) < 0.03
+    assert torch.count_nonzero(ck.int8_attention(q, k, v, attn_mask=all_masked)) == 0
 
 
 @requires_int8_attention

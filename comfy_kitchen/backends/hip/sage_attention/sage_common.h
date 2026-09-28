@@ -38,6 +38,13 @@ constexpr float kLog2e = 1.44269504088896340736f;
 // them, and -ffast-math is on. See the fast-math note in the HIP backend README.
 constexpr float kMaskedScore = -50000.0f;
 
+// Masked-score sentinel in the base-two domain. tile_m is only compared with
+// m_run's kMaskedScore start after it has been brought to base two, so a fully
+// masked tile has to land below that start for tile_scale to underflow to zero.
+// 16-bit prepared biases are converted after the bias is added, which widens the
+// gap further.
+constexpr float kMaskedScoreBase2 = kMaskedScore * kLog2e;
+
 constexpr float kInt8Max = 127.0f;
 
 template <typename T>

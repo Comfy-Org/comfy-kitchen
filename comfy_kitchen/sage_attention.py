@@ -159,9 +159,21 @@ def _validate_inputs(
     k: torch.Tensor,
     v: torch.Tensor,
     attn_mask: torch.Tensor | None,
+    *,
+    layout: str = "HND",
 ) -> torch.Tensor | None:
+    if layout not in ("HND", "NHD"):
+        raise ValueError(f"layout must be 'HND' or 'NHD', got {layout!r}")
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
-        raise ValueError("q, k, and v must have shape [batch, heads, sequence, head_dim]")
+        # The HND wording is the historical message; the transposed variant is only
+        # offered when a caller asks for layout="NHD", so the other backends keep
+        # producing the exact error text they have always produced.
+        shapes = (
+            "[batch, sequence, heads, head_dim] (layout='NHD')"
+            if layout == "NHD"
+            else "[batch, heads, sequence, head_dim]"
+        )
+        raise ValueError(f"q, k, and v must have shape {shapes}")
     if q.dtype not in _SUPPORTED_DTYPES:
         raise TypeError(f"q, k, and v must be float32, float16, or bfloat16, got {q.dtype}")
     if q.dtype != k.dtype or q.dtype != v.dtype:
@@ -176,13 +188,19 @@ def _validate_inputs(
             "or the HIP extension on an AMD device with matrix cores (RDNA3 or newer)"
         )
 
-    batch, q_heads, q_length, head_dim = q.shape
-    k_batch, kv_heads, kv_length, k_head_dim = k.shape
-    if v.shape != (batch, kv_heads, kv_length, head_dim):
-        raise ValueError(
-            f"v must have shape [q.batch, k.heads, k.sequence, q.head_dim], got {tuple(v.shape)}"
-        )
-    if k_batch != batch or k_head_dim != head_dim:
+    if layout == "NHD":
+        batch, q_length, q_heads, head_dim = q.shape
+        _, kv_length, kv_heads, k_head_dim = k.shape
+        expected_v = (batch, kv_length, kv_heads, head_dim)
+        expected_note = "[q.batch, k.sequence, k.heads, q.head_dim]"
+    else:
+        batch, q_heads, q_length, head_dim = q.shape
+        _, kv_heads, kv_length, k_head_dim = k.shape
+        expected_v = (batch, kv_heads, kv_length, head_dim)
+        expected_note = "[q.batch, k.heads, k.sequence, q.head_dim]"
+    if v.shape != expected_v:
+        raise ValueError(f"v must have shape {expected_note}, got {tuple(v.shape)}")
+    if k.shape[0] != batch or k.shape[3] != head_dim:
         raise ValueError(
             f"q and k batch/head dimensions must match, got {tuple(q.shape)} and {tuple(k.shape)}"
         )
@@ -202,12 +220,18 @@ def _validate_inputs(
         raise ValueError("attn_mask must be on the same CUDA device as q, k, and v")
     if attn_mask.dtype not in (torch.bool, torch.float16, torch.bfloat16, torch.float32):
         raise TypeError("attn_mask must be bool, float16, bfloat16, or float32")
+    mask_shape = (
+        (batch, q_length, q_heads, kv_length)
+        if layout == "NHD"
+        else (batch, q_heads, q_length, kv_length)
+    )
     try:
-        return torch.broadcast_to(attn_mask, (batch, q_heads, q_length, kv_length))
+        return torch.broadcast_to(attn_mask, mask_shape)
     except RuntimeError as error:
+        shape_note = f"[{', '.join(str(dim) for dim in mask_shape)}]"
         raise ValueError(
-            "attn_mask must be broadcastable to "
-            f"[{batch}, {q_heads}, {q_length}, {kv_length}], got {tuple(attn_mask.shape)}"
+            f"attn_mask must be broadcastable to {shape_note}, got "
+            f"{tuple(attn_mask.shape)}"
         ) from error
 
 
@@ -218,8 +242,9 @@ def _int8_attention_cuda(
     *,
     scale: float | None = None,
     attn_mask: torch.Tensor | None = None,
+    layout: str = "HND",
 ) -> torch.Tensor:
-    attn_mask = _validate_inputs(q, k, v, attn_mask)
+    attn_mask = _validate_inputs(q, k, v, attn_mask, layout=layout)
 
     original_head_dim = q.shape[-1]
     attention_scale = original_head_dim**-0.5 if scale is None else float(scale)
@@ -246,7 +271,7 @@ def _int8_attention_cuda(
                 q,
                 k,
                 v,
-                tensor_layout="HND",
+                tensor_layout=layout,
                 is_causal=False,
                 sm_scale=attention_scale,
             )
@@ -281,9 +306,16 @@ def _int8_attention_cuda(
             v,
             attention_scale=attention_scale,
             attn_mask=attn_mask,
+            layout=layout,
         )
         output = output[..., :original_head_dim]
         return output.float() if q.dtype == torch.float32 else output
+
+    if layout != "HND":
+        raise NotImplementedError(
+            "layout='NHD' INT8 attention is served by the HIP extension; the "
+            "CUDA fallback path expects [B, H, L, D] operands."
+        )
 
     batch, q_heads, q_length, _ = q.shape
     _, kv_heads, kv_length, _ = k.shape
@@ -615,12 +647,18 @@ def int8_attention_from_prequantized(
     return output.float() if quantized.input_dtype == torch.float32 else output
 
 
+# The custom ops carry the layout as an int rather than a string so their
+# schemas stay primitive-typed; index i is _LAYOUT_BY_CODE[i].
+_LAYOUT_BY_CODE = ("HND", "NHD")
+
+
 @torch.library.custom_op("comfy_kitchen::int8_attention", mutates_args=())
 def _op_int8_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     scale: float | None,
+    layout_code: int,
 ) -> torch.Tensor:
     return _int8_attention_cuda(
         q,
@@ -628,6 +666,7 @@ def _op_int8_attention(
         v,
         scale=scale,
         attn_mask=None,
+        layout=_LAYOUT_BY_CODE[layout_code],
     )
 
 
@@ -637,6 +676,7 @@ def _op_int8_attention_fake(
     k,
     v,
     scale,
+    layout_code,
 ):
     return q.new_empty(q.shape)
 
@@ -648,6 +688,7 @@ def _op_int8_attention_masked(
     v: torch.Tensor,
     attn_mask: torch.Tensor,
     scale: float | None,
+    layout_code: int,
 ) -> torch.Tensor:
     return _int8_attention_cuda(
         q,
@@ -655,6 +696,7 @@ def _op_int8_attention_masked(
         v,
         scale=scale,
         attn_mask=attn_mask,
+        layout=_LAYOUT_BY_CODE[layout_code],
     )
 
 
@@ -665,6 +707,7 @@ def _op_int8_attention_masked_fake(
     v,
     attn_mask,
     scale,
+    layout_code,
 ):
     return q.new_empty(q.shape)
 
@@ -676,10 +719,17 @@ def int8_attention(
     *,
     scale: float | None = None,
     attn_mask: torch.Tensor | None = None,
+    layout: str = "HND",
 ) -> torch.Tensor:
     """Compute inference SDPA with signed INT8 Q/K/V and unsigned INT8 P.
 
-    Inputs use ``[batch, heads, sequence, head_dim]`` layout. Grouped-query
+    Inputs use ``[batch, heads, sequence, head_dim]`` layout by default, or
+    ``[batch, sequence, heads, head_dim]`` with ``layout="NHD"`` (ComfyUI's
+    ``attention_sage`` convention). NHD is served without copying: the kernels
+    index q, k, v and the output by explicit stride, so neither a q/k/v permute
+    nor an output permute is paid. ``attn_mask`` is only supported with the
+    default HND layout, because mask preparation and the packed mask buffers
+    are written for the ``[B, H, Lq, Lk]`` domain. Grouped-query
     attention and unequal non-causal Q/K sequence lengths are supported. Head
     dimensions are padded to the kernel's 64-, 128-, or 256-wide tile and
     sliced back on return; 64, 128, and 256 take the zero-copy dimension path.
@@ -695,12 +745,21 @@ def int8_attention(
     arithmetic is FP32. This path does not allocate FP8 tensors or execute FP8
     MMA instructions.
     """
+    if layout not in _LAYOUT_BY_CODE:
+        raise ValueError(f"layout must be one of {_LAYOUT_BY_CODE}, got {layout!r}")
+    if attn_mask is not None and layout != "HND":
+        raise NotImplementedError(
+            "attn_mask requires layout='HND'; the packed mask preparation is "
+            "written for the [B, H, Lq, Lk] domain"
+        )
+    layout_code = _LAYOUT_BY_CODE.index(layout)
     if attn_mask is None:
         return torch.ops.comfy_kitchen.int8_attention(
             q,
             k,
             v,
             scale,
+            layout_code,
         )
     return torch.ops.comfy_kitchen.int8_attention_masked(
         q,
@@ -708,4 +767,5 @@ def int8_attention(
         v,
         attn_mask,
         scale,
+        layout_code,
     )
