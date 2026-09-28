@@ -1168,8 +1168,8 @@ def test_fp16_conv3d_matches_fp32_reference(hip, c, k, d, h, w, ksize, stride, w
 @needs_wmma
 def test_fp16_conv3d_declines_like_cuda(hip):
     torch.manual_seed(0)
-    # a token launch, and a deep (C*T*R*S > 8192) launch large enough to fill the device
-    for shape in [(64, 64, 3, 6, 6), (512, 512, 5, 66, 66)]:
+    # a token launch, and a deep (C*T*R*S > 16384) launch large enough to fill the device
+    for shape in [(64, 64, 3, 6, 6), (640, 640, 5, 66, 66)]:
         x, weight, bias, residual = _conv_inputs(*shape, (3, 3, 3), with_residual=True)
         assert hip._wmma_fp16_conv3d(x, weight, bias, residual, [1, 1, 1]) is None
         got = hip.fp16_conv3d(x, weight, bias, residual, [1, 1, 1])
@@ -1241,7 +1241,7 @@ def test_group_norm_silu_pad3d_binding_rejects_negative_padding(hip, side):
     with pytest.raises(RuntimeError, match=f"{side} must be non-negative"):
         hip._C.group_norm_silu_pad3d(
             hip._dl(x), None, None, hip._dl(out), None, 1, 8, 2, 4, 4, 1, 0.0,
-            pads["left"], pads["right"], pads["top"], pads["bottom"], pads["front"], False,
+            pads["left"], pads["right"], pads["top"], pads["bottom"], pads["front"], False, False,
             hip._stream(x))
 
 
@@ -1250,6 +1250,220 @@ def test_fp16_conv3d_bad_stride_is_reported_by_torch(hip):
     x, weight, bias, _ = _conv_inputs(16, 16, 4, 10, 10, (3, 3, 3))
     with pytest.raises(RuntimeError):
         hip.fp16_conv3d(x, weight, bias, None, [0, 1, 1])
+    out = torch.empty((1, 16, 2, 8, 8), dtype=torch.float16, device=DEV)
+    with pytest.raises(RuntimeError):
+        hip.fp16_conv3d_out(x, weight, bias, None, [0, 1, 1], out)
+
+
+@needs_wmma
+def test_fp16_conv3d_deep_large_launch_is_served(hip):
+    """512 channels x 27 taps, the depth CUDA's gate admits; HIP accumulates in fp32."""
+    torch.manual_seed(0)
+    x, weight, bias, residual = _conv_inputs(512, 512, 4, 66, 130, (3, 3, 3), with_residual=True)
+    got = hip._wmma_fp16_conv3d(x, weight, bias, residual, [1, 1, 1])
+    assert got is not None
+    assert _rel_err(got, _conv_ref(x, weight, bias, residual, (1, 1, 1))) < 5e-3
+
+
+@needs_wmma
+def test_fp16_conv3d_input_windows_match_packed(hip):
+    """Row and frame windows of x are read in place and are bit-identical to the packed run."""
+    torch.manual_seed(0)
+    x, weight, bias, _ = _conv_inputs(128, 128, 6, 130, 258, (3, 3, 3))
+    full = hip._wmma_fp16_conv3d(x, weight, bias, None, [1, 1, 1])
+    for h0, h1 in ((0, 64), (64, 128)):  # the input window carries the 2-row halo
+        view = x[:, :, :, h0:h1 + 2, :]
+        assert not view.is_contiguous(memory_format=torch.channels_last_3d)
+        assert hip._ndhwc_strides(view) is not None
+        tile = hip._wmma_fp16_conv3d(view, weight, bias, None, [1, 1, 1])
+        assert tile is not None and torch.equal(tile, full[:, :, :, h0:h1, :])
+    # a batch of two, so the batch stride is applied
+    x2 = torch.cat([x, x.flip(2)]).contiguous(memory_format=torch.channels_last_3d)
+    ref = hip._wmma_fp16_conv3d(x2[:, :, :, :66].contiguous(memory_format=torch.channels_last_3d),
+                                weight, bias, None, [1, 1, 1])
+    got = hip._wmma_fp16_conv3d(x2[:, :, :, :66], weight, bias, None, [1, 1, 1])
+    assert got is not None and torch.equal(got, ref)
+
+
+@needs_wmma
+def test_fp16_conv3d_broadcast_row_input(hip):
+    """A zero H stride is the kernel's packed marker, so an expanded view must be copied rather
+    than indexed as if it held H rows."""
+    torch.manual_seed(0)
+    x, weight, bias, _ = _conv_inputs(128, 128, 6, 1, 258, (3, 3, 3))
+    view = x.expand(-1, -1, -1, 130, -1)
+    assert view.stride()[3] == 0
+    assert hip._ndhwc_strides(view) is None
+    got = hip._wmma_fp16_conv3d(view, weight, bias, None, [1, 1, 1])
+    ref = hip._wmma_fp16_conv3d(view.contiguous(memory_format=torch.channels_last_3d), weight,
+                                bias, None, [1, 1, 1])
+    assert got is not None and torch.equal(got, ref)
+
+
+@needs_wmma
+def test_fp16_conv3d_frame_window_out(hip):
+    torch.manual_seed(0)
+    x, weight, bias, _ = _conv_inputs(128, 128, 6, 66, 130, (3, 3, 3))
+    full = hip._wmma_fp16_conv3d(x, weight, bias, None, [1, 1, 1])
+    out = torch.zeros_like(full).contiguous(memory_format=torch.channels_last_3d)
+    for z0, z1 in ((0, 2), (2, 4)):
+        window = out[:, :, z0:z1]
+        got = hip._wmma_fp16_conv3d(x[:, :, z0:z1 + 2], weight, bias, None, [1, 1, 1], out=window)
+        assert got is not None and got.data_ptr() == window.data_ptr()
+    assert torch.equal(out, full)
+    buf = torch.empty_like(full)
+    hip.fp16_conv3d_out(x, weight, bias, None, [1, 1, 1], buf)
+    assert torch.equal(buf, full)
+
+
+@needs_wmma
+def test_fp16_conv3d_out_the_kernel_cannot_index(hip):
+    """A row window of out, or a frame window across two batches, cannot be written as the
+    packed matrix the epilogue stores, so the kernel declines and the op copies into it
+    without touching the rest of the buffer."""
+    torch.manual_seed(0)
+    x, weight, bias, _ = _conv_inputs(128, 128, 4, 34, 130, (3, 3, 3))
+    full = hip.fp16_conv3d(x, weight, bias, None, [1, 1, 1])
+    out = torch.full_like(full, 7.0).contiguous(memory_format=torch.channels_last_3d)
+    window = out[:, :, :, :16, :]
+    assert hip._wmma_fp16_conv3d(x[:, :, :, :18, :], weight, bias, None, [1, 1, 1],
+                                 out=window) is None
+    hip.fp16_conv3d_out(x[:, :, :, :18, :], weight, bias, None, [1, 1, 1], window)
+    assert torch.equal(window, full[:, :, :, :16, :])
+    assert bool((out[:, :, :, 16:] == 7.0).all())
+
+    cl = torch.channels_last_3d
+    x = torch.randn(2, 128, 6, 66, 130, dtype=torch.float16, device=DEV).contiguous(memory_format=cl)
+    big = torch.full((2, 128, 4, 64, 128), 7.0, dtype=torch.float16, device=DEV).contiguous(
+        memory_format=cl)
+    window = big[:, :, 0:2]
+    assert hip._wmma_fp16_conv3d(x[:, :, 0:4], weight, None, None, [1, 1, 1], out=window) is None
+    hip.fp16_conv3d_out(x[:, :, 0:4], weight, None, None, [1, 1, 1], window)
+    assert _rel_err(window, _conv_ref(x[:, :, 0:4], weight, None, None, (1, 1, 1))) < 5e-3
+    assert bool((big[:, :, 2:] == 7.0).all())
+
+    with pytest.raises(ValueError, match="out must be"):
+        hip._wmma_fp16_conv3d(x, weight, None, None, [1, 1, 1], out=window)
+
+
+@needs_wmma
+def test_fp16_conv3d_binding_rejects_out_of_range_strides(hip):
+    x, weight, _, _ = _conv_inputs(16, 16, 4, 10, 10, (3, 3, 3))
+    out = torch.empty((1, 16, 2, 8, 8), dtype=torch.float16, device=DEV)
+    with pytest.raises(RuntimeError, match="stride out of range"):
+        hip._C.fp16_conv3d(hip._dl(x), hip._dl(weight), None, None, hip._dl(out),
+                           1, 4, 10, 10, 16, 16, 3, 3, 3, 1, 1, 1, hip._stream(x),
+                           16, 160, 2**31, 0)
+
+
+@pytest.mark.parametrize(
+    ("b", "c", "t", "h", "w", "pad"),
+    [
+        (1, 128, 3, 40, 56, (1, 1, 1, 1, 2)),
+        (2, 256, 2, 33, 17, (1, 1, 1, 1, 2)),
+        (1, 512, 2, 9, 9, (0, 1, 0, 1, 2)),
+        (1, 64, 2, 8, 8, (1, 1, 1, 1, 0)),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_group_norm_silu_pad3d_zero_pad_matches_eager(hip, monkeypatch, b, c, t, h, w, pad, dtype):
+    torch.manual_seed(0)
+    x, weight, bias = _gn_inputs(b, c, t, h, w, dtype)
+    ref = _eager_group_norm(x, weight, bias, 32, 1e-6, list(pad), True, True)
+    _no_eager_group_norm(monkeypatch)
+    got = hip.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, list(pad), True, True)
+    assert got.shape == ref.shape and got.is_contiguous(memory_format=torch.channels_last_3d)
+    assert _rel_err(got, ref) < 5 * torch.finfo(dtype).eps
+    left, right, top, bottom, _ = pad
+    interior = got[:, :, :, top:got.shape[3] - bottom, left:got.shape[4] - right]
+    assert torch.count_nonzero(got).item() == torch.count_nonzero(interior).item()
+
+
+def test_group_norm_silu_pad3d_zero_pad_wider_than_input(hip, monkeypatch):
+    """A zero border reads nothing, so it may exceed the input where reflection cannot."""
+    torch.manual_seed(0)
+    _no_eager_group_norm(monkeypatch)
+    for shape, pad in (((1, 32, 3, 7, 5), (2, 1, 1, 2, 2)), ((1, 32, 1, 2, 2), (3, 3, 3, 3, 0))):
+        x = torch.randn(shape, dtype=torch.float16, device=DEV).contiguous(
+            memory_format=torch.channels_last_3d)
+        got = hip.group_norm_silu_pad3d(x, None, None, 1, 0.0, list(pad), False, True)
+        left, right, top, bottom, front = pad
+        ref = torch.nn.functional.pad(x, (left, right, top, bottom, front, 0))
+        assert torch.equal(got, ref)
+
+
+def test_group_norm_silu_pad3d_zero_pad_empty_frame(hip):
+    """An empty frame has no rows to normalize but still a zero border to write."""
+    x = torch.randn(1, 64, 2, 0, 4, dtype=torch.float16, device=DEV).contiguous(
+        memory_format=torch.channels_last_3d)
+    out = torch.full((1, 64, 2, 2, 6), 7.0, dtype=torch.float16, device=DEV).contiguous(
+        memory_format=torch.channels_last_3d)
+    hip.group_norm_silu_pad3d(x, None, None, 1, 0.0, [1, 1, 1, 1, 0], False, True, out=out)
+    assert torch.count_nonzero(out).item() == 0
+
+
+def test_group_norm_silu_pad3d_out_overlapping_input(hip):
+    """Frames are written in no particular order, so an out that shares memory with x must
+    not be written in place: frame 2 below is both read and written."""
+    torch.manual_seed(0)
+    buf, weight, bias = _gn_inputs(1, 128, 5, 40, 56, torch.float16)
+    x = buf[:, :, 0:3]
+    ref = hip.group_norm_silu_pad3d(x.clone(memory_format=torch.channels_last_3d), weight, bias,
+                                    32, 1e-6, [0, 0, 0, 0, 0], True)
+    hip.group_norm_silu_pad3d_out(x, weight, bias, 32, 1e-6, [0, 0, 0, 0, 0], True, False,
+                                  buf[:, :, 2:5])
+    assert torch.equal(buf[:, :, 2:5], ref)
+
+
+@needs_wmma
+def test_fp16_conv3d_out_overlapping_input_is_declined(hip):
+    """Blocks read input rows other blocks may already have written, so an out laid over x
+    takes the copy path."""
+    torch.manual_seed(0)
+    x, weight, _, _ = _conv_inputs(128, 128, 6, 66, 130, (3, 3, 3))
+    ref = hip._wmma_fp16_conv3d(x.clone(memory_format=torch.channels_last_3d), weight, None,
+                                None, [1, 1, 1])
+    out = torch.as_strided(x, ref.shape, ref.stride(), x.storage_offset())
+    assert hip._wmma_fp16_conv3d(x, weight, None, None, [1, 1, 1], out=out) is None
+    hip.fp16_conv3d_out(x, weight, None, None, [1, 1, 1], out)
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("case", ["larger", "dtype", "device"])
+def test_group_norm_silu_pad3d_out_contract(hip, case):
+    """A direct backend call gets the same out checks as the public op: a larger packed out
+    would pass the binding's length check, and a host out would reach the kernel."""
+    x, weight, bias = _gn_inputs(1, 128, 2, 16, 16, torch.float16)
+    shape = (1, 128, 2, 18, 18)
+    out = {
+        "larger": torch.empty((1, 128, 3, 18, 18), dtype=torch.float16, device=DEV),
+        "dtype": torch.empty(shape, dtype=torch.bfloat16, device=DEV),
+        "device": torch.empty(shape, dtype=torch.float16),
+    }[case].contiguous(memory_format=torch.channels_last_3d)
+    with pytest.raises(ValueError, match="out must be"):
+        hip.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, [1, 1, 1, 1, 0], True, True, out=out)
+
+
+def test_group_norm_silu_pad3d_out(hip, monkeypatch):
+    """A packed out and a frame-offset view of a longer buffer are written in place."""
+    torch.manual_seed(0)
+    x, weight, bias = _gn_inputs(1, 128, 3, 40, 56, torch.float16)
+    pad = [1, 1, 1, 1, 0]
+    _no_eager_group_norm(monkeypatch)
+    ref = hip.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, pad, True, True)
+    out = torch.empty_like(ref)
+    assert hip.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, pad, True, True,
+                                     out=out).data_ptr() == out.data_ptr()
+    assert torch.equal(out, ref)
+    buf = torch.full((1, 128, 5, 42, 58), 7.0, dtype=torch.float16, device=DEV).contiguous(
+        memory_format=torch.channels_last_3d)
+    hip.group_norm_silu_pad3d_out(x, weight, bias, 32, 1e-6, pad, True, True, buf[:, :, 2:])
+    assert torch.equal(buf[:, :, 2:], ref) and bool((buf[:, :, :2] == 7.0).all())
+    # a row window cannot be indexed by the kernel and is copied into
+    buf = torch.full((1, 128, 3, 50, 58), 7.0, dtype=torch.float16, device=DEV).contiguous(
+        memory_format=torch.channels_last_3d)
+    hip.group_norm_silu_pad3d_out(x, weight, bias, 32, 1e-6, pad, True, True, buf[:, :, :, 4:46])
+    assert torch.equal(buf[:, :, :, 4:46], ref) and bool((buf[:, :, :, :4] == 7.0).all())
 
 
 @needs_wmma
@@ -1498,6 +1712,85 @@ def test_w4a8_linear_chunking_does_not_change_the_result(hip, monkeypatch, n, ch
 
     assert chunked.shape == (m, n)
     assert torch.equal(chunked, one_pass)
+
+
+@pytest.mark.parametrize(("m", "n", "k", "group_size"),
+                         [(1, 256, 512, 16), (3, 768, 1024, 16), (8, 512, 2048, 32),
+                          (2, 384, 2048, 128), (1, 512, 1104, 16)])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@needs_wmma
+def test_w4a8_decode_gemv_matches_the_chunked_path(hip, monkeypatch, m, n, k, group_size, bias,
+                                                   out_dtype):
+    """The GEMV decodes the weight in registers instead of through the INT8
+    workspace, but lands on the same int8 grid and runs the same epilogue, so the
+    two paths have to agree bit for bit rather than merely closely.
+
+    K=1104 leaves a half-row that is not 16-byte aligned, which is the only case
+    that reaches the GEMV's one-vector-per-lane loop."""
+    torch.manual_seed(0)
+    convrot = 256 if k % 256 == 0 else 16
+    _, (qdata, s_rel, s_channel, _, cb) = _quantize_w4a8(
+        n, k, group_size=group_size, convrot_groupsize=convrot
+    )
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    bias_t = torch.randn(n, device=DEV, dtype=out_dtype) if bias else None
+    kwargs = {
+        "codebook": cb,
+        "bias": bias_t,
+        "group_size": group_size,
+        "convrot_groupsize": convrot,
+        "out_dtype": out_dtype,
+    }
+
+    # A launcher that declined would leave both calls on the chunked path, where
+    # the comparison below passes without the GEMV having run at all.
+    taken = []
+    launch = hip._C.w4a8_codebook_gemv
+
+    def record(*args):
+        taken.append(launch(*args))
+        return taken[-1]
+
+    monkeypatch.setattr(hip._C, "w4a8_codebook_gemv", record)
+
+    got = hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, **kwargs)
+    assert taken == [True]
+    monkeypatch.setattr(hip, "_W4A8_GEMV_MAX_ROWS", 0)
+    chunked = hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, **kwargs)
+
+    assert got.shape == (m, n)
+    assert torch.equal(got, chunked)
+
+
+@needs_wmma
+def test_w4a8_decode_gemv_declines_what_it_cannot_take(hip):
+    """The launcher answers for its own envelope so the caller never has to predict
+    it, and a decline has to leave the output alone rather than half-write it."""
+    n, k = 256, 512
+    torch.manual_seed(0)
+
+    def call(m, group_size):
+        _, (qdata, s_rel, s_channel, _, cb) = _quantize_w4a8(n, k, group_size=group_size)
+        cb_arg = cb.to(device=DEV, dtype=torch.float32).reshape(-1).contiguous()
+        s_channel_arg = s_channel.to(device=DEV, dtype=torch.float32).reshape(-1).contiguous()
+        xq = torch.zeros(m, k, device=DEV, dtype=torch.int8)
+        xs = torch.ones(m, device=DEV, dtype=torch.float32)
+        out = torch.full((m, n), float("nan"), device=DEV, dtype=torch.bfloat16)
+        used = hip._C.w4a8_codebook_gemv(
+            hip._dl(xq), hip._dl(qdata), hip._dl(s_rel.view(torch.uint8)), hip._dl(cb_arg),
+            hip._dl(s_channel_arg), hip._dl(xs), None, hip._dl(out),
+            m, n, k, group_size, hip.DTYPE_TO_CODE[torch.bfloat16], 0,
+        )
+        return used, out
+
+    used, out = call(hip._W4A8_GEMV_MAX_ROWS, 16)
+    assert used and not out.isnan().any()
+    # One row past the accumulator array, and a group finer than one 16-column vector.
+    for m, group_size in ((hip._W4A8_GEMV_MAX_ROWS + 1, 16), (1, 8)):
+        used, out = call(m, group_size)
+        assert not used
+        assert out.isnan().all()
 
 
 def test_w4a8_chunk_cols_stays_within_its_bounds(hip):
@@ -1845,6 +2138,122 @@ def test_w4a8_decode_launcher_rejects_an_unsupported_group_size(hip, group_size,
             hip._dl(qdata), hip._dl(s_rel), 0, None, hip._dl(out), 8, k, group_size,
             hip._stream(qdata),
         )
+
+
+def _random_w6a8(n, k, group_size, scale_dtype):
+    """Arbitrary 6-bit storage: every code and high-plane bit pattern, not only the
+    ones a quantizer happens to emit."""
+    qdata = torch.randint(-128, 128, (n, k * 3 // 4), dtype=torch.int8, device=DEV)
+    s_rel = (torch.rand(n, k // group_size, device=DEV) * 3.5 + 0.25).to(scale_dtype)
+    return qdata, s_rel
+
+
+# K=96 and 1056 give 3K/4-byte rows that are 8- but not 16-byte aligned.
+@pytest.mark.parametrize(("k", "group_size"), [(512, 16), (512, 32), (1024, 64), (96, 32),
+                                               (1056, 16)])
+@pytest.mark.parametrize("scale_dtype", [torch.float8_e4m3fn, torch.float32])
+def test_w6a8_decode_is_bit_exact(hip, k, group_size, scale_dtype):
+    torch.manual_seed(0)
+    qdata, s_rel = _random_w6a8(96, k, group_size, scale_dtype)
+
+    out = hip._dequant_int4_grouped_to_int8(qdata, s_rel, None, group_size)
+    ref = eager_w4a8._dequant_int4_grouped_to_int8(qdata, s_rel, None, group_size)
+
+    assert out.shape == (96, k) and out.dtype == torch.int8
+    assert torch.equal(out, ref)
+
+
+# K=512 takes the GEMV's paired 16-byte loads, K=1056 its one-vector fallback.
+@pytest.mark.parametrize(("k", "convrot"), [(512, 256), (1056, 16)])
+@pytest.mark.parametrize("m", [1, 8, 192, 600])
+@pytest.mark.parametrize("scale_dtype", [torch.float8_e4m3fn, torch.float32])
+@needs_wmma
+def test_w6a8_linear_matches_int8_linear_on_the_decoded_weight(hip, monkeypatch, k, convrot, m,
+                                                               scale_dtype):
+    """Every W6A8 route decodes to the same int8 grid and runs the same activation
+    quantizer and epilogue as int8_linear, so the result has to be bit-identical to
+    int8_linear on the eagerly decoded weight."""
+    torch.manual_seed(0)
+    n = 384
+    _, (qdata, s_rel, s_channel, correction, cb) = _quantize_w4a8(
+        n, k, bits=6, convrot_groupsize=convrot, scale_dtype=scale_dtype
+    )
+    assert qdata.shape == (n, k * 3 // 4) and cb is None and correction is None
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    bias = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+
+    taken = []
+    launch = hip._C.w4a8_codebook_gemv
+
+    def record(*args):
+        taken.append(launch(*args))
+        return taken[-1]
+
+    monkeypatch.setattr(hip._C, "w4a8_codebook_gemv", record)
+    monkeypatch.setattr(hip, "_w4a8_chunk_cols", lambda *_: 128)
+    got = hip.w4a8_int8_linear(
+        x, qdata, s_rel, s_channel, bias=bias, convrot_groupsize=convrot
+    )
+    int8_weight = eager_w4a8._dequant_int4_grouped_to_int8(qdata, s_rel, None, 16)
+    ref = hip.int8_linear(x, int8_weight, s_channel, bias, torch.bfloat16, True, convrot)
+
+    gemv = m <= hip._W4A8_GEMV_MAX_ROWS and scale_dtype == torch.float8_e4m3fn
+    assert taken == ([True] if gemv else [])
+    assert torch.equal(got, ref)
+
+
+@pytest.mark.parametrize(
+    ("cols", "group_size", "codebook", "match"),
+    [(3 * 512 // 8, 16, False, "packed width"),
+     (3 * 512 // 4, 8, False, "6-bit storage needs"),
+     (3 * 512 // 4, 16, True, "no codebook")],
+    ids=["width", "group", "codebook"],
+)
+def test_w6a8_bindings_reject_what_the_layout_cannot_hold(hip, cols, group_size, codebook,
+                                                          match):
+    n, k = 8, 512
+    qdata = torch.zeros(n, cols, dtype=torch.int8, device=DEV)
+    s_rel = torch.ones(n, k // group_size, dtype=torch.float32, device=DEV)
+    out = torch.zeros(n, k, dtype=torch.int8, device=DEV)
+    cb = torch.zeros(16, dtype=torch.float32, device=DEV) if codebook else None
+
+    with pytest.raises(RuntimeError, match=match):
+        hip._C.dequant_int4_grouped_to_int8(
+            hip._dl(qdata), hip._dl(s_rel), 0, None if cb is None else hip._dl(cb),
+            hip._dl(out), n, k, group_size, hip._stream(qdata),
+        )
+
+
+@needs_wmma
+def test_w6a8_layout_linear_dispatches_to_hip():
+    torch.manual_seed(0)
+    w = torch.randn(256, 512, device=DEV, dtype=torch.bfloat16) * 0.02
+    qt = QuantizedTensor.from_float(w, "AsymW4A8Int8Layout", bits=6)
+    assert qt._qdata.shape == (256, 384)
+    x = torch.randn(32, 512, device=DEV, dtype=torch.bfloat16)
+    params = qt._params
+
+    impl = registry.get_implementation(
+        "w4a8_int8_linear",
+        kwargs={
+            "x": x,
+            "qdata": qt._qdata,
+            "s_rel": params.scale,
+            "s_channel": params.s_channel,
+            "codebook": params.codebook,
+            "correction": params.correction,
+            "bias": None,
+            "group_size": params.group_size,
+            "convrot_groupsize": params.convrot_groupsize,
+            "out_dtype": torch.bfloat16,
+        },
+    )
+    assert impl.__module__ == "comfy_kitchen.backends.hip"
+
+    out = torch.nn.functional.linear(x, qt)
+    ref = (x @ w.t()).float()
+    assert out.shape == (32, 256)
+    assert (out.float() - ref).norm() / ref.norm() < 0.04
 
 
 def test_quantize_int8_rowwise_matches_eager():
@@ -3458,3 +3867,139 @@ def test_na3d_launcher_rejects_a_mismatched_operand(hip):
     with pytest.raises(RuntimeError, match="float16 or bfloat16"):
         hip._C.na3d(hip._dl(q.float()), hip._dl(q), hip._dl(q), hip._dl(out),
                     *extents, hip.DTYPE_TO_CODE[torch.float32], stream)
+
+
+# ---------------------------------------------------------------------------
+# GatedDeltaNet decode
+#
+# tests/test_gated_delta_fused.py covers the shape the CUDA backend is built for
+# and runs here unchanged. What it cannot cover is the part of the HIP kernel that
+# is not a transcription: the recurrent state is [DK, DV] fp32, 64 KiB at DK = DV
+# = 128, which is the whole RDNA per-workgroup LDS budget, so it lives in
+# registers split R ways across the DK axis. R changes with DV, and each R is a
+# separate instantiation with its own partition reduction.
+# ---------------------------------------------------------------------------
+
+needs_gated_delta = pytest.mark.skipif(
+    not ck.gated_delta_decode_is_available(), reason="fused DeltaNet decode kernels unavailable"
+)
+
+
+def _gated_delta_reference(conv_out, x, w_a, w_b, dt_bias, g_decay, state, z, norm_w,
+                           heads, key_heads, key_dim_head, value_dim, scale, eps):
+    from torch.nn import functional
+
+    batch, seq = x.shape[0], x.shape[1]
+    key_dim = key_heads * key_dim_head
+    a = functional.linear(x, w_a)
+    b = functional.linear(x, w_b)
+    beta = b.sigmoid().reshape(batch, seq, heads)
+    g = (g_decay * functional.softplus(a.float() + dt_bias)).reshape(batch, seq, heads).exp()
+    query, key, value = conv_out.transpose(1, 2).split(
+        [key_dim, key_dim, heads * value_dim], dim=-1
+    )
+    repeats = heads // key_heads
+    q = functional.normalize(
+        query.reshape(batch, seq, key_heads, key_dim_head).float(), dim=-1
+    ).repeat_interleave(repeats, dim=2) * scale
+    k = functional.normalize(
+        key.reshape(batch, seq, key_heads, key_dim_head).float(), dim=-1
+    ).repeat_interleave(repeats, dim=2)
+    v = value.reshape(batch, seq, heads, value_dim).float()
+    outs, snaps = [], []
+    for s in range(seq):
+        state.mul_(g[:, s, :, None, None])
+        kv_mem = torch.einsum("bhk,bhkv->bhv", k[:, s], state)
+        delta = (v[:, s] - kv_mem) * beta[:, s, :, None]
+        state.add_(torch.einsum("bhk,bhv->bhkv", k[:, s], delta))
+        outs.append(torch.einsum("bhk,bhkv->bhv", q[:, s], state))
+        if s < seq - 1:
+            snaps.append(state.clone())
+    out = torch.stack(outs, dim=1).to(x.dtype)
+    out = functional.rms_norm(out.reshape(-1, value_dim), (value_dim,), norm_w, eps)
+    out = out * functional.silu(z.reshape(-1, value_dim))
+    return out.reshape(batch, seq, heads, value_dim), (torch.stack(snaps) if snaps else None)
+
+
+@pytest.mark.parametrize("value_dim", [128, 256, 512])
+@pytest.mark.parametrize("key_heads", [1, 2, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@needs_gated_delta
+def test_gated_delta_decode_across_key_slices(hip, value_dim, key_heads, dtype, seed):
+    """One instantiation per DK slice, and the slice is chosen from DV: 128 takes 8
+    threads per key column, 256 takes 4 and 512 takes 2. key_heads sweeps the GQA
+    fan-out, which is what decides which q/k row a value head reads."""
+    batch, heads, key_dim_head, hidden, seq = 2, 4, 128, 256, 4
+    if not ck.gated_delta_decode_is_available(
+        key_head_dim=key_dim_head, value_head_dim=value_dim
+    ):
+        pytest.skip(f"value_head_dim {value_dim} unsupported here")
+    key_dim = key_heads * key_dim_head
+    channels = 2 * key_dim + heads * value_dim
+    scale, eps = key_dim_head ** -0.5, 1e-6
+
+    conv_out = torch.randn(batch, channels, seq, device=DEV, dtype=dtype)
+    x = torch.randn(batch, seq, hidden, device=DEV, dtype=dtype)
+    w_a = torch.randn(heads, hidden, device=DEV, dtype=dtype) * 0.05
+    w_b = torch.randn(heads, hidden, device=DEV, dtype=dtype) * 0.05
+    dt_bias = torch.randn(heads, device=DEV)
+    g_decay = -torch.rand(heads, device=DEV) - 0.5
+    state = torch.randn(batch, heads, key_dim_head, value_dim, device=DEV) * 0.1
+    z = torch.randn(batch, seq, heads * value_dim, device=DEV, dtype=dtype)
+    norm_w = torch.rand(value_dim, device=DEV, dtype=dtype) + 0.5
+
+    ref_state = state.clone()
+    ref_out, ref_snaps = _gated_delta_reference(
+        conv_out, x, w_a, w_b, dt_bias, g_decay, ref_state, z, norm_w, heads, key_heads,
+        key_dim_head, value_dim, scale, eps,
+    )
+
+    got_state = state.clone()
+    snaps = torch.empty((seq - 1, batch, heads, key_dim_head, value_dim), device=DEV)
+    got = ck.gated_delta_decode_fused(
+        conv_out, x, w_a, w_b, dt_bias, g_decay, got_state, key_dim, key_heads, scale, z,
+        norm_w, eps, snaps,
+    )
+
+    # The DK reduction is split across threads and summed partition by partition,
+    # so it reassociates against the reference rather than matching it exactly.
+    tol = 1e-5 if dtype == torch.float32 else 6e-3
+    assert got.shape == (batch, seq, heads, value_dim)
+    assert _rel_err(got.float(), ref_out.float()) < tol
+    assert _rel_err(got_state, ref_state) < tol
+    assert _rel_err(snaps, ref_snaps) < tol
+
+
+@pytest.mark.parametrize("kernel_size", [2, 4, 8])
+@pytest.mark.parametrize("seq", [1, 5, 8])
+@needs_gated_delta
+def test_deltanet_conv_step_window_fits_registers(hip, kernel_size, seq, seed):
+    """The conv window is a private array, so the carried state plus this step's
+    tokens has to stay inside it; KS = 8 with seq = 8 is the widest that does."""
+    from torch.nn import functional
+
+    batch, channels, dtype = 2, 512, torch.bfloat16
+    proj = torch.randn(batch, seq, channels, device=DEV, dtype=dtype)
+    state = torch.randn(batch, channels, kernel_size - 1, device=DEV, dtype=dtype)
+    w = torch.randn(channels, 1, kernel_size, device=DEV, dtype=dtype) * 0.5
+    b = torch.randn(channels, device=DEV, dtype=dtype) * 0.1
+
+    combined = torch.cat([state, proj.transpose(1, 2)], dim=-1)
+    ref = functional.silu(functional.conv1d(combined, w, b, groups=channels))
+    ref_state = combined[:, :, seq:].contiguous()
+
+    got_state = state.clone()
+    snaps = (
+        torch.empty((seq - 1, batch, channels, kernel_size - 1), device=DEV, dtype=dtype)
+        if seq > 1
+        else None
+    )
+    got = ck.deltanet_conv_step(proj, got_state, w, b, snaps)
+
+    assert _rel_err(got, ref) < 1e-2
+    assert torch.equal(got_state, ref_state)
+    if seq > 1:
+        expected = torch.stack(
+            [combined[:, :, 1 + s: s + kernel_size] for s in range(seq - 1)]
+        )
+        assert torch.equal(snaps, expected)

@@ -3,6 +3,7 @@
 // Plain ConvRot W4A4 helpers: rowwise signed int4 quantization and int4 MMA
 // with row/column dequant scales.
 #include "dtype_dispatch.cuh"
+#include "float_utils.cuh"
 #include "svdquant_utils.cuh"
 
 #include <cuda_runtime.h>
@@ -417,17 +418,7 @@ __device__ __forceinline__ float to_float<__half>(__half v) { return __half2floa
 template<>
 __device__ __forceinline__ float to_float<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
 
-template<typename T>
-__device__ __forceinline__ T from_float(float v);
-
-template<>
-__device__ __forceinline__ float from_float<float>(float v) { return v; }
-
-template<>
-__device__ __forceinline__ __half from_float<__half>(float v) { return __float2half(v); }
-
-template<>
-__device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
+using comfy::from_float;
 
 template<int NUM_WARPS>
 __device__ __forceinline__ float block_reduce_max(float v, float* warp_smem, float* block_smem) {
