@@ -1891,6 +1891,25 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
             throw std::runtime_error(std::string(kFn) +
                                      ": the last dimension of q, k, v and o must be contiguous");
         }
+        // The Q fragment is staged from global memory with two 16-byte loads, so
+        // every address it derives must land on a 16-byte boundary: q's base
+        // pointer and all three leading strides must be multiples of 8 16-bit
+        // elements. k is read from LDS here, so it has no such requirement.
+        {
+            const int64_t q_strides[] = {q.stride(0), q.stride(1), q.stride(2)};
+            for (int64_t s : q_strides) {
+                if (s % 8 != 0) {
+                    throw std::runtime_error(std::string(kFn) +
+                                             ": q's leading strides must be multiples of 8 "
+                                              "elements for the 16-byte Q fragment loads");
+                }
+            }
+            if (reinterpret_cast<uintptr_t>(q.data()) % 16 != 0) {
+                throw std::runtime_error(std::string(kFn) +
+                                         ": q must be 16-byte aligned for the 16-byte Q fragment "
+                                          "loads");
+            }
+        }
         require_len(v_int8, static_cast<int64_t>(batch) * kv_heads * head_dim * padded_k * 2,
                     kFn, "v_int8");
         launch_sage_transpose_v(v.data(), v_int8.data(), batch, kv_heads, kv_len, head_dim,

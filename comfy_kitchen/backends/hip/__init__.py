@@ -3244,18 +3244,11 @@ def sage_int8_sdpa(
     output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
     cta_k = _sage_cta_k(head_dim, kv_length, attn_mask is not None, q.device)
 
-    # ComfyUI's attention_comfy_kitchen_int8 does
-    # out.transpose(1, 2).reshape(b, -1, heads * dim_head) on the result. With
-    # HND-packed output that transpose destroys contiguity and the reshape
-    # materialises a 0.17-0.49 ms copy per call; packing the storage NHD and
-    # presenting it as [B, H, S, D] makes the transpose contiguous, so the
-    # reshape is a free view. It is only offered to the short-key direct path:
-    # that kernel reads q/k/v strided anyway and writes output tiles it can
-    # tolerate. On the int8 path the output write is bandwidth-bound and an
-    # NHD-packed layout costs more than the copy it removes (measured
-    # +0.18 to +0.36 ms at SDXL self-attention).
-    # Mirrors sage_sdpa's use_direct in dlpack_bindings.cpp; keep the two in step.
-    d64_short_keys = head_dim == 64 and q_length <= 2048 and not (
+    # Mirrors sage_sdpa's use_direct in dlpack_bindings.cpp exactly; keep the two
+    # in step. The C++ decides which kernel runs, so the Python gate must agree or
+    # the buffers will not match: qo=1024 kv=4096 would allocate the direct stubs
+    # while the int8 kernel demands full q_int8/k_int8 and throw.
+    d64_short_keys = head_dim == 64 and kv_length <= 2048 and not (
         q_length == kv_length and kv_length <= 1024
     )
     use_direct = (
@@ -3265,19 +3258,21 @@ def sage_int8_sdpa(
         and (d64_short_keys or (head_dim == 128 and kv_length <= 256))
     )
 
-    if use_direct:
-        # NHD-packed storage presented to the kernels as [B, H, S, D].
-        out_nhd = torch.empty(
-            batch, q_length, q_heads, head_dim, dtype=output_dtype, device=q.device
-        )
-        output = out_nhd.as_strided(
-            (batch, q_heads, q_length, head_dim),
-            (q_length * q_heads * head_dim, head_dim, q_heads * head_dim, 1),
-        )
-    else:
-        output = torch.empty(
-            batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q.device
-        )
+    # ComfyUI's attention_comfy_kitchen_int8 finishes with
+    # out.transpose(1, 2).reshape(b, -1, heads * dim_head). HND-packed storage
+    # makes that transpose non-contiguous, so the reshape materialises a copy of
+    # the whole output: 0.65 ms at SDXL cross-attention 4096x77x10x64, more than
+    # the attention itself. NHD-packed storage presented to the kernels as
+    # [B, H, S, D] makes the transpose contiguous and the reshape a free view.
+    # Both the direct kernel (explicit o strides) and sage_attend (which reads
+    # o.stride(0..2) off the tensor) accept the packing, so it is unconditional.
+    out_nhd = torch.empty(
+        batch, q_length, q_heads, head_dim, dtype=output_dtype, device=q.device
+    )
+    output = out_nhd.as_strided(
+        (batch, q_heads, q_length, head_dim),
+        (q_length * q_heads * head_dim, head_dim, q_heads * head_dim, 1),
+    )
 
     buffers, anchor_indices = (
         _sage_buffers_direct(q, k, cta_k) if use_direct else _sage_buffers(q, k, cta_k)

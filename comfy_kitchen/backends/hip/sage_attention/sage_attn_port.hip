@@ -245,11 +245,17 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
 #pragma unroll
     for (int dt = 0; dt < DTiles; ++dt) {
         if (q_idx_q < qo_len) {
-            const int64_t q_off = b * q_stride_b + hq * q_stride_h + q_idx_q * q_stride_n +
-                                  dt * kBK;
-            const QK_DTYPE* src = q + q_off;
-#pragma unroll
-            for (int i = 0; i < 16; ++i) q_frag[dt][i] = static_cast<QK_ELEM>(src[i]);
+            // Two 16-byte loads instead of 16 scalar vload1s. q_off is a
+            // multiple of kBK == 16 elements (32 bytes), and the launcher
+            // asserts a 16-byte-aligned base, so both halves are aligned.
+            const QK_DTYPE* src = q + b * q_stride_b + hq * q_stride_h +
+                                  q_idx_q * q_stride_n + dt * kBK;
+            QK_VEC loaded;
+            *reinterpret_cast<uint4*>(&loaded) =
+                *reinterpret_cast<const uint4*>(src);
+            *reinterpret_cast<uint4*>((char*)&loaded + 16) =
+                *reinterpret_cast<const uint4*>(src + 8);
+            q_frag[dt] = loaded;
         } else {
 #pragma unroll
             for (int i = 0; i < 16; ++i) q_frag[dt][i] = 0;
@@ -319,9 +325,12 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
 #pragma unroll
             for (int dt = 0; dt < DTiles; ++dt) {
                 const QK_DTYPE* k_ptr = &k_tile[(ct * kBK + m_row) * KStride + dt * kBK];
+                // Two 16-byte LDS loads: k_ptr is k_tile + (row * KStride + dt * kBK)
+                // elements, and both KStride and kBK are multiples of 16 elements.
                 QK_VEC k_frag;
-#pragma unroll
-                for (int i = 0; i < 16; ++i) k_frag[i] = static_cast<QK_ELEM>(k_ptr[i]);
+                *reinterpret_cast<uint4*>(&k_frag) = *reinterpret_cast<const uint4*>(k_ptr);
+                *reinterpret_cast<uint4*>((char*)&k_frag + 16) =
+                    *reinterpret_cast<const uint4*>(k_ptr + 8);
                 if constexpr (std::is_same<QK_DTYPE, __half>::value) {
                     score_acc = wmma_f32_f16(k_frag, q_frag[dt], score_acc);
                 } else {
