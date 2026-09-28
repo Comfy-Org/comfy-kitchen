@@ -10,6 +10,10 @@ else:
     _hip_backend = None
 
 _MAX_STEPS = 8
+# Published wheels compile 75-virtual as the floor (see setup.py). Volta
+# (sm_70) still reports enough opt-in shared memory for the fused decode
+# budget, so the shmem check alone waves V100 through to a rejected launch.
+_NATIVE_MINIMUM_CAPABILITY = (7, 5)
 _device_optin: dict[int, int] = {}
 
 
@@ -37,6 +41,8 @@ def is_available(device: torch.device | None = None, key_head_dim: int = 128, va
     if ext is None or not hasattr(ext, "gated_delta_decode_fused") or not hasattr(ext, "deltanet_conv_step"):
         return False
     if key_head_dim != 128 or value_head_dim % 32 != 0 or not 0 < value_head_dim <= 512:
+        return False
+    if torch.cuda.get_device_capability(device) < _NATIVE_MINIMUM_CAPABILITY:
         return False
     index = device.index if device is not None else None
     if index is None:
