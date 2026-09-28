@@ -30,7 +30,10 @@
 
 namespace {
 using namespace cute;
+using comfy_cutlass::device_sm_count;
+using comfy_cutlass::device_l2_bytes;
 // Bands of 32 N tiles: a 154 MB weight at 32k rows reads 0.9 GB from DRAM instead of 26 GB.
+// An L2 too small to hold a band narrows them, see stream_k_band_tiles.
 using ThreadblockSwizzleBandedStreamK = comfy_cutlass::ThreadblockSwizzleLeanStreamKT<32>;
 
 template <typename ThreadMap, bool Scalar>
@@ -205,21 +208,6 @@ int select_fused_int8_config(int m, int n, int k) {
 // The tree ignores wave quantization: at decoder-tile M (~2k rows) its 128x256
 // pick can leave a 2.1-wave grid where 128x128 wins despite ~8% lower per-tile
 // throughput. Between those two, take the smaller wave-rounding x tile-cost.
-template <cudaDeviceAttr Attr>
-int cached_device_attribute(int fallback) {
-    static int values[64] = {};
-    int dev = 0;
-    cudaGetDevice(&dev);
-    if (dev < 0 || dev >= 64) return fallback;
-    if (values[dev] == 0) {
-        cudaDeviceGetAttribute(&values[dev], Attr, dev);
-        if (values[dev] <= 0) values[dev] = fallback;
-    }
-    return values[dev];
-}
-int device_sm_count() { return cached_device_attribute<cudaDevAttrMultiProcessorCount>(1); }
-int device_l2_bytes() { return cached_device_attribute<cudaDevAttrL2CacheSize>(1 << 30); }
-
 int wave_guard(int m, int n, int selected) {
     if (selected != 0 && selected != 1) return selected;
     const int sms = device_sm_count();

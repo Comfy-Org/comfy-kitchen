@@ -135,6 +135,19 @@ class TestCudaBackend:
         assert rel_l2(got, ref) < 2e-2          # int8 activation rounding between backends
         assert rel_l2(got, exact) < 4e-2        # and both are close to the bf16 matmul
 
+    # a small L2 decodes the weight whole, a large one in chunks; 4352 columns leave a short last chunk
+    @pytest.mark.parametrize("bits", [4, 6])
+    @pytest.mark.parametrize("m", [64, 1024])
+    def test_linear_is_the_same_whole_or_chunked(self, bits, m, seed, monkeypatch):
+        w = torch.randn(4352, 512, device="cuda", dtype=torch.bfloat16) * 0.02
+        q, s, c, _, cb = eager_w4a8.quantize_w4a8_int8_weight(w, bits=bits)
+        x = torch.randn(m, 512, device="cuda", dtype=torch.bfloat16)
+        outs = []
+        for chunk in (1024, 4096, 4352):
+            monkeypatch.setattr(cuda_backend, "_w4a8_weight_chunk_cols", lambda m, n, d, c=chunk: c)
+            outs.append(cuda_backend.w4a8_int8_linear(x, q, s, c, codebook=cb, out_dtype=torch.bfloat16))
+        assert torch.equal(outs[0], outs[2]) and torch.equal(outs[1], outs[2])
+
     def test_two_pass_fp32_scale_route(self, weight):
         q, s, c, _, _ = eager_w4a8.quantize_w4a8_int8_weight(weight, bits=6, scale_dtype=torch.float32)
         x = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)

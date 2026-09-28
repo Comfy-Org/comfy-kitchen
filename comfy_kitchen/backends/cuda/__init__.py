@@ -237,6 +237,9 @@ _nvidia_16_series_device_cache: dict[int, bool] = {}
 _cutlass_int8_device_cache: dict[int, bool] = {}
 _device_capability_cache: dict[int, tuple[int, int]] = {}
 _device_multiprocessor_count_cache: dict[int, int] = {}
+_device_l2_bytes_cache: dict[int, int] = {}
+# kBandRetainL2Bytes in cutlass_gemm_common.cuh: an L2 below this keeps no weight slice resident
+_SMALL_L2_BYTES = 16 << 20
 _FORCE_INT4_INT8_FALLBACK = os.environ.get("COMFY_KITCHEN_FORCE_INT4_INT8_FALLBACK", "0") == "1"
 _INT4_PACKED_WEIGHT_SMALL_M_MAX = 8
 _INT4_INT8_WEIGHT_CHUNK_N = max(1, int(os.environ.get("COMFY_KITCHEN_INT4_INT8_WEIGHT_CHUNK_N", "4096")))
@@ -271,6 +274,16 @@ def _cuda_device_multiprocessor_count(device_index: int) -> int:
         count = torch.cuda.get_device_properties(device_index).multi_processor_count
         _device_multiprocessor_count_cache[device_index] = count
     return count
+
+
+def _cuda_device_l2_bytes(device_index: int) -> int:
+    l2 = _device_l2_bytes_cache.get(device_index)
+    if l2 is None:
+        props = torch.cuda.get_device_properties(device_index)
+        # unknown counts as large, which keeps every L2-sized default
+        l2 = getattr(props, "L2_cache_size", 0) or (1 << 30)
+        _device_l2_bytes_cache[device_index] = l2
+    return l2
 
 
 def _cuda_device_is_turing(device_index: int) -> bool:
@@ -862,6 +875,17 @@ def _int4_int8_weight_chunk_cols(m: int, n: int) -> int:
     if m <= 128:
         return min(n, _INT4_INT8_WEIGHT_CHUNK_N)
     return min(n, _INT4_INT8_WEIGHT_CHUNK_N)
+
+
+def _w4a8_weight_chunk_cols(m: int, n: int, device_index: int) -> int:
+    # Chunks keep the decoded weight in L2; one that cannot fit only adds launches. Decoding
+    # N > 4096 whole on a 3080 (5 MB) is up to 20% faster at M=512 and 2-5% at M=4096.
+    if (
+        _cuda_device_l2_bytes(device_index) < _SMALL_L2_BYTES
+        and "COMFY_KITCHEN_INT4_INT8_WEIGHT_CHUNK_N" not in os.environ
+    ):
+        return n
+    return _int4_int8_weight_chunk_cols(m, n)
 
 
 def _int4_weight_int8_act_gemm_dequant_chunked(
@@ -2367,7 +2391,7 @@ def w4a8_int8_linear(
         and s_rel.dtype == torch.float8_e4m3fn
     )
     if chunked:
-        chunk_cols = _int4_int8_weight_chunk_cols(m, n)
+        chunk_cols = _w4a8_weight_chunk_cols(m, n, x.get_device())
         workspace = torch.empty(
             min(chunk_cols, n), k, dtype=torch.int8, device=x.device
         )
