@@ -1445,6 +1445,10 @@ extern "C" void launch_sage_port_attn(
             // BN 32 for the short self shapes.
             bm_sel = 64;
             bn_sel = (kv_len >= 4096) ? 64 : 32;
+        } else if (kv_len <= 128) {
+            // D64 short-key cross: 16-key tiles on the 32_t kernel.
+            bm_sel = 64;
+            bn_sel = 16;
         } else {
             // D64 cross: 32-key tiles on the 32_t kernel.
             bm_sel = 64;
