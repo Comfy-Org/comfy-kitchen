@@ -2015,6 +2015,8 @@ extern "C" {
         int out_dtype_code,
         cudaStream_t stream);
 
+    int cutlass_int8_selected_config(int64_t M, int64_t N, int64_t K);
+
     bool launch_cutlass_int8_dequant_config(
         const void* A,
         const void* B,
@@ -4055,6 +4057,10 @@ NB_MODULE(_C, m) {
           nb::arg("d"),
           nb::arg("out_dtype_code"),
           nb::arg("stream_ptr"));
+
+    m.def("cutlass_int8_selected_config", &cutlass_int8_selected_config,
+          "The fused INT8 GEMM tile config the shape heuristic picks for (M, N, K); -1 without CUTLASS",
+          nb::arg("m"), nb::arg("n"), nb::arg("k"));
 
     m.def("cutlass_int8_dequant_config", &cutlass_int8_dequant_config,
           "Benchmark one fused CUTLASS INT8 kernel configuration",

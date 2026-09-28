@@ -47,7 +47,9 @@ inline void* get_stream_workspace(size_t size, cudaStream_t stream) {
     return workspace.data;
 }
 
-struct ThreadblockSwizzleLeanStreamK {
+// BandN > 0: walk N in bands of that many tiles so a wave's weight slice stays in L2.
+template <int BandN = 0>
+struct ThreadblockSwizzleLeanStreamKT {
     using StreamkFeature = void;
 
     template <typename GemmKernel>
@@ -74,9 +76,9 @@ struct ThreadblockSwizzleLeanStreamK {
     int sk_waves;
     bool cohort_raster = false;
 
-    ThreadblockSwizzleLeanStreamK() = default;
+    ThreadblockSwizzleLeanStreamKT() = default;
 
-    ThreadblockSwizzleLeanStreamK(
+    ThreadblockSwizzleLeanStreamKT(
         cutlass::gemm::GemmUniversalMode,
         cutlass::gemm::GemmCoord problem_size_arg,
         cutlass::gemm::GemmCoord tile_size,
@@ -156,6 +158,12 @@ struct ThreadblockSwizzleLeanStreamK {
         if (tiled_shape_.m() < tiled_shape_.n()) {
             tile_n = tile_index / tiled_shape_.m();
             tile_m = tile_index - tile_n * tiled_shape_.m();
+        } else if constexpr (BandN > 0) {
+            const int band = tile_index / (BandN * tiled_shape_.m());
+            const int band_n = min(BandN, tiled_shape_.n() - band * BandN);
+            const int r = tile_index - band * BandN * tiled_shape_.m();
+            tile_m = r / band_n;
+            tile_n = band * BandN + (r - tile_m * band_n);
         } else {
             tile_m = tile_index / tiled_shape_.n();
             tile_n = tile_index - tile_m * tiled_shape_.n();
@@ -200,6 +208,8 @@ struct ThreadblockSwizzleLeanStreamK {
             : block_index;
     }
 };
+
+using ThreadblockSwizzleLeanStreamK = ThreadblockSwizzleLeanStreamKT<0>;
 
 template <typename T, typename = void>
 struct IsStreamKSwizzle : std::false_type {};
