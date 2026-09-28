@@ -1251,14 +1251,19 @@ extern "C" void launch_sage_direct_attn(
     }
 
     if (dtype_code == 1) {  // fp16
-        // The sweep overrides are read once per process (static) and force a
-        // single fp16 config. They are only valid for head_dim == 64: a direct
-        // launch is templated on head_dim, and an override set while processing a
-        // head_dim-128 input would run the 64-channel kernel, write half of o and
-        // leave the rest uninitialized. With head_dim == 128 the overrides are
-        // ignored and the shape-differentiated dispatch below runs instead.
-        static const int ebm = []{ const char* s = getenv("SAGE_DIRECT_BM"); return s ? atoi(s) : 0; }();
-        static const int ebn = []{ const char* s = getenv("SAGE_DIRECT_BN"); return s ? atoi(s) : 0; }();
+        // The sweep overrides force a single fp16 config. They are read per call
+        // rather than once per process so a sweep can interleave configs inside
+        // one process: cross-process timing on this iGPU drifts with the clock and
+        // would swamp a config comparison (same reason as SAGE_PORT_*). They are
+        // only valid for head_dim == 64: a direct launch is templated on head_dim,
+        // and an override set while processing a head_dim-128 input would run the
+        // 64-channel kernel, write half of o and leave the rest uninitialized.
+        // With head_dim == 128 they are ignored and the shape-differentiated
+        // dispatch below runs instead.
+        const char* s_bm = getenv("SAGE_DIRECT_BM");
+        const char* s_bn = getenv("SAGE_DIRECT_BN");
+        const int ebm = s_bm ? atoi(s_bm) : 0;
+        const int ebn = s_bn ? atoi(s_bn) : 0;
         if (ebm != 0 && ebn != 0 && head_dim == 64) {
             if (ebm == 128 && ebn == 64) {
                 LAUNCH_DIRECT(64, 128, 64, __half);
@@ -1266,6 +1271,8 @@ extern "C" void launch_sage_direct_attn(
                 LAUNCH_DIRECT(64, 128, 32, __half);
             } else if (ebm == 64 && ebn == 32) {
                 LAUNCH_DIRECT(64, 64, 32, __half);
+            } else if (ebm == 64 && ebn == 16) {
+                LAUNCH_DIRECT(64, 64, 16, __half);
             } else if (ebm == 64 && ebn == 128) {
                 LAUNCH_DIRECT(64, 64, 128, __half);
             } else if (ebm == 128 && ebn == 128) {

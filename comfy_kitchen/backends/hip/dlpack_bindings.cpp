@@ -1672,15 +1672,23 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
     }
     require_dtype(o, output_dtype_code, output_dtype_code, fn, "o");
     require_len(o, static_cast<int64_t>(batch) * q_heads * qo_len * head_dim, fn, "o");
-    // The output strides below are synthesized from the extents rather than read
-    // from o, so anything but the packed layout would be written as though it
-    // were packed. Both entry points reach this, so the check belongs here.
+    // The kernels index o by explicit stride, so it may be the packed HND layout
+    // or an NHD-packed buffer viewed as [B, H, Lq, D]. ComfyUI's
+    // attention_comfy_kitchen_int8 does out.transpose(1, 2).reshape(...): only
+    // NHD-packed strides make that transpose contiguous and the reshape a free
+    // view instead of a copy. The one real invariant is a contiguous last dim.
     if (o.ndim() != 4 || static_cast<int>(o.shape(0)) != batch ||
         static_cast<int>(o.shape(1)) != q_heads || static_cast<int>(o.shape(2)) != qo_len ||
         static_cast<int>(o.shape(3)) != head_dim) {
         throw std::runtime_error(std::string(fn) + ": o must be [B, H_q, Lq, D]");
     }
-    require_packed_contiguous(o, fn, "o");
+    if (o.stride(3) != 1) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": the last dimension of o must be contiguous");
+    }
+    const int64_t o_stride_b = o.stride(0);
+    const int64_t o_stride_h = o.stride(1);
+    const int64_t o_stride_n = o.stride(2);
 
     const void* mask_ptr = nullptr;
     int64_t mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k;
@@ -1719,8 +1727,7 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
                 static_cast<int64_t>(kv_len) * head_dim,
                 static_cast<int64_t>(kv_heads) * head_dim * padded_k,
                 static_cast<int64_t>(head_dim) * padded_k, padded_k,
-                static_cast<int64_t>(q_heads) * qo_len * head_dim,
-                static_cast<int64_t>(qo_len) * head_dim, head_dim, sm_scale, output_dtype_code,
+                o_stride_b, o_stride_h, o_stride_n, sm_scale, output_dtype_code,
                 stream);
         } else {
             // Pure-int8 path on the ported gfx110x schedule (int8 V, u8 P).
@@ -1735,8 +1742,7 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
                 static_cast<int64_t>(kv_len) * head_dim,
                 static_cast<int64_t>(kv_heads) * head_dim * padded_k,
                 static_cast<int64_t>(head_dim) * padded_k, padded_k,
-                static_cast<int64_t>(q_heads) * qo_len * head_dim,
-                static_cast<int64_t>(qo_len) * head_dim, head_dim, sm_scale, output_dtype_code,
+                o_stride_b, o_stride_h, o_stride_n, sm_scale, output_dtype_code,
                 v_dtype_code, stream);
         }
     } else if (v_dtype_code == 1) {
@@ -1759,8 +1765,7 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
             static_cast<int64_t>(kv_len) * head_dim,
             static_cast<int64_t>(kv_heads) * head_dim * padded_k,
             static_cast<int64_t>(head_dim) * padded_k, padded_k,
-            static_cast<int64_t>(q_heads) * qo_len * head_dim,
-            static_cast<int64_t>(qo_len) * head_dim, head_dim, sm_scale, output_dtype_code,
+            o_stride_b, o_stride_h, o_stride_n, sm_scale, output_dtype_code,
             1 /* fp16 V */, stream);
     } else {
         // int8-QK / bf16-fp16-SV fallback (masked or prequantized-bf16 callers):
@@ -1776,8 +1781,7 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
             static_cast<int64_t>(kv_len) * head_dim,
             static_cast<int64_t>(kv_heads) * head_dim * padded_k,
             static_cast<int64_t>(head_dim) * padded_k, padded_k,
-            static_cast<int64_t>(q_heads) * qo_len * head_dim,
-            static_cast<int64_t>(qo_len) * head_dim, head_dim, sm_scale, output_dtype_code,
+            o_stride_b, o_stride_h, o_stride_n, sm_scale, output_dtype_code,
             v_dtype_code, stream);
     }
     check_hip_launch();

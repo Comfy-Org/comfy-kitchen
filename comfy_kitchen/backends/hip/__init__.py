@@ -3112,6 +3112,41 @@ def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
     return buffers, anchor_indices
 
 
+def _sage_buffers_direct(q: torch.Tensor, k: torch.Tensor, cta_k: int):
+    """Allocate only the V scratch the short-key direct path reads.
+
+    sage_sdpa's use_direct branch runs launch_sage_transpose_v into v_int8 and
+    then launch_sage_direct_attn straight from q, k and v: the int8 prepass never
+    runs, so q_int8, k_int8, the three scales and anchor_indices are written by
+    nothing and require_len only looks at v_int8. The binding still demands a
+    tensor per argument, so the six unfilled slots share one 16-byte stub instead
+    of six real allocations (six torch.empty calls per attention).
+    """
+    batch, _, _, head_dim = q.shape
+    _, kv_heads, kv_length, _ = k.shape
+    if head_dim not in _SAGE_HEAD_DIMS:
+        raise ValueError(f"int8 attention head_dim must be one of {_SAGE_HEAD_DIMS}")
+
+    padded_k = -(-kv_length // cta_k) * cta_k
+    device = q.device
+    stub = torch.empty(16, dtype=torch.int8, device=device)
+    buffers = {
+        "q_int8": stub,
+        "k_int8": stub,
+        "q_scale": stub,
+        "k_scale": stub,
+        "v_scale": stub,
+        "v_int8": torch.empty(
+            batch * kv_heads * head_dim,
+            padded_k * (2 if _is_small_igpu(device) else 1),
+            dtype=torch.int8,
+            device=device,
+        ),
+    }
+    anchor_indices = torch.empty(16, dtype=torch.int32, device=device)
+    return buffers, anchor_indices
+
+
 def _sage_can_fuse_dense_mask(attn_mask: torch.Tensor | None) -> bool:
     return (
         attn_mask is not None
@@ -3176,21 +3211,6 @@ def _view_nhd_as_hnd(t: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _view_hnd_as_nhd(t: torch.Tensor) -> torch.Tensor:
-    """View a packed [B, H, L, D] result as its [B, L, H, D] shape. Zero-copy.
-
-    The same axis swap as _view_nhd_as_hnd, which is why the two functions are
-    structurally identical: NHD and HND are transposes of each other, so reading
-    one as the other is the inverse operation with no stride arithmetic of its own.
-    """
-    batch, heads, seq, channels = t.shape
-    stride_batch, stride_heads, stride_seq, stride_channels = t.stride()
-    return t.as_strided(
-        (batch, seq, heads, channels),
-        (stride_batch, stride_seq, stride_heads, stride_channels),
-    )
-
-
 def sage_int8_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3220,13 +3240,48 @@ def sage_int8_sdpa(
     elif layout != "HND":
         raise ValueError(f"layout must be 'HND' or 'NHD', got {layout!r}")
     batch, q_heads, q_length, head_dim = q.shape
+    _, _, kv_length, _ = k.shape
     output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
-    output = torch.empty(
-        batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q.device
+    cta_k = _sage_cta_k(head_dim, kv_length, attn_mask is not None, q.device)
+
+    # ComfyUI's attention_comfy_kitchen_int8 does
+    # out.transpose(1, 2).reshape(b, -1, heads * dim_head) on the result. With
+    # HND-packed output that transpose destroys contiguity and the reshape
+    # materialises a 0.17-0.49 ms copy per call; packing the storage NHD and
+    # presenting it as [B, H, S, D] makes the transpose contiguous, so the
+    # reshape is a free view. It is only offered to the short-key direct path:
+    # that kernel reads q/k/v strided anyway and writes output tiles it can
+    # tolerate. On the int8 path the output write is bandwidth-bound and an
+    # NHD-packed layout costs more than the copy it removes (measured
+    # +0.18 to +0.36 ms at SDXL self-attention).
+    # Mirrors sage_sdpa's use_direct in dlpack_bindings.cpp; keep the two in step.
+    d64_short_keys = head_dim == 64 and q_length <= 2048 and not (
+        q_length == kv_length and kv_length <= 1024
+    )
+    use_direct = (
+        _is_small_igpu(q.device)
+        and attn_mask is None
+        and q.dtype == output_dtype
+        and (d64_short_keys or (head_dim == 128 and kv_length <= 256))
     )
 
-    cta_k = _sage_cta_k(head_dim, k.shape[2], attn_mask is not None, q.device)
-    buffers, anchor_indices = _sage_buffers(q, k, cta_k)
+    if use_direct:
+        # NHD-packed storage presented to the kernels as [B, H, S, D].
+        out_nhd = torch.empty(
+            batch, q_length, q_heads, head_dim, dtype=output_dtype, device=q.device
+        )
+        output = out_nhd.as_strided(
+            (batch, q_heads, q_length, head_dim),
+            (q_length * q_heads * head_dim, head_dim, q_heads * head_dim, 1),
+        )
+    else:
+        output = torch.empty(
+            batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q.device
+        )
+
+    buffers, anchor_indices = (
+        _sage_buffers_direct(q, k, cta_k) if use_direct else _sage_buffers(q, k, cta_k)
+    )
     raw_dense_mask = None
     if head_dim <= 128 and _sage_can_fuse_dense_mask(attn_mask):
         # sage_sdpa sizes the packed output from the raw mask's extents, while
@@ -3261,7 +3316,11 @@ def sage_int8_sdpa(
         None if attn_mask is None else _dl(attn_mask),
         None if raw_dense_mask is None else _dl(raw_dense_mask),
     )
-    return _view_hnd_as_nhd(output) if layout == "NHD" else output
+    # output.transpose(1, 2) is the zero-copy HND-to-NHD view in both allocation
+    # branches: the direct branch hands back NHD-packed storage as an [B, H, S, D]
+    # view, whose transpose lands contiguous; the int8 branch is packed HND, whose
+    # transpose is the correct non-contiguous view of the same bytes.
+    return output if layout == "HND" else output.transpose(1, 2)
 
 
 def sage_int8_quantize(
