@@ -31,7 +31,10 @@ class PrequantizedInt8Attention:
     """Packed Q/K/V and immutable launch metadata for split INT8 attention.
 
     Instances own only the quantized tensors, their scales, and an optional
-    attention mask. They never retain the floating-point Q, K, or V inputs.
+    attention mask in its active layout: expanded 4D values or a prepared 3D
+    buffer containing key values and tile metadata, or a HIP 5D dense tile
+    buffer. Prepared masks replace the original mask. Instances never retain
+    the floating-point Q, K, or V inputs.
     Create instances with :func:`prequantize_int8_attention` rather than
     constructing them directly.
     """
@@ -159,21 +162,9 @@ def _validate_inputs(
     k: torch.Tensor,
     v: torch.Tensor,
     attn_mask: torch.Tensor | None,
-    *,
-    layout: str = "HND",
 ) -> torch.Tensor | None:
-    if layout not in ("HND", "NHD"):
-        raise ValueError(f"layout must be 'HND' or 'NHD', got {layout!r}")
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
-        # The HND wording is the historical message; the transposed variant is only
-        # offered when a caller asks for layout="NHD", so the other backends keep
-        # producing the exact error text they have always produced.
-        shapes = (
-            "[batch, sequence, heads, head_dim] (layout='NHD')"
-            if layout == "NHD"
-            else "[batch, heads, sequence, head_dim]"
-        )
-        raise ValueError(f"q, k, and v must have shape {shapes}")
+        raise ValueError("q, k, and v must have shape [batch, heads, sequence, head_dim]")
     if q.dtype not in _SUPPORTED_DTYPES:
         raise TypeError(f"q, k, and v must be float32, float16, or bfloat16, got {q.dtype}")
     if q.dtype != k.dtype or q.dtype != v.dtype:
@@ -188,19 +179,13 @@ def _validate_inputs(
             "or the HIP extension on an AMD device with matrix cores (RDNA3 or newer)"
         )
 
-    if layout == "NHD":
-        batch, q_length, q_heads, head_dim = q.shape
-        _, kv_length, kv_heads, k_head_dim = k.shape
-        expected_v = (batch, kv_length, kv_heads, head_dim)
-        expected_note = "[q.batch, k.sequence, k.heads, q.head_dim]"
-    else:
-        batch, q_heads, q_length, head_dim = q.shape
-        _, kv_heads, kv_length, k_head_dim = k.shape
-        expected_v = (batch, kv_heads, kv_length, head_dim)
-        expected_note = "[q.batch, k.heads, k.sequence, q.head_dim]"
-    if v.shape != expected_v:
-        raise ValueError(f"v must have shape {expected_note}, got {tuple(v.shape)}")
-    if k.shape[0] != batch or k.shape[3] != head_dim:
+    batch, q_heads, q_length, head_dim = q.shape
+    k_batch, kv_heads, kv_length, k_head_dim = k.shape
+    if v.shape != (batch, kv_heads, kv_length, head_dim):
+        raise ValueError(
+            f"v must have shape [q.batch, k.heads, k.sequence, q.head_dim], got {tuple(v.shape)}"
+        )
+    if k_batch != batch or k_head_dim != head_dim:
         raise ValueError(
             f"q and k batch/head dimensions must match, got {tuple(q.shape)} and {tuple(k.shape)}"
         )
@@ -220,18 +205,12 @@ def _validate_inputs(
         raise ValueError("attn_mask must be on the same CUDA device as q, k, and v")
     if attn_mask.dtype not in (torch.bool, torch.float16, torch.bfloat16, torch.float32):
         raise TypeError("attn_mask must be bool, float16, bfloat16, or float32")
-    mask_shape = (
-        (batch, q_length, q_heads, kv_length)
-        if layout == "NHD"
-        else (batch, q_heads, q_length, kv_length)
-    )
     try:
-        return torch.broadcast_to(attn_mask, mask_shape)
+        return torch.broadcast_to(attn_mask, (batch, q_heads, q_length, kv_length))
     except RuntimeError as error:
-        shape_note = f"[{', '.join(str(dim) for dim in mask_shape)}]"
         raise ValueError(
-            f"attn_mask must be broadcastable to {shape_note}, got "
-            f"{tuple(attn_mask.shape)}"
+            "attn_mask must be broadcastable to "
+            f"[{batch}, {q_heads}, {q_length}, {kv_length}], got {tuple(attn_mask.shape)}"
         ) from error
 
 
@@ -242,9 +221,8 @@ def _int8_attention_cuda(
     *,
     scale: float | None = None,
     attn_mask: torch.Tensor | None = None,
-    layout: str = "HND",
 ) -> torch.Tensor:
-    attn_mask = _validate_inputs(q, k, v, attn_mask, layout=layout)
+    attn_mask = _validate_inputs(q, k, v, attn_mask)
 
     original_head_dim = q.shape[-1]
     attention_scale = original_head_dim**-0.5 if scale is None else float(scale)
@@ -271,7 +249,7 @@ def _int8_attention_cuda(
                 q,
                 k,
                 v,
-                tensor_layout=layout,
+                tensor_layout="HND",
                 is_causal=False,
                 sm_scale=attention_scale,
             )
@@ -306,23 +284,16 @@ def _int8_attention_cuda(
             v,
             attention_scale=attention_scale,
             attn_mask=attn_mask,
-            layout=layout,
         )
         output = output[..., :original_head_dim]
         return output.float() if q.dtype == torch.float32 else output
-
-    if layout != "HND":
-        raise NotImplementedError(
-            "layout='NHD' INT8 attention is served by the HIP extension; the "
-            "CUDA fallback path expects [B, H, L, D] operands."
-        )
 
     batch, q_heads, q_length, _ = q.shape
     _, kv_heads, kv_length, _ = k.shape
     cta_k = _select_cta_k(
         kernel_head_dim,
         kv_length,
-        has_mask=attn_mask is not None,
+        has_mask=attn_mask is not None and attn_mask.ndim == 4,
     )
     padded_k_length = _pad_to_cta_k(kv_length, cta_k)
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
@@ -361,45 +332,25 @@ def _int8_attention_cuda(
     anchor_indices_ptr = anchor_indices.data_ptr()
 
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
-    if attn_mask is None:
-        _cuda_backend._C.sage_sdpa(
-            _cuda_backend._wrap_for_dlpack(q),
-            _cuda_backend._wrap_for_dlpack(k),
-            _cuda_backend._wrap_for_dlpack(v),
-            _cuda_backend._wrap_for_dlpack(output),
-            _cuda_backend._wrap_for_dlpack(q_int8),
-            _cuda_backend._wrap_for_dlpack(q_scale),
-            _cuda_backend._wrap_for_dlpack(k_int8),
-            _cuda_backend._wrap_for_dlpack(k_scale),
-            _cuda_backend._wrap_for_dlpack(v_int8),
-            _cuda_backend._wrap_for_dlpack(v_scale),
-            attention_scale,
-            DTYPE_TO_CODE[q.dtype],
-            DTYPE_TO_CODE[output_dtype],
-            stream_ptr,
-            anchor_indices_ptr,
-            cta_k=cta_k,
-        )
-    else:
-        _cuda_backend._C.sage_sdpa(
-            _cuda_backend._wrap_for_dlpack(q),
-            _cuda_backend._wrap_for_dlpack(k),
-            _cuda_backend._wrap_for_dlpack(v),
-            _cuda_backend._wrap_for_dlpack(output),
-            _cuda_backend._wrap_for_dlpack(q_int8),
-            _cuda_backend._wrap_for_dlpack(q_scale),
-            _cuda_backend._wrap_for_dlpack(k_int8),
-            _cuda_backend._wrap_for_dlpack(k_scale),
-            _cuda_backend._wrap_for_dlpack(v_int8),
-            _cuda_backend._wrap_for_dlpack(v_scale),
-            attention_scale,
-            DTYPE_TO_CODE[q.dtype],
-            DTYPE_TO_CODE[output_dtype],
-            stream_ptr,
-            anchor_indices_ptr,
-            _cuda_backend._wrap_for_dlpack(attn_mask),
-            cta_k=cta_k,
-        )
+    _cuda_backend._C.sage_sdpa(
+        _cuda_backend._wrap_for_dlpack(q),
+        _cuda_backend._wrap_for_dlpack(k),
+        _cuda_backend._wrap_for_dlpack(v),
+        _cuda_backend._wrap_for_dlpack(output),
+        _cuda_backend._wrap_for_dlpack(q_int8),
+        _cuda_backend._wrap_for_dlpack(q_scale),
+        _cuda_backend._wrap_for_dlpack(k_int8),
+        _cuda_backend._wrap_for_dlpack(k_scale),
+        _cuda_backend._wrap_for_dlpack(v_int8),
+        _cuda_backend._wrap_for_dlpack(v_scale),
+        attention_scale,
+        DTYPE_TO_CODE[q.dtype],
+        DTYPE_TO_CODE[output_dtype],
+        stream_ptr,
+        anchor_indices_ptr,
+        _cuda_backend._wrap_for_dlpack(attn_mask) if attn_mask is not None else None,
+        cta_k,
+    )
 
     output = output[..., :original_head_dim]
     return output.float() if q.dtype == torch.float32 else output
@@ -417,7 +368,9 @@ def prequantize_int8_attention(
 
     The returned object does not retain the floating-point inputs, so model
     code can delete those tensors before calling
-    :func:`int8_attention_from_prequantized`. Quantization and consumption use
+    :func:`int8_attention_from_prequantized`. Optimized key masks are prepared
+    as part of this snapshot; recreate it after changing the mask.
+    Quantization and consumption use
     the current CUDA stream and preserve normal PyTorch stream ordering; no
     host synchronization is introduced.
 
@@ -455,6 +408,7 @@ def prequantize_int8_attention(
     if not math.isfinite(attention_scale):
         raise ValueError(f"scale must be finite, got {attention_scale}")
 
+    attn_mask = _prepare_attn_mask(attn_mask, attention_scale)
     if _hip_backend is not None:
         # The packed V row width follows this cta_k, so the value that packed the
         # buffers is the one that has to come back to attend over them. Taking the
@@ -482,7 +436,7 @@ def prequantize_int8_attention(
     cta_k = _select_cta_k(
         kernel_head_dim,
         kv_length,
-        has_mask=attn_mask is not None,
+        has_mask=attn_mask is not None and attn_mask.ndim == 4,
     )
     padded_k_length = _pad_to_cta_k(kv_length, cta_k)
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
@@ -622,7 +576,7 @@ def int8_attention_from_prequantized(
     )
 
     stream_ptr = torch.cuda.current_stream(quantized.q.device).cuda_stream
-    arguments = (
+    _cuda_backend._C.sage_sdpa_prequantized(
         _cuda_backend._wrap_for_dlpack(quantized.q),
         _cuda_backend._wrap_for_dlpack(quantized.k),
         _cuda_backend._wrap_for_dlpack(quantized.v),
@@ -634,22 +588,15 @@ def int8_attention_from_prequantized(
         quantized.attention_scale,
         DTYPE_TO_CODE[output_dtype],
         stream_ptr,
+        (
+            _cuda_backend._wrap_for_dlpack(quantized.attn_mask)
+            if quantized.attn_mask is not None
+            else None
+        ),
     )
-    if quantized.attn_mask is None:
-        _cuda_backend._C.sage_sdpa_prequantized(*arguments)
-    else:
-        _cuda_backend._C.sage_sdpa_prequantized(
-            *arguments,
-            _cuda_backend._wrap_for_dlpack(quantized.attn_mask),
-        )
 
     output = output[..., : quantized.original_head_dim]
     return output.float() if quantized.input_dtype == torch.float32 else output
-
-
-# The custom ops carry the layout as an int rather than a string so their
-# schemas stay primitive-typed; index i is _LAYOUT_BY_CODE[i].
-_LAYOUT_BY_CODE = ("HND", "NHD")
 
 
 @torch.library.custom_op("comfy_kitchen::int8_attention", mutates_args=())
@@ -658,16 +605,8 @@ def _op_int8_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     scale: float | None,
-    layout_code: int,
 ) -> torch.Tensor:
-    return _int8_attention_cuda(
-        q,
-        k,
-        v,
-        scale=scale,
-        attn_mask=None,
-        layout=_LAYOUT_BY_CODE[layout_code],
-    )
+    return _int8_attention_cuda(q, k, v, scale=scale, attn_mask=None)
 
 
 @_op_int8_attention.register_fake
@@ -676,7 +615,6 @@ def _op_int8_attention_fake(
     k,
     v,
     scale,
-    layout_code,
 ):
     return q.new_empty(q.shape)
 
@@ -688,16 +626,8 @@ def _op_int8_attention_masked(
     v: torch.Tensor,
     attn_mask: torch.Tensor,
     scale: float | None,
-    layout_code: int,
 ) -> torch.Tensor:
-    return _int8_attention_cuda(
-        q,
-        k,
-        v,
-        scale=scale,
-        attn_mask=attn_mask,
-        layout=_LAYOUT_BY_CODE[layout_code],
-    )
+    return _int8_attention_cuda(q, k, v, scale=scale, attn_mask=attn_mask)
 
 
 @_op_int8_attention_masked.register_fake
@@ -707,7 +637,6 @@ def _op_int8_attention_masked_fake(
     v,
     attn_mask,
     scale,
-    layout_code,
 ):
     return q.new_empty(q.shape)
 
@@ -719,17 +648,10 @@ def int8_attention(
     *,
     scale: float | None = None,
     attn_mask: torch.Tensor | None = None,
-    layout: str = "HND",
 ) -> torch.Tensor:
     """Compute inference SDPA with signed INT8 Q/K/V and unsigned INT8 P.
 
-    Inputs use ``[batch, heads, sequence, head_dim]`` layout by default, or
-    ``[batch, sequence, heads, head_dim]`` with ``layout="NHD"`` (ComfyUI's
-    ``attention_sage`` convention). NHD is served without copying: the kernels
-    index q, k, v and the output by explicit stride, so neither a q/k/v permute
-    nor an output permute is paid. ``attn_mask`` is only supported with the
-    default HND layout, because mask preparation and the packed mask buffers
-    are written for the ``[B, H, Lq, Lk]`` domain. Grouped-query
+    Inputs use ``[batch, heads, sequence, head_dim]`` layout. Grouped-query
     attention and unequal non-causal Q/K sequence lengths are supported. Head
     dimensions are padded to the kernel's 64-, 128-, or 256-wide tile and
     sliced back on return; 64, 128, and 256 take the zero-copy dimension path.
@@ -745,27 +667,6 @@ def int8_attention(
     arithmetic is FP32. This path does not allocate FP8 tensors or execute FP8
     MMA instructions.
     """
-    if layout not in _LAYOUT_BY_CODE:
-        raise ValueError(f"layout must be one of {_LAYOUT_BY_CODE}, got {layout!r}")
-    if attn_mask is not None and layout != "HND":
-        raise NotImplementedError(
-            "attn_mask requires layout='HND'; the packed mask preparation is "
-            "written for the [B, H, Lq, Lk] domain"
-        )
-    layout_code = _LAYOUT_BY_CODE.index(layout)
     if attn_mask is None:
-        return torch.ops.comfy_kitchen.int8_attention(
-            q,
-            k,
-            v,
-            scale,
-            layout_code,
-        )
-    return torch.ops.comfy_kitchen.int8_attention_masked(
-        q,
-        k,
-        v,
-        attn_mask,
-        scale,
-        layout_code,
-    )
+        return torch.ops.comfy_kitchen.int8_attention(q, k, v, scale)
+    return torch.ops.comfy_kitchen.int8_attention_masked(q, k, v, attn_mask, scale)

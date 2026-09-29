@@ -12,7 +12,7 @@
 #include <nanobind/stl/optional.h>
 
 #include "launchers.h"
-#include "sage_attention/dense_mask.h"  // comfy_small_igpu
+#include "sage_attention/dense_mask.h"
 
 namespace nb = nanobind;
 
@@ -90,13 +90,13 @@ void launch_na3d_kernel(const void*, const void*, const void*, void*, int, int, 
 void launch_sage_quant_qk_int8(const void*, void*, void*, const void*, void*, void*, void*, int,
                                int, int, int, int, int, int, int, int64_t, int64_t, int64_t,
                                int64_t, int64_t, int64_t, int, int, hipStream_t,
-                                const SageDenseMask16*);
+                               const SageDenseMask16*);
 void launch_sage_quant_v_int8(const void*, void*, void*, int, int, int, int, int, int64_t, int64_t,
                               int64_t, int, hipStream_t);
 void launch_sage_prepare_key_mask(const void*, float*, int, int, int, int64_t, int64_t,
-                                   int64_t, int, int, hipStream_t);
+                                  int64_t, int, int, hipStream_t);
 void launch_sage_prepare_dense_mask(const void*, void*, int, int, int, int, int64_t, int64_t,
-                                     int64_t, int64_t, int, int, hipStream_t);
+                                    int64_t, int64_t, int, int, hipStream_t);
 void launch_sage_int8_attn(const void*, const void*, const void*, void*, const void*, const void*,
                            const void*, const void*, int64_t, int64_t, int64_t, int64_t, int, int,
                            int, int, int, int, int, int, int, int, int64_t, int64_t, int64_t,
@@ -1522,9 +1522,8 @@ static int sage_prepared_mask_width(int kv_len) {
     return ((tiles * (kSageCtaK + 1) + 3) / 4) * 4;
 }
 
-// An expanded mask carries zero strides, so a per-key mask arrives with
-// mask_stride_q == 0 and its query term drops out of the kernel's addressing on
-// its own. That needs no separate mask mode.
+// A prepared row holds padded FP32 key biases followed by one descriptor per
+// 64-key tile. Dtype code 4 is internal to this layout, never a public mask dtype.
 static void sage_mask_info(const OptArray& attn_mask, int batch, int q_heads, int qo_len,
                            int kv_len, const void*& ptr, int64_t& stride_b, int64_t& stride_h,
                            int64_t& stride_q, int64_t& stride_k, int& dtype_code,
@@ -1536,51 +1535,40 @@ static void sage_mask_info(const OptArray& attn_mask, int batch, int q_heads, in
 
     const auto& mask = attn_mask.value();
     if (mask.ndim() == 5) {
-        const int q_tiles = (qo_len + 15) / 16;
-        const int k_tiles = (kv_len + 63) / 64;
-        const int packed_width = mask.dtype().code == static_cast<uint8_t>(nb::dlpack::dtype_code::Int) &&
-                                mask.dtype().bits == 32 ? 32 : 1024;
-        if (static_cast<int>(mask.shape(0)) != batch || static_cast<int>(mask.shape(1)) != q_heads ||
-            static_cast<int>(mask.shape(2)) != q_tiles || static_cast<int>(mask.shape(3)) != k_tiles ||
-            static_cast<int>(mask.shape(4)) != packed_width) {
-            throw std::runtime_error(std::string(fn) +
-                                    ": prepared dense mask must be [B, H_q, Lq/16, Lk/64, width]");
+        const bool bit_packed =
+            mask.dtype().code == static_cast<uint8_t>(nb::dlpack::dtype_code::Int) &&
+            mask.dtype().bits == 32;
+        if ((mask.shape(0) != 1 && mask.shape(0) != batch) ||
+            (mask.shape(1) != 1 && mask.shape(1) != q_heads) ||
+            mask.shape(2) != (qo_len + 15) / 16 || mask.shape(3) != (kv_len + 63) / 64 ||
+            mask.shape(4) != (bit_packed ? 32 : 1024)) {
+            throw std::runtime_error(std::string(fn) + ": invalid prepared dense mask shape");
         }
-        if (mask.dtype().code == static_cast<uint8_t>(nb::dlpack::dtype_code::Int) &&
-            mask.dtype().bits == 32) {
-            dtype_code = 7;
-        } else if (mask.dtype().code == static_cast<uint8_t>(nb::dlpack::dtype_code::Bfloat) &&
-                   mask.dtype().bits == 16) {
-            dtype_code = 8;
-        } else if (mask.dtype().code == static_cast<uint8_t>(nb::dlpack::dtype_code::Float) &&
-                   mask.dtype().bits == 16) {
-            dtype_code = 9;
-        } else if (mask.dtype().code == static_cast<uint8_t>(nb::dlpack::dtype_code::Float) &&
-                   mask.dtype().bits == 32) {
-            dtype_code = 5;
-        } else {
-            throw std::runtime_error(std::string(fn) +
-                                    ": prepared dense mask must be int32, float16, bfloat16 or float32");
+        const int packed_dtype = map_dtype_to_code(mask.dtype());
+        if ((packed_dtype < 0 || packed_dtype > 2) && !bit_packed) {
+            throw std::runtime_error(std::string(fn) + ": prepared dense mask must be float32, float16, bfloat16 or int32");
         }
+        require_packed_contiguous(mask, fn, "prepared dense mask");
         ptr = mask.data();
-        stride_b = mask.stride(0);
-        stride_h = mask.stride(1);
-        stride_q = mask.stride(2);
+        stride_b = mask.shape(0) == 1 ? 0 : mask.stride(0);
+        stride_h = mask.shape(1) == 1 ? 0 : mask.stride(1);
         stride_k = 1;
+        dtype_code = bit_packed ? 7 : (packed_dtype == 2 ? 8 : (packed_dtype == 1 ? 9 : 5));
         return;
     }
     if (mask.ndim() == 3) {
-        if (static_cast<int>(mask.shape(0)) != batch || static_cast<int>(mask.shape(1)) != q_heads ||
-            static_cast<int>(mask.shape(2)) != sage_prepared_mask_width(kv_len)) {
-            throw std::runtime_error(std::string(fn) +
-                                    ": prepared key mask must be [B, H_q, width]");
+        if ((mask.shape(0) != 1 && mask.shape(0) != batch) ||
+            (mask.shape(1) != 1 && mask.shape(1) != q_heads) ||
+            mask.shape(2) != sage_prepared_mask_width(kv_len)) {
+            throw std::runtime_error(std::string(fn) + ": invalid prepared key mask shape");
         }
-        dtype_code = 4;
+        require_dtype(mask, 0, 0, fn, "prepared key mask");
+        require_packed_contiguous(mask, fn, "prepared key mask");
         ptr = mask.data();
-        stride_b = mask.stride(0);
-        stride_h = mask.stride(1);
-        stride_q = 0;
+        stride_b = mask.shape(0) == 1 ? 0 : mask.stride(0);
+        stride_h = mask.shape(1) == 1 ? 0 : mask.stride(1);
         stride_k = 1;
+        dtype_code = 4;
         return;
     }
     if (mask.ndim() != 4 || static_cast<int>(mask.shape(0)) != batch ||
@@ -1672,27 +1660,46 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
     }
     require_dtype(o, output_dtype_code, output_dtype_code, fn, "o");
     require_len(o, static_cast<int64_t>(batch) * q_heads * qo_len * head_dim, fn, "o");
-    // The kernels index o by explicit stride, so it may be the packed HND layout
-    // or an NHD-packed buffer viewed as [B, H, Lq, D]. ComfyUI's
-    // attention_comfy_kitchen_int8 does out.transpose(1, 2).reshape(...): only
-    // NHD-packed strides make that transpose contiguous and the reshape a free
-    // view instead of a copy. The one real invariant is a contiguous last dim.
-    if (o.ndim() != 4 || static_cast<int>(o.shape(0)) != batch ||
-        static_cast<int>(o.shape(1)) != q_heads || static_cast<int>(o.shape(2)) != qo_len ||
-        static_cast<int>(o.shape(3)) != head_dim) {
-        throw std::runtime_error(std::string(fn) + ": o must be [B, H_q, Lq, D]");
+    int64_t o_stride_b;
+    int64_t o_stride_h;
+    int64_t o_stride_n;
+    if (igpu) {
+        // The kernels index o by explicit stride, so on the gfx1103 iGPU it may be
+        // the packed HND layout or an NHD-packed buffer viewed as [B, H, Lq, D].
+        // ComfyUI's attention_comfy_kitchen_int8 does out.transpose(1, 2).reshape(...):
+        // only NHD-packed strides make that transpose contiguous and the reshape a
+        // free view instead of a copy. The one real invariant is a contiguous last dim.
+        if (o.ndim() != 4 || static_cast<int>(o.shape(0)) != batch ||
+            static_cast<int>(o.shape(1)) != q_heads || static_cast<int>(o.shape(2)) != qo_len ||
+            static_cast<int>(o.shape(3)) != head_dim) {
+            throw std::runtime_error(std::string(fn) + ": o must be [B, H_q, Lq, D]");
+        }
+        if (o.stride(3) != 1) {
+            throw std::runtime_error(std::string(fn) +
+                                     ": the last dimension of o must be contiguous");
+        }
+        o_stride_b = o.stride(0);
+        o_stride_h = o.stride(1);
+        o_stride_n = o.stride(2);
+    } else {
+        // Fork principle 1: upstream's validation is kept verbatim everywhere else.
+        // The strided-o relaxation above exists only to serve the iGPU NHD-packed
+        // output; relaxing it on other devices would drop a hard check for every
+        // caller and widen an iGPU-only path to the whole AMD backend.
+        require_packed_contiguous(o, fn, "o");
+        o_stride_b = q_heads * qo_len * head_dim;
+        o_stride_h = qo_len * head_dim;
+        o_stride_n = head_dim;
     }
-    if (o.stride(3) != 1) {
-        throw std::runtime_error(std::string(fn) +
-                                 ": the last dimension of o must be contiguous");
-    }
-    const int64_t o_stride_b = o.stride(0);
-    const int64_t o_stride_h = o.stride(1);
-    const int64_t o_stride_n = o.stride(2);
 
     const void* mask_ptr = nullptr;
     int64_t mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k;
     int mask_dtype_code;
+    if (attn_mask.has_value() &&
+        (attn_mask->device_type() != nb::device::rocm::value ||
+         attn_mask->device_id() != q_int8.device_id())) {
+        throw std::runtime_error(std::string(fn) + ": attention mask must be on q's ROCm device");
+    }
     sage_mask_info(attn_mask, batch, q_heads, qo_len, kv_len, mask_ptr, mask_stride_b,
                    mask_stride_h, mask_stride_q, mask_stride_k, mask_dtype_code, fn);
 
@@ -1794,7 +1801,7 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
                nb::ndarray<> k_scale, nb::ndarray<> v_int8, nb::ndarray<> v_scale,
                nb::ndarray<> anchor_indices, float sm_scale, int cta_k, int input_dtype_code,
                int output_dtype_code, uintptr_t stream_ptr, OptArray attn_mask = std::nullopt,
-                OptArray raw_dense_mask = std::nullopt) {
+               OptArray raw_dense_mask = std::nullopt) {
     constexpr const char* kFn = "sage_sdpa";
     sage_check_shapes(q, k, v, kFn);
     sage_check_cta_k(cta_k, kFn);
@@ -1998,12 +2005,19 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
     // next row unless the caller actually supplied padded_k-stride data
     // (the Python scratch is presented as a padded_k-wide view here).
     // The direct fp16 transpose's doubled width lives only in sage_sdpa.
-    const int64_t v_row = static_cast<int64_t>(v_int8.shape(1));
-    const int64_t v_padded_k = sage_padded_k(kv_len, cta_k);
-    if (v_row != v_padded_k) {
-        throw std::runtime_error(std::string(kFn) + ": packed v row width " +
-                                 std::to_string(v_int8.shape(1)) + " does not match cta_k " +
-                                 std::to_string(cta_k));
+    // gfx1103 only (fork principle 1): sage_int8_quantize narrows the doubled iGPU
+    // V scratch back to a single-width view before handing it to this entry point,
+    // and that narrowing is the only thing that can present a row wider than
+    // padded_k. Upstream allocates the single-width buffer outright, so outside the
+    // iGPU this check would be new validation mainline never had.
+    if (igpu) {
+        const int64_t v_row = static_cast<int64_t>(v_int8.shape(1));
+        const int64_t v_padded_k = sage_padded_k(kv_len, cta_k);
+        if (v_row != v_padded_k) {
+            throw std::runtime_error(std::string(kFn) + ": packed v row width " +
+                                     std::to_string(v_int8.shape(1)) +
+                                     " does not match cta_k " + std::to_string(cta_k));
+        }
     }
 
     sage_attend(q_int8, k_int8, v_int8, o, q_scale, k_scale, v_scale, attn_mask, batch, q_heads,

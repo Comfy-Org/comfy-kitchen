@@ -3172,45 +3172,6 @@ def _sage_dense_mask_buffer(attn_mask: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _expand_prepared_mask(mask: torch.Tensor, batch: int, heads: int) -> torch.Tensor:
-    """Present a broadcast-packed mask over the query's batch and head extents.
-
-    _sage_dense_mask_buffer packs a broadcast mask down to one row per real axis,
-    but sage_mask_info validates a prepared mask against the query extents. Keep
-    the packed rows and address the shared axes through a zero stride, which the
-    attention kernels drop out of their mask addressing.
-    """
-    if mask.shape[0] == batch and mask.shape[1] == heads:
-        return mask
-    strides = list(mask.stride())
-    if mask.shape[0] == 1:
-        strides[0] = 0
-    if mask.shape[1] == 1:
-        strides[1] = 0
-    return mask.as_strided((batch, heads, *mask.shape[2:]), tuple(strides))
-
-
-def _view_nhd_as_hnd(t: torch.Tensor) -> torch.Tensor:
-    """View a [B, L, H, D] operand as the kernels' [B, H, L, D] packing. Zero-copy.
-
-    The two layouts differ only by a swap of the head and row axes, so the mapping
-    is that swap applied to the shape and to the stride tuple alike. No assumption
-    about the incoming strides is needed: the quantizers, the attention kernels and
-    the V transpose all index every operand by an explicit
-    (stride_b, stride_h, stride_n) triple, and none of them requires the operands to
-    be packed. For a contiguous NHD operand the mapped strides stay aligned for
-    every supported head dimension (D in 64/128/256 gives 128/256/512 bytes per
-    head step), which is what the quantizer's uint2 loads and the direct kernel's
-    uint4 K loads require.
-    """
-    batch, seq, heads, channels = t.shape
-    stride_batch, stride_seq, stride_heads, stride_channels = t.stride()
-    return t.as_strided(
-        (batch, heads, seq, channels),
-        (stride_batch, stride_heads, stride_seq, stride_channels),
-    )
-
-
 def sage_int8_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3218,27 +3179,12 @@ def sage_int8_sdpa(
     *,
     attention_scale: float,
     attn_mask: torch.Tensor | None,
-    layout: str = "HND",
 ) -> torch.Tensor:
     """Quantize and attend in one call. q, k and v are already padded to a
     supported head dimension; the output keeps that width.
 
-    ``layout`` is "HND" ([B, H, L, D], the kernels' native packing) or "NHD"
-    ([B, L, H, D], ComfyUI's attention_sage convention). NHD maps the shape to
-    the packing with as_strided instead of copying it, so neither the callers'
-    q/k/v permute nor an output permute is paid; the kernels index every operand
-    by explicit stride.
+    Operands are [B, H, L, D], the kernels' native packing.
     """
-    if layout == "NHD":
-        if attn_mask is not None:
-            raise NotImplementedError(
-                "sage_int8_sdpa: attn_mask requires layout='HND'; the mask "
-                "preparation and packed-mask layouts are written for the "
-                "[B, H, Lq, Lk] domain"
-            )
-        q, k, v = _view_nhd_as_hnd(q), _view_nhd_as_hnd(k), _view_nhd_as_hnd(v)
-    elif layout != "HND":
-        raise ValueError(f"layout must be 'HND' or 'NHD', got {layout!r}")
     batch, q_heads, q_length, head_dim = q.shape
     _, _, kv_length, _ = k.shape
     output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
@@ -3265,32 +3211,32 @@ def sage_int8_sdpa(
     # the attention itself. NHD-packed storage presented to the kernels as
     # [B, H, S, D] makes the transpose contiguous and the reshape a free view.
     # Both the direct kernel (explicit o strides) and sage_attend (which reads
-    # o.stride(0..2) off the tensor) accept the packing, so it is unconditional.
-    out_nhd = torch.empty(
-        batch, q_length, q_heads, head_dim, dtype=output_dtype, device=q.device
-    )
-    output = out_nhd.as_strided(
-        (batch, q_heads, q_length, head_dim),
-        (q_length * q_heads * head_dim, head_dim, q_heads * head_dim, 1),
-    )
+    # o.stride(0..2) off the tensor) accept the packing.
+    #
+    # gfx1103 only (fork principle 1): the 0.65 ms figure is a 780M measurement, and
+    # the change is not a pure win elsewhere -- it alters the contiguity of the
+    # tensor returned for layout="HND", which dGPU callers may rely on. Upstream's
+    # HND packing is what every other device keeps.
+    if _is_small_igpu(q.device):
+        out_nhd = torch.empty(
+            batch, q_length, q_heads, head_dim, dtype=output_dtype, device=q.device
+        )
+        output = out_nhd.as_strided(
+            (batch, q_heads, q_length, head_dim),
+            (q_length * q_heads * head_dim, head_dim, q_heads * head_dim, 1),
+        )
+    else:
+        output = torch.empty(
+            batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q.device
+        )
 
     buffers, anchor_indices = (
         _sage_buffers_direct(q, k, cta_k) if use_direct else _sage_buffers(q, k, cta_k)
     )
     raw_dense_mask = None
     if head_dim <= 128 and _sage_can_fuse_dense_mask(attn_mask):
-        # sage_sdpa sizes the packed output from the raw mask's extents, while
-        # sage_mask_info sizes it from the query extents. A zero-stride batch or
-        # head axis makes the two disagree, so pack the materialised mask instead;
-        # the fused path is bounded to short queries and short keys.
         raw_dense_mask = attn_mask
-        if attn_mask.stride(0) == 0 or attn_mask.stride(1) == 0:
-            raw_dense_mask = attn_mask.contiguous()
         attn_mask = _sage_dense_mask_buffer(raw_dense_mask)
-    elif attn_mask is not None:
-        # A dense or key mask already packed for a broadcast layout keeps one row
-        # per real axis, so re-present it over the query extents.
-        attn_mask = _expand_prepared_mask(attn_mask, batch, q_heads)
     _C.sage_sdpa(
         _dl(q),
         _dl(k),
@@ -3311,11 +3257,12 @@ def sage_int8_sdpa(
         None if attn_mask is None else _dl(attn_mask),
         None if raw_dense_mask is None else _dl(raw_dense_mask),
     )
-    # output.transpose(1, 2) is the zero-copy HND-to-NHD view in both allocation
-    # branches: the direct branch hands back NHD-packed storage as an [B, H, S, D]
-    # view, whose transpose lands contiguous; the int8 branch is packed HND, whose
-    # transpose is the correct non-contiguous view of the same bytes.
-    return output if layout == "HND" else output.transpose(1, 2)
+    # The NHD-packed branch (gfx1103 only) already stores the output so that
+    # ComfyUI's out.transpose(1, 2) lands contiguous; the HND branch is packed
+    # [B, H, S, D], whose transpose is the correct non-contiguous view of the same
+    # bytes. Either way the caller gets the bytes and decides the view, so the
+    # layout='HND' contract returns the [B, H, S, D] tensor unchanged.
+    return output
 
 
 def sage_int8_quantize(

@@ -281,6 +281,11 @@ __global__ void prepare_dense_bool_bits_kernel(
 // the compiler cannot conclude the value is finite, and clamp to a sentinel with
 // the original sign, so +inf still means "strongly attend". The sentinel is
 // base-two because that is the domain tile_m is compared against m_run's start in.
+//
+// Without this, a fully dropped tile makes tile_m -inf and exp2(score - tile_m)
+// is NaN; see the note at the top of this file. The kernel is built -ffast-math
+// for every AMD arch, so this is a correctness fix for all of them, not a
+// per-device tuning choice.
 template <bool kBF16>
 __forceinline__ __device__ float dense16_mask_bias(uint16_t bits) {
     const uint16_t inf = kBF16 ? 0x7f80u : 0x7c00u;
