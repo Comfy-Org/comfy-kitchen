@@ -187,7 +187,6 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
         ),
-        # Uses inline PTX: cvt.rn.f16x2.e2m1x2 (SM100/Blackwell instruction)
         "dequantize_nvfp4": FunctionConstraints(
             params={
                 "qx": ParamConstraint(
@@ -201,7 +200,6 @@ def _build_constraints() -> dict:
                 "output_type": ParamConstraint(dtypes=standard_floats),
             },
             default_devices=cuda_devices,
-            min_compute_capability=(10, 0),  # SM100 required for cvt.rn.f16x2.e2m1x2
         ),
         "apply_rope1": FunctionConstraints(
             params={
