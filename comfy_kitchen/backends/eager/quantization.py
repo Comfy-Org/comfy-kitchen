@@ -752,11 +752,20 @@ def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
         if hasattr(torch, "int8_mm"):
             return torch.int8_mm(lhs, rhs)
-        # On ROCm, torch._int_mm calls hipblasLt which can return
-        # HIPBLAS_STATUS_INVALID_VALUE for shapes its heuristic rejects.
-        # Fall back to int16 matmul, which is correct for int8 inputs.
-        if getattr(torch.version, "hip", None):
-            return lhs.to(torch.int16) @ rhs.to(torch.int16)
+        # ROCm routes _int_mm through hipblasLt, but the only shapes it rejects are
+        # the ones the padding below already removes: mat2.size(1) must be a positive
+        # multiple of 8 and mat1.size(0) must exceed 16. Measured over N in
+        # {1,2,3,5,7,9,15,17,23,31,33,47,63,65,100,127,129} and M in
+        # {1,2,8,16,17,32,33,64,127,128,300,333,512,1024,2048}, _int_mm is exact
+        # once M is rounded to >=32 and N to _int8_mm_n_alignment. No ROCm-specific
+        # path is needed.
+        #
+        # This previously branched to `lhs.to(int16) @ rhs.to(int16)` on ROCm. That
+        # does not compile to a matmul: torch raises NotImplementedError
+        # ("addmm_cuda not implemented for 'Short'"), so every caller of the eager
+        # int8 path raised instead of returning. It is removed rather than repaired
+        # because int16 accumulation is also wrong -- an int8 dot product over the K
+        # these shapes use reaches ~5.5e5, well past the int16 maximum of 32767.
         return torch._int_mm(lhs, rhs)
 
     orig_m = a.size(0)
