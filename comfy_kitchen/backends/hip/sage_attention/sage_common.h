@@ -254,6 +254,25 @@ __forceinline__ __device__ void convrot(float* v) {
     }
 }
 
+// Non-finite test that survives -ffast-math.
+//
+// The kernels are built with -ffinite-math-only, under which the optimizer may
+// assume no float is infinite or NaN. It is then free to fold an exponent test
+// on a *computed* value to "finite" and delete the branch, which is how a
+// masked tile used to reach fma/exp2 as -inf and turn its whole row's
+// denominator into NaN. The value is therefore laundered through an
+// empty asm volatile first, so the register it tests is one the compiler has
+// not been able to reason about.
+//
+// Pair this with reading mask elements as integer bits (see mask_keep and
+// dense32_mask_bias): a test on a value that came straight out of memory is
+// foldable for the same reason, and there the integer load is the laundering.
+__forceinline__ __device__ bool float_bits_are_nonfinite(float v) {
+    float opaque = v;
+    asm volatile("" : "+v"(opaque));
+    return (__float_as_uint(opaque) & 0x7f800000u) == 0x7f800000u;
+}
+
 // ---------------------------------------------------------------------------
 // WMMA fragment plumbing shared by the int8 attention kernels
 // ---------------------------------------------------------------------------

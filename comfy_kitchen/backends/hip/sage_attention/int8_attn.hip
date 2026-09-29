@@ -295,11 +295,15 @@ __forceinline__ __device__ float dense16_mask_bias(uint16_t bits) {
     return (bits & inf) == inf ? clamped : finite;
 }
 
-__forceinline__ __device__ float dense32_mask_bias(float bias) {
-    const uint32_t bits = __float_as_uint(bias);
+// `bits` is the raw float32 pattern, never a float: -ffinite-math-only lets the
+// optimizer fold a non-finite test on a float-typed value to "finite", which
+// deleted this branch and let the prepared mask's -inf through to fma/exp2. The
+// caller therefore reads the packed buffer through a uint32_t view, the same
+// trick mask_keep and dense16_mask_bias use.
+__forceinline__ __device__ float dense32_mask_bias(uint32_t bits) {
     return (bits & 0x7f800000u) == 0x7f800000u
         ? ((bits & 0x80000000u) != 0 ? kMaskedScoreBase2 : -kMaskedScoreBase2)
-        : bias;
+        : __uint_as_float(bits);
 }
 
 __forceinline__ __device__ float bool_mask_bias(uint32_t keep_bits, int bit) {
@@ -384,10 +388,17 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
     const int num_qo_heads = gridDim.y;
     const int kv_head = head / num_kv_groups;
     const float* key_mask = nullptr;
+    // Bit view of whichever float32 buffer supplies this mode's dense biases:
+    // the LDS copy kDirectKey stages, the packed key mask kPreparedKey reads,
+    // or the packed float32 mask kPreparedDense reads. dense32_mask_bias takes
+    // bits rather than a float so that -ffast-math cannot fold away its
+    // non-finite branch; see the comment on it.
+    const uint32_t* dense_bias_mask = nullptr;
     const uint32_t* dense_bool_mask = nullptr;
     const uint16_t* dense_half_mask = nullptr;
     if constexpr (kDirectKey) {
         key_mask = smem_mask;
+        dense_bias_mask = reinterpret_cast<const uint32_t*>(smem_mask);
     } else if constexpr (kPreparedDenseBool) {
         dense_bool_mask = static_cast<const uint32_t*>(mask) +
                           static_cast<int64_t>(batch) * mask_stride_b +
@@ -400,6 +411,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
         key_mask = static_cast<const float*>(mask) +
                    static_cast<int64_t>(batch) * mask_stride_b +
                    static_cast<int64_t>(head) * mask_stride_h;
+        dense_bias_mask = reinterpret_cast<const uint32_t*>(key_mask);
     }
 
     const int8_t* q_head = q + static_cast<int64_t>(batch) * q_stride_b +
@@ -622,12 +634,14 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                                 static_cast<uint16_t>(packed_words[e / 2] >> ((e % 2) * 16)));
                         }
                     } else {
-                        const float4 lo = *reinterpret_cast<const float4*>(key_mask + mask_index);
-                        const float4 hi = *reinterpret_cast<const float4*>(key_mask + mask_index + 4);
-                        biases[0] = dense32_mask_bias(lo.x); biases[1] = dense32_mask_bias(lo.y);
-                        biases[2] = dense32_mask_bias(lo.z); biases[3] = dense32_mask_bias(lo.w);
-                        biases[4] = dense32_mask_bias(hi.x); biases[5] = dense32_mask_bias(hi.y);
-                        biases[6] = dense32_mask_bias(hi.z); biases[7] = dense32_mask_bias(hi.w);
+                        const uint4 lo = *reinterpret_cast<const uint4*>(dense_bias_mask + mask_index);
+                        const uint4 hi = *reinterpret_cast<const uint4*>(dense_bias_mask + mask_index + 4);
+                        const uint32_t packed_words[8] = {lo.x, lo.y, lo.z, lo.w,
+                                                          hi.x, hi.y, hi.z, hi.w};
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) {
+                            biases[e] = dense32_mask_bias(packed_words[e]);
+                        }
                     }
 #endif
 #pragma unroll
@@ -646,7 +660,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                         } else if constexpr (kPreparedDense16) {
                             bias = dense16_mask_bias<kPreparedDenseBF16>(dense_half_mask[mask_index]);
                         } else {
-                            bias = dense32_mask_bias(key_mask[mask_index]);
+                            bias = dense32_mask_bias(dense_bias_mask[mask_index]);
                         }
 #endif
                         prob[fk][e] = fmaf(static_cast<float>(s_acc[fk][e]),
@@ -714,7 +728,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
             // tile_scale, which underflows to zero for a fully masked tile.
             tile_m = fmaxf(tile_m, swap_half_wave(tile_m));
             if constexpr (kDense) {
-                const bool valid_tile = (__float_as_uint(tile_m) & 0x7f800000u) != 0x7f800000u;
+                const bool valid_tile = !float_bits_are_nonfinite(tile_m);
                 row_valid[fq] = row_valid[fq] || valid_tile;
                 tile_m = valid_tile ? tile_m : kMaskedScore;
             }
@@ -772,8 +786,13 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                         packed_hi = __builtin_amdgcn_cvt_pk_u8_f32(p, e - 4, packed_hi);
                     }
 #else
-                    tile_sum += p;
                     packed[e] = prob_to_u8(p);
+                    // Normalize with the same quantized probabilities the PV matmul
+                    // consumes, the way the gfx12 path below does with sad_u8.
+                    // Summing the float p instead leaves the numerator rounded to
+                    // U8 and the denominator not, so even a row whose values are all
+                    // equal comes out a few 1e-4 low instead of exactly right.
+                    tile_sum += static_cast<float>(packed[e]);
 #endif
                 }
 #if defined(COMFY_MMA_GFX12)
