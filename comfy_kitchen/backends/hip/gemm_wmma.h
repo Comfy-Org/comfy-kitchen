@@ -49,36 +49,23 @@ struct TileStager {
 
     uint4 regs[kPerThread];
 
-    template <bool ASSUME_ROWS_FULL = false, bool ASSUME_K_FULL = false>
     __forceinline__ __device__ void load(const uint8_t* __restrict__ src, int row0, int rows_total,
                                          int kbyte0, int kbytes) {
         const int tid = threadIdx.x;
         #pragma unroll
         for (int i = 0; i < kPerThread; ++i) {
             // A thread-strided assignment makes every load instruction cover
-            // consecutive 16-byte chunks across a wave. Keep the original
-            // thread-major order as the control until exact-shape profiling
-            // promotes this layout.
+            // consecutive 16-byte chunks across a wave. The thread-major
+            // order stays the default; COALESCED_STAGING opts in.
             const int c = COALESCED_STAGING ? tid + i * THREADS
                                              : tid * kPerThread + i;
             const int grow = row0 + c / kChunksPerRow;
             const int gk = kbyte0 + (c % kChunksPerRow) * 16;
 
-            if constexpr (ASSUME_ROWS_FULL && ASSUME_K_FULL) {
-                const uint8_t* const p =
-                    src + static_cast<int64_t>(grow) * kbytes + gk;
-                regs[i] = *reinterpret_cast<const uint4*>(p);
-            } else {
-                const bool valid_row = ASSUME_ROWS_FULL || grow < rows_total;
-                const bool valid_k = ASSUME_K_FULL || gk < kbytes;
-                if (valid_row && valid_k) {
-                    const uint8_t* const p =
-                        src + static_cast<int64_t>(grow) * kbytes + gk;
-                    regs[i] = *reinterpret_cast<const uint4*>(p);
-                } else {
-                    regs[i] = make_uint4(0, 0, 0, 0);
-                }
-            }
+            regs[i] = (grow < rows_total && gk < kbytes)
+                          ? *reinterpret_cast<const uint4*>(
+                                src + static_cast<int64_t>(grow) * kbytes + gk)
+                          : make_uint4(0, 0, 0, 0);
         }
     }
 
@@ -100,7 +87,7 @@ struct TileStager {
 
     // Same, for an operand whose rows are gathered rather than stored contiguously:
     // Src::chunk(row, kbyte) returns those 16 bytes, and neither is out of range.
-    template <bool ASSUME_ROWS_FULL = false, bool ASSUME_K_FULL = false, typename Src>
+    template <typename Src>
     __forceinline__ __device__ void load(const Src& src, int row0, int rows_total, int kbyte0,
                                          int kbytes) {
         const int tid = threadIdx.x;
@@ -143,9 +130,8 @@ struct GemmOperandA<const uint8_t*> {
 // Epi is a functor: float operator()(int row, int col, float acc) const.
 template <typename Mma, typename Epi, typename OutT,
           int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN,
-          bool COALESCED_STAGING = false, bool TILED_A = false,
-          bool ASSUME_NK_FULL = false, bool TILED_B = false,
-          typename ASrc = const uint8_t*>
+          typename ASrc = const uint8_t*,
+          bool COALESCED_STAGING = false, bool TILED_A = false>
 __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
     typename GemmOperandA<ASrc>::type A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
     int M, int N, int kbytes, int ldc, Epi epi) {
@@ -208,15 +194,9 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
         const int64_t tile = static_cast<int64_t>(bm) * (kbytes / BKB);
         sa.load_contiguous(A + tile * BM * BKB);
     } else {
-        sa.template load<false, ASSUME_NK_FULL>(A, m0, M, 0, kbytes);
+        sa.load(A, m0, M, 0, kbytes);
     }
-    if constexpr (TILED_B) {
-        const int64_t tile = static_cast<int64_t>(bn) * (kbytes / BKB);
-        sb.load_contiguous(B + tile * BN * BKB);
-    } else {
-        sb.template load<ASSUME_NK_FULL, ASSUME_NK_FULL>(
-            B, n0, N, 0, kbytes);
-    }
+    sb.load(B, n0, N, 0, kbytes);
     sa.store(As);
     sb.store(Bs);
     __syncthreads();
@@ -232,18 +212,9 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
                     static_cast<int64_t>(bm) * (kbytes / BKB) + knext / BKB;
                 sa.load_contiguous(A + tile * BM * BKB);
             } else {
-                sa.template load<false, ASSUME_NK_FULL>(
-                    A, m0, M, knext, kbytes);
+                sa.load(A, m0, M, knext, kbytes);
             }
-            if constexpr (TILED_B) {
-                const int64_t tile =
-                    static_cast<int64_t>(bn) * (kbytes / BKB)
-                    + knext / BKB;
-                sb.load_contiguous(B + tile * BN * BKB);
-            } else {
-                sb.template load<ASSUME_NK_FULL, ASSUME_NK_FULL>(
-                    B, n0, N, knext, kbytes);
-            }
+            sb.load(B, n0, N, knext, kbytes);
         }
 
         // Register-level pipeline over K-steps: the LDS reads for step kk+1 are
@@ -299,19 +270,14 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
     for (int i = 0; i < TM; ++i) {
         #pragma unroll
         for (int e = 0; e < 8; ++e) {
-            const int r =
-                m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
+            const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
             if (r >= M) continue;
             OutT* crow = C + static_cast<int64_t>(r) * ldc;
             #pragma unroll
             for (int j = 0; j < TN; ++j) {
-                const int col =
-                    n0 + wn * (TN * 16) + j * 16 + col_lane;
-                if constexpr (!ASSUME_NK_FULL) {
-                    if (col >= N) continue;
-                }
-                crow[col] = static_cast<OutT>(
-                    epi(r, col, Mma::get(acc[i][j], e)));
+                const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
+                if (col >= N) continue;
+                crow[col] = static_cast<OutT>(epi(r, col, Mma::get(acc[i][j], e)));
             }
         }
     }
@@ -320,11 +286,12 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
 // Two equal-width projections over the same activation tile. Half of the
 // workgroup computes each projection, so each thread retains the same single
 // accumulator set as gemm_wmma_kernel while both halves share every global/LDS
-// load of A. The two outputs remain independent and keep the single-GEMM MMA and
-// epilogue order exactly.
+// load of A. The two outputs remain independent and keep the single-GEMM MMA
+// order; the epilogue evaluates (acc * scale_a) * scale_b (+ bias) in that
+// fixed order, which is not guaranteed to be bitwise equal to the generic
+// EpiRowwise under -ffast-math.
 template <typename Mma, typename Epi, typename OutT,
-          int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN,
-          bool TILED_B = false>
+          int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN>
 __global__ __launch_bounds__(2 * WARPS_M * WARPS_N * kWave)
 void gemm_wmma_pair_kernel(
     const uint8_t* __restrict__ A,
@@ -384,14 +351,8 @@ void gemm_wmma_pair_kernel(
     TileStager<BN, BKB, kThreads> sb1;
 
     sa.load(A, m0, M, 0, kbytes);
-    if constexpr (TILED_B) {
-        const int64_t tile = static_cast<int64_t>(bn) * (kbytes / BKB);
-        sb0.load_contiguous(B0 + tile * BN * BKB);
-        sb1.load_contiguous(B1 + tile * BN * BKB);
-    } else {
-        sb0.load(B0, n0, N, 0, kbytes);
-        sb1.load(B1, n0, N, 0, kbytes);
-    }
+    sb0.load(B0, n0, N, 0, kbytes);
+    sb1.load(B1, n0, N, 0, kbytes);
     sa.store(As);
     sb0.store(Bs[0]);
     sb1.store(Bs[1]);
@@ -402,16 +363,8 @@ void gemm_wmma_pair_kernel(
         const bool has_next = knext < kbytes;
         if (has_next) {
             sa.load(A, m0, M, knext, kbytes);
-            if constexpr (TILED_B) {
-                const int64_t tile =
-                    static_cast<int64_t>(bn) * (kbytes / BKB)
-                    + knext / BKB;
-                sb0.load_contiguous(B0 + tile * BN * BKB);
-                sb1.load_contiguous(B1 + tile * BN * BKB);
-            } else {
-                sb0.load(B0, n0, N, knext, kbytes);
-                sb1.load(B1, n0, N, knext, kbytes);
-            }
+            sb0.load(B0, n0, N, knext, kbytes);
+            sb1.load(B1, n0, N, knext, kbytes);
         }
 
         typename Mma::Frag af[2][TM];
@@ -461,74 +414,70 @@ void gemm_wmma_pair_kernel(
         }
     }
 
-    constexpr bool kCacheRowwiseEpilogue =
-        std::is_same_v<Epi, EpiRowwiseNoBias> ||
-        std::is_same_v<Epi, EpiRowwise>;
-    float* scale_a_lds = nullptr;
-    float* scale_b_lds = nullptr;
-    float* bias_lds = nullptr;
-    if constexpr (kCacheRowwiseEpilogue) {
-        // The matrix loop is finished, so its A/B tiles can hold the much
-        // smaller epilogue operands. Synchronize before overwriting them, then
-        // load each unique row/channel scale and optional bias once per
-        // workgroup instead of once per unrolled accumulator element.
-        __syncthreads();
-        scale_a_lds = reinterpret_cast<float*>(As);
-        scale_b_lds = reinterpret_cast<float*>(&Bs[0][0]);
-        bias_lds = scale_b_lds + 2 * BN;
-        if (tid < BM) {
-            const int r = m0 + tid;
-            scale_a_lds[tid] = r < M ? epi0.scale_a[r] : 0.0f;
-        }
-        if (tid < BN) {
-            const int col = n0 + tid;
-            if (col < N) {
-                if constexpr (std::is_same_v<Epi, EpiRowwiseNoBias>) {
-                    scale_b_lds[tid] = epi0.scale_b[col];
-                } else {
-                    scale_b_lds[tid] =
-                        epi0.scale_b[col * epi0.scale_b_stride];
-                    bias_lds[tid] = epi0.bias
-                        ? load_scalar(epi0.bias, epi0.bias_code, col)
-                        : 0.0f;
-                }
-            } else {
-                scale_b_lds[tid] = 0.0f;
-                if constexpr (std::is_same_v<Epi, EpiRowwise>) {
-                    bias_lds[tid] = 0.0f;
-                }
-            }
-        } else if (tid < 2 * BN) {
-            const int local_col = tid - BN;
-            const int col = n0 + local_col;
-            if (col < N) {
-                if constexpr (std::is_same_v<Epi, EpiRowwiseNoBias>) {
-                    scale_b_lds[BN + local_col] = epi1.scale_b[col];
-                } else {
-                    scale_b_lds[BN + local_col] =
-                        epi1.scale_b[col * epi1.scale_b_stride];
-                    bias_lds[BN + local_col] = epi1.bias
-                        ? load_scalar(epi1.bias, epi1.bias_code, col)
-                        : 0.0f;
-                }
-            } else {
-                scale_b_lds[BN + local_col] = 0.0f;
-                if constexpr (std::is_same_v<Epi, EpiRowwise>) {
-                    bias_lds[BN + local_col] = 0.0f;
-                }
-            }
-        }
-        __syncthreads();
+    static_assert(std::is_same_v<Epi, EpiRowwiseNoBias> ||
+                      std::is_same_v<Epi, EpiRowwise>,
+                  "the pair epilogue caches rowwise operands in LDS");
+    // The matrix loop is finished, so its A/B tiles can hold the much
+    // smaller epilogue operands. Synchronize before overwriting them, then
+    // load each unique row/channel scale and optional bias once per
+    // workgroup instead of once per unrolled accumulator element.
+    __syncthreads();
+    float* const scale_a_lds = reinterpret_cast<float*>(As);
+    float* const scale_b_lds = reinterpret_cast<float*>(&Bs[0][0]);
+    float* const bias_lds = scale_b_lds + 2 * BN;
+    if (tid < BM) {
+        const int r = m0 + tid;
+        scale_a_lds[tid] = r < M ? epi0.scale_a[r] : 0.0f;
     }
+    if (tid < BN) {
+        const int col = n0 + tid;
+        if (col < N) {
+            if constexpr (std::is_same_v<Epi, EpiRowwiseNoBias>) {
+                scale_b_lds[tid] = epi0.scale_b[col];
+            } else {
+                scale_b_lds[tid] =
+                    epi0.scale_b[col * epi0.scale_b_stride];
+                bias_lds[tid] = epi0.bias
+                    ? load_scalar(epi0.bias, epi0.bias_code, col)
+                    : 0.0f;
+            }
+        } else {
+            scale_b_lds[tid] = 0.0f;
+            if constexpr (std::is_same_v<Epi, EpiRowwise>) {
+                bias_lds[tid] = 0.0f;
+            }
+        }
+    } else if (tid < 2 * BN) {
+        const int local_col = tid - BN;
+        const int col = n0 + local_col;
+        if (col < N) {
+            if constexpr (std::is_same_v<Epi, EpiRowwiseNoBias>) {
+                scale_b_lds[BN + local_col] = epi1.scale_b[col];
+            } else {
+                scale_b_lds[BN + local_col] =
+                    epi1.scale_b[col * epi1.scale_b_stride];
+                bias_lds[BN + local_col] = epi1.bias
+                    ? load_scalar(epi1.bias, epi1.bias_code, col)
+                    : 0.0f;
+            }
+        } else {
+            scale_b_lds[BN + local_col] = 0.0f;
+            if constexpr (std::is_same_v<Epi, EpiRowwise>) {
+                bias_lds[BN + local_col] = 0.0f;
+            }
+        }
+    }
+    __syncthreads();
 
     Epi epi = projection == 0 ? epi0 : epi1;
     OutT* C = projection == 0 ? C0 : C1;
     epi.init();
     const int col_lane = acc_col(lane);
-    if constexpr (kCacheRowwiseEpilogue) {
-        // The accepted pair is row-major at writeback. Load its activation
-        // scale once for the four adjacent column fragments instead of letting
-        // the generic functor reload it for every fully unrolled output.
+    {
+        // Writeback is row-major. Load the activation scale once for the TN
+        // adjacent column fragments instead of letting the generic functor
+        // reload it for every fully unrolled output. Reassociation is off so
+        // the scale products keep a fixed evaluation order.
         #pragma clang fp reassociate(off)
         #pragma unroll
         for (int i = 0; i < TM; ++i) {
@@ -560,36 +509,19 @@ void gemm_wmma_pair_kernel(
                 }
             }
         }
-    } else {
-        #pragma unroll
-        for (int i = 0; i < TM; ++i) {
-            #pragma unroll
-            for (int e = 0; e < 8; ++e) {
-                const int r =
-                    m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
-                if (r >= M) continue;
-                OutT* crow = C + static_cast<int64_t>(r) * ldc;
-                #pragma unroll
-                for (int j = 0; j < TN; ++j) {
-                    const int col =
-                        n0 + wn * (TN * 16) + j * 16 + col_lane;
-                    if (col >= N) continue;
-                    crow[col] = static_cast<OutT>(
-                        epi(r, col, Mma::get(acc[i][j], e)));
-                }
-            }
-        }
     }
 }
 
 // Two adjacent M tiles over one weight tile. Half of the workgroup computes
-// each M tile, so every thread keeps the same accumulator shape and arithmetic
-// order as gemm_wmma_kernel while both halves share each global/LDS B stage.
+// each M tile, so every thread keeps the same accumulator shape and MMA order as
+// gemm_wmma_kernel while both halves share each global/LDS B stage. The
+// epilogue evaluates (acc * scale_a) * scale_b (+ bias) in a fixed order,
+// which is not guaranteed to be bitwise equal to the generic EpiRowwise under
+// -ffast-math.
 // gemm_wmma_pair_kernel shares A across two projections; this kernel instead
 // shares B across two row tiles.
 template <typename Mma, typename Epi, typename OutT,
-          int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN,
-          bool VOPD_CROSS_E = false, bool TILED_B = false>
+          int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN>
 __global__ __launch_bounds__(2 * WARPS_M * WARPS_N * kWave)
 void gemm_wmma_dual_m_kernel(
     const uint8_t* __restrict__ A,
@@ -609,6 +541,9 @@ void gemm_wmma_dual_m_kernel(
                   "the N warp grid must tile BN exactly");
     static_assert(BKB % kStepBytes == 0,
                   "BKB must be a whole number of MMA K-steps");
+    static_assert(std::is_same_v<Epi, EpiRowwiseNoBias> ||
+                      std::is_same_v<Epi, EpiRowwise>,
+                  "the dual-M epilogue caches rowwise operands");
 
     __shared__ __align__(16) uint8_t As[2][BM * kStride];
     __shared__ __align__(16) uint8_t Bs[BN * kStride];
@@ -622,7 +557,7 @@ void gemm_wmma_dual_m_kernel(
     const int wn = tile_warp % WARPS_N;
 
     // Each block covers two adjacent M tiles. Group two such blocks so the
-    // traversal retains the production kernel's four-M-tile B locality.
+    // traversal keeps gemm_wmma_kernel's four-M-tile B locality.
     constexpr int kGroupM = 2;
     const int blocks_n = gridDim.x;
     const int blocks_m = gridDim.y;
@@ -651,12 +586,7 @@ void gemm_wmma_dual_m_kernel(
 
     sa0.load(A, m0_pair, M, 0, kbytes);
     sa1.load(A, m0_pair + BM, M, 0, kbytes);
-    if constexpr (TILED_B) {
-        const int64_t tile = static_cast<int64_t>(bn) * (kbytes / BKB);
-        sb.load_contiguous(B + tile * BN * BKB);
-    } else {
-        sb.load(B, n0, N, 0, kbytes);
-    }
+    sb.load(B, n0, N, 0, kbytes);
     sa0.store(As[0]);
     sa1.store(As[1]);
     sb.store(Bs);
@@ -668,14 +598,7 @@ void gemm_wmma_dual_m_kernel(
         if (has_next) {
             sa0.load(A, m0_pair, M, knext, kbytes);
             sa1.load(A, m0_pair + BM, M, knext, kbytes);
-            if constexpr (TILED_B) {
-                const int64_t tile =
-                    static_cast<int64_t>(bn) * (kbytes / BKB)
-                    + knext / BKB;
-                sb.load_contiguous(B + tile * BN * BKB);
-            } else {
-                sb.load(B, n0, N, knext, kbytes);
-            }
+            sb.load(B, n0, N, knext, kbytes);
         }
 
         typename Mma::Frag af[2][TM];
@@ -730,7 +653,7 @@ void gemm_wmma_dual_m_kernel(
     const int col_lane = acc_col(lane);
     if constexpr (std::is_same_v<Epi, EpiRowwiseNoBias>) {
         #pragma clang fp reassociate(off)
-        // Cache the four channel scales owned by this lane directly in VGPRs.
+        // Cache the TN channel scales owned by this lane directly in VGPRs.
         // This avoids both the generic functor's fully-unrolled reloads and an
         // LDS round trip/barrier after the matrix loop.
         float col_scale[TN];
@@ -759,13 +682,13 @@ void gemm_wmma_dual_m_kernel(
                 }
             }
         }
-    } else if constexpr (std::is_same_v<Epi, EpiRowwise>) {
+    } else {
         #pragma clang fp contract(off)
         #pragma clang fp reassociate(off)
-        // Bias-bearing checkpoints otherwise reload the same channel scale and
-        // bias for every accumulator element. Each lane owns TN columns, so
-        // retain those operands across all of its output rows just as the
-        // bias-free specialization does.
+        // With a bias the generic functor would reload the same channel scale
+        // and bias for every accumulator element. Each lane owns TN columns,
+        // so keep those operands in registers across all of its output rows,
+        // as the bias-free specialization does.
         float col_scale[TN];
         float col_bias[TN];
         #pragma unroll
@@ -798,109 +721,6 @@ void gemm_wmma_dual_m_kernel(
                     value *= col_scale[j];
                     value += col_bias[j];
                     crow[col] = static_cast<OutT>(value);
-                }
-            }
-        }
-    } else if constexpr (std::is_same_v<Epi, EpiRowwiseGatedResidual>) {
-        #pragma clang fp contract(off)
-        #pragma clang fp reassociate(off)
-        // This is the same cached rowwise linear epilogue above, followed by
-        // the visible BF16 materialization and addcmul arithmetic.  Gate is a
-        // row-broadcast vector, so each lane retains its TN values while the
-        // residual is read once at the final output location.
-        float col_scale[TN];
-        float col_bias[TN];
-        float col_gate[TN];
-        #pragma unroll
-        for (int j = 0; j < TN; ++j) {
-            const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
-            if (col < N) {
-                col_scale[j] = epi.scale_b[col * epi.scale_b_stride];
-                col_bias[j] = epi.bias
-                    ? load_scalar(epi.bias, epi.bias_code, col) : 0.0f;
-                col_gate[j] = static_cast<float>(epi.gate[col]);
-            } else {
-                col_scale[j] = 0.0f;
-                col_bias[j] = 0.0f;
-                col_gate[j] = 0.0f;
-            }
-        }
-        #pragma unroll
-        for (int i = 0; i < TM; ++i) {
-            #pragma unroll
-            for (int e = 0; e < 8; ++e) {
-                const int r =
-                    m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
-                if (r >= M) continue;
-                OutT* const crow = C + static_cast<int64_t>(r) * ldc;
-                const __bf16* const residual_row =
-                    epi.residual + static_cast<int64_t>(r) * epi.residual_stride;
-                const float row_scale = epi.scale_a[r];
-                #pragma unroll
-                for (int j = 0; j < TN; ++j) {
-                    const int col =
-                        n0 + wn * (TN * 16) + j * 16 + col_lane;
-                    if (col >= N) continue;
-                    float linear = Mma::get(acc[i][j], e) * row_scale;
-                    linear *= col_scale[j];
-                    linear += col_bias[j];
-                    const __bf16 rounded = static_cast<__bf16>(linear);
-                    const float value = fmaf(
-                        col_gate[j], static_cast<float>(rounded),
-                        static_cast<float>(residual_row[col]));
-                    crow[col] = static_cast<OutT>(value);
-                }
-            }
-        }
-    } else if constexpr (VOPD_CROSS_E) {
-        #pragma clang fp reassociate(off)
-        #pragma unroll
-        for (int i = 0; i < TM; ++i) {
-            #pragma unroll
-            for (int e = 0; e < 8; e += 2) {
-                const int r0 =
-                    m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
-                const int r1 =
-                    m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e + 1);
-                const bool valid0 = r0 < M;
-                const bool valid1 = r1 < M;
-                if (!valid0 && !valid1) continue;
-                #pragma unroll
-                for (int j = 0; j < TN; ++j) {
-                    const int col =
-                        n0 + wn * (TN * 16) + j * 16 + col_lane;
-                    if (col >= N) continue;
-                    if (valid0) {
-                        OutT* const crow0 =
-                            C + static_cast<int64_t>(r0) * ldc;
-                        crow0[col] = static_cast<OutT>(
-                            epi(r0, col, Mma::get(acc[i][j], e)));
-                    }
-                    if (valid1) {
-                        OutT* const crow1 =
-                            C + static_cast<int64_t>(r1) * ldc;
-                        crow1[col] = static_cast<OutT>(
-                            epi(r1, col, Mma::get(acc[i][j], e + 1)));
-                    }
-                }
-            }
-        }
-    } else {
-        #pragma unroll
-        for (int i = 0; i < TM; ++i) {
-            #pragma unroll
-            for (int e = 0; e < 8; ++e) {
-                const int r =
-                    m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
-                if (r >= M) continue;
-                OutT* crow = C + static_cast<int64_t>(r) * ldc;
-                #pragma unroll
-                for (int j = 0; j < TN; ++j) {
-                    const int col =
-                        n0 + wn * (TN * 16) + j * 16 + col_lane;
-                    if (col >= N) continue;
-                    crow[col] = static_cast<OutT>(
-                        epi(r, col, Mma::get(acc[i][j], e)));
                 }
             }
         }
@@ -958,32 +778,27 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
             // With few blocks per WGP there is nothing to interleave across, so
             // the 16-wave grid hides latency within a block instead.
             if (blocks_128 <= 4 * wgps) {
-                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2,
-                                 false, false, false, false, ASrc>
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
                     <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
             } else {
-                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4,
-                                 false, false, false, false, ASrc>
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>
                     <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
             }
         } else {
             constexpr int BM = 128, BN = 128, BKB = 64;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4,
-                             false, false, false, false, ASrc>
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>
                 <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
         }
     } else if (kbytes >= 2048) {
         constexpr int BM = 64, BN = 64, BKB = 128;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2,
-                         false, false, false, false, ASrc>
+        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
             <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
     } else {
         constexpr int BM = 64, BN = 64, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2,
-                         false, false, false, false, ASrc>
+        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
             <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
     }
 }

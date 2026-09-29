@@ -19,11 +19,7 @@ from comfy_kitchen.backends.eager.quantization import (
 )
 from comfy_kitchen.constraints import validate_function_call
 from comfy_kitchen.registry import registry
-from comfy_kitchen.tensor import (
-    AsymW4A8Int8Layout,
-    QuantizedTensor,
-    TensorWiseINT8Layout,
-)
+from comfy_kitchen.tensor import AsymW4A8Int8Layout, QuantizedTensor, TensorWiseINT8Layout
 from comfy_kitchen.tensor.int8_utils import _build_hadamard
 
 from .conftest import skip_unless_gfx12_wmma
@@ -72,15 +68,6 @@ def hip():
     from comfy_kitchen.backends import hip as hip_backend
 
     return hip_backend
-
-
-def _tile_b(b: torch.Tensor, tile_k: int) -> torch.Tensor:
-    n, k = b.shape
-    return (
-        b.reshape(n // 128, 128, k // tile_k, tile_k)
-        .permute(0, 2, 1, 3)
-        .contiguous()
-    )
 
 
 # Covers each tile path on 16-48 WGP parts: GEMV (M <= 8), skinny (M or N <= 64),
@@ -228,20 +215,6 @@ def test_int8_linear_pair_reuses_exact_convrot_quantization():
 
 
 @needs_wmma
-def test_gfx12_swiglu_silu_exceptions_match_torch():
-    skip_unless_gfx12_wmma()
-
-    values = torch.tensor(
-        [5.9375, -87.5, -88.0, -88.5],
-        device=DEV,
-        dtype=torch.bfloat16,
-    )
-    result_bits = torch.nn.functional.silu(values).view(torch.uint16).cpu().tolist()
-
-    assert result_bits == [0x40BD, 0x8395, 0x8335, 0x82DD]
-
-
-@needs_wmma
 def test_gfx12_split_swiglu_down_is_exact(hip):
     skip_unless_gfx12_wmma()
 
@@ -333,123 +306,116 @@ def test_gfx12_modulated_pair_is_exact(hip):
     assert torch.equal(candidate[1], reference[1])
 
 
-@needs_wmma
-@pytest.mark.parametrize("k", [3072])
-def test_affine_modulated_convrot_is_exact(hip, k):
-    """Generic fused shift/scale producer must preserve the materialized path."""
-    torch.manual_seed(201 + k)
-    m, n = 129, 256
-    x = torch.randn((1, m, k), device=DEV, dtype=torch.bfloat16)
-    modulation_scale = (
-        torch.randn((1, k), device=DEV, dtype=torch.bfloat16) * 0.25
-    )
-    modulation_shift = (
-        torch.randn((1, k), device=DEV, dtype=torch.bfloat16) * 0.25
-    )
-    weights = tuple(
-        torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
-        for _ in range(3)
-    )
-    scales = tuple(
-        torch.rand(n, device=DEV, dtype=torch.float32) + 0.25
-        for _ in range(3)
-    )
-    modulated = torch.addcmul(
-        modulation_shift.unsqueeze(1), x,
-        1.0 + modulation_scale.unsqueeze(1),
+def _convrot_int8_weight(n: int, k: int) -> QuantizedTensor:
+    return QuantizedTensor.from_float(
+        torch.randn(n, k, device=DEV, dtype=torch.bfloat16),
+        "TensorWiseINT8Layout", per_channel=True, convrot=True,
+        convrot_groupsize=256,
     )
 
-    with ck.use_backend("hip"):
-        reference = ck.int8_linear_pair(
-            modulated, weights[0], weights[1], scales[0], scales[1],
-            None, None, torch.bfloat16,
-            convrot=True, convrot_groupsize=256,
-        )
-        candidate = ck.int8_linear_pair_modulated(
-            x, modulation_scale, weights[0], weights[1], scales[0], scales[1],
-            None, None, torch.bfloat16,
-            convrot=True, convrot_groupsize=256,
-            modulation_shift=modulation_shift,
-        )
-        single = ck.int8_linear_modulated(
-            x, modulation_scale, weights[0], scales[0], None,
-            torch.bfloat16, convrot=True, convrot_groupsize=256,
-            modulation_shift=modulation_shift,
-        )
-        triple = ck.int8_linear_triple_modulated(
-            x, modulation_scale, weights[0], weights[1], weights[2],
-            scales[0], scales[1], scales[2], None, None, None,
-            torch.bfloat16, convrot=True, convrot_groupsize=256,
-            modulation_shift=modulation_shift,
-        )
-        third_reference = ck.int8_linear(
-            modulated, weights[2], scales[2], None, torch.bfloat16,
-            convrot=True, convrot_groupsize=256,
-        )
 
-    assert torch.equal(candidate[0], reference[0])
-    assert torch.equal(candidate[1], reference[1])
-    assert torch.equal(single, reference[0])
-    assert torch.equal(triple[0], reference[0])
-    assert torch.equal(triple[1], reference[1])
-    assert torch.equal(triple[2], third_reference)
+def _snapshot_weights(weights):
+    return [
+        (w._qdata.data_ptr(), w._qdata.clone(), w._params.scale.clone())
+        for w in weights
+    ]
+
+
+def _assert_weights_untouched(weights, snapshot):
+    """Dynamic VRAM owns weight storage: fused ops must read it in place."""
+    for weight, (ptr, qdata, scale) in zip(weights, snapshot, strict=True):
+        assert weight._qdata.data_ptr() == ptr
+        assert torch.equal(weight._qdata, qdata)
+        assert torch.equal(weight._params.scale, scale)
+
+
+def _modulated_rms(x, norm_weight, eps, modulation_scale):
+    normalized = torch.nn.functional.rms_norm(
+        x, (x.shape[-1],), norm_weight, eps
+    )
+    return normalized * (1.0 + modulation_scale.unsqueeze(1))
 
 
 @needs_wmma
-def test_tensorwise_layout_owns_compound_affine_execution(hip):
-    """Model integrations need no knowledge of packed INT8 storage."""
-    torch.manual_seed(211)
-    m, n, k = 129, 256, 3072
+def test_gfx12_fused_rms_modulated_matches_unfused(hip):
+    skip_unless_gfx12_wmma()
+
+    torch.manual_seed(36)
+    m, n, k = 256, 3840, 3840
+    eps = 1.0e-6
     x = torch.randn((1, m, k), device=DEV, dtype=torch.bfloat16)
+    norm_weight = torch.rand(k, device=DEV, dtype=torch.bfloat16) + 0.5
     modulation_scale = (
         torch.randn((1, k), device=DEV, dtype=torch.bfloat16) * 0.25
     )
-    modulation_shift = (
-        torch.randn((1, k), device=DEV, dtype=torch.bfloat16) * 0.25
-    )
-    weights = tuple(
-        QuantizedTensor.from_float(
-            torch.randn(n, k, device=DEV, dtype=torch.bfloat16),
-            "TensorWiseINT8Layout", per_channel=True, convrot=True,
-            convrot_groupsize=256,
+    weight = _convrot_int8_weight(n, k)
+    qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    snapshot = _snapshot_weights([weight])
+
+    with torch.inference_mode(), ck.use_backend("hip"):
+        reference = ck.int8_linear(
+            _modulated_rms(x, norm_weight, eps, modulation_scale),
+            qdata, scale, None, torch.bfloat16,
+            convrot=True, convrot_groupsize=256,
         )
-        for _ in range(3)
+        candidate = TensorWiseINT8Layout.fused_rms_modulated(
+            x, weight, None, norm_weight, eps, modulation_scale
+        )
+
+    assert candidate is not NotImplemented
+    assert torch.equal(candidate, reference)
+    _assert_weights_untouched([weight], snapshot)
+
+
+@needs_wmma
+@pytest.mark.parametrize("with_norm", [False, True])
+def test_gfx12_fused_swiglu_ffn_matches_unfused(hip, with_norm):
+    skip_unless_gfx12_wmma()
+
+    torch.manual_seed(38)
+    m, width, hidden = 256, 3840, 10240
+    eps = 1.0e-6
+    x = torch.randn((1, m, width), device=DEV, dtype=torch.bfloat16)
+    norm_weight = torch.rand(width, device=DEV, dtype=torch.bfloat16) + 0.5
+    modulation_scale = (
+        torch.randn((1, width), device=DEV, dtype=torch.bfloat16) * 0.25
     )
-    biases = tuple(
-        torch.randn(n, device=DEV, dtype=torch.bfloat16) for _ in range(3)
+    weights = (
+        _convrot_int8_weight(hidden, width),
+        _convrot_int8_weight(hidden, width),
+        _convrot_int8_weight(width, hidden),
     )
-    modulated = torch.addcmul(
-        modulation_shift.unsqueeze(1), x,
-        1.0 + modulation_scale.unsqueeze(1),
+    plain = [TensorWiseINT8Layout.get_plain_tensors(w) for w in weights]
+    snapshot = _snapshot_weights(weights)
+    fusion_kwargs = (
+        {"norm_weight": norm_weight, "norm_eps": eps,
+         "modulation_scale": modulation_scale}
+        if with_norm else {}
     )
 
     with torch.inference_mode(), ck.use_backend("hip"):
-        reference = tuple(
-            torch.nn.functional.linear(modulated, weight, bias)
-            for weight, bias in zip(weights, biases, strict=True)
+        projected = (
+            _modulated_rms(x, norm_weight, eps, modulation_scale)
+            if with_norm else x
         )
-        triple = TensorWiseINT8Layout.fused_triple_modulated(
-            x, weights, biases, modulation_scale, modulation_shift,
+        gate, up = (
+            ck.int8_linear(
+                projected, qdata, scale, None, torch.bfloat16,
+                convrot=True, convrot_groupsize=256,
+            )
+            for qdata, scale in plain[:2]
         )
-        pair = TensorWiseINT8Layout.fused_pair(
-            x, weights[0], weights[1], biases[0], biases[1],
-            modulation_scale=modulation_scale,
-            modulation_shift=modulation_shift,
+        reference = ck.int8_linear(
+            torch.nn.functional.silu(gate) * up, plain[2][0], plain[2][1],
+            None, torch.bfloat16, convrot=True, convrot_groupsize=256,
         )
-        single = TensorWiseINT8Layout.fused_affine(
-            x, weights[2], biases[2], modulation_scale, modulation_shift,
+        candidate = TensorWiseINT8Layout.fused_swiglu_ffn(
+            x, *weights, None, None, None, **fusion_kwargs
         )
 
-    assert triple is not NotImplemented
-    assert pair is not NotImplemented
-    assert single is not NotImplemented
-    assert all(
-        torch.equal(candidate, expected)
-        for candidate, expected in zip(triple, reference, strict=True)
-    )
-    assert torch.equal(pair[0], reference[0])
-    assert torch.equal(pair[1], reference[1])
-    assert torch.equal(single, reference[2])
+    assert candidate is not NotImplemented
+    assert torch.equal(candidate, reference)
+    _assert_weights_untouched(weights, snapshot)
 
 
 @pytest.mark.parametrize(
@@ -536,52 +502,6 @@ def test_gfx12_int8_dual_m_shared_b_is_exact(hip, m, n):
     ).to(torch.bfloat16)
     assert torch.equal(candidate, reference)
 
-    if m >= 512:
-        tiled_b = _tile_b(b, 64)
-        tiled_candidate = torch.empty_like(candidate)
-        hip._C.int8_gemm_b_tiled(
-            hip._dl(a), hip._dl(tiled_b), hip._dl(tiled_candidate),
-            hip._dl(scale_a), hip._dl(scale_b), 1, None, m, n, k,
-            hip.DTYPE_TO_CODE[torch.bfloat16], 64, True, stream,
-        )
-        torch.cuda.synchronize()
-        assert torch.equal(tiled_candidate, reference)
-
-
-@pytest.mark.parametrize("tile_k", [64, 128])
-@pytest.mark.parametrize("dual_m", [False, True])
-@pytest.mark.parametrize("with_bias", [False, True])
-@needs_wmma
-def test_int8_generic_tiled_b_is_exact(hip, tile_k, dual_m, with_bias):
-    """Physical B tiling preserves the mature row-major GEMM result."""
-    torch.manual_seed(21)
-    m, n, k = 513, 256, 1024
-    a = torch.randint(-127, 128, (m, k), device=DEV, dtype=torch.int8)
-    b = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
-    tiled_b = _tile_b(b, tile_k)
-    scale_a = torch.rand(m, device=DEV, dtype=torch.float32) + 0.25
-    scale_b = torch.rand(n, device=DEV, dtype=torch.float32) + 0.25
-    bias = (
-        torch.rand(n, device=DEV, dtype=torch.bfloat16)
-        if with_bias else None
-    )
-    control = torch.empty((m, n), device=DEV, dtype=torch.bfloat16)
-    candidate = torch.empty_like(control)
-    stream = hip._stream(a)
-    hip._C.int8_gemm(
-        hip._dl(a), hip._dl(b), hip._dl(control), hip._dl(scale_a),
-        hip._dl(scale_b), 1, None if bias is None else hip._dl(bias),
-        m, n, k, hip.DTYPE_TO_CODE[torch.bfloat16], stream,
-    )
-    hip._C.int8_gemm_b_tiled(
-        hip._dl(a), hip._dl(tiled_b), hip._dl(candidate),
-        hip._dl(scale_a), hip._dl(scale_b), 1,
-        None if bias is None else hip._dl(bias), m, n, k,
-        hip.DTYPE_TO_CODE[torch.bfloat16], tile_k, dual_m, stream,
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(candidate, control)
-
 
 @needs_wmma
 def test_int8_generic_tiled_a_is_exact(hip):
@@ -590,7 +510,6 @@ def test_int8_generic_tiled_a_is_exact(hip):
     m, n, k = 257, 256, 1024
     x = torch.randn((m, k), device=DEV, dtype=torch.bfloat16)
     b = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
-    tiled_b = _tile_b(b, 128)
     scale_b = torch.rand(n, device=DEV, dtype=torch.float32) + 0.25
     padded_m = (m + 127) // 128 * 128
     padded_x = torch.nn.functional.pad(x, (0, 0, 0, padded_m - m))
@@ -610,7 +529,6 @@ def test_int8_generic_tiled_a_is_exact(hip):
 
     reference = torch.empty((m, n), device=DEV, dtype=torch.bfloat16)
     row_major = torch.empty_like(reference)
-    tiled = torch.empty_like(reference)
     stream = hip._stream(x)
     hip._C.int8_gemm(
         hip._dl(row_a), hip._dl(b), hip._dl(reference), hip._dl(tiled_scale_a),
@@ -620,77 +538,11 @@ def test_int8_generic_tiled_a_is_exact(hip):
     hip._C.int8_gemm_a_tiled128_down(
         hip._dl(tiled_a), hip._dl(b), hip._dl(row_major),
         hip._dl(tiled_scale_a), hip._dl(scale_b), 1, None, m, n, k,
-        hip.DTYPE_TO_CODE[torch.bfloat16], False, stream,
-    )
-    hip._C.int8_gemm_a_tiled128_down(
-        hip._dl(tiled_a), hip._dl(tiled_b), hip._dl(tiled),
-        hip._dl(tiled_scale_a), hip._dl(scale_b), 1, None, m, n, k,
-        hip.DTYPE_TO_CODE[torch.bfloat16], True, stream,
+        hip.DTYPE_TO_CODE[torch.bfloat16], stream,
     )
     torch.cuda.synchronize()
 
     assert torch.equal(row_major, reference)
-    assert torch.equal(tiled, reference)
-
-
-@pytest.mark.parametrize("tile_k", [64, 128])
-@pytest.mark.parametrize("dual_m", [False, True])
-@pytest.mark.parametrize("with_bias", [False, True])
-@needs_wmma
-def test_int8_tiled_b_gated_residual_is_exact(
-    hip, tile_k, dual_m, with_bias
-):
-    """The fused epilogue preserves both visible BF16 rounding points."""
-    torch.manual_seed(210)
-    m, n, k = 513, 256, 1024
-    a = torch.randint(-127, 128, (m, k), device=DEV, dtype=torch.int8)
-    b = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
-    tiled_b = _tile_b(b, tile_k)
-    scale_a = torch.rand(m, device=DEV, dtype=torch.float32) + 0.25
-    scale_b = torch.rand(n, device=DEV, dtype=torch.float32) + 0.25
-    bias = (
-        torch.rand(n, device=DEV, dtype=torch.bfloat16)
-        if with_bias else None
-    )
-    residual = torch.randn((m, n), device=DEV, dtype=torch.bfloat16)
-    gate = torch.randn(n, device=DEV, dtype=torch.bfloat16)
-    linear = torch.empty_like(residual)
-    candidate = torch.empty_like(residual)
-    stream = hip._stream(a)
-    hip._C.int8_gemm_b_tiled(
-        hip._dl(a), hip._dl(tiled_b), hip._dl(linear),
-        hip._dl(scale_a), hip._dl(scale_b), 1,
-        None if bias is None else hip._dl(bias), m, n, k,
-        hip.DTYPE_TO_CODE[torch.bfloat16], tile_k, dual_m, stream,
-    )
-    reference = torch.addcmul(residual, gate, linear)
-    hip._C.int8_gemm_b_tiled_gated_residual(
-        hip._dl(a), hip._dl(tiled_b), hip._dl(candidate),
-        hip._dl(scale_a), hip._dl(scale_b), 1,
-        None if bias is None else hip._dl(bias),
-        hip._dl(residual), hip._dl(gate), m, n, k, tile_k, dual_m, stream,
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(candidate, reference)
-
-
-@pytest.mark.parametrize("gate_shape", [(128, 1), (2, 64)])
-def test_int8_linear_gated_residual_rejects_same_numel_non_channel_gate(
-    hip, gate_shape
-):
-    """Flattening a same-numel gate must not change its broadcast axis."""
-    torch.manual_seed(211)
-    m, n, k = 128, 128, 256
-    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
-    weight = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
-    weight_scale = torch.rand(n, device=DEV, dtype=torch.float32) + 0.25
-    residual = torch.randn(m, n, device=DEV, dtype=torch.bfloat16)
-    gate = torch.randn(gate_shape, device=DEV, dtype=torch.bfloat16)
-
-    with pytest.raises(ValueError, match="broadcastable row ending"):
-        hip.int8_linear_gated_residual(
-            x, weight, weight_scale, residual, gate
-        )
 
 
 def _offset_copy(t: torch.Tensor) -> torch.Tensor:
@@ -3611,9 +3463,15 @@ def test_convrot_int8_needs_spill_probe(hip):
 
 @needs_wmma
 def test_convrot_wide_global_is_exact_to_fused_lds(hip):
-    """The scalable global fallback preserves the mature fused INT8 result."""
+    """The global-spill implementation matches the fused-LDS one row for row."""
     torch.manual_seed(37)
-    m, k = 96, 12288
+    m, k = 96, 24576
+    in_code = hip.DTYPE_TO_CODE[torch.bfloat16]
+    with torch.cuda.device(DEV):
+        # 96 rows of this width take the global path; 64 fit the one-wave
+        # fused-LDS schedule.
+        assert hip._C.convrot_int8_needs_spill(m, k, in_code)
+        assert not hip._C.convrot_int8_needs_spill(64, k, in_code)
     x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
     global_q = torch.empty(m, k, device=DEV, dtype=torch.int8)
     global_scales = torch.empty(m, device=DEV, dtype=torch.float32)
@@ -3627,8 +3485,8 @@ def test_convrot_wide_global_is_exact_to_fused_lds(hip):
         hip._dl(spill_rotated), hip._dl(spill_partials), m, k, 256, 0,
         hip._stream(x),
     )
-    # M<96 selects the mature fused-LDS schedule. ConvRot is row-independent,
-    # so two bounded launches form an exact reference for the same 96 rows.
+    # ConvRot is row-independent, so two launches below 96 rows, which take
+    # the fused-LDS schedule, form a reference for the same 96 rows.
     for start, end in ((0, 64), (64, m)):
         hip._C.quantize_int8_convrot(
             hip._dl(x[start:end]), hip._dl(fused_q[start:end]),
@@ -3644,10 +3502,12 @@ def test_convrot_wide_global_is_exact_to_fused_lds(hip):
 
 @needs_wmma
 def test_convrot_wide_spill_chunks_are_exact(hip, monkeypatch):
-    """Bounded row chunks preserve the global fallback's per-row arithmetic."""
+    """Bounded row chunks write into the caller's q and scales in place."""
     torch.manual_seed(41)
-    m, k = 257, 12288
+    m, k = 257, 32768
+    in_code = hip.DTYPE_TO_CODE[torch.bfloat16]
     x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    assert hip._convrot_int8_needs_spill(m, k, in_code, x.device)
     expected_q = torch.empty(m, k, device=DEV, dtype=torch.int8)
     expected_scales = torch.empty(m, device=DEV, dtype=torch.float32)
     spill_rotated = torch.empty(m, k, device=DEV, dtype=x.dtype)
@@ -3658,7 +3518,9 @@ def test_convrot_wide_spill_chunks_are_exact(hip, monkeypatch):
         hip._dl(spill_rotated), hip._dl(spill_partials), m, k, 256, 1,
         hip._stream(x),
     )
-    monkeypatch.setattr(hip, "_CONVROT_SPILL_WORKSPACE_BYTES", 6 << 20)
+    # 190 rows fit this cap, so the call runs two chunks of 129 and 128 rows;
+    # the second chunk's scales slice starts at a 4-byte (not 16-byte) offset.
+    monkeypatch.setattr(hip, "_CONVROT_SPILL_WORKSPACE_BYTES", 12 << 20)
     actual_q, actual_scales = hip._rotate_quant_int8(x, 256, "gelu_tanh")
     torch.cuda.synchronize()
 

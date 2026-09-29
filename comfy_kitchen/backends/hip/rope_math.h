@@ -14,8 +14,6 @@
 
 namespace comfy::hip_backend {
 
-extern "C" __device__ float __ocml_rsqrt_f32(float);
-
 __forceinline__ __device__ float ieee_div_f32(
     float numerator, float denominator) {
     bool denominator_scale = false;

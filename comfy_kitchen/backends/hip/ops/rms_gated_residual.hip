@@ -6,10 +6,10 @@
 #include <cstdint>
 #include <stdexcept>
 
-#include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "../launchers.h"
 #include "../rope_math.h"
 
 namespace comfy::hip_backend {

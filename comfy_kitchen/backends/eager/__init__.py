@@ -54,12 +54,10 @@ __all__ = [
     "stochastic_rounding_fp8",
     "fp16_linear",
     "int8_linear",
-    "int8_linear_gated_residual",
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
     "int8_linear_pair",
     "int8_linear_pair_modulated",
-    "int8_linear_triple_modulated",
     "int8_linear_pair_rms_modulated",
     "int8_linear_swiglu_split",
     "w4a8_int8_linear",
@@ -99,14 +97,12 @@ from .quantization import (
     dequantize_per_tensor_fp8,
     fp16_linear,
     int8_linear,
-    int8_linear_gated_residual,
     int8_linear_modulated,
     int8_linear_pair,
     int8_linear_pair_modulated,
     int8_linear_pair_rms_modulated,
     int8_linear_rms_modulated,
     int8_linear_swiglu_split,
-    int8_linear_triple_modulated,
     quantize_and_rotate_rowwise,
     quantize_int8_convrot_weight,
     quantize_int8_rowwise,
@@ -626,27 +622,15 @@ def _build_constraints() -> dict:
     }
     modulation = {
         "modulation_scale": float_param,
-        "modulation_shift": float_param,
     }
-    tiled = {"weight_tiled_b": bool_param, "weight_tile_k": int_param}
     out.update({
-        "int8_linear_gated_residual": fusion_constraints(single | {
-            "residual": float_param, "gate": float_param,
-            "weight_tile_k": int_param, "dual_m": bool_param,
-        }),
-        "int8_linear_modulated": fusion_constraints(single | modulation | tiled),
+        "int8_linear_modulated": fusion_constraints(single | modulation),
         "int8_linear_rms_modulated": fusion_constraints(single | modulation | {
             "norm_weight": float_param, "norm_eps": float_value,
-            "weight_tiled_b": bool_param,
         }),
-        "int8_linear_pair": fusion_constraints({"x": float_param} | projections(2) | {
-            "weight_tile_k": int_param,
-        }),
+        "int8_linear_pair": fusion_constraints({"x": float_param} | projections(2)),
         "int8_linear_pair_modulated": fusion_constraints(
-            {"x": float_param} | projections(2) | modulation | {"weight_tile_k": int_param}
-        ),
-        "int8_linear_triple_modulated": fusion_constraints(
-            {"x": float_param} | projections(3) | modulation | {"weight_tile_k": int_param}
+            {"x": float_param} | projections(2) | modulation
         ),
         "int8_linear_pair_rms_modulated": fusion_constraints(
             {"x": float_param} | projections(2) | modulation | {
@@ -656,7 +640,7 @@ def _build_constraints() -> dict:
         "int8_linear_swiglu_split": fusion_constraints({
             "gate": float_param, "up": float_param, "weight": int8_param,
             "weight_scale": float_param, "bias": float_param,
-        } | tiled),
+        }),
     })
 
     if hasattr(torch, "float8_e8m0fnu"):

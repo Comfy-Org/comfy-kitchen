@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <cstdint>
+
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+
+#include "rope_math.h"  // round_bf16
 
 namespace comfy::hip_backend {
 
@@ -17,22 +21,21 @@ __forceinline__ __device__ __bf16 swiglu_bf16_value(
     __bf16 gate, __bf16 up) {
     const uint16_t gate_bits = __builtin_bit_cast(uint16_t, gate);
     const float gate_f = static_cast<float>(gate);
-    __bf16 silu;
+    float silu;
     // PyTorch's current ROCm BF16 SiLU differs from the native float expf
     // path at four finite BF16 inputs. Preserve those exact rounded values;
     // every other finite BF16 input maps identically on gfx12.
     switch (gate_bits) {
-        case 0x40be: silu = bf16_from_bits(0x40bd); break;  //  5.9375
-        case 0xc2af: silu = bf16_from_bits(0x8395); break;  // -87.5
-        case 0xc2b0: silu = bf16_from_bits(0x8335); break;  // -88.0
-        case 0xc2b1: silu = bf16_from_bits(0x82dd); break;  // -88.5
+        case 0x40be: silu = static_cast<float>(bf16_from_bits(0x40bd)); break;  //  5.9375
+        case 0xc2af: silu = static_cast<float>(bf16_from_bits(0x8395)); break;  // -87.5
+        case 0xc2b0: silu = static_cast<float>(bf16_from_bits(0x8335)); break;  // -88.0
+        case 0xc2b1: silu = static_cast<float>(bf16_from_bits(0x82dd)); break;  // -88.5
         default:
-            silu = static_cast<__bf16>(
-                gate_f / (1.0f + expf(-gate_f)));
+            // round_bf16, not a __bf16 round trip, which -ffast-math folds away.
+            silu = round_bf16(gate_f / (1.0f + expf(-gate_f)));
             break;
     }
-    return static_cast<__bf16>(
-        static_cast<float>(silu) * static_cast<float>(up));
+    return static_cast<__bf16>(round_bf16(silu * static_cast<float>(up)));
 }
 
 }  // namespace comfy::hip_backend

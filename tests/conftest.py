@@ -70,7 +70,7 @@ def skip_unless_gfx12_wmma() -> None:
     from comfy_kitchen.backends import hip
 
     if not hip._has_nonduplicated_wmma():
-        pytest.skip("requires gfx12-class WMMA (gfx120x)")
+        pytest.skip("requires non-duplicated WMMA (gfx12 or gfx117)")
 
 
 @pytest.fixture(scope="session")

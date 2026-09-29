@@ -13,8 +13,6 @@
 // even index), which is the layout the iu4 A-fragment consumes directly.
 #pragma once
 
-#include <atomic>
-#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -22,6 +20,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "device_arch.h"
 #include "rope_math.h"
 #include "swiglu_bf16.h"
 
@@ -422,22 +421,6 @@ __forceinline__ __device__ float finite_absmax_for_quant(float abs_max) {
     return abs_max;
 }
 
-// Match ``torch.addcmul(shift, x, 1 + scale)`` when all operands and the
-// materialized result are BF16.  The add that forms the scale factor is a
-// separate PyTorch operation, while addcmul evaluates the multiply-add in
-// FP32 before rounding its output once to BF16.
-__forceinline__ __device__ float load_affine_modulated_bf16(
-    const void* __restrict__ x, const void* __restrict__ modulation_scale,
-    const void* __restrict__ modulation_shift, int64_t index, int column) {
-    const float factor = round_bf16(
-        1.0f + static_cast<float>(
-            static_cast<const __bf16*>(modulation_scale)[column]));
-    const float value = static_cast<float>(static_cast<const __bf16*>(x)[index]);
-    const float shift = static_cast<float>(
-        static_cast<const __bf16*>(modulation_shift)[column]);
-    return round_bf16(fmaf(value, factor, shift));
-}
-
 constexpr int kConvrotGlobalGroupsPerBlock = 4;
 constexpr int kConvrotGlobalBlockThreads = kConvrotGlobalGroupsPerBlock * 64;
 constexpr size_t kConvrotGlobalSmemBytes =
@@ -582,15 +565,11 @@ void launch_convrot_quant_global_managed(
 
 // Fused single-kernel path: FHT in LDS, vectorized loads, warp-shuffle absmax.
 // One block per row; the rotated row stays in shared memory as RowT.
-template <typename RowT, int BLOCK_THREADS, int ACT, bool AFFINE_MODULATE = false>
+template <typename RowT, int BLOCK_THREADS, int ACT>
 __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     const void* __restrict__ x, int in_dtype, int8_t* __restrict__ qout,
     float* __restrict__ scaleout, int M, int K, const void* __restrict__ act_weight,
-    float act_eps, const void* __restrict__ modulation_scale = nullptr,
-    const void* __restrict__ modulation_shift = nullptr) {
-
-    static_assert(!AFFINE_MODULATE || std::is_same_v<RowT, __bf16>);
-    static_assert(!AFFINE_MODULATE || ACT == kActNone);
+    float act_eps) {
 
     constexpr int kGroupThreads = 64;
     constexpr int kGroupsInFlight = BLOCK_THREADS / kGroupThreads;
@@ -641,20 +620,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
         float xv2 = 0.0f;
         float xv3 = 0.0f;
         if (active) {
-            if constexpr (AFFINE_MODULATE) {
-                xv0 = load_affine_modulated_bf16(
-                    x, modulation_scale, modulation_shift,
-                    in_row_offset + col, col);
-                xv1 = load_affine_modulated_bf16(
-                    x, modulation_scale, modulation_shift,
-                    in_row_offset + col + 1, col + 1);
-                xv2 = load_affine_modulated_bf16(
-                    x, modulation_scale, modulation_shift,
-                    in_row_offset + col + 2, col + 2);
-                xv3 = load_affine_modulated_bf16(
-                    x, modulation_scale, modulation_shift,
-                    in_row_offset + col + 3, col + 3);
-            } else if constexpr (ACT == kActRmsNorm) {
+            if constexpr (ACT == kActRmsNorm) {
                 const RowT* xr = static_cast<const RowT*>(x) + in_row_offset;
                 const RowT* wr = static_cast<const RowT*>(act_weight);
                 xv0 = load_row_value(xr[col]) * rstd * load_row_value(wr[col]);
@@ -713,27 +679,23 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     }
 }
 
-template <typename RowT, int ACT, int BLOCK_THREADS, bool AFFINE_MODULATE = false>
+template <typename RowT, int ACT, int BLOCK_THREADS>
 inline bool launch_convrot_quant_fused_impl(
     const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
-    const void* act_weight, float act_eps, hipStream_t stream,
-    const void* modulation_scale = nullptr,
-    const void* modulation_shift = nullptr) {
+    const void* act_weight, float act_eps, hipStream_t stream) {
     const int groups_in_flight = BLOCK_THREADS / 64;
     const size_t shmem =
         static_cast<size_t>(K) * sizeof(RowT) +
         static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256 * sizeof(float);
-    auto kernel = convrot_quant_fused_kernel<
-        RowT, BLOCK_THREADS, ACT, AFFINE_MODULATE>;
+    auto kernel = convrot_quant_fused_kernel<RowT, BLOCK_THREADS, ACT>;
     const hipError_t attr_err = hipFuncSetAttribute(
         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(shmem));
     if (attr_err != hipSuccess) {
         return false;
     }
-    kernel<<<M, BLOCK_THREADS, shmem, stream>>>(
-        x, in_dtype, qout, scaleout, M, K, act_weight, act_eps,
-        modulation_scale, modulation_shift);
+    kernel<<<M, BLOCK_THREADS, shmem, stream>>>(x, in_dtype, qout, scaleout, M, K, act_weight,
+                                                act_eps);
     return hipGetLastError() == hipSuccess;
 }
 
@@ -756,53 +718,6 @@ struct LaunchConvrotQuantFusedForBlock {
             x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream);
     }
 };
-
-template <int BLOCK_THREADS>
-inline bool launch_convrot_quant_affine_fused_impl(
-    const void* x, const void* modulation_scale,
-    const void* modulation_shift, int8_t* qout, float* scaleout,
-    int M, int K, hipStream_t stream) {
-    return launch_convrot_quant_fused_impl<
-        __bf16, kActNone, BLOCK_THREADS, true>(
-            x, 2, qout, scaleout, M, K, nullptr, 0.0f, stream,
-            modulation_scale, modulation_shift);
-}
-
-struct LaunchConvrotQuantAffineForBlock {
-    const void* x;
-    const void* modulation_scale;
-    const void* modulation_shift;
-    int8_t* qout;
-    float* scaleout;
-    int M;
-    int K;
-    hipStream_t stream;
-    bool* launched;
-
-    template <int BLOCK_THREADS>
-    void operator()() const {
-        *launched = launch_convrot_quant_affine_fused_impl<BLOCK_THREADS>(
-            x, modulation_scale, modulation_shift, qout, scaleout,
-            M, K, stream);
-    }
-};
-
-inline bool launch_convrot_quant_affine_bf16(
-    const void* x, const void* modulation_scale,
-    const void* modulation_shift, int8_t* qout, float* scaleout,
-    int M, int K, hipStream_t stream) {
-    const int block_threads = convrot_pick_fused_block_threads(M, K, /*bf16*/ 2);
-    if (block_threads == 0) {
-        return false;
-    }
-    bool launched = false;
-    dispatch_convrot_fused_block_threads(
-        block_threads,
-        LaunchConvrotQuantAffineForBlock{
-            x, modulation_scale, modulation_shift, qout, scaleout,
-            M, K, stream, &launched});
-    return launched;
-}
 
 template <int ACT>
 struct LaunchConvrotQuantFusedForRow {
@@ -922,8 +837,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_kernel(
 // two barriers). Bank-aligned FP32 LDS. Not an arch-specific WMMA path; keep
 // separate from convrot_quant_kernel for other shapes and devices.
 template <int ACT, bool TILED_QOUT = false, bool SPLIT_SWIGLU = false,
-          bool MODULATE = false, bool PACK_QUANT = false,
-          bool RMSNORM = false, bool FUSED_RMS_STATS = false,
+          bool MODULATE = false, bool RMSNORM = false,
           bool PACKED_ELEMENT_SCHEDULE = false>
 __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
     const void* __restrict__ x, const void* __restrict__ auxiliary, int in_dtype,
@@ -932,17 +846,15 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
     float rms_eps = 0.0f) {
 
     static_assert(!SPLIT_SWIGLU || ACT == kActSwiGLU);
+    static_assert(!SPLIT_SWIGLU || PACKED_ELEMENT_SCHEDULE);
     static_assert(!MODULATE || ACT == kActNone);
     static_assert(!MODULATE || !SPLIT_SWIGLU);
-    static_assert(!RMSNORM || MODULATE);
-    static_assert(RMSNORM == FUSED_RMS_STATS);
+    static_assert(!RMSNORM || (MODULATE && PACKED_ELEMENT_SCHEDULE));
     static_assert(!PACKED_ELEMENT_SCHEDULE ||
                   ((ACT == kActSwiGLU && TILED_QOUT && SPLIT_SWIGLU &&
-                    PACK_QUANT && !MODULATE && !RMSNORM) ||
+                    !MODULATE) ||
                    (ACT == kActNone && !TILED_QOUT && !SPLIT_SWIGLU &&
-                    MODULATE && PACK_QUANT) ||
-                   (ACT == kActNone && !TILED_QOUT && !SPLIT_SWIGLU &&
-                    !MODULATE && PACK_QUANT && !RMSNORM)));
+                    MODULATE == RMSNORM)));
 
     constexpr int kThreads = 512;
     constexpr int kGroup = 256;
@@ -970,8 +882,8 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
     const int local_group = t / kGroup;
     const int element = t % kGroup;
     const int group_count = K / kGroup;
-    // Tile-major INT8 output is [M_tile, K_tile, row_in_tile, K_in_tile].
-    // This removes the hot down GEMM's K-strided activation loads.
+    // Tile-major INT8 output is [M_tile, K_tile, row_in_tile, K_in_tile],
+    // so the tile-major down GEMM reads each 128x128 tile contiguously.
     const int64_t qout_row_base = TILED_QOUT
         ? static_cast<int64_t>(row >> 7) * K * 128 + (row & 127) * 128
         : static_cast<int64_t>(row) * K;
@@ -982,58 +894,56 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
 
     float row_rstd = 0.0f;
     if constexpr (RMSNORM) {
-        if constexpr (FUSED_RMS_STATS) {
-            #pragma clang fp reassociate(off)
-            #pragma clang fp contract(on)
-            #pragma clang fp reciprocal(off)
-            // Match PyTorch's vectorized K=3840 RMSNorm statistics exactly.
-            // Only the first eight waves participate, reproducing its 32x8
-            // workgroup and four-BF16 vector ownership.  The same loads also
-            // seed the existing BF16 row buffer for the ConvRot pass.
-            float sum_sq = 0.0f;
-            if (t < 256) {
-                const auto* input_vectors =
-                    reinterpret_cast<const convrot_bf16x4*>(
-                        static_cast<const __bf16*>(x) + input_row);
-                auto* row_vectors =
-                    reinterpret_cast<convrot_bf16x4*>(rowbuf);
-                #pragma unroll
-                for (int vector = t; vector < 3840 / 4; vector += 256) {
-                    const convrot_bf16x4 values = input_vectors[vector];
-                    row_vectors[vector] = values;
-                    #pragma unroll
-                    for (int element4 = 0; element4 < 4; ++element4) {
-                        const float value =
-                            static_cast<float>(values[element4]);
-                        sum_sq += value * value;
-                    }
-                }
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1) {
-                    sum_sq += __shfl_down(sum_sq, offset, 32);
-                }
-            }
-
+        #pragma clang fp reassociate(off)
+        #pragma clang fp contract(on)
+        #pragma clang fp reciprocal(off)
+        // Match PyTorch's vectorized K=3840 RMSNorm statistics exactly.
+        // Only the first eight waves participate, reproducing its 32x8
+        // workgroup and four-BF16 vector ownership.  The same loads also
+        // seed the existing BF16 row buffer for the ConvRot pass.
+        float sum_sq = 0.0f;
+        if (t < 256) {
+            const auto* input_vectors =
+                reinterpret_cast<const convrot_bf16x4*>(
+                    static_cast<const __bf16*>(x) + input_row);
+            auto* row_vectors =
+                reinterpret_cast<convrot_bf16x4*>(rowbuf);
             #pragma unroll
-            for (int offset = 4; offset > 0; offset >>= 1) {
-                if (lane == 0 && wave < 8 && wave >= offset &&
-                    wave < 2 * offset) {
-                    wave_max[wave - offset] = sum_sq;
+            for (int vector = t; vector < 3840 / 4; vector += 256) {
+                const convrot_bf16x4 values = input_vectors[vector];
+                row_vectors[vector] = values;
+                #pragma unroll
+                for (int element4 = 0; element4 < 4; ++element4) {
+                    const float value =
+                        static_cast<float>(values[element4]);
+                    sum_sq += value * value;
                 }
-                __syncthreads();
-                if (lane == 0 && wave < offset) {
-                    sum_sq += wave_max[wave];
-                }
-                __syncthreads();
             }
-            if (t == 0) {
-                const float mean_square =
-                    ieee_div_f32(sum_sq, static_cast<float>(K));
-                wave_max[0] = __ocml_rsqrt_f32(mean_square + rms_eps);
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                sum_sq += __shfl_down(sum_sq, offset, 32);
+            }
+        }
+
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            if (lane == 0 && wave < 8 && wave >= offset &&
+                wave < 2 * offset) {
+                wave_max[wave - offset] = sum_sq;
             }
             __syncthreads();
-            row_rstd = wave_max[0];
+            if (lane == 0 && wave < offset) {
+                sum_sq += wave_max[wave];
+            }
+            __syncthreads();
         }
+        if (t == 0) {
+            const float mean_square =
+                ieee_div_f32(sum_sq, static_cast<float>(K));
+            wave_max[0] = __ocml_rsqrt_f32(mean_square + rms_eps);
+        }
+        __syncthreads();
+        row_rstd = wave_max[0];
     }
     float local_max = 0.0f;
     if constexpr (PACKED_ELEMENT_SCHEDULE) {
@@ -1071,9 +981,7 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
                 } else if constexpr (MODULATE) {
                     const int column = group * kGroup + element_base;
                     const convrot_bf16x4 values =
-                        *reinterpret_cast<const convrot_bf16x4*>(
-                            (FUSED_RMS_STATS ? rowbuf : static_cast<const __bf16*>(x) + input_row)
-                            + column);
+                        *reinterpret_cast<const convrot_bf16x4*>(rowbuf + column);
                     const convrot_bf16x4 weights =
                         *reinterpret_cast<const convrot_bf16x4*>(
                             static_cast<const __bf16*>(norm_weight) + column);
@@ -1152,12 +1060,13 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
                     h4[digit3][0] * v0 + h4[digit3][1] * v1 +
                     h4[digit3][2] * v2 + h4[digit3][3] * v3;
                 if (active) {
-                    const __bf16 stored =
-                        static_cast<__bf16>(transformed[element4] * norm);
+                    // round_bf16: the row max must be taken over the stored
+                    // BF16 values, and -ffast-math folds a __bf16 round trip.
+                    const float stored =
+                        round_bf16(transformed[element4] * norm);
                     rowbuf[static_cast<int64_t>(group) * kGroup + element_base + element4] =
-                        stored;
-                    local_max = fmaxf(
-                        local_max, fabsf(static_cast<float>(stored)));
+                        static_cast<__bf16>(stored);
+                    local_max = fmaxf(local_max, fabsf(stored));
                 }
             }
             if (group_base + kPackedGroupsPerPass < group_count) {
@@ -1177,13 +1086,6 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
             active[slot] = group < group_count;
             if (!active[slot]) {
                 transformed[slot] = 0.0f;
-            } else if constexpr (SPLIT_SWIGLU) {
-                const int64_t index =
-                    input_row + group * kGroup + element;
-                transformed[slot] = static_cast<float>(
-                    swiglu_bf16_value(
-                        static_cast<const __bf16*>(x)[index],
-                        static_cast<const __bf16*>(auxiliary)[index]));
             } else if constexpr (MODULATE) {
                 const int column = group * kGroup + element;
                 const int64_t index = input_row + column;
@@ -1198,26 +1100,9 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
                 const float factor = round_bf16(
                     1.0f + static_cast<float>(
                         static_cast<const __bf16*>(auxiliary)[column]));
-                if constexpr (RMSNORM) {
-                    // Match PyTorch's BF16 RMSNorm materialization exactly:
-                    // gamma * (rstd * x), all in FP32, then one BF16 rounding.
-                    // The empty vector-asm boundary prevents Kitchen's global
-                    // -ffast-math from reassociating the two FP32 multiplies.
-                    float normalized =
-                        row_rstd * static_cast<float>(
-                            FUSED_RMS_STATS
-                                ? rowbuf[column]
-                                : static_cast<const __bf16*>(x)[index]);
-                    asm volatile("" : "+v"(normalized));
-                    normalized *= static_cast<float>(
-                        static_cast<const __bf16*>(norm_weight)[column]);
-                    normalized = round_bf16(normalized);
-                    transformed[slot] = round_bf16(normalized * factor);
-                } else {
-                    transformed[slot] = round_bf16(
-                        static_cast<float>(
-                            static_cast<const __bf16*>(x)[index]) * factor);
-                }
+                transformed[slot] = round_bf16(
+                    static_cast<float>(
+                        static_cast<const __bf16*>(x)[index]) * factor);
             } else {
                 transformed[slot] = load_input_act<ACT>(
                     x, input_row, group * kGroup + element, K, in_dtype);
@@ -1296,17 +1181,17 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
             const int group =
                 group_base + local_group + slot * kGroupsPerSlot;
             if (active[slot]) {
-                const __bf16 stored =
-                    static_cast<__bf16>(transformed[slot] * norm);
-                rowbuf[static_cast<int64_t>(group) * kGroup + element] = stored;
-                local_max = fmaxf(local_max, fabsf(static_cast<float>(stored)));
+                const float stored = round_bf16(transformed[slot] * norm);
+                rowbuf[static_cast<int64_t>(group) * kGroup + element] =
+                    static_cast<__bf16>(stored);
+                local_max = fmaxf(local_max, fabsf(stored));
             }
         }
     }
     }
 
-    // Register/wave reduction replaces the stock 256-float LDS reduction and
-    // its eight workgroup barriers with two workgroup barriers total.
+    // Row max: reduce within each wave by shuffles, then across the waves
+    // through LDS, with two workgroup barriers in total.
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         local_max = fmaxf(local_max, __shfl_down(local_max, offset, 32));
@@ -1328,51 +1213,40 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
     const float inverse_scale = 127.0f / row_max;
     if (t == 0) scaleout[row] = scale;
 
-    if constexpr (PACK_QUANT) {
-        // One aligned dword LDS read covers two adjacent BF16
-        // values, avoiding the two-lanes-per-bank mapping of scalar BF16 reads.
-        // Even logical columns are also physically adjacent in the tiled128
-        // layout, so one aligned 16-bit store preserves both output layouts.
-        for (int pair = t; pair < K / 2; pair += kThreads) {
-            const int column = 2 * pair;
-            const convrot_bf16x2 values =
-                *reinterpret_cast<const convrot_bf16x2*>(rowbuf + column);
-            int q0 = static_cast<int>(
-                rintf(static_cast<float>(values[0]) * inverse_scale));
-            int q1 = static_cast<int>(
-                rintf(static_cast<float>(values[1]) * inverse_scale));
-            q0 = q0 < -127 ? -127 : (q0 > 127 ? 127 : q0);
-            q1 = q1 < -127 ? -127 : (q1 > 127 ? 127 : q1);
-            const int64_t qindex = TILED_QOUT
-                ? qout_row_base + static_cast<int64_t>(column >> 7) * 16384 +
-                      (column & 127)
-                : qout_row_base + column;
-            const uint16_t packed =
-                static_cast<uint8_t>(static_cast<int8_t>(q0)) |
-                (static_cast<uint16_t>(
-                     static_cast<uint8_t>(static_cast<int8_t>(q1))) << 8);
-            *reinterpret_cast<uint16_t*>(qout + qindex) = packed;
-        }
-    } else {
-        for (int column = t; column < K; column += kThreads) {
-            int quantized = static_cast<int>(
-                rintf(static_cast<float>(rowbuf[column]) * inverse_scale));
-            quantized = quantized < -127 ? -127 : (quantized > 127 ? 127 : quantized);
-            const int64_t qindex = TILED_QOUT
-                ? qout_row_base + static_cast<int64_t>(column >> 7) * 16384 +
-                      (column & 127)
-                : qout_row_base + column;
-            qout[qindex] = static_cast<int8_t>(quantized);
-        }
+    // One aligned dword LDS read covers two adjacent BF16
+    // values, avoiding the two-lanes-per-bank mapping of scalar BF16 reads.
+    // Even logical columns are also physically adjacent in the tiled128
+    // layout, so one aligned 16-bit store preserves both output layouts.
+    for (int pair = t; pair < K / 2; pair += kThreads) {
+        const int column = 2 * pair;
+        const convrot_bf16x2 values =
+            *reinterpret_cast<const convrot_bf16x2*>(rowbuf + column);
+        int q0 = static_cast<int>(
+            rintf(static_cast<float>(values[0]) * inverse_scale));
+        int q1 = static_cast<int>(
+            rintf(static_cast<float>(values[1]) * inverse_scale));
+        q0 = q0 < -127 ? -127 : (q0 > 127 ? 127 : q0);
+        q1 = q1 < -127 ? -127 : (q1 > 127 ? 127 : q1);
+        const int64_t qindex = TILED_QOUT
+            ? qout_row_base + static_cast<int64_t>(column >> 7) * 16384 +
+                  (column & 127)
+            : qout_row_base + column;
+        const uint16_t packed =
+            static_cast<uint8_t>(static_cast<int8_t>(q0)) |
+            (static_cast<uint16_t>(
+                 static_cast<uint8_t>(static_cast<int8_t>(q1))) << 8);
+        *reinterpret_cast<uint16_t*>(qout + qindex) = packed;
     }
 }
 
-inline bool convrot_wave32_512_supported() {
-    int device = 0;
+inline bool select_convrot_wave32_512(int device) {
     hipDeviceProp_t properties{};
-    return hipGetDevice(&device) == hipSuccess &&
-        hipGetDeviceProperties(&properties, device) == hipSuccess &&
+    return hipGetDeviceProperties(&properties, device) == hipSuccess &&
         properties.warpSize == 32 && properties.maxThreadsPerBlock >= 512;
+}
+
+inline bool convrot_wave32_512_supported() {
+    return cached_device_query<select_convrot_wave32_512>();
 }
 
 inline bool convrot_512x2_supported(int K) {
@@ -1393,31 +1267,8 @@ inline bool convrot_512x2_supported(int K) {
         static_cast<size_t>(lds_bytes);
 }
 
-inline bool use_convrot_packed_schedule() {
-    return convrot_wave32_512_supported();
-}
-
 inline bool use_gfx12_convrot_packed_none() {
-    constexpr int kMaxDevices = 16;
-    static std::atomic<int> cache[kMaxDevices] = {};
-    int device = 0;
-    if (hipGetDevice(&device) != hipSuccess) return false;
-
-    auto select = [device] {
-        hipDeviceProp_t properties{};
-        return hipGetDeviceProperties(&properties, device) == hipSuccess &&
-            (std::strncmp(properties.gcnArchName, "gfx1170", 7) == 0 ||
-             std::strncmp(properties.gcnArchName, "gfx12", 5) == 0) &&
-            properties.warpSize == 32 && properties.maxThreadsPerBlock >= 512;
-    };
-    if (device < 0 || device >= kMaxDevices) return select();
-
-    int selected = cache[device].load(std::memory_order_relaxed);
-    if (selected == 0) {
-        selected = select() ? 2 : 1;
-        cache[device].store(selected, std::memory_order_relaxed);
-    }
-    return selected == 2;
+    return use_nonduplicated_wmma_schedule() && convrot_wave32_512_supported();
 }
 
 template <int ACT>
@@ -1428,50 +1279,32 @@ inline void launch_convrot_quant_512x2_bf16(
     if constexpr (ACT == kActNone) {
         if (use_gfx12_convrot_packed_none()) {
             convrot_quant_512x2_bf16_kernel<
-                ACT, false, false, false, true, false, false, true>
+                ACT, false, false, false, false, true>
                 <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
                     x, nullptr, in_dtype, qout, scaleout, M, K);
             return;
         }
     }
-    if (use_convrot_packed_schedule()) {
-        convrot_quant_512x2_bf16_kernel<ACT, false, false, false, true>
-            <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
-                x, nullptr, in_dtype, qout, scaleout, M, K);
-    } else {
-        convrot_quant_512x2_bf16_kernel<ACT>
-            <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
-                x, nullptr, in_dtype, qout, scaleout, M, K);
-    }
+    convrot_quant_512x2_bf16_kernel<ACT>
+        <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
+            x, nullptr, in_dtype, qout, scaleout, M, K);
 }
 
 inline void launch_convrot_quant_512x2_bf16_swiglu_split_tiled128(
     const void* gate, const void* up, int8_t* qout, float* scaleout,
     int M, int K, hipStream_t stream) {
-    if (use_convrot_packed_schedule()) {
-        convrot_quant_512x2_bf16_kernel<
-            kActSwiGLU, true, true, false, true, false, false, true>
-            <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
-                gate, up, 2, qout, scaleout, M, K);
-    } else {
-        convrot_quant_512x2_bf16_kernel<kActSwiGLU, true, true>
-            <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
-                gate, up, 2, qout, scaleout, M, K);
-    }
+    convrot_quant_512x2_bf16_kernel<
+        kActSwiGLU, true, true, false, false, true>
+        <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
+            gate, up, 2, qout, scaleout, M, K);
 }
 
 inline void launch_convrot_quant_512x2_bf16_modulated(
     const void* x, const void* modulation_scale,
     int8_t* qout, float* scaleout, int M, int K, hipStream_t stream) {
-    if (use_convrot_packed_schedule()) {
-        convrot_quant_512x2_bf16_kernel<kActNone, false, false, true, true>
-            <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
-                x, modulation_scale, 2, qout, scaleout, M, K);
-    } else {
-        convrot_quant_512x2_bf16_kernel<kActNone, false, false, true>
-            <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
-                x, modulation_scale, 2, qout, scaleout, M, K);
-    }
+    convrot_quant_512x2_bf16_kernel<kActNone, false, false, true>
+        <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
+            x, modulation_scale, 2, qout, scaleout, M, K);
 }
 
 template <typename RowT, bool PACK_INT4, int ACT, int BLOCK_THREADS>

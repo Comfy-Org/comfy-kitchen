@@ -11,7 +11,7 @@ def rms_gated_residual(
     gate: torch.Tensor,
     eps: float = 1.0e-5,
 ) -> torch.Tensor:
-    """Reference RMSNorm followed by the visible gate product and residual add."""
+    """Reference ``residual + gate * rms_norm(activation, norm_weight)``."""
     normalized = functional.rms_norm(
         activation, (activation.shape[-1],), norm_weight, eps
     )

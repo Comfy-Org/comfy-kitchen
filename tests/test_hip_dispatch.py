@@ -22,11 +22,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _HIP_DIR = _ROOT / "comfy_kitchen" / "backends" / "hip"
 _HIP_CMAKE = _HIP_DIR / "CMakeLists.txt"
 _HIP_ARCH_MANIFEST = _HIP_DIR / "architectures.json"
-_HIP_ARCH_GROUP_NAMES = (
-    "elementwise_only",
-    "wmma_gfx11",
-    "wmma_gfx12",
-)
+_HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12")
 
 
 def _architecture_groups() -> dict[str, list[str]]:
@@ -36,13 +32,6 @@ def _architecture_groups() -> dict[str, list[str]]:
 def _manifest_archs() -> list[str]:
     groups = _architecture_groups()
     return [arch for group_name in _HIP_ARCH_GROUP_NAMES for arch in groups[group_name]]
-
-
-@pytest.mark.parametrize("value", [False, True])
-def test_hip_int8_attention_scale_rejects_boolean_tensor(value):
-    q = torch.empty(1, 1, 1, 128)
-    with pytest.raises(TypeError, match="scale"):
-        hip_backend.hip_int8_attention(q, None, None, torch.tensor(value))
 
 
 def test_non_rocm_runtime_does_not_import_hip_backend():
@@ -338,11 +327,7 @@ def test_sdist_rules_include_every_hip_build_input():
     assert "include comfy_kitchen/backends/hip/CMakeLists.txt" in manifest
     assert "recursive-include comfy_kitchen/backends/hip *.cpp *.h *.hip *.in *.json" in manifest
     assert "include-package-data = false" in pyproject
-    assert (
-        '"comfy_kitchen.backends.hip" = '
-        '["architectures.json"]'
-        in pyproject
-    )
+    assert '"comfy_kitchen.backends.hip" = ["architectures.json"]' in pyproject
 
 
 def test_hip_kernels_are_independent_of_the_python_extension_target():

@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // INT8 quantization kernels for the WMMA int8 GEMM.
-#include <cstring>
 #include <stdexcept>
 
 #include "../hadamard.h"
@@ -16,18 +15,17 @@ inline bool use_convrot_512x2_bf16(int in_code, int K, int group_size) {
         return false;
     }
 
-    // The packed-element schedule is exact and faster at these two measured
-    // widths. K=3072, 5120, 5376, and 6144 are slower and do not preserve the
-    // generic producer's rounding, so they retain that path.
+    // The 512-thread schedules (packed-element for plain activations, two
+    // groups per thread for gelu/swiglu) are used only at K=3840 and 10240,
+    // where they match the generic producer exactly and are faster. Other
+    // widths keep the generic producer.
     if (K != 3840 && K != 10240) {
         return false;
     }
 
-    // Portable wave32 RDNA schedule: requires a 512-thread workgroup and
-    // enough LDS, but no arch-specific instruction or layout. Validated on
-    // gfx12; other supported devices retain the same exact fallback when
-    // these launch capabilities are absent.
-    return convrot_512x2_supported(K);
+    // Tuned for gfx12/gfx117; other targets keep the generic producer. The
+    // schedule also needs wave32, a 512-thread workgroup and LDS for the row.
+    return use_nonduplicated_wmma_schedule() && convrot_512x2_supported(K);
 }
 
 __forceinline__ __device__ int8_t quant_round(float v, float inv) {
@@ -231,8 +229,15 @@ void launch_convrot_quant_global_managed(
     dispatch_convrot_row_type(
         in_dtype,
         LaunchConvrotQuantGlobalManaged<ACT>{
-            x, in_dtype, qout, scaleout, M, K, stream,
-            spill_rotated, spill_partials});
+            x,
+            in_dtype,
+            qout,
+            scaleout,
+            M,
+            K,
+            stream,
+            spill_rotated,
+            spill_partials});
 }
 
 template void launch_convrot_quant_global_managed<kActNone>(
@@ -313,8 +318,9 @@ extern "C" void launch_quantize_int8_convrot_kernel(
 }
 
 // Consume separate BF16 gate/up projections,
-// reproduce the exact standalone SwiGLU rounding contract, and emit the same
-// tile-major INT8 activation expected by the accepted down GEMM.
+// reproduce the exact standalone SwiGLU rounding contract, and emit the
+// tile-major INT8 activation read by the tile-major down GEMM
+// (int8_gemm_a_tiled128_down).
 extern "C" void launch_quantize_int8_convrot_swiglu_split_tiled128_kernel(
     const void* gate, const void* up, void* q, void* scales,
     int M, int K, int group_size, hipStream_t stream) {
@@ -352,34 +358,9 @@ extern "C" void launch_quantize_int8_convrot_modulated_kernel(
         static_cast<float*>(scales), M, K, stream);
 }
 
-// Fold a materialized BF16 affine modulation into the generic fused
-// ConvRot producer.  The schedule is selected from dimensions and LDS
-// capacity, so the path applies to any compatible hidden width.
-extern "C" void launch_quantize_int8_convrot_affine_kernel(
-    const void* x, const void* modulation_scale,
-    const void* modulation_shift, void* q, void* scales,
-    int M, int K, int group_size, hipStream_t stream) {
-
-    using namespace comfy::hip_backend;
-    if (group_size != 256) {
-        throw std::runtime_error(
-            "convrot affine: requires group_size=256");
-    }
-    check_convrot_k(K, group_size, 2, /*int8_quant=*/true);
-    if (M == 0) return;
-    if (!launch_convrot_quant_affine_bf16(
-            x, modulation_scale, modulation_shift,
-            static_cast<int8_t*>(q), static_cast<float*>(scales),
-            M, K, stream)) {
-        throw std::runtime_error(
-            "convrot affine: row does not fit the fused LDS schedule");
-    }
-}
-
-// Returns 1 when INT8 G=256 must use the generic global-spill path for
-// this device. The specialized live shapes fit in LDS on capable wave32 RDNA
-// devices, so they do not allocate a workspace; generic and ultra-wide shapes
-// retain the generic capacity predicate.
+// Returns 1 when no fused-LDS block size fits an INT8 G=256 row of (M, K) on
+// this device, so the generic global-spill path runs and the caller must
+// allocate its workspace.
 extern "C" int convrot_int8_needs_spill_host(int M, int K, int in_code) {
     using namespace comfy::hip_backend;
     return convrot_int8_needs_spill_buffers(M, K, in_code) ? 1 : 0;
