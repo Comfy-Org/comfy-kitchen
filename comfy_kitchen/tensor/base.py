@@ -35,6 +35,50 @@ def get_cuda_capability() -> tuple[int, int] | None:
     return torch.cuda.get_device_capability()
 
 
+@lru_cache(maxsize=None)
+def native_scaled_mm_usable(device_type: str) -> bool:
+    """Whether ``torch._scaled_mm`` actually runs on this device's backend.
+
+    ``get_cuda_capability`` cannot answer this. On ROCm it reports a gfx-shaped
+    number -- gfx1103 answers (11, 0) -- so every layout's ``MIN_SM_VERSION``
+    check passes on an AMD part, while PyTorch implements ``_scaled_mm`` only
+    for SM89/SM90 and above and for ROCm MI300 or above.
+
+    A layout whose only fast path is that op used to cope by catching the
+    resulting ``NotImplementedError`` and falling back to dequantization, but
+    that only survives in eager mode: under ``torch.compile`` the op is traced
+    into the graph, the exception escapes at runtime, and the model dies.
+    Consulting this from the layout handler decides the matter in Python, where
+    dynamo evaluates it while tracing and bakes in the branch eager would have
+    taken.
+
+    Scoped to the layouts that genuinely have nowhere else to go. FP8 and INT8
+    are deliberately not gated this way: on a WMMA part the HIP backend serves
+    both from its own kernels, and gating them would push working matmuls onto
+    a dequantize fallback.
+
+    Probed once per device type with a 1x1 matmul rather than read off the
+    capability number, because what matters is the shape PyTorch actually
+    accepts, which no version query reports. Answers "assume yes" during CUDA
+    graph capture, where the probe's own allocations would be recorded into the
+    graph being captured.
+    """
+    if device_type != "cuda" or not torch.cuda.is_available():
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        return True
+    try:
+        a = torch.zeros((1, 16), device=device_type, dtype=torch.bfloat16)
+        b = torch.zeros((1, 16), device=device_type, dtype=torch.bfloat16)
+        scale = torch.ones((), device=device_type, dtype=torch.float32)
+        torch._scaled_mm(
+            a, b.t(), scale_a=scale, scale_b=scale, bias=None, out_dtype=torch.bfloat16
+        )
+    except Exception:
+        return False
+    return True
+
+
 # ==================== Base Params Dataclass ====================
 
 @dataclass(frozen=True)

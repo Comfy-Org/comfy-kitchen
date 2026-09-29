@@ -14,6 +14,7 @@ from .base import (
     QuantizedLayout,
     QuantizedTensor,
     dequantize_args,
+    native_scaled_mm_usable,
     register_layout_op,
 )
 
@@ -177,6 +178,14 @@ def _handle_nvfp4_mm(qt, args, kwargs):
     if a._qdata.dim() != 2:
         return torch.mm(*dequantize_args(args))
 
+    # The native scaled GEMM this dispatches to does not exist on every part
+    # torch.cuda reports as "cuda" (see native_scaled_mm_usable). Decline here
+    # rather than let the try/except below catch it: under torch.compile the
+    # custom op is traced into the graph, so the exception would escape instead.
+    if not native_scaled_mm_usable(a._qdata.device.type):
+        logger.debug("NVFP4 mm: no native scaled GEMM here, falling back to dequantize")
+        return torch.mm(*dequantize_args(args))
+
     a_transposed = getattr(a._params, "transposed", False)
     b_transposed = getattr(b._params, "transposed", False)
 
@@ -225,6 +234,13 @@ def _handle_nvfp4_linear(qt, args, kwargs):
 
     # NVFP4 only supports 2D tensors
     if input_tensor._qdata.dim() != 2:
+        return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
+
+    # See _handle_nvfp4_mm: the native scaled GEMM is not available everywhere
+    # torch.cuda reports as "cuda", and a try/except fallback does not survive
+    # torch.compile because the custom op is traced into the graph.
+    if not native_scaled_mm_usable(input_tensor._qdata.device.type):
+        logger.debug("NVFP4 linear: no native scaled GEMM here, falling back to dequantize")
         return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
 
     input_transposed = getattr(input_tensor._params, "transposed", False)
