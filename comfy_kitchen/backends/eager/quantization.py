@@ -752,10 +752,12 @@ def _is_gfx103x(device: torch.device | int | None = None) -> bool:
 
     Kept self-contained on purpose: ``backends/eager`` must import and work without
     the HIP extension, so it cannot reach ``backends/hip``'s manifest loader. The
-    predicate matches the same set the rest of the tree uses -- the
+    predicate matches the same RDNA2 set the rest of the tree uses -- the
     ``elementwise_only`` group of ``backends/hip/architectures.json`` (gfx1030-1036),
-    ``gfx1035_sage._detect_gfx1035_arch``, and the C++ ``comfy_is_gfx10()``. If that
-    group is ever renamed or extended, this predicate has to move with it.
+    ``gfx1035_sage._detect_gfx103x_arch``, and the C++ ``comfy_is_gfx10()``. The gate is
+    the architecture class, not one part: every gfx103x device lacks matrix cores, so
+    every one of them needs this path. If that group is ever renamed or extended, this
+    predicate has to move with it.
     """
     if not getattr(torch.version, "hip", None) or not torch.cuda.is_available():
         return False

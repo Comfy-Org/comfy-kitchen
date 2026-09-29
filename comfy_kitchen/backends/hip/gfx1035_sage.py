@@ -1,16 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 SageAttention team.
 # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""gfx1035 (RDNA2) SageAttention: INT8 QK^T + FP16 P·V on VALU.
+"""RDNA2 (gfx103x) SageAttention: INT8 QK^T + FP16 P·V on VALU.
 
 RDNA2 has no matrix cores, so the main HIP backend's sage_attention/*.hip
 sources (built on WMMA) do not build or run for gfx103x at all. This module
 loads the ported RDNA2 kernels and exposes the same call shape as the external
 SageAttention package, so callers can treat it as a drop-in backend.
 
-The gate in :func:`is_available` is deliberately architecture-strict: the
-extension is compiled for gfx103x only, and this module refuses to run on any
-other target rather than silently producing wrong results.
+The gate in :func:`is_available` is deliberately architecture-strict, and it
+covers the whole RDNA2 family (gfx1030-1036), not just the gfx1035 the module
+and build suffix are named after: every gfx103x part lacks matrix cores, so
+every one of them needs this port. The extension is compiled for gfx103x only,
+and this module refuses to run on any other target rather than silently
+producing wrong results.
 """
 
 from __future__ import annotations
@@ -33,8 +36,15 @@ _import_error: Exception | None = None
 _ARCH_LOADED: str | None = None
 
 
-def _detect_gfx1035_arch(device: torch.device | int | None = None) -> str | None:
-    """Return the gfx103x architecture name of ``device``, or None."""
+def _detect_gfx103x_arch(device: torch.device | int | None = None) -> str | None:
+    """Return the RDNA2 (gfx103x) architecture name of ``device``, or None.
+
+    Covers the whole RDNA2 family, not just gfx1035: gfx1030-1036 all lack matrix
+    cores, so all of them need this port and all of them are accepted by the
+    extension's CMake target. The historical ``gfx1035`` name lives on in the
+    directory, module and build-suffix for compatibility, but the *gate* is
+    architecture-class, not a single part.
+    """
     arch = _gfx_arch(device)
     return arch if isinstance(arch, str) and arch.startswith("gfx103") else None
 
@@ -45,7 +55,7 @@ def _load_module() -> None:
     if _module is not None or _import_error is not None:
         return
 
-    arch = _detect_gfx1035_arch()
+    arch = _detect_gfx103x_arch()
     if arch is None:
         _import_error = RuntimeError(
             "gfx1035 sage attention: no RDNA2 (gfx103x) device is visible; "
@@ -64,7 +74,8 @@ def _load_module() -> None:
     if path is None:
         _import_error = RuntimeError(
             "gfx1035 sage attention: extension not built (no _qattn_gfx1035 module "
-            "in backends/hip). Rebuild with COMFY_HIP_ARCHS=gfx1035."
+            "in backends/hip). Rebuild with COMFY_HIP_ARCHS set to this device's RDNA2 "
+            "target, e.g. COMFY_HIP_ARCHS=gfx1035."
         )
         return
 
@@ -91,7 +102,7 @@ def is_available(device: torch.device | int | None = None) -> bool:
     """Whether the gfx1035 SageAttention path can run for this device."""
     if not torch.cuda.is_available() or not getattr(torch.version, "hip", None):
         return False
-    if _detect_gfx1035_arch(device) is None:
+    if _detect_gfx103x_arch(device) is None:
         return False
     _load_module()
     return _module is not None
