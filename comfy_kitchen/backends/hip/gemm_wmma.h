@@ -380,6 +380,18 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
     // likes BKB=128). The env override (COMFY_KITCHEN_WMMA_TILE) forces any mode.
     // Every other architecture falls through to the upstream heuristic below:
     // the branch above was tuned against 6 WGPs and is a regression elsewhere.
+    //
+    // Do not retune the 8-bit arm (the `kbytes >= 4096` chain below) on K alone.
+    // An attempt to route int8 K in [2048, 5120] to the 64x64 BKB128 tile looked
+    // like a 1.07-1.57x win when measured at M=8192/12288, and then *regressed*
+    // 9 of the 16 shapes the benchmark actually runs (301.6 -> 306.4 ms summed).
+    // Re-measuring with K and N fixed and M swept (4096..32768) showed the small
+    // tile at 0.97-1.00x of the 128x128 for K=2048 at every M, so the original
+    // sweep's signal was an artifact, not a K effect. Two traps, both worth
+    // avoiding: the first GPU work in a process runs on cold clocks (it inflated
+    // that sweep's apparent effect by 14-24%, above its own noise floor), and
+    // shapes must include the M the workload really uses -- ComfyUI CFG at B=2
+    // reaches M=2*sq=18432, well past where the effect was assumed to hold.
     if (!skinny && comfy_small_igpu() && mode != 10) {
         if (Mma::kStepBytes >= 32) {
             // 32-byte K-steps (fp16/bf16) halve the K-steps per tile versus 8-bit
