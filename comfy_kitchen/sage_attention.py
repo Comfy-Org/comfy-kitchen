@@ -235,6 +235,11 @@ def _int8_attention_cuda(
         # layouts as the WMMA kernels (see gfx1035_sage._MASK_*), so a mask is
         # handled here rather than declined.
         if _gfx1035_sage.is_available(q.device):
+            # This branch returns before the finiteness check further down, which
+            # every other backend reaches, so a non-finite scale would otherwise
+            # reach the ported kernel and come back as NaN instead of raising.
+            if not math.isfinite(attention_scale):
+                raise ValueError(f"scale must be finite, got {attention_scale}")
             # Head dims outside 64/128 are padded up to the next supported tile
             # rather than rejected: the ported kernel's 64 and 128 instantiations
             # are the same ones the WMMA path pads to, and a zero-padded lane
@@ -619,7 +624,13 @@ def _op_int8_attention(
     v: torch.Tensor,
     scale: float | None,
 ) -> torch.Tensor:
-    return _int8_attention_cuda(q, k, v, scale=scale, attn_mask=None)
+    return _int8_attention_cuda(
+        q,
+        k,
+        v,
+        scale=scale,
+        attn_mask=None,
+    )
 
 
 @_op_int8_attention.register_fake
@@ -640,7 +651,13 @@ def _op_int8_attention_masked(
     attn_mask: torch.Tensor,
     scale: float | None,
 ) -> torch.Tensor:
-    return _int8_attention_cuda(q, k, v, scale=scale, attn_mask=attn_mask)
+    return _int8_attention_cuda(
+        q,
+        k,
+        v,
+        scale=scale,
+        attn_mask=attn_mask,
+    )
 
 
 @_op_int8_attention_masked.register_fake
@@ -681,5 +698,16 @@ def int8_attention(
     MMA instructions.
     """
     if attn_mask is None:
-        return torch.ops.comfy_kitchen.int8_attention(q, k, v, scale)
-    return torch.ops.comfy_kitchen.int8_attention_masked(q, k, v, attn_mask, scale)
+        return torch.ops.comfy_kitchen.int8_attention(
+            q,
+            k,
+            v,
+            scale,
+        )
+    return torch.ops.comfy_kitchen.int8_attention_masked(
+        q,
+        k,
+        v,
+        attn_mask,
+        scale,
+    )
