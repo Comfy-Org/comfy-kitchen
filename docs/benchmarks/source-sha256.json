@@ -1,0 +1,11 @@
+{
+  "baseline_commit": "19ea55b9ebdaf77942dab36223e1222009d3ce11",
+  "files": {
+    "comfy_kitchen/backends/cuda/CMakeLists.txt": "27a4833f1474e90e504d90e943ddaa2f51ad153b471bf6e39523457a0a39a32d",
+    "comfy_kitchen/backends/cuda/sage_attention/sage_attn_launcher.cu": "14104c2c30fc90a76f6a1272fc2dcad58062a4b36963d9fe9b308cc40fe1bc18",
+    "comfy_kitchen/backends/cuda/sage_attention/dense_tma_sm120.cu": "8afb9158b8e17d35b33b3d1f1dd1eddcfa0374f013507079250fa97d719fae4d",
+    "comfy_kitchen/backends/cuda/sage_attention/dense_tma_sm120.cuh": "3e0f7bc90f3fb61fcfc15e730b3d2b7872c9f5c8d06ca870817aedcaf288f093",
+    "comfy_kitchen/backends/cuda/sage_attention/dense_tma_sm120.h": "2318fc5f68c6817727a7cebfacb61021add43279ae6286f43682e29253216fa9",
+    "comfy_kitchen/backends/cuda/sage_attention/tma_pipeline.cuh": "e817c41c618fa165a7cb7f6c982357e7bd20f60d372b2d186b8cdfa88107ca1c"
+  }
+}
