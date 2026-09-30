@@ -45,7 +45,8 @@ def _sdpa_reference(q, k, v, scale):
     "shape", [(1, 8, 2, 8192, 8193), (2, 4, 2, 8197, 9217), (1, 4, 4, 8192, 8192)]
 )
 @pytest.mark.parametrize("scale", [None, 0.0, -(128**-0.5)])
-def test_tma_repeat_stream_graph(shape, scale, record_property):
+@pytest.mark.parametrize("layout", ["BHSD", "BSHD"])
+def test_tma_repeat_stream_graph(shape, scale, layout, record_property):
     if torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("SM120 required")
     b, h, hk, lq, lk = shape
@@ -54,23 +55,27 @@ def test_tma_repeat_stream_graph(shape, scale, record_property):
     k = torch.randn(b, hk, lk, 128, device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
     packed = ck.prequantize_int8_attention(q, k, v, scale=scale)
-    expected = ck.int8_attention_from_prequantized(packed)
+    expected = ck.int8_attention_from_prequantized(packed, output_layout=layout)
     reference = _sdpa_reference(q, k, v, scale)
+    if layout == "BSHD":
+        reference = reference.transpose(1, 2)
     assert torch.isfinite(reference).all()
     assert torch.isfinite(expected).all()
     nrmse = _nrmse(expected, reference)
     record_property("sdpa_nrmse", nrmse)
     assert nrmse < 0.03
     for _ in range(3):
-        assert torch.equal(ck.int8_attention_from_prequantized(packed), expected)
+        assert torch.equal(
+            ck.int8_attention_from_prequantized(packed, output_layout=layout), expected
+        )
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        actual = ck.int8_attention_from_prequantized(packed)
+        actual = ck.int8_attention_from_prequantized(packed, output_layout=layout)
     torch.cuda.current_stream().wait_stream(stream)
     assert torch.equal(actual, expected)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = ck.int8_attention_from_prequantized(packed)
+        captured = ck.int8_attention_from_prequantized(packed, output_layout=layout)
     graph.replay()
     assert torch.equal(captured, expected)

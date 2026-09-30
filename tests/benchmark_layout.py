@@ -6,7 +6,7 @@ from pathlib import Path
 
 import comfy_kitchen as ck
 
-r = Path.cwd()
+r = Path(__file__).resolve().parent.parent / "docs" / "benchmarks"
 report = {"torch": torch.__version__, "gpu": torch.cuda.get_device_name(), "cases": []}
 for h, n in [(8, 8192), (56, 14850), (56, 32700), (56, 87142), (56, 90461)]:
     torch.manual_seed(42)
