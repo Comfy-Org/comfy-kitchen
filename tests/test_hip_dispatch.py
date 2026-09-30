@@ -180,6 +180,47 @@ def test_hip_advertises_every_inplace_rope_entry():
         assert constraints[f"{functional}_"] is constraints[functional]
 
 
+@pytest.mark.parametrize(
+    ("wmma", "probe_answers", "expected"),
+    [
+        # A part with matrix cores has the fork's own GEMM, so the answer is known
+        # and torch._scaled_mm is never called.
+        (True, True, True),
+        (True, False, True),
+        # RDNA2 has neither, so the probe is the only thing left to ask. It cannot
+        # succeed there either, but that is PyTorch's call to make, not ours.
+        (False, True, True),
+        (False, False, False),
+    ],
+)
+def test_quantized_mm_gate_asks_the_wmma_gemms_first(monkeypatch, wmma, probe_answers, expected):
+    """The FP8/INT8 quantized-matmul gate must not reach torch._scaled_mm on a WMMA part.
+
+    native_scaled_mm_usable decides the question by running a 1x1 torch._scaled_mm,
+    which is the entry point that routes to hipBLASLt. On a matrix-core part the
+    fork's kernel already answers the gate, so the probe is both redundant and a
+    fall-through the kernel suite forbids:
+    test_no_hipblaslt_on_the_quantized_paths failed on gfx1103 while the 1x1 result
+    it produced was discarded a line later.
+    """
+    from comfy_kitchen.tensor import base as tensor_base
+
+    if not getattr(torch.version, "hip", None):
+        pytest.skip("requires a ROCm PyTorch runtime")
+
+    probed = []
+
+    def probe(device_type):
+        probed.append(device_type)
+        return probe_answers
+
+    monkeypatch.setattr(hip_backend, "has_wmma", lambda: wmma)
+    monkeypatch.setattr(tensor_base, "native_scaled_mm_usable", probe)
+
+    assert tensor_base.quantized_mm_has_fast_path("cuda") is expected
+    assert probed == ([] if wmma else ["cuda"])
+
+
 def _setup_namespace() -> dict:
     """Load setup.py definitions without executing its final setuptools.setup()."""
     path = _ROOT / "setup.py"

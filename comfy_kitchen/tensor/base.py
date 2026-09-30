@@ -136,7 +136,7 @@ def quantized_mm_has_fast_path(device_type: str) -> bool:
     """Whether a quantized matmul has anything faster than dequantize-and-matmul.
 
     Two things can serve one: PyTorch's own scaled/IMMA GEMM, and this fork's HIP
-    backend kernels. Either is enough, and both have to be asked for, because on
+    backend kernels. Either is enough, and neither can be assumed, because on
     ROCm the capability number is a gfx shape rather than an SM version (see
     :func:`native_scaled_mm_usable`), so a layout's ``MIN_SM_VERSION`` check alone
     passes on parts where neither exists.
@@ -146,13 +146,25 @@ def quantized_mm_has_fast_path(device_type: str) -> bool:
     genuinely has no fast path and has to fall back -- which is a decision that
     has to be made while dynamo is tracing, not by catching the op's failure
     afterwards.
+
+    The two are asked in that order for a reason that is not a preference. On a
+    WMMA part ``has_wmma`` settles the question by itself -- a part that has
+    matrix cores has a fast path whatever PyTorch thinks, and a part that has
+    none is RDNA2, where the probe would not succeed either -- so
+    :func:`native_scaled_mm_usable` is left to run only where its answer is the
+    only answer. That also keeps ``torch._scaled_mm`` off this path on every part
+    the WMMA kernels cover. The probe is a 1x1 capability check, not a matmul, but
+    it is still the entry point that reaches hipBLASLt, and
+    ``test_no_hipblaslt_on_the_quantized_paths`` fails on it (gfx1103 did, until
+    the two were swapped) while never being able to see that the 1x1 result was
+    discarded right after.
     """
     if device_type == "cuda" and getattr(torch.version, "hip", None) is not None:
-        if native_scaled_mm_usable(device_type):
-            return True
         from ..backends.hip import has_wmma
 
-        return has_wmma()
+        if has_wmma():
+            return True
+        return native_scaled_mm_usable(device_type)
     return True
 
 
