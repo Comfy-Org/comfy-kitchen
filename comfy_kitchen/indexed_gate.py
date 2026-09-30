@@ -125,3 +125,66 @@ def int8_gemm_indexed_gate(a, b, x_scale, w_scale, gate, row_indices, residual):
     Inference only; an opaque custom op supports torch.compile and CUDA Graphs.
     """
     return _op(a, b, x_scale, w_scale, gate, row_indices, residual)
+
+
+def _validate_linear(x, weight, weight_scale, gate, row_indices, residual, input_act):
+    if x.ndim != 2 or x.dtype != torch.bfloat16:
+        raise ValueError("x must be a BF16 matrix")
+    if input_act not in (None, "swiglu"):
+        raise ValueError("input_act must be None or swiglu")
+    k = x.shape[1] // (2 if input_act == "swiglu" else 1)
+    if k == 0 or k % 256 or k > 131071 or x.shape[1] != k * (2 if input_act == "swiglu" else 1):
+        raise ValueError("activated K must be positive and divisible by 256")
+    if x.requires_grad:
+        raise ValueError("int8_linear_indexed_gate is inference-only")
+    if weight.ndim != 2 or weight.shape[1] != k or weight.dtype != torch.int8:
+        raise ValueError("weight must be INT8 [N,K]")
+    m, n = x.shape[0], weight.shape[0]
+    if weight_scale.dtype != torch.float32 or weight_scale.shape != (n,):
+        raise ValueError("weight_scale must be FP32 [N]")
+    if gate.ndim != 2 or gate.shape[1] != n or residual.shape != (m, n):
+        raise ValueError("gate must be [G,N] and residual [M,N]")
+    if gate.dtype != torch.bfloat16 or residual.dtype != torch.bfloat16:
+        raise ValueError("gate and residual must be BF16")
+    if row_indices.dtype != torch.int32 or row_indices.shape != (m,):
+        raise ValueError("row_indices must be INT32 [M]")
+    if any(t.device != x.device for t in (weight, weight_scale, gate, row_indices, residual)):
+        raise ValueError("all tensors must share a device")
+    if any(t.requires_grad for t in (weight_scale, gate, residual)):
+        raise ValueError("int8_linear_indexed_gate is inference-only")
+
+
+@torch.library.custom_op("comfy_kitchen::int8_linear_indexed_gate", mutates_args=())
+def int8_linear_indexed_gate(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    gate: torch.Tensor,
+    row_indices: torch.Tensor,
+    residual: torch.Tensor,
+    input_act: str | None = None,
+) -> torch.Tensor:
+    """ConvRot256 INT8 linear followed by an indexed BF16 gate and residual.
+
+    No bias; x is BF16 [M,K] (or [M,2K] for ``input_act="swiglu"``).
+    Weight is an already ConvRot-quantized INT8 [N,K] matrix. The optional
+    SwiGLU retains the BF16 SiLU and product roundings of ``int8_linear``.
+    """
+    from .backends import cuda
+    from . import int8_linear
+
+    _validate_linear(x, weight, weight_scale, gate, row_indices, residual, input_act)
+    if x.is_cuda and not torch.version.hip and cuda._C is not None:
+        q, qs = cuda.quantize_int8_rowwise_convrot64(x.contiguous(), 256, input_act=input_act)
+    else:
+        branch = int8_linear(x, weight, weight_scale, convrot=True, input_act=input_act)
+        return torch.addcmul(residual, branch, _gather_gate(gate, row_indices)).contiguous()
+    return int8_gemm_indexed_gate(
+        q, weight, qs.reshape(-1, 1), weight_scale, gate, row_indices, residual
+    )
+
+
+@int8_linear_indexed_gate.register_fake
+def _linear_fake(x, weight, weight_scale, gate, row_indices, residual, input_act=None):
+    _validate_linear(x, weight, weight_scale, gate, row_indices, residual, input_act)
+    return residual.new_empty(residual.shape)
