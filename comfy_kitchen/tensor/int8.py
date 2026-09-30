@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import torch
 
+from comfy_kitchen.exceptions import NoCapableBackendError
 from comfy_kitchen.registry import registry
 
 from .base import (
@@ -34,13 +35,25 @@ _INT8_DEQUANT_DTYPE_TO_CODE = {
 
 
 def _dtype_code(dtype: torch.dtype) -> int:
-    if dtype == torch.float32:
-        return 0
-    if dtype == torch.float16:
-        return 1
-    if dtype == torch.bfloat16:
-        return 2
-    raise ValueError(f"Unsupported INT8 output dtype: {dtype}")
+    try:
+        return _INT8_DEQUANT_DTYPE_TO_CODE[dtype]
+    except KeyError:
+        raise ValueError(f"Unsupported INT8 output dtype: {dtype}") from None
+
+
+def _has_native_fusion(func_name: str, kwargs: dict) -> bool:
+    """Whether ``func_name`` would dispatch to a native kernel for ``kwargs``.
+
+    The eager fused ops only re-compose the unfused ops, so without a native
+    kernel the caller's unfused path is at least as fast. An explicit backend
+    override (e.g. ``use_backend("eager")`` in tests) is honored.
+    """
+    if getattr(registry._thread_local, "backend_override", None) is not None:
+        return True
+    try:
+        return registry.get_capable_backend(func_name, kwargs) != "eager"
+    except NoCapableBackendError:
+        return False
 
 
 class TensorWiseINT8Layout(QuantizedLayout):
@@ -75,12 +88,8 @@ class TensorWiseINT8Layout(QuantizedLayout):
         convrot: bool = False
         convrot_groupsize: int = 256
         transposed: bool = False
-
         def _tensor_fields(self) -> list[str]:
             return ["scale"]
-
-        def _validate_tensor_fields(self):
-            pass
 
     @classmethod
     def quantize(
@@ -201,6 +210,141 @@ class TensorWiseINT8Layout(QuantizedLayout):
             Tuple of (quantized_data, scale).
         """
         return qtensor._qdata, qtensor._params.scale
+
+    @classmethod
+    def _fusion_operand(cls, weight: QuantizedTensor):
+        """Resolve row-major storage needed by compound INT8 operations."""
+        if not isinstance(weight, QuantizedTensor) or weight._layout_cls != cls.__name__:
+            return None
+        params = weight._params
+        if getattr(params, "transposed", False):
+            return None
+        return (
+            weight._qdata.contiguous(),
+            params.scale,
+            bool(getattr(params, "convrot", False)),
+            int(getattr(params, "convrot_groupsize", 256)),
+        )
+
+    @classmethod
+    def _fusion_operands(cls, weights):
+        """Resolve a compatible group of projections or return ``None``."""
+        operands = tuple(
+            cls._fusion_operand(weight) for weight in weights
+        )
+        if any(operand is None for operand in operands):
+            return None
+        qdata, _, convrot, group_size = operands[0]
+        if any(
+            operand[2:4] != (convrot, group_size)
+            or operand[0].shape != qdata.shape
+            for operand in operands[1:]
+        ):
+            return None
+        return operands
+
+    @classmethod
+    def fused_rms_modulated(
+        cls,
+        x: torch.Tensor,
+        weight: QuantizedTensor,
+        bias: torch.Tensor | None,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+        modulation_scale: torch.Tensor,
+    ):
+        # The fused kernels apply one modulation row to every token; a batched
+        # (e.g. CFG, B > 1) modulation falls back to the unfused composition.
+        width = x.shape[-1]
+        if modulation_scale.numel() != width or norm_weight.numel() != width:
+            return NotImplemented
+        operand = cls._fusion_operand(weight)
+        if operand is None:
+            return NotImplemented
+        qdata, scale, convrot, group_size = operand
+        if not _has_native_fusion("int8_linear_rms_modulated", {
+            "x": x, "norm_weight": norm_weight,
+            "modulation_scale": modulation_scale, "weight": qdata,
+            "out_dtype": x.dtype,
+        }):
+            return NotImplemented
+        from comfy_kitchen import int8_linear_rms_modulated
+
+        return int8_linear_rms_modulated(
+            x, norm_weight, norm_eps, modulation_scale, qdata, scale,
+            bias, x.dtype, convrot=convrot,
+            convrot_groupsize=group_size,
+        )
+
+    @classmethod
+    def fused_swiglu_ffn(
+        cls,
+        x: torch.Tensor,
+        gate_weight: QuantizedTensor,
+        up_weight: QuantizedTensor,
+        down_weight: QuantizedTensor,
+        gate_bias: torch.Tensor | None,
+        up_bias: torch.Tensor | None,
+        down_bias: torch.Tensor | None,
+        *,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+        modulation_scale: torch.Tensor | None = None,
+    ):
+        # Modulation is only fused together with the RMSNorm, and only as one
+        # row shared by every token (see fused_rms_modulated).
+        width = x.shape[-1]
+        if (norm_weight is None) != (modulation_scale is None):
+            return NotImplemented
+        if norm_weight is not None and (
+            norm_weight.numel() != width or modulation_scale.numel() != width
+        ):
+            return NotImplemented
+        pair = cls._fusion_operands((gate_weight, up_weight))
+        down = cls._fusion_operand(down_weight)
+        if pair is None or down is None:
+            return NotImplemented
+        first, second = pair
+        qgate, gate_scale, convrot, group_size = first
+        qup, up_scale, _, _ = second
+        pair_op = (
+            "int8_linear_pair" if norm_weight is None
+            else "int8_linear_pair_rms_modulated"
+        )
+        if not (
+            _has_native_fusion(pair_op, {
+                "x": x, "norm_weight": norm_weight,
+                "modulation_scale": modulation_scale,
+                "weight0": qgate, "weight1": qup, "out_dtype": x.dtype,
+            })
+            and _has_native_fusion("int8_linear_swiglu_split", {
+                "weight": down[0], "out_dtype": x.dtype,
+            })
+        ):
+            return NotImplemented
+        if norm_weight is None:
+            from comfy_kitchen import int8_linear_pair
+
+            gate, up = int8_linear_pair(
+                x, qgate, qup, gate_scale, up_scale, gate_bias, up_bias,
+                x.dtype, convrot=convrot, convrot_groupsize=group_size,
+            )
+        else:
+            from comfy_kitchen import int8_linear_pair_rms_modulated
+
+            gate, up = int8_linear_pair_rms_modulated(
+                x, norm_weight, norm_eps, modulation_scale,
+                qgate, qup, gate_scale, up_scale, gate_bias, up_bias,
+                x.dtype, convrot=convrot, convrot_groupsize=group_size,
+            )
+
+        qdown, down_scale, down_convrot, down_group = down
+        from comfy_kitchen import int8_linear_swiglu_split
+
+        return int8_linear_swiglu_split(
+            gate, up, qdown, down_scale, down_bias, gate.dtype,
+            convrot=down_convrot, convrot_groupsize=down_group,
+        )
 
     @classmethod
     def state_dict_tensors(cls, qdata: torch.Tensor, params: Params) -> dict[str, torch.Tensor]:

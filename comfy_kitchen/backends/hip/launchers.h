@@ -38,6 +38,27 @@ void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* 
                              int bias_code, int M, int N, int K, int ldc, int out_code,
                              hipStream_t stream);
 
+// Two equal-width row-major GEMMs sharing activation staging.
+void launch_int8_gemm_pair_kernel(
+    const void* a, const void* b0, const void* b1, void* c0, void* c1,
+    const void* scale_a, const void* scale_b0, int scale_b_stride0,
+    const void* scale_b1, int scale_b_stride1, const void* bias0,
+    int bias_code0, const void* bias1, int bias_code1, int M, int N, int K,
+    int ldc, int out_code, hipStream_t stream);
+
+// A is physically [M_tile, K_tile, 128, 128]; B is row-major.
+void launch_int8_gemm_a_tiled128_down_kernel(
+    const void* a, const void* b, void* c, const void* scale_a,
+    const void* scale_b, int scale_b_stride, const void* bias,
+    int bias_code, int M, int N, int K, int ldc, int out_code,
+    hipStream_t stream);
+
+// Exact BF16 RMSNorm followed by gate multiplication and residual add.
+void launch_rms_gated_residual_bf16_kernel(
+    const void* activation, const void* norm_weight, const void* residual,
+    const void* gate, void* output, int rows, int width, float eps,
+    hipStream_t stream);
+
 // scale_code is a DTYPE_TO_CODE value: 0 float32, 5 e4m3 (passed as raw bytes).
 // codebook is 16 floats, or null for the uniform levels. bits is 4 or 6.
 void launch_dequant_int4_grouped_to_int8_kernel(const void* qw, const void* s_rel, int scale_code,

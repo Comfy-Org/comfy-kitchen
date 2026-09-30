@@ -391,6 +391,31 @@ class TestTensorWiseINT8Layout:
         assert sd[""].dtype == torch.int8
         assert sd["_scale"].numel() == 1
 
+    @pytest.mark.parametrize(("n", "k"), [(128, 1024), (512, 1024), (11520, 3840)])
+    def test_linear_never_relayouts_weight_storage(self, seed, n, k):
+        """Dynamic VRAM owns the weight buffer: linear must read it in place."""
+        import comfy_kitchen as ck
+        from comfy_kitchen.tensor import QuantizedTensor, TensorWiseINT8Layout
+
+        x = torch.randn(512, k, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(
+            w, "TensorWiseINT8Layout", per_channel=True
+        )
+        row_major, scale = TensorWiseINT8Layout.get_plain_tensors(qt)
+        ptr = qt._qdata.data_ptr()
+        snapshot = qt._qdata.clone()
+
+        with torch.inference_mode():
+            reference = ck.int8_linear(
+                x, row_major.clone(), scale, out_dtype=x.dtype
+            )
+            candidate = torch.nn.functional.linear(x, qt)
+
+        assert torch.equal(candidate, reference)
+        assert qt._qdata.data_ptr() == ptr
+        assert torch.equal(qt._qdata, snapshot)
+
     def test_supports_fast_matmul(self):
         """supports_fast_matmul returns True on CUDA SM >= 7.5."""
         from comfy_kitchen.tensor import TensorWiseINT8Layout
@@ -943,3 +968,76 @@ class TestTensorWisePublicAPI:
 
         assert out.shape == (17, 1)
         assert out.dtype == torch.bfloat16
+
+
+def test_fused_int8_methods_decline_batched_modulation():
+    """A per-sample (B > 1) modulation falls back to the unfused composition."""
+    width = 256
+    x = torch.randn(2, 4, width, dtype=torch.bfloat16)
+    norm_weight = torch.ones(width, dtype=torch.bfloat16)
+    modulation_scale = torch.zeros(2, width, dtype=torch.bfloat16)
+
+    # The shape checks run before any weight is inspected.
+    assert (
+        TensorWiseINT8Layout.fused_rms_modulated(
+            x, None, None, norm_weight, 1.0e-6, modulation_scale
+        )
+        is NotImplemented
+    )
+    assert (
+        TensorWiseINT8Layout.fused_swiglu_ffn(
+            x, None, None, None, None, None, None,
+            norm_weight=norm_weight, norm_eps=1.0e-6,
+            modulation_scale=modulation_scale,
+        )
+        is NotImplemented
+    )
+    # Modulation is only fused together with the RMSNorm.
+    assert (
+        TensorWiseINT8Layout.fused_swiglu_ffn(
+            x, None, None, None, None, None, None,
+            modulation_scale=modulation_scale[:1],
+        )
+        is NotImplemented
+    )
+
+
+def test_fused_int8_methods_decline_without_native_backend():
+    """Without a native kernel the fused methods leave the unfused path to the caller."""
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    torch.manual_seed(0)
+    width, hidden = 256, 512
+    x = torch.randn(1, 4, width, dtype=torch.bfloat16)
+    norm_weight = torch.rand(width, dtype=torch.bfloat16) + 0.5
+    modulation_scale = torch.randn(1, width, dtype=torch.bfloat16) * 0.25
+
+    def weight(n, k):
+        return QuantizedTensor.from_float(
+            torch.randn(n, k, dtype=torch.bfloat16), "TensorWiseINT8Layout",
+            per_channel=True, convrot=True, convrot_groupsize=256,
+        )
+
+    qkv = weight(3 * width, width)
+    ffn = (weight(hidden, width), weight(hidden, width), weight(width, hidden))
+
+    # CPU tensors only match the eager backend.
+    assert TensorWiseINT8Layout.fused_rms_modulated(
+        x, qkv, None, norm_weight, 1.0e-6, modulation_scale
+    ) is NotImplemented
+    assert TensorWiseINT8Layout.fused_swiglu_ffn(
+        x, *ffn, None, None, None,
+        norm_weight=norm_weight, norm_eps=1.0e-6,
+        modulation_scale=modulation_scale,
+    ) is NotImplemented
+    assert TensorWiseINT8Layout.fused_swiglu_ffn(
+        x, *ffn, None, None, None
+    ) is NotImplemented
+
+    # An explicit eager override still runs the reference composition.
+    with ck.use_backend("eager"):
+        out = TensorWiseINT8Layout.fused_rms_modulated(
+            x, qkv, None, norm_weight, 1.0e-6, modulation_scale
+        )
+    assert out is not NotImplemented
+    assert out.shape == (1, 4, 3 * width)

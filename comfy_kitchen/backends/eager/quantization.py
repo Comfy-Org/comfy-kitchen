@@ -1081,6 +1081,156 @@ def int8_linear(
     return _apply_residual(result, residual, residual_scale)
 
 
+def _modulate_int8_input(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Materialize the portable batch-one modulation contract once."""
+    k = x.shape[-1]
+    if scale.numel() != k:
+        raise ValueError(
+            f"modulation_scale must contain one batch-one row of {k} values, "
+            f"got {scale.numel()}"
+        )
+    shape = (1,) * (x.ndim - 1) + (k,)
+    return x * (1.0 + scale.reshape(shape))
+
+
+def int8_linear_pair(
+    x: torch.Tensor,
+    weight0: torch.Tensor,
+    weight1: torch.Tensor,
+    weight_scale0: torch.Tensor,
+    weight_scale1: torch.Tensor,
+    bias0: torch.Tensor | None = None,
+    bias1: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Portable reference for two equal-width INT8 projections."""
+    if weight0.shape != weight1.shape:
+        raise ValueError(
+            f"paired INT8 weights must have the same shape, got "
+            f"{tuple(weight0.shape)} and {tuple(weight1.shape)}"
+        )
+    return tuple(
+        int8_linear(
+            x, weight, scale, bias, out_dtype, convrot, convrot_groupsize
+        )
+        for weight, scale, bias in (
+            (weight0, weight_scale0, bias0), (weight1, weight_scale1, bias1)
+        )
+    )
+
+
+def int8_linear_modulated(
+    x: torch.Tensor,
+    modulation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """Portable batch-one modulation reference for an INT8 projection."""
+    return int8_linear(
+        _modulate_int8_input(x, modulation_scale),
+        weight, weight_scale, bias, out_dtype,
+        convrot, convrot_groupsize,
+    )
+
+
+def int8_linear_rms_modulated(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    modulation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """Portable RMSNorm plus batch-one modulation reference."""
+    normalized = torch.nn.functional.rms_norm(
+        x, (x.shape[-1],), norm_weight, norm_eps
+    )
+    return int8_linear_modulated(
+        normalized, modulation_scale, weight, weight_scale, bias, out_dtype,
+        convrot, convrot_groupsize,
+    )
+
+
+def int8_linear_pair_modulated(
+    x: torch.Tensor,
+    modulation_scale: torch.Tensor,
+    weight0: torch.Tensor,
+    weight1: torch.Tensor,
+    weight_scale0: torch.Tensor,
+    weight_scale1: torch.Tensor,
+    bias0: torch.Tensor | None = None,
+    bias1: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Portable batch-one modulation reference for paired projections."""
+    return int8_linear_pair(
+        _modulate_int8_input(x, modulation_scale),
+        weight0, weight1, weight_scale0, weight_scale1,
+        bias0, bias1, out_dtype, convrot, convrot_groupsize,
+    )
+
+
+def int8_linear_pair_rms_modulated(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    modulation_scale: torch.Tensor,
+    weight0: torch.Tensor,
+    weight1: torch.Tensor,
+    weight_scale0: torch.Tensor,
+    weight_scale1: torch.Tensor,
+    bias0: torch.Tensor | None = None,
+    bias1: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Portable paired RMSNorm plus batch-one modulation reference."""
+    normalized = torch.nn.functional.rms_norm(
+        x, (x.shape[-1],), norm_weight, norm_eps
+    )
+    return int8_linear_pair_modulated(
+        normalized, modulation_scale, weight0, weight1,
+        weight_scale0, weight_scale1, bias0, bias1, out_dtype,
+        convrot, convrot_groupsize,
+    )
+
+
+def int8_linear_swiglu_split(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """Portable reference for a down projection consuming split SwiGLU inputs."""
+    if gate.shape != up.shape:
+        raise ValueError(
+            f"split SwiGLU inputs must have the same shape, got "
+            f"{tuple(gate.shape)} and {tuple(up.shape)}"
+        )
+    activated = torch.nn.functional.silu(gate) * up
+    return int8_linear(
+        activated, weight, weight_scale, bias, out_dtype,
+        convrot, convrot_groupsize,
+    )
+
+
 # =============================================================================
 # torch.library Custom Op Definitions — INT8 Tensor-wise
 # =============================================================================
