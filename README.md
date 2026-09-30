@@ -171,6 +171,13 @@ fp32 FMAs on `gfx90c`. At M=4096, N=K=3072 this measured:
 | `gfx1010` | 0.69 → 4.7 TOPS | 0.22 → 5.2 TOPS | 0.63 → 4.7 TOPS | 2.0 TFLOPS |
 | `gfx90c`  | 0.10 → 0.80 TOPS | 0.03 → 0.76 TOPS | 0.15 → 0.87 TOPS | 0.34 TFLOPS |
 
+On `gfx1010`, batches of 48 rows or fewer are packed into 16- or 32-row tiles
+instead of a mostly empty 64-row one, and K is split across blocks (interleaved
+256-byte grains, reduced in a fixed order, so results stay deterministic) when
+that leaves too few blocks to fill the GPU. At N=K=3072 this took M=16 from
+0.79 / 0.90 / 0.72 to 1.70 / 1.68 / 1.45 TOPS (int8 / fp8 / int4) and M=32 from
+1.50 / 1.74 / 1.37 to 2.46 / 2.67 / 2.04.
+
 The other pre-WMMA targets keep the software tile, since the kernel is only
 enabled where it has been measured and validated.
 
