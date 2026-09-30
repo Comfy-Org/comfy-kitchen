@@ -103,3 +103,22 @@ def test_invalid_rank():
     args[0] = args[0].flatten()
     with pytest.raises(ValueError, match="matrix"):
         _op(*args, 1e-5)
+
+
+def test_declined_native_releases_scratch(monkeypatch):
+    from comfy_kitchen import h3_qkv
+    from comfy_kitchen.backends import cuda
+
+    if torch.cuda.get_device_capability() != (12, 0) or cuda._C is None:
+        pytest.skip("SM120 extension required")
+    args = operands(8193)
+    before = torch.cuda.memory_allocated()
+    fallback = h3_qkv._fallback
+
+    def check(*a):
+        assert torch.cuda.memory_allocated() == before
+        return fallback(*a)
+
+    monkeypatch.setattr(cuda._C, "h3_qkv_quant", lambda *a: False)
+    monkeypatch.setattr(h3_qkv, "_fallback", check)
+    h3_qkv._op(*args, 1e-5)

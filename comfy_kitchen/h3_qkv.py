@@ -130,6 +130,10 @@ def _op(
             )
         if used:
             return qi, ki, vi, qs, ks, vs
+        # A no-CUTLASS build declines before launching. Do not retain scratch
+        # and unused result buffers while executing the fallback.
+        del tensors, qi, ki, vi, qs, ks, vs, partial, anchors
+        del sample_q, sample_scale, sample_rope, sample_out, projected, inverse
     return _fallback(*inputs, eps)
 
 
