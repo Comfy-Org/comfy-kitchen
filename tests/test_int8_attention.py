@@ -17,9 +17,10 @@ requires_int8_attention = pytest.mark.skipif(
 
 # RDNA2 (gfx103x) has no matrix cores, so it runs the ported SageAttention
 # RDNA2 kernel rather than the WMMA/CUDA implementation most of these tests
-# describe. The port covers only head_dim 64 and 128, takes no mask, and has no
-# prequantized packed layout, so the tests that pin WMMA-specific shapes,
-# scratch allocation, or masks must skip there.
+# describe. The port covers only head_dim 64 and 128, and has no packed
+# snapshot, so the tests that pin WMMA-specific shapes, scratch allocation, or
+# packed layouts must skip there. Masks it handles, in every representation the
+# shared producers build.
 def _uses_gfx1035_port() -> bool:
     return bool(
         getattr(torch.version, "hip", None)
@@ -33,6 +34,29 @@ skip_on_gfx1035_port = pytest.mark.skipif(
     GFX1035_PORT,
     reason="WMMA/CUDA-specific behaviour; RDNA2 uses the ported SageAttention kernel",
 )
+
+
+def _head_dims(head_dims):
+    """``head_dims`` minus the ones the RDNA2 port cannot instantiate.
+
+    The ported kernel holds its P*V accumulator in registers: one float per
+    (row, head-dim) pair the thread owns, i.e. ``acc[TM][HD / TM]`` in
+    ``attn_kernel_i8q_f16pv_tiled_pv``. That is exactly ``HD`` registers per
+    thread, because the tile has as many threads as it has query rows. gfx103x
+    has 256 VGPRs per lane, so HD=128 already spends half the file and HD=256 --
+    the next tile the shared code pads up to -- would spend all of it on the
+    accumulator alone, with nothing left for Q, the scores, or the staging
+    addresses. It is a register-file limit rather than a missing feature, and
+    the matrix-core and CUDA paths have no such constraint.
+
+    Every head_dim at or below 128 still runs: the shared code pads anything
+    narrower up to 64 or 128, and a zero-padded lane contributes nothing to the
+    Q.K dot product. On every other platform this filter is a no-op, so the
+    parametrization stays identical there.
+    """
+    if not GFX1035_PORT:
+        return list(head_dims)
+    return [head_dim for head_dim in head_dims if head_dim <= 128]
 
 def _qkv(batch, q_heads, kv_heads, q_length, kv_length, head_dim, dtype=torch.bfloat16):
     q = torch.randn(batch, q_length, q_heads, head_dim, device="cuda", dtype=dtype).transpose(1, 2)
@@ -146,7 +170,7 @@ def test_int8_attention_allocates_only_integer_8bit_scratch(monkeypatch):
 @requires_int8_attention
 @skip_on_gfx1035_port
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("head_dim", [1, 64, 96, 128, 192, 256])
+@pytest.mark.parametrize("head_dim", _head_dims([1, 64, 96, 128, 192, 256]))
 def test_int8_attention_matches_sdpa(dtype, head_dim):
     q, k, v = _qkv(1, 8, 8, 257, 257, head_dim, dtype)
     assert not q.is_contiguous()
@@ -219,7 +243,7 @@ def test_int8_attention_batch_two_direct_and_prequantized(masked):
 
 @requires_int8_attention
 @skip_on_gfx1035_port
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float16, torch.bfloat16])
 def test_int8_attention_mask_gqa_broadcast_and_fully_masked_row(head_dim, mask_dtype):
     q, k, v = _qkv(1, 8, 2, 193, 257, head_dim)
@@ -335,7 +359,7 @@ def test_int8_attention_unprepared_mask_zeroes_fully_masked_rows(mask_dtype, kv_
 
 @requires_int8_attention
 @skip_on_gfx1035_port
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("key_only", [False, True])
 def test_int8_attention_long_masked_sequence(head_dim, mask_dtype, key_only):
@@ -619,7 +643,7 @@ def test_int8_attention_accepts_dlpack_normalized_batch_stride():
 @requires_int8_attention
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("bias_kind", ["fade", "constant_tiles", "fully_masked"])
-@pytest.mark.parametrize("head_dim", [32, 64, 96, 128, 160, 256])
+@pytest.mark.parametrize("head_dim", _head_dims([32, 64, 96, 128, 160, 256]))
 def test_int8_attention_prepared_key_bias(dtype, bias_kind, head_dim):
     torch.manual_seed(178)
     q, k, v = _qkv(2, 4, 2, 129, 33601, head_dim, dtype)
@@ -661,7 +685,7 @@ def test_int8_attention_prepared_key_bias(dtype, bias_kind, head_dim):
 
 
 @requires_int8_attention
-@pytest.mark.parametrize("head_dim", range(1, 257))
+@pytest.mark.parametrize("head_dim", _head_dims(range(1, 257)))
 def test_int8_attention_prepared_mask_all_head_dimensions(head_dim):
     torch.manual_seed(179)
     q, k, v = _qkv(2, 4, 2, 137, 1153, head_dim)
@@ -743,7 +767,7 @@ def test_int8_attention_prepared_mask_releases_original():
 
 
 @requires_int8_attention
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
 @pytest.mark.parametrize("mask_shape", [(2, 1), (1, 4), (2, 4)])
 def test_int8_attention_prepared_bias_batch_head_strides(head_dim, mask_shape):
     """Compact batch/head rows must keep independent tile biases and empty rows."""
@@ -831,7 +855,7 @@ def test_hip_short_key_mask_matches_prequantized_snapshot(
 
 @requires_int8_attention
 @pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("scale", [0.0, -0.125, 0.125, 1e-10])
 @pytest.mark.parametrize("mask_shape", [(1, 1), (2, 1), (1, 4), (2, 4)])
@@ -911,7 +935,7 @@ def test_hip_dense_16_preparation_preserves_finite_bits(mask_dtype, strided):
 
 @requires_int8_attention
 @pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("mask_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("scale", [0.0, -0.125, 0.125, 1e-10])
@@ -949,7 +973,7 @@ def test_hip_dense_16_accuracy_and_snapshot(
 
 @requires_int8_attention
 @pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("mask_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("scale", [0.0, -0.125, 0.125])
@@ -975,6 +999,14 @@ def test_hip_dense_16_preserves_constant_values(head_dim, dtype, mask_dtype, sca
 @pytest.mark.parametrize("mask_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("lengths", [(2, 65), (256, 2048)])
 @pytest.mark.parametrize("mask_shape", [(1, 1), (2, 1), (1, 4), (2, 4)])
+# The RDNA2 port never packs a query-varying mask, so there is no separate
+# preparation pass for this to fuse: its kernel reads the caller's [B,H,Q,K] mask
+# in place, through the strides it was handed. That is a strictly better answer
+# than the WMMA fused path, which still has to permute the mask into a packed tile
+# for the MMA fragment layout and can only hide the extra launch. Packing itself
+# is still exercised on the port, on the snapshot side of this same comparison,
+# through prequantize_int8_attention.
+@skip_on_gfx1035_port
 def test_hip_fused_dense_mask_matches_snapshot(
     head_dim, dtype, mask_dtype, lengths, mask_shape, monkeypatch
 ):
@@ -1141,6 +1173,12 @@ def test_hip_prepare_key_mask_rejects_invalid_buffers(invalid):
 
 @requires_int8_attention
 @pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
+# This drives hip.sage_int8_attend, the WMMA binding, whose packed V is a 2D
+# int8 buffer. The RDNA2 port's snapshot keeps V as the 4D fp16 tensor its
+# kernel reads natively, so the binding rejects the snapshot's V shape before
+# it ever looks at the mask. The port validates a prepared mask in its own op
+# (rank, contiguity, and tile coverage, in attn_gfx103x.hip).
+@skip_on_gfx1035_port
 @pytest.mark.parametrize("invalid", ["dtype", "width", "stride", "heads", "cpu"])
 def test_hip_attention_rejects_invalid_prepared_mask(invalid):
     q, k, v = _qkv(1, 4, 2, 129, 1153, 128)
@@ -1193,7 +1231,7 @@ def _expected_use_direct(is_igpu, head_dim, q_length, kv_length, masked, dtype_o
 
 
 @requires_int8_attention
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
 @pytest.mark.parametrize(
     "q_length,kv_length",
     [

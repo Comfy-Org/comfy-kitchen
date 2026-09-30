@@ -8,6 +8,12 @@
 using torch::stable::Tensor;
 
 // gfx103x (RDNA2) int8 attention kernels 的 host 分发入口 (由 pybind 映射到 op)
+//
+// mask_mode / mask_dtype / mask select the attention mask representation; see
+// sageattn_gfx10::Gfx10Mask in mma_gfx10.h. mask_mode 0 means "no mask" and mask
+// is then ignored. The prepared modes read the same buffers the main HIP
+// backend's sage_prepare_key_mask / sage_prepare_dense_mask produce, so a mask
+// snapshot is portable between the two backends.
 Tensor qk_int8_sv_bf16_attn_gfx103x_t(
     Tensor query,
     Tensor key,
@@ -19,7 +25,10 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
     int64_t tensor_layout,
     int64_t is_causal,
     double sm_scale,
-    Tensor q_fp);
+    Tensor q_fp,
+    int64_t mask_mode,
+    int64_t mask_dtype,
+    Tensor mask);
 
 // A std::tuple, not a std::vector: this is declared as `-> (Tensor, Tensor,
 // Tensor, Tensor)` rather than `-> Tensor[]` because the stable ABI's TensorList

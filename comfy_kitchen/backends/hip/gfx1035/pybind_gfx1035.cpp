@@ -31,7 +31,8 @@ STABLE_TORCH_LIBRARY(comfy_kitchen_qattn_gfx1035, m) {
     m.def("qk_int8_sv_bf16_attn_t("
             "Tensor query, Tensor key, Tensor value, Tensor(a!) output, "
             "Tensor q_scale, Tensor k_scale, Tensor v_scale, int tensor_layout, "
-            "int is_causal, float sm_scale, Tensor q_fp"
+            "int is_causal, float sm_scale, Tensor q_fp, int mask_mode, int mask_dtype, "
+            "Tensor mask"
           ") -> Tensor");
     m.def("quant_qk_int8("
             "Tensor query, Tensor key, Tensor key_mean, int tensor_layout, "

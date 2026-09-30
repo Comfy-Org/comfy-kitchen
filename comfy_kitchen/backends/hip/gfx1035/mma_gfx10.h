@@ -56,7 +56,224 @@ template <typename ODT> __device__ __forceinline__ ODT gfx10_out_convert(float v
 template <> __device__ __forceinline__ __half gfx10_out_convert<__half>(float v) { return __float2half_rn(v); }
 template <> __device__ __forceinline__ __hip_bfloat16 gfx10_out_convert<__hip_bfloat16>(float v) { return __float2bfloat16(v); }
 
-template <int HD, bool ISC, int BN, int BM, typename ODT, int TM = 2, bool INQ = false>
+// ---------------------------------------------------------------------------
+// Attention masks
+//
+// RDNA2 has no matrix cores, so the mask support the WMMA port gets from the MMA
+// fragment layout has to be expressed differently here. The *representations*
+// are shared with the WMMA backend on purpose: the same sage_prepare_key_mask /
+// sage_prepare_dense_mask producers fill them, and comfy_kitchen/sage_attention.py
+// picks which one to build. That is what lets a prepared mask be a device-side
+// snapshot which survives the float inputs going away, and it keeps the two
+// backends reading one layout instead of two.
+//
+// Every representation answers the same two questions for one (query, key) pair:
+// is this key kept, and what bias (in the base-two softmax domain) does it add?
+// A dropped key contributes nothing at all -- the caller never evaluates exp2 on
+// its score -- so the sentinel the producer stored for it is never used as a
+// number. That removes the -3e38/NaN bookkeeping the WMMA kernels need and makes
+// a fully masked row fall out as an exact zero, with no separate validity flag.
+//
+// The dense layouts pack a 16-query by 64-key tile into 1024 slots, or into 32
+// words of 32 keep bits for the Boolean form. Both use the WMMA accumulator's key
+// order, which the RDNA2 kernel need not reproduce but can read, because the
+// permutation is a pure function of the two tile-local coordinates:
+//
+//   dense value slot = q_local * 8 + (k % 8) + ((k / 8 % 2) << 7) + (k / 16 << 8)
+//   dense keep word  = q_local + 16 * (k / 8 % 2), bit (k / 16) * 8 + (k % 8)
+//
+// tests/test_int8_attention.py decodes the 16-bit buffer element by element
+// against the shared producer, so these two formulas are pinned from Python.
+// ---------------------------------------------------------------------------
+// The numeric values are the ones sage_attention.py and the WMMA backend's
+// MaskMode already use, so one host-side "mode" selects the same representation
+// on both backends. Plain ints, not an enum class: the mode is a template
+// argument, and `if constexpr` on an enum-typed parameter from another
+// translation unit's point of view is needlessly awkward for no benefit.
+namespace MaskMode {
+constexpr int kNone = 0;
+constexpr int kRaw = 2;
+constexpr int kPreparedKey = 4;
+constexpr int kPreparedDense = 5;
+constexpr int kPreparedDenseBool = 7;
+constexpr int kPreparedDenseBF16 = 8;
+constexpr int kPreparedDenseF16 = 9;
+}  // namespace MaskMode
+
+// The producer's tiles, not this kernel's BN: 64 keys everywhere and 16 queries
+// for the dense layouts, so one mask is readable by both backends.
+constexpr int kGfx10TileK = 64;
+constexpr int kGfx10TileQ = 16;
+constexpr int kGfx10DenseSlot = 1024;
+constexpr int kGfx10BoolWord = 32;
+
+// Stand-in for a dropped key's score. It only ever reaches fmaxf, so the exact
+// value is irrelevant as long as it is finite and below every real score;
+// -3.0e38f is what the unmasked path already used for out-of-range keys.
+constexpr float kGfx10MaskedScore = -3.0e38f;
+
+// -ffast-math implies -ffinite-math-only, which lets the optimizer conclude that
+// a float-typed value is finite and delete the branch that tests it. That is
+// exactly the test that decides "this bias drops the key", so it always runs on
+// the raw bits and never on a float. Same rule as mask_keep() in
+// sage_attention/int8_attn.hip.
+__device__ __forceinline__ bool gfx10_bits_dropped(uint32_t bits, uint32_t exponent) {
+    return (bits & exponent) == exponent;
+}
+
+// Reads one raw (unprepared) mask element. False means dropped; otherwise the
+// bias comes back in *natural* units and the caller scales it, which is what
+// makes the raw and prepared-16 reads agree bit for bit.
+__device__ __forceinline__ bool gfx10_raw_mask_bias(
+    const void* mask, int64_t offset, int dtype_code, float& bias) {
+    if (dtype_code == 3) {
+        bias = 0.0f;
+        return static_cast<const uint8_t*>(mask)[offset] != 0;
+    }
+    if (dtype_code == 0) {
+        const uint32_t bits = static_cast<const uint32_t*>(mask)[offset];
+        if (gfx10_bits_dropped(bits, 0x7F800000u)) return false;
+        bias = __uint_as_float(bits);
+        return true;
+    }
+    const uint16_t bits = static_cast<const uint16_t*>(mask)[offset];
+    if (dtype_code == 1) {
+        if (gfx10_bits_dropped(bits, 0x7C00u)) return false;
+        bias = __half2float(*reinterpret_cast<const __half*>(&bits));
+        return true;
+    }
+    if (gfx10_bits_dropped(bits, 0x7F80u)) return false;
+    bias = static_cast<float>(*reinterpret_cast<const __bf16*>(&bits));
+    return true;
+}
+
+// 16-bit dense biases stay in natural units, exactly as the raw 16-bit read
+// returns them, so both scale once and land on the same float.
+template <bool Bf16>
+__device__ __forceinline__ bool gfx10_dense16_mask_bias(uint16_t bits, float& bias) {
+    const uint16_t exponent = Bf16 ? 0x7F80u : 0x7C00u;
+    if (gfx10_bits_dropped(bits, exponent)) return false;
+    bias = Bf16 ? static_cast<float>(__uint_as_float(static_cast<uint32_t>(bits) << 16))
+                : __half2float(*reinterpret_cast<const __half*>(&bits));
+    return true;
+}
+
+__device__ __forceinline__ bool gfx10_dense32_mask_bias(uint32_t bits, float& bias) {
+    if (gfx10_bits_dropped(bits, 0x7F800000u)) return false;
+    bias = __uint_as_float(bits);
+    return true;
+}
+
+// Index of a (batch, head, query, key-tile) inside a prepared mask. Every
+// prepared buffer is allocated contiguous by its producer, so the row pitch
+// follows from the tile counts rather than from strides.
+__device__ __forceinline__ int64_t gfx10_mask_row(
+    int64_t batch, int64_t head, int64_t mask_batch, int64_t mask_heads,
+    int64_t q_tiles, int64_t k_tiles, int64_t q_index, int64_t k_index) {
+    const int64_t b = (mask_batch == 1) ? 0 : batch;
+    const int64_t h = (mask_heads == 1) ? 0 : head;
+    return ((b * mask_heads + h) * q_tiles + (q_index / kGfx10TileQ)) * k_tiles +
+           (k_index / kGfx10TileK);
+}
+
+// One (query, key) lookup against any of the shared representations. `bias` is
+// written only when the key is kept, and is always in the base-two log domain
+// the softmax in the kernel below runs in.
+__device__ __forceinline__ bool gfx10_mask_lookup(
+    int mode, const void* mask, int dtype_code,
+    int64_t stride_b, int64_t stride_h, int64_t stride_q, int64_t stride_k,
+    int64_t batch, int64_t head, int64_t q_index, int64_t k_index,
+    int64_t mask_batch, int64_t mask_heads, int64_t q_tiles, int64_t k_tiles,
+    int64_t k_row_pitch, float log2e, float& bias) {
+    switch (mode) {
+        case MaskMode::kRaw: {
+            // A raw mask arrives broadcast to the attention's shape, so a
+            // stride-0 batch or head axis means every batch (or head) reads the
+            // same row. Indexing with the raw batch/head would run off the end
+            // of the smaller buffer, so each axis is clamped to what the mask
+            // actually spans. The strides themselves already encode the
+            // broadcast, so they are used as given.
+            const int64_t mb = (mask_batch == 1) ? 0 : batch;
+            const int64_t mh = (mask_heads == 1) ? 0 : head;
+            const bool keep = gfx10_raw_mask_bias(
+                mask,
+                mb * stride_b + mh * stride_h + q_index * stride_q + k_index * stride_k,
+                dtype_code, bias);
+            if (keep) bias *= log2e;
+            return keep;
+        }
+        case MaskMode::kPreparedKey: {
+            // One row per (batch, head): k_tiles * 64 key biases followed by one
+            // descriptor per tile, which is -inf when the tile kept nothing at
+            // all so a whole tile is one test to skip.
+            //
+            // The mask has its own batch and head extents, which are usually
+            // smaller than the attention's: a [1,1,1,K] mask broadcast over 4
+            // query heads and 2 batches packs one row, not eight. Clamping each
+            // index to the mask's own extent is what keeps such a mask from
+            // reading past its single row -- the out-of-bounds read is what made
+            // masked results differ between back-to-back calls, since the memory
+            // past the buffer is whatever the allocator handed out next.
+            const int64_t mb = (mask_batch == 1) ? 0 : batch;
+            const int64_t mh = (mask_heads == 1) ? 0 : head;
+            const float* row = static_cast<const float*>(mask) +
+                               (mb * mask_heads + mh) * k_row_pitch;
+            const int64_t tile = k_index / kGfx10TileK;
+            if (gfx10_bits_dropped(__float_as_uint(row[k_tiles * kGfx10TileK + tile]),
+                                   0x7F800000u)) {
+                return false;
+            }
+            return gfx10_dense32_mask_bias(
+                __float_as_uint(row[tile * kGfx10TileK + (k_index % kGfx10TileK)]), bias);
+        }
+        case MaskMode::kPreparedDenseBool: {
+            // 32 words per 16-query by 64-key tile; within a tile the word is
+            // q_local + 16 * (k/8 % 2) and the bit is (k/16) * 8 + k%8.
+            const int64_t k_local = k_index % kGfx10TileK;
+            const int64_t word =
+                gfx10_mask_row(batch, head, mask_batch, mask_heads, q_tiles, k_tiles,
+                               q_index, k_index) * kGfx10BoolWord +
+                (q_index % kGfx10TileQ) + 16 * ((k_local / 8) % 2);
+            const int bit = static_cast<int>((k_local / 16) * 8 + (k_local % 8));
+            if ((static_cast<const uint32_t*>(mask)[word] >> bit) & 1u) {
+                bias = 0.0f;
+                return true;
+            }
+            return false;
+        }
+        default: {
+            // 1024 slots per tile; within a tile the slot is
+            // q_local * 8 + (k%8) + ((k/8%2) << 7) + (k/16 << 8).
+            const int64_t k_local = k_index % kGfx10TileK;
+            const int64_t slot =
+                gfx10_mask_row(batch, head, mask_batch, mask_heads, q_tiles, k_tiles,
+                               q_index, k_index) * kGfx10DenseSlot +
+                (q_index % kGfx10TileQ) * 8 + (k_local % 8) + ((k_local / 8 % 2) << 7) +
+                ((k_local / 16) << 8);
+            if (mode == MaskMode::kPreparedDenseBF16) {
+                const bool keep = gfx10_dense16_mask_bias<true>(
+                    static_cast<const uint16_t*>(mask)[slot], bias);
+                if (keep) bias *= log2e;
+                return keep;
+            }
+            if (mode == MaskMode::kPreparedDenseF16) {
+                const bool keep = gfx10_dense16_mask_bias<false>(
+                    static_cast<const uint16_t*>(mask)[slot], bias);
+                if (keep) bias *= log2e;
+                return keep;
+            }
+            // The fp32 producer already scaled by log2(e) when it packed.
+            return gfx10_dense32_mask_bias(static_cast<const uint32_t*>(mask)[slot], bias);
+        }
+    }
+}
+
+// MaskMode selects a Gfx10Mask and, for kRaw, the dtype of the operand. It is a
+// template parameter rather than a runtime argument because every lookup is
+// behind it: a runtime mode would cost a branch and a register per key in the
+// inner loop, where the register budget is already the binding constraint.
+template <int HD, bool ISC, int BN, int BM, typename ODT, int TM = 2, bool INQ = false,
+          int MASK = MaskMode::kNone, int MASK_DTYPE = 0>
 __global__ __attribute__((amdgpu_waves_per_eu(2))) __launch_bounds__(BM, 1) void attn_kernel_i8q_f16pv_tiled_pv(
     const int8_t* __restrict__ q, const int8_t* __restrict__ k,
     const __half* __restrict__ v, ODT* __restrict__ out,
@@ -70,13 +287,19 @@ __global__ __attribute__((amdgpu_waves_per_eu(2))) __launch_bounds__(BM, 1) void
     int64_t qs_stride_b, int64_t qs_stride_h,
     int64_t ks_stride_b, int64_t ks_stride_h,
     int diag,
-    const void* __restrict__ q_fp, int q_src_bf16, float sm_scale_log2e) {
+    const void* __restrict__ q_fp, int q_src_bf16, float sm_scale_log2e,
+    const void* __restrict__ mask = nullptr,
+    int64_t mask_stride_b = 0, int64_t mask_stride_h = 0,
+    int64_t mask_stride_q = 0, int64_t mask_stride_k = 0,
+    int64_t mask_batch = 1, int64_t mask_heads = 1, int64_t mask_q_tiles = 1,
+    int64_t mask_k_tiles = 1, int64_t mask_k_row_pitch = 0) {
 #if defined(__GFX10__)
     const int diag_qk = diag & 1;
     const int diag_sm = (diag >> 1) & 1;
     const int diag_pv = (diag >> 2) & 1;
     const int diag_st = (diag >> 3) & 1;
     const int diag_wb = (diag >> 4) & 1;
+    constexpr bool kMasked = MASK != MaskMode::kNone;
     constexpr int QUADS = HD / 4;
     constexpr int NTHREAD = BM;
     constexpr int K_STRIDE = HD;
@@ -230,6 +453,14 @@ __global__ __attribute__((amdgpu_waves_per_eu(2))) __launch_bounds__(BM, 1) void
         }
 
         float scr[BN];
+        // Whether each key in this tile survives the mask. Kept as a flag rather
+        // than encoded in the score: -ffast-math implies -ffinite-math-only,
+        // which lets the optimizer decide a float compare against a sentinel is
+        // a constant and fold it away. A bool cannot be reasoned about that way,
+        // so "dropped" stays observable to the optimizer that could have removed
+        // it. It also costs nothing: BN predicates already fit in one VGPR's
+        // worth of predicate state alongside the BN scores the loop keeps live.
+        bool keep_b[BN];
         {
             #pragma unroll
             for (int j0 = 0; j0 < BN; j0 += 4) {
@@ -253,30 +484,83 @@ __global__ __attribute__((amdgpu_waves_per_eu(2))) __launch_bounds__(BM, 1) void
                 for (int tj = 0; tj < 4; ++tj) {
                     int s = (tj == 0) ? s0 : (tj == 1) ? s1 : (tj == 2) ? s2 : s3;
                     const int64_t n = kb + j0 + tj;
-                    const float ksj = k_scale[b * ks_stride_b + kvh * ks_stride_h + static_cast<int>(n / MIN_BLK_K)];
-                    float sc = static_cast<float>(s) * (qsv * ksj);
-                    if ((!valid) || (ISC && n > m) || (n >= kv_len)) sc = -3.0e38f;
+                    bool keep = valid && !(ISC && n > m) && (n < kv_len);
+                    float bias = 0.0f;
+                    if (keep && kMasked) {
+                        keep = gfx10_mask_lookup(
+                            MASK, mask, MASK_DTYPE, mask_stride_b, mask_stride_h,
+                            mask_stride_q, mask_stride_k, b, h, m, n, mask_batch,
+                            mask_heads, mask_q_tiles, mask_k_tiles, mask_k_row_pitch,
+                            kLog2e, bias);
+                    }
+                    // Only a kept key is scaled, so the k_scale read stays inside
+                    // the buffer: the last tile's padding can address a group
+                    // past the end.
+                    float sc = 0.0f;
+                    if (keep) {
+                        const float ksj = k_scale[b * ks_stride_b + kvh * ks_stride_h +
+                                                 static_cast<int>(n / MIN_BLK_K)];
+                        // The product is formed and rounded on its own, then the
+                        // bias is added, rather than folding the two into one
+                        // fma. A mask with no bias (a Boolean one) or no mask at
+                        // all would otherwise let the optimizer see the add as a
+                        // no-op and reassociate the scale product, rounding it
+                        // differently from the case where the bias arrives from
+                        // memory. Two masks that mean the same thing then
+                        // disagree by an ulp, which is exactly what
+                        // test_hip_compact_dense_bool_matches_float_bias
+                        // compares. One extra add per key is free next to the
+                        // sdots above.
+                        const float scaled = static_cast<float>(s) * (qsv * ksj);
+                        // A mask bias arrives in the base-two log domain, so it
+                        // lands in the same units the exp2 below is fed.
+                        sc = scaled + bias;
+                    }
                     scr[j0 + tj] = sc;
+                    // Both arrays are written on every path, the dropped one
+                    // included. keep_b is uninitialized on entry to the key loop,
+                    // and setting it only for kept keys would leave a dropped key
+                    // holding the *previous tile's* flag, which resurrects it
+                    // with a stale score: invisible on a full tile, but it
+                    // silently steals weight from the real keys whenever kv_len
+                    // is not a multiple of BN.
+                    keep_b[j0 + tj] = keep;
                 }
             }
         }
 
         float P_al = 1.0f;
         if (!diag_sm) {
-            float lm = scr[0];
+            // A dropped key must not raise the running maximum: the max is what
+            // the exponentials are normalized against, so a sentinel leaking in
+            // would push every real score to -inf and the whole row to zero.
+            float lm = kGfx10MaskedScore;
             #pragma unroll
-            for (int j = 1; j < BN; ++j) lm = fmaxf(lm, scr[j]);
+            for (int j = 0; j < BN; ++j) {
+                if (keep_b[j]) lm = fmaxf(lm, scr[j]);
+            }
             float gm = fmaxf(row_m, lm);
             float alpha = (row_l > 0.0f) ? exp2f(row_m - gm) : 0.0f;
             P_al = alpha;
             row_m = gm;
             row_l *= alpha;
+            // Normalize with the same probabilities the P*V product consumes.
+            // The probabilities are stored as fp16 (that is what p_buf holds and
+            // what the fdot2 below multiplies), so summing the fp32 values here
+            // would leave the denominator un-rounded while the numerator is
+            // rounded -- a row whose V is constant would then come out a few
+            // 1e-3 off the value it should return instead of exactly it. This
+            // is the same reason the WMMA kernels sum the U8 probabilities
+            // rather than the fp32 ones.
             float ps = 0.0f;
             #pragma unroll
             for (int j = 0; j < BN; ++j) {
-                float p = exp2f(scr[j] - row_m);
-                ps += p;
-                p_buf[j * BM + (int)(m % BM)] = __float2half(p);
+                // Dropped keys contribute exactly nothing, so a fully masked row
+                // keeps row_l at 0 and the write-back below turns that into a
+                // clean zero without a separate validity flag.
+                const __half p16 = __float2half(keep_b[j] ? exp2f(scr[j] - row_m) : 0.0f);
+                p_buf[j * BM + (int)(m % BM)] = p16;
+                ps += __half2float(p16);
             }
             row_l += ps;
         } else {
@@ -332,7 +616,10 @@ __global__ __attribute__((amdgpu_waves_per_eu(2))) __launch_bounds__(BM, 1) void
         for (int u = 0; u < TM; ++u) {
             const int64_t row = blockIdx.x * BM + r0 + u;
             if ((row < qo_len) && (h < q_heads)) {
-                const float inv = 1.0f / l_buf[r0 + u];
+                // A row whose keys were all dropped has l == 0 and an acc that is
+                // already zero; 0 * inf would be NaN, so guard the reciprocal.
+                const float l = l_buf[r0 + u];
+                const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
                 const int64_t base = b * o_stride_b + row * o_stride_n + h * o_stride_h;
                 #pragma unroll
                 for (int dd = 0; dd < TD; ++dd)
