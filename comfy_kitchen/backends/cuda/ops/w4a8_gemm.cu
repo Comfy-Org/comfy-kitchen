@@ -217,11 +217,8 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
 
 
 
-// W4A8 / W6A8 requantize in one launch: raw bf16/fp16 weight -> ConvRot in shared memory ->
-// packed codes + fp8 s_rel + f32 s_channel (4-bit: codebook assign, 2 ALS scale iters; 6-bit:
-// uniform levels, 2 ALS iters; both: per-channel scale, optional stochastic rounding, pack).
-// Same values the eager quantizer computes, up to fp32 rounding order. One block per row;
-// each thread owns whole groups.
+// W4A8 / W6A8 requantize in one launch: raw weight -> ConvRot -> packed codes + fp8 s_rel +
+// f32 s_channel. Same math as the eager quantizer, up to fp32 rounding order.
 namespace {
 
 __device__ __forceinline__ float rq_to_float(__half v) { return __half2float(v); }
@@ -246,7 +243,7 @@ __device__ __forceinline__ float rq_warp_max(float v) {
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, o));
     return v;
 }
-// Row max across the block; `warp_max` is smem [32]. Returns the max on every thread.
+// Block-wide max, returned on every thread.
 __device__ __forceinline__ float rq_block_max(float v, float* warp_max) {
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
     v = rq_warp_max(v);
@@ -262,8 +259,7 @@ __device__ __forceinline__ float rq_block_max(float v, float* warp_max) {
     return warp_max[0];
 }
 
-// Number of entries of a sorted 16-entry table below x (or <= x with LE): a fixed 4-step
-// branch-free bisection (~12 instructions, no divergence).
+// Entries of a sorted 16-entry table below x (<= x with LE); branch-free bisection.
 template <bool LE, typename Table>
 __device__ __forceinline__ int rq_count16(Table tab, float x) {
     auto lt = [&](int j) { return LE ? (tab(j) <= x) : (tab(j) < x); };
@@ -273,9 +269,7 @@ __device__ __forceinline__ int rq_count16(Table tab, float x) {
     p += lt(p) ? 1 : 0;
     return p;
 }
-// Nearest entry (lowest index on ties, as a linear scan picks); DISTINCT tables skip the
-// search for the lowest index among duplicated values (the codebook is distinct, the int8
-// level table is not).
+// Nearest entry, lowest index on ties; DISTINCT skips the duplicate-value search.
 template <bool DISTINCT, typename Table>
 __device__ __forceinline__ int rq_nearest16(Table tab, float x) {
     const int pos = rq_count16<false>(tab, x);
@@ -286,15 +280,12 @@ __device__ __forceinline__ int rq_nearest16(Table tab, float x) {
     return rq_count16<false>(tab, tl);   // first index holding the value tl
 }
 
-// The rotated row is parked in smem in the (16-bit) weight dtype -- the eager path rounds its
-// rotated copy to it too -- with 2 elements of padding per group, so thread t's group t lands
-// in its own banks (stride (G+2)/2 words, odd).
+// Rotated row in smem, in the weight dtype, 2 elements of padding per group (bank-conflict free).
 template <int LOG2G>
 __device__ __forceinline__ int rq_padded_index(int i) { return i + 2 * (i >> LOG2G); }
 template <int G> struct RqLog2 { static constexpr int value = G == 16 ? 4 : G == 32 ? 5 : 6; };
 
-// One W4A8 row (group 16, codebook, fp8 s_rel): per-group ALS codebook scale, row channel
-// scale, grid-aware assignment (+SR), nibble pack. Reads the padded smem row.
+// One W4A8 row (group 16, codebook, fp8 s_rel) from the padded smem row.
 template <typename InputType>
 __device__ __forceinline__ void w4_quantize_row(
     const InputType* row_buf, int K, int64_t elem_base, const float* cb,   // cb: smem [16], sorted
@@ -319,7 +310,7 @@ __device__ __forceinline__ void w4_quantize_row(
         #pragma unroll
         for (int i = 0; i < G; ++i) { w[i] = src(base + i); amax = fmaxf(amax, fabsf(w[i])); }
         float gs = fmaxf(amax, 1e-8f);
-        float inv = 1.0f / gs;                 // reciprocal: off the eager w/gs by <= 1 ulp
+        float inv = 1.0f / gs;
         int idx[G];
         #pragma unroll
         for (int i = 0; i < G; ++i) idx[i] = rq_nearest16<true>(cbt, w[i] * inv);
@@ -341,16 +332,14 @@ __device__ __forceinline__ void w4_quantize_row(
     const float inv_sc = 1.0f / sc;
     if (threadIdx.x == 0) *s_channel_out = sc;
 
-    // --- Phase 2: s_rel (fp8) -> int8 levels -> assign (+SR) -> pack. The SR choice is
-    // warp-uniform; branching once keeps each element loop single-purpose. ---
+    // --- Phase 2: s_rel (fp8) -> int8 levels -> assign (+SR) -> pack ---
     auto phase2 = [&](auto sr_tag) {
         constexpr bool SR = decltype(sr_tag)::value;
         for (int g = threadIdx.x; g < groups; g += blockDim.x) {
             const uint8_t srel_bits = __nv_cvt_float_to_fp8(gscale[g] / sc, __NV_SATFINITE, __NV_E4M3);
             s_rel_row[g] = srel_bits;
             const float srel_r = __half2float(__nv_cvt_fp8_to_halfraw(srel_bits, __NV_E4M3));
-            // int8 level j of this group, from the smem codebook on demand (a register table
-            // would be dynamically indexed -> local memory)
+            // int8 level j, computed on demand (a register table would spill to local memory)
             auto lv = [&](int j) { return fminf(127.0f, fmaxf(-127.0f, nearbyintf(cb[j] * srel_r))); };
             const int base = g * G;
             uint32_t words[2] = {0u, 0u};
@@ -375,14 +364,11 @@ __device__ __forceinline__ void w4_quantize_row(
     if (stochastic) phase2(std::true_type{}); else phase2(std::false_type{});
 }
 
-// The int8 value 6-bit level index `i` (0..62, level i-31) decodes to for group step `s`:
-// round(clamp(level * s)) -- the eager _grid_levels table, evaluated on the fly.
+// int8 value of 6-bit level index i (0..62) at group step s: eager's _grid_levels, on the fly.
 __device__ __forceinline__ float w6_level(int i, float s) {
     return fminf(127.0f, fmaxf(-127.0f, nearbyintf(static_cast<float>(i - 31) * s)));
 }
-// searchsorted(levels, t): first level index >= t. The estimate lands within a step of it
-// (level(i) >= t roughly when (i-31)*s > ceil(t)-0.5); the fixup loops make the result exact
-// whatever the estimate did, so this equals a bisection and costs ~2 level evaluations.
+// First level index >= t (searchsorted): closed-form estimate, fixup loops make it exact.
 __device__ __forceinline__ int w6_lower_bound(float t, float s, float inv_s) {
     int i = __float2int_rn((ceilf(t) - 0.5f) * inv_s) + 31;
     i = min(max(i, 0), 63);
@@ -390,8 +376,7 @@ __device__ __forceinline__ int w6_lower_bound(float t, float s, float inv_s) {
     while (i < 63 && w6_level(i, s) < t) ++i;
     return i;
 }
-// Eager _assign_grid on the uniform 6-bit grid: the nearer of the two brackets around t,
-// lower index on ties; SR draws a point in the bracket instead.
+// Eager _assign_grid: nearer bracket around t (lower on ties), or an SR draw in the bracket.
 template <bool SR>
 __device__ __forceinline__ int w6_assign(float t, float s, float inv_s, int64_t idx, uint64_t seed) {
     const int pos = w6_lower_bound(t, s, inv_s);
@@ -405,8 +390,7 @@ __device__ __forceinline__ int w6_assign(float t, float s, float inv_s, int64_t 
     return (fabsf(t - w6_level(h, s)) < fabsf(t - w6_level(l, s))) ? h : l;
 }
 
-// One W6A8 row: the eager 6-bit quantizer (uniform levels -31..31, 2 ALS rounds, fp8 s_rel,
-// grid-aware assignment) without the search. Reads the padded smem row.
+// One W6A8 row (uniform levels, fp8 s_rel, no scale search) from the padded smem row.
 template <typename InputType, int G>
 __device__ __forceinline__ void w6_quantize_row(
     const InputType* row_buf, int K, int64_t elem_base,
@@ -420,8 +404,7 @@ __device__ __forceinline__ void w6_quantize_row(
     auto src = [&](int i) { return rq_to_float(row_buf[rq_padded_index<RqLog2<G>::value>(i)]); };
     const int groups = K / G;
 
-    // --- Phase 1: per-group step (ALS on the integer levels); row amax of the decoded weight.
-    // Only the group's weights stay in registers; the levels are recomputed from the step. ---
+    // --- Phase 1: per-group step (2 ALS rounds); row amax of the decoded weight ---
     float thr_amax = 0.0f;
     for (int g = threadIdx.x; g < groups; g += blockDim.x) {
         const int base = g * G;
@@ -430,7 +413,7 @@ __device__ __forceinline__ void w6_quantize_row(
         #pragma unroll
         for (int i = 0; i < G; ++i) { w[i] = src(base + i); amax = fmaxf(amax, fabsf(w[i])); }
         float gs = fmaxf(amax / 31.0f, 1e-8f);
-        float inv = 1.0f / gs;                 // reciprocal: off eager's w/gs by <= 1 ulp
+        float inv = 1.0f / gs;
         #pragma unroll
         for (int it = 0; it < 2; ++it) {       // eager _ALS_ITERS
             float num = 0.0f, den = 0.0f;
@@ -451,8 +434,7 @@ __device__ __forceinline__ void w6_quantize_row(
     const float inv_sc = 1.0f / sc;
     if (threadIdx.x == 0) *s_channel_out = sc;
 
-    // --- Phase 2: fp8 s_rel -> grid assignment -> code q+32, packed four columns at a time.
-    // The SR choice is warp-uniform; branching once keeps each element loop single-purpose. ---
+    // --- Phase 2: fp8 s_rel -> grid assignment -> code q+32 -> two-plane pack ---
     int8_t* hi_plane = packed_row + K / 2;
     auto phase2 = [&](auto sr_tag) {
         constexpr bool SR = decltype(sr_tag)::value;
@@ -480,22 +462,70 @@ __device__ __forceinline__ void w6_quantize_row(
     if (stochastic) phase2(std::true_type{}); else phase2(std::false_type{});
 }
 
-// ConvRot FHT stage on a 256-group in smem: same operand order as int8_linear.cu's
-// convrot_fht_stage64, so the rotated values equal rotate_int8_convrot_weight's bit for bit.
-template <int S>
-__device__ __forceinline__ void rq_fht_stage(const float* __restrict__ src, float* __restrict__ dst, int lane) {
-    const int base = (lane % S) + (lane / S) * (4 * S);
-    const float x0 = src[base], x1 = src[base + S], x2 = src[base + 2 * S], x3 = src[base + 3 * S];
-    dst[base] = 0.5f * (x0 + x1 + x2 - x3);
-    dst[base + S] = 0.5f * (x0 + x1 - x2 + x3);
-    dst[base + 2 * S] = 0.5f * (x0 - x1 + x2 + x3);
-    dst[base + 3 * S] = 0.5f * (-x0 + x1 + x2 + x3);
+// Row k of H4, same association as int8_linear.cu's h4_row_dot (bit-identical).
+__device__ __forceinline__ float rq_h4_row(int k, float x0, float x1, float x2, float x3) {
+    return 0.5f * ((((k == 3 ? -x0 : x0) + (k == 2 ? -x1 : x1)) + (k == 1 ? -x2 : x2)) + (k == 0 ? -x3 : x3));
 }
 
-// Fused requant: rotate the raw weight row in shared memory (64 threads per 256-group, the smem
-// ping-pong FHT of rotate_int8_convrot_weight), round to the weight dtype as the eager rotated
-// copy is, park it padded in smem, then quantize it from there (4-bit codebook g16, or 6-bit
-// uniform). No rotated copy in memory, one launch per weight.
+// Radix-4 stage pairing register bit RB with the lane bit selected by LX.
+template <int RB, int LX>
+__device__ __forceinline__ void rq_fht_mixed(float (&v)[32], int lane_bit) {
+    #pragma unroll
+    for (int r = 0; r < 32; ++r) {
+        if (r & (1 << RB)) continue;
+        const int r1 = r | (1 << RB);
+        const float a0 = v[r], a1 = v[r1];
+        const float p0 = __shfl_xor_sync(0xffffffffu, a0, LX);
+        const float p1 = __shfl_xor_sync(0xffffffffu, a1, LX);
+        const float x0 = lane_bit ? p0 : a0, x1 = lane_bit ? p1 : a1;
+        const float x2 = lane_bit ? a0 : p0, x3 = lane_bit ? a1 : p1;
+        v[r] = rq_h4_row(2 * lane_bit, x0, x1, x2, x3);
+        v[r1] = rq_h4_row(2 * lane_bit + 1, x0, x1, x2, x3);
+    }
+}
+
+// ConvRot256 of one group in registers: 8 lanes x 32 values. Index bits 0,1,2,4,6 are register
+// bits, 3,5,7 lane bits. Same stage order and arithmetic as rotate_int8_convrot_weight; the
+// rounded result goes to the padded smem row.
+template <typename InputType, int LOG2G>
+__device__ __forceinline__ void rq_rotate_group_regs(const InputType* __restrict__ xg, InputType* row_buf,
+                                                     int e_base, int lane8, bool store)
+{
+    const int b3 = lane8 & 1, b5 = (lane8 >> 1) & 1, b7 = lane8 >> 2;
+    float v[32];   // r = b0 | b1<<1 | b2<<2 | b4<<3 | b6<<4
+    #pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const int off = 8 * b3 + 16 * (q & 1) + 32 * b5 + 64 * (q >> 1) + 128 * b7;
+        const uint4 raw = *reinterpret_cast<const uint4*>(xg + off);   // 8 x 16-bit
+        const InputType* e = reinterpret_cast<const InputType*>(&raw);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) v[q * 8 + i] = rq_to_float(e[i]);
+    }
+    #pragma unroll
+    for (int base = 0; base < 32; base += 4) {       // stage 0: bits (0,1), register-only
+        const float x0 = v[base], x1 = v[base + 1], x2 = v[base + 2], x3 = v[base + 3];
+        v[base] = 0.5f * (x0 + x1 + x2 - x3);
+        v[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
+        v[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
+        v[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+    }
+    rq_fht_mixed<2, 1>(v, b3);                        // bits (2,3)
+    rq_fht_mixed<3, 2>(v, b5);                        // bits (4,5)
+    rq_fht_mixed<4, 4>(v, b7);                        // bits (6,7)
+    if (!store) return;
+    #pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const int off = 8 * b3 + 16 * (q & 1) + 32 * b5 + 64 * (q >> 1) + 128 * b7;
+        InputType* dst = row_buf + rq_padded_index<LOG2G>(e_base + off);   // even index: 4-byte pairs
+        #pragma unroll
+        for (int i = 0; i < 8; i += 2) {
+            InputType pair[2] = {rq_from_float<InputType>(v[q * 8 + i]), rq_from_float<InputType>(v[q * 8 + i + 1])};
+            *reinterpret_cast<uint32_t*>(dst + i) = *reinterpret_cast<const uint32_t*>(pair);
+        }
+    }
+}
+
+// Fused requant: rotate the row in registers, park it in smem, quantize (4-bit codebook g16 or 6-bit uniform).
 template <typename InputType, int BITS, int G>
 __global__ void __launch_bounds__(512)
 quantize_wxa8_convrot_fused_kernel(
@@ -506,50 +536,24 @@ quantize_wxa8_convrot_fused_kernel(
     float* __restrict__ s_channel,          // [N]
     int K, bool stochastic, uint64_t seed)
 {
-    const int kSubs = blockDim.x / 64;          // 256-groups rotated per pass (256 or 512 threads)
     constexpr int LOG2G = RqLog2<G>::value;
     __shared__ float warp_max[32];
     __shared__ float cb[16];
     extern __shared__ float smem[];
-    float* bufs = smem;                          // [kSubs][2][256] FHT ping-pong
-    float* gscale = bufs + kSubs * 512;          // [K/G]
+    float* gscale = smem;                                                 // [K/G]
     InputType* row_buf = reinterpret_cast<InputType*>(gscale + (K >> LOG2G));   // padded rotated row
     if (BITS == 4 && threadIdx.x < 16) cb[threadIdx.x] = codebook[threadIdx.x];
 
     const int64_t row = blockIdx.x;
     const InputType* wrow = weight + row * K;
-    const int sub = threadIdx.x / 64, lane = threadIdx.x % 64;
+    const int clusters = blockDim.x / 8, cluster = threadIdx.x / 8, lane8 = threadIdx.x % 8;
     const int n_groups = K / 256;
-    float* buf0 = bufs + sub * 512;
-    float* buf1 = buf0 + 256;
-    for (int it = 0; it < (n_groups + kSubs - 1) / kSubs; ++it) {
-        const int g = it * kSubs + sub;
+    for (int it = 0; it < (n_groups + clusters - 1) / clusters; ++it) {   // uniform trip count (shuffles)
+        const int g = it * clusters + cluster;
         const bool active = g < n_groups;
-        const int base = lane * 4;
-        const InputType* xg = wrow + g * 256 + base;
-        const float x0 = active ? rq_to_float(xg[0]) : 0.0f;
-        const float x1 = active ? rq_to_float(xg[1]) : 0.0f;
-        const float x2 = active ? rq_to_float(xg[2]) : 0.0f;
-        const float x3 = active ? rq_to_float(xg[3]) : 0.0f;
-        buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
-        buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
-        buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
-        buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
-        __syncthreads();
-        rq_fht_stage<4>(buf1, buf0, lane);
-        __syncthreads();
-        rq_fht_stage<16>(buf0, buf1, lane);
-        __syncthreads();
-        if (active) {                            // last stage (S = 64) straight into the padded row
-            const float y0 = buf1[lane], y1 = buf1[lane + 64], y2 = buf1[lane + 128], y3 = buf1[lane + 192];
-            const int e = g * 256 + lane;
-            row_buf[rq_padded_index<LOG2G>(e)] = rq_from_float<InputType>(0.5f * (y0 + y1 + y2 - y3));
-            row_buf[rq_padded_index<LOG2G>(e + 64)] = rq_from_float<InputType>(0.5f * (y0 + y1 - y2 + y3));
-            row_buf[rq_padded_index<LOG2G>(e + 128)] = rq_from_float<InputType>(0.5f * (y0 - y1 + y2 + y3));
-            row_buf[rq_padded_index<LOG2G>(e + 192)] = rq_from_float<InputType>(0.5f * (-y0 + y1 + y2 + y3));
-        }
-        __syncthreads();
+        rq_rotate_group_regs<InputType, LOG2G>(wrow + (active ? g : 0) * 256, row_buf, g * 256, lane8, active);
     }
+    __syncthreads();
     if constexpr (BITS == 4) {
         w4_quantize_row<InputType>(
             row_buf, K, row * K, cb,
@@ -565,9 +569,9 @@ template <int BITS, int G>
 bool launch_wxa8_fused(const void* weight, const float* codebook, void* packed, void* s_rel, void* s_channel,
                        int64_t N, int64_t K, int in_dtype_code, bool stochastic, uint64_t seed, cudaStream_t stream)
 {
-    const bool wide = K > (BITS == 4 ? 16384 : 8192);   // one block per SM anyway: more warps (4-bit has the fatter phases)
+    const bool wide = K > (BITS == 4 ? 16384 : 8192);   // long rows: one block per SM anyway, use more warps
     const int threads = wide ? 512 : 256;
-    const size_t shmem = ((threads / 64) * 512 + K / G) * sizeof(float) + (static_cast<size_t>(K) + 2 * (K / G)) * 2;   // 16-bit row, pad 2/group
+    const size_t shmem = (K / G) * sizeof(float) + (static_cast<size_t>(K) + 2 * (K / G)) * 2;   // group steps + 16-bit padded row
     int dev = 0, max_shmem = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return false;
     if (cudaDeviceGetAttribute(&max_shmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess)
@@ -587,7 +591,7 @@ bool launch_wxa8_fused(const void* weight, const float* codebook, void* packed, 
         return true;
     };
     bool ok;
-    if (in_dtype_code == 0) return false;   // fp32 weights are never requantized from ComfyUI; eager handles them
+    if (in_dtype_code == 0) return false;   // fp32 weights: eager
     if (in_dtype_code == 1) ok = run(static_cast<__half*>(nullptr));
     else ok = run(static_cast<__nv_bfloat16*>(nullptr));
     if (!ok) return false;
@@ -596,10 +600,8 @@ bool launch_wxa8_fused(const void* weight, const float* codebook, void* packed, 
 
 }  // namespace
 
-// weight: [N,K] raw (unrotated), ConvRot group 256, in in_dtype_code (1=fp16, 2=bf16; fp32 declines).
-// bits 4 (codebook [16], G=16) or 6 (uniform, G in {16,32,64}); s_rel: [N,K/G] e4m3 bits.
-// Returns false (caller uses the eager path) when the row does not fit shared memory or the
-// launch is rejected, so uninitialized outputs are never mistaken for a result.
+// weight [N,K] raw, ConvRot group 256, fp16/bf16 (fp32 declines); bits 4 (codebook, G=16) or 6
+// (G in {16,32,64}). Returns false when the row does not fit shared memory: caller runs eager.
 extern "C" bool launch_quantize_wxa8_convrot_fused(
     const void* weight, const void* codebook, void* packed, void* s_rel, void* s_channel,
     int64_t N, int64_t K, int bits, int G, int in_dtype_code, bool stochastic, uint64_t seed, cudaStream_t stream)
