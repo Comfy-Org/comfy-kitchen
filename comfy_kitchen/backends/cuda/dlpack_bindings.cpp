@@ -1,3 +1,4 @@
+#include <vector>
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -2725,6 +2726,112 @@ static std::tuple<int64_t, int64_t, int64_t> check_int8_gemm_operands(
     return {M, N, K};
 }
 
+extern "C" int h3_qkv_available();
+extern "C" int h3_sample_gather(const void *, const void *, const void *,
+                                void *, void *, void *, int, uintptr_t);
+extern "C" int h3_sample_konly(const int8_t *, const int8_t *, const float *,
+                               const float *, void *, const void *,
+                               const void *, const void *, float, int8_t *,
+                               float *, float *, int, uintptr_t);
+extern "C" int h3_sample_anchor(const void *, void *, uintptr_t);
+extern "C" int h3_qkv_quant_kv(const int8_t *, const int8_t *, const float *,
+                               const float *, void *, const void *,
+                               const void *, const void *, float, int8_t *,
+                               float *, float *, int8_t *, float *,
+                               const void *, const int *, int, uintptr_t);
+extern "C" int h3_finish_v(const void *, const float *, float *, float *,
+                           int8_t *, int, uintptr_t);
+
+bool h3_qkv_quant(nb::list tensors, float eps, uintptr_t st) {
+  if (tensors.size() != 21)
+    throw std::runtime_error("h3_qkv_quant: expected 21 tensors");
+  std::vector<nb::ndarray<nb::device::cuda>> t;
+  for (auto item : tensors)
+    t.push_back(nb::cast<nb::ndarray<nb::device::cuda>>(item));
+  if (t[0].ndim() != 2)
+    throw std::runtime_error("h3_qkv_quant: a must be a matrix");
+  const int64_t m = t[0].shape(0), parts = (m + 127) / 128;
+  if (m < 1 || m > 200000)
+    return false;
+  const std::vector<std::vector<size_t>> shapes = {
+      {(size_t)m, 5376},
+      {21504, 5376},
+      {(size_t)m, 1},
+      {21504, 1},
+      {1, (size_t)m, 1, 48, 2, 2},
+      {128},
+      {128},
+      {1, 56, (size_t)m, 128},
+      {1, 56, (size_t)m, 128},
+      {1, 56, (size_t)parts * 32},
+      {1, 56, (size_t)parts * 4},
+      {56, (size_t)parts, 128},
+      {1, 56},
+      {9, 5376},
+      {9, 1},
+      {1, 9, 1, 48, 2, 2},
+      {9, 21504},
+      {(size_t)m, 21504},
+      {56 * 128, (size_t)parts * 128},
+      {56 * 128},
+      {56 * 128}};
+  const int codes[] = {3, 3, 0, 0, 2, 2, 2, 3, 3, 0, 0,
+                       0, 4, 3, 0, 2, 2, 2, 3, 0, 0};
+  for (size_t i = 0; i < t.size(); ++i) {
+    if (t[i].ndim() != shapes[i].size() || t[i].device_id() != t[0].device_id())
+      throw std::runtime_error("h3_qkv_quant: rank/device mismatch");
+    for (size_t j = 0; j < shapes[i].size(); ++j)
+      if (t[i].shape(j) != shapes[i][j])
+        throw std::runtime_error("h3_qkv_quant: shape mismatch");
+    need_contiguous(t[i], "h3_qkv_quant", "operand");
+    auto dt = t[i].dtype();
+    bool valid =
+        codes[i] == 3
+            ? dt.code == static_cast<uint8_t>(nb::dlpack::dtype_code::Int) &&
+                  dt.bits == 8
+        : codes[i] == 4
+            ? dt.code == static_cast<uint8_t>(nb::dlpack::dtype_code::Int) &&
+                  dt.bits == 32
+            : map_dtype_to_code(dt) == codes[i];
+    if (!valid || uintptr_t(t[i].data()) % 16)
+      throw std::runtime_error("h3_qkv_quant: dtype/alignment mismatch");
+  }
+  if (!std::isfinite(eps) || eps <= 0)
+    throw std::runtime_error("h3_qkv_quant: invalid eps");
+  int device = 0, major = 0, minor = 0;
+  if (cudaGetDevice(&device) != cudaSuccess || device != t[0].device_id())
+    throw std::runtime_error("h3_qkv_quant: active CUDA device mismatch");
+  if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                             device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
+                             device) != cudaSuccess)
+    throw std::runtime_error("h3_qkv_quant: device capability query failed");
+  if (major != 12 || minor != 0 || !h3_qkv_available())
+    return false;
+  auto ptr = [&](int i) { return t[i].data(); };
+  if (!h3_sample_gather(ptr(0), ptr(2), ptr(4), ptr(13), ptr(14), ptr(15), m,
+                        st))
+    throw std::runtime_error("H3 sample gather failed");
+  if (!h3_sample_konly((int8_t *)ptr(13), (int8_t *)ptr(1), (float *)ptr(14),
+                       (float *)ptr(3), ptr(16), ptr(15), ptr(5), ptr(6), eps,
+                       nullptr, nullptr, nullptr, 9, st))
+    throw std::runtime_error("H3 sample projection failed");
+  auto sk = (char *)ptr(16) + 56 * 9 * 128 * 2;
+  if (!h3_sample_anchor(sk, ptr(12), st))
+    throw std::runtime_error("H3 anchor failed");
+  if (!h3_qkv_quant_kv((int8_t *)ptr(0), (int8_t *)ptr(1), (float *)ptr(2),
+                       (float *)ptr(3), ptr(17), ptr(4), ptr(5), ptr(6), eps,
+                       (int8_t *)ptr(7), (float *)ptr(9), (float *)ptr(11),
+                       (int8_t *)ptr(8), (float *)ptr(10), sk, (int *)ptr(12),
+                       m, st))
+    throw std::runtime_error("H3 QKV projection failed");
+  auto v = (char *)ptr(17) + int64_t(2) * 56 * m * 128 * 2;
+  if (!h3_finish_v(v, (float *)ptr(11), (float *)ptr(19), (float *)ptr(20),
+                   (int8_t *)ptr(18), m, st))
+    throw std::runtime_error("H3 V quantization failed");
+  return true;
+}
+
 // INT8 GEMM + fused dequant (D = acc * xs[m] * ws[n] + bias[n]) via CUTLASS.
 // Returns true on success; false means caller falls back to cuBLAS + dequant.
 bool cutlass_int8_dequant(
@@ -3995,6 +4102,7 @@ NB_MODULE(_C, m) {
           nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"));
 
+    m.def("h3_qkv_quant", &h3_qkv_quant, nb::arg("tensors"), nb::arg("eps"), nb::arg("stream_ptr"));
     m.def("cutlass_int8_dequant", &cutlass_int8_dequant,
           "INT8 GEMM + fused rowwise x colwise dequant + bias via CUTLASS; false -> fall back to cuBLAS",
           nb::arg("a"),
