@@ -16,10 +16,10 @@ for h, n in [(8, 8192), (56, 14850), (56, 32700), (56, 87142), (56, 90461)]:
     packed = ck.prequantize_int8_attention(q, k, v)
     del q, k, v
 
-    def old():
+    def old(packed=packed):
         return ck.int8_attention_from_prequantized(packed).transpose(1, 2).contiguous()
 
-    def new():
+    def new(packed=packed):
         return ck.int8_attention_from_prequantized(packed, output_layout="BSHD")
 
     a = old()
@@ -56,4 +56,4 @@ for h, n in [(8, 8192), (56, 14850), (56, 32700), (56, 87142), (56, 90461)]:
     report["cases"].append(row)
     (r / "layout-benchmark.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(row), flush=True)
-    del outputs, graphs, g, packed
+    del outputs, graphs, g, packed, old, new, fn
