@@ -291,6 +291,66 @@ compute_int_qk(const smem_t<swizzle_mode, stride> &smem_Q,
   offset_Q -= (2 * num_tiles_qk_inner);
   offset_K -= (2 * num_tiles_qk_inner);
 }
+template <uint32_t num_warps_q, uint32_t num_warps_k, uint32_t num_tiles_q,
+          uint32_t num_tiles_k, uint32_t num_tiles_qk_inner,
+          SwizzleMode swizzle_mode, uint32_t stride, DataType DTypeQK>
+__device__ __forceinline__ void compute_int_qk_cached(
+    const smem_t<swizzle_mode, stride> &smem_K, int32_t RS[][num_tiles_k][8],
+    uint32_t RQ[][num_tiles_qk_inner][4], uint32_t &offset_K) {
+  uint32_t RK[4];
+
+  // the first iteration, mma mode is kInit
+#pragma unroll
+  for (uint32_t iter = 0; iter < 1; iter++) {
+#pragma unroll
+    for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+      // load RK
+      smem_K.ldmatrix_m8n8x4(offset_K, RK);
+      offset_K = smem_K.advance_offset_by_row<16>(offset_K);
+
+      // mma
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+        if constexpr (DTypeQK == DataType::kInt8) {
+          mma::mma_sync_m16n16k32_row_col_s8s8s32<mma::MMAMode::kInit>(
+              RS[fq][fk], RQ[fq][iter], RK);
+        } else if constexpr (DTypeQK == DataType::kInt4) {
+          mma::mma_sync_m16n16k64_row_col_s4s4s32<mma::MMAMode::kInit>(
+              RS[fq][fk], RQ[fq][iter], RK);
+        }
+      }
+    }
+    offset_K = smem_K.advance_offset_by_column<2>(
+        offset_K - (num_tiles_k * 16 * stride), iter);
+  }
+
+  // following iteration, mma mode is kInplace
+#pragma unroll
+  for (uint32_t iter = 1; iter < num_tiles_qk_inner; iter++) {
+#pragma unroll
+    for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+      // load RK
+      smem_K.ldmatrix_m8n8x4(offset_K, RK);
+      offset_K = smem_K.advance_offset_by_row<16>(offset_K);
+
+      // mma
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+        if constexpr (DTypeQK == DataType::kInt8) {
+          mma::mma_sync_m16n16k32_row_col_s8s8s32<mma::MMAMode::kInplaceUpdate>(
+              RS[fq][fk], RQ[fq][iter], RK);
+        } else if constexpr (DTypeQK == DataType::kInt4) {
+          mma::mma_sync_m16n16k64_row_col_s4s4s32<mma::MMAMode::kInplaceUpdate>(
+              RS[fq][fk], RQ[fq][iter], RK);
+        }
+      }
+    }
+    offset_K = smem_K.advance_offset_by_column<2>(
+        offset_K - (num_tiles_k * 16 * stride), iter);
+  }
+
+  offset_K -= (2 * num_tiles_qk_inner);
+}
 #pragma nv_diag_default 174
 
 // for case when num_tiles_qk_inner = 1
@@ -1079,14 +1139,66 @@ __device__ __forceinline__ void normalize_d(float RO[][num_tiles_v][8],
   }
 }
 
+
+// Use eight-column fragments so the next Tensor Core dot product can overlap
+// conversion and FP32 accumulation of the previous fragment. Each output keeps
+// its four integer dot products followed by the original FP32 FMA.
+template <SwizzleMode swizzle_mode, uint32_t stride>
+__device__ __forceinline__ void
+compute_int8_sv_pipelined_n8(const smem_t<swizzle_mode, stride> &smem_V,
+                             int32_t RS_scale[][8][8], uint32_t RS_u8[][4][4],
+                             float RO[][8][8]) {
+
+  auto multiply = [&](uint32_t frag, int32_t partial[4]) {
+    uint32_t RV[4][2];
+#pragma unroll
+    for (uint32_t fk = 0; fk < 4; ++fk) {
+      const uint32_t offset = smem_V.get_permuted_offset(
+          get_lane_id() % 8 + frag * 8, (get_lane_id() / 8) % 2 + fk * 2);
+      smem_V.ldmatrix_m8n8x2(offset, RV[fk]);
+      if (fk == 0)
+        mma::mma_sync_m16n8k32_row_col_u8s8s32<mma::MMAMode::kInit>(
+            partial, RS_u8[0][fk], RV[fk]);
+      else
+        mma::mma_sync_m16n8k32_row_col_u8s8s32<mma::MMAMode::kInplaceUpdate>(
+            partial, RS_u8[0][fk], RV[fk]);
+    }
+  };
+  auto accumulate = [&](uint32_t frag, const int32_t partial[4]) {
+#pragma unroll
+    for (uint32_t k = 0; k < 4; ++k) {
+      float &output = RO[0][frag / 2][(frag % 2) * 4 + k];
+      output = fmaf(__int2float_rn(partial[k]),
+                    __int_as_float(RS_scale[0][0][k / 2]), output);
+    }
+  };
+
+  int32_t partial[2][4];
+  multiply(0, partial[0]);
+#pragma unroll
+  for (uint32_t frag = 1; frag < 16; ++frag) {
+    multiply(frag, partial[frag % 2]);
+    accumulate(frag - 1, partial[(frag - 1) % 2]);
+  }
+  accumulate(15, partial[1]);
+}
+
 template <uint32_t num_warps_q, uint32_t num_warps_k, uint32_t num_tiles_q,
           uint32_t num_tiles_k, uint32_t num_tiles_v, SwizzleMode swizzle_mode,
-          uint32_t stride, typename DTypeSVAccum>
+          uint32_t stride, bool pipeline_pv = true, typename DTypeSVAccum>
 __device__ __forceinline__ void
 compute_int8_sv(const smem_t<swizzle_mode, stride> &smem_V,
                 int32_t RS_scale[][num_tiles_k][8],
                 uint32_t RS_u8[][num_tiles_k / 2][4],
                 DTypeSVAccum RO[][num_tiles_v][8]) {
+#if __CUDA_ARCH__ == 890
+  if constexpr (pipeline_pv && num_warps_q == 4 && num_warps_k == 1 && num_tiles_q == 1 &&
+                num_tiles_k == 8 && num_tiles_v == 8) {
+    compute_int8_sv_pipelined_n8<swizzle_mode, stride>(smem_V, RS_scale, RS_u8, RO);
+    return;
+  }
+#endif
+
   static_assert(std::is_same<DTypeSVAccum, float>::value);
   uint32_t smem_V_row_base = get_lane_id() % 8 + (get_lane_id() / 16) * 8;
   uint32_t smem_V_col_base = (get_lane_id() / 8) % 2;

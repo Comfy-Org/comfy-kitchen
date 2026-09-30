@@ -194,10 +194,10 @@ extern "C" {
         const void* mask, int64_t mask_stride_b, int64_t mask_stride_h,
         int64_t mask_stride_q, int64_t mask_stride_k, int mask_dtype_code,
         int cta_k, int B, int Lq, int Lk, int H_q, int H_kv, int D,
-        int q_st_bz, int q_st_n, int q_st_h,
-        int k_st_bz, int k_st_n, int k_st_h,
-        int v_st_bz, int v_st_h, int v_st_d,
-        int o_st_bz, int o_st_n, int o_st_h,
+        int64_t q_st_bz, int q_st_n, int64_t q_st_h,
+        int64_t k_st_bz, int k_st_n, int64_t k_st_h,
+        int64_t v_st_bz, int64_t v_st_h, int v_st_d,
+        int64_t o_st_bz, int o_st_n, int64_t o_st_h,
         float sm_scale, int output_dtype_code, cudaStream_t stream, const float *mask_tile_bias = nullptr);
 
     void launch_sage_prepare_key_mask(
@@ -1189,26 +1189,18 @@ void sage_sdpa_prequantized(
             "sage_sdpa_prequantized: quantized tensors and output must be contiguous");
     }
 
-    const int64_t qi_st_bz64 = static_cast<int64_t>(H_q) * Lq * D;
-    const int64_t ki_st_bz64 = static_cast<int64_t>(H_kv) * Lk * D;
-    const int64_t v_st_bz64 = static_cast<int64_t>(H_kv) * D * padded_Lk;
-    if (qi_st_bz64 > INT_MAX || ki_st_bz64 > INT_MAX || v_st_bz64 > INT_MAX) {
-        throw std::overflow_error(
-            "sage_sdpa_prequantized: tensor strides exceed int32 range; reduce batch/seq/head dimensions");
-    }
-
-    const int qi_st_h = Lq * D;
+    const int64_t qi_st_h = static_cast<int64_t>(Lq) * D;
     const int qi_st_n = D;
-    const int qi_st_bz = static_cast<int>(qi_st_bz64);
-    const int ki_st_h = Lk * D;
+    const int64_t qi_st_bz = H_q * qi_st_h;
+    const int64_t ki_st_h = static_cast<int64_t>(Lk) * D;
     const int ki_st_n = D;
-    const int ki_st_bz = static_cast<int>(ki_st_bz64);
+    const int64_t ki_st_bz = H_kv * ki_st_h;
     const int v_st_d = padded_Lk;
-    const int v_st_h = D * padded_Lk;
-    const int v_st_bz = static_cast<int>(v_st_bz64);
-    const int o_st_h = Lq * D;
+    const int64_t v_st_h = static_cast<int64_t>(D) * padded_Lk;
+    const int64_t v_st_bz = H_kv * v_st_h;
+    const int64_t o_st_h = qi_st_h;
     const int o_st_n = D;
-    const int o_st_bz = static_cast<int>(qi_st_bz64);
+    const int64_t o_st_bz = qi_st_bz;
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
@@ -1261,14 +1253,11 @@ void sage_attn(
             "sage_attn: packed V sequence extent must cover K and be a multiple of 64");
     }
 
-    const int64_t st_q_bz = static_cast<int64_t>(q.stride(0));
-    const int64_t st_k_bz = static_cast<int64_t>(k.stride(0));
-    const int64_t st_v_bz = static_cast<int64_t>(v.stride(0));
-    const int64_t st_o_bz = static_cast<int64_t>(o.stride(0));
-    if (st_q_bz > INT_MAX || st_k_bz > INT_MAX ||
-        st_v_bz > INT_MAX || st_o_bz > INT_MAX) {
+    // Sequence strides still feed the 32-bit within-head tile iterators.
+    if (q.stride(2) > INT_MAX || k.stride(2) > INT_MAX ||
+        v.stride(2) > INT_MAX || o.stride(2) > INT_MAX) {
         throw std::overflow_error(
-            "sage_attn: tensor strides exceed int32 range");
+            "sage_attn: within-head strides exceed int32 range");
     }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
@@ -1360,24 +1349,19 @@ void sage_sdpa(
         v.stride(0), v.stride(1), v.stride(2),
         input_dtype_code, stream);
 
-    // int64_t arithmetic to detect overflow before narrowing to int.
-    const int64_t qi_st_bz64 = static_cast<int64_t>(H_q)  * Lq * D;
-    const int64_t ki_st_bz64 = static_cast<int64_t>(H_kv) * Lk * D;
-    const int64_t v_st_bz64  = static_cast<int64_t>(H_kv) * D * padded_Lk;
-
-    if (qi_st_bz64 > INT_MAX || ki_st_bz64 > INT_MAX || v_st_bz64 > INT_MAX) {
-        throw std::overflow_error(
-            "sage_sdpa: tensor strides exceed int32 range; reduce batch/seq/head dimensions");
-    }
-
-    const int qi_st_h = Lq * D, qi_st_n = D, qi_st_bz = static_cast<int>(qi_st_bz64);
-    const int ki_st_h = Lk * D, ki_st_n = D, ki_st_bz = static_cast<int>(ki_st_bz64);
-    const int o_st_h  = Lq * D, o_st_n  = D, o_st_bz  = static_cast<int>(qi_st_bz64);
+    // Quantization packs each head contiguously, but a batch can exceed 2 GiB.
+    // Keep batch/head addressing wide all the way through the attention launch.
+    const int64_t qi_st_h = static_cast<int64_t>(Lq) * D;
+    const int64_t qi_st_bz = H_q * qi_st_h;
+    const int64_t ki_st_h = static_cast<int64_t>(Lk) * D;
+    const int64_t ki_st_bz = H_kv * ki_st_h;
+    const int64_t o_st_h = qi_st_h, o_st_bz = qi_st_bz;
+    const int qi_st_n = D, ki_st_n = D, o_st_n = D;
     // v_int8 is [B*H_kv*D, padded_Lk] (2D from quant kernel).
     // Attention expects V as [B, H, D, padded_N].
     const int v_st_d  = padded_Lk;
-    const int v_st_h  = D * padded_Lk;
-    const int v_st_bz = static_cast<int>(v_st_bz64);
+    const int64_t v_st_h = static_cast<int64_t>(D) * padded_Lk;
+    const int64_t v_st_bz = H_kv * v_st_h;
 
     launch_sage_attn_kernel(
         q_int8.data(), k_int8.data(), v_int8.data(), o.data(),

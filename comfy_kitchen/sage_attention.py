@@ -30,8 +30,9 @@ class PrequantizedInt8Attention:
 
     Instances own only the quantized tensors, their scales, and an optional
     attention mask in its active layout: expanded 4D values or a prepared 3D
-    buffer containing key values and tile metadata. Prepared masks replace the
-    original mask. Instances never retain the floating-point Q, K, or V inputs.
+    buffer containing key values and tile metadata, or a HIP 5D dense tile
+    buffer. Prepared masks replace the original mask. Instances never retain
+    the floating-point Q, K, or V inputs.
     Create instances with :func:`prequantize_int8_attention` rather than
     constructing them directly.
     """
@@ -67,29 +68,56 @@ def _select_cta_k(
 def _prepare_attn_mask(
     attn_mask: torch.Tensor | None,
     attention_scale: float,
+    *,
+    fuse_short_key_mask: bool = False,
+    fuse_short_dense_mask: bool = False,
 ) -> torch.Tensor | None:
-    """Keep the expanded 4D mask or replace it with a packed 3D key mask."""
-    # Preparation's extra allocation and launch usually lose on short key rows.
-    # Keep this conservative cutoff; large query batches can break even earlier.
-    # HIP paired measurements: benchmarks/hip_mask_attention.py.
-    # Constant tiles of a per-key bias can share the unmasked integer softmax;
-    # varying tiles retain every bias value in FP32.
+    """Prepare masks for the native tile layout or let a short fused call do it."""
+    if (
+        fuse_short_dense_mask
+        and _hip_backend is not None
+        and _hip_backend._sage_can_fuse_dense_mask(attn_mask)
+    ):
+        return attn_mask
+    if (
+        fuse_short_key_mask
+        and _hip_backend is not None
+        and attn_mask is not None
+        and attn_mask.shape[2] <= 256
+        and 64 < attn_mask.shape[3] <= 2048
+        and (attn_mask.stride(2) == 0 or attn_mask.shape[2] == 1)
+    ):
+        return attn_mask
+    # HIP retains native 16-bit dense biases in their original domain; FP32
+    # biases use the base-two softmax domain. Boolean masks pack one bit per pair.
+    # Its floating-score path also supports nonpositive scales.
+    # CUDA's prepared layout is limited to broadcast masks and positive scales.
+    # Paired HIP measurements: benchmarks/hip_mask_overhead.py.
     if (
         attn_mask is None
-        or attn_mask.shape[-1] <= 1024
-        or attn_mask.stride(2) != 0
-        or attention_scale <= 0
+        or attn_mask.shape[-1] <= (64 if _hip_backend is not None else 1024)
+        or (_hip_backend is None and attn_mask.stride(2) != 0)
+        or (_hip_backend is None and attention_scale <= 0)
     ):
         return attn_mask
     mask_batch = 1 if attn_mask.stride(0) == 0 else attn_mask.shape[0]
     mask_heads = 1 if attn_mask.stride(1) == 0 else attn_mask.shape[1]
+    if _hip_backend is not None and attn_mask.stride(2) != 0 and attn_mask.shape[2] > 1:
+        compact_mask = attn_mask[:mask_batch, :mask_heads]
+        packed = _hip_backend._sage_dense_mask_buffer(attn_mask)
+        _hip_backend._C.sage_prepare_dense_mask(
+            _hip_backend._dl(compact_mask),
+            _hip_backend._dl(packed),
+            torch.cuda.current_stream(attn_mask.device).cuda_stream,
+        )
+        return packed
     compact_mask = attn_mask[:mask_batch, :mask_heads, :1, :]
     # HIP retains its 64-key schedule and has its own prepared-mask layout.
     tile_k = _hip_backend._SAGE_CTA_K if _hip_backend is not None else LARGE_CTA_K
     backend = _hip_backend if _hip_backend is not None else _cuda_backend
     wrap = backend._dl if _hip_backend is not None else backend._wrap_for_dlpack
     tiles = (attn_mask.shape[-1] + tile_k - 1) // tile_k
-    # Align each packed row for float2 loads in the attention kernel.
+    # Align each packed row for vector loads in the attention kernel.
     packed_width = ((tiles * (tile_k + 1) + 3) // 4) * 4
     packed = torch.empty(
         (mask_batch, mask_heads, packed_width),
@@ -204,7 +232,12 @@ def _int8_attention_cuda(
     if not math.isfinite(attention_scale):
         raise ValueError(f"scale must be finite, got {attention_scale}")
 
-    attn_mask = _prepare_attn_mask(attn_mask, attention_scale)
+    attn_mask = _prepare_attn_mask(
+        attn_mask,
+        attention_scale,
+        fuse_short_key_mask=kernel_head_dim <= 128,
+        fuse_short_dense_mask=kernel_head_dim <= 128,
+    )
     if _hip_backend is not None:
         output = _hip_backend.sage_int8_sdpa(
             q,
