@@ -144,18 +144,16 @@ class TestCudaBackend:
 
     @pytest.mark.parametrize("group_size", [16, 32, 64])
     def test_fused_requant_matches_eager(self, weight, group_size, monkeypatch):
-        """The fused 6-bit requant kernel reproduces the eager quantizer (search off): same
-        scales and the same int8 grid, up to fp32 summation order in the ALS step."""
-        if not getattr(cuda_backend, "_W6A8_FUSED_QUANT", False):
-            pytest.skip("fused W6A8 requant not built")
+        """The fused ConvRot+requant kernel reproduces the eager quantizer (search off): same
+        scales and int8 grid up to fp32 rounding-order effects, nothing systematic."""
+        if not cuda_backend._WXA8_FUSED_QUANT:
+            pytest.skip("fused requant not built")
         kw = {"bits": 6, "group_size": group_size, "codebook": False, "scale_search": False}
         q, s, c, _, _ = eager_w4a8.quantize_w4a8_int8_weight(weight, **kw)
         monkeypatch.setattr(cuda_backend, "_quantize_w4a8_chunked", lambda *a, **k: pytest.fail("eager path used"))
         qf, sf, cf, corr, cb = cuda_backend.quantize_w4a8_int8_weight(weight, **kw)
         assert corr is None and cb is None and qf.shape == q.shape and sf.dtype == s.dtype
         assert torch.allclose(cf, c, rtol=1e-5, atol=0)
-        # fp32 summation order in the ALS step moves a few group steps by one fp8 ulp and
-        # flips a few boundary assignments by one level; nothing systematic
         sb, sfb = raw(s).int(), raw(sf).int()
         assert (sb != sfb).float().mean().item() < 1e-3 and (sb - sfb).abs().max().item() <= 1
         grid = eager_w4a8._dequant_int4_grouped_to_int8(q, s, None, group_size)
@@ -166,8 +164,8 @@ class TestCudaBackend:
         assert abs(ef - e) < 1e-4 * e
 
     def test_fused_requant_stochastic_rounding(self, weight):
-        if not getattr(cuda_backend, "_W6A8_FUSED_QUANT", False):
-            pytest.skip("fused W6A8 requant not built")
+        if not cuda_backend._WXA8_FUSED_QUANT:
+            pytest.skip("fused requant not built")
         kw = {"bits": 6, "group_size": 32, "codebook": False, "scale_search": False, "stochastic_rounding": 7}
         q, s, c, _, _ = cuda_backend.quantize_w4a8_int8_weight(weight, **kw)
         q2, _, _, _, _ = cuda_backend.quantize_w4a8_int8_weight(weight, **kw)
@@ -176,12 +174,24 @@ class TestCudaBackend:
         assert e < 0.035
 
     def test_requantize_uses_fused_kernel(self, weight, monkeypatch):
-        if not getattr(cuda_backend, "_W6A8_FUSED_QUANT", False):
-            pytest.skip("fused W6A8 requant not built")
+        if not cuda_backend._WXA8_FUSED_QUANT:
+            pytest.skip("fused requant not built")
         qt = QuantizedTensor.from_float(weight, "AsymW4A8Int8Layout", bits=6, group_size=32)
         monkeypatch.setattr(cuda_backend, "_quantize_w4a8_chunked", lambda *a, **k: pytest.fail("eager path used"))
-        rq = qt.requantize_from_float(weight.float())
+        rq = qt.requantize_from_float(weight)   # ComfyUI hands over compute-dtype (bf16/fp16) weights
         assert rel_l2(rq.dequantize(), weight) < 0.03
+
+    def test_long_rows_fall_back_to_eager(self, seed):
+        """A row that does not fit shared memory takes the eager quantizer, same result class."""
+        if not cuda_backend._WXA8_FUSED_QUANT:
+            pytest.skip("fused requant not built")
+        w = torch.randn(8, 65536, device="cuda", dtype=torch.bfloat16) * 0.02
+        kw = {"bits": 6, "group_size": 32, "codebook": False, "scale_search": False}
+        q, s, c, _, _ = cuda_backend.quantize_w4a8_int8_weight(w, **kw)
+        qe, se, ce, _, _ = eager_w4a8.quantize_w4a8_int8_weight(w, **kw)
+        e = rel_l2(eager_w4a8.dequantize_w4a8_int8_weight(q, s, c, group_size=32, output_dtype=torch.float32), w)
+        ee = rel_l2(eager_w4a8.dequantize_w4a8_int8_weight(qe, se, ce, group_size=32, output_dtype=torch.float32), w)
+        assert abs(e - ee) < 1e-4 * ee
 
     def test_four_bit_path_unchanged(self, weight):
         q, s, c, _, cb = eager_w4a8.quantize_w4a8_int8_weight(weight, bits=4)

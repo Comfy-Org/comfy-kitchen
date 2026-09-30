@@ -2074,26 +2074,15 @@ extern "C" {
         int64_t bits,
         cudaStream_t stream);
 
-    bool launch_quantize_w4a8_convrot(
-        const void* rotated,
+    bool launch_quantize_wxa8_convrot_fused(
+        const void* weight,
         const void* codebook,
         void* packed,
         void* s_rel,
         void* s_channel,
         int64_t N,
         int64_t K,
-        int in_dtype_code,
-        bool stochastic,
-        uint64_t seed,
-        cudaStream_t stream);
-
-    bool launch_quantize_w6a8_convrot(
-        const void* rotated,
-        void* packed,
-        void* s_rel,
-        void* s_channel,
-        int64_t N,
-        int64_t K,
+        int bits,
         int G,
         int in_dtype_code,
         bool stochastic,
@@ -3047,66 +3036,37 @@ void dequant_int4_grouped_to_int8_e4m3(
 
 // Fused W4A8 requantize (group_size=16): rotated weight [N,K] -> packed int4
 // [N,K/2] + fp8-e4m3 s_rel [N,K/16] + f32 s_channel [N] in one launch.
-void quantize_w4a8_convrot(
-    nb::ndarray<nb::ndim<2>, nb::device::cuda> rotated,          // [N, K] fp32/fp16/bf16
-    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> codebook,  // [16]
-    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> packed,   // [N, K/2]
-    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> s_rel,   // [N, K/16] e4m3 bits
+// Fused ConvRot + W4A8/W6A8 requant from the raw weight (see ops/w4a8_gemm.cu). Returns false
+// when the row is too long for shared memory: the caller runs the eager quantizer instead.
+bool quantize_wxa8_convrot_fused(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> weight,           // [N, K] fp32/fp16/bf16, unrotated
+    nb::ndarray<float, nb::device::cuda> codebook,               // [16] at 4 bits, else empty
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> packed,   // [N, K*bits/8]
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> s_rel,   // [N, K/group_size] e4m3 bits
     nb::ndarray<float, nb::ndim<1>, nb::device::cuda> s_channel, // [N]
-    bool stochastic, uint64_t seed, uintptr_t stream_ptr) {
-    const int64_t N = rotated.shape(0);
-    const int64_t K = rotated.shape(1);
-    const int in_code = map_dtype_to_code(rotated.dtype());
+    int64_t bits, int64_t group_size, bool stochastic, uint64_t seed, uintptr_t stream_ptr) {
+    const int64_t N = weight.shape(0);
+    const int64_t K = weight.shape(1);
+    const int in_code = map_dtype_to_code(weight.dtype());
     if (in_code < 0 || in_code > 2)
-        throw std::runtime_error("quantize_w4a8_convrot: rotated must be fp32/fp16/bf16");
-    if (N <= 0) throw std::runtime_error("quantize_w4a8_convrot: N must be positive");
-    if (K % 16 != 0) throw std::runtime_error("quantize_w4a8_convrot: K must be a multiple of 16");
-    if (static_cast<int64_t>(packed.shape(0)) != N || static_cast<int64_t>(packed.shape(1)) != K / 2)
-        throw std::runtime_error("quantize_w4a8_convrot: packed must be [N, K/2]");
-    if (static_cast<int64_t>(s_rel.shape(0)) != N || static_cast<int64_t>(s_rel.shape(1)) != K / 16)
-        throw std::runtime_error("quantize_w4a8_convrot: s_rel must be [N, K/16]");
-    if (static_cast<int64_t>(s_channel.shape(0)) != N)
-        throw std::runtime_error("quantize_w4a8_convrot: s_channel must be [N]");
-    if (static_cast<int64_t>(codebook.shape(0)) != 16)
-        throw std::runtime_error("quantize_w4a8_convrot: codebook must be [16]");
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    if (!launch_quantize_w4a8_convrot(
-            rotated.data(), codebook.data(), packed.data(), s_rel.data(), s_channel.data(),
-            N, K, in_code, stochastic, seed, stream))
-        throw std::runtime_error(
-            "quantize_w4a8_convrot: launch failed (group scales exceed shared memory, or "
-            "invalid launch config)");
-}
-
-void quantize_w6a8_convrot(
-    nb::ndarray<nb::ndim<2>, nb::device::cuda> rotated,          // [N, K] fp32/fp16/bf16
-    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> packed,   // [N, 3K/4]
-    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> s_rel,   // [N, K/G] e4m3 bits
-    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> s_channel, // [N]
-    int64_t group_size, bool stochastic, uint64_t seed, uintptr_t stream_ptr) {
-    const int64_t N = rotated.shape(0);
-    const int64_t K = rotated.shape(1);
-    const int in_code = map_dtype_to_code(rotated.dtype());
-    if (in_code < 0 || in_code > 2)
-        throw std::runtime_error("quantize_w6a8_convrot: rotated must be fp32/fp16/bf16");
-    if (N <= 0) throw std::runtime_error("quantize_w6a8_convrot: N must be positive");
-    if (group_size != 16 && group_size != 32 && group_size != 64)
-        throw std::runtime_error("quantize_w6a8_convrot: group_size must be 16, 32 or 64");
-    if (K % 32 != 0 || K % group_size != 0)
-        throw std::runtime_error("quantize_w6a8_convrot: K must be a multiple of 32 and of group_size");
-    if (static_cast<int64_t>(packed.shape(0)) != N || static_cast<int64_t>(packed.shape(1)) != K * 3 / 4)
-        throw std::runtime_error("quantize_w6a8_convrot: packed must be [N, 3K/4]");
+        throw std::runtime_error("quantize_wxa8_convrot_fused: weight must be fp32/fp16/bf16");
+    if (N <= 0) throw std::runtime_error("quantize_wxa8_convrot_fused: N must be positive");
+    if (!((bits == 4 && group_size == 16) || (bits == 6 && (group_size == 16 || group_size == 32 || group_size == 64))))
+        throw std::runtime_error("quantize_wxa8_convrot_fused: bits/group_size must be 4/16 or 6/{16,32,64}");
+    if (K % 256 != 0 || K % group_size != 0)
+        throw std::runtime_error("quantize_wxa8_convrot_fused: K must be a multiple of 256 and of group_size");
+    if (static_cast<int64_t>(packed.shape(0)) != N || static_cast<int64_t>(packed.shape(1)) != K * bits / 8)
+        throw std::runtime_error("quantize_wxa8_convrot_fused: packed must be [N, K*bits/8]");
     if (static_cast<int64_t>(s_rel.shape(0)) != N || static_cast<int64_t>(s_rel.shape(1)) != K / group_size)
-        throw std::runtime_error("quantize_w6a8_convrot: s_rel must be [N, K/group_size]");
+        throw std::runtime_error("quantize_wxa8_convrot_fused: s_rel must be [N, K/group_size]");
     if (static_cast<int64_t>(s_channel.shape(0)) != N)
-        throw std::runtime_error("quantize_w6a8_convrot: s_channel must be [N]");
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    if (!launch_quantize_w6a8_convrot(
-            rotated.data(), packed.data(), s_rel.data(), s_channel.data(),
-            N, K, static_cast<int>(group_size), in_code, stochastic, seed, stream))
-        throw std::runtime_error(
-            "quantize_w6a8_convrot: launch failed (group scales exceed shared memory, or "
-            "invalid launch config)");
+        throw std::runtime_error("quantize_wxa8_convrot_fused: s_channel must be [N]");
+    if (bits == 4 && static_cast<int64_t>(codebook.size()) != 16)
+        throw std::runtime_error("quantize_wxa8_convrot_fused: codebook must be [16] at 4 bits");
+    return launch_quantize_wxa8_convrot_fused(
+        weight.data(), bits == 4 ? codebook.data() : nullptr, packed.data(), s_rel.data(), s_channel.data(),
+        N, K, static_cast<int>(bits), static_cast<int>(group_size), in_code, stochastic, seed,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Returns the code width (4 or 6) implied by the packed weight row.
@@ -4151,15 +4111,10 @@ NB_MODULE(_C, m) {
           nb::arg("qw"), nb::arg("s_rel"), nb::arg("codebook").none(), nb::arg("out"),
           nb::arg("g"), nb::arg("stream_ptr"));
 
-    m.def("quantize_w4a8_convrot", &quantize_w4a8_convrot,
-          "Fused W4A8 requant (group_size=16): rotated weight -> packed int4 + fp8 s_rel + f32 s_channel",
-          nb::arg("rotated"), nb::arg("codebook"), nb::arg("packed"), nb::arg("s_rel"),
-          nb::arg("s_channel"), nb::arg("stochastic"), nb::arg("seed"), nb::arg("stream_ptr"));
-
-    m.def("quantize_w6a8_convrot", &quantize_w6a8_convrot,
-          "Fused W6A8 requant (group_size 16/32/64): rotated weight -> two-plane 6-bit codes + fp8 s_rel + f32 s_channel",
-          nb::arg("rotated"), nb::arg("packed"), nb::arg("s_rel"), nb::arg("s_channel"),
-          nb::arg("group_size"), nb::arg("stochastic"), nb::arg("seed"), nb::arg("stream_ptr"));
+    m.def("quantize_wxa8_convrot_fused", &quantize_wxa8_convrot_fused,
+          "Fused ConvRot + W4A8/W6A8 requant from the raw weight; false -> row too long for shared memory.",
+          nb::arg("weight"), nb::arg("codebook"), nb::arg("packed"), nb::arg("s_rel"), nb::arg("s_channel"),
+          nb::arg("bits"), nb::arg("group_size"), nb::arg("stochastic"), nb::arg("seed"), nb::arg("stream_ptr"));
 
     m.def("w4a8_codebook_gemm_chunked", &w4a8_codebook_gemm_chunked,
           "Chunked fused W4A8: per-chunk codebook+s_rel dequant -> L2-hot int8 -> strided int8 GEMM",
