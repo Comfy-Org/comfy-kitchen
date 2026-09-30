@@ -157,6 +157,20 @@ def _prepared_mask_width(kv_length: int) -> int:
     return ((tiles * (_MASK_TILE_K + 1) + 3) // 4) * 4
 
 
+def _vector_readable(t: torch.Tensor) -> bool:
+    """Whether a 16-byte vector load can address every element of ``t``.
+
+    The kernels read whole rows with 16-byte loads whose offsets are computed
+    from the strides, so every stride has to be a multiple of 8 halfs and the
+    base has to be 16-byte aligned. A tensor from permute/slice often is and
+    often is not, so this is asked rather than assumed -- it is what decides
+    whether a strided Q can be read in place instead of copied.
+    """
+    if t.data_ptr() % 16 != 0:
+        return False
+    return all(stride % 8 == 0 for stride in t.stride()[:-1])
+
+
 def _prepare_key_mask(mask: torch.Tensor) -> torch.Tensor:
     """Pack a key-broadcast mask into the 3D fp32 layout the kernel reads.
 
@@ -378,29 +392,29 @@ def sageattn(
     if sm_scale is None:
         sm_scale = head_dim ** -0.5
 
-    # The quantization and attention kernels read q and k with 16-byte vector
-    # loads whose offsets are computed from the strides. Non-contiguous inputs
-    # (from permute/slice) can read past the intended row into the padding
-    # row left by the slice, producing wrong quantized values. Make them
-    # contiguous; the copy is one kernel and cheaper than a wrong result.
-    if not q.is_contiguous():
-        q = q.contiguous()
+    # The prepass quantizer and the V staging read their operands with 16-byte
+    # vector loads, so K and V have to be laid out for that.
     if not k.is_contiguous():
         k = k.contiguous()
     if not v.is_contiguous():
         v = v.contiguous()
 
-    # Write-back uses 16-byte vector stores, so q's strides must be multiples of
-    # 8 halfs. Non-contiguous q (from permute/slice) would misalign them.
-    for dim in (0, 1, 2):
-        if q.stride(dim) % 8 != 0:
-            raise ValueError(
-                "native backend requires q strides that are multiples of 8 halfs "
-                "(16-byte aligned write-back). Use contiguous tensors. "
-                f"Got strides={q.stride()}."
-            )
-
-    o = torch.empty_like(q)
+    # The result is packed [B, S, H, D] and handed back as a [B, H, S, D] view.
+    # Every ComfyUI attention path ends with
+    # `out.transpose(1, 2).reshape(batch, -1, heads * dim)`, and on
+    # HND-contiguous storage that reshape is a full copy of the result: on the
+    # short-KV cross-attention shapes it cost as much as the attention itself.
+    # The kernel writes through the strides the tensor reports, so producing the
+    # layout the caller wants is free, and the reshape becomes a view.
+    batch = q.size(0)
+    q_heads = q.size(1) if tensor_layout == "HND" else q.size(2)
+    qo_len = q.size(2) if tensor_layout == "HND" else q.size(1)
+    out = torch.empty(
+        batch, qo_len, q_heads, head_dim,
+        dtype=dtype if input_dtype != torch.float32 else torch.float16,
+        device=q.device,
+    )
+    o = out.transpose(1, 2) if tensor_layout == "HND" else out
 
     kv_len = k.size(2) if tensor_layout == "HND" else k.size(1)
 
@@ -419,34 +433,42 @@ def sageattn(
             v_for_attn = v16.permute(0, 2, 1, 3).contiguous()
     else:
         v_for_attn = v if v.dtype == torch.float16 else v.half()
-    v_scale = torch.empty(
-        q.size(0), k.size(1) if tensor_layout == "HND" else k.size(2),
-        (kv_len + 31) // 32, device=q.device, dtype=torch.float32,
-    )
+    # v_scale is a placeholder the ported op's signature carries and the kernel
+    # never reads (see qk_int8_sv_bf16_attn_gfx103x_t), so there is no reason to
+    # allocate the per-32-key float buffer a quantized-V kernel would want.
+    v_scale = torch.empty(0, device=q.device, dtype=torch.float32)
 
     if smooth_k:
         k_mean = ops.mean_seq(k, layout_code)
     else:
         k_mean = torch.empty(0, device=q.device, dtype=q.dtype)
 
-    # In-kernel Q quantization avoids a Q round-trip for short KV, where the
-    # prepass dominates. Only safe for contiguous, non-causal q.
+    # In-kernel Q quantization lets the attention kernel quantize Q itself, so Q
+    # never has to be materialized. It is off by default and the env override
+    # exists only to measure it, for two reasons.
     #
-    # It is off unless CK_GFX1035_INQ=1, because it does not agree with the
-    # prepass: the kernel scales each query row against its own amax while the
-    # prepass scales MIN_BLK_Q rows together, so the int8 differs. A prequantized
-    # snapshot is packed by the prepass, so consuming one back has to use the
-    # prepass too, and
-    # test_prequantized_attention_is_bitwise_identical_to_fused pins that the
-    # fused call and the snapshot of one input agree exactly. The override stays
-    # so a tuning run can still measure it.
+    # It does not agree with the prepass: the kernel scales each query row
+    # against its own amax while the prepass scales MIN_BLK_Q rows together, so
+    # the int8 differs and a prequantized snapshot -- which is packed by the
+    # prepass -- would not match the fused call it came from.
+    # test_prequantized_attention_is_bitwise_identical_to_fused pins that match.
+    # And with the output packed it measured no faster anyway (1.80 vs 1.78 ms
+    # on SDXL cross-attention at 6144x77x10x64), the Q round-trip not being what
+    # the short-KV shapes spend their time on.
     skip_inq = bool(
         head_dim in _SUPPORTED_HEAD_DIMS
         and not is_causal
         and kv_len <= 1024
-        and q.is_contiguous()
+        and _vector_readable(q)
         and os.getenv("CK_GFX1035_INQ") == "1"
     )
+    if not _vector_readable(q):
+        # The quantizer reads whole 8-element packs whose offsets come from the
+        # strides, so a Q whose strides are not multiples of 8 halfs (or whose
+        # base is misaligned) has to be repacked. A Q that is merely *strided* --
+        # the usual [B,S,H,D].transpose(1,2) -- is read in place: on the
+        # short-KV cross-attention shapes this copy was a third of the call.
+        q = q.contiguous()
     q_fp = q
     if skip_inq and tensor_layout == "NHD":
         b_, s_, h_, d_ = q.shape
