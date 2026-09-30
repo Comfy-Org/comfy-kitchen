@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024 SageAttention team; 2025 NVIDIA CORPORATION & AFFILIATES.
 // SM120 D128 unmasked specialization. Arithmetic helpers are shared with the
-// ordinary kernel. Only operand movement and register allocation change.
+// ordinary kernel. Positive-scale arithmetic is retained; nonpositive scales
+// apply scaling before the maximum and the padding mask.
 #pragma once
 #include "qk_int_sv_i8_cuda.cuh"
 #include "tma_pipeline.cuh"
@@ -9,6 +10,7 @@
 #include <cuda.h>
 
 namespace comfy_sm120 {
+template <bool positive_scale>
 __global__ __launch_bounds__(384, 1) void dense_tma(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V, nv_bfloat16 *__restrict__ O, float *__restrict__ Q_scale,
     float *__restrict__ K_scale, float *__restrict__ V_scale, uint32_t qo_len, uint32_t kv_len,
@@ -218,7 +220,22 @@ __global__ __launch_bounds__(384, 1) void dense_tma(
         q_scale * K_scale[k_scale_idx + iter * k_scale_advance_offset];
     const float tile_scale = original_sm_scale * dequant_scale;
     uint32_t RS_u8[1][4][4];
-    if (iter + 1 < num_iterations) {
+    if constexpr (!positive_scale) {
+      // Max-before-scale is valid only for a positive scale. Scale first for
+      // zero/negative values, then mask in the scaled domain so padding cannot
+      // turn into positive logits (negative scale) or valid logits (zero).
+      auto &scores = reinterpret_cast<float (&)[1][8][8]>(RS);
+#pragma unroll
+      for (int fk = 0; fk < 8; ++fk) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+          scores[0][fk][i] = __int2float_rz(RS[0][fk][i]) * tile_scale;
+      }
+      if (iter + 1 == num_iterations)
+        apply_out_of_bound_mask<1, 8>(iter * 128 + 2 * (lane_id % 4), scores,
+                                      kv_len);
+      update_mdo_f32_u8<1, 8, 8>(scores, RO, m, d, S_U8_OFFSET, RS_u8);
+    } else if (iter + 1 < num_iterations) {
       update_mdo_i32_u8<1, 8, 8>(RS, RO, m, d, tile_scale, S_U8_OFFSET, RS_u8);
     } else {
       // Retain the ordinary kernel's last-tile conversion and OOB masking.

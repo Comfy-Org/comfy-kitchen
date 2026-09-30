@@ -68,12 +68,15 @@ bool launch_dense_tma_sm120(const DenseTmaArgs &a, cudaStream_t stream) {
   if (!make_map(&mapK, a.k, kd, ks) || !make_map(&mapV, a.v, vd, vs))
     return false;
   constexpr int shared_bytes = 4 * 128 * 128 + 1024;
-  error = cudaFuncSetAttribute(comfy_sm120::dense_tma,
+  // Separate instantiations keep the common positive-scale loop unchanged.
+  auto kernel = a.sm_scale > 0 ? comfy_sm120::dense_tma<true>
+                              : comfy_sm120::dense_tma<false>;
+  error = cudaFuncSetAttribute(kernel,
                                cudaFuncAttributeMaxDynamicSharedMemorySize,
                                shared_bytes);
   if (error != cudaSuccess)
     throw std::runtime_error(cudaGetErrorString(error));
-  comfy_sm120::dense_tma<<<dim3((a.qo_len + 127) / 128, a.qo_heads, a.batch),
+  kernel<<<dim3((a.qo_len + 127) / 128, a.qo_heads, a.batch),
                            dim3(32, 12), shared_bytes, stream>>>(
       static_cast<int8_t *>(a.q), static_cast<int8_t *>(a.k),
       static_cast<int8_t *>(a.v), static_cast<nv_bfloat16 *>(a.o),
