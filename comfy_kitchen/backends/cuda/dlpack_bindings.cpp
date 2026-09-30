@@ -2725,6 +2725,44 @@ static std::tuple<int64_t, int64_t, int64_t> check_int8_gemm_operands(
     return {M, N, K};
 }
 
+extern "C" bool launch_cutlass_int8_indexed_gate(
+    const int8_t*,const int8_t*,const float*,const float*,void*,const void*,
+    const int32_t*,const void*,int64_t,int64_t,int64_t,int64_t,cudaStream_t);
+
+bool cutlass_int8_indexed_gate(
+    nb::ndarray<int8_t,nb::ndim<2>,nb::device::cuda> a,
+    nb::ndarray<int8_t,nb::ndim<2>,nb::device::cuda> b,
+    nb::ndarray<float,nb::device::cuda> xs,
+    nb::ndarray<float,nb::device::cuda> ws,
+    nb::ndarray<nb::ndim<2>,nb::device::cuda> gate,
+    nb::ndarray<int32_t,nb::ndim<1>,nb::device::cuda> rows,
+    nb::ndarray<nb::ndim<2>,nb::device::cuda> residual,
+    nb::ndarray<nb::ndim<2>,nb::device::cuda> out,
+    uintptr_t stream_ptr) {
+  const char* who="cutlass_int8_indexed_gate";
+  const int64_t m=a.shape(0), k=a.shape(1), n=b.shape(0);
+  if (b.shape(1)!=k || gate.shape(1)!=n || rows.size()!=m ||
+      residual.shape(0)!=m || residual.shape(1)!=n ||
+      out.shape(0)!=m || out.shape(1)!=n || xs.size()!=m || ws.size()!=n)
+    throw std::runtime_error("cutlass_int8_indexed_gate: incompatible shapes");
+  if (map_dtype_to_code(gate.dtype())!=2 || map_dtype_to_code(residual.dtype())!=2 ||
+      map_dtype_to_code(out.dtype())!=2)
+    throw std::runtime_error("cutlass_int8_indexed_gate: gate, residual and output must be bf16");
+  const int device=a.device_id();
+  if (b.device_id()!=device || xs.device_id()!=device || ws.device_id()!=device ||
+      gate.device_id()!=device || rows.device_id()!=device || residual.device_id()!=device || out.device_id()!=device)
+    throw std::runtime_error("cutlass_int8_indexed_gate: tensors must share a device");
+  if (m==0 || n==0) return true;
+  if (k==0) return false;
+  need_contiguous(a,who,"a"); need_contiguous(b,who,"b");
+  need_contiguous(xs,who,"xs"); need_contiguous(ws,who,"ws");
+  need_contiguous(gate,who,"gate"); need_contiguous(rows,who,"rows");
+  need_contiguous(residual,who,"residual"); need_contiguous(out,who,"out");
+  return launch_cutlass_int8_indexed_gate(a.data(),b.data(),xs.data(),ws.data(),
+      out.data(),gate.data(),rows.data(),residual.data(),m,n,k,gate.shape(0),
+      reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
 // INT8 GEMM + fused dequant (D = acc * xs[m] * ws[n] + bias[n]) via CUTLASS.
 // Returns true on success; false means caller falls back to cuBLAS + dequant.
 bool cutlass_int8_dequant(
@@ -3994,6 +4032,10 @@ NB_MODULE(_C, m) {
           nb::arg("allow_sm80_cutlass"),
           nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"));
+
+    m.def("cutlass_int8_indexed_gate", &cutlass_int8_indexed_gate,
+          nb::arg("a"),nb::arg("b"),nb::arg("xs"),nb::arg("ws"),nb::arg("gate"),
+          nb::arg("rows"),nb::arg("residual"),nb::arg("out"),nb::arg("stream_ptr"));
 
     m.def("cutlass_int8_dequant", &cutlass_int8_dequant,
           "INT8 GEMM + fused rowwise x colwise dequant + bias via CUTLASS; false -> fall back to cuBLAS",
