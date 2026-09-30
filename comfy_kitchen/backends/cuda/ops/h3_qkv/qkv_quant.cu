@@ -9,9 +9,9 @@
 #include <cuda_runtime.h>
 
 #ifdef COMFY_HAVE_CUTLASS
-extern "C" int h3_qkv_available() { return 1; }
 
 #include "mma.cuh"
+#include "runtime.cuh"
 
 namespace h3_qkv_full {
 using h3_qkv::Mma;
@@ -351,6 +351,13 @@ int launch(const int8_t *A, const int8_t *B, const float *xs, const float *ws,
   return cudaGetLastError() == cudaSuccess;
 }
 } // namespace h3_qkv_full
+
+extern "C" int h3_sample_available();
+extern "C" int h3_finish_available();
+extern "C" int h3_qkv_available() {
+  return h3_qkv::loadable(h3_qkv_full::direct<5>) &&
+         h3_sample_available() && h3_finish_available();
+}
 
 extern "C" int h3_qkv_quant_kv(const int8_t *A, const int8_t *B,
                                const float *xs, const float *ws, void *D,

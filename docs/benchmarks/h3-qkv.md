@@ -7,8 +7,8 @@ The CUDA path combines a 5376→21504 projection, per-head weighted RMSNorm, 96-
 ## Scope
 
 - CUDA, SM120, one packed sequence, 56 heads × 128 channels, BF16 RoPE/norm weights, no bias. Inputs follow the public API's documented shapes.
-- Native fusion is selected for 8192–200000 rows, contiguous and 16-byte aligned inputs. Smaller inputs keep the existing projection/preparation chain because the fused kernel was slower in measurement. Other CUDA architectures/layouts use the fallback. CPU/ROCm are outside this API's declared contract.
-- Source builds without CUTLASS return to the fallback before launching the fused chain.
+- Native fusion is selected for 8192–200000 rows, 16-byte aligned inputs after contiguous normalization. Smaller inputs keep the existing projection/preparation chain because the fused kernel was slower in measurement. Other CUDA architectures use the fallback. CPU/ROCm are outside this API's declared contract.
+- Source builds without CUTLASS or a loadable device image return to the fallback before launching the fused chain. The eager projection fallback processes at most 1024 rows of INT32/FP32 scratch at a time.
 - Graph/Inductor use an opaque custom op and fake tensor contract. The fallback avoids the direct CUTLASS launcher while capturing because that launcher's workspace allocation can invalidate capture for large M.
 - Finite model values and finite positive normal FP32 epsilon are expected. Existing APIs remain unchanged.
 
@@ -24,13 +24,13 @@ RTX 5090 D v2, Torch 2.12.0+cu130, CUDA 13.0.88, Kitchen base 19ea55b. Microbenc
 
 | Rows | Stock ms | Fused/selected ms | Reduction |
 |---:|---:|---:|---:|
-| 4096 | 2.142864 | 2.182340 | -1.842% |
-| 4097 | 2.232588 | 2.249572 | -0.761% |
-| 8192 | 4.491016 | 4.174260 | 7.053% |
-| 14850 | 8.352496 | 7.396684 | 11.443% |
-| 32700 | 18.809397 | 15.913524 | 15.396% |
-| 87142 | 50.810171 | 42.261513 | 16.825% |
-| 90461 | 52.681864 | 43.918579 | 16.634% |
+| 4096 | 2.169664 | 2.149704 | 0.920% |
+| 4097 | 2.240808 | 2.243132 | -0.104% |
+| 8192 | 4.491612 | 4.173356 | 7.086% |
+| 14850 | 8.336608 | 7.397484 | 11.265% |
+| 32700 | 18.807447 | 15.913076 | 15.389% |
+| 87142 | 50.770336 | 42.275801 | 16.731% |
+| 90461 | 52.687628 | 43.912533 | 16.655% |
 
 4096/4097 rows select the fallback; small timing differences there are measurement noise, not native-fusion claims.
 
@@ -44,4 +44,7 @@ Current ComfyUI 8cfe5e1, Larry v4 INT8 / Euler-beta 8 steps / seed42 / CFG1 / sh
 - This experiment explicitly selects the same Kitchen INT8 attention in both arms. It is not a proposed generic ComfyUI attention-dispatch implementation. A proper upstream consumer must preserve selected attention and patch contracts.
 - No fresh RGB/PCM decode or continuous-service throughput measurement is claimed. Do not add this percentage to other fusions or the historical SpeedKit 6.49% result.
 
-The portable CUDA wrapper initially used separate raw-source kernels; the submitted implementation removes unused planes/helpers and shares the CUTLASS Mma type. It has been rebuilt and retested after this cleanup: **20 tests passed** in 1.62 seconds (including declined-dispatch scratch lifetime). Existing Comfy Org/NVIDIA source notices are retained; CUTLASS is a build dependency under its own BSD license.
+The portable CUDA wrapper initially used separate raw-source kernels; the submitted implementation removes unused planes/helpers and shares the CUTLASS Mma type. It has been rebuilt and retested after this cleanup: **24 tests passed, 1 skipped** in 1.76 seconds (including 87142-row strided-input memory, no-CUTLASS projection, and declined-dispatch scratch lifetime; the two-device test was skipped in the one-GPU container). Existing Comfy Org/NVIDIA source notices are retained; CUTLASS is a build dependency under its own BSD license.
+
+
+Review follow-up: an actual sdist was built with `python setup.py --no-cuda --no-hip sdist`; all 65 CUDA source entries, including the new runtime header and QKV `.cu` files, were present. CUDA image probes were compiled separately with SM80-only SASS and without CUTLASS: both returned unavailable on SM120 before dispatch, and subsequent CUDA work succeeded. See `h3-qkv-image-probes.json` and `h3-qkv-sdist-check.json`.

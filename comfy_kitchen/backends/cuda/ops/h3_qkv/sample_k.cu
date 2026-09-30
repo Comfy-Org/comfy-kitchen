@@ -10,6 +10,7 @@
 #ifdef COMFY_HAVE_CUTLASS
 
 #include "mma.cuh"
+#include "runtime.cuh"
 
 namespace h3_qkv_sample {
 using h3_qkv::Mma;
@@ -185,4 +186,13 @@ extern "C" int h3_sample_gather(const void *Q, const void *XS, const void *ROPE,
       (const int8_t *)Q, (const float *)XS, (const __nv_bfloat16 *)ROPE,
       (int8_t *)SQ, (float *)SX, (__nv_bfloat16 *)SR, M);
   return cudaGetLastError() == cudaSuccess;
+}
+
+extern "C" int h3_sample_available() {
+#ifdef COMFY_HAVE_CUTLASS
+  return h3_qkv::loadable(h3_qkv_sample::direct<4>) &&
+         h3_qkv::loadable(gather_sample_rows);
+#else
+  return 0;
+#endif
 }

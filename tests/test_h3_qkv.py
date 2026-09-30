@@ -122,3 +122,51 @@ def test_declined_native_releases_scratch(monkeypatch):
     monkeypatch.setattr(cuda._C, "h3_qkv_quant", lambda *a: False)
     monkeypatch.setattr(h3_qkv, "_fallback", check)
     h3_qkv._op(*args, 1e-5)
+
+
+@pytest.mark.parametrize("m", [37, 1025, 8193])
+def test_no_cutlass_matches_projection(monkeypatch, m):
+    from comfy_kitchen.backends import cuda
+
+    if cuda._C is None:
+        pytest.skip("CUDA extension required for the independent reference")
+    args = operands(m)
+    expected = _fallback(*args, 1e-5)
+    monkeypatch.setattr(cuda._C, "cutlass_int8_dequant", lambda *a: False)
+    actual = _fallback(*args, 1e-5)
+    for out, ref in zip(actual, expected, strict=True):
+        assert torch.equal(out, ref)
+
+
+def test_strided_large_sequence_memory():
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120 native memory regression")
+    args = list(operands(87142))
+    expected = _op(*args, 1e-5)
+    padded = torch.empty((87142, 5377), device="cuda", dtype=torch.int8)
+    padded[:, :5376] = args[0]
+    before_input = args[0]
+    args[0] = padded[:, :5376]
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    actual = _op(*args, 1e-5)
+    torch.cuda.synchronize()
+    # Native outputs, BF16 scratch and the compact input copy fit in 7 GiB.
+    # The old fallback needed several 7.5 GB INT32/FP32 projection planes.
+    assert torch.cuda.max_memory_allocated() - before < 7 * 1024**3
+    for out, ref in zip(actual, expected, strict=True):
+        assert torch.equal(out, ref)
+    assert torch.equal(args[0], before_input)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_fallback_with_different_current_device():
+    with torch.cuda.device(1):
+        args = operands(37)
+        expected = _fallback(*args, 1e-5)
+    with torch.cuda.device(0):
+        actual = _fallback(*args, 1e-5)
+        assert torch.cuda.current_device() == 0
+    for out, ref in zip(actual, expected, strict=True):
+        assert torch.equal(out, ref)

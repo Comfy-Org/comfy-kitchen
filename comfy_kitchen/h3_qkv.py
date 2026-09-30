@@ -6,7 +6,7 @@ import math
 import torch
 
 from .backends import cuda
-from .sage_attention import PrequantizedInt8Attention, prequantize_int8_attention
+from .sage_attention import PrequantizedInt8Attention, _select_cta_k, prequantize_int8_attention
 
 
 def _validate(a, weight, a_scale, weight_scale, rope, q_weight, k_weight, eps):
@@ -40,22 +40,28 @@ def _fallback(a, weight, a_scale, weight_scale, rope, q_weight, k_weight, eps):
     from . import rms_rope_split_half_
     from .backends.eager.quantization import mm_int8
 
+    a, weight, a_scale, weight_scale = (
+        t.contiguous() for t in (a, weight, a_scale, weight_scale)
+    )
     out = torch.empty((a.shape[0], 21504), device=a.device, dtype=torch.bfloat16)
     empty = out.new_empty(0)
     used = False
-    if (
-        cuda._C is not None
-        and not torch.cuda.is_current_stream_capturing()
-        and all(t.is_contiguous() for t in (a, weight, a_scale, weight_scale))
-    ):
-        used = cuda._C.cutlass_int8_dequant(
-            *(cuda._wrap_for_dlpack(t) for t in (a, weight, a_scale, weight_scale, empty, out)),
-            2,
-            torch.cuda.current_stream(a.device).cuda_stream,
-        )
+    with torch.cuda.device(a.device):
+        if cuda._C is not None and not torch.cuda.is_current_stream_capturing():
+            used = cuda._C.cutlass_int8_dequant(
+                *(cuda._wrap_for_dlpack(t) for t in (a, weight, a_scale, weight_scale, empty, out)),
+                2,
+                torch.cuda.current_stream(a.device).cuda_stream,
+            )
     if not used:
-        acc = mm_int8(a, weight.T).float()
-        out = ((acc * a_scale) * weight_scale.T + 0.0).to(torch.bfloat16)
+        # Bound INT32/FP32 scratch even when CUTLASS is unavailable. Preserve
+        # both FP32 scaling roundings and the BF16 projection rounding.
+        for start in range(0, len(a), 1024):
+            stop = min(start + 1024, len(a))
+            acc = mm_int8(a[start:stop], weight.T).float()
+            acc.mul_(a_scale[start:stop]).mul_(weight_scale.T).add_(0.0)
+            out[start:stop].copy_(acc)
+            del acc
     q, k, v = out.split(7168, dim=-1)
     q = q.reshape(1, len(a), 56, 128)
     k = k.reshape(1, len(a), 56, 128)
@@ -77,10 +83,11 @@ def _op(
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _validate(a, weight, a_scale, weight_scale, rope, q_weight, k_weight, eps)
-    inputs = (a, weight, a_scale, weight_scale, rope, q_weight, k_weight)
+    inputs = tuple(t.contiguous() for t in (a, weight, a_scale, weight_scale, rope, q_weight, k_weight))
     m = len(a)
     if (
         8192 <= m <= 200000
+        and _select_cta_k(128, m, has_mask=False) == 128
         and cuda._C is not None
         and hasattr(cuda._C, "h3_qkv_quant")
         and torch.cuda.get_device_capability(a.device) == (12, 0)
@@ -141,7 +148,7 @@ def _op(
 def _fake(a, weight, a_scale, weight_scale, rope, q_weight, k_weight, eps):
     _validate(a, weight, a_scale, weight_scale, rope, q_weight, k_weight, eps)
     m = a.shape[0]
-    cta_k = 128 if m > 1024 else 64
+    cta_k = _select_cta_k(128, m, has_mask=False)
     parts = (m + 127) // 128
     kv_parts = (m + cta_k - 1) // cta_k
     return (
@@ -164,5 +171,6 @@ def h3_qkv_prequantize(a, weight, a_scale, weight_scale, rope, q_weight, k_weigh
     """
     q, k, v, qs, ks, vs = _op(a, weight, a_scale, weight_scale, rope, q_weight, k_weight, eps)
     return PrequantizedInt8Attention(
-        q, k, v, qs, ks, vs, 128, torch.bfloat16, 128**-0.5, 128 if len(a) > 1024 else 64, None
+        q, k, v, qs, ks, vs, 128, torch.bfloat16, 128**-0.5,
+        _select_cta_k(128, len(a), has_mask=False), None
     )

@@ -2806,6 +2806,10 @@ bool h3_qkv_quant(nb::list tensors, float eps, uintptr_t st) {
       cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
                              device) != cudaSuccess)
     throw std::runtime_error("h3_qkv_quant: device capability query failed");
+  const auto pending_error = cudaGetLastError();
+  if (pending_error != cudaSuccess)
+    throw std::runtime_error(std::string("H3 pre-existing CUDA error: ") +
+                             cudaGetErrorString(pending_error));
   if (major != 12 || minor != 0 || !h3_qkv_available())
     return false;
   auto ptr = [&](int i) { return t[i].data(); };

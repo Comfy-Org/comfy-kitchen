@@ -7,7 +7,8 @@ from pathlib import Path
 from test_h3_qkv import operands
 from comfy_kitchen.h3_qkv import _fallback, _op
 
-r = Path.cwd()
+r = Path(__file__).resolve().parents[1] / "docs" / "benchmarks"
+r.mkdir(parents=True, exist_ok=True)
 
 report = {"torch": torch.__version__, "gpu": torch.cuda.get_device_name(), "records": []}
 for m in [4096, 4097, 8192, 14850, 32700, 87142, 90461]:
@@ -44,7 +45,7 @@ for m in [4096, 4097, 8192, 14850, 32700, 87142, 90461]:
         "equal": equal,
     }
     report["records"].append(row)
-    (r / "qkv-eager-benchmark.json").write_text(json.dumps(report, indent=2))
+    (r / "h3-qkv-benchmark.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(row), flush=True)
     del outputs, functions, args
     torch.cuda.empty_cache()

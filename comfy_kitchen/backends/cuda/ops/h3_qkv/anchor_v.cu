@@ -3,6 +3,7 @@
 // All rights reserved.
 // K detector from Kitchen/SageAttention; same nine-key criterion as
 // sage_sdpa_quantize.
+#include "runtime.cuh"
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -195,8 +196,15 @@ extern "C" int h3_finish_v(const void *v, const float *partial, float *scales,
                            float *inv, int8_t *out, int m, uintptr_t st) {
   int parts = (m + 127) / 128, padded = parts * 128;
   finish_scales<<<28, 256, 0, (cudaStream_t)st>>>(partial, scales, inv, parts);
+  if (cudaGetLastError() != cudaSuccess)
+    return 0;
   quantize_v<<<(int64_t(56) * 128 * padded + 255) / 256, 256, 0,
                (cudaStream_t)st>>>((const __nv_bfloat16 *)v, out, inv, m,
                                    padded);
   return cudaGetLastError() == cudaSuccess;
+}
+
+extern "C" int h3_finish_available() {
+  return h3_qkv::loadable(detect_k_anchor<__nv_bfloat16>) &&
+         h3_qkv::loadable(finish_scales) && h3_qkv::loadable(quantize_v);
 }
