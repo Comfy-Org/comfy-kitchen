@@ -485,16 +485,22 @@ class TestTensorWiseINT8Layout:
     def test_int8_linear_correctness(self, seed, backend):
         """int8_linear matches the exact int8 arithmetic of its own activation.
 
-        A bitwise cross-backend comparison is not the right contract here: the
-        eager backend divides by the activation scale in the activation dtype
-        (fp16/bf16), while the HIP kernel divides in fp32, and the library's own
-        quantizer parity test accepts that as up to one int8 LSB on <=1% of
-        codes (test_qdq.py::test_quantize_int8_rowwise_all_backends, atol=1.0).
-        One activation LSB propagates through the dot product, so the two
-        backends' outputs legitimately differ by more than fp32 rounding.
-        Measured on the gfx1103 iGPU the HIP output is the closer of the two to
-        the float64 reference (6.6e-3 vs 7.0e-3 max relative), so this asserts
-        accuracy against exact int8 arithmetic plus a loose cross-backend bound.
+        A bitwise cross-backend comparison is not the right contract for the
+        compiled HIP backend: eager divides by the activation scale in the
+        activation dtype (fp16/bf16) while the HIP kernel divides in fp32, and
+        the library's own quantizer parity test accepts that as up to one int8
+        LSB on <=1% of codes (test_qdq.py::test_quantize_int8_rowwise_all_backends,
+        atol=1.0). One activation LSB propagates through the dot product, so the
+        two legitimately differ by more than fp32 rounding. Measured on gfx1035
+        the compiled HIP output is in fact the closer of the two to exact int8
+        arithmetic (4.8e-4 max relative, vs eager's 2.1e-1), so the meaningful
+        assertion is the exactness one below.
+
+        The relaxed cross-backend bound is therefore scoped to that backend only.
+        Upstream's 1% is kept for every other backend, because they do meet it and
+        a wider bound there would stop watching hardware this fork does not own.
+        Measured on gfx1035, mismatch ratio vs eager: hip 0.111, triton 0.000,
+        eager 0.000.
         """
         import comfy_kitchen as ck
         from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
@@ -521,10 +527,11 @@ class TestTensorWiseINT8Layout:
         assert_values_close(
             out.float(), exact, rtol=5e-3, atol=5e-3, name=f"int8_linear_{backend}_exact"
         )
-        # And the backends agree to within the accepted activation-LSB spread.
+        # And the backends agree, to upstream's bound except where the
+        # activation-dtype scale division above actually forces a wider one.
         assert_values_close(
             out, ref_out, rtol=1e-2, atol=1e-2, name=f"int8_linear_{backend}",
-            max_mismatch_ratio=0.15,
+            max_mismatch_ratio=0.15 if backend == "hip" else 0.01,
         )
 
     def test_int8_linear_cuda_single_row_gemv(self, seed):
