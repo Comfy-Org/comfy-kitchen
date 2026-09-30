@@ -5,6 +5,7 @@ import weakref
 
 import pytest
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import comfy_kitchen as ck
 import comfy_kitchen.sage_attention as sage_attention_module
@@ -460,9 +461,39 @@ def test_int8_attention_long_sequence_and_partial_tile(scale):
     torch.manual_seed(31)
     q, k, v = _qkv(1, 4, 4, 129, 8193, 128)
     actual = ck.int8_attention(q, k, v, scale=scale)
-    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=scale)
+    # Some optimized BF16 SDPA backends return NaNs for nonpositive scales.
+    # Keep the accuracy oracle independent of those dispatch choices.
+    with sdpa_kernel(SDPBackend.MATH):
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q.float(), k.float(), v.float(), scale=scale
+        )
 
     assert torch.isfinite(actual).all()
+    assert torch.isfinite(expected).all()
+    assert _nrmse(actual, expected) < 0.03
+
+
+@requires_int8_attention
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("kv_length", [1, 64, 65, 512, 513, 1024, 1025, 8193])
+@pytest.mark.parametrize("scale_sign", [0, -1])
+def test_int8_attention_nonpositive_scale(head_dim, dtype, kv_length, scale_sign):
+    # Exercise single/full/partial tiles, both probability paths, CTA_K 64/128,
+    # and grouped-query attention. FP32 math is independent of fused SDPA.
+    torch.manual_seed(41)
+    q, k, v = _qkv(1, 4, 2, 129, kv_length, head_dim, dtype)
+    scale = scale_sign * head_dim**-0.5
+    actual = ck.int8_attention(q, k, v, scale=scale)
+    packed = ck.prequantize_int8_attention(q, k, v, scale=scale)
+    prequantized = ck.int8_attention_from_prequantized(packed)
+    with sdpa_kernel(SDPBackend.MATH):
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q.float(), k.float(), v.float(), scale=scale, enable_gqa=True
+        )
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(expected).all()
+    assert torch.equal(actual, prequantized)
     assert _nrmse(actual, expected) < 0.03
 
 
