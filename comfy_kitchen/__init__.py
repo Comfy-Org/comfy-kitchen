@@ -21,6 +21,7 @@ from .flash_attention import is_available as flash_attention_decode_is_available
 from .float_utils import from_blocked, swap_nibbles, to_blocked
 from .gated_delta import deltanet_conv_step, gated_delta_decode_fused
 from .gated_delta import is_available as gated_delta_decode_is_available
+from .indexed_norm import indexed_norm_convrot
 from .registry import registry
 from .sage_attention import (
     PrequantizedInt8Attention,
@@ -60,6 +61,7 @@ __all__ = [
     "fp16_conv3d",
     "group_norm_silu_pad3d",
     "rms_adaln",
+    "indexed_norm_convrot",
     # Attention
     "PrequantizedInt8Attention",
     "int8_attention",

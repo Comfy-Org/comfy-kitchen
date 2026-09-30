@@ -132,6 +132,7 @@ set(CUDA_SOURCES
     ops/group_norm_pad3d.cu
     ops/turing_int8.cu
     ops/int8_linear.cu
+    ops/indexed_norm_convrot.cu
     ops/convrot_w4a4.cu
     ops/turing_int4.cu
     ops/rms_rope.cu

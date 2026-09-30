@@ -2725,6 +2725,44 @@ static std::tuple<int64_t, int64_t, int64_t> check_int8_gemm_operands(
     return {M, N, K};
 }
 
+extern "C" bool launch_indexed_norm_convrot(
+    const void*, const void*, const void*, const void*, const int32_t*, int8_t*, float*,
+    int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, float, int, cudaStream_t);
+
+bool indexed_norm_convrot(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> x,
+    nb::ndarray<nb::ndim<1>, nb::device::cuda> w,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> shift,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> scale,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> rows,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> q,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> qs,
+    float eps, uintptr_t stream_ptr) {
+  const int64_t m=x.shape(0), k=x.shape(1);
+  if (w.size()!=k || shift.shape(1)!=k || scale.shape(1)!=k ||
+      shift.shape(0)!=scale.shape(0) || rows.size()!=m || q.shape(0)!=m ||
+      q.shape(1)!=k || qs.shape(0)!=m || qs.shape(1)!=1)
+    throw std::runtime_error("indexed_norm_convrot: incompatible shapes");
+  const int tc=map_dtype_to_code(shift.dtype());
+  if (map_dtype_to_code(x.dtype())!=2 || map_dtype_to_code(w.dtype())!=2 ||
+      (tc!=0 && tc!=2) || map_dtype_to_code(scale.dtype())!=tc)
+    throw std::runtime_error("indexed_norm_convrot: BF16 x/weight and FP32 or BF16 tables required");
+  const int device=x.device_id();
+  if (w.device_id()!=device || shift.device_id()!=device || scale.device_id()!=device ||
+      rows.device_id()!=device || q.device_id()!=device || qs.device_id()!=device)
+    throw std::runtime_error("indexed_norm_convrot: tensors must share a device");
+  if (!std::isfinite(eps) || eps < std::numeric_limits<float>::min())
+    throw std::runtime_error("indexed_norm_convrot: epsilon must be positive normal FP32");
+  need_contiguous(w,"indexed_norm_convrot","weight");
+  need_contiguous(rows,"indexed_norm_convrot","rows");
+  need_contiguous(q,"indexed_norm_convrot","q");
+  need_contiguous(qs,"indexed_norm_convrot","q_scale");
+  if (x.stride(1)!=1 || shift.stride(1)!=1 || scale.stride(1)!=1) return false;
+  return launch_indexed_norm_convrot(x.data(),w.data(),shift.data(),scale.data(),
+      rows.data(),q.data(),qs.data(),m,k,x.stride(0),shift.stride(0),scale.stride(0),
+      shift.shape(0),eps,tc==2,reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
 // INT8 GEMM + fused dequant (D = acc * xs[m] * ws[n] + bias[n]) via CUTLASS.
 // Returns true on success; false means caller falls back to cuBLAS + dequant.
 bool cutlass_int8_dequant(
@@ -3995,6 +4033,9 @@ NB_MODULE(_C, m) {
           nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"));
 
+    m.def("indexed_norm_convrot", &indexed_norm_convrot,
+          nb::arg("x"), nb::arg("weight"), nb::arg("shift"), nb::arg("scale"),
+          nb::arg("rows"), nb::arg("q"), nb::arg("q_scale"), nb::arg("eps"), nb::arg("stream_ptr"));
     m.def("cutlass_int8_dequant", &cutlass_int8_dequant,
           "INT8 GEMM + fused rowwise x colwise dequant + bias via CUTLASS; false -> fall back to cuBLAS",
           nb::arg("a"),
