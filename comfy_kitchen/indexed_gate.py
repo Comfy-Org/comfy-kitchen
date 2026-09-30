@@ -174,7 +174,14 @@ def int8_linear_indexed_gate(
     from . import int8_linear
 
     _validate_linear(x, weight, weight_scale, gate, row_indices, residual, input_act)
-    if x.is_cuda and not torch.version.hip and cuda._C is not None:
+    k = x.shape[1] // (2 if input_act == "swiglu" else 1)
+    if (
+        x.is_cuda
+        and not torch.version.hip
+        and cuda._C is not None
+        and k <= cuda._CONVROT_FUSED_MAX_K
+        and cuda._convrot_fused_shared_memory_fits(x, k, 256)
+    ):
         q, qs = cuda.quantize_int8_rowwise_convrot64(x.contiguous(), 256, input_act=input_act)
     else:
         branch = int8_linear(x, weight, weight_scale, convrot=True, input_act=input_act)
