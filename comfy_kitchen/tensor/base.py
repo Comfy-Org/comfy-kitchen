@@ -132,6 +132,30 @@ class BaseLayoutParams:
                 object.__setattr__(self, field.name, src_val)
 
 
+def quantized_mm_has_fast_path(device_type: str) -> bool:
+    """Whether a quantized matmul has anything faster than dequantize-and-matmul.
+
+    Two things can serve one: PyTorch's own scaled/IMMA GEMM, and this fork's HIP
+    backend kernels. Either is enough, and both have to be asked for, because on
+    ROCm the capability number is a gfx shape rather than an SM version (see
+    :func:`native_scaled_mm_usable`), so a layout's ``MIN_SM_VERSION`` check alone
+    passes on parts where neither exists.
+
+    The HIP backend's GEMMs are WMMA kernels. RDNA2 has no matrix cores and this
+    fork builds only the elementwise kernels there, so a quantized matmul there
+    genuinely has no fast path and has to fall back -- which is a decision that
+    has to be made while dynamo is tracing, not by catching the op's failure
+    afterwards.
+    """
+    if device_type == "cuda" and getattr(torch.version, "hip", None) is not None:
+        if native_scaled_mm_usable(device_type):
+            return True
+        from ..backends.hip import has_wmma
+
+        return has_wmma()
+    return True
+
+
 class QuantizedLayout(ABC):
     """Base class for quantization layouts. Subclasses define inner Params dataclass."""
 
