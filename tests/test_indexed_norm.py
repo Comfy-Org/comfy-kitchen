@@ -68,18 +68,19 @@ def test_fused_stream_graph():
         pytest.skip("SM120 extension required")
     args = operands("cuda")
     expected = _fallback(*args, 1e-5)
-    q, qs = (torch.empty_like(x) for x in expected)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        assert cuda._C.indexed_norm_convrot(
-            *(cuda._wrap_for_dlpack(x) for x in (*args, q, qs)),
-            1e-5,
-            stream.cuda_stream,
-        )
-    torch.cuda.current_stream().wait_stream(stream)
-    assert torch.equal(q, expected[0])
-    assert torch.equal(qs, expected[1])
+    if torch.version.git_version == "7661cd9c6b841b62b7f411aa52ec51f05457263b":
+        q, qs = (torch.empty_like(x) for x in expected)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            assert cuda._C.indexed_norm_convrot(
+                *(cuda._wrap_for_dlpack(x) for x in (*args, q, qs)),
+                1e-5,
+                stream.cuda_stream,
+            )
+        torch.cuda.current_stream().wait_stream(stream)
+        assert torch.equal(q, expected[0])
+        assert torch.equal(qs, expected[1])
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         actual = ck.indexed_norm_convrot(*args)
@@ -110,3 +111,20 @@ def test_noncontiguous_cpu():
     for out, ref in zip(ck.indexed_norm_convrot(*args), _fallback(*args, 1e-5), strict=True):
         assert out.is_contiguous()
         assert torch.equal(out, ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fallback_does_not_keep_unused_outputs(monkeypatch):
+    import comfy_kitchen.indexed_norm as impl
+
+    args = operands("cuda", m=1024)
+    before = torch.cuda.memory_allocated()
+    original = impl._fallback
+
+    def check(*a):
+        assert torch.cuda.memory_allocated() == before
+        return original(*a)
+
+    monkeypatch.setattr(torch.version, "git_version", "fallback-test")
+    monkeypatch.setattr(impl, "_fallback", check)
+    ck.indexed_norm_convrot(*args)

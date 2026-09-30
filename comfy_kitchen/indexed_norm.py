@@ -62,10 +62,8 @@ def _op(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _validate(x, weight, shift, scale, rows, eps)
     m, k = x.shape
-    q = torch.empty((m, k), device=x.device, dtype=torch.int8)
-    qs = torch.empty((m, 1), device=x.device, dtype=torch.float32)
     if m == 0:
-        return q, qs
+        return (x.new_empty((m, k), dtype=torch.int8), x.new_empty((m, 1), dtype=torch.float32))
     # The native reduction reproduces this Torch CUDA RMSNorm tree. Other
     # versions keep their native RMSNorm rather than silently changing it.
     if (
@@ -81,6 +79,8 @@ def _op(
         and weight.is_contiguous()
         and rows.is_contiguous()
     ):
+        q = torch.empty((m, k), device=x.device, dtype=torch.int8)
+        qs = torch.empty((m, 1), device=x.device, dtype=torch.float32)
         with torch.cuda.device(x.device):
             used = cuda._C.indexed_norm_convrot(
                 *(cuda._wrap_for_dlpack(t) for t in (x, weight, shift, scale, rows, q, qs)),
@@ -89,6 +89,7 @@ def _op(
             )
         if used:
             return q, qs
+        del q, qs
     return _fallback(x, weight, shift, scale, rows, eps)
 
 

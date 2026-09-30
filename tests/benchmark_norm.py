@@ -7,8 +7,23 @@ from pathlib import Path
 import comfy_kitchen as ck
 from comfy_kitchen.backends import cuda
 
-r = Path.cwd()
-report = {"torch": torch.__version__, "gpu": torch.cuda.get_device_name(), "cases": []}
+r = Path(__file__).resolve().parent.parent / "docs" / "benchmarks"
+if (
+    torch.version.git_version != "7661cd9c6b841b62b7f411aa52ec51f05457263b"
+    or torch.cuda.get_device_capability() != (12, 0)
+    or cuda._C is None
+    or not hasattr(cuda._C, "indexed_norm_convrot")
+):
+    raise RuntimeError(
+        "This fused benchmark requires the qualified Torch revision and SM120 extension"
+    )
+report = {
+    "torch": torch.__version__,
+    "torch_git": torch.version.git_version,
+    "gpu": torch.cuda.get_device_name(),
+    "implementation": "native SM120",
+    "cases": [],
+}
 for m in [131, 8192, 14850, 32700, 87142, 90461]:
     torch.manual_seed(42)
     k = 5376
@@ -32,6 +47,14 @@ for m in [131, 8192, 14850, 32700, 87142, 90461]:
     def fast(x=x, w=w, shift=shift, scale=scale, rows=rows):
         return ck.indexed_norm_convrot(x, w, shift, scale, rows)
 
+    probe_q = torch.empty((m, k), dtype=torch.int8, device=x.device)
+    probe_s = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+    assert cuda._C.indexed_norm_convrot(
+        *(cuda._wrap_for_dlpack(t) for t in (x, w, shift, scale, rows, probe_q, probe_s)),
+        1e-5,
+        torch.cuda.current_stream().cuda_stream,
+    )
+    del probe_q, probe_s
     a = base()
     b = fast()
     assert all(torch.equal(aa, bb) for aa, bb in zip(a, b, strict=True))
@@ -61,7 +84,9 @@ for m in [131, 8192, 14850, 32700, 87142, 90461]:
         "samples_ms": samples,
         "median_ms": med,
         "reduction_percent": 100 * (1 - med["fused"] / med["segmented"]),
-        "equal": all(torch.equal(a, b) for a, b in zip(outputs["segmented"], outputs["fused"], strict=True)),
+        "equal": all(
+            torch.equal(a, b) for a, b in zip(outputs["segmented"], outputs["fused"], strict=True)
+        ),
     }
     report["cases"].append(row)
     (r / "norm-benchmark.json").write_text(json.dumps(report, indent=2))
