@@ -1446,6 +1446,39 @@ def _fused_quantize_w4a8(
     return packed, s_rel, s_channel, None, cb
 
 
+_W6A8_FUSED_QUANT = hasattr(_C, "quantize_w6a8_convrot")
+
+
+def _fused_quantize_w6a8(
+    weight: torch.Tensor,
+    group_size: int,
+    convrot_groupsize: int,
+    stochastic_rounding: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None]:
+    """Rotate + fused 6-bit requant (fp8 s_rel, no scale search), row-chunked like the 4-bit path."""
+    n, k = weight.shape
+    packed = torch.empty(n, k * 3 // 4, dtype=torch.int8, device=weight.device)
+    s_rel = torch.empty(n, k // group_size, dtype=torch.float8_e4m3fn, device=weight.device)
+    s_channel = torch.empty(n, dtype=torch.float32, device=weight.device)
+    block = max(1, _QUANT_ROW_ELEM_BUDGET // max(k, 1))
+    for r0 in range(0, n, block):
+        r1 = min(r0 + block, n)
+        rot = rotate_int8_convrot_weight(weight[r0:r1].contiguous(), convrot_groupsize)
+        seed = stochastic_rounding + r0 if stochastic_rounding > 0 else 0
+        _C.quantize_w6a8_convrot(
+            _wrap_for_dlpack(rot.contiguous()),
+            _wrap_for_dlpack(packed[r0:r1]),
+            _wrap_for_dlpack(s_rel[r0:r1].view(torch.uint8)),
+            _wrap_for_dlpack(s_channel[r0:r1]),
+            group_size,
+            stochastic_rounding > 0,
+            int(seed),
+            torch.cuda.current_stream(weight.device).cuda_stream,
+        )
+        del rot
+    return packed, s_rel, s_channel, None, None
+
+
 def quantize_w4a8_int8_weight(
     weight: torch.Tensor,
     group_size: int = 16,
@@ -1467,7 +1500,7 @@ def quantize_w4a8_int8_weight(
     """Prepare W4A8/W6A8 weights using native CUDA ConvRot and eager packing math."""
     validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
     # Fused CUDA requant for the default codebook layout (4-bit, group_size 16, fp8 scales);
-    # asym / uniform / fp32-scale / other group sizes / 6-bit use the chunked eager path.
+    # asym / uniform / fp32-scale / other group sizes use the chunked eager path.
     if (
         _W4A8_FUSED_QUANT
         and bits == 4
@@ -1483,6 +1516,18 @@ def quantize_w4a8_int8_weight(
             else _decide_codebook(weight, rotate_int8_convrot_weight, group_size, convrot_groupsize)
         )
         return _fused_quantize_w4a8(weight, cb, convrot_groupsize, stochastic_rounding)
+    # Fused 6-bit requant: the eager quantizer minus the quantize-time scale search.
+    if (
+        _W6A8_FUSED_QUANT
+        and bits == 6
+        and symmetric
+        and not scale_search
+        and group_size in (16, 32, 64)
+        and scale_dtype == torch.float8_e4m3fn
+        and weight.shape[1] % 32 == 0
+        and weight.shape[1] // group_size <= 47 * 1024 // 4
+    ):
+        return _fused_quantize_w6a8(weight, group_size, convrot_groupsize, stochastic_rounding)
     return _quantize_w4a8_chunked(
         weight,
         rotate_int8_convrot_weight,

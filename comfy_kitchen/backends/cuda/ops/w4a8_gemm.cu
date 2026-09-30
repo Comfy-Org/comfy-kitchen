@@ -389,6 +389,162 @@ extern "C" bool launch_quantize_w4a8_convrot(
     return cudaGetLastError() == cudaSuccess;
 }
 
+namespace {
+
+// The int8 value 6-bit level index `i` (0..62, level i-31) decodes to for group step `s`:
+// round(clamp(level * s)) -- the eager _grid_levels table, evaluated on the fly.
+__device__ __forceinline__ float w6_level(int i, float s) {
+    return fminf(127.0f, fmaxf(-127.0f, nearbyintf(static_cast<float>(i - 31) * s)));
+}
+
+// Eager _assign_grid on the uniform 6-bit grid: searchsorted(levels, t) (first level >= t,
+// found by bisection since the levels are monotone), then the nearer of the two brackets,
+// lower index on ties; SR draws a point in the bracket instead.
+template <bool STOCHASTIC>
+__device__ __forceinline__ int w6_assign(float t, float s, int64_t idx, uint64_t seed) {
+    int lo = 0, n = 63;                 // first index with level >= t
+    while (n > 0) {
+        const int half = n >> 1;
+        if (w6_level(lo + half, s) < t) { lo += half + 1; n -= half + 1; } else n = half;
+    }
+    const int pos = lo;
+    if constexpr (STOCHASTIC) {
+        const int l = min(max(pos - 1, 0), 61);
+        const float level_lo = w6_level(l, s);
+        const float thr = level_lo + rq_uniform(idx, seed) * (w6_level(l + 1, s) - level_lo);
+        return min(l + (t > thr ? 1 : 0), 62);
+    }
+    const int l = min(max(pos - 1, 0), 62), h = min(pos, 62);
+    return (fabsf(t - w6_level(h, s)) < fabsf(t - w6_level(l, s))) ? h : l;
+}
+
+// Fused W6A8 requant: the eager 6-bit quantizer (uniform levels -31..31, 2 ALS rounds,
+// fp8 s_rel, grid-aware assignment) without the search, one row per block.
+template <typename InputType, int G, bool STOCHASTIC>
+__global__ void quantize_w6a8_convrot_kernel(
+    const InputType* __restrict__ rotated,  // [N, K]
+    int8_t* __restrict__ packed,            // [N, 3K/4]: nibble plane then 2-bit plane
+    uint8_t* __restrict__ s_rel,            // [N, K/G] e4m3 bits
+    float* __restrict__ s_channel,          // [N]
+    int K, uint64_t seed)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int groups = K / G;
+    const int64_t row_off = static_cast<int64_t>(row) * K;
+
+    __shared__ float warp_max[32];
+    extern __shared__ float gscale[];  // [groups]
+
+    // --- Phase 1: per-group step (ALS on the integer levels); row amax of the decoded weight ---
+    float thr_amax = 0.0f;
+    for (int g = tid; g < groups; g += nthreads) {
+        const int64_t base = row_off + static_cast<int64_t>(g) * G;
+        float w[G];
+        float amax = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < G; ++i) { w[i] = rq_to_float(rotated[base + i]); amax = fmaxf(amax, fabsf(w[i])); }
+        float gs = fmaxf(amax / 31.0f, 1e-8f);
+        float q[G];
+        #pragma unroll
+        for (int i = 0; i < G; ++i) q[i] = fminf(31.0f, fmaxf(-31.0f, nearbyintf(w[i] / gs)));
+        #pragma unroll
+        for (int it = 0; it < 2; ++it) {       // eager _ALS_ITERS
+            float num = 0.0f, den = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < G; ++i) { num += w[i] * q[i]; den += q[i] * q[i]; }
+            gs = fmaxf(num / fmaxf(den, 1e-8f), 1e-8f);
+            #pragma unroll
+            for (int i = 0; i < G; ++i) q[i] = fminf(31.0f, fmaxf(-31.0f, nearbyintf(w[i] / gs)));
+        }
+        gscale[g] = gs;
+        #pragma unroll
+        for (int i = 0; i < G; ++i) thr_amax = fmaxf(thr_amax, fabsf(q[i] * gs));
+    }
+
+    float wm = rq_warp_max(thr_amax);
+    const int lane = tid & 31, wid = tid >> 5;
+    if (lane == 0) warp_max[wid] = wm;
+    __syncthreads();
+    if (wid == 0) {
+        const int nwarps = (nthreads + 31) >> 5;
+        float t = (lane < nwarps) ? warp_max[lane] : 0.0f;
+        t = rq_warp_max(t);
+        if (lane == 0) warp_max[0] = t;
+    }
+    __syncthreads();
+    const float sc = fmaxf(warp_max[0] / 127.0f, 1e-8f);
+    if (tid == 0) s_channel[row] = sc;
+
+    // --- Phase 2: fp8 s_rel -> grid assignment -> code q+32 -> two-plane pack ---
+    const int64_t low_off = static_cast<int64_t>(row) * (K * 3 / 4);
+    const int64_t hi_off = low_off + K / 2;
+    const int64_t srow_off = static_cast<int64_t>(row) * groups;
+    for (int g = tid; g < groups; g += nthreads) {
+        const uint8_t srel_bits = __nv_cvt_float_to_fp8(gscale[g] / sc, __NV_SATFINITE, __NV_E4M3);
+        s_rel[srow_off + g] = srel_bits;
+        const float srel_r = __half2float(__nv_cvt_fp8_to_halfraw(srel_bits, __NV_E4M3));
+        const int64_t base = row_off + static_cast<int64_t>(g) * G;
+        int u[G];
+        #pragma unroll
+        for (int i = 0; i < G; ++i)
+            u[i] = w6_assign<STOCHASTIC>(rq_to_float(rotated[base + i]) / sc, srel_r, base + i, seed) + 1;
+        #pragma unroll
+        for (int p = 0; p < G / 2; ++p)
+            packed[low_off + static_cast<int64_t>(g) * (G / 2) + p] =
+                static_cast<int8_t>((u[2 * p] & 0xF) | ((u[2 * p + 1] & 0xF) << 4));
+        #pragma unroll
+        for (int p = 0; p < G / 4; ++p) {
+            const int c = 4 * p;
+            packed[hi_off + static_cast<int64_t>(g) * (G / 4) + p] = static_cast<int8_t>(
+                ((u[c] >> 4) & 3) | (((u[c + 1] >> 4) & 3) << 2) | (((u[c + 2] >> 4) & 3) << 4) | (((u[c + 3] >> 4) & 3) << 6));
+        }
+    }
+}
+
+}  // namespace
+
+// rotated: [N,K]; packed: [N,3K/4]; s_rel: [N,K/G] e4m3 bits. G in {16,32,64}, K % 32 == 0.
+// Returns false when the group-step shared memory won't fit or the launch is rejected.
+extern "C" bool launch_quantize_w6a8_convrot(
+    const void* rotated, void* packed, void* s_rel, void* s_channel,
+    int64_t N, int64_t K, int G, int in_dtype_code, bool stochastic, uint64_t seed, cudaStream_t stream)
+{
+    const int threads = 256;
+    const size_t shmem = static_cast<size_t>(K / G) * sizeof(float);
+    int dev = 0, max_shmem = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (cudaDeviceGetAttribute(&max_shmem, cudaDevAttrMaxSharedMemoryPerBlock, dev) != cudaSuccess)
+        return false;
+    if (shmem + 128 > static_cast<size_t>(max_shmem)) return false;
+    dim3 grid(static_cast<unsigned>(N));
+#define RQ6_LAUNCH(IT, GS)                                                                        \
+    do {                                                                                          \
+        if (stochastic)                                                                           \
+            quantize_w6a8_convrot_kernel<IT, GS, true><<<grid, threads, shmem, stream>>>(         \
+                static_cast<const IT*>(rotated), static_cast<int8_t*>(packed),                    \
+                static_cast<uint8_t*>(s_rel), static_cast<float*>(s_channel), static_cast<int>(K), seed); \
+        else                                                                                      \
+            quantize_w6a8_convrot_kernel<IT, GS, false><<<grid, threads, shmem, stream>>>(        \
+                static_cast<const IT*>(rotated), static_cast<int8_t*>(packed),                    \
+                static_cast<uint8_t*>(s_rel), static_cast<float*>(s_channel), static_cast<int>(K), 0); \
+    } while (0)
+#define RQ6_DTYPE(GS)                                                                             \
+    do {                                                                                          \
+        if (in_dtype_code == 0) RQ6_LAUNCH(float, GS);                                            \
+        else if (in_dtype_code == 1) RQ6_LAUNCH(__half, GS);                                      \
+        else RQ6_LAUNCH(__nv_bfloat16, GS);                                                       \
+    } while (0)
+    if (G == 16) RQ6_DTYPE(16);
+    else if (G == 32) RQ6_DTYPE(32);
+    else if (G == 64) RQ6_DTYPE(64);
+    else return false;
+#undef RQ6_DTYPE
+#undef RQ6_LAUNCH
+    return cudaGetLastError() == cudaSuccess;
+}
+
 // Fused W4A8 GEMV for decode (M<=8): dequantize int4+codebook in registers and
 // dp4a against the int8 activation in one pass — no int8 workspace round-trip.
 // Bit-exact with the chunked path: same __float2int_rn(cb[c]*s_rel) int8 grid,
