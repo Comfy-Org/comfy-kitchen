@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import torch
 
+from comfy_kitchen.exceptions import NoCapableBackendError
 from comfy_kitchen.registry import registry
 
 from .base import (
@@ -38,6 +39,21 @@ def _dtype_code(dtype: torch.dtype) -> int:
         return _INT8_DEQUANT_DTYPE_TO_CODE[dtype]
     except KeyError:
         raise ValueError(f"Unsupported INT8 output dtype: {dtype}") from None
+
+
+def _has_native_fusion(func_name: str, kwargs: dict) -> bool:
+    """Whether ``func_name`` would dispatch to a native kernel for ``kwargs``.
+
+    The eager fused ops only re-compose the unfused ops, so without a native
+    kernel the caller's unfused path is at least as fast. An explicit backend
+    override (e.g. ``use_backend("eager")`` in tests) is honored.
+    """
+    if getattr(registry._thread_local, "backend_override", None) is not None:
+        return True
+    try:
+        return registry.get_capable_backend(func_name, kwargs) != "eager"
+    except NoCapableBackendError:
+        return False
 
 
 class TensorWiseINT8Layout(QuantizedLayout):
@@ -246,6 +262,12 @@ class TensorWiseINT8Layout(QuantizedLayout):
         if operand is None:
             return NotImplemented
         qdata, scale, convrot, group_size = operand
+        if not _has_native_fusion("int8_linear_rms_modulated", {
+            "x": x, "norm_weight": norm_weight,
+            "modulation_scale": modulation_scale, "weight": qdata,
+            "out_dtype": x.dtype,
+        }):
+            return NotImplemented
         from comfy_kitchen import int8_linear_rms_modulated
 
         return int8_linear_rms_modulated(
@@ -285,6 +307,21 @@ class TensorWiseINT8Layout(QuantizedLayout):
         first, second = pair
         qgate, gate_scale, convrot, group_size = first
         qup, up_scale, _, _ = second
+        pair_op = (
+            "int8_linear_pair" if norm_weight is None
+            else "int8_linear_pair_rms_modulated"
+        )
+        if not (
+            _has_native_fusion(pair_op, {
+                "x": x, "norm_weight": norm_weight,
+                "modulation_scale": modulation_scale,
+                "weight0": qgate, "weight1": qup, "out_dtype": x.dtype,
+            })
+            and _has_native_fusion("int8_linear_swiglu_split", {
+                "weight": down[0], "out_dtype": x.dtype,
+            })
+        ):
+            return NotImplemented
         if norm_weight is None:
             from comfy_kitchen import int8_linear_pair
 

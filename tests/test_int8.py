@@ -1000,3 +1000,44 @@ def test_fused_int8_methods_decline_batched_modulation():
         )
         is NotImplemented
     )
+
+
+def test_fused_int8_methods_decline_without_native_backend():
+    """Without a native kernel the fused methods leave the unfused path to the caller."""
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    torch.manual_seed(0)
+    width, hidden = 256, 512
+    x = torch.randn(1, 4, width, dtype=torch.bfloat16)
+    norm_weight = torch.rand(width, dtype=torch.bfloat16) + 0.5
+    modulation_scale = torch.randn(1, width, dtype=torch.bfloat16) * 0.25
+
+    def weight(n, k):
+        return QuantizedTensor.from_float(
+            torch.randn(n, k, dtype=torch.bfloat16), "TensorWiseINT8Layout",
+            per_channel=True, convrot=True, convrot_groupsize=256,
+        )
+
+    qkv = weight(3 * width, width)
+    ffn = (weight(hidden, width), weight(hidden, width), weight(width, hidden))
+
+    # CPU tensors only match the eager backend.
+    assert TensorWiseINT8Layout.fused_rms_modulated(
+        x, qkv, None, norm_weight, 1.0e-6, modulation_scale
+    ) is NotImplemented
+    assert TensorWiseINT8Layout.fused_swiglu_ffn(
+        x, *ffn, None, None, None,
+        norm_weight=norm_weight, norm_eps=1.0e-6,
+        modulation_scale=modulation_scale,
+    ) is NotImplemented
+    assert TensorWiseINT8Layout.fused_swiglu_ffn(
+        x, *ffn, None, None, None
+    ) is NotImplemented
+
+    # An explicit eager override still runs the reference composition.
+    with ck.use_backend("eager"):
+        out = TensorWiseINT8Layout.fused_rms_modulated(
+            x, qkv, None, norm_weight, 1.0e-6, modulation_scale
+        )
+    assert out is not NotImplemented
+    assert out.shape == (1, 4, 3 * width)
