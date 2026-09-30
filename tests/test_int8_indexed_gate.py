@@ -78,6 +78,33 @@ def test_compile():
     assert torch.equal(compiled(*args), ck.int8_gemm_indexed_gate(*args))
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_inductor_noncontiguous_residual(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    args = list(operands(device))
+    args[6] = args[6].T.contiguous().T
+    assert not args[6].is_contiguous()
+    before = [x.clone() for x in args]
+
+    def consume(*inputs):
+        result = ck.int8_gemm_indexed_gate(*inputs)
+        return result, result.float().sum(dim=1)
+
+    # Exercise Inductor's extern-output stride guard and a stride-sensitive
+    # consumer; backend="eager" cannot detect a fake/real layout mismatch.
+    compiled = torch.compile(consume, fullgraph=True)
+    out, reduced = compiled(*args)
+    expected = _fallback(*args)
+    eager = ck.int8_gemm_indexed_gate(*args)
+    assert eager.is_contiguous()
+    assert out.is_contiguous()
+    assert torch.equal(out, expected)
+    torch.testing.assert_close(reduced, expected.float().sum(dim=1))
+    for original, saved in zip(args, before, strict=True):
+        assert torch.equal(original, saved)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_stream_graph_and_fused_path():
     from comfy_kitchen.backends import cuda

@@ -46,7 +46,7 @@ def _fallback(a, b, x_scale, w_scale, gate, row_indices, residual):
     else:
         acc = mm_int8(a, b.t()).float()
     branch = ((acc * x_scale.reshape(-1, 1)) * w_scale + 0.0).to(torch.bfloat16)
-    return torch.addcmul(residual, branch, _gather_gate(gate, row_indices))
+    return torch.addcmul(residual, branch, _gather_gate(gate, row_indices)).contiguous()
 
 
 def _cuda_plain_fallback(a, b, x_scale, w_scale, gate, row_indices, residual):
@@ -63,7 +63,7 @@ def _cuda_plain_fallback(a, b, x_scale, w_scale, gate, row_indices, residual):
         stream,
     )
     if used:
-        return torch.addcmul(residual, branch, _gather_gate(gate, row_indices))
+        return torch.addcmul(residual, branch, _gather_gate(gate, row_indices)).contiguous()
     return _fallback(a, b, x_scale, w_scale, gate, row_indices, residual)
 
 
@@ -120,7 +120,7 @@ def int8_gemm_indexed_gate(a, b, x_scale, w_scale, gate, row_indices, residual):
     gate: BF16 [G,N]; row_indices: INT32 [M]; residual: BF16 [M,N]. All tensors
     must share a device. Gate indices outside [0,G) select zero, including
     G=0; this avoids an index-validation host synchronization. Inputs are not
-    modified. Noncontiguous inputs and unsupported devices use a PyTorch
+    modified. The output is contiguous. Noncontiguous inputs and unsupported devices use a PyTorch
     fallback. The fused initial implementation targets SM120, K%16=0, N%8=0.
     Inference only; an opaque custom op supports torch.compile and CUDA Graphs.
     """
