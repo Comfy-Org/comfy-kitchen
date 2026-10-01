@@ -1706,66 +1706,18 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
     const int padded_k = sage_padded_k(kv_len, cta_k);
     const int v_dtype_code = map_dtype_to_code(v_int8.dtype());
     if (v_dtype_code == 4) {
-        // The ported gfx110x kernel's int8-PV path keeps its online-softmax
-        // accumulator in INT32 and truncates on every rescale between key tiles,
-        // so over a long partial sequence its normalization drifts off the exact
-        // sum the upstream bias-PV scheme preserves. The strict atol=0
-        // constant-preservation test (upstream) catches this, so any shape whose
-        // tail tile is partial routes to the upstream legacy kernel, which is
-        // bit-stable across every tile boundary. The v_stride_n fix in
-        // sage_attn_port.hip already removed the out-of-bounds V-row reads that
-        // used to make these shapes produce nrmse~1.3 garbage, so the ported
-        // kernel is correct for tile-aligned D128 (and for all D64, where the
-        // cta_k=64 padding always matches).
-        const bool partial_tile = (kv_len % cta_k) != 0;
-        if (mask_ptr != nullptr || head_dim == 256 || !igpu || partial_tile) {
-            // Legacy pure-int8 kernel: handles masks, D256 has no room for the
-            // ported kernel's tiles, dGPUs keep the upstream implementation
-            // (the ported schedule is tuned against the 6-WGP 780M), and the
-            // partial-key-tile shapes stay on the bit-stable upstream path.
-            launch_sage_int8_attn(
-                q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(),
-                k_scale.data(), v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h,
-                mask_stride_q, mask_stride_k, mask_dtype_code, cta_k, batch, qo_len, kv_len,
-                sage_padded_q(qo_len), q_heads, kv_heads, head_dim, padded_k / kSageKeyGroup,
-                static_cast<int64_t>(q_heads) * qo_len * head_dim,
-                static_cast<int64_t>(qo_len) * head_dim,
-                static_cast<int64_t>(kv_heads) * kv_len * head_dim,
-                static_cast<int64_t>(kv_len) * head_dim,
-                static_cast<int64_t>(kv_heads) * head_dim * padded_k,
-                static_cast<int64_t>(head_dim) * padded_k, padded_k,
-                o_stride_b, o_stride_h, o_stride_n, sm_scale, output_dtype_code,
-                stream);
-        } else {
-            // Pure-int8 path on the ported gfx110x schedule (int8 V, u8 P).
-            launch_sage_port_attn(
-                q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(),
-                k_scale.data(), v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h,
-                mask_stride_q, mask_stride_k, mask_dtype_code, cta_k, batch, qo_len, kv_len,
-                sage_padded_q(qo_len), q_heads, kv_heads, head_dim, padded_k / kSageKeyGroup,
-                static_cast<int64_t>(q_heads) * qo_len * head_dim,
-                static_cast<int64_t>(qo_len) * head_dim,
-                static_cast<int64_t>(kv_heads) * kv_len * head_dim,
-                static_cast<int64_t>(kv_len) * head_dim,
-                static_cast<int64_t>(kv_heads) * head_dim * padded_k,
-                static_cast<int64_t>(head_dim) * padded_k, padded_k,
-                o_stride_b, o_stride_h, o_stride_n, sm_scale, output_dtype_code,
-                v_dtype_code, stream);
-        }
-    } else if (v_dtype_code == 1) {
-        // fp16 V: the ported SageAttention gfx110x kernel (int8 QK / fp16 SV,
-        // BLOCK_M 64/128 with waves_per_eu hints). The transposed V buffer is
-        // always fp16 — bf16/fp32 inputs were downcast by the transpose. This
-        // is an iGPU-only extension of the upstream API.
-        if (!igpu) {
-            throw std::runtime_error(
-                "fp16-V prequantized attention requires the gfx1103 iGPU backend");
-        }
-        launch_sage_port_attn(
-            q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(), k_scale.data(),
-            v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
-            mask_dtype_code, cta_k, batch, qo_len, kv_len, sage_padded_q(qo_len), q_heads,
-            kv_heads, head_dim, padded_k / kSageKeyGroup,
+        // Pure-int8 V: upstream's int8_attn.hip, unchanged. This used to branch to
+        // a ported gfx110x schedule for the iGPU's tile-aligned shapes, but that
+        // schedule measured 1.10x-1.40x SLOWER than this kernel on every shape in
+        // benchmark_attn.py that it served (0 wins / 11 losses / 7 ties, interleaved
+        // in-process, ~1% null control), so it was removed rather than kept behind
+        // a gate. sage_attn_port.hip still holds the direct short-key kernel, which
+        // wins on its own shapes and is reached from sage_sdpa's use_direct branch.
+        launch_sage_int8_attn(
+            q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(),
+            k_scale.data(), v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h,
+            mask_stride_q, mask_stride_k, mask_dtype_code, cta_k, batch, qo_len, kv_len,
+            sage_padded_q(qo_len), q_heads, kv_heads, head_dim, padded_k / kSageKeyGroup,
             static_cast<int64_t>(q_heads) * qo_len * head_dim,
             static_cast<int64_t>(qo_len) * head_dim,
             static_cast<int64_t>(kv_heads) * kv_len * head_dim,
@@ -1773,10 +1725,13 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
             static_cast<int64_t>(kv_heads) * head_dim * padded_k,
             static_cast<int64_t>(head_dim) * padded_k, padded_k,
             o_stride_b, o_stride_h, o_stride_n, sm_scale, output_dtype_code,
-            1 /* fp16 V */, stream);
+            stream);
     } else {
-        // int8-QK / bf16-fp16-SV fallback (masked or prequantized-bf16 callers):
-        // V carries its own dtype.
+        // fp16 or bf16 V: a prequantized caller supplying unquantized V (masked
+        // callers, and prequantized snapshots that kept V in its input dtype).
+        // The bf16-SV bridge reads the same transposed buffer at the same width;
+        // it used to be reachable only for V != int8, and the fp16-V case also
+        // went to the now-removed port schedule.
         launch_sage_bf16sv_attn(
             q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(), k_scale.data(),
             mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k, mask_dtype_code,
