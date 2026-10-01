@@ -23,16 +23,39 @@
 namespace comfy::hip_backend::sage {
 namespace {
 
-// Channels per thread, selected by architecture in the launchers below:
-//  32 on the gfx1103 iGPU. The read strides a whole row (256 bytes at D128)
-//    between consecutive keys, so the per-thread vector width sets the sector
-//    efficiency: 8 channels is 16 bytes of a 32-byte sector (half wasted unless
-//    a neighbouring d-tile block catches it in L2), 32 is a full sector run.
-//    Pass 1 drops to 1x unrolling to keep the live temporary count down.
+// Channels per thread, selected by architecture and problem size in the
+// launchers below:
+//  32 on the gfx1103 iGPU, and only once the V has kWideTileMinElems elements.
+//    The read strides a whole row (256 bytes at D128) between consecutive keys,
+//    so the per-thread vector width sets the sector efficiency: 8 channels is 16
+//    bytes of a 32-byte sector (half wasted unless a neighbouring d-tile block
+//    catches it in L2), 32 is a full sector run. Pass 1 drops to 1x unrolling to
+//    keep the live temporary count down.
 //   8 everywhere else -- the upstream tile, whose 4x unrolling was the schedule
-//    measured on 60-96 CU parts.
+//    measured on 60-96 CU parts, and also the right choice on the iGPU for the
+//    short-V shapes where 4x the blocks is what fills the machine.
 constexpr int kDTileIGpu = 32;
 constexpr int kDTileUpstream = 8;
+
+// The wide tile is not free: it gives B*H*(D/32) blocks instead of B*H*(D/8), so
+// it trades 4x the block count for 4x the work per block. That only pays once
+// there is enough work to keep 6 WGPs busy. Swept N in [77, 12288] at D64 (B=2,
+// H=10) and D128 (B=2, H=16), interleaved in-process, the 32-channel tile is
+// 0.59x-0.95x (faster) from ~7M V elements up and 0.91x-1.88x (slower) below:
+//
+//     D64   N=4096 -> 5.2M  1.07x     N=6144 -> 7.9M  0.77x
+//     D128  N=1536 -> 6.3M  0.99x     N=2048 -> 8.4M  0.95x
+//     D128  N=128  1.88x (the worst case: only 128 blocks of 1 KB of work)
+//
+// blocks32 * N is proportional to B*H*N*D, so one element count separates both
+// head dims without a hand-fitted per-D constant -- and it scales the right way
+// with batch and head count, since more blocks is exactly what the narrow tile
+// was buying.
+constexpr int64_t kWideTileMinElems = 7000000;
+
+inline bool use_wide_tile(int B, int H, int N, int D) {
+    return static_cast<int64_t>(B) * H * N * D >= kWideTileMinElems;
+}
 
 template <int DTILE>
 constexpr int kUnrollFor = (DTILE >= 32) ? 1 : ((DTILE >= 16) ? 2 : 4);
@@ -169,13 +192,14 @@ void launch_typed(const void* v, void* out, void* scale, int B, int H, int N, in
     }
 }
 
-// Architecture dispatch: the 32-channel tile is the gfx1103 iGPU tuning; every
-// other GPU gets the upstream 8-channel tile with its 4x unrolling.
+// Architecture dispatch: the 32-channel tile is the gfx1103 iGPU tuning, and only
+// above kWideTileMinElems elements; every other shape and GPU gets the upstream
+// 8-channel tile with its 4x unrolling.
 template <typename T>
 void launch_quant_arch(const void* v, void* out, void* scale, int B, int H, int N, int D,
                        int padded_N, int64_t stride_b, int64_t stride_h, int64_t stride_n,
                        hipStream_t stream) {
-    if (comfy_small_igpu())
+    if (comfy_small_igpu() && use_wide_tile(B, H, N, D))
         launch_typed<T, kDTileIGpu>(v, out, scale, B, H, N, D, padded_N, stride_b, stride_h,
                                     stride_n, stream);
     else
@@ -315,9 +339,10 @@ extern "C" void launch_sage_quant_v_int8(const void* v, void* out, void* scale, 
         throw std::runtime_error(
             "sage int8 attention: V base pointer and B/H/N strides must be 16-byte aligned");
     }
-    // The tile actually staged below depends on the architecture; head_dim has
-    // to divide whichever one runs here.
-    const int dtile = comfy_small_igpu() ? kDTileIGpu : kDTileUpstream;
+    // The tile actually staged below depends on the architecture and the element
+    // count; head_dim has to divide whichever one runs here.
+    const int dtile =
+        (comfy_small_igpu() && use_wide_tile(B, H, N, D)) ? kDTileIGpu : kDTileUpstream;
     if (D <= 0 || D % dtile != 0) {
         throw std::runtime_error("sage int8 attention: head_dim must be a positive multiple of " +
                                  std::to_string(dtile));

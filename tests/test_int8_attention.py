@@ -1255,13 +1255,17 @@ def test_hip_attention_rejects_invalid_prepared_mask(invalid):
 # benchmark_attn.py shapes, so V in any other dtype is now rejected outright
 # rather than silently reinterpreted. The 16-bit arms of the old kernel also had
 # no prepared-mask modes, so the old dispatch misread one as raw bf16.
+#
+# Matched loosely on purpose: the contract is "a non-int8 packed V is refused",
+# not which of the two call sites refuses it.
 @skip_on_gfx1035_port
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_hip_attention_rejects_non_int8_v(dtype):
     q, k, v = _qkv(1, 4, 4, 256, 256, 64)
     packed = ck.prequantize_int8_attention(q, k, v)
     assert packed.v.dtype == torch.int8, "the fixture must produce int8 V"
-    with pytest.raises(RuntimeError, match=r"packed v must be int8"):
+    with pytest.raises(RuntimeError, match=r"v(_int8|_int8 packed)? .*unsupported dtype"
+                                            r"|packed v must be int8"):
         sage_attention_module._hip_backend.sage_int8_attend(
             packed.q,
             packed.k,
