@@ -2888,23 +2888,38 @@ def _build_constraints(has_wmma: bool = True) -> dict:
 # Must match kCtaQ and the key tiles in sage_attention/int8_attn.hip.
 _SAGE_CTA_Q = 128
 _SAGE_CTA_K = 64
-_SAGE_LARGE_CTA_K = 128
+# _SAGE_LARGE_CTA_K (128) went with the wide-tile gate in _sage_cta_k: the gate
+# never reached the kernel, which discards cta_k, so nothing selects it now.
 _SAGE_KEY_GROUP = 16
 _SAGE_HEAD_DIMS = (64, 128, 256)
 
 
 def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool,
                 device: torch.device | int | None = None) -> int:
-    """Keys per attention iteration.
+    """Keys per attention iteration. Always 64.
 
-    64 by default; 128 for long unmasked D128 sequences. Measured on the 6-WGP
-    780M, the wide tile is ~15% faster than the narrow one at head_dim=128 with
-    kv_len >= 2048 and no mask (D64 prefers 64; D256 has no LDS room for 128).
-    The kernel instantiates the matching tile from the runtime value, and the
-    K-scale buffer padding below uses the same choice, so the two stay in sync.
+    This used to return 128 for long unmasked D128 sequences on the iGPU, on the
+    strength of a ~15% measurement. Two things retired it.
+
+    It never reached the kernel. int8_attn.hip discards the value outright --
+    ``(void)cta_k;`` and ``SAGE_ATTN_LAUNCH(HD, 64, ...)`` -- so a tile-aligned
+    sequence produced identical buffers and identical launches either way. The
+    gate only inflated the V scratch for kv lengths that are not a multiple of
+    128. It became live only while the ported gfx110x schedule, which does take
+    CTA_K as a parameter, was in front of it; that schedule is gone (it measured
+    1.10x-1.40x slower than upstream on every shape it served).
+
+    And with the schedule gone there is nothing for it to select: A/B'd in one
+    process with CK_SAGE_FORCE_CTA64 flipping this per call, over the Anima D128
+    shapes in benchmark_attn.py, the wide tile came out 0.99x-1.01x per case and
+    1.002x in total -- i.e. identical, as the ``(void)`` predicts.
+
+    D256 has no LDS room for a 128-key tile regardless, so the shape envelope
+    argument that gated this never applied to it either. The parameter stays
+    because the callers and the buffer padding are written against a tile width,
+    and because the kernel instantiates the matching tile from the runtime value
+    should a future schedule honour it again.
     """
-    if _is_small_igpu(device) and head_dim == 128 and kv_length >= 2048 and not has_mask:
-        return _SAGE_LARGE_CTA_K
     return _SAGE_CTA_K
 
 
