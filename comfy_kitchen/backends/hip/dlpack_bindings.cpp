@@ -1704,48 +1704,33 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
                    mask_stride_h, mask_stride_q, mask_stride_k, mask_dtype_code, fn);
 
     const int padded_k = sage_padded_k(kv_len, cta_k);
+    // V must be int8 -- that is the only PV this backend has. The 16-bit-V variant
+    // that used to live here (int8_bf16sv.hip, Q/K int8 with bf16/fp16 V and bf16
+    // probabilities, as the reference sageattn library ships) measured 1.48x
+    // SLOWER than this kernel summed over all 18 benchmark_attn.py shapes, on 15
+    // of 18 individually, and no public API could reach it: both int8_attention
+    // and prequantize_int8_attention go through sage_int8_quantize, which always
+    // produces int8 V. Its only edge was accuracy, and that is not this tree's
+    // job, so a non-int8 V is now rejected instead of silently misread.
     const int v_dtype_code = map_dtype_to_code(v_int8.dtype());
-    if (v_dtype_code == 4) {
-        // Pure-int8 V: upstream's int8_attn.hip, unchanged. This used to branch to
-        // a ported gfx110x schedule for the iGPU's tile-aligned shapes, but that
-        // schedule measured 1.10x-1.40x SLOWER than this kernel on every shape in
-        // benchmark_attn.py that it served (0 wins / 11 losses / 7 ties, interleaved
-        // in-process, ~1% null control), so it was removed rather than kept behind
-        // a gate. sage_attn_port.hip still holds the direct short-key kernel, which
-        // wins on its own shapes and is reached from sage_sdpa's use_direct branch.
-        launch_sage_int8_attn(
-            q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(),
-            k_scale.data(), v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h,
-            mask_stride_q, mask_stride_k, mask_dtype_code, cta_k, batch, qo_len, kv_len,
-            sage_padded_q(qo_len), q_heads, kv_heads, head_dim, padded_k / kSageKeyGroup,
-            static_cast<int64_t>(q_heads) * qo_len * head_dim,
-            static_cast<int64_t>(qo_len) * head_dim,
-            static_cast<int64_t>(kv_heads) * kv_len * head_dim,
-            static_cast<int64_t>(kv_len) * head_dim,
-            static_cast<int64_t>(kv_heads) * head_dim * padded_k,
-            static_cast<int64_t>(head_dim) * padded_k, padded_k,
-            o_stride_b, o_stride_h, o_stride_n, sm_scale, output_dtype_code,
-            stream);
-    } else {
-        // fp16 or bf16 V: a prequantized caller supplying unquantized V (masked
-        // callers, and prequantized snapshots that kept V in its input dtype).
-        // The bf16-SV bridge reads the same transposed buffer at the same width;
-        // it used to be reachable only for V != int8, and the fp16-V case also
-        // went to the now-removed port schedule.
-        launch_sage_bf16sv_attn(
-            q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(), k_scale.data(),
-            mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k, mask_dtype_code,
-            cta_k, batch, qo_len, kv_len, sage_padded_q(qo_len), q_heads, kv_heads, head_dim,
-            padded_k / kSageKeyGroup,
-            static_cast<int64_t>(q_heads) * qo_len * head_dim,
-            static_cast<int64_t>(qo_len) * head_dim,
-            static_cast<int64_t>(kv_heads) * kv_len * head_dim,
-            static_cast<int64_t>(kv_len) * head_dim,
-            static_cast<int64_t>(kv_heads) * head_dim * padded_k,
-            static_cast<int64_t>(head_dim) * padded_k, padded_k,
-            o_stride_b, o_stride_h, o_stride_n, sm_scale, output_dtype_code,
-            v_dtype_code, stream);
+    if (v_dtype_code != 4) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": packed v must be int8 (dtype code 4), got code " +
+                                 std::to_string(v_dtype_code));
     }
+    launch_sage_int8_attn(
+        q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(),
+        k_scale.data(), v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h,
+        mask_stride_q, mask_stride_k, mask_dtype_code, cta_k, batch, qo_len, kv_len,
+        sage_padded_q(qo_len), q_heads, kv_heads, head_dim, padded_k / kSageKeyGroup,
+        static_cast<int64_t>(q_heads) * qo_len * head_dim,
+        static_cast<int64_t>(qo_len) * head_dim,
+        static_cast<int64_t>(kv_heads) * kv_len * head_dim,
+        static_cast<int64_t>(kv_len) * head_dim,
+        static_cast<int64_t>(kv_heads) * head_dim * padded_k,
+        static_cast<int64_t>(head_dim) * padded_k, padded_k,
+        o_stride_b, o_stride_h, o_stride_n, sm_scale, output_dtype_code,
+        stream);
     check_hip_launch();
 }
 

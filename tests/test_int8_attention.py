@@ -1246,6 +1246,36 @@ def test_hip_attention_rejects_invalid_prepared_mask(invalid):
         )
 
 
+@requires_int8_attention
+@pytest.mark.skipif(not torch.version.hip, reason="HIP packed-V binding")
+# int8_bf16sv.hip used to take over whenever V arrived in its own dtype. It was
+# unreachable from the public API (both int8_attention and
+# prequantize_int8_attention go through sage_int8_quantize, which always emits
+# int8 V) and measured 1.48x slower than int8_attn.hip summed over the 18
+# benchmark_attn.py shapes, so V in any other dtype is now rejected outright
+# rather than silently reinterpreted. The 16-bit arms of the old kernel also had
+# no prepared-mask modes, so the old dispatch misread one as raw bf16.
+@skip_on_gfx1035_port
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_hip_attention_rejects_non_int8_v(dtype):
+    q, k, v = _qkv(1, 4, 4, 256, 256, 64)
+    packed = ck.prequantize_int8_attention(q, k, v)
+    assert packed.v.dtype == torch.int8, "the fixture must produce int8 V"
+    with pytest.raises(RuntimeError, match=r"packed v must be int8"):
+        sage_attention_module._hip_backend.sage_int8_attend(
+            packed.q,
+            packed.k,
+            packed.v.to(dtype),
+            packed.q_scale,
+            packed.k_scale,
+            packed.v_scale,
+            attention_scale=packed.attention_scale,
+            attn_mask=None,
+            output_dtype=torch.bfloat16,
+            cta_k=packed.cta_k,
+        )
+
+
 # --- use_direct gate agreement (fork) ----------------------------------------
 #
 # The short-key direct path is selected twice: the Python gate in
