@@ -32,11 +32,49 @@ The sampler excludes input conditioning, VAE, export and initial weight loading.
 - Existing attention suite plus the new tests: **both baseline and candidate have 457 passed, 595 skipped, 2 failed**. The same two inherited zero/negative-scale tests fail on both; they are tracked separately in [#224](https://github.com/Comfy-Org/comfy-kitchen/pull/224). They are not removed or counted as passes.
 - A 204-case exploratory schedule sweep preceded the final narrow dispatch. No claim of measured performance on other GPU architectures.
 
-To reproduce after building each checkout with identical flags:
+### Regression and V-only smoke commands
+
+After building each checkout with identical flags:
 
 ```bash
 python -m pytest tests/test_int8_v_quant_schedule.py tests/test_int8_attention.py -q
 python benchmarks/bench_v_quant.py --output v-quant.json
 ```
 
-Compare output hashes and repeated measurements from both checkouts. The benchmark script only produces random public input; no model or business media is distributed.
+These commands run regression tests and a V-only smoke benchmark. They do not
+reproduce the interleaved attention comparison or the full sampler results above.
+
+### Recorded attention and sampler experiment
+
+The [original scripts, build argv, inputs' hashes and raw results](https://github.com/Tokha233/ComfyUI-H3-SpeedKit/tree/9d584ed/experiments/v-quant-1001)
+are archived separately. Kitchen Python and base attention/V source are pinned to
+`12389a30463c62c93670b049d59bf3fa56c0316d`; candidate V source is from this PR at
+`6dd6f95a7d4b8fd9ea1d6b72a695b513c2ac045c`. The common native objects come from
+integration snapshot `8710121`, with the attention launcher rebuilt from
+`12389a3`. ComfyUI is `8cfe5e1ecb97512dea8deaac15e1228d7e6feeb1` on both arms.
+
+The recorded build uses CUDA 13.0.88, `-O3 -DNDEBUG -std=c++20`,
+`--generate-code=arch=compute_120,code=[sm_120]`, `--use_fast_math`,
+`--expt-relaxed-constexpr`, `--expt-extended-lambda`, and the same common objects
+on both sides. `remote-extensions-build.json` in the archive contains the full
+compile/link argv, include paths and defines. The archive README describes the
+required prepared overlays and object build; its laboratory paths must be
+adapted before reuse. This is not a clean rebuild of all main-branch objects.
+
+With that experiment environment prepared, the exact measured commands were:
+
+```bash
+python /tmp/h3-kitchen-followup-1001/build_extensions.py
+python /tmp/h3-kitchen-followup-1001/bench_extensions.py
+python /tmp/h3-kitchen-followup-1001/sampler.py --arm base --pair 0
+python /tmp/h3-kitchen-followup-1001/sampler.py --arm candidate --pair 0
+python /tmp/h3-kitchen-followup-1001/sampler.py --arm candidate --pair 1
+python /tmp/h3-kitchen-followup-1001/sampler.py --arm base --pair 1
+python /tmp/h3-kitchen-followup-1001/profile_sampler.py --arm candidate --pair 9
+```
+
+`bench_extensions.py` contains both the interleaved V-only and complete attention
+measurements. Each sampler command starts an independent process; profiling is
+separate from timing. Compare the video/audio hashes before timing summaries.
+Condition preparation inside the sampler is included; condition encoding, VAE,
+export and initial loading are excluded. The fixture and model are not bundled.
