@@ -17,10 +17,31 @@ import subprocess
 import sys
 
 
+def validate_checkout(path):
+    checkout = path.resolve(strict=True)
+    if not (checkout / "comfy_kitchen" / "__init__.py").is_file():
+        raise ValueError(f"No comfy_kitchen package in checkout: {checkout}")
+    return checkout
+
+
+def require_inside(path, checkout):
+    resolved = Path(path).resolve(strict=True)
+    if not resolved.is_relative_to(checkout):
+        raise RuntimeError(f"Import resolved outside requested checkout {checkout}: {resolved}")
+    return str(resolved)
+
+
 def worker(args):
-    sys.path.insert(0, str(args.worker.resolve()))
+    checkout = validate_checkout(args.worker)
+    sys.path.insert(0, str(checkout))
     import torch
     import comfy_kitchen as ck
+    from comfy_kitchen.backends import cuda
+
+    package_path = require_inside(ck.__file__, checkout)
+    if cuda._C is None:
+        raise RuntimeError(f"CUDA extension is unavailable in {checkout}")
+    extension_path = require_inside(cuda._C.__file__, checkout)
 
     if torch.cuda.get_device_capability() != (12, 0):
         raise RuntimeError("This qualification targets SM120")
@@ -54,7 +75,10 @@ def worker(args):
                     "sha256": signature, "samples_ms": timings,
                     "median_ms": statistics.median(timings),
                 })
-    return {"gpu": torch.cuda.get_device_name(), "torch": torch.__version__, "rows": records}
+    return {
+        "gpu": torch.cuda.get_device_name(), "torch": torch.__version__, "rows": records,
+        "package_path": package_path, "extension_path": extension_path,
+    }
 
 
 def main():
@@ -69,6 +93,10 @@ def main():
         return
     if args.baseline_dir is None or args.candidate_dir is None:
         parser.error("both checkout directories are required")
+    # Validate both before starting any GPU worker. A typo must not fall through
+    # to a globally installed package and accidentally benchmark it twice.
+    args.baseline_dir = validate_checkout(args.baseline_dir)
+    args.candidate_dir = validate_checkout(args.candidate_dir)
     runs = []
     for index, arm in enumerate(["baseline", "candidate", "candidate", "baseline"]):
         checkout = args.baseline_dir if arm == "baseline" else args.candidate_dir
