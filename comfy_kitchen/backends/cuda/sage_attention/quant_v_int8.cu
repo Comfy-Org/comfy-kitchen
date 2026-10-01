@@ -8,6 +8,7 @@
 //
 // One thread block per (b, h, d_tile) with D_TILE=8 d-channels. Short K uses
 // 128 threads so it does not launch idle warps; longer K uses 512 threads.
+// Large D128 half/bfloat16 inputs use 1024 threads on SM120.
 // Threads cooperate along N with vectorized 128-bit loads, warp-shuffle absmax
 // reduction, and reverse Pass 2 iteration for L2 cache reuse. Pass 1 uses 4×
 // manual unroll for memory-level parallelism at low occupancy.
@@ -196,9 +197,46 @@ extern "C" void launch_quant_v_int8_kernel(const void *v, void *out, void *scale
 
   const int blocks = B * H * (D / kDTile);
 
+  // Long D128 rows benefit from more concurrent loads on SM120.
+  // Keep smaller tensors and other layouts on their existing schedules.
+  const bool contiguous = sn == D &&
+      (H == 1 || sh == static_cast<int64_t>(N) * D) &&
+      (B == 1 || sb == static_cast<int64_t>(H) * N * D);
+  const bool token_major = sh == D &&
+      (sn == static_cast<int64_t>(H) * D || sn == static_cast<int64_t>(3) * H * D) &&
+      (B == 1 || sb == static_cast<int64_t>(N) * sn);
+  const bool large_input = D == 128 && N >= 12288 && B * H >= 32 &&
+      input_dtype_code != comfy::DTYPE_CODE_FLOAT32 && (contiguous || token_major) &&
+      static_cast<int64_t>(B) * H * N * D * element_size >= 128 * 1024 * 1024;
+  bool wide_block = false;
+  if (large_input) {
+    int device;
+    cudaError_t status = cudaGetDevice(&device);
+    static thread_local int cached_device = -1;
+    static thread_local bool cached_sm120 = false;
+    if (status == cudaSuccess && device != cached_device) {
+      int major, minor;
+      status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+      if (status == cudaSuccess)
+        status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+      if (status == cudaSuccess) {
+        cached_sm120 = major == 12 && minor == 0;
+        cached_device = device;
+      }
+    }
+    if (status != cudaSuccess)
+      throw std::runtime_error(std::string("quant_v_int8 device query failed: ") +
+                               cudaGetErrorString(status));
+    wide_block = cached_sm120;
+  }
+
   DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
     if (N <= 256) {
       quant_v_int8_kernel<T, 128><<<blocks, 128, 0, stream>>>(
+          static_cast<const T *>(v), static_cast<int8_t *>(out),
+          static_cast<float *>(scale), N, padded_N, H, D, sb, sh, sn);
+    } else if (wide_block) {
+      quant_v_int8_kernel<T, 1024><<<blocks, 1024, 0, stream>>>(
           static_cast<const T *>(v), static_cast<int8_t *>(out),
           static_cast<float *>(scale), N, padded_N, H, D, sb, sh, sn);
     } else {
