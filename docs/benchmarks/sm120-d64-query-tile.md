@@ -34,3 +34,43 @@ Cached-Q candidates were also tested. The plain small tile was chosen for its si
 - The unmodified main launcher reproduces those same two failures; they are handled by #224.
 - Combined with #224 and the existing upstream candidates: 527 passed, 594 skipped, no failures.
 - The new split-head oracle contributes ten byte-equality cases with interleaved QKV, both 16-bit output types, and tail lengths.
+
+## Independent-process integration check
+
+Loading several experimental `_C` modules simultaneously and swapping all entry
+points caused a GEMM timing artifact: unchanged GEMM entries became slower,
+while attention remained faster. An attention-only proxy was sufficient for the
+narrow table above, but should not stand in for testing an installed extension.
+
+A follow-up ABBA test loaded **one Kitchen extension per fresh process**, using
+identical linked objects except for the attention launcher. Each process had one
+warmup and two formal 243-frame decodes. Four formal observations per arm:
+
+| Scope | Base seconds | Small tile seconds | Time reduction |
+|---|---:|---:|---:|
+| Full decoder, separate processes | 9.962410 | 9.866619 | 0.9615% |
+
+All 12 floating-point RGB and RGB8 signatures match. This is one representative
+latent, not online throughput. Raw process records are in
+[sm120-d64-independent-decode.json](sm120-d64-independent-decode.json).
+
+The public-API microbenchmark can also run the two checkouts in separate
+processes:
+
+```sh
+python docs/benchmarks/bench_sm120_d64_query_tile.py \
+  --baseline-dir /path/to/baseline-checkout \
+  --candidate-dir /path/to/candidate-checkout --output d64.json
+```
+
+Both checkouts must already contain a CUDA extension built with the same
+compiler/options and dependencies. The benchmark holds prequantization outside
+the measured API and validates exact outputs; it does not measure VAE latency.
+
+The independent-process script completed all 12 dtype/shape cases, with exact
+signatures across four processes. At `[4,32,1797,64]`, public prequantized API time
+fell 4.55% (FP16) / 4.80% (BF16); `[2,32,1025,64]` fell 9.80% / 9.17%. The smallest
+`[1,32,1024,64]` shape was essentially neutral (-0.96% / +0.54% time reduction),
+and the 2049 fallback was within 0.09%. These are API measurements, distinct from
+the direct kernel table. Full events are in
+[sm120-d64-independent-micro.json](sm120-d64-independent-micro.json).
