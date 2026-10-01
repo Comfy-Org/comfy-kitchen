@@ -27,3 +27,10 @@ A separate integration run held all non-attention extension entry points fixed a
 These decoder timings include dynamic weight loading and GPU→CPU output. They are not online service throughput or an end-to-end generation speedup. Only two representative latents were used for this integration check; no private prompts or media are included.
 
 Cached-Q candidates were also tested. The plain small tile was chosen for its simpler scope and consistent benefit in the qualified workloads. The cache pipeline is unchanged in this PR.
+
+## Correctness suite
+
+- Current-main Python API plus this launcher: 429 passed, 594 skipped, and two pre-existing zero/negative-scale failures.
+- The unmodified main launcher reproduces those same two failures; they are handled by #224.
+- Combined with #224 and the existing upstream candidates: 527 passed, 594 skipped, no failures.
+- The new split-head oracle contributes ten byte-equality cases with interleaved QKV, both 16-bit output types, and tail lengths.
