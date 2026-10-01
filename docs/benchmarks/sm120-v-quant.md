@@ -46,11 +46,11 @@ reproduce the interleaved attention comparison or the full sampler results above
 
 ### Recorded attention and sampler experiment
 
-The [original scripts, build argv, inputs' hashes and raw results](https://github.com/Tokha233/ComfyUI-H3-SpeedKit/tree/9d584ed/experiments/v-quant-1001)
+The [original scripts, build argv, inputs' hashes and raw results](https://github.com/Tokha233/ComfyUI-H3-SpeedKit/tree/d6d6da7/experiments/v-quant-1001)
 are archived separately. Kitchen Python and base attention/V source are pinned to
 `12389a30463c62c93670b049d59bf3fa56c0316d`; candidate V source is from this PR at
 `6dd6f95a7d4b8fd9ea1d6b72a695b513c2ac045c`. The common native objects come from
-integration snapshot `8710121`, with the attention launcher rebuilt from
+integration snapshot `8710121` / `2be5d18`, with the attention launcher rebuilt from
 `12389a3`. ComfyUI is `8cfe5e1ecb97512dea8deaac15e1228d7e6feeb1` on both arms.
 
 The recorded build uses CUDA 13.0.88, `-O3 -DNDEBUG -std=c++20`,
