@@ -145,14 +145,6 @@ __forceinline__ __device__ float row_reduce_fmax(float v) {
     return v;
 }
 
-// The XOR-16 step spans both halves of a 32-lane row. Take it as VALU instead
-// of ds_bpermute so the strided loads still have work to hide.
-template <>
-__forceinline__ __device__ float row_reduce_fmax<32>(float v) {
-    v = fmaxf(v, swap_half_wave(v));
-    return row_reduce_fmax<16>(v);
-}
-
 // Fused block-Hadamard rotation (convrot), mirroring convrot4/64/128 in the CUDA
 // quantizer. Orthogonal, so Q.K is unchanged; it only moves quantization outliers
 // off single channels. Q and K must use the same block size or the scores are
@@ -189,23 +181,13 @@ __forceinline__ __device__ void convrot64(float* v) {
 __forceinline__ __device__ void convrot128_plain(float* v) {
     convrot4(v);
     const int lane = threadIdx.x & 31;
-    const int half_lane = lane & 15;
 #pragma unroll
-    for (int bit = 1; bit < 16; bit <<= 1) {
+    for (int bit = 1; bit < 32; bit <<= 1) {
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
-            const float other = __shfl_xor(v[c], bit, 16);
-            v[c] = (half_lane & bit) ? other - v[c] : v[c] + other;
+            const float other = __shfl_xor(v[c], bit, 32);
+            v[c] = (lane & bit) ? other - v[c] : v[c] + other;
         }
-    }
-    // H128 differs from H64 within each half only by the XOR-16 leg. That leg
-    // crosses the two halves of the wave, so ds_bpermute is on the critical
-    // path after the strided row load. swap_half_wave gives the same exchange
-    // in VALU on gfx11 and falls back to __shfl_xor elsewhere.
-#pragma unroll
-    for (int c = 0; c < 4; ++c) {
-        const float other = swap_half_wave(v[c]);
-        v[c] = (lane & 16) ? other - v[c] : v[c] + other;
     }
 #pragma unroll
     for (int c = 0; c < 4; ++c) v[c] *= 0.1767766952966369f;
