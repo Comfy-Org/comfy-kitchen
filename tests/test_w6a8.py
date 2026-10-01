@@ -135,12 +135,78 @@ class TestCudaBackend:
         assert rel_l2(got, ref) < 2e-2          # int8 activation rounding between backends
         assert rel_l2(got, exact) < 4e-2        # and both are close to the bf16 matmul
 
+    # a small L2 decodes the weight whole, a large one in chunks; 4352 columns leave a short last chunk
+    @pytest.mark.parametrize("bits", [4, 6])
+    @pytest.mark.parametrize("m", [64, 1024])
+    def test_linear_is_the_same_whole_or_chunked(self, bits, m, seed, monkeypatch):
+        w = torch.randn(4352, 512, device="cuda", dtype=torch.bfloat16) * 0.02
+        q, s, c, _, cb = eager_w4a8.quantize_w4a8_int8_weight(w, bits=bits)
+        x = torch.randn(m, 512, device="cuda", dtype=torch.bfloat16)
+        outs = []
+        for chunk in (1024, 4096, 4352):
+            monkeypatch.setattr(cuda_backend, "_w4a8_weight_chunk_cols", lambda m, n, d, c=chunk: c)
+            outs.append(cuda_backend.w4a8_int8_linear(x, q, s, c, codebook=cb, out_dtype=torch.bfloat16))
+        assert torch.equal(outs[0], outs[2]) and torch.equal(outs[1], outs[2])
+
     def test_two_pass_fp32_scale_route(self, weight):
         q, s, c, _, _ = eager_w4a8.quantize_w4a8_int8_weight(weight, bits=6, scale_dtype=torch.float32)
         x = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
         got = cuda_backend.w4a8_int8_linear(x, q, s, c, out_dtype=torch.bfloat16)
         ref = eager_w4a8.w4a8_int8_linear(x, q, s, c, out_dtype=torch.bfloat16)
         assert rel_l2(got, ref) < 2e-2
+
+    @pytest.mark.parametrize("group_size", [16, 32, 64])
+    def test_fused_requant_matches_eager(self, weight, group_size, monkeypatch):
+        """The fused ConvRot+requant kernel reproduces the eager quantizer (search off): same
+        scales and int8 grid up to fp32 rounding-order effects, nothing systematic."""
+        if not cuda_backend._WXA8_FUSED_QUANT:
+            pytest.skip("fused requant not built")
+        kw = {"bits": 6, "group_size": group_size, "codebook": False, "scale_search": False}
+        q, s, c, _, _ = eager_w4a8.quantize_w4a8_int8_weight(weight, **kw)
+        monkeypatch.setattr(cuda_backend, "_quantize_w4a8_chunked", lambda *a, **k: pytest.fail("eager path used"))
+        qf, sf, cf, corr, cb = cuda_backend.quantize_w4a8_int8_weight(weight, **kw)
+        assert corr is None and cb is None and qf.shape == q.shape and sf.dtype == s.dtype
+        assert torch.allclose(cf, c, rtol=1e-5, atol=0)
+        sb, sfb = raw(s).int(), raw(sf).int()
+        assert (sb != sfb).float().mean().item() < 1e-3 and (sb - sfb).abs().max().item() <= 1
+        grid = eager_w4a8._dequant_int4_grouped_to_int8(q, s, None, group_size)
+        grid_f = eager_w4a8._dequant_int4_grouped_to_int8(qf, sf, None, group_size)
+        assert (grid_f != grid).float().mean().item() < 1e-3
+        e = rel_l2(eager_w4a8.dequantize_w4a8_int8_weight(q, s, c, group_size=group_size, output_dtype=torch.float32), weight)
+        ef = rel_l2(eager_w4a8.dequantize_w4a8_int8_weight(qf, sf, cf, group_size=group_size, output_dtype=torch.float32), weight)
+        assert abs(ef - e) < 1e-4 * e
+
+    def test_fused_requant_stochastic_rounding(self, weight):
+        if not cuda_backend._WXA8_FUSED_QUANT:
+            pytest.skip("fused requant not built")
+        kw = {"bits": 6, "group_size": 32, "codebook": False, "scale_search": False, "stochastic_rounding": 7}
+        q, s, c, _, _ = cuda_backend.quantize_w4a8_int8_weight(weight, **kw)
+        q2, _, _, _, _ = cuda_backend.quantize_w4a8_int8_weight(weight, **kw)
+        assert torch.equal(q, q2)  # seeded, deterministic
+        e = rel_l2(cuda_backend.dequantize_w4a8_int8_weight(q, s, c, group_size=32, output_dtype=torch.float32), weight)
+        assert e < 0.035
+
+    def test_requantize_uses_fused_kernel(self, weight, monkeypatch):
+        if not cuda_backend._WXA8_FUSED_QUANT:
+            pytest.skip("fused requant not built")
+        qt = QuantizedTensor.from_float(weight, "AsymW4A8Int8Layout", bits=6, group_size=32)
+        monkeypatch.setattr(cuda_backend, "_quantize_w4a8_chunked", lambda *a, **k: pytest.fail("eager path used"))
+        rq = qt.requantize_from_float(weight)   # ComfyUI hands over compute-dtype (bf16/fp16) weights
+        assert rel_l2(rq.dequantize(), weight) < 0.03
+
+    def test_declined_shape_falls_back_to_eager(self, weight, monkeypatch):
+        """When the fused launcher declines (a row too long for shared memory, which depends on the
+        GPU), the chunked eager quantizer runs and its result is returned unchanged."""
+        if not cuda_backend._WXA8_FUSED_QUANT:
+            pytest.skip("fused requant not built")
+        monkeypatch.setattr(cuda_backend._C, "quantize_wxa8_convrot_fused", lambda *a, **k: False)
+        calls = []
+        chunked = cuda_backend._quantize_w4a8_chunked
+        monkeypatch.setattr(cuda_backend, "_quantize_w4a8_chunked", lambda *a, **k: calls.append(1) or chunked(*a, **k))
+        kw = {"bits": 6, "group_size": 32, "codebook": False, "scale_search": False}
+        q, s, c, _, _ = cuda_backend.quantize_w4a8_int8_weight(weight, **kw)
+        qe, se, ce, _, _ = eager_w4a8.quantize_w4a8_int8_weight(weight, **kw)
+        assert calls and torch.equal(q, qe) and torch.equal(raw(s), raw(se)) and torch.equal(c, ce)
 
     def test_four_bit_path_unchanged(self, weight):
         q, s, c, _, cb = eager_w4a8.quantize_w4a8_int8_weight(weight, bits=4)

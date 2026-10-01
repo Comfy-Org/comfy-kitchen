@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cmath>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -47,7 +48,40 @@ inline void* get_stream_workspace(size_t size, cudaStream_t stream) {
     return workspace.data;
 }
 
-struct ThreadblockSwizzleLeanStreamK {
+template <cudaDeviceAttr Attr>
+inline int cached_device_attribute(int fallback) {
+    static int values[64] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return fallback;
+    if (values[dev] == 0) {
+        cudaDeviceGetAttribute(&values[dev], Attr, dev);
+        if (values[dev] <= 0) values[dev] = fallback;
+    }
+    return values[dev];
+}
+inline int device_sm_count() { return cached_device_attribute<cudaDevAttrMultiProcessorCount>(1); }
+inline int device_l2_bytes() { return cached_device_attribute<cudaDevAttrL2CacheSize>(1 << 30); }
+
+// Splits the measured cards: 36 and 96 MB of L2 were tuned at the full band, 5 MB cannot
+// keep a band of weights from one wave to the next.
+constexpr int kBandRetainL2Bytes = 16 << 20;
+
+// Band width in N tiles: `retained` where the L2 holds a band. Where it cannot, the width
+// that leaves one wave of blocks the least to read, sms / band activation tiles plus band
+// weight tiles. A 3080 (68 SMs, 5 MB) runs within 2% of its best from 4 to 12 tiles at any
+// K, and takes up to 47% longer at 32.
+inline int stream_k_band_tiles(int retained, int sms, cutlass::gemm::GemmCoord tile_size) {
+    if (device_l2_bytes() >= kBandRetainL2Bytes) return retained;
+    const int band = static_cast<int>(
+        std::lround(std::sqrt(double(sms) * tile_size.m() / tile_size.n())));
+    return band < 1 ? 1 : band;
+}
+
+// BandN > 0: walk N in bands so a wave's weight slice stays in L2, BandN tiles wide where
+// the L2 holds a band.
+template <int BandN = 0>
+struct ThreadblockSwizzleLeanStreamKT {
     using StreamkFeature = void;
 
     template <typename GemmKernel>
@@ -73,10 +107,11 @@ struct ThreadblockSwizzleLeanStreamK {
     int sk_tiles;
     int sk_waves;
     bool cohort_raster = false;
+    int band_tiles = BandN;
 
-    ThreadblockSwizzleLeanStreamK() = default;
+    ThreadblockSwizzleLeanStreamKT() = default;
 
-    ThreadblockSwizzleLeanStreamK(
+    ThreadblockSwizzleLeanStreamKT(
         cutlass::gemm::GemmUniversalMode,
         cutlass::gemm::GemmCoord problem_size_arg,
         cutlass::gemm::GemmCoord tile_size,
@@ -98,6 +133,9 @@ struct ThreadblockSwizzleLeanStreamK {
           avail_sms(available_sms < 0 || available_sms > device_sms
                         ? device_sms
                         : available_sms) {
+        if constexpr (BandN > 0) {
+            band_tiles = stream_k_band_tiles(BandN, avail_sms, tile_size);
+        }
         const int output_tiles = tiled_shape_.m() * tiled_shape_.n();
         const int partial_wave_tiles = output_tiles % avail_sms;
         if (partial_wave_tiles == 0) {
@@ -156,6 +194,12 @@ struct ThreadblockSwizzleLeanStreamK {
         if (tiled_shape_.m() < tiled_shape_.n()) {
             tile_n = tile_index / tiled_shape_.m();
             tile_m = tile_index - tile_n * tiled_shape_.m();
+        } else if (band_tiles > 0) {
+            const int band = tile_index / (band_tiles * tiled_shape_.m());
+            const int band_n = min(band_tiles, tiled_shape_.n() - band * band_tiles);
+            const int r = tile_index - band * band_tiles * tiled_shape_.m();
+            tile_m = r / band_n;
+            tile_n = band * band_tiles + (r - tile_m * band_n);
         } else {
             tile_m = tile_index / tiled_shape_.n();
             tile_n = tile_index - tile_m * tiled_shape_.n();
@@ -200,6 +244,8 @@ struct ThreadblockSwizzleLeanStreamK {
             : block_index;
     }
 };
+
+using ThreadblockSwizzleLeanStreamK = ThreadblockSwizzleLeanStreamKT<0>;
 
 template <typename T, typename = void>
 struct IsStreamKSwizzle : std::false_type {};
