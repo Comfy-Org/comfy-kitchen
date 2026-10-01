@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024 SageAttention team.
+// SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/tensor_struct.h>
 
@@ -561,24 +564,22 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> quant_qk_int8_gfx103x(
 
     dim3 block(256);
 
-    const int blk_sel = getenv("SAGEATTN_QUANT_BLK") ? atoi(getenv("SAGEATTN_QUANT_BLK")) : 1;
+    // Tile shape by head dim. The two wider pairs were reachable only through the
+// SAGEATTN_QUANT_BLK sweep knob, which this tree has dropped (it read the
+// environment on every launch, and the fork removed the equivalent
+// COMFY_KITCHEN_WMMA_TILE scaffolding for the same reason), so D64 uses 128/64
+// and D128 falls back to the minimum block.
     constexpr int BLK_Q64 = 128;
     constexpr int BLK_K64 = 64;
-    constexpr int BLK_Q128 = 64;
-    constexpr int BLK_K128 = 32;
     int blk_q, blk_k;
-    if (blk_sel == 128) { blk_q = BLK_Q64; blk_k = BLK_K64; }
-    else if (blk_sel == 64) { blk_q = BLK_Q128; blk_k = BLK_K128; }
-    else if (blk_sel == 0) { blk_q = MIN_BLK_Q; blk_k = MIN_BLK_K; }
-    else if (head_dim == 64) { blk_q = BLK_Q64; blk_k = BLK_K64; }
+    if (head_dim == 64) { blk_q = BLK_Q64; blk_k = BLK_K64; }
     else { blk_q = MIN_BLK_Q; blk_k = MIN_BLK_K; }
     const int q_blocks = (q_len + blk_q - 1) / blk_q;
     const int k_blocks = (kv_len + blk_k - 1) / blk_k;
 
-    int q_gpb = getenv("SAGEATTN_QUANT_GPB") ? atoi(getenv("SAGEATTN_QUANT_GPB")) : 1;
-    if (q_gpb < 1) q_gpb = 1;
-    dim3 grid_q((q_blocks + q_gpb - 1) / q_gpb, q_heads, batch);
-    dim3 grid_k((k_blocks + q_gpb - 1) / q_gpb, kv_heads, batch);
+    constexpr int q_gpb = 1;  // one (q_block, head, batch) per program
+    dim3 grid_q(q_blocks, q_heads, batch);
+    dim3 grid_k(k_blocks, kv_heads, batch);
 
     #define LAUNCH_QUANT(HD, T, BQ, BK) \
         do { \
@@ -603,7 +604,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> quant_qk_int8_gfx103x(
     #define LAUNCH_QUANT_DISPATCH(HD, T) \
         do { \
             if (blk_q == BLK_Q64) { LAUNCH_QUANT(HD, T, 128, 64); } \
-            else if (blk_q == BLK_Q128) { LAUNCH_QUANT(HD, T, 64, 32); } \
             else { LAUNCH_QUANT(HD, T, MIN_BLK_Q, MIN_BLK_K); } \
         } while(0)
 
@@ -722,8 +722,10 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
         }
     }
 
-    const int v10_inq_mode = getenv("SAGEATTN_V10_INQ") ? atoi(getenv("SAGEATTN_V10_INQ")) : 2;
-    const bool v10_inq_wanted = (v10_inq_mode == 1) || (v10_inq_mode == 2 && kv_len <= 1024);
+    // In-kernel Q quantization applies to short-KV shapes; the previous mode 1
+    // (always) and mode 3 (never) arms were only reachable through the
+    // SAGEATTN_V10_INQ sweep knob, which this tree has dropped.
+    const bool v10_inq_wanted = kv_len <= 1024;
     // The in-kernel-Q path is only real when an fp16/bf16 Q source came in; the
     // prepass path hands over an empty tensor to say "Q is already packed".
     const bool inq = v10_inq_wanted && q_fp.numel() > 0;
@@ -793,22 +795,13 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
     ctx.mask_mode = gmask;
     ctx.mask_dtype = static_cast<int>(mask_dtype);
 
-    // Tile shape. The env overrides are the ones the ported kernel shipped with,
-    // so a tuning experiment stays an environment variable and not a rebuild.
-    int v10_bn, v10_tm;
-    if (head_dim == 64) {
-        const int bn_env = getenv("SAGEATTN_BN_D64") ? atoi(getenv("SAGEATTN_BN_D64")) : 32;
-        v10_bn = (bn_env == 64) ? 64 : 32;
-        v10_tm = getenv("SAGEATTN_TM_D64") ? atoi(getenv("SAGEATTN_TM_D64"))
-              : (getenv("SAGEATTN_TM") ? atoi(getenv("SAGEATTN_TM")) : 8);
-    } else {
-        const int bn_env = getenv("SAGEATTN_BN_D128") ? atoi(getenv("SAGEATTN_BN_D128"))
-                           : (getenv("SAGEATTN_BN") ? atoi(getenv("SAGEATTN_BN")) : 16);
-        v10_bn = (bn_env == 32) ? 32 : 16;
-        v10_tm = getenv("SAGEATTN_TM_D128") ? atoi(getenv("SAGEATTN_TM_D128"))
-              : (getenv("SAGEATTN_TM") ? atoi(getenv("SAGEATTN_TM")) : 8);
-    }
-    const int tm = (v10_tm == 2) ? 2 : ((v10_tm == 4) ? 4 : 8);
+    // Tile shape. The ported kernel shipped these as SAGEATTN_BN_D64 / _BN_D128 /
+    // SAGEATTN_TM* environment overrides, read on every launch; this tree has
+    // dropped them (fork commit 0bc6628 removed the equivalent
+    // COMFY_KITCHEN_WMMA_TILE scaffolding for the WMMA backend) so the tuned pair
+    // is now a constant: BN = 32 at D64 and 16 at D128, TM = 8 rows per thread.
+    constexpr int tm = 8;
+    const int v10_bn = (head_dim == 64) ? 32 : 16;
 
     // One launcher covers every combination the old macro set spelled out. The
     // tile shape (head dim, causal, key tile, rows per thread, in-kernel Q
@@ -823,18 +816,10 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
     // loop's critical path, where the register budget is already the binding
     // constraint on this architecture.
     const bool causal = is_causal != 0;
-    if (causal) { launch_attn_cf<true>(ctx, head_dim, inq, out_bf, v10_bn, tm); }
-    else        { launch_attn_cf<false>(ctx, head_dim, inq, out_bf, v10_bn, tm); }
-    return output;
-
     // is_causal selects the triangular schedule. comfy_kitchen's int8 attention
     // has no causal mode, but the ported op exposes the flag, so the
     // instantiation is kept rather than dropped.
     if (causal) { launch_attn_cf<true>(ctx, head_dim, inq, out_bf, v10_bn, tm); }
     else        { launch_attn_cf<false>(ctx, head_dim, inq, out_bf, v10_bn, tm); }
-    #undef CK_DISPATCH_OUT128
-    #undef CK_DISPATCH_OUT64
-    #undef CK_DISPATCH_BN128
-    #undef CK_DISPATCH_TM
     return output;
 }

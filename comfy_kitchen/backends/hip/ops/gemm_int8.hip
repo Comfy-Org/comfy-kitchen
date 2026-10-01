@@ -6,8 +6,6 @@
 #include <stdexcept>
 #include <string>
 
-#include "../arch_compat.h"
-
 #include "../epilogue.h"
 #include "../gemm_gfx10.h"
 #include "../gemm_wmma.h"
@@ -60,22 +58,23 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
     }
 
     if (comfy_is_gfx10()) {
-        // RDNA2: no matrix cores, use VALU v_dot4_i32_i8
-        constexpr int BM = 64;
-        constexpr int BN = 64;
-        const int num_tiles = ((N + BN - 1) / BN) * ((M + BM - 1) / BM);
-        if (num_tiles > 24) {
-            // Persistent kernel: 6 fixed blocks process tiles in a loop
-            dim3 block(256);
-            dim3 grid(6);
-            gemm_int8_persistent_kernel<OutT><<<grid, block, 0, stream>>>(
-                A, B, epi, C, M, N, K, ldc);
-        } else {
-            dim3 block(256);
-            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-            gemm_int8_valu_kernel<OutT><<<grid, block, 0, stream>>>(
-                A, B, epi, C, M, N, K, ldc);
-        }
+        // RDNA2: no matrix cores, use VALU v_dot4_i32_i8.
+        //
+        // One block per tile, never a persistent walk. The persistent variant
+        // this replaces was 1.14x-1.80x slower on every shape measured on the
+        // 6-CU gfx1035 (256^3 .. 4096x4096x8192), because a fixed grid of
+        // min(tiles, wgps * blocks_per_cu) gives the hardware's own block
+        // scheduler no tiles to overlap: consecutive tiles run back to back on
+        // one CU with a barrier between them. Letting the scheduler stream the
+        // grid is both simpler and faster. See benchmark_attn/待验证.md B5.
+        // Shared with gemm_int8_valu_kernel so the grid cannot drift from the
+        // tile the kernel assumes. See kInt8BM in gemm_gfx10.h.
+        constexpr int BM = kInt8BM;
+        constexpr int BN = kInt8BN;
+        dim3 block(kInt8Threads);
+        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+        gemm_int8_valu_kernel<OutT><<<grid, block, 0, stream>>>(
+            A, B, epi, C, M, N, K, ldc);
     } else {
         launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
     }

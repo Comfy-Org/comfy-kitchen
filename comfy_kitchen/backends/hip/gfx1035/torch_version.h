@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
 // TORCH_FEATURE_VERSION and TORCH_VERSION_x_y_z are defined only in torch >= 2.10
 #ifndef TORCH_FEATURE_VERSION
 #ifdef TORCH_TARGET_VERSION

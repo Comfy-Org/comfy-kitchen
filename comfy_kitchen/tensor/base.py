@@ -59,14 +59,14 @@ def native_scaled_mm_usable(device_type: str) -> bool:
 
     Probed once per device type with a 1x1 matmul rather than read off the
     capability number, because what matters is the shape PyTorch actually
-    accepts, which no version query reports. Answers "assume yes" during CUDA
-    graph capture, where the probe's own allocations would be recorded into the
-    graph being captured.
+    accepts, which no version query reports. During CUDA graph capture the probe
+    cannot run -- its allocations would be recorded into the graph -- so the
+    question is deferred: the capture-time answer comes from
+    :func:`quantized_mm_has_fast_path`, which has already asked the WMMA kernels
+    and so knows the answer without probing, and from any earlier eager answer.
     """
     if device_type != "cuda" or not torch.cuda.is_available():
         return False
-    if torch.cuda.is_current_stream_capturing():
-        return True
     try:
         a = torch.zeros((1, 16), device=device_type, dtype=torch.bfloat16)
         b = torch.zeros((1, 16), device=device_type, dtype=torch.bfloat16)
@@ -158,12 +158,24 @@ def quantized_mm_has_fast_path(device_type: str) -> bool:
     ``test_no_hipblaslt_on_the_quantized_paths`` fails on it (gfx1103 did, until
     the two were swapped) while never being able to see that the 1x1 result was
     discarded right after.
+
+    Which also makes this the answer during CUDA graph capture, where the probe
+    cannot run at all. That matters: capture reaches this on a part with no
+    matrix cores, where the probe's answer is "no", and assuming "yes" there
+    would trace the op that does not exist into the graph.
     """
     if device_type == "cuda" and getattr(torch.version, "hip", None) is not None:
         from ..backends.hip import has_wmma
 
         if has_wmma():
             return True
+        if torch.cuda.is_current_stream_capturing():
+            # No matrix cores, so _scaled_mm has no WMMA path to take and the
+            # probe cannot run inside a capture either; dequantize-and-matmul is
+            # the branch eager would have taken. See native_scaled_mm_usable.
+            return False
+        return native_scaled_mm_usable(device_type)
+    if device_type == "cuda" and torch.cuda.is_available():
         return native_scaled_mm_usable(device_type)
     return True
 

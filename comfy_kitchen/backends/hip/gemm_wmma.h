@@ -300,6 +300,9 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
     // amortizes the BKB=128 tile's LDS round trips; shallower K runs faster with
     // BKB=64 on the 512-thread grid (measured on the 6-WGP 780M: the
     // Anima/SDXL K<=2048..2880 shapes prefer 128x128 BKB64 16w, while K=8192
+    // (kbytes 16384) wants 128x128 BKB128 16w -- which is the split both arms
+    // below make).
+    //
     // Every other architecture falls through to the upstream heuristic below:
     // the branch above was tuned against 6 WGPs and is a regression elsewhere.
     //

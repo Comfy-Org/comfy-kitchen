@@ -2898,8 +2898,7 @@ _SAGE_KEY_GROUP = 16
 _SAGE_HEAD_DIMS = (64, 128, 256)
 
 
-def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool,
-                device: torch.device | int | None = None) -> int:
+def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool) -> int:
     """Keys per attention iteration. Always 64.
 
     This used to return 128 for long unmasked D128 sequences on the iGPU, on the
@@ -2919,7 +2918,7 @@ def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool,
     1.002x in total -- i.e. identical, as the ``(void)`` predicts.
 
     D256 has no LDS room for a 128-key tile regardless, so the shape envelope
-    argument that gated this never applied to it either. The parameter stays
+    argument that gated this never applied to it either. It stays a function
     because the callers and the buffer padding are written against a tile width,
     and because the kernel instantiates the matching tile from the runtime value
     should a future schedule honour it again.
@@ -3155,9 +3154,12 @@ def _sage_buffers_direct(q: torch.Tensor, k: torch.Tensor, cta_k: int):
         "q_scale": stub,
         "k_scale": stub,
         "v_scale": stub,
+        # Always the doubled width: only the iGPU has a direct path (sage_int8_sdpa
+        # gates on _is_small_igpu before choosing this allocator), and its C++
+        # branch requires 2 * padded_k bytes for the fp16 transposed V.
         "v_int8": torch.empty(
             batch * kv_heads * head_dim,
-            padded_k * (2 if _is_small_igpu(device) else 1),
+            padded_k * 2,
             dtype=torch.int8,
             device=device,
         ),
@@ -3207,7 +3209,7 @@ def sage_int8_sdpa(
     batch, q_heads, q_length, head_dim = q.shape
     _, _, kv_length, _ = k.shape
     output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
-    cta_k = _sage_cta_k(head_dim, kv_length, attn_mask is not None, q.device)
+    cta_k = _sage_cta_k(head_dim, kv_length, attn_mask is not None)
 
     # Mirrors sage_sdpa's use_direct in dlpack_bindings.cpp exactly; keep the two
     # in step. The C++ decides which kernel runs, so the Python gate must agree or

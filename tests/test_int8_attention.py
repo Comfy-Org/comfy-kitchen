@@ -1356,7 +1356,7 @@ def test_use_direct_gate_matches_the_direct_buffer_contract(
     # one: a single v_int8 of padded_k * 2 int8 elements per (kv_head, head_dim)
     # row, with the six unread slots shared. Check the width the C++ require_len
     # asks for is present.
-    cta_k = hip_backend._sage_cta_k(head_dim, kv_length, masked, device)
+    cta_k = hip_backend._sage_cta_k(head_dim, kv_length, masked)
     padded_k = -(-kv_length // cta_k) * cta_k
     buffers, _ = hip_backend._sage_buffers_direct(q, k, cta_k)
     assert buffers["v_int8"].shape[1] == padded_k * 2, (
