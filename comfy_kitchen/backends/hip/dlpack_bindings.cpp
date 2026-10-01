@@ -69,8 +69,9 @@ void launch_unpack_int4_kernel(const void*, void*, int64_t, hipStream_t);
 int convrot_max_k_host(int);
 int convrot_int8_needs_spill_host(int, int, int);
 
-void launch_quantize_w4a8_convrot_kernel(const void*, const void*, void*, void*, void*, int64_t,
-                                         int64_t, int, bool, uint64_t, hipStream_t);
+void launch_quantize_wxa8_convrot_fused_kernel(const void*, const void*, void*, void*, void*,
+                                               int64_t, int64_t, int, int, int, bool, uint64_t,
+                                               hipStream_t);
 bool launch_w4a8_codebook_gemv_kernel(const void* xq, const void* qw, const void* s_rel,
                                       const void* codebook, const void* s_channel, const void* xs,
                                       const void* bias, int bias_code, void* out, int out_code,
@@ -84,7 +85,7 @@ bool launch_gated_delta_decode_fused_kernel(
 bool launch_deltanet_conv_step_kernel(const void* proj, void* conv_state, const void* conv_w,
                                       const void* conv_b, void* conv_out, void* conv_snaps, int B,
                                       int C, int S, int KS, int dtype_code, hipStream_t stream);
-int w4a8_requant_max_k_kernel();
+int wxa8_requant_max_k_kernel(int);
 void launch_na3d_kernel(const void*, const void*, const void*, void*, int, int, int, int, int, int,
                         int, int, int, int, int, int, float, int, hipStream_t);
 
@@ -693,30 +694,44 @@ void unpack_int4(nb::ndarray<> q, nb::ndarray<> out, int64_t nbytes, uintptr_t s
 
 // scale_code names the s_rel storage: 0 float32, 5 e4m3 (crossing as uint8, as
 // elsewhere). codebook is optional; without it the levels are uniform.
-// Fused W4A8 requantize (group_size 16): a rotated weight [N, K] becomes packed
-// int4 [N, K/2], raw e4m3 s_rel [N, K/16] and f32 s_channel [N] in one launch.
-void quantize_w4a8_convrot(nb::ndarray<> rotated, nb::ndarray<> codebook, nb::ndarray<> packed,
-                           nb::ndarray<> s_rel, nb::ndarray<> s_channel, int N, int K,
-                           bool stochastic, uint64_t seed, uintptr_t stream_ptr) {
-    constexpr const char* kFn = "quantize_w4a8_convrot";
+// Fused ConvRot + W4A8/W6A8 requantize from the raw weight [N, K]: packed codes
+// [N, K*bits/8], raw e4m3 s_rel [N, K/group_size] and f32 s_channel [N] in one launch.
+// codebook is 16 floats at 4 bits and ignored at 6. The rotation reads 16-byte
+// vectors, so the weight has to start 16-byte aligned.
+void quantize_wxa8_convrot_fused(nb::ndarray<> weight, nb::ndarray<> codebook,
+                                 nb::ndarray<> packed, nb::ndarray<> s_rel,
+                                 nb::ndarray<> s_channel, int N, int K, int bits, int group_size,
+                                 bool stochastic, uint64_t seed, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "quantize_wxa8_convrot_fused";
     require_nonneg(N, kFn, "N");
     require_nonneg(K, kFn, "K");
-    if (K % 16 != 0) {
-        throw std::runtime_error(std::string(kFn) + ": K must be a multiple of 16");
+    if (!((bits == 4 && group_size == 16) ||
+          (bits == 6 && (group_size == 16 || group_size == 32 || group_size == 64)))) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": bits/group_size must be 4/16 or 6/{16,32,64}");
     }
-    require_dtype(rotated, 0, 2, kFn, "rotated");
+    if (K % 256 != 0 || K % group_size != 0) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": K must be a multiple of 256 and of group_size");
+    }
+    require_dtype(weight, 1, 2, kFn, "weight");
     require_dtype(packed, 4, 4, kFn, "packed");
     require_dtype(s_rel, 3, 3, kFn, "s_rel");
     require_scale_len(s_channel, static_cast<size_t>(N), kFn, "s_channel");
-    require_scale_len(codebook, 16, kFn, "codebook");
-    require_len(rotated, static_cast<int64_t>(N) * K, kFn, "rotated");
-    require_len(packed, static_cast<int64_t>(N) * (K / 2), kFn, "packed");
-    require_len(s_rel, static_cast<int64_t>(N) * (K / 16), kFn, "s_rel");
+    if (bits == 4) {
+        require_scale_len(codebook, 16, kFn, "codebook");
+    }
+    require_len(weight, static_cast<int64_t>(N) * K, kFn, "weight");
+    require_len(packed, static_cast<int64_t>(N) * K * bits / 8, kFn, "packed");
+    require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
+    if (reinterpret_cast<uintptr_t>(weight.data()) % 16 != 0) {
+        throw std::runtime_error(std::string(kFn) + ": weight must be 16-byte aligned");
+    }
 
-    launch_quantize_w4a8_convrot_kernel(rotated.data(), codebook.data(), packed.data(),
-                                        s_rel.data(), s_channel.data(), N, K,
-                                        map_dtype_to_code(rotated.dtype()), stochastic, seed,
-                                        reinterpret_cast<hipStream_t>(stream_ptr));
+    launch_quantize_wxa8_convrot_fused_kernel(
+        weight.data(), bits == 4 ? codebook.data() : nullptr, packed.data(), s_rel.data(),
+        s_channel.data(), N, K, bits, group_size, map_dtype_to_code(weight.dtype()), stochastic,
+        seed, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -2348,8 +2363,8 @@ NB_MODULE(_C, m) {
           nb::arg("k"), nb::arg("in_code"));
     m.def("unpack_int4", &unpack_int4);
     m.def("dequant_int4_grouped_to_int8", &dequant_int4_grouped_to_int8);
-    m.def("quantize_w4a8_convrot", &quantize_w4a8_convrot);
-    m.def("w4a8_requant_max_k", &w4a8_requant_max_k_kernel);
+    m.def("quantize_wxa8_convrot_fused", &quantize_wxa8_convrot_fused);
+    m.def("wxa8_requant_max_k", &wxa8_requant_max_k_kernel, nb::arg("group_size"));
     m.def("w4a8_int8_gemm_chunked", &w4a8_int8_gemm_chunked);
     m.def("w4a8_codebook_gemv", &w4a8_codebook_gemv);
     m.def("gated_delta_decode_fused", &gated_delta_decode_fused, nb::arg("mixed_qkv"),

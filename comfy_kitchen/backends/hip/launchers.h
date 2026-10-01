@@ -45,15 +45,18 @@ void launch_dequant_int4_grouped_to_int8_kernel(const void* qw, const void* s_re
                                                 int64_t k, int group_size, int bits,
                                                 hipStream_t stream);
 
-// in_dtype_code is a DTYPE_TO_CODE value: 0 float32, 1 float16, 2 bfloat16.
-// s_rel is written as raw e4m3 bytes; seed is ignored unless stochastic is set.
-void launch_quantize_w4a8_convrot_kernel(const void* rotated, const void* codebook, void* packed,
-                                         void* s_rel, void* s_channel, int64_t n, int64_t k,
-                                         int in_dtype_code, bool stochastic, uint64_t seed,
-                                         hipStream_t stream);
+// weight is the raw [N, K] weight, in_dtype_code 1 float16 or 2 bfloat16. bits 4 takes
+// the 16-entry codebook at g 16, bits 6 uniform levels at g 16/32/64. s_rel is written
+// as raw e4m3 bytes; seed is ignored unless stochastic is set.
+void launch_quantize_wxa8_convrot_fused_kernel(const void* weight, const void* codebook,
+                                               void* packed, void* s_rel, void* s_channel,
+                                               int64_t n, int64_t k, int bits, int g,
+                                               int in_dtype_code, bool stochastic, uint64_t seed,
+                                               hipStream_t stream);
 
-// Widest K the fused requantize can take on the current device, 0 if unknown.
-int w4a8_requant_max_k_kernel();
+// Widest K the fused requantize can take at this group size on the current device,
+// 0 if unknown.
+int wxa8_requant_max_k_kernel(int group_size);
 
 void launch_w4a8_int8_gemm_chunked_kernel(const void* xq, const void* qw, const void* s_rel,
                                           int scale_code, const void* codebook,
