@@ -20,10 +20,6 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
-// True on the small RDNA3 iGPU (Radeon 780M, gfx1103) that the kernel-tuning
-// changes in this tree were measured on. dGPUs keep the upstream defaults:
-// several block-size and dispatch choices tuned against 6 WGPs are a
-// regression on 60-96 CU parts.
 #include "launchers.h"  // comfy_small_igpu
 
 namespace comfy::hip_backend {

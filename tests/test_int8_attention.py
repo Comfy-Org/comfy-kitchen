@@ -138,11 +138,9 @@ def test_int8_attention_hip_dispatch_follows_matrix_cores(monkeypatch, has_wmma)
     if not getattr(torch.version, "hip", None):
         pytest.skip("requires a ROCm PyTorch runtime")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(
-        sage_attention_module._hip_backend, "has_wmma", lambda: has_wmma
-    )
-    # Now that both paths live on _hip_backend, this monkeypatch and the one above
-        # differ only in which attribute they replace. setattr still restores it.
+    monkeypatch.setattr(sage_attention_module._hip_backend, "has_wmma", lambda: has_wmma)
+    # Both RDNA2 and WMMA live on _hip_backend now, so this and the patch above
+    # differ only in which attribute they replace. setattr still restores it.
     monkeypatch.setattr(
         sage_attention_module._hip_backend, "rdna2_is_available", lambda _device: False
     )
@@ -240,16 +238,40 @@ def test_int8_attention_accuracy_without_a_mask(
     assert snapshot.shape == q.shape
     assert torch.isfinite(fused).all()
     assert torch.isfinite(snapshot).all()
-    # The snapshot is packed by the prepass and attended by the same launcher, so the
-    # two must agree exactly or one of them is quantizing differently.
-    assert torch.equal(fused, snapshot), (
-        f"fused and snapshot disagree at head_dim={head_dim} "
-        f"q_heads={q_heads} kv_heads={kv_heads} q_length={q_length} "
-        f"kv_length={kv_length} dtype={dtype}: max abs diff "
-        f"{(fused.float() - snapshot.float()).abs().max().item():.5f}"
-    )
+    if not _fused_uses_the_direct_kernel(q, k):
+        # The snapshot is packed by the prepass and attended by the same launcher,
+        # so the two must agree exactly or one of them is quantizing differently.
+        assert torch.equal(fused, snapshot), (
+            f"fused and snapshot disagree at head_dim={head_dim} "
+            f"q_heads={q_heads} kv_heads={kv_heads} q_length={q_length} "
+            f"kv_length={kv_length} dtype={dtype}: max abs diff "
+            f"{(fused.float() - snapshot.float()).abs().max().item():.5f}"
+        )
     assert _nrmse(fused, expected) < 0.03
     assert _nrmse(snapshot, expected) < 0.03
+
+
+def _fused_uses_the_direct_kernel(q, k):
+    """Whether a fused call runs the iGPU's short-key direct kernel.
+
+    sage_int8_sdpa takes that path for short keys on the gfx1103 iGPU, and it is a
+    different algorithm from the int8 kernel a snapshot always runs, so there the
+    two agree on accuracy rather than bitwise. Everywhere else the fused call runs
+    the snapshot's kernel too. The condition is _expected_use_direct, which
+    test_use_direct_gate_matches_the_direct_buffer_contract pins against both gates.
+    """
+    hip_backend = sage_attention_module._hip_backend
+    if hip_backend is None:
+        return False
+    output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
+    return _expected_use_direct(
+        is_igpu=hip_backend._is_small_igpu(q.device),
+        head_dim=q.shape[3],
+        q_length=q.shape[2],
+        kv_length=k.shape[2],
+        masked=False,
+        dtype_ok=q.dtype == output_dtype,
+    )
 
 
 @pytest.mark.parametrize(
@@ -1439,7 +1461,7 @@ def _call_use_direct(hip_backend, q, k, attn_mask):
     Duplicated on purpose: this is the specification the implementation is checked
     against, so it must not call into the implementation to find out what it does.
     """
-    batch, q_heads, q_length, head_dim = q.shape
+    _, _, q_length, head_dim = q.shape
     _, _, kv_length, _ = k.shape
     output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
     d64_short_keys = head_dim == 64 and kv_length <= 2048 and not (

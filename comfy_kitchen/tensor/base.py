@@ -6,7 +6,7 @@ import dataclasses
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import Any
 
 import torch
@@ -35,7 +35,7 @@ def get_cuda_capability() -> tuple[int, int] | None:
     return torch.cuda.get_device_capability()
 
 
-@lru_cache(maxsize=None)
+@cache
 def native_scaled_mm_usable(device_type: str) -> bool:
     """Whether ``torch._scaled_mm`` actually runs on this device's backend.
 

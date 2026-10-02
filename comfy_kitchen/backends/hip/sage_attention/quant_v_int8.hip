@@ -208,12 +208,10 @@ void launch_quant_arch(const void* v, void* out, void* scale, int B, int H, int 
 }
 
 // Transpose-only V: same [B*H*D, padded_N] output layout as the quantizer, but
-// in V's own dtype with no scale — the bf16/fp16-SV attention path (int8 QK,
-// unquantized V) reads its PV fragments straight from here, matching the
-// SageAttention gfx110x kernels. InT/OutT may differ for fp32 input: the
-// bf16/fp16 WMMA PV needs 16-bit V, so fp32 is downcast to bf16 here (the
-// whole path runs 16-bit for fp32 inputs, as the Python layer's output dtype
-// already does).
+// in V's own dtype with no scale, so sage_sdpa's direct fp16 short-key kernel can
+// read its PV fragments straight from here. InT/OutT may differ for fp32 input:
+// the kernel is 16-bit throughout, so fp32 is downcast to bf16 here (the whole
+// path runs 16-bit for fp32 inputs, as the Python layer's output dtype already does).
 template <typename InT, typename OutT, int DTILE, int Threads>
 __global__ __launch_bounds__(Threads) void transpose_v_kernel(
     const InT* __restrict__ v, OutT* __restrict__ out, int N, int padded_N, int H, int D,

@@ -518,9 +518,7 @@ def _fp16_shape_served(m, n, k) -> bool:
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     if props.gcnArchName.split(":")[0] == "gfx1103":
         return True
-    if k <= 4096 or m > 8192:
-        return False
-    return True
+    return k > 4096 and m <= 8192
 
 
 def _served_fp16_linear(hip, monkeypatch):

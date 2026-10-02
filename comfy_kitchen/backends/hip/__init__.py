@@ -188,7 +188,7 @@ def _is_small_igpu(device: torch.device | int | None = None) -> bool:
     return _is_small_igpu_index(index)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _is_small_igpu_index(index: int) -> bool:
     arch = _gfx_arch(index)
     return arch is not None and arch == "gfx1103"
@@ -3515,12 +3515,12 @@ def _load_rdna2_module() -> None:
     # COMFY_HIP_ARCHS named, and registered whether or not this device can use it.
     # Which device can use it is the arch gate above, and the only thing left to fail.
     try:
-        from . import _C as module
+        from . import _C
     except Exception as e:  # a broken extension must not break import
         _rdna2_import_error = e
         return
 
-    _rdna2_module = module
+    _rdna2_module = _C
     _rdna2_arch_loaded = arch
 
 
@@ -4083,7 +4083,6 @@ def rdna2_attend_prequantized(quantized) -> torch.Tensor:
         k = k.contiguous()
 
     batch, q_heads, q_length, head_dim = q.shape
-    kv_len = k.size(2)
     # The RDNA2 kernel is fp16-only, so a float32 input accumulates and writes
     # fp16 here and is widened on return -- the same thing rdna2_sageattn() does. Using
     # bf16 instead (as the WMMA backends do, having a bf16 path) would round the

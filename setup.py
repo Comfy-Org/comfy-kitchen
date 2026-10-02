@@ -59,14 +59,11 @@ def cmake_path(path: str | os.PathLike[str]) -> str:
 
 class CMakeExtension(Extension):
     def __init__(self, name: str, source_dir: str = "", backend: str = "cuda",
-                 hip_archs: str = "", build_suffix: str = ""):
+                 hip_archs: str = ""):
         super().__init__(name, sources=[])
         self.source_dir = os.path.abspath(source_dir) if source_dir else ""
         self.backend = backend
         self.hip_archs = hip_archs
-        # A second extension with the same backend needs its own build directory,
-        # otherwise CMake reuses the first one's cache and fails on the new source.
-        self.build_suffix = build_suffix
 
 
 class CMakeBuildExt(build_ext):
@@ -135,8 +132,6 @@ class CMakeBuildExt(build_ext):
         # different source dir ("does not match the source ... used to generate
         # cache"), so configuring the second one into the first one's directory fails.
         build_temp = pathlib.Path(self.build_temp).resolve() / ext.backend
-        if getattr(ext, "build_suffix", ""):
-            build_temp = build_temp / ext.build_suffix
         build_temp.mkdir(parents=True, exist_ok=True)
 
         # All options have been set in finalize_options with proper defaults
@@ -620,8 +615,6 @@ def setup_hip_extension() -> CMakeExtension | None:
     )
 
 
-
-
 def get_cuda_version() -> tuple[int, ...] | None:
     # get_cuda_path() returns None rather than a pair when nvcc is absent.
     cuda_paths = get_cuda_path()
@@ -747,7 +740,6 @@ def get_extensions() -> list[setuptools.Extension]:
         hip_ext = setup_hip_extension()
         if hip_ext is not None:
             extensions.append(hip_ext)
-
 
     if not extensions:
         print("\n" + "=" * 80)

@@ -151,7 +151,7 @@ def is_available(device: torch.device | None = None) -> bool:
         # The ported RDNA2 kernel covers gfx1035 instead; it is gated on the
         # architecture in hip.rdna2_is_available, so this cannot leak onto
         # a gfx11xx/gfx12xx device.
-        if _hip_backend is not None and _hip_backend.rdna2_is_available(device):
+        if _hip_backend.rdna2_is_available(device):
             return True
         return _hip_backend.int8_attention_is_available()
     capability = torch.cuda.get_device_capability(device)
@@ -228,49 +228,49 @@ def _int8_attention_cuda(
     original_head_dim = q.shape[-1]
     attention_scale = original_head_dim**-0.5 if scale is None else float(scale)
 
-    if _hip_backend is not None:
+    if _hip_backend is not None and _hip_backend.rdna2_is_available(q.device):
         # RDNA2 (gfx103x) has no matrix cores, so the WMMA sage attention below
         # neither builds nor runs for it. gfx1035 instead takes the ported
         # SageAttention RDNA2 kernel (INT8 Q·K^T + FP16 P·V on VALU), which is
         # instantiated for head_dim 64 and 128. It reads the same prepared-mask
         # layouts as the WMMA kernels (see hip._RDNA2_MASK_*), so a mask is
         # handled here rather than declined.
-        if _hip_backend.rdna2_is_available(q.device):
-            # This branch returns before the finiteness check further down, which
-            # every other backend reaches, so a non-finite scale would otherwise
-            # reach the ported kernel and come back as NaN instead of raising.
-            if not math.isfinite(attention_scale):
-                raise ValueError(f"scale must be finite, got {attention_scale}")
-            # Head dims outside 64/128 are padded up to the next supported tile
-            # rather than rejected: the ported kernel's 64 and 128 instantiations
-            # are the same ones the WMMA path pads to, and a zero-padded lane
-            # contributes nothing to the QK dot product.
-            if original_head_dim <= 64:
-                kernel_head_dim = 64
-            elif original_head_dim <= 128:
-                kernel_head_dim = 128
-            else:
-                raise NotImplementedError(
-                    "INT8 attention requires head_dim <= 128 on RDNA2 (gfx103x); "
-                    f"the ported kernel is instantiated for 64 and 128 only, got "
-                    f"{original_head_dim}."
-                )
-            if kernel_head_dim != original_head_dim:
-                padding = (0, kernel_head_dim - original_head_dim)
-                q = functional.pad(q, padding)
-                k = functional.pad(k, padding)
-                v = functional.pad(v, padding)
-            output = _hip_backend.rdna2_sageattn(
-                q,
-                k,
-                v,
-                tensor_layout="HND",
-                is_causal=False,
-                sm_scale=attention_scale,
-                attn_mask=attn_mask,
+        #
+        # This branch returns before the finiteness check further down, which
+        # every other backend reaches, so a non-finite scale would otherwise
+        # reach the ported kernel and come back as NaN instead of raising.
+        if not math.isfinite(attention_scale):
+            raise ValueError(f"scale must be finite, got {attention_scale}")
+        # Head dims outside 64/128 are padded up to the next supported tile
+        # rather than rejected: the ported kernel's 64 and 128 instantiations
+        # are the same ones the WMMA path pads to, and a zero-padded lane
+        # contributes nothing to the QK dot product.
+        if original_head_dim <= 64:
+            kernel_head_dim = 64
+        elif original_head_dim <= 128:
+            kernel_head_dim = 128
+        else:
+            raise NotImplementedError(
+                "INT8 attention requires head_dim <= 128 on RDNA2 (gfx103x); "
+                f"the ported kernel is instantiated for 64 and 128 only, got "
+                f"{original_head_dim}."
             )
-            output = output[..., :original_head_dim]
-            return output.float() if q.dtype == torch.float32 else output
+        if kernel_head_dim != original_head_dim:
+            padding = (0, kernel_head_dim - original_head_dim)
+            q = functional.pad(q, padding)
+            k = functional.pad(k, padding)
+            v = functional.pad(v, padding)
+        output = _hip_backend.rdna2_sageattn(
+            q,
+            k,
+            v,
+            tensor_layout="HND",
+            is_causal=False,
+            sm_scale=attention_scale,
+            attn_mask=attn_mask,
+        )
+        output = output[..., :original_head_dim]
+        return output.float() if q.dtype == torch.float32 else output
 
     if original_head_dim <= 64:
         kernel_head_dim = 64

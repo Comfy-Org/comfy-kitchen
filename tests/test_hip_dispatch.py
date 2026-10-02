@@ -275,7 +275,6 @@ def test_setup_builds_both_backends_only_when_hip_is_requested():
     namespace["BUILD_HIP"] = True
     namespace["setup_cuda_extension"] = lambda: cuda_extension
     namespace["setup_hip_extension"] = lambda: hip_extension
-    namespace["setup_gfx1035_extension"] = lambda: None
 
     assert namespace["get_extensions"]() == [cuda_extension, hip_extension]
 
@@ -319,7 +318,6 @@ def test_rocm_only_build_still_auto_selects_hip():
     namespace["get_rocm_path"] = lambda: ("/opt/rocm", object())
     namespace["get_torch_gpu_runtime"] = lambda: "hip"
     namespace["setup_hip_extension"] = lambda: hip_extension
-    namespace["setup_gfx1035_extension"] = lambda: None
 
     assert namespace["get_extensions"]() == [hip_extension]
 
