@@ -754,7 +754,7 @@ def _is_gfx103x(device: torch.device | int | None = None) -> bool:
     the HIP extension, so it cannot reach ``backends/hip``'s manifest loader. The
     predicate matches the same RDNA2 set the rest of the tree uses -- the
     ``elementwise_only`` group of ``backends/hip/architectures.json`` (gfx1030-1036),
-    ``gfx1035_sage._detect_gfx103x_arch``, and the C++ ``comfy_is_gfx10()``. The gate is
+    ``hip.rdna2_is_available``, and the C++ ``comfy_is_gfx10()``. The gate is
     the architecture class, not one part: every gfx103x device lacks matrix cores, so
     every one of them needs this path. If that group is ever renamed or extended, this
     predicate has to move with it.

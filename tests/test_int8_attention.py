@@ -24,8 +24,8 @@ requires_int8_attention = pytest.mark.skipif(
 def _uses_gfx1035_port() -> bool:
     return bool(
         getattr(torch.version, "hip", None)
-        and sage_attention_module._gfx1035_sage is not None
-        and sage_attention_module._gfx1035_sage.is_available()
+        and sage_attention_module._hip_backend is not None
+        and sage_attention_module._hip_backend.rdna2_is_available()
     )
 
 
@@ -141,8 +141,10 @@ def test_int8_attention_hip_dispatch_follows_matrix_cores(monkeypatch, has_wmma)
     monkeypatch.setattr(
         sage_attention_module._hip_backend, "has_wmma", lambda: has_wmma
     )
+    # Now that both paths live on _hip_backend, this monkeypatch and the one above
+        # differ only in which attribute they replace. setattr still restores it.
     monkeypatch.setattr(
-        sage_attention_module._gfx1035_sage, "is_available", lambda _device: False
+        sage_attention_module._hip_backend, "rdna2_is_available", lambda _device: False
     )
     assert sage_attention_module.is_available() is has_wmma
 
