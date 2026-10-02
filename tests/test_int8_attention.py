@@ -184,6 +184,72 @@ def test_int8_attention_matches_sdpa(dtype, head_dim):
     assert _nrmse(actual, expected) < 0.03
 
 
+# Head dims the RDNA2 port instantiates, and the ones every other backend also runs.
+# Not _head_dims([...]) here on purpose: that filter drops 256 for the port's
+# register-file limit, but the port also has no instantiation for 1 or 96 and raises
+# on them, so this test names the two it can actually run.
+_ACCURACY_HEAD_DIMS = [64, 128]
+
+# One tile of each, then spans that cross several of both. 64 is a single 64-key tile
+# and a single 128-row query tile; 257 crosses three query tiles and five key tiles;
+# 1153 crosses nine and nineteen. A kernel that only gets the interior of the grid
+# right, or the tail blocks wrong, fails one of these.
+_ACCURACY_SHAPES = [
+    # (q_heads, kv_heads, q_length, kv_length)
+    (8, 8, 257, 257),  # MHA
+    (4, 2, 257, 1153),  # GQA, key length far past the query length
+    (4, 2, 64, 64),  # one tile of each
+]
+
+
+@requires_int8_attention
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("head_dim", _ACCURACY_HEAD_DIMS)
+@pytest.mark.parametrize("q_heads, kv_heads, q_length, kv_length", _ACCURACY_SHAPES)
+def test_int8_attention_accuracy_without_a_mask(
+    dtype, head_dim, q_heads, kv_heads, q_length, kv_length
+):
+    """Accuracy with no mask, on both entry points.
+
+    The masked tests cover the port, but a mask-only gate cannot tell a broken mask
+    lookup from a broken kernel: both make the masked numbers wrong and leave nothing
+    to compare them against. This is the unmasked reference those comparisons need.
+
+    Both entry points are asserted, and against each other, because they share one
+    launcher and the failure they had in common was upstream of the split.
+    """
+    torch.manual_seed(179)
+    q, k, v = _qkv(2, q_heads, kv_heads, q_length, kv_length, head_dim, dtype)
+    scale = head_dim ** -0.5
+
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.float(),
+        k.float().repeat_interleave(q_heads // kv_heads, dim=1),
+        v.float().repeat_interleave(q_heads // kv_heads, dim=1),
+        scale=scale,
+    )
+
+    fused = ck.int8_attention(q, k, v, scale=scale)
+    snapshot = ck.int8_attention_from_prequantized(
+        ck.prequantize_int8_attention(q, k, v, scale=scale)
+    )
+
+    assert fused.shape == q.shape
+    assert snapshot.shape == q.shape
+    assert torch.isfinite(fused).all()
+    assert torch.isfinite(snapshot).all()
+    # The snapshot is packed by the prepass and attended by the same launcher, so the
+    # two must agree exactly or one of them is quantizing differently.
+    assert torch.equal(fused, snapshot), (
+        f"fused and snapshot disagree at head_dim={head_dim} "
+        f"q_heads={q_heads} kv_heads={kv_heads} q_length={q_length} "
+        f"kv_length={kv_length} dtype={dtype}: max abs diff "
+        f"{(fused.float() - snapshot.float()).abs().max().item():.5f}"
+    )
+    assert _nrmse(fused, expected) < 0.03
+    assert _nrmse(snapshot, expected) < 0.03
+
+
 @pytest.mark.parametrize(
     "option",
     [
