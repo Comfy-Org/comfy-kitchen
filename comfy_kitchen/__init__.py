@@ -21,6 +21,7 @@ from .flash_attention import is_available as flash_attention_decode_is_available
 from .float_utils import from_blocked, swap_nibbles, to_blocked
 from .gated_delta import deltanet_conv_step, gated_delta_decode_fused
 from .gated_delta import is_available as gated_delta_decode_is_available
+from .h3_qkv import h3_qkv_prequantize
 from .registry import registry
 from .sage_attention import (
     PrequantizedInt8Attention,
@@ -62,6 +63,7 @@ __all__ = [
     "rms_adaln",
     # Attention
     "PrequantizedInt8Attention",
+    "h3_qkv_prequantize",
     "int8_attention",
     "int8_attention_from_prequantized",
     "int8_attention_is_available",
