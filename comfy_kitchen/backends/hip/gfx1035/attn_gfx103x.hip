@@ -4,7 +4,12 @@
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/tensor_struct.h>
 
-#include "torch_version.h"
+// new_empty and the other in-place constructors moved behind tensor_inl.h in torch
+// 2.10. stable/version.h defines TORCH_FEATURE_VERSION and TORCH_VERSION_2_10_0
+// itself and resolves TORCH_TARGET_VERSION for us, so it is the version probe and
+// there is no shim header to keep in step with torch's own. Nothing above this
+// point includes it, so ask for it directly.
+#include <torch/csrc/stable/version.h>
 #if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_10_0
 #include <torch/csrc/stable/tensor_inl.h>
 #endif
@@ -20,7 +25,6 @@
 #error "attn_gfx103x.cu is only intended for ROCm/HIP."
 #endif
 
-#include "reduction_utils.cuh"
 
 #include <cfloat>
 #include <cmath>
@@ -42,6 +46,38 @@ constexpr float kLog2e = 1.4426950408889634f;
 
 constexpr int MIN_BLK_Q = 32;
 constexpr int MIN_BLK_K = 16;
+
+// The two warp/block maximum reductions the Q/K quantizer needs, and nothing
+// else. These came from reduction_utils.cuh, a port of vLLM's reduction set that
+// arrived with the rest of the SageAttention reference code. Ten functions came in
+// that way and nine were never called from anywhere in the tree; only
+// blockReduceMax was, once, in quant_qk_int8_gfx103x below, and it needs
+// warpReduceMax to do its work. The header went rather than being trimmed, taking
+// a namespace indirection and a warp-mask macro with it.
+template <typename T>
+__device__ __forceinline__ T warp_reduce_max(T val) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        val = max(val, __shfl_xor(val, mask, 32));
+    return val;
+}
+
+// Maximum over the whole block. The lane-0 slot of each warp goes through shared
+// memory, and the second pass reads those slots back with -1e20f in the lanes past
+// the warp count. That keeps the reduction total-count agnostic, so blockDim.x need
+// not be a multiple of 32.
+template <typename T>
+__device__ __forceinline__ T block_reduce_max(T val) {
+    __shared__ T partial[32];
+    const int lane = threadIdx.x & 0x1f;
+    const int wid = threadIdx.x >> 5;
+    val = warp_reduce_max(val);
+    if (lane == 0) partial[wid] = val;
+    __syncthreads();
+    val = (threadIdx.x < (blockDim.x / 32.f)) ? partial[lane] : -1e20f;
+    return warp_reduce_max(val);
+}
+
 
 #include "mma_gfx10.h"
 
@@ -271,55 +307,6 @@ __device__ __forceinline__ int8_t float_to_int8(float x) {
     return static_cast<int8_t>(rounded);
 }
 
-template <typename T>
-__global__ void mean_hnd_kernel(
-    const T* __restrict__ input,
-    T* __restrict__ mean_out,
-    const int64_t seq_len,
-    const int64_t heads,
-    const int64_t head_dim,
-    const int64_t in_stride_b,
-    const int64_t in_stride_n,
-    const int64_t in_stride_h) {
-    constexpr int TileD = 16;
-    constexpr int Threads = 256;
-    __shared__ float partial_sum[16][256];
-
-    const int tid = threadIdx.x;
-    const int64_t d_base = static_cast<int64_t>(blockIdx.x) * TileD;
-    const int64_t h = blockIdx.y;
-    const int64_t b = blockIdx.z;
-    if (d_base + TileD > head_dim) return;
-
-    float acc[16];
-#pragma unroll
-    for (int c = 0; c < 16; ++c) acc[c] = 0.0f;
-    for (int64_t s = tid; s < seq_len; s += Threads) {
-        const int64_t offset = b * in_stride_b + s * in_stride_n + h * in_stride_h + d_base;
-        const uint4* p4 = reinterpret_cast<const uint4*>(input + offset);
-        const T* v = reinterpret_cast<const T*>(p4);
-#pragma unroll
-        for (int c = 0; c < 16; ++c) acc[c] += to_float(v[c]);
-    }
-#pragma unroll
-    for (int c = 0; c < 16; ++c) partial_sum[c][tid] = acc[c];
-    __syncthreads();
-    if (tid < TileD) {
-        float sum = 0.0f;
-#pragma unroll
-        for (int i = 0; i < Threads; ++i) sum += partial_sum[tid][i];
-        const int64_t mean_d = d_base + tid;
-        const float value = sum / static_cast<float>(seq_len);
-        if constexpr (std::is_same<T, __half>::value) {
-            mean_out[(b * heads + h) * head_dim + mean_d] = from_float_f16(value);
-        } else if constexpr (std::is_same<T, __hip_bfloat16>::value) {
-            mean_out[(b * heads + h) * head_dim + mean_d] = from_float_bf16(value);
-        } else {
-            mean_out[(b * heads + h) * head_dim + mean_d] = value;
-        }
-    }
-}
-
 template <typename T, int HeadDim, int BLK, int MIN_BLK>
 __global__ void quant_qk_int8_hnd_kernel(
     const T* __restrict__ input,
@@ -405,7 +392,7 @@ __global__ void quant_qk_int8_hnd_kernel(
             }
         }
         for (int r = 0; r < RATIO; ++r) {
-            const float block_amax = vllm::blockReduceMax(local_amax[r]);
+            const float block_amax = block_reduce_max(local_amax[r]);
             if (tid == 0) {
                 shared_amax[r] = block_amax;
                 if (base_row + static_cast<int64_t>(r) * MIN_BLK < seq_len) {
@@ -487,43 +474,6 @@ __global__ void quant_qk_int8_hnd_kernel(
     }
 }
 
-}
-
-Tensor mean_seq_gfx103x(Tensor input, int64_t tensor_layout) {
-    const int64_t batch = input.size(0);
-    const int64_t heads = (tensor_layout == kHND) ? input.size(1) : input.size(2);
-    const int64_t seq_len = (tensor_layout == kHND) ? input.size(2) : input.size(1);
-    const int64_t head_dim = input.size(3);
-
-    const int64_t in_stride_b = input.stride(0);
-    const int64_t in_stride_n = (tensor_layout == kHND) ? input.stride(2) : input.stride(1);
-    const int64_t in_stride_h = (tensor_layout == kHND) ? input.stride(1) : input.stride(2);
-
-    Tensor output = new_empty_like(input, {batch, heads, head_dim}, input.scalar_type());
-    const hipStream_t stream = current_hip_stream(input);
-    dim3 block(256);
-    dim3 grid((head_dim + 15) / 16, heads, batch);
-
-    if (input.scalar_type() == ScalarType::Half) {
-        mean_hnd_kernel<__half><<<grid, block, 0, stream>>>(
-            reinterpret_cast<const __half*>(input.data_ptr()),
-            reinterpret_cast<__half*>(output.data_ptr()),
-            seq_len, heads, head_dim,
-            in_stride_b, in_stride_n, in_stride_h);
-    } else if (input.scalar_type() == ScalarType::BFloat16) {
-        mean_hnd_kernel<__hip_bfloat16><<<grid, block, 0, stream>>>(
-            reinterpret_cast<const __hip_bfloat16*>(input.data_ptr()),
-            reinterpret_cast<__hip_bfloat16*>(output.data_ptr()),
-            seq_len, heads, head_dim,
-            in_stride_b, in_stride_n, in_stride_h);
-    } else {
-        mean_hnd_kernel<float><<<grid, block, 0, stream>>>(
-            reinterpret_cast<const float*>(input.data_ptr()),
-            reinterpret_cast<float*>(output.data_ptr()),
-            seq_len, heads, head_dim,
-            in_stride_b, in_stride_n, in_stride_h);
-    }
-    return output;
 }
 
 std::tuple<Tensor, Tensor, Tensor, Tensor> quant_qk_int8_gfx103x(

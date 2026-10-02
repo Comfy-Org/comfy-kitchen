@@ -12,8 +12,43 @@
 
 #include <Python.h>
 #include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/tensor.h>
 
-#include "attn_gfx103x.h"
+#include <tuple>
+
+using torch::stable::Tensor;
+
+// The three host entry points, declared here rather than in a header of their own.
+// attn_gfx103x.h existed only to satisfy this one #include, and the mainline HIP
+// backend declares its entry points the same way -- in dlpack_bindings.cpp, next to
+// the code they wrap, with no separate .h in between. There is no second consumer
+// of these declarations to share them with: the kernels are reachable only through
+// the ops registered below.
+
+Tensor qk_int8_sv_bf16_attn_gfx103x_t(
+    Tensor query,
+    Tensor key,
+    Tensor value,
+    Tensor output,
+    Tensor q_scale,
+    Tensor k_scale,
+    Tensor v_scale,
+    int64_t tensor_layout,
+    int64_t is_causal,
+    double sm_scale,
+    Tensor q_fp,
+    int64_t mask_mode,
+    int64_t mask_dtype,
+    Tensor mask);
+
+std::tuple<Tensor, Tensor, Tensor, Tensor> quant_qk_int8_gfx103x(
+    Tensor query,
+    Tensor key,
+    Tensor key_mean,
+    int64_t tensor_layout,
+    double sm_scale,
+    int64_t skip_q);
+
 
 PyMODINIT_FUNC PyInit__qattn_gfx1035(void)
 {
@@ -38,11 +73,9 @@ STABLE_TORCH_LIBRARY(comfy_kitchen_qattn_gfx1035, m) {
             "Tensor query, Tensor key, Tensor key_mean, int tensor_layout, "
             "float sm_scale, int skip_q"
           ") -> (Tensor, Tensor, Tensor, Tensor)");
-    m.def("mean_seq(Tensor input, int tensor_layout) -> Tensor");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(comfy_kitchen_qattn_gfx1035, CUDA, m) {
     m.impl("qk_int8_sv_bf16_attn_t", TORCH_BOX(qk_int8_sv_bf16_attn_gfx103x_t));
     m.impl("quant_qk_int8", TORCH_BOX(quant_qk_int8_gfx103x));
-    m.impl("mean_seq", TORCH_BOX(mean_seq_gfx103x));
 }

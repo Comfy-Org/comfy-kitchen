@@ -326,7 +326,6 @@ def sageattn(
     tensor_layout: str = "HND",
     is_causal: bool = False,
     sm_scale: float | None = None,
-    smooth_k: bool = False,
     attn_mask: torch.Tensor | None = None,
     prequantized: bool = False,
 ) -> torch.Tensor:
@@ -438,10 +437,12 @@ def sageattn(
     # allocate the per-32-key float buffer a quantized-V kernel would want.
     v_scale = torch.empty(0, device=q.device, dtype=torch.float32)
 
-    if smooth_k:
-        k_mean = ops.mean_seq(k, layout_code)
-    else:
-        k_mean = torch.empty(0, device=q.device, dtype=q.dtype)
+    # smooth_k went with the mean-seq kernel it needed. Nothing in the tree set
+    # it, the only caller of sageattn passes nothing, and int8_attention lists it
+    # among the options it must reject, so the feature is absent from the public
+    # surface rather than merely unused. quant_qk_int8 still takes a key_mean and
+    # subtracts it when it gets one; nothing produces one now.
+    k_mean = torch.empty(0, device=q.device, dtype=q.dtype)
 
     # In-kernel Q quantization lets the attention kernel quantize Q itself, so Q
     # never has to be materialized. It is off by default and the env override
