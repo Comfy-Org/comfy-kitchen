@@ -2,6 +2,40 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // INT8 quantization kernels for the WMMA int8 GEMM.
+//
+// Where this stands against the memory system, so nobody re-derives it.
+//
+// Measured streaming ceilings on the 6-CU gfx1035 (16 B per lane per request,
+// footprints past the 2 MiB L2, so DRAM not cache):
+//
+//   read only             88.2 GB/s
+//   copy    (read+write)  70.1 GB/s
+//   write only            69.9 GB/s
+//   triad   (2r + 1w)     69.0 GB/s
+//   copy at 4 B per lane  64.4 GB/s
+//
+// An earlier note in this project recorded "89.7 GB/s" as *the* ceiling. That is
+// the read number, so it was right as a read ceiling and wrong the moment it was
+// used as the denominator for a kernel that also writes -- read+write tops out at
+// 70, and the rowwise quantiser has a 2:1 read:write ratio, so its ceiling is the
+// copy number and nothing above it.
+//
+// Against that ceiling, the rowwise quantiser's own traffic is exact and small:
+// read M*K*esize, write M*K int8 plus 4*M of scales, so 3*M*K + 4*M bytes for
+// fp16 in. Measured:
+//
+//   12288 x 8192   302.0 MB   3.957 ms   76.3 GB/s   109% of copy
+//    4096 x 4096    50.3 MB   0.659 ms   76.4 GB/s   109%
+//   12288 x 2048    75.5 MB   1.023 ms   73.8 GB/s   105%
+//    3072 x 1280    11.8 MB   0.192 ms   61.6 GB/s    88%
+//
+// It is at the memory limit and reads above the copy ceiling because its writes
+// are dense int8 and its read:write ratio is 2:1 rather than 1:1, which leaves
+// more of the read headroom. There is no headroom left here; the vectorised
+// 16-byte path below is what put it there (it was 0.56x of triton's before, and
+// 68.9 GB/s instead of 148). The only remaining overhead is the two torch.empty
+// calls in the public wrapper, 1.01-1.17x on top, which is allocator cost and not
+// worth an aliasing buffer to avoid.
 #include <stdexcept>
 
 #include "../hadamard.h"

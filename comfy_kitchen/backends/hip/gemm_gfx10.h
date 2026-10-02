@@ -121,21 +121,37 @@ constexpr int kFp16Pad = 8;
 //     only if the block is small enough that several fit.
 //   * Bank conflicts, which is what the B layout below is for.
 //
+// The B layout, and why it is a layout change rather than a padding change.
+// On gfx10 a 16-byte lane read is serviced in phases of 8 lanes, since 8 x 16 B =
+// 128 B is the whole 32-bank array, and a phase is conflict-free only when those
+// 8 addresses are 16 B apart -- TN * STRIDE must be 16 (mod 128). Row-major
+// cannot satisfy that at any pitch that also keeps the int4 staging store
+// 16-byte aligned, so padding only trades 8-way for 4-way: measured 5.63 TOPS at
+// pad 16, 4.50 at pad 0, 3.81 at pad 32, 4.84 at pad 48, 3.79 at pad 64. Storing
+// chunk c of row r at (c * BN + r) * 16 puts consecutive lanes on consecutive
+// addresses with no constraint on the pitch at all: 5.63 -> 5.97. The A side needs
+// no change; with TX = 32 the whole warp shares trow and therefore shares the A
+// address, and an LDS broadcast is free.
+//
 // Measured on the real shapes, 16x8/256x128 -> 16x4/128x128, output verified
 // bit-exact against a host reference in double on every entry:
 //
 //   M       N      K     16x8/256x128   16x4/128x128   ratio   triton
 //   12288  2048   2048     3.97 TOPS       5.97 TOPS    0.67x    4.89
 //   12288  2048   8192     4.06            5.91         0.69x    4.93
-//   12288  8192   2048     3.97            4.60         0.86x    5.22
+//   12288  8192   2048     3.97            5.99         0.66x    5.22
 //   3072   10240  1280     4.23            6.09         0.69x    5.33
 //   3072   1280   1280     4.28            6.26         0.68x      -
 //   4096   4096   4096     4.05            5.79         0.70x    4.90
 //
-// Weighted by call count from the dispatch trace that is 0.65x. The one weak
-// shape is 12288x8192x2048, where N is large and M/BM is 96, so A is re-read
-// 64 times; 32x2/128x128 and a third buffer both do better there (5.08 and 5.01)
-// if that shape ever dominates, but neither is better anywhere else.
+// Weighted by call count from the dispatch trace that is 0.65x.
+//
+// One caveat about that table, because it was got wrong once. An earlier run of
+// the same harness put 12288x8192x2048 at 4.60 TOPS (0.86x) rather than 5.99
+// (0.66x). It is not reproducible: the same binary in a second harness, and with
+// the other nine configurations run first to move the clock, both give 68.2-68.4
+// ms, and the shipped 16x8 baseline reproduces to within 0.2% in every one of
+// those runs. A single 30% outlier in a table is not a property of the kernel.
 //
 // Two things that look like they should help and do not:
 //
@@ -147,18 +163,51 @@ constexpr int kFp16Pad = 8;
 //     grants 128 per thread, 332 spill to scratch, and the inner loop becomes
 //     bound by 712 bytes per lane per k-tile of local-memory traffic.
 //
-// B is staged chunk-major rather than row-major, and that is the second half of
-// the 5.63 -> 5.97. On gfx10 a 16-byte lane read is serviced in phases of 8
-// lanes, since 8 x 16 B = 128 B is the whole 32-bank array, and a phase is
-// conflict-free only when those 8 addresses are 16 B apart -- TN * STRIDE must be
-// 16 (mod 128). Row-major cannot satisfy that at any pitch that also keeps the
-// int4 staging store 16-byte aligned, so padding only trades 8-way for 4-way:
-// measured 5.63 at pad 16, 4.50 at pad 0, 3.81 at pad 32, 4.84 at pad 48, 3.79
-// at pad 64. Storing chunk c of row r at (c * BN + r) * 16 instead makes
-// consecutive lanes consecutive 16-byte addresses with no constraint on the pitch
-// at all, and drops the B footprint's padding term. The A side needs no change:
-// with TX = 32 the whole warp shares trow and therefore shares the A address, and
-// an LDS broadcast is free.
+// The staging's 16-byte loads, which look like the last obvious thing and are not.
+// The disassembly puts 1109 instructions of 64-bit address arithmetic in this
+// kernel, 21.5% of it, and shows the int4 staging read split into 4-byte and
+// 2-byte pieces:
+//
+//   global_load*  324 ins  1088 B/lane   dwordx4:4x16B  dword:192x4B  ushort:128x2B
+//
+// which is 4.8x the load-pipeline requests for the same bytes, because the row
+// address A + (m0 + r) * K has a runtime stride K that the compiler cannot prove
+// 16-byte aligned. Three spellings of the promise were measured and none pays:
+//
+//   __builtin_assume((K & 15) == 0) and the same on both pointers -- leaves the
+//       emitted loads byte-identical to the plain cast, 2287 instructions and
+//       4 dwordx4 / 128 dword either way. Documented not to reach codegen.
+//   __builtin_assume_aligned on each loaded address -- also byte-identical.
+//   Rewriting the row offset structurally as (m0 + r) * (K >> 4) * 16, so the
+//       multiply by the literal 16 makes the alignment evident in the IR with no
+//       assumption involved -- 2285 instructions, still 4 dwordx4 / 128 dword,
+//       and a tie in wall clock on every real shape.
+//
+// Unrolling the staging loop does produce dwordx4 (8 of them) and costs 3-9%,
+// which settles it: more 16-byte requests do not make this kernel faster, so the
+// staging is limited by bytes moved rather than by requests. None of the 1109
+// address instructions are inside the dot4 span either -- 0% -- so the compute loop
+// is already clean and there is nothing to hoist out of it.
+//
+// And one that is not a tile question at all, recorded because it looked like the
+// obvious next thing:
+//
+//   * The block order. triton groups its program ids into GROUP_M-tall bands
+//     (group_size_m=8) before mapping them to tiles, and this launcher uses the
+//     plain blockIdx mapping. Measured GROUP_M = 1/2/4/8/16 on every real shape:
+//     all within 3% of each other, with the winner different on each shape. The
+//     reason is occupancy: only 6 blocks are resident at a time on 6 CUs, and 6
+//     consecutive blockIdx.x already share one A tile, so there is nothing for a
+//     band to improve. Same for 512-thread geometries (BN or BM 256), which need
+//     2 waves/SIMD's worth of block to be resident and are 1.3-1.7x slower.
+//
+// No geometry dispatch is justified inside this kernel. A scan over N (640 to
+// 10240), K (640 to 4096) and M (128 to 12288) found no boundary on the first two
+// and one on the third: at M = 154, where BM = 128 leaves the last block row 20%
+// occupied and BM = 64 would leave it 41%, the 64-row block wins by 1.15-1.30x.
+// That shape is 0.4% of a step's int8 GEMM time, so the dispatch would be worth
+// 0.08%. Wider blocks (BN or BM = 256) need 512 threads and lose 1.3-1.7x; three
+// and four buffers and BK = 32 lose 1.04-1.26x.
 //
 // The grid is one block per tile, NOT a persistent walk -- see the note on why
 // the persistent variant was deleted.
