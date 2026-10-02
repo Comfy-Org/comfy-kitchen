@@ -71,7 +71,7 @@ template <bool skip_masked_tiles, uint32_t CTA_Q, uint32_t CTA_K,
           bool fuse_v_scale = false, bool fuse_v_mean = false,
           bool use_pv_fp16_accu = false,
           bool fuse_fp32_probabilities = true, bool skip_masked_copies = false,
-          typename Offset = uint32_t>
+          typename Offset = uint32_t, bool positive_scale = true>
 __device__ __forceinline__ void qk_int_sv_i8_attn_body(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
@@ -124,9 +124,13 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
                                mask_mode == MaskMode::kPreparedKey;
   // For unmasked and causal FP32 kernels, retain raw scores until update_mdo
   // fuses score scaling, max subtraction, and conversion to the exp2 domain.
-  // Custom masks keep pre-scaled scores so additive bias values retain their
-  // existing semantics.
-  constexpr bool pre_scale_scores = custom_mask;
+  // A nonpositive scale must be applied before the maximum reduction and
+  // before masking: a negative scale reverses score ordering, and zero must
+  // not turn padded keys into valid zero logits. Custom masks also require
+  // pre-scaled scores so additive biases retain their existing semantics.
+  constexpr bool pre_scale_scores = custom_mask || !positive_scale;
+  const float mask_value = !positive_scale ? -CUDART_INF_F :
+                               (pre_scale_scores ? -50000.0f : -1.0e30f);
 #if __CUDA_ARCH__ >= 1000
   // Blackwell schedules the lower-pressure generic FP32 path better for short
   // rows. The launcher passes false at K <= 512; older architectures retain
@@ -631,7 +635,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
             update_mdo_f32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
                 scores, RO, m, d, S_U8_OFFSET, RS_u8);
           }
-        } else if constexpr (use_fused_fp32_probabilities &&
+        } else if constexpr (use_fused_fp32_probabilities && positive_scale &&
                              mask_mode == MaskMode::kNone) {
           update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
               RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
@@ -797,7 +801,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
             update_mdo_f32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
                 scores, RO, m, d, S_U8_OFFSET, RS_u8);
           }
-        } else if constexpr (use_fused_fp32_probabilities &&
+        } else if constexpr (use_fused_fp32_probabilities && positive_scale &&
                              mask_mode == MaskMode::kNone) {
           update_mdo_i32_u8<num_tiles_q, num_tiles_k, num_tiles_v>(
               RS, RO, m, d, sm_scale, S_U8_OFFSET, RS_u8);
@@ -820,7 +824,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
           if constexpr (mask_mode == MaskMode::kCausal) {
             apply_causal_mask<num_tiles_q, num_tiles_k>(
                 Q_idx_lane_base, K_idx_lane_base, RS_soft,
-                pre_scale_scores ? -50000.0f : -1.0e30f);
+                mask_value);
           } else if constexpr (mask_mode == MaskMode::kCustom) {
             apply_custom_mask<num_tiles_q, num_tiles_k>(
                 Q_idx_lane_base, K_idx_lane_base, RS_soft, valid, AttnMask,
@@ -968,7 +972,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
           if constexpr (mask_mode == MaskMode::kCausal) {
             apply_causal_mask<num_tiles_q, num_tiles_k>(
                 Q_idx_lane_base, K_idx_lane_base, RS_soft,
-                pre_scale_scores ? -50000.0f : -1.0e30f);
+                mask_value);
           } else if constexpr (mask_mode == MaskMode::kCustom) {
             apply_custom_mask<num_tiles_q, num_tiles_k>(
                 Q_idx_lane_base, K_idx_lane_base, RS_soft, valid, AttnMask,
@@ -982,7 +986,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
           }
           apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(
               K_idx_lane_base, RS_soft, kv_len,
-              pre_scale_scores ? -50000.0f : -1.0e30f);
+              mask_value);
 
           update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true,
                      pre_scale_scores>(RS_soft, RO, m, d, pv_scale, sm_scale,
@@ -1195,7 +1199,8 @@ template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K,
           MaskMode mask_mode = MaskMode::kNone, bool return_lse = false,
           bool fuse_v_scale = false, bool fuse_v_mean = false,
           bool use_pv_fp16_accu = false,
-          bool fuse_fp32_probabilities = true, typename Offset = uint32_t>
+          bool fuse_fp32_probabilities = true, typename Offset = uint32_t,
+          bool positive_scale = true>
 __global__ void qk_int_sv_i8_attn_kernel(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
@@ -1227,7 +1232,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
       qk_int_sv_i8_attn_body<true, CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK,
         Q_GRAN, K_GRAN, DTypeSVAccum, use_inst_buffer, DTypeOut,
         DenominatorAccumUnit, mask_mode, return_lse, fuse_v_scale, fuse_v_mean,
-        use_pv_fp16_accu, fuse_fp32_probabilities, true, Offset>(
+        use_pv_fp16_accu, fuse_fp32_probabilities, true, Offset, positive_scale>(
           Q, K, V, O, Lse, Q_scale, K_scale, V_scale, V_mean, AttnMask,
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,
@@ -1237,7 +1242,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
       qk_int_sv_i8_attn_body<true, CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK,
         Q_GRAN, K_GRAN, DTypeSVAccum, use_inst_buffer, DTypeOut,
         DenominatorAccumUnit, mask_mode, return_lse, fuse_v_scale, fuse_v_mean,
-        use_pv_fp16_accu, fuse_fp32_probabilities, false, Offset>(
+        use_pv_fp16_accu, fuse_fp32_probabilities, false, Offset, positive_scale>(
           Q, K, V, O, Lse, Q_scale, K_scale, V_scale, V_mean, AttnMask,
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,
@@ -1247,7 +1252,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
       qk_int_sv_i8_attn_body<false, CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK,
         Q_GRAN, K_GRAN, DTypeSVAccum, use_inst_buffer, DTypeOut,
         DenominatorAccumUnit, mask_mode, return_lse, fuse_v_scale, fuse_v_mean,
-        use_pv_fp16_accu, fuse_fp32_probabilities, false, Offset>(
+        use_pv_fp16_accu, fuse_fp32_probabilities, false, Offset, positive_scale>(
           Q, K, V, O, Lse, Q_scale, K_scale, V_scale, V_mean, AttnMask,
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,
@@ -1258,7 +1263,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
     qk_int_sv_i8_attn_body<false, CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK,
         Q_GRAN, K_GRAN, DTypeSVAccum, use_inst_buffer, DTypeOut,
         DenominatorAccumUnit, mask_mode, return_lse, fuse_v_scale, fuse_v_mean,
-        use_pv_fp16_accu, fuse_fp32_probabilities, false, Offset>(
+        use_pv_fp16_accu, fuse_fp32_probabilities, false, Offset, positive_scale>(
           Q, K, V, O, Lse, Q_scale, K_scale, V_scale, V_mean, AttnMask,
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,
