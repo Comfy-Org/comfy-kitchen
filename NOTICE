@@ -104,5 +104,12 @@ commit d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5.
 
 ================================================================================
 
+Indexed gate epilogue visitor
+-----------------------------
+comfy_kitchen/backends/cuda/ops/indexed_gate.cuh adapts CUTLASS VisitorAuxLoad.
+Copyright NVIDIA CORPORATION & AFFILIATES. License: BSD-3-Clause.
+Pinned CUTLASS source: d4b4b494c3c51bf6507e7ab09fbafd1e9fa94f39.
+Full license is retained in the adapted source file.
+
 For full license texts of these dependencies, please refer to their respective
 project repositories or installation directories.
