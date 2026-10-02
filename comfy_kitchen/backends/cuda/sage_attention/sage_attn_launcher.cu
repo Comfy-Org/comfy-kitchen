@@ -8,6 +8,9 @@
 // state. V scaling is fused and LSE is not returned.
 
 #include "qk_int_sv_i8_cuda.cuh"
+#ifdef COMFY_HAVE_SM120_TMA
+#include "dense_tma_sm120.h"
+#endif
 #include <math_constants.h>
 #include <algorithm>
 #include <stdexcept>
@@ -123,6 +126,22 @@ extern "C" void launch_sage_attn_kernel(
   auto qs_ = const_cast<float *>(static_cast<const float *>(q_scale));
   auto ks_ = const_cast<float *>(static_cast<const float *>(k_scale));
   auto vs_ = const_cast<float *>(static_cast<const float *>(v_scale));
+
+#ifdef COMFY_HAVE_SM120_TMA
+  // Preserve the short/image-shape tile heuristic; select only long, dense D128.
+  if (!wide_offsets && !mask && !mask_tile_bias && head_dim==128 && cta_k==128 &&
+      output_dtype_code==2 && qo_len>=8192 && kv_len>=8192 &&
+      std::max({stride_bz_q,stride_h_q,stride_bz_k,stride_h_k,stride_bz_v,
+                stride_h_v,stride_bz_o,stride_h_o}) <= UINT32_MAX) {
+    DenseTmaArgs args{q_,k_,v_,o,qs_,ks_,vs_,
+        uint32_t(batch_size),uint32_t(qo_len),uint32_t(kv_len),uint32_t(num_qo_heads),uint32_t(num_kv_heads),
+        uint32_t(stride_bz_q),uint32_t(stride_h_q),uint32_t(stride_seq_q),
+        uint32_t(stride_bz_k),uint32_t(stride_h_k),uint32_t(stride_seq_k),
+        uint32_t(stride_bz_v),uint32_t(stride_h_v),uint32_t(stride_d_v),
+        uint32_t(stride_bz_o),uint32_t(stride_h_o),uint32_t(stride_seq_o),sm_scale};
+    if (launch_dense_tma_sm120(args,stream)) return;
+  }
+#endif
 
 #define LAUNCH_IMPL_Q(HD, CK, MM, DT, FUSE_FP32, CQ, OFFSET)                                     \
   launch_impl<HD, CK, MM, DT, FUSE_FP32, CQ, OFFSET>(                                    \

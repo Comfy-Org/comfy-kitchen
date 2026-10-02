@@ -176,6 +176,17 @@ target_include_directories(comfy_kitchen_cuda_kernels PRIVATE
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
+# setmaxnreg is architecture-specific: keep it out of portable PTX and other
+# GPU builds. The ordinary launcher remains available on every architecture.
+if(";${COMFY_CUDA_ARCHS};" MATCHES ";120[a-f]?(-real|-virtual)?;")
+    add_library(comfy_kitchen_sm120_tma OBJECT sage_attention/dense_tma_sm120.cu)
+    set_target_properties(comfy_kitchen_sm120_tma PROPERTIES CUDA_ARCHITECTURES "120a-real")
+    target_compile_options(comfy_kitchen_sm120_tma PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS};--maxrregcount=168>)
+    target_include_directories(comfy_kitchen_sm120_tma PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/sage_attention)
+    target_compile_definitions(comfy_kitchen_cuda_kernels PRIVATE COMFY_HAVE_SM120_TMA)
+endif()
+
 # CUTLASS (header-only) for the near-peak INT8 GEMM. Vendored at
 # third_party/cutlass (or pass -DCOMFY_CUTLASS_DIR). Optional: without it the
 # CUTLASS op compiles to a stub and int8_linear falls back to cuBLAS.
@@ -209,6 +220,9 @@ else()
 endif()
 
 target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_cuda_kernels>)
+if(TARGET comfy_kitchen_sm120_tma)
+    target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_sm120_tma>)
+endif()
 
 target_compile_definitions(_C PRIVATE NB_STATIC)
 

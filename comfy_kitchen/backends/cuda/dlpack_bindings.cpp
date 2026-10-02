@@ -1178,15 +1178,19 @@ void sage_sdpa_prequantized(
         throw std::runtime_error(
             "sage_sdpa_prequantized: incompatible quantized tensor shapes");
     }
+    const bool bhsd_output = o.stride(2) == D &&
+        o.stride(1) == static_cast<int64_t>(Lq) * D;
+    const bool bshd_output = o.stride(1) == D &&
+        o.stride(2) == static_cast<int64_t>(H_q) * D;
     if (q_int8.stride(3) != 1 || q_int8.stride(2) != D ||
         q_int8.stride(1) != static_cast<int64_t>(Lq) * D ||
         k_int8.stride(3) != 1 || k_int8.stride(2) != D ||
         k_int8.stride(1) != static_cast<int64_t>(Lk) * D ||
         v_int8.stride(1) != 1 || v_int8.stride(0) != padded_Lk ||
-        o.stride(3) != 1 || o.stride(2) != D ||
-        o.stride(1) != static_cast<int64_t>(Lq) * D) {
+        o.stride(3) != 1 || (!bhsd_output && !bshd_output) ||
+        o.stride(0) != static_cast<int64_t>(H_q) * Lq * D) {
         throw std::runtime_error(
-            "sage_sdpa_prequantized: quantized tensors and output must be contiguous");
+            "sage_sdpa_prequantized: contiguous inputs and BHSD/BSHD output required");
     }
 
     const int64_t qi_st_h = static_cast<int64_t>(Lq) * D;
@@ -1198,9 +1202,12 @@ void sage_sdpa_prequantized(
     const int v_st_d = padded_Lk;
     const int64_t v_st_h = static_cast<int64_t>(D) * padded_Lk;
     const int64_t v_st_bz = H_kv * v_st_h;
-    const int64_t o_st_h = qi_st_h;
-    const int o_st_n = D;
-    const int64_t o_st_bz = qi_st_bz;
+    if (o.stride(2) > INT_MAX) {
+        throw std::overflow_error("sage_sdpa_prequantized: output row stride exceeds int32");
+    }
+    const int64_t o_st_h = o.stride(1);
+    const int o_st_n = static_cast<int>(o.stride(2));
+    const int64_t o_st_bz = o.stride(0);
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
