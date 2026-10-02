@@ -54,6 +54,13 @@ void launch_quantize_wxa8_convrot_fused_kernel(const void* weight, const void* c
                                                int in_dtype_code, bool stochastic, uint64_t seed,
                                                hipStream_t stream);
 
+// Staged 4-bit requantize of an already rotated [N, K] weight, in_dtype_code 0 float32,
+// 1 float16 or 2 bfloat16. Throws when the K/16 group scales do not fit in LDS.
+void launch_quantize_w4a8_convrot_kernel(const void* rotated, const void* codebook, void* packed,
+                                         void* s_rel, void* s_channel, int64_t n, int64_t k,
+                                         int in_dtype_code, bool stochastic, uint64_t seed,
+                                         hipStream_t stream);
+
 // Widest K the fused requantize can take at this group size on the current device,
 // 0 if unknown.
 int wxa8_requant_max_k_kernel(int group_size);
