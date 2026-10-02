@@ -70,6 +70,7 @@ __forceinline__ __device__ float rq_div(float a, float b) {
     return __builtin_fmaf(__builtin_fmaf(-b, q, a), r, q);
 }
 
+__forceinline__ __device__ float rq_to_float(float v) { return v; }
 __forceinline__ __device__ float rq_to_float(__half v) { return __half2float(v); }
 __forceinline__ __device__ float rq_to_float(__bf16 v) { return static_cast<float>(v); }
 template <typename T>
@@ -155,15 +156,15 @@ struct RqLog2 {
     static constexpr int value = G == 16 ? 4 : G == 32 ? 5 : 6;
 };
 
-template <typename InputT>
-__forceinline__ __device__ void w4_quantize_row(const InputT* row_buf, int k, int64_t elem_base,
+// src(i) is the rotated row's element i as fp32.
+template <typename Src>
+__forceinline__ __device__ void w4_quantize_row(Src src, int k, int64_t elem_base,
                                                 const float* cb, int8_t* __restrict__ packed_row,
                                                 uint8_t* __restrict__ s_rel_row,
                                                 float* __restrict__ s_channel_out, float* gscale,
                                                 float* slice_max, bool stochastic,
                                                 uint64_t seed) {
     constexpr int G = 16;
-    auto src = [&](int i) { return rq_to_float(row_buf[rq_padded_index<4>(i)]); };
     auto cbt = [&](int j) { return cb[j]; };
     const int groups = k / G;
 
@@ -479,9 +480,9 @@ __global__ __launch_bounds__(512) void quantize_wxa8_convrot_fused_kernel(
     }
     __syncthreads();
     if constexpr (BITS == 4) {
-        w4_quantize_row<InputT>(row_buf, k, row * k, cb, packed + row * (k / 2),
-                                s_rel + row * (k / G), s_channel + row, gscale, slice_max,
-                                stochastic, seed);
+        auto src = [&](int i) { return rq_to_float(row_buf[rq_padded_index<4>(i)]); };
+        w4_quantize_row(src, k, row * k, cb, packed + row * (k / 2), s_rel + row * (k / G),
+                        s_channel + row, gscale, slice_max, stochastic, seed);
     } else {
         w6_quantize_row<InputT, G>(row_buf, k, row * k, packed + row * (k * 3 / 4),
                                    s_rel + row * (k / G), s_channel + row, gscale, slice_max,
@@ -510,6 +511,45 @@ void launch_wxa8_fused(const void* weight, const float* codebook, void* packed, 
             static_cast<const __bf16*>(weight), codebook, static_cast<int8_t*>(packed),
             static_cast<uint8_t*>(s_rel), static_cast<float*>(s_channel), kk, stochastic, s);
     }
+}
+
+// Staged W4A8 requantize for what the fused kernel cannot hold: fp32 weights and rows
+// too wide for the rotated LDS row. The caller rotates first; only the group scales
+// sit in LDS, and the row is read from global memory in each phase.
+template <typename InputT>
+__global__ __launch_bounds__(256) void quantize_w4a8_convrot_kernel(
+    const InputT* __restrict__ rotated,  // [N, K]
+    const float* __restrict__ codebook,  // [16]
+    int8_t* __restrict__ packed,         // [N, K/2]
+    uint8_t* __restrict__ s_rel,         // [N, K/16], raw e4m3 bytes
+    float* __restrict__ s_channel,       // [N]
+    int k, bool stochastic, uint64_t seed) {
+
+    __shared__ float slice_max[16];
+    __shared__ float cb[16];
+    extern __shared__ float gscale[];  // [K/16]
+    if (threadIdx.x < 16) {
+        cb[threadIdx.x] = codebook[threadIdx.x];
+    }
+    __syncthreads();
+
+    const int64_t row = blockIdx.x;
+    const InputT* rrow = rotated + row * k;
+    auto src = [&](int i) { return rq_to_float(rrow[i]); };
+    w4_quantize_row(src, k, row * k, cb, packed + row * (k / 2), s_rel + row * (k / 16),
+                    s_channel + row, gscale, slice_max, stochastic, seed);
+}
+
+template <typename InputT>
+void launch_w4a8_staged(const void* rotated, const float* codebook, void* packed, void* s_rel,
+                        void* s_channel, int64_t n, int64_t k, bool stochastic, uint64_t seed,
+                        size_t shmem, hipStream_t stream) {
+    const int groups = static_cast<int>(k / 16);
+    const int threads = std::min(256, (groups + 31) / 32 * 32);
+    quantize_w4a8_convrot_kernel<InputT><<<static_cast<unsigned int>(n), threads, shmem, stream>>>(
+        static_cast<const InputT*>(rotated), codebook, static_cast<int8_t*>(packed),
+        static_cast<uint8_t*>(s_rel), static_cast<float*>(s_channel), static_cast<int>(k),
+        stochastic, stochastic ? seed : 0);
 }
 
 }  // namespace
@@ -561,4 +601,41 @@ extern "C" void launch_quantize_wxa8_convrot_fused_kernel(
 
 extern "C" int wxa8_requant_max_k_kernel(int group_size) {
     return comfy::hip_backend::wxa8_requant_max_k(group_size);
+}
+
+// rotated is the ConvRot-rotated [N, K] weight: in_dtype_code 0 float32, 1 float16 or
+// 2 bfloat16. Same outputs as the fused kernel at 4 bits, group 16.
+extern "C" void launch_quantize_w4a8_convrot_kernel(const void* rotated, const void* codebook,
+                                                    void* packed, void* s_rel, void* s_channel,
+                                                    int64_t n, int64_t k, int in_dtype_code,
+                                                    bool stochastic, uint64_t seed,
+                                                    hipStream_t stream) {
+    using namespace comfy::hip_backend;
+    constexpr const char* kFn = "quantize_w4a8_convrot";
+    if (in_dtype_code < 0 || in_dtype_code > 2) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": rotated must be float32, float16 or bfloat16");
+    }
+    if (k <= 0 || k % 16 != 0) {
+        throw std::runtime_error(std::string(kFn) + ": K must be a positive multiple of 16");
+    }
+    const size_t shmem = static_cast<size_t>(k / 16) * sizeof(float);
+    if (shmem + kRequantStaticLds > static_cast<size_t>(requant_device_lds())) {
+        throw std::runtime_error(std::string(kFn) + ": K=" + std::to_string(k) +
+                                 " group scales do not fit in LDS");
+    }
+    if (n == 0) {
+        return;  // a zero-block launch is hipErrorInvalidConfiguration
+    }
+    const float* cb = static_cast<const float*>(codebook);
+    if (in_dtype_code == 0) {
+        launch_w4a8_staged<float>(rotated, cb, packed, s_rel, s_channel, n, k, stochastic, seed,
+                                  shmem, stream);
+    } else if (in_dtype_code == 1) {
+        launch_w4a8_staged<__half>(rotated, cb, packed, s_rel, s_channel, n, k, stochastic, seed,
+                                   shmem, stream);
+    } else {
+        launch_w4a8_staged<__bf16>(rotated, cb, packed, s_rel, s_channel, n, k, stochastic, seed,
+                                   shmem, stream);
+    }
 }

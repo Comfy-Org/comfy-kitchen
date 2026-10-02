@@ -46,6 +46,7 @@ from comfy_kitchen.backends.eager.sol_attn import (
     coarse_output,
 )
 from comfy_kitchen.backends.eager.w4a8_int8 import (
+    _QUANT_ROW_ELEM_BUDGET,
     _decide_codebook,
     _dequantize_w4a8_int8_weight_from_int8,
     _quantize_w4a8_chunked,
@@ -1073,7 +1074,7 @@ def _requant_supported(k: int, group_size: int, device: torch.device, dtype: tor
 
     The budget is read for the weight's own device rather than the process-current
     one, so a multi-GPU process asks the card the kernel will actually launch on.
-    fp32 weights go to eager, as on CUDA.
+    fp32 weights take the staged path, as on CUDA.
     """
     if not _EXT_AVAILABLE or k % 256 != 0 or k % group_size != 0:
         return False
@@ -1126,6 +1127,50 @@ def _fused_quantize_wxa8(
     return packed, s_rel, s_channel, None, (cb if bits == 4 else None)
 
 
+_W4A8_STAGED_QUANT = _EXT_AVAILABLE
+# The staged kernel keeps only K/16 fp32 group scales in LDS. Same limit as CUDA's,
+# which reserves room for its static arrays within the 48 KiB default block limit.
+_W4A8_STAGED_MAX_K = 16 * (47 * 1024 // 4)
+
+
+def _quantize_w4a8_staged(
+    weight: torch.Tensor,
+    codebook: torch.Tensor,
+    convrot_groupsize: int,
+    stochastic_rounding: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, torch.Tensor]:
+    """Rotate, then requantize in a second launch, a row block at a time so no full
+    rotated copy is held. Every output is per row, so each block writes straight into
+    its slice."""
+    n, k = weight.shape
+    dev = weight.device
+    cb = codebook.to(device=dev, dtype=torch.float32).contiguous()
+    packed = torch.empty(n, k // 2, dtype=torch.int8, device=dev)
+    s_rel = torch.empty(n, k // 16, dtype=torch.float8_e4m3fn, device=dev)
+    s_channel = torch.empty(n, dtype=torch.float32, device=dev)
+    block = max(1, _QUANT_ROW_ELEM_BUDGET // max(k, 1))
+    with torch.cuda.device(dev):
+        for r0 in range(0, n, block):
+            r1 = min(r0 + block, n)
+            rot = _eager.rotate_int8_convrot_weight(weight[r0:r1].contiguous(), convrot_groupsize)
+            # Offset per block like the eager packer, so blocks decorrelate yet stay deterministic.
+            seed = stochastic_rounding + r0 if stochastic_rounding > 0 else 0
+            _C.quantize_w4a8_convrot(
+                _dl(rot.contiguous()),
+                _dl(cb),
+                _dl(packed[r0:r1]),
+                _dl(s_rel[r0:r1].view(torch.uint8)),
+                _dl(s_channel[r0:r1]),
+                r1 - r0,
+                k,
+                seed > 0,
+                seed,
+                _stream(weight),
+            )
+            del rot
+    return packed, s_rel, s_channel, None, cb
+
+
 def quantize_w4a8_int8_weight(
     weight: torch.Tensor,
     group_size: int = 16,
@@ -1146,19 +1191,31 @@ def quantize_w4a8_int8_weight(
 ]:
     """Prepare W4A8/W6A8 weights: the fused HIP ConvRot + requantize for the default
     configs (4-bit symmetric codebook g16, or 6-bit without the quantize-time scale
-    search; fp8 scales), the chunked eager path otherwise."""
+    search; fp8 scales). W4A8 the fused kernel declines takes the staged HIP requantize;
+    everything else the chunked eager path."""
     validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
-    fused_ok = (
+    layout_ok = (
         scale_dtype == torch.float8_e4m3fn
         and symmetric
-        and convrot_groupsize == 256
         and (
             (bits == 4 and codebook and group_size == 16)
             or (bits == 6 and not scale_search and group_size in (16, 32, 64))
         )
+    )
+    fused_ok = (
+        layout_ok
+        and convrot_groupsize == 256
         and _requant_supported(weight.shape[1], group_size, weight.device, weight.dtype)
     )
-    if fused_ok:
+    staged_ok = (
+        layout_ok
+        and not fused_ok
+        and bits == 4
+        and _W4A8_STAGED_QUANT
+        and weight.dtype in (torch.float32, torch.float16, torch.bfloat16)
+        and weight.shape[1] <= _W4A8_STAGED_MAX_K
+    )
+    if fused_ok or staged_ok:
         cb = None
         if bits == 4:
             cb = (
@@ -1168,6 +1225,8 @@ def quantize_w4a8_int8_weight(
                     weight, _eager.rotate_int8_convrot_weight, group_size, convrot_groupsize
                 )
             )
+        if staged_ok:
+            return _quantize_w4a8_staged(weight, cb, convrot_groupsize, stochastic_rounding)
         return _fused_quantize_wxa8(weight, bits, group_size, cb, stochastic_rounding)
     return _quantize_w4a8_chunked(
         weight,

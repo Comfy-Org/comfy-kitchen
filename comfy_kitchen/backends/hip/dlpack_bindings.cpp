@@ -768,6 +768,34 @@ void quantize_wxa8_convrot_fused(nb::ndarray<> weight, nb::ndarray<> codebook,
     check_hip_launch();
 }
 
+// Staged W4A8 requantize of an already rotated [N, K] weight (float32, float16 or
+// bfloat16): packed int4 codes [N, K/2], raw e4m3 s_rel [N, K/16], f32 s_channel [N].
+// Takes what the fused kernel declines: fp32 weights and rows too wide for its LDS row.
+void quantize_w4a8_convrot(nb::ndarray<> rotated, nb::ndarray<> codebook, nb::ndarray<> packed,
+                           nb::ndarray<> s_rel, nb::ndarray<> s_channel, int N, int K,
+                           bool stochastic, uint64_t seed, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "quantize_w4a8_convrot";
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    if (K % 16 != 0) {
+        throw std::runtime_error(std::string(kFn) + ": K must be a multiple of 16");
+    }
+    require_dtype(rotated, 0, 2, kFn, "rotated");
+    require_dtype(packed, 4, 4, kFn, "packed");
+    require_dtype(s_rel, 3, 3, kFn, "s_rel");
+    require_scale_len(s_channel, static_cast<size_t>(N), kFn, "s_channel");
+    require_scale_len(codebook, 16, kFn, "codebook");
+    require_len(rotated, static_cast<int64_t>(N) * K, kFn, "rotated");
+    require_len(packed, static_cast<int64_t>(N) * (K / 2), kFn, "packed");
+    require_len(s_rel, static_cast<int64_t>(N) * (K / 16), kFn, "s_rel");
+
+    launch_quantize_w4a8_convrot_kernel(rotated.data(), codebook.data(), packed.data(),
+                                        s_rel.data(), s_channel.data(), N, K,
+                                        map_dtype_to_code(rotated.dtype()), stochastic, seed,
+                                        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
 // Code width implied by the packed [N, K * bits / 8] row: K/2 bytes at 4 bits,
 // 3K/4 at 6. The length checks only bound the buffer from below, so the width is
 // read from the shape rather than inferred from the element count. 6-bit storage
@@ -2517,6 +2545,7 @@ NB_MODULE(_C, m) {
     m.def("dequant_int4_grouped_to_int8", &dequant_int4_grouped_to_int8);
     m.def("quantize_wxa8_convrot_fused", &quantize_wxa8_convrot_fused);
     m.def("wxa8_requant_max_k", &wxa8_requant_max_k_kernel, nb::arg("group_size"));
+    m.def("quantize_w4a8_convrot", &quantize_w4a8_convrot);
     m.def("w4a8_int8_gemm_chunked", &w4a8_int8_gemm_chunked);
     m.def("w4a8_codebook_gemv", &w4a8_codebook_gemv);
     m.def("gated_delta_decode_fused", &gated_delta_decode_fused, nb::arg("mixed_qkv"),

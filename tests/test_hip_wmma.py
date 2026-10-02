@@ -1468,54 +1468,142 @@ def test_wxa8_fused_quantize_rotates_in_the_kernel(hip, bits, group_size, monkey
         ("uniform", torch.bfloat16, {"codebook": False}),
         ("fp32_scale", torch.bfloat16, {"scale_dtype": torch.float32}),
         ("group_size_32", torch.bfloat16, {"group_size": 32}),
-        ("fp32_weight", torch.float32, {}),
         ("w6_scale_search", torch.bfloat16, {"bits": 6, "codebook": False}),
         ("w6_fp32_scale", torch.bfloat16, {**_W6_KWARGS, "scale_dtype": torch.float32}),
         ("w6_fp32_weight", torch.float32, _W6_KWARGS),
     ],
 )
 def test_wxa8_fused_quantize_declines_off_the_default_layout(hip, tag, dtype, kwargs, monkeypatch):
-    """The kernel implements the layouts CUDA's does. Everything else has to reach the
+    """The kernels implement the layouts CUDA's do. Everything else has to reach the
     shared packer unchanged, not a near-miss fast path.
 
-    The fused entry is stubbed rather than inferred from output equality: the two
-    paths agree to an ulp, so equality alone would keep passing if the gate ever let
+    The kernel entries are stubbed rather than inferred from output equality: the
+    paths agree to an ulp, so equality alone would keep passing if a gate ever let
     one of these layouts through.
     """
     w, _ = _requant_inputs(64, 512, dtype)
     kwargs = {"convrot_groupsize": 256, **kwargs}
 
     def _refuse(*_args, **_kwargs):
-        raise AssertionError(f"fused path taken for {tag}")
+        raise AssertionError(f"kernel path taken for {tag}")
 
     monkeypatch.setattr(hip, "_fused_quantize_wxa8", _refuse)
+    monkeypatch.setattr(hip, "_quantize_w4a8_staged", _refuse)
     ref = eager_w4a8.quantize_w4a8_int8_weight(w, **kwargs)
     out = hip.quantize_w4a8_int8_weight(w, **kwargs)
 
     _assert_same_packed(out, ref)
 
 
+def _refuse_path(name):
+    def _refuse(*_args, **_kwargs):
+        raise AssertionError(f"{name} path taken")
+
+    return _refuse
+
+
+def _shrink_fused_lds(hip, monkeypatch):
+    monkeypatch.setattr(hip, "_wxa8_requant_max_k", {})
+    monkeypatch.setattr(hip._C, "wxa8_requant_max_k", lambda group_size: 256)
+
+
 def test_wxa8_fused_quantize_declines_a_row_wider_than_lds(hip, monkeypatch):
     """The rotated row and the group scales sit in LDS, so K is bounded per device.
-    Past the budget the wrapper must fall back instead of launching something that
-    cannot fit.
+    Past the budget the wrapper must hand the row to the staged kernel instead of
+    launching something that cannot fit.
 
     Declining the budget and consulting it are two claims: the fused entry is
     stubbed so the second one is asserted rather than inferred from a shape the two
     paths happen to agree on.
     """
     w, cb = _requant_inputs(8, 512)
-    monkeypatch.setattr(hip, "_wxa8_requant_max_k", {})
-    monkeypatch.setattr(hip._C, "wxa8_requant_max_k", lambda group_size: 256)
+    _shrink_fused_lds(hip, monkeypatch)
     assert not hip._requant_supported(512, 16, w.device, w.dtype)
 
-    def _refuse(*_args, **_kwargs):
-        raise AssertionError("fused path taken for a row wider than the LDS budget")
+    monkeypatch.setattr(hip, "_fused_quantize_wxa8", _refuse_path("fused"))
+    monkeypatch.setattr(hip, "_quantize_w4a8_chunked", _refuse_path("eager"))
+    ref = eager_w4a8.quantize_w4a8_int8_weight(w, 16, convrot_groupsize=256, codebook_tensor=cb)
+    out = hip.quantize_w4a8_int8_weight(w, 16, convrot_groupsize=256, codebook_tensor=cb)
+    _assert_requant_close(out, ref, w, 16)
 
-    monkeypatch.setattr(hip, "_fused_quantize_wxa8", _refuse)
+
+@pytest.mark.parametrize(
+    ("dtype", "k"),
+    [
+        (torch.float32, 1024),
+        (torch.float32, 51200),
+        (torch.float32, 188160),
+        (torch.float16, 188160),
+        (torch.bfloat16, 188160),
+    ],
+)
+def test_w4a8_staged_quantize_matches_eager(hip, dtype, k, monkeypatch):
+    """fp32 weights and rows too wide for the fused LDS row take the staged kernel.
+    The weights are strided and the row budget forces several blocks with a short
+    last one, so each block has to land in its own output slice."""
+    torch.manual_seed(0)
+    w = (torch.randn(5, 2 * k, device=DEV, dtype=dtype) * 0.02)[:, ::2]
+    cb = eager_w4a8._decide_codebook(w, eager_rotate_int8_convrot_weight, 16, 256)
+    monkeypatch.setattr(hip, "_QUANT_ROW_ELEM_BUDGET", 2 * k)
+    monkeypatch.setattr(hip, "_fused_quantize_wxa8", _refuse_path("fused"))
+    monkeypatch.setattr(hip, "_quantize_w4a8_chunked", _refuse_path("eager"))
+    ref = eager_w4a8.quantize_w4a8_int8_weight(w, 16, convrot_groupsize=256, codebook_tensor=cb)
+    out = hip.quantize_w4a8_int8_weight(w, 16, convrot_groupsize=256, codebook_tensor=cb)
+    _assert_requant_close(out, ref, w, 16)
+
+
+@pytest.mark.parametrize("unavailable", ["binding", "lds"])
+def test_w4a8_staged_quantize_falls_back_to_eager(hip, unavailable, monkeypatch):
+    """Without the staged kernel, or past its K limit, the eager packer still runs."""
+    w, cb = _requant_inputs(8, 512)
+    _shrink_fused_lds(hip, monkeypatch)
+    if unavailable == "binding":
+        monkeypatch.setattr(hip, "_W4A8_STAGED_QUANT", False)
+    else:
+        monkeypatch.setattr(hip, "_W4A8_STAGED_MAX_K", 0)
+    monkeypatch.setattr(hip, "_quantize_w4a8_staged", _refuse_path("staged"))
     ref = eager_w4a8.quantize_w4a8_int8_weight(w, 16, convrot_groupsize=256, codebook_tensor=cb)
     out = hip.quantize_w4a8_int8_weight(w, 16, convrot_groupsize=256, codebook_tensor=cb)
     _assert_same_packed(out, ref)
+
+
+def test_w4a8_staged_quantize_stochastic_rounding_is_seeded(hip, monkeypatch):
+    w, cb = _requant_inputs(128, 512, torch.float32)
+    monkeypatch.setattr(hip, "_QUANT_ROW_ELEM_BUDGET", 50 * 512)
+    monkeypatch.setattr(hip, "_quantize_w4a8_chunked", _refuse_path("eager"))
+    kwargs = {"convrot_groupsize": 256, "codebook_tensor": cb}
+    a = hip.quantize_w4a8_int8_weight(w, 16, stochastic_rounding=7, **kwargs)[0]
+    b = hip.quantize_w4a8_int8_weight(w, 16, stochastic_rounding=7, **kwargs)[0]
+    c = hip.quantize_w4a8_int8_weight(w, 16, stochastic_rounding=8, **kwargs)[0]
+    assert torch.equal(a, b)
+    assert not torch.equal(a, c)
+
+
+@pytest.mark.parametrize("stochastic_rounding", [0, 5])
+@pytest.mark.parametrize(("dtype", "k"), [(torch.float32, 1024), (torch.bfloat16, 188160)])
+def test_w4a8_staged_quantize_is_graph_capturable(hip, dtype, k, stochastic_rounding, monkeypatch):
+    torch.manual_seed(0)
+    w = torch.randn(5, k, device=DEV, dtype=dtype) * 0.02
+    cb = eager_w4a8._decide_codebook(w, eager_rotate_int8_convrot_weight, 16, 256)
+    monkeypatch.setattr(hip, "_QUANT_ROW_ELEM_BUDGET", 2 * k)
+    monkeypatch.setattr(hip, "_quantize_w4a8_chunked", _refuse_path("eager"))
+    kwargs = {
+        "convrot_groupsize": 256,
+        "codebook_tensor": cb,
+        "stochastic_rounding": stochastic_rounding,
+    }
+    expected = hip.quantize_w4a8_int8_weight(w, 16, **kwargs)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        hip.quantize_w4a8_int8_weight(w, 16, **kwargs)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = hip.quantize_w4a8_int8_weight(w, 16, **kwargs)
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_same_packed(captured, expected)
 
 
 def test_wxa8_fused_quantize_realigns_an_offset_weight(hip):
