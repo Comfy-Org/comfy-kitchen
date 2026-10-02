@@ -19,6 +19,10 @@ import triton
 import triton.language as tl
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
 from comfy_kitchen.backends._activations import apply_residual as _apply_residual
+from comfy_kitchen.backends.eager.quantization import DTYPE_CODE_TO_DTYPE
+from comfy_kitchen.backends.eager.quantization import (
+    dequantize_int8_simple as eager_dequantize_int8_simple,
+)
 from comfy_kitchen.float_utils import (
     F8_E4M3_MAX,
     F8_E5M2_MAX,
@@ -121,6 +125,33 @@ def dequantize_fp8_kernel_tl(
     tl.store(output_ptr + offsets, dequantized, mask=mask)
 
 
+@triton.jit
+def dequantize_int8_simple_kernel_tl(
+    x_ptr,
+    output_ptr,
+    scale_ptr,
+    scale_mode: tl.constexpr,
+    inner_dim,
+    n_elements,
+    block_size: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    block_start = pid * block_size
+    offsets = block_start + tl.arange(0, block_size)
+    mask = offsets < n_elements
+
+    if scale_mode == 0:
+        scale = tl.load(scale_ptr)
+    elif scale_mode == 1:
+        scale = tl.load(scale_ptr + offsets, mask=mask)
+    elif scale_mode == 2:
+        scale = tl.load(scale_ptr + offsets // inner_dim, mask=mask)
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    result = x.to(tl.float32) * scale
+    tl.store(output_ptr + offsets, result, mask=mask)
+
+
 def dequantize_per_tensor_fp8(
     x: torch.Tensor, scale: torch.Tensor, output_type: torch.dtype = torch.bfloat16
 ) -> torch.Tensor:
@@ -155,6 +186,43 @@ def dequantize_per_tensor_fp8(
     output = output.view(orig_shape)
 
     return output
+
+
+def dequantize_int8_simple_dtype(
+    q: torch.Tensor, scale: torch.Tensor, output_dtype_code: int
+) -> torch.Tensor:
+    if not q.is_contiguous():
+        q = q.contiguous()
+
+    orig_shape = q.shape
+    q_flat = q.flatten()
+    inner_dim = q.shape[-1] if q.dim() > 0 else 1
+
+    if scale.numel() == 1:
+        scale_mode = 0
+    elif tuple(scale.shape) == tuple(q.shape):
+        scale_mode = 1
+    elif (
+        q.dim() > 0
+        and scale.dim() == q.dim()
+        and tuple(scale.shape[:-1]) == tuple(q.shape[:-1])
+        and scale.shape[-1] == 1
+    ):
+        scale_mode = 2
+    else:
+        return eager_dequantize_int8_simple(q, scale).to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
+
+    output = torch.empty_like(q_flat, dtype=DTYPE_CODE_TO_DTYPE[output_dtype_code])
+    if q_flat.numel() == 0:
+        return output.view(orig_shape)
+
+    scale = scale.to(device=q.device, dtype=torch.float32).contiguous().flatten()
+    block_size = 128
+    grid = (triton.cdiv(q_flat.numel(), block_size),)
+    dequantize_int8_simple_kernel_tl[grid](
+        q_flat, output, scale, scale_mode, inner_dim, q_flat.numel(), block_size
+    )
+    return output.view(orig_shape)
 
 
 @triton.jit
