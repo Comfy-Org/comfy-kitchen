@@ -620,51 +620,6 @@ def setup_hip_extension() -> CMakeExtension | None:
     )
 
 
-def setup_gfx1035_extension() -> CMakeExtension | None:
-    """Build the RDNA2 (gfx103x) SageAttention port, for RDNA2 devices only.
-
-    The main HIP backend's sage_attention sources are WMMA and do not build for
-    gfx103x, which has no matrix cores. This extension carries the ported
-    SageAttention RDNA2 kernels and is compiled for gfx103x targets only, so it
-    is dead weight on a gfx11xx/gfx12xx build rather than a second code path.
-    It is therefore gated on at least one visible RDNA2 device.
-    """
-    if BUILD_NO_HIP:
-        return None
-
-    # The extension is only useful on an RDNA2 device, so a machine with no
-    # gfx103x visible skips it rather than paying the compile cost.
-    archs = get_hip_archs_override()
-    if not archs:
-        archs = detect_hip_archs()
-    rdna2 = [
-        arch for arch in archs
-        if arch in HIP_ARCH_GROUPS["elementwise_only"]
-    ]
-    if not rdna2:
-        return None
-
-    rocm_home, hip_compiler = get_rocm_path()
-    if hip_compiler is None:
-        print("No ROCm compiler detected; skipping the gfx1035 extension")
-        return None
-
-    root_dir = pathlib.Path(__file__).resolve().parent
-    source_dir = root_dir / "comfy_kitchen" / "backends" / "hip" / "gfx1035"
-    if not source_dir.exists():
-        return None
-
-    print(
-        "Building gfx1035 SageAttention extension with CMake: "
-        "comfy_kitchen.backends.hip._qattn_gfx1035"
-    )
-    return CMakeExtension(
-        name="comfy_kitchen.backends.hip._qattn_gfx1035",
-        source_dir=str(source_dir),
-        backend="hip",
-        hip_archs=";".join(sorted(set(rdna2))),
-        build_suffix="gfx1035",
-    )
 
 
 def get_cuda_version() -> tuple[int, ...] | None:
@@ -793,12 +748,6 @@ def get_extensions() -> list[setuptools.Extension]:
         if hip_ext is not None:
             extensions.append(hip_ext)
 
-        # The gfx1035 port shares the ROCm toolchain and is only useful on an
-        # RDNA2 device, so it rides along with the HIP build rather than being
-        # gated separately.
-        gfx1035_ext = setup_gfx1035_extension()
-        if gfx1035_ext is not None:
-            extensions.append(gfx1035_ext)
 
     if not extensions:
         print("\n" + "=" * 80)

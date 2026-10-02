@@ -1,22 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024 SageAttention team.
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-#include <torch/csrc/stable/ops.h>
-#include <torch/csrc/stable/tensor_struct.h>
-
-// new_empty and the other in-place constructors moved behind tensor_inl.h in torch
-// 2.10. stable/version.h defines TORCH_FEATURE_VERSION and TORCH_VERSION_2_10_0
-// itself and resolves TORCH_TARGET_VERSION for us, so it is the version probe and
-// there is no shim header to keep in step with torch's own. Nothing above this
-// point includes it, so ask for it directly.
-#include <torch/csrc/stable/version.h>
-#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_10_0
-#include <torch/csrc/stable/tensor_inl.h>
-#endif
-
-#include <torch/headeronly/core/ScalarType.h>
-#include <torch/headeronly/util/Exception.h>
-
 #if defined(__HIP_PLATFORM_AMD__)
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
@@ -35,17 +19,20 @@
 #include <type_traits>
 #include <vector>
 
-using torch::stable::Tensor;
-using ScalarType = torch::headeronly::ScalarType;
+#include "../mma_gfx103x.h"
+#include "sage_attn_gfx103x.h"
 
 namespace {
 
 constexpr int kNHD = 0;
 constexpr int kHND = 1;
-constexpr float kLog2e = 1.4426950408889634f;
 
-constexpr int MIN_BLK_Q = 32;
-constexpr int MIN_BLK_K = 16;
+// Shared with the tile header, which is included at file scope and so cannot see
+// this namespace's constants. Pulled in unqualified so every use below reads as one
+// set rather than two names for the same number.
+using sageattn_gfx10::kLog2e;
+using sageattn_gfx10::MIN_BLK_K;
+using sageattn_gfx10::MIN_BLK_Q;
 
 // The two warp/block maximum reductions the Q/K quantizer needs, and nothing
 // else. These came from reduction_utils.cuh, a port of vLLM's reduction set that
@@ -77,9 +64,6 @@ __device__ __forceinline__ T block_reduce_max(T val) {
     val = (threadIdx.x < (blockDim.x / 32.f)) ? partial[lane] : -1e20f;
     return warp_reduce_max(val);
 }
-
-
-#include "mma_gfx10.h"
 
 // Every operand the attention kernel takes, gathered so the launcher can stay a
 // template over the tile shape and the mask representation instead of a wall of
@@ -281,17 +265,6 @@ void launch_attn_cf(const AttnLaunchCtx& c, int64_t head_dim, bool inq, bool out
     }
 }
 
-Tensor new_empty_like(const Tensor& like, std::initializer_list<int64_t> sizes, ScalarType dtype) {
-    return torch::stable::new_empty(like, std::vector<int64_t>(sizes), std::make_optional(dtype));
-}
-
-hipStream_t current_hip_stream(const Tensor& tensor) {
-    int32_t device_index = tensor.get_device_index();
-    void* stream = nullptr;
-    TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_index, &stream));
-    return reinterpret_cast<hipStream_t>(stream);
-}
-
 __device__ __forceinline__ float to_float(const __half v) { return __half2float(v); }
 __device__ __forceinline__ float to_float(const __hip_bfloat16 v) { return __bfloat162float(v); }
 __device__ __forceinline__ float to_float(float v) { return v; }
@@ -476,79 +449,47 @@ __global__ void quant_qk_int8_hnd_kernel(
 
 }
 
-std::tuple<Tensor, Tensor, Tensor, Tensor> quant_qk_int8_gfx103x(
-    Tensor query, Tensor key, Tensor key_mean,
-    int64_t tensor_layout, double sm_scale, int64_t skip_q) {
+// Quantize Q and K. The block shape is picked from the head dim: the two wider
+// pairs were reachable only through the SAGEATTN_QUANT_BLK sweep knob, which this
+// tree has dropped (it read the environment on every launch, and the fork removed
+// the equivalent COMFY_KITCHEN_WMMA_TILE scaffolding for the same reason), so D64
+// uses 128/64 and D128 falls back to the minimum block.
+namespace sageattn_gfx103x {
 
-    const int64_t batch = query.size(0);
-    const int64_t q_heads = (tensor_layout == kHND) ? query.size(1) : query.size(2);
-    const int64_t kv_heads = (tensor_layout == kHND) ? key.size(1) : key.size(2);
-    const int64_t q_len = (tensor_layout == kHND) ? query.size(2) : query.size(1);
-    const int64_t kv_len = (tensor_layout == kHND) ? key.size(2) : key.size(1);
-    const int64_t head_dim = query.size(3);
-
-    Tensor q_int8 = new_empty_like(query, {batch, q_heads, q_len, head_dim}, ScalarType::Char);
-    Tensor k_int8 = new_empty_like(key, {batch, kv_heads, kv_len, head_dim}, ScalarType::Char);
-
-    const int q_groups = (q_len + MIN_BLK_Q - 1) / MIN_BLK_Q;
-    const int k_groups = (kv_len + MIN_BLK_K - 1) / MIN_BLK_K;
-
-    Tensor q_scale = new_empty_like(query, {batch, q_heads, q_groups}, ScalarType::Float);
-    Tensor k_scale = new_empty_like(key, {batch, kv_heads, k_groups}, ScalarType::Float);
-    if (skip_q) {
-
-        q_int8 = new_empty_like(query, {0}, ScalarType::Char);
-        q_scale = new_empty_like(query, {0}, ScalarType::Float);
-    }
-
-    const hipStream_t stream = current_hip_stream(query);
-    const float sm_scale_log2e = static_cast<float>(sm_scale) * kLog2e;
-    const bool has_mean = key_mean.numel() > 0;
-
-    const int64_t q_sb = query.stride(0);
-    const int64_t q_sn = (tensor_layout == kHND) ? query.stride(2) : query.stride(1);
-    const int64_t q_sh = (tensor_layout == kHND) ? query.stride(1) : query.stride(2);
-    const int64_t k_sb = key.stride(0);
-    const int64_t k_sn = (tensor_layout == kHND) ? key.stride(2) : key.stride(1);
-    const int64_t k_sh = (tensor_layout == kHND) ? key.stride(1) : key.stride(2);
-
-    dim3 block(256);
-
-    // Tile shape by head dim. The two wider pairs were reachable only through the
-// SAGEATTN_QUANT_BLK sweep knob, which this tree has dropped (it read the
-// environment on every launch, and the fork removed the equivalent
-// COMFY_KITCHEN_WMMA_TILE scaffolding for the same reason), so D64 uses 128/64
-// and D128 falls back to the minimum block.
+void gfx103x_launch_quant_qk(const QuantArgs& a, hipStream_t stream) {
     constexpr int BLK_Q64 = 128;
     constexpr int BLK_K64 = 64;
     int blk_q, blk_k;
-    if (head_dim == 64) { blk_q = BLK_Q64; blk_k = BLK_K64; }
+    if (a.head_dim == 64) { blk_q = BLK_Q64; blk_k = BLK_K64; }
     else { blk_q = MIN_BLK_Q; blk_k = MIN_BLK_K; }
-    const int q_blocks = (q_len + blk_q - 1) / blk_q;
-    const int k_blocks = (kv_len + blk_k - 1) / blk_k;
 
+    dim3 block(256);
     constexpr int q_gpb = 1;  // one (q_block, head, batch) per program
-    dim3 grid_q(q_blocks, q_heads, batch);
-    dim3 grid_k(k_blocks, kv_heads, batch);
+    dim3 grid_q(static_cast<unsigned>((a.q_len + blk_q - 1) / blk_q),
+                static_cast<unsigned>(a.q_heads), static_cast<unsigned>(a.batch));
+    dim3 grid_k(static_cast<unsigned>((a.kv_len + blk_k - 1) / blk_k),
+                static_cast<unsigned>(a.kv_heads), static_cast<unsigned>(a.batch));
+
+    const float sm_scale_log2e = static_cast<float>(a.sm_scale) * kLog2e;
 
     #define LAUNCH_QUANT(HD, T, BQ, BK) \
         do { \
-            if (!skip_q) { \
+            if (!a.skip_q) { \
                 quant_qk_int8_hnd_kernel<T, HD, BQ, MIN_BLK_Q><<<grid_q, block, 0, stream>>>( \
-                    reinterpret_cast<const T*>(query.data_ptr()), \
-                    reinterpret_cast<int8_t*>(q_int8.data_ptr()), \
+                    reinterpret_cast<const T*>(a.q), \
+                    a.q_int8, \
                     nullptr, \
-                    reinterpret_cast<float*>(q_scale.data_ptr()), \
-                    batch, q_heads, q_len, q_groups, 1, sm_scale_log2e, \
-                    q_sb, q_sn, q_sh, q_gpb); \
+                    a.q_scale, \
+                    a.batch, a.q_heads, a.q_len, static_cast<int>(a.q_groups), 1, sm_scale_log2e, \
+                    a.q_stride_b, a.q_stride_n, a.q_stride_h, q_gpb); \
             } \
             quant_qk_int8_hnd_kernel<T, HD, BK, MIN_BLK_K><<<grid_k, block, 0, stream>>>( \
-                reinterpret_cast<const T*>(key.data_ptr()), \
-                reinterpret_cast<int8_t*>(k_int8.data_ptr()), \
-                has_mean ? reinterpret_cast<const T*>(key_mean.data_ptr()) : nullptr, \
-                reinterpret_cast<float*>(k_scale.data_ptr()), \
-                batch, kv_heads, kv_len, k_groups, 0, 1.0f, \
-                k_sb, k_sn, k_sh, q_gpb); \
+                reinterpret_cast<const T*>(a.k), \
+                a.k_int8, \
+                reinterpret_cast<const T*>(a.key_mean), \
+                a.k_scale, \
+                a.batch, a.kv_heads, a.kv_len, static_cast<int>(a.k_groups), 0, 1.0f, \
+                a.k_stride_b, a.k_stride_n, a.k_stride_h, q_gpb); \
         } while(0)
 
     #define LAUNCH_QUANT_DISPATCH(HD, T) \
@@ -557,88 +498,58 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> quant_qk_int8_gfx103x(
             else { LAUNCH_QUANT(HD, T, MIN_BLK_Q, MIN_BLK_K); } \
         } while(0)
 
-    if (query.scalar_type() == ScalarType::Half) {
-        if (head_dim == 64) { LAUNCH_QUANT_DISPATCH(64, __half); }
-        else { LAUNCH_QUANT_DISPATCH(128, __half); }
-    } else {
-        if (head_dim == 64) { LAUNCH_QUANT_DISPATCH(64, __hip_bfloat16); }
+    if (a.src_bf16) {
+        if (a.head_dim == 64) { LAUNCH_QUANT_DISPATCH(64, __hip_bfloat16); }
         else { LAUNCH_QUANT_DISPATCH(128, __hip_bfloat16); }
+    } else {
+        if (a.head_dim == 64) { LAUNCH_QUANT_DISPATCH(64, __half); }
+        else { LAUNCH_QUANT_DISPATCH(128, __half); }
     }
     #undef LAUNCH_QUANT_DISPATCH
     #undef LAUNCH_QUANT
-    return {q_int8, q_scale, k_int8, k_scale};
 }
 
-Tensor qk_int8_sv_bf16_attn_gfx103x_t(
-    Tensor query, Tensor key, Tensor value, Tensor output,
-    Tensor q_scale, Tensor k_scale, Tensor v_scale,
-    int64_t tensor_layout, int64_t is_causal, double sm_scale, Tensor q_fp,
-    int64_t mask_mode, int64_t mask_dtype, Tensor mask) {
-    (void)v_scale;
-
-    const Tensor& qgeo = (query.dim() < 4) ? q_fp : query;
-    const int64_t batch = qgeo.size(0);
-    const int64_t q_heads = qgeo.size(1);
-    const int64_t kv_heads = key.size(1);
-    const int64_t qo_len = qgeo.size(2);
-    const int64_t kv_len = key.size(2);
-    const int64_t head_dim = qgeo.size(3);
-    const int64_t q_stride_b = (query.dim() >= 4) ? query.stride(0) : 0;
-    const int64_t q_stride_n = (query.dim() >= 4) ? query.stride(2) : 0;
-    const int64_t q_stride_h = (query.dim() >= 4) ? query.stride(1) : 0;
-    const int64_t k_stride_b = key.stride(0);
-    const int64_t k_stride_n = key.stride(2);
-    const int64_t k_stride_h = key.stride(1);
-
-    const int64_t v_stride_b = value.stride(0);
-    const int64_t v_stride_n = value.stride(1);
-    const int64_t v_stride_h = value.stride(2);
-    const int64_t o_stride_b = output.stride(0);
-    const int64_t o_stride_n = (tensor_layout == kHND) ? output.stride(2) : output.stride(1);
-    const int64_t o_stride_h = (tensor_layout == kHND) ? output.stride(1) : output.stride(2);
-    const int64_t qs_stride_b = (q_scale.numel() > 0) ? q_scale.stride(0) : 0,
-      qs_stride_h = (q_scale.numel() > 0) ? q_scale.stride(1) : 0;
-    const int64_t ks_stride_b = k_scale.stride(0), ks_stride_h = k_scale.stride(1);
-    const hipStream_t stream = current_hip_stream(query);
+void gfx103x_launch_attn(const AttnArgs& in, hipStream_t stream) {
+    const bool inq = in.kv_len <= 1024 && in.has_q_fp;
 
     // Mask descriptor. Raw masks are indexed by the caller's strides; every
     // prepared form is contiguous with a pitch the tile counts fix, so the
     // kernel indexes those arithmetically (see gfx10_mask_row).
-    const int gmask = static_cast<int>(mask_mode);
+    const int gmask = in.mask_mode;
     const bool masked = gmask != 0;
     int64_t mask_sb = 0, mask_sh = 0, mask_sq = 0, mask_sk = 0;
     int64_t mask_batch = 1, mask_heads = 1, mask_q_tiles = 0, mask_k_tiles = 0;
     int64_t mask_k_row_pitch = 0;
     if (masked) {
         if (gmask == sageattn_gfx10::MaskMode::kRaw) {
-            if (mask.dim() != 4) {
+            if (in.mask_ndim != 4) {
                 throw std::runtime_error("attn_gfx103x: a raw attn_mask must be [B,H,Q,K]");
             }
-            mask_sb = mask.stride(0);
-            mask_sh = mask.stride(1);
-            mask_sq = mask.stride(2);
-            mask_sk = mask.stride(3);
+            mask_sb = in.mask_stride[0];
+            mask_sh = in.mask_stride[1];
+            mask_sq = in.mask_stride[2];
+            mask_sk = in.mask_stride[3];
             // The compact extents tell the kernel which batch/head indices the
             // mask actually covers; a stride-0 axis is one it does not. The
             // strides are passed through unchanged -- they already encode the
             // broadcast, and rewriting them would break the in-bounds
             // arithmetic the producer's layout depends on.
-            mask_batch = (mask_sb == 0) ? 1 : mask.size(0);
-            mask_heads = (mask_sh == 0) ? 1 : mask.size(1);
+            mask_batch = (mask_sb == 0) ? 1 : in.mask_shape[0];
+            mask_heads = (mask_sh == 0) ? 1 : in.mask_shape[1];
         } else if (gmask == sageattn_gfx10::MaskMode::kPreparedKey) {
             // [B, H, tiles * 65]: the row pitch is the buffer's own width, and
             // the kernel derives the tile count from kv_len. There are no query
             // or key tile extents to read -- that is why this branch does not
-            // touch size(2)/size(3), which a 3D tensor does not have.
-            if (mask.dim() != 3) {
+            // touch shape[2]/shape[3], which a 3D tensor does not have.
+            if (in.mask_ndim != 3) {
                 throw std::runtime_error("attn_gfx103x: a prepared key mask must be [B,H,W]");
             }
-            if (!mask.is_contiguous()) {
+            if (!in.mask_contiguous) {
                 throw std::runtime_error("attn_gfx103x: a prepared attn_mask must be contiguous");
             }
-            mask_batch = mask.size(0);
-            mask_heads = mask.size(1);
-            mask_k_tiles = (kv_len + sageattn_gfx10::kGfx10TileK - 1) / sageattn_gfx10::kGfx10TileK;
+            mask_batch = in.mask_shape[0];
+            mask_heads = in.mask_shape[1];
+            mask_k_tiles = (in.kv_len + sageattn_gfx10::kGfx10TileK - 1) / sageattn_gfx10::kGfx10TileK;
             // The producer rounds the row up to a multiple of four so its own
             // vector loads stay aligned; the kernel has to stride by that width,
             // not by the exact tiles*65.
@@ -646,21 +557,21 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
             mask_k_row_pitch = (exact + 3) / 4 * 4;
         } else {
             // Dense: [B, H, q_tiles, k_tiles, slots].
-            if (mask.dim() != 5) {
+            if (in.mask_ndim != 5) {
                 throw std::runtime_error("attn_gfx103x: a prepared dense mask must be 5D");
             }
-            if (!mask.is_contiguous()) {
+            if (!in.mask_contiguous) {
                 throw std::runtime_error("attn_gfx103x: a prepared attn_mask must be contiguous");
             }
-            mask_batch = mask.size(0);
-            mask_heads = mask.size(1);
-            mask_q_tiles = mask.size(2);
-            mask_k_tiles = mask.size(3);
+            mask_batch = in.mask_shape[0];
+            mask_heads = in.mask_shape[1];
+            mask_q_tiles = in.mask_shape[2];
+            mask_k_tiles = in.mask_shape[3];
             // The buffer has to cover every (query, key) the kernel will ask
             // for, or the lookup runs off the end of the allocation.
-            const int64_t need_q_tiles = (qo_len + sageattn_gfx10::kGfx10TileQ - 1) /
+            const int64_t need_q_tiles = (in.qo_len + sageattn_gfx10::kGfx10TileQ - 1) /
                                          sageattn_gfx10::kGfx10TileQ;
-            const int64_t need_k_tiles = (kv_len + sageattn_gfx10::kGfx10TileK - 1) /
+            const int64_t need_k_tiles = (in.kv_len + sageattn_gfx10::kGfx10TileK - 1) /
                                          sageattn_gfx10::kGfx10TileK;
             if (mask_q_tiles < need_q_tiles || mask_k_tiles < need_k_tiles) {
                 throw std::runtime_error(
@@ -672,60 +583,49 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
         }
     }
 
-    // In-kernel Q quantization applies to short-KV shapes; the previous mode 1
-    // (always) and mode 3 (never) arms were only reachable through the
-    // SAGEATTN_V10_INQ sweep knob, which this tree has dropped.
-    const bool v10_inq_wanted = kv_len <= 1024;
-    // The in-kernel-Q path is only real when an fp16/bf16 Q source came in; the
-    // prepass path hands over an empty tensor to say "Q is already packed".
-    const bool inq = v10_inq_wanted && q_fp.numel() > 0;
-    const int q_fp_bf16 = (q_fp.scalar_type() == ScalarType::BFloat16) ? 1 : 0;
-
-    const bool out_bf = (output.scalar_type() == ScalarType::BFloat16);
-
     AttnLaunch a{};
-    a.q = reinterpret_cast<const int8_t*>(inq ? q_fp.data_ptr() : query.data_ptr());
-    a.k = reinterpret_cast<const int8_t*>(key.data_ptr());
-    a.v = reinterpret_cast<const __half*>(value.data_ptr());
-    a.out = output.data_ptr();
-    a.q_scale = reinterpret_cast<const float*>(q_scale.data_ptr());
-    a.k_scale = reinterpret_cast<const float*>(k_scale.data_ptr());
-    // The kernel always takes a Q pointer; on the prepass path it is the packed
+    // The kernel always takes a Q pointer: on the prepass path it is the packed
     // int8, on the in-kernel path the fp16/bf16 source it quantizes itself.
-    a.q_fp = inq ? reinterpret_cast<const void*>(q_fp.data_ptr()) : a.q;
-    a.q_src_bf16 = inq ? q_fp_bf16 : 0;
-    a.sm_scale_log2e = inq ? static_cast<float>(sm_scale) * kLog2e : 0.0f;
-    a.batch = batch;
-    a.qo_len = qo_len;
-    a.kv_len = kv_len;
-    a.q_heads = q_heads;
-    a.kv_heads = kv_heads;
-    a.q_stride_b = q_stride_b;
-    a.q_stride_n = q_stride_n;
-    a.q_stride_h = q_stride_h;
-    // q_fp is the empty placeholder on the packed-Q path, so its strides are
-    // only read when there is a real 4D source behind it.
+    a.q = inq ? reinterpret_cast<const int8_t*>(in.q_fp) : in.q;
+    a.k = in.k;
+    a.v = in.v;
+    a.out = in.out;
+    a.q_scale = in.q_scale;
+    a.k_scale = in.k_scale;
+    a.q_fp = inq ? in.q_fp : a.q;
+    a.q_src_bf16 = inq ? in.q_fp_bf16 : 0;
+    a.sm_scale_log2e = inq ? static_cast<float>(in.sm_scale) * kLog2e : 0.0f;
+    a.batch = in.batch;
+    a.qo_len = in.qo_len;
+    a.kv_len = in.kv_len;
+    a.q_heads = in.q_heads;
+    a.kv_heads = in.kv_heads;
+    a.q_stride_b = in.q_stride_b;
+    a.q_stride_n = in.q_stride_n;
+    a.q_stride_h = in.q_stride_h;
+    // The Q source is absent on the packed-Q path, so its strides are only read
+    // when there is a real 4D source behind it.
     if (inq) {
-        a.q_fp_stride_b = q_fp.stride(0);
-        a.q_fp_stride_n = q_fp.stride(2);
-        a.q_fp_stride_h = q_fp.stride(1);
+        a.q_fp_stride_b = in.q_fp_stride_b;
+        a.q_fp_stride_n = in.q_fp_stride_n;
+        a.q_fp_stride_h = in.q_fp_stride_h;
     }
-    a.k_stride_b = k_stride_b;
-    a.k_stride_n = k_stride_n;
-    a.k_stride_h = k_stride_h;
-    a.v_stride_b = v_stride_b;
-    a.v_stride_n = v_stride_n;
-    a.v_stride_h = v_stride_h;
-    a.o_stride_b = o_stride_b;
-    a.o_stride_n = o_stride_n;
-    a.o_stride_h = o_stride_h;
-    a.qs_stride_b = qs_stride_b;
-    a.qs_stride_h = qs_stride_h;
-    a.ks_stride_b = ks_stride_b;
-    a.ks_stride_h = ks_stride_h;
-    a.mask = masked ? mask.data_ptr() : nullptr;
+    a.k_stride_b = in.k_stride_b;
+    a.k_stride_n = in.k_stride_n;
+    a.k_stride_h = in.k_stride_h;
+    a.v_stride_b = in.v_stride_b;
+    a.v_stride_n = in.v_stride_n;
+    a.v_stride_h = in.v_stride_h;
+    a.o_stride_b = in.o_stride_b;
+    a.o_stride_n = in.layout_is_hnd ? in.o_stride_head : in.o_stride_seq;
+    a.o_stride_h = in.layout_is_hnd ? in.o_stride_seq : in.o_stride_head;
+    a.qs_stride_b = in.qs_stride_b;
+    a.qs_stride_h = in.qs_stride_h;
+    a.ks_stride_b = in.ks_stride_b;
+    a.ks_stride_h = in.ks_stride_h;
+    a.mask = masked ? in.mask : nullptr;
     a.mask_mode = gmask;
-    a.mask_dtype = static_cast<int>(mask_dtype);
+    a.mask_dtype = in.mask_dtype;
     a.mask_sb = mask_sb;
     a.mask_sh = mask_sh;
     a.mask_sq = mask_sq;
@@ -739,11 +639,11 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
     AttnLaunchCtx ctx{};
     ctx.ops = a;
     ctx.block = dim3(128);
-    ctx.grid = dim3(static_cast<unsigned>((qo_len + 127) / 128),
-                    static_cast<unsigned>(q_heads), static_cast<unsigned>(batch));
+    ctx.grid = dim3(static_cast<unsigned>((in.qo_len + 127) / 128),
+                    static_cast<unsigned>(in.q_heads), static_cast<unsigned>(in.batch));
     ctx.stream = stream;
     ctx.mask_mode = gmask;
-    ctx.mask_dtype = static_cast<int>(mask_dtype);
+    ctx.mask_dtype = in.mask_dtype;
 
     // Tile shape. The ported kernel shipped these as SAGEATTN_BN_D64 / _BN_D128 /
     // SAGEATTN_TM* environment overrides, read on every launch; this tree has
@@ -751,7 +651,7 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
     // COMFY_KITCHEN_WMMA_TILE scaffolding for the WMMA backend) so the tuned pair
     // is now a constant: BN = 32 at D64 and 16 at D128, TM = 8 rows per thread.
     constexpr int tm = 8;
-    const int v10_bn = (head_dim == 64) ? 32 : 16;
+    const int v10_bn = (in.head_dim == 64) ? 32 : 16;
 
     // One launcher covers every combination the old macro set spelled out. The
     // tile shape (head dim, causal, key tile, rows per thread, in-kernel Q
@@ -765,11 +665,12 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
     // a runtime tile choice would put a branch and a live register on the inner
     // loop's critical path, where the register budget is already the binding
     // constraint on this architecture.
-    const bool causal = is_causal != 0;
-    // is_causal selects the triangular schedule. comfy_kitchen's int8 attention
-    // has no causal mode, but the ported op exposes the flag, so the
-    // instantiation is kept rather than dropped.
-    if (causal) { launch_attn_cf<true>(ctx, head_dim, inq, out_bf, v10_bn, tm); }
-    else        { launch_attn_cf<false>(ctx, head_dim, inq, out_bf, v10_bn, tm); }
-    return output;
+    //
+    // causal selects the triangular schedule. comfy_kitchen's int8 attention has
+    // no causal mode, but the ported op exposes the flag, so the instantiation is
+    // kept rather than dropped.
+    if (in.causal) { launch_attn_cf<true>(ctx, in.head_dim, inq, in.out_bf16 != 0, v10_bn, tm); }
+    else           { launch_attn_cf<false>(ctx, in.head_dim, inq, in.out_bf16 != 0, v10_bn, tm); }
 }
+
+}  // namespace sageattn_gfx103x

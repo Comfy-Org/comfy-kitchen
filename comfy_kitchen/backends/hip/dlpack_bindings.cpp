@@ -37,6 +37,11 @@ int map_dtype_to_code(const nb::dlpack::dtype& dtype) {
     return -1;
 }
 
+// Defined in dlpack_bindings_gfx103x.cpp. Declared here rather than in a header
+// of its own, which is what the rest of this file does: the definition and the
+// documentation sit together, and this is the one line that has to name it.
+void register_gfx103x_ops(nb::module_& m);
+
 extern "C" {
 void launch_quantize_per_tensor_fp8_kernel(const void*, const void*, void*, int64_t, int, int,
                                            hipStream_t);
@@ -2594,4 +2599,9 @@ NB_MODULE(_C, m) {
     m.def("svdquant_lora_down", &svdquant_lora_down);
     m.def("svdquant_quantize", &svdquant_quantize);
     m.def("svdquant_gemm", &svdquant_gemm);
+
+    // RDNA2 SageAttention. Registered on every architecture -- outside __GFX10__ the
+    // kernels compile to empty bodies -- so this is a no-op on gfx11/gfx12. The
+    // gate that keeps it off a non-RDNA2 device is in the Python layer.
+    register_gfx103x_ops(m);
 }

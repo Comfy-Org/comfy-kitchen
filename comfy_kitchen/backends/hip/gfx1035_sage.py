@@ -18,15 +18,12 @@ producing wrong results.
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import os
-import sys
 from collections.abc import Sequence
 
 import torch
 
-from . import _visible_gfx_arches, _gfx_arch
+from . import _C, _stream, _visible_gfx_arches, _gfx_arch
 
 # Supported head dimensions for the ported kernels.
 _SUPPORTED_HEAD_DIMS = (64, 128)
@@ -63,34 +60,13 @@ def _load_module() -> None:
         )
         return
 
-    directory = os.path.dirname(__file__)
-    suffixes = tuple(importlib.machinery.EXTENSION_SUFFIXES)
-    path = None
-    for name in sorted(os.listdir(directory)):
-        if name.startswith("_qattn_gfx1035.") and name.endswith(suffixes):
-            path = os.path.join(directory, name)
-            break
-
-    if path is None:
-        _import_error = RuntimeError(
-            "gfx1035 sage attention: extension not built (no _qattn_gfx1035 module "
-            "in backends/hip). Rebuild with COMFY_HIP_ARCHS set to this device's RDNA2 "
-            "target, e.g. COMFY_HIP_ARCHS=gfx1035."
-        )
-        return
-
+    # The entry points live on _C with every other kernel in this backend, so there
+    # is nothing to locate: one extension, built for whichever architectures
+    # COMFY_HIP_ARCHS named, and registered whether or not this device can use it.
+    # Which device can use it is the arch gate above, and the only thing left to fail.
     try:
-        spec = importlib.util.spec_from_file_location(
-            "comfy_kitchen.backends.hip._qattn_gfx1035", path
-        )
-        if spec is None or spec.loader is None:
-            raise ImportError(f"no extension loader for {path}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["comfy_kitchen.backends.hip._qattn_gfx1035"] = module
-        spec.loader.exec_module(module)
+        from . import _C as module
     except Exception as e:  # a broken extension must not break import
-        if sys.modules.get("comfy_kitchen.backends.hip._qattn_gfx1035") is not None:
-            del sys.modules["comfy_kitchen.backends.hip._qattn_gfx1035"]
         _import_error = e
         return
 
@@ -115,12 +91,25 @@ def import_error() -> str | None:
 
 
 def _ops():
+    """The shared extension module, checked.
+
+    Named for what it returns rather than renamed outright: every call site below
+    goes through here, so the availability check stays in one place.
+    """
+    if _module is None:
+        _load_module()
     if _module is None:
         raise RuntimeError(f"gfx1035 sage attention unavailable: {_import_error}")
-    return torch.ops.comfy_kitchen_qattn_gfx1035
+    return _module
 
 
-# Mask representations, mirroring sageattn_gfx10::MaskMode in mma_gfx10.h and
+# The granularity the Q/K quantizer writes its per-block scales at: one per this
+# many keys. Mirrors sageattn_gfx103x::kQuantGroupQ / kQuantGroupK, which fix the
+# scale shapes the C++ used to derive itself.
+_QUANT_GROUP_Q = 32
+_QUANT_GROUP_K = 16
+
+# Mask representations, mirroring sageattn_gfx10::MaskMode in mma_gfx103x.h and
 # the WMMA backend's own MaskMode. The values are shared on purpose: the RDNA2
 # port reads the buffers the main HIP backend's sage_prepare_* kernels produce,
 # so a prepared mask is the same object on either backend.
@@ -185,7 +174,7 @@ def _prepare_key_mask(mask: torch.Tensor) -> torch.Tensor:
     compacted first, because slicing a stride-0 view leaves a stride-0 view and
     the producer would size the buffer from the wrong extents.
     """
-    from . import _C, _dl, _stream
+    from . import _dl
 
     mask_batch = 1 if mask.stride(0) == 0 else mask.shape[0]
     mask_heads = 1 if mask.stride(1) == 0 else mask.shape[1]
@@ -432,11 +421,6 @@ def sageattn(
             v_for_attn = v16.permute(0, 2, 1, 3).contiguous()
     else:
         v_for_attn = v if v.dtype == torch.float16 else v.half()
-    # v_scale is a placeholder the ported op's signature carries and the kernel
-    # never reads (see qk_int8_sv_bf16_attn_gfx103x_t), so there is no reason to
-    # allocate the per-32-key float buffer a quantized-V kernel would want.
-    v_scale = torch.empty(0, device=q.device, dtype=torch.float32)
-
     # smooth_k went with the mean-seq kernel it needed. Nothing in the tree set
     # it, the only caller of sageattn passes nothing, and int8_attention lists it
     # among the options it must reject, so the feature is absent from the public
@@ -475,15 +459,36 @@ def sageattn(
         b_, s_, h_, d_ = q.shape
         q_fp = q.as_strided((b_, h_, s_, d_), (s_ * h_ * d_, d_, h_ * d_, 1))
 
-    q_int8, q_scale, k_int8, k_scale = ops.quant_qk_int8(
-        q, k, k_mean, layout_code, float(sm_scale), int(skip_inq)
+    # _C has no torch in it, so every buffer is built here. The quantizer always
+    # writes packed [B, heads, seq, dim] whatever layout Q arrived in, which is why
+    # q_int8 is HND even on the NHD path.
+    kv_heads = k.size(1) if tensor_layout == "HND" else k.size(2)
+    if skip_inq:
+        # Q is quantized inside the attention kernel, so it is never materialized.
+        q_int8 = torch.empty(0, device=q.device, dtype=torch.int8)
+        q_scale = torch.empty(0, device=q.device, dtype=torch.float32)
+    else:
+        q_int8 = torch.empty(batch, q_heads, qo_len, head_dim,
+                             device=q.device, dtype=torch.int8)
+        q_scale = torch.empty(batch, q_heads,
+                              (qo_len + _QUANT_GROUP_Q - 1) // _QUANT_GROUP_Q,
+                              device=q.device, dtype=torch.float32)
+    k_int8 = torch.empty(batch, kv_heads, kv_len, head_dim,
+                         device=q.device, dtype=torch.int8)
+    k_scale = torch.empty(batch, kv_heads,
+                          (kv_len + _QUANT_GROUP_K - 1) // _QUANT_GROUP_K,
+                          device=q.device, dtype=torch.float32)
+
+    ops.gfx103x_quant_qk_int8(
+        q, k, k_mean, q_int8, q_scale, k_int8, k_scale,
+        layout_code, float(sm_scale), int(skip_inq), _stream(q),
     )
-    ops.qk_int8_sv_bf16_attn_t(
+    ops.gfx103x_qk_int8_sv_attn(
         q_int8, k_int8, v_for_attn, o,
-        q_scale, k_scale, v_scale,
+        q_scale, k_scale,
         layout_code, int(is_causal), float(sm_scale),
         q_fp if skip_inq else torch.empty(0, device=q.device, dtype=q.dtype),
-        mask_mode, mask_dtype, mask_buffer,
+        mask_mode, mask_dtype, mask_buffer, _stream(q),
     )
 
     if input_dtype == torch.float32:
@@ -546,8 +551,25 @@ def prequantize(
     k_mean = torch.empty(0, device=q.device, dtype=work_k.dtype)
     # skip_q=0: the snapshot is the whole point, so Q has to be packed here
     # rather than left for the attention pass to quantize in place.
-    q_int8, q_scale, k_int8, k_scale = ops.quant_qk_int8(
-        work_q, work_k, k_mean, 1, float(attention_scale), 0
+    #
+    # The snapshot is always HND -- layout 1 below -- and the quantizer writes
+    # packed [B, heads, seq, dim] regardless, so the shapes follow from work_q and
+    # work_k directly with no layout arithmetic to get wrong.
+    batch, q_heads, q_len, head_dim = work_q.shape
+    k_batch, kv_heads, kv_len, _ = work_k.shape
+    q_int8 = torch.empty(batch, q_heads, q_len, head_dim,
+                         device=q.device, dtype=torch.int8)
+    q_scale = torch.empty(batch, q_heads,
+                          (q_len + _QUANT_GROUP_Q - 1) // _QUANT_GROUP_Q,
+                          device=q.device, dtype=torch.float32)
+    k_int8 = torch.empty(k_batch, kv_heads, kv_len, head_dim,
+                         device=q.device, dtype=torch.int8)
+    k_scale = torch.empty(k_batch, kv_heads,
+                          (kv_len + _QUANT_GROUP_K - 1) // _QUANT_GROUP_K,
+                          device=q.device, dtype=torch.float32)
+    ops.gfx103x_quant_qk_int8(
+        work_q, work_k, k_mean, q_int8, q_scale, k_int8, k_scale,
+        1, float(attention_scale), 0, _stream(work_q),
     )
     v_fp16 = v if v.dtype == torch.float16 else v.half()
     if not v_fp16.is_contiguous():
@@ -611,16 +633,13 @@ def attend_prequantized(quantized) -> torch.Tensor:
     output_dtype = torch.float16 if quantized.input_dtype == torch.float32 \
         else quantized.input_dtype
     o = torch.empty(batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q.device)
-    v_scale = torch.empty(
-        batch, k.size(1), (kv_len + 31) // 32, device=q.device, dtype=torch.float32
-    )
     # q_fp is empty: that is how the op is told Q is already packed int8.
-    _ops().qk_int8_sv_bf16_attn_t(
+    _ops().gfx103x_qk_int8_sv_attn(
         q, k, quantized.v, o,
-        quantized.q_scale, quantized.k_scale, v_scale,
+        quantized.q_scale, quantized.k_scale,
         1, 0, float(quantized.attention_scale),
         torch.empty(0, device=q.device, dtype=torch.float16),
-        mask_mode, mask_dtype, mask_buffer,
+        mask_mode, mask_dtype, mask_buffer, _stream(q),
     )
     o = o[..., : quantized.original_head_dim]
     return o.to(torch.float32) if quantized.input_dtype == torch.float32 else o

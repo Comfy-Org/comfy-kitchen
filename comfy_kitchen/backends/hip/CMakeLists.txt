@@ -191,6 +191,7 @@ set(HIP_SOURCES
 
 set(CPP_SOURCES
     dlpack_bindings.cpp
+    dlpack_bindings_gfx103x.cpp
 )
 
 # Keep HIP compilation independent of the Python extension target. The kernels
@@ -218,6 +219,40 @@ target_include_directories(comfy_kitchen_hip_kernels PRIVATE
 )
 target_link_libraries(comfy_kitchen_hip_kernels PRIVATE hip::host)
 
+# The RDNA2 attention kernel gets its own object library because it is built with a
+# different flag set, not because it needs a different module. The kernels target
+# above adds -mno-wavefrontsize64 and compiles as gnu++20; this kernel was tuned and
+# measured under neither, and per-source options cannot remove a target's options --
+# the first attempt at this merge left both in and every masked int8-attention test
+# failed while the unmasked ones passed. The flag list below is the one the kernel
+# shipped with, reproduced exactly.
+#
+# Its objects still land in _C through target_sources below, like the WMMA kernels',
+# so a gfx1035 build produces one extension and nothing here can affect what a
+# gfx1103 or gfx1201 build emits.
+add_library(comfy_kitchen_hip_kernels_gfx103x OBJECT
+    sage_attention/sage_attn_gfx103x.hip
+)
+target_compile_options(comfy_kitchen_hip_kernels_gfx103x PRIVATE
+    $<$<COMPILE_LANGUAGE:HIP>:-O3>
+    $<$<COMPILE_LANGUAGE:HIP>:-std=c++17>
+    $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
+    $<$<COMPILE_LANGUAGE:HIP>:-fgpu-flush-denormals-to-zero>
+    $<$<COMPILE_LANGUAGE:HIP>:-fno-offload-uniform-block>
+    $<$<COMPILE_LANGUAGE:HIP>:-mllvm=--lsr-drop-solution=1>
+    $<$<COMPILE_LANGUAGE:HIP>:-mllvm=-enable-post-misched=1>
+    $<$<COMPILE_LANGUAGE:HIP>:-mllvm=-amdgpu-early-inline-all=true>
+    $<$<COMPILE_LANGUAGE:HIP>:-mllvm=-amdgpu-function-calls=false>
+    $<$<COMPILE_LANGUAGE:HIP>:-mllvm=-amdgpu-max-memory-clause=32>
+    $<$<COMPILE_LANGUAGE:HIP>:-mllvm=-amdgpu-vgpr-index-mode=1>
+)
+target_include_directories(comfy_kitchen_hip_kernels_gfx103x PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/sage_attention
+    ${_CK_HIP_GENERATED_INCLUDE_DIR}
+)
+target_link_libraries(comfy_kitchen_hip_kernels_gfx103x PRIVATE hip::host)
+
 # NOMINSIZE: nanobind_add_module() otherwise puts -Os on the whole target, which the
 # kernel object target already avoids. Keep it off the binding translation unit too.
 if(Python_VERSION VERSION_GREATER_EQUAL "3.12")
@@ -235,6 +270,10 @@ else()
 endif()
 
 target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_hip_kernels>)
+# The RDNA2 kernel's objects are attached the same way, and for the same reason: a
+# target_sources line of its own keeps them out of the source list the nanobind
+# module is built from, so a CPython-only change does not rebuild them.
+target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_hip_kernels_gfx103x>)
 
 target_compile_definitions(_C PRIVATE NB_STATIC)
 

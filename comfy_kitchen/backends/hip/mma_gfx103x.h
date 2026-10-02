@@ -17,6 +17,16 @@
 
 namespace sageattn_gfx10 {
 
+// The granularity the Q/K quantizer writes its per-block scales at, and the factor
+// that folds the softmax's base-2 conversion into Q's scale. They are defined here
+// rather than in the .hip because the tile body below reads them and this header is
+// included at file scope, above the .hip's anonymous namespace -- and because the
+// quantizer, which is not architecture-gated, needs the first two on every arch.
+// Outside the __GFX10__ guard below for exactly that reason.
+constexpr int MIN_BLK_Q = 32;
+constexpr int MIN_BLK_K = 16;
+constexpr float kLog2e = 1.4426950408889634f;
+
 typedef _Float16 v4h __attribute__((ext_vector_type(4)));
 typedef _Float16 v2h __attribute__((ext_vector_type(2)));
 
