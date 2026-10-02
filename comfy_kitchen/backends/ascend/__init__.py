@@ -19,6 +19,7 @@ from comfy_kitchen.backends._activations import (
 from comfy_kitchen.backends._activations import (
     input_act_width as _input_act_width,
 )
+from comfy_kitchen.backends.ascend.weight_cache import W4A4WeightCache
 from comfy_kitchen.backends.eager.convrot_w4a4 import quantize_signed_int4_rowwise
 from comfy_kitchen.backends.eager.svdquant import _unpack_int4_row_major
 from comfy_kitchen.constraints import (
@@ -32,6 +33,7 @@ from comfy_kitchen.registry import registry
 from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
 
 __all__ = [
+    "W4A4WeightCache",
     "convrot_w4a4_linear",
     "dequantize_int8_simple",
     "dequantize_int8_simple_dtype",
@@ -538,6 +540,8 @@ def convrot_w4a4_linear(
     convrot_groupsize: int = 256,
     quant_group_size: int = _INT4_QUANT_GROUP_SIZE,
     linear_dtype: str = "int4",
+    *,
+    weight_cache: W4A4WeightCache | None = None,
 ) -> torch.Tensor:
     """Run ConvRot W4A4 with reference preprocessing and integer accumulation.
 
@@ -555,7 +559,9 @@ def convrot_w4a4_linear(
 
     original_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-    qweight = qweight.to(device=x.device).contiguous()
+    qweight = qweight.to(device=x.device)
+    if weight_cache is None:
+        qweight = qweight.contiguous()
     hadamard = _build_hadamard(
         convrot_groupsize,
         device=x.device,
@@ -564,7 +570,11 @@ def convrot_w4a4_linear(
     rotated = _rotate_activation(x_2d, hadamard, convrot_groupsize)
     packed_x, activation_scale = quantize_signed_int4_rowwise(rotated)
     quantized_x = _unpack_int4_row_major(packed_x).contiguous()
-    quantized_weight = _unpack_int4_row_major(qweight).contiguous()
+    quantized_weight = (
+        _unpack_int4_row_major(qweight).contiguous()
+        if weight_cache is None
+        else weight_cache._unpack(qweight)
+    )
     result = torch_npu.npu_quant_matmul(
         quantized_x,
         quantized_weight.t(),

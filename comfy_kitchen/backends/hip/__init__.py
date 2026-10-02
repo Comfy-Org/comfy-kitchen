@@ -1333,6 +1333,8 @@ def convrot_w4a4_linear(
     convrot_groupsize: int = 256,
     quant_group_size: int = _INT4_GROUP_SIZE,
     linear_dtype: str = "int4",
+    *,
+    weight_cache=None,
 ) -> torch.Tensor:
     if linear_dtype not in {"int4", "int8"}:
         raise ValueError(f"ConvRot W4A4 linear_dtype must be 'int4' or 'int8', got {linear_dtype!r}")

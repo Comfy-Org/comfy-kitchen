@@ -85,6 +85,8 @@ def convrot_w4a4_linear(
     convrot_groupsize: int = 256,
     quant_group_size: int = _INT4_GROUP_SIZE,
     linear_dtype: str = "int4",
+    *,
+    weight_cache=None,
 ) -> torch.Tensor:
     """Compute ``x @ W.T + bias`` using ConvRot W4A4 int4 MMA."""
     if linear_dtype not in {"int4", "int8"}:
@@ -101,6 +103,7 @@ def convrot_w4a4_linear(
             "linear_dtype": linear_dtype,
         },
     )
+    cache_kwargs = {} if weight_cache is None else {"weight_cache": weight_cache}
     return impl(
         x,
         qweight,
@@ -109,6 +112,7 @@ def convrot_w4a4_linear(
         convrot_groupsize=convrot_groupsize,
         quant_group_size=quant_group_size,
         linear_dtype=linear_dtype,
+        **cache_kwargs,
     )
 
 
