@@ -42,22 +42,6 @@ namespace comfy::hip_backend {
 // leaves the host reference unresolved instead of declining to run. So each
 // pass gets a trapping definition, as mma.h does for the WMMA policies.
 
-// Row padding for the LDS staging buffers. The inner loops read 16 bytes at a
-// time, so every row's first byte has to be 16-byte aligned. The original
-// padding of 4 gave 68 bytes for the int8 tile (17 dwords) and 136 for the fp16
-// one (34 dwords), so every odd row landed on a 4-byte boundary -- and clang
-// still emitted ds_read_b128, which the ISA leaves undefined for a misaligned
-// address.
-//
-// 16 is what ships for the int8 tile: on the 6-CU gfx1035 it was worth 2.6x on
-// its own (0.87 -> 2.29 TOPS at 4096^3) once the persistent-grid bug below was
-// also fixed, because halving the bank conflicts on the operand reads outweighs
-// the 18% larger LDS footprint. 20 dwords still leaves a 2-way conflict on the
-// 8-lane phase, so an XOR row swizzle is the next step if this kernel is tuned
-// further. The fp16 tile uses a different padding for a different reason; see
-// kFp16Pad below.
-constexpr int kPad = 16;
-
 // INT8 VALU block tile. Defined here rather than inside the kernel so the
 // launcher in ops/gemm_int8.hip derives its grid from the same values. They were
 // independent copies of 128/64; when the kernel was retuned to 256/128 the
@@ -65,9 +49,21 @@ constexpr int kPad = 16;
 // computing a quarter of the output per block and leaving three quarters of it
 // unwritten. That is a wrong-answer bug rather than a slowdown, so the tile now
 // has exactly one definition.
-constexpr int kInt8BM = 256;
+constexpr int kInt8BM = 128;
 constexpr int kInt8BN = 128;
 constexpr int kInt8Threads = 256;
+
+// Row padding for the int8 A staging buffer, in bytes. Zero, and that is a
+// measured result rather than an oversight. There used to be a shared kPad = 16
+// here that both GEMMs used, because the inner loops read 16 bytes at a time and
+// a row-major LDS row has to start 16-byte aligned for the int4 staging store to
+// be legal -- clang emits ds_read_b128 regardless, which the ISA leaves undefined
+// for a misaligned address, so the alignment was load-bearing. The int8 tile no
+// longer needs it: B is staged chunk-major (see gemm_int8_valu_kernel), which
+// drops the constraint on B entirely, and A is better off unpadded because the
+// staging writes become one contiguous 512-byte run per warp instead of eight
+// 64-byte runs. 5.63 -> 5.97 TOPS at 12288x2048x2048 from this constant alone.
+constexpr int kInt8Pad = 0;
 
 // Row padding for the fp16 tile. The inner loop reads 16 bytes at a time and a
 // row's byte offset is 2 * (row * STRIDE + k), so STRIDE must be a multiple of 8
@@ -82,89 +78,117 @@ constexpr int kFp16Pad = 8;
 
 // ===========================================================================
 // INT8 GEMM (triple-buffered): C[M, N] = A[M, K] @ B[N, K]^T
-// Triple buffering hides DRAM load latency by overlapping prefetch with compute.
-// With double buffering, the __syncthreads between prefetch and compute serialized
-// them, leaving DRAM latency unhidden. Triple buffering issues the load for tile k+1
-// BEFORE computing tile k, so the load overlaps with the compute.
+// Thread tile 16x4 over a 128x128 block, 256 threads, BK 64, double buffered.
 //
-// Thread tile is 16x8 over a 256x128 block, still 256 threads (16 rows x 32 cols
-// of threads), double buffered.
+// This replaces 16x8/256x128, which the previous sweep had chosen. It is 1.45x
+// faster on the real dispatch mix and it overtakes triton, which 16x8 did not.
 //
-// This replaces 8x4/128x64 triple-buffered, which the earlier sweep had chosen on
-// cubic shapes. The real workloads are not cubic: the dispatch trace of one step
-// at 1024x1536 with B=2 issues M=12288 or M=3072 with K/N of 1280, 2048, 640,
-// 8192, and 74% of the int8 GEMM time sits in three M=12288 shapes. Re-measured
-// there, 16x8/256x128 is 1.30-1.37x faster than 8x4/128x64 on every one of them,
-// output verified bit-exact against a host reference in double:
+// What changed the conclusion is the register file, not the arithmetic. The
+// device code for 16x8 was disassembled out of the .pyd's .hip_fat section (the
+// section is named .hip_fat, not .hip_fatbin, and it holds 90 embedded AMDGPU
+// ELF objects -- llvm-objdump reads one of those fine, it just cannot read them
+// out of the fat binary itself). Its inner loop is 2048 v_dot4_i32_i8 against 96
+// ds_read_b128, i.e. 21.33 dot4 per LDS read, which is 4*TM*TN/(TM+TN) for a
+// 16x8 tile exactly. Triton's is 10.04. So triton was doing *half* our MAC per LDS
+// read and still winning by 1.5x, which rules out both the LDS read rate and
+// arithmetic intensity as the binding constraint.
 //
-//   M     N     K    8x4/128x64   16x8/256x128   speedup   triton
-//   12288 2048 2048   2.93 TOPS     4.02 TOPS      1.37x    4.89
-//   12288 2048 8192   2.94          4.04           1.37x    4.93
-//   12288 8192 2048   2.97          4.00           1.35x    5.22
-//   3072  10240 1280  2.90          4.12           1.42x    5.33
-//   4096  4096 4096   2.94          3.93           1.34x    4.90
+// -Rpass-analysis=kernel-resource-usage is what settled it. gfx10 has a 512-entry
+// register file per SIMD and allocates it in whole waves, so waves/SIMD is
+// floor(512 / VGPRs) with no partial credit, and the value is piecewise constant:
 //
-// The mechanism is MACs per LDS read: for a TM x TN tile on v_dot4c_i32_i8 that
-// is 16*TM*TN/(TM+TN), so 8x4 gives 42.7 and 16x8 gives 53.3. Arithmetic issue
-// rate is not the limit (dot4 and fp32 FMA time the same) and DRAM is not either
-// (35-43 GB/s against a measured 89.7 GB/s ceiling), so the LDS read rate is
-// what the tile has to amortise over.
+//   16x8 /256x128  128 accumulators   VGPR 214   2 waves/SIMD   3.97 TOPS
+//   16x4 /128x128   64 accumulators   VGPR 154   3 waves/SIMD   5.97 TOPS
+//   8x8  /256x128   64 accumulators   VGPR 125   4 waves/SIMD   2.75 TOPS
+//   8x4  /128x64    32 accumulators   VGPR  97   5 waves/SIMD   3.48 TOPS
+//   16x16/256x256  256 accumulators   VGPR 256   1 wave/SIMD    0.72 TOPS
 //
-// Two rejected alternatives, both measured, both worth keeping out of the tree:
-//   * 16x8/128x128 keeps the 2.90 TOPS class (3.64-3.85) -- it is the block tile
-//     width, not the thread tile, that carries the rest of the gain.
-//   * 16x16 needs BM*BN coverable by 256 threads, which forces either a 128x256
-//     block (LDS 60 KiB, fits) at 128 threads or a 256x256 block, and the latter
-//     only fits at BK=32. Both were measured and both are far worse: 0.52 TOPS
-//     at 128 threads, 0.72 at 256 threads with BK=32, 1.16 with BK=16 and four
-//     buffers. The cause is register spilling, not LDS, and the compiler reports
-//     it directly under -Rpass-analysis=kernel-resource-usage:
+// triton's own autotune configs land at n_regs = 126..128, i.e. 4 waves/SIMD, for
+// the ones that win. It reaches 4 waves with 128x128 block tiles and 4 or 8 warps.
+// 128 int32 accumulators cannot fit under 128 VGPRs at all, so no amount of
+// scheduling work makes 16x8 reach 4 waves; the accumulator count is what has to
+// come down. The last row is why: past 128 accumulators it spills to scratch and
+// collapses.
 //
-//       8x4  /128x64  32 accumulators   VGPR 228   scratch 0    spill   0   2.95 TOPS
-//       16x8 /256x128 128 accumulators  VGPR 232   scratch 0    spill   0   4.01 TOPS
-//       16x16/256x256 256 accumulators  VGPR 256   scratch 712  spill 332   0.72 TOPS
+// Occupancy is not the whole story either, because the two 64-accumulator tiles
+// differ by 2.2x despite both reaching at least 3 waves. Two things separate
+// 16x4 from 8x8:
 //
-//     A 16x16 int32 accumulator tile needs 256 VGPRs and the architecture grants
-//     128 per thread, so 332 spill to scratch and the inner loop becomes bound by
-//     local-memory traffic -- 712 bytes per lane per k-tile. 16x8 sits exactly at
-//     the 128 budget with zero spill, which is why it is the optimum rather than
-//     a compromise. 32x8, 16x32 and 8x32 were measured for the same reason and
-//     are worse still (0.24-0.70 TOPS).
+//   * Wave count within a block. 512 threads is 16 waves on 4 SIMDs; at 4
+//     waves/SIMD that is exactly one resident block and 3 of every 4 waves never
+//     run. The 4-wave configs at 512 threads all measured badly (8x8 at 512 is
+//     2.19-2.75 TOPS, worse than any 256-thread entry). Occupancy is worth having
+//     only if the block is small enough that several fit.
+//   * Bank conflicts, which is what the B layout below is for.
 //
-//     So triton's 10.04 dot4-per-LDS-read is not a 16x16 thread tile. Its ratio
-//     is what a 16x8 tile reaches with a wider k-unroll, and the ceiling here is
-//     the register file, not the LDS budget.
-//   * widening the k-unroll was tried too, on the theory that more dot4 per LDS
-//     read is free once the accumulators fit. It is not: 16x8/128x128 at BK=96
-//     drops to 2.41 TOPS from 3.73 at BK=64, because the LDS row grows with BK
-//     and the wider row costs more than the extra unroll buys. BK=128 does not fit
-//     at two buffers anywhere (2*(BM+BN)*144 exceeds 64 KiB for both 256x64 and
-//     128x128) and a single buffer cannot overlap a load with compute. So BK=64
-//     stands, and 16x8/256x128/K64 is the measured optimum, not a stopping point.
+// Measured on the real shapes, 16x8/256x128 -> 16x4/128x128, output verified
+// bit-exact against a host reference in double on every entry:
+//
+//   M       N      K     16x8/256x128   16x4/128x128   ratio   triton
+//   12288  2048   2048     3.97 TOPS       5.97 TOPS    0.67x    4.89
+//   12288  2048   8192     4.06            5.91         0.69x    4.93
+//   12288  8192   2048     3.97            4.60         0.86x    5.22
+//   3072   10240  1280     4.23            6.09         0.69x    5.33
+//   3072   1280   1280     4.28            6.26         0.68x      -
+//   4096   4096   4096     4.05            5.79         0.70x    4.90
+//
+// Weighted by call count from the dispatch trace that is 0.65x. The one weak
+// shape is 12288x8192x2048, where N is large and M/BM is 96, so A is re-read
+// 64 times; 32x2/128x128 and a third buffer both do better there (5.08 and 5.01)
+// if that shape ever dominates, but neither is better anywhere else.
+//
+// Two things that look like they should help and do not:
+//
+//   * Capping the k-chunk unroll does nothing for 16x8: at KU=1/2/4 the compiler
+//     reports 234/213/214 VGPRs, all 2 waves. For 64 accumulators it is worth a
+//     lot (8x8 goes 178 -> 138), so the hoisting is real but 128 accumulators
+//     dominate it.
+//   * 16x16 is still out. 256 accumulators needs 256 VGPRs, the architecture
+//     grants 128 per thread, 332 spill to scratch, and the inner loop becomes
+//     bound by 712 bytes per lane per k-tile of local-memory traffic.
+//
+// B is staged chunk-major rather than row-major, and that is the second half of
+// the 5.63 -> 5.97. On gfx10 a 16-byte lane read is serviced in phases of 8
+// lanes, since 8 x 16 B = 128 B is the whole 32-bank array, and a phase is
+// conflict-free only when those 8 addresses are 16 B apart -- TN * STRIDE must be
+// 16 (mod 128). Row-major cannot satisfy that at any pitch that also keeps the
+// int4 staging store 16-byte aligned, so padding only trades 8-way for 4-way:
+// measured 5.63 at pad 16, 4.50 at pad 0, 3.81 at pad 32, 4.84 at pad 48, 3.79
+// at pad 64. Storing chunk c of row r at (c * BN + r) * 16 instead makes
+// consecutive lanes consecutive 16-byte addresses with no constraint on the pitch
+// at all, and drops the B footprint's padding term. The A side needs no change:
+// with TX = 32 the whole warp shares trow and therefore shares the A address, and
+// an LDS broadcast is free.
 //
 // The grid is one block per tile, NOT a persistent walk -- see the note on why
 // the persistent variant was deleted.
 // ===========================================================================
 
 template <typename OutT>
-__global__ __launch_bounds__(256) void gemm_int8_valu_kernel(
+__global__ __launch_bounds__(kInt8Threads) void gemm_int8_valu_kernel(
     const int8_t* __restrict__ A, const int8_t* __restrict__ B,
     EpiRowwise epi,
     OutT* __restrict__ C,
     int M, int N, int K, int ldc) {
 
     constexpr int TM = 16;     // rows per thread
-    constexpr int TN = 8;      // cols per thread
+    constexpr int TN = 4;      // cols per thread
     constexpr int BM = kInt8BM;
     constexpr int BN = kInt8BN;
     constexpr int BK = 64;
     constexpr int THREADS = kInt8Threads;
-    constexpr int STRIDE = BK + kPad;
+    constexpr int STRIDE = BK + kInt8Pad;
+    constexpr int VPR = BK / 16;          // 16-byte chunks per row per k-tile
+    constexpr int CHUNKS = BK / 16;
     constexpr int A_SIZE = BM * STRIDE;
-    constexpr int B_SIZE = BN * STRIDE;
-    // Double buffered: 2 * (256 + 128) * 80 = 61440 B, just inside the 64 KiB
-    // per-block limit. A third buffer would be 92160 and would be demoted to local
-    // memory by the compiler without any error being reported.
+    // B is staged chunk-major: B_buf[buf][chunk * BN + row][0..15]. See the note
+    // on the layout below for why that is worth 6% and why padding cannot achieve
+    // the same thing. Its footprint has no padding term at all.
+    constexpr int B_SIZE = BN * BK;
+    // Double buffered: 2 * (128*64 + 128*64) = 32768 B, half the 64 KiB per-block
+    // limit. A third buffer would be 49152 and does fit, but measured 5.06 TOPS
+    // against 5.97 for two at 12288x2048x2048: the third slice is 16 KiB of LDS
+    // per block resident for prefetch distance the hardware does not repay.
     constexpr int NBUFFERS = 2;
     static_assert((BM / TM) * (BN / TN) == THREADS,
                   "thread tile and block tile must cover the block exactly");
@@ -174,11 +198,16 @@ __global__ __launch_bounds__(256) void gemm_int8_valu_kernel(
     // 90 KiB). Assert the footprint rather than trusting it.
     static_assert(NBUFFERS * (A_SIZE + B_SIZE) <= 64 * 1024,
                   "int8 LDS footprint exceeds 64 KiB and will spill to local");
+    // Chunk-major B is addressed as (chunk * BN + row) * 16, so it needs BN and
+    // 16-byte granularity, nothing else. Row-major would need STRIDE % 16 == 0 for
+    // the int4 staging store, which is what kInt8Pad used to have to guarantee.
+    static_assert((BN * 16) % 16 == 0 && VPR == CHUNKS, "chunk-major B layout");
 
     __shared__ int8_t A_buf[NBUFFERS][A_SIZE];
     __shared__ int8_t B_buf[NBUFFERS][B_SIZE];
 
     const int tid = threadIdx.x;
+    // TX = 32 puts one warp entirely inside one row-group, which matters below.
     const int trow = tid / (BN / TN);
     const int tcol = tid % (BN / TN);
     const int orow = trow * TM;
@@ -188,27 +217,31 @@ __global__ __launch_bounds__(256) void gemm_int8_valu_kernel(
     const int n0 = blockIdx.x * BN;
 
     int acc[TM][TN] = {};
-    const int chunks = BK / 16;
 
-    // Helper: load a tile from global to shared memory buffer
+    // Helper: load a tile from global to shared memory buffer.
+    //
+    // Out-of-range elements are written as zero rather than skipped, so the compute
+    // loop needs no mask: a K that is not a multiple of BK or 16 still produces the
+    // right answer, which matters because these weights come from a checkpoint
+    // whose K is whatever the layer happened to have.
     auto load_tile = [&](int buf_idx, int k0) {
-        for (int i = tid; i < BM * chunks; i += THREADS) {
-            const int r = i / chunks;
-            const int c = i % chunks;
+        for (int i = tid; i < BM * VPR; i += THREADS) {
+            const int r = i / VPR;
+            const int c = i % VPR;
             const int gk = k0 + c * 16;
             int4 val = make_int4(0, 0, 0, 0);
             if (m0 + r < M && gk + 15 < K)
                 val = *reinterpret_cast<const int4*>(A + (m0 + r) * K + gk);
             *reinterpret_cast<int4*>(&A_buf[buf_idx][r * STRIDE + c * 16]) = val;
         }
-        for (int i = tid; i < BN * chunks; i += THREADS) {
-            const int r = i / chunks;
-            const int c = i % chunks;
+        for (int i = tid; i < BN * VPR; i += THREADS) {
+            const int r = i / VPR;
+            const int c = i % VPR;
             const int gk = k0 + c * 16;
             int4 val = make_int4(0, 0, 0, 0);
             if (n0 + r < N && gk + 15 < K)
                 val = *reinterpret_cast<const int4*>(B + (n0 + r) * K + gk);
-            *reinterpret_cast<int4*>(&B_buf[buf_idx][r * STRIDE + c * 16]) = val;
+            *reinterpret_cast<int4*>(&B_buf[buf_idx][(c * BN + r) * 16]) = val;
         }
     };
 
@@ -219,18 +252,23 @@ __global__ __launch_bounds__(256) void gemm_int8_valu_kernel(
     // output column. Written as a nest over the compile-time TM/TN/4 rather
     // than spelled out per (row, col, field) -- the compiler unrolls all three
     // loops, so this is the same v_dot4_i32_i8 sequence the flat version emitted.
+    //
+    // The chunk loop is "#pragma unroll 1": one 16-byte k-chunk's worth of
+    // av/bv is live at a time instead of all four. That is what keeps the
+    // register file from deciding the occupancy -- see the note on the tile.
     auto compute_tile = [&](int buf_idx) {
         const int8_t* Ac = &A_buf[buf_idx][0];
         const int8_t* Bc = &B_buf[buf_idx][0];
-        #pragma unroll
-        for (int k = 0; k < BK; k += 16) {
+        #pragma unroll 1
+        for (int c = 0; c < CHUNKS; ++c) {
+            const int k = c * 16;
             int4 av[TM], bv[TN];
             #pragma unroll
             for (int i = 0; i < TM; ++i)
                 av[i] = *reinterpret_cast<const int4*>(&Ac[(orow + i) * STRIDE + k]);
             #pragma unroll
             for (int j = 0; j < TN; ++j)
-                bv[j] = *reinterpret_cast<const int4*>(&Bc[(ocol + j) * STRIDE + k]);
+                bv[j] = *reinterpret_cast<const int4*>(&Bc[(c * BN + ocol + j) * 16]);
             #pragma unroll
             for (int i = 0; i < TM; ++i) {
                 #pragma unroll
