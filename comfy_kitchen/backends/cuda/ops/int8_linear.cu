@@ -1313,6 +1313,8 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     }
 }
 
+#include "convrot_register.cuh"
+
 } // namespace
 
 } // namespace comfy
@@ -1639,6 +1641,46 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
     }
     if (act_code == comfy::kActRmsNorm && act_weight == nullptr) {
         throw std::runtime_error("convrot64 fused kernel: rms_norm activation requires a weight");
+    }
+
+    // Narrow SM120 specialization; all other contracts retain the existing
+    // launcher. Cache properties per host thread, including device switches.
+    if (input_dtype_code == 2 && !stochastic && act_code == comfy::kActNone &&
+        (num_cols == 5376 || num_cols == 7168) && num_rows <= INT_MAX &&
+        (reinterpret_cast<uintptr_t>(input) & 15u) == 0 &&
+        (reinterpret_cast<uintptr_t>(output) & 7u) == 0) {
+        int device = -1;
+        static thread_local int cached_device = -1;
+        static thread_local bool is_sm120 = false;
+        cudaError_t query_error = cudaGetDevice(&device);
+        if (query_error != cudaSuccess) {
+            throw std::runtime_error(std::string("ConvRot device query failed: ") + cudaGetErrorString(query_error));
+        }
+        if (device != cached_device) {
+            int major = 0, minor = 0;
+            query_error = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+            if (query_error == cudaSuccess)
+                query_error = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+            if (query_error != cudaSuccess)
+                throw std::runtime_error(std::string("ConvRot device query failed: ") + cudaGetErrorString(query_error));
+            is_sm120 = major == 12 && minor == 0;
+            cached_device = device;
+        }
+        if (is_sm120) {
+            if (num_cols == 5376) {
+                comfy::register_rotate_quant<5376><<<num_rows, 192, 0, stream>>>(
+                    static_cast<const nv_bfloat16*>(input), static_cast<int8_t*>(output),
+                    static_cast<float*>(scales));
+            } else {
+                comfy::register_rotate_quant<7168><<<num_rows, 224, 0, stream>>>(
+                    static_cast<const nv_bfloat16*>(input), static_cast<int8_t*>(output),
+                    static_cast<float*>(scales));
+            }
+            const cudaError_t error = cudaGetLastError();
+            if (error != cudaSuccess)
+                throw std::runtime_error(std::string("CUDA register ConvRot failed: ") + cudaGetErrorString(error));
+            return;
+        }
     }
 
     DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {

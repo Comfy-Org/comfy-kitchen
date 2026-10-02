@@ -1,0 +1,7 @@
+{
+  "baseline_commit": "19ea55b9ebdaf77942dab36223e1222009d3ce11",
+  "files": {
+    "comfy_kitchen/backends/cuda/ops/int8_linear.cu": "42f39b5b5c4964ff01efa15f203102bd5b4bc370c28d81a464185bfbcd7b8581",
+    "comfy_kitchen/backends/cuda/ops/convrot_register.cuh": "dc4a4707468c70d51401fa605450e240766b50435ce234e40789404340c935a4"
+  }
+}
