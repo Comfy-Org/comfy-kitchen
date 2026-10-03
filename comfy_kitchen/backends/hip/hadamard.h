@@ -72,9 +72,63 @@ inline int convrot_max_k(int in_dtype, int block_threads = 256) {
     return static_cast<int>((static_cast<size_t>(lds) - static_lds) / element_size);
 }
 
+// Block-thread override for A/B measurement only: COMFY_CONVROT_BLOCK=<n>.
+// 0 / unset means "use the heuristic below".
+//
+// Same reasoning as COMFY_GEMM_TILE in gemm_wmma.h: the block shape has to be
+// sweepable from inside one process, because the cold-clock ramp on this device
+// (measured 1.9x on the first GEMM of a process) is larger than the differences
+// being chased. Read per call so one process can interleave every block size
+// under the same clocks.
+inline int comfy_convrot_block_override() {
+    const char* s = getenv("COMFY_CONVROT_BLOCK");
+    if (!s || !*s) return 0;
+    const int v = atoi(s);
+    return (v > 0 && (v % 64) == 0) ? v : 0;
+}
+
 inline int convrot_quant_fused_block_threads(int M, int K) {
+    if (const int ov = comfy_convrot_block_override(); ov > 0) {
+        return ov;
+    }
     if (M == 1) {
         return 512;
+    }
+    // The small RDNA3 iGPU, retuned on the shape count the workload really has.
+    //
+    // The previous heuristic keyed off K alone (512 for K<=4096, a few special
+    // cases above that) and therefore could not see the quantity that actually
+    // decides this kernel's shape: **how many 256-wide Hadamard groups the row
+    // has**. BLOCK_THREADS/64 subgroups each own one group, so BLOCK_THREADS is
+    // "groups in flight" and a block wider than the row's group count simply
+    // leaves threads idle -- K=1280 has 5 groups and was being launched with
+    // 8 groups' worth of threads.
+    //
+    // Measured on the 6-WGP 780M, same-process interleaved (ck_tools/
+    // ck_convrot_ab.py), 4 rounds x 6 iters, M in {512, 2048, 8192, 18432} and
+    // K in {1280, 2048, 2560, 5120, 8192}. Best block and its gain over the old
+    // heuristic, per K, agreed across **every** M:
+    //
+    //   K=1280 (5 groups)   64   1.14x .. 1.88x   -> 44-51 GB/s, was 23-31
+    //   K=2048 (8 groups)   64   1.02x .. 1.26x   -> 45-47 GB/s
+    //   K=2560 (10 groups)  64   1.10x .. 1.18x   -> 45-46 GB/s
+    //   K=5120 (20 groups)  256  1.32x .. 1.45x   -> 44-45 GB/s
+    //   K=8192 (32 groups)  256  1.03x .. 1.04x
+    //
+    // Why the split: the rotated row lives in LDS (K * sizeof(RowT)) and the
+    // transform scratch is BLOCK_THREADS/64 * 2 KB, so a wide block costs LDS
+    // *proportional to its width* on top of the row. For a short row that
+    // overhead dwarfs the work -- at K=1280 a 512-thread block asks for 18.9 KB
+    // of LDS to move 2.5 KB of data, and only ~3 blocks fit per WGP against ~14
+    // for a 64-thread block. Past K~2560 the row itself dominates the footprint
+    // and the trade flips back toward width, because the block then has enough
+    // independent groups to hide latency inside itself.
+    //
+    // Note this is the **activation** quantizer, which is 7-56% of every
+    // convrot=True int8_linear call, so it is not a rounding error even though
+    // the GEMM it feeds is already at the machine ceiling.
+    if (comfy_small_igpu()) {
+        return (K / kConvRotGroup256) <= 10 ? 64 : 256;
     }
     if (K == kConvRotGroup256) {
         return 64;
@@ -88,12 +142,6 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
     // Empirical block-size tuning for K=10240 (640 over default).
     if (K == 10240) {
         return 640;
-    }
-    // K <= 4096: a 512-thread block (8 groups in flight) beats the 1024-thread
-    // default on the 6-WGP 780M, which halves occupancy on K=2048/2880 rows and
-    // leaves half the subgroups idle. dGPUs keep 1024.
-    if (comfy_small_igpu() && K <= 4096) {
-        return 512;
     }
     return 1024;
 }
@@ -194,10 +242,23 @@ inline void dispatch_convrot_row_type(int in_dtype, Fn fn) {
 }
 
 // Pick fused-kernel block width from convrot_quant_fused_block_threads().
+//
+// Only these widths are instantiated, so anything else has to land on one of
+// them. The previous `else -> 1024` was a **silent** fallback: a sweep that asked
+// for 128/192/256/320/384/448 got 1024 for every one of them and reported a flat
+// plateau, which reads exactly like "block size does not matter between 128 and
+// 448". Round to the nearest instantiated width instead, and keep the ladder in
+// sync with the callers below.
+constexpr int kConvrotFusedBlockLadder[] = {64, 128, 256, 512, 640, 768, 1024};
+
 template <typename Fn>
 inline void dispatch_convrot_fused_block_threads(int block_threads, Fn fn) {
     if (block_threads == 64) {
         fn.template operator()<64>();
+    } else if (block_threads == 128) {
+        fn.template operator()<128>();
+    } else if (block_threads == 256) {
+        fn.template operator()<256>();
     } else if (block_threads == 512) {
         fn.template operator()<512>();
     } else if (block_threads == 640) {
