@@ -61,6 +61,15 @@ if getattr(torch.version, "hip", None):
 else:
     registry.mark_unavailable("hip", "PyTorch ROCm/HIP runtime not available")
 
+# Apple GPUs: a weight-only Metal backend, preferred over eager where it registers.
+if torch.backends.mps.is_available():
+    from .backends import mps as _mps_backend  # noqa: F401
+
+    if registry.is_available("mps"):
+        registry.set_priority(["mps", *[b for b in registry._priority if b != "mps"]])
+else:
+    registry.mark_unavailable("mps", "PyTorch MPS runtime not available")
+
 __all__ = [
     # Normalization
     "adaln",
