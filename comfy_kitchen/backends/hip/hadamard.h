@@ -20,6 +20,8 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "launchers.h"  // comfy_small_igpu
+
 namespace comfy::hip_backend {
 
 // convrot_quant_kernel handles 256/G groups per pass and rotates in log4(G)
@@ -70,9 +72,69 @@ inline int convrot_max_k(int in_dtype, int block_threads = 256) {
     return static_cast<int>((static_cast<size_t>(lds) - static_lds) / element_size);
 }
 
+// Block-thread override for the **legacy** (non-fused) ConvRot quantizer, which
+// is what INT8 G=64 and the INT4 paths use: COMFY_CONVROT_LEGACY_BLOCK=<n>.
+// Unset means "use the heuristic below".
+//
+// This exists only because that path has no width tuning worth trusting (see the
+// note at its dispatch) and a rebuild-per-width sweep cannot be trusted on this
+// device: the first GEMM after a rebuild runs on cold clocks, measured at 1.9x,
+// which is larger than the effect. Read per call so one process can interleave
+// every width under the same clocks.
+inline int comfy_convrot_legacy_block_override() {
+    const char* s = getenv("COMFY_CONVROT_LEGACY_BLOCK");
+    if (!s || !*s) return 0;
+    const int v = atoi(s);
+    return (v == 64 || v == 128 || v == 256 || v == 512 || v == 1024) ? v : 0;
+}
+
 inline int convrot_quant_fused_block_threads(int M, int K) {
     if (M == 1) {
         return 512;
+    }
+    // The small RDNA3 iGPU, retuned on the shape count the workload really has.
+    //
+    // The previous heuristic keyed off K alone (512 for K<=4096, a few special
+    // cases above that) and therefore could not see the quantity that actually
+    // decides this kernel's shape: **how many 256-wide Hadamard groups the row
+    // has**. BLOCK_THREADS/64 subgroups each own one group, so BLOCK_THREADS is
+    // "groups in flight" and a block wider than the row's group count simply
+    // leaves threads idle -- K=1280 has 5 groups and was being launched with
+    // 8 groups' worth of threads.
+    //
+    // Measured on the 6-WGP 780M, same-process interleaved (ck_tools/
+    // ck_convrot_ab.py), 4 rounds x 6 iters, M in {512, 2048, 8192, 18432} and
+    // K in {1280, 2048, 2560, 5120, 8192}. Best block and its gain over the old
+    // heuristic, per K, agreed across **every** M:
+    //
+    //   K=1280 (5 groups)   64   1.14x .. 1.88x   -> 44-51 GB/s, was 23-31
+    //   K=2048 (8 groups)   64   1.02x .. 1.26x   -> 45-47 GB/s
+    //   K=2560 (10 groups)  64   1.10x .. 1.18x   -> 45-46 GB/s
+    //   K=5120 (20 groups)  256  1.32x .. 1.45x   -> 44-45 GB/s
+    //   K=8192 (32 groups)  256  1.03x .. 1.04x
+    //
+    // Why the split: the rotated row lives in LDS (K * sizeof(RowT)) and the
+    // transform scratch is BLOCK_THREADS/64 * 2 KB, so a wide block costs LDS
+    // *proportional to its width* on top of the row. For a short row that
+    // overhead dwarfs the work -- at K=1280 a 512-thread block asks for 18.9 KB
+    // of LDS to move 2.5 KB of data, and only ~3 blocks fit per WGP against ~14
+    // for a 64-thread block. Past K~2560 the row itself dominates the footprint
+    // and the trade flips back toward width, because the block then has enough
+    // independent groups to hide latency inside itself.
+    //
+    // Note this is the **activation** quantizer, which is 7-56% of every
+    // convrot=True int8_linear call, so it is not a rounding error even though
+    // the GEMM it feeds is already at the machine ceiling.
+    //
+    // Re-measure with ck_tools/ck_convrot_ab.py before changing it. That script
+    // A/Bs every block width in one process; a rebuild-per-width sweep cannot be
+    // trusted here, because the first GEMM after a rebuild runs on cold clocks on
+    // this device (measured 1.9x), which is larger than the differences being
+    // chased. Only {64, 128, 256, 512, 640, 768, 1024} are instantiated, and
+    // anything else silently becomes 1024 -- which reads, in a sweep, exactly
+    // like "block width does not matter".
+    if (comfy_small_igpu()) {
+        return (K / kConvRotGroup256) <= 10 ? 64 : 256;
     }
     if (K == kConvRotGroup256) {
         return 64;
@@ -186,10 +248,21 @@ inline void dispatch_convrot_row_type(int in_dtype, Fn fn) {
 }
 
 // Pick fused-kernel block width from convrot_quant_fused_block_threads().
+//
+// These are the widths the kernel is instantiated at. 128 and 256 used to be
+// absent and fell through to the 1024 arm: a sweep asking for 128/192/256/320/
+// 384/448 therefore measured 1024 seven times and reported a flat plateau, which
+// reads exactly like "block width does not matter between 128 and 448". Both are
+// now real instantiations, and both are what convrot_quant_fused_block_threads
+// can actually return on the small iGPU (64 and 256).
 template <typename Fn>
 inline void dispatch_convrot_fused_block_threads(int block_threads, Fn fn) {
     if (block_threads == 64) {
         fn.template operator()<64>();
+    } else if (block_threads == 128) {
+        fn.template operator()<128>();
+    } else if (block_threads == 256) {
+        fn.template operator()<256>();
     } else if (block_threads == 512) {
         fn.template operator()<512>();
     } else if (block_threads == 640) {
@@ -656,6 +729,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
         scaleout[row] = scale;
     }
 
+    // Quantize the rotated row out of LDS and write one int8 per element.
     for (int col = tid; col < K; col += BLOCK_THREADS) {
         const float v = load_row_value(row_buf[col]);
         int q = static_cast<int>(rintf(v * inv));
@@ -887,13 +961,57 @@ inline void launch_convrot_quant(
     // INT4 G=256 with K>=512: 1024-thread blocks process 4 Hadamard groups/pass
     // (15->4 passes at K=3840). INT8 G=256 returns above. Smaller configs keep
     // 256 threads for occupancy on narrow K.
-    const int block_threads = (group_size == 256 && K >= 512) ? 1024 : 256;
-    if (block_threads == 1024) {
-        launch_convrot_quant_for_block<PACK_INT4, ACT, 1024>(
-            x, in_dtype, qout, scaleout, M, K, group_size, stream);
+    //
+    // **INT8 G=64** also lands here, because the fused kernel above is written for
+    // 256-wide groups. It was the last clearly mis-tuned kernel the workload still
+    // spends time in: 256 threads measured 22 GB/s while the fused G=256 path
+    // reaches 36-42, because at G=64 a 256-thread block asks for four groups' worth
+    // of scratch to move one group's worth of work and most of the block sits out
+    // the loop. 64 threads is exactly one group, so every thread works every pass.
+    //
+    // Measured on gfx1103, same-process interleaved (ck_tools/
+    // ck_legacy_convrot_ab.py), forward and reverse rotation:
+    //
+    //   M8192  K640  (SDXL level-2 qkv/out)  0.714 -> 0.487 ms  1.465x  22 -> 32 GB/s
+    //   M18432 K1280 (SDXL 1536px level-2)   2.775 -> 2.357 ms  1.177x
+    //   M4608  K1280 (SDXL 1536px qkv/out)   0.703 -> 0.625 ms  1.125x
+    //   M8192  K2048                          2.020 -> 2.011 ms  1.004x
+    //   M2048  K1280                          0.306 -> 0.307 ms  0.996x
+    //
+    // i.e. a clear win where the row is long and a tie where it is short, never a
+    // loss outside noise. Scoped to !PACK_INT4 so the INT4 widths above, which were
+    // tuned separately, keep theirs.
+    int block_threads;
+    if constexpr (!PACK_INT4) {
+        block_threads = (group_size == 64) ? 64
+                        : (group_size == 256 && K >= 512) ? 1024 : 256;
     } else {
-        launch_convrot_quant_for_block<PACK_INT4, ACT, 256>(
-            x, in_dtype, qout, scaleout, M, K, group_size, stream);
+        block_threads = (group_size == 256 && K >= 512) ? 1024 : 256;
+    }
+    if (const int ov = comfy_convrot_legacy_block_override(); ov > 0) {
+        block_threads = ov;
+    }
+    switch (block_threads) {
+        case 64:
+            launch_convrot_quant_for_block<PACK_INT4, ACT, 64>(
+                x, in_dtype, qout, scaleout, M, K, group_size, stream);
+            break;
+        case 128:
+            launch_convrot_quant_for_block<PACK_INT4, ACT, 128>(
+                x, in_dtype, qout, scaleout, M, K, group_size, stream);
+            break;
+        case 512:
+            launch_convrot_quant_for_block<PACK_INT4, ACT, 512>(
+                x, in_dtype, qout, scaleout, M, K, group_size, stream);
+            break;
+        case 1024:
+            launch_convrot_quant_for_block<PACK_INT4, ACT, 1024>(
+                x, in_dtype, qout, scaleout, M, K, group_size, stream);
+            break;
+        default:
+            launch_convrot_quant_for_block<PACK_INT4, ACT, 256>(
+                x, in_dtype, qout, scaleout, M, K, group_size, stream);
+            break;
     }
 }
 

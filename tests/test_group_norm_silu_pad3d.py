@@ -96,7 +96,13 @@ class TestGroupNormSiluPad3d:
         if not cuda_available:
             pytest.skip("CUDA required")
         x = torch.randn(1, 64, 3, 8, 8, dtype=torch.float16, device="cuda")
-        for backend in ("cuda", "eager"):
+        # The compiled extension is "cuda" on a CUDA build and "hip" on ROCm,
+        # where PyTorch still reports the device as "cuda". Ask the registry
+        # which of them is present instead of naming one.
+        compiled = [name for name in ("cuda", "hip")
+                    if ck.list_backends().get(name, {}).get("available", False)]
+        assert compiled, "no compiled backend available"
+        for backend in [*compiled, "eager"]:
             for kwargs in ({}, {"out": torch.empty_like(x)}):
                 with ck.use_backend(backend), pytest.raises(ValueError, match="non-negative"):
                     ck.group_norm_silu_pad3d(x, None, None, 1, 0.0, (0, 0, 0, 0, -1), silu=False, **kwargs)

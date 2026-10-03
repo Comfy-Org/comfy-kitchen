@@ -14,6 +14,9 @@ from .backends import cuda as _cuda_backend
 from .backends.eager.quantization import DTYPE_TO_CODE
 
 if getattr(torch.version, "hip", None):
+    # One module holds both sage attention implementations: sage_int8_sdpa and
+    # friends for a GPU with matrix cores, rdna2_sageattn and friends for RDNA2,
+    # which has none. Which one runs is an arch test, not an import.
     from .backends import hip as _hip_backend
 else:
     _hip_backend = None
@@ -143,6 +146,13 @@ def is_available(device: torch.device | None = None) -> bool:
         # something SM-shaped for a gfx part, so the compute capability test
         # below would wave AMD hardware through to a CUDA extension that never
         # loaded. Ask the HIP backend instead.
+        #
+        # RDNA2 (gfx103x) has no matrix cores, so the WMMA path declines it.
+        # The ported RDNA2 kernel covers gfx1035 instead; it is gated on the
+        # architecture in hip.rdna2_is_available, so this cannot leak onto
+        # a gfx11xx/gfx12xx device.
+        if _hip_backend.rdna2_is_available(device):
+            return True
         return _hip_backend.int8_attention_is_available()
     capability = torch.cuda.get_device_capability(device)
     return capability >= _NATIVE_MINIMUM_CAPABILITY and _cuda_backend._EXT_AVAILABLE
@@ -216,6 +226,52 @@ def _int8_attention_cuda(
     attn_mask = _validate_inputs(q, k, v, attn_mask)
 
     original_head_dim = q.shape[-1]
+    attention_scale = original_head_dim**-0.5 if scale is None else float(scale)
+
+    if _hip_backend is not None and _hip_backend.rdna2_is_available(q.device):
+        # RDNA2 (gfx103x) has no matrix cores, so the WMMA sage attention below
+        # neither builds nor runs for it. gfx1035 instead takes the ported
+        # SageAttention RDNA2 kernel (INT8 Q·K^T + FP16 P·V on VALU), which is
+        # instantiated for head_dim 64 and 128. It reads the same prepared-mask
+        # layouts as the WMMA kernels (see hip._RDNA2_MASK_*), so a mask is
+        # handled here rather than declined.
+        #
+        # This branch returns before the finiteness check further down, which
+        # every other backend reaches, so a non-finite scale would otherwise
+        # reach the ported kernel and come back as NaN instead of raising.
+        if not math.isfinite(attention_scale):
+            raise ValueError(f"scale must be finite, got {attention_scale}")
+        # Head dims outside 64/128 are padded up to the next supported tile
+        # rather than rejected: the ported kernel's 64 and 128 instantiations
+        # are the same ones the WMMA path pads to, and a zero-padded lane
+        # contributes nothing to the QK dot product.
+        if original_head_dim <= 64:
+            kernel_head_dim = 64
+        elif original_head_dim <= 128:
+            kernel_head_dim = 128
+        else:
+            raise NotImplementedError(
+                "INT8 attention requires head_dim <= 128 on RDNA2 (gfx103x); "
+                f"the ported kernel is instantiated for 64 and 128 only, got "
+                f"{original_head_dim}."
+            )
+        if kernel_head_dim != original_head_dim:
+            padding = (0, kernel_head_dim - original_head_dim)
+            q = functional.pad(q, padding)
+            k = functional.pad(k, padding)
+            v = functional.pad(v, padding)
+        output = _hip_backend.rdna2_sageattn(
+            q,
+            k,
+            v,
+            tensor_layout="HND",
+            is_causal=False,
+            sm_scale=attention_scale,
+            attn_mask=attn_mask,
+        )
+        output = output[..., :original_head_dim]
+        return output.float() if q.dtype == torch.float32 else output
+
     if original_head_dim <= 64:
         kernel_head_dim = 64
     elif original_head_dim <= 128:
@@ -228,7 +284,6 @@ def _int8_attention_cuda(
         k = functional.pad(k, padding)
         v = functional.pad(v, padding)
 
-    attention_scale = original_head_dim**-0.5 if scale is None else float(scale)
     if not math.isfinite(attention_scale):
         raise ValueError(f"scale must be finite, got {attention_scale}")
 
@@ -359,6 +414,23 @@ def prequantize_int8_attention(
     if not math.isfinite(attention_scale):
         raise ValueError(f"scale must be finite, got {attention_scale}")
 
+    if _hip_backend is not None and _hip_backend.rdna2_is_available(q.device):
+        if kernel_head_dim == 256:
+            raise NotImplementedError(
+                "prequantize_int8_attention requires head_dim <= 128 on RDNA2 "
+                f"(gfx103x); the ported kernel is instantiated for 64 and 128 only, "
+                f"got {original_head_dim}."
+            )
+        return _hip_backend.rdna2_prequantize(
+            q,
+            k,
+            v,
+            original_head_dim=original_head_dim,
+            input_dtype=input_dtype,
+            attention_scale=attention_scale,
+            attn_mask=attn_mask,
+        )
+
     attn_mask = _prepare_attn_mask(attn_mask, attention_scale)
     if _hip_backend is not None:
         # The packed V row width follows this cta_k, so the value that packed the
@@ -485,6 +557,12 @@ def int8_attention_from_prequantized(
             "INT8 attention requires the comfy-kitchen CUDA extension on SM75 or newer, "
             "or the HIP extension on an AMD device with matrix cores (RDNA3 or newer)"
         )
+
+    if (
+        _hip_backend is not None
+        and _hip_backend.rdna2_is_available(quantized.q.device)
+    ):
+        return _hip_backend.rdna2_attend_prequantized(quantized)
 
     batch, q_heads, q_length, kernel_head_dim = quantized.q.shape
     output_dtype = (

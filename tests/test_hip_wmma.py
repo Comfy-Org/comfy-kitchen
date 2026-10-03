@@ -505,6 +505,22 @@ def _rel_err(got, ref) -> float:
     return ((got - ref).abs().max() / ref.abs().max().clamp(min=1e-9)).item()
 
 
+def _fp16_shape_served(m, n, k) -> bool:
+    """Mirror fp16_shape_served() in backends/hip/ops/gemm_fp16.hip.
+
+    The envelope is architecture-dependent: only the gfx1103 iGPU keeps the
+    shallow-K and huge-M shapes on WMMA (the vendor GEMM loses there, measured
+    4.5-6 TF vs 7-10 TF on its 6 WGPs). Every other GPU keeps upstream's
+    envelope and hands those shapes to the vendor GEMM.
+    """
+    if k % 8 != 0 or n % 8 != 0:
+        return False
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if props.gcnArchName.split(":")[0] == "gfx1103":
+        return True
+    return k > 4096 and m <= 8192
+
+
 def _served_fp16_linear(hip, monkeypatch):
     """Fail the test if fp16_linear falls back to torch's linear."""
     served = []
@@ -523,17 +539,18 @@ def _served_fp16_linear(hip, monkeypatch):
 # shapes cover the tile paths it reaches and a shape it declines.
 @needs_wmma
 @pytest.mark.parametrize(
-    ("m", "n", "k", "served"),
+    ("m", "n", "k"),
     [
-        (1797, 2048, 8192, True),
-        (512, 512, 8192, True),
-        (37, 264, 6144, True),
-        (1797, 6144, 2048, False),
+        (1797, 2048, 8192),
+        (512, 512, 8192),
+        (37, 264, 6144),
+        (1797, 6144, 2048),
+        (1797, 6140, 2048),
     ],
 )
 @pytest.mark.parametrize("with_bias", [True, False])
 @pytest.mark.parametrize("with_residual", [True, False])
-def test_fp16_linear_matches_fp32_reference(hip, monkeypatch, m, n, k, served, with_bias,
+def test_fp16_linear_matches_fp32_reference(hip, monkeypatch, m, n, k, with_bias,
                                              with_residual):
     torch.manual_seed(0)
     x = torch.randn(m, k, dtype=torch.float16, device=DEV)
@@ -548,7 +565,7 @@ def test_fp16_linear_matches_fp32_reference(hip, monkeypatch, m, n, k, served, w
     if with_residual:
         ref = r.float() + rs.float() * ref
 
-    assert calls == [served]
+    assert calls == [_fp16_shape_served(m, n, k)]
     assert got.dtype == torch.float16 and got.shape == (m, n)
     # fp32 accumulation: only the fp16 operands and the stored result are rounded
     assert _rel_err(got, ref) < 5e-3
@@ -1376,11 +1393,22 @@ def _assert_requant_close(out, ref, w, group_size):
     """The kernel repeats eager's arithmetic, division for division, so it has to
     reproduce eager's scales and codes, not merely land near them.
 
-    The one thing it cannot reproduce is the summation order of eager's group
-    reductions, which is torch's, not a sequential accumulate. That moves an ALS group
-    scale by an ulp, and an ulp is visible only where the scale sat on an e4m3 rounding
-    boundary -- so a handful of groups shift one e4m3 code, and the int8 levels of
-    those groups move with it. Anything wider than that is a real divergence.
+    Two things it cannot reproduce, both rounding order rather than arithmetic. The
+    first is the summation order of eager's group reductions, which is torch's, not a
+    sequential accumulate. That moves an ALS group scale by an ulp, and an ulp is
+    visible only where the scale sat on an e4m3 rounding boundary -- so a handful of
+    groups shift one e4m3 code, and the int8 levels of those groups move with it.
+
+    The second is eager's ConvRot: torch tiles its 256-term sum differently from the
+    kernel's FHT, so on the rare element that sits exactly on a weight-dtype rounding
+    boundary the two land an ulp apart. That is 311 of 393216 elements at 384x1024
+    bf16, and on 2 rows of 384 the ulp reaches 1.05e-4 of s_channel -- past the rtol
+    below, because a 6-bit group's ALS scale weights one element's rounding error by
+    |q| / sum(q^2). The kernel is the correctly rounded side of that pair: an exactly
+    rotated row pushed back through eager's own packer reproduces its s_channel bit
+    for bit on every bf16 shape here. So the W6A8 test rotates its reference exactly
+    (see _exactly_rotated) instead of the bound here being widened to cover it.
+    Anything wider than these is a real divergence.
     """
     torch.testing.assert_close(out[2], ref[2], rtol=1e-5, atol=0)
     srel_delta = (out[1].view(torch.uint8).int() - ref[1].view(torch.uint8).int()).abs()
@@ -1412,16 +1440,35 @@ def test_w4a8_fused_quantize_matches_eager(hip, dtype, n, k):
     _assert_requant_close(out, ref, w, 16)
 
 
+def _exactly_rotated(weight, group_size):
+    """Eager's ConvRot with the sum accumulated exactly, then rounded once.
+
+    Drop-in for ``rotate_int8_convrot_weight``: same layout, same dtype, same single
+    rounding at the end -- only the 256-term accumulation is exact rather than
+    torch's tiled fp32 one. See _assert_requant_close for why the reference needs it.
+    """
+    h = _build_hadamard(group_size, device=weight.device, dtype=weight.dtype)
+    rows, cols = weight.shape
+    grouped = weight.reshape(rows, cols // group_size, group_size)
+    return torch.matmul(grouped.double(), h.t().double()).to(weight.dtype).reshape(rows, cols)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("group_size", [16, 32, 64])
 @pytest.mark.parametrize(("n", "k"), [(64, 256), (33, 512), (384, 1024), (40, 16640)])
-def test_w6a8_fused_quantize_matches_eager(hip, dtype, group_size, n, k):
+def test_w6a8_fused_quantize_matches_eager(hip, dtype, group_size, n, k, monkeypatch):
     """40x16640 bf16 holds a group whose first ALS step divides exactly onto a .5 tie.
     A reciprocal-multiply there rounds the other way and moves the whole row's
     s_channel by about 1%, so the shape pins the correctly rounded division."""
     w, _ = _requant_inputs(n, k, dtype)
     _requires_fused_requant(hip, w, group_size)
+    # The reference rotates exactly, because the kernel's rotation is the correctly
+    # rounded one and eager's is not -- see _exactly_rotated. Patched only across the
+    # ref call: the fused kernel path never reaches eager's rotation, and the patch
+    # is undone so the shape below cannot be blamed on it if that ever changes.
+    monkeypatch.setattr(eager_w4a8, "rotate_int8_convrot_weight", _exactly_rotated)
     ref = eager_w4a8.quantize_w4a8_int8_weight(w, group_size, **_W6_KWARGS)
+    monkeypatch.undo()
     out = hip.quantize_w4a8_int8_weight(w, group_size, **_W6_KWARGS)
     assert out[4] is None and out[0].shape == ref[0].shape
     _assert_requant_close(out, ref, w, group_size)

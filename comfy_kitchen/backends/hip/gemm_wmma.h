@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
+﻿// SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
 // Tiled WMMA GEMM core, shared by the fp8, int8, int4 and fp16 paths and the fp16
@@ -20,6 +20,7 @@
 
 #include <atomic>
 
+#include "launchers.h"  // comfy_small_igpu
 #include "mma.h"
 
 namespace comfy::hip_backend {
@@ -252,6 +253,32 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
 // ---------------------------------------------------------------------------
 // Tile selection, shared by the fp8 and int8 launchers.
 // ---------------------------------------------------------------------------
+//
+// Do not retune these numbers without re-running the sweeps in ck_tools/; three
+// separate attempts to do better all measured worse on the 6-WGP 780M, and the
+// kernel is at the machine's limit rather than short of one. All three used
+// ck_tools/ck_tile_ab.py, which A/Bs every candidate against this heuristic in a
+// single process with forward *and* reverse rotation (the first candidate in a
+// rotation is otherwise systematically slow and invents ~1.4x on shapes that
+// change nothing).
+//
+//   1. Wider tiles. 128x128 has 2*BM*BN/(BM+BN) = 128 ops per byte of global
+//      traffic, and the kernel moves that at ~100 GB/s, which accounts for the
+//      ~12 TOPS it measures -- so widening the tile looked like the obvious fix.
+//      256x128 (170 ops/byte) and 256x256 (256 ops/byte) measured 0.49x-0.92x.
+//      TM/TN doubles with the tile, and the accumulators alone reach 64-128 VGPRs,
+//      which spills. Arithmetic intensity is bought with the register file here.
+//   2. More independent WMMA chains. ck_tools/wmma_peak.hip issues MMAs from a
+//      fixed accumulator set with no memory traffic and finds 1/2/4 accumulators
+//      all plateau at 7.9 TOPS while 8 reach 31 and 16 reach 62, so TM*TN = 4
+//      looked like a stall. Reshaping the warp grid to 8 chains at the same tile
+//      (TM=4,TN=2 or TM=2,TN=4) measured 0.88x-0.94x. The microkernel stalls
+//      because nothing else is in flight; this kernel has LDS loads and the K
+//      loop around each MMA, so there is already enough to cover the latency, and
+//      the extra registers only cost occupancy.
+//   3. 64x64 and 64x128 tiles are within 1% on every workload shape. The two
+//      that beat this heuristic do so by 1.03x-1.09x on shapes worth 0.1-0.25% of
+//      a step, and both lose on other shapes in the same family.
 
 // hipDeviceAttributeMultiprocessorCount reports WGPs on RDNA, not CUs (32 on a
 // 64-CU gfx1201), and a workgroup schedules onto a WGP, so WGPs are the unit the
@@ -285,15 +312,78 @@ inline int device_wgp_count() {
 template <typename Mma, typename Epi, typename OutT, typename ASrc = const uint8_t*>
 void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbytes,
                       int ldc, Epi epi, hipStream_t stream) {
-    const int blocks_128 = ((M + 127) / 128) * ((N + 127) / 128);
-
     const int wgps = device_wgp_count();
+    const int blocks_128 = ((M + 127) / 128) * ((N + 127) / 128);
 
     // Zero padding the block count cannot see: at M <= 64 the 128-row tile is at
     // least half empty, and the finer 64x64 grid recovers the wasted MMAs.
     const bool skinny = (M <= 64 || N <= 64);
 
-    if (!skinny && blocks_128 >= wgps) {
+
+    // The gfx1103-only branch, keyed on the architecture rather than a WGP
+    // threshold: low-WGP devices (6 WGPs on a 780M, 8 on a 680M) have too few
+    // workgroup processors to interleave many small blocks, so a 16-wave
+    // 512-thread block that hides WMMA latency within the block wins. Deeper K
+    // amortizes the BKB=128 tile's LDS round trips; shallower K runs faster with
+    // BKB=64 on the 512-thread grid (measured on the 6-WGP 780M: the
+    // Anima/SDXL K<=2048..2880 shapes prefer 128x128 BKB64 16w, while K=8192
+    // (kbytes 16384) wants 128x128 BKB128 16w -- which is the split both arms
+    // below make).
+    //
+    // Every other architecture falls through to the upstream heuristic below:
+    // the branch above was tuned against 6 WGPs and is a regression elsewhere.
+    //
+    // Do not retune the 8-bit arm (the `kbytes >= 4096` chain below) on K alone.
+    // An attempt to route int8 K in [2048, 5120] to the 64x64 BKB128 tile looked
+    // like a 1.07-1.57x win when measured at M=8192/12288, and then *regressed*
+    // 9 of the 16 shapes the benchmark actually runs (301.6 -> 306.4 ms summed).
+    // Re-measuring with K and N fixed and M swept (4096..32768) showed the small
+    // tile at 0.97-1.00x of the 128x128 for K=2048 at every M, so the original
+    // sweep's signal was an artifact, not a K effect. Two traps, both worth
+    // avoiding: the first GPU work in a process runs on cold clocks (it inflated
+    // that sweep's apparent effect by 14-24%, above its own noise floor), and
+    // shapes must include the M the workload really uses -- ComfyUI CFG at B=2
+    // reaches M=2*sq=18432, well past where the effect was assumed to hold.
+    if (!skinny && comfy_small_igpu()) {
+        if (Mma::kStepBytes >= 32) {
+            // 32-byte K-steps (fp16/bf16) halve the K-steps per tile versus 8-bit
+            // operands. Re-measured on the 6-WGP 780M across ten Anima/SDXL/conv
+            // shapes (ck_tools/sweep_gemm_fp.py, same-process interleaved): for a
+            // moderate K the 64x64 BKB128 4-wave tile beats 128x128 by 3-27% -- it
+            // yields 4x the blocks to interleave and its smaller LDS footprint
+            // keeps more of them resident -- while deep K (mlp2, K=8192) and very
+            // shallow K (adaln2, K=256) both want 128x128 back. kbytes is 2*K here,
+            // so the 1024..4096 window is K in [512, 2048]; every measured shape
+            // inside it agreed, and conv320 (kbytes 5760) plus adaln2 (512)
+            // regress outside it.
+            if (kbytes >= 1024 && kbytes <= 4096) {
+                constexpr int BM = 64, BN = 64, BKB = 128;
+                dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
+                    <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+            } else {
+                constexpr int BM = 128, BN = 128, BKB = 128;
+                dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
+                    <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+            }
+        } else if (kbytes >= 4096) {
+            constexpr int BM = 128, BN = 128, BKB = 128;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
+                <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        } else if (blocks_128 >= wgps) {
+            constexpr int BM = 128, BN = 128, BKB = 64;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
+                <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        } else {
+            constexpr int BM = 64, BN = 64, BKB = 64;
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
+                <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
+        }
+    } else if (!skinny && blocks_128 >= wgps) {
         if (kbytes >= 4096) {
             constexpr int BM = 128, BN = 128, BKB = 128;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);

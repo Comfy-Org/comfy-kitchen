@@ -6,7 +6,7 @@ import dataclasses
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import Any
 
 import torch
@@ -33,6 +33,50 @@ def get_cuda_capability() -> tuple[int, int] | None:
     if not torch.cuda.is_available():
         return None
     return torch.cuda.get_device_capability()
+
+
+@cache
+def native_scaled_mm_usable(device_type: str) -> bool:
+    """Whether ``torch._scaled_mm`` actually runs on this device's backend.
+
+    ``get_cuda_capability`` cannot answer this. On ROCm it reports a gfx-shaped
+    number -- gfx1103 answers (11, 0) -- so every layout's ``MIN_SM_VERSION``
+    check passes on an AMD part, while PyTorch implements ``_scaled_mm`` only
+    for SM89/SM90 and above and for ROCm MI300 or above.
+
+    A layout whose only fast path is that op used to cope by catching the
+    resulting ``NotImplementedError`` and falling back to dequantization, but
+    that only survives in eager mode: under ``torch.compile`` the op is traced
+    into the graph, the exception escapes at runtime, and the model dies.
+    Consulting this from the layout handler decides the matter in Python, where
+    dynamo evaluates it while tracing and bakes in the branch eager would have
+    taken.
+
+    Scoped to the layouts that genuinely have nowhere else to go. FP8 and INT8
+    are deliberately not gated this way: on a WMMA part the HIP backend serves
+    both from its own kernels, and gating them would push working matmuls onto
+    a dequantize fallback.
+
+    Probed once per device type with a 1x1 matmul rather than read off the
+    capability number, because what matters is the shape PyTorch actually
+    accepts, which no version query reports. During CUDA graph capture the probe
+    cannot run -- its allocations would be recorded into the graph -- so the
+    question is deferred: the capture-time answer comes from
+    :func:`quantized_mm_has_fast_path`, which has already asked the WMMA kernels
+    and so knows the answer without probing, and from any earlier eager answer.
+    """
+    if device_type != "cuda" or not torch.cuda.is_available():
+        return False
+    try:
+        a = torch.zeros((1, 16), device=device_type, dtype=torch.bfloat16)
+        b = torch.zeros((1, 16), device=device_type, dtype=torch.bfloat16)
+        scale = torch.ones((), device=device_type, dtype=torch.float32)
+        torch._scaled_mm(
+            a, b.t(), scale_a=scale, scale_b=scale, bias=None, out_dtype=torch.bfloat16
+        )
+    except Exception:
+        return False
+    return True
 
 
 # ==================== Base Params Dataclass ====================
@@ -86,6 +130,54 @@ class BaseLayoutParams:
                 getattr(self, field.name).copy_(src_val, non_blocking=non_blocking)
             else:
                 object.__setattr__(self, field.name, src_val)
+
+
+def quantized_mm_has_fast_path(device_type: str) -> bool:
+    """Whether a quantized matmul has anything faster than dequantize-and-matmul.
+
+    Two things can serve one: PyTorch's own scaled/IMMA GEMM, and this fork's HIP
+    backend kernels. Either is enough, and neither can be assumed, because on
+    ROCm the capability number is a gfx shape rather than an SM version (see
+    :func:`native_scaled_mm_usable`), so a layout's ``MIN_SM_VERSION`` check alone
+    passes on parts where neither exists.
+
+    The HIP backend's GEMMs are WMMA kernels. RDNA2 has no matrix cores and this
+    fork builds only the elementwise kernels there, so a quantized matmul there
+    genuinely has no fast path and has to fall back -- which is a decision that
+    has to be made while dynamo is tracing, not by catching the op's failure
+    afterwards.
+
+    The two are asked in that order for a reason that is not a preference. On a
+    WMMA part ``has_wmma`` settles the question by itself -- a part that has
+    matrix cores has a fast path whatever PyTorch thinks, and a part that has
+    none is RDNA2, where the probe would not succeed either -- so
+    :func:`native_scaled_mm_usable` is left to run only where its answer is the
+    only answer. That also keeps ``torch._scaled_mm`` off this path on every part
+    the WMMA kernels cover. The probe is a 1x1 capability check, not a matmul, but
+    it is still the entry point that reaches hipBLASLt, and
+    ``test_no_hipblaslt_on_the_quantized_paths`` fails on it (gfx1103 did, until
+    the two were swapped) while never being able to see that the 1x1 result was
+    discarded right after.
+
+    Which also makes this the answer during CUDA graph capture, where the probe
+    cannot run at all. That matters: capture reaches this on a part with no
+    matrix cores, where the probe's answer is "no", and assuming "yes" there
+    would trace the op that does not exist into the graph.
+    """
+    if device_type == "cuda" and getattr(torch.version, "hip", None) is not None:
+        from ..backends.hip import has_wmma
+
+        if has_wmma():
+            return True
+        if torch.cuda.is_current_stream_capturing():
+            # No matrix cores, so _scaled_mm has no WMMA path to take and the
+            # probe cannot run inside a capture either; dequantize-and-matmul is
+            # the branch eager would have taken. See native_scaled_mm_usable.
+            return False
+        return native_scaled_mm_usable(device_type)
+    if device_type == "cuda" and torch.cuda.is_available():
+        return native_scaled_mm_usable(device_type)
+    return True
 
 
 class QuantizedLayout(ABC):

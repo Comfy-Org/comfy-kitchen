@@ -37,6 +37,11 @@ int map_dtype_to_code(const nb::dlpack::dtype& dtype) {
     return -1;
 }
 
+// Defined in dlpack_bindings_gfx103x.cpp. Declared here rather than in a header
+// of its own, which is what the rest of this file does: the definition and the
+// documentation sit together, and this is the one line that has to name it.
+void register_gfx103x_ops(nb::module_& m);
+
 extern "C" {
 void launch_quantize_per_tensor_fp8_kernel(const void*, const void*, void*, int64_t, int, int,
                                            hipStream_t);
@@ -428,6 +433,40 @@ bool fp16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias,
         require_len(*resid, static_cast<int64_t>(M) * N, kFn, "resid");
     }
     const bool served = launch_fp16_gemm_kernel(
+        a.data(), b.data(), d.data(), opt_data(bias), opt_data(rscale), opt_data(resid), M, N, K,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return served;
+}
+
+// Same envelope as fp16_gemm, every operand bf16 (bias/rscale/resid stay fp16:
+// the Python layer converts them). false means the caller serves the shape.
+bool bf16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias, OptArray rscale,
+               OptArray resid, int M, int N, int K, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "bf16_gemm";
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_dtype(a, 2, 2, kFn, "a");
+    require_dtype(b, 2, 2, kFn, "b");
+    require_dtype(d, 2, 2, kFn, "d");
+    require_len(a, static_cast<int64_t>(M) * K, kFn, "a");
+    require_len(b, static_cast<int64_t>(N) * K, kFn, "b");
+    require_len(d, static_cast<int64_t>(M) * N, kFn, "d");
+    if (bias.has_value()) {
+        require_fp16(*bias, kFn, "bias");
+        require_len(*bias, N, kFn, "bias");
+    }
+    if (rscale.has_value() != resid.has_value()) {
+        throw std::runtime_error(std::string(kFn) + ": rscale and resid must be given together");
+    }
+    if (resid.has_value()) {
+        require_fp16(*rscale, kFn, "rscale");
+        require_fp16(*resid, kFn, "resid");
+        require_len(*rscale, N, kFn, "rscale");
+        require_len(*resid, static_cast<int64_t>(M) * N, kFn, "resid");
+    }
+    const bool served = launch_bf16_gemm_kernel(
         a.data(), b.data(), d.data(), opt_data(bias), opt_data(rscale), opt_data(resid), M, N, K,
         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
@@ -1483,6 +1522,8 @@ static void sage_quantize(const nb::ndarray<>& q, const nb::ndarray<>& k, const 
                               k.stride(1), k.stride(2), input_dtype_code,
                               sage_rotation(kv_len, head_dim), stream, dense_mask);
 
+    // V is quantized to int8 and transposed to [B*H*D, padded_K], which is the only
+    // packed-V form sage_attend accepts.
     launch_sage_quant_v_int8(v.data(), v_int8.data(), v_scale.data(), batch, kv_heads, kv_len,
                              head_dim, padded_k, v.stride(0), v.stride(1), v.stride(2),
                              input_dtype_code, stream);
@@ -1628,21 +1669,39 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
                         const nb::ndarray<>& v_scale, const OptArray& attn_mask, int batch,
                         int q_heads, int kv_heads, int qo_len, int kv_len, int head_dim,
                         int cta_k, float sm_scale, int output_dtype_code, hipStream_t stream,
-                        const char* fn) {
+                        bool igpu, const char* fn) {
     if (output_dtype_code != 1 && output_dtype_code != 2) {
         throw std::runtime_error(std::string(fn) + ": output dtype must be float16 or bfloat16");
     }
     require_dtype(o, output_dtype_code, output_dtype_code, fn, "o");
     require_len(o, static_cast<int64_t>(batch) * q_heads * qo_len * head_dim, fn, "o");
-    // The output strides below are synthesized from the extents rather than read
-    // from o, so anything but the packed layout would be written as though it
-    // were packed. Both entry points reach this, so the check belongs here.
-    if (o.ndim() != 4 || static_cast<int>(o.shape(0)) != batch ||
-        static_cast<int>(o.shape(1)) != q_heads || static_cast<int>(o.shape(2)) != qo_len ||
-        static_cast<int>(o.shape(3)) != head_dim) {
-        throw std::runtime_error(std::string(fn) + ": o must be [B, H_q, Lq, D]");
+    int64_t o_stride_b;
+    int64_t o_stride_h;
+    int64_t o_stride_n;
+    if (igpu) {
+        // The kernels index o by explicit stride, so on the gfx1103 iGPU it may also
+        // be an NHD-packed buffer viewed as [B, H_q, Lq, D]: only those strides make
+        // ComfyUI's out.transpose(1, 2).reshape(...) a view instead of a copy.
+        if (o.ndim() != 4 || static_cast<int>(o.shape(0)) != batch ||
+            static_cast<int>(o.shape(1)) != q_heads || static_cast<int>(o.shape(2)) != qo_len ||
+            static_cast<int>(o.shape(3)) != head_dim) {
+            throw std::runtime_error(std::string(fn) + ": o must be [B, H_q, Lq, D]");
+        }
+        if (o.stride(3) != 1) {
+            throw std::runtime_error(std::string(fn) +
+                                     ": the last dimension of o must be contiguous");
+        }
+        o_stride_b = o.stride(0);
+        o_stride_h = o.stride(1);
+        o_stride_n = o.stride(2);
+    } else {
+        // Fork principle 1: upstream's packed-output check is kept verbatim on every
+        // other device, so the relaxation above stays an iGPU-only path.
+        require_packed_contiguous(o, fn, "o");
+        o_stride_b = q_heads * qo_len * head_dim;
+        o_stride_h = qo_len * head_dim;
+        o_stride_n = head_dim;
     }
-    require_packed_contiguous(o, fn, "o");
 
     const void* mask_ptr = nullptr;
     int64_t mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k;
@@ -1656,18 +1715,28 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
                    mask_stride_h, mask_stride_q, mask_stride_k, mask_dtype_code, fn);
 
     const int padded_k = sage_padded_k(kv_len, cta_k);
+    // int8 V is the only PV this backend has. The 16-bit-V variant that used to live
+    // here (int8_bf16sv.hip) measured 1.48x slower over benchmark_attn.py's 18 shapes
+    // and no public API could reach it, so a non-int8 V is refused rather than misread.
+    const int v_dtype_code = map_dtype_to_code(v_int8.dtype());
+    if (v_dtype_code != 4) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": packed v must be int8 (dtype code 4), got code " +
+                                 std::to_string(v_dtype_code));
+    }
     launch_sage_int8_attn(
-        q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(), k_scale.data(),
-        v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
-        mask_dtype_code, cta_k, batch, qo_len, kv_len, sage_padded_q(qo_len), q_heads,
-        kv_heads, head_dim, padded_k / kSageKeyGroup,
-        static_cast<int64_t>(q_heads) * qo_len * head_dim, static_cast<int64_t>(qo_len) * head_dim,
+        q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(),
+        k_scale.data(), v_scale.data(), mask_ptr, mask_stride_b, mask_stride_h,
+        mask_stride_q, mask_stride_k, mask_dtype_code, cta_k, batch, qo_len, kv_len,
+        sage_padded_q(qo_len), q_heads, kv_heads, head_dim, padded_k / kSageKeyGroup,
+        static_cast<int64_t>(q_heads) * qo_len * head_dim,
+        static_cast<int64_t>(qo_len) * head_dim,
         static_cast<int64_t>(kv_heads) * kv_len * head_dim,
         static_cast<int64_t>(kv_len) * head_dim,
         static_cast<int64_t>(kv_heads) * head_dim * padded_k,
         static_cast<int64_t>(head_dim) * padded_k, padded_k,
-        static_cast<int64_t>(q_heads) * qo_len * head_dim, static_cast<int64_t>(qo_len) * head_dim,
-        head_dim, sm_scale, output_dtype_code, stream);
+        o_stride_b, o_stride_h, o_stride_n, sm_scale, output_dtype_code,
+        stream);
     check_hip_launch();
 }
 
@@ -1683,6 +1752,7 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
     sage_check_shapes(q, k, v, kFn);
     sage_check_cta_k(cta_k, kFn);
     const auto stream = reinterpret_cast<hipStream_t>(stream_ptr);
+    const bool igpu = comfy_small_igpu(q.device_id());
     const int batch = static_cast<int>(q.shape(0));
     const int q_heads = static_cast<int>(q.shape(1));
     const int qo_len = static_cast<int>(q.shape(2));
@@ -1729,12 +1799,93 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
         fused_mask = {static_cast<const uint16_t*>(ptr), static_cast<uint16_t*>(prepared.data()),
                       mask_batch, mask_heads, qo_len, kv_len, code, sb, sh, sq, sk};
     }
-    sage_quantize(q, k, v, q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, anchor_indices,
-                  input_dtype_code, cta_k, stream, kFn, &fused_mask);
-    check_hip_launch();
-    sage_attend(q_int8, k_int8, v_int8, o, q_scale, k_scale, v_scale, attn_mask, batch, q_heads,
-                kv_heads, qo_len, kv_len, head_dim, cta_k, sm_scale, output_dtype_code, stream,
-                kFn);
+
+    // Direct fp16/bf16 attention for short keys, skipping the int8 prepass
+    // (mirrors the reference library's use_direct thresholds). Only unmasked
+    // calls take this path; the direct kernel has no mask handling.
+    const int padded_k = sage_padded_k(kv_len, cta_k);
+    // fp32 inputs stay on the int8 path (the direct kernel reads 16-bit dtypes),
+    // and small self-attention keeps int8 so the prequantized split API stays
+    // bitwise equal. The direct kernel is an iGPU extension of the upstream API.
+    const bool direct_dtype =
+        (input_dtype_code == 1 || input_dtype_code == 2) &&
+        (output_dtype_code == 1 || output_dtype_code == 2) &&
+        input_dtype_code == output_dtype_code;
+    const bool use_direct =
+        igpu && !attn_mask.has_value() && direct_dtype &&
+        ((head_dim == 64 && kv_len <= 2048 && !(qo_len == kv_len && kv_len <= 1024)) ||
+         (head_dim == 128 && kv_len <= 256));
+    if (use_direct) {
+        // The direct kernel bypasses the int8 prepass, so the operand checks the
+        // int8 path runs in sage_quantize/sage_attend are skipped here. Re-run the
+        // ones the direct launches depend on: it reinterprets q/k as fp16/bf16 from
+        // input_dtype_code, reads 16 adjacent elements and K rows via uint4 (last
+        // dim must be contiguous), the transpose writes fp16 over the full V width
+        // (buffer must be the 2x-wide gfx1103 layout), and o is written with 16-byte
+        // stores.
+        require_dtype(q, 1, 2, kFn, "q");
+        require_dtype(k, 1, 2, kFn, "k");
+        require_dtype(v, 1, 2, kFn, "v");
+        // o is written at output_dtype_code (16-bit, same as the input on the
+        // direct path), so validate it against the output argument rather than
+        // silently ignoring it.
+        require_dtype(o, output_dtype_code, output_dtype_code, kFn, "o");
+        // The direct kernel writes o for every Q row and head, so o must have the
+        // [B, H_q, Lq, D] extent and enough capacity; sage_attend does the same.
+        require_len(o, static_cast<int64_t>(batch) * q_heads * qo_len * head_dim, kFn, "o");
+        if (o.ndim() != 4 || static_cast<int>(o.shape(0)) != batch ||
+            static_cast<int>(o.shape(1)) != q_heads || static_cast<int>(o.shape(2)) != qo_len ||
+            static_cast<int>(o.shape(3)) != head_dim) {
+            throw std::runtime_error(std::string(kFn) + ": o must be [B, H_q, Lq, D]");
+        }
+        if (q.stride(3) != 1 || k.stride(3) != 1 || v.stride(3) != 1 || o.stride(3) != 1) {
+            throw std::runtime_error(std::string(kFn) +
+                                     ": the last dimension of q, k, v and o must be contiguous");
+        }
+        // The Q fragment is staged from global memory with two 16-byte loads, so
+        // every address it derives must land on a 16-byte boundary: q's base
+        // pointer and all three leading strides must be multiples of 8 16-bit
+        // elements. k is read from LDS here, so it has no such requirement.
+        {
+            const int64_t q_strides[] = {q.stride(0), q.stride(1), q.stride(2)};
+            for (int64_t s : q_strides) {
+                if (s % 8 != 0) {
+                    throw std::runtime_error(std::string(kFn) +
+                                             ": q's leading strides must be multiples of 8 "
+                                              "elements for the 16-byte Q fragment loads");
+                }
+            }
+            if (reinterpret_cast<uintptr_t>(q.data()) % 16 != 0) {
+                throw std::runtime_error(std::string(kFn) +
+                                         ": q must be 16-byte aligned for the 16-byte Q fragment "
+                                          "loads");
+            }
+        }
+        require_len(v_int8, static_cast<int64_t>(batch) * kv_heads * head_dim * padded_k * 2,
+                    kFn, "v_int8");
+        launch_sage_transpose_v(v.data(), v_int8.data(), batch, kv_heads, kv_len, head_dim,
+                                padded_k, v.stride(0), v.stride(1), v.stride(2), input_dtype_code,
+                                stream);
+        check_hip_launch();
+        launch_sage_direct_attn(
+            q.data(), k.data(), v_int8.data(), o.data(),
+            static_cast<int64_t>(q.stride(0)), static_cast<int64_t>(q.stride(1)),
+            static_cast<int64_t>(q.stride(2)), static_cast<int64_t>(k.stride(0)),
+            static_cast<int64_t>(k.stride(1)), static_cast<int64_t>(k.stride(2)),
+            static_cast<int64_t>(kv_heads) * head_dim * padded_k,
+            static_cast<int64_t>(head_dim) * padded_k, padded_k,
+            static_cast<int64_t>(o.stride(0)), static_cast<int64_t>(o.stride(1)),
+            static_cast<int64_t>(o.stride(2)), batch, qo_len, kv_len, q_heads, kv_heads, head_dim,
+            sm_scale, input_dtype_code, stream);
+        check_hip_launch();
+    } else {
+        sage_quantize(q, k, v, q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, anchor_indices,
+                      input_dtype_code, cta_k, stream, kFn, &fused_mask);
+        check_hip_launch();
+        sage_attend(q_int8, k_int8, v_int8, o, q_scale, k_scale, v_scale, attn_mask, batch,
+                    q_heads, kv_heads, qo_len, kv_len, head_dim, cta_k, sm_scale,
+                    output_dtype_code, stream, igpu, kFn);
+    }
 }
 
 // Quantization half of the split API. Deliberately the same launches with the
@@ -1766,6 +1917,7 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
                                  ": q, k and o must be 4D and packed v must be 2D");
     }
     sage_check_cta_k(cta_k, kFn);
+    const bool igpu = comfy_small_igpu(q_int8.device_id());
     const int batch = static_cast<int>(q_int8.shape(0));
     const int q_heads = static_cast<int>(q_int8.shape(1));
     const int qo_len = static_cast<int>(q_int8.shape(2));
@@ -1786,18 +1938,25 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
     }
     sage_check_quantized(q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, batch, q_heads,
                          kv_heads, qo_len, kv_len, head_dim, cta_k, kFn);
-    // V is packed as [B * H_kv * D, padded_k], and padded_k follows cta_k. Element
-    // count alone cannot tell a buffer packed against a different cta_k from a
-    // correct one, and the kernel would read shifted rows rather than fail.
-    if (v_int8.shape(1) != static_cast<size_t>(sage_padded_k(kv_len, cta_k))) {
-        throw std::runtime_error(std::string(kFn) + ": packed v row width " +
-                                 std::to_string(v_int8.shape(1)) + " does not match cta_k " +
-                                 std::to_string(cta_k));
+    // sage_attend reads V rows with a padded_k stride, so a row must be padded_k int8
+    // elements wide. Element count alone cannot tell a buffer packed against a
+    // different cta_k from a correct one, and the kernel would read shifted rows
+    // rather than fail. Unconditional on purpose: sage_int8_quantize narrows the
+    // iGPU's doubled V scratch back to one width before handing it over, so no
+    // device has a legitimate reason to present a wider row.
+    {
+        const int64_t v_row = static_cast<int64_t>(v_int8.shape(1));
+        const int64_t v_padded_k = sage_padded_k(kv_len, cta_k);
+        if (v_row != v_padded_k) {
+            throw std::runtime_error(std::string(kFn) + ": packed v row width " +
+                                     std::to_string(v_int8.shape(1)) +
+                                     " does not match cta_k " + std::to_string(cta_k));
+        }
     }
 
     sage_attend(q_int8, k_int8, v_int8, o, q_scale, k_scale, v_scale, attn_mask, batch, q_heads,
                 kv_heads, qo_len, kv_len, head_dim, cta_k, sm_scale, output_dtype_code,
-                reinterpret_cast<hipStream_t>(stream_ptr), kFn);
+                reinterpret_cast<hipStream_t>(stream_ptr), igpu, kFn);
 }
 
 
@@ -2343,6 +2502,9 @@ NB_MODULE(_C, m) {
     m.def("fp16_gemm", &fp16_gemm, nb::arg("a"), nb::arg("b"), nb::arg("d"),
           nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),
           nb::arg("N"), nb::arg("K"), nb::arg("stream_ptr"));
+    m.def("bf16_gemm", &bf16_gemm, nb::arg("a"), nb::arg("b"), nb::arg("d"),
+          nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),
+          nb::arg("N"), nb::arg("K"), nb::arg("stream_ptr"));
     m.def("fp16_conv3d", &fp16_conv3d, nb::arg("x"), nb::arg("w"), nb::arg("bias").none(),
           nb::arg("resid").none(), nb::arg("out"), nb::arg("N"), nb::arg("D"), nb::arg("H"),
           nb::arg("W"), nb::arg("C"), nb::arg("K"), nb::arg("T"), nb::arg("R"), nb::arg("S"),
@@ -2413,4 +2575,9 @@ NB_MODULE(_C, m) {
     m.def("svdquant_lora_down", &svdquant_lora_down);
     m.def("svdquant_quantize", &svdquant_quantize);
     m.def("svdquant_gemm", &svdquant_gemm);
+
+    // RDNA2 SageAttention. Registered on every architecture -- outside __GFX10__ the
+    // kernels compile to empty bodies -- so this is a no-op on gfx11/gfx12. The
+    // gate that keeps it off a non-RDNA2 device is in the Python layer.
+    register_gfx103x_ops(m);
 }

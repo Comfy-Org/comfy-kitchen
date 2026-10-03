@@ -747,11 +747,66 @@ def _round_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+def _is_gfx103x(device: torch.device | int | None = None) -> bool:
+    """True on RDNA2 (gfx103x), which has no matrix cores and no hipblasLt INT8 path.
+
+    Kept self-contained on purpose: ``backends/eager`` must import and work without
+    the HIP extension, so it cannot reach ``backends/hip``'s manifest loader. The
+    predicate matches the same RDNA2 set the rest of the tree uses -- the
+    ``elementwise_only`` group of ``backends/hip/architectures.json`` (gfx1030-1036),
+    ``hip.rdna2_is_available``, and the C++ ``comfy_is_gfx10()``. The gate is
+    the architecture class, not one part: every gfx103x device lacks matrix cores, so
+    every one of them needs this path. If that group is ever renamed or extended, this
+    predicate has to move with it.
+    """
+    if not getattr(torch.version, "hip", None) or not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.get_device_properties(device).gcnArchName.startswith("gfx103")
+    except Exception:
+        return False
+
+
+def _exact_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """INT8 matmul by exact float accumulation, for devices without an INT8 GEMM.
+
+    The int8 products are exact integers; only the accumulation can lose them, and
+    only through the float format's integer range. fp32 represents integers exactly
+    only up to 2**24, and 127*127*K passes that at K > 1040, which the test suite
+    does reach (K up to 2048). So promote to fp64 -- exact to 2**53, which no K
+    comes near -- when the fp32 bound would be exceeded. fp32 is kept for the common
+    small-K case because it is materially faster on a part with no int8 tensor cores.
+
+    Correct by construction rather than measured: this path has not been run on
+    gfx103x hardware from this tree, and is a reference/fallback, not a hot path.
+    """
+    if 127 * 127 * lhs.shape[-2] < (1 << 24):
+        return (lhs.float() @ rhs.float()).to(torch.int32)
+    return (lhs.double() @ rhs.double()).to(torch.int32)
+
+
 def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Multiply INT8 matrices and return INT32 accumulators."""
     def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
         if hasattr(torch, "int8_mm"):
             return torch.int8_mm(lhs, rhs)
+        # RDNA2 (gfx103x) has no matrix cores, so hipblasLt offers no INT8 GEMM and
+        # torch._int_mm raises for shapes a WMMA part accepts. Gated: on every other
+        # architecture this is upstream's torch._int_mm and nothing else. Measured on
+        # gfx1103, _int_mm is exact once the padding below rounds M to >= 32 and N to
+        # _int8_mm_n_alignment, over N in {1,2,3,5,7,9,15,17,23,31,33,47,63,65,100,
+        # 127,129} and M in {1,2,8,16,17,32,33,64,127,128,300,333,512,1024,2048}.
+        #
+        # The fork previously branched to `lhs.to(int16) @ rhs.to(int16)` for *all*
+        # ROCm, which broke every eager int8 caller on gfx1103 and friends: torch has
+        # no int16 matmul on ROCm, so it raised NotImplementedError("addmm_cuda not
+        # implemented for 'Short'), and the accumulation would have overflowed int16
+        # past K=2 anyway. _exact_int8_mm replaces it.
+        if _is_gfx103x(lhs.device):
+            try:
+                return torch._int_mm(lhs, rhs)
+            except RuntimeError:
+                return _exact_int8_mm(lhs, rhs)
         return torch._int_mm(lhs, rhs)
 
     orig_m = a.size(0)

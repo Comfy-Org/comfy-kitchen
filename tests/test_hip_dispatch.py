@@ -161,6 +161,10 @@ def test_hip_drops_gemms_without_matrix_cores():
                "dequantize_int8_simple_dtype",
                "dequantize_int8_convrot_weight_dtype"):
         assert op in without
+    # int8_linear and fp16_linear have VALU (v_dot4_i32_i8 / v_dot2_f32_f16)
+    # paths behind __GFX10__, so RDNA2 keeps them.
+    for op in ("int8_linear", "fp16_linear"):
+        assert op in without
     # The fused W4A8 requantize is elementwise too: it packs weights and never
     # reaches a matrix core, so RDNA2 must keep it.
     assert "quantize_w4a8_int8_weight" in without
@@ -174,6 +178,63 @@ def test_hip_advertises_every_inplace_rope_entry():
                        "apply_rope_split_half1", "rms_rope", "rms_rope1",
                        "rms_rope_split_half", "rms_rope_split_half1"):
         assert constraints[f"{functional}_"] is constraints[functional]
+
+
+@pytest.mark.parametrize(
+    ("wmma", "probe_answers", "capturing", "expected"),
+    [
+        # A part with matrix cores has the fork's own GEMM, so the answer is known
+        # and torch._scaled_mm is never called -- capture or not.
+        (True, True, False, True),
+        (True, False, False, True),
+        (True, False, True, True),
+        # RDNA2 has neither, so the probe is the only thing left to ask. It cannot
+        # succeed there either, but that is PyTorch's call to make, not ours.
+        (False, True, False, True),
+        (False, False, False, False),
+        # Inside a capture the probe cannot run at all (its allocations would be
+        # recorded into the graph), and the only part that reaches this branch is
+        # one with no matrix cores, so "no" is the answer capture must get.
+        (False, True, True, False),
+        (False, False, True, False),
+    ],
+)
+def test_quantized_mm_gate_asks_the_wmma_gemms_first(
+    monkeypatch, wmma, probe_answers, capturing, expected
+):
+    """The FP8/INT8 quantized-matmul gate must not reach torch._scaled_mm on a WMMA part.
+
+    native_scaled_mm_usable decides the question by running a 1x1 torch._scaled_mm,
+    which is the entry point that routes to hipBLASLt. On a matrix-core part the
+    fork's kernel already answers the gate, so the probe is both redundant and a
+    fall-through the kernel suite forbids:
+    test_no_hipblaslt_on_the_quantized_paths failed on gfx1103 while the 1x1 result
+    it produced was discarded a line later.
+
+    The capture rows cover the other half: the probe cannot allocate during a
+    capture, so the gate has to answer from what it already knows. It answered
+    "assume yes" there, which on the only part that reaches that branch -- one
+    with no matrix cores -- is the answer most likely to be wrong.
+    """
+    from comfy_kitchen.tensor import base as tensor_base
+
+    if not getattr(torch.version, "hip", None):
+        pytest.skip("requires a ROCm PyTorch runtime")
+
+    probed = []
+
+    def probe(device_type):
+        probed.append(device_type)
+        return probe_answers
+
+    monkeypatch.setattr(hip_backend, "has_wmma", lambda: wmma)
+    monkeypatch.setattr(tensor_base, "native_scaled_mm_usable", probe)
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: capturing
+    )
+
+    assert tensor_base.quantized_mm_has_fast_path("cuda") is expected
+    assert probed == ([] if wmma or capturing else ["cuda"])
 
 
 def _setup_namespace() -> dict:
