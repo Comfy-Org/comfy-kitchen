@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Shared numerics for the RDNA int8 attention port. Everything here has a
-// counterpart in the CUDA backend's sage_attention/ sources; where a constant is
-// duplicated rather than derived, the two must agree or the backends produce
+// counterpart in the CUDA backend's sage_attention/ sources; where a constant
+// is duplicated rather than derived, the two must agree or the backends produce
 // different numbers for the same input.
 #pragma once
 
@@ -20,22 +20,19 @@
 
 namespace comfy::hip_backend::sage {
 
-// Every kernel here indexes lanes with & 31, reduces with a width of 32 and packs
-// fragments per half wave. RDNA defaults to wave32, but -mwavefrontsize64 would
-// compile all of that into silently wrong scales rather than an error.
-#if defined(__AMDGCN_WAVEFRONT_SIZE__)
-static_assert(__AMDGCN_WAVEFRONT_SIZE__ == 32,
-              "the int8 attention kernels are wave32 only");
-#endif
+// Every kernel indexes logical lanes with & 31 and gives shuffles an explicit
+// width of 32. On Vega wave64, each physical wave therefore executes as two
+// independent logical partitions matching the software MMA fragment contract.
 
 // Softmax probabilities are unsigned int8, so the online maximum is shifted far
-// enough that exp2 fills the whole range: exp2(7.9943534) rounds to 255. Mirrors
-// S_U8_OFFSET in the CUDA attn_utils.cuh.
+// enough that exp2 fills the whole range: exp2(7.9943534) rounds to 255.
+// Mirrors S_U8_OFFSET in the CUDA attn_utils.cuh.
 constexpr float kProbU8Offset = 7.9943534f;
 constexpr float kLog2e = 1.44269504088896340736f;
 
 // Finite, not -inf: masked scores go through fma and exp2 before anything tests
-// them, and -ffast-math is on. See the fast-math note in the HIP backend README.
+// them, and -ffast-math is on. See the fast-math note in the HIP backend
+// README.
 constexpr float kMaskedScore = -50000.0f;
 
 constexpr float kInt8Max = 127.0f;
@@ -51,8 +48,8 @@ __forceinline__ __device__ float to_float(T v) {
     }
 }
 
-// Four adjacent channels in one instruction: 16 bytes for fp32, 8 for the 16-bit
-// types. The caller guarantees the group is in bounds.
+// Four adjacent channels in one instruction: 16 bytes for fp32, 8 for the
+// 16-bit types. The caller guarantees the group is in bounds.
 template <typename T>
 __forceinline__ __device__ void load4(const T* p, float* out) {
     if constexpr (std::is_same_v<T, float>) {
@@ -95,22 +92,22 @@ __forceinline__ __device__ void store4_i8(int8_t* p, int8_t a, int8_t b, int8_t 
 
 // XOR-16 exchange between the two halves of a wave.
 //
-// __shfl_xor lowers to a ds_bpermute plus the lane arithmetic and exec-mask guard
-// around it, and ds_bpermute runs on the LDS crossbar, so each exchange also
-// plants an s_wait_dscnt that orders against the K and V tile loads in flight.
-// v_permlanex16_b32 is one VALU instruction and touches no LDS state. The
-// selectors are the identity pick inside each half, which reduces it to a plain
-// half swap; verified lane by lane against __shfl_xor.
+// __shfl_xor lowers to a ds_bpermute plus the lane arithmetic and exec-mask
+// guard around it, and ds_bpermute runs on the LDS crossbar, so each exchange
+// also plants an s_wait_dscnt that orders against the K and V tile loads in
+// flight. v_permlanex16_b32 is one VALU instruction and touches no LDS state.
+// The selectors are the identity pick inside each half, which reduces it to a
+// plain half swap; verified lane by lane against __shfl_xor.
 //
 // gfx11 only. The attention kernel needs 228 of these there against gfx12's 52,
-// because gfx11 also assembles the P fragment through this exchange on every key
-// tile. On gfx12 the substitution measured as a wash, so that path keeps the
-// portable form rather than carry an unmeasurable change.
+// because gfx11 also assembles the P fragment through this exchange on every
+// key tile. On gfx12 the substitution measured as a wash, so that path keeps
+// the portable form rather than carry an unmeasurable change.
 //
 // Callers must be wave-uniform. __shfl_xor carries an exec-mask guard and this
 // does not, so a partner lane that is inactive reads back this lane's own value
-// instead. Every call site in the attention kernel is outside any lane-dependent
-// branch, which is what makes the two interchangeable.
+// instead. Every call site in the attention kernel is outside any
+// lane-dependent branch, which is what makes the two interchangeable.
 #if defined(COMFY_MMA_GFX11)
 __forceinline__ __device__ uint32_t swap_half_wave_b32(uint32_t v) {
     return static_cast<uint32_t>(__builtin_amdgcn_permlanex16(
@@ -138,11 +135,11 @@ __forceinline__ __device__ float row_reduce_fmax(float v) {
     return v;
 }
 
-// Fused block-Hadamard rotation (convrot), mirroring convrot4/64/128 in the CUDA
-// quantizer. Orthogonal, so Q.K is unchanged; it only moves quantization outliers
-// off single channels. Q and K must use the same block size or the scores are
-// wrong. Each lane owns four adjacent channels of a 128-channel tile, so H4 is
-// local, H64 crosses a half-wave and H128 the whole wave.
+// Fused block-Hadamard rotation (convrot), mirroring convrot4/64/128 in the
+// CUDA quantizer. Orthogonal, so Q.K is unchanged; it only moves quantization
+// outliers off single channels. Q and K must use the same block size or the
+// scores are wrong. Each lane owns four adjacent channels of a 128-channel
+// tile, so H4 is local, H64 crosses a half-wave and H128 the whole wave.
 
 __forceinline__ __device__ void convrot4(float* v) {
     const float x0 = v[0], x1 = v[1], x2 = v[2], x3 = v[3];
@@ -246,12 +243,21 @@ __forceinline__ __device__ uint32_t prob_to_u8(float p) {
 __forceinline__ __device__ MmaInt8::Frag pack_prob_frag(const uint32_t p[8], int lane) {
     const uint32_t lo = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
     const uint32_t hi = p[4] | (p[5] << 8) | (p[6] << 16) | (p[7] << 24);
-#if !defined(COMFY_MMA_GFX11)
-    // gfx12, and the no-matrix-core stub, whose Frag is this narrow too.
+#if defined(COMFY_MMA_GFX12)
     (void)lane;
     MmaInt8::Frag f;
     f[0] = static_cast<int>(lo);
     f[1] = static_cast<int>(hi);
+    return f;
+#elif !defined(COMFY_MMA_GFX11)
+    const uint32_t partner_lo = swap_half_wave_b32(lo);
+    const uint32_t partner_hi = swap_half_wave_b32(hi);
+    const bool low_half = (lane & 31) < 16;
+    MmaInt8::Frag f;
+    f[0] = static_cast<int>(low_half ? lo : partner_lo);
+    f[1] = static_cast<int>(low_half ? hi : partner_hi);
+    f[2] = static_cast<int>(low_half ? partner_lo : lo);
+    f[3] = static_cast<int>(low_half ? partner_hi : hi);
     return f;
 #else
     const uint32_t partner_lo = swap_half_wave_b32(lo);
@@ -272,15 +278,30 @@ __forceinline__ __device__ MmaInt8::Frag pack_prob_frag(const uint32_t p[8], int
 }
 
 // The same repack for a BF16 P operand, which the Sol-Attn routing kernel needs
-// for its pooled PV. gfx12's K slice is the accumulator order again; gfx11 rebuilds
-// the 16-key step from the two half-waves, exchanging four packed dwords instead of
-// eight floats.
+// for its pooled PV. gfx12's K slice is the accumulator order again; gfx11
+// rebuilds the 16-key step from the two half-waves, exchanging four packed
+// dwords instead of eight floats.
 __forceinline__ __device__ MmaBf16::Frag pack_prob_frag_bf16(const float p[8], int lane) {
     MmaBf16::Frag f;
-#if !defined(COMFY_MMA_GFX11)
+#if defined(COMFY_MMA_GFX12)
     (void)lane;
 #pragma unroll
     for (int e = 0; e < 8; ++e) f[e] = static_cast<__bf16>(p[e]);
+#elif !defined(COMFY_MMA_GFX11)
+    union {
+        uint32_t w[4];
+        __bf16 e[8];
+    } own, partner;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) own.e[e] = static_cast<__bf16>(p[e]);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) partner.w[i] = swap_half_wave_b32(own.w[i]);
+    const bool low_half = (lane & 31) < 16;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        f[e] = low_half ? own.e[e] : partner.e[e];
+        f[8 + e] = low_half ? partner.e[e] : own.e[e];
+    }
 #else
     union {
         uint32_t w[4];

@@ -314,6 +314,25 @@ def test_apply_rope_trims_excess_sequence_frequencies(
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
 
+def test_apply_rope_gfx10_fallback_trims_axis1_frequencies(monkeypatch):
+    pytest.importorskip("triton")
+    from comfy_kitchen.backends.triton import rope as triton_rope
+
+    x = torch.randn(2, 3, 1, 64, dtype=torch.float32)
+    freqs = torch.randn(1, 5, 1, 32, 2, 2, dtype=torch.float32)
+    monkeypatch.setattr(torch.version, "hip", "6.0")
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: type("Properties", (), {"gcnArchName": "gfx1030"})(),
+    )
+
+    actual, _ = triton_rope._apply_rope(x, freqs)
+    expected = _reference_apply_rope(x, freqs[:, : x.shape[1]])
+
+    torch.testing.assert_close(actual, expected)
+
+
 @pytest.mark.parametrize("backend", ["cuda", "hip", "triton", "eager"])
 @pytest.mark.parametrize("split_half", [False, True])
 @pytest.mark.parametrize("last_dim_strided", [False, True])

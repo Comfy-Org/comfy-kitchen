@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // FP8 scaled GEMM on WMMA (v_wmma_f32_16x16x16_fp8_fp8 on gfx12; gfx11 has no
-// fp8 WMMA and widens the operands to bf16). See mma.h.
+// fp8 WMMA and widens the operands to bf16), as a thread-level GEMM on gfx90c and
+// gfx1010 (gemm_simt.h), and on the software tile policy on the other pre-WMMA
+// targets. See mma.h.
 // C[M, N] = (A[M, K] @ B[N, K]^T) * scale_a * scale_b + bias
 #include <stdexcept>
 #include <string>
 
 #include "../epilogue.h"
 #include "../fp8_utils.h"
+#include "../gemm_simt.h"
 #include "../gemm_wmma.h"
 
 namespace comfy::hip_backend {
@@ -54,6 +57,10 @@ static void launch_fp8(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N
         dim3 block(kWave, 8);
         dim3 grid((N + 7) / 8, M);
         gemv_fp8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, epi);
+        return;
+    }
+    if (device_uses_simt_gemm()) {
+        launch_gemm_simt<SimtFp8, EpiTensorwise, OutT>(A, B, C, M, N, K, N, epi, stream);
         return;
     }
     launch_gemm_wmma<MmaFp8, EpiTensorwise, OutT>(A, B, C, M, N, K, N, epi, stream);

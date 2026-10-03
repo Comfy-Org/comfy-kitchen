@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Pure INT8 attention on RDNA matrix cores. The CUDA backend's sage_attention/
+// Pure INT8 attention on RDNA matrix cores, or on the software tile policy on Vega,
+// RDNA1 and RDNA2 (same fragment layout, see mma.h). The CUDA backend's sage_attention/
 // sources are the reference for what this computes; how it computes it differs,
 // because the RDNA fragment layout does.
 //

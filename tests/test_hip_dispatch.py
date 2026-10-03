@@ -17,12 +17,14 @@ import torch
 
 import comfy_kitchen.scaled_mm_v2 as scaled_mm_module
 from comfy_kitchen.backends import hip as hip_backend
+from comfy_kitchen.constraints import validate_function_call
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _HIP_DIR = _ROOT / "comfy_kitchen" / "backends" / "hip"
 _HIP_CMAKE = _HIP_DIR / "CMakeLists.txt"
 _HIP_ARCH_MANIFEST = _HIP_DIR / "architectures.json"
-_HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12")
+_HIP_BINDINGS = _HIP_DIR / "dlpack_bindings.cpp"
+_HIP_ARCH_GROUP_NAMES = ("software_tile", "wmma_gfx11", "wmma_gfx12")
 
 
 def _architecture_groups() -> dict[str, list[str]]:
@@ -85,12 +87,11 @@ def test_scaled_mm_does_not_probe_hip_on_non_rocm_runtime(monkeypatch):
     [
         [],
         ["gfx90a"],   # CDNA: MFMA, not WMMA
-        ["gfx1010"],  # RDNA1: neither matrix cores nor the dot-product paths
         ["gfx1201", "gfx90a"],
     ],
 )
 def test_hip_declines_unsupported_arch(arches):
-    """The backend registers for RDNA2/3/4 and nothing else."""
+    """The backend registers for the manifest's Vega and RDNA1-4 targets and nothing else."""
     assert hip_backend._unsupported_arch_reason(arches) is not None
 
 
@@ -134,27 +135,135 @@ def test_hip_declines_when_an_arch_cannot_be_read():
         (["gfx1200"], True),
         (["gfx1201", "gfx1100"], True),
         (["gfx1151"], True),
-        (["gfx1030"], False),             # RDNA2 has no matrix cores
-        (["gfx1200", "gfx1030"], False),  # kernels launch on the tensor's own device
+        (["gfx1030"], True),              # RDNA2 uses the software tile policy
+        (["gfx1200", "gfx1030"], True),   # kernels launch on the tensor's own device
         ([None], False),
     ],
 )
 def test_hip_wmma_capability(arches, expected):
-    """Only an all-matrix-core process may advertise the GEMMs."""
+    """Every validated target implements the tiled GEMM contract."""
     assert hip_backend._has_wmma(arches) is expected
 
 
-def test_hip_drops_gemms_without_matrix_cores():
-    """RDNA2 keeps the elementwise kernels and hands the GEMMs back to triton/eager."""
+@pytest.mark.parametrize(
+    ("arches", "expected"),
+    [
+        (["gfx1200"], True),
+        (["gfx1100", "gfx1151"], True),
+        (["gfx1030"], False),
+        (["gfx90c"], False),
+        (["gfx1200", "gfx1030"], False),
+    ],
+)
+def test_hip_native_wmma_capability(arches, expected):
+    assert hip_backend._has_native_wmma(arches) is expected
+
+
+def test_pageable_host_weight_is_rejected_before_launch():
+    weight = torch.empty((4, 16), dtype=torch.int8)
+    with pytest.raises(ValueError, match="offload_weight"):
+        hip_backend._weight_operand(weight, torch.device("cuda"), "weight")
+
+
+def test_aligned_pinned_host_weight_is_retained_for_the_launch():
+    class PinnedWeight:
+        device = torch.device("cpu")
+        shape = (4, 16)
+
+        def is_pinned(self):
+            return True
+
+        def contiguous(self):
+            return self
+
+        def data_ptr(self):
+            return 16
+
+    weight = PinnedWeight()
+    temporary_host_operands = []
+
+    assert (
+        hip_backend._weight_operand(
+            weight, torch.device("cuda"), "weight", temporary_host_operands=temporary_host_operands
+        )
+        is weight
+    )
+    assert temporary_host_operands == [weight]
+
+
+def test_temporary_host_operands_are_retained_until_the_launch_completes(monkeypatch):
+    class FakeEvent:
+        complete = False
+
+        def record(self, stream):
+            self.stream = stream
+
+        def query(self):
+            return self.complete
+
+    event = FakeEvent()
+    stream = object()
+    monkeypatch.setattr(hip_backend, "_pending_host_operands", [])
+    monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
+
+    operand = torch.empty(1)
+    hip_backend._retain_host_operands_until_stream_complete([operand], torch.device("cuda"))
+
+    assert event.stream is stream
+    assert hip_backend._pending_host_operands == [(event, operand)]
+
+    event.complete = True
+    hip_backend._retain_host_operands_until_stream_complete([], torch.device("cuda"))
+    assert not hip_backend._pending_host_operands
+
+
+def test_sage_direct_entries_require_tiled_attention(monkeypatch):
+    monkeypatch.setattr(hip_backend, "has_wmma", lambda: False)
+
+    calls = (
+        lambda: hip_backend.sage_int8_sdpa(None, None, None, attention_scale=1.0, attn_mask=None),
+        lambda: hip_backend.sage_int8_quantize(None, None, None),
+        lambda: hip_backend.sage_int8_attend(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            attention_scale=1.0,
+            attn_mask=None,
+            output_dtype=torch.float16,
+        ),
+    )
+
+    for call in calls:
+        with pytest.raises(RuntimeError, match="tiled-attention"):
+            call()
+
+
+def test_sage_native_entries_accept_validated_software_tile_arches():
+    bindings = _HIP_BINDINGS.read_text(encoding="utf-8")
+    common = (_HIP_DIR / "sage_attention" / "sage_common.h").read_text(encoding="utf-8")
+    groups = _architecture_groups()
+
+    assert "gfx1010" in groups["software_tile"]
+    assert all("gfx1010" not in groups[group] for group in ("wmma_gfx11", "wmma_gfx12"))
+    assert bindings.count("sage_require_supported_arch(") == 4  # definition plus entries
+    assert "!sage_is_supported_arch(properties.gcnArchName)" in bindings
+    assert "COMFY_HIP_SUPPORTED_ARCH_NAMES" in bindings
+    assert "properties.warpSize != 32" not in bindings
+    assert "independent logical partitions" in common
+
+
+def test_hip_advertises_attention_with_any_tile_policy():
     with_wmma = hip_backend._build_constraints(has_wmma=True)
     without = hip_backend._build_constraints(has_wmma=False)
 
-    # Every WMMA-only op must be advertised with matrix cores; an intersection
-    # would pass while any single one was missing from the constraints.
-    assert set(with_wmma) >= hip_backend._WMMA_ONLY_OPS
-    assert not (hip_backend._WMMA_ONLY_OPS & set(without))
-    # na3d is a matrix-core kernel: without one it traps rather than answers.
-    assert "na3d" in hip_backend._WMMA_ONLY_OPS
+    assert set(with_wmma) >= hip_backend._TILED_ATTENTION_OPS
+    assert not (hip_backend._TILED_ATTENTION_OPS & set(without))
+    for op in ("fp16_linear", "int8_linear", "convrot_w4a4_linear"):
+        assert op in without
     # The elementwise kernels need no matrix cores and must survive.
     for op in ("apply_rope", "apply_rope_", "rms_rope", "rms_rope_split_half1_", "adaln",
                "rms_adaln", "group_norm_silu_pad3d", "quantize_per_tensor_fp8", "gemv_awq_w4a16",
@@ -162,8 +271,71 @@ def test_hip_drops_gemms_without_matrix_cores():
                "dequantize_int8_convrot_weight_dtype"):
         assert op in without
     # The fused W4A8 requantize is elementwise too: it packs weights and never
-    # reaches a matrix core, so RDNA2 must keep it.
+    # reaches a matrix core, so the software tile targets must keep it.
     assert "quantize_w4a8_int8_weight" in without
+
+
+class _ReachedRopeKernelError(Exception):
+    pass
+
+
+@pytest.mark.parametrize("arch", sorted(hip_backend._ARCH_SUPPORTED))
+@pytest.mark.parametrize("freqs_dtype", (torch.bfloat16, torch.float32))
+def test_split_half_rope_eager_fallback_covers_every_software_tile_arch(
+    monkeypatch, arch, freqs_dtype
+):
+    """Every software tile target, Vega included, takes eager's split-half path with
+    half-precision frequencies; WMMA targets and fp32 frequencies reach the kernel."""
+    eager_calls = []
+
+    def eager(x, freqs):
+        eager_calls.append(x)
+        return x
+
+    def kernel_path(*args):
+        raise _ReachedRopeKernelError
+
+    monkeypatch.setattr(hip_backend, "_gfx_arch", lambda device=None: arch)
+    monkeypatch.setattr(hip_backend._eager_rope, "apply_rope_split_half1", eager)
+    monkeypatch.setattr(hip_backend, "_rope_rows", kernel_path)
+
+    xq = torch.zeros(1, 2, 4, 8)
+    freqs = torch.zeros(1, 1, 4, 4, 2, 2, dtype=freqs_dtype)
+    fallback = arch in hip_backend._ARCH_SOFTWARE_TILE and freqs_dtype != torch.float32
+    if fallback:
+        hip_backend._rope(xq, None, freqs, split_half=True)
+        assert eager_calls == [xq]
+    else:
+        with pytest.raises(_ReachedRopeKernelError):
+            hip_backend._rope(xq, None, freqs, split_half=True)
+        assert eager_calls == []
+
+
+@pytest.mark.parametrize(
+    ("operation", "weight_name", "weight_dtype", "input_width"),
+    (
+        ("fp16_linear", "weight", torch.float16, 32),
+        ("int8_linear", "weight", torch.int8, 16),
+        ("convrot_w4a4_linear", "qweight", torch.int8, 32),
+    ),
+)
+def test_hip_linear_constraints_require_pinned_cpu_weights(
+    monkeypatch, operation, weight_name, weight_dtype, input_width
+):
+    constraints = hip_backend._build_constraints()[operation]
+    kwargs = {weight_name: torch.empty(input_width, input_width, dtype=weight_dtype)}
+
+    pageable = validate_function_call(constraints, kwargs)
+    assert pageable.failed_param == weight_name
+    assert pageable.failure_reason == "CPU weights must be mapped pinned memory"
+
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
+    assert validate_function_call(constraints, kwargs).success
+
+    cpu_input = validate_function_call(
+        constraints, {"x": torch.empty(1, input_width, dtype=torch.float16)}
+    )
+    assert cpu_input.failed_param == "x"
 
 
 def test_hip_advertises_every_inplace_rope_entry():
@@ -270,7 +442,7 @@ def test_architecture_manifest_is_unique_and_shared_by_setup_and_runtime():
     assert len(manifest_archs) == len(set(manifest_archs))
     assert tuple(manifest_archs) == namespace["SUPPORTED_HIP_ARCHS"]
     assert manifest_archs == namespace["DEFAULT_HIP_ARCHS"].split(";")
-    assert set(groups["elementwise_only"]) == hip_backend._ARCH_ELEMENTWISE_ONLY
+    assert set(groups["software_tile"]) == hip_backend._ARCH_SOFTWARE_TILE
     assert set(groups["wmma_gfx11"]) == hip_backend._ARCH_WMMA_GFX11
     assert set(groups["wmma_gfx12"]) == hip_backend._ARCH_WMMA_GFX12
     assert set(manifest_archs) == hip_backend._ARCH_SUPPORTED
@@ -303,6 +475,7 @@ def test_mma_architecture_macros_are_generated_from_the_manifest():
     assert "defined(__gfx" not in mma
     assert "@COMFY_HIP_GFX11_CONDITION@" in template
     assert "@COMFY_HIP_GFX12_CONDITION@" in template
+    assert "@COMFY_HIP_WAVE64_VEGA_CONDITION@" in template
 
 
 def test_sdist_rules_include_every_hip_build_input():

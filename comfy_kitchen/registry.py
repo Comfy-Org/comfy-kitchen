@@ -17,6 +17,17 @@ from .exceptions import (
 logger = logging.getLogger("comfy_kitchen.dispatch")
 
 
+def _log_selection(message: str, *args) -> None:
+    """Debug-log a backend selection, except while dynamo traces the dispatch.
+
+    dynamo cannot trace a Logger method and breaks the graph there. A break inside
+    QuantizedTensor.from_float hands the layout's python-int shapes to the resumed
+    frame as fresh SymInts, which later fail dynamo's range checks in the next op.
+    """
+    if not torch.compiler.is_compiling():
+        logger.debug(message, *args)
+
+
 class BackendRegistry:
     def __init__(self):
         self._backends = {}  # {name: backend_module}
@@ -207,11 +218,11 @@ class BackendRegistry:
             elif validate:
                 result = self.validate_backend_for_call(override, func_name, kwargs)
                 if result.success:
-                    logger.debug("Backend %s selected for %s (override)", override, func_name)
+                    _log_selection("Backend %s selected for %s (override)", override, func_name)
                     return override
                 failures[override] = f"{result.failed_param}: {result.failure_reason}"
             else:
-                logger.debug("Backend %s selected for %s (override)", override, func_name)
+                _log_selection("Backend %s selected for %s (override)", override, func_name)
                 return override
 
         # Try backends in priority order
@@ -227,7 +238,7 @@ class BackendRegistry:
                     failures[backend_name] = f"{result.failed_param}: {result.failure_reason}"
                     continue
 
-            logger.debug("Backend %s selected for %s", backend_name, func_name)
+            _log_selection("Backend %s selected for %s", backend_name, func_name)
             return backend_name
 
         raise NoCapableBackendError(func_name, failures)

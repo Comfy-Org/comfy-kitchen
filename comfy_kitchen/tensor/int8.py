@@ -234,6 +234,8 @@ class TensorWiseINT8Layout(QuantizedLayout):
     @classmethod
     def supports_fast_matmul(cls) -> bool:
         """Check if fast INT8 matmul is available."""
+        if getattr(torch.version, "hip", None):
+            return registry.get_constraints("hip", "int8_linear") is not None
         capability = get_cuda_capability()
         if capability is None:
             return False

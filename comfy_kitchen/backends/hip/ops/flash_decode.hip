@@ -76,10 +76,14 @@ __forceinline__ __device__ float wave_sum(float v) {
     v = dpp_add<0x4E>(v);
     v = dpp_add<0x141>(v);
     v = dpp_add<0x140>(v);
+#if defined(__gfx90c__) || defined(__gfx900__) || defined(__gfx906__) || defined(__gfx90a__)
+    return v + __shfl_xor(v, 16, kWave);
+#else
     const int bits = __builtin_bit_cast(int, v);
     return v + __builtin_bit_cast(
                    float, __builtin_amdgcn_permlanex16(bits, bits, 0x76543210, 0xfedcba98, false,
                                                        false));
+#endif
 }
 
 // Splits partition [0, length). A split past the end still runs the epilogue:
@@ -332,7 +336,8 @@ void launch_groups(const void* q, const void* k, const void* v, const int* kv_le
                    hipStream_t stream) {
     switch (groups_per_pass(query_length)) {
         case 8:
-            // Cap the 256-dimensional tile at four groups to stay within the LDS budget.
+            // Cap the 256-dimensional tile at four groups to stay within the LDS
+            // budget.
             launch_typed<HeadDim, HeadDim == 128 ? 8 : 4>(
                 q, k, v, kv_lengths, out, softmax_lse, out_accum, lse_accum, batch,
                 query_length, heads, kv_capacity, num_splits, q_batch_stride, q_row_stride,

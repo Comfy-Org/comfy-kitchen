@@ -144,14 +144,15 @@ def test_flash_attention_decode_availability_checks_capability_and_kernel(
     assert flash_attention_module.is_available() is expected
 
 
-@pytest.mark.parametrize("has_wmma", [True, False])
-def test_flash_attention_decode_hip_gate_follows_bf16_arch(monkeypatch, has_wmma):
+@pytest.mark.parametrize("has_native_wmma", [True, False])
+def test_flash_attention_decode_hip_gate_follows_bf16_arch(monkeypatch, has_native_wmma):
     """On ROCm the gate is the arch's bf16 support, not a compute capability.
 
     torch.cuda is the ROCm API there and reports an SM-shaped capability for a
-    gfx part, so the CUDA test above would wave RDNA2 through. RDNA2 has no
-    bf16, and a caller that drops to another dtype there arrives with a KV
-    cache this kernel declines. WMMA marks the same line: gfx11 and newer.
+    gfx part, so the CUDA test above would wave RDNA2 through. Vega, RDNA1 and
+    RDNA2 have no bf16, and a caller that drops to another dtype there arrives
+    with a KV cache this kernel declines. Native WMMA marks the same line: gfx11
+    and newer.
     """
     if not getattr(torch.version, "hip", None):
         pytest.skip("requires a ROCm PyTorch runtime")
@@ -159,9 +160,9 @@ def test_flash_attention_decode_hip_gate_follows_bf16_arch(monkeypatch, has_wmma
         pytest.skip("requires the built HIP extension")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(
-        flash_attention_module._hip_backend, "has_wmma", lambda: has_wmma
+        flash_attention_module._hip_backend, "has_native_wmma", lambda: has_native_wmma
     )
-    assert flash_attention_module.is_available() is has_wmma
+    assert flash_attention_module.is_available() is has_native_wmma
 
 
 @requires_flash_decode

@@ -167,7 +167,7 @@ def _validate_inputs(
     if not is_available(q.device):
         raise RuntimeError(
             "INT8 attention requires the comfy-kitchen CUDA extension on SM75 or newer, "
-            "or the HIP extension on an AMD device with matrix cores (RDNA3 or newer)"
+            "or the HIP extension on a validated AMD device (Vega, RDNA1 or newer)"
         )
 
     batch, q_heads, q_length, head_dim = q.shape
@@ -483,7 +483,7 @@ def int8_attention_from_prequantized(
     if not is_available(quantized.q.device):
         raise RuntimeError(
             "INT8 attention requires the comfy-kitchen CUDA extension on SM75 or newer, "
-            "or the HIP extension on an AMD device with matrix cores (RDNA3 or newer)"
+            "or the HIP extension on a validated AMD device (Vega, RDNA1 or newer)"
         )
 
     batch, q_heads, q_length, kernel_head_dim = quantized.q.shape

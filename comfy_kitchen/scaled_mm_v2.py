@@ -54,8 +54,9 @@ def _hip_fp8_gemm(
     if not registry.is_available("hip"):
         return None
     # This path skips the registry, so its per-architecture capability filter does
-    # not cover it. RDNA2 registers for the elementwise kernels but has no matrix
-    # cores and its GEMM traps, so test for WMMA rather than availability.
+    # not cover it. has_wmma() admits native WMMA and the software tile policy
+    # (Vega, RDNA1, RDNA2) alike; it is false only when a visible device is off
+    # the manifest, so test it rather than availability.
     if not hip.has_wmma():
         return None
     # Availability is process-wide, but the kernel launches on one device and takes

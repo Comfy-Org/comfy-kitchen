@@ -9,7 +9,7 @@ from comfy_kitchen.tensor import (
     TensorWiseINT8Layout,
 )
 
-from .conftest import assert_values_close
+from .conftest import assert_values_close, inductor_unusable_reason
 
 
 class DummyQuantizedModel(torch.nn.Module):
@@ -179,6 +179,9 @@ class TestQuantizedCompile:
         if not layout_cls.supports_fast_matmul():
             reqs = layout_cls.get_requirements()
             pytest.skip(f"{layout_cls.__name__} matmul not supported (requires SM >= {reqs['min_sm_version']}, have {reqs['current_sm_version']})")
+        reason = inductor_unusable_reason("cuda")
+        if reason is not None:
+            pytest.skip(reason)
         return DummyQuantizedModel(
             in_features=64, hidden=128, out_features=32, layout_cls=layout_cls.__name__, device="cuda"
         )

@@ -28,6 +28,16 @@ from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
 from triton.language.extra import libdevice
 
 
+def _is_gfx10(tensor: torch.Tensor) -> bool:
+    if not getattr(torch.version, "hip", None):
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(tensor.device).gcnArchName.split(":")[0]
+    except (AttributeError, RuntimeError):
+        return False
+    return arch.startswith("gfx10")
+
+
 @triton.jit
 def quantize_fp8_kernel_tl(
     x_ptr,
@@ -55,6 +65,13 @@ def quantize_fp8_kernel_tl(
 def quantize_per_tensor_fp8(
     x: torch.Tensor, scale: torch.Tensor, output_type: torch.dtype = torch.float8_e4m3fn
 ) -> torch.Tensor:
+    if _is_gfx10(x):
+        from comfy_kitchen.backends.eager.quantization import (
+            quantize_per_tensor_fp8 as eager_quantize,
+        )
+
+        return eager_quantize(x, scale, output_type)
+
     if output_type == torch.float8_e4m3fn:
         lp_max = F8_E4M3_MAX
     elif output_type == torch.float8_e5m2:
@@ -124,6 +141,13 @@ def dequantize_fp8_kernel_tl(
 def dequantize_per_tensor_fp8(
     x: torch.Tensor, scale: torch.Tensor, output_type: torch.dtype = torch.bfloat16
 ) -> torch.Tensor:
+    if _is_gfx10(x):
+        from comfy_kitchen.backends.eager.quantization import (
+            dequantize_per_tensor_fp8 as eager_dequantize,
+        )
+
+        return eager_dequantize(x, scale, output_type)
+
     if not x.is_contiguous():
         x = x.contiguous()
 
@@ -338,6 +362,11 @@ def quantize_nvfp4(
     pad_16x: bool = False,
     hi_first: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if _is_gfx10(x):
+        from comfy_kitchen.backends.eager.quantization import quantize_nvfp4 as eager_quantize
+
+        return eager_quantize(x, per_tensor_scale, epsilon, pad_16x, hi_first)
+
     # Note: epsilon is accepted for API compatibility but not currently used
     orig_shape = x.shape
 
@@ -545,6 +574,11 @@ def dequantize_nvfp4(
     output_type: torch.dtype = torch.bfloat16,
     hi_first: bool = True,
 ) -> torch.Tensor:
+    if _is_gfx10(qx):
+        from comfy_kitchen.backends.eager.quantization import dequantize_nvfp4 as eager_dequantize
+
+        return eager_dequantize(qx, per_tensor_scale, block_scales, output_type, hi_first)
+
     # Triton backend: fused kernel with inline SM100 cvt.rn.f16x2.e2m1x2 instruction
     block_size = 16
     tile_size = 128
@@ -699,6 +733,11 @@ def quantize_mxfp8(
     Returns:
         Tuple of (quantized_fp8_tensor, block_scales_e8m0)
     """
+    if _is_gfx10(x):
+        from comfy_kitchen.backends.eager.quantization import quantize_mxfp8 as eager_quantize
+
+        return eager_quantize(x, pad_32x)
+
     block_size = 32
 
     # Handle padding
@@ -820,6 +859,11 @@ def triton_quantize_rowwise(x: torch.Tensor):
     Input: [Batch, Dim] (float16/bfloat16/float32)
     Output: [Batch, Dim] (int8), [Batch, 1] (float32)
     """
+    if _is_gfx10(x):
+        from comfy_kitchen.backends.eager.quantization import quantize_int8_rowwise
+
+        return quantize_int8_rowwise(x)
+
     rows, cols = x.shape
     y = torch.empty_like(x, dtype=torch.int8)
     s = torch.empty((rows, 1), device=x.device, dtype=torch.float32)

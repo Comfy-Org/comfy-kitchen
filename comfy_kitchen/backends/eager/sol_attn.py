@@ -195,9 +195,13 @@ def sol_attn(
     qblk = torch.arange(t, device=q.device) // BLOCK
     if block_len is not None:   # dead query rows must not enter the block's mean
         s_blk = s_blk * _valid_rows(t, lengths).view(1, 1, t, 1)
-    colmean = torch.zeros(b, h, n, n, device=q.device, dtype=s_blk.dtype)
-    colmean.scatter_add_(2, qblk.view(1, 1, t, 1).expand(b, h, t, n), s_blk)
-    colmean = colmean / lengths.view(1, 1, n, 1)
+    # A fixed-order reduction over each query block, not scatter_add: its fp32 atomics
+    # sum in arbitrary order, so identical key blocks can score a few ulps apart, and
+    # top-k then splits a tied group the ">=" below is meant to keep whole.
+    pad = n * BLOCK - t
+    if pad:
+        s_blk = torch.cat([s_blk, s_blk.new_zeros(b, h, pad, n)], dim=2)
+    colmean = s_blk.view(b, h, n, BLOCK, n).sum(dim=3) / lengths.view(1, 1, n, 1)
     idx = torch.arange(n, device=q.device)
     if topk_ratio:
         # sink blocks are always exact, so they neither count toward nor consume the budget

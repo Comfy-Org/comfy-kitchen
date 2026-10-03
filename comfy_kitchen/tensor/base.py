@@ -30,7 +30,7 @@ def get_layout_class(name: str):
 @lru_cache(maxsize=1)
 def get_cuda_capability() -> tuple[int, int] | None:
     """Get CUDA compute capability (SM version), cached."""
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or getattr(torch.version, "hip", None):
         return None
     return torch.cuda.get_device_capability()
 

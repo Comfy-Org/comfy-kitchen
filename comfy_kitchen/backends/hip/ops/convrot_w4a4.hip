@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// ConvRot W4A4 on WMMA (iu4: 16x16x32 on gfx12, 16x16x16 on gfx11). See mma.h.
+// ConvRot W4A4 on WMMA (iu4: 16x16x32 on gfx12, 16x16x16 on gfx11), as a
+// thread-level GEMM on gfx90c and gfx1010 (gemm_simt.h), and on the software tile
+// policy on the other pre-WMMA targets. See mma.h.
 //
 // out = (Aq[M, K/2] @ Wq[N, K/2]^T) * x_scale[row] * w_scale[col] + bias
 //
@@ -12,6 +14,7 @@
 #include <string>
 
 #include "../epilogue.h"
+#include "../gemm_simt.h"
 #include "../gemm_wmma.h"
 #include "../hadamard.h"
 
@@ -33,6 +36,10 @@ template <typename OutT>
 static void launch_w4a4(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int K,
                         EpiRowwise epi, hipStream_t stream) {
     const int kbytes = K / 2;
+    if (device_uses_simt_gemm()) {
+        launch_gemm_simt<SimtInt4, EpiRowwise, OutT>(A, B, C, M, N, kbytes, N, epi, stream);
+        return;
+    }
     if (M >= 512 && N >= 128 && K > N) {
         constexpr int BM = 256, BN = 128, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);

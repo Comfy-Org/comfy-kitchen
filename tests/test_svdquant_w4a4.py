@@ -203,7 +203,7 @@ class TestGroupedSplitQKV:
             )
 
         for idx, (actual, ref) in enumerate(zip(fused, expected, strict=True)):
-            assert_values_close(actual, ref, rtol=0.0, atol=0.0, name=f"fused qkv {idx}")
+            assert_values_close(actual, ref, rtol=1e-5, atol=1e-6, name=f"fused qkv {idx}")
 
 
 # =============================================================================

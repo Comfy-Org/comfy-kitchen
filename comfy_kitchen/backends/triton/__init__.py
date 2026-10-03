@@ -43,6 +43,7 @@ from comfy_kitchen.registry import registry
 
 _TRITON_AVAILABLE = True
 _TRITON_ERROR = None
+_TRITON_UNSUPPORTED_HIP_ARCHS = frozenset({"gfx900", "gfx906", "gfx90c"})
 
 try:
     import triton  # noqa: F401
@@ -125,6 +126,22 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _int8_linear_call_rule(kwargs):
+        x = kwargs.get("x")
+        if x is None or not getattr(torch.version, "hip", None):
+            return ValidationResult.ok()
+        try:
+            arch = torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0]
+        except (AttributeError, RuntimeError):
+            return ValidationResult.fail(
+                "__hardware__", "could not determine ROCm GPU architecture"
+            )
+        if arch in _TRITON_UNSUPPORTED_HIP_ARCHS or arch.startswith("gfx10"):
+            return ValidationResult.fail(
+                "__hardware__", f"Triton INT8 dot is unsupported on {arch}"
+            )
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -248,6 +265,7 @@ def _build_constraints() -> dict:
             },
             default_devices=triton_devices,
             min_compute_capability=(8, 0),  # Required for Triton INT8 dot
+            call_rules=(_int8_linear_call_rule,),
         ),
         "w4a8_int8_linear": FunctionConstraints(
             params={
@@ -264,6 +282,7 @@ def _build_constraints() -> dict:
             },
             default_devices=triton_devices,
             min_compute_capability=(8, 0),  # Required for Triton INT8 dot
+            call_rules=(_int8_linear_call_rule,),
         ),
         "quantize_int8_rowwise": FunctionConstraints(
             params={
@@ -351,6 +370,20 @@ def _register():
     if not has_cuda and not has_xpu:
         registry.mark_unavailable("triton", "Neither CUDA nor XPU available on this system")
         return
+
+    if getattr(torch.version, "hip", None) and has_cuda:
+        architectures = {
+            torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+            for device in range(torch.cuda.device_count())
+        }
+        unsupported_architectures = architectures & _TRITON_UNSUPPORTED_HIP_ARCHS
+        if unsupported_architectures:
+            registry.mark_unavailable(
+                "triton",
+                "Triton is unsupported on ROCm architecture "
+                f"{sorted(unsupported_architectures)[0]}",
+            )
+            return
 
     registry.register(
         name="triton",

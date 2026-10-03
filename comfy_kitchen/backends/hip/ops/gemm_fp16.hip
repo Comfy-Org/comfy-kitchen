@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// FP16 GEMM on WMMA (v_wmma_f32_16x16x16_f16), gfx11 and gfx12. See mma.h.
+// FP16 GEMM on WMMA (v_wmma_f32_16x16x16_f16), gfx11 and gfx12. See mma.h. The Python
+// layer sends pre-WMMA devices to rocBLAS instead: the software fp16 tile was 7x to
+// 15x slower there.
 //   D[M, N] = A[M, K] @ B[N, K]^T + bias, or resid + rscale * (that) fused.
 // The accumulators are fp32, so this is at least as accurate as the fp16-accumulate
 // contract fp16_linear promises. Returns false for shapes the caller must serve.

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // FP16 NDHWC conv3d as an implicit GEMM on the WMMA tile core, with bias and an
-// optional residual in the epilogue. Zero padding only: callers pre-pad
+// optional residual in the epilogue. Native WMMA only: the Python layer sends
+// pre-WMMA devices to a windowed MIOpen conv instead. Zero padding only: callers pre-pad
 // (group_norm_pad3d.hip). Row m of the implicit A operand is the input patch under
 // output position m, gathered 8 channels at a time straight from x, so no im2col
 // buffer exists; B is the weight in its channels_last_3d (K, T, R, S, C) layout and

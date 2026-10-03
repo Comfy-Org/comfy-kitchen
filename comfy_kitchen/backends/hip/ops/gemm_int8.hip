@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// INT8 GEMM on WMMA (v_wmma_i32_16x16x16_iu8), gfx11 and gfx12. See mma.h.
+// INT8 GEMM on WMMA (v_wmma_i32_16x16x16_iu8) on gfx11 and gfx12, as a thread-level
+// GEMM on gfx90c and gfx1010 (gemm_simt.h), and on the software tile policy
+// (sdot4 on gfx103x) on the other pre-WMMA targets. See mma.h.
 // C[M, N] = (A[M, K] @ B[N, K]^T) * scale_a[row] * scale_b[col] + bias
 #include <stdexcept>
 #include <string>
 
 #include "../epilogue.h"
+#include "../gemm_simt.h"
 #include "../gemm_wmma.h"
 #include "../launchers.h"
 
@@ -53,6 +56,10 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
         dim3 block(kWave, 8);
         dim3 grid((N + 7) / 8, M);
         gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
+        return;
+    }
+    if (device_uses_simt_gemm()) {
+        launch_gemm_simt<SimtInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
         return;
     }
     launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
