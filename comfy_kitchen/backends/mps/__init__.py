@@ -3,7 +3,9 @@
 
 Apple GPUs before M5 have no fast integer matrix path, so this backend is
 weight-only: integer weights stay resident in memory, are decoded to fp16 by a
-single-pass Metal kernel, and feed the stock fp16 GEMM. Activations are not
+single-pass Metal kernel, and feed the stock fp16 GEMM. Activation rows and weight
+rows are scaled by exact powers of two first, so the fp16 GEMM cannot overflow;
+a fused epilogue restores the range in the output dtype. Activations are not
 quantized. ConvRot checkpoints store the weight already rotated, so the
 activation is rotated online (cheap, group-wise) instead of un-rotating the
 weight on every call.
