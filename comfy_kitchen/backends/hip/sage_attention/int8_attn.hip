@@ -355,16 +355,22 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
     // is cancelled by o_bias every 8 tiles, which bounds how much of the mantissa
     // small outputs can lose. gfx12 has had this; gfx11 had kBiasPV hard false.
     //
-    // The HD==64 arm stays as upstream had it -- masked modes only. Widening it to
-    // the unmasked path (the one SDXL spends most of its attention time in) was
-    // tried and measured **slower**, so the asymmetry is real rather than an
-    // oversight: at HD=64 the tile is DT=4 x KT=4, i.e. 16 conversions against 16
-    // MMAs instead of HD=128's 64 against 32, so there is nothing to win, while
-    // the o_bias cancellation (DT x 8 subtractions every 8 tiles) is paid either
-    // way. Measured on gfx1103 at B2 S1024x1024 H20 D64: attend 1.196 -> 1.347 ms,
-    // 0.89x. Numerics were fine (ck_tools/ck_attn_check.py: relative error against
-    // a float32 SDPA unchanged at 0.01370), which is the point -- it is a
-    // performance result, not a correctness one.
+    // Both directions of this have been measured on gfx1103, because the obvious
+    // "make it symmetric" edits are both wrong:
+    //
+    //   * Turning it ON for the unmasked HD=64 path (what SDXL spends most of its
+    //     attention time in) is **slower**: attend 1.196 -> 1.347 ms at B2 S1024x1024
+    //     H20 D64, 0.89x. At HD=64 the tile is DT=4 x KT=4, so 16 conversions
+    //     against 16 MMAs -- there is nothing to win, while the o_bias cancellation
+    //     (DT x 8 subtractions every 8 tiles) is paid either way.
+    //   * Turning it OFF for HD=128 is also slower: B2 S4096x4096 H16 D128 attend
+    //     25.39 -> 26.55 ms (0.956x), S4096x512 3.23 -> 3.40, S9216x9216 132.96 ->
+    //     135.06. There the tile is DT=8 x KT=4, i.e. 64 conversions against 32
+    //     MMAs, so removing them costs more than the bookkeeping adds.
+    //
+    // Both are performance results, not correctness ones: ck_attn_check.py shows
+    // the relative error against a float32 SDPA unchanged (0.01370 at HD=64) when
+    // the HD=64 arm is enabled.
     constexpr bool kBiasPV = (HD == 128 && (!kCustomMask || kPrepared)) ||
                              (HD == 64 && (kPreparedKey || kDirectKey || kPreparedDense16));
     // Adding a signed integer x to these bits gives the exact FP32 value
