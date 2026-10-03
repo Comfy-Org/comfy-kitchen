@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
+﻿// SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
 // Tiled WMMA GEMM core, shared by the fp8, int8, int4 and fp16 paths and the fp16
@@ -253,24 +253,32 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
 // ---------------------------------------------------------------------------
 // Tile selection, shared by the fp8 and int8 launchers.
 // ---------------------------------------------------------------------------
-
-// Tile override for A/B measurement only: COMFY_GEMM_TILE=<BM>x<BN>x<BKB>.
-// Empty (the default) means "use the heuristic below".
 //
-// This exists because the tile heuristics in this file were tuned one shape at a
-// time, and the most recent gfx1103 sweep found a systematic ~14-25% gap between
-// the deep-K (kbytes >= 4096 -> BKB 128) shapes and every BKB 64 shape. Measuring
-// that needs every tile live in **one** process: a rebuild-per-point sweep cannot
-// do it, because the first GEMM after a rebuild runs on cold clocks and the
-// difference being chased is smaller than that ramp (measured here: the same
-// shape, 0.575 ms late in a process vs 1.129 ms first in one -- a 1.9x artifact).
-// Hence the uncached getenv: reading it once per process would force one tile per
-// process and put the cross-process variance (measured 8-43% on this box) right
-// on top of the effect.
-inline const char* comfy_gemm_tile_override() {
-    const char* s = getenv("COMFY_GEMM_TILE");
-    return (s && *s) ? s : "";
-}
+// Do not retune these numbers without re-running the sweeps in ck_tools/; three
+// separate attempts to do better all measured worse on the 6-WGP 780M, and the
+// kernel is at the machine's limit rather than short of one. All three used
+// ck_tools/ck_tile_ab.py, which A/Bs every candidate against this heuristic in a
+// single process with forward *and* reverse rotation (the first candidate in a
+// rotation is otherwise systematically slow and invents ~1.4x on shapes that
+// change nothing).
+//
+//   1. Wider tiles. 128x128 has 2*BM*BN/(BM+BN) = 128 ops per byte of global
+//      traffic, and the kernel moves that at ~100 GB/s, which accounts for the
+//      ~12 TOPS it measures -- so widening the tile looked like the obvious fix.
+//      256x128 (170 ops/byte) and 256x256 (256 ops/byte) measured 0.49x-0.92x.
+//      TM/TN doubles with the tile, and the accumulators alone reach 64-128 VGPRs,
+//      which spills. Arithmetic intensity is bought with the register file here.
+//   2. More independent WMMA chains. ck_tools/wmma_peak.hip issues MMAs from a
+//      fixed accumulator set with no memory traffic and finds 1/2/4 accumulators
+//      all plateau at 7.9 TOPS while 8 reach 31 and 16 reach 62, so TM*TN = 4
+//      looked like a stall. Reshaping the warp grid to 8 chains at the same tile
+//      (TM=4,TN=2 or TM=2,TN=4) measured 0.88x-0.94x. The microkernel stalls
+//      because nothing else is in flight; this kernel has LDS loads and the K
+//      loop around each MMA, so there is already enough to cover the latency, and
+//      the extra registers only cost occupancy.
+//   3. 64x64 and 64x128 tiles are within 1% on every workload shape. The two
+//      that beat this heuristic do so by 1.03x-1.09x on shapes worth 0.1-0.25% of
+//      a step, and both lose on other shapes in the same family.
 
 // hipDeviceAttributeMultiprocessorCount reports WGPs on RDNA, not CUs (32 on a
 // 64-CU gfx1201), and a workgroup schedules onto a WGP, so WGPs are the unit the
@@ -311,50 +319,6 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
     // least half empty, and the finer 64x64 grid recovers the wasted MMAs.
     const bool skinny = (M <= 64 || N <= 64);
 
-    // Measurement override: the four instantiations below are the only ones this
-    // device's workload reaches, so dispatch by name rather than parsing a tuple.
-    // Only the 128x128 grid comes in a BKB 64 and a BKB 128 flavor; the 64x64 grid
-    // has one 512-thread and one 128-thread form.
-    if (const char* ov = comfy_gemm_tile_override(); *ov) {
-        if (strcmp(ov, "128x128x64") == 0) {
-            constexpr int BM = 128, BN = 128, BKB = 64;
-            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
-                <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
-            return;
-        }
-        if (strcmp(ov, "128x128x128") == 0) {
-            constexpr int BM = 128, BN = 128, BKB = 128;
-            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
-                <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
-            return;
-        }
-        if (strcmp(ov, "64x64x64") == 0) {
-            constexpr int BM = 64, BN = 64, BKB = 64;
-            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
-                <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
-            return;
-        }
-        if (strcmp(ov, "64x64x128") == 0) {
-            constexpr int BM = 64, BN = 64, BKB = 128;
-            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
-                <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
-            return;
-        }
-        if (strcmp(ov, "128x128x64w8") == 0) {
-            constexpr int BM = 128, BN = 128, BKB = 64;
-            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>
-                <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
-            return;
-        }
-        // Unknown name: fall through to the heuristic rather than silently
-        // picking something, so a typo shows up as "no effect", not as a
-        // mysterious regression.
-    }
 
     // The gfx1103-only branch, keyed on the architecture rather than a WGP
     // threshold: low-WGP devices (6 WGPs on a 780M, 8 on a 680M) have too few

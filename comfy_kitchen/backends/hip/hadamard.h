@@ -72,25 +72,7 @@ inline int convrot_max_k(int in_dtype, int block_threads = 256) {
     return static_cast<int>((static_cast<size_t>(lds) - static_lds) / element_size);
 }
 
-// Block-thread override for A/B measurement only: COMFY_CONVROT_BLOCK=<n>.
-// 0 / unset means "use the heuristic below".
-//
-// Same reasoning as COMFY_GEMM_TILE in gemm_wmma.h: the block shape has to be
-// sweepable from inside one process, because the cold-clock ramp on this device
-// (measured 1.9x on the first GEMM of a process) is larger than the differences
-// being chased. Read per call so one process can interleave every block size
-// under the same clocks.
-inline int comfy_convrot_block_override() {
-    const char* s = getenv("COMFY_CONVROT_BLOCK");
-    if (!s || !*s) return 0;
-    const int v = atoi(s);
-    return (v > 0 && (v % 64) == 0) ? v : 0;
-}
-
 inline int convrot_quant_fused_block_threads(int M, int K) {
-    if (const int ov = comfy_convrot_block_override(); ov > 0) {
-        return ov;
-    }
     if (M == 1) {
         return 512;
     }
@@ -127,6 +109,14 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
     // Note this is the **activation** quantizer, which is 7-56% of every
     // convrot=True int8_linear call, so it is not a rounding error even though
     // the GEMM it feeds is already at the machine ceiling.
+    //
+    // Re-measure with ck_tools/ck_convrot_ab.py before changing it. That script
+    // A/Bs every block width in one process; a rebuild-per-width sweep cannot be
+    // trusted here, because the first GEMM after a rebuild runs on cold clocks on
+    // this device (measured 1.9x), which is larger than the differences being
+    // chased. Only {64, 128, 256, 512, 640, 768, 1024} are instantiated, and
+    // anything else silently becomes 1024 -- which reads, in a sweep, exactly
+    // like "block width does not matter".
     if (comfy_small_igpu()) {
         return (K / kConvRotGroup256) <= 10 ? 64 : 256;
     }

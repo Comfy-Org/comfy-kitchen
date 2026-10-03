@@ -342,12 +342,20 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
     constexpr bool kPrepared = kPreparedKey || kPreparedDense || kDirectKey;
     constexpr bool kDense = kPreparedDense;
     constexpr bool kCustomMask = kMask != MaskMode::kNone;
-#if defined(COMFY_MMA_GFX12)
+    // Starting the integer MMA at kIntBias instead of zero lets its int32 result
+    // feed the FP32 FMA by bitcast, so the PV tile costs one FMA per output
+    // element instead of an FMA **and** an int32->fp32 conversion. On gfx11 that
+    // conversion was the dominant non-MMA cost: per key tile each thread does
+    // DT * KT MMAs (8 * 4 = 32 at HD=128) against DT * 8 conversions, so the
+    // conversions outnumbered the MMAs two to one.
+    //
+    // The bias is exact, not a rounding trick: adding 12582912 to an integer whose
+    // magnitude is bounded by the static_assert above yields the FP32 value
+    // 12582912 + x bit for bit, and the 12582912 * tile_scale each tile contributes
+    // is cancelled by o_bias every 8 tiles, which bounds how much of the mantissa
+    // small outputs can lose. gfx12 has had this; gfx11 had kBiasPV hard false.
     constexpr bool kBiasPV = (HD == 128 && (!kCustomMask || kPrepared)) ||
                              (HD == 64 && (kPreparedKey || kDirectKey || kPreparedDense16));
-#else
-    constexpr bool kBiasPV = false;
-#endif
     // Adding a signed integer x to these bits gives the exact FP32 value
     // 12582912 + x while |x| <= 2^22. A PV tile is bounded by
     // CTA_K * 128 * 255, including the most negative signed INT8 value.
