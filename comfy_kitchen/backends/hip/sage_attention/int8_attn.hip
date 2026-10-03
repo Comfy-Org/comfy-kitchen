@@ -354,6 +354,17 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
     // 12582912 + x bit for bit, and the 12582912 * tile_scale each tile contributes
     // is cancelled by o_bias every 8 tiles, which bounds how much of the mantissa
     // small outputs can lose. gfx12 has had this; gfx11 had kBiasPV hard false.
+    //
+    // The HD==64 arm stays as upstream had it -- masked modes only. Widening it to
+    // the unmasked path (the one SDXL spends most of its attention time in) was
+    // tried and measured **slower**, so the asymmetry is real rather than an
+    // oversight: at HD=64 the tile is DT=4 x KT=4, i.e. 16 conversions against 16
+    // MMAs instead of HD=128's 64 against 32, so there is nothing to win, while
+    // the o_bias cancellation (DT x 8 subtractions every 8 tiles) is paid either
+    // way. Measured on gfx1103 at B2 S1024x1024 H20 D64: attend 1.196 -> 1.347 ms,
+    // 0.89x. Numerics were fine (ck_tools/ck_attn_check.py: relative error against
+    // a float32 SDPA unchanged at 0.01370), which is the point -- it is a
+    // performance result, not a correctness one.
     constexpr bool kBiasPV = (HD == 128 && (!kCustomMask || kPrepared)) ||
                              (HD == 64 && (kPreparedKey || kDirectKey || kPreparedDense16));
     // Adding a signed integer x to these bits gives the exact FP32 value
