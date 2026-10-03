@@ -233,14 +233,12 @@ inline void dispatch_convrot_row_type(int in_dtype, Fn fn) {
 
 // Pick fused-kernel block width from convrot_quant_fused_block_threads().
 //
-// Only these widths are instantiated, so anything else has to land on one of
-// them. The previous `else -> 1024` was a **silent** fallback: a sweep that asked
-// for 128/192/256/320/384/448 got 1024 for every one of them and reported a flat
-// plateau, which reads exactly like "block size does not matter between 128 and
-// 448". Round to the nearest instantiated width instead, and keep the ladder in
-// sync with the callers below.
-constexpr int kConvrotFusedBlockLadder[] = {64, 128, 256, 512, 640, 768, 1024};
-
+// These are the widths the kernel is instantiated at. 128 and 256 used to be
+// absent and fell through to the 1024 arm: a sweep asking for 128/192/256/320/
+// 384/448 therefore measured 1024 seven times and reported a flat plateau, which
+// reads exactly like "block width does not matter between 128 and 448". Both are
+// now real instantiations, and both are what convrot_quant_fused_block_threads
+// can actually return on the small iGPU (64 and 256).
 template <typename Fn>
 inline void dispatch_convrot_fused_block_threads(int block_threads, Fn fn) {
     if (block_threads == 64) {
