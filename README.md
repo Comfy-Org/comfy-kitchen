@@ -56,6 +56,30 @@ Ascend support for `quantize_and_rotate_rowwise` requires
 These capabilities are registered only when the
 corresponding operator is available.
 
+## Apple GPU (mps) backend
+
+The `mps` backend runs `int8_linear` (INT8, optionally ConvRot) and
+`w4a8_int8_linear` (the `AsymW4A8Int8Layout` formats: 4-bit with or without a
+codebook, 6-bit, symmetric or asymmetric) on Apple GPUs, plus
+`dequantize_w4a8_int8_weight` and `quantize_w4a8_int8_weight` (eager on the
+CPU) so hosts can merge LoRAs into those weights. It is registered when MPS is
+available and `torch.mps.compile_shader` exists.
+
+Apple GPUs before M5 have no fast integer matrix path, so the backend is
+weight-only: integer weights stay resident, a Metal kernel decodes them to fp16,
+and the stock fp16 GEMM runs. Activations are not quantized. A fused prologue
+divides each activation row by an exact power of two (and applies the ConvRot
+rotation in the same pass), the decode does the same per weight row, and a fused
+epilogue restores both exponents, adds bias and residual in eager's order, and
+writes the output dtype. Every GEMM operand is at most 1, so the fp16 GEMM cannot
+overflow for K up to 65504; wider layers compute in fp32.
+
+`int8_linear` and `w4a8_int8_linear` also take an unmerged LoRA (`lora_down`
+[R, K], `lora_up` [N, R], `lora_scale`), computed as if the weight were
+`W + lora_scale * lora_up @ lora_down` without forming that matrix. These are
+opt-in arguments: a backend that does not declare them is skipped for calls that
+pass them.
+
 ## Huawei Ascend backend
 
 Ascend `convrot_w4a4_linear` requires `npu_quant_matmul`, not RotateQuant.

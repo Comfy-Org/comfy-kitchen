@@ -496,3 +496,224 @@ def test_ldexp_bits_rounds_like_float64():
     lib.ldexp_probe(out, x.to(D).view(torch.int32), s.to(D))
     want = torch.ldexp(x.double(), s.double()).float()  # one rounding, ties to even
     assert torch.equal(out.cpu().view(torch.float32), want)
+
+
+# --- Unmerged LoRA (lora_down / lora_up / lora_scale) ---------------------------------------
+
+
+def _lora(n, k, rank, seed=1, down_std=0.05, up_std=0.05):
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randn(rank, k, generator=gen) * down_std, torch.randn(n, rank, generator=gen) * up_std
+
+
+def _merged_oracle(x, wd, down, up, scale, bias=None, res=None, rs=None):
+    """float64 CPU linear over the merged weight W + scale * up @ down (original basis)."""
+    w = wd.double() + scale * up.double() @ down.double()
+    out = x.cpu().double() @ w.T
+    if bias is not None:
+        out = out + bias.cpu().double()
+    if res is not None:
+        out = res.cpu().double() + rs.cpu().double() * out
+    return out
+
+
+@pytest.mark.parametrize("dtype,tol", [(torch.float16, 1e-3), (torch.bfloat16, 6e-3)])
+@pytest.mark.parametrize("rank", [16, 64])
+@pytest.mark.parametrize("convrot", [True, False])
+@pytest.mark.parametrize("bias", [True, False])
+@pytest.mark.parametrize("residual", [True, False])
+def test_lora_matches_merged_oracle(dtype, tol, rank, convrot, bias, residual):
+    n, k, m = 384, 1024, 37
+    q, s, wd = _make(n, k, True, convrot)
+    down, up = _lora(n, k, rank)
+    x = torch.randn(2, m, k)
+    b = torch.randn(n) if bias else None
+    res, rs = (torch.randn(2, m, n), torch.rand(n)) if residual else (None, None)
+    exact = _merged_oracle(x, wd, down, up, 0.7, b, res, rs)
+    # The LoRA term is a large part of the result, so dropping or mis-rotating it fails.
+    assert _rel(_merged_oracle(x, wd, down, up, 0.0, b, res, rs), exact) > 10 * tol
+    out = ck.int8_linear(
+        x.to(D, dtype), q.to(D), s.to(D), None if b is None else b.to(D, dtype), dtype,
+        convrot=convrot, convrot_groupsize=G,
+        residual=None if res is None else res.to(D, dtype), residual_scale=None if rs is None else rs.to(D, dtype),
+        lora_down=down.to(D, dtype), lora_up=up.to(D, dtype), lora_scale=0.7,
+    )
+    assert out.dtype == dtype and out.shape == (2, m, n)
+    assert _rel(out.cpu().double(), exact) < tol
+
+
+@pytest.mark.parametrize("n,m", [(382, 37), (384, 1), (8, 9)])
+def test_lora_odd_shapes_use_the_scalar_epilogue(n, m):
+    # N % 4 != 0 takes the one-column kernel; M below and between the 8-row blocks.
+    k = 512
+    q, s, wd = _make(n, k, True, True)
+    down, up = _lora(n, k, 16)
+    x = torch.randn(m, k)
+    out = ck.int8_linear(x.to(D, torch.float32), q.to(D), s.to(D), None, torch.float32, convrot=True,
+                         convrot_groupsize=G, lora_down=down.to(D), lora_up=up.to(D), lora_scale=1.5)
+    assert _rel(out.cpu().double(), _merged_oracle(x, wd, down, up, 1.5)) < 2e-4
+
+
+def test_lora_chunked_and_transposed_decode_match(monkeypatch):
+    # Chunks start at col0 > 0, which the epilogue uses to index the up weight.
+    from comfy_kitchen.backends.mps import linear
+    q, s, wd = _make(512, 1024, True, True)
+    down, up = _lora(512, 1024, 64)
+    x = torch.randn(9, 1024)
+    args = (x.to(D, torch.float16), q.to(D), s.to(D))
+    kw = {"out_dtype": torch.float16, "convrot": True, "lora_down": down.to(D), "lora_up": up.to(D), "lora_scale": 0.5}
+    a = linear.int8_linear(*args, **kw)
+    monkeypatch.setattr(linear, "_MAX_DECODE_BYTES", 2 * 1024 * 100)
+    b = linear.int8_linear(*args, **kw)
+    assert torch.equal(a.cpu(), b.cpu())
+    monkeypatch.setattr(linear, "_TRANSPOSED_DECODE_MIN_K", 1)
+    c = linear.int8_linear(*args, **kw)
+    assert _rel(c.cpu().double(), _merged_oracle(x.half(), wd, down, up, 0.5)) < 1e-3
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_lora_large_activations_stay_finite_and_exact(dtype):
+    # x ~ 2e4 against a LoRA down of ~4: x @ down^T reaches ~3e6, far past fp16, while the
+    # merged layer's output stays moderate. Tiny rows keep their precision next to huge ones.
+    n, k = 384, 1024
+    q, s, wd = _make(n, k, True, True)
+    down, up = _lora(n, k, 64, down_std=4.0, up_std=1e-3)
+    x = torch.randn(5, k) * 2.0e4
+    x[2] *= 1e-6
+    x = x.to(dtype)
+    exact = _merged_oracle(x, wd, down, up, 0.9)
+    out = ck.int8_linear(x.to(D), q.to(D), s.to(D), None, dtype, convrot=True,
+                         lora_down=down.to(D, dtype), lora_up=up.to(D, dtype), lora_scale=0.9)
+    o = out.cpu().double()
+    assert torch.isfinite(o).all()
+    tol = 6e-3 if dtype == torch.bfloat16 else 1e-3
+    for r in range(5):
+        assert _rel(o[r], exact[r]) < tol
+
+
+def test_lora_fp16_low_rank_activation_past_fp16_range():
+    # fp16 in and out, result ~1e3, but x @ down^T ~ 1e5: an fp16 side path overflows here.
+    n, k = 256, 1024
+    q, s, wd = _make(n, k, True, True)
+    down, up = _lora(n, k, 16, down_std=4.0, up_std=2e-3)
+    x = (torch.randn(4, k) * 1e3).half()
+    exact = _merged_oracle(x, wd, down, up, 1.0)
+    assert exact.abs().max() < 6e4 < (x.double() @ down.double().T).abs().max()
+    out = ck.int8_linear(x.to(D), q.to(D), s.to(D), None, torch.float16, convrot=True,
+                         lora_down=down.to(D, torch.float16), lora_up=up.to(D, torch.float16))
+    assert torch.isfinite(out).all()
+    assert _rel(out.cpu().double(), exact) < 1e-3
+
+
+def test_lora_zero_scale_is_the_base_layer_bit_for_bit():
+    q, s, _ = _make(384, 1024, True, True)
+    down, up = _lora(384, 1024, 16)
+    x = torch.randn(7, 1024, device=D, dtype=torch.bfloat16)
+    base = ck.int8_linear(x, q.to(D), s.to(D), None, torch.bfloat16, convrot=True)
+    zero = ck.int8_linear(x, q.to(D), s.to(D), None, torch.bfloat16, convrot=True,
+                          lora_down=down.to(D), lora_up=up.to(D), lora_scale=0.0)
+    assert torch.equal(base.cpu(), zero.cpu())
+
+
+@pytest.mark.parametrize("down_shape,up_shape", [((16, 512), (384, 16)), ((16, 1024), (384, 8)), ((16, 1024), (383, 16))])
+def test_lora_shape_mismatch_raises(down_shape, up_shape):
+    q, s, _ = _make(384, 1024, True, True)
+    x = torch.randn(3, 1024, device=D)
+    with pytest.raises(ValueError, match="lora"):
+        ck.int8_linear(x, q.to(D), s.to(D), None, torch.float32, convrot=True,
+                       lora_down=torch.zeros(down_shape, device=D), lora_up=torch.zeros(up_shape, device=D))
+
+
+def test_lora_needs_both_halves():
+    q, s, _ = _make(384, 1024, True, True)
+    with pytest.raises(ValueError, match="together"):
+        ck.int8_linear(torch.randn(3, 1024, device=D), q.to(D), s.to(D), lora_down=torch.zeros(4, 1024, device=D))
+
+
+def test_lora_is_refused_by_backends_that_do_not_declare_it():
+    # eager has no LoRA parameters: a CPU call is refused at dispatch, not silently merged-less.
+    q, s, _ = _make(384, 1024, True, True)
+    with pytest.raises(ck.NoCapableBackendError, match="lora_down"):
+        ck.int8_linear(torch.randn(3, 1024), q, s, lora_down=torch.zeros(4, 1024), lora_up=torch.zeros(384, 4))
+
+
+@pytest.mark.parametrize("rank", [12, 384])
+def test_lora_inference_tensors_odd_and_wide_ranks(rank):
+    # ComfyUI samples under inference_mode; rank 12 pads to 16, 384 spans 12 rank tiles.
+    q, s, wd = _make(384, 1024, True, True)
+    down, up = _lora(384, 1024, rank, down_std=0.02, up_std=0.02)
+    x = torch.randn(5, 1024)
+    with torch.inference_mode():
+        out = ck.int8_linear(x.to(D), q.to(D), s.to(D), None, torch.float32, convrot=True,
+                             lora_down=down.to(D), lora_up=up.to(D, torch.bfloat16).float().t().contiguous().t(),
+                             lora_scale=0.25)
+    up_used = up.bfloat16().float()
+    assert _rel(out.cpu().double(), _merged_oracle(x, wd, down, up_used, 0.25)) < 2e-4
+
+
+# --- LoRA range safety at extreme exponents (review 2026-10-02 Sol, findings 1-4) ------------
+
+
+def _const_lora(dtype, k, x, down, up, scale, wq=0, ws=1.0, n=4):
+    """INT8 weight of constant wq (scale ws), constant x/down/up, rank 1: the reviewer's inputs."""
+    q = torch.full((n, k), wq, dtype=torch.int8, device=D)
+    return ck.int8_linear(
+        torch.full((1, k), x, dtype=dtype, device=D), q, torch.tensor([ws], device=D), None, dtype,
+        lora_down=torch.full((1, k), down, dtype=dtype, device=D),
+        lora_up=torch.full((n, 1), up, dtype=dtype, device=D), lora_scale=scale,
+    ).cpu()
+
+
+@pytest.mark.parametrize("dtype,k,x,down,up,scale,want", [
+    # 1: up * scale * 2^dexp(down) was formed in fp32: 2^26 * 2 * 2^101 = inf.
+    (torch.float32, 4, 2.0 ** -100, 2.0 ** 100, 2.0 ** 26, 2.0, 2.0 ** 29),
+    # 1: up * scale overflowed before any exponent compensated it.
+    (torch.float32, 4, 1.0, 2.0 ** -100, 2.0 ** 100, 2.0 ** 30, 2.0 ** 32),
+    # 2: finite prepared operands, but their product 2^129 overflowed the fp32 accumulator.
+    (torch.float32, 1024, 2.0 ** -120, 1.0, 2.0 ** 120, 1.0, 1024.0),
+    # 4: x @ down^T = 131072 is past fp16 (the removed unfused mode stored it in fp16).
+    (torch.float16, 4, 1024.0, 32.0, 1 / 128, 1.0, 1024.0),
+])
+def test_lora_extreme_exponents_match_the_merged_weight(dtype, k, x, down, up, scale, want):
+    out = _const_lora(dtype, k, x, down, up, scale)
+    assert torch.equal(out, torch.full_like(out, want))
+
+
+def test_lora_that_cancels_the_weight_gives_zero():
+    # 3: W = 2^120 and up @ down = -2^120 merge to an exact zero weight. Restoring the base
+    # (2^132) and LoRA (-2^132) ranges separately gave inf - inf = NaN.
+    out = _const_lora(torch.float32, 4, 2.0 ** 10, 1.0, -(2.0 ** 120), 1.0, wq=1, ws=2.0 ** 120)
+    assert torch.equal(out, torch.zeros_like(out))
+
+
+def test_lora_zero_contribution_keeps_a_tiny_base_exact():
+    # The common domain follows the terms' own exponents: a LoRA term that is exactly zero
+    # (down orthogonal to x) must not drag a base value far below its scale into underflow.
+    k = 8
+    x = torch.tensor([[1.0, -1.0] * 4])
+    q = torch.ones(4, k, dtype=torch.int8)
+    q[:, 1::2] = 0
+    out = ck.int8_linear(x.to(D), q.to(D), torch.tensor([2.0 ** -120], device=D), None, torch.float32,
+                         lora_down=torch.ones(1, k, device=D), lora_up=torch.full((4, 1), 2.0 ** 100, device=D))
+    assert torch.equal(out.cpu(), torch.full((1, 4), 4 * 2.0 ** -120))
+
+
+def test_unfused_mode_is_gone(monkeypatch):
+    # The comparison mode stored x @ down^T in the input dtype; it was removed, not patched.
+    monkeypatch.setenv("COMFY_KITCHEN_MPS_LORA", "unfused")
+    out = _const_lora(torch.float16, 4, 1024.0, 32.0, 1 / 128, 1.0)
+    assert torch.equal(out, torch.full_like(out, 1024.0))
+
+
+@pytest.mark.parametrize("gap", [60, 70])
+def test_lora_fast_and_wide_scale_gaps_match(gap):
+    # Rank 0 has a huge up weight (2^(gap+5)) but a down row orthogonal to x, so it adds 0 yet
+    # sets the LoRA scale 2^gap above the base's; rank 1 adds 12 to a base of 4. A gap of 60
+    # takes the fma fast path, 70 the exponent-following path: both must give exactly 16.
+    k = 4
+    x = torch.ones(1, k, device=D)
+    q = torch.ones(4, k, dtype=torch.int8, device=D)
+    down = torch.tensor([[1.0, -1.0, 1.0, -1.0], [1.0, 1.0, 1.0, 1.0]], device=D)
+    up = torch.tensor([[2.0 ** (gap + 5), 3.0]] * 4, device=D)
+    out = ck.int8_linear(x, q, torch.ones(1, device=D), None, torch.float32, lora_down=down, lora_up=up)
+    assert torch.equal(out.cpu(), torch.full((1, 4), 16.0))

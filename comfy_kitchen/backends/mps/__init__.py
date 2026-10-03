@@ -5,7 +5,8 @@ Apple GPUs before M5 have no fast integer matrix path, so this backend is
 weight-only: integer weights stay resident in memory, are decoded to fp16 by a
 single-pass Metal kernel, and feed the stock fp16 GEMM. Activation rows and weight
 rows are scaled by exact powers of two first, so the fp16 GEMM cannot overflow;
-a fused epilogue restores the range in the output dtype. Activations are not
+a fused epilogue restores the range in the output dtype (and adds an optional
+unmerged LoRA's up-projection in fp32). Activations are not
 quantized. ConvRot checkpoints store the weight already rotated, so the
 activation is rotated online (cheap, group-wise) instead of un-rotating the
 weight on every call.
@@ -42,6 +43,13 @@ def _build_constraints() -> dict:
         "group_size": ParamConstraint(dtypes=frozenset({int})),
         "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
     }
+    # Unmerged LoRA: down [R, K] and up [N, R]; their shapes against the layer are checked
+    # by the backend, which raises on a mismatch rather than letting another backend drop them.
+    lora = {
+        "lora_down": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
+        "lora_up": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
+        "lora_scale": ParamConstraint(dtypes=frozenset({float, int})),
+    }
     return {
         "int8_linear": FunctionConstraints(
             params={
@@ -51,12 +59,14 @@ def _build_constraints() -> dict:
                 "bias": ParamConstraint(dtypes=floats),
                 "convrot": ParamConstraint(dtypes=frozenset({bool})),
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                **lora,
             },
             default_devices=mps,
         ),
         "w4a8_int8_linear": FunctionConstraints(
             params={
                 **packed_w4a8,
+                **lora,
                 "x": ParamConstraint(dtypes=floats),
                 "bias": ParamConstraint(dtypes=floats),
                 "out_dtype": ParamConstraint(dtypes=floats),

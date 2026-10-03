@@ -539,3 +539,103 @@ class TestRangeAndSemantics:
         rows = finite.all(1)  # the rotation back sums in another order: compare at the row's scale
         err = (got[rows] - ref[rows]).float().abs().amax(1)
         assert (err <= 4 * torch.finfo(out_dtype).eps * ref[rows].float().abs().amax(1)).all()
+
+
+class TestLora:
+    """Unmerged LoRA: the result is the float linear over eager's dequantized (physical-basis)
+    weight plus ``scale * up @ down``, the weight a merge would have produced before requantizing."""
+
+    @staticmethod
+    def lora(rank, down_std=0.05, up_std=0.05, n=N, k=K):
+        gen = torch.Generator().manual_seed(5)
+        return torch.randn(rank, k, generator=gen) * down_std, torch.randn(n, rank, generator=gen) * up_std
+
+    @staticmethod
+    def oracle(x, packed, group_size, down, up, scale, bias=None):
+        q, s_rel, s_channel, correction, codebook = packed
+        w = eager_w4a8.dequantize_w4a8_int8_weight(
+            q, s_rel, s_channel, codebook, correction, group_size, 256, torch.float32
+        ).double() + scale * up.double() @ down.double()
+        out = x.double() @ w.T
+        return out if bias is None else out + bias.double()
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("rank", [16, 64])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    @pytest.mark.parametrize("fmt", ["w4_codebook", "w6", "w4_asym"])
+    def test_matches_merged_oracle(self, dtype, rank, with_bias, fmt):
+        group_size = 32 if fmt == "w6" else 16
+        packed = quantize(fmt, group_size)
+        down, up = self.lora(rank)
+        gen = torch.Generator().manual_seed(6)
+        x = torch.randn(2, 7, K, generator=gen).to(dtype)
+        bias = torch.randn(N, generator=gen).to(dtype) if with_bias else None
+        ref = self.oracle(x, packed, group_size, down, up, 0.6, bias)
+        base = self.oracle(x, packed, group_size, down, up, 0.0, bias)
+        assert ((base - ref).norm() / ref.norm()).item() > 0.1  # the LoRA term matters
+        q, s_rel, s_channel, correction, codebook = to_mps(*packed)
+        got = ck.w4a8_int8_linear(
+            x.to("mps"), q, s_rel, s_channel, codebook=codebook, correction=correction,
+            bias=None if bias is None else bias.to("mps"), group_size=group_size, out_dtype=dtype,
+            lora_down=down.to("mps", dtype), lora_up=up.to("mps", dtype), lora_scale=0.6,
+        )
+        assert got.shape == (2, 7, N) and got.dtype == dtype
+        out_rounding = torch.finfo(dtype).eps / 2
+        got = got.cpu().double()
+        assert (got - ref).abs().max().item() <= (3e-3 + 2 * out_rounding) * ref.abs().max().item()
+        assert ((got - ref).norm() / ref.norm()).item() < 1.5e-3 + out_rounding
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+    def test_large_activations_stay_finite_and_exact(self, dtype):
+        """x ~ 2e4 against a down weight of ~4: the low-rank activation passes fp16's range by
+        far; per-row accuracy holds for rows 1e6 apart in magnitude."""
+        packed = quantize("w6", 32)
+        down, up = self.lora(64, down_std=4.0, up_std=1e-3)
+        x = torch.randn(5, K, generator=torch.Generator().manual_seed(7)) * 2.0e4
+        x[2] *= 1e-6
+        x = x.to(dtype)
+        ref = self.oracle(x, packed, 32, down, up, 1.0)
+        q, s_rel, s_channel, correction, codebook = to_mps(*packed)
+        got = mps_w4a8().w4a8_int8_linear(
+            x.to("mps"), q, s_rel, s_channel, codebook, correction, group_size=32, out_dtype=dtype,
+            lora_down=down.to("mps", dtype), lora_up=up.to("mps", dtype),
+        ).cpu().double()
+        assert torch.isfinite(got).all()
+        tol = 6e-3 if dtype == torch.bfloat16 else 1.5e-3
+        for r in range(5):
+            assert ((got[r] - ref[r]).norm() / ref[r].norm()).item() < tol
+
+    @pytest.mark.parametrize("n,rank", [(67, 13), (190, 5), (200, 64)])
+    @pytest.mark.parametrize("transposed", [False, True])
+    @pytest.mark.parametrize("chunked", [False, True])
+    @pytest.mark.parametrize("fmt", ["w6", "w4_asym"])
+    def test_chunked_transposed_and_tails(self, n, rank, transposed, chunked, fmt, monkeypatch):
+        """Ranks off the 8-row tile (13, 5) and columns off the 4- and 64-column grids (67, 190)
+        through the transposed decode (row stride N + R8) and through several chunks, where
+        later chunks read a compact copy of the first chunk's low-rank columns."""
+        from comfy_kitchen.backends.mps import linear
+
+        if transposed:
+            monkeypatch.setattr(linear, "_TRANSPOSED_DECODE_MIN_K", 1)
+        if chunked:
+            monkeypatch.setattr(linear, "_MAX_DECODE_BYTES", 48 * 2 * K)  # 48-row chunks
+        group_size = 32 if fmt == "w6" else 16
+        packed = quantize(fmt, group_size, n=n)
+        down, up = self.lora(rank, n=n)
+        x = torch.randn(11, K, generator=torch.Generator().manual_seed(8)).to(torch.float16)
+        bias = torch.randn(n, generator=torch.Generator().manual_seed(9)).to(torch.float16)
+        ref = self.oracle(x, packed, group_size, down, up, 0.75, bias)
+        q, s_rel, s_channel, correction, codebook = to_mps(*packed)
+        got = mps_w4a8().w4a8_int8_linear(
+            x.to("mps"), q, s_rel, s_channel, codebook, correction, bias.to("mps"), group_size,
+            out_dtype=torch.float16, lora_down=down.to("mps"), lora_up=up.to("mps"), lora_scale=0.75,
+        ).cpu().double()
+        assert ((got - ref).norm() / ref.norm()).item() < 1.5e-3
+
+    def test_shape_mismatch_raises(self):
+        packed = to_mps(*quantize("w6", 32))
+        with pytest.raises(ValueError, match="lora"):
+            mps_w4a8().w4a8_int8_linear(
+                torch.randn(3, K, device="mps"), *packed[:3], None, None, group_size=32,
+                lora_down=torch.zeros(8, K - 4, device="mps"), lora_up=torch.zeros(N, 8, device="mps"),
+            )

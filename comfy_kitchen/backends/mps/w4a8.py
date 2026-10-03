@@ -127,8 +127,8 @@ kernel void w4a8_decode(device vec<O, 4>* out,
     out[r * (ulong(a.K) / 4) + pos.x] = vec<O, 4>(w);
 }
 
-// Normalized rows [row0, row0 + rows) written transposed, out [K, rows], through a tile of
-// 32 rows x 128 columns in threadgroup memory. Grid (ceil(K/128) * 32, ceil(rows/32) * 8),
+// Normalized rows [row0, row0 + rows) written transposed, out [K, rows] with row stride
+// ld >= rows, through a tile of 32 rows x 128 columns in threadgroup memory. Grid (ceil(K/128) * 32, ceil(rows/32) * 8),
 // threadgroups of 32x8.
 template <int BITS, typename S, typename O>
 kernel void w4a8_decode_t(device O* out,
@@ -146,6 +146,7 @@ kernel void w4a8_decode_t(device O* out,
                           constant long& has_correction,
                           constant long& row0,
                           constant long& rows,
+                          constant long& ld,
                           uint2 tg [[threadgroup_position_in_grid]],
                           uint2 lid [[thread_position_in_threadgroup]]) {
     const W4Args a = {K_, N, group_size, has_correction};
@@ -177,8 +178,8 @@ kernel void w4a8_decode_t(device O* out,
         if (k >= K || r0 >= R) {
             continue;
         }
-        device O* o = out + k * R + r0;
-        if (r0 + 4 <= R && R % 4 == 0) {
+        device O* o = out + k * ulong(ld) + r0;
+        if (r0 + 4 <= R && R % 4 == 0 && ld % 4 == 0) {
             *(device vec<O, 4>*)o = vec<O, 4>(tile[kl][rq], tile[kl][rq + 1], tile[kl][rq + 2], tile[kl][rq + 3]);
         } else {
             for (uint j = 0; j < 4u && r0 + j < R; ++j) {
@@ -199,7 +200,7 @@ kernel void w4a8_decode_t(device O* out,
         device O*, device int*, device const uchar*, device const S*,                       \
         device const float*, constant float*, constant float*, device const float*,         \
         device const float*, constant long&, constant long&, constant long&, constant long&,  \
-        constant long&, constant long&, uint2, uint2);
+        constant long&, constant long&, constant long&, uint2, uint2);
 #define W4_ALL(BITS, S, NAME)                                                                   \
     W4_ROWS(BITS, S, float, false, "w" #BITS "_" NAME "_decode_f32")                           \
     W4_ROWS(BITS, S, half, true, "w" #BITS "_" NAME "_decode_norm_f16")                        \
@@ -258,13 +259,15 @@ def _decode_w4a8(
     ch_exp: torch.Tensor | None = None,
     corr_max: torch.Tensor | None = None,
     transposed: bool = False,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Rows [row0, row0 + rows) of the rotated-basis weight.
 
     Without ``ch_exp``: eager's fp32 decode, value for value, as [rows, K].
     With ``ch_exp`` (int32 [N], filled here): each row divided by 2^ch_exp[row] so |w'| <= 1,
     in ``out_dtype`` (fp16 or fp32), as [rows, K] or, when ``transposed``, [K, rows]. A
-    correction needs ``corr_max``, the max |correction| of each row.
+    correction needs ``corr_max``, the max |correction| of each row. ``out`` (normalized
+    decode only, from ``linear.decode_buffer``) receives the rows in place.
     """
     normalize = ch_exp is not None
     if not normalize and (out_dtype != torch.float32 or transposed):
@@ -290,14 +293,17 @@ def _decode_w4a8(
         int(correction is not None),
         row0,
     )
+    if out is None:
+        shape = (k, rows) if transposed else (rows, k)
+        out = torch.empty(shape, dtype=out_dtype, device=qdata.device)
+    elif not normalize:
+        raise ValueError("out is for the normalized decode")
     if transposed:
-        out = torch.empty((k, rows), dtype=out_dtype, device=qdata.device)
         getattr(lib, f"{name}_t_{suffix}")(
-            out, *args, rows,
+            out, *args, rows, out.stride(0),
             threads=(-(-k // 128) * 32, -(-rows // 32) * 8), group_size=(32, 8),
         )
     else:
-        out = torch.empty((rows, k), dtype=out_dtype, device=qdata.device)
         getattr(lib, f"{name}{'_norm' if normalize else ''}_{suffix}")(
             out, *args, threads=(k // 4, rows), group_size=(min(k // 4, 256), 1),
         )
@@ -341,11 +347,16 @@ def w4a8_int8_linear(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
+    lora_down: torch.Tensor | None = None,
+    lora_up: torch.Tensor | None = None,
+    lora_scale: float = 1.0,
 ) -> torch.Tensor:
     """W4A8/W6A8-weight linear, computed as fp16 GEMM over on-the-fly decoded weights.
 
     Bias follows eager: the asymmetric path adds it inside the linear (cast to x's dtype,
     before rounding); the symmetric path rounds to ``out_dtype`` first, as int8_linear does.
+    ``lora_down`` [R, K], ``lora_up`` [N, R] and ``lora_scale`` add an unmerged LoRA, as in
+    int8_linear; ``lora_down`` is in the physical (un-rotated) basis.
     """
     n, k, bits = validate_w4a8_operands(
         qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize
@@ -357,16 +368,18 @@ def w4a8_int8_linear(
         device, qdata, s_rel, s_channel, codebook, correction, bits
     )
     corr_max = None if correction is None else correction.abs().amax(dim=0).contiguous()
+    lora = _linear.lora_operands(lora_down, lora_up, lora_scale, n, k, device)
 
-    def decode(row0, rows, cdtype, transposed, ch_exp):
+    def decode(row0, rows, cdtype, transposed, ch_exp, out=None):
         return _decode_w4a8(
             qdata, s_rel, s_channel, levels, correction, k, bits, group_size, row0, rows,
-            cdtype, ch_exp, corr_max, transposed,
+            cdtype, ch_exp, corr_max, transposed, out,
         )
 
     return _linear.weight_only_linear(
         x, n, k, decode, bias=bias, out_dtype=out_dtype, group=convrot_groupsize,
         bias_in_linear=correction is not None,  # eager: asymmetric runs F.linear, symmetric int8_linear
+        lora=lora,
     )
 
 

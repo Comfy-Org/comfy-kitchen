@@ -16,6 +16,17 @@ Each call runs four steps, all range-safe by construction:
    arithmetic (no 2**128 ever formed), adds bias before the single rounding to
    the output dtype, applies residual/residual_scale, and writes the output.
 
+An unmerged LoRA (lora_down [R, K], lora_up [N, R]) rides along without forming the
+[N, K] delta. The down weight goes through the same prologue as an activation (rotated
+into the stored weight's basis, rows normalized), and its R rows are appended to the
+first decoded weight chunk, so the main GEMM also produces the low-rank activation of
+the normalized row in R extra columns: the down projection costs about 1% of the GEMM
+instead of a separate skinny GEMM. The epilogue multiplies that activation by the up
+weight on the simdgroup matrix units in fp32 and adds it before the rounding, bias and
+residual, where a merged weight's GEMM would have. The up weight is carried as mantissa
+and per-output exponent and the two terms meet in a common scaled domain before the range
+is restored, so the LoRA path is range-safe the same way the base path is.
+
 Apple GPUs flush fp32 subnormals in arithmetic (fp16 subnormals survive), so
 exponents are read and applied on raw bits, never by multiplying.
 """
@@ -31,6 +42,7 @@ from comfy_kitchen.tensor.int8_utils import _rotate_activation, _build_hadamard
 # Metal helpers shared with w4a8.py. bf16 tensors are read and written as ushort.
 METAL_COMMON = r"""
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 // fp32 bit pattern of element i; bf16 is the top half of an fp32.
@@ -126,6 +138,26 @@ inline float split_pow2(float x, int headroom, thread int& f) {
     }
     f = ceil_exp(a) + headroom;
     return as_type<float>(ldexp_bits(u, -f));
+}
+
+// Bits of (a * 2^ea + b * 2^eb) * 2^e. Both terms are first brought to the larger one's own
+// exponent (so each is below 1 in magnitude) and added there: neither side overflows or
+// restores its range before they cancel, and a zero term never pulls the other's exponent.
+// The result is rounded once by the add and once more only if it lands out of normal range.
+inline uint add_scaled(uint a, int ea, uint b, int eb, int e) {
+    const uint aa = a & 0x7FFFFFFFu, ab = b & 0x7FFFFFFFu;
+    if (ab == 0u) {
+        return ldexp_bits(a, ea + e);
+    }
+    if (aa == 0u) {
+        return ldexp_bits(b, eb + e);
+    }
+    if (aa >= 0x7F800000u || ab >= 0x7F800000u) {  // inf or NaN: propagate as an add would
+        return as_type<uint>(as_type<float>(a) + as_type<float>(b));
+    }
+    const int top = max(ceil_exp(aa) + ea, ceil_exp(ab) + eb);
+    const float t = as_type<float>(ldexp_bits(a, ea - top)) + as_type<float>(ldexp_bits(b, eb - top));
+    return ldexp_bits(as_type<uint>(t), top + e);
 }
 """
 
@@ -284,8 +316,9 @@ kernel void i8_decode4(device vec<T, 4>* out,
     }
 }
 
-// Same decode written transposed, out[k, r], through a 32x32 threadgroup tile so both the
-// int8 read and the write are coalesced. Grid (K rounded up to 32, rows rounded up to 32).
+// Same decode written transposed, out[k, r] with row stride ld >= rows, through a 32x32
+// threadgroup tile so both the int8 read and the write are coalesced. Grid (K rounded up to
+// 32, rows rounded up to 32).
 template <typename T>
 kernel void i8_decode_t(device T* out,
                         device int* ch_exp,
@@ -295,6 +328,7 @@ kernel void i8_decode_t(device T* out,
                         constant long& rows,
                         constant long& row0,
                         constant long& scale_stride,
+                        constant long& ld,
                         uint2 tg [[threadgroup_position_in_grid]],
                         uint2 lid [[thread_position_in_threadgroup]]) {
     threadgroup float tile[32][33];
@@ -311,13 +345,13 @@ kernel void i8_decode_t(device T* out,
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const ulong ko = ulong(tg.x) * 32 + lid.y, ro = ulong(tg.y) * 32 + lid.x;
     if (ko < ulong(K) && ro < ulong(rows)) {
-        out[ko * ulong(rows) + ro] = T(tile[lid.x][lid.y]);
+        out[ko * ulong(ld) + ro] = T(tile[lid.x][lid.y]);
     }
 }
 
 // Transposed decode, four values per load and per store: a threadgroup of 32x8 threads
-// moves a tile of 32 rows x 128 columns through threadgroup memory. Needs K and rows to be
-// multiples of 4. Grid (ceil(K/128) * 32, ceil(rows/32) * 8).
+// moves a tile of 32 rows x 128 columns through threadgroup memory. Needs K, rows and the
+// row stride ld to be multiples of 4. Grid (ceil(K/128) * 32, ceil(rows/32) * 8).
 template <typename T>
 kernel void i8_decode_t4(device T* out,
                          device int* ch_exp,
@@ -327,6 +361,7 @@ kernel void i8_decode_t4(device T* out,
                          constant long& rows,
                          constant long& row0,
                          constant long& scale_stride,
+                         constant long& ld,
                          uint2 tg [[threadgroup_position_in_grid]],
                          uint2 lid [[thread_position_in_threadgroup]]) {
     threadgroup T tile[128][36];  // [k][r], padded
@@ -356,7 +391,7 @@ kernel void i8_decode_t4(device T* out,
         const uint kl = (tid >> 3) + 32u * p;
         const ulong k = ulong(tg.x) * 128 + kl;
         if (k < ulong(K) && r0 < ulong(rows)) {
-            *(device vec<T, 4>*)(out + k * ulong(rows) + r0) =
+            *(device vec<T, 4>*)(out + k * ulong(ld) + r0) =
                 vec<T, 4>(tile[kl][rq], tile[kl][rq + 1], tile[kl][rq + 2], tile[kl][rq + 3]);
         }
     }
@@ -366,11 +401,32 @@ kernel void i8_decode_t4(device T* out,
 // residual + residual_scale * that, rounded again (eager's order). Bias arrives as fp32
 // values already rounded the way eager rounds them. FL is a compile-time bit set:
 // 1 = bias, 2 = residual, 4 = round to the output dtype before adding bias (eager's INT8
-// order; without it bias is added before the one rounding, as eager's F.linear does).
-// As a runtime argument the flags cost 1.5-2.5x here.
+// order; without it bias is added before the one rounding, as eager's F.linear does),
+// 8 = LoRA: the GEMM value is c * 2^(re + ce) with ex = re + ce, the LoRA value
+// lora * 2^(re + lue); the two are summed in their common scaled domain and only then
+// restored (add_scaled), so a LoRA that cancels the weight gives 0, as a merged weight
+// would, not inf - inf. As a runtime argument the flags cost 1.5-2.5x here.
+// Fast path: when the two scales are within 2^64 of each other, both terms are brought to
+// the larger scale by exact power-of-two multipliers in [2^-64, 1] and summed by one fma.
+// Only a term below 2^-126 of the larger scale can flush there, far beneath fp32 rounding
+// of the sum; wider gaps take add_scaled, which follows the terms' own exponents.
 template <int FL, typename TO>
-inline uint epilogue_value(device TO* out, uint cb, int ex, float bv, float r, float rs) {
-    uint b = ldexp_bits(cb, ex);
+inline uint epilogue_value(device TO* out, uint cb, int ex, float bv, float r, float rs,
+                           float lora = 0.0f, int lue = 0, int re = 0) {
+    uint b;
+    if (FL & 8) {
+        const int ce = ex - re, d = ce - lue;
+        if (d >= -64 && d <= 64) {
+            const int top = max(ce, lue);
+            const float pa = as_type<float>(uint(127 + ce - top) << 23);
+            const float pb = as_type<float>(uint(127 + lue - top) << 23);
+            b = ldexp_bits(as_type<uint>(fma(lora, pb, as_type<float>(cb) * pa)), re + top);
+        } else {
+            b = add_scaled(cb, ce, as_type<uint>(lora), lue, re);
+        }
+    } else {
+        b = ldexp_bits(cb, ex);
+    }
     if (FL & 1) {
         if (FL & 4) {
             b = as_type<uint>(round_as(out, as_type<float>(b)));
@@ -442,6 +498,167 @@ kernel void epilogue4(device TO* out,
     store_b4(out, m * ulong(N) + col, b);
 }
 
+// The epilogue with a LoRA up-projection folded in. la holds the low-rank activation of the
+// normalized row, la[m * la_stride + la_off + r] = x'[m] . D'[r] (the GEMM's extra columns,
+// each at most K), and upT [R, ups] the normalized up weight (|upT| < 1, from lora_up_prep,
+// zero-padded so a tile may read 64 columns past col0 + rows), so the LoRA output of row m
+// is 2^(row_exp[m] + up_exp[col]) * sum_r la[m, r] * upT[r, col]. The sum is at most R * K,
+// so the fp32 accumulation on the simdgroup matrix units cannot overflow; its exponent is
+// applied only when it meets the base value (flag 8 of epilogue_value). A threadgroup
+// of LT_M / 8 simdgroups owns a tile of LT_M rows x LT_N columns: la is staged through
+// threadgroup memory LT_R ranks at a time, each simdgroup accumulates 8 rows x LT_N columns,
+// and the tile then goes through the usual per-element epilogue, 4 threads per row. R is a
+// multiple of 8. VEC: rows, N and col0 multiples of 4. c is [M, rows] with row stride
+// c_stride. Grid (ceil(rows / LT_N) * LT_T, ceil(M / LT_M)), threadgroups of LT_T x 1.
+constant constexpr uint LT_M = 32, LT_N = 64, LT_R = 32, LT_T = LT_M * 4;
+
+template <int FL, typename TC, typename TO, bool VEC>
+kernel void epilogue_lora(device TO* out,
+                          device const TC* c,
+                          device const int* row_exp,
+                          device const int* ch_exp,
+                          device const float* bias,
+                          device const TO* res,
+                          device const TO* rscale,
+                          device const TC* la,
+                          device const float* upT,
+                          device const int* up_exp,
+                          constant long& N,
+                          constant long& col0,
+                          constant long& bias_stride,
+                          constant long& res_stride,
+                          constant long& rscale_stride,
+                          constant long& M_,
+                          constant long& R_,
+                          constant long& rows_,
+                          constant long& c_stride,
+                          constant long& la_stride,
+                          constant long& la_off,
+                          constant long& ups,
+                          uint2 tg [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float la_t[LT_M][LT_R];
+    threadgroup float lora_t[LT_M][LT_N];
+    const ulong M = ulong(M_), R = ulong(R_), rows = ulong(rows_), cs = ulong(c_stride);
+    const ulong m0 = ulong(tg.y) * LT_M, n0 = ulong(tg.x) * LT_N;
+    simdgroup_float8x8 acc[LT_N / 8];
+    for (uint j = 0; j < LT_N / 8; ++j) {
+        acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    device const float* ub = upT + ulong(col0) + n0;
+    for (ulong r0 = 0; r0 < R; r0 += LT_R) {
+        for (uint e = tid; e < LT_M * LT_R; e += LT_T) {
+            const uint i = e / LT_R, j = e % LT_R;
+            const ulong m = m0 + i, r = r0 + j;
+            la_t[i][j] = (m < M && r < R) ? float(la[m * ulong(la_stride) + ulong(la_off) + r]) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const ulong kend = min(ulong(LT_R), R - r0);
+        for (ulong kk = 0; kk < kend; kk += 8) {
+            simdgroup_float8x8 a;
+            simdgroup_load(a, &la_t[sg * 8][kk], LT_R);
+            for (uint j = 0; j < LT_N / 8; ++j) {
+                simdgroup_float8x8 b;  // the 4 simdgroups read the same b; the cache serves it
+                simdgroup_load(b, ub + (r0 + kk) * ulong(ups) + j * 8, ulong(ups));
+                simdgroup_multiply_accumulate(acc[j], a, b, acc[j]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint j = 0; j < LT_N / 8; ++j) {
+        simdgroup_store(acc[j], &lora_t[sg * 8][j * 8], LT_N);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 4 threads per row; quad q of thread t covers columns 16q + 4(t % 4) .. + 3.
+    const uint i = tid / 4u;
+    const ulong m = m0 + i;
+    if (m >= M) {
+        return;
+    }
+    const int re = row_exp[m];
+    for (uint q = 0; q < LT_N / 16u; ++q) {
+        const uint jl = q * 16u + (tid % 4u) * 4u;
+        const ulong n = n0 + jl;
+        if (n >= rows) {
+            break;
+        }
+        const ulong col = ulong(col0) + n;
+        if (VEC) {
+            const uint4 cb = f32_bits4(c, m * cs + n);
+            uint4 b;
+            for (uint v = 0; v < 4u; ++v) {
+                const float bv = (FL & 1) ? bias[(col + v) * ulong(bias_stride)] : 0.0f;
+                const float r = (FL & 2) ? load_f(res, m * ulong(res_stride) + col + v) : 0.0f;
+                const float rs = (FL & 2) ? load_f(rscale, (col + v) * ulong(rscale_stride)) : 0.0f;
+                b[v] = epilogue_value<FL>(out, cb[v], re + ch_exp[col + v], bv, r, rs, lora_t[i][jl + v],
+                                          up_exp[col + v], re);
+            }
+            store_b4(out, m * ulong(N) + col, b);
+        } else {
+            for (uint v = 0; v < 4u && n + v < rows; ++v) {
+                const ulong cv = col + v;
+                const float bv = (FL & 1) ? bias[cv * ulong(bias_stride)] : 0.0f;
+                const float r = (FL & 2) ? load_f(res, m * ulong(res_stride) + cv) : 0.0f;
+                const float rs = (FL & 2) ? load_f(rscale, cv * ulong(rscale_stride)) : 0.0f;
+                store_b(out, m * ulong(N) + cv,
+                        epilogue_value<FL>(out, f32_bits(c, m * cs + n + v), re + ch_exp[cv], bv, r, rs,
+                                           lora_t[i][jl + v], up_exp[cv], re));
+            }
+        }
+    }
+}
+
+// The LoRA up weight as mantissa and exponent, never materialized at full range: with
+// scale = sm * 2^se (|sm| in [1/2, 1)), up[n, r] * scale * 2^dexp[r] = upT[r, n] * 2^up_exp[n],
+// where up_exp[n] is the smallest exponent with every |upT[r, n]| < 1 for that output row.
+// fp32, zero in the padding (R8 rows, ups columns) so the LoRA epilogue reads aligned,
+// bounded tiles. One thread per column n; grid (ups).
+template <typename TU>
+kernel void lora_up_prep(device float* upT,
+                         device int* up_exp,
+                         device const TU* up,
+                         device const int* dexp,
+                         constant float& scale,
+                         constant long& N,
+                         constant long& R,
+                         constant long& R8,
+                         constant long& ups,
+                         uint pos [[thread_position_in_grid]]) {
+    const ulong n = pos;
+    int se;
+    const float sm = split_pow2(scale, 0, se);
+    const int none = -(1 << 30);
+    int e = none;
+    if (n < ulong(N)) {
+        for (ulong r = 0; r < ulong(R); ++r) {
+            const uint a = f32_bits(up, n * ulong(R) + r) & 0x7FFFFFFFu;
+            if (a != 0u && a < 0x7F800000u) {
+                e = max(e, ceil_exp(a) + dexp[r]);
+            }
+        }
+        if (e == none) {
+            e = 0;  // an all-zero (or non-finite) row: nothing to scale
+        }
+        up_exp[n] = e + se;
+    }
+    for (ulong r = 0; r < ulong(R8); ++r) {
+        float v = 0.0f;
+        if (n < ulong(N) && r < ulong(R)) {
+            v = as_type<float>(ldexp_bits(f32_bits(up, n * ulong(R) + r), dexp[r] - e)) * sm;
+        }
+        upT[r * ulong(ups) + n] = v;
+    }
+}
+#define UPP(TU, NAME)                                                                        \
+    template [[host_name("lora_up_prep_" NAME)]] kernel void lora_up_prep<TU>(               \
+        device float*, device int*, device const TU*, device const int*, constant float&,    \
+        constant long&, constant long&, constant long&, constant long&, uint);
+UPP(half, "f16")
+UPP(float, "f32")
+UPP(ushort, "bf16")
+
 #define ACT1(TI, TO, VEC, NAME)                                                             \
     template [[host_name(NAME)]] kernel void act_prologue<TI, TO, VEC>(                    \
         device TO*, device int*, device const TI*, constant long&, constant long&,         \
@@ -463,10 +680,10 @@ ACT(ushort, float, "bf16_f32")
         constant long&, constant long&, constant long&, uint2);                              \
     template [[host_name("i8_decode_t4_" NAME)]] kernel void i8_decode_t4<T>(                \
         device T*, device int*, device const char4*, device const float*, constant long&,    \
-        constant long&, constant long&, constant long&, uint2, uint2);                       \
+        constant long&, constant long&, constant long&, constant long&, uint2, uint2);       \
     template [[host_name("i8_decode_t_" NAME)]] kernel void i8_decode_t<T>(                  \
         device T*, device int*, device const char*, device const float*, constant long&,     \
-        constant long&, constant long&, constant long&, uint2, uint2);
+        constant long&, constant long&, constant long&, constant long&, uint2, uint2);
 DEC(half, "f16")
 DEC(float, "f32")
 
@@ -487,6 +704,24 @@ EPI(half, ushort, "f16_bf16")
 EPI(float, half, "f32_f16")
 EPI(float, float, "f32_f32")
 EPI(float, ushort, "f32_bf16")
+
+#define LEPI1(FL, TC, TO, VEC, NAME)                                                           \
+    template [[host_name(NAME)]] kernel void epilogue_lora<FL, TC, TO, VEC>(                   \
+        device TO*, device const TC*, device const int*, device const int*, device const float*, \
+        device const TO*, device const TO*, device const TC*, device const float*,              \
+        device const int*, constant long&, constant long&, constant long&, constant long&,       \
+        constant long&, constant long&, constant long&, constant long&, constant long&,          \
+        constant long&, constant long&, constant long&, uint2, uint, uint);
+#define LEPI2(FL, TC, TO, NAME) LEPI1(FL, TC, TO, true, "epilogue_lora4_" #FL "_" NAME) \
+    LEPI1(FL, TC, TO, false, "epilogue_lora_" #FL "_" NAME)
+#define LEPI(TC, TO, NAME) LEPI2(8, TC, TO, NAME) LEPI2(9, TC, TO, NAME) LEPI2(10, TC, TO, NAME) \
+    LEPI2(11, TC, TO, NAME) LEPI2(13, TC, TO, NAME) LEPI2(15, TC, TO, NAME)
+LEPI(half, half, "f16_f16")
+LEPI(half, float, "f16_f32")
+LEPI(half, ushort, "f16_bf16")
+LEPI(float, half, "f32_f16")
+LEPI(float, float, "f32_f32")
+LEPI(float, ushort, "f32_bf16")
 """
 
 _lib = None
@@ -503,6 +738,9 @@ _FP16_MAX_K = 65504
 
 # The fused rotation holds 1024 fp32 values per threadgroup.
 _MAX_FUSED_GROUP = 1024
+
+# The LoRA epilogue's tile: LT_M rows x LT_N columns per threadgroup of LT_M * 4 (see the shader).
+_LORA_TILE_M, _LORA_TILE_N = 32, 64
 
 # MPS matmul against a lazily transposed weight (what F.linear does) falls onto a
 # slow path once the input width passes ~8k: 2x slower at K=16384 on an M1 Max.
@@ -600,14 +838,76 @@ def _residual_operands(residual, residual_scale, out_shape, n, out_dtype, device
     return res2, res2.stride(0), rs_v, 0 if rs_v.numel() == 1 else 1
 
 
+def lora_operands(lora_down, lora_up, lora_scale, n, k, device):
+    """Validated ``(down [R, K], up [N, R], scale)``, or None when there is no LoRA term.
+
+    Several LoRAs on one layer are one LoRA of the summed rank: concatenate the downs along
+    R and the ups along R, each up multiplied by its own scale (and pass ``lora_scale=1``).
+    """
+    if lora_down is None and lora_up is None:
+        return None
+    if lora_down is None or lora_up is None:
+        raise ValueError("lora_down and lora_up must be given together")
+    if lora_down.dim() != 2 or lora_up.dim() != 2:
+        raise ValueError(
+            f"lora_down must be [R, K] and lora_up [N, R], got {tuple(lora_down.shape)} and {tuple(lora_up.shape)}"
+        )
+    r = lora_down.shape[0]
+    if lora_down.shape[1] != k or tuple(lora_up.shape) != (n, r):
+        raise ValueError(
+            f"lora_down {tuple(lora_down.shape)} and lora_up {tuple(lora_up.shape)} do not fit "
+            f"a layer with N={n}, K={k}: expected [R, {k}] and [{n}, R]"
+        )
+    scale = float(lora_scale)
+    if r == 0 or scale == 0.0:
+        return None
+    down, up = lora_down.to(device=device), lora_up.to(device=device).contiguous()
+    if down.dtype not in DTYPE_SUFFIX:
+        down = down.float()
+    if up.dtype not in DTYPE_SUFFIX:
+        up = up.float()
+    return down, up, scale
+
+
+def _lora_gemm_operands(lora, group, cdtype):
+    """(dn [R8, K] in cdtype, upT [R8, N4 + 64] in fp32, up_exp [N] int32), R8 = R rounded up
+    to 8 and N4 = N rounded up to 4, padded with zeros (the epilogue's 8x8 matrix tiles and
+    aligned rows; a tile may read 64 columns past the end).
+
+    The down weight goes through the activation prologue: rotated into the stored weight's
+    basis (D H pairs with the rotated row x' exactly as the stored W H does, H being
+    orthogonal) and each row divided by 2^dexp[r] so |D'| <= 1. Appended to the decoded
+    weight, it makes the main GEMM also produce la = x' @ D'^T, each value at most K like the
+    base product. The up weight with the scale and 2^dexp folded in is never formed: it is
+    carried as upT[r, n] * 2^up_exp[n] with |upT| < 1, so the LoRA output of row m is
+    2^(row_exp[m] + up_exp[n]) * la[m] @ upT[:, n], its sum at most R * K."""
+    down, up, scale = lora
+    r, n = down.shape[0], up.shape[0]
+    r8 = -(-r // 8) * 8
+    dn, dexp = prologue(down, group, cdtype)
+    ups = -(-n // 4) * 4 + _LORA_TILE_N
+    upt = torch.empty((r8, ups), dtype=torch.float32, device=up.device)
+    up_exp = torch.empty(n, dtype=torch.int32, device=up.device)
+    getattr(_shaders(), f"lora_up_prep_{DTYPE_SUFFIX[up.dtype]}")(
+        upt, up_exp, up, dexp, scale, n, r, r8, ups, threads=(ups,), group_size=(min(ups, 256),),
+    )
+    if r8 != r:
+        dn = torch.cat([dn, dn.new_zeros((r8 - r, dn.shape[1]))])
+    return dn, upt, up_exp
+
+
 def weight_only_linear(x, n, k, decode, *, bias, out_dtype, group, residual=None, residual_scale=None,
-                       bias_in_linear=False):
+                       bias_in_linear=False, lora=None):
     """Shared driver for INT8 and W4A8: prologue, chunked decode + GEMM, fused epilogue.
 
     Bias follows eager per format. By default (eager INT8 and symmetric W4A8) the result is
     rounded to ``out_dtype`` and bias, cast to ``out_dtype``, is added after. With
     ``bias_in_linear`` (eager's asymmetric W4A8, ``F.linear(x, w, bias)``) bias is cast to
     x's dtype and added before the single rounding.
+
+    ``lora`` (from ``lora_operands``) adds ``scale * (x @ down^T) @ up^T`` where a merged
+    weight would: in fp32, before the rounding, bias and residual. ``down`` is in the layer's
+    original (un-rotated) basis.
 
     ``decode(row0, rows, cdtype, transposed, ch_exp)`` returns rows [row0, row0 + rows) of the
     normalized weight, [rows, K] (or [K, rows] when transposed), and fills ch_exp[row0:row0+rows].
@@ -618,7 +918,7 @@ def weight_only_linear(x, n, k, decode, *, bias, out_dtype, group, residual=None
     bias_v, bias_stride = _bias_operand(bias, n, x.dtype if bias_in_linear else out_dtype, device)
     x2 = x.reshape(-1, k)
     m = x2.shape[0]
-    if m == 0 or n == 0 or k == 0:
+    if m == 0 or n == 0 or k == 0:  # an empty K makes the LoRA term zero as well
         out = torch.zeros(out_shape, dtype=out_dtype, device=device)
         if bias_v is not None:
             out = out + bias_v.to(out_dtype)
@@ -635,6 +935,10 @@ def weight_only_linear(x, n, k, decode, *, bias, out_dtype, group, residual=None
     flags = (bias_v is not None) | ((res is not None) << 1)
     if bias_v is not None and not bias_in_linear:
         flags |= 4
+    if lora is not None:
+        dn, upt, up_exp = _lora_gemm_operands(lora, group, cdtype)
+        rank = dn.shape[0]
+        flags |= 8
     unused = torch.zeros(1, dtype=out_dtype, device=device)  # placeholder for absent operands
     res2, res_stride, rs_v, rs_stride = res if res is not None else (unused, 0, unused, 0)
     no_bias = torch.zeros(1, dtype=torch.float32, device=device)
@@ -644,15 +948,36 @@ def weight_only_linear(x, n, k, decode, *, bias, out_dtype, group, residual=None
         rows_per_chunk -= rows_per_chunk % 4  # keeps chunk starts on the vector epilogue's grid
     for row0 in range(0, n, rows_per_chunk):
         rows = min(rows_per_chunk, n - row0)
-        w = decode(row0, rows, cdtype, transposed, ch_exp)
+        if lora is not None and row0 == 0:
+            # The first chunk's GEMM also computes the low-rank activation: D' rides along as
+            # rank extra weight rows, la lands in c's last rank columns.
+            w, view = decode_buffer(rows, k, cdtype, transposed, rank, device)
+            decode(row0, rows, cdtype, transposed, ch_exp, view)
+            if transposed:
+                w[:, rows:] = dn.t()
+            else:
+                w[rows:] = dn
+        else:
+            w = decode(row0, rows, cdtype, transposed, ch_exp)
         c = xc @ w if transposed else torch.nn.functional.linear(xc, w)
         v = 4 if rows % 4 == 0 and n % 4 == 0 and row0 % 4 == 0 else 1
-        getattr(lib, f"epilogue{4 if v == 4 else ''}_{flags}_{epi_name}")(
-            out, c, row_exp, ch_exp,
-            bias_v if bias_v is not None else no_bias, res2, rs_v,
-            n, row0, bias_stride, res_stride, rs_stride,
-            threads=(rows // v, m), group_size=(min(rows // v, 256), 1),
-        )
+        operands = (out, c, row_exp, ch_exp, bias_v if bias_v is not None else no_bias, res2, rs_v)
+        if lora is None:
+            getattr(lib, f"epilogue{4 if v == 4 else ''}_{flags}_{epi_name}")(
+                *operands, n, row0, bias_stride, res_stride, rs_stride,
+                threads=(rows // v, m), group_size=(min(rows // v, 256), 1),
+            )
+        else:
+            if row0 == 0:
+                la_args = (c, c.stride(0), rows)  # (tensor, row stride, column offset)
+            getattr(lib, f"epilogue_lora{4 if v == 4 else ''}_{flags}_{epi_name}")(
+                *operands, la_args[0], upt, up_exp, n, row0, bias_stride, res_stride, rs_stride, m, rank, rows,
+                c.stride(0), la_args[1], la_args[2], upt.stride(0),
+                threads=(-(-rows // _LORA_TILE_N) * _LORA_TILE_M * 4, -(-m // _LORA_TILE_M)),
+                group_size=(_LORA_TILE_M * 4, 1),
+            )
+            if row0 == 0 and rows < n:  # later chunks read a compact copy
+                la_args = (c[:, rows:].contiguous(), rank, 0)
         del w, c
     out = out.reshape(out_shape)
     if residual is not None and res is None:
@@ -660,32 +985,46 @@ def weight_only_linear(x, n, k, decode, *, bias, out_dtype, group, residual=None
     return out
 
 
-def decode_int8(weight, scale, row0, rows, cdtype, transposed, ch_exp):
-    """Rows [row0, row0 + rows) of the INT8 weight, each divided by 2^ch_exp so |w'| < 1."""
+def decode_buffer(rows, k, cdtype, transposed, extra, device):
+    """A decode destination with ``extra`` spare weight rows after the decoded ones: [rows +
+    extra, K], or [K, rows + extra] when transposed. Returns (buffer, view of the decoded
+    rows); the view is what the decode writes, the buffer what the GEMM reads."""
+    if transposed:
+        buf = torch.empty((k, rows + extra), dtype=cdtype, device=device)
+        return buf, buf[:, :rows]
+    buf = torch.empty((rows + extra, k), dtype=cdtype, device=device)
+    return buf, buf[:rows]
+
+
+def decode_int8(weight, scale, row0, rows, cdtype, transposed, ch_exp, out=None):
+    """Rows [row0, row0 + rows) of the INT8 weight, each divided by 2^ch_exp so |w'| < 1.
+
+    ``out`` (from ``decode_buffer``) receives them in place; otherwise a new tensor is returned.
+    """
     k = weight.shape[1]
     lib = _shaders()
     suffix = DTYPE_SUFFIX[cdtype]
     scale_stride = 0 if scale.numel() == 1 else 1
-    if transposed and k % 4 == 0 and rows % 4 == 0:
-        out = torch.empty((k, rows), dtype=cdtype, device=weight.device)
+    if out is None:
+        shape = (k, rows) if transposed else (rows, k)
+        out = torch.empty(shape, dtype=cdtype, device=weight.device)
+    ld = out.stride(0)
+    if transposed and k % 4 == 0 and rows % 4 == 0 and ld % 4 == 0:
         getattr(lib, f"i8_decode_t4_{suffix}")(
-            out, ch_exp, weight, scale, k, rows, row0, scale_stride,
+            out, ch_exp, weight, scale, k, rows, row0, scale_stride, ld,
             threads=(-(-k // 128) * 32, -(-rows // 32) * 8), group_size=(32, 8),
         )
     elif transposed:
-        out = torch.empty((k, rows), dtype=cdtype, device=weight.device)
         getattr(lib, f"i8_decode_t_{suffix}")(
-            out, ch_exp, weight, scale, k, rows, row0, scale_stride,
+            out, ch_exp, weight, scale, k, rows, row0, scale_stride, ld,
             threads=(-(-k // 32) * 32, -(-rows // 32) * 32), group_size=(32, 32),
         )
     elif k % 4 == 0:
-        out = torch.empty((rows, k), dtype=cdtype, device=weight.device)
         getattr(lib, f"i8_decode4_{suffix}")(
             out, ch_exp, weight, scale, k, row0, scale_stride,
             threads=(k // 4, rows), group_size=(min(k // 4, 256), 1),
         )
     else:
-        out = torch.empty((rows, k), dtype=cdtype, device=weight.device)
         getattr(lib, f"i8_decode_{suffix}")(
             out, ch_exp, weight, scale, k, row0, scale_stride,
             threads=(k, rows), group_size=(min(k, 256), 1),
@@ -706,8 +1045,16 @@ def int8_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    lora_down: torch.Tensor | None = None,
+    lora_up: torch.Tensor | None = None,
+    lora_scale: float = 1.0,
 ) -> torch.Tensor:
-    """INT8-weight linear, computed as fp16 GEMM over on-the-fly decoded weights."""
+    """INT8-weight linear, computed as fp16 GEMM over on-the-fly decoded weights.
+
+    ``lora_down`` [R, K] and ``lora_up`` [N, R] (the layer's original, un-rotated basis) add
+    ``lora_scale * (x @ lora_down^T) @ lora_up^T`` without merging, as if the weight were
+    ``W + lora_scale * lora_up @ lora_down``. See ``lora_operands`` for several LoRAs.
+    """
     x = apply_input_act(x, input_act, input_act_weight, input_act_eps)
     n, k = weight.shape
     if x.shape[-1] != k:
@@ -726,11 +1073,13 @@ def int8_linear(
             f"for weight shape {tuple(weight.shape)}"
         )
 
-    def decode(row0, rows, cdtype, transposed, ch_exp):
-        return decode_int8(weight, scale, row0, rows, cdtype, transposed, ch_exp)
+    lora = lora_operands(lora_down, lora_up, lora_scale, n, k, x.device)
+
+    def decode(row0, rows, cdtype, transposed, ch_exp, out=None):
+        return decode_int8(weight, scale, row0, rows, cdtype, transposed, ch_exp, out)
 
     return weight_only_linear(
         x, n, k, decode, bias=bias, out_dtype=out_dtype,
         group=convrot_groupsize if convrot else None,
-        residual=residual, residual_scale=residual_scale,
+        residual=residual, residual_scale=residual_scale, lora=lora,
     )
