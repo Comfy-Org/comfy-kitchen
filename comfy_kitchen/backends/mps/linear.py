@@ -17,21 +17,21 @@ using namespace metal;
 kernel void dequant_i8_rowscale_f16(device half* out,
                                     constant char* w,
                                     constant float* scale,
-                                    constant uint& K,
+                                    constant long& K,
                                     uint idx [[thread_position_in_grid]]) {
-    out[idx] = half(float(w[idx]) * scale[idx / K]);
+    out[idx] = half(float(w[idx]) * scale[idx / uint(K)]);
 }
 
 // Same decode, written transposed: out[k, n] = half(w[n, k] * scale[n]).
 kernel void dequant_i8_rowscale_f16_t(device half* out,
                                       constant char* w,
                                       constant float* scale,
-                                      constant uint& K,
-                                      constant uint& N,
+                                      constant long& K,
+                                      constant long& N,
                                       uint idx [[thread_position_in_grid]]) {
-    uint k = idx / N;
-    uint n = idx - k * N;
-    out[idx] = half(float(w[n * K + k]) * scale[n]);
+    uint k = idx / uint(N);
+    uint n = idx - k * uint(N);
+    out[idx] = half(float(w[n * uint(K) + k]) * scale[n]);
 }
 """
 
@@ -82,6 +82,33 @@ def _gemm(xc: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, cdtype: t
     return xc @ w if transposed else torch.nn.functional.linear(xc, w)
 
 
+def _to_compute(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None, torch.dtype]:
+    """Cast activations to the compute dtype without losing range.
+
+    fp16 tops out at 65504 while bf16/fp32 callers routinely carry larger
+    activations (text-encoder states in the 1e4 range overflow after one GEMM).
+    Each row is divided by a power of two that brings its max below 1, which is
+    exact in every float format, and the result is multiplied back in the output
+    dtype by ``_from_compute``.
+    """
+    cdtype = _compute_dtype(x)
+    if cdtype != torch.float16 or x.dtype == torch.float16:
+        return x.to(cdtype), None, cdtype
+    row_max = x.abs().amax(dim=-1, keepdim=True).float().clamp(min=1e-30)
+    row_scale = torch.exp2(torch.ceil(torch.log2(row_max)))
+    return (x * torch.reciprocal(row_scale).to(x.dtype)).to(cdtype), row_scale, cdtype
+
+
+def _from_compute(result: torch.Tensor, row_scale: torch.Tensor | None,
+                  bias: torch.Tensor | None, out_dtype: torch.dtype) -> torch.Tensor:
+    result = result.to(out_dtype)
+    if row_scale is not None:
+        result = result * row_scale.to(out_dtype)
+    if bias is not None:
+        result = result + bias.to(device=result.device, dtype=out_dtype)
+    return result
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -114,8 +141,7 @@ def int8_linear(
         )
     scale = scale.contiguous()
 
-    cdtype = _compute_dtype(x)
-    xc = x.to(cdtype)
+    xc, row_scale, cdtype = _to_compute(x)
     if convrot:
         if k % convrot_groupsize != 0:
             raise ValueError(
@@ -134,7 +160,5 @@ def int8_linear(
                                scale[i:i + rows_per_chunk].contiguous(), cdtype))
         result = torch.cat(parts, dim=-1)
 
-    if bias is not None:
-        result = result + bias.to(device=result.device, dtype=result.dtype)
-    result = result.to(out_dtype)
+    result = _from_compute(result, row_scale, bias, out_dtype)
     return apply_residual(result, residual, residual_scale)

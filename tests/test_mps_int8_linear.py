@@ -87,3 +87,18 @@ def test_transposed_decode_matches_plain(monkeypatch):
     monkeypatch.setattr(linear, "_MAX_DECODE_BYTES", 2 * 1024 * 100)
     c = linear.int8_linear(x, q.to("mps"), s.to("mps"), out_dtype=torch.float16, convrot=True)
     assert torch.equal(b.cpu(), c.cpu())
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_large_activations_do_not_overflow_fp16(dtype):
+    # Text-encoder states reach ~1.6e4; one GEMM in fp16 would overflow 65504.
+    q, s, wd = _make(384, 1024, True, True)
+    x = torch.randn(5, 1024) * 2.0e4
+    x[2] *= 1e-6  # tiny rows must keep their precision next to huge ones
+    exact = torch.nn.functional.linear(x.to(dtype).float(), wd)
+    out = ck.int8_linear(x.to("mps", dtype), q.to("mps"), s.to("mps"), None, dtype, convrot=True)
+    o = out.float().cpu()
+    assert torch.isfinite(o).all()
+    tol = 6e-3 if dtype == torch.bfloat16 else 1e-3
+    for r in range(5):
+        assert _rel(o[r], exact[r]) < tol
