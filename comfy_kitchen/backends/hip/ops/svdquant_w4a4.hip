@@ -26,28 +26,9 @@ namespace comfy::hip_backend {
 constexpr int kSvdGroup = 64;       // quantization group, in elements
 constexpr int kSvdGroupBytes = 32;  // ... and in packed int4 bytes
 
-// x @ proj_down -> (M, R), fp32. One thread per output column: proj_down is
-// (K, R), so consecutive threads read consecutive addresses.
-__global__ __launch_bounds__(256) void lora_down_kernel(
-    const void* __restrict__ x, const void* __restrict__ lora_down,
-    float* __restrict__ lora_act, int M, int K, int R, int x_code, int d_code) {
-
-    const int m = blockIdx.x;
-    const int r = threadIdx.x;
-    if (r >= R) return;
-
-    float sum = 0.0f;
-    for (int k = 0; k < K; ++k) {
-        sum += load_in(x, static_cast<int64_t>(m) * K + k, x_code) *
-               load_in(lora_down, static_cast<int64_t>(k) * R + r, d_code);
-    }
-    lora_act[static_cast<int64_t>(m) * R + r] = sum;
-}
-
-// Smooth, then per-row per-group int4 quantize + pack. ascales is stored
-// transposed as (K/64, M_pad).
+// Scalar fallback for operands with different dtypes.
 template <bool UNSIGNED>
-__global__ __launch_bounds__(256) void svdquant_quant_kernel(
+__global__ __launch_bounds__(256) void svdquant_quant_scalar_kernel(
     const void* __restrict__ x, const void* __restrict__ smooth,
     int8_t* __restrict__ q, void* __restrict__ ascales,
     int M, int M_pad, int K, int x_code, int s_code) {
@@ -89,6 +70,100 @@ __global__ __launch_bounds__(256) void svdquant_quant_kernel(
             qrow[i / 2] = static_cast<int8_t>(((q0 & 0xF) | ((q1 & 0xF) << 4)) & 0xFF);
         }
     }
+}
+
+// Smooth, then per-row per-group int4 quantize + pack. Sixteen threads process
+// one 64-element group, keeping four smoothed values per thread so x and smooth
+// are read once. ascales is stored transposed as (K/64, M_pad).
+template <typename Elem, bool UNSIGNED>
+__global__ __launch_bounds__(256) void svdquant_quant_kernel(
+    const Elem* __restrict__ x, const Elem* __restrict__ smooth,
+    int8_t* __restrict__ q, Elem* __restrict__ ascales,
+    int M, int M_pad, int K) {
+
+    constexpr int kThreadsPerGroup = 16;
+    constexpr int kElemsPerThread = kSvdGroup / kThreadsPerGroup;
+    constexpr int kGroupsPerBlock = 256 / kThreadsPerGroup;
+    constexpr float kQMax = UNSIGNED ? 15.0f : 7.0f;
+    constexpr int kQMin = UNSIGNED ? 0 : -7;
+    constexpr int kQMaxInt = UNSIGNED ? 15 : 7;
+
+    const int m = blockIdx.x;
+    const int lane = threadIdx.x % kThreadsPerGroup;
+    const int group_slot = threadIdx.x / kThreadsPerGroup;
+    const int ngroups = K / kSvdGroup;
+
+    for (int g = group_slot; g < ngroups; g += kGroupsPerBlock) {
+        const int elem = lane * kElemsPerThread;
+        const int kbase = g * kSvdGroup + elem;
+        const int64_t xbase = static_cast<int64_t>(m) * K + kbase;
+
+        float values[kElemsPerThread];
+        float absmax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kElemsPerThread; ++i) {
+            values[i] = static_cast<float>(x[xbase + i]) /
+                        static_cast<float>(smooth[kbase + i]);
+            absmax = fmaxf(absmax, fabsf(values[i]));
+        }
+
+#pragma unroll
+        for (int offset = kThreadsPerGroup / 2; offset > 0; offset >>= 1) {
+            absmax = fmaxf(absmax, __shfl_xor(absmax, offset, kThreadsPerGroup));
+        }
+
+        absmax = fmaxf(absmax, 1e-10f);
+        const float scale = absmax / kQMax;
+        const float inv = kQMax / absmax;
+        if (lane == 0) {
+            ascales[static_cast<int64_t>(g) * M_pad + m] = static_cast<Elem>(scale);
+        }
+
+        int quantized[kElemsPerThread];
+#pragma unroll
+        for (int i = 0; i < kElemsPerThread; ++i) {
+            int v = static_cast<int>(rintf(values[i] * inv));
+            quantized[i] = v < kQMin ? kQMin : (v > kQMaxInt ? kQMaxInt : v);
+        }
+
+        const uint16_t packed =
+            static_cast<uint16_t>((quantized[0] & 0xF) |
+                                  ((quantized[1] & 0xF) << 4) |
+                                  ((quantized[2] & 0xF) << 8) |
+                                  ((quantized[3] & 0xF) << 12));
+        int8_t* qrow = q + static_cast<int64_t>(m) * (K / 2) + g * kSvdGroupBytes;
+        reinterpret_cast<uint16_t*>(qrow)[lane] = packed;
+    }
+}
+
+template <bool UNSIGNED>
+void launch_svdquant_quant(
+    const void* x, const void* smooth, int8_t* q, void* ascales,
+    int M, int M_pad, int K, int x_code, int s_code, hipStream_t stream) {
+
+    if (x_code == s_code) {
+        if (x_code == 0) {
+            svdquant_quant_kernel<float, UNSIGNED><<<M, 256, 0, stream>>>(
+                static_cast<const float*>(x), static_cast<const float*>(smooth), q,
+                static_cast<float*>(ascales), M, M_pad, K);
+            return;
+        }
+        if (x_code == 1) {
+            svdquant_quant_kernel<__half, UNSIGNED><<<M, 256, 0, stream>>>(
+                static_cast<const __half*>(x), static_cast<const __half*>(smooth), q,
+                static_cast<__half*>(ascales), M, M_pad, K);
+            return;
+        }
+        if (x_code == 2) {
+            svdquant_quant_kernel<__bf16, UNSIGNED><<<M, 256, 0, stream>>>(
+                static_cast<const __bf16*>(x), static_cast<const __bf16*>(smooth), q,
+                static_cast<__bf16*>(ascales), M, M_pad, K);
+            return;
+        }
+    }
+
+    svdquant_quant_scalar_kernel<UNSIGNED><<<M, 256, 0, stream>>>(
+        x, smooth, q, ascales, M, M_pad, K, x_code, s_code);
 }
 
 // Group-scaled int4 GEMM with the LoRA-up correction folded into the writeback.
@@ -236,19 +311,6 @@ __global__ __launch_bounds__(256) void svdquant_gemm_kernel(
 
 }  // namespace comfy::hip_backend
 
-extern "C" void launch_svdquant_lora_down_kernel(
-    const void* x, const void* lora_down, void* lora_act, int M, int K, int R, int x_code,
-    int d_code, hipStream_t stream) {
-
-    using namespace comfy::hip_backend;
-    if (R > 256) throw std::runtime_error("svdquant: LoRA rank above 256 is not supported");
-    if (M == 0) {
-        return;  // a zero-block launch is hipErrorInvalidConfiguration
-    }
-    lora_down_kernel<<<M, 256, 0, stream>>>(x, lora_down, static_cast<float*>(lora_act), M, K, R,
-                                            x_code, d_code);
-}
-
 extern "C" void launch_svdquant_quant_kernel(
     const void* x, const void* smooth, void* q, void* ascales, int M, int M_pad, int K,
     int x_code, int s_code, bool act_unsigned, hipStream_t stream) {
@@ -265,11 +327,13 @@ extern "C" void launch_svdquant_quant_kernel(
                                  " must be a multiple of 64");
     }
     if (act_unsigned) {
-        svdquant_quant_kernel<true><<<M, 256, 0, stream>>>(
-            x, smooth, static_cast<int8_t*>(q), ascales, M, M_pad, K, x_code, s_code);
+        launch_svdquant_quant<true>(
+            x, smooth, static_cast<int8_t*>(q), ascales,
+            M, M_pad, K, x_code, s_code, stream);
     } else {
-        svdquant_quant_kernel<false><<<M, 256, 0, stream>>>(
-            x, smooth, static_cast<int8_t*>(q), ascales, M, M_pad, K, x_code, s_code);
+        launch_svdquant_quant<false>(
+            x, smooth, static_cast<int8_t*>(q), ascales,
+            M, M_pad, K, x_code, s_code, stream);
     }
 }
 
