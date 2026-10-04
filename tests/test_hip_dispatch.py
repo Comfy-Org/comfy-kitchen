@@ -174,12 +174,16 @@ def test_hip_drops_gemms_without_matrix_cores():
     # model family unreachable on this backend, and routed it to a triton path
     # that decodes the entire [N, K] weight before the GEMM reads it.
     assert "w4a8_int8_linear" in without
+    # ...and convrot_w4a4_linear, for the same reason: its WMMA tile needs matrix
+    # cores but the VALU one does not, so the op dispatches on has_wmma() at the
+    # launch rather than being dropped. A dGPU in the same box still gets MmaInt4.
+    assert "convrot_w4a4_linear" in without
     # ...and nothing may be added to the set without a GEMM that traps on RDNA2.
     # The only gfx10 fallbacks in the kernel tree are in gemm_int8.hip and
     # gemm_fp16.hip; if one of these names gains a path there, remove it here.
     assert hip_backend._WMMA_ONLY_OPS == frozenset({
         "fp16_conv3d", "fp16_conv3d_out", "na3d", "sol_attn",
-        "convrot_w4a4_linear", "scaled_mm_svdquant_w4a4",
+        "scaled_mm_svdquant_w4a4",
     })
     # The fused W4A8 requantize is elementwise too: it packs weights and never
     # reaches a matrix core, so RDNA2 must keep it.

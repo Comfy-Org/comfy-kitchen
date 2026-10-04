@@ -224,11 +224,12 @@ _ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
 _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 
 # The GEMMs that need matrix cores and have no RDNA2 fallback. Everything else
-# either has a VALU path behind __GFX10__ (int8_linear, fp16_linear) or runs on
-# any supported architecture. This set names the registry-dispatched GEMMs that
-# _build_constraints drops on RDNA2; the fp8 GEMM is not among them because it
-# is reached through scaled_mm_v2's _hip_fp8_gemm, which gates on has_wmma()
-# itself rather than through the registry.
+# either has a VALU path behind __GFX10__ (int8_linear, fp16_linear,
+# w4a8_int8_linear, convrot_w4a4_linear) or runs on any supported architecture.
+# This set names the registry-dispatched GEMMs that _build_constraints drops on
+# RDNA2; the fp8 GEMM is not among them because it is reached through
+# scaled_mm_v2's _hip_fp8_gemm, which gates on has_wmma() itself rather than
+# through the registry.
 #
 # w4a8_int8_linear used to be here and was wrong. Its GEMM is not one of the
 # WMMA-only kernels: w4a8_dequant.hip's launcher finishes each decoded column
@@ -239,12 +240,19 @@ _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 # models to triton and made a dequantize-the-whole-weight-then-Triton-GEMM pass
 # out of a decode the HIP backend does in column chunks. Measured on the 6-CU
 # gfx1035 at the Anima W4A8 shapes: 8.85 -> 6.55 ms per (4096, 2048, 2048) call.
+#
+# convrot_w4a4_linear is here for the same reason of arrival and not of truth:
+# it reached for MmaInt4, and MmaInt4 is a __builtin_trap() without matrix
+# cores. The VALU tile in gemm_gfx10.h does the same product sum with
+# v_dot8_i32_i4 and is ~1.9x the int8 tile here, so the op itself no longer
+# needs a matrix core. It is dispatched on has_wmma() at the launch, not
+# dropped here, so a box holding both an RDNA2 iGPU and an RDNA3 dGPU sends each
+# call to the tile that part has.
 _WMMA_ONLY_OPS = frozenset({
     "fp16_conv3d",
     "fp16_conv3d_out",
     "na3d",
     "sol_attn",
-    "convrot_w4a4_linear",
     "scaled_mm_svdquant_w4a4",
 })
 
@@ -1460,11 +1468,30 @@ def convrot_w4a4_linear(
     qw = _operand(qweight, x.device, "qweight", shape=(n, k // 2))
 
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-    _C.convrot_w4a4_gemm(
-        _dl(qact), _dl(qw), _dl(out),
-        _dl(x_scale), _dl(wscales), None if bias is None else _dl(bias),
-        m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
-    )
+    if has_wmma():
+        _C.convrot_w4a4_gemm(
+            _dl(qact), _dl(qw), _dl(out),
+            _dl(x_scale), _dl(wscales), None if bias is None else _dl(bias),
+            m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
+        )
+    else:
+        # RDNA2 has no matrix cores, so the WMMA tile cannot run here. The VALU
+        # tile does the same arithmetic: qact and qw are already signed int4
+        # packed two per byte with the low nibble on even k, which is what
+        # v_dot8_i32_i4 consumes, and it retires at the same instruction rate as
+        # the int8 tile's v_dot4_i32_i8 while doing twice the products per
+        # instruction. Measured on the 6-CU gfx1035, int4_gemm against int8_gemm
+        # over identical values: 1.65x-2.08x, median 1.90x.
+        #
+        # Gate at the launch rather than through the registry, the way
+        # scaled_mm_v2's _hip_fp8_gemm does: a box with both an RDNA2 iGPU and a
+        # matrix-core dGPU registers this backend once and dispatches per call.
+        _C.int4_gemm(
+            _dl(qact), _dl(qw), _dl(out),
+            _dl(x_scale), _dl(wscales), 1,
+            None if bias is None else _dl(bias),
+            m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
+        )
     return out.reshape(*orig_shape[:-1], n)
 
 
