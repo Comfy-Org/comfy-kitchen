@@ -165,6 +165,22 @@ def test_hip_drops_gemms_without_matrix_cores():
     # paths behind __GFX10__, so RDNA2 keeps them.
     for op in ("int8_linear", "fp16_linear"):
         assert op in without
+    # w4a8_int8_linear's GEMM is launch_int8_gemm_kernel, not one of the WMMA
+    # kernels: w4a8_dequant.hip's chunked launcher finishes every decoded column
+    # chunk with it, and that already branches to the VALU tile on gfx10. The
+    # grouped INT4/INT6 decode in front of it is architecture-independent and
+    # templates on BITS, so both W4A8 and W6A8 work on RDNA2 as they stand. It
+    # used to be listed here, which did not make it correct -- it made a whole
+    # model family unreachable on this backend, and routed it to a triton path
+    # that decodes the entire [N, K] weight before the GEMM reads it.
+    assert "w4a8_int8_linear" in without
+    # ...and nothing may be added to the set without a GEMM that traps on RDNA2.
+    # The only gfx10 fallbacks in the kernel tree are in gemm_int8.hip and
+    # gemm_fp16.hip; if one of these names gains a path there, remove it here.
+    assert hip_backend._WMMA_ONLY_OPS == frozenset({
+        "fp16_conv3d", "fp16_conv3d_out", "na3d", "sol_attn",
+        "convrot_w4a4_linear", "scaled_mm_svdquant_w4a4",
+    })
     # The fused W4A8 requantize is elementwise too: it packs weights and never
     # reaches a matrix core, so RDNA2 must keep it.
     assert "quantize_w4a8_int8_weight" in without

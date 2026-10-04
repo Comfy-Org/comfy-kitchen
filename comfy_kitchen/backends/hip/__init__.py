@@ -229,6 +229,16 @@ _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 # _build_constraints drops on RDNA2; the fp8 GEMM is not among them because it
 # is reached through scaled_mm_v2's _hip_fp8_gemm, which gates on has_wmma()
 # itself rather than through the registry.
+#
+# w4a8_int8_linear used to be here and was wrong. Its GEMM is not one of the
+# WMMA-only kernels: w4a8_dequant.hip's launcher finishes each decoded column
+# chunk with launch_int8_gemm_kernel, and that one already branches to the VALU
+# tile on comfy_is_gfx10() (ops/gemm_int8.hip). The grouped INT4/INT6 decode is
+# architecture-independent and templates on BITS, so the whole W4A8 and W6A8
+# stack runs on RDNA2 as it stands -- it was only unreachable, which sent those
+# models to triton and made a dequantize-the-whole-weight-then-Triton-GEMM pass
+# out of a decode the HIP backend does in column chunks. Measured on the 6-CU
+# gfx1035 at the Anima W4A8 shapes: 8.85 -> 6.55 ms per (4096, 2048, 2048) call.
 _WMMA_ONLY_OPS = frozenset({
     "fp16_conv3d",
     "fp16_conv3d_out",
@@ -236,7 +246,6 @@ _WMMA_ONLY_OPS = frozenset({
     "sol_attn",
     "convrot_w4a4_linear",
     "scaled_mm_svdquant_w4a4",
-    "w4a8_int8_linear",
 })
 
 
@@ -2928,9 +2937,11 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         constraints[inplace_name] = constraints[functional_name]
 
     if not has_wmma:
-        # RDNA2: the GEMM kernels are compiled but trap, so they must not be
-        # advertised. Dropping them here routes those ops to triton/eager while the
-        # elementwise kernels below still dispatch to HIP.
+        # RDNA2: the WMMA GEMM kernels are compiled but trap, so they must not be
+        # advertised. Dropping the ops in _WMMA_ONLY_OPS here routes those to
+        # triton/eager while the elementwise kernels below, and the GEMMs that have
+        # a VALU path (int8_linear, fp16_linear, w4a8_int8_linear), still dispatch
+        # to HIP.
         constraints = {k: v for k, v in constraints.items() if k not in _WMMA_ONLY_OPS}
 
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
