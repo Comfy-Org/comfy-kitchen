@@ -1194,17 +1194,54 @@ inline void launch_convrot_quant(
     //   M2048  K1280                          0.306 -> 0.307 ms  0.996x
     //
     // i.e. a clear win where the row is long and a tie where it is short, never a
-    // loss outside noise. Scoped to !PACK_INT4 so the INT4 widths above, which were
-    // tuned separately, keep theirs.
+    // INT4 G=256: retuned on gfx1103. It was 1024 threads for every K>=512, which is
+    // the *widest* block for the least work per thread: at G=256 a 1024-thread block
+    // carries four groups per pass, so a 5-group row (K=1280) runs 2 passes with the
+    // last one three-quarters idle, and each pass costs 4 butterfly stages x 2
+    // __syncthreads() plus a 10-level LDS absmax reduction over 1024 threads. Only 2
+    // such blocks fit per CU (LDS), so there is nothing to interleave behind the
+    // barriers. Measured 6.4-17.0 GB/s against the 63 GB/s copy ceiling, on shapes
+    // where the fused INT8 quantizer reaches 30.8-52.8.
+    //
+    // Same-process interleaved over COMFY_CONVROT_LEGACY_BLOCK, 256/512/1024 only (see
+    // the clamp below on why 64/128 are not offered for G=256), forward and reverse
+    // rotation, output bit-identical in every case:
+    //
+    //   M8192  K1280 fp16   3.121 -> 1.755 ms  1.78x   8.4 -> 15.0 GB/s
+    //   M4608  K1280 fp16   1.674 -> 0.904 ms  1.85x   8.8 -> 16.3 GB/s
+    //   M1024  K1280 fp16   0.515 -> 0.318 ms  1.62x   6.4 -> 10.3 GB/s
+    //   M8192  K2048 bf16   3.408 -> 2.576 ms  1.32x  12.3 -> 16.3 GB/s
+    //   M18432 K2048 bf16   7.225 -> 5.368 ms  1.35x  13.1 -> 17.6 GB/s
+    //   M2048  K2048 fp16   0.901 -> 0.660 ms  1.36x  11.7 -> 15.9 GB/s
+    //   M2048  K5120 fp16   1.827 -> 1.569 ms  1.16x  14.4 -> 16.7 GB/s
+    //   M8192  K8192 bf16  10.270 -> 9.398 ms  1.09x  16.3 -> 17.9 GB/s  (512 wins)
+    //   M18432 K8192 bf16  22.180 -> 19.995 ms 1.11x  17.0 -> 18.9 GB/s  (512 wins)
+    //
+    // The 256/512 split follows the group count, the same shape as the fused kernel's
+    // rule above: up to about twenty 256-wide groups the narrow block wins outright,
+    // and past that the row itself dominates and the trade turns back toward width.
+    //
+    // **This is the floor, not the ceiling.** The remaining gap to the fused INT8
+    // quantizer is structural -- scalar 2-byte loads, 8 barriers per pass, a 10-level
+    // LDS reduction, 2 resident blocks per CU -- not a block-width mistake, so the real
+    // fix is to give PACK_INT4 the fused kernel. Not done here because that kernel
+    // scales by 0.5 per butterfly stage while this one scales by rsqrt(G) once at the
+    // end, so the two disagree in the rotation's rounding. Block width was the part
+    // that could be taken for free.
     int block_threads;
     if constexpr (!PACK_INT4) {
         block_threads = (group_size == 64) ? 64
                         : (group_size == 256 && K >= 512) ? 1024 : 256;
     } else {
-        block_threads = (group_size == 256 && K >= 512) ? 1024 : 256;
+        block_threads = (group_size == 256) ? ((K / kConvRotGroup256) <= 20 ? 256 : 512)
+                                            : 256;
     }
     if (const int ov = comfy_convrot_legacy_block_override(); ov > 0) {
-        block_threads = ov;
+        // convrot_quant_kernel's per-pass loop is `for (gbase = 0; gbase < ngrp;
+        // gbase += gpw)` with gpw = BLOCK_THREADS / G, so a block narrower than G makes
+        // gpw 0 and that loop never terminates -- the sweep above hung the process on
+        // BLOCK=64 at G=256. Clamp instead of accepting, so the override cannot wedge.
+        block_threads = (ov >= group_size) ? ov : group_size;
     }
     switch (block_threads) {
         case 64:
