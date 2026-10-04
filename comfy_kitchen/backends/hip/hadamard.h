@@ -441,16 +441,38 @@ __forceinline__ __device__ void load_row4(const void* x, int64_t in_row, int col
 // Whether the fused kernel may read its four values per lane in one vector
 // load, and up to which block width.
 //
-// **Measured on gfx1035 only**, and gated to it for the same reason the staged
-// rowwise quantizer is gated to `comfy_small_igpu()`: a schedule that was
-// measured on one part is not assumed on another, and this tree's convention is
+// **Measured on gfx1035 and gfx1103**, and gated to those two for the same reason
+// the staged rowwise quantizer is gated to `comfy_small_igpu()`: a schedule that
+// was measured on one part is not assumed on another, and this tree's convention is
 // to say which part a tuning change was measured on rather than to assume it is
-// free. The win is at narrow blocks, where the block count is what keeps the
-// memory system busy and four 2-byte requests per lane cost real issue slots
+// free. On gfx1035 the win is at narrow blocks, where the block count is what keeps
+// the memory system busy and four 2-byte requests per lane cost real issue slots
 // (1.1x-1.2x on the K=1280/2048/5120 rows of the production dispatch). It is a
 // loss at the widest block, which is already down to one resident block per CU on
 // LDS alone: there the extra registers cost more than the requests saved, and
 // measured at K=8192 (BLOCK=1024) the scalar path is 1.06x-1.09x faster.
+//
+// On gfx1103 (the 6-WGP 780M, `comfy_small_igpu()`) it is a larger win than on
+// gfx1035 and holds at **every** block width the production dispatch picks, which
+// is <= 256 here, so the same 512 cap covers it. Same-process interleaved over
+// COMFY_CONVROT_VEC_LOAD, 14 samples per arm, vector/scalar, output bit-identical
+// in every case (COMFY_CONVROT_VEC_LOAD=1 vs =0, checked before timing):
+//
+//   M= 8192 K= 2048 bf16  1.555 -> 1.154 ms  0.742x   32.4 -> 43.7 GB/s
+//   M= 8192 K= 8192 bf16  5.687 -> 4.003 ms  0.704x   35.4 -> 50.3 GB/s
+//   M=18432 K= 2048 bf16  3.081 -> 2.227 ms  0.723x   36.8 -> 50.9 GB/s
+//   M=18432 K= 8192 bf16 12.393 -> 8.611 ms  0.695x   36.6 -> 52.6 GB/s
+//   M= 2048 K= 1280 fp16  0.313 -> 0.275 ms  0.879x   25.2 -> 28.6 GB/s
+//   M= 2048 K= 5120 fp16  0.862 -> 0.687 ms  0.797x   36.5 -> 45.8 GB/s
+//   M= 8192 K= 1280 fp16  0.721 -> 0.604 ms  0.838x   43.7 -> 52.1 GB/s
+//   M=18432 K= 1280 fp16  1.851 -> 1.450 ms  0.783x   38.3 -> 48.9 GB/s
+//   M= 2048 K= 2048 fp16  0.426 -> 0.363 ms  0.851x   29.5 -> 34.7 GB/s
+//   M= 4608 K= 1280 fp16  0.509 -> 0.424 ms  0.834x   34.8 -> 41.8 GB/s
+//
+// GB/s is against the kernel's own compulsory traffic (M*K*(esize+1) + 4M). This is
+// the activation quantizer, which is 9.3% of an Anima w4a8 sampling step and 7-56%
+// of every convrot=True int8_linear call, so it is not a rounding error even though
+// the GEMM it feeds already measures ~80% of this part's int8 ceiling.
 //
 // Every other architecture keeps the scalar loads, which is exactly what the
 // kernel compiled before this change.
@@ -462,8 +484,25 @@ __forceinline__ __device__ void load_row4(const void* x, int64_t in_row, int col
 // argument, not a different load sequence per target.
 constexpr int kConvrotVecLoadMaxBlock = 512;
 
+// Experiment knob for the schedule above: COMFY_CONVROT_VEC_LOAD=1 forces the
+// vector loads on, =0 forces them off, unset follows the gate below. Same reason
+// as the block overrides: one process has to interleave both arms, because the
+// first GEMM after a rebuild runs on cold clocks here and that alone measures
+// larger than the effect being chased.
+inline int comfy_convrot_vec_load_override() {
+    const char* s = getenv("COMFY_CONVROT_VEC_LOAD");
+    if (!s || !*s) return -1;
+    const int v = atoi(s);
+    return (v == 0 || v == 1) ? v : -1;
+}
+
 inline bool convrot_vec_load_enabled(int block_threads) {
-    return block_threads <= kConvrotVecLoadMaxBlock && comfy_is_gfx10();
+    const int ov = comfy_convrot_vec_load_override();
+    if (ov >= 0) {
+        return ov == 1;
+    }
+    return block_threads <= kConvrotVecLoadMaxBlock &&
+           (comfy_is_gfx10() || comfy_small_igpu());
 }
 
 template <int CODE, int ACT>
