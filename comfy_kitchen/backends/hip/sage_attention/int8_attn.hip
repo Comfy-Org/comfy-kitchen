@@ -24,6 +24,7 @@
 #include <string>
 #include <type_traits>
 
+#include "../gemm_simt.h"
 #include "../mma.h"
 #include "sage_common.h"
 
@@ -863,6 +864,315 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
     }
 }
 
+#if defined(__gfx1010__)
+#define COMFY_SAGE_FP16_SIMT 1
+#endif
+
+// gfx1010 has no matrix unit and no dot4, so the MMA policy above costs ~1.5
+// instructions per MAC plus a ds_bpermute per accumulator element. This kernel
+// takes the thread-level route the SIMT GEMM uses instead: K and V are staged in
+// LDS as f16 and every MAC is one v_fma_mix_f32 (f16 x f16 -> f32 accumulate).
+// That is exact here: int8 values are exact in f16, their products fit 22 bits,
+// and every integer partial sum stays below 2^24.
+//
+// A lane PAIR owns a query (16 per wave). Each lane keeps half of Q and half of O
+// (interleaved 8-wide and 4-wide groups, which keeps the pair's LDS reads on
+// distinct banks), the partial scores are folded with one DPP swap, and the
+// softmax is duplicated on both lanes (no shuffles, ~2% of the work). P stays
+// f16 instead of the U8 the matrix path needs.
+//
+// PK=true (used for D=128) swaps the fma_mix chains for v_pk_fma_f16, ~1.8x the MAC
+// rate on gfx1010, at the cost of inexact f16 accumulation. Q is pre-scaled by 1/16
+// (exact) so a 16-pair QK chain cannot overflow, QK chains are flushed to f32 every
+// 16 pairs and PV chains every 16 keys, and P is shifted by 2^-4 (it cancels in
+// O / d) to keep the PV chains below 65504. Measured end-to-end error stays within
+// ~3% of the exact path, far below the int8 quantization error.
+#if defined(COMFY_SAGE_FP16_SIMT)
+using half2_t = _Float16 __attribute__((ext_vector_type(2)));
+struct __attribute__((aligned(16))) Half8 { half2_t v[4]; };
+
+__forceinline__ __device__ void i8x4_to_half2(uint32_t w, half2_t& lo, half2_t& hi) {
+    // (u8 + 128) planted in the mantissa of 1024 is exactly 1024 + u8 + 128 - 128.
+    w ^= 0x80808080u;
+    const half2_t bias = {static_cast<_Float16>(1152.0f), static_cast<_Float16>(1152.0f)};
+    lo = __builtin_bit_cast(half2_t, __byte_perm(w, 0x64646464u, 0x5140u)) - bias;
+    hi = __builtin_bit_cast(half2_t, __byte_perm(w, 0x64646464u, 0x5342u)) - bias;
+}
+
+__forceinline__ __device__ void i8x16_to_half8x2(const uint4& raw, Half8& a, Half8& b) {
+    i8x4_to_half2(raw.x, a.v[0], a.v[1]);
+    i8x4_to_half2(raw.y, a.v[2], a.v[3]);
+    i8x4_to_half2(raw.z, b.v[0], b.v[1]);
+    i8x4_to_half2(raw.w, b.v[2], b.v[3]);
+}
+
+__forceinline__ __device__ float swap_pair(float v) {
+    return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0xB1, 0xF, 0xF, false));
+}
+
+__forceinline__ __device__ float fma_h(_Float16 a, _Float16 b, float c) {
+    return __builtin_fmaf(static_cast<float>(a), static_cast<float>(b), c);
+}
+#endif
+
+template <int HD, bool PK, typename OutT>
+__global__ __launch_bounds__(256) void int8_attn_fp16_kernel(
+    const int8_t* __restrict__ q, const int8_t* __restrict__ k, const int8_t* __restrict__ v,
+    OutT* __restrict__ o, const float* __restrict__ q_scale, const float* __restrict__ k_scale,
+    const float* __restrict__ v_scale, int qo_len, int kv_len, int qo_len_padded,
+    int k_groups_per_head, int num_kv_groups, int64_t q_stride_b, int64_t q_stride_h,
+    int64_t k_stride_b, int64_t k_stride_h, int64_t v_stride_b, int64_t v_stride_h,
+    int64_t v_stride_d, int64_t o_stride_b, int64_t o_stride_h, int64_t o_stride_n,
+    float sm_scale) {
+#if defined(COMFY_SAGE_FP16_SIMT)
+    constexpr int kThreads = 256;
+    constexpr int kBlockQ = 128;
+    constexpr int CTA_K = 64;
+    constexpr int kSub = 16;                 // keys per softmax step = one k_scale group
+    constexpr int kChunks = HD / 16;         // 8-wide Q/K chunks owned by a lane
+    constexpr int kGroups = HD / 8;          // 4-wide O groups owned by a lane
+    constexpr int kKStride = HD;             // halves per K row
+    constexpr int kVStride = CTA_K + 8;      // halves per V row: 144 B, so rows 4 apart
+                                             // land 64 B apart in the banks
+    __shared__ __attribute__((aligned(16))) _Float16 smem_k[CTA_K * kKStride];
+    __shared__ __attribute__((aligned(16))) _Float16 smem_v[HD * kVStride];
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wave = tid >> 5;
+    const int half_id = lane & 1;
+    const int batch = blockIdx.z;
+    const int head = blockIdx.y;
+    const int num_qo_heads = gridDim.y;
+    const int kv_head = head / num_kv_groups;
+    const int q_idx = blockIdx.x * kBlockQ + wave * 16 + (lane >> 1);
+
+    const int8_t* q_head = q + static_cast<int64_t>(batch) * q_stride_b +
+                           static_cast<int64_t>(head) * q_stride_h;
+    const int8_t* k_head = k + static_cast<int64_t>(batch) * k_stride_b +
+                           static_cast<int64_t>(kv_head) * k_stride_h;
+    const int8_t* v_head = v + static_cast<int64_t>(batch) * v_stride_b +
+                           static_cast<int64_t>(kv_head) * v_stride_h;
+
+    sm_scale *= kLog2e;
+
+    half2_t qh[HD / 4];
+    {
+        const int8_t* q_row = q_head + static_cast<int64_t>(imin(q_idx, qo_len - 1)) * HD;
+#pragma unroll
+        for (int c = 0; c < kChunks; ++c) {
+            const uint2 raw = *reinterpret_cast<const uint2*>(q_row + (2 * c + half_id) * 8);
+            i8x4_to_half2(raw.x, qh[4 * c], qh[4 * c + 1]);
+            i8x4_to_half2(raw.y, qh[4 * c + 2], qh[4 * c + 3]);
+        }
+        if constexpr (PK) {
+            const half2_t sixteenth = {static_cast<_Float16>(0.0625f), static_cast<_Float16>(0.0625f)};
+#pragma unroll
+            for (int i = 0; i < HD / 4; ++i) qh[i] = qh[i] * sixteenth;
+        }
+    }
+    const float q_lane_scale = (PK ? 16.0f : 1.0f) *
+        sm_scale * q_scale[(static_cast<int64_t>(batch) * num_qo_heads + head) * qo_len_padded +
+                           imin(q_idx, qo_len_padded - 1)];
+
+    float o_val[kGroups][4];
+#pragma unroll
+    for (int g = 0; g < kGroups; ++g) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) o_val[g][j] = 0.0f;
+    }
+    float m_run = kMaskedScore;
+    float d_run = 0.0f;
+
+    const int num_iters = (kv_len + CTA_K - 1) / CTA_K;
+    const float* k_scale_head =
+        k_scale + (static_cast<int64_t>(batch) * (num_qo_heads / num_kv_groups) + kv_head) *
+                      k_groups_per_head;
+
+    auto run_iter = [&](auto boundary_tag, int iter) {
+        constexpr bool kBoundary = decltype(boundary_tag)::value;
+        const int kb0 = iter * CTA_K;
+
+        __syncthreads();
+#pragma unroll
+        for (int idx = tid; idx < CTA_K * (HD / 16); idx += kThreads) {
+            const int row = idx / (HD / 16);
+            const int unit = idx % (HD / 16);
+            const int key = kb0 + row;
+            uint4 raw = {0u, 0u, 0u, 0u};
+            if (!kBoundary || key < kv_len) {
+                raw = *reinterpret_cast<const uint4*>(k_head + static_cast<int64_t>(key) * HD +
+                                                     unit * 16);
+            }
+            Half8 a, b;
+            i8x16_to_half8x2(raw, a, b);
+            Half8* dst = reinterpret_cast<Half8*>(smem_k + row * kKStride + unit * 16);
+            dst[0] = a;
+            dst[1] = b;
+        }
+#pragma unroll
+        for (int idx = tid; idx < HD * (CTA_K / 16); idx += kThreads) {
+            const int row = idx / (CTA_K / 16);
+            const int unit = idx % (CTA_K / 16);
+            const uint4 raw = *reinterpret_cast<const uint4*>(
+                v_head + static_cast<int64_t>(row) * v_stride_d + kb0 + unit * 16);
+            Half8 a, b;
+            i8x16_to_half8x2(raw, a, b);
+            Half8* dst = reinterpret_cast<Half8*>(smem_v + row * kVStride + unit * 16);
+            dst[0] = a;
+            dst[1] = b;
+        }
+        __syncthreads();
+
+#pragma unroll 1
+        for (int sub = 0; sub < CTA_K / kSub; ++sub) {
+            const int key0 = kb0 + sub * kSub;
+            if (kBoundary && key0 >= kv_len) break;
+
+            float s[kSub];
+#pragma unroll
+            for (int g4 = 0; g4 < kSub / 4; ++g4) {
+                float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                [[maybe_unused]] half2_t pacc[4];
+#pragma unroll
+                for (int c = 0; c < kChunks; ++c) {
+#pragma unroll
+                    for (int kk = 0; kk < 4; ++kk) {
+                        const Half8 kv = *reinterpret_cast<const Half8*>(
+                            smem_k + (sub * kSub + g4 * 4 + kk) * kKStride +
+                            (2 * c + half_id) * 8);
+                        if constexpr (PK) {
+                            if (c % 4 == 0) pacc[kk] = half2_t{0, 0};
+#pragma unroll
+                            for (int e = 0; e < 4; ++e)
+                                pacc[kk] = __builtin_elementwise_fma(qh[4 * c + e], kv.v[e], pacc[kk]);
+                            if (c % 4 == 3 || c == kChunks - 1) {
+                                acc[kk] = fma_h(pacc[kk].x, static_cast<_Float16>(1.0f), acc[kk]);
+                                acc[kk] = fma_h(pacc[kk].y, static_cast<_Float16>(1.0f), acc[kk]);
+                            }
+                        } else {
+#pragma unroll
+                            for (int e = 0; e < 4; ++e) {
+                                acc[kk] = fma_h(qh[4 * c + e].x, kv.v[e].x, acc[kk]);
+                                acc[kk] = fma_h(qh[4 * c + e].y, kv.v[e].y, acc[kk]);
+                            }
+                        }
+                    }
+                }
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk) s[g4 * 4 + kk] = acc[kk];
+            }
+#pragma unroll
+            for (int i = 0; i < kSub; ++i) s[i] += swap_pair(s[i]);
+
+            const float scale = q_lane_scale * k_scale_head[iter * (CTA_K / kSub) + sub];
+            float mx = s[0];
+#pragma unroll
+            for (int i = 1; i < kSub; ++i) {
+                mx = fmaxf(mx, (kBoundary && key0 + i >= kv_len) ? -1.0e30f : s[i]);
+            }
+            const float tile_m = mx * scale;
+
+            const bool update = tile_m > m_run + 8.0f;
+            if (__any(update)) {
+                const float m_next = update ? tile_m - 4.0f : m_run;
+                const float alpha = softmax_exp2(m_run - m_next);
+                d_run *= alpha;
+#pragma unroll
+                for (int g = 0; g < kGroups; ++g) {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) o_val[g][j] *= alpha;
+                }
+                m_run = m_next;
+            }
+
+            half2_t ph[kSub / 2];
+            const float negative_m = -m_run - (PK ? 4.0f : 0.0f);
+#pragma unroll
+            for (int i = 0; i < kSub / 2; ++i) {
+                float p0 = softmax_exp2(fmaf(s[2 * i], scale, negative_m));
+                float p1 = softmax_exp2(fmaf(s[2 * i + 1], scale, negative_m));
+                if (kBoundary) {
+                    p0 = key0 + 2 * i < kv_len ? p0 : 0.0f;
+                    p1 = key0 + 2 * i + 1 < kv_len ? p1 : 0.0f;
+                }
+                d_run += p0 + p1;
+                ph[i] = __builtin_bit_cast(half2_t, __builtin_amdgcn_cvt_pkrtz(p0, p1));
+            }
+
+#pragma unroll
+            for (int g = 0; g < kGroups; ++g) {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int row = 8 * g + 4 * half_id + j;
+                    const Half8 v0 = *reinterpret_cast<const Half8*>(smem_v + row * kVStride + sub * kSub);
+                    const Half8 v1 = *reinterpret_cast<const Half8*>(smem_v + row * kVStride + sub * kSub + 8);
+                    float a = o_val[g][j];
+                    if constexpr (PK) {
+                        half2_t pa = half2_t{0, 0};
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) pa = __builtin_elementwise_fma(ph[e], v0.v[e], pa);
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) pa = __builtin_elementwise_fma(ph[4 + e], v1.v[e], pa);
+                        a = fma_h(pa.x, static_cast<_Float16>(1.0f), a);
+                        a = fma_h(pa.y, static_cast<_Float16>(1.0f), a);
+                    } else {
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            a = fma_h(ph[e].x, v0.v[e].x, a);
+                            a = fma_h(ph[e].y, v0.v[e].y, a);
+                        }
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            a = fma_h(ph[4 + e].x, v1.v[e].x, a);
+                            a = fma_h(ph[4 + e].y, v1.v[e].y, a);
+                        }
+                    }
+                    o_val[g][j] = a;
+                }
+            }
+        }
+    };
+
+    const int interior_iters = kv_len / CTA_K;
+    int iter = 0;
+    for (; iter < interior_iters; ++iter) run_iter(std::false_type{}, iter);
+    for (; iter < num_iters; ++iter) run_iter(std::true_type{}, iter);
+
+    if (q_idx >= qo_len) return;
+    const float inv_d = d_run > 0.0f ? 1.0f / d_run : 0.0f;
+    const float* v_scale_head =
+        v_scale + (static_cast<int64_t>(batch) * (num_qo_heads / num_kv_groups) + kv_head) * HD;
+    OutT* row = o + static_cast<int64_t>(batch) * o_stride_b +
+                static_cast<int64_t>(head) * o_stride_h + static_cast<int64_t>(q_idx) * o_stride_n;
+#pragma unroll
+    for (int g = 0; g < kGroups; ++g) {
+        const int d0 = 4 * (2 * g + half_id);
+        const float4 vs = *reinterpret_cast<const float4*>(v_scale_head + d0);
+        __attribute__((aligned(8))) OutT packed[4] = {
+            static_cast<OutT>(o_val[g][0] * vs.x * inv_d),
+            static_cast<OutT>(o_val[g][1] * vs.y * inv_d),
+            static_cast<OutT>(o_val[g][2] * vs.z * inv_d),
+            static_cast<OutT>(o_val[g][3] * vs.w * inv_d)};
+        *reinterpret_cast<uint2*>(row + d0) = *reinterpret_cast<const uint2*>(packed);
+    }
+#endif
+}
+
+template <int HD, bool PK, typename OutT>
+void launch_fp16(const int8_t* q, const int8_t* k, const int8_t* v, OutT* o, const float* q_scale,
+                 const float* k_scale, const float* v_scale, int batch, int qo_len, int kv_len,
+                 int qo_len_padded, int num_qo_heads, int k_groups_per_head, int num_kv_groups,
+                 int64_t q_stride_b, int64_t q_stride_h, int64_t k_stride_b, int64_t k_stride_h,
+                 int64_t v_stride_b, int64_t v_stride_h, int64_t v_stride_d, int64_t o_stride_b,
+                 int64_t o_stride_h, int64_t o_stride_n, float sm_scale, hipStream_t stream) {
+    const dim3 grid(div_ceil_host(qo_len, 128), num_qo_heads, batch);
+    int8_attn_fp16_kernel<HD, PK, OutT><<<grid, 256, 0, stream>>>(
+        q, k, v, o, q_scale, k_scale, v_scale, qo_len, kv_len, qo_len_padded, k_groups_per_head,
+        num_kv_groups, q_stride_b, q_stride_h, k_stride_b, k_stride_h, v_stride_b, v_stride_h,
+        v_stride_d, o_stride_b, o_stride_h, o_stride_n, sm_scale);
+}
+
 template <int HD, int CTA_K, MaskMode kMask, typename OutT>
 void launch_one(const int8_t* q, const int8_t* k, const int8_t* v, OutT* o, const float* q_scale,
                 const float* k_scale, const float* v_scale, const void* mask,
@@ -1005,6 +1315,26 @@ extern "C" void launch_sage_int8_attn(
             SAGE_ATTN_OUT(HD, MaskMode::kNone);                                                  \
         }                                                                                        \
     } while (0)
+
+    // The fp16 FMA kernel does not support masks, D256, or a negative scale (it
+    // takes the tile maximum before scaling).
+    if (mask == nullptr && (head_dim == 64 || head_dim == 128) && sm_scale >= 0.0f &&
+        kv_len > 0 && comfy::hip_backend::simt_gemm_target() == comfy::hip_backend::SimtTarget::kGfx1010) {
+#define SAGE_ATTN_FP16(HD, PKM, OUT)                                                            \
+    launch_fp16<HD, PKM, OUT>(qi, ki, vi, static_cast<OUT*>(o), qs, ks, vs, batch, qo_len, kv_len, \
+                         qo_len_padded, num_qo_heads, k_groups_per_head, num_kv_groups,          \
+                         q_stride_b, q_stride_h, k_stride_b, k_stride_h, v_stride_b, v_stride_h, \
+                         v_stride_d, o_stride_b, o_stride_h, o_stride_n, sm_scale, stream)
+        if (head_dim == 64) {
+            if (output_dtype_code == 1) SAGE_ATTN_FP16(64, false, __half);
+            else SAGE_ATTN_FP16(64, false, __bf16);
+        } else {
+            if (output_dtype_code == 1) SAGE_ATTN_FP16(128, true, __half);
+            else SAGE_ATTN_FP16(128, true, __bf16);
+        }
+#undef SAGE_ATTN_FP16
+        return;
+    }
 
     switch (head_dim) {
         case 64: SAGE_ATTN_MASK(64); break;
