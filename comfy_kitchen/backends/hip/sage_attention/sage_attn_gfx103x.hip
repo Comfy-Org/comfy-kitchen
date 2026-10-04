@@ -114,7 +114,8 @@ struct AttnLaunchCtx {
 // are: a runtime mode would put a branch and a live register on the critical
 // path of every key in the inner loop, where the register budget is already the
 // binding constraint on this architecture.
-template <int HD, bool CAUSAL, int BN, int TM, typename ODT, bool INQ, int MASK, int MASK_DTYPE>
+template <int HD, bool CAUSAL, int BN, int BM, int TM, typename ODT, bool INQ, int MASK,
+          int MASK_DTYPE>
 void launch_attn(const AttnLaunchCtx& c) {
     const AttnLaunch& a = c.ops;
     // The in-kernel-Q path reads Q from the fp16/bf16 source; otherwise it reads
@@ -122,7 +123,7 @@ void launch_attn(const AttnLaunchCtx& c) {
     const int64_t qi_b = INQ ? a.q_fp_stride_b : a.q_stride_b;
     const int64_t qi_n = INQ ? a.q_fp_stride_n : a.q_stride_n;
     const int64_t qi_h = INQ ? a.q_fp_stride_h : a.q_stride_h;
-    sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<HD, CAUSAL, BN, 128, ODT, TM, INQ, MASK,
+    sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<HD, CAUSAL, BN, BM, ODT, TM, INQ, MASK,
                                                    MASK_DTYPE>
         <<<c.grid, c.block, 0, c.stream>>>(
         a.q, a.k, a.v, static_cast<ODT*>(a.out), a.q_scale, a.k_scale, a.batch, a.qo_len,
@@ -136,29 +137,29 @@ void launch_attn(const AttnLaunchCtx& c) {
 // Resolves the runtime mask mode into the template argument the kernel takes.
 // The dtype is a second dimension of the same dispatch: kRaw is the only mode
 // that cares, and a Boolean mask and a float mask compile to different reads.
-template <int HD, bool CAUSAL, int BN, int TM, typename ODT, bool INQ>
+template <int HD, bool CAUSAL, int BN, int BM, int TM, typename ODT, bool INQ>
 void launch_attn_mask(const AttnLaunchCtx& c) {
     const AttnLaunch& a = c.ops;
     switch (c.mask_mode) {
         case sageattn_gfx10::MaskMode::kNone:
-            launch_attn<HD, CAUSAL, BN, TM, ODT, INQ, sageattn_gfx10::MaskMode::kNone, 0>(c);
+            launch_attn<HD, CAUSAL, BN, BM, TM, ODT, INQ, sageattn_gfx10::MaskMode::kNone, 0>(c);
             return;
         case sageattn_gfx10::MaskMode::kPreparedKey:
-            launch_attn<HD, CAUSAL, BN, TM, ODT, INQ, sageattn_gfx10::MaskMode::kPreparedKey, 0>(c);
+            launch_attn<HD, CAUSAL, BN, BM, TM, ODT, INQ, sageattn_gfx10::MaskMode::kPreparedKey, 0>(c);
             return;
         case sageattn_gfx10::MaskMode::kPreparedDense:
-            launch_attn<HD, CAUSAL, BN, TM, ODT, INQ, sageattn_gfx10::MaskMode::kPreparedDense, 0>(c);
+            launch_attn<HD, CAUSAL, BN, BM, TM, ODT, INQ, sageattn_gfx10::MaskMode::kPreparedDense, 0>(c);
             return;
         case sageattn_gfx10::MaskMode::kPreparedDenseBool:
-            launch_attn<HD, CAUSAL, BN, TM, ODT, INQ,
+            launch_attn<HD, CAUSAL, BN, BM, TM, ODT, INQ,
                         sageattn_gfx10::MaskMode::kPreparedDenseBool, 0>(c);
             return;
         case sageattn_gfx10::MaskMode::kPreparedDenseBF16:
-            launch_attn<HD, CAUSAL, BN, TM, ODT, INQ,
+            launch_attn<HD, CAUSAL, BN, BM, TM, ODT, INQ,
                         sageattn_gfx10::MaskMode::kPreparedDenseBF16, 0>(c);
             return;
         case sageattn_gfx10::MaskMode::kPreparedDenseF16:
-            launch_attn<HD, CAUSAL, BN, TM, ODT, INQ,
+            launch_attn<HD, CAUSAL, BN, BM, TM, ODT, INQ,
                         sageattn_gfx10::MaskMode::kPreparedDenseF16, 0>(c);
             return;
         case sageattn_gfx10::MaskMode::kRaw:
@@ -170,16 +171,16 @@ void launch_attn_mask(const AttnLaunchCtx& c) {
     // 2 bf16, 3 bool -- the same codes the main HIP backend's mask helpers use.
     switch (c.mask_dtype) {
         case 3:
-            launch_attn<HD, CAUSAL, BN, TM, ODT, INQ, sageattn_gfx10::MaskMode::kRaw, 3>(c);
+            launch_attn<HD, CAUSAL, BN, BM, TM, ODT, INQ, sageattn_gfx10::MaskMode::kRaw, 3>(c);
             return;
         case 1:
-            launch_attn<HD, CAUSAL, BN, TM, ODT, INQ, sageattn_gfx10::MaskMode::kRaw, 1>(c);
+            launch_attn<HD, CAUSAL, BN, BM, TM, ODT, INQ, sageattn_gfx10::MaskMode::kRaw, 1>(c);
             return;
         case 2:
-            launch_attn<HD, CAUSAL, BN, TM, ODT, INQ, sageattn_gfx10::MaskMode::kRaw, 2>(c);
+            launch_attn<HD, CAUSAL, BN, BM, TM, ODT, INQ, sageattn_gfx10::MaskMode::kRaw, 2>(c);
             return;
         default:
-            launch_attn<HD, CAUSAL, BN, TM, ODT, INQ, sageattn_gfx10::MaskMode::kRaw, 0>(c);
+            launch_attn<HD, CAUSAL, BN, BM, TM, ODT, INQ, sageattn_gfx10::MaskMode::kRaw, 0>(c);
             return;
     }
 }
@@ -192,77 +193,53 @@ void launch_attn_mask(const AttnLaunchCtx& c) {
 template <bool CAUSAL>
 void launch_attn_cf(const AttnLaunchCtx& c, int64_t head_dim, bool inq, bool out_bf, int v10_bn,
                     int tm) {
+    // The query tile BM is a template argument on the kernel for the same reason
+    // BN and TM are, and it is pinned at 128: every extra value in this cross
+    // product is a full set of instantiations (head dim x key tile x rows per
+    // thread x output dtype x in-kernel Q x seven mask modes x causal) and the
+    // kernel is already compiled for hundreds of them. Raising BM would cut the
+    // K/V staging traffic per query, which the L2 already absorbs here, so it was
+    // left alone rather than paid for.
+    constexpr int BM = 128;
+
+    // One macro per level of the dispatch so the template argument lists cannot
+    // drift apart between the combinations: the geometry picks the instantiation
+    // and the rows-per-thread sweep picks within it.
+#define CK_GFX103X_BY_TM(HD_, BN_)                                                            \
+    do {                                                                                      \
+        if (out_bf) {                                                                         \
+            if (inq) {                                                                        \
+                if (tm <= 2)   { launch_attn_mask<HD_, CAUSAL, BN_, BM, 2, __hip_bfloat16, true>(c);  return; } \
+                if (tm <= 4)   { launch_attn_mask<HD_, CAUSAL, BN_, BM, 4, __hip_bfloat16, true>(c);  return; } \
+                launch_attn_mask<HD_, CAUSAL, BN_, BM, 8, __hip_bfloat16, true>(c);  return;  \
+            }                                                                                 \
+            if (tm <= 2)       { launch_attn_mask<HD_, CAUSAL, BN_, BM, 2, __hip_bfloat16, false>(c); return; } \
+            if (tm <= 4)       { launch_attn_mask<HD_, CAUSAL, BN_, BM, 4, __hip_bfloat16, false>(c); return; } \
+            launch_attn_mask<HD_, CAUSAL, BN_, BM, 8, __hip_bfloat16, false>(c);      return;  \
+        }                                                                                     \
+        if (inq) {                                                                            \
+            if (tm <= 2)   { launch_attn_mask<HD_, CAUSAL, BN_, BM, 2, __half, true>(c);  return; }   \
+            if (tm <= 4)   { launch_attn_mask<HD_, CAUSAL, BN_, BM, 4, __half, true>(c);  return; }   \
+            launch_attn_mask<HD_, CAUSAL, BN_, BM, 8, __half, true>(c);                  return;   \
+        }                                                                                     \
+        if (tm <= 2)       { launch_attn_mask<HD_, CAUSAL, BN_, BM, 2, __half, false>(c); return; }    \
+        if (tm <= 4)       { launch_attn_mask<HD_, CAUSAL, BN_, BM, 4, __half, false>(c); return; }    \
+        launch_attn_mask<HD_, CAUSAL, BN_, BM, 8, __half, false>(c);                  return;    \
+    } while (0)
+
     if (head_dim == 64) {
-        // D64 runs a 32-key tile: BN=16 halves the V tile and measured slower.
-        if (out_bf) {
-            if (inq) {
-                if (tm == 2)      { launch_attn_mask<64, CAUSAL, 32, 2, __hip_bfloat16, true>(c); }
-                else if (tm == 4) { launch_attn_mask<64, CAUSAL, 32, 4, __hip_bfloat16, true>(c); }
-                else              { launch_attn_mask<64, CAUSAL, 32, 8, __hip_bfloat16, true>(c); }
-            } else {
-                if (tm == 2)      { launch_attn_mask<64, CAUSAL, 32, 2, __hip_bfloat16, false>(c); }
-                else if (tm == 4) { launch_attn_mask<64, CAUSAL, 32, 4, __hip_bfloat16, false>(c); }
-                else              { launch_attn_mask<64, CAUSAL, 32, 8, __hip_bfloat16, false>(c); }
-            }
-        } else {
-            if (inq) {
-                if (tm == 2)      { launch_attn_mask<64, CAUSAL, 32, 2, __half, true>(c); }
-                else if (tm == 4) { launch_attn_mask<64, CAUSAL, 32, 4, __half, true>(c); }
-                else              { launch_attn_mask<64, CAUSAL, 32, 8, __half, true>(c); }
-            } else {
-                if (tm == 2)      { launch_attn_mask<64, CAUSAL, 32, 2, __half, false>(c); }
-                else if (tm == 4) { launch_attn_mask<64, CAUSAL, 32, 4, __half, false>(c); }
-                else              { launch_attn_mask<64, CAUSAL, 32, 8, __half, false>(c); }
-            }
-        }
+        // D64 keeps the wide key tile whatever the override asks for: 16 halves
+        // the V tile here and measured slower.
+        CK_GFX103X_BY_TM(64, 32);
         return;
     }
     // D128 tunes its key tile between 16 and 32.
-    if (v10_bn == 32) {
-        if (out_bf) {
-            if (inq) {
-                if (tm == 2)      { launch_attn_mask<128, CAUSAL, 32, 2, __hip_bfloat16, true>(c); }
-                else if (tm == 4) { launch_attn_mask<128, CAUSAL, 32, 4, __hip_bfloat16, true>(c); }
-                else              { launch_attn_mask<128, CAUSAL, 32, 8, __hip_bfloat16, true>(c); }
-            } else {
-                if (tm == 2)      { launch_attn_mask<128, CAUSAL, 32, 2, __hip_bfloat16, false>(c); }
-                else if (tm == 4) { launch_attn_mask<128, CAUSAL, 32, 4, __hip_bfloat16, false>(c); }
-                else              { launch_attn_mask<128, CAUSAL, 32, 8, __hip_bfloat16, false>(c); }
-            }
-        } else {
-            if (inq) {
-                if (tm == 2)      { launch_attn_mask<128, CAUSAL, 32, 2, __half, true>(c); }
-                else if (tm == 4) { launch_attn_mask<128, CAUSAL, 32, 4, __half, true>(c); }
-                else              { launch_attn_mask<128, CAUSAL, 32, 8, __half, true>(c); }
-            } else {
-                if (tm == 2)      { launch_attn_mask<128, CAUSAL, 32, 2, __half, false>(c); }
-                else if (tm == 4) { launch_attn_mask<128, CAUSAL, 32, 4, __half, false>(c); }
-                else              { launch_attn_mask<128, CAUSAL, 32, 8, __half, false>(c); }
-            }
-        }
+    if (v10_bn >= 32) {
+        CK_GFX103X_BY_TM(128, 32);
         return;
     }
-    if (out_bf) {
-        if (inq) {
-            if (tm == 2)      { launch_attn_mask<128, CAUSAL, 16, 2, __hip_bfloat16, true>(c); }
-            else if (tm == 4) { launch_attn_mask<128, CAUSAL, 16, 4, __hip_bfloat16, true>(c); }
-            else              { launch_attn_mask<128, CAUSAL, 16, 8, __hip_bfloat16, true>(c); }
-        } else {
-            if (tm == 2)      { launch_attn_mask<128, CAUSAL, 16, 2, __hip_bfloat16, false>(c); }
-            else if (tm == 4) { launch_attn_mask<128, CAUSAL, 16, 4, __hip_bfloat16, false>(c); }
-            else              { launch_attn_mask<128, CAUSAL, 16, 8, __hip_bfloat16, false>(c); }
-        }
-    } else {
-        if (inq) {
-            if (tm == 2)      { launch_attn_mask<128, CAUSAL, 16, 2, __half, true>(c); }
-            else if (tm == 4) { launch_attn_mask<128, CAUSAL, 16, 4, __half, true>(c); }
-            else              { launch_attn_mask<128, CAUSAL, 16, 8, __half, true>(c); }
-        } else {
-            if (tm == 2)      { launch_attn_mask<128, CAUSAL, 16, 2, __half, false>(c); }
-            else if (tm == 4) { launch_attn_mask<128, CAUSAL, 16, 4, __half, false>(c); }
-            else              { launch_attn_mask<128, CAUSAL, 16, 8, __half, false>(c); }
-        }
-    }
+    CK_GFX103X_BY_TM(128, 16);
+#undef CK_GFX103X_BY_TM
 }
 
 __device__ __forceinline__ float to_float(const __half v) { return __half2float(v); }
@@ -650,8 +627,25 @@ void gfx103x_launch_attn(const AttnArgs& in, hipStream_t stream) {
     // dropped them (fork commit 0bc6628 removed the equivalent
     // COMFY_KITCHEN_WMMA_TILE scaffolding for the WMMA backend) so the tuned pair
     // is now a constant: BN = 32 at D64 and 16 at D128, TM = 8 rows per thread.
-    constexpr int tm = 8;
-    const int v10_bn = (in.head_dim == 64) ? 32 : 16;
+    //
+    // CK_GFX103X_BN / CK_GFX103X_TM put them back for measurement only. A
+    // rebuild-per-tile sweep cannot be trusted on this device -- the first kernel
+    // after a rebuild runs on cold clocks, measured 1.9x, which is larger than
+    // these effects -- so the sweep has to happen inside one process, which means
+    // the knob has to be read per launch. Values outside the instantiated set are
+    // ignored rather than clamped, because a sweep that silently keeps measuring
+    // the default reads exactly like "the tile does not matter".
+    constexpr int tm_default = 8;
+    int tm = tm_default;
+    if (const char* e = getenv("CK_GFX103X_TM")) {
+        const int v = atoi(e);
+        if (v == 2 || v == 4 || v == 8) tm = v;
+    }
+    int v10_bn = (in.head_dim == 64) ? 32 : 16;
+    if (const char* e = getenv("CK_GFX103X_BN")) {
+        const int v = atoi(e);
+        if (v == 16 || v == 32) v10_bn = v;
+    }
 
     // One launcher covers every combination the old macro set spelled out. The
     // tile shape (head dim, causal, key tile, rows per thread, in-kernel Q
