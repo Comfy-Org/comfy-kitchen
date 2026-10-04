@@ -22,7 +22,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _HIP_DIR = _ROOT / "comfy_kitchen" / "backends" / "hip"
 _HIP_CMAKE = _HIP_DIR / "CMakeLists.txt"
 _HIP_ARCH_MANIFEST = _HIP_DIR / "architectures.json"
-_HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12")
+_HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx117", "wmma_gfx12")
 
 
 def _architecture_groups() -> dict[str, list[str]]:
@@ -105,8 +105,6 @@ def test_hip_accepts_every_manifest_target(arch):
         "gfx1037",
         "gfx1104",
         "gfx1154",
-        "gfx1170",
-        "gfx1171",
         "gfx1172",
         "gfx1202",
         "gfx1250",
@@ -134,8 +132,11 @@ def test_hip_declines_when_an_arch_cannot_be_read():
         (["gfx1200"], True),
         (["gfx1201", "gfx1100"], True),
         (["gfx1151"], True),
+        (["gfx1170"], True),
+        (["gfx1171"], True),
         (["gfx1030"], False),             # RDNA2 has no matrix cores
         (["gfx1200", "gfx1030"], False),  # kernels launch on the tensor's own device
+        (["gfx1170", "gfx1200"], True),
         ([None], False),
     ],
 )
@@ -272,6 +273,7 @@ def test_architecture_manifest_is_unique_and_shared_by_setup_and_runtime():
     assert manifest_archs == namespace["DEFAULT_HIP_ARCHS"].split(";")
     assert set(groups["elementwise_only"]) == hip_backend._ARCH_ELEMENTWISE_ONLY
     assert set(groups["wmma_gfx11"]) == hip_backend._ARCH_WMMA_GFX11
+    assert set(groups["wmma_gfx117"]) == hip_backend._ARCH_WMMA_GFX117
     assert set(groups["wmma_gfx12"]) == hip_backend._ARCH_WMMA_GFX12
     assert set(manifest_archs) == hip_backend._ARCH_SUPPORTED
 
@@ -281,8 +283,10 @@ def test_setup_architecture_check_is_exact_and_fail_closed():
     supported = namespace["hip_arch_supported"]
 
     assert all(supported(arch) for arch in _manifest_archs())
-    for arch in ("gfx1037", "gfx1104", "gfx1170", "gfx1202", "gfx1250"):
+    for arch in ("gfx1037", "gfx1104", "gfx1202", "gfx1250"):
         assert not supported(arch)
+    for arch in ("gfx1170", "gfx1171"):
+        assert supported(arch)
 
 
 def test_cmake_reads_and_validates_the_shared_architecture_manifest():
@@ -302,6 +306,7 @@ def test_mma_architecture_macros_are_generated_from_the_manifest():
     assert '#include "architecture_config.h"' in mma
     assert "defined(__gfx" not in mma
     assert "@COMFY_HIP_GFX11_CONDITION@" in template
+    assert "@COMFY_HIP_GFX117_CONDITION@" in template
     assert "@COMFY_HIP_GFX12_CONDITION@" in template
 
 
