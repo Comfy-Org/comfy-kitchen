@@ -141,6 +141,14 @@ extern "C" void launch_int4_gemm_kernel(
     if (M == 0 || N == 0) {
         return;
     }
+    // v_dot8_i32_i4 exists on gfx10 and nowhere else: the stub in gemm_gfx10.h's
+    // !__GFX10__ arm is a trap. This binding is exposed on every target, so a
+    // caller on an RDNA3/4 part would get that trap rather than an answer --
+    // refuse here instead. convrot_w4a4.hip checks comfy_is_gfx10() before
+    // calling, so the only way to land here is a direct call on the wrong device.
+    if (!comfy_is_gfx10()) {
+        throw std::runtime_error("int4_gemm: v_dot8_i32_i4 is gfx10 only");
+    }
     if (ldc < N) {
         throw std::runtime_error("int4_gemm: ldc=" + std::to_string(ldc) +
                                  " is narrower than N=" + std::to_string(N));

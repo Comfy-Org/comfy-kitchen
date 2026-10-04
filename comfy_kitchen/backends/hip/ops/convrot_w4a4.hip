@@ -77,6 +77,23 @@ extern "C" void launch_convrot_w4a4_gemm_kernel(
     const uint8_t* A = static_cast<const uint8_t*>(a);
     const uint8_t* B = static_cast<const uint8_t*>(b);
 
+    // RDNA2 has no matrix cores, so MmaInt4 is a trap there. But it has
+    // v_dot8_i32_i4, which is the same product sum: eight signed 4x4-bit products
+    // per instruction against WMMA's sixteen-then-thirty-two-per-MMA, and the
+    // operands are already in the layout it wants (signed int4, two per byte,
+    // low nibble = even k). Branch on the launching device, the way
+    // launch_int8_gemm_kernel branches on comfy_is_gfx10(), so a box holding both
+    // an RDNA2 iGPU and a matrix-core dGPU sends each call to the tile that part
+    // has rather than deciding once for the process.
+    if (comfy_is_gfx10()) {
+        // The VALU tile takes the same EpiRowwise the WMMA path above builds, so
+        // the operands and the epilogue are identical; only the product sum moves.
+        // K is a multiple of 32, which is what launch_int4_gemm_kernel requires.
+        launch_int4_gemm_kernel(a, b, c, x_scale, w_scale, 1, bias, bias_code,
+                                M, N, K, N /*ldc*/, out_code, stream);
+        return;
+    }
+
     if (out_code == kBF16) {
         launch_w4a4<__bf16>(A, B, static_cast<__bf16*>(c), M, N, K, epi, stream);
     } else if (out_code == kF16) {

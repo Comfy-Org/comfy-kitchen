@@ -243,11 +243,11 @@ _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 #
 # convrot_w4a4_linear is here for the same reason of arrival and not of truth:
 # it reached for MmaInt4, and MmaInt4 is a __builtin_trap() without matrix
-# cores. The VALU tile in gemm_gfx10.h does the same product sum with
-# v_dot8_i32_i4 and is ~1.9x the int8 tile here, so the op itself no longer
-# needs a matrix core. It is dispatched on has_wmma() at the launch, not
-# dropped here, so a box holding both an RDNA2 iGPU and an RDNA3 dGPU sends each
-# call to the tile that part has.
+# cores. Its launcher now branches on the launching device the way
+# launch_int8_gemm_kernel does, so RDNA2 reaches gemm_int4_valu_kernel -- the
+# same product sum on v_dot8_i32_i4, ~1.9x the int8 tile here -- and everything
+# else reaches MmaInt4 exactly as before. Removing it here only stops the whole
+# op being withheld from RDNA2; the WMMA path is untouched.
 _WMMA_ONLY_OPS = frozenset({
     "fp16_conv3d",
     "fp16_conv3d_out",
@@ -1468,30 +1468,17 @@ def convrot_w4a4_linear(
     qw = _operand(qweight, x.device, "qweight", shape=(n, k // 2))
 
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-    if has_wmma():
-        _C.convrot_w4a4_gemm(
-            _dl(qact), _dl(qw), _dl(out),
-            _dl(x_scale), _dl(wscales), None if bias is None else _dl(bias),
-            m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
-        )
-    else:
-        # RDNA2 has no matrix cores, so the WMMA tile cannot run here. The VALU
-        # tile does the same arithmetic: qact and qw are already signed int4
-        # packed two per byte with the low nibble on even k, which is what
-        # v_dot8_i32_i4 consumes, and it retires at the same instruction rate as
-        # the int8 tile's v_dot4_i32_i8 while doing twice the products per
-        # instruction. Measured on the 6-CU gfx1035, int4_gemm against int8_gemm
-        # over identical values: 1.65x-2.08x, median 1.90x.
-        #
-        # Gate at the launch rather than through the registry, the way
-        # scaled_mm_v2's _hip_fp8_gemm does: a box with both an RDNA2 iGPU and a
-        # matrix-core dGPU registers this backend once and dispatches per call.
-        _C.int4_gemm(
-            _dl(qact), _dl(qw), _dl(out),
-            _dl(x_scale), _dl(wscales), 1,
-            None if bias is None else _dl(bias),
-            m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
-        )
+    # The launcher picks the tile from the launching device's own architecture:
+    # MmaInt4 where there are matrix cores, the VALU v_dot8_i32_i4 tile on RDNA2.
+    # Deciding here instead would be wrong on a box with both an iGPU and a dGPU,
+    # because has_wmma() is the intersection over every visible device and so
+    # reports false for the whole process -- which would send the dGPU's calls to
+    # an instruction it does not have.
+    _C.convrot_w4a4_gemm(
+        _dl(qact), _dl(qw), _dl(out),
+        _dl(x_scale), _dl(wscales), None if bias is None else _dl(bias),
+        m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
+    )
     return out.reshape(*orig_shape[:-1], n)
 
 
