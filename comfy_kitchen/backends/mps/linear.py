@@ -953,6 +953,7 @@ def weight_only_linear(x, n, k, decode, *, bias, out_dtype, group, residual=None
             # rank extra weight rows, la lands in c's last rank columns.
             w, view = decode_buffer(rows, k, cdtype, transposed, rank, device)
             decode(row0, rows, cdtype, transposed, ch_exp, view)
+            del view  # otherwise this view keeps the first decoded weight buffer alive
             if transposed:
                 w[:, rows:] = dn.t()
             else:
@@ -978,7 +979,7 @@ def weight_only_linear(x, n, k, decode, *, bias, out_dtype, group, residual=None
             )
             if row0 == 0 and rows < n:  # later chunks read a compact copy
                 la_args = (c[:, rows:].contiguous(), rank, 0)
-        del w, c
+        del w, c, operands  # operands also holds c; release it before allocating the next chunk
     out = out.reshape(out_shape)
     if residual is not None and res is None:
         out = apply_residual(out, residual, residual_scale)
