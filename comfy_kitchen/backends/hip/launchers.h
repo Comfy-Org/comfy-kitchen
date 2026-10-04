@@ -121,6 +121,14 @@ void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* 
                              const void* scale_b, int scale_b_stride, const void* bias,
                              int bias_code, int M, int N, int K, int ldc, int out_code,
                              hipStream_t stream);
+// Same shape as launch_int8_gemm_kernel, but a and b are signed int4 packed two
+// per byte (low nibble = even k), so a row is K / 2 bytes wide and K must be a
+// multiple of 32. gfx10 only: other targets get a trapping stub and the binding
+// refuses before reaching it.
+void launch_int4_gemm_kernel(const void* a, const void* b, void* c, const void* scale_a,
+                             const void* scale_b, int scale_b_stride, const void* bias,
+                             int bias_code, int M, int N, int K, int ldc, int out_code,
+                             hipStream_t stream);
 // scale_code is a DTYPE_TO_CODE value: 0 float32, 5 e4m3 (passed as raw bytes).
 // codebook is 16 floats, or null for the uniform levels. bits is 4 or 6.
 void launch_dequant_int4_grouped_to_int8_kernel(const void* qw, const void* s_rel, int scale_code,

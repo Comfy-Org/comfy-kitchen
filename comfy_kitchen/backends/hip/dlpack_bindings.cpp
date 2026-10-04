@@ -372,6 +372,41 @@ void int8_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> 
     check_hip_launch();
 }
 
+void int4_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> scale_a,
+               nb::ndarray<> scale_b, int scale_b_stride, OptArray bias, int M, int N, int K,
+               int out_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "int4_gemm";
+    if (scale_b_stride != 0 && scale_b_stride != 1) {
+        throw std::runtime_error(std::string(kFn) + ": scale_b_stride must be 0 or 1, got " +
+                                 std::to_string(scale_b_stride));
+    }
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    // int4 packs two nibbles per byte, so the operand rows are K / 2 bytes wide.
+    if (K % 32 != 0) {
+        throw std::runtime_error(std::string(kFn) + ": K must be a multiple of 32, got " +
+                                 std::to_string(K));
+    }
+    // The kernel reads 16 bytes at a time, which is 32 k-values, and assumes a
+    // whole number of those per row.
+    require_dtype(a, 4, 4, kFn, "a");
+    require_dtype(b, 4, 4, kFn, "b");
+    require_dtype(c, 0, 2, kFn, "c");
+    require_out_matches(c, out_code, kFn);
+    require_len(a, static_cast<int64_t>(M) * (K / 2), kFn, "a");
+    require_len(b, static_cast<int64_t>(N) * (K / 2), kFn, "b");
+    require_len(c, static_cast<int64_t>(M) * N, kFn, "c");
+    require_scale_len(scale_a, static_cast<size_t>(M), kFn, "scale_a");
+    require_scale_len(scale_b, scale_b_stride == 1 ? static_cast<size_t>(N) : 1, kFn, "scale_b");
+    require_bias(bias, N, kFn);
+
+    launch_int4_gemm_kernel(a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(),
+                            scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, N /*ldc*/,
+                            out_code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
 void convrot_w4a4_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> x_scale,
                        nb::ndarray<> w_scale, OptArray bias, int M, int N, int K, int out_code,
                        uintptr_t stream_ptr) {
@@ -2498,6 +2533,7 @@ NB_MODULE(_C, m) {
     m.def("stochastic_round_fp8", &stochastic_round_fp8);
     m.def("scaled_mm_fp8", &scaled_mm_fp8);
     m.def("int8_gemm", &int8_gemm);
+    m.def("int4_gemm", &int4_gemm);
     m.def("convrot_w4a4_gemm", &convrot_w4a4_gemm);
     m.def("fp16_gemm", &fp16_gemm, nb::arg("a"), nb::arg("b"), nb::arg("d"),
           nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),

@@ -122,3 +122,57 @@ extern "C" void launch_int8_gemm_kernel(
         throw std::runtime_error("int8_gemm: unsupported output dtype");
     }
 }
+
+// INT4 on VALU, the int4 counterpart of the above. a and b are signed int4
+// packed two per byte (low nibble = even k), so a row is K / 2 bytes wide and a
+// 16-byte LDS read covers 32 k-values -- hence K must be a multiple of 32.
+//
+// The launcher lives here rather than in gemm_gfx10.h because that header is
+// included by ops/gemm_fp16.hip as well, and a plain extern "C" definition would
+// be emitted into both objects and collide at link time.
+extern "C" void launch_int4_gemm_kernel(
+    const void* a, const void* b, void* c,
+    const void* scale_a, const void* scale_b, int scale_b_stride,
+    const void* bias, int bias_code,
+    int M, int N, int K, int ldc, int out_code, hipStream_t stream) {
+
+    using namespace comfy::hip_backend;
+
+    if (M == 0 || N == 0) {
+        return;
+    }
+    if (ldc < N) {
+        throw std::runtime_error("int4_gemm: ldc=" + std::to_string(ldc) +
+                                 " is narrower than N=" + std::to_string(N));
+    }
+    // The tile reads a row 16 bytes at a time and each read is 32 k-values, so
+    // the row has to be a whole number of reads. An empty GEMM does no reads, so
+    // this only applies once there is real work above.
+    if (K % 32 != 0) {
+        throw std::runtime_error("int4_gemm: K=" + std::to_string(K) +
+                                 " must be a multiple of 32");
+    }
+
+    EpiRowwise epi{static_cast<const float*>(scale_a), static_cast<const float*>(scale_b),
+                   scale_b_stride, bias, bias_code};
+
+    const int8_t* A = static_cast<const int8_t*>(a);
+    const int8_t* B = static_cast<const int8_t*>(b);
+
+    // One block per tile, the same grid launch_int8 settled on.
+    dim3 block(kInt8Threads);
+    dim3 grid((N + kInt8BN - 1) / kInt8BN, (M + kInt8BM - 1) / kInt8BM);
+
+    if (out_code == kBF16) {
+        gemm_int4_valu_kernel<__bf16><<<grid, block, 0, stream>>>(A, B, epi,
+                                                                  static_cast<__bf16*>(c), M, N, K, ldc);
+    } else if (out_code == kF16) {
+        gemm_int4_valu_kernel<__half><<<grid, block, 0, stream>>>(A, B, epi,
+                                                                 static_cast<__half*>(c), M, N, K, ldc);
+    } else if (out_code == kF32) {
+        gemm_int4_valu_kernel<float><<<grid, block, 0, stream>>>(A, B, epi,
+                                                                 static_cast<float*>(c), M, N, K, ldc);
+    } else {
+        throw std::runtime_error("int4_gemm: unsupported output dtype");
+    }
+}

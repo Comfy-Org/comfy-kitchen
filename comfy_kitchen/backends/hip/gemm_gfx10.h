@@ -22,6 +22,8 @@
 #include <hip/hip_fp16.h>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
 
 #include "epilogue.h"
@@ -64,6 +66,13 @@ constexpr int kInt8Threads = 256;
 // staging writes become one contiguous 512-byte run per warp instead of eight
 // 64-byte runs. 5.63 -> 5.97 TOPS at 12288x2048x2048 from this constant alone.
 constexpr int kInt8Pad = 0;
+
+// Row padding for the int4 A staging buffer, in bytes. A k-tile of 64 k-values
+// is 32 bytes per row, so a row still starts 16-byte aligned at pad 0 and the
+// ds_read_b128 in the inner loop is legal. Zero here is not measured the way
+// kInt8Pad's zero was: the int4 tile is new, and this constant exists so that a
+// sweep does not have to edit the tile's body.
+constexpr int kInt4Pad = 0;
 
 // Row padding for the fp16 tile. The inner loop reads 16 bytes at a time and a
 // row's byte offset is 2 * (row * STRIDE + k), so STRIDE must be a multiple of 8
@@ -378,6 +387,142 @@ __global__ __launch_bounds__(kInt8Threads) void gemm_int8_valu_kernel(
 }
 
 // ===========================================================================
+// INT4 GEMM on VALU: C[M, N] = (A[M, K] @ B[N, K]^T) * scale_a[row] * scale_b[col]
+//
+// A and B are signed int4 packed two per byte, low nibble = even k, which is the
+// layout ops/convrot_w4a4.hip's quantized weights already use. The tile is the
+// int8 tile above with one change: v_dot8_i32_i4 does eight 4x4-bit products per
+// instruction against v_dot4_i32_i8's four, and retires at the same rate on this
+// part (measured 1.62 vs 1.58 Tera-instr/s), so a k-tile needs half the dot
+// instructions and half the ds_read_b128 for the same arithmetic. LDS therefore
+// holds half the bytes per row and the chunk count per k-tile halves with it.
+//
+// Not the same entry point as convrot_w4a4_linear: that one is WMMA-only (MmaInt4
+// traps without matrix cores) and this one needs none.
+// ===========================================================================
+__device__ __forceinline__ int dot8_i4(int a, int b, int c) {
+    int r;
+    asm("v_dot8_i32_i4 %0, %1, %2, %3" : "=v"(r) : "v"(a), "v"(b), "v"(c));
+    return r;
+}
+
+template <typename OutT>
+__global__ __launch_bounds__(kInt8Threads) void gemm_int4_valu_kernel(
+    const int8_t* __restrict__ A, const int8_t* __restrict__ B,
+    EpiRowwise epi,
+    OutT* __restrict__ C,
+    int M, int N, int K, int ldc) {
+
+    constexpr int TM = 16;
+    constexpr int TN = 4;
+    constexpr int BM = kInt8BM;
+    constexpr int BN = kInt8BN;
+    constexpr int BK = 64;                 // k-values per tile, i.e. 32 bytes
+    constexpr int THREADS = kInt8Threads;
+    // A 16-byte LDS read is 32 k-values, so a BK=64 tile is CPR=2 chunks.
+    constexpr int CPR = BK / 32;
+    constexpr int ROWB = BK / 2;           // bytes per row per k-tile
+    constexpr int STRIDE = ROWB + kInt4Pad;
+    constexpr int VPR = CPR;               // 16-byte chunks per row per k-tile
+    constexpr int B_SIZE = CPR * BN * 16;  // chunk-major, no padding term
+    constexpr int A_SIZE = BM * STRIDE;
+    constexpr int NBUFFERS = 2;
+    static_assert((BM / TM) * (BN / TN) == THREADS, "thread tile and block tile must agree");
+    static_assert(NBUFFERS * (A_SIZE + B_SIZE) <= 64 * 1024, "int4 LDS footprint would spill");
+    static_assert(BK % 32 == 0, "a chunk must be a whole number of 16-byte reads");
+
+    __shared__ int8_t A_buf[NBUFFERS][A_SIZE];
+    __shared__ int8_t B_buf[NBUFFERS][B_SIZE];
+
+    const int tid = threadIdx.x;
+    const int trow = tid / (BN / TN);
+    const int tcol = tid % (BN / TN);
+    const int orow = trow * TM;
+    const int ocol = tcol * TN;
+
+    const int m0 = blockIdx.y * BM;
+    const int n0 = blockIdx.x * BN;
+    const int K2 = K / 2;                  // bytes per operand row
+
+    int acc[TM][TN] = {};
+
+    auto load_tile = [&](int buf_idx, int k0) {
+        for (int i = tid; i < BM * VPR; i += THREADS) {
+            const int r = i / VPR;
+            const int c = i % VPR;
+            const int gk = k0 / 2 + c * 16;
+            int4 val = make_int4(0, 0, 0, 0);
+            if (m0 + r < M && gk + 15 < K2)
+                val = *reinterpret_cast<const int4*>(A + (m0 + r) * K2 + gk);
+            *reinterpret_cast<int4*>(&A_buf[buf_idx][r * STRIDE + c * 16]) = val;
+        }
+        for (int i = tid; i < BN * VPR; i += THREADS) {
+            const int r = i / VPR;
+            const int c = i % VPR;
+            const int gk = k0 / 2 + c * 16;
+            int4 val = make_int4(0, 0, 0, 0);
+            if (n0 + r < N && gk + 15 < K2)
+                val = *reinterpret_cast<const int4*>(B + (n0 + r) * K2 + gk);
+            *reinterpret_cast<int4*>(&B_buf[buf_idx][(c * BN + r) * 16]) = val;
+        }
+    };
+
+    auto compute_tile = [&](int buf_idx) {
+        #pragma unroll 1
+        for (int c = 0; c < CPR; ++c) {
+            int4 av[TM], bv[TN];
+            #pragma unroll
+            for (int i = 0; i < TM; ++i)
+                av[i] = *reinterpret_cast<const int4*>(&A_buf[buf_idx][(orow + i) * STRIDE + c * 16]);
+            #pragma unroll
+            for (int j = 0; j < TN; ++j)
+                bv[j] = *reinterpret_cast<const int4*>(&B_buf[buf_idx][(c * BN + ocol + j) * 16]);
+            #pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    acc[i][j] = dot8_i4(av[i].x, bv[j].x, acc[i][j]);
+                    acc[i][j] = dot8_i4(av[i].y, bv[j].y, acc[i][j]);
+                    acc[i][j] = dot8_i4(av[i].z, bv[j].z, acc[i][j]);
+                    acc[i][j] = dot8_i4(av[i].w, bv[j].w, acc[i][j]);
+                }
+            }
+        }
+    };
+
+    #pragma unroll 1
+    for (int p = 0; p < NBUFFERS - 1; ++p)
+        if (p * BK < K) load_tile(p, p * BK);
+    __syncthreads();
+
+    constexpr int PREFETCH = NBUFFERS - 1;
+    int buf = 0;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        const int next_buf = (buf + 1) % NBUFFERS;
+        const int prefetch_buf = (buf + PREFETCH) % NBUFFERS;
+        const int kprefetch = k0 + PREFETCH * BK;
+        if (kprefetch < K) {
+            load_tile(prefetch_buf, kprefetch);
+        }
+        compute_tile(buf);
+        __syncthreads();
+        buf = next_buf;
+    }
+
+    #pragma unroll
+    for (int ri = 0; ri < TM; ri++) {
+        const int row = m0 + orow + ri;
+        if (row >= M) continue;
+        #pragma unroll
+        for (int ci = 0; ci < TN; ci++) {
+            const int col = n0 + ocol + ci;
+            if (col >= N) continue;
+            C[row * ldc + col] = static_cast<OutT>(epi(row, col, static_cast<float>(acc[ri][ci])));
+        }
+    }
+}
+
+// ===========================================================================
 // FP16 GEMM: C[M, N] = A[M, K] @ B[N, K]^T
 
 //
@@ -550,6 +695,15 @@ __global__ __launch_bounds__(256) void gemm_int8_valu_kernel(
     __builtin_trap();
 }
 
+// v_dot8_i32_i4 is gfx10-only for the same reason: the stub below is what a
+// build for another target gets, so the binding has to refuse to launch here
+// rather than let this run.
+template <typename OutT>
+__global__ __launch_bounds__(256) void gemm_int4_valu_kernel(
+    const int8_t*, const int8_t*, EpiRowwise, OutT*, int, int, int, int) {
+    __builtin_trap();
+}
+
 template <typename OutT>
 __global__ __launch_bounds__(256) void gemm_fp16_valu_kernel(
     const __half*, const __half*, EpiFp16, OutT*, int, int, int, int) {
@@ -559,3 +713,9 @@ __global__ __launch_bounds__(256) void gemm_fp16_valu_kernel(
 #endif  // __GFX10__
 
 }  // namespace comfy::hip_backend
+
+// launch_int4_gemm_kernel is in ops/gemm_int8.hip next to
+// launch_int8_gemm_kernel, not here: this header is included by two translation
+// units and a plain extern "C" definition would be emitted into both and collide
+// at link time. See the note above gemm_fp16_valu_kernel for the same reason the
+// kernels here are templates.
