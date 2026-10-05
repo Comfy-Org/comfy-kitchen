@@ -12,6 +12,34 @@ from comfy_kitchen.tensor import (
 from .conftest import assert_values_close
 
 
+def _scaled_mm_available() -> bool:
+    """Whether this GPU has a native scaled GEMM for FP8.
+
+    torch.compile lowers an FP8 matmul to torch._scaled_mm when the hardware has
+    one, and the eager path uses the same op, so both sides agree bit for bit.
+    Without it both sides fall back to a dequantize + matmul sequence, and
+    inductor picks a different reduction order than eager does: the outputs
+    then differ by a few bf16 ULP on ~1-13% of elements. That is inherent to
+    having no scaled GEMM, not a compile bug, and no tolerance separates it
+    from a real accuracy regression (measured on gfx1103, torch 2.13.0+rocm10:
+    baseline 0.8-12.9% of elements out of tolerance, a 2% systematic bias
+    injected on top 0.6-16.6% -- the two ranges overlap, so a bound wide
+    enough to pass is also wide enough to miss the regression).
+
+    Upstream CI is CPU-only, so this never runs there.
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        a = torch.zeros(16, 64, device="cuda").to(torch.float8_e4m3fn)
+        b = torch.zeros(64, 32, device="cuda").to(torch.float8_e4m3fn)
+        scale = torch.ones((), device="cuda")
+        torch._scaled_mm(a, b, scale, scale)
+    except Exception:
+        return False
+    return True
+
+
 class DummyQuantizedModel(torch.nn.Module):
     """Simple model for testing CUDA graph capture and torch.compile with quantized weights.
 
@@ -202,6 +230,13 @@ class TestQuantizedCompile:
     @pytest.mark.parametrize("model", LAYOUT_CONFIGS, indirect=True)
     def test_compile_model(self, model):
         """Test torch.compile on quantized model."""
+        # Comparing a compiled FP8 output against eager at rtol=1e-3 only means
+        # anything when both sides run the same scaled GEMM. See
+        # _scaled_mm_available for the measurement behind this.
+        if "FP8" in model.layout_cls and not _scaled_mm_available():
+            pytest.skip("no native FP8 scaled GEMM; eager and inductor disagree "
+                        "by a few bf16 ULP with no tolerance that separates it "
+                        "from a real regression")
         x = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
 
         # Get reference output
@@ -231,7 +266,11 @@ class TestQuantizedCompile:
 
     @pytest.mark.parametrize("model", LAYOUT_CONFIGS, indirect=True)
     def test_compile_model_multiple_runs(self, model):
-        """Test compiled model produces consistent results across multiple runs."""
+        """Test compiled model produces consistent results across multiple runs.
+
+        This one only checks run-to-run stability of the compiled graph, so it
+        needs no tolerance and no scaled GEMM; it runs everywhere.
+        """
         x = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
 
         compiled_model = torch.compile(model)
