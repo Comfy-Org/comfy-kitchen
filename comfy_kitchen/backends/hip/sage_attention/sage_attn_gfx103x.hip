@@ -107,6 +107,10 @@ struct AttnLaunchCtx {
     hipStream_t stream;
     int mask_mode;
     int mask_dtype;
+    // Which stage of the kernel body to drop, bit 0 QK / 1 softmax / 2 PV /
+    // 3 staging / 4 writeback. Zero on every real launch; see CK_GFX103X_DIAG in
+    // gfx103x_launch_attn.
+    int diag;
 };
 
 // Dispatches one kernel instantiation. MASK and MASK_DTYPE are template
@@ -129,7 +133,7 @@ void launch_attn(const AttnLaunchCtx& c) {
         a.q, a.k, a.v, static_cast<ODT*>(a.out), a.q_scale, a.k_scale, a.batch, a.qo_len,
         a.kv_len, a.q_heads, a.kv_heads, qi_b, qi_n, qi_h, a.k_stride_b, a.k_stride_n,
         a.k_stride_h, a.v_stride_b, a.v_stride_n, a.v_stride_h, a.o_stride_b, a.o_stride_n,
-        a.o_stride_h, a.qs_stride_b, a.qs_stride_h, a.ks_stride_b, a.ks_stride_h, 0, a.q_fp,
+        a.o_stride_h, a.qs_stride_b, a.qs_stride_h, a.ks_stride_b, a.ks_stride_h, c.diag, a.q_fp,
         a.q_src_bf16, a.sm_scale_log2e, a.mask, a.mask_sb, a.mask_sh, a.mask_sq, a.mask_sk,
         a.mask_batch, a.mask_heads, a.mask_q_tiles, a.mask_k_tiles, a.mask_k_row_pitch);
 }
@@ -197,9 +201,21 @@ void launch_attn_cf(const AttnLaunchCtx& c, int64_t head_dim, bool inq, bool out
     // BN and TM are, and it is pinned at 128: every extra value in this cross
     // product is a full set of instantiations (head dim x key tile x rows per
     // thread x output dtype x in-kernel Q x seven mask modes x causal) and the
-    // kernel is already compiled for hundreds of them. Raising BM would cut the
-    // K/V staging traffic per query, which the L2 already absorbs here, so it was
-    // left alone rather than paid for.
+    // kernel is already compiled for hundreds of them.
+    //
+    // 256 was instantiated and measured (2026-10, 6-CU gfx1035) to test the claim
+    // that the L2 absorbs a head's K/V being re-read by all 32 query tiles at
+    // BM=128 -- 1.5 MiB per head at S=4096 D=128. It is: B1 H16 S4096x4096 D128
+    // went 40.63 -> 40.31 ms and B1 H16 S4096x512 D128 5.64 -> 5.93, i.e. inside
+    // the run-to-run spread and in opposite directions. The instantiation was
+    // removed again rather than left in the tree, because a knob that measures as
+    // nothing is not worth doubling this kernel's compile time for.
+    //
+    // The tile that *is* worth its instantiations: at D128 the key tile is 16 and
+    // at D64 it is 32, with 8 rows per thread everywhere. All six combinations
+    // the kernel can be built with were swept in one process on the shapes above
+    // (CK_GFX103X_BN x CK_GFX103X_TM): the shipped pair wins both, BN=32 costs
+    // 1.47x and TM=4 1.04x at D128, and TM=2 is 1.38x.
     constexpr int BM = 128;
 
     // One macro per level of the dispatch so the template argument lists cannot
@@ -615,19 +631,7 @@ void gfx103x_launch_attn(const AttnArgs& in, hipStream_t stream) {
 
     AttnLaunchCtx ctx{};
     ctx.ops = a;
-    ctx.block = dim3(128);
-    ctx.grid = dim3(static_cast<unsigned>((in.qo_len + 127) / 128),
-                    static_cast<unsigned>(in.q_heads), static_cast<unsigned>(in.batch));
-    ctx.stream = stream;
-    ctx.mask_mode = gmask;
-    ctx.mask_dtype = in.mask_dtype;
 
-    // Tile shape. The ported kernel shipped these as SAGEATTN_BN_D64 / _BN_D128 /
-    // SAGEATTN_TM* environment overrides, read on every launch; this tree has
-    // dropped them (fork commit 0bc6628 removed the equivalent
-    // COMFY_KITCHEN_WMMA_TILE scaffolding for the WMMA backend) so the tuned pair
-    // is now a constant: BN = 32 at D64 and 16 at D128, TM = 8 rows per thread.
-    //
     // CK_GFX103X_BN / CK_GFX103X_TM put them back for measurement only. A
     // rebuild-per-tile sweep cannot be trusted on this device -- the first kernel
     // after a rebuild runs on cold clocks, measured 1.9x, which is larger than
@@ -646,6 +650,49 @@ void gfx103x_launch_attn(const AttnArgs& in, hipStream_t stream) {
         const int v = atoi(e);
         if (v == 16 || v == 32) v10_bn = v;
     }
+
+    // The diag bitfield drops one stage of the kernel body (bit 0 QK, 1 softmax,
+    // 2 PV, 3 staging, 4 writeback). It exists in the ported kernel as a
+    // development aid and is always 0 on this path; CK_GFX103X_DIAG exposes it so
+    // the per-stage cost can be measured from outside without a rebuild.
+    // It produces wrong output by construction, so nothing may default to
+    // non-zero.
+    //
+    // What it says, on the 6-CU gfx1035 at this kernel's largest production shape
+    // (B1 H16 S4096x4096 D128, the Anima self-attention -- 31% of that model's step):
+    //
+    //   diag  dropped        ms      share
+    //   0     nothing        40.63   --
+    //   1     QK             24.71   QK     39.2%
+    //   2     softmax        40.42   softmax  0.5%
+    //   4     PV             29.92   PV     26.4%
+    //   8     K/V staging    37.80   staging  7.0%
+    //   15    everything      7.10   loop, barriers, alpha/l store, writeback 17.5%
+    //
+    // Those two shares are the reason the obvious rewrite is not the obvious win.
+    // Per thread per BN=16 key tile this kernel issues 512 v_dot4_i32_i8 for the
+    // QK and 1024 v_fdot2_f32_f16 for the PV, for the same 2048 MACs each. On
+    // this part sdot4 retires at one instruction per clock per lane and fdot2 at
+    // two (the VALU's paired FP32 pipes), so both halves already cost the same
+    // 512 cycles and neither can be shortened by moving the operands. Moving the
+    // PV to INT8 -- what the WMMA path does, and what SageAttention does on
+    // silicon with a matrix unit -- would need 512 v_dot4 at 1/clk, the same 512
+    // cycles, plus ~3x the LDS reads (four P bytes per (row, key group) instead of
+    // four halves per (row, key pair), re-read once per head-dim group) and a V
+    // quantization pass. It is strictly more work here, which is why this port
+    // keeps P in f16 and calls itself i8q_f16pv.
+    int diag = 0;
+    if (const char* e = getenv("CK_GFX103X_DIAG")) {
+        diag = atoi(e);
+    }
+
+    ctx.block = dim3(128);
+    ctx.grid = dim3(static_cast<unsigned>((in.qo_len + 127) / 128),
+                    static_cast<unsigned>(in.q_heads), static_cast<unsigned>(in.batch));
+    ctx.stream = stream;
+    ctx.mask_mode = gmask;
+    ctx.mask_dtype = in.mask_dtype;
+    ctx.diag = diag;
 
     // One launcher covers every combination the old macro set spelled out. The
     // tile shape (head dim, causal, key tile, rows per thread, in-kernel Q
