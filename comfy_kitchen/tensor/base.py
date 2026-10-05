@@ -111,10 +111,23 @@ class BaseLayoutParams:
         return type(self)(**kwargs)
 
     def clone(self) -> BaseLayoutParams:
-        """Clone all tensor fields."""
+        """Clone all tensor fields.
+
+        The clone is taken under the field's own inference status. ``Tensor.clone``
+        does not preserve it -- cloning an ordinary tensor inside
+        ``inference_mode`` yields an inference tensor -- so without this a params
+        object rebuilt inside inference mode would mix an ordinary wrapper (see
+        ``QuantizedTensor.__new__``) with inference-mode scales, and any later
+        in-place touch of one of them would be rejected.
+        """
         kwargs = {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
         for field in self._tensor_fields():
-            kwargs[field] = kwargs[field].clone()
+            src = kwargs[field]
+            if src.is_inference() != torch.is_inference_mode_enabled():
+                with torch.inference_mode(src.is_inference()):
+                    kwargs[field] = src.clone()
+            else:
+                kwargs[field] = src.clone()
         return type(self)(**kwargs)
 
     def copy_from(self, src: BaseLayoutParams, non_blocking: bool = False) -> None:
@@ -252,6 +265,45 @@ class QuantizedTensor(torch.Tensor):
         layout_cls: str,
         params: Any,
     ):
+        # The wrapper must come out with the same inference status as the data it
+        # wraps, and it cannot come out with it by accident.
+        #
+        # An ordinary op result inherits its inference status from its inputs: a
+        # ``clone``/``to`` of a tensor that was made outside inference mode is not
+        # an inference tensor even when it runs inside one, and an alias
+        # (``detach``/``view``/``select``/``t``) hands the input's *enabled*
+        # VariableVersion to the result. `_make_wrapper_subclass` is not such an
+        # op -- it allocates directly -- so it gets neither half of that: whatever
+        # it builds while ``torch.inference_mode()`` is on is an inference tensor
+        # no matter what the operands are.
+        #
+        # For an alias op the two disagree and PyTorch refuses outright, with
+        # "Cannot set version_counter for inference tensor" from
+        # ``TensorImpl::set_version_counter``: the dispatcher is attaching the
+        # input's enabled version counter to an inference tensor, which has no
+        # version counter to attach. That is reachable from ordinary inference-mode
+        # code -- ``torch.nn.Parameter(quantized, requires_grad=False)`` does
+        # ``data.detach()`` -- and it is not hypothetical: ComfyUI re-wraps every
+        # quantized parameter in ``ops.py::_quantized_apply`` after each
+        # ``.to()``/``.cuda()``, and calls that while sampling runs inside
+        # ``inference_mode``, so any checkpoint whose weights were materialized
+        # outside inference mode dies on the first model (re)load. Anima did;
+        # SDXL did not, because by the time it reloaded its parameters had already
+        # been replaced by inference-mode ones.
+        #
+        # So pin the status explicitly instead of inheriting whatever the ambient
+        # mode happens to be. Inference mode is a thread-local, so narrowing it
+        # around this one allocation is enough, and it is a no-op on the paths that
+        # already agree.
+        if qdata.is_inference() != torch.is_inference_mode_enabled():
+            with torch.inference_mode(qdata.is_inference()):
+                return torch.Tensor._make_wrapper_subclass(
+                    cls,
+                    params.orig_shape,
+                    device=qdata.device,
+                    dtype=params.orig_dtype,
+                    requires_grad=False,
+                )
         return torch.Tensor._make_wrapper_subclass(
             cls,
             params.orig_shape,
