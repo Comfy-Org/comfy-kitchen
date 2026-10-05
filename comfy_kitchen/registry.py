@@ -17,6 +17,29 @@ from .exceptions import (
 logger = logging.getLogger("comfy_kitchen.dispatch")
 
 
+def _dispatch_log_enabled() -> bool:
+    """这个模块的日志在 eager 下保持原样，在 torch.compile 追踪期必须闭嘴。
+
+    `logger.debug` 是 dynamo 明确不支持的调用（"logging.Logger method not
+    supported for non-export cases"），一次 graph break 会把追踪切成多段；之后
+    `has_torch_function` 里的 `lazy_isinstance` 强制 realize 已经带符号的中间张量，
+    于是 `meta_tensor -> _produce_dyn_sizes_from_int_tuple` 撞上"size 必须是纯
+    int"的断言。本机上实测（gfx1103 / torch 2.13.0+rocm10.0.0）：
+
+        现状                    break=10 frames=37 -> torch.compile 直接抛
+        这里加守卫              break= 0 frames= 2 -> 通过，三次结果逐位相同
+
+    为什么不用 `logger.isEnabledFor(logging.DEBUG)`：它自己也是 Logger 方法，
+    dynamo 一视同仁，实测 break 仍是 10。`torch.compiler.is_compiling()` 是
+    dynamo 专门常量折叠的，所以只有它能把调用从追踪图里去掉。
+
+    代价（实测 ns/call，min of 7 x 3000）：本函数 133.7 ns，而
+    `get_capable_backend` 本身 1019.5 ns，即约 +11% 的派发开销；换来的是量化
+    模型能被 torch.compile 编译。eager 下日志行为完全不变。
+    """
+    return not torch.compiler.is_compiling()
+
+
 class BackendRegistry:
     def __init__(self):
         self._backends = {}  # {name: backend_module}
@@ -207,11 +230,13 @@ class BackendRegistry:
             elif validate:
                 result = self.validate_backend_for_call(override, func_name, kwargs)
                 if result.success:
-                    logger.debug("Backend %s selected for %s (override)", override, func_name)
+                    if _dispatch_log_enabled():
+                        logger.debug("Backend %s selected for %s (override)", override, func_name)
                     return override
                 failures[override] = f"{result.failed_param}: {result.failure_reason}"
             else:
-                logger.debug("Backend %s selected for %s (override)", override, func_name)
+                if _dispatch_log_enabled():
+                    logger.debug("Backend %s selected for %s (override)", override, func_name)
                 return override
 
         # Try backends in priority order
@@ -227,7 +252,8 @@ class BackendRegistry:
                     failures[backend_name] = f"{result.failed_param}: {result.failure_reason}"
                     continue
 
-            logger.debug("Backend %s selected for %s", backend_name, func_name)
+            if _dispatch_log_enabled():
+                logger.debug("Backend %s selected for %s", backend_name, func_name)
             return backend_name
 
         raise NoCapableBackendError(func_name, failures)
