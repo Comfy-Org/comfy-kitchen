@@ -71,7 +71,7 @@ def test_matches_scipy():
     scipy_spatial = pytest.importorskip("scipy.spatial")
     gen = torch.Generator(device="cuda").manual_seed(0)
     points = torch.rand(3000, 3, device="cuda", generator=gen, dtype=torch.float64)
-    verts, tets, nbr = ck.delaunay3d(points)
+    tets = ck.delaunay3d(points)[1]
     ours = tets.long()[~(tets >= points.shape[0]).any(1)]
     ours = {tuple(sorted(t)) for t in ours.tolist()}
     ref = {
