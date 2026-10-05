@@ -147,10 +147,27 @@ class TestQuantizedCUDAGraph:
             static_output = model(static_input)
         stream.synchronize()
 
+        # Replay on the **default** stream, not the side stream used for capture.
+        # On ROCm a graph replayed from a non-default stream does not observe writes
+        # made to the captured input buffer after capture: `static_input.copy_()` lands,
+        # the tensor still holds the new data afterwards, and the output comes back
+        # bit-for-bit identical to the first replay's. So the assertion below failed
+        # for all three layouts, deterministically.
+        #
+        # This is not about the quantized ops. A bare
+        # `torch.nn.functional.linear(x, w)` with no quantization behaves the same way,
+        # and a sweep over the (capture stream, replay stream, warmup stream)
+        # combinations gives a clean split: every combination that replays on the side
+        # stream fails and every one that replays on the default stream passes
+        # (5/5 each, both with and without quantization). PyTorch's
+        # `CUDAGraph.replay` docstring does not state this requirement, so the upstream
+        # form of this test cannot pass on this runtime as written.
+        #
+        # Reproduce with benchmark_attn/verify_cudagraph_fix.py.
+
         # Get initial output
-        with torch.cuda.stream(stream):
-            graph.replay()
-        stream.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
         output1 = static_output.clone()
 
         # Update static input and replay
@@ -158,9 +175,8 @@ class TestQuantizedCUDAGraph:
         new_data = torch.randn_like(static_input) * 10.0
         static_input.copy_(new_data)
 
-        with torch.cuda.stream(stream):
-            graph.replay()
-        stream.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
         output2 = static_output.clone()
 
         # Outputs should differ since input changed
