@@ -48,6 +48,8 @@ import torch
 from comfy_kitchen.backends.hip import (
     _C,
     _EXT_AVAILABLE,
+    _visible_gfx_arches,
+    rdna2_is_available,
     _EXT_ERROR,
     _dl,
     _rotate_quant_int8,
@@ -125,21 +127,26 @@ def test_convrot_quant_is_independent_of_block_width(dtype, m, k):
 
 PACK4_KNOB = "COMFY_CONVROT_PACK4_FUSED"
 PACK4_GROUP = 256
-# The int4 activation quantizer runs on the fused kernel when the rotated row
-# fits in LDS, and on convrot_quant_kernel otherwise. Those are different
-# kernels writing the same bytes, so which one ran is a schedule choice like
-# any other -- but a schedule choice that is currently only reachable through a
-# measurement knob, and an earlier revision of that knob was dead code (the
-# gate read `PACK_INT4 || knob`, and PACK_INT4 is a compile-time constant, so
-# `||` short-circuited it). A dead knob means an A/B that compares the fused
-# kernel against itself and reports "bit-identical", which is exactly the
-# result that looks like success. So: pinned here, from the outside, where no
-# such bug can hide.
+# The int4 activation quantizer runs on convrot_quant_fused_kernel on the
+# architectures that routing was measured for -- gfx1103 and RDNA2, the two whose
+# block-width table convrot_quant_fused_block_threads has an entry for -- and on
+# convrot_quant_kernel everywhere else. COMFY_CONVROT_PACK4_FUSED chooses between
+# the two only *within* that set; on any other part it is ignored, because the
+# routing itself does not apply there.
 #
-# (M, K) pairs: Anima's and SDXL's real activation shapes, plus the degenerate
-# rows that exercise absmax and the clamp rather than the butterfly -- all-zero
-# (rowmax floors at 1e-10), a single large outlier (everything else rounds to
-# zero), and values far below bf16's smallest normal.
+# Hence the gate below. Without it these tests would not fail on a dGPU, which is
+# the worse outcome: both arms would run the legacy kernel and "the fused and
+# legacy paths agree" would hold for the uninteresting reason that only one of
+# them ran. A green test that cannot fail is worse than a skipped one, because it
+# reports coverage that does not exist.
+requires_pack4_fused = pytest.mark.skipif(
+    not any(
+        arch.split(":")[0] == "gfx1103" for arch in _visible_gfx_arches() if arch
+    )
+    and not rdna2_is_available(),
+    reason="the PACK_INT4 fused activation quantizer is routed only on gfx1103 and RDNA2",
+)
+
 PACK4_SHAPES = [
     (512, 1024),
     (1024, 2048),
@@ -191,6 +198,7 @@ def _pack4_row(kind: str, m: int, k: int, dtype: torch.dtype) -> torch.Tensor:
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("m,k", PACK4_SHAPES, ids=lambda v: str(v))
+@requires_pack4_fused
 def test_convrot_quant_int4_agrees_between_fused_and_legacy(dtype, m, k):
     """The fused and legacy int4 activation quantizers must produce the same bits.
 
@@ -223,6 +231,7 @@ def test_convrot_quant_int4_agrees_between_fused_and_legacy(dtype, m, k):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("kind", ["zeros", "spike", "tiny"])
+@requires_pack4_fused
 def test_convrot_quant_int4_agrees_on_degenerate_rows(dtype, kind):
     """Same invariant on the rows that stress absmax and the clamp, not the FHT."""
     m, k = 512, 2048
@@ -236,6 +245,7 @@ def test_convrot_quant_int4_agrees_on_degenerate_rows(dtype, kind):
 
 
 @pytest.mark.parametrize("width", WIDTHS)
+@requires_pack4_fused
 def test_convrot_quant_int4_fused_agrees_across_block_widths(width):
     """The fused int4 path is schedule-invariant too, once block width can reach it."""
     m, k = 1024, 2048
@@ -249,6 +259,7 @@ def test_convrot_quant_int4_fused_agrees_across_block_widths(width):
     assert torch.equal(s, default_s), f"int4 scales differ at fused block={width}"
 
 
+@requires_pack4_fused
 def test_convrot_quant_int4_agrees_at_every_k_the_kernel_accepts():
     """Sweep K across the whole range the int4 quantizer supports, not a chosen few.
 
