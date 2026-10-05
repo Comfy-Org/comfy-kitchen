@@ -1,6 +1,5 @@
 import math
 
-import numpy as np
 import pytest
 import torch
 
@@ -9,31 +8,43 @@ import comfy_kitchen as ck
 from .conftest import requires_cuda_backend
 
 
+def _sub(u, v):
+    return (u[0] - v[0], u[1] - v[1], u[2] - v[2])
+
+
+def _cross(u, v):
+    return (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0])
+
+
+def _dot(u, v):
+    return u[0] * v[0] + u[1] * v[1] + u[2] * v[2]
+
+
 def _reference(vertices, faces, edges, positions, cos_threshold):
-    vs = vertices.double().cpu().numpy()
+    vs = vertices.double().cpu().tolist()
     fs = faces.cpu().tolist()
-    fan = [[] for _ in range(vs.shape[0])]
+    fan = [[] for _ in range(len(vs))]
     for i, t in enumerate(fs):
         for x in t:
             fan[x].append(i)
     flips, skinny, link_ok = [], [], []
-    for (a, b), p in zip(edges.cpu().tolist(), positions.double().cpu().numpy(), strict=True):
+    for (a, b), p in zip(edges.cpu().tolist(), positions.double().cpu().tolist(), strict=True):
         n_flip, n_moved, sk = 0, 0, 0.0
         for v, other in ((a, b), (b, a)):
             for f in fan[v]:
                 t = fs[f]
                 if other in t:
                     continue
-                old = vs[t]
-                new = old.copy()
+                old = [vs[x] for x in t]
+                new = list(old)
                 new[t.index(v)] = p
-                n_old = np.cross(old[1] - old[0], old[2] - old[0])
-                n_new = np.cross(new[1] - new[0], new[2] - new[0])
-                len_old, len_new = np.linalg.norm(n_old), np.linalg.norm(n_new)
-                sq_old = sum(float(d @ d) for d in (old[1] - old[0], old[2] - old[0], old[2] - old[1]))
-                sq = sum(float(d @ d) for d in (new[1] - new[0], new[2] - new[0], new[2] - new[1]))
+                n_old = _cross(_sub(old[1], old[0]), _sub(old[2], old[0]))
+                n_new = _cross(_sub(new[1], new[0]), _sub(new[2], new[0]))
+                len_old, len_new = math.sqrt(_dot(n_old, n_old)), math.sqrt(_dot(n_new, n_new))
+                sq_old = sum(_dot(d, d) for d in (_sub(old[1], old[0]), _sub(old[2], old[0]), _sub(old[2], old[1])))
+                sq = sum(_dot(d, d) for d in (_sub(new[1], new[0]), _sub(new[2], new[0]), _sub(new[2], new[1])))
                 usable = len_old > 1e-6 * sq_old and len_new > 1e-6 * sq
-                if usable and n_old @ n_new < cos_threshold * len_old * len_new:
+                if usable and _dot(n_old, n_new) < cos_threshold * len_old * len_new:
                     n_flip += 1
                 shape = 2 * math.sqrt(3) * len_new / max(sq, 1e-20)
                 sk += 1 - min(max(shape, 0.0), 1.0)
