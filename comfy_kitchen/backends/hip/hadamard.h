@@ -112,11 +112,14 @@ inline int comfy_convrot_fused_block_override() {
 
 // COMFY_CONVROT_PACK4_FUSED=0 forces the PACK_INT4 activation quantizer back onto
 // convrot_quant_kernel, so one process can A/B the two on the same clocks. Unset (or
-// any other value) means the fused kernel, which is the default. Read on every launch
-// like the block overrides above. This is a measurement knob, not a user setting: it
-// exists because a rebuild-per-variant sweep cannot be trusted here (see the cold
-// clock note above), and the claim it settles -- that the two agree bit for bit --
-// is not something to take from reading the source.
+// any other value) means the fused kernel, which is the default **on the
+// architectures where that routing was measured** (gfx1103 and RDNA2); elsewhere the
+// legacy kernel is used regardless, because the block-width table the fused kernel
+// needs has no entry for those parts. Read on every launch like the block overrides
+// above. This is a measurement knob, not a user setting: it exists because a
+// rebuild-per-variant sweep cannot be trusted here (see the cold clock note above),
+// and the claim it settles -- that the two agree bit for bit -- is not something to
+// take from reading the source.
 inline bool comfy_convrot_pack4_fused() {
     const char* s = getenv("COMFY_CONVROT_PACK4_FUSED");
     return !(s && *s && atoi(s) == 0);
@@ -1220,12 +1223,39 @@ inline void launch_convrot_quant(
     // RowT's largest finite value (finite_absmax_for_quant) and the legacy one does
     // not. That only differs on a non-finite row, which no real activation is.
     //
+    // **Gated to gfx1103 and RDNA2**, the two architectures whose fused block-width
+    // table exists in convrot_quant_fused_block_threads. On anything else PACK_INT4
+    // keeps the legacy kernel it has always used. Every number above is from the
+    // 6-WGP 780M, so gfx1035 is included on the strength of the shared table and its
+    // own measured block widths rather than on a PACK_INT4 measurement of its own --
+    // which is a weaker claim than gfx1103's and is stated as such rather than
+    // dressed up as a general one. Nothing here is architecture-visible in the
+    // output: the two kernels are bit-identical, so restricting the routing can only
+    // cost speed, never change a result.
+    //
     // COMFY_CONVROT_PACK4_FUSED=0 puts PACK_INT4 back on the legacy kernel.
     // The knob has to gate PACK_INT4 itself, not sit beside it in an `||`: PACK_INT4
     // is a compile-time constant, so `PACK_INT4 || knob` short-circuits and the knob
     // is dead code -- which makes the A/B compare the fused kernel against itself and
     // report "bit-identical" at 1.00x. It is a `?:` on the two paths instead.
-    if (group_size == 256 && (PACK_INT4 ? comfy_convrot_pack4_fused() : true)) {
+    //
+    // **PACK_INT4's use of the fused kernel is gated to the architectures it was
+    // measured on**, for the same reason the block-width heuristic above is: the
+    // fused kernel spends its LDS partly on per-block-width scratch, so which width
+    // wins depends on how many blocks a part has to interleave, and
+    // convrot_quant_fused_block_threads answers from a table that has entries for
+    // gfx1103 and gfx103x but was never measured on the dGPU parts. The int8 path
+    // runs that kernel on every architecture and is left alone; only the int4
+    // *routing decision*, which is new here, is restricted.
+    //
+    // Everything except gfx1103 and RDNA2 therefore keeps the legacy int4 kernel
+    // it has always used. That is a performance choice, not a correctness one: both
+    // kernels are bit-identical, so no output changes anywhere.
+    const bool pack4_takes_fused =
+        comfy_small_igpu() || comfy_is_gfx10()
+        ? comfy_convrot_pack4_fused()
+        : false;
+    if (group_size == 256 && (PACK_INT4 ? pack4_takes_fused : true)) {
         const int block_threads = convrot_pick_fused_block_threads(M, K, in_dtype);
         if (block_threads > 0) {
             bool launched = false;

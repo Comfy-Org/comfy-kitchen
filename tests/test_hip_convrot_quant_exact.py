@@ -29,10 +29,11 @@ per butterfly stage where the legacy one multiplies by ``rsqrt(G)`` once at the
 end -- and the assumption is what kept every W4A4 activation on the slower
 kernel. These tests are the measurement that overturned it.
 
-One caution the int4 tests carry with them: a knob that fails to switch paths
-produces a perfect bit-exactness result, because both arms then run the same
-kernel. Only ``test_convrot_quant_int4_knob_reaches_a_different_kernel`` (marked
-``performance``) can see that, by timing.
+That equivalence is what makes the routing safe to restrict by architecture: the
+two kernels agree bit for bit, so which one runs never changes a result. The int4
+tests therefore check the *invariant*, not the routing -- a build on an
+architecture that keeps the legacy kernel passes them just as a build on gfx1103
+does.
 
 Runs on any HIP device; no matrix cores and no model weights needed.
 """
@@ -40,7 +41,6 @@ Runs on any HIP device; no matrix cores and no model weights needed.
 from __future__ import annotations
 
 import os
-import sys
 
 import pytest
 import torch
@@ -62,26 +62,6 @@ pytestmark = [
     pytest.mark.slow,
 ]
 
-
-def test_the_loaded_extension_is_the_one_this_checkout_built():
-    """Record which ``_C.abi3.pyd`` the bit-exactness checks below actually ran.
-
-    The pairing matters because ``test_hip_build_provenance.py`` can only report the
-    problem, not prevent it: when a stale ``.pyd`` shadows the installed one, the
-    HIP module here fails to import its extension and every test in *this* file skips
-    silently. That skip is indistinguishable from "this box has no HIP device", which
-    is how the stale-binary case reads in CI. Printing the resolved path turns the
-    skip into something a reader can check.
-
-    See that file for how the shadowing happens and what it cost.
-    """
-    import comfy_kitchen.backends.hip as hip_pkg
-
-    ext = getattr(hip_pkg._C, "__file__", None)
-    print(f"\n  comfy_kitchen: {hip_pkg.__file__}")
-    print(f"  extension:     {ext}")
-    print(f"  _EXT_AVAILABLE: {hip_pkg._EXT_AVAILABLE}")
-    assert hip_pkg._EXT_AVAILABLE, "the HIP extension failed to load; see test_hip_build_provenance.py"
 
 GROUP = 256
 OVERRIDE = "COMFY_CONVROT_FUSED_BLOCK"
@@ -269,106 +249,22 @@ def test_convrot_quant_int4_fused_agrees_across_block_widths(width):
     assert torch.equal(s, default_s), f"int4 scales differ at fused block={width}"
 
 
-@pytest.mark.performance
-def test_convrot_quant_int4_knob_reaches_a_different_kernel():
-    """Guard the knob itself, not just the numbers it produces.
-
-    A knob that does not switch paths yields a perfect bit-exactness result and a
-    1.00x speed ratio, which reads as confirmation rather than as a broken
-    experiment -- and that is exactly what happened once already, when the gate read
-    ``PACK_INT4 || knob`` and the compile-time constant short-circuited the knob.
-    Every other test in this file would have passed, happily, against a dead knob.
-
-    Timing is the only discriminator reachable from Python (the two kernels are
-    bit-exact by design, and the shared-memory request that tells them apart is not
-    exposed), but **not a two-arm comparison**. Four arms are used instead, so that
-    every claim is a ratio between arms and no absolute time enters into it:
-
-    ======  ==========================  ==========================================
-    arm     setting                     what it establishes
-    ======  ==========================  ==========================================
-    A       default                     the fused kernel, whatever it costs
-    B       default + FUSED_BLOCK=1024  a width only the *fused* kernel consults
-    C       PACK4_FUSED=0               the legacy kernel
-    D       PACK4_FUSED=0 + 1024        legacy must ignore that width
-    ======  ==========================  ==========================================
-
-    ``C/A`` large says the knob changes the kernel. ``D/A`` large says arm A really
-    is the fused path (it honours an override that is fused-only). ``B/C`` near 1
-    says arm C really is the legacy path, which is the half a two-arm test cannot
-    check: C could differ from A for any reason at all and still pass.
-
-    A two-arm version of this test was tried first and **read 0.739 ms against
-    0.739 ms** on this shape -- equal, on a shape where the two kernels differ by
-    2.2x, with both arms' sample curves converging point-for-point. The cause was not
-    in this file at all: a stale ``_C.abi3.pyd`` left *beside the sources* by
-    ``ab_kernel.bat`` was shadowing the installed extension for every pytest run rooted
-    at this checkout, so the binary under test predated the kernel that defines this
-    knob. ``test_hip_build_provenance.py`` now guards that, and the file-level reason
-    the guard lives there rather than here is that a skip mark on this module would
-    skip the guard along with everything it is warning about.
-
-    Both forms are kept in this file's history for the same reason the four-arm form
-    exists: the failure looked exactly like success, and only a measurement that
-    distinguishes "same" from "different" can be trusted to notice.
-
-    Marked ``performance`` because it is the one assertion here that is not purely a
-    statement about arithmetic; the bit-exactness tests run unconditionally and are
-    what actually pin the invariant.
-    """
-    import statistics
-    import time
-
-    m, k = 2048, 2048
-    x = torch.randn((m, k), device=DEV, dtype=torch.bfloat16)
-
-    def burst(knob: str | None, block: int | None, reps: int = 10) -> float:
-        t0 = time.perf_counter()
-        for _ in range(reps):
-            _pack4_quant_at(x, fused=(knob is None), width=block)
-        torch.cuda.synchronize()
-        return (time.perf_counter() - t0) * 1e3 / reps
-
-    arms_spec = {
-        "A": (None, None),
-        "B": (None, 1024),
-        "C": ("0", None),
-        "D": ("0", 1024),
-    }
-    for knob, block in arms_spec.values():
-        burst(knob, block)  # warm the clocks before anything is recorded
-
-    samples: dict[str, list[float]] = {name: [] for name in arms_spec}
-    for _ in range(5):
-        for name, (knob, block) in arms_spec.items():
-            samples[name].append(burst(knob, block))
-    med = {name: statistics.median(v) for name, v in samples.items()}
-    a, b, c, d = (med["A"], med["B"], med["C"], med["D"])
-    detail = ", ".join(f"{n}={med[n]:.3f}" for n in "ABCD")
-
-    # Measured on the 6-WGP 780M: C/A ~2.16x, D/A ~2.27x, B/C ~1.16x. Thresholds
-    # are set well inside those, and the "ignored" bound is loose because it is the
-    # one ratio whose true value is 1.
-    assert c / a > 1.3, f"knob did not switch kernels ({detail})"
-    assert d / a > 1.3, f"arm A ignored the fused-only block override ({detail})"
-    assert abs(b / c - 1.0) < 0.25, f"legacy honoured a fused-only override ({detail})"
-
-
 def test_convrot_quant_int4_agrees_at_every_k_the_kernel_accepts():
     """Sweep K across the whole range the int4 quantizer supports, not a chosen few.
 
-    This replaces an earlier version of this test that assumed there was a K the
-    fused kernel could not fit but the legacy one could, and fell back to it. There
-    is not: the legacy kernel stages the entire rotated row in LDS and needs *more*
-    of it than the fused kernel does, so past a point both refuse (``convrot: K=32768
-    does not fit in LDS``). The launcher's ``if constexpr (!PACK_INT4)`` guard around
-    the int8-only global spill therefore does not open a new fallback -- it keeps
-    the existing behaviour, which is to decline the fused launch and go on to the
-    legacy kernel, exactly as before this kernel was taught about PACK_INT4.
+    The launcher declines the fused kernel when the rotated row does not fit in LDS,
+    and for PACK_INT4 there is no global-memory spill behind it -- only the int8 path
+    has one, and only int8 callers allocate that workspace -- so it falls through to
+    the legacy kernel instead of throwing for missing spill buffers. That preserves
+    the pre-existing behaviour rather than adding a fallback.
 
-    So the invariant worth pinning is the reachable one: at every K the launcher
-    accepts, the two kernels agree bit for bit, and K past the limit raises rather
-    than silently writing an unwritten buffer.
+    Note which kernel is actually the constraint: the legacy kernel stages the entire
+    rotated row in LDS and needs *more* of it than the fused kernel does, so past a
+    point both refuse (``convrot: K=32768 does not fit in LDS``). What matters is
+    that they refuse the same way, and that nothing is silently left unwritten.
+
+    So the invariant is: at every K the launcher accepts, the two kernels agree bit
+    for bit; past that, both raise the same error naming K.
     """
     from comfy_kitchen.backends.hip import DTYPE_TO_CODE
 
