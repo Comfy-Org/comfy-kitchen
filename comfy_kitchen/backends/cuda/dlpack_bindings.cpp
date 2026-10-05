@@ -325,6 +325,56 @@ extern "C" {
         int         dtype_code,
         bool        subtract_mean,
         cudaStream_t stream);
+
+    // 3D Delaunay steps, looped from Python — see ops/delaunay3d.cu.
+    void launch_delaunay_vote(const void* pt_tet, const void* pt_prio, int n_pts, void* vote, cudaStream_t stream);
+    void launch_delaunay_split(int n_tets, const void* vote, const void* split_rank, const void* prio_to_pt,
+                               void* tet_v, void* tet_opp, void* alive, void* pt_tet, void* active, cudaStream_t stream);
+    void launch_delaunay_relocate_split(int n_pts, const void* vote, const void* split_rank, int base_new,
+                                        const void* tet_v, const void* points, void* pt_tet, cudaStream_t stream);
+    void launch_delaunay_flip_detect(int n_active, const void* active_list, const void* active_flag,
+                                     const void* tet_v, const void* tet_opp, const void* points, void* cand_info,
+                                     void* cand_n, void* cand_m, void* owner, void* retry, cudaStream_t stream);
+    void launch_delaunay_flip_decide(int n_cand, const void* active_list, const void* cand_info, const void* cand_n,
+                                     const void* cand_m, const void* owner, void* exec, void* active_next,
+                                     cudaStream_t stream);
+    void launch_delaunay_flip_execute(int n_cand, const void* active_list, const void* exec, const void* cand_n,
+                                      const void* cand_m, const void* slot_rank, const void* run_rank, int base_new,
+                                      const void* points, void* tet_v, void* tet_opp, void* alive, void* flipped,
+                                      void* redirect, void* pend, void* new_tets, void* active_next,
+                                      cudaStream_t stream);
+    void launch_delaunay_flip_fixup(int n_run, const void* new_tets, const void* flipped, const void* redirect,
+                                    void* tet_opp, void* pend, cudaStream_t stream);
+    void launch_delaunay_relocate_flip(int n_pts, const void* flipped, const void* new_tets, const void* tet_v,
+                                       const void* points, void* pt_tet, cudaStream_t stream);
+    void launch_delaunay_compact(int n_tets, const void* alive, const void* new_index, const void* tet_v,
+                                 const void* tet_opp, void* out_tets, void* out_nbr, cudaStream_t stream);
+
+    // Triangle BVH and closest-point queries — see ops/mesh_bvh.cu.
+    void launch_mesh_bvh_build(const void* codes, const void* tris, int n_leaves, void* child, void* parent,
+                               void* visits, void* box, cudaStream_t stream);
+    void launch_closest_point_on_mesh(const void* points, int n_points, const void* tris, const void* tri_index,
+                                      int n_leaves, const void* child, const void* box, float max_dist, void* dist,
+                                      void* closest, void* face, cudaStream_t stream);
+
+    // Union-find connected components — see ops/connected_components.cu.
+    void launch_connected_components(const void* edges, int64_t n_edges, bool edges_int64, int n_nodes,
+                                     void* parent, void* labels, cudaStream_t stream);
+
+    // Edge-collapse checks — see ops/edge_collapse.cu.
+    void launch_edge_collapse_checks(const void* verts, const void* faces, const void* offsets, void* cursor, void* fan,
+                                     const void* edges, const void* positions, int n_corners, int n_edges,
+                                     float cos_threshold, void* flips, void* skinny, void* link_ok, cudaStream_t stream);
+
+    // Push-relabel min cut on bounded-degree graphs — see ops/min_cut.cu.
+    void launch_min_cut_init(int n, int K, const void* nbr, const void* cap, void* r, void* rev, cudaStream_t stream);
+    void launch_min_cut_global_relabel(int n, int K, const void* nbr, const void* rev, const void* r, const void* rt,
+                                       float tol, int big, void* h, void* lists, void* counts, cudaStream_t stream);
+    void launch_min_cut_rebuild_active(int n, const void* e, const void* h, float tol, int big, void* list, void* count,
+                                       void* queued, cudaStream_t stream);
+    void launch_min_cut_iterate(int n, int K, const void* nbr, const void* rev, void* r, void* e, void* rt, void* h,
+                                void* inc, void* hn, float tol, int big, const void* list, const void* count,
+                                void* list_out, void* count_out, void* queued, void* active, cudaStream_t stream);
 }
 
 // Nanobind wrapper for quantize_per_tensor_fp8
@@ -1731,6 +1781,123 @@ void rms_adaln(
     launch_adaln_kernel(
         x.data(), scale.data(), shift.data(), out.data(),
         N, D, scale_group, shift_group, eps, dtype_code, /*subtract_mean=*/false, stream);
+}
+
+// Nanobind wrappers for the 3D Delaunay steps (int32 / uint8 / float64 buffers owned by Python)
+using cuda_array = nb::ndarray<nb::device::cuda>;
+
+void delaunay_vote(cuda_array pt_tet, cuda_array pt_prio, int n_pts, cuda_array vote, uintptr_t stream_ptr) {
+    launch_delaunay_vote(pt_tet.data(), pt_prio.data(), n_pts, vote.data(),
+                         reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void delaunay_split(int n_tets, cuda_array vote, cuda_array split_rank, cuda_array prio_to_pt, cuda_array tet_v,
+                    cuda_array tet_opp, cuda_array alive, cuda_array pt_tet, cuda_array active, uintptr_t stream_ptr) {
+    launch_delaunay_split(n_tets, vote.data(), split_rank.data(), prio_to_pt.data(), tet_v.data(), tet_opp.data(),
+                          alive.data(), pt_tet.data(), active.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void delaunay_relocate_split(int n_pts, cuda_array vote, cuda_array split_rank, int base_new, cuda_array tet_v,
+                             cuda_array points, cuda_array pt_tet, uintptr_t stream_ptr) {
+    launch_delaunay_relocate_split(n_pts, vote.data(), split_rank.data(), base_new, tet_v.data(), points.data(),
+                                   pt_tet.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void delaunay_flip_detect(int n_active, cuda_array active_list, cuda_array active_flag, cuda_array tet_v,
+                          cuda_array tet_opp, cuda_array points, cuda_array cand_info, cuda_array cand_n,
+                          cuda_array cand_m, cuda_array owner, cuda_array retry, uintptr_t stream_ptr) {
+    launch_delaunay_flip_detect(n_active, active_list.data(), active_flag.data(), tet_v.data(), tet_opp.data(),
+                                points.data(), cand_info.data(), cand_n.data(), cand_m.data(), owner.data(),
+                                retry.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void delaunay_flip_decide(int n_cand, cuda_array active_list, cuda_array cand_info, cuda_array cand_n,
+                          cuda_array cand_m, cuda_array owner, cuda_array exec, cuda_array active_next,
+                          uintptr_t stream_ptr) {
+    launch_delaunay_flip_decide(n_cand, active_list.data(), cand_info.data(), cand_n.data(), cand_m.data(),
+                                owner.data(), exec.data(), active_next.data(),
+                                reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void delaunay_flip_execute(int n_cand, cuda_array active_list, cuda_array exec, cuda_array cand_n,
+                           cuda_array cand_m, cuda_array slot_rank, cuda_array run_rank, int base_new,
+                           cuda_array points, cuda_array tet_v, cuda_array tet_opp, cuda_array alive,
+                           cuda_array flipped, cuda_array redirect, cuda_array pend, cuda_array new_tets,
+                           cuda_array active_next, uintptr_t stream_ptr) {
+    launch_delaunay_flip_execute(n_cand, active_list.data(), exec.data(), cand_n.data(), cand_m.data(),
+                                 slot_rank.data(), run_rank.data(), base_new, points.data(), tet_v.data(),
+                                 tet_opp.data(), alive.data(), flipped.data(), redirect.data(), pend.data(),
+                                 new_tets.data(), active_next.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void delaunay_flip_fixup(int n_run, cuda_array new_tets, cuda_array flipped, cuda_array redirect, cuda_array tet_opp,
+                         cuda_array pend, uintptr_t stream_ptr) {
+    launch_delaunay_flip_fixup(n_run, new_tets.data(), flipped.data(), redirect.data(), tet_opp.data(), pend.data(),
+                               reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void delaunay_relocate_flip(int n_pts, cuda_array flipped, cuda_array new_tets, cuda_array tet_v, cuda_array points,
+                            cuda_array pt_tet, uintptr_t stream_ptr) {
+    launch_delaunay_relocate_flip(n_pts, flipped.data(), new_tets.data(), tet_v.data(), points.data(), pt_tet.data(),
+                                  reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void delaunay_compact(int n_tets, cuda_array alive, cuda_array new_index, cuda_array tet_v, cuda_array tet_opp,
+                      cuda_array out_tets, cuda_array out_nbr, uintptr_t stream_ptr) {
+    launch_delaunay_compact(n_tets, alive.data(), new_index.data(), tet_v.data(), tet_opp.data(), out_tets.data(),
+                            out_nbr.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void mesh_bvh_build(cuda_array codes, cuda_array tris, int n_leaves, cuda_array child, cuda_array parent,
+                    cuda_array visits, cuda_array box, uintptr_t stream_ptr) {
+    launch_mesh_bvh_build(codes.data(), tris.data(), n_leaves, child.data(), parent.data(), visits.data(), box.data(),
+                          reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void closest_point_on_mesh(cuda_array points, int n_points, cuda_array tris, cuda_array tri_index, int n_leaves,
+                           cuda_array child, cuda_array box, float max_dist, cuda_array dist, cuda_array closest,
+                           cuda_array face, uintptr_t stream_ptr) {
+    launch_closest_point_on_mesh(points.data(), n_points, tris.data(), tri_index.data(), n_leaves, child.data(),
+                                 box.data(), max_dist, dist.data(), closest.data(), face.data(),
+                                 reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void connected_components(cuda_array edges, int64_t n_edges, bool edges_int64, int n_nodes, cuda_array parent,
+                          cuda_array labels, uintptr_t stream_ptr) {
+    launch_connected_components(edges.data(), n_edges, edges_int64, n_nodes, parent.data(), labels.data(),
+                                reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void edge_collapse_checks(cuda_array verts, cuda_array faces, cuda_array offsets, cuda_array cursor, cuda_array fan,
+                          cuda_array edges, cuda_array positions, int n_corners, int n_edges, float cos_threshold,
+                          cuda_array flips, cuda_array skinny, cuda_array link_ok, uintptr_t stream_ptr) {
+    launch_edge_collapse_checks(verts.data(), faces.data(), offsets.data(), cursor.data(), fan.data(), edges.data(),
+                                positions.data(), n_corners, n_edges, cos_threshold, flips.data(), skinny.data(),
+                                link_ok.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void min_cut_init(int n, int K, cuda_array nbr, cuda_array cap, cuda_array r, cuda_array rev, uintptr_t stream_ptr) {
+    launch_min_cut_init(n, K, nbr.data(), cap.data(), r.data(), rev.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void min_cut_global_relabel(int n, int K, cuda_array nbr, cuda_array rev, cuda_array r, cuda_array rt, float tol, int big,
+                            cuda_array h, cuda_array lists, cuda_array counts, uintptr_t stream_ptr) {
+    launch_min_cut_global_relabel(n, K, nbr.data(), rev.data(), r.data(), rt.data(), tol, big, h.data(), lists.data(),
+                                  counts.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void min_cut_rebuild_active(int n, cuda_array e, cuda_array h, float tol, int big, cuda_array list, cuda_array count,
+                            cuda_array queued, uintptr_t stream_ptr) {
+    launch_min_cut_rebuild_active(n, e.data(), h.data(), tol, big, list.data(), count.data(), queued.data(),
+                                  reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void min_cut_iterate(int n, int K, cuda_array nbr, cuda_array rev, cuda_array r, cuda_array e, cuda_array rt, cuda_array h,
+                     cuda_array inc, cuda_array hn, float tol, int big, cuda_array list, cuda_array count,
+                     cuda_array list_out, cuda_array count_out, cuda_array queued, cuda_array active, uintptr_t stream_ptr) {
+    launch_min_cut_iterate(n, K, nbr.data(), rev.data(), r.data(), e.data(), rt.data(), h.data(), inc.data(), hn.data(),
+                           tol, big, list.data(), count.data(), list_out.data(), count_out.data(), queued.data(),
+                           active.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // fp16-accumulate conv3d; all tensors fp16 NDHWC (validated in Python), residual is
@@ -4539,6 +4706,62 @@ NB_MODULE(_C, m) {
           nb::arg("eps"),
           nb::arg("dtype_code"),
           nb::arg("stream_ptr"));
+
+    m.def("delaunay_vote", &delaunay_vote, "Delaunay: each tet with uninserted points picks one",
+          nb::arg("pt_tet"), nb::arg("pt_prio"), nb::arg("n_pts"), nb::arg("vote"), nb::arg("stream_ptr"));
+    m.def("delaunay_split", &delaunay_split, "Delaunay: 1-4 split of the voting tets",
+          nb::arg("n_tets"), nb::arg("vote"), nb::arg("split_rank"), nb::arg("prio_to_pt"), nb::arg("tet_v"),
+          nb::arg("tet_opp"), nb::arg("alive"), nb::arg("pt_tet"), nb::arg("active"), nb::arg("stream_ptr"));
+    m.def("delaunay_relocate_split", &delaunay_relocate_split, "Delaunay: move points of split tets to their child",
+          nb::arg("n_pts"), nb::arg("vote"), nb::arg("split_rank"), nb::arg("base_new"), nb::arg("tet_v"),
+          nb::arg("points"), nb::arg("pt_tet"), nb::arg("stream_ptr"));
+    m.def("delaunay_flip_detect", &delaunay_flip_detect, "Delaunay: find 2-3 / 3-2 flips on changed tets",
+          nb::arg("n_active"), nb::arg("active_list"), nb::arg("active_flag"), nb::arg("tet_v"), nb::arg("tet_opp"),
+          nb::arg("points"), nb::arg("cand_info"), nb::arg("cand_n"), nb::arg("cand_m"), nb::arg("owner"),
+          nb::arg("retry"), nb::arg("stream_ptr"));
+    m.def("delaunay_flip_decide", &delaunay_flip_decide, "Delaunay: keep flips that own all their tets",
+          nb::arg("n_cand"), nb::arg("active_list"), nb::arg("cand_info"), nb::arg("cand_n"), nb::arg("cand_m"),
+          nb::arg("owner"), nb::arg("exec"), nb::arg("active_next"), nb::arg("stream_ptr"));
+    m.def("delaunay_flip_execute", &delaunay_flip_execute, "Delaunay: perform the chosen flips",
+          nb::arg("n_cand"), nb::arg("active_list"), nb::arg("exec"), nb::arg("cand_n"), nb::arg("cand_m"),
+          nb::arg("slot_rank"), nb::arg("run_rank"), nb::arg("base_new"), nb::arg("points"), nb::arg("tet_v"),
+          nb::arg("tet_opp"), nb::arg("alive"), nb::arg("flipped"), nb::arg("redirect"), nb::arg("pend"),
+          nb::arg("new_tets"), nb::arg("active_next"), nb::arg("stream_ptr"));
+    m.def("delaunay_flip_fixup", &delaunay_flip_fixup, "Delaunay: reconnect faces across flips of one pass",
+          nb::arg("n_run"), nb::arg("new_tets"), nb::arg("flipped"), nb::arg("redirect"), nb::arg("tet_opp"),
+          nb::arg("pend"), nb::arg("stream_ptr"));
+    m.def("delaunay_relocate_flip", &delaunay_relocate_flip, "Delaunay: move points of flipped tets",
+          nb::arg("n_pts"), nb::arg("flipped"), nb::arg("new_tets"), nb::arg("tet_v"), nb::arg("points"),
+          nb::arg("pt_tet"), nb::arg("stream_ptr"));
+    m.def("delaunay_compact", &delaunay_compact, "Delaunay: drop dead tets and remap neighbours",
+          nb::arg("n_tets"), nb::arg("alive"), nb::arg("new_index"), nb::arg("tet_v"), nb::arg("tet_opp"),
+          nb::arg("out_tets"), nb::arg("out_nbr"), nb::arg("stream_ptr"));
+    m.def("mesh_bvh_build", &mesh_bvh_build, "Linear BVH over Morton-sorted triangles",
+          nb::arg("codes"), nb::arg("tris"), nb::arg("n_leaves"), nb::arg("child"), nb::arg("parent"),
+          nb::arg("visits"), nb::arg("box"), nb::arg("stream_ptr"));
+    m.def("closest_point_on_mesh", &closest_point_on_mesh, "Closest point on a BVH'd triangle mesh per query",
+          nb::arg("points"), nb::arg("n_points"), nb::arg("tris"), nb::arg("tri_index"), nb::arg("n_leaves"),
+          nb::arg("child"), nb::arg("box"), nb::arg("max_dist"), nb::arg("dist"), nb::arg("closest"), nb::arg("face"),
+          nb::arg("stream_ptr"));
+    m.def("connected_components", &connected_components, "Union-find connected components of an edge list",
+          nb::arg("edges"), nb::arg("n_edges"), nb::arg("edges_int64"), nb::arg("n_nodes"), nb::arg("parent"),
+          nb::arg("labels"), nb::arg("stream_ptr"));
+    m.def("edge_collapse_checks", &edge_collapse_checks, "Flip / skinny / link checks for candidate edge collapses",
+          nb::arg("verts"), nb::arg("faces"), nb::arg("offsets"), nb::arg("cursor"), nb::arg("fan"), nb::arg("edges"),
+          nb::arg("positions"), nb::arg("n_corners"), nb::arg("n_edges"), nb::arg("cos_threshold"), nb::arg("flips"),
+          nb::arg("skinny"), nb::arg("link_ok"), nb::arg("stream_ptr"));
+    m.def("min_cut_init", &min_cut_init, "Residuals and reverse slots for min_cut", nb::arg("n"), nb::arg("K"),
+          nb::arg("nbr"), nb::arg("cap"), nb::arg("r"), nb::arg("rev"), nb::arg("stream_ptr"));
+    m.def("min_cut_global_relabel", &min_cut_global_relabel, "Heights by BFS from the sink", nb::arg("n"), nb::arg("K"),
+          nb::arg("nbr"), nb::arg("rev"), nb::arg("r"), nb::arg("rt"), nb::arg("tol"), nb::arg("big"), nb::arg("h"),
+          nb::arg("lists"), nb::arg("counts"), nb::arg("stream_ptr"));
+    m.def("min_cut_rebuild_active", &min_cut_rebuild_active, "Active list from scratch", nb::arg("n"), nb::arg("e"),
+          nb::arg("h"), nb::arg("tol"), nb::arg("big"), nb::arg("list"), nb::arg("count"), nb::arg("queued"),
+          nb::arg("stream_ptr"));
+    m.def("min_cut_iterate", &min_cut_iterate, "One push-relabel iteration over the active list", nb::arg("n"),
+          nb::arg("K"), nb::arg("nbr"), nb::arg("rev"), nb::arg("r"), nb::arg("e"), nb::arg("rt"), nb::arg("h"),
+          nb::arg("inc"), nb::arg("hn"), nb::arg("tol"), nb::arg("big"), nb::arg("list"), nb::arg("count"),
+          nb::arg("list_out"), nb::arg("count_out"), nb::arg("queued"), nb::arg("active"), nb::arg("stream_ptr"));
 
     // Feature availability flag (computed at module load time)
     m.attr("HAS_CUBLASLT") = comfy::CublasLtRuntime::instance().is_available();
