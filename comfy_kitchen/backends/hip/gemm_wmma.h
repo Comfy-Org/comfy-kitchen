@@ -333,6 +333,13 @@ inline bool launch_gemm_wmma_forced(const ASrc& A, const uint8_t* B, OutT* C, in
     CK_LAUNCH_WMMA_TILE(64, 64, 64, 2, 2, 2, 2)
     CK_LAUNCH_WMMA_TILE(128, 128, 128, 4, 2, 2, 4)
     CK_LAUNCH_WMMA_TILE(128, 128, 64, 4, 2, 2, 4)
+    // convrot_w4a4's own tiles. That launcher used to bypass this function and
+    // call gemm_wmma_kernel itself, so COMFY_GEMM_WMMA_TILE could not express
+    // "run W4A4 the way it ran before this change" and the A/B had no control arm.
+    // It routes through here now, so its tiles belong in the table for the same
+    // reason the six above do. Not free for the 8-bit policies -- this is a new
+    // instantiation for them -- but a tile that cannot be named cannot be tested.
+    CK_LAUNCH_WMMA_TILE(256, 128, 64, 4, 2, 4, 4)
     // Wider / narrower tiles and shallow K-steps, the shapes the sweep asks about.
     CK_LAUNCH_WMMA_TILE(256, 128, 128, 4, 4, 4, 2)
     CK_LAUNCH_WMMA_TILE(256, 128, 64, 4, 4, 4, 2)

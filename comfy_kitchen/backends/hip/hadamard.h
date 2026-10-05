@@ -110,6 +110,18 @@ inline int comfy_convrot_fused_block_override() {
                : 0;
 }
 
+// COMFY_CONVROT_PACK4_FUSED=0 forces the PACK_INT4 activation quantizer back onto
+// convrot_quant_kernel, so one process can A/B the two on the same clocks. Unset (or
+// any other value) means the fused kernel, which is the default. Read on every launch
+// like the block overrides above. This is a measurement knob, not a user setting: it
+// exists because a rebuild-per-variant sweep cannot be trusted here (see the cold
+// clock note above), and the claim it settles -- that the two agree bit for bit --
+// is not something to take from reading the source.
+inline bool comfy_convrot_pack4_fused() {
+    const char* s = getenv("COMFY_CONVROT_PACK4_FUSED");
+    return !(s && *s && atoi(s) == 0);
+}
+
 inline int convrot_quant_fused_block_threads(int M, int K) {
     if (const int ov = comfy_convrot_fused_block_override(); ov > 0) {
         return ov;
@@ -826,7 +838,7 @@ void launch_convrot_quant_global_managed(
 
 // Fused single-kernel path: FHT in LDS, vectorized loads, warp-shuffle absmax.
 // One block per row; the rotated row stays in shared memory as RowT.
-template <typename RowT, int BLOCK_THREADS, int ACT>
+template <typename RowT, bool PACK_INT4, int BLOCK_THREADS, int ACT>
 __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     const void* __restrict__ x, int in_dtype, int8_t* __restrict__ qout,
     float* __restrict__ scaleout, int M, int K, const void* __restrict__ act_weight,
@@ -936,23 +948,48 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     }
 
     abs_max = block_reduce_max<kWarps>(abs_max, warp_smem, &block_smem);
+    // The int4 activation range is +-7, not +-127 (convrot_quant_kernel's kQMax).
+    // Symmetric, so the absmax/scale/inv algebra below is unchanged apart from the
+    // constant: rintf(v * inv) then clamped to +-kQMax is the same expression the
+    // legacy kernel evaluates, so packing nibbles costs no accuracy over it.
+    constexpr float kQMax = PACK_INT4 ? 7.0f : 127.0f;
     const float rowmax = fmaxf(finite_absmax_for_quant<RowT>(abs_max), 1e-10f);
-    const float scale = rowmax / 127.0f;
-    const float inv = 127.0f / rowmax;
+    const float scale = rowmax / kQMax;
+    const float inv = kQMax / rowmax;
     if (tid == 0) {
         scaleout[row] = scale;
     }
 
-    // Quantize the rotated row out of LDS and write one int8 per element.
-    for (int col = tid; col < K; col += BLOCK_THREADS) {
-        const float v = load_row_value(row_buf[col]);
-        int q = static_cast<int>(rintf(v * inv));
-        q = q < -127 ? -127 : (q > 127 ? 127 : q);
-        qout[row_offset + col] = static_cast<int8_t>(q);
+    // Quantize the rotated row out of LDS and write one int8 per element. PACK_INT4
+    // writes one byte per *two* elements, low nibble = even index, which is the
+    // layout convrot_quant_kernel emits and MmaInt4's loader expects.
+    if constexpr (PACK_INT4) {
+        const int Kp = K / 2;
+        // row*K is the *input* stride; a packed output row is K/2 bytes, so it needs
+        // its own base. Indexing with row_offset here would write K/2 bytes past the
+        // intended row and overrun the buffer on the last one.
+        const int64_t out_row = static_cast<int64_t>(row) * Kp;
+        for (int jb = tid; jb < Kp; jb += BLOCK_THREADS) {
+            const float a = load_row_value(row_buf[2 * jb]);
+            const float b = load_row_value(row_buf[2 * jb + 1]);
+            int qa = static_cast<int>(rintf(a * inv));
+            int qb = static_cast<int>(rintf(b * inv));
+            qa = qa < -7 ? -7 : (qa > 7 ? 7 : qa);
+            qb = qb < -7 ? -7 : (qb > 7 ? 7 : qb);
+            qout[out_row + jb] =
+                static_cast<int8_t>(((qa & 0xF) | ((qb & 0xF) << 4)) & 0xFF);
+        }
+    } else {
+        for (int col = tid; col < K; col += BLOCK_THREADS) {
+            const float v = load_row_value(row_buf[col]);
+            int q = static_cast<int>(rintf(v * inv));
+            q = q < -127 ? -127 : (q > 127 ? 127 : q);
+            qout[row_offset + col] = static_cast<int8_t>(q);
+        }
     }
 }
 
-template <typename RowT, int ACT, int BLOCK_THREADS>
+template <typename RowT, bool PACK_INT4, int ACT, int BLOCK_THREADS>
 inline bool launch_convrot_quant_fused_impl(
     const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
     const void* act_weight, float act_eps, hipStream_t stream) {
@@ -960,7 +997,7 @@ inline bool launch_convrot_quant_fused_impl(
     const size_t shmem =
         static_cast<size_t>(K) * sizeof(RowT) +
         static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256 * sizeof(float);
-    auto kernel = convrot_quant_fused_kernel<RowT, BLOCK_THREADS, ACT>;
+    auto kernel = convrot_quant_fused_kernel<RowT, PACK_INT4, BLOCK_THREADS, ACT>;
     const hipError_t attr_err = hipFuncSetAttribute(
         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(shmem));
@@ -973,7 +1010,7 @@ inline bool launch_convrot_quant_fused_impl(
     return hipGetLastError() == hipSuccess;
 }
 
-template <typename RowT, int ACT>
+template <typename RowT, bool PACK_INT4, int ACT>
 struct LaunchConvrotQuantFusedForBlock {
     const void* x;
     int in_dtype;
@@ -988,12 +1025,12 @@ struct LaunchConvrotQuantFusedForBlock {
 
     template <int BLOCK_THREADS>
     void operator()() const {
-        *launched = launch_convrot_quant_fused_impl<RowT, ACT, BLOCK_THREADS>(
+        *launched = launch_convrot_quant_fused_impl<RowT, PACK_INT4, ACT, BLOCK_THREADS>(
             x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream);
     }
 };
 
-template <int ACT>
+template <bool PACK_INT4, int ACT>
 struct LaunchConvrotQuantFusedForRow {
     const void* x;
     int in_dtype;
@@ -1011,7 +1048,7 @@ struct LaunchConvrotQuantFusedForRow {
     void operator()() const {
         dispatch_convrot_fused_block_threads(
             block_threads,
-            LaunchConvrotQuantFusedForBlock<RowT, ACT>{
+            LaunchConvrotQuantFusedForBlock<RowT, PACK_INT4, ACT>{
                 x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream, launched});
     }
 };
@@ -1150,27 +1187,71 @@ inline void launch_convrot_quant(
     int M, int K, int group_size, hipStream_t stream,
     void* spill_rotated = nullptr, void* spill_partials = nullptr) {
 
-    // INT8 G=256: fused when (M, K) fits in LDS, else caller-owned global spill.
-    if (!PACK_INT4 && group_size == 256) {
+    // G=256: fused when (M, K) fits in LDS, else caller-owned global spill.
+    //
+    // PACK_INT4 takes this path too now. It used to be excluded by `!PACK_INT4`,
+    // which sent every W4A4 activation through the legacy kernel at 15.6-20.6 GB/s
+    // against a 63 GB/s copy ceiling.
+    //
+    // The comment that exclusion was justified with ("that kernel scales by 0.5 per
+    // butterfly stage while this one scales by rsqrt(G) once at the end, so the two
+    // disagree in the rotation's rounding") does not survive measurement. The likely
+    // reason it looked true on paper: multiplying by 0.5 is exact in IEEE-754, fp32
+    // addition is homogeneous under a power-of-two scale, and both paths round the
+    // rotated value through RowT before taking the absmax, derive scale = rowmax/kQMax
+    // and inv = kQMax/rowmax, and evaluate the same rintf(v * inv) clamped to +-kQMax.
+    // The int4 tail differs only in packing two nibbles per byte. **But that is the
+    // explanation, not the evidence** -- the evidence is that the two agree bit for
+    // bit, which is what benchmark_attn/ck_fused_pack4_ab.py measures (it probes that
+    // its own control arm is live first; an earlier revision of the gate shorted the
+    // knob out with `PACK_INT4 ||` and produced a convincing 13/13 "bit-identical"
+    // at 1.00x by comparing the fused kernel against itself).
+    //
+    //   M=8192  K=2048 bf16   2.077 -> 0.818 ms  2.539x  20.2 -> 51.3 GB/s
+    //   M=8192  K=8192 bf16   8.767 -> 3.739 ms  2.345x  19.1 -> 44.9 GB/s
+    //   M=18432 K=2048 fp16   4.880 -> 1.801 ms  2.709x  19.3 -> 52.4 GB/s
+    //   M=8192  K=1280 fp16   1.342 -> 0.491 ms  2.731x  19.5 -> 53.4 GB/s
+    //   M=4608  K=1280 fp16   0.869 -> 0.311 ms  2.795x  17.0 -> 47.4 GB/s
+    //   M=2048  K=1280 fp16   0.421 -> 0.163 ms  2.573x  15.6 -> 40.1 GB/s
+    //   plus all-zero / single-spike / 1e-30 rows, both dtypes: 2.32-2.80x, and
+    //   0 of M*K/2 output bytes and 0 of M scales differ in every case.
+    //
+    // One asymmetry the exclusion did hide: the fused kernel clamps the absmax to
+    // RowT's largest finite value (finite_absmax_for_quant) and the legacy one does
+    // not. That only differs on a non-finite row, which no real activation is.
+    //
+    // COMFY_CONVROT_PACK4_FUSED=0 puts PACK_INT4 back on the legacy kernel.
+    // The knob has to gate PACK_INT4 itself, not sit beside it in an `||`: PACK_INT4
+    // is a compile-time constant, so `PACK_INT4 || knob` short-circuits and the knob
+    // is dead code -- which makes the A/B compare the fused kernel against itself and
+    // report "bit-identical" at 1.00x. It is a `?:` on the two paths instead.
+    if (group_size == 256 && (PACK_INT4 ? comfy_convrot_pack4_fused() : true)) {
         const int block_threads = convrot_pick_fused_block_threads(M, K, in_dtype);
         if (block_threads > 0) {
             bool launched = false;
             dispatch_convrot_row_type(
                 in_dtype,
-                LaunchConvrotQuantFusedForRow<ACT>{
+                LaunchConvrotQuantFusedForRow<PACK_INT4, ACT>{
                     x, in_dtype, qout, scaleout, M, K, nullptr, 0.0f, stream, block_threads,
                     &launched});
             if (launched) {
                 return;
             }
         }
-        if (spill_rotated == nullptr || spill_partials == nullptr) {
-            throw std::runtime_error(
-                "convrot global spill requires caller-provided workspace buffers");
+        if constexpr (!PACK_INT4) {
+            // Only the int8 path has a global spill, and only the int8 path has
+            // callers that allocate its workspace (convrot_int8_needs_spill). An
+            // int4 row too big for LDS therefore falls through to the legacy
+            // kernel below, which has no LDS limit on the rotated row beyond the
+            // per-group block width.
+            if (spill_rotated == nullptr || spill_partials == nullptr) {
+                throw std::runtime_error(
+                    "convrot global spill requires caller-provided workspace buffers");
+            }
+            launch_convrot_quant_global_managed<ACT>(
+                x, in_dtype, qout, scaleout, M, K, stream, spill_rotated, spill_partials);
+            return;
         }
-        launch_convrot_quant_global_managed<ACT>(
-            x, in_dtype, qout, scaleout, M, K, stream, spill_rotated, spill_partials);
-        return;
     }
 
     // INT4 G=256 with K>=512: 1024-thread blocks process 4 Hadamard groups/pass
@@ -1223,11 +1304,11 @@ inline void launch_convrot_quant(
     //
     // **This is the floor, not the ceiling.** The remaining gap to the fused INT8
     // quantizer is structural -- scalar 2-byte loads, 8 barriers per pass, a 10-level
-    // LDS reduction, 2 resident blocks per CU -- not a block-width mistake, so the real
-    // fix is to give PACK_INT4 the fused kernel. Not done here because that kernel
-    // scales by 0.5 per butterfly stage while this one scales by rsqrt(G) once at the
-    // end, so the two disagree in the rotation's rounding. Block width was the part
-    // that could be taken for free.
+    // LDS reduction, 2 resident blocks per CU -- not a block-width mistake. The real
+    // fix was to give PACK_INT4 the fused kernel, which the gate above now does: the
+    // scaling argument that used to justify excluding it does not survive a look at
+    // IEEE-754, and the two paths measure bit-identical. COMFY_CONVROT_PACK4_FUSED=0
+    // forces this kernel back so that claim can be re-checked on any shape.
     int block_threads;
     if constexpr (!PACK_INT4) {
         block_threads = (group_size == 64) ? 64
@@ -1281,7 +1362,7 @@ inline void launch_convrot_quant_rms_norm(
     if (block_threads > 0) {
         dispatch_convrot_row_type(
             in_dtype,
-            LaunchConvrotQuantFusedForRow<kActRmsNorm>{
+            LaunchConvrotQuantFusedForRow<false, kActRmsNorm>{
                 x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream, block_threads,
                 &launched});
     }
