@@ -300,6 +300,7 @@ __global__ __attribute__((amdgpu_waves_per_eu(2))) __launch_bounds__(BM, 1) void
     int64_t qs_stride_b, int64_t qs_stride_h,
     int64_t ks_stride_b, int64_t ks_stride_h,
     int diag,
+    int kscale_hoist,
     const void* __restrict__ q_fp, int q_src_bf16, float sm_scale_log2e,
     const void* __restrict__ mask = nullptr,
     int64_t mask_stride_b = 0, int64_t mask_stride_h = 0,
@@ -339,6 +340,10 @@ __global__ __attribute__((amdgpu_waves_per_eu(2))) __launch_bounds__(BM, 1) void
 
     const int tid = threadIdx.x;
     const int64_t m = blockIdx.x * BM + tid;
+    // NTHREAD == BM and tid < BM, so this is `m % BM` without the 64-bit modulo.
+    // The three LDS arrays below are indexed by it, and it is read once per key
+    // tile in the softmax and twice more in the PV.
+    const int mloc = tid;
     const int64_t b = blockIdx.z;
     const int64_t h = blockIdx.y;
     const int64_t kvh = h / (q_heads / kv_heads);
@@ -474,6 +479,23 @@ __global__ __attribute__((amdgpu_waves_per_eu(2))) __launch_bounds__(BM, 1) void
         // it. It also costs nothing: BN predicates already fit in one VGPR's
         // worth of predicate state alongside the BN scores the loop keeps live.
         bool keep_b[BN];
+        // k_scale is indexed by `n / MIN_BLK_K`. As written below that is a pair
+        // of 64-bit products plus a divide **per key**, on a value the whole tile
+        // shares: MIN_BLK_K is 16 and BN is 16 or 32, so a key tile spans at most
+        // BN / MIN_BLK_K = 1 or 2 consecutive groups, and `kb` is always a whole
+        // number of them. One uniform branch per tile buys back 16 divides and 16
+        // addresses, and with them the 32 loads.
+        //
+        // `ks_full` keeps the trailing partial tile on the original path: its last
+        // group can be one past the end of the scale buffer, which is exactly what
+        // the `if (keep)` guard below exists to avoid.
+        const bool ks_full = (kb + BN) <= kv_len;
+        const int ks_grp0 = static_cast<int>(kb / MIN_BLK_K);
+        float ks_c0 = 0.0f, ks_c1 = 0.0f;
+        if (kscale_hoist && ks_full) {
+            ks_c0 = k_scale[b * ks_stride_b + kvh * ks_stride_h + ks_grp0];
+            if (BN > MIN_BLK_K) ks_c1 = k_scale[b * ks_stride_b + kvh * ks_stride_h + ks_grp0 + 1];
+        }
         {
             #pragma unroll
             for (int j0 = 0; j0 < BN; j0 += 4) {
@@ -511,8 +533,14 @@ __global__ __attribute__((amdgpu_waves_per_eu(2))) __launch_bounds__(BM, 1) void
                     // past the end.
                     float sc = 0.0f;
                     if (keep) {
-                        const float ksj = k_scale[b * ks_stride_b + kvh * ks_stride_h +
-                                                 static_cast<int>(n / MIN_BLK_K)];
+                        // (kb + j0 + tj) / MIN_BLK_K, split so the part that is
+                        // the same for every key is computed once. kb is a
+                        // multiple of BN and BN a multiple of MIN_BLK_K, so this
+                        // is the original expression's value exactly.
+                        const int g = (j0 + tj) / MIN_BLK_K;
+                        const float ksj = (kscale_hoist && ks_full)
+                            ? (g == 0 ? ks_c0 : ks_c1)
+                            : k_scale[b * ks_stride_b + kvh * ks_stride_h + ks_grp0 + g];
                         // The product is formed and rounded on its own, then the
                         // bias is added, rather than folding the two into one
                         // fma. A mask with no bias (a Boolean one) or no mask at
@@ -572,16 +600,16 @@ __global__ __attribute__((amdgpu_waves_per_eu(2))) __launch_bounds__(BM, 1) void
                 // keeps row_l at 0 and the write-back below turns that into a
                 // clean zero without a separate validity flag.
                 const __half p16 = __float2half(keep_b[j] ? exp2f(scr[j] - row_m) : 0.0f);
-                p_buf[j * BM + (int)(m % BM)] = p16;
+                p_buf[j * BM + mloc] = p16;
                 ps += __half2float(p16);
             }
             row_l += ps;
         } else {
             #pragma unroll
-            for (int j = 0; j < BN; ++j) p_buf[j * BM + (int)(m % BM)] = __float2half(scr[j]);
+            for (int j = 0; j < BN; ++j) p_buf[j * BM + mloc] = __float2half(scr[j]);
         }
-        alpha_buf[m % BM] = P_al;
-        l_buf[m % BM] = row_l;
+        alpha_buf[mloc] = P_al;
+        l_buf[mloc] = row_l;
 
         __syncthreads();
 

@@ -111,6 +111,9 @@ struct AttnLaunchCtx {
     // 3 staging / 4 writeback. Zero on every real launch; see CK_GFX103X_DIAG in
     // gfx103x_launch_attn.
     int diag;
+    // Whether the QK inner loop may hoist the per-key k_scale load to once per
+    // key tile. See CK_GFX103X_KSCALE in gfx103x_launch_attn.
+    int kscale_hoist;
 };
 
 // Dispatches one kernel instantiation. MASK and MASK_DTYPE are template
@@ -133,7 +136,8 @@ void launch_attn(const AttnLaunchCtx& c) {
         a.q, a.k, a.v, static_cast<ODT*>(a.out), a.q_scale, a.k_scale, a.batch, a.qo_len,
         a.kv_len, a.q_heads, a.kv_heads, qi_b, qi_n, qi_h, a.k_stride_b, a.k_stride_n,
         a.k_stride_h, a.v_stride_b, a.v_stride_n, a.v_stride_h, a.o_stride_b, a.o_stride_n,
-        a.o_stride_h, a.qs_stride_b, a.qs_stride_h, a.ks_stride_b, a.ks_stride_h, c.diag, a.q_fp,
+        a.o_stride_h, a.qs_stride_b, a.qs_stride_h, a.ks_stride_b, a.ks_stride_h, c.diag,
+        c.kscale_hoist, a.q_fp,
         a.q_src_bf16, a.sm_scale_log2e, a.mask, a.mask_sb, a.mask_sh, a.mask_sq, a.mask_sk,
         a.mask_batch, a.mask_heads, a.mask_q_tiles, a.mask_k_tiles, a.mask_k_row_pitch);
 }
@@ -686,6 +690,37 @@ void gfx103x_launch_attn(const AttnArgs& in, hipStream_t stream) {
         diag = atoi(e);
     }
 
+    // CK_GFX103X_KSCALE lifts the per-key k_scale load out of the QK inner loop.
+    // It is on by default: it is bit-identical, and it is faster on the shapes that
+    // carry the time at every resolution. Self-attention is ~80% of the attention an
+    // SDXL or Anima step spends (ab_knob.py, --reps 5, ~40 ms per timing window):
+    //
+    //   Anima  B1 H16 S4096x4096 D128   40.58 ->  40.25 ms   0.992x
+    //   Anima  B1 H16 S6144x6144 D128   90.91 ->  90.13 ms   0.992x
+    //   Anima  B1 H16 S9216x9216 D128  203.63 -> 201.50 ms   0.990x
+    //   SDXL   B1 H10 S4096x4096 D64    13.36 ->  13.21 ms   0.989x
+    //   SDXL   B1 H10 S6144x6144 D64    28.99 ->  28.70 ms   0.990x
+    //   SDXL   B1 H10 S9216x9216 D64    64.54 ->  64.00 ms   0.992x
+    //
+    // The cross-attention shapes (Skv = 77 and 512) do not reproduce a win: they
+    // land at 0.97x~1.02x with spreads of the same size, i.e. neutral. An earlier
+    // pass read them 3% and 13% apart; that was the measurement, not the kernel --
+    // it was giving every shape the same iteration count, so a 0.17 ms shape got a
+    // 1 ms timing window and a 200 ms shape got a 26 s one. ab_knob.py sizes the
+    // window to the shape now. Set this to 0 for the per-key address arithmetic.
+    //
+    // Read per launch rather than baked into a template argument, for the same
+    // reason as the tile knobs: the candidate has to be measurable against the
+    // incumbent in one process, because the first kernel after a rebuild runs on
+    // cold clocks by 1.9x. Only 0 and 1 mean anything; anything else is 0, since a
+    // sweep that silently keeps measuring the default reads like "the knob does
+    // nothing".
+    int kscale_hoist = 1;
+    if (const char* e = getenv("CK_GFX103X_KSCALE")) {
+        const int v = atoi(e);
+        if (v == 0) kscale_hoist = 0;
+    }
+
     ctx.block = dim3(128);
     ctx.grid = dim3(static_cast<unsigned>((in.qo_len + 127) / 128),
                     static_cast<unsigned>(in.q_heads), static_cast<unsigned>(in.batch));
@@ -693,6 +728,7 @@ void gfx103x_launch_attn(const AttnArgs& in, hipStream_t stream) {
     ctx.mask_mode = gmask;
     ctx.mask_dtype = in.mask_dtype;
     ctx.diag = diag;
+    ctx.kscale_hoist = kscale_hoist;
 
     // One launcher covers every combination the old macro set spelled out. The
     // tile shape (head dim, causal, key tile, rows per thread, in-kernel Q
