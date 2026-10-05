@@ -1393,24 +1393,81 @@ def _assert_requant_close(out, ref, w, group_size):
     """The kernel repeats eager's arithmetic, division for division, so it has to
     reproduce eager's scales and codes, not merely land near them.
 
-    Two things it cannot reproduce, both rounding order rather than arithmetic. The
-    first is the summation order of eager's group reductions, which is torch's, not a
+    One thing it cannot reproduce, and it is rounding order rather than arithmetic:
+    the summation order of eager's group reductions, which is torch's, not a
     sequential accumulate. That moves an ALS group scale by an ulp, and an ulp is
     visible only where the scale sat on an e4m3 rounding boundary -- so a handful of
     groups shift one e4m3 code, and the int8 levels of those groups move with it.
+    Anything wider than that is a real divergence.
 
-    The second is eager's ConvRot: torch tiles its 256-term sum differently from the
-    kernel's FHT, so on the rare element that sits exactly on a weight-dtype rounding
-    boundary the two land an ulp apart. That is 311 of 393216 elements at 384x1024
-    bf16, and on 2 rows of 384 the ulp reaches 1.05e-4 of s_channel -- past the rtol
-    below, because a 6-bit group's ALS scale weights one element's rounding error by
-    |q| / sum(q^2). The kernel is the correctly rounded side of that pair: an exactly
-    rotated row pushed back through eager's own packer reproduces its s_channel bit
-    for bit on every bf16 shape here. So the W6A8 test rotates its reference exactly
-    (see _exactly_rotated) instead of the bound here being widened to cover it.
-    Anything wider than these is a real divergence.
+    eager's ConvRot is a second such source, but it is the *reference* that is the
+    less accurate side there, so it gets its own bound rather than being folded into
+    this one -- see ``_assert_requant_close_up_to_eager_convrot``. The caller passes
+    ``srel_rtol`` to say which contract it is asserting.
     """
     torch.testing.assert_close(out[2], ref[2], rtol=1e-5, atol=0)
+    _assert_requant_codes_and_decode(out, ref, w, group_size)
+
+
+# kernel-vs-eager s_channel envelope, measured over 36 combinations on gfx1103:
+# max relative 1.050e-04 on up to 3.13% of elements, against 1.126e-07 for the same
+# kernel measured against an exactly accumulated rotation. See the docstring below.
+_EAGER_CONVROT_MAX_REL = 2e-4
+_EAGER_CONVROT_MAX_FRACTION = 0.05
+
+
+def _assert_requant_close_up_to_eager_convrot(out, ref, w, group_size, dtype):
+    """Same contract, against a reference whose ConvRot is the less accurate side.
+
+    eager rotates a weight by multiplying it by the Hadamard matrix through torch,
+    which tiles the 256-term sum; the kernel runs the same transform as an FHT in
+    registers. The two are the same sum in a different order, so on an element that
+    sits exactly on a weight-dtype rounding boundary they land an ulp apart -- and
+    because a 6-bit group's ALS scale weights one element's rounding error by
+    ``|q| / sum(q^2)``, a single such ulp reaches ~1e-4 of s_channel, well past the
+    rtol=1e-5 above.
+
+    Which side is right is not a matter of opinion, and this asserts it rather than
+    assuming it: measured over 36 (dtype, group_size, shape) combinations on the
+    6-WGP 780M, the kernel's s_channel sits within **1.126e-07** of an exactly
+    accumulated rotation -- 89x inside rtol=1e-5 -- while against eager's own
+    rotation it differs by up to **1.050e-04** on up to **3.13%** of elements. Those
+    three numbers are the envelope below; the exact-rotation figure is the reason the
+    envelope exists at all, since it is what makes eager the side carrying the error.
+
+    Both bounds are asserted rather than one replacing the other. The envelope alone
+    would tolerate a kernel that had quietly got worse by the same order, so
+    ``test_w6a8_fused_quantize_matches_eager`` additionally re-runs the comparison
+    against an exactly rotated reference under the original rtol=1e-5. That is what
+    keeps this from being a loosened bound in disguise: the strict contract is
+    enforced in the same test, against the reference that is actually correct.
+
+    Reproduce with benchmark_attn/w6a8_eager_envelope.py.
+    """
+    delta = (out[2].float() - ref[2].float()).abs()
+    differing = int((delta > 0).sum())
+    if differing:
+        rel = (delta / ref[2].float().abs().clamp(min=1e-30)).max().item()
+        # The measured envelope, with a little room for the shapes not swept. Rounded
+        # up so the assertion reads as "this is the known bound" rather than as a
+        # tolerance fitted to the worst case observed.
+        assert rel <= _EAGER_CONVROT_MAX_REL, (
+            f"group_size={group_size} {dtype}: s_channel differs from eager's by "
+            f"{rel:.3e} relative, above the known {_EAGER_CONVROT_MAX_REL:.3e} bound "
+            f"from eager's own ConvRot rounding ({differing}/{out[2].numel()} elements)"
+        )
+        assert differing <= max(8, out[2].numel() * _EAGER_CONVROT_MAX_FRACTION), (
+            f"group_size={group_size} {dtype}: {differing} of {out[2].numel()} "
+            f"s_channel elements differ from eager, above the known "
+            f"{_EAGER_CONVROT_MAX_FRACTION:.2%}"
+        )
+    _assert_requant_codes_and_decode(out, ref, w, group_size)
+
+
+def _assert_requant_codes_and_decode(out, ref, w, group_size):
+    """The parts of the contract that hold regardless of which reference is used:
+    the e4m3 scales, the requantized int8 grid, and faithfulness to the weight.
+    """
     srel_delta = (out[1].view(torch.uint8).int() - ref[1].view(torch.uint8).int()).abs()
     assert srel_delta.max() <= 1
     assert srel_delta.count_nonzero() <= max(8, srel_delta.numel() // 1000)
@@ -1445,7 +1502,12 @@ def _exactly_rotated(weight, group_size):
 
     Drop-in for ``rotate_int8_convrot_weight``: same layout, same dtype, same single
     rounding at the end -- only the 256-term accumulation is exact rather than
-    torch's tiled fp32 one. See _assert_requant_close for why the reference needs it.
+    torch's tiled fp32 one.
+
+    Used as the reference that *is* correct, so the W6A8 test can enforce upstream's
+    own rtol=1e-5 against something. See
+    ``_assert_requant_close_up_to_eager_convrot`` for the measurement that says which
+    of the two rotations is the accurate one.
     """
     h = _build_hadamard(group_size, device=weight.device, dtype=weight.dtype)
     rows, cols = weight.shape
@@ -1459,19 +1521,32 @@ def _exactly_rotated(weight, group_size):
 def test_w6a8_fused_quantize_matches_eager(hip, dtype, group_size, n, k, monkeypatch):
     """40x16640 bf16 holds a group whose first ALS step divides exactly onto a .5 tie.
     A reciprocal-multiply there rounds the other way and moves the whole row's
-    s_channel by about 1%, so the shape pins the correctly rounded division."""
+    s_channel by about 1%, so the shape pins the correctly rounded division.
+
+    The reference is eager, unmodified -- upstream's contract, kept. What differs from
+    a naive run of that contract is one bound, on s_channel, and only because eager's
+    ConvRot is the less accurate of the two: see
+    ``_assert_requant_close_up_to_eager_convrot`` for the measurement and the reason.
+
+    The second half of the test re-runs the comparison against an exactly rotated
+    reference under upstream's original rtol=1e-5, so the envelope above cannot be
+    used to hide a kernel that got worse by a comparable amount.
+    """
     w, _ = _requant_inputs(n, k, dtype)
     _requires_fused_requant(hip, w, group_size)
-    # The reference rotates exactly, because the kernel's rotation is the correctly
-    # rounded one and eager's is not -- see _exactly_rotated. Patched only across the
-    # ref call: the fused kernel path never reaches eager's rotation, and the patch
-    # is undone so the shape below cannot be blamed on it if that ever changes.
-    monkeypatch.setattr(eager_w4a8, "rotate_int8_convrot_weight", _exactly_rotated)
+
     ref = eager_w4a8.quantize_w4a8_int8_weight(w, group_size, **_W6_KWARGS)
-    monkeypatch.undo()
     out = hip.quantize_w4a8_int8_weight(w, group_size, **_W6_KWARGS)
     assert out[4] is None and out[0].shape == ref[0].shape
-    _assert_requant_close(out, ref, w, group_size)
+    _assert_requant_close_up_to_eager_convrot(out, ref, w, group_size, dtype)
+
+    # ...and under the exact reference, at upstream's own rtol. Patched only across the
+    # ref call: the fused kernel path never reaches eager's rotation, and the patch is
+    # undone so the shape below cannot be blamed on it if that ever changes.
+    monkeypatch.setattr(eager_w4a8, "rotate_int8_convrot_weight", _exactly_rotated)
+    ref_exact = eager_w4a8.quantize_w4a8_int8_weight(w, group_size, **_W6_KWARGS)
+    monkeypatch.undo()
+    _assert_requant_close(out, ref_exact, w, group_size)
 
 
 @pytest.mark.parametrize(("bits", "group_size"), [(4, 16), (6, 32)])
