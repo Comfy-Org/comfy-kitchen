@@ -109,3 +109,26 @@ def test_max_dist(max_dist):
     assert not bool(((face < 0) & hit).any()) and not bool(((face >= 0) & miss).any())
     assert torch.all(dist[miss] == torch.tensor(max_dist)) and torch.equal(closest[miss], points[miss])
     torch.testing.assert_close(dist[hit], full[hit])
+
+
+@pytest.mark.cuda
+@requires_cuda_backend
+def test_negative_max_dist():
+    tris = _random_mesh(200, 7)
+    points = tris.mean(1)  # on the mesh, so any non-negative cutoff would find them
+    dist, closest, face = ck.closest_point_on_mesh(ck.mesh_bvh(tris), points, max_dist=-1.0)
+    assert torch.all(dist == -1.0) and torch.equal(closest, points) and torch.all(face == -1)
+
+
+@pytest.mark.cuda
+@requires_cuda_backend
+def test_rejects_bad_input():
+    tris = _random_mesh(20, 8)
+    for bad in (tris[:2, :2], torch.cat([tris, tris[:, :1]], 1)):
+        with pytest.raises(ValueError, match="triangles"):
+            ck.mesh_bvh(bad)
+    bvh = ck.mesh_bvh(tris)
+    with pytest.raises(ValueError, match="points"):
+        ck.closest_point_on_mesh(bvh, torch.zeros(5, 2, device="cuda"))
+    with pytest.raises(ValueError, match="bvh is on"):
+        ck.closest_point_on_mesh(bvh._replace(triangles=bvh.triangles.cpu()), torch.zeros(5, 3, device="cuda"))

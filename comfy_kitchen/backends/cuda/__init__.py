@@ -2936,6 +2936,7 @@ _DELAUNAY_MAX_TETS = 2**29  # adjacency is stored as (tet << 2 | face) in int32
 def delaunay3d(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """See comfy_kitchen.delaunay3d. Rounds and flip passes loop here because each
     launch is sized by the step before it."""
+    _check_shape("points", points, (None, 3))
     device = points.device
     n = points.shape[0]
     if n == 0:
@@ -3074,6 +3075,7 @@ def _morton_spread21(x: torch.Tensor) -> torch.Tensor:
 
 
 def mesh_bvh(triangles: torch.Tensor) -> MeshBVH:
+    _check_shape("triangles", triangles, (None, 3, 3))
     device = triangles.device
     n = triangles.shape[0]
     if n == 0:
@@ -3100,8 +3102,14 @@ def mesh_bvh(triangles: torch.Tensor) -> MeshBVH:
 def closest_point_on_mesh(
     bvh: MeshBVH, points: torch.Tensor, max_dist: float = float("inf")
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _check_shape("points", points, (None, 3))
+    if bvh.triangles.device != points.device:
+        raise ValueError(f"bvh is on {bvh.triangles.device} but points are on {points.device}")
     n = points.shape[0]
     points = points.contiguous()
+    if max_dist < 0:  # nothing lies within a negative cutoff; the kernel compares squares, so answer here
+        return (torch.full((n,), float(max_dist), dtype=torch.float32, device=points.device), points.clone(),
+                torch.full((n,), -1, dtype=torch.int64, device=points.device))
     dist = torch.empty(n, dtype=torch.float32, device=points.device)
     closest = torch.empty((n, 3), dtype=torch.float32, device=points.device)
     face = torch.empty(n, dtype=torch.int64, device=points.device)

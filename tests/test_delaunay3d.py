@@ -119,3 +119,10 @@ def test_shell_points():
     verts, tets, nbr = ck.delaunay3d(points)
     _check_valid(points, verts, tets, nbr)
     assert _non_delaunay_fraction(verts, tets, nbr) < 2e-2
+
+
+@pytest.mark.cuda
+@requires_cuda_backend
+def test_rejects_bad_input():
+    with pytest.raises(ValueError, match="points"):
+        ck.delaunay3d(torch.rand(10, 2, device="cuda", dtype=torch.float64))
