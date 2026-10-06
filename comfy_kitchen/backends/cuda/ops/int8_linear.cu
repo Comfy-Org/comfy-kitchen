@@ -1500,6 +1500,12 @@ __global__ void __launch_bounds__(kFusedGemvThreads) int8_gemv_convrot_fused_ker
 // clusters (sm_90+).
 constexpr int kClusterQuantThreads = 512;
 constexpr int kClusterQuantGroups = kClusterQuantThreads / 64;
+// the attribute itself is rejected by the pre-sm_90 device passes of a multi-arch build
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define CLUSTER_DIMS(cl)
+#else
+#define CLUSTER_DIMS(cl) __cluster_dims__(cl, 1, 1)
+#endif
 constexpr int kClusterQuantMaxPasses = 4;
 
 // torch's silu, x / (1 + exp(-x)), bit for bit. This file is compiled with
@@ -1570,7 +1576,7 @@ __device__ __forceinline__ float torch_rms_rstd(
 // act_out (optional, [M, K]) receives the activated row as well, in the input dtype, for
 // a consumer that needs act(x) itself alongside the int8 image (only with ACT != none).
 template<typename InputType, int CL, int ACT>
-__global__ void __cluster_dims__(CL, 1, 1) __launch_bounds__(kClusterQuantThreads)
+__global__ void CLUSTER_DIMS(CL) __launch_bounds__(kClusterQuantThreads)
 quantize_int8_convrot_cluster_kernel(
     const InputType* __restrict__ x,
     const InputType* __restrict__ act_weight,
