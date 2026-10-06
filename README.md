@@ -43,6 +43,12 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `convrot_w4a4_linear`       | ✓     | ✓    |        | ✓   | ✓*  |
 | `quantize_convrot_w4a4_weight` | ✓  | ✓    |        | ✓   |     |
 | `dequantize_convrot_w4a4_weight` | ✓ | ✓   |        | ✓   |     |
+| `delaunay3d`                |       | ✓    |        |     |     |
+| `mesh_bvh`                  |       | ✓    |        |     |     |
+| `closest_point_on_mesh`     |       | ✓    |        |     |     |
+| `connected_components`      |       | ✓    |        |     |     |
+| `edge_collapse_checks`      |       | ✓    |        |     |     |
+| `min_cut`                   |       | ✓    |        |     |     |
 
 Each of the eight rope entries also has an in-place form (`apply_rope_`,
 `rms_rope_split_half1_`, ...) with the same backend coverage as the row above.
