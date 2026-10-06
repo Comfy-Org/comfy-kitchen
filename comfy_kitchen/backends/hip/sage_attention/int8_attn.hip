@@ -689,9 +689,15 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
             // tile_scale, which underflows to zero for a fully masked tile.
             tile_m = fmaxf(tile_m, swap_half_wave(tile_m));
             if constexpr (kDense) {
-                const bool valid_tile = (__float_as_uint(tile_m) & 0x7f800000u) != 0x7f800000u;
+                // Fast-math marks the reduced maximum finite even when every
+                // key is masked. Hide its bits from that assumption so the
+                // empty-tile guard survives (notably on gfx11). This compiler
+                // barrier emits no instruction and leaves other paths alone.
+                uint32_t tile_m_bits = __float_as_uint(tile_m);
+                asm volatile("" : "+v"(tile_m_bits));
+                const bool valid_tile = (tile_m_bits & 0x7f800000u) != 0x7f800000u;
                 row_valid[fq] = row_valid[fq] || valid_tile;
-                tile_m = valid_tile ? tile_m : kMaskedScore;
+                tile_m = valid_tile ? __uint_as_float(tile_m_bits) : kMaskedScore;
             }
             // Subtract the maximum before converting natural scores to base two.
             // Fusing score*log2(e)-rounded_max loses cancellation for large biases.

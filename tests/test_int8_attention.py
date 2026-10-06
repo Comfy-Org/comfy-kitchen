@@ -771,6 +771,42 @@ def test_hip_compact_dense_bool_matches_float_bias(head_dim, dtype, scale, mask_
 
 @requires_int8_attention
 @pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("kv_length", [65, 257])
+def test_hip_dense_mask_empty_tiles(head_dim, mask_dtype, kv_length):
+    """Empty tiles must not poison other tiles or fully masked rows (#214)."""
+    torch.manual_seed(214)
+    q, k, v = _qkv(2, 4, 2, 17, kv_length, head_dim, torch.float16)
+    keep = torch.ones(1, 1, 17, kv_length, device="cuda", dtype=torch.bool)
+    keep[..., 0, :] = False
+    keep[..., 1, -1] = False  # The final tile contains only this masked key.
+    keep[..., 2:5, :] = False
+    keep[..., 2, -1] = True  # Empty initial tiles, then a valid final key.
+    keep[..., 3, 0] = True  # A valid first key, then empty tiles.
+    keep[..., 4, 0] = True
+    keep[..., 4, -1] = True  # Empty interior tiles between two valid keys.
+    mask = keep if mask_dtype == torch.bool else torch.where(keep, 0.0, -torch.inf).to(mask_dtype)
+
+    # Zero scale isolates mask/softmax handling from QK quantization error.
+    packed = ck.prequantize_int8_attention(q, k, v, scale=0.0, attn_mask=mask)
+    direct = ck.int8_attention(q, k, v, scale=0.0, attn_mask=mask)
+    snapshot = ck.int8_attention_from_prequantized(packed)
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.float(),
+        k.float().repeat_interleave(2, dim=1),
+        v.float().repeat_interleave(2, dim=1),
+        attn_mask=keep,
+        scale=0.0,
+    )
+    assert torch.isfinite(direct).all()
+    assert torch.equal(direct, snapshot)
+    assert torch.count_nonzero(direct[:, :, 0]) == 0
+    assert _nrmse(direct, reference) < 0.02
+
+
+@requires_int8_attention
+@pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_hip_compact_dense_bool_rejects_additive_mask(dtype):
     hip = sage_attention_module._hip_backend

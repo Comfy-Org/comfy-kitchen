@@ -16,17 +16,18 @@
 namespace {
 
 template <int HEAD_DIM, int CTA_K, MaskMode mask_mode, typename DTypeOut,
-          bool fuse_fp32_probabilities = true, int CTA_Q = 128>
+          bool fuse_fp32_probabilities = true, int CTA_Q = 128,
+          typename Offset = uint32_t>
 void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
                  float *k_scale, float *v_scale, const void *mask,
                  int64_t mask_stride_b, int64_t mask_stride_h,
                  int64_t mask_stride_q, int64_t mask_stride_k,
                  int mask_dtype_code, int qo_len, int kv_len,
-                 int num_qo_heads, int num_kv_groups, int stride_bz_q,
-                 int stride_seq_q, int stride_h_q, int stride_bz_k,
-                 int stride_seq_k, int stride_h_k, int stride_bz_v,
-                 int stride_h_v, int stride_d_v, int stride_bz_o,
-                 int stride_seq_o, int stride_h_o, float sm_scale,
+                 int num_qo_heads, int num_kv_groups, Offset stride_bz_q,
+                 int stride_seq_q, Offset stride_h_q, Offset stride_bz_k,
+                 int stride_seq_k, Offset stride_h_k, Offset stride_bz_v,
+                 Offset stride_h_v, int stride_d_v, Offset stride_bz_o,
+                 int stride_seq_o, Offset stride_h_o, float sm_scale,
                  int batch_size, cudaStream_t stream, const float *mask_tile_bias) {
   // Tiling constants — must match sage_attention.py and dlpack_bindings.cpp.
   // D>=128 otherwise needs too many live FP32 output accumulators per thread.
@@ -44,7 +45,7 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
       CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8,
       QuantGranularity::kPerThread, QuantGranularity::kPerThread, float, false,
       DTypeOut, ComputeUnit::kCudaCore, mask_mode, false, true, false, false,
-      fuse_fp32_probabilities>;
+      fuse_fp32_probabilities, Offset>;
 
   cudaError_t error = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -82,9 +83,9 @@ extern "C" void launch_sage_attn_kernel(
     int64_t mask_stride_k, int mask_dtype_code, int cta_k, int batch_size,
     int qo_len,
     int kv_len, int num_qo_heads, int num_kv_heads, int head_dim,
-    int stride_bz_q, int stride_seq_q, int stride_h_q, int stride_bz_k,
-    int stride_seq_k, int stride_h_k, int stride_bz_v, int stride_h_v,
-    int stride_d_v, int stride_bz_o, int stride_seq_o, int stride_h_o,
+    int64_t stride_bz_q, int stride_seq_q, int64_t stride_h_q, int64_t stride_bz_k,
+    int stride_seq_k, int64_t stride_h_k, int64_t stride_bz_v, int64_t stride_h_v,
+    int stride_d_v, int64_t stride_bz_o, int stride_seq_o, int64_t stride_h_o,
     float sm_scale, int output_dtype_code, cudaStream_t stream,
     const float *mask_tile_bias) {
   if (cta_k != 64 && cta_k != 128) {
@@ -94,7 +95,25 @@ extern "C" void launch_sage_attn_kernel(
     throw std::runtime_error(
         "sage_attn: cta_k 128 requires unmasked head_dim 128/256 or a prepared key mask");
   }
+  // Only the per-head tile iterators require 32-bit offsets. Batch/head bases
+  // can use 64-bit arithmetic, so the head count must not reduce this limit.
+  if (static_cast<int64_t>(qo_len) * stride_seq_q > INT_MAX ||
+      static_cast<int64_t>(kv_len) * stride_seq_k > INT_MAX ||
+      static_cast<int64_t>(head_dim) * stride_d_v > INT_MAX ||
+      static_cast<int64_t>(qo_len) * stride_seq_o > INT_MAX) {
+    throw std::overflow_error(
+        "sage_attn: within-head offsets exceed int32 range; reduce sequence length");
+  }
   int num_kv_groups = num_qo_heads / num_kv_heads;
+  // The existing kernel uses unsigned offsets. Keep it for the full uint32
+  // range. Check the largest index products, not the total tensor size:
+  // pointer additions are already 64-bit, but each index * stride can wrap.
+  // A singleton dimension never uses its stride.
+  const bool wide_offsets =
+      static_cast<int64_t>(batch_size - 1) *
+          std::max({stride_bz_q, stride_bz_k, stride_bz_v, stride_bz_o}) > UINT32_MAX ||
+      static_cast<int64_t>(num_qo_heads - 1) * std::max(stride_h_q, stride_h_o) > UINT32_MAX ||
+      static_cast<int64_t>(num_kv_heads - 1) * std::max(stride_h_k, stride_h_v) > UINT32_MAX;
 
   // Upstream kernel uses non-const pointers; cast away const from the
   // extern "C" boundary (kernel does not modify inputs).
@@ -105,8 +124,8 @@ extern "C" void launch_sage_attn_kernel(
   auto ks_ = const_cast<float *>(static_cast<const float *>(k_scale));
   auto vs_ = const_cast<float *>(static_cast<const float *>(v_scale));
 
-#define LAUNCH_Q(HD, CK, MM, DT, FUSE_FP32, CQ)                                     \
-  launch_impl<HD, CK, MM, DT, FUSE_FP32, CQ>(                                    \
+#define LAUNCH_IMPL_Q(HD, CK, MM, DT, FUSE_FP32, CQ, OFFSET)                                     \
+  launch_impl<HD, CK, MM, DT, FUSE_FP32, CQ, OFFSET>(                                    \
                           q_, k_, v_, static_cast<DT *>(o), qs_, ks_, vs_,     \
                           mask, mask_stride_b, mask_stride_h, mask_stride_q,   \
                           mask_stride_k, mask_dtype_code, qo_len, kv_len,      \
@@ -115,6 +134,16 @@ extern "C" void launch_sage_attn_kernel(
                           stride_seq_k, stride_h_k, stride_bz_v, stride_h_v,   \
                           stride_d_v, stride_bz_o, stride_seq_o, stride_h_o,   \
                           sm_scale, batch_size, stream, mask_tile_bias)
+
+// Keep the ordinary launch's argument packing and call path unchanged.
+#define LAUNCH_Q(HD, CK, MM, DT, FUSE_FP32, CQ)                         \
+  do {                                                               \
+    if (wide_offsets) {                                              \
+      LAUNCH_IMPL_Q(HD, CK, MM, DT, FUSE_FP32, CQ, uint64_t);           \
+    } else {                                                         \
+      LAUNCH_IMPL_Q(HD, CK, MM, DT, FUSE_FP32, CQ, uint32_t);           \
+    }                                                                \
+  } while (false)
 
 #define LAUNCH(HD, CK, MM, DT, FUSE_FP32) \
   LAUNCH_Q(HD, CK, MM, DT, FUSE_FP32, 128)
@@ -258,6 +287,7 @@ extern "C" void launch_sage_attn_kernel(
 
 #undef LAUNCH
 #undef LAUNCH_Q
+#undef LAUNCH_IMPL_Q
 #undef LAUNCH_CTA
 #undef DISPATCH_DTYPE
 #undef DISPATCH_MASK

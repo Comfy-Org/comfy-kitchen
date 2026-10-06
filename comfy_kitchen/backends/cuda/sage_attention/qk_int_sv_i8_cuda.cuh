@@ -70,7 +70,8 @@ template <bool skip_masked_tiles, uint32_t CTA_Q, uint32_t CTA_K,
           MaskMode mask_mode = MaskMode::kNone, bool return_lse = false,
           bool fuse_v_scale = false, bool fuse_v_mean = false,
           bool use_pv_fp16_accu = false,
-          bool fuse_fp32_probabilities = true, bool skip_masked_copies = false>
+          bool fuse_fp32_probabilities = true, bool skip_masked_copies = false,
+          typename Offset = uint32_t>
 __device__ __forceinline__ void qk_int_sv_i8_attn_body(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
@@ -80,12 +81,12 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
     const int64_t mask_stride_h, const int64_t mask_stride_q,
     const int64_t mask_stride_k, const int mask_dtype_code,
     const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
-    const uint32_t stride_bz_q, const uint32_t stride_seq_q,
-    const uint32_t stride_h_q, const uint32_t stride_bz_k,
-    const uint32_t stride_seq_k, const uint32_t stride_h_k,
-    const uint32_t stride_bz_v, const uint32_t stride_h_v,
-    const uint32_t stride_d_v, const uint32_t stride_bz_o,
-    const uint32_t stride_seq_o, const uint32_t stride_h_o, float sm_scale,
+    const Offset stride_bz_q, const uint32_t stride_seq_q,
+    const Offset stride_h_q, const Offset stride_bz_k,
+    const uint32_t stride_seq_k, const Offset stride_h_k,
+    const Offset stride_bz_v, const Offset stride_h_v,
+    const uint32_t stride_d_v, const Offset stride_bz_o,
+    const uint32_t stride_seq_o, const Offset stride_h_o, float sm_scale,
     const float *__restrict__ MaskTileBias) {
   // compile time check
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4,
@@ -1194,7 +1195,7 @@ template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K,
           MaskMode mask_mode = MaskMode::kNone, bool return_lse = false,
           bool fuse_v_scale = false, bool fuse_v_mean = false,
           bool use_pv_fp16_accu = false,
-          bool fuse_fp32_probabilities = true>
+          bool fuse_fp32_probabilities = true, typename Offset = uint32_t>
 __global__ void qk_int_sv_i8_attn_kernel(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
@@ -1204,12 +1205,12 @@ __global__ void qk_int_sv_i8_attn_kernel(
     const int64_t mask_stride_h, const int64_t mask_stride_q,
     const int64_t mask_stride_k, const int mask_dtype_code,
     const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
-    const uint32_t stride_bz_q, const uint32_t stride_seq_q,
-    const uint32_t stride_h_q, const uint32_t stride_bz_k,
-    const uint32_t stride_seq_k, const uint32_t stride_h_k,
-    const uint32_t stride_bz_v, const uint32_t stride_h_v,
-    const uint32_t stride_d_v, const uint32_t stride_bz_o,
-    const uint32_t stride_seq_o, const uint32_t stride_h_o, float sm_scale,
+    const Offset stride_bz_q, const uint32_t stride_seq_q,
+    const Offset stride_h_q, const Offset stride_bz_k,
+    const uint32_t stride_seq_k, const Offset stride_h_k,
+    const Offset stride_bz_v, const Offset stride_h_v,
+    const uint32_t stride_d_v, const Offset stride_bz_o,
+    const uint32_t stride_seq_o, const Offset stride_h_o, float sm_scale,
     const float *__restrict__ MaskTileBias) {
   if constexpr (mask_mode == MaskMode::kPreparedKey && head_dim == 128) {
     const uint32_t tiles = (kv_len + 127) / 128;
@@ -1226,7 +1227,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
       qk_int_sv_i8_attn_body<true, CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK,
         Q_GRAN, K_GRAN, DTypeSVAccum, use_inst_buffer, DTypeOut,
         DenominatorAccumUnit, mask_mode, return_lse, fuse_v_scale, fuse_v_mean,
-        use_pv_fp16_accu, fuse_fp32_probabilities, true>(
+        use_pv_fp16_accu, fuse_fp32_probabilities, true, Offset>(
           Q, K, V, O, Lse, Q_scale, K_scale, V_scale, V_mean, AttnMask,
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,
@@ -1236,7 +1237,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
       qk_int_sv_i8_attn_body<true, CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK,
         Q_GRAN, K_GRAN, DTypeSVAccum, use_inst_buffer, DTypeOut,
         DenominatorAccumUnit, mask_mode, return_lse, fuse_v_scale, fuse_v_mean,
-        use_pv_fp16_accu, fuse_fp32_probabilities>(
+        use_pv_fp16_accu, fuse_fp32_probabilities, false, Offset>(
           Q, K, V, O, Lse, Q_scale, K_scale, V_scale, V_mean, AttnMask,
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,
@@ -1246,7 +1247,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
       qk_int_sv_i8_attn_body<false, CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK,
         Q_GRAN, K_GRAN, DTypeSVAccum, use_inst_buffer, DTypeOut,
         DenominatorAccumUnit, mask_mode, return_lse, fuse_v_scale, fuse_v_mean,
-        use_pv_fp16_accu, fuse_fp32_probabilities>(
+        use_pv_fp16_accu, fuse_fp32_probabilities, false, Offset>(
           Q, K, V, O, Lse, Q_scale, K_scale, V_scale, V_mean, AttnMask,
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,
@@ -1257,7 +1258,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
     qk_int_sv_i8_attn_body<false, CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK,
         Q_GRAN, K_GRAN, DTypeSVAccum, use_inst_buffer, DTypeOut,
         DenominatorAccumUnit, mask_mode, return_lse, fuse_v_scale, fuse_v_mean,
-        use_pv_fp16_accu, fuse_fp32_probabilities>(
+        use_pv_fp16_accu, fuse_fp32_probabilities, false, Offset>(
           Q, K, V, O, Lse, Q_scale, K_scale, V_scale, V_mean, AttnMask,
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,

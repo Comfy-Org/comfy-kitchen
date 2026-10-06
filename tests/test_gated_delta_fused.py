@@ -7,6 +7,7 @@ import torch
 from torch.nn import functional
 
 import comfy_kitchen as ck
+import comfy_kitchen.gated_delta as gated_delta_module
 from tests.conftest import rel_err
 
 B, HV, HK, DK, DV, HD, KS = 2, 4, 2, 128, 128, 256, 4
@@ -45,6 +46,31 @@ def _decode_ref(conv_out, x, w_a, w_b, dt_bias, g_decay, state, z, norm_w, seq):
     out = torch.stack(outs, dim=1).to(x.dtype)
     out = functional.rms_norm(out.reshape(-1, DV), (DV,), norm_w, EPS) * functional.silu(z.reshape(-1, DV))
     return out.reshape(B, seq, HV, DV), (torch.stack(snaps) if snaps else None)
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [
+        ((7, 5), True),
+        ((7, 0), False),
+        ((8, 0), True),
+        ((8, 7), True),
+        ((11, 0), True),
+    ],
+)
+def test_gated_delta_capability_dispatch(monkeypatch, capability, expected):
+    if getattr(torch.version, "hip", None):
+        pytest.skip("compute capability does not gate the HIP path")
+    ext = type("C", (), {"gated_delta_decode_fused": object(), "deltanet_conv_step": object()})()
+    props = type("P", (), {"major": capability[0], "shared_memory_per_block_optin": 96 * 1024})()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: capability)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _index: props)
+    monkeypatch.setattr(gated_delta_module._cuda_backend, "_EXT_AVAILABLE", True)
+    monkeypatch.setattr(gated_delta_module._cuda_backend, "_C", ext)
+    gated_delta_module._device_optin.clear()
+    assert gated_delta_module.is_available() is expected
 
 
 @pytest.mark.skipif(not ck.gated_delta_decode_is_available(), reason="fused DeltaNet decode kernels unavailable")
