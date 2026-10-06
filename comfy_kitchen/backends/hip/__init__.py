@@ -2637,6 +2637,26 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 return ValidationResult.fail("q", "grid dims exceed HIP limits")
         return ValidationResult.ok()
 
+    def _fp16_linear_call_rule(kwargs):
+        # bf16 for x/weight is the gfx1103 iGPU's own bf16 GEMM path. It cannot be
+        # decided in the envelope below: _build_constraints runs once, at
+        # registration, so the device current *then* is not necessarily the device
+        # these tensors live on. A process-wide _is_small_igpu() therefore rejects
+        # valid gfx1103 bf16 calls (losing the fast path outright) or admits dGPU bf16
+        # ones (a wasted dispatch, since fp16_linear declines those and falls back to
+        # torch). Decide per call, off x's own device, which is what fp16_linear's own
+        # check already does -- so a call refused here still has somewhere correct to
+        # go rather than being admitted to a fallback.
+        #
+        # weight is not tested separately: the kernel path requires
+        # weight.dtype == x.dtype, so x alone decides the pair.
+        x = kwargs.get("x")
+        if (isinstance(x, torch.Tensor) and x.dtype == torch.bfloat16
+                and not _is_small_igpu(x.device)):
+            return ValidationResult.fail(
+                "x", f"bf16 needs the gfx1103 iGPU; {x.device} would fall back to torch")
+        return ValidationResult.ok()
+
     constraints = {
         "sol_attn": FunctionConstraints(
             params={
@@ -2860,28 +2880,18 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ),
         "fp16_linear": FunctionConstraints(
             params={
-                # bf16 only on the gfx1103 iGPU, whose fp16_linear runs a bf16
-                # GEMM path; dGPUs declare the upstream fp16-only envelope so
-                # registry dispatch never routes bf16 here.
-                "x": ParamConstraint(
-                    dtypes=frozenset(
-                        {torch.float16, torch.bfloat16} if _is_small_igpu()
-                        else {torch.float16}
-                    ),
-                    shape_rules=(MinDims(2),),
-                ),
-                "weight": ParamConstraint(
-                    dtypes=(
-                        frozenset({torch.float16, torch.bfloat16}) if _is_small_igpu()
-                        else frozenset({torch.float16})
-                    ),
-                    shape_rules=(ExactDims(2),)
-                ),
+                # bf16 is admitted in the envelope for x and weight only, and
+                # _fp16_linear_call_rule decides it per call from x's device. The
+                # auxiliary operands stay FP16 because the launcher requires it and
+                # the fast path enforces it.
+                "x": ParamConstraint(dtypes=half_floats, shape_rules=(MinDims(2),)),
+                "weight": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(2),)),
                 "bias": ParamConstraint(dtypes=frozenset({torch.float16})),
                 "residual": ParamConstraint(dtypes=frozenset({torch.float16})),
                 "residual_scale": ParamConstraint(dtypes=frozenset({torch.float16})),
             },
             default_devices=dev,
+            call_rules=(_fp16_linear_call_rule,),
         ),
         "fp16_conv3d": FunctionConstraints(
             params={
