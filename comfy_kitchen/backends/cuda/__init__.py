@@ -3127,8 +3127,11 @@ def _check_shape(name: str, tensor: torch.Tensor, shape: tuple) -> None:
 
 
 def _check_indices(name: str, index: torch.Tensor, n: int, lowest: int = 0) -> None:
-    """The kernels index raw buffers with these values, so out-of-range ones would read or write past them."""
-    if index.numel() == 0:
+    """The kernels index raw buffers with these values, so out-of-range ones would read or write past them.
+
+    Skipped while a CUDA graph is being captured: reading the bounds back would break the capture, and a replay
+    cannot check them anyway, so the caller who captures owns the indices."""
+    if index.numel() == 0 or torch.cuda.is_current_stream_capturing():
         return
     lo, hi = torch.stack(torch.aminmax(index)).tolist()
     if lo < lowest or hi >= n:
