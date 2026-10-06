@@ -144,3 +144,22 @@ def test_deterministic():
     for _ in range(5):
         for a, b in zip(first, ck.edge_collapse_checks(*args), strict=True):
             assert torch.equal(a, b)
+
+
+@pytest.mark.cuda
+@requires_cuda_backend
+def test_rejects_bad_input():
+    vertices, faces = _grid(4, torch.Generator().manual_seed(0))
+    vertices, faces = vertices.cuda(), faces.cuda()
+    edges = _edges(faces).cuda()
+    positions = vertices[edges].mean(1)
+    with pytest.raises(ValueError, match="positions"):
+        ck.edge_collapse_checks(vertices, faces, edges, positions[:-1])
+    with pytest.raises(ValueError, match="vertices"):
+        ck.edge_collapse_checks(vertices[:, :2], faces, edges, positions)
+    with pytest.raises(ValueError, match="faces must lie"):
+        ck.edge_collapse_checks(vertices, torch.cat([faces, faces[:1] + vertices.shape[0]]), edges, positions)
+    bad = edges.clone()
+    bad[0, 1] = vertices.shape[0]
+    with pytest.raises(ValueError, match="edges must lie"):
+        ck.edge_collapse_checks(vertices, faces, bad, positions)

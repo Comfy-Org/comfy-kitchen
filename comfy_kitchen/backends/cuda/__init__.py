@@ -3112,7 +3112,33 @@ def closest_point_on_mesh(
     return dist, closest, face
 
 
+def _check_count(name: str, value) -> int:
+    """A size the kernels index with: a non-negative integer."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _check_shape(name: str, tensor: torch.Tensor, shape: tuple) -> None:
+    """`shape` entries of None accept any size."""
+    if tensor.dim() != len(shape) or any(s is not None and t != s for t, s in zip(tensor.shape, shape, strict=True)):
+        want = ", ".join("*" if s is None else str(s) for s in shape)
+        raise ValueError(f"{name} must have shape ({want}), got {tuple(tensor.shape)}")
+
+
+def _check_indices(name: str, index: torch.Tensor, n: int, lowest: int = 0) -> None:
+    """The kernels index raw buffers with these values, so out-of-range ones would read or write past them."""
+    if index.numel() == 0:
+        return
+    lo, hi = torch.stack(torch.aminmax(index)).tolist()
+    if lo < lowest or hi >= n:
+        raise ValueError(f"{name} must lie in [{lowest}, {n}), got values in [{lo}, {hi}]")
+
+
 def connected_components(edges: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    num_nodes = _check_count("num_nodes", num_nodes)
+    _check_shape("edges", edges, (None, 2))
+    _check_indices("edges", edges, num_nodes)
     edges = edges.contiguous()
     parent = torch.arange(num_nodes, dtype=torch.int32, device=edges.device)
     labels = torch.empty(num_nodes, dtype=torch.int64, device=edges.device)
@@ -3128,6 +3154,12 @@ def edge_collapse_checks(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     device = vertices.device
     n_verts, n_edges = vertices.shape[0], edges.shape[0]
+    _check_shape("vertices", vertices, (None, 3))
+    _check_shape("faces", faces, (None, 3))
+    _check_shape("edges", edges, (None, 2))
+    _check_shape("positions", positions, (n_edges, 3))
+    _check_indices("faces", faces, n_verts)
+    _check_indices("edges", edges, n_verts)
     faces = faces.to(torch.int32).contiguous()
     corners = faces.reshape(-1)
     # vertex-to-face CSR, filled by the kernel: sorting the corners would take several times their size
@@ -3151,6 +3183,12 @@ def min_cut(nbr: torch.Tensor, cap: torch.Tensor, s_cap: torch.Tensor, t_cap: to
             relabel_every: int = 64) -> torch.Tensor:
     device = nbr.device
     n, k = nbr.shape
+    if k > 128:
+        raise ValueError(f"nbr can have at most 128 slots per node (reverse slots are int8), got {k}")
+    _check_shape("cap", cap, (n, k))
+    _check_shape("s_cap", s_cap, (n,))
+    _check_shape("t_cap", t_cap, (n,))
+    _check_indices("nbr", nbr, n, lowest=-1)
     if n == 0:
         return torch.empty(0, dtype=torch.bool, device=device)
     nbr = nbr.to(torch.int32).contiguous()
@@ -3168,7 +3206,7 @@ def min_cut(nbr: torch.Tensor, cap: torch.Tensor, s_cap: torch.Tensor, t_cap: to
     hn = torch.empty(n, dtype=torch.int32, device=device)
     bfs_lists = torch.empty((2, n), dtype=torch.int32, device=device)
     bfs_counts = torch.zeros(2, dtype=torch.int32, device=device)
-    tol = 1e-12 * float(cap.max())
+    tol = 1e-12 * float(cap.max()) if cap.numel() else 0.0  # a graph may have terminal edges only
     big = n + 2
     stream = torch.cuda.current_stream(device).cuda_stream
     w = _wrap_for_dlpack

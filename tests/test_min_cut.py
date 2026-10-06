@@ -140,3 +140,33 @@ def test_int64_neighbours_and_repeatable():
     assert torch.equal(first, _reference(nbr, cap, s_cap, t_cap))
     for _ in range(3):
         assert torch.equal(ck.min_cut(nbr, cap, s_cap, t_cap), first)
+
+
+@pytest.mark.cuda
+@requires_cuda_backend
+def test_no_neighbour_slots():
+    # terminal edges only: a node stays on the source side unless its sink capacity is larger
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    s_cap = torch.rand(1000, device="cuda", generator=gen)
+    t_cap = torch.rand(1000, device="cuda", generator=gen)
+    out = ck.min_cut(torch.empty(1000, 0, dtype=torch.int32, device="cuda"), torch.empty(1000, 0, device="cuda"), s_cap, t_cap)
+    assert torch.equal(out, s_cap >= t_cap)
+
+
+@pytest.mark.cuda
+@requires_cuda_backend
+def test_rejects_bad_input():
+    gen = torch.Generator(device="cuda").manual_seed(9)
+    nbr, cap = _grid_graph(4, 4, 4, "cuda", gen)
+    n = nbr.shape[0]
+    zero = torch.zeros(n, device="cuda")
+    with pytest.raises(ValueError, match="128"):
+        ck.min_cut(torch.full((n, 129), -1, dtype=torch.int32, device="cuda"), torch.zeros(n, 129, device="cuda"), zero, zero)
+    with pytest.raises(ValueError, match="cap"):
+        ck.min_cut(nbr, cap[:, :5], zero, zero)
+    with pytest.raises(ValueError, match="t_cap"):
+        ck.min_cut(nbr, cap, zero, zero[:-1])
+    bad = nbr.clone()
+    bad[0, 0] = n
+    with pytest.raises(ValueError, match="nbr must lie"):
+        ck.min_cut(bad, cap, zero, zero)

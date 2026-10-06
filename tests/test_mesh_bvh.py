@@ -71,7 +71,8 @@ def test_large_triangles():
             torch.tensor([[[0, 0, 1], [1, 0, 1], [0, 1, 1]]], device="cuda"),
         ]
     )
-    points = torch.rand(3000, 3, device="cuda") * torch.tensor([1.0, 1.0, 1.2], device="cuda")
+    gen = torch.Generator(device="cuda").manual_seed(2)
+    points = torch.rand(3000, 3, device="cuda", generator=gen) * torch.tensor([1.0, 1.0, 1.2], device="cuda")
     dist, _, _ = ck.closest_point_on_mesh(ck.mesh_bvh(tris.float()), points)
     torch.testing.assert_close(dist, _brute_force(points, tris.float()), rtol=1e-5, atol=1e-6)
 
@@ -97,10 +98,14 @@ def test_degenerate_triangles():
 @pytest.mark.parametrize("max_dist", [0.05, 0.0517, 0.0731, 0.1234])
 def test_max_dist(max_dist):
     tris = _random_mesh(500, 5)
-    points = torch.rand(4000, 3, device="cuda") * 3 - 1
+    gen = torch.Generator(device="cuda").manual_seed(6)
+    points = torch.rand(4000, 3, device="cuda", generator=gen) * 3 - 1
     full, _, _ = ck.closest_point_on_mesh(ck.mesh_bvh(tris), points)
     dist, closest, face = ck.closest_point_on_mesh(ck.mesh_bvh(tris), points, max_dist=max_dist)
-    miss = full >= max_dist
-    assert torch.equal(face < 0, miss)
+    # the kernel compares squared distances, `full` is a rounded square root: skip points within rounding of the limit
+    clear = (full - max_dist).abs() > 1e-5
+    miss = (full >= max_dist) & clear
+    hit = (full < max_dist) & clear
+    assert not bool(((face < 0) & hit).any()) and not bool(((face >= 0) & miss).any())
     assert torch.all(dist[miss] == torch.tensor(max_dist)) and torch.equal(closest[miss], points[miss])
-    torch.testing.assert_close(dist[~miss], full[~miss])
+    torch.testing.assert_close(dist[hit], full[hit])

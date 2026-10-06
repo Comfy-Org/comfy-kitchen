@@ -36,7 +36,7 @@ def test_random_graph(n, n_edges, dtype):
 def test_long_chain():
     # one shuffled path through all nodes: deep trees, many racing hooks
     n = 200000
-    order = torch.randperm(n, device="cuda")
+    order = torch.randperm(n, device="cuda", generator=torch.Generator(device="cuda").manual_seed(0))
     edges = torch.stack([order[:-1], order[1:]], 1)
     assert torch.equal(
         ck.connected_components(edges, n), torch.zeros(n, dtype=torch.int64, device="cuda")
@@ -55,3 +55,19 @@ def test_star_and_isolated():
     expected[::2] = 0  # node 0 is a star leaf
     expected[hub] = 0
     assert torch.equal(labels, expected)
+
+
+@pytest.mark.cuda
+@requires_cuda_backend
+def test_rejects_bad_input():
+    edges = torch.tensor([[0, 1], [1, 2]], device="cuda")
+    for n in (None, -1, 2.5):
+        with pytest.raises(ValueError, match="num_nodes"):
+            ck.connected_components(edges, n)
+    with pytest.raises(ValueError, match="edges must lie"):
+        ck.connected_components(edges, 2)
+    with pytest.raises(ValueError, match="edges must lie"):
+        ck.connected_components(torch.tensor([[0, -1]], device="cuda"), 3)
+    with pytest.raises(ValueError, match="shape"):
+        ck.connected_components(torch.zeros(4, 3, dtype=torch.long, device="cuda"), 3)
+    assert ck.connected_components(torch.empty(0, 2, dtype=torch.long, device="cuda"), 0).shape == (0,)
