@@ -45,6 +45,35 @@ constexpr float kMaskedScore = -50000.0f;
 // gap further.
 constexpr float kMaskedScoreBase2 = kMaskedScore * kLog2e;
 
+// The bias a prepared mask hands back for a dropped key, and why it is not
+// kMaskedScoreBase2: the score loop *adds* the bias to the caller's Q*K, so a
+// sentinel only works if no score can climb back out of it. -50000 cannot manage
+// that -- a Q*K of a few hundred already exceeds it -- which is why the dropped-key
+// fix had to carry per-element validity bits beside the score and select on them.
+//
+// A sentinel large enough to be unrecoverable makes every one of those selects
+// unnecessary, because each consumer of the score already does the right thing with
+// an unrecoverable value:
+//   * the reduced maximum cannot be raised by a key that scores -1e30, so it cannot
+//     promote a fully dropped tile;
+//   * exp2(-1e30 - tile_m + kProbU8Offset) is exactly 0, so a dropped key
+//     contributes nothing to the PV product nor to tile_sum;
+//   * tile validity is then a single compare of the reduced maximum against it.
+//
+// Measured on gfx1103 over a sweep of scores from 1e-3 to 1e30: fmaf(score, 1,
+// kDroppedBias) is exactly kDroppedBias for every score below 1e23 (the sweep's only
+// exceptions were the 1e30 values injected on purpose), and the hardware exp2 returns
+// exactly 0.0f. Real scores are bounded by K * 127 * 127 * sm_scale, about 1e7 at
+// K=4096, so the margin is over fifteen orders of magnitude. 1e30 is also far enough
+// below FLT_MAX (3.4e38) that the fma cannot overflow to -inf, which
+// -ffinite-math-only would then be free to mishandle.
+constexpr float kDroppedBias = -1.0e30f;
+
+// Half of the above: the test that asks "did this tile keep anything". A real score is
+// nowhere near it, and the factor of two keeps the compare clear of kDroppedBias
+// itself without needing a strict inequality on the exact sentinel.
+constexpr float kDroppedBiasTest = kDroppedBias * 0.5f;
+
 constexpr float kInt8Max = 127.0f;
 
 template <typename T>
