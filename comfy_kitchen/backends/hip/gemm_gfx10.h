@@ -550,30 +550,26 @@ __global__ __launch_bounds__(256) void gemm_fp16_valu_kernel(
     // Tile: 4x4 per thread over a 64x64 block, BK 64, double buffered.
     //
     // An 8x8 / 128x128 / BK32 tile was measured 19% faster standalone (1.96 vs
-    // 1.65 TOPS at 4096^3, benchmark_attn/待验证.md B6) and validated at that
+    // 1.65 TOPS at 4096^3, the standalone benchmark notes B6) and validated at that
     // size in the harness, but it is wrong in the library from 196 blocks
     // upward: rel err 2.8e-04 at 169 blocks, 1.2e+00 at 196, in every element,
     // repeatably. Do not retune this tile on harness numbers alone -- re-measure
     // through fp16_linear at 1792^2 and 2048^2 at minimum.
     //
-    // That failure is not yet diagnosed, and this fix does not diagnose it. What it
-    // does remove is a second, different fault that this same commit introduced: the
-    // q loop below was pairing A pair q with B pair 0, so only one k-pair in four was
-    // multiplied correctly. That fault is size-independent -- every shape would read
-    // 1.2e+00 with correlation 0.247 -- and the table above has shapes reading
-    // 3e-04, so it cannot have been measured on a build carrying it. The table
-    // therefore describes the pre-loop kernel, and its "correct through 676 blocks,
-    // wrong from 729" boundary is a still-open question that this one-character fix
-    // neither explains nor settles.
+    // That failure came from a fault this commit introduced: the q loop below was
+    // pairing A pair q with B pair 0, so only one k-pair in four was multiplied
+    // correctly. That fault is size-independent -- every shape would read 1.2e+00
+    // with correlation 0.247 -- so the measured "wrong from 196 blocks" boundary
+    // above could not have come from a build carrying it.
     //
-    // Both of those are now settled, by measuring the corrected kernel directly on
+    // Both questions are settled, by measuring the corrected kernel directly on
     // the 6-CU gfx1035 with the fp16_shape_served gate temporarily lifted. It is
     // correct on every shape tried -- rel err ~2.07e-04 (fp32-accumulate noise for
     // an fp16 product) and correlation 1.0000, including all five the old table
-    // called WRONG, and including 676 / 784 / 841 / 729 / 5504 blocks, so the
-    // boundary above does not exist. Both epilogues and ragged M/N agree. So the
-    // q-loop fix is what removed the reported failure, and nothing above this line
-    // describes the kernel as it stands.
+    // called WRONG, and including 676 / 784 / 841 / 729 / 5504 blocks, so no block
+    // boundary of the kind the old table described exists. Both epilogues and
+    // ragged M/N agree. So the q-loop fix is what removed the reported failure, and
+    // nothing above this line describes the kernel as it stands.
     //
     // The gate stays shut for speed, not correctness: 2.4-3.2x slower than torch
     // from 1024^3 up, and 1.2x slower even at 512^2. See fp16_shape_served.

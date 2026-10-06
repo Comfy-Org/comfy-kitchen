@@ -808,9 +808,17 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                 // finiteness test on it is true for a fully dropped tile too. The
                 // old test needed an asm barrier to survive -ffinite-math-only at
                 // all; this one is integers and needs none.
+                // The inversion is masked to the low byte on purpose: dropped[] holds
+                // one bit per accumulator element (8 of them) and nothing ever writes
+                // bits 8-31, so inverting the full word would leave those bits set and
+                // make kept nonzero for every lane. That would make this test constant
+                // true, so a fully dropped tile would keep its tile_m instead of taking
+                // kMaskedScore and would mark its row valid, skipping the zero-output
+                // path at the end -- and with kBiasPV the bias-cancellation residue
+                // would leak into a row that must be exactly zero.
                 uint32_t kept = 0;
 #pragma unroll
-                for (int fk = 0; fk < KT; ++fk) kept |= dropped[fk] ^ 0xffffffffu;
+                for (int fk = 0; fk < KT; ++fk) kept |= dropped[fk] ^ 0xffu;
                 // The half-wave exchange is evaluated before the test rather than
                 // inside it: swap_half_wave_b32 carries no exec-mask guard, so a
                 // partner lane that a short-circuit left inactive reads this lane's

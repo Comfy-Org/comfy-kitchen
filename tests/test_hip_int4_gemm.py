@@ -17,7 +17,7 @@ import torch
 
 pytest.importorskip("comfy_kitchen")
 
-from comfy_kitchen.backends import hip as hip_backend  # noqa: E402
+from comfy_kitchen.backends import hip as hip_backend
 
 _C = getattr(hip_backend, "_C", None)
 
@@ -93,7 +93,7 @@ def test_int4_rejects_k_that_is_not_a_multiple_of_32():
     sa = torch.ones(8, device=dev, dtype=torch.float32)
     sw = torch.ones(8, device=dev, dtype=torch.float32)
     out = torch.empty((8, 8), device=dev, dtype=torch.float16)
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match=r"K must be a multiple of 32, got 16"):
         _C.int4_gemm(hip_backend._dl(x4), hip_backend._dl(x4), hip_backend._dl(out),
                      hip_backend._dl(sa), hip_backend._dl(sw), 1, None,
                      8, 8, 16, hip_backend.DTYPE_TO_CODE[torch.float16],

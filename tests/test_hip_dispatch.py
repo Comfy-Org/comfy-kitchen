@@ -182,10 +182,15 @@ def test_hip_drops_gemms_without_matrix_cores():
     # ...and nothing may be added to the set without a GEMM that traps on RDNA2.
     # The only gfx10 fallbacks in the kernel tree are in gemm_int8.hip and
     # gemm_fp16.hip; if one of these names gains a path there, remove it here.
-    assert hip_backend._WMMA_ONLY_OPS == frozenset({
+    # Kept in the `literal == actual` order that ruff's SIM300 asks for. The
+    # inline form reads worse and reports no better, and a per-line noqa for it
+    # would be silenced by a future refactor anyway, so the suggestion is taken
+    # once here instead of carrying a suppression.
+    expected_wmma_only = frozenset({
         "fp16_conv3d", "fp16_conv3d_out", "na3d", "sol_attn",
         "scaled_mm_svdquant_w4a4",
     })
+    assert expected_wmma_only == hip_backend._WMMA_ONLY_OPS
     # The fused W4A8 requantize is elementwise too: it packs weights and never
     # reaches a matrix core, so RDNA2 must keep it.
     assert "quantize_w4a8_int8_weight" in without

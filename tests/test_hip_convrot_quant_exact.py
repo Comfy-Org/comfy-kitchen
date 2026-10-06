@@ -277,11 +277,8 @@ def test_convrot_quant_int4_agrees_at_every_k_the_kernel_accepts():
     So the invariant is: at every K the launcher accepts, the two kernels agree bit
     for bit; past that, both raise the same error naming K.
     """
-    from comfy_kitchen.backends.hip import DTYPE_TO_CODE
-
     m = 64
     dtype = torch.bfloat16
-    code = DTYPE_TO_CODE[dtype]
     accepted = 0
     for k in range(256, 65536, 256):
         x = torch.randn((m, k), device=DEV, dtype=dtype) * 0.7

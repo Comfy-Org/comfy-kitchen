@@ -66,7 +66,7 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
         // min(tiles, wgps * blocks_per_cu) gives the hardware's own block
         // scheduler no tiles to overlap: consecutive tiles run back to back on
         // one CU with a barrier between them. Letting the scheduler stream the
-        // grid is both simpler and faster. See benchmark_attn/待验证.md B5.
+        // grid is both simpler and faster. See the standalone benchmark notes B5.
         // Shared with gemm_int8_valu_kernel so the grid cannot drift from the
         // tile the kernel assumes. See kInt8BM in gemm_gfx10.h.
         constexpr int BM = kInt8BM;

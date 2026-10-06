@@ -18,24 +18,28 @@ logger = logging.getLogger("comfy_kitchen.dispatch")
 
 
 def _dispatch_log_enabled() -> bool:
-    """这个模块的日志在 eager 下保持原样，在 torch.compile 追踪期必须闭嘴。
+    """Keep this module's logging unchanged under eager, but silent while
+    torch.compile is tracing.
 
-    `logger.debug` 是 dynamo 明确不支持的调用（"logging.Logger method not
-    supported for non-export cases"），一次 graph break 会把追踪切成多段；之后
-    `has_torch_function` 里的 `lazy_isinstance` 强制 realize 已经带符号的中间张量，
-    于是 `meta_tensor -> _produce_dyn_sizes_from_int_tuple` 撞上"size 必须是纯
-    int"的断言。本机上实测（gfx1103 / torch 2.13.0+rocm10.0.0）：
+    `logger.debug` is a call dynamo explicitly rejects ("logging.Logger method not
+    supported for non-export cases"). One graph break splits the trace into
+    segments, and afterwards the `lazy_isinstance` inside `has_torch_function`
+    forces a realize of the already-symbolic intermediates, so
+    `meta_tensor -> _produce_dyn_sizes_from_int_tuple` trips the "size must be a
+    plain int" assertion. Measured here (gfx1103 / torch 2.13.0+rocm10.0.0):
 
-        现状                    break=10 frames=37 -> torch.compile 直接抛
-        这里加守卫              break= 0 frames= 2 -> 通过，三次结果逐位相同
+        as-is             break=10 frames=37 -> torch.compile raises outright
+        with this guard   break= 0 frames= 2 -> passes, three runs bit-identical
 
-    为什么不用 `logger.isEnabledFor(logging.DEBUG)`：它自己也是 Logger 方法，
-    dynamo 一视同仁，实测 break 仍是 10。`torch.compiler.is_compiling()` 是
-    dynamo 专门常量折叠的，所以只有它能把调用从追踪图里去掉。
+    Why not `logger.isEnabledFor(logging.DEBUG)`: it is itself a Logger method,
+    and dynamo treats it no differently -- break stayed at 10 in measurement.
+    `torch.compiler.is_compiling()` is the one call dynamo constant-folds, so it
+    is the only thing that removes the call from the traced graph.
 
-    代价（实测 ns/call，min of 7 x 3000）：本函数 133.7 ns，而
-    `get_capable_backend` 本身 1019.5 ns，即约 +11% 的派发开销；换来的是量化
-    模型能被 torch.compile 编译。eager 下日志行为完全不变。
+    Cost (measured ns/call, min of 7 x 3000): 133.7 ns for this function against
+    1019.5 ns for `get_capable_backend` itself, i.e. about +11% dispatch
+    overhead; in exchange quantized models become compilable. Logging behaviour
+    under eager is completely unchanged.
     """
     return not torch.compiler.is_compiling()
 
