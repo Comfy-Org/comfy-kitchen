@@ -885,12 +885,18 @@ def int8_linear(
         bias = _bias_operand(bias, n, x.device)
 
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
-    _C.int8_gemm(
-        _dl(q), _dl(weight), _dl(out),
-        _dl(x_scale), _dl(weight_scale), 0 if weight_scale.numel() == 1 else 1,
-        None if bias is None else _dl(bias),
-        m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
-    )
+    # Pin the current device: launch_int8_gemm_kernel picks its tile family from
+    # comfy_is_gfx10(), which reads the *current* device, while _stream(x) names a
+    # stream on x.device. On a box holding both an RDNA2 iGPU and a matrix-core
+    # dGPU those can be different devices, and the kernel then runs a v_dot4 tile
+    # that traps on the operand's part (or the WMMA tile on the iGPU).
+    with torch.cuda.device(x.device):
+        _C.int8_gemm(
+            _dl(q), _dl(weight), _dl(out),
+            _dl(x_scale), _dl(weight_scale), 0 if weight_scale.numel() == 1 else 1,
+            None if bias is None else _dl(bias),
+            m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
+        )
     # Unlike CUDA, the residual is not folded into the epilogue: the per-element
     # residual reads there cost more than a separate addcmul at the output widths
     # pre-norm blocks apply it to.
@@ -1058,25 +1064,29 @@ def _w4a8_int8_linear_chunked(
     # An empty weight has no chunk to size; the loop then has nothing to walk.
     chunk_cols = max(1, _w4a8_chunk_cols(m, n, k, device))
     workspace = torch.empty((chunk_cols, k), dtype=torch.int8, device=device)
-    _C.w4a8_int8_gemm_chunked(
-        _dl(xq),
-        _dl(qdata_arg),
-        _dl(s_rel_arg),
-        scale_code,
-        None if codebook_arg is None else _dl(codebook_arg),
-        _dl(s_channel_arg),
-        _dl(xs_arg),
-        None if bias_arg is None else _dl(bias_arg),
-        _dl(workspace),
-        _dl(out),
-        m,
-        n,
-        k,
-        group_size,
-        chunk_cols,
-        DTYPE_TO_CODE[out_dtype],
-        _stream(x),
-    )
+    # Same reason as int8_linear's int8_gemm: the chunked path reaches
+    # launch_int8_gemm_kernel, whose gfx10 test reads the current device while the
+    # stream is the one for x.device.
+    with torch.cuda.device(x.device):
+        _C.w4a8_int8_gemm_chunked(
+            _dl(xq),
+            _dl(qdata_arg),
+            _dl(s_rel_arg),
+            scale_code,
+            None if codebook_arg is None else _dl(codebook_arg),
+            _dl(s_channel_arg),
+            _dl(xs_arg),
+            None if bias is None else _dl(bias_arg),
+            _dl(workspace),
+            _dl(out),
+            m,
+            n,
+            k,
+            group_size,
+            chunk_cols,
+            DTYPE_TO_CODE[out_dtype],
+            _stream(x),
+        )
     return out.reshape(*orig_shape[:-1], n)
 
 
@@ -1473,12 +1483,15 @@ def convrot_w4a4_linear(
     # Deciding here instead would be wrong on a box with both an iGPU and a dGPU,
     # because has_wmma() is the intersection over every visible device and so
     # reports false for the whole process -- which would send the dGPU's calls to
-    # an instruction it does not have.
-    _C.convrot_w4a4_gemm(
-        _dl(qact), _dl(qw), _dl(out),
-        _dl(x_scale), _dl(wscales), None if bias is None else _dl(bias),
-        m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
-    )
+    # an instruction it does not have. That makes "the launching device" load
+    # bearing, so pin it: comfy_is_gfx10() inside the launcher reads the current
+    # device, while _stream(x) names the stream for x.device.
+    with torch.cuda.device(x.device):
+        _C.convrot_w4a4_gemm(
+            _dl(qact), _dl(qw), _dl(out),
+            _dl(x_scale), _dl(wscales), None if bias is None else _dl(bias),
+            m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
+        )
     return out.reshape(*orig_shape[:-1], n)
 
 
@@ -3277,6 +3290,37 @@ def _sage_dense_mask_buffer(attn_mask: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _sage_use_direct(
+    q: torch.Tensor, k: torch.Tensor, attn_mask: torch.Tensor | None
+) -> bool:
+    """Whether sage_int8_sdpa takes the iGPU direct-V branch.
+
+    Mirrors sage_sdpa's use_direct in dlpack_bindings.cpp exactly; keep the two in
+    step. The C++ decides which kernel runs, so the Python gate must agree or the
+    buffers will not match: qo=1024 kv=4096 would allocate the direct stubs while
+    the int8 kernel demands full q_int8/k_int8 and throw.
+
+    Its own function rather than an inline expression in sage_int8_sdpa because
+    the gate is a contract with two implementations on either side of it, and
+    test_use_direct_gate_matches_the_direct_buffer_contract has to be able to ask
+    this one. A test that re-derives the rule compares two copies of it and
+    passes when only one of them drifts, which is exactly the drift it exists to
+    catch.
+    """
+    _, _, q_length, head_dim = q.shape
+    _, _, kv_length, _ = k.shape
+    output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
+    d64_short_keys = head_dim == 64 and kv_length <= 2048 and not (
+        q_length == kv_length and kv_length <= 1024
+    )
+    return (
+        _is_small_igpu(q.device)
+        and attn_mask is None
+        and q.dtype == output_dtype
+        and (d64_short_keys or (head_dim == 128 and kv_length <= 256))
+    )
+
+
 def sage_int8_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3294,20 +3338,7 @@ def sage_int8_sdpa(
     _, _, kv_length, _ = k.shape
     output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
     cta_k = _sage_cta_k(head_dim, kv_length, attn_mask is not None)
-
-    # Mirrors sage_sdpa's use_direct in dlpack_bindings.cpp exactly; keep the two
-    # in step. The C++ decides which kernel runs, so the Python gate must agree or
-    # the buffers will not match: qo=1024 kv=4096 would allocate the direct stubs
-    # while the int8 kernel demands full q_int8/k_int8 and throw.
-    d64_short_keys = head_dim == 64 and kv_length <= 2048 and not (
-        q_length == kv_length and kv_length <= 1024
-    )
-    use_direct = (
-        _is_small_igpu(q.device)
-        and attn_mask is None
-        and q.dtype == output_dtype
-        and (d64_short_keys or (head_dim == 128 and kv_length <= 256))
-    )
+    use_direct = _sage_use_direct(q, k, attn_mask)
 
     # ComfyUI's attention_comfy_kitchen_int8 finishes with
     # out.transpose(1, 2).reshape(b, -1, heads * dim_head). HND-packed storage
@@ -3527,18 +3558,16 @@ def _load_rdna2_module() -> None:
     if _rdna2_module is not None or _rdna2_import_error is not None:
         return
 
-    arch = _rdna2_arch()
-    if arch is None:
-        _rdna2_import_error = RuntimeError(
-            "RDNA2 sage attention: no RDNA2 (gfx103x) device is visible; "
-            "this backend is compiled for RDNA2 only."
-        )
-        return
-
     # The entry points live on _C with every other kernel in this backend, so there
     # is nothing to locate: one extension, built for whichever architectures
     # COMFY_HIP_ARCHS named, and registered whether or not this device can use it.
-    # Which device can use it is the arch gate above, and the only thing left to fail.
+    #
+    # Deliberately no architecture test of the current device here. Which device can
+    # use it is already the per-device gate in rdna2_is_available, and this loader
+    # caches whatever it decides for the rest of the process: on a box holding both
+    # an RDNA2 iGPU and a dGPU, a first call made while the dGPU was current would
+    # have cached "no RDNA2 device is visible" and every later call with a real
+    # gfx1035 tensor would report the path unavailable until the process ended.
     try:
         from . import _C
     except Exception as e:  # a broken extension must not break import
@@ -3546,7 +3575,9 @@ def _load_rdna2_module() -> None:
         return
 
     _rdna2_module = _C
-    _rdna2_arch_loaded = arch
+    # Recorded for the message, not for the gate: _rdna2_arch_loaded names the
+    # architecture this module was loaded for, and there is only one per process.
+    _rdna2_arch_loaded = _rdna2_arch()
 
 
 def rdna2_is_available(device: torch.device | int | None = None) -> bool:
@@ -3562,7 +3593,14 @@ def rdna2_is_available(device: torch.device | int | None = None) -> bool:
 def rdna2_import_error() -> str | None:
     """Why the extension is unavailable, for error messages."""
     _load_rdna2_module()
-    return None if _rdna2_module is not None else str(_rdna2_import_error)
+    if _rdna2_module is not None:
+        return None
+    if _rdna2_import_error is not None:
+        return str(_rdna2_import_error)
+    # The extension loaded and this call was still refused: the gate was the
+    # per-device architecture check in rdna2_is_available, not the loader. Saying
+    # so keeps the message from reading as a broken build.
+    return "the requested device is not RDNA2 (gfx103x)"
 
 
 def _rdna2_ext():

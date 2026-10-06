@@ -319,12 +319,52 @@ def test_convrot_quant_int4_agrees_at_every_k_the_kernel_accepts():
 def test_the_default_width_is_not_the_widest_one():
     """Guard against the table silently degenerating to "always 1024", which is
     what it effectively was on RDNA2 before this tree had an entry for it."""
-    x = torch.randn((1024, 1280), device=DEV, dtype=torch.float16) * 0.7
+    m, k = 1024, 1280
+    x = torch.randn((m, k), device=DEV, dtype=torch.float16) * 0.7
     default_q, _ = _quant_at(x, None)
     for width in (64, 128):
         q, _ = _quant_at(x, width)
         assert torch.equal(q.to(torch.int32), default_q.to(torch.int32))
-    # And the heuristic really does land somewhere narrower than the dGPU answer.
-    from comfy_kitchen.backends import hip
 
-    assert hip._visible_gfx_arches() is not None
+    # And the heuristic really does land somewhere narrower than the dGPU answer.
+    # Asked of the extension rather than inferred from the outputs above: every
+    # width produces the same bits, so no comparison between quantized results can
+    # tell a correct table from one that answers 1024 for everything -- which is the
+    # failure this guards, and the one the dGPU fallback is. An earlier version of
+    # this test closed with `_visible_gfx_arches() is not None`, which is a tuple and
+    # so could not fail, and said nothing about the table besides that.
+    #
+    # The override has to be unset or the reading is whatever the environment says,
+    # rather than what the table says.
+    from comfy_kitchen.backends.hip import DTYPE_TO_CODE
+
+    previous = os.environ.get(OVERRIDE)
+    try:
+        os.environ.pop(OVERRIDE, None)
+        width = _C.convrot_fused_block(m, k, DTYPE_TO_CODE[torch.float16])
+    finally:
+        if previous is None:
+            os.environ.pop(OVERRIDE, None)
+        else:
+            os.environ[OVERRIDE] = previous
+
+    assert width != 0, (
+        f"the fused quantizer would spill rather than pick a width at {(m, k)}, "
+        "so this shape proves nothing about the table"
+    )
+    arches = {arch.split(":")[0] for arch in _visible_gfx_arches() if arch}
+    if "gfx1103" in arches or any(a.startswith("gfx103") for a in arches):
+        # The two families with a measured entry in the table. K=1280 is five
+        # Hadamard groups and both answer 64 there, so the widest answer either can
+        # give is the one this rules out.
+        assert width < 1024, (
+            f"the heuristic picked the widest width ({width}) at K={k}, which is 5 "
+            f"Hadamard groups, on {sorted(arches)}"
+        )
+    else:
+        # Elsewhere the table is the dGPU fallback and there is nothing narrower to
+        # claim. What is still worth asserting is that the width is one the fused
+        # kernel is instantiated at, since anything else silently becomes 1024.
+        assert width in (64, 128, 256, 512, 640, 768, 1024), (
+            f"uninstantiated block width {width} at K={k} on {sorted(arches)}"
+        )

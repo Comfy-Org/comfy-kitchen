@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
 import gc
 import weakref
 
@@ -977,6 +978,65 @@ def test_hip_compact_dense_bool_matches_float_bias(head_dim, dtype, scale, mask_
 
 @requires_int8_attention
 @pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
+@pytest.mark.parametrize("scale_boost", [1, 10**3, 10**5])
+def test_hip_dropped_key_survives_a_large_qk_score(scale_boost):
+    """A dropped key must stay dropped when the Q*K score dwarfs the mask sentinel.
+
+    A prepared mask's -inf becomes a finite sentinel, ``kMaskedScoreBase2`` at about
+    -72134 in base two, and the kernel *adds* it to the caller's Q*K score rather
+    than replacing it. So whether a -inf key actually drops came to depend on the
+    score being smaller than that constant -- a property of the data rather than of
+    the mask, and the score is not bounded that way. Every dropped key whose tile
+    held one large enough score came back with that tile's largest probability: a
+    fully masked row returned a key of V instead of zeros, at any boost from 1e3 up.
+
+    Multiplying both quantization scales is the lever, because the scale is the
+    kernel's only free multiplier on the score. It is a proxy for large activations
+    rather than one: the quantizer rotates each row by a Hadamard before scaling, so
+    raising the *input* magnitudes does not raise the score -- a constant row
+    rotates to zero -- and the scales are what actually move it.
+
+    scale_boost=1 is the control: the same shapes and the same mask at the scales the
+    packing actually produced. It has to behave identically, which is what makes
+    this a test of the sentinel rather than of the mask or of the shapes.
+    """
+    torch.manual_seed(451)
+    q, k, v = _qkv(1, 2, 2, 8, 128, 64, torch.float16)
+
+    keep = torch.ones(1, 1, 8, 128, device="cuda", dtype=torch.bool)
+    keep[..., 0, :] = False           # nothing kept
+    keep[..., 3, :] = False           # nothing kept, and not the first row
+    keep[..., 1, 1:] = False          # one key out of the tile it sits in
+    keep[..., 2, :-1] = False         # one key out of the tile after an empty one
+
+    packed = ck.prequantize_int8_attention(q, k, v, attn_mask=keep)
+    if scale_boost != 1:
+        packed = dataclasses.replace(
+            packed,
+            q_scale=packed.q_scale * scale_boost,
+            k_scale=packed.k_scale * scale_boost,
+        )
+    actual = ck.int8_attention_from_prequantized(packed)
+    assert torch.isfinite(actual).all()
+
+    for row in (0, 3):
+        assert torch.count_nonzero(actual[:, :, row]) == 0, (
+            f"row {row} keeps no key at all, so it must be exactly zero; got "
+            f"{actual[:, :, row].abs().max().item()} with scale_boost={scale_boost}"
+        )
+    # The rows that do keep keys have to stay non-trivial, or an all-zero output
+    # would satisfy the assertions above and hide a second regression. The bar is
+    # half rather than all: V is int8-quantized per channel, so some of its entries
+    # come back as exact zeros at any boost.
+    kept = actual[:, :, 1:]
+    assert torch.count_nonzero(kept) > 0.5 * kept.numel(), (
+        f"only {int(torch.count_nonzero(kept))} of {kept.numel()} outputs are "
+        f"nonzero with scale_boost={scale_boost}"
+    )
+
+
+@requires_int8_attention
+@pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
 @pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("kv_length", [65, 257])
@@ -1379,7 +1439,12 @@ def test_hip_attention_rejects_non_int8_v(dtype):
 # rejects. They have already drifted once in this fork's history, so pin them.
 #
 # The expected condition below is written out independently of the implementation
-# so that editing either copy of the gate has to be a deliberate act here too.
+# so that editing either copy of the gate has to be a deliberate act here too. Only
+# one of the two is a copy in this file, though: the actual answer comes from the
+# backend's _sage_use_direct, which is the helper sage_int8_sdpa itself calls. An
+# earlier version of _call_use_direct re-derived the rule here instead, which made
+# the assertion compare two copies that both lived in this file -- editing the gate
+# without editing the test left it green.
 def _expected_use_direct(is_igpu, head_dim, q_length, kv_length, masked, dtype_ok):
     if not (is_igpu and not masked and dtype_ok):
         return False
@@ -1456,21 +1521,15 @@ def test_use_direct_gate_matches_the_direct_buffer_contract(
 
 
 def _call_use_direct(hip_backend, q, k, attn_mask):
-    """Evaluate the same expression sage_int8_sdpa uses for its gate.
+    """Ask the implementation sage_int8_sdpa itself gates on.
 
-    Duplicated on purpose: this is the specification the implementation is checked
-    against, so it must not call into the implementation to find out what it does.
+    Deliberately the backend's own helper rather than a second copy of the rule
+    here. ``_expected_use_direct`` below is the independent specification this is
+    compared against; re-deriving the actual answer in the test file as well would
+    make the assertion compare two copies of one rule, both of which live here, so
+    editing the gate in ``comfy_kitchen/backends/hip/__init__.py`` would leave the
+    test green. That drift has already happened once, which is why the gate lives
+    in a helper at all.
     """
-    _, _, q_length, head_dim = q.shape
-    _, _, kv_length, _ = k.shape
-    output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
-    d64_short_keys = head_dim == 64 and kv_length <= 2048 and not (
-        q_length == kv_length and kv_length <= 1024
-    )
-    return (
-        hip_backend._is_small_igpu(q.device)
-        and attn_mask is None
-        and q.dtype == output_dtype
-        and (d64_short_keys or (head_dim == 128 and kv_length <= 256))
-    )
+    return hip_backend._sage_use_direct(q, k, attn_mask)
 

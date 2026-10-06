@@ -72,6 +72,7 @@ void launch_convrot_quant_int4_kernel(const void*, int, void*, void*, int, int, 
 void launch_unpack_int4_kernel(const void*, void*, int64_t, hipStream_t);
 int convrot_max_k_host(int);
 int convrot_int8_needs_spill_host(int, int, int);
+int convrot_fused_block_host(int, int, int);
 
 void launch_quantize_wxa8_convrot_fused_kernel(const void*, const void*, void*, void*, void*,
                                                int64_t, int64_t, int, int, int, bool, uint64_t,
@@ -2558,6 +2559,8 @@ NB_MODULE(_C, m) {
     m.def("convrot_max_k", &convrot_max_k_host);
     m.def("convrot_int8_needs_spill", &convrot_int8_needs_spill_host, nb::arg("m"),
           nb::arg("k"), nb::arg("in_code"));
+    m.def("convrot_fused_block", &convrot_fused_block_host, nb::arg("m"), nb::arg("k"),
+          nb::arg("in_code"));
     m.def("unpack_int4", &unpack_int4);
     m.def("dequant_int4_grouped_to_int8", &dequant_int4_grouped_to_int8);
     m.def("quantize_wxa8_convrot_fused", &quantize_wxa8_convrot_fused);

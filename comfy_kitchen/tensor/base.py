@@ -6,7 +6,7 @@ import dataclasses
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from functools import cache, lru_cache
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -35,7 +35,14 @@ def get_cuda_capability() -> tuple[int, int] | None:
     return torch.cuda.get_device_capability()
 
 
-@cache
+def _capture_active() -> bool:
+    """Whether a CUDA graph capture is in progress right now."""
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+_native_scaled_mm_probe: dict[str, bool] = {}
+
+
 def native_scaled_mm_usable(device_type: str) -> bool:
     """Whether ``torch._scaled_mm`` actually runs on this device's backend.
 
@@ -57,25 +64,45 @@ def native_scaled_mm_usable(device_type: str) -> bool:
     both from its own kernels, and gating them would push working matmuls onto
     a dequantize fallback.
 
-    Probed once per device type with a 1x1 matmul rather than read off the
-    capability number, because what matters is the shape PyTorch actually
-    accepts, which no version query reports. During CUDA graph capture the probe
-    cannot run -- its allocations would be recorded into the graph -- so the
-    question is deferred: the capture-time answer comes from
-    :func:`quantized_mm_has_fast_path`, which has already asked the WMMA kernels
-    and so knows the answer without probing, and from any earlier eager answer.
+    Probed once per device type rather than read off the capability number,
+    because what matters is the shape PyTorch actually accepts, which no version
+    query reports. The operands are FP8 at a 16-aligned shape, because that is
+    the only thing ``_scaled_mm`` takes: a bf16 probe raises on the dtype check,
+    and ``(1, 16) @ (16, 1)`` raises because the output dimension is not a
+    multiple of 16, so a probe of either shape answers "unsupported" on every
+    part and the answer is then held for the process -- FP8 and NVFP4 lose their
+    scaled GEMM on the NVIDIA hardware this gate exists to detect.
+
+    During CUDA graph capture the probe cannot run at all -- its allocations
+    would be recorded into the graph -- so the answer is deferred rather than
+    produced: :func:`quantized_mm_has_fast_path` and the NVFP4 handlers both come
+    through here, and what a capture gets is "no fast path", which is the branch
+    dequantize-and-matmul takes and therefore always a correct one. Deferring
+    also means not caching: a capture-time "no" recorded for the process would
+    cost a supported part its fast path long after the capture ended. An answer
+    already in the dict -- a probe run before the capture, or during an earlier
+    one -- is returned as it is, so priming is all it takes to keep the fast path
+    inside a capture.
     """
+    cached = _native_scaled_mm_probe.get(device_type)
+    if cached is not None:
+        return cached
+    if _capture_active():
+        return False
     if device_type != "cuda" or not torch.cuda.is_available():
+        _native_scaled_mm_probe[device_type] = False
         return False
     try:
-        a = torch.zeros((1, 16), device=device_type, dtype=torch.bfloat16)
-        b = torch.zeros((1, 16), device=device_type, dtype=torch.bfloat16)
+        a = torch.zeros((16, 16), device=device_type).to(torch.float8_e4m3fn)
+        b = torch.zeros((16, 16), device=device_type).to(torch.float8_e4m3fn)
         scale = torch.ones((), device=device_type, dtype=torch.float32)
         torch._scaled_mm(
             a, b.t(), scale_a=scale, scale_b=scale, bias=None, out_dtype=torch.bfloat16
         )
     except Exception:
+        _native_scaled_mm_probe[device_type] = False
         return False
+    _native_scaled_mm_probe[device_type] = True
     return True
 
 
@@ -175,14 +202,18 @@ def quantized_mm_has_fast_path(device_type: str) -> bool:
     Which also makes this the answer during CUDA graph capture, where the probe
     cannot run at all. That matters: capture reaches this on a part with no
     matrix cores, where the probe's answer is "no", and assuming "yes" there
-    would trace the op that does not exist into the graph.
+    would trace the op that does not exist into the graph. The non-HIP CUDA
+    branch below needs the same guard for the other reason -- there the probe is
+    the only source of an answer, and asking it inside a capture would either
+    record its allocations into the graph or, if the probe failed and was cached,
+    pin the whole process to the dequantize fallback.
     """
     if device_type == "cuda" and getattr(torch.version, "hip", None) is not None:
         from ..backends.hip import has_wmma
 
         if has_wmma():
             return True
-        if torch.cuda.is_current_stream_capturing():
+        if _capture_active():
             # No matrix cores, so _scaled_mm has no WMMA path to take and the
             # probe cannot run inside a capture either; dequantize-and-matmul is
             # the branch eager would have taken. See native_scaled_mm_usable.

@@ -594,6 +594,19 @@ extern "C" int convrot_int8_needs_spill_host(int M, int K, int in_code) {
     return convrot_int8_needs_spill_buffers(M, K, in_code) ? 1 : 0;
 }
 
+// The block width the fused quantizer will actually launch at for (M, K, in_dtype),
+// or 0 when nothing fits in LDS and it spills. Exposed so the width the per-arch
+// table picks is observable from Python: the widths agree bit for bit, so a test
+// that only compares quantized output cannot tell a correct table from one that
+// has degenerated to the widest entry for every shape.
+extern "C" int convrot_fused_block_host(int M, int K, int in_code) {
+    using namespace comfy::hip_backend;
+    if (M <= 0 || K <= 0) {
+        return 0;
+    }
+    return convrot_pick_fused_block_threads(M, K, in_code);
+}
+
 // scratch is a 4-byte device buffer, pre-zeroed by the caller.
 extern "C" void launch_quantize_int8_tensorwise_kernel(
     const void* x, int in_code, void* q, void* scale, void* scratch,

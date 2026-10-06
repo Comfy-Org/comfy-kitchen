@@ -182,6 +182,8 @@ def _handle_nvfp4_mm(qt, args, kwargs):
     # torch.cuda reports as "cuda" (see native_scaled_mm_usable). Decline here
     # rather than let the try/except below catch it: under torch.compile the
     # custom op is traced into the graph, so the exception would escape instead.
+    # That helper also declines inside a CUDA graph capture, where its probe would
+    # otherwise record its own allocations into the graph being built.
     if not native_scaled_mm_usable(a._qdata.device.type):
         logger.debug("NVFP4 mm: no native scaled GEMM here, falling back to dequantize")
         return torch.mm(*dequantize_args(args))
@@ -238,7 +240,8 @@ def _handle_nvfp4_linear(qt, args, kwargs):
 
     # See _handle_nvfp4_mm: the native scaled GEMM is not available everywhere
     # torch.cuda reports as "cuda", and a try/except fallback does not survive
-    # torch.compile because the custom op is traced into the graph.
+    # torch.compile because the custom op is traced into the graph. The probe
+    # inside native_scaled_mm_usable is likewise kept out of a graph capture.
     if not native_scaled_mm_usable(input_tensor._qdata.device.type):
         logger.debug("NVFP4 linear: no native scaled GEMM here, falling back to dequantize")
         return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))

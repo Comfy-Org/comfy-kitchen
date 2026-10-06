@@ -65,7 +65,8 @@ __device__ __forceinline__ unsigned permlanex16_u32(unsigned src) {
     return result;
 }
 
-// The wave32 WMMA builtins below are gfx11-only: gfx10 (no WMMA at all) and// gfx12 (its WMMA builtins carry a _gfx12 suffix) reject them at compile time,
+// The wave32 WMMA builtins below are gfx11-only: gfx10 (no WMMA at all) and
+// gfx12 (its WMMA builtins carry a _gfx12 suffix) reject them at compile time,
 // which would break any multi-arch build that includes those targets. The
 // runtime dispatch only ever launches this kernel on gfx1103
 // (comfy_small_igpu gates every path here), so the other targets get trap

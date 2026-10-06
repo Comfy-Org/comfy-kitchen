@@ -132,6 +132,39 @@ def test_eager_int8_matmul_turing_n_alignment(monkeypatch):
     assert calls == [0]
 
 
+@pytest.mark.parametrize("k", [256, 1024, 2048, 4096])
+def test_exact_int8_mm_is_exact_past_the_fp32_integer_range(k):
+    """_exact_int8_mm must widen on K, not on M.
+
+    The int8 products are exact integers, so only the accumulation can lose them,
+    and only through the float format's integer range: fp32 represents integers
+    exactly up to 2**24. Each product is at most 128*128, so that budget runs out
+    at K = 1024 and anything deeper has to accumulate in fp64.
+
+    The operands are chosen so the exact total is odd and past 2**24, which is what
+    makes an fp32 accumulation observably wrong rather than merely imprecise: at
+    K = 2048 the sum is about -3.3e7, where an fp32 ulp is 4, so no rounding mode
+    recovers the last bit and the fp32 path returns -33032064 for -33032065. M is
+    32 throughout, which is what the padding in _int_matmul_accumulate produces --
+    so a check written on the M axis reads "32" and never widens.
+    """
+    from comfy_kitchen.backends.eager.quantization import _exact_int8_mm
+
+    lhs = torch.full((32, k), 127, dtype=torch.int8)
+    rhs = torch.full((k, 4), -127, dtype=torch.int8)
+    # One even product in an odd total: -127 * -127 is odd, so an all-odd sum past
+    # 2**24 is the case fp32 cannot represent at all.
+    rhs[-1] = -126
+
+    actual = _exact_int8_mm(lhs, rhs)
+    expected = (lhs.to(torch.int64) @ rhs.to(torch.int64)).to(torch.int32)
+
+    assert actual.dtype == torch.int32
+    assert torch.equal(actual, expected), (
+        f"K={k}: got {actual[0, 0].item()}, exact is {expected[0, 0].item()}"
+    )
+
+
 def test_cuda_int8_linear_does_not_retain_scratch_tensors():
     """CUDA INT8 linear uses per-call temporaries instead of retained scratch caches."""
     if not cuda_backend_available():

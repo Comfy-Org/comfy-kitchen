@@ -53,6 +53,13 @@ __device__ __forceinline__ T warp_reduce_max(T val) {
 // memory, and the second pass reads those slots back with -1e20f in the lanes past
 // the warp count. That keeps the reduction total-count agnostic, so blockDim.x need
 // not be a multiple of 32.
+//
+// Two barriers, not one: only the first warp reads partial[], and every warp writes
+// it again on the next call (D64 runs this loop four times per block, once per
+// quant group). Without the second barrier a fast warp can overwrite the slot a
+// slower one is still reading, which mixes two groups' maxima into one amax -- too
+// low a maximum clips codes, too high a one throws away precision, and both depend
+// on timing, so nothing reproduces them reliably.
 template <typename T>
 __device__ __forceinline__ T block_reduce_max(T val) {
     __shared__ T partial[32];
@@ -62,7 +69,9 @@ __device__ __forceinline__ T block_reduce_max(T val) {
     if (lane == 0) partial[wid] = val;
     __syncthreads();
     val = (threadIdx.x < (blockDim.x / 32.f)) ? partial[lane] : -1e20f;
-    return warp_reduce_max(val);
+    val = warp_reduce_max(val);
+    __syncthreads();
+    return val;
 }
 
 // Every operand the attention kernel takes, gathered so the launcher can stay a
@@ -507,6 +516,16 @@ void gfx103x_launch_quant_qk(const QuantArgs& a, hipStream_t stream) {
 }
 
 void gfx103x_launch_attn(const AttnArgs& in, hipStream_t stream) {
+    // In-kernel Q quantization is only instantiated for short KV. Past that the
+    // launcher would quietly fall back to the packed-Q kernel, which then reads a
+    // null `q` for every valid query row, so refuse the combination instead: the
+    // binding hands over an fp16/bf16 Q with no packed counterpart, and the only
+    // correct fix is for the caller to pack Q first.
+    if (in.has_q_fp && !in.q_is_packed && in.kv_len > 1024) {
+        throw std::runtime_error(
+            "attn_gfx103x: quantizing Q in the attention kernel needs kv_len <= 1024; "
+            "pass packed Q instead");
+    }
     const bool inq = in.kv_len <= 1024 && in.has_q_fp;
 
     // Mask descriptor. Raw masks are indexed by the caller's strides; every

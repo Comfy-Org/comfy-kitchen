@@ -93,6 +93,32 @@ void require_elems(const nb::ndarray<>& t, int64_t need, const char* fn, const c
     }
 }
 
+// The two head dims the port instantiates. launch_attn_cf and
+// gfx103x_launch_quant_qk both dispatch `head_dim == 64 ? HD64 : HD128`, so any
+// other width would silently run the HD128 kernel over rows of a different length
+// and read past the end of K, V and Q.
+void require_head_dim(int64_t head_dim, const char* fn) {
+    if (head_dim != 64 && head_dim != 128) {
+        fail(fn, "head_dim must be 64 or 128, got " + std::to_string(head_dim));
+    }
+}
+
+// The kernel derives a query head's KV head as `head / (q_heads / kv_heads)`, an
+// integer division. kv_heads == 0 divides by zero on the device, and kv_heads not
+// dividing q_heads reads a key from a head that does not exist.
+void require_head_ratio(int64_t q_heads, int64_t kv_heads, const char* fn) {
+    if (kv_heads <= 0 || q_heads % kv_heads != 0) {
+        fail(fn, "q_heads=" + std::to_string(q_heads) +
+                    " must be a positive multiple of kv_heads=" + std::to_string(kv_heads));
+    }
+}
+
+// One scale per quant group the kernel indexes, so a short scale buffer is the same
+// out-of-bounds read as a short operand row.
+int64_t quant_groups(int64_t length, int64_t group) {
+    return (length + group - 1) / group;
+}
+
 hipStream_t as_stream(uintptr_t stream_ptr) {
     return reinterpret_cast<hipStream_t>(stream_ptr);
 }
@@ -135,6 +161,12 @@ void gfx103x_quant_qk_int8(nb::ndarray<> query, nb::ndarray<> key, nb::ndarray<>
     const int64_t q_len = hnd ? query.shape(2) : query.shape(1);
     const int64_t kv_len = hnd ? key.shape(2) : key.shape(1);
     const int64_t head_dim = query.shape(3);
+    require_head_dim(head_dim, fn);
+    require_head_ratio(q_heads, kv_heads, fn);
+    if (key.shape(3) != head_dim) {
+        fail(fn, "key head_dim " + std::to_string(key.shape(3)) +
+                    " does not match query head_dim " + std::to_string(head_dim));
+    }
 
     QuantArgs a{};
     a.q = query.data();
@@ -232,6 +264,20 @@ void gfx103x_qk_int8_sv_attn(nb::ndarray<> query, nb::ndarray<> key, nb::ndarray
     a.kv_len = key.shape(2);
     a.head_dim = qgeo.shape(3);
 
+    // Same reasons as in gfx103x_quant_qk_int8: the tile is instantiated per head
+    // dim, the KV head of a query head is an integer division of the head counts,
+    // and K/V/scales are read at the extents named here. _C is importable on its
+    // own, so this has to be refused here rather than left to the Python layer.
+    require_head_dim(a.head_dim, fn);
+    require_head_ratio(a.q_heads, a.kv_heads, fn);
+    if (key.shape(3) != a.head_dim || value.shape(3) != a.head_dim) {
+        fail(fn, "key/value head_dim " + std::to_string(key.shape(3)) + "/" +
+                    std::to_string(value.shape(3)) + " does not match query head_dim " +
+                    std::to_string(a.head_dim));
+    }
+    require_elems(key, a.batch * a.kv_heads * a.kv_len * a.head_dim, fn, "key");
+    require_elems(value, a.batch * a.kv_heads * a.kv_len * a.head_dim, fn, "value");
+
     if (q_packed) {
         a.q = static_cast<const int8_t*>(query.data());
         a.q_stride_b = query.stride(0);
@@ -281,6 +327,20 @@ void gfx103x_qk_int8_sv_attn(nb::ndarray<> query, nb::ndarray<> key, nb::ndarray
     }
     a.ks_stride_b = k_scale.stride(0);
     a.ks_stride_h = k_scale.stride(1);
+
+    // One scale per quant group, at the same extents as the packed operand. An
+    // empty q_scale is the "no per-block scale" case the prepass hands over and the
+    // launcher zeroes the strides for; k_scale is never optional here.
+    require_elems(k_scale,
+                  a.batch * a.kv_heads *
+                      quant_groups(a.kv_len, sageattn_gfx103x::kQuantGroupK),
+                  fn, "k_scale");
+    if (q_scale.size() > 0) {
+        require_elems(q_scale,
+                      a.batch * a.q_heads *
+                          quant_groups(a.qo_len, sageattn_gfx103x::kQuantGroupQ),
+                      fn, "q_scale");
+    }
 
     a.sm_scale = sm_scale;
     a.causal = is_causal ? 1 : 0;

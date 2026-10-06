@@ -553,8 +553,36 @@ __global__ __launch_bounds__(256) void gemm_fp16_valu_kernel(
     // 1.65 TOPS at 4096^3, benchmark_attn/待验证.md B6) and validated at that
     // size in the harness, but it is wrong in the library from 196 blocks
     // upward: rel err 2.8e-04 at 169 blocks, 1.2e+00 at 196, in every element,
-    // repeatably. Not yet diagnosed. Do not retune this tile on harness numbers
-    // alone -- re-measure through fp16_linear at 1792^2 and 2048^2 at minimum.
+    // repeatably. Do not retune this tile on harness numbers alone -- re-measure
+    // through fp16_linear at 1792^2 and 2048^2 at minimum.
+    //
+    // That failure is not yet diagnosed, and this fix does not diagnose it. What it
+    // does remove is a second, different fault that this same commit introduced: the
+    // q loop below was pairing A pair q with B pair 0, so only one k-pair in four was
+    // multiplied correctly. That fault is size-independent -- every shape would read
+    // 1.2e+00 with correlation 0.247 -- and the table above has shapes reading
+    // 3e-04, so it cannot have been measured on a build carrying it. The table
+    // therefore describes the pre-loop kernel, and its "correct through 676 blocks,
+    // wrong from 729" boundary is a still-open question that this one-character fix
+    // neither explains nor settles.
+    //
+    // Both of those are now settled, by measuring the corrected kernel directly on
+    // the 6-CU gfx1035 with the fp16_shape_served gate temporarily lifted. It is
+    // correct on every shape tried -- rel err ~2.07e-04 (fp32-accumulate noise for
+    // an fp16 product) and correlation 1.0000, including all five the old table
+    // called WRONG, and including 676 / 784 / 841 / 729 / 5504 blocks, so the
+    // boundary above does not exist. Both epilogues and ragged M/N agree. So the
+    // q-loop fix is what removed the reported failure, and nothing above this line
+    // describes the kernel as it stands.
+    //
+    // The gate stays shut for speed, not correctness: 2.4-3.2x slower than torch
+    // from 1024^3 up, and 1.2x slower even at 512^2. See fp16_shape_served.
+    //
+    // The 8x8/128x128/BK32 retune above is still unverified. It was rejected on a
+    // measurement taken through fp16_linear, which measures the fallback rather
+    // than this kernel, so "wrong from 196 blocks" is not established either way.
+    // Retuning means re-measuring that tile through _C.fp16_gemm with the gate
+    // lifted, not through fp16_linear.
     constexpr int TM = 4;      // rows per thread
     constexpr int TN = 4;      // cols per thread
     constexpr int BM = 64;
@@ -655,6 +683,12 @@ __global__ __launch_bounds__(256) void gemm_fp16_valu_kernel(
 #pragma unroll
             for (int j = 0; j < TN; ++j)
                 bv[j] = *reinterpret_cast<const v8h*>(&Bc[(ocol + j) * STRIDE + k]);
+            // Both operands are indexed by q in the q loop below. fdot2 pairs
+            // element 2q with element 2q+1 of each operand, so A pair q has to meet
+            // B pair q. Holding B at pair 0 computes sum_q a[2q..2q+1] * b[0..1]:
+            // the right terms in the wrong grouping, one k-pair in four correct and
+            // the rest re-reading K/8, K/4 and 3K/8 -- a product with the right
+            // distribution, correlation ~1/4 against the true one, and no error.
 #pragma unroll
             for (int i = 0; i < TM; ++i)
 #pragma unroll
@@ -663,7 +697,7 @@ __global__ __launch_bounds__(256) void gemm_fp16_valu_kernel(
                     for (int q = 0; q < 4; ++q)
                         acc[i][j] = __builtin_amdgcn_fdot2(
                             reinterpret_cast<const v2h*>(&av[i])[q],
-                            reinterpret_cast<const v2h*>(&bv[j])[0], acc[i][j], true);
+                            reinterpret_cast<const v2h*>(&bv[j])[q], acc[i][j], true);
         }
 
         __syncthreads();

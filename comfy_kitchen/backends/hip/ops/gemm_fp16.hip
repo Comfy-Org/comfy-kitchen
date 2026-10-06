@@ -24,31 +24,37 @@ inline bool fp16_shape_served(int M, int N, int K) {
         // RDNA2 has no matrix cores, so this arch reaches the VALU
         // v_dot2_f32_f16 kernel instead of WMMA. That kernel is gated off.
         //
-        // It is wrong above a size threshold whose mechanism is unknown, and it
-        // is not faster than torch anywhere it is correct. Measured on the 6-CU
-        // gfx1035, min-of-12 interleaved, through fp16_linear:
+        // Why: it is correct and slower than torch. Measured on the 6-CU gfx1035,
+        // min-of-12 in one process, calling _C.fp16_gemm -- i.e.
+        // launch_fp16_gemm_kernel -- with this gate temporarily lifted:
         //
-        //   shape                hip ms   eager ms   eager/hip   rel err
-        //   128x128 K128           0.155     0.154       0.99      3.2e-04 ok
-        //   512x512 K512           0.305     0.319       1.04      2.6e-04 ok
-        //   1024x1024 K1024        0.717     0.702       0.98      3.9e-04 ok
-        //   1536x1536 K1536        2.476     2.080       0.84      3.1e-04 ok
-        //   1024x1024 K8192       10.242     6.659       0.65      1.2e+00 WRONG
-        //   1728x1728 K512         2.272     0.825       0.36      1.2e+00 WRONG
-        //   2048x2048 K2048        9.235     4.849       0.53      1.2e+00 WRONG
-        //   4096x4096 K4096       73.372    34.450       0.47      1.2e+00 WRONG
-        //   2048x11008 K4096      98.946    52.261       0.53      1.2e+00 WRONG
+        //   shape                blocks   valu ms  torch ms  torch/valu   rel err
+        //   128x128 K128               4     0.127     0.188        1.48   2.07e-04
+        //   512x512 K512              64     0.385     0.315        0.82   2.07e-04
+        //   1024x1024 K1024          256     1.901     0.767        0.40   2.08e-04
+        //   1536x1536 K1536          576     6.072     2.075        0.34   2.08e-04
+        //   1024x1024 K8192          256    14.490     6.267        0.43   2.07e-04
+        //   1728x1728 K512           729     2.486     0.844        0.34   2.07e-04
+        //   2048x2048 K2048         1024    13.224     4.616        0.35   2.07e-04
+        //   4096x4096 K4096         4096   110.406    34.059        0.31   2.08e-04
+        //   2048x11008 K4096        5504   149.018    53.945        0.36   2.08e-04
         //
-        // Correct shapes tie eager; wrong shapes are 1.5-2.8x slower *and*
-        // wrong, so serving them from torch is strictly better on both axes.
+        // Every rel err is fp32-accumulate noise for an fp16 product (~2e-04),
+        // and the correlation against the true product is 1.0000 throughout.
+        // Both epilogues (bias, and resid + rscale * (acc + bias)) agree, ragged
+        // M/N that are not multiples of the 64x64 tile are right, and K up to
+        // 32768 is right. So torch wins on speed alone: 2.4-3.2x from 1024^3 up,
+        // and 1.2x even at 512^2. The one shape this kernel wins is 128x128, too
+        // small to be worth an arch carve-out on its own.
         //
-        // The failure: output fully written, value distribution preserved to
-        // within 1% (std ratio 0.989) but correlation against the true product
-        // only 0.247, bitwise repeatable, and independent of K. The boundary is
-        // per-axis and moves as the other axis grows. Restoring upstream's
-        // persistent kernel and its num_tiles > 24 gate did not move it, so this
-        // predates the restructuring in this tree. Not yet root-caused; see
-        // benchmark_attn/待验证.md B7.
+        // This replaces an earlier table here that read 1.2e+00 with correlation
+        // 0.247 on the five largest shapes and reported a "correct through 676
+        // blocks, wrong from 729" boundary. That was measured through
+        // fp16_linear, which this gate makes the fallback rather than this
+        // kernel, and it does not reproduce: the corrected kernel is right at
+        // 676, 784, 841, 729 and 5504 blocks alike. The 8x8/128x128/BK32 retune
+        // note in gemm_gfx10.h rests on the same discarded measurement and is
+        // unverified for the same reason.
         //
         // gfx11/gfx12 have WMMA and never arrive here, so this gate is inert
         // off RDNA2 and cannot affect a dGPU.

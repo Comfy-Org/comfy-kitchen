@@ -772,15 +772,22 @@ def _exact_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
 
     The int8 products are exact integers; only the accumulation can lose them, and
     only through the float format's integer range. fp32 represents integers exactly
-    only up to 2**24, and 127*127*K passes that at K > 1040, which the test suite
+    only up to 2**24, and 128*128*K reaches that at K > 1024, which the test suite
     does reach (K up to 2048). So promote to fp64 -- exact to 2**53, which no K
     comes near -- when the fp32 bound would be exceeded. fp32 is kept for the common
     small-K case because it is materially faster on a part with no int8 tensor cores.
 
+    The bound is over K, the reduction dimension (``lhs`` is [M, K]), and the product
+    is the largest an int8 pair can make: -128 * -128 is 16384, which 127 * 127 =
+    16129 does not reach, and int8 runs to -128 at both ends. Using M, the other
+    dimension of lhs, made the check pass on essentially every shape (the caller pads
+    M to at least 32) while saying nothing about K, so the deep-K rows this function
+    exists for ran in fp32 and came back with the wrong integers and no error.
+
     Correct by construction rather than measured: this path has not been run on
     gfx103x hardware from this tree, and is a reference/fallback, not a hot path.
     """
-    if 127 * 127 * lhs.shape[-2] < (1 << 24):
+    if 128 * 128 * lhs.shape[-1] <= (1 << 24):
         return (lhs.float() @ rhs.float()).to(torch.int32)
     return (lhs.double() @ rhs.double()).to(torch.int32)
 

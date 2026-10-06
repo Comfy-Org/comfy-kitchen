@@ -286,13 +286,23 @@ __global__ void prepare_dense_bool_bits_kernel(
 // is NaN; see the note at the top of this file. The kernel is built -ffast-math
 // for every AMD arch, so this is a correctness fix for all of them, not a
 // per-device tuning choice.
+//
+// The sentinel is finite, though, and it is *added to* the caller's Q*K score
+// rather than replacing it, so on its own it does not make a dropped key drop.
+// The bias alone cannot carry the answer: a large enough score lifts a -inf key
+// back over the tile maximum, which both suppresses the keys that really are kept
+// and marks the tile valid. So each helper also reports whether it clamped a
+// negative infinity -- dropped-key validity, tracked beside the score rather than
+// inside it -- and the caller keys the probability packing off that.
 template <bool kBF16>
-__forceinline__ __device__ float dense16_mask_bias(uint16_t bits) {
+__forceinline__ __device__ float dense16_mask_bias(uint16_t bits, uint32_t* dropped) {
     const uint16_t inf = kBF16 ? 0x7f80u : 0x7c00u;
+    const bool is_inf = (bits & inf) == inf;
+    const bool negative = (bits & 0x8000u) != 0;
     const float finite = kBF16 ? __uint_as_float(static_cast<uint32_t>(bits) << 16)
                                : __half2float(*reinterpret_cast<const __half*>(&bits));
-    const float clamped = (bits & 0x8000u) != 0 ? kMaskedScoreBase2 : -kMaskedScoreBase2;
-    return (bits & inf) == inf ? clamped : finite;
+    *dropped = (is_inf && negative) ? 1u : 0u;
+    return is_inf ? (negative ? kMaskedScoreBase2 : -kMaskedScoreBase2) : finite;
 }
 
 // `bits` is the raw float32 pattern, never a float: -ffinite-math-only lets the
@@ -300,19 +310,33 @@ __forceinline__ __device__ float dense16_mask_bias(uint16_t bits) {
 // deleted this branch and let the prepared mask's -inf through to fma/exp2. The
 // caller therefore reads the packed buffer through a uint32_t view, the same
 // trick mask_keep and dense16_mask_bias use.
-__forceinline__ __device__ float dense32_mask_bias(uint32_t bits) {
-    return (bits & 0x7f800000u) == 0x7f800000u
-        ? ((bits & 0x80000000u) != 0 ? kMaskedScoreBase2 : -kMaskedScoreBase2)
-        : __uint_as_float(bits);
+__forceinline__ __device__ float dense32_mask_bias(uint32_t bits, uint32_t* dropped) {
+    const bool is_inf = (bits & 0x7f800000u) == 0x7f800000u;
+    const bool negative = (bits & 0x80000000u) != 0;
+    *dropped = (is_inf && negative) ? 1u : 0u;
+    return is_inf ? (negative ? kMaskedScoreBase2 : -kMaskedScoreBase2) : __uint_as_float(bits);
 }
 
-__forceinline__ __device__ float bool_mask_bias(uint32_t keep_bits, int bit) {
-    int32_t dropped = static_cast<int32_t>((~keep_bits) << (31 - bit)) >> 31;
+__forceinline__ __device__ float bool_mask_bias(uint32_t keep_bits, int bit, uint32_t* dropped) {
+    int32_t was_dropped = static_cast<int32_t>((~keep_bits) << (31 - bit)) >> 31;
     // Keep the sign extraction as an integer operation. The finite masked score
     // is reached by a multiply rather than a compare/select, which would extend
     // scalar predicate lifetimes.
-    asm volatile("" : "+v"(dropped));
-    return -kMaskedScoreBase2 * static_cast<float>(dropped);
+    asm volatile("" : "+v"(was_dropped));
+    // The extraction yields 0 or -1, and casting -1 to uint32_t sets every bit --
+    // which as a per-element flag would report all eight elements of the step
+    // dropped instead of the one. Take the low bit, so this reads 0 or 1 like the
+    // two helpers above.
+    *dropped = static_cast<uint32_t>(was_dropped) & 1u;
+    return -kMaskedScoreBase2 * static_cast<float>(was_dropped);
+}
+
+// Expand four validity bits into the four byte lanes of a u32, which is what the
+// two halves of a gfx12 packed probability word need. The fields do not overlap --
+// the nibble is at most 0xF, so bit b lands in byte b and nowhere else -- so the
+// multiply is exact rather than a carry.
+__forceinline__ __device__ uint32_t expand4_to_bytes(uint32_t nibble) {
+    return (nibble & 0xfu) * 0x01010101u;
 }
 
 template <int HD, int CTA_K, MaskMode kMask, typename OutT>
@@ -616,6 +640,11 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
             // to land on the scaled score. Folding the mask into the score loop
             // instead, to retire the accumulator earlier, spills D256.
             float prob[kBoundary ? KT : 1][8];
+            // Which of those eight elements per key step is dropped, one bit per
+            // element. Not derivable from prob afterwards: the masked score is a
+            // finite sentinel added to a finite score, and the packing below has to
+            // know the difference. Zero on the interior path, which has no mask.
+            uint32_t dropped[kBoundary ? KT : 1] = {};
             float tile_m;
 
             if constexpr (kBoundary && kPrepared) {
@@ -645,10 +674,11 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                           fk * 256 + (lane / 16) * 128 + r * 8
                         : kb0 + fk * 16 + acc_row(lane, 0);
                     float biases[8];
+                    uint32_t biases_dropped[8] = {};
                     if constexpr (kPreparedDenseBool) {
 #pragma unroll
                         for (int e = 0; e < 8; ++e) {
-                            biases[e] = bool_mask_bias(keep_bits, fk * 8 + e);
+                            biases[e] = bool_mask_bias(keep_bits, fk * 8 + e, &biases_dropped[e]);
                         }
                     } else if constexpr (kPreparedDense16) {
                         const uint4 words = *reinterpret_cast<const uint4*>(dense_half_mask + mask_index);
@@ -656,7 +686,8 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
 #pragma unroll
                         for (int e = 0; e < 8; ++e) {
                             biases[e] = dense16_mask_bias<kPreparedDenseBF16>(
-                                static_cast<uint16_t>(packed_words[e / 2] >> ((e % 2) * 16)));
+                                static_cast<uint16_t>(packed_words[e / 2] >> ((e % 2) * 16)),
+                                &biases_dropped[e]);
                         }
                     } else {
                         const uint4 lo = *reinterpret_cast<const uint4*>(dense_bias_mask + mask_index);
@@ -665,7 +696,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                                                           hi.x, hi.y, hi.z, hi.w};
 #pragma unroll
                         for (int e = 0; e < 8; ++e) {
-                            biases[e] = dense32_mask_bias(packed_words[e]);
+                            biases[e] = dense32_mask_bias(packed_words[e], &biases_dropped[e]);
                         }
                     }
 #endif
@@ -673,6 +704,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                     for (int e = 0; e < 8; ++e) {
 #if defined(COMFY_MMA_GFX12)
                         float bias = biases[e];
+                        const uint32_t drop = biases_dropped[e];
 #else
                         const int key_row = acc_row(lane, e);
                         const int64_t mask_index = kPreparedDense
@@ -680,16 +712,24 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                               fk * 256 + (key_row / 8) * 128 + r * 8 + key_row % 8
                             : kb0 + fk * 16 + key_row;
                         float bias;
+                        uint32_t drop = 0;
                         if constexpr (kPreparedDenseBool) {
-                            bias = bool_mask_bias(e < 4 ? keep_bits : keep_bits_hi, fk * 8 + 2 * (e % 4));
+                            bias = bool_mask_bias(e < 4 ? keep_bits : keep_bits_hi,
+                                                  fk * 8 + 2 * (e % 4), &drop);
                         } else if constexpr (kPreparedDense16) {
-                            bias = dense16_mask_bias<kPreparedDenseBF16>(dense_half_mask[mask_index]);
+                            bias = dense16_mask_bias<kPreparedDenseBF16>(dense_half_mask[mask_index],
+                                                                        &drop);
                         } else {
-                            bias = dense32_mask_bias(dense_bias_mask[mask_index]);
+                            bias = dense32_mask_bias(dense_bias_mask[mask_index], &drop);
                         }
 #endif
-                        prob[fk][e] = fmaf(static_cast<float>(s_acc[fk][e]),
-                                           tile_scale_k[fk], bias);
+                        // A dropped key contributes the sentinel rather than its own
+                        // score, so the reduced maximum below is taken over the kept
+                        // keys only and a large Q*K cannot promote a dropped one.
+                        dropped[fk] |= drop << e;
+                        prob[fk][e] = drop
+                            ? kMaskedScore
+                            : fmaf(static_cast<float>(s_acc[fk][e]), tile_scale_k[fk], bias);
                     }
                 }
                 tile_m = prob[0][0];
@@ -727,6 +767,12 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                             row_valid[fq] = row_valid[fq] || keep;
                         }
                         prob[fk][e] = keep ? score : kMaskedScore;
+                        // Same record as the prepared path: the sentinel keeps a
+                        // dropped key out of tile_m, but the packed probability
+                        // below still has to be forced to zero, because a
+                        // fully-dropped tile's tile_scale is not always small enough
+                        // for the sentinel to underflow on its own.
+                        dropped[fk] |= keep ? 0u : (1u << e);
                     }
                 }
                 tile_m = prob[0][0];
@@ -752,16 +798,28 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
             // Its gap to the running maximum rides on the accumulator side as
             // tile_scale, which underflows to zero for a fully masked tile.
             tile_m = fmaxf(tile_m, swap_half_wave(tile_m));
-            if constexpr (kDense) {
-                // Fast-math marks the reduced maximum finite even when every
-                // key is masked. Hide its bits from that assumption so the
-                // empty-tile guard survives (notably on gfx11). This compiler
-                // barrier emits no instruction and leaves other paths alone.
-                uint32_t tile_m_bits = __float_as_uint(tile_m);
-                asm volatile("" : "+v"(tile_m_bits));
-                const bool valid_tile = (tile_m_bits & 0x7f800000u) != 0x7f800000u;
-                row_valid[fq] = row_valid[fq] || valid_tile;
-                tile_m = valid_tile ? __uint_as_float(tile_m_bits) : kMaskedScore;
+            // kBoundary because dropped[] is one element wide on the interior
+            // instance, which has no mask to record; that instance runs no interior
+            // iteration for a custom mask anyway (interior_iters stays 0).
+            if constexpr (kDense && kBoundary) {
+                // Whether the tile kept anything, read off the validity bits rather
+                // than off a finiteness test on the reduced maximum: that maximum is
+                // built from sentinels and finite values now, so a fast-math
+                // finiteness test on it is true for a fully dropped tile too. The
+                // old test needed an asm barrier to survive -ffinite-math-only at
+                // all; this one is integers and needs none.
+                uint32_t kept = 0;
+#pragma unroll
+                for (int fk = 0; fk < KT; ++fk) kept |= dropped[fk] ^ 0xffffffffu;
+                // The half-wave exchange is evaluated before the test rather than
+                // inside it: swap_half_wave_b32 carries no exec-mask guard, so a
+                // partner lane that a short-circuit left inactive reads this lane's
+                // own value back instead of its own (see the note on it in
+                // sage_common.h). Only the result of the OR is tested, so which byte
+                // lane the kept bit lands in does not matter.
+                const bool tile_kept = (kept | swap_half_wave_b32(kept)) != 0u;
+                row_valid[fq] = row_valid[fq] || tile_kept;
+                tile_m = tile_kept ? tile_m : kMaskedScore;
             }
             // Subtract the maximum before converting natural scores to base two.
             // Fusing score*log2(e)-rounded_max loses cancellation for large biases.
@@ -799,6 +857,11 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                 uint32_t packed[8];
 #endif
                 const float negative_m = -tile_m;
+                // A dropped key packs to a zero probability, whatever exp2 made of
+                // its biased score. Zero is the only safe value here: it is what
+                // keeps the key out of the PV product, and because tile_sum below
+                // sums the same bytes, out of the softmax denominator with it.
+                const uint32_t drop = dropped[kBoundary ? fk : 0];
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
                     const float p =
@@ -817,7 +880,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                         packed_hi = __builtin_amdgcn_cvt_pk_u8_f32(p, e - 4, packed_hi);
                     }
 #else
-                    packed[e] = prob_to_u8(p);
+                    packed[e] = ((drop >> e) & 1u) ? 0u : prob_to_u8(p);
                     // Normalize with the same quantized probabilities the PV matmul
                     // consumes, the way the gfx12 path below does with sad_u8.
                     // Summing the float p instead leaves the numerator rounded to
@@ -827,6 +890,11 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
 #endif
                 }
 #if defined(COMFY_MMA_GFX12)
+                // cvt_pk_u8_f32 writes two bytes at a time into a value it does not
+                // read, so a dropped element's byte has to be cleared afterwards
+                // rather than skipped. Elements 0-3 are the low word, 4-7 the high.
+                packed_lo &= ~expand4_to_bytes(drop);
+                packed_hi &= ~expand4_to_bytes(drop >> 4);
                 p_frag[fk] =
                     MmaInt8::Frag{static_cast<int>(packed_lo), static_cast<int>(packed_hi)};
                 // Normalize with the same quantized probabilities used by PV.
