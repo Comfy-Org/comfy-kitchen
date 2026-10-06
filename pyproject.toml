@@ -99,10 +99,6 @@ ignore = [
     "E501",  # Line too long (handled by formatter)
     "B008",  # Do not perform function call in argument defaults
     "N802",  # Function name should be lowercase (ComfyUI Nodes)
-    # Comments and docstrings are English throughout, so there is no remaining text
-    # RUF002 should stay quiet for. Ignored rather than dropped from select so a
-    # stray fullwidth mark is still visible in a new file.
-    "RUF002",
     "RUF022",
     "SIM108",
     "I001",
