@@ -183,7 +183,10 @@ __device__ __forceinline__ void mma_m16n8k32_s8(
 #endif
 }
 
+// cp.async and L2 cache hints are sm_80+, like the mma above; the host launcher
+// rejects older devices so the pre-sm_80 passes only need to compile.
 __device__ __forceinline__ void cp_async16_evict_first(uint32_t smem, const void* gptr) {
+#if __CUDA_ARCH__ >= 800
     // Weights are read once per step: evict_first keeps the demand stream from
     // displacing lines the prefetch ring already landed; ring-prefetched lines
     // (inserted with the default priority) still hit.
@@ -191,10 +194,17 @@ __device__ __forceinline__ void cp_async16_evict_first(uint32_t smem, const void
     asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
     asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
                  :: "r"(smem), "l"(gptr), "l"(policy));
+#endif
 }
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n"); }
+__device__ __forceinline__ void cp_async_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n");
+#endif
+}
 template <int N> __device__ __forceinline__ void cp_async_wait() {
+#if __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#endif
 }
 
 // Streaming decode GEMM for the Qwen schedule. A warp owns one 16-output tile over

@@ -141,6 +141,12 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
 
 // Weights are read once per step: evict_first keeps the demand stream from
 // displacing lines the prefetch ring already landed (see w4a8_gemm.cu).
+// L2 cache hints are sm_80+; Turing takes plain read-only loads.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+__device__ __forceinline__ uint64_t l2_evict_first_policy() { return 0; }
+__device__ __forceinline__ int ld_evict_first(const int* p, uint64_t) { return __ldg(p); }
+__device__ __forceinline__ int4 ld_evict_first(const int4* p, uint64_t) { return __ldg(p); }
+#else
 __device__ __forceinline__ uint64_t l2_evict_first_policy() {
     uint64_t policy;
     asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
@@ -157,6 +163,7 @@ __device__ __forceinline__ int4 ld_evict_first(const int4* p, uint64_t policy) {
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p), "l"(policy));
     return v;
 }
+#endif
 
 __device__ __forceinline__ int warp_reduce_sum_i32(int v) {
     for (int offset = kThreadsPerWarp / 2; offset > 0; offset >>= 1) {

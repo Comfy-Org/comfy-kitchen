@@ -124,12 +124,15 @@ struct RingCursor {
         }
     }
     // Request [cursor, cursor + n) into L2, one bulk prefetch per region piece.
+    // Bulk prefetch is sm_90+; prefetch_ring_is_available keeps older devices off the ring.
     __device__ void prefetch(uint64_t n) {
         while (n != 0) {
             const uint64_t avail = bytes - offset;
             const uint64_t step = n < avail ? n : avail;
+#if __CUDA_ARCH__ >= 900
             asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
                          :: "l"(base + offset), "r"(static_cast<unsigned>(step)) : "memory");
+#endif
             n -= step;
             offset += step;
             if (offset == bytes) next_region();

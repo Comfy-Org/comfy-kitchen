@@ -144,8 +144,15 @@ __global__ void deltanet_conv_deferred_kernel(
 // running state: an argmax-chain row commits, then the leaves hanging off it run against
 // that state with commit = false. The state written to global memory is still only the
 // committed prefix: no current row ever reaches it.
+// the attribute itself is rejected by the pre-sm_90 device passes of a multi-arch build
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define CLUSTER_DIMS(cl)
+#else
+#define CLUSTER_DIMS(cl) __cluster_dims__(cl, 1, 1)
+#endif
+
 template <typename T, int DK, int DV, int S, bool Tree>
-__global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(256, 2)
+__global__ void CLUSTER_DIMS(4) __launch_bounds__(256, 2)
 gated_delta_decode_deferred_kernel(
     const T* __restrict__ x,           // [B, S, Hd]
     const T* __restrict__ w_a,         // [Hv, Hd]
