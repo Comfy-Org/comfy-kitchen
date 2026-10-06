@@ -244,9 +244,9 @@ void w4a8_codebook_mma_stream_kernel(
     int M, int N, int K, int rows)
 {
     constexpr int S = kStreamStages;
-    extern __shared__ __align__(16) uint8_t smem[];
-    uint4* lut = reinterpret_cast<uint4*>(smem);
-    uint8_t* xs_s = smem + 4096;
+    extern __shared__ __align__(16) uint8_t stream_smem[];
+    uint4* lut = reinterpret_cast<uint4*>(stream_smem);
+    uint8_t* xs_s = stream_smem + 4096;
     const int x_stride = rows * 32 + 16;   // +16 keeps the per-token rows off one bank pattern
     uint8_t* stages = xs_s + 8 * x_stride;
 
