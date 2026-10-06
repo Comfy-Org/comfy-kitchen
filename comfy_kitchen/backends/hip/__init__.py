@@ -23,6 +23,7 @@ import pathlib
 import sys
 import weakref
 from collections.abc import Sequence
+from contextlib import nullcontext
 
 import torch
 
@@ -208,6 +209,37 @@ def _visible_gfx_arches() -> tuple[str | None, ...]:
     torch.cuda.current_device()
 
     return tuple(_gfx_arch(i) for i in range(torch.cuda.device_count()))
+
+
+# Why the launchers below need the *current* device pinned: launch_int8_gemm_kernel,
+# gemm_fp16's launcher and convrot_w4a4's all pick their tile family from
+# comfy_is_gfx10(), which reads the current device, while the stream they are handed
+# comes from _stream(x) and names a stream on x.device. On a box holding both an
+# RDNA2 iGPU and a matrix-core dGPU those can be different devices, and the kernel
+# then runs a v_dot4 tile that traps on the operand's part (or the WMMA tile on the
+# iGPU).
+#
+# Entering torch.cuda.device() is not free, though: measured 1.87 us per call on
+# gfx1103 (1.42 us of it just constructing the context manager, against 0.03 us for
+# a bare `pass`). The quantized GEMMs call this once per layer, so on an SDXL
+# txt2img that is ~700 pin/unpin pairs per step and ~39 ms per image of pure
+# overhead. With a single visible device the pin is provably a no-op -- x.device is
+# that device and current_device() is always it -- so it is only entered when the
+# box can actually disagree.
+@functools.cache
+def _device_pin_can_matter() -> bool:
+    """Whether a caller's tensor can live on a device other than the current one."""
+    # torch.cuda.current_device() first, for ROCm lazy init: device_count() may
+    # return 0 until HIP is initialized. Same ordering as _visible_gfx_arches.
+    torch.cuda.current_device()
+    return torch.cuda.device_count() > 1
+
+
+def _device_pin(device: torch.device | int):
+    """Context manager pinning ``device`` as current, free when it cannot matter."""
+    if _device_pin_can_matter():
+        return torch.cuda.device(device)
+    return nullcontext()
 
 
 # RDNA2 has no matrix cores; RDNA3/3.5 and RDNA4 do. This exact manifest is also
@@ -885,12 +917,10 @@ def int8_linear(
         bias = _bias_operand(bias, n, x.device)
 
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
-    # Pin the current device: launch_int8_gemm_kernel picks its tile family from
-    # comfy_is_gfx10(), which reads the *current* device, while _stream(x) names a
-    # stream on x.device. On a box holding both an RDNA2 iGPU and a matrix-core
-    # dGPU those can be different devices, and the kernel then runs a v_dot4 tile
-    # that traps on the operand's part (or the WMMA tile on the iGPU).
-    with torch.cuda.device(x.device):
+    # launch_int8_gemm_kernel picks its tile family from comfy_is_gfx10(), which
+    # reads the *current* device, while _stream(x) names a stream on x.device. See
+    # _device_pin for why the pin is skipped when it cannot matter.
+    with _device_pin(x.device):
         _C.int8_gemm(
             _dl(q), _dl(weight), _dl(out),
             _dl(x_scale), _dl(weight_scale), 0 if weight_scale.numel() == 1 else 1,
@@ -1066,8 +1096,8 @@ def _w4a8_int8_linear_chunked(
     workspace = torch.empty((chunk_cols, k), dtype=torch.int8, device=device)
     # Same reason as int8_linear's int8_gemm: the chunked path reaches
     # launch_int8_gemm_kernel, whose gfx10 test reads the current device while the
-    # stream is the one for x.device.
-    with torch.cuda.device(x.device):
+    # stream is the one for x.device. See _device_pin.
+    with _device_pin(x.device):
         _C.w4a8_int8_gemm_chunked(
             _dl(xq),
             _dl(qdata_arg),
@@ -1484,9 +1514,9 @@ def convrot_w4a4_linear(
     # because has_wmma() is the intersection over every visible device and so
     # reports false for the whole process -- which would send the dGPU's calls to
     # an instruction it does not have. That makes "the launching device" load
-    # bearing, so pin it: comfy_is_gfx10() inside the launcher reads the current
-    # device, while _stream(x) names the stream for x.device.
-    with torch.cuda.device(x.device):
+    # bearing, so pin it. See _device_pin for why it is skipped when there is
+    # only one visible device.
+    with _device_pin(x.device):
         _C.convrot_w4a4_gemm(
             _dl(qact), _dl(qw), _dl(out),
             _dl(x_scale), _dl(wscales), None if bias is None else _dl(bias),
