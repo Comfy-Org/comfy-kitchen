@@ -232,3 +232,91 @@ def test_flash_attention_decode_rejects_invalid_dimensions(q_dim, k_dim, v_dim):
     lengths = torch.tensor([257], device="cuda", dtype=torch.int32)
     with pytest.raises(RuntimeError, match=r"dimensions|k/v shape mismatch"):
         ck.flash_attention_decode(q, k, v, lengths)
+
+
+requires_gqa_decode = pytest.mark.skipif(
+    not ck.flash_attention_decode_gqa_is_available(),
+    reason="requires the head_dim-256 GQA decode kernel",
+)
+
+
+@requires_gqa_decode
+def test_flash_attention_decode_tree_merge_matches_full_softmax():
+    # A verify tree's rows read the committed prefix through one non-causal decode pass and
+    # fold their own ancestors in afterwards. Row r must then equal a plain softmax over the
+    # prefix plus exactly the slots on its root-to-r path.
+    torch.manual_seed(0)
+    batch, kv_heads, groups, head_dim, capacity, prefix = 2, 2, 4, 256, 96, 37
+    heads = kv_heads * groups
+    parent = [-1, 0, 1, 2, 0, 1, 4, 4]
+    rows = len(parent)
+    key = torch.randn(batch, kv_heads, capacity, head_dim, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    q = torch.randn(batch, heads, rows, head_dim, device="cuda", dtype=torch.bfloat16)
+    xk = torch.randn(batch, kv_heads, rows, head_dim, device="cuda", dtype=torch.bfloat16)
+    xv = torch.randn_like(xk)
+    key[:, :, prefix:prefix + rows] = xk
+    value[:, :, prefix:prefix + rows] = xv
+
+    def path(r):
+        out = []
+        while r >= 0:
+            out.append(r)
+            r = parent[r]
+        return out[::-1]
+
+    mask = torch.tensor([sum(1 << t for t in path(r)) for r in range(rows)], dtype=torch.int32, device="cuda")
+    lengths = torch.full((batch,), prefix, device="cuda", dtype=torch.int32)
+    out, lse = ck.flash_attention_decode_gqa(q, key, value, lengths, return_lse=True, causal=False)
+    merged = torch.empty_like(out)
+    ck.flash_attention_decode_tree_merge(out, lse, q, xk, xv, mask, merged)
+
+    kf = key.repeat_interleave(groups, dim=1).float()
+    vf = value.repeat_interleave(groups, dim=1).float()
+    expected = torch.empty(batch, rows, heads * head_dim, device="cuda", dtype=torch.float32)
+    for r in range(rows):
+        cols = list(range(prefix)) + [prefix + t for t in path(r)]
+        scores = (q[:, :, r].float().unsqueeze(2) * kf[:, :, cols]).sum(-1) * head_dim ** -0.5
+        probs = scores.softmax(dim=-1)
+        expected[:, r] = (probs.unsqueeze(-1) * vf[:, :, cols]).sum(2).reshape(batch, heads * head_dim)
+    torch.testing.assert_close(merged.float(), expected, atol=3e-3, rtol=1e-2)
+
+
+@requires_flash_decode
+@pytest.mark.parametrize("num_splits", [2, 5, 32])
+def test_flash_attention_decode_fused_combine_matches_two_launch(monkeypatch, num_splits):
+    """The in-kernel split fold (last CTA per row) must reproduce the separate
+    combine launch bit for bit: same warp-width reduction of the split maxima and
+    sums, same split order in the weighted accumulation."""
+    monkeypatch.setattr(flash_attention_module, "_num_splits", lambda *_, **__: num_splits)
+    torch.manual_seed(0)
+    q = torch.randn(3, 1, 8, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(3, 4097, 2, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    lengths = torch.tensor([1, 73, 4097], device="cuda", dtype=torch.int32)
+    monkeypatch.setattr(flash_attention_module, "fused_combine", False)
+    two_launch = ck.flash_attention_decode(q, k, v, lengths)
+    monkeypatch.setattr(flash_attention_module, "fused_combine", True)
+    fused = [ck.flash_attention_decode(q, k, v, lengths) for _ in range(3)]  # counters must rearm between calls
+    for out in fused:
+        assert torch.equal(out, two_launch)
+    torch.testing.assert_close(two_launch, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
+
+
+@requires_gqa_decode
+@pytest.mark.parametrize("num_splits", [2, 5, 32])
+@pytest.mark.parametrize("query_length", [1, 4])
+def test_flash_attention_decode_gqa_fused_combine_matches_two_launch(monkeypatch, num_splits, query_length):
+    monkeypatch.setattr(flash_attention_module, "_num_splits", lambda *_, **__: num_splits)
+    torch.manual_seed(0)
+    q = torch.randn(3, 8, query_length, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(3, 2, 4097, 256, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    lengths = torch.tensor([query_length, 73, 4097], device="cuda", dtype=torch.int32)
+    monkeypatch.setattr(flash_attention_module, "fused_combine", False)
+    out_ref, lse_ref = ck.flash_attention_decode_gqa(q, k, v, lengths, return_lse=True)
+    monkeypatch.setattr(flash_attention_module, "fused_combine", True)
+    for _ in range(3):
+        out, lse = ck.flash_attention_decode_gqa(q, k, v, lengths, return_lse=True)
+        assert torch.equal(out, out_ref)
+        assert torch.equal(lse, lse_ref)

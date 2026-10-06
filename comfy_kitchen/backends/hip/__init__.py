@@ -53,6 +53,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
+from comfy_kitchen.tensor.w4a8_stream import unpack_w4a8_mma_weight
 
 logger = logging.getLogger("comfy_kitchen.hip")
 
@@ -1199,8 +1200,12 @@ def dequantize_w4a8_int8_weight(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     output_dtype: torch.dtype = torch.bfloat16,
+    stream_rows: int = 0,
 ) -> torch.Tensor:
     """Decode W4A8 storage into its physical [N, K] floating weight."""
+    if stream_rows:
+        n = s_channel.numel()
+        qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, qdata.numel() * 16 // (n * 9), stream_rows)
     validate_w4a8_operands(
         qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize
     )
@@ -1224,6 +1229,12 @@ def w4a8_int8_linear(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
+    stream_rows: int = 0,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``x @ W.T + bias`` via the HIP INT4/INT6 decode feeding the WMMA INT8 GEMM.
 
@@ -1233,6 +1244,19 @@ def w4a8_int8_linear(
     packed weight itself, so a few rows take a GEMV that dequantizes in registers
     and never writes the INT8 weight at all.
     """
+    if residual is not None:
+        return _apply_residual(
+            w4a8_int8_linear(
+                x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
+                convrot_groupsize, out_dtype, stream_rows, input_act, input_act_weight,
+                input_act_eps,
+            ),
+            residual,
+            residual_scale,
+        )
+    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    if stream_rows:
+        qdata, s_rel = unpack_w4a8_mma_weight(qdata, s_channel.numel(), x.shape[-1], stream_rows)
     _n, k, _bits = validate_w4a8_operands(
         qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize
     )

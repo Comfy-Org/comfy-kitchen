@@ -14,9 +14,11 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (
     _w4a8_geometry,
     validate_w4a8_operands,
 )
+from comfy_kitchen.tensor.w4a8_stream import unpack_w4a8_mma_weight
 from comfy_kitchen.backends.eager.w4a8_int8 import (
     w4a8_int8_linear as eager_w4a8_int8_linear,
 )
+from comfy_kitchen.backends._activations import apply_input_act, apply_residual
 from triton.language.extra import libdevice
 
 from .quantization import int8_linear
@@ -117,8 +119,27 @@ def w4a8_int8_linear(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
+    stream_rows: int = 0,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``x @ W.T + bias`` for AsymW4A8Int8 via the fused Triton dequant + INT8 GEMM."""
+    if residual is not None:
+        return apply_residual(
+            w4a8_int8_linear(
+                x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
+                convrot_groupsize, out_dtype, stream_rows, input_act, input_act_weight,
+                input_act_eps,
+            ),
+            residual,
+            residual_scale,
+        )
+    x = apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    if stream_rows:
+        qdata, s_rel = unpack_w4a8_mma_weight(qdata, s_channel.numel(), x.shape[-1], stream_rows)
     _n, k, _bits = validate_w4a8_operands(
         qdata,
         s_rel,

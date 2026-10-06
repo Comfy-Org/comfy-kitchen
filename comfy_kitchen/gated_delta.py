@@ -9,24 +9,12 @@ if getattr(torch.version, "hip", None):
 else:
     _hip_backend = None
 
-_MAX_STEPS = 8
-# Published wheels compile 75-virtual as the floor (see setup.py). Volta
-# (sm_70) still reports enough opt-in shared memory for the fused decode
-# budget, so the shmem check alone waves V100 through to a rejected launch.
-_NATIVE_MINIMUM_CAPABILITY = (7, 5)
-_device_optin: dict[int, int] = {}
+SLOT_MAX = 8  # token slots per deferred side buffer; verify steps run S <= SLOT_MAX tokens
+CTL_INTS = 2 + 3 * SLOT_MAX  # ctl = {pending, parity, slot[8], parent[8], prog[8]}
 
 
-def _fused_shmem_bytes(key_head_dim: int, value_head_dim: int) -> int:
-    # fp32 state slice, q/k rows for every step, per-warp reduce scratch (mirrors the launcher)
-    warps = max(value_head_dim, 128) // 32
-    return (key_head_dim * value_head_dim + 2 * _MAX_STEPS * key_head_dim + 4 * _MAX_STEPS * warps) * 4
-
-
-def is_available(device: torch.device | None = None, key_head_dim: int = 128, value_head_dim: int = 128) -> bool:
-    """Return whether the fused DeltaNet decode kernels can run on this device for these head dims."""
-    if device is not None and device.type != "cuda":
-        return False
+def is_available(device: torch.device | int | None = None, key_head_dim: int = 128, value_head_dim: int = 128) -> bool:
+    """Return whether the snapshot-based fused DeltaNet decode kernels (HIP) can run here."""
     if not torch.cuda.is_available():
         return False
     if _hip_backend is not None:
@@ -40,21 +28,118 @@ def is_available(device: torch.device | None = None, key_head_dim: int = 128, va
     ext = _cuda_backend._C if _cuda_backend._EXT_AVAILABLE else None
     if ext is None or not hasattr(ext, "gated_delta_decode_fused") or not hasattr(ext, "deltanet_conv_step"):
         return False
-    if key_head_dim != 128 or value_head_dim % 32 != 0 or not 0 < value_head_dim <= 512:
+    if key_head_dim != 128 or value_head_dim != 128:
         return False
-    if torch.cuda.get_device_capability(device) < _NATIVE_MINIMUM_CAPABILITY:
+    if device is not None and torch.device(device).type != "cuda":
         return False
-    index = device.index if device is not None else None
-    if index is None:
-        index = torch.cuda.current_device()
-    optin = _device_optin.get(index)
-    if optin is None:
-        props = torch.cuda.get_device_properties(index)
-        optin = getattr(props, "shared_memory_per_block_optin", None)
-        if optin is None:
-            optin = 96 * 1024 if props.major >= 8 else 0
-        _device_optin[index] = optin
-    return _fused_shmem_bytes(key_head_dim, value_head_dim) <= optin
+    # the decode kernel runs one head per 4-block cluster (sm_90+)
+    return torch.cuda.get_device_capability(device) >= (9, 0)
+
+
+def deferred_is_available(device: torch.device | int | None = None, key_head_dim: int = 128, value_head_dim: int = 128) -> bool:
+    """Return whether the deferred-commit DeltaNet decode kernels (CUDA sm_90+) can run on this device."""
+    if not torch.cuda.is_available() or _hip_backend is not None:
+        return False
+    ext = _cuda_backend._C if _cuda_backend._EXT_AVAILABLE else None
+    if ext is None or not hasattr(ext, "gated_delta_decode_deferred") or not hasattr(ext, "deltanet_conv_deferred"):
+        return False
+    if key_head_dim != 128 or value_head_dim != 128:
+        return False
+    if device is not None and torch.device(device).type != "cuda":
+        return False
+    # the decode kernel runs one head per 4-block cluster (sm_90+)
+    return torch.cuda.get_device_capability(device) >= (9, 0)
+
+
+def deferred_buffers(batch: int, channels: int, heads: int, num_key_heads: int, dtype: torch.dtype, device: torch.device):
+    """Allocate the side buffers of the deferred-commit decode: (qkv_buf, proj_buf, gates_buf, sumsq_buf).
+
+    Each is double-buffered over the step parity and holds SLOT_MAX token slots.
+    """
+    qkv_buf = torch.empty((2, batch, channels, SLOT_MAX), dtype=dtype, device=device)
+    proj_buf = torch.empty((2, batch, SLOT_MAX, channels), dtype=dtype, device=device)
+    gates_buf = torch.empty((2, batch, SLOT_MAX, heads, 2), dtype=torch.float32, device=device)
+    sumsq_buf = torch.empty((2, batch, SLOT_MAX, num_key_heads, 2), dtype=torch.float32, device=device)
+    return qkv_buf, proj_buf, gates_buf, sumsq_buf
+
+
+def deltanet_conv_step_deferred(
+    proj: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_w: torch.Tensor,
+    conv_b: torch.Tensor | None,
+    proj_buf: torch.Tensor,
+    qkv_buf: torch.Tensor,
+    ctl: torch.Tensor,
+) -> None:
+    """Depthwise causal conv + silu over proj [B, S, C] into qkv_buf[ctl[1]] (stride SLOT_MAX).
+
+    ctl is an int32 device vector of CTL_INTS entries {pending, parity, slot[8], parent[8],
+    prog[8]}: the `pending` accepted tokens of the previous step, at its side-buffer slots
+    slot[0..pending) of proj_buf[1 - parity], are committed into conv_state first; then each
+    current row is convolved over its own ancestors, parent[r] naming the row that row r
+    extends (-1: the committed window). The current projections are saved to proj_buf[parity]
+    for the next step.
+    """
+    if not deferred_is_available(proj.device):
+        raise RuntimeError("deltanet_conv_step_deferred requires the CUDA extension on sm_90+")
+    channels = proj.shape[2]
+    wrap = _cuda_backend._wrap_for_dlpack
+    ok = _cuda_backend._C.deltanet_conv_deferred(
+        wrap(proj), wrap(proj_buf), wrap(conv_state), wrap(conv_w.reshape(channels, -1).contiguous()),
+        wrap(conv_b.contiguous()) if conv_b is not None else None, wrap(qkv_buf), wrap(ctl),
+        torch.cuda.current_stream(proj.device).cuda_stream,
+    )
+    if not ok:
+        raise RuntimeError("deltanet_conv_step_deferred launch rejected")
+
+
+def gated_delta_decode_deferred(
+    x: torch.Tensor,
+    w_a: torch.Tensor,
+    w_b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    g_decay: torch.Tensor,
+    state: torch.Tensor,
+    key_dim: int,
+    num_key_heads: int,
+    scale: float,
+    z: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    qkv_buf: torch.Tensor,
+    gates_buf: torch.Tensor,
+    sumsq_buf: torch.Tensor,
+    ctl: torch.Tensor,
+    tree: int = 0,
+) -> torch.Tensor:
+    """S GatedDeltaNet decode steps from qkv_buf[ctl[1]] written by deltanet_conv_step_deferred.
+
+    Replays the `ctl[0]` accepted tokens of the previous step from the [1 - parity] side
+    buffers (at the slots named by ctl), writes the committed fp32 state [B, Hv, DK, DV] in
+    place, then returns the outputs of the S current rows without committing them. tree != 0
+    runs the rows through ctl's program (entry = row | commit << 5, in depth-first order: a
+    chain row commits, the leaves off it then run without committing) instead of as a straight
+    chain; a row's ancestors are ctl's parent[]
+    (see deltanet_conv_step_deferred). State, dt_bias and g_decay must be contiguous.
+    """
+    batch, seq, _ = x.shape
+    heads, key_dim_head, value_dim = state.shape[1], state.shape[2], state.shape[3]
+    if not deferred_is_available(x.device, key_dim_head, value_dim):
+        raise RuntimeError("gated_delta_decode_deferred is unavailable for this device and head shape")
+    out = torch.empty((batch, seq, heads, value_dim), dtype=x.dtype, device=x.device)
+    wrap = _cuda_backend._wrap_for_dlpack
+    ok = _cuda_backend._C.gated_delta_decode_deferred(
+        wrap(x.contiguous()), wrap(w_a.contiguous()), wrap(w_b.contiguous()),
+        wrap(dt_bias), wrap(g_decay), wrap(qkv_buf), wrap(gates_buf), wrap(sumsq_buf), wrap(ctl),
+        wrap(state), wrap(out),
+        wrap(z.reshape(batch, seq, heads * value_dim)), wrap(norm_weight.contiguous()), eps,
+        key_dim, num_key_heads, scale, tree,
+        torch.cuda.current_stream(x.device).cuda_stream,
+    )
+    if not ok:
+        raise RuntimeError("gated_delta_decode_deferred launch rejected")
+    return out
 
 
 def gated_delta_decode_fused(
@@ -93,12 +178,15 @@ def gated_delta_decode_fused(
         if not ok:
             raise RuntimeError("gated_delta_decode_fused launch rejected")
         return out
+    # per-head gate values and q/k sums of squares handed from the gates kernel to the decode kernel
+    gates = torch.empty((batch, seq, heads, 2), dtype=torch.float32, device=x.device)
+    qk_sumsq = torch.empty((batch, seq, num_key_heads, 2), dtype=torch.float32, device=x.device)
     wrap = _cuda_backend._wrap_for_dlpack
     ok = _cuda_backend._C.gated_delta_decode_fused(
         wrap(mixed_qkv.contiguous()), wrap(x.contiguous()), wrap(w_a.contiguous()), wrap(w_b.contiguous()),
-        wrap(dt_bias), wrap(g_decay), wrap(state), wrap(out),
+        wrap(dt_bias), wrap(g_decay), wrap(gates), wrap(qk_sumsq), wrap(state), wrap(out),
         wrap(snapshots) if snapshots is not None else None,
-        wrap(z.reshape(batch, seq, heads * value_dim).contiguous()), wrap(norm_weight.contiguous()), eps,
+        wrap(z.reshape(batch, seq, heads * value_dim)), wrap(norm_weight.contiguous()), eps,
         key_dim, num_key_heads, scale,
         torch.cuda.current_stream(x.device).cuda_stream,
     )
@@ -133,7 +221,7 @@ def deltanet_conv_step(
         return out
     wrap = _cuda_backend._wrap_for_dlpack
     ok = _cuda_backend._C.deltanet_conv_step(
-        wrap(proj.contiguous()), wrap(conv_state), wrap(conv_w.reshape(channels, -1).contiguous()),
+        wrap(proj), wrap(conv_state), wrap(conv_w.reshape(channels, -1).contiguous()),
         wrap(conv_b.contiguous()) if conv_b is not None else None, wrap(out),
         wrap(snapshots) if snapshots is not None else None,
         torch.cuda.current_stream(proj.device).cuda_stream,

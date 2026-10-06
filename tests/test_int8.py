@@ -33,6 +33,55 @@ COMFYUI_NVIDIA_16_SERIES = (
 )
 
 
+@pytest.mark.parametrize(("n", "k", "stream_rows"), [(16, 256, 8), (48, 512, 16), (320, 1024, 32)])
+def test_w4a8_mma_pack_roundtrip(n, k, stream_rows):
+    qdata = torch.randint(-128, 128, (n, k // 2), dtype=torch.int8)
+    scale_bits = torch.randint(0, 256, (n, k // 16), dtype=torch.uint8)
+    scales = scale_bits.view(torch.float8_e4m3fn)
+
+    packed = ck.pack_w4a8_mma_weight(qdata, scales, stream_rows)
+    unpacked_qdata, unpacked_scales = ck.unpack_w4a8_mma_weight(packed, n, k, stream_rows)
+
+    assert packed.shape == (n * k * 9 // 16,)
+    assert torch.equal(unpacked_qdata, qdata)
+    assert torch.equal(unpacked_scales.view(torch.uint8), scale_bits)
+
+
+def test_w4a8_mma_pack_is_run_major():
+    # The streamed kernel reads record (tile, krow) at
+    # ((krow_in_split // 8) * splits + split) * tiles * 8 + tile * 8 + krow_in_split % 8:
+    # with 2 splits of 16 records, tile 1's record krow 20 (split 1, run 0, j 4) sits in
+    # the second chunk of the first run block.
+    n, k, stream_rows = 32, 1024, 16
+    qdata = torch.zeros((n, k // 2), dtype=torch.int8)
+    scales = torch.zeros((n, k // 16), dtype=torch.uint8)
+    tile, krow = 1, 20
+    qdata[tile * 16:(tile + 1) * 16, krow * 16:(krow + 1) * 16] = 1
+    packed = ck.pack_w4a8_mma_weight(qdata, scales.view(torch.float8_e4m3fn), stream_rows)
+    records = packed.view(-1, 288)
+    tiles, splits = n // 16, k // 32 // stream_rows
+    split, i = divmod(krow, stream_rows)
+    expected = ((i // 8) * splits + split) * tiles * 8 + tile * 8 + i % 8
+    (hit,) = records[:, :256].any(dim=1).nonzero().flatten().tolist()
+    assert hit == expected
+
+
+@pytest.mark.parametrize(
+    ("n", "k", "expected"),
+    [
+        (12288, 2560, 16),  # 768 tiles x 5 splits fills the wave
+        (1024, 2560, 8),  # small N: halves down to the pack run
+        (5120, 8704, 16),  # 272 records: 32 does not divide, 16 does
+        (5120, 3072, 8),
+        (12280, 2560, 0),  # N % 16
+        (4096, 1280, 8),  # K % 256 == 0 but 40 records: only 8 divides
+        (4096, 1152, 0),  # K % 256 != 0
+    ],
+)
+def test_w4a8_mma_stream_rows(n, k, expected):
+    assert ck.w4a8_mma_stream_rows(n, k) == expected
+
+
 def test_cuda_int8_cublas_turing_n_alignment(monkeypatch):
     """CUDA cuBLAS fallback pads Turing skinny N to 32."""
     from comfy_kitchen.backends import cuda

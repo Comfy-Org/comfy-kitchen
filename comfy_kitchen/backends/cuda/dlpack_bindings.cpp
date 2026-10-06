@@ -17,16 +17,69 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/tuple.h>
+#include <nanobind/stl/vector.h>
 #include <cuda_runtime.h>
 #include <climits>
 #include <cstring>
 #include <optional>
 #include <tuple>
+#include <vector>
 
 #include "cublaslt_runtime.h"
 #include "input_act_codes.h"
+#include "prefetch_ring.h"
 
 namespace nb = nanobind;
+
+bool prefetch_ring_available() {
+    return prefetch_ring_is_available();
+}
+
+void prefetch_ring_configure(
+    nb::ndarray<uint64_t, nb::ndim<2>, nb::device::cuda> regions,
+    int64_t count, uint64_t lookahead_bytes, uint32_t chunk_bytes, uint32_t credits, uintptr_t stream_ptr) {
+    if (regions.shape(1) != 2 || regions.stride(1) != 1 || regions.stride(0) != 2)
+        throw std::runtime_error("prefetch ring regions must be contiguous [capacity, 2]");
+    if (count < 0 || count > regions.shape(0) || count > INT_MAX)
+        throw std::runtime_error("prefetch ring count exceeds descriptor capacity");
+    if (!prefetch_ring_is_available())
+        throw std::runtime_error("prefetch ring requires an SM90 or newer CUDA device");
+    if (chunk_bytes == 0 || chunk_bytes % 16 != 0 || chunk_bytes > 98304)
+        throw std::runtime_error("prefetch ring chunk must be a multiple of 16 bytes up to 96 KiB");
+    if (lookahead_bytes < chunk_bytes)
+        throw std::runtime_error("prefetch ring lookahead must cover at least one chunk");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_prefetch_ring_configure(regions.data(), static_cast<int>(count), lookahead_bytes, chunk_bytes, credits, stream);
+}
+
+void prefetch_ring_disable(uintptr_t stream_ptr) {
+    launch_prefetch_ring_disable(reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void prefetch_ring_start(uintptr_t stream_ptr) {
+    launch_prefetch_ring_start(reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+std::tuple<uint64_t, uint64_t, uint32_t, uint64_t, uint64_t, uint64_t, std::vector<uint32_t>, std::vector<uint32_t>, uint32_t> prefetch_ring_stats() {
+    PrefetchRingState s;
+    prefetch_ring_read_stats(&s);
+    return {s.total, s.consumed, s.stalled, s.touched, s.skipped, s.waited_ns,
+            std::vector<uint32_t>(s.smid, s.smid + PREFETCH_RING_ISSUERS), std::vector<uint32_t>(s.distinct_hist, s.distinct_hist + PREFETCH_RING_ISSUERS + 1),
+            s.trace_n};
+}
+
+void prefetch_ring_set_trace(std::optional<nb::ndarray<uint64_t, nb::ndim<2>, nb::device::cuda>> trace, uintptr_t stream_ptr) {
+    uint64_t* ptr = nullptr;
+    uint32_t cap = 0;
+    if (trace.has_value()) {
+        if (trace->shape(1) != 4 || trace->stride(1) != 1 || trace->stride(0) != 4 || trace->shape(0) > UINT32_MAX)
+            throw std::runtime_error("prefetch ring trace must be contiguous [capacity, 4] uint64");
+        ptr = trace->data();
+        cap = static_cast<uint32_t>(trace->shape(0));
+    }
+    launch_prefetch_ring_set_trace(ptr, cap, reinterpret_cast<cudaStream_t>(stream_ptr));
+}
 
 // Helper: Map nanobind dtype to internal dtype code
 // Returns: 0=float32, 1=float16, 2=bfloat16, 3=uint8, 4=int8, 5=float8_e4m3fn, 6=float8_e5m2
@@ -149,6 +202,20 @@ extern "C" {
         bool has_k,
         bool split_half,
         cudaStream_t stream);
+
+    void launch_rms_rope_kv_decode_kernel(
+        const void* q, const void* k, const void* v, const void* freqs,
+        const void* q_scale, const void* k_scale, void* q_out, void* k_out,
+        void* key_cache, void* value_cache, const int64_t* position,
+        int64_t batch, int64_t rows, int64_t q_heads, int64_t kv_heads,
+        int64_t head_dim, int64_t rot_dim, int64_t q_s0, int64_t q_s1,
+        int64_t q_s2, int64_t k_s0, int64_t k_s1, int64_t k_s2, int64_t v_s0,
+        int64_t v_s1, int64_t v_s2, int64_t qo_s0, int64_t qo_s1, int64_t qo_s2,
+        int64_t ko_s0, int64_t ko_s1, int64_t ko_s2, int64_t c_s0, int64_t c_s1,
+        int64_t c_s2, int64_t p_sb, int64_t p_ss, int64_t f_s0, int64_t f_s2,
+        int64_t f_s3, int64_t f_s4, int64_t f_s5, int64_t qs_stride,
+        int64_t ks_stride, float epsilon, int input_dtype_code,
+        int freqs_dtype_code, int scale_dtype_code, cudaStream_t stream);
 
     void launch_dequantize_nvfp4_kernel(
         const void* input,
@@ -886,6 +953,118 @@ void rms_rope1(nb::ndarray<nb::device::cuda> q,
       reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
+// Decode-step fused q/k RMSNorm + split-half RoPE with the KV-cache scatter:
+// q [B,Hq,D] -> q_out [B,Hq,D]; k/v [B,Hkv,D] -> key_cache/value_cache
+// [B,capacity,Hkv,D] at row position[b].
+void rms_rope_kv_decode(nb::ndarray<nb::device::cuda> q,
+                        nb::ndarray<nb::device::cuda> k,
+                        nb::ndarray<nb::device::cuda> v,
+                        nb::ndarray<nb::device::cuda> freqs,
+                        nb::ndarray<nb::device::cuda> q_scale,
+                        nb::ndarray<nb::device::cuda> k_scale,
+                        nb::ndarray<nb::device::cuda> q_out,
+                        nb::ndarray<nb::device::cuda> k_out,
+                        nb::ndarray<nb::device::cuda> key_cache,
+                        nb::ndarray<nb::device::cuda> value_cache,
+                        nb::ndarray<int64_t, nb::device::cuda> position,
+                        float epsilon, uintptr_t stream_ptr) {
+  if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || q_out.ndim() != 4 || k_out.ndim() != 4) {
+    throw std::runtime_error("rms_rope_kv_decode q/k/v must be [B,S,H,D], q_out/k_out [B,H,S,D]");
+  }
+  const int64_t batch = q.shape(0);
+  const int64_t rows = q.shape(1);
+  const int64_t q_heads = q.shape(2);
+  const int64_t kv_heads = k.shape(2);
+  const int64_t head_dim = q.shape(3);
+  if (head_dim < 32 || head_dim % 32 != 0) {
+    throw std::runtime_error(
+        "rms_rope_kv_decode requires head_dim to be a positive multiple of 32");
+  }
+  if (k.shape(0) != batch || k.shape(1) != rows || k.shape(3) != head_dim) {
+    throw std::runtime_error("rms_rope_kv_decode k must be [B,S,Hkv,D]");
+  }
+  for (int axis = 0; axis < 4; ++axis) {
+    if (v.shape(axis) != k.shape(axis)) {
+      throw std::runtime_error("rms_rope_kv_decode v must match k");
+    }
+  }
+  if (q_out.shape(0) != batch || q_out.shape(1) != q_heads || q_out.shape(2) != rows || q_out.shape(3) != head_dim ||
+      k_out.shape(0) != batch || k_out.shape(1) != kv_heads || k_out.shape(2) != rows || k_out.shape(3) != head_dim) {
+    throw std::runtime_error("rms_rope_kv_decode q_out/k_out must be [B,H,S,D]");
+  }
+  if (key_cache.ndim() != 4 || value_cache.ndim() != 4 ||
+      key_cache.shape(0) != batch || key_cache.shape(1) != kv_heads ||
+      key_cache.shape(3) != head_dim) {
+    throw std::runtime_error(
+        "rms_rope_kv_decode caches must be [B,Hkv,capacity,D]");
+  }
+  for (int axis = 0; axis < 4; ++axis) {
+    if (value_cache.shape(axis) != key_cache.shape(axis) ||
+        value_cache.stride(axis) != key_cache.stride(axis)) {
+      throw std::runtime_error(
+          "rms_rope_kv_decode key/value caches must share shape and strides");
+    }
+  }
+  const nb::ndarray<nb::device::cuda>* paired[] = {&q, &k, &v, &q_out, &k_out, &key_cache, &value_cache};
+  for (const auto* t : paired) {
+    if (t->stride(3) != 1 || t->stride(0) % 2 != 0 || t->stride(1) % 2 != 0 || t->stride(2) % 2 != 0) {
+      throw std::runtime_error(
+          "rms_rope_kv_decode requires contiguous head_dim and even leading strides");
+    }
+  }
+  if (position.ndim() != 2 || (position.shape(0) != 1 && position.shape(0) != batch) ||
+      (position.shape(1) != 1 && position.shape(1) != rows)) {
+    throw std::runtime_error(
+        "rms_rope_kv_decode position must be an int64 [B|1, S|1] tensor");
+  }
+  if (freqs.ndim() != 6 || (freqs.shape(0) != 1 && freqs.shape(0) != batch) ||
+      freqs.shape(1) != 1 || (freqs.shape(2) != 1 && freqs.shape(2) != rows) ||
+      freqs.shape(3) < 2 || freqs.shape(3) % 2 != 0 || freqs.shape(3) * 2 > head_dim ||
+      freqs.shape(4) != 2 || freqs.shape(5) != 2) {
+    throw std::runtime_error(
+        "rms_rope_kv_decode freqs must be [1|B,1,1|S,rot/2,2,2] with rot a multiple of 4 up to head_dim");
+  }
+  const int64_t rot_dim = freqs.shape(3) * 2;
+  if (q_scale.ndim() != 1 || q_scale.shape(0) != head_dim ||
+      k_scale.ndim() != 1 || k_scale.shape(0) != head_dim) {
+    throw std::runtime_error(
+        "rms_rope_kv_decode scales must be 1D tensors of length head_dim");
+  }
+
+  const int input_dtype_code = map_dtype_to_code(q.dtype());
+  const int freqs_dtype_code = map_dtype_to_code(freqs.dtype());
+  const int scale_dtype_code = map_dtype_to_code(q_scale.dtype());
+  if ((input_dtype_code != 1 && input_dtype_code != 2) ||
+      map_dtype_to_code(k.dtype()) != input_dtype_code ||
+      map_dtype_to_code(v.dtype()) != input_dtype_code ||
+      map_dtype_to_code(q_out.dtype()) != input_dtype_code ||
+      map_dtype_to_code(k_out.dtype()) != input_dtype_code ||
+      map_dtype_to_code(key_cache.dtype()) != input_dtype_code ||
+      map_dtype_to_code(value_cache.dtype()) != input_dtype_code) {
+    throw std::runtime_error(
+        "rms_rope_kv_decode tensors must share an FP16/BF16 dtype");
+  }
+  if (freqs_dtype_code < 0 || scale_dtype_code < 0 ||
+      map_dtype_to_code(k_scale.dtype()) != scale_dtype_code) {
+    throw std::runtime_error(
+        "rms_rope_kv_decode freqs/scales must be FP32, FP16, or BF16");
+  }
+
+  launch_rms_rope_kv_decode_kernel(
+      q.data(), k.data(), v.data(), freqs.data(), q_scale.data(),
+      k_scale.data(), q_out.data(), k_out.data(), key_cache.data(), value_cache.data(),
+      position.data(), batch, rows, q_heads, kv_heads, head_dim, rot_dim,
+      q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2),
+      v.stride(0), v.stride(1), v.stride(2), q_out.stride(0), q_out.stride(1), q_out.stride(2),
+      k_out.stride(0), k_out.stride(1), k_out.stride(2),
+      key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+      position.shape(0) == 1 ? 0 : position.stride(0), position.shape(1) == 1 ? 0 : position.stride(1),
+      freqs.shape(0) == 1 ? 0 : freqs.stride(0), freqs.shape(2) == 1 ? 0 : freqs.stride(2),
+      freqs.stride(3), freqs.stride(4), freqs.stride(5), q_scale.stride(0), k_scale.stride(0), epsilon,
+      input_dtype_code, freqs_dtype_code, scale_dtype_code,
+      reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
 // Nanobind wrapper: signed INT8 V quantization
 void quant_v_int8(
     nb::ndarray<nb::device::cuda> v,
@@ -1570,6 +1749,16 @@ static void need_contiguous(const A& a, const char* who, const char* what) {
     }
 }
 
+// [B, S, N] whose rows are contiguous but may sit in a wider tensor (column slice); returns the row stride
+template <class A>
+static int64_t row_stride_3d(const A& a, const char* who, const char* what) {
+    const int64_t ld = a.shape(1) > 1 ? a.stride(1) : a.shape(2);
+    if ((a.shape(2) > 1 && a.stride(2) != 1) || ld < a.shape(2)
+        || (a.shape(0) > 1 && a.stride(0) != ld * a.shape(1)))
+        throw std::runtime_error(std::string(who) + ": " + what + " rows must be contiguous with a uniform row stride");
+    return ld;
+}
+
 // Workspace dims and slot byte offsets, from the C++ Plan (the one definition).
 nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads, int64_t token_aug = 0) {
     int64_t v[48];
@@ -2123,17 +2312,17 @@ extern "C" {
         int out_dtype_code,
         cudaStream_t stream);
 
-    bool launch_gated_delta_decode_fused(
-        const void* mixed_qkv, const void* x, const void* w_a, const void* w_b,
-        const void* dt_bias, const void* g_decay, void* state, void* out, void* snapshots,
-        const void* z, const void* norm_w, float eps,
+    bool launch_gated_delta_decode_deferred(
+        const void* x, const void* w_a, const void* w_b, const void* dt_bias, const void* g_decay,
+        const void* qkv_buf, void* gates_buf, void* sumsq_buf, const void* ctl,
+        void* state, void* out, const void* z, const void* norm_w, float eps,
         int64_t B, int64_t Hv, int64_t Hk, int64_t S, int64_t DK, int64_t DV, int64_t C, int64_t Hd,
-        int64_t key_dim, float scale, int dtype_code, cudaStream_t stream);
+        int64_t key_dim, float scale, int64_t ldz, int dtype_code, int64_t tree, cudaStream_t stream);
 
-    bool launch_deltanet_conv_step(
-        const void* proj, void* conv_state, const void* conv_w, const void* conv_b,
-        void* conv_out, void* conv_snaps,
-        int64_t B, int64_t C, int64_t S, int64_t KS, int dtype_code, cudaStream_t stream);
+    bool launch_deltanet_conv_deferred(
+        const void* proj, void* proj_buf, void* conv_state, const void* conv_w, const void* conv_b,
+        void* qkv_buf, const void* ctl,
+        int64_t B, int64_t C, int64_t S, int64_t KS, int64_t ldp, int dtype_code, cudaStream_t stream);
 
     bool launch_w4a8_codebook_gemv(
         const void* xq,
@@ -2149,6 +2338,27 @@ extern "C" {
         int64_t K,
         int64_t G,
         int64_t bits,
+        int out_dtype_code,
+        cudaStream_t stream);
+
+    bool launch_w4a8_codebook_mma(
+        const void* xq,
+        const void* weight,
+        const void* decode_lut,
+        const void* s_channel,
+        const void* xs,
+        const void* bias,
+        const void* residual,
+        const void* residual_scale,
+        void* workspace,
+        void* counters,
+        void* out,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int64_t G,
+        int64_t stream_rows,
+        int64_t warps_per_block,
         int out_dtype_code,
         cudaStream_t stream);
 
@@ -2187,6 +2397,19 @@ extern "C" {
         int rotated_dtype_code,
         bool stochastic,
         uint64_t seed,
+        cudaStream_t stream);
+
+    bool launch_quantize_int8_convrot_cluster_kernel(
+        const void* input,
+        const void* act_weight,
+        float act_eps,
+        int act_code,
+        void* output,
+        void* scales,
+        void* act_out,
+        int64_t num_rows,
+        int64_t num_cols,
+        int input_dtype_code,
         cudaStream_t stream);
 
     void launch_quantize_int8_rowwise_convrot64_kernel(
@@ -2232,6 +2455,28 @@ extern "C" {
         bool has_bias,
         int output_dtype_code,
         int bias_dtype_code,
+        const void* residual,
+        const void* residual_scale,
+        cudaStream_t stream);
+
+    void launch_int8_gemv_convrot_fused_kernel(
+        const void* input,
+        int input_dtype_code,
+        int act_code,
+        const void* act_weight,
+        float act_eps,
+        const void* weight,
+        const void* weight_scales,
+        const void* bias,
+        bool has_bias,
+        int bias_dtype_code,
+        void* output,
+        int output_dtype_code,
+        int64_t N,
+        int64_t K,
+        int64_t weight_scale_size,
+        const void* residual,
+        const void* residual_scale,
         cudaStream_t stream);
 
     void launch_dequantize_int8_simple_kernel(
@@ -2261,6 +2506,25 @@ extern "C" {
         int batch, int query_length, int heads, int head_dim, int kv_capacity, int num_splits,
         int64_t q_batch_stride, int64_t q_row_stride, int64_t q_head_stride,
         int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
+        int* combine_counters, cudaStream_t stream);
+
+    void launch_flash_decode_gqa(
+        const void* q, const void* k, const void* v, const int* kv_lengths,
+        void* output, float* softmax_lse, float* softmax_lse_accum, float* output_accum,
+        int batch, int query_length, int heads, int kv_heads, int kv_capacity, int num_splits, bool causal,
+        int64_t q_batch_stride, int64_t q_row_stride, int64_t q_head_stride,
+        int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
+        int64_t o_batch_stride, int64_t o_row_stride, int64_t o_head_stride,
+        int* combine_counters, cudaStream_t stream);
+
+    void launch_flash_decode_tree_merge(
+        const void* out, const float* lse, const void* q, const void* k, const void* v, const int* mask, void* merged,
+        int batch, int rows, int heads, int kv_heads,
+        int64_t q_batch_stride, int64_t q_head_stride, int64_t q_row_stride,
+        int64_t k_batch_stride, int64_t k_head_stride, int64_t k_row_stride,
+        int64_t v_batch_stride, int64_t v_head_stride, int64_t v_row_stride,
+        int64_t o_batch_stride, int64_t o_row_stride,
+        int64_t m_batch_stride, int64_t m_row_stride,
         cudaStream_t stream);
 
 }
@@ -3192,6 +3456,151 @@ bool w4a8_codebook_gemm_chunked(
         workspace.data(), out.data(), M, N, K, G, chunk_cols, bits, out_dtype_code, stream);
 }
 
+// input is [M, K] (or [M, 2K] gate|up for act_code swiglu); the activation is folded
+// into the cluster quantizer on sm_90+. rotated/partial_absmax are the staged-pair
+// fallback scratch for older devices and are only required when no activation is fused.
+// Streamed W4A8 activation quantizer on its own: act(input) -> (xq, xs) in the layout
+// w4a8_codebook_mma_linear consumes, so several linears over one input quantize it once
+// (hand them xq/xs and no input). act_out additionally materializes act(input) itself.
+bool quantize_int8_convrot_input(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    std::optional<nb::ndarray<nb::device::cuda>> act_weight,
+    double act_eps,
+    int64_t act_code,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> xq,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> xs,
+    std::optional<nb::ndarray<nb::ndim<2>, nb::device::cuda>> act_out,
+    uintptr_t stream_ptr) {
+    const int64_t M = xq.shape(0);
+    const int64_t K = xq.shape(1);
+    const int64_t in_width = (act_code == comfy::kActSwiGLU) ? 2 : 1;
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
+    if (input.shape(0) != M || input.shape(1) != K * in_width
+            || xs.shape(0) != M || xs.shape(1) != 1
+            || input.stride(1) != 1 || input.stride(0) != K * in_width
+            || xq.stride(1) != 1 || xq.stride(0) != K
+            || xs.stride(1) != 1 || xs.stride(0) != 1)
+        throw std::runtime_error("quantize_int8_convrot_input shape or stride mismatch");
+    if (act_code != comfy::kActNone && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm)
+        throw std::runtime_error("quantize_int8_convrot_input act_code must be none, swiglu, or rms_norm");
+    const bool has_act_weight = act_weight.has_value() && act_weight->size() > 0;
+    if (act_code == comfy::kActRmsNorm
+            && (!has_act_weight || act_weight->size() != K || act_weight->stride(0) != 1
+                || map_dtype_to_code(act_weight->dtype()) != input_dtype_code))
+        throw std::runtime_error("quantize_int8_convrot_input rms_norm weight must be K contiguous elements in the input dtype");
+    if (act_out.has_value()
+            && (act_code == comfy::kActNone
+                || act_out->shape(0) != M || act_out->shape(1) != K
+                || act_out->stride(1) != 1 || act_out->stride(0) != K
+                || map_dtype_to_code(act_out->dtype()) != input_dtype_code))
+        throw std::runtime_error("quantize_int8_convrot_input act_out must be [M, K] contiguous in the input dtype, with an activation");
+    if (input_dtype_code < 0 || input_dtype_code > 2)
+        throw std::runtime_error("quantize_int8_convrot_input input must be fp32, fp16, or bf16");
+    return launch_quantize_int8_convrot_cluster_kernel(
+        input.data(), has_act_weight ? act_weight->data() : nullptr,
+        static_cast<float>(act_eps), static_cast<int>(act_code),
+        xq.data(), xs.data(), act_out.has_value() ? act_out->data() : nullptr,
+        M, K, input_dtype_code, reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+// input absent: xq/xs already hold the quantized activation (quantize_int8_convrot_input).
+bool w4a8_codebook_mma_linear(
+    std::optional<nb::ndarray<nb::ndim<2>, nb::device::cuda>> input,
+    std::optional<nb::ndarray<nb::ndim<2>, nb::device::cuda>> rotated,
+    std::optional<nb::ndarray<float, nb::ndim<2>, nb::device::cuda>> partial_absmax,
+    std::optional<nb::ndarray<nb::device::cuda>> act_weight,
+    double act_eps,
+    int64_t act_code,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> xq,
+    nb::ndarray<int8_t, nb::ndim<1>, nb::device::cuda> weight,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> decode_lut,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> s_channel,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> xs,
+    std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> bias,
+    std::optional<nb::ndarray<nb::ndim<2>, nb::device::cuda>> residual,
+    std::optional<nb::ndarray<nb::ndim<1>, nb::device::cuda>> residual_scale,
+    nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> workspace,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> counters,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> out,
+    int64_t convrot_group_size, int64_t G, int64_t stream_rows,
+    int64_t warps_per_block, int out_dtype_code, uintptr_t stream_ptr) {
+    const int64_t M = xq.shape(0);
+    const int64_t K = xq.shape(1);
+    const int64_t in_width = (act_code == comfy::kActSwiGLU) ? 2 : 1;
+    const int64_t N = s_channel.size();
+    const int input_dtype_code = input.has_value() ? map_dtype_to_code(input->dtype()) : 1;
+    if (!input.has_value() && (act_code != comfy::kActNone || rotated.has_value()))
+        throw std::runtime_error("w4a8_codebook_mma_linear: a prequantized input takes no activation or staged scratch");
+    if (M > 8 || convrot_group_size <= 0 || K % convrot_group_size != 0
+            || (input.has_value() && (input->shape(0) != M || input->shape(1) != K * in_width))
+            || xs.shape(0) != M || xs.shape(1) != 1
+            || N % 16 != 0 || weight.size() != N * K * 9 / 16 || K % G != 0)
+        throw std::runtime_error("w4a8_codebook_mma_linear shape mismatch or M > 8");
+    if (act_code != comfy::kActNone && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm)
+        throw std::runtime_error("w4a8_codebook_mma_linear act_code must be none, swiglu, or rms_norm");
+    const bool has_act_weight = act_weight.has_value() && act_weight->size() > 0;
+    if (act_code == comfy::kActRmsNorm
+            && (!has_act_weight || act_weight->size() != K || act_weight->stride(0) != 1
+                || map_dtype_to_code(act_weight->dtype()) != input_dtype_code))
+        throw std::runtime_error("w4a8_codebook_mma_linear rms_norm weight must be K contiguous elements in the input dtype");
+    if (rotated.has_value() != partial_absmax.has_value()
+            || (rotated.has_value()
+                && (rotated->shape(0) != M || rotated->shape(1) != K
+                    || map_dtype_to_code(rotated->dtype()) != input_dtype_code
+                    || rotated->stride(1) != 1 || rotated->stride(0) != K
+                    || partial_absmax->shape(0) != M || partial_absmax->shape(1) != K / convrot_group_size
+                    || partial_absmax->stride(1) != 1
+                    || partial_absmax->stride(0) != K / convrot_group_size)))
+        throw std::runtime_error("w4a8_codebook_mma_linear staged scratch mismatch");
+    if (decode_lut.shape(0) != 256 || decode_lut.shape(1) != 16
+            || decode_lut.stride(1) != 1 || decode_lut.stride(0) != 16)
+        throw std::runtime_error("w4a8_codebook_mma_linear decode LUT must be contiguous [256, 16]");
+    if ((bias.has_value() && bias->size() != N)
+            || workspace.shape(0) != M || workspace.shape(1) != N
+            || counters.size() != N / 16 || counters.stride(0) != 1
+            || out.shape(0) != M || out.shape(1) != N
+            || map_dtype_to_code(out.dtype()) != out_dtype_code)
+        throw std::runtime_error("w4a8_codebook_mma_linear workspace, counters, output, or bias mismatch");
+    if (residual.has_value() != residual_scale.has_value()
+            || (residual.has_value()
+                && (residual->shape(0) != M || residual->shape(1) != N
+                    || residual->stride(1) != 1 || residual->stride(0) != N
+                    || map_dtype_to_code(residual->dtype()) != out_dtype_code
+                    || residual_scale->size() != N || residual_scale->stride(0) != 1
+                    || map_dtype_to_code(residual_scale->dtype()) != out_dtype_code)))
+        throw std::runtime_error("w4a8_codebook_mma_linear residual must be [M, N] contiguous with a [N] scale, both in the output dtype");
+    if ((input.has_value() && (input->stride(1) != 1 || input->stride(0) != K * in_width))
+            || xq.stride(1) != 1 || xq.stride(0) != K
+            || weight.stride(0) != 1 || s_channel.stride(0) != 1
+            || xs.stride(1) != 1 || xs.stride(0) != 1
+            || workspace.stride(1) != 1 || workspace.stride(0) != N
+            || out.stride(1) != 1 || out.stride(0) != N)
+        throw std::runtime_error("w4a8_codebook_mma_linear requires contiguous tensors");
+    if (input_dtype_code < 0 || input_dtype_code > 2)
+        throw std::runtime_error("w4a8_codebook_mma_linear input must be fp32, fp16, or bf16");
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (input.has_value() && !launch_quantize_int8_convrot_cluster_kernel(
+            input->data(), has_act_weight ? act_weight->data() : nullptr,
+            static_cast<float>(act_eps), static_cast<int>(act_code),
+            xq.data(), xs.data(), nullptr, M, K, input_dtype_code, stream)) {
+        if (act_code != comfy::kActNone || !rotated.has_value())
+            throw std::runtime_error(
+                "w4a8_codebook_mma_linear: fused activation quantizer unsupported here "
+                "(needs sm_90+ and K % 256 == 0); apply the activation eagerly");
+        launch_quantize_int8_convrot_staged_kernel(
+            input->data(), rotated->data(), partial_absmax->data(), xq.data(), xs.data(), M, K,
+            static_cast<int>(convrot_group_size), input_dtype_code, input_dtype_code,
+            false, 0, stream);
+    }
+    return launch_w4a8_codebook_mma(
+        xq.data(), weight.data(), decode_lut.data(), s_channel.data(), xs.data(),
+        bias.has_value() ? bias->data() : nullptr,
+        residual.has_value() ? residual->data() : nullptr,
+        residual_scale.has_value() ? residual_scale->data() : nullptr,
+        workspace.data(), counters.data(),
+        out.data(), M, N, K, G, stream_rows, warps_per_block, out_dtype_code, stream);
+}
 // Common W4A8 inference path: online ConvRot activation quantization followed by the
 // chunked int4 decode + strided INT8 GEMM, coordinated through one Python/native call.
 bool w4a8_codebook_linear_chunked(
@@ -3532,6 +3941,23 @@ void dequantize_int8_linear(
         stream);
 }
 
+// Fused GEMV residual: residual [1, N] and residual_scale [1] or [N], both in the output dtype;
+// an empty residual means none.
+static void check_gemv_residual(
+    const nb::ndarray<nb::device::cuda>& residual,
+    const nb::ndarray<nb::device::cuda>& residual_scale,
+    int64_t N, int output_dtype_code) {
+    if (!(residual.data() && residual.size() > 0)) {
+        return;
+    }
+    if (residual.size() != static_cast<size_t>(N) || map_dtype_to_code(residual.dtype()) != output_dtype_code) {
+        throw std::runtime_error("INT8 GEMV residual must have N elements in the output dtype");
+    }
+    if (residual_scale.size() != static_cast<size_t>(N) || map_dtype_to_code(residual_scale.dtype()) != output_dtype_code) {
+        throw std::runtime_error("INT8 GEMV residual scale must have N elements in the output dtype");
+    }
+}
+
 void int8_gemv_dequant(
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> input,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> weight,
@@ -3539,6 +3965,8 @@ void int8_gemv_dequant(
     nb::ndarray<float, nb::device::cuda> weight_scales,
     nb::ndarray<nb::device::cuda> bias,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<nb::device::cuda> residual,
+    nb::ndarray<nb::device::cuda> residual_scale,
     int output_dtype_code,
     uintptr_t stream_ptr) {
 
@@ -3573,6 +4001,9 @@ void int8_gemv_dequant(
         }
     }
 
+    check_gemv_residual(residual, residual_scale, N, output_dtype_code);
+    const bool has_residual = residual.data() && residual.size() > 0;
+
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_int8_gemv_dequant_kernel(
         input.data(),
@@ -3588,36 +4019,53 @@ void int8_gemv_dequant(
         has_bias,
         output_dtype_code,
         bias_dtype_code,
+        has_residual ? residual.data() : nullptr,
+        has_residual ? residual_scale.data() : nullptr,
         stream);
 }
 
 void int8_linear_m1(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
-    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> q_scratch,
-    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> x_scales,
+    nb::ndarray<nb::device::cuda> q_scratch,
+    nb::ndarray<nb::device::cuda> x_scales,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> weight,
     nb::ndarray<float, nb::device::cuda> weight_scales,
     nb::ndarray<nb::device::cuda> bias,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<nb::device::cuda> residual,
+    nb::ndarray<nb::device::cuda> residual_scale,
     int output_dtype_code,
     bool convrot,
     int group_size,
+    int act_code,
+    nb::ndarray<nb::device::cuda> act_weight,
+    float act_eps,
     uintptr_t stream_ptr) {
 
     const int64_t M = input.shape(0);
-    const int64_t K = input.shape(1);
+    const int64_t K = weight.shape(1);
     const int64_t N = weight.shape(0);
     if (M != 1) {
         throw std::runtime_error("INT8 M=1 linear expects input M == 1");
     }
-    if (weight.shape(1) != K) {
+    // ConvRot fuses the quantizer (and input activation) into the GEMV: the raw
+    // row is K wide, or 2K for SwiGLU's [gate | up]; q_scratch/x_scales unused.
+    if (act_code != 0 && !convrot) {
+        throw std::runtime_error("INT8 M=1 linear input activation requires convrot");
+    }
+    const int64_t in_width = (act_code == comfy::kActSwiGLU) ? 2 : 1;
+    if (input.shape(1) != K * in_width) {
         throw std::runtime_error("INT8 M=1 linear weight K mismatch");
     }
-    if (q_scratch.shape(0) != 1 || q_scratch.shape(1) != K) {
-        throw std::runtime_error("INT8 M=1 linear q scratch shape mismatch");
-    }
-    if (x_scales.shape(0) != 1 || x_scales.shape(1) != 1) {
-        throw std::runtime_error("INT8 M=1 linear activation scale shape mismatch");
+    if (!convrot) {
+        if (q_scratch.dtype() != nb::dtype<int8_t>() || q_scratch.ndim() != 2
+            || q_scratch.shape(0) != 1 || q_scratch.shape(1) != K) {
+            throw std::runtime_error("INT8 M=1 linear q scratch shape mismatch");
+        }
+        if (x_scales.dtype() != nb::dtype<float>() || x_scales.ndim() != 2
+            || x_scales.shape(0) != 1 || x_scales.shape(1) != 1) {
+            throw std::runtime_error("INT8 M=1 linear activation scale shape mismatch");
+        }
     }
     if (output.shape(0) != 1 || output.shape(1) != N) {
         throw std::runtime_error("INT8 M=1 linear output shape mismatch");
@@ -3647,33 +4095,52 @@ void int8_linear_m1(
     }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    if (convrot) {
-        launch_quantize_int8_rowwise_convrot64_kernel(
-            input.data(),
-            q_scratch.data(),
-            x_scales.data(),
-            M,
-            K,
-            group_size,
-            input_dtype_code,
-            false,
-            /*act_code=*/0,
-            0,
-            /*act_weight=*/nullptr,
-            /*act_eps=*/0.0f,
-            stream);
-    } else {
-        launch_quantize_int8_rowwise_kernel(
-            input.data(),
-            q_scratch.data(),
-            x_scales.data(),
-            M,
-            K,
-            input_dtype_code,
-            false,
-            0,
-            stream);
+    check_gemv_residual(residual, residual_scale, N, output_dtype_code);
+    const bool has_residual = residual.data() && residual.size() > 0;
+    if (has_residual && (K & 3) != 0) {
+        throw std::runtime_error("INT8 M=1 linear fused residual requires K divisible by 4");
     }
+    if (convrot) {
+        const bool has_act_weight = act_weight.data() && act_weight.size() > 0;
+        if (has_act_weight) {
+            if (act_weight.shape(0) != K) {
+                throw std::runtime_error("INT8 M=1 linear act weight shape mismatch");
+            }
+            if (map_dtype_to_code(act_weight.dtype()) != input_dtype_code) {
+                throw std::runtime_error("INT8 M=1 linear act weight must match the input dtype");
+            }
+        }
+        launch_int8_gemv_convrot_fused_kernel(
+            input.data(),
+            input_dtype_code,
+            act_code,
+            has_act_weight ? act_weight.data() : nullptr,
+            act_eps,
+            weight.data(),
+            weight_scales.data(),
+            has_bias ? bias.data() : nullptr,
+            has_bias,
+            bias_dtype_code,
+            output.data(),
+            output_dtype_code,
+            N,
+            K,
+            static_cast<int64_t>(weight_scales.size()),
+            has_residual ? residual.data() : nullptr,
+            has_residual ? residual_scale.data() : nullptr,
+            stream);
+        return;
+    }
+    launch_quantize_int8_rowwise_kernel(
+        input.data(),
+        q_scratch.data(),
+        x_scales.data(),
+        M,
+        K,
+        input_dtype_code,
+        false,
+        0,
+        stream);
     launch_int8_gemv_dequant_kernel(
         q_scratch.data(),
         weight.data(),
@@ -3688,6 +4155,8 @@ void int8_linear_m1(
         has_bias,
         output_dtype_code,
         bias_dtype_code,
+        has_residual ? residual.data() : nullptr,
+        has_residual ? residual_scale.data() : nullptr,
         stream);
 }
 
@@ -3770,6 +4239,7 @@ void flash_attention_decode(
     nb::ndarray<float, nb::device::cuda> softmax_lse,
     nb::ndarray<float, nb::device::cuda> softmax_lse_accum,
     nb::ndarray<float, nb::device::cuda> output_accum,
+    nb::ndarray<int32_t, nb::device::cuda> combine_counters,
     int num_splits,
     uintptr_t stream_ptr) {
     const int batch = k.shape(0);
@@ -3796,6 +4266,14 @@ void flash_attention_decode(
     if (k.stride(0) != v.stride(0) || k.stride(1) != v.stride(1) || k.stride(2) != v.stride(2) || k.stride(3) != 1 || v.stride(3) != 1 || q.stride(2) != 1 || output.stride(2) != 1) {
         throw std::runtime_error("Unsupported Flash Attention tensor strides");
     }
+    // In-kernel combine needs one zeroed counter per (batch * head, m_block); m_block is 1 here (seqlen_q <= 64).
+    int* counters = nullptr;
+    if (num_splits > 1 && combine_counters.size() > 0) {
+        if (combine_counters.size() < static_cast<size_t>(batch) * heads) {
+            throw std::runtime_error("Flash Attention combine counters too small");
+        }
+        counters = combine_counters.data();
+    }
 
     launch_flash_decode(
         q.data(), k.data(), v.data(), kv_lengths.data(), output.data(), softmax_lse.data(),
@@ -3803,108 +4281,228 @@ void flash_attention_decode(
         num_splits > 1 ? output_accum.data() : nullptr,
         batch, query_length, heads, head_dim, kv_capacity, num_splits,
         q.stride(0) * query_length, q.stride(0), q.stride(1),
-        k.stride(0), k.stride(1), k.stride(2), reinterpret_cast<cudaStream_t>(stream_ptr));
+        k.stride(0), k.stride(1), k.stride(2), counters, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
-bool gated_delta_decode_fused(
-    nb::ndarray<nb::ndim<3>, nb::device::cuda> mixed_qkv,      // [B, C, S] conv+silu output
+// GQA decode attention, head_dim 256, bottom-right causal over kv_lengths[b] slots:
+// q [B, H, S, 256], k/v [B, Hk, capacity, 256], output [B, S, H*256] (contiguous).
+void flash_attention_decode_gqa(
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> q,
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> k,
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> v,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> kv_lengths,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> output,
+    nb::ndarray<float, nb::device::cuda> softmax_lse,
+    nb::ndarray<float, nb::device::cuda> softmax_lse_accum,
+    nb::ndarray<float, nb::device::cuda> output_accum,
+    nb::ndarray<int32_t, nb::device::cuda> combine_counters,
+    int num_splits,
+    bool causal,
+    uintptr_t stream_ptr) {
+    constexpr int64_t kHeadDim = 256;
+    const int64_t batch = q.shape(0), heads = q.shape(1), query_length = q.shape(2);
+    const int64_t kv_heads = k.shape(1), kv_capacity = k.shape(2);
+    if (batch <= 0 || heads <= 0 || query_length <= 0 || query_length > 64 || kv_heads <= 0 || heads % kv_heads != 0 || kv_capacity <= 0 || q.shape(3) != kHeadDim) {
+        throw std::runtime_error("Invalid Flash Attention GQA decode dimensions");
+    }
+    if (k.shape(0) != batch || k.shape(3) != kHeadDim || v.shape(0) != batch || v.shape(1) != kv_heads || v.shape(2) != kv_capacity || v.shape(3) != kHeadDim) {
+        throw std::runtime_error("Flash Attention GQA k/v shape mismatch");
+    }
+    if (output.shape(0) != batch || output.shape(1) != query_length || output.shape(2) != heads * kHeadDim || kv_lengths.size() != static_cast<size_t>(batch)) {
+        throw std::runtime_error("Flash Attention GQA output or length shape mismatch");
+    }
+    if (map_dtype_to_code(q.dtype()) != 2 || map_dtype_to_code(k.dtype()) != 2 || map_dtype_to_code(v.dtype()) != 2 || map_dtype_to_code(output.dtype()) != 2) {
+        throw std::runtime_error("Flash Attention tensors must have bfloat16 dtype");
+    }
+    const size_t lse_size = static_cast<size_t>(batch) * heads * query_length;
+    if (softmax_lse.size() != lse_size || num_splits < 1 || num_splits > 32 || (num_splits > 1 && (softmax_lse_accum.size() != lse_size * num_splits || output_accum.size() != lse_size * kHeadDim * num_splits))) {
+        throw std::runtime_error("Invalid Flash Attention split workspace");
+    }
+    if (k.stride(0) != v.stride(0) || k.stride(1) != v.stride(1) || k.stride(2) != v.stride(2) || k.stride(3) != 1 || v.stride(3) != 1 || q.stride(3) != 1
+        || output.stride(2) != 1 || output.stride(1) != heads * kHeadDim || output.stride(0) != query_length * heads * kHeadDim) {
+        throw std::runtime_error("Unsupported Flash Attention tensor strides");
+    }
+
+    const int64_t groups = heads / kv_heads;
+    // In-kernel combine needs one zeroed counter per (batch * head, m_block); m_block is 1 here (seqlen_q <= 64).
+    int* counters = nullptr;
+    if (num_splits > 1 && combine_counters.size() > 0) {
+        if (combine_counters.size() < static_cast<size_t>(batch * (query_length == 1 ? kv_heads : heads))) {
+            throw std::runtime_error("Flash Attention combine counters too small");
+        }
+        counters = combine_counters.data();
+    }
+    if (query_length == 1) {
+        // Every group head of a kv head attends the same slots: fold the groups into query rows
+        // so K/V stream once per kv head. q [B, H, 1, D] viewed as [B, Hk, G, D]; output rows are
+        // already [B, 1, (Hk, G, D)].
+        launch_flash_decode_gqa(
+            q.data(), k.data(), v.data(), kv_lengths.data(), output.data(), softmax_lse.data(),
+            num_splits > 1 ? softmax_lse_accum.data() : nullptr,
+            num_splits > 1 ? output_accum.data() : nullptr,
+            static_cast<int>(batch), static_cast<int>(groups), static_cast<int>(kv_heads), static_cast<int>(kv_heads), static_cast<int>(kv_capacity), num_splits, false,
+            q.stride(0), q.stride(1), groups * q.stride(1),
+            k.stride(0), k.stride(2), k.stride(1),
+            output.stride(0), kHeadDim, groups * kHeadDim, counters, reinterpret_cast<cudaStream_t>(stream_ptr));
+        return;
+    }
+    launch_flash_decode_gqa(
+        q.data(), k.data(), v.data(), kv_lengths.data(), output.data(), softmax_lse.data(),
+        num_splits > 1 ? softmax_lse_accum.data() : nullptr,
+        num_splits > 1 ? output_accum.data() : nullptr,
+        static_cast<int>(batch), static_cast<int>(query_length), static_cast<int>(heads), static_cast<int>(kv_heads), static_cast<int>(kv_capacity), num_splits, causal,
+        q.stride(0), q.stride(2), q.stride(1),
+        k.stride(0), k.stride(2), k.stride(1),
+        output.stride(0), output.stride(1), kHeadDim, counters, reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+// Verify-tree merge: out [B, S, H*256] and lse [B, H, S] come from a prefix-only
+// flash_attention_decode_gqa (causal = false) over the S verify rows; q [B, H, S, 256] and
+// k/v [B, Hk, S, 256] are the rows' own rotated query/key/value and mask [S] the rows each
+// row must fold in (bit t = row t). merged [B, S, H*256] receives the result.
+void flash_attention_decode_tree_merge(
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> out,
+    nb::ndarray<float, nb::ndim<3>, nb::device::cuda> lse,
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> q,
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> k,
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> v,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> mask,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> merged,
+    uintptr_t stream_ptr) {
+    constexpr int64_t kHeadDim = 256;
+    const int64_t batch = q.shape(0), heads = q.shape(1), rows = q.shape(2);
+    const int64_t kv_heads = k.shape(1);
+    if (batch <= 0 || heads <= 0 || rows <= 0 || rows > 8 || kv_heads <= 0 || heads % kv_heads != 0
+        || q.shape(3) != kHeadDim || k.shape(0) != batch || k.shape(2) != rows || k.shape(3) != kHeadDim
+        || v.shape(0) != batch || v.shape(1) != kv_heads || v.shape(2) != rows || v.shape(3) != kHeadDim
+        || mask.shape(0) != rows)
+        throw std::runtime_error("Tree merge shape mismatch");
+    if (out.shape(0) != batch || out.shape(1) != rows || out.shape(2) != heads * kHeadDim
+        || merged.shape(0) != batch || merged.shape(1) != rows || merged.shape(2) != heads * kHeadDim
+        || lse.shape(0) != batch || lse.shape(1) != heads || lse.shape(2) != rows)
+        throw std::runtime_error("Tree merge output or lse shape mismatch");
+    if (map_dtype_to_code(q.dtype()) != 2 || map_dtype_to_code(k.dtype()) != 2 || map_dtype_to_code(v.dtype()) != 2
+        || map_dtype_to_code(out.dtype()) != 2 || map_dtype_to_code(merged.dtype()) != 2)
+        throw std::runtime_error("Tree merge tensors must have bfloat16 dtype");
+    if (q.stride(3) != 1 || k.stride(3) != 1 || v.stride(3) != 1 || out.stride(2) != 1 || merged.stride(2) != 1
+        || out.stride(1) != heads * kHeadDim || merged.stride(1) != heads * kHeadDim)
+        throw std::runtime_error("Unsupported tree merge strides");
+    need_contiguous(mask, "flash_attention_decode_tree_merge", "mask");
+    launch_flash_decode_tree_merge(
+        out.data(), lse.data(), q.data(), k.data(), v.data(), mask.data(), merged.data(),
+        static_cast<int>(batch), static_cast<int>(rows), static_cast<int>(heads), static_cast<int>(kv_heads),
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        out.stride(0), out.stride(1), merged.stride(0), merged.stride(1),
+        reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+bool gated_delta_decode_deferred(
     nb::ndarray<nb::ndim<3>, nb::device::cuda> x,              // [B, S, Hd]
     nb::ndarray<nb::ndim<2>, nb::device::cuda> w_a,            // [Hv, Hd]
     nb::ndarray<nb::ndim<2>, nb::device::cuda> w_b,            // [Hv, Hd]
     nb::ndarray<float, nb::ndim<1>, nb::device::cuda> dt_bias, // [Hv]
     nb::ndarray<float, nb::ndim<1>, nb::device::cuda> g_decay, // [Hv]
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> qkv_buf,        // [2, B, C, 8] conv+silu output
+    nb::ndarray<float, nb::ndim<5>, nb::device::cuda> gates_buf,   // [2, B, 8, Hv, 2]
+    nb::ndarray<float, nb::ndim<5>, nb::device::cuda> sumsq_buf,   // [2, B, 8, Hk, 2]
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> ctl,   // {pending, parity, slot[8], parent[8], prog[8]}
     nb::ndarray<float, nb::ndim<4>, nb::device::cuda> state,   // [B, Hv, DK, DV]
     nb::ndarray<nb::ndim<4>, nb::device::cuda> out,            // [B, S, Hv, DV]
-    std::optional<nb::ndarray<float, nb::ndim<5>, nb::device::cuda>> snapshots,  // [S-1, B, Hv, DK, DV]
     nb::ndarray<nb::ndim<3>, nb::device::cuda> z,              // [B, S, Hv*DV] norm gate
     nb::ndarray<nb::ndim<1>, nb::device::cuda> norm_w,         // [DV]
     double eps,
-    int64_t key_dim, int64_t num_key_heads, double scale, uintptr_t stream_ptr) {
-    const char* who = "gated_delta_decode_fused";
-    const int64_t B = mixed_qkv.shape(0), C = mixed_qkv.shape(1), S = mixed_qkv.shape(2);
+    int64_t key_dim, int64_t num_key_heads, double scale, int64_t tree, uintptr_t stream_ptr) {
+    const char* who = "gated_delta_decode_deferred";
+    const int64_t B = x.shape(0), S = x.shape(1), Hd = x.shape(2);
+    const int64_t C = qkv_buf.shape(2);
     const int64_t Hv = state.shape(1), DK = state.shape(2), DV = state.shape(3);
-    const int64_t Hd = x.shape(2);
-    const int dtype_code = map_dtype_to_code(mixed_qkv.dtype());
-    if (dtype_code < 0 || dtype_code > 2 || map_dtype_to_code(x.dtype()) != dtype_code
+    const int dtype_code = map_dtype_to_code(x.dtype());
+    if (dtype_code < 0 || dtype_code > 2 || map_dtype_to_code(qkv_buf.dtype()) != dtype_code
         || map_dtype_to_code(w_a.dtype()) != dtype_code || map_dtype_to_code(w_b.dtype()) != dtype_code
         || map_dtype_to_code(out.dtype()) != dtype_code || map_dtype_to_code(z.dtype()) != dtype_code
         || map_dtype_to_code(norm_w.dtype()) != dtype_code)
-        throw std::runtime_error(std::string(who) + ": mixed_qkv, x, w_a, w_b, z, norm_w and out must share a fp32/fp16/bf16 dtype");
-    if (x.shape(0) != B || x.shape(1) != S || w_a.shape(0) != Hv || w_a.shape(1) != Hd
+        throw std::runtime_error(std::string(who) + ": x, w_a, w_b, qkv_buf, z, norm_w and out must share a fp32/fp16/bf16 dtype");
+    if (w_a.shape(0) != Hv || w_a.shape(1) != Hd
         || w_b.shape(0) != Hv || w_b.shape(1) != Hd || dt_bias.shape(0) != Hv || g_decay.shape(0) != Hv
         || state.shape(0) != B || out.shape(0) != B || out.shape(1) != S || out.shape(2) != Hv || out.shape(3) != DV
         || z.shape(0) != B || z.shape(1) != S || z.shape(2) != Hv * DV || norm_w.shape(0) != DV
         || num_key_heads <= 0 || Hv % num_key_heads != 0 || C < 2 * key_dim + Hv * DV
-        || key_dim != num_key_heads * DK)
+        || key_dim != num_key_heads * DK
+        || qkv_buf.shape(0) != 2 || qkv_buf.shape(1) != B || qkv_buf.shape(3) != 8
+        || gates_buf.shape(0) != 2 || gates_buf.shape(1) != B || gates_buf.shape(2) != 8 || gates_buf.shape(3) != Hv || gates_buf.shape(4) != 2
+        || sumsq_buf.shape(0) != 2 || sumsq_buf.shape(1) != B || sumsq_buf.shape(2) != 8 || sumsq_buf.shape(3) != num_key_heads || sumsq_buf.shape(4) != 2
+        || ctl.shape(0) != 26)
         throw std::runtime_error(std::string(who) + ": shape mismatch");
-    need_contiguous(mixed_qkv, who, "mixed_qkv");
     need_contiguous(x, who, "x");
     need_contiguous(w_a, who, "w_a");
     need_contiguous(w_b, who, "w_b");
     need_contiguous(dt_bias, who, "dt_bias");
     need_contiguous(g_decay, who, "g_decay");
+    need_contiguous(qkv_buf, who, "qkv_buf");
+    need_contiguous(gates_buf, who, "gates_buf");
+    need_contiguous(sumsq_buf, who, "sumsq_buf");
+    need_contiguous(ctl, who, "ctl");
     need_contiguous(state, who, "state");
     need_contiguous(out, who, "out");
-    need_contiguous(z, who, "z");
+    const int64_t ldz = row_stride_3d(z, who, "z");
     need_contiguous(norm_w, who, "norm_w");
-    void* snap_ptr = nullptr;
-    if (snapshots.has_value() && S > 1) {
-        auto& sn = *snapshots;
-        if (sn.shape(0) < S - 1 || sn.shape(1) != B || sn.shape(2) != Hv || sn.shape(3) != DK || sn.shape(4) != DV)
-            throw std::runtime_error(std::string(who) + ": snapshot shape mismatch");
-        need_contiguous(sn, who, "snapshots");
-        snap_ptr = sn.data();
-    }
-    return launch_gated_delta_decode_fused(
-        mixed_qkv.data(), x.data(), w_a.data(), w_b.data(), dt_bias.data(), g_decay.data(),
-        state.data(), out.data(), snap_ptr, z.data(), norm_w.data(), static_cast<float>(eps),
-        B, Hv, num_key_heads, S, DK, DV, C, Hd, key_dim, static_cast<float>(scale), dtype_code,
+    return launch_gated_delta_decode_deferred(
+        x.data(), w_a.data(), w_b.data(), dt_bias.data(), g_decay.data(),
+        qkv_buf.data(), gates_buf.data(), sumsq_buf.data(), ctl.data(),
+        state.data(), out.data(), z.data(), norm_w.data(), static_cast<float>(eps),
+        B, Hv, num_key_heads, S, DK, DV, C, Hd, key_dim, static_cast<float>(scale), ldz, dtype_code, tree,
         reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
-bool deltanet_conv_step(
+bool deltanet_conv_deferred(
     nb::ndarray<nb::ndim<3>, nb::device::cuda> proj,        // [B, S, C]
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> proj_buf,    // [2, B, 8, C]
     nb::ndarray<nb::ndim<3>, nb::device::cuda> conv_state,  // [B, C, KS-1] in/out
     nb::ndarray<nb::ndim<2>, nb::device::cuda> conv_w,      // [C, KS]
     std::optional<nb::ndarray<nb::ndim<1>, nb::device::cuda>> conv_b,  // [C]
-    nb::ndarray<nb::ndim<3>, nb::device::cuda> conv_out,    // [B, C, S]
-    std::optional<nb::ndarray<nb::ndim<4>, nb::device::cuda>> conv_snaps,  // [S-1, B, C, KS-1]
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> qkv_buf,     // [2, B, C, 8]
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> ctl,   // {pending, parity, slot[8], parent[8], prog[8]}
     uintptr_t stream_ptr) {
-    const char* who = "deltanet_conv_step";
+    const char* who = "deltanet_conv_deferred";
     const int64_t B = proj.shape(0), S = proj.shape(1), C = proj.shape(2);
     const int64_t L = conv_state.shape(2), KS = conv_w.shape(1);
     const int dtype_code = map_dtype_to_code(proj.dtype());
     if (dtype_code < 0 || dtype_code > 2 || map_dtype_to_code(conv_state.dtype()) != dtype_code
-        || map_dtype_to_code(conv_w.dtype()) != dtype_code || map_dtype_to_code(conv_out.dtype()) != dtype_code
+        || map_dtype_to_code(conv_w.dtype()) != dtype_code || map_dtype_to_code(qkv_buf.dtype()) != dtype_code
+        || map_dtype_to_code(proj_buf.dtype()) != dtype_code
         || (conv_b.has_value() && map_dtype_to_code(conv_b->dtype()) != dtype_code))
         throw std::runtime_error(std::string(who) + ": all tensors must share a fp32/fp16/bf16 dtype");
     if (conv_state.shape(0) != B || conv_state.shape(1) != C || L != KS - 1 || conv_w.shape(0) != C
-        || conv_out.shape(0) != B || conv_out.shape(1) != C || conv_out.shape(2) != S
+        || proj_buf.shape(0) != 2 || proj_buf.shape(1) != B || proj_buf.shape(2) != 8 || proj_buf.shape(3) != C
+        || qkv_buf.shape(0) != 2 || qkv_buf.shape(1) != B || qkv_buf.shape(2) != C || qkv_buf.shape(3) != 8
+        || ctl.shape(0) != 26
         || (conv_b.has_value() && conv_b->shape(0) != C))
         throw std::runtime_error(std::string(who) + ": shape mismatch");
-    need_contiguous(proj, who, "proj");
+    const int64_t ldp = row_stride_3d(proj, who, "proj");
+    need_contiguous(proj_buf, who, "proj_buf");
     need_contiguous(conv_state, who, "conv_state");
     need_contiguous(conv_w, who, "conv_w");
-    need_contiguous(conv_out, who, "conv_out");
+    need_contiguous(qkv_buf, who, "qkv_buf");
+    need_contiguous(ctl, who, "ctl");
     if (conv_b.has_value())
         need_contiguous(*conv_b, who, "conv_b");
-    void* snaps = nullptr;
-    if (conv_snaps.has_value() && S > 1) {
-        auto& sn = *conv_snaps;
-        if (map_dtype_to_code(sn.dtype()) != dtype_code || sn.shape(0) < S - 1 || sn.shape(1) != B
-            || sn.shape(2) != C || sn.shape(3) != L)
-            throw std::runtime_error(std::string(who) + ": snapshots must be [>=S-1, B, C, KS-1] in the activation dtype");
-        need_contiguous(sn, who, "conv_snaps");
-        snaps = sn.data();
-    }
-    return launch_deltanet_conv_step(
-        proj.data(), conv_state.data(), conv_w.data(), conv_b.has_value() ? conv_b->data() : nullptr,
-        conv_out.data(), snaps, B, C, S, KS, dtype_code, reinterpret_cast<cudaStream_t>(stream_ptr));
+    return launch_deltanet_conv_deferred(
+        proj.data(), proj_buf.data(), conv_state.data(), conv_w.data(), conv_b.has_value() ? conv_b->data() : nullptr,
+        qkv_buf.data(), ctl.data(), B, C, S, KS, ldp, dtype_code, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 NB_MODULE(_C, m) {
     m.doc() = "comfy_kitchen CUDA kernels - nanobind + DLPack interface (NO PyTorch C++ dependencies)";
-    
+
+    m.def("prefetch_ring_available", &prefetch_ring_available);
+    m.def("prefetch_ring_configure", &prefetch_ring_configure,
+          nb::arg("regions"), nb::arg("count"), nb::arg("lookahead_bytes"), nb::arg("chunk_bytes"), nb::arg("credits"), nb::arg("stream_ptr"));
+    m.def("prefetch_ring_disable", &prefetch_ring_disable, nb::arg("stream_ptr"));
+    m.def("prefetch_ring_start", &prefetch_ring_start, nb::arg("stream_ptr"));
+    m.def("prefetch_ring_stats", &prefetch_ring_stats);
+    m.def("prefetch_ring_set_trace", &prefetch_ring_set_trace, nb::arg("trace").none(), nb::arg("stream_ptr"));
     m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8,
           "Quantize to FP8 using nanobind ndarrays",
           nb::arg("input"),
@@ -4178,6 +4776,20 @@ NB_MODULE(_C, m) {
           nb::arg("out"), nb::arg("g"), nb::arg("chunk_cols"), nb::arg("out_dtype_code"),
           nb::arg("stream_ptr"));
 
+    m.def("quantize_int8_convrot_input", &quantize_int8_convrot_input,
+          "Streamed W4A8 activation quantizer (optional fused activation, optional activated-row output)",
+          nb::arg("input"), nb::arg("act_weight").none(), nb::arg("act_eps"), nb::arg("act_code"),
+          nb::arg("xq"), nb::arg("xs"), nb::arg("act_out").none(), nb::arg("stream_ptr"));
+    m.def("w4a8_codebook_mma_linear", &w4a8_codebook_mma_linear,
+          "Staged ConvRot activation quantization and direct packed W4A8 tensor-core MMA",
+          nb::arg("input").none(), nb::arg("rotated").none(), nb::arg("partial_absmax").none(),
+          nb::arg("act_weight").none(), nb::arg("act_eps"), nb::arg("act_code"), nb::arg("xq"),
+          nb::arg("weight"), nb::arg("decode_lut"),
+          nb::arg("s_channel"), nb::arg("xs"), nb::arg("bias").none(),
+          nb::arg("residual").none(), nb::arg("residual_scale").none(),
+          nb::arg("workspace"), nb::arg("counters"), nb::arg("out"), nb::arg("convrot_group_size"),
+          nb::arg("g"), nb::arg("stream_rows"), nb::arg("warps_per_block"),
+          nb::arg("out_dtype_code"), nb::arg("stream_ptr"));
     m.def("w4a8_codebook_linear_chunked", &w4a8_codebook_linear_chunked,
           "Fused W4A8 inference orchestration: ConvRot activation quantization followed by chunked decode/GEMM",
           nb::arg("input"), nb::arg("xq"), nb::arg("xs"), nb::arg("weight"),
@@ -4260,11 +4872,13 @@ NB_MODULE(_C, m) {
           nb::arg("weight_scales"),
           nb::arg("bias"),
           nb::arg("output"),
+          nb::arg("residual"),
+          nb::arg("residual_scale"),
           nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"));
 
     m.def("int8_linear_m1", &int8_linear_m1,
-          "M=1 INT8 linear: activation quantization followed by GEMV/dequant",
+          "M=1 INT8 linear: activation quantization (fused into the ConvRot GEMV) followed by GEMV/dequant",
           nb::arg("input"),
           nb::arg("q_scratch"),
           nb::arg("x_scales"),
@@ -4272,9 +4886,14 @@ NB_MODULE(_C, m) {
           nb::arg("weight_scales"),
           nb::arg("bias"),
           nb::arg("output"),
+          nb::arg("residual"),
+          nb::arg("residual_scale"),
           nb::arg("output_dtype_code"),
           nb::arg("convrot"),
           nb::arg("group_size"),
+          nb::arg("act_code"),
+          nb::arg("act_weight"),
+          nb::arg("act_eps"),
           nb::arg("stream_ptr"));
 
     m.def("dequantize_int8_simple", &dequantize_int8_simple,
@@ -4315,6 +4934,13 @@ NB_MODULE(_C, m) {
           nb::arg("q"), nb::arg("freqs"), nb::arg("q_scale"), nb::arg("q_out"),
           nb::arg("epsilon"), nb::arg("stream_ptr"),
           nb::arg("split_half") = false);
+
+    m.def("rms_rope_kv_decode", &rms_rope_kv_decode,
+          "Decode-step fused q/k RMSNorm + split-half RoPE with KV-cache scatter",
+          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("freqs"),
+          nb::arg("q_scale"), nb::arg("k_scale"), nb::arg("q_out"), nb::arg("k_out"),
+          nb::arg("key_cache"), nb::arg("value_cache"), nb::arg("position"),
+          nb::arg("epsilon"), nb::arg("stream_ptr"));
 
     m.def("quantize_nvfp4", &quantize_nvfp4,
           "Quantize to FP4 E2M1 with E4M3 block scales using cuBLAS tiled layout",
@@ -4487,17 +5113,18 @@ NB_MODULE(_C, m) {
           nb::arg("causal_t"), nb::arg("causal_h"), nb::arg("causal_w"),
           nb::arg("scale"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
 
-    m.def("gated_delta_decode_fused", &gated_delta_decode_fused,
-          "GatedDeltaNet decode with gate projections, gate math and q/k normalization folded in",
-          nb::arg("mixed_qkv"), nb::arg("x"), nb::arg("w_a"), nb::arg("w_b"), nb::arg("dt_bias"), nb::arg("g_decay"),
-          nb::arg("state"), nb::arg("out"), nb::arg("snapshots") = nb::none(),
-          nb::arg("z"), nb::arg("norm_w"), nb::arg("eps"),
-          nb::arg("key_dim"), nb::arg("num_key_heads"), nb::arg("scale"), nb::arg("stream_ptr"));
+    m.def("gated_delta_decode_deferred", &gated_delta_decode_deferred,
+          "GatedDeltaNet decode with gate projections and q/k normalization folded in; "
+          "replays the previous step's accepted tokens before committing the state",
+          nb::arg("x"), nb::arg("w_a"), nb::arg("w_b"), nb::arg("dt_bias"), nb::arg("g_decay"),
+          nb::arg("qkv_buf"), nb::arg("gates_buf"), nb::arg("sumsq_buf"), nb::arg("ctl"),
+          nb::arg("state"), nb::arg("out"), nb::arg("z"), nb::arg("norm_w"), nb::arg("eps"),
+          nb::arg("key_dim"), nb::arg("num_key_heads"), nb::arg("scale"), nb::arg("tree"), nb::arg("stream_ptr"));
 
-    m.def("deltanet_conv_step", &deltanet_conv_step,
-          "Depthwise causal conv decode step with silu, in-place state update and rollback snapshots",
-          nb::arg("proj"), nb::arg("conv_state"), nb::arg("conv_w"), nb::arg("conv_b") = nb::none(),
-          nb::arg("conv_out"), nb::arg("conv_snaps") = nb::none(), nb::arg("stream_ptr"));
+    m.def("deltanet_conv_deferred", &deltanet_conv_deferred,
+          "Depthwise causal conv decode step with silu; commits the previous step's accepted window first",
+          nb::arg("proj"), nb::arg("proj_buf"), nb::arg("conv_state"), nb::arg("conv_w"), nb::arg("conv_b") = nb::none(),
+          nb::arg("qkv_buf"), nb::arg("ctl"), nb::arg("stream_ptr"));
 
     m.def("sol_attn_plan", &sol_attn_plan_py,
           "Workspace dims, slot byte offsets and total bytes for this shape and token budget",
@@ -4542,7 +5169,16 @@ NB_MODULE(_C, m) {
           "Flash Attention decode over a fixed-capacity variable-length KV cache",
           nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("kv_lengths"),
           nb::arg("output"), nb::arg("softmax_lse"), nb::arg("softmax_lse_accum"),
-          nb::arg("output_accum"), nb::arg("num_splits"), nb::arg("stream_ptr"));
+          nb::arg("output_accum"), nb::arg("combine_counters"), nb::arg("num_splits"), nb::arg("stream_ptr"));
+    m.def("flash_attention_decode_gqa", &flash_attention_decode_gqa,
+          "GQA decode attention (head_dim 256) over a [batch, kv_heads, capacity, 256] cache; causal = the verify staircase",
+          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("kv_lengths"),
+          nb::arg("output"), nb::arg("softmax_lse"), nb::arg("softmax_lse_accum"),
+          nb::arg("output_accum"), nb::arg("combine_counters"), nb::arg("num_splits"), nb::arg("causal"), nb::arg("stream_ptr"));
+    m.def("flash_attention_decode_tree_merge", &flash_attention_decode_tree_merge,
+          "Fold a verify tree's own rows into a prefix-only GQA decode result using its log-sum-exp",
+          nb::arg("out"), nb::arg("lse"), nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("mask"),
+          nb::arg("merged"), nb::arg("stream_ptr"));
 
     m.def("cutlass_fp16_conv3d", &cutlass_fp16_conv3d,
           "fp16-accumulate NDHWC conv3d with fused bias/residual; false when declined",

@@ -12,14 +12,11 @@ from __future__ import annotations
 
 import torch
 
+from comfy_kitchen.backends._activations import apply_input_act, apply_residual
+from comfy_kitchen.tensor.w4a8_stream import _FIXED_LUT, unpack_w4a8_mma_weight
+
 from .quantization import int8_linear, rotate_int8_convrot_weight
 
-# Lloyd-Max-optimal 16 levels for a group-normalized Gaussian. ConvRot makes every layer's
-# rotated groups Gaussian, so this one table matches a per-tensor fit and skips the k-means.
-_FIXED_LUT = (
-    -0.980602, -0.794529, -0.638165, -0.500986, -0.377321, -0.263187, -0.155210, -0.050720,
-    0.052541, 0.156985, 0.265284, 0.379533, 0.502636, 0.638953, 0.794876, 0.980671,
-)
 # Fit per-tensor instead when the rotated groups stay heavy-tailed. Gaussian layers sit near
 # -0.5; the threshold only trips on genuinely non-Gaussian ones (real models never do).
 _W4A8_GATE_KURTOSIS = -0.1
@@ -629,8 +626,12 @@ def dequantize_w4a8_int8_weight(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     output_dtype: torch.dtype = torch.bfloat16,
+    stream_rows: int = 0,
 ) -> torch.Tensor:
     """Decode W4A8 storage into its physical [N, K] floating weight."""
+    if stream_rows:
+        n = s_channel.numel()
+        qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, qdata.numel() * 16 // (n * 9), stream_rows)
     validate_w4a8_operands(
         qdata,
         s_rel,
@@ -667,8 +668,27 @@ def w4a8_int8_linear(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
+    stream_rows: int = 0,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute x @ W.T + bias using portable W4A8 operations."""
+    """Compute x @ W.T + bias (then residual + residual_scale * that) using portable W4A8 operations."""
+    if residual is not None:
+        return apply_residual(
+            w4a8_int8_linear(
+                x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
+                convrot_groupsize, out_dtype, stream_rows, input_act, input_act_weight,
+                input_act_eps,
+            ),
+            residual,
+            residual_scale,
+        )
+    x = apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    if stream_rows:
+        qdata, s_rel = unpack_w4a8_mma_weight(qdata, s_channel.numel(), x.shape[-1], stream_rows)
     _n, k, _bits = validate_w4a8_operands(
         qdata,
         s_rel,

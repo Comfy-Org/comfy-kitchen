@@ -538,3 +538,120 @@ class TestPartialRotary:
         assert torch.equal(q, q_ref) and torch.equal(k, k_ref)
         assert not torch.equal(q, q_orig), "q buffer was never written in place"
         assert not torch.equal(k, k_orig), "k buffer was never written in place"
+
+
+requires_kv_decode = pytest.mark.skipif(
+    not torch.cuda.is_available() or not ck.rms_rope_kv_decode_is_available(),
+    reason="requires the CUDA extension",
+)
+
+
+@requires_kv_decode
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("batch,q_heads,kv_heads,head_dim", [(1, 16, 8, 128), (3, 8, 2, 384), (2, 4, 4, 256), (1, 2, 2, 768), (1, 4, 2, 160)])
+def test_rms_rope_kv_decode_matches_split_ops(dtype, batch, q_heads, kv_heads, head_dim):
+    """One single-row decode step must equal F.rms_norm + split-half rope on q/k plus the two
+    cache scatters, bit for bit (torch's sum-of-squares order, same rotation arithmetic,
+    same slot). Only position[b]'s row of each cache may change."""
+    torch.manual_seed(0)
+    capacity = 40
+    # q/k/v are strided views of one packed [B, 1, (Hq + 2 Hkv) D] row, as the caller hands them over
+    qkv = torch.randn(batch, 1, (q_heads + 2 * kv_heads) * head_dim, device="cuda", dtype=dtype)
+    xq, xk, xv = qkv.split((q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim), dim=-1)
+    q_scale = torch.rand(head_dim, device="cuda", dtype=dtype) + 0.5
+    k_scale = torch.rand(head_dim, device="cuda", dtype=dtype) + 0.5
+    angles = torch.rand(head_dim // 2, device="cuda") * 6.28
+    cos, sin = angles.cos(), angles.sin()
+    freqs = torch.stack((cos, -sin, sin, cos), dim=-1).reshape(1, 1, 1, head_dim // 2, 2, 2)
+    position = torch.randint(0, capacity, (batch,), device="cuda", dtype=torch.int64)
+    # the caller's cache is [B, capacity, Hkv, D]; the kernel addresses it as [B, Hkv, capacity, D]
+    key_cache = torch.randn(batch, capacity, kv_heads, head_dim, device="cuda", dtype=dtype)
+    value_cache = torch.randn_like(key_cache)
+    ref_key, ref_value = key_cache.clone(), value_cache.clone()
+
+    q_n = torch.nn.functional.rms_norm(xq.view(batch, 1, q_heads, head_dim), (head_dim,), weight=q_scale, eps=1e-6)
+    k_n = torch.nn.functional.rms_norm(xk.view(batch, 1, kv_heads, head_dim), (head_dim,), weight=k_scale, eps=1e-6)
+    q_ref, k_ref = ck.apply_rope_split_half(q_n.transpose(1, 2), k_n.transpose(1, 2), freqs)
+    index = position.view(batch, 1, 1, 1).expand(batch, 1, kv_heads, head_dim)
+    ref_key.scatter_(1, index, k_ref.transpose(1, 2))
+    ref_value.scatter_(1, index, xv.view(batch, 1, kv_heads, head_dim))
+
+    q_out, k_out = ck.rms_rope_kv_decode(
+        xq.view(batch, 1, q_heads, head_dim), xk.view(batch, 1, kv_heads, head_dim), xv.view(batch, 1, kv_heads, head_dim),
+        freqs, q_scale, k_scale, key_cache.transpose(1, 2), value_cache.transpose(1, 2), position.view(batch, 1), 1e-6)
+
+    assert q_out.shape == (batch, q_heads, 1, head_dim)
+    assert torch.equal(q_out, q_ref)
+    assert torch.equal(k_out, k_ref)
+    assert torch.equal(key_cache, ref_key)
+    assert torch.equal(value_cache, ref_value)
+
+
+@requires_kv_decode
+@pytest.mark.parametrize("rows", [1, 6, 8192])
+def test_rms_rope_kv_decode_partial_rotary_rows(rows):
+    """Qwen3.5-style step: S rows of a packed [q | gate] head layout, norm over the whole
+    head, rotation over the first rot dims only, per-row positions and rotations, cache
+    [B, Hkv, capacity, D]. Reference is the unfused chain (F.rms_norm, split-half rope on
+    the rotary slice, cat, index_copy). 8192 rows (12.6M elements) catch a sum-of-squares
+    order that differs from torch's: a wrong order flips ~1 bf16 ulp in ~3e-6 of them."""
+    torch.manual_seed(0)
+    batch, q_heads, kv_heads, head_dim, rot, capacity = 1, 4, 2, 256, 64, max(32, rows)
+    dtype = torch.bfloat16
+    qkv = torch.randn(batch, rows, (2 * q_heads + 2 * kv_heads) * head_dim, device="cuda", dtype=dtype)
+    qg, xk, xv = qkv.split((2 * q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim), dim=-1)
+    xq = qg.view(batch, rows, q_heads, 2 * head_dim)[..., :head_dim]
+    xk = xk.view(batch, rows, kv_heads, head_dim)
+    xv = xv.view(batch, rows, kv_heads, head_dim)
+    q_scale = torch.rand(head_dim, device="cuda", dtype=dtype) + 0.5
+    k_scale = torch.rand(head_dim, device="cuda", dtype=dtype) + 0.5
+    angles = torch.rand(rows, rot // 2, device="cuda") * 6.28
+    cos, sin = angles.cos(), angles.sin()
+    freqs = torch.stack((cos, -sin, sin, cos), dim=-1).reshape(1, 1, rows, rot // 2, 2, 2)
+    start = capacity - rows
+    position = torch.arange(start, start + rows, device="cuda")
+    key_cache = torch.randn(batch, kv_heads, capacity, head_dim, device="cuda", dtype=dtype)
+    value_cache = torch.randn_like(key_cache)
+    ref_key, ref_value = key_cache.clone(), value_cache.clone()
+
+    q_n = torch.nn.functional.rms_norm(xq, (head_dim,), weight=q_scale, eps=1e-6).transpose(1, 2)
+    k_n = torch.nn.functional.rms_norm(xk, (head_dim,), weight=k_scale, eps=1e-6).transpose(1, 2)
+    q_rot, k_rot = ck.apply_rope_split_half(q_n[..., :rot], k_n[..., :rot], freqs)
+    q_ref = torch.cat([q_rot, q_n[..., rot:]], dim=-1)
+    k_ref = torch.cat([k_rot, k_n[..., rot:]], dim=-1)
+    ref_key.index_copy_(2, position, k_ref)
+    ref_value.index_copy_(2, position, xv.transpose(1, 2))
+
+    q_out, k_out = ck.rms_rope_kv_decode(xq, xk, xv, freqs, q_scale, k_scale, key_cache, value_cache, position.view(1, rows), 1e-6)
+
+    assert torch.equal(q_out, q_ref)
+    assert torch.equal(k_out, k_ref)
+    assert torch.equal(key_cache, ref_key)
+    assert torch.equal(value_cache, ref_value)
+
+
+@requires_kv_decode
+def test_rms_rope_kv_decode_per_batch_freqs():
+    torch.manual_seed(0)
+    batch, q_heads, kv_heads, head_dim, capacity = 2, 4, 2, 128, 8
+    q = torch.randn(batch, q_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    scale = torch.ones(head_dim, device="cuda", dtype=torch.bfloat16)
+    angles = torch.rand(batch, head_dim // 2, device="cuda") * 6.28
+    cos, sin = angles.cos(), angles.sin()
+    freqs = torch.stack((cos, -sin, sin, cos), dim=-1).reshape(batch, 1, 1, head_dim // 2, 2, 2)
+    position = torch.tensor([5, 1], device="cuda")
+    key_cache = torch.zeros(batch, capacity, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    value_cache = torch.zeros_like(key_cache)
+
+    q_ref, k_ref = ck.rms_rope_split_half(q.unsqueeze(2), k.unsqueeze(2), freqs, scale, scale, 1e-6)
+    q_out, _ = ck.rms_rope_kv_decode(q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), freqs, scale, scale,
+                                     key_cache.transpose(1, 2), value_cache.transpose(1, 2), position.view(batch, 1), 1e-6)
+
+    assert torch.equal(q_out, q_ref)
+    for b in range(batch):
+        assert torch.equal(key_cache[b, position[b]], k_ref[b, :, 0])
+        assert torch.equal(value_cache[b, position[b]], v[b])
+        untouched = torch.arange(capacity, device="cuda") != position[b]
+        assert not key_cache[b, untouched].any() and not value_cache[b, untouched].any()

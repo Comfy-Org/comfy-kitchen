@@ -122,6 +122,12 @@ class QuantizedLayout(ABC):
         return {}
 
     @classmethod
+    def decode_layout(cls, qdata: torch.Tensor, params: Any) -> tuple[torch.Tensor, Any]:
+        """Relayout a resident weight into its decode kernel's read order. The default
+        layout has no such order; layouts that do return new (qdata, params)."""
+        return qdata, params
+
+    @classmethod
     def supports_fast_matmul(cls) -> bool:
         """Check if fast quantized matmul is supported on current hardware."""
         if cls.MIN_SM_VERSION is None:
