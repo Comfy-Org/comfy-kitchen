@@ -40,6 +40,64 @@ inline size_t convrot_static_lds_bytes(int block_threads) {
 
 constexpr int kConvRotGroup256 = 256;
 
+// The FHT scratch buffers are padded so the radix-4 stage's strided reads land on
+// distinct LDS banks. With a plain 256-float buffer, convrot_fht_stage64<4>'s
+// base = (lane%4) + (lane/4)*16 puts a wave's 32 lanes on only 8 banks (4-way
+// conflict, so its 8 instructions cost 32 cycles per group); stage<16> is 2-way.
+// One float of padding after every 16 elements takes stage<4> from 4-way to 2-way
+// and leaves stage<16> alone, for +6% LDS.
+//
+// **Why 1 and not 4.** Four floats flattens every stage to a single wavefront
+// (S=4 and S=16 both conflict-free) and measured at least as fast as one float on
+// the shapes this part runs -- the two sit inside each other's run-to-run spread.
+// It is still the wrong choice: the scratch
+// then grows 25% instead of 6%, and that is enough to change the block-width
+// decision on every architecture whose width table this file carries. K=12288 and
+// K=14336 stop fitting a 1024-thread block (padded needs 65668 B against a
+// 65536 B LDS limit -- over by 132 B) and fall to 768, a pure performance loss
+// on shapes this part never runs and therefore never measures.
+// benchmark_attn/check_pad_gating.py lists which (K, dtype) that touches per
+// architecture. At one float nothing on any table moves, so the padding stays
+// off the width heuristics' backs entirely and convrot_quant_fused_block_threads
+// is left exactly as it was -- which is also the smaller diff.
+//
+// **Not gated by architecture, deliberately.** The bank layout being fixed
+// (32 banks x 4 B on every GCN/RDNA part) is not part specific, so gating the
+// padding to the parts it was measured on would forfeit the win everywhere else
+// for no correctness reason: it only reorders LDS addresses, and
+// convrot_fused_lds_fits below charges the padded size so an over-wide block
+// degrades to a narrower one (or to the global spill) rather than misbehaving.
+//
+// Measured on the 6-WGP 780M, same-process interleaved over both .pyd builds,
+// 31-41 rounds, product heuristics unchanged (benchmark_attn/sweep_quant_pad.py).
+// Shapes are the ones the real checkpoints present, at all three usual
+// resolutions, weighted by layer count (benchmark_attn/ck_shapes.py reads each
+// quantized weight's comfy_quant blob for K; M comes from the benchmark's
+// by_shape signatures). Per-resolution, per-model total quantizer time:
+//
+//              1024x1024   1024x1536   1536x1536
+//   Anima        -3.7%       -4.6%       -7.4%
+//   SDXL         -2.7%       -0.5%       -4.0%
+//
+// Every shape is negative or flat in both models; the two that read slightly
+// positive at 31 rounds (SDXL K=1280 at 1024x1024, +0.4%; K=5120 at 1024x1536,
+// +2.9%) are ~0.2 ms calls and came out at -11.0% and -10.2% at 41 rounds, so take
+// the direction as measured and each individual magnitude as noisy. SDXL's K=640
+// x75 layers are group_size 64, which routes to the legacy kernel and does not
+// touch this padding.
+//
+// The activation shapes do not depend on the weight format at all: K is the layer's
+// in_features, fixed by the architecture, while the bit width only changes the
+// weight tensor's column count (K x bits/8). int8, w4a8, w6a8 and w4a4 therefore hand
+// this kernel an identical (M, K) set at every resolution and get an identical
+// speedup.
+//
+// Bit-exact in every case -- padding moves addresses, not arithmetic.
+constexpr int kConvRotFhtPadUnit = 16;
+constexpr int kConvRotFhtPadFloats = 1;
+constexpr int kConvRotGroup256Pad =
+    kConvRotGroup256 + (kConvRotGroup256 / kConvRotFhtPadUnit) * kConvRotFhtPadFloats;
+
 // convrot_quant_kernel stages the whole rotated row in dynamic LDS, preserving
 // the input dtype's rounding contract. K is therefore bounded by both the
 // workgroup budget and the input element size. Past it the wrappers fall back
@@ -264,10 +322,13 @@ inline bool convrot_fused_lds_fits(int K, int block_threads, int in_dtype) {
         return false;
     }
     const int groups_in_flight = block_threads / 64;
+    // The scratch term is kConvRotGroup256Pad, not kConvRotGroup256: the FHT stages
+    // address the padded buffers, so charging the dense size here would let a launch
+    // pick a block width whose dynamic LDS request the driver then refuses.
     const size_t need =
         (static_cast<size_t>(block_threads / 32) + 1) * sizeof(float) +
         static_cast<size_t>(K) * row_element_size +
-        static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256 * sizeof(float);
+        static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256Pad * sizeof(float);
     return need <= static_cast<size_t>(lds);
 }
 
@@ -630,28 +691,39 @@ __forceinline__ __device__ float block_reduce_sum(float v, float* warp_smem, flo
     return *block_smem;
 }
 
+// Maps a 0..255 slot of a FHT scratch buffer to its padded LDS address. Only the
+// scratch uses this; the caller's row_buf/output stays a dense array, so the
+// quantize pass keeps reading it contiguously.
+__forceinline__ __device__ int convrot_fht_slot(int i) {
+    return i + (i / kConvRotFhtPadUnit) * kConvRotFhtPadFloats;
+}
+
 template <int S>
 __forceinline__ __device__ void convrot_fht_stage64(
     const float* __restrict__ src, float* __restrict__ dst, int lane) {
     const int base = (lane % S) + (lane / S) * (4 * S);
-    const float x0 = src[base];
-    const float x1 = src[base + S];
-    const float x2 = src[base + 2 * S];
-    const float x3 = src[base + 3 * S];
-    dst[base] = 0.5f * (x0 + x1 + x2 - x3);
-    dst[base + S] = 0.5f * (x0 + x1 - x2 + x3);
-    dst[base + 2 * S] = 0.5f * (x0 - x1 + x2 + x3);
-    dst[base + 3 * S] = 0.5f * (-x0 + x1 + x2 + x3);
+    const int p0 = convrot_fht_slot(base);
+    const int p1 = convrot_fht_slot(base + S);
+    const int p2 = convrot_fht_slot(base + 2 * S);
+    const int p3 = convrot_fht_slot(base + 3 * S);
+    const float x0 = src[p0];
+    const float x1 = src[p1];
+    const float x2 = src[p2];
+    const float x3 = src[p3];
+    dst[p0] = 0.5f * (x0 + x1 + x2 - x3);
+    dst[p1] = 0.5f * (x0 + x1 - x2 + x3);
+    dst[p2] = 0.5f * (x0 - x1 + x2 + x3);
+    dst[p3] = 0.5f * (-x0 + x1 + x2 + x3);
 }
 
 template <int S>
 __forceinline__ __device__ float convrot_fht_stage64_store_absmax(
     const float* __restrict__ src, float* __restrict__ row_buf, int lane) {
     const int base = (lane % S) + (lane / S) * (4 * S);
-    const float x0 = src[base];
-    const float x1 = src[base + S];
-    const float x2 = src[base + 2 * S];
-    const float x3 = src[base + 3 * S];
+    const float x0 = src[convrot_fht_slot(base)];
+    const float x1 = src[convrot_fht_slot(base + S)];
+    const float x2 = src[convrot_fht_slot(base + 2 * S)];
+    const float x3 = src[convrot_fht_slot(base + 3 * S)];
     const float y0 = 0.5f * (x0 + x1 + x2 - x3);
     const float y1 = 0.5f * (x0 + x1 - x2 + x3);
     const float y2 = 0.5f * (x0 - x1 + x2 + x3);
@@ -667,10 +739,10 @@ template <int S, typename RowT>
 __forceinline__ __device__ float convrot_fht_stage64_store_absmax_typed(
     const float* __restrict__ src, RowT* __restrict__ output, int lane) {
     const int base = (lane % S) + (lane / S) * (4 * S);
-    const float x0 = src[base];
-    const float x1 = src[base + S];
-    const float x2 = src[base + 2 * S];
-    const float x3 = src[base + 3 * S];
+    const float x0 = src[convrot_fht_slot(base)];
+    const float x1 = src[convrot_fht_slot(base + S)];
+    const float x2 = src[convrot_fht_slot(base + 2 * S)];
+    const float x3 = src[convrot_fht_slot(base + 3 * S)];
     const float y0 = 0.5f * (x0 + x1 + x2 - x3);
     const float y1 = 0.5f * (x0 + x1 - x2 + x3);
     const float y2 = 0.5f * (x0 - x1 + x2 + x3);
@@ -700,7 +772,7 @@ __forceinline__ __device__ float finite_absmax_for_quant(float abs_max) {
 constexpr int kConvrotGlobalGroupsPerBlock = 8;
 constexpr int kConvrotGlobalBlockThreads = kConvrotGlobalGroupsPerBlock * 64;
 constexpr size_t kConvrotGlobalSmemBytes =
-    static_cast<size_t>(kConvrotGlobalGroupsPerBlock) * 2 * kConvRotGroup256 * sizeof(float);
+    static_cast<size_t>(kConvrotGlobalGroupsPerBlock) * 2 * kConvRotGroup256Pad * sizeof(float);
 
 // Large K: rotate 8 groups/block into global memory, record per-group absmax, then
 // quantize in a second kernel. Fixed 16 KiB LDS regardless of K.
@@ -722,10 +794,11 @@ __global__ __launch_bounds__(GROUPS_PER_BLOCK* 64) void convrot_rotate_groups64_
     const int64_t in_row_offset = row_offset * kInWidth;
     const int group_col = group * kConvRotGroup256;
 
-    float* buf0 = smem + sub * (2 * kConvRotGroup256);
-    float* buf1 = buf0 + kConvRotGroup256;
+    float* buf0 = smem + sub * (2 * kConvRotGroup256Pad);
+    float* buf1 = buf0 + kConvRotGroup256Pad;
 
     const int base = lane * 4;
+    const int seed_base = convrot_fht_slot(base);
     const int col = group_col + base;
     float xv0 = 0.0f;
     float xv1 = 0.0f;
@@ -748,10 +821,10 @@ __global__ __launch_bounds__(GROUPS_PER_BLOCK* 64) void convrot_rotate_groups64_
             xv3 = load_input_act<ACT>(x, in_row_offset, col + 3, K, in_dtype);
         }
     }
-    buf1[base] = 0.5f * (xv0 + xv1 + xv2 - xv3);
-    buf1[base + 1] = 0.5f * (xv0 + xv1 - xv2 + xv3);
-    buf1[base + 2] = 0.5f * (xv0 - xv1 + xv2 + xv3);
-    buf1[base + 3] = 0.5f * (-xv0 + xv1 + xv2 + xv3);
+    buf1[seed_base] = 0.5f * (xv0 + xv1 + xv2 - xv3);
+    buf1[seed_base + 1] = 0.5f * (xv0 + xv1 - xv2 + xv3);
+    buf1[seed_base + 2] = 0.5f * (xv0 - xv1 + xv2 + xv3);
+    buf1[seed_base + 3] = 0.5f * (-xv0 + xv1 + xv2 + xv3);
     __syncthreads();
 
     convrot_fht_stage64<4>(buf1, buf0, lane);
@@ -867,9 +940,14 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     const int64_t in_row_offset = row_offset * kInWidth;
     const int n_groups = K / kConvRotGroup256;
 
-    float* buf0 = tmp + sub * (2 * kConvRotGroup256);
-    float* buf1 = buf0 + kConvRotGroup256;
+    float* buf0 = tmp + sub * (2 * kConvRotGroup256Pad);
+    float* buf1 = buf0 + kConvRotGroup256Pad;
     float abs_max = 0.0f;
+    // The register butterfly that seeds each group has to land at the same padded
+    // slots convrot_fht_slot() hands the first FHT stage, so it writes through the
+    // map rather than at raw `lane * 4`. Loop invariant: it does not depend on the
+    // group, only on the lane.
+    const int seed_base = convrot_fht_slot(lane * 4);
 
     // RmsNorm needs the row's mean square before the first group.
     float rstd = 1.0f;
@@ -930,10 +1008,10 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
                 xv3 = v[3];
             }
         }
-        buf1[base] = 0.5f * (xv0 + xv1 + xv2 - xv3);
-        buf1[base + 1] = 0.5f * (xv0 + xv1 - xv2 + xv3);
-        buf1[base + 2] = 0.5f * (xv0 - xv1 + xv2 + xv3);
-        buf1[base + 3] = 0.5f * (-xv0 + xv1 + xv2 + xv3);
+        buf1[seed_base] = 0.5f * (xv0 + xv1 + xv2 - xv3);
+        buf1[seed_base + 1] = 0.5f * (xv0 + xv1 - xv2 + xv3);
+        buf1[seed_base + 2] = 0.5f * (xv0 - xv1 + xv2 + xv3);
+        buf1[seed_base + 3] = 0.5f * (-xv0 + xv1 + xv2 + xv3);
         __syncthreads();
 
         convrot_fht_stage64<4>(buf1, buf0, lane);
@@ -999,7 +1077,7 @@ inline bool launch_convrot_quant_fused_impl(
     const int groups_in_flight = BLOCK_THREADS / 64;
     const size_t shmem =
         static_cast<size_t>(K) * sizeof(RowT) +
-        static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256 * sizeof(float);
+        static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256Pad * sizeof(float);
     auto kernel = convrot_quant_fused_kernel<RowT, PACK_INT4, BLOCK_THREADS, ACT>;
     const hipError_t attr_err = hipFuncSetAttribute(
         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize,
