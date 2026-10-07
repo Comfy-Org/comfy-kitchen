@@ -16,7 +16,11 @@
 // exits when the step is consumed. Ranges must be 16-byte aligned in base and
 // size. Besides weights the list may carry per-step state the attention
 // kernels read (KV cache rows, DeltaNet recurrent state); `credits` says which
-// of those kernels credit their reads, so the host only lists what is credited. Counters are updated without synchronization by design: the consumer
+// of those kernels credit their reads, so the host only lists what is credited.
+// Small tensors read by kernels that never credit (norm scales, conv taps, gate
+// projections) carry PREFETCH_REGION_SELF_CREDIT: the issuer credits them
+// itself as its walk passes them, so they ride in the stream without a
+// consumer. Counters are updated without synchronization by design: the consumer
 // credits with fire-and-forget atomics and the issuer reads snapshots; the
 // only consequence of a stale read is a chunk prefetched late or twice.
 #ifndef PREFETCH_RING_ISSUERS
@@ -28,9 +32,14 @@ enum : uint32_t {
     PREFETCH_RING_CREDIT_DELTA = 2u,   // gated delta decode credits its recurrent state tile
 };
 
+enum : uint64_t {
+    PREFETCH_REGION_SELF_CREDIT = 1ull,   // no consumer credits it: the issuer does when its walk passes the region
+};
+
 struct PrefetchRegion {
     const unsigned char* base;
     uint64_t bytes;
+    uint64_t flags;   // PREFETCH_REGION_* mask
 };
 
 struct PrefetchRingState {

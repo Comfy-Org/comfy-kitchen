@@ -97,20 +97,32 @@ __device__ __forceinline__ void trace_record(PrefetchRingState* ring, uint64_t* 
 // Cursor into the concatenated region list; advancing by n bytes walks regions.
 // The current region is cached in registers: the issue loop must not take a
 // dependent global load per chunk (see the issuer geometry note).
+//
+// Every CTA walks the whole stream (it prefetches only its own chunks), so the
+// CTA given `consumed` credits each self-crediting region once, as its walk
+// leaves the region on the first pass; the wrap-around past `total` is not
+// a read of this step.
 struct RingCursor {
     const PrefetchRegion* regions;
     int count;
     int index;
     uint64_t offset;
+    uint64_t position;   // walked bytes of the step's stream
+    uint64_t total;
+    uint64_t* consumed;  // nullptr: this CTA does not credit
     const unsigned char* base;
     uint64_t bytes;
+    uint64_t flags;
 
     __device__ void load() {
         const PrefetchRegion r = regions[index];
         base = r.base;
         bytes = r.bytes;
+        flags = r.flags;
     }
     __device__ void next_region() {
+        if (consumed != nullptr && (flags & PREFETCH_REGION_SELF_CREDIT) && position <= total)
+            atomicAdd(reinterpret_cast<unsigned long long*>(consumed), static_cast<unsigned long long>(bytes));
         offset = 0;
         if (++index == count) index = 0;
         load();
@@ -121,6 +133,7 @@ struct RingCursor {
             const uint64_t step = n < avail ? n : avail;
             n -= step;
             offset += step;
+            position += step;
             if (offset == bytes) next_region();
         }
     }
@@ -136,6 +149,7 @@ struct RingCursor {
 #endif
             n -= step;
             offset += step;
+            position += step;
             if (offset == bytes) next_region();
         }
     }
@@ -145,7 +159,10 @@ struct RingCursor {
 // stream. A chunk is requested once it lies within `lookahead` of the consumed
 // position; chunks demand has already consumed are skipped. The kernel ends
 // after requesting `lookahead` bytes past the end of the step (the wrap-around
-// start of the next one).
+// start of the next one). CTA 0 credits the self-crediting regions as it
+// passes them (RingCursor); that credit lands when the region is issued, a
+// little ahead of its read, which widens the window by at most the
+// self-crediting bytes within one lookahead.
 //
 // The loop decides from a snapshot of the racy counters that was loaded while
 // the previous chunk issued, so the fast path has no load latency in it; a
@@ -180,7 +197,7 @@ __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(Pr
     const uint32_t trace_cap = ring->trace_cap;
 
     uint64_t cursor = chunk * blockIdx.x;
-    RingCursor pos{ring->regions, ring->count, 0, 0, nullptr, 0};
+    RingCursor pos{ring->regions, ring->count, 0, 0, 0, end, blockIdx.x == 0 ? &ring->consumed : nullptr, nullptr, 0, 0};
     pos.load();
     pos.advance(cursor);
 

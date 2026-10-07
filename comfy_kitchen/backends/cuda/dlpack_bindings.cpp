@@ -39,8 +39,8 @@ bool prefetch_ring_available() {
 void prefetch_ring_configure(
     nb::ndarray<uint64_t, nb::ndim<2>, nb::device::cuda> regions,
     int64_t count, uint64_t lookahead_bytes, uint32_t chunk_bytes, uint32_t credits, uintptr_t stream_ptr) {
-    if (regions.shape(1) != 2 || regions.stride(1) != 1 || regions.stride(0) != 2)
-        throw std::runtime_error("prefetch ring regions must be contiguous [capacity, 2]");
+    if (regions.shape(1) != 3 || regions.stride(1) != 1 || regions.stride(0) != 3)
+        throw std::runtime_error("prefetch ring regions must be contiguous [capacity, 3]");
     if (count < 0 || count > regions.shape(0) || count > INT_MAX)
         throw std::runtime_error("prefetch ring count exceeds descriptor capacity");
     if (!prefetch_ring_is_available())

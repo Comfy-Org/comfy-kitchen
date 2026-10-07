@@ -22,10 +22,14 @@ def is_available() -> bool:
 CREDIT_KV = 1      # flash_attention_decode_gqa credits the K/V rows it attends
 CREDIT_DELTA = 2   # gated_delta_decode_deferred credits its recurrent state
 
+# region flag: nothing credits the region's bytes (read by a plain torch kernel, say); the issuer
+# credits them itself as it passes the region
+SELF_CREDIT = 1
+
 
 def configure(regions: torch.Tensor, count: int, lookahead_bytes: int, chunk_bytes: int = 96 * 1024, credits: int = 0) -> None:
-    """regions: [capacity, 2] uint64 (base, bytes) in read order; the byte counts may be rewritten
-    on the same stream between steps (start() re-sums them)."""
+    """regions: [capacity, 3] uint64 (base, bytes, flags) in read order; the byte counts may be
+    rewritten on the same stream between steps (start() re-sums them)."""
     cuda = _cuda()
     stream = torch.cuda.current_stream(regions.device).cuda_stream
     cuda._C.prefetch_ring_configure(cuda._wrap_for_dlpack(regions), count, lookahead_bytes, chunk_bytes, credits, stream)

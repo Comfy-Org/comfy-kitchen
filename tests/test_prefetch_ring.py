@@ -10,13 +10,16 @@ LOOKAHEAD = 1 << 20
 
 
 def _run_step(regions, credits, consume):
-    """Configure a ring over `regions`, start one step, run `consume` and check the counters.
+    """Configure a ring over `regions` ((base, bytes) or (base, bytes, flags)), start one step, run
+    `consume` and check the counters.
 
     The regions total less than LOOKAHEAD, so the issuers request everything up front and then
     wait for credit; without any they give up (100 ms) and count as stalled (all but the CTAs
-    whose stride already carried them past the wrap-around end).
+    whose stride already carried them past the wrap-around end). Self-crediting regions are
+    credited by the issuer itself, exactly once although its walk wraps past them again.
     """
     consume()   # first launches load modules, which would exceed the issuers' give-up time
+    regions = [r if len(r) == 3 else r + (0,) for r in regions]
     descriptors = torch.tensor(regions, dtype=torch.uint64, device="cuda")
     prefetch_ring.configure(descriptors, len(regions), LOOKAHEAD, credits=credits)
     prefetch_ring.start(descriptors.device)
@@ -24,10 +27,21 @@ def _run_step(regions, credits, consume):
     torch.cuda.synchronize()   # the issuers run on a side stream
     total, consumed, stalled, *_ = prefetch_ring.stats()
     prefetch_ring.disable(descriptors.device)
-    assert total == sum(bytes_ for _, bytes_ in regions)
-    expected = sum(bytes_ for _, bytes_ in regions) if credits else 0
+    assert total == sum(bytes_ for _, bytes_, _ in regions)
+    expected = sum(bytes_ for _, bytes_, flags in regions if flags & prefetch_ring.SELF_CREDIT or credits)
     assert consumed == expected
-    assert (stalled == 0) == bool(credits)
+    assert (stalled == 0) == (expected == total)
+
+
+def _self_credit(tensor):
+    return (tensor.data_ptr(), tensor.numel() * tensor.element_size(), prefetch_ring.SELF_CREDIT)
+
+
+@requires_ring
+def test_self_credit_regions_need_no_consumer():
+    # nothing reads these: the issuer credits them as it passes and the step completes
+    tensors = [torch.empty(n, device="cuda", dtype=torch.uint8) for n in (16, 8192, 65536, 48, 256)]
+    _run_step([_self_credit(t) for t in tensors], 0, lambda: None)
 
 
 @requires_ring
@@ -46,6 +60,8 @@ def test_flash_decode_gqa_credits_live_kv_rows(query_length, credits):
     kv_lengths = torch.tensor(lengths, device="cuda", dtype=torch.int32)
     row_bytes = 256 * k.element_size()
     regions = [(t[b, h].data_ptr(), lengths[b] * row_bytes) for t in (k, v) for b in range(batch) for h in range(kv_heads)]
+    scale, bias = torch.empty(256, device="cuda", dtype=torch.bfloat16), torch.empty(2048, device="cuda", dtype=torch.bfloat16)
+    regions = [_self_credit(scale)] + regions + [_self_credit(bias)]   # norm scale ahead, bias after: issuer-credited either side
     _run_step(regions, credits, lambda: ck.flash_attention_decode_gqa(q, k, v, kv_lengths))
 
 
