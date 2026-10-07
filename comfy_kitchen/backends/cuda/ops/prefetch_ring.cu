@@ -23,6 +23,8 @@ PrefetchRingState* g_states[16] = {};
 bool g_unsupported[16] = {};   // pre-sm_90: no bulk prefetch, consumers keep ring == nullptr
 cudaStream_t g_issue_streams[16] = {};
 cudaEvent_t g_start_events[16] = {};
+int g_region_counts[16] = {};
+constexpr size_t kMaxStagedRegionBytes = 48 * 1024;   // dynamic shared memory without opt-in
 
 __device__ uint64_t region_total(const PrefetchRegion* regions, int count) {
     uint64_t total = 0;
@@ -175,8 +177,21 @@ struct RingCursor {
 // be right before the step ends). The step is over, so the issuer exits rather
 // than waiting against the new step's count and holding up the issuer queued
 // behind it.
+//
+// Every CTA walks every region descriptor, and the step's stream evicts the
+// descriptor array from L2, so with hundreds of small regions (norm scales,
+// gate projections) the walk became hundreds of DRAM-latency loads per CTA
+// per step. The CTA stages the descriptors in shared memory first when they
+// fit (`staged`).
 
-__global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(PrefetchRingState* ring) {
+__global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(PrefetchRingState* ring, bool staged) {
+    extern __shared__ PrefetchRegion staged_regions[];
+    const PrefetchRegion* regions = ring->regions;
+    if (staged) {
+        for (int i = threadIdx.x; i < ring->count; i += blockDim.x) staged_regions[i] = regions[i];
+        __syncthreads();
+        regions = staged_regions;
+    }
     if (threadIdx.x != 0) return;
     {
         unsigned sm;
@@ -204,7 +219,7 @@ __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(Pr
     const uint32_t trace_cap = ring->trace_cap;
 
     uint64_t cursor = chunk * blockIdx.x;
-    RingCursor pos{ring->regions, ring->count, 0, 0, 0, end, blockIdx.x == 0 ? &ring->consumed : nullptr, nullptr, 0, 0};
+    RingCursor pos{regions, ring->count, 0, 0, 0, end, blockIdx.x == 0 ? &ring->consumed : nullptr, nullptr, 0, 0};
     pos.load();
     pos.advance(cursor);
 
@@ -312,8 +327,10 @@ extern "C" PrefetchRingState* prefetch_ring_consumer_state() {
 extern "C" void launch_prefetch_ring_configure(
     const uint64_t* regions, int count, uint64_t lookahead, uint32_t chunk, uint32_t credits,
     cudaStream_t stream) {
-    PrefetchRingState* state = current_state(nullptr);
+    int device = 0;
+    PrefetchRingState* state = current_state(&device);
     if (state == nullptr) return;
+    g_region_counts[device] = count;
     configure_prefetch_ring_kernel<<<1, 1, 0, stream>>>(
         state, reinterpret_cast<const PrefetchRegion*>(regions), count, lookahead, chunk, credits);
 }
@@ -333,7 +350,11 @@ extern "C" void launch_prefetch_ring_start(cudaStream_t stream) {
     reset_prefetch_ring_kernel<<<1, 1, 0, stream>>>(state);
     cudaEventRecord(g_start_events[device], stream);
     cudaStreamWaitEvent(g_issue_streams[device], g_start_events[device], 0);
-    prefetch_ring_issuer_kernel<<<kIssuers, kIssuerThreads, 0, g_issue_streams[device]>>>(state);
+    const size_t staged = g_region_counts[device] * sizeof(PrefetchRegion);
+    if (staged <= kMaxStagedRegionBytes)
+        prefetch_ring_issuer_kernel<<<kIssuers, kIssuerThreads, staged, g_issue_streams[device]>>>(state, true);
+    else
+        prefetch_ring_issuer_kernel<<<kIssuers, kIssuerThreads, 0, g_issue_streams[device]>>>(state, false);
 }
 
 extern "C" void launch_prefetch_ring_set_trace(uint64_t* trace, uint32_t cap, cudaStream_t stream) {
