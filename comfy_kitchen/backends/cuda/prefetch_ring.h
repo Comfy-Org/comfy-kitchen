@@ -75,7 +75,11 @@ static __device__ __forceinline__ void prefetch_ring_consume_device(
 }
 #endif
 
+// Allocates the current device's ring state on first call (false before sm_90).
 bool prefetch_ring_is_available();
+// The current device's ring state for kernel-argument consumers; nullptr until
+// prefetch_ring_is_available has run on this device.
+extern "C" PrefetchRingState* prefetch_ring_consumer_state();
 
 extern "C" void launch_prefetch_ring_configure(
     const uint64_t* regions, int count, uint64_t lookahead, uint32_t chunk, uint32_t credits,
@@ -84,7 +88,6 @@ extern "C" void launch_prefetch_ring_disable(cudaStream_t stream);
 extern "C" void launch_prefetch_ring_start(cudaStream_t stream);
 extern "C" void launch_prefetch_ring_set_trace(uint64_t* trace, uint32_t cap, cudaStream_t stream);
 extern "C" void set_w4a8_prefetch_ring_state(PrefetchRingState* state);
-extern "C" void set_int8_prefetch_ring_state(PrefetchRingState* state);
 extern "C" void set_flash_prefetch_ring_state(PrefetchRingState* state);
 extern "C" void set_gated_delta_prefetch_ring_state(PrefetchRingState* state);
 extern "C" void prefetch_ring_read_stats(PrefetchRingState* host);

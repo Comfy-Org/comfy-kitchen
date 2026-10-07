@@ -20,6 +20,7 @@ constexpr int kIssuers = PREFETCH_RING_ISSUERS;
 constexpr int kIssuerThreads = 32;
 constexpr int kIssueBatch = 8;   // chunks issued per consumed-snapshot
 PrefetchRingState* g_states[16] = {};
+bool g_unsupported[16] = {};   // pre-sm_90: no bulk prefetch, consumers keep ring == nullptr
 cudaStream_t g_issue_streams[16] = {};
 cudaEvent_t g_start_events[16] = {};
 
@@ -239,9 +240,14 @@ __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(Pr
 
 PrefetchRingState* current_state(int* device_out) {
     int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16)
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16 || g_unsupported[device])
         return nullptr;
     if (g_states[device] == nullptr) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess || major < 9) {
+            g_unsupported[device] = true;
+            return nullptr;
+        }
         if (cudaMalloc(&g_states[device], sizeof(PrefetchRingState)) != cudaSuccess)
             return nullptr;
         cudaMemset(g_states[device], 0, sizeof(PrefetchRingState));
@@ -256,7 +262,6 @@ PrefetchRingState* current_state(int* device_out) {
                              cudaFuncAttributePreferredSharedMemoryCarveout,
                              PREFETCH_RING_ISSUER_CARVEOUT);
         set_w4a8_prefetch_ring_state(g_states[device]);
-        set_int8_prefetch_ring_state(g_states[device]);
         set_flash_prefetch_ring_state(g_states[device]);
         set_gated_delta_prefetch_ring_state(g_states[device]);
     }
@@ -266,12 +271,17 @@ PrefetchRingState* current_state(int* device_out) {
 
 } // namespace
 
+// Also allocates the device's state, so consumer kernels captured into a CUDA graph
+// after this call bake the live pointer even when the ring is configured later.
 bool prefetch_ring_is_available() {
+    return current_state(nullptr) != nullptr;
+}
+
+// Lookup only: consumer launches may be under stream capture, where allocation is illegal.
+extern "C" PrefetchRingState* prefetch_ring_consumer_state() {
     int device = 0;
-    int major = 0;
-    return cudaGetDevice(&device) == cudaSuccess
-        && cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess
-        && major >= 9;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16) return nullptr;
+    return g_states[device];
 }
 
 extern "C" void launch_prefetch_ring_configure(

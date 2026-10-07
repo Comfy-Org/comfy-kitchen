@@ -25,17 +25,6 @@ namespace {
 
 constexpr int kInt8Threads = 256;
 
-// Prefetch ring consumer state for the M=1/2 GEMVs, per device (set by the ring
-// on first use). Passed to the kernels as an argument: a __device__ global costs
-// each block a dependent global load before its ring credit.
-PrefetchRingState* g_int8_prefetch_ring[16] = {};
-
-PrefetchRingState* int8_prefetch_ring_state() {
-    int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16) return nullptr;
-    return g_int8_prefetch_ring[device];
-}
-
 template<typename T>
 __device__ __forceinline__ float to_float(T val);
 template<> __device__ __forceinline__ float to_float<float>(float val) { return val; }
@@ -1722,13 +1711,6 @@ quantize_int8_convrot_cluster_kernel(
 
 extern "C" {
 
-void set_int8_prefetch_ring_state(PrefetchRingState* state) {
-    int device = 0;
-    if (cudaGetDevice(&device) == cudaSuccess && device >= 0 && device < 16) {
-        comfy::g_int8_prefetch_ring[device] = state;
-    }
-}
-
 void launch_quantize_int8_rowwise_kernel(
     const void* input,
     void* output,
@@ -2312,7 +2294,9 @@ void launch_int8_gemv_dequant_kernel(
     if (residual != nullptr && (num_rows != 1 || (K & 3) != 0)) {
         throw std::runtime_error("INT8 GEMV fused residual requires M == 1 and K divisible by 4");
     }
-    PrefetchRingState* ring = comfy::int8_prefetch_ring_state();
+    // Passed to the kernels as an argument: a __device__ global costs each block a
+    // dependent global load before its ring credit.
+    PrefetchRingState* ring = prefetch_ring_consumer_state();
     // 16-byte loads need K % 16 == 0 and 16-byte aligned activation and weight bases.
     const bool vec16 = (K & 15) == 0
         && (reinterpret_cast<uintptr_t>(input) & 15) == 0
@@ -2481,7 +2465,9 @@ void launch_int8_gemv_convrot_fused_kernel(
     const size_t smem_bytes =
         (static_cast<size_t>(K) + (comfy::kFusedGemvThreads / 64) * 2 * comfy::kConvRotGroup) * sizeof(float)
         + static_cast<size_t>(K);
-    PrefetchRingState* ring = comfy::int8_prefetch_ring_state();
+    // Passed to the kernels as an argument: a __device__ global costs each block a
+    // dependent global load before its ring credit.
+    PrefetchRingState* ring = prefetch_ring_consumer_state();
 
     DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
         DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {

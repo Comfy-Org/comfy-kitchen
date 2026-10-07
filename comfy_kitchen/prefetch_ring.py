@@ -11,6 +11,8 @@ def _cuda():
 
 
 def is_available() -> bool:
+    """Also allocates the current device's ring state: call it before capturing CUDA graphs of
+    the consumer kernels (int8 GEMVs take the ring pointer as a launch argument)."""
     cuda = _cuda()
     ext = cuda._C if cuda._EXT_AVAILABLE else None
     return bool(ext is not None and hasattr(ext, "prefetch_ring_available") and ext.prefetch_ring_available())
