@@ -13,7 +13,7 @@ from __future__ import annotations
 import torch
 
 from comfy_kitchen.backends._activations import apply_input_act, apply_residual
-from comfy_kitchen.tensor.w4a8_stream import _FIXED_LUT, unpack_w4a8_mma_weight
+from comfy_kitchen.tensor.w4a8_stream import _FIXED_LUT, _pack_codes, _unpack_codes, unpack_w4a8_mma_weight
 
 from .quantization import int8_linear, rotate_int8_convrot_weight
 
@@ -61,33 +61,6 @@ def _w4a8_geometry(
     if bits == 6:
         _check_six_bit_layout(k, group_size)
     return n, k, bits
-
-
-def _pack_codes(unsigned: torch.Tensor, bits: int) -> torch.Tensor:
-    """Pack unsigned int32 codes [N, K] into the int8 storage contract."""
-    low = ((unsigned[:, 0::2] & 0xF) | ((unsigned[:, 1::2] & 0xF) << 4)).to(torch.int8)
-    if bits == 4:
-        return low.contiguous()
-    hi = (unsigned[:, 0::4] >> 4) & 0x3  # slice first: each term touches K/4, not K
-    for j in range(1, 4):
-        hi |= ((unsigned[:, j::4] >> 4) & 0x3) << (2 * j)
-    return torch.cat([low, hi.to(torch.int8)], dim=1).contiguous()
-
-
-def _unpack_codes(qdata: torch.Tensor, k: int, bits: int) -> torch.Tensor:
-    """Inverse of _pack_codes: int8 storage -> unsigned int32 codes [N, K]."""
-    n = qdata.shape[0]
-    packed = qdata.view(torch.uint8).to(torch.int32)  # uint8 view: no sign-extension mask
-    low = packed[:, : k // 2]
-    codes = torch.empty(n, k, dtype=torch.int32, device=qdata.device)
-    codes[:, 0::2] = low & 0xF
-    codes[:, 1::2] = (low >> 4) & 0xF
-    if bits == 6:
-        # high-plane byte b holds cols 4b..4b+3 at bits 0,2,4,6: one fused expansion
-        shifts = torch.tensor([0, 2, 4, 6], device=qdata.device, dtype=torch.int32)
-        hi = (packed[:, k // 2 :].unsqueeze(-1) >> shifts) & 0x3
-        codes |= hi.reshape(n, k) << 4
-    return codes
 
 
 def _codebook_for(normalized: torch.Tensor) -> torch.Tensor:
@@ -626,12 +599,8 @@ def dequantize_w4a8_int8_weight(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     output_dtype: torch.dtype = torch.bfloat16,
-    stream_rows: int = 0,
 ) -> torch.Tensor:
     """Decode W4A8 storage into its physical [N, K] floating weight."""
-    if stream_rows:
-        n = s_channel.numel()
-        qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, qdata.numel() * 16 // (n * 9), stream_rows)
     validate_w4a8_operands(
         qdata,
         s_rel,

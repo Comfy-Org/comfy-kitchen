@@ -167,6 +167,33 @@ __device__ __forceinline__ void decode_w4a8_record_smem(
     decoded[3] = decode_w4a8_chunk(packed.y >> 16, scales >> 24, lut);
 }
 
+// 6-bit: four codes per 24-bit chunk, uniform levels (c - 32) on the int8 grid of
+// level_to_int8 (one fp32 rounding of (c - 32) * s: 32 * s is exact, so the fma is
+// the same product). s comes from a 256-entry fp8 -> fp32 table in shared memory.
+__device__ __forceinline__ unsigned decode_w6a8_chunk(unsigned codes, float s)
+{
+    const float bias = -32.0f * s;
+    int v[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float c = static_cast<float>((codes >> (6 * i)) & 0x3fu);
+        v[i] = max(-127, min(127, __float2int_rn(fmaf(c, s, bias))));
+    }
+    return __byte_perm(__byte_perm(v[0], v[1], 0x0040u), __byte_perm(v[2], v[3], 0x0040u), 0x5410u);
+}
+
+// Lane's 12 code bytes: 8 at lane*8 (plane A), 4 at 256 + lane*4 (plane B), as
+// pack_w4a8_mma_weight lays them out; chunk j is bytes 3j..3j+2.
+__device__ __forceinline__ void decode_w6a8_record_smem(
+    const uint2& a, unsigned b, unsigned scales,
+    const float* __restrict__ scale_table, unsigned (&decoded)[4])
+{
+    decoded[0] = decode_w6a8_chunk(a.x, scale_table[scales & 0xffu]);
+    decoded[1] = decode_w6a8_chunk(__byte_perm(a.x, a.y, 0x0543u), scale_table[(scales >> 8) & 0xffu]);
+    decoded[2] = decode_w6a8_chunk(__byte_perm(a.y, b, 0x0432u), scale_table[(scales >> 16) & 0xffu]);
+    decoded[3] = decode_w6a8_chunk(b >> 8, scale_table[scales >> 24]);
+}
+
 __device__ __forceinline__ void mma_m16n8k32_s8(
     int (&acc)[4], const unsigned (&a)[4], const unsigned (&b)[2])
 {
@@ -213,15 +240,17 @@ template <int N> __device__ __forceinline__ void cp_async_wait() {
 // in flight, for the warp's whole life. Register rings can't do this: ptxas gives
 // every load in the loop one scoreboard, so waiting on one record waits on all.
 //
-// Weight layout (pack_w4a8_mma_weight): 288-byte records (256 B of int4 codes in
-// mma m16n8k32 fragment order + 32 scale bytes) for a 16-output x 32-K tile, stored
-// run-major: [krow_in_split / kPackRows][split][tile][kPackRows][288]. Every split
+// Weight layout (pack_w4a8_mma_weight): kRecordBytes records (512 codes at BITS
+// bits in mma m16n8k32 fragment order + 32 scale bytes: 288 B at 4 bits, 416 B at
+// 6) for a 16-output x 32-K tile, stored run-major:
+// [krow_in_split / kPackRows][split][tile][kPackRows][record]. Every split
 // runs in the same wave and every warp walks its records in order, so the whole
 // grid's demand advances through the weight front to back and a prefetcher can
 // treat the weight as one linear region.
 //
-// LUT and the block's x slice are staged in shared memory after the first loads are
-// issued. The split-K reduction finishes in-kernel: each warp adds its tile into the
+// The decode table (4-bit: the [256 scales][16 codes] int8 LUT; 6-bit: the 256 fp8
+// scales as fp32) and the block's x slice are staged in shared memory after the
+// first loads are issued. The split-K reduction finishes in-kernel: each warp adds its tile into the
 // int32 workspace, bumps the tile's counter, and the warp that arrives last reads
 // the tile back from L2, applies the scales/bias, writes the output, and returns
 // the workspace tile and counter to zero. So the workspace and counters are zero
@@ -232,12 +261,19 @@ constexpr int kStreamStages = 4;
 constexpr int kPackRows = 8;
 constexpr int kStreamMaxRows = 32;
 
+template <int BITS> struct StreamRecord {
+    static constexpr int kBytes = 512 * BITS / 8 + 32;
+    static constexpr int kTableBytes = BITS == 4 ? 4096 : 256 * static_cast<int>(sizeof(float));
+};
+
+template <int BITS>
 __host__ __device__ constexpr int w4a8_stream_smem_bytes(int warps_per_block, int rows) {
-    return 4096 + 8 * (rows * 32 + 16) + warps_per_block * kStreamStages * 288;
+    return StreamRecord<BITS>::kTableBytes + 8 * (rows * 32 + 16)
+        + warps_per_block * kStreamStages * StreamRecord<BITS>::kBytes;
 }
 
 
-template <int WarpsPerBlock, typename OutputT>
+template <int WarpsPerBlock, typename OutputT, int BITS>
 __global__ __launch_bounds__(WarpsPerBlock * 32)
 void w4a8_codebook_mma_stream_kernel(
     const int8_t* __restrict__ x,
@@ -254,9 +290,11 @@ void w4a8_codebook_mma_stream_kernel(
     int M, int N, int K, int rows)
 {
     constexpr int S = kStreamStages;
+    constexpr int R = StreamRecord<BITS>::kBytes;
     extern __shared__ __align__(16) uint8_t stream_smem[];
     uint4* lut = reinterpret_cast<uint4*>(stream_smem);
-    uint8_t* xs_s = stream_smem + 4096;
+    float* scale_table = reinterpret_cast<float*>(stream_smem);
+    uint8_t* xs_s = stream_smem + StreamRecord<BITS>::kTableBytes;
     const int x_stride = rows * 32 + 16;   // +16 keeps the per-token rows off one bank pattern
     uint8_t* stages = xs_s + 8 * x_stride;
 
@@ -269,23 +307,23 @@ void w4a8_codebook_mma_stream_kernel(
     const int splits = static_cast<int>(gridDim.y);
     const int k_begin = split * rows * 32;
 
-    // lanes 0..17 each move 16 B of the 288 B record
+    // lanes 0..R/16-1 each move 16 B of the record
     const int8_t* tile_base = weight
-        + static_cast<int64_t>(output_tile) * kPackRows * 288 + lane * 16;
-    const int64_t run_stride = static_cast<int64_t>(tiles) * kPackRows * 288;
+        + static_cast<int64_t>(output_tile) * kPackRows * R + lane * 16;
+    const int64_t run_stride = static_cast<int64_t>(tiles) * kPackRows * R;
     auto record = [&](int i) -> const int8_t* {
-        return tile_base + ((i / kPackRows) * splits + split) * run_stride + (i % kPackRows) * 288;
+        return tile_base + ((i / kPackRows) * splits + split) * run_stride + (i % kPackRows) * R;
     };
-    const bool issuer = active && lane < 18;
-    const uint8_t* my_stages = stages + warp * S * 288;
+    const bool issuer = active && lane < R / 16;
+    const uint8_t* my_stages = stages + warp * S * R;
     const uint32_t st_s = static_cast<uint32_t>(__cvta_generic_to_shared(my_stages)) + lane * 16;
 
-    // Ring consumption: thread 0 credits the block's kPackRows*288-byte runs as
+    // Ring consumption: thread 0 credits the block's kPackRows*R-byte runs as
     // its own loads of them complete (sibling warps stream in lockstep, so the
     // error is < 1 block). Every block of the wave passes each run boundary at
     // about the same time, so the credited total tracks the weight's read front.
     const uint64_t run_credit = static_cast<uint64_t>(
-        min(WarpsPerBlock, tiles - static_cast<int>(blockIdx.x) * WarpsPerBlock)) * kPackRows * 288;
+        min(WarpsPerBlock, tiles - static_cast<int>(blockIdx.x) * WarpsPerBlock)) * kPackRows * R;
     auto credit = [&](int i) {
         if (threadIdx.x == 0 && ((i + 1) & (kPackRows - 1)) == 0)
             prefetch_ring_consume_device(g_w4a8_prefetch_ring, run_credit);
@@ -293,11 +331,15 @@ void w4a8_codebook_mma_stream_kernel(
 
     #pragma unroll
     for (int s = 0; s < S; ++s) {
-        if (issuer) cp_async16_evict_first(st_s + s * 288, record(s));
+        if (issuer) cp_async16_evict_first(st_s + s * R, record(s));
         cp_async_commit();
     }
     for (int i = threadIdx.x; i < 256; i += WarpsPerBlock * 32) {
-        lut[i] = reinterpret_cast<const uint4*>(decode_lut)[i];
+        if constexpr (BITS == 4) {
+            lut[i] = reinterpret_cast<const uint4*>(decode_lut)[i];
+        } else {
+            scale_table[i] = load_scale<uint8_t>(static_cast<uint8_t>(i));
+        }
     }
     for (int i = threadIdx.x; i < 8 * rows * 2; i += WarpsPerBlock * 32) {
         const int token = i / (rows * 2), v = i % (rows * 2);
@@ -314,14 +356,20 @@ void w4a8_codebook_mma_stream_kernel(
     const int thread_in_group = lane & 3;
     const uint8_t* xrow = xs_s + token * x_stride + thread_in_group * 4;
     const uint8_t* rec_codes = my_stages + lane * 8;
-    const uint8_t* rec_scales = my_stages + 256 + token * 4;
+    const uint8_t* rec_codes_hi = my_stages + 256 + lane * 4;
+    const uint8_t* rec_scales = my_stages + (R - 32) + token * 4;
     int acc[4] = {};
 
     auto consume = [&](int stage, int i) {
-        const uint2 packed = *reinterpret_cast<const uint2*>(rec_codes + stage * 288);
-        const unsigned scales = *reinterpret_cast<const unsigned*>(rec_scales + stage * 288);
+        const uint2 packed = *reinterpret_cast<const uint2*>(rec_codes + stage * R);
+        const unsigned scales = *reinterpret_cast<const unsigned*>(rec_scales + stage * R);
         unsigned decoded[4];
-        decode_w4a8_record_smem(packed, scales, lut, decoded);
+        if constexpr (BITS == 4) {
+            decode_w4a8_record_smem(packed, scales, lut, decoded);
+        } else {
+            const unsigned hi = *reinterpret_cast<const unsigned*>(rec_codes_hi + stage * R);
+            decode_w6a8_record_smem(packed, hi, scales, scale_table, decoded);
+        }
         const unsigned input[2] = {
             *reinterpret_cast<const unsigned*>(xrow + i * 32),
             *reinterpret_cast<const unsigned*>(xrow + i * 32 + 16),
@@ -340,7 +388,7 @@ void w4a8_codebook_mma_stream_kernel(
             consume(j, i + j);
             credit(i + j);
             __syncwarp();
-            if (issuer) cp_async16_evict_first(st_s + j * 288, record(i + S + j));
+            if (issuer) cp_async16_evict_first(st_s + j * R, record(i + S + j));
             cp_async_commit();
         }
     }
@@ -350,7 +398,7 @@ void w4a8_codebook_mma_stream_kernel(
         consume(i % S, i);
         credit(i);
         __syncwarp();
-        if (issuer && i + S < rows) cp_async16_evict_first(st_s + (i % S) * 288, record(i + S));
+        if (issuer && i + S < rows) cp_async16_evict_first(st_s + (i % S) * R, record(i + S));
         cp_async_commit();
     }
 
@@ -506,19 +554,21 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
     return true;
 }
 
-// stream_rows is the packing's records per split (pack_w4a8_mma_weight); the
-// workspace [M, N] int32 and counters [N/16] int32 must be zero on entry and are
-// zero again on exit, so the caller keeps both across launches. residual [M, N] and
-// residual_scale [N] are in the output dtype (both or neither).
+// stream_rows is the packing's records per split (pack_w4a8_mma_weight) and bits
+// (4 or 6) its code width; the workspace [M, N] int32 and counters [N/16] int32 must
+// be zero on entry and are zero again on exit, so the caller keeps both across
+// launches. residual [M, N] and residual_scale [N] are in the output dtype (both or
+// neither).
 extern "C" bool launch_w4a8_codebook_mma(
     const void* xq, const void* weight, const void* decode_lut,
     const void* s_channel, const void* xs, const void* bias, const void* residual,
     const void* residual_scale, void* workspace, void* counters, void* out,
-    int64_t M, int64_t N, int64_t K, int64_t G, int64_t stream_rows,
+    int64_t M, int64_t N, int64_t K, int64_t G, int64_t stream_rows, int64_t bits,
     int64_t warps_per_block, int out_dtype_code, cudaStream_t stream)
 {
     if (M == 0 || N == 0 || K == 0) return true;
     if (M > 8 || decode_lut == nullptr || N > std::numeric_limits<int>::max()
+            || (bits != 4 && bits != 6)
             || K > std::numeric_limits<int>::max() || N % 16 != 0
             || G != 16 || K % G != 0
             || (stream_rows != 8 && stream_rows != 16 && stream_rows != 32)
@@ -537,14 +587,14 @@ extern "C" bool launch_w4a8_codebook_mma(
     }
     const int rows = static_cast<int>(stream_rows);
     const int splits = static_cast<int>(K) / 32 / rows;
-    auto launch = [&]<int WarpsPerBlock>() {
+    auto launch = [&]<int WarpsPerBlock, int BITS>() {
         constexpr int OutputsPerBlock = WarpsPerBlock * 16;
         const dim3 grid(
             static_cast<unsigned int>((N + OutputsPerBlock - 1) / OutputsPerBlock),
             static_cast<unsigned int>(splits));
         DISPATCH_FP_DTYPE(out_dtype_code, OutputT, [&] {
-            w4a8_codebook_mma_stream_kernel<WarpsPerBlock, OutputT>
-                <<<grid, WarpsPerBlock * 32, w4a8_stream_smem_bytes(WarpsPerBlock, rows), stream>>>(
+            w4a8_codebook_mma_stream_kernel<WarpsPerBlock, OutputT, BITS>
+                <<<grid, WarpsPerBlock * 32, w4a8_stream_smem_bytes<BITS>(WarpsPerBlock, rows), stream>>>(
                 static_cast<const int8_t*>(xq),
                 static_cast<const int8_t*>(weight),
                 static_cast<const int8_t*>(decode_lut),
@@ -559,11 +609,15 @@ extern "C" bool launch_w4a8_codebook_mma(
                 static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), rows);
         });
     };
+    auto launch_bits = [&]<int WarpsPerBlock>() {
+        if (bits == 4) launch.template operator()<WarpsPerBlock, 4>();
+        else launch.template operator()<WarpsPerBlock, 6>();
+    };
     switch (warps_per_block) {
-        case 1: launch.template operator()<1>(); break;
-        case 2: launch.template operator()<2>(); break;
-        case 4: launch.template operator()<4>(); break;
-        case 8: launch.template operator()<8>(); break;
+        case 1: launch_bits.template operator()<1>(); break;
+        case 2: launch_bits.template operator()<2>(); break;
+        case 4: launch_bits.template operator()<4>(); break;
+        case 8: launch_bits.template operator()<8>(); break;
     }
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {

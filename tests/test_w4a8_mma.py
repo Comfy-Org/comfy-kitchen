@@ -15,10 +15,10 @@ from tests.conftest import requires_cuda_backend
 pytestmark = requires_cuda_backend
 
 
-def _packed_weight(n, k, seed=0):
+def _packed_weight(n, k, seed=0, bits=4):
     torch.manual_seed(seed)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02
-    qdata, s_rel, s_channel, correction, cb = eager_w4a8.quantize_w4a8_int8_weight(w)
+    qdata, s_rel, s_channel, correction, cb = eager_w4a8.quantize_w4a8_int8_weight(w, bits=bits)
     assert correction is None
     rows = ck.w4a8_mma_stream_rows(n, k)
     assert rows
@@ -37,8 +37,9 @@ class TestW4A8PackedMMA:
     @pytest.mark.parametrize(("n", "k"), [(4096, 4096), (320, 1280), (17408, 2560), (16384, 4096)])
     @pytest.mark.parametrize("m", [1, 7, 8])
     @pytest.mark.parametrize("bias", [False, True])
-    def test_matches_unpacked_route(self, n, k, m, bias, seed):
-        qdata, s_rel, s_channel, cb, packed, rows = _packed_weight(n, k)
+    @pytest.mark.parametrize("bits", [4, 6])
+    def test_matches_unpacked_route(self, n, k, m, bias, bits, seed):
+        qdata, s_rel, s_channel, cb, packed, rows = _packed_weight(n, k, bits=bits)
         assert rows == {(4096, 4096): 8, (320, 1280): 8, (17408, 2560): 16, (16384, 4096): 32}[(n, k)]
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(n, device="cuda", dtype=torch.float32) if bias else None
@@ -51,12 +52,13 @@ class TestW4A8PackedMMA:
 
     @pytest.mark.parametrize("m", [1, 7])
     @pytest.mark.parametrize("bias", [False, True])
-    def test_fused_residual_matches_addcmul(self, m, bias, seed):
+    @pytest.mark.parametrize("bits", [4, 6])
+    def test_fused_residual_matches_addcmul(self, m, bias, bits, seed):
         # The epilogue's residual + scale * linear must be bit-identical to the unfused
         # addcmul on the same bf16-rounded linear; a scale of exactly 1 must reduce
         # to torch.add(residual, linear).
         n, k = 4096, 4096
-        _, _, s_channel, _, packed, rows = _packed_weight(n, k)
+        _, _, s_channel, _, packed, rows = _packed_weight(n, k, bits=bits)
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(n, device="cuda", dtype=torch.float32) if bias else None
         empty = torch.empty(0, device="cuda", dtype=torch.float8_e4m3fn)
@@ -130,12 +132,14 @@ class TestW4A8PackedMMA:
         assert workspace.shape[0] == 8
         assert not workspace.any() and not counters.any()
 
-    def test_decode_layout_roundtrip(self, seed):
+    @pytest.mark.parametrize("bits", [4, 6])
+    def test_decode_layout_roundtrip(self, bits, seed):
         # decode_layout packs a resident canonical weight in place of its qdata + s_rel
         # bytes; the layout still computes the same linear for decode and prefill rows,
         # refuses to serialize the packed form, and leaves non-streaming shapes alone.
         n, k = 4096, 4096
-        qdata, s_rel, s_channel, cb, _, rows = _packed_weight(n, k)
+        qdata, s_rel, s_channel, cb, _, rows = _packed_weight(n, k, bits=bits)
+        assert (cb is None) == (bits == 6)
         params = AsymW4A8Int8Layout.Params(
             scale=s_rel, s_channel=s_channel, codebook=cb,
             orig_dtype=torch.bfloat16, orig_shape=(n, k),
@@ -156,7 +160,7 @@ class TestW4A8PackedMMA:
             got = torch.nn.functional.linear(x, weight)
             ref = torch.nn.functional.linear(x, reference)
             torch.testing.assert_close(got.float(), ref.float(), atol=2e-2, rtol=1e-2)
-        torch.testing.assert_close(weight.dequantize(), reference.dequantize())
+        assert torch.equal(weight.dequantize(), reference.dequantize())
 
         odd = AsymW4A8Int8Layout.Params(
             scale=s_rel[:4088], s_channel=s_channel[:4088], codebook=cb,

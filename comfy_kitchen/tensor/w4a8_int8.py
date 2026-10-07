@@ -88,7 +88,6 @@ def dequantize_w4a8_int8_weight(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     output_dtype: torch.dtype = torch.bfloat16,
-    stream_rows: int = 0,
 ) -> torch.Tensor:
     """Dequantize a packed W4A8 weight into its original basis."""
     kwargs = {
@@ -100,7 +99,6 @@ def dequantize_w4a8_int8_weight(
         "group_size": group_size,
         "convrot_groupsize": convrot_groupsize,
         "output_dtype": output_dtype,
-        "stream_rows": stream_rows,
     }
     impl = registry.get_implementation("dequantize_w4a8_int8_weight", kwargs=kwargs)
     return impl(**kwargs)
@@ -264,16 +262,21 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         becomes its 1D record stream (s_rel folded in), read front to back, so the
         whole weight is one linear region for a prefetcher. The packed layout is
         resident-only and never serialized. Returned unchanged when the kernel does
-        not apply (shape, correction, non-default codebook, non-fp8 scales)."""
+        not apply (shape, correction, non-default 4-bit codebook, non-fp8 scales)."""
         n, k = params.orig_shape
         rows = w4a8_mma_stream_rows(n, k)
+        if params.codebook is None:
+            # 6-bit codes are uniform; 4-bit without a codebook is not what the kernel decodes
+            codebook_ok = qdata.shape[1] * 8 == k * 6
+        else:
+            codebook_ok = torch.equal(params.codebook.float().cpu(), default_w4a8_codebook())
         if (
             params.transposed
             or not rows
             or params.group_size != 16
             or params.correction is not None
             or params.scale.dtype != torch.float8_e4m3fn
-            or (params.codebook is not None and not torch.equal(params.codebook.float().cpu(), default_w4a8_codebook()))
+            or not codebook_ok
         ):
             return qdata, params
         packed = pack_w4a8_mma_weight(qdata, params.scale, rows)
@@ -284,16 +287,18 @@ class AsymW4A8Int8Layout(QuantizedLayout):
 
     @classmethod
     def dequantize(cls, qdata: torch.Tensor, params: Params) -> torch.Tensor:
+        s_rel = params.scale
+        if params.stream_rows:
+            qdata, s_rel = unpack_w4a8_mma_weight(qdata, *params.orig_shape, params.stream_rows)
         return dequantize_w4a8_int8_weight(
             qdata,
-            params.scale,
+            s_rel,
             params.s_channel,
             codebook=params.codebook,
             correction=params.correction,
             group_size=params.group_size,
             convrot_groupsize=params.convrot_groupsize,
             output_dtype=params.orig_dtype,
-            stream_rows=params.stream_rows,
         )
 
     @classmethod

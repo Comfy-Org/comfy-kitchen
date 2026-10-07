@@ -1200,12 +1200,8 @@ def dequantize_w4a8_int8_weight(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     output_dtype: torch.dtype = torch.bfloat16,
-    stream_rows: int = 0,
 ) -> torch.Tensor:
     """Decode W4A8 storage into its physical [N, K] floating weight."""
-    if stream_rows:
-        n = s_channel.numel()
-        qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, qdata.numel() * 16 // (n * 9), stream_rows)
     validate_w4a8_operands(
         qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize
     )

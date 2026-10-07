@@ -207,7 +207,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
-from comfy_kitchen.tensor.w4a8_stream import _FIXED_LUT, unpack_w4a8_mma_weight  # noqa: E402
+from comfy_kitchen.tensor.w4a8_stream import _FIXED_LUT, unpack_w4a8_mma_weight, w4a8_mma_record_bytes  # noqa: E402
 from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     w4a8_int8_linear as eager_w4a8_int8_linear,
 )
@@ -2181,7 +2181,7 @@ def w4a8_int8_linear_prequantized(
         or qdata.dim() != 1
         or qdata.dtype != torch.int8
         or n % 16
-        or qdata.numel() != n * k * 9 // 16
+        or qdata.numel() not in (n * k * w4a8_mma_record_bytes(4) // 512, n * k * w4a8_mma_record_bytes(6) // 512)
         or group_size != 16
     ):
         raise ValueError("invalid MMA-packed W4A8 operands")
@@ -2530,12 +2530,8 @@ def dequantize_w4a8_int8_weight(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     output_dtype: torch.dtype = torch.bfloat16,
-    stream_rows: int = 0,
 ) -> torch.Tensor:
     """Dequantize W4A8 weights with native CUDA decode and ConvRot operations."""
-    if stream_rows:
-        n = s_channel.numel()
-        qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, qdata.numel() * 16 // (n * 9), stream_rows)
     validate_w4a8_operands(
         qdata,
         s_rel,
@@ -2606,7 +2602,7 @@ def w4a8_int8_linear(
             qdata.dim() != 1
             or qdata.dtype != torch.int8
             or n % 16
-            or qdata.numel() != n * k * 9 // 16
+            or qdata.numel() not in (n * k * w4a8_mma_record_bytes(4) // 512, n * k * w4a8_mma_record_bytes(6) // 512)
             or s_rel.numel() != 0
             or group_size != 16
             or correction is not None

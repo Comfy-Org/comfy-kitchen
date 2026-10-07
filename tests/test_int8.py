@@ -7,6 +7,7 @@ import torch
 
 import comfy_kitchen as ck
 from comfy_kitchen.backends import cuda
+from comfy_kitchen.backends.eager import w4a8_int8 as eager_w4a8
 from comfy_kitchen.tensor import TensorWiseINT8Layout
 
 from .conftest import (
@@ -33,18 +34,37 @@ COMFYUI_NVIDIA_16_SERIES = (
 )
 
 
+@pytest.mark.parametrize("bits", [4, 6])
 @pytest.mark.parametrize(("n", "k", "stream_rows"), [(16, 256, 8), (48, 512, 16), (320, 1024, 32)])
-def test_w4a8_mma_pack_roundtrip(n, k, stream_rows):
-    qdata = torch.randint(-128, 128, (n, k // 2), dtype=torch.int8)
+def test_w4a8_mma_pack_roundtrip(n, k, stream_rows, bits):
+    qdata = torch.randint(-128, 128, (n, k * bits // 8), dtype=torch.int8)
     scale_bits = torch.randint(0, 256, (n, k // 16), dtype=torch.uint8)
     scales = scale_bits.view(torch.float8_e4m3fn)
 
     packed = ck.pack_w4a8_mma_weight(qdata, scales, stream_rows)
     unpacked_qdata, unpacked_scales = ck.unpack_w4a8_mma_weight(packed, n, k, stream_rows)
 
-    assert packed.shape == (n * k * 9 // 16,)
+    assert packed.shape == (n * k * (512 * bits // 8 + 32) // 512,)
     assert torch.equal(unpacked_qdata, qdata)
     assert torch.equal(unpacked_scales.view(torch.uint8), scale_bits)
+
+
+def test_w6a8_mma_pack_lane_bytes():
+    # The 6-bit record the kernel decodes: lane l's fragment j (output half j & 1,
+    # K quarter j >> 1 of its 4-column group) is the 24-bit little-endian word at bytes
+    # 3j..3j+2 of its 12 code bytes, the first 8 at l*8 and the last 4 at 256 + l*4.
+    n, k = 16, 256
+    codes = torch.randint(0, 64, (n, k), dtype=torch.int32)
+    qdata = eager_w4a8._pack_codes(codes, 6)
+    packed = ck.pack_w4a8_mma_weight(qdata, torch.zeros(n, k // 16, dtype=torch.uint8).view(torch.float8_e4m3fn), 8)
+    record = packed.view(torch.uint8).view(-1, 416)[0]  # tile 0, K rows 0..31
+    for lane in (0, 5, 31):
+        token, group = lane >> 2, lane & 3
+        lane_bytes = record[lane * 8:lane * 8 + 8].tolist() + record[256 + lane * 4:256 + lane * 4 + 4].tolist()
+        for j in range(4):
+            word = lane_bytes[3 * j] | lane_bytes[3 * j + 1] << 8 | lane_bytes[3 * j + 2] << 16
+            row, col = token + 8 * (j & 1), group * 4 + 16 * (j >> 1)
+            assert [(word >> (6 * i)) & 63 for i in range(4)] == codes[row, col:col + 4].tolist()
 
 
 def test_w4a8_mma_pack_is_run_major():

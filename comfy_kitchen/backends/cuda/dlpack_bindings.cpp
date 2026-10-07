@@ -2358,6 +2358,7 @@ extern "C" {
         int64_t K,
         int64_t G,
         int64_t stream_rows,
+        int64_t bits,
         int64_t warps_per_block,
         int out_dtype_code,
         cudaStream_t stream);
@@ -3534,8 +3535,12 @@ bool w4a8_codebook_mma_linear(
     if (M > 8 || convrot_group_size <= 0 || K % convrot_group_size != 0
             || (input.has_value() && (input->shape(0) != M || input->shape(1) != K * in_width))
             || xs.shape(0) != M || xs.shape(1) != 1
-            || N % 16 != 0 || weight.size() != N * K * 9 / 16 || K % G != 0)
+            || N % 16 != 0 || K % G != 0)
         throw std::runtime_error("w4a8_codebook_mma_linear shape mismatch or M > 8");
+    // record stream size implies the code width: 288-byte records at 4 bits, 416 at 6
+    const int64_t bits = weight.size() == N * K * 9 / 16 ? 4 : (weight.size() == N * K * 13 / 16 ? 6 : 0);
+    if (bits == 0)
+        throw std::runtime_error("w4a8_codebook_mma_linear weight is not a 4- or 6-bit record stream");
     if (act_code != comfy::kActNone && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm)
         throw std::runtime_error("w4a8_codebook_mma_linear act_code must be none, swiglu, or rms_norm");
     const bool has_act_weight = act_weight.has_value() && act_weight->size() > 0;
@@ -3599,7 +3604,7 @@ bool w4a8_codebook_mma_linear(
         residual.has_value() ? residual->data() : nullptr,
         residual_scale.has_value() ? residual_scale->data() : nullptr,
         workspace.data(), counters.data(),
-        out.data(), M, N, K, G, stream_rows, warps_per_block, out_dtype_code, stream);
+        out.data(), M, N, K, G, stream_rows, bits, warps_per_block, out_dtype_code, stream);
 }
 // Common W4A8 inference path: online ConvRot activation quantization followed by the
 // chunked int4 decode + strided INT8 GEMM, coordinated through one Python/native call.
