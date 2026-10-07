@@ -34,12 +34,13 @@ __device__ uint64_t region_total(const PrefetchRegion* regions, int count) {
 
 __global__ void configure_prefetch_ring_kernel(
     PrefetchRingState* ring, const PrefetchRegion* regions, int count,
-    uint64_t lookahead, uint32_t chunk, uint32_t credits) {
+    uint64_t lookahead, uint64_t min_lead, uint32_t chunk, uint32_t credits) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     ring->regions = regions;
     ring->count = count;
     ring->total = region_total(regions, count);
     ring->lookahead = lookahead;
+    ring->min_lead = min_lead;
     ring->chunk = chunk;
     ring->credits = credits;
     ring->stalled = 0;
@@ -211,6 +212,7 @@ __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(Pr
     }
     const uint64_t end = ring->total;
     const uint64_t lookahead = ring->lookahead;
+    const uint64_t min_lead = ring->min_lead;
     const uint64_t chunk = ring->chunk;
     const uint64_t stride = chunk * gridDim.x;
     volatile uint64_t* consumed_p = &ring->consumed;
@@ -227,9 +229,13 @@ __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(Pr
     uint64_t consumed = *consumed_p;
     int enabled = *enabled_p;
     while (cursor < end + lookahead && enabled) {
-        if (cursor + chunk <= consumed) {
-            // demand already read this: jump to our first chunk at/after the consumed position
-            const uint64_t skip = ((consumed / chunk) * chunk - cursor + stride - 1) / stride * stride;
+        if (cursor + chunk <= consumed + min_lead) {
+            // Demand already read this, or will before the request could land: a request
+            // queued behind the ring's in-flight bytes completes after the GEMV has read
+            // and (evict_first) dropped the line, so it only costs DRAM. Jump to our
+            // first chunk at/after the floor and leave the gap to demand.
+            const uint64_t floor = consumed + min_lead;
+            const uint64_t skip = ((floor / chunk) * chunk - cursor + stride - 1) / stride * stride;
             cursor += skip;
             pos.advance(skip);
             skipped += skip / gridDim.x;
@@ -325,14 +331,14 @@ extern "C" PrefetchRingState* prefetch_ring_consumer_state() {
 }
 
 extern "C" void launch_prefetch_ring_configure(
-    const uint64_t* regions, int count, uint64_t lookahead, uint32_t chunk, uint32_t credits,
+    const uint64_t* regions, int count, uint64_t lookahead, uint64_t min_lead, uint32_t chunk, uint32_t credits,
     cudaStream_t stream) {
     int device = 0;
     PrefetchRingState* state = current_state(&device);
     if (state == nullptr) return;
     g_region_counts[device] = count;
     configure_prefetch_ring_kernel<<<1, 1, 0, stream>>>(
-        state, reinterpret_cast<const PrefetchRegion*>(regions), count, lookahead, chunk, credits);
+        state, reinterpret_cast<const PrefetchRegion*>(regions), count, lookahead, min_lead, chunk, credits);
 }
 
 extern "C" void launch_prefetch_ring_disable(cudaStream_t stream) {

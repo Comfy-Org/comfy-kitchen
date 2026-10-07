@@ -38,7 +38,7 @@ bool prefetch_ring_available() {
 
 void prefetch_ring_configure(
     nb::ndarray<uint64_t, nb::ndim<2>, nb::device::cuda> regions,
-    int64_t count, uint64_t lookahead_bytes, uint32_t chunk_bytes, uint32_t credits, uintptr_t stream_ptr) {
+    int64_t count, uint64_t lookahead_bytes, uint64_t min_lead_bytes, uint32_t chunk_bytes, uint32_t credits, uintptr_t stream_ptr) {
     if (regions.shape(1) != 3 || regions.stride(1) != 1 || regions.stride(0) != 3)
         throw std::runtime_error("prefetch ring regions must be contiguous [capacity, 3]");
     if (count < 0 || count > regions.shape(0) || count > INT_MAX)
@@ -47,10 +47,10 @@ void prefetch_ring_configure(
         throw std::runtime_error("prefetch ring requires an SM90 or newer CUDA device");
     if (chunk_bytes == 0 || chunk_bytes % 16 != 0 || chunk_bytes > 98304)
         throw std::runtime_error("prefetch ring chunk must be a multiple of 16 bytes up to 96 KiB");
-    if (lookahead_bytes < chunk_bytes)
-        throw std::runtime_error("prefetch ring lookahead must cover at least one chunk");
+    if (lookahead_bytes < min_lead_bytes + chunk_bytes)
+        throw std::runtime_error("prefetch ring lookahead must cover the minimum lead plus one chunk");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    launch_prefetch_ring_configure(regions.data(), static_cast<int>(count), lookahead_bytes, chunk_bytes, credits, stream);
+    launch_prefetch_ring_configure(regions.data(), static_cast<int>(count), lookahead_bytes, min_lead_bytes, chunk_bytes, credits, stream);
 }
 
 void prefetch_ring_disable(uintptr_t stream_ptr) {
@@ -4534,7 +4534,7 @@ NB_MODULE(_C, m) {
 
     m.def("prefetch_ring_available", &prefetch_ring_available);
     m.def("prefetch_ring_configure", &prefetch_ring_configure,
-          nb::arg("regions"), nb::arg("count"), nb::arg("lookahead_bytes"), nb::arg("chunk_bytes"), nb::arg("credits"), nb::arg("stream_ptr"));
+          nb::arg("regions"), nb::arg("count"), nb::arg("lookahead_bytes"), nb::arg("min_lead_bytes"), nb::arg("chunk_bytes"), nb::arg("credits"), nb::arg("stream_ptr"));
     m.def("prefetch_ring_disable", &prefetch_ring_disable, nb::arg("stream_ptr"));
     m.def("prefetch_ring_start", &prefetch_ring_start, nb::arg("stream_ptr"));
     m.def("prefetch_ring_stats", &prefetch_ring_stats);

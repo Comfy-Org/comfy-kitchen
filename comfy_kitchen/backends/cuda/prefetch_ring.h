@@ -48,6 +48,7 @@ struct PrefetchRingState {
     int enabled;
     uint64_t total;       // sum of region bytes (one step)
     uint64_t lookahead;   // bytes kept in flight ahead of `consumed`
+    uint64_t min_lead;    // chunks closer than this to `consumed` are left to demand (see the issuer)
     uint32_t chunk;       // bytes per prefetch request
     uint32_t credits;     // PREFETCH_RING_CREDIT_* mask: non-weight consumers that credit their reads
     uint32_t stalled;     // issuer CTAs that gave up waiting for consumption (diagnostic)
@@ -91,7 +92,7 @@ bool prefetch_ring_is_available();
 extern "C" PrefetchRingState* prefetch_ring_consumer_state();
 
 extern "C" void launch_prefetch_ring_configure(
-    const uint64_t* regions, int count, uint64_t lookahead, uint32_t chunk, uint32_t credits,
+    const uint64_t* regions, int count, uint64_t lookahead, uint64_t min_lead, uint32_t chunk, uint32_t credits,
     cudaStream_t stream);
 extern "C" void launch_prefetch_ring_disable(cudaStream_t stream);
 extern "C" void launch_prefetch_ring_start(cudaStream_t stream);
