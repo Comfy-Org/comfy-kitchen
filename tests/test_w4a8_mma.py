@@ -31,16 +31,15 @@ def _packed_weight(n, k, seed=0, bits=4):
     reason="packed W4A8 MMA decode needs sm_90+ (cluster quantizer)",
 )
 class TestW4A8PackedMMA:
-    # (n, k) covering each stream_rows the geometry rule picks: 8 (one run per warp,
-    # including K = 1280 with 40 records = 5 splits of 8), 16 and 32 (multi-run
-    # warps, where the run-major layout interleaves splits).
-    @pytest.mark.parametrize(("n", "k"), [(4096, 4096), (320, 1280), (17408, 2560), (16384, 4096)])
+    # (n, k) covering each stream_rows the geometry rule picks: 8 (K = 1280 with 40
+    # records = 5 splits of 8) and 16 (single and multi-split).
+    @pytest.mark.parametrize(("n", "k"), [(4096, 4096), (320, 1280), (17408, 2560), (16384, 512)])
     @pytest.mark.parametrize("m", [1, 7, 8])
     @pytest.mark.parametrize("bias", [False, True])
     @pytest.mark.parametrize("bits", [4, 6])
     def test_matches_unpacked_route(self, n, k, m, bias, bits, seed):
         qdata, s_rel, s_channel, cb, packed, rows = _packed_weight(n, k, bits=bits)
-        assert rows == {(4096, 4096): 8, (320, 1280): 8, (17408, 2560): 16, (16384, 4096): 32}[(n, k)]
+        assert rows == {(4096, 4096): 16, (320, 1280): 8, (17408, 2560): 16, (16384, 512): 16}[(n, k)]
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(n, device="cuda", dtype=torch.float32) if bias else None
         empty = torch.empty(0, device="cuda", dtype=torch.float8_e4m3fn)

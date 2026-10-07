@@ -67,11 +67,10 @@ def test_w6a8_mma_pack_lane_bytes():
             assert [(word >> (6 * i)) & 63 for i in range(4)] == codes[row, col:col + 4].tolist()
 
 
-def test_w4a8_mma_pack_is_run_major():
+def test_w4a8_mma_pack_is_record_major():
     # The streamed kernel reads record (tile, krow) at
-    # ((krow_in_split // 8) * splits + split) * tiles * 8 + tile * 8 + krow_in_split % 8:
-    # with 2 splits of 16 records, tile 1's record krow 20 (split 1, run 0, j 4) sits in
-    # the second chunk of the first run block.
+    # (krow_in_split * splits + split) * tiles + tile: with 2 splits of 16 records,
+    # tile 1's record krow 20 (split 1, step 4) is the 4th step's second-split record.
     n, k, stream_rows = 32, 1024, 16
     qdata = torch.zeros((n, k // 2), dtype=torch.int8)
     scales = torch.zeros((n, k // 16), dtype=torch.uint8)
@@ -81,7 +80,7 @@ def test_w4a8_mma_pack_is_run_major():
     records = packed.view(-1, 288)
     tiles, splits = n // 16, k // 32 // stream_rows
     split, i = divmod(krow, stream_rows)
-    expected = ((i // 8) * splits + split) * tiles * 8 + tile * 8 + i % 8
+    expected = (i * splits + split) * tiles + tile
     (hit,) = records[:, :256].any(dim=1).nonzero().flatten().tolist()
     assert hit == expected
 
@@ -89,10 +88,9 @@ def test_w4a8_mma_pack_is_run_major():
 @pytest.mark.parametrize(
     ("n", "k", "expected"),
     [
-        (12288, 2560, 16),  # 768 tiles x 5 splits fills the wave
-        (1024, 2560, 8),  # small N: halves down to the pack run
-        (5120, 8704, 16),  # 272 records: 32 does not divide, 16 does
-        (5120, 3072, 8),
+        (12288, 2560, 16),
+        (5120, 8704, 16),  # 272 records: 16 divides
+        (5120, 3072, 16),
         (12280, 2560, 0),  # N % 16
         (4096, 1280, 8),  # K % 256 == 0 but 40 records: only 8 divides
         (4096, 1152, 0),  # K % 256 != 0

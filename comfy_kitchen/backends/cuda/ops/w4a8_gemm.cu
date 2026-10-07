@@ -257,11 +257,12 @@ template <int N> __device__ __forceinline__ void cp_async_wait() {
 //
 // Weight layout (pack_w4a8_mma_weight): kRecordBytes records (512 codes at BITS
 // bits in mma m16n8k32 fragment order + 32 scale bytes: 288 B at 4 bits, 416 B at
-// 6) for a 16-output x 32-K tile, stored run-major:
-// [krow_in_split / kPackRows][split][tile][kPackRows][record]. Every split
-// runs in the same wave and every warp walks its records in order, so the whole
-// grid's demand advances through the weight front to back and a prefetcher can
-// treat the weight as one linear region.
+// 6) for a 16-output x 32-K tile, stored record-major:
+// [krow_in_split][split][tile][record]. Every warp walks its records in order
+// and every split runs in the same wave, so at any step the grid reads one
+// contiguous K/32/rows-th of the weight and its demand advances through the
+// weight front to back: a prefetcher can treat the weight as one linear region
+// with a lookahead of a few steps.
 //
 // The decode table (4-bit: the [256 scales][16 codes] int8 LUT; 6-bit: the 256 fp8
 // scales as fp32) and the block's x slice are staged in shared memory after the
@@ -273,8 +274,7 @@ template <int N> __device__ __forceinline__ void cp_async_wait() {
 // residual (nullable): out = residual + residual_scale * out, with the linear rounded
 // to OutputT first, as the unfused addcmul sees it (int8_linear.cu's contract).
 constexpr int kStreamStages = 4;
-constexpr int kPackRows = 8;
-constexpr int kStreamMaxRows = 32;
+constexpr int kCreditRecords = 8;   // records between ring credits; rows is a multiple
 
 template <int BITS> struct StreamRecord {
     static constexpr int kBytes = 512 * BITS / 8 + 32;
@@ -324,23 +324,23 @@ void w4a8_codebook_mma_stream_kernel(
 
     // lanes 0..R/16-1 each move 16 B of the record
     const int8_t* tile_base = weight
-        + static_cast<int64_t>(output_tile) * kPackRows * R + lane * 16;
-    const int64_t run_stride = static_cast<int64_t>(tiles) * kPackRows * R;
+        + (static_cast<int64_t>(split) * tiles + output_tile) * R + lane * 16;
+    const int64_t step_stride = static_cast<int64_t>(splits) * tiles * R;
     auto record = [&](int i) -> const int8_t* {
-        return tile_base + ((i / kPackRows) * splits + split) * run_stride + (i % kPackRows) * R;
+        return tile_base + i * step_stride;
     };
     const bool issuer = active && lane < R / 16;
     const uint8_t* my_stages = stages + warp * S * R;
     const uint32_t st_s = static_cast<uint32_t>(__cvta_generic_to_shared(my_stages)) + lane * 16;
 
-    // Ring consumption: thread 0 credits the block's kPackRows*R-byte runs as
-    // its own loads of them complete (sibling warps stream in lockstep, so the
-    // error is < 1 block). Every block of the wave passes each run boundary at
-    // about the same time, so the credited total tracks the weight's read front.
+    // Ring consumption: thread 0 credits the block's records every kCreditRecords
+    // of its own, as those loads complete (sibling warps stream in lockstep, so the
+    // error is < 1 block). Every block of the wave passes each step at about the
+    // same time, so the credited total tracks the weight's read front.
     const uint64_t run_credit = static_cast<uint64_t>(
-        min(WarpsPerBlock, tiles - static_cast<int>(blockIdx.x) * WarpsPerBlock)) * kPackRows * R;
+        min(WarpsPerBlock, tiles - static_cast<int>(blockIdx.x) * WarpsPerBlock)) * kCreditRecords * R;
     auto credit = [&](int i) {
-        if (threadIdx.x == 0 && ((i + 1) & (kPackRows - 1)) == 0)
+        if (threadIdx.x == 0 && ((i + 1) & (kCreditRecords - 1)) == 0)
             prefetch_ring_consume_device(g_w4a8_prefetch_ring, run_credit);
     };
 

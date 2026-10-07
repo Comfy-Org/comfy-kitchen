@@ -51,11 +51,7 @@ def _unpack_codes(qdata: torch.Tensor, k: int, bits: int) -> torch.Tensor:
     return codes
 
 
-W4A8_MMA_PACK_ROWS = 8  # records per contiguous run (the kernel's kPackRows)
-# The streamed kernel's grid is sized so tiles x splits fills about one wave of this
-# many warps. A constant rather than the running GPU's SM count (170 x 20 on the
-# RTX 5090) so the packed layout is a function of the shape alone.
-_W4A8_MMA_WAVE_WARPS = 3400
+W4A8_MMA_CREDIT_RECORDS = 8  # the kernel credits the prefetch ring every 8 records
 
 
 def w4a8_mma_record_bytes(bits: int) -> int:
@@ -65,15 +61,13 @@ def w4a8_mma_record_bytes(bits: int) -> int:
 
 def w4a8_mma_stream_rows(n: int, k: int) -> int:
     """Records per split each warp streams for an [N, K] weight, or 0 when the MMA
-    layout does not apply: the largest of 32/16/8 dividing K/32 that still fills a
-    wave, so small matrices (o_proj) do not run under-occupied."""
-    if n % 16 != 0 or k % (W4A8_MMA_PACK_ROWS * 32) != 0:
+    layout does not apply. 16 when K/32 allows, else 8: a warp's work is 16 records,
+    few enough that the grid is several waves on every GPU (32 records put the
+    9B gate_up at 1.13 waves on an RTX 5090, a 20% loss to the second wave) and
+    enough that the 4-stage pipeline prologue is amortised."""
+    if n % 16 != 0 or k % (W4A8_MMA_CREDIT_RECORDS * 32) != 0:
         return 0
-    k_rows, tiles = k // 32, n // 16
-    rows = 32
-    while rows > W4A8_MMA_PACK_ROWS and (k_rows % rows != 0 or tiles * (k_rows // rows) < _W4A8_MMA_WAVE_WARPS):
-        rows //= 2
-    return rows
+    return 16 if (k // 32) % 16 == 0 else 8
 
 
 def _mma_bits(packed_numel: int, n: int, k: int) -> int:
@@ -113,8 +107,8 @@ def _fragment_major_inverse(fragments: torch.Tensor, cols: int) -> torch.Tensor:
 def pack_w4a8_mma_weight(qdata: torch.Tensor, s_rel: torch.Tensor, stream_rows: int) -> torch.Tensor:
     """Relayout [N, K*bits/8] codes + [N, K/16] fp8 group scales into the streamed MMA
     kernel's record stream (w4a8_gemm.cu): one record per 16-output x 32-K tile, the
-    codes in mma m16n8k32 fragment order then 32 scale bytes, run-major
-    [krow_in_split // 8][split][tile][8][record] with K/32/stream_rows splits, which the
+    codes in mma m16n8k32 fragment order then 32 scale bytes, record-major
+    [krow_in_split][split][tile][record] with K/32/stream_rows splits, which the
     kernel reads front to back. At 4 bits a lane's 16 codes are 8 nibble bytes at
     lane*8; at 6 bits each 4-code fragment is 24 little-endian bits, the lane's first
     8 bytes at lane*8 and the last 4 at 256 + lane*4."""
@@ -125,7 +119,7 @@ def pack_w4a8_mma_weight(qdata: torch.Tensor, s_rel: torch.Tensor, stream_rows: 
     bits = qdata.shape[1] * 8 // k if k else 0
     if qdata.shape[0] != n or bits not in (4, 6) or qdata.shape[1] * 8 != k * bits:
         raise ValueError("MMA packing requires group_size 16 scales and 4- or 6-bit codes")
-    if n % 16 != 0 or k % (stream_rows * 32) != 0 or stream_rows % W4A8_MMA_PACK_ROWS != 0:
+    if n % 16 != 0 or k % (stream_rows * 32) != 0 or stream_rows % W4A8_MMA_CREDIT_RECORDS != 0:
         raise ValueError("MMA packing requires N % 16 == 0 and K % (32 * stream_rows) == 0")
     tiles, k_rows = n // 16, k // 32
     if bits == 4:
@@ -155,10 +149,10 @@ def pack_w4a8_mma_weight(qdata: torch.Tensor, s_rel: torch.Tensor, stream_rows: 
         dim=3,
     ).contiguous().view(tiles, k_rows, 32)
     records = torch.cat((weight_bytes, scale_bytes), dim=2)
-    splits, runs = k_rows // stream_rows, stream_rows // W4A8_MMA_PACK_ROWS
+    splits = k_rows // stream_rows
     return (
-        records.view(tiles, splits, runs, W4A8_MMA_PACK_ROWS, w4a8_mma_record_bytes(bits))
-        .permute(2, 1, 0, 3, 4)
+        records.view(tiles, splits, stream_rows, w4a8_mma_record_bytes(bits))
+        .permute(2, 1, 0, 3)
         .contiguous()
         .view(torch.int8)
         .view(-1)
@@ -179,11 +173,11 @@ def unpack_w4a8_mma_weight(
     bits = _mma_bits(packed.numel(), n, k)
     record_bytes = w4a8_mma_record_bytes(bits)
     tiles, k_rows = n // 16, k // 32
-    splits, runs = k_rows // stream_rows, stream_rows // W4A8_MMA_PACK_ROWS
+    splits = k_rows // stream_rows
     records = (
         packed.view(torch.uint8)
-        .view(runs, splits, tiles, W4A8_MMA_PACK_ROWS, record_bytes)
-        .permute(2, 1, 0, 3, 4)
+        .view(stream_rows, splits, tiles, record_bytes)
+        .permute(2, 1, 0, 3)
         .reshape(tiles, k_rows, record_bytes)
     )
     code_bytes = record_bytes - 32
