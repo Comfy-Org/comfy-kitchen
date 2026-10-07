@@ -33,6 +33,19 @@ __forceinline__ __device__ void store_value(void* dst, int64_t idx, float value)
     reinterpret_cast<T*>(dst)[idx] = from_float_as<T>(value);
 }
 
+// -ffast-math lets the compiler drop unpack_fp8's special-value branch once the
+// result feeds the scale multiply (NaN came back as 480). Decode the specials from
+// the raw byte, and hide their bits from the optimizer so the select survives.
+__forceinline__ __device__ float unpack_fp8_scaled(uint8_t value, int dtype_code, float s) {
+    const bool e4m3 = dtype_code == kFp8E4M3Code;
+    const bool special = e4m3 ? (value & 0x7f) == 0x7f : (value & 0x7c) == 0x7c;
+    uint32_t special_bits = ((value & 0x80) ? 0x80000000u : 0u) |
+                            ((!e4m3 && (value & 0x3) == 0) ? 0x7f800000u : 0x7fc00000u);
+    asm volatile("" : "+v"(special_bits));
+    const uint32_t scaled_bits = __float_as_uint(unpack_fp8(value, dtype_code) * s);
+    return __uint_as_float(special ? special_bits : scaled_bits);
+}
+
 template<typename InputType>
 __global__ void quantize_per_tensor_fp8_kernel(
     const InputType* input,
@@ -61,7 +74,7 @@ __global__ void dequantize_per_tensor_fp8_kernel(
     if (idx >= numel) {
         return;
     }
-    store_value<OutputType>(output, idx, unpack_fp8(input[idx], input_dtype_code) * scale[0]);
+    store_value<OutputType>(output, idx, unpack_fp8_scaled(input[idx], input_dtype_code, scale[0]));
 }
 
 // Vectorized counterparts. The per-element arithmetic is identical to the scalar
@@ -115,12 +128,12 @@ __global__ void dequantize_per_tensor_fp8_vec_kernel(
         VecChunk<OutputType> out;
         #pragma unroll
         for (int i = 0; i < kVecElems; ++i) {
-            out.v[i] = from_float_as<OutputType>(unpack_fp8(in.v[i], input_dtype_code) * s);
+            out.v[i] = from_float_as<OutputType>(unpack_fp8_scaled(in.v[i], input_dtype_code, s));
         }
         *reinterpret_cast<VecChunk<OutputType>*>(out_typed + i0) = out;
     } else {
         for (int64_t i = i0; i < numel; ++i) {
-            store_value<OutputType>(output, i, unpack_fp8(input[i], input_dtype_code) * s);
+            store_value<OutputType>(output, i, unpack_fp8_scaled(input[i], input_dtype_code, s));
         }
     }
 }

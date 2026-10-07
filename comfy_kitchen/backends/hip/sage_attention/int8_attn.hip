@@ -563,7 +563,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                 if constexpr (kPreparedDenseBool) {
                     const int64_t tile =
                         static_cast<int64_t>(imin(q_idx, qo_len - 1) / 16) * num_iters + iter;
-#if defined(COMFY_MMA_GFX12)
+#if !defined(COMFY_MMA_GFX11)
                     keep_bits = dense_bool_mask[tile * 32 + lane];
 #else
                     // gfx11 interleaves even/odd keys between the half-waves.
@@ -617,7 +617,12 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                             : kb0 + fk * 16 + key_row;
                         float bias;
                         if constexpr (kPreparedDenseBool) {
+#if defined(COMFY_MMA_GFX11)
                             bias = bool_mask_bias(e < 4 ? keep_bits : keep_bits_hi, fk * 8 + 2 * (e % 4));
+#else
+                            // The emulated MMA (gfx10) uses the gfx12 accumulator rows.
+                            bias = bool_mask_bias(keep_bits, fk * 8 + e);
+#endif
                         } else if constexpr (kPreparedDense16) {
                             const uint16_t bits = dense_half_mask[mask_index];
                             if constexpr (kPreparedDenseBF16) bias = __uint_as_float(static_cast<uint32_t>(bits) << 16);
@@ -755,8 +760,9 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                         packed_hi = __builtin_amdgcn_cvt_pk_u8_f32(p, e - 4, packed_hi);
                     }
 #else
-                    tile_sum += p;
                     packed[e] = prob_to_u8(p);
+                    // Normalize with the same quantized probabilities used by PV.
+                    tile_sum += static_cast<float>(packed[e]);
 #endif
                 }
 #if defined(COMFY_MMA_GFX12)
