@@ -168,6 +168,13 @@ struct RingCursor {
 // the previous chunk issued, so the fast path has no load latency in it; a
 // stale snapshot only delays a skip or a window advance by one chunk. The
 // counters are polled synchronously only while the window is exhausted.
+//
+// `consumed` only grows within a step; a snapshot below the previous one means
+// the next step's reset ran while this issuer was still finishing (its
+// wrap-around prefetch starts only once the last region is credited, which can
+// be right before the step ends). The step is over, so the issuer exits rather
+// than waiting against the new step's count and holding up the issuer queued
+// behind it.
 
 __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(PrefetchRingState* ring) {
     if (threadIdx.x != 0) return;
@@ -219,8 +226,9 @@ __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(Pr
             do {
                 __nanosleep(256);
                 waited += 256;
-                consumed = *consumed_p;
-                enabled = *enabled_p;
+                const uint64_t now = *consumed_p;
+                enabled = *enabled_p && now >= consumed;
+                consumed = now;
                 if (!enabled) break;
                 if (global_timer() - t0 > 100000000ull) {   // 100 ms without consumption
                     atomicAdd(&ring->stalled, 1u);
@@ -246,8 +254,8 @@ __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(Pr
             pos.advance(stride - chunk);
             cursor += stride;
         }
+        enabled = next_enabled && next_consumed >= consumed;
         consumed = next_consumed;
-        enabled = next_enabled;
     }
     atomicAdd(reinterpret_cast<unsigned long long*>(&ring->touched), touched);
     atomicAdd(reinterpret_cast<unsigned long long*>(&ring->skipped), skipped);

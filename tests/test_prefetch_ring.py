@@ -1,3 +1,5 @@
+import time
+
 import pytest
 import torch
 
@@ -42,6 +44,24 @@ def test_self_credit_regions_need_no_consumer():
     # nothing reads these: the issuer credits them as it passes and the step completes
     tensors = [torch.empty(n, device="cuda", dtype=torch.uint8) for n in (16, 8192, 65536, 48, 256)]
     _run_step([_self_credit(t) for t in tensors], 0, lambda: None)
+
+
+@requires_ring
+def test_issuer_exits_when_the_next_step_resets():
+    # step 1's issuer credits `scale` and then waits for credit on `unread` that never comes;
+    # step 2 (with `unread` shrunk to nothing) resets the count underneath it. The stale issuer
+    # must see the count fall and exit, not stall for 100 ms while step 2's issuer queues behind it.
+    scale = torch.empty(65536, device="cuda", dtype=torch.uint8)
+    unread = torch.empty(1 << 19, device="cuda", dtype=torch.uint8)
+    descriptors = torch.tensor([_self_credit(scale), (unread.data_ptr(), unread.numel(), 0)], dtype=torch.uint64, device="cuda")
+    prefetch_ring.configure(descriptors, 2, LOOKAHEAD)
+    prefetch_ring.start(descriptors.device)
+    time.sleep(0.02)
+    descriptors[1, 1] = 0
+    prefetch_ring.start(descriptors.device)
+    total, consumed, stalled, *_ = prefetch_ring.stats()
+    prefetch_ring.disable(descriptors.device)
+    assert (total, consumed, stalled) == (scale.numel(), scale.numel(), 0)
 
 
 @requires_ring
