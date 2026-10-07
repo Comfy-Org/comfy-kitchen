@@ -48,9 +48,23 @@ template <> __device__ __forceinline__ float store_output<float>(float value) { 
 template <> __device__ __forceinline__ __half store_output<__half>(float value) { return __float2half(value); }
 template <> __device__ __forceinline__ __nv_bfloat16 store_output<__nv_bfloat16>(float value) { return __float2bfloat16(value); }
 
-// The int8 grid shared by every W4A8/W6A8 path (and the eager/Triton decoders).
+// The int8 grid shared by every W4A8/W6A8 path (and the eager/Triton decoders):
+// round-to-nearest-even of the fp32 product, clamped to +-127. Done without cvt
+// instructions (16/clk/SM, the decode bottleneck): adding 1.5 * 2^23 puts the fp32
+// rounding on the unit grid, so the sum is 0x4B400000 + q bit for bit (|v * s| < 2^22,
+// true for every stored scale), the clamp stays in fp32, and the low byte of that
+// pattern is q's two's complement.
+constexpr float kRoundMagic = 12582912.0f;
+__device__ __forceinline__ float grid_clamp(float biased) {
+    return fminf(fmaxf(biased, kRoundMagic - 127.0f), kRoundMagic + 127.0f);
+}
 __device__ __forceinline__ int8_t level_to_int8(float v, float s) {
-    return static_cast<int8_t>(max(-127, min(127, __float2int_rn(v * s))));
+    // product rounded first, as the eager path (v * s need not be exact)
+    return static_cast<int8_t>(__float_as_int(grid_clamp(__fadd_rn(__fmul_rn(v, s), kRoundMagic))));
+}
+// Uniform level (c - zero) of a code c < 2^23 as fp32, exactly, without an I2F.
+__device__ __forceinline__ float code_level(unsigned c, float zero) {
+    return __int_as_float(0x4B000000u | c) - (8388608.0f + zero);
 }
 
 // Decode one uint2 (8 packed bytes = 16 low nibbles, low nibble = even col) to 16 int8.
@@ -75,15 +89,15 @@ __device__ __forceinline__ void dequant16_to_int8(
             if constexpr (BITS == 6) {
                 const unsigned c0 = (byte & 0xF) | (((hi >> (4 * oo)) & 3u) << 4);
                 const unsigned c1 = ((byte >> 4) & 0xF) | (((hi >> (4 * oo + 2)) & 3u) << 4);
-                v0 = static_cast<float>(c0) - 32.0f;
-                v1 = static_cast<float>(c1) - 32.0f;
+                v0 = code_level(c0, 32.0f);
+                v1 = code_level(c1, 32.0f);
                 s = sc0;
             } else {
                 const int lg = (G >= 16) ? 0 : ((oo * 2) / G);  // local group in the vec
                 s = (lg == 0) ? sc0 : (lg == 1 ? sc1 : (lg == 2 ? sc2 : sc3));
                 const unsigned c0 = byte & 0xF, c1 = (byte >> 4) & 0xF;
-                v0 = cb ? cb[c0] : (static_cast<float>(c0) - 8.0f);
-                v1 = cb ? cb[c1] : (static_cast<float>(c1) - 8.0f);
+                v0 = cb ? cb[c0] : code_level(c0, 8.0f);
+                v1 = cb ? cb[c1] : code_level(c1, 8.0f);
             }
             o[2 * oo]     = level_to_int8(v0, s);
             o[2 * oo + 1] = level_to_int8(v1, s);
@@ -168,16 +182,17 @@ __device__ __forceinline__ void decode_w4a8_record_smem(
 }
 
 // 6-bit: four codes per 24-bit chunk, uniform levels (c - 32) on the int8 grid of
-// level_to_int8 (one fp32 rounding of (c - 32) * s: 32 * s is exact, so the fma is
-// the same product). s comes from a 256-entry fp8 -> fp32 table in shared memory.
+// level_to_int8. s is e4m3 (256-entry fp8 -> fp32 table in shared memory), so the
+// product has <= 10 significant bits and the single-rounding fma onto the magic grid
+// equals the rounded product of level_to_int8. The clamped patterns are packed straight
+// from their low bytes.
 __device__ __forceinline__ unsigned decode_w6a8_chunk(unsigned codes, float s)
 {
-    const float bias = -32.0f * s;
-    int v[4];
+    unsigned v[4];
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const float c = static_cast<float>((codes >> (6 * i)) & 0x3fu);
-        v[i] = max(-127, min(127, __float2int_rn(fmaf(c, s, bias))));
+        const float level = code_level((codes >> (6 * i)) & 0x3fu, 32.0f);
+        v[i] = __float_as_uint(grid_clamp(fmaf(level, s, kRoundMagic)));
     }
     return __byte_perm(__byte_perm(v[0], v[1], 0x0040u), __byte_perm(v[2], v[3], 0x0040u), 0x5410u);
 }
