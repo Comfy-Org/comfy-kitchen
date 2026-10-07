@@ -207,7 +207,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
-from comfy_kitchen.tensor.w4a8_stream import _FIXED_LUT, unpack_w4a8_mma_weight, w4a8_mma_record_bytes  # noqa: E402
+from comfy_kitchen.tensor.w4a8_stream import _FIXED_LUT, w4a8_mma_record_bytes  # noqa: E402
 from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     w4a8_int8_linear as eager_w4a8_int8_linear,
 )
@@ -2552,6 +2552,23 @@ def dequantize_w4a8_int8_weight(
     return rotate_int8_convrot_weight(weight_rotated.contiguous(), convrot_groupsize).to(output_dtype)
 
 
+def _unpack_w4a8_mma_weight(packed: torch.Tensor, n: int, k: int, stream_rows: int):
+    """Record stream -> conventional codes + e4m3 group scales for the prefill GEMM
+    (native inverse of pack_w4a8_mma_weight; the tensor-level torch unpack costs
+    ~15 ms per 9B gate_up at 6 bits)."""
+    bits = 6 if packed.numel() == n * k * w4a8_mma_record_bytes(6) // 512 else 4
+    qdata = torch.empty(n, k * bits // 8, dtype=torch.int8, device=packed.device)
+    s_rel = torch.empty(n, k // 16, dtype=torch.uint8, device=packed.device)
+    _C.unpack_w4a8_mma_weight(
+        _wrap_for_dlpack(packed),
+        _wrap_for_dlpack(qdata),
+        _wrap_for_dlpack(s_rel),
+        stream_rows,
+        torch.cuda.current_stream(packed.device).cuda_stream,
+    )
+    return qdata, s_rel.view(torch.float8_e4m3fn)
+
+
 def w4a8_int8_linear(
     x: torch.Tensor,
     qdata: torch.Tensor,
@@ -2704,7 +2721,7 @@ def w4a8_int8_linear(
         )
 
     if mma_packed:
-        qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, k, stream_rows)
+        qdata, s_rel = _unpack_w4a8_mma_weight(qdata, n, k, stream_rows)
 
     chunked = (
         _W4A8_CHUNKED

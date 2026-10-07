@@ -2254,6 +2254,16 @@ extern "C" {
         int64_t bits,
         cudaStream_t stream);
 
+    void launch_unpack_w4a8_mma_weight(
+        const void* packed,
+        void* qdata,
+        void* s_rel,
+        int64_t N,
+        int64_t K,
+        int64_t stream_rows,
+        int64_t bits,
+        cudaStream_t stream);
+
     void launch_dequant_int4_grouped_to_int8_e4m3(
         const void* qw,
         const void* s_rel,
@@ -3287,6 +3297,27 @@ void dequant_int4_grouped_to_int8(
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const void* cb = codebook.has_value() ? codebook->data() : nullptr;
     launch_dequant_int4_grouped_to_int8(qw.data(), s_rel.data(), cb, out.data(), N, K, G, bits, stream);
+}
+
+// MMA record stream -> conventional [N, K*bits/8] codes + [N, K/16] e4m3 scale bits
+// (the inverse of pack_w4a8_mma_weight), for the prefill GEMM over a streamed weight.
+void unpack_w4a8_mma_weight(
+    nb::ndarray<int8_t, nb::ndim<1>, nb::device::cuda> packed,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> qdata,   // [N, K*bits/8]
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> s_rel,  // [N, K/16] e4m3 bits
+    int64_t stream_rows, uintptr_t stream_ptr) {
+    const int64_t N = s_rel.shape(0);
+    const int64_t K = static_cast<int64_t>(s_rel.shape(1)) * 16;
+    const int64_t bits = K ? static_cast<int64_t>(qdata.shape(1)) * 8 / K : 0;
+    if (static_cast<int64_t>(qdata.shape(0)) != N || (bits != 4 && bits != 6) ||
+        static_cast<int64_t>(qdata.shape(1)) * 8 != K * bits)
+        throw std::runtime_error("unpack_w4a8_mma_weight: qdata must be [N, K*4/8] or [N, K*6/8]");
+    if (N % 16 != 0 || stream_rows <= 0 || K % (32 * stream_rows) != 0)
+        throw std::runtime_error("unpack_w4a8_mma_weight: N % 16 == 0 and K % (32 * stream_rows) == 0 required");
+    if (static_cast<int64_t>(packed.shape(0)) != N * K * (512 * bits / 8 + 32) / 512)
+        throw std::runtime_error("unpack_w4a8_mma_weight: packed size does not match [N, K] at this width");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_unpack_w4a8_mma_weight(packed.data(), qdata.data(), s_rel.data(), N, K, stream_rows, bits, stream);
 }
 
 // fp8 (e4m3) per-group scale: s_rel passed as raw uint8 bits.
@@ -4758,6 +4789,10 @@ NB_MODULE(_C, m) {
           "Grouped int4/int6 -> int8 dequant (group scale folded into int8); optional 16-entry codebook (4-bit)",
           nb::arg("qw"), nb::arg("s_rel"), nb::arg("codebook").none(), nb::arg("out"),
           nb::arg("g"), nb::arg("stream_ptr"));
+
+    m.def("unpack_w4a8_mma_weight", &unpack_w4a8_mma_weight,
+          "MMA record stream -> [N, K*bits/8] packed codes + [N, K/16] e4m3 group scale bits",
+          nb::arg("packed"), nb::arg("qdata"), nb::arg("s_rel"), nb::arg("stream_rows"), nb::arg("stream_ptr"));
 
     m.def("dequant_int4_grouped_to_int8_e4m3", &dequant_int4_grouped_to_int8_e4m3,
           "Grouped int4/int6 -> int8 dequant with fp8 e4m3 per-group scale; optional 16-entry codebook (4-bit)",

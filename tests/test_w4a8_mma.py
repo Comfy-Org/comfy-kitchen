@@ -49,6 +49,23 @@ class TestW4A8PackedMMA:
         # same int8 grid and int32 accumulation; the only difference is fp32 epilogue order
         torch.testing.assert_close(got.float(), ref.float(), atol=2e-2, rtol=1e-2)
 
+    # The native unpack feeds the prefill GEMM; it must reproduce the torch inverse byte
+    # for byte (codes and scale bits) on every stream_rows / split geometry, with codes
+    # using the full 4- or 6-bit range (random, not quantized Gaussian) so a wrong
+    # fragment, nibble or high-plane bit cannot hide.
+    @pytest.mark.parametrize(("n", "k"), [(4096, 4096), (320, 1280), (17408, 2560), (16384, 512)])
+    @pytest.mark.parametrize("bits", [4, 6])
+    def test_native_unpack_matches_torch(self, n, k, bits, seed):
+        rows = ck.w4a8_mma_stream_rows(n, k)
+        qdata = torch.randint(-128, 128, (n, k * bits // 8), device="cuda", dtype=torch.int8)
+        s_rel = torch.randint(0, 256, (n, k // 16), device="cuda").to(torch.uint8).view(torch.float8_e4m3fn)
+        packed = ck.pack_w4a8_mma_weight(qdata, s_rel, rows)
+        got_q, got_s = cuda_backend._unpack_w4a8_mma_weight(packed, n, k, rows)
+        ref_q, ref_s = ck.unpack_w4a8_mma_weight(packed, n, k, rows)
+        assert torch.equal(got_q, ref_q) and torch.equal(got_q, qdata)
+        assert torch.equal(got_s.view(torch.uint8), ref_s.view(torch.uint8))
+        assert torch.equal(got_s.view(torch.uint8), s_rel.view(torch.uint8))
+
     @pytest.mark.parametrize("m", [1, 7])
     @pytest.mark.parametrize("bias", [False, True])
     @pytest.mark.parametrize("bits", [4, 6])

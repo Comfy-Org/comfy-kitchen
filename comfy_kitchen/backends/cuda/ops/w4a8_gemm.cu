@@ -501,7 +501,92 @@ void launch_dequant_grouped_to_int8(
             static_cast<const float*>(codebook),
             static_cast<int8_t*>(out), n_vec, Khalf, static_cast<int>(K), static_cast<int>(G));
 }
+// Record stream (pack_w4a8_mma_weight in tensor/w4a8_stream.py) -> the storage contract
+// above plus [N, K/16] fp8 group scales, for the prefill GEMM over an MMA-packed weight.
+// One thread per (record, output row): the row's 32 codes are fragments j = kh*2 + h
+// (h = row/8, kh = K half) of lanes r*4+g (r = row%8, g = 4-col group), 2 nibble bytes
+// per fragment at 4 bits or a 24-bit little-endian word at 6 bits (a lane's 12 bytes
+// are 8 at lane*8 and 4 at 256+lane*4); its scale bytes sit at r*4 + h + 2*half.
+// Threads follow storage order so the record reads coalesce; the 16-byte row stores
+// scatter across 16 rows.
+template <int BITS>
+__global__ void unpack_w4a8_mma_weight_kernel(
+    const uint8_t* __restrict__ packed, int8_t* __restrict__ qdata, uint8_t* __restrict__ s_rel,
+    long n_threads, int tiles, int splits, int stream_rows, int K)
+{
+    const long v = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= n_threads) return;
+    constexpr int kRecordBytes = 512 * BITS / 8 + 32;
+    const int row = v & 15;
+    const long rec = v >> 4;
+    const int t = rec % tiles;
+    const long rem = rec / tiles;
+    const int split = rem % splits;
+    const int kr = split * stream_rows + static_cast<int>(rem / splits);
+    const uint8_t* __restrict__ record = packed + rec * kRecordBytes;
+    const int h = row >> 3, r = row & 7;
+    unsigned nib[4] = {0u, 0u, 0u, 0u};  // 16 nibble bytes: col c -> byte c/2, even = low
+    unsigned hi[2] = {0u, 0u};           // 6-bit top-2 planes: col c -> byte c/4, bit 2*(c%4)
+    #pragma unroll
+    for (int kh = 0; kh < 2; ++kh) {
+        const int j = kh * 2 + h;
+        #pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            const int lane = r * 4 + g;
+            unsigned codes;  // 4 codes, 6 bits apart at 6 bits, nibbles at 4 bits
+            if constexpr (BITS == 6) {
+                const uint2 lo = *reinterpret_cast<const uint2*>(record + lane * 8);
+                const unsigned w2 = *reinterpret_cast<const unsigned*>(record + 256 + lane * 4);
+                // bits [24j, 24j+24) of the lane's 96-bit little-endian value (w2:lo.y:lo.x)
+                if (kh == 0)
+                    codes = h ? __funnelshift_r(lo.x, lo.y, 24) : lo.x;
+                else
+                    codes = h ? (w2 >> 8) : __funnelshift_r(lo.y, w2, 16);
+                codes &= 0xFFFFFFu;
+                unsigned n2 = 0, h2 = 0;
+                #pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const unsigned code = (codes >> (6 * c)) & 0x3Fu;
+                    n2 |= (code & 0xFu) << (4 * c);
+                    h2 |= (code >> 4) << (2 * c);
+                }
+                codes = n2;
+                hi[kh] |= h2 << (8 * g);
+            } else {
+                codes = *reinterpret_cast<const unsigned short*>(record + lane * 8 + j * 2);
+            }
+            nib[kh * 2 + (g >> 1)] |= codes << (16 * (g & 1));
+        }
+    }
+    const long n = (long)t * 16 + row;
+    const long row_bytes = (long)K * BITS / 8;
+    int8_t* __restrict__ out_row = qdata + n * row_bytes;
+    *reinterpret_cast<uint4*>(out_row + kr * 16) = make_uint4(nib[0], nib[1], nib[2], nib[3]);
+    if constexpr (BITS == 6)
+        *reinterpret_cast<uint2*>(out_row + K / 2 + kr * 8) = make_uint2(hi[0], hi[1]);
+    const uint8_t* __restrict__ scales = record + 512 * BITS / 8 + r * 4 + h;
+    *reinterpret_cast<unsigned short*>(s_rel + n * (K / 16) + kr * 2) =
+        static_cast<unsigned short>(scales[0] | (scales[2] << 8));
+}
 }  // namespace
+
+extern "C" void launch_unpack_w4a8_mma_weight(
+    const void* packed, void* qdata, void* s_rel,
+    int64_t N, int64_t K, int64_t stream_rows, int64_t bits, cudaStream_t stream)
+{
+    const int tiles = N / 16, splits = K / 32 / stream_rows;
+    const long n_threads = (long)N * K / 32;
+    const int block = 256;
+    const long grid = (n_threads + block - 1) / block;
+    if (bits == 6)
+        unpack_w4a8_mma_weight_kernel<6><<<grid, block, 0, stream>>>(
+            static_cast<const uint8_t*>(packed), static_cast<int8_t*>(qdata), static_cast<uint8_t*>(s_rel),
+            n_threads, tiles, splits, static_cast<int>(stream_rows), static_cast<int>(K));
+    else
+        unpack_w4a8_mma_weight_kernel<4><<<grid, block, 0, stream>>>(
+            static_cast<const uint8_t*>(packed), static_cast<int8_t*>(qdata), static_cast<uint8_t*>(s_rel),
+            n_threads, tiles, splits, static_cast<int>(stream_rows), static_cast<int>(K));
+}
 
 extern "C" void set_w4a8_prefetch_ring_state(PrefetchRingState* state) {
     cudaMemcpyToSymbol(g_w4a8_prefetch_ring, &state, sizeof(state));
