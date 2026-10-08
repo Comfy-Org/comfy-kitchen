@@ -148,3 +148,27 @@ def test_staged_requant_is_deterministic_and_graph_capturable(dtype, k, stochast
     q, s, c, _, _ = captured
     reconstructed = cuda_backend.dequantize_w4a8_int8_weight(q, s, c, codebook=cb, output_dtype=torch.float32)
     assert rel_l2(reconstructed, weight) < 0.12
+
+
+@pytest.mark.parametrize("bits,codebook", [(4, False), (4, True), (6, False)])
+def test_decode_grid_all_codes_and_finite_fp8_scales(bits, codebook):
+    # Inspect the dequant workspace, not the GEMM output: sums could hide wrong rounding.
+    n, k = 128, 256
+    cb = fixed_codebook() if codebook else None
+    codes = (torch.arange(k, device="cuda", dtype=torch.int32) % (1 << bits)).expand(n, k)
+    packed = eager_w4a8._pack_codes(codes, bits)
+    scale_bits = torch.arange(n, device="cuda", dtype=torch.uint8).clamp(max=126)
+    scales = scale_bits[:, None].expand(n, k // 16).contiguous().view(torch.float8_e4m3fn)
+    xq = torch.zeros(8, k, device="cuda", dtype=torch.int8)
+    xs = torch.ones(8, device="cuda")
+    channel = torch.ones(n, device="cuda")
+    workspace = torch.empty(n, k, device="cuda", dtype=torch.int8)
+    out = torch.empty(8, n, device="cuda", dtype=torch.bfloat16)
+    wrap = cuda_backend._wrap_for_dlpack
+    assert cuda_backend._C.w4a8_codebook_gemm_chunked(
+        wrap(xq), wrap(packed), wrap(scales.view(torch.uint8)), wrap(cb) if cb is not None else None,
+        wrap(channel), wrap(xs), None, wrap(workspace), wrap(out), 16, n,
+        cuda_backend.DTYPE_TO_CODE[out.dtype], torch.cuda.current_stream().cuda_stream)
+    levels = cb[codes.long()] if cb is not None else codes.float() - (1 << (bits - 1))
+    expected = (levels * scales.float().repeat_interleave(16, dim=1)).round().clamp(-127, 127).to(torch.int8)
+    assert torch.equal(workspace, expected)

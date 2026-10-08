@@ -36,9 +36,23 @@ template <> __device__ __forceinline__ float load_scale<uint8_t>(uint8_t v) {
     return __half2float(__nv_cvt_fp8_to_halfraw(v, __NV_E4M3));
 }
 
-// The int8 grid shared by every W4A8/W6A8 path (and the eager/Triton decoders).
+// The int8 grid shared by every W4A8/W6A8 path (and the eager/Triton decoders):
+// round-to-nearest-even of the fp32 product, clamped to +-127. Done without cvt
+// instructions (16/clk/SM, the decode bottleneck): adding 1.5 * 2^23 puts the fp32
+// rounding on the unit grid, so the sum is 0x4B400000 + q bit for bit (|v * s| < 2^22,
+// true for every stored scale), the clamp stays in fp32, and the low byte of that
+// pattern is q's two's complement.
+constexpr float kRoundMagic = 12582912.0f;
+__device__ __forceinline__ float grid_clamp(float biased) {
+    return fminf(fmaxf(biased, kRoundMagic - 127.0f), kRoundMagic + 127.0f);
+}
 __device__ __forceinline__ int8_t level_to_int8(float v, float s) {
-    return static_cast<int8_t>(max(-127, min(127, __float2int_rn(v * s))));
+    // product rounded first, as the eager path (v * s need not be exact)
+    return static_cast<int8_t>(__float_as_int(grid_clamp(__fadd_rn(__fmul_rn(v, s), kRoundMagic))));
+}
+// Uniform level (c - zero) of a code c < 2^23 as fp32, exactly, without an I2F.
+__device__ __forceinline__ float code_level(unsigned c, float zero) {
+    return __int_as_float(0x4B000000u | c) - (8388608.0f + zero);
 }
 
 // Decode one uint2 (8 packed bytes = 16 low nibbles, low nibble = even col) to 16 int8.
@@ -63,15 +77,15 @@ __device__ __forceinline__ void dequant16_to_int8(
             if constexpr (BITS == 6) {
                 const unsigned c0 = (byte & 0xF) | (((hi >> (4 * oo)) & 3u) << 4);
                 const unsigned c1 = ((byte >> 4) & 0xF) | (((hi >> (4 * oo + 2)) & 3u) << 4);
-                v0 = static_cast<float>(c0) - 32.0f;
-                v1 = static_cast<float>(c1) - 32.0f;
+                v0 = code_level(c0, 32.0f);
+                v1 = code_level(c1, 32.0f);
                 s = sc0;
             } else {
                 const int lg = (G >= 16) ? 0 : ((oo * 2) / G);  // local group in the vec
                 s = (lg == 0) ? sc0 : (lg == 1 ? sc1 : (lg == 2 ? sc2 : sc3));
                 const unsigned c0 = byte & 0xF, c1 = (byte >> 4) & 0xF;
-                v0 = cb ? cb[c0] : (static_cast<float>(c0) - 8.0f);
-                v1 = cb ? cb[c1] : (static_cast<float>(c1) - 8.0f);
+                v0 = cb ? cb[c0] : code_level(c0, 8.0f);
+                v1 = cb ? cb[c1] : code_level(c1, 8.0f);
             }
             o[2 * oo]     = level_to_int8(v0, s);
             o[2 * oo + 1] = level_to_int8(v1, s);
@@ -771,7 +785,7 @@ extern "C" bool launch_quantize_w4a8_convrot(
 
 // Fused W4A8 GEMV for decode (M<=8): dequantize int4+codebook in registers and
 // dp4a against the int8 activation in one pass — no int8 workspace round-trip.
-// Bit-exact with the chunked path: same __float2int_rn(cb[c]*s_rel) int8 grid,
+// Bit-exact with the chunked path: same level_to_int8(cb[c], s_rel) int8 grid,
 // same acc*xs*s_channel(+bias) epilogue. Requires G>=16 and G%16==0 so one
 // 16-col vec never spans two groups.
 namespace {
