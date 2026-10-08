@@ -37,6 +37,12 @@ __all__ = [
     "connected_components",
     "edge_collapse_checks",
     "min_cut",
+    "shortest_paths",
+    "shortest_paths_sparse",
+    "bellman_ford",
+    "trace_paths",
+    "walk_successors",
+    "conjugate_gradient",
     "sol_attn",
     "sol_attn_chunked",
     "adaln",
@@ -3437,6 +3443,14 @@ def _check_indices(name: str, index: torch.Tensor, n: int, lowest: int = 0) -> N
         raise ValueError(f"{name} must lie in [{lowest}, {n}), got values in [{lo}, {hi}]")
 
 
+def _byte_mask(name: str, mask: torch.Tensor | None, n: int) -> torch.Tensor | None:
+    """A bool (n,) mask as the bytes the kernels read, without a copy when it is contiguous."""
+    if mask is None:
+        return None
+    _check_shape(name, mask, (n,))
+    return mask.contiguous().view(torch.uint8) if mask.dtype == torch.bool else mask.to(torch.uint8).contiguous()
+
+
 def connected_components(edges: torch.Tensor, num_nodes: int) -> torch.Tensor:
     num_nodes = _check_count("num_nodes", num_nodes)
     _check_shape("edges", edges, (None, 2))
@@ -3528,6 +3542,185 @@ def min_cut(nbr: torch.Tensor, cap: torch.Tensor, s_cap: torch.Tensor, t_cap: to
             break
     _C.min_cut_global_relabel(n, k, w(nbr), w(rev), w(r), w(rt), tol, big, w(h), w(bfs_lists), w(bfs_counts), stream)
     return h >= big
+
+
+def _shortest_paths(indptr, dst, weight, n, bound, delta, active, blocked, stop, end, closer, reach, dist, keys, front):
+    """One search into dense rows dist (keys None) or a table of keys and their distances dist; True when the table
+    ran full."""
+    device, rows, cap = bound.device, bound.shape[0], dist.numel()
+    _check_shape("indptr", indptr, (n + 1,))
+    _check_shape("weight", weight, (dst.shape[0],))
+    for name, t in (("end", end), ("closer", closer), ("reach", reach)):
+        if t is not None:
+            _check_shape(name, t, (rows,))
+    if not dist.is_contiguous() or not bound.is_contiguous():
+        raise ValueError("dist and bound are updated in place and must be contiguous")
+    if not delta > 0:
+        raise ValueError(f"delta must be positive, got {delta}")
+    bits = torch.zeros(3 * ((cap + 31) // 32), dtype=torch.int32, device=device)
+    queues = torch.empty(4 * cap, dtype=torch.int32, device=device)
+    counts = torch.zeros(7, dtype=torch.int32, device=device)
+    levels = torch.full((4, rows), torch.inf, dtype=torch.float64, device=device)
+    levels[:2] = -torch.inf
+    tensors = (indptr.to(torch.int32).contiguous(), dst.to(torch.int32).contiguous(), weight.contiguous(),
+               _byte_mask("active", active, n), _byte_mask("blocked", blocked, n), _byte_mask("stop", stop, n),
+               None if end is None else end.to(torch.int64).contiguous(),
+               None if closer is None else closer.to(torch.int64).contiguous(),
+               None if reach is None else reach.to(torch.float64).contiguous(), bound, dist, keys,
+               front.to(torch.int64).contiguous(), bits, queues, counts, levels)
+    _C.shortest_paths(rows, n, dst.shape[0], front.numel(), cap, float(delta),
+                      *[None if t is None else _wrap_for_dlpack(t) for t in tensors],
+                      torch.cuda.current_stream(device).cuda_stream)
+    bad, full = counts[5:].tolist()
+    if bad:
+        raise ValueError("shortest_paths: indptr, dst, front / starts, end or closer holds an index out of range")
+    return full
+
+
+def shortest_paths(indptr: torch.Tensor, dst: torch.Tensor, weight: torch.Tensor, dist: torch.Tensor,
+                   front: torch.Tensor, bound: torch.Tensor, delta: float, active: torch.Tensor | None = None,
+                   blocked: torch.Tensor | None = None, end: torch.Tensor | None = None,
+                   closer: torch.Tensor | None = None) -> None:
+    rows, n = dist.shape
+    _check_shape("bound", bound, (rows,))
+    if rows * n >= 2 ** 31:
+        raise ValueError(f"dist must have fewer than 2**31 entries, got {rows} x {n}")
+    _shortest_paths(indptr, dst, weight, n, bound, delta, active, blocked, None, end, closer, None, dist, None, front)
+
+
+def shortest_paths_sparse(indptr: torch.Tensor, dst: torch.Tensor, weight: torch.Tensor, starts: torch.Tensor,
+                          bound: torch.Tensor, delta: float, num_nodes: int, active: torch.Tensor | None = None,
+                          blocked: torch.Tensor | None = None, stop: torch.Tensor | None = None,
+                          end: torch.Tensor | None = None, closer: torch.Tensor | None = None,
+                          reach: torch.Tensor | None = None, max_slots: int = 2 ** 30) -> tuple[torch.Tensor, torch.Tensor]:
+    device, rows, n = starts.device, starts.shape[0], _check_count("num_nodes", num_nodes)
+    _check_shape("bound", bound, (rows,))
+    if rows == 0:
+        return torch.empty(0, dtype=torch.int64, device=device), torch.empty(0, dtype=torch.float64, device=device)
+    start_bound = bound.clone()
+    cap = 1 << (min(max_slots, 2 ** 30).bit_length() - 1)
+    slots = min(cap, 1 << max(12, (64 * rows - 1).bit_length()))
+    out_keys, out_vals = [], []
+    c, take = 0, rows
+    while c < rows:
+        take = min(take, rows - c)
+        part = slice(c, c + take)
+        keys = torch.full((slots,), -1, dtype=torch.int64, device=device)
+        vals = torch.full((slots,), torch.inf, dtype=torch.float64, device=device)
+        per_row = (None if t is None else t[part] for t in (end, closer, reach))
+        if _shortest_paths(indptr, dst, weight, n, bound[part], delta, active, blocked, stop, *per_row, vals, keys,
+                           torch.arange(take, device=device) * n + starts[part]):
+            bound[part] = start_bound[part]                      # a full table loses entries: more slots or fewer rows
+            if slots < cap:
+                slots = min(cap, slots * 4)
+            elif take > 1:
+                take = (take + 1) // 2
+            else:
+                raise ValueError("shortest_paths_sparse: one search reaches more nodes than max_slots")
+            continue
+        used = torch.nonzero(keys >= 0)[:, 0]
+        k, order = torch.sort(keys[used])
+        out_keys.append(k + c * n)
+        out_vals.append(vals[used][order])
+        c += take
+    return (torch.cat(out_keys), torch.cat(out_vals)) if len(out_keys) > 1 else (out_keys[0], out_vals[0])
+
+
+def bellman_ford(indptr: torch.Tensor, tail: torch.Tensor, weight: torch.Tensor, dist: torch.Tensor,
+                 max_iters: int) -> tuple[torch.Tensor, torch.Tensor]:
+    device, n = dist.device, dist.shape[0]
+    _check_shape("indptr", indptr, (n + 1,))
+    _check_shape("weight", weight, (tail.shape[0],))
+    _check_count("max_iters", max_iters)
+    parent = torch.full((n,), -1, dtype=torch.int32, device=device)
+    on_cycle = torch.zeros(n, dtype=torch.bool, device=device)
+    work = dist.repeat(2, 1)                                    # Jacobi buffers, the result lands in the first
+    jump = torch.empty(2 * n, dtype=torch.int32, device=device)
+    flags = torch.zeros(5, dtype=torch.int32, device=device)
+    w = _wrap_for_dlpack
+    _C.bellman_ford(n, tail.shape[0], w(indptr.to(torch.int32).contiguous()), w(tail.to(torch.int32).contiguous()),
+                    w(weight.contiguous()), w(work), w(parent), w(jump), w(flags), w(on_cycle.view(torch.uint8)),
+                    max_iters, torch.cuda.current_stream(device).cuda_stream)
+    if flags[4]:
+        raise ValueError("bellman_ford: indptr or tail holds an index out of range")
+    dist.copy_(work[0])
+    return parent.long(), on_cycle
+
+
+def trace_paths(indptr: torch.Tensor, tail: torch.Tensor, weight: torch.Tensor, starts: torch.Tensor,
+                ends: torch.Tensor, dist: torch.Tensor | tuple[torch.Tensor, torch.Tensor], num_nodes: int,
+                reach: torch.Tensor | None = None, stop: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    device, rows, n = starts.device, starts.shape[0], _check_count("num_nodes", num_nodes)
+    _check_shape("indptr", indptr, (n + 1,))
+    _check_shape("weight", weight, (tail.shape[0],))
+    _check_shape("ends", ends, (rows,))
+    if reach is not None:
+        _check_shape("reach", reach, (rows,))
+    keys, values = dist if isinstance(dist, tuple) else (None, dist)
+    _check_shape("dist", values, (rows, n) if keys is None else (keys.shape[0],))
+    lengths = torch.zeros(rows, dtype=torch.int32, device=device)
+    error = torch.zeros(1, dtype=torch.int32, device=device)
+    tensors = (indptr.to(torch.int32).contiguous(), tail.to(torch.int32).contiguous(), weight.contiguous(),
+               None if keys is None else keys.to(torch.int64).contiguous(), values.contiguous(),
+               starts.to(torch.int64).contiguous(), ends.to(torch.int64).contiguous(),
+               None if reach is None else reach.to(torch.float64).contiguous(), _byte_mask("stop", stop, n), error,
+               lengths)
+
+    def walk(offsets, out):
+        _C.trace_paths(rows, n, tail.shape[0], 0 if keys is None else keys.shape[0],
+                       *[None if t is None else _wrap_for_dlpack(t) for t in (*tensors, offsets, out)],
+                       torch.cuda.current_stream(device).cuda_stream)
+    walk(None, None)
+    lengths = lengths.long()
+    total, bad = torch.stack([lengths.sum(), error[0].long()]).tolist()
+    if bad:
+        raise ValueError("trace_paths: indptr, tail, starts or ends holds an index out of range")
+    out = torch.empty(total, dtype=torch.int64, device=device)
+    if total:
+        walk(torch.cumsum(lengths, 0) - lengths, out)
+    return out, lengths
+
+
+def walk_successors(succ: torch.Tensor, starts: torch.Tensor, stop: torch.Tensor, active: torch.Tensor,
+                    twin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    device, n, rows = starts.device, succ.shape[0], starts.shape[0]
+    _check_shape("twin", twin, (n,))
+    _check_indices("succ", succ, n, lowest=-1)
+    _check_indices("starts", starts, n)
+    _check_indices("twin", twin, n, lowest=-1)
+    lengths = torch.zeros(rows, dtype=torch.int32, device=device)
+    tensors = (succ.to(torch.int32).contiguous(), _byte_mask("stop", stop, n), _byte_mask("active", active, n),
+               twin.to(torch.int32).contiguous(), starts.to(torch.int64).contiguous(),
+               torch.zeros(rows, (n + 31) // 32, dtype=torch.int32, device=device), lengths)
+    stream = torch.cuda.current_stream(device).cuda_stream
+    _C.walk_successors(rows, n, *map(_wrap_for_dlpack, tensors), None, 0, stream)
+    out = torch.full((rows, int(lengths.max()) if rows else 0), -1, dtype=torch.int64, device=device)
+    if out.numel():
+        _C.walk_successors(rows, n, *map(_wrap_for_dlpack, tensors), _wrap_for_dlpack(out), out.shape[1], stream)
+    return out, lengths.long()
+
+
+def conjugate_gradient(indptr: torch.Tensor, cols: torch.Tensor, vals: torch.Tensor, b: torch.Tensor, x: torch.Tensor,
+                       max_iters: int, tol: float) -> None:
+    device, n = b.device, indptr.shape[0] - 1
+    k = 1 if b.dim() == 1 else b.shape[1]
+    _check_shape("vals", vals, (cols.shape[0],))
+    _check_shape("b", b, (n,) if b.dim() == 1 else (n, None))
+    _check_shape("x", x, tuple(b.shape))
+    _check_count("max_iters", max_iters)
+    if not 1 <= k <= 4:
+        raise ValueError(f"b must have 1 to 4 columns, got {k}")
+    if not x.is_contiguous():
+        raise ValueError("x is updated in place and must be contiguous")
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    work = torch.empty(3 * x.numel() + 8 * sms, dtype=torch.float64, device=device)     # r, p, A p, block partials
+    error = torch.zeros(1, dtype=torch.int32, device=device)
+    w = _wrap_for_dlpack
+    _C.conjugate_gradient(n, k, cols.shape[0], w(indptr.to(torch.int32).contiguous()), w(cols.to(torch.int32).contiguous()),
+                          w(vals.contiguous()), w(b.contiguous()), w(x), w(work), max_iters, float(tol), w(error),
+                          torch.cuda.current_stream(device).cuda_stream)
+    if error.item():
+        raise ValueError("conjugate_gradient: indptr or cols holds an index out of range")
 
 
 _ZERO_VECTORS: dict[tuple, torch.Tensor] = {}
@@ -4371,6 +4564,8 @@ def _build_constraints() -> dict:
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
+    index_1d = ParamConstraint(dtypes=frozenset({torch.int32, torch.int64}), shape_rules=(ExactDims(1),))
+    f64_1d = ParamConstraint(dtypes=frozenset({torch.float64}), shape_rules=(ExactDims(1),))
 
     constraints = {
         "sol_attn": FunctionConstraints(
@@ -4450,6 +4645,40 @@ def _build_constraints() -> dict:
                 "s_cap": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)),
                 "t_cap": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)),
             },
+            default_devices=cuda_devices,
+            min_compute_capability=(7, 5),
+        ),
+        "shortest_paths": FunctionConstraints(
+            params={"indptr": index_1d, "dst": index_1d, "weight": f64_1d, "front": index_1d, "bound": f64_1d,
+                    "dist": ParamConstraint(dtypes=frozenset({torch.float64}), shape_rules=(ExactDims(2),))},
+            default_devices=cuda_devices,
+            min_compute_capability=(7, 5),
+        ),
+        "shortest_paths_sparse": FunctionConstraints(
+            params={"indptr": index_1d, "dst": index_1d, "weight": f64_1d, "starts": index_1d, "bound": f64_1d},
+            default_devices=cuda_devices,
+            min_compute_capability=(7, 5),
+        ),
+        "bellman_ford": FunctionConstraints(
+            params={"indptr": index_1d, "tail": index_1d, "weight": f64_1d, "dist": f64_1d},
+            default_devices=cuda_devices,
+            min_compute_capability=(7, 5),
+        ),
+        "trace_paths": FunctionConstraints(
+            params={"indptr": index_1d, "tail": index_1d, "weight": f64_1d, "starts": index_1d, "ends": index_1d},
+            default_devices=cuda_devices,
+            min_compute_capability=(7, 5),
+        ),
+        "walk_successors": FunctionConstraints(
+            params={"succ": index_1d, "starts": index_1d,
+                    "stop": ParamConstraint(dtypes=frozenset({torch.bool}), shape_rules=(ExactDims(1),))},
+            default_devices=cuda_devices,
+            min_compute_capability=(7, 5),
+        ),
+        "conjugate_gradient": FunctionConstraints(
+            params={"indptr": index_1d, "cols": index_1d, "vals": f64_1d,
+                    "b": ParamConstraint(dtypes=frozenset({torch.float64})),
+                    "x": ParamConstraint(dtypes=frozenset({torch.float64}))},
             default_devices=cuda_devices,
             min_compute_capability=(7, 5),
         ),

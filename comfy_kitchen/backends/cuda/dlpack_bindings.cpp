@@ -375,6 +375,23 @@ extern "C" {
     void launch_min_cut_iterate(int n, int K, const void* nbr, const void* rev, void* r, void* e, void* rt, void* h,
                                 void* inc, void* hn, float tol, int big, const void* list, const void* count,
                                 void* list_out, void* count_out, void* queued, void* active, cudaStream_t stream);
+
+    // Shortest paths, Bellman-Ford, path read-back, successor walks and conjugate gradients — see ops/<op name>.cu.
+    void launch_shortest_paths(int R, int N, int E, int n_front, long long cap, double delta, const void* indptr,
+                               const void* dst, const void* w, const void* active, const void* blocked, const void* stop,
+                               const void* end, const void* closer, const void* reach, void* bound, void* dist, void* keys,
+                               const void* front, void* bits, void* queues, void* counts, void* levels, cudaStream_t stream);
+    void launch_bellman_ford(int n, int E, const void* indptr, const void* tail, const void* w, void* dist, void* parent,
+                             void* jump, void* flags, void* on_cycle, int max_iters, cudaStream_t stream);
+    void launch_trace_paths(int R, int N, int E, long long n_keys, const void* indptr, const void* tail, const void* w,
+                            const void* keys, const void* values, const void* starts, const void* ends, const void* reach,
+                            const void* stop, void* error, void* lengths, const void* offsets, void* out,
+                            cudaStream_t stream);
+    void launch_walk_successors(int R, int N, const void* succ, const void* stop, const void* active, const void* twin,
+                                const void* starts, void* seen, void* lengths, void* out, int L, cudaStream_t stream);
+    void launch_conjugate_gradient(int n, int k, int nnz, const void* indptr, const void* cols, const void* vals,
+                                   const void* b, void* x, void* work, int max_iters, double tol, void* error,
+                                   cudaStream_t stream);
 }
 
 // Nanobind wrapper for quantize_per_tensor_fp8
@@ -1908,6 +1925,48 @@ void min_cut_iterate(int n, int K, cuda_array nbr, cuda_array rev, cuda_array r,
     launch_min_cut_iterate(n, K, nbr.data(), rev.data(), r.data(), e.data(), rt.data(), h.data(), inc.data(), hn.data(),
                            tol, big, list.data(), count.data(), list_out.data(), count_out.data(), queued.data(),
                            active.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+static void* data_or_null(const std::optional<cuda_array>& a) { return a ? a->data() : nullptr; }
+
+void shortest_paths(int R, int N, int E, int n_front, int64_t cap, double delta, cuda_array indptr, cuda_array dst,
+                    cuda_array w, std::optional<cuda_array> active, std::optional<cuda_array> blocked,
+                    std::optional<cuda_array> stop, std::optional<cuda_array> end, std::optional<cuda_array> closer,
+                    std::optional<cuda_array> reach, cuda_array bound, cuda_array dist, std::optional<cuda_array> keys,
+                    cuda_array front, cuda_array bits, cuda_array queues, cuda_array counts, cuda_array levels,
+                    uintptr_t stream_ptr) {
+    launch_shortest_paths(R, N, E, n_front, cap, delta, indptr.data(), dst.data(), w.data(), data_or_null(active),
+                          data_or_null(blocked), data_or_null(stop), data_or_null(end), data_or_null(closer),
+                          data_or_null(reach), bound.data(), dist.data(), data_or_null(keys), front.data(), bits.data(),
+                          queues.data(), counts.data(), levels.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void bellman_ford(int n, int E, cuda_array indptr, cuda_array tail, cuda_array w, cuda_array dist, cuda_array parent,
+                  cuda_array jump, cuda_array flags, cuda_array on_cycle, int max_iters, uintptr_t stream_ptr) {
+    launch_bellman_ford(n, E, indptr.data(), tail.data(), w.data(), dist.data(), parent.data(), jump.data(), flags.data(),
+                        on_cycle.data(), max_iters, reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void trace_paths(int R, int N, int E, int64_t n_keys, cuda_array indptr, cuda_array tail, cuda_array w,
+                 std::optional<cuda_array> keys, cuda_array values, cuda_array starts, cuda_array ends,
+                 std::optional<cuda_array> reach, std::optional<cuda_array> stop, cuda_array error, cuda_array lengths,
+                 std::optional<cuda_array> offsets, std::optional<cuda_array> out, uintptr_t stream_ptr) {
+    launch_trace_paths(R, N, E, n_keys, indptr.data(), tail.data(), w.data(), data_or_null(keys), values.data(),
+                       starts.data(), ends.data(), data_or_null(reach), data_or_null(stop), error.data(), lengths.data(),
+                       data_or_null(offsets), data_or_null(out), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void walk_successors(int R, int N, cuda_array succ, cuda_array stop, cuda_array active, cuda_array twin,
+                     cuda_array starts, cuda_array seen, cuda_array lengths, std::optional<cuda_array> out, int L,
+                     uintptr_t stream_ptr) {
+    launch_walk_successors(R, N, succ.data(), stop.data(), active.data(), twin.data(), starts.data(), seen.data(),
+                           lengths.data(), data_or_null(out), L, reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void conjugate_gradient(int n, int k, int nnz, cuda_array indptr, cuda_array cols, cuda_array vals, cuda_array b,
+                        cuda_array x, cuda_array work, int max_iters, double tol, cuda_array error, uintptr_t stream_ptr) {
+    launch_conjugate_gradient(n, k, nnz, indptr.data(), cols.data(), vals.data(), b.data(), x.data(), work.data(),
+                              max_iters, tol, error.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // fp16-accumulate conv3d; all tensors fp16 NDHWC (validated in Python), residual is
@@ -5353,6 +5412,24 @@ NB_MODULE(_C, m) {
           nb::arg("K"), nb::arg("nbr"), nb::arg("rev"), nb::arg("r"), nb::arg("e"), nb::arg("rt"), nb::arg("h"),
           nb::arg("inc"), nb::arg("hn"), nb::arg("tol"), nb::arg("big"), nb::arg("list"), nb::arg("count"),
           nb::arg("list_out"), nb::arg("count_out"), nb::arg("queued"), nb::arg("active"), nb::arg("stream_ptr"));
+    m.def("shortest_paths", &shortest_paths, "Batched delta-stepping shortest paths, in place", nb::arg("R"), nb::arg("N"),
+          nb::arg("E"), nb::arg("n_front"), nb::arg("cap"), nb::arg("delta"), nb::arg("indptr"), nb::arg("dst"), nb::arg("w"),
+          nb::arg("active").none(), nb::arg("blocked").none(), nb::arg("stop").none(), nb::arg("end").none(),
+          nb::arg("closer").none(), nb::arg("reach").none(), nb::arg("bound"), nb::arg("dist"), nb::arg("keys").none(),
+          nb::arg("front"), nb::arg("bits"), nb::arg("queues"), nb::arg("counts"), nb::arg("levels"), nb::arg("stream_ptr"));
+    m.def("bellman_ford", &bellman_ford, "Jacobi Bellman-Ford sweeps until convergence or a parent cycle", nb::arg("n"),
+          nb::arg("E"), nb::arg("indptr"), nb::arg("tail"), nb::arg("w"), nb::arg("dist"), nb::arg("parent"), nb::arg("jump"),
+          nb::arg("flags"), nb::arg("on_cycle"), nb::arg("max_iters"), nb::arg("stream_ptr"));
+    m.def("trace_paths", &trace_paths, "Shortest paths read back from distance fields", nb::arg("R"), nb::arg("N"),
+          nb::arg("E"), nb::arg("n_keys"), nb::arg("indptr"), nb::arg("tail"), nb::arg("w"), nb::arg("keys").none(),
+          nb::arg("values"), nb::arg("starts"), nb::arg("ends"), nb::arg("reach").none(), nb::arg("stop").none(),
+          nb::arg("error"), nb::arg("lengths"), nb::arg("offsets").none(), nb::arg("out").none(), nb::arg("stream_ptr"));
+    m.def("walk_successors", &walk_successors, "Walks along a successor array", nb::arg("R"), nb::arg("N"),
+          nb::arg("succ"), nb::arg("stop"), nb::arg("active"), nb::arg("twin"), nb::arg("starts"), nb::arg("seen"),
+          nb::arg("lengths"), nb::arg("out").none(), nb::arg("L"), nb::arg("stream_ptr"));
+    m.def("conjugate_gradient", &conjugate_gradient, "Conjugate gradients on a CSR matrix, in place", nb::arg("n"),
+          nb::arg("k"), nb::arg("nnz"), nb::arg("indptr"), nb::arg("cols"), nb::arg("vals"), nb::arg("b"), nb::arg("x"),
+          nb::arg("work"), nb::arg("max_iters"), nb::arg("tol"), nb::arg("error"), nb::arg("stream_ptr"));
 
     // Feature availability flag (computed at module load time)
     m.attr("HAS_CUBLASLT") = comfy::CublasLtRuntime::instance().is_available();
