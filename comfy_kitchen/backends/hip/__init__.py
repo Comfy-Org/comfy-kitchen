@@ -86,7 +86,9 @@ __all__ = [
     "int8_linear",
     "int8_attention_is_available",
     "flash_attention_decode_is_available",
+    "flash_attention_decode_gqa_is_available",
     "flash_decode",
+    "flash_decode_gqa",
     "gated_delta_decode_fused",
     "gated_delta_decode_is_available",
     "deltanet_conv_step",
@@ -2924,6 +2926,11 @@ def flash_attention_decode_is_available() -> bool:
     return has_wmma() and hasattr(_C, "flash_attention_decode")
 
 
+def flash_attention_decode_gqa_is_available() -> bool:
+    """Whether the head-first GQA decode kernel can run here."""
+    return has_wmma() and hasattr(_C, "flash_attention_decode_gqa")
+
+
 # ---------------------------------------------------------------------------
 # GatedDeltaNet decode
 #
@@ -3052,6 +3059,32 @@ def flash_decode(
     launch so both backends can share comfy_kitchen/flash_attention.py.
     """
     _C.flash_attention_decode(
+        _dl(q),
+        _dl(k),
+        _dl(v),
+        _dl(kv_lengths),
+        _dl(output),
+        _dl(softmax_lse),
+        _dl(softmax_lse_accum),
+        _dl(output_accum),
+        num_splits,
+        _stream(q),
+    )
+
+
+def flash_decode_gqa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_lengths: torch.Tensor,
+    output: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    softmax_lse_accum: torch.Tensor,
+    output_accum: torch.Tensor,
+    num_splits: int,
+) -> None:
+    """Head-first GQA decode attention into ``output``. See ops/flash_decode.hip."""
+    _C.flash_attention_decode_gqa(
         _dl(q),
         _dl(k),
         _dl(v),

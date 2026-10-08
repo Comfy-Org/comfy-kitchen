@@ -20,16 +20,19 @@ void launch_na3d_kernel(const void* q, const void* k, const void* v, void* out, 
                         int kh, int kw, int causal_t, int causal_h, int causal_w, float scale,
                         int dtype_code, hipStream_t stream);
 
-// BF16 decode attention over a fixed-capacity KV cache. query_length is the GQA
-// group count folded into the query sequence dimension by the Python layer, and
-// head_dim is 128 or 256. out_accum and lse_accum are read only when
-// num_splits > 1. See ops/flash_decode.hip.
+// BF16 decode attention over a fixed-capacity KV cache. The rows of one KV head
+// are a (group, step) grid of query_length = groups * steps rows; `causal` gives
+// row (g, s) the slot limit kv_lengths[b] - steps + s + 1. head_dim is 128 or
+// 256. out_accum and lse_accum are read only when num_splits > 1. See
+// ops/flash_decode.hip.
 void launch_flash_decode(const void* q, const void* k, const void* v, const int* kv_lengths,
                          void* out, float* softmax_lse, float* out_accum, float* lse_accum,
-                         int batch, int query_length, int heads, int head_dim, int kv_capacity, int num_splits,
-                         int64_t q_batch_stride, int64_t q_row_stride, int64_t q_head_stride,
-                         int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
-                         hipStream_t stream);
+                         int batch, int query_length, int steps, int heads, int head_dim,
+                         int kv_capacity, int num_splits, bool causal,
+                         int64_t q_batch_stride, int64_t q_group_stride, int64_t q_step_stride,
+                         int64_t q_head_stride, int64_t k_batch_stride, int64_t k_row_stride,
+                         int64_t k_head_stride, int64_t o_batch_stride, int64_t o_group_stride,
+                         int64_t o_step_stride, int64_t o_head_stride, hipStream_t stream);
 
 // ldc is c's row stride, so a caller writing an N-column slice of a wider output
 // passes that output's width; a whole GEMM passes N.

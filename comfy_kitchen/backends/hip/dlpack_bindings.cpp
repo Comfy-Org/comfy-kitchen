@@ -1922,9 +1922,117 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
         static_cast<float*>(softmax_lse.data()),
         num_splits > 1 ? static_cast<float*>(output_accum.data()) : nullptr,
         num_splits > 1 ? static_cast<float*>(softmax_lse_accum.data()) : nullptr, batch,
-        query_length, heads, head_dim, kv_capacity, num_splits, q.stride(0) * query_length, q.stride(0),
-        q.stride(1), k.stride(0), k.stride(1), k.stride(2),
+        query_length, 1, heads, head_dim, kv_capacity, num_splits, false,
+        q.stride(0) * query_length, q.stride(0), 0, q.stride(1), k.stride(0), k.stride(1),
+        k.stride(2), q.stride(0) * query_length, q.stride(0), 0, q.stride(1),
         reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// The head-first GQA entry: q [B, H, S, 256] over k/v [B, Hk, capacity, 256] into
+// output [B, S, H*256] (contiguous), bottom-right causal over kv_lengths[b] slots
+// when `causal`. The kernel runs the G*S rows of one kv head together, so K/V
+// stream once per kv head.
+void flash_attention_decode_gqa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
+                                nb::ndarray<> kv_lengths, nb::ndarray<> output,
+                                nb::ndarray<> softmax_lse, nb::ndarray<> softmax_lse_accum,
+                                nb::ndarray<> output_accum, int num_splits,
+                                uintptr_t stream_ptr) {
+    constexpr const char* kFn = "flash_attention_decode_gqa";
+    constexpr int64_t kHeadDim = 256;
+    constexpr int kElemsPerLoad = 4;
+    if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || output.ndim() != 3 ||
+        kv_lengths.ndim() != 1) {
+        throw std::runtime_error(std::string(kFn) + ": operand rank mismatch");
+    }
+    const int64_t batch = q.shape(0), heads = q.shape(1), query_length = q.shape(2);
+    const int64_t kv_heads = k.shape(1), kv_capacity = k.shape(2);
+    if (batch <= 0 || heads <= 0 || query_length <= 0 || query_length > 64 || kv_heads <= 0 ||
+        heads % kv_heads != 0 || kv_capacity <= 0 || q.shape(3) != kHeadDim) {
+        throw std::runtime_error(std::string(kFn) + ": invalid q dimensions");
+    }
+    if (k.shape(0) != batch || k.shape(3) != kHeadDim || v.shape(0) != batch ||
+        v.shape(1) != kv_heads || v.shape(2) != kv_capacity || v.shape(3) != kHeadDim) {
+        throw std::runtime_error(std::string(kFn) + ": k/v shape mismatch");
+    }
+    if (output.shape(0) != batch || output.shape(1) != query_length ||
+        output.shape(2) != heads * kHeadDim || kv_lengths.size() != static_cast<size_t>(batch)) {
+        throw std::runtime_error(std::string(kFn) + ": output or length shape mismatch");
+    }
+    require_dtype(q, 2, 2, kFn, "q");
+    require_dtype(k, 2, 2, kFn, "k");
+    require_dtype(v, 2, 2, kFn, "v");
+    require_dtype(output, 2, 2, kFn, "output");
+    if (map_dtype_to_code(kv_lengths.dtype()) != -1 ||
+        kv_lengths.dtype().code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) ||
+        kv_lengths.dtype().bits != 32) {
+        throw std::runtime_error(std::string(kFn) + ": kv_lengths must be int32");
+    }
+    const size_t lse_size = static_cast<size_t>(batch) * heads * query_length;
+    if (softmax_lse.size() != lse_size || num_splits < 1 || num_splits > 32 ||
+        (num_splits > 1 &&
+         (softmax_lse_accum.size() != lse_size * num_splits ||
+          output_accum.size() != lse_size * kHeadDim * num_splits))) {
+        throw std::runtime_error(std::string(kFn) + ": invalid split workspace");
+    }
+    require_dtype(softmax_lse, 0, 0, kFn, "softmax_lse");
+    require_packed_contiguous(kv_lengths, kFn, "kv_lengths");
+    require_packed_contiguous(softmax_lse, kFn, "softmax_lse");
+    if (num_splits > 1) {
+        require_dtype(softmax_lse_accum, 0, 0, kFn, "softmax_lse_accum");
+        require_dtype(output_accum, 0, 0, kFn, "output_accum");
+        require_packed_contiguous(softmax_lse_accum, kFn, "softmax_lse_accum");
+        require_packed_contiguous(output_accum, kFn, "output_accum");
+    }
+    if (k.stride(0) != v.stride(0) || k.stride(1) != v.stride(1) || k.stride(2) != v.stride(2) ||
+        k.stride(3) != 1 || v.stride(3) != 1 || q.stride(3) != 1 || output.stride(2) != 1 ||
+        output.stride(1) != heads * kHeadDim || output.stride(0) != query_length * heads * kHeadDim) {
+        throw std::runtime_error(std::string(kFn) + ": unsupported tensor strides");
+    }
+    const int64_t vectored[] = {q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2)};
+    for (int64_t stride : vectored) {
+        if (stride % kElemsPerLoad != 0) {
+            throw std::runtime_error(std::string(kFn) + ": strides must be a multiple of 4");
+        }
+    }
+    constexpr uintptr_t kLoadBytes = kElemsPerLoad * sizeof(uint16_t);
+    const void* row_starts[] = {q.data(), k.data(), v.data(), output.data()};
+    for (const void* base : row_starts) {
+        if (reinterpret_cast<uintptr_t>(base) % kLoadBytes != 0) {
+            throw std::runtime_error(std::string(kFn) + ": q, k, v and output must be 8-byte aligned");
+        }
+    }
+    constexpr int kDeviceRocm = nb::device::rocm::value;
+    const nb::ndarray<>* operands[] = {&q, &k, &v, &output, &kv_lengths, &softmax_lse};
+    for (const nb::ndarray<>* t : operands) {
+        if (t->device_type() != kDeviceRocm || t->device_id() != q.device_id()) {
+            throw std::runtime_error(std::string(kFn) +
+                                     ": every operand must be ROCm device memory on q's device");
+        }
+    }
+    if (num_splits > 1 &&
+        (softmax_lse_accum.device_type() != kDeviceRocm ||
+         output_accum.device_type() != kDeviceRocm ||
+         softmax_lse_accum.device_id() != q.device_id() ||
+         output_accum.device_id() != q.device_id())) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": split workspace must be ROCm device memory on q's device");
+    }
+
+    // Query head h of kv head kh is kh * groups + g, so the group stride is q's head
+    // stride and the kv-head stride is groups of those. Output rows are already
+    // [B, S, (Hk, G, D)].
+    const int64_t groups = heads / kv_heads;
+    launch_flash_decode(
+        q.data(), k.data(), v.data(), static_cast<const int*>(kv_lengths.data()), output.data(),
+        static_cast<float*>(softmax_lse.data()),
+        num_splits > 1 ? static_cast<float*>(output_accum.data()) : nullptr,
+        num_splits > 1 ? static_cast<float*>(softmax_lse_accum.data()) : nullptr,
+        static_cast<int>(batch), static_cast<int>(groups * query_length),
+        static_cast<int>(query_length), static_cast<int>(kv_heads), static_cast<int>(kHeadDim),
+        static_cast<int>(kv_capacity), num_splits, true, q.stride(0), q.stride(1), q.stride(2),
+        groups * q.stride(1), k.stride(0), k.stride(2), k.stride(1), output.stride(0), kHeadDim,
+        output.stride(1), groups * kHeadDim, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -2379,6 +2487,10 @@ NB_MODULE(_C, m) {
           nb::arg("stream_ptr"));
     m.def("na3d", &na3d);
     m.def("flash_attention_decode", &flash_attention_decode, nb::arg("q"), nb::arg("k"),
+          nb::arg("v"), nb::arg("kv_lengths"), nb::arg("output"), nb::arg("softmax_lse"),
+          nb::arg("softmax_lse_accum"), nb::arg("output_accum"), nb::arg("num_splits"),
+          nb::arg("stream_ptr"));
+    m.def("flash_attention_decode_gqa", &flash_attention_decode_gqa, nb::arg("q"), nb::arg("k"),
           nb::arg("v"), nb::arg("kv_lengths"), nb::arg("output"), nb::arg("softmax_lse"),
           nb::arg("softmax_lse_accum"), nb::arg("output_accum"), nb::arg("num_splits"),
           nb::arg("stream_ptr"));
