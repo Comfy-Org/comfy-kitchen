@@ -8,7 +8,7 @@ Requires Python ≥3.10 (repo targets 3.12), PyTorch ≥2.7.0. Native builds nee
 
 ```bash
 git submodule update --init --recursive   # third_party/cutlass + flash-attention are required for source builds
-pip install .                             # source build; CUDA auto-detected, HIP auto-selected when nvcc is absent
+pip install .                             # source build; CUDA auto-detected; HIP auto-selected only when nvcc is absent, a ROCm compiler is found and PyTorch is not a CUDA build
 pip install -e ".[dev]"                   # editable + dev deps (pytest, pytest-benchmark, ruff)
 pip install -e . --no-build-isolation -v  # faster iterative rebuilds
 ```
@@ -20,7 +20,7 @@ pip install -e . --no-build-isolation -v  # faster iterative rebuilds
 
 ## Test / lint
 
-CI (`.github/workflows/build-wheels.yml`, jobs `test_*`) installs the CPU-only wheel plus CPU PyTorch, then runs exactly:
+CI (`.github/workflows/build-wheels.yml`, jobs `test_*`) installs CPU PyTorch plus a prebuilt wheel — the pure-Python wheel on Linux, the CUDA(+HIP) wheel on Windows and Windows ARM (GPU tests skip without hardware) — then every `test_*` job runs exactly:
 
 ```bash
 ruff check .                       # lint only (config in pyproject.toml); formatting is `ruff format`, not run in CI
