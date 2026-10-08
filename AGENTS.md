@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Comfy Kitchen is a fast kernel library for diffusion inference (`comfy-kitchen` on PyPI, package `comfy_kitchen`). It exposes quantization, attention, RoPE, normalization and GEMM kernels behind a single dispatch registry that picks the best available backend per call — `hip` → `cuda` → `triton` → `eager` — validating each backend's device/dtype/shape/compute-capability constraints up front instead of using try/except fallbacks. The `cuda` and `hip` backends are native extensions compiled from C/C++/CUDA/HIP sources at build time; `eager` (pure PyTorch) and `triton` need no compiler.
+Comfy Kitchen is a fast kernel library for diffusion inference (`comfy-kitchen` on PyPI, package `comfy_kitchen`). It exposes quantization, attention, RoPE, normalization and GEMM kernels behind a single dispatch registry that picks the best available backend per call — by default `ascend` → `cuda` → `triton` → `eager`, or `hip` → `cuda` → `triton` → `eager` when the HIP backend registers under a ROCm PyTorch build — validating each backend's device/dtype/shape/compute-capability constraints up front instead of using try/except fallbacks. The `cuda` and `hip` backends are native extensions compiled from C/C++/CUDA/HIP sources at build time; `eager` (pure PyTorch), `triton` and `ascend` (torch-npu operators, registered only when torch-npu and a Huawei Ascend NPU are present) need no compiler.
 
 ## Build / install
 
@@ -35,7 +35,7 @@ python -m pytest tests/ -v --tb=short   # or just `pytest` — config in pytest.
 
 ```
 comfy_kitchen/           # the package
-  registry.py            # backend registry + automatic dispatch (hip→cuda→triton→eager)
+  registry.py            # backend registry + automatic dispatch (ascend→cuda→triton→eager; hip first on ROCm)
   constraints.py         # device/dtype/shape/compute-capability constraints checked before dispatch
   exceptions.py          # e.g. NoCapableBackendError
   tensor/                # QuantizedTensor (torch.Tensor subclass) + FP8/NVFP4/MXFP8 layouts
@@ -44,9 +44,10 @@ comfy_kitchen/           # the package
     triton/              # Triton JIT kernels
     cuda/                # native CUDA extension sources (*.cu/*.cuh/*.h) → cuda/_C*.so
     hip/                 # native HIP extension sources + CMakeLists.txt + architectures.json → hip/_C*.so
+    ascend/              # torch-npu backend for Huawei Ascend NPUs (optional; no native build)
   flash_attention.py, sage_attention.py, gated_delta.py, scaled_mm_v2.py, allocation.py, _rope_utils.py
 tests/                   # pytest suite (test_*.py) + conftest.py
-samples/                 # standalone usage examples (nvfp4_linear.py, mxfp8_model_patcher.py)
+samples/                 # standalone usage examples + benchmarks (nvfp4_linear.py, mxfp8_model_patcher.py, benchmark_ascend_w4a4_unpacked.py)
 third_party/             # git submodules: cutlass, flash-attention (do not edit)
 setup.py                 # all native-build logic (CUDA + HIP CMake orchestration, arch detection)
 pyproject.toml           # metadata, ruff config, build-system requires
@@ -66,7 +67,7 @@ pyproject.toml           # metadata, ruff config, build-system requires
 
 ## Deeper docs
 
-- `README.md` — capability matrix, HIP backend design (WMMA/RDNA generations), `QuantizedTensor` usage, full build-option table, requirements.
+- `README.md` — capability matrix, HIP backend design (WMMA/RDNA generations), Huawei Ascend backend, `QuantizedTensor` usage, full build-option table, requirements.
 - `CONTRIBUTING.md` — license, DCO text.
 - `.github/workflows/build-wheels.yml` — authoritative build/test/publish pipeline (Linux x86_64/arm64, Windows x64/arm, CPU-only wheel; PyPI publish on `v*` tags).
 - `.github/workflows/cla.yml` — CLA enforcement.
