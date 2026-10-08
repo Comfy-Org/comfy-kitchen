@@ -21,6 +21,7 @@
 #include <atomic>
 #include <type_traits>
 
+#include "device_arch.h"
 #include "mma.h"
 
 namespace comfy::hip_backend {
@@ -601,43 +602,46 @@ void gemm_wmma_dual_m_kernel(
             sb.load(B, n0, N, knext, kbytes);
         }
 
-        typename Mma::Frag af[2][TM];
-        typename Mma::Frag bf[2][TN];
-        #pragma unroll
-        for (int i = 0; i < TM; ++i)
-            af[0][i] = Mma::load(
-                As[mtile], wm * (TM * 16) + i * 16 + row,
-                0, kStride, lane);
-        #pragma unroll
-        for (int j = 0; j < TN; ++j)
-            bf[0][j] = Mma::load(
-                Bs, wn * (TN * 16) + j * 16 + row,
-                0, kStride, lane);
-
-        #pragma unroll
-        for (int kk = 0; kk < kSteps; ++kk) {
-            const int cur = kk & 1;
-            const int nxt = cur ^ 1;
-            if (kk + 1 < kSteps) {
-                const int kbyte = (kk + 1) * kStepBytes;
-                #pragma unroll
-                for (int i = 0; i < TM; ++i)
-                    af[nxt][i] = Mma::load(
-                        As[mtile], wm * (TM * 16) + i * 16 + row,
-                        kbyte, kStride, lane);
-                #pragma unroll
-                for (int j = 0; j < TN; ++j)
-                    bf[nxt][j] = Mma::load(
-                        Bs, wn * (TN * 16) + j * 16 + row,
-                        kbyte, kStride, lane);
-            }
-
+        // A half past M only stages and syncs; its results would be dropped.
+        if (m0 < M) {
+            typename Mma::Frag af[2][TM];
+            typename Mma::Frag bf[2][TN];
             #pragma unroll
             for (int i = 0; i < TM; ++i)
+                af[0][i] = Mma::load(
+                    As[mtile], wm * (TM * 16) + i * 16 + row,
+                    0, kStride, lane);
+            #pragma unroll
+            for (int j = 0; j < TN; ++j)
+                bf[0][j] = Mma::load(
+                    Bs, wn * (TN * 16) + j * 16 + row,
+                    0, kStride, lane);
+
+            #pragma unroll
+            for (int kk = 0; kk < kSteps; ++kk) {
+                const int cur = kk & 1;
+                const int nxt = cur ^ 1;
+                if (kk + 1 < kSteps) {
+                    const int kbyte = (kk + 1) * kStepBytes;
+                    #pragma unroll
+                    for (int i = 0; i < TM; ++i)
+                        af[nxt][i] = Mma::load(
+                            As[mtile], wm * (TM * 16) + i * 16 + row,
+                            kbyte, kStride, lane);
+                    #pragma unroll
+                    for (int j = 0; j < TN; ++j)
+                        bf[nxt][j] = Mma::load(
+                            Bs, wn * (TN * 16) + j * 16 + row,
+                            kbyte, kStride, lane);
+                }
+
                 #pragma unroll
-                for (int j = 0; j < TN; ++j)
-                    acc[i][j] = Mma::mma(
-                        af[cur][i], bf[cur][j], acc[i][j]);
+                for (int i = 0; i < TM; ++i)
+                    #pragma unroll
+                    for (int j = 0; j < TN; ++j)
+                        acc[i][j] = Mma::mma(
+                            af[cur][i], bf[cur][j], acc[i][j]);
+            }
         }
 
         if (has_next) {
@@ -753,6 +757,27 @@ inline int device_wgp_count() {
     return n;
 }
 
+// Workgroups of Kernel at kThreads resident on one WGP, limited by its VGPR and
+// LDS use. Cached per ordinal like device_wgp_count; the fallback of two keeps
+// the default schedules.
+template <auto Kernel, int kThreads>
+inline int resident_blocks() {
+    constexpr int kMaxDevices = 16;
+    static std::atomic<int> cache[kMaxDevices] = {};
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDevices) return 2;
+    int n = cache[dev].load(std::memory_order_relaxed);
+    if (n == 0) {
+        if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
+                &n, reinterpret_cast<const void*>(Kernel), kThreads, 0) != hipSuccess ||
+            n <= 0) {
+            n = 2;
+        }
+        cache[dev].store(n, std::memory_order_relaxed);
+    }
+    return n;
+}
+
 // Pick and launch a tile for C[M, N] = A[M, K] @ B[N, K]^T, selecting on grid
 // coverage, K depth and warp grid. 128x128 has the best arithmetic intensity but
 // wastes the device when it yields fewer blocks than there are WGPs; BKB=128
@@ -776,8 +801,13 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
             constexpr int BM = 128, BN = 128, BKB = 128;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
             // With few blocks per WGP there is nothing to interleave across, so
-            // the 16-wave grid hides latency within a block instead.
-            if (blocks_128 <= 4 * wgps) {
+            // the 16-wave grid hides latency within a block instead. The same
+            // holds when the 8-wave kernel fits only once per WGP (gfx1170).
+            constexpr auto kEightWave =
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>;
+            if (blocks_128 <= 4 * wgps ||
+                (use_nonduplicated_wmma_schedule() &&
+                 resident_blocks<kEightWave, 256>() < 2)) {
                 gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
                     <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
             } else {

@@ -44,6 +44,49 @@ __global__ __launch_bounds__(256) void gemv_int8_kernel(
     }
 }
 
+template <typename OutT, int BKB>
+static void launch_dual_m_tiles(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N,
+                                int K, int ldc, EpiRowwise epi, hipStream_t stream) {
+    constexpr int BM = 128, BN = 128;
+    dim3 grid((N + BN - 1) / BN, (M + 2 * BM - 1) / (2 * BM));
+    if (epi.bias == nullptr && epi.scale_b_stride == 1) {
+        EpiRowwiseNoBias no_bias{epi.scale_a, epi.scale_b};
+        gemm_wmma_dual_m_kernel<MmaInt8, EpiRowwiseNoBias, OutT, BM, BN, BKB, 4, 2, 2, 4>
+            <<<grid, 512, 0, stream>>>(A, B, C, M, N, K, ldc, no_bias);
+    } else {
+        gemm_wmma_dual_m_kernel<MmaInt8, EpiRowwise, OutT, BM, BN, BKB, 4, 2, 2, 4>
+            <<<grid, 512, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
+    }
+}
+
+// Two adjacent M tiles share one staged B tile, halving B traffic per MMA. This
+// wins once the grid covers the device and two blocks fit per WGP, so one
+// block's loads overlap the other's MMAs; use the deepest K stage that fits
+// twice. An odd tile count idles half of the last pair, so require an even
+// count or at least seven tiles. Returns false to fall back to launch_gemm_wmma.
+template <typename OutT>
+static bool launch_int8_dual_m(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int K,
+                               int ldc, EpiRowwise epi, hipStream_t stream) {
+    const int m_tiles = (M + 127) / 128;
+    const int n_tiles = (N + 127) / 128;
+    if (N <= 64 || m_tiles < 2 || (m_tiles % 2 != 0 && m_tiles < 7) ||
+        m_tiles * n_tiles < device_wgp_count()) {
+        return false;
+    }
+    constexpr auto kDualK128 =
+        gemm_wmma_dual_m_kernel<MmaInt8, EpiRowwise, OutT, 128, 128, 128, 4, 2, 2, 4>;
+    constexpr auto kDualK64 =
+        gemm_wmma_dual_m_kernel<MmaInt8, EpiRowwise, OutT, 128, 128, 64, 4, 2, 2, 4>;
+    if (resident_blocks<kDualK128, 512>() >= 2) {
+        launch_dual_m_tiles<OutT, 128>(A, B, C, M, N, K, ldc, epi, stream);
+    } else if (resident_blocks<kDualK64, 512>() >= 2) {
+        launch_dual_m_tiles<OutT, 64>(A, B, C, M, N, K, ldc, epi, stream);
+    } else {
+        return false;
+    }
+    return true;
+}
+
 template <typename OutT>
 static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N, int K, int ldc,
                         EpiRowwise epi, hipStream_t stream) {
@@ -56,47 +99,9 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
         gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
         return;
     }
-    if (!use_nonduplicated_wmma_schedule()) {
+    if (!use_nonduplicated_wmma_schedule() ||
+        !launch_int8_dual_m(Au, Bu, C, M, N, K, ldc, epi, stream)) {
         launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
-        return;
-    }
-    if (M >= 96 && N >= 96) {
-        if (M >= 512 && K == 3840 &&
-            (N == 3840 || N == 10240 || N == 11520)) {
-            // Square, packed-QKV, and MLP projections all reuse one staged B
-            // tile across two adjacent M tiles.
-            constexpr int BM = 128, BN = 128, BKB = 64;
-            dim3 grid((N + BN - 1) / BN, (M + 2 * BM - 1) / (2 * BM));
-            if (epi.bias == nullptr && epi.scale_b_stride == 1) {
-                EpiRowwiseNoBias no_bias{epi.scale_a, epi.scale_b};
-                gemm_wmma_dual_m_kernel<MmaInt8, EpiRowwiseNoBias, OutT,
-                                        BM, BN, BKB, 4, 2, 2, 4>
-                    <<<grid, 512, 0, stream>>>(
-                        Au, Bu, C, M, N, K, ldc, no_bias);
-            } else {
-                gemm_wmma_dual_m_kernel<MmaInt8, EpiRowwise, OutT,
-                                        BM, BN, BKB, 4, 2, 2, 4>
-                    <<<grid, 512, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
-            }
-        } else if (M >= 512 && N >= 128 && K > N) {
-            constexpr int BM = 128, BN = 128, BKB = 64;
-            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-            gemm_wmma_kernel<MmaInt8, EpiRowwise, OutT, BM, BN, BKB,
-                             4, 2, 2, 4, const uint8_t*, true>
-                <<<grid, 256, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
-        } else {
-            // Non-duplicated WMMA operands favor the lower-LDS stage.
-            constexpr int BM = 128, BN = 128, BKB = 64;
-            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-            gemm_wmma_kernel<MmaInt8, EpiRowwise, OutT, BM, BN, BKB,
-                             4, 2, 2, 4>
-                <<<grid, 256, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
-        }
-    } else {
-        constexpr int BM = 64, BN = 64, BKB = 64;
-        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-        gemm_wmma_kernel<MmaInt8, EpiRowwise, OutT, BM, BN, BKB, 2, 2, 2, 2>
-            <<<grid, 128, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
     }
 }
 
