@@ -17,6 +17,7 @@ __all__ = [
     "ValidationResult",
     "validate_function_call",
     "validate_param",
+    "w4a8_storage_call_rule",
 ]
 
 
@@ -357,3 +358,15 @@ def with_out_param(base: FunctionConstraints) -> FunctionConstraints:
     """The ``_out`` form of an op: base constraints plus a 5-D ``out`` in x's dtypes."""
     out = ParamConstraint(dtypes=base.params["x"].dtypes, shape_rules=(ExactDims(5),))
     return replace(base, params={**base.params, "out": out})
+
+
+def w4a8_storage_call_rule(kwargs):
+    """Validate conventional 2D or MMA-packed 1D W4A8 storage."""
+    expected_dims = 1 if kwargs.get("stream_rows", 0) else 2
+    for name in ("qdata", "s_rel"):
+        tensor = kwargs.get(name)
+        if tensor is not None and tensor.dim() != expected_dims:
+            return ValidationResult.fail(
+                name, f"shape {list(tensor.shape)} fails: exactly {expected_dims}D"
+            )
+    return ValidationResult.ok()

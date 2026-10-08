@@ -10,6 +10,7 @@ from comfy_kitchen.constraints import (
     ParamConstraint,
     validate_function_call,
     validate_param,
+    w4a8_storage_call_rule,
 )
 from comfy_kitchen.exceptions import NoCapableBackendError
 
@@ -57,6 +58,26 @@ class TestShapeRules:
         assert "16" in DivisibleBy(dim=1, factor=16).describe()
         assert "4" in MinDims(ndim=4).describe()
         assert "2" in ExactDims(ndim=2).describe()
+
+
+@pytest.mark.parametrize(
+    ("stream_rows", "qdata_shape", "scale_shape", "expected"),
+    [
+        (0, (16, 128), (16, 16), True),
+        (8, (2304,), (0,), True),
+        (0, (2304,), (0,), False),
+        (8, (16, 128), (16, 16), False),
+    ],
+)
+def test_w4a8_storage_call_rule(stream_rows, qdata_shape, scale_shape, expected):
+    result = w4a8_storage_call_rule(
+        {
+            "qdata": torch.empty(qdata_shape, dtype=torch.int8),
+            "s_rel": torch.empty(scale_shape, dtype=torch.float8_e4m3fn),
+            "stream_rows": stream_rows,
+        }
+    )
+    assert result.success is expected
 
 
 class TestParamConstraint:

@@ -6,6 +6,7 @@
 #include "utils.cuh"
 #include "dtype_dispatch.cuh"
 #include "input_act_codes.h"
+#include <cooperative_groups.h>
 
 #include <algorithm>
 #include <cmath>
@@ -1433,6 +1434,227 @@ __global__ void __launch_bounds__(kFusedGemvThreads) int8_gemv_convrot_fused_ker
     }
 }
 
+// Decode-shape (M <= 16) ConvRot quantizer in one launch: the row is split over a
+// cluster of CL blocks (8 groups of 256 per block per pass), each block rotates its
+// groups into registers, the row absmax is exchanged over DSMEM, and the same
+// registers are quantized. Numerically identical to the staged rotate+quantize pair
+// (fp32 absmax of the unrounded rotation, bf16-rounded rotated value, same divide and
+// rounding). Optional input activations are folded in and match the eager torch ops
+// bit for bit: RmsNorm reproduces torch's vectorized rms_norm reduction (128 threads,
+// vec4, warp shfl_down tree, 4-warp merge) and rounds gamma*(rstd*x) to the input
+// dtype; SwiGLU rounds silu(gate) and silu(gate)*up to the input dtype. Requires
+// clusters (sm_90+).
+constexpr int kClusterQuantThreads = 512;
+constexpr int kClusterQuantGroups = kClusterQuantThreads / 64;
+// the attribute itself is rejected by the pre-sm_90 device passes of a multi-arch build
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define CLUSTER_DIMS(cl)
+#else
+#define CLUSTER_DIMS(cl) __cluster_dims__(cl, 1, 1)
+#endif
+constexpr int kClusterQuantMaxPasses = 4;
+
+// torch's silu, x / (1 + exp(-x)), bit for bit. This file is compiled with
+// --use_fast_math, which would turn expf into ex2.approx(x*log2e) and the
+// division into an approximate reciprocal; torch is not. Every step below is
+// pinned with a rounding-mode intrinsic so fast-math cannot rewrite it, and it
+// follows the SASS nvcc emits for torch's kernel: the precise expf range
+// reduction (saturating j = floor(a*log2e) via the 1.5*2^23 trick, 2^j from the
+// mantissa bits, ex2.approx of the residual) with the trailing "+ 1" contracted
+// into the scale multiply exactly as nvcc's default fmad does for torch. The
+// final division is non-ftz so bf16 denormal inputs keep their denormal result.
+// Verified exhaustively against torch over all 65536 fp16 and bf16 inputs.
+__device__ __forceinline__ float torch_silu(float x)
+{
+    const float a = -x;
+    const float t = __saturatef(__fmaf_rn(a, __uint_as_float(0x3bbb989du) /* log2e/252 */, 0.5f));
+    const float u = __fmaf_rd(t, 252.0f, 12582913.0f);
+    const float j = __fadd_rn(u, -12583039.0f);
+    float f = __fmaf_rn(a, 1.4426950216293334961f, -j);
+    f = __fmaf_rn(a, 1.925963033500011079e-08f, f);
+    float r;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(f));
+    const float scale = __uint_as_float(__float_as_uint(u) << 23);
+    const float denom = __fmaf_rn(scale, r, 1.0f);
+    float y;
+    asm("div.rn.f32 %0, %1, %2;" : "=f"(y) : "f"(x), "f"(denom));
+    return y;
+}
+
+template<typename InputType>
+__device__ __forceinline__ float torch_rms_rstd(
+    const InputType* __restrict__ row, int K, float eps, float* buf /* >= 6 floats */)
+{
+    // Mirrors PyTorch vectorized_layer_norm_kernel<rms_norm=true>: blockDim (32, 4).
+    constexpr int kNumThreads = 128;
+    constexpr int kVec = 4;
+    const int tid = threadIdx.x;
+    float sigma2 = 0.0f;
+    if (tid < kNumThreads) {
+        const int n_vec = K / kVec;
+        for (int i = tid; i < n_vec; i += kNumThreads) {
+            const InputType* v = row + static_cast<int64_t>(i) * kVec;
+            #pragma unroll
+            for (int ii = 0; ii < kVec; ++ii) {
+                const float val = to_float(v[ii]);
+                sigma2 = __fmaf_rn(val, val, sigma2);
+            }
+        }
+        for (int offset = kThreadsPerWarp / 2; offset > 0; offset >>= 1) {
+            sigma2 = sigma2 + __shfl_down_sync(0xffffffffu, sigma2, offset);
+        }
+    }
+    const int lane = tid & (kThreadsPerWarp - 1);
+    const int wid = tid >> 5;
+    // inter-warp merge over warps 0..3 in torch's order
+    for (int offset = 2; offset > 0; offset /= 2) {
+        if (lane == 0 && wid >= offset && wid < 2 * offset) buf[wid - offset] = sigma2;
+        __syncthreads();
+        if (lane == 0 && wid < offset) sigma2 = sigma2 + buf[wid];
+        __syncthreads();
+    }
+    // IEEE divide like torch's; --use_fast_math would make it approximate
+    if (tid == 0) buf[4] = __fdiv_rn(sigma2, static_cast<float>(K));
+    __syncthreads();
+    return rsqrtf(buf[4] + eps);
+}
+
+// act_out (optional, [M, K]) receives the activated row as well, in the input dtype, for
+// a consumer that needs act(x) itself alongside the int8 image (only with ACT != none).
+template<typename InputType, int CL, int ACT>
+__global__ void CLUSTER_DIMS(CL) __launch_bounds__(kClusterQuantThreads)
+quantize_int8_convrot_cluster_kernel(
+    const InputType* __restrict__ x,
+    const InputType* __restrict__ act_weight,
+    float act_eps,
+    int8_t* __restrict__ q,
+    float* __restrict__ scales,
+    InputType* __restrict__ act_out,
+    int K)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    namespace cg = cooperative_groups;
+    cg::cluster_group cluster = cg::this_cluster();
+    const int rank = static_cast<int>(cluster.block_rank());
+    constexpr int kWarps = kClusterQuantThreads / kThreadsPerWarp;
+    constexpr int kSlots = CL * kClusterQuantGroups;
+
+    __shared__ float fht[kClusterQuantGroups][2][kConvRotGroup];
+    __shared__ float warp_smem[kWarps];
+    __shared__ float block_smem;
+    __shared__ float norm_buf[6];
+    __shared__ float cluster_max;
+
+    const int tid = threadIdx.x;
+    const int sub = tid / 64;
+    const int lane = tid % 64;
+    const int row = static_cast<int>(blockIdx.x) / CL;
+    const int n_groups = K / kConvRotGroup;
+    const int passes = (n_groups + kSlots - 1) / kSlots;
+    const int64_t row_offset = static_cast<int64_t>(row) * K;
+    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
+    const InputType* in_row = x + row_offset * kInWidth;
+
+    float rstd = 1.0f;
+    if constexpr (ACT == kActRmsNorm) {
+        rstd = torch_rms_rstd<InputType>(in_row, K, act_eps, norm_buf);
+    }
+
+    float y[kClusterQuantMaxPasses][4];
+    float abs_max = 0.0f;
+    #pragma unroll
+    for (int p = 0; p < kClusterQuantMaxPasses; ++p) {
+        if (p >= passes) break;
+        const int group = p * kSlots + rank * kClusterQuantGroups + sub;
+        const bool active = group < n_groups;
+        const int col = group * kConvRotGroup + lane * 4;
+        float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (active) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                if constexpr (ACT == kActRmsNorm) {
+                    const float g = to_float(act_weight[col + i]);
+                    v[i] = to_float(from_float<InputType>(g * (rstd * to_float(in_row[col + i]))));
+                } else if constexpr (ACT == kActSwiGLU) {
+                    const float gate = to_float(in_row[col + i]);
+                    const float up = to_float(in_row[K + col + i]);
+                    const float s = to_float(from_float<InputType>(torch_silu(gate)));
+                    v[i] = to_float(from_float<InputType>(s * up));
+                } else {
+                    v[i] = to_float(in_row[col + i]);
+                }
+            }
+            if constexpr (ACT != kActNone) {
+                if (act_out != nullptr) {
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        act_out[row_offset + col + i] = from_float<InputType>(v[i]);
+                    }
+                }
+            }
+        }
+        float* buf0 = fht[sub][0];
+        float* buf1 = fht[sub][1];
+        const int base = lane * 4;
+        buf1[base] = 0.5f * (v[0] + v[1] + v[2] - v[3]);
+        buf1[base + 1] = 0.5f * (v[0] + v[1] - v[2] + v[3]);
+        buf1[base + 2] = 0.5f * (v[0] - v[1] + v[2] + v[3]);
+        buf1[base + 3] = 0.5f * (-v[0] + v[1] + v[2] + v[3]);
+        __syncthreads();
+        convrot_fht_stage64<4>(buf1, buf0, lane);
+        __syncthreads();
+        convrot_fht_stage64<16>(buf0, buf1, lane);
+        __syncthreads();
+        {
+            constexpr int S = 64;
+            const int b = (lane % S) + (lane / S) * (4 * S);
+            const float x0 = buf1[b], x1 = buf1[b + S], x2 = buf1[b + 2 * S], x3 = buf1[b + 3 * S];
+            y[p][0] = 0.5f * (x0 + x1 + x2 - x3);
+            y[p][1] = 0.5f * (x0 + x1 - x2 + x3);
+            y[p][2] = 0.5f * (x0 - x1 + x2 + x3);
+            y[p][3] = 0.5f * (-x0 + x1 + x2 + x3);
+        }
+        if (active) {
+            abs_max = fmaxf(abs_max, fmaxf(fmaxf(fabsf(y[p][0]), fabsf(y[p][1])),
+                                           fmaxf(fabsf(y[p][2]), fabsf(y[p][3]))));
+        }
+        __syncthreads();
+    }
+
+    abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
+    if (tid == 0) cluster_max = abs_max;
+    cluster.sync();
+    float row_max = 0.0f;
+    #pragma unroll
+    for (int r = 0; r < CL; ++r) {
+        row_max = fmaxf(row_max, cluster.map_shared_rank(&cluster_max, r)[0]);
+    }
+    cluster.sync();  // every peer has read cluster_max before anyone may exit
+
+    const float scale = fmaxf(
+        finite_absmax_for_int8_scale<InputType>(row_max) * (1.0f / 127.0f),
+        1.0e-30f);
+    if (rank == 0 && tid == 0) {
+        scales[row] = scale;
+    }
+    #pragma unroll
+    for (int p = 0; p < kClusterQuantMaxPasses; ++p) {
+        if (p >= passes) break;
+        const int group = p * kSlots + rank * kClusterQuantGroups + sub;
+        if (group >= n_groups) continue;
+        // The last FHT stage leaves lane l holding output columns l, l+64, l+128,
+        // l+192 of its group (same layout as convrot_fht_stage64_store_absmax).
+        int8_t* qg = q + row_offset + group * kConvRotGroup + lane;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float scaled = quant_div_float_to_float<InputType>(y[p][i], scale);
+            const float quantized = fminf(127.0f, fmaxf(-128.0f, nearbyintf(scaled)));
+            qg[i * 64] = static_cast<int8_t>(quantized);
+        }
+    }
+#endif
+}
+
 } // namespace
 
 } // namespace comfy
@@ -1724,6 +1946,80 @@ void launch_quantize_int8_convrot_staged_kernel(
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string("CUDA INT8 staged convrot quantization failed: ") + cudaGetErrorString(err));
     }
+}
+
+// Single-launch replacement for the staged pair on sm_90+ (same int8/scale output,
+// optional fused input activation). Returns false when the shape or device is not
+// covered so the caller can fall back.
+bool launch_quantize_int8_convrot_cluster_kernel(
+    const void* input,
+    const void* act_weight,
+    float act_eps,
+    int act_code,
+    void* output,
+    void* scales,
+    void* act_out,
+    int64_t num_rows,
+    int64_t num_cols,
+    int input_dtype_code,
+    cudaStream_t stream)
+{
+    using namespace comfy;
+    if (num_rows <= 0 || num_rows > 16 || num_cols <= 0 || num_cols % kConvRotGroup != 0
+            || input_dtype_code < 0 || input_dtype_code > 2)
+        return false;
+    if (act_code != kActNone && act_code != kActSwiGLU && act_code != kActRmsNorm)
+        return false;
+    if (act_code == kActRmsNorm && act_weight == nullptr)
+        return false;
+    if (act_code == kActNone && act_out != nullptr)
+        return false;
+    const int64_t n_groups = num_cols / kConvRotGroup;
+    // Smallest cluster that covers the row in one pass; otherwise the widest cluster
+    // and as many passes as it takes (bounded by the register file the kernel holds).
+    int cl = 8;
+    for (int c = 1; c <= 8; c *= 2) {
+        if (n_groups <= static_cast<int64_t>(c) * kClusterQuantGroups) { cl = c; break; }
+    }
+    if (n_groups > static_cast<int64_t>(cl) * kClusterQuantGroups * kClusterQuantMaxPasses)
+        return false;
+    int device = 0, cc_major = 0;
+    if (cudaGetDevice(&device) != cudaSuccess
+            || cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess
+            || cc_major < 9)
+        return false;
+
+    DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
+        auto launch = [&]<int CL, int ACT>() {
+            quantize_int8_convrot_cluster_kernel<InputType, CL, ACT>
+                <<<static_cast<unsigned>(num_rows * CL), kClusterQuantThreads, 0, stream>>>(
+                    static_cast<const InputType*>(input),
+                    static_cast<const InputType*>(act_weight),
+                    act_eps,
+                    static_cast<int8_t*>(output),
+                    static_cast<float*>(scales),
+                    static_cast<InputType*>(act_out),
+                    static_cast<int>(num_cols));
+        };
+        auto launch_cl = [&]<int CL>() {
+            switch (act_code) {
+                case kActSwiGLU: launch.template operator()<CL, kActSwiGLU>(); break;
+                case kActRmsNorm: launch.template operator()<CL, kActRmsNorm>(); break;
+                default: launch.template operator()<CL, kActNone>(); break;
+            }
+        };
+        switch (cl) {
+            case 1: launch_cl.template operator()<1>(); break;
+            case 2: launch_cl.template operator()<2>(); break;
+            case 4: launch_cl.template operator()<4>(); break;
+            default: launch_cl.template operator()<8>(); break;
+        }
+    });
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA INT8 cluster convrot quantization failed: ") + cudaGetErrorString(err));
+    }
+    return true;
 }
 
 void launch_quantize_int8_rowwise_convrot64_kernel(

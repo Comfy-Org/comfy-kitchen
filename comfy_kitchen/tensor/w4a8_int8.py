@@ -26,6 +26,13 @@ from .base import (
     dequantize_args,
     register_layout_op,
 )
+from .w4a8_stream import (
+    _mma_bits,
+    default_w4a8_codebook,
+    pack_w4a8_mma_weight,
+    unpack_w4a8_mma_weight,
+    w4a8_mma_stream_rows,
+)
 
 
 def quantize_w4a8_int8_weight(
@@ -109,8 +116,23 @@ def w4a8_int8_linear(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
+    stream_rows: int = 0,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute ``x @ W.T + bias`` with the selected W4A8 backend."""
+    """Compute ``x @ W.T + bias`` with the selected W4A8 backend.
+
+    input_act ("swiglu" or "rms_norm", with input_act_weight/input_act_eps for the
+    norm) is applied to x on the way into the activation quantizer; the CUDA
+    decode path folds it into that kernel, every other path applies it eagerly
+    with identical results. residual/residual_scale make the result
+    ``residual + residual_scale * (x @ W.T + bias)`` (a pre-norm block's addcmul,
+    with the linear rounded to out_dtype first), fused into the CUDA decode
+    kernel's epilogue and applied after the GEMM everywhere else.
+    """
     kwargs = {
         "x": x,
         "qdata": qdata,
@@ -122,6 +144,12 @@ def w4a8_int8_linear(
         "group_size": group_size,
         "convrot_groupsize": convrot_groupsize,
         "out_dtype": out_dtype,
+        "stream_rows": stream_rows,
+        "input_act": input_act,
+        "input_act_weight": input_act_weight,
+        "input_act_eps": input_act_eps,
+        "residual": residual,
+        "residual_scale": residual_scale,
     }
     impl = registry.get_implementation("w4a8_int8_linear", kwargs=kwargs)
     return impl(**kwargs)
@@ -141,6 +169,9 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         codebook: torch.Tensor | None = None
         group_size: int = 16
         convrot_groupsize: int = 256
+        # != 0: qdata is the streamed decode kernel's 1D record stream with this
+        # many records per split (decode_layout); scale is then empty.
+        stream_rows: int = 0
         transposed: bool = False
 
         def _tensor_fields(self) -> list[str]:
@@ -170,7 +201,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
                     f"and divide 16 or be a multiple of 16"
                 )
             groups = k // self.group_size
-            expected_scale_shape = (n, groups)
+            expected_scale_shape = (0,) if self.stream_rows else (n, groups)
             if tuple(self.scale.shape) != expected_scale_shape:
                 raise ValueError(
                     f"scale must have shape {expected_scale_shape}, got {tuple(self.scale.shape)}"
@@ -227,10 +258,51 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         return qdata, params
 
     @classmethod
+    def decode_layout(cls, qdata: torch.Tensor, params: Params) -> tuple[torch.Tensor, Params]:
+        """Relayout a canonical weight for the CUDA streamed decode kernel: qdata
+        becomes its 1D record stream (s_rel folded in), read front to back, so the
+        whole weight is one linear region for a prefetcher. The packed layout is
+        resident-only and never serialized. Returned unchanged when the kernel does
+        not apply (not an SM80+ CUDA device, shape, correction, non-default 4-bit
+        codebook, non-fp8 scales). Every backend still accepts the packed form; the
+        others unpack it per call."""
+        if (
+            not qdata.is_cuda
+            or torch.version.hip is not None
+            or torch.cuda.get_device_capability(qdata.device) < (8, 0)
+        ):
+            return qdata, params
+        n, k = params.orig_shape
+        rows = w4a8_mma_stream_rows(n, k)
+        if params.codebook is None:
+            # 6-bit codes are uniform; 4-bit without a codebook is not what the kernel decodes
+            codebook_ok = qdata.shape[1] * 8 == k * 6
+        else:
+            codebook_ok = torch.equal(params.codebook.float().cpu(), default_w4a8_codebook())
+        if (
+            params.transposed
+            or not rows
+            or params.group_size != 16
+            or params.correction is not None
+            or params.scale.dtype != torch.float8_e4m3fn
+            or not codebook_ok
+        ):
+            return qdata, params
+        packed = pack_w4a8_mma_weight(qdata, params.scale, rows)
+        params = dataclasses.replace(
+            params, scale=params.scale.new_empty(0), stream_rows=rows
+        )
+        return packed, params
+
+    @classmethod
     def dequantize(cls, qdata: torch.Tensor, params: Params) -> torch.Tensor:
+        s_rel = params.scale
+        if params.stream_rows:
+            n, k = params.orig_shape[::-1] if params.transposed else params.orig_shape
+            qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, k, params.stream_rows)
         return dequantize_w4a8_int8_weight(
             qdata,
-            params.scale,
+            s_rel,
             params.s_channel,
             codebook=params.codebook,
             correction=params.correction,
@@ -261,6 +333,8 @@ class AsymW4A8Int8Layout(QuantizedLayout):
 
     @classmethod
     def state_dict_tensors(cls, qdata: torch.Tensor, params: Params) -> dict[str, torch.Tensor]:
+        if params.stream_rows:
+            raise ValueError("decode_layout weights are resident-only; save the canonical layout")
         out = {
             "": qdata,
             "_s_rel": params.scale,
@@ -278,6 +352,9 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         from comfy_kitchen.backends.eager.w4a8_int8 import _w4a8_geometry
 
         params = qtensor._params
+        if params.stream_rows:
+            n, k = params.orig_shape
+            return _mma_bits(qtensor._qdata.numel(), n, k)
         return _w4a8_geometry(qtensor._qdata, params.scale, params.group_size)[2]
 
     @classmethod
@@ -325,6 +402,7 @@ def _w4a8_int8_forward(
         group_size=params.group_size,
         convrot_groupsize=params.convrot_groupsize,
         out_dtype=out_dtype,
+        stream_rows=params.stream_rows,
     )
 
 

@@ -9,8 +9,10 @@ from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
 from .backends.cuda import rms_rope_kv_decode, rms_rope_kv_decode_is_available
+from .backends.cuda import w4a8_quantize_input, w4a8_int8_linear_prequantized
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
+from .tensor.w4a8_stream import pack_w4a8_mma_weight, unpack_w4a8_mma_weight, w4a8_mma_stream_rows
 from .exceptions import (
     BackendError,
     BackendNotFoundError,
@@ -77,6 +79,8 @@ __all__ = [
     "flash_attention_decode_is_available",
     "rms_rope_kv_decode",
     "rms_rope_kv_decode_is_available",
+    "w4a8_quantize_input",
+    "w4a8_int8_linear_prequantized",
     "na2d",
     "na3d",
     "sol_attn",
@@ -92,6 +96,9 @@ __all__ = [
     "quantize_svdquant_w4a4",
     "quantize_convrot_w4a4_weight",
     "quantize_w4a8_int8_weight",
+    "pack_w4a8_mma_weight",
+    "unpack_w4a8_mma_weight",
+    "w4a8_mma_stream_rows",
     "quantize_int8_rowwise",
     "quantize_int8_tensorwise",
     "dequantize_int8_simple",

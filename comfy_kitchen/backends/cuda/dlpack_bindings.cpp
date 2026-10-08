@@ -2191,6 +2191,16 @@ extern "C" {
         int64_t bits,
         cudaStream_t stream);
 
+    void launch_unpack_w4a8_mma_weight(
+        const void* packed,
+        void* qdata,
+        void* s_rel,
+        int64_t N,
+        int64_t K,
+        int64_t stream_rows,
+        int64_t bits,
+        cudaStream_t stream);
+
     void launch_dequant_int4_grouped_to_int8_e4m3(
         const void* qw,
         const void* s_rel,
@@ -2278,6 +2288,28 @@ extern "C" {
         int out_dtype_code,
         cudaStream_t stream);
 
+    bool launch_w4a8_codebook_mma(
+        const void* xq,
+        const void* weight,
+        const void* decode_lut,
+        const void* s_channel,
+        const void* xs,
+        const void* bias,
+        const void* residual,
+        const void* residual_scale,
+        void* workspace,
+        void* counters,
+        void* out,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int64_t G,
+        int64_t stream_rows,
+        int64_t bits,
+        int64_t warps_per_block,
+        int out_dtype_code,
+        cudaStream_t stream);
+
     void launch_quantize_int8_rowwise_convrot_kernel(
         const void* input,
         void* output,
@@ -2313,6 +2345,19 @@ extern "C" {
         int rotated_dtype_code,
         bool stochastic,
         uint64_t seed,
+        cudaStream_t stream);
+
+    bool launch_quantize_int8_convrot_cluster_kernel(
+        const void* input,
+        const void* act_weight,
+        float act_eps,
+        int act_code,
+        void* output,
+        void* scales,
+        void* act_out,
+        int64_t num_rows,
+        int64_t num_cols,
+        int input_dtype_code,
         cudaStream_t stream);
 
     void launch_quantize_int8_rowwise_convrot64_kernel(
@@ -3181,6 +3226,27 @@ void dequant_int4_grouped_to_int8(
     launch_dequant_int4_grouped_to_int8(qw.data(), s_rel.data(), cb, out.data(), N, K, G, bits, stream);
 }
 
+// MMA record stream -> conventional [N, K*bits/8] codes + [N, K/16] e4m3 scale bits
+// (the inverse of pack_w4a8_mma_weight), for the prefill GEMM over a streamed weight.
+void unpack_w4a8_mma_weight(
+    nb::ndarray<int8_t, nb::ndim<1>, nb::device::cuda> packed,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> qdata,   // [N, K*bits/8]
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> s_rel,  // [N, K/16] e4m3 bits
+    int64_t stream_rows, uintptr_t stream_ptr) {
+    const int64_t N = s_rel.shape(0);
+    const int64_t K = static_cast<int64_t>(s_rel.shape(1)) * 16;
+    const int64_t bits = K ? static_cast<int64_t>(qdata.shape(1)) * 8 / K : 0;
+    if (static_cast<int64_t>(qdata.shape(0)) != N || (bits != 4 && bits != 6) ||
+        static_cast<int64_t>(qdata.shape(1)) * 8 != K * bits)
+        throw std::runtime_error("unpack_w4a8_mma_weight: qdata must be [N, K*4/8] or [N, K*6/8]");
+    if (N % 16 != 0 || stream_rows <= 0 || K % (32 * stream_rows) != 0)
+        throw std::runtime_error("unpack_w4a8_mma_weight: N % 16 == 0 and K % (32 * stream_rows) == 0 required");
+    if (static_cast<int64_t>(packed.shape(0)) != N * K * (512 * bits / 8 + 32) / 512)
+        throw std::runtime_error("unpack_w4a8_mma_weight: packed size does not match [N, K] at this width");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_unpack_w4a8_mma_weight(packed.data(), qdata.data(), s_rel.data(), N, K, stream_rows, bits, stream);
+}
+
 // fp8 (e4m3) per-group scale: s_rel passed as raw uint8 bits.
 void dequant_int4_grouped_to_int8_e4m3(
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> qw,     // [N, K*bits/8]
@@ -3349,6 +3415,155 @@ bool w4a8_codebook_gemm_chunked(
         workspace.data(), out.data(), M, N, K, G, chunk_cols, bits, out_dtype_code, stream);
 }
 
+// Streamed W4A8 activation quantizer on its own: act(input) -> (xq, xs) in the layout
+// w4a8_codebook_mma_linear consumes, so several linears over one input quantize it once
+// (hand them xq/xs and no input). act_out additionally materializes act(input) itself.
+bool quantize_int8_convrot_input(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    std::optional<nb::ndarray<nb::device::cuda>> act_weight,
+    double act_eps,
+    int64_t act_code,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> xq,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> xs,
+    std::optional<nb::ndarray<nb::ndim<2>, nb::device::cuda>> act_out,
+    uintptr_t stream_ptr) {
+    const int64_t M = xq.shape(0);
+    const int64_t K = xq.shape(1);
+    const int64_t in_width = (act_code == comfy::kActSwiGLU) ? 2 : 1;
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
+    if (input.shape(0) != M || input.shape(1) != K * in_width
+            || xs.shape(0) != M || xs.shape(1) != 1
+            || input.stride(1) != 1 || input.stride(0) != K * in_width
+            || xq.stride(1) != 1 || xq.stride(0) != K
+            || xs.stride(1) != 1 || xs.stride(0) != 1)
+        throw std::runtime_error("quantize_int8_convrot_input shape or stride mismatch");
+    if (act_code != comfy::kActNone && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm)
+        throw std::runtime_error("quantize_int8_convrot_input act_code must be none, swiglu, or rms_norm");
+    const bool has_act_weight = act_weight.has_value() && act_weight->size() > 0;
+    if (act_code == comfy::kActRmsNorm
+            && (!has_act_weight || act_weight->size() != K || act_weight->stride(0) != 1
+                || map_dtype_to_code(act_weight->dtype()) != input_dtype_code))
+        throw std::runtime_error("quantize_int8_convrot_input rms_norm weight must be K contiguous elements in the input dtype");
+    if (act_out.has_value()
+            && (act_code == comfy::kActNone
+                || act_out->shape(0) != M || act_out->shape(1) != K
+                || act_out->stride(1) != 1 || act_out->stride(0) != K
+                || map_dtype_to_code(act_out->dtype()) != input_dtype_code))
+        throw std::runtime_error("quantize_int8_convrot_input act_out must be [M, K] contiguous in the input dtype, with an activation");
+    if (input_dtype_code < 0 || input_dtype_code > 2)
+        throw std::runtime_error("quantize_int8_convrot_input input must be fp32, fp16, or bf16");
+    return launch_quantize_int8_convrot_cluster_kernel(
+        input.data(), has_act_weight ? act_weight->data() : nullptr,
+        static_cast<float>(act_eps), static_cast<int>(act_code),
+        xq.data(), xs.data(), act_out.has_value() ? act_out->data() : nullptr,
+        M, K, input_dtype_code, reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+// input is [M, K] (or [M, 2K] gate|up for act_code swiglu); the activation is folded
+// into the cluster quantizer on sm_90+. rotated/partial_absmax are the staged-pair
+// fallback scratch for older devices and are only required when no activation is fused.
+// input absent: xq/xs already hold the quantized activation (quantize_int8_convrot_input).
+bool w4a8_codebook_mma_linear(
+    std::optional<nb::ndarray<nb::ndim<2>, nb::device::cuda>> input,
+    std::optional<nb::ndarray<nb::ndim<2>, nb::device::cuda>> rotated,
+    std::optional<nb::ndarray<float, nb::ndim<2>, nb::device::cuda>> partial_absmax,
+    std::optional<nb::ndarray<nb::device::cuda>> act_weight,
+    double act_eps,
+    int64_t act_code,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> xq,
+    nb::ndarray<int8_t, nb::ndim<1>, nb::device::cuda> weight,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> decode_lut,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> s_channel,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> xs,
+    std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> bias,
+    std::optional<nb::ndarray<nb::ndim<2>, nb::device::cuda>> residual,
+    std::optional<nb::ndarray<nb::ndim<1>, nb::device::cuda>> residual_scale,
+    nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> workspace,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> counters,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> out,
+    int64_t convrot_group_size, int64_t G, int64_t stream_rows,
+    int64_t warps_per_block, int out_dtype_code, uintptr_t stream_ptr) {
+    const int64_t M = xq.shape(0);
+    const int64_t K = xq.shape(1);
+    const int64_t in_width = (act_code == comfy::kActSwiGLU) ? 2 : 1;
+    const int64_t N = s_channel.size();
+    const int input_dtype_code = input.has_value() ? map_dtype_to_code(input->dtype()) : 1;
+    if (!input.has_value() && (act_code != comfy::kActNone || rotated.has_value()))
+        throw std::runtime_error("w4a8_codebook_mma_linear: a prequantized input takes no activation or staged scratch");
+    if (M > 8 || convrot_group_size <= 0 || K % convrot_group_size != 0
+            || (input.has_value() && (input->shape(0) != M || input->shape(1) != K * in_width))
+            || xs.shape(0) != M || xs.shape(1) != 1
+            || N % 16 != 0 || K % G != 0)
+        throw std::runtime_error("w4a8_codebook_mma_linear shape mismatch or M > 8");
+    // record stream size implies the code width: 288-byte records at 4 bits, 416 at 6
+    const int64_t bits = weight.size() == N * K * 9 / 16 ? 4 : (weight.size() == N * K * 13 / 16 ? 6 : 0);
+    if (bits == 0)
+        throw std::runtime_error("w4a8_codebook_mma_linear weight is not a 4- or 6-bit record stream");
+    if (act_code != comfy::kActNone && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm)
+        throw std::runtime_error("w4a8_codebook_mma_linear act_code must be none, swiglu, or rms_norm");
+    const bool has_act_weight = act_weight.has_value() && act_weight->size() > 0;
+    if (act_code == comfy::kActRmsNorm
+            && (!has_act_weight || act_weight->size() != K || act_weight->stride(0) != 1
+                || map_dtype_to_code(act_weight->dtype()) != input_dtype_code))
+        throw std::runtime_error("w4a8_codebook_mma_linear rms_norm weight must be K contiguous elements in the input dtype");
+    if (rotated.has_value() != partial_absmax.has_value()
+            || (rotated.has_value()
+                && (rotated->shape(0) != M || rotated->shape(1) != K
+                    || map_dtype_to_code(rotated->dtype()) != input_dtype_code
+                    || rotated->stride(1) != 1 || rotated->stride(0) != K
+                    || partial_absmax->shape(0) != M || partial_absmax->shape(1) != K / convrot_group_size
+                    || partial_absmax->stride(1) != 1
+                    || partial_absmax->stride(0) != K / convrot_group_size)))
+        throw std::runtime_error("w4a8_codebook_mma_linear staged scratch mismatch");
+    if (decode_lut.shape(0) != 256 || decode_lut.shape(1) != 16
+            || decode_lut.stride(1) != 1 || decode_lut.stride(0) != 16)
+        throw std::runtime_error("w4a8_codebook_mma_linear decode LUT must be contiguous [256, 16]");
+    if ((bias.has_value() && bias->size() != N)
+            || workspace.shape(0) != M || workspace.shape(1) != N
+            || counters.size() != N / 16 || counters.stride(0) != 1
+            || out.shape(0) != M || out.shape(1) != N
+            || map_dtype_to_code(out.dtype()) != out_dtype_code)
+        throw std::runtime_error("w4a8_codebook_mma_linear workspace, counters, output, or bias mismatch");
+    if (residual.has_value() != residual_scale.has_value()
+            || (residual.has_value()
+                && (residual->shape(0) != M || residual->shape(1) != N
+                    || residual->stride(1) != 1 || residual->stride(0) != N
+                    || map_dtype_to_code(residual->dtype()) != out_dtype_code
+                    || residual_scale->size() != N || residual_scale->stride(0) != 1
+                    || map_dtype_to_code(residual_scale->dtype()) != out_dtype_code)))
+        throw std::runtime_error("w4a8_codebook_mma_linear residual must be [M, N] contiguous with a [N] scale, both in the output dtype");
+    if ((input.has_value() && (input->stride(1) != 1 || input->stride(0) != K * in_width))
+            || xq.stride(1) != 1 || xq.stride(0) != K
+            || weight.stride(0) != 1 || s_channel.stride(0) != 1
+            || xs.stride(1) != 1 || xs.stride(0) != 1
+            || workspace.stride(1) != 1 || workspace.stride(0) != N
+            || out.stride(1) != 1 || out.stride(0) != N)
+        throw std::runtime_error("w4a8_codebook_mma_linear requires contiguous tensors");
+    if (input_dtype_code < 0 || input_dtype_code > 2)
+        throw std::runtime_error("w4a8_codebook_mma_linear input must be fp32, fp16, or bf16");
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (input.has_value() && !launch_quantize_int8_convrot_cluster_kernel(
+            input->data(), has_act_weight ? act_weight->data() : nullptr,
+            static_cast<float>(act_eps), static_cast<int>(act_code),
+            xq.data(), xs.data(), nullptr, M, K, input_dtype_code, stream)) {
+        if (act_code != comfy::kActNone || !rotated.has_value())
+            throw std::runtime_error(
+                "w4a8_codebook_mma_linear: fused activation quantizer unsupported here "
+                "(needs sm_90+ and K % 256 == 0); apply the activation eagerly");
+        launch_quantize_int8_convrot_staged_kernel(
+            input->data(), rotated->data(), partial_absmax->data(), xq.data(), xs.data(), M, K,
+            static_cast<int>(convrot_group_size), input_dtype_code, input_dtype_code,
+            false, 0, stream);
+    }
+    return launch_w4a8_codebook_mma(
+        xq.data(), weight.data(), decode_lut.data(), s_channel.data(), xs.data(),
+        bias.has_value() ? bias->data() : nullptr,
+        residual.has_value() ? residual->data() : nullptr,
+        residual_scale.has_value() ? residual_scale->data() : nullptr,
+        workspace.data(), counters.data(),
+        out.data(), M, N, K, G, stream_rows, bits, warps_per_block, out_dtype_code, stream);
+}
 // Common W4A8 inference path: online ConvRot activation quantization followed by the
 // chunked int4 decode + strided INT8 GEMM, coordinated through one Python/native call.
 bool w4a8_codebook_linear_chunked(
@@ -4454,6 +4669,10 @@ NB_MODULE(_C, m) {
           nb::arg("qw"), nb::arg("s_rel"), nb::arg("codebook").none(), nb::arg("out"),
           nb::arg("g"), nb::arg("stream_ptr"));
 
+    m.def("unpack_w4a8_mma_weight", &unpack_w4a8_mma_weight,
+          "MMA record stream -> [N, K*bits/8] packed codes + [N, K/16] e4m3 group scale bits",
+          nb::arg("packed"), nb::arg("qdata"), nb::arg("s_rel"), nb::arg("stream_rows"), nb::arg("stream_ptr"));
+
     m.def("dequant_int4_grouped_to_int8_e4m3", &dequant_int4_grouped_to_int8_e4m3,
           "Grouped int4/int6 -> int8 dequant with fp8 e4m3 per-group scale; optional 16-entry codebook (4-bit)",
           nb::arg("qw"), nb::arg("s_rel"), nb::arg("codebook").none(), nb::arg("out"),
@@ -4476,6 +4695,20 @@ NB_MODULE(_C, m) {
           nb::arg("out"), nb::arg("g"), nb::arg("chunk_cols"), nb::arg("out_dtype_code"),
           nb::arg("stream_ptr"));
 
+    m.def("quantize_int8_convrot_input", &quantize_int8_convrot_input,
+          "Streamed W4A8 activation quantizer (optional fused activation, optional activated-row output)",
+          nb::arg("input"), nb::arg("act_weight").none(), nb::arg("act_eps"), nb::arg("act_code"),
+          nb::arg("xq"), nb::arg("xs"), nb::arg("act_out").none(), nb::arg("stream_ptr"));
+    m.def("w4a8_codebook_mma_linear", &w4a8_codebook_mma_linear,
+          "Staged ConvRot activation quantization and direct packed W4A8 tensor-core MMA",
+          nb::arg("input").none(), nb::arg("rotated").none(), nb::arg("partial_absmax").none(),
+          nb::arg("act_weight").none(), nb::arg("act_eps"), nb::arg("act_code"), nb::arg("xq"),
+          nb::arg("weight"), nb::arg("decode_lut"),
+          nb::arg("s_channel"), nb::arg("xs"), nb::arg("bias").none(),
+          nb::arg("residual").none(), nb::arg("residual_scale").none(),
+          nb::arg("workspace"), nb::arg("counters"), nb::arg("out"), nb::arg("convrot_group_size"),
+          nb::arg("g"), nb::arg("stream_rows"), nb::arg("warps_per_block"),
+          nb::arg("out_dtype_code"), nb::arg("stream_ptr"));
     m.def("w4a8_codebook_linear_chunked", &w4a8_codebook_linear_chunked,
           "Fused W4A8 inference orchestration: ConvRot activation quantization followed by chunked decode/GEMM",
           nb::arg("input"), nb::arg("xq"), nb::arg("xs"), nb::arg("weight"),

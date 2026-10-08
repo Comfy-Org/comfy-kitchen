@@ -7,6 +7,7 @@ import torch
 
 import comfy_kitchen as ck
 from comfy_kitchen.backends import cuda
+from comfy_kitchen.backends.eager import w4a8_int8 as eager_w4a8
 from comfy_kitchen.tensor import TensorWiseINT8Layout
 
 from .conftest import (
@@ -31,6 +32,110 @@ COMFYUI_NVIDIA_16_SERIES = (
     "T1000",
     "T1200",
 )
+
+
+@pytest.mark.parametrize("bits", [4, 6])
+@pytest.mark.parametrize(("n", "k", "stream_rows"), [(16, 256, 8), (48, 512, 16), (320, 1024, 32)])
+def test_w4a8_mma_pack_roundtrip(n, k, stream_rows, bits):
+    qdata = torch.randint(-128, 128, (n, k * bits // 8), dtype=torch.int8)
+    scale_bits = torch.randint(0, 256, (n, k // 16), dtype=torch.uint8)
+    scales = scale_bits.view(torch.float8_e4m3fn)
+
+    packed = ck.pack_w4a8_mma_weight(qdata, scales, stream_rows)
+    unpacked_qdata, unpacked_scales = ck.unpack_w4a8_mma_weight(packed, n, k, stream_rows)
+
+    assert packed.shape == (n * k * (512 * bits // 8 + 32) // 512,)
+    assert torch.equal(unpacked_qdata, qdata)
+    assert torch.equal(unpacked_scales.view(torch.uint8), scale_bits)
+
+
+def test_w6a8_mma_pack_lane_bytes():
+    # The 6-bit record the kernel decodes: lane l's fragment j (output half j & 1,
+    # K quarter j >> 1 of its 4-column group) is the 24-bit little-endian word at bytes
+    # 3j..3j+2 of its 12 code bytes, the first 8 at l*8 and the last 4 at 256 + l*4.
+    n, k = 16, 256
+    codes = torch.randint(0, 64, (n, k), dtype=torch.int32)
+    qdata = eager_w4a8._pack_codes(codes, 6)
+    packed = ck.pack_w4a8_mma_weight(qdata, torch.zeros(n, k // 16, dtype=torch.uint8).view(torch.float8_e4m3fn), 8)
+    record = packed.view(torch.uint8).view(-1, 416)[0]  # tile 0, K rows 0..31
+    for lane in (0, 5, 31):
+        token, group = lane >> 2, lane & 3
+        lane_bytes = record[lane * 8:lane * 8 + 8].tolist() + record[256 + lane * 4:256 + lane * 4 + 4].tolist()
+        for j in range(4):
+            word = lane_bytes[3 * j] | lane_bytes[3 * j + 1] << 8 | lane_bytes[3 * j + 2] << 16
+            row, col = token + 8 * (j & 1), group * 4 + 16 * (j >> 1)
+            assert [(word >> (6 * i)) & 63 for i in range(4)] == codes[row, col:col + 4].tolist()
+
+
+def test_w4a8_mma_pack_is_record_major():
+    # The streamed kernel reads record (tile, krow) at
+    # (krow_in_split * splits + split) * tiles + tile: with 2 splits of 16 records,
+    # tile 1's record krow 20 (split 1, step 4) is the 4th step's second-split record.
+    n, k, stream_rows = 32, 1024, 16
+    qdata = torch.zeros((n, k // 2), dtype=torch.int8)
+    scales = torch.zeros((n, k // 16), dtype=torch.uint8)
+    tile, krow = 1, 20
+    qdata[tile * 16:(tile + 1) * 16, krow * 16:(krow + 1) * 16] = 1
+    packed = ck.pack_w4a8_mma_weight(qdata, scales.view(torch.float8_e4m3fn), stream_rows)
+    records = packed.view(-1, 288)
+    tiles, splits = n // 16, k // 32 // stream_rows
+    split, i = divmod(krow, stream_rows)
+    expected = (i * splits + split) * tiles + tile
+    (hit,) = records[:, :256].any(dim=1).nonzero().flatten().tolist()
+    assert hit == expected
+
+
+@pytest.mark.parametrize(
+    ("n", "k", "expected"),
+    [
+        (12288, 2560, 16),
+        (5120, 8704, 16),  # 272 records: 16 divides
+        (5120, 3072, 16),
+        (12280, 2560, 0),  # N % 16
+        (4096, 1280, 8),  # K % 256 == 0 but 40 records: only 8 divides
+        (4096, 1152, 0),  # K % 256 != 0
+    ],
+)
+def test_w4a8_mma_stream_rows(n, k, expected):
+    assert ck.w4a8_mma_stream_rows(n, k) == expected
+
+
+@pytest.mark.parametrize("bits", [4, 6])
+def test_w4a8_mma_packed_layout_is_reversible(bits):
+    # A resident record-stream weight still dequantizes, transposes and runs F.linear (with
+    # an input activation and residual) wherever the streamed kernel does not, identically
+    # to its canonical layout; decode_layout itself only packs for the CUDA kernel.
+    import dataclasses
+
+    from comfy_kitchen.tensor import AsymW4A8Int8Layout, QuantizedTensor
+
+    torch.manual_seed(0)
+    n, k = 32, 256
+    w = torch.randn(n, k, dtype=torch.bfloat16) * 0.02
+    qdata, s_rel, s_channel, _, cb = eager_w4a8.quantize_w4a8_int8_weight(w, bits=bits)
+    params = AsymW4A8Int8Layout.Params(
+        scale=s_rel, s_channel=s_channel, codebook=cb, orig_dtype=torch.bfloat16, orig_shape=(n, k),
+    )
+    assert AsymW4A8Int8Layout.decode_layout(qdata, params) == (qdata, params)
+
+    rows = ck.w4a8_mma_stream_rows(n, k)
+    packed_params = dataclasses.replace(params, scale=s_rel.new_empty(0), stream_rows=rows)
+    weight = QuantizedTensor(ck.pack_w4a8_mma_weight(qdata, s_rel, rows), "AsymW4A8Int8Layout", packed_params)
+    reference = QuantizedTensor(qdata, "AsymW4A8Int8Layout", params)
+    assert AsymW4A8Int8Layout.bits(weight) == bits
+    assert torch.equal(weight.dequantize(), reference.dequantize())
+    assert torch.equal(weight.t().dequantize(), reference.t().dequantize())
+
+    x = torch.randn(3, 2 * k, dtype=torch.bfloat16)
+    residual = torch.randn(3, n, dtype=torch.bfloat16)
+    scale = torch.rand(n, dtype=torch.bfloat16)
+    got, ref = (
+        ck.w4a8_int8_linear(x, *AsymW4A8Int8Layout.get_plain_tensors(t)[:3], codebook=cb,
+                            stream_rows=t._params.stream_rows, input_act="swiglu",
+                            residual=residual, residual_scale=scale)
+        for t in (weight, reference)
+    )
+    assert torch.equal(got, ref)
 
 
 def test_cuda_int8_cublas_turing_n_alignment(monkeypatch):
