@@ -970,8 +970,8 @@ def fp16_packed_linear(
     out_dtype: torch.dtype | None = None,
     weight_amax: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Linear with fp16 weights on packed fp16 math, accumulated in fp32 every 16
-    products and stored as ``out_dtype`` (x's dtype by default).
+    """Linear with fp16 weights on packed fp16 math, each fp16 partial sum folded into
+    fp32 every 32 products and stored as ``out_dtype`` (x's dtype by default).
 
     The HIP backend serves gfx90c and gfx1010, which lack matrix cores and dot
     instructions: x of any float dtype and range is scaled per row by a power of two

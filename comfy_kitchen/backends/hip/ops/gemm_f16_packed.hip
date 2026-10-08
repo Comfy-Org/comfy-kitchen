@@ -25,6 +25,12 @@ namespace comfy::hip_backend {
 namespace {
 
 // Half of fp16's range, the margin for the fp16 rounding of the partial sums.
+//
+// Why the bound holds: a fp16 chain sums kStageProducts products a * w, so with
+// |a| <= amax_row / s and |w| <= w_amax its exact value is at most
+// kStageProducts * amax_row * w_amax / s. Choosing s as below makes that <= 32768. Each
+// fp16 FMA rounds its running sum by at most half an ulp (2^-11 relative), so the rounded
+// chain stays well under fp16's largest finite value, 65504, and never becomes inf.
 constexpr float kStageSumLimit = 32768.0f;
 // Products per fp16 half between folds, see SimtF16Packed.
 constexpr int kStageProducts = kSimtWords * SimtF16Packed::kFoldStages;
@@ -53,7 +59,11 @@ __global__ __launch_bounds__(kScaleThreads) void scale_rows_to_f16_kernel(
 #pragma unroll
         for (int w = 1; w < kScaleThreads / 32; ++w) amax = fmaxf(amax, wave_max[w]);
         // The smallest power of two that bounds the stage sums, which also scales a
-        // small row up into fp16's precision.
+        // small row up into fp16's precision. A power of two only changes the exponent,
+        // so dividing by it here and multiplying it back in EpiRowScale is exact: the only
+        // rounding this pass adds is fp32 or bf16 -> fp16, whose 11-bit mantissa keeps
+        // more of x than bf16's 8. e < 0 (a row of small values) scales the row up, which
+        // keeps it out of fp16's subnormal range. An all-zero row (ratio 0) keeps e = 0.
         const float ratio = amax * w_amax[0] * kStageProducts / kStageSumLimit;
         const int e = ratio > 0.0f ? static_cast<int>(ceilf(log2f(ratio))) : 0;
         row_scale[blockIdx.x] = ldexpf(1.0f, e);
@@ -64,7 +74,9 @@ __global__ __launch_bounds__(kScaleThreads) void scale_rows_to_f16_kernel(
     for (int i = tid; i < K; i += kScaleThreads) out[base + i] = __float2half(load_f(x, base + i) * inv);
 }
 
-// Bound on a row's largest element against weights of largest magnitude w_amax.
+// Bound on a row's largest element against weights of largest magnitude w_amax, the
+// same bound as above solved for amax_row. The ConvRot path passes 127, the largest
+// |w| of an INT8 weight, since its weight needs no reduction to find it.
 constexpr float row_bound(float w_amax) { return kStageSumLimit / (w_amax * kStageProducts); }
 
 template <typename InT>
@@ -87,7 +99,7 @@ extern "C" bool launch_fp16_packed_linear_kernel(
     if (M == 0 || N == 0) {
         return true;  // a zero-dimension grid is hipErrorInvalidConfiguration
     }
-    // Rows are staged 16 bytes at a time. Small M stays on the vendor GEMV.
+    // Rows are staged 16 bytes (8 halves) at a time. Small M stays on the vendor GEMV.
     if (!device_uses_simt_gemm() || K % 8 != 0 || M <= 8) {
         return false;
     }
@@ -104,6 +116,8 @@ extern "C" bool launch_fp16_packed_linear_kernel(
         throw std::runtime_error("fp16_packed_linear: unsupported input dtype");
     }
 
+    // The GEMM sums (x[row] / s[row]) . w; EpiRowScale multiplies s[row] back in fp32.
+    // The GEMM's K is in bytes, two per fp16 element.
     const EpiRowScale epi{scale, bias, bias_code};
     const auto* A = reinterpret_cast<const uint8_t*>(xh);
     const auto* B = static_cast<const uint8_t*>(w);
@@ -146,6 +160,9 @@ extern "C" bool launch_int8_convrot_packed_linear_kernel(
         return false;
     }
 
+    // INT8 weights times their per-channel scale are the dequantized weight, so the
+    // INT8 codes cast to fp16 (exact, |w| <= 127) take the place of the fp16 weight and
+    // EpiRowwise applies both the row's power of two and w_scale.
     const EpiRowwise epi{scale, static_cast<const float*>(w_scale), w_scale_stride, bias,
                          bias_code};
     const auto* A = reinterpret_cast<const uint8_t*>(xh);

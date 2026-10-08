@@ -21,6 +21,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `na2d`                      | ✓     | ✓    | ✓      | ✓   |     |
 | `sol_attn`                  | ✓     | ✓    |        | ✓   |     |
 | `int8_attention`            |       | ✓    |        | ✓   |     |
+| `int8_block_sparse_attention` |     |      |        | ✓†  |     |
 | `apply_rope`                | ✓     | ✓    | ✓      | ✓   | ✓*  |
 | `apply_rope1`               | ✓     | ✓    | ✓      | ✓   | ✓*  |
 | `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   | ✓*  |
@@ -37,6 +38,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `dequantize_int8_simple_dtype` | ✓  | ✓    |        | ✓   | ✓   |
 | `dequantize_int8_convrot_weight_dtype` | ✓ | ✓ |    | ✓   |     |
 | `int8_linear`               | ✓     | ✓    | ✓      | ✓   | ✓*  |
+| `fp16_packed_linear`        | ✓     |      |        | ✓†  |     |
 | `gemv_awq_w4a16`            | ✓     | ✓    |        | ✓   |     |
 | `quantize_svdquant_w4a4`    | ✓     | ✓    |        | ✓   |     |
 | `scaled_mm_svdquant_w4a4`   | ✓     | ✓    |        | ✓   |     |
@@ -55,6 +57,9 @@ Ascend support for `quantize_and_rotate_rowwise` requires
 `convrot_w4a4_linear` requires only `torch_npu.npu_quant_matmul`.
 These capabilities are registered only when the
 corresponding operator is available.
+
+† HIP kernel on `gfx1010` (and `gfx90c` for `fp16_packed_linear`) only; see
+[the thread-level kernels](#vega-rdna1-and-rdna2-pre-wmma-gpus).
 
 ## Huawei Ascend backend
 
@@ -110,9 +115,10 @@ The `hip` backend implements the quantized paths with its own kernels: native
 WMMA on RDNA3/RDNA3.5/RDNA4 and a software 16x16 tile policy on Vega, RDNA1 and
 RDNA2. Every quantized matmul (fp8, int8, int4) is compiled from the sources in
 `comfy_kitchen/backends/hip/` and never reaches hipBLAS/hipBLASLt. The only
-exception is the unquantized fp16 path: on GPUs without native WMMA, and for
-shapes its kernel declines, `fp16_linear` and `fp16_conv3d` run through torch
-(rocBLAS and MIOpen) in bounded chunks; see
+exception is the unquantized fp16 path: on GPUs with neither native WMMA nor the
+thread-level GEMM (`gfx90c`, `gfx1010`), and for shapes its kernel declines,
+`fp16_linear` and `fp16_conv3d` run through torch (rocBLAS and MIOpen) in bounded
+chunks; see
 [Vega, RDNA1 and RDNA2](#vega-rdna1-and-rdna2-pre-wmma-gpus).
 
 Both rope kernels address their inputs through the tensor's own strides, so a q/k
@@ -134,8 +140,9 @@ What a GPU gets depends on whether it has matrix cores:
 | RDNA3.5    | `gfx1150`-`gfx1153`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
 | RDNA3      | `gfx1100`-`gfx1103`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
 | RDNA2      | `gfx1030`-`gfx1036`         | `sdot4`      | Software tile GEMMs and attention; fp16 GEMM/conv3d via chunked rocBLAS/MIOpen |
-| RDNA1      | `gfx1010`-`gfx1012`         | vector ALU   | Software tile GEMMs and attention; fp16 GEMM/conv3d via chunked rocBLAS/MIOpen |
-| Vega (APU) | `gfx90c`                    | vector ALU   | Software tile GEMMs and attention (wave64); fp16 GEMM/conv3d via chunked rocBLAS/MIOpen |
+| RDNA1      | `gfx1010`                   | vector ALU   | Thread-level GEMMs (incl. fp16 and conv3d), fp16-FMA attention, block-sparse attention |
+| RDNA1      | `gfx1011`, `gfx1012`        | vector ALU   | Software tile GEMMs and attention; fp16 GEMM/conv3d via chunked rocBLAS/MIOpen |
+| Vega (APU) | `gfx90c`                    | vector ALU   | Thread-level GEMMs (incl. fp16 and conv3d); software tile attention (wave64) |
 | Vega       | `gfx900`, `gfx906`          | vector ALU   | Software tile GEMMs and attention (wave64); fp16 GEMM/conv3d via chunked rocBLAS/MIOpen |
 
 fp8, int8 and int4 share one byte-addressed tile kernel (`gemm_wmma.h`). RDNA3
@@ -182,8 +189,55 @@ that leaves too few blocks to fill the GPU. At N=K=3072 this took M=16 from
 0.79 / 0.90 / 0.72 to 1.70 / 1.68 / 1.45 TOPS (int8 / fp8 / int4) and M=32 from
 1.50 / 1.74 / 1.37 to 2.46 / 2.67 / 2.04.
 
+The same kernel serves fp16 on these two targets:
+
+- `fp16_linear` keeps fp16 pairs in LDS and accumulates in fp32 (`v_fma_mix_f32`
+  on `gfx1010`): 4.2-4.9 TFLOPS on `gfx1010` at M=4096 and MiniMax-H3's linear
+  shapes, against 1.6-2.3 for rocBLAS fp16.
+- `fp16_packed_linear` multiplies with `v_pk_fma_f16`, twice the MAC rate,
+  accumulating 32 products per fp16 half before folding into fp32. Each
+  activation row is first scaled by a power of two against the weight's largest
+  element so no partial sum overflows, so x may be fp32, bf16 or fp16 of any
+  range. On `gfx1010` it runs 5.5-6.0 TFLOPS at H3's shapes, and its error against
+  an fp64 GEMM (8.9e-4 nrmse) is ~2.6x lower than with bf16 operands.
+  `fp16_packed_linear_is_accelerated(device)` reports whether a model that
+  computes in fp32 only for lack of bf16 should route its linears here.
+- ConvRot INT8 `int8_linear` (group size 256, M > 8) casts the INT8 weight to
+  fp16 (exact) and runs the packed GEMM against fp16 rotated rows instead of
+  int8-quantized ones: 4.1-4.5 → 5.3-5.8 TFLOPS at the H3 VAE decoder's shapes,
+  and more accurate since activations are never rounded to int8.
+- `fp16_conv3d` (C a multiple of 32) is an implicit GEMM on the packed kernel
+  with zero padding applied in the gather (`padding=`), so it needs no im2col
+  workspace. At Wan VAE decoder shapes it runs 5.6-6.7 TFLOPS against 1.2-2.3
+  for MIOpen.
+
+On `gfx1010`, `int8_attention` uses a dedicated kernel instead of the emulated
+MMA: K and V are staged in LDS as fp16 and each MAC is one `v_fma_mix_f32`
+(exact for int8 operands), or `v_pk_fma_f16` at head dim 128. Four lanes share
+two queries, so every K/V word read from LDS feeds two of them. At H3's shapes
+(56 heads, D128, S 4K-16K) this runs 5.4-5.6 TFLOPS, up from 2.2-3.0.
+`int8_block_sparse_attention` runs the same kernel over a per-query-block list
+of 64-key tiles (`lut`, as top-k selectors produce it): at S=8192 and 90%
+sparsity it takes 53 ms where the dense kernel takes 350 ms.
+
 The other pre-WMMA targets keep the software tile, since the kernel is only
 enabled where it has been measured and validated.
+
+#### Measured on an RX 5600M (`gfx1010`)
+
+- rocBLAS on this GPU runs fp32 at 2.1-2.9 TFLOPS and fp16 at 1.6-2.3, so fp16
+  through rocBLAS is no speedup; the kitchen kernels above are.
+- The card is power-limited (about 80 W board power): sustained GEMM load drops
+  the shader clock from 1750 MHz to about 1.0-1.15 GHz. Kernels already run near
+  peak at that clock, so only fewer instructions per MAC (packed math) still
+  helps.
+- One MiniMax-H3 transformer block (Q4_K GGUF dequantized to fp16, S=8192):
+  2934 ms with torch GEMMs and split attention, 1529 ms with
+  `fp16_packed_linear` and `int8_attention`. The GEMMs are then 65% of the
+  block and attention 20%.
+- VAE decode of a 640x352 clip: Wan 2.1 106.9 → 42.4 s (peak VRAM 3.97 → 2.00
+  GB) from the implicit-GEMM `fp16_conv3d`; H3 137.9 → 101.0 s from the packed
+  ConvRot INT8 path.
 
 On these targets the backend supports:
 
@@ -194,10 +248,11 @@ On these targets the backend supports:
 | INT8 quantization | `quantize_int8_rowwise`, `quantize_int8_tensorwise`, `quantize_and_rotate_rowwise`, `quantize_int8_convrot_weight`, `dequantize_int8_*` | Elementwise and row-reduction kernels |
 | INT8 GEMM | `int8_linear` (incl. ConvRot, `input_act`, fused RMSNorm and residual) | Thread-level GEMM on `gfx90c`/`gfx1010`, software tile elsewhere (`sdot4` on RDNA2) |
 | INT4 / W4A8 / W6A8 | `convrot_w4a4_linear`, `quantize/dequantize_convrot_w4a4_weight`, `quantize_svdquant_w4a4`, `scaled_mm_svdquant_w4a4`, `gemv_awq_w4a16`, `w4a8_int8_linear` | Packed codes decoded in registers; ConvRot W4A4 and the W4A8 GEMM use the thread-level GEMM on `gfx90c`/`gfx1010`, the rest the software tile |
-| FP16 GEMM / conv | `fp16_linear`, `fp16_conv3d` | torch (rocBLAS / MIOpen) in 16 MiB chunks, see below |
+| FP16 GEMM / conv | `fp16_linear`, `fp16_packed_linear`, `fp16_conv3d` | Thread-level GEMM on `gfx90c`/`gfx1010`; torch (rocBLAS / MIOpen) in 16 MiB chunks elsewhere, see below |
 | Normalization | `adaln`, `rms_adaln`, `group_norm_silu_pad3d` | Native kernels, same as RDNA3/4 |
 | RoPE | all `apply_rope*` and `rms_rope*` entries, including in-place | Native strided kernels, same as RDNA3/4 |
-| Attention | `na3d`, `na2d`, `sol_attn`, Sage INT8 attention (`int8_attention`) | Software tile; same memory behavior as on RDNA3/4 |
+| Attention | `na3d`, `na2d`, `sol_attn`, Sage INT8 attention (`int8_attention`) | Software tile, except `int8_attention` on `gfx1010` (fp16-FMA kernel); same memory behavior as on RDNA3/4 |
+| Block-sparse attention | `int8_block_sparse_attention` | `gfx1010` only |
 
 Not available on these targets, so these fall through to another backend (or,
 for decode helpers, report unavailable through their `*_is_available()` check):
@@ -206,9 +261,10 @@ for decode helpers, report unavailable through their `*_is_available()` check):
   RDNA2 and older have no bf16 arithmetic, and the kernel is written around it.
 - GatedDeltaNet fused decode (`gated_delta_decode_is_available()` is false),
   for the same reason.
-- The native fp16 GEMM and conv3d kernels. Without matrix cores, the software
-  fp16 tile ran 7x to 15x slower than rocBLAS/MIOpen, so `fp16_linear` and
-  `fp16_conv3d` use torch there instead. The calls are chunked so their scratch
+- The native fp16 GEMM and conv3d kernels, other than on `gfx90c` and
+  `gfx1010`. Without matrix cores, the software fp16 tile ran 7x to 15x slower
+  than rocBLAS/MIOpen, so `fp16_linear` and `fp16_conv3d` use torch there
+  instead. The calls are chunked so their scratch
   stays near 16 MiB: MIOpen's im2col workspace for an unchunked conv3d is about
   30x the output, and a pinned host weight is staged one row block at a time
   instead of being copied to VRAM whole. On `gfx1010` and `gfx90c`, 16 MiB
@@ -219,7 +275,8 @@ for decode helpers, report unavailable through their `*_is_available()` check):
 Without matrix cores these GPUs will not reach RDNA3 speeds on the same
 kernels. On `gfx90c` and `gfx1010` the quantized GEMMs still run 2.2-2.7x faster
 than an fp16 rocBLAS GEMM of the same shape, as well as using half or a quarter
-of the weight memory. On the other pre-WMMA targets the software tile is slower
+of the weight memory, and on `gfx1010` the packed fp16 GEMM runs about 2x
+rocBLAS fp32 for models that cannot compute in bf16. On the other pre-WMMA targets the software tile is slower
 than rocBLAS fp16, and the benefit there is memory footprint and avoiding
 eager's slow paths.
 
@@ -257,9 +314,10 @@ about whether to build the extension for an older card and when not to force
   and the quantizers are each one kernel instead of a chain of torch ops, which
   saves memory traffic on bandwidth-limited cards. The RoPE kernels also rotate
   q/k slices of a packed qkv in place instead of copying them.
-- **Video VAEs in fp16.** `fp16_conv3d` bounds MIOpen's workspace to 16 MiB
-  windows. A direct `torch.nn.functional.conv3d` on a large video latent can
-  allocate an im2col buffer many times the size of its output.
+- **Video VAEs in fp16.** On `gfx90c` and `gfx1010`, `fp16_conv3d` is an
+  implicit GEMM with no im2col workspace; elsewhere it bounds MIOpen's
+  workspace to 16 MiB windows. A direct `torch.nn.functional.conv3d` on a large
+  video latent can allocate an im2col buffer many times the size of its output.
 
 Eager is still the better choice when:
 
@@ -496,7 +554,7 @@ with ck.use_backend("triton"):
 The library supports multiple backends:
 - **eager**: Pure PyTorch implementation
 - **cuda**: Custom CUDA C kernels (CUDA only)
-- **hip**: Custom HIP kernels (native WMMA on RDNA3/3.5/4; software tiles on Vega, RDNA1 and RDNA2)
+- **hip**: Custom HIP kernels (native WMMA on RDNA3/3.5/4; thread-level kernels on `gfx90c`/`gfx1010`; software tiles on other Vega, RDNA1 and RDNA2)
 - **triton**: Triton JIT-compiled kernels
 
 ### Automatic Backend Selection

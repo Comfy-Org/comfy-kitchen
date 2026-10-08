@@ -40,6 +40,10 @@ namespace {
 using half2_t = _Float16 __attribute__((ext_vector_type(2)));
 struct __attribute__((aligned(16))) Half8 { half2_t v[4]; };
 
+// Four int8 to fp16 with two byte permutes and two packed subtracts, no conversions.
+// fp16 0x6400 is 1024, where the ulp is exactly 1, so writing a byte u into the low
+// mantissa bits (0x64uu) gives the fp16 value 1024 + u. Flipping the sign bit first
+// turns int8 b into u = b + 128, and subtracting 1152 = 1024 + 128 leaves b exactly.
 __forceinline__ __device__ void i8x4_to_half2(uint32_t w, half2_t& lo, half2_t& hi) {
     // (u8 + 128) planted in the mantissa of 1024 is exactly 1024 + u8 + 128 - 128.
     w ^= 0x80808080u;
@@ -125,6 +129,8 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
     const int8_t* v_head = v + static_cast<int64_t>(batch) * v_stride_b +
                            static_cast<int64_t>(kv_head) * v_stride_h;
 
+    // The softmax runs in base 2 (exp2 is the hardware's native exponential), so the
+    // scores' scale absorbs log2(e).
     sm_scale *= kLog2e;
 
     half2_t qh[kR][kChunks * 4];
@@ -143,6 +149,9 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
 #pragma unroll
             for (int i = 0; i < kChunks * 4; ++i) qh[r][i] = qh[r][i] * sixteenth;
         }
+        // The scores are integer dot products of the int8 codes; this scale (Q's
+        // dequant scale, the softmax scale, and the 16 the PK path divided Q by) is
+        // applied once per score, in the softmax, rather than to Q or K.
         q_lane_scale[r] = (PK ? 16.0f : 1.0f) * sm_scale *
             q_scale[(static_cast<int64_t>(batch) * num_qo_heads + head) * qo_len_padded +
                     imin(q0 + r, qo_len_padded - 1)];
@@ -185,6 +194,9 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
             dst[0] = a;
             dst[1] = b;
         }
+        // V arrives transposed ([dim][key]) and zero padded to a multiple of CTA_K by the
+        // quantizer, so this tile needs no bounds check and a lane's PV reads 16
+        // consecutive keys of one dim as two 16-byte loads.
 #pragma unroll
         for (int idx = tid; idx < HD * (CTA_K / 16); idx += kThreads) {
             const int row = idx / (CTA_K / 16);
@@ -255,6 +267,8 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
                 for (int r = 0; r < kR; ++r)
 #pragma unroll
                     for (int kk = 0; kk < 4; ++kk) {
+                        // fma_h(x, 1, y) is one v_fma_mix_f32: both f16 halves are widened
+                        // and added in a single instruction.
                         if constexpr (PK) {
                             const half2_t sum = pacc[0][r][kk] +
                                 __builtin_bit_cast(half2_t, dpp_u32<kSwapPair>(__builtin_bit_cast(uint32_t, pacc[1][r][kk])));
@@ -288,6 +302,13 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
                 mx = fmaxf(mx, swap_pair_of_pairs(mx));
                 const float tile_m = mx * scale;
 
+                // Lazy rescaling (in log2 units). The running max m_run only moves when a
+                // tile's max passes it by more than 8, and then to 4 below that max, so
+                // most steps skip rescaling O. Probabilities may then exceed 1, but by at
+                // most 2^8, which fp16 holds; with PK the extra -4 below caps them at
+                // 2^4, so a 16-key PV chain stays within 16 * 16 * 128 = 32768. __any keeps
+                // the branch wave-uniform: lanes that did not need it rescale by alpha = 1.
+                // O and d are rescaled together, so the final O / d is unchanged.
                 const bool update = tile_m > m_run[r] + 8.0f;
                 if (__any(update)) {
                     const float m_next = update ? tile_m - 4.0f : m_run[r];
@@ -306,6 +327,8 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
                     if (kBoundary) p[kk] = key_base + kk < kv_len ? p[kk] : 0.0f;
                 }
                 d_run[r] += (p[0] + p[1]) + (p[2] + p[3]);  // this lane's keys; summed at the end
+                // Round toward zero to f16 for PV: p <= 2^8, so no overflow, and the f16
+                // rounding (2^-11 relative) is far below the int8 quantization of V.
                 own[r][0] = __builtin_bit_cast(uint32_t, __builtin_amdgcn_cvt_pkrtz(p[0], p[1]));
                 own[r][1] = __builtin_bit_cast(uint32_t, __builtin_amdgcn_cvt_pkrtz(p[2], p[3]));
             }
@@ -366,7 +389,8 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
 #pragma unroll 1
         for (int t = 0; t < topk; ++t) {
             const int tile = tiles[t];
-            // The same for the whole block. A tile outside K would read past V.
+            // The same for the whole block, which run_iter's __syncthreads requires. A
+            // tile outside K would read past V.
             if (tile < 0 || tile >= num_iters) continue;
             if (tile < interior_iters) {
                 run_iter(std::false_type{}, tile);
@@ -392,6 +416,8 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
 #pragma unroll
     for (int r = 0; r < kR; ++r) {
         if (q0 + r >= qo_len) break;
+        // d is 0 only when no key was attended (such as a block-sparse row whose tiles
+        // were all skipped); its output is 0 rather than NaN.
         const float inv_d = d_run[r] > 0.0f ? 1.0f / d_run[r] : 0.0f;
         OutT* row = o + static_cast<int64_t>(batch) * o_stride_b +
                     static_cast<int64_t>(head) * o_stride_h +

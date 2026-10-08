@@ -654,6 +654,9 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     abs_max = block_reduce_max<kWarps>(abs_max, warp_smem, &block_smem);
     const float rowmax = fmaxf(finite_absmax_for_quant<RowT>(abs_max), 1e-10f);
     if constexpr (std::is_same_v<QT, __half>) {
+        // The rotated row keeps its precision (no int8 rounding); it is only divided by
+        // the power of two 2^e that brings its absmax to f16_bound or below, which is
+        // exact, and the GEMM's epilogue multiplies 2^e back from scaleout.
         const int e = static_cast<int>(ceilf(log2f(rowmax / f16_bound)));
         if (tid == 0) {
             scaleout[row] = ldexpf(1.0f, e);

@@ -879,8 +879,8 @@ def fp16_packed_linear(
     out_dtype: torch.dtype | None = None,
     weight_amax: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Linear on packed fp16 math with fp32 accumulation every 16 products, stored as
-    ``out_dtype`` (x's dtype by default). x (any float dtype, any range) is scaled per
+    """Linear on packed fp16 math, each fp16 partial sum folded into fp32 every 32
+    products (_PACKED_STAGE_PRODUCTS), stored as ``out_dtype`` (x's dtype by default). x (any float dtype, any range) is scaled per
     row by a power of two against ``weight_amax`` (the largest |weight|, computed when
     not given) so no fp16 partial sum overflows. Served on gfx90c and gfx1010; other
     devices, and shapes the kernel declines, run torch."""

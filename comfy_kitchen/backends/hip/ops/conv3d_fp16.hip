@@ -49,6 +49,11 @@ struct ConvPatchSrc {
 // 64-byte stage of a row lies within one filter tap: the tap is resolved once per stage
 // for the whole block, and a row once per thread, leaving a bounds check and an add
 // per chunk.
+//
+// Row m's K axis runs over taps (t, r, s) in order with C channels each, the same order
+// as the weight's (K, T, R, S, C) layout, so A row m dotted with B row k is output
+// channel k at output position m. Padding is never materialized: a tap that lands in the
+// padding reads as zeros, which is what a zero-padded input would hold there.
 struct ConvPatchSimtSrc {
     const uint8_t* x;
     int zpq, pq, q_out;
@@ -59,6 +64,8 @@ struct ConvPatchSimtSrc {
     int pd, ph, pw;
     int D, H, W;
 
+    // base may point before x or past its end when the tap lies in the padding; it is
+    // only dereferenced by chunk() after the bounds check, so that is never read.
     struct Row {
         int64_t base;  // element offset of tap (0, 0, 0), which may lie in the padding
         int z, p, q;   // its input position; z = D past M, so every tap is outside
@@ -88,6 +95,8 @@ struct ConvPatchSimtSrc {
         return {t * xd + r * xh + s * xw + (e - tap * C), t, r, s};
     }
 
+    // The casts to unsigned fold "0 <= i && i < extent" into one compare per axis: a
+    // negative position (in the leading padding) wraps to a huge value.
     __forceinline__ __device__ uint4 chunk(const Row& w, const Stage& st, int offset) const {
         const bool inside = static_cast<unsigned>(w.z + st.t) < static_cast<unsigned>(D) &&
                             static_cast<unsigned>(w.p + st.r) < static_cast<unsigned>(H) &&
@@ -98,7 +107,11 @@ struct ConvPatchSimtSrc {
 };
 
 // fp16 output of the packed GEMM: out = acc * acc_scale[0] + bias[col] (+ resid[row, col]).
-// acc_scale undoes the power of two the caller scaled the weight by.
+// acc_scale undoes the power of two the caller scaled the weight by. The weight, not x,
+// carries the scale because the implicit GEMM reads x in place: a per-row scaled copy of
+// x would be the im2col-sized buffer this path exists to avoid. One scale for the whole
+// conv, from both operands' absmax, gives the same fp16 overflow bound as
+// gemm_f16_packed.hip's per-row one.
 struct EpiConvScaled {
     const float* acc_scale;
     const __half* bias;

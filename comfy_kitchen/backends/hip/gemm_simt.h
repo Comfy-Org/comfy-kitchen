@@ -219,6 +219,12 @@ struct SimtF16 {
 // fp16 (one per K word) before the kernel folds the pair into the fp32 accumulator, so
 // the caller only has to keep that many products' partial sums inside fp16's range
 // (see ops/gemm_f16_packed.hip).
+//
+// A K word holds elements (2i, 2i + 1) of both operands, so the low half of the packed
+// accumulator sums the even-K products and the high half the odd-K ones: two independent
+// fp16 chains of kSimtWords * kFoldStages = 32 products each. Only those 32-product
+// partial sums are ever rounded to fp16 (11-bit mantissa); everything across folds adds
+// in fp32, so the rounding error does not grow with K the way a pure fp16 GEMM's does.
 struct SimtF16Packed {
     using Acc = float;
     using Pack = SimtFp8::half2_t;
@@ -236,13 +242,16 @@ struct SimtF16Packed {
     static __forceinline__ __device__ Pack dot(Frag a, Frag b, Pack c) {
         return __builtin_elementwise_fma(a.h, b.h, c);
     }
+    // The two chains are widened separately: adding them in fp16 first would round
+    // once more and could overflow where each chain alone does not.
     static __forceinline__ __device__ float fold(Pack p, float c) {
         return c + static_cast<float>(p.x) + static_cast<float>(p.y);
     }
     static __forceinline__ __device__ float finish(float c) { return c; }
 };
 
-// A policy with a Pack type accumulates into it, folded into Acc after every stage.
+// A policy with a Pack type accumulates into it, folded into Acc every Op::kFoldStages
+// stages.
 template <typename Op, typename = void>
 struct SimtPack {
     using type = char;
@@ -466,6 +475,9 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
                 }
             }
         }
+        // Fold the fp16 chains into fp32 before they hold more products than the caller's
+        // operand scaling bounds, and after this slice's last stage so no partial is lost
+        // (a slice's stage count need not be a multiple of kFoldStages).
         if constexpr (kPacked) {
             if (++stage % Op::kFoldStages == 0 || !has_next) {
 #pragma unroll
