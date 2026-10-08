@@ -427,7 +427,10 @@ def _convrot_int8_fused_shared_memory_bytes(m: int, k: int) -> int:
     else:
         block_threads = 1024
     groups_in_flight = block_threads // 64
-    return (k + groups_in_flight * 2 * 256) * 4
+    smem = (k + groups_in_flight * 2 * 256) * 4
+    if m == 1:
+        smem += k  # the M=1 GEMV keeps the quantized int8 row in shared memory too
+    return smem
 
 
 def _convrot_int4_fused_shared_memory_bytes(m: int, k: int, group_size: int, dtype_size: int) -> int:
@@ -972,6 +975,8 @@ def _int4_linear_via_int8_values(
             _wrap_for_dlpack(weight_scale_arg),
             _wrap_for_dlpack(bias_arg),
             _wrap_for_dlpack(output),
+            _wrap_for_dlpack(_empty_cuda_tensor(x_int8.device, out_dtype)),
+            _wrap_for_dlpack(_empty_cuda_tensor(x_int8.device, out_dtype)),
             DTYPE_TO_CODE[out_dtype],
             stream_ptr,
         )
@@ -1790,6 +1795,8 @@ def int8_gemv_dequant(
         _wrap_for_dlpack(weight_scale),
         _wrap_for_dlpack(bias_arg),
         _wrap_for_dlpack(out),
+        _wrap_for_dlpack(_empty_cuda_tensor(x_qdata.device, out_dtype)),
+        _wrap_for_dlpack(_empty_cuda_tensor(x_qdata.device, out_dtype)),
         DTYPE_TO_CODE[out_dtype],
         stream_ptr,
     )
@@ -2078,9 +2085,21 @@ def int8_linear(
     output_dtype_code = DTYPE_TO_CODE[out_dtype]
     is_2d_output = len(orig_shape) == 2
 
-    # The residual is fused into the CUTLASS epilogue when that path runs;
-    # every other route applies it eagerly here so all paths agree.
+    # The residual is fused into the CUTLASS epilogue and the M=1 GEMV when those
+    # paths run; every other route applies it eagerly here so all paths agree.
     fused_residual_done = False
+
+    def _gemv_residual_args():
+        # the GEMV epilogue takes residual [1, n] and scale [n] in the output dtype;
+        # anything broadcast is left to the eager addcmul in _finish
+        nonlocal fused_residual_done
+        if (residual is None or residual.dtype != out_dtype or residual_scale.dtype != out_dtype
+                or residual.numel() != n or residual_scale.numel() != n):
+            empty = _empty_cuda_tensor(x.device, out_dtype)
+            return empty, empty
+        fused_residual_done = True
+        return (residual.reshape(1, n).contiguous(),
+                _gemm_vector_arg(residual_scale, x.device, out_dtype))
 
     def _finish(o):
         if not fused_residual_done:
@@ -2088,28 +2107,32 @@ def int8_linear(
                                 residual_scale)
         return o if is_2d_output else o.reshape(*orig_shape[:-1], n)
 
-    convrot_m1_supported = (
-        m == 1
-        and convrot
-        and convrot_groupsize == 256
-        and k % 256 == 0
-        and 256 <= k <= _CONVROT_FUSED_MAX_K
-        and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
-    )
+    # the fused GEMV reads weight rows with 16-byte loads
+    convrot_m1_supported = m == 1 and _fused_convrot_ok and weight.data_ptr() % 16 == 0
     nonconvrot_m1_supported = (
         m == 1
         and not convrot
         and k % 4 == 0
         and (k <= 2560 or (k == 6144 and n <= 128))
     )
-    if input_act in (None, "none") and (convrot_m1_supported or nonconvrot_m1_supported):
-        x_qdata = torch.empty((1, k), dtype=torch.int8, device=x.device)
-        x_scale = torch.empty((1, 1), dtype=torch.float32, device=x.device)
+    # ConvRot M=1 runs the quantizer (with any input activation) inside the GEMV;
+    # the non-ConvRot M=1 path still quantizes separately, so it needs a plain input.
+    if convrot_m1_supported or (input_act in (None, "none") and nonconvrot_m1_supported):
+        if convrot_m1_supported:
+            # quantizer fused into the GEMV: no int8 scratch
+            x_qdata = _empty_cuda_tensor(x.device, torch.int8)
+            x_scale = _empty_cuda_tensor(x.device, torch.float32)
+            act_weight_arg = _act_weight_arg(input_act, input_act_weight, x.device, x_2d.dtype)
+        else:
+            x_qdata = torch.empty((1, k), dtype=torch.int8, device=x.device)
+            x_scale = torch.empty((1, 1), dtype=torch.float32, device=x.device)
+            act_weight_arg = _empty_cuda_tensor(x.device, x_2d.dtype)
         weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
         out = torch.empty((1, n), dtype=out_dtype, device=x.device)
         bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
         if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
             bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
+        resid_arg, resid_scale_arg = _gemv_residual_args()
         _C.int8_linear_m1(
             _wrap_for_dlpack(x_2d),
             _wrap_for_dlpack(x_qdata),
@@ -2118,9 +2141,14 @@ def int8_linear(
             _wrap_for_dlpack(weight_scale),
             _wrap_for_dlpack(bias_arg),
             _wrap_for_dlpack(out),
+            _wrap_for_dlpack(resid_arg),
+            _wrap_for_dlpack(resid_scale_arg),
             output_dtype_code,
             convrot,
             convrot_groupsize,
+            _input_act_code(input_act),
+            _wrap_for_dlpack(act_weight_arg),
+            float(input_act_eps),
             stream_ptr,
         )
         return _finish(out)
@@ -2175,6 +2203,10 @@ def int8_linear(
         bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
         if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
             bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
+        if m == 1:
+            resid_arg, resid_scale_arg = _gemv_residual_args()
+        else:
+            resid_arg = resid_scale_arg = _empty_cuda_tensor(x.device, out_dtype)
         _C.int8_gemv_dequant(
             _wrap_for_dlpack(x_qdata),
             _wrap_for_dlpack(weight),
@@ -2182,6 +2214,8 @@ def int8_linear(
             _wrap_for_dlpack(weight_scale),
             _wrap_for_dlpack(bias_arg),
             _wrap_for_dlpack(out),
+            _wrap_for_dlpack(resid_arg),
+            _wrap_for_dlpack(resid_scale_arg),
             output_dtype_code,
             stream_ptr,
         )

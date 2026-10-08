@@ -2232,6 +2232,28 @@ extern "C" {
         bool has_bias,
         int output_dtype_code,
         int bias_dtype_code,
+        const void* residual,
+        const void* residual_scale,
+        cudaStream_t stream);
+
+    void launch_int8_gemv_convrot_fused_kernel(
+        const void* input,
+        int input_dtype_code,
+        int act_code,
+        const void* act_weight,
+        float act_eps,
+        const void* weight,
+        const void* weight_scales,
+        const void* bias,
+        bool has_bias,
+        int bias_dtype_code,
+        void* output,
+        int output_dtype_code,
+        int64_t N,
+        int64_t K,
+        int64_t weight_scale_size,
+        const void* residual,
+        const void* residual_scale,
         cudaStream_t stream);
 
     void launch_dequantize_int8_simple_kernel(
@@ -3532,6 +3554,23 @@ void dequantize_int8_linear(
         stream);
 }
 
+// Fused GEMV residual: residual [1, N] and residual_scale [N], both in the output dtype;
+// an empty residual means none.
+static void check_gemv_residual(
+    const nb::ndarray<nb::device::cuda>& residual,
+    const nb::ndarray<nb::device::cuda>& residual_scale,
+    int64_t N, int output_dtype_code) {
+    if (!(residual.data() && residual.size() > 0)) {
+        return;
+    }
+    if (residual.size() != static_cast<size_t>(N) || map_dtype_to_code(residual.dtype()) != output_dtype_code) {
+        throw std::runtime_error("INT8 GEMV residual must have N elements in the output dtype");
+    }
+    if (residual_scale.size() != static_cast<size_t>(N) || map_dtype_to_code(residual_scale.dtype()) != output_dtype_code) {
+        throw std::runtime_error("INT8 GEMV residual scale must have N elements in the output dtype");
+    }
+}
+
 void int8_gemv_dequant(
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> input,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> weight,
@@ -3539,6 +3578,8 @@ void int8_gemv_dequant(
     nb::ndarray<float, nb::device::cuda> weight_scales,
     nb::ndarray<nb::device::cuda> bias,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<nb::device::cuda> residual,
+    nb::ndarray<nb::device::cuda> residual_scale,
     int output_dtype_code,
     uintptr_t stream_ptr) {
 
@@ -3573,6 +3614,9 @@ void int8_gemv_dequant(
         }
     }
 
+    check_gemv_residual(residual, residual_scale, N, output_dtype_code);
+    const bool has_residual = residual.data() && residual.size() > 0;
+
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_int8_gemv_dequant_kernel(
         input.data(),
@@ -3588,36 +3632,53 @@ void int8_gemv_dequant(
         has_bias,
         output_dtype_code,
         bias_dtype_code,
+        has_residual ? residual.data() : nullptr,
+        has_residual ? residual_scale.data() : nullptr,
         stream);
 }
 
 void int8_linear_m1(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
-    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> q_scratch,
-    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> x_scales,
+    nb::ndarray<nb::device::cuda> q_scratch,
+    nb::ndarray<nb::device::cuda> x_scales,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> weight,
     nb::ndarray<float, nb::device::cuda> weight_scales,
     nb::ndarray<nb::device::cuda> bias,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<nb::device::cuda> residual,
+    nb::ndarray<nb::device::cuda> residual_scale,
     int output_dtype_code,
     bool convrot,
     int group_size,
+    int act_code,
+    nb::ndarray<nb::device::cuda> act_weight,
+    float act_eps,
     uintptr_t stream_ptr) {
 
     const int64_t M = input.shape(0);
-    const int64_t K = input.shape(1);
+    const int64_t K = weight.shape(1);
     const int64_t N = weight.shape(0);
     if (M != 1) {
         throw std::runtime_error("INT8 M=1 linear expects input M == 1");
     }
-    if (weight.shape(1) != K) {
+    // ConvRot fuses the quantizer (and input activation) into the GEMV: the raw
+    // row is K wide, or 2K for SwiGLU's [gate | up]; q_scratch/x_scales unused.
+    if (act_code != 0 && !convrot) {
+        throw std::runtime_error("INT8 M=1 linear input activation requires convrot");
+    }
+    const int64_t in_width = (act_code == comfy::kActSwiGLU) ? 2 : 1;
+    if (input.shape(1) != K * in_width) {
         throw std::runtime_error("INT8 M=1 linear weight K mismatch");
     }
-    if (q_scratch.shape(0) != 1 || q_scratch.shape(1) != K) {
-        throw std::runtime_error("INT8 M=1 linear q scratch shape mismatch");
-    }
-    if (x_scales.shape(0) != 1 || x_scales.shape(1) != 1) {
-        throw std::runtime_error("INT8 M=1 linear activation scale shape mismatch");
+    if (!convrot) {
+        if (q_scratch.dtype() != nb::dtype<int8_t>() || q_scratch.ndim() != 2
+            || q_scratch.shape(0) != 1 || q_scratch.shape(1) != K) {
+            throw std::runtime_error("INT8 M=1 linear q scratch shape mismatch");
+        }
+        if (x_scales.dtype() != nb::dtype<float>() || x_scales.ndim() != 2
+            || x_scales.shape(0) != 1 || x_scales.shape(1) != 1) {
+            throw std::runtime_error("INT8 M=1 linear activation scale shape mismatch");
+        }
     }
     if (output.shape(0) != 1 || output.shape(1) != N) {
         throw std::runtime_error("INT8 M=1 linear output shape mismatch");
@@ -3647,33 +3708,52 @@ void int8_linear_m1(
     }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    if (convrot) {
-        launch_quantize_int8_rowwise_convrot64_kernel(
-            input.data(),
-            q_scratch.data(),
-            x_scales.data(),
-            M,
-            K,
-            group_size,
-            input_dtype_code,
-            false,
-            /*act_code=*/0,
-            0,
-            /*act_weight=*/nullptr,
-            /*act_eps=*/0.0f,
-            stream);
-    } else {
-        launch_quantize_int8_rowwise_kernel(
-            input.data(),
-            q_scratch.data(),
-            x_scales.data(),
-            M,
-            K,
-            input_dtype_code,
-            false,
-            0,
-            stream);
+    check_gemv_residual(residual, residual_scale, N, output_dtype_code);
+    const bool has_residual = residual.data() && residual.size() > 0;
+    if (has_residual && (K & 3) != 0) {
+        throw std::runtime_error("INT8 M=1 linear fused residual requires K divisible by 4");
     }
+    if (convrot) {
+        const bool has_act_weight = act_weight.data() && act_weight.size() > 0;
+        if (has_act_weight) {
+            if (act_weight.shape(0) != K) {
+                throw std::runtime_error("INT8 M=1 linear act weight shape mismatch");
+            }
+            if (map_dtype_to_code(act_weight.dtype()) != input_dtype_code) {
+                throw std::runtime_error("INT8 M=1 linear act weight must match the input dtype");
+            }
+        }
+        launch_int8_gemv_convrot_fused_kernel(
+            input.data(),
+            input_dtype_code,
+            act_code,
+            has_act_weight ? act_weight.data() : nullptr,
+            act_eps,
+            weight.data(),
+            weight_scales.data(),
+            has_bias ? bias.data() : nullptr,
+            has_bias,
+            bias_dtype_code,
+            output.data(),
+            output_dtype_code,
+            N,
+            K,
+            static_cast<int64_t>(weight_scales.size()),
+            has_residual ? residual.data() : nullptr,
+            has_residual ? residual_scale.data() : nullptr,
+            stream);
+        return;
+    }
+    launch_quantize_int8_rowwise_kernel(
+        input.data(),
+        q_scratch.data(),
+        x_scales.data(),
+        M,
+        K,
+        input_dtype_code,
+        false,
+        0,
+        stream);
     launch_int8_gemv_dequant_kernel(
         q_scratch.data(),
         weight.data(),
@@ -3688,6 +3768,8 @@ void int8_linear_m1(
         has_bias,
         output_dtype_code,
         bias_dtype_code,
+        has_residual ? residual.data() : nullptr,
+        has_residual ? residual_scale.data() : nullptr,
         stream);
 }
 
@@ -4260,11 +4342,13 @@ NB_MODULE(_C, m) {
           nb::arg("weight_scales"),
           nb::arg("bias"),
           nb::arg("output"),
+          nb::arg("residual"),
+          nb::arg("residual_scale"),
           nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"));
 
     m.def("int8_linear_m1", &int8_linear_m1,
-          "M=1 INT8 linear: activation quantization followed by GEMV/dequant",
+          "M=1 INT8 linear: activation quantization (fused into the ConvRot GEMV) followed by GEMV/dequant",
           nb::arg("input"),
           nb::arg("q_scratch"),
           nb::arg("x_scales"),
@@ -4272,9 +4356,14 @@ NB_MODULE(_C, m) {
           nb::arg("weight_scales"),
           nb::arg("bias"),
           nb::arg("output"),
+          nb::arg("residual"),
+          nb::arg("residual_scale"),
           nb::arg("output_dtype_code"),
           nb::arg("convrot"),
           nb::arg("group_size"),
+          nb::arg("act_code"),
+          nb::arg("act_weight"),
+          nb::arg("act_eps"),
           nb::arg("stream_ptr"));
 
     m.def("dequantize_int8_simple", &dequantize_int8_simple,

@@ -41,9 +41,18 @@ inline void* get_stream_workspace(size_t size, cudaStream_t stream) {
     auto& workspace = workspaces[{device, reinterpret_cast<uintptr_t>(stream)}];
     if (workspace.size >= size) return workspace.data;
 
-    if (workspace.data != nullptr && cudaFree(workspace.data) != cudaSuccess) return nullptr;
+    // The first stream-K GEMM on a stream may run inside a CUDA graph capture on
+    // that stream; cudaMalloc/cudaFree are legal there only in relaxed mode.
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    if (workspace.data != nullptr && cudaFree(workspace.data) != cudaSuccess) {
+        cudaThreadExchangeStreamCaptureMode(&mode);
+        return nullptr;
+    }
     workspace = {};
-    if (cudaMalloc(&workspace.data, size) != cudaSuccess) return nullptr;
+    const cudaError_t err = cudaMalloc(&workspace.data, size);
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    if (err != cudaSuccess) return nullptr;
     workspace.size = size;
     return workspace.data;
 }
