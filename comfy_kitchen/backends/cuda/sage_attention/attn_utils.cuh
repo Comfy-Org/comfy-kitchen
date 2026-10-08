@@ -46,6 +46,7 @@ enum class MaskMode {
   kCausal = 1,
   kCustom = 2,
   kCustomKey = 3,
+  kPreparedKey = 4,
 };
 
 enum class DataType {
@@ -290,6 +291,66 @@ compute_int_qk(const smem_t<swizzle_mode, stride> &smem_Q,
   offset_Q -= (2 * num_tiles_qk_inner);
   offset_K -= (2 * num_tiles_qk_inner);
 }
+template <uint32_t num_warps_q, uint32_t num_warps_k, uint32_t num_tiles_q,
+          uint32_t num_tiles_k, uint32_t num_tiles_qk_inner,
+          SwizzleMode swizzle_mode, uint32_t stride, DataType DTypeQK>
+__device__ __forceinline__ void compute_int_qk_cached(
+    const smem_t<swizzle_mode, stride> &smem_K, int32_t RS[][num_tiles_k][8],
+    uint32_t RQ[][num_tiles_qk_inner][4], uint32_t &offset_K) {
+  uint32_t RK[4];
+
+  // the first iteration, mma mode is kInit
+#pragma unroll
+  for (uint32_t iter = 0; iter < 1; iter++) {
+#pragma unroll
+    for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+      // load RK
+      smem_K.ldmatrix_m8n8x4(offset_K, RK);
+      offset_K = smem_K.advance_offset_by_row<16>(offset_K);
+
+      // mma
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+        if constexpr (DTypeQK == DataType::kInt8) {
+          mma::mma_sync_m16n16k32_row_col_s8s8s32<mma::MMAMode::kInit>(
+              RS[fq][fk], RQ[fq][iter], RK);
+        } else if constexpr (DTypeQK == DataType::kInt4) {
+          mma::mma_sync_m16n16k64_row_col_s4s4s32<mma::MMAMode::kInit>(
+              RS[fq][fk], RQ[fq][iter], RK);
+        }
+      }
+    }
+    offset_K = smem_K.advance_offset_by_column<2>(
+        offset_K - (num_tiles_k * 16 * stride), iter);
+  }
+
+  // following iteration, mma mode is kInplace
+#pragma unroll
+  for (uint32_t iter = 1; iter < num_tiles_qk_inner; iter++) {
+#pragma unroll
+    for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+      // load RK
+      smem_K.ldmatrix_m8n8x4(offset_K, RK);
+      offset_K = smem_K.advance_offset_by_row<16>(offset_K);
+
+      // mma
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+        if constexpr (DTypeQK == DataType::kInt8) {
+          mma::mma_sync_m16n16k32_row_col_s8s8s32<mma::MMAMode::kInplaceUpdate>(
+              RS[fq][fk], RQ[fq][iter], RK);
+        } else if constexpr (DTypeQK == DataType::kInt4) {
+          mma::mma_sync_m16n16k64_row_col_s4s4s32<mma::MMAMode::kInplaceUpdate>(
+              RS[fq][fk], RQ[fq][iter], RK);
+        }
+      }
+    }
+    offset_K = smem_K.advance_offset_by_column<2>(
+        offset_K - (num_tiles_k * 16 * stride), iter);
+  }
+
+  offset_K -= (2 * num_tiles_qk_inner);
+}
 #pragma nv_diag_default 174
 
 // for case when num_tiles_qk_inner = 1
@@ -454,6 +515,27 @@ __device__ __forceinline__ void apply_custom_key_mask(
                             ? fmaf(RS[fq][fk][k], score_scale,
                                    bias[value] * math::log2e)
                             : -50000.0f;
+      }
+    }
+  }
+}
+
+template <uint32_t num_tiles_q, uint32_t num_tiles_k>
+__device__ __forceinline__ void apply_prepared_key_mask(
+    const uint32_t K_idx_lane_base, float RS[][num_tiles_k][8],
+    const float *mask, const float score_scale) {
+#pragma unroll
+  for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+    const float2 bias_lo = *reinterpret_cast<const float2 *>(mask + K_idx_lane_base + fk * 16);
+    const float2 bias_hi = *reinterpret_cast<const float2 *>(mask + K_idx_lane_base + fk * 16 + 8);
+    const float bias[4] = {bias_lo.x * math::log2e, bias_lo.y * math::log2e,
+                           bias_hi.x * math::log2e, bias_hi.y * math::log2e};
+#pragma unroll
+    for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+      for (uint32_t k = 0; k < 8; k++) {
+        RS[fq][fk][k] = fmaf(RS[fq][fk][k], score_scale,
+                             bias[(k >> 2) * 2 + (k & 1)]);
       }
     }
   }
@@ -630,11 +712,11 @@ pack_scaled_exp2_u8x4(const int32_t a, const int32_t b, const int32_t c,
 }
 
 template <uint32_t num_tiles_q, uint32_t num_tiles_k,
-          uint32_t num_tiles_v>
+          uint32_t num_tiles_v, bool add_bias = false>
 __device__ __forceinline__ void update_mdo_i32_u8(
     int32_t RS[][num_tiles_k][8], float RO[][num_tiles_v][8],
     float m[][2], float d[][2], const float sm_scale, const float exp_offset_value,
-    uint32_t RS_u8[][num_tiles_k / 2][4]) {
+    uint32_t RS_u8[][num_tiles_k / 2][4], const float tile_bias = 0.0f) {
 #pragma unroll
   for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
@@ -651,6 +733,84 @@ __device__ __forceinline__ void update_mdo_i32_u8(
 
       float m_temp = fmaf(__int2float_rz(m_temp_i32), sm_scale,
                           -exp_offset_value);
+      if constexpr (add_bias) m_temp += tile_bias;
+      m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x1));
+      m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x2));
+      const float tile_m = m_temp;
+      m[fq][k] = max(m_prev, tile_m);
+
+      const float smaller_scale =
+          math::ptx_exp2(-fabsf(m_prev - tile_m));
+      const float o_scale = m_prev < tile_m ? smaller_scale : 1.0f;
+      const float tile_scale = tile_m < m_prev ? smaller_scale : 1.0f;
+      d[fq][k] *= o_scale;
+#pragma unroll
+      for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
+        RO[fq][fv][k * 2] *= o_scale;
+        RO[fq][fv][k * 2 + 1] *= o_scale;
+        RO[fq][fv][k * 2 + 4] *= o_scale;
+        RO[fq][fv][k * 2 + 5] *= o_scale;
+      }
+
+      const float negative_m = add_bias ? tile_bias - tile_m : -tile_m;
+#pragma unroll
+      for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++) {
+        const PackedU8RowSum probabilities_0 = pack_scaled_exp2_u8x4(
+            RS[fq][fk * 2][k * 2], RS[fq][fk * 2][k * 2 + 1],
+            RS[fq][fk * 2][k * 2 + 4], RS[fq][fk * 2][k * 2 + 5],
+            sm_scale, negative_m);
+        const PackedU8RowSum probabilities_1 = pack_scaled_exp2_u8x4(
+            RS[fq][fk * 2 + 1][k * 2],
+            RS[fq][fk * 2 + 1][k * 2 + 1],
+            RS[fq][fk * 2 + 1][k * 2 + 4],
+            RS[fq][fk * 2 + 1][k * 2 + 5], sm_scale, negative_m);
+        RS_u8[fq][fk][k] = probabilities_0.probabilities;
+        RS_u8[fq][fk][k + 2] = probabilities_1.probabilities;
+        d[fq][k] += probabilities_0.denominator * tile_scale;
+        d[fq][k] += probabilities_1.denominator * tile_scale;
+      }
+      // QK scores are dead after packing. Reuse their registers for the
+      // probability scale rather than extending the kernel's live state.
+      RS[fq][0][k] = __float_as_int(tile_scale);
+    }
+  }
+}
+
+// Pack each group immediately after exponentiation so masked attention does
+// not keep an entire tile of FP32 probabilities live through the P*V setup.
+// Sum the same rounded probabilities used by P*V, as in the unmasked path.
+__device__ __forceinline__ PackedU8RowSum
+pack_exp2_u8x4(const float a, const float b, const float c,
+              const float d, const float negative_m) {
+  const float pa = math::ptx_exp2(a + negative_m);
+  const float pb = math::ptx_exp2(b + negative_m);
+  const float pc = math::ptx_exp2(c + negative_m);
+  const float pd = math::ptx_exp2(d + negative_m);
+  const uint32_t packed = mma::pack_u8x4(pa, pb, pc, pd);
+  return {packed, __uint2float_rn(__dp4a(packed, 0x01010101u, 0u))};
+}
+
+template <uint32_t num_tiles_q, uint32_t num_tiles_k,
+          uint32_t num_tiles_v>
+__device__ __forceinline__ void update_mdo_f32_u8(
+    float RS[][num_tiles_k][8], float RO[][num_tiles_v][8],
+    float m[][2], float d[][2], const float exp_offset_value,
+    uint32_t RS_u8[][num_tiles_k / 2][4]) {
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+    for (uint32_t k = 0; k < 2; k++) {
+      const float m_prev = m[fq][k];
+      float m_temp_f32 = -50000.0f;
+#pragma unroll
+      for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+        const float m_local =
+            max(max(RS[fq][fk][k * 2], RS[fq][fk][k * 2 + 1]),
+                max(RS[fq][fk][k * 2 + 4], RS[fq][fk][k * 2 + 5]));
+        m_temp_f32 = max(m_temp_f32, m_local);
+      }
+
+      float m_temp = m_temp_f32 - exp_offset_value;
       m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x1));
       m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x2));
       const float tile_m = m_temp;
@@ -672,15 +832,15 @@ __device__ __forceinline__ void update_mdo_i32_u8(
       const float negative_m = -tile_m;
 #pragma unroll
       for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++) {
-        const PackedU8RowSum probabilities_0 = pack_scaled_exp2_u8x4(
+        const PackedU8RowSum probabilities_0 = pack_exp2_u8x4(
             RS[fq][fk * 2][k * 2], RS[fq][fk * 2][k * 2 + 1],
             RS[fq][fk * 2][k * 2 + 4], RS[fq][fk * 2][k * 2 + 5],
-            sm_scale, negative_m);
-        const PackedU8RowSum probabilities_1 = pack_scaled_exp2_u8x4(
+            negative_m);
+        const PackedU8RowSum probabilities_1 = pack_exp2_u8x4(
             RS[fq][fk * 2 + 1][k * 2],
             RS[fq][fk * 2 + 1][k * 2 + 1],
             RS[fq][fk * 2 + 1][k * 2 + 4],
-            RS[fq][fk * 2 + 1][k * 2 + 5], sm_scale, negative_m);
+            RS[fq][fk * 2 + 1][k * 2 + 5], negative_m);
         RS_u8[fq][fk][k] = probabilities_0.probabilities;
         RS_u8[fq][fk][k + 2] = probabilities_1.probabilities;
         d[fq][k] += probabilities_0.denominator * tile_scale;
@@ -688,7 +848,7 @@ __device__ __forceinline__ void update_mdo_i32_u8(
       }
       // QK scores are dead after packing. Reuse their registers for the
       // probability scale rather than extending the kernel's live state.
-      RS[fq][0][k] = __float_as_int(tile_scale);
+      RS[fq][0][k] = tile_scale;
     }
   }
 }
@@ -979,14 +1139,66 @@ __device__ __forceinline__ void normalize_d(float RO[][num_tiles_v][8],
   }
 }
 
+
+// Use eight-column fragments so the next Tensor Core dot product can overlap
+// conversion and FP32 accumulation of the previous fragment. Each output keeps
+// its four integer dot products followed by the original FP32 FMA.
+template <SwizzleMode swizzle_mode, uint32_t stride>
+__device__ __forceinline__ void
+compute_int8_sv_pipelined_n8(const smem_t<swizzle_mode, stride> &smem_V,
+                             int32_t RS_scale[][8][8], uint32_t RS_u8[][4][4],
+                             float RO[][8][8]) {
+
+  auto multiply = [&](uint32_t frag, int32_t partial[4]) {
+    uint32_t RV[4][2];
+#pragma unroll
+    for (uint32_t fk = 0; fk < 4; ++fk) {
+      const uint32_t offset = smem_V.get_permuted_offset(
+          get_lane_id() % 8 + frag * 8, (get_lane_id() / 8) % 2 + fk * 2);
+      smem_V.ldmatrix_m8n8x2(offset, RV[fk]);
+      if (fk == 0)
+        mma::mma_sync_m16n8k32_row_col_u8s8s32<mma::MMAMode::kInit>(
+            partial, RS_u8[0][fk], RV[fk]);
+      else
+        mma::mma_sync_m16n8k32_row_col_u8s8s32<mma::MMAMode::kInplaceUpdate>(
+            partial, RS_u8[0][fk], RV[fk]);
+    }
+  };
+  auto accumulate = [&](uint32_t frag, const int32_t partial[4]) {
+#pragma unroll
+    for (uint32_t k = 0; k < 4; ++k) {
+      float &output = RO[0][frag / 2][(frag % 2) * 4 + k];
+      output = fmaf(__int2float_rn(partial[k]),
+                    __int_as_float(RS_scale[0][0][k / 2]), output);
+    }
+  };
+
+  int32_t partial[2][4];
+  multiply(0, partial[0]);
+#pragma unroll
+  for (uint32_t frag = 1; frag < 16; ++frag) {
+    multiply(frag, partial[frag % 2]);
+    accumulate(frag - 1, partial[(frag - 1) % 2]);
+  }
+  accumulate(15, partial[1]);
+}
+
 template <uint32_t num_warps_q, uint32_t num_warps_k, uint32_t num_tiles_q,
           uint32_t num_tiles_k, uint32_t num_tiles_v, SwizzleMode swizzle_mode,
-          uint32_t stride, typename DTypeSVAccum>
+          uint32_t stride, bool pipeline_pv = true, typename DTypeSVAccum>
 __device__ __forceinline__ void
 compute_int8_sv(const smem_t<swizzle_mode, stride> &smem_V,
                 int32_t RS_scale[][num_tiles_k][8],
                 uint32_t RS_u8[][num_tiles_k / 2][4],
                 DTypeSVAccum RO[][num_tiles_v][8]) {
+#if __CUDA_ARCH__ == 890
+  if constexpr (pipeline_pv && num_warps_q == 4 && num_warps_k == 1 && num_tiles_q == 1 &&
+                num_tiles_k == 8 && num_tiles_v == 8) {
+    compute_int8_sv_pipelined_n8<swizzle_mode, stride>(smem_V, RS_scale, RS_u8, RO);
+    return;
+  }
+#endif
+
   static_assert(std::is_same<DTypeSVAccum, float>::value);
   uint32_t smem_V_row_base = get_lane_id() % 8 + (get_lane_id() / 16) * 8;
   uint32_t smem_V_col_base = (get_lane_id() / 8) % 2;

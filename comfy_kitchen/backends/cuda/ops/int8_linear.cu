@@ -665,6 +665,48 @@ __global__ void int8_gemv_dequant_warp_kernel(
     }
 }
 
+template<int WARPS, typename OutputType, typename BiasType>
+__global__ void int8_gemv2_dequant_warp_kernel(
+    const int8_t* __restrict__ x,
+    const int8_t* __restrict__ w,
+    const float* __restrict__ x_scales,
+    const float* __restrict__ weight_scales,
+    const BiasType* __restrict__ bias,
+    OutputType* __restrict__ output,
+    int n,
+    int k,
+    int scale_size)
+{
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * WARPS + threadIdx.x / 32;
+    if (row >= n) {
+        return;
+    }
+    const int4* xv0 = reinterpret_cast<const int4*>(x);
+    const int4* xv1 = reinterpret_cast<const int4*>(x + k);
+    const int4* wv = reinterpret_cast<const int4*>(w + static_cast<int64_t>(row) * k);
+    int a0 = 0, a1 = 0;
+    for (int i = lane; i < k / 16; i += 32) {
+        const int4 weights = wv[i], x0 = xv0[i], x1 = xv1[i];
+        a0 = __dp4a(x0.x, weights.x, a0);
+        a1 = __dp4a(x1.x, weights.x, a1);
+        a0 = __dp4a(x0.y, weights.y, a0);
+        a1 = __dp4a(x1.y, weights.y, a1);
+        a0 = __dp4a(x0.z, weights.z, a0);
+        a1 = __dp4a(x1.z, weights.z, a1);
+        a0 = __dp4a(x0.w, weights.w, a0);
+        a1 = __dp4a(x1.w, weights.w, a1);
+    }
+    a0 = warp_reduce_sum_i32(a0);
+    a1 = warp_reduce_sum_i32(a1);
+    if (lane == 0) {
+        const float scale = weight_scales[scale_size == 1 ? 0 : row];
+        const float b = bias ? to_float(bias[row]) : 0.0f;
+        output[row] = from_float<OutputType>(float(a0) * x_scales[0] * scale + b);
+        output[n + row] = from_float<OutputType>(float(a1) * x_scales[1] * scale + b);
+    }
+}
+
 template<typename OutputType>
 __global__ void dequantize_int8_simple_kernel(
     const int8_t* __restrict__ input,
@@ -933,6 +975,52 @@ __global__ void dequantize_int8_convrot_groups64_kernel(
 
     if (active) {
         convrot_fht_stage64_store<64, OutputType>(buf1, output + row_offset + group_col, lane);
+    }
+}
+
+// 64-wide ConvRot groups: 16 threads per group, four elements each, the same butterfly one stage
+// shorter. Groups are flattened across rows so narrow rows (K = 128: two groups) still fill a block.
+template<int GROUPS_PER_BLOCK, typename OutputType>
+__global__ void dequantize_int8_convrot_g64_kernel(
+    const int8_t* __restrict__ q,
+    const float* __restrict__ scales,
+    OutputType* __restrict__ output,
+    int64_t num_groups,
+    int K,
+    int scale_size)
+{
+    constexpr int kGroup = 64;
+    constexpr int kGroupThreads = kGroup / 4;
+    __shared__ float smem[GROUPS_PER_BLOCK * 2 * kGroup];
+
+    const int sub = threadIdx.x / kGroupThreads;
+    const int lane = threadIdx.x % kGroupThreads;
+    const int64_t group = static_cast<int64_t>(blockIdx.x) * GROUPS_PER_BLOCK + sub;
+    const bool active = group < num_groups;
+    const int groups_per_row = K / kGroup;
+    const int64_t row = active ? group / groups_per_row : 0;
+    const int64_t offset = row * K + (active ? group % groups_per_row : 0) * kGroup;
+    const float scale = scales[scale_size == 1 ? 0 : row];
+
+    float* buf0 = smem + sub * (2 * kGroup);
+    float* buf1 = buf0 + kGroup;
+
+    const int base = lane * 4;
+    const float x0 = active ? static_cast<float>(q[offset + base]) * scale : 0.0f;
+    const float x1 = active ? static_cast<float>(q[offset + base + 1]) * scale : 0.0f;
+    const float x2 = active ? static_cast<float>(q[offset + base + 2]) * scale : 0.0f;
+    const float x3 = active ? static_cast<float>(q[offset + base + 3]) * scale : 0.0f;
+    buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
+    buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
+    buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
+    buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+    __syncthreads();
+
+    convrot_fht_stage64<4>(buf1, buf0, lane);
+    __syncthreads();
+
+    if (active) {
+        convrot_fht_stage64_store<16, OutputType>(buf0, output + offset, lane);
     }
 }
 
@@ -1716,6 +1804,7 @@ void launch_int8_gemv_dequant_kernel(
     const void* weight_scales,
     const void* bias,
     void* output,
+    int64_t num_rows,
     int64_t num_cols,
     int64_t K,
     int64_t weight_scale_size,
@@ -1733,6 +1822,35 @@ void launch_int8_gemv_dequant_kernel(
     }
     if (weight_scale_size != 1 && weight_scale_size != num_cols) {
         throw std::runtime_error("INT8 GEMV weight scale must be scalar or per-output-channel");
+    }
+
+    if (num_rows == 2) {
+        if (K % 16 != 0) {
+            throw std::runtime_error("INT8 two-row GEMV requires K divisible by 16");
+        }
+        DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+            auto launch = [&](auto bias_ptr) {
+                using BiasType = std::remove_cv_t<std::remove_pointer_t<decltype(bias_ptr)>>;
+                constexpr int warps = 8;
+                comfy::int8_gemv2_dequant_warp_kernel<warps, OutputType, BiasType>
+                    <<<(num_cols + warps - 1) / warps, warps * 32, 0, stream>>>(
+                        static_cast<const int8_t*>(input), static_cast<const int8_t*>(weight),
+                        static_cast<const float*>(x_scales), static_cast<const float*>(weight_scales),
+                        bias_ptr, static_cast<OutputType*>(output), num_cols, K, weight_scale_size);
+            };
+            if (has_bias) {
+                DISPATCH_FP_DTYPE(bias_dtype_code, BiasType, [&] {
+                    launch(static_cast<const BiasType*>(bias));
+                });
+            } else {
+                launch(static_cast<const float*>(nullptr));
+            }
+        });
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            throw std::runtime_error(std::string("CUDA INT8 two-row GEMV failed: ") + cudaGetErrorString(err));
+        }
+        return;
     }
 
     DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
@@ -1930,17 +2048,36 @@ void launch_dequantize_int8_convrot_kernel(
     if (num_rows == 0 || num_cols == 0) {
         return;
     }
-    if (group_size != comfy::kConvRotGroup) {
-        throw std::runtime_error("convrot dequant kernel only supports group_size 256");
+    if (group_size != comfy::kConvRotGroup && group_size != 64) {
+        throw std::runtime_error("convrot dequant kernel only supports group_size 64 or 256");
     }
-    if (num_cols % comfy::kConvRotGroup != 0) {
-        throw std::runtime_error("convrot dequant kernel requires K divisible by 256");
+    if (num_cols % group_size != 0) {
+        throw std::runtime_error("convrot dequant kernel requires K divisible by group_size");
     }
     if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("convrot dequant kernel only supports K <= INT_MAX");
     }
     if (scale_size != 1 && scale_size != num_rows) {
         throw std::runtime_error("convrot dequant scale must be scalar or per-row");
+    }
+
+    if (group_size == 64) {
+        const int64_t num_groups = num_rows * (num_cols / 64);
+        const unsigned int blocks = static_cast<unsigned int>((num_groups + 15) / 16);
+        DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+            comfy::dequantize_int8_convrot_g64_kernel<16, OutputType><<<blocks, 16 * 16, 0, stream>>>(
+                static_cast<const int8_t*>(input),
+                static_cast<const float*>(scales),
+                static_cast<OutputType*>(output),
+                num_groups,
+                static_cast<int>(num_cols),
+                static_cast<int>(scale_size));
+        });
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            throw std::runtime_error(std::string("CUDA INT8 convrot dequantization failed: ") + cudaGetErrorString(err));
+        }
+        return;
     }
 
     if (num_cols >= comfy::kConvRotGroup) {

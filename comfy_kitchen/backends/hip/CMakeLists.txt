@@ -179,7 +179,9 @@ set(HIP_SOURCES
     ops/gemv_awq.hip
     ops/svdquant_w4a4.hip
     ops/w4a8_dequant.hip
+    ops/w4a8_gemv.hip
     ops/w4a8_requant.hip
+    ops/gated_delta.hip
 )
 
 set(CPP_SOURCES

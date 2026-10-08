@@ -14,8 +14,10 @@ else:
 _MINIMUM_CAPABILITY = (8, 0)
 
 
-def is_available(device: torch.device | int | None = None) -> bool:
-    """Return whether flash attention decode is available on this GPU."""
+def is_available(device: torch.device | None = None) -> bool:
+    """Return whether flash attention decode is available on the requested device."""
+    if device is not None and device.type != "cuda":
+        return False
     if not torch.cuda.is_available():
         return False
     if _hip_backend is not None:
@@ -35,8 +37,8 @@ def is_available(device: torch.device | int | None = None) -> bool:
     return torch.cuda.get_device_capability(device) >= _MINIMUM_CAPABILITY
 
 
-def _num_splits(batch_heads: int, kv_capacity: int, multiprocessors: int) -> int:
-    blocks = (kv_capacity + 127) // 128
+def _num_splits(batch_heads: int, kv_capacity: int, multiprocessors: int, block_n: int) -> int:
+    blocks = (kv_capacity + block_n - 1) // block_n
     max_splits = min(32, multiprocessors * 2, blocks)
     best = 0.0
     efficiencies = []
@@ -58,7 +60,10 @@ def _num_splits(batch_heads: int, kv_capacity: int, multiprocessors: int) -> int
 def flash_attention_decode(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_lengths: torch.Tensor
 ) -> torch.Tensor:
-    """Decode attention for BF16 [batch, length, heads, 128] tensors."""
+    """Decode BF16 [batch, 1, heads, head_dim] queries over a fixed KV cache.
+
+    CUDA and HIP support head dimensions 128 and 256.
+    """
     batch, _, query_heads, head_dim = q.shape
     _, kv_capacity, kv_heads, _ = k.shape
     if not is_available(q.device):
@@ -80,6 +85,7 @@ def flash_attention_decode(
         batch * kv_heads,
         kv_capacity,
         torch.cuda.get_device_properties(q.device).multi_processor_count,
+        64 if head_dim == 256 and _hip_backend is None else 128,
     )
     softmax_lse = torch.empty(batch * kv_heads * groups, dtype=torch.float32, device=q.device)
     if num_splits > 1:

@@ -66,6 +66,23 @@ __forceinline__ __device__ T wave_reduce_sum(T v) {
     return v;
 }
 
+// Four int8 products accumulated into a 32-bit sum, the operands packed one per
+// byte. RDNA3/4 spell it v_dot4_i32_iu8 with both operands marked signed; RDNA2
+// has the older v_dot4c_i32_i8 under a different builtin, and the host pass has
+// neither, so both fall back to the arithmetic the instruction performs.
+__forceinline__ __device__ int dot4_i8(int a, int b, int c) {
+#if defined(COMFY_HAS_WMMA)
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#else
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        c += static_cast<int>(static_cast<int8_t>((a >> (i * 8)) & 0xFF)) *
+             static_cast<int>(static_cast<int8_t>((b >> (i * 8)) & 0xFF));
+    }
+    return c;
+#endif
+}
+
 __forceinline__ __device__ int frag_row(int lane) { return lane % 16; }
 
 // Row of accumulator element `e` for this lane; the column is lane % 16. The two

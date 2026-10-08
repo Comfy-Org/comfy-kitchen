@@ -13,6 +13,8 @@ from .conftest import (
     assert_values_close,
     cuda_backend_available,
     get_capable_backends,
+    rel_err,
+    requires_cuda_backend,
 )
 
 COMFYUI_NVIDIA_16_SERIES = (
@@ -344,6 +346,29 @@ class TestTensorWiseINT8Layout:
             dq = qt.dequantize()
             assert dq.dtype == dtype
             assert dq.shape == w.shape
+
+    @pytest.mark.parametrize("group_size", [64, 256])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    def test_convrot_dequant_kernel_matches_float32_reference(self, seed, group_size, dtype):
+        """The fused ConvRot dequant rotates in float32 and rounds to the output dtype once, like the
+        float32 rotate-then-cast reference, including rows whose scale is near zero."""
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
+        from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_weight
+
+        rows, k = 257, 3 * group_size
+        q = torch.randint(-127, 128, (rows, k), device="cuda", dtype=torch.int8)
+        scale = torch.rand(rows, 1, device="cuda") * 1e-2
+        scale[0] = 1e-9
+        assert cuda._should_use_convrot_dequant_kernel(q, k, group_size)
+        out = cuda.dequantize_int8_convrot_weight_dtype(q, scale, group_size, cuda.DTYPE_TO_CODE[dtype])
+        h = _build_hadamard(group_size, device="cuda", dtype=torch.float32)
+        ref = _rotate_weight(q.float() * scale, h, group_size)
+        assert out.dtype == dtype
+        # a single rounding of a value within float32 summation-order tolerance of the reference
+        tol = 8 * torch.finfo(torch.float32).eps * ref.abs().amax(dim=1, keepdim=True)
+        lo, hi = (ref - tol).to(dtype).float(), (ref + tol).to(dtype).float()
+        assert ((out.float() >= lo) & (out.float() <= hi)).all()
 
     def test_weight_roundtrip_error(self, seed):
         """Roundtrip error stays within INT8 quantization tolerance."""
@@ -920,3 +945,49 @@ class TestTensorWisePublicAPI:
 
         assert out.shape == (17, 1)
         assert out.dtype == torch.bfloat16
+
+
+class TestBandedStreamK:
+    """The banded stream-K tile order must give bit-identical output to the identity order."""
+
+    @staticmethod
+    def _run(m, n, k, config):
+        from comfy_kitchen.backends import cuda as cuda_backend
+        c, wrap = cuda_backend._C, cuda_backend._wrap_for_dlpack
+        stream = torch.cuda.current_stream().cuda_stream
+        a = torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda")
+        b = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+        xs = torch.rand(m, 1, device="cuda") * 0.01
+        ws = torch.rand(n, device="cuda") * 0.01
+        outs = {}
+        for cfg in config:
+            out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+            if cfg == "auto":
+                empty = cuda_backend._empty_cuda_tensor(a.device, torch.bfloat16)
+                assert c.cutlass_int8_dequant(wrap(a), wrap(b), wrap(xs), wrap(ws), wrap(empty), wrap(out), 2, stream)
+            else:
+                assert c.cutlass_int8_dequant_config(wrap(a), wrap(b), wrap(xs), wrap(ws), wrap(out), 2, cfg, stream)
+            outs[cfg] = out
+        ref = (a.float() @ b.float().t()) * xs * ws
+        return outs, ref
+
+    # 37 / 74 N tiles: a short last band; M has enough tiles that both configs band
+    @requires_cuda_backend
+    @pytest.mark.parametrize("m,n,k", [(9600, 9408, 128), (19100, 9408, 128)])
+    def test_bands_match_identity_order(self, m, n, k, seed):
+        outs, ref = self._run(m, n, k, config=[0, 12, 13])
+        assert torch.equal(outs[12], outs[0]) and torch.equal(outs[13], outs[0])
+        assert rel_err(outs[0].float(), ref) < 1e-2
+
+    @requires_cuda_backend
+    def test_large_activation_reroutes_to_banded_stream_k(self):
+        """Config 0 shapes move to banded stream-K past the L2-derived activation size."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+        pick = cuda_backend._C.cutlass_int8_selected_config
+        l2 = torch.cuda.get_device_properties(0).L2_cache_size
+        threshold = max(l2 * 3 // 4, 48 << 20)
+        n, k = 16384, 8192
+        assert pick(2048, n, k) in (0, 1)                 # 16.8 MB: below any threshold
+        m = 9216                                          # 75.5 MB
+        assert pick(m, n, k) == (13 if m * k > threshold else 0)
+        assert pick(4096, 24576, 32768) in (0, 1)         # fewer M tiles than N: no reroute

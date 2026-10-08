@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
 __all__ = [
+    "with_out_param",
     "DivisibleBy",
     "ExactDims",
     "FunctionConstraints",
@@ -350,3 +351,9 @@ def na3d_common_call_rule(kwargs):
             "kernel_size", f"entries must be positive, got {list(kernel_size)}"
         )
     return ValidationResult.ok()
+
+
+def with_out_param(base: FunctionConstraints) -> FunctionConstraints:
+    """The ``_out`` form of an op: base constraints plus a 5-D ``out`` in x's dtypes."""
+    out = ParamConstraint(dtypes=base.params["x"].dtypes, shape_rules=(ExactDims(5),))
+    return replace(base, params={**base.params, "out": out})

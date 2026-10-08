@@ -4,6 +4,7 @@ from .allocation import set_allocation_context
 from .backends import cuda as _cuda_backend
 
 # Import backends to trigger auto-registration
+from .backends import ascend as _ascend_backend  # noqa: F401
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
@@ -208,10 +209,12 @@ def sol_attn(
     )
 
 
-def sol_attn_is_available(device: torch.device | int | None = None) -> bool:
+def sol_attn_is_available(device: torch.device | None = None) -> bool:
     """Whether the compiled Sol-Attn kernels can run on ``device``: the CUDA
     backend on sm_80+, or the HIP backend on a GPU with matrix cores. The
     per-call rules (bf16/fp16, head_dim 128, matching q/k/v) still apply."""
+    if device is not None and device.type != "cuda":
+        return False
     if not torch.cuda.is_available():
         return False
     if getattr(torch.version, "hip", None):
@@ -317,14 +320,19 @@ def fp16_conv3d(
     bias: torch.Tensor | None = None,
     residual: torch.Tensor | None = None,
     stride: int | tuple[int, int, int] = 1,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """fp16-accumulate conv3d with bias and residual fused into the epilogue.
 
     x [N, C, D, H, W], weight [K, C, T, R, S], zero padding only. Same opt-in
-    numerics as fp16_linear; shapes the kernel declines run torch's conv.
+    numerics as fp16_linear; shapes the kernel declines run torch's conv. x and out may be
+    NDHWC-ordered views of larger tensors, so a tiled conv needs no per-tile copies.
     """
     stride = [stride] * 3 if isinstance(stride, int) else list(stride)
-    return torch.ops.comfy_kitchen.fp16_conv3d(x, weight, bias, residual, stride)
+    if out is None:
+        return torch.ops.comfy_kitchen.fp16_conv3d(x, weight, bias, residual, stride)
+    torch.ops.comfy_kitchen.fp16_conv3d_out(x, weight, bias, residual, stride, out)
+    return out
 
 
 def group_norm_silu_pad3d(
@@ -335,13 +343,22 @@ def group_norm_silu_pad3d(
     eps: float = 1e-6,
     pad: tuple[int, int, int, int, int] = (0, 0, 0, 0, 0),
     silu: bool = True,
+    zero_pad: bool = False,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-frame GroupNorm, SiLU and causal conv3d padding in one pass.
 
-    x [B, C, T, H, W]; pad is (left, right, top, bottom, front): reflect in space,
-    zero frames in front. weight=None is pad-only. Output is channels_last_3d.
+    x [B, C, T, H, W]; pad is (left, right, top, bottom, front). The spatial border
+    reflects, or is zero when zero_pad; the front frames are always zero. weight=None is
+    pad-only. Output is channels_last_3d, into out when given, which is returned; for a
+    batch of one out may be a frame-offset view, leaving room for a caller's real halo.
     """
-    return torch.ops.comfy_kitchen.group_norm_silu_pad3d(x, weight, bias, num_groups, eps, list(pad), silu)
+    if out is None:
+        return torch.ops.comfy_kitchen.group_norm_silu_pad3d(
+            x, weight, bias, num_groups, eps, list(pad), silu, zero_pad)
+    torch.ops.comfy_kitchen.group_norm_silu_pad3d_out(
+        x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, out)
+    return out
 
 
 def rms_adaln(

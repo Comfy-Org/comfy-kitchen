@@ -21,41 +21,43 @@ namespace flash {
 #define COMFY_FLASH_PARAM
 #endif
 
-using Traits = Flash_fwd_kernel_traits<128, 64, 128, 4, false, false, cutlass::bfloat16_t>;
+template<int HeadDim>
+using DecodeTraits = Flash_fwd_kernel_traits<HeadDim, 64, HeadDim == 128 ? 128 : 64, 4, false, false, cutlass::bfloat16_t>;
 
-template<bool Split>
+template<typename Traits, bool Split>
 __global__ void flash_decode_kernel(COMFY_FLASH_PARAM const Flash_fwd_params params) {
     COMFY_FLASH_BODY((compute_attn_splitkv<Traits, false, false, false, false, true, false, Split, false>(params));)
 }
 
-template<int LogMaxSplits>
+template<typename Traits, int LogMaxSplits>
 __global__ void flash_decode_combine_kernel(COMFY_FLASH_PARAM const Flash_fwd_params params) {
     COMFY_FLASH_BODY((combine_attn_seqk_parallel<Traits, 4, LogMaxSplits, true>(params));)
 }
 
+template<typename Traits>
 void launch_flash_decode_typed(Flash_fwd_params& params, cudaStream_t stream) {
     constexpr size_t smem_size = Traits::kSmemSize;
     dim3 grid(1, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
 
     if (params.num_splits > 1) {
-        auto kernel = &flash_decode_kernel<true>;
+        auto kernel = &flash_decode_kernel<Traits, true>;
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         kernel<<<grid, Traits::kNThreads, smem_size, stream>>>(params);
 
         const dim3 combine_grid((params.b * params.h * params.seqlen_q + 3) / 4);
         if (params.num_splits <= 2) {
-            flash_decode_combine_kernel<1><<<combine_grid, Traits::kNThreads, 0, stream>>>(params);
+            flash_decode_combine_kernel<Traits, 1><<<combine_grid, Traits::kNThreads, 0, stream>>>(params);
         } else if (params.num_splits <= 4) {
-            flash_decode_combine_kernel<2><<<combine_grid, Traits::kNThreads, 0, stream>>>(params);
+            flash_decode_combine_kernel<Traits, 2><<<combine_grid, Traits::kNThreads, 0, stream>>>(params);
         } else if (params.num_splits <= 8) {
-            flash_decode_combine_kernel<3><<<combine_grid, Traits::kNThreads, 0, stream>>>(params);
+            flash_decode_combine_kernel<Traits, 3><<<combine_grid, Traits::kNThreads, 0, stream>>>(params);
         } else if (params.num_splits <= 16) {
-            flash_decode_combine_kernel<4><<<combine_grid, Traits::kNThreads, 0, stream>>>(params);
+            flash_decode_combine_kernel<Traits, 4><<<combine_grid, Traits::kNThreads, 0, stream>>>(params);
         } else {
-            flash_decode_combine_kernel<5><<<combine_grid, Traits::kNThreads, 0, stream>>>(params);
+            flash_decode_combine_kernel<Traits, 5><<<combine_grid, Traits::kNThreads, 0, stream>>>(params);
         }
     } else {
-        auto kernel = &flash_decode_kernel<false>;
+        auto kernel = &flash_decode_kernel<Traits, false>;
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         kernel<<<grid, Traits::kNThreads, smem_size, stream>>>(params);
     }
@@ -67,7 +69,7 @@ void launch_flash_decode_typed(Flash_fwd_params& params, cudaStream_t stream) {
 extern "C" void launch_flash_decode(
     const void* q, const void* k, const void* v, const int* kv_lengths,
     void* output, float* softmax_lse, float* softmax_lse_accum, float* output_accum,
-    int batch, int query_length, int heads, int kv_capacity, int num_splits,
+    int batch, int query_length, int heads, int head_dim, int kv_capacity, int num_splits,
     int64_t q_batch_stride, int64_t q_row_stride, int64_t q_head_stride,
     int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
     cudaStream_t stream) {
@@ -94,14 +96,18 @@ extern "C" void launch_flash_decode(
     params.h_h_k_ratio = 1;
     params.seqlen_q = query_length;
     params.seqlen_k = kv_capacity;
-    params.d = params.d_rounded = 128;
+    params.d = params.d_rounded = head_dim;
     params.seqlen_q_rounded = ((query_length + 127) / 128) * 128;
     params.total_q = batch * query_length;
-    params.scale_softmax = 0.08838834764831845f;
-    params.scale_softmax_log2 = 0.12751743082871335f;
+    params.scale_softmax = head_dim == 128 ? 0.08838834764831845f : 0.0625f;
+    params.scale_softmax_log2 = head_dim == 128 ? 0.12751743082871335f : 0.09016844005556021f;
     params.window_size_left = params.window_size_right = -1;
     params.num_splits = num_splits;
     params.is_bf16 = true;
 
-    flash::launch_flash_decode_typed(params, stream);
+    if (head_dim == 128) {
+        flash::launch_flash_decode_typed<flash::DecodeTraits<128>>(params, stream);
+    } else {
+        flash::launch_flash_decode_typed<flash::DecodeTraits<256>>(params, stream);
+    }
 }
