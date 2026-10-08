@@ -13,7 +13,7 @@ pip install -e ".[dev]"                   # editable + dev deps (pytest, pytest-
 pip install -e . --no-build-isolation -v  # faster iterative rebuilds
 ```
 
-- `COMFY_KITCHEN_BUILD_HIP=1` adds the HIP extension to a CUDA build; `COMFY_KITCHEN_BUILD_NO_HIP=1` / `--no-hip` suppresses it; `--no-cuda` builds a CPU-only (pure-Python) wheel.
+- `COMFY_KITCHEN_BUILD_HIP=1` adds the HIP extension to a CUDA build; `COMFY_KITCHEN_BUILD_NO_HIP=1` / `--no-hip` suppresses it; `--no-cuda` builds a CPU-only (pure-Python) wheel unless HIP is explicitly requested (`--hip` / `COMFY_KITCHEN_BUILD_HIP=1`), in which case the HIP extension is still built.
 - `COMFY_HIP_ARCHS` / `COMFY_CUDA_ARCHS` (or `--hip-archs=`/`--cuda-archs=` via `setup.py build_ext`) pin the GPU targets; under build isolation no GPU is visible, so the build falls back to the full manifest of targets.
 - `COMFY_KITCHEN_DISABLE_HIP=1` removes the HIP backend from dispatch at runtime.
 - Build options such as `--no-cuda`, `--hip`, `--debug-build`, `--lineinfo` require invoking `setup.py` directly (they are not `pip install` flags). See `README.md` for the full option table.
@@ -23,7 +23,7 @@ pip install -e . --no-build-isolation -v  # faster iterative rebuilds
 CI (`.github/workflows/build-wheels.yml`, jobs `test_*`) installs the CPU-only wheel plus CPU PyTorch, then runs exactly:
 
 ```bash
-ruff check .                       # lint (also the format checker; config in pyproject.toml)
+ruff check .                       # lint only (config in pyproject.toml); formatting is `ruff format`, not run in CI
 python -m pytest tests/ -v --tb=short   # or just `pytest` — config in pytest.ini
 ```
 
