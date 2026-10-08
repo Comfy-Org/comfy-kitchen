@@ -10,6 +10,9 @@
 
 #include "flash.h"
 #include "flash_fwd_kernel.h"
+#include "../prefetch_ring.h"
+
+__device__ PrefetchRingState* g_flash_prefetch_ring = nullptr;
 
 namespace flash {
 
@@ -27,9 +30,23 @@ namespace flash {
 using Traits128 = Flash_fwd_kernel_traits<128, 64, 128, 4, false, false, cutlass::bfloat16_t>;
 using Traits256 = Flash_fwd_kernel_traits<256, 64, 64, 4, false, false, cutlass::bfloat16_t>;
 
+// Ring consumption: the K and V rows of (bidb, kv head) up to seqused_k were read by the
+// CTAs of that kv head, so one CTA (split 0, m_block 0, first group head) credits them once
+// its own pass is done. Only when the host listed the cache in the ring (credits bit).
+template<bool Split>
+__device__ __forceinline__ void flash_decode_credit_kv(const Flash_fwd_params& params) {
+    PrefetchRingState* ring = g_flash_prefetch_ring;
+    if (ring == nullptr || !(ring->credits & PREFETCH_RING_CREDIT_KV)) return;
+    const int bidb = Split ? blockIdx.z / params.h : blockIdx.y;
+    const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
+    if (blockIdx.x != 0 || (Split && blockIdx.y != 0) || bidh % params.h_h_k_ratio != 0 || threadIdx.x != 0) return;
+    prefetch_ring_consume_device(ring, static_cast<uint64_t>(params.seqused_k[bidb]) * params.d * 2 * sizeof(cutlass::bfloat16_t));
+}
+
 template<typename Traits, bool Is_causal, bool Split>
 __global__ void flash_decode_kernel(COMFY_FLASH_PARAM const Flash_fwd_params params) {
     COMFY_FLASH_BODY((compute_attn_splitkv<Traits, Is_causal, false, false, false, true, false, Split, false>(params));)
+    COMFY_FLASH_BODY((flash_decode_credit_kv<Split>(params));)
 }
 
 template<typename Traits, int LogMaxSplits>
@@ -98,6 +115,7 @@ template<typename Traits, bool Is_causal>
 __global__ void flash_decode_fused_combine_kernel(COMFY_FLASH_PARAM const Flash_fwd_params params, int* __restrict__ counters) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     compute_attn_splitkv<Traits, Is_causal, false, false, false, true, false, true, false>(params);
+    flash_decode_credit_kv<true>(params);
 
     __shared__ int s_last;
     __threadfence();
@@ -168,6 +186,10 @@ void launch_flash_decode_typed(Flash_fwd_params& params, int* combine_counters, 
 }
 
 } // namespace flash
+
+extern "C" void set_flash_prefetch_ring_state(PrefetchRingState* state) {
+    cudaMemcpyToSymbol(g_flash_prefetch_ring, &state, sizeof(state));
+}
 
 static flash::Flash_fwd_params decode_params(
     const void* q, const void* k, const void* v, const int* kv_lengths,

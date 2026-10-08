@@ -6,6 +6,7 @@
 #include "utils.cuh"
 #include "dtype_dispatch.cuh"
 #include "input_act_codes.h"
+#include "../prefetch_ring.h"
 #include <cooperative_groups.h>
 
 #include <algorithm>
@@ -125,6 +126,32 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
     }
     return v;
 }
+
+// Weights are read once per step: evict_first keeps the demand stream from
+// displacing lines the prefetch ring already landed (see w4a8_gemm.cu).
+// L2 cache hints are sm_80+; Turing takes plain read-only loads.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+__device__ __forceinline__ uint64_t l2_evict_first_policy() { return 0; }
+__device__ __forceinline__ int ld_evict_first(const int* p, uint64_t) { return __ldg(p); }
+__device__ __forceinline__ int4 ld_evict_first(const int4* p, uint64_t) { return __ldg(p); }
+#else
+__device__ __forceinline__ uint64_t l2_evict_first_policy() {
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
+    return policy;
+}
+__device__ __forceinline__ int ld_evict_first(const int* p, uint64_t policy) {
+    int v;
+    asm volatile("ld.global.nc.L2::cache_hint.b32 %0, [%1], %2;\n" : "=r"(v) : "l"(p), "l"(policy));
+    return v;
+}
+__device__ __forceinline__ int4 ld_evict_first(const int4* p, uint64_t policy) {
+    int4 v;
+    asm volatile("ld.global.nc.L2::cache_hint.v4.b32 {%0, %1, %2, %3}, [%4], %5;\n"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p), "l"(policy));
+    return v;
+}
+#endif
 
 __device__ __forceinline__ int warp_reduce_sum_i32(int v) {
     for (int offset = kThreadsPerWarp / 2; offset > 0; offset >>= 1) {
@@ -644,49 +671,58 @@ __global__ void int8_gemv_dequant_warp_kernel(
     int weight_scale_size,
     bool has_bias,
     const OutputType* __restrict__ residual,
-    const OutputType* __restrict__ residual_scale)
+    const OutputType* __restrict__ residual_scale,
+    PrefetchRingState* ring)
 {
     const int lane = threadIdx.x & (kThreadsPerWarp - 1);
     const int warp = threadIdx.x >> 5;
-    const int n = static_cast<int>(blockIdx.x) * WARPS_PER_BLOCK + warp;
-    if (n >= N) {
-        return;
-    }
+    const int n0 = static_cast<int>(blockIdx.x) * WARPS_PER_BLOCK;
+    const int n = n0 + warp;
+    if (n < N) {
+        const int8_t* __restrict__ w_row = weight + static_cast<int64_t>(n) * K;
+        const uint64_t policy = l2_evict_first_policy();
 
-    const int8_t* __restrict__ w_row = weight + static_cast<int64_t>(n) * K;
-    int acc = 0;
-    if constexpr (Vec16) {
-        const int4* __restrict__ x16 = reinterpret_cast<const int4*>(x);
-        const int4* __restrict__ w16 = reinterpret_cast<const int4*>(w_row);
-        const int K16 = K >> 4;
-        for (int i = lane; i < K16; i += kThreadsPerWarp) {
-            const int4 w = w16[i];
-            const int4 xv = x16[i];
-            acc = __dp4a(xv.x, w.x, acc);
-            acc = __dp4a(xv.y, w.y, acc);
-            acc = __dp4a(xv.z, w.z, acc);
-            acc = __dp4a(xv.w, w.w, acc);
+        int acc = 0;
+        if constexpr (Vec16) {
+            const int4* __restrict__ x16 = reinterpret_cast<const int4*>(x);
+            const int4* __restrict__ w16 = reinterpret_cast<const int4*>(w_row);
+            const int K16 = K >> 4;
+            for (int i = lane; i < K16; i += kThreadsPerWarp) {
+                const int4 w = ld_evict_first(w16 + i, policy);
+                const int4 xv = x16[i];
+                acc = __dp4a(xv.x, w.x, acc);
+                acc = __dp4a(xv.y, w.y, acc);
+                acc = __dp4a(xv.z, w.z, acc);
+                acc = __dp4a(xv.w, w.w, acc);
+            }
+        } else {
+            const int* __restrict__ x4 = reinterpret_cast<const int*>(x);
+            const int* __restrict__ w4 = reinterpret_cast<const int*>(w_row);
+            for (int k4 = lane; k4 < (K >> 2); k4 += kThreadsPerWarp) {
+                acc = __dp4a(x4[k4], ld_evict_first(w4 + k4, policy), acc);
+            }
         }
-    } else {
-        const int* __restrict__ x4 = reinterpret_cast<const int*>(x);
-        const int* __restrict__ w4 = reinterpret_cast<const int*>(w_row);
-        for (int k4 = lane; k4 < (K >> 2); k4 += kThreadsPerWarp) {
-            acc = __dp4a(x4[k4], w4[k4], acc);
+        acc = warp_reduce_sum_i32(acc);
+
+        if (lane == 0) {
+            const float weight_scale = weight_scales[weight_scale_size == 1 ? 0 : n];
+            float value = static_cast<float>(acc) * x_scales[0] * weight_scale;
+            if (has_bias) {
+                value += to_float(bias[n]);
+            }
+            if (residual != nullptr) {
+                const float linear = to_float(from_float<OutputType>(value));
+                value = to_float(residual[n])
+                    + to_float(residual_scale[n]) * linear;
+            }
+            output[n] = from_float<OutputType>(value);
         }
     }
-    acc = warp_reduce_sum_i32(acc);
-
-    if (lane == 0) {
-        const float weight_scale = weight_scales[weight_scale_size == 1 ? 0 : n];
-        float value = static_cast<float>(acc) * x_scales[0] * weight_scale;
-        if (has_bias) {
-            value += to_float(bias[n]);
-        }
-        if (residual != nullptr) {
-            const float linear = to_float(from_float<OutputType>(value));
-            value = to_float(residual[n]) + to_float(residual_scale[n]) * linear;
-        }
-        output[n] = from_float<OutputType>(value);
+    // Ring consumption: one add per block for the rows its warps read (the
+    // weight is recorded as one region; blocks walk it in address order).
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        prefetch_ring_consume_device(ring, static_cast<uint64_t>(min(WARPS_PER_BLOCK, N - n0)) * K);
     }
 }
 
@@ -700,35 +736,41 @@ __global__ void int8_gemv2_dequant_warp_kernel(
     OutputType* __restrict__ output,
     int n,
     int k,
-    int scale_size)
+    int scale_size,
+    PrefetchRingState* ring)
 {
     const int lane = threadIdx.x % 32;
-    const int row = blockIdx.x * WARPS + threadIdx.x / 32;
-    if (row >= n) {
-        return;
+    const int row0 = blockIdx.x * WARPS;
+    const int row = row0 + threadIdx.x / 32;
+    if (row < n) {
+        const int4* xv0 = reinterpret_cast<const int4*>(x);
+        const int4* xv1 = reinterpret_cast<const int4*>(x + k);
+        const int4* wv = reinterpret_cast<const int4*>(w + static_cast<int64_t>(row) * k);
+        const uint64_t policy = l2_evict_first_policy();
+        int a0 = 0, a1 = 0;
+        for (int i = lane; i < k / 16; i += 32) {
+            const int4 weights = ld_evict_first(wv + i, policy), x0 = xv0[i], x1 = xv1[i];
+            a0 = __dp4a(x0.x, weights.x, a0);
+            a1 = __dp4a(x1.x, weights.x, a1);
+            a0 = __dp4a(x0.y, weights.y, a0);
+            a1 = __dp4a(x1.y, weights.y, a1);
+            a0 = __dp4a(x0.z, weights.z, a0);
+            a1 = __dp4a(x1.z, weights.z, a1);
+            a0 = __dp4a(x0.w, weights.w, a0);
+            a1 = __dp4a(x1.w, weights.w, a1);
+        }
+        a0 = warp_reduce_sum_i32(a0);
+        a1 = warp_reduce_sum_i32(a1);
+        if (lane == 0) {
+            const float scale = weight_scales[scale_size == 1 ? 0 : row];
+            const float b = bias ? to_float(bias[row]) : 0.0f;
+            output[row] = from_float<OutputType>(float(a0) * x_scales[0] * scale + b);
+            output[n + row] = from_float<OutputType>(float(a1) * x_scales[1] * scale + b);
+        }
     }
-    const int4* xv0 = reinterpret_cast<const int4*>(x);
-    const int4* xv1 = reinterpret_cast<const int4*>(x + k);
-    const int4* wv = reinterpret_cast<const int4*>(w + static_cast<int64_t>(row) * k);
-    int a0 = 0, a1 = 0;
-    for (int i = lane; i < k / 16; i += 32) {
-        const int4 weights = wv[i], x0 = xv0[i], x1 = xv1[i];
-        a0 = __dp4a(x0.x, weights.x, a0);
-        a1 = __dp4a(x1.x, weights.x, a1);
-        a0 = __dp4a(x0.y, weights.y, a0);
-        a1 = __dp4a(x1.y, weights.y, a1);
-        a0 = __dp4a(x0.z, weights.z, a0);
-        a1 = __dp4a(x1.z, weights.z, a1);
-        a0 = __dp4a(x0.w, weights.w, a0);
-        a1 = __dp4a(x1.w, weights.w, a1);
-    }
-    a0 = warp_reduce_sum_i32(a0);
-    a1 = warp_reduce_sum_i32(a1);
-    if (lane == 0) {
-        const float scale = weight_scales[scale_size == 1 ? 0 : row];
-        const float b = bias ? to_float(bias[row]) : 0.0f;
-        output[row] = from_float<OutputType>(float(a0) * x_scales[0] * scale + b);
-        output[n + row] = from_float<OutputType>(float(a1) * x_scales[1] * scale + b);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        prefetch_ring_consume_device(ring, static_cast<uint64_t>(min(WARPS, n - row0)) * k);
     }
 }
 
@@ -1382,7 +1424,8 @@ __global__ void __launch_bounds__(kFusedGemvThreads) int8_gemv_convrot_fused_ker
     int weight_scale_size,
     bool has_bias,
     const OutputType* __restrict__ residual,
-    const OutputType* __restrict__ residual_scale)
+    const OutputType* __restrict__ residual_scale,
+    PrefetchRingState* ring)
 {
     constexpr int kWarps = kFusedGemvThreads / kThreadsPerWarp;
     extern __shared__ float smem[];
@@ -1396,6 +1439,7 @@ __global__ void __launch_bounds__(kFusedGemvThreads) int8_gemv_convrot_fused_ker
     const int lane = threadIdx.x & (kThreadsPerWarp - 1);
     const int warp = threadIdx.x >> 5;
     const int K16 = K >> 4;
+    const uint64_t policy = l2_evict_first_policy();
 
     const float x_scale = convrot64_quantize_row<InputType, kFusedGemvThreads, false, ACT>(
         x, q_smem, K, 0, 0, act_weight, act_eps, row_buf, tmp, warp_smem, &block_smem);
@@ -1410,7 +1454,7 @@ __global__ void __launch_bounds__(kFusedGemvThreads) int8_gemv_convrot_fused_ker
             int acc = 0;
             #pragma unroll 4
             for (int i = lane; i < K16; i += kThreadsPerWarp) {
-                const int4 w = w16[i];
+                const int4 w = ld_evict_first(w16 + i, policy);
                 const int4 xv = x16[i];
                 acc = __dp4a(xv.x, w.x, acc);
                 acc = __dp4a(xv.y, w.y, acc);
@@ -1430,6 +1474,11 @@ __global__ void __launch_bounds__(kFusedGemvThreads) int8_gemv_convrot_fused_ker
                 }
                 output[n] = from_float<OutputType>(value);
             }
+        }
+        // one ring add per column group once every warp has read its row
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            prefetch_ring_consume_device(ring, static_cast<uint64_t>(min(kFusedGemvCols, N - n0)) * K);
         }
     }
 }
@@ -2244,6 +2293,9 @@ void launch_int8_gemv_dequant_kernel(
     if (residual != nullptr && (num_rows != 1 || (K & 3) != 0)) {
         throw std::runtime_error("INT8 GEMV fused residual requires M == 1 and K divisible by 4");
     }
+    // Passed to the kernels as an argument: a __device__ global costs each block a
+    // dependent global load before its ring credit.
+    PrefetchRingState* ring = prefetch_ring_consumer_state();
     // 16-byte loads need K % 16 == 0 and 16-byte aligned activation and weight bases.
     const bool vec16 = (K & 15) == 0
         && (reinterpret_cast<uintptr_t>(input) & 15) == 0
@@ -2261,7 +2313,7 @@ void launch_int8_gemv_dequant_kernel(
                     <<<(num_cols + warps - 1) / warps, warps * 32, 0, stream>>>(
                         static_cast<const int8_t*>(input), static_cast<const int8_t*>(weight),
                         static_cast<const float*>(x_scales), static_cast<const float*>(weight_scales),
-                        bias_ptr, static_cast<OutputType*>(output), num_cols, K, weight_scale_size);
+                        bias_ptr, static_cast<OutputType*>(output), num_cols, K, weight_scale_size, ring);
             };
             if (has_bias) {
                 DISPATCH_FP_DTYPE(bias_dtype_code, BiasType, [&] {
@@ -2299,7 +2351,8 @@ void launch_int8_gemv_dequant_kernel(
                 static_cast<int>(weight_scale_size),
                 bias_flag,
                 static_cast<const OutputType*>(residual),
-                static_cast<const OutputType*>(residual_scale));
+                static_cast<const OutputType*>(residual_scale),
+                ring);
         };
         if (!has_bias) {
             if ((K & 3) == 0) {
@@ -2411,6 +2464,9 @@ void launch_int8_gemv_convrot_fused_kernel(
     const size_t smem_bytes =
         (static_cast<size_t>(K) + (comfy::kFusedGemvThreads / 64) * 2 * comfy::kConvRotGroup) * sizeof(float)
         + static_cast<size_t>(K);
+    // Passed to the kernels as an argument: a __device__ global costs each block a
+    // dependent global load before its ring credit.
+    PrefetchRingState* ring = prefetch_ring_consumer_state();
 
     DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
         DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
@@ -2436,7 +2492,8 @@ void launch_int8_gemv_convrot_fused_kernel(
                     static_cast<int>(weight_scale_size),
                     has_bias,
                     static_cast<const OutputType*>(residual),
-                    static_cast<const OutputType*>(residual_scale));
+                    static_cast<const OutputType*>(residual_scale),
+                    ring);
             };
             switch (act_code) {
                 case comfy::kActGeluTanh:

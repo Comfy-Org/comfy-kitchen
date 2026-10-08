@@ -24,6 +24,12 @@ from .flash_attention import is_available as flash_attention_decode_is_available
 from .flash_attention import flash_attention_decode_gqa, flash_attention_decode_gqa_is_available
 from .flash_attention import flash_attention_decode_tree_merge
 from .float_utils import from_blocked, swap_nibbles, to_blocked
+from .prefetch_ring import (
+    configure as configure_prefetch_ring,
+    disable as disable_prefetch_ring,
+    is_available as prefetch_ring_is_available,
+    start as start_prefetch_ring,
+)
 from .gated_delta import deltanet_conv_step, gated_delta_decode_fused
 from .gated_delta import is_available as gated_delta_decode_is_available
 from .gated_delta import deferred_is_available as gated_delta_deferred_is_available
@@ -94,6 +100,10 @@ __all__ = [
     "rms_rope_kv_decode_is_available",
     "w4a8_quantize_input",
     "w4a8_int8_linear_prequantized",
+    "configure_prefetch_ring",
+    "disable_prefetch_ring",
+    "prefetch_ring_is_available",
+    "start_prefetch_ring",
     "na2d",
     "na3d",
     "sol_attn",

@@ -17,6 +17,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/tuple.h>
 #include <cuda_runtime.h>
 #include <climits>
 #include <cstring>
@@ -25,8 +26,44 @@
 
 #include "cublaslt_runtime.h"
 #include "input_act_codes.h"
+#include "prefetch_ring.h"
 
 namespace nb = nanobind;
+
+bool prefetch_ring_available() {
+    return prefetch_ring_is_available();
+}
+
+void prefetch_ring_configure(
+    nb::ndarray<uint64_t, nb::ndim<2>, nb::device::cuda> regions,
+    int64_t count, uint64_t lookahead_bytes, uint64_t min_lead_bytes, uint32_t chunk_bytes, uint32_t credits, uintptr_t stream_ptr) {
+    if (regions.shape(1) != 3 || regions.stride(1) != 1 || regions.stride(0) != 3)
+        throw std::runtime_error("prefetch ring regions must be contiguous [capacity, 3]");
+    if (count < 0 || count > regions.shape(0) || count > INT_MAX)
+        throw std::runtime_error("prefetch ring count exceeds descriptor capacity");
+    if (!prefetch_ring_is_available())
+        throw std::runtime_error("prefetch ring requires an SM90 or newer CUDA device");
+    if (chunk_bytes == 0 || chunk_bytes % 16 != 0 || chunk_bytes > 98304)
+        throw std::runtime_error("prefetch ring chunk must be a multiple of 16 bytes up to 96 KiB");
+    if (lookahead_bytes < min_lead_bytes + chunk_bytes)
+        throw std::runtime_error("prefetch ring lookahead must cover the minimum lead plus one chunk");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_prefetch_ring_configure(regions.data(), static_cast<int>(count), lookahead_bytes, min_lead_bytes, chunk_bytes, credits, stream);
+}
+
+void prefetch_ring_disable(uintptr_t stream_ptr) {
+    launch_prefetch_ring_disable(reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void prefetch_ring_start(uintptr_t stream_ptr) {
+    launch_prefetch_ring_start(reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+std::tuple<uint64_t, uint64_t, uint32_t> prefetch_ring_counters() {
+    PrefetchRingState s;
+    prefetch_ring_read_counters(&s);
+    return {s.total, s.consumed, s.stalled};
+}
 
 // Helper: Map nanobind dtype to internal dtype code
 // Returns: 0=float32, 1=float16, 2=bfloat16, 3=uint8, 4=int8, 5=float8_e4m3fn, 6=float8_e5m2
@@ -4586,6 +4623,13 @@ bool deltanet_conv_deferred(
 
 NB_MODULE(_C, m) {
     m.doc() = "comfy_kitchen CUDA kernels - nanobind + DLPack interface (NO PyTorch C++ dependencies)";
+
+    m.def("prefetch_ring_available", &prefetch_ring_available);
+    m.def("prefetch_ring_configure", &prefetch_ring_configure,
+          nb::arg("regions"), nb::arg("count"), nb::arg("lookahead_bytes"), nb::arg("min_lead_bytes"), nb::arg("chunk_bytes"), nb::arg("credits"), nb::arg("stream_ptr"));
+    m.def("prefetch_ring_disable", &prefetch_ring_disable, nb::arg("stream_ptr"));
+    m.def("prefetch_ring_start", &prefetch_ring_start, nb::arg("stream_ptr"));
+    m.def("prefetch_ring_counters", &prefetch_ring_counters);
     
     m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8,
           "Quantize to FP8 using nanobind ndarrays",

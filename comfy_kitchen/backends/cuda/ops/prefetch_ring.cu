@@ -1,0 +1,348 @@
+#include <cuda_runtime.h>
+
+#include <cstdint>
+
+#include "../prefetch_ring.h"
+
+namespace {
+
+// Issuer geometry, measured on RTX 5090 / CUDA 13.0: one cp.async.bulk.prefetch.L2 issuer thread sustains
+// ~170 GB/s and self-throttles, 10 of them reach the DRAM ceiling (1.64-1.71
+// TB/s) with every line landing; from 14 on, requests are dropped. Prefetch
+// requests return no data to the SM, which is what makes them cheap for a
+// concurrently running L2-hitting GEMM: an ld-based issuer at the same rate
+// slows such a GEMM about twice as much.
+//
+// Requests are dropped once the aggregate issue rate into an idle bus exceeds
+// about 80% of the DRAM rate (RTX 5080 and 5090): 10 issuers
+// burst at 1.1-1.3 TB/s, which lands completely on a 1.79 TB/s part and loses a
+// third on a 0.96 TB/s one. A per-issuer pace derived from the device's memory
+// clock and bus width keeps the burst at kIssueRateFraction of the bus; the
+// hardware already throttles the issuers below that while demand traffic runs.
+// A W6A8 9B decoder with a 55 MiB ring on the 5080: 88-92% of the bus is 5% faster
+// than unpaced, 96-100% gives nothing, 75-80% starts skipping; the 5090 is flat
+// from 75% to 100% (+2.6% over unpaced).
+constexpr int kIssuers = 10;
+constexpr double kIssueRateFraction = 0.90;
+constexpr int kIssuerThreads = 32;
+constexpr int kIssueBatch = 8;   // chunks issued per consumed-snapshot
+constexpr int kPaceCreditChunks = 2;   // paced issuer may owe at most this many chunks after an oversleep
+PrefetchRingState* g_states[16] = {};
+bool g_unsupported[16] = {};   // pre-sm_90: no bulk prefetch, consumers keep ring == nullptr
+cudaStream_t g_issue_streams[16] = {};
+cudaEvent_t g_start_events[16] = {};
+int g_region_counts[16] = {};
+double g_issue_bytes_per_ns[16] = {};   // paced aggregate issue rate (0: unpaced)
+uint32_t g_pace_ns[16] = {};            // per-issuer nanoseconds per chunk at that rate
+constexpr size_t kMaxStagedRegionBytes = 48 * 1024;   // dynamic shared memory without opt-in
+
+__device__ uint64_t region_total(const PrefetchRegion* regions, int count) {
+    uint64_t total = 0;
+    for (int i = 0; i < count; ++i) total += regions[i].bytes;
+    return total;
+}
+
+__global__ void configure_prefetch_ring_kernel(
+    PrefetchRingState* ring, const PrefetchRegion* regions, int count,
+    uint64_t lookahead, uint64_t min_lead, uint32_t chunk, uint32_t credits) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    ring->regions = regions;
+    ring->count = count;
+    ring->total = region_total(regions, count);
+    ring->lookahead = lookahead;
+    ring->min_lead = min_lead;
+    ring->chunk = chunk;
+    ring->credits = credits;
+    ring->stalled = 0;
+    ring->consumed = 0;
+    ring->enabled = count > 0 && ring->total > 0;
+}
+
+__global__ void disable_prefetch_ring_kernel(PrefetchRingState* ring) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) ring->enabled = 0;
+}
+
+// Runs on the consumer stream at step start: every consumer of the previous
+// step (including W4A8 kernels outside the ring scope) has finished, so the
+// step's byte count restarts at zero. Re-arms a ring that was disabled
+// mid-step (a host sync must stop the issuer first; see prefetch_ring_disable).
+// Region byte counts may change between steps (KV rows grow), so the step
+// total is summed here from the descriptors the host updated on `stream`.
+__global__ void reset_prefetch_ring_kernel(PrefetchRingState* ring) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        ring->total = region_total(ring->regions, ring->count);
+        ring->consumed = 0;
+        ring->enabled = ring->count > 0 && ring->total > 0;
+    }
+}
+
+__device__ __forceinline__ uint64_t global_timer() {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// Cursor into the concatenated region list; advancing by n bytes walks regions.
+// The current region is cached in registers: the issue loop must not take a
+// dependent global load per chunk (see the issuer geometry note).
+//
+// Every CTA walks the whole stream (it prefetches only its own chunks), so the
+// CTA given `consumed` credits each self-crediting region once, as its walk
+// leaves the region on the first pass; the wrap-around past `total` is not
+// a read of this step.
+struct RingCursor {
+    const PrefetchRegion* regions;
+    int count;
+    int index;
+    uint64_t offset;
+    uint64_t position;   // walked bytes of the step's stream
+    uint64_t total;
+    uint64_t* consumed;  // nullptr: this CTA does not credit
+    const unsigned char* base;
+    uint64_t bytes;
+    uint64_t flags;
+
+    __device__ void load() {
+        const PrefetchRegion r = regions[index];
+        base = r.base;
+        bytes = r.bytes;
+        flags = r.flags;
+    }
+    __device__ void next_region() {
+        if (consumed != nullptr && (flags & PREFETCH_REGION_SELF_CREDIT) && position <= total)
+            atomicAdd(reinterpret_cast<unsigned long long*>(consumed), static_cast<unsigned long long>(bytes));
+        offset = 0;
+        if (++index == count) index = 0;
+        load();
+    }
+    __device__ void advance(uint64_t n) {
+        while (n != 0) {
+            const uint64_t avail = bytes - offset;
+            const uint64_t step = n < avail ? n : avail;
+            n -= step;
+            offset += step;
+            position += step;
+            if (offset == bytes) next_region();
+        }
+    }
+    // Request [cursor, cursor + n) into L2, one bulk prefetch per region piece.
+    // Bulk prefetch is sm_90+; prefetch_ring_is_available keeps older devices off the ring.
+    __device__ void prefetch(uint64_t n) {
+        while (n != 0) {
+            const uint64_t avail = bytes - offset;
+            const uint64_t step = n < avail ? n : avail;
+#if __CUDA_ARCH__ >= 900
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                         :: "l"(base + offset), "r"(static_cast<unsigned>(step)) : "memory");
+#endif
+            n -= step;
+            offset += step;
+            position += step;
+            if (offset == bytes) next_region();
+        }
+    }
+};
+
+// One thread per CTA; CTA i owns chunks i, i + kIssuers, ... of the step's byte
+// stream. A chunk is requested once it lies within `lookahead` of the consumed
+// position; chunks demand has already consumed are skipped. The kernel ends
+// after requesting `lookahead` bytes past the end of the step (the wrap-around
+// start of the next one). CTA 0 credits the self-crediting regions as it
+// passes them (RingCursor); that credit lands when the region is issued, a
+// little ahead of its read, which widens the window by at most the
+// self-crediting bytes within one lookahead.
+//
+// The loop decides from a snapshot of the racy counters that was loaded while
+// the previous chunk issued, so the fast path has no load latency in it; a
+// stale snapshot only delays a skip or a window advance by one chunk. The
+// counters are polled synchronously only while the window is exhausted.
+//
+// `consumed` only grows within a step; a snapshot below the previous one means
+// the next step's reset ran while this issuer was still finishing (its
+// wrap-around prefetch starts only once the last region is credited, which can
+// be right before the step ends). The step is over, so the issuer exits rather
+// than waiting against the new step's count and holding up the issuer queued
+// behind it.
+//
+// Every CTA walks every region descriptor, and the step's stream evicts the
+// descriptor array from L2, so with hundreds of small regions (norm scales,
+// gate projections) the walk became hundreds of DRAM-latency loads per CTA
+// per step. The CTA stages the descriptors in shared memory first when they
+// fit (`staged`).
+
+__global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(PrefetchRingState* ring, bool staged, uint32_t pace_ns) {
+    extern __shared__ PrefetchRegion staged_regions[];
+    const PrefetchRegion* regions = ring->regions;
+    if (staged) {
+        for (int i = threadIdx.x; i < ring->count; i += blockDim.x) staged_regions[i] = regions[i];
+        __syncthreads();
+        regions = staged_regions;
+    }
+    if (threadIdx.x != 0) return;
+    const uint64_t end = ring->total;
+    const uint64_t lookahead = ring->lookahead;
+    const uint64_t min_lead = ring->min_lead;
+    const uint64_t chunk = ring->chunk;
+    const uint64_t stride = chunk * gridDim.x;
+    volatile uint64_t* consumed_p = &ring->consumed;
+    volatile int* enabled_p = &ring->enabled;
+
+    uint64_t cursor = chunk * blockIdx.x;
+    RingCursor pos{regions, ring->count, 0, 0, 0, end, blockIdx.x == 0 ? &ring->consumed : nullptr, nullptr, 0, 0};
+    pos.load();
+    pos.advance(cursor);
+
+    uint64_t next_issue = 0;
+    uint64_t consumed = *consumed_p;
+    int enabled = *enabled_p;
+    while (cursor < end + lookahead && enabled) {
+        if (cursor + chunk <= consumed + min_lead) {
+            // Demand already read this, or will before the request could land: a request
+            // queued behind the ring's in-flight bytes completes after the GEMV has read
+            // and (evict_first) dropped the line, so it only costs DRAM. Jump to our
+            // first chunk at/after the floor and leave the gap to demand.
+            const uint64_t floor = consumed + min_lead;
+            const uint64_t skip = ((floor / chunk) * chunk - cursor + stride - 1) / stride * stride;
+            cursor += skip;
+            pos.advance(skip);
+            continue;
+        }
+        if (cursor >= consumed + lookahead) {
+            const uint64_t t0 = global_timer();
+            do {
+                __nanosleep(256);
+                const uint64_t now = *consumed_p;
+                enabled = *enabled_p && now >= consumed;
+                consumed = now;
+                if (!enabled) break;
+                if (global_timer() - t0 > 100000000ull) {   // 100 ms without consumption
+                    atomicAdd(&ring->stalled, 1u);
+                    enabled = 0;
+                    break;
+                }
+            } while (cursor >= consumed + lookahead);
+            continue;   // re-evaluate against the fresh snapshot
+        }
+        // Issue a batch of chunks against the current snapshot. The refreshed
+        // snapshot is loaded first and only read after the batch, so its L2
+        // round trip (which grows under GEMM hit traffic) overlaps the issues
+        // instead of gating each one: one dependent load per chunk capped the
+        // issuer at ~1.2 TB/s during GEMMs.
+        const uint64_t next_consumed = *consumed_p;
+        const int next_enabled = *enabled_p;
+        const uint64_t cap = consumed + lookahead < end + lookahead ? consumed + lookahead : end + lookahead;
+        for (int k = 0; k < kIssueBatch && cursor < cap; ++k) {
+            if (pace_ns != 0) {
+                // Token bucket: __nanosleep rounds up to ~1.1 us, so the schedule advances
+                // by pace_ns per chunk and an oversleep is repaid by the next chunks going
+                // out at once. Credit is capped at kPaceCreditChunks so a long credit wait
+                // cannot turn into a burst.
+                uint64_t now = global_timer();
+                if (next_issue + kPaceCreditChunks * pace_ns < now) next_issue = now - kPaceCreditChunks * pace_ns;
+                while (now < next_issue) {
+                    __nanosleep(next_issue - now < 1000 ? static_cast<unsigned>(next_issue - now) : 1000u);
+                    now = global_timer();
+                }
+                next_issue += pace_ns;
+            }
+            pos.prefetch(chunk);
+            pos.advance(stride - chunk);
+            cursor += stride;
+        }
+        enabled = next_enabled && next_consumed >= consumed;
+        consumed = next_consumed;
+    }
+}
+
+
+PrefetchRingState* current_state(int* device_out) {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16 || g_unsupported[device])
+        return nullptr;
+    if (g_states[device] == nullptr) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess || major < 9) {
+            g_unsupported[device] = true;
+            return nullptr;
+        }
+        if (cudaMalloc(&g_states[device], sizeof(PrefetchRingState)) != cudaSuccess)
+            return nullptr;
+        cudaMemset(g_states[device], 0, sizeof(PrefetchRingState));
+        cudaStreamCreateWithFlags(&g_issue_streams[device], cudaStreamNonBlocking);
+        cudaEventCreateWithFlags(&g_start_events[device], cudaEventDisableTiming);
+        // The issuer CTAs are resident for the whole step. An SM only hosts CTAs
+        // that agree on its L1/shared carveout, and a kernel with no shared
+        // memory would be configured for maximum L1, keeping the streamed GEMM
+        // (~46 KB dynamic shared per CTA) off those SMs for the whole step.
+        // Ask for the GEMM's configuration so the SMs stay shared.
+        cudaFuncSetAttribute(prefetch_ring_issuer_kernel,
+                             cudaFuncAttributePreferredSharedMemoryCarveout,
+                             cudaSharedmemCarveoutMaxShared);
+        int clock_khz = 0, bus_bits = 0;
+        cudaDeviceGetAttribute(&clock_khz, cudaDevAttrMemoryClockRate, device);
+        cudaDeviceGetAttribute(&bus_bits, cudaDevAttrGlobalMemoryBusWidth, device);
+        g_issue_bytes_per_ns[device] = kIssueRateFraction * clock_khz * 1e3 * 2.0 * bus_bits / 8.0 / 1e9;   // DDR: two transfers per clock
+        set_w4a8_prefetch_ring_state(g_states[device]);
+        set_flash_prefetch_ring_state(g_states[device]);
+        set_gated_delta_prefetch_ring_state(g_states[device]);
+    }
+    if (device_out) *device_out = device;
+    return g_states[device];
+}
+
+} // namespace
+
+// Also allocates the device's state, so consumer kernels captured into a CUDA graph
+// after this call bake the live pointer even when the ring is configured later.
+bool prefetch_ring_is_available() {
+    return current_state(nullptr) != nullptr;
+}
+
+// Lookup only: consumer launches may be under stream capture, where allocation is illegal.
+extern "C" PrefetchRingState* prefetch_ring_consumer_state() {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 16) return nullptr;
+    return g_states[device];
+}
+
+extern "C" void launch_prefetch_ring_configure(
+    const uint64_t* regions, int count, uint64_t lookahead, uint64_t min_lead, uint32_t chunk, uint32_t credits,
+    cudaStream_t stream) {
+    int device = 0;
+    PrefetchRingState* state = current_state(&device);
+    if (state == nullptr) return;
+    g_region_counts[device] = count;
+    g_pace_ns[device] = g_issue_bytes_per_ns[device] > 0
+        ? static_cast<uint32_t>(chunk * kIssuers / g_issue_bytes_per_ns[device]) : 0u;
+    configure_prefetch_ring_kernel<<<1, 1, 0, stream>>>(
+        state, reinterpret_cast<const PrefetchRegion*>(regions), count, lookahead, min_lead, chunk, credits);
+}
+
+extern "C" void launch_prefetch_ring_disable(cudaStream_t stream) {
+    PrefetchRingState* state = current_state(nullptr);
+    if (state != nullptr) disable_prefetch_ring_kernel<<<1, 1, 0, stream>>>(state);
+}
+
+// Start the issuer for one step on the ring's side stream, ordered after the
+// work already enqueued on `stream` (configure / previous step) and the
+// counter reset.
+extern "C" void launch_prefetch_ring_start(cudaStream_t stream) {
+    int device = 0;
+    PrefetchRingState* state = current_state(&device);
+    if (state == nullptr) return;
+    reset_prefetch_ring_kernel<<<1, 1, 0, stream>>>(state);
+    cudaEventRecord(g_start_events[device], stream);
+    cudaStreamWaitEvent(g_issue_streams[device], g_start_events[device], 0);
+    const size_t staged = g_region_counts[device] * sizeof(PrefetchRegion);
+    if (staged <= kMaxStagedRegionBytes)
+        prefetch_ring_issuer_kernel<<<kIssuers, kIssuerThreads, staged, g_issue_streams[device]>>>(state, true, g_pace_ns[device]);
+    else
+        prefetch_ring_issuer_kernel<<<kIssuers, kIssuerThreads, 0, g_issue_streams[device]>>>(state, false, g_pace_ns[device]);
+}
+
+// Synchronous copy of the state counters (tests).
+extern "C" void prefetch_ring_read_counters(PrefetchRingState* host) {
+    PrefetchRingState* state = current_state(nullptr);
+    *host = PrefetchRingState{};
+    if (state != nullptr) cudaMemcpy(host, state, sizeof(*host), cudaMemcpyDeviceToHost);
+}

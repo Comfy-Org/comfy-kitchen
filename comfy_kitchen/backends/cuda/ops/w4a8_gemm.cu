@@ -26,12 +26,15 @@
 
 #include "dtype_dispatch.cuh"
 #include "float_utils.cuh"
+#include "../prefetch_ring.h"
 
 // Grouped int4 -> int8 dequant for the int8-GEMM W4A8 path: out[n,k] =
 // round((q_u[n,k]-8) * s_rel[n, k/G]), q_u packed uint4 (even col=low nibble).
 // s_rel = per-group scale / per-channel scale (so the int8 range is used). The
 // per-channel scale is applied later in the int8 GEMM epilogue. Memory-bound.
 namespace {
+__device__ PrefetchRingState* g_w4a8_prefetch_ring = nullptr;
+
 // Per-group scale is fp32 or fp8 (e4m3). fp8 halves the scale metadata at a tiny
 // quality cost. uint8_t storage == e4m3 raw bits.
 template <typename ScaleT> __device__ __forceinline__ float load_scale(ScaleT v);
@@ -222,11 +225,17 @@ __device__ __forceinline__ void mma_m16n8k32_s8(
 #endif
 }
 
-// cp.async is sm_80+, like the mma above; the host launcher rejects older devices
-// so the pre-sm_80 passes only need to compile.
+// cp.async and L2 cache hints are sm_80+, like the mma above; the host launcher
+// rejects older devices so the pre-sm_80 passes only need to compile.
 __device__ __forceinline__ void cp_async16(uint32_t smem, const void* gptr) {
 #if __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem), "l"(gptr));
+    // Weights are read once per step: evict_first keeps the demand stream from
+    // displacing lines the prefetch ring already landed; ring-prefetched lines
+    // (inserted with the default priority) still hit.
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
+                 :: "r"(smem), "l"(gptr), "l"(policy));
 #endif
 }
 __device__ __forceinline__ void cp_async_commit() {
@@ -265,6 +274,7 @@ template <int N> __device__ __forceinline__ void cp_async_wait() {
 // residual (nullable): out = residual + residual_scale * out, with the linear rounded
 // to OutputT first, as the unfused addcmul sees it (int8_linear.cu's contract).
 constexpr int kStreamStages = 4;
+constexpr int kCreditRecords = 8;   // records between ring credits; rows is a multiple
 
 template <int BITS> struct StreamRecord {
     static constexpr int kBytes = 512 * BITS / 8 + 32;
@@ -323,6 +333,17 @@ void w4a8_codebook_mma_stream_kernel(
     const uint8_t* my_stages = stages + warp * S * R;
     const uint32_t st_s = static_cast<uint32_t>(__cvta_generic_to_shared(my_stages)) + lane * 16;
 
+    // Ring consumption: thread 0 credits the block's records every kCreditRecords
+    // of its own, as those loads complete (sibling warps stream in lockstep, so the
+    // error is < 1 block). Every block of the wave passes each step at about the
+    // same time, so the credited total tracks the weight's read front.
+    const uint64_t run_credit = static_cast<uint64_t>(
+        min(WarpsPerBlock, tiles - static_cast<int>(blockIdx.x) * WarpsPerBlock)) * kCreditRecords * R;
+    auto credit = [&](int i) {
+        if (threadIdx.x == 0 && ((i + 1) & (kCreditRecords - 1)) == 0)
+            prefetch_ring_consume_device(g_w4a8_prefetch_ring, run_credit);
+    };
+
     #pragma unroll
     for (int s = 0; s < S; ++s) {
         if (issuer) cp_async16(st_s + s * R, record(s));
@@ -380,6 +401,7 @@ void w4a8_codebook_mma_stream_kernel(
             cp_async_wait<S - 1>();
             __syncwarp();
             consume(j, i + j);
+            credit(i + j);
             __syncwarp();
             if (issuer) cp_async16(st_s + j * R, record(i + S + j));
             cp_async_commit();
@@ -389,6 +411,7 @@ void w4a8_codebook_mma_stream_kernel(
         cp_async_wait<S - 1>();
         __syncwarp();
         consume(i % S, i);
+        credit(i);
         __syncwarp();
         if (issuer && i + S < rows) cp_async16(st_s + (i % S) * R, record(i + S));
         cp_async_commit();
@@ -563,6 +586,10 @@ extern "C" void launch_unpack_w4a8_mma_weight(
         unpack_w4a8_mma_weight_kernel<4><<<grid, block, 0, stream>>>(
             static_cast<const uint8_t*>(packed), static_cast<int8_t*>(qdata), static_cast<uint8_t*>(s_rel),
             n_threads, tiles, splits, static_cast<int>(stream_rows), static_cast<int>(K));
+}
+
+extern "C" void set_w4a8_prefetch_ring_state(PrefetchRingState* state) {
+    cudaMemcpyToSymbol(g_w4a8_prefetch_ring, &state, sizeof(state));
 }
 
 // codebook: 16 floats (non-uniform levels) or nullptr for uniform (q-8); ignored at 6 bits.
