@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 
 #include "../prefetch_ring.h"
 
@@ -13,7 +14,15 @@ namespace {
 // requests return no data to the SM, which is what makes them cheap for a
 // concurrently running L2-hitting GEMM: an ld-based issuer at the same rate
 // slows such a GEMM about twice as much (contend3_bench.py).
+//
+// Requests are dropped once the aggregate issue rate into an idle bus exceeds
+// about 80% of the DRAM rate (pf_probe.py, RTX 5080 and 5090): 10 issuers
+// burst at 1.1-1.3 TB/s, which lands completely on a 1.79 TB/s part and loses a
+// third on a 0.96 TB/s one. A per-issuer pace derived from the device's memory
+// clock and bus width keeps the burst at kIssueRateFraction of the bus; the
+// hardware already throttles the issuers below that while demand traffic runs.
 constexpr int kIssuers = PREFETCH_RING_ISSUERS;
+constexpr double kIssueRateFraction = 0.75;
 #ifndef PREFETCH_RING_ISSUER_CARVEOUT
 #define PREFETCH_RING_ISSUER_CARVEOUT cudaSharedmemCarveoutMaxShared
 #endif
@@ -24,6 +33,8 @@ bool g_unsupported[16] = {};   // pre-sm_90: no bulk prefetch, consumers keep ri
 cudaStream_t g_issue_streams[16] = {};
 cudaEvent_t g_start_events[16] = {};
 int g_region_counts[16] = {};
+double g_issue_bytes_per_ns[16] = {};   // paced aggregate issue rate (0: unpaced)
+uint32_t g_pace_ns[16] = {};            // per-issuer nanoseconds per chunk at that rate
 constexpr size_t kMaxStagedRegionBytes = 48 * 1024;   // dynamic shared memory without opt-in
 
 __device__ uint64_t region_total(const PrefetchRegion* regions, int count) {
@@ -185,7 +196,7 @@ struct RingCursor {
 // per step. The CTA stages the descriptors in shared memory first when they
 // fit (`staged`).
 
-__global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(PrefetchRingState* ring, bool staged) {
+__global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(PrefetchRingState* ring, bool staged, uint32_t pace_ns) {
     extern __shared__ PrefetchRegion staged_regions[];
     const PrefetchRegion* regions = ring->regions;
     if (staged) {
@@ -226,6 +237,7 @@ __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(Pr
     pos.advance(cursor);
 
     uint64_t touched = 0, skipped = 0, waited = 0;
+    uint64_t next_issue = 0;
     uint64_t consumed = *consumed_p;
     int enabled = *enabled_p;
     while (cursor < end + lookahead && enabled) {
@@ -270,6 +282,16 @@ __global__ void __launch_bounds__(kIssuerThreads) prefetch_ring_issuer_kernel(Pr
         const uint64_t cap = consumed + lookahead < end + lookahead ? consumed + lookahead : end + lookahead;
         trace_record(ring, trace, trace_cap, consumed, cursor, PREFETCH_RING_TRACE_ISSUE);
         for (int k = 0; k < kIssueBatch && cursor < cap; ++k) {
+            if (pace_ns != 0) {
+                // No credit accumulates while the window was exhausted: a burst into an
+                // idle bus starts at once and then holds the paced rate.
+                uint64_t now = global_timer();
+                while (now < next_issue) {
+                    __nanosleep(next_issue - now < 1000 ? static_cast<unsigned>(next_issue - now) : 1000u);
+                    now = global_timer();
+                }
+                next_issue = now + pace_ns;
+            }
             pos.prefetch(chunk);
             touched += chunk;
             pos.advance(stride - chunk);
@@ -307,6 +329,10 @@ PrefetchRingState* current_state(int* device_out) {
         cudaFuncSetAttribute(prefetch_ring_issuer_kernel,
                              cudaFuncAttributePreferredSharedMemoryCarveout,
                              PREFETCH_RING_ISSUER_CARVEOUT);
+        int clock_khz = 0, bus_bits = 0;
+        cudaDeviceGetAttribute(&clock_khz, cudaDevAttrMemoryClockRate, device);
+        cudaDeviceGetAttribute(&bus_bits, cudaDevAttrGlobalMemoryBusWidth, device);
+        g_issue_bytes_per_ns[device] = kIssueRateFraction * clock_khz * 1e3 * 2.0 * bus_bits / 8.0 / 1e9;   // DDR: two transfers per clock
         set_w4a8_prefetch_ring_state(g_states[device]);
         set_flash_prefetch_ring_state(g_states[device]);
         set_gated_delta_prefetch_ring_state(g_states[device]);
@@ -337,6 +363,9 @@ extern "C" void launch_prefetch_ring_configure(
     PrefetchRingState* state = current_state(&device);
     if (state == nullptr) return;
     g_region_counts[device] = count;
+    g_pace_ns[device] = g_issue_bytes_per_ns[device] > 0
+        ? static_cast<uint32_t>(chunk * kIssuers / g_issue_bytes_per_ns[device]) : 0u;
+    if (const char* env = getenv("COMFY_PREFETCH_RING_PACE_NS")) g_pace_ns[device] = static_cast<uint32_t>(atoi(env));
     configure_prefetch_ring_kernel<<<1, 1, 0, stream>>>(
         state, reinterpret_cast<const PrefetchRegion*>(regions), count, lookahead, min_lead, chunk, credits);
 }
@@ -358,9 +387,9 @@ extern "C" void launch_prefetch_ring_start(cudaStream_t stream) {
     cudaStreamWaitEvent(g_issue_streams[device], g_start_events[device], 0);
     const size_t staged = g_region_counts[device] * sizeof(PrefetchRegion);
     if (staged <= kMaxStagedRegionBytes)
-        prefetch_ring_issuer_kernel<<<kIssuers, kIssuerThreads, staged, g_issue_streams[device]>>>(state, true);
+        prefetch_ring_issuer_kernel<<<kIssuers, kIssuerThreads, staged, g_issue_streams[device]>>>(state, true, g_pace_ns[device]);
     else
-        prefetch_ring_issuer_kernel<<<kIssuers, kIssuerThreads, 0, g_issue_streams[device]>>>(state, false);
+        prefetch_ring_issuer_kernel<<<kIssuers, kIssuerThreads, 0, g_issue_streams[device]>>>(state, false, g_pace_ns[device]);
 }
 
 extern "C" void launch_prefetch_ring_set_trace(uint64_t* trace, uint32_t cap, cudaStream_t stream) {
