@@ -3503,6 +3503,50 @@ def rms_rope_split_half_(
 
 
 
+def rms_rope_kv_decode_is_available(device: torch.device | int | None = None) -> bool:
+    if device is not None and torch.device(device).type != "cuda":
+        return False
+    return _EXT_AVAILABLE and _C is not None and hasattr(_C, "rms_rope_kv_decode")
+
+
+def rms_rope_kv_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    position: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode step over S rows: RMSNorm + split-half RoPE of q [B,S,Hq,D] and k [B,S,Hkv,D]
+    over the first rot dims of each normed head, with rope(k) and v [B,S,Hkv,D] written
+    into key_cache/value_cache [B,Hkv,cap,D] at row position[b, s] (int64 [B|1, S|1]).
+    Returns rope(q) [B,Hq,S,D] and rope(k) [B,Hkv,S,D]. freqs_cis is the
+    [1|B,1,1|S,rot/2,2,2] rotation."""
+    batch, rows, q_heads, head_dim = q.shape
+    q_out = torch.empty((batch, q_heads, rows, head_dim), dtype=q.dtype, device=q.device)
+    k_out = torch.empty((batch, k.shape[2], rows, head_dim), dtype=q.dtype, device=q.device)
+    _C.rms_rope_kv_decode(
+        _wrap_for_dlpack(q),
+        _wrap_for_dlpack(k),
+        _wrap_for_dlpack(v),
+        _wrap_for_dlpack(freqs_cis),
+        _wrap_for_dlpack(q_scale),
+        _wrap_for_dlpack(k_scale),
+        _wrap_for_dlpack(q_out),
+        _wrap_for_dlpack(k_out),
+        _wrap_for_dlpack(key_cache),
+        _wrap_for_dlpack(value_cache),
+        _wrap_for_dlpack(position),
+        epsilon,
+        torch.cuda.current_stream(q.device).cuda_stream,
+    )
+    return q_out, k_out
+
+
 def apply_rope_split_half1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return _apply_rope1_cuda(x, freqs_cis, split_half=True, inplace=False)
 

@@ -8,6 +8,7 @@ from .backends import ascend as _ascend_backend  # noqa: F401
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
+from .backends.cuda import rms_rope_kv_decode, rms_rope_kv_decode_is_available
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
 from .exceptions import (
@@ -74,6 +75,8 @@ __all__ = [
     "deltanet_conv_step",
     "gated_delta_decode_is_available",
     "flash_attention_decode_is_available",
+    "rms_rope_kv_decode",
+    "rms_rope_kv_decode_is_available",
     "na2d",
     "na3d",
     "sol_attn",
