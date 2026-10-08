@@ -22,6 +22,8 @@ from comfy_kitchen.backends import hip as hip_backend
 from comfy_kitchen.backends.eager.sol_attn import sol_attn as sol_attn_eager
 from comfy_kitchen.exceptions import NoCapableBackendError
 
+from .conftest import cuda_backend_available
+
 
 def _fused_backend():
     """The compiled backend that owns sol_attn here. PyTorch reports ROCm devices
@@ -881,6 +883,33 @@ def test_topk_budget_excludes_sinks():
         expect = s.topk(kk, dim=-1).values[..., -1]
         assert torch.allclose(thr, expect, rtol=2e-5), sinks
         assert (s >= thr.unsqueeze(-1)).sum(-1).eq(kk).all(), sinks   # exactly kk non-sink blocks kept
+
+
+@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
+def test_topk_and_masked_means_slices_match_one_pass(monkeypatch):
+    """Sliced top-k scores and masked block means match a single pass bit for bit."""
+    g = torch.Generator(device="cuda").manual_seed(4)
+    n, bh = 40, 7
+    c8 = torch.randint(-127, 128, (bh, n, HD), device="cuda", generator=g).float()
+    csc = torch.rand(bh, n, device="cuda", generator=g) + 0.5
+    kc = torch.randn(bh, n, HD, device="cuda", generator=g)
+    t = 64 * 30 + 17
+    x = torch.randn(1, t, 3, HD, device="cuda", dtype=torch.bfloat16, generator=g)
+    block_len = torch.randint(1, 65, ((t + 63) // 64,), device="cuda", dtype=torch.int32,
+                              generator=g)
+    lengths = cuda_backend._block_lengths(t, block_len.numel(), x.device, block_len)
+    valid = cuda_backend._valid_rows(t, lengths)
+
+    def run():
+        return (cuda_backend._topk_from_pooled(c8, csc, kc, 0.2, 1.0, (2, 5)),
+                cuda_backend._block_means(x, lengths, valid))
+
+    whole = run()
+    monkeypatch.setattr(cuda_backend, "_SOL_TOPK_SLICE_BYTES", 1)
+    monkeypatch.setattr(cuda_backend, "_SOL_MEAN_SLICE_ROWS", 64)
+    sliced = run()
+    assert torch.equal(sliced[0], whole[0])
+    assert torch.equal(sliced[1], whole[1])
 
 
 def test_topk_zero_budget_routes_nothing():

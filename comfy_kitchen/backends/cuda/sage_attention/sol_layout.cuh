@@ -35,6 +35,14 @@
 #define SOL_SM80 0
 #endif
 
+// 3 CTAs per SM for the exact and token kernels: free on sm_120, a small spill that pays off
+// on Ampere. Ada would spill more, so it stays unbounded.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200 || (__CUDA_ARCH__ >= 800 && __CUDA_ARCH__ < 890))
+#define SOL_THREE_CTA 1
+#else
+#define SOL_THREE_CTA 0
+#endif
+
 namespace sol {
 
 constexpr int HEAD_DIM = 128;   // the only head_dim these kernels handle
