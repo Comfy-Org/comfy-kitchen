@@ -36,6 +36,12 @@
 // Computes C[M, N] = epilogue(A[M, K] @ B[N, K]^T) with the operands in their
 // natural row-major form and C written with row stride ldc, like gemm_wmma.h.
 // kbytes, the row length in bytes, must be a multiple of 16.
+//
+// A may instead be gathered (ASrc, an implicit-GEMM convolution's patch rows): the
+// source resolves each of a thread's rows once, ASrc::row(grow, valid), and each
+// stage of 64 K bytes once, ASrc::stage(kbyte0), and ASrc::chunk(row, stage, offset)
+// then returns the 16 bytes at that offset into the stage. kbytes must then be a
+// multiple of 64, so no stage runs past the end of a row.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -44,6 +50,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 #include "gemm_wmma.h"
 
@@ -190,6 +197,73 @@ struct SimtFp8 {
     static __forceinline__ __device__ float finish(float c) { return c * 65536.0f; }
 };
 
+// fp16 pairs, kept in LDS as is: v_fma_mix_f32 on gfx1010, fp32 FMAs on gfx90c.
+// On gfx1010 at M=4096 and MiniMax-H3's linear shapes this measured 4.2-4.9 TFLOPS,
+// against 1.6-2.3 for rocBLAS fp16, while accumulating in fp32.
+struct SimtF16 {
+    using Acc = float;
+    static constexpr int kExpand = 1;
+    static constexpr int kSubs = 1;
+    static constexpr bool kPack16 = false;  // see launch_gemm_simt
+    using Frag = SimtFp8::Frag;
+    static __forceinline__ __device__ void expand(uint32_t w, uint32_t out[kExpand]) { out[0] = w; }
+    static __forceinline__ __device__ Frag unpack(uint32_t w, int s) { return SimtFp8::unpack(w, s); }
+    static __forceinline__ __device__ float dot(const Frag& a, const Frag& b, float c) {
+        return SimtFp8::dot(a, b, c);
+    }
+    static __forceinline__ __device__ float finish(float c) { return c; }
+};
+
+// fp16 pairs multiplied two at a time by v_pk_fma_f16, which both targets have: twice
+// SimtF16's MAC rate. Each half of a pair accumulates kFoldStages stages' products in
+// fp16 (one per K word) before the kernel folds the pair into the fp32 accumulator, so
+// the caller only has to keep that many products' partial sums inside fp16's range
+// (see ops/gemm_f16_packed.hip).
+struct SimtF16Packed {
+    using Acc = float;
+    using Pack = SimtFp8::half2_t;
+    // Folding after every stage cost 5-7% at H3's shapes on gfx1010 against every
+    // second one; fp32 error vs the fp64 GEMM went from 6.7e-4 to 8.9e-4.
+    static constexpr int kFoldStages = 2;
+    static constexpr int kExpand = 1;
+    static constexpr int kSubs = 1;
+    static constexpr bool kPack16 = false;  // see launch_gemm_simt
+    struct Frag {
+        Pack h;
+    };
+    static __forceinline__ __device__ void expand(uint32_t w, uint32_t out[kExpand]) { out[0] = w; }
+    static __forceinline__ __device__ Frag unpack(uint32_t w, int) { return {__builtin_bit_cast(Pack, w)}; }
+    static __forceinline__ __device__ Pack dot(Frag a, Frag b, Pack c) {
+        return __builtin_elementwise_fma(a.h, b.h, c);
+    }
+    static __forceinline__ __device__ float fold(Pack p, float c) {
+        return c + static_cast<float>(p.x) + static_cast<float>(p.y);
+    }
+    static __forceinline__ __device__ float finish(float c) { return c; }
+};
+
+// A policy with a Pack type accumulates into it, folded into Acc after every stage.
+template <typename Op, typename = void>
+struct SimtPack {
+    using type = char;
+    static constexpr bool kPacked = false;
+};
+template <typename Op>
+struct SimtPack<Op, std::void_t<typename Op::Pack>> {
+    using type = typename Op::Pack;
+    static constexpr bool kPacked = true;
+};
+
+// A gathered A operand's per-row state; nothing for dense rows.
+template <typename ASrc>
+struct SimtARow {
+    using type = typename ASrc::Row;
+};
+template <>
+struct SimtARow<const uint8_t*> {
+    using type = char;
+};
+
 // ---------------------------------------------------------------------------
 // The kernel. 256 threads as a TY x TX grid (TX = 256 / TY); thread (tx, ty)
 // owns rows ty*4 + {0..3} of each TY*4-row slice of the block tile and likewise
@@ -210,10 +284,11 @@ constexpr int kSimtGrainStages = 4;
 // Two blocks per CU caps gfx90c at the 128 VGPRs that keep two wave64s per SIMD;
 // left uncapped its fp8 and int4 tiles took ~200 and ran 15-30% slower. gfx1010's
 // wave32 budget is wider and it measured the same either way.
-template <typename Op, typename Epi, typename OutT, int TY, int TM, int TN, bool SPLIT>
+template <typename Op, typename Epi, typename OutT, int TY, int TM, int TN, bool SPLIT,
+          typename ASrc = const uint8_t*>
 __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
-    const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, OutT* __restrict__ C, int M,
-    int N, int kbytes, int ldc, Epi epi, typename Op::Acc* __restrict__ partial) {
+    typename GemmOperandA<ASrc>::type A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
+    int M, int N, int kbytes, int ldc, Epi epi, typename Op::Acc* __restrict__ partial) {
 #if defined(COMFY_SIMT_GEMM)
     constexpr int TX = kSimtThreads / TY;
     constexpr int BM = TY * TM, BN = TX * TN;
@@ -274,15 +349,34 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
 
     // Chunk c covers row c % ROWS and K bytes (c / ROWS) * 16, so consecutive
     // threads store consecutive rows of one LDS word: distinct banks.
+    constexpr bool kDenseA = std::is_same_v<ASrc, const uint8_t*>;
     uint4 ra[kAPer], rb[kBPer];
-    auto load = [&](int kb0) {
+    [[maybe_unused]] typename SimtARow<ASrc>::type arow[kAPer];
+    if constexpr (!kDenseA) {
 #pragma unroll
         for (int i = 0; i < kAPer; ++i) {
             const int c = tid + i * kSimtThreads;
-            const int grow = m0 + c % BM, gk = kb0 + (c / BM) * 16;
-            ra[i] = ((kAChunks % kSimtThreads == 0 || c < kAChunks) && grow < M && gk < kbytes)
-                        ? *reinterpret_cast<const uint4*>(A + static_cast<int64_t>(grow) * kbytes + gk)
-                        : make_uint4(0, 0, 0, 0);
+            arow[i] = A.row(m0 + c % BM,
+                            (kAChunks % kSimtThreads == 0 || c < kAChunks) && m0 + c % BM < M);
+        }
+    }
+    auto load = [&](int kb0) {
+        if constexpr (kDenseA) {
+#pragma unroll
+            for (int i = 0; i < kAPer; ++i) {
+                const int c = tid + i * kSimtThreads;
+                const int grow = m0 + c % BM, gk = kb0 + (c / BM) * 16;
+                ra[i] = ((kAChunks % kSimtThreads == 0 || c < kAChunks) && grow < M && gk < kbytes)
+                            ? *reinterpret_cast<const uint4*>(A + static_cast<int64_t>(grow) * kbytes + gk)
+                            : make_uint4(0, 0, 0, 0);
+            }
+        } else {
+            const auto stage = A.stage(kb0);
+#pragma unroll
+            for (int i = 0; i < kAPer; ++i) {
+                const int c = tid + i * kSimtThreads;
+                ra[i] = A.chunk(arow[i], stage, (c / BM) * 16);
+            }
         }
 #pragma unroll
         for (int i = 0; i < kBPer; ++i) {
@@ -318,15 +412,21 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
         }
     };
 
+    constexpr bool kPacked = SimtPack<Op>::kPacked;
     typename Op::Acc acc[TM][TN];
+    [[maybe_unused]] typename SimtPack<Op>::type pack[TM][TN];
 #pragma unroll
     for (int i = 0; i < TM; ++i)
 #pragma unroll
-        for (int j = 0; j < TN; ++j) acc[i][j] = 0;
+        for (int j = 0; j < TN; ++j) {
+            acc[i][j] = 0;
+            if constexpr (kPacked) pack[i][j] = {};
+        }
 
     load(kb_begin);
     store();
     __syncthreads();
+    [[maybe_unused]] int stage = 0;
 
     for (int kb0 = kb_begin; kb0 < kbytes; kb0 = next_k(kb0)) {
         const bool has_next = next_k(kb0) < kbytes;
@@ -356,8 +456,25 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
                 for (int i = 0; i < TM; ++i) {
                     const typename Op::Frag af = Op::unpack(aw[i], s);
 #pragma unroll
-                    for (int j = 0; j < TN; ++j) acc[i][j] = Op::dot(af, bf[j], acc[i][j]);
+                    for (int j = 0; j < TN; ++j) {
+                        if constexpr (kPacked) {
+                            pack[i][j] = Op::dot(af, bf[j], pack[i][j]);
+                        } else {
+                            acc[i][j] = Op::dot(af, bf[j], acc[i][j]);
+                        }
+                    }
                 }
+            }
+        }
+        if constexpr (kPacked) {
+            if (++stage % Op::kFoldStages == 0 || !has_next) {
+#pragma unroll
+                for (int i = 0; i < TM; ++i)
+#pragma unroll
+                    for (int j = 0; j < TN; ++j) {
+                        acc[i][j] = Op::fold(pack[i][j], acc[i][j]);
+                        pack[i][j] = {};
+                    }
             }
         }
 
@@ -461,8 +578,9 @@ inline bool device_uses_simt_gemm() { return simt_gemm_target() != SimtTarget::k
 // its raw sums to a stream-ordered scratch buffer and a second kernel adds them
 // in order and applies the epilogue. A scratch allocation that fails falls back
 // to a single slice rather than failing the GEMM.
-template <typename Op, typename Epi, typename OutT, int TY, int TM, int TN>
-void launch_simt_tile(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int kbytes,
+template <typename Op, typename Epi, typename OutT, int TY, int TM, int TN,
+          typename ASrc = const uint8_t*>
+void launch_simt_tile(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbytes,
                       int ldc, Epi epi, int slices, hipStream_t stream) {
     constexpr int bm = TY * TM, bn = (kSimtThreads / TY) * TN;
     constexpr int kStage = kSimtWords * 4;
@@ -481,11 +599,11 @@ void launch_simt_tile(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N,
     }
     grid.z = slices;
     if (!partial) {
-        gemm_simt_kernel<Op, Epi, OutT, TY, TM, TN, false>
+        gemm_simt_kernel<Op, Epi, OutT, TY, TM, TN, false, ASrc>
             <<<grid, kSimtThreads, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi, nullptr);
         return;
     }
-    gemm_simt_kernel<Op, Epi, OutT, TY, TM, TN, true>
+    gemm_simt_kernel<Op, Epi, OutT, TY, TM, TN, true, ASrc>
         <<<grid, kSimtThreads, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi, partial);
     const int64_t mn = static_cast<int64_t>(M) * N;
     gemm_simt_reduce_kernel<Op, Epi, OutT>
@@ -508,8 +626,8 @@ void launch_simt_tile(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N,
 //     of 16x256, or K is past 4 KiB.
 //   - int4 keeps the 16-row tile up to M = 48 (three of them beat one 64-row tile)
 //     while its rows are at most 2 KiB, and loses past that.
-template <typename Op, typename Epi, typename OutT>
-void launch_gemm_simt(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int kbytes,
+template <typename Op, typename Epi, typename OutT, typename ASrc = const uint8_t*>
+void launch_gemm_simt(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbytes,
                       int ldc, Epi epi, hipStream_t stream) {
     const int units = device_wgp_count();
     const auto blocks = [&](int bm, int bn) {
@@ -531,21 +649,21 @@ void launch_gemm_simt(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N,
     const bool packed = M <= 48 && simt_gemm_target() == SimtTarget::kGfx1010;
     if (packed && M <= 16 &&
         (Op::kPack16 || (blocks(16, 256) < 24 && kbytes <= 4096))) {
-        launch_simt_tile<Op, Epi, OutT, 4, 4, 4>(A, B, C, M, N, kbytes, ldc, epi,
+        launch_simt_tile<Op, Epi, OutT, 4, 4, 4, ASrc>(A, B, C, M, N, kbytes, ldc, epi,
                                                  slices(16, 256), stream);
     } else if (packed && M <= 32) {
-        launch_simt_tile<Op, Epi, OutT, 8, 4, 4>(A, B, C, M, N, kbytes, ldc, epi,
+        launch_simt_tile<Op, Epi, OutT, 8, 4, 4, ASrc>(A, B, C, M, N, kbytes, ldc, epi,
                                                  slices(32, 128), stream);
     } else if (packed && Op::kPack16 && kbytes <= 2048) {
-        launch_simt_tile<Op, Epi, OutT, 4, 4, 4>(A, B, C, M, N, kbytes, ldc, epi,
+        launch_simt_tile<Op, Epi, OutT, 4, 4, 4, ASrc>(A, B, C, M, N, kbytes, ldc, epi,
                                                  slices(16, 256), stream);
     } else if (M > 64 && blocks(128, 128) >= 2 * units) {
-        launch_simt_tile<Op, Epi, OutT, 16, 8, 8>(A, B, C, M, N, kbytes, ldc, epi, 1, stream);
+        launch_simt_tile<Op, Epi, OutT, 16, 8, 8, ASrc>(A, B, C, M, N, kbytes, ldc, epi, 1, stream);
     } else if (blocks(64, 128) >= 2 * units) {
-        launch_simt_tile<Op, Epi, OutT, 16, 4, 8>(A, B, C, M, N, kbytes, ldc, epi,
+        launch_simt_tile<Op, Epi, OutT, 16, 4, 8, ASrc>(A, B, C, M, N, kbytes, ldc, epi,
                                                   packed ? slices64(64, 128) : 1, stream);
     } else {
-        launch_simt_tile<Op, Epi, OutT, 16, 4, 4>(A, B, C, M, N, kbytes, ldc, epi,
+        launch_simt_tile<Op, Epi, OutT, 16, 4, 4, ASrc>(A, B, C, M, N, kbytes, ldc, epi,
                                                   packed ? slices64(64, 64) : 1, stream);
     }
 }

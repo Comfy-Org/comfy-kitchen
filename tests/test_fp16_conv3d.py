@@ -187,3 +187,50 @@ class TestStridedViews:
         got = cuda_backend._cutlass_fp16_conv3d(x, weight, bias, None, [1, 1, 1])
         assert got is not None
         assert rel_err(got.float(), _ref(x, weight, bias, None, (1, 1, 1))) < fp16_accum_tol(512 * 27)
+
+
+def _simt_device():
+    return torch.cuda.is_available() and ck.fp16_packed_linear_is_accelerated(torch.device("cuda", 0))
+
+
+class TestSimtFp16Conv3d:
+    """gfx90c/gfx1010: the implicit GEMM on the packed fp16 GEMM, zero-padding in the
+    gather. Error is the packed GEMM's (~1e-3 of the fp32 reference)."""
+
+    @pytest.mark.parametrize(
+        "c,k,d,h,w,ksize,stride,padding",
+        [
+            (96, 96, 4, 30, 34, (3, 3, 3), (1, 1, 1), (0, 1, 1)),
+            (64, 24, 3, 17, 13, (3, 3, 3), (1, 2, 2), (1, 1, 1)),
+            (32, 40, 5, 9, 11, (3, 1, 1), (2, 1, 1), (0, 0, 0)),
+            (384, 192, 1, 22, 40, (1, 3, 3), (1, 1, 1), (0, 1, 1)),
+        ],
+    )
+    @pytest.mark.parametrize("with_residual", [False, True])
+    def test_matches_fp32_conv(self, c, k, d, h, w, ksize, stride, padding, with_residual):
+        if not _simt_device():
+            pytest.skip("packed fp16 GEMM device required")
+        torch.manual_seed(0)
+        x, weight, bias, _ = _inputs(c, k, d, h, w, ksize)
+        ref = functional.conv3d(x.float(), weight.float(), bias.float(), stride=stride, padding=padding)
+        residual = torch.randn_like(ref).half().contiguous(memory_format=CL3D) if with_residual else None
+        if residual is not None:
+            ref = ref + residual.float()
+
+        out = ck.fp16_conv3d(x, weight, bias, residual, stride, padding=padding)
+
+        assert out.shape == ref.shape and out.is_contiguous(memory_format=CL3D)
+        assert rel_err(out.float(), ref) < 2e-3
+
+    def test_large_activations_stay_finite(self):
+        if not _simt_device():
+            pytest.skip("packed fp16 GEMM device required")
+        torch.manual_seed(1)
+        x, weight, bias, _ = _inputs(64, 32, 3, 12, 12, (3, 3, 3))
+        # |x| up to ~35000: 32 products with the weight's largest overflow fp16 unscaled,
+        # while the output itself stays well inside fp16
+        x = (x * 8000).contiguous(memory_format=CL3D)
+        ref = functional.conv3d(x.float(), weight.float(), bias.float(), padding=1)
+        out = ck.fp16_conv3d(x, weight, bias, padding=1)
+        assert torch.isfinite(out).all()
+        assert rel_err(out.float(), ref) < 2e-3

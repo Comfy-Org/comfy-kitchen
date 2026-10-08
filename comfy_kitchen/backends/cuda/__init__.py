@@ -3065,15 +3065,23 @@ def _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-1, out=None)
     return out if ok else None
 
 
+def _zero_pad3d(x: torch.Tensor, padding: list[int]) -> torch.Tensor:
+    pd, ph, pw = padding
+    return torch.nn.functional.pad(x, (pw, pw, ph, ph, pd, pd)) if pd or ph or pw else x
+
+
 def fp16_conv3d(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     residual: torch.Tensor | None,
     stride: list[int],
+    padding: list[int],
 ) -> torch.Tensor:
     """fp16-accumulate conv3d with fused bias/residual, channels_last_3d in and out;
-    torch's conv when the kernel declines the shape."""
+    torch's conv when the kernel declines the shape. The kernel takes no padding, so x is
+    padded first."""
+    x = _zero_pad3d(x, padding)
     out = _cutlass_fp16_conv3d(x, weight, bias, residual, stride)
     if out is not None:
         return out
@@ -3087,9 +3095,11 @@ def fp16_conv3d_out(
     bias: torch.Tensor | None,
     residual: torch.Tensor | None,
     stride: list[int],
+    padding: list[int],
     out: torch.Tensor,
 ) -> None:
     """fp16_conv3d into ``out``; torch's conv plus a copy when the kernel declines the shape."""
+    x = _zero_pad3d(x, padding)
     if _cutlass_fp16_conv3d(x, weight, bias, residual, stride, out=out) is not None:
         return
     res = torch.nn.functional.conv3d(x, weight, bias, stride=stride)

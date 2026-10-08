@@ -547,8 +547,13 @@ def test_fp16_linear_matches_fp32_reference(hip, monkeypatch, m, n, k, served, w
     if with_residual:
         ref = r.float() + rs.float() * ref
 
-    # without native WMMA every shape runs rocBLAS and the kernel is never asked
-    assert calls == ([served] if hip._native_wmma_on(torch.device(DEV, 0)) else [])
+    # The WMMA tile declines the shallow-K shapes; the thread-level GEMM (gfx90c,
+    # gfx1010) serves them all; anywhere else rocBLAS runs and the kernel is not asked.
+    device = torch.device(DEV, 0)
+    if hip._native_wmma_on(device):
+        assert calls == [served]
+    else:
+        assert calls == ([True] if hip._simt_gemm_on(device) else [])
     assert got.dtype == torch.float16 and got.shape == (m, n)
     # fp32 accumulation: only the fp16 operands and the stored result are rounded
     assert _rel_err(got, ref) < 5e-3
@@ -713,7 +718,7 @@ def test_fp16_conv3d_matches_fp32_reference(hip, c, k, d, h, w, ksize, stride, w
                                             with_residual):
     torch.manual_seed(0)
     x, weight, bias, residual = _conv_inputs(c, k, d, h, w, ksize, with_bias, with_residual, stride)
-    got = hip._wmma_fp16_conv3d(x, weight, bias, residual, list(stride))
+    got = hip._kernel_fp16_conv3d(x, weight, bias, residual, list(stride))
     assert got is not None, "the kernel declined a shape it should serve"
     assert got.is_contiguous(memory_format=torch.channels_last_3d)
     assert _rel_err(got, _conv_ref(x, weight, bias, residual, stride)) < 5e-3
@@ -725,12 +730,12 @@ def test_fp16_conv3d_declines_like_cuda(hip):
     # a token launch, and a deep (C*T*R*S > 16384) launch large enough to fill the device
     for shape in [(64, 64, 3, 6, 6), (640, 640, 5, 66, 66)]:
         x, weight, bias, residual = _conv_inputs(*shape, (3, 3, 3), with_residual=True)
-        assert hip._wmma_fp16_conv3d(x, weight, bias, residual, [1, 1, 1]) is None
-        got = hip.fp16_conv3d(x, weight, bias, residual, [1, 1, 1])
+        assert hip._kernel_fp16_conv3d(x, weight, bias, residual, [1, 1, 1]) is None
+        got = hip.fp16_conv3d(x, weight, bias, residual, [1, 1, 1], [0, 0, 0])
         assert _rel_err(got, _conv_ref(x, weight, bias, residual, (1, 1, 1))) < 5e-3
     # a residual that does not match the output shape
     x, weight, bias, residual = _conv_inputs(128, 128, 5, 130, 130, (3, 3, 3), with_residual=True)
-    assert hip._wmma_fp16_conv3d(x, weight, bias, residual[:, :64], [1, 1, 1]) is None
+    assert hip._kernel_fp16_conv3d(x, weight, bias, residual[:, :64], [1, 1, 1]) is None
 
 
 @needs_wmma
@@ -765,8 +770,8 @@ def test_fp16_epilogue_operands_follow_the_input_device(hip):
     # served, then declined (a token launch)
     for shape in [(128, 128, 5, 130, 130), (64, 64, 3, 6, 6)]:
         xc, wc, bc, rc = _conv_inputs(*shape, (3, 3, 3), with_residual=True)
-        ref = hip.fp16_conv3d(xc, wc, bc, rc, [1, 1, 1])
-        got = hip.fp16_conv3d(xc, wc, bc.cpu(), rc.cpu(), [1, 1, 1])
+        ref = hip.fp16_conv3d(xc, wc, bc, rc, [1, 1, 1], [0, 0, 0])
+        got = hip.fp16_conv3d(xc, wc, bc.cpu(), rc.cpu(), [1, 1, 1], [0, 0, 0])
         torch.cuda.synchronize()
         assert torch.equal(got, ref)
 
@@ -803,10 +808,10 @@ def test_group_norm_silu_pad3d_binding_rejects_negative_padding(hip, side):
 def test_fp16_conv3d_bad_stride_is_reported_by_torch(hip):
     x, weight, bias, _ = _conv_inputs(16, 16, 4, 10, 10, (3, 3, 3))
     with pytest.raises(RuntimeError):
-        hip.fp16_conv3d(x, weight, bias, None, [0, 1, 1])
+        hip.fp16_conv3d(x, weight, bias, None, [0, 1, 1], [0, 0, 0])
     out = torch.empty((1, 16, 2, 8, 8), dtype=torch.float16, device=DEV)
     with pytest.raises(RuntimeError):
-        hip.fp16_conv3d_out(x, weight, bias, None, [0, 1, 1], out)
+        hip.fp16_conv3d_out(x, weight, bias, None, [0, 1, 1], [0, 0, 0], out)
 
 
 @needs_wmma
@@ -814,7 +819,7 @@ def test_fp16_conv3d_deep_large_launch_is_served(hip):
     """512 channels x 27 taps, the depth CUDA's gate admits; HIP accumulates in fp32."""
     torch.manual_seed(0)
     x, weight, bias, residual = _conv_inputs(512, 512, 4, 66, 130, (3, 3, 3), with_residual=True)
-    got = hip._wmma_fp16_conv3d(x, weight, bias, residual, [1, 1, 1])
+    got = hip._kernel_fp16_conv3d(x, weight, bias, residual, [1, 1, 1])
     assert got is not None
     assert _rel_err(got, _conv_ref(x, weight, bias, residual, (1, 1, 1))) < 5e-3
 
@@ -824,18 +829,18 @@ def test_fp16_conv3d_input_windows_match_packed(hip):
     """Row and frame windows of x are read in place and are bit-identical to the packed run."""
     torch.manual_seed(0)
     x, weight, bias, _ = _conv_inputs(128, 128, 6, 130, 258, (3, 3, 3))
-    full = hip._wmma_fp16_conv3d(x, weight, bias, None, [1, 1, 1])
+    full = hip._kernel_fp16_conv3d(x, weight, bias, None, [1, 1, 1])
     for h0, h1 in ((0, 64), (64, 128)):  # the input window carries the 2-row halo
         view = x[:, :, :, h0:h1 + 2, :]
         assert not view.is_contiguous(memory_format=torch.channels_last_3d)
         assert hip._ndhwc_strides(view) is not None
-        tile = hip._wmma_fp16_conv3d(view, weight, bias, None, [1, 1, 1])
+        tile = hip._kernel_fp16_conv3d(view, weight, bias, None, [1, 1, 1])
         assert tile is not None and torch.equal(tile, full[:, :, :, h0:h1, :])
     # a batch of two, so the batch stride is applied
     x2 = torch.cat([x, x.flip(2)]).contiguous(memory_format=torch.channels_last_3d)
-    ref = hip._wmma_fp16_conv3d(x2[:, :, :, :66].contiguous(memory_format=torch.channels_last_3d),
+    ref = hip._kernel_fp16_conv3d(x2[:, :, :, :66].contiguous(memory_format=torch.channels_last_3d),
                                 weight, bias, None, [1, 1, 1])
-    got = hip._wmma_fp16_conv3d(x2[:, :, :, :66], weight, bias, None, [1, 1, 1])
+    got = hip._kernel_fp16_conv3d(x2[:, :, :, :66], weight, bias, None, [1, 1, 1])
     assert got is not None and torch.equal(got, ref)
 
 
@@ -848,8 +853,8 @@ def test_fp16_conv3d_broadcast_row_input(hip):
     view = x.expand(-1, -1, -1, 130, -1)
     assert view.stride()[3] == 0
     assert hip._ndhwc_strides(view) is None
-    got = hip._wmma_fp16_conv3d(view, weight, bias, None, [1, 1, 1])
-    ref = hip._wmma_fp16_conv3d(view.contiguous(memory_format=torch.channels_last_3d), weight,
+    got = hip._kernel_fp16_conv3d(view, weight, bias, None, [1, 1, 1])
+    ref = hip._kernel_fp16_conv3d(view.contiguous(memory_format=torch.channels_last_3d), weight,
                                 bias, None, [1, 1, 1])
     assert got is not None and torch.equal(got, ref)
 
@@ -858,17 +863,17 @@ def test_fp16_conv3d_broadcast_row_input(hip):
 def test_fp16_conv3d_frame_window_out(hip):
     torch.manual_seed(0)
     x, weight, bias, _ = _conv_inputs(128, 128, 6, 66, 130, (3, 3, 3))
-    full = hip._wmma_fp16_conv3d(x, weight, bias, None, [1, 1, 1])
+    full = hip._kernel_fp16_conv3d(x, weight, bias, None, [1, 1, 1])
     out = torch.zeros_like(full).contiguous(memory_format=torch.channels_last_3d)
     for z0, z1 in ((0, 2), (2, 4)):
         window = out[:, :, z0:z1]
-        got = hip._wmma_fp16_conv3d(x[:, :, z0:z1 + 2], weight, bias, None, [1, 1, 1], out=window)
+        got = hip._kernel_fp16_conv3d(x[:, :, z0:z1 + 2], weight, bias, None, [1, 1, 1], out=window)
         assert got is not None and got.data_ptr() == window.data_ptr()
     assert torch.equal(out, full)
     buf = torch.empty_like(full)
-    hip.fp16_conv3d_out(x, weight, bias, None, [1, 1, 1], buf)
+    hip.fp16_conv3d_out(x, weight, bias, None, [1, 1, 1], [0, 0, 0], buf)
     # the public op, which is the kernel only where the device has native WMMA
-    assert torch.equal(buf, hip.fp16_conv3d(x, weight, bias, None, [1, 1, 1]))
+    assert torch.equal(buf, hip.fp16_conv3d(x, weight, bias, None, [1, 1, 1], [0, 0, 0]))
 
 
 @needs_wmma
@@ -878,12 +883,12 @@ def test_fp16_conv3d_out_the_kernel_cannot_index(hip):
     without touching the rest of the buffer."""
     torch.manual_seed(0)
     x, weight, bias, _ = _conv_inputs(128, 128, 4, 34, 130, (3, 3, 3))
-    full = hip.fp16_conv3d(x, weight, bias, None, [1, 1, 1])
+    full = hip.fp16_conv3d(x, weight, bias, None, [1, 1, 1], [0, 0, 0])
     out = torch.full_like(full, 7.0).contiguous(memory_format=torch.channels_last_3d)
     window = out[:, :, :, :16, :]
-    assert hip._wmma_fp16_conv3d(x[:, :, :, :18, :], weight, bias, None, [1, 1, 1],
+    assert hip._kernel_fp16_conv3d(x[:, :, :, :18, :], weight, bias, None, [1, 1, 1],
                                  out=window) is None
-    hip.fp16_conv3d_out(x[:, :, :, :18, :], weight, bias, None, [1, 1, 1], window)
+    hip.fp16_conv3d_out(x[:, :, :, :18, :], weight, bias, None, [1, 1, 1], [0, 0, 0], window)
     assert torch.equal(window, full[:, :, :, :16, :])
     assert bool((out[:, :, :, 16:] == 7.0).all())
 
@@ -892,13 +897,13 @@ def test_fp16_conv3d_out_the_kernel_cannot_index(hip):
     big = torch.full((2, 128, 4, 64, 128), 7.0, dtype=torch.float16, device=DEV).contiguous(
         memory_format=cl)
     window = big[:, :, 0:2]
-    assert hip._wmma_fp16_conv3d(x[:, :, 0:4], weight, None, None, [1, 1, 1], out=window) is None
-    hip.fp16_conv3d_out(x[:, :, 0:4], weight, None, None, [1, 1, 1], window)
+    assert hip._kernel_fp16_conv3d(x[:, :, 0:4], weight, None, None, [1, 1, 1], out=window) is None
+    hip.fp16_conv3d_out(x[:, :, 0:4], weight, None, None, [1, 1, 1], [0, 0, 0], window)
     assert _rel_err(window, _conv_ref(x[:, :, 0:4], weight, None, None, (1, 1, 1))) < 5e-3
     assert bool((big[:, :, 2:] == 7.0).all())
 
     with pytest.raises(ValueError, match="out must be"):
-        hip._wmma_fp16_conv3d(x, weight, None, None, [1, 1, 1], out=window)
+        hip._kernel_fp16_conv3d(x, weight, None, None, [1, 1, 1], out=window)
 
 
 @needs_wmma
@@ -976,13 +981,13 @@ def test_fp16_conv3d_out_overlapping_input_is_declined(hip):
     takes the copy path."""
     torch.manual_seed(0)
     x, weight, _, _ = _conv_inputs(128, 128, 6, 66, 130, (3, 3, 3))
-    ref = hip._wmma_fp16_conv3d(x.clone(memory_format=torch.channels_last_3d), weight, None,
+    ref = hip._kernel_fp16_conv3d(x.clone(memory_format=torch.channels_last_3d), weight, None,
                                 None, [1, 1, 1])
     out = torch.as_strided(x, ref.shape, ref.stride(), x.storage_offset())
-    assert hip._wmma_fp16_conv3d(x, weight, None, None, [1, 1, 1], out=out) is None
+    assert hip._kernel_fp16_conv3d(x, weight, None, None, [1, 1, 1], out=out) is None
     ref = hip.fp16_conv3d(x.clone(memory_format=torch.channels_last_3d), weight, None, None,
-                          [1, 1, 1])
-    hip.fp16_conv3d_out(x, weight, None, None, [1, 1, 1], out)
+                          [1, 1, 1], [0, 0, 0])
+    hip.fp16_conv3d_out(x, weight, None, None, [1, 1, 1], [0, 0, 0], out)
     assert torch.equal(out, ref)
 
 
@@ -1859,6 +1864,8 @@ def test_w6a8_linear_matches_int8_linear_on_the_decoded_weight(hip, monkeypatch,
         x, qdata, s_rel, s_channel, bias=bias, convrot_groupsize=convrot
     )
     int8_weight = eager_w4a8._dequant_int4_grouped_to_int8(qdata, s_rel, None, 16)
+    # int8_linear's own INT8 GEMM route; gfx90c/gfx1010 otherwise take the packed fp16 GEMM
+    monkeypatch.setattr(hip, "_int8_convrot_packed_linear", lambda *_: None)
     ref = hip.int8_linear(x, int8_weight, s_channel, bias, torch.bfloat16, True, convrot)
 
     gemv = m <= hip._W4A8_GEMV_MAX_ROWS and scale_dtype == torch.float8_e4m3fn

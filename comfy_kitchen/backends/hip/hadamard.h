@@ -550,11 +550,14 @@ void launch_convrot_quant_global_managed(
 
 // Fused single-kernel path: FHT in LDS, vectorized loads, warp-shuffle absmax.
 // One block per row; the rotated row stays in shared memory as RowT.
-template <typename RowT, int BLOCK_THREADS, int ACT>
+// QT int8_t quantizes the row; QT __half writes it times a power of two 2^-e with
+// scaleout = 2^e, the smallest that keeps its absmax within f16_bound (exact scaling,
+// for the packed fp16 GEMM on gfx90c/gfx1010, see ops/gemm_f16_packed.hip).
+template <typename RowT, int BLOCK_THREADS, int ACT, typename QT>
 __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
-    const void* __restrict__ x, int in_dtype, int8_t* __restrict__ qout,
+    const void* __restrict__ x, int in_dtype, QT* __restrict__ qout,
     float* __restrict__ scaleout, int M, int K, const void* __restrict__ act_weight,
-    float act_eps) {
+    float act_eps, float f16_bound) {
 
     constexpr int kGroupThreads = 64;
     constexpr int kGroupsInFlight = BLOCK_THREADS / kGroupThreads;
@@ -650,6 +653,17 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
 
     abs_max = block_reduce_max<kWarps>(abs_max, warp_smem, &block_smem);
     const float rowmax = fmaxf(finite_absmax_for_quant<RowT>(abs_max), 1e-10f);
+    if constexpr (std::is_same_v<QT, __half>) {
+        const int e = static_cast<int>(ceilf(log2f(rowmax / f16_bound)));
+        if (tid == 0) {
+            scaleout[row] = ldexpf(1.0f, e);
+        }
+        const float inv = ldexpf(1.0f, -e);
+        for (int col = tid; col < K; col += BLOCK_THREADS) {
+            qout[row_offset + col] = __float2half(load_row_value(row_buf[col]) * inv);
+        }
+        return;
+    }
     const float scale = rowmax / 127.0f;
     const float inv = 127.0f / rowmax;
     if (tid == 0) {
@@ -660,19 +674,19 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
         const float v = load_row_value(row_buf[col]);
         int q = static_cast<int>(rintf(v * inv));
         q = q < -127 ? -127 : (q > 127 ? 127 : q);
-        qout[row_offset + col] = static_cast<int8_t>(q);
+        qout[row_offset + col] = static_cast<QT>(q);
     }
 }
 
-template <typename RowT, int ACT, int BLOCK_THREADS>
+template <typename RowT, int ACT, int BLOCK_THREADS, typename QT>
 inline bool launch_convrot_quant_fused_impl(
-    const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
-    const void* act_weight, float act_eps, hipStream_t stream) {
+    const void* x, int in_dtype, QT* qout, float* scaleout, int M, int K,
+    const void* act_weight, float act_eps, float f16_bound, hipStream_t stream) {
     const int groups_in_flight = BLOCK_THREADS / 64;
     const size_t shmem =
         static_cast<size_t>(K) * sizeof(RowT) +
         static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256 * sizeof(float);
-    auto kernel = convrot_quant_fused_kernel<RowT, BLOCK_THREADS, ACT>;
+    auto kernel = convrot_quant_fused_kernel<RowT, BLOCK_THREADS, ACT, QT>;
     const hipError_t attr_err = hipFuncSetAttribute(
         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(shmem));
@@ -680,40 +694,42 @@ inline bool launch_convrot_quant_fused_impl(
         return false;
     }
     kernel<<<M, BLOCK_THREADS, shmem, stream>>>(x, in_dtype, qout, scaleout, M, K, act_weight,
-                                                act_eps);
+                                                act_eps, f16_bound);
     return hipGetLastError() == hipSuccess;
 }
 
-template <typename RowT, int ACT>
+template <typename RowT, int ACT, typename QT>
 struct LaunchConvrotQuantFusedForBlock {
     const void* x;
     int in_dtype;
-    int8_t* qout;
+    QT* qout;
     float* scaleout;
     int M;
     int K;
     const void* act_weight;
     float act_eps;
+    float f16_bound;
     hipStream_t stream;
     bool* launched;
 
     template <int BLOCK_THREADS>
     void operator()() const {
-        *launched = launch_convrot_quant_fused_impl<RowT, ACT, BLOCK_THREADS>(
-            x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream);
+        *launched = launch_convrot_quant_fused_impl<RowT, ACT, BLOCK_THREADS, QT>(
+            x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, f16_bound, stream);
     }
 };
 
-template <int ACT>
+template <int ACT, typename QT = int8_t>
 struct LaunchConvrotQuantFusedForRow {
     const void* x;
     int in_dtype;
-    int8_t* qout;
+    QT* qout;
     float* scaleout;
     int M;
     int K;
     const void* act_weight;
     float act_eps;
+    float f16_bound;
     hipStream_t stream;
     int block_threads;
     bool* launched;
@@ -722,8 +738,9 @@ struct LaunchConvrotQuantFusedForRow {
     void operator()() const {
         dispatch_convrot_fused_block_threads(
             block_threads,
-            LaunchConvrotQuantFusedForBlock<RowT, ACT>{
-                x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream, launched});
+            LaunchConvrotQuantFusedForBlock<RowT, ACT, QT>{
+                x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, f16_bound, stream,
+                launched});
     }
 };
 
@@ -869,8 +886,8 @@ inline void launch_convrot_quant(
             dispatch_convrot_row_type(
                 in_dtype,
                 LaunchConvrotQuantFusedForRow<ACT>{
-                    x, in_dtype, qout, scaleout, M, K, nullptr, 0.0f, stream, block_threads,
-                    &launched});
+                    x, in_dtype, qout, scaleout, M, K, nullptr, 0.0f, 0.0f, stream,
+                    block_threads, &launched});
             if (launched) {
                 return;
             }
@@ -912,12 +929,42 @@ inline void launch_convrot_quant_rms_norm(
         dispatch_convrot_row_type(
             in_dtype,
             LaunchConvrotQuantFusedForRow<kActRmsNorm>{
-                x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream, block_threads,
-                &launched});
+                x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, 0.0f, stream,
+                block_threads, &launched});
     }
     if (!launched) {
         throw std::runtime_error("convrot: rms_norm activation needs the fused G=256 kernel");
     }
+}
+
+// Rotation into power-of-two-scaled fp16 rows for the packed fp16 GEMM, on the fused
+// G=256 kernel only. Returns false, having launched nothing, where it does not fit.
+inline bool launch_convrot_rotate_f16(
+    const void* x, int in_dtype, __half* out, float* scaleout, int M, int K, int act,
+    const void* act_weight, float act_eps, float f16_bound, hipStream_t stream) {
+    const int block_threads = convrot_pick_fused_block_threads(M, K, in_dtype);
+    if (block_threads == 0) {
+        return false;
+    }
+    bool launched = false;
+    if (act == kActRmsNorm) {
+        dispatch_convrot_row_type(in_dtype, LaunchConvrotQuantFusedForRow<kActRmsNorm, __half>{
+            x, in_dtype, out, scaleout, M, K, act_weight, act_eps, f16_bound, stream,
+            block_threads, &launched});
+    } else if (act == kActGeluTanh) {
+        dispatch_convrot_row_type(in_dtype, LaunchConvrotQuantFusedForRow<kActGeluTanh, __half>{
+            x, in_dtype, out, scaleout, M, K, nullptr, 0.0f, f16_bound, stream, block_threads,
+            &launched});
+    } else if (act == kActSwiGLU) {
+        dispatch_convrot_row_type(in_dtype, LaunchConvrotQuantFusedForRow<kActSwiGLU, __half>{
+            x, in_dtype, out, scaleout, M, K, nullptr, 0.0f, f16_bound, stream, block_threads,
+            &launched});
+    } else {
+        dispatch_convrot_row_type(in_dtype, LaunchConvrotQuantFusedForRow<kActNone, __half>{
+            x, in_dtype, out, scaleout, M, K, nullptr, 0.0f, f16_bound, stream, block_threads,
+            &launched});
+    }
+    return launched;
 }
 
 }  // namespace comfy::hip_backend

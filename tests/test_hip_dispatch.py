@@ -249,7 +249,7 @@ def test_sage_native_entries_accept_validated_software_tile_arches():
 
     assert "gfx1010" in groups["software_tile"]
     assert all("gfx1010" not in groups[group] for group in ("wmma_gfx11", "wmma_gfx12"))
-    assert bindings.count("sage_require_supported_arch(") == 4  # definition plus entries
+    assert bindings.count("sage_require_supported_arch(") == 5  # definition plus entries
     assert "!sage_is_supported_arch(properties.gcnArchName)" in bindings
     assert "COMFY_HIP_SUPPORTED_ARCH_NAMES" in bindings
     assert "properties.warpSize != 32" not in bindings
@@ -262,7 +262,7 @@ def test_hip_advertises_attention_with_any_tile_policy():
 
     assert set(with_wmma) >= hip_backend._TILED_ATTENTION_OPS
     assert not (hip_backend._TILED_ATTENTION_OPS & set(without))
-    for op in ("fp16_linear", "int8_linear", "convrot_w4a4_linear"):
+    for op in ("fp16_linear", "fp16_packed_linear", "int8_linear", "convrot_w4a4_linear"):
         assert op in without
     # The elementwise kernels need no matrix cores and must survive.
     for op in ("apply_rope", "apply_rope_", "rms_rope", "rms_rope_split_half1_", "adaln",

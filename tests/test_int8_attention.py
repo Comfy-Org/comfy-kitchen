@@ -1113,3 +1113,62 @@ def test_hip_attention_rejects_invalid_prepared_mask(invalid):
             output_dtype=torch.bfloat16,
             cta_k=packed.cta_k,
         )
+
+
+requires_block_sparse = pytest.mark.skipif(
+    not (_CUDA_READY and ck.int8_block_sparse_attention_is_available(torch.device("cuda", 0))),
+    reason="block-sparse INT8 attention runs on gfx1010 only",
+)
+
+
+def _block_mask(lut, block_q, q_length, kv_length):
+    tiles = torch.zeros(*lut.shape[:3], (kv_length + 63) // 64, dtype=torch.bool, device=lut.device)
+    tiles.scatter_(-1, lut.long(), True)
+    return tiles.repeat_interleave(block_q, 2)[:, :, :q_length].repeat_interleave(64, 3)[..., :kv_length]
+
+
+@requires_block_sparse
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("block_q", [64, 128])
+@pytest.mark.parametrize("kv_heads", [4, 2])
+def test_block_sparse_matches_masked_reference(head_dim, block_q, kv_heads):
+    torch.manual_seed(191)
+    q, k, v = _qkv(2, 4, kv_heads, 1000, 1100, head_dim, torch.float16)
+    tiles, q_blocks = (1100 + 63) // 64, (1000 + block_q - 1) // block_q
+    # distinct tiles per row, the partial last tile included
+    lut = torch.stack([
+        torch.cat([torch.tensor([tiles - 1]), torch.randperm(tiles - 1)[:4]])
+        for _ in range(2 * 4 * q_blocks)
+    ]).view(2, 4, q_blocks, 5).int().cuda()
+
+    actual = ck.int8_block_sparse_attention(q, k, v, lut, block_q=block_q)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.float(),
+        k.float().repeat_interleave(4 // kv_heads, dim=1),
+        v.float().repeat_interleave(4 // kv_heads, dim=1),
+        attn_mask=_block_mask(lut, block_q, 1000, 1100),
+    )
+    assert torch.isfinite(actual).all()
+    assert _nrmse(actual, expected) < 0.03
+
+
+@requires_block_sparse
+@pytest.mark.parametrize("block_q", [64, 128])
+def test_block_sparse_over_every_tile_is_dense(block_q):
+    torch.manual_seed(192)
+    q, k, v = _qkv(1, 4, 4, 300, 257, 128, torch.float16)
+    tiles = torch.arange(5, dtype=torch.int32, device="cuda")
+    lut = tiles.expand(1, 4, (300 + block_q - 1) // block_q, 5).contiguous()
+
+    dense = ck.int8_attention(q, k, v)
+    assert torch.equal(ck.int8_block_sparse_attention(q, k, v, lut, block_q=block_q), dense)
+    reversed_order = ck.int8_block_sparse_attention(q, k, v, lut.flip(-1).contiguous(), block_q=block_q)
+    assert _nrmse(reversed_order, dense) < 0.005
+
+
+@requires_block_sparse
+def test_block_sparse_rejects_lut_for_another_block_size():
+    q, k, v = _qkv(1, 4, 4, 300, 257, 128, torch.float16)
+    lut = torch.zeros(1, 4, 3, 2, dtype=torch.int32, device="cuda")  # 3 blocks fit block_q=128
+    with pytest.raises(RuntimeError, match="lut must be int32"):
+        ck.int8_block_sparse_attention(q, k, v, lut, block_q=64)

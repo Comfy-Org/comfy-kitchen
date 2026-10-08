@@ -540,6 +540,52 @@ def int8_attention_from_prequantized(
     return output.float() if quantized.input_dtype == torch.float32 else output
 
 
+def is_block_sparse_available(device: torch.device | None = None) -> bool:
+    """Whether :func:`int8_block_sparse_attention` has a kernel for this device."""
+    if _hip_backend is None or not is_available(device):
+        return False
+    index = torch.cuda.current_device() if device is None or device.index is None else device.index
+    return _hip_backend._gfx_arch(index) == "gfx1010"
+
+
+def int8_block_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lut: torch.Tensor,
+    *,
+    block_q: int,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Block-sparse :func:`int8_attention`: query block ``b`` (``block_q`` 64 or 128
+    queries) of each head attends only to the 64-key tiles ``lut[batch, head, b, :]``.
+
+    ``lut`` is int32 ``[batch, q_heads, ceil(q_len / block_q), topk]`` with distinct
+    tiles per row (a repeated tile is attended twice), as top-k selectors produce it. Inputs use ``[batch, heads, sequence, head_dim]``
+    layout with head_dim 64 or 128 and are quantized exactly as in
+    :func:`int8_attention`. Requires :func:`is_block_sparse_available`.
+    """
+    if not is_block_sparse_available(q.device):
+        raise RuntimeError("INT8 block-sparse attention requires the HIP extension on gfx1010")
+    if q.shape[-1] not in (64, 128):
+        raise ValueError(f"head_dim must be 64 or 128, got {q.shape[-1]}")
+    packed = prequantize_int8_attention(q, k, v, scale=scale)
+    output_dtype = torch.bfloat16 if packed.input_dtype == torch.float32 else packed.input_dtype
+    output = _hip_backend.sage_int8_block_sparse_attend(
+        packed.q,
+        packed.k,
+        packed.v,
+        packed.q_scale,
+        packed.k_scale,
+        packed.v_scale,
+        lut.to(torch.int32).contiguous(),
+        block_q=block_q,
+        attention_scale=packed.attention_scale,
+        output_dtype=output_dtype,
+    )
+    return output.float() if packed.input_dtype == torch.float32 else output
+
+
 @torch.library.custom_op("comfy_kitchen::int8_attention", mutates_args=())
 def _op_int8_attention(
     q: torch.Tensor,

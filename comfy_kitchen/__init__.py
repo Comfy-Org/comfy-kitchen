@@ -26,9 +26,12 @@ from .sage_attention import (
     PrequantizedInt8Attention,
     int8_attention,
     int8_attention_from_prequantized,
+    int8_block_sparse_attention,
     prequantize_int8_attention,
 )
+from .sage_attention import _hip_backend
 from .sage_attention import is_available as int8_attention_is_available
+from .sage_attention import is_block_sparse_available as int8_block_sparse_attention_is_available
 from .tensor.convrot_w4a4 import (
     convrot_w4a4_linear,
     dequantize_convrot_w4a4_weight,
@@ -65,6 +68,8 @@ __all__ = [
     "int8_attention",
     "int8_attention_from_prequantized",
     "int8_attention_is_available",
+    "int8_block_sparse_attention",
+    "int8_block_sparse_attention_is_available",
     "prequantize_int8_attention",
     "flash_attention_decode",
     "gated_delta_decode_fused",
@@ -98,6 +103,8 @@ __all__ = [
     "dequantize_w4a8_int8_weight",
     "gemv_awq_w4a16",
     "fp16_linear",
+    "fp16_packed_linear",
+    "fp16_packed_linear_is_accelerated",
     "int8_linear",
     "w4a8_int8_linear",
     # Positional encoding
@@ -322,17 +329,19 @@ def fp16_conv3d(
     residual: torch.Tensor | None = None,
     stride: int | tuple[int, int, int] = 1,
     out: torch.Tensor | None = None,
+    padding: int | tuple[int, int, int] = 0,
 ) -> torch.Tensor:
     """fp16-accumulate conv3d with bias and residual fused into the epilogue.
 
-    x [N, C, D, H, W], weight [K, C, T, R, S], zero padding only. Same opt-in
+    x [N, C, D, H, W], weight [K, C, T, R, S], with zero padding on each side. Same opt-in
     numerics as fp16_linear; shapes the kernel declines run torch's conv. x and out may be
     NDHWC-ordered views of larger tensors, so a tiled conv needs no per-tile copies.
     """
     stride = [stride] * 3 if isinstance(stride, int) else list(stride)
+    padding = [padding] * 3 if isinstance(padding, int) else list(padding)
     if out is None:
-        return torch.ops.comfy_kitchen.fp16_conv3d(x, weight, bias, residual, stride)
-    torch.ops.comfy_kitchen.fp16_conv3d_out(x, weight, bias, residual, stride, out)
+        return torch.ops.comfy_kitchen.fp16_conv3d(x, weight, bias, residual, stride, padding)
+    torch.ops.comfy_kitchen.fp16_conv3d_out(x, weight, bias, residual, stride, padding, out)
     return out
 
 
@@ -952,6 +961,39 @@ def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
 def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N]."""
     return _mm_int8(a, b)
+
+
+def fp16_packed_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    weight_amax: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Linear with fp16 weights on packed fp16 math, accumulated in fp32 every 16
+    products and stored as ``out_dtype`` (x's dtype by default).
+
+    The HIP backend serves gfx90c and gfx1010, which lack matrix cores and dot
+    instructions: x of any float dtype and range is scaled per row by a power of two
+    against ``weight_amax`` (the largest |weight|, computed when not given) so that no
+    fp16 partial sum overflows. Elsewhere this is ``torch.nn.functional.linear``.
+    """
+    kwargs = {"x": x, "weight": weight, "bias": bias, "out_dtype": out_dtype,
+              "weight_amax": weight_amax}
+    impl = registry.get_implementation("fp16_packed_linear", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def fp16_packed_linear_is_accelerated(device: torch.device) -> bool:
+    """Whether :func:`fp16_packed_linear` on ``device`` runs a kernel that outruns the
+    device's fp32 GEMM, so a model computing in fp32 only for want of bf16 arithmetic
+    gains by using it."""
+    return (
+        device.type == "cuda"
+        and _hip_backend is not None
+        and registry.is_available("hip")
+        and _hip_backend.fp16_packed_linear_is_accelerated(device)
+    )
 
 
 def fp16_linear(

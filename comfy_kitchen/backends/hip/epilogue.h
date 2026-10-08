@@ -67,6 +67,20 @@ struct EpiRowwise {
     }
 };
 
+// out = acc * row_scale[row] + bias[col]
+struct EpiRowScale {
+    const float* row_scale;
+    const void* bias;
+    int bias_code;
+
+    __forceinline__ __device__ void init() {}
+
+    __forceinline__ __device__ float operator()(int row, int col, float acc) const {
+        const float v = acc * row_scale[row];
+        return bias ? v + load_scalar(bias, bias_code, col) : v;
+    }
+};
+
 // Unscaled fp16 operands: out = acc + bias[col], or with resid set
 // out = resid[row * resid_stride + col] + rscale[col] * (acc + bias[col]).
 // resid_stride 0 broadcasts a single [N] residual row. All operands are fp16.

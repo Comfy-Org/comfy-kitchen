@@ -51,9 +51,15 @@ void launch_convrot_w4a4_gemm_kernel(const void*, const void*, void*, const void
                                      const void*, int, int, int, int, int, hipStream_t);
 bool launch_fp16_gemm_kernel(const void*, const void*, void*, const void*, const void*,
                              const void*, int, int, int, hipStream_t);
+bool launch_fp16_packed_linear_kernel(const void*, int, const void*, const void*, void*, void*,
+                                      const void*, int, void*, int, int, int, int, hipStream_t);
+bool launch_int8_convrot_packed_linear_kernel(const void*, int, int, const void*, float,
+                                              const void*, const void*, int, const void*, int,
+                                              void*, void*, void*, int, int, int, int,
+                                              hipStream_t);
 bool launch_fp16_conv3d_kernel(const void*, const void*, const void*, const void*, void*, int, int,
                                int, int, int, int, int, int, int, int, int, int, int, int, int,
-                               int, int, int, int, hipStream_t);
+                               int, int, int, int, int, int, int, const void*, hipStream_t);
 
 void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, hipStream_t);
 void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
@@ -104,6 +110,11 @@ void launch_sage_int8_attn(const void*, const void*, const void*, void*, const v
                            int, int, int, int, int, int, int, int, int64_t, int64_t, int64_t,
                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                            float, int, hipStream_t);
+void launch_sage_int8_block_sparse_attn(const void*, const void*, const void*, void*, const void*,
+                                        const void*, const void*, const void*, int, int, int, int,
+                                        int, int, int, int, int, int, int64_t, int64_t, int64_t,
+                                        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                                        int64_t, float, int, hipStream_t);
 
 void launch_adaln_kernel(const void*, const void*, const void*, void*, int, int, int, int, float,
                          int, int, int, bool, hipStream_t);
@@ -435,12 +446,91 @@ bool fp16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias,
     return served;
 }
 
+// D = (x @ w^T) + bias on packed fp16 math: x (fp32, fp16 or bf16) is scaled per row
+// into x16 (fp16 scratch, scale in row_scale) against w_amax, the largest |w|. false
+// means the caller serves the call.
+bool fp16_packed_linear(nb::ndarray<> x, nb::ndarray<> w, nb::ndarray<> w_amax,
+                        nb::ndarray<> x16, nb::ndarray<> row_scale, OptArray bias,
+                        nb::ndarray<> d, int M, int N, int K, int out_code,
+                        uintptr_t stream_ptr) {
+    constexpr const char* kFn = "fp16_packed_linear";
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_dtype(x, 0, 2, kFn, "x");
+    require_dtype(w, 1, 1, kFn, "w");
+    require_dtype(w_amax, 0, 0, kFn, "w_amax");
+    require_dtype(x16, 1, 1, kFn, "x16");
+    require_dtype(row_scale, 0, 0, kFn, "row_scale");
+    require_dtype(d, 0, 2, kFn, "d");
+    require_out_matches(d, out_code, kFn);
+    require_len(x, static_cast<int64_t>(M) * K, kFn, "x");
+    require_len(w, static_cast<int64_t>(N) * K, kFn, "w");
+    require_len(w_amax, 1, kFn, "w_amax");
+    require_len(x16, static_cast<int64_t>(M) * K, kFn, "x16");
+    require_len(row_scale, M, kFn, "row_scale");
+    require_len(d, static_cast<int64_t>(M) * N, kFn, "d");
+    require_bias(bias, N, kFn);
+    const bool served = launch_fp16_packed_linear_kernel(
+        x.data(), map_dtype_to_code(x.dtype()), w.data(), w_amax.data(), x16.data(),
+        row_scale.data(), opt_data(bias), opt_code(bias), d.data(), out_code, M, N, K,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return served;
+}
+
+// ConvRot INT8 linear on the packed fp16 GEMM: x (with act_code as in
+// quantize_int8_convrot) is rotated into x16 (fp16 scratch, scale in row_scale) and
+// multiplied by w16, the INT8 weight cast to fp16, under the INT8 rowwise epilogue.
+// false means the caller serves the call.
+bool int8_convrot_packed_linear(nb::ndarray<> x, int act_code, OptArray act_weight,
+                                float act_eps, nb::ndarray<> w16, nb::ndarray<> w_scale,
+                                int w_scale_stride, OptArray bias, nb::ndarray<> x16,
+                                nb::ndarray<> row_scale, nb::ndarray<> d, int M, int N, int K,
+                                int out_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "int8_convrot_packed_linear";
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_dtype(x, 0, 2, kFn, "x");
+    require_dtype(w16, 1, 1, kFn, "w16");
+    require_dtype(w_scale, 0, 0, kFn, "w_scale");
+    require_dtype(x16, 1, 1, kFn, "x16");
+    require_dtype(row_scale, 0, 0, kFn, "row_scale");
+    require_dtype(d, 0, 2, kFn, "d");
+    require_out_matches(d, out_code, kFn);
+    const int64_t in_width = act_code == 2 ? 2 : 1;
+    require_len(x, static_cast<int64_t>(M) * K * in_width, kFn, "x");
+    require_len(w16, static_cast<int64_t>(N) * K, kFn, "w16");
+    require_len(w_scale, w_scale_stride ? N : 1, kFn, "w_scale");
+    require_len(x16, static_cast<int64_t>(M) * K, kFn, "x16");
+    require_len(row_scale, M, kFn, "row_scale");
+    require_len(d, static_cast<int64_t>(M) * N, kFn, "d");
+    require_bias(bias, N, kFn);
+    if (act_code == 3) {
+        if (!act_weight.has_value()) {
+            throw std::runtime_error(std::string(kFn) + ": rms_norm requires act_weight");
+        }
+        if (map_dtype_to_code(act_weight->dtype()) != map_dtype_to_code(x.dtype())) {
+            throw std::runtime_error(std::string(kFn) + ": act_weight dtype must match x");
+        }
+        require_len(*act_weight, K, kFn, "act_weight");
+    }
+    const bool served = launch_int8_convrot_packed_linear_kernel(
+        x.data(), map_dtype_to_code(x.dtype()), act_code,
+        act_code == 3 ? act_weight->data() : nullptr, act_eps, w16.data(), w_scale.data(),
+        w_scale_stride, opt_data(bias), opt_code(bias), x16.data(), row_scale.data(), d.data(),
+        out_code, M, N, K, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return served;
+}
+
 // NDHWC conv3d, zero padding, x [N, D, H, W, C] and w [K, T, R, S, C] fp16 in that
 // memory order; out and resid are [N, Z, P, Q, K]. false means the caller serves it.
 bool fp16_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, OptArray resid,
                  nb::ndarray<> out, int N, int D, int H, int W, int C, int K, int T, int R, int S,
                  int sd, int sh, int sw, uintptr_t stream_ptr, int64_t xs_w, int64_t xs_h,
-                 int64_t xs_d, int64_t xs_n) {
+                 int64_t xs_d, int64_t xs_n, int pd, int ph, int pw, OptArray acc_scale) {
     constexpr const char* kFn = "fp16_conv3d";
     for (int64_t st : {xs_w, xs_h, xs_d, xs_n}) {
         if (st < 0 || st > INT32_MAX) {
@@ -456,10 +546,14 @@ bool fp16_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, OptArray resid
     require_positive(sd, kFn, "sd");
     require_positive(sh, kFn, "sh");
     require_positive(sw, kFn, "sw");
-    if (D < T || H < R || W < S) {
+    require_nonneg(pd, kFn, "pd");
+    require_nonneg(ph, kFn, "ph");
+    require_nonneg(pw, kFn, "pw");
+    if (D + 2 * pd < T || H + 2 * ph < R || W + 2 * pw < S) {
         throw std::runtime_error(std::string(kFn) + ": input smaller than the filter");
     }
-    const int Z = (D - T) / sd + 1, P = (H - R) / sh + 1, Q = (W - S) / sw + 1;
+    const int Z = (D + 2 * pd - T) / sd + 1, P = (H + 2 * ph - R) / sh + 1,
+              Q = (W + 2 * pw - S) / sw + 1;
     const int64_t outs = static_cast<int64_t>(N) * Z * P * Q * K;
     require_fp16(x, kFn, "x");
     require_fp16(w, kFn, "w");
@@ -475,10 +569,15 @@ bool fp16_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, OptArray resid
         require_fp16(*resid, kFn, "resid");
         require_len(*resid, outs, kFn, "resid");
     }
+    if (acc_scale.has_value()) {
+        require_dtype(*acc_scale, 0, 0, kFn, "acc_scale");
+        require_len(*acc_scale, 1, kFn, "acc_scale");
+    }
     const bool served = launch_fp16_conv3d_kernel(
         x.data(), w.data(), opt_data(bias), opt_data(resid), out.data(), N, D, H, W, C, K, T, R, S,
         Z, P, Q, sd, sh, sw, static_cast<int>(xs_w), static_cast<int>(xs_h),
-        static_cast<int>(xs_d), static_cast<int>(xs_n), reinterpret_cast<hipStream_t>(stream_ptr));
+        static_cast<int>(xs_d), static_cast<int>(xs_n), pd, ph, pw, opt_data(acc_scale),
+        reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
     return served;
 }
@@ -1829,6 +1928,81 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
 }
 
 
+// Block-sparse attention over packed layouts from sage_sdpa_quantize at cta_k 64:
+// query block b of head h reads the key tiles lut[batch, h, b, :]. The kernel trusts
+// the lut's extents, so they are all checked here; tile values outside K are skipped.
+void sage_block_sparse_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8,
+                                    nb::ndarray<> v_int8, nb::ndarray<> o, nb::ndarray<> q_scale,
+                                    nb::ndarray<> k_scale, nb::ndarray<> v_scale,
+                                    nb::ndarray<> lut, int block_q, float sm_scale,
+                                    int output_dtype_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "sage_block_sparse_prequantized";
+    constexpr int kCtaK = 64;
+    sage_require_supported_arch(q_int8, kFn);
+    if (q_int8.ndim() != 4 || k_int8.ndim() != 4 || o.ndim() != 4 || v_int8.ndim() != 2 ||
+        lut.ndim() != 4) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": q, k, o and lut must be 4D and packed v must be 2D");
+    }
+    const int batch = static_cast<int>(q_int8.shape(0));
+    const int q_heads = static_cast<int>(q_int8.shape(1));
+    const int qo_len = static_cast<int>(q_int8.shape(2));
+    const int head_dim = static_cast<int>(q_int8.shape(3));
+    const int kv_heads = static_cast<int>(k_int8.shape(1));
+    const int kv_len = static_cast<int>(k_int8.shape(2));
+    if (batch == 0 || q_heads == 0 || kv_heads == 0 || qo_len == 0 || kv_len == 0) {
+        throw std::runtime_error(
+            std::string(kFn) + ": batch, head counts and sequence lengths must be positive");
+    }
+    if (static_cast<int>(k_int8.shape(0)) != batch ||
+        static_cast<int>(k_int8.shape(3)) != head_dim || q_heads % kv_heads != 0) {
+        throw std::runtime_error(std::string(kFn) + ": incompatible quantized tensor shapes");
+    }
+    sage_check_quantized(q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, batch, q_heads,
+                         kv_heads, qo_len, kv_len, head_dim, kCtaK, kFn);
+    const int padded_k = sage_padded_k(kv_len, kCtaK);
+    if (v_int8.shape(1) != static_cast<size_t>(padded_k)) {
+        throw std::runtime_error(std::string(kFn) + ": v must be packed with cta_k 64");
+    }
+    if (block_q <= 0) {
+        throw std::runtime_error(std::string(kFn) + ": block_q must be positive");
+    }
+    const int topk = static_cast<int>(lut.shape(3));
+    if (lut.dtype() != nb::dtype<int32_t>() || static_cast<int>(lut.shape(0)) != batch ||
+        static_cast<int>(lut.shape(1)) != q_heads ||
+        static_cast<int>(lut.shape(2)) != (qo_len + block_q - 1) / block_q || topk <= 0) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": lut must be int32 [B, H_q, ceil(Lq / block_q), topk]");
+    }
+    require_packed_contiguous(lut, kFn, "lut");
+    if (lut.device_type() != nb::device::rocm::value || lut.device_id() != q_int8.device_id()) {
+        throw std::runtime_error(std::string(kFn) + ": lut must be on q's ROCm device");
+    }
+    if (output_dtype_code != 1 && output_dtype_code != 2) {
+        throw std::runtime_error(std::string(kFn) + ": output dtype must be float16 or bfloat16");
+    }
+    require_dtype(o, output_dtype_code, output_dtype_code, kFn, "o");
+    if (static_cast<int>(o.shape(0)) != batch || static_cast<int>(o.shape(1)) != q_heads ||
+        static_cast<int>(o.shape(2)) != qo_len || static_cast<int>(o.shape(3)) != head_dim) {
+        throw std::runtime_error(std::string(kFn) + ": o must be [B, H_q, Lq, D]");
+    }
+    require_packed_contiguous(o, kFn, "o");
+
+    launch_sage_int8_block_sparse_attn(
+        q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(), k_scale.data(),
+        v_scale.data(), lut.data(), topk, block_q, batch, qo_len, kv_len, sage_padded_q(qo_len),
+        q_heads, kv_heads, head_dim, padded_k / kSageKeyGroup,
+        static_cast<int64_t>(q_heads) * qo_len * head_dim, static_cast<int64_t>(qo_len) * head_dim,
+        static_cast<int64_t>(kv_heads) * kv_len * head_dim,
+        static_cast<int64_t>(kv_len) * head_dim,
+        static_cast<int64_t>(kv_heads) * head_dim * padded_k,
+        static_cast<int64_t>(head_dim) * padded_k, padded_k,
+        static_cast<int64_t>(q_heads) * qo_len * head_dim, static_cast<int64_t>(qo_len) * head_dim,
+        head_dim, sm_scale, output_dtype_code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+
 // BF16 decode attention. Every extent below is derived from the operands rather
 // than taken from the caller, and the kernel indexes with the strides passed
 // here, so a mismatch is an out-of-bounds device access. Mirrors the checks in
@@ -2372,11 +2546,21 @@ NB_MODULE(_C, m) {
     m.def("fp16_gemm", &fp16_gemm, nb::arg("a"), nb::arg("b"), nb::arg("d"),
           nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),
           nb::arg("N"), nb::arg("K"), nb::arg("stream_ptr"));
+    m.def("fp16_packed_linear", &fp16_packed_linear, nb::arg("x"), nb::arg("w"),
+          nb::arg("w_amax"), nb::arg("x16"), nb::arg("row_scale"), nb::arg("bias").none(),
+          nb::arg("d"), nb::arg("M"), nb::arg("N"), nb::arg("K"), nb::arg("out_code"),
+          nb::arg("stream_ptr"));
+    m.def("int8_convrot_packed_linear", &int8_convrot_packed_linear, nb::arg("x"),
+          nb::arg("act_code"), nb::arg("act_weight").none(), nb::arg("act_eps"), nb::arg("w16"),
+          nb::arg("w_scale"), nb::arg("w_scale_stride"), nb::arg("bias").none(), nb::arg("x16"),
+          nb::arg("row_scale"), nb::arg("d"), nb::arg("M"), nb::arg("N"), nb::arg("K"),
+          nb::arg("out_code"), nb::arg("stream_ptr"));
     m.def("fp16_conv3d", &fp16_conv3d, nb::arg("x"), nb::arg("w"), nb::arg("bias").none(),
           nb::arg("resid").none(), nb::arg("out"), nb::arg("N"), nb::arg("D"), nb::arg("H"),
           nb::arg("W"), nb::arg("C"), nb::arg("K"), nb::arg("T"), nb::arg("R"), nb::arg("S"),
           nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("stream_ptr"), nb::arg("xs_w") = 0,
-          nb::arg("xs_h") = 0, nb::arg("xs_d") = 0, nb::arg("xs_n") = 0);
+          nb::arg("xs_h") = 0, nb::arg("xs_d") = 0, nb::arg("xs_n") = 0, nb::arg("pd") = 0,
+          nb::arg("ph") = 0, nb::arg("pw") = 0, nb::arg("acc_scale").none() = nb::none());
     m.def("quantize_int8_rowwise", &quantize_int8_rowwise);
     m.def("quantize_int8_convrot", &quantize_int8_convrot, nb::arg("x"), nb::arg("q"),
           nb::arg("scales"), nb::arg("spill_rotated").none(), nb::arg("spill_partials").none(),
@@ -2429,6 +2613,7 @@ NB_MODULE(_C, m) {
           nb::arg("v_int8"), nb::arg("o"), nb::arg("q_scale"), nb::arg("k_scale"),
           nb::arg("v_scale"), nb::arg("cta_k"), nb::arg("sm_scale"),
           nb::arg("output_dtype_code"), nb::arg("stream_ptr"), nb::arg("attn_mask") = nb::none());
+    m.def("sage_block_sparse_prequantized", &sage_block_sparse_prequantized);
     m.def("adaln", &adaln);
     m.def("rms_adaln", &rms_adaln);
     m.def("group_norm_silu_pad3d", &group_norm_silu_pad3d, nb::arg("x"), nb::arg("weight").none(),

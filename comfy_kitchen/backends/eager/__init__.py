@@ -52,6 +52,7 @@ __all__ = [
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
     "fp16_linear",
+    "fp16_packed_linear",
     "int8_linear",
     "w4a8_int8_linear",
 ]
@@ -89,6 +90,7 @@ from .quantization import (
     dequantize_nvfp4,
     dequantize_per_tensor_fp8,
     fp16_linear,
+    fp16_packed_linear,
     int8_linear,
     quantize_and_rotate_rowwise,
     quantize_int8_convrot_weight,
@@ -539,6 +541,14 @@ def _build_constraints() -> dict:
             "q": ParamConstraint(dtypes=frozenset({torch.int8})),
             "scale": ParamConstraint(dtypes=standard_floats),
             "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["fp16_packed_linear"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "weight": ParamConstraint(dtypes=standard_floats),
+            "bias": ParamConstraint(dtypes=standard_floats),
         },
         default_devices=all_devices,
     )

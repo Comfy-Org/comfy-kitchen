@@ -177,6 +177,7 @@ set(HIP_SOURCES
     ops/quantize_int8.hip
     ops/gemm_fp8.hip
     ops/gemm_int8.hip
+    ops/gemm_f16_packed.hip
     ops/gemm_fp16.hip
     ops/conv3d_fp16.hip
     ops/convrot_w4a4.hip
@@ -186,6 +187,13 @@ set(HIP_SOURCES
     sage_attention/quant_qk_int8.hip
     sage_attention/quant_v_int8.hip
     sage_attention/int8_attn.hip
+    sage_attention/int8_attn_d64_f16.hip
+    sage_attention/int8_attn_d64_bf16.hip
+    sage_attention/int8_attn_d128_f16.hip
+    sage_attention/int8_attn_d128_bf16.hip
+    sage_attention/int8_attn_d256_f16.hip
+    sage_attention/int8_attn_d256_bf16.hip
+    sage_attention/int8_attn_fp16.hip
     sage_attention/sol_attn.hip
     sage_attention/sol_attn_preprocess.hip
     sage_attention/sol_attn_vtranspose.hip
