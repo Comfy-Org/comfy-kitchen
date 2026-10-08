@@ -1696,6 +1696,16 @@ static void need_contiguous(const A& a, const char* who, const char* what) {
     }
 }
 
+// [B, S, N] whose rows are contiguous but may sit in a wider tensor (column slice); returns the row stride
+template <class A>
+static int64_t row_stride_3d(const A& a, const char* who, const char* what) {
+    const int64_t ld = a.shape(1) > 1 ? a.stride(1) : a.shape(2);
+    if ((a.shape(2) > 1 && a.stride(2) != 1) || ld < a.shape(2)
+        || (a.shape(0) > 1 && a.stride(0) != ld * a.shape(1)))
+        throw std::runtime_error(std::string(who) + ": " + what + " rows must be contiguous with a uniform row stride");
+    return ld;
+}
+
 // Workspace dims and slot byte offsets, from the C++ Plan (the one definition).
 nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads, int64_t token_aug = 0) {
     int64_t v[48];
@@ -2271,6 +2281,18 @@ extern "C" {
         void* conv_out, void* conv_snaps,
         int64_t B, int64_t C, int64_t S, int64_t KS, int dtype_code, cudaStream_t stream);
 
+    bool launch_gated_delta_decode_deferred(
+        const void* x, const void* w_a, const void* w_b, const void* dt_bias, const void* g_decay,
+        const void* qkv_buf, void* gates_buf, void* sumsq_buf, const void* ctl,
+        void* state, void* out, const void* z, const void* norm_w, float eps,
+        int64_t B, int64_t Hv, int64_t Hk, int64_t S, int64_t DK, int64_t DV, int64_t C, int64_t Hd,
+        int64_t key_dim, float scale, int64_t ldz, int dtype_code, int64_t tree, cudaStream_t stream);
+
+    bool launch_deltanet_conv_deferred(
+        const void* proj, void* proj_buf, void* conv_state, const void* conv_w, const void* conv_b,
+        void* qkv_buf, const void* ctl,
+        int64_t B, int64_t C, int64_t S, int64_t KS, int64_t ldp, int dtype_code, cudaStream_t stream);
+
     bool launch_w4a8_codebook_gemv(
         const void* xq,
         const void* weight,
@@ -2464,6 +2486,16 @@ extern "C" {
         int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
         int64_t o_batch_stride, int64_t o_row_stride, int64_t o_head_stride,
         int* combine_counters, cudaStream_t stream);
+
+    void launch_flash_decode_tree_merge(
+        const void* out, const float* lse, const void* q, const void* k, const void* v, const int* mask, void* merged,
+        int batch, int rows, int heads, int kv_heads,
+        int64_t q_batch_stride, int64_t q_head_stride, int64_t q_row_stride,
+        int64_t k_batch_stride, int64_t k_head_stride, int64_t k_row_stride,
+        int64_t v_batch_stride, int64_t v_head_stride, int64_t v_row_stride,
+        int64_t o_batch_stride, int64_t o_row_stride,
+        int64_t m_batch_stride, int64_t m_row_stride,
+        cudaStream_t stream);
 
 }
 
@@ -4319,6 +4351,48 @@ void flash_attention_decode_gqa(
         output.stride(0), output.stride(1), kHeadDim, counters, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
+// Verify-tree merge: out [B, S, H*256] and lse [B, H, S] come from a prefix-only
+// flash_attention_decode_gqa (causal = false) over the S verify rows; q [B, H, S, 256] and
+// k/v [B, Hk, S, 256] are the rows' own rotated query/key/value and mask [S] the rows each
+// row must fold in (bit t = row t). merged [B, S, H*256] receives the result.
+void flash_attention_decode_tree_merge(
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> out,
+    nb::ndarray<float, nb::ndim<3>, nb::device::cuda> lse,
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> q,
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> k,
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> v,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> mask,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> merged,
+    uintptr_t stream_ptr) {
+    constexpr int64_t kHeadDim = 256;
+    const int64_t batch = q.shape(0), heads = q.shape(1), rows = q.shape(2);
+    const int64_t kv_heads = k.shape(1);
+    if (batch <= 0 || heads <= 0 || rows <= 0 || rows > 8 || kv_heads <= 0 || heads % kv_heads != 0
+        || q.shape(3) != kHeadDim || k.shape(0) != batch || k.shape(2) != rows || k.shape(3) != kHeadDim
+        || v.shape(0) != batch || v.shape(1) != kv_heads || v.shape(2) != rows || v.shape(3) != kHeadDim
+        || mask.shape(0) != rows)
+        throw std::runtime_error("Tree merge shape mismatch");
+    if (out.shape(0) != batch || out.shape(1) != rows || out.shape(2) != heads * kHeadDim
+        || merged.shape(0) != batch || merged.shape(1) != rows || merged.shape(2) != heads * kHeadDim
+        || lse.shape(0) != batch || lse.shape(1) != heads || lse.shape(2) != rows)
+        throw std::runtime_error("Tree merge output or lse shape mismatch");
+    if (map_dtype_to_code(q.dtype()) != 2 || map_dtype_to_code(k.dtype()) != 2 || map_dtype_to_code(v.dtype()) != 2
+        || map_dtype_to_code(out.dtype()) != 2 || map_dtype_to_code(merged.dtype()) != 2)
+        throw std::runtime_error("Tree merge tensors must have bfloat16 dtype");
+    if (q.stride(3) != 1 || k.stride(3) != 1 || v.stride(3) != 1 || out.stride(2) != 1 || merged.stride(2) != 1
+        || out.stride(1) != heads * kHeadDim || merged.stride(1) != heads * kHeadDim)
+        throw std::runtime_error("Unsupported tree merge strides");
+    need_contiguous(mask, "flash_attention_decode_tree_merge", "mask");
+    launch_flash_decode_tree_merge(
+        out.data(), lse.data(), q.data(), k.data(), v.data(), mask.data(), merged.data(),
+        static_cast<int>(batch), static_cast<int>(rows), static_cast<int>(heads), static_cast<int>(kv_heads),
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        out.stride(0), out.stride(1), merged.stride(0), merged.stride(1),
+        reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
 bool gated_delta_decode_fused(
     nb::ndarray<nb::ndim<3>, nb::device::cuda> mixed_qkv,      // [B, C, S] conv+silu output
     nb::ndarray<nb::ndim<3>, nb::device::cuda> x,              // [B, S, Hd]
@@ -4413,6 +4487,101 @@ bool deltanet_conv_step(
     return launch_deltanet_conv_step(
         proj.data(), conv_state.data(), conv_w.data(), conv_b.has_value() ? conv_b->data() : nullptr,
         conv_out.data(), snaps, B, C, S, KS, dtype_code, reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+bool gated_delta_decode_deferred(
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> x,              // [B, S, Hd]
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> w_a,            // [Hv, Hd]
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> w_b,            // [Hv, Hd]
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> dt_bias, // [Hv]
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> g_decay, // [Hv]
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> qkv_buf,        // [2, B, C, 8] conv+silu output
+    nb::ndarray<float, nb::ndim<5>, nb::device::cuda> gates_buf,   // [2, B, 8, Hv, 2]
+    nb::ndarray<float, nb::ndim<5>, nb::device::cuda> sumsq_buf,   // [2, B, 8, Hk, 2]
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> ctl,   // {pending, parity, slot[8], parent[8], prog[8]}
+    nb::ndarray<float, nb::ndim<4>, nb::device::cuda> state,   // [B, Hv, DK, DV]
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> out,            // [B, S, Hv, DV]
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> z,              // [B, S, Hv*DV] norm gate
+    nb::ndarray<nb::ndim<1>, nb::device::cuda> norm_w,         // [DV]
+    double eps,
+    int64_t key_dim, int64_t num_key_heads, double scale, int64_t tree, uintptr_t stream_ptr) {
+    const char* who = "gated_delta_decode_deferred";
+    const int64_t B = x.shape(0), S = x.shape(1), Hd = x.shape(2);
+    const int64_t C = qkv_buf.shape(2);
+    const int64_t Hv = state.shape(1), DK = state.shape(2), DV = state.shape(3);
+    const int dtype_code = map_dtype_to_code(x.dtype());
+    if (dtype_code < 0 || dtype_code > 2 || map_dtype_to_code(qkv_buf.dtype()) != dtype_code
+        || map_dtype_to_code(w_a.dtype()) != dtype_code || map_dtype_to_code(w_b.dtype()) != dtype_code
+        || map_dtype_to_code(out.dtype()) != dtype_code || map_dtype_to_code(z.dtype()) != dtype_code
+        || map_dtype_to_code(norm_w.dtype()) != dtype_code)
+        throw std::runtime_error(std::string(who) + ": x, w_a, w_b, qkv_buf, z, norm_w and out must share a fp32/fp16/bf16 dtype");
+    if (w_a.shape(0) != Hv || w_a.shape(1) != Hd
+        || w_b.shape(0) != Hv || w_b.shape(1) != Hd || dt_bias.shape(0) != Hv || g_decay.shape(0) != Hv
+        || state.shape(0) != B || out.shape(0) != B || out.shape(1) != S || out.shape(2) != Hv || out.shape(3) != DV
+        || z.shape(0) != B || z.shape(1) != S || z.shape(2) != Hv * DV || norm_w.shape(0) != DV
+        || num_key_heads <= 0 || Hv % num_key_heads != 0 || C < 2 * key_dim + Hv * DV
+        || key_dim != num_key_heads * DK
+        || qkv_buf.shape(0) != 2 || qkv_buf.shape(1) != B || qkv_buf.shape(3) != 8
+        || gates_buf.shape(0) != 2 || gates_buf.shape(1) != B || gates_buf.shape(2) != 8 || gates_buf.shape(3) != Hv || gates_buf.shape(4) != 2
+        || sumsq_buf.shape(0) != 2 || sumsq_buf.shape(1) != B || sumsq_buf.shape(2) != 8 || sumsq_buf.shape(3) != num_key_heads || sumsq_buf.shape(4) != 2
+        || ctl.shape(0) != 26)
+        throw std::runtime_error(std::string(who) + ": shape mismatch");
+    need_contiguous(x, who, "x");
+    need_contiguous(w_a, who, "w_a");
+    need_contiguous(w_b, who, "w_b");
+    need_contiguous(dt_bias, who, "dt_bias");
+    need_contiguous(g_decay, who, "g_decay");
+    need_contiguous(qkv_buf, who, "qkv_buf");
+    need_contiguous(gates_buf, who, "gates_buf");
+    need_contiguous(sumsq_buf, who, "sumsq_buf");
+    need_contiguous(ctl, who, "ctl");
+    need_contiguous(state, who, "state");
+    need_contiguous(out, who, "out");
+    const int64_t ldz = row_stride_3d(z, who, "z");
+    need_contiguous(norm_w, who, "norm_w");
+    return launch_gated_delta_decode_deferred(
+        x.data(), w_a.data(), w_b.data(), dt_bias.data(), g_decay.data(),
+        qkv_buf.data(), gates_buf.data(), sumsq_buf.data(), ctl.data(),
+        state.data(), out.data(), z.data(), norm_w.data(), static_cast<float>(eps),
+        B, Hv, num_key_heads, S, DK, DV, C, Hd, key_dim, static_cast<float>(scale), ldz, dtype_code, tree,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+bool deltanet_conv_deferred(
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> proj,        // [B, S, C]
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> proj_buf,    // [2, B, 8, C]
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> conv_state,  // [B, C, KS-1] in/out
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> conv_w,      // [C, KS]
+    std::optional<nb::ndarray<nb::ndim<1>, nb::device::cuda>> conv_b,  // [C]
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> qkv_buf,     // [2, B, C, 8]
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> ctl,   // {pending, parity, slot[8], parent[8], prog[8]}
+    uintptr_t stream_ptr) {
+    const char* who = "deltanet_conv_deferred";
+    const int64_t B = proj.shape(0), S = proj.shape(1), C = proj.shape(2);
+    const int64_t L = conv_state.shape(2), KS = conv_w.shape(1);
+    const int dtype_code = map_dtype_to_code(proj.dtype());
+    if (dtype_code < 0 || dtype_code > 2 || map_dtype_to_code(conv_state.dtype()) != dtype_code
+        || map_dtype_to_code(conv_w.dtype()) != dtype_code || map_dtype_to_code(qkv_buf.dtype()) != dtype_code
+        || map_dtype_to_code(proj_buf.dtype()) != dtype_code
+        || (conv_b.has_value() && map_dtype_to_code(conv_b->dtype()) != dtype_code))
+        throw std::runtime_error(std::string(who) + ": all tensors must share a fp32/fp16/bf16 dtype");
+    if (conv_state.shape(0) != B || conv_state.shape(1) != C || L != KS - 1 || conv_w.shape(0) != C
+        || proj_buf.shape(0) != 2 || proj_buf.shape(1) != B || proj_buf.shape(2) != 8 || proj_buf.shape(3) != C
+        || qkv_buf.shape(0) != 2 || qkv_buf.shape(1) != B || qkv_buf.shape(2) != C || qkv_buf.shape(3) != 8
+        || ctl.shape(0) != 26
+        || (conv_b.has_value() && conv_b->shape(0) != C))
+        throw std::runtime_error(std::string(who) + ": shape mismatch");
+    const int64_t ldp = row_stride_3d(proj, who, "proj");
+    need_contiguous(proj_buf, who, "proj_buf");
+    need_contiguous(conv_state, who, "conv_state");
+    need_contiguous(conv_w, who, "conv_w");
+    need_contiguous(qkv_buf, who, "qkv_buf");
+    need_contiguous(ctl, who, "ctl");
+    if (conv_b.has_value())
+        need_contiguous(*conv_b, who, "conv_b");
+    return launch_deltanet_conv_deferred(
+        proj.data(), proj_buf.data(), conv_state.data(), conv_w.data(), conv_b.has_value() ? conv_b->data() : nullptr,
+        qkv_buf.data(), ctl.data(), B, C, S, KS, ldp, dtype_code, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 NB_MODULE(_C, m) {
@@ -5044,6 +5213,19 @@ NB_MODULE(_C, m) {
           nb::arg("proj"), nb::arg("conv_state"), nb::arg("conv_w"), nb::arg("conv_b") = nb::none(),
           nb::arg("conv_out"), nb::arg("conv_snaps") = nb::none(), nb::arg("stream_ptr"));
 
+    m.def("gated_delta_decode_deferred", &gated_delta_decode_deferred,
+          "GatedDeltaNet decode with gate projections and q/k normalization folded in; "
+          "replays the previous step's accepted tokens before committing the state",
+          nb::arg("x"), nb::arg("w_a"), nb::arg("w_b"), nb::arg("dt_bias"), nb::arg("g_decay"),
+          nb::arg("qkv_buf"), nb::arg("gates_buf"), nb::arg("sumsq_buf"), nb::arg("ctl"),
+          nb::arg("state"), nb::arg("out"), nb::arg("z"), nb::arg("norm_w"), nb::arg("eps"),
+          nb::arg("key_dim"), nb::arg("num_key_heads"), nb::arg("scale"), nb::arg("tree"), nb::arg("stream_ptr"));
+
+    m.def("deltanet_conv_deferred", &deltanet_conv_deferred,
+          "Depthwise causal conv decode step with silu; commits the previous step's accepted window first",
+          nb::arg("proj"), nb::arg("proj_buf"), nb::arg("conv_state"), nb::arg("conv_w"), nb::arg("conv_b") = nb::none(),
+          nb::arg("qkv_buf"), nb::arg("ctl"), nb::arg("stream_ptr"));
+
     m.def("sol_attn_plan", &sol_attn_plan_py,
           "Workspace dims, slot byte offsets and total bytes for this shape and token budget",
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"), nb::arg("token_aug") = 0);
@@ -5093,6 +5275,11 @@ NB_MODULE(_C, m) {
           nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("kv_lengths"),
           nb::arg("output"), nb::arg("softmax_lse"), nb::arg("softmax_lse_accum"),
           nb::arg("output_accum"), nb::arg("combine_counters"), nb::arg("num_splits"), nb::arg("causal"), nb::arg("stream_ptr"));
+
+    m.def("flash_attention_decode_tree_merge", &flash_attention_decode_tree_merge,
+          "Fold a verify tree's own rows into a prefix-only GQA decode result using its log-sum-exp",
+          nb::arg("out"), nb::arg("lse"), nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("mask"),
+          nb::arg("merged"), nb::arg("stream_ptr"));
 
     m.def("cutlass_fp16_conv3d", &cutlass_fp16_conv3d,
           "fp16-accumulate NDHWC conv3d with fused bias/residual; false when declined",

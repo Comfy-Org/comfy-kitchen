@@ -242,6 +242,48 @@ requires_gqa_decode = pytest.mark.skipif(
 )
 
 
+@requires_gqa_decode
+def test_flash_attention_decode_tree_merge_matches_full_softmax():
+    # A verify tree's rows read the committed prefix through one non-causal decode pass and
+    # fold their own ancestors in afterwards. Row r must then equal a plain softmax over the
+    # prefix plus exactly the slots on its root-to-r path.
+    torch.manual_seed(0)
+    batch, kv_heads, groups, head_dim, capacity, prefix = 2, 2, 4, 256, 96, 37
+    heads = kv_heads * groups
+    parent = [-1, 0, 1, 2, 0, 1, 4, 4]
+    rows = len(parent)
+    key = torch.randn(batch, kv_heads, capacity, head_dim, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    q = torch.randn(batch, heads, rows, head_dim, device="cuda", dtype=torch.bfloat16)
+    xk = torch.randn(batch, kv_heads, rows, head_dim, device="cuda", dtype=torch.bfloat16)
+    xv = torch.randn_like(xk)
+    key[:, :, prefix:prefix + rows] = xk
+    value[:, :, prefix:prefix + rows] = xv
+
+    def path(r):
+        out = []
+        while r >= 0:
+            out.append(r)
+            r = parent[r]
+        return out[::-1]
+
+    mask = torch.tensor([sum(1 << t for t in path(r)) for r in range(rows)], dtype=torch.int32, device="cuda")
+    lengths = torch.full((batch,), prefix, device="cuda", dtype=torch.int32)
+    out, lse = ck.flash_attention_decode_gqa(q, key, value, lengths, return_lse=True, causal=False)
+    merged = torch.empty_like(out)
+    ck.flash_attention_decode_tree_merge(out, lse, q, xk, xv, mask, merged)
+
+    kf = key.repeat_interleave(groups, dim=1).float()
+    vf = value.repeat_interleave(groups, dim=1).float()
+    expected = torch.empty(batch, rows, heads * head_dim, device="cuda", dtype=torch.float32)
+    for r in range(rows):
+        cols = list(range(prefix)) + [prefix + t for t in path(r)]
+        scores = (q[:, :, r].float().unsqueeze(2) * kf[:, :, cols]).sum(-1) * head_dim ** -0.5
+        probs = scores.softmax(dim=-1)
+        expected[:, r] = (probs.unsqueeze(-1) * vf[:, :, cols]).sum(2).reshape(batch, heads * head_dim)
+    torch.testing.assert_close(merged.float(), expected, atol=3e-3, rtol=1e-2)
+
+
 @requires_flash_decode
 @pytest.mark.parametrize("num_splits", [2, 5, 32])
 def test_flash_attention_decode_fused_combine_matches_two_launch(monkeypatch, num_splits):

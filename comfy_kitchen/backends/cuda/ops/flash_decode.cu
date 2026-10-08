@@ -253,3 +253,121 @@ extern "C" void launch_flash_decode_gqa(
         flash::launch_flash_decode_typed<flash::Traits256, false>(params, combine_counters, stream);
     }
 }
+
+// Tree-verify rows: the GQA decode pass above attended only the committed prefix
+// (kv_lengths = the committed length, causal = false) and returned its log-sum-exp; a row's
+// own token and its ancestors inside this step are the slots that prefix skips. Fold them in
+// exactly as further softmax columns:
+//   s_t = scale * q . k_t;  m = max(lse, max_t s_t)
+//   o = (out * e^(lse - m) + sum_t v_t * e^(s_t - m)) / (e^(lse - m) + sum_t e^(s_t - m))
+// mask[j] holds the rows to fold into row j (bit t = row t, always including j itself).
+// One warp per (batch, row, head), eight dims per lane, fp32 math, bf16 out.
+namespace tree_merge {
+
+constexpr int kMergeHeadDim = 256;
+constexpr int kMergeWarps = 8;
+constexpr int kMaxRows = 8;
+
+__global__ void __launch_bounds__(kMergeWarps * 32) flash_decode_tree_merge_kernel(
+    const __nv_bfloat16* __restrict__ out, const float* __restrict__ lse,
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const int* __restrict__ mask, __nv_bfloat16* __restrict__ merged,
+    int total, int rows, int heads, int groups, float scale,
+    int64_t q_bs, int64_t q_hs, int64_t q_rs,
+    int64_t k_bs, int64_t k_hs, int64_t k_rs,
+    int64_t v_bs, int64_t v_hs, int64_t v_rs,
+    int64_t o_bs, int64_t o_rs,
+    int64_t m_bs, int64_t m_rs) {
+    const int lane = threadIdx.x & 31;
+    const int idx = blockIdx.x * kMergeWarps + (threadIdx.x >> 5);
+    if (idx >= total) return;
+    const int h = idx % heads;
+    const int j = (idx / heads) % rows;
+    const int b = idx / (heads * rows);
+    const int kh = h / groups;
+    const int d0 = lane * 8;
+    const int bits = mask[j];
+
+    const uint4 qv = *reinterpret_cast<const uint4*>(q + b * q_bs + h * q_hs + j * q_rs + d0);
+    const auto* q2 = reinterpret_cast<const __nv_bfloat162*>(&qv);
+
+    float s[kMaxRows];
+    const float l = lse[(b * heads + h) * rows + j];
+    float m = l;
+#pragma unroll
+    for (int t = 0; t < kMaxRows; ++t) {
+        s[t] = -INFINITY;
+        if (t < rows && (bits & (1 << t))) {
+            const uint4 kv4 = *reinterpret_cast<const uint4*>(k + b * k_bs + kh * k_hs + t * k_rs + d0);
+            const auto* k2 = reinterpret_cast<const __nv_bfloat162*>(&kv4);
+            float dot = 0.f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 qf = __bfloat1622float2(q2[i]), kf = __bfloat1622float2(k2[i]);
+                dot += qf.x * kf.x + qf.y * kf.y;
+            }
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off);
+            s[t] = dot * scale;
+            m = fmaxf(m, s[t]);
+        }
+    }
+
+    const float w_flash = expf(l - m);
+    float denom = w_flash;
+    float acc[8];
+    const uint4 ov = *reinterpret_cast<const uint4*>(out + b * o_bs + j * o_rs + h * kMergeHeadDim + d0);
+    const auto* o2 = reinterpret_cast<const __nv_bfloat162*>(&ov);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 of = __bfloat1622float2(o2[i]);
+        acc[2 * i] = of.x * w_flash;
+        acc[2 * i + 1] = of.y * w_flash;
+    }
+#pragma unroll
+    for (int t = 0; t < kMaxRows; ++t) {
+        if (t < rows && (bits & (1 << t))) {
+            const float w = expf(s[t] - m);
+            denom += w;
+            const uint4 vv = *reinterpret_cast<const uint4*>(v + b * v_bs + kh * v_hs + t * v_rs + d0);
+            const auto* v2 = reinterpret_cast<const __nv_bfloat162*>(&vv);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 vf = __bfloat1622float2(v2[i]);
+                acc[2 * i] = fmaf(vf.x, w, acc[2 * i]);
+                acc[2 * i + 1] = fmaf(vf.y, w, acc[2 * i + 1]);
+            }
+        }
+    }
+    const float inv = 1.f / denom;
+    uint4 res;
+    auto* r2 = reinterpret_cast<__nv_bfloat162*>(&res);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        r2[i] = __floats2bfloat162_rn(acc[2 * i] * inv, acc[2 * i + 1] * inv);
+    *reinterpret_cast<uint4*>(merged + b * m_bs + j * m_rs + h * kMergeHeadDim + d0) = res;
+}
+
+} // namespace tree_merge
+
+extern "C" void launch_flash_decode_tree_merge(
+    const void* out, const float* lse, const void* q, const void* k, const void* v, const int* mask, void* merged,
+    int batch, int rows, int heads, int kv_heads,
+    int64_t q_batch_stride, int64_t q_head_stride, int64_t q_row_stride,
+    int64_t k_batch_stride, int64_t k_head_stride, int64_t k_row_stride,
+    int64_t v_batch_stride, int64_t v_head_stride, int64_t v_row_stride,
+    int64_t o_batch_stride, int64_t o_row_stride,
+    int64_t m_batch_stride, int64_t m_row_stride,
+    cudaStream_t stream) {
+    using namespace tree_merge;
+    const int warps = batch * rows * heads;
+    flash_decode_tree_merge_kernel<<<(warps + kMergeWarps - 1) / kMergeWarps, kMergeWarps * 32, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(out), lse,
+        static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(k), static_cast<const __nv_bfloat16*>(v),
+        mask, static_cast<__nv_bfloat16*>(merged),
+        warps, rows, heads, heads / kv_heads, 1.0f / sqrtf(float(kMergeHeadDim)),
+        q_batch_stride, q_head_stride, q_row_stride,
+        k_batch_stride, k_head_stride, k_row_stride,
+        v_batch_stride, v_head_stride, v_row_stride,
+        o_batch_stride, o_row_stride, m_batch_stride, m_row_stride);
+}

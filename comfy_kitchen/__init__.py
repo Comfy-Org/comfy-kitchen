@@ -22,9 +22,15 @@ from .exceptions import (
 from .flash_attention import flash_attention_decode
 from .flash_attention import is_available as flash_attention_decode_is_available
 from .flash_attention import flash_attention_decode_gqa, flash_attention_decode_gqa_is_available
+from .flash_attention import flash_attention_decode_tree_merge
 from .float_utils import from_blocked, swap_nibbles, to_blocked
 from .gated_delta import deltanet_conv_step, gated_delta_decode_fused
 from .gated_delta import is_available as gated_delta_decode_is_available
+from .gated_delta import deferred_is_available as gated_delta_deferred_is_available
+from .gated_delta import deferred_buffers as gated_delta_deferred_buffers
+from .gated_delta import deltanet_conv_step_deferred, gated_delta_decode_deferred
+from .gated_delta import CTL_INTS as gated_delta_ctl_ints  # noqa: N811
+from .gated_delta import SLOT_MAX as gated_delta_slot_max  # noqa: N811
 from .registry import registry
 from .sage_attention import (
     PrequantizedInt8Attention,
@@ -73,9 +79,16 @@ __all__ = [
     "flash_attention_decode",
     "flash_attention_decode_gqa",
     "flash_attention_decode_gqa_is_available",
+    "flash_attention_decode_tree_merge",
     "gated_delta_decode_fused",
     "deltanet_conv_step",
     "gated_delta_decode_is_available",
+    "gated_delta_deferred_is_available",
+    "gated_delta_deferred_buffers",
+    "deltanet_conv_step_deferred",
+    "gated_delta_decode_deferred",
+    "gated_delta_ctl_ints",
+    "gated_delta_slot_max",
     "flash_attention_decode_is_available",
     "rms_rope_kv_decode",
     "rms_rope_kv_decode_is_available",

@@ -201,3 +201,24 @@ def flash_attention_decode_gqa(
     if return_lse:
         return output, softmax_lse.view(batch, heads, query_length)
     return output
+
+
+def flash_attention_decode_tree_merge(
+    out: torch.Tensor, lse: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    mask: torch.Tensor, merged: torch.Tensor,
+) -> torch.Tensor:
+    """Fold a verify tree's own rows into a prefix-only decode result.
+
+    ``out`` [B, S, H*256] and ``lse`` [B, H, S] come from flash_attention_decode_gqa over the
+    committed prefix with causal=False; q [B, H, S, 256] and k/v [B, Hk, S, 256] are the verify
+    rows' own rotated query/key/value, and mask [S] int32 the rows each row attends inside the
+    step (bit t = row t, including itself). Writes and returns ``merged`` [B, S, H*256]."""
+    if not flash_attention_decode_gqa_is_available(q.device, q.dtype):
+        raise RuntimeError(
+            "flash_attention_decode_tree_merge requires BF16 inputs and the CUDA extension on SM80 or newer"
+        )
+    _cuda_backend._C.flash_attention_decode_tree_merge(
+        *map(_cuda_backend._wrap_for_dlpack, (out, lse, q, k, v, mask, merged)),
+        torch.cuda.current_stream(q.device).cuda_stream,
+    )
+    return merged
