@@ -139,12 +139,14 @@ def gated_delta_decode_deferred(
     """S GatedDeltaNet decode steps from qkv_buf[ctl[1]] written by deltanet_conv_step_deferred.
 
     Replays the `ctl[0]` accepted tokens of the previous step from the [1 - parity] side
-    buffers (at the slots named by ctl), writes the committed fp32 state [B, Hv, DK, DV] in
+    buffers (at the slots named by ctl), writes the committed fp32/bf16 state [B, Hv, DK, DV] in
     place, then returns the outputs of the S current rows without committing them. tree != 0
     runs the rows through ctl's program (entry = row | commit << 5, in depth-first order: a
     chain row commits, the leaves off it then run without committing) instead of as a straight
     chain; a row's ancestors are ctl's parent[]
     (see deltanet_conv_step_deferred). State, dt_bias and g_decay must be contiguous.
+    Arithmetic is fp32. BF16 state rounds once after replay, before the current rows;
+    speculative rows never round or write the persistent state.
     """
     batch, seq, _ = x.shape
     heads, key_dim_head, value_dim = state.shape[1], state.shape[2], state.shape[3]

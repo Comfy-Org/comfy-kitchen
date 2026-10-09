@@ -168,7 +168,8 @@ class TestGatedDeltaDeferred:
     STEPS = ((4, 0), (4, 3), (4, 1), (6, 5), (6, 2), (1, 0), (8, 7), (3, 0), (1, 0))
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-    def test_matches_eager_with_rollback(self, dtype, seed):
+    @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+    def test_matches_eager_with_rollback(self, dtype, state_dtype, seed):
         dev = "cuda"
         w = torch.randn(C, 1, KS, device=dev, dtype=dtype) * 0.5
         b = torch.randn(C, device=dev, dtype=dtype) * 0.1
@@ -178,18 +179,19 @@ class TestGatedDeltaDeferred:
         g_decay = -torch.rand(HV, device=dev) - 0.5
         norm_w = torch.rand(DV, device=dev, dtype=dtype) + 0.5
         conv_state = torch.randn(B, C, KS - 1, device=dev, dtype=dtype)
-        state = torch.randn(B, HV, DK, DV, device=dev) * 0.1
-        ref_conv_state, ref_state = conv_state.clone(), state.clone()
+        state = (torch.randn(B, HV, DK, DV, device=dev) * 0.1).to(state_dtype)
+        ref_conv_state, ref_state = conv_state.clone(), state.float().clone()
 
         qkv_buf, proj_buf, gates_buf, sumsq_buf = ck.gated_delta_deferred_buffers(B, C, HV, HK, dtype, torch.device(dev))
         ctl = torch.zeros((ck.gated_delta_ctl_ints,), dtype=torch.int32, device=dev)
-        tol = 1e-5 if dtype == torch.float32 else 5e-3
+        tol = 1e-5 if dtype == state_dtype == torch.float32 else 5e-3
         pending, parity = 0, 0
         for i, (seq, accepts) in enumerate(self.STEPS):
             proj = torch.randn(B, seq, C, device=dev, dtype=dtype)
             x = torch.randn(B, seq, HD, device=dev, dtype=dtype)
             z = torch.randn(B, seq, HV * DV, device=dev, dtype=dtype)
 
+            ref_state = ref_state.to(state_dtype).float()
             ctl.copy_(_ctl(pending, parity))
             ck.deltanet_conv_step_deferred(proj, conv_state, w, b, proj_buf, qkv_buf, ctl)
             got = ck.gated_delta_decode_deferred(x, w_a, w_b, dt_bias, g_decay, state, KEY_DIM, HK, SCALE,
@@ -225,7 +227,8 @@ class TestGatedDeltaDeferred:
     )
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-    def test_tree_rows_and_path_commit(self, dtype, seed):
+    @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+    def test_tree_rows_and_path_commit(self, dtype, state_dtype, seed):
         # Every row of a verify tree must equal the eager run of its own root-to-row token
         # sequence, and committing an accepted path (ctl slots) must equal running that
         # sequence alone.
@@ -240,11 +243,11 @@ class TestGatedDeltaDeferred:
         g_decay = -torch.rand(HV, device=dev) - 0.5
         norm_w = torch.rand(DV, device=dev, dtype=dtype) + 0.5
         conv_state = torch.randn(B, C, KS - 1, device=dev, dtype=dtype)
-        state = torch.randn(B, HV, DK, DV, device=dev) * 0.1
-        ref_conv_state, ref_state = conv_state.clone(), state.clone()
+        state = (torch.randn(B, HV, DK, DV, device=dev) * 0.1).to(state_dtype)
+        ref_conv_state, ref_state = conv_state.clone(), state.float().clone()
         qkv_buf, proj_buf, gates_buf, sumsq_buf = ck.gated_delta_deferred_buffers(B, C, HV, HK, dtype, torch.device(dev))
         ctl = torch.zeros((ck.gated_delta_ctl_ints,), dtype=torch.int32, device=dev)
-        tol = 1e-5 if dtype == torch.float32 else 5e-3
+        tol = 1e-5 if dtype == state_dtype == torch.float32 else 5e-3
 
         def run(proj, x, z, ctl_host, tree):
             ctl.copy_(ctl_host)
@@ -268,6 +271,7 @@ class TestGatedDeltaDeferred:
         z = torch.randn(B, seq, HV * DV, device=dev, dtype=dtype)
         run(proj, x, z, _ctl(0, 0), 0)
         _eager_step(proj[:, :2], ref_conv_state, w, b, x[:, :2], w_a, w_b, dt_bias, g_decay, ref_state, z[:, :2], norm_w, 2)
+        ref_state = ref_state.to(state_dtype).float()
 
         # step 1: the tree
         proj = torch.randn(B, rows_n, C, device=dev, dtype=dtype)
@@ -286,6 +290,7 @@ class TestGatedDeltaDeferred:
         accepted = [0, 1, 4]
         _eager_step(proj[:, accepted], ref_conv_state, w, b, x[:, accepted], w_a, w_b, dt_bias, g_decay,
                     ref_state, z[:, accepted], norm_w, len(accepted))
+        ref_state = ref_state.to(state_dtype).float()
         seq = 3
         proj = torch.randn(B, seq, C, device=dev, dtype=dtype)
         x = torch.randn(B, seq, HD, device=dev, dtype=dtype)

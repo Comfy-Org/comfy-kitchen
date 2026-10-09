@@ -398,7 +398,7 @@ __global__ void deltanet_conv_deferred_kernel(
 #define CLUSTER_DIMS(cl) __cluster_dims__(cl, 1, 1)
 #endif
 
-template <typename T, int DK, int DV, int S, bool Tree>
+template <typename T, typename State, int DK, int DV, int S, bool Tree>
 __global__ void CLUSTER_DIMS(4) __launch_bounds__(256, 2)
 gated_delta_decode_deferred_kernel(
     const T* __restrict__ x,           // [B, S, Hd]
@@ -410,7 +410,7 @@ gated_delta_decode_deferred_kernel(
     float* __restrict__ gates_buf,     // [2, B, kSlotMax, Hv, 2]: decay g, beta
     float* __restrict__ sumsq_buf,     // [2, B, kSlotMax, Hk, 2]: sum q^2, sum k^2
     const int* __restrict__ ctl,       // {pending, parity, slot[8], parent[8], prog[8]}
-    float* __restrict__ state,         // [B, Hv, DK, DV] committed state, updated in place
+    State* __restrict__ state,         // [B, Hv, DK, DV] committed state, updated in place
     T* __restrict__ out,               // [B, S, Hv, DV]
     const T* __restrict__ z,           // [B, S, Hv*DV] norm gate, row stride ldz
     const T* __restrict__ norm_w,      // [DV]
@@ -458,10 +458,10 @@ gated_delta_decode_deferred_kernel(
     float st[KPL];
     #pragma unroll
     for (int r = 0; r < KPL; ++r)
-        st[r] = state[state_off + tile_off + r * DV];
-    // ring consumption: this block's [DK, COLS] fp32 tile of the state, when the host listed it
+        st[r] = to_f<State>(state[state_off + tile_off + r * DV]);
+    // ring consumption: this block's [DK, COLS] stored tile, when the host listed it
     if (t == 0 && g_gated_delta_prefetch_ring != nullptr && (g_gated_delta_prefetch_ring->credits & PREFETCH_RING_CREDIT_DELTA))
-        prefetch_ring_consume_device(g_gated_delta_prefetch_ring, static_cast<uint64_t>(DK) * COLS * sizeof(float));
+        prefetch_ring_consume_device(g_gated_delta_prefetch_ring, static_cast<uint64_t>(DK) * COLS * sizeof(State));
 
     // gate projections of the current tokens (bf16 projection outputs, bf16 sigmoid,
     // fp32 softplus/exp, as in the eager chain) and the q/k sums of squares
@@ -621,8 +621,12 @@ gated_delta_decode_deferred_kernel(
     for (int i = 0; i < pending; ++i)
         step(i, false, 0);
     #pragma unroll
-    for (int r = 0; r < KPL; ++r)
-        state[state_off + tile_off + r * DV] = st[r];
+    for (int r = 0; r < KPL; ++r) {
+        // Current rows start from the same rounded state that survives this step.
+        const State stored = comfy::from_float<State>(st[r]);
+        state[state_off + tile_off + r * DV] = stored;
+        st[r] = to_f<State>(stored);
+    }
     // current tokens: outputs only, state stays uncommitted until the next step
     if constexpr (Tree) {
         // prog[e] = row | commit << 5, in depth-first order
@@ -746,10 +750,10 @@ extern "C" bool launch_gated_delta_decode_deferred(
     const void* qkv_buf, void* gates_buf, void* sumsq_buf, const void* ctl,
     void* state, void* out, const void* z, const void* norm_w, float eps,
     int64_t B, int64_t Hv, int64_t Hk, int64_t S, int64_t DK, int64_t DV, int64_t C, int64_t Hd,
-    int64_t key_dim, float scale, int64_t ldz, int dtype_code, int64_t tree, cudaStream_t stream)
+    int64_t key_dim, float scale, int64_t ldz, int dtype_code, int state_dtype_code, int64_t tree, cudaStream_t stream)
 {
     if (DK != 128 || DV != 128 || S < 1 || S > kSlotMax || Hk <= 0 || Hv % Hk != 0 || Hd % 8 != 0
-            || dtype_code < 0 || dtype_code > 2)
+            || dtype_code < 0 || dtype_code > 2 || (state_dtype_code != 0 && state_dtype_code != 2))
         return false;
     int device = 0, cc_major = 0;
     if (cudaGetDevice(&device) != cudaSuccess
@@ -758,14 +762,20 @@ extern "C" bool launch_gated_delta_decode_deferred(
         return false;
     return DISPATCH_FP_DTYPE(dtype_code, T, [&] {
         auto launch = [&]<int Steps, bool IsTree = false>() {
-            gated_delta_decode_deferred_kernel<T, 128, 128, Steps, IsTree><<<static_cast<unsigned>(B * Hv * 4), 256, 0, stream>>>(
-                static_cast<const T*>(x), static_cast<const T*>(w_a), static_cast<const T*>(w_b),
-                static_cast<const float*>(dt_bias), static_cast<const float*>(g_decay),
-                static_cast<const T*>(qkv_buf), static_cast<float*>(gates_buf), static_cast<float*>(sumsq_buf),
-                static_cast<const int*>(ctl), static_cast<float*>(state), static_cast<T*>(out),
-                static_cast<const T*>(z), static_cast<const T*>(norm_w), eps,
-                static_cast<int>(B), static_cast<int>(Hv), static_cast<int>(Hk),
-                static_cast<int>(C), static_cast<int>(Hd), static_cast<int>(key_dim), scale, static_cast<int>(ldz));
+            auto typed = [&]<typename State>() {
+                gated_delta_decode_deferred_kernel<T, State, 128, 128, Steps, IsTree><<<static_cast<unsigned>(B * Hv * 4), 256, 0, stream>>>(
+                    static_cast<const T*>(x), static_cast<const T*>(w_a), static_cast<const T*>(w_b),
+                    static_cast<const float*>(dt_bias), static_cast<const float*>(g_decay),
+                    static_cast<const T*>(qkv_buf), static_cast<float*>(gates_buf), static_cast<float*>(sumsq_buf),
+                    static_cast<const int*>(ctl), static_cast<State*>(state), static_cast<T*>(out),
+                    static_cast<const T*>(z), static_cast<const T*>(norm_w), eps,
+                    static_cast<int>(B), static_cast<int>(Hv), static_cast<int>(Hk),
+                    static_cast<int>(C), static_cast<int>(Hd), static_cast<int>(key_dim), scale, static_cast<int>(ldz));
+            };
+            if (state_dtype_code == 2)
+                typed.template operator()<__nv_bfloat16>();
+            else
+                typed.template operator()<float>();
         };
         if (tree != 0) {
             // tree verify: the ctl program decides the schedule, S only sizes the kernel

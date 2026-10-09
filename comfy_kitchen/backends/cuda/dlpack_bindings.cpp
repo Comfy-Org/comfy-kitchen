@@ -2323,7 +2323,7 @@ extern "C" {
         const void* qkv_buf, void* gates_buf, void* sumsq_buf, const void* ctl,
         void* state, void* out, const void* z, const void* norm_w, float eps,
         int64_t B, int64_t Hv, int64_t Hk, int64_t S, int64_t DK, int64_t DV, int64_t C, int64_t Hd,
-        int64_t key_dim, float scale, int64_t ldz, int dtype_code, int64_t tree, cudaStream_t stream);
+        int64_t key_dim, float scale, int64_t ldz, int dtype_code, int state_dtype_code, int64_t tree, cudaStream_t stream);
 
     bool launch_deltanet_conv_deferred(
         const void* proj, void* proj_buf, void* conv_state, const void* conv_w, const void* conv_b,
@@ -4536,7 +4536,7 @@ bool gated_delta_decode_deferred(
     nb::ndarray<float, nb::ndim<5>, nb::device::cuda> gates_buf,   // [2, B, 8, Hv, 2]
     nb::ndarray<float, nb::ndim<5>, nb::device::cuda> sumsq_buf,   // [2, B, 8, Hk, 2]
     nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> ctl,   // {pending, parity, slot[8], parent[8], prog[8]}
-    nb::ndarray<float, nb::ndim<4>, nb::device::cuda> state,   // [B, Hv, DK, DV]
+    nb::ndarray<nb::ndim<4>, nb::device::cuda> state,          // [B, Hv, DK, DV], fp32 or bf16
     nb::ndarray<nb::ndim<4>, nb::device::cuda> out,            // [B, S, Hv, DV]
     nb::ndarray<nb::ndim<3>, nb::device::cuda> z,              // [B, S, Hv*DV] norm gate
     nb::ndarray<nb::ndim<1>, nb::device::cuda> norm_w,         // [DV]
@@ -4547,6 +4547,9 @@ bool gated_delta_decode_deferred(
     const int64_t C = qkv_buf.shape(2);
     const int64_t Hv = state.shape(1), DK = state.shape(2), DV = state.shape(3);
     const int dtype_code = map_dtype_to_code(x.dtype());
+    const int state_dtype_code = map_dtype_to_code(state.dtype());
+    if (state_dtype_code != 0 && state_dtype_code != 2)
+        throw std::runtime_error(std::string(who) + ": state must be fp32 or bf16");
     if (dtype_code < 0 || dtype_code > 2 || map_dtype_to_code(qkv_buf.dtype()) != dtype_code
         || map_dtype_to_code(w_a.dtype()) != dtype_code || map_dtype_to_code(w_b.dtype()) != dtype_code
         || map_dtype_to_code(out.dtype()) != dtype_code || map_dtype_to_code(z.dtype()) != dtype_code
@@ -4580,7 +4583,7 @@ bool gated_delta_decode_deferred(
         x.data(), w_a.data(), w_b.data(), dt_bias.data(), g_decay.data(),
         qkv_buf.data(), gates_buf.data(), sumsq_buf.data(), ctl.data(),
         state.data(), out.data(), z.data(), norm_w.data(), static_cast<float>(eps),
-        B, Hv, num_key_heads, S, DK, DV, C, Hd, key_dim, static_cast<float>(scale), ldz, dtype_code, tree,
+        B, Hv, num_key_heads, S, DK, DV, C, Hd, key_dim, static_cast<float>(scale), ldz, dtype_code, state_dtype_code, tree,
         reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
