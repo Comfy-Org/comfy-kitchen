@@ -5,6 +5,8 @@ import triton.language as tl
 from comfy_kitchen._rope_utils import check_rope_inplace, detect_rms_rope_bnhd
 from comfy_kitchen.backends.eager import rope as _eager_rope
 
+from .rope import _rot_pair
+
 
 @triton.jit
 def rms_rope_kernel(
@@ -85,8 +87,12 @@ def rms_rope_kernel(
     freqs_10 = tl.load(freqs_base + stride_freqs_rot, mask=mask, other=0.0 )
     freqs_11 = tl.load(freqs_base + stride_freqs_rot + stride_freqs_pair, mask=mask, other=0.0)
 
-    out_0 = freqs_00 * x_0 + freqs_01 * x_1
-    out_1 = freqs_10 * x_0 + freqs_11 * x_1
+    # Same rounding as the reference formula, and for the same reason: see
+    # _rot_pair in backends/triton/rope.py. Fusing these into one expression
+    # contracts to a single FMA and lands a full ulp from the reference, which
+    # in bf16 is 0.8% of the value.
+    out_0 = _rot_pair(freqs_00, freqs_01, x_0, x_1, compute_dtype)
+    out_1 = _rot_pair(freqs_10, freqs_11, x_0, x_1, compute_dtype)
 
     tl.store(out_base + dim_idx_0 * stride_out_dim, out_0, mask=mask)
     tl.store(out_base + dim_idx_1 * stride_out_dim, out_1, mask=mask)

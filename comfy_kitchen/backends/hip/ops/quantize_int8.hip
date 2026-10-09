@@ -2,9 +2,44 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // INT8 quantization kernels for the WMMA int8 GEMM.
+//
+// Where this stands against the memory system, so nobody re-derives it.
+//
+// Measured streaming ceilings on the 6-CU gfx1035 (16 B per lane per request,
+// footprints past the 2 MiB L2, so DRAM not cache):
+//
+//   read only             88.2 GB/s
+//   copy    (read+write)  70.1 GB/s
+//   write only            69.9 GB/s
+//   triad   (2r + 1w)     69.0 GB/s
+//   copy at 4 B per lane  64.4 GB/s
+//
+// An earlier note in this project recorded "89.7 GB/s" as *the* ceiling. That is
+// the read number, so it was right as a read ceiling and wrong the moment it was
+// used as the denominator for a kernel that also writes -- read+write tops out at
+// 70, and the rowwise quantiser has a 2:1 read:write ratio, so its ceiling is the
+// copy number and nothing above it.
+//
+// Against that ceiling, the rowwise quantiser's own traffic is exact and small:
+// read M*K*esize, write M*K int8 plus 4*M of scales, so 3*M*K + 4*M bytes for
+// fp16 in. Measured:
+//
+//   12288 x 8192   302.0 MB   3.957 ms   76.3 GB/s   109% of copy
+//    4096 x 4096    50.3 MB   0.659 ms   76.4 GB/s   109%
+//   12288 x 2048    75.5 MB   1.023 ms   73.8 GB/s   105%
+//    3072 x 1280    11.8 MB   0.192 ms   61.6 GB/s    88%
+//
+// It is at the memory limit and reads above the copy ceiling because its writes
+// are dense int8 and its read:write ratio is 2:1 rather than 1:1, which leaves
+// more of the read headroom. There is no headroom left here; the vectorised
+// 16-byte path below is what put it there (it was 0.56x of triton's before, and
+// 68.9 GB/s instead of 148). The only remaining overhead is the two torch.empty
+// calls in the public wrapper, 1.01-1.17x on top, which is allocator cost and not
+// worth an aliasing buffer to avoid.
 #include <stdexcept>
 
 #include "../hadamard.h"
+#include "../launchers.h"  // comfy_small_igpu
 
 namespace comfy::hip_backend {
 
@@ -17,7 +52,242 @@ __forceinline__ __device__ int8_t quant_round(float v, float inv) {
     return static_cast<int8_t>(q);
 }
 
+// 16-byte element loads for the rowwise quantizer: 4 floats or 8 16-bit values
+// per thread per chunk, so a warp requests a full 512B run of a row at once
+// instead of 64B with the old scalar stride. The staging keeps the values in
+// registers, so the row is still read exactly once when it fits the budget.
+template <int CODE>
+__forceinline__ __device__ void load_vec16(const uint4 v, float* out) {
+    if constexpr (CODE == 0) {
+        const float* f = reinterpret_cast<const float*>(&v);
+        out[0] = f[0];
+        out[1] = f[1];
+        out[2] = f[2];
+        out[3] = f[3];
+    } else if constexpr (CODE == 1) {
+        const __half* h = reinterpret_cast<const __half*>(&v);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) out[i] = __half2float(h[i]);
+    } else {
+        const __bf16* b = reinterpret_cast<const __bf16*>(&v);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) out[i] = static_cast<float>(b[i]);
+    }
+}
+
+__forceinline__ __device__ void load_vec16_rt(const uint4 v, float* out, int code) {
+    if (code == 0)
+        load_vec16<0>(v, out);
+    else if (code == 1)
+        load_vec16<1>(v, out);
+    else
+        load_vec16<2>(v, out);
+}
+
+// Packs kVec quantized int8 values into one aligned store (8 bytes for 16-bit
+// inputs, 4 for f32). WIDTH: 0/1 selects the store width at runtime.
+__forceinline__ __device__ void quant_store_vec_rt(const float* vals, int8_t* q, float inv,
+                                                   int width) {
+    if (width == 4) {
+        int32_t p = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+            p |= static_cast<int32_t>(static_cast<uint8_t>(quant_round(vals[i], inv))) << (8 * i);
+        *reinterpret_cast<int32_t*>(q) = p;
+    } else {
+        int64_t p = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i)
+            p |= static_cast<int64_t>(static_cast<uint8_t>(quant_round(vals[i], inv))) << (8 * i);
+        *reinterpret_cast<int64_t*>(q) = p;
+    }
+}
+
 // One block per row: block-reduce the row absmax, then quantize the row.
+// gfx1103 iGPU path (selected in launch_quantize_int8_rowwise_kernel): reads x
+// once when the row fits the per-thread register budget (K <= 12288),
+// which on a bandwidth-limited iGPU saves a full second global read of x; the
+// two-pass fallback covers arbitrarily long rows. Loads are 16-byte chunks
+// (8 bf16/fp16 or 4 fp32 per thread), so a warp covers 512 bytes of a row per
+// request. The staged values use unrolled loops with statically-known indices
+// so they stay in registers (dynamic indexing would spill them to local
+// memory, which on an iGPU is a round trip through DRAM). The K % 16 == 0
+// contract of the callers keeps every row 16-byte aligned; the scalar path
+// below covers anything else.
+constexpr int kQuantMaxStaged = 48;  // floats per thread, K / 256 <= 48
+
+__global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel_staged(
+    const void* __restrict__ x, int in_code, int8_t* __restrict__ q,
+    float* __restrict__ scales, int M, int K) {
+
+    __shared__ float red[8];  // one slot per warp
+    const int row = blockIdx.x;
+    const int t = threadIdx.x;
+    const int w = t / 32;
+    const int lane = t % 32;
+    const int64_t base = static_cast<int64_t>(row) * K;
+
+    const bool staged = ((K + 255) / 256 <= kQuantMaxStaged);
+    const bool is_f32 = (in_code == 0);
+    const bool vec = is_f32 ? (K % 4 == 0) : (K % 8 == 0);
+    const bool packed = staged && vec;
+
+    float vals[kQuantMaxStaged];  // register-resident when staged
+    float lmax = 0.0f;
+
+    if (!vec) {
+        for (int j = t; j < K; j += 256)
+            lmax = fmaxf(lmax, fabsf(load_in(x, base + j, in_code)));
+    } else if (is_f32) {
+        // One 16-byte chunk (4 floats) per lane per block-wide step of 1024
+        // elements. The staged rows keep c statically bounded so vals[] stays in
+        // registers (runtime c would spill it to local memory); a row longer than
+        // the staged window reduces every chunk with runtime c so the absmax scale
+        // still spans the whole row before the two-pass output below quantizes it.
+        if (staged) {
+            #pragma unroll
+            for (int c = 0; c < kQuantMaxStaged / 4; ++c) {
+                const int j = t * 4 + c * 1024;
+                if (j < K) {
+                    const uint4 v = *reinterpret_cast<const uint4*>(
+                        static_cast<const char*>(x) + (base + j) * 4);
+                    float tmp[4];
+                    load_vec16_rt(v, tmp, 0);
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        lmax = fmaxf(lmax, fabsf(tmp[i]));
+                        vals[c * 4 + i] = tmp[i];
+                    }
+                }
+            }
+        } else {
+            for (int j = t * 4; j < K; j += 1024) {
+                const uint4 v = *reinterpret_cast<const uint4*>(
+                    static_cast<const char*>(x) + (base + j) * 4);
+                float tmp[4];
+                load_vec16_rt(v, tmp, 0);
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) lmax = fmaxf(lmax, fabsf(tmp[i]));
+            }
+        }
+    } else {
+        if (staged) {
+            #pragma unroll
+            for (int c = 0; c < kQuantMaxStaged / 8; ++c) {
+                const int j = t * 8 + c * 2048;
+                if (j < K) {
+                    const uint4 v = *reinterpret_cast<const uint4*>(
+                        static_cast<const char*>(x) + (base + j) * 2);
+                    float tmp[8];
+                    load_vec16_rt(v, tmp, in_code);
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        lmax = fmaxf(lmax, fabsf(tmp[i]));
+                        vals[c * 8 + i] = tmp[i];
+                    }
+                }
+            }
+        } else {
+            for (int j = t * 8; j < K; j += 2048) {
+                const uint4 v = *reinterpret_cast<const uint4*>(
+                    static_cast<const char*>(x) + (base + j) * 2);
+                float tmp[8];
+                load_vec16_rt(v, tmp, in_code);
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) lmax = fmaxf(lmax, fabsf(tmp[i]));
+            }
+        }
+    }
+
+    // Warp-shuffle block reduction: two barriers instead of one per halving
+    // step of the full block.
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) lmax = fmaxf(lmax, __shfl_xor(lmax, off, 32));
+    if (lane == 0) red[w] = lmax;
+    __syncthreads();
+    if (w == 0) {
+        const float tmax = (lane < 8) ? red[lane] : 0.0f;
+        float v = tmax;
+        #pragma unroll
+        for (int off = 4; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor(v, off, 32));
+        if (lane == 0) red[0] = v;
+    }
+    __syncthreads();
+
+    const float scale = fmaxf(red[0] / kInt8Max, 1e-30f);
+    if (t == 0) scales[row] = scale;
+    const float inv = 1.0f / scale;
+
+    // Packed (staged and vectorizable) rows write out of the staged registers.
+    // Short non-vectorizable rows (K not a whole chunk) leave vals unfilled, so
+    // they fall through to the scalar second pass below. packed implies staged,
+    // so c stays statically bounded and vals[] stays in registers.
+    if (packed) {
+        if (is_f32) {
+            #pragma unroll
+            for (int c = 0; c < kQuantMaxStaged / 4; ++c) {
+                const int j = t * 4 + c * 1024;
+                if (j < K) quant_store_vec_rt(vals + c * 4, q + base + j, inv, 4);
+            }
+        } else {
+            #pragma unroll
+            for (int c = 0; c < kQuantMaxStaged / 8; ++c) {
+                const int j = t * 8 + c * 2048;
+                if (j < K) quant_store_vec_rt(vals + c * 8, q + base + j, inv, 8);
+            }
+        }
+        return;
+    }
+
+    // Two-pass fallback for rows longer than the register budget.
+    if (!vec) {
+        for (int j = t; j < K; j += 256)
+            q[base + j] = quant_round(load_in(x, base + j, in_code), inv);
+    } else if (is_f32) {
+        for (int j = t * 4; j < K; j += 1024) {
+            const uint4 v = *reinterpret_cast<const uint4*>(
+                static_cast<const char*>(x) + (base + j) * 4);
+            float tmp[4];
+            load_vec16_rt(v, tmp, 0);
+            quant_store_vec_rt(tmp, q + base + j, inv, 4);
+        }
+    } else {
+        for (int j = t * 8; j < K; j += 2048) {
+            const uint4 v = *reinterpret_cast<const uint4*>(
+                static_cast<const char*>(x) + (base + j) * 2);
+            float tmp[8];
+            load_vec16_rt(v, tmp, in_code);
+            quant_store_vec_rt(tmp, q + base + j, inv, 8);
+        }
+    }
+}
+
+// Upstream implementation, kept for every architecture other than the gfx1103
+// dGPU and every other non-iGPU: the scalar two-pass original -- block-reduce
+// the row absmax through LDS, then quantize with one strided pass.
+//
+// The loads are the whole story on this path, and they are vectorised. The
+// original walked the row with `load_in(x, base + j, in_code)`, one element per
+// thread per step, so a warp asked for 32 consecutive halves = 64 bytes, and
+// because the element count and the dtype are both runtime values the compiler
+// could not widen it. Measured on the 6-CU gfx1035 at 4096x8192, walking that
+// row with 16-byte loads instead is 1.75x faster end to end (2.182 -> 1.245 ms),
+// which is more than the 1.5x the traffic ratio alone would predict because the
+// scalar version also loses on coalescing.
+//
+// The single-read "staged" idea above is deliberately NOT used here. It was
+// measured on the same part and came out 2.46x SLOWER: float vals[48] per thread
+// is far too many live registers to keep more than one block resident per CU, and
+// with only 6 CUs there is no other work to hide the lost parallelism behind. A
+// bounded window of 4 vectors per thread matched the two-read version but did not
+// beat it, so the extra register pressure and the extra code buy nothing.
+//
+// A warp-shuffle reduction instead of the LDS halving was also measured, in
+// isolation: 0.97x, i.e. nothing. The eight __syncthreads() it removes are not on
+// the critical path when the kernel is bandwidth-bound. Kept the simpler LDS
+// reduction.
+//
+// Output is bit-identical to the scalar version for all three input dtypes.
 __global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel(
     const void* __restrict__ x, int in_code, int8_t* __restrict__ q,
     float* __restrict__ scales, int M, int K) {
@@ -25,10 +295,31 @@ __global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel(
     __shared__ float red[256];
     const int row = blockIdx.x;
     const int t = threadIdx.x;
+    const int64_t base = static_cast<int64_t>(row) * K;
+
+    // 16-byte chunks: 8 halves / 4 floats per thread per step, so a warp covers
+    // 512 bytes of the row per request. The callers guarantee K % 8 == 0 for the
+    // 16-bit dtypes and K % 4 == 0 for f32; anything else falls to the scalar
+    // tail, which is also the whole path when the row is not vectorisable.
+    const int width = (in_code == 0) ? 4 : 8;
+    const bool vec = (K % width) == 0;
+    const int nvec = vec ? K / width : 0;
 
     float lmax = 0.0f;
-    for (int j = t; j < K; j += 256)
-        lmax = fmaxf(lmax, fabsf(load_in(x, static_cast<int64_t>(row) * K + j, in_code)));
+    if (vec) {
+        for (int j = t; j < nvec; j += 256) {
+            float tmp[8];
+            load_vec16_rt(*reinterpret_cast<const uint4*>(
+                              static_cast<const char*>(x) + (base + j * width) *
+                                  (in_code == 0 ? 4 : 2)),
+                          tmp, in_code);
+            #pragma unroll
+            for (int i = 0; i < width; ++i) lmax = fmaxf(lmax, fabsf(tmp[i]));
+        }
+    } else {
+        for (int j = t; j < K; j += 256)
+            lmax = fmaxf(lmax, fabsf(load_in(x, base + j, in_code)));
+    }
 
     red[t] = lmax;
     __syncthreads();
@@ -41,9 +332,20 @@ __global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel(
     if (t == 0) scales[row] = scale;
     const float inv = 1.0f / scale;
 
-    for (int j = t; j < K; j += 256) {
-        const float v = load_in(x, static_cast<int64_t>(row) * K + j, in_code);
-        q[static_cast<int64_t>(row) * K + j] = quant_round(v, inv);
+    if (vec) {
+        for (int j = t; j < nvec; j += 256) {
+            float tmp[8];
+            load_vec16_rt(*reinterpret_cast<const uint4*>(
+                              static_cast<const char*>(x) + (base + j * width) *
+                                  (in_code == 0 ? 4 : 2)),
+                          tmp, in_code);
+            quant_store_vec_rt(tmp, q + base + j * width, inv, width);
+        }
+    } else {
+        for (int j = t; j < K; j += 256) {
+            const float v = load_in(x, base + j, in_code);
+            q[base + j] = quant_round(v, inv);
+        }
     }
 }
 
@@ -238,8 +540,15 @@ extern "C" void launch_quantize_int8_rowwise_kernel(
     if (M == 0) {
         return;  // a zero-block launch is hipErrorInvalidConfiguration
     }
-    quantize_int8_rowwise_kernel<<<M, 256, 0, stream>>>(
-        x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales), M, K);
+    // Architecture dispatch: the staged kernel is the gfx1103 iGPU tuning; every
+    // other GPU runs the upstream scalar kernel above.
+    if (comfy_small_igpu()) {
+        quantize_int8_rowwise_kernel_staged<<<M, 256, 0, stream>>>(
+            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales), M, K);
+    } else {
+        quantize_int8_rowwise_kernel<<<M, 256, 0, stream>>>(
+            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales), M, K);
+    }
 }
 
 // Fused ConvRot rotation + rowwise int8 quantize. act_code: 0 none, 1 gelu tanh,
@@ -283,6 +592,19 @@ extern "C" void launch_quantize_int8_convrot_kernel(
 extern "C" int convrot_int8_needs_spill_host(int M, int K, int in_code) {
     using namespace comfy::hip_backend;
     return convrot_int8_needs_spill_buffers(M, K, in_code) ? 1 : 0;
+}
+
+// The block width the fused quantizer will actually launch at for (M, K, in_dtype),
+// or 0 when nothing fits in LDS and it spills. Exposed so the width the per-arch
+// table picks is observable from Python: the widths agree bit for bit, so a test
+// that only compares quantized output cannot tell a correct table from one that
+// has degenerated to the widest entry for every shape.
+extern "C" int convrot_fused_block_host(int M, int K, int in_code) {
+    using namespace comfy::hip_backend;
+    if (M <= 0 || K <= 0) {
+        return 0;
+    }
+    return convrot_pick_fused_block_threads(M, K, in_code);
 }
 
 // scratch is a 4-byte device buffer, pre-zeroed by the caller.

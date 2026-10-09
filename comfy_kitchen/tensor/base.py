@@ -35,6 +35,80 @@ def get_cuda_capability() -> tuple[int, int] | None:
     return torch.cuda.get_device_capability()
 
 
+def _capture_active() -> bool:
+    """Whether a CUDA graph capture is in progress right now."""
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+_native_scaled_mm_probe: dict[str, bool] = {}
+
+
+def native_scaled_mm_usable(device_type: str) -> bool:
+    """Whether ``torch._scaled_mm`` actually runs on this device's backend.
+
+    ``get_cuda_capability`` cannot answer this. On ROCm it reports a gfx-shaped
+    number -- gfx1103 answers (11, 0) -- so every layout's ``MIN_SM_VERSION``
+    check passes on an AMD part, while PyTorch implements ``_scaled_mm`` only
+    for SM89/SM90 and above and for ROCm MI300 or above.
+
+    A layout whose only fast path is that op used to cope by catching the
+    resulting ``NotImplementedError`` and falling back to dequantization, but
+    that only survives in eager mode: under ``torch.compile`` the op is traced
+    into the graph, the exception escapes at runtime, and the model dies.
+    Consulting this from the layout handler decides the matter in Python, where
+    dynamo evaluates it while tracing and bakes in the branch eager would have
+    taken.
+
+    Scoped to the layouts that genuinely have nowhere else to go. FP8 and INT8
+    are deliberately not gated this way: on a WMMA part the HIP backend serves
+    both from its own kernels, and gating them would push working matmuls onto
+    a dequantize fallback. NVFP4 has a kernel there too and now reaches this
+    through :func:`quantized_mm_has_fast_path`, which is what turns the answer
+    into "yes" on an AMD part.
+
+    Probed once per device type rather than read off the capability number,
+    because what matters is the shape PyTorch actually accepts, which no version
+    query reports. The operands are FP8 at a 16-aligned shape, because that is
+    the only thing ``_scaled_mm`` takes: a bf16 probe raises on the dtype check,
+    and ``(1, 16) @ (16, 1)`` raises because the output dimension is not a
+    multiple of 16, so a probe of either shape answers "unsupported" on every
+    part and the answer is then held for the process -- FP8 and NVFP4 lose their
+    scaled GEMM on the NVIDIA hardware this gate exists to detect.
+
+    During CUDA graph capture the probe cannot run at all -- its allocations
+    would be recorded into the graph -- so the answer is deferred rather than
+    produced: :func:`quantized_mm_has_fast_path` comes through here, and so does
+    the NVFP4 gate that delegates to it (:func:`nvfp4_mm_has_fast_path`), and
+    what a capture gets is "no fast path", which is the branch dequantize-and-matmul
+    takes and therefore always a correct one. Deferring
+    also means not caching: a capture-time "no" recorded for the process would
+    cost a supported part its fast path long after the capture ended. An answer
+    already in the dict -- a probe run before the capture, or during an earlier
+    one -- is returned as it is, so priming is all it takes to keep the fast path
+    inside a capture.
+    """
+    cached = _native_scaled_mm_probe.get(device_type)
+    if cached is not None:
+        return cached
+    if _capture_active():
+        return False
+    if device_type != "cuda" or not torch.cuda.is_available():
+        _native_scaled_mm_probe[device_type] = False
+        return False
+    try:
+        a = torch.zeros((16, 16), device=device_type).to(torch.float8_e4m3fn)
+        b = torch.zeros((16, 16), device=device_type).to(torch.float8_e4m3fn)
+        scale = torch.ones((), device=device_type, dtype=torch.float32)
+        torch._scaled_mm(
+            a, b.t(), scale_a=scale, scale_b=scale, bias=None, out_dtype=torch.bfloat16
+        )
+    except Exception:
+        _native_scaled_mm_probe[device_type] = False
+        return False
+    _native_scaled_mm_probe[device_type] = True
+    return True
+
+
 # ==================== Base Params Dataclass ====================
 
 @dataclass(frozen=True)
@@ -67,10 +141,23 @@ class BaseLayoutParams:
         return type(self)(**kwargs)
 
     def clone(self) -> BaseLayoutParams:
-        """Clone all tensor fields."""
+        """Clone all tensor fields.
+
+        The clone is taken under the field's own inference status. ``Tensor.clone``
+        does not preserve it -- cloning an ordinary tensor inside
+        ``inference_mode`` yields an inference tensor -- so without this a params
+        object rebuilt inside inference mode would mix an ordinary wrapper (see
+        ``QuantizedTensor.__new__``) with inference-mode scales, and any later
+        in-place touch of one of them would be rejected.
+        """
         kwargs = {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
         for field in self._tensor_fields():
-            kwargs[field] = kwargs[field].clone()
+            src = kwargs[field]
+            if src.is_inference() != torch.is_inference_mode_enabled():
+                with torch.inference_mode(src.is_inference()):
+                    kwargs[field] = src.clone()
+            else:
+                kwargs[field] = src.clone()
         return type(self)(**kwargs)
 
     def copy_from(self, src: BaseLayoutParams, non_blocking: bool = False) -> None:
@@ -86,6 +173,78 @@ class BaseLayoutParams:
                 getattr(self, field.name).copy_(src_val, non_blocking=non_blocking)
             else:
                 object.__setattr__(self, field.name, src_val)
+
+
+def quantized_mm_has_fast_path(device_type: str) -> bool:
+    """Whether a quantized matmul has anything faster than dequantize-and-matmul.
+
+    Two things can serve one: PyTorch's own scaled/IMMA GEMM, and this fork's HIP
+    backend kernels. Either is enough, and neither can be assumed, because on
+    ROCm the capability number is a gfx shape rather than an SM version (see
+    :func:`native_scaled_mm_usable`), so a layout's ``MIN_SM_VERSION`` check alone
+    passes on parts where neither exists.
+
+    The HIP backend's GEMMs are WMMA kernels. RDNA2 has no matrix cores and this
+    fork builds only the elementwise kernels there, so a quantized matmul there
+    genuinely has no fast path and has to fall back -- which is a decision that
+    has to be made while dynamo is tracing, not by catching the op's failure
+    afterwards.
+
+    The two are asked in that order for a reason that is not a preference. On a
+    WMMA part ``has_wmma`` settles the question by itself -- a part that has
+    matrix cores has a fast path whatever PyTorch thinks, and a part that has
+    none is RDNA2, where the probe would not succeed either -- so
+    :func:`native_scaled_mm_usable` is left to run only where its answer is the
+    only answer. That also keeps ``torch._scaled_mm`` off this path on every part
+    the WMMA kernels cover. The probe is a 1x1 capability check, not a matmul, but
+    it is still the entry point that reaches hipBLASLt, and
+    ``test_no_hipblaslt_on_the_quantized_paths`` fails on it (gfx1103 did, until
+    the two were swapped) while never being able to see that the 1x1 result was
+    discarded right after.
+
+    Which also makes this the answer during CUDA graph capture, where the probe
+    cannot run at all. That matters: capture reaches this on a part with no
+    matrix cores, where the probe's answer is "no", and assuming "yes" there
+    would trace the op that does not exist into the graph. The non-HIP CUDA
+    branch below needs the same guard for the other reason -- there the probe is
+    the only source of an answer, and asking it inside a capture would either
+    record its allocations into the graph or, if the probe failed and was cached,
+    pin the whole process to the dequantize fallback.
+    """
+    if device_type == "cuda" and getattr(torch.version, "hip", None) is not None:
+        from ..backends.hip import has_wmma
+
+        if has_wmma():
+            return True
+        if _capture_active():
+            # No matrix cores, so _scaled_mm has no WMMA path to take and the
+            # probe cannot run inside a capture either; dequantize-and-matmul is
+            # the branch eager would have taken. See native_scaled_mm_usable.
+            return False
+        return native_scaled_mm_usable(device_type)
+    if device_type == "cuda" and torch.cuda.is_available():
+        return native_scaled_mm_usable(device_type)
+    return True
+
+
+def nvfp4_mm_has_fast_path(device_type: str) -> bool:
+    """Whether an NVFP4 matmul can stay fused on this device.
+
+    Same answer as :func:`quantized_mm_has_fast_path` -- the HIP backend's NVFP4
+    GEMM is a WMMA kernel, so a part with matrix cores has a fast path whatever
+    PyTorch thinks -- with the CPU case taken back out.
+
+    It has to be, because the fallback this gate guards is not symmetric across
+    layouts. FP8's registry entry (``scaled_mm_v2``) ends in ``torch._scaled_mm``,
+    which exists on CPU and fails per call. NVFP4's ends in
+    ``a.view(torch.float4_e2m1fn_x2)`` (eager/quantization.py:238), a dtype only
+    CUDA tensors have, so a CPU answer of "yes" is not a slower path but a wrong
+    one -- and under ``torch.compile`` the resulting exception escapes the graph
+    instead of being caught, which is the whole hazard this gate exists to avoid.
+    """
+    if device_type != "cuda" or not torch.cuda.is_available():
+        return False
+    return quantized_mm_has_fast_path(device_type)
 
 
 class QuantizedLayout(ABC):
@@ -160,6 +319,45 @@ class QuantizedTensor(torch.Tensor):
         layout_cls: str,
         params: Any,
     ):
+        # The wrapper must come out with the same inference status as the data it
+        # wraps, and it cannot come out with it by accident.
+        #
+        # An ordinary op result inherits its inference status from its inputs: a
+        # ``clone``/``to`` of a tensor that was made outside inference mode is not
+        # an inference tensor even when it runs inside one, and an alias
+        # (``detach``/``view``/``select``/``t``) hands the input's *enabled*
+        # VariableVersion to the result. `_make_wrapper_subclass` is not such an
+        # op -- it allocates directly -- so it gets neither half of that: whatever
+        # it builds while ``torch.inference_mode()`` is on is an inference tensor
+        # no matter what the operands are.
+        #
+        # For an alias op the two disagree and PyTorch refuses outright, with
+        # "Cannot set version_counter for inference tensor" from
+        # ``TensorImpl::set_version_counter``: the dispatcher is attaching the
+        # input's enabled version counter to an inference tensor, which has no
+        # version counter to attach. That is reachable from ordinary inference-mode
+        # code -- ``torch.nn.Parameter(quantized, requires_grad=False)`` does
+        # ``data.detach()`` -- and it is not hypothetical: ComfyUI re-wraps every
+        # quantized parameter in ``ops.py::_quantized_apply`` after each
+        # ``.to()``/``.cuda()``, and calls that while sampling runs inside
+        # ``inference_mode``, so any checkpoint whose weights were materialized
+        # outside inference mode dies on the first model (re)load. Anima did;
+        # SDXL did not, because by the time it reloaded its parameters had already
+        # been replaced by inference-mode ones.
+        #
+        # So pin the status explicitly instead of inheriting whatever the ambient
+        # mode happens to be. Inference mode is a thread-local, so narrowing it
+        # around this one allocation is enough, and it is a no-op on the paths that
+        # already agree.
+        if qdata.is_inference() != torch.is_inference_mode_enabled():
+            with torch.inference_mode(qdata.is_inference()):
+                return torch.Tensor._make_wrapper_subclass(
+                    cls,
+                    params.orig_shape,
+                    device=qdata.device,
+                    dtype=params.orig_dtype,
+                    requires_grad=False,
+                )
         return torch.Tensor._make_wrapper_subclass(
             cls,
             params.orig_shape,

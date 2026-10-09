@@ -142,14 +142,34 @@ def apply_rope_kernel(
         _apply_freq_tile(xk_ptr, xk_out_ptr, mask, freqs_00, freqs_01, freqs_10, freqs_11, x_offset_0, x_offset_1, out_offset_0, out_offset_1, compute_dtype)
 
 @triton.jit
+def _rot_pair(freqs_0, freqs_1, x_0, x_1, compute_dtype):
+    """One rotation output, `f0 * x0 + f1 * x1`, with the reference's rounding.
+
+    The reference formula multiplies and adds tensors of the freqs dtype, so
+    PyTorch rounds each product and then their sum. Written as one expression
+    Triton contracts it into a single FMA that rounds once, and its native bf16
+    arithmetic on the AMD backend does not round to nearest per operation
+    either, so both land a full ulp away from the reference -- 0.8% in bf16,
+    well outside the comparison tolerance the tests use.
+
+    Widening the products to fp32 keeps them exact, and the explicit
+    .to(compute_dtype) puts the two intermediate roundings back exactly where
+    the reference has them. This reproduces the reference bit for bit.
+    """
+    prod_0 = (freqs_0.to(tl.float32) * x_0.to(tl.float32)).to(compute_dtype)
+    prod_1 = (freqs_1.to(tl.float32) * x_1.to(tl.float32)).to(compute_dtype)
+    return (prod_0.to(tl.float32) + prod_1.to(tl.float32)).to(compute_dtype)
+
+
+@triton.jit
 def _apply_freq_tile(x_ptr, x_out_ptr, mask, freqs_00, freqs_01, freqs_10, freqs_11, x_offset_0, x_offset_1, out_offset_0, out_offset_1, compute_dtype):
     # Load xq values and cast to computation dtype
-    x_0 = tl.load(x_ptr + x_offset_0, mask=mask, other=0.0).to(compute_dtype)
-    x_1 = tl.load(x_ptr + x_offset_1, mask=mask, other=0.0).to(compute_dtype)
+    x_0 = tl.load(x_ptr + x_offset_0, mask=mask, other=0.0)
+    x_1 = tl.load(x_ptr + x_offset_1, mask=mask, other=0.0)
 
     # Apply rotation to xq
-    xq_out_0 = freqs_00 * x_0 + freqs_01 * x_1
-    xq_out_1 = freqs_10 * x_0 + freqs_11 * x_1
+    xq_out_0 = _rot_pair(freqs_00, freqs_01, x_0, x_1, compute_dtype)
+    xq_out_1 = _rot_pair(freqs_10, freqs_11, x_0, x_1, compute_dtype)
 
     # Store results
     tl.store(x_out_ptr + out_offset_0, xq_out_0, mask=mask)

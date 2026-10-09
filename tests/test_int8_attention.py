@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
 import gc
 import weakref
 
@@ -15,6 +16,48 @@ requires_int8_attention = pytest.mark.skipif(
     reason="requires a CUDA or HIP extension on an INT8-attention-capable GPU",
 )
 
+# RDNA2 (gfx103x) has no matrix cores, so it runs the ported SageAttention
+# RDNA2 kernel rather than the WMMA/CUDA implementation most of these tests
+# describe. The port covers only head_dim 64 and 128, and has no packed
+# snapshot, so the tests that pin WMMA-specific shapes, scratch allocation, or
+# packed layouts must skip there. Masks it handles, in every representation the
+# shared producers build.
+def _uses_gfx1035_port() -> bool:
+    return bool(
+        getattr(torch.version, "hip", None)
+        and sage_attention_module._hip_backend is not None
+        and sage_attention_module._hip_backend.rdna2_is_available()
+    )
+
+
+GFX1035_PORT = _uses_gfx1035_port()
+skip_on_gfx1035_port = pytest.mark.skipif(
+    GFX1035_PORT,
+    reason="WMMA/CUDA-specific behaviour; RDNA2 uses the ported SageAttention kernel",
+)
+
+
+def _head_dims(head_dims):
+    """``head_dims`` minus the ones the RDNA2 port cannot instantiate.
+
+    The ported kernel holds its P*V accumulator in registers: one float per
+    (row, head-dim) pair the thread owns, i.e. ``acc[TM][HD / TM]`` in
+    ``attn_kernel_i8q_f16pv_tiled_pv``. That is exactly ``HD`` registers per
+    thread, because the tile has as many threads as it has query rows. gfx103x
+    has 256 VGPRs per lane, so HD=128 already spends half the file and HD=256 --
+    the next tile the shared code pads up to -- would spend all of it on the
+    accumulator alone, with nothing left for Q, the scores, or the staging
+    addresses. It is a register-file limit rather than a missing feature, and
+    the matrix-core and CUDA paths have no such constraint.
+
+    Every head_dim at or below 128 still runs: the shared code pads anything
+    narrower up to 64 or 128, and a zero-padded lane contributes nothing to the
+    Q.K dot product. On every other platform this filter is a no-op, so the
+    parametrization stays identical there.
+    """
+    if not GFX1035_PORT:
+        return list(head_dims)
+    return [head_dim for head_dim in head_dims if head_dim <= 128]
 
 def _qkv(batch, q_heads, kv_heads, q_length, kv_length, head_dim, dtype=torch.bfloat16):
     q = torch.randn(batch, q_length, q_heads, head_dim, device="cuda", dtype=dtype).transpose(1, 2)
@@ -89,15 +132,24 @@ def test_int8_attention_hip_dispatch_follows_matrix_cores(monkeypatch, has_wmma)
     torch.cuda is the ROCm API there and reports an SM-shaped capability for a
     gfx part, so the CUDA test above would wave RDNA2 through to a kernel built
     on WMMA. RDNA2 has none and must decline.
+
+    The RDNA2 (gfx103x) SageAttention port is excluded here by mocking its gate
+    off: the WMMA decision it overrides is the subject of this test.
     """
     if not getattr(torch.version, "hip", None):
         pytest.skip("requires a ROCm PyTorch runtime")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(sage_attention_module._hip_backend, "has_wmma", lambda: has_wmma)
+    # Both RDNA2 and WMMA live on _hip_backend now, so this and the patch above
+    # differ only in which attribute they replace. setattr still restores it.
+    monkeypatch.setattr(
+        sage_attention_module._hip_backend, "rdna2_is_available", lambda _device: False
+    )
     assert sage_attention_module.is_available() is has_wmma
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_allocates_only_integer_8bit_scratch(monkeypatch):
     q, k, v = _qkv(1, 4, 4, 129, 129, 64)
     allocated_dtypes = []
@@ -110,14 +162,16 @@ def test_int8_attention_allocates_only_integer_8bit_scratch(monkeypatch):
     monkeypatch.setattr(torch, "empty", recording_empty)
     ck.int8_attention(q, k, v)
 
+    # Pure-int8 path: Q, K and V all quantized to int8 (V transposed).
     assert allocated_dtypes.count(torch.int8) == 3
     assert allocated_dtypes.count(torch.int32) == 1
     assert torch.float8_e4m3fn not in allocated_dtypes
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("head_dim", [1, 64, 96, 128, 192, 256])
+@pytest.mark.parametrize("head_dim", _head_dims([1, 64, 96, 128, 192, 256]))
 def test_int8_attention_matches_sdpa(dtype, head_dim):
     q, k, v = _qkv(1, 8, 8, 257, 257, head_dim, dtype)
     assert not q.is_contiguous()
@@ -129,6 +183,96 @@ def test_int8_attention_matches_sdpa(dtype, head_dim):
     assert actual.dtype == dtype
     assert torch.isfinite(actual).all()
     assert _nrmse(actual, expected) < 0.03
+
+
+# Head dims the RDNA2 port instantiates, and the ones every other backend also runs.
+# Not _head_dims([...]) here on purpose: that filter drops 256 for the port's
+# register-file limit, but the port also has no instantiation for 1 or 96 and raises
+# on them, so this test names the two it can actually run.
+_ACCURACY_HEAD_DIMS = [64, 128]
+
+# One tile of each, then spans that cross several of both. 64 is a single 64-key tile
+# and a single 128-row query tile; 257 crosses three query tiles and five key tiles;
+# 1153 crosses nine and nineteen. A kernel that only gets the interior of the grid
+# right, or the tail blocks wrong, fails one of these.
+_ACCURACY_SHAPES = [
+    # (q_heads, kv_heads, q_length, kv_length)
+    (8, 8, 257, 257),  # MHA
+    (4, 2, 257, 1153),  # GQA, key length far past the query length
+    (4, 2, 64, 64),  # one tile of each
+]
+
+
+@requires_int8_attention
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("head_dim", _ACCURACY_HEAD_DIMS)
+@pytest.mark.parametrize("q_heads, kv_heads, q_length, kv_length", _ACCURACY_SHAPES)
+def test_int8_attention_accuracy_without_a_mask(
+    dtype, head_dim, q_heads, kv_heads, q_length, kv_length
+):
+    """Accuracy with no mask, on both entry points.
+
+    The masked tests cover the port, but a mask-only gate cannot tell a broken mask
+    lookup from a broken kernel: both make the masked numbers wrong and leave nothing
+    to compare them against. This is the unmasked reference those comparisons need.
+
+    Both entry points are asserted, and against each other, because they share one
+    launcher and the failure they had in common was upstream of the split.
+    """
+    torch.manual_seed(179)
+    q, k, v = _qkv(2, q_heads, kv_heads, q_length, kv_length, head_dim, dtype)
+    scale = head_dim ** -0.5
+
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.float(),
+        k.float().repeat_interleave(q_heads // kv_heads, dim=1),
+        v.float().repeat_interleave(q_heads // kv_heads, dim=1),
+        scale=scale,
+    )
+
+    fused = ck.int8_attention(q, k, v, scale=scale)
+    snapshot = ck.int8_attention_from_prequantized(
+        ck.prequantize_int8_attention(q, k, v, scale=scale)
+    )
+
+    assert fused.shape == q.shape
+    assert snapshot.shape == q.shape
+    assert torch.isfinite(fused).all()
+    assert torch.isfinite(snapshot).all()
+    if not _fused_uses_the_direct_kernel(q, k):
+        # The snapshot is packed by the prepass and attended by the same launcher,
+        # so the two must agree exactly or one of them is quantizing differently.
+        assert torch.equal(fused, snapshot), (
+            f"fused and snapshot disagree at head_dim={head_dim} "
+            f"q_heads={q_heads} kv_heads={kv_heads} q_length={q_length} "
+            f"kv_length={kv_length} dtype={dtype}: max abs diff "
+            f"{(fused.float() - snapshot.float()).abs().max().item():.5f}"
+        )
+    assert _nrmse(fused, expected) < 0.03
+    assert _nrmse(snapshot, expected) < 0.03
+
+
+def _fused_uses_the_direct_kernel(q, k):
+    """Whether a fused call runs the iGPU's short-key direct kernel.
+
+    sage_int8_sdpa takes that path for short keys on the gfx1103 iGPU, and it is a
+    different algorithm from the int8 kernel a snapshot always runs, so there the
+    two agree on accuracy rather than bitwise. Everywhere else the fused call runs
+    the snapshot's kernel too. The condition is _expected_use_direct, which
+    test_use_direct_gate_matches_the_direct_buffer_contract pins against both gates.
+    """
+    hip_backend = sage_attention_module._hip_backend
+    if hip_backend is None:
+        return False
+    output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
+    return _expected_use_direct(
+        is_igpu=hip_backend._is_small_igpu(q.device),
+        head_dim=q.shape[3],
+        q_length=q.shape[2],
+        kv_length=k.shape[2],
+        masked=False,
+        dtype_ok=q.dtype == output_dtype,
+    )
 
 
 @pytest.mark.parametrize(
@@ -148,6 +292,7 @@ def test_int8_attention_rejects_removed_options(option):
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_gqa_and_unequal_lengths():
     q, k, v = _qkv(1, 16, 4, 191, 257, 128)
     actual = ck.int8_attention(q, k, v, scale=0.07)
@@ -163,6 +308,7 @@ def test_int8_attention_gqa_and_unequal_lengths():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 @pytest.mark.parametrize("masked", [False, True])
 def test_int8_attention_batch_two_direct_and_prequantized(masked):
     q, k, v = _qkv(2, 8, 2, 193, 257, 128)
@@ -187,7 +333,8 @@ def test_int8_attention_batch_two_direct_and_prequantized(masked):
 
 
 @requires_int8_attention
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@skip_on_gfx1035_port
+@pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float16, torch.bfloat16])
 def test_int8_attention_mask_gqa_broadcast_and_fully_masked_row(head_dim, mask_dtype):
     q, k, v = _qkv(1, 8, 2, 193, 257, head_dim)
@@ -216,7 +363,10 @@ def test_int8_attention_mask_gqa_broadcast_and_fully_masked_row(head_dim, mask_d
 
 
 @requires_int8_attention
-@pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float16, torch.bfloat16, torch.float32])
+@skip_on_gfx1035_port
+@pytest.mark.parametrize(
+    "mask_dtype", [torch.bool, torch.float16, torch.bfloat16, torch.float32]
+)
 def test_int8_attention_key_broadcast_mask(mask_dtype):
     q, k, v = _qkv(1, 8, 2, 193, 257, 64)
     if mask_dtype == torch.bool:
@@ -241,6 +391,7 @@ def test_int8_attention_key_broadcast_mask(mask_dtype):
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.bfloat16])
 def test_int8_attention_fully_masked_key_broadcast_is_zero(mask_dtype):
     q, k, v = _qkv(1, 4, 4, 129, 97, 64)
@@ -255,7 +406,51 @@ def test_int8_attention_fully_masked_key_broadcast_is_zero(mask_dtype):
 
 
 @requires_int8_attention
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@skip_on_gfx1035_port
+@pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("kv_length", [16, 32, 64])
+def test_int8_attention_unprepared_mask_zeroes_fully_masked_rows(mask_dtype, kv_length):
+    """kv_len <= 64 skips mask preparation and takes MaskMode::kCustom.
+
+    That mode clamps no bias: a dropped key carries kMaskedScore straight into the
+    score loop and never reaches the underflowing-tile_scale argument the prepared
+    dense modes rely on. A fully masked row is carried by row_valid, which only the
+    custom mode tracks against the actual keep test, so this is the one mask path
+    whose fully masked rows were never covered. Pin it.
+    """
+    q_length = 193
+    q, k, v = _qkv(1, 8, 2, q_length, kv_length, 64)
+    if mask_dtype == torch.bool:
+        mask = torch.ones(1, 1, q_length, kv_length, dtype=torch.bool, device="cuda")
+        mask[..., :, kv_length // 2:] = False
+        all_masked = torch.zeros_like(mask)
+    else:
+        mask = torch.zeros(1, 1, q_length, kv_length, dtype=mask_dtype, device="cuda")
+        mask[..., :, kv_length // 2:] = -torch.inf
+        all_masked = torch.full_like(mask, -torch.inf)
+    masked_row = 5
+    mask[..., masked_row, :] = False if mask_dtype == torch.bool else -torch.inf
+
+    actual = ck.int8_attention(q, k, v, attn_mask=mask)
+    baseline = mask
+    if mask.dtype != torch.bool and mask.dtype != q.dtype:
+        baseline = mask.to(q.dtype)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        k.repeat_interleave(4, dim=1),
+        v.repeat_interleave(4, dim=1),
+        attn_mask=baseline,
+    )
+
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual[..., masked_row, :]) == 0
+    assert _nrmse(actual, expected) < 0.03
+    assert torch.count_nonzero(ck.int8_attention(q, k, v, attn_mask=all_masked)) == 0
+
+
+@requires_int8_attention
+@skip_on_gfx1035_port
+@pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("key_only", [False, True])
 def test_int8_attention_long_masked_sequence(head_dim, mask_dtype, key_only):
@@ -297,6 +492,7 @@ def test_int8_attention_long_masked_sequence(head_dim, mask_dtype, key_only):
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_stabilizes_large_common_key_component():
     torch.manual_seed(7)
     q, k, v = _qkv(1, 16, 16, 513, 513, 128)
@@ -312,6 +508,7 @@ def test_int8_attention_stabilizes_large_common_key_component():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_stabilization_is_deterministic():
     torch.manual_seed(11)
     q, k, v = _qkv(1, 8, 8, 257, 257, 128)
@@ -323,6 +520,7 @@ def test_int8_attention_stabilization_is_deterministic():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 @pytest.mark.parametrize(
     "configuration",
     [
@@ -367,6 +565,7 @@ def test_prequantized_attention_is_bitwise_identical_to_fused(configuration):
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_prequantized_masked_attention_is_bitwise_identical_to_fused():
     q, k, v = _qkv(1, 8, 2, 193, 257, 128)
     mask = torch.linspace(-1, 1, 257, device="cuda", dtype=torch.float32).reshape(1, 1, 1, 257)
@@ -385,6 +584,7 @@ def test_prequantized_masked_attention_is_bitwise_identical_to_fused():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_prequantized_attention_releases_float_inputs_before_execution():
     q, k, v = _qkv(1, 8, 2, 513, 769, 128)
     expected = ck.int8_attention(q, k, v)
@@ -410,6 +610,7 @@ def test_prequantized_attention_releases_float_inputs_before_execution():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_torch_compile_fullgraph():
     q, k, v = _qkv(1, 4, 4, 129, 129, 64)
     compiled = torch.compile(
@@ -423,6 +624,7 @@ def test_int8_attention_torch_compile_fullgraph():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_cuda_graph():
     q, k, v = _qkv(1, 4, 4, 129, 129, 64)
     warmup_stream = torch.cuda.Stream()
@@ -440,6 +642,7 @@ def test_int8_attention_cuda_graph():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_rotation_handles_outliers():
     torch.manual_seed(1)
     q, k, v = _qkv(1, 8, 8, 513, 513, 128)
@@ -455,6 +658,7 @@ def test_rotation_handles_outliers():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 @pytest.mark.parametrize("scale", [None, 0.0, -(128**-0.5)])
 def test_int8_attention_long_sequence_and_partial_tile(scale):
     torch.manual_seed(31)
@@ -467,6 +671,7 @@ def test_int8_attention_long_sequence_and_partial_tile(scale):
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_long_sequence_preserves_constant_values():
     torch.manual_seed(32)
     q, k, v = _qkv(1, 4, 4, 129, 8193, 128)
@@ -482,6 +687,7 @@ def test_int8_attention_long_sequence_preserves_constant_values():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_rescales_across_large_increases_in_logits():
     torch.manual_seed(33)
     q, k, v = _qkv(1, 4, 4, 129, 1025, 128)
@@ -498,6 +704,7 @@ def test_int8_attention_rescales_across_large_increases_in_logits():
 
 
 @requires_int8_attention
+@skip_on_gfx1035_port
 def test_int8_attention_accepts_dlpack_normalized_batch_stride():
     """A size-one extent carries no address, so its stride must not be policed.
 
@@ -527,7 +734,7 @@ def test_int8_attention_accepts_dlpack_normalized_batch_stride():
 @requires_int8_attention
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("bias_kind", ["fade", "constant_tiles", "fully_masked"])
-@pytest.mark.parametrize("head_dim", [32, 64, 96, 128, 160, 256])
+@pytest.mark.parametrize("head_dim", _head_dims([32, 64, 96, 128, 160, 256]))
 def test_int8_attention_prepared_key_bias(dtype, bias_kind, head_dim):
     torch.manual_seed(178)
     q, k, v = _qkv(2, 4, 2, 129, 33601, head_dim, dtype)
@@ -569,7 +776,7 @@ def test_int8_attention_prepared_key_bias(dtype, bias_kind, head_dim):
 
 
 @requires_int8_attention
-@pytest.mark.parametrize("head_dim", range(1, 257))
+@pytest.mark.parametrize("head_dim", _head_dims(range(1, 257)))
 def test_int8_attention_prepared_mask_all_head_dimensions(head_dim):
     torch.manual_seed(179)
     q, k, v = _qkv(2, 4, 2, 137, 1153, head_dim)
@@ -651,7 +858,7 @@ def test_int8_attention_prepared_mask_releases_original():
 
 
 @requires_int8_attention
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
 @pytest.mark.parametrize("mask_shape", [(2, 1), (1, 4), (2, 4)])
 def test_int8_attention_prepared_bias_batch_head_strides(head_dim, mask_shape):
     """Compact batch/head rows must keep independent tile biases and empty rows."""
@@ -739,7 +946,7 @@ def test_hip_short_key_mask_matches_prequantized_snapshot(
 
 @requires_int8_attention
 @pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("scale", [0.0, -0.125, 0.125, 1e-10])
 @pytest.mark.parametrize("mask_shape", [(1, 1), (2, 1), (1, 4), (2, 4)])
@@ -771,7 +978,66 @@ def test_hip_compact_dense_bool_matches_float_bias(head_dim, dtype, scale, mask_
 
 @requires_int8_attention
 @pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("scale_boost", [1, 10**3, 10**5])
+def test_hip_dropped_key_survives_a_large_qk_score(scale_boost):
+    """A dropped key must stay dropped when the Q*K score dwarfs the mask sentinel.
+
+    A prepared mask's -inf becomes a finite sentinel, ``kMaskedScoreBase2`` at about
+    -72134 in base two, and the kernel *adds* it to the caller's Q*K score rather
+    than replacing it. So whether a -inf key actually drops came to depend on the
+    score being smaller than that constant -- a property of the data rather than of
+    the mask, and the score is not bounded that way. Every dropped key whose tile
+    held one large enough score came back with that tile's largest probability: a
+    fully masked row returned a key of V instead of zeros, at any boost from 1e3 up.
+
+    Multiplying both quantization scales is the lever, because the scale is the
+    kernel's only free multiplier on the score. It is a proxy for large activations
+    rather than one: the quantizer rotates each row by a Hadamard before scaling, so
+    raising the *input* magnitudes does not raise the score -- a constant row
+    rotates to zero -- and the scales are what actually move it.
+
+    scale_boost=1 is the control: the same shapes and the same mask at the scales the
+    packing actually produced. It has to behave identically, which is what makes
+    this a test of the sentinel rather than of the mask or of the shapes.
+    """
+    torch.manual_seed(451)
+    q, k, v = _qkv(1, 2, 2, 8, 128, 64, torch.float16)
+
+    keep = torch.ones(1, 1, 8, 128, device="cuda", dtype=torch.bool)
+    keep[..., 0, :] = False           # nothing kept
+    keep[..., 3, :] = False           # nothing kept, and not the first row
+    keep[..., 1, 1:] = False          # one key out of the tile it sits in
+    keep[..., 2, :-1] = False         # one key out of the tile after an empty one
+
+    packed = ck.prequantize_int8_attention(q, k, v, attn_mask=keep)
+    if scale_boost != 1:
+        packed = dataclasses.replace(
+            packed,
+            q_scale=packed.q_scale * scale_boost,
+            k_scale=packed.k_scale * scale_boost,
+        )
+    actual = ck.int8_attention_from_prequantized(packed)
+    assert torch.isfinite(actual).all()
+
+    for row in (0, 3):
+        assert torch.count_nonzero(actual[:, :, row]) == 0, (
+            f"row {row} keeps no key at all, so it must be exactly zero; got "
+            f"{actual[:, :, row].abs().max().item()} with scale_boost={scale_boost}"
+        )
+    # The rows that do keep keys have to stay non-trivial, or an all-zero output
+    # would satisfy the assertions above and hide a second regression. The bar is
+    # half rather than all: V is int8-quantized per channel, so some of its entries
+    # come back as exact zeros at any boost.
+    kept = actual[:, :, 1:]
+    assert torch.count_nonzero(kept) > 0.5 * kept.numel(), (
+        f"only {int(torch.count_nonzero(kept))} of {kept.numel()} outputs are "
+        f"nonzero with scale_boost={scale_boost}"
+    )
+
+
+@requires_int8_attention
+@pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
+@pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("kv_length", [65, 257])
 def test_hip_dense_mask_empty_tiles(head_dim, mask_dtype, kv_length):
@@ -855,7 +1121,7 @@ def test_hip_dense_16_preparation_preserves_finite_bits(mask_dtype, strided):
 
 @requires_int8_attention
 @pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("mask_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("scale", [0.0, -0.125, 0.125, 1e-10])
@@ -893,7 +1159,7 @@ def test_hip_dense_16_accuracy_and_snapshot(
 
 @requires_int8_attention
 @pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("mask_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("scale", [0.0, -0.125, 0.125])
@@ -919,6 +1185,14 @@ def test_hip_dense_16_preserves_constant_values(head_dim, dtype, mask_dtype, sca
 @pytest.mark.parametrize("mask_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("lengths", [(2, 65), (256, 2048)])
 @pytest.mark.parametrize("mask_shape", [(1, 1), (2, 1), (1, 4), (2, 4)])
+# The RDNA2 port never packs a query-varying mask, so there is no separate
+# preparation pass for this to fuse: its kernel reads the caller's [B,H,Q,K] mask
+# in place, through the strides it was handed. That is a strictly better answer
+# than the WMMA fused path, which still has to permute the mask into a packed tile
+# for the MMA fragment layout and can only hide the extra launch. Packing itself
+# is still exercised on the port, on the snapshot side of this same comparison,
+# through prequantize_int8_attention.
+@skip_on_gfx1035_port
 def test_hip_fused_dense_mask_matches_snapshot(
     head_dim, dtype, mask_dtype, lengths, mask_shape, monkeypatch
 ):
@@ -1085,6 +1359,12 @@ def test_hip_prepare_key_mask_rejects_invalid_buffers(invalid):
 
 @requires_int8_attention
 @pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
+# This drives hip.sage_int8_attend, the WMMA binding, whose packed V is a 2D
+# int8 buffer. The RDNA2 port's snapshot keeps V as the 4D fp16 tensor its
+# kernel reads natively, so the binding rejects the snapshot's V shape before
+# it ever looks at the mask. The port validates a prepared mask in its own op
+# (rank, contiguity, and tile coverage, in attn_gfx103x.hip).
+@skip_on_gfx1035_port
 @pytest.mark.parametrize("invalid", ["dtype", "width", "stride", "heads", "cpu"])
 def test_hip_attention_rejects_invalid_prepared_mask(invalid):
     q, k, v = _qkv(1, 4, 2, 129, 1153, 128)
@@ -1114,3 +1394,142 @@ def test_hip_attention_rejects_invalid_prepared_mask(invalid):
             output_dtype=torch.bfloat16,
             cta_k=packed.cta_k,
         )
+
+
+@requires_int8_attention
+@pytest.mark.skipif(not torch.version.hip, reason="HIP packed-V binding")
+# int8_bf16sv.hip used to take over whenever V arrived in its own dtype. It was
+# unreachable from the public API (both int8_attention and
+# prequantize_int8_attention go through sage_int8_quantize, which always emits
+# int8 V) and measured 1.48x slower than int8_attn.hip summed over the 18
+# benchmark_attn.py shapes, so V in any other dtype is now rejected outright
+# rather than silently reinterpreted. The 16-bit arms of the old kernel also had
+# no prepared-mask modes, so the old dispatch misread one as raw bf16.
+#
+# Matched loosely on purpose: the contract is "a non-int8 packed V is refused",
+# not which of the two call sites refuses it.
+@skip_on_gfx1035_port
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_hip_attention_rejects_non_int8_v(dtype):
+    q, k, v = _qkv(1, 4, 4, 256, 256, 64)
+    packed = ck.prequantize_int8_attention(q, k, v)
+    assert packed.v.dtype == torch.int8, "the fixture must produce int8 V"
+    with pytest.raises(RuntimeError, match=r"v(_int8|_int8 packed)? .*unsupported dtype"
+                                            r"|packed v must be int8"):
+        sage_attention_module._hip_backend.sage_int8_attend(
+            packed.q,
+            packed.k,
+            packed.v.to(dtype),
+            packed.q_scale,
+            packed.k_scale,
+            packed.v_scale,
+            attention_scale=packed.attention_scale,
+            attn_mask=None,
+            output_dtype=torch.bfloat16,
+            cta_k=packed.cta_k,
+        )
+
+
+# --- use_direct gate agreement (fork) ----------------------------------------
+#
+# The short-key direct path is selected twice: the Python gate in
+# comfy_kitchen/backends/hip/__init__.py:sage_int8_sdpa decides which buffers to
+# allocate, and the C++ gate in dlpack_bindings.cpp:sage_sdpa decides which kernel
+# runs. If they disagree, Python hands over a buffer whose width the C++ require_len
+# rejects. They have already drifted once in this fork's history, so pin them.
+#
+# The expected condition below is written out independently of the implementation
+# so that editing either copy of the gate has to be a deliberate act here too. Only
+# one of the two is a copy in this file, though: the actual answer comes from the
+# backend's _sage_use_direct, which is the helper sage_int8_sdpa itself calls. An
+# earlier version of _call_use_direct re-derived the rule here instead, which made
+# the assertion compare two copies that both lived in this file -- editing the gate
+# without editing the test left it green.
+def _expected_use_direct(is_igpu, head_dim, q_length, kv_length, masked, dtype_ok):
+    if not (is_igpu and not masked and dtype_ok):
+        return False
+    d64_short_keys = head_dim == 64 and kv_length <= 2048 and not (
+        q_length == kv_length and kv_length <= 1024
+    )
+    d128_short_keys = head_dim == 128 and kv_length <= 256
+    return d64_short_keys or d128_short_keys
+
+
+@requires_int8_attention
+@pytest.mark.parametrize("head_dim", _head_dims([64, 128, 256]))
+@pytest.mark.parametrize(
+    "q_length,kv_length",
+    [
+        (1024, 1024),    # small self-attention: excluded from direct on purpose
+        (6144, 6144),    # large self-attention: int8 path
+        (6144, 77),      # SDXL cross-attention, D64 short keys: direct
+        (1536, 77),      # SDXL cross-attention, D64 short keys: direct
+        (1024, 4096),    # the qo<kv case that used to select mismatched buffers
+        (4096, 512),     # Anima cross-attention
+        (4096, 256),     # Anima cross-attention, D128 short keys: direct
+        (4096, 300),     # just past the D128 short-key bound
+        (2048, 2048),    # self-attention just past the small-self bound
+    ],
+)
+@pytest.mark.parametrize("masked", [False, True])
+def test_use_direct_gate_matches_the_direct_buffer_contract(
+    head_dim, q_length, kv_length, masked
+):
+    """The Python gate and the buffer the C++ direct branch requires must agree.
+
+    The C++ branch is not called here -- this pins the contract from the Python
+    side, and only for the device actually present. On a non-gfx1103 build both
+    gates must be False, which is itself the assertion that keeps the iGPU tuning
+    from leaking onto other devices.
+    """
+    hip_backend = sage_attention_module._hip_backend
+    if hip_backend is None:
+        pytest.skip("HIP extension not built")
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    is_igpu = hip_backend._is_small_igpu(device)
+
+    # The real gate needs q/k/v only to read dtype, device and the two lengths.
+    q = torch.empty(1, 1, q_length, head_dim, device=device, dtype=torch.bfloat16)
+    k = torch.empty(1, 1, kv_length, head_dim, device=device, dtype=torch.bfloat16)
+    attn_mask = torch.zeros(1, 1, q_length, kv_length, device=device) if masked else None
+
+    actual = _call_use_direct(hip_backend, q, k, attn_mask)
+    expected = _expected_use_direct(
+        is_igpu, head_dim, q_length, kv_length, masked, dtype_ok=True
+    )
+    assert actual == expected, (
+        f"use_direct={actual} but the C++ direct branch would be selected={expected} "
+        f"for head_dim={head_dim} qo={q_length} kv={kv_length} masked={masked} "
+        f"igpu={is_igpu}"
+    )
+
+    if not actual:
+        return
+
+    # Where the gate is true, the allocation the C++ branch validates is the direct
+    # one: a single v_int8 of padded_k * 2 int8 elements per (kv_head, head_dim)
+    # row, with the six unread slots shared. Check the width the C++ require_len
+    # asks for is present.
+    cta_k = hip_backend._sage_cta_k(head_dim, kv_length, masked)
+    padded_k = -(-kv_length // cta_k) * cta_k
+    buffers, _ = hip_backend._sage_buffers_direct(q, k, cta_k)
+    assert buffers["v_int8"].shape[1] == padded_k * 2, (
+        "the direct path needs a 2*padded_k-wide V scratch on the iGPU; "
+        f"got {buffers['v_int8'].shape[1]} for padded_k={padded_k}"
+    )
+
+
+def _call_use_direct(hip_backend, q, k, attn_mask):
+    """Ask the implementation sage_int8_sdpa itself gates on.
+
+    Deliberately the backend's own helper rather than a second copy of the rule
+    here. ``_expected_use_direct`` below is the independent specification this is
+    compared against; re-deriving the actual answer in the test file as well would
+    make the assertion compare two copies of one rule, both of which live here, so
+    editing the gate in ``comfy_kitchen/backends/hip/__init__.py`` would leave the
+    test green. That drift has already happened once, which is why the gate lives
+    in a helper at all.
+    """
+    return hip_backend._sage_use_direct(q, k, attn_mask)
+
