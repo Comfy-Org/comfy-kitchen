@@ -76,7 +76,8 @@ quant_v_int8_kernel(const T *__restrict__ v, int8_t *__restrict__ out,
     const int page = initialize ? blockIdx.y : max(0, (length - 1) / padded_N - 1) + blockIdx.y;
     if (page >= pages || page * padded_N >= length) return;
     N = min(padded_N, length - page * padded_N);
-    v += static_cast<int64_t>(page) * padded_N * sn;
+    const int source_row = initialize ? page * padded_N : page * padded_N % (sh / sn);
+    v += static_cast<int64_t>(source_row) * sn;
     const int64_t offset = (static_cast<int64_t>(b) * (pages - 1) + page) * H * D;
     out += offset * padded_N;
     scale_out += offset;

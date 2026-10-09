@@ -16,7 +16,10 @@ class Int8DecodeCache:
         """Refresh the last two pages, or initialize the prefix. length is one CUDA int64.
 
         All batches share the length. After initialization the committed length may
-        advance by at most one page per call. BF16 source tensors are [B,H,capacity,256].
+        advance by at most one page per call. BF16 sources are [B,H,rows,256].
+        Initialization reads the full prefix. Updates can instead read a page-aligned
+        circular source: absolute row i lives at i % rows. The caller must retain both
+        pages being refreshed, including through speculative writes and rollback.
         """
         cuda._C._int8_decode_update(
             *map(cuda._wrap_for_dlpack, (key, value, self.key, self.value, self.key_scale, self.value_scale, length)),
