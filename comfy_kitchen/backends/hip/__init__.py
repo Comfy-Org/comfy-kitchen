@@ -883,8 +883,9 @@ def fp16_packed_linear(
     """Linear on packed fp16 math, each fp16 partial sum folded into fp32 every 32
     products (_PACKED_STAGE_PRODUCTS), stored as ``out_dtype`` (x's dtype by default). x (any float dtype, any range) is scaled per
     row by a power of two against ``weight_amax`` (the largest |weight|, computed when
-    not given) so no fp16 partial sum overflows. Served on gfx90c and gfx1010; other
-    devices, and shapes the kernel declines, run torch."""
+    not given) so no fp16 partial sum overflows. Up to 8 rows run a GEMV in fp32 math over
+    the fp16 weight instead. Served on gfx90c and gfx1010; other devices, and shapes the
+    kernel declines, run torch."""
     out_dtype = x.dtype if out_dtype is None else out_dtype
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     m = x_2d.shape[0]
@@ -900,10 +901,11 @@ def fp16_packed_linear(
         and weight.data_ptr() % 16 == 0
         and (bias is None or bias.is_contiguous())
     ):
-        if weight_amax is None:
-            weight_amax = torch.linalg.vector_norm(weight, float("inf"), dtype=torch.float32)
         x16 = torch.empty((m, k), dtype=torch.float16, device=x.device)
         row_scale = torch.empty(m, dtype=torch.float32, device=x.device)
+        if weight_amax is None:
+            # the small-M GEMV (m <= 8) runs in fp32 and reads no amax
+            weight_amax = row_scale[:1] if m <= 8 else torch.linalg.vector_norm(weight, float("inf"), dtype=torch.float32)
         out = torch.empty((m, n), dtype=out_dtype, device=x.device)
         if _C.fp16_packed_linear(
             _dl(x_2d), _dl(weight), _dl(weight_amax.reshape(1)), _dl(x16), _dl(row_scale),
