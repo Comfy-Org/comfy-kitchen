@@ -1224,35 +1224,31 @@ __device__ __forceinline__ float load_input_act(
     }
 }
 
-template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC, int ACT = kActNone>
-__global__ void quantize_int8_rowwise_convrot64_kernel(
-    const InputType* __restrict__ x,
-    int8_t* __restrict__ q,
-    float* __restrict__ scales,
+// One row of the ConvRot quantizer, run by a whole BLOCK_THREADS block: optional input
+// activation (SwiGLU reads a [gate | up] raw row twice as wide as the K it writes;
+// RmsNorm stages the raw row first for its mean of squares), 256-point FHT per group,
+// row absmax -> scale, int8 store into `q_row` (global or shared). Returns the scale.
+template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC, int ACT>
+__device__ __forceinline__ float convrot64_quantize_row(
+    const InputType* __restrict__ x_row,
+    int8_t* q_row,
     int K,
+    int64_t rng_base,
     uint64_t seed,
     const InputType* __restrict__ act_weight,
-    float act_eps)
+    float act_eps,
+    float* row_buf,
+    float* tmp,
+    float* warp_smem,
+    float* block_smem)
 {
     constexpr int kGroupThreads = 64;
     constexpr int kGroupsInFlight = BLOCK_THREADS / kGroupThreads;
     constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
 
-    extern __shared__ float smem[];
-    float* row_buf = smem;
-    float* tmp = smem + K;
-
-    __shared__ float warp_smem[kWarps];
-    __shared__ float block_smem;
-
-    const int row = static_cast<int>(blockIdx.x);
     const int tid = threadIdx.x;
     const int sub = tid / kGroupThreads;
     const int lane = tid % kGroupThreads;
-    const int64_t row_offset = static_cast<int64_t>(row) * K;
-    // SwiGLU reads a [gate | up] raw row twice as wide as the K it writes.
-    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
-    const int64_t in_row_offset = row_offset * kInWidth;
     const int n_groups = K / kConvRotGroup;
 
     float* buf0 = tmp + sub * (2 * kConvRotGroup);
@@ -1266,11 +1262,11 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     if constexpr (ACT == kActRmsNorm) {
         float sum_sq = 0.0f;
         for (int col = tid; col < K; col += BLOCK_THREADS) {
-            const float v = to_float(x[row_offset + col]);
+            const float v = to_float(x_row[col]);
             row_buf[col] = v;
             sum_sq += v * v;
         }
-        sum_sq = block_reduce_sum_f32_t<kWarps>(sum_sq, warp_smem, &block_smem);
+        sum_sq = block_reduce_sum_f32_t<kWarps>(sum_sq, warp_smem, block_smem);
         rstd = rsqrtf(sum_sq / static_cast<float>(K) + act_eps);
     }
 
@@ -1289,10 +1285,10 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
             x2 = active ? row_buf[col + 2] * rstd * to_float(act_weight[col + 2]) : 0.0f;
             x3 = active ? row_buf[col + 3] * rstd * to_float(act_weight[col + 3]) : 0.0f;
         } else {
-            x0 = active ? load_input_act<ACT>(x, in_row_offset, col, K) : 0.0f;
-            x1 = active ? load_input_act<ACT>(x, in_row_offset, col + 1, K) : 0.0f;
-            x2 = active ? load_input_act<ACT>(x, in_row_offset, col + 2, K) : 0.0f;
-            x3 = active ? load_input_act<ACT>(x, in_row_offset, col + 3, K) : 0.0f;
+            x0 = active ? load_input_act<ACT>(x_row, 0, col, K) : 0.0f;
+            x1 = active ? load_input_act<ACT>(x_row, 0, col + 1, K) : 0.0f;
+            x2 = active ? load_input_act<ACT>(x_row, 0, col + 2, K) : 0.0f;
+            x3 = active ? load_input_act<ACT>(x_row, 0, col + 3, K) : 0.0f;
         }
         buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
         buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
@@ -1313,26 +1309,49 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
         __syncthreads();
     }
 
-    abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
+    abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, block_smem);
     const float scale = fmaxf(
         finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f),
         1.0e-30f);
-    if (tid == 0) {
-        scales[row] = scale;
-    }
 
     for (int col = tid; col < K; col += BLOCK_THREADS) {
-        const int64_t idx = row_offset + col;
         const float scaled = quant_div_float_to_float<InputType>(row_buf[col], scale);
         float quantized;
         if constexpr (STOCHASTIC) {
-            const InputType noise = stochastic_rng_value<InputType>(idx, seed);
+            const InputType noise = stochastic_rng_value<InputType>(rng_base + col, seed);
             quantized = floorf(stochastic_sum_to_float<InputType>(scaled, noise));
         } else {
             quantized = nearbyintf(scaled);
         }
         quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
-        q[idx] = static_cast<int8_t>(quantized);
+        q_row[col] = static_cast<int8_t>(quantized);
+    }
+    return scale;
+}
+
+template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC, int ACT = kActNone>
+__global__ void quantize_int8_rowwise_convrot64_kernel(
+    const InputType* __restrict__ x,
+    int8_t* __restrict__ q,
+    float* __restrict__ scales,
+    int K,
+    uint64_t seed,
+    const InputType* __restrict__ act_weight,
+    float act_eps)
+{
+    constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
+    extern __shared__ float smem[];
+    __shared__ float warp_smem[kWarps];
+    __shared__ float block_smem;
+
+    const int row = static_cast<int>(blockIdx.x);
+    const int64_t row_offset = static_cast<int64_t>(row) * K;
+    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
+    const float scale = convrot64_quantize_row<InputType, BLOCK_THREADS, STOCHASTIC, ACT>(
+        x + row_offset * kInWidth, q + row_offset, K, row_offset, seed, act_weight, act_eps,
+        smem, smem + K, warp_smem, &block_smem);
+    if (threadIdx.x == 0) {
+        scales[row] = scale;
     }
 }
 
