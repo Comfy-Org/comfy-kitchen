@@ -68,6 +68,7 @@ __all__ = [
     "fp16_conv3d",
     "fp16_conv3d_out",
     "fp16_linear",
+    "fp16_packed_conv3d",
     "fp16_packed_linear",
     "gemv_awq_w4a16",
     "group_norm_silu_pad3d",
@@ -1900,25 +1901,31 @@ def _ndhwc_strides(t: torch.Tensor):
 
 
 def _kernel_fp16_conv3d(x, weight, bias, residual, stride, out=None, padding=(0, 0, 0),
-                        acc_scale=None):
+                        acc_scale=None, dilation=(1, 1, 1), out_dtype=torch.float16, ncdhw=False):
     """The fused kernel's result, or None when it does not apply to this call. x and out may
     be NDHWC-ordered views of larger tensors, so a tiled convolution needs no per-tile copies.
-    acc_scale selects the thread-level GEMM (see _simt_fp16_conv3d), the only one that pads.
+    acc_scale selects the thread-level GEMM (see _simt_fp16_conv3d), the only one that pads,
+    dilates, writes an out_dtype other than fp16 (bias and residual are in out_dtype), and with
+    ncdhw writes a contiguous NCDHW out and reads residual in that layout.
     """
     n, c, d, h, w = x.shape
     k, _, t, r, s = weight.shape
     sd, sh, sw = stride
     pd, ph, pw = padding
-    if min(sd, sh, sw) < 1:
-        return None  # torch's conv reports the bad stride
+    dd, dh, dw = dilation
+    if min(sd, sh, sw) < 1 or min(dd, dh, dw) < 1:
+        return None  # torch's conv reports the bad stride or dilation
+    if acc_scale is None and (max(dd, dh, dw) > 1 or out_dtype != torch.float16 or ncdhw):
+        return None
     d, h, w = d + 2 * pd, h + 2 * ph, w + 2 * pw
-    z, p, q = (d - t) // sd + 1, (h - r) // sh + 1, (w - s) // sw + 1
+    te, re, se = (t - 1) * dd + 1, (r - 1) * dh + 1, (s - 1) * dw + 1
+    z, p, q = (d - te) // sd + 1, (h - re) // sh + 1, (w - se) // sw + 1
     supported = (
         x.dtype == torch.float16 and weight.dtype == torch.float16
         and weight.device == x.device and weight.shape[1] == c
-        and (c % 8 == 0 or c < 8) and k % 8 == 0 and d >= t and h >= r and w >= s
-        and (bias is None or (bias.dtype == torch.float16 and bias.shape == (k,)))
-        and (residual is None or (residual.dtype == torch.float16
+        and (c % 8 == 0 or c < 8) and k % 8 == 0 and d >= te and h >= re and w >= se
+        and (bias is None or (bias.dtype == out_dtype and bias.shape == (k,)))
+        and (residual is None or (residual.dtype == out_dtype
                                   and residual.shape == (n, k, z, p, q)))
     )
     if not supported:
@@ -1934,18 +1941,23 @@ def _kernel_fp16_conv3d(x, weight, bias, residual, stride, out=None, padding=(0,
         x = x.contiguous(memory_format=cl)
         xs = (0, 0, 0, 0)
     weight = weight.contiguous(memory_format=cl)
+    out_format = torch.contiguous_format if ncdhw else cl
     # the epilogue reads both off raw pointers on x's stream
     bias = None if bias is None else bias.to(device=x.device).contiguous()
     residual = (None if residual is None
-                else residual.to(device=x.device).contiguous(memory_format=cl))
+                else residual.to(device=x.device).contiguous(memory_format=out_format))
     if out is None:
-        out = torch.empty((n, k, z, p, q), dtype=torch.float16, device=x.device, memory_format=cl)
+        out = torch.empty((n, k, z, p, q), dtype=out_dtype, device=x.device,
+                          memory_format=out_format)
     else:
-        if out.shape != (n, k, z, p, q) or out.dtype != torch.float16 or out.device != x.device:
+        if out.shape != (n, k, z, p, q) or out.dtype != out_dtype or out.device != x.device:
             raise ValueError("fp16_conv3d: out must be an fp16 [N, K, Z, P, Q] tensor on x's device")
+        if ncdhw:
+            if not out.is_contiguous():
+                return None
         # the epilogue writes a packed [N*Z*P*Q, K] matrix, so besides a packed tensor only a
         # frame window of a single batch fits
-        if not out.is_contiguous(memory_format=cl) and _ndhwc_strides(out) != (
+        elif not out.is_contiguous(memory_format=cl) and _ndhwc_strides(out) != (
                 k, q * k, p * q * k, 0 if n == 1 else z * p * q * k):
             return None
         # blocks read operands other blocks may already have overwritten
@@ -1959,6 +1971,7 @@ def _kernel_fp16_conv3d(x, weight, bias, residual, stride, out=None, padding=(0,
         None if residual is None else _dl(residual), _dl(out),
         n, d - 2 * pd, h - 2 * ph, w - 2 * pw, c, k, t, r, s, sd, sh, sw, _stream(x), *xs,
         pd=pd, ph=ph, pw=pw, acc_scale=None if acc_scale is None else _dl(acc_scale),
+        dd=dd, dh=dh, dw=dw, out_ncdhw=ncdhw,
     )
     return out if served else None
 
@@ -1969,7 +1982,7 @@ _PACKED_STAGE_PRODUCTS = 32
 _PACKED_STAGE_SUM_LIMIT = 32768.0
 
 
-def _simt_fp16_conv3d(x, weight, bias, residual, stride, padding, out=None):
+def _simt_fp16_conv3d(x, weight, bias, residual, stride, padding, out=None, dilation=(1, 1, 1)):
     """fp16_conv3d on gfx90c/gfx1010's packed fp16 GEMM, an implicit GEMM that on gfx1010
     measured 3-4.5x MIOpen's im2col + rocBLAS conv at Wan VAE decoder shapes (5.6-6.7 TFLOPS)
     and needs no im2col workspace. A packed fold's partial sums must stay in fp16's
@@ -1985,7 +1998,63 @@ def _simt_fp16_conv3d(x, weight, bias, residual, stride, padding, out=None):
              * (_PACKED_STAGE_PRODUCTS / _PACKED_STAGE_SUM_LIMIT))
     acc_scale = torch.exp2(torch.log2(bound).ceil_().clamp_(min=0)).reshape(1)
     return _kernel_fp16_conv3d(x, (weight / acc_scale).half(), bias, residual, stride, out,
-                               padding, acc_scale)
+                               padding, acc_scale, dilation)
+
+
+def _transpose_cast(x, out, n, a, b, divisor):
+    """Packed [n, a, b] x into packed [n, b, a] out in out's dtype, divided by divisor (a
+    one-element fp32 tensor); see ops/transpose_cast.hip."""
+    _C.transpose_cast(_dl(x), _dl(out), n, a, b, _dl(divisor), _stream(x))
+
+
+def fp16_packed_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    dilation: list[int],
+) -> torch.Tensor:
+    """conv3d with an fp16 weight on gfx90c/gfx1010's packed fp16 implicit GEMM, x of any
+    float dtype and range, the result in x's dtype and memory format (channels_last_3d or
+    contiguous). A channels_last_3d fp16 x is read in place against a scaled weight
+    (_simt_fp16_conv3d). Any other x is taken to an NDHWC fp16 copy, divided by the power
+    of two that keeps each packed partial sum in fp16's range against the unscaled weight
+    (and the copy's largest element under 2**15); the epilogue multiplies it back. A
+    contiguous x is taken to that copy by _transpose_cast, as torch's strided copy between
+    the layouts is 7-70x slower than a plain one here, and the epilogue writes its result
+    NCDHW directly. No im2col workspace exists.
+    Other devices, and shapes the kernel declines, run torch's conv in x's dtype."""
+    cl = torch.channels_last_3d
+    if (_simt_gemm_on(x.device) and x.shape[1] % 32 == 0 and weight.dtype == torch.float16
+            and weight.device == x.device):
+        if bias is not None:
+            bias = bias.to(device=x.device, dtype=x.dtype)
+        channels_last = x.is_contiguous(memory_format=cl)
+        if channels_last and x.dtype == torch.float16:
+            out = _simt_fp16_conv3d(x, weight, bias, None, stride, padding, dilation=dilation)
+        else:
+            if not channels_last:
+                x = x.contiguous()
+            inf = float("inf")
+            x_amax = torch.linalg.vector_norm(x, inf, dtype=torch.float32)
+            bound = (x_amax * torch.linalg.vector_norm(weight, inf, dtype=torch.float32)
+                     * (_PACKED_STAGE_PRODUCTS / _PACKED_STAGE_SUM_LIMIT))
+            # the floor keeps an all-zero x's scale finite
+            exponent = torch.maximum(torch.log2(bound), torch.log2(x_amax) - 15).ceil_().clamp_(min=-64)
+            acc_scale = torch.exp2(exponent).reshape(1)
+            x16 = torch.empty(x.shape, dtype=torch.float16, device=x.device, memory_format=cl)
+            n, c = x.shape[:2]
+            if channels_last:
+                torch.div(x, acc_scale, out=x16)
+            else:
+                _transpose_cast(x, x16, n, c, x[0, 0].numel(), acc_scale)
+            out = _kernel_fp16_conv3d(x16, weight, bias, None, stride, padding=padding,
+                                      acc_scale=acc_scale, dilation=dilation, out_dtype=x.dtype,
+                                      ncdhw=not channels_last)
+        if out is not None:
+            return out
+    return _eager.fp16_packed_conv3d(x, weight, bias, stride, padding, dilation)
 
 
 def _zero_pad3d(x, padding):
@@ -3120,6 +3189,16 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             },
             default_devices=dev,
         ),
+        "fp16_packed_conv3d": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(5),)),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(5),)
+                ),
+                "bias": ParamConstraint(dtypes=floats),
+            },
+            default_devices=dev,
+        ),
         "fp16_packed_linear": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=floats, shape_rules=(MinDims(2),)),
@@ -3644,12 +3723,14 @@ def sage_int8_block_sparse_attend(
     block_q: int,
     attention_scale: float,
     output_dtype: torch.dtype,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Attend over sage_int8_quantize's packed layouts (cta_k 64), with query block b
-    of each head reading only the 64-key tiles lut[..., b, :]. gfx1010 only."""
+    of each head reading only the 64-key tiles lut[..., b, :]. gfx1010 only. out, when
+    given, is a [B, H, L, D] tensor of output_dtype, contiguous along D, written in place."""
     _require_sage_attention()
     batch, q_heads, q_length, head_dim = q_int8.shape
-    output = torch.empty(
+    output = out if out is not None else torch.empty(
         batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q_int8.device
     )
     _C.sage_block_sparse_prequantized(

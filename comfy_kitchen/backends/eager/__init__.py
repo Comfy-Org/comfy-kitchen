@@ -2,6 +2,7 @@ __all__ = [
     "adaln",
     "fp16_conv3d",
     "fp16_conv3d_out",
+    "fp16_packed_conv3d",
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
     "na3d",
@@ -71,7 +72,7 @@ from comfy_kitchen.registry import registry
 
 from .adaln import adaln, rms_adaln
 from .awq import gemv_awq_w4a16
-from .conv3d import fp16_conv3d, fp16_conv3d_out
+from .conv3d import fp16_conv3d, fp16_conv3d_out, fp16_packed_conv3d
 from .convrot_w4a4 import (
     convrot_w4a4_linear,
     dequantize_convrot_w4a4_weight,
@@ -541,6 +542,14 @@ def _build_constraints() -> dict:
             "q": ParamConstraint(dtypes=frozenset({torch.int8})),
             "scale": ParamConstraint(dtypes=standard_floats),
             "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["fp16_packed_conv3d"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
+            "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
+            "bias": ParamConstraint(dtypes=standard_floats),
         },
         default_devices=all_devices,
     )

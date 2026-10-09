@@ -59,7 +59,10 @@ bool launch_int8_convrot_packed_linear_kernel(const void*, int, int, const void*
                                               hipStream_t);
 bool launch_fp16_conv3d_kernel(const void*, const void*, const void*, const void*, void*, int, int,
                                int, int, int, int, int, int, int, int, int, int, int, int, int,
-                               int, int, int, int, int, int, int, const void*, hipStream_t);
+                               int, int, int, int, int, int, int, int, int, int, const void*, int,
+                               bool, hipStream_t);
+void launch_transpose_cast_kernel(const void*, int, void*, int, int, int, int, const void*,
+                                  hipStream_t);
 
 void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, hipStream_t);
 void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
@@ -526,11 +529,13 @@ bool int8_convrot_packed_linear(nb::ndarray<> x, int act_code, OptArray act_weig
 }
 
 // NDHWC conv3d, zero padding, x [N, D, H, W, C] and w [K, T, R, S, C] fp16 in that
-// memory order; out and resid are [N, Z, P, Q, K]. false means the caller serves it.
+// memory order; out and resid are [N, Z, P, Q, K] ([N, K, Z, P, Q] with out_ncdhw), fp16 or
+// (with acc_scale) fp32 or bf16, and bias shares their dtype. false means the caller serves it.
 bool fp16_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, OptArray resid,
                  nb::ndarray<> out, int N, int D, int H, int W, int C, int K, int T, int R, int S,
                  int sd, int sh, int sw, uintptr_t stream_ptr, int64_t xs_w, int64_t xs_h,
-                 int64_t xs_d, int64_t xs_n, int pd, int ph, int pw, OptArray acc_scale) {
+                 int64_t xs_d, int64_t xs_n, int pd, int ph, int pw, OptArray acc_scale,
+                 int dd, int dh, int dw, bool out_ncdhw) {
     constexpr const char* kFn = "fp16_conv3d";
     for (int64_t st : {xs_w, xs_h, xs_d, xs_n}) {
         if (st < 0 || st > INT32_MAX) {
@@ -549,24 +554,30 @@ bool fp16_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, OptArray resid
     require_nonneg(pd, kFn, "pd");
     require_nonneg(ph, kFn, "ph");
     require_nonneg(pw, kFn, "pw");
-    if (D + 2 * pd < T || H + 2 * ph < R || W + 2 * pw < S) {
+    require_positive(dd, kFn, "dd");
+    require_positive(dh, kFn, "dh");
+    require_positive(dw, kFn, "dw");
+    // the dilated filter's extent on each axis
+    const int TE = (T - 1) * dd + 1, RE = (R - 1) * dh + 1, SE = (S - 1) * dw + 1;
+    if (D + 2 * pd < TE || H + 2 * ph < RE || W + 2 * pw < SE) {
         throw std::runtime_error(std::string(kFn) + ": input smaller than the filter");
     }
-    const int Z = (D + 2 * pd - T) / sd + 1, P = (H + 2 * ph - R) / sh + 1,
-              Q = (W + 2 * pw - S) / sw + 1;
+    const int Z = (D + 2 * pd - TE) / sd + 1, P = (H + 2 * ph - RE) / sh + 1,
+              Q = (W + 2 * pw - SE) / sw + 1;
     const int64_t outs = static_cast<int64_t>(N) * Z * P * Q * K;
     require_fp16(x, kFn, "x");
     require_fp16(w, kFn, "w");
-    require_fp16(out, kFn, "out");
+    require_dtype(out, 0, 2, kFn, "out");
+    const int out_code = map_dtype_to_code(out.dtype());
     require_len(x, static_cast<int64_t>(N) * D * H * W * C, kFn, "x");
     require_len(w, static_cast<int64_t>(K) * T * R * S * C, kFn, "w");
     require_len(out, outs, kFn, "out");
     if (bias.has_value()) {
-        require_fp16(*bias, kFn, "bias");
+        require_dtype(*bias, out_code, out_code, kFn, "bias");
         require_len(*bias, K, kFn, "bias");
     }
     if (resid.has_value()) {
-        require_fp16(*resid, kFn, "resid");
+        require_dtype(*resid, out_code, out_code, kFn, "resid");
         require_len(*resid, outs, kFn, "resid");
     }
     if (acc_scale.has_value()) {
@@ -576,8 +587,8 @@ bool fp16_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, OptArray resid
     const bool served = launch_fp16_conv3d_kernel(
         x.data(), w.data(), opt_data(bias), opt_data(resid), out.data(), N, D, H, W, C, K, T, R, S,
         Z, P, Q, sd, sh, sw, static_cast<int>(xs_w), static_cast<int>(xs_h),
-        static_cast<int>(xs_d), static_cast<int>(xs_n), pd, ph, pw, opt_data(acc_scale),
-        reinterpret_cast<hipStream_t>(stream_ptr));
+        static_cast<int>(xs_d), static_cast<int>(xs_n), pd, ph, pw, dd, dh, dw, opt_data(acc_scale),
+        out_code, out_ncdhw, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
     return served;
 }
@@ -597,6 +608,25 @@ static void require_convrot_group(int k, int group_size, const char* fn) {
         throw std::runtime_error(std::string(fn) + ": K=" + std::to_string(k) +
                                  " is not divisible by group_size=" + std::to_string(group_size));
     }
+}
+
+// Packed [N, A, B] x -> packed [N, B, A] out, each element divided by divisor[0].
+void transpose_cast(nb::ndarray<> x, nb::ndarray<> out, int N, int A, int B,
+                    nb::ndarray<> divisor, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "transpose_cast";
+    require_nonneg(N, kFn, "N");
+    require_nonneg(A, kFn, "A");
+    require_nonneg(B, kFn, "B");
+    require_dtype(x, 0, 2, kFn, "x");
+    require_dtype(out, 0, 2, kFn, "out");
+    require_len(x, static_cast<int64_t>(N) * A * B, kFn, "x");
+    require_len(out, static_cast<int64_t>(N) * A * B, kFn, "out");
+    require_dtype(divisor, 0, 0, kFn, "divisor");
+    require_len(divisor, 1, kFn, "divisor");
+    launch_transpose_cast_kernel(x.data(), map_dtype_to_code(x.dtype()), out.data(),
+                                 map_dtype_to_code(out.dtype()), N, A, B, divisor.data(),
+                                 reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
 }
 
 void quantize_int8_rowwise(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales, int M, int K,
@@ -1978,15 +2008,19 @@ void sage_block_sparse_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8,
     if (lut.device_type() != nb::device::rocm::value || lut.device_id() != q_int8.device_id()) {
         throw std::runtime_error(std::string(kFn) + ": lut must be on q's ROCm device");
     }
-    if (output_dtype_code != 1 && output_dtype_code != 2) {
-        throw std::runtime_error(std::string(kFn) + ": output dtype must be float16 or bfloat16");
+    if (output_dtype_code < 0 || output_dtype_code > 2) {
+        throw std::runtime_error(std::string(kFn) + ": output dtype must be float32, float16 or bfloat16");
     }
     require_dtype(o, output_dtype_code, output_dtype_code, kFn, "o");
     if (static_cast<int>(o.shape(0)) != batch || static_cast<int>(o.shape(1)) != q_heads ||
         static_cast<int>(o.shape(2)) != qo_len || static_cast<int>(o.shape(3)) != head_dim) {
         throw std::runtime_error(std::string(kFn) + ": o must be [B, H_q, Lq, D]");
     }
-    require_packed_contiguous(o, kFn, "o");
+    // o may be a strided view, such as a [B, Lq, H_q, D] buffer transposed, so a model
+    // that stores attention outputs sequence-major gets them without a copy.
+    if (o.stride(3) != 1) {
+        throw std::runtime_error(std::string(kFn) + ": o must be contiguous along D");
+    }
 
     launch_sage_int8_block_sparse_attn(
         q_int8.data(), k_int8.data(), v_int8.data(), o.data(), q_scale.data(), k_scale.data(),
@@ -1996,9 +2030,8 @@ void sage_block_sparse_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8,
         static_cast<int64_t>(kv_heads) * kv_len * head_dim,
         static_cast<int64_t>(kv_len) * head_dim,
         static_cast<int64_t>(kv_heads) * head_dim * padded_k,
-        static_cast<int64_t>(head_dim) * padded_k, padded_k,
-        static_cast<int64_t>(q_heads) * qo_len * head_dim, static_cast<int64_t>(qo_len) * head_dim,
-        head_dim, sm_scale, output_dtype_code, reinterpret_cast<hipStream_t>(stream_ptr));
+        static_cast<int64_t>(head_dim) * padded_k, padded_k, o.stride(0), o.stride(1), o.stride(2),
+        sm_scale, output_dtype_code, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -2560,7 +2593,10 @@ NB_MODULE(_C, m) {
           nb::arg("W"), nb::arg("C"), nb::arg("K"), nb::arg("T"), nb::arg("R"), nb::arg("S"),
           nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("stream_ptr"), nb::arg("xs_w") = 0,
           nb::arg("xs_h") = 0, nb::arg("xs_d") = 0, nb::arg("xs_n") = 0, nb::arg("pd") = 0,
-          nb::arg("ph") = 0, nb::arg("pw") = 0, nb::arg("acc_scale").none() = nb::none());
+          nb::arg("ph") = 0, nb::arg("pw") = 0, nb::arg("acc_scale").none() = nb::none(),
+          nb::arg("dd") = 1, nb::arg("dh") = 1, nb::arg("dw") = 1, nb::arg("out_ncdhw") = false);
+    m.def("transpose_cast", &transpose_cast, nb::arg("x"), nb::arg("out"), nb::arg("N"),
+          nb::arg("A"), nb::arg("B"), nb::arg("divisor"), nb::arg("stream_ptr"));
     m.def("quantize_int8_rowwise", &quantize_int8_rowwise);
     m.def("quantize_int8_convrot", &quantize_int8_convrot, nb::arg("x"), nb::arg("q"),
           nb::arg("scales"), nb::arg("spill_rotated").none(), nb::arg("spill_partials").none(),

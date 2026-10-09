@@ -103,6 +103,7 @@ __all__ = [
     "dequantize_w4a8_int8_weight",
     "gemv_awq_w4a16",
     "fp16_linear",
+    "fp16_packed_conv3d",
     "fp16_packed_linear",
     "fp16_packed_linear_is_accelerated",
     "int8_linear",
@@ -981,6 +982,29 @@ def fp16_packed_linear(
     kwargs = {"x": x, "weight": weight, "bias": bias, "out_dtype": out_dtype,
               "weight_amax": weight_amax}
     impl = registry.get_implementation("fp16_packed_linear", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def fp16_packed_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: int | tuple[int, int, int] = 1,
+    padding: int | tuple[int, int, int] = 0,
+    dilation: int | tuple[int, int, int] = 1,
+) -> torch.Tensor:
+    """conv3d with an fp16 weight on the packed fp16 math of :func:`fp16_packed_linear`,
+    zero padding, the result in x's dtype and, on the HIP backend, its memory format.
+
+    The HIP backend serves gfx90c and gfx1010 with an implicit GEMM (no im2col workspace)
+    when x has a multiple of 32 channels: x of any float dtype and range is scaled by a power
+    of two so that no fp16 partial sum overflows. Elsewhere this is torch's conv3d in x's dtype.
+    """
+    stride, padding, dilation = ([v] * 3 if isinstance(v, int) else list(v)
+                                 for v in (stride, padding, dilation))
+    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": stride, "padding": padding,
+              "dilation": dilation}
+    impl = registry.get_implementation("fp16_packed_conv3d", kwargs=kwargs)
     return impl(**kwargs)
 
 

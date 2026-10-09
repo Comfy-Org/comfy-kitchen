@@ -234,3 +234,54 @@ class TestSimtFp16Conv3d:
         out = ck.fp16_conv3d(x, weight, bias, padding=1)
         assert torch.isfinite(out).all()
         assert rel_err(out.float(), ref) < 2e-3
+
+
+class TestFp16PackedConv3d:
+    """fp16_packed_conv3d: x of any float dtype, range and layout against an fp16 weight;
+    the result keeps x's dtype and memory format. Off the packed GEMM devices it is torch's
+    conv in x's dtype."""
+
+    @pytest.mark.parametrize(
+        "c,k,spatial,ksize,stride,padding,dilation",
+        [
+            (256, 128, (1, 40, 72), (1, 3, 3), (1, 1, 1), (0, 1, 1), (1, 1, 1)),
+            (128, 128, (1, 1, 3000), (1, 1, 7), (1, 1, 1), (0, 0, 27), (1, 1, 9)),
+            (64, 40, (3, 17, 13), (3, 3, 3), (1, 2, 2), (1, 2, 2), (1, 2, 2)),
+            (96, 8, (1, 1, 999), (1, 1, 3), (1, 1, 2), (0, 0, 1), (1, 1, 1)),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("channels_last", [False, True])
+    def test_matches_fp64_conv(self, c, k, spatial, ksize, stride, padding, dilation, dtype, channels_last):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA/HIP required")
+        torch.manual_seed(0)
+        x = (torch.randn(2, c, *spatial, device="cuda") * 30).to(dtype)
+        if channels_last:
+            x = x.contiguous(memory_format=CL3D)
+        weight = (torch.randn(k, c, *ksize, device="cuda") / math.sqrt(c * math.prod(ksize))).half()
+        bias = torch.randn(k, device="cuda")
+        ref = functional.conv3d(x.double(), weight.double(), bias.double(), stride, padding, dilation)
+
+        out = ck.fp16_packed_conv3d(x, weight, bias, stride, padding, dilation)
+
+        assert out.shape == ref.shape and out.dtype == dtype
+        if _simt_device():
+            assert out.is_contiguous(memory_format=CL3D if channels_last else torch.contiguous_format)
+        # bf16 and fp16 outputs carry their own rounding on top of the packed GEMM's ~1e-3
+        assert rel_err(out.double(), ref) < (2e-3 if dtype == torch.float32 else 6e-3)
+
+    def test_wide_range_and_zero_input(self):
+        if not _simt_device():
+            pytest.skip("packed fp16 GEMM device required")
+        torch.manual_seed(1)
+        weight = (torch.randn(32, 64, 1, 3, 3, device="cuda") * 0.05).half()
+        # fp32 activations past fp16's range, and ones far below its normal range
+        for magnitude in (1e6, 1e-6):
+            x = torch.randn(1, 64, 1, 24, 24, device="cuda") * magnitude
+            ref = functional.conv3d(x.double(), weight.double(), padding=(0, 1, 1))
+            out = ck.fp16_packed_conv3d(x, weight, padding=(0, 1, 1))
+            assert torch.isfinite(out).all()
+            assert rel_err(out.double(), ref) < 2e-3
+        zeros = ck.fp16_packed_conv3d(torch.zeros(1, 64, 1, 8, 8, device="cuda"), weight, padding=(0, 1, 1))
+        assert torch.equal(zeros, torch.zeros_like(zeros))

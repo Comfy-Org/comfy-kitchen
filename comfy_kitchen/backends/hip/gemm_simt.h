@@ -293,6 +293,17 @@ constexpr int kSimtGrainStages = 4;
 // Two blocks per CU caps gfx90c at the 128 VGPRs that keep two wave64s per SIMD;
 // left uncapped its fp8 and int4 tiles took ~200 and ran 15-30% slower. gfx1010's
 // wave32 budget is wider and it measured the same either way.
+// Element offset of C[r, col]: row-major with row stride ldc, unless the epilogue places
+// its output itself through out_offset(r, col) (the packed conv writing NCDHW).
+template <typename Epi>
+__forceinline__ __device__ int64_t simt_out_offset(const Epi& epi, int r, int col, int ldc) {
+    if constexpr (requires { epi.out_offset(r, col); }) {
+        return epi.out_offset(r, col);
+    } else {
+        return static_cast<int64_t>(r) * ldc + col;
+    }
+}
+
 template <typename Op, typename Epi, typename OutT, int TY, int TM, int TN, bool SPLIT,
           typename ASrc = const uint8_t*>
 __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
@@ -518,12 +529,12 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
     for (int i = 0; i < TM; ++i) {
         const int r = m0 + (i / 4) * (TY * 4) + ty * 4 + i % 4;
         if (r >= M) continue;
-        OutT* crow = C + static_cast<int64_t>(r) * ldc;
 #pragma unroll
         for (int j = 0; j < TN; ++j) {
             const int col = n0 + (j / 4) * (TX * 4) + tx * 4 + j % 4;
             if (col >= N) continue;
-            crow[col] = static_cast<OutT>(epi(r, col, Op::finish(acc[i][j])));
+            C[simt_out_offset(epi, r, col, ldc)] =
+                static_cast<OutT>(epi(r, col, Op::finish(acc[i][j])));
         }
     }
 #endif  // COMFY_SIMT_GEMM
@@ -543,7 +554,7 @@ __global__ __launch_bounds__(256) void gemm_simt_reduce_kernel(
     for (int z = 1; z < slices; ++z) sum += partial[z * mn + i];
     const int r = static_cast<int>(i / N), col = static_cast<int>(i % N);
     epi.init();
-    C[static_cast<int64_t>(r) * ldc + col] = static_cast<OutT>(epi(r, col, Op::finish(sum)));
+    C[simt_out_offset(epi, r, col, ldc)] = static_cast<OutT>(epi(r, col, Op::finish(sum)));
 #endif
 }
 

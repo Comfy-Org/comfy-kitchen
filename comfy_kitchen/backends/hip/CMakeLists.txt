@@ -180,6 +180,7 @@ set(HIP_SOURCES
     ops/gemm_f16_packed.hip
     ops/gemm_fp16.hip
     ops/conv3d_fp16.hip
+    ops/transpose_cast.hip
     ops/convrot_w4a4.hip
     ops/adaln.hip
     ops/group_norm_pad3d.hip

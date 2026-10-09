@@ -36,6 +36,19 @@ def fp16_conv3d_out(
     out.copy_(fp16_conv3d(x, weight, bias, residual, stride, padding))
 
 
+def fp16_packed_conv3d(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    dilation: list[int],
+) -> Tensor:
+    """3D conv with zero padding in x's dtype."""
+    return functional.conv3d(x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype),
+                             stride=stride, padding=padding, dilation=dilation)
+
+
 def _out_shape(x, weight, stride, padding):
     n, _, d, h, w = x.shape
     k, _, t, r, s = weight.shape

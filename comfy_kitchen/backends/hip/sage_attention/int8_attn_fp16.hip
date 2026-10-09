@@ -106,10 +106,14 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
     constexpr int kChunks = HD / 8 / kL;     // 8-wide Q/K chunks a lane owns: kL * c + part
     constexpr int kDims = HD / kL;           // O dims a lane owns: kL * t + part
     constexpr int kKStride = HD;             // halves per K row
-    constexpr int kVStride = CTA_K + 8;      // halves per V row: 144 B, so the kL adjacent
-                                             // rows a group reads sit 16 B apart in the banks
     __shared__ __attribute__((aligned(16))) _Float16 smem_k[CTA_K * kKStride];
-    __shared__ __attribute__((aligned(16))) _Float16 smem_v[HD * kVStride];
+    // V rows are 128 B (64 keys) with their 16 B granules xor-swizzled by the row, so the
+    // kL adjacent rows a group reads land in different banks. Padding the rows instead
+    // made the tiles 34 KB, which fits only three 4-wave blocks in a WGP's 128 KB.
+    __shared__ __attribute__((aligned(16))) _Float16 smem_v[HD * CTA_K];
+    auto v_granule = [&](int row, int g) -> Half8* {
+        return reinterpret_cast<Half8*>(smem_v + row * CTA_K + (g ^ (row & 7)) * 8);
+    };
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -205,9 +209,8 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
                 v_head + static_cast<int64_t>(row) * v_stride_d + kb0 + unit * 16);
             Half8 a, b;
             i8x16_to_half8x2(raw, a, b);
-            Half8* dst = reinterpret_cast<Half8*>(smem_v + row * kVStride + unit * 16);
-            dst[0] = a;
-            dst[1] = b;
+            *v_granule(row, 2 * unit) = a;
+            *v_granule(row, 2 * unit + 1) = b;
         }
         __syncthreads();
 
@@ -351,8 +354,8 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
 #pragma unroll
             for (int t = 0; t < kDims; ++t) {
                 const int row = kL * t + part;
-                const Half8 v0 = *reinterpret_cast<const Half8*>(smem_v + row * kVStride + sub * kSub);
-                const Half8 v1 = *reinterpret_cast<const Half8*>(smem_v + row * kVStride + sub * kSub + 8);
+                const Half8 v0 = *v_granule(row, 2 * sub);
+                const Half8 v1 = *v_granule(row, 2 * sub + 1);
 #pragma unroll
                 for (int r = 0; r < kR; ++r) {
                     float a = o_val[r][t];
@@ -441,28 +444,29 @@ void launch_fp16(const Int8AttnLaunch& a, const int* lut, int topk) {
         a.o_stride_b, a.o_stride_h, a.o_stride_n, a.sm_scale);
 }
 
+template <int HD, bool PK, int kWaves>
+void launch_fp16_out(const Int8AttnLaunch& a, int output_dtype_code, const int* lut, int topk) {
+    // Output dtype codes: 0 float32 (block-sparse only), 1 float16, 2 bfloat16.
+    if (output_dtype_code == 0) {
+        launch_fp16<HD, PK, kWaves, float>(a, lut, topk);
+    } else if (output_dtype_code == 1) {
+        launch_fp16<HD, PK, kWaves, __half>(a, lut, topk);
+    } else {
+        launch_fp16<HD, PK, kWaves, __bf16>(a, lut, topk);
+    }
+}
+
 }  // namespace
 
 void launch_int8_attn_fp16(const Int8AttnLaunch& a, int head_dim, int output_dtype_code,
                            const int* lut, int topk, int block_q) {
     // 16 queries a wave, so block_q fixes the waves per block.
-    const bool half_out = output_dtype_code == 1;
     if (head_dim == 64) {
-        if (block_q == 64) {
-            half_out ? launch_fp16<64, false, 4, __half>(a, lut, topk)
-                     : launch_fp16<64, false, 4, __bf16>(a, lut, topk);
-        } else {
-            half_out ? launch_fp16<64, false, 8, __half>(a, lut, topk)
-                     : launch_fp16<64, false, 8, __bf16>(a, lut, topk);
-        }
+        block_q == 64 ? launch_fp16_out<64, false, 4>(a, output_dtype_code, lut, topk)
+                      : launch_fp16_out<64, false, 8>(a, output_dtype_code, lut, topk);
     } else {
-        if (block_q == 64) {
-            half_out ? launch_fp16<128, true, 4, __half>(a, lut, topk)
-                     : launch_fp16<128, true, 4, __bf16>(a, lut, topk);
-        } else {
-            half_out ? launch_fp16<128, true, 8, __half>(a, lut, topk)
-                     : launch_fp16<128, true, 8, __bf16>(a, lut, topk);
-        }
+        block_q == 64 ? launch_fp16_out<128, true, 4>(a, output_dtype_code, lut, topk)
+                      : launch_fp16_out<128, true, 8>(a, output_dtype_code, lut, topk);
     }
 }
 
