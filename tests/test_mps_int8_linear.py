@@ -698,6 +698,61 @@ def test_lora_zero_contribution_keeps_a_tiny_base_exact():
     assert torch.equal(out.cpu(), torch.full((1, 4), 4 * 2.0 ** -120))
 
 
+@pytest.mark.parametrize("k", [4, 256])
+def test_lora_zero_contribution_inside_the_fast_gap_keeps_a_tiny_base(k):
+    # Review 2026-10-09 Sol, finding 1: the scales are within the fma fast path's 2^64 gap,
+    # but the base GEMM value (2^-100 here) sits far below its own scale while the LoRA term
+    # is exactly zero. Scaling both to the LoRA's larger scale flushed the base to 0.
+    x = torch.zeros(1, k)
+    x[0, :3] = torch.tensor([1.0, 2.0 ** -100, -1.0])
+    q = torch.zeros(1, k, dtype=torch.int8)
+    q[0, 1] = 1
+    down = torch.zeros(1, k)
+    down[0, 0] = down[0, 2] = 1.0
+    out = ck.int8_linear(x.to(D), q.to(D), torch.ones(1, device=D), None, torch.float32,
+                         lora_down=down.to(D), lora_up=torch.full((1, 1), 2.0 ** 68, device=D))
+    assert torch.equal(out.cpu(), torch.full((1, 1), 2.0 ** -100))
+
+
+_EPILOGUE_PROBE = r"""
+kernel void probe_lora_epilogue(device float* out, device const uint* cb, device const int* ce,
+                                device const float* lora, device const int* lue,
+                                device const int* re, uint i [[thread_position_in_grid]]) {
+    out[i] = as_type<float>(epilogue_value<8, float>(out + i, cb[i], ce[i] + re[i], 0.0f, 0.0f,
+                                                     0.0f, lora[i], lue[i], re[i]));
+}
+"""
+
+
+def _f32(bits):
+    return torch.tensor([bits], dtype=torch.int64).to(torch.int32).view(torch.float32).item()
+
+
+@pytest.mark.parametrize("cb,ce,lora,lue,re", [
+    # Review 2026-10-09 Sol: both terms normal but tiny; they cancel to 2^-149 in the fast
+    # path's scaled domain, which flushed before the 2^100 restore. Expected 2^-49.
+    (0x01000000, 0, _f32(0x80FFFFFF), 0, 100),
+    # A zero LoRA term with a scale 2^40 above the base's: the base must survive.
+    (0x0D800000, 0, 0.0, 40, 0),
+    # Exact cancellation stays exactly zero.
+    (0x3F800000, 3, -1.0, 3, 0),
+    # Ordinary terms in the fast gap.
+    (0x3FC00000, -5, 0.75, 7, 2),
+])
+def test_lora_epilogue_matches_exact_sum(cb, ce, lora, lue, re):
+    from comfy_kitchen.backends.mps import linear
+
+    lib = torch.mps.compile_shader(linear._SHADERS + _EPILOGUE_PROBE)
+    out = torch.empty(1, device=D)
+    lib.probe_lora_epilogue(
+        out, torch.tensor([cb], dtype=torch.int64).to(torch.int32).to(D), torch.tensor([ce], dtype=torch.int32, device=D),
+        torch.tensor([lora], device=D), torch.tensor([lue], dtype=torch.int32, device=D),
+        torch.tensor([re], dtype=torch.int32, device=D),
+    )
+    exact = (_f32(cb) * 2.0 ** ce + lora * 2.0 ** lue) * 2.0 ** re  # float64: exact here
+    assert out.cpu().item() == torch.tensor(exact, dtype=torch.float32).item()
+
+
 def test_unfused_mode_is_gone(monkeypatch):
     # The comparison mode stored x @ down^T in the input dtype; it was removed, not patched.
     monkeypatch.setenv("COMFY_KITCHEN_MPS_LORA", "unfused")

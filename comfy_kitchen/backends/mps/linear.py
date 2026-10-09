@@ -408,16 +408,19 @@ kernel void i8_decode_t4(device T* out,
 // would, not inf - inf. As a runtime argument the flags cost 1.5-2.5x here.
 // Fast path: when the two scales are within 2^64 of each other, both terms are brought to
 // the larger scale by exact power-of-two multipliers in [2^-64, 1] and summed by one fma.
-// Only a term below 2^-126 of the larger scale can flush there, far beneath fp32 rounding
-// of the sum; wider gaps take add_scaled, which follows the terms' own exponents.
+// It is taken only when both scaled terms stay at or above 2^-102 (biased exponent >= 25):
+// then any nonzero sum, even after cancellation, is a multiple of an ulp >= 2^-125 and so
+// normal. A zero or tiny term must not set the scale, or the other term or the cancelled
+// sum would flush (a LoRA contributing 0 would erase a small base). Everything else takes
+// add_scaled, which follows the terms' own exponents.
 template <int FL, typename TO>
 inline uint epilogue_value(device TO* out, uint cb, int ex, float bv, float r, float rs,
                            float lora = 0.0f, int lue = 0, int re = 0) {
     uint b;
     if (FL & 8) {
-        const int ce = ex - re, d = ce - lue;
-        if (d >= -64 && d <= 64) {
-            const int top = max(ce, lue);
+        const int ce = ex - re, d = ce - lue, top = max(ce, lue);
+        const int ea = int((cb >> 23) & 0xFFu), el = int((as_type<uint>(lora) >> 23) & 0xFFu);
+        if (d >= -64 && d <= 64 && ea + ce - top >= 25 && el + lue - top >= 25) {
             const float pa = as_type<float>(uint(127 + ce - top) << 23);
             const float pb = as_type<float>(uint(127 + lue - top) << 23);
             b = ldexp_bits(as_type<uint>(fma(lora, pb, as_type<float>(cb) * pa)), re + top);
@@ -977,8 +980,9 @@ def weight_only_linear(x, n, k, decode, *, bias, out_dtype, group, residual=None
                 threads=(-(-rows // _LORA_TILE_N) * _LORA_TILE_M * 4, -(-m // _LORA_TILE_M)),
                 group_size=(_LORA_TILE_M * 4, 1),
             )
-            if row0 == 0 and rows < n:  # later chunks read a compact copy
-                la_args = (c[:, rows:].contiguous(), rank, 0)
+            if row0 == 0 and rows < n:  # later chunks read a compact copy; clone, since at
+                # M = 1 the slice is already contiguous and .contiguous() would keep c alive
+                la_args = (c[:, rows:].clone(memory_format=torch.contiguous_format), rank, 0)
         del w, c, operands  # operands also holds c; release it before allocating the next chunk
     out = out.reshape(out_shape)
     if residual is not None and res is None:

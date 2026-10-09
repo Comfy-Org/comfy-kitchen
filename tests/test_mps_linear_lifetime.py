@@ -12,10 +12,11 @@ import torch
 from comfy_kitchen.backends.mps import linear
 
 
+@pytest.mark.parametrize("m", [1, 3])
 @pytest.mark.parametrize("with_lora", [False, True])
-def test_previous_chunk_result_is_released_before_next_decode(monkeypatch, with_lora):
+def test_previous_chunk_result_is_released_before_next_decode(monkeypatch, with_lora, m):
     generator = torch.Generator().manual_seed(4)
-    m, k, n, rank = 3, 4, 12, 8
+    k, n, rank = 4, 12, 8
     x = torch.randn(m, k, generator=generator)
     weight = torch.randn(n, k, generator=generator)
     down = torch.randn(rank, k, generator=generator)

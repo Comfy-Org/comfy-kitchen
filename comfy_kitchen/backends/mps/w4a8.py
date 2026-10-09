@@ -357,6 +357,10 @@ def w4a8_int8_linear(
     before rounding); the symmetric path rounds to ``out_dtype`` first, as int8_linear does.
     ``lora_down`` [R, K], ``lora_up`` [N, R] and ``lora_scale`` add an unmerged LoRA, as in
     int8_linear; ``lora_down`` is in the physical (un-rotated) basis.
+
+    Precision differs from eager by design. Eager's asymmetric path first materializes the
+    weight in x's dtype, so bf16 inputs round every weight to bf16; this path computes from the
+    stored weight's exact value and can be closer to it than eager (and so not bit-equal).
     """
     n, k, bits = validate_w4a8_operands(
         qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize
@@ -396,7 +400,9 @@ def dequantize_w4a8_int8_weight(
     """Decode W4A8/W6A8 storage into its physical (un-rotated) [N, K] weight, as eager does.
 
     Eager's contract, step for step: the rotated-basis weight in fp32 (int8 grid * s_channel
-    [+ correction], which the fp32 kernel reproduces bit for bit), cast to ``output_dtype``,
+    [+ correction], which the fp32 kernel reproduces bit for bit except that values below the
+    fp32 normal range flush to zero, as eager's own fp32 arithmetic does on Apple GPUs
+    (measured on an M1 Max)), cast to ``output_dtype``,
     then rotated back in ``output_dtype``. The eager decode cannot run here because MPS has
     no fp8 arithmetic; the kernel reads the fp8 scale bytes through a lookup table instead.
     Row-chunked under the same budget as the linear decode, so the fp32 transient stays bounded.

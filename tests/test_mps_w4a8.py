@@ -218,6 +218,22 @@ class TestLinear:
         )
         assert impl is mps_w4a8().w4a8_int8_linear
 
+    def test_asymmetric_uses_the_exact_stored_weight_not_eagers_rounded_one(self):
+        # Deliberate precision contract: eager's asymmetric path rounds the weight to x's dtype
+        # (bf16 1.00390625 -> 1) before F.linear, giving 0 here. The mps path computes from
+        # the stored weight's exact value, which gives 1 (review 2026-10-09).
+        k = 256
+        q = torch.full((1, k // 2), 0x99, dtype=torch.uint8).view(torch.int8)
+        s_rel, s_ch = torch.ones(1, k // 16), torch.tensor([2.0 ** -8])
+        corr = torch.ones(16, 1, dtype=torch.bfloat16)
+        bias = torch.tensor([-256.0], dtype=torch.bfloat16)
+        x = torch.ones(1, k, dtype=torch.bfloat16)
+        kwargs = {"codebook": None, "group_size": 16, "convrot_groupsize": 256, "out_dtype": torch.float32}
+        eager = eager_w4a8.w4a8_int8_linear(x, q, s_rel, s_ch, correction=corr, bias=bias, **kwargs)
+        mps = mps_w4a8().w4a8_int8_linear(*to_mps(x, q, s_rel, s_ch), correction=corr.to("mps"),
+                                          bias=bias.to("mps"), **kwargs)
+        assert eager.item() == 0.0 and mps.cpu().item() == 1.0
+
     def test_rejects_mismatched_k(self):
         q, s_rel, s_channel, _, codebook = to_mps(*quantize("w4_codebook"))
         with pytest.raises(ValueError, match="does not match"):
