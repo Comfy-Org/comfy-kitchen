@@ -57,6 +57,7 @@ def _build_constraints() -> dict:
                 "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
                 "weight_scale": ParamConstraint(dtypes=floats),
                 "bias": ParamConstraint(dtypes=floats),
+                "out_dtype": ParamConstraint(dtypes=floats),
                 "convrot": ParamConstraint(dtypes=frozenset({bool})),
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
                 **lora,

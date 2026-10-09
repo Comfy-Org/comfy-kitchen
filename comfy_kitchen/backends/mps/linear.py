@@ -916,14 +916,14 @@ def weight_only_linear(x, n, k, decode, *, bias, out_dtype, group, residual=None
     out_shape = (*lead, n)
     device = x.device
     bias_v, bias_stride = _bias_operand(bias, n, x.dtype if bias_in_linear else out_dtype, device)
-    x2 = x.reshape(-1, k)
-    m = x2.shape[0]
-    if m == 0 or n == 0 or k == 0:  # an empty K makes the LoRA term zero as well
+    if x.numel() == 0 or n == 0:  # an empty K makes the LoRA term zero as well
         out = torch.zeros(out_shape, dtype=out_dtype, device=device)
         if bias_v is not None:
             out = out + bias_v.to(out_dtype)
         return apply_residual(out, residual, residual_scale)
 
+    x2 = x.reshape(-1, k)
+    m = x2.shape[0]
     res = _residual_operands(residual, residual_scale, out_shape, n, out_dtype, device)
     cdtype = _compute_dtype(x, k)
     xc, row_exp = prologue(x2, group, cdtype)
