@@ -866,3 +866,35 @@ extern "C" void launch_quant_qk_per_thread_int8(
 #undef DISPATCH_C256
 #undef DO
 }
+
+namespace {
+// Fixed H128 rotations and no sequence-wide centering: a sealed page never changes.
+__global__ void quant_k_decode_pages(
+    const nv_bfloat16* k, int8_t* out, float* scales, const int64_t* position,
+    int B, int H, int capacity, int pages, int page_size, bool initialize) {
+  const int b = blockIdx.z / H, h = blockIdx.z % H;
+  const int length = static_cast<int>(position[0]);
+  const int page = initialize ? blockIdx.y : max(0, (length - 1) / page_size - 1) + blockIdx.y;
+  if (page >= pages || page * page_size >= length) return;
+  const int live = min(page_size, length - page * page_size);
+  const int64_t dst = (static_cast<int64_t>(b) * pages + page) * H + h;
+  process_k<nv_bfloat16, 8, 64, 2, 129, true>(
+      k + ((static_cast<int64_t>(b) * H + h) * capacity + page * page_size) * 256,
+      out + dst * page_size * 256, scales + dst * (page_size / 64) * 4,
+      blockIdx.x, live, 256, -1, 256);
+}
+}
+
+extern "C" void launch_int8_decode_quant_q(
+    const void* q, int8_t* out, float* scales, int B, int H, int rows, cudaStream_t stream) {
+  quant_q_kernel<nv_bfloat16, 2, 128, 16, 2, 129, true><<<dim3(8, H, B), 128, 0, stream>>>(
+      static_cast<const nv_bfloat16*>(q), out, scales, rows, 256, H, 64,
+      static_cast<int64_t>(H) * rows * 256, static_cast<int64_t>(rows) * 256, 256);
+}
+
+extern "C" void launch_int8_decode_quant_k(
+    const void* k, int8_t* out, float* scales, const int64_t* position,
+    int B, int H, int capacity, int pages, int page_size, bool initialize, cudaStream_t stream) {
+  quant_k_decode_pages<<<dim3(page_size / 64, initialize ? pages : 2, B * H), 128, 0, stream>>>(
+      static_cast<const nv_bfloat16*>(k), out, scales, position, B, H, capacity, pages, page_size, initialize);
+}

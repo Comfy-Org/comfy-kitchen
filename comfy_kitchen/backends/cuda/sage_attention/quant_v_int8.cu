@@ -58,11 +58,12 @@ __device__ __forceinline__ void load_tile(const T *ptr, float *out_vals) {
   }
 }
 
-template <typename T, int THREADS>
+template <typename T, int THREADS, bool paged = false>
 __global__ void
 quant_v_int8_kernel(const T *__restrict__ v, int8_t *__restrict__ out,
                    float *__restrict__ scale_out, int N, int padded_N, int H,
-                   int D, int64_t sb, int64_t sh, int64_t sn) {
+                   int D, int64_t sb, int64_t sh, int64_t sn,
+                   int pages = 0, const int64_t* position = nullptr, bool initialize = false) {
   const int d_tiles = D / kDTile;
   const int d_tile = blockIdx.x % d_tiles;
   const int bh = blockIdx.x / d_tiles;
@@ -70,6 +71,16 @@ quant_v_int8_kernel(const T *__restrict__ v, int8_t *__restrict__ out,
   const int b = bh / H;
   const int d0 = d_tile * kDTile;
 
+  if constexpr (paged) {
+    const int length = static_cast<int>(position[0]);
+    const int page = initialize ? blockIdx.y : max(0, (length - 1) / padded_N - 1) + blockIdx.y;
+    if (page >= pages || page * padded_N >= length) return;
+    N = min(padded_N, length - page * padded_N);
+    v += static_cast<int64_t>(page) * padded_N * sn;
+    const int64_t offset = (static_cast<int64_t>(b) * (pages - 1) + page) * H * D;
+    out += offset * padded_N;
+    scale_out += offset;
+  }
   const T *base = v + b * sb + h * sh + d0;
   constexpr int WARPS = THREADS / 32;
 
@@ -213,4 +224,13 @@ extern "C" void launch_quant_v_int8_kernel(const void *v, void *out, void *scale
     throw std::runtime_error(std::string("quant_v_int8 kernel launch failed: ") +
                              cudaGetErrorString(error));
   }
+}
+
+extern "C" void launch_int8_decode_quant_v(
+    const void* v, int8_t* out, float* scales, const int64_t* position,
+    int B, int H, int capacity, int pages, int page_size, bool initialize, cudaStream_t stream) {
+  quant_v_int8_kernel<__nv_bfloat16, 128, true><<<dim3(B * H * 32, initialize ? pages : 2), 128, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(v), out, scales, page_size, page_size, H, 256,
+      static_cast<int64_t>(H) * capacity * 256, static_cast<int64_t>(capacity) * 256, 256,
+      pages, position, initialize);
 }

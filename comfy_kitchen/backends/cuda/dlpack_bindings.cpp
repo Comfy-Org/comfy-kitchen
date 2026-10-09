@@ -4621,8 +4621,11 @@ bool deltanet_conv_deferred(
         qkv_buf.data(), ctl.data(), B, C, S, KS, ldp, dtype_code, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
+void register_int8_decode(nb::module_& m);
+
 NB_MODULE(_C, m) {
     m.doc() = "comfy_kitchen CUDA kernels - nanobind + DLPack interface (NO PyTorch C++ dependencies)";
+    register_int8_decode(m);
 
     m.def("prefetch_ring_available", &prefetch_ring_available);
     m.def("prefetch_ring_configure", &prefetch_ring_configure,
