@@ -654,7 +654,13 @@ def scaled_mm_nvfp4(
         raise ValueError("scaled_mm_nvfp4 expects two 2D operands")
 
     a = _aligned(a.to(torch.uint8).contiguous())
-    b = _aligned(b.to(torch.uint8).contiguous())
+    # The device move is not optional. Every scale and bias below is placed with
+    # a.device and the kernel is launched on a's stream, so a `b` left on another
+    # device hands the kernel a foreign pointer to dereference there. This is not
+    # hypothetical on a part that offloads: the text-encoder runs with
+    # offload_device="cpu", so weights do arrive on the host.
+    # scaled_mm_fp8 already does this (b.to(device=a.device)).
+    b = _aligned(b.to(device=a.device, dtype=torch.uint8).contiguous())
     m, k_packed = a.shape
     n, b_k_packed = b.shape
     if b_k_packed != k_packed:

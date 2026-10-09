@@ -420,8 +420,13 @@ void int4_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> 
 // float. Their length is the blocked buffer: RoundUp(rows,128) rows of
 // RoundUp(cols/16, 4) bytes.
 static size_t nvfp4_scale_elems(int rows, int blocks) {
-    return static_cast<size_t>((rows + 127) & ~127) *
-           static_cast<size_t>((blocks + 3) & ~3);
+    // Widened before the rounding offset is added, not after. `rows + 127` in int
+    // overflows for a rows near INT_MAX, and signed overflow is undefined, so the
+    // capacity check could accept a buffer that is too small and the kernel would
+    // then read past it. These extents come through the binding as open inputs.
+    const int64_t r = (static_cast<int64_t>(rows) + 127) & ~static_cast<int64_t>(127);
+    const int64_t b = (static_cast<int64_t>(blocks) + 3) & ~static_cast<int64_t>(3);
+    return static_cast<size_t>(r) * static_cast<size_t>(b);
 }
 
 void quantize_nvfp4(nb::ndarray<> x, nb::ndarray<> global_scale, nb::ndarray<> out,

@@ -911,16 +911,33 @@ extern "C" void launch_scaled_mm_nvfp4_kernel(
 // mean nothing on another architecture. gfx11 has 4 SIMDs per WGP, 512 VGPRs per
 // SIMD and 64 KB of LDS per WGP, and the 780M has 6 of them; gfx12 has 8 SIMDs per
 // WGP and a different LDS budget, and the dGPU parts have 20-96 WGPs rather than 6.
-// Every number in the table above is a property of that machine, so the family is
-// gated to gfx11 and the other architectures get one conservative tile instead of
-// inheriting a schedule whose measurements do not apply to them.
+// Every number in the table above is a property of that machine, so another
+// architecture gets a default chosen from the shape rather than from a measurement
+// that does not apply to it.
 //
-// COMFY_MMA_GFX11 rather than COMFY_MMA_GFX1103: the tile table was swept on the
-// 780M, but what it is reading off the architecture is the 4-SIMD WGP and the
-// 512-VGPR/64 KB-LDS budget, which is the whole gfx11 family and not one SKU of it.
-// This is the same arch gate mma.h's hw_exp2 uses, resolved at compile time because
-// the choice sits in a launcher.
-#if defined(COMFY_MMA_GFX11)
+// **This has to be a runtime query, not a preprocessor branch.** COMFY_MMA_GFX11 is
+// generated as `defined(__gfx1100__) || ...`, and those macros exist only inside a
+// device pass -- a host launcher cannot see them, so `#if defined(COMFY_MMA_GFX11)`
+// here evaluated false and the gfx11 arm was never compiled. Confirmed by building
+// for gfx1103 and finding no reference in the object file to device_wgp_count, which
+// only the gfx11 arm calls. The override family is instantiated on both paths
+// deliberately: a sweep that silently substitutes the tile it asked for reports "that
+// tile does not matter" for a tile it never ran, which is what gemm_wmma.h warns
+// about for an unlisted tile.
+#define CK_NVFP4_DISPATCH_GFX11(T)                                                             \
+    if (((M + 63) / 64) * ((N + 63) / 64) >= device_wgp_count()) {                            \
+        CK_NVFP4_GEMM_LAUNCH(T, 64, 64, 64, 2, 2, 2, 2);                                     \
+    } else {                                                                                  \
+        CK_NVFP4_GEMM_LAUNCH_P(T, 128, 128, 64, 4, 2, 2, 4, 2);                              \
+    }
+
+// The trailing semicolon lives here, not at the use site, because
+// CK_NVFP4_GEMM_LAUNCH expands to a `do { ... } while (0)` with no semicolon of
+// its own -- every other caller writes the `;` after the macro name, and this one
+// nesting it inside a helper is exactly where that convention breaks.
+#define CK_NVFP4_DISPATCH_DEFAULT(T)                                                          \
+    CK_NVFP4_GEMM_LAUNCH(T, 64, 64, 64, 2, 2, 2, 2);
+
 #define CK_NVFP4_DISPATCH_OUT(T)                                                              \
     do {                                                                                      \
         const EpiTensorwise epi{TSA, TSB, bias, bias_code, 0.0f};                              \
@@ -933,46 +950,12 @@ extern "C" void launch_scaled_mm_nvfp4_kernel(
             CK_NVFP4_GEMM_LAUNCH(T, 128, 64, 32, 4, 2, 2, 2);                                \
         } else if (ovr.bm == 128) {                                                           \
             CK_NVFP4_GEMM_LAUNCH_P(T, 128, 128, 64, 4, 2, 2, 4, 2);                           \
-        } else if (((M + 63) / 64) * ((N + 63) / 64) >= device_wgp_count()) {                 \
-            CK_NVFP4_GEMM_LAUNCH(T, 64, 64, 64, 2, 2, 2, 2);                                 \
+        } else if (comfy_gfx11()) {                                                           \
+            CK_NVFP4_DISPATCH_GFX11(T)                                                        \
         } else {                                                                              \
-            CK_NVFP4_GEMM_LAUNCH_P(T, 128, 128, 64, 4, 2, 2, 4, 2);                           \
+            CK_NVFP4_DISPATCH_DEFAULT(T)                                                      \
         }                                                                                     \
     } while (0)
-#else
-// Not gfx11. The override still reaches the WHOLE family, because that is the
-// point of it: a sweep that silently substitutes a tile for the one it asked for
-// reports "that tile does not matter" for a tile it never ran, which is the exact
-// failure gemm_wmma.h warns about for an unlisted tile. So every override arm is
-// spelled out here as it is above. What is gfx1103-only and therefore NOT here is
-// the `device_wgp_count()` arm of the default: it asks whether the grid is big
-// enough to keep the machine busy, and the answer that was right for 6 WGPs is not
-// the answer for 20-96. The default is the single tile the decode loop spends its
-// time in, chosen from the shape rather than from a measurement on this part.
-//
-// The reasoning behind that default: M is 16-40 against an N in the thousands, so
-// the grid is one row of M-tiles and the choice comes down to how little padding a
-// narrow M tile wastes -- 64 rows against a 16-row M is 4x the MMAs, and 128 would
-// be 8x. 64x64x64 with 2x2 warps is also the tile the gfx1103 sweep found best on
-// that shape, which is an argument from the shape and one measurement on one part,
-// not a measurement on this architecture.
-#define CK_NVFP4_DISPATCH_OUT(T)                                                              \
-    do {                                                                                      \
-        const EpiTensorwise epi{TSA, TSB, bias, bias_code, 0.0f};                              \
-        const GemmTileOverride ovr = comfy_gemm_wmma_tile_override();                         \
-        if (ovr.bm == 64 && ovr.bkb == 32) {                                                   \
-            CK_NVFP4_GEMM_LAUNCH(T, 64, 64, 32, 2, 2, 2, 2);                                 \
-        } else if (ovr.bm == 64) {                                                            \
-            CK_NVFP4_GEMM_LAUNCH(T, 64, 64, 64, 2, 2, 2, 2);                                 \
-        } else if (ovr.bm == 128 && ovr.bkb == 32) {                                          \
-            CK_NVFP4_GEMM_LAUNCH(T, 128, 64, 32, 4, 2, 2, 2);                                \
-        } else if (ovr.bm == 128) {                                                           \
-            CK_NVFP4_GEMM_LAUNCH_P(T, 128, 128, 64, 4, 2, 2, 4, 2);                           \
-        } else {                                                                              \
-            CK_NVFP4_GEMM_LAUNCH(T, 64, 64, 64, 2, 2, 2, 2);                                 \
-        }                                                                                     \
-    } while (0)
-#endif
 
     if (out_code == kBF16) {
         CK_NVFP4_DISPATCH_OUT(__bf16);

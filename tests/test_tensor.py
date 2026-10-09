@@ -1158,6 +1158,9 @@ class TestNVFP4LinearOperations:
         come from the fallback path that owns the complaint, not from an index
         expression in the dispatch handler.
         """
+        if not torch.cuda.is_available():
+            pytest.skip("requires CUDA")
+
         params = TensorCoreNVFP4Layout.Params(
             scale=torch.tensor(1.0, device="cuda"),
             orig_dtype=torch.bfloat16,
@@ -1205,6 +1208,88 @@ class TestNVFP4LinearOperations:
 
         # Output should be in orig_dtype (bfloat16)
         assert result.dtype == torch.bfloat16
+
+    def test_nvfp4_bias_free_linear_still_takes_the_fused_gemm(self):
+        """No bias must not read as an unusable bias.
+
+        `_bias_for_kernel` returns None for two different things: "there is no bias"
+        and "this bias is not usable". The handlers used to assign its result back
+        over `bias`, so `if bias is None` fired for BOTH.
+
+        How much that was worth took measuring rather than reading, and the answer
+        is: less than it looks. A bias-free NVFP4 call does NOT reach the linear
+        handler at all -- TensorCoreNVFP4Layout.quantize rejects a non-2D tensor, and
+        a 2-D F.linear is decomposed by ATen into mm(x, w.t()), so it lands in
+        _handle_nvfp4_mm, which has no bias logic. The addmm handler's fallback
+        closes over `args` and so already kept the caller's bias, and it already
+        checked bias.dim(). So the original code was not reachable-wrong; the
+        separation below is defence, not a repair.
+
+        What is worth pinning is the reachable half, and the fact that the conflating
+        shape stays out: an unpadded N with a bias, which is what the padding exists
+        for, has to keep the fused path.
+        """
+        if not TensorCoreNVFP4Layout.supports_fast_matmul():
+            pytest.skip("NVFP4 matmul not supported on this hardware")
+
+        import comfy_kitchen as ck
+
+        torch.manual_seed(0)
+        x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16) * 0.5
+        calls = []
+        real_mm = ck.scaled_mm_nvfp4
+
+        def spy(*a, **k):
+            calls.append(1)
+            return real_mm(*a, **k)
+
+        # 1. the reachable unpadded-N case: a bias of out_features, a weight padded
+        #    to 32. The bias has to be zero-extended for the kernel and the answer
+        #    still has to match the dequantized reference.
+        w20 = torch.randn(20, 128, device="cuda", dtype=torch.bfloat16) * 0.5
+        b20 = torch.randn(20, device="cuda", dtype=torch.bfloat16)
+        qx = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
+        qw20 = QuantizedTensor.from_float(w20, "TensorCoreNVFP4Layout")
+        ck.scaled_mm_nvfp4 = spy
+        try:
+            out = torch.nn.functional.linear(qx, qw20, b20)
+        finally:
+            ck.scaled_mm_nvfp4 = real_mm
+        assert calls, "an out_features=20 linear lost the fused path"
+        expected = torch.nn.functional.linear(qx.dequantize(), qw20.dequantize(), b20)
+        assert torch.allclose(out.float(), expected.float(), rtol=0.3, atol=0.3)
+
+        # 2. the linear handler directly, because F.linear cannot reach it. Called
+        #    through the dispatch table the same way ATen would, so this covers the
+        #    bias-free case that the public path decomposes away.
+        from comfy_kitchen.tensor.base import _LAYOUT_DISPATCH_TABLE
+
+        handler = _LAYOUT_DISPATCH_TABLE[torch.ops.aten.linear.default][
+            TensorCoreNVFP4Layout
+        ]
+        w = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) * 0.5
+        qw = QuantizedTensor.from_float(w, "TensorCoreNVFP4Layout")
+        ck.scaled_mm_nvfp4 = spy
+        try:
+            out = handler(qx, (qx, qw, None), {})
+        finally:
+            ck.scaled_mm_nvfp4 = real_mm
+        assert len(calls) == 2, "the bias-free linear handler fell back"
+        expected = torch.nn.functional.linear(qx.dequantize(), qw.dequantize())
+        assert torch.allclose(out.float(), expected.float(), rtol=0.3, atol=0.3)
+
+        # 3. a non-1-D bias, which only the linear handler can receive: the addmm
+        #    handler checks bias.dim() itself, this one has no such check, and
+        #    _bias_operand rejects anything but 1-D with ValueError -- which is not
+        #    in the except clause, so it would escape instead of falling back.
+        #    F.linear accepts a (1, N) bias, so the input is legitimate.
+        b2d = torch.randn(1, 64, device="cuda", dtype=torch.bfloat16)
+        expected = torch.nn.functional.linear(qx.dequantize(), qw.dequantize(), b2d)
+        try:
+            out = handler(qx, (qx, qw, b2d), {})
+        except ValueError as e:
+            pytest.fail(f"a (1, N) bias escaped as {e} instead of falling back")
+        assert torch.allclose(out.float(), expected.float(), rtol=0.3, atol=0.3)
 
     def test_nvfp4_mm_fast_path_is_off_on_cpu(self):
         """The fused NVFP4 GEMM needs CUDA: eager reaches for a CUDA-only dtype.

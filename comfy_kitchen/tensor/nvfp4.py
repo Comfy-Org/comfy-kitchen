@@ -166,11 +166,26 @@ def _bias_for_kernel(bias: torch.Tensor | None, logical_n: int, padded_n: int) -
     The common case, N already a multiple of 16, returns the tensor untouched --
     an ``nn.Linear`` in a quantized checkpoint almost always is, and this runs on
     every forward.
+
+    **The return value has two meanings, and a caller must not collapse them.**
+    ``None`` means "no bias" when ``bias`` was None and "this bias is not usable"
+    otherwise, and the caller has to be able to tell those apart -- so it must keep
+    the result in its own variable and only reject a bias that was not None to begin
+    with. Assigning this over the caller's ``bias`` is what made every bias-free
+    linear fall back to dequantize-and-matmul, and made the exception fallback hand
+    the padded bias to a weight with ``orig_n`` rows. Only this function may return
+    None for both reasons; every caller must keep them apart.
+
+    A bias that is not 1-D is rejected here rather than left to ``_bias_operand``,
+    which raises ValueError, and ValueError is not in the handlers' except clause --
+    so it would escape instead of falling back. ``F.linear`` accepts a ``(1, N)``
+    bias, so this is reachable.
     """
     if bias is None:
-        return bias
-    if bias.numel() != logical_n:
-        # A broadcast addend, or a bias for a different operand. Not ours.
+        return None
+    if bias.dim() != 1 or bias.numel() != logical_n:
+        # A broadcast addend, a bias for a different operand, or a rank the epilogue
+        # cannot index. Not ours, and not something to pass on.
         return None
     return torch.nn.functional.pad(bias, (0, padded_n - logical_n))
 
@@ -304,9 +319,12 @@ def _handle_nvfp4_addmm(qt, args, kwargs):
     weight_qdata, scale_b, block_scale_b = TensorCoreNVFP4Layout.get_plain_tensors(mat2)
     out_dtype = kwargs.get("out_dtype", mat1._params.orig_dtype)
 
-    # mat2.shape[1] is the unpadded N; the kernel indexes the padded one.
-    bias = _bias_for_kernel(bias, mat2.shape[1], weight_qdata.shape[0])
-    if bias is None:
+    # mat2.shape[1] is the unpadded N; the kernel indexes the padded one. As in
+    # _handle_nvfp4_linear, `bias` stays the caller's for every fallback and
+    # `kernel_bias` is the only thing the kernel sees -- otherwise a bias-free addmm
+    # reads as an unusable bias and silently loses the fused path.
+    kernel_bias = _bias_for_kernel(bias, mat2.shape[1], weight_qdata.shape[0])
+    if bias is not None and kernel_bias is None:
         return fallback()
 
     try:
@@ -317,7 +335,7 @@ def _handle_nvfp4_addmm(qt, args, kwargs):
             tensor_scale_b=scale_b,
             block_scale_a=block_scale_a,
             block_scale_b=block_scale_b,
-            bias=bias,
+            bias=kernel_bias,
             out_dtype=out_dtype,
         )
         return _slice_to_original_shape(
@@ -366,9 +384,13 @@ def _handle_nvfp4_linear(qt, args, kwargs):
     out_dtype = kwargs.get("out_dtype", input_tensor._params.orig_dtype)
 
     # weight is (out_features, in_features), so its row count is N; the kernel
-    # indexes the padded one.
-    bias = _bias_for_kernel(bias, weight.shape[0], weight_qdata.shape[0])
-    if bias is None:
+    # indexes the padded one. Two variables, deliberately: `bias` stays the caller's
+    # and every fallback below must use it, while `kernel_bias` is the padded form
+    # only the fused kernel accepts. Collapsing them into one is what made a
+    # bias-free linear fall back (kernel_bias is None, which read as "unusable"),
+    # and made the except path hand the padded bias to a weight with orig_n rows.
+    kernel_bias = _bias_for_kernel(bias, weight.shape[0], weight_qdata.shape[0])
+    if bias is not None and kernel_bias is None:
         return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
 
     try:
@@ -380,7 +402,7 @@ def _handle_nvfp4_linear(qt, args, kwargs):
             tensor_scale_b=scale_b,
             block_scale_a=block_scale_a,
             block_scale_b=block_scale_b,
-            bias=bias,
+            bias=kernel_bias,
             out_dtype=out_dtype,
         )
 
