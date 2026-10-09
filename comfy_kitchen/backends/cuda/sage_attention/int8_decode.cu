@@ -57,7 +57,7 @@ extern "C" void launch_int8_decode(
     void* partial, float* lse, void* out, float* out_lse,
     int batch, int heads, int rows, int pages, int page_size, int seq, cudaStream_t stream) {
   constexpr int smem = (64 + 64 + 64) * 256;
-  int8_decode_pages<<<dim3(pages, heads, batch), 128, smem, stream>>>(
+  int8_decode_pages<<<dim3(pages, heads, batch), dim3(32, 4), smem, stream>>>(
       q, k, v, qs, ks, vs, lengths, static_cast<nv_bfloat16*>(partial), lse, heads, rows, pages, page_size);
   int8_decode_combine<<<batch * heads * rows, 256, 0, stream>>>(
       static_cast<nv_bfloat16*>(partial), lse, lengths, static_cast<nv_bfloat16*>(out), out_lse,
