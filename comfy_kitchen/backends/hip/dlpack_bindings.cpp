@@ -84,6 +84,15 @@ bool launch_gated_delta_decode_fused_kernel(
 bool launch_deltanet_conv_step_kernel(const void* proj, void* conv_state, const void* conv_w,
                                       const void* conv_b, void* conv_out, void* conv_snaps, int B,
                                       int C, int S, int KS, int dtype_code, hipStream_t stream);
+bool launch_gated_delta_decode_deferred_kernel(
+    const void* x, const void* w_a, const void* w_b, const void* dt_bias, const void* g_decay,
+    const void* qkv_buf, void* gates_buf, void* sumsq_buf, const void* ctl, void* state,
+    void* out, const void* z, const void* norm_w, float eps, int B, int Hv, int Hk, int S, int DK,
+    int DV, int C, int Hd, int key_dim, float scale, int dtype_code, hipStream_t stream);
+bool launch_deltanet_conv_deferred_kernel(const void* proj, void* proj_buf, void* conv_state,
+                                          const void* conv_w, const void* conv_b, void* qkv_buf,
+                                          const void* ctl, int B, int C, int S, int KS,
+                                          int dtype_code, hipStream_t stream);
 int wxa8_requant_max_k_kernel(int);
 void launch_na3d_kernel(const void*, const void*, const void*, void*, int, int, int, int, int, int,
                         int, int, int, int, int, int, float, int, hipStream_t);
@@ -2476,6 +2485,158 @@ bool deltanet_conv_step(nb::ndarray<> proj, nb::ndarray<> conv_state, nb::ndarra
     return used;
 }
 
+// ctl is the deferred-decode control {pending, parity} the kernels index directly,
+// so it has to be a packed int32 vector of exactly that length.
+static constexpr int kDeferredSlots = 8;
+static constexpr int kDeferredCtlLen = 2;
+
+static void require_deferred_ctl(const nb::ndarray<>& ctl, const char* fn) {
+    if (ctl.dtype().code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) ||
+        ctl.dtype().bits != 32 || ctl.ndim() != 1 || ctl.shape(0) != kDeferredCtlLen) {
+        throw std::runtime_error(std::string(fn) + ": ctl must be an int32 vector of " +
+                                 std::to_string(kDeferredCtlLen) + " elements");
+    }
+    require_packed_contiguous(ctl, fn, "ctl");
+}
+
+// GatedDeltaNet decode with the previous step's accepted tokens replayed from the
+// side buffers before the state is committed; the S current rows only produce
+// outputs and refill the buffers.
+bool gated_delta_decode_deferred(nb::ndarray<> x, nb::ndarray<> w_a, nb::ndarray<> w_b,
+                                 nb::ndarray<> dt_bias, nb::ndarray<> g_decay,
+                                 nb::ndarray<> qkv_buf, nb::ndarray<> gates_buf,
+                                 nb::ndarray<> sumsq_buf, nb::ndarray<> ctl, nb::ndarray<> state,
+                                 nb::ndarray<> out, nb::ndarray<> z, nb::ndarray<> norm_w,
+                                 double eps, int key_dim, int num_key_heads, double scale,
+                                 uintptr_t stream_ptr) {
+    constexpr const char* kFn = "gated_delta_decode_deferred";
+    if (x.ndim() != 3 || w_a.ndim() != 2 || w_b.ndim() != 2 || qkv_buf.ndim() != 4 ||
+        gates_buf.ndim() != 5 || sumsq_buf.ndim() != 5 || state.ndim() != 4 || out.ndim() != 4 ||
+        z.ndim() != 3 || norm_w.ndim() != 1) {
+        throw std::runtime_error(std::string(kFn) + ": unexpected tensor rank");
+    }
+    const int B = static_cast<int>(x.shape(0)), S = static_cast<int>(x.shape(1)),
+              Hd = static_cast<int>(x.shape(2));
+    const int C = static_cast<int>(qkv_buf.shape(2));
+    const int Hv = static_cast<int>(state.shape(1)), DK = static_cast<int>(state.shape(2)),
+              DV = static_cast<int>(state.shape(3));
+    const int Hk = num_key_heads;
+    require_positive(B, kFn, "B");
+    require_positive(S, kFn, "S");
+    require_positive(Hd, kFn, "Hd");
+    require_positive(Hv, kFn, "Hv");
+    require_positive(Hk, kFn, "num_key_heads");
+    require_positive(key_dim, kFn, "key_dim");
+    if (Hv % Hk != 0 || key_dim != Hk * DK) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": num_key_heads must divide Hv and key_dim must be Hk * DK");
+    }
+    if (C < 2 * key_dim + Hv * DV) {
+        throw std::runtime_error(std::string(kFn) + ": C is too small for 2 * key_dim + Hv * DV");
+    }
+    const int dtype_code = map_dtype_to_code(x.dtype());
+    require_code(dtype_code, 0, 2, kFn, "activation dtype");
+    require_same_dtype(w_a, dtype_code, kFn, "w_a");
+    require_same_dtype(w_b, dtype_code, kFn, "w_b");
+    require_same_dtype(qkv_buf, dtype_code, kFn, "qkv_buf");
+    require_same_dtype(out, dtype_code, kFn, "out");
+    require_same_dtype(z, dtype_code, kFn, "z");
+    require_same_dtype(norm_w, dtype_code, kFn, "norm_w");
+    if (w_a.shape(0) != Hv || w_a.shape(1) != Hd || w_b.shape(0) != Hv || w_b.shape(1) != Hd ||
+        state.shape(0) != B || out.shape(0) != B || out.shape(1) != S || out.shape(2) != Hv ||
+        out.shape(3) != DV || z.shape(0) != B || z.shape(1) != S ||
+        z.shape(2) != static_cast<size_t>(Hv) * DV || norm_w.shape(0) != DV ||
+        qkv_buf.shape(0) != 2 || qkv_buf.shape(1) != B || qkv_buf.shape(3) != kDeferredSlots ||
+        gates_buf.shape(0) != 2 || gates_buf.shape(1) != B ||
+        gates_buf.shape(2) != kDeferredSlots || gates_buf.shape(3) != Hv ||
+        gates_buf.shape(4) != 2 || sumsq_buf.shape(0) != 2 || sumsq_buf.shape(1) != B ||
+        sumsq_buf.shape(2) != kDeferredSlots || sumsq_buf.shape(3) != Hk ||
+        sumsq_buf.shape(4) != 2) {
+        throw std::runtime_error(std::string(kFn) + ": shape mismatch");
+    }
+    require_scale_len(dt_bias, static_cast<size_t>(Hv), kFn, "dt_bias");
+    require_scale_len(g_decay, static_cast<size_t>(Hv), kFn, "g_decay");
+    require_scale_len(gates_buf, static_cast<size_t>(2) * B * kDeferredSlots * Hv * 2, kFn,
+                      "gates_buf");
+    require_scale_len(sumsq_buf, static_cast<size_t>(2) * B * kDeferredSlots * Hk * 2, kFn,
+                      "sumsq_buf");
+    require_scale_len(state, static_cast<size_t>(B) * Hv * DK * DV, kFn, "state");
+    require_deferred_ctl(ctl, kFn);
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(w_a, kFn, "w_a");
+    require_packed_contiguous(w_b, kFn, "w_b");
+    require_packed_contiguous(dt_bias, kFn, "dt_bias");
+    require_packed_contiguous(g_decay, kFn, "g_decay");
+    require_packed_contiguous(qkv_buf, kFn, "qkv_buf");
+    require_packed_contiguous(gates_buf, kFn, "gates_buf");
+    require_packed_contiguous(sumsq_buf, kFn, "sumsq_buf");
+    require_packed_contiguous(state, kFn, "state");
+    require_packed_contiguous(out, kFn, "out");
+    require_packed_contiguous(z, kFn, "z");
+    require_packed_contiguous(norm_w, kFn, "norm_w");
+
+    const bool used = launch_gated_delta_decode_deferred_kernel(
+        x.data(), w_a.data(), w_b.data(), dt_bias.data(), g_decay.data(), qkv_buf.data(),
+        gates_buf.data(), sumsq_buf.data(), ctl.data(), state.data(), out.data(), z.data(),
+        norm_w.data(), static_cast<float>(eps), B, Hv, Hk, S, DK, DV, C, Hd, key_dim,
+        static_cast<float>(scale), dtype_code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return used;
+}
+
+// Depthwise causal conv decode step with silu that first commits the previous
+// step's accepted window from proj_buf into conv_state, then writes silu(conv) of
+// the S current rows into the current side of qkv_buf.
+bool deltanet_conv_deferred(nb::ndarray<> proj, nb::ndarray<> proj_buf, nb::ndarray<> conv_state,
+                            nb::ndarray<> conv_w, OptArray conv_b, nb::ndarray<> qkv_buf,
+                            nb::ndarray<> ctl, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "deltanet_conv_deferred";
+    if (proj.ndim() != 3 || proj_buf.ndim() != 4 || conv_state.ndim() != 3 || conv_w.ndim() != 2 ||
+        qkv_buf.ndim() != 4) {
+        throw std::runtime_error(std::string(kFn) + ": unexpected tensor rank");
+    }
+    const int B = static_cast<int>(proj.shape(0)), S = static_cast<int>(proj.shape(1)),
+              C = static_cast<int>(proj.shape(2));
+    const int KS = static_cast<int>(conv_w.shape(1));
+    require_positive(B, kFn, "B");
+    require_positive(S, kFn, "S");
+    require_positive(C, kFn, "C");
+    if (KS < 2) {
+        throw std::runtime_error(std::string(kFn) + ": KS must be at least 2");
+    }
+    const int dtype_code = map_dtype_to_code(proj.dtype());
+    require_code(dtype_code, 0, 2, kFn, "activation dtype");
+    require_same_dtype(proj_buf, dtype_code, kFn, "proj_buf");
+    require_same_dtype(conv_state, dtype_code, kFn, "conv_state");
+    require_same_dtype(conv_w, dtype_code, kFn, "conv_w");
+    require_same_dtype(qkv_buf, dtype_code, kFn, "qkv_buf");
+    if (conv_state.shape(0) != B || conv_state.shape(1) != C ||
+        conv_state.shape(2) != static_cast<size_t>(KS - 1) || conv_w.shape(0) != C ||
+        proj_buf.shape(0) != 2 || proj_buf.shape(1) != B || proj_buf.shape(2) != kDeferredSlots ||
+        proj_buf.shape(3) != C || qkv_buf.shape(0) != 2 || qkv_buf.shape(1) != B ||
+        qkv_buf.shape(2) != C || qkv_buf.shape(3) != kDeferredSlots) {
+        throw std::runtime_error(std::string(kFn) + ": shape mismatch");
+    }
+    require_deferred_ctl(ctl, kFn);
+    require_packed_contiguous(proj, kFn, "proj");
+    require_packed_contiguous(proj_buf, kFn, "proj_buf");
+    require_packed_contiguous(conv_state, kFn, "conv_state");
+    require_packed_contiguous(conv_w, kFn, "conv_w");
+    require_packed_contiguous(qkv_buf, kFn, "qkv_buf");
+    if (conv_b.has_value()) {
+        require_same_dtype(*conv_b, dtype_code, kFn, "conv_b");
+        require_len(*conv_b, C, kFn, "conv_b");
+        require_packed_contiguous(*conv_b, kFn, "conv_b");
+    }
+
+    const bool used = launch_deltanet_conv_deferred_kernel(
+        proj.data(), proj_buf.data(), conv_state.data(), conv_w.data(), opt_data(conv_b),
+        qkv_buf.data(), ctl.data(), B, C, S, KS, dtype_code,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return used;
+}
+
 NB_MODULE(_C, m) {
     m.doc() = "ComfyKitchen HIP backend native operations (RDNA2-RDNA4, WMMA on gfx11/gfx12)";
     m.def("sol_attn_plan", &sol_attn_plan_py,
@@ -2550,6 +2711,14 @@ NB_MODULE(_C, m) {
           nb::arg("conv_w"), nb::arg("conv_b").none(), nb::arg("conv_out"),
           nb::arg("conv_snaps").none(), nb::arg("B"), nb::arg("C"), nb::arg("S"), nb::arg("KS"),
           nb::arg("stream_ptr"));
+    m.def("gated_delta_decode_deferred", &gated_delta_decode_deferred, nb::arg("x"),
+          nb::arg("w_a"), nb::arg("w_b"), nb::arg("dt_bias"), nb::arg("g_decay"),
+          nb::arg("qkv_buf"), nb::arg("gates_buf"), nb::arg("sumsq_buf"), nb::arg("ctl"),
+          nb::arg("state"), nb::arg("out"), nb::arg("z"), nb::arg("norm_w"), nb::arg("eps"),
+          nb::arg("key_dim"), nb::arg("num_key_heads"), nb::arg("scale"), nb::arg("stream_ptr"));
+    m.def("deltanet_conv_deferred", &deltanet_conv_deferred, nb::arg("proj"),
+          nb::arg("proj_buf"), nb::arg("conv_state"), nb::arg("conv_w"),
+          nb::arg("conv_b").none(), nb::arg("qkv_buf"), nb::arg("ctl"), nb::arg("stream_ptr"));
     m.def("na3d", &na3d);
     m.def("flash_attention_decode", &flash_attention_decode, nb::arg("q"), nb::arg("k"),
           nb::arg("v"), nb::arg("kv_lengths"), nb::arg("output"), nb::arg("softmax_lse"),
