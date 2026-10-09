@@ -625,9 +625,11 @@ __global__ void int8_gemv_dequant_kernel(
     }
 }
 
+// One warp per output column. Vec16: 16-byte weight/activation loads (K % 16 == 0), the
+// integer accumulation is order-independent so the result matches the 4-byte loop exactly.
 // residual (nullable): out = residual + residual_scale * out, with the linear rounded to
 // OutputType first, as the unfused addcmul sees it.
-template<int WARPS_PER_BLOCK, typename OutputType, typename BiasType>
+template<int WARPS_PER_BLOCK, typename OutputType, typename BiasType, bool Vec16>
 __global__ void int8_gemv_dequant_warp_kernel(
     const int8_t* __restrict__ x,
     const int8_t* __restrict__ weight,
@@ -649,13 +651,26 @@ __global__ void int8_gemv_dequant_warp_kernel(
         return;
     }
 
-    const int K4 = K >> 2;
-    const int* __restrict__ x4 = reinterpret_cast<const int*>(x);
-    const int* __restrict__ w4 = reinterpret_cast<const int*>(weight + static_cast<int64_t>(n) * K);
-
+    const int8_t* __restrict__ w_row = weight + static_cast<int64_t>(n) * K;
     int acc = 0;
-    for (int k4 = lane; k4 < K4; k4 += kThreadsPerWarp) {
-        acc = __dp4a(x4[k4], w4[k4], acc);
+    if constexpr (Vec16) {
+        const int4* __restrict__ x16 = reinterpret_cast<const int4*>(x);
+        const int4* __restrict__ w16 = reinterpret_cast<const int4*>(w_row);
+        const int K16 = K >> 4;
+        for (int i = lane; i < K16; i += kThreadsPerWarp) {
+            const int4 w = w16[i];
+            const int4 xv = x16[i];
+            acc = __dp4a(xv.x, w.x, acc);
+            acc = __dp4a(xv.y, w.y, acc);
+            acc = __dp4a(xv.z, w.z, acc);
+            acc = __dp4a(xv.w, w.w, acc);
+        }
+    } else {
+        const int* __restrict__ x4 = reinterpret_cast<const int*>(x);
+        const int* __restrict__ w4 = reinterpret_cast<const int*>(w_row);
+        for (int k4 = lane; k4 < (K >> 2); k4 += kThreadsPerWarp) {
+            acc = __dp4a(x4[k4], w4[k4], acc);
+        }
     }
     acc = warp_reduce_sum_i32(acc);
 
@@ -1836,6 +1851,10 @@ void launch_int8_gemv_dequant_kernel(
     if (residual != nullptr && (num_rows != 1 || (K & 3) != 0)) {
         throw std::runtime_error("INT8 GEMV fused residual requires M == 1 and K divisible by 4");
     }
+    // 16-byte loads need K % 16 == 0 and 16-byte aligned activation and weight bases.
+    const bool vec16 = (K & 15) == 0
+        && (reinterpret_cast<uintptr_t>(input) & 15) == 0
+        && (reinterpret_cast<uintptr_t>(weight) & 15) == 0;
 
     if (num_rows == 2) {
         if (K % 16 != 0) {
@@ -1872,20 +1891,22 @@ void launch_int8_gemv_dequant_kernel(
             constexpr int kWarpsPerBlock = 8;
             const unsigned int blocks =
                 static_cast<unsigned int>((num_cols + kWarpsPerBlock - 1) / kWarpsPerBlock);
-            comfy::int8_gemv_dequant_warp_kernel<kWarpsPerBlock, OutputType, BiasType>
-                <<<blocks, kWarpsPerBlock * comfy::kThreadsPerWarp, 0, stream>>>(
-                    static_cast<const int8_t*>(input),
-                    static_cast<const int8_t*>(weight),
-                    static_cast<const float*>(x_scales),
-                    static_cast<const float*>(weight_scales),
-                    bias_ptr,
-                    static_cast<OutputType*>(output),
-                    static_cast<int>(num_cols),
-                    static_cast<int>(K),
-                    static_cast<int>(weight_scale_size),
-                    bias_flag,
-                    static_cast<const OutputType*>(residual),
-                    static_cast<const OutputType*>(residual_scale));
+            auto kernel = vec16
+                ? comfy::int8_gemv_dequant_warp_kernel<kWarpsPerBlock, OutputType, BiasType, true>
+                : comfy::int8_gemv_dequant_warp_kernel<kWarpsPerBlock, OutputType, BiasType, false>;
+            kernel<<<blocks, kWarpsPerBlock * comfy::kThreadsPerWarp, 0, stream>>>(
+                static_cast<const int8_t*>(input),
+                static_cast<const int8_t*>(weight),
+                static_cast<const float*>(x_scales),
+                static_cast<const float*>(weight_scales),
+                bias_ptr,
+                static_cast<OutputType*>(output),
+                static_cast<int>(num_cols),
+                static_cast<int>(K),
+                static_cast<int>(weight_scale_size),
+                bias_flag,
+                static_cast<const OutputType*>(residual),
+                static_cast<const OutputType*>(residual_scale));
         };
         if (!has_bias) {
             if ((K & 3) == 0) {
