@@ -133,6 +133,13 @@ void launch_rms_rope_kernel(const void*, const void*, const void*, const void*, 
                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int, int,
                             int, float, bool, hipStream_t);
+void launch_quantize_nvfp4_kernel(const void*, const void*, void*, void*, int, int, int, int, int,
+                                 bool, hipStream_t);
+void launch_dequantize_nvfp4_kernel(const void*, const void*, const void*, void*, int, int, int, bool,
+                                   hipStream_t);
+void launch_scaled_mm_nvfp4_kernel(const void*, const void*, void*, const void*, const void*,
+                                  const void*, const void*, const void*, int, int, int, int, int,
+                                  int, hipStream_t);
 }
 
 static void check_hip_launch() {
@@ -405,6 +412,124 @@ void int4_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> 
     launch_int4_gemm_kernel(a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(),
                             scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, N /*ldc*/,
                             out_code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// The NVFP4 block scales are e4m3, which crosses as uint8 (map_dtype_to_code has
+// no name for DLPack codes 10/12), so they are checked as uint8 rather than as a
+// float. Their length is the blocked buffer: RoundUp(rows,128) rows of
+// RoundUp(cols/16, 4) bytes.
+static size_t nvfp4_scale_elems(int rows, int blocks) {
+    return static_cast<size_t>((rows + 127) & ~127) *
+           static_cast<size_t>((blocks + 3) & ~3);
+}
+
+void quantize_nvfp4(nb::ndarray<> x, nb::ndarray<> global_scale, nb::ndarray<> out,
+                    nb::ndarray<> block_scales, int rows, int cols, int orig_rows,
+                    int orig_cols, int input_dtype_code, bool hi_first,
+                    uintptr_t stream_ptr) {
+    constexpr const char* kFn = "quantize_nvfp4";
+    require_code(input_dtype_code, 0, 2, kFn, "input dtype");
+    if (map_dtype_to_code(x.dtype()) != input_dtype_code) {
+        throw std::runtime_error(std::string(kFn) + ": input dtype does not match its code");
+    }
+    require_nonneg(rows, kFn, "rows");
+    require_nonneg(cols, kFn, "cols");
+    require_nonneg(orig_rows, kFn, "orig_rows");
+    require_nonneg(orig_cols, kFn, "orig_cols");
+    // One scale per 16 elements, and one packed byte per 2, so the PADDED column
+    // count must be a whole number of blocks or a block would straddle the row's
+    // end. orig_rows/orig_cols are unconstrained: a padded call is exactly the
+    // case where they are not multiples of 16, which is why they are separate.
+    if (cols % 16 != 0) {
+        throw std::runtime_error(std::string(kFn) + ": cols must be a multiple of 16, got " +
+                                 std::to_string(cols));
+    }
+    // The output is the padded 16x16 grid, so a caller-supplied extent SMALLER
+    // than the input's would have the kernel address the input past its end.
+    if (orig_rows > rows || orig_cols > cols) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": the padded extents must not be smaller than the original "
+                                 "ones");
+    }
+    require_dtype(out, 3, 3, kFn, "out");
+    require_dtype(block_scales, 3, 3, kFn, "block_scales");
+    require_scale(global_scale, kFn);
+    require_numel(static_cast<int64_t>(rows) * (cols / 2), out, kFn, "out");
+    require_numel(nvfp4_scale_elems(rows, cols / 16), block_scales, kFn, "block_scales");
+
+    launch_quantize_nvfp4_kernel(x.data(), global_scale.data(), out.data(),
+                                 block_scales.data(), rows, cols, orig_rows, orig_cols,
+                                 input_dtype_code, hi_first,
+                                 reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void dequantize_nvfp4(nb::ndarray<> in, nb::ndarray<> global_scale, nb::ndarray<> block_scales,
+                      nb::ndarray<> out, int rows, int cols, int output_dtype_code,
+                      bool hi_first, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "dequantize_nvfp4";
+    require_code(output_dtype_code, 0, 2, kFn, "output dtype");
+    if (map_dtype_to_code(out.dtype()) != output_dtype_code) {
+        throw std::runtime_error(std::string(kFn) + ": output dtype does not match its code");
+    }
+    require_nonneg(rows, kFn, "rows");
+    require_nonneg(cols, kFn, "cols");
+    if (cols % 16 != 0) {
+        throw std::runtime_error(std::string(kFn) + ": cols must be a multiple of 16");
+    }
+    require_dtype(in, 3, 3, kFn, "in");
+    require_dtype(block_scales, 3, 3, kFn, "block_scales");
+    require_dtype(out, 0, 2, kFn, "out");
+    require_scale(global_scale, kFn);
+    require_numel(static_cast<int64_t>(rows) * (cols / 2), in, kFn, "in");
+    require_numel(static_cast<int64_t>(rows) * cols, out, kFn, "out");
+    require_numel(nvfp4_scale_elems(rows, cols / 16), block_scales, kFn, "block_scales");
+
+    launch_dequantize_nvfp4_kernel(in.data(), global_scale.data(), block_scales.data(),
+                                   out.data(), rows, cols, output_dtype_code, hi_first,
+                                   reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void scaled_mm_nvfp4(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> sa,
+                     nb::ndarray<> sb, nb::ndarray<> tsa, nb::ndarray<> tsb, OptArray bias,
+                     int M, int N, int K, int ldc, int out_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "scaled_mm_nvfp4";
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_nonneg(ldc, kFn, "ldc");
+    // A packed row is K/2 bytes and a block scale covers 16 elements, so K must be
+    // a whole number of 32-element chunks for the 16-byte row loads to stay inside
+    // the row and for a chunk's two scales to stay adjacent in the blocked layout.
+    if (K % 32 != 0) {
+        throw std::runtime_error(std::string(kFn) + ": K must be a multiple of 32, got " +
+                                 std::to_string(K));
+    }
+    if (ldc < N) {
+        throw std::runtime_error(std::string(kFn) + ": ldc=" + std::to_string(ldc) +
+                                 " is smaller than N=" + std::to_string(N));
+    }
+    // E2M1 crosses as uint8: a is (M, K/2), b is (N, K/2), c is (M, ldc).
+    require_dtype(a, 3, 3, kFn, "a");
+    require_dtype(b, 3, 3, kFn, "b");
+    require_dtype(c, 0, 2, kFn, "c");
+    require_dtype(sa, 3, 3, kFn, "block_scale_a");
+    require_dtype(sb, 3, 3, kFn, "block_scale_b");
+    require_out_matches(c, out_code, kFn);
+    require_len(a, static_cast<int64_t>(M) * (K / 2), kFn, "a");
+    require_len(b, static_cast<int64_t>(N) * (K / 2), kFn, "b");
+    require_len(c, static_cast<int64_t>(M) * ldc, kFn, "c");
+    require_len(sa, nvfp4_scale_elems(M, K / 16), kFn, "block_scale_a");
+    require_len(sb, nvfp4_scale_elems(N, K / 16), kFn, "block_scale_b");
+    require_scale(tsa, kFn);
+    require_scale(tsb, kFn);
+    require_bias(bias, N, kFn);
+
+    launch_scaled_mm_nvfp4_kernel(a.data(), b.data(), c.data(), sa.data(), sb.data(), tsa.data(),
+                                  tsb.data(), opt_data(bias), opt_code(bias), M, N, K, ldc,
+                                  out_code, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -2535,6 +2660,17 @@ NB_MODULE(_C, m) {
     m.def("scaled_mm_fp8", &scaled_mm_fp8);
     m.def("int8_gemm", &int8_gemm);
     m.def("int4_gemm", &int4_gemm);
+    m.def("quantize_nvfp4", &quantize_nvfp4, nb::arg("x"), nb::arg("global_scale"),
+          nb::arg("out"), nb::arg("block_scales"), nb::arg("rows"), nb::arg("cols"),
+          nb::arg("orig_rows"), nb::arg("orig_cols"), nb::arg("input_dtype_code"),
+          nb::arg("hi_first") = true, nb::arg("stream_ptr"));
+    m.def("dequantize_nvfp4", &dequantize_nvfp4, nb::arg("in"), nb::arg("global_scale"),
+          nb::arg("block_scales"), nb::arg("out"), nb::arg("rows"), nb::arg("cols"),
+          nb::arg("output_dtype_code"), nb::arg("hi_first") = true, nb::arg("stream_ptr"));
+    m.def("scaled_mm_nvfp4", &scaled_mm_nvfp4, nb::arg("a"), nb::arg("b"), nb::arg("c"),
+          nb::arg("block_scale_a"), nb::arg("block_scale_b"), nb::arg("tensor_scale_a"),
+          nb::arg("tensor_scale_b"), nb::arg("bias").none(), nb::arg("M"), nb::arg("N"),
+          nb::arg("K"), nb::arg("ldc"), nb::arg("out_code"), nb::arg("stream_ptr"));
     m.def("convrot_w4a4_gemm", &convrot_w4a4_gemm);
     m.def("fp16_gemm", &fp16_gemm, nb::arg("a"), nb::arg("b"), nb::arg("d"),
           nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),

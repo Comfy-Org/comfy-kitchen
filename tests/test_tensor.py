@@ -12,6 +12,7 @@ from comfy_kitchen.tensor import (
     TensorWiseINT8Layout,
     get_cuda_capability,
 )
+from comfy_kitchen.tensor.base import nvfp4_mm_has_fast_path, quantized_mm_has_fast_path
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1035,6 +1036,159 @@ class TestNVFP4LinearOperations:
         assert result.shape == expected.shape
         assert torch.equal(result, expected)
 
+    def test_nvfp4_addmm_with_transposed_b(self):
+        """Test NVFP4 addmm with transposed b, the shape a linear weight arrives in."""
+        if not nvfp4_mm_has_fast_path("cuda"):
+            pytest.skip("no fused NVFP4 GEMM on this hardware")
+
+        m, k, n = 32, 64, 128
+        bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        # b has shape (n, k) - like a linear weight
+        b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+
+        qt_a = QuantizedTensor.from_float(a, "TensorCoreNVFP4Layout")
+        qt_b = QuantizedTensor.from_float(b, "TensorCoreNVFP4Layout")
+
+        result = torch.addmm(bias, qt_a, qt_b.t())
+        expected = torch.addmm(bias, qt_a.dequantize(), qt_b.dequantize().t())
+
+        assert result.shape == expected.shape
+        assert result.dtype == expected.dtype
+        # NVFP4 has limited precision
+        assert torch.allclose(result, expected, rtol=0.3, atol=0.3)
+
+    def test_nvfp4_linear_with_bias_reaches_the_fused_gemm(self):
+        """F.linear with a bias must land on the fused GEMM, not dequantize.
+
+        ATen folds a 2D linear with a bias into addmm, so this is the shape every
+        biased nn.Linear in the model takes. Reaching the fallback here would leave
+        the fast path reachable only from a call nothing makes.
+        """
+        if not nvfp4_mm_has_fast_path("cuda"):
+            pytest.skip("no fused NVFP4 GEMM on this hardware")
+
+        m, k, n = 1, 64, 128
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreNVFP4Layout")
+
+        calls = []
+        real = comfy_kitchen.scaled_mm_nvfp4
+        real_dq = comfy_kitchen.dequantize_nvfp4
+
+        def counting_mm(*args, **kwargs):
+            calls.append("mm")
+            return real(*args, **kwargs)
+
+        def counting_dq(*args, **kwargs):
+            calls.append("dequantize")
+            return real_dq(*args, **kwargs)
+
+        comfy_kitchen.scaled_mm_nvfp4 = counting_mm
+        comfy_kitchen.dequantize_nvfp4 = counting_dq
+        try:
+            result = torch.nn.functional.linear(qt_x, qt_w, bias)
+        finally:
+            comfy_kitchen.scaled_mm_nvfp4 = real
+            comfy_kitchen.dequantize_nvfp4 = real_dq
+
+        assert calls == ["mm"], f"expected one fused GEMM, got {calls}"
+        # Against the dequantized reference, not the float one: this is the same
+        # comparison the quantized NVFP4 semantics are defined by, and a K=64 dot
+        # product of quantized operands moves by more than rtol=0.3 of the output.
+        expected = torch.nn.functional.linear(
+            qt_x.dequantize(), qt_w.dequantize(), bias
+        )
+        assert result.shape == expected.shape
+        assert torch.allclose(result, expected, rtol=0.3, atol=0.3)
+
+    def test_nvfp4_linear_with_unpadded_out_features_does_not_raise(self):
+        """An out_features that is not a multiple of 16 must fall back, not raise.
+
+        The weight is stored padded, so the kernel's N is the padded row count while
+        nn.Linear's bias has the unpadded length. The handler used to validate the
+        bias against the unpadded N -- which is the right check -- and then hand the
+        short tensor to a kernel that indexes the padded N. _bias_operand raises
+        ValueError on that, and ValueError was not in the handler's except clause,
+        so the exception escaped instead of falling back. Popping the handler out of
+        the dispatch table made the same call return the dequantized answer, which is
+        what made it a regression rather than a gap.
+
+        Also covers the sibling gap the same review found: neither the mm nor the
+        linear handler checked the SECOND operand's rank, so a 1-D one reached a
+        shape index and raised IndexError where eager raises a RuntimeError.
+        """
+        if not TensorCoreNVFP4Layout.supports_fast_matmul():
+            pytest.skip("NVFP4 matmul not supported on this hardware")
+
+        in_f, out_f = 64, 20  # 20 pads to 32
+        x = torch.randn(4, in_f, device="cuda", dtype=torch.bfloat16) * 0.5
+        w = torch.randn(out_f, in_f, device="cuda", dtype=torch.bfloat16) * 0.5
+        bias = torch.randn(out_f, device="cuda", dtype=torch.bfloat16) * 0.5
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
+        qt_w = QuantizedTensor.from_float(w, "TensorCoreNVFP4Layout")
+        assert qt_w._qdata.shape[0] == 32, "the weight is expected to pad to 32 rows"
+
+        # Against the dequantized reference: that is the comparison the quantized
+        # NVFP4 semantics are defined by.
+        expected = torch.nn.functional.linear(
+            qt_x.dequantize(), qt_w.dequantize(), bias
+        )
+        result = torch.nn.functional.linear(qt_x, qt_w, bias)  # must not raise
+        assert result.shape == expected.shape == (4, out_f)
+        assert torch.allclose(result.float(), expected.float(), rtol=0.3, atol=0.3)
+
+    def test_nvfp4_handlers_do_not_index_a_non_2d_second_operand(self):
+        """A 1-D second operand must not be indexed by the handler's own shape access.
+
+        Both handlers read mat2's shape -- one for the bias length, one for the output
+        slice -- after checking only the FIRST operand's rank. A 1-D second operand
+        therefore reached a tuple index and raised IndexError, where eager raises a
+        RuntimeError about the rank, so the caller saw the wrong exception type from
+        the wrong library.
+
+        This cannot be built through the public API: TensorCoreNVFP4Layout.quantize
+        rejects a non-2D tensor, so no 1-D NVFP4 QuantizedTensor exists to hand a
+        handler. What is testable is the guard itself, so the tensor is constructed
+        directly and the assertion is on the failure MODE: whatever comes out must
+        come from the fallback path that owns the complaint, not from an index
+        expression in the dispatch handler.
+        """
+        params = TensorCoreNVFP4Layout.Params(
+            scale=torch.tensor(1.0, device="cuda"),
+            orig_dtype=torch.bfloat16,
+            orig_shape=(64,),
+            block_scale=torch.zeros(4, 8, dtype=torch.float8_e4m3fn, device="cuda"),
+        )
+        mat2_1d = QuantizedTensor(
+            torch.zeros(64, dtype=torch.uint8, device="cuda"),
+            "TensorCoreNVFP4Layout",
+            params,
+        )
+        assert mat2_1d._qdata.dim() == 1
+
+        from comfy_kitchen.tensor.base import _LAYOUT_DISPATCH_TABLE
+
+        x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16) * 0.5
+        qt_x = QuantizedTensor.from_float(x, "TensorCoreNVFP4Layout")
+        bias = torch.zeros(64, device="cuda", dtype=torch.bfloat16)
+        handler = _LAYOUT_DISPATCH_TABLE[torch.ops.aten.addmm.default][
+            TensorCoreNVFP4Layout
+        ]
+
+        try:
+            handler(qt_x, (bias, qt_x, mat2_1d), {})
+        except IndexError as e:
+            pytest.fail(f"handler indexed a 1-D mat2 itself: {e}")
+        except Exception:
+            # Anything else is the fallback path's own complaint, which is the point:
+            # the rank is not representable in this layout and dequantize says so.
+            pass
+
     def test_nvfp4_linear_output_dtype(self):
         """Test that NVFP4 linear output has correct dtype."""
         if not TensorCoreNVFP4Layout.supports_fast_matmul():
@@ -1051,6 +1205,60 @@ class TestNVFP4LinearOperations:
 
         # Output should be in orig_dtype (bfloat16)
         assert result.dtype == torch.bfloat16
+
+    def test_nvfp4_mm_fast_path_is_off_on_cpu(self):
+        """The fused NVFP4 GEMM needs CUDA: eager reaches for a CUDA-only dtype.
+
+        quantized_mm_has_fast_path answers True for any device that is not CUDA,
+        which is right for FP8 (its fallback is torch._scaled_mm) but wrong here.
+
+        The CUDA half asserts an equality rather than `is not None`, which cannot
+        fail: the function returns a bool. What it has to check is that the
+        override actually agrees with the generic predicate for the devices it does
+        not exclude -- if nvfp4_mm_has_fast_path ever returned False on "cuda", or
+        started returning something that is not the bool its annotation promises,
+        `is not None` would still pass.
+        """
+        assert nvfp4_mm_has_fast_path("cpu") is False
+        assert nvfp4_mm_has_fast_path("cuda") == quantized_mm_has_fast_path("cuda")
+        assert isinstance(nvfp4_mm_has_fast_path("cuda"), bool)
+
+    @pytest.mark.parametrize("pipe", ["1", "2"])
+    def test_scaled_mm_is_correct_at_both_pipeline_depths(self, pipe, monkeypatch):
+        """COMFY_NVFP4_PIPE selects the K-step pipeline depth, so both must be right.
+
+        They were not. The K-step loop indexed its fragment buffer with
+        ``PIPE == 2 ? (kk & 1) : 0`` and gated the per-step LDS reload behind
+        ``PIPE == 2``, so at depth 1 the buffer kept the fragment the pre-loop load
+        had put there and every MMA in the tile ran the same 16-element dot product.
+        Relative error 2.28 at M=8/N=32/K=128, against 0.0025 at depth 2.
+
+        The tile table then reported depth 1 as a 1.02x loss -- a plausible number for
+        a kernel that was not computing a matmul. That is the shape of the hazard: a
+        tuning knob that changes the schedule can change the ANSWER, and nothing in a
+        timing sweep notices. Hence this is a correctness test over the knob.
+        """
+        if not TensorCoreNVFP4Layout.supports_fast_matmul():
+            pytest.skip("NVFP4 matmul not supported on this hardware")
+        monkeypatch.setenv("COMFY_NVFP4_PIPE", pipe)
+        # Read per launch by the launcher (getenv in nvfp4.hip's comfy_nvfp4_pipe),
+        # so no rebuild is needed -- which is what makes a tuning knob reachable from
+        # a test at all, and also what let the wrong answer into a timing sweep.
+
+        import comfy_kitchen as ck
+
+        one = torch.tensor(1.0, device="cuda")
+        # K=128 is four K-steps of 16, so a depth that reuses one fragment shows up
+        # as that fragment counted four times.
+        a = torch.randn(8, 128, device="cuda", dtype=torch.bfloat16) * 0.5
+        w = torch.randn(32, 128, device="cuda", dtype=torch.bfloat16) * 0.5
+        qa, bsa = ck.quantize_nvfp4(a, one)
+        qw, bsw = ck.quantize_nvfp4(w, one)
+        got = ck.scaled_mm_nvfp4(qa, qw, one, one, bsa, bsw, out_dtype=torch.float32)
+        ref = (ck.dequantize_nvfp4(qa, one, bsa, torch.float32)
+               @ ck.dequantize_nvfp4(qw, one, bsw, torch.float32).T)
+        rel = (got - ref).abs().max().item() / ref.abs().max().item()
+        assert rel < 0.01, f"PIPE={pipe}: relative error {rel:.4f}"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

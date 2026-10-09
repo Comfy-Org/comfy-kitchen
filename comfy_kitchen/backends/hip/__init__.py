@@ -55,6 +55,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
+from comfy_kitchen.float_utils import roundup
 
 logger = logging.getLogger("comfy_kitchen.hip")
 
@@ -68,6 +69,9 @@ __all__ = [
     "gemv_awq_w4a16",
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
+    "quantize_nvfp4",
+    "dequantize_nvfp4",
+    "scaled_mm_nvfp4",
     "quantize_svdquant_w4a4",
     "scaled_mm_svdquant_w4a4",
     "apply_rope",
@@ -280,12 +284,21 @@ _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 # same product sum on v_dot8_i32_i4, ~1.9x the int8 tile here -- and everything
 # else reaches MmaInt4 exactly as before. Removing it here only stops the whole
 # op being withheld from RDNA2; the WMMA path is untouched.
+#
+# scaled_mm_nvfp4 is in this set for a different reason than the rest. The tile
+# kernel needs WMMA, and mma.h's no-matrix-core fallback for MmaF16::mma is
+# __builtin_trap() rather than a plausible wrong answer -- so on RDNA2 the kernel
+# is compiled (the TU must build in every device pass) but must never be launched.
+# quantize_nvfp4 and dequantize_nvfp4 stay out of this set deliberately: they are
+# VALU and LDS work with no matrix instruction in them, and they are the ops that
+# make the packed representation usable at all when the GEMM has to fall back.
 _WMMA_ONLY_OPS = frozenset({
     "fp16_conv3d",
     "fp16_conv3d_out",
     "na3d",
     "sol_attn",
     "scaled_mm_svdquant_w4a4",
+    "scaled_mm_nvfp4",
 })
 
 
@@ -510,6 +523,160 @@ def scaled_mm_fp8(
         _dl(a.view(torch.uint8)), _dl(b_nk.view(torch.uint8)), _dl(out),
         _dl(scale_a), _dl(scale_b), None if bias is None else _dl(bias),
         m, n, k, DTYPE_TO_CODE[out_dtype], _stream(a),
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# NVFP4 (E2M1 + per-16 e4m3 block scales)
+# ---------------------------------------------------------------------------
+
+# The blocked scale buffer's shape: one byte per 16 columns, in cuBLAS's "D block
+# scaling factors layout" over (RoundUp(rows, 128), RoundUp(cols/16, 4)). Mirrors
+# cuda/__init__.py:663-686 and the kernel's nvfp4_scale_offset, which is the exact
+# inverse of comfy_kitchen.float_utils.to_blocked.
+def _nvfp4_scale_shape(rows: int, cols: int) -> tuple[int, int]:
+    return (roundup(rows, 128), roundup(cols // 16, 4))
+
+
+def _nvfp4_scale_operand(block_scale: torch.Tensor, rows: int, cols: int,
+                         device: torch.device) -> torch.Tensor:
+    """``block_scale`` as the contiguous raw e4m3 bytes the kernels index.
+
+    The kernels address the scales through the blocked layout rather than as a 2D
+    grid, so what they need is the raw byte buffer with the right length. A
+    ``float8_e4m3fn`` tensor is already that storage; anything else has to be cast,
+    and the cast has to be a real copy because a same-itemcount reinterpret of a
+    differently shaped tensor would change which byte a logical cell lands on.
+    """
+    want = _nvfp4_scale_shape(rows, cols)
+    if block_scale.shape != want:
+        raise ValueError(
+            f"block_scale must have shape {want} for a ({rows}, {cols}) NVFP4 tensor, "
+            f"got {tuple(block_scale.shape)}"
+        )
+    # e4m3 crosses DLPack as uint8 (map_dtype_to_code has no name for codes 10/12).
+    return _operand(block_scale.view(torch.uint8), device, "block_scale", shape=want)
+
+
+def quantize_nvfp4(
+    x: torch.Tensor,
+    per_tensor_scale: torch.Tensor,
+    epsilon: float = 0.0,
+    pad_16x: bool = False,
+    hi_first: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """E2M1 block quantize: two nibbles per byte, one e4m3 scale per 16 columns.
+
+    ``epsilon`` is accepted and ignored, exactly as it is on the eager and triton
+    paths -- no reference implementation uses it either (see triton/quantization.py:395).
+    """
+    del epsilon  # unused by every implementation of this op; see above
+    x = x.contiguous()
+    if x.dim() != 2:
+        raise ValueError(f"quantize_nvfp4 expects a 2D tensor, got {x.dim()}D")
+    orig_rows, orig_cols = x.shape
+    # The block scale covers 16 elements and a packed byte covers 2, so the width
+    # has to be a whole number of blocks -- of the PADDED width, which is the whole
+    # point of pad_16x. An unpadded call therefore still needs orig_cols % 16 == 0.
+    if not pad_16x and orig_cols % 16 != 0:
+        raise ValueError(
+            f"quantize_nvfp4 requires the column count divisible by 16 "
+            f"(or pad_16x=True), got {orig_cols}"
+        )
+    rows = roundup(orig_rows, 16) if pad_16x else orig_rows
+    cols = roundup(orig_cols, 16) if pad_16x else orig_cols
+
+    scale = _scale_operand(per_tensor_scale, x.device)
+    out = torch.empty((rows, cols // 2), dtype=torch.uint8, device=x.device)
+    # Zeroed, not empty: the blocked buffer pads both dimensions up, and the padding
+    # is part of the layout rather than a hole. cuda/__init__.py:662 says so too.
+    scales = torch.zeros(_nvfp4_scale_shape(rows, cols), dtype=torch.uint8, device=x.device)
+    _C.quantize_nvfp4(
+        _dl(x), _dl(scale), _dl(out), _dl(scales),
+        rows, cols, orig_rows, orig_cols, DTYPE_TO_CODE[x.dtype], hi_first, _stream(x),
+    )
+    return out, scales.view(torch.float8_e4m3fn)
+
+
+def dequantize_nvfp4(
+    qx: torch.Tensor,
+    per_tensor_scale: torch.Tensor,
+    block_scales: torch.Tensor,
+    output_type: torch.dtype = torch.bfloat16,
+    hi_first: bool = True,
+) -> torch.Tensor:
+    """``e2m1(qx) * block_scale * per_tensor_scale`` back to a float tensor."""
+    qx = qx.contiguous()
+    if qx.dim() != 2:
+        raise ValueError(f"dequantize_nvfp4 expects a 2D tensor, got {qx.dim()}D")
+    rows, packed_cols = qx.shape
+    cols = packed_cols * 2
+    if cols % 16 != 0:
+        raise ValueError(f"dequantize_nvfp4 requires the column count divisible by 16, got {cols}")
+
+    scale = _scale_operand(per_tensor_scale, qx.device)
+    scales = _nvfp4_scale_operand(block_scales, rows, cols, qx.device)
+    out = torch.empty((rows, cols), dtype=output_type, device=qx.device)
+    _C.dequantize_nvfp4(
+        _dl(qx), _dl(scale), _dl(scales), _dl(out),
+        rows, cols, DTYPE_TO_CODE[output_type], hi_first, _stream(qx),
+    )
+    return out
+
+
+def scaled_mm_nvfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    tensor_scale_a: torch.Tensor,
+    tensor_scale_b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    alpha: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """out = (a @ b.T) * (tensor_scale_a * tensor_scale_b) + bias, on NVFP4 operands.
+
+    a is (M, K/2) and b is (N, K/2) uint8, two e2m1 values per byte. Both block
+    scales are in the blocked layout the kernels index; the per-tensor scales are
+    the global half of the decomposition and are applied once in the epilogue.
+
+    ``alpha`` is accepted for signature compatibility with the eager and CUDA paths
+    and ignored: it means the same thing ``tensor_scale_a * tensor_scale_b`` already
+    says, and cuda/__init__.py:1858-1859 defaults it to exactly that. Passing a
+    different alpha would silently disagree with the reference, so the kernels take
+    only the two scales.
+    """
+    del alpha  # equals tensor_scale_a * tensor_scale_b; see docstring
+    out_dtype = torch.bfloat16 if out_dtype is None else out_dtype
+    if a.dim() != 2 or b.dim() != 2:
+        raise ValueError("scaled_mm_nvfp4 expects two 2D operands")
+
+    a = _aligned(a.to(torch.uint8).contiguous())
+    b = _aligned(b.to(torch.uint8).contiguous())
+    m, k_packed = a.shape
+    n, b_k_packed = b.shape
+    if b_k_packed != k_packed:
+        raise ValueError(f"inner dimension mismatch: a K={2 * k_packed}, b K={2 * b_k_packed}")
+    k = 2 * k_packed
+    # Both paths read a packed row a 16-byte chunk at a time, and one scale covers
+    # 16 elements, so K must be a whole number of blocks and of chunks.
+    if k % 32 != 0:
+        raise ValueError(f"scaled_mm_nvfp4 requires K divisible by 32, got {k}")
+
+    sa = _nvfp4_scale_operand(block_scale_a, m, k, a.device)
+    sb = _nvfp4_scale_operand(block_scale_b, n, k, a.device)
+    tsa = _scale_operand(tensor_scale_a, a.device)
+    tsb = _scale_operand(tensor_scale_b, a.device)
+    if bias is not None:
+        bias = _bias_operand(bias, n, a.device)
+
+    out = torch.empty((m, n), dtype=out_dtype, device=a.device)
+    _C.scaled_mm_nvfp4(
+        _dl(a), _dl(b), _dl(out), _dl(sa), _dl(sb), _dl(tsa), _dl(tsb),
+        None if bias is None else _dl(bias),
+        m, n, k, n, DTYPE_TO_CODE[out_dtype], _stream(a),
     )
     return out
 
@@ -2685,6 +2852,49 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             },
             default_devices=dev,
             call_rules=(_na3d_call_rule,),
+        ),
+        # NVFP4. The three ops together are the whole NVFP4 story on this backend:
+        # with scaled_mm_nvfp4 registered, an NVFP4 linear no longer has to
+        # dequantize its weight to a float tensor first, which is what the
+        # dequantize-and-matmul fallback costs (measured on the shapes in
+        # qwen3vl_32b_minimax_h3_nvfp4_awq: 12.6 ms against a 0.29 ms roofline for
+        # q_proj at M=1, 38 ms against 0.90 for up_proj at M=512).
+        #
+        # K is not constrained here beyond what the kernels demand, because the
+        # shape rules cannot see K for the GEMM (it is packed two values per byte in
+        # a, b) and quantize/dequantize are told cols/rows directly. The wrappers
+        # and the bindings both check the divisibility they need, so a call that
+        # would read past a row is refused there rather than admitted and
+        # miscompiled.
+        "quantize_nvfp4": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
+                "per_tensor_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+            },
+            default_devices=dev,
+        ),
+        "dequantize_nvfp4": FunctionConstraints(
+            params={
+                "qx": ParamConstraint(
+                    dtypes=frozenset({torch.uint8}), shape_rules=(ExactDims(2),)
+                ),
+                "per_tensor_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "block_scales": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn})),
+                "output_type": ParamConstraint(dtypes=out_floats),
+            },
+            default_devices=dev,
+        ),
+        "scaled_mm_nvfp4": FunctionConstraints(
+            params={
+                "a": ParamConstraint(dtypes=frozenset({torch.uint8}), shape_rules=(ExactDims(2),)),
+                "b": ParamConstraint(dtypes=frozenset({torch.uint8}), shape_rules=(ExactDims(2),)),
+                "tensor_scale_a": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "tensor_scale_b": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "block_scale_a": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn})),
+                "block_scale_b": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn})),
+                "out_dtype": ParamConstraint(dtypes=out_floats),
+            },
+            default_devices=dev,
         ),
         "quantize_per_tensor_fp8": FunctionConstraints(
             params={

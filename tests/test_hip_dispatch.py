@@ -188,12 +188,36 @@ def test_hip_drops_gemms_without_matrix_cores():
     # once here instead of carrying a suppression.
     expected_wmma_only = frozenset({
         "fp16_conv3d", "fp16_conv3d_out", "na3d", "sol_attn",
-        "scaled_mm_svdquant_w4a4",
+        "scaled_mm_svdquant_w4a4", "scaled_mm_nvfp4",
     })
     assert expected_wmma_only == hip_backend._WMMA_ONLY_OPS
     # The fused W4A8 requantize is elementwise too: it packs weights and never
     # reaches a matrix core, so RDNA2 must keep it.
     assert "quantize_w4a8_int8_weight" in without
+
+
+def test_hip_nvfp4_gemm_is_withheld_from_rDNA2_but_the_codec_is_not():
+    """The NVFP4 split: two codecs that work anywhere, one GEMM that needs WMMA.
+
+    ops/nvfp4.hip compiles in every device pass -- the translation unit has to build
+    wherever the backend is built, and gfx11 and gfx12 both supply an MmaF16 -- so
+    nothing about the file itself stops an RDNA2 device from launching the tile. What
+    stops it is this gate, and the consequence of getting it wrong is a fault rather
+    than a wrong number: mma.h's no-matrix-core MmaF16::mma is __builtin_trap().
+
+    So the gate has to draw the line exactly here. Withholding all three would make
+    the packed representation unusable on RDNA2, which is the one part where having it
+    helps most -- the eager path has to decode the whole [N, K] weight to a float
+    tensor first. Advertising all three is the trap.
+    """
+    with_wmma = hip_backend._build_constraints(has_wmma=True)
+    without = hip_backend._build_constraints(has_wmma=False)
+
+    assert "scaled_mm_nvfp4" in with_wmma
+    assert "scaled_mm_nvfp4" not in without
+    for op in ("quantize_nvfp4", "dequantize_nvfp4"):
+        assert op in with_wmma
+        assert op in without
 
 
 def test_hip_advertises_every_inplace_rope_entry():

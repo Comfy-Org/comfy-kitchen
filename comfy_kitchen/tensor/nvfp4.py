@@ -14,7 +14,7 @@ from .base import (
     QuantizedLayout,
     QuantizedTensor,
     dequantize_args,
-    native_scaled_mm_usable,
+    nvfp4_mm_has_fast_path,
     register_layout_op,
 )
 
@@ -96,7 +96,7 @@ class TensorCoreNVFP4Layout(QuantizedLayout):
 
     @classmethod
     def state_dict_tensors(cls, qdata: torch.Tensor, params: Params) -> dict[str, torch.Tensor]:
-        """Return key suffix → tensor mapping for serialization."""
+        """Return key suffix -> tensor mapping for serialization."""
         return {
             "": qdata,
             "_scale": params.block_scale,
@@ -147,6 +147,34 @@ def _handle_nvfp4_transpose(qt, args, kwargs):
 
 # ==================== NVFP4 Matmul Operations ====================
 
+def _bias_for_kernel(bias: torch.Tensor | None, logical_n: int, padded_n: int) -> torch.Tensor | None:
+    """The bias in the length the kernel's epilogue indexes, which is the padded N.
+
+    ``ck.scaled_mm_nvfp4`` derives N from the packed operand's row count, and the
+    weight is stored padded to a multiple of 16, so an ``nn.Linear`` whose
+    out_features is 20 hands over a 20-element bias for a kernel that will index 32
+    of them. ``_bias_operand`` raises ValueError on the mismatch, and ValueError is
+    not in these handlers' except clause -- so the call escaped as an exception
+    instead of falling back, which is a regression: without the fused handler the
+    same call returns the dequantized answer.
+
+    Zero-extending is what makes it correct rather than merely non-crashing. The
+    padded columns of the output are discarded by ``_slice_to_original_shape``, so
+    whatever sits there cannot reach the result; zero is simply the value that has
+    to be a defined one so the epilogue's load stays in bounds.
+
+    The common case, N already a multiple of 16, returns the tensor untouched --
+    an ``nn.Linear`` in a quantized checkpoint almost always is, and this runs on
+    every forward.
+    """
+    if bias is None:
+        return bias
+    if bias.numel() != logical_n:
+        # A broadcast addend, or a bias for a different operand. Not ours.
+        return None
+    return torch.nn.functional.pad(bias, (0, padded_n - logical_n))
+
+
 def _slice_to_original_shape(
     result: torch.Tensor,
     orig_m: int,
@@ -166,7 +194,7 @@ def _handle_nvfp4_mm(qt, args, kwargs):
     with scaled_mm_nvfp4 since that kernel computes a @ b_phys.T, which equals
     a @ b_logical when b_logical = b_phys.T.
 
-    This handles the common torch.compile decomposition: linear(x, w) → mm(x, w.t())
+    This handles the common torch.compile decomposition: linear(x, w) -> mm(x, w.t())
     """
     a, b = args[0], args[1]
 
@@ -174,18 +202,20 @@ def _handle_nvfp4_mm(qt, args, kwargs):
     if not (isinstance(a, QuantizedTensor) and isinstance(b, QuantizedTensor)):
         return torch.mm(*dequantize_args(args))
 
-    # NVFP4 only supports 2D tensors
-    if a._qdata.dim() != 2:
+    # NVFP4 only supports 2D tensors. Both operands -- `b._params.orig_shape[1]` below
+    # is an index into a 2-tuple, so a 1-D b would raise IndexError rather than the
+    # RuntimeError eager gives for the same call.
+    if a._qdata.dim() != 2 or b._qdata.dim() != 2:
         return torch.mm(*dequantize_args(args))
 
-    # The native scaled GEMM this dispatches to does not exist on every part
-    # torch.cuda reports as "cuda" (see native_scaled_mm_usable). Decline here
-    # rather than let the try/except below catch it: under torch.compile the
-    # custom op is traced into the graph, so the exception would escape instead.
-    # That helper also declines inside a CUDA graph capture, where its probe would
-    # otherwise record its own allocations into the graph being built.
-    if not native_scaled_mm_usable(a._qdata.device.type):
-        logger.debug("NVFP4 mm: no native scaled GEMM here, falling back to dequantize")
+    # The fused scaled GEMM this dispatches to does not exist on every part torch
+    # reports as "cuda": PyTorch's own _scaled_mm is SM100-only for NVFP4, while
+    # this fork's HIP backend has a WMMA kernel for it on any part with matrix
+    # cores. Decline here rather than let the try/except below catch it: under
+    # torch.compile the custom op is traced into the graph, so the exception would
+    # escape instead (see nvfp4_mm_has_fast_path).
+    if not nvfp4_mm_has_fast_path(a._qdata.device.type):
+        logger.debug("NVFP4 mm: no fused scaled GEMM here, falling back to dequantize")
         return torch.mm(*dequantize_args(args))
 
     a_transposed = getattr(a._params, "transposed", False)
@@ -220,6 +250,84 @@ def _handle_nvfp4_mm(qt, args, kwargs):
         return torch.mm(*dequantize_args(args))
 
 
+@register_layout_op(torch.ops.aten.addmm.default, TensorCoreNVFP4Layout)
+def _handle_nvfp4_addmm(qt, args, kwargs):
+    """NVFP4 addmm: output = bias + input @ weight, the form linear takes.
+
+    This is not an extra entry point so much as the one that runs. `F.linear` on
+    a 2D input with a bias does not dispatch to `aten.linear`: ATen folds it into
+    `addmm` whenever it can, so every biased `nn.Linear` -- which is every
+    Linear in the model being benchmarked -- arrives here and never reaches
+    _handle_nvfp4_linear. Without this handler the NVFP4 fast path is
+    unreachable in practice, not merely unused.
+
+    mat2 is the already-transposed weight, as in _handle_nvfp4_mm, and the
+    kernel's ``a @ b.T`` is what that means.
+    """
+    bias, mat1, mat2 = args[0], args[1], args[2]
+
+    # Every fallback carries kwargs through. This op's scale arguments are not in
+    # them, but beta/alpha and out_dtype are, and dropping them changes the result
+    # rather than just its spelling.
+    def fallback():
+        return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
+
+    if not (isinstance(mat1, QuantizedTensor) and isinstance(mat2, QuantizedTensor)):
+        return fallback()
+    # Both operands. Checking only mat1 left a 1-D mat2 to reach `mat2.shape[1]`,
+    # which is an IndexError -- and eager's answer there is a RuntimeError saying
+    # "Expected 2D tensor", so the caller sees the wrong exception type from the
+    # wrong library.
+    if mat1._qdata.dim() != 2 or mat2._qdata.dim() != 2:
+        return fallback()
+
+    # beta/alpha have no place in a scaled GEMM: the kernel applies exactly one
+    # product scale and adds the bias once. A broadcast addend rather than a
+    # per-column bias is the same kind of request -- the epilogue takes a 1D
+    # bias of length N -- and both fall back.
+    if kwargs.get("beta", 1) != 1 or kwargs.get("alpha", 1) != 1:
+        return fallback()
+    if not (isinstance(bias, torch.Tensor) and bias.dim() == 1):
+        return fallback()
+
+    # See _handle_nvfp4_mm: the gate has to be a Python decision dynamo can
+    # trace, not a caught exception.
+    if not nvfp4_mm_has_fast_path(mat1._qdata.device.type):
+        logger.debug("NVFP4 addmm: no fused scaled GEMM here, falling back to dequantize")
+        return fallback()
+
+    if getattr(mat1._params, "transposed", False) or not getattr(mat2._params, "transposed", False):
+        logger.debug("NVFP4 addmm: unsupported transpose configuration, falling back to dequantize")
+        return fallback()
+
+    input_qdata, scale_a, block_scale_a = TensorCoreNVFP4Layout.get_plain_tensors(mat1)
+    weight_qdata, scale_b, block_scale_b = TensorCoreNVFP4Layout.get_plain_tensors(mat2)
+    out_dtype = kwargs.get("out_dtype", mat1._params.orig_dtype)
+
+    # mat2.shape[1] is the unpadded N; the kernel indexes the padded one.
+    bias = _bias_for_kernel(bias, mat2.shape[1], weight_qdata.shape[0])
+    if bias is None:
+        return fallback()
+
+    try:
+        result = ck.scaled_mm_nvfp4(
+            input_qdata,
+            weight_qdata,
+            tensor_scale_a=scale_a,
+            tensor_scale_b=scale_b,
+            block_scale_a=block_scale_a,
+            block_scale_b=block_scale_b,
+            bias=bias,
+            out_dtype=out_dtype,
+        )
+        return _slice_to_original_shape(
+            result, mat1._params.orig_shape[0], mat2._params.orig_shape[1]
+        )
+    except (RuntimeError, TypeError) as e:
+        logger.warning(f"NVFP4 addmm failed: {e}, falling back to dequantization")
+        return fallback()
+
+
 @register_layout_op(torch.ops.aten.linear.default, TensorCoreNVFP4Layout)
 def _handle_nvfp4_linear(qt, args, kwargs):
     """NVFP4 linear: output = input @ weight.T + bias
@@ -234,16 +342,17 @@ def _handle_nvfp4_linear(qt, args, kwargs):
     if not (isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor)):
         return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
 
-    # NVFP4 only supports 2D tensors
-    if input_tensor._qdata.dim() != 2:
+    # NVFP4 only supports 2D tensors. Both operands: checking only the input left a
+    # 1-D weight to reach an indexing expression that raises IndexError, where
+    # eager raises a RuntimeError about the rank.
+    if input_tensor._qdata.dim() != 2 or weight._qdata.dim() != 2:
         return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
 
-    # See _handle_nvfp4_mm: the native scaled GEMM is not available everywhere
-    # torch.cuda reports as "cuda", and a try/except fallback does not survive
-    # torch.compile because the custom op is traced into the graph. The probe
-    # inside native_scaled_mm_usable is likewise kept out of a graph capture.
-    if not native_scaled_mm_usable(input_tensor._qdata.device.type):
-        logger.debug("NVFP4 linear: no native scaled GEMM here, falling back to dequantize")
+    # See _handle_nvfp4_mm: PyTorch's own NVFP4 GEMM is NVIDIA-only, so the gate has
+    # to accept this fork's HIP kernel, and it still has to be a Python decision
+    # dynamo can trace rather than a caught exception.
+    if not nvfp4_mm_has_fast_path(input_tensor._qdata.device.type):
+        logger.debug("NVFP4 linear: no fused scaled GEMM here, falling back to dequantize")
         return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
 
     input_transposed = getattr(input_tensor._params, "transposed", False)
@@ -255,6 +364,12 @@ def _handle_nvfp4_linear(qt, args, kwargs):
     input_qdata, scale_a, block_scale_a = TensorCoreNVFP4Layout.get_plain_tensors(input_tensor)
     weight_qdata, scale_b, block_scale_b = TensorCoreNVFP4Layout.get_plain_tensors(weight)
     out_dtype = kwargs.get("out_dtype", input_tensor._params.orig_dtype)
+
+    # weight is (out_features, in_features), so its row count is N; the kernel
+    # indexes the padded one.
+    bias = _bias_for_kernel(bias, weight.shape[0], weight_qdata.shape[0])
+    if bias is None:
+        return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
 
     try:
         # scaled_mm_nvfp4 computes (a @ b.T) * scale, which is linear semantics

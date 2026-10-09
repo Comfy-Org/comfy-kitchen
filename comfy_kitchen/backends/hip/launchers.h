@@ -163,6 +163,32 @@ void launch_w4a8_int8_gemm_chunked_kernel(const void* xq, const void* qw, const 
                                           int K, int group_size, int chunk_cols, int bits,
                                           int out_code, hipStream_t stream);
 
+// NVFP4: E2M1 packed two per byte (high nibble = even column) with one e4m3
+// block scale per 16 columns in cuBLAS blocked layout. See ops/nvfp4.hip and
+// nvfp4_utils.h for the codec and the layout.
+//
+// x is fp16/bf16/fp32 (in_dtype_code 0/1/2) over (rows, cols); out is rows x
+// cols/2 uint8 and block_scales is raw e4m3 bytes over
+// (RoundUp(rows,128), RoundUp(cols/16,4)). orig_rows/orig_cols are the input's
+// own extents, which differ from rows/cols only when the caller padded to 16x16.
+void launch_quantize_nvfp4_kernel(const void* x, const void* global_scale, void* out,
+                                  void* block_scales, int rows, int cols, int orig_rows,
+                                  int orig_cols, int input_dtype_code, bool hi_first,
+                                  hipStream_t stream);
+
+// The inverse: in is rows x cols/2 uint8, block_scales the same blocked e4m3
+// buffer, out is rows x cols in output_dtype_code 0/1/2.
+void launch_dequantize_nvfp4_kernel(const void* in, const void* global_scale,
+                                    const void* block_scales, void* out, int rows, int cols,
+                                    int output_dtype_code, bool hi_first, hipStream_t stream);
+
+// out[M, N] = (a[M, K] @ b[N, K]^T) with each operand's block scales folded in,
+// scaled by tsa[0] * tsb[0] and offset by bias[col]. K must be a multiple of 32.
+void launch_scaled_mm_nvfp4_kernel(const void* a, const void* b, void* c, const void* sa,
+                                   const void* sb, const void* tsa, const void* tsb,
+                                   const void* bias, int bias_code, int M, int N, int K,
+                                   int ldc, int out_code, hipStream_t stream);
+
 // V unquantized and transposed to the packed [B*H*D, padded_N] layout the direct
 // short-key kernel reads. Defined in sage_attention/quant_v_int8.hip.
 void launch_sage_transpose_v(const void* v, void* out, int B, int H, int N, int D, int padded_N,

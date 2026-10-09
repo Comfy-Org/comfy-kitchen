@@ -187,6 +187,7 @@ set(HIP_SOURCES
     ops/w4a8_gemv.hip
     ops/w4a8_requant.hip
     ops/gated_delta.hip
+    ops/nvfp4.hip
 )
 
 set(CPP_SOURCES

@@ -62,7 +62,9 @@ def native_scaled_mm_usable(device_type: str) -> bool:
     Scoped to the layouts that genuinely have nowhere else to go. FP8 and INT8
     are deliberately not gated this way: on a WMMA part the HIP backend serves
     both from its own kernels, and gating them would push working matmuls onto
-    a dequantize fallback.
+    a dequantize fallback. NVFP4 has a kernel there too and now reaches this
+    through :func:`quantized_mm_has_fast_path`, which is what turns the answer
+    into "yes" on an AMD part.
 
     Probed once per device type rather than read off the capability number,
     because what matters is the shape PyTorch actually accepts, which no version
@@ -75,9 +77,10 @@ def native_scaled_mm_usable(device_type: str) -> bool:
 
     During CUDA graph capture the probe cannot run at all -- its allocations
     would be recorded into the graph -- so the answer is deferred rather than
-    produced: :func:`quantized_mm_has_fast_path` and the NVFP4 handlers both come
-    through here, and what a capture gets is "no fast path", which is the branch
-    dequantize-and-matmul takes and therefore always a correct one. Deferring
+    produced: :func:`quantized_mm_has_fast_path` comes through here, and so does
+    the NVFP4 gate that delegates to it (:func:`nvfp4_mm_has_fast_path`), and
+    what a capture gets is "no fast path", which is the branch dequantize-and-matmul
+    takes and therefore always a correct one. Deferring
     also means not caching: a capture-time "no" recorded for the process would
     cost a supported part its fast path long after the capture ended. An answer
     already in the dict -- a probe run before the capture, or during an earlier
@@ -222,6 +225,26 @@ def quantized_mm_has_fast_path(device_type: str) -> bool:
     if device_type == "cuda" and torch.cuda.is_available():
         return native_scaled_mm_usable(device_type)
     return True
+
+
+def nvfp4_mm_has_fast_path(device_type: str) -> bool:
+    """Whether an NVFP4 matmul can stay fused on this device.
+
+    Same answer as :func:`quantized_mm_has_fast_path` -- the HIP backend's NVFP4
+    GEMM is a WMMA kernel, so a part with matrix cores has a fast path whatever
+    PyTorch thinks -- with the CPU case taken back out.
+
+    It has to be, because the fallback this gate guards is not symmetric across
+    layouts. FP8's registry entry (``scaled_mm_v2``) ends in ``torch._scaled_mm``,
+    which exists on CPU and fails per call. NVFP4's ends in
+    ``a.view(torch.float4_e2m1fn_x2)`` (eager/quantization.py:238), a dtype only
+    CUDA tensors have, so a CPU answer of "yes" is not a slower path but a wrong
+    one -- and under ``torch.compile`` the resulting exception escapes the graph
+    instead of being caught, which is the whole hazard this gate exists to avoid.
+    """
+    if device_type != "cuda" or not torch.cuda.is_available():
+        return False
+    return quantized_mm_has_fast_path(device_type)
 
 
 class QuantizedLayout(ABC):
