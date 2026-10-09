@@ -20,6 +20,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cfloat>
+#include <cmath>
 #include <cstdint>
 
 #include "../launchers.h"
@@ -404,4 +405,95 @@ extern "C" void launch_flash_decode(const void* q, const void* k, const void* v,
     } else {
         comfy::hip_backend::launch_groups<256>(a);
     }
+}
+
+// Current-step rows: the prefix decode pass returned its output and natural-log LSE; row j's own token and
+// the earlier rows of this step are the slots that prefix skips. Fold them in as
+// further softmax columns, the same arithmetic as the CUDA kernel:
+//   s_t = scale * q . k_t;  m = max(lse, max_t s_t)
+//   o = (out * e^(lse - m) + sum_t v_t * e^(s_t - m)) / (e^(lse - m) + sum_t e^(s_t - m))
+// over the step rows t <= j.
+// One wave per (batch, row, head), eight dims per lane, fp32 math, bf16 out.
+namespace comfy::hip_backend {
+namespace {
+
+constexpr int kMergeHeadDim = 256;
+constexpr int kMergeWaves = 8;
+constexpr int kMergeMaxRows = 8;
+constexpr int kMergeDims = kMergeHeadDim / kWave;
+
+__global__ __launch_bounds__(kMergeWaves * kWave) void flash_decode_step_merge_kernel(
+    const __bf16* __restrict__ out, const float* __restrict__ lse, const __bf16* __restrict__ q,
+    const __bf16* __restrict__ k, const __bf16* __restrict__ v, __bf16* __restrict__ merged,
+    int total, int rows, int heads, int groups, float scale,
+    int64_t q_bs, int64_t q_hs, int64_t q_rs, int64_t k_bs, int64_t k_hs, int64_t k_rs,
+    int64_t v_bs, int64_t v_hs, int64_t v_rs, int64_t o_bs, int64_t o_rs, int64_t m_bs,
+    int64_t m_rs) {
+    const int lane = static_cast<int>(threadIdx.x) % kWave;
+    const int idx = static_cast<int>(blockIdx.x) * kMergeWaves + static_cast<int>(threadIdx.x) / kWave;
+    if (idx >= total) return;
+    const int h = idx % heads;
+    const int j = (idx / heads) % rows;
+    const int b = idx / (heads * rows);
+    const int kh = h / groups;
+    const int d0 = lane * kMergeDims;
+
+    const FloatVec<kMergeDims> qv = load_bf16<kMergeDims>(q + b * q_bs + h * q_hs + j * q_rs + d0);
+    float s[kMergeMaxRows];
+    const float l = lse[(b * heads + h) * rows + j];
+    float m = l;
+#pragma unroll
+    for (int t = 0; t < kMergeMaxRows; ++t) {
+        s[t] = -INFINITY;
+        if (t <= j) {
+            const FloatVec<kMergeDims> kv = load_bf16<kMergeDims>(k + b * k_bs + kh * k_hs + t * k_rs + d0);
+            float dot = 0.0f;
+#pragma unroll
+            for (int d = 0; d < kMergeDims; ++d) dot += qv[d] * kv[d];
+            s[t] = wave_sum(dot) * scale;
+            m = fmaxf(m, s[t]);
+        }
+    }
+
+    const float w_flash = expf(l - m);
+    float denom = w_flash;
+    FloatVec<kMergeDims> acc = load_bf16<kMergeDims>(out + b * o_bs + j * o_rs + h * kMergeHeadDim + d0);
+#pragma unroll
+    for (int d = 0; d < kMergeDims; ++d) acc[d] *= w_flash;
+#pragma unroll
+    for (int t = 0; t < kMergeMaxRows; ++t) {
+        if (t <= j) {
+            const float w = expf(s[t] - m);
+            denom += w;
+            const FloatVec<kMergeDims> vv = load_bf16<kMergeDims>(v + b * v_bs + kh * v_hs + t * v_rs + d0);
+#pragma unroll
+            for (int d = 0; d < kMergeDims; ++d) acc[d] = fmaf(vv[d], w, acc[d]);
+        }
+    }
+    const float inv = 1.0f / denom;
+    __bf16* dst = merged + b * m_bs + j * m_rs + h * kMergeHeadDim + d0;
+#pragma unroll
+    for (int d = 0; d < kMergeDims; ++d) dst[d] = static_cast<__bf16>(acc[d] * inv);
+}
+
+}  // namespace
+}  // namespace comfy::hip_backend
+
+extern "C" void launch_flash_decode_step_merge(
+    const void* out, const float* lse, const void* q, const void* k, const void* v,
+    void* merged, int batch, int rows, int heads, int kv_heads, int64_t q_batch_stride,
+    int64_t q_head_stride, int64_t q_row_stride, int64_t k_batch_stride, int64_t k_head_stride,
+    int64_t k_row_stride, int64_t v_batch_stride, int64_t v_head_stride, int64_t v_row_stride,
+    int64_t o_batch_stride, int64_t o_row_stride, int64_t m_batch_stride, int64_t m_row_stride,
+    hipStream_t stream) {
+    using namespace comfy::hip_backend;
+    const int waves = batch * rows * heads;
+    flash_decode_step_merge_kernel<<<(waves + kMergeWaves - 1) / kMergeWaves, kMergeWaves * kWave, 0,
+                                     stream>>>(
+        static_cast<const __bf16*>(out), lse, static_cast<const __bf16*>(q),
+        static_cast<const __bf16*>(k), static_cast<const __bf16*>(v),
+        static_cast<__bf16*>(merged), waves, rows, heads, heads / kv_heads,
+        1.0f / sqrtf(static_cast<float>(kMergeHeadDim)), q_batch_stride, q_head_stride,
+        q_row_stride, k_batch_stride, k_head_stride, k_row_stride, v_batch_stride, v_head_stride,
+        v_row_stride, o_batch_stride, o_row_stride, m_batch_stride, m_row_stride);
 }

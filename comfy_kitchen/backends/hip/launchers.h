@@ -34,6 +34,16 @@ void launch_flash_decode(const void* q, const void* k, const void* v, const int*
                          int64_t k_head_stride, int64_t o_batch_stride, int64_t o_group_stride,
                          int64_t o_step_stride, int64_t o_head_stride, hipStream_t stream);
 
+// Folds the current step's rows causally (row j attends rows t <= j) into a
+// prefix-only decode result; see ops/flash_decode.hip. heads is the query head count.
+void launch_flash_decode_step_merge(
+    const void* out, const float* lse, const void* q, const void* k, const void* v, void* merged,
+    int batch, int rows, int heads, int kv_heads, int64_t q_batch_stride,
+    int64_t q_head_stride, int64_t q_row_stride, int64_t k_batch_stride, int64_t k_head_stride,
+    int64_t k_row_stride, int64_t v_batch_stride, int64_t v_head_stride, int64_t v_row_stride,
+    int64_t o_batch_stride, int64_t o_row_stride, int64_t m_batch_stride, int64_t m_row_stride,
+    hipStream_t stream);
+
 // ldc is c's row stride, so a caller writing an N-column slice of a wider output
 // passes that output's width; a whole GEMM passes N.
 void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* scale_a,

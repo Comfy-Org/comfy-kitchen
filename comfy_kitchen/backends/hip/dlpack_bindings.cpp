@@ -2036,6 +2036,71 @@ void flash_attention_decode_gqa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> 
     check_hip_launch();
 }
 
+// Current-step merge: out [B, S, H*256] and lse [B, H, S] come from a prefix-only
+// decode over the S step rows; q [B, H, S, 256]
+// and k/v [B, Hk, S, 256] are the rows' own rotated query/key/value, and row j folds
+// in step rows t <= j. merged [B, S, H*256] receives the result.
+void flash_attention_decode_step_merge(nb::ndarray<> out, nb::ndarray<> lse, nb::ndarray<> q,
+                                       nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> merged,
+                                       uintptr_t stream_ptr) {
+    constexpr const char* kFn = "flash_attention_decode_step_merge";
+    constexpr int64_t kHeadDim = 256;
+    if (out.ndim() != 3 || lse.ndim() != 3 || q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 ||
+        merged.ndim() != 3) {
+        throw std::runtime_error(std::string(kFn) + ": operand rank mismatch");
+    }
+    const int64_t batch = q.shape(0), heads = q.shape(1), rows = q.shape(2);
+    const int64_t kv_heads = k.shape(1);
+    if (batch <= 0 || heads <= 0 || rows <= 0 || rows > 8 || kv_heads <= 0 ||
+        heads % kv_heads != 0 || q.shape(3) != kHeadDim || k.shape(0) != batch ||
+        k.shape(2) != rows || k.shape(3) != kHeadDim || v.shape(0) != batch ||
+        v.shape(1) != kv_heads || v.shape(2) != rows || v.shape(3) != kHeadDim) {
+        throw std::runtime_error(std::string(kFn) + ": shape mismatch");
+    }
+    if (out.shape(0) != batch || out.shape(1) != rows || out.shape(2) != heads * kHeadDim ||
+        merged.shape(0) != batch || merged.shape(1) != rows ||
+        merged.shape(2) != heads * kHeadDim || lse.shape(0) != batch || lse.shape(1) != heads ||
+        lse.shape(2) != rows) {
+        throw std::runtime_error(std::string(kFn) + ": output or lse shape mismatch");
+    }
+    require_dtype(q, 2, 2, kFn, "q");
+    require_dtype(k, 2, 2, kFn, "k");
+    require_dtype(v, 2, 2, kFn, "v");
+    require_dtype(out, 2, 2, kFn, "out");
+    require_dtype(merged, 2, 2, kFn, "merged");
+    require_dtype(lse, 0, 0, kFn, "lse");
+    require_packed_contiguous(lse, kFn, "lse");
+    if (q.stride(3) != 1 || k.stride(3) != 1 || v.stride(3) != 1 || out.stride(2) != 1 ||
+        merged.stride(2) != 1 || out.stride(1) != heads * kHeadDim ||
+        merged.stride(1) != heads * kHeadDim) {
+        throw std::runtime_error(std::string(kFn) + ": unsupported tensor strides");
+    }
+    const int64_t vectored[] = {q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1),
+                                k.stride(2), v.stride(0), v.stride(1), v.stride(2),
+                                out.stride(0), merged.stride(0)};
+    for (int64_t stride : vectored) {
+        if (stride % 4 != 0) {
+            throw std::runtime_error(std::string(kFn) + ": strides must be a multiple of 4");
+        }
+    }
+    constexpr int kDeviceRocm = nb::device::rocm::value;
+    const nb::ndarray<>* operands[] = {&out, &lse, &q, &k, &v, &merged};
+    for (const nb::ndarray<>* t : operands) {
+        if (t->device_type() != kDeviceRocm || t->device_id() != q.device_id()) {
+            throw std::runtime_error(std::string(kFn) +
+                                     ": every operand must be ROCm device memory on q's device");
+        }
+    }
+    launch_flash_decode_step_merge(
+        out.data(), static_cast<const float*>(lse.data()), q.data(), k.data(), v.data(),
+        merged.data(), static_cast<int>(batch),
+        static_cast<int>(rows), static_cast<int>(heads), static_cast<int>(kv_heads), q.stride(0),
+        q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1),
+        v.stride(2), out.stride(0), out.stride(1), merged.stride(0), merged.stride(1),
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
 
 // ---------------------------------------------------------------------------
 // Sol-Attn sparse attention
@@ -2493,6 +2558,9 @@ NB_MODULE(_C, m) {
     m.def("flash_attention_decode_gqa", &flash_attention_decode_gqa, nb::arg("q"), nb::arg("k"),
           nb::arg("v"), nb::arg("kv_lengths"), nb::arg("output"), nb::arg("softmax_lse"),
           nb::arg("softmax_lse_accum"), nb::arg("output_accum"), nb::arg("num_splits"),
+          nb::arg("stream_ptr"));
+    m.def("flash_attention_decode_step_merge", &flash_attention_decode_step_merge, nb::arg("out"),
+          nb::arg("lse"), nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("merged"),
           nb::arg("stream_ptr"));
     m.def("sage_prepare_key_mask", &sage_prepare_key_mask,
           nb::arg("mask"), nb::arg("packed"), nb::arg("stream_ptr"));

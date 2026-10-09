@@ -143,9 +143,10 @@ def flash_attention_decode(
 def flash_attention_decode_gqa_is_available(
     device: torch.device | int | None = None, dtype: torch.dtype = torch.bfloat16
 ) -> bool:
-    """Return whether flash_attention_decode_gqa runs its native kernel on ``device`` for
-    ``dtype`` inputs: BF16, head_dim 256, the CUDA extension on SM80 or newer or the HIP
-    extension on RDNA3 or newer. It otherwise computes the same result in torch."""
+    """Return whether flash_attention_decode_gqa and flash_attention_decode_step_merge run
+    their native kernel on ``device`` for ``dtype`` inputs: BF16, head_dim 256, the CUDA
+    extension on SM80 or newer or the HIP extension on RDNA3 or newer. Both functions
+    otherwise compute the same result in torch."""
     if dtype != torch.bfloat16:
         return False
     if isinstance(device, int):
@@ -231,3 +232,43 @@ def flash_attention_decode_gqa(
             torch.cuda.current_stream(q.device).cuda_stream,
         )
     return output
+
+
+def _step_merge_torch(out, lse, q, k, v, merged):
+    batch, heads, rows, head_dim = q.shape
+    groups = heads // k.shape[1]
+    kf = k.float().repeat_interleave(groups, dim=1)
+    vf = v.float().repeat_interleave(groups, dim=1)
+    scores = torch.matmul(q.float(), kf.transpose(-1, -2)) * head_dim ** -0.5  # [B, H, row, t]
+    causal = torch.ones(rows, rows, dtype=torch.bool, device=q.device).tril()
+    scores.masked_fill_(~causal, float("-inf"))
+    m = torch.maximum(lse, scores.amax(-1))
+    w_flash = torch.exp(lse - m)
+    w = torch.exp(scores - m.unsqueeze(-1))
+    denom = w_flash + w.sum(-1)
+    acc = out.view(batch, rows, heads, head_dim).transpose(1, 2).float() * w_flash.unsqueeze(-1)
+    acc = acc + torch.matmul(w, vf)
+    merged.copy_((acc / denom.unsqueeze(-1)).transpose(1, 2).reshape(batch, rows, heads * head_dim))
+    return merged
+
+
+def flash_attention_decode_step_merge(
+    out: torch.Tensor, lse: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    merged: torch.Tensor,
+) -> torch.Tensor:
+    """Fold the current step's own rows causally into a prefix-only decode result.
+
+    ``out`` [B, S, H*D] and ``lse`` [B, H, S] describe attention over the committed
+    prefix; q [B, H, S, D] and k/v [B, Hk, S, D] are the step
+    rows' own rotated query/key/value, and row j additionally attends step rows t <= j.
+    Writes and returns ``merged`` [B, S, H*D]."""
+    if q.shape[-1] != 256 or not flash_attention_decode_gqa_is_available(q.device, q.dtype):
+        return _step_merge_torch(out, lse, q, k, v, merged)
+    if _hip_backend is not None:
+        _hip_backend.flash_decode_step_merge(out, lse, q, k, v, merged)
+        return merged
+    _cuda_backend._C.flash_attention_decode_step_merge(
+        *map(_cuda_backend._wrap_for_dlpack, (out, lse, q, k, v, merged)),
+        torch.cuda.current_stream(q.device).cuda_stream,
+    )
+    return merged
