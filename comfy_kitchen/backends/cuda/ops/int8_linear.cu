@@ -1867,25 +1867,29 @@ void launch_int8_gemv_dequant_kernel(
     }
 
     DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+        auto launch_warp = [&](auto bias_ptr, bool bias_flag) {
+            using BiasType = std::remove_cv_t<std::remove_pointer_t<decltype(bias_ptr)>>;
+            constexpr int kWarpsPerBlock = 8;
+            const unsigned int blocks =
+                static_cast<unsigned int>((num_cols + kWarpsPerBlock - 1) / kWarpsPerBlock);
+            comfy::int8_gemv_dequant_warp_kernel<kWarpsPerBlock, OutputType, BiasType>
+                <<<blocks, kWarpsPerBlock * comfy::kThreadsPerWarp, 0, stream>>>(
+                    static_cast<const int8_t*>(input),
+                    static_cast<const int8_t*>(weight),
+                    static_cast<const float*>(x_scales),
+                    static_cast<const float*>(weight_scales),
+                    bias_ptr,
+                    static_cast<OutputType*>(output),
+                    static_cast<int>(num_cols),
+                    static_cast<int>(K),
+                    static_cast<int>(weight_scale_size),
+                    bias_flag,
+                    static_cast<const OutputType*>(residual),
+                    static_cast<const OutputType*>(residual_scale));
+        };
         if (!has_bias) {
             if ((K & 3) == 0) {
-                constexpr int kWarpsPerBlock = 8;
-                const unsigned int blocks =
-                    static_cast<unsigned int>((num_cols + kWarpsPerBlock - 1) / kWarpsPerBlock);
-                comfy::int8_gemv_dequant_warp_kernel<kWarpsPerBlock, OutputType, float>
-                    <<<blocks, kWarpsPerBlock * comfy::kThreadsPerWarp, 0, stream>>>(
-                        static_cast<const int8_t*>(input),
-                        static_cast<const int8_t*>(weight),
-                        static_cast<const float*>(x_scales),
-                        static_cast<const float*>(weight_scales),
-                        nullptr,
-                        static_cast<OutputType*>(output),
-                        static_cast<int>(num_cols),
-                        static_cast<int>(K),
-                        static_cast<int>(weight_scale_size),
-                        false,
-                        static_cast<const OutputType*>(residual),
-                        static_cast<const OutputType*>(residual_scale));
+                launch_warp(static_cast<const float*>(nullptr), false);
             } else {
                 comfy::int8_gemv_dequant_kernel<comfy::kInt8Threads, OutputType, float>
                     <<<static_cast<unsigned int>(num_cols), comfy::kInt8Threads, 0, stream>>>(
@@ -1905,23 +1909,7 @@ void launch_int8_gemv_dequant_kernel(
 
         DISPATCH_FP_DTYPE(bias_dtype_code, BiasType, [&] {
             if ((K & 3) == 0) {
-                constexpr int kWarpsPerBlock = 8;
-                const unsigned int blocks =
-                    static_cast<unsigned int>((num_cols + kWarpsPerBlock - 1) / kWarpsPerBlock);
-                comfy::int8_gemv_dequant_warp_kernel<kWarpsPerBlock, OutputType, BiasType>
-                    <<<blocks, kWarpsPerBlock * comfy::kThreadsPerWarp, 0, stream>>>(
-                        static_cast<const int8_t*>(input),
-                        static_cast<const int8_t*>(weight),
-                        static_cast<const float*>(x_scales),
-                        static_cast<const float*>(weight_scales),
-                        static_cast<const BiasType*>(bias),
-                        static_cast<OutputType*>(output),
-                        static_cast<int>(num_cols),
-                        static_cast<int>(K),
-                        static_cast<int>(weight_scale_size),
-                        true,
-                        static_cast<const OutputType*>(residual),
-                        static_cast<const OutputType*>(residual_scale));
+                launch_warp(static_cast<const BiasType*>(bias), true);
             } else {
                 comfy::int8_gemv_dequant_kernel<comfy::kInt8Threads, OutputType, BiasType>
                     <<<static_cast<unsigned int>(num_cols), comfy::kInt8Threads, 0, stream>>>(
