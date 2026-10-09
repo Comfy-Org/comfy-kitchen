@@ -2078,9 +2078,20 @@ def int8_linear(
     output_dtype_code = DTYPE_TO_CODE[out_dtype]
     is_2d_output = len(orig_shape) == 2
 
-    # The residual is fused into the CUTLASS epilogue when that path runs;
-    # every other route applies it eagerly here so all paths agree.
+    # The residual is fused into the CUTLASS epilogue and the M=1 GEMV when those
+    # paths run; every other route applies it eagerly here so all paths agree.
     fused_residual_done = False
+
+    def _gemv_residual_args():
+        # the GEMV epilogue takes residual [1, n] and scale [n] in the output dtype;
+        # anything broadcast is left to the eager addcmul in _finish
+        nonlocal fused_residual_done
+        if (residual is None or residual.dtype != out_dtype or residual_scale.dtype != out_dtype
+                or residual.numel() != n or residual_scale.numel() != n):
+            return None, None
+        fused_residual_done = True
+        return (_wrap_for_dlpack(residual.reshape(1, n).contiguous()),
+                _wrap_for_dlpack(_gemm_vector_arg(residual_scale, x.device, out_dtype)))
 
     def _finish(o):
         if not fused_residual_done:
@@ -2110,6 +2121,7 @@ def int8_linear(
         bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
         if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
             bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
+        resid_arg, resid_scale_arg = _gemv_residual_args()
         _C.int8_linear_m1(
             _wrap_for_dlpack(x_2d),
             _wrap_for_dlpack(x_qdata),
@@ -2122,6 +2134,8 @@ def int8_linear(
             convrot,
             convrot_groupsize,
             stream_ptr,
+            residual=resid_arg,
+            residual_scale=resid_scale_arg,
         )
         return _finish(out)
 
@@ -2175,6 +2189,10 @@ def int8_linear(
         bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
         if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
             bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
+        if m == 1:
+            resid_arg, resid_scale_arg = _gemv_residual_args()
+        else:
+            resid_arg = resid_scale_arg = None
         _C.int8_gemv_dequant(
             _wrap_for_dlpack(x_qdata),
             _wrap_for_dlpack(weight),
@@ -2184,6 +2202,8 @@ def int8_linear(
             _wrap_for_dlpack(out),
             output_dtype_code,
             stream_ptr,
+            residual=resid_arg,
+            residual_scale=resid_scale_arg,
         )
         return _finish(out)
 

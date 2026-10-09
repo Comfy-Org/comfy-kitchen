@@ -625,6 +625,8 @@ __global__ void int8_gemv_dequant_kernel(
     }
 }
 
+// residual (nullable): out = residual + residual_scale * out, with the linear rounded to
+// OutputType first, as the unfused addcmul sees it.
 template<int WARPS_PER_BLOCK, typename OutputType, typename BiasType>
 __global__ void int8_gemv_dequant_warp_kernel(
     const int8_t* __restrict__ x,
@@ -636,7 +638,9 @@ __global__ void int8_gemv_dequant_warp_kernel(
     int N,
     int K,
     int weight_scale_size,
-    bool has_bias)
+    bool has_bias,
+    const OutputType* __restrict__ residual,
+    const OutputType* __restrict__ residual_scale)
 {
     const int lane = threadIdx.x & (kThreadsPerWarp - 1);
     const int warp = threadIdx.x >> 5;
@@ -660,6 +664,10 @@ __global__ void int8_gemv_dequant_warp_kernel(
         float value = static_cast<float>(acc) * x_scales[0] * weight_scale;
         if (has_bias) {
             value += to_float(bias[n]);
+        }
+        if (residual != nullptr) {
+            const float linear = to_float(from_float<OutputType>(value));
+            value = to_float(residual[n]) + to_float(residual_scale[n]) * linear;
         }
         output[n] = from_float<OutputType>(value);
     }
@@ -1811,6 +1819,8 @@ void launch_int8_gemv_dequant_kernel(
     bool has_bias,
     int output_dtype_code,
     int bias_dtype_code,
+    const void* residual,
+    const void* residual_scale,
     cudaStream_t stream)
 {
     if (num_cols == 0 || K == 0) {
@@ -1822,6 +1832,9 @@ void launch_int8_gemv_dequant_kernel(
     }
     if (weight_scale_size != 1 && weight_scale_size != num_cols) {
         throw std::runtime_error("INT8 GEMV weight scale must be scalar or per-output-channel");
+    }
+    if (residual != nullptr && (num_rows != 1 || (K & 3) != 0)) {
+        throw std::runtime_error("INT8 GEMV fused residual requires M == 1 and K divisible by 4");
     }
 
     if (num_rows == 2) {
@@ -1870,7 +1883,9 @@ void launch_int8_gemv_dequant_kernel(
                         static_cast<int>(num_cols),
                         static_cast<int>(K),
                         static_cast<int>(weight_scale_size),
-                        false);
+                        false,
+                        static_cast<const OutputType*>(residual),
+                        static_cast<const OutputType*>(residual_scale));
             } else {
                 comfy::int8_gemv_dequant_kernel<comfy::kInt8Threads, OutputType, float>
                     <<<static_cast<unsigned int>(num_cols), comfy::kInt8Threads, 0, stream>>>(
@@ -1904,7 +1919,9 @@ void launch_int8_gemv_dequant_kernel(
                         static_cast<int>(num_cols),
                         static_cast<int>(K),
                         static_cast<int>(weight_scale_size),
-                        true);
+                        true,
+                        static_cast<const OutputType*>(residual),
+                        static_cast<const OutputType*>(residual_scale));
             } else {
                 comfy::int8_gemv_dequant_kernel<comfy::kInt8Threads, OutputType, BiasType>
                     <<<static_cast<unsigned int>(num_cols), comfy::kInt8Threads, 0, stream>>>(

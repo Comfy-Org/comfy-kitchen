@@ -2232,6 +2232,8 @@ extern "C" {
         bool has_bias,
         int output_dtype_code,
         int bias_dtype_code,
+        const void* residual,
+        const void* residual_scale,
         cudaStream_t stream);
 
     void launch_dequantize_int8_simple_kernel(
@@ -3532,6 +3534,23 @@ void dequantize_int8_linear(
         stream);
 }
 
+// Fused GEMV residual: residual [1, N] and residual_scale [N], both in the output dtype;
+// an omitted residual disables the epilogue.
+static void check_gemv_residual(
+    const std::optional<nb::ndarray<nb::device::cuda>>& residual,
+    const std::optional<nb::ndarray<nb::device::cuda>>& residual_scale,
+    int64_t N, int output_dtype_code) {
+    if (!residual) {
+        return;
+    }
+    if (residual->size() != static_cast<size_t>(N) || map_dtype_to_code(residual->dtype()) != output_dtype_code) {
+        throw std::runtime_error("INT8 GEMV residual must have N elements in the output dtype");
+    }
+    if (!residual_scale || residual_scale->size() != static_cast<size_t>(N) || map_dtype_to_code(residual_scale->dtype()) != output_dtype_code) {
+        throw std::runtime_error("INT8 GEMV residual scale must have N elements in the output dtype");
+    }
+}
+
 void int8_gemv_dequant(
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> input,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> weight,
@@ -3540,7 +3559,9 @@ void int8_gemv_dequant(
     nb::ndarray<nb::device::cuda> bias,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
     int output_dtype_code,
-    uintptr_t stream_ptr) {
+    uintptr_t stream_ptr,
+    std::optional<nb::ndarray<nb::device::cuda>> residual,
+    std::optional<nb::ndarray<nb::device::cuda>> residual_scale) {
 
     const int64_t M = input.shape(0);
     const int64_t K = input.shape(1);
@@ -3573,6 +3594,8 @@ void int8_gemv_dequant(
         }
     }
 
+    check_gemv_residual(residual, residual_scale, N, output_dtype_code);
+
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_int8_gemv_dequant_kernel(
         input.data(),
@@ -3588,6 +3611,8 @@ void int8_gemv_dequant(
         has_bias,
         output_dtype_code,
         bias_dtype_code,
+        residual ? residual->data() : nullptr,
+        residual ? residual_scale->data() : nullptr,
         stream);
 }
 
@@ -3602,7 +3627,9 @@ void int8_linear_m1(
     int output_dtype_code,
     bool convrot,
     int group_size,
-    uintptr_t stream_ptr) {
+    uintptr_t stream_ptr,
+    std::optional<nb::ndarray<nb::device::cuda>> residual,
+    std::optional<nb::ndarray<nb::device::cuda>> residual_scale) {
 
     const int64_t M = input.shape(0);
     const int64_t K = input.shape(1);
@@ -3647,6 +3674,10 @@ void int8_linear_m1(
     }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    check_gemv_residual(residual, residual_scale, N, output_dtype_code);
+    if (residual && (K & 3) != 0) {
+        throw std::runtime_error("INT8 M=1 linear fused residual requires K divisible by 4");
+    }
     if (convrot) {
         launch_quantize_int8_rowwise_convrot64_kernel(
             input.data(),
@@ -3688,6 +3719,8 @@ void int8_linear_m1(
         has_bias,
         output_dtype_code,
         bias_dtype_code,
+        residual ? residual->data() : nullptr,
+        residual ? residual_scale->data() : nullptr,
         stream);
 }
 
@@ -4261,7 +4294,9 @@ NB_MODULE(_C, m) {
           nb::arg("bias"),
           nb::arg("output"),
           nb::arg("output_dtype_code"),
-          nb::arg("stream_ptr"));
+          nb::arg("stream_ptr"),
+          nb::arg("residual") = nb::none(),
+          nb::arg("residual_scale") = nb::none());
 
     m.def("int8_linear_m1", &int8_linear_m1,
           "M=1 INT8 linear: activation quantization followed by GEMV/dequant",
@@ -4275,7 +4310,9 @@ NB_MODULE(_C, m) {
           nb::arg("output_dtype_code"),
           nb::arg("convrot"),
           nb::arg("group_size"),
-          nb::arg("stream_ptr"));
+          nb::arg("stream_ptr"),
+          nb::arg("residual") = nb::none(),
+          nb::arg("residual_scale") = nb::none());
 
     m.def("dequantize_int8_simple", &dequantize_int8_simple,
           "INT8 dequantization to float32",
