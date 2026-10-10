@@ -2322,7 +2322,7 @@ extern "C" {
         const void* qkv_buf, void* gates_buf, void* sumsq_buf, const void* ctl,
         void* state, void* out, const void* z, const void* norm_w, float eps,
         int64_t B, int64_t Hv, int64_t Hk, int64_t S, int64_t DK, int64_t DV, int64_t C, int64_t Hd,
-        int64_t key_dim, float scale, int64_t ldz, int dtype_code, cudaStream_t stream);
+        int64_t key_dim, float scale, int64_t ldz, int dtype_code, int64_t tree, cudaStream_t stream);
 
     bool launch_deltanet_conv_deferred(
         const void* proj, void* proj_buf, void* conv_state, const void* conv_w, const void* conv_b,
@@ -4464,13 +4464,13 @@ bool gated_delta_decode_deferred(
     nb::ndarray<nb::ndim<4>, nb::device::cuda> qkv_buf,        // [2, B, C, 8] conv+silu output
     nb::ndarray<float, nb::ndim<5>, nb::device::cuda> gates_buf,   // [2, B, 8, Hv, 2]
     nb::ndarray<float, nb::ndim<5>, nb::device::cuda> sumsq_buf,   // [2, B, 8, Hk, 2]
-    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> ctl,   // {pending, parity}
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> ctl,   // {pending, parity, slot[8], parent[8], prog[8]}
     nb::ndarray<float, nb::ndim<4>, nb::device::cuda> state,   // [B, Hv, DK, DV]
     nb::ndarray<nb::ndim<4>, nb::device::cuda> out,            // [B, S, Hv, DV]
     nb::ndarray<nb::ndim<3>, nb::device::cuda> z,              // [B, S, Hv*DV] norm gate
     nb::ndarray<nb::ndim<1>, nb::device::cuda> norm_w,         // [DV]
     double eps,
-    int64_t key_dim, int64_t num_key_heads, double scale, uintptr_t stream_ptr) {
+    int64_t key_dim, int64_t num_key_heads, double scale, int64_t tree, uintptr_t stream_ptr) {
     const char* who = "gated_delta_decode_deferred";
     const int64_t B = x.shape(0), S = x.shape(1), Hd = x.shape(2);
     const int64_t C = qkv_buf.shape(2);
@@ -4490,7 +4490,7 @@ bool gated_delta_decode_deferred(
         || qkv_buf.shape(0) != 2 || qkv_buf.shape(1) != B || qkv_buf.shape(3) != 8
         || gates_buf.shape(0) != 2 || gates_buf.shape(1) != B || gates_buf.shape(2) != 8 || gates_buf.shape(3) != Hv || gates_buf.shape(4) != 2
         || sumsq_buf.shape(0) != 2 || sumsq_buf.shape(1) != B || sumsq_buf.shape(2) != 8 || sumsq_buf.shape(3) != num_key_heads || sumsq_buf.shape(4) != 2
-        || ctl.shape(0) != 2)
+        || ctl.shape(0) != 26)
         throw std::runtime_error(std::string(who) + ": shape mismatch");
     need_contiguous(x, who, "x");
     need_contiguous(w_a, who, "w_a");
@@ -4509,7 +4509,7 @@ bool gated_delta_decode_deferred(
         x.data(), w_a.data(), w_b.data(), dt_bias.data(), g_decay.data(),
         qkv_buf.data(), gates_buf.data(), sumsq_buf.data(), ctl.data(),
         state.data(), out.data(), z.data(), norm_w.data(), static_cast<float>(eps),
-        B, Hv, num_key_heads, S, DK, DV, C, Hd, key_dim, static_cast<float>(scale), ldz, dtype_code,
+        B, Hv, num_key_heads, S, DK, DV, C, Hd, key_dim, static_cast<float>(scale), ldz, dtype_code, tree,
         reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
@@ -4520,7 +4520,7 @@ bool deltanet_conv_deferred(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> conv_w,      // [C, KS]
     std::optional<nb::ndarray<nb::ndim<1>, nb::device::cuda>> conv_b,  // [C]
     nb::ndarray<nb::ndim<4>, nb::device::cuda> qkv_buf,     // [2, B, C, 8]
-    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> ctl,   // {pending, parity}
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> ctl,   // {pending, parity, slot[8], parent[8], prog[8]}
     uintptr_t stream_ptr) {
     const char* who = "deltanet_conv_deferred";
     const int64_t B = proj.shape(0), S = proj.shape(1), C = proj.shape(2);
@@ -4534,7 +4534,7 @@ bool deltanet_conv_deferred(
     if (conv_state.shape(0) != B || conv_state.shape(1) != C || L != KS - 1 || conv_w.shape(0) != C
         || proj_buf.shape(0) != 2 || proj_buf.shape(1) != B || proj_buf.shape(2) != 8 || proj_buf.shape(3) != C
         || qkv_buf.shape(0) != 2 || qkv_buf.shape(1) != B || qkv_buf.shape(2) != C || qkv_buf.shape(3) != 8
-        || ctl.shape(0) != 2
+        || ctl.shape(0) != 26
         || (conv_b.has_value() && conv_b->shape(0) != C))
         throw std::runtime_error(std::string(who) + ": shape mismatch");
     const int64_t ldp = row_stride_3d(proj, who, "proj");
@@ -5177,7 +5177,7 @@ NB_MODULE(_C, m) {
           nb::arg("x"), nb::arg("w_a"), nb::arg("w_b"), nb::arg("dt_bias"), nb::arg("g_decay"),
           nb::arg("qkv_buf"), nb::arg("gates_buf"), nb::arg("sumsq_buf"), nb::arg("ctl"),
           nb::arg("state"), nb::arg("out"), nb::arg("z"), nb::arg("norm_w"), nb::arg("eps"),
-          nb::arg("key_dim"), nb::arg("num_key_heads"), nb::arg("scale"), nb::arg("stream_ptr"));
+          nb::arg("key_dim"), nb::arg("num_key_heads"), nb::arg("scale"), nb::arg("tree"), nb::arg("stream_ptr"));
 
     m.def("deltanet_conv_deferred", &deltanet_conv_deferred,
           "Depthwise causal conv decode step with silu; commits the previous step's accepted window first",
