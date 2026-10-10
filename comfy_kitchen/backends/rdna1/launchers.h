@@ -1,0 +1,86 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Launchers called from more than one translation unit. They are extern "C", so a
+// declaration that drifts from its definition still links and then corrupts the
+// call frame; declaring them once where the definition can see it makes the
+// compiler check instead.
+#pragma once
+
+#include <hip/hip_runtime.h>
+
+#include <cstdint>
+
+extern "C" {
+
+// Fused 3D neighborhood attention over contiguous (B, T, H, W, NH, HD) tensors.
+// dtype_code is a DTYPE_TO_CODE value: 1 float16, 2 bfloat16. See ops/na3d.hip.
+void launch_na3d_kernel(const void* q, const void* k, const void* v, void* out, int batch,
+                        int t_size, int h_size, int w_size, int num_heads, int head_dim, int kt,
+                        int kh, int kw, int causal_t, int causal_h, int causal_w, float scale,
+                        int dtype_code, hipStream_t stream);
+
+// ldc is c's row stride, so a caller writing an N-column slice of a wider output
+// passes that output's width; a whole GEMM passes N.
+void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* scale_a,
+                             const void* scale_b, int scale_b_stride, const void* bias,
+                             int bias_code, int M, int N, int K, int ldc, int out_code,
+                             hipStream_t stream);
+
+// scale_code is a DTYPE_TO_CODE value: 0 float32, 5 e4m3 (passed as raw bytes).
+// codebook is 16 floats, or null for the uniform levels. bits is 4 or 6.
+void launch_dequant_int4_grouped_to_int8_kernel(const void* qw, const void* s_rel, int scale_code,
+                                                const void* codebook, void* out, int64_t n,
+                                                int64_t k, int group_size, int bits,
+                                                hipStream_t stream);
+
+// weight is the raw [N, K] weight, in_dtype_code 1 float16 or 2 bfloat16. bits 4 takes
+// the 16-entry codebook at g 16, bits 6 uniform levels at g 16/32/64. s_rel is written
+// as raw e4m3 bytes; seed is ignored unless stochastic is set.
+void launch_quantize_wxa8_convrot_fused_kernel(const void* weight, const void* codebook,
+                                               void* packed, void* s_rel, void* s_channel,
+                                               int64_t n, int64_t k, int bits, int g,
+                                               int in_dtype_code, bool stochastic, uint64_t seed,
+                                               hipStream_t stream);
+
+// Staged 4-bit requantize of an already rotated [N, K] weight, in_dtype_code 0 float32,
+// 1 float16 or 2 bfloat16. Throws when the K/16 group scales do not fit in LDS.
+void launch_quantize_w4a8_convrot_kernel(const void* rotated, const void* codebook, void* packed,
+                                         void* s_rel, void* s_channel, int64_t n, int64_t k,
+                                         int in_dtype_code, bool stochastic, uint64_t seed,
+                                         hipStream_t stream);
+
+// Widest K the fused requantize can take at this group size on the current device,
+// 0 if unknown.
+int wxa8_requant_max_k_kernel(int group_size);
+
+void launch_w4a8_int8_gemm_chunked_kernel(const void* xq, const void* qw, const void* s_rel,
+                                          int scale_code, const void* codebook,
+                                          const void* s_channel, const void* xs, const void* bias,
+                                          int bias_code, void* workspace, void* out, int M, int N,
+                                          int K, int group_size, int chunk_cols, int bits,
+                                          int out_code, hipStream_t stream);
+
+// Sol-Attn sparse attention -- see sage_attention/sol_attn.hip. The whole pipeline
+// runs over one caller-allocated workspace whose carve-up sol_attn_plan reports.
+extern const char* const sol_attn_plan_names[];  // null-terminated
+int sol_attn_plan(int batch, int seq_len, int num_heads, int n_tok, int64_t* out, int cap);
+void sol_producer_begin(void* workspace, int batch, int seq_len, int num_heads, int n_tok,
+                        hipStream_t stream);
+void sol_producer_chunk(void* workspace, const void* qkv, const void* fab, const void* qw,
+                        const void* kw, const void* kmean, const void* vscale, const void* blen,
+                        float rope_eps, int rot_dim, int t0, int M, int batch, int seq_len,
+                        int num_heads, int n_tok, hipStream_t stream);
+void launch_sol_attn_core(void* workspace, void* out, const void* vscale, void* kmean_next,
+                          void* vamax_out, const void* blen, int tail, int batch, int seq_len,
+                          int num_heads, float tau, float scale, const void* ext_threshold,
+                          int sink_start, int sink_end, int sink_q_start, int sink_q_end,
+                          int n_tok, hipStream_t stream);
+void launch_sol_attn(const void* q, const void* k, const void* v, void* out, void* workspace,
+                     int batch, int seq_len, int num_heads, int head_dim, int elem, float tau, float scale,
+                     const void* key_bias, const void* ext_threshold, const void* blen, int tail,
+                     int sink_start, int sink_end, int sink_q_start, int sink_q_end, int64_t qs_b,
+                     int64_t qs_t, int64_t qs_h, int64_t ks_b, int64_t ks_t, int64_t ks_h,
+                     int64_t vs_b, int64_t vs_t, int64_t vs_h, int n_tok, hipStream_t stream);
+
+}  // extern "C"

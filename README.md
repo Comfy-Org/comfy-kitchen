@@ -4,45 +4,48 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 
 ## Backend Capabilities Matrix
 
-| Function                    | eager | cuda | triton | hip | ascend |
-|-----------------------------|-------|------|--------|-----|-----|
-| `quantize_per_tensor_fp8`   | ✓     | ✓    | ✓      | ✓   |     |
-| `dequantize_per_tensor_fp8` | ✓     | ✓    | ✓      | ✓   |     |
-| `stochastic_rounding_fp8`   | ✓     | ✓    |        | ✓   |     |
-| `quantize_nvfp4`            | ✓     | ✓    | ✓      |     |     |
-| `dequantize_nvfp4`          | ✓     | ✓    | ✓      |     |     |
-| `scaled_mm_nvfp4`           | ✓     | ✓    |        |     |     |
-| `quantize_mxfp8`            | ✓     | ✓    | ✓      |     |     |
-| `dequantize_mxfp8`          | ✓     |      |        |     |     |
-| `scaled_mm_mxfp8`           | ✓     |      |        |     |     |
-| `adaln`                     | ✓     | ✓    | ✓      | ✓   |     |
-| `rms_adaln`                 | ✓     | ✓    | ✓      | ✓   |     |
-| `na3d`                      | ✓     | ✓    | ✓      | ✓   |     |
-| `na2d`                      | ✓     | ✓    | ✓      | ✓   |     |
-| `sol_attn`                  | ✓     | ✓    |        | ✓   |     |
-| `int8_attention`            |       | ✓    |        | ✓   |     |
-| `apply_rope`                | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `apply_rope1`               | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `apply_rope_split_half1`    | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `rms_rope`                  | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `rms_rope1`                 | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `rms_rope_split_half`       | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `rms_rope_split_half1`      | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `quantize_int8_rowwise`     | ✓     | ✓    | ✓      | ✓   | ✓   |
-| `quantize_int8_tensorwise`  | ✓     | ✓    |        | ✓   | ✓   |
-| `quantize_and_rotate_rowwise` | ✓   | ✓    | ✓      | ✓   | ✓*  |
-| `quantize_int8_convrot_weight` | ✓  | ✓    |        | ✓   |     |
-| `dequantize_int8_simple`    | ✓     | ✓    |        | ✓   | ✓   |
-| `dequantize_int8_simple_dtype` | ✓  | ✓    |        | ✓   | ✓   |
-| `dequantize_int8_convrot_weight_dtype` | ✓ | ✓ |    | ✓   |     |
-| `int8_linear`               | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `gemv_awq_w4a16`            | ✓     | ✓    |        | ✓   |     |
-| `quantize_svdquant_w4a4`    | ✓     | ✓    |        | ✓   |     |
-| `scaled_mm_svdquant_w4a4`   | ✓     | ✓    |        | ✓   |     |
-| `convrot_w4a4_linear`       | ✓     | ✓    |        | ✓   | ✓*  |
-| `quantize_convrot_w4a4_weight` | ✓  | ✓    |        | ✓   |     |
-| `dequantize_convrot_w4a4_weight` | ✓ | ✓   |        | ✓   |     |
+| Function                    | eager | cuda | triton | hip | rdna1 | ascend |
+|-----------------------------|-------|------|--------|-----|-------|-----|
+| `quantize_per_tensor_fp8`   | ✓     | ✓    | ✓      | ✓   | ✓     |     |
+| `dequantize_per_tensor_fp8` | ✓     | ✓    | ✓      | ✓   | ✓     |     |
+| `stochastic_rounding_fp8`   | ✓     | ✓    |        | ✓   | ✓     |     |
+| `quantize_nvfp4`            | ✓     | ✓    | ✓      |     |       |     |
+| `dequantize_nvfp4`          | ✓     | ✓    | ✓      |     |       |     |
+| `scaled_mm_nvfp4`           | ✓     | ✓    |        |     |       |     |
+| `quantize_mxfp8`            | ✓     | ✓    | ✓      |     |       |     |
+| `dequantize_mxfp8`          | ✓     |      |        |     |       |     |
+| `scaled_mm_mxfp8`           | ✓     |      |        |     |       |     |
+| `adaln`                     | ✓     | ✓    | ✓      | ✓   | ✓     |     |
+| `rms_adaln`                 | ✓     | ✓    | ✓      | ✓   | ✓     |     |
+| `na3d`                      | ✓     | ✓    | ✓      | ✓   | ✓     |     |
+| `na2d`                      | ✓     | ✓    | ✓      | ✓   |       |     |
+| `sol_attn`                  | ✓     | ✓    |        | ✓   | ✓     |     |
+| `int8_attention`            |       | ✓    |        | ✓   | ✓     |     |
+| `apply_rope`                | ✓     | ✓    | ✓      | ✓   | ✓     | ✓*  |
+| `apply_rope1`               | ✓     | ✓    | ✓      | ✓   | ✓     | ✓*  |
+| `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   | ✓     | ✓*  |
+| `apply_rope_split_half1`    | ✓     | ✓    | ✓      | ✓   | ✓     | ✓*  |
+| `rms_rope`                  | ✓     | ✓    | ✓      | ✓   | ✓     | ✓*  |
+| `rms_rope1`                 | ✓     | ✓    | ✓      | ✓   | ✓     | ✓*  |
+| `rms_rope_split_half`       | ✓     | ✓    | ✓      | ✓   | ✓     | ✓*  |
+| `rms_rope_split_half1`      | ✓     | ✓    | ✓      | ✓   | ✓     | ✓*  |
+| `quantize_int8_rowwise`     | ✓     | ✓    | ✓      | ✓   | ✓     | ✓   |
+| `quantize_int8_tensorwise`  | ✓     | ✓    |        | ✓   | ✓     | ✓   |
+| `quantize_and_rotate_rowwise` | ✓   | ✓    | ✓      | ✓   | ✓     | ✓*  |
+| `quantize_int8_convrot_weight` | ✓  | ✓    |        | ✓   | ✓     |     |
+| `dequantize_int8_simple`    | ✓     | ✓    |        | ✓   |       | ✓   |
+| `dequantize_int8_simple_dtype` | ✓  | ✓    |        | ✓   | ✓     | ✓   |
+| `dequantize_int8_convrot_weight_dtype` | ✓ | ✓ |    | ✓   | ✓     |     |
+| `int8_linear`               | ✓     | ✓    | ✓      | ✓   | ✓     | ✓*  |
+| `gemv_awq_w4a16`            | ✓     | ✓    |        | ✓   | ✓     |     |
+| `quantize_svdquant_w4a4`    | ✓     | ✓    |        | ✓   | ✓     |     |
+| `scaled_mm_svdquant_w4a4`   | ✓     | ✓    |        | ✓   | ✓     |     |
+| `convrot_w4a4_linear`       | ✓     | ✓    |        | ✓   | ✓     | ✓*  |
+| `quantize_convrot_w4a4_weight` | ✓  | ✓    |        | ✓   | ✓     |     |
+| `dequantize_convrot_w4a4_weight` | ✓ | ✓   |        | ✓   | ✓     |     |
+| `fp16_packed_linear`        | ✓     |      |        |     | ✓     |     |
+| `fp16_packed_conv3d`        | ✓     |      |        |     | ✓     |     |
+| `int8_block_sparse_attention` |       |      |        |     | ✓     |     |
 
 Each of the eight rope entries also has an in-place form (`apply_rope_`,
 `rms_rope_split_half1_`, ...) with the same backend coverage as the row above.
@@ -210,6 +213,70 @@ carrying CUDA and HIP side by side keeps its `abi3` tag. At runtime only the
 extension matching PyTorch's CUDA or ROCm runtime is loaded.
 
 
+## RDNA1 backend (AMD gfx1010)
+
+The `rdna1` backend serves RDNA1 (`gfx1010`: RX 5700 / 5600 / 5600M class), which the
+`hip` backend does not: the part has neither matrix cores nor dot-product
+instructions, and ROCm ships no hipBLASLt kernels for it, so eager's `int8_linear`
+(`torch._int_mm`) fails there and INT8 models cannot run. Like `hip`, it does not
+link or call hipBLAS/hipBLASLt; every quantized matmul is compiled from the sources
+in `comfy_kitchen/backends/rdna1/`, a copy of the HIP sources built for that one
+target.
+
+Without matrix cores, the GEMMs are thread-level and register-blocked
+(`gemm_simt.h`): each thread owns a block of the output and multiplies with the
+vector ALU. fp8 is re-encoded as fp16 (exact) and accumulated in fp32, int8 goes
+through 24-bit multiply-adds, and attention runs a software 16x16 tile policy
+(`mma.h`) in place of WMMA.
+
+`fp16_packed_linear` and `fp16_packed_conv3d` run fp16 weights on packed fp16 FMAs,
+twice the multiply-accumulate rate of the fp32 path. Each activation row is scaled
+by a power of two so that no fp16 partial sum overflows, and the partial sums are
+folded into fp32 every 32 products. ConvRot `int8_linear` with group size 256 runs
+on the same GEMM, since int8 weights are exact in fp16. The conv is an implicit GEMM
+with no im2col workspace.
+
+`int8_attention` has an fp16-FMA kernel for unmasked head dimensions 64 and 128,
+and `int8_block_sparse_attention` restricts each block of queries to a caller-chosen
+set of 64-key tiles.
+
+| What runs                      | How                                                         |
+|--------------------------------|-------------------------------------------------------------|
+| fp8, INT8, INT4/INT6, ConvRot, SVDQuant and AWQ linears | Thread-level GEMM              |
+| ConvRot INT8 (group 256), `fp16_packed_linear`, `fp16_packed_conv3d` | Packed fp16 GEMM  |
+| `int8_attention`, `sol_attn`, `na3d` | Software tile policy; fp16-FMA kernel for `int8_attention` |
+| Quantizers, RoPE, RMS-RoPE, AdaLN, GroupNorm+SiLU+pad | Elementwise kernels              |
+| NVFP4, MXFP8, `na2d`, flash decode, GatedDeltaNet decode | Not provided; eager            |
+
+The backend registers when a `gfx1010` is visible and declines tensors on any other
+device, so it runs in one process beside `hip`, each serving its own GPUs. Where it
+registers, dispatch is `rdna1` → `hip` → `eager`; Triton is left out because it
+miscompiles on `gfx1010`. A request outside a kernel's domain falls back to torch
+or eager. Set `COMFY_KITCHEN_DISABLE_RDNA1=1` to remove the backend from dispatch.
+
+On upstream ComfyUI with Z-Image Turbo at 1024x1024 on an RX 5600M, the int8_convrot
+models on this backend sample at 10.7 s/it and peak at 3.5 GB of VRAM, against
+about 27 s/it and 5.2 GB for the fp8 models on eager; the int8_convrot models do not run
+on eager at all. The setup and a time breakdown are in
+[the backend's README](comfy_kitchen/backends/rdna1/README.md).
+
+### Building
+
+The extension is built by the same ROCm toolchain and options as the HIP backend.
+It is selected when the build machine sees a `gfx1010`, or when `COMFY_HIP_ARCHS`
+lists it; any other targets in the list go to the `hip` extension as usual:
+
+```bash
+COMFY_HIP_ARCHS=gfx1010 pip install .
+```
+
+It is not part of the default target list, so a build that sees no GPU does not
+include it.
+
+```bash
+python -m pytest tests/test_rdna1.py
+```
+
 ## Quantized Tensors
 
 The library provides `QuantizedTensor`, a `torch.Tensor` subclass that transparently intercepts PyTorch operations and dispatches them to optimized quantized kernels when available.
@@ -332,6 +399,7 @@ The library supports multiple backends:
 - **eager**: Pure PyTorch implementation
 - **cuda**: Custom CUDA C kernels (CUDA only)
 - **hip**: Custom HIP kernels (WMMA GEMMs on RDNA3/3.5/4; non-WMMA kernels also on RDNA2)
+- **rdna1**: Custom HIP kernels for RDNA1 (`gfx1010`), which has no matrix cores
 - **triton**: Triton JIT-compiled kernels
 
 ### Automatic Backend Selection

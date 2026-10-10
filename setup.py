@@ -131,7 +131,7 @@ class CMakeBuildExt(build_ext):
         # share self.build_temp, and CMake refuses to reuse a cache generated for a
         # different source dir ("does not match the source ... used to generate
         # cache"), so configuring the second one into the first one's directory fails.
-        build_temp = pathlib.Path(self.build_temp).resolve() / ext.backend
+        build_temp = pathlib.Path(self.build_temp).resolve() / pathlib.Path(ext.source_dir).name
         build_temp.mkdir(parents=True, exist_ok=True)
 
         # All options have been set in finalize_options with proper defaults
@@ -184,12 +184,15 @@ class CMakeBuildExt(build_ext):
                 cmake_args.append(f"-DCMAKE_PREFIX_PATH={rocm_posix}")
                 cmake_args.append(f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={rocm_posix}")
 
-            # --hip-archs beats the environment, which beats what setup_hip_extension
+            # --hip-archs beats the environment, which beats what setup_hip_extensions
             # resolved from the visible devices. The CLI value is raw, so normalize it
             # the way ext.hip_archs already was: CMake splits its arch list on ";", and
             # an unnormalized "gfx1100,gfx1200" would reach it as a single bad target.
-            cli_archs = ";".join(normalize_archs(self.hip_archs)) if self.hip_archs else ""
-            hip_archs = cli_archs or ext.hip_archs
+            # rdna1 fixes its own target and takes no list.
+            cli_archs = ";".join(
+                arch for arch in normalize_archs(self.hip_archs or "") if arch != RDNA1_ARCH
+            )
+            hip_archs = (cli_archs or ext.hip_archs) if ext.hip_archs else ""
             if hip_archs:
                 cmake_args.append(f"-DCOMFY_HIP_ARCHS={hip_archs}")
 
@@ -334,6 +337,10 @@ if not SUPPORTED_HIP_ARCHS or len(SUPPORTED_HIP_ARCHS) != len(set(SUPPORTED_HIP_
     raise RuntimeError(f"{HIP_ARCH_MANIFEST_PATH} is empty or contains duplicate targets")
 
 DEFAULT_HIP_ARCHS = ";".join(SUPPORTED_HIP_ARCHS)
+
+
+# gfx1010 has a backend of its own, rdna1, built for that one target.
+RDNA1_ARCH = "gfx1010"
 
 
 def hip_arch_supported(arch: str) -> bool:
@@ -528,14 +535,14 @@ def get_rocm_path() -> tuple[str | None, pathlib.Path | None]:
     return rocm_home, compiler
 
 
-def setup_hip_extension() -> CMakeExtension | None:
+def setup_hip_extensions() -> list[CMakeExtension]:
     print("=" * 80)
     print("Checking for HIP/ROCm availability...")
     print("=" * 80)
 
     if BUILD_NO_HIP:
         print("HIP extension disabled by --no-hip flag")
-        return None
+        return []
 
     rocm_home, hip_compiler = get_rocm_path()
     if hip_compiler is None:
@@ -545,54 +552,60 @@ def setup_hip_extension() -> CMakeExtension | None:
                 "(looked for clang++/amdclang++/hipcc). Install ROCm or the rocm-sdk wheel."
             )
         print("No ROCm compiler detected; skipping HIP backend")
-        return None
+        return []
 
     print(f"Found ROCm root: {rocm_home or 'auto'}")
     print(f"Found HIP compiler: {hip_compiler}")
 
     # RDNA2 has no matrix cores, so it gets the elementwise kernels only; the GEMMs
-    # need the gfx11 or gfx12 WMMA intrinsics. Everything below RDNA2 (and CDNA,
-    # which uses MFMA rather than WMMA) has no path through these sources at all.
+    # need the gfx11 or gfx12 WMMA intrinsics. gfx1010 is built as the rdna1 backend
+    # instead. Everything else below RDNA2 (and CDNA, which uses MFMA rather than
+    # WMMA) has no path through these sources at all.
     archs = get_hip_archs_override()
     if archs:
+        rdna1 = RDNA1_ARCH in archs
+        archs = [arch for arch in archs if arch != RDNA1_ARCH]
         unsupported = [arch for arch in archs if not hip_arch_supported(arch)]
         if unsupported:
             raise RuntimeError(
                 f"ERROR: unsupported HIP architecture target(s): {';'.join(unsupported)}. "
-                f"Validated targets: {';'.join(SUPPORTED_HIP_ARCHS)}"
+                f"Validated targets: {';'.join((*SUPPORTED_HIP_ARCHS, RDNA1_ARCH))}"
             )
-        print(f"HIP architectures from the override: {';'.join(archs)}")
+        print(f"HIP architectures from the override: {';'.join(archs + [RDNA1_ARCH] * rdna1)}")
     else:
         detected = detect_hip_archs()
+        rdna1 = RDNA1_ARCH in detected
         if detected:
             archs = [arch for arch in detected if hip_arch_supported(arch)]
-            if not archs:
+            if not archs and not rdna1:
                 message = (
-                    f"Visible AMD GPUs ({';'.join(detected)}) are not RDNA2/3/4; "
-                    "these kernels would not run on them."
+                    f"Visible AMD GPUs ({';'.join(detected)}) are not RDNA2/3/4 or "
+                    "gfx1010; these kernels would not run on them."
                 )
                 if BUILD_HIP:
                     raise RuntimeError(f"ERROR: --hip requested but {message}")
                 print(f"{message} Skipping the HIP backend.")
                 print("Set COMFY_HIP_ARCHS to build for a target anyway.")
-                return None
-            print(f"Detected supported devices: {';'.join(archs)}")
+                return []
+            print(f"Detected supported devices: {';'.join(archs + [RDNA1_ARCH] * rdna1)}")
         else:
             archs = normalize_archs(DEFAULT_HIP_ARCHS)
             print(f"No AMD GPU visible; building for the default {';'.join(archs)}")
 
-    root_dir = pathlib.Path(__file__).resolve().parent
-    hip_backend_dir = root_dir / "comfy_kitchen" / "backends" / "hip"
-    if not hip_backend_dir.exists():
-        raise RuntimeError(f"HIP backend directory not found: {hip_backend_dir}")
-
-    print("Building HIP extension with CMake + nanobind: comfy_kitchen.backends.hip._C")
-    return CMakeExtension(
-        name="comfy_kitchen.backends.hip._C",
-        source_dir=str(hip_backend_dir),
-        backend="hip",
-        hip_archs=";".join(archs),
-    )
+    backends_dir = pathlib.Path(__file__).resolve().parent / "comfy_kitchen" / "backends"
+    extensions = []
+    for name in ["rdna1"] * rdna1 + ["hip"] * bool(archs):
+        backend_dir = backends_dir / name
+        if not backend_dir.exists():
+            raise RuntimeError(f"HIP backend directory not found: {backend_dir}")
+        print(f"Building HIP extension with CMake + nanobind: comfy_kitchen.backends.{name}._C")
+        extensions.append(CMakeExtension(
+            name=f"comfy_kitchen.backends.{name}._C",
+            source_dir=str(backend_dir),
+            backend="hip",
+            hip_archs=";".join(archs) if name == "hip" else "",
+        ))
+    return extensions
 
 
 def get_cuda_version() -> tuple[int, ...] | None:
@@ -717,9 +730,7 @@ def get_extensions() -> list[setuptools.Extension]:
     # the missing-CUDA path above, and combined-wheel CI opts in explicitly.
     build_hip_extension = BUILD_HIP or (not BUILD_NO_CUDA and not extensions)
     if build_hip_extension:
-        hip_ext = setup_hip_extension()
-        if hip_ext is not None:
-            extensions.append(hip_ext)
+        extensions.extend(setup_hip_extensions())
 
     if not extensions:
         print("\n" + "=" * 80)

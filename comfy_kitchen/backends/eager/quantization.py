@@ -982,6 +982,21 @@ def fp16_linear(
     return _apply_residual(out, residual, residual_scale)
 
 
+def fp16_packed_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    weight_amax: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``linear(x)`` in x's dtype, stored as ``out_dtype``."""
+    del weight_amax
+    out = torch.nn.functional.linear(
+        x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
+    )
+    return out if out_dtype is None else out.to(out_dtype)
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
