@@ -219,9 +219,10 @@ extern "C" void launch_sage_attn_kernel(
     LAUNCH_Q(HD, CK, MaskMode::kPreparedKey, nv_bfloat16, true, CQ);             \
   }
 
-  // Ampere: 64-row query tiles fit two CTAs per SM where 128-row tiles fit one; 6-10% faster
-  // on a 3080, sustained included.
-  if (mask == nullptr && head_dim == 128 && cta_k == 128 && is_ampere(current_device_sm())) {
+  // Ampere: 64-row tiles fit two CTAs per SM, 2-4% faster on a 3080 up to 38k keys. Longer
+  // sequences lose: each CTA re-reads K/V, which costs power (6-22% slower on a 300 W A6000).
+  if (mask == nullptr && head_dim == 128 && cta_k == 128 && kv_len <= 40960 &&
+      is_ampere(current_device_sm())) {
     if (output_dtype_code == 1) {
       LAUNCH_Q(128, 128, MaskMode::kNone, half, true, 64);
     } else {
@@ -287,7 +288,7 @@ extern "C" void launch_sage_attn_kernel(
     const int sm = current_device_sm();
     const bool smaller_ada_tile = sm == 89 &&
         qo_len >= 4096 && qo_len <= 16896 && kv_len >= 4096 && kv_len <= 16896;
-    // Ampere as above: 18-21% faster with a mask
+    // Ampere: 7-9% faster with a key mask, at any length
     if (sm >= 100 || smaller_ada_tile || is_ampere(sm)) {
       DISPATCH_PREPARED(128, 128, 64);
     } else {

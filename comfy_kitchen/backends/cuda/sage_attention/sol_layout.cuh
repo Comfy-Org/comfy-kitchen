@@ -26,6 +26,7 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 
+#include "math.cuh"
 #include "mma.cuh"
 
 // Device bodies compile out below sm_80; dispatch pins sol_attn to sm_80+.
@@ -33,14 +34,6 @@
 #define SOL_SM80 1
 #else
 #define SOL_SM80 0
-#endif
-
-// 3 CTAs per SM for the exact and token kernels: free on sm_120, a small spill that pays off
-// on Ampere. Ada would spill more, so it stays unbounded.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200 || (__CUDA_ARCH__ >= 800 && __CUDA_ARCH__ < 890))
-#define SOL_THREE_CTA 1
-#else
-#define SOL_THREE_CTA 0
 #endif
 
 namespace sol {
@@ -317,6 +310,7 @@ constexpr int TILE_PKC = BLOCK / 32;      // int8 k-chunks of O += P.V
 constexpr int TILE_LDK = HEAD_DIM;        // K tile row stride, bytes
 constexpr int TILE_LDV = BLOCK;           // V^T tile row stride, bytes
 constexpr float TILE_MASKED = -1.0e37f;   // scores at or below this are masked (NEG lands here)
+static_assert(HEAD_DIM <= 256 && BLOCK <= 128, "math::i2f_exact needs |Q.K| and |P.V| <= 2^22");
 
 // S = Q.K^T: the warp's 16 rows against the tile's 64 keys, int32 accumulators.
 __device__ __forceinline__ void tile_qk(const int8_t* sK_tile, const uint32_t (&qa)[TILE_KC][4],
@@ -351,8 +345,8 @@ __device__ __forceinline__ void tile_scores(const int32_t (&s_acc)[TILE_NKT][4],
         #pragma unroll
         for (int e = 0; e < 4; ++e) {
             const int row = e >> 1;
-            const float s = (e & 1) ? fmaf((float)s_acc[nt][e], qsc[row] * k1s, m1)
-                                    : fmaf((float)s_acc[nt][e], qsc[row] * k0s, m0);
+            const float s = (e & 1) ? fmaf(math::i2f_exact(s_acc[nt][e]), qsc[row] * k1s, m1)
+                                    : fmaf(math::i2f_exact(s_acc[nt][e]), qsc[row] * k0s, m0);
             p_val[nt][e] = s;
             if (FOLD_MAX) bmax[row] = fmaxf(bmax[row], s);
         }
@@ -415,10 +409,10 @@ __device__ __forceinline__ void tile_softmax_pv(float (&p_val)[TILE_NKT][4], flo
     #pragma unroll
     for (int kk = 0; kk < TILE_PKC; ++kk) {
         const int b0 = 4 * kk, b1 = b0 + 1, b2 = b0 + 2, b3 = b0 + 3;
-        pa[kk][0] = mma::pack_u8x4(p_val[b0][0], p_val[b0][1], p_val[b1][0], p_val[b1][1]);
-        pa[kk][1] = mma::pack_u8x4(p_val[b0][2], p_val[b0][3], p_val[b1][2], p_val[b1][3]);
-        pa[kk][2] = mma::pack_u8x4(p_val[b2][0], p_val[b2][1], p_val[b3][0], p_val[b3][1]);
-        pa[kk][3] = mma::pack_u8x4(p_val[b2][2], p_val[b2][3], p_val[b3][2], p_val[b3][3]);
+        pa[kk][0] = mma::pack_u8x4_exact_nonneg(p_val[b0][0], p_val[b0][1], p_val[b1][0], p_val[b1][1]);
+        pa[kk][1] = mma::pack_u8x4_exact_nonneg(p_val[b0][2], p_val[b0][3], p_val[b1][2], p_val[b1][3]);
+        pa[kk][2] = mma::pack_u8x4_exact_nonneg(p_val[b2][0], p_val[b2][1], p_val[b3][0], p_val[b3][1]);
+        pa[kk][3] = mma::pack_u8x4_exact_nonneg(p_val[b2][2], p_val[b2][3], p_val[b3][2], p_val[b3][3]);
     }
     uint32_t li[2] = {0, 0};
     #pragma unroll
@@ -433,8 +427,8 @@ __device__ __forceinline__ void tile_softmax_pv(float (&p_val)[TILE_NKT][4], flo
         li[0] += __shfl_xor_sync(0xffffffffu, li[0], off);
         li[1] += __shfl_xor_sync(0xffffffffu, li[1], off);
     }
-    l_r[0] = l_r[0] * alpha0 + (float)li[0];
-    l_r[1] = l_r[1] * alpha1 + (float)li[1];
+    l_r[0] = l_r[0] * alpha0 + math::i2f_exact((int32_t)li[0]);
+    l_r[1] = l_r[1] * alpha1 + math::i2f_exact((int32_t)li[1]);
 
     #pragma unroll
     for (int nt = 0; nt < TILE_NT; ++nt) {
@@ -448,10 +442,10 @@ __device__ __forceinline__ void tile_softmax_pv(float (&p_val)[TILE_NKT][4], flo
             uint32_t vbf[2] = {vb.x, vb.y};
             mma_u8s8(d, pa[kk], vbf);
         }
-        o_acc[nt][0] = fmaf(o_acc[nt][0], alpha0, (float)d[0]);
-        o_acc[nt][1] = fmaf(o_acc[nt][1], alpha0, (float)d[1]);
-        o_acc[nt][2] = fmaf(o_acc[nt][2], alpha1, (float)d[2]);
-        o_acc[nt][3] = fmaf(o_acc[nt][3], alpha1, (float)d[3]);
+        o_acc[nt][0] = fmaf(o_acc[nt][0], alpha0, math::i2f_exact(d[0]));
+        o_acc[nt][1] = fmaf(o_acc[nt][1], alpha0, math::i2f_exact(d[1]));
+        o_acc[nt][2] = fmaf(o_acc[nt][2], alpha1, math::i2f_exact(d[2]));
+        o_acc[nt][3] = fmaf(o_acc[nt][3], alpha1, math::i2f_exact(d[3]));
     }
 }
 

@@ -47,8 +47,7 @@ constexpr int NSTAGE = 2;      // pipeline depth; occupancy beats depth here
 // kiP: [B*H,Tp,D] int8 (perm_key + perm_d)   ksb: [B*H,Tp] float2 = (ks, bias)
 // vTi: [B*H,D,Tp] int8 (transposed; perm_d on keys, no perm_key)   vsc: [B*H,D] f32
 // sm_120 fits 3 blocks/SM without spilling; sm_89 would spill, so Ada is unbounded.
-// Ampere: 4-6% faster at 3 blocks despite a 24 B spill; a third stage at 2 blocks is not.
-#if SOL_THREE_CTA
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
 #define SOL_EXACT_BOUNDS __launch_bounds__(NTHREADS, 3)
 #else
 #define SOL_EXACT_BOUNDS __launch_bounds__(NTHREADS)
