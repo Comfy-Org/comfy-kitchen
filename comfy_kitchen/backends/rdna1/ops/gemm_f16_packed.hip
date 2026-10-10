@@ -86,6 +86,17 @@ void launch_scale_rows(const void* x, __half* x16, float* row_scale, const float
         static_cast<const InT*>(x), x16, row_scale, w_amax, K);
 }
 
+// fp16 rows x [R, K] into the GEMM's tiled layout (simt_tiled_offset), where out holds
+// ceil(R / 128) * 128 rows. One thread per 16-byte chunk, so K is a multiple of 8.
+__global__ __launch_bounds__(256) void tile_rows_f16_kernel(
+    const __half* __restrict__ x, __half* __restrict__ out, int R, int K) {
+    const int64_t chunk = static_cast<int64_t>(blockIdx.x) * 256 + threadIdx.x;
+    const int row = static_cast<int>(chunk / (K / 8)), k = static_cast<int>(chunk % (K / 8)) * 8;
+    if (row >= R) return;
+    *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(out) + simt_tiled_offset(row, 2 * k, 2 * K)) =
+        *reinterpret_cast<const uint4*>(x + static_cast<int64_t>(row) * K + k);
+}
+
 // Decode-sized M (<= 8) is bound on streaming the weight, which the GEMM's tiles would
 // only read once per row: one wave per output column reads its fp16 weight row once
 // for every x row, in fp32 math (a fp16 weight is exact in fp32), so the result is
@@ -211,13 +222,15 @@ extern "C" bool launch_fp16_packed_linear_kernel(
 
 // ConvRot INT8 linear on the packed GEMM: x (in_code, with input activation act_code,
 // as launch_quantize_int8_convrot_kernel) is rotated into fp16 scratch x16 with row
-// scales row_scale, then D = (x16 @ w16^T) * row_scale[row] * w_scale[col] + bias,
-// w16 being the INT8 weight cast to fp16. Returns false, having launched nothing,
-// where this device or shape has no such route; the caller keeps the INT8 GEMM.
+// scales row_scale, then D = (x16 @ w^T) * row_scale[row] * w_scale[col] + bias, the
+// GEMM reading the INT8 weight w where it lies and widening it to fp16 itself. Where the
+// GEMM takes its square tile, x16 is re-staged into the tiled layout in the scratch x16t,
+// which holds M rounded up to a multiple of 128 rows. Returns false, having launched
+// nothing, where this device or shape has no such route; the caller keeps the INT8 GEMM.
 extern "C" bool launch_int8_convrot_packed_linear_kernel(
     const void* x, int in_code, int act_code, const void* act_weight, float act_eps,
-    const void* w16, const void* w_scale, int w_scale_stride, const void* bias, int bias_code,
-    void* x16, void* row_scale, void* d, int out_code, int M, int N, int K,
+    const void* w, const void* w_scale, int w_scale_stride, const void* bias, int bias_code,
+    void* x16, void* x16t, void* row_scale, void* d, int out_code, int M, int N, int K,
     hipStream_t stream) {
 
     using namespace comfy::hip_backend;
@@ -234,21 +247,33 @@ extern "C" bool launch_int8_convrot_packed_linear_kernel(
     }
 
     // INT8 weights times their per-channel scale are the dequantized weight, so the
-    // INT8 codes cast to fp16 (exact, |w| <= 127) take the place of the fp16 weight and
-    // EpiRowwise applies both the row's power of two and w_scale.
+    // INT8 codes widened to fp16 (exact, |w| <= 127) take the place of the fp16 weight
+    // and EpiRowwise applies both the row's power of two and w_scale.
     const EpiRowwise epi{scale, static_cast<const float*>(w_scale), w_scale_stride, bias,
                          bias_code};
-    const auto* A = reinterpret_cast<const uint8_t*>(xh);
-    const auto* B = static_cast<const uint8_t*>(w16);
+    const bool tiled = simt_square_tile(M, N);
+    if (tiled) {
+        const int64_t chunks = static_cast<int64_t>(M) * (K / 8);
+        tile_rows_f16_kernel<<<static_cast<unsigned>((chunks + 255) / 256), 256, 0, stream>>>(
+            xh, static_cast<__half*>(x16t), M, K);
+    }
+    const auto* A = reinterpret_cast<const uint8_t*>(tiled ? x16t : x16);
+    const auto* B = static_cast<const uint8_t*>(w);
+    const auto gemm = [&]<typename OutT>(OutT* out) {
+        if (tiled) {
+            launch_gemm_simt_tiled<SimtF16Packed, EpiRowwise, OutT, true>(A, B, out, M, N, 2 * K, N,
+                                                                         epi, stream);
+        } else {
+            launch_gemm_simt<SimtF16Packed, EpiRowwise, OutT, const uint8_t*, true>(
+                A, B, out, M, N, 2 * K, N, epi, stream);
+        }
+    };
     if (out_code == kF32) {
-        launch_gemm_simt<SimtF16Packed, EpiRowwise, float>(A, B, static_cast<float*>(d), M, N,
-                                                           2 * K, N, epi, stream);
+        gemm(static_cast<float*>(d));
     } else if (out_code == kBF16) {
-        launch_gemm_simt<SimtF16Packed, EpiRowwise, __bf16>(A, B, static_cast<__bf16*>(d), M, N,
-                                                            2 * K, N, epi, stream);
+        gemm(static_cast<__bf16*>(d));
     } else if (out_code == kF16) {
-        launch_gemm_simt<SimtF16Packed, EpiRowwise, __half>(A, B, static_cast<__half*>(d), M, N,
-                                                            2 * K, N, epi, stream);
+        gemm(static_cast<__half*>(d));
     } else {
         throw std::runtime_error("int8_convrot_packed_linear: unsupported output dtype");
     }

@@ -170,6 +170,45 @@ def test_int8_linear_convrot_large_k_matches_eager(k):
     assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
 
 
+def test_int8_linear_convrot_tiled_operands_match_eager():
+    """Enough 128-row tiles that the packed GEMM takes its tiled operand layout, with a
+    partial last tile of rows and of columns."""
+    torch.manual_seed(1)
+    m, n, k = 1100, 2100, 512
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16)
+    wq, ws = ck.quantize_int8_rowwise(w)
+
+    with ck.use_backend(BACKEND):
+        out = ck.int8_linear(x, wq, ws.reshape(-1), None, torch.bfloat16, convrot=True,
+                             convrot_groupsize=256)
+    ref = _eager_reference(ck.int8_linear, x, wq, ws.reshape(-1), None, torch.bfloat16,
+                        convrot=True, convrot_groupsize=256)
+
+    scale = ref.float().abs().max().item()
+    assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
+
+
+def test_fp16_gemm_rejects_a_k_whose_byte_length_overflows(hip):
+    """The fp16 GEMMs take a row length in bytes, 2 * K as an int: the binding has to
+    stop a K past half of INT_MAX before any launcher doubles it."""
+    t = torch.zeros(16, device=DEV, dtype=torch.float16)
+    with pytest.raises(RuntimeError, match="too large for an fp16 row"):
+        hip._C.fp16_gemm(hip._dl(t), hip._dl(t), hip._dl(t), None, None, None, 1, 1, 2**30,
+                         hip._stream(t))
+
+
+def test_rope_fab_cache_is_released_with_its_freqs(hip):
+    """The packed RoPE coefficients are cached per freqs tensor and must not outlive it:
+    the cache would otherwise hold device memory after the run that made it."""
+    t, rot = 8, 16
+    freqs = torch.randn(t, 1, rot // 2, 2, 2, device=DEV)
+    fab = hip._packed_rope_fab(freqs, t, rot)
+    assert hip._packed_rope_fab(freqs, t, rot) is fab
+    del freqs
+    assert not hip._ROPE_FAB_CACHE
+
+
 def _offset_copy(t: torch.Tensor) -> torch.Tensor:
     """A contiguous copy of ``t`` deliberately based off a 16-byte boundary."""
     flat = t.reshape(-1)

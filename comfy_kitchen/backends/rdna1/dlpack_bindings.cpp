@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+#include <climits>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -54,7 +55,7 @@ bool launch_fp16_packed_linear_kernel(const void*, int, const void*, const void*
                                       const void*, int, void*, int, int, int, int, hipStream_t);
 bool launch_int8_convrot_packed_linear_kernel(const void*, int, int, const void*, float,
                                               const void*, const void*, int, const void*, int,
-                                              void*, void*, void*, int, int, int, int,
+                                              void*, void*, void*, void*, int, int, int, int,
                                               hipStream_t);
 bool launch_fp16_conv3d_kernel(const void*, const void*, const void*, const void*, void*, int, int,
                                int, int, int, int, int, int, int, int, int, int, int, int, int,
@@ -213,6 +214,14 @@ static void require_nonneg(int v, const char* fn, const char* name) {
     if (v < 0) {
         throw std::runtime_error(std::string(fn) + ": " + name + " must be non-negative, got " +
                                  std::to_string(v));
+    }
+}
+
+// The fp16 GEMMs take K as a row length in bytes, 2 * K as an int.
+static void require_fp16_k(int k, const char* fn) {
+    if (k > INT_MAX / 2) {
+        throw std::runtime_error(std::string(fn) + ": K=" + std::to_string(k) +
+                                 " is too large for an fp16 row");
     }
 }
 
@@ -414,6 +423,7 @@ bool fp16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias,
     require_nonneg(M, kFn, "M");
     require_nonneg(N, kFn, "N");
     require_nonneg(K, kFn, "K");
+    require_fp16_k(K, kFn);
     require_fp16(a, kFn, "a");
     require_fp16(b, kFn, "b");
     require_fp16(d, kFn, "d");
@@ -451,6 +461,7 @@ bool fp16_packed_linear(nb::ndarray<> x, nb::ndarray<> w, nb::ndarray<> w_amax,
     require_nonneg(M, kFn, "M");
     require_nonneg(N, kFn, "N");
     require_nonneg(K, kFn, "K");
+    require_fp16_k(K, kFn);
     require_dtype(x, 0, 2, kFn, "x");
     require_dtype(w, 1, 1, kFn, "w");
     require_dtype(w_amax, 0, 0, kFn, "w_amax");
@@ -475,29 +486,33 @@ bool fp16_packed_linear(nb::ndarray<> x, nb::ndarray<> w, nb::ndarray<> w_amax,
 
 // ConvRot INT8 linear on the packed fp16 GEMM: x (with act_code as in
 // quantize_int8_convrot) is rotated into x16 (fp16 scratch, scale in row_scale) and
-// multiplied by w16, the INT8 weight cast to fp16, under the INT8 rowwise epilogue.
-// false means the caller serves the call.
+// multiplied by the INT8 weight w, which the GEMM widens to fp16 as it reads it, under
+// the INT8 rowwise epilogue. The fp16 scratch x16t holds M rounded up to a multiple of
+// 128 rows, for the GEMM's tiled layout of x16. false means the caller serves the call.
 bool int8_convrot_packed_linear(nb::ndarray<> x, int act_code, OptArray act_weight,
-                                float act_eps, nb::ndarray<> w16, nb::ndarray<> w_scale,
+                                float act_eps, nb::ndarray<> w, nb::ndarray<> w_scale,
                                 int w_scale_stride, OptArray bias, nb::ndarray<> x16,
-                                nb::ndarray<> row_scale, nb::ndarray<> d, int M, int N, int K,
-                                int out_code, uintptr_t stream_ptr) {
+                                nb::ndarray<> x16t, nb::ndarray<> row_scale, nb::ndarray<> d,
+                                int M, int N, int K, int out_code, uintptr_t stream_ptr) {
     constexpr const char* kFn = "int8_convrot_packed_linear";
     require_nonneg(M, kFn, "M");
     require_nonneg(N, kFn, "N");
     require_nonneg(K, kFn, "K");
+    require_fp16_k(K, kFn);
     require_dtype(x, 0, 2, kFn, "x");
-    require_dtype(w16, 1, 1, kFn, "w16");
+    require_dtype(w, 4, 4, kFn, "w");
     require_dtype(w_scale, 0, 0, kFn, "w_scale");
     require_dtype(x16, 1, 1, kFn, "x16");
+    require_dtype(x16t, 1, 1, kFn, "x16t");
     require_dtype(row_scale, 0, 0, kFn, "row_scale");
     require_dtype(d, 0, 2, kFn, "d");
     require_out_matches(d, out_code, kFn);
     const int64_t in_width = act_code == 2 ? 2 : 1;
     require_len(x, static_cast<int64_t>(M) * K * in_width, kFn, "x");
-    require_len(w16, static_cast<int64_t>(N) * K, kFn, "w16");
+    require_len(w, static_cast<int64_t>(N) * K, kFn, "w");
     require_len(w_scale, w_scale_stride ? N : 1, kFn, "w_scale");
     require_len(x16, static_cast<int64_t>(M) * K, kFn, "x16");
+    require_len(x16t, (static_cast<int64_t>(M) + 127) / 128 * 128 * K, kFn, "x16t");
     require_len(row_scale, M, kFn, "row_scale");
     require_len(d, static_cast<int64_t>(M) * N, kFn, "d");
     require_bias(bias, N, kFn);
@@ -512,9 +527,9 @@ bool int8_convrot_packed_linear(nb::ndarray<> x, int act_code, OptArray act_weig
     }
     const bool served = launch_int8_convrot_packed_linear_kernel(
         x.data(), map_dtype_to_code(x.dtype()), act_code,
-        act_code == 3 ? act_weight->data() : nullptr, act_eps, w16.data(), w_scale.data(),
-        w_scale_stride, opt_data(bias), opt_code(bias), x16.data(), row_scale.data(), d.data(),
-        out_code, M, N, K, reinterpret_cast<hipStream_t>(stream_ptr));
+        act_code == 3 ? act_weight->data() : nullptr, act_eps, w.data(), w_scale.data(),
+        w_scale_stride, opt_data(bias), opt_code(bias), x16.data(), x16t.data(), row_scale.data(),
+        d.data(), out_code, M, N, K, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
     return served;
 }
@@ -2311,10 +2326,10 @@ NB_MODULE(_C, m) {
           nb::arg("d"), nb::arg("M"), nb::arg("N"), nb::arg("K"), nb::arg("out_code"),
           nb::arg("stream_ptr"));
     m.def("int8_convrot_packed_linear", &int8_convrot_packed_linear, nb::arg("x"),
-          nb::arg("act_code"), nb::arg("act_weight").none(), nb::arg("act_eps"), nb::arg("w16"),
+          nb::arg("act_code"), nb::arg("act_weight").none(), nb::arg("act_eps"), nb::arg("w"),
           nb::arg("w_scale"), nb::arg("w_scale_stride"), nb::arg("bias").none(), nb::arg("x16"),
-          nb::arg("row_scale"), nb::arg("d"), nb::arg("M"), nb::arg("N"), nb::arg("K"),
-          nb::arg("out_code"), nb::arg("stream_ptr"));
+          nb::arg("x16t"), nb::arg("row_scale"), nb::arg("d"), nb::arg("M"), nb::arg("N"),
+          nb::arg("K"), nb::arg("out_code"), nb::arg("stream_ptr"));
     m.def("fp16_conv3d", &fp16_conv3d, nb::arg("x"), nb::arg("w"), nb::arg("bias").none(),
           nb::arg("resid").none(), nb::arg("out"), nb::arg("N"), nb::arg("D"), nb::arg("H"),
           nb::arg("W"), nb::arg("C"), nb::arg("K"), nb::arg("T"), nb::arg("R"), nb::arg("S"),

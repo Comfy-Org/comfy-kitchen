@@ -255,7 +255,7 @@ miscompiles on `gfx1010`. A request outside a kernel's domain falls back to torc
 or eager. Set `COMFY_KITCHEN_DISABLE_RDNA1=1` to remove the backend from dispatch.
 
 On upstream ComfyUI with Z-Image Turbo at 1024x1024 on an RX 5600M, the int8_convrot
-models on this backend sample at 10.7 s/it and peak at 3.5 GB of VRAM, against
+models on this backend sample at 9.3 s/it and peak at 3.6 GB of VRAM, against
 about 27 s/it and 5.2 GB for the fp8 models on eager; the int8_convrot models do not run
 on eager at all. The setup and a time breakdown are in
 [the backend's README](comfy_kitchen/backends/rdna1/README.md).

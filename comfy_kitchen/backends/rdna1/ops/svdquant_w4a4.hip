@@ -18,7 +18,7 @@
 #include <string>
 
 #include "../epilogue.h"
-#include "../gemm_wmma.h"
+#include "../gemm_common.h"
 #include "../hadamard.h"  // load_in
 
 namespace comfy::hip_backend {
@@ -104,7 +104,7 @@ __global__ __launch_bounds__(256) void svdquant_gemm_kernel(
     constexpr int BM = 128, BN = 128, BKB = 64, TM = 2, TN = 4;
     constexpr int kStride = BKB + kLdsPad;
 
-    // Byte arrays that TileStager::store writes through uint2, as in gemm_wmma.h.
+    // Byte arrays that TileStager::store writes through uint2.
     __shared__ __align__(16) uint8_t As[BM * kStride];
     __shared__ __align__(16) uint8_t Bs[BN * kStride];
 

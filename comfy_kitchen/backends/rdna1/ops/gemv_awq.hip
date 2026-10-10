@@ -7,7 +7,7 @@
 //   y       = x @ W^T + bias
 //
 // Small-batch shapes are bandwidth bound on streaming the weight and offer no
-// operand reuse for a WMMA tile, so one wave reduces one output column.
+// operand reuse for a GEMM tile, so one wave reduces one output column.
 #include <stdexcept>
 #include <string>
 

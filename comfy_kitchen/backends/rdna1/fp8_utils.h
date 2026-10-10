@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // OCP FP8 encode/decode shared by the elementwise quantization kernels and the
-// scalar small-M GEMV path. The WMMA path consumes fp8 as raw bytes and needs
-// none of this.
+// scalar small-M GEMV path. The GEMM consumes fp8 as raw bytes and needs none of
+// this.
 #pragma once
 
 #include <hip/hip_fp16.h>
@@ -159,12 +159,9 @@ __forceinline__ __device__ float unpack_fp8(uint8_t value, int dtype_code = kFp8
            (1.0f + static_cast<float>(mantissa) / (1 << mantissa_bits));
 }
 
-// Fast e4m3fn decode for the small-M GEMV and, on gfx11, for widening the WMMA
-// operands to bf16. Both feed arbitrary user tensors, so the specials have to
-// survive: gfx12 hardware propagates a NaN operand through the fp8 WMMA, and the
-// widened gfx11 path has to agree with it. Results are assembled from bits, not
-// float literals, because -ffast-math would fold a branch that only ever returns
-// a NaN.
+// Fast e4m3fn decode for the small-M GEMV, which feeds arbitrary user tensors, so the
+// specials have to survive. Results are assembled from bits, not float literals,
+// because -ffast-math would fold a branch that only ever returns a NaN.
 __forceinline__ __device__ float fp8_to_float(uint8_t b) {
     const uint32_t sign_bits = (b & 0x80) ? 0x80000000u : 0u;
     const int exp = (b >> 3) & 0xF;
@@ -180,25 +177,6 @@ __forceinline__ __device__ float fp8_to_float(uint8_t b) {
 
     const uint32_t bits = (static_cast<uint32_t>(exp - 7 + 127) << 23) |
                           (static_cast<uint32_t>(man) << 20);
-    return sign * __uint_as_float(bits);
-}
-
-// e5m2 counterpart. Unlike e4m3fn it follows IEEE: an all-ones exponent is an
-// infinity when the mantissa is zero and a NaN otherwise.
-__forceinline__ __device__ float bf8_to_float(uint8_t b) {
-    const uint32_t sign_bits = (b & 0x80) ? 0x80000000u : 0u;
-    const int exp = (b >> 2) & 0x1F;
-    const int man = b & 0x3;
-
-    if (exp == 0x1F) {
-        return __uint_as_float(sign_bits | (man == 0 ? 0x7f800000u : 0x7fc00000u));
-    }
-
-    const float sign = (b & 0x80) ? -1.0f : 1.0f;
-    if (exp == 0) return sign * man * 0.0000152587890625f;  // subnormal step: 2^-16
-
-    const uint32_t bits = (static_cast<uint32_t>(exp - 15 + 127) << 23) |
-                          (static_cast<uint32_t>(man) << 21);
     return sign * __uint_as_float(bits);
 }
 

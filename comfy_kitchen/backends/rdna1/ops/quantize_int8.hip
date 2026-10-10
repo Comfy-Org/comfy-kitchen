@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// INT8 quantization kernels for the WMMA int8 GEMM.
+// INT8 quantization kernels for the INT8 GEMM.
 #include <stdexcept>
 
 #include "../hadamard.h"

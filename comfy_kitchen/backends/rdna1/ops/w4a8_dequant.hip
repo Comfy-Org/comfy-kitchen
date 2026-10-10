@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Grouped INT4 / INT6 -> INT8 weight decode for the W4A8 and W6A8 paths. The per-group scale is
-// folded in here so the result feeds the WMMA int8 GEMM directly; the
+// folded in here so the result feeds the INT8 GEMM directly; the
 // per-channel scale stays for that GEMM's epilogue. Memory-bound.
 #include <stdexcept>
 

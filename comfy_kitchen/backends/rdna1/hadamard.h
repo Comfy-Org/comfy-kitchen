@@ -353,25 +353,6 @@ __forceinline__ __device__ void convrot_fht_stage64(
     dst[base + 3 * S] = 0.5f * (-x0 + x1 + x2 + x3);
 }
 
-template <int S>
-__forceinline__ __device__ float convrot_fht_stage64_store_absmax(
-    const float* __restrict__ src, float* __restrict__ row_buf, int lane) {
-    const int base = (lane % S) + (lane / S) * (4 * S);
-    const float x0 = src[base];
-    const float x1 = src[base + S];
-    const float x2 = src[base + 2 * S];
-    const float x3 = src[base + 3 * S];
-    const float y0 = 0.5f * (x0 + x1 + x2 - x3);
-    const float y1 = 0.5f * (x0 + x1 - x2 + x3);
-    const float y2 = 0.5f * (x0 - x1 + x2 + x3);
-    const float y3 = 0.5f * (-x0 + x1 + x2 + x3);
-    row_buf[base] = y0;
-    row_buf[base + S] = y1;
-    row_buf[base + 2 * S] = y2;
-    row_buf[base + 3 * S] = y3;
-    return fmaxf(fmaxf(fabsf(y0), fabsf(y1)), fmaxf(fabsf(y2), fabsf(y3)));
-}
-
 template <int S, typename RowT>
 __forceinline__ __device__ float convrot_fht_stage64_store_absmax_typed(
     const float* __restrict__ src, RowT* __restrict__ output, int lane) {

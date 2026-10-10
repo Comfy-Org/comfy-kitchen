@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Shared INT4 / INT6 -> INT8 weight decode for the W4A8 and W6A8 paths. The
-// chunked decode writes the result to a workspace the WMMA GEMM reads back; the
+// chunked decode writes the result to a workspace the INT8 GEMM reads back; the
 // decode GEMV keeps it in registers. Both must land on the same int8 grid, so
 // the rounding and the level table live here rather than in either kernel.
 //

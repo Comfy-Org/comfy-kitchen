@@ -264,7 +264,7 @@ def _weight_operand(
     if weight.device.type != "cpu":
         return _operand(weight, device, name, shape)
     if not weight.is_pinned():
-        raise ValueError(f"{name} on CPU must be mapped pinned memory; use hip.offload_weight()")
+        raise ValueError(f"{name} on CPU must be mapped pinned memory; use offload_weight()")
     weight = weight.contiguous()
     if weight.data_ptr() % 16:
         aligned = torch.empty_like(weight, pin_memory=True)
@@ -834,20 +834,23 @@ def _int8_convrot_packed_linear(
 ) -> torch.Tensor | None:
     """ConvRot INT8 linear on the packed fp16 GEMM, or None where the fused rotation
     does not fit. With no int8 dot instructions, the INT8 weights (exact in fp16) run
-    faster against fp16 rows than int8-rounded ones.
+    faster against fp16 rows than int8-rounded ones. The GEMM reads the INT8 weight where
+    it lies; x16t is scratch for its tiled layout of the rotated rows, in whole tiles of 128.
     """
     m = x2d.shape[0]
     n, k = weight.shape
     x16 = torch.empty((m, k), dtype=torch.float16, device=x2d.device)
+    x16t = torch.empty((-(-m // 128) * 128, k), dtype=torch.float16, device=x2d.device)
     row_scale = torch.empty((m,), dtype=torch.float32, device=x2d.device)
     out = torch.empty((m, n), dtype=out_dtype, device=x2d.device)
     with torch.cuda.device(x2d.device):
         served = _C.int8_convrot_packed_linear(
             _dl(x2d), _input_act_code(input_act), None if act_weight is None else _dl(act_weight),
-            float(act_eps), _dl(weight.to(torch.float16)), _dl(weight_scale),
+            float(act_eps), _dl(weight), _dl(weight_scale),
             0 if weight_scale.numel() == 1 else 1,
             None if bias is None else _dl(_bias_operand(bias, n, x2d.device)),
-            _dl(x16), _dl(row_scale), _dl(out), m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x2d),
+            _dl(x16), _dl(x16t), _dl(row_scale), _dl(out), m, n, k, DTYPE_TO_CODE[out_dtype],
+            _stream(x2d),
         )
     return out if served else None
 
@@ -2526,7 +2529,8 @@ _ROPE_FAB_CACHE = {}
 def _packed_rope_fab(freqs, t, rot):
     """[..., T, 1, rot/2, 2, 2] -> [T, rot, 2] per-channel (self, partner)
     coefficients. Cached per freqs tensor (one attention step reuses one across
-    layers); the weak ref validates an id() hit without retaining freqs."""
+    layers); the weak ref validates an id() hit without retaining freqs, and drops the
+    entry with it so the cache does not hold device memory past the run."""
     key = (id(freqs), t, rot)
     hit = _ROPE_FAB_CACHE.get(key)
     if hit is not None and hit[0]() is freqs:
@@ -2541,7 +2545,7 @@ def _packed_rope_fab(freqs, t, rot):
     fab[:, rot // 2:, 0] = f[:, :, 1, 1]
     fab[:, rot // 2:, 1] = f[:, :, 1, 0]
     _ROPE_FAB_CACHE.clear()   # one live entry
-    _ROPE_FAB_CACHE[key] = (weakref.ref(freqs), fab)
+    _ROPE_FAB_CACHE[key] = (weakref.ref(freqs, lambda _: _ROPE_FAB_CACHE.pop(key, None)), fab)
     return fab
 
 
@@ -3227,7 +3231,6 @@ def _build_constraints() -> dict:
 # Must match kCtaQ and the key tiles in sage_attention/int8_attn.hip.
 _SAGE_CTA_Q = 128
 _SAGE_CTA_K = 64
-_SAGE_LARGE_CTA_K = 128
 _SAGE_KEY_GROUP = 16
 _SAGE_HEAD_DIMS = (64, 128, 256)
 

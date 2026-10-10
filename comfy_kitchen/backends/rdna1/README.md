@@ -46,7 +46,10 @@ kernels, and MIOpen has no CK grouped-conv library for it.
 - `fp16_packed_linear` / `fp16_packed_conv3d`: fp16 weights on `v_pk_fma_f16`, partial
   sums folded into fp32 every 32 products, activations of any range scaled by a power
   of two. The conv is an implicit GEMM with no im2col workspace. ConvRot INT8 linears
-  with group size 256 run on the same packed GEMM.
+  with group size 256 run on the same packed GEMM. Fetching operands, not arithmetic,
+  bounds that GEMM here, so it reads the INT8 weight where it lies and widens it to fp16
+  as it stages it (one SDWA conversion per element), and where it takes its 128x128 tile
+  the activations are staged in a tiled layout (a tile's stage of K stored contiguously).
 - NA3D, Sage INT8 and Sol attention on a software 16x16 tile policy (`mma.h`), plus an
   fp16-FMA Sage kernel for unmasked head_dim 64/128 and `int8_block_sparse_attention`.
 - Elementwise kernels: fp8/int8 quantize, RoPE, RMS-RoPE, AdaLN, GroupNorm+SiLU+pad.
@@ -84,12 +87,12 @@ the eager backend can run; B is this backend.
 
 | | A: fp8, eager, sub-quadratic attention | B: int8_convrot, rdna1, `--use-ck-attention` |
 | --- | --- | --- |
-| Cold run (model loading included) | 173.0 s | 105.6 s |
-| Warm runs (new seed) | 139.5 s, 143.8 s | 73.9 s, 75.5 s |
-| Sampling | 26.7-28.1 s/it | 10.7-10.8 s/it |
-| Peak VRAM | 5.2 GB | 3.5 GB |
+| Cold run (model loading included) | 173.0 s | 97.6 s |
+| Warm runs (new seed) | 139.5 s, 143.8 s | 66.0 s, 65.6 s |
+| Sampling | 26.7-28.1 s/it | 9.2-9.3 s/it |
+| Peak VRAM | 5.2 GB | 3.6 GB |
 
-B samples 2.5x faster and peaks 1.7 GB lower. Both images of a seed show the same
+B samples 2.9x faster and peaks 1.6 GB lower. Both images of a seed show the same
 composition.
 
 The int8_convrot models do not run in configuration A: the first sampling step fails
@@ -103,7 +106,7 @@ A B run with the GPU synchronized around each call, per 4-step image:
 
 | Op | Calls | Time | Runs on |
 | --- | --- | --- | --- |
-| ConvRot INT8 linears (`int8_linear`) | 680 | 33.8 s | rdna1, packed fp16 GEMM |
+| ConvRot INT8 linears (`int8_linear`) | 680 | 27.6 s | rdna1, packed fp16 GEMM |
 | Attention (`int8_attention_from_prequantized`) | 136 | 5.8 s | rdna1 |
 | RMS-RoPE | 136 | 0.3 s | rdna1 |
 | Unquantized linears on the GPU | 24 | under 0.1 s | torch |
@@ -142,3 +145,6 @@ sampling ratio.
 - VRAM is device-wide `mem_info_vram_used` sampled at 20 Hz, which includes PyTorch's
   caching allocator; the card holds 20 MB at idle.
 - One cold and two warm runs per configuration.
+- The GPU is power-limited under load, so its clock, and with it the sampling rate, moves
+  about 5% with temperature: the same build measured 9.2-9.4 s/it from a cool start and
+  9.6-9.9 s/it straight after a long run.

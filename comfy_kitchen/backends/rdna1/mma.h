@@ -128,39 +128,6 @@ __forceinline__ __device__ Acc software_mma(Frag a, Frag b, Acc c, Dot dot) {
     return c;
 }
 
-struct MmaFp8 {
-    using Acc = v8f;
-    using Frag = v4i;
-    static constexpr int kStepBytes = 16;
-    static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
-                                                int) {
-        return load_frag_b128(lds, row, kbyte, stride);
-    }
-    static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
-    static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
-        return software_mma(a, b, c, [] __device__(Frag av, Frag bv, float sum) {
-            const uint8_t* ap = reinterpret_cast<const uint8_t*>(&av);
-            const uint8_t* bp = reinterpret_cast<const uint8_t*>(&bv);
-#pragma unroll
-            for (int i = 0; i < 16; ++i) sum += fp8_to_float(ap[i]) * fp8_to_float(bp[i]);
-            return sum;
-        });
-    }
-    static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
-};
-
-struct MmaBf8 : MmaFp8 {
-    static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
-        return software_mma(a, b, c, [] __device__(Frag av, Frag bv, float sum) {
-            const uint8_t* ap = reinterpret_cast<const uint8_t*>(&av);
-            const uint8_t* bp = reinterpret_cast<const uint8_t*>(&bv);
-#pragma unroll
-            for (int i = 0; i < 16; ++i) sum += bf8_to_float(ap[i]) * bf8_to_float(bp[i]);
-            return sum;
-        });
-    }
-};
-
 struct MmaInt8 {
     using Acc = v8i;
     using Frag = v4i;
