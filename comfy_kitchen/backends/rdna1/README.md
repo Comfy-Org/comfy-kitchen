@@ -5,6 +5,17 @@ one target from its own copy of the HIP sources. It registers only for gfx1010,
 declines tensors on any other device, and leaves the `hip` backend and every other
 GPU untouched.
 
+## Why `rdna1` is a separate backend rather than another tier in `hip`
+
+- **gfx1010 needs different algorithms.** It has no WMMA, no dot-product instructions, no bf16 arithmetic, and is wave32. The `hip` kernels are built around WMMA tiles, so RDNA1 needs its own GEMMs (`gemm_simt.h`, the packed fp16 FMA GEMM, the implicit-GEMM conv3d) and a software tile policy for attention.
+- **`hip` has no tier it fits.** `architectures.json` has `elementwise_only`, `wmma_gfx11` and `wmma_gfx12`. A fourth, non-WMMA tier would thread `#if` branches through every GEMM and attention kernel the supported cards share.
+- **Those shared branches have already broken gfx1010 silently.** `#if GFX12 ... #else` code that assumed the else branch meant gfx11 gave wrong masked int8 attention on gfx1010. CI has no RDNA1 hardware, so every HIP port could reintroduce that class of bug.
+- **No regression risk for supported cards.** This PR changes no file under `backends/hip`. `rdna1` registers only when a gfx1010 is visible and declines tensors on any other device.
+- **The op set differs.** `rdna1` drops flash decode and GatedDeltaNet decode (they need bf16) and adds `gemm_f16_packed` and `transpose_cast`. As a separate backend, the missing ops fall through to eager via the registry instead of needing per-op arch guards inside `hip`.
+- **It is easy to drop.** `COMFY_KITCHEN_DISABLE_RDNA1=1` turns it off, and removing it is mostly deleting one directory and its tests, plus the small dispatch shim in `backends/amd.py`.
+
+**Cost:** `rdna1` starts from a copy of the HIP sources, so shared headers (`mma.h`, `hadamard.h`, `sage_common.h` and others) are duplicated, and fixes to them have to be ported by hand.
+
 ## Why use it instead of the eager backend
 
 On gfx1010 the eager backend cannot run INT8 models at all: its INT8 matmul is
