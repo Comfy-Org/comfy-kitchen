@@ -1114,3 +1114,57 @@ def test_hip_attention_rejects_invalid_prepared_mask(invalid):
             output_dtype=torch.bfloat16,
             cta_k=packed.cta_k,
         )
+
+
+@requires_int8_attention
+@pytest.mark.skipif(bool(torch.version.hip), reason="CUDA paged decode kernel")
+@pytest.mark.parametrize("seq", [1, 7])
+@pytest.mark.parametrize("circular", [False, True])
+def test_int8_decode_graph_growing_prefix_and_rollback(seq, circular):
+    from comfy_kitchen.int8_decode import Int8DecodeCache
+
+    torch.manual_seed(127)
+    batch, heads, kv_heads, capacity = 2, 24, 4, 3079
+    q = torch.randn(batch, heads, seq, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, kv_heads, capacity, 256, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    v[:, :, :512].add_(0.5)
+    cache = Int8DecodeCache(batch, kv_heads, capacity, q.device)
+    length = torch.zeros(1, device="cuda", dtype=torch.int64)
+    out, lse = cache.attend(q, length)
+    assert (out == 0).all() and torch.isneginf(lse).all()
+
+    length.fill_(1021)
+    cache.update(k, v, length, initialize=True)
+    source_k = k[:, :, :1536].contiguous() if circular else k
+    source_v = v[:, :, :1536].contiguous() if circular else v
+    reference = Int8DecodeCache(batch, kv_heads, capacity, q.device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        cache.update(source_k, source_v, length)
+        out, lse = cache.attend(q, length)
+    previous = 1021
+    # Cross page/ring boundaries, discard rows across them, then overwrite and grow again.
+    for n in [1023, 1024, 1025, 1031, 1023, 1032, 1535, 1536, 1537, 1541, 1534,
+              1543, 2047, 2048, 2049, 2055, 2047, 2056, 2559, 2560, 2561, 3071, 3072, capacity]:
+        length.fill_(n)
+        v[:, :, max(0, n - 7):n].neg_()
+        if circular:
+            # Include speculative rows BEFORE updating the committed prefix. Two source
+            # pages would clobber the previous page at the wrap; three must preserve it.
+            start, end = min(previous, n) - 7, min(capacity, n + seq)
+            slots = torch.arange(start, end, device=q.device).remainder(1536)
+            source_k.index_copy_(2, slots, k[:, :, start:end])
+            source_v.index_copy_(2, slots, v[:, :, start:end])
+        graph.replay()
+        reference.update(k, v, length, initialize=True)
+        expected, expected_lse = reference.attend(q, length)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
+        keys = k[:, :, :n].repeat_interleave(heads // kv_heads, dim=1).float()
+        values = v[:, :, :n].repeat_interleave(heads // kv_heads, dim=1).float()
+        scores = q.float() @ keys.transpose(-1, -2) / 16
+        expected = (scores.softmax(-1) @ values).transpose(1, 2).reshape_as(out)
+        assert _nrmse(out, expected) < 0.025
+        torch.testing.assert_close(lse, scores.logsumexp(-1), rtol=0, atol=0.04)
+        previous = n
