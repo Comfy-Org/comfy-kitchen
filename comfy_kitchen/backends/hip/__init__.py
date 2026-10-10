@@ -86,10 +86,16 @@ __all__ = [
     "int8_linear",
     "int8_attention_is_available",
     "flash_attention_decode_is_available",
+    "flash_attention_decode_gqa_is_available",
     "flash_decode",
+    "flash_decode_gqa",
+    "flash_decode_step_merge",
     "gated_delta_decode_fused",
     "gated_delta_decode_is_available",
     "deltanet_conv_step",
+    "gated_delta_deferred_is_available",
+    "gated_delta_decode_deferred",
+    "deltanet_conv_deferred",
     "is_available",
     "sage_int8_attend",
     "sage_int8_quantize",
@@ -2924,6 +2930,11 @@ def flash_attention_decode_is_available() -> bool:
     return has_wmma() and hasattr(_C, "flash_attention_decode")
 
 
+def flash_attention_decode_gqa_is_available() -> bool:
+    """Whether the head-first GQA decode and step-merge kernels can run here."""
+    return has_wmma() and hasattr(_C, "flash_attention_decode_gqa")
+
+
 # ---------------------------------------------------------------------------
 # GatedDeltaNet decode
 #
@@ -3035,6 +3046,90 @@ def deltanet_conv_step(
     )
 
 
+def gated_delta_deferred_is_available(key_head_dim: int = 128, value_head_dim: int = 128) -> bool:
+    """Whether the deferred-commit DeltaNet decode kernels can run here.
+
+    The deferred kernel keeps the whole [DK, DV] state in one 1024-thread block
+    the way the snapshot kernel does, so it is built for DK = DV = 128 only.
+    """
+    if not has_wmma() or not hasattr(_C, "gated_delta_decode_deferred"):
+        return False
+    return key_head_dim == _DELTA_KEY_DIM and value_head_dim == _DELTA_KEY_DIM
+
+
+def deltanet_conv_deferred(
+    proj: torch.Tensor,
+    proj_buf: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_w: torch.Tensor,
+    conv_b: torch.Tensor | None,
+    qkv_buf: torch.Tensor,
+    ctl: torch.Tensor,
+) -> bool:
+    """Deferred-commit conv step: see comfy_kitchen.gated_delta.deltanet_conv_step_deferred.
+
+    The kernel reads packed layouts, so ``proj`` must be contiguous. Returns False
+    for a shape outside the kernel's envelope, leaving every buffer untouched.
+    """
+    return _C.deltanet_conv_deferred(
+        _dl(proj),
+        _dl(proj_buf),
+        _dl(conv_state),
+        _dl(conv_w),
+        None if conv_b is None else _dl(conv_b),
+        _dl(qkv_buf),
+        _dl(ctl),
+        _stream(proj),
+    )
+
+
+def gated_delta_decode_deferred(
+    x: torch.Tensor,
+    w_a: torch.Tensor,
+    w_b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    g_decay: torch.Tensor,
+    qkv_buf: torch.Tensor,
+    gates_buf: torch.Tensor,
+    sumsq_buf: torch.Tensor,
+    ctl: torch.Tensor,
+    state: torch.Tensor,
+    out: torch.Tensor,
+    z: torch.Tensor,
+    norm_w: torch.Tensor,
+    eps: float,
+    key_dim: int,
+    num_key_heads: int,
+    scale: float,
+) -> bool:
+    """Deferred-commit decode: see comfy_kitchen.gated_delta.gated_delta_decode_deferred.
+
+    ``z`` is read packed as [B, S, Hv*DV], so a strided gate view is copied here.
+    Returns False for a shape outside the kernel's envelope, leaving ``state``,
+    ``out`` and the side buffers untouched.
+    """
+    return _C.gated_delta_decode_deferred(
+        _dl(x),
+        _dl(w_a),
+        _dl(w_b),
+        _dl(dt_bias),
+        _dl(g_decay),
+        _dl(qkv_buf),
+        _dl(gates_buf),
+        _dl(sumsq_buf),
+        _dl(ctl),
+        _dl(state),
+        _dl(out),
+        _dl(z.contiguous()),
+        _dl(norm_w),
+        float(eps),
+        key_dim,
+        num_key_heads,
+        float(scale),
+        _stream(x),
+    )
+
+
 def flash_decode(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3063,6 +3158,45 @@ def flash_decode(
         num_splits,
         _stream(q),
     )
+
+
+def flash_decode_gqa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_lengths: torch.Tensor,
+    output: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    softmax_lse_accum: torch.Tensor,
+    output_accum: torch.Tensor,
+    num_splits: int,
+) -> None:
+    """Head-first GQA decode attention into ``output``. See ops/flash_decode.hip."""
+    _C.flash_attention_decode_gqa(
+        _dl(q),
+        _dl(k),
+        _dl(v),
+        _dl(kv_lengths),
+        _dl(output),
+        _dl(softmax_lse),
+        _dl(softmax_lse_accum),
+        _dl(output_accum),
+        num_splits,
+        _stream(q),
+    )
+
+
+def flash_decode_step_merge(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    merged: torch.Tensor,
+) -> None:
+    """Fold the current step's rows causally into a prefix-only decode result. See ops/flash_decode.hip."""
+    _C.flash_attention_decode_step_merge(
+        _dl(out), _dl(lse), _dl(q), _dl(k), _dl(v), _dl(merged), _stream(q))
 
 
 def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):

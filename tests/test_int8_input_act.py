@@ -381,3 +381,60 @@ class TestRmsNormInputAct:
                 h, weight, wscale, None, torch.bfloat16,
                 convrot=True, convrot_groupsize=_GROUP, input_act="rms_norm",
             )
+
+
+class TestFusedGemvQuantizer:
+    """M=1 ConvRot decode runs the quantizer (with the activation) as the GEMV's
+    prologue. Its operands come from the same 512-thread row routine as the
+    standalone quantizer, so the fused linear must reproduce quantize -> GEMV bit
+    for bit, with or without bias and the fused residual."""
+
+    # the decoder's four GEMVs: qkv/gate_up (plain or rms_norm on K=2048), o_proj
+    # (rms-less K=2048, N=2048), down_proj (swiglu on a 2*6144 row, K=6144)
+    @pytest.mark.parametrize("act,k,n", [
+        ("none", 2048, 4096),
+        ("rms_norm", 2048, 12288),
+        ("rms_norm", 2048, 2048),
+        ("swiglu", 6144, 2048),
+        ("gelu_tanh", 6144, 512),
+        ("none", 16384, 256),  # widest K the fused route accepts (46+ KB of smem)
+    ])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_matches_quantize_then_gemv_bitwise(self, act, k, n, dtype, with_bias, seed, cuda_available):
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        in_width = 2 if act == "swiglu" else 1
+        h = torch.randn(1, k * in_width, dtype=dtype, device="cuda") * 2.0
+        w = torch.randn(k, dtype=dtype, device="cuda") if act == "rms_norm" else None
+        weight = torch.randint(-127, 127, (n, k), dtype=torch.int8, device="cuda")
+        wscale = torch.rand(n, dtype=torch.float32, device="cuda") * 0.01 + 1e-3
+        bias = torch.randn(n, dtype=dtype, device="cuda") if with_bias else None
+        act_kwargs = {"input_act": act, "input_act_weight": w, "input_act_eps": _EPS}
+
+        q, s = cuda_backend.quantize_int8_rowwise_convrot64(h, _GROUP, **act_kwargs)
+        ref = cuda_backend.int8_gemv_dequant(q, weight, s, wscale, bias, dtype)
+        got = ck.int8_linear(h, weight, wscale, bias, dtype,
+                             convrot=True, convrot_groupsize=_GROUP, **act_kwargs)
+        assert got.shape == ref.shape == (1, n)
+        assert torch.equal(got, ref), f"{act} K={k} N={n}: {(got != ref).sum().item()} mismatches"
+
+        resid = torch.randn(1, n, dtype=dtype, device="cuda")
+        one = torch.ones(n, dtype=dtype, device="cuda")
+        got_r = ck.int8_linear(h, weight, wscale, bias, dtype, residual=resid, residual_scale=one,
+                               convrot=True, convrot_groupsize=_GROUP, **act_kwargs)
+        assert torch.equal(got_r, resid + ref)
+
+    def test_swiglu_row_is_half_the_input(self, cuda_available):
+        """The activated row is K wide while the raw [gate | up] input is 2K; a
+        weight that does not match the halved width must be rejected."""
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        h = torch.randn(1, 2 * 2048, dtype=torch.bfloat16, device="cuda")
+        weight = torch.randint(-127, 127, (256, 4096), dtype=torch.int8, device="cuda")
+        wscale = torch.tensor(0.01, dtype=torch.float32, device="cuda")
+        with pytest.raises((AssertionError, RuntimeError)):
+            ck.int8_linear(h, weight, wscale, None, torch.bfloat16,
+                           convrot=True, convrot_groupsize=_GROUP, input_act="swiglu")

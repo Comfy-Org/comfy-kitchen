@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fused GatedDeltaNet decode kernels against the eager stepwise chain."""
+"""Fused GatedDeltaNet decode kernels (snapshot and deferred-commit) against the eager stepwise chain."""
 
 import pytest
 import torch
@@ -19,7 +19,10 @@ EPS = 1e-6
 
 def _conv_ref(proj, conv_state, w, b, seq):
     combined = torch.cat([conv_state, proj.transpose(1, 2)], dim=-1)
-    out = functional.silu(functional.conv1d(combined, w.reshape(C, 1, KS), b, groups=C))
+    # fp32 taps rounded once to the activation dtype before silu, the kernels' contract
+    # (cuDNN rounds a bf16 conv the same way, MIOpen does not)
+    y = functional.conv1d(combined.float(), w.float().reshape(C, 1, KS), b.float(), groups=C).to(proj.dtype)
+    out = functional.silu(y)
     snaps = torch.stack([combined[:, :, 1 + s:1 + s + KS - 1] for s in range(seq - 1)]) if seq > 1 else None
     return out, combined[:, :, seq:].contiguous(), snaps
 
@@ -128,6 +131,87 @@ class TestGatedDeltaDecodeFused:
         if seq > 1:
             assert rel_err(snaps, ref_snaps) < tol
 
+    def test_rejects_long_sequence(self):
+        seq = 9
+        conv_out = torch.randn(B, C, seq, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(B, seq, HD, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(HV, HD, device="cuda", dtype=torch.bfloat16)
+        state = torch.zeros(B, HV, DK, DV, device="cuda")
+        z = torch.zeros(B, seq, HV * DV, device="cuda", dtype=torch.bfloat16)
+        norm_w = torch.ones(DV, device="cuda", dtype=torch.bfloat16)
+        with pytest.raises(RuntimeError):
+            ck.gated_delta_decode_fused(conv_out, x, w, w, torch.zeros(HV, device="cuda"), -torch.ones(HV, device="cuda"),
+                                        state, KEY_DIM, HK, SCALE, z, norm_w, EPS)
+
+
+def _eager_step(proj, conv_state, w, b, x, w_a, w_b, dt_bias, g_decay, state, z, norm_w, seq):
+    """One eager decode over seq tokens; conv_state and state are updated in place."""
+    conv_out, new_conv_state, _ = _conv_ref(proj, conv_state, w, b, seq)
+    conv_state.copy_(new_conv_state)
+    out, _ = _decode_ref(conv_out, x, w_a, w_b, dt_bias, g_decay, state, z, norm_w, seq)
+    return out
+
+
+def _ctl(pending, parity, device):
+    """ctl = {pending, parity}"""
+    return torch.tensor([pending, parity], dtype=torch.int32, device=device)
+
+
+def _deferred_devices():
+    # the torch path on cpu always; the native kernels when a cuda device runs them
+    return ["cpu"] + (["cuda"] if ck.gated_delta_deferred_is_available() else [])
+
+
+@pytest.mark.parametrize("dev", _deferred_devices())
+class TestGatedDeltaDeferred:
+    # (tokens in the verify step, tokens the verifier accepted) per step; the
+    # committed tokens of a step are the accepted drafts plus the correction
+    STEPS = ((4, 0), (4, 3), (4, 1), (6, 5), (6, 2), (1, 0), (8, 7), (3, 0), (1, 0))
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+    def test_matches_eager_with_rollback(self, dev, dtype, seed):
+        w = torch.randn(C, 1, KS, device=dev, dtype=dtype) * 0.5
+        b = torch.randn(C, device=dev, dtype=dtype) * 0.1
+        w_a = torch.randn(HV, HD, device=dev, dtype=dtype) * 0.05
+        w_b = torch.randn(HV, HD, device=dev, dtype=dtype) * 0.05
+        dt_bias = torch.randn(HV, device=dev)
+        g_decay = -torch.rand(HV, device=dev) - 0.5
+        norm_w = torch.rand(DV, device=dev, dtype=dtype) + 0.5
+        conv_state = torch.randn(B, C, KS - 1, device=dev, dtype=dtype)
+        state = torch.randn(B, HV, DK, DV, device=dev) * 0.1
+        ref_conv_state, ref_state = conv_state.clone(), state.clone()
+
+        qkv_buf, proj_buf, gates_buf, sumsq_buf = ck.gated_delta_deferred_buffers(B, C, HV, HK, dtype, torch.device(dev))
+        ctl = torch.zeros((ck.gated_delta_ctl_ints,), dtype=torch.int32, device=dev)
+        tol = 1e-5 if dtype == torch.float32 else 5e-3
+        pending, parity = 0, 0
+        for i, (seq, accepts) in enumerate(self.STEPS):
+            proj = torch.randn(B, seq, C, device=dev, dtype=dtype)
+            x = torch.randn(B, seq, HD, device=dev, dtype=dtype)
+            z = torch.randn(B, seq, HV * DV, device=dev, dtype=dtype)
+
+            ctl.copy_(_ctl(pending, parity, device=dev))
+            ck.deltanet_conv_step_deferred(proj, conv_state, w, b, proj_buf, qkv_buf, ctl)
+            got = ck.gated_delta_decode_deferred(x, w_a, w_b, dt_bias, g_decay, state, KEY_DIM, HK, SCALE,
+                                                 z, norm_w, EPS, qkv_buf, gates_buf, sumsq_buf, ctl)
+            # the kernel committed the previous step's accepted tokens: state must match the eager commit
+            assert torch.equal(conv_state, ref_conv_state), f"step {i}: conv state"
+            assert rel_err(state, ref_state) < tol, f"step {i}: recurrent state"
+
+            # outputs of all seq tokens from the committed state, computed eagerly on a scratch copy
+            ref_out = _eager_step(proj, ref_conv_state.clone(), w, b, x, w_a, w_b, dt_bias, g_decay,
+                                  ref_state.clone(), z, norm_w, seq)
+            assert rel_err(got.float(), ref_out.float()) < tol, f"step {i}: out"
+
+            # eager commit of the accepted drafts + correction token
+            pending = accepts + 1
+            _eager_step(proj[:, :pending], ref_conv_state, w, b, x[:, :pending], w_a, w_b, dt_bias, g_decay,
+                        ref_state, z[:, :pending], norm_w, pending)
+            parity ^= 1
+
+
+@pytest.mark.skipif(not ck.gated_delta_decode_is_available(), reason="fused DeltaNet decode kernels unavailable")
+class TestGatedDeltaFusedLimits:
     def test_rejects_long_sequence(self):
         seq = 9
         conv_out = torch.randn(B, C, seq, device="cuda", dtype=torch.bfloat16)
