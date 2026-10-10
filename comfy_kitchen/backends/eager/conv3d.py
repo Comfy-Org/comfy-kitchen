@@ -34,6 +34,19 @@ def fp16_conv3d_out(
     out.copy_(fp16_conv3d(x, weight, bias, residual, stride))
 
 
+def fp16_packed_conv3d(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    dilation: list[int],
+) -> Tensor:
+    """3D conv with zero padding in x's dtype."""
+    return functional.conv3d(x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype),
+                             stride=stride, padding=padding, dilation=dilation)
+
+
 @torch.library.custom_op("comfy_kitchen::fp16_conv3d_out", mutates_args=("out",))
 def _op_fp16_conv3d_out(
     x: torch.Tensor,

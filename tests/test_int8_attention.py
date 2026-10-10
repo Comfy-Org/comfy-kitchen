@@ -93,7 +93,10 @@ def test_int8_attention_hip_dispatch_follows_matrix_cores(monkeypatch, has_wmma)
     if not getattr(torch.version, "hip", None):
         pytest.skip("requires a ROCm PyTorch runtime")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(sage_attention_module._hip_backend, "has_wmma", lambda: has_wmma)
+    monkeypatch.setattr(
+        sage_attention_module._hip_backend_for(None), "int8_attention_is_available",
+        lambda: has_wmma,
+    )
     assert sage_attention_module.is_available() is has_wmma
 
 
@@ -809,7 +812,7 @@ def test_hip_dense_mask_empty_tiles(head_dim, mask_dtype, kv_length):
 @pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_hip_compact_dense_bool_rejects_additive_mask(dtype):
-    hip = sage_attention_module._hip_backend
+    hip = sage_attention_module._hip_backend_for(None)
     mask = torch.zeros(1, 1, 17, 65, device="cuda", dtype=dtype)
     output = torch.full((1, 1, 2, 2, 32), 17, device="cuda", dtype=torch.int32)
     with pytest.raises(RuntimeError, match="bit-packed preparation requires a Boolean mask"):
@@ -824,7 +827,7 @@ def test_hip_compact_dense_bool_rejects_additive_mask(dtype):
 @pytest.mark.parametrize("mask_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("strided", [False, True])
 def test_hip_dense_16_preparation_preserves_finite_bits(mask_dtype, strided):
-    hip = sage_attention_module._hip_backend
+    hip = sage_attention_module._hip_backend_for(None)
     torch.manual_seed(184)
     storage = torch.randn(2, 3, 17, 130, device="cuda", dtype=mask_dtype)
     mask = storage[..., ::2] if strided else storage[..., :65].contiguous()
@@ -922,7 +925,7 @@ def test_hip_dense_16_preserves_constant_values(head_dim, dtype, mask_dtype, sca
 def test_hip_fused_dense_mask_matches_snapshot(
     head_dim, dtype, mask_dtype, lengths, mask_shape, monkeypatch
 ):
-    hip = sage_attention_module._hip_backend
+    hip = sage_attention_module._hip_backend_for(None)
     q_length, kv_length = lengths
     torch.manual_seed(187)
     q, k, v = _qkv(2, 4, 2, q_length, kv_length, head_dim, dtype)
@@ -995,7 +998,7 @@ def test_hip_fused_dense_mask_graph_reads_updated_bias(head_dim, mask_dtype):
      "output_cpu", "missing", "broadcast", "alignment"],
 )
 def test_hip_fused_dense_mask_rejects_invalid_buffers(invalid):
-    hip = sage_attention_module._hip_backend
+    hip = sage_attention_module._hip_backend_for(None)
     q, k, v = _qkv(1, 4, 2, 17, 65, 64)
     buffers, anchors = hip._sage_buffers(q, k, 64)
     output = torch.empty(q.shape, device="cuda", dtype=q.dtype)
@@ -1036,7 +1039,7 @@ def test_hip_fused_dense_mask_rejects_invalid_buffers(invalid):
 @pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
 @pytest.mark.parametrize("invalid", ["input_dtype", "output_dtype", "width", "stride", "cpu"])
 def test_hip_prepare_dense_bool_rejects_invalid_buffers(invalid):
-    hip = sage_attention_module._hip_backend
+    hip = sage_attention_module._hip_backend_for(None)
     mask = torch.ones(1, 1, 17, 65, device="cuda", dtype=torch.bool)
     output = torch.full((1, 1, 2, 2, 32), 17, device="cuda", dtype=torch.int32)
     if invalid == "input_dtype":
@@ -1061,7 +1064,7 @@ def test_hip_prepare_dense_bool_rejects_invalid_buffers(invalid):
 @pytest.mark.skipif(not torch.version.hip, reason="HIP prepared-mask binding")
 @pytest.mark.parametrize("invalid", ["input_dtype", "output_dtype", "width", "stride", "cpu"])
 def test_hip_prepare_key_mask_rejects_invalid_buffers(invalid):
-    hip = sage_attention_module._hip_backend
+    hip = sage_attention_module._hip_backend_for(None)
     mask = torch.zeros(1, 1, 1, 1153, device="cuda")
     width = ((19 * 65 + 3) // 4) * 4
     output = torch.full((1, 1, width), 17.0, device="cuda")
@@ -1102,7 +1105,7 @@ def test_hip_attention_rejects_invalid_prepared_mask(invalid):
     else:
         mask = mask.cpu()
     with pytest.raises(RuntimeError, match=r"prepared key mask|mask must be on q's ROCm device"):
-        sage_attention_module._hip_backend.sage_int8_attend(
+        sage_attention_module._hip_backend_for(None).sage_int8_attend(
             packed.q,
             packed.k,
             packed.v,
@@ -1114,3 +1117,62 @@ def test_hip_attention_rejects_invalid_prepared_mask(invalid):
             output_dtype=torch.bfloat16,
             cta_k=packed.cta_k,
         )
+
+
+requires_block_sparse = pytest.mark.skipif(
+    not (_CUDA_READY and ck.int8_block_sparse_attention_is_available(torch.device("cuda", 0))),
+    reason="block-sparse INT8 attention runs on the rdna1 backend (gfx1010) only",
+)
+
+
+def _block_mask(lut, block_q, q_length, kv_length):
+    tiles = torch.zeros(*lut.shape[:3], (kv_length + 63) // 64, dtype=torch.bool, device=lut.device)
+    tiles.scatter_(-1, lut.long(), True)
+    return tiles.repeat_interleave(block_q, 2)[:, :, :q_length].repeat_interleave(64, 3)[..., :kv_length]
+
+
+@requires_block_sparse
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("block_q", [64, 128])
+@pytest.mark.parametrize("kv_heads", [4, 2])
+def test_block_sparse_matches_masked_reference(head_dim, block_q, kv_heads):
+    torch.manual_seed(191)
+    q, k, v = _qkv(2, 4, kv_heads, 1000, 1100, head_dim, torch.float16)
+    tiles, q_blocks = (1100 + 63) // 64, (1000 + block_q - 1) // block_q
+    # distinct tiles per row, the partial last tile included
+    lut = torch.stack([
+        torch.cat([torch.tensor([tiles - 1]), torch.randperm(tiles - 1)[:4]])
+        for _ in range(2 * 4 * q_blocks)
+    ]).view(2, 4, q_blocks, 5).int().cuda()
+
+    actual = ck.int8_block_sparse_attention(q, k, v, lut, block_q=block_q)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.float(),
+        k.float().repeat_interleave(4 // kv_heads, dim=1),
+        v.float().repeat_interleave(4 // kv_heads, dim=1),
+        attn_mask=_block_mask(lut, block_q, 1000, 1100),
+    )
+    assert torch.isfinite(actual).all()
+    assert _nrmse(actual, expected) < 0.03
+
+
+@requires_block_sparse
+@pytest.mark.parametrize("block_q", [64, 128])
+def test_block_sparse_over_every_tile_is_dense(block_q):
+    torch.manual_seed(192)
+    q, k, v = _qkv(1, 4, 4, 300, 257, 128, torch.float16)
+    tiles = torch.arange(5, dtype=torch.int32, device="cuda")
+    lut = tiles.expand(1, 4, (300 + block_q - 1) // block_q, 5).contiguous()
+
+    dense = ck.int8_attention(q, k, v)
+    assert torch.equal(ck.int8_block_sparse_attention(q, k, v, lut, block_q=block_q), dense)
+    reversed_order = ck.int8_block_sparse_attention(q, k, v, lut.flip(-1).contiguous(), block_q=block_q)
+    assert _nrmse(reversed_order, dense) < 0.005
+
+
+@requires_block_sparse
+def test_block_sparse_rejects_lut_for_another_block_size():
+    q, k, v = _qkv(1, 4, 4, 300, 257, 128, torch.float16)
+    lut = torch.zeros(1, 4, 3, 2, dtype=torch.int32, device="cuda")  # 3 blocks fit block_q=128
+    with pytest.raises(RuntimeError, match="lut must be int32"):
+        ck.int8_block_sparse_attention(q, k, v, lut, block_q=64)
