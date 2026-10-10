@@ -64,7 +64,9 @@ __global__ __launch_bounds__(kScaleThreads) void scale_rows_to_f16_kernel(
         // rounding this pass adds is fp32 or bf16 -> fp16, whose 11-bit mantissa keeps
         // more of x than bf16's 8. e < 0 (a row of small values) scales the row up, which
         // keeps it out of fp16's subnormal range. An all-zero row (ratio 0) keeps e = 0.
-        const float ratio = amax * w_amax[0] * kStageProducts / kStageSumLimit;
+        // Weights small enough that the stage sums allow a scaled row above fp16's range
+        // (w_amax * kStageProducts < 1) bound the row itself by kStageSumLimit instead.
+        const float ratio = amax * fmaxf(w_amax[0] * kStageProducts, 1.0f) / kStageSumLimit;
         const int e = ratio > 0.0f ? static_cast<int>(ceilf(log2f(ratio))) : 0;
         row_scale[blockIdx.x] = ldexpf(1.0f, e);
         row_inv = ldexpf(1.0f, -e);

@@ -54,6 +54,21 @@ def test_rows_of_any_range_stay_finite_and_accurate(cuda_available):
         assert _nrmse(out[row], expected[row]) < 2e-3
 
 
+def test_small_weights_keep_scaled_rows_in_fp16_range(cuda_available):
+    if not cuda_available:
+        pytest.skip("CUDA required")
+    torch.manual_seed(2)
+    x = torch.randn(64, 2048, device="cuda")
+    x[0] *= 1e6
+    w = (torch.randn(256, 2048, device="cuda") * 1e-4).half()  # stage sums alone would scale rows past fp16
+    out = ck.fp16_packed_linear(x, w, out_dtype=torch.float32)
+    expected = _reference(x, w, None)
+
+    assert torch.isfinite(out).all()
+    for row in (0, 1):
+        assert _nrmse(out[row], expected[row]) < 2e-3
+
+
 @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_output_dtypes_and_given_weight_amax(out_dtype, cuda_available):
     if not cuda_available:
