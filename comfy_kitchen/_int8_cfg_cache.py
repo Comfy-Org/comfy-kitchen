@@ -88,15 +88,15 @@ def _load() -> None:
     except (OSError, json.JSONDecodeError) as e:
         _logger.warning("failed to load INT8 cfg cache %s: %s", path, e)
         return
+    shapes = data.get("shapes") if isinstance(data, dict) else None
+    if not isinstance(shapes, dict):
+        _logger.warning("INT8 cfg cache %s: not an object with a 'shapes' object; ignoring", path)
+        return
 
     sm = data.get("sm_version", "")
-    _cache_sm = sm or None
+    _cache_sm = sm if isinstance(sm, str) and sm else None
     sms = data.get("multiprocessor_count")
     _cache_sms = sms if type(sms) is int and sms > 0 else None
-    shapes = data.get("shapes", {})
-    if not isinstance(shapes, dict):
-        _logger.warning("INT8 cfg cache %s: 'shapes' is not an object; ignoring the file", path)
-        return
     count = 0
     skipped = 0
     for key, entry in shapes.items():

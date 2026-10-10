@@ -283,21 +283,26 @@ SHAPE_GROUPS = {
 def load_existing_table(path: Path, sm_version: str) -> dict[str, dict]:
     """Entries of an existing table at `path`, to be merged with this sweep.
 
-    A table for another SM is never merged into or overwritten: its picks are for
-    other silicon, so the caller must name a different --out.
+    A table for another SM, or a file that is not a table, is never merged into or
+    overwritten: the caller must name a different --out (or fix the file).
     """
     if not path.is_file():
         return {}
-    with path.open() as f:
-        data = json.load(f)
+    try:
+        with path.open() as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        sys.exit(f"ERROR: cannot read {path} ({e}); fix it or pass --out <new file>.")
+    shapes = data.get("shapes") if isinstance(data, dict) else None
+    if not isinstance(shapes, dict):
+        sys.exit(f"ERROR: {path} is not a sweep table (no 'shapes' object); pass --out <new file>.")
     existing_sm = data.get("sm_version")
     if existing_sm != sm_version:
         sys.exit(
             f"ERROR: {path} was swept on sm {existing_sm}, this device is sm {sm_version}; "
             f"pass --out <new file> instead of merging into it."
         )
-    shapes = data.get("shapes", {})
-    return dict(shapes) if isinstance(shapes, dict) else {}
+    return dict(shapes)
 
 
 def main() -> None:

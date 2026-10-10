@@ -66,6 +66,18 @@ def test_serves_exact_shapes_and_skips_malformed_entries(table, fake_device):
     assert len(cache._loaded) == 3
 
 
+@pytest.mark.parametrize("root", ["[1, 2, 3]", '"a table"', '{"shapes": [1]}', "{broken"])
+def test_malformed_table_is_ignored_not_raised(tmp_path, monkeypatch, fake_device, root):
+    path = tmp_path / "table.json"
+    path.write_text(root)
+    monkeypatch.setenv("COMFY_KITCHEN_INT8_CFG_CACHE", str(path))
+    cache.reset()
+    fake_device()
+    assert cache.get_cfg(1024, 4096, 4096, 2) is None
+    cache.check_m_in_swept_range(1024)
+    cache.reset()
+
+
 def test_swept_range_comes_from_the_entries(table, fake_device):
     table()
     fake_device()
