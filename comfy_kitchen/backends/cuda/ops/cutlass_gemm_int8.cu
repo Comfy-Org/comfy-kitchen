@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
 
 #ifdef COMFY_HAVE_CUTLASS
 
@@ -187,8 +188,73 @@ struct FusedInt8GemmResidual {
     }
 };
 
+namespace {
+
+// Parse an exact small non-negative integer from an env value; -1 when unset,
+// empty, or anything but digits (rejects "1junk" / " 1" / "1,2").
+int parse_forced_config_env() {
+    const char* v = std::getenv("COMFY_KITCHEN_FORCE_CUTLASS_INT8_CONFIG");
+    if (v == nullptr || *v == '\0') return -1;
+    int i = 0;
+    for (const char* p = v; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9' || i > 999) return -1;
+        i = i * 10 + (*p - '0');
+    }
+    return (i >= 0 && i <= 13) ? i : -1;
+}
+
+// COMFY_KITCHEN_FORCE_CUTLASS_INT8_CONFIG=<int> forces a config index for
+// benchmarking; -1 (no effect) when unset or not an exact 0-13 integer.
+int forced_fused_int8_config() {
+    static const int forced = parse_forced_config_env();
+    return forced;
+}
+
+// Whether the current CUDA device is sm86 (GA102 consumer Ampere, e.g. RTX 3090 /
+// A6000 / A40). Cached per device: a multi-GPU box may mix arches, so the
+// first query must not decide for all of them.
+bool device_is_sm86() {
+    using comfy_cutlass::cached_device_attribute;
+    // A minor version of 0 caches as the fallback (-1), which still is not 6.
+    return cached_device_attribute<cudaDevAttrComputeCapabilityMajor>(-1) == 8
+        && cached_device_attribute<cudaDevAttrComputeCapabilityMinor>(-1) == 6;
+}
+
+}  // namespace
+
+// cfg13's banded stream-K only bands when M has at least as many 128-row tiles as N has
+// 256-col tiles; with fewer it keeps the identity order (ThreadblockSwizzleLeanStreamKT).
+bool cfg13_bands(int m, int n) { return (m + 127) / 128 >= (n + 255) / 256; }
+
 int select_fused_int8_config(int m, int n, int k) {
     if (k % 16 != 0) return 9;
+
+    // sm86 (GA102: 84 SMs, 6 MB L2): picks measured on an A6000 at its 300 W cap on
+    // 2026-10-03 with banded stream-K, from a 14-config sweep over 38 LTX 2.5, MiniMax H3
+    // and mid-M shapes plus an interleaved sustained-load comparison of the choosers
+    // (int8_autotune_sweep.py, a6000_int8_cfg_table.json). Only the no-bias bf16 epilogue
+    // was timed; the bias, residual, fp16 and fp32 variants share these picks unmeasured.
+    // Sustained gap to the fastest config: 0.5% average, 5.7% worst, against 3.6% and 43%
+    // for the generic path (tree below, wave_guard, L2 reroute) on the same card.
+    if (device_is_sm86()) {
+        if (m > 2048) {
+            // Banded stream-K wins all 22 measured shapes above 2048 rows that band; cfg0
+            // is 2-16% slower on the 25900-80666 row layers. Shapes with more N than M
+            // tiles keep the identity order and go to the tree (4096x16384x4096: its cfg0,
+            // a 0.3% tie).
+            if (cfg13_bands(m, n)) return 13;
+        } else if (m <= 512) {
+            // The tree sends large-weight tiny-M shapes to stream-K, 17-29% slower here.
+            return (n >= 8192 && k <= 4096) ? 3 : 2;
+        } else if (m <= 1024) {
+            return 12;
+        } else {
+            if (k <= 2048) return n >= 16384 ? 0 : 1;
+            if (n >= 8192) return 0;
+            // Narrow N, tall K (1797x2048x8192): cfg1; the tree's cfg12 is 43% slower.
+            return n >= 4096 ? 12 : 1;
+        }
+    }
 
     const int64_t mn = int64_t(m) * n;
     if (n <= 24832) {
@@ -219,13 +285,18 @@ int wave_guard(int m, int n, int selected) {
 }
 
 int choose_fused_int8_config(int m, int n, int k) {
+    // A forced config wins outright: neither the wave guard, the L2 reroute below nor
+    // the launcher's fallback list may substitute another tile, so it is exactly what
+    // runs (or fails) and what cutlass_int8_selected_config reports.
+    const int forced = forced_fused_int8_config();
+    if (forced >= 0) return forced;
     const int selected = wave_guard(m, n, select_fused_int8_config(m, n, k));
     if (selected != 0 && selected != 1) return selected;
     // The identity order re-reads the activation per weight column once it outgrows L2;
     // banded stream-K does not, but only bands when M has at least as many tiles as N.
     // Measured crossovers: 66-88 MB at 96 MB L2, 42-63 MB at 36 MB.
     const int64_t reroute_bytes = std::max<int64_t>(int64_t(device_l2_bytes()) * 3 / 4, int64_t(48) << 20);
-    const bool bands = (m + 127) / 128 >= (n + 255) / 256;
+    const bool bands = cfg13_bands(m, n);
     return (bands && int64_t(m) * k > reroute_bytes) ? 13 : selected;
 }
 
@@ -233,6 +304,7 @@ template <typename Launch>
 bool launch_fused_int8_heuristic(int m, int n, int k, Launch launch) {
     const int selected = choose_fused_int8_config(m, n, k);
     if (launch(selected)) return true;
+    if (forced_fused_int8_config() >= 0) return false;  // a forced tile never falls back
 
     static constexpr int aligned_fallbacks[] = {2, 12, 0, 13, 1, 6, 8, 7, 3, 4, 5};
     static constexpr int low_alignment_fallbacks[] = {9, 10, 11};
