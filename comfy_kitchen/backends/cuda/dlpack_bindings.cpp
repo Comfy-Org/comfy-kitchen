@@ -1519,16 +1519,53 @@ void na3d(
 }
 
 // Nanobind wrappers for Sol-Attn sparse attention
+//
+// _C is importable, so none of this can assume the Python layer put it together.
+// The kernels reach q/k/v and the workspace as bare pointers sized from (B, T, H),
+// so a short buffer, or a layout the 16-byte staging loads cannot use, is an
+// out-of-bounds device access rather than an exception.
 static void check_block_len(const nb::ndarray<nb::device::cuda>& b, int64_t seq_len, const char* who) {
     if (b.dtype() != nb::dtype<int32_t>() || b.ndim() != 1 || b.stride(0) != 1 ||
         (int64_t)b.size() != (seq_len + 63) / 64)
         throw std::runtime_error(std::string(who) + ": block_len must be a contiguous 1-D int32 array of ceil(T/64) elements");
 }
 
-static void need_elems(const nb::ndarray<nb::device::cuda>& a, int64_t n, const char* who, const char* what) {
+template <typename A>
+static void need_contiguous(const A& a, const char* who, const char* what) {
+    int64_t expect = 1;
+    for (int i = (int)a.ndim() - 1; i >= 0; --i) {
+        if (a.shape(i) > 1 && a.stride(i) != expect)
+            throw std::runtime_error(std::string(who) + ": " + what + " must be contiguous");
+        expect *= (int64_t)a.shape(i);
+    }
+}
+// The kernels read these as packed arrays of one dtype, so an element count on
+// its own is not enough: a narrower dtype makes the buffer shorter in bytes than
+// the kernel reads, and a strided view of the right count is accessed as though
+// it were packed. `code` is a map_dtype_to_code value.
+static void need_elems(const nb::ndarray<nb::device::cuda>& a, int64_t n, int code, const char* who,
+                       const char* what) {
     if ((int64_t)a.size() != n)
         throw std::runtime_error(std::string(who) + ": " + what + " must have " + std::to_string(n)
                                  + " elements, got " + std::to_string(a.size()));
+    if (map_dtype_to_code(a.dtype()) != code)
+        throw std::runtime_error(std::string(who) + ": " + what + " has an unsupported dtype");
+    need_contiguous(a, who, what);
+}
+// Extents size every workspace slot and every grid, and they reach the kernels as
+// plain ints. A non-positive one plans a workspace nothing checks again.
+static void need_extents(int64_t batch, int64_t seq_len, int64_t num_heads, const char* who) {
+    if (batch <= 0 || seq_len <= 0 || num_heads <= 0)
+        throw std::runtime_error(std::string(who) + ": batch, seq_len and num_heads must all be positive");
+}
+// Both sinks are half-open [start, end) block ranges, mirroring
+// sol_attn_common_call_rule on the Python side. A negative start would make the
+// routing kernel emit that many extra list entries, wrapped to huge uint16 block
+// ids, and overrun the per-query row.
+static void need_sinks(int64_t start, int64_t end, const char* who, const char* what) {
+    if (start < 0 || end < 0 || end < start)
+        throw std::runtime_error(std::string(who) + ": " + what
+                                 + " must be a [start, end) range with 0 <= start <= end");
 }
 static void need_workspace(const nb::ndarray<nb::device::cuda>& ws, int64_t batch, int64_t seq_len,
                            int64_t num_heads, int64_t token_aug, const char* who) {
@@ -1536,6 +1573,12 @@ static void need_workspace(const nb::ndarray<nb::device::cuda>& ws, int64_t batc
     const int n = sol_attn_plan((int)batch, (int)seq_len, (int)num_heads, (int)token_aug, v, 48);
     if (n > 48 || (int64_t)ws.size() < v[n - 1])   // last slot is "total"
         throw std::runtime_error(std::string(who) + ": workspace too small for this shape");
+    // sol_attn_plan reports byte offsets and the Python layer slices the workspace
+    // with them to read the block means back out, so a workspace of anything but
+    // bytes reads the wrong slots. The size check above already bounds the
+    // allocation, since no element is narrower than a byte; this pins the units.
+    if (map_dtype_to_code(ws.dtype()) != 3)
+        throw std::runtime_error(std::string(who) + ": workspace must be a uint8 array");
 }
 // q/k/v/out element code for launch_sol_attn: 0 = bfloat16, 1 = float16, -1 = neither
 static int sol_elem_code(const nb::ndarray<nb::device::cuda>& a) {
@@ -1559,15 +1602,6 @@ static void need_staging_layout(const nb::ndarray<nb::device::cuda>& a, const ch
     if (!ok)
         throw std::runtime_error(std::string(who) + ": " + what
             + " must have a contiguous last dim, a 16-byte aligned base and leading strides that are multiples of 8");
-}
-template <typename A>
-static void need_contiguous(const A& a, const char* who, const char* what) {
-    int64_t expect = 1;
-    for (int i = (int)a.ndim() - 1; i >= 0; --i) {
-        if (a.shape(i) > 1 && a.stride(i) != expect)
-            throw std::runtime_error(std::string(who) + ": " + what + " must be contiguous");
-        expect *= (int64_t)a.shape(i);
-    }
 }
 
 // Workspace dims and slot byte offsets, from the C++ Plan (the one definition).
@@ -1597,8 +1631,11 @@ void sol_attn(
     bool tail = true, int64_t token_aug = 0)
 {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
-        throw std::runtime_error("sol_attn: threshold must have B*H*ceil(T/64) elements");
+    need_extents(batch, seq_len, num_heads, "sol_attn");
+    need_sinks(sink_start, sink_end, "sol_attn", "sink_blocks");
+    need_sinks(sink_q_start, sink_q_end, "sol_attn", "sink_q");
+    if (threshold)
+        need_elems(*threshold, batch * num_heads * ((seq_len + 63) / 64), 0, "sol_attn", "threshold");
     if (block_len) check_block_len(*block_len, seq_len, "sol_attn");
     const int elem = sol_elem_code(q);
     if (elem < 0) throw std::runtime_error("sol_attn: q must be bfloat16 or float16");
@@ -1611,7 +1648,7 @@ void sol_attn(
     need_staging_layout(v, "sol_attn", "v");
     need_contiguous(out, "sol_attn", "out");
     need_workspace(workspace, batch, seq_len, num_heads, token_aug, "sol_attn");
-    if (key_bias) need_elems(*key_bias, batch * seq_len, "sol_attn", "key_bias");
+    if (key_bias) need_elems(*key_bias, batch * seq_len, 0, "sol_attn", "key_bias");
     // Explicit strides: only the last dim must be contiguous (BHND views go in as-is).
     launch_sol_attn(
         q.data(), k.data(), v.data(), out.data(), workspace.data(),
@@ -1629,6 +1666,8 @@ void sol_attn(
 void sol_producer_begin_py(nb::ndarray<nb::device::cuda> workspace,
                            int64_t batch, int64_t seq_len, int64_t num_heads,
                            uintptr_t stream_ptr, int64_t token_aug = 0) {
+    need_extents(batch, seq_len, num_heads, "sol_producer_begin");
+    need_workspace(workspace, batch, seq_len, num_heads, token_aug, "sol_producer_begin");
     sol_producer_begin(workspace.data(), (int)batch, (int)seq_len,
                        (int)num_heads, (int)token_aug, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
@@ -1642,6 +1681,7 @@ void sol_producer_chunk_py(
     int64_t batch, int64_t seq_len, int64_t num_heads,
     uintptr_t stream_ptr,
     std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt, int64_t token_aug = 0) {
+    need_extents(batch, seq_len, num_heads, "sol_producer_chunk");
     if (batch != 1)
         throw std::runtime_error("sol_producer_chunk: the producer path is B=1 only");
     if (rot_dim <= 0 || rot_dim > 128 || rot_dim % 8)
@@ -1650,12 +1690,12 @@ void sol_producer_chunk_py(
         throw std::runtime_error("sol_producer_chunk: chunk [t0, t0 + m) must lie in [0, seq_len] with a 64-aligned start");
     if (block_len) check_block_len(*block_len, seq_len, "sol_producer_chunk");
     need_workspace(workspace, batch, seq_len, num_heads, token_aug, "sol_producer_chunk");
-    need_elems(qkv, m * 3 * num_heads * 128, "sol_producer_chunk", "qkv");
-    need_elems(fab, seq_len * rot_dim * 2, "sol_producer_chunk", "fab");
-    need_elems(qw, 128, "sol_producer_chunk", "qw");
-    need_elems(kw, 128, "sol_producer_chunk", "kw");
-    need_elems(kmean, batch * num_heads * 128, "sol_producer_chunk", "kmean");
-    need_elems(vscale, batch * num_heads * 128, "sol_producer_chunk", "vscale");
+    need_elems(qkv, m * 3 * num_heads * 128, 2, "sol_producer_chunk", "qkv");
+    need_elems(fab, seq_len * rot_dim * 2, 0, "sol_producer_chunk", "fab");
+    need_elems(qw, 128, 2, "sol_producer_chunk", "qw");
+    need_elems(kw, 128, 2, "sol_producer_chunk", "kw");
+    need_elems(kmean, batch * num_heads * 128, 0, "sol_producer_chunk", "kmean");
+    need_elems(vscale, batch * num_heads * 128, 0, "sol_producer_chunk", "vscale");
     sol_producer_chunk(workspace.data(), qkv.data(), fab.data(), qw.data(),
                        kw.data(), kmean.data(), vscale.data(),
                        block_len ? block_len->data() : nullptr,
@@ -1675,15 +1715,18 @@ void sol_attn_core_py(
     std::optional<nb::ndarray<nb::device::cuda>> threshold = std::nullopt,
     std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt,
     bool tail = true, int64_t token_aug = 0) {
+    need_extents(batch, seq_len, num_heads, "sol_attn_core");
+    need_sinks(sink_start, sink_end, "sol_attn_core", "sink_blocks");
+    need_sinks(sink_q_start, sink_q_end, "sol_attn_core", "sink_q");
     const int64_t stats = batch * num_heads * 128;
-    if ((int64_t)vscale.size() != stats || (int64_t)kmean_next.size() != stats ||
-        (int64_t)vamax_out.size() != stats)
-        throw std::runtime_error("sol_attn_core: vscale/kmean_next/vamax_out must have B*H*128 elements");
-    if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
-        throw std::runtime_error("sol_attn_core: threshold must have B*H*ceil(T/64) elements");
+    need_elems(vscale, stats, 0, "sol_attn_core", "vscale");
+    need_elems(kmean_next, stats, 0, "sol_attn_core", "kmean_next");
+    need_elems(vamax_out, stats, 0, "sol_attn_core", "vamax_out");
+    if (threshold)
+        need_elems(*threshold, batch * num_heads * ((seq_len + 63) / 64), 0, "sol_attn_core", "threshold");
     if (block_len) check_block_len(*block_len, seq_len, "sol_attn_core");
     need_workspace(workspace, batch, seq_len, num_heads, token_aug, "sol_attn_core");
-    need_elems(out, batch * seq_len * num_heads * 128, "sol_attn_core", "out");
+    need_elems(out, batch * seq_len * num_heads * 128, 2, "sol_attn_core", "out");
     launch_sol_attn_core(
         workspace.data(), out.data(), vscale.data(), kmean_next.data(), vamax_out.data(),
         block_len ? block_len->data() : nullptr, tail ? 1 : 0,
