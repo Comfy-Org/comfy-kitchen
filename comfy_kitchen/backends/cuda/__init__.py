@@ -2584,6 +2584,9 @@ def na3d(
 
 _SOL_HD = 128
 _SOL_VSCALE_MARGIN = 1.1   # clip headroom on last step's V absmax
+# Slice sizes that bound sol_attn's top-k temporaries
+_SOL_TOPK_SLICE_BYTES = 64 << 20
+_SOL_MEAN_SLICE_ROWS = 128 * 64   # whole 64-token blocks
 
 
 def _topk_from_pooled(c8, csc, kc, topk_ratio, log2s, sinks):
@@ -2597,15 +2600,22 @@ def _topk_from_pooled(c8, csc, kc, topk_ratio, log2s, sinks):
     n = kc.shape[1]
     ksc = (kc.abs().amax(-1, True) / 127.0).clamp_min(1e-12)     # prep_pooled_quant
     k8 = torch.round(kc / ksc).clamp_(-127, 127)
-    s = torch.bmm(c8, k8.transpose(1, 2))     # integer dot, exact in fp32
-    s = s * (csc * log2s).unsqueeze(-1) * ksc.squeeze(-1).unsqueeze(-2)
     s0, s1 = sinks
-    if s1 > s0:
-        s[..., s0:s1] = float("-inf")
     kk = _topk_count(n - _sink_count(n, s0, s1), topk_ratio)
     if kk == 0:   # nothing beyond the forced blocks: a threshold no finite score clears
-        return torch.full(s.shape[:-1], float("inf"), device=s.device, dtype=s.dtype)
-    kth = s.topk(kk, dim=-1, sorted=False).values.min(-1).values
+        return torch.full(c8.shape[:-1], float("inf"), device=c8.device, dtype=c8.dtype)
+    # Head slices, scaled in place: the whole [BH, N, N] scores spilled a 10 GB card at 109k tokens
+    step = max(1, _SOL_TOPK_SLICE_BYTES // (n * n * c8.element_size()))
+    row_scale = (csc * log2s).unsqueeze(-1)
+    col_scale = ksc.squeeze(-1).unsqueeze(-2)
+    kth = torch.empty(c8.shape[:-1], device=c8.device, dtype=c8.dtype)
+    for a in range(0, c8.shape[0], step):
+        b = a + step
+        s = torch.bmm(c8[a:b], k8[a:b].transpose(1, 2))     # integer dot, exact in fp32
+        s.mul_(row_scale[a:b]).mul_(col_scale[a:b])
+        if s1 > s0:
+            s[..., s0:s1] = float("-inf")
+        kth[a:b] = s.topk(kk, dim=-1, sorted=False).values.min(-1).values
     # backed off a few ulps: this replica of the kernel's scores is not bit-exact
     return (kth - kth.abs() * 1e-5).contiguous()
 
@@ -2623,12 +2633,18 @@ def _block_means(x, lengths=None, valid=None):
             tail = x[:, full:].sum(1, keepdim=True, dtype=torch.float32) / (t - full)
             m = torch.cat([m, tail], dim=1)
     else:
-        if valid is not None:
-            x = x * valid.view(1, -1, 1, 1).to(x.dtype)
-        m = x[:, :full].view(b, -1, 64, h, d).sum(2, dtype=torch.float32)
-        if full != t:
-            m = torch.cat([m, x[:, full:].sum(1, keepdim=True, dtype=torch.float32)], dim=1)
-        m = m / lengths.view(1, -1, 1, 1)
+        # masked in slices, not one full copy of x
+        parts = []
+        for a in range(0, t, _SOL_MEAN_SLICE_ROWS):
+            xs = x[:, a:a + _SOL_MEAN_SLICE_ROWS]
+            if valid is not None:
+                xs = xs * valid[a:a + _SOL_MEAN_SLICE_ROWS].view(1, -1, 1, 1).to(x.dtype)
+            f = (xs.shape[1] // 64) * 64
+            if f:
+                parts.append(xs[:, :f].view(b, -1, 64, h, d).sum(2, dtype=torch.float32))
+            if f != xs.shape[1]:
+                parts.append(xs[:, f:].sum(1, keepdim=True, dtype=torch.float32))
+        m = torch.cat(parts, dim=1) / lengths.view(1, -1, 1, 1)
     return m.permute(0, 2, 1, 3).reshape(b * h, -1, d)
 
 
@@ -2765,8 +2781,6 @@ def sol_attn(
                     f"is not a multiple of 8, so the 16-byte staging loads would "
                     f"be misaligned; call .contiguous() on it")
     sb, sq = _sink_pair(sink_blocks), _sink_pair(sink_q)
-    thr = (_topk_threshold(q, k, topk_ratio, scale, mean_lengths, valid, sb)
-           if topk_ratio else None)
     kb = None
     if key_bias is not None:
         # exact branch only, in log2 units; biased blocks must be sink-covered
@@ -2775,6 +2789,9 @@ def sol_attn(
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug))
     workspace = torch.empty(p["total"], dtype=torch.uint8, device=q.device)
+    # after the large buffers so its temporaries don't fragment the cache they reuse
+    thr = (_topk_threshold(q, k, topk_ratio, scale, mean_lengths, valid, sb)
+           if topk_ratio else None)
     _C.sol_attn(
         _wrap_for_dlpack(q),
         _wrap_for_dlpack(k),
@@ -2885,11 +2902,12 @@ def sol_attn_chunked(
     vscale = vscale.to(device=dev, dtype=torch.float32).clamp_min(1e-8).contiguous()
     produce(kmean, vscale)
     sb, sq = _sink_pair(sink_blocks), _sink_pair(sink_q)
-    threshold = (_topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sb)
-                 if topk_ratio else None)
     out = torch.empty(1, t, h, d, dtype=torch.bfloat16, device=dev)
     kmean_next = torch.empty(h, d, device=dev, dtype=torch.float32)
     vamax = torch.empty(h, d, device=dev, dtype=torch.float32)
+    # after out, as in sol_attn
+    threshold = (_topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sb)
+                 if topk_ratio else None)
     _C.sol_attn_core(
         _wrap_for_dlpack(ws), _wrap_for_dlpack(out), _wrap_for_dlpack(vscale),
         _wrap_for_dlpack(kmean_next), _wrap_for_dlpack(vamax),

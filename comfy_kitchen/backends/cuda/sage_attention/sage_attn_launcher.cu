@@ -74,6 +74,27 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
   }
 }
 
+// Compute capability (major * 10 + minor), cached per device.
+int current_device_sm() {
+  static int cached[64] = {};
+  int device = 0;
+  cudaError_t error = cudaGetDevice(&device);
+  const bool cacheable = error == cudaSuccess && device >= 0 && device < 64;
+  if (cacheable && cached[device] != 0) return cached[device];
+  int major = 0, minor = 0;
+  if (error == cudaSuccess)
+    error = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  if (error == cudaSuccess)
+    error = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+  if (error != cudaSuccess)
+    throw std::runtime_error(std::string("sage_attn device query failed: ") +
+                             cudaGetErrorString(error));
+  if (cacheable) cached[device] = major * 10 + minor;
+  return major * 10 + minor;
+}
+
+bool is_ampere(int sm) { return sm >= 80 && sm < 89; }
+
 } // anonymous namespace
 
 extern "C" void launch_sage_attn_kernel(
@@ -198,6 +219,18 @@ extern "C" void launch_sage_attn_kernel(
     LAUNCH_Q(HD, CK, MaskMode::kPreparedKey, nv_bfloat16, true, CQ);             \
   }
 
+  // Ampere: 64-row tiles fit two CTAs per SM, 2-4% faster on a 3080 up to 38k keys. Longer
+  // sequences lose: each CTA re-reads K/V, which costs power (6-22% slower on a 300 W A6000).
+  if (mask == nullptr && head_dim == 128 && cta_k == 128 && kv_len <= 40960 &&
+      is_ampere(current_device_sm())) {
+    if (output_dtype_code == 1) {
+      LAUNCH_Q(128, 128, MaskMode::kNone, half, true, 64);
+    } else {
+      LAUNCH_Q(128, 128, MaskMode::kNone, nv_bfloat16, true, 64);
+    }
+    return;
+  }
+
   // Keep smaller unmasked query tiles limited to Blackwell image shapes.
   // Ada retains 128-query tiles: warmed ComfyUI workloads regress with the
   // smaller tiles under stock-clock thermal throttling.
@@ -252,21 +285,11 @@ extern "C" void launch_sage_attn_kernel(
       return;
     }
     // Q scales retain their original 128-row groups for either query tile.
-    int device, major, minor = 0;
-    cudaError_t error = cudaGetDevice(&device);
-    if (error == cudaSuccess) {
-      error = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-    }
-    if (error == cudaSuccess && major == 8) {
-      error = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
-    }
-    if (error != cudaSuccess) {
-      throw std::runtime_error(std::string("sage_attn device query failed: ") +
-                               cudaGetErrorString(error));
-    }
-    const bool smaller_ada_tile = major == 8 && minor == 9 &&
+    const int sm = current_device_sm();
+    const bool smaller_ada_tile = sm == 89 &&
         qo_len >= 4096 && qo_len <= 16896 && kv_len >= 4096 && kv_len <= 16896;
-    if (major >= 10 || smaller_ada_tile) {
+    // Ampere: 7-9% faster with a key mask, at any length
+    if (sm >= 100 || smaller_ada_tile || is_ampere(sm)) {
       DISPATCH_PREPARED(128, 128, 64);
     } else {
       DISPATCH_PREPARED(128, 128, 128);
