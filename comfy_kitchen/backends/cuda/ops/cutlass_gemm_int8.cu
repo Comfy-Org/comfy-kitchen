@@ -226,35 +226,39 @@ bool device_is_sm86() {
 // 256-col tiles; with fewer it keeps the identity order (ThreadblockSwizzleLeanStreamKT).
 bool cfg13_bands(int m, int n) { return (m + 127) / 128 >= (n + 255) / 256; }
 
+// sm86 (fitted on an A6000: GA102, 84 SMs, 6 MB L2, 300 W cap): the measured pick, or
+// -1 to defer to the generic tree. Fitted on 2026-10-03 with banded stream-K from a
+// 14-config sweep over 45 LTX 2.5, MiniMax H3, Wan 2.2 and mid-M shapes, M 274-161920,
+// K 2048-16384 (samples/int8_autotune_sweep.py times the configs themselves and writes
+// a6000_int8_cfg_table.json); a separate interleaved sustained-load run then scored
+// each chooser's pick against the per-shape winner. Only the no-bias bf16 epilogue was
+// timed; the bias, residual, fp16 and fp32 variants share these picks unmeasured.
+// Sustained gap to the fastest config: 0.5% average, 5.7% worst, against 3.6% and 43%
+// for the generic path (tree, wave_guard, L2 reroute) on the same card. Every sm86 die
+// takes this branch; smaller ones (GA104/GA106: fewer SMs, 3-4 MB L2) are unmeasured.
+int sm86_fused_int8_config(int m, int n, int k) {
+    if (k % 16 != 0 || !device_is_sm86()) return -1;
+    if (m > 2048) {
+        // Banded stream-K wins all 22 measured shapes above 2048 rows that band; cfg0
+        // is 2-16% slower on the 25900-80666 row layers. Shapes with more N than M
+        // tiles keep the identity order and go to the tree (4096x16384x4096: its cfg0,
+        // a 0.3% tie).
+        return cfg13_bands(m, n) ? 13 : -1;
+    }
+    // The tree sends large-weight tiny-M shapes to stream-K, 17-29% slower here.
+    if (m <= 512) return (n >= 8192 && k <= 4096) ? 3 : 2;
+    if (m <= 1024) return 12;
+    if (k <= 2048) return n >= 16384 ? 0 : 1;
+    if (n >= 8192) return 0;
+    // Narrow N, tall K (1797x2048x8192): cfg1; the tree's cfg12 is 43% slower.
+    return n >= 4096 ? 12 : 1;
+}
+
 int select_fused_int8_config(int m, int n, int k) {
     if (k % 16 != 0) return 9;
 
-    // sm86 (GA102: 84 SMs, 6 MB L2): picks measured on an A6000 at its 300 W cap on
-    // 2026-10-03 with banded stream-K, from a 14-config sweep over 38 LTX 2.5, MiniMax H3
-    // and mid-M shapes plus an interleaved sustained-load comparison of the choosers
-    // (int8_autotune_sweep.py, a6000_int8_cfg_table.json). Only the no-bias bf16 epilogue
-    // was timed; the bias, residual, fp16 and fp32 variants share these picks unmeasured.
-    // Sustained gap to the fastest config: 0.5% average, 5.7% worst, against 3.6% and 43%
-    // for the generic path (tree below, wave_guard, L2 reroute) on the same card.
-    if (device_is_sm86()) {
-        if (m > 2048) {
-            // Banded stream-K wins all 22 measured shapes above 2048 rows that band; cfg0
-            // is 2-16% slower on the 25900-80666 row layers. Shapes with more N than M
-            // tiles keep the identity order and go to the tree (4096x16384x4096: its cfg0,
-            // a 0.3% tie).
-            if (cfg13_bands(m, n)) return 13;
-        } else if (m <= 512) {
-            // The tree sends large-weight tiny-M shapes to stream-K, 17-29% slower here.
-            return (n >= 8192 && k <= 4096) ? 3 : 2;
-        } else if (m <= 1024) {
-            return 12;
-        } else {
-            if (k <= 2048) return n >= 16384 ? 0 : 1;
-            if (n >= 8192) return 0;
-            // Narrow N, tall K (1797x2048x8192): cfg1; the tree's cfg12 is 43% slower.
-            return n >= 4096 ? 12 : 1;
-        }
-    }
+    const int sm86 = sm86_fused_int8_config(m, n, k);
+    if (sm86 >= 0) return sm86;
 
     const int64_t mn = int64_t(m) * n;
     if (n <= 24832) {
@@ -290,6 +294,11 @@ int choose_fused_int8_config(int m, int n, int k) {
     // runs (or fails) and what cutlass_int8_selected_config reports.
     const int forced = forced_fused_int8_config();
     if (forced >= 0) return forced;
+    // The sm86 rule's picks go through wave_guard and the reroute like the tree's:
+    // measured shapes are pinned by the table before this is reached, both adjusters
+    // agree with the rule on every swept shape, and off the swept domain (e.g. K past
+    // 16384 at decoder-tile M, a 3-wave cfg1 grid) their wave and L2 reasoning is the
+    // better extrapolation.
     const int selected = wave_guard(m, n, select_fused_int8_config(m, n, k));
     if (selected != 0 && selected != 1) return selected;
     // The identity order re-reads the activation per weight column once it outgrows L2;

@@ -37,9 +37,15 @@ Usage:
   python int8_autotune_sweep.py --cfgs 0 1 12 13      # subset of cfgs
   python int8_autotune_sweep.py --iters 200           # more iters (default 100)
   python int8_autotune_sweep.py --out table.json      # different output path
+  python int8_autotune_sweep.py --resume              # skip shapes already in the table
+
+An existing table at --out is merged, not replaced: a partial sweep (one shape
+group, --resume) rewrites only the shapes it timed and keeps the rest, and each
+entry records its own `swept_at` date. A table swept on another SM, or a --cfgs
+subset against an existing table, is refused (name a different --out).
 
 Run with the GPU otherwise idle. Safe to interrupt mid-sweep — the JSON is
-checkpointed after each shape.
+checkpointed after each shape; continue with --resume.
 
 Multi-GPU note: pin the target with CUDA_VISIBLE_DEVICES so device 0 below
 is the card you actually want, e.g.:
@@ -274,6 +280,26 @@ SHAPE_GROUPS = {
 }
 
 
+def load_existing_table(path: Path, sm_version: str) -> dict[str, dict]:
+    """Entries of an existing table at `path`, to be merged with this sweep.
+
+    A table for another SM is never merged into or overwritten: its picks are for
+    other silicon, so the caller must name a different --out.
+    """
+    if not path.is_file():
+        return {}
+    with path.open() as f:
+        data = json.load(f)
+    existing_sm = data.get("sm_version")
+    if existing_sm != sm_version:
+        sys.exit(
+            f"ERROR: {path} was swept on sm {existing_sm}, this device is sm {sm_version}; "
+            f"pass --out <new file> instead of merging into it."
+        )
+    shapes = data.get("shapes", {})
+    return dict(shapes) if isinstance(shapes, dict) else {}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--shapes", choices=["all", *SHAPE_GROUPS], default="all")
@@ -282,6 +308,7 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     ap.add_argument("--device", type=int, default=0)
+    ap.add_argument("--resume", action="store_true", help="skip shapes already present in --out")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -299,16 +326,29 @@ def main() -> None:
     groups = SHAPE_GROUPS if args.shapes == "all" else [args.shapes]
     shapes = [shape for group in groups for shape in SHAPE_GROUPS[group]]
 
+    sm_version = f"{cap[0]}.{cap[1]}"
+    # A partial sweep (one shape group, or --resume) must not drop the other groups'
+    # entries from an existing table: start from them and replace only what is swept.
+    results = load_existing_table(args.out, sm_version)
+    if set(args.cfgs) != set(ALL_CFGS) and results:
+        sys.exit(
+            f"ERROR: --cfgs {args.cfgs} times only part of the palette; its best_cfg cannot "
+            f"replace the full entries in {args.out}. Pass --out <new file>."
+        )
+    if args.resume:
+        shapes = [s for s in shapes if f"{s[0]}x{s[1]}x{s[2]}" not in results]
+
     print(f"Device: {props.name}  sm{cap[0]}{cap[1]}")
     print(
         f"Sweeping {len(shapes)} shapes  x  {len(args.cfgs)} cfgs  @ warmup={args.warmup} iters={args.iters}"
     )
-    print(f"  Output: {args.out}")
+    print(f"  Output: {args.out}  ({len(results)} existing entries kept)")
     print("  GPU should be otherwise idle for reproducibility\n")
 
-    results: dict[str, dict] = {}
+    swept_at = time.strftime("%Y-%m-%d")
     for m, n, k in shapes:
         r = sweep_shape(m, n, k, args.cfgs, args.iters, args.warmup, device)
+        r["swept_at"] = swept_at
         results[f"{m}x{n}x{k}"] = r
         # checkpoint after each shape
         # Min/max M they've actually benchmarked. The runtime cache loader
@@ -317,7 +357,9 @@ def main() -> None:
         m_vals = [r["m"] for r in results.values()]
         payload = {
             "device": props.name,
-            "sm_version": f"{cap[0]}.{cap[1]}",
+            "sm_version": sm_version,
+            # the loader serves the table only to devices with about this many SMs
+            "multiprocessor_count": props.multi_processor_count,
             "total_memory_mib": props.total_memory // (1024 * 1024),
             "warmup_iters": args.warmup,
             "timed_iters": args.iters,

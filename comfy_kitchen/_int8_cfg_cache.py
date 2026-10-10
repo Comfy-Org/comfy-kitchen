@@ -10,18 +10,21 @@ Cache source precedence:
   2. `a6000_int8_cfg_table.json` inside the package (shipped in wheels) if present.
   3. Otherwise empty; the existing heuristic in C++ wins.
 
-The JSON schema matches what `int8_autotune_sweep.py` writes:
+The JSON schema matches what `samples/int8_autotune_sweep.py` writes:
 
   {
     "device": "NVIDIA RTX A6000",
     "sm_version": "8.6",
+    "multiprocessor_count": 84,
     "shapes": {
       "<M>x<N>x<K>": {"best_cfg": int, "best_ms": float, ...},
       ...
     }
   }
 
-Only the entry under "shapes" is consumed; the rest is informational.
+Consumed: "shapes" (the picks), "sm_version" and "multiprocessor_count" (which
+devices the picks may serve); the swept M range is derived from the entries.
+Everything else is informational.
 """
 
 from __future__ import annotations
@@ -40,6 +43,8 @@ _loaded: dict[tuple[int, int, int, int], int] = {}
 _load_attempted = False  # true after the first load attempt, hit or miss
 _loaded_from: Path | None = None
 _cache_sm: str | None = None  # sm_version from the JSON (e.g. "8.6")
+_cache_sms: int | None = None  # multiprocessor_count the table was swept on, if recorded
+_device_matches: dict[int, bool] = {}  # per device index: may this table serve it?
 _m_min_swept: int | None = None
 _m_max_swept: int | None = None
 _range_warning_emitted: set[str] = set()  # one-shot per direction
@@ -70,7 +75,7 @@ def _default_cache_path() -> Path | None:
 
 
 def _load() -> None:
-    global _load_attempted, _loaded_from, _cache_sm, _m_min_swept, _m_max_swept
+    global _load_attempted, _loaded_from, _cache_sm, _cache_sms, _m_min_swept, _m_max_swept
     if _load_attempted:
         return
     _load_attempted = True
@@ -86,6 +91,8 @@ def _load() -> None:
 
     sm = data.get("sm_version", "")
     _cache_sm = sm or None
+    sms = data.get("multiprocessor_count")
+    _cache_sms = sms if type(sms) is int and sms > 0 else None
     shapes = data.get("shapes", {})
     if not isinstance(shapes, dict):
         _logger.warning("INT8 cfg cache %s: 'shapes' is not an object; ignoring the file", path)
@@ -116,8 +123,12 @@ def _load() -> None:
     if skipped:
         _logger.warning("INT8 cfg cache %s: skipped %d malformed entries", path, skipped)
 
-    _m_min_swept = data.get("m_min_swept")
-    _m_max_swept = data.get("m_max_swept")
+    # The swept M range comes from the entries just loaded, not from the file's
+    # informational m_min_swept/m_max_swept keys: a hand-edited table cannot then
+    # put a string or a stale bound into the inference-path comparison.
+    if _loaded:
+        _m_min_swept = min(key[0] for key in _loaded)
+        _m_max_swept = max(key[0] for key in _loaded)
     _loaded_from = path
     # WARNING level (not INFO) so it's visible by default in ComfyUI startups
     # without needing to configure logging — this is a "yes your setup is
@@ -136,37 +147,57 @@ def get_cfg(m: int, n: int, k: int, out_dtype_code: int, device_index: int = 0) 
     """Return the cached cfg index for (m, n, k, out_dtype_code), or None.
 
     Returns None when no cache is loaded, the shape isn't in the cache, or
-    the cached file was authored for a different SM than `device_index`.
+    the cached file was authored for different silicon than `device_index`.
     Callers should fall back to the existing heuristic on None.
     """
     if not _load_attempted:
         _load()
     if not _loaded:
         return None
-
-    # Only consult the cache on the SM it was benchmarked on — per-shape
-    # winners are silicon-specific. Allow the file to omit sm_version; that
-    # means "trust me".
-    if _cache_sm:
-        try:
-            cur = torch.cuda.get_device_capability(device_index)
-            cur_str = f"{cur[0]}.{cur[1]}"
-            if cur_str != _cache_sm:
-                return None
-        except Exception:
-            return None  # can't even ask for the capability; don't guess
-
+    fits = _device_matches.get(device_index)
+    if fits is None:
+        fits = _device_matches[device_index] = _table_fits_device(device_index)
+    if not fits:
+        return None
     return _loaded.get((m, n, k, out_dtype_code))
+
+
+def _table_fits_device(device_index: int) -> bool:
+    """Per-shape winners are silicon-specific: the table only serves the SM
+    version it was swept on and, when it recorded one, a device with about the
+    same multiprocessor count (every sm86 die from GA106 to GA102 shares the
+    version; a 28-SM card must not run picks timed on 84). A file that omits
+    these fields means "trust me". Decided once per device index."""
+    try:
+        cur = torch.cuda.get_device_capability(device_index)
+        if _cache_sm and f"{cur[0]}.{cur[1]}" != _cache_sm:
+            return False
+        if _cache_sms:
+            sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+            if abs(sms - _cache_sms) > _cache_sms // 10:
+                _logger.warning(
+                    "[int8_cfg_cache] table was swept on a %d-SM device, cuda:%d has %d SMs; "
+                    "not using its per-shape picks there",
+                    _cache_sms,
+                    device_index,
+                    sms,
+                )
+                return False
+    except Exception:
+        return False  # can't even ask the device; don't guess
+    return True
 
 
 def reset() -> None:
     """Drop the loaded cache (for tests)."""
-    global _loaded, _load_attempted, _loaded_from, _cache_sm, _range_warning_emitted
-    global _m_min_swept, _m_max_swept
+    global _loaded, _load_attempted, _loaded_from, _cache_sm, _cache_sms, _device_matches
+    global _m_min_swept, _m_max_swept, _range_warning_emitted
     _loaded = {}
     _load_attempted = False
     _loaded_from = None
     _cache_sm = None
+    _cache_sms = None
+    _device_matches = {}
     _range_warning_emitted = set()
     _m_min_swept = None
     _m_max_swept = None
@@ -189,7 +220,9 @@ def check_m_in_swept_range(m: int) -> None:
     if direction in _range_warning_emitted:
         return
     _range_warning_emitted.add(direction)
-    _logger.info(
+    # WARNING like the load message: visible without logging configuration, and
+    # bounded to one line per direction per process.
+    _logger.warning(
         "int8 GEMM M=%d is %s swept range [%d, %d]; consider re-running "
         "int8_autotune_sweep.py with shapes covering this M (heuristic may "
         "be suboptimal here)",

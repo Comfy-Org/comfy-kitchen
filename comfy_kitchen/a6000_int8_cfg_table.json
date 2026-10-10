@@ -1,6 +1,7 @@
 {
   "device": "NVIDIA RTX A6000",
   "sm_version": "8.6",
+  "multiprocessor_count": 84,
   "total_memory_mib": 45487,
   "warmup_iters": 10,
   "timed_iters": 100,
