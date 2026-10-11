@@ -132,3 +132,27 @@ def test_stream_graph_and_fused_path():
         captured = ck.int8_gemm_indexed_gate(*args)
     graph.replay()
     assert torch.equal(captured, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [128, 4096])
+def test_plain_fallback_has_no_live_fused_output(monkeypatch, rows):
+    from comfy_kitchen import indexed_gate
+    from comfy_kitchen.backends import cuda
+
+    if cuda._C is None or not hasattr(cuda._C, "cutlass_int8_indexed_gate"):
+        pytest.skip("new CUDA extension required")
+    args = operands("cuda", rows, 512, 256)
+    expected = _fallback(*args)
+    before = torch.cuda.memory_allocated()
+    fallback = indexed_gate._cuda_plain_fallback
+
+    def check(*inputs):
+        assert torch.cuda.memory_allocated() == before
+        return fallback(*inputs)
+
+    # Cover both the medium-M route and a native call declining a supported M.
+    monkeypatch.setattr(cuda._C, "cutlass_int8_indexed_gate", lambda *a: False)
+    monkeypatch.setattr(indexed_gate, "_cuda_plain_fallback", check)
+    actual = ck.int8_gemm_indexed_gate(*args)
+    assert torch.equal(actual, expected)
