@@ -1074,11 +1074,38 @@ extern "C" void launch_scaled_mm_nvfp4_kernel(
 #define CK_NVFP4_DISPATCH_DEFAULT(T)                                                          \
     CK_NVFP4_GEMM_LAUNCH(T, 64, 64, 64, 2, 2, 2, 2);
 
+// The gfx10 arm comes FIRST, ahead of the WMMA tile override, and that ordering is
+// load-bearing rather than cosmetic. COMFY_GEMM_WMMA_TILE selects tiles for
+// gemm_wmma_kernel, which on RDNA2 reaches MmaF16::mma -- COMFY_MMA_STUB_BODY, since
+// COMFY_MMA_GFX11 is defined only in a gfx11 device pass. So an override left in the
+// environment on a gfx103x box used to route every NVFP4 linear into a kernel that
+// cannot execute there, and the result is SILENT: the wave trap leaves the output
+// never written, check_hip_launch() catches launch-time errors but not execution
+// faults, and the caller reads back the uninitialised empty() it allocated. Measured
+// with COMFY_GEMM_WMMA_TILE=64,64,64,2,2,2,2 on this part: rel 1.7, 1.9 and 3.4e23
+// against the reference, and no exception anywhere.
+//
+// This was unreachable before the VALU GEMM landed, and that is the only reason it is
+// a new bug: scaled_mm_nvfp4 was not advertised on RDNA2, so the launcher was never
+// entered. Now that _VALU_GEMM_OPS advertises it there, an override -- say, carried
+// over from a gfx1103 sweep -- selects a kernel that does not exist on this part
+// instead of the VALU one that does. An override with nothing to tune cannot be
+// honoured, and silently running the heuristic instead is already this file's
+// convention for a tile the table does not list (gemm_wmma.h's "an unlisted tile
+// returns false and the caller silently runs the heuristic").
+//
+// This is the ordering convrot_w4a4.hip already uses for the same reason, and
+// against the same hazard: it branches on comfy_is_gfx10() ahead of
+// launch_gemm_wmma_forced with a comment saying so. Checked the other consumer of
+// comfy_gemm_wmma_tile_override() -- launch_gemm_wmma_forced has exactly two callers,
+// and convrot_w4a4.hip is the second -- so this is the only site that needed it.
 #define CK_NVFP4_DISPATCH_OUT(T)                                                              \
     do {                                                                                      \
         const EpiTensorwise epi{TSA, TSB, bias, bias_code, 0.0f};                              \
         const GemmTileOverride ovr = comfy_gemm_wmma_tile_override();                         \
-        if (ovr.bm == 64 && ovr.bkb == 32) {                                                   \
+        if (comfy_is_gfx10()) {                                                                \
+            CK_NVFP4_DISPATCH_GFX10(T)                                                         \
+        } else if (ovr.bm == 64 && ovr.bkb == 32) {                                           \
             CK_NVFP4_GEMM_LAUNCH(T, 64, 64, 32, 2, 2, 2, 2);                                 \
         } else if (ovr.bm == 64) {                                                            \
             CK_NVFP4_GEMM_LAUNCH(T, 64, 64, 64, 2, 2, 2, 2);                                 \
@@ -1086,8 +1113,6 @@ extern "C" void launch_scaled_mm_nvfp4_kernel(
             CK_NVFP4_GEMM_LAUNCH(T, 128, 64, 32, 4, 2, 2, 2);                                \
         } else if (ovr.bm == 128) {                                                           \
             CK_NVFP4_GEMM_LAUNCH_P(T, 128, 128, 64, 4, 2, 2, 4, 2);                           \
-        } else if (comfy_is_gfx10()) {                                                        \
-            CK_NVFP4_DISPATCH_GFX10(T)                                                        \
         } else if (comfy_gfx11()) {                                                           \
             CK_NVFP4_DISPATCH_GFX11(T)                                                        \
         } else {                                                                              \
