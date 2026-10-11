@@ -104,15 +104,24 @@ def _round_int4(scaled: torch.Tensor, stochastic_rounding: int | None = 0) -> to
     return scaled.round_().clamp_(-_INT4_MAX, _INT4_MAX).to(torch.int8)
 
 
-def quantize_signed_int4_rowwise(
+def _quantize_signed_int4_rowwise_unpacked(
     x: torch.Tensor,
     stochastic_rounding: int | None = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return signed INT4 codes in INT8 storage, without packing nibbles."""
     rows, _ = x.shape
     absmax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
     scales = absmax / _INT4_MAX
     q = _round_int4(x / scales, stochastic_rounding=stochastic_rounding)
-    return _pack_int4_row_major(q), scales.reshape(rows).to(torch.float32)
+    return q, scales.reshape(rows).to(torch.float32)
+
+
+def quantize_signed_int4_rowwise(
+    x: torch.Tensor,
+    stochastic_rounding: int | None = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q, scales = _quantize_signed_int4_rowwise_unpacked(x, stochastic_rounding)
+    return _pack_int4_row_major(q), scales
 
 
 def prepare_int4_weight_for_int8_linear(weight: torch.Tensor) -> torch.Tensor:
