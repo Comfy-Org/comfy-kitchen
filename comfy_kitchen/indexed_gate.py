@@ -90,13 +90,15 @@ def _op(
         and hasattr(cuda._C, "cutlass_int8_indexed_gate")
         and all(t.is_contiguous() for t in tensors)
     ):
-        out = torch.empty_like(residual)
         with torch.cuda.device(a.device):
-            stream = torch.cuda.current_stream(a.device).cuda_stream
-            if (a.shape[0] >= 4096 or a.shape[0] <= 64) and cuda._C.cutlass_int8_indexed_gate(
-                *(cuda._wrap_for_dlpack(t) for t in (*tensors, out)), stream
-            ):
-                return out
+            if a.shape[0] >= 4096 or a.shape[0] <= 64:
+                out = torch.empty_like(residual)
+                stream = torch.cuda.current_stream(a.device).cuda_stream
+                if cuda._C.cutlass_int8_indexed_gate(
+                    *(cuda._wrap_for_dlpack(t) for t in (*tensors, out)), stream
+                ):
+                    return out
+                del out
             return _cuda_plain_fallback(*tensors)
     return _fallback(*tensors)
 
