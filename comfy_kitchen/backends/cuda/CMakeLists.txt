@@ -154,10 +154,12 @@ set(CUDA_SOURCES
     sage_attention/quant_v_int8.cu
     sage_attention/quant_qk_int8.cu
     sage_attention/sage_attn_launcher.cu
+    sage_attention/int8_decode.cu
 )
 
 set(CPP_SOURCES
     dlpack_bindings.cpp
+    int8_decode_bindings.cpp
 )
 
 # Keep CUDA compilation independent of the Python extension target. The

@@ -20,16 +20,29 @@ void launch_na3d_kernel(const void* q, const void* k, const void* v, void* out, 
                         int kh, int kw, int causal_t, int causal_h, int causal_w, float scale,
                         int dtype_code, hipStream_t stream);
 
-// BF16 decode attention over a fixed-capacity KV cache. query_length is the GQA
-// group count folded into the query sequence dimension by the Python layer, and
-// head_dim is 128 or 256. out_accum and lse_accum are read only when
-// num_splits > 1. See ops/flash_decode.hip.
+// BF16 decode attention over a fixed-capacity KV cache. The rows of one KV head
+// are a (group, step) grid of query_length = groups * steps rows; `causal` gives
+// row (g, s) the slot limit kv_lengths[b] - steps + s + 1. head_dim is 128 or
+// 256. out_accum and lse_accum are read only when num_splits > 1. See
+// ops/flash_decode.hip.
 void launch_flash_decode(const void* q, const void* k, const void* v, const int* kv_lengths,
                          void* out, float* softmax_lse, float* out_accum, float* lse_accum,
-                         int batch, int query_length, int heads, int head_dim, int kv_capacity, int num_splits,
-                         int64_t q_batch_stride, int64_t q_row_stride, int64_t q_head_stride,
-                         int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
-                         hipStream_t stream);
+                         int batch, int query_length, int steps, int heads, int head_dim,
+                         int kv_capacity, int num_splits, bool causal,
+                         int64_t q_batch_stride, int64_t q_group_stride, int64_t q_step_stride,
+                         int64_t q_head_stride, int64_t k_batch_stride, int64_t k_row_stride,
+                         int64_t k_head_stride, int64_t o_batch_stride, int64_t o_group_stride,
+                         int64_t o_step_stride, int64_t o_head_stride, hipStream_t stream);
+
+// Folds the current step's rows causally (row j attends rows t <= j) into a
+// prefix-only decode result; see ops/flash_decode.hip. heads is the query head count.
+void launch_flash_decode_step_merge(
+    const void* out, const float* lse, const void* q, const void* k, const void* v, void* merged,
+    int batch, int rows, int heads, int kv_heads, int64_t q_batch_stride,
+    int64_t q_head_stride, int64_t q_row_stride, int64_t k_batch_stride, int64_t k_head_stride,
+    int64_t k_row_stride, int64_t v_batch_stride, int64_t v_head_stride, int64_t v_row_stride,
+    int64_t o_batch_stride, int64_t o_row_stride, int64_t m_batch_stride, int64_t m_row_stride,
+    hipStream_t stream);
 
 // ldc is c's row stride, so a caller writing an N-column slice of a wider output
 // passes that output's width; a whole GEMM passes N.
@@ -45,15 +58,25 @@ void launch_dequant_int4_grouped_to_int8_kernel(const void* qw, const void* s_re
                                                 int64_t k, int group_size, int bits,
                                                 hipStream_t stream);
 
-// in_dtype_code is a DTYPE_TO_CODE value: 0 float32, 1 float16, 2 bfloat16.
-// s_rel is written as raw e4m3 bytes; seed is ignored unless stochastic is set.
+// weight is the raw [N, K] weight, in_dtype_code 1 float16 or 2 bfloat16. bits 4 takes
+// the 16-entry codebook at g 16, bits 6 uniform levels at g 16/32/64. s_rel is written
+// as raw e4m3 bytes; seed is ignored unless stochastic is set.
+void launch_quantize_wxa8_convrot_fused_kernel(const void* weight, const void* codebook,
+                                               void* packed, void* s_rel, void* s_channel,
+                                               int64_t n, int64_t k, int bits, int g,
+                                               int in_dtype_code, bool stochastic, uint64_t seed,
+                                               hipStream_t stream);
+
+// Staged 4-bit requantize of an already rotated [N, K] weight, in_dtype_code 0 float32,
+// 1 float16 or 2 bfloat16. Throws when the K/16 group scales do not fit in LDS.
 void launch_quantize_w4a8_convrot_kernel(const void* rotated, const void* codebook, void* packed,
                                          void* s_rel, void* s_channel, int64_t n, int64_t k,
                                          int in_dtype_code, bool stochastic, uint64_t seed,
                                          hipStream_t stream);
 
-// Widest K the fused requantize can take on the current device, 0 if unknown.
-int w4a8_requant_max_k_kernel();
+// Widest K the fused requantize can take at this group size on the current device,
+// 0 if unknown.
+int wxa8_requant_max_k_kernel(int group_size);
 
 void launch_w4a8_int8_gemm_chunked_kernel(const void* xq, const void* qw, const void* s_rel,
                                           int scale_code, const void* codebook,
