@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
-  * Shared by the CUTLASS GEMM units (int8, fp16): per-stream workspace cache,
+  * Shared by the CUTLASS GEMM units (int8, fp16): stream-ordered workspace,
   * lean stream-K swizzle, GemmUniversal launch tail.
  */
 #pragma once
@@ -10,9 +10,6 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdint>
-#include <map>
-#include <mutex>
-#include <tuple>
 #include <type_traits>
 
 #include "cutlass/cutlass.h"
@@ -21,32 +18,6 @@
 #include "cutlass/gemm/threadblock/threadblock_swizzle.h"
 
 namespace comfy_cutlass {
-
-struct StreamWorkspace {
-    void* data = nullptr;
-    size_t size = 0;
-};
-
-// One buffer per (device, stream), grown on demand and kept for the process
-// lifetime; assumes a stream is driven by one host thread at a time.
-inline void* get_stream_workspace(size_t size, cudaStream_t stream) {
-    if (size == 0) return nullptr;
-
-    int device;
-    if (cudaGetDevice(&device) != cudaSuccess) return nullptr;
-
-    static std::mutex mutex;
-    static std::map<std::tuple<int, uintptr_t>, StreamWorkspace> workspaces;
-    std::lock_guard<std::mutex> lock(mutex);
-    auto& workspace = workspaces[{device, reinterpret_cast<uintptr_t>(stream)}];
-    if (workspace.size >= size) return workspace.data;
-
-    if (workspace.data != nullptr && cudaFree(workspace.data) != cudaSuccess) return nullptr;
-    workspace = {};
-    if (cudaMalloc(&workspace.data, size) != cudaSuccess) return nullptr;
-    workspace.size = size;
-    return workspace.data;
-}
 
 template <cudaDeviceAttr Attr>
 inline int cached_device_attribute(int fallback) {
@@ -296,10 +267,14 @@ bool launch_universal(const ElementA* A, const ElementB* B, const Callback& cb,
     Gemm gemm;
     if (gemm.can_implement(args) != cutlass::Status::kSuccess) return false;
     const size_t workspace_size = Gemm::get_workspace_size(args);
-    void* workspace = get_stream_workspace(workspace_size, stream);
-    if (workspace_size != 0 && workspace == nullptr) return false;
-    if (gemm.initialize(args, workspace, stream) != cutlass::Status::kSuccess) return false;
-    return gemm(stream) == cutlass::Status::kSuccess;
+    void* workspace = nullptr;
+    // Scope scratch storage to this launch. Capture owns its allocation/free nodes;
+    // an allocator interceptor sees the same sequence in eager warmup and capture.
+    if (workspace_size != 0 && cudaMallocAsync(&workspace, workspace_size, stream) != cudaSuccess) return false;
+    auto status = gemm.initialize(args, workspace, stream);
+    if (status == cutlass::Status::kSuccess) status = gemm(stream);
+    if (workspace != nullptr && cudaFreeAsync(workspace, stream) != cudaSuccess) return false;
+    return status == cutlass::Status::kSuccess;
 }
 
 }  // namespace comfy_cutlass
