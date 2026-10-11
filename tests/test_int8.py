@@ -13,6 +13,8 @@ from .conftest import (
     assert_values_close,
     cuda_backend_available,
     get_capable_backends,
+    rel_err,
+    requires_cuda_backend,
 )
 
 COMFYUI_NVIDIA_16_SERIES = (
@@ -943,3 +945,100 @@ class TestTensorWisePublicAPI:
 
         assert out.shape == (17, 1)
         assert out.dtype == torch.bfloat16
+
+
+class TestBandedStreamK:
+    """The banded stream-K tile order must give bit-identical output to the identity order."""
+
+    @requires_cuda_backend
+    def test_captured_workspace_survives_larger_gemms(self, seed):
+        """Later GEMMs and captures must not replace a live graph's scratch storage."""
+        if torch.cuda.get_device_capability()[0] < 8:
+            pytest.skip("CUTLASS stream-K requires SM80 or newer")
+
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        wrap = cuda_backend._wrap_for_dlpack
+        stream = torch.cuda.Stream()
+        cases = []
+        for k, config in [(128, 12), (1024, 12), (4096, 13), (8192, 13)]:
+            a = torch.randint(-8, 8, (128, k), dtype=torch.int8, device="cuda")
+            b = torch.randint(-8, 8, (256, k), dtype=torch.int8, device="cuda")
+            xs = torch.full((128, 1), 0.125, device="cuda")
+            ws = torch.full((256,), 0.0625, device="cuda")
+            out = torch.empty((128, 256), dtype=torch.bfloat16, device="cuda")
+            expected = ((a.float() @ b.float().t()) * xs * ws).bfloat16()
+            cases.append((a, b, xs, ws, out, expected, config))
+        stream.wait_stream(torch.cuda.current_stream())
+
+        def run(case):
+            a, b, xs, ws, out, _, config = case
+            assert cuda_backend._C.cutlass_int8_dequant_config(
+                wrap(a), wrap(b), wrap(xs), wrap(ws), wrap(out), 2, config, stream.cuda_stream
+            )
+
+        first, second = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream):
+            # No workspace warmup: capture must handle the first allocation and growth.
+            with torch.cuda.graph(first, stream=stream):
+                run(cases[0])
+                run(cases[1])
+            with torch.cuda.graph(second, stream=stream):
+                run(cases[2])
+            run(cases[3])
+            for _ in range(5):
+                for case in cases[:3]:
+                    case[4].fill_(float("nan"))
+                second.replay()
+                first.replay()
+                stream.synchronize()
+                for case in cases:
+                    torch.testing.assert_close(case[4], case[5], rtol=0, atol=0)
+            second.reset()
+            run(cases[3])
+            first.replay()
+            stream.synchronize()
+            for case in cases[:2]:
+                torch.testing.assert_close(case[4], case[5], rtol=0, atol=0)
+
+    @staticmethod
+    def _run(m, n, k, config):
+        from comfy_kitchen.backends import cuda as cuda_backend
+        c, wrap = cuda_backend._C, cuda_backend._wrap_for_dlpack
+        stream = torch.cuda.current_stream().cuda_stream
+        a = torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda")
+        b = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+        xs = torch.rand(m, 1, device="cuda") * 0.01
+        ws = torch.rand(n, device="cuda") * 0.01
+        outs = {}
+        for cfg in config:
+            out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+            if cfg == "auto":
+                empty = cuda_backend._empty_cuda_tensor(a.device, torch.bfloat16)
+                assert c.cutlass_int8_dequant(wrap(a), wrap(b), wrap(xs), wrap(ws), wrap(empty), wrap(out), 2, stream)
+            else:
+                assert c.cutlass_int8_dequant_config(wrap(a), wrap(b), wrap(xs), wrap(ws), wrap(out), 2, cfg, stream)
+            outs[cfg] = out
+        ref = (a.float() @ b.float().t()) * xs * ws
+        return outs, ref
+
+    # 37 / 74 N tiles: a short last band; M has enough tiles that both configs band
+    @requires_cuda_backend
+    @pytest.mark.parametrize("m,n,k", [(9600, 9408, 128), (19100, 9408, 128)])
+    def test_bands_match_identity_order(self, m, n, k, seed):
+        outs, ref = self._run(m, n, k, config=[0, 12, 13])
+        assert torch.equal(outs[12], outs[0]) and torch.equal(outs[13], outs[0])
+        assert rel_err(outs[0].float(), ref) < 1e-2
+
+    @requires_cuda_backend
+    def test_large_activation_reroutes_to_banded_stream_k(self):
+        """Config 0 shapes move to banded stream-K past the L2-derived activation size."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+        pick = cuda_backend._C.cutlass_int8_selected_config
+        l2 = torch.cuda.get_device_properties(0).L2_cache_size
+        threshold = max(l2 * 3 // 4, 48 << 20)
+        n, k = 16384, 8192
+        assert pick(2048, n, k) in (0, 1)                 # 16.8 MB: below any threshold
+        m = 9216                                          # 75.5 MB
+        assert pick(m, n, k) == (13 if m * k > threshold else 0)
+        assert pick(4096, 24576, 32768) in (0, 1)         # fewer M tiles than N: no reroute
