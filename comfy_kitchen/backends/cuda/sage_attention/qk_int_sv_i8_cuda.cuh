@@ -71,7 +71,8 @@ template <bool skip_masked_tiles, uint32_t CTA_Q, uint32_t CTA_K,
           bool fuse_v_scale = false, bool fuse_v_mean = false,
           bool use_pv_fp16_accu = false,
           bool fuse_fp32_probabilities = true, bool skip_masked_copies = false,
-          typename Offset = uint32_t, bool positive_scale = true>
+          typename Offset = uint32_t, bool decode_page = false,
+          bool positive_scale = true>
 __device__ __forceinline__ void qk_int_sv_i8_attn_body(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
@@ -150,8 +151,8 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
   const uint32_t warp_id = get_warp_id();
 
   // maximize L2 hit rate
-  const uint32_t batch_id = blockIdx.z;
-  const uint32_t bx = blockIdx.x;
+  const uint32_t batch_id = decode_page ? 0 : blockIdx.z;
+  const uint32_t bx = decode_page ? 0 : blockIdx.x;
   const uint32_t num_qo_heads = gridDim.y;
   const uint32_t head_id = blockIdx.y;
 
@@ -222,7 +223,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
                   get_warp_idx_k<num_warps_q, num_warps_k>();
   } else if constexpr (K_GRAN == QuantGranularity::kPerThread) {
     const uint32_t num_warp_block_k =
-        div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K);
+        (decode_page ? stride_h_k / (head_dim * CTA_K) : div_ceil(kv_len, CTA_K)) * (CTA_K / WARP_K);
     k_scale_idx =
         batch_id * (num_qo_heads / num_kv_groups) * (num_warp_block_k * 4) +
         (head_id / num_kv_groups) * (num_warp_block_k * 4) +
@@ -1177,16 +1178,16 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
   }
 
   if constexpr (return_lse) {
-    // ! this only works for num_tiles_q = 2
-    uint32_t lse_idx = bx * CTA_Q + lane_id / 4 + 8 * (lane_id % 4) +
-                       WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>();
-    float *lse_lane_ptr =
-        Lse + batch_id * (qo_len * num_qo_heads) + head_id * qo_len + lse_idx;
-    uint32_t fq = (lane_id % 4) / 2;
-    uint32_t k = (lane_id % 4) % 2;
-
-    if (lse_idx < qo_len) {
-      lse_lane_ptr[0] = math::ptx_log2(d[fq][k]) + m[fq][k];
+    if (lane_id % 4 == 0) {
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; ++fq) {
+#pragma unroll
+        for (uint32_t k = 0; k < 2; ++k) {
+          const uint32_t row = bx * CTA_Q + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>() + fq * 16 + lane_id / 4 + k * 8;
+          if (row < qo_len)
+            Lse[(batch_id * num_qo_heads + head_id) * qo_len + row] = math::ptx_log2(d[fq][k]) + m[fq][k];
+        }
+      }
     }
   }
 }
@@ -1232,7 +1233,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
       qk_int_sv_i8_attn_body<true, CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK,
         Q_GRAN, K_GRAN, DTypeSVAccum, use_inst_buffer, DTypeOut,
         DenominatorAccumUnit, mask_mode, return_lse, fuse_v_scale, fuse_v_mean,
-        use_pv_fp16_accu, fuse_fp32_probabilities, true, Offset, positive_scale>(
+        use_pv_fp16_accu, fuse_fp32_probabilities, true, Offset, false, positive_scale>(
           Q, K, V, O, Lse, Q_scale, K_scale, V_scale, V_mean, AttnMask,
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,
@@ -1242,7 +1243,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
       qk_int_sv_i8_attn_body<true, CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK,
         Q_GRAN, K_GRAN, DTypeSVAccum, use_inst_buffer, DTypeOut,
         DenominatorAccumUnit, mask_mode, return_lse, fuse_v_scale, fuse_v_mean,
-        use_pv_fp16_accu, fuse_fp32_probabilities, false, Offset, positive_scale>(
+        use_pv_fp16_accu, fuse_fp32_probabilities, false, Offset, false, positive_scale>(
           Q, K, V, O, Lse, Q_scale, K_scale, V_scale, V_mean, AttnMask,
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,
@@ -1252,7 +1253,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
       qk_int_sv_i8_attn_body<false, CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK,
         Q_GRAN, K_GRAN, DTypeSVAccum, use_inst_buffer, DTypeOut,
         DenominatorAccumUnit, mask_mode, return_lse, fuse_v_scale, fuse_v_mean,
-        use_pv_fp16_accu, fuse_fp32_probabilities, false, Offset, positive_scale>(
+        use_pv_fp16_accu, fuse_fp32_probabilities, false, Offset, false, positive_scale>(
           Q, K, V, O, Lse, Q_scale, K_scale, V_scale, V_mean, AttnMask,
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,
@@ -1263,7 +1264,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
     qk_int_sv_i8_attn_body<false, CTA_Q, CTA_K, WARP_Q, WARP_K, head_dim, DTypeQK,
         Q_GRAN, K_GRAN, DTypeSVAccum, use_inst_buffer, DTypeOut,
         DenominatorAccumUnit, mask_mode, return_lse, fuse_v_scale, fuse_v_mean,
-        use_pv_fp16_accu, fuse_fp32_probabilities, false, Offset, positive_scale>(
+        use_pv_fp16_accu, fuse_fp32_probabilities, false, Offset, false, positive_scale>(
           Q, K, V, O, Lse, Q_scale, K_scale, V_scale, V_mean, AttnMask,
           mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k,
           mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q, stride_seq_q,

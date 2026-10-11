@@ -86,10 +86,16 @@ __all__ = [
     "int8_linear",
     "int8_attention_is_available",
     "flash_attention_decode_is_available",
+    "flash_attention_decode_gqa_is_available",
     "flash_decode",
+    "flash_decode_gqa",
+    "flash_decode_step_merge",
     "gated_delta_decode_fused",
     "gated_delta_decode_is_available",
     "deltanet_conv_step",
+    "gated_delta_deferred_is_available",
+    "gated_delta_decode_deferred",
+    "deltanet_conv_deferred",
     "is_available",
     "sage_int8_attend",
     "sage_int8_quantize",
@@ -1010,67 +1016,111 @@ def _w4a8_int8_linear_chunked(
     return out.reshape(*orig_shape[:-1], n)
 
 
-# Keyed by device: the fused requantize holds one float per 16-wide group in LDS,
-# so the widest K it can take is a property of whichever card the weight lives on.
-_w4a8_requant_max_k: dict[int, int] = {}
+# Keyed by device and group size: the fused requantize holds the rotated row and one
+# float per group in LDS, so the widest K it can take is a property of whichever card
+# the weight lives on.
+_wxa8_requant_max_k: dict[tuple[int, int], int] = {}
 
 
-def _requant_supported(k: int, device: torch.device, dtype: torch.dtype) -> bool:
+def _requant_supported(k: int, group_size: int, device: torch.device, dtype: torch.dtype) -> bool:
     """Whether the fused requantize can take a row of this width on ``device``.
 
     The budget is read for the weight's own device rather than the process-current
     one, so a multi-GPU process asks the card the kernel will actually launch on.
+    fp32 weights take the staged path, as on CUDA.
     """
-    if not _EXT_AVAILABLE or k % 16 != 0:
+    if not _EXT_AVAILABLE or k % 256 != 0 or k % group_size != 0:
         return False
-    if dtype not in (torch.float32, torch.float16, torch.bfloat16):
+    if dtype not in (torch.float16, torch.bfloat16):
         return False
 
     index = device.index if device.index is not None else torch.cuda.current_device()
-    max_k = _w4a8_requant_max_k.get(index)
+    key = (index, group_size)
+    max_k = _wxa8_requant_max_k.get(key)
     if max_k is None:
         with torch.cuda.device(index):
-            max_k = _C.w4a8_requant_max_k()
-        _w4a8_requant_max_k[index] = max_k
+            max_k = _C.wxa8_requant_max_k(group_size)
+        _wxa8_requant_max_k[key] = max_k
     return max_k > 0 and k <= max_k
 
 
-def _fused_quantize_w4a8(
+def _fused_quantize_wxa8(
+    weight: torch.Tensor,
+    bits: int,
+    group_size: int,
+    codebook: torch.Tensor | None,
+    stochastic_rounding: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, torch.Tensor | None]:
+    """ConvRot and requantize the raw weight in one launch, with no rotated copy."""
+    n, k = weight.shape
+    dev = weight.device
+    if bits == 4:
+        cb = codebook.to(device=dev, dtype=torch.float32).contiguous()
+        packed = torch.empty(n, k // 2, dtype=torch.int8, device=dev)
+    else:
+        cb = torch.empty(0, dtype=torch.float32, device=dev)
+        packed = torch.empty(n, k * 3 // 4, dtype=torch.int8, device=dev)
+    s_rel = torch.empty(n, k // group_size, dtype=torch.float8_e4m3fn, device=dev)
+    s_channel = torch.empty(n, dtype=torch.float32, device=dev)
+    with torch.cuda.device(dev):
+        _C.quantize_wxa8_convrot_fused(
+            _dl(_aligned(weight.contiguous())),
+            _dl(cb),
+            _dl(packed),
+            _dl(s_rel.view(torch.uint8)),
+            _dl(s_channel),
+            n,
+            k,
+            bits,
+            group_size,
+            stochastic_rounding > 0,
+            int(stochastic_rounding) if stochastic_rounding > 0 else 0,
+            _stream(weight),
+        )
+    return packed, s_rel, s_channel, None, (cb if bits == 4 else None)
+
+
+_W4A8_STAGED_QUANT = _EXT_AVAILABLE
+# The staged kernel keeps only K/16 fp32 group scales in LDS. Same limit as CUDA's,
+# which reserves room for its static arrays within the 48 KiB default block limit.
+_W4A8_STAGED_MAX_K = 16 * (47 * 1024 // 4)
+
+
+def _quantize_w4a8_staged(
     weight: torch.Tensor,
     codebook: torch.Tensor,
     convrot_groupsize: int,
     stochastic_rounding: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, torch.Tensor]:
-    """Rotate and requantize a row block at a time, so no whole rotated copy is held.
-
-    Every output is per-row and the kernel reduces only within a row, so a block
-    writes straight into its own output slices.
-    """
+    """Rotate, then requantize in a second launch, a row block at a time so no full
+    rotated copy is held. Every output is per row, so each block writes straight into
+    its slice."""
     n, k = weight.shape
-    cb = codebook.to(device=weight.device, dtype=torch.float32).contiguous()
-    packed = torch.empty(n, k // 2, dtype=torch.int8, device=weight.device)
-    s_rel = torch.empty(n, k // 16, dtype=torch.float8_e4m3fn, device=weight.device)
-    s_channel = torch.empty(n, dtype=torch.float32, device=weight.device)
+    dev = weight.device
+    cb = codebook.to(device=dev, dtype=torch.float32).contiguous()
+    packed = torch.empty(n, k // 2, dtype=torch.int8, device=dev)
+    s_rel = torch.empty(n, k // 16, dtype=torch.float8_e4m3fn, device=dev)
+    s_channel = torch.empty(n, dtype=torch.float32, device=dev)
     block = max(1, _QUANT_ROW_ELEM_BUDGET // max(k, 1))
-    for r0 in range(0, n, block):
-        r1 = min(r0 + block, n)
-        rot = _eager.rotate_int8_convrot_weight(weight[r0:r1].contiguous(), convrot_groupsize)
-        # Offset the seed by the row start so blocks decorrelate but a fixed block
-        # size still reproduces.
-        seed = stochastic_rounding + r0 if stochastic_rounding > 0 else 0
-        _C.quantize_w4a8_convrot(
-            _dl(rot.contiguous()),
-            _dl(cb),
-            _dl(packed[r0:r1]),
-            _dl(s_rel[r0:r1].view(torch.uint8)),
-            _dl(s_channel[r0:r1]),
-            r1 - r0,
-            k,
-            stochastic_rounding > 0,
-            seed,
-            _stream(weight),
-        )
-        del rot
+    with torch.cuda.device(dev):
+        for r0 in range(0, n, block):
+            r1 = min(r0 + block, n)
+            rot = _eager.rotate_int8_convrot_weight(weight[r0:r1].contiguous(), convrot_groupsize)
+            # Offset per block like the eager packer, so blocks decorrelate yet stay deterministic.
+            seed = stochastic_rounding + r0 if stochastic_rounding > 0 else 0
+            _C.quantize_w4a8_convrot(
+                _dl(rot.contiguous()),
+                _dl(cb),
+                _dl(packed[r0:r1]),
+                _dl(s_rel[r0:r1].view(torch.uint8)),
+                _dl(s_channel[r0:r1]),
+                r1 - r0,
+                k,
+                seed > 0,
+                seed,
+                _stream(weight),
+            )
+            del rot
     return packed, s_rel, s_channel, None, cb
 
 
@@ -1092,26 +1142,45 @@ def quantize_w4a8_int8_weight(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Prepare W4A8/W6A8 weights with the fused HIP requantize and eager ConvRot."""
+    """Prepare W4A8/W6A8 weights: the fused HIP ConvRot + requantize for the default
+    configs (4-bit symmetric codebook g16, or 6-bit without the quantize-time scale
+    search; fp8 scales). W4A8 the fused kernel declines takes the staged HIP requantize;
+    everything else the chunked eager path."""
     validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
-    # The fused kernel covers the default 4-bit codebook layout only. Asymmetric, uniform,
-    # fp32-scale, other group sizes and 6-bit stay on the chunked eager path.
-    if (
-        bits == 4
+    layout_ok = (
+        scale_dtype == torch.float8_e4m3fn
         and symmetric
-        and codebook
-        and group_size == 16
-        and scale_dtype == torch.float8_e4m3fn
-        and _requant_supported(weight.shape[1], weight.device, weight.dtype)
-    ):
-        cb = (
-            codebook_tensor
-            if codebook_tensor is not None
-            else _decide_codebook(
-                weight, _eager.rotate_int8_convrot_weight, group_size, convrot_groupsize
-            )
+        and (
+            (bits == 4 and codebook and group_size == 16)
+            or (bits == 6 and not scale_search and group_size in (16, 32, 64))
         )
-        return _fused_quantize_w4a8(weight, cb, convrot_groupsize, stochastic_rounding)
+    )
+    fused_ok = (
+        layout_ok
+        and convrot_groupsize == 256
+        and _requant_supported(weight.shape[1], group_size, weight.device, weight.dtype)
+    )
+    staged_ok = (
+        layout_ok
+        and not fused_ok
+        and bits == 4
+        and _W4A8_STAGED_QUANT
+        and weight.dtype in (torch.float32, torch.float16, torch.bfloat16)
+        and weight.shape[1] <= _W4A8_STAGED_MAX_K
+    )
+    if fused_ok or staged_ok:
+        cb = None
+        if bits == 4:
+            cb = (
+                codebook_tensor
+                if codebook_tensor is not None
+                else _decide_codebook(
+                    weight, _eager.rotate_int8_convrot_weight, group_size, convrot_groupsize
+                )
+            )
+        if staged_ok:
+            return _quantize_w4a8_staged(weight, cb, convrot_groupsize, stochastic_rounding)
+        return _fused_quantize_wxa8(weight, bits, group_size, cb, stochastic_rounding)
     return _quantize_w4a8_chunked(
         weight,
         _eager.rotate_int8_convrot_weight,
@@ -2861,6 +2930,11 @@ def flash_attention_decode_is_available() -> bool:
     return has_wmma() and hasattr(_C, "flash_attention_decode")
 
 
+def flash_attention_decode_gqa_is_available() -> bool:
+    """Whether the head-first GQA decode and step-merge kernels can run here."""
+    return has_wmma() and hasattr(_C, "flash_attention_decode_gqa")
+
+
 # ---------------------------------------------------------------------------
 # GatedDeltaNet decode
 #
@@ -2972,6 +3046,90 @@ def deltanet_conv_step(
     )
 
 
+def gated_delta_deferred_is_available(key_head_dim: int = 128, value_head_dim: int = 128) -> bool:
+    """Whether the deferred-commit DeltaNet decode kernels can run here.
+
+    The deferred kernel keeps the whole [DK, DV] state in one 1024-thread block
+    the way the snapshot kernel does, so it is built for DK = DV = 128 only.
+    """
+    if not has_wmma() or not hasattr(_C, "gated_delta_decode_deferred"):
+        return False
+    return key_head_dim == _DELTA_KEY_DIM and value_head_dim == _DELTA_KEY_DIM
+
+
+def deltanet_conv_deferred(
+    proj: torch.Tensor,
+    proj_buf: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_w: torch.Tensor,
+    conv_b: torch.Tensor | None,
+    qkv_buf: torch.Tensor,
+    ctl: torch.Tensor,
+) -> bool:
+    """Deferred-commit conv step: see comfy_kitchen.gated_delta.deltanet_conv_step_deferred.
+
+    The kernel reads packed layouts, so ``proj`` must be contiguous. Returns False
+    for a shape outside the kernel's envelope, leaving every buffer untouched.
+    """
+    return _C.deltanet_conv_deferred(
+        _dl(proj),
+        _dl(proj_buf),
+        _dl(conv_state),
+        _dl(conv_w),
+        None if conv_b is None else _dl(conv_b),
+        _dl(qkv_buf),
+        _dl(ctl),
+        _stream(proj),
+    )
+
+
+def gated_delta_decode_deferred(
+    x: torch.Tensor,
+    w_a: torch.Tensor,
+    w_b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    g_decay: torch.Tensor,
+    qkv_buf: torch.Tensor,
+    gates_buf: torch.Tensor,
+    sumsq_buf: torch.Tensor,
+    ctl: torch.Tensor,
+    state: torch.Tensor,
+    out: torch.Tensor,
+    z: torch.Tensor,
+    norm_w: torch.Tensor,
+    eps: float,
+    key_dim: int,
+    num_key_heads: int,
+    scale: float,
+) -> bool:
+    """Deferred-commit decode: see comfy_kitchen.gated_delta.gated_delta_decode_deferred.
+
+    ``z`` is read packed as [B, S, Hv*DV], so a strided gate view is copied here.
+    Returns False for a shape outside the kernel's envelope, leaving ``state``,
+    ``out`` and the side buffers untouched.
+    """
+    return _C.gated_delta_decode_deferred(
+        _dl(x),
+        _dl(w_a),
+        _dl(w_b),
+        _dl(dt_bias),
+        _dl(g_decay),
+        _dl(qkv_buf),
+        _dl(gates_buf),
+        _dl(sumsq_buf),
+        _dl(ctl),
+        _dl(state),
+        _dl(out),
+        _dl(z.contiguous()),
+        _dl(norm_w),
+        float(eps),
+        key_dim,
+        num_key_heads,
+        float(scale),
+        _stream(x),
+    )
+
+
 def flash_decode(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3000,6 +3158,45 @@ def flash_decode(
         num_splits,
         _stream(q),
     )
+
+
+def flash_decode_gqa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_lengths: torch.Tensor,
+    output: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    softmax_lse_accum: torch.Tensor,
+    output_accum: torch.Tensor,
+    num_splits: int,
+) -> None:
+    """Head-first GQA decode attention into ``output``. See ops/flash_decode.hip."""
+    _C.flash_attention_decode_gqa(
+        _dl(q),
+        _dl(k),
+        _dl(v),
+        _dl(kv_lengths),
+        _dl(output),
+        _dl(softmax_lse),
+        _dl(softmax_lse_accum),
+        _dl(output_accum),
+        num_splits,
+        _stream(q),
+    )
+
+
+def flash_decode_step_merge(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    merged: torch.Tensor,
+) -> None:
+    """Fold the current step's rows causally into a prefix-only decode result. See ops/flash_decode.hip."""
+    _C.flash_attention_decode_step_merge(
+        _dl(out), _dl(lse), _dl(q), _dl(k), _dl(v), _dl(merged), _stream(q))
 
 
 def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):

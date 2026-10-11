@@ -232,3 +232,127 @@ def test_flash_attention_decode_rejects_invalid_dimensions(q_dim, k_dim, v_dim):
     lengths = torch.tensor([257], device="cuda", dtype=torch.int32)
     with pytest.raises(RuntimeError, match=r"dimensions|k/v shape mismatch"):
         ck.flash_attention_decode(q, k, v, lengths)
+
+
+requires_gqa_decode = pytest.mark.skipif(
+    not ck.flash_attention_decode_gqa_is_available(),
+    reason="requires the head_dim-256 GQA decode kernel",
+)
+
+# flash_attention_decode_gqa and flash_attention_decode_step_merge compute the same result
+# everywhere: the native kernel for BF16 head_dim 256 where one is built, torch otherwise.
+# The reference tests run on the GPU when there is one (native for bf16/256, torch for the
+# other operands) and on the CPU otherwise.
+GQA_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+GQA_OPERANDS = [(torch.bfloat16, 256), (torch.float32, 256), (torch.bfloat16, 128)]
+
+
+@pytest.mark.parametrize(("dtype", "head_dim"), GQA_OPERANDS)
+@pytest.mark.parametrize("rows", [1, 8])
+def test_flash_attention_decode_step_merge_matches_full_softmax(dtype, head_dim, rows):
+    # Verify rows read the committed prefix through one decode pass and fold the step's own
+    # rows in afterwards, row r seeing step rows t <= r. Row r must then equal a plain softmax
+    # over the prefix plus step rows 0..r.
+    torch.manual_seed(0)
+    batch, kv_heads, groups, prefix = 2, 2, 4, 37
+    heads = kv_heads * groups
+    prefix_k = torch.randn(batch, kv_heads, prefix, head_dim, device=GQA_DEVICE, dtype=dtype)
+    prefix_v = torch.randn_like(prefix_k)
+    q = torch.randn(batch, heads, rows, head_dim, device=GQA_DEVICE, dtype=dtype)
+    xk = torch.randn(batch, kv_heads, rows, head_dim, device=GQA_DEVICE, dtype=dtype)
+    xv = torch.randn_like(xk)
+
+    def scores_values(k, v):
+        scores = torch.einsum("bhsd,bhcd->bhsc", q.float(), k.repeat_interleave(groups, dim=1).float())
+        return scores * head_dim ** -0.5, v.repeat_interleave(groups, dim=1).float()
+
+    def attend(scores, values):
+        return torch.einsum("bhsc,bhcd->bshd", scores.softmax(-1), values).reshape(batch, rows, -1)
+
+    # the prefix-only decode result in the layout flash_attention_decode_gqa writes
+    prefix_scores, prefix_values = scores_values(prefix_k, prefix_v)
+    out = attend(prefix_scores, prefix_values).to(dtype)
+    merged = torch.empty_like(out)
+    ck.flash_attention_decode_step_merge(out, prefix_scores.logsumexp(-1), q, xk, xv, merged)
+
+    step_scores, step_values = scores_values(xk, xv)
+    future = torch.ones(rows, rows, dtype=torch.bool, device=GQA_DEVICE).triu(1)
+    expected = attend(torch.cat([prefix_scores, step_scores.masked_fill(future, float("-inf"))], dim=-1),
+                      torch.cat([prefix_values, step_values], dim=2))
+    torch.testing.assert_close(merged.float(), expected, atol=3e-3, rtol=1e-2)
+
+
+@requires_flash_decode
+@pytest.mark.parametrize("num_splits", [2, 5, 32])
+def test_flash_attention_decode_fused_combine_matches_two_launch(monkeypatch, num_splits):
+    """The in-kernel split fold (last CTA per row) must reproduce the separate
+    combine launch bit for bit: same warp-width reduction of the split maxima and
+    sums, same split order in the weighted accumulation."""
+    monkeypatch.setattr(flash_attention_module, "_num_splits", lambda *_, **__: num_splits)
+    torch.manual_seed(0)
+    q = torch.randn(3, 1, 8, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(3, 4097, 2, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    lengths = torch.tensor([1, 73, 4097], device="cuda", dtype=torch.int32)
+    with monkeypatch.context() as fallback:
+        fallback.setattr(flash_attention_module, "_COMBINE_COUNTERS", 0)
+        two_launch = ck.flash_attention_decode(q, k, v, lengths)
+    fused = [ck.flash_attention_decode(q, k, v, lengths) for _ in range(3)]  # counters must rearm between calls
+    for out in fused:
+        assert torch.equal(out, two_launch)
+    torch.testing.assert_close(two_launch, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
+
+
+@requires_gqa_decode
+@pytest.mark.parametrize("num_splits", [2, 5, 32])
+@pytest.mark.parametrize("query_length", [1, 4])
+def test_flash_attention_decode_gqa_fused_combine_matches_two_launch(monkeypatch, num_splits, query_length):
+    monkeypatch.setattr(flash_attention_module, "_num_splits", lambda *_, **__: num_splits)
+    torch.manual_seed(0)
+    q = torch.randn(3, 8, query_length, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(3, 2, 4097, 256, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    lengths = torch.tensor([query_length, 73, 4097], device="cuda", dtype=torch.int32)
+    with monkeypatch.context() as fallback:
+        fallback.setattr(flash_attention_module, "_COMBINE_COUNTERS", 0)
+        out_ref = ck.flash_attention_decode_gqa(q, k, v, lengths)
+    for _ in range(3):
+        assert torch.equal(ck.flash_attention_decode_gqa(q, k, v, lengths), out_ref)
+
+
+@pytest.mark.parametrize(("dtype", "head_dim"), GQA_OPERANDS)
+@pytest.mark.parametrize("query_length", [1, 3, 7, 8])
+def test_flash_attention_decode_gqa_matches_reference(query_length, dtype, head_dim):
+    # row j of batch b sees slots < kv_lengths[b] - S + j + 1
+    torch.manual_seed(0)
+    batch, kv_heads, groups, capacity = 2, 2, 4, 300
+    heads = kv_heads * groups
+    q = torch.randn(batch, query_length, heads, head_dim, device=GQA_DEVICE, dtype=dtype).transpose(1, 2)
+    k = torch.randn(batch, kv_heads, capacity, head_dim, device=GQA_DEVICE, dtype=dtype)
+    v = torch.randn_like(k)
+    lengths = [query_length + 5, 281]
+    out = ck.flash_attention_decode_gqa(q, k, v, torch.tensor(lengths, device=GQA_DEVICE, dtype=torch.int32))
+
+    kf = k.repeat_interleave(groups, dim=1).float()
+    vf = v.repeat_interleave(groups, dim=1).float()
+    scores = torch.einsum("bhsd,bhcd->bhsc", q.float(), kf) * head_dim ** -0.5
+    cols = torch.arange(capacity, device=GQA_DEVICE)
+    for b, length in enumerate(lengths):
+        limit = length - query_length + 1 + torch.arange(query_length, device=GQA_DEVICE)
+        scores[b].masked_fill_(cols[None, None, :] >= limit[None, :, None], float("-inf"))
+    expected = torch.einsum("bhsc,bhcd->bshd", scores.softmax(-1), vf).reshape(batch, query_length, -1)
+    torch.testing.assert_close(out.float(), expected, atol=3e-3, rtol=1e-2)
+
+
+def test_flash_attention_decode_gqa_native_is_bf16_only():
+    assert not ck.flash_attention_decode_gqa_is_available(dtype=torch.float16)
+    assert not ck.flash_attention_decode_gqa_is_available(dtype=torch.float32)
+
+
+def test_flash_attention_decode_gqa_torch_empty_prefix_is_zero():
+    # the torch path writes zeros for a row without slots, as the kernels do, not 0/0
+    q = torch.randn(1, 4, 1, 256, device=GQA_DEVICE, dtype=torch.float32)
+    k = torch.randn(1, 2, 64, 256, device=GQA_DEVICE, dtype=torch.float32)
+    lengths = torch.zeros(1, device=GQA_DEVICE, dtype=torch.int32)
+    out = ck.flash_attention_decode_gqa(q, k, k, lengths)
+    assert torch.equal(out, torch.zeros_like(out))
