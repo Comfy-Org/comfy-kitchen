@@ -1397,7 +1397,6 @@ def test_hip_attention_rejects_invalid_prepared_mask(invalid):
 
 
 @requires_int8_attention
-@requires_int8_attention
 @pytest.mark.skipif(not torch.version.hip, reason="HIP packed-V binding")
 # int8_bf16sv.hip used to take over whenever V arrived in its own dtype. It was
 # unreachable from the public API (both int8_attention and
@@ -1525,7 +1524,7 @@ def _call_use_direct(hip_backend, q, k, attn_mask):
     """Ask the implementation sage_int8_sdpa itself gates on.
 
     Deliberately the backend's own helper rather than a second copy of the rule
-    here. ``_expected_use_direct`` below is the independent specification this is
+    here. ``_expected_use_direct`` above is the independent specification this is
     compared against; re-deriving the actual answer in the test file as well would
     make the assertion compare two copies of one rule, both of which live here, so
     editing the gate in ``comfy_kitchen/backends/hip/__init__.py`` would leave the
@@ -1535,10 +1534,6 @@ def _call_use_direct(hip_backend, q, k, attn_mask):
     return hip_backend._sage_use_direct(q, k, attn_mask)
 
 
-# Both sides appended a block here and each had its own @requires_int8_attention
-# immediately above. Git kept one of those decorators as shared context and left the
-# other block with none, so the resolution restores the second one rather than
-# choosing a side. Nothing else was contested: the two blocks are independent tests.
 @requires_int8_attention
 @pytest.mark.skipif(bool(torch.version.hip), reason="CUDA paged decode kernel")
 @pytest.mark.parametrize("seq", [1, 7])

@@ -1998,9 +1998,22 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
         // dim must be contiguous), the transpose writes fp16 over the full V width
         // (buffer must be the 2x-wide gfx1103 layout), and o is written with 16-byte
         // stores.
-        require_dtype(q, 1, 2, kFn, "q");
-        require_dtype(k, 1, 2, kFn, "k");
-        require_dtype(v, 1, 2, kFn, "v");
+        // Exact match against input_dtype_code, not "either 16-bit float". The
+        // direct launches reinterpret q and k from input_dtype_code, and fp16 and
+        // bf16 are both two bytes: a tensor of the wrong one has the right length,
+        // so nothing below this line would notice and the kernel would read bf16 bits
+        // as fp16. That is reachable from sage_int8_sdpa rather than only from a
+        // direct _C.sage_sdpa call -- it derives input_dtype_code from q.dtype alone
+        // and never checks that k and v agree -- so q in one 16-bit float and k in the
+        // other passes every check here and returns wrong numbers silently.
+        //
+        // direct_dtype already restricts input_dtype_code to 1 or 2 on this path, so
+        // the exact-match form cannot reject a code the direct kernel would have
+        // accepted. sage_quantize takes the same form for the int8 path (the require
+        // on q there has always been exact), and this is the 16-bit equivalent of it.
+        require_dtype(q, input_dtype_code, input_dtype_code, kFn, "q");
+        require_dtype(k, input_dtype_code, input_dtype_code, kFn, "k");
+        require_dtype(v, input_dtype_code, input_dtype_code, kFn, "v");
         // o is written at output_dtype_code (16-bit, same as the input on the
         // direct path), so validate it against the output argument rather than
         // silently ignoring it.

@@ -1052,22 +1052,36 @@ def fp16_linear(
     if residual is not None:
         resid_arg = residual.to(device=x.device).reshape(m, n).contiguous()
         rscale_arg = _vector_operand(residual_scale, x.device, torch.float16)
-    if x.dtype == torch.float16:
-        served = _C.fp16_gemm(
-            _dl(x_2d), _dl(weight), _dl(out),
-            None if bias_arg is None else _dl(bias_arg),
-            None if rscale_arg is None else _dl(rscale_arg),
-            None if resid_arg is None else _dl(resid_arg),
-            m, n, k, _stream(x),
-        )
-    else:
-        served = _C.bf16_gemm(
-            _dl(x_2d), _dl(weight), _dl(out),
-            None if bias_arg is None else _dl(bias_arg),
-            None if rscale_arg is None else _dl(rscale_arg),
-            None if resid_arg is None else _dl(resid_arg),
-            m, n, k, _stream(x),
-        )
+    # The stream comes from x, but both launchers pick their architecture from the
+    # CURRENT device -- launch_fp16_gemm_kernel branches on comfy_is_gfx10() to reach
+    # the VALU v_dot2_f32_f16 kernel and falls through to launch_gemm_wmma<MmaF16>
+    # otherwise, and fp16_shape_served reads the same device. On a box where those
+    # two devices differ, a gfx11 current device sends a gfx103x stream to a WMMA
+    # launch, and MmaF16 does not exist there. The reverse direction is milder and
+    # asymmetric by dtype: the bf16 launcher declines gfx10 outright (there is no
+    # v_dot2_f32_bf16 below gfx11) while fp16 has a VALU kernel, so a gfx10 current
+    # device with a gfx11 stream declines one and mis-serves the other.
+    #
+    # This is the same pin int8_linear, _w4a8_int8_linear_chunked and
+    # convrot_w4a4_linear already apply for the same reason, and it is free where it
+    # cannot matter: _device_pin is a nullcontext when only one device is visible.
+    with _device_pin(x.device):
+        if x.dtype == torch.float16:
+            served = _C.fp16_gemm(
+                _dl(x_2d), _dl(weight), _dl(out),
+                None if bias_arg is None else _dl(bias_arg),
+                None if rscale_arg is None else _dl(rscale_arg),
+                None if resid_arg is None else _dl(resid_arg),
+                m, n, k, _stream(x),
+            )
+        else:
+            served = _C.bf16_gemm(
+                _dl(x_2d), _dl(weight), _dl(out),
+                None if bias_arg is None else _dl(bias_arg),
+                None if rscale_arg is None else _dl(rscale_arg),
+                None if resid_arg is None else _dl(resid_arg),
+                m, n, k, _stream(x),
+            )
     if not served:
         # The GEMM declined the shape; torch's linear needs the bias in the input
         # dtype (addmm requires compatible operand dtypes), so cast the FP16 bias
@@ -4184,6 +4198,7 @@ def _rdna2_prepare_attn_mask(
     mask: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
+    kv_length: int | None = None,
 ) -> tuple[int, int, torch.Tensor]:
     """Turn a caller-supplied mask into a (mode, dtype code, buffer) triple.
 
@@ -4210,7 +4225,17 @@ def _rdna2_prepare_attn_mask(
         )
     if mask.device != q.device:
         raise ValueError("attn_mask must be on the same device as q, k and v")
-    kv_length = k.shape[2]
+    # The key length, from the axis the caller's layout puts it on. It cannot be
+    # derived from k alone: tensor_layout="HND" is [B, H, S, D] and tensor_layout=
+    # "NHD" is [B, S, H, D], so k.shape[2] is the key length under the first and the
+    # HEAD COUNT under the second. Reading the wrong one is not a crash and not a
+    # wrong answer -- it is a wrong axis feeding two decisions below, so the failure
+    # is a ValueError rejecting a valid mask whenever the head count differs from the
+    # key length, and the prepared-key packing being chosen against the head count
+    # rather than the key count. Defaulted rather than required so the HND behaviour
+    # is unchanged for any other caller.
+    if kv_length is None:
+        kv_length = k.shape[2]
     if mask.shape[-1] not in (kv_length, 1):
         raise ValueError(
             f"attn_mask's last extent must be {kv_length} or 1, got {mask.shape[-1]}"
@@ -4259,6 +4284,7 @@ def _rdna2_unpack_prepared_mask(
     packed: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
+    kv_length: int | None = None,
 ) -> tuple[int, int, torch.Tensor]:
     """Recognise a packed mask buffer and return the mode to read it with.
 
@@ -4271,11 +4297,18 @@ def _rdna2_unpack_prepared_mask(
     if packed.dim() == 4:
         return _RDNA2_MASK_RAW, _RDNA2_MASK_DTYPE_CODE[packed.dtype], packed
     if packed.dim() == 3:
-        expected = _rdna2_prepared_mask_width(k.shape[2])
+        # Same axis question as _rdna2_prepare_attn_mask, and it is not only the
+        # message here: _rdna2_prepared_mask_width derives the expected packed width
+        # from the key length, so reading the head count under NHD sizes the check
+        # against the wrong number of 64-key tiles and it both rejects masks packed
+        # for the real key length and accepts ones packed for the head count.
+        if kv_length is None:
+            kv_length = k.shape[2]
+        expected = _rdna2_prepared_mask_width(kv_length)
         if packed.shape[-1] != expected:
             raise ValueError(
                 f"prepared key mask must be {expected} wide for kv_length "
-                f"{k.shape[2]}, got {packed.shape[-1]}"
+                f"{kv_length}, got {packed.shape[-1]}"
             )
         if packed.dtype != torch.float32:
             raise ValueError("prepared key mask must be float32")
@@ -4359,11 +4392,21 @@ def rdna2_sageattn(
     # True when this call built the mask itself, and so owns a temporary the
     # pending kernel still reads.
     owns_mask_buffer = False
+    # The key length, from the axis tensor_layout puts it on, derived ONCE here
+    # because two helpers below need it and deriving it from k alone gets the head
+    # count under NHD: HND is [B, H, S, D] so k.size(2) is the key length, and NHD is
+    # [B, S, H, D] so it is k.size(1). The mask helpers read it to validate the mask's
+    # last extent and to size the prepared-key packing.
+    kv_len = k.size(2) if tensor_layout == "HND" else k.size(1)
     if attn_mask is not None:
         if prequantized:
-            mask_mode, mask_dtype, mask_buffer = _rdna2_unpack_prepared_mask(attn_mask, q, k)
+            mask_mode, mask_dtype, mask_buffer = _rdna2_unpack_prepared_mask(
+                attn_mask, q, k, kv_len
+            )
         else:
-            mask_mode, mask_dtype, mask_buffer = _rdna2_prepare_attn_mask(attn_mask, q, k)
+            mask_mode, mask_dtype, mask_buffer = _rdna2_prepare_attn_mask(
+                attn_mask, q, k, kv_len
+            )
             owns_mask_buffer = True
 
     input_dtype = dtype
@@ -4400,8 +4443,6 @@ def rdna2_sageattn(
         device=q.device,
     )
     o = out.transpose(1, 2) if tensor_layout == "HND" else out
-
-    kv_len = k.size(2) if tensor_layout == "HND" else k.size(1)
 
     # gfx103x reads native [B,H,N,D] V directly; no transpose is needed, and the
     # v_scale argument is a placeholder the kernel does not read. The kernel
