@@ -17,6 +17,7 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <cmath>
+#include <algorithm>
 
 #ifdef COMFY_HAVE_CUTLASS
 
@@ -29,7 +30,11 @@
 
 namespace {
 using namespace cute;
-using comfy_cutlass::ThreadblockSwizzleLeanStreamK;
+using comfy_cutlass::device_sm_count;
+using comfy_cutlass::device_l2_bytes;
+// Bands of 32 N tiles: a 154 MB weight at 32k rows reads 0.9 GB from DRAM instead of 26 GB.
+// An L2 too small to hold a band narrows them, see stream_k_band_tiles.
+using ThreadblockSwizzleBandedStreamK = comfy_cutlass::ThreadblockSwizzleLeanStreamKT<32>;
 
 template <typename ThreadMap, bool Scalar>
 struct WeightScaleBroadcast;
@@ -203,18 +208,6 @@ int select_fused_int8_config(int m, int n, int k) {
 // The tree ignores wave quantization: at decoder-tile M (~2k rows) its 128x256
 // pick can leave a 2.1-wave grid where 128x128 wins despite ~8% lower per-tile
 // throughput. Between those two, take the smaller wave-rounding x tile-cost.
-int device_sm_count() {
-    static int counts[64] = {};
-    int dev = 0;
-    cudaGetDevice(&dev);
-    if (dev < 0 || dev >= 64) return 1;
-    if (counts[dev] == 0) {
-        cudaDeviceGetAttribute(&counts[dev], cudaDevAttrMultiProcessorCount, dev);
-        if (counts[dev] <= 0) counts[dev] = 1;
-    }
-    return counts[dev];
-}
-
 int wave_guard(int m, int n, int selected) {
     if (selected != 0 && selected != 1) return selected;
     const int sms = device_sm_count();
@@ -225,9 +218,20 @@ int wave_guard(int m, int n, int selected) {
     return cost(256, 1.0) <= cost(128, 1.08) ? 0 : 1;
 }
 
+int choose_fused_int8_config(int m, int n, int k) {
+    const int selected = wave_guard(m, n, select_fused_int8_config(m, n, k));
+    if (selected != 0 && selected != 1) return selected;
+    // The identity order re-reads the activation per weight column once it outgrows L2;
+    // banded stream-K does not, but only bands when M has at least as many tiles as N.
+    // Measured crossovers: 66-88 MB at 96 MB L2, 42-63 MB at 36 MB.
+    const int64_t reroute_bytes = std::max<int64_t>(int64_t(device_l2_bytes()) * 3 / 4, int64_t(48) << 20);
+    const bool bands = (m + 127) / 128 >= (n + 255) / 256;
+    return (bands && int64_t(m) * k > reroute_bytes) ? 13 : selected;
+}
+
 template <typename Launch>
 bool launch_fused_int8_heuristic(int m, int n, int k, Launch launch) {
-    const int selected = wave_guard(m, n, select_fused_int8_config(m, n, k));
+    const int selected = choose_fused_int8_config(m, n, k);
     if (launch(selected)) return true;
 
     static constexpr int aligned_fallbacks[] = {2, 12, 0, 13, 1, 6, 8, 7, 3, 4, 5};
@@ -261,8 +265,8 @@ using FusedInt8Configs = ConfigList<
     TileConfig< 64, 128,  64, 32, 64,  64, 4, 8>,                                    // 9  (K % 8 alignment)
     TileConfig< 32, 128,  64, 32, 64,  64, 4, 8>,                                    // 10
     TileConfig< 16, 128,  64, 16, 64,  64, 4, 8>,                                    // 11
-    TileConfig<128, 128,  64, 64, 64,  64, 4, 16, ThreadblockSwizzleLeanStreamK>,    // 12 (stream-K)
-    TileConfig<128, 256,  64, 64, 64,  64, 3, 16, ThreadblockSwizzleLeanStreamK>>;   // 13
+    TileConfig<128, 128,  64, 64, 64,  64, 4, 16, ThreadblockSwizzleBandedStreamK>,  // 12 (stream-K)
+    TileConfig<128, 256,  64, 64, 64,  64, 3, 16, ThreadblockSwizzleBandedStreamK>>; // 13
 constexpr int kFusedConfigCount = FusedInt8Configs::size;
 
 template <typename OutT, typename C>
@@ -337,6 +341,10 @@ bool dispatch_fused_residual(const int8_t* A, const int8_t* B, const float* xs, 
 }  // namespace
 
 extern "C" {
+int cutlass_int8_selected_config(int64_t M, int64_t N, int64_t K) {
+    return choose_fused_int8_config(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K));
+}
+
 bool launch_cutlass_int8_dequant_residual(
     const void* A, const void* B, const void* xs, const void* ws, const void* bias,
     const void* rscale, const void* resid, void* D, int64_t M, int64_t N, int64_t K,
@@ -442,5 +450,7 @@ extern "C" bool launch_cutlass_int8_dequant_residual(
     cudaStream_t) {
     return false;
 }
+
+extern "C" int cutlass_int8_selected_config(int64_t, int64_t, int64_t) { return -1; }
 
 #endif
