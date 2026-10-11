@@ -144,6 +144,64 @@ def test_hip_wmma_capability(arches, expected):
     assert hip_backend._has_wmma(arches) is expected
 
 
+def _comfy_is_gfx10_archs():
+    """The architectures C++'s comfy_is_gfx10() accepts, read out of launchers.h.
+
+    Parsed rather than restated, because restating it here would be a third copy of
+    the list -- and a test that compares a constant against a copy of itself passes
+    forever while the real gate moves on without it. The gate is a std::strstr chain
+    over gfx1030..gfx1036; anything that stops looking like that is a change worth
+    failing on rather than silently skipping.
+    """
+    src = pathlib.Path(hip_backend.__file__).with_name("launchers.h").read_text(
+        encoding="utf-8"
+    )
+    start = src.index("inline bool comfy_is_gfx10(int device)")
+    body = src[start : src.index("inline bool comfy_is_gfx10()", start)]
+    found = re.findall(r'strstr\(n, "(gfx\d+)"\)', body)
+    assert found, "comfy_is_gfx10() no longer matches architectures by name"
+    return frozenset(found)
+
+
+def test_valu_gemm_gate_is_the_gfx103x_gate_and_not_a_parallel_one():
+    """_ARCH_VALU_GEMM must be exactly what comfy_is_gfx10() accepts.
+
+    The NVFP4 VALU GEMM is reached behind comfy_is_gfx10() in ops/nvfp4.hip's
+    CK_NVFP4_DISPATCH_OUT. The Python half of that is _ARCH_VALU_GEMM, which decides
+    whether scaled_mm_nvfp4 is advertised at all. Two gates that are meant to be one
+    and are written twice drift, and the failure is the worst kind: on an
+    architecture in one list and not the other the op is advertised and the launcher
+    declines it (a slow dequantize with no error), or the reverse (a kernel reached
+    on a part whose instruction set it was not compiled for).
+
+    So this asserts the two agree, exactly, rather than asserting that the constant
+    is a plausible-looking set of gfx103x parts.
+    """
+    assert hip_backend._ARCH_VALU_GEMM == _comfy_is_gfx10_archs()
+    assert hip_backend._ARCH_VALU_GEMM == hip_backend._ARCH_ELEMENTWISE_ONLY
+
+
+def test_valu_gemm_ops_are_readmitted_only_for_the_gfx103x_gate():
+    """The op comes back exactly when the architecture says so, and not by default.
+
+    _build_constraints drops scaled_mm_nvfp4 as a WMMA-only op, then puts it back for
+    has_valu_gemm. The default argument has to stay False: it is what every caller
+    that does not know the architecture gets, and a default of True would advertise a
+    VALU kernel on a box that has no matrix cores and no RDNA2 either.
+    """
+    re_admitted = hip_backend._VALU_GEMM_OPS
+    assert re_admitted <= hip_backend._WMMA_ONLY_OPS
+    assert "scaled_mm_nvfp4" in re_admitted
+
+    assert re_admitted <= set(hip_backend._build_constraints(has_wmma=False,
+                                                             has_valu_gemm=True))
+    # Closed on a part that is neither matrix-core nor RDNA2. has_wmma defaults to
+    # True, so that part is the explicit (False, False) rather than the bare call --
+    # and it is the pair _register computes on a box that is neither.
+    assert not (re_admitted & set(hip_backend._build_constraints(has_wmma=False)))
+    assert "scaled_mm_nvfp4" not in hip_backend._build_constraints(has_wmma=False)
+
+
 def test_hip_drops_gemms_without_matrix_cores():
     """RDNA2 keeps the elementwise kernels and hands the GEMMs back to triton/eager."""
     with_wmma = hip_backend._build_constraints(has_wmma=True)

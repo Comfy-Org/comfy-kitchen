@@ -88,6 +88,7 @@ __all__ = [
     "dequantize_int8_simple_dtype",
     "dequantize_per_tensor_fp8",
     "dequantize_w4a8_int8_weight",
+    "has_valu_gemm",
     "has_wmma",
     "int8_linear",
     "int8_attention_is_available",
@@ -203,8 +204,12 @@ def _is_small_igpu_index(index: int) -> bool:
 def _visible_gfx_arches() -> tuple[str | None, ...]:
     """One entry per visible device; None where the architecture could not be read.
 
-    Cached: the visible device set is fixed for the life of the process, and
-    scaled_mm_v2 consults has_wmma() on every candidate GEMM.
+    Cheap, but not free and not because of anything in here: the visible device set
+    is fixed for the life of the process, and torch caches get_device_properties, so
+    the whole call is a current_device(), a device_count() and a tuple build. It was
+    measured at 0.05 us against 2.97 us for a bare _gfx_arch(0), which is the whole
+    argument for calling it once per predicate rather than once per term -- see
+    has_wmma and has_valu_gemm, which both hoist it for exactly this reason.
     """
     if not torch.cuda.is_available() or not getattr(torch.version, "hip", None):
         return ()
@@ -259,6 +264,12 @@ _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
 _ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
 _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 
+# The RDNA2 manifest group, read back out of the same file rather than spelled as a
+# literal list, because this gate has to move in lockstep with _has_wmma's: both
+# derive from architectures.json, and a second hand-written gfx103x list is a second
+# place for the manifest and the gate to disagree.
+_ARCH_VALU_GEMM = _ARCH_ELEMENTWISE_ONLY
+
 # The GEMMs that need matrix cores and have no RDNA2 fallback. Everything else
 # either has a VALU path behind __GFX10__ (int8_linear, fp16_linear,
 # w4a8_int8_linear, convrot_w4a4_linear) or runs on any supported architecture.
@@ -285,10 +296,21 @@ _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 # else reaches MmaInt4 exactly as before. Removing it here only stops the whole
 # op being withheld from RDNA2; the WMMA path is untouched.
 #
-# scaled_mm_nvfp4 is in this set for a different reason than the rest. The tile
-# kernel needs WMMA, and mma.h's no-matrix-core fallback for MmaF16::mma is
-# __builtin_trap() rather than a plausible wrong answer -- so on RDNA2 the kernel
-# is compiled (the TU must build in every device pass) but must never be launched.
+# scaled_mm_nvfp4 is in this set for a different reason than the rest. The WMMA tile
+# kernel needs matrix cores, and mma.h's no-matrix-core fallback for MmaF16::mma is
+# __builtin_trap() rather than a plausible wrong answer -- so on an architecture with
+# neither matrix cores nor a VALU NVFP4 kernel, that kernel is compiled (the TU must
+# build in every device pass) but must never be launched.
+#
+# RDNA2 is no longer that architecture. nvfp4_gfx10.h gives it a VALU GEMM on
+# v_dot4_i32_i8 -- a GEMV for M <= 4 and a register tile above it, both reached
+# behind the same comfy_is_gfx10() gate as every other gfx103x VALU path -- so
+# _WMMA_ONLY_OPS drops scaled_mm_nvfp4 only for devices outside _ARCH_VALU_GEMM, and
+# _build_constraints puts it back for those inside it. The distinction the set is
+# drawing is "this op's only implementation is a matrix-core kernel" and not "this op
+# needs a matrix core", which is what w4a8_int8_linear and convrot_w4a4_linear were
+# both wrongly filed under above.
+#
 # quantize_nvfp4 and dequantize_nvfp4 stay out of this set deliberately: they are
 # VALU and LDS work with no matrix instruction in them, and they are the ops that
 # make the packed representation usable at all when the GEMM has to fall back.
@@ -298,6 +320,13 @@ _WMMA_ONLY_OPS = frozenset({
     "na3d",
     "sol_attn",
     "scaled_mm_svdquant_w4a4",
+    "scaled_mm_nvfp4",
+})
+
+# The subset of _WMMA_ONLY_OPS that has a VALU implementation on _ARCH_VALU_GEMM, and
+# so is re-advertised there. Only scaled_mm_nvfp4 is in it: the others' VALU
+# fallbacks (conv3d, na3d, sol_attn, svdquant w4a4) do not exist on this backend.
+_VALU_GEMM_OPS = frozenset({
     "scaled_mm_nvfp4",
 })
 
@@ -328,8 +357,49 @@ def _has_wmma(arches: Sequence[str | None]) -> bool:
     return bool(arches) and all(a in _ARCH_WMMA for a in arches)
 
 
+def _has_valu_gemm(arches: Sequence[str | None]) -> bool:
+    """Whether every visible device has the RDNA2 VALU GEMM set.
+
+    The same intersection _has_wmma takes and for the same reason: registration is
+    per-process while kernels launch on the tensor's own device, so the capability
+    set has to hold for all of them. False on a mixed box, which is what sends an
+    NVFP4 matmul back to dequantize there -- the safe answer, and the same one
+    _has_wmma gives.
+    """
+    return bool(arches) and all(a in _ARCH_VALU_GEMM for a in arches)
+
+
 def is_available() -> bool:
     return _EXT_AVAILABLE and _unsupported_arch_reason(_visible_gfx_arches()) is None
+
+
+def has_valu_gemm() -> bool:
+    """Whether every visible device has the RDNA2 VALU GEMM set (gfx103x).
+
+    False when the extension is unavailable, when the architectures are not all in
+    the validated manifest, or when the process has a mix of RDNA2 and matrix-core
+    cards -- the same intersection :func:`has_wmma` takes, and for the same reason:
+    registration is per-process while kernels launch on the tensor's own device.
+
+    This is what makes the NVFP4 GEMM reachable on RDNA2. ``scaled_mm_nvfp4``'s
+    launcher branches on ``comfy_is_gfx10()`` and reaches nvfp4_gfx10.h's GEMV or
+    register tile there, so the op is advertised on gfx103x as well as on the
+    matrix-core parts; this predicate is the Python-side half of that, and
+    :func:`comfy_kitchen.tensor.base.nvfp4_mm_has_fast_path` is what consults it.
+
+    One arch snapshot per call, and the snapshot is hoisted for the same reason
+    :func:`has_wmma` hoists it: this sits on the per-matmul dispatch path, and
+    ``_visible_gfx_arches`` is not free -- it reads the current device and builds a
+    properties object per device. Calling it twice is not a style question either.
+    It is not what made a call cost 170 us on this stack, but it is free to be
+    wrong here and the fix is one line.
+    """
+    arches = _visible_gfx_arches()
+    return (
+        _EXT_AVAILABLE
+        and _unsupported_arch_reason(arches) is None
+        and _has_valu_gemm(arches)
+    )
 
 
 def has_wmma() -> bool:
@@ -2775,7 +2845,7 @@ def _topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sinks):
 # Registration
 # ---------------------------------------------------------------------------
 
-def _build_constraints(has_wmma: bool = True) -> dict:
+def _build_constraints(has_wmma: bool = True, has_valu_gemm: bool = False) -> dict:
     from comfy_kitchen.constraints import (
         DivisibleBy,
         ExactDims,
@@ -3225,7 +3295,19 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         # triton/eager while the elementwise kernels below, and the GEMMs that have
         # a VALU path (int8_linear, fp16_linear, w4a8_int8_linear), still dispatch
         # to HIP.
+        #
+        # _VALU_GEMM_OPS is put back out of the pre-drop dict rather than out of the
+        # filtered one, which is empty of them by construction -- reading it back out
+        # of `constraints` here silently does nothing and would leave the gate closed
+        # with nothing to show for it. This is the same shape w4a8_int8_linear and
+        # convrot_w4a4_linear were removed for: the launcher behind
+        # scaled_mm_nvfp4 branches on comfy_is_gfx10() exactly as the other RDNA2 VALU
+        # paths do, so the same call reaches the WMMA tile on gfx11 and the GEMV or
+        # the register tile on gfx103x with nothing else having to know which is which.
+        valu_gemm = {k: v for k, v in constraints.items() if k in _VALU_GEMM_OPS}
         constraints = {k: v for k, v in constraints.items() if k not in _WMMA_ONLY_OPS}
+        if has_valu_gemm:
+            constraints.update(valu_gemm)
 
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in constraints:
@@ -3760,15 +3842,18 @@ def _register():
         return
 
     has_wmma = _has_wmma(arches)
+    has_valu_gemm = _has_valu_gemm(arches)
     registry.register(
         name="hip",
         module=sys.modules[__name__],
-        capabilities=_build_constraints(has_wmma),
+        capabilities=_build_constraints(has_wmma, has_valu_gemm),
     )
     logger.debug(
         "registered HIP backend for %s (%s)",
         ", ".join(sorted({a for a in arches if a})),
-        "with WMMA" if has_wmma else "elementwise only, no matrix cores",
+        "with WMMA"
+        if has_wmma
+        else ("no matrix cores, VALU GEMMs" if has_valu_gemm else "elementwise only"),
     )
 
 

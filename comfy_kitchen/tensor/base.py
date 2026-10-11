@@ -230,13 +230,22 @@ def quantized_mm_has_fast_path(device_type: str) -> bool:
 def nvfp4_mm_has_fast_path(device_type: str) -> bool:
     """Whether an NVFP4 matmul can stay fused on this device.
 
-    Same answer as :func:`quantized_mm_has_fast_path` -- the HIP backend's NVFP4
-    GEMM is a WMMA kernel, so a part with matrix cores has a fast path whatever
-    PyTorch thinks -- with the CPU case taken back out.
+    The HIP backend's NVFP4 GEMM is a WMMA tile on the matrix-core parts and a
+    ``v_dot4_i32_i8`` VALU GEMV or register tile on gfx103x (nvfp4_gfx10.h, reached
+    behind ``comfy_is_gfx10()`` and advertised by ``_VALU_GEMM_OPS``), so on both
+    families a fast path exists and this defers to the two of them:
 
-    It has to be, because the fallback this gate guards is not symmetric across
-    layouts. FP8's registry entry (``scaled_mm_v2``) ends in ``torch._scaled_mm``,
-    which exists on CPU and fails per call. NVFP4's ends in
+    - ``has_wmma()`` -- a matrix-core part has the tile whatever PyTorch thinks.
+    - ``has_valu_gemm()`` -- gfx103x has the VALU kernels, and there is no
+      ``torch._scaled_mm`` to probe (it refuses on ROCm below MI300), so the probe
+      below would answer "no" and send every NVFP4 matmul to dequantize on a part
+      that can run it fused. That is the same reason ``quantized_mm_has_fast_path``
+      does not fall through to ``native_scaled_mm_usable`` when ``has_wmma()``
+      holds; here it is the only answer on gfx103x, so it is asked first.
+
+    The CPU case is taken back out either way, because the fallback this gate guards
+    is not symmetric across layouts. FP8's registry entry (``scaled_mm_v2``) ends in
+    ``torch._scaled_mm``, which exists on CPU and fails per call. NVFP4's ends in
     ``a.view(torch.float4_e2m1fn_x2)`` (eager/quantization.py:238), a dtype only
     CUDA tensors have, so a CPU answer of "yes" is not a slower path but a wrong
     one -- and under ``torch.compile`` the resulting exception escapes the graph
@@ -244,6 +253,11 @@ def nvfp4_mm_has_fast_path(device_type: str) -> bool:
     """
     if device_type != "cuda" or not torch.cuda.is_available():
         return False
+    if getattr(torch.version, "hip", None) is not None:
+        from ..backends.hip import has_valu_gemm, has_wmma
+
+        if has_wmma() or has_valu_gemm():
+            return True
     return quantized_mm_has_fast_path(device_type)
 
 

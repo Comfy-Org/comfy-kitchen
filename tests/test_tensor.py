@@ -1297,16 +1297,37 @@ class TestNVFP4LinearOperations:
         quantized_mm_has_fast_path answers True for any device that is not CUDA,
         which is right for FP8 (its fallback is torch._scaled_mm) but wrong here.
 
-        The CUDA half asserts an equality rather than `is not None`, which cannot
-        fail: the function returns a bool. What it has to check is that the
-        override actually agrees with the generic predicate for the devices it does
-        not exclude -- if nvfp4_mm_has_fast_path ever returned False on "cuda", or
-        started returning something that is not the bool its annotation promises,
-        `is not None` would still pass.
+        The CUDA half used to assert plain equality with the generic predicate, and
+        that was the wrong invariant rather than merely a stale one: the two are now
+        allowed to disagree, and only on the architectures where NVFP4 has a kernel
+        the generic predicate cannot see.
+
+        ``quantized_mm_has_fast_path`` answers "is there a fast path", and it reaches
+        its answer by asking has_wmma() and, failing that, probing
+        ``torch._scaled_mm``. On gfx103x both miss: there are no matrix cores, and
+        ``torch._scaled_mm`` refuses on ROCm below MI300. But gfx103x DOES have an
+        NVFP4 kernel -- a v_dot4_i32_i8 GEMV and tile behind comfy_is_gfx10()
+        (nvfp4_gfx10.h) -- so the generic predicate says False there while the NVFP4
+        one says True, and deferring would send every NVFP4 matmul to
+        dequantize-and-matmul on a part that can run it fused. That is the whole
+        reason nvfp4_mm_has_fast_path consults has_valu_gemm() itself.
+
+        So the invariant is the weaker and more useful one: wherever NVFP4 has no
+        kernel of its own the two must still agree exactly, and a disagreement is
+        only legitimate where has_valu_gemm() is what explains it.
         """
+        from comfy_kitchen.backends import hip as hip_backend
+
         assert nvfp4_mm_has_fast_path("cpu") is False
-        assert nvfp4_mm_has_fast_path("cuda") == quantized_mm_has_fast_path("cuda")
         assert isinstance(nvfp4_mm_has_fast_path("cuda"), bool)
+
+        if not hip_backend.has_valu_gemm():
+            assert nvfp4_mm_has_fast_path("cuda") == quantized_mm_has_fast_path("cuda")
+        else:
+            # gfx103x: a fused NVFP4 kernel exists and torch._scaled_mm does not, so
+            # True against False is the intended answer rather than a leak.
+            assert nvfp4_mm_has_fast_path("cuda") is True
+            assert quantized_mm_has_fast_path("cuda") is False
 
     @pytest.mark.parametrize("pipe", ["1", "2"])
     def test_scaled_mm_is_correct_at_both_pipeline_depths(self, pipe, monkeypatch):

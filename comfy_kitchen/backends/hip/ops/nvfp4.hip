@@ -49,6 +49,14 @@
 //   conservative tile than by a schedule that was never run there. See
 //   CK_NVFP4_DISPATCH_OUT.
 //
+//   gfx103x has no WMMA either, but unlike gfx11 it is not left without a GEMM:
+//   nvfp4_gfx10.h supplies one, VALU-tiled, and CK_NVFP4_DISPATCH_GFX10 is the arm
+//   that reaches it. It sits BEHIND the same comfy_is_gfx10() gate as every other
+//   gfx103x VALU path, and __init__.py's _VALU_GEMM_OPS is what advertises
+//   scaled_mm_nvfp4 there. It uses v_dot4_i32_i8 rather than fp16 and scales the
+//   accumulator per block instead of folding the scale into the operand; that file
+//   says why the second half is possible here and impossible under WMMA.
+//
 // See nvfp4_utils.h for the codec and the blocked scale layout.
 #include <stdexcept>
 #include <string>
@@ -57,6 +65,7 @@
 #include "../fp8_utils.h"   // fp8_to_float, for the e4m3 block scales
 #include "../gemm_wmma.h"   // frag_row / acc_row come from mma.h via here
 #include "../mma.h"
+#include "../nvfp4_gfx10.h"  // the gfx103x VALU arm, behind comfy_is_gfx10()
 #include "../nvfp4_utils.h"
 
 namespace comfy::hip_backend {
@@ -680,6 +689,25 @@ typename MmaF16::Frag bf[PIPE][TN];
 // and it is the one knob here whose answer is not obvious from the ISA: the
 // register count says 1 should buy the fourth wave, the instruction count says 2
 // should hide more latency. On this part 2 wins, so that is the default.
+// Whether the gfx103x dispatch must skip the GEMV and use the register tile at every
+// M. Read once per process, so it costs nothing after the first call.
+//
+// This exists because neither gfx10 kernel can check its own answer. nvfp4_gemv_-
+// valu_kernel and nvfp4_gemm_valu_kernel have no slow-path reference inside them,
+// so a geometry chosen wrongly produces a wrong answer rather than a slow one, and
+// the way to find out which is which is to compare both against eager in the same
+// process -- the same reason gemm_wmma.h's sweep has to validate each candidate.
+// Setting this is how a sweep reaches the tile at M = 1 to time it; the GEMV at
+// every M <= 4 is skipped when it is set, and the tile's own BM boundary (M <= 64) is
+// unchanged by it.
+inline int comfy_nvfp4_gfx10_tile_only() {
+    static const int v = [] {
+        const char* s = getenv("COMFY_NVFP4_GFX10_TILE_ONLY");
+        return (s && *s && *s != '0') ? 1 : 0;
+    }();
+    return v;
+}
+
 inline int comfy_nvfp4_pipe() {
     static const int v = [] {
         const char* s = getenv("COMFY_NVFP4_PIPE");
@@ -931,6 +959,114 @@ extern "C" void launch_scaled_mm_nvfp4_kernel(
         CK_NVFP4_GEMM_LAUNCH_P(T, 128, 128, 64, 4, 2, 2, 4, 2);                              \
     }
 
+// gfx103x, behind the same comfy_is_gfx10() gate the rest of the VALU paths use.
+//
+// The split is at M, and it is a split rather than a preference: a BM=128 tile at
+// M = 1 does 128x the MACs it needs and re-reads the whole activation 128 times,
+// while the GEMV at M = 40 cannot hold its accumulators. Text-encoder decode is
+// M = 1 and is 94% of the step, so the GEMV is what carries this workload; prefill
+// is M ~= 40 and is 4%, and is what the tile is for. The MMAX ladder and the
+// crossover table are in CK_NVFP4_DISPATCH_GFX10 below.
+//
+// One column count, and it is the narrow one. nvfp4_gfx10.h used to pick between 128
+// and 32 columns by grid size, on the theory that 128 -- which owns a whole 512-byte
+// block-scale window, at 1 byte of scale per 8 of weight instead of per 16 -- was
+// worth its locality wherever the grid was long enough to fill the machine. Measured,
+// that is backwards: 32 columns is ahead of 128 at every N, including N=25600 where
+// 128 gives 200 blocks and fills the machine easily. The grid is worth more than the
+// locality on a part with six CUs. One arm, and the threshold is gone.
+#define CK_NVFP4_GEMV_LAUNCH(T, MMAX)                                                          \
+    do {                                                                                       \
+        dim3 grid((N + kGemvCols - 1) / kGemvCols);                                            \
+        nvfp4_gemv_valu_kernel<T, MMAX, kGemvCols, kGemvLaneBlocksWide>                        \
+            <<<grid, kGemvThreads, 0, stream>>>(A, B, SA, SB, static_cast<T*>(c), M, N, K,     \
+                                                a_blocks, b_blocks, ldc, epi);                 \
+        return;                                                                                \
+    } while (0)
+
+// Two tiles, and the choice between them is BM and nothing else.
+//
+// BM=128/TM=16 is the int8 tile's own measured geometry (5.97 TOPS at 16x4/128x128,
+// gemm_gfx10.h) and is the right one whenever M fills it. The small tile has the SAME
+// TM and TN and half the threads, so it keeps the register tile's arithmetic
+// intensity -- TM x TN MACs per (TM + TN) staged bytes -- and only shortens the block:
+//
+//   BM=128 TM=16 TN=4 256 thr:  64 MACs per 20 bytes = 3.20
+//   BM=64  TM=8  TN=4 256 thr:  32 MACs per 12 bytes = 2.67   <- 17% worse per unit work
+//   BM=64  TM=16 TN=4 128 thr:  64 MACs per 20 bytes = 3.20   <- what is used
+//
+// The 8x4 variant is the obvious way to halve BM and it is measurably worse for it:
+// 7.71 against 6.90 ms at N=25600/K=5120/M=40, which is the intensity ratio and not
+// anything about the row count. 128 threads is 4 waves, which the tile still gets
+// occupancy from -- LDS is halved too, so a WGP holds twice as many blocks.
+//
+// It exists for one reason: the tile does BM rows of work for however many are real,
+// so at M=40 a BM=128 tile spends 68% of its arithmetic on rows past M. Measured on
+// N=25600, K=5120:
+//
+//   M      BM=128   BM=64
+//    40      10.75      6.90
+//   128      11.31     11.18
+//
+// which is the 128/40 = 3.2x the arithmetic predicts at M=40 and a tie at M=128, as a
+// row-count argument has to be. 64 is the crossover and not 40 because the boundary
+// lands on where M fills a tile rather than on M itself.
+#define CK_NVFP4_TILED_GFX10_LAUNCH(T)                                                         \
+    do {                                                                                       \
+        if (M <= 64) {                                                                         \
+            dim3 grid((N + 127) / 128, (M + 63) / 64);                                         \
+            nvfp4_gemm_valu_kernel<T, 64, 128, 64, 16, 4, 128>                                 \
+                <<<grid, 128, 0, stream>>>(A, B, SA, SB, static_cast<T*>(c), M, N, K, a_blocks, \
+                                           b_blocks, ldc, epi);                                 \
+        } else {                                                                               \
+            dim3 grid((N + 127) / 128, (M + 127) / 128);                                       \
+            nvfp4_gemm_valu_kernel<T, 128, 128, 64, 16, 4, 256>                                \
+                <<<grid, 256, 0, stream>>>(A, B, SA, SB, static_cast<T*>(c), M, N, K,          \
+                                           a_blocks, b_blocks, ldc, epi);                       \
+        }                                                                                      \
+        return;                                                                                \
+    } while (0)
+
+// The M threshold, the MMAX ladder, and the GEMV/tile split, all from one measurement.
+// (N=25600, K=5120, ms; the crossover is not sensitive to the shape.)
+//
+//   M      GEMV      64-row tile
+//    1     1.182          --
+//    2     1.307          --
+//    3     1.939          --
+//    4     1.923          --
+//    8       --         5.606
+//   16       --         5.659
+//   40       --         5.829
+//   64       --         5.880
+//  128       --        11.352
+//
+// The GEMV keeps 43% of the read roofline at M=4 and stops there because acc is
+// kColsPerWarp x MMAX floats and the activation window hoisted out of its column loop
+// is MMAX x 8 dwords: at MMAX=8 those are 128 and 64 registers before the weight side,
+// which on a 512-VGPR part costs a wave a SIMD and the GEMV loses to the tile anyway.
+// The tile's own BM boundary is 64, and it is 64 rather than 40 because it does BM
+// rows of work for however many are real -- the boundary lands on where M fills a
+// tile, not on M itself.
+//
+// The GEMV's reach above M=1 is a direct consequence of hoisting the activation
+// window out of the column loop: that leaves one weight load, one decode, one scale
+// load and MMAX * (4 dot4 + 6 float) per column per iteration, which the weight
+// bytes still dominate up to M=4. Without it, M=2 already fell to the tile's rate.
+#define CK_NVFP4_DISPATCH_GFX10(T)                                                             \
+    do {                                                                                       \
+        if (M <= 4 && !comfy_nvfp4_gfx10_tile_only()) {                                       \
+            if (M <= 1) {                                                                      \
+                CK_NVFP4_GEMV_LAUNCH(T, 1);                                                    \
+            } else if (M <= 2) {                                                               \
+                CK_NVFP4_GEMV_LAUNCH(T, 2);                                                    \
+            } else {                                                                           \
+                CK_NVFP4_GEMV_LAUNCH(T, 4);                                                    \
+            }                                                                                  \
+        }                                                                                      \
+        CK_NVFP4_TILED_GFX10_LAUNCH(T);                                                        \
+    } while (0);
+
 // The trailing semicolon lives here, not at the use site, because
 // CK_NVFP4_GEMM_LAUNCH expands to a `do { ... } while (0)` with no semicolon of
 // its own -- every other caller writes the `;` after the macro name, and this one
@@ -950,6 +1086,8 @@ extern "C" void launch_scaled_mm_nvfp4_kernel(
             CK_NVFP4_GEMM_LAUNCH(T, 128, 64, 32, 4, 2, 2, 2);                                \
         } else if (ovr.bm == 128) {                                                           \
             CK_NVFP4_GEMM_LAUNCH_P(T, 128, 128, 64, 4, 2, 2, 4, 2);                           \
+        } else if (comfy_is_gfx10()) {                                                        \
+            CK_NVFP4_DISPATCH_GFX10(T)                                                        \
         } else if (comfy_gfx11()) {                                                           \
             CK_NVFP4_DISPATCH_GFX11(T)                                                        \
         } else {                                                                              \

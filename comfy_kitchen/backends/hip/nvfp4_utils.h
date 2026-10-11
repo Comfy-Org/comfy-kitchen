@@ -80,6 +80,17 @@ __forceinline__ __device__ void e2m1_init_lut(float* lut, int tid) {
 // Blocked scale layout
 // ---------------------------------------------------------------------------
 
+// Bytes one 128-row group's four-block column group occupies, and so the stride
+// between two ADJACENT such groups in the buffer. Spelled out because it is the one
+// number a kernel walking the scales needs and it is not legible inside the offset
+// expression below: it is what makes a lane's two consecutive block scales one byte
+// apart, and what lets a kernel advance along K by a whole number of four-block
+// groups with a multiply. Also the reason a 128-row group's scales are one run of
+// 512 CONTIGUOUS bytes with nothing missing -- which is what nvfp4_gfx10.h sizes its
+// column block from.
+constexpr int kScaleRowsPerGroup = 32;                      // d3, rows inside a group
+constexpr int kScaleGroupStride = kScaleRowsPerGroup * 16;  // 512 bytes
+
 // Flat offset of the e4m3 scale for logical (row, col) -- col counts 16-element
 // blocks along K -- inside a buffer stored as (RoundUp(rows,128),
 // RoundUp(K/16,4)) and viewed row-major.
@@ -100,7 +111,7 @@ __forceinline__ __device__ int nvfp4_scale_offset(int row, int col, int col_leng
     const int cbg = col >> 2;   // col / 4
     const int d5 = col & 3;     // col % 4
     const int cbg_cnt = (col_length + 3) >> 2;
-    return ((rb * cbg_cnt + cbg) * 32 + d3) * 16 + d4 * 4 + d5;
+    return ((rb * cbg_cnt + cbg) * kScaleRowsPerGroup + d3) * 16 + d4 * 4 + d5;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,5 +293,99 @@ __forceinline__ __device__ void e2m1x16_to_half_scaled(const uint4 packed,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Integer decode: E2M1 -> doubled E2M1 in int8
+// ---------------------------------------------------------------------------
+//
+// This is the form the gfx103x GEMM consumes, and it exists because E2M1's
+// magnitude grid DOUBLES into {0, 1, 2, 3, 4, 6, 8, 12} -- every one of them an
+// exact int8, the largest a quarter of the format's range. So the decode is a
+// widening by multiplication with 2, and what follows is integer arithmetic end to
+// end: v_dot4_i32_i8 accumulates the products exactly, and a 16-element block sums
+// to at most 16 * 144 = 2304, nowhere near the int32 the accumulator holds.
+//
+// The alternative on this part is widening to fp16 and using v_dot2_f32_f16, which
+// folds the e4m3 block scale into the staged operand instead of applying it to the
+// accumulator (see e2m1x16_to_half_scaled above). That is the better *shape* -- no
+// per-block rescale -- and it is what gfx11 does, because WMMA has no integer
+// counterpart to trade against. It loses here on the instruction count, and that is
+// not close: gfx10 retires v_dot2_f32_f16 at a quarter of v_dot4_i32_i8's rate and
+// does two MACs per instruction against four, so one MAC through the fp16 form
+// costs 8x the dot instructions of one through the integer form. That is the same
+// ratio the measured int8 and fp16 VALU tiles show end to end (5.97 against 1.96
+// TOPS on this 6-CU part, gemm_gfx10.h).
+//
+// The scale is what the integer form gives up, and it gives it up exactly once per
+// 16-element block: the 4-element products v_dot4_i32_i8 forms never straddle a
+// block, so a whole block's int32 sum can be scaled and added to a float
+// accumulator. That is impossible under WMMA (where one lane's accumulator element
+// spans eight rows with eight different scales, ops/nvfp4.hip's note on the integer
+// WMMA path) and it is the entire reason the integer form is usable at all.
+//
+// The table is indexed by the packed BYTE, like the fp16 one above and for the same
+// reason: the byte IS the index, so one read returns both of its values and there is
+// nothing to split. Entry layout is (doubled value of the high nibble) in the high
+// byte, (doubled value of the low nibble) in the low byte -- the same high-nibble
+// convention the format uses for the elements themselves.
+//
+// Which nibble lands in which byte of a staged dword is likewise not recorded, for
+// the same reason as above and the same argument: both operands go through this, so
+// the pair swap is applied to a and b alike and sum_k a[sigma(k)] * b[sigma(k)] is
+// sum_k a[k] * b[k] exactly. See the long note before e2m1x16_to_half_scaled.
+constexpr int kE2m1I8ByteLutSize = 256;
+
+// Fill the byte-indexed integer table. THREADS threads cooperate; caller barriers.
+__forceinline__ __device__ void e2m1_init_i8_byte_lut(uint16_t* lut, int tid, int threads) {
+    for (int i = tid; i < kE2m1I8ByteLutSize; i += threads) {
+        // 2 * value, exact for every E2M1 code (see the note above). The cast is
+        // through float because e2m1_code_to_f32 is the definition and the
+        // multiplication is by a power of two, so neither step rounds.
+        const int32_t hi = static_cast<int32_t>(2.0f * e2m1_code_to_f32(i >> 4));
+        const int32_t lo = static_cast<int32_t>(2.0f * e2m1_code_to_f32(i & 0xFu));
+        lut[i] = static_cast<uint16_t>(((hi & 0xFF) << 8) | (lo & 0xFF));
+    }
+}
+
+// Two packed bytes -> the four doubled-E2M1 int8 of one v_dot4 group, as the dword
+// that instruction consumes.
+__forceinline__ __device__ uint32_t e2m1x2_to_i8x4(uint16_t packed, const uint16_t* lut) {
+    const uint32_t b0 = packed & 0xFFu;
+    const uint32_t b1 = packed >> 8;
+    return static_cast<uint32_t>(lut[b0]) | (static_cast<uint32_t>(lut[b1]) << 16);
+}
+
+// 16 packed bytes -> 8 such dwords, 32 elements.
+__forceinline__ __device__ void e2m1x16_to_i8x8(const uint4 packed, const uint16_t* lut,
+                                                uint32_t* out) {
+    const uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+    #pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        // Shift and mask rather than v_bfe, for the reason spelled out in
+        // e2m1x16_to_half_scaled: the inline-asm bit-field extract does not get its
+        // offset to the assembler as an immediate, and LLVM materializes the shift
+        // amounts in scalar registers instead. Byte 0 folds to a single and.
+        out[2 * w] = e2m1x2_to_i8x4(static_cast<uint16_t>(words[w] & 0xFFFFu), lut);
+        out[2 * w + 1] = e2m1x2_to_i8x4(static_cast<uint16_t>(words[w] >> 16), lut);
+    }
+}
+
+// One 16-element block's contribution to one output element: the integer sum of the
+// products, scaled by the two e4m3 block scales and accumulated.
+//
+// The two operands are both doubled, so this sum is FOUR times the value the format
+// defines. kNvfp4Double is the 1/4 that undoes it, and the caller folds it into the
+// A-side scale, because a power of two rides into a multiply that is being done
+// anyway -- putting it anywhere else would cost an instruction per output element
+// for nothing.
+//
+// Three instructions per accumulator per block -- cvt, mul, fma -- against four
+// v_dot4 for the same 16 MACs, which is where the 1.75x instruction count over a
+// plain int8 GEMM comes from. There is no cheaper spelling: the sum has to leave
+// int32 before either scale can touch it, and there are two different scales.
+constexpr float kNvfp4Double = 0.25f;
+
+__forceinline__ __device__ float nvfp4_block_acc(float acc, int dot4_sum, float sa, float sb) {
+    return fmaf(static_cast<float>(dot4_sum) * sa, sb, acc);
+}
 
 }  // namespace comfy::hip_backend
