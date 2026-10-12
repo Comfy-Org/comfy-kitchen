@@ -129,6 +129,11 @@ class QuantizedLayout(ABC):
         return NotImplemented
 
     @classmethod
+    def optimize_for_gemv(cls, weight: QuantizedTensor, storage: torch.Tensor) -> QuantizedTensor:
+        """Optionally optimize resident storage for small-M linear calls."""
+        return weight
+
+    @classmethod
     def supports_fast_matmul(cls) -> bool:
         """Check if fast quantized matmul is supported on current hardware."""
         if cls.MIN_SM_VERSION is None:
@@ -278,6 +283,15 @@ class QuantizedTensor(torch.Tensor):
 
     def storage(self):
         return self._qdata.storage()
+
+    def optimize_for_gemv(self, storage: torch.Tensor) -> QuantizedTensor:
+        """Optimize a resident weight within its caller-owned byte buffer.
+
+        May overwrite this weight's storage; use the returned tensor afterwards.
+        Other weights/metadata in the buffer remain intact. Both GEMV and GEMM must
+        remain supported. Unsupported layouts return self without modifying storage.
+        """
+        return self.layout_cls.optimize_for_gemv(self, storage)
 
     def linear_input_act(self, x: torch.Tensor, bias=None, input_act=None,
                          input_act_weight=None, input_act_eps=0.0,
