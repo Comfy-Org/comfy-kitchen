@@ -521,6 +521,32 @@ def test_token_aug_surplus_over_the_budget_stays_in_the_tail():
     assert _rel(aug, ref) < 0.15 * no_aug, (_rel(aug, ref), no_aug)
 
 
+@pytest.mark.skipif(backend is not cuda_backend, reason="CUDA-only token overflow retry")
+def test_cuda_token_aug_clamped_top_bin_is_deterministic_and_preserves_tail():
+    """The open-ended high-score bin can reserve ~1952 tokens for a 256-slot list.
+
+    All unretained tokens must still enter the approximate tail, and the
+    selected exact subset must not change with cross-CTA scheduling.
+    """
+    t, h, c = 4096, 2, 30.0
+    g = torch.Generator(device="cuda").manual_seed(0)
+    u = torch.randn(h, HD, device="cuda", generator=g)
+    u = u / u.norm(dim=-1, keepdim=True)
+    sign = torch.where(torch.arange(t, device="cuda") % 2 == 0, 1.0, -1.0)
+    q = (c * u)[None].expand(t, h, HD)
+    k = (c * u)[None] * sign[:, None, None]
+    v = torch.randn(t, h, HD, device="cuda", generator=g)
+    q, k, v = (x[None].to(torch.bfloat16).contiguous() for x in (q, k, v))
+    plan = cuda_backend._C.sol_attn_plan(1, t, h, token_aug=256)
+    assert 0 <= plan["tokOverflow"] < plan["total"]
+    out = ck.sol_attn(q, k, v, tau=4.0, token_aug=256)
+    for _ in range(12):
+        assert torch.equal(out, ck.sol_attn(q, k, v, tau=4.0, token_aug=256))
+    ref = _dense(q, k, v)
+    without_tokens = _rel(ck.sol_attn(q, k, v, tau=4.0), ref)
+    assert _rel(out, ref) < 0.15 * without_tokens
+
+
 def test_token_aug_chunked_matches_direct():
     """The chunked path runs the same token stage."""
     c = _chunked_case(seed=13, rot=96, v_scale=0.02)

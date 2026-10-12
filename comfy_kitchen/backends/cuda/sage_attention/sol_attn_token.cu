@@ -141,7 +141,8 @@ __global__ void SOL_TOKEN_BOUNDS sol_token_kernel(
     __nv_bfloat16* __restrict__ part_o, float* __restrict__ part_m,     // [NSPLIT,B*H,NQ,(HD)]; o in bf16 like the route handover
     float* __restrict__ part_l,
     int Tp, int NQ, int NTB, int n_tok, int tail,       // NQ: rows = groups of TOK_GROUP query blocks
-    int NQB, int sink_q_start, int sink_q_end, float scale_log2)   // NQB: query blocks
+    int NQB, int sink_q_start, int sink_q_end, float scale_log2,
+    const uint32_t* __restrict__ overflow_rows, int retry_overflow)   // NQB: query blocks
 {
 #if SOL_SM80
     extern __shared__ __align__(16) int8_t smem[];
@@ -164,6 +165,18 @@ __global__ void SOL_TOKEN_BOUNDS sol_token_kernel(
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int g = lane >> 2, qd = lane & 3;
     const int qb0 = blockIdx.x * BQ;
+    // The normal parallel pass is unchanged.  During overflow recovery, a
+    // single CTA handles each flagged group in fixed key-tile order.
+    __shared__ int retry_cta_has_rows;
+    if (PASS == 2 && retry_overflow) {
+        if (tid == 0) retry_cta_has_rows = 0;
+        __syncthreads();
+        const int qr = qb0 + tid;
+        if (tid < BQ && qr < NQ && overflow_rows[(size_t)bh * NQ + qr])
+            atomicOr(&retry_cta_has_rows, 1);
+        __syncthreads();
+        if (!retry_cta_has_rows) return;
+    }
     const int64_t vT_base = (int64_t)bh * HD * Tp;
     const int64_t kp_base = (int64_t)bh * Tp;
     const int64_t kd_base = (int64_t)bh * Tp * HD;
@@ -175,7 +188,8 @@ __global__ void SOL_TOKEN_BOUNDS sol_token_kernel(
     #pragma unroll
     for (int rr = 0; rr < 2; ++rr) {
         const int m0 = qbr[rr] * TOK_GROUP, m1 = min(NQB, m0 + TOK_GROUP) - 1;
-        active[rr] = qbr[rr] < NQ && !(m0 >= sink_q_start && m1 < sink_q_end);
+        active[rr] = qbr[rr] < NQ && !(m0 >= sink_q_start && m1 < sink_q_end)
+            && !(PASS == 2 && retry_overflow && !overflow_rows[(size_t)bh * NQ + qbr[rr]]);
     }
 
     // centroid fragments (cen8 is perm_d'd like the q rows)
@@ -357,7 +371,7 @@ __global__ void SOL_TOKEN_BOUNDS sol_token_kernel(
     // this split's softmax state, in the exact kernel's units (o and l x255 / vsc)
     #pragma unroll
     for (int rr = 0; rr < 2; ++rr) {
-        if (qbr[rr] >= NQ) continue;
+        if (qbr[rr] >= NQ || (PASS == 2 && retry_overflow && !active[rr])) continue;
         const size_t qs = ((size_t)split * gridDim.z + bh) * NQ + qbr[rr];
         const float f = m_r[rr] > MASKED ? exp2f(c_r[rr] - m_r[rr]) : 1.f;
         if (qd == 0) {
@@ -375,6 +389,32 @@ __global__ void SOL_TOKEN_BOUNDS sol_token_kernel(
 #undef SK
 #undef SVT
 #endif  // SOL_SM80
+}
+
+// A split-CTA race matters only when more than n_tok reservations were made.
+// Re-arm those groups and neutralize their original parallel tail partials;
+// a one-split retry then walks the same tiles in a fixed order, populating
+// both the exact list and its complementary tail with no lost/doubled mass.
+__global__ void sol_token_overflow_rearm_kernel(
+    int32_t* __restrict__ tok_cnt, uint32_t* __restrict__ overflow,
+    __nv_bfloat16* __restrict__ part_o, float* __restrict__ part_m,
+    float* __restrict__ part_l, int NG, int nsplit, int n_tok)
+{
+    __shared__ int flag;
+    const int qg = blockIdx.x, bh = blockIdx.y, c = threadIdx.x;
+    const size_t qs = (size_t)bh * NG + qg;
+    if (c == 0) flag = tok_cnt[qs] > n_tok;
+    __syncthreads();  // all lanes must see the original count before reset
+    if (c == 0) {
+        overflow[qs] = (uint32_t)flag;
+        if (flag) tok_cnt[qs] = 0;
+    }
+    if (!flag) return;
+    for (int split = 1; split < nsplit; ++split) {
+        const size_t ps = ((size_t)split * gridDim.y + bh) * NG + qg;
+        part_o[ps * HD + c] = __float2bfloat16(0.f);
+        if (c == 0) { part_m[ps] = NEG; part_l[ps] = 0.f; }
+    }
 }
 
 // sort each list so the exact kernel's order is deterministic: a 256-lane bitonic
@@ -445,7 +485,8 @@ void launch_sol_token(
     void* gcen8, void* gcens, void* gref, void* gbits,                        // per group
     const void* kiP, const void* ksb, const void* vTi,
     void* tok_tiles, void* tok_tilecnt,
-    void* tok_hist, void* tok_idx, void* tok_cnt, void* part_o, void* part_m, void* part_l,
+    void* tok_hist, void* tok_idx, void* tok_cnt, void* tok_overflow,
+    void* part_o, void* part_m, void* part_l,
     void* o_part, void* m_part, void* l_part,
     int B, int Tp, int H, int NQ, int NPAD, int NTB, int n_tok, int tail,
     int sink_q_start, int sink_q_end, float scale_log2, cudaStream_t stream)
@@ -472,8 +513,19 @@ void launch_sol_token(
     (const float*)gref, (uint32_t*)tok_hist, (uint32_t*)tok_idx, (int32_t*)tok_cnt,        \
     (__nv_bfloat16*)part_o, (float*)part_m, (float*)part_l,                                \
     Tp, NG, NTB, n_tok, tail, NQ, sink_q_start, sink_q_end, scale_log2
-    sol_token_kernel<1><<<grid1, NTHREADS, s1, stream>>>(SOLT_ARGS);
-    sol_token_kernel<2><<<grid, NTHREADS, s2, stream>>>(SOLT_ARGS);
+    sol_token_kernel<1><<<grid1, NTHREADS, s1, stream>>>(SOLT_ARGS, nullptr, 0);
+    sol_token_kernel<2><<<grid, NTHREADS, s2, stream>>>(SOLT_ARGS, nullptr, 0);
+    if (nsplit > 1) {
+        // Preserve the fast parallel path for all ordinary groups.  For
+        // overflow groups only, replace the timing-dependent first n_tok
+        // reservations *and* their tail states with one serial tile walk.
+        sol_token_overflow_rearm_kernel<<<dim3(NG, B * H), HD, 0, stream>>>(
+            (int32_t*)tok_cnt, (uint32_t*)tok_overflow,
+            (__nv_bfloat16*)part_o, (float*)part_m, (float*)part_l,
+            NG, nsplit, n_tok);
+        sol_token_kernel<2><<<dim3(grid.x, 1, grid.z), NTHREADS, s2, stream>>>(
+            SOLT_ARGS, (const uint32_t*)tok_overflow, 1);
+    }
 #undef SOLT_ARGS
     sol_token_sort_kernel<<<dim3(NG, B * H), NTOK_MAX, 0, stream>>>((uint32_t*)tok_idx, (const int32_t*)tok_cnt, NG, n_tok);
     sol_token_merge_kernel<<<dim3(NQ, B * H), HD, 0, stream>>>(
