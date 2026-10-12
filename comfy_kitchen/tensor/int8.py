@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import torch
 
+import comfy_kitchen as ck
 from comfy_kitchen.registry import registry
 
 from .base import (
@@ -201,6 +202,21 @@ class TensorWiseINT8Layout(QuantizedLayout):
             Tuple of (quantized_data, scale).
         """
         return qtensor._qdata, qtensor._params.scale
+
+    @classmethod
+    def linear_input_act(cls, weight: QuantizedTensor, x: torch.Tensor, bias=None,
+                         input_act=None, input_act_weight=None, input_act_eps=0.0,
+                         residual=None, residual_scale=None):
+        params = weight._params
+        if params.transposed:
+            return NotImplemented
+        qdata, scale = cls.get_plain_tensors(weight)
+        return ck.int8_linear(
+            x, qdata, scale, bias, x.dtype,
+            convrot=params.convrot, convrot_groupsize=params.convrot_groupsize,
+            input_act=input_act, input_act_weight=input_act_weight, input_act_eps=input_act_eps,
+            residual=residual, residual_scale=residual_scale,
+        )
 
     @classmethod
     def state_dict_tensors(cls, qdata: torch.Tensor, params: Params) -> dict[str, torch.Tensor]:

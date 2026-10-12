@@ -122,6 +122,13 @@ class QuantizedLayout(ABC):
         return {}
 
     @classmethod
+    def linear_input_act(cls, weight: QuantizedTensor, x: torch.Tensor, bias=None,
+                         input_act=None, input_act_weight=None, input_act_eps=0.0,
+                         residual=None, residual_scale=None):
+        """Return the activated linear result, or NotImplemented without modifying inputs."""
+        return NotImplemented
+
+    @classmethod
     def supports_fast_matmul(cls) -> bool:
         """Check if fast quantized matmul is supported on current hardware."""
         if cls.MIN_SM_VERSION is None:
@@ -271,6 +278,18 @@ class QuantizedTensor(torch.Tensor):
 
     def storage(self):
         return self._qdata.storage()
+
+    def linear_input_act(self, x: torch.Tensor, bias=None, input_act=None,
+                         input_act_weight=None, input_act_eps=0.0,
+                         residual=None, residual_scale=None):
+        """Compute linear(act(x), self, bias), optionally followed by residual addcmul.
+
+        Return NotImplemented when the layout cannot handle this operation; the caller
+        owns the eager fallback. Norm weights must already be prepared on x's device.
+        """
+        return self.layout_cls.linear_input_act(
+            self, x, bias, input_act, input_act_weight, input_act_eps, residual, residual_scale,
+        )
 
     def dequantize(self) -> torch.Tensor:
         # Ensure qdata is contiguous - backends may not handle non-contiguous views
