@@ -222,9 +222,58 @@ target_include_directories(_C PRIVATE
 
 # Link libraries
 # Note: cuBLASLt is loaded dynamically at runtime via dlopen/LoadLibrary
-target_link_libraries(_C PRIVATE
-    CUDA::cudart_static
-)
+# Linux CUDA runtime interoperability fix for issue #245.
+# Match the CUDA toolkit selected for compilation and dynamically link its
+# runtime without embedding a build-machine-specific library search path.
+# On Windows, preserve the existing static-CUDART linkage.
+if(UNIX AND NOT APPLE)
+    # CMake may find a host libcudart older than the selected NVCC, even when
+    # CUDAToolkit_VERSION reports the expected toolchain. An observed build
+    # compiled with CUDA 13 but linked to Ubuntu's libcudart.so.11.0.
+    # Refuse a compiler/runtime mismatch instead of silently accepting it.
+    if(NOT CUDAToolkit_ROOT OR NOT CUDAToolkit_VERSION_MAJOR)
+        message(FATAL_ERROR "CUDA toolkit needs explicit CUDAToolkit_ROOT and CUDAToolkit_VERSION_MAJOR")
+    endif()
+    set(_ck_rt_soname "libcudart.so.${CUDAToolkit_VERSION_MAJOR}")
+    set(_ck_rt_candidates
+        "${CUDAToolkit_ROOT}/lib/${_ck_rt_soname}"
+        "${CUDAToolkit_ROOT}/lib64/${_ck_rt_soname}"
+        "${CUDAToolkit_ROOT}/targets/x86_64-linux/lib/${_ck_rt_soname}"
+        "${CUDAToolkit_ROOT}/targets/aarch64-linux/lib/${_ck_rt_soname}"
+    )
+    unset(_ck_selected_cudart)
+    foreach(_candidate IN LISTS _ck_rt_candidates)
+        if(EXISTS "${_candidate}")
+            set(_ck_selected_cudart "${_candidate}")
+            break()
+        endif()
+    endforeach()
+    if(NOT _ck_selected_cudart)
+        message(FATAL_ERROR
+            "CUDA #245: cannot find ${_ck_rt_soname} under selected "
+            "CUDAToolkit_ROOT=${CUDAToolkit_ROOT}. Refusing to link an unrelated host CUDA runtime.")
+    endif()
+    get_target_property(_ck_find_cudart CUDA::cudart IMPORTED_LOCATION)
+    message(STATUS "CUDA #245: FindCUDAToolkit CUDA::cudart=${_ck_find_cudart}")
+    message(STATUS "CUDA #245: pinned selected CUDA runtime=${_ck_selected_cudart}")
+    set_target_properties(comfy_kitchen_cuda_kernels PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+    set_target_properties(_C PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+    # Link the explicit soname from the selected NVCC toolkit, not a
+    # potentially stale CUDA::cudart imported-target cache entry.
+    target_link_libraries(_C PRIVATE "${_ck_selected_cudart}")
+    # setup.py uses CMAKE_LIBRARY_OUTPUT_DIRECTORY and copies the built extension
+    # directly into the wheel: CMake's *build* RPATH is what ships, not an
+    # install(TARGETS) step. Never publish absolute build-host CUDA paths.
+    # The wheel's CUDA runtime is supplied by the consumer (e.g. PyTorch's
+    # already-loaded libcudart.so.<major>), not by a local developer toolkit.
+    set_target_properties(_C PROPERTIES
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "$ORIGIN"
+        INSTALL_RPATH_USE_LINK_PATH FALSE
+    )
+else()
+    target_link_libraries(_C PRIVATE CUDA::cudart_static)
+endif()
 
 # On Windows, static cudart requires additional system libraries
 if(WIN32)
@@ -237,14 +286,6 @@ endif()
 # Ensure Python libraries are properly linked on Windows
 if(WIN32)
     target_link_directories(_C PRIVATE ${Python_LIBRARY_DIRS})
-endif()
-
-# Set RPATH for runtime library loading
-if(UNIX AND NOT APPLE)
-    set_target_properties(_C PROPERTIES
-        INSTALL_RPATH "$ORIGIN:${CUDAToolkit_LIBRARY_DIR}"
-        BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
-    )
 endif()
 
 # Fix multi-config generator output directory issue
