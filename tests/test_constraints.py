@@ -404,6 +404,15 @@ class TestOptInParams:
         assert check_opt_in_params("int8_linear", plain, {"x": torch.zeros(2), "lora_down": None}).success
         assert check_opt_in_params("quantize_svdquant_w4a4", plain, lora).success
 
+    def test_lora_scale_becomes_a_python_float(self):
+        from comfy_kitchen.constraints import lora_kwargs
+
+        down, up = torch.zeros(1, 2), torch.zeros(3, 1)
+        for scale in (torch.tensor(0.5), torch.tensor(0.5, dtype=torch.float16), 2, 0.5):
+            kwargs = lora_kwargs(down, up, scale)
+            assert type(kwargs["lora_scale"]) is float and kwargs["lora_scale"] == float(scale)
+        assert lora_kwargs(None, None, torch.tensor(0.5)) == {}
+
     def test_eager_int8_linear_refuses_a_lora_call(self):
         q = torch.ones(4, 8, dtype=torch.int8)
         with pytest.raises(NoCapableBackendError, match="lora_down"):

@@ -185,7 +185,7 @@ def lora_kwargs(lora_down, lora_up, lora_scale) -> dict:
         return {}
     if lora_down is None or lora_up is None:
         raise ValueError("lora_down and lora_up must be given together")
-    return {"lora_down": lora_down, "lora_up": lora_up, "lora_scale": lora_scale}
+    return {"lora_down": lora_down, "lora_up": lora_up, "lora_scale": float(lora_scale)}
 
 
 @dataclass
