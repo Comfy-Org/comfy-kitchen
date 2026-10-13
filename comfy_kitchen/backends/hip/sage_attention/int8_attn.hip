@@ -1255,13 +1255,38 @@ extern "C" void launch_sage_int8_attn(
     // begin with. Repairing the masked staging is a real change to the schedule
     // and wants its own measurement; it is not folded into a tile that does not
     // pay for itself in the first place.
+    //
+    // The wide branch names `kNone` directly rather than going through
+    // SAGE_ATTN_MASK. `wide` already requires mask == nullptr, and every arm of
+    // that macro tests `mask != nullptr` first, so the expansion here was
+    // identically kNone -- while still *instantiating* all ten mask modes at 128
+    // keys, for both output dtypes and both head dims: 40 kernels of which 4 can
+    // ever launch. Naming the one that runs drops 36, and the code object and the
+    // compile time with them.
+    //
+    // Worth being precise about what that does and does not buy. It is **not** a
+    // compile-time guard: `mask` is a runtime pointer, so if someone later relaxes
+    // `wide` to admit masked calls this still compiles -- and so did the version
+    // before it. In that hypothetical this names kNone and the kernel ignores the
+    // mask, where the old expansion would have named a masked variant that reads
+    // past its staging. Both are silently wrong; neither stops the build. What the
+    // change buys is size, and a reader who can see that kNone is the only thing
+    // built at 128 instead of inferring it from a macro ten branches wide.
     const bool wide = cta_k >= 128 && mask == nullptr;
     switch (head_dim) {
         case 64:
-            if (wide) { SAGE_ATTN_MASK(64, 128); } else { SAGE_ATTN_MASK(64, 64); }
+            if (wide) {
+                SAGE_ATTN_OUT(64, 128, MaskMode::kNone);
+            } else {
+                SAGE_ATTN_MASK(64, 64);
+            }
             break;
         case 128:
-            if (wide) { SAGE_ATTN_MASK(128, 128); } else { SAGE_ATTN_MASK(128, 64); }
+            if (wide) {
+                SAGE_ATTN_OUT(128, 128, MaskMode::kNone);
+            } else {
+                SAGE_ATTN_MASK(128, 64);
+            }
             break;
         case 256: SAGE_ATTN_MASK(256, 64); break;
         default:
