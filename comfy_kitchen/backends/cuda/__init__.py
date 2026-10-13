@@ -2050,11 +2050,12 @@ def fp16_linear(
     return out if len(orig_shape) == 2 else out.reshape(*orig_shape[:-1], n)
 
 
-def _w4a8_cluster_quantizer_ok(k: int, device: torch.device) -> bool:
+def _w4a8_cluster_quantizer_ok(k: int, input_act: str | None, device: torch.device) -> bool:
     """Whether the single-launch ConvRot quantizer of the streamed W4A8 decode (sm_90
-    clusters, at most four passes of 8 x 8 groups) covers a K-wide row."""
+    clusters, at most four passes of 8 x 8 groups) covers act(x) for a K-wide row."""
     return (
         device.type == "cuda"
+        and input_act in (None, "swiglu", "rms_norm")
         and k % 256 == 0
         and k <= 256 * 8 * 8 * 4
         and _cuda_device_capability(device.index)[0] >= 9
@@ -2062,8 +2063,8 @@ def _w4a8_cluster_quantizer_ok(k: int, device: torch.device) -> bool:
 
 
 def _w4a8_mma_linear(
-    x_2d, rotated, partial_absmax, xq, xs,
-    qdata, s_channel, bias_float, out,
+    x_2d, rotated, partial_absmax, act_weight, input_act_eps, input_act, xq, xs,
+    qdata, s_channel, bias_float, resid_2d, resid_scale, out,
     convrot_groupsize, group_size, output_dtype_code, stream_ptr,
 ):
     """Quantize x_2d and run the streamed MMA GEMM into out."""
@@ -2077,12 +2078,17 @@ def _w4a8_mma_linear(
         _wrap_for_dlpack(x_2d),
         _wrap_for_dlpack(rotated) if rotated is not None else None,
         _wrap_for_dlpack(partial_absmax) if partial_absmax is not None else None,
+        _wrap_for_dlpack(act_weight) if act_weight is not None else None,
+        float(input_act_eps),
+        _input_act_code(input_act),
         _wrap_for_dlpack(xq),
         _wrap_for_dlpack(qdata),
         _wrap_for_dlpack(decode_lut) if decode_lut is not None else None,
         _wrap_for_dlpack(s_channel),
         _wrap_for_dlpack(xs),
         _wrap_for_dlpack(bias_float) if bias_float is not None else None,
+        _wrap_for_dlpack(resid_2d) if resid_2d is not None else None,
+        _wrap_for_dlpack(resid_scale) if resid_scale is not None else None,
         _wrap_for_dlpack(workspace),
         _wrap_for_dlpack(counters),
         _wrap_for_dlpack(out),
@@ -2614,20 +2620,20 @@ def w4a8_packed_linear(
     residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Resident packed W4A8/W6A8: small-M MMA or direct packed dequantization for prefill."""
-    if residual is not None:
-        if residual_scale is None:
-            raise ValueError("w4a8_int8_linear: residual requires residual_scale")
-        return _apply_residual(
-            w4a8_packed_linear(
-                x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
-                convrot_groupsize, out_dtype, input_act, input_act_weight, input_act_eps,
-            ),
-            residual,
-            residual_scale,
-        )
-    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    if input_act in (None, "none"):
+        input_act = None
+    if residual is not None and residual_scale is None:
+        raise ValueError("w4a8_int8_linear: residual requires residual_scale")
     n = s_channel.numel()
-    k = x.shape[-1]
+    k = x.shape[-1] // _input_act_width(input_act)
+    fuse_act = (
+        input_act is not None
+        and x.numel() <= 8 * x.shape[-1]
+        and _w4a8_cluster_quantizer_ok(k, input_act, x.device)
+    )
+    if input_act is not None and not fuse_act:
+        x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+        input_act = None
     if (
         qdata.dim() != 1
         or qdata.dtype != torch.int8
@@ -2640,22 +2646,39 @@ def w4a8_packed_linear(
         raise ValueError("invalid MMA-packed W4A8 operands")
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     m = x_2d.shape[0]
+    if residual is not None and not (
+        m <= 8 and residual.numel() == m * n and residual_scale.numel() == n
+    ):
+        return _apply_residual(
+            w4a8_packed_linear(
+                x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
+                convrot_groupsize, out_dtype, input_act, input_act_weight, input_act_eps,
+            ),
+            residual,
+            residual_scale,
+        )
     xq = torch.empty(m, k, dtype=torch.int8, device=x.device)
     xs = torch.empty(m, 1, dtype=torch.float32, device=x.device)
     out = torch.empty(m, n, dtype=out_dtype, device=x.device)
     if m <= 8:
         # Staged-pair scratch is only needed where the single cluster quantizer
-        # cannot run (pre-sm_90, very wide K).
-        rotated = partial_absmax = None
-        if not _w4a8_cluster_quantizer_ok(k, x.device):
+        # cannot run (pre-sm_90, very wide K); a fused activation implies the cluster path.
+        rotated = partial_absmax = act_weight = None
+        if input_act is None and not _w4a8_cluster_quantizer_ok(k, None, x.device):
             rotated = torch.empty_like(x_2d)
             partial_absmax = torch.empty(
                 m, k // convrot_groupsize, dtype=torch.float32, device=x.device
             )
+        if input_act == "rms_norm":
+            act_weight = _act_weight_arg(input_act, input_act_weight, x.device, x_2d.dtype)
+        resid_2d = resid_scale = None
+        if residual is not None:
+            resid_2d = residual.reshape(m, n).to(out_dtype).contiguous()
+            resid_scale = _gemm_vector_arg(residual_scale, x.device, out_dtype)
         bias_float = bias.float().contiguous() if bias is not None else None
         _w4a8_mma_linear(
-            x_2d, rotated, partial_absmax, xq, xs,
-            qdata, s_channel, bias_float, out,
+            x_2d, rotated, partial_absmax, act_weight, input_act_eps, input_act, xq, xs,
+            qdata, s_channel, bias_float, resid_2d, resid_scale, out,
             convrot_groupsize, group_size, DTYPE_TO_CODE[out_dtype],
             torch.cuda.current_stream(x.device).cuda_stream,
         )

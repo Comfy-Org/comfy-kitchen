@@ -2182,6 +2182,8 @@ extern "C" {
         const void* s_channel,
         const void* xs,
         const void* bias,
+        const void* residual,
+        const void* residual_scale,
         void* workspace,
         void* counters,
         void* out,
@@ -3298,28 +3300,35 @@ bool w4a8_codebook_gemm_chunked(
         workspace.data(), out.data(), M, N, K, G, chunk_cols, bits, mma_packed, out_dtype_code, stream);
 }
 
-// input is [M, K]. rotated/partial_absmax are the staged-pair fallback scratch
-// where the cluster quantizer cannot run.
+// input is [M, K] (or [M, 2K] gate|up for act_code swiglu); the activation is folded
+// into the cluster quantizer on sm_90+. rotated/partial_absmax are the staged-pair
+// fallback scratch for older devices and are only required when no activation is fused.
 bool w4a8_codebook_mma_linear(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
     std::optional<nb::ndarray<nb::ndim<2>, nb::device::cuda>> rotated,
     std::optional<nb::ndarray<float, nb::ndim<2>, nb::device::cuda>> partial_absmax,
+    std::optional<nb::ndarray<nb::device::cuda>> act_weight,
+    double act_eps,
+    int64_t act_code,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> xq,
     nb::ndarray<int8_t, nb::ndim<1>, nb::device::cuda> weight,
     std::optional<nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda>> decode_lut,
     nb::ndarray<float, nb::ndim<1>, nb::device::cuda> s_channel,
     nb::ndarray<float, nb::ndim<2>, nb::device::cuda> xs,
     std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> bias,
+    std::optional<nb::ndarray<nb::ndim<2>, nb::device::cuda>> residual,
+    std::optional<nb::ndarray<nb::ndim<1>, nb::device::cuda>> residual_scale,
     nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> workspace,
     nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> counters,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> out,
     int64_t convrot_group_size, int64_t G, int out_dtype_code, uintptr_t stream_ptr) {
     const int64_t M = xq.shape(0);
     const int64_t K = xq.shape(1);
+    const int64_t in_width = (act_code == comfy::kActSwiGLU) ? 2 : 1;
     const int64_t N = s_channel.size();
     const int input_dtype_code = map_dtype_to_code(input.dtype());
     if (M > 8 || convrot_group_size <= 0 || K % convrot_group_size != 0
-            || input.shape(0) != M || input.shape(1) != K
+            || input.shape(0) != M || input.shape(1) != K * in_width
             || xs.shape(0) != M || xs.shape(1) != 1
             || N % 16 != 0 || K % G != 0)
         throw std::runtime_error("w4a8_codebook_mma_linear shape mismatch or M > 8");
@@ -3327,6 +3336,13 @@ bool w4a8_codebook_mma_linear(
     const int64_t bits = weight.size() == N * K * 9 / 16 ? 4 : (weight.size() == N * K * 13 / 16 ? 6 : 0);
     if (bits == 0)
         throw std::runtime_error("w4a8_codebook_mma_linear weight is not a 4- or 6-bit record stream");
+    if (act_code != comfy::kActNone && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm)
+        throw std::runtime_error("w4a8_codebook_mma_linear act_code must be none, swiglu, or rms_norm");
+    const bool has_act_weight = act_weight.has_value() && act_weight->size() > 0;
+    if (act_code == comfy::kActRmsNorm
+            && (!has_act_weight || act_weight->size() != K || act_weight->stride(0) != 1
+                || map_dtype_to_code(act_weight->dtype()) != input_dtype_code))
+        throw std::runtime_error("w4a8_codebook_mma_linear rms_norm weight must be K contiguous elements in the input dtype");
     if (rotated.has_value() != partial_absmax.has_value()
             || (rotated.has_value()
                 && (rotated->shape(0) != M || rotated->shape(1) != K
@@ -3346,7 +3362,15 @@ bool w4a8_codebook_mma_linear(
             || out.shape(0) != M || out.shape(1) != N
             || map_dtype_to_code(out.dtype()) != out_dtype_code)
         throw std::runtime_error("w4a8_codebook_mma_linear workspace, counters, output, or bias mismatch");
-    if (input.stride(1) != 1 || input.stride(0) != K
+    if (residual.has_value() != residual_scale.has_value()
+            || (residual.has_value()
+                && (residual->shape(0) != M || residual->shape(1) != N
+                    || residual->stride(1) != 1 || residual->stride(0) != N
+                    || map_dtype_to_code(residual->dtype()) != out_dtype_code
+                    || residual_scale->size() != N || residual_scale->stride(0) != 1
+                    || map_dtype_to_code(residual_scale->dtype()) != out_dtype_code)))
+        throw std::runtime_error("w4a8_codebook_mma_linear residual must be [M, N] contiguous with a [N] scale, both in the output dtype");
+    if (input.stride(1) != 1 || input.stride(0) != K * in_width
             || xq.stride(1) != 1 || xq.stride(0) != K
             || weight.stride(0) != 1 || s_channel.stride(0) != 1
             || xs.stride(1) != 1 || xs.stride(0) != 1
@@ -3358,10 +3382,13 @@ bool w4a8_codebook_mma_linear(
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     if (!launch_quantize_int8_convrot_cluster_kernel(
-            input.data(), nullptr, 0.0f, comfy::kActNone,
+            input.data(), has_act_weight ? act_weight->data() : nullptr,
+            static_cast<float>(act_eps), static_cast<int>(act_code),
             xq.data(), xs.data(), M, K, input_dtype_code, stream)) {
-        if (!rotated.has_value())
-            throw std::runtime_error("w4a8_codebook_mma_linear: staged quantizer scratch required here");
+        if (act_code != comfy::kActNone || !rotated.has_value())
+            throw std::runtime_error(
+                "w4a8_codebook_mma_linear: fused activation quantizer unsupported here "
+                "(needs sm_90+ and K % 256 == 0); apply the activation eagerly");
         launch_quantize_int8_convrot_staged_kernel(
             input.data(), rotated->data(), partial_absmax->data(), xq.data(), xs.data(), M, K,
             static_cast<int>(convrot_group_size), input_dtype_code, input_dtype_code,
@@ -3370,6 +3397,8 @@ bool w4a8_codebook_mma_linear(
     return launch_w4a8_codebook_mma(
         xq.data(), weight.data(), decode_lut.has_value() ? decode_lut->data() : nullptr, s_channel.data(), xs.data(),
         bias.has_value() ? bias->data() : nullptr,
+        residual.has_value() ? residual->data() : nullptr,
+        residual_scale.has_value() ? residual_scale->data() : nullptr,
         workspace.data(), counters.data(),
         out.data(), M, N, K, G, bits, out_dtype_code, stream);
 }
@@ -4631,9 +4660,10 @@ NB_MODULE(_C, m) {
     m.def("w4a8_codebook_mma_linear", &w4a8_codebook_mma_linear,
           "Staged ConvRot activation quantization and direct packed W4A8 tensor-core MMA",
           nb::arg("input"), nb::arg("rotated").none(), nb::arg("partial_absmax").none(),
-          nb::arg("xq"),
+          nb::arg("act_weight").none(), nb::arg("act_eps"), nb::arg("act_code"), nb::arg("xq"),
           nb::arg("weight"), nb::arg("decode_lut").none(),
           nb::arg("s_channel"), nb::arg("xs"), nb::arg("bias").none(),
+          nb::arg("residual").none(), nb::arg("residual_scale").none(),
           nb::arg("workspace"), nb::arg("counters"), nb::arg("out"), nb::arg("convrot_group_size"),
           nb::arg("g"),
           nb::arg("out_dtype_code"), nb::arg("stream_ptr"));

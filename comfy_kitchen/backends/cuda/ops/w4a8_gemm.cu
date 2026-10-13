@@ -284,6 +284,8 @@ void w4a8_codebook_mma_stream_kernel(
     const float* __restrict__ s_channel,
     const float* __restrict__ x_scales,
     const float* __restrict__ bias,
+    const OutputT* __restrict__ residual,
+    const OutputT* __restrict__ residual_scale,
     int* __restrict__ workspace,
     int* __restrict__ counters,
     OutputT* __restrict__ output,
@@ -396,6 +398,21 @@ void w4a8_codebook_mma_stream_kernel(
     int* ws01 = &workspace[static_cast<int64_t>(token0) * N + n_bottom];
     int* ws10 = &workspace[static_cast<int64_t>(token1) * N + n_top];
     int* ws11 = &workspace[static_cast<int64_t>(token1) * N + n_bottom];
+    // Residual operands are issued here so they are in flight behind the atomics and
+    // fences below instead of on the finishing warp's dependent tail.
+    float r00 = 0.f, r01 = 0.f, r10 = 0.f, r11 = 0.f, rs_top = 0.f, rs_bottom = 0.f;
+    if (residual) {
+        rs_top = static_cast<float>(residual_scale[n_top]);
+        rs_bottom = static_cast<float>(residual_scale[n_bottom]);
+        if (token0 < M) {
+            r00 = static_cast<float>(residual[static_cast<int64_t>(token0) * N + n_top]);
+            r01 = static_cast<float>(residual[static_cast<int64_t>(token0) * N + n_bottom]);
+        }
+        if (token1 < M) {
+            r10 = static_cast<float>(residual[static_cast<int64_t>(token1) * N + n_top]);
+            r11 = static_cast<float>(residual[static_cast<int64_t>(token1) * N + n_bottom]);
+        }
+    }
     if (token0 < M) {
         atomicAdd(ws00, acc[0]);
         atomicAdd(ws01, acc[2]);
@@ -416,19 +433,23 @@ void w4a8_codebook_mma_stream_kernel(
 
     // Same lane->element mapping as the adds above, so the warp covers the whole
     // [M, 16] tile exactly once: read (L2), scale, store, and re-zero.
-    auto finish = [&](int* ws, int tok, int n) {
+    auto finish = [&](int* ws, int tok, int n, float res, float res_scale) {
         float value = static_cast<float>(__ldcg(ws)) * x_scales[tok] * s_channel[n];
         if (bias) value += bias[n];
+        if (residual) {
+            const float linear = static_cast<float>(store_output<OutputT>(value));
+            value = res + res_scale * linear;
+        }
         output[static_cast<int64_t>(tok) * N + n] = store_output<OutputT>(value);
         *ws = 0;
     };
     if (token0 < M) {
-        finish(ws00, token0, n_top);
-        finish(ws01, token0, n_bottom);
+        finish(ws00, token0, n_top, r00, rs_top);
+        finish(ws01, token0, n_bottom, r01, rs_bottom);
     }
     if (token1 < M) {
-        finish(ws10, token1, n_top);
-        finish(ws11, token1, n_bottom);
+        finish(ws10, token1, n_top, r10, rs_top);
+        finish(ws11, token1, n_bottom, r11, rs_bottom);
     }
     if (lane == 0) counters[output_tile] = 0;
 }
@@ -583,11 +604,12 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
 
 // bits (4 or 6) is the code width. The workspace [M, N] int32 and counters [N/16] int32 must
 // be zero on entry and are zero again on exit, so the caller keeps both across
-// launches.
+// launches. residual [M, N] and residual_scale [N] are in the output dtype (both or
+// neither).
 extern "C" bool launch_w4a8_codebook_mma(
     const void* xq, const void* weight, const void* decode_lut,
-    const void* s_channel, const void* xs, const void* bias,
-    void* workspace, void* counters, void* out,
+    const void* s_channel, const void* xs, const void* bias, const void* residual,
+    const void* residual_scale, void* workspace, void* counters, void* out,
     int64_t M, int64_t N, int64_t K, int64_t G, int64_t bits,
     int out_dtype_code, cudaStream_t stream)
 {
@@ -622,6 +644,8 @@ extern "C" bool launch_w4a8_codebook_mma(
                 static_cast<const float*>(s_channel),
                 static_cast<const float*>(xs),
                 static_cast<const float*>(bias),
+                static_cast<const OutputT*>(residual),
+                static_cast<const OutputT*>(residual_scale),
                 static_cast<int*>(workspace),
                 static_cast<int*>(counters),
                 static_cast<OutputT*>(out),
