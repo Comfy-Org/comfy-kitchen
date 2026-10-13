@@ -950,6 +950,57 @@ class TestTensorWisePublicAPI:
 class TestBandedStreamK:
     """The banded stream-K tile order must give bit-identical output to the identity order."""
 
+    @requires_cuda_backend
+    def test_captured_workspace_survives_larger_gemms(self, seed):
+        """Later GEMMs and captures must not replace a live graph's scratch storage."""
+        if torch.cuda.get_device_capability()[0] < 8:
+            pytest.skip("CUTLASS stream-K requires SM80 or newer")
+
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        wrap = cuda_backend._wrap_for_dlpack
+        stream = torch.cuda.Stream()
+        cases = []
+        for k, config in [(128, 12), (1024, 12), (4096, 13), (8192, 13)]:
+            a = torch.randint(-8, 8, (128, k), dtype=torch.int8, device="cuda")
+            b = torch.randint(-8, 8, (256, k), dtype=torch.int8, device="cuda")
+            xs = torch.full((128, 1), 0.125, device="cuda")
+            ws = torch.full((256,), 0.0625, device="cuda")
+            out = torch.empty((128, 256), dtype=torch.bfloat16, device="cuda")
+            expected = ((a.float() @ b.float().t()) * xs * ws).bfloat16()
+            cases.append((a, b, xs, ws, out, expected, config))
+        stream.wait_stream(torch.cuda.current_stream())
+
+        def run(case):
+            a, b, xs, ws, out, _, config = case
+            assert cuda_backend._C.cutlass_int8_dequant_config(
+                wrap(a), wrap(b), wrap(xs), wrap(ws), wrap(out), 2, config, stream.cuda_stream
+            )
+
+        first, second = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream):
+            # No workspace warmup: capture must handle the first allocation and growth.
+            with torch.cuda.graph(first, stream=stream):
+                run(cases[0])
+                run(cases[1])
+            with torch.cuda.graph(second, stream=stream):
+                run(cases[2])
+            run(cases[3])
+            for _ in range(5):
+                for case in cases[:3]:
+                    case[4].fill_(float("nan"))
+                second.replay()
+                first.replay()
+                stream.synchronize()
+                for case in cases:
+                    torch.testing.assert_close(case[4], case[5], rtol=0, atol=0)
+            second.reset()
+            run(cases[3])
+            first.replay()
+            stream.synchronize()
+            for case in cases[:2]:
+                torch.testing.assert_close(case[4], case[5], rtol=0, atol=0)
+
     @staticmethod
     def _run(m, n, k, config):
         from comfy_kitchen.backends import cuda as cuda_backend
