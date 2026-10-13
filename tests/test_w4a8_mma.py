@@ -157,17 +157,17 @@ class TestW4A8PackedMMA:
         graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
         outputs = []
         capture_stream = torch.cuda.Stream()
-        for graph, x in zip(graphs, inputs):
+        for graph, x in zip(graphs, inputs, strict=False):
             with torch.cuda.graph(graph, stream=capture_stream):
                 outputs.append(linear(x))
         torch.cuda.synchronize()
         streams = [torch.cuda.Stream(), torch.cuda.Stream()]
         for _ in range(16):
-            for stream, graph in zip(streams, graphs):
+            for stream, graph in zip(streams, graphs, strict=False):
                 with torch.cuda.stream(stream):
                     graph.replay()
             torch.cuda.synchronize()
-            for got, ref in zip(outputs, expected):
+            for got, ref in zip(outputs, expected, strict=False):
                 assert torch.equal(got, ref)
 
     @pytest.mark.parametrize("bits", [4, 6])
