@@ -280,6 +280,23 @@ extern "C" void launch_quantize_int8_convrot_kernel(
 }
 
 // Returns 1 when INT8 G=256 must use the global spill path for (M, K, in_dtype).
+// Fused Hadamard rotation + rowwise int4 quantize + nibble pack. Used for both
+// the activation and the weight: both rotate along K and quantize per row.
+extern "C" void launch_convrot_quant_int4_kernel(
+    const void* x, int in_code, void* qout, void* scales,
+    int M, int K, int group_size, hipStream_t stream) {
+
+    using namespace comfy::hip_backend;
+    check_convrot_group_size(group_size);
+    check_convrot_k(K, group_size, in_code);
+    if (M == 0) {
+        return;  // a zero-block launch is hipErrorInvalidConfiguration
+    }
+    launch_convrot_quant<true>(
+        x, in_code, static_cast<int8_t*>(qout), static_cast<float*>(scales),
+        M, K, group_size, stream);
+}
+
 extern "C" int convrot_int8_needs_spill_host(int M, int K, int in_code) {
     using namespace comfy::hip_backend;
     return convrot_int8_needs_spill_buffers(M, K, in_code) ? 1 : 0;

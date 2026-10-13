@@ -7,7 +7,7 @@ GPU untouched.
 
 ## Why `rdna1` is a separate backend rather than another tier in `hip`
 
-- **gfx1010 needs different algorithms.** It has no WMMA, no dot-product instructions, no bf16 arithmetic, and is wave32. The `hip` kernels are built around WMMA tiles, so RDNA1 needs its own GEMMs (`gemm_simt.h`, the packed fp16 FMA GEMM, the implicit-GEMM conv3d) and a software tile policy for attention.
+- **gfx1010 needs different algorithms.** It has no WMMA, no dot-product instructions and no bf16 arithmetic. The `hip` kernels are built around WMMA tiles, so RDNA1 needs its own GEMMs (`gemm_simt.h`, the packed fp16 FMA GEMM, the implicit-GEMM conv3d) and a software tile policy for attention.
 - **`hip` has no tier it fits.** `architectures.json` has `elementwise_only`, `wmma_gfx11` and `wmma_gfx12`. A fourth, non-WMMA tier would thread `#if` branches through every GEMM and attention kernel the supported cards share.
 - **Those shared branches have already broken gfx1010 silently.** `#if GFX12 ... #else` code that assumed the else branch meant gfx11 gave wrong masked int8 attention on gfx1010. CI has no RDNA1 hardware, so every HIP port could reintroduce that class of bug.
 - **No regression risk for supported cards.** This PR changes no file under `backends/hip`. `rdna1` registers only when a gfx1010 is visible and declines tensors on any other device.
@@ -33,7 +33,7 @@ gfx1010 has:
 - **no dot-product instructions** (`v_dot4`/`sdot4`): int8 products go through
   `v_mad_i32_i24`, or through fp16 FMAs, in which int8 values are exact;
 - **no bf16 arithmetic**: bf16 inputs are widened;
-- **wave32** natively (built with `-mno-wavefrontsize64`).
+- **wave32** for the GEMM, conv and attention kernels, which measured 3-11% slower at wave64 on the RX 5600M. The files whose kernels measured faster at wave64 (1.02-1.75x: AdaLN, RoPE, the INT8 and fp8 quantizers, group norm, depthwise conv, the fp16, fp8, W4A8 and AWQ GEMVs, SVDQuant, the Sage quantizers, Sol routing and exact blocks) are built with `-mwavefrontsize64`; the list is in `CMakeLists.txt`.
 
 PyTorch's ROCm libraries do not cover it fully either: hipBLASLt has no gfx1010
 kernels, and MIOpen has no CK grouped-conv library for it.
@@ -50,6 +50,27 @@ kernels, and MIOpen has no CK grouped-conv library for it.
   bounds that GEMM here, so it reads the INT8 weight where it lies and widens it to fp16
   as it stages it (one SDWA conversion per element), and where it takes its 128x128 tile
   the activations are staged in a tiled layout (a tile's stage of K stored contiguously).
+- `fp16_packed_conv_transpose3d`: a transposed conv as one stride-1 implicit GEMM per output
+  residue (phase), each phase's epilogue writing its positions of the output directly, so
+  there is no zero-stuffed input. MIOpen's fp16 transposed conv runs at 0.15-0.2 TFLOPS here;
+  this is 13-25x that at audio VAE upsampler shapes and level with MIOpen's fp32 one. Input
+  channel counts that are not a multiple of 32 are zero-padded in the fp16 copy of x, for
+  this and for `fp16_packed_conv3d`, which runs RGB and latent conv_in shapes 2-12x slower
+  than MIOpen; `direct_conv3d` serves those.
+- `depthwise_conv3d` / `depthwise_conv_transpose3d`: a gather kernel for one-filter-per-channel
+  convs (the vocoders' anti-aliasing FIR filters), 1.6-2.1x MIOpen for the transpose and
+  0.8-2.0x for the forward conv.
+- `direct_conv3d`: a direct conv in fp32 math that reads x in place, for the convs the
+  implicit GEMM serves badly. At 3x3 against MIOpen (time ratio): 3 -> 128 channels over
+  512x512 0.42 in fp32 and fp16; 128 -> 3 over 512x512 0.93 in fp32 and 0.17 in fp16, 2.7-3.4x
+  the implicit GEMM. MIOpen's fp32 kernels stay ahead past about 64 patch elements and at
+  narrow outputs under 512x512 (1.5-2.4x); the implicit GEMM past 8 output channels.
+
+Where MIOpen or rocBLAS stay ahead (callers should route these to torch): 1x1 convs (a plain
+GEMM over x as it lies; the packed GEMM first transposes it), fp32 2D convs up to 5x5
+(MIOpen's Winograd kernels, 1.2-2.8x), transposed convs of up to 640 input positions and most
+fp32 ones, and GEMMs under about a GFLOP over a short K (the packed linear's floor is
+~0.15 ms against rocBLAS's ~0.1).
 - NA3D, Sage INT8 and Sol attention on a software 16x16 tile policy (`mma.h`), plus an
   fp16-FMA Sage kernel for unmasked head_dim 64/128 and `int8_block_sparse_attention`.
 - Elementwise kernels: fp8/int8 quantize, RoPE, RMS-RoPE, AdaLN, GroupNorm+SiLU+pad.

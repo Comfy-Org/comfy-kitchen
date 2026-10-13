@@ -107,6 +107,38 @@ struct EpiConvScaled {
     }
 };
 
+// One phase of a transposed conv: a stride-1 conv over x whose output position (z, p, q)
+// lands at (z * uz + rz, p * up + rp, q * uq + rq) of the contiguous NCDHW output, so the
+// phases interleave into it without a copy. out = acc * acc_scale[0] + bias[col].
+struct EpiConvPhase {
+    const float* acc_scale;
+    const void* bias;
+    int k, code;
+    int zpq, pq, q_out;
+    int uz, up, uq;
+    int rz, rp, rq;
+    int Zf, Pf, Qf;
+    float scale;
+
+    __forceinline__ __device__ void init() { scale = acc_scale[0]; }
+
+    __forceinline__ __device__ int64_t out_offset(int row, int col) const {
+        const int n = row / zpq;
+        int rem = row - n * zpq;
+        const int z = rem / pq;
+        rem -= z * pq;
+        const int p = rem / q_out;
+        const int q = rem - p * q_out;
+        return ((static_cast<int64_t>(n) * k + col) * Zf + z * uz + rz) * Pf * Qf +
+               static_cast<int64_t>(p * up + rp) * Qf + q * uq + rq;
+    }
+
+    __forceinline__ __device__ float operator()(int, int col, float acc) const {
+        const float v = acc * scale;
+        return bias ? v + load_scalar(bias, code, col) : v;
+    }
+};
+
 }  // namespace comfy::hip_backend
 
 // resid is the full NZPQK output-shaped residual, or null. xs_* are the element strides of
@@ -155,6 +187,52 @@ extern "C" bool launch_fp16_conv3d_kernel(
             src, b, static_cast<__bf16*>(out), M, K, kbytes, K, epi, stream);
     } else {
         launch_gemm_simt<SimtF16Packed, EpiConvScaled, __half, ConvPatchSimtSrc>(
+            src, b, static_cast<__half*>(out), M, K, kbytes, K, epi, stream);
+    }
+    return true;
+}
+
+// One phase of a transposed conv (see EpiConvPhase). x is packed NDHWC fp16 and w the phase's
+// taps as [K, T, R, S, C], already flipped into correlation order. Z, P and Q count the
+// phase's output positions; pd/ph/pw are the leading zero padding and may be negative (a
+// crop), with the trailing side left to the gather's bounds check. out is the whole
+// [N, K, Zf, Pf, Qf] output.
+extern "C" bool launch_fp16_conv3d_phase_kernel(
+    const void* x, const void* w, const void* bias, void* out, int N, int D, int H, int W, int C,
+    int K, int T, int R, int S, int Z, int P, int Q, int pd, int ph, int pw, int uz, int up,
+    int uq, int rz, int rp, int rq, int Zf, int Pf, int Qf, const void* acc_scale, int out_code,
+    hipStream_t stream) {
+
+    using namespace comfy::hip_backend;
+
+    if (C % 32 != 0 || K % 8 != 0) {
+        return false;
+    }
+    const int64_t m64 = static_cast<int64_t>(N) * Z * P * Q;
+    const int64_t depth = static_cast<int64_t>(C) * T * R * S;
+    if (m64 == 0 || K == 0) {
+        return true;
+    }
+    if (m64 > 0x7fffffff || 2 * depth > 0x7fffffff) {
+        return false;
+    }
+    const int M = static_cast<int>(m64);
+    const ConvPatchSimtSrc src{static_cast<const uint8_t*>(x), Z * P * Q, P * Q, Q, C,
+                               C, static_cast<int64_t>(W) * C, static_cast<int64_t>(H) * W * C,
+                               static_cast<int64_t>(D) * H * W * C, R * S, S, 1, 1, 1, pd, ph, pw,
+                               D, H, W, 1, 1, 1};
+    const EpiConvPhase epi{static_cast<const float*>(acc_scale), bias, K, out_code, Z * P * Q,
+                           P * Q, Q, uz, up, uq, rz, rp, rq, Zf, Pf, Qf, 1.0f};
+    const auto* b = static_cast<const uint8_t*>(w);
+    const int kbytes = static_cast<int>(2 * depth);
+    if (out_code == kF32) {
+        launch_gemm_simt<SimtF16Packed, EpiConvPhase, float, ConvPatchSimtSrc>(
+            src, b, static_cast<float*>(out), M, K, kbytes, K, epi, stream);
+    } else if (out_code == kBF16) {
+        launch_gemm_simt<SimtF16Packed, EpiConvPhase, __bf16, ConvPatchSimtSrc>(
+            src, b, static_cast<__bf16*>(out), M, K, kbytes, K, epi, stream);
+    } else {
+        launch_gemm_simt<SimtF16Packed, EpiConvPhase, __half, ConvPatchSimtSrc>(
             src, b, static_cast<__half*>(out), M, K, kbytes, K, epi, stream);
     }
     return true;

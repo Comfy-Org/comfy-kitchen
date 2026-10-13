@@ -20,6 +20,7 @@
 #include "../epilogue.h"
 #include "../gemm_simt.h"
 #include "../hadamard.h"
+#include "../launchers.h"
 
 namespace comfy::hip_backend {
 namespace {
@@ -88,76 +89,24 @@ void launch_scale_rows(const void* x, __half* x16, float* row_scale, const float
         static_cast<const InT*>(x), x16, row_scale, w_amax, K);
 }
 
-// fp16 rows x [R, K] into the GEMM's tiled layout (simt_tiled_offset), where out holds
-// ceil(R / 128) * 128 rows. One thread per 16-byte chunk, so K is a multiple of 8.
+// fp16 rows x [R, K] into the GEMM's tiled layout (simt_tiled_offset) of their row-paired
+// form (SimtF16Pairs), where out holds ceil(R / 128) * 128 rows. One thread per 16-byte
+// chunk of the output, so K is a multiple of 8.
 __global__ __launch_bounds__(256) void tile_rows_f16_kernel(
     const __half* __restrict__ x, __half* __restrict__ out, int R, int K) {
     const int64_t chunk = static_cast<int64_t>(blockIdx.x) * 256 + threadIdx.x;
     const int row = static_cast<int>(chunk / (K / 8)), k = static_cast<int>(chunk % (K / 8)) * 8;
-    if (row >= R) return;
+    if (row >= ((R + 1) & ~1)) return;
+    // Row 2p of the output takes the even K of rows 2p and 2p + 1, row 2p + 1 the odd K.
+    const int r0 = row & ~1;
+    const uint4 a = *reinterpret_cast<const uint4*>(x + static_cast<int64_t>(r0) * K + k);
+    const uint4 b = r0 + 1 < R ? *reinterpret_cast<const uint4*>(x + static_cast<int64_t>(r0 + 1) * K + k)
+                               : make_uint4(0, 0, 0, 0);
+    const auto pair = [&](uint32_t wa, uint32_t wb) {
+        return (row & 1) ? (wa >> 16) | (wb & 0xFFFF0000u) : (wa & 0xFFFFu) | (wb << 16);
+    };
     *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(out) + simt_tiled_offset(row, 2 * k, 2 * K)) =
-        *reinterpret_cast<const uint4*>(x + static_cast<int64_t>(row) * K + k);
-}
-
-// Decode-sized M (<= 8) is bound on streaming the weight, which the GEMM's tiles would
-// only read once per row: one wave per output column reads its fp16 weight row once
-// for every x row, in fp32 math (a fp16 weight is exact in fp32), so the result is
-// that of linear(x, w.float()) without the fp32 copy of the weight.
-constexpr int kGemvWaves = 8;
-constexpr int kGemvMaxRows = 8;
-
-template <typename InT, typename OutT>
-__global__ __launch_bounds__(kWave* kGemvWaves) void gemv_f16_kernel(
-    const InT* __restrict__ x, const __half* __restrict__ w, const void* __restrict__ bias,
-    int bias_code, OutT* __restrict__ out, int M, int N, int K) {
-    const int n = blockIdx.x * kGemvWaves + threadIdx.y;
-    if (n >= N) return;
-    const __half* wrow = w + static_cast<int64_t>(n) * K;
-
-    float sum[kGemvMaxRows] = {};
-    for (int k = threadIdx.x * 8; k < K; k += kWave * 8) {
-        const uint4 wv = *reinterpret_cast<const uint4*>(wrow + k);
-        const __half* wh = reinterpret_cast<const __half*>(&wv);
-        float wf[8];
-#pragma unroll
-        for (int i = 0; i < 8; ++i) wf[i] = __half2float(wh[i]);
-#pragma unroll
-        for (int m = 0; m < kGemvMaxRows; ++m) {
-            if (m < M) {
-                const InT* xr = x + static_cast<int64_t>(m) * K + k;
-#pragma unroll
-                for (int i = 0; i < 8; ++i) sum[m] = fmaf(load_f(xr, i), wf[i], sum[m]);
-            }
-        }
-    }
-#pragma unroll
-    for (int m = 0; m < kGemvMaxRows; ++m) {
-        if (m < M) {
-            float v = wave_reduce_sum(sum[m]);
-            if (threadIdx.x == 0) {
-                if (bias) v += load_scalar(bias, bias_code, n);
-                out[static_cast<int64_t>(m) * N + n] = static_cast<OutT>(v);
-            }
-        }
-    }
-}
-
-template <typename InT>
-void launch_gemv_f16(const void* x, const void* w, const void* bias, int bias_code, void* d,
-                     int out_code, int M, int N, int K, hipStream_t stream) {
-    const dim3 block(kWave, kGemvWaves);
-    const dim3 grid((N + kGemvWaves - 1) / kGemvWaves);
-    const auto* xi = static_cast<const InT*>(x);
-    const auto* wh = static_cast<const __half*>(w);
-    if (out_code == kF32) {
-        gemv_f16_kernel<InT, float><<<grid, block, 0, stream>>>(xi, wh, bias, bias_code, static_cast<float*>(d), M, N, K);
-    } else if (out_code == kBF16) {
-        gemv_f16_kernel<InT, __bf16><<<grid, block, 0, stream>>>(xi, wh, bias, bias_code, static_cast<__bf16*>(d), M, N, K);
-    } else if (out_code == kF16) {
-        gemv_f16_kernel<InT, __half><<<grid, block, 0, stream>>>(xi, wh, bias, bias_code, static_cast<__half*>(d), M, N, K);
-    } else {
-        throw std::runtime_error("fp16_packed_linear: unsupported output dtype");
-    }
+        make_uint4(pair(a.x, b.x), pair(a.y, b.y), pair(a.z, b.z), pair(a.w, b.w));
 }
 
 }  // namespace
@@ -177,16 +126,8 @@ extern "C" bool launch_fp16_packed_linear_kernel(
     if (K % 8 != 0) {
         return false;
     }
-    if (M <= kGemvMaxRows) {
-        if (x_code == kF32) {
-            launch_gemv_f16<float>(x, w, bias, bias_code, d, out_code, M, N, K, stream);
-        } else if (x_code == kF16) {
-            launch_gemv_f16<__half>(x, w, bias, bias_code, d, out_code, M, N, K, stream);
-        } else if (x_code == kBF16) {
-            launch_gemv_f16<__bf16>(x, w, bias, bias_code, d, out_code, M, N, K, stream);
-        } else {
-            throw std::runtime_error("fp16_packed_linear: unsupported input dtype");
-        }
+    if (M <= kGemvF16MaxRows) {
+        launch_gemv_f16_kernel(x, x_code, w, bias, bias_code, d, out_code, M, N, K, stream);
         return true;
     }
     auto* xh = static_cast<__half*>(x16);
@@ -255,7 +196,7 @@ extern "C" bool launch_int8_convrot_packed_linear_kernel(
                          bias_code};
     const bool tiled = simt_square_tile(M, N);
     if (tiled) {
-        const int64_t chunks = static_cast<int64_t>(M) * (K / 8);
+        const int64_t chunks = static_cast<int64_t>((M + 1) & ~1) * (K / 8);
         tile_rows_f16_kernel<<<static_cast<unsigned>((chunks + 255) / 256), 256, 0, stream>>>(
             xh, static_cast<__half*>(x16t), M, K);
     }
@@ -263,7 +204,7 @@ extern "C" bool launch_int8_convrot_packed_linear_kernel(
     const auto* B = static_cast<const uint8_t*>(w);
     const auto gemm = [&]<typename OutT>(OutT* out) {
         if (tiled) {
-            launch_gemm_simt_tiled<SimtF16Packed, EpiRowwise, OutT, true>(A, B, out, M, N, 2 * K, N,
+            launch_gemm_simt_tiled<SimtF16Pairs, EpiRowwise, OutT, true>(A, B, out, M, N, 2 * K, N,
                                                                          epi, stream);
         } else {
             launch_gemm_simt<SimtF16Packed, EpiRowwise, OutT, const uint8_t*, true>(

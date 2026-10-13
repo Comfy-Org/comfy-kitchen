@@ -89,11 +89,16 @@ set(HIP_SOURCES
     ops/stochastic_round_fp8.hip
     ops/quantize_int8.hip
     ops/gemm_fp8.hip
+    ops/gemv_fp8.hip
     ops/gemm_int8.hip
     ops/gemm_f16_packed.hip
+    ops/gemv_f16.hip
     ops/gemm_fp16.hip
     ops/conv3d_fp16.hip
     ops/transpose_cast.hip
+    ops/depthwise_conv.hip
+    ops/direct_conv.hip
+    ops/packed_scale.hip
     ops/convrot_w4a4.hip
     ops/adaln.hip
     ops/group_norm_pad3d.hip
@@ -139,6 +144,31 @@ target_compile_options(comfy_kitchen_rdna1_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3>
     $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
     $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64>
+)
+# Files whose kernels measured faster at wave64 on the RX 5600M (1.02-1.75x), mostly the
+# ones that stream global memory with little arithmetic per element. The GEMM, conv and
+# attention kernels measured 3-11% slower there and stay wave32. Source options follow
+# the target's.
+set_source_files_properties(
+    ops/per_tensor_fp8.hip
+    ops/quantize_int8.hip
+    ops/gemv_f16.hip
+    ops/gemv_fp8.hip
+    ops/transpose_cast.hip
+    ops/depthwise_conv.hip
+    ops/adaln.hip
+    ops/group_norm_pad3d.hip
+    sage_attention/quant_qk_int8.hip
+    sage_attention/quant_v_int8.hip
+    sage_attention/sol_attn_route.hip
+    sage_attention/sol_attn_exact.hip
+    ops/apply_rope.hip
+    ops/rms_rope.hip
+    ops/gemv_awq.hip
+    ops/svdquant_w4a4.hip
+    ops/w4a8_dequant.hip
+    ops/w4a8_gemv.hip
+    PROPERTIES COMPILE_OPTIONS "-mwavefrontsize64;-include;${CMAKE_CURRENT_SOURCE_DIR}/wave64.h"
 )
 if(COMFY_ENABLE_LINEINFO OR CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_options(

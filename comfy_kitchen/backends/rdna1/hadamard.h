@@ -278,8 +278,8 @@ __forceinline__ __device__ float load_row_value<__half>(__half v) {
     return __half2float(v);
 }
 
-// The build pins wave32 (CMakeLists.txt); there is no compile-time wavefront
-// constant to assert on.
+// Reductions fold groups of 32 lanes, which is a whole wave in the wave32 files and
+// half of one in the wave64 files (CMakeLists.txt).
 constexpr int kWarpSize = 32;
 
 __forceinline__ __device__ float warp_reduce_max(float v) {
@@ -310,7 +310,7 @@ __forceinline__ __device__ float block_reduce_max(float v, float* warp_smem, flo
     return *block_smem;
 }
 
-// Only lane 0 is read back, and it never sees a lane shuffled in from past the warp.
+// Only lane 0 of each 32 is read back, and it never sees a lane from past its 32.
 __forceinline__ __device__ float warp_reduce_sum(float v) {
 #pragma unroll
     for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {

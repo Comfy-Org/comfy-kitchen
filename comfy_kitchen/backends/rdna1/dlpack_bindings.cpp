@@ -61,8 +61,21 @@ bool launch_fp16_conv3d_kernel(const void*, const void*, const void*, const void
                                int, int, int, int, int, int, int, int, int, int, int, int, int,
                                int, int, int, int, int, int, int, int, int, int, const void*, int,
                                bool, hipStream_t);
-void launch_transpose_cast_kernel(const void*, int, void*, int, int, int, int, const void*,
+bool launch_fp16_conv3d_phase_kernel(const void*, const void*, const void*, void*, int, int, int,
+                                     int, int, int, int, int, int, int, int, int, int, int, int,
+                                     int, int, int, int, int, int, int, int, int, const void*,
+                                     int, hipStream_t);
+void launch_transpose_cast_kernel(const void*, int, void*, int, int, int, int, int, const void*,
                                   hipStream_t);
+void launch_packed_acc_scale_kernel(const void*, int, int64_t, const void*, int, int64_t, void*,
+                                    void*, float, bool, hipStream_t);
+bool launch_direct_conv3d_kernel(const void*, const void*, const void*, void*, int, int, int, int,
+                                 int, int, int, int, int, int, int, int, int, int, int, int, int,
+                                 int, int, int, int, int, hipStream_t);
+void launch_depthwise_conv3d_kernel(const void*, int, const void*, int, const void*, int, void*,
+                                    int, int, int, int, int, int, int, int, int, int, int, int,
+                                    int, int, int, int, int, int, int, int, int, bool,
+                                    hipStream_t);
 
 void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, hipStream_t);
 void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
@@ -616,21 +629,180 @@ static void require_convrot_group(int k, int group_size, const char* fn) {
     }
 }
 
-// Packed [N, A, B] x -> packed [N, B, A] out, each element divided by divisor[0].
+// One phase of a transposed conv3d: a stride-1 conv of packed NDHWC fp16 x [N, D, H, W, C]
+// with w [K, T, R, S, C], whose [Z, P, Q] output positions land at (z * uz + rz, ...) of the
+// contiguous [N, K, Zf, Pf, Qf] out. pd/ph/pw are the leading zero padding (negative crops).
+bool fp16_conv3d_phase(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, nb::ndarray<> out, int N,
+                       int D, int H, int W, int C, int K, int T, int R, int S, int Z, int P, int Q,
+                       int pd, int ph, int pw, int uz, int up, int uq, int rz, int rp, int rq,
+                       int Zf, int Pf, int Qf, nb::ndarray<> acc_scale, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "fp16_conv3d_phase";
+    require_nonneg(N, kFn, "N");
+    for (int v : {D, H, W, C, T, R, S, uz, up, uq}) {
+        require_positive(v, kFn, "extent");
+    }
+    for (int v : {K, Z, P, Q, rz, rp, rq}) {
+        require_nonneg(v, kFn, "extent");
+    }
+    // every position the phase writes lies inside out
+    if ((Z > 0 && (Z - 1) * static_cast<int64_t>(uz) + rz >= Zf) ||
+        (P > 0 && (P - 1) * static_cast<int64_t>(up) + rp >= Pf) ||
+        (Q > 0 && (Q - 1) * static_cast<int64_t>(uq) + rq >= Qf)) {
+        throw std::runtime_error(std::string(kFn) + ": phase exceeds the output");
+    }
+    require_fp16(x, kFn, "x");
+    require_fp16(w, kFn, "w");
+    require_dtype(out, 0, 2, kFn, "out");
+    const int out_code = map_dtype_to_code(out.dtype());
+    require_len(x, static_cast<int64_t>(N) * D * H * W * C, kFn, "x");
+    require_len(w, static_cast<int64_t>(K) * T * R * S * C, kFn, "w");
+    require_len(out, static_cast<int64_t>(N) * K * Zf * Pf * Qf, kFn, "out");
+    if (bias.has_value()) {
+        require_dtype(*bias, out_code, out_code, kFn, "bias");
+        require_len(*bias, K, kFn, "bias");
+    }
+    require_dtype(acc_scale, 0, 0, kFn, "acc_scale");
+    require_len(acc_scale, 1, kFn, "acc_scale");
+    const bool served = launch_fp16_conv3d_phase_kernel(
+        x.data(), w.data(), opt_data(bias), out.data(), N, D, H, W, C, K, T, R, S, Z, P, Q, pd,
+        ph, pw, uz, up, uq, rz, rp, rq, Zf, Pf, Qf, acc_scale.data(), out_code,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return served;
+}
+
+// Depthwise conv3d (or its transpose) of contiguous x [N, C, D, H, W] with w [C, 1, T, R, S]
+// into out [N, C, Z, P, Q]; every tensor fp32, fp16 or bf16.
+void depthwise_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, nb::ndarray<> out, int N,
+                      int C, int D, int H, int W, int Z, int P, int Q, int T, int R, int S, int sd,
+                      int sh, int sw, int pd, int ph, int pw, int dd, int dh, int dw,
+                      bool transpose, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "depthwise_conv3d";
+    require_nonneg(N, kFn, "N");
+    for (int v : {C, D, H, W, T, R, S, sd, sh, sw, dd, dh, dw}) {
+        require_positive(v, kFn, "extent");
+    }
+    for (int v : {Z, P, Q, pd, ph, pw}) {
+        require_nonneg(v, kFn, "extent");
+    }
+    // the last output position's taps must reach no further than the kernel bounds-checks
+    const auto in_range = [&](int in, int o, int taps, int s, int pad, int dil) {
+        if (o == 0) return true;
+        const int64_t span = static_cast<int64_t>(taps - 1) * dil + 1;
+        return transpose ? (static_cast<int64_t>(in - 1) * s - 2 * pad + span + s - 1 >= o)
+                         : (static_cast<int64_t>(o - 1) * s + span <= in + 2 * static_cast<int64_t>(pad));
+    };
+    if (!in_range(D, Z, T, sd, pd, dd) || !in_range(H, P, R, sh, ph, dh) ||
+        !in_range(W, Q, S, sw, pw, dw) || (transpose && (dd != 1 || dh != 1 || dw != 1))) {
+        throw std::runtime_error(std::string(kFn) + ": output extent does not match the conv");
+    }
+    require_dtype(x, 0, 2, kFn, "x");
+    require_dtype(w, 0, 2, kFn, "w");
+    require_dtype(out, 0, 2, kFn, "out");
+    require_len(x, static_cast<int64_t>(N) * C * D * H * W, kFn, "x");
+    require_len(w, static_cast<int64_t>(C) * T * R * S, kFn, "w");
+    require_len(out, static_cast<int64_t>(N) * C * Z * P * Q, kFn, "out");
+    // the launcher's grid indexes the [N, C, Z, P] rows with an int
+    if (static_cast<int64_t>(N) * C * Z * P > INT_MAX) {
+        throw std::runtime_error(std::string(kFn) + ": too many output rows");
+    }
+    if (bias.has_value()) {
+        require_dtype(*bias, 0, 2, kFn, "bias");
+        require_len(*bias, C, kFn, "bias");
+    }
+    launch_depthwise_conv3d_kernel(
+        x.data(), map_dtype_to_code(x.dtype()), w.data(), map_dtype_to_code(w.dtype()),
+        opt_data(bias), bias.has_value() ? map_dtype_to_code(bias->dtype()) : 0, out.data(),
+        map_dtype_to_code(out.dtype()), N, C, D, H, W, Z, P, Q, T, R, S, sd, sh, sw, pd, ph, pw,
+        dd, dh, dw, transpose, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// Direct conv3d of contiguous x [N, C, D, H, W] with fp32 w [K, C, T, R, S] and bias into
+// out [N, K, Z, P, Q] of x's dtype (fp32, fp16 or bf16). false means the caller serves the
+// call.
+bool direct_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, nb::ndarray<> out, int N,
+                   int C, int K, int D, int H, int W, int Z, int P, int Q, int T, int R, int S,
+                   int sd, int sh, int sw, int pd, int ph, int pw, int dd, int dh, int dw,
+                   uintptr_t stream_ptr) {
+    constexpr const char* kFn = "direct_conv3d";
+    require_nonneg(N, kFn, "N");
+    for (int v : {C, K, D, H, W, T, R, S, sd, sh, sw, dd, dh, dw}) {
+        require_positive(v, kFn, "extent");
+    }
+    for (int v : {Z, P, Q, pd, ph, pw}) {
+        require_nonneg(v, kFn, "extent");
+    }
+    // the last output position's taps must reach no further than the kernel bounds-checks
+    const auto in_range = [](int in, int o, int taps, int s, int pad, int dil) {
+        return o == 0 || static_cast<int64_t>(o - 1) * s + static_cast<int64_t>(taps - 1) * dil + 1 <=
+                             in + 2 * static_cast<int64_t>(pad);
+    };
+    if (!in_range(D, Z, T, sd, pd, dd) || !in_range(H, P, R, sh, ph, dh) ||
+        !in_range(W, Q, S, sw, pw, dw)) {
+        throw std::runtime_error(std::string(kFn) + ": output extent does not match the conv");
+    }
+    require_dtype(x, 0, 2, kFn, "x");
+    require_dtype(w, 0, 0, kFn, "w");
+    require_out_matches(out, map_dtype_to_code(x.dtype()), kFn);
+    require_len(x, static_cast<int64_t>(N) * C * D * H * W, kFn, "x");
+    require_len(w, static_cast<int64_t>(K) * C * T * R * S, kFn, "w");
+    require_len(out, static_cast<int64_t>(N) * K * Z * P * Q, kFn, "out");
+    if (bias.has_value()) {
+        require_dtype(*bias, 0, 0, kFn, "bias");
+        require_len(*bias, K, kFn, "bias");
+    }
+    const bool served = launch_direct_conv3d_kernel(
+        x.data(), w.data(), opt_data(bias), out.data(), map_dtype_to_code(x.dtype()), N, C, K, D,
+        H, W, Z, P, Q, T, R, S, sd, sh, sw, pd, ph, pw, dd, dh, dw,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return served;
+}
+
+// out[0] = the power of two the packed convs scale x (or, with scale_weight, the weight) by,
+// from the largest |x| and |w| of two dense float tensors. bits is a zeroed two-element
+// int32 scratch.
+void packed_acc_scale(nb::ndarray<> x, nb::ndarray<> w, nb::ndarray<> bits, nb::ndarray<> out,
+                      float stage_ratio, bool scale_weight, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "packed_acc_scale";
+    require_dtype(x, 0, 2, kFn, "x");
+    require_dtype(w, 0, 2, kFn, "w");
+    require_dtype(out, 0, 0, kFn, "out");
+    require_len(out, 1, kFn, "out");
+    if (bits.dtype() != nb::dtype<int32_t>() || bits.size() < 2) {
+        throw std::runtime_error(std::string(kFn) + ": bits must be two int32");
+    }
+    launch_packed_acc_scale_kernel(x.data(), map_dtype_to_code(x.dtype()),
+                                   static_cast<int64_t>(x.size()), w.data(),
+                                   map_dtype_to_code(w.dtype()), static_cast<int64_t>(w.size()),
+                                   bits.data(), out.data(), stage_ratio, scale_weight,
+                                   reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// Packed [N, A, B] x -> packed [N, B, AP] out, each element divided by divisor[0] and each
+// output row's tail (a >= A) zero-filled.
 void transpose_cast(nb::ndarray<> x, nb::ndarray<> out, int N, int A, int B,
-                    nb::ndarray<> divisor, uintptr_t stream_ptr) {
+                    nb::ndarray<> divisor, uintptr_t stream_ptr, int AP) {
     constexpr const char* kFn = "transpose_cast";
     require_nonneg(N, kFn, "N");
     require_nonneg(A, kFn, "A");
     require_nonneg(B, kFn, "B");
+    if (AP == 0) {
+        AP = A;
+    }
+    if (AP < A) {
+        throw std::runtime_error(std::string(kFn) + ": AP must be at least A");
+    }
     require_dtype(x, 0, 2, kFn, "x");
     require_dtype(out, 0, 2, kFn, "out");
     require_len(x, static_cast<int64_t>(N) * A * B, kFn, "x");
-    require_len(out, static_cast<int64_t>(N) * A * B, kFn, "out");
+    require_len(out, static_cast<int64_t>(N) * AP * B, kFn, "out");
     require_dtype(divisor, 0, 0, kFn, "divisor");
     require_len(divisor, 1, kFn, "divisor");
     launch_transpose_cast_kernel(x.data(), map_dtype_to_code(x.dtype()), out.data(),
-                                 map_dtype_to_code(out.dtype()), N, A, B, divisor.data(),
+                                 map_dtype_to_code(out.dtype()), N, A, AP, B, divisor.data(),
                                  reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
@@ -2338,7 +2510,28 @@ NB_MODULE(_C, m) {
           nb::arg("ph") = 0, nb::arg("pw") = 0, nb::arg("acc_scale").none() = nb::none(),
           nb::arg("dd") = 1, nb::arg("dh") = 1, nb::arg("dw") = 1, nb::arg("out_ncdhw") = false);
     m.def("transpose_cast", &transpose_cast, nb::arg("x"), nb::arg("out"), nb::arg("N"),
-          nb::arg("A"), nb::arg("B"), nb::arg("divisor"), nb::arg("stream_ptr"));
+          nb::arg("A"), nb::arg("B"), nb::arg("divisor"), nb::arg("stream_ptr"),
+          nb::arg("AP") = 0);
+    m.def("packed_acc_scale", &packed_acc_scale, nb::arg("x"), nb::arg("w"), nb::arg("bits"),
+          nb::arg("out"), nb::arg("stage_ratio"), nb::arg("scale_weight"), nb::arg("stream_ptr"));
+    m.def("fp16_conv3d_phase", &fp16_conv3d_phase, nb::arg("x"), nb::arg("w"),
+          nb::arg("bias").none(), nb::arg("out"), nb::arg("N"), nb::arg("D"), nb::arg("H"),
+          nb::arg("W"), nb::arg("C"), nb::arg("K"), nb::arg("T"), nb::arg("R"), nb::arg("S"),
+          nb::arg("Z"), nb::arg("P"), nb::arg("Q"), nb::arg("pd"), nb::arg("ph"), nb::arg("pw"),
+          nb::arg("uz"), nb::arg("up"), nb::arg("uq"), nb::arg("rz"), nb::arg("rp"),
+          nb::arg("rq"), nb::arg("Zf"), nb::arg("Pf"), nb::arg("Qf"), nb::arg("acc_scale"),
+          nb::arg("stream_ptr"));
+    m.def("direct_conv3d", &direct_conv3d, nb::arg("x"), nb::arg("w"), nb::arg("bias").none(),
+          nb::arg("out"), nb::arg("N"), nb::arg("C"), nb::arg("K"), nb::arg("D"), nb::arg("H"),
+          nb::arg("W"), nb::arg("Z"), nb::arg("P"), nb::arg("Q"), nb::arg("T"), nb::arg("R"),
+          nb::arg("S"), nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("pd"), nb::arg("ph"),
+          nb::arg("pw"), nb::arg("dd"), nb::arg("dh"), nb::arg("dw"), nb::arg("stream_ptr"));
+    m.def("depthwise_conv3d", &depthwise_conv3d, nb::arg("x"), nb::arg("w"),
+          nb::arg("bias").none(), nb::arg("out"), nb::arg("N"), nb::arg("C"), nb::arg("D"),
+          nb::arg("H"), nb::arg("W"), nb::arg("Z"), nb::arg("P"), nb::arg("Q"), nb::arg("T"),
+          nb::arg("R"), nb::arg("S"), nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("pd"),
+          nb::arg("ph"), nb::arg("pw"), nb::arg("dd"), nb::arg("dh"), nb::arg("dw"),
+          nb::arg("transpose"), nb::arg("stream_ptr"));
     m.def("quantize_int8_rowwise", &quantize_int8_rowwise);
     m.def("quantize_int8_convrot", &quantize_int8_convrot, nb::arg("x"), nb::arg("q"),
           nb::arg("scales"), nb::arg("spill_rotated").none(), nb::arg("spill_partials").none(),

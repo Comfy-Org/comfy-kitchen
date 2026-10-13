@@ -244,6 +244,30 @@ struct SimtF16Packed {
     static __forceinline__ __device__ float finish(float c) { return c; }
 };
 
+// SimtF16Packed with the accumulator packed across rows instead of across K: one register
+// holds the fp16 chains of C[2p, j] and C[2p + 1, j], and each FMA takes one K element of
+// both rows against that element of column j broadcast to both halves (op_sel, no extra
+// instruction). Same MAC rate with half the fp16 accumulators. A must then hold a row pair
+// per word: A'[2p, 2e..2e+1] = (A[2p, 2e], A[2p + 1, 2e]) and A'[2p + 1, 2e..2e+1] =
+// (A[2p, 2e + 1], A[2p + 1, 2e + 1]), the transpose of every 2x2 block of (row, K), with a
+// missing last row as zeros. B is unchanged. A chain now takes both of a K word's
+// products, so it is folded every stage to hold the same 32.
+// Measured on gfx1010 in the ConvRot INT8 linear (M=4128, N and K 3840..10240): the 8x8
+// block went from 171 to 139 VGPRs and the op ran 1-6% faster, 7-12% with the 8x16 block
+// this leaves room for (see launch_gemm_simt_tiled).
+struct SimtF16Pairs : SimtF16Packed {
+    static constexpr int kFoldStages = 1;
+    static constexpr bool kRowPairs = true;
+    static __forceinline__ __device__ Pack dot(Frag a0, Frag a1, Frag b, Pack c) {
+        c = __builtin_elementwise_fma(a0.h, Pack{b.h.x, b.h.x}, c);
+        return __builtin_elementwise_fma(a1.h, Pack{b.h.y, b.h.y}, c);
+    }
+    static __forceinline__ __device__ void fold(Pack p, float& c0, float& c1) {
+        c0 += static_cast<float>(p.x);
+        c1 += static_cast<float>(p.y);
+    }
+};
+
 // A policy with a Pack type accumulates into it, folded into Acc every Op::kFoldStages
 // stages.
 template <typename Op, typename = void>
@@ -326,6 +350,8 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
     constexpr int kBPer = (kBChunks + kSimtThreads - 1) / kSimtThreads;
     static_assert(TX * TY == kSimtThreads, "TY must divide the block's threads");
     static_assert(!TILED || BM == kSimtTileRows, "a tiled A is laid out for the 128-row tile");
+    static_assert(!requires { Op::kRowPairs; } || std::is_same_v<ASrc, const uint8_t*>,
+                  "a row-paired A is dense");
     static_assert(!BI8 || Op::kExpand == 1, "an int8 B is widened by Op::expand_i8 alone");
     static_assert(TM % 4 == 0 && TN % 4 == 0, "a thread reads its rows four at a time");
     static_assert(kAChunks % kSimtThreads == 0 || kAChunks < kSimtThreads,
@@ -333,6 +359,9 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
     static_assert(kBChunks % kSimtThreads == 0 || kBChunks < kSimtThreads,
                   "a partial last round of chunk loads is only handled for a tile under one round");
     constexpr int kE = Op::kExpand;
+    constexpr bool kPairs = requires { Op::kRowPairs; };
+    // Rows of A to load: a row-paired A keeps the odd K of its last row in the row after it.
+    const int a_rows = kPairs ? (M + 1) & ~1 : M;
     constexpr int kLdsWords = kSimtWords * kE;  // LDS words per row per stage
 
     // K-major: LDS word lw of row r at [lw * BM + r], where global word kw expands
@@ -396,7 +425,7 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
                 const int64_t off = TILED ? static_cast<int64_t>(m0) * kbytes +
                                                 static_cast<int64_t>(kb0) * BM + c * 16
                                           : static_cast<int64_t>(grow) * kbytes + gk;
-                ra[i] = ((kAChunks % kSimtThreads == 0 || c < kAChunks) && grow < M && gk < kbytes)
+                ra[i] = ((kAChunks % kSimtThreads == 0 || c < kAChunks) && grow < a_rows && gk < kbytes)
                             ? *reinterpret_cast<const uint4*>(A + off)
                             : make_uint4(0, 0, 0, 0);
             }
@@ -498,15 +527,25 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
                 typename Op::Frag bf[TN];
 #pragma unroll
                 for (int j = 0; j < TN; ++j) bf[j] = Op::unpack(bw[j], s);
+                if constexpr (kPairs) {
 #pragma unroll
-                for (int i = 0; i < TM; ++i) {
-                    const typename Op::Frag af = Op::unpack(aw[i], s);
+                    for (int p = 0; p < TM / 2; ++p) {
+                        const typename Op::Frag a0 = Op::unpack(aw[2 * p], s);
+                        const typename Op::Frag a1 = Op::unpack(aw[2 * p + 1], s);
 #pragma unroll
-                    for (int j = 0; j < TN; ++j) {
-                        if constexpr (kPacked) {
-                            pack[i][j] = Op::dot(af, bf[j], pack[i][j]);
-                        } else {
-                            acc[i][j] = Op::dot(af, bf[j], acc[i][j]);
+                        for (int j = 0; j < TN; ++j) pack[p][j] = Op::dot(a0, a1, bf[j], pack[p][j]);
+                    }
+                } else {
+#pragma unroll
+                    for (int i = 0; i < TM; ++i) {
+                        const typename Op::Frag af = Op::unpack(aw[i], s);
+#pragma unroll
+                        for (int j = 0; j < TN; ++j) {
+                            if constexpr (kPacked) {
+                                pack[i][j] = Op::dot(af, bf[j], pack[i][j]);
+                            } else {
+                                acc[i][j] = Op::dot(af, bf[j], acc[i][j]);
+                            }
                         }
                     }
                 }
@@ -516,7 +555,15 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
         // operand scaling bounds, and after this slice's last stage so no partial is lost
         // (a slice's stage count need not be a multiple of kFoldStages).
         if constexpr (kPacked) {
-            if (++stage % Op::kFoldStages == 0 || !has_next) {
+            if constexpr (kPairs) {
+#pragma unroll
+                for (int p = 0; p < TM / 2; ++p)
+#pragma unroll
+                    for (int j = 0; j < TN; ++j) {
+                        Op::fold(pack[p][j], acc[2 * p][j], acc[2 * p + 1][j]);
+                        pack[p][j] = {};
+                    }
+            } else if (++stage % Op::kFoldStages == 0 || !has_next) {
 #pragma unroll
                 for (int i = 0; i < TM; ++i)
 #pragma unroll
@@ -640,16 +687,32 @@ void launch_simt_tile(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
 //     of 16x256, or K is past 4 KiB.
 //   - int4 keeps the 16-row tile up to M = 48 (three of them beat one 64-row tile)
 //     while its rows are at most 2 KiB, and loses past that.
+//
+// Narrow N (N <= 16, an RGB or latent conv head) mirrors that: a 512x8 or 256x16 tile
+// spends the threads on rows rather than on columns past N. Measured with the packed conv
+// at 128 -> 8 channels over 512x512: 1.75x the 64x64 tile it took before, 1.4x at
+// 256 -> 16 over 256x256. Under about 70 tiles the 64x64 tile stays ahead (0.88x at a
+// 1x1 conv with 64 of them).
 // Whether launch_gemm_simt gives this shape the square 128-row tile, the one a tiled A
 // is laid out for.
 inline bool simt_square_tile(int M, int N) {
     return M > 64 && static_cast<int64_t>((M + 127) / 128) * ((N + 127) / 128) >= 2 * device_wgp_count();
 }
 
-// launch_gemm_simt for a simt_square_tile shape with A in the tiled layout.
+// launch_gemm_simt for a simt_square_tile shape with A in the tiled layout. A row-paired
+// Op's 8x16 block fits the registers without spilling (250 VGPRs on gfx1010), and its
+// 128x256 tile fetches a quarter less of the operands per product: measured 1-6% faster
+// than 128x128 from about 250 tiles on the 18-WGP RX 5600M and 5-20% slower under 160.
 template <typename Op, typename Epi, typename OutT, bool BI8 = false>
 void launch_gemm_simt_tiled(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int kbytes,
                             int ldc, Epi epi, hipStream_t stream) {
+    if constexpr (requires { Op::kRowPairs; }) {
+        if (static_cast<int64_t>((M + 127) / 128) * ((N + 255) / 256) >= 12 * device_wgp_count()) {
+            launch_simt_tile<Op, Epi, OutT, 16, 8, 16, const uint8_t*, true, BI8>(
+                A, B, C, M, N, kbytes, ldc, epi, 1, stream);
+            return;
+        }
+    }
     launch_simt_tile<Op, Epi, OutT, 16, 8, 8, const uint8_t*, true, BI8>(A, B, C, M, N, kbytes,
                                                                         ldc, epi, 1, stream);
 }
@@ -685,6 +748,13 @@ void launch_gemm_simt(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
     } else if (packed && Op::kPack16 && kbytes <= 2048) {
         launch_simt_tile<Op, Epi, OutT, 4, 4, 4, ASrc, false, BI8>(A, B, C, M, N, kbytes, ldc, epi,
                                                  slices(16, 256), stream);
+    } else if (Op::kExpand == 1 && N <= 8 && blocks(512, 8) >= 4 * units) {
+        // 32 KiB of LDS per expanded word, so the tile is not instantiated for fp8's two
+        if constexpr (Op::kExpand == 1) {
+            launch_simt_tile<Op, Epi, OutT, 128, 4, 4, ASrc, false, BI8>(A, B, C, M, N, kbytes, ldc, epi, 1, stream);
+        }
+    } else if (N <= 16 && blocks(256, 16) >= 4 * units) {
+        launch_simt_tile<Op, Epi, OutT, 64, 4, 4, ASrc, false, BI8>(A, B, C, M, N, kbytes, ldc, epi, 1, stream);
     } else if (simt_square_tile(M, N)) {
         launch_simt_tile<Op, Epi, OutT, 16, 8, 8, ASrc, false, BI8>(A, B, C, M, N, kbytes, ldc, epi, 1, stream);
     } else if (blocks(64, 128) >= 2 * units) {

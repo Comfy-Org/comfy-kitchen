@@ -13,6 +13,19 @@
 
 extern "C" {
 
+// out[M, N] = x[M, K] @ w[N, K]^T + bias in fp32 math over a fp16 weight, for
+// M <= kGemvF16MaxRows. K is a multiple of 8. See ops/gemv_f16.hip.
+constexpr int kGemvF16MaxRows = 8;
+void launch_gemv_f16_kernel(const void* x, int x_code, const void* w, const void* bias,
+                            int bias_code, void* d, int out_code, int M, int N, int K,
+                            hipStream_t stream);
+
+// c[M, N] = (a[M, K] @ b[N, K]^T) * scale_a * scale_b + bias over e4m3 bytes, for M <= 8.
+// K is a multiple of 16. See ops/gemv_fp8.hip.
+void launch_gemv_fp8_kernel(const void* a, const void* b, void* c, const void* scale_a,
+                            const void* scale_b, const void* bias, int bias_code, int M, int N,
+                            int K, int out_code, hipStream_t stream);
+
 // Fused 3D neighborhood attention over contiguous (B, T, H, W, NH, HD) tensors.
 // dtype_code is a DTYPE_TO_CODE value: 1 float16, 2 bfloat16. See ops/na3d.hip.
 void launch_na3d_kernel(const void* q, const void* k, const void* v, void* out, int batch,

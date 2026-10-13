@@ -111,6 +111,10 @@ __all__ = [
     "gemv_awq_w4a16",
     "fp16_linear",
     "fp16_packed_conv3d",
+    "fp16_packed_conv_transpose3d",
+    "depthwise_conv3d",
+    "depthwise_conv_transpose3d",
+    "direct_conv3d",
     "fp16_packed_linear",
     "fp16_packed_linear_is_accelerated",
     "int8_linear",
@@ -1012,6 +1016,80 @@ def fp16_packed_conv3d(
     kwargs = {"x": x, "weight": weight, "bias": bias, "stride": stride, "padding": padding,
               "dilation": dilation}
     impl = registry.get_implementation("fp16_packed_conv3d", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def _triple(v):
+    return [v] * 3 if isinstance(v, int) else list(v)
+
+
+def fp16_packed_conv_transpose3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: int | tuple[int, int, int] = 1,
+    padding: int | tuple[int, int, int] = 0,
+    output_padding: int | tuple[int, int, int] = 0,
+) -> torch.Tensor:
+    """conv_transpose3d (one group, no dilation) with an fp16 ``[C, K, T, R, S]`` weight on
+    the packed fp16 math of :func:`fp16_packed_linear`, the result in x's dtype.
+
+    rdna1 serves it as one stride-1 implicit GEMM per output residue, with no zero-stuffed
+    input and no im2col workspace. Elsewhere this is torch's conv_transpose3d in x's dtype.
+    """
+    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _triple(stride),
+              "padding": _triple(padding), "output_padding": _triple(output_padding)}
+    impl = registry.get_implementation("fp16_packed_conv_transpose3d", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def depthwise_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: int | tuple[int, int, int] = 1,
+    padding: int | tuple[int, int, int] = 0,
+    dilation: int | tuple[int, int, int] = 1,
+) -> torch.Tensor:
+    """conv3d with one ``[1, T, R, S]`` filter per channel (groups == channels) and zero
+    padding, the result in x's dtype. rdna1 serves it with a gather kernel accumulating in
+    fp32; elsewhere this is torch's grouped conv3d."""
+    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _triple(stride),
+              "padding": _triple(padding), "dilation": _triple(dilation)}
+    impl = registry.get_implementation("depthwise_conv3d", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def direct_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: int | tuple[int, int, int] = 1,
+    padding: int | tuple[int, int, int] = 0,
+    dilation: int | tuple[int, int, int] = 1,
+) -> torch.Tensor:
+    """conv3d with zero padding, the result contiguous in x's dtype. rdna1 serves it with a
+    direct kernel in fp32 math that reads x in place, for convs with few input or few output
+    channels; elsewhere this is torch's conv3d."""
+    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _triple(stride),
+              "padding": _triple(padding), "dilation": _triple(dilation)}
+    impl = registry.get_implementation("direct_conv3d", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def depthwise_conv_transpose3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: int | tuple[int, int, int] = 1,
+    padding: int | tuple[int, int, int] = 0,
+    output_padding: int | tuple[int, int, int] = 0,
+) -> torch.Tensor:
+    """conv_transpose3d with one ``[1, T, R, S]`` filter per channel (groups == channels) and
+    no dilation, the result in x's dtype; see :func:`depthwise_conv3d`."""
+    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _triple(stride),
+              "padding": _triple(padding), "output_padding": _triple(output_padding)}
+    impl = registry.get_implementation("depthwise_conv_transpose3d", kwargs=kwargs)
     return impl(**kwargs)
 
 

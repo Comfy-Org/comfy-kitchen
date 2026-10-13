@@ -65,7 +65,11 @@ __all__ = [
     "fp16_conv3d_out",
     "fp16_linear",
     "fp16_packed_conv3d",
+    "fp16_packed_conv_transpose3d",
     "fp16_packed_linear",
+    "depthwise_conv3d",
+    "depthwise_conv_transpose3d",
+    "direct_conv3d",
     "gemv_awq_w4a16",
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
@@ -775,6 +779,10 @@ def fp16_linear(
     return out if len(orig_shape) == 2 else out.reshape(out_shape)
 
 
+# Weight elements from which 9 to 16 rows run as two GEMVs (see fp16_packed_linear).
+_GEMV_PAIR_WEIGHT = 2**24
+
+
 def fp16_packed_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -786,12 +794,18 @@ def fp16_packed_linear(
     products (_PACKED_STAGE_PRODUCTS), stored as ``out_dtype`` (x's dtype by default). x (any float dtype, any range) is scaled per
     row by a power of two against ``weight_amax`` (the largest |weight|, computed when
     not given) so no fp16 partial sum overflows. Up to 8 rows run a GEMV in fp32 math over
-    the fp16 weight instead. Shapes the kernel declines run torch."""
+    the fp16 weight instead, and 9 to 16 rows over a large weight run it twice: the short-M
+    GEMM tiles fetch the weight at a fraction of the GEMV's rate (1.2-2.2x measured from
+    2**24 weight elements). Shapes the kernel declines run torch."""
     out_dtype = x.dtype if out_dtype is None else out_dtype
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     m = x_2d.shape[0]
     n, k = weight.shape
     out_shape = (*x.shape[:-1], n)
+    if 8 < m <= 16 and n * k >= _GEMV_PAIR_WEIGHT:
+        out = torch.cat([fp16_packed_linear(x_2d[:8], weight, bias, out_dtype),
+                         fp16_packed_linear(x_2d[8:], weight, bias, out_dtype)])
+        return out.reshape(out_shape)
     if bias is not None:
         bias = bias.to(device=x.device)
     if (
@@ -1897,19 +1911,54 @@ def _simt_fp16_conv3d(x, weight, bias, residual, stride, padding, out=None, dila
     if x.shape[1] % 32 or x.dtype != torch.float16 or weight.dtype != torch.float16 \
             or weight.device != x.device:
         return None
-    inf = float("inf")
-    bound = (torch.linalg.vector_norm(x, inf, dtype=torch.float32)
-             * torch.linalg.vector_norm(weight, inf, dtype=torch.float32)
-             * (_PACKED_STAGE_PRODUCTS / _PACKED_STAGE_SUM_LIMIT))
-    acc_scale = torch.exp2(torch.log2(bound).ceil_().clamp_(min=0)).reshape(1)
+    acc_scale = _packed_acc_scale(x, weight, scale_weight=True)
     return _kernel_fp16_conv3d(x, (weight / acc_scale).half(), bias, residual, stride, acc_scale,
                                out, padding, dilation)
 
 
-def _transpose_cast(x, out, n, a, b, divisor):
-    """Packed [n, a, b] x into packed [n, b, a] out in out's dtype, divided by divisor (a
-    one-element fp32 tensor); see ops/transpose_cast.hip."""
-    _C.transpose_cast(_dl(x), _dl(out), n, a, b, _dl(divisor), _stream(x))
+def _transpose_cast(x, out, n, a, b, divisor, ap=0):
+    """Packed [n, a, b] x into packed [n, b, ap] out in out's dtype (ap = a when 0, else each
+    row's tail is zero-filled), divided by divisor (a one-element fp32 tensor); see
+    ops/transpose_cast.hip."""
+    _C.transpose_cast(_dl(x), _dl(out), n, a, b, _dl(divisor), _stream(x), ap)
+
+
+def _dense(t):
+    return t.is_contiguous() or t.is_contiguous(memory_format=torch.channels_last_3d)
+
+
+def _packed_acc_scale(x, weight, scale_weight=False):
+    """The power of two (a one-element fp32 tensor) to divide x by so that each packed
+    partial sum against weight stays in fp16's range and x's largest element under 2**15;
+    with scale_weight, the one to divide the weight by instead (at least 1). Dense tensors
+    take ops/packed_scale.hip; a strided view of a larger tensor takes the same math in torch."""
+    ratio = _PACKED_STAGE_PRODUCTS / _PACKED_STAGE_SUM_LIMIT
+    if _dense(x) and _dense(weight):
+        bits = torch.zeros(2, dtype=torch.int32, device=x.device)
+        acc_scale = torch.empty(1, dtype=torch.float32, device=x.device)
+        _C.packed_acc_scale(_dl(x), _dl(weight), _dl(bits), _dl(acc_scale), ratio, scale_weight,
+                            _stream(x))
+        return acc_scale
+    inf = float("inf")
+    x_amax = torch.linalg.vector_norm(x, inf, dtype=torch.float32)
+    bound = x_amax * torch.linalg.vector_norm(weight, inf, dtype=torch.float32) * ratio
+    if scale_weight:
+        return torch.exp2(torch.log2(bound).ceil_().clamp_(min=0)).reshape(1)
+    # the floor keeps an all-zero x's scale finite
+    exponent = torch.maximum(torch.log2(bound), torch.log2(x_amax) - 15).ceil_().clamp_(min=-64)
+    return torch.exp2(exponent).reshape(1)
+
+
+def _scaled_ndhwc_copy(x, acc_scale):
+    """Contiguous NCDHW x of any float dtype as the packed convs' operand: a channels_last_3d
+    fp16 copy divided by acc_scale, its channels zero-padded to a multiple of 32 (the width
+    of the gather's reads)."""
+    n, c = x.shape[:2]
+    cp = -(-c // 32) * 32
+    x16 = torch.empty((n, cp, *x.shape[2:]), dtype=torch.float16, device=x.device,
+                      memory_format=torch.channels_last_3d)
+    _transpose_cast(x, x16, n, c, x[0, 0].numel(), acc_scale, cp)
+    return x16
 
 
 def fp16_packed_conv3d(
@@ -1922,7 +1971,8 @@ def fp16_packed_conv3d(
 ) -> torch.Tensor:
     """conv3d with an fp16 weight on the packed fp16 implicit GEMM, x of any
     float dtype and range, the result in x's dtype and memory format (channels_last_3d or
-    contiguous). A channels_last_3d fp16 x is read in place against a scaled weight
+    contiguous; contiguous when x's channels are not a multiple of 32, which the copy
+    zero-pads up to one). A channels_last_3d fp16 x is read in place against a scaled weight
     (_simt_fp16_conv3d). Any other x is taken to an NDHWC fp16 copy, divided by the power
     of two that keeps each packed partial sum in fp16's range against the unscaled weight
     (and the copy's largest element under 2**15); the epilogue multiplies it back. A
@@ -1931,34 +1981,177 @@ def fp16_packed_conv3d(
     NCDHW directly. No im2col workspace exists.
     Shapes the kernel declines run torch's conv in x's dtype."""
     cl = torch.channels_last_3d
-    if x.shape[1] % 32 == 0 and weight.dtype == torch.float16 and weight.device == x.device:
+    if weight.dtype == torch.float16 and weight.device == x.device:
         if bias is not None:
             bias = bias.to(device=x.device, dtype=x.dtype)
-        channels_last = x.is_contiguous(memory_format=cl)
+        c = x.shape[1]
+        channels_last = c % 32 == 0 and x.is_contiguous(memory_format=cl)
         if channels_last and x.dtype == torch.float16:
             out = _simt_fp16_conv3d(x, weight, bias, None, stride, padding, dilation=dilation)
         else:
             if not channels_last:
                 x = x.contiguous()
-            inf = float("inf")
-            x_amax = torch.linalg.vector_norm(x, inf, dtype=torch.float32)
-            bound = (x_amax * torch.linalg.vector_norm(weight, inf, dtype=torch.float32)
-                     * (_PACKED_STAGE_PRODUCTS / _PACKED_STAGE_SUM_LIMIT))
-            # the floor keeps an all-zero x's scale finite
-            exponent = torch.maximum(torch.log2(bound), torch.log2(x_amax) - 15).ceil_().clamp_(min=-64)
-            acc_scale = torch.exp2(exponent).reshape(1)
-            x16 = torch.empty(x.shape, dtype=torch.float16, device=x.device, memory_format=cl)
-            n, c = x.shape[:2]
+            acc_scale = _packed_acc_scale(x, weight)
             if channels_last:
+                x16 = torch.empty(x.shape, dtype=torch.float16, device=x.device, memory_format=cl)
                 torch.div(x, acc_scale, out=x16)
             else:
-                _transpose_cast(x, x16, n, c, x[0, 0].numel(), acc_scale)
+                x16 = _scaled_ndhwc_copy(x, acc_scale)
+                if x16.shape[1] != c:
+                    weight = torch.nn.functional.pad(weight, (0, 0, 0, 0, 0, 0, 0, x16.shape[1] - c))
             out = _kernel_fp16_conv3d(x16, weight, bias, None, stride, acc_scale, padding=padding,
                                       dilation=dilation, out_dtype=x.dtype,
                                       ncdhw=not channels_last)
         if out is not None:
             return out
     return _eager.fp16_packed_conv3d(x, weight, bias, stride, padding, dilation)
+
+
+def fp16_packed_conv_transpose3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    output_padding: list[int],
+) -> torch.Tensor:
+    """conv_transpose3d (one group, no dilation) with an fp16 [C, K, T, R, S] weight on the
+    packed fp16 implicit GEMM, x of any float dtype and range, the result contiguous in x's
+    dtype. Output position o of an axis reads only the taps j with (o + padding - j) %
+    stride == 0, so the transpose splits into one stride-1 conv per residue of o (a phase)
+    over the taps of that residue: no zero-stuffed input and no wasted products. x is taken
+    to the scaled NDHWC fp16 copy of fp16_packed_conv3d, the weight to [K, taps, C] once and
+    from there to each phase's taps, and each phase's epilogue writes its positions of the
+    output directly. Shapes the kernel declines run torch's conv_transpose3d in x's dtype."""
+    n, c, *size = x.shape
+    k, *taps = weight.shape[1:]
+    full = [(i - 1) * s - 2 * p + t + op
+            for i, s, p, t, op in zip(size, stride, padding, taps, output_padding, strict=True)]
+    if (weight.dtype != torch.float16 or weight.device != x.device or weight.shape[0] != c
+            or k % 8 or min(full) < 1 or min(stride) < 1 or min(padding) < 0 or n * c * k == 0):
+        return _eager.fp16_packed_conv_transpose3d(x, weight, bias, stride, padding, output_padding)
+    x = x.contiguous()
+    acc_scale = _packed_acc_scale(x, weight)
+    x16 = _scaled_ndhwc_copy(x, acc_scale)
+    cp = x16.shape[1]
+    ntaps = taps[0] * taps[1] * taps[2]
+    wt = torch.empty((k, ntaps, cp), dtype=torch.float16, device=x.device)
+    one = torch.ones(1, dtype=torch.float32, device=x.device)
+    _transpose_cast(weight.contiguous(), wt, 1, c, k * ntaps, one, cp)
+    if bias is not None:
+        bias = bias.to(device=x.device, dtype=x.dtype).contiguous()
+    out = torch.empty((n, k, *full), dtype=x.dtype, device=x.device)
+
+    # per axis and residue r: (taps in correlation order, leading zero padding, positions)
+    def phases(taps_a, s, p, o):
+        for r in range(min(s, o)):
+            js = list(range((r + p) % s, taps_a, s))[::-1]
+            yield r, js, len(js) - 1 - (r + p) // s, len(range(r, o, s))
+
+    plan = [(pz, pp, pq) for pz in phases(taps[0], stride[0], padding[0], full[0])
+            for pp in phases(taps[1], stride[1], padding[1], full[1])
+            for pq in phases(taps[2], stride[2], padding[2], full[2])]
+    # every phase's taps as flat [T, R, S] indices, uploaded once
+    order = torch.tensor([(t * taps[1] + r) * taps[2] + s for pz, pp, pq in plan
+                          for t in pz[1] for r in pp[1] for s in pq[1]], device=x.device)
+    start = 0
+    for (rz, jt, pd, z), (rp, jr, ph, p), (rq, js, pw, q) in plan:
+        count = len(jt) * len(jr) * len(js)
+        if count == 0:  # stride past the filter: these positions see no tap
+            view = out[:, :, rz::stride[0], rp::stride[1], rq::stride[2]]
+            view.zero_() if bias is None else view.copy_(bias.reshape(1, k, 1, 1, 1))
+            continue
+        wp = wt.index_select(1, order[start:start + count])
+        start += count
+        if not _C.fp16_conv3d_phase(
+            _dl(x16), _dl(wp), None if bias is None else _dl(bias), _dl(out), n, *size, cp, k,
+            len(jt), len(jr), len(js), z, p, q, pd, ph, pw, *stride, rz, rp, rq, *full,
+            _dl(acc_scale), _stream(x),
+        ):
+            return _eager.fp16_packed_conv_transpose3d(x, weight, bias, stride, padding,
+                                                       output_padding)
+    return out
+
+
+def _depthwise(x, weight, bias, stride, padding, dilation, out_size, transpose):
+    n, c, *size = x.shape
+    x = x.contiguous()
+    weight = weight.to(device=x.device).contiguous()
+    if bias is not None:
+        bias = bias.to(device=x.device).contiguous()
+    out = torch.empty((n, c, *out_size), dtype=x.dtype, device=x.device)
+    _C.depthwise_conv3d(_dl(x), _dl(weight), None if bias is None else _dl(bias), _dl(out), n, c,
+                        *size, *out_size, *weight.shape[2:], *stride, *padding, *dilation,
+                        transpose, _stream(x))
+    return out
+
+
+def depthwise_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    dilation: list[int],
+) -> torch.Tensor:
+    """conv3d with one [1, T, R, S] filter per channel (groups == channels), zero padding, any
+    float dtypes, the result contiguous in x's dtype; see ops/depthwise_conv.hip."""
+    out_size = [(i + 2 * p - (t - 1) * d - 1) // s + 1 if min(s, d) > 0 else 0
+                for i, s, p, t, d in zip(x.shape[2:], stride, padding, weight.shape[2:], dilation, strict=True)]
+    if weight.shape[:2] != (x.shape[1], 1) or min(out_size) < 1 or min(padding) < 0 or x.numel() == 0:
+        return _eager.depthwise_conv3d(x, weight, bias, stride, padding, dilation)
+    return _depthwise(x, weight, bias, stride, padding, dilation, out_size, False)
+
+
+def direct_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    dilation: list[int],
+) -> torch.Tensor:
+    """conv3d with zero padding on the direct kernel (ops/direct_conv.hip): x of any float
+    dtype read in place, fp32 math against an fp32 copy of the weight, the result contiguous
+    in x's dtype. It is the faster kernel for few input channels or at most 8 output
+    channels; see the file for where MIOpen and the packed conv stay ahead."""
+    out_size = [(i + 2 * p - (t - 1) * d - 1) // s + 1 if min(s, d) > 0 else 0
+                for i, s, p, t, d in zip(x.shape[2:], stride, padding, weight.shape[2:], dilation, strict=True)]
+    if weight.shape[1] != x.shape[1] or min(out_size) < 1 or min(padding) < 0 or x.numel() == 0:
+        return _eager.direct_conv3d(x, weight, bias, stride, padding, dilation)
+    n, c, *size = x.shape
+    k = weight.shape[0]
+    x = x.contiguous()
+    weight = weight.to(device=x.device, dtype=torch.float32).contiguous()
+    if bias is not None:
+        bias = bias.to(device=x.device, dtype=torch.float32).contiguous()
+    out = torch.empty((n, k, *out_size), dtype=x.dtype, device=x.device)
+    with torch.cuda.device(x.device):
+        served = _C.direct_conv3d(_dl(x), _dl(weight), None if bias is None else _dl(bias), _dl(out),
+                                  n, c, k, *size, *out_size, *weight.shape[2:], *stride, *padding,
+                                  *dilation, _stream(x))
+    if not served:
+        return _eager.direct_conv3d(x, weight, bias, stride, padding, dilation)
+    return out
+
+
+def depthwise_conv_transpose3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    output_padding: list[int],
+) -> torch.Tensor:
+    """conv_transpose3d with one [1, T, R, S] filter per channel (groups == channels), no
+    dilation, any float dtypes, the result contiguous in x's dtype."""
+    out_size = [(i - 1) * s - 2 * p + t + op
+                for i, s, p, t, op in zip(x.shape[2:], stride, padding, weight.shape[2:], output_padding, strict=True)]
+    if (weight.shape[:2] != (x.shape[1], 1) or min(out_size) < 1 or min(stride) < 1
+            or min(padding) < 0 or x.numel() == 0
+            or any(op >= s for op, s in zip(output_padding, stride, strict=True))):
+        return _eager.depthwise_conv_transpose3d(x, weight, bias, stride, padding, output_padding)
+    return _depthwise(x, weight, bias, stride, padding, (1, 1, 1), out_size, True)
 
 
 def _torch_conv3d(x, weight, bias, residual, stride, out=None):
@@ -3072,6 +3265,40 @@ def _build_constraints() -> dict:
                 "weight": ParamConstraint(
                     dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(5),)
                 ),
+                "bias": ParamConstraint(dtypes=floats),
+            },
+            default_devices=dev,
+        ),
+        "fp16_packed_conv_transpose3d": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(5),)),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(5),)
+                ),
+                "bias": ParamConstraint(dtypes=floats),
+            },
+            default_devices=dev,
+        ),
+        "depthwise_conv3d": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(5),)),
+                "weight": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(5),)),
+                "bias": ParamConstraint(dtypes=floats),
+            },
+            default_devices=dev,
+        ),
+        "depthwise_conv_transpose3d": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(5),)),
+                "weight": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(5),)),
+                "bias": ParamConstraint(dtypes=floats),
+            },
+            default_devices=dev,
+        ),
+        "direct_conv3d": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(5),)),
+                "weight": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(5),)),
                 "bias": ParamConstraint(dtypes=floats),
             },
             default_devices=dev,

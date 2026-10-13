@@ -250,6 +250,9 @@ class TestFp16PackedConv3d:
             (128, 128, (1, 1, 3000), (1, 1, 7), (1, 1, 1), (0, 0, 27), (1, 1, 9)),
             (64, 40, (3, 17, 13), (3, 3, 3), (1, 2, 2), (1, 2, 2), (1, 2, 2)),
             (96, 8, (1, 1, 999), (1, 1, 3), (1, 1, 2), (0, 0, 1), (1, 1, 1)),
+            # channel counts the gather's 32-channel reads do not divide
+            (48, 24, (1, 1, 500), (1, 1, 7), (1, 1, 1), (0, 0, 3), (1, 1, 1)),
+            (3, 8, (2, 9, 11), (3, 3, 3), (1, 1, 1), (1, 1, 1), (1, 1, 1)),
         ],
     )
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
@@ -269,7 +272,8 @@ class TestFp16PackedConv3d:
 
         assert out.shape == ref.shape and out.dtype == dtype
         if _simt_device():
-            assert out.is_contiguous(memory_format=CL3D if channels_last else torch.contiguous_format)
+            keeps_layout = channels_last and c % 32 == 0
+            assert out.is_contiguous(memory_format=CL3D if keeps_layout else torch.contiguous_format)
         # bf16 and fp16 outputs carry their own rounding on top of the packed GEMM's ~1e-3
         assert rel_err(out.double(), ref) < (2e-3 if dtype == torch.float32 else 6e-3)
 
@@ -287,3 +291,175 @@ class TestFp16PackedConv3d:
             assert rel_err(out.double(), ref) < 2e-3
         zeros = ck.fp16_packed_conv3d(torch.zeros(1, 64, 1, 8, 8, device="cuda"), weight, padding=(0, 1, 1))
         assert torch.equal(zeros, torch.zeros_like(zeros))
+
+
+class TestFp16PackedConvTranspose3d:
+    """fp16_packed_conv_transpose3d: x of any float dtype and range against an fp16
+    [C, K, T, R, S] weight, the result in x's dtype. Off the packed GEMM devices it is torch's
+    conv_transpose3d in x's dtype."""
+
+    @pytest.mark.parametrize(
+        "c,k,spatial,ksize,stride,padding,output_padding",
+        [
+            (512, 256, (1, 1, 300), (1, 1, 8), (1, 1, 4), (0, 0, 2), (0, 0, 0)),
+            (64, 32, (1, 1, 50), (1, 1, 20), (1, 1, 10), (0, 0, 5), (0, 0, 0)),
+            (48, 24, (1, 1, 40), (1, 1, 9), (1, 1, 5), (0, 0, 2), (0, 0, 0)),
+            (16, 8, (1, 1, 21), (1, 1, 7), (1, 1, 3), (0, 0, 0), (0, 0, 2)),
+            (32, 8, (1, 1, 9), (1, 1, 2), (1, 1, 5), (0, 0, 0), (0, 0, 0)),     # stride past the filter
+            (32, 8, (1, 1, 30), (1, 1, 16), (1, 1, 8), (0, 0, 12), (0, 0, 0)),  # padding past the stride
+            (64, 32, (1, 13, 11), (1, 4, 4), (1, 2, 2), (0, 1, 1), (0, 0, 0)),
+            (32, 16, (1, 9, 7), (1, 3, 3), (1, 2, 2), (0, 1, 1), (0, 1, 1)),
+            (40, 8, (3, 5, 4), (4, 4, 4), (2, 2, 2), (1, 1, 1), (0, 0, 0)),
+            (3, 8, (4, 5, 6), (3, 3, 3), (2, 1, 3), (0, 1, 2), (1, 0, 0)),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_matches_fp64_conv_transpose(self, c, k, spatial, ksize, stride, padding, output_padding,
+                                         dtype, with_bias):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA/HIP required")
+        torch.manual_seed(0)
+        x = (torch.randn(2, c, *spatial, device="cuda") * 30).to(dtype)
+        weight = (torch.randn(c, k, *ksize, device="cuda") / math.sqrt(c * math.prod(ksize))).half()
+        bias = torch.randn(k, device="cuda") if with_bias else None
+        ref = functional.conv_transpose3d(x.double(), weight.double(), None if bias is None else bias.double(),
+                                          stride, padding, output_padding)
+
+        out = ck.fp16_packed_conv_transpose3d(x, weight, bias, stride, padding, output_padding)
+
+        assert out.shape == ref.shape and out.dtype == dtype and out.is_contiguous()
+        assert rel_err(out.double(), ref) < (2e-3 if dtype == torch.float32 else 6e-3)
+
+    def test_wide_range_and_zero_input(self):
+        if not _simt_device():
+            pytest.skip("packed fp16 GEMM device required")
+        torch.manual_seed(1)
+        weight = (torch.randn(64, 32, 1, 1, 8, device="cuda") * 0.05).half()
+        for magnitude in (1e6, 1e-6):
+            x = torch.randn(1, 64, 1, 1, 200, device="cuda") * magnitude
+            ref = functional.conv_transpose3d(x.double(), weight.double(), stride=(1, 1, 4), padding=(0, 0, 2))
+            out = ck.fp16_packed_conv_transpose3d(x, weight, stride=(1, 1, 4), padding=(0, 0, 2))
+            assert torch.isfinite(out).all()
+            assert rel_err(out.double(), ref) < 2e-3
+        zeros = ck.fp16_packed_conv_transpose3d(torch.zeros(1, 64, 1, 1, 20, device="cuda"), weight, stride=(1, 1, 4))
+        assert torch.equal(zeros, torch.zeros_like(zeros))
+
+
+class TestDirectConv3d:
+    """direct_conv3d: any float dtype read in place, fp32 math, the result in x's dtype. The
+    shapes cover each thread layout (at most 8 output channels with and without patch
+    slices, more than 8), strides and dilations off the 8-wide load, and ragged edges."""
+
+    @pytest.mark.parametrize(
+        "n,c,k,spatial,ksize,stride,padding,dilation",
+        [
+            (1, 3, 128, (1, 37, 53), (1, 3, 3), (1, 1, 1), (0, 1, 1), (1, 1, 1)),
+            (2, 128, 3, (1, 40, 41), (1, 3, 3), (1, 1, 1), (0, 1, 1), (1, 1, 1)),
+            (1, 24, 3, (1, 260, 257), (1, 3, 3), (1, 1, 1), (0, 1, 1), (1, 1, 1)),
+            (1, 16, 37, (1, 33, 20), (1, 3, 3), (1, 2, 2), (0, 1, 1), (1, 1, 1)),
+            (3, 5, 9, (1, 17, 7), (1, 5, 3), (1, 1, 2), (0, 2, 0), (1, 1, 1)),
+            (1, 7, 12, (1, 30, 31), (1, 3, 3), (1, 1, 1), (0, 2, 2), (1, 2, 2)),
+            (1, 600, 4, (1, 9, 20), (1, 1, 1), (1, 1, 1), (0, 0, 0), (1, 1, 1)),
+            (1, 1, 64, (1, 1, 1000), (1, 1, 7), (1, 1, 2), (0, 0, 9), (1, 1, 3)),
+            (1, 3, 17, (5, 20, 19), (3, 3, 3), (1, 1, 1), (1, 1, 1), (1, 1, 1)),
+            (2, 12, 5, (4, 9, 33), (1, 3, 3), (1, 2, 1), (0, 1, 1), (1, 1, 1)),
+            (1, 2, 2, (1, 3, 3), (1, 3, 3), (1, 1, 1), (0, 1, 1), (1, 1, 1)),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_matches_fp32(self, n, c, k, spatial, ksize, stride, padding, dilation, dtype, with_bias):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA/HIP required")
+        torch.manual_seed(0)
+        x = torch.randn(n, c, *spatial, device="cuda").to(dtype)
+        weight = (torch.randn(k, c, *ksize, device="cuda") * 0.1).to(dtype)
+        bias = torch.randn(k, device="cuda").to(dtype) if with_bias else None
+        ref = functional.conv3d(x.float(), weight.float(), None if bias is None else bias.float(),
+                                stride, padding, dilation)
+
+        out = ck.direct_conv3d(x, weight, bias, stride, padding, dilation)
+
+        assert out.shape == ref.shape and out.dtype == dtype
+        assert rel_err(out.float(), ref) < {torch.float32: 1e-5, torch.float16: 2e-3, torch.bfloat16: 1.2e-2}[dtype]
+
+    def test_reads_a_channels_last_view(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA/HIP required")
+        torch.manual_seed(0)
+        x = torch.randn(1, 4, 2, 16, 16, device="cuda").to(memory_format=torch.channels_last_3d)
+        weight = torch.randn(40, 4, 3, 3, 3, device="cuda")
+        ref = functional.conv3d(x, weight, padding=1)
+        assert rel_err(ck.direct_conv3d(x, weight, padding=1), ref) < 1e-5
+
+
+class TestDepthwiseConv3d:
+    """depthwise_conv3d and depthwise_conv_transpose3d: one filter per channel, any float
+    dtypes, fp32 accumulation, the result in x's dtype."""
+
+    @pytest.mark.parametrize(
+        "c,spatial,ksize,stride,padding,dilation",
+        [
+            (8, (1, 1, 1001), (1, 1, 12), (1, 1, 2), (0, 0, 0), (1, 1, 1)),
+            (5, (1, 1, 64), (1, 1, 12), (1, 1, 1), (0, 0, 5), (1, 1, 1)),
+            (7, (1, 1, 64), (1, 1, 3), (1, 1, 2), (0, 0, 3), (1, 1, 3)),
+            (16, (1, 17, 19), (1, 5, 5), (1, 2, 2), (0, 2, 2), (1, 1, 1)),
+            (6, (5, 9, 8), (3, 3, 3), (1, 2, 1), (1, 0, 1), (1, 2, 1)),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_conv_matches_fp32(self, c, spatial, ksize, stride, padding, dilation, dtype, with_bias):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA/HIP required")
+        torch.manual_seed(0)
+        x = torch.randn(2, c, *spatial, device="cuda").to(dtype)
+        weight = torch.randn(c, 1, *ksize, device="cuda").to(dtype)
+        bias = torch.randn(c, device="cuda").to(dtype) if with_bias else None
+        ref = functional.conv3d(x.float(), weight.float(), None if bias is None else bias.float(),
+                                stride, padding, dilation, groups=c)
+
+        out = ck.depthwise_conv3d(x, weight, bias, stride, padding, dilation)
+
+        assert out.shape == ref.shape and out.dtype == dtype
+        assert rel_err(out.float(), ref.to(dtype).float()) < 1e-2
+
+    @pytest.mark.parametrize(
+        "c,spatial,ksize,stride,padding,output_padding",
+        [
+            (8, (1, 1, 1001), (1, 1, 12), (1, 1, 2), (0, 0, 0), (0, 0, 0)),
+            (5, (1, 1, 64), (1, 1, 12), (1, 1, 3), (0, 0, 4), (0, 0, 2)),
+            (7, (1, 1, 20), (1, 1, 2), (1, 1, 5), (0, 0, 0), (0, 0, 0)),
+            (16, (1, 17, 19), (1, 4, 4), (1, 2, 2), (0, 1, 1), (0, 1, 0)),
+            (6, (5, 9, 8), (3, 4, 3), (2, 2, 1), (1, 0, 1), (1, 0, 0)),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_transpose_matches_fp32(self, c, spatial, ksize, stride, padding, output_padding, dtype, with_bias):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA/HIP required")
+        torch.manual_seed(0)
+        x = torch.randn(2, c, *spatial, device="cuda").to(dtype)
+        weight = torch.randn(c, 1, *ksize, device="cuda").to(dtype)
+        bias = torch.randn(c, device="cuda").to(dtype) if with_bias else None
+        ref = functional.conv_transpose3d(x.float(), weight.float(), None if bias is None else bias.float(),
+                                          stride, padding, output_padding, groups=c)
+
+        out = ck.depthwise_conv_transpose3d(x, weight, bias, stride, padding, output_padding)
+
+        assert out.shape == ref.shape and out.dtype == dtype
+        assert rel_err(out.float(), ref.to(dtype).float()) < 1e-2
+
+    def test_expanded_filter(self):
+        """The vocoders pass one [1, 1, taps] filter expanded over the channels."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA/HIP required")
+        torch.manual_seed(2)
+        x = torch.randn(1, 24, 1, 1, 500, device="cuda")
+        weight = torch.randn(1, 1, 1, 1, 12, device="cuda").expand(24, -1, -1, -1, -1)
+        ref = functional.conv3d(x, weight, stride=(1, 1, 2), groups=24)
+        assert rel_err(ck.depthwise_conv3d(x, weight, stride=(1, 1, 2)), ref) < 1e-5
+        ref = functional.conv_transpose3d(x, weight, stride=(1, 1, 2), groups=24)
+        assert rel_err(ck.depthwise_conv_transpose3d(x, weight, stride=(1, 1, 2)), ref) < 1e-5
