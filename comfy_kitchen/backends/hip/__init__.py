@@ -196,7 +196,14 @@ def _is_small_igpu(device: torch.device | int | None = None) -> bool:
     else:
         index = device.index
         if index is None:
-            return False
+            # torch.device("cuda") means the current device, same as None -- the
+            # docstring above has always said so. Returning False here instead made
+            # that a lie, and silently disabled anything gated on it: the int8
+            # attention key-tile override returned 64 even on a 780M with
+            # COMFY_SAGE_CTA_K=128 set. No existing caller was affected, because a
+            # tensor's .device always carries an index, which is why this stayed
+            # hidden.
+            index = torch.cuda.current_device()
     return _is_small_igpu_index(index)
 
 
@@ -3352,14 +3359,18 @@ _SAGE_KEY_GROUP = 16
 _SAGE_HEAD_DIMS = (64, 128, 256)
 
 
-def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool) -> int:
+def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool,
+                device: torch.device | int | None = None) -> int:
     """Keys per attention iteration: 64. 128 is implemented, measured, and not used.
 
     The kernel used to discard this outright (``(void)cta_k;`` with the launch
     macro hardcoding 64), so the ~15% figure and the later 0.99x-1.01x A/B that
     retired the wide tile were both reading an identical launch -- there was
     nothing for the value to select. The argument is honoured now, and with it a
-    real choice: ``COMFY_SAGE_CTA_K=128`` picks the wide tile.
+    real choice: ``COMFY_SAGE_CTA_K=128`` picks the wide tile. That override is
+    **gfx1103-only**, which is not the same as "off by default": before the
+    argument was honoured the 128-key tile existed nowhere, so a global override
+    would hand every other architecture a schedule that has never run on it.
 
     Measured, that choice loses. Interleaved in one process at H=48/D=128/no
     mask, one sequence length per process: 0.997x at S=512, 1.028x at 1024,
@@ -3385,8 +3396,16 @@ def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool) -> int:
     """
     # Module-level `os`, not a function-local import: this runs on every attention
     # call, which is the hottest path in the quantised attention stack.
-    if (not has_mask) and os.environ.get("COMFY_SAGE_CTA_K") == "128" \
-            and head_dim <= 128:
+    #
+    # **gfx1103 only**, which is a different claim from "off by default". The
+    # override exists because the 128-key tile was measured here; before this it
+    # was not instantiated on *any* target, so honouring the value unconditionally
+    # would hand every other architecture a schedule nothing has ever run on it --
+    # an env var should not be able to do that. comfy_small_igpu() resolves for
+    # the device the tensors live on, so a mixed iGPU + dGPU box answers per
+    # device rather than for whichever was current.
+    if ((not has_mask) and os.environ.get("COMFY_SAGE_CTA_K") == "128"
+            and head_dim <= 128 and _is_small_igpu(device)):
         return _SAGE_LARGE_CTA_K
     return _SAGE_CTA_K
 
@@ -3833,7 +3852,7 @@ def sage_int8_sdpa(
     batch, q_heads, q_length, head_dim = q.shape
     _, _, kv_length, _ = k.shape
     output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
-    cta_k = _sage_cta_k(head_dim, kv_length, attn_mask is not None)
+    cta_k = _sage_cta_k(head_dim, kv_length, attn_mask is not None, q.device)
     use_direct = _sage_use_direct(q, k, attn_mask)
 
     # ComfyUI's attention_comfy_kitchen_int8 finishes with
@@ -3922,7 +3941,7 @@ def sage_int8_quantize(
     """
     batch, _, _, head_dim = q.shape
     if cta_k is None:
-        cta_k = _sage_cta_k(head_dim, k.shape[2], False)
+        cta_k = _sage_cta_k(head_dim, k.shape[2], False, q.device)
     buffers, anchor_indices = _sage_buffers(q, k, cta_k)
     _C.sage_sdpa_quantize(
         _dl(q),
@@ -3982,18 +4001,23 @@ def sage_int8_attend(
     error rather than a slow path. Deriving it makes the buffer the single source
     of truth and every combination agree.
 
-    The derivation is exact rather than a divisibility test: ``v_int8``'s row is
-    ``sage_padded_k(kv_len, c)`` for whichever ``c`` the quantiser used, and for
-    Krea2's sequence lengths the two candidates do not collide (6186 -> 6208 at 64
-    against 6272 at 128). Anything unrecognised falls back to the narrow tile,
-    which is the one every device accepts.
+    **The narrow tile is tried first, and that order is load-bearing.** When
+    ``kv_len`` is a multiple of 128 the two candidates pad to the *same* width, so
+    the row cannot say which one built it; asking 128 first would answer 128
+    always, and the 128-key schedule -- which is opt-in, and is not even
+    instantiated on an architecture that never asked for it -- would become the
+    default everywhere for those sequence lengths. Narrow-first pins the answer to
+    ``_SAGE_CTA_K`` whenever the two are indistinguishable, which is the upstream
+    behaviour. The cost is that the override is then a no-op for
+    ``kv_len % 128 == 0``; the buffers are byte-identical there, so nothing is lost
+    but the experiment.
     """
     batch, q_heads, q_length, head_dim = q_int8.shape
     if cta_k is None:
         kv_len = k_int8.shape[2]
         row = v_int8.shape[-1]
         cta_k = _SAGE_CTA_K
-        for candidate in (_SAGE_LARGE_CTA_K, _SAGE_CTA_K):
+        for candidate in (_SAGE_CTA_K, _SAGE_LARGE_CTA_K):
             if row == -(-kv_len // candidate) * candidate:
                 cta_k = candidate
                 break
