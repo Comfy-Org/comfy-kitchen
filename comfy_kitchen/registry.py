@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from .constraints import FunctionConstraints, ValidationResult, validate_function_call
+from .constraints import FunctionConstraints, ValidationResult, check_opt_in_params, validate_function_call
 from .exceptions import (
     BackendNotFoundError,
     BackendNotImplementedError,
@@ -168,6 +168,9 @@ class BackendRegistry:
             return ValidationResult.fail("__function__", "not implemented")
 
         constraints = self._constraints.get((backend_name, func_name))
+        opt_in = check_opt_in_params(func_name, constraints, kwargs)
+        if not opt_in.success:
+            return opt_in
         if constraints is None:
             return ValidationResult.ok()
 

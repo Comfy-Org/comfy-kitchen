@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import torch
 
+from comfy_kitchen.constraints import lora_kwargs
 from comfy_kitchen.registry import registry
 
 from .base import (
@@ -109,8 +110,15 @@ def w4a8_int8_linear(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
+    lora_down: torch.Tensor | None = None,
+    lora_up: torch.Tensor | None = None,
+    lora_scale: float = 1.0,
 ) -> torch.Tensor:
-    """Compute ``x @ W.T + bias`` with the selected W4A8 backend."""
+    """Compute ``x @ W.T + bias`` with the selected W4A8 backend.
+
+    ``lora_down`` [R, K] / ``lora_up`` [N, R] / ``lora_scale`` add an unmerged LoRA, as
+    ``comfy_kitchen.int8_linear`` documents; only backends that declare them accept them.
+    """
     kwargs = {
         "x": x,
         "qdata": qdata,
@@ -122,6 +130,7 @@ def w4a8_int8_linear(
         "group_size": group_size,
         "convrot_groupsize": convrot_groupsize,
         "out_dtype": out_dtype,
+        **lora_kwargs(lora_down, lora_up, lora_scale),
     }
     impl = registry.get_implementation("w4a8_int8_linear", kwargs=kwargs)
     return impl(**kwargs)

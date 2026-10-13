@@ -12,9 +12,12 @@ __all__ = [
     "ExactDims",
     "FunctionConstraints",
     "MinDims",
+    "OPT_IN_PARAMS",
     "ParamConstraint",
     "ShapeRule",
     "ValidationResult",
+    "check_opt_in_params",
+    "lora_kwargs",
     "validate_function_call",
     "validate_param",
 ]
@@ -148,6 +151,41 @@ class FunctionConstraints:
 # =============================================================================
 # Validation Logic
 # =============================================================================
+
+# Optional arguments, per function, that a backend must declare in its
+# ``FunctionConstraints.params`` to receive. Every other parameter a backend leaves
+# undeclared is unconstrained; these change the result, so a backend that does not list
+# them (or has no constraints at all) cannot run a call that passes them.
+_UNMERGED_LORA = frozenset({"lora_down", "lora_up"})
+OPT_IN_PARAMS: dict[str, frozenset[str]] = {
+    "int8_linear": _UNMERGED_LORA,
+    "w4a8_int8_linear": _UNMERGED_LORA,
+}
+
+
+def check_opt_in_params(
+    func_name: str,
+    constraints: FunctionConstraints | None,
+    kwargs: Mapping[str, object],
+) -> ValidationResult:
+    """Fail when ``kwargs`` carries an opt-in argument of ``func_name`` that the backend's
+    constraints do not declare."""
+    declared = constraints.params if constraints is not None else {}
+    for name in sorted(OPT_IN_PARAMS.get(func_name, ())):
+        if kwargs.get(name) is not None and name not in declared:
+            return ValidationResult.fail(name, "not supported by this backend")
+    return ValidationResult.ok()
+
+
+def lora_kwargs(lora_down, lora_up, lora_scale) -> dict:
+    """A public wrapper's unmerged-LoRA arguments, present only when a LoRA is passed, so
+    backends that do not declare them keep their signatures and are skipped only for calls
+    that carry a LoRA."""
+    if lora_down is None and lora_up is None:
+        return {}
+    if lora_down is None or lora_up is None:
+        raise ValueError("lora_down and lora_up must be given together")
+    return {"lora_down": lora_down, "lora_up": lora_up, "lora_scale": float(lora_scale)}
 
 
 @dataclass

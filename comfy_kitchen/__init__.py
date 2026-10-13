@@ -10,6 +10,7 @@ from .backends import triton as _triton_backend  # noqa: F401
 from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
+from .constraints import lora_kwargs
 from .exceptions import (
     BackendError,
     BackendNotFoundError,
@@ -60,6 +61,15 @@ if getattr(torch.version, "hip", None):
         sol_attn_chunked = _hip_backend.sol_attn_chunked
 else:
     registry.mark_unavailable("hip", "PyTorch ROCm/HIP runtime not available")
+
+# Apple GPUs: a weight-only Metal backend, preferred over eager where it registers.
+if torch.backends.mps.is_available():
+    from .backends import mps as _mps_backend  # noqa: F401
+
+    if registry.is_available("mps"):
+        registry.set_priority(["mps", *[b for b in registry._priority if b != "mps"]])
+else:
+    registry.mark_unavailable("mps", "PyTorch MPS runtime not available")
 
 __all__ = [
     # Normalization
@@ -1023,6 +1033,9 @@ def int8_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    lora_down: torch.Tensor | None = None,
+    lora_up: torch.Tensor | None = None,
+    lora_scale: float = 1.0,
 ) -> torch.Tensor:
     """INT8 linear layer dynamically quantized.
 
@@ -1046,6 +1059,14 @@ def int8_linear(
             ``residual + residual_scale * linear(x)`` (a pre-norm block's
             addcmul), fused into the GEMM epilogue where supported.
         residual_scale: Per-channel [N] scale for the residual form.
+        lora_down: Optional unmerged LoRA down weight [R, K], in the layer's
+            original (un-rotated) basis. With ``lora_up`` [N, R] the result is
+            computed as if the weight were ``W + lora_scale * lora_up @ lora_down``,
+            without forming that [N, K] matrix. Several LoRAs are one of the
+            summed rank (concatenate along R, each up times its own scale).
+            Only backends that declare these parameters accept them (mps today).
+        lora_up: Optional unmerged LoRA up weight [N, R].
+        lora_scale: Multiplier on the LoRA term (strength * alpha / rank).
 
     Returns:
         Result tensor.
@@ -1065,6 +1086,7 @@ def int8_linear(
         "input_act_eps": input_act_eps,
         "residual": residual,
         "residual_scale": residual_scale,
+        **lora_kwargs(lora_down, lora_up, lora_scale),
     }
     impl = registry.get_implementation("int8_linear", kwargs=kwargs)
     return impl(**kwargs)

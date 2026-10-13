@@ -375,3 +375,45 @@ class TestINT8Constraints:
         )
         assert result.success is False
         assert "torch.int8" in str(result.failure_reason)
+
+
+
+class TestOptInParams:
+    """Unmerged-LoRA arguments change the result, so only a backend that declares them may
+    take them; the rule is per function (SVDQuant's own lora_down is not affected)."""
+
+    def test_undeclared_lora_fails(self):
+        from comfy_kitchen.constraints import check_opt_in_params
+
+        plain = FunctionConstraints(params={"x": ParamConstraint()}, default_devices=frozenset({"cpu"}))
+        kwargs = {"x": torch.zeros(2), "lora_down": torch.zeros(1, 2), "lora_up": torch.zeros(3, 1)}
+        for constraints in (plain, None):
+            result = check_opt_in_params("int8_linear", constraints, kwargs)
+            assert not result.success and result.failed_param == "lora_down"
+
+    def test_declared_absent_or_other_function_passes(self):
+        from comfy_kitchen.constraints import check_opt_in_params
+
+        declared = FunctionConstraints(
+            params={"x": ParamConstraint(), "lora_down": ParamConstraint(), "lora_up": ParamConstraint()},
+            default_devices=frozenset({"cpu"}),
+        )
+        plain = FunctionConstraints(params={"x": ParamConstraint()}, default_devices=frozenset({"cpu"}))
+        lora = {"x": torch.zeros(2), "lora_down": torch.zeros(1, 2), "lora_up": torch.zeros(3, 1)}
+        assert check_opt_in_params("w4a8_int8_linear", declared, lora).success
+        assert check_opt_in_params("int8_linear", plain, {"x": torch.zeros(2), "lora_down": None}).success
+        assert check_opt_in_params("quantize_svdquant_w4a4", plain, lora).success
+
+    def test_lora_scale_becomes_a_python_float(self):
+        from comfy_kitchen.constraints import lora_kwargs
+
+        down, up = torch.zeros(1, 2), torch.zeros(3, 1)
+        for scale in (torch.tensor(0.5), torch.tensor(0.5, dtype=torch.float16), 2, 0.5):
+            kwargs = lora_kwargs(down, up, scale)
+            assert type(kwargs["lora_scale"]) is float and kwargs["lora_scale"] == float(scale)
+        assert lora_kwargs(None, None, torch.tensor(0.5)) == {}
+
+    def test_eager_int8_linear_refuses_a_lora_call(self):
+        q = torch.ones(4, 8, dtype=torch.int8)
+        with pytest.raises(NoCapableBackendError, match="lora_down"):
+            ck.int8_linear(torch.randn(2, 8), q, torch.ones(1), lora_down=torch.zeros(1, 8), lora_up=torch.zeros(4, 1))
