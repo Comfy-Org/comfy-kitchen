@@ -20,7 +20,11 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <type_traits>
+#include <limits>
+#include <stdexcept>
+#include <string>
 
+#include "dtype_dispatch.cuh"
 #include "float_utils.cuh"
 
 // Grouped int4 -> int8 dequant for the int8-GEMM W4A8 path: out[n,k] =
@@ -36,9 +40,28 @@ template <> __device__ __forceinline__ float load_scale<uint8_t>(uint8_t v) {
     return __half2float(__nv_cvt_fp8_to_halfraw(v, __NV_E4M3));
 }
 
-// The int8 grid shared by every W4A8/W6A8 path (and the eager/Triton decoders).
+template <typename T> __device__ __forceinline__ T store_output(float value);
+template <> __device__ __forceinline__ float store_output<float>(float value) { return value; }
+template <> __device__ __forceinline__ __half store_output<__half>(float value) { return __float2half(value); }
+template <> __device__ __forceinline__ __nv_bfloat16 store_output<__nv_bfloat16>(float value) { return __float2bfloat16(value); }
+
+// The int8 grid shared by every W4A8/W6A8 path (and the eager/Triton decoders):
+// round-to-nearest-even of the fp32 product, clamped to +-127. Done without cvt
+// instructions (16/clk/SM, the decode bottleneck): adding 1.5 * 2^23 puts the fp32
+// rounding on the unit grid, so the sum is 0x4B400000 + q bit for bit (|v * s| < 2^22,
+// true for every stored scale), the clamp stays in fp32, and the low byte of that
+// pattern is q's two's complement.
+constexpr float kRoundMagic = 12582912.0f;
+__device__ __forceinline__ float grid_clamp(float biased) {
+    return fminf(fmaxf(biased, kRoundMagic - 127.0f), kRoundMagic + 127.0f);
+}
 __device__ __forceinline__ int8_t level_to_int8(float v, float s) {
-    return static_cast<int8_t>(max(-127, min(127, __float2int_rn(v * s))));
+    // product rounded first, as the eager path (v * s need not be exact)
+    return static_cast<int8_t>(__float_as_int(grid_clamp(__fadd_rn(__fmul_rn(v, s), kRoundMagic))));
+}
+// Uniform level (c - zero) of a code c < 2^23 as fp32, exactly, without an I2F.
+__device__ __forceinline__ float code_level(unsigned c, float zero) {
+    return __int_as_float(0x4B000000u | c) - (8388608.0f + zero);
 }
 
 // Decode one uint2 (8 packed bytes = 16 low nibbles, low nibble = even col) to 16 int8.
@@ -63,15 +86,15 @@ __device__ __forceinline__ void dequant16_to_int8(
             if constexpr (BITS == 6) {
                 const unsigned c0 = (byte & 0xF) | (((hi >> (4 * oo)) & 3u) << 4);
                 const unsigned c1 = ((byte >> 4) & 0xF) | (((hi >> (4 * oo + 2)) & 3u) << 4);
-                v0 = static_cast<float>(c0) - 32.0f;
-                v1 = static_cast<float>(c1) - 32.0f;
+                v0 = code_level(c0, 32.0f);
+                v1 = code_level(c1, 32.0f);
                 s = sc0;
             } else {
                 const int lg = (G >= 16) ? 0 : ((oo * 2) / G);  // local group in the vec
                 s = (lg == 0) ? sc0 : (lg == 1 ? sc1 : (lg == 2 ? sc2 : sc3));
                 const unsigned c0 = byte & 0xF, c1 = (byte >> 4) & 0xF;
-                v0 = cb ? cb[c0] : (static_cast<float>(c0) - 8.0f);
-                v1 = cb ? cb[c1] : (static_cast<float>(c1) - 8.0f);
+                v0 = cb ? cb[c0] : code_level(c0, 8.0f);
+                v1 = cb ? cb[c1] : code_level(c1, 8.0f);
             }
             o[2 * oo]     = level_to_int8(v0, s);
             o[2 * oo + 1] = level_to_int8(v1, s);
@@ -132,6 +155,306 @@ __global__ void dequant_int4_grouped_to_int8_kernel(
     *reinterpret_cast<uint4*>(&out[(long)n * K + k0]) = *reinterpret_cast<uint4*>(o4);
 }
 
+// Decode one 16-code chunk (one scale byte) with the LUT row for that scale held in
+// shared memory: two byte permutes pick codes 0-7 / 8-15, code bit 3 selects between
+// them.
+__device__ __forceinline__ unsigned decode_w4a8_chunk(
+    unsigned codes, unsigned scale_bits, const uint4* __restrict__ lut)
+{
+    const uint4 table = lut[scale_bits];
+    // selector nibbles use bits 0-2 only; bit 3 of each code then picks lo/hi per byte
+    const unsigned lo = __byte_perm(table.x, table.y, codes);
+    const unsigned hi = __byte_perm(table.z, table.w, codes);
+    return __byte_perm(lo, hi, ((codes >> 1) & 0x4444u) | 0x3210u);
+}
+
+__device__ __forceinline__ void decode_w4a8_record_smem(
+    const uint2& packed, unsigned scales,
+    const uint4* __restrict__ lut, unsigned (&decoded)[4])
+{
+    decoded[0] = decode_w4a8_chunk(packed.x, scales & 0xffu, lut);
+    decoded[1] = decode_w4a8_chunk(packed.x >> 16, (scales >> 8) & 0xffu, lut);
+    decoded[2] = decode_w4a8_chunk(packed.y, (scales >> 16) & 0xffu, lut);
+    decoded[3] = decode_w4a8_chunk(packed.y >> 16, scales >> 24, lut);
+}
+
+// 6-bit: four codes per 24-bit chunk, uniform levels (c - 32) on the int8 grid of
+// level_to_int8. s is e4m3 (256-entry fp8 -> fp32 table in shared memory), so the
+// product has <= 10 significant bits and the single-rounding fma onto the magic grid
+// equals the rounded product of level_to_int8. The clamped patterns are packed straight
+// from their low bytes.
+__device__ __forceinline__ unsigned decode_w6a8_chunk(unsigned codes, float s)
+{
+    unsigned v[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float level = code_level((codes >> (6 * i)) & 0x3fu, 32.0f);
+        v[i] = __float_as_uint(grid_clamp(fmaf(level, s, kRoundMagic)));
+    }
+    return __byte_perm(__byte_perm(v[0], v[1], 0x0040u), __byte_perm(v[2], v[3], 0x0040u), 0x5410u);
+}
+
+// Lane's 12 code bytes: 8 at lane*8 (plane A), 4 at 256 + lane*4 (plane B), as
+// pack_w4a8_slabs_kernel lays them out; chunk j is bytes 3j..3j+2.
+__device__ __forceinline__ void decode_w6a8_record_smem(
+    const uint2& a, unsigned b, unsigned scales,
+    const float* __restrict__ scale_table, unsigned (&decoded)[4])
+{
+    decoded[0] = decode_w6a8_chunk(a.x, scale_table[scales & 0xffu]);
+    decoded[1] = decode_w6a8_chunk(__byte_perm(a.x, a.y, 0x0543u), scale_table[(scales >> 8) & 0xffu]);
+    decoded[2] = decode_w6a8_chunk(__byte_perm(a.y, b, 0x0432u), scale_table[(scales >> 16) & 0xffu]);
+    decoded[3] = decode_w6a8_chunk(b >> 8, scale_table[scales >> 24]);
+}
+
+__device__ __forceinline__ void mma_m16n8k32_s8(
+    int (&acc)[4], const unsigned (&a)[4], const unsigned (&b)[2])
+{
+#if __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%0, %1, %2, %3};\n"
+        : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]));
+#endif
+}
+
+// cp.async is sm_80+, like the mma above; the host launcher rejects older devices
+// so the pre-sm_80 passes only need to compile.
+__device__ __forceinline__ void cp_async16(uint32_t smem, const void* gptr) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem), "l"(gptr));
+#endif
+}
+__device__ __forceinline__ void cp_async_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n");
+#endif
+}
+template <int N> __device__ __forceinline__ void cp_async_wait() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#endif
+}
+
+// Streaming decode GEMM (M <= 8). A warp owns one 16-output tile over
+// `rows` consecutive K records and streams them through a Stages-deep per-warp
+// cp.async ring in shared memory: one record is decoded + MMA'd while Stages-1 are
+// in flight, for the warp's whole life. Register rings can't do this: ptxas gives
+// every load in the loop one scoreboard, so waiting on one record waits on all.
+//
+// Weight layout: kRecordBytes records (512 codes at BITS
+// bits in mma m16n8k32 fragment order + 32 scale bytes: 288 B at 4 bits, 416 B at
+// 6) for a 16-output x 32-K tile, stored [tile][k_row][record]. Each warp walks
+// contiguous records within its tile and K split; no global record permutation.
+//
+// The decode table (4-bit: the [256 scales][16 codes] int8 LUT; 6-bit: the 256 fp8
+// scales as fp32) and the block's x slice are staged in shared memory after the
+// first loads are issued. The split-K reduction finishes in-kernel: each warp adds its tile into the
+// int32 workspace, bumps the tile's counter, and the warp that arrives last reads
+// the tile back from L2, applies the scales/bias, writes the output, and returns
+// the workspace tile and counter to zero. So the workspace and counters are zero
+// on entry and on exit, and the caller keeps both across launches.
+// residual (nullable): out = residual + residual_scale * out, with the linear rounded
+// to OutputT first, as the unfused addcmul sees it (int8_linear.cu's contract).
+constexpr int kStreamStages = 4;
+constexpr int kMmaWarps = 8;
+
+template <int BITS> struct StreamRecord {
+    static constexpr int kBytes = 512 * BITS / 8 + 32;
+    static constexpr int kTableBytes = BITS == 4 ? 4096 : 256 * static_cast<int>(sizeof(float));
+};
+
+template <int BITS>
+__host__ __device__ constexpr int w4a8_stream_smem_bytes(int rows) {
+    return StreamRecord<BITS>::kTableBytes + 8 * (rows * 32 + 16)
+        + kMmaWarps * kStreamStages * StreamRecord<BITS>::kBytes;
+}
+
+
+template <typename OutputT, int BITS>
+__global__ __launch_bounds__(kMmaWarps * 32)
+void w4a8_codebook_mma_stream_kernel(
+    const int8_t* __restrict__ x,
+    const int8_t* __restrict__ weight,
+    const int8_t* __restrict__ decode_lut,
+    const float* __restrict__ s_channel,
+    const float* __restrict__ x_scales,
+    const float* __restrict__ bias,
+    const OutputT* __restrict__ residual,
+    const OutputT* __restrict__ residual_scale,
+    int* __restrict__ workspace,
+    int* __restrict__ counters,
+    OutputT* __restrict__ output,
+    int M, int N, int K, int rows)
+{
+    constexpr int S = kStreamStages;
+    constexpr int R = StreamRecord<BITS>::kBytes;
+    extern __shared__ __align__(16) uint8_t stream_smem[];
+    uint4* lut = reinterpret_cast<uint4*>(stream_smem);
+    float* scale_table = reinterpret_cast<float*>(stream_smem);
+    uint8_t* xs_s = stream_smem + StreamRecord<BITS>::kTableBytes;
+    const int x_stride = rows * 32 + 16;   // +16 keeps the per-token rows off one bank pattern
+    uint8_t* stages = xs_s + 8 * x_stride;
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int tiles = N / 16;
+    const int output_tile = static_cast<int>(blockIdx.x) * kMmaWarps + warp;
+    const bool active = output_tile < tiles;
+    const int split = static_cast<int>(blockIdx.y);
+    const int splits = static_cast<int>(gridDim.y);
+    const int k_begin = split * rows * 32;
+
+    // lanes 0..R/16-1 each move 16 B of the record
+    const int8_t* tile_base = weight
+        + (static_cast<int64_t>(output_tile) * (K / 32) + split * rows) * R + lane * 16;
+    auto record = [&](int i) -> const int8_t* {
+        return tile_base + i * R;
+    };
+    const bool issuer = active && lane < R / 16;
+    const uint8_t* my_stages = stages + warp * S * R;
+    const uint32_t st_s = static_cast<uint32_t>(__cvta_generic_to_shared(my_stages)) + lane * 16;
+
+    #pragma unroll
+    for (int s = 0; s < S; ++s) {
+        if (issuer) cp_async16(st_s + s * R, record(s));
+        cp_async_commit();
+    }
+    for (int i = threadIdx.x; i < 256; i += kMmaWarps * 32) {
+        if constexpr (BITS == 4) {
+            lut[i] = reinterpret_cast<const uint4*>(decode_lut)[i];
+        } else {
+            scale_table[i] = load_scale<uint8_t>(static_cast<uint8_t>(i));
+        }
+    }
+    for (int i = threadIdx.x; i < 8 * rows * 2; i += kMmaWarps * 32) {
+        const int token = i / (rows * 2), v = i % (rows * 2);
+        uint4 value = make_uint4(0u, 0u, 0u, 0u);
+        if (token < M) {
+            value = reinterpret_cast<const uint4*>(x + static_cast<int64_t>(token) * K + k_begin)[v];
+        }
+        *reinterpret_cast<uint4*>(xs_s + token * x_stride + v * 16) = value;
+    }
+    __syncthreads();
+    if (!active) return;
+
+    const int token = lane >> 2;
+    const int thread_in_group = lane & 3;
+    const uint8_t* xrow = xs_s + token * x_stride + thread_in_group * 4;
+    const uint8_t* rec_codes = my_stages + lane * 8;
+    const uint8_t* rec_codes_hi = my_stages + 256 + lane * 4;
+    const uint8_t* rec_scales = my_stages + (R - 32) + token * 4;
+    int acc[4] = {};
+
+    auto consume = [&](int stage, int i) {
+        const uint2 packed = *reinterpret_cast<const uint2*>(rec_codes + stage * R);
+        const unsigned scales = *reinterpret_cast<const unsigned*>(rec_scales + stage * R);
+        unsigned decoded[4];
+        if constexpr (BITS == 4) {
+            decode_w4a8_record_smem(packed, scales, lut, decoded);
+        } else {
+            const unsigned hi = *reinterpret_cast<const unsigned*>(rec_codes_hi + stage * R);
+            decode_w6a8_record_smem(packed, hi, scales, scale_table, decoded);
+        }
+        const unsigned input[2] = {
+            *reinterpret_cast<const unsigned*>(xrow + i * 32),
+            *reinterpret_cast<const unsigned*>(xrow + i * 32 + 16),
+        };
+        mma_m16n8k32_s8(acc, decoded, input);
+    };
+
+    // Record i is consumed once at most S-1 newer groups are pending, then its stage
+    // is refilled with record i+S. Unrolled by S so stage indices are compile-time.
+    int i = 0;
+    for (; i + S <= rows - S; i += S) {
+        #pragma unroll
+        for (int j = 0; j < S; ++j) {
+            cp_async_wait<S - 1>();
+            __syncwarp();
+            consume(j, i + j);
+            __syncwarp();
+            if (issuer) cp_async16(st_s + j * R, record(i + S + j));
+            cp_async_commit();
+        }
+    }
+    for (; i < rows; ++i) {
+        cp_async_wait<S - 1>();
+        __syncwarp();
+        consume(i % S, i);
+        __syncwarp();
+        if (issuer && i + S < rows) cp_async16(st_s + (i % S) * R, record(i + S));
+        cp_async_commit();
+    }
+
+    const int token0 = thread_in_group * 2;
+    const int token1 = token0 + 1;
+    const int n_top = output_tile * 16 + token;
+    const int n_bottom = n_top + 8;
+    int* ws00 = &workspace[static_cast<int64_t>(token0) * N + n_top];
+    int* ws01 = &workspace[static_cast<int64_t>(token0) * N + n_bottom];
+    int* ws10 = &workspace[static_cast<int64_t>(token1) * N + n_top];
+    int* ws11 = &workspace[static_cast<int64_t>(token1) * N + n_bottom];
+    // Residual operands are issued here so they are in flight behind the atomics and
+    // fences below instead of on the finishing warp's dependent tail.
+    float r00 = 0.f, r01 = 0.f, r10 = 0.f, r11 = 0.f, rs_top = 0.f, rs_bottom = 0.f;
+    if (residual) {
+        rs_top = static_cast<float>(residual_scale[n_top]);
+        rs_bottom = static_cast<float>(residual_scale[n_bottom]);
+        if (token0 < M) {
+            r00 = static_cast<float>(residual[static_cast<int64_t>(token0) * N + n_top]);
+            r01 = static_cast<float>(residual[static_cast<int64_t>(token0) * N + n_bottom]);
+        }
+        if (token1 < M) {
+            r10 = static_cast<float>(residual[static_cast<int64_t>(token1) * N + n_top]);
+            r11 = static_cast<float>(residual[static_cast<int64_t>(token1) * N + n_bottom]);
+        }
+    }
+    if (token0 < M) {
+        atomicAdd(ws00, acc[0]);
+        atomicAdd(ws01, acc[2]);
+    }
+    if (token1 < M) {
+        atomicAdd(ws10, acc[1]);
+        atomicAdd(ws11, acc[3]);
+    }
+
+    // Publish this warp's adds, then arrive on the tile counter. The lane that sees
+    // splits-1 prior arrivals knows every split's adds are visible at L2.
+    __threadfence();
+    int prior = 0;
+    if (lane == 0) prior = atomicAdd(&counters[output_tile], 1);
+    prior = __shfl_sync(0xffffffffu, prior, 0);
+    if (prior != splits - 1) return;
+    __threadfence();
+
+    // Same lane->element mapping as the adds above, so the warp covers the whole
+    // [M, 16] tile exactly once: read (L2), scale, store, and re-zero.
+    auto finish = [&](int* ws, int tok, int n, float res, float res_scale) {
+        float value = static_cast<float>(__ldcg(ws)) * x_scales[tok] * s_channel[n];
+        if (bias) value += bias[n];
+        if (residual) {
+            const float linear = static_cast<float>(store_output<OutputT>(value));
+            value = res + res_scale * linear;
+        }
+        output[static_cast<int64_t>(tok) * N + n] = store_output<OutputT>(value);
+        *ws = 0;
+    };
+    if (token0 < M) {
+        finish(ws00, token0, n_top, r00, rs_top);
+        finish(ws01, token0, n_bottom, r01, rs_bottom);
+    }
+    if (token1 < M) {
+        finish(ws10, token1, n_top, r10, rs_top);
+        finish(ws11, token1, n_bottom, r11, rs_bottom);
+    }
+    if (lane == 0) counters[output_tile] = 0;
+}
+
+
 template <typename ScaleT>
 void launch_dequant_grouped_to_int8(
     const void* qw, const void* s_rel, const void* codebook, void* out,
@@ -151,7 +474,137 @@ void launch_dequant_grouped_to_int8(
             static_cast<const float*>(codebook),
             static_cast<int8_t*>(out), n_vec, Khalf, static_cast<int>(K), static_cast<int>(G));
 }
+// Non-overlapping backwards batches pack directly from source to destination.
+// Only the bottom slabs overlap: one CTA saves each of those before expanding it.
+template <int BITS, bool OVERLAP>
+__global__ void pack_w4a8_slabs_kernel(uint8_t* data, const uint8_t* scales,
+                                     uint8_t* scratch, int first, int last, int K) {
+    constexpr int code_bytes = 512 * BITS / 8, record_bytes = code_bytes + 32;
+    constexpr int parts = OVERLAP ? 1 : 8;
+    const int row_bytes = K * BITS / 8, slab_bytes = 16 * row_bytes, k_rows = K / 32;
+    for (int tile = last - 1 - blockIdx.x / parts; tile >= first; tile -= gridDim.x / parts) {
+        const uint8_t* slab = data + (int64_t)tile * slab_bytes;
+        if constexpr (OVERLAP) {
+            for (int i = threadIdx.x; i < slab_bytes / 4; i += blockDim.x)
+                reinterpret_cast<unsigned*>(scratch)[i] = reinterpret_cast<const unsigned*>(slab)[i];
+            __syncthreads();
+            slab = scratch;
+        }
+        for (int i = threadIdx.x + (blockIdx.x % parts) * blockDim.x; i < k_rows * record_bytes; i += blockDim.x * parts) {
+            const int kr = i / record_bytes, b = i % record_bytes;
+            uint8_t value;
+            if (b >= code_bytes) {
+                const int s = b - code_bytes, row = (s / 4) + 8 * (s & 1), half = (s % 4) / 2;
+                value = scales[((int64_t)tile * 16 + row) * (K / 16) + kr * 2 + half];
+            } else if constexpr (BITS == 4) {
+                const int lane = b / 8, j = (b % 8) / 2;
+                const int row = lane / 4 + 8 * (j & 1);
+                const int col = kr * 32 + (lane % 4) * 4 + (j / 2) * 16 + (b & 1) * 2;
+                value = slab[row * row_bytes + col / 2];
+            } else {
+                const int lane = b < 256 ? b / 8 : (b - 256) / 4;
+                const int lb = b < 256 ? b % 8 : 8 + (b - 256) % 4;
+                const int j = lb / 3, row = lane / 4 + 8 * (j & 1);
+                const int col = kr * 32 + (lane % 4) * 4 + (j / 2) * 16;
+                unsigned word = 0;
+                #pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const int k = col + c;
+                    const unsigned lo = (slab[row * row_bytes + k / 2] >> (4 * (k & 1))) & 15;
+                    const unsigned hi = (slab[row * row_bytes + K / 2 + k / 4] >> (2 * (k & 3))) & 3;
+                    word |= (lo | (hi << 4)) << (6 * c);
+                }
+                value = word >> (8 * (lb % 3));
+            }
+            data[(int64_t)tile * k_rows * record_bytes + i] = value;
+        }
+        if constexpr (OVERLAP) __syncthreads();
+    }
+}
+
+// Read record-stream weights directly into one canonical INT8 GEMM chunk.
+// One thread writes a 16-code group; n0/cols may cut across a 16-output record.
+template <int BITS>
+__global__ void dequant_w4a8_mma_chunk_kernel(
+    const uint8_t* __restrict__ packed, const float* __restrict__ codebook,
+    int8_t* __restrict__ out, long n_groups, int n0, int K)
+{
+    const long v = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= n_groups) return;
+    constexpr int kRecordBytes = 512 * BITS / 8 + 32;
+    const int n = n0 + v / (K / 16);
+    const int kg = v % (K / 16), kr = kg / 2;
+    const int h = (n & 15) >> 3, r = n & 7, kh = kg & 1;
+    const long rec = (long)(n / 16) * (K / 32) + kr;
+    const uint8_t* __restrict__ record = packed + rec * kRecordBytes;
+    const float scale = load_scale<uint8_t>(record[512 * BITS / 8 + r * 4 + h + 2 * kh]);
+    uint4 decoded;
+    int8_t* values = reinterpret_cast<int8_t*>(&decoded);
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        const int j = kh * 2 + h;
+        const int lane = r * 4 + g;
+        unsigned codes;
+        if constexpr (BITS == 6) {
+            const uint2 lo = *reinterpret_cast<const uint2*>(record + lane * 8);
+            const unsigned w2 = *reinterpret_cast<const unsigned*>(record + 256 + lane * 4);
+            if (kh == 0)
+                codes = h ? __funnelshift_r(lo.x, lo.y, 24) : lo.x;
+            else
+                codes = h ? (w2 >> 8) : __funnelshift_r(lo.y, w2, 16);
+        } else {
+            codes = *reinterpret_cast<const unsigned short*>(record + lane * 8 + j * 2);
+        }
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const unsigned code = (codes >> (BITS * c)) & ((1u << BITS) - 1);
+            const float level = BITS == 6 ? code_level(code, 32.0f)
+                : (codebook ? codebook[code] : code_level(code, 8.0f));
+            values[g * 4 + c] = level_to_int8(level, scale);
+        }
+    }
+    reinterpret_cast<uint4*>(out)[v] = decoded;
+}
 }  // namespace
+
+extern "C" void launch_pack_w4a8_mma_inplace(
+    void* data, const void* scales, void* scratch,
+    int64_t N, int64_t K, int bits, cudaStream_t stream) {
+    auto* bytes = static_cast<uint8_t*>(data);
+    auto* temp = static_cast<uint8_t*>(scratch);
+    int last = N / 16;
+    while (last > 2 * bits) {
+        // first * expanded_slab_bytes >= last * canonical_slab_bytes:
+        // the entire destination batch is above its entire source batch.
+        const int first = (last * (2 * bits) + 2 * bits) / (2 * bits + 1);
+        if (bits == 4)
+            pack_w4a8_slabs_kernel<4, false><<<(last - first) * 8, 256, 0, stream>>>(bytes, static_cast<const uint8_t*>(scales), temp, first, last, K);
+        else
+            pack_w4a8_slabs_kernel<6, false><<<(last - first) * 8, 256, 0, stream>>>(bytes, static_cast<const uint8_t*>(scales), temp, first, last, K);
+        last = first;
+    }
+    if (bits == 4)
+        pack_w4a8_slabs_kernel<4, true><<<1, 1024, 0, stream>>>(bytes, static_cast<const uint8_t*>(scales), temp, 0, last, K);
+    else
+        pack_w4a8_slabs_kernel<6, true><<<1, 1024, 0, stream>>>(bytes, static_cast<const uint8_t*>(scales), temp, 0, last, K);
+}
+
+static void launch_dequant_w4a8_mma_chunk(
+    const void* packed, const void* codebook, void* out,
+    int64_t n0, int64_t cols, int64_t K, int64_t bits, cudaStream_t stream)
+{
+    const long n_groups = (long)cols * K / 16;
+    const int block = 256;
+    const long grid = (n_groups + block - 1) / block;
+    if (bits == 6)
+        dequant_w4a8_mma_chunk_kernel<6><<<grid, block, 0, stream>>>(
+            static_cast<const uint8_t*>(packed), nullptr, static_cast<int8_t*>(out),
+            n_groups, n0, K);
+    else
+        dequant_w4a8_mma_chunk_kernel<4><<<grid, block, 0, stream>>>(
+            static_cast<const uint8_t*>(packed), static_cast<const float*>(codebook), static_cast<int8_t*>(out),
+            n_groups, n0, K);
+}
 
 // codebook: 16 floats (non-uniform levels) or nullptr for uniform (q-8); ignored at 6 bits.
 extern "C" void launch_dequant_int4_grouped_to_int8(
@@ -191,7 +644,7 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
     void* workspace,       // [chunk_cols, K] int8 scratch (preallocated, reused)
     void* out,             // [M, N] output (out_dtype)
     int64_t M, int64_t N, int64_t K, int64_t G, int64_t chunk_cols, int64_t bits,
-    int out_dtype_code, cudaStream_t stream)
+    bool mma_packed, int out_dtype_code, cudaStream_t stream)
 {
     // A non-positive chunk stride never advances n0 -> would loop forever; a non-positive
     // K/G would divide by zero below. Bail so the caller uses the 2-pass path.
@@ -199,10 +652,14 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
     const int64_t row_bytes = K * bits / 8, KG = K / G, osz = (out_dtype_code == 0) ? 4 : 2;
     for (int64_t n0 = 0; n0 < N; n0 += chunk_cols) {
         const int64_t cols = (chunk_cols < N - n0) ? chunk_cols : (N - n0);
-        launch_dequant_int4_grouped_to_int8_e4m3(
-            static_cast<const int8_t*>(weight) + n0 * row_bytes,
-            static_cast<const uint8_t*>(s_rel) + n0 * KG,
-            codebook, workspace, cols, K, G, bits, stream);
+        if (mma_packed) {
+            launch_dequant_w4a8_mma_chunk(weight, codebook, workspace, n0, cols, K, bits, stream);
+        } else {
+            launch_dequant_int4_grouped_to_int8_e4m3(
+                static_cast<const int8_t*>(weight) + n0 * row_bytes,
+                static_cast<const uint8_t*>(s_rel) + n0 * KG,
+                codebook, workspace, cols, K, G, bits, stream);
+        }
         // bias is in the output dtype (the strided GEMM's contract), so it
         // advances by the same element size as the output.
         const void* bias_chunk = bias ? static_cast<const char*>(bias) + n0 * osz : nullptr;
@@ -215,6 +672,64 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
     return true;
 }
 
+// bits (4 or 6) is the code width. The workspace [M, N] int32 and counters [N/16] int32 must
+// be zero on entry and are zero again on exit, so the caller keeps both across
+// launches. residual [M, N] and residual_scale [N] are in the output dtype (both or
+// neither).
+extern "C" bool launch_w4a8_codebook_mma(
+    const void* xq, const void* weight, const void* decode_lut,
+    const void* s_channel, const void* xs, const void* bias, const void* residual,
+    const void* residual_scale, void* workspace, void* counters, void* out,
+    int64_t M, int64_t N, int64_t K, int64_t G, int64_t bits,
+    int out_dtype_code, cudaStream_t stream)
+{
+    if (M == 0 || N == 0 || K == 0) return true;
+    if (M > 8 || (bits == 4 && decode_lut == nullptr) || N > std::numeric_limits<int>::max()
+            || (bits != 4 && bits != 6)
+            || K > std::numeric_limits<int>::max() || N % 16 != 0
+            || G != 16 || K % 256 != 0) {
+        return false;
+    }
+    int device = 0;
+    int compute_capability_major = 0;
+    if (cudaGetDevice(&device) != cudaSuccess
+            || cudaDeviceGetAttribute(
+                &compute_capability_major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess
+            || compute_capability_major < 8) {
+        return false;
+    }
+    const int rows = K % 512 == 0 ? 16 : 8;
+    const int splits = static_cast<int>(K) / 32 / rows;
+    auto launch = [&]<int BITS>() {
+        constexpr int OutputsPerBlock = kMmaWarps * 16;
+        const dim3 grid(
+            static_cast<unsigned int>((N + OutputsPerBlock - 1) / OutputsPerBlock),
+            static_cast<unsigned int>(splits));
+        DISPATCH_FP_DTYPE(out_dtype_code, OutputT, [&] {
+            w4a8_codebook_mma_stream_kernel<OutputT, BITS>
+                <<<grid, kMmaWarps * 32, w4a8_stream_smem_bytes<BITS>(rows), stream>>>(
+                static_cast<const int8_t*>(xq),
+                static_cast<const int8_t*>(weight),
+                static_cast<const int8_t*>(decode_lut),
+                static_cast<const float*>(s_channel),
+                static_cast<const float*>(xs),
+                static_cast<const float*>(bias),
+                static_cast<const OutputT*>(residual),
+                static_cast<const OutputT*>(residual_scale),
+                static_cast<int*>(workspace),
+                static_cast<int*>(counters),
+                static_cast<OutputT*>(out),
+                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), rows);
+        });
+    };
+    if (bits == 4) launch.template operator()<4>();
+    else launch.template operator()<6>();
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        throw std::runtime_error(std::string("W4A8 packed MMA failed: ") + cudaGetErrorString(error));
+    }
+    return true;
+}
 
 
 // W4A8 / W6A8 requantize in one launch: raw weight -> ConvRot -> packed codes + fp8 s_rel +
