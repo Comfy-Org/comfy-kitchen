@@ -28,6 +28,7 @@ from .base import (
 )
 from .w4a8_packed import (
     _mma_bits,
+    default_w4a8_codebook,
     unpack_w4a8_mma_weight,
 )
 
@@ -252,6 +253,51 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             convrot_groupsize=convrot_groupsize,
         )
         return qdata, params
+
+    @classmethod
+    def optimize_for_gemv(cls, weight: QuantizedTensor, storage: torch.Tensor) -> QuantizedTensor:
+        """Pack resident codes/scales for small-M MMA. Prefill dequantizes the same
+        records directly into INT8 chunks; neither path needs canonical weights."""
+        qdata, params = weight._qdata, weight._params
+        if (
+            params.mma_packed
+            or params.transposed
+            or not qdata.is_cuda
+            or torch.version.hip is not None
+            or not registry.is_available("cuda")
+            or torch.cuda.get_device_capability(qdata.device) < (8, 0)
+        ):
+            return weight
+        n, k = params.orig_shape
+        if params.codebook is None:
+            # 6-bit codes are uniform; 4-bit without a codebook is not what the kernel decodes
+            codebook_ok = qdata.shape[1] * 8 == k * 6
+        else:
+            codebook_ok = torch.equal(params.codebook.float().cpu(), default_w4a8_codebook())
+        if (
+            n % 16 != 0 or k % 256 != 0
+            or params.group_size != 16
+            or params.correction is not None
+            or params.scale.dtype != torch.float8_e4m3fn
+            or not codebook_ok
+        ):
+            return weight
+        if storage.dtype != torch.uint8 or storage.ndim != 1 or not storage.is_contiguous() or storage.device != qdata.device:
+            raise ValueError("resident storage must be a contiguous byte buffer on the weight's device")
+        start = qdata.data_ptr() - storage.data_ptr()
+        scale_start = params.scale.data_ptr() - storage.data_ptr()
+        end = scale_start + params.scale.nbytes
+        if start < 0 or scale_start < start + qdata.nbytes or end > storage.nbytes:
+            return weight
+        # Import only on the eligible CUDA path; the backend imports this layout.
+        from comfy_kitchen.backends.cuda import pack_w4a8_mma_weight_
+
+        dest = storage[start:start + qdata.nbytes + params.scale.nbytes].view(qdata.dtype)
+        pack_w4a8_mma_weight_(dest, params.scale)
+        params = dataclasses.replace(
+            params, scale=params.scale.new_empty(0), mma_packed=True
+        )
+        return QuantizedTensor(dest, weight._layout_cls, params)
 
     @classmethod
     def dequantize(cls, qdata: torch.Tensor, params: Params) -> torch.Tensor:

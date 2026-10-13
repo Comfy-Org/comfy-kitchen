@@ -474,6 +474,54 @@ void launch_dequant_grouped_to_int8(
             static_cast<const float*>(codebook),
             static_cast<int8_t*>(out), n_vec, Khalf, static_cast<int>(K), static_cast<int>(G));
 }
+// Non-overlapping backwards batches pack directly from source to destination.
+// Only the bottom slabs overlap: one CTA saves each of those before expanding it.
+template <int BITS, bool OVERLAP>
+__global__ void pack_w4a8_slabs_kernel(uint8_t* data, const uint8_t* scales,
+                                     uint8_t* scratch, int first, int last, int K) {
+    constexpr int code_bytes = 512 * BITS / 8, record_bytes = code_bytes + 32;
+    constexpr int parts = OVERLAP ? 1 : 8;
+    const int row_bytes = K * BITS / 8, slab_bytes = 16 * row_bytes, k_rows = K / 32;
+    for (int tile = last - 1 - blockIdx.x / parts; tile >= first; tile -= gridDim.x / parts) {
+        const uint8_t* slab = data + (int64_t)tile * slab_bytes;
+        if constexpr (OVERLAP) {
+            for (int i = threadIdx.x; i < slab_bytes / 4; i += blockDim.x)
+                reinterpret_cast<unsigned*>(scratch)[i] = reinterpret_cast<const unsigned*>(slab)[i];
+            __syncthreads();
+            slab = scratch;
+        }
+        for (int i = threadIdx.x + (blockIdx.x % parts) * blockDim.x; i < k_rows * record_bytes; i += blockDim.x * parts) {
+            const int kr = i / record_bytes, b = i % record_bytes;
+            uint8_t value;
+            if (b >= code_bytes) {
+                const int s = b - code_bytes, row = (s / 4) + 8 * (s & 1), half = (s % 4) / 2;
+                value = scales[((int64_t)tile * 16 + row) * (K / 16) + kr * 2 + half];
+            } else if constexpr (BITS == 4) {
+                const int lane = b / 8, j = (b % 8) / 2;
+                const int row = lane / 4 + 8 * (j & 1);
+                const int col = kr * 32 + (lane % 4) * 4 + (j / 2) * 16 + (b & 1) * 2;
+                value = slab[row * row_bytes + col / 2];
+            } else {
+                const int lane = b < 256 ? b / 8 : (b - 256) / 4;
+                const int lb = b < 256 ? b % 8 : 8 + (b - 256) % 4;
+                const int j = lb / 3, row = lane / 4 + 8 * (j & 1);
+                const int col = kr * 32 + (lane % 4) * 4 + (j / 2) * 16;
+                unsigned word = 0;
+                #pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const int k = col + c;
+                    const unsigned lo = (slab[row * row_bytes + k / 2] >> (4 * (k & 1))) & 15;
+                    const unsigned hi = (slab[row * row_bytes + K / 2 + k / 4] >> (2 * (k & 3))) & 3;
+                    word |= (lo | (hi << 4)) << (6 * c);
+                }
+                value = word >> (8 * (lb % 3));
+            }
+            data[(int64_t)tile * k_rows * record_bytes + i] = value;
+        }
+        if constexpr (OVERLAP) __syncthreads();
+    }
+}
+
 // Read record-stream weights directly into one canonical INT8 GEMM chunk.
 // One thread writes a 16-code group; n0/cols may cut across a 16-output record.
 template <int BITS>
@@ -518,6 +566,28 @@ __global__ void dequant_w4a8_mma_chunk_kernel(
     reinterpret_cast<uint4*>(out)[v] = decoded;
 }
 }  // namespace
+
+extern "C" void launch_pack_w4a8_mma_inplace(
+    void* data, const void* scales, void* scratch,
+    int64_t N, int64_t K, int bits, cudaStream_t stream) {
+    auto* bytes = static_cast<uint8_t*>(data);
+    auto* temp = static_cast<uint8_t*>(scratch);
+    int last = N / 16;
+    while (last > 2 * bits) {
+        // first * expanded_slab_bytes >= last * canonical_slab_bytes:
+        // the entire destination batch is above its entire source batch.
+        const int first = (last * (2 * bits) + 2 * bits) / (2 * bits + 1);
+        if (bits == 4)
+            pack_w4a8_slabs_kernel<4, false><<<(last - first) * 8, 256, 0, stream>>>(bytes, static_cast<const uint8_t*>(scales), temp, first, last, K);
+        else
+            pack_w4a8_slabs_kernel<6, false><<<(last - first) * 8, 256, 0, stream>>>(bytes, static_cast<const uint8_t*>(scales), temp, first, last, K);
+        last = first;
+    }
+    if (bits == 4)
+        pack_w4a8_slabs_kernel<4, true><<<1, 1024, 0, stream>>>(bytes, static_cast<const uint8_t*>(scales), temp, 0, last, K);
+    else
+        pack_w4a8_slabs_kernel<6, true><<<1, 1024, 0, stream>>>(bytes, static_cast<const uint8_t*>(scales), temp, 0, last, K);
+}
 
 static void launch_dequant_w4a8_mma_chunk(
     const void* packed, const void* codebook, void* out,

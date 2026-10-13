@@ -2114,6 +2114,10 @@ extern "C" {
         uint64_t seed,
         cudaStream_t stream);
 
+    void launch_pack_w4a8_mma_inplace(
+        void* data, const void* scales, void* scratch,
+        int64_t N, int64_t K, int bits, cudaStream_t stream);
+
     bool launch_w4a8_codebook_gemm_chunked(
         const void* xq,
         const void* weight,
@@ -3209,6 +3213,21 @@ bool quantize_wxa8_convrot_fused(
         weight.data(), bits == 4 ? codebook.data() : nullptr, packed.data(), s_rel.data(), s_channel.data(),
         N, K, static_cast<int>(bits), static_cast<int>(group_size), in_code, stochastic, seed,
         reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void pack_w4a8_mma_inplace(
+    nb::ndarray<int8_t, nb::ndim<1>, nb::device::cuda> data,
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> scales,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> scratch,
+    uintptr_t stream_ptr) {
+    const int64_t N = scales.shape(0), K = scales.shape(1) * 16;
+    const int bits = data.size() == N * K * 9 / 16 ? 4 : (data.size() == N * K * 13 / 16 ? 6 : 0);
+    if (!bits || N <= 0 || N % 16 || K <= 0 || K % 256
+            || data.stride(0) != 1 || scales.stride(1) != 1 || scales.stride(0) != K / 16
+            || scratch.stride(0) != 1 || scratch.size() < static_cast<size_t>(2 * K * bits))
+        throw std::runtime_error("pack_w4a8_mma_inplace: invalid storage or scratch geometry");
+    launch_pack_w4a8_mma_inplace(data.data(), scales.data(), scratch.data(),
+        N, K, bits, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Returns the code width (4 or 6) implied by the packed weight row.
@@ -4649,6 +4668,10 @@ NB_MODULE(_C, m) {
           "Fused ConvRot + W4A8/W6A8 requant from the raw weight; false -> row too long for shared memory.",
           nb::arg("weight"), nb::arg("codebook"), nb::arg("packed"), nb::arg("s_rel"), nb::arg("s_channel"),
           nb::arg("bits"), nb::arg("group_size"), nb::arg("stochastic"), nb::arg("seed"), nb::arg("stream_ptr"));
+
+    m.def("pack_w4a8_mma_inplace", &pack_w4a8_mma_inplace,
+          "In-place backwards slab expansion into tiled codes and interleaved scales",
+          nb::arg("data"), nb::arg("scales"), nb::arg("scratch"), nb::arg("stream_ptr"));
 
     m.def("w4a8_codebook_gemm_chunked", &w4a8_codebook_gemm_chunked,
           "Chunked fused W4A8: per-chunk codebook+s_rel dequant -> L2-hot int8 -> strided int8 GEMM",

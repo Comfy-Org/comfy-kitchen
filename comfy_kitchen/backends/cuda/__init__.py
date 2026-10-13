@@ -2463,6 +2463,23 @@ def dequantize_w4a8_int8_weight(
     return rotate_int8_convrot_weight(weight_rotated.contiguous(), convrot_groupsize).to(output_dtype)
 
 
+def pack_w4a8_mma_weight_(dest: torch.Tensor, s_rel: torch.Tensor):
+    """Canonical codes at dest's start -> packed records in the same storage.
+
+    Scratch is the saved group scales plus one 16-row slab. All work runs on
+    the caller's stream; the output keeps slab/K order without a global permutation.
+    """
+    n, groups = s_rel.shape
+    k = groups * 16
+    bits = 4 if dest.numel() == n * k * 9 // 16 else 6
+    scales = s_rel.view(torch.uint8).clone()
+    scratch = torch.empty(2 * k * bits, dtype=torch.uint8, device=dest.device)
+    _C.pack_w4a8_mma_inplace(
+        _wrap_for_dlpack(dest), _wrap_for_dlpack(scales), _wrap_for_dlpack(scratch),
+        torch.cuda.current_stream(dest.device).cuda_stream,
+    )
+
+
 def w4a8_int8_linear(
     x: torch.Tensor,
     qdata: torch.Tensor,
