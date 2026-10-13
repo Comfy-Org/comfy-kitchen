@@ -106,7 +106,7 @@ extern "C" bool launch_fp16_gemm_kernel(
                     static_cast<const __half*>(resid), N};
         launch_gemm_wmma<MmaF16, EpiFp16, __half>(
             static_cast<const uint8_t*>(a), static_cast<const uint8_t*>(b), static_cast<__half*>(d),
-            M, N, 2 * K, N, epi, stream);
+            M, N, 2 * K, N, epi, stream, GemmPolicy{true, false});
         return true;
     }
 }
@@ -141,6 +141,6 @@ extern "C" bool launch_bf16_gemm_kernel(
                 static_cast<const __half*>(resid), N};
     launch_gemm_wmma<MmaBf16G, EpiFp16, __bf16>(
         static_cast<const uint8_t*>(a), static_cast<const uint8_t*>(b), static_cast<__bf16*>(d),
-        M, N, 2 * K, N, epi, stream);
+        M, N, 2 * K, N, epi, stream, GemmPolicy{true, false});
     return true;
 }

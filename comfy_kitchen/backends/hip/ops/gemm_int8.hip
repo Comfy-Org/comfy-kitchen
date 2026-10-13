@@ -76,7 +76,15 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
         gemm_int8_valu_kernel<OutT><<<grid, block, 0, stream>>>(
             A, B, epi, C, M, N, K, ldc);
     } else {
-        launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
+        // 8-bit operand, and on gfx11 the fragment is a whole 128-bit K-step
+        // (mma.h's MmaInt8 : LdsPad16), so the heuristic may pick the wider thread
+        // tile. Stated here rather than read off the policy type because the
+        // tile choice is host code and only a device pass resolves MmaInt8 to an
+        // architecture -- see GemmPolicy in gemm_wmma.h. Harmless on gfx12, whose
+        // int8 fragment is 8 bytes: that whole branch is inside
+        // `comfy_small_igpu()`.
+        launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream,
+                                                    GemmPolicy{false, true});
     }
 }
 

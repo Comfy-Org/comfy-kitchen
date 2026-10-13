@@ -318,9 +318,11 @@ __global__ __launch_bounds__(kThreadsQuant) void dequantize_nvfp4_kernel(
 
 // LDS row stride, in halves. The +8 is 16 bytes and keeps every row 16-byte
 // aligned, which is what lets a fragment's 32-byte K-step load as two
-// ds_read_b128 rather than sixteen scalar reads. (gemm_wmma.h's kLdsPad is 8
-// BYTES, which breaks that alignment; it can afford to, because its operands are
-// already 16-bit in LDS from a byte-addressed stager.)
+// ds_read_b128 rather than sixteen scalar reads. gemm_wmma.h's stager pads by
+// Mma::kLdsPad, which is 8 bytes for every policy whose fragments are not a
+// whole 128-bit K-step (see mma.h's LdsPad8/LdsPad16); those pay for their
+// 32-byte read with scalar loads. This kernel stages fp16 values out of a
+// packed nibble buffer rather than byte-addressed int8, so the pad belongs here.
 constexpr int kNvfp4LdsPadHalves = 8;
 
 // Staging for one ROWS x BKB tile, where BKB counts ELEMENTS along K.

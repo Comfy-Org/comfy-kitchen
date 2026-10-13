@@ -49,6 +49,25 @@ typedef _Float16 v16h __attribute__((ext_vector_type(16)));
 
 constexpr int kWave = 32;
 
+// LDS row padding the tiled GEMM core must use for a given policy's fragment
+// reads, expressed as two base classes so every policy inherits one and only the
+// ones with a reason to differ say so.
+//
+// 8 spreads 16 rows across 16 distinct banks (stride 34 words: lane r lands on
+// bank 2r), and is what a 32-bit or 64-bit fragment read wants. 16 keeps every
+// row 16-byte aligned at the cost of a two-way bank conflict (stride 36 words:
+// lanes 0-7 of a 128-bit phase still cover all 32 banks), which a policy whose
+// fragment is a whole 128-bit K-step trades for four times the issue slots per
+// read. The int8 attention kernels reached that trade on gfx11 long ago
+// (sage_attention/int8_attn.hip's kLdsPad); the GEMM core did not, and its
+// fragment reads were the four-scalar form of that.
+struct LdsPad8 {
+    static constexpr int kLdsPad = 8;
+};
+struct LdsPad16 {
+    static constexpr int kLdsPad = 16;
+};
+
 // 2^x for the softmax paths. Under -ffast-math clang lowers exp2f to a
 // range-reduction sequence (compare, two selects, add, v_exp_f32, ldexp): about
 // five VALU instructions per call, and every attention kernel here calls it once
@@ -129,22 +148,14 @@ __forceinline__ __device__ v2i load_frag_b64(const void* lds, int row, int kbyte
     return *reinterpret_cast<const v2i*>(p);
 }
 
-__forceinline__ __device__ v4i load_frag_b128(const void* lds, int row, int kbyte, int stride) {
-    const char* p = static_cast<const char*>(lds) + row * stride + kbyte;
-    // kLdsPad breaks 16-byte alignment, so this must not become a single b128 load.
-    v4i r;
-    const int* q = reinterpret_cast<const int*>(p);
-    r[0] = q[0];
-    r[1] = q[1];
-    r[2] = q[2];
-    r[3] = q[3];
-    return r;
-}
-
 // Same, for a row the caller guarantees is 16-byte aligned: one LDS instruction
 // instead of four. gfx11 hands every lane the whole 16-byte K-step, so this is
-// the difference between one ds_load_b128 and four ds_load_b32 on every single
-// fragment read in an attention inner loop.
+// the difference between one ds_read_b128 and four ds_read_b32 on every single
+// fragment read of an inner loop -- in attention and in the tiled GEMM core
+// alike. The caller guarantees it by padding the LDS row stride to a multiple of
+// 16 (LdsPad16 below); at stride +8 a row is only 8-byte aligned, and four
+// separate ds_read_b32 is the only legal spelling, which is what this tree
+// shipped until the GEMM core adopted the padded stride.
 __forceinline__ __device__ v4i load_frag_b128_aligned(const void* lds, int row, int kbyte,
                                                       int stride) {
     const char* p = static_cast<const char*>(lds) + row * stride + kbyte;
@@ -186,7 +197,7 @@ __forceinline__ __device__ typename Mma::Frag load_frag_16bit(const typename Mma
 
 #if defined(COMFY_MMA_GFX12)
 
-struct MmaFp8 {
+struct MmaFp8 : LdsPad8 {
     using Acc = v8f;
     using Frag = v2i;
     static constexpr int kStepBytes = 16;
@@ -201,7 +212,7 @@ struct MmaFp8 {
     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
 };
 
-struct MmaBf8 {
+struct MmaBf8 : LdsPad8 {
     using Acc = v8f;
     using Frag = v2i;
     static constexpr int kStepBytes = 16;
@@ -216,7 +227,7 @@ struct MmaBf8 {
     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
 };
 
-struct MmaInt8 {
+struct MmaInt8 : LdsPad8 {
     using Acc = v8i;
     using Frag = v2i;
     static constexpr int kStepBytes = 16;
@@ -244,7 +255,7 @@ struct MmaInt8 {
 };
 
 // The one type whose K-step differs: gfx12 does K=32 per MMA, gfx11 does K=16.
-struct MmaInt4 {
+struct MmaInt4 : LdsPad8 {
     using Acc = v8i;
     using Frag = v2i;
     static constexpr int kStepBytes = 16;
@@ -265,7 +276,7 @@ struct MmaInt4 {
 // 16-bit float MMA, used by the attention kernels rather than the GEMM core: they
 // build fragments from global memory and from LDS scratch, so the policy exposes
 // the element type and the half-wave's K slice instead of a byte-addressed load.
-struct MmaBf16 {
+struct MmaBf16 : LdsPad8 {
     using Acc = v8f;
     using Frag = v8bf;
     using Elem = __bf16;
@@ -278,7 +289,7 @@ struct MmaBf16 {
     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
 };
 
-struct MmaF16 {
+struct MmaF16 : LdsPad8 {
     using Acc = v8f;
     using Frag = v8h;
     using Elem = _Float16;
@@ -300,7 +311,7 @@ struct MmaF16 {
 };
 
 // BF16 GEMM policy for gfx12, mirroring MmaF16's half-wave K split.
-struct MmaBf16G {
+struct MmaBf16G : LdsPad8 {
     using Acc = v8f;
     using Frag = v8bf;
     using Elem = __bf16;
@@ -322,7 +333,7 @@ struct MmaBf16G {
 
 #elif defined(COMFY_MMA_GFX11)
 
-struct MmaFp8 {
+struct MmaFp8 : LdsPad8 {
     using Acc = v8f;
     using Frag = v16bf;
     static constexpr int kStepBytes = 16;  // 16 fp8 bytes == K-step of 16
@@ -337,7 +348,7 @@ struct MmaFp8 {
     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
 };
 
-struct MmaBf8 {
+struct MmaBf8 : LdsPad8 {
     using Acc = v8f;
     using Frag = v16bf;
     static constexpr int kStepBytes = 16;
@@ -352,13 +363,18 @@ struct MmaBf8 {
     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
 };
 
-struct MmaInt8 {
+struct MmaInt8 : LdsPad16 {
     using Acc = v8i;
     using Frag = v4i;  // whole K-step of 16 int8, duplicated across half-waves
     static constexpr int kStepBytes = 16;
     static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
                                                 int lane) {
-        return load_frag_b128(lds, row, kbyte, stride);
+        // LdsPad16 makes every LDS row 16-byte aligned (BKB is already a multiple
+        // of 16, kbyte is a whole K-step), so this is one ds_read_b128. At the
+        // 8-byte pad the same address is only dword-aligned and the read has to
+        // split into four ds_read_b32 -- four times the issue slots, once per
+        // fragment, per K-step, on the innermost loop of the dominant GEMM.
+        return load_frag_b128_aligned(lds, row, kbyte, stride);
     }
     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
     static __forceinline__ __device__ Frag load_aligned(const void* lds, int row, int kbyte,
@@ -377,7 +393,7 @@ struct MmaInt8 {
     static __forceinline__ __device__ float get(Acc c, int e) { return static_cast<float>(c[e]); }
 };
 
-struct MmaInt4 {
+struct MmaInt4 : LdsPad8 {
     using Acc = v8i;
     using Frag = v2i;  // K=16 nibbles == 8 bytes, whole step, duplicated
     static constexpr int kStepBytes = 8;
@@ -397,7 +413,7 @@ struct MmaInt4 {
 
 
 // gfx11 hands every lane the whole 16-wide K-step, duplicated across half-waves.
-struct MmaBf16 {
+struct MmaBf16 : LdsPad8 {
     using Acc = v8f;
     using Frag = v16bf;
     using Elem = __bf16;
@@ -412,7 +428,7 @@ struct MmaBf16 {
 
 // BF16 policy for the tiled GEMM core: unlike MmaBf16 (the fp8-widening path),
 // a bf16 GEMM consumes 32 bytes of a row per 16-element K-step, same as MmaF16.
-struct MmaBf16G {
+struct MmaBf16G : LdsPad8 {
     using Acc = v8f;
     using Frag = v16bf;
     using Elem = __bf16;
@@ -432,7 +448,7 @@ struct MmaBf16G {
     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
 };
 
-struct MmaF16 {
+struct MmaF16 : LdsPad8 {
     using Acc = v8f;
     using Frag = v16h;
     using Elem = _Float16;
@@ -462,7 +478,7 @@ struct MmaF16 {
     __builtin_trap();       \
     return c;
 
-struct MmaFp8 {
+struct MmaFp8 : LdsPad8 {
     using Acc = v8f;
     using Frag = v2i;
     static constexpr int kStepBytes = 16;
@@ -474,7 +490,7 @@ struct MmaFp8 {
 
 struct MmaBf8 : MmaFp8 {};
 
-struct MmaInt8 {
+struct MmaInt8 : LdsPad8 {
     using Acc = v8i;
     using Frag = v2i;
     static constexpr int kStepBytes = 16;
@@ -491,7 +507,7 @@ struct MmaInt8 {
 
 struct MmaInt4 : MmaInt8 {};
 
-struct MmaBf16 {
+struct MmaBf16 : LdsPad8 {
     using Acc = v8f;
     using Frag = v8bf;
     using Elem = __bf16;
@@ -507,7 +523,7 @@ struct MmaBf16G : MmaBf16 {
     static __forceinline__ __device__ Frag load(const void*, int, int, int, int) { return Frag{}; }
 };
 
-struct MmaF16 {
+struct MmaF16 : LdsPad8 {
     using Acc = v8f;
     using Frag = v8h;
     using Elem = _Float16;

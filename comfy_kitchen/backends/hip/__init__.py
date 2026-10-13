@@ -3347,37 +3347,47 @@ def _build_constraints(has_wmma: bool = True, has_valu_gemm: bool = False) -> di
 # Must match kCtaQ and the key tiles in sage_attention/int8_attn.hip.
 _SAGE_CTA_Q = 128
 _SAGE_CTA_K = 64
-# _SAGE_LARGE_CTA_K (128) went with the wide-tile gate in _sage_cta_k: the gate
-# never reached the kernel, which discards cta_k, so nothing selects it now.
+_SAGE_LARGE_CTA_K = 128
 _SAGE_KEY_GROUP = 16
 _SAGE_HEAD_DIMS = (64, 128, 256)
 
 
 def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool) -> int:
-    """Keys per attention iteration. Always 64.
+    """Keys per attention iteration: 64. 128 is implemented, measured, and not used.
 
-    This used to return 128 for long unmasked D128 sequences on the iGPU, on the
-    strength of a ~15% measurement. Two things retired it.
+    The kernel used to discard this outright (``(void)cta_k;`` with the launch
+    macro hardcoding 64), so the ~15% figure and the later 0.99x-1.01x A/B that
+    retired the wide tile were both reading an identical launch -- there was
+    nothing for the value to select. The argument is honoured now, and with it a
+    real choice: ``COMFY_SAGE_CTA_K=128`` picks the wide tile.
 
-    It never reached the kernel. int8_attn.hip discards the value outright --
-    ``(void)cta_k;`` and ``SAGE_ATTN_LAUNCH(HD, 64, ...)`` -- so a tile-aligned
-    sequence produced identical buffers and identical launches either way. The
-    gate only inflated the V scratch for kv lengths that are not a multiple of
-    128. It became live only while the ported gfx110x schedule, which does take
-    CTA_K as a parameter, was in front of it; that schedule is gone (it measured
-    1.10x-1.40x slower than upstream on every shape it served).
+    Measured, that choice loses. Interleaved in one process at H=48/D=128/no
+    mask, one sequence length per process: 0.997x at S=512, 1.028x at 1024,
+    1.001x at 2048, 0.986x at 3072, 0.987x at 5120, 1.003x at 8192, and at the
+    three sequence lengths Krea2 ships -- 1.009x (S=4138), 1.027x (6186),
+    1.038x (9258). Never a win, and consistently worse where this checkpoint
+    lives, by more as S grows. So 64 stays the default and this function exists
+    only to keep the two sides of the contract in step.
 
-    And with the schedule gone there is nothing for it to select: A/B'd in one
-    process with CK_SAGE_FORCE_CTA64 flipping this per call, over the Anima D128
-    shapes in benchmark_attn.py, the wide tile came out 0.99x-1.01x per case and
-    1.002x in total -- i.e. identical, as the ``(void)`` predicts.
+    It stays a function because two things depend on it agreeing with the kernel:
+    the V scratch is padded to a multiple of it, and the k-scale buffer is sized
+    ``padded_k // _SAGE_KEY_GROUP``. A 128 here at D256 would pad buffers for a
+    tile the kernel never launches -- it only instantiates the wide tile up to
+    D128, 69,632 B of LDS against a 64 KB limit -- so that falls back to 64.
 
-    D256 has no LDS room for a 128-key tile regardless, so the shape envelope
-    argument that gated this never applied to it either. It stays a function
-    because the callers and the buffer padding are written against a tile width,
-    and because the kernel instantiates the matching tile from the runtime value
-    should a future schedule honour it again.
+    The kernel additionally ignores a 128 request when a mask is present: the
+    mask staging is sized for the 64-key schedule and reading it back at
+    CTA_K=128 walks off the end (7.2e-01 worst relative error against a float
+    softmax reference, where the 64-key tile gives 1.3e-02). Krea2's DiT is
+    unmasked and this only concerns the override, but the two sides have to agree
+    on *when* 128 applies as well as *whether*, or the buffer padding and the
+    launch disagree.
     """
+    # Module-level `os`, not a function-local import: this runs on every attention
+    # call, which is the hottest path in the quantised attention stack.
+    if (not has_mask) and os.environ.get("COMFY_SAGE_CTA_K") == "128" \
+            and head_dim <= 128:
+        return _SAGE_LARGE_CTA_K
     return _SAGE_CTA_K
 
 
@@ -3892,9 +3902,27 @@ def sage_int8_quantize(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    cta_k: int = _SAGE_CTA_K,
+    cta_k: int | None = None,
 ) -> dict:
-    """Quantize q, k and v without allocating the attention output."""
+    """Quantize q, k and v without allocating the attention output.
+
+    **``cta_k`` here and in :func:`sage_int8_attend` must be the same number.**
+    This half pads the k-scale buffer and the V scratch to a multiple of it; the
+    attend half tells the kernel the tile width and the kernel then reads a scale
+    for every lane of its last tile. A buffer sized for 64 read by a 128-wide
+    kernel walks off the end -- four floats at Krea2's 1024x1536 sequence. That
+    was harmless while the kernel discarded the argument outright; it is not now
+    that the tile is really selected.
+
+    So both halves default to ``None``: this one asks :func:`_sage_cta_k`, and
+    :func:`sage_int8_attend` reads the width back out of the buffer this one built.
+    A caller passing two *different* explicit values is the remaining hazard, so
+    that is what the note above is for. The returned dict stays a dict of tensors;
+    it is the prequantised-buffer contract and must not gain a metadata key.
+    """
+    batch, _, _, head_dim = q.shape
+    if cta_k is None:
+        cta_k = _sage_cta_k(head_dim, k.shape[2], False)
     buffers, anchor_indices = _sage_buffers(q, k, cta_k)
     _C.sage_sdpa_quantize(
         _dl(q),
@@ -3918,7 +3946,6 @@ def sage_int8_quantize(
     # stride. Hand that single-width view to the packed form: the prequantized
     # contract is a padded_k-wide row, and presenting the wider scratch would make
     # the attention kernel read the second half of one row as the next.
-    batch, _, _, head_dim = q.shape
     kv_heads = k.shape[1]
     padded_k = -(-k.shape[2] // cta_k) * cta_k
     v_rows = batch * kv_heads * head_dim
@@ -3942,10 +3969,34 @@ def sage_int8_attend(
     attention_scale: float,
     attn_mask: torch.Tensor | None,
     output_dtype: torch.dtype,
-    cta_k: int = _SAGE_CTA_K,
+    cta_k: int | None = None,
 ) -> torch.Tensor:
-    """Attend over the packed layouts sage_int8_quantize produced."""
+    """Attend over the packed layouts sage_int8_quantize produced.
+
+    ``cta_k`` must equal what the quantise half used. Left at ``None`` it is read
+    back out of ``v_int8``'s row width rather than asked a second time, because the
+    two halves cannot always be asked consistently: the quantise half runs before
+    the caller has a mask, so under ``COMFY_SAGE_CTA_K=128`` it pads for 128 while
+    a masked attend wants 64 -- and the C++ side checks the row against
+    ``sage_padded_k(kv_len, cta_k)`` by equality, so guessing wrong there is a hard
+    error rather than a slow path. Deriving it makes the buffer the single source
+    of truth and every combination agree.
+
+    The derivation is exact rather than a divisibility test: ``v_int8``'s row is
+    ``sage_padded_k(kv_len, c)`` for whichever ``c`` the quantiser used, and for
+    Krea2's sequence lengths the two candidates do not collide (6186 -> 6208 at 64
+    against 6272 at 128). Anything unrecognised falls back to the narrow tile,
+    which is the one every device accepts.
+    """
     batch, q_heads, q_length, head_dim = q_int8.shape
+    if cta_k is None:
+        kv_len = k_int8.shape[2]
+        row = v_int8.shape[-1]
+        cta_k = _SAGE_CTA_K
+        for candidate in (_SAGE_LARGE_CTA_K, _SAGE_CTA_K):
+            if row == -(-kv_len // candidate) * candidate:
+                cta_k = candidate
+                break
     output = torch.empty(
         batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q_int8.device
     )

@@ -17,6 +17,44 @@
 // Tiling: 16 queries per wave and 64 keys per iteration; LDS holds only K and V.
 // Dense masks at D64/D128 use 256-query blocks to reuse each K/V tile across
 // more waves. Other paths retain the 128-query schedule.
+//
+// WHY THE TUNING IS NOT WHERE THE TIME IS (measured from the ISA, gfx1103)
+// ---------------------------------------------------------------------------
+// With no usable profiler on Windows and no counters on this iGPU, the generated
+// code is the instrument. Counting the innermost key loop out of
+// `--cuda-device-only -S`, for HD=128 / MaskMode::kNone / CTA_K=64:
+//
+//   loop instructions 2730, of which
+//     v_wmma_i32_16x16x16_iu8  128   -> 4.7% matrix density
+//     ds_load_b128            128
+//     s_waitcnt               174
+//     v_mul_f32               233   v_sub_f32 197   v_fmac_f32 132
+//     v_cndmask_b32            83   v_exp_f32    68   v_rndne_f32 64
+//
+// **The kernel is softmax-bound, not matrix-bound.** Cross-check: at S=4138 the
+// loop count works out to ~7.2e10 thread-instructions, and 6 CU x 4 SIMD x 32
+// lanes at ~2.9 GHz issues ~2.2e12/s -- 33 ms against the 45.5 ms measured. The
+// gap between those two numbers is the whole story: the kernel is within ~1.4x of
+// its own issue limit while spending 95% of its slots on scalar float work.
+//
+// The cost is per *output element*, and it is set by head_dim, not by the key
+// tile: each lane holds a DT x 8 accumulator with DT = HD/16 = 8, and every key
+// tile does 8 x 8 = 64 `__int_as_float` + 64 `fmaf` to fold the INT32 partial into
+// the running output. CTA_K does not change that count, it only divides how many
+// times it happens -- which is why the wider key tile helps the *ratio* (14.1
+// instructions per WMMA at CTA_K=128 against 21.3 here) and still loses: its LDS
+// footprint of 36,864 B drops resident blocks per CU from 3 to 1, and 280
+// s_waitcnt per 256 WMMA is not worth one block's worth of concurrency.
+//
+// So the remaining ~1.3x here is **algorithmic, not a tuning knob**: a blocked
+// online softmax that rescales on a schedule rather than every tile, or an
+// accumulator held in a form that does not need a float rescale per tile. That is
+// a redesign of the score/output loop, it moves the numerics, and this kernel
+// serves every model in the tree -- SDXL, Anima and Krea2 all quantise attention
+// through it -- so it wants its own branch and its own error budget. Tuning what
+// is here cannot reach it: the two levers that exist (key tile width, LDS pad)
+// have both been measured, and the pad already matches what the int8 GEMM core
+// now uses.
 #include <hip/hip_runtime.h>
 
 #include <stdexcept>
@@ -1077,54 +1115,115 @@ extern "C" void launch_sage_int8_attn(
                                 q_stride_h, k_stride_b, k_stride_h, v_stride_b, v_stride_h,      \
                                 v_stride_d, o_stride_b, o_stride_h, o_stride_n, sm_scale, stream)
 
-    // One key tile, 64 keys. The CUDA backend widens to 128 for long unmasked
-    // keys; ported and measured, that is slower on RDNA, where V is staged
-    // transposed so the wide tile doubles both LDS tiles and costs more occupancy
-    // than it saves. It does not fit at D256 at all, wanting 67 KB against a
-    // 64 KB workgroup limit. A caller may still ask for 128 and get the same
-    // answer from the narrow tile: tile size is a schedule, not a shape.
-    (void)cta_k;
-#define SAGE_ATTN_CTA(HD, MM, OUT) SAGE_ATTN_LAUNCH(HD, 64, MM, OUT)
+    // Key tile width, in instantiated keys per launch. The caller's `cta_k` is
+    // honoured only where a matching tile is built, and ignored otherwise --
+    // tile size is a schedule, not a shape, so an unbuildable request must still
+    // produce a correct result rather than a failed launch.
+    //
+    // The tile is named per `switch` case rather than chosen by a runtime `if`
+    // inside SAGE_ATTN_CTA, and that is not a style preference. A runtime `if`
+    // instantiates **both** branches, so `if (ck >= 128) launch_one<256, 128,
+    // ...>` would compile -- and fail, because at D256 the two LDS tiles want
+    // 128*(256+pad) + 256*(128+pad) = 69,632 B at pad 16 against a 64 KB
+    // workgroup limit. Only D64 and D128 name a 128-key tile. 128 also sits
+    // within 16 KB of the INT32-partial bound the kernel asserts
+    // (128*128*255 = 4,177,920 against 2^22), a second reason it is a narrow
+    // door rather than a default.
+    //
+    // What the wider tile trades: the two LDS tiles go from 19,456 B to 36,864 B,
+    // so resident blocks per CU fall from 3 to 1, while the key loop per block
+    // halves -- same total work, half as many iterations, a third of the
+    // concurrency to hide them behind.
+    //
+    // **Measured: the trade loses.** `COMFY_SAGE_CTA_K=128` selects it, arms
+    // interleaved in one process at H=48/D=128/no mask, one sequence length per
+    // process (four shapes resident in one process moved a single arm by 30-42%
+    // on this part -- the shared-memory page placement, see the GEMM tile
+    // heuristic's note):
+    //
+    //   S= 512  0.997x     S=3072  0.986x
+    //   S=1024  1.028x     S=5120  0.987x
+    //   S=2048  1.001x     S=8192  1.003x
+    //   Krea2:  S=4138 1.009x, S=6186 1.027x, S=9258 1.038x
+    //
+    // Never a win, and at the three sequence lengths Krea2 actually ships it is
+    // consistently worse, by more as S grows. That is the occupancy trade being
+    // charged with interest: the loop gets shorter but there is nothing left
+    // behind it to overlap with, and a longer S means more of the run is spent
+    // in that state.
+    //
+    // This corrects the record on a claim that used to sit here. The note that
+    // 128 "is slower on RDNA, ported and measured" could not have been measured
+    // on this backend, because this file discarded the argument and hardcoded 64
+    // -- the tile was identical in both arms, which is also why the later A/B in
+    // _sage_cta_k came out 0.99x-1.01x. Both were reading a no-op. The
+    // instantiation stays, because that is what makes the number above
+    // re-checkable, and because a discarded schedule argument is how this arm
+    // went dead in the first place.
+#define SAGE_ATTN_CTA(HD, CK, MM, OUT) SAGE_ATTN_LAUNCH(HD, CK, MM, OUT)
 
-#define SAGE_ATTN_OUT(HD, MM)                                                                    \
+#define SAGE_ATTN_OUT(HD, CK, MM)                                                                 \
     do {                                                                                         \
         if (output_dtype_code == 1) {                                                            \
-            SAGE_ATTN_CTA(HD, MM, __half);                                                       \
+            SAGE_ATTN_CTA(HD, CK, MM, __half);                                                  \
         } else {                                                                                 \
-            SAGE_ATTN_CTA(HD, MM, __bf16);                                                       \
+            SAGE_ATTN_CTA(HD, CK, MM, __bf16);                                                  \
         }                                                                                        \
     } while (0)
 
-#define SAGE_ATTN_MASK(HD)                                                                       \
+#define SAGE_ATTN_MASK(HD, CK)                                                                   \
     do {                                                                                         \
         if (mask != nullptr && mask_dtype_code == 8) {                                           \
-            if (qo_len <= 256) { SAGE_ATTN_OUT(HD, MaskMode::kPreparedDenseBF16Short); }           \
-            else { SAGE_ATTN_OUT(HD, MaskMode::kPreparedDenseBF16); }                                      \
+            if (qo_len <= 256) { SAGE_ATTN_OUT(HD, CK, MaskMode::kPreparedDenseBF16Short); }     \
+            else { SAGE_ATTN_OUT(HD, CK, MaskMode::kPreparedDenseBF16); }                        \
         } else if (mask != nullptr && mask_dtype_code == 9) {                                    \
-            if (qo_len <= 256) { SAGE_ATTN_OUT(HD, MaskMode::kPreparedDenseF16Short); }            \
-            else { SAGE_ATTN_OUT(HD, MaskMode::kPreparedDenseF16); }                                       \
-        } else if (mask != nullptr && mask_dtype_code == 7) {                                           \
-            SAGE_ATTN_OUT(HD, MaskMode::kPreparedDenseBool);                                      \
+            if (qo_len <= 256) { SAGE_ATTN_OUT(HD, CK, MaskMode::kPreparedDenseF16Short); }      \
+            else { SAGE_ATTN_OUT(HD, CK, MaskMode::kPreparedDenseF16); }                         \
+        } else if (mask != nullptr && mask_dtype_code == 7) {                                    \
+            SAGE_ATTN_OUT(HD, CK, MaskMode::kPreparedDenseBool);                                \
         } else if (mask != nullptr && mask_dtype_code == 5) {                                    \
-            SAGE_ATTN_OUT(HD, MaskMode::kPreparedDense);                                          \
+            SAGE_ATTN_OUT(HD, CK, MaskMode::kPreparedDense);                                    \
         } else if (mask != nullptr && mask_dtype_code == 4) {                                    \
-            SAGE_ATTN_OUT(HD, MaskMode::kPreparedKey);                                            \
+            SAGE_ATTN_OUT(HD, CK, MaskMode::kPreparedKey);                                      \
         } else if (mask != nullptr) {                                                            \
             if (HD <= 128 && (mask_stride_q == 0 || qo_len == 1) && qo_len <= 256 &&              \
                 kv_len > 64 && kv_len <= kMaxDirectKeyLength) {                                 \
-                SAGE_ATTN_OUT(HD, MaskMode::kDirectKey);                                         \
+                SAGE_ATTN_OUT(HD, CK, MaskMode::kDirectKey);                                    \
             } else {                                                                            \
-                SAGE_ATTN_OUT(HD, MaskMode::kCustom);                                            \
+                SAGE_ATTN_OUT(HD, CK, MaskMode::kCustom);                                       \
             }                                                                                   \
         } else {                                                                                 \
-            SAGE_ATTN_OUT(HD, MaskMode::kNone);                                                  \
+            SAGE_ATTN_OUT(HD, CK, MaskMode::kNone);                                             \
         }                                                                                        \
     } while (0)
 
+    // The tile width is named per case, not branched on inside SAGE_ATTN_CTA,
+    // and D256 has no 128-key instantiation to name at all.
+    //
+    // **Unmasked only.** The masked path is not merely slower at CTA_K=128, it is
+    // wrong: the mask is staged per key tile into `row_words[32 * TilesPerBlock]`
+    // and read back as `key_mask[num_iters * CTA_K + iter]`, and that staging is
+    // sized for the 64-key schedule, so doubling CTA_K walks off it. Measured
+    // against a float softmax reference at H=4/D128/S=100 with a zero bias, worst
+    // relative error 7.2e-01 against 1.3e-02 for the 64-key tile -- wrong, not
+    // imprecise. The unmasked path at the same shapes is exact against 64
+    // (identical max error 2.06e-03 at S=100 and 2.57e-03 at S=256, and the same
+    // int8 quantisation error at S=4138), so the defect is the mask staging and
+    // not the tile.
+    //
+    // That is also why the CUDA gate this mirrors was scoped to unmasked keys to
+    // begin with. Repairing the masked staging is a real change to the schedule
+    // and wants its own measurement; it is not folded into a tile that does not
+    // pay for itself in the first place.
+    const bool wide = cta_k >= 128 && mask == nullptr;
     switch (head_dim) {
-        case 64: SAGE_ATTN_MASK(64); break;
-        case 128: SAGE_ATTN_MASK(128); break;
-        case 256: SAGE_ATTN_MASK(256); break;
+        case 64:
+            if (wide) { SAGE_ATTN_MASK(64, 128); } else { SAGE_ATTN_MASK(64, 64); }
+            break;
+        case 128:
+            if (wide) { SAGE_ATTN_MASK(128, 128); } else { SAGE_ATTN_MASK(128, 64); }
+            break;
+        case 256: SAGE_ATTN_MASK(256, 64); break;
         default:
             throw std::runtime_error("sage int8 attention: unsupported head_dim " +
                                      std::to_string(head_dim));
