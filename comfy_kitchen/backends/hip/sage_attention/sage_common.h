@@ -271,6 +271,32 @@ __forceinline__ __device__ void convrot(float* v) {
 
 // Round to nearest even and saturate, matching cvt.rni.sat.u8.f32 in the CUDA
 // backend's pack_u8x4.
+//
+// Written as `fminf(255, fmaxf(0, rintf(p)))` because that is what the ISA says
+// it has to be, and both halves of that are load-bearing in opposite ways. An
+// attempt to fold the rint away -- reasoning that v_cvt_u32_f32 already rounds to
+// nearest even, clamps negatives to zero, saturates above UINT_MAX and maps NaN to
+// zero, so the float-domain rint and both clamps would be the same answers
+// recomputed -- measured faster and failed tests/test_int8_attention.py's
+// nonpositive-scale tolerance at NRMSE 0.0317 against a 0.03 bound. It turned out
+// to buy nothing at all, for the reason below.
+//
+// Half of that reasoning is right and half is wrong, and the ISA settles which:
+//   * the two clamps **are** free. The generated loop carries no v_med3_f32 for
+//     them at all -- the compiler folds fmaxf(0,·) and fminf(255,·) into the
+//     convert's own saturation, so this expression is already two instructions,
+//     v_rndne_f32 and v_cvt_u32_f32, and there is nothing to remove.
+//   * the rint is **not** free. v_cvt_u32_f32 truncates toward zero; it does not
+//     round to nearest even. Casting 0.6, 1.5 and 254.6 gives 0, 1 and 254 where
+//     rintf gives 1, 2 and 255. The dropped rint biases every probability
+//     downward by up to 1/255, which is exactly the small systematic drift that
+//     took NRMSE from just under 0.03 to 0.0317.
+//
+// The gfx12 path below does get to use the native cvt_pk_u8_f32, whose comment
+// says the same thing is redundant there -- because that instruction really does
+// round to nearest even and saturate. It does not exist on gfx11. Worth knowing
+// before touching this again: the ISA for the two targets differs in a way the
+// shared spelling hides.
 __forceinline__ __device__ uint32_t prob_to_u8(float p) {
     return static_cast<uint32_t>(fminf(255.0f, fmaxf(0.0f, rintf(p))));
 }

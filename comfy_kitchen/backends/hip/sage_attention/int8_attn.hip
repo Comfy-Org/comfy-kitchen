@@ -22,29 +22,51 @@
 // ---------------------------------------------------------------------------
 // With no usable profiler on Windows and no counters on this iGPU, the generated
 // code is the instrument. Counting the innermost key loop out of
-// `--cuda-device-only -S`, for HD=128 / MaskMode::kNone / CTA_K=64:
+// `--cuda-device-only -S`, for HD=128 / MaskMode::kNone / CTA_K=64, in **disjoint**
+// buckets (the first pass at this overlapped -- `v_int` and `f32` both matched
+// v_mul_f32 -- and double-counted the float column into a bigger headline than the
+// data supports):
 //
-//   loop instructions 2730, of which
-//     v_wmma_i32_16x16x16_iu8  128   -> 4.7% matrix density
-//     ds_load_b128            128
-//     s_waitcnt               174
-//     v_mul_f32               233   v_sub_f32 197   v_fmac_f32 132
-//     v_cndmask_b32            83   v_exp_f32    68   v_rndne_f32 64
+//   loop instructions 2379, of which
+//     v_wmma_i32_16x16x16_iu8  128  -> 4.7% matrix density
+//     softmax-ish             1066  -> 44.8%   (exp2, cvt, f32, mov)
+//     s_waitcnt + s_delay_alu  296  -> 12.4%
+//     integer                   580  -> 24.4%
+//     ds_load_b128 / global     214
 //
 // **The kernel is softmax-bound, not matrix-bound.** Cross-check: at S=4138 the
 // loop count works out to ~7.2e10 thread-instructions, and 6 CU x 4 SIMD x 32
-// lanes at ~2.9 GHz issues ~2.2e12/s -- 33 ms against the 45.5 ms measured. The
-// gap between those two numbers is the whole story: the kernel is within ~1.4x of
-// its own issue limit while spending 95% of its slots on scalar float work.
+// lanes at ~2.9 GHz issues ~2.2e12/s -- 33 ms against the 45.5 ms then measured.
+// The gap between those two numbers is the whole story: the kernel is within ~1.4x
+// of its own issue limit while spending under a twentieth of its slots on the
+// matrix.
 //
-// The cost is per *output element*, and it is set by head_dim, not by the key
-// tile: each lane holds a DT x 8 accumulator with DT = HD/16 = 8, and every key
-// tile does 8 x 8 = 64 `__int_as_float` + 64 `fmaf` to fold the INT32 partial into
-// the running output. CTA_K does not change that count, it only divides how many
-// times it happens -- which is why the wider key tile helps the *ratio* (14.1
+// The cost is per *probability*, and it is set by head_dim, not by the key tile:
+// a lane holds a DT x 8 accumulator with DT = HD/16 = 8, so every key tile does
+// 8 x 8 = 64 conversions and 64 FMAs to fold the INT32 partial into the running
+// output. CTA_K does not change that count, it only divides how many times it
+// happens -- which is why the wider key tile improves the *ratio* (14.1
 // instructions per WMMA at CTA_K=128 against 21.3 here) and still loses: its LDS
 // footprint of 36,864 B drops resident blocks per CU from 3 to 1, and 280
 // s_waitcnt per 256 WMMA is not worth one block's worth of concurrency.
+//
+// **What that buys.** If the loop is issue-bound, removing an instruction from it
+// removes it everywhere, and the one place where a whole block of them was
+// removable turned out to be the probability *sum*, not the quantize: the tile's
+// denominator was accumulating eight float bytes per step, a convert and an add
+// each, where sad_u8 does two integer adds and one convert at the end. Exact
+// either way -- the bytes are integers in [0, 255] and 255 * 8 = 2040 never leaves
+// f32's range. In the ISA: v_cvt_f32_u32 38 -> 2 and v_add_f32 47 -> 4 against
+// v_sad_u8 0 -> 16, so the innermost loop goes 2379 -> 2340 instructions and the
+// matrix density 5.4% -> 5.5%. Worth 2.3-2.7% on this kernel at Krea2's three
+// sequence lengths (45.53 -> 44.34 ms at S=4138, 95.30 -> 92.69 at 6186,
+// 206.87 -> 202.15 at 9258), which is under half a percent of a Krea2 step but
+// more of one for the attention-heavier checkpoints.
+//
+// The quantize next to it looks like the same kind of win and is not: prob_to_u8
+// already compiles to two instructions, because the compiler folds both float
+// clamps into the convert's saturation. See the note there -- the rint in that
+// expression is load-bearing, and taking it out is faster and wrong.
 //
 // So the remaining ~1.3x here is **algorithmic, not a tuning knob**: a blocked
 // online softmax that rescales on a schedule rather than every tile, or an
@@ -866,7 +888,8 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
 #if defined(COMFY_MMA_GFX12)
             uint32_t tile_sum_u32 = 0;
 #else
-            float tile_sum = 0.0f;
+            // Integer sum of the quantized bytes, converted to float once per tile.
+            uint32_t tile_sum_u8 = 0;
 #endif
 #pragma unroll
             for (int fk = 0; fk < KT; ++fk) {
@@ -904,13 +927,28 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                     // the PV product and tile_sum alone. That is what the sentinel buys.
                     packed[e] = prob_to_u8(p);
                     // Normalize with the same quantized probabilities the PV matmul
-                    // consumes, the way the gfx12 path below does with sad_u8.
-                    // Summing the float p instead leaves the numerator rounded to
-                    // U8 and the denominator not, so even a row whose values are all
-                    // equal comes out a few 1e-4 low instead of exactly right.
-                    tile_sum += static_cast<float>(packed[e]);
+                    // consumes. Summing the float p instead leaves the numerator
+                    // rounded to U8 and the denominator not, so even a row whose
+                    // values are all equal comes out a few 1e-4 low instead of
+                    // exactly right. The bytes are summed once per tile below, in
+                    // integer.
 #endif
                 }
+#if !defined(COMFY_MMA_GFX12)
+                // The same eight bytes pack_prob_frag assembles below, summed in
+                // integer rather than through float: a convert and an add per
+                // element become two integer adds and one convert per tile. Exact
+                // either way -- the bytes are integers in [0, 255], so the total
+                // never leaves f32's 24-bit range (255 * 8 = 2040).
+                tile_sum_u8 = __builtin_amdgcn_sad_u8(
+                    packed[4] | (packed[5] << 8) | (packed[6] << 16) |
+                        (packed[7] << 24),
+                    0,
+                    __builtin_amdgcn_sad_u8(
+                        packed[0] | (packed[1] << 8) | (packed[2] << 16) |
+                            (packed[3] << 24),
+                        0, tile_sum_u8));
+#endif
 #if defined(COMFY_MMA_GFX12)
                 p_frag[fk] =
                     MmaInt8::Frag{static_cast<int>(packed_lo), static_cast<int>(packed_hi)};
@@ -924,6 +962,8 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
             }
 #if defined(COMFY_MMA_GFX12)
             const float tile_sum = static_cast<float>(tile_sum_u32);
+#else
+            const float tile_sum = static_cast<float>(tile_sum_u8);
 #endif
             d_run[fq] += tile_sum * tile_scale;
 
