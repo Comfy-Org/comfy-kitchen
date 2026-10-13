@@ -26,6 +26,10 @@ from .base import (
     dequantize_args,
     register_layout_op,
 )
+from .w4a8_packed import (
+    _mma_bits,
+    unpack_w4a8_mma_weight,
+)
 
 
 def quantize_w4a8_int8_weight(
@@ -109,6 +113,7 @@ def w4a8_int8_linear(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
+    mma_packed: bool = False,
     input_act: str | None = None,
     input_act_weight: torch.Tensor | None = None,
     input_act_eps: float = 0.0,
@@ -139,7 +144,8 @@ def w4a8_int8_linear(
         "residual": residual,
         "residual_scale": residual_scale,
     }
-    impl = registry.get_implementation("w4a8_int8_linear", kwargs=kwargs)
+    operation = "w4a8_packed_linear" if mma_packed else "w4a8_int8_linear"
+    impl = registry.get_implementation(operation, kwargs=kwargs)
     return impl(**kwargs)
 
 
@@ -157,6 +163,8 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         codebook: torch.Tensor | None = None
         group_size: int = 16
         convrot_groupsize: int = 256
+        # Packed qdata interleaves codes and group scales; scale is then empty.
+        mma_packed: bool = False
         transposed: bool = False
 
         def _tensor_fields(self) -> list[str]:
@@ -186,7 +194,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
                     f"and divide 16 or be a multiple of 16"
                 )
             groups = k // self.group_size
-            expected_scale_shape = (n, groups)
+            expected_scale_shape = (0,) if self.mma_packed else (n, groups)
             if tuple(self.scale.shape) != expected_scale_shape:
                 raise ValueError(
                     f"scale must have shape {expected_scale_shape}, got {tuple(self.scale.shape)}"
@@ -244,9 +252,13 @@ class AsymW4A8Int8Layout(QuantizedLayout):
 
     @classmethod
     def dequantize(cls, qdata: torch.Tensor, params: Params) -> torch.Tensor:
+        s_rel = params.scale
+        if params.mma_packed:
+            n, k = params.orig_shape[::-1] if params.transposed else params.orig_shape
+            qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, k)
         return dequantize_w4a8_int8_weight(
             qdata,
-            params.scale,
+            s_rel,
             params.s_channel,
             codebook=params.codebook,
             correction=params.correction,
@@ -286,13 +298,15 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         return w4a8_int8_linear(
             x, qdata, s_rel, s_channel, codebook=codebook, correction=correction, bias=bias,
             group_size=params.group_size, convrot_groupsize=params.convrot_groupsize,
-            out_dtype=params.orig_dtype,
+            out_dtype=params.orig_dtype, mma_packed=params.mma_packed,
             input_act=input_act, input_act_weight=input_act_weight, input_act_eps=input_act_eps,
             residual=residual, residual_scale=residual_scale,
         )
 
     @classmethod
     def state_dict_tensors(cls, qdata: torch.Tensor, params: Params) -> dict[str, torch.Tensor]:
+        if params.mma_packed:
+            raise ValueError("GEMV-optimized weights are resident-only; save the canonical layout")
         out = {
             "": qdata,
             "_s_rel": params.scale,
@@ -310,6 +324,9 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         from comfy_kitchen.backends.eager.w4a8_int8 import _w4a8_geometry
 
         params = qtensor._params
+        if params.mma_packed:
+            n, k = params.orig_shape
+            return _mma_bits(qtensor._qdata.numel(), n, k)
         return _w4a8_geometry(qtensor._qdata, params.scale, params.group_size)[2]
 
     @classmethod
@@ -357,6 +374,7 @@ def _w4a8_int8_forward(
         group_size=params.group_size,
         convrot_groupsize=params.convrot_groupsize,
         out_dtype=out_dtype,
+        mma_packed=params.mma_packed,
     )
 
 

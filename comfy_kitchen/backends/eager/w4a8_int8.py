@@ -13,7 +13,7 @@ from __future__ import annotations
 import torch
 
 from comfy_kitchen.backends._activations import apply_input_act, apply_residual
-from comfy_kitchen.tensor.w4a8_packed import _FIXED_LUT, _pack_codes, _unpack_codes
+from comfy_kitchen.tensor.w4a8_packed import _FIXED_LUT, _pack_codes, _unpack_codes, unpack_w4a8_mma_weight
 
 from .quantization import int8_linear, rotate_int8_convrot_weight
 
@@ -693,4 +693,30 @@ def w4a8_int8_linear(
         out_dtype=out_dtype,
         convrot=True,
         convrot_groupsize=convrot_groupsize,
+    )
+
+
+def w4a8_packed_linear(
+    x: torch.Tensor,
+    qdata: torch.Tensor,
+    s_rel: torch.Tensor,
+    s_channel: torch.Tensor,
+    codebook: torch.Tensor | None = None,
+    correction: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    group_size: int = 16,
+    convrot_groupsize: int = 256,
+    out_dtype: torch.dtype = torch.bfloat16,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Portable fallback for resident packed weights."""
+    x = apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    qdata, s_rel = unpack_w4a8_mma_weight(qdata, s_channel.numel(), x.shape[-1])
+    return w4a8_int8_linear(
+        x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
+        convrot_groupsize, out_dtype, residual=residual, residual_scale=residual_scale,
     )

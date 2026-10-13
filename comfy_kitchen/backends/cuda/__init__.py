@@ -65,6 +65,7 @@ __all__ = [
     "fp16_linear",
     "int8_linear",
     "w4a8_int8_linear",
+    "w4a8_packed_linear",
     "int4_linear",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
@@ -207,6 +208,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
+from comfy_kitchen.tensor.w4a8_packed import _FIXED_LUT, _mma_bits, w4a8_mma_record_bytes  # noqa: E402
 from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     w4a8_int8_linear as eager_w4a8_int8_linear,
 )
@@ -220,6 +222,7 @@ from comfy_kitchen.constraints import (  # noqa: E402
     na3d_common_call_rule,
     sol_attn_common_call_rule,
     with_out_param,
+    with_w4a8_packed_storage,
 )
 from comfy_kitchen.float_utils import roundup  # noqa: E402
 from comfy_kitchen.registry import registry  # noqa: E402
@@ -244,6 +247,29 @@ _FORCE_INT4_INT8_FALLBACK = os.environ.get("COMFY_KITCHEN_FORCE_INT4_INT8_FALLBA
 _INT4_PACKED_WEIGHT_SMALL_M_MAX = 8
 _INT4_INT8_WEIGHT_CHUNK_N = max(1, int(os.environ.get("COMFY_KITCHEN_INT4_INT8_WEIGHT_CHUNK_N", "4096")))
 _W4A8_CHUNKED = os.environ.get("COMFY_KITCHEN_W4A8_CHUNKED", "1") != "0"
+_W4A8_FIXED_DECODE_LUTS: dict[torch.device, torch.Tensor] = {}
+
+
+def _w4a8_fixed_decode_lut(device: torch.device) -> torch.Tensor:
+    if (decode_lut := _W4A8_FIXED_DECODE_LUTS.get(device)) is None:
+        codebook = torch.tensor(_FIXED_LUT, dtype=torch.float32)
+        scales = torch.arange(256, dtype=torch.uint8)
+        scales = scales.view(torch.float8_e4m3fn).float()
+        table = (
+            (scales[:, None] * codebook[None, :])
+            .round_()
+            .clamp_(-127, 127)
+            .to(torch.int8)
+            .contiguous()
+        )
+        # The immutable table outlives each capture; finish its copy before another
+        # stream can read it, and keep it outside execution-scoped allocations.
+        with allocation_context():
+            decode_lut = table.to(device)
+        _W4A8_FIXED_DECODE_LUTS[device] = decode_lut
+    return decode_lut
+
+
 _NVIDIA_16_SERIES = (
     "1660",
     "1650",
@@ -2024,6 +2050,51 @@ def fp16_linear(
     return out if len(orig_shape) == 2 else out.reshape(*orig_shape[:-1], n)
 
 
+def _w4a8_cluster_quantizer_ok(k: int, device: torch.device) -> bool:
+    """Whether the single-launch ConvRot quantizer of the streamed W4A8 decode (sm_90
+    clusters, at most four passes of 8 x 8 groups) covers a K-wide row."""
+    return (
+        device.type == "cuda"
+        and k % 256 == 0
+        and k <= 256 * 8 * 8 * 4
+        and _cuda_device_capability(device.index)[0] >= 9
+    )
+
+
+def _w4a8_mma_linear(
+    x_2d, rotated, partial_absmax, xq, xs,
+    qdata, s_channel, bias_float, out,
+    convrot_groupsize, group_size, output_dtype_code, stream_ptr,
+):
+    """Quantize x_2d and run the streamed MMA GEMM into out."""
+    m, n = out.shape
+    # Call-local split-K sums and counters also isolate independently replayed graphs.
+    scratch = torch.zeros(m * n + n // 16, dtype=torch.int32, device=out.device)
+    workspace, counters = scratch[:m * n].view(m, n), scratch[m * n:]
+    bits = _mma_bits(qdata.numel(), n, xq.shape[1])
+    decode_lut = _w4a8_fixed_decode_lut(qdata.device) if bits == 4 else None
+    used = _C.w4a8_codebook_mma_linear(
+        _wrap_for_dlpack(x_2d),
+        _wrap_for_dlpack(rotated) if rotated is not None else None,
+        _wrap_for_dlpack(partial_absmax) if partial_absmax is not None else None,
+        _wrap_for_dlpack(xq),
+        _wrap_for_dlpack(qdata),
+        _wrap_for_dlpack(decode_lut) if decode_lut is not None else None,
+        _wrap_for_dlpack(s_channel),
+        _wrap_for_dlpack(xs),
+        _wrap_for_dlpack(bias_float) if bias_float is not None else None,
+        _wrap_for_dlpack(workspace),
+        _wrap_for_dlpack(counters),
+        _wrap_for_dlpack(out),
+        convrot_groupsize,
+        group_size,
+        output_dtype_code,
+        stream_ptr,
+    )
+    if not used:
+        raise RuntimeError("MMA-packed W4A8 weight is unsupported on this device")
+
+
 def _act_weight_arg(input_act, input_act_weight, device, dtype: torch.dtype) -> torch.Tensor:
     """The fused quantizer's act-weight operand: the norm weight for acts
     that carry one, the empty placeholder otherwise."""
@@ -2477,7 +2548,7 @@ def w4a8_int8_linear(
     if chunked:
         used, xq, xs = _w4a8_linear_chunked(
             x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
-            convrot_groupsize, group_size,
+            convrot_groupsize, group_size, False,
         )
         if used:
             return out.reshape(*x.shape[:-1], n)
@@ -2525,10 +2596,85 @@ def w4a8_int8_linear(
     return out.reshape(*x.shape[:-1], n)
 
 
+def w4a8_packed_linear(
+    x: torch.Tensor,
+    qdata: torch.Tensor,
+    s_rel: torch.Tensor,
+    s_channel: torch.Tensor,
+    codebook: torch.Tensor | None = None,
+    correction: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    group_size: int = 16,
+    convrot_groupsize: int = 256,
+    out_dtype: torch.dtype = torch.bfloat16,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Resident packed W4A8/W6A8: small-M MMA or direct packed dequantization for prefill."""
+    if residual is not None:
+        if residual_scale is None:
+            raise ValueError("w4a8_int8_linear: residual requires residual_scale")
+        return _apply_residual(
+            w4a8_packed_linear(
+                x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
+                convrot_groupsize, out_dtype, input_act, input_act_weight, input_act_eps,
+            ),
+            residual,
+            residual_scale,
+        )
+    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    n = s_channel.numel()
+    k = x.shape[-1]
+    if (
+        qdata.dim() != 1
+        or qdata.dtype != torch.int8
+        or n % 16
+        or qdata.numel() not in (n * k * w4a8_mma_record_bytes(4) // 512, n * k * w4a8_mma_record_bytes(6) // 512)
+        or s_rel.numel() != 0
+        or group_size != 16
+        or correction is not None
+    ):
+        raise ValueError("invalid MMA-packed W4A8 operands")
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    m = x_2d.shape[0]
+    xq = torch.empty(m, k, dtype=torch.int8, device=x.device)
+    xs = torch.empty(m, 1, dtype=torch.float32, device=x.device)
+    out = torch.empty(m, n, dtype=out_dtype, device=x.device)
+    if m <= 8:
+        # Staged-pair scratch is only needed where the single cluster quantizer
+        # cannot run (pre-sm_90, very wide K).
+        rotated = partial_absmax = None
+        if not _w4a8_cluster_quantizer_ok(k, x.device):
+            rotated = torch.empty_like(x_2d)
+            partial_absmax = torch.empty(
+                m, k // convrot_groupsize, dtype=torch.float32, device=x.device
+            )
+        bias_float = bias.float().contiguous() if bias is not None else None
+        _w4a8_mma_linear(
+            x_2d, rotated, partial_absmax, xq, xs,
+            qdata, s_channel, bias_float, out,
+            convrot_groupsize, group_size, DTYPE_TO_CODE[out_dtype],
+            torch.cuda.current_stream(x.device).cuda_stream,
+        )
+    else:
+        bias_arg = _gemm_vector_arg(bias, x.device, out_dtype) if bias is not None else None
+        used, _, _ = _w4a8_linear_chunked(
+            x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
+            convrot_groupsize, group_size, True,
+        )
+        if not used:
+            raise RuntimeError("Packed W4A8 prefill is unsupported by the INT8 GEMM")
+    return out.reshape(*x.shape[:-1], n)
+
+
 def _w4a8_linear_chunked(
     x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
-    convrot_groupsize, group_size,
+    convrot_groupsize, group_size, mma_packed,
 ):
+    """Shared bounded INT8 GEMM; the native dequantizer reads the selected storage format."""
     m, k = x_2d.shape
     n = s_channel.numel()
     output_dtype_code = DTYPE_TO_CODE[out.dtype]
@@ -2562,6 +2708,7 @@ def _w4a8_linear_chunked(
             chunk_cols,
             output_dtype_code,
             stream_ptr,
+            mma_packed,
         )
         return used, xq, xs
     else:
@@ -2588,6 +2735,7 @@ def _w4a8_linear_chunked(
         chunk_cols,
         output_dtype_code,
         stream_ptr,
+        mma_packed,
     )
     return used, xq, xs
 
@@ -4574,6 +4722,7 @@ def _build_constraints() -> dict:
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in constraints:
             constraints[name + "_out"] = with_out_param(constraints[name])
+    constraints["w4a8_packed_linear"] = with_w4a8_packed_storage(constraints["w4a8_int8_linear"])
     return constraints
 
 

@@ -14,6 +14,11 @@ _FIXED_LUT = (
 )
 
 
+def default_w4a8_codebook() -> torch.Tensor:
+    """The frozen Lloyd-Max codebook (the CUDA streamed decode kernel's built-in LUT)."""
+    return torch.tensor(_FIXED_LUT, dtype=torch.float32)
+
+
 def _pack_codes(unsigned: torch.Tensor, bits: int) -> torch.Tensor:
     """Pack unsigned int32 codes [N, K] into the int8 storage contract: a K/2-byte nibble
     plane (even col = low nibble), followed at 6 bits by a K/4-byte plane of each code's
@@ -41,3 +46,66 @@ def _unpack_codes(qdata: torch.Tensor, k: int, bits: int) -> torch.Tensor:
         hi = (packed[:, k // 2 :].unsqueeze(-1) >> shifts) & 0x3
         codes |= hi.reshape(n, k) << 4
     return codes
+
+
+def w4a8_mma_record_bytes(bits: int) -> int:
+    """Bytes per 16-output x 32-K record: 512 codes plus 32 fp8 scale bytes (288 / 416)."""
+    return 512 * bits // 8 + 32
+
+
+def _mma_bits(packed_numel: int, n: int, k: int) -> int:
+    for bits in (4, 6):
+        if packed_numel == n * k * w4a8_mma_record_bytes(bits) // 512:
+            return bits
+    raise ValueError(f"MMA packed weight must be a contiguous int8 [{n * k * 9 // 16}] or [{n * k * 13 // 16}] tensor")
+
+
+def _fragment_major_inverse(fragments: torch.Tensor, cols: int) -> torch.Tensor:
+    tiles, k_rows = fragments.shape[:2]
+    half = cols // 2
+    codes = torch.empty((tiles, k_rows, 16, cols), dtype=fragments.dtype, device=fragments.device)
+    codes[:, :, :8, :half] = fragments[:, :, :, :, 0, :].reshape(tiles, k_rows, 8, half)
+    codes[:, :, 8:, :half] = fragments[:, :, :, :, 1, :].reshape(tiles, k_rows, 8, half)
+    codes[:, :, :8, half:] = fragments[:, :, :, :, 2, :].reshape(tiles, k_rows, 8, half)
+    codes[:, :, 8:, half:] = fragments[:, :, :, :, 3, :].reshape(tiles, k_rows, 8, half)
+    return codes
+
+
+def unpack_w4a8_mma_weight(
+    packed: torch.Tensor,
+    n: int,
+    k: int,
+    scale_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Recover canonical codes/scales for explicit dequantization and eager fallback."""
+    if packed.dim() != 1 or packed.dtype != torch.int8 or not packed.is_contiguous():
+        raise ValueError("MMA packed weight must be a contiguous 1D int8 tensor")
+    if n % 16 != 0 or k % 256 != 0:
+        raise ValueError("MMA packed weight requires N % 16 == 0 and K % 256 == 0")
+    bits = _mma_bits(packed.numel(), n, k)
+    record_bytes = w4a8_mma_record_bytes(bits)
+    tiles, k_rows = n // 16, k // 32
+    records = packed.view(torch.uint8).view(tiles, k_rows, record_bytes)
+    code_bytes = record_bytes - 32
+    if bits == 4:
+        fragments = records[:, :, :code_bytes].view(tiles, k_rows, 8, 4, 4, 2)
+        qdata = _fragment_major_inverse(fragments, 16).permute(0, 2, 1, 3).reshape(n, k // 2)
+    else:
+        lane_bytes = torch.cat(
+            (records[:, :, :256].reshape(tiles, k_rows, 32, 8), records[:, :, 256:code_bytes].reshape(tiles, k_rows, 32, 4)),
+            dim=3,
+        ).to(torch.int32).view(tiles, k_rows, 8, 4, 4, 3)
+        words = lane_bytes[..., 0] | lane_bytes[..., 1] << 8 | lane_bytes[..., 2] << 16
+        shifts = torch.tensor([0, 6, 12, 18], device=packed.device, dtype=torch.int32)
+        fragments = (words.unsqueeze(-1) >> shifts) & 0x3F
+        codes = _fragment_major_inverse(fragments, 32).permute(0, 2, 1, 3).reshape(n, k)
+        qdata = _pack_codes(codes, bits).view(torch.uint8)
+
+    scale_fragments = records[:, :, code_bytes:].view(tiles, k_rows, 8, 4)
+    scale_tiles = torch.empty((tiles, k_rows, 16, 2), dtype=torch.uint8, device=packed.device)
+    scale_tiles[:, :, :8, 0] = scale_fragments[:, :, :, 0]
+    scale_tiles[:, :, 8:, 0] = scale_fragments[:, :, :, 1]
+    scale_tiles[:, :, :8, 1] = scale_fragments[:, :, :, 2]
+    scale_tiles[:, :, 8:, 1] = scale_fragments[:, :, :, 3]
+    scales = scale_tiles.permute(0, 2, 1, 3).reshape(n, k // 16)
+    return qdata.view(torch.int8), scales.view(scale_dtype)
