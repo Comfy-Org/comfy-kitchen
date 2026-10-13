@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import torch
 
+from comfy_kitchen.backends._activations import apply_input_act, apply_residual
+
 from .quantization import int8_linear, rotate_int8_convrot_weight
 
 # Lloyd-Max-optimal 16 levels for a group-normalized Gaussian. ConvRot makes every layer's
@@ -667,8 +669,24 @@ def w4a8_int8_linear(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute x @ W.T + bias using portable W4A8 operations."""
+    """Compute x @ W.T + bias (then residual + residual_scale * that) using portable W4A8 operations."""
+    if residual is not None:
+        return apply_residual(
+            w4a8_int8_linear(
+                x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
+                convrot_groupsize, out_dtype, input_act, input_act_weight,
+                input_act_eps,
+            ),
+            residual,
+            residual_scale,
+        )
+    x = apply_input_act(x, input_act, input_act_weight, input_act_eps)
     _n, k, _bits = validate_w4a8_operands(
         qdata,
         s_rel,

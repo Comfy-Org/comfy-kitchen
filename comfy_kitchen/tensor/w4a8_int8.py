@@ -109,8 +109,19 @@ def w4a8_int8_linear(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute ``x @ W.T + bias`` with the selected W4A8 backend."""
+    """Compute ``x @ W.T + bias`` with the selected W4A8 backend.
+
+    input_act ("swiglu" or "rms_norm", with input_act_weight/input_act_eps for the
+    norm) is applied eagerly before activation quantization. residual/residual_scale
+    make the result ``residual + residual_scale * (x @ W.T + bias)``, with the
+    linear rounded to out_dtype first.
+    """
     kwargs = {
         "x": x,
         "qdata": qdata,
@@ -122,6 +133,11 @@ def w4a8_int8_linear(
         "group_size": group_size,
         "convrot_groupsize": convrot_groupsize,
         "out_dtype": out_dtype,
+        "input_act": input_act,
+        "input_act_weight": input_act_weight,
+        "input_act_eps": input_act_eps,
+        "residual": residual,
+        "residual_scale": residual_scale,
     }
     impl = registry.get_implementation("w4a8_int8_linear", kwargs=kwargs)
     return impl(**kwargs)
@@ -257,6 +273,22 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             params.s_channel,
             params.correction,
             params.codebook,
+        )
+
+    @classmethod
+    def linear_input_act(cls, weight: QuantizedTensor, x: torch.Tensor, bias=None,
+                         input_act=None, input_act_weight=None, input_act_eps=0.0,
+                         residual=None, residual_scale=None):
+        params = weight._params
+        if params.transposed:
+            return NotImplemented
+        qdata, s_rel, s_channel, correction, codebook = cls.get_plain_tensors(weight)
+        return w4a8_int8_linear(
+            x, qdata, s_rel, s_channel, codebook=codebook, correction=correction, bias=bias,
+            group_size=params.group_size, convrot_groupsize=params.convrot_groupsize,
+            out_dtype=params.orig_dtype,
+            input_act=input_act, input_act_weight=input_act_weight, input_act_eps=input_act_eps,
+            residual=residual, residual_scale=residual_scale,
         )
 
     @classmethod
