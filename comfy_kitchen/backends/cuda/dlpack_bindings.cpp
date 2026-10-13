@@ -2130,6 +2130,7 @@ extern "C" {
         int64_t G,
         int64_t chunk_cols,
         int64_t bits,
+        bool mma_packed,
         int out_dtype_code,
         cudaStream_t stream);
 
@@ -3179,27 +3180,41 @@ bool quantize_wxa8_convrot_fused(
 }
 
 // Returns the code width (4 or 6) implied by the packed weight row.
+template <typename Weight, typename Scales>
 static int64_t validate_w4a8_codebook_gemm_contract(
     int64_t M, int64_t N, int64_t K,
-    int64_t weight_cols,
-    int64_t s_rel_n, int64_t s_rel_groups,
+    const Weight& weight, const Scales& s_rel,
     int64_t s_channel_size, int64_t xs_size,
     int64_t codebook_size, int64_t bias_size, int bias_dtype_code,
     int64_t workspace_rows, int64_t workspace_cols,
     int64_t out_rows, int64_t out_cols,
     const nb::dlpack::dtype& out_dtype,
-    int64_t G, int64_t chunk_cols, int out_dtype_code) {
-    const int64_t bits = w4a8_bits_from_width(weight_cols, K, G, codebook_size >= 0, "w4a8_codebook_gemm");
+    int64_t G, int64_t chunk_cols, int out_dtype_code, bool mma_packed) {
     if (K % 16 != 0)
         throw std::runtime_error("w4a8_codebook_gemm: K must be a multiple of 16");
     if (G < 4 || (16 % G != 0 && G % 16 != 0))
         throw std::runtime_error("w4a8_codebook_gemm: G must be >=4 and divide 16 or be a multiple of 16");
+    int64_t bits;
+    if (mma_packed) {
+        if (N <= 0 || N % 16 || K <= 0 || K % 256 || G != 16
+                || weight.ndim() != 1 || weight.stride(0) != 1 || s_rel.size() != 0)
+            throw std::runtime_error("w4a8_codebook_gemm: invalid packed storage geometry");
+        bits = weight.size() == N * K * 9 / 16 ? 4 : (weight.size() == N * K * 13 / 16 ? 6 : 0);
+        if (!bits)
+            throw std::runtime_error("w4a8_codebook_gemm: invalid packed weight size");
+    } else {
+        if (weight.ndim() != 2 || weight.shape(0) != N || s_rel.ndim() != 2
+                || weight.stride(1) != 1 || weight.stride(0) != weight.shape(1)
+                || s_rel.stride(1) != 1 || s_rel.stride(0) != s_rel.shape(1))
+            throw std::runtime_error("w4a8_codebook_gemm: canonical weight and scales must be contiguous matrices");
+        bits = w4a8_bits_from_width(weight.shape(1), K, G, codebook_size >= 0, "w4a8_codebook_gemm");
+        if (s_rel.shape(0) != N || s_rel.shape(1) != K / G)
+            throw std::runtime_error("w4a8_codebook_gemm: s_rel must be [N, K/G]");
+    }
     if (K % G != 0)
         throw std::runtime_error("w4a8_codebook_gemm: K must be divisible by G");
     if (xs_size != M)
         throw std::runtime_error("w4a8_codebook_gemm: xs must have M values");
-    if (s_rel_n != N || s_rel_groups != K / G)
-        throw std::runtime_error("w4a8_codebook_gemm: s_rel must be [N, K/G]");
     if (s_channel_size != N)
         throw std::runtime_error("w4a8_codebook_gemm: s_channel must be [N]");
     if (codebook_size >= 0 && codebook_size != 16)
@@ -3224,35 +3239,33 @@ static int64_t validate_w4a8_codebook_gemm_contract(
 // Chunked fused W4A8: per-chunk (codebook+s_rel) dequant -> L2-hot int8 -> strided int8 GEMM.
 bool w4a8_codebook_gemm_chunked(
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> xq,        // [M, K] int8 act
-    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> weight,    // [N, K/2] packed uint4
-    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> s_rel,    // [N, K/G] e4m3 bits
+    nb::ndarray<int8_t, nb::device::cuda> weight,                // canonical or record stream
+    nb::ndarray<uint8_t, nb::device::cuda> s_rel,                // [N, K/G] or empty
     std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> codebook,  // [16] or None
     nb::ndarray<float, nb::ndim<1>, nb::device::cuda> s_channel,  // [N] fp32
     nb::ndarray<float, nb::ndim<1>, nb::device::cuda> xs,         // [M] fp32
     std::optional<nb::ndarray<nb::ndim<1>, nb::device::cuda>> bias,  // [N] in out_dtype, or None
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> workspace, // [chunk_cols, K] int8
     nb::ndarray<nb::ndim<2>, nb::device::cuda> out,               // [M, N] out_dtype
-    int64_t G, int64_t chunk_cols, int out_dtype_code, uintptr_t stream_ptr) {
+    int64_t G, int64_t chunk_cols, int out_dtype_code, uintptr_t stream_ptr, bool mma_packed) {
     const int64_t M = xq.shape(0);
     const int64_t K = xq.shape(1);
-    const int64_t N = weight.shape(0);
+    const int64_t N = s_channel.size();
     const int64_t bits = validate_w4a8_codebook_gemm_contract(
-        M, N, K,
-        weight.shape(1),
-        s_rel.shape(0), s_rel.shape(1),
+        M, N, K, weight, s_rel,
         s_channel.size(), xs.size(),
         codebook.has_value() ? static_cast<int64_t>(codebook->size()) : -1,
         bias.has_value() ? static_cast<int64_t>(bias->size()) : -1,
         bias.has_value() ? map_dtype_to_code(bias->dtype()) : out_dtype_code,
         workspace.shape(0), workspace.shape(1),
         out.shape(0), out.shape(1), out.dtype(),
-        G, chunk_cols, out_dtype_code);
+        G, chunk_cols, out_dtype_code, mma_packed);
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const void* cb = codebook.has_value() ? codebook->data() : nullptr;
     const void* bs = bias.has_value() ? bias->data() : nullptr;
     return launch_w4a8_codebook_gemm_chunked(
         xq.data(), weight.data(), s_rel.data(), cb, s_channel.data(), xs.data(), bs,
-        workspace.data(), out.data(), M, N, K, G, chunk_cols, bits, out_dtype_code, stream);
+        workspace.data(), out.data(), M, N, K, G, chunk_cols, bits, mma_packed, out_dtype_code, stream);
 }
 
 // Common W4A8 inference path: online ConvRot activation quantization followed by the
@@ -3261,18 +3274,18 @@ bool w4a8_codebook_linear_chunked(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> input,             // [M, K] fp32/fp16/bf16
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> xq,       // [M, K]
     nb::ndarray<float, nb::ndim<2>, nb::device::cuda> xs,        // [M, 1]
-    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> weight,   // [N, K/2]
-    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> s_rel,   // [N, K/G]
+    nb::ndarray<int8_t, nb::device::cuda> weight,              // canonical or record stream
+    nb::ndarray<uint8_t, nb::device::cuda> s_rel,              // [N, K/G] or empty
     std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> codebook,
     nb::ndarray<float, nb::ndim<1>, nb::device::cuda> s_channel, // [N]
     std::optional<nb::ndarray<nb::ndim<1>, nb::device::cuda>> bias,  // [N] in out_dtype, or None
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> workspace,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> out,
     int64_t convrot_group_size, int64_t G, int64_t chunk_cols,
-    int out_dtype_code, uintptr_t stream_ptr) {
+    int out_dtype_code, uintptr_t stream_ptr, bool mma_packed) {
     const int64_t M = input.shape(0);
     const int64_t K = input.shape(1);
-    const int64_t N = weight.shape(0);
+    const int64_t N = s_channel.size();
     if (xq.shape(0) != M || xq.shape(1) != K)
         throw std::runtime_error("w4a8_codebook_linear: xq must be [M, K]");
     if (xs.shape(0) != M || xs.shape(1) != 1)
@@ -3281,9 +3294,7 @@ bool w4a8_codebook_linear_chunked(
             || xq.stride(1) != 1 || xq.stride(0) != K
             || xs.stride(1) != 1 || xs.stride(0) != 1)
         throw std::runtime_error("w4a8_codebook_linear: input, xq, and xs must be contiguous");
-    if (weight.stride(1) != 1 || weight.stride(0) != weight.shape(1)
-            || s_rel.stride(1) != 1 || s_rel.stride(0) != s_rel.shape(1)
-            || s_channel.stride(0) != 1
+    if (s_channel.stride(0) != 1
             || workspace.stride(1) != 1 || workspace.stride(0) != workspace.shape(1)
             || out.stride(1) != 1 || out.stride(0) != out.shape(1)
             || (codebook.has_value() && codebook->stride(0) != 1)
@@ -3293,16 +3304,14 @@ bool w4a8_codebook_linear_chunked(
     if (input_dtype_code < 0 || input_dtype_code > 2)
         throw std::runtime_error("w4a8_codebook_linear: input must be fp32, fp16, or bf16");
     const int64_t bits = validate_w4a8_codebook_gemm_contract(
-        M, N, K,
-        weight.shape(1),
-        s_rel.shape(0), s_rel.shape(1),
+        M, N, K, weight, s_rel,
         s_channel.size(), xs.size(),
         codebook.has_value() ? static_cast<int64_t>(codebook->size()) : -1,
         bias.has_value() ? static_cast<int64_t>(bias->size()) : -1,
         bias.has_value() ? map_dtype_to_code(bias->dtype()) : out_dtype_code,
         workspace.shape(0), workspace.shape(1),
         out.shape(0), out.shape(1), out.dtype(),
-        G, chunk_cols, out_dtype_code);
+        G, chunk_cols, out_dtype_code, mma_packed);
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_quantize_int8_rowwise_convrot_kernel(
@@ -3313,7 +3322,7 @@ bool w4a8_codebook_linear_chunked(
     const void* bs = bias.has_value() ? bias->data() : nullptr;
     return launch_w4a8_codebook_gemm_chunked(
         xq.data(), weight.data(), s_rel.data(), cb, s_channel.data(), xs.data(), bs,
-        workspace.data(), out.data(), M, N, K, G, chunk_cols, bits, out_dtype_code, stream);
+        workspace.data(), out.data(), M, N, K, G, chunk_cols, bits, mma_packed, out_dtype_code, stream);
 }
 
 bool w4a8_codebook_gemv(
@@ -3347,16 +3356,14 @@ bool w4a8_codebook_gemv(
     if (G < 16 || (G % 16) != 0)
         throw std::runtime_error("w4a8_codebook_gemv: G must be a multiple of 16");
     const int64_t bits = validate_w4a8_codebook_gemm_contract(
-        M, N, K,
-        weight.shape(1),
-        s_rel.shape(0), s_rel.shape(1),
+        M, N, K, weight, s_rel,
         s_channel.size(), xs.size(),
         codebook.has_value() ? static_cast<int64_t>(codebook->size()) : -1,
         bias.has_value() ? static_cast<int64_t>(bias->size()) : -1,
         bias.has_value() ? map_dtype_to_code(bias->dtype()) : out_dtype_code,
         /*workspace_rows=*/0, /*workspace_cols=*/0,
         out.shape(0), out.shape(1), out.dtype(),
-        G, /*chunk_cols=*/0, out_dtype_code);
+        G, /*chunk_cols=*/0, out_dtype_code, /*mma_packed=*/false);
     const int input_dtype_code = map_dtype_to_code(input.dtype());
     if (input_dtype_code < 0 || input_dtype_code > 2)
         throw std::runtime_error("w4a8_codebook_gemv: input must be fp32, fp16, or bf16");
@@ -4514,7 +4521,7 @@ NB_MODULE(_C, m) {
           nb::arg("xq"), nb::arg("weight"), nb::arg("s_rel"), nb::arg("codebook").none(),
           nb::arg("s_channel"), nb::arg("xs"), nb::arg("bias").none(), nb::arg("workspace"),
           nb::arg("out"), nb::arg("g"), nb::arg("chunk_cols"), nb::arg("out_dtype_code"),
-          nb::arg("stream_ptr"));
+          nb::arg("stream_ptr"), nb::arg("mma_packed") = false);
 
     m.def("w4a8_codebook_linear_chunked", &w4a8_codebook_linear_chunked,
           "Fused W4A8 inference orchestration: ConvRot activation quantization followed by chunked decode/GEMM",
@@ -4522,7 +4529,7 @@ NB_MODULE(_C, m) {
           nb::arg("s_rel"), nb::arg("codebook").none(), nb::arg("s_channel"),
           nb::arg("bias").none(), nb::arg("workspace"), nb::arg("out"),
           nb::arg("convrot_group_size"), nb::arg("g"), nb::arg("chunk_cols"),
-          nb::arg("out_dtype_code"), nb::arg("stream_ptr"));
+          nb::arg("out_dtype_code"), nb::arg("stream_ptr"), nb::arg("mma_packed") = false);
 
     m.def("w4a8_codebook_gemv", &w4a8_codebook_gemv,
           "Fused W4A8 decode GEMV (M<=8): in-register int4+codebook dequant, no workspace",

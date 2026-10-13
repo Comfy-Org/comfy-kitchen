@@ -165,7 +165,67 @@ void launch_dequant_grouped_to_int8(
             static_cast<const float*>(codebook),
             static_cast<int8_t*>(out), n_vec, Khalf, static_cast<int>(K), static_cast<int>(G));
 }
+// Read record-stream weights directly into one canonical INT8 GEMM chunk.
+// One thread writes a 16-code group; n0/cols may cut across a 16-output record.
+template <int BITS>
+__global__ void dequant_w4a8_mma_chunk_kernel(
+    const uint8_t* __restrict__ packed, const float* __restrict__ codebook,
+    int8_t* __restrict__ out, long n_groups, int n0, int K)
+{
+    const long v = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= n_groups) return;
+    constexpr int kRecordBytes = 512 * BITS / 8 + 32;
+    const int n = n0 + v / (K / 16);
+    const int kg = v % (K / 16), kr = kg / 2;
+    const int h = (n & 15) >> 3, r = n & 7, kh = kg & 1;
+    const long rec = (long)(n / 16) * (K / 32) + kr;
+    const uint8_t* __restrict__ record = packed + rec * kRecordBytes;
+    const float scale = load_scale<uint8_t>(record[512 * BITS / 8 + r * 4 + h + 2 * kh]);
+    uint4 decoded;
+    int8_t* values = reinterpret_cast<int8_t*>(&decoded);
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        const int j = kh * 2 + h;
+        const int lane = r * 4 + g;
+        unsigned codes;
+        if constexpr (BITS == 6) {
+            const uint2 lo = *reinterpret_cast<const uint2*>(record + lane * 8);
+            const unsigned w2 = *reinterpret_cast<const unsigned*>(record + 256 + lane * 4);
+            if (kh == 0)
+                codes = h ? __funnelshift_r(lo.x, lo.y, 24) : lo.x;
+            else
+                codes = h ? (w2 >> 8) : __funnelshift_r(lo.y, w2, 16);
+        } else {
+            codes = *reinterpret_cast<const unsigned short*>(record + lane * 8 + j * 2);
+        }
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const unsigned code = (codes >> (BITS * c)) & ((1u << BITS) - 1);
+            const float level = BITS == 6 ? code_level(code, 32.0f)
+                : (codebook ? codebook[code] : code_level(code, 8.0f));
+            values[g * 4 + c] = level_to_int8(level, scale);
+        }
+    }
+    reinterpret_cast<uint4*>(out)[v] = decoded;
+}
 }  // namespace
+
+static void launch_dequant_w4a8_mma_chunk(
+    const void* packed, const void* codebook, void* out,
+    int64_t n0, int64_t cols, int64_t K, int64_t bits, cudaStream_t stream)
+{
+    const long n_groups = (long)cols * K / 16;
+    const int block = 256;
+    const long grid = (n_groups + block - 1) / block;
+    if (bits == 6)
+        dequant_w4a8_mma_chunk_kernel<6><<<grid, block, 0, stream>>>(
+            static_cast<const uint8_t*>(packed), nullptr, static_cast<int8_t*>(out),
+            n_groups, n0, K);
+    else
+        dequant_w4a8_mma_chunk_kernel<4><<<grid, block, 0, stream>>>(
+            static_cast<const uint8_t*>(packed), static_cast<const float*>(codebook), static_cast<int8_t*>(out),
+            n_groups, n0, K);
+}
 
 // codebook: 16 floats (non-uniform levels) or nullptr for uniform (q-8); ignored at 6 bits.
 extern "C" void launch_dequant_int4_grouped_to_int8(
@@ -205,7 +265,7 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
     void* workspace,       // [chunk_cols, K] int8 scratch (preallocated, reused)
     void* out,             // [M, N] output (out_dtype)
     int64_t M, int64_t N, int64_t K, int64_t G, int64_t chunk_cols, int64_t bits,
-    int out_dtype_code, cudaStream_t stream)
+    bool mma_packed, int out_dtype_code, cudaStream_t stream)
 {
     // A non-positive chunk stride never advances n0 -> would loop forever; a non-positive
     // K/G would divide by zero below. Bail so the caller uses the 2-pass path.
@@ -213,10 +273,14 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
     const int64_t row_bytes = K * bits / 8, KG = K / G, osz = (out_dtype_code == 0) ? 4 : 2;
     for (int64_t n0 = 0; n0 < N; n0 += chunk_cols) {
         const int64_t cols = (chunk_cols < N - n0) ? chunk_cols : (N - n0);
-        launch_dequant_int4_grouped_to_int8_e4m3(
-            static_cast<const int8_t*>(weight) + n0 * row_bytes,
-            static_cast<const uint8_t*>(s_rel) + n0 * KG,
-            codebook, workspace, cols, K, G, bits, stream);
+        if (mma_packed) {
+            launch_dequant_w4a8_mma_chunk(weight, codebook, workspace, n0, cols, K, bits, stream);
+        } else {
+            launch_dequant_int4_grouped_to_int8_e4m3(
+                static_cast<const int8_t*>(weight) + n0 * row_bytes,
+                static_cast<const uint8_t*>(s_rel) + n0 * KG,
+                codebook, workspace, cols, K, G, bits, stream);
+        }
         // bias is in the output dtype (the strided GEMM's contract), so it
         // advances by the same element size as the output.
         const void* bias_chunk = bias ? static_cast<const char*>(bias) + n0 * osz : nullptr;
