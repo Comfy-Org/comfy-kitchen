@@ -914,6 +914,27 @@ void launch_convrot_quant_global_managed(
 
 // Fused single-kernel path: FHT in LDS, vectorized loads, warp-shuffle absmax.
 // One block per row; the rotated row stays in shared memory as RowT.
+//
+// **The LDS round-trip below is worth keeping. PR 183 removes it -- do not.**
+// Measured on gfx1103, M=16384 (benchmark_attn/bench_convrot_split.py, the
+// production swiglu-fused entry, i.e. exactly this kernel):
+//
+//   K=4096    2.394 ms   201 MB moved    84.1 GB/s
+//   K=12288   6.570 ms   604 MB moved    91.9 GB/s
+//
+// The 128x128 GEMM tile on this part is documented at ~100 GB/s (see
+// gemm_wmma.h), so at 92% of that this kernel is **HBM-bandwidth-bound**. Its
+// LDS traffic is a small fraction of the HBM traffic it must move, and a
+// bandwidth-bound kernel does not get faster by removing internal LDS traffic --
+// the bytes still have to cross the memory bus.
+//
+// The size argument agrees: the rotation is 3.5% of the K=12288 int8_linear and
+// 5.7% of the K=4096 one, so even eliminating the whole rotation would move the
+// GEMM's 54%-of-DiT share by under 2% of DiT, and PR 183 removes only part of it.
+//
+// Same conclusion as PR 174 in gemm_wmma.h, reached the other way round: that one
+// lost by removing a compare from a K loop that had slack to spare; this one would
+// lose by trying to unblock a kernel that is already at the memory bus.
 template <typename RowT, bool PACK_INT4, int BLOCK_THREADS, int ACT>
 __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     const void* __restrict__ x, int in_dtype, int8_t* __restrict__ qout,
