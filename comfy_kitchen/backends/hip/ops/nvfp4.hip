@@ -894,45 +894,95 @@ extern "C" void launch_scaled_mm_nvfp4_kernel(
 // back; BKB=32 is legal because the stager's unit is a 32-element chunk and the
 // WMMA K-step is 16.
 //
-// Measured on gfx1103, one process per candidate with 300 warmup calls first and
-// the choice made per launch through COMFY_GEMM_WMMA_TILE and COMFY_NVFP4_PIPE (a
-// rebuild per candidate is not usable here: the first GEMM after a rebuild runs on
-// cold clocks, measured 1.9x). Decode is the weighted per-token total over the
-// five shapes the decode loop issues, 350 GEMMs to a token:
+// Measured on gfx1103. One process, every candidate interleaved under one set of
+// clocks (a rebuild per candidate is not usable here: the first GEMM after a rebuild
+// runs on cold clocks, measured 1.9x), and the choice made per launch through
+// COMFY_GEMM_WMMA_TILE and COMFY_NVFP4_PIPE -- which is only true since
+// comfy_nvfp4_pipe() stopped caching its first answer; see the note on it there.
 //
-//   tile            decode ms   vs 64x64x64
-//   128x128x64 p2       840.5        1.50
-//    64x64x64  p2       562.2        1.00   <- the default
-//    64x64x64  p1       559.6        1.00
-//    64x64x32  p2       775.5        1.39
-//    64x64x32  p1       808.0        1.44
-//   128x64x32  p2      1097.5        1.96
-//   128x64x32  p1      1082.4        1.93
+// THE FIVE SHAPES, WHICH WERE NOT WRITTEN DOWN
+// -------------------------------------------
+// Without these the table is not reproducible, and they are not guessable from the
+// kernel. Recovered from qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors (Qwen3-VL-32B,
+// 50 layers), which is what "350 GEMMs to a token" counts. Weight [N, K] => GEMM K x
+// N, at M=1:
 //
-// **The PIPE=1 rows in this table were re-measured, and the old ones were wrong.**
-// The earlier table reported 64x64x64 PIPE=1 as a 1.02x loser and 64x64x32 PIPE=1 as
-// a 1.45x loser; those kernels ran the same 16-element dot product kSteps times (see
-// the K-step loop) and were not producing the numbers at all. Re-measured, the two
-// depths are a TIE at 64x64x64: interleaved in one process over 7 rounds, median
-// 482.1 against 481.3 ms, ratio 1.002, per-round spread 9.6% and 10.8%. That spread
-// is why a single-shot sequential sweep cannot separate them -- two full runs of
-// the table above put the gap at 5.3% and then at 0.5%.
+//   q_proj  [8192, 2560]   x  50     K=2560   N=8192
+//   k,v     [1024, 2560]   x 100     K=2560   N=1024
+//   o_proj  [5120, 4096]   x  50     K=4096   N=5120
+//   gate/up [25600, 2560]  x 100     K=2560   N=25600
+//   down    [5120, 12800]  x  50     K=12800  N=5120
+//                                            = 350
+//
+// The visual tower is excluded: prefill, and bf16 rather than NVFP4. lm_head is
+// excluded for the same reason. The metric is the weighted per-token total over
+// those five.
+//
+// HOW TO MEASURE IT, BECAUSE THE OBVIOUS WAY IS WRONG
+// ---------------------------------------------------
+// Interleaving candidates inside one process is necessary and not sufficient. With a
+// FIXED order within each round, position in the round correlates with clock state on
+// a part that heats: the first candidate measured is systematically the fastest, and
+// it keeps that bias every round, so it never averages out because it never moves.
+// Rotate the order by the round index so every candidate visits every position, and
+// print the per-position medians to confirm the rotation did its job.
+//
+// After that the noise floor limits the experiment, not the tiles. The per-round
+// standard deviation on the dominant shape is ~17% (sd 251 us on a 1449 us median),
+// so resolving 1-2% takes hundreds of paired rounds and a sign test on the per-round
+// differences -- never a ratio of independent medians. Concretely, and this is the
+// trap: a 160-round pass put gate/up at depth 1 6.3% under the heuristic, which reads
+// as a 3% win on the token total, and it did not survive 400 paired rounds on that
+// shape alone (ratio 1.012, depth 1 winning 214 rounds to 186). Same failure the
+// earlier re-measurement of this table recorded as "5.3% and then at 0.5%".
+//
+// 160 rotated rounds x 10 reps, paired per-round sign test:
+//
+//   tile / depth      decode ms   vs 64x64x64   vs heuristic
+//   128x128x64 p2        448.5        1.58          1.558
+//   128x64x32  p2        540.9        1.91          1.878
+//   128x64x32  p1        550.8        1.95          1.913
+//    64x64x32  p2        378.1        1.34          1.313     4 / 160
+//    64x64x32  p1        358.3        1.27          1.244
+//    64x64x64  p2        283.1        1.00          0.983   <- what the heuristic picks
+//    64x64x64  p1        280.0        0.99          0.972   89 / 71, a TIE
+//   (heuristic           287.9        1.02          1.000)  <- what ships; a TIE vs p2
+//
+// The ratios reproduce the previous pass on every row that mattered and the
+// conclusions survive intact. The ABSOLUTE numbers do not: the same tile and depth on
+// this part measures 283 ms/token here against 562.2 before, a factor of 1.99. Only
+// ratios pick a default so nothing downstream depends on the absolutes, but they are
+// not reproducible and should not be quoted as if they were -- that earlier pass ran
+// before the shapes above were pinned down.
+//
+// The knob space is closed, which is why nothing here is left to win: the override is
+// matched on (bm, bkb) alone and routes ovr.bm == 128 straight to
+// CK_NVFP4_GEMM_LAUNCH_P(..., 2), so there are four reachable tiles, three of them at
+// both depths, and that is all. The default is already at the optimum of them.
+//
+// One earlier version of the PIPE=1 rows was not a measurement at all, and that is
+// worth recording as such: the table read 64x64x64 PIPE=1 as a 1.02x loser and
+// 64x64x32 PIPE=1 as a 1.45x loser, and those kernels were running the same 16-element
+// dot product kSteps times (see the K-step loop), so they were not producing the
+// numbers they appeared to produce. Any sweep of this knob needs the correctness check
+// at the bottom of this block for that reason, and not only for tile selection.
 //
 // So depth 1 stays off by default, on the tie and not on a measured loss: it buys
 // no wave, because the LDS footprint already capped the block count at 3 per WGP
 // (19456 B, against a 16384 B budget for four), so what it saves is the second
 // fragment buffer -- 16 VGPRs, 143 down to 127 -- and what it gives up is the LDS
-// overlap. Those cancel here. On a part with more LDS headroom, or a tile whose
-// fragments were the bottleneck, the trade would not cancel.
+// overlap. Those cancel here, and the tie holds on all three tiles that have both
+// depths (76/84, 76/84 and 77/83 wins for depth 2). On a part with more LDS headroom,
+// or a tile whose fragments were the bottleneck, the trade would not cancel.
 //
 // Note that BKB=32 reaches 5 blocks per WGP at 11264 B but not 4 waves per SIMD
 // (512/118 is 4.3, and 5 blocks of 4 warps over 4 SIMDs is 5 waves' worth of
 // threads -- the register count is no longer the binding constraint there, and
-// BKB=32 still loses by 1.4x). And 128x64x32 sits at exactly 16384 B, the
+// BKB=32 still loses by 1.3x). And 128x64x32 sits at exactly 16384 B, the
 // four-block budget, which the decode table's 1 KB would have to share.
 //
 // The two stable results in the table are the ones worth keeping: a 128-row tile
-// costs 1.4-2.0x, and halving BKB costs 1.4x. Halving BKB does relieve the LDS --
+// costs 1.6-1.9x, and halving BKB costs 1.3x. Halving BKB does relieve the LDS --
 // 11264 B is 5 blocks per WGP -- but it starves the stager, because at BKB=32 a
 // 64-row tile has 64 chunks for 128 threads and half of them stage nothing, and
 // every saving comes back as loop trips and barriers. Occupancy is the ceiling on
