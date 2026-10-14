@@ -32,7 +32,8 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
   // Tiling constants — must match sage_attention.py and dlpack_bindings.cpp.
   // D>=128 otherwise needs too many live FP32 output accumulators per thread.
   // A 16-row warp tile halves that accumulator set.
-  constexpr int WARP_Q = HEAD_DIM >= 128 ? 16 : 32;
+  constexpr int WARP_Q =
+      HEAD_DIM >= 128 || (HEAD_DIM == 64 && CTA_Q == 64) ? 16 : 32;
   constexpr int WARP_K = CTA_K;
 
   size_t smem_max =
@@ -196,6 +197,32 @@ extern "C" void launch_sage_attn_kernel(
     LAUNCH_Q(HD, CK, MaskMode::kPreparedKey, half, true, CQ);                    \
   } else {                                                                     \
     LAUNCH_Q(HD, CK, MaskMode::kPreparedKey, nv_bfloat16, true, CQ);             \
+  }
+
+  // H3 video VAE: a 16-row warp tile reduces the D64 accumulator footprint.
+  // Quantization still uses the existing 128-row Q groups; only the attention
+  // work partition changes. Keep this limited to measured SM120 shapes.
+  if (mask == nullptr && mask_tile_bias == nullptr && head_dim == 64 &&
+      cta_k == 64 && num_qo_heads == 32 && num_kv_heads == 32 &&
+      batch_size <= 8 && qo_len == kv_len && qo_len >= 1024 && qo_len <= 2048 &&
+      sm_scale > 0) {
+    int device = 0, major = 0, minor = 0;
+    cudaError_t error = cudaGetDevice(&device);
+    if (error == cudaSuccess)
+      error = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    if (error == cudaSuccess)
+      error = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+    if (error != cudaSuccess)
+      throw std::runtime_error(std::string("sage_attn device query failed: ") +
+                               cudaGetErrorString(error));
+    if (major == 12 && minor == 0) {
+      if (output_dtype_code == 1) {
+        LAUNCH_Q(64, 64, MaskMode::kNone, half, true, 64);
+      } else {
+        LAUNCH_Q(64, 64, MaskMode::kNone, nv_bfloat16, true, 64);
+      }
+      return;
+    }
   }
 
   // Keep smaller unmasked query tiles limited to Blackwell image shapes.
