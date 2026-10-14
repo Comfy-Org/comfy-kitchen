@@ -13,15 +13,6 @@ else:
 
 _MINIMUM_CAPABILITY = (8, 0)
 
-_COMBINE_COUNTERS = 4096
-
-
-def _counters(device: torch.device, needed: int, num_splits: int) -> torch.Tensor:
-    if num_splits == 1 or needed > _COMBINE_COUNTERS:
-        return _cuda_backend._empty_cuda_tensor(device, torch.int32)
-    # Overlapping calls and independently captured graphs must not share arrival counters.
-    return torch.zeros(_COMBINE_COUNTERS, dtype=torch.int32, device=device)
-
 
 def is_available(device: torch.device | None = None) -> bool:
     """Return whether flash attention decode is available on the requested device."""
@@ -121,8 +112,7 @@ def flash_attention_decode(
         _cuda_backend._C.flash_attention_decode(
             *map(
                 _cuda_backend._wrap_for_dlpack,
-                (query, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum,
-                 _counters(q.device, batch * kv_heads, num_splits)),
+                (query, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum),
             ),
             num_splits,
             torch.cuda.current_stream(q.device).cuda_stream,
@@ -215,8 +205,7 @@ def flash_attention_decode_gqa(
         _cuda_backend._C.flash_attention_decode_gqa(
             *map(
                 _cuda_backend._wrap_for_dlpack,
-                (q, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum,
-                 _counters(q.device, batch * (kv_heads if query_length == 1 else heads), num_splits)),
+                (q, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum),
             ),
             num_splits,
             torch.cuda.current_stream(q.device).cuda_stream,

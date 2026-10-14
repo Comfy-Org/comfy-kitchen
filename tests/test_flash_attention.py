@@ -279,11 +279,6 @@ def test_flash_attention_decode_rejects_invalid_dimensions(q_dim, k_dim, v_dim):
         ck.flash_attention_decode(q, k, v, lengths)
 
 
-requires_gqa_decode = pytest.mark.skipif(
-    not ck.flash_attention_decode_gqa_is_available(),
-    reason="requires the head_dim-256 GQA decode kernel",
-)
-
 # flash_attention_decode_gqa and flash_attention_decode_step_merge compute the same result
 # everywhere: the native kernel for BF16 head_dim 256 where one is built, torch otherwise.
 # The reference tests run on the GPU when there is one (native for bf16/256, torch for the
@@ -325,44 +320,6 @@ def test_flash_attention_decode_step_merge_matches_full_softmax(dtype, head_dim,
     expected = attend(torch.cat([prefix_scores, step_scores.masked_fill(future, float("-inf"))], dim=-1),
                       torch.cat([prefix_values, step_values], dim=2))
     torch.testing.assert_close(merged.float(), expected, atol=3e-3, rtol=1e-2)
-
-
-@requires_flash_decode
-@pytest.mark.parametrize("num_splits", [2, 5, 32])
-def test_flash_attention_decode_fused_combine_matches_two_launch(monkeypatch, num_splits):
-    """The in-kernel split fold (last CTA per row) must reproduce the separate
-    combine launch bit for bit: same warp-width reduction of the split maxima and
-    sums, same split order in the weighted accumulation."""
-    monkeypatch.setattr(flash_attention_module, "_num_splits", lambda *_, **__: num_splits)
-    torch.manual_seed(0)
-    q = torch.randn(3, 1, 8, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(3, 4097, 2, 128, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn_like(k)
-    lengths = torch.tensor([1, 73, 4097], device="cuda", dtype=torch.int32)
-    with monkeypatch.context() as fallback:
-        fallback.setattr(flash_attention_module, "_COMBINE_COUNTERS", 0)
-        two_launch = ck.flash_attention_decode(q, k, v, lengths)
-    fused = [ck.flash_attention_decode(q, k, v, lengths) for _ in range(3)]  # counters must rearm between calls
-    for out in fused:
-        assert torch.equal(out, two_launch)
-    torch.testing.assert_close(two_launch, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
-
-
-@requires_gqa_decode
-@pytest.mark.parametrize("num_splits", [2, 5, 32])
-@pytest.mark.parametrize("query_length", [1, 4])
-def test_flash_attention_decode_gqa_fused_combine_matches_two_launch(monkeypatch, num_splits, query_length):
-    monkeypatch.setattr(flash_attention_module, "_num_splits", lambda *_, **__: num_splits)
-    torch.manual_seed(0)
-    q = torch.randn(3, 8, query_length, 256, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(3, 2, 4097, 256, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn_like(k)
-    lengths = torch.tensor([query_length, 73, 4097], device="cuda", dtype=torch.int32)
-    with monkeypatch.context() as fallback:
-        fallback.setattr(flash_attention_module, "_COMBINE_COUNTERS", 0)
-        out_ref = ck.flash_attention_decode_gqa(q, k, v, lengths)
-    for _ in range(3):
-        assert torch.equal(ck.flash_attention_decode_gqa(q, k, v, lengths), out_ref)
 
 
 @pytest.mark.parametrize(("dtype", "head_dim"), GQA_OPERANDS)
