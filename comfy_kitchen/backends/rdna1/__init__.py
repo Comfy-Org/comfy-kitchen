@@ -67,9 +67,12 @@ __all__ = [
     "fp16_packed_conv3d",
     "fp16_packed_conv_transpose3d",
     "fp16_packed_linear",
+    "q8_0_linear",
     "depthwise_conv3d",
     "depthwise_conv_transpose3d",
     "direct_conv3d",
+    "fp32_winograd_conv2d",
+    "fp32_winograd_conv_transpose2d",
     "gemv_awq_w4a16",
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
@@ -821,13 +824,59 @@ def fp16_packed_linear(
             # the small-M GEMV (m <= 8) runs in fp32 and reads no amax
             weight_amax = row_scale[:1] if m <= 8 else torch.linalg.vector_norm(weight, float("inf"), dtype=torch.float32)
         out = torch.empty((m, n), dtype=out_dtype, device=x.device)
+        # the GEMM's tiled layout of the scaled rows, in whole tiles of 128, where it takes
+        # its square tile (never at 64 rows or fewer, nor under K = 640: ops/gemm_f16_packed.hip)
+        x16t = (torch.empty((-(-m // 128) * 128, k), dtype=torch.float16, device=x.device)
+                if m > 64 and k >= 640 else None)
         if _C.fp16_packed_linear(
-            _dl(x_2d), _dl(weight), _dl(weight_amax.reshape(1)), _dl(x16), _dl(row_scale),
+            _dl(x_2d), _dl(weight), _dl(weight_amax.reshape(1)), _dl(x16),
+            None if x16t is None else _dl(x16t), _dl(row_scale),
             None if bias is None else _dl(bias), _dl(out), m, n, k, DTYPE_TO_CODE[out_dtype],
             _stream(x),
         ):
             return out.reshape(out_shape)
     return _eager.fp16_packed_linear(x, weight.to(x.device), bias, out_dtype)
+
+
+def q8_0_linear(
+    x: torch.Tensor,
+    raw: torch.Tensor,
+    out_features: int,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Linear against a GGUF Q8_0 weight (raw bytes). Where the packed GEMM takes its square
+    tile (ops/gemm_f16_packed.hip, launch_q8_0_packed_linear_kernel), the blocks are
+    repacked into int8 codes and a [K / 32, N] scale table, which the tiled GEMM reads in
+    place, applying each block's scale as it folds the stage the block covers: the int8
+    ConvRot path's kernel at the weight's own precision, with no fp16 copy of the weight.
+    Elsewhere the weight is dequantized to fp16 for fp16_packed_linear."""
+    out_dtype = x.dtype if out_dtype is None else out_dtype
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    m, k = x_2d.shape
+    n = out_features
+    out_shape = (*x.shape[:-1], n)
+    if bias is not None:
+        bias = bias.to(device=x.device).contiguous()
+    if (m > 64 and k % 32 == 0 and n % 8 == 0 and raw.device == x.device and raw.is_contiguous()
+            and x.dtype in (torch.float32, torch.float16, torch.bfloat16)):
+        dev = x.device
+        x16 = torch.empty((m, k), dtype=torch.float16, device=dev)
+        x16t = torch.empty((-(-m // 128) * 128, k), dtype=torch.float16, device=dev)
+        row_scale = torch.empty(m, dtype=torch.float32, device=dev)
+        codes = torch.empty((n, k), dtype=torch.int8, device=dev)
+        scales = torch.empty((k // 32, n), dtype=torch.float16, device=dev)
+        # the codes' bound, |q| <= 127, stands in for the weight's largest element
+        w_amax = torch.full((1,), 127.0, dtype=torch.float32, device=dev)
+        out = torch.empty((m, n), dtype=out_dtype, device=dev)
+        if _C.q8_0_packed_linear(
+            _dl(x_2d), _dl(raw.reshape(-1)), _dl(w_amax), _dl(x16), _dl(x16t), _dl(row_scale),
+            _dl(codes), _dl(scales), None if bias is None else _dl(bias), _dl(out), m, n, k,
+            DTYPE_TO_CODE[out_dtype], _stream(x),
+        ):
+            return out.reshape(out_shape)
+    weight = _eager.quantization.dequantize_q8_0(raw, n, k)
+    return fp16_packed_linear(x, weight, bias, out_dtype)
 
 
 # Acts the HIP fused quantizer implements; anything else is applied eagerly so
@@ -1961,6 +2010,33 @@ def _scaled_ndhwc_copy(x, acc_scale):
     return x16
 
 
+def _winograd_conv3d(x, weight, bias, stride, padding):
+    """conv3d of a contiguous x with a [K, C, T, 3, 3] weight at stride (sd, 1, 1) on the
+    Winograd kernel (ops/winograd_conv.hip), the result contiguous in x's dtype, or None for
+    a shape it declines. x is taken to a scaled fp16 copy blocked by 16 channels,
+    [N, C / 16, D, H, W, 16], one transpose_cast of x seen as [N * C / 16, 16, DHW]; the
+    transforms add up to four inputs and scale the filter by up to 2.25, hence the wider
+    accumulator scale."""
+    n, c, d, h, w = x.shape
+    k, _, t = weight.shape[:3]
+    z = (d + 2 * padding[0] - t) // stride[0] + 1
+    p, q = h + 2 * padding[1] - 2, w + 2 * padding[2] - 2
+    # under 64 output tiles the blocks of 64 tiles run mostly empty (1.3-1.4x the implicit
+    # GEMM's time at 1280 channels over 8x8; level at 64 tiles)
+    if min(z, p, q) < 1 or min(padding) < 0 or c % 16 or n * z * ((p + 1) // 2) * ((q + 1) // 2) < 64:
+        return None
+    acc_scale = _packed_acc_scale(x, weight).mul_(16.0)
+    x16 = torch.empty(x.numel(), dtype=torch.float16, device=x.device)
+    _transpose_cast(x, x16, n * c // 16, 16, d * h * w, acc_scale)
+    cp = c
+    u = torch.empty(-(-k // 32) * (t * cp // 16) * 4096, dtype=torch.int32, device=x.device)
+    out = torch.empty((n, k, z, p, q), dtype=x.dtype, device=x.device)
+    served = _C.fp16_winograd_conv(
+        _dl(x16), _dl(weight.contiguous()), None if bias is None else _dl(bias.contiguous()), _dl(out),
+        _dl(u), n, d, h, w, cp, c, k, t, z, p, q, stride[0], *padding, _dl(acc_scale), _stream(x))
+    return out if served else None
+
+
 def fp16_packed_conv3d(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1991,6 +2067,11 @@ def fp16_packed_conv3d(
         else:
             if not channels_last:
                 x = x.contiguous()
+                if (weight.shape[3:] == (3, 3) and tuple(stride[1:]) == (1, 1)
+                        and tuple(dilation) == (1, 1, 1) and weight.shape[1] == c and x.numel() > 0):
+                    out = _winograd_conv3d(x, weight, bias, stride, padding)
+                    if out is not None:
+                        return out
             acc_scale = _packed_acc_scale(x, weight)
             if channels_last:
                 x16 = torch.empty(x.shape, dtype=torch.float16, device=x.device, memory_format=cl)
@@ -2101,6 +2182,95 @@ def depthwise_conv3d(
     if weight.shape[:2] != (x.shape[1], 1) or min(out_size) < 1 or min(padding) < 0 or x.numel() == 0:
         return _eager.depthwise_conv3d(x, weight, bias, stride, padding, dilation)
     return _depthwise(x, weight, bias, stride, padding, dilation, out_size, False)
+
+
+@functools.cache
+def _winograd_groups(device: torch.device) -> int:
+    """Workgroups for MIOpen's Winograd kernels on device, or 0 where they do not run: they
+    are gfx10 code objects, built in CU mode with one workgroup per CU. torch reports the
+    gfx10 WGPs, two CUs each (36 groups on the 18-WGP RX 5600M, MIOpen's count; 18 ran
+    1.4x slower and 54 or 72 1.1-1.2x)."""
+    props = torch.cuda.get_device_properties(device)
+    return 2 * props.multi_processor_count if props.gcnArchName.startswith("gfx1010") else 0
+
+
+def fp32_winograd_conv2d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: list[int],
+    padding: list[int],
+) -> torch.Tensor:
+    """fp32 conv2d with zero padding at stride 1 or 2 on MIOpen's Winograd RxS kernels
+    (miopen_winograd/), the fp32 kernels MIOpen itself runs on gfx1010, without its search
+    on each new shape: f2x3 at stride 1 up to 5x5 filters, f3x2 at stride 2 and for larger
+    filters, as MIOpen's own timings fall (f2x3 1.7-3.5x faster at stride-1 3x3 and 5x5,
+    f3x2 1.5-1.8x faster at stride 2 and 7x7). Accumulation is fp32 (error ~1e-6). Shapes
+    past the kernels' limits (IsShaderConstraintsMetV30 in MIOpen) run torch's conv2d."""
+    n, c, h, w = x.shape
+    k, _, r, s = weight.shape
+    ph, pw = padding
+    st = stride[0]
+    oh, ow = (h + 2 * ph - r) // st + 1, (w + 2 * pw - s) // st + 1
+    lim = 1 << 16
+    groups = _winograd_groups(x.device) if x.is_cuda else 0
+    if (groups == 0 or stride[0] != stride[1] or st not in (1, 2) or weight.shape[1] != c
+            or weight.device != x.device or min(ph, pw) < 0 or min(oh, ow) < 1
+            or max(n, c, h, w, k, r, s, oh, ow, ph, pw) >= lim or h * w >= 1 << 29
+            or (c + 1) * h * w >= 1 << 30 or (c + 1) * r * s >= 1 << 22 or k * r * s >= 1 << 28
+            or (k + 1) * oh * ow >= 1 << 30):
+        return _eager.fp32_winograd_conv2d(x, weight, bias, stride, padding)
+    x = x.contiguous()
+    weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.to(device=x.device, dtype=torch.float32).contiguous()
+    out = torch.empty((n, k, oh, ow), dtype=torch.float32, device=x.device)
+    variant = (2 if st == 2 or max(r, s) > 5 else 0) + st - 1
+    with torch.cuda.device(x.device):
+        _C.fp32_winograd_conv2d(_dl(x), _dl(weight), None if bias is None else _dl(bias), _dl(out),
+                                n, c, h, w, k, r, s, ph, pw, oh, ow, variant, False, groups, _stream(x))
+    return out
+
+
+def fp32_winograd_conv_transpose2d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    output_padding: list[int],
+) -> torch.Tensor:
+    """fp32 conv_transpose2d (one group, no dilation) of x [N, C, H, W] with a [C, K, R, S]
+    weight at stride 1 or 2 on MIOpen's Winograd kernels run as its backward-data solver runs
+    them: the filter reversed, the backward padding R - 1 - padding, and at stride 2 the
+    dilation2 kernels. f3x2 there and for filters past 5 wide, f2x3 otherwise, as for
+    fp32_winograd_conv2d. Shapes past the kernels' limits run torch's conv_transpose2d."""
+    n, c, h, w = x.shape
+    k, r, s = weight.shape[1:]
+    ph, pw = padding
+    st = stride[0]
+    oh = (h - 1) * st - 2 * ph + r + output_padding[0]
+    ow = (w - 1) * st - 2 * pw + s + output_padding[1]
+    lim = 1 << 16
+    groups = _winograd_groups(x.device) if x.is_cuda else 0
+    if (groups == 0 or stride[0] != stride[1] or st not in (1, 2) or weight.shape[0] != c
+            or weight.device != x.device or min(ph, pw) < 0 or ph > r - 1 or pw > s - 1
+            or max(output_padding) >= st or min(output_padding) < 0 or min(oh, ow) < 1
+            or max(n, c, h, w, k, r, s, oh, ow) >= lim or oh * ow >= 1 << 29
+            or (k + 1) * oh * ow >= 1 << 30 or (k + 1) * r * s >= 1 << 22 or c * r * s >= 1 << 28
+            or (c + 1) * h * w >= 1 << 30):
+        return _eager.fp32_winograd_conv_transpose2d(x, weight, bias, stride, padding, output_padding)
+    x = x.contiguous()
+    weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.to(device=x.device, dtype=torch.float32).contiguous()
+    out = torch.empty((n, k, oh, ow), dtype=torch.float32, device=x.device)
+    f3x2 = st == 2 or max(r, s) > 5
+    variant = (5 if f3x2 else 4) if st == 2 else (2 if f3x2 else 0)
+    with torch.cuda.device(x.device):
+        _C.fp32_winograd_conv2d(_dl(x), _dl(weight), None if bias is None else _dl(bias), _dl(out),
+                                n, c, h, w, k, r, s, ph, pw, oh, ow, variant, True, groups, _stream(x))
+    return out
 
 
 def direct_conv3d(
@@ -3303,12 +3473,36 @@ def _build_constraints() -> dict:
             },
             default_devices=dev,
         ),
+        "fp32_winograd_conv_transpose2d": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(4),)),
+                "weight": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(4),)),
+                "bias": ParamConstraint(dtypes=floats),
+            },
+            default_devices=dev,
+        ),
+        "fp32_winograd_conv2d": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(4),)),
+                "weight": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(4),)),
+                "bias": ParamConstraint(dtypes=floats),
+            },
+            default_devices=dev,
+        ),
         "fp16_packed_linear": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=floats, shape_rules=(MinDims(2),)),
                 "weight": ParamConstraint(
                     dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(2),)
                 ),
+                "bias": ParamConstraint(dtypes=floats),
+            },
+            default_devices=dev,
+        ),
+        "q8_0_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=floats, shape_rules=(MinDims(2),)),
+                "raw": ParamConstraint(dtypes=frozenset({torch.uint8})),
                 "bias": ParamConstraint(dtypes=floats),
             },
             default_devices=dev,

@@ -293,6 +293,142 @@ class TestFp16PackedConv3d:
         assert torch.equal(zeros, torch.zeros_like(zeros))
 
 
+class TestWinogradConv3d:
+    """rdna1: fp16_packed_conv3d takes [T, 3, 3] filters at stride (sd, 1, 1) on the Winograd
+    F(2x2, 3x3) kernel when x is channels-first with a multiple of 16 channels and the output
+    has at least 64 tiles. Its transforms add ~1.7x the implicit GEMM's error."""
+
+    @pytest.mark.parametrize(
+        "c,k,spatial,ksize,stride,padding",
+        [
+            (32, 32, (1, 16, 16), (1, 3, 3), (1, 1, 1), (0, 1, 1)),
+            (64, 40, (1, 17, 23), (1, 3, 3), (1, 1, 1), (0, 1, 1)),  # odd extents, K past the block
+            (48, 3, (1, 33, 70), (1, 3, 3), (1, 1, 1), (0, 1, 1)),
+            (96, 96, (4, 20, 20), (3, 3, 3), (1, 1, 1), (1, 1, 1)),
+            (32, 64, (5, 19, 21), (3, 3, 3), (2, 1, 1), (1, 0, 2)),  # depth stride, uneven padding
+            (512, 512, (1, 64, 64), (1, 3, 3), (1, 1, 1), (0, 1, 1)),
+            (16, 64, (1, 300, 9), (1, 3, 3), (1, 1, 1), (0, 1, 1)),  # tall: blocks of 8 tiles a row
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    def test_matches_fp64_conv(self, c, k, spatial, ksize, stride, padding, dtype):
+        if not _simt_device():
+            pytest.skip("packed fp16 GEMM device required")
+        from comfy_kitchen.backends import rdna1
+
+        torch.manual_seed(0)
+        x = (torch.randn(2, c, *spatial, device="cuda") * 30).to(dtype)
+        weight = (torch.randn(k, c, *ksize, device="cuda") / math.sqrt(c * math.prod(ksize))).half()
+        bias = torch.randn(k, device="cuda").to(dtype)
+        ref = functional.conv3d(x.double(), weight.double(), bias.double(), stride, padding)
+
+        out = rdna1._winograd_conv3d(x, weight, bias, stride, padding)
+
+        assert out is not None and out.shape == ref.shape and out.dtype == dtype and out.is_contiguous()
+        assert rel_err(out.double(), ref) < (3e-3 if dtype == torch.float32 else 6e-3)
+
+    def test_wide_range(self):
+        if not _simt_device():
+            pytest.skip("packed fp16 GEMM device required")
+        from comfy_kitchen.backends import rdna1
+
+        torch.manual_seed(1)
+        weight = (torch.randn(32, 64, 1, 3, 3, device="cuda") * 0.05).half()
+        for magnitude in (1e6, 1e-6):
+            x = torch.randn(1, 64, 1, 24, 24, device="cuda") * magnitude
+            ref = functional.conv3d(x.double(), weight.double(), padding=(0, 1, 1))
+            out = rdna1._winograd_conv3d(x, weight, None, (1, 1, 1), (0, 1, 1))
+            assert out is not None and torch.isfinite(out).all()
+            assert rel_err(out.double(), ref) < 3e-3
+
+    def test_declines_small_outputs(self):
+        if not _simt_device():
+            pytest.skip("packed fp16 GEMM device required")
+        from comfy_kitchen.backends import rdna1
+
+        x = torch.randn(1, 64, 1, 8, 8, device="cuda")
+        weight = torch.randn(64, 64, 1, 3, 3, device="cuda").half()
+        assert rdna1._winograd_conv3d(x, weight, None, (1, 1, 1), (0, 1, 1)) is None
+
+
+def _winograd_device():
+    if not torch.cuda.is_available():
+        return False
+    from comfy_kitchen.backends import rdna1
+
+    return rdna1._winograd_groups(torch.device("cuda", 0)) > 0
+
+
+class TestFp32WinogradConv2d:
+    """rdna1: fp32 conv2d and conv_transpose2d on MIOpen's Winograd RxS kernels, built into
+    the backend. They accumulate in fp32, so the error is fp32 rounding."""
+
+    @pytest.mark.parametrize(
+        "n,c,k,h,w,r,s,stride,padding",
+        [
+            (1, 64, 64, 32, 32, 3, 3, 1, 1),
+            (2, 37, 45, 31, 29, 3, 3, 1, 1),
+            (1, 3, 64, 224, 224, 7, 7, 2, 3),
+            (1, 128, 3, 96, 80, 3, 3, 1, 1),
+            (1, 64, 64, 65, 63, 5, 5, 1, 2),
+            (1, 64, 64, 64, 64, 3, 3, 2, 0),
+            (1, 8, 8, 9, 300, 3, 5, 1, 1),
+            (1, 64, 64, 33, 33, 4, 4, 2, 1),
+        ],
+    )
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_conv_matches_fp64(self, n, c, k, h, w, r, s, stride, padding, with_bias):
+        if not _winograd_device():
+            pytest.skip("gfx1010 required")
+        torch.manual_seed(0)
+        x = torch.randn(n, c, h, w, device="cuda") * 5
+        weight = torch.randn(k, c, r, s, device="cuda") * 0.05
+        bias = torch.randn(k, device="cuda") if with_bias else None
+        ref = functional.conv2d(x.double(), weight.double(), None if bias is None else bias.double(),
+                                stride, padding)
+        out = ck.fp32_winograd_conv2d(x, weight, bias, stride, padding)
+        assert out.shape == ref.shape and out.dtype == torch.float32
+        assert rel_err(out.double(), ref) < 5e-6
+
+    @pytest.mark.parametrize(
+        "n,c,k,h,w,r,stride,padding,output_padding",
+        [
+            (1, 64, 32, 16, 16, 4, 2, 1, 0),
+            (2, 33, 18, 13, 11, 3, 2, 1, 1),
+            (1, 64, 32, 16, 16, 3, 1, 1, 0),
+            (1, 32, 16, 20, 20, 3, 2, 0, 0),
+            (1, 16, 8, 9, 9, 5, 2, 2, 1),
+            (1, 64, 64, 12, 12, 7, 1, 3, 0),
+            (1, 8, 8, 10, 10, 2, 2, 0, 0),
+            (1, 16, 8, 1, 300, 1, 2, 0, 0),  # a 1D conv as one row
+        ],
+    )
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_conv_transpose_matches_fp64(self, n, c, k, h, w, r, stride, padding, output_padding, with_bias):
+        if not _winograd_device():
+            pytest.skip("gfx1010 required")
+        torch.manual_seed(0)
+        x = torch.randn(n, c, h, w, device="cuda") * 3
+        s = 4 if h == 1 else r
+        padding = (0, 1) if h == 1 else padding
+        weight = torch.randn(c, k, r, s, device="cuda") * 0.05
+        bias = torch.randn(k, device="cuda") if with_bias else None
+        ref = functional.conv_transpose2d(x.double(), weight.double(), None if bias is None else bias.double(),
+                                          stride, padding, output_padding)
+        out = ck.fp32_winograd_conv_transpose2d(x, weight, bias, stride, padding, output_padding)
+        assert out.shape == ref.shape and out.dtype == torch.float32
+        assert rel_err(out.double(), ref) < 5e-6
+
+    def test_past_the_kernel_limits_runs_torch(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA/HIP required")
+        x = torch.randn(1, 8, 1, 70000, device="cuda")
+        weight = torch.randn(8, 8, 1, 3, device="cuda")
+        ref = functional.conv2d(x, weight, None, 1, (0, 1))
+        out = ck.fp32_winograd_conv2d(x, weight, None, 1, (0, 1))
+        assert torch.allclose(out, ref, rtol=1e-4, atol=1e-4)
+
+
 class TestFp16PackedConvTranspose3d:
     """fp16_packed_conv_transpose3d: x of any float dtype and range against an fp16
     [C, K, T, R, S] weight, the result in x's dtype. Off the packed GEMM devices it is torch's

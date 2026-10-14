@@ -40,6 +40,12 @@
 //          fp16 pairs as it is stored to LDS (Op::expand_i8): half the bytes fetched, and
 //          an INT8 weight is read where it lies with no fp16 copy.
 //
+// BLOCK SCALES  An epilogue with a block_scale member ([K / 32, N] fp16, one per 64-byte
+// stage of K and column: a GGUF Q8_0 weight's block scales, B its int8 codes under BI8)
+// has the kernel multiply each stage's fp16 chains by their column's scale as it folds them
+// into fp32, so the GEMM computes A @ (scale * B)^T. Only a row-paired Op, which folds every
+// stage, takes them; every other epilogue compiles to the kernel as it was.
+//
 // A may instead be gathered (ASrc, an implicit-GEMM convolution's patch rows): the
 // source resolves each of a thread's rows once, ASrc::row(grow, valid), and each
 // stage of 64 K bytes once, ASrc::stage(kbyte0), and ASrc::chunk(row, stage, offset)
@@ -360,6 +366,8 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
                   "a partial last round of chunk loads is only handled for a tile under one round");
     constexpr int kE = Op::kExpand;
     constexpr bool kPairs = requires { Op::kRowPairs; };
+    constexpr bool kBlockScaled = requires(const Epi& e) { e.block_scale; };
+    static_assert(!kBlockScaled || kPairs, "block scales are applied at a per-stage fold");
     // Rows of A to load: a row-paired A keeps the odd K of its last row in the row after it.
     const int a_rows = kPairs ? (M + 1) & ~1 : M;
     constexpr int kLdsWords = kSimtWords * kE;  // LDS words per row per stage
@@ -370,6 +378,7 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
     // hazard (LLVM's lds-misaligned-bug).
     __shared__ __align__(16) uint32_t As[kLdsWords * BM];
     __shared__ __align__(16) uint32_t Bs[kLdsWords * BN];
+    __shared__ float Ss[kBlockScaled ? BN : 1];  // the stage's block scale of each column
 
     const int tid = threadIdx.x;
     const int tx = tid % TX, ty = tid / TX;
@@ -407,6 +416,9 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
     // threads store consecutive rows of one LDS word: distinct banks.
     constexpr bool kDenseA = std::is_same_v<ASrc, const uint8_t*>;
     uint4 ra[kAPer], rb[kBPer];
+    // The stage whose block scales store() stages: loaded there, not with the operands, to
+    // keep them out of the registers live across the math (the 8x16 block spilled with them).
+    [[maybe_unused]] int scale_kb = 0;
     [[maybe_unused]] typename SimtARow<ASrc>::type arow[kAPer];
     if constexpr (!kDenseA) {
 #pragma unroll
@@ -447,6 +459,7 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
                         ? *reinterpret_cast<const uint4*>(B + static_cast<int64_t>(grow) * (kbytes / kDiv) + gk)
                         : make_uint4(0, 0, 0, 0);
         }
+        if constexpr (kBlockScaled) scale_kb = kb0;
     };
     // Word q of a chunk is global word (c / ROWS) * 4 + q of the row.
     auto store_chunk = [&](uint32_t* lds, int rows, int c, const uint4& v) {
@@ -483,6 +496,18 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
                 }
             } else {
                 store_chunk(Bs, BN, c, rb[i]);
+            }
+        }
+        if constexpr (kBlockScaled) {
+            // N is a multiple of 8, so a group of 8 columns is all in range or all out
+            const int col = n0 + tid * 8;
+            if (tid < BN / 8) {
+                const uint4 v = col < N ? *reinterpret_cast<const uint4*>(
+                                              epi.block_scale + static_cast<int64_t>(scale_kb / kBytes) * N + col)
+                                        : make_uint4(0, 0, 0, 0);
+                const __half* h = reinterpret_cast<const __half*>(&v);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) Ss[tid * 8 + i] = __half2float(h[i]);
             }
         }
     };
@@ -555,7 +580,18 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
         // operand scaling bounds, and after this slice's last stage so no partial is lost
         // (a slice's stage count need not be a multiple of kFoldStages).
         if constexpr (kPacked) {
-            if constexpr (kPairs) {
+            if constexpr (kBlockScaled) {
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    const float sc = Ss[(j / 4) * (TX * 4) + tx * 4 + j % 4];
+#pragma unroll
+                    for (int p = 0; p < TM / 2; ++p) {
+                        acc[2 * p][j] = __builtin_fmaf(static_cast<float>(pack[p][j].x), sc, acc[2 * p][j]);
+                        acc[2 * p + 1][j] = __builtin_fmaf(static_cast<float>(pack[p][j].y), sc, acc[2 * p + 1][j]);
+                        pack[p][j] = {};
+                    }
+                }
+            } else if constexpr (kPairs) {
 #pragma unroll
                 for (int p = 0; p < TM / 2; ++p)
 #pragma unroll

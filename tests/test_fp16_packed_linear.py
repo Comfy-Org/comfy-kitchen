@@ -120,3 +120,38 @@ def test_int8_convrot_linear_on_packed_gemm(input_act, x_dtype, cuda_available):
                                           None if act_weight is None else act_weight.double(), 1e-6),
                           w, b)
     assert _nrmse(out, expected) < 2e-3
+
+
+class TestQ8_0Linear:
+    """q8_0_linear: a GGUF Q8_0 weight given as raw blocks. rdna1 reads the codes in its tiled
+    packed GEMM and applies the block scales at each stage's fold; small M falls back to the
+    dequantized fp16 GEMM. Either way the result matches the dequantized weight's product."""
+
+    @staticmethod
+    def _q8_0(n, k, device):
+        scales = (torch.rand(n, k // 32, device=device) * 0.02 + 1e-3).half()
+        codes = torch.randint(-127, 128, (n, k // 32, 32), dtype=torch.int8, device=device)
+        raw = torch.cat([scales.view(torch.uint8).reshape(n, k // 32, 2), codes.view(torch.uint8)], dim=2)
+        weight = (codes.float() * scales.float()[..., None]).reshape(n, k)
+        return raw.reshape(n, -1).contiguous(), weight
+
+    @pytest.mark.parametrize("m,k,n", [(4224, 1024, 768), (300, 640, 512), (130, 2048, 1024), (64, 512, 256), (9, 256, 128)])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_matches_dequantized(self, m, k, n, dtype, with_bias):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA/HIP required")
+        torch.manual_seed(0)
+        raw, weight = self._q8_0(n, k, "cuda")
+        x = (torch.randn(m, k, device="cuda") * 4).to(dtype)
+        bias = torch.randn(n, device="cuda") if with_bias else None
+        ref = x.double() @ weight.double().T + (0 if bias is None else bias.double())
+        out = ck.q8_0_linear(x, raw, n, bias)
+        assert out.shape == (m, n) and out.dtype == dtype
+        assert (out.double() - ref).norm() / ref.norm() < (2e-3 if dtype != torch.bfloat16 else 6e-3)
+
+    def test_eager_dequantize_matches_blocks(self):
+        from comfy_kitchen.backends.eager.quantization import dequantize_q8_0
+
+        raw, weight = self._q8_0(16, 64, "cpu")
+        assert torch.equal(dequantize_q8_0(raw, 16, 64, torch.float32), weight)

@@ -98,6 +98,7 @@ set(HIP_SOURCES
     ops/transpose_cast.hip
     ops/depthwise_conv.hip
     ops/direct_conv.hip
+    ops/winograd_conv.hip
     ops/packed_scale.hip
     ops/convrot_w4a4.hip
     ops/adaln.hip
@@ -129,8 +130,42 @@ set(HIP_SOURCES
     ops/w4a8_requant.hip
 )
 
+# MIOpen's Winograd RxS kernels (miopen_winograd/README.md), assembled the way MIOpen
+# assembles them for gfx1010 and embedded in the module, in the order the bindings index
+# them (kWinoNames in dlpack_bindings.cpp).
+set(WINO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/miopen_winograd")
+set(WINO_KERNELS f2x3_stride1 f2x3_stride2 f3x2_stride1 f3x2_stride2 f2x3_dilation2 f3x2_dilation2)
+set(WINO_NAMES "")
+set(WINO_OBJECTS "")
+foreach(kernel IN LISTS WINO_KERNELS)
+    set(name "Conv_Winograd_v30_3_1_fp32_${kernel}")
+    set(object "${CMAKE_CURRENT_BINARY_DIR}/miopen_winograd/${name}.hsaco")
+    add_custom_command(
+        OUTPUT "${object}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/miopen_winograd"
+        COMMAND "${CMAKE_HIP_COMPILER}" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1010:xnack-
+                -mcumode -mwavefrontsize64 -Wa,-defsym,ROCM_METADATA_VERSION=5
+                -Wa,-defsym,FORCE_CACHE_BYPASS_ON_STORE=0 -I "${WINO_DIR}"
+                "${WINO_DIR}/${name}.s" -o "${object}"
+        DEPENDS "${WINO_DIR}/${name}.s" "${WINO_DIR}/Conv_Winograd_v30_3_1_gfx10_fp32_${kernel}.inc"
+                "${WINO_DIR}/Conv_Winograd_v30_3_1_metadata.inc"
+        VERBATIM
+    )
+    list(APPEND WINO_NAMES "${name}")
+    list(APPEND WINO_OBJECTS "${object}")
+endforeach()
+set(WINO_BLOBS "${CMAKE_CURRENT_BINARY_DIR}/miopen_winograd_blobs.cpp")
+add_custom_command(
+    OUTPUT "${WINO_BLOBS}"
+    COMMAND "${CMAKE_COMMAND}" -DOUT=${WINO_BLOBS} -DDIR=${CMAKE_CURRENT_BINARY_DIR}/miopen_winograd
+            "-DNAMES=${WINO_NAMES}" -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_hsaco.cmake"
+    DEPENDS ${WINO_OBJECTS} "${CMAKE_CURRENT_SOURCE_DIR}/embed_hsaco.cmake"
+    VERBATIM
+)
+
 set(CPP_SOURCES
     dlpack_bindings.cpp
+    ${WINO_BLOBS}
 )
 
 # Keep HIP compilation independent of the Python extension target. The kernels

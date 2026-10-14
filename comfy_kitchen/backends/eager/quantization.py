@@ -997,6 +997,29 @@ def fp16_packed_linear(
     return out if out_dtype is None else out.to(out_dtype)
 
 
+def dequantize_q8_0(raw: torch.Tensor, out_features: int, in_features: int,
+                    dtype: torch.dtype = torch.float16) -> torch.Tensor:
+    """A GGUF Q8_0 weight, raw [out_features, in_features / 32 * 34] bytes (each block an
+    fp16 scale then 32 int8 codes), as a dense [out_features, in_features] tensor."""
+    blocks = raw.reshape(out_features, in_features // 32, 34)
+    scale = blocks[..., :2].contiguous().view(torch.float16).to(dtype)
+    codes = blocks[..., 2:].contiguous().view(torch.int8).to(dtype)
+    return (codes * scale).reshape(out_features, in_features)
+
+
+def q8_0_linear(
+    x: torch.Tensor,
+    raw: torch.Tensor,
+    out_features: int,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """``linear(x)`` against a GGUF Q8_0 weight, dequantized to x's dtype."""
+    weight = dequantize_q8_0(raw, out_features, x.shape[-1], x.dtype)
+    out = torch.nn.functional.linear(x, weight, None if bias is None else bias.to(x.dtype))
+    return out if out_dtype is None else out.to(out_dtype)
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,

@@ -131,7 +131,10 @@ __all__ = [
     "depthwise_conv3d",
     "depthwise_conv_transpose3d",
     "direct_conv3d",
+    "fp32_winograd_conv2d",
+    "fp32_winograd_conv_transpose2d",
     "fp16_packed_linear",
+    "q8_0_linear",
     "fp16_packed_linear_is_accelerated",
     "int8_linear",
     "w4a8_int8_linear",
@@ -1011,6 +1014,23 @@ def fp16_packed_linear(
     return impl(**kwargs)
 
 
+def q8_0_linear(
+    x: torch.Tensor,
+    raw: torch.Tensor,
+    out_features: int,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Linear against a GGUF Q8_0 weight given as its raw bytes (uint8, [out_features,
+    in_features / 32 * 34]: per 32-element block an fp16 scale and 32 int8 codes), stored as
+    ``out_dtype`` (x's dtype by default). The rdna1 backend reads the codes in its packed
+    GEMM and applies the block scales there; elsewhere the weight is dequantized to x's
+    dtype for ``torch.nn.functional.linear``."""
+    kwargs = {"x": x, "raw": raw, "out_features": out_features, "bias": bias, "out_dtype": out_dtype}
+    impl = registry.get_implementation("q8_0_linear", kwargs=kwargs)
+    return impl(**kwargs)
+
+
 def fp16_packed_conv3d(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1033,6 +1053,10 @@ def fp16_packed_conv3d(
               "dilation": dilation}
     impl = registry.get_implementation("fp16_packed_conv3d", kwargs=kwargs)
     return impl(**kwargs)
+
+
+def _pair(v):
+    return [v] * 2 if isinstance(v, int) else list(v)
 
 
 def _triple(v):
@@ -1090,6 +1114,38 @@ def direct_conv3d(
     kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _triple(stride),
               "padding": _triple(padding), "dilation": _triple(dilation)}
     impl = registry.get_implementation("direct_conv3d", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def fp32_winograd_conv2d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: int | tuple[int, int] = 1,
+    padding: int | tuple[int, int] = 0,
+) -> torch.Tensor:
+    """fp32 conv2d with zero padding. rdna1 serves stride 1 and 2 with MIOpen's Winograd RxS
+    kernels, built into the backend so no MIOpen search runs; elsewhere this is torch's
+    conv2d."""
+    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _pair(stride), "padding": _pair(padding)}
+    impl = registry.get_implementation("fp32_winograd_conv2d", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def fp32_winograd_conv_transpose2d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: int | tuple[int, int] = 1,
+    padding: int | tuple[int, int] = 0,
+    output_padding: int | tuple[int, int] = 0,
+) -> torch.Tensor:
+    """fp32 conv_transpose2d (one group, no dilation) with a [C, K, R, S] weight. rdna1 serves
+    stride 1 and 2 with MIOpen's Winograd RxS kernels as its backward-data solver runs them;
+    elsewhere this is torch's conv_transpose2d."""
+    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _pair(stride),
+              "padding": _pair(padding), "output_padding": _pair(output_padding)}
+    impl = registry.get_implementation("fp32_winograd_conv_transpose2d", kwargs=kwargs)
     return impl(**kwargs)
 
 

@@ -72,6 +72,30 @@ def direct_conv3d(
     return fp16_packed_conv3d(x, weight, bias, stride, padding, dilation)
 
 
+def fp32_winograd_conv2d(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor | None,
+    stride: list[int],
+    padding: list[int],
+) -> Tensor:
+    """fp32 2D conv with zero padding."""
+    return functional.conv2d(x, weight, bias, stride=stride, padding=padding)
+
+
+def fp32_winograd_conv_transpose2d(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    output_padding: list[int],
+) -> Tensor:
+    """fp32 2D transposed conv, one group."""
+    return functional.conv_transpose2d(x, weight, bias, stride=stride, padding=padding,
+                                       output_padding=output_padding)
+
+
 def depthwise_conv3d(
     x: Tensor,
     weight: Tensor,

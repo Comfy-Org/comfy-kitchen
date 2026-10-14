@@ -81,6 +81,22 @@ struct EpiRowScale {
     }
 };
 
+// out = acc * row_scale[row] + bias[col] for a GEMM whose B carries per-stage block scales
+// (block_scale [K / 32, N], see BLOCK SCALES in gemm_simt.h): a GGUF Q8_0 weight.
+struct EpiRowScaleBlocks {
+    const float* row_scale;
+    const void* bias;
+    int bias_code;
+    const __half* block_scale;
+
+    __forceinline__ __device__ void init() {}
+
+    __forceinline__ __device__ float operator()(int row, int col, float acc) const {
+        const float v = acc * row_scale[row];
+        return bias ? v + load_scalar(bias, bias_code, col) : v;
+    }
+};
+
 // Unscaled fp16 operands: out = acc + bias[col], or with resid set
 // out = resid[row * resid_stride + col] + rscale[col] * (acc + bias[col]).
 // resid_stride 0 broadcasts a single [N] residual row. All operands are fp16.

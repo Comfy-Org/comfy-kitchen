@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 #include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -52,7 +55,11 @@ void launch_convrot_w4a4_gemm_kernel(const void*, const void*, void*, const void
 bool launch_fp16_gemm_kernel(const void*, const void*, void*, const void*, const void*,
                              const void*, int, int, int, hipStream_t);
 bool launch_fp16_packed_linear_kernel(const void*, int, const void*, const void*, void*, void*,
-                                      const void*, int, void*, int, int, int, int, hipStream_t);
+                                      void*, const void*, int, void*, int, int, int, int,
+                                      hipStream_t);
+bool launch_q8_0_packed_linear_kernel(const void*, int, const void*, const void*, void*, void*,
+                                      void*, void*, void*, const void*, int, void*, int, int, int,
+                                      int, hipStream_t);
 bool launch_int8_convrot_packed_linear_kernel(const void*, int, int, const void*, float,
                                               const void*, const void*, int, const void*, int,
                                               void*, void*, void*, void*, int, int, int, int,
@@ -72,6 +79,9 @@ void launch_packed_acc_scale_kernel(const void*, int, int64_t, const void*, int,
 bool launch_direct_conv3d_kernel(const void*, const void*, const void*, void*, int, int, int, int,
                                  int, int, int, int, int, int, int, int, int, int, int, int, int,
                                  int, int, int, int, int, hipStream_t);
+bool launch_fp16_winograd_conv_kernel(const void*, const void*, int, const void*, void*, int, void*,
+                                      int, int, int, int, int, int, int, int, int, int, int, int,
+                                      int, int, int, const void*, hipStream_t);
 void launch_depthwise_conv3d_kernel(const void*, int, const void*, int, const void*, int, void*,
                                     int, int, int, int, int, int, int, int, int, int, int, int,
                                     int, int, int, int, int, int, int, int, int, bool,
@@ -467,7 +477,7 @@ bool fp16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias,
 // into x16 (fp16 scratch, scale in row_scale) against w_amax, the largest |w|. false
 // means the caller serves the call.
 bool fp16_packed_linear(nb::ndarray<> x, nb::ndarray<> w, nb::ndarray<> w_amax,
-                        nb::ndarray<> x16, nb::ndarray<> row_scale, OptArray bias,
+                        nb::ndarray<> x16, OptArray x16t, nb::ndarray<> row_scale, OptArray bias,
                         nb::ndarray<> d, int M, int N, int K, int out_code,
                         uintptr_t stream_ptr) {
     constexpr const char* kFn = "fp16_packed_linear";
@@ -486,13 +496,63 @@ bool fp16_packed_linear(nb::ndarray<> x, nb::ndarray<> w, nb::ndarray<> w_amax,
     require_len(w, static_cast<int64_t>(N) * K, kFn, "w");
     require_len(w_amax, 1, kFn, "w_amax");
     require_len(x16, static_cast<int64_t>(M) * K, kFn, "x16");
+    if (x16t.has_value()) {
+        require_dtype(*x16t, 1, 1, kFn, "x16t");
+        require_len(*x16t, static_cast<int64_t>((M + 127) / 128) * 128 * K, kFn, "x16t");
+    }
     require_len(row_scale, M, kFn, "row_scale");
     require_len(d, static_cast<int64_t>(M) * N, kFn, "d");
     require_bias(bias, N, kFn);
     const bool served = launch_fp16_packed_linear_kernel(
         x.data(), map_dtype_to_code(x.dtype()), w.data(), w_amax.data(), x16.data(),
-        row_scale.data(), opt_data(bias), opt_code(bias), d.data(), out_code, M, N, K,
+        x16t.has_value() ? x16t->data() : nullptr, row_scale.data(), opt_data(bias),
+        opt_code(bias), d.data(), out_code, M, N, K,
         reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return served;
+}
+
+// Linear of x [M, K] against a GGUF Q8_0 weight, raw [N, K / 32 * 34] bytes, on the
+// tiled packed GEMM (see ops/gemm_f16_packed.hip); w_amax holds 127, x16 / x16t / row_scale
+// as for fp16_packed_linear, codes ([N, K] int8) and scales ([K / 32, N] fp16) scratch.
+// false means the caller serves the call.
+bool q8_0_packed_linear(nb::ndarray<> x, nb::ndarray<> raw, nb::ndarray<> w_amax,
+                        nb::ndarray<> x16, nb::ndarray<> x16t, nb::ndarray<> row_scale,
+                        nb::ndarray<> codes, nb::ndarray<> scales, OptArray bias, nb::ndarray<> d,
+                        int M, int N, int K, int out_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "q8_0_packed_linear";
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_fp16_k(K, kFn);
+    if (K % 32 != 0) {
+        throw std::runtime_error(std::string(kFn) + ": K must be a multiple of 32");
+    }
+    require_dtype(x, 0, 2, kFn, "x");
+    require_dtype(w_amax, 0, 0, kFn, "w_amax");
+    require_dtype(x16, 1, 1, kFn, "x16");
+    require_dtype(x16t, 1, 1, kFn, "x16t");
+    require_dtype(row_scale, 0, 0, kFn, "row_scale");
+    require_dtype(scales, 1, 1, kFn, "scales");
+    require_dtype(d, 0, 2, kFn, "d");
+    require_out_matches(d, out_code, kFn);
+    if (raw.dtype() != nb::dtype<uint8_t>() || codes.dtype() != nb::dtype<int8_t>()) {
+        throw std::runtime_error(std::string(kFn) + ": raw must be uint8 and codes int8");
+    }
+    require_len(x, static_cast<int64_t>(M) * K, kFn, "x");
+    require_len(raw, static_cast<int64_t>(N) * (K / 32) * 34, kFn, "raw");
+    require_len(w_amax, 1, kFn, "w_amax");
+    require_len(x16, static_cast<int64_t>(M) * K, kFn, "x16");
+    require_len(x16t, static_cast<int64_t>((M + 127) / 128) * 128 * K, kFn, "x16t");
+    require_len(row_scale, M, kFn, "row_scale");
+    require_len(codes, static_cast<int64_t>(N) * K, kFn, "codes");
+    require_len(scales, static_cast<int64_t>(K / 32) * N, kFn, "scales");
+    require_len(d, static_cast<int64_t>(M) * N, kFn, "d");
+    require_bias(bias, N, kFn);
+    const bool served = launch_q8_0_packed_linear_kernel(
+        x.data(), map_dtype_to_code(x.dtype()), raw.data(), w_amax.data(), x16.data(), x16t.data(),
+        row_scale.data(), codes.data(), scales.data(), opt_data(bias), opt_code(bias), d.data(),
+        out_code, M, N, K, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
     return served;
 }
@@ -758,6 +818,199 @@ bool direct_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, nb::ndarray<
         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
     return served;
+}
+
+// Winograd conv3d of the scaled NDHWC fp16 x [N, D, H, W, Cp] with w [K, C, T, 3, 3] into the
+// contiguous out [N, K, Z, P, Q], whose dtype bias shares; u is int32 scratch for the
+// transformed filter. false means the caller serves the call.
+bool fp16_winograd_conv(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, nb::ndarray<> out,
+                        nb::ndarray<> u, int N, int D, int H, int W, int Cp, int C, int K, int T,
+                        int Z, int P, int Q, int sd, int pd, int ph, int pw,
+                        nb::ndarray<> acc_scale, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "fp16_winograd_conv";
+    require_nonneg(N, kFn, "N");
+    for (int v : {D, H, W, Cp, C, K, T, sd}) {
+        require_positive(v, kFn, "extent");
+    }
+    for (int v : {Z, P, Q, pd, ph, pw}) {
+        require_nonneg(v, kFn, "extent");
+    }
+    if (P != H + 2 * ph - 2 || Q != W + 2 * pw - 2 ||
+        (Z > 0 && static_cast<int64_t>(Z - 1) * sd + T > D + 2 * static_cast<int64_t>(pd))) {
+        throw std::runtime_error(std::string(kFn) + ": output extent does not match the conv");
+    }
+    require_dtype(x, 1, 1, kFn, "x");
+    require_dtype(w, 0, 2, kFn, "w");
+    require_dtype(out, 0, 2, kFn, "out");
+    require_dtype(acc_scale, 0, 0, kFn, "acc_scale");
+    require_len(acc_scale, 1, kFn, "acc_scale");
+    require_len(x, static_cast<int64_t>(N) * D * H * W * Cp, kFn, "x");
+    require_len(w, static_cast<int64_t>(K) * C * T * 9, kFn, "w");
+    require_len(out, static_cast<int64_t>(N) * K * Z * P * Q, kFn, "out");
+    if (u.dtype() != nb::dtype<int32_t>() || Cp % 16 != 0 ||
+        static_cast<int64_t>(u.size()) < static_cast<int64_t>((K + 31) / 32) * (static_cast<int64_t>(T) * Cp / 16) * 4096) {
+        throw std::runtime_error(std::string(kFn) + ": u must be int32 scratch for the transformed filter");
+    }
+    if (bias.has_value()) {
+        require_out_matches(*bias, map_dtype_to_code(out.dtype()), kFn);
+        require_len(*bias, K, kFn, "bias");
+    }
+    const bool served = launch_fp16_winograd_conv_kernel(
+        x.data(), w.data(), map_dtype_to_code(w.dtype()), opt_data(bias), out.data(),
+        map_dtype_to_code(out.dtype()), u.data(), N, D, H, W, Cp, C, K, T, Z, P, Q, sd, pd, ph, pw,
+        acc_scale.data(), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return served;
+}
+
+// MIOpen's Winograd RxS kernels (miopen_winograd/), embedded by embed_hsaco.cmake in the
+// order of kWinoNames.
+namespace comfy::hip_backend {
+extern const unsigned char* const kWinoBlobs[];
+extern const size_t kWinoBlobSizes[];
+}  // namespace comfy::hip_backend
+
+static const char* const kWinoNames[] = {
+    "miopenSp3AsmConv_v30_3_1_gfx10_fp32_f2x3_stride1",
+    "miopenSp3AsmConv_v30_3_1_gfx10_fp32_f2x3_stride2",
+    "miopenSp3AsmConv_v30_3_1_gfx10_fp32_f3x2_stride1",
+    "miopenSp3AsmConv_v30_3_1_gfx10_fp32_f3x2_stride2",
+    "miopenSp3AsmConv_v30_3_1_gfx10_fp32_f2x3_dilation2",
+    "miopenSp3AsmConv_v30_3_1_gfx10_fp32_f3x2_dilation2",
+};
+
+// The kernels' argument block, laid out as their metadata (Conv_Winograd_v30_3_1_metadata.inc)
+// declares it and filled as MIOpen's ConvBinWinoRxS<>::GetSolution fills it for a forward
+// conv or a backward-data one: element strides, one group, no activation.
+struct WinoArgs {
+    uint32_t N, C, H, W, K, n_groups;
+    uint64_t flags;
+    const void* in;
+    const void* weights;
+    void* out;
+    void* reserved_ptr;
+    uint32_t R, S;
+    int32_t pad_h, pad_w;
+    uint32_t out_h, out_w;
+    const void* bias;
+    float alpha, beta;
+    uint64_t d_offset, f_offset, o_offset, b_offset;
+    uint32_t d_strides[4], f_strides[4], o_strides[4];  // N/K, C, H, W
+    uint32_t G, d_G_stride, f_G_stride, o_G_stride;
+    uint8_t activation_mode, sync_limit, sync_period, reserved8;
+    uint32_t reserved32;
+    uint64_t hidden[5];  // global offsets and unused hidden arguments
+};
+static_assert(offsetof(WinoArgs, flags) == 24 && offsetof(WinoArgs, R) == 64 &&
+              offsetof(WinoArgs, bias) == 88 && offsetof(WinoArgs, d_offset) == 104 &&
+              offsetof(WinoArgs, d_strides) == 136 && offsetof(WinoArgs, G) == 184 &&
+              offsetof(WinoArgs, activation_mode) == 200 && sizeof(WinoArgs) == 248,
+              "WinoArgs must match the kernels' kernarg segment");
+
+// Each kernel's function on the current device, its code object loaded on first use. The
+// modules stay loaded for the process: six code objects of 33-42 KB.
+static hipFunction_t wino_function(int variant) {
+    static std::mutex mutex;
+    static std::map<std::pair<int, int>, hipFunction_t> functions;
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) {
+        throw std::runtime_error("fp32_winograd_conv2d: no current HIP device");
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto key = std::make_pair(device, variant);
+    if (auto it = functions.find(key); it != functions.end()) {
+        return it->second;
+    }
+    hipModule_t module = nullptr;
+    hipFunction_t function = nullptr;
+    if (hipModuleLoadData(&module, comfy::hip_backend::kWinoBlobs[variant]) != hipSuccess ||
+        hipModuleGetFunction(&function, module, kWinoNames[variant]) != hipSuccess) {
+        (void)hipGetLastError();
+        throw std::runtime_error(std::string("fp32_winograd_conv2d: cannot load ") + kWinoNames[variant]);
+    }
+    functions.emplace(key, function);
+    return function;
+}
+
+// conv2d of contiguous fp32 x [N, C, H, W] with contiguous fp32 w [K, C, R, S] into contiguous
+// fp32 out [N, K, out_h, out_w], or with transposed set conv_transpose2d with w [C, K, R, S]
+// (out_h and out_w then include any output padding); bias fp32 [K] or none, zero padding
+// (the conv's own, not the backward one), stride 1 or 2 on both axes, on the kernel
+// `variant` indexes (kWinoNames) with n_groups workgroups (one per CU). A transposed conv at
+// stride 2 takes a dilation2 kernel, as MIOpen's backward data does.
+void fp32_winograd_conv2d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, nb::ndarray<> out,
+                          int N, int C, int H, int W, int K, int R, int S, int pad_h, int pad_w,
+                          int out_h, int out_w, int variant, bool transposed, int n_groups,
+                          uintptr_t stream_ptr) {
+    constexpr const char* kFn = "fp32_winograd_conv2d";
+    for (int v : {N, C, H, W, K, R, S, out_h, out_w, n_groups}) {
+        require_positive(v, kFn, "extent");
+    }
+    require_nonneg(pad_h, kFn, "pad_h");
+    require_nonneg(pad_w, kFn, "pad_w");
+    // forward: kernels 0-3; transposed: the stride-1 kernels (0, 2) or the dilation2 ones (4, 5)
+    if (transposed ? !(variant == 0 || variant == 2 || variant == 4 || variant == 5)
+                   : !(variant >= 0 && variant <= 3)) {
+        throw std::runtime_error(std::string(kFn) + ": variant does not match the direction");
+    }
+    const int stride = (transposed ? variant >= 4 : variant % 2 == 1) ? 2 : 1;
+    if (transposed) {
+        // the backward pad must not be negative, and only output padding (< stride) may
+        // extend the output past the transposed conv's own extent
+        const auto fits = [&](int in, int taps, int pad, int o) {
+            const int base = (in - 1) * stride - 2 * pad + taps;
+            return pad <= taps - 1 && base <= o && o < base + stride;
+        };
+        if (!fits(H, R, pad_h, out_h) || !fits(W, S, pad_w, out_w)) {
+            throw std::runtime_error(std::string(kFn) + ": output extent does not match the conv");
+        }
+    } else if ((H + 2 * pad_h - R) / stride + 1 != out_h || (W + 2 * pad_w - S) / stride + 1 != out_w) {
+        throw std::runtime_error(std::string(kFn) + ": output extent does not match the conv");
+    }
+    require_dtype(x, 0, 0, kFn, "x");
+    require_dtype(w, 0, 0, kFn, "w");
+    require_dtype(out, 0, 0, kFn, "out");
+    require_len(x, static_cast<int64_t>(N) * C * H * W, kFn, "x");
+    require_len(w, static_cast<int64_t>(K) * C * R * S, kFn, "w");
+    require_len(out, static_cast<int64_t>(N) * K * out_h * out_w, kFn, "out");
+    if (bias.has_value()) {
+        require_dtype(*bias, 0, 0, kFn, "bias");
+        require_len(*bias, K, kFn, "bias");
+    }
+    // F_NKC_STRIDES | F_GROUP_STRIDES | F_USE_ACTIVATION_MODE, as MIOpen sets for v30, and
+    // F_BIAS (the fused-bias path of its conv + bias fusion) when a bias is given
+    constexpr uint64_t kFlags = (1u << 9) | (1u << 10) | (1u << 14);
+    constexpr uint64_t kBias = 1u << 7;
+    // F_REVERSE_R | F_REVERSE_S | F_FLIP_K_C, MIOpen's backward-data flags
+    constexpr uint64_t kBackward = (1u << 0) | (1u << 1) | (1u << 2);
+    const uint32_t hw = static_cast<uint32_t>(H) * W, rs = static_cast<uint32_t>(R) * S;
+    const uint32_t ohw = static_cast<uint32_t>(out_h) * out_w;
+    WinoArgs args{};
+    args.N = N, args.C = C, args.H = H, args.W = W, args.K = K;
+    args.n_groups = n_groups;
+    args.flags = kFlags | (bias.has_value() ? kBias : 0) | (transposed ? kBackward : 0);
+    args.in = x.data(), args.weights = w.data(), args.out = out.data();
+    args.R = R, args.S = S;
+    args.pad_h = transposed ? R - 1 - pad_h : pad_h;
+    args.pad_w = transposed ? S - 1 - pad_w : pad_w;
+    args.out_h = out_h, args.out_w = out_w;
+    args.bias = opt_data(bias);
+    const uint32_t d[4] = {C * hw, hw, static_cast<uint32_t>(W), 1};
+    // w is read as [K, C, R, S], or for a transposed conv as torch's [C, K, R, S]
+    const uint32_t f[4] = {transposed ? rs : C * rs, transposed ? K * rs : rs, static_cast<uint32_t>(S), 1};
+    const uint32_t o[4] = {K * ohw, ohw, static_cast<uint32_t>(out_w), 1};
+    std::memcpy(args.d_strides, d, sizeof(d));
+    std::memcpy(args.f_strides, f, sizeof(f));
+    std::memcpy(args.o_strides, o, sizeof(o));
+    args.G = 1, args.d_G_stride = d[0], args.f_G_stride = K * f[0], args.o_G_stride = o[0];
+    size_t size = sizeof(args);
+    void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &size,
+                      HIP_LAUNCH_PARAM_END};
+    if (hipModuleLaunchKernel(wino_function(variant), n_groups, 1, 1, 256, 1, 1, 0,
+                              reinterpret_cast<hipStream_t>(stream_ptr), nullptr, config) != hipSuccess) {
+        (void)hipGetLastError();
+        throw std::runtime_error(std::string(kFn) + ": launch failed");
+    }
 }
 
 // out[0] = the power of two the packed convs scale x (or, with scale_weight, the weight) by,
@@ -2494,9 +2747,13 @@ NB_MODULE(_C, m) {
           nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),
           nb::arg("N"), nb::arg("K"), nb::arg("stream_ptr"));
     m.def("fp16_packed_linear", &fp16_packed_linear, nb::arg("x"), nb::arg("w"),
-          nb::arg("w_amax"), nb::arg("x16"), nb::arg("row_scale"), nb::arg("bias").none(),
-          nb::arg("d"), nb::arg("M"), nb::arg("N"), nb::arg("K"), nb::arg("out_code"),
+          nb::arg("w_amax"), nb::arg("x16"), nb::arg("x16t").none(), nb::arg("row_scale"),
+          nb::arg("bias").none(), nb::arg("d"), nb::arg("M"), nb::arg("N"), nb::arg("K"), nb::arg("out_code"),
           nb::arg("stream_ptr"));
+    m.def("q8_0_packed_linear", &q8_0_packed_linear, nb::arg("x"), nb::arg("raw"),
+          nb::arg("w_amax"), nb::arg("x16"), nb::arg("x16t"), nb::arg("row_scale"),
+          nb::arg("codes"), nb::arg("scales"), nb::arg("bias").none(), nb::arg("d"), nb::arg("M"),
+          nb::arg("N"), nb::arg("K"), nb::arg("out_code"), nb::arg("stream_ptr"));
     m.def("int8_convrot_packed_linear", &int8_convrot_packed_linear, nb::arg("x"),
           nb::arg("act_code"), nb::arg("act_weight").none(), nb::arg("act_eps"), nb::arg("w"),
           nb::arg("w_scale"), nb::arg("w_scale_stride"), nb::arg("bias").none(), nb::arg("x16"),
@@ -2521,6 +2778,16 @@ NB_MODULE(_C, m) {
           nb::arg("uz"), nb::arg("up"), nb::arg("uq"), nb::arg("rz"), nb::arg("rp"),
           nb::arg("rq"), nb::arg("Zf"), nb::arg("Pf"), nb::arg("Qf"), nb::arg("acc_scale"),
           nb::arg("stream_ptr"));
+    m.def("fp16_winograd_conv", &fp16_winograd_conv, nb::arg("x"), nb::arg("w"),
+          nb::arg("bias").none(), nb::arg("out"), nb::arg("u"), nb::arg("N"), nb::arg("D"),
+          nb::arg("H"), nb::arg("W"), nb::arg("Cp"), nb::arg("C"), nb::arg("K"), nb::arg("T"),
+          nb::arg("Z"), nb::arg("P"), nb::arg("Q"), nb::arg("sd"), nb::arg("pd"), nb::arg("ph"),
+          nb::arg("pw"), nb::arg("acc_scale"), nb::arg("stream_ptr"));
+    m.def("fp32_winograd_conv2d", &fp32_winograd_conv2d, nb::arg("x"), nb::arg("w"),
+          nb::arg("bias").none(), nb::arg("out"), nb::arg("N"), nb::arg("C"), nb::arg("H"),
+          nb::arg("W"), nb::arg("K"), nb::arg("R"), nb::arg("S"), nb::arg("pad_h"),
+          nb::arg("pad_w"), nb::arg("out_h"), nb::arg("out_w"), nb::arg("variant"),
+          nb::arg("transposed"), nb::arg("n_groups"), nb::arg("stream_ptr"));
     m.def("direct_conv3d", &direct_conv3d, nb::arg("x"), nb::arg("w"), nb::arg("bias").none(),
           nb::arg("out"), nb::arg("N"), nb::arg("C"), nb::arg("K"), nb::arg("D"), nb::arg("H"),
           nb::arg("W"), nb::arg("Z"), nb::arg("P"), nb::arg("Q"), nb::arg("T"), nb::arg("R"),
