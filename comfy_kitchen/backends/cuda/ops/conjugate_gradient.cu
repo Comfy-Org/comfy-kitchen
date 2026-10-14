@@ -19,8 +19,9 @@
 // the row-major (n, k) b and x), the whole solve in one cooperative kernel: per iteration a matrix-vector phase, an
 // update phase and a direction phase, each closed by a grid barrier. Dot products are summed per block (warp shuffles,
 // then warps in order) and the block partials in a fixed order by every block, so the result does not depend on
-// thread timing. All columns iterate until every column's residual is within tol of its right-hand side. Indices
-// are checked once at the start.
+// thread timing. Consecutive sums write alternate halves of the partials: a block may start the next sum while
+// others still read the last one, and the barrier inside that sum orders every read before the one after. All columns
+// iterate until every column's residual is within tol of its right-hand side. Indices are checked once at the start.
 
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
@@ -49,14 +50,14 @@ struct Solve {
     double* r;
     double* p;
     double* ap;
-    double* partial;  // (blocks, 2 * kMaxCols)
+    double* partial;  // (2, blocks, 2 * kMaxCols)
     int max_iters;
     double tol2;
     int* error;       // set when indptr or cols holds an index out of range
 };
 
 // sums m <= 2 * kMaxCols values over the block into partial[blockIdx.x], then over all blocks into total
-__device__ void grid_sum(const cg::grid_group& grid, const Solve& s, double* acc, int m, double* total) {
+__device__ void grid_sum(const cg::grid_group& grid, double* partial, double* acc, int m, double* total) {
     __shared__ double warp_sums[kWarps][2 * kMaxCols];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     for (int c = 0; c < m; ++c) {
@@ -68,7 +69,7 @@ __device__ void grid_sum(const cg::grid_group& grid, const Solve& s, double* acc
     if (threadIdx.x < m) {
         double v = 0.0;
         for (int w = 0; w < kWarps; ++w) v += warp_sums[w][threadIdx.x];
-        s.partial[blockIdx.x * 2 * kMaxCols + threadIdx.x] = v;
+        partial[blockIdx.x * 2 * kMaxCols + threadIdx.x] = v;
     }
     grid.sync();
     __shared__ double sums[2 * kMaxCols];
@@ -76,7 +77,7 @@ __device__ void grid_sum(const cg::grid_group& grid, const Solve& s, double* acc
         for (int c = 0; c < m; ++c) {
             double v = 0.0;
             for (int blk = lane; blk < static_cast<int>(gridDim.x); blk += 32)
-                v += __ldcg(s.partial + blk * 2 * kMaxCols + c);
+                v += __ldcg(partial + blk * 2 * kMaxCols + c);
             for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
             if (lane == 0) sums[c] = v;
         }
@@ -104,6 +105,8 @@ __global__ void cg_kernel(Solve s) {
     grid.sync();
     if (__ldcg(s.error)) return;
     double acc[2 * kMaxCols], rs[kMaxCols], stop[kMaxCols], total[2 * kMaxCols];
+    double* const half[2] = {s.partial, s.partial + gridDim.x * 2 * kMaxCols};
+    int flip = 0;
     for (int c = 0; c < 2 * k; ++c) acc[c] = 0.0;
     for (int i = tid; i < s.n; i += stride)
         for (int c = 0; c < k; ++c) {
@@ -114,7 +117,7 @@ __global__ void cg_kernel(Solve s) {
             acc[c] += ri * ri;
             acc[k + c] += s.b[at] * s.b[at];
         }
-    grid_sum(grid, s, acc, 2 * k, total);
+    grid_sum(grid, half[flip++ % 2], acc, 2 * k, total);
     for (int c = 0; c < k; ++c) {
         rs[c] = total[c];
         stop[c] = s.tol2 * fmax(total[k + c], 1e-300);
@@ -131,7 +134,7 @@ __global__ void cg_kernel(Solve s) {
                 s.ap[at] = v;
                 acc[c] += __ldcg(s.p + at) * v;
             }
-        grid_sum(grid, s, acc, k, total);
+        grid_sum(grid, half[flip++ % 2], acc, k, total);
         double alpha[kMaxCols];
         for (int c = 0; c < k; ++c) alpha[c] = rs[c] / fmax(total[c], 1e-300);
         for (int c = 0; c < k; ++c) acc[c] = 0.0;
@@ -143,7 +146,7 @@ __global__ void cg_kernel(Solve s) {
                 s.r[at] = ri;
                 acc[c] += ri * ri;
             }
-        grid_sum(grid, s, acc, k, total);
+        grid_sum(grid, half[flip++ % 2], acc, k, total);
         for (long long at = tid; at < static_cast<long long>(s.n) * k; at += stride)
             s.p[at] = __ldcg(s.r + at) + total[at % k] / fmax(rs[at % k], 1e-300) * __ldcg(s.p + at);
         for (int c = 0; c < k; ++c) rs[c] = total[c];
@@ -158,7 +161,7 @@ using namespace comfy::conjugate_gradient;
 
 extern "C" {
 
-// x holds the start and the solution on return; work is (3 * n * k + 2 * kMaxCols * SMs) scratch, error a zeroed int
+// x holds the start and the solution on return; work is (3 * n * k + 4 * kMaxCols * SMs) scratch, error a zeroed int
 // set (and nothing solved) on an index out of range.
 void launch_conjugate_gradient(int n, int k, int nnz, const void* indptr, const void* cols, const void* vals,
                                const void* b, void* x, void* work, int max_iters, double tol, void* error,
