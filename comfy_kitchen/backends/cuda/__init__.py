@@ -3713,7 +3713,7 @@ def conjugate_gradient(indptr: torch.Tensor, cols: torch.Tensor, vals: torch.Ten
     if not x.is_contiguous():
         raise ValueError("x is updated in place and must be contiguous")
     sms = torch.cuda.get_device_properties(device).multi_processor_count
-    work = torch.empty(3 * x.numel() + 8 * sms, dtype=torch.float64, device=device)     # r, p, A p, block partials
+    work = torch.empty(3 * x.numel() + 16 * sms, dtype=torch.float64, device=device)    # r, p, A p, 2 x block partials
     error = torch.zeros(1, dtype=torch.int32, device=device)
     w = _wrap_for_dlpack
     _C.conjugate_gradient(n, k, cols.shape[0], w(indptr.to(torch.int32).contiguous()), w(cols.to(torch.int32).contiguous()),
