@@ -5,15 +5,15 @@
 // in shared memory for all S steps, one block per (batch, head), one thread per
 // value column. Snapshots after steps 0..S-2 serve the speculative-decode rollback.
 //
-// The deferred-commit variant (sm_90+) instead keeps the state in registers on a
-// 4-block cluster per (batch, head) and replays the accepted tokens of the
-// previous verify step from small side buffers before writing the state once.
+// Deferred commit keeps state in registers across four blocks per (batch, head).
+// SM90+ fuses gated RMSNorm using a cluster; SM80/89 uses a second kernel.
+// Accepted tokens are replayed before writing the committed state once.
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#include <cstdint>
 #include <cooperative_groups.h>
+#include <cstdint>
 
 #include "float_utils.cuh"
 #include "dtype_dispatch.cuh"
@@ -625,6 +625,264 @@ gated_delta_decode_deferred_kernel(
 #endif
 }
 
+// SM80/89: the same register-owned recurrence without cluster cooperation.
+// A separate gated RMSNorm consumes the rounded column outputs.
+// Delta-rule steps for one (batch, head) across
+// 4 blocks x 256 threads. Block r owns value columns [32r, 32r+32); a warp owns 4
+// columns and a lane one column x a 16-row kk slice held in registers, so the
+// per-token column sum over kk is 16 fmas and 3 shuffles with no block barrier.
+// The prologue folds the a/b gate projections (threads 0..127, the same 128-thread
+// reduction for every block) and normalizes q/k for the pending
+// replay tokens and the S current tokens into shared memory, laid out so a lane's
+// 16-row slice is 4 conflict-free 128-bit reads.
+
+template <typename T, int DK, int DV, int S>
+__global__ void __launch_bounds__(256, 2)
+gated_delta_decode_deferred_flat_kernel(
+    const T* __restrict__ x,           // [B, S, Hd]
+    const T* __restrict__ w_a,         // [Hv, Hd]
+    const T* __restrict__ w_b,         // [Hv, Hd]
+    const float* __restrict__ dt_bias, // [Hv]
+    const float* __restrict__ g_decay, // [Hv]
+    const T* __restrict__ qkv_buf,     // [2, B, C, kSlotMax] conv+silu output, previous / current step
+    float* __restrict__ gates_buf,     // [2, B, kSlotMax, Hv, 2]: decay g, beta
+    float* __restrict__ sumsq_buf,     // [2, B, kSlotMax, Hk, 2]: sum q^2, sum k^2
+    const int* __restrict__ ctl,       // {pending, parity}
+    float* __restrict__ state,         // [B, Hv, DK, DV] committed state, updated in place
+    T* __restrict__ out,               // [B, S, Hv, DV]
+    int B, int Hv, int Hk, int C, int Hd, int key_dim, float scale)
+{
+    constexpr int NT = 256, NW = NT / 32, CL = 4;
+    constexpr int COLS = DV / CL;           // columns per block
+    constexpr int RG = 8;                   // row groups per warp (lane >> 2)
+    constexpr int KPL = DK / RG;            // rows per lane
+    constexpr int MAXT = kSlotMax + S;      // replay slots + current tokens
+    constexpr int GNT = 128, GNW = GNT / 32;   // gate projection threads / warps
+    static_assert(COLS == NW * 4 && KPL == 16 && DK == 128, "kernel is shaped for DK = DV = 128");
+    const int rank = static_cast<int>(blockIdx.x) % CL;
+    __shared__ __align__(16) float sk[MAXT * DK];   // [i][j][rg][e]: row = 16 rg + 4 j + e
+    __shared__ __align__(16) float sq[MAXT * DK];
+    __shared__ float sv[MAXT][COLS];         // v for this block's columns
+    __shared__ float sg[MAXT][2];            // decay g, beta per token
+    __shared__ float ssum[MAXT][2];          // sum q^2, sum k^2 per token
+    __shared__ float red[4 * S][GNW];
+    __shared__ float oc[S][COLS];            // bf16-rounded column outputs
+    const int head = static_cast<int>(blockIdx.x) / CL;
+    const int b = head / Hv;
+    const int h = head % Hv;
+    const int t = threadIdx.x;
+    const int lane = t & 31, wid = t >> 5;
+    const int col = lane & 3, rg = lane >> 2;
+    const int gc = rank * COLS + wid * 4 + col;   // this lane's value column
+    const int gqa = Hv / Hk;
+    const int hk = h / gqa;
+    const int pending = ctl[0], par = ctl[1];
+    const int64_t qkv_slab = static_cast<int64_t>(B) * C * kSlotMax;
+    const T* __restrict__ prev_qkv = qkv_buf + (1 - par) * qkv_slab + static_cast<int64_t>(b) * C * kSlotMax;
+    const T* __restrict__ cur_qkv = qkv_buf + par * qkv_slab + static_cast<int64_t>(b) * C * kSlotMax;
+    const int64_t state_off = (static_cast<int64_t>(b) * Hv + h) * DK * DV;
+    const int64_t tile_off = static_cast<int64_t>(rg * KPL) * DV + gc;   // this lane's first state element within the head
+
+    float st[KPL];
+    #pragma unroll
+    for (int r = 0; r < KPL; ++r)
+        st[r] = state[state_off + tile_off + r * DV];
+
+    // gate projections of the current tokens (bf16 projection outputs, bf16 sigmoid,
+    // fp32 softplus/exp, as in the eager chain) and the q/k sums of squares
+    if (t < GNT) {
+        float acc[4 * S];
+        #pragma unroll
+        for (int i = 0; i < 4 * S; ++i)
+            acc[i] = 0.0f;
+        const T* __restrict__ wa = w_a + static_cast<int64_t>(h) * Hd;
+        const T* __restrict__ wb = w_b + static_cast<int64_t>(h) * Hd;
+        const T* __restrict__ xb = x + static_cast<int64_t>(b) * S * Hd;
+        #pragma unroll 4
+        for (int i = 2 * t; i < Hd; i += 2 * GNT) {
+            const float2 wav = load2<T>(wa + i);
+            const float2 wbv = load2<T>(wb + i);
+            #pragma unroll
+            for (int s = 0; s < S; ++s) {
+                const float2 xv = load2<T>(xb + static_cast<int64_t>(s) * Hd + i);
+                acc[s] = fmaf(xv.x, wav.x, acc[s]);
+                acc[S + s] = fmaf(xv.x, wbv.x, acc[S + s]);
+                acc[s] = fmaf(xv.y, wav.y, acc[s]);
+                acc[S + s] = fmaf(xv.y, wbv.y, acc[S + s]);
+            }
+        }
+        const int64_t qrow = static_cast<int64_t>(hk) * DK + t;
+        #pragma unroll
+        for (int s = 0; s < S; ++s) {
+            const float qv = to_f<T>(cur_qkv[qrow * kSlotMax + s]);
+            const float kv = to_f<T>(cur_qkv[(qrow + key_dim) * kSlotMax + s]);
+            acc[2 * S + s] = qv * qv;
+            acc[3 * S + s] = kv * kv;
+        }
+        #pragma unroll
+        for (int i = 0; i < 4 * S; ++i) {
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                acc[i] += __shfl_xor_sync(0xffffffffu, acc[i], o);
+            if (lane == 0)
+                red[i][wid] = acc[i];
+        }
+    }
+    // gates and sums of squares of the previous step's pending tokens
+    if (t >= GNT && t - GNT < kSlotMax) {
+        const int i = t - GNT;
+        if (i < pending) {
+            const float2 g = *reinterpret_cast<const float2*>(
+                gates_buf + (((1 - par) * static_cast<int64_t>(B) + b) * kSlotMax + i) * Hv * 2 + h * 2);
+            const float2 n = *reinterpret_cast<const float2*>(
+                sumsq_buf + (((1 - par) * static_cast<int64_t>(B) + b) * kSlotMax + i) * Hk * 2 + hk * 2);
+            sg[i][0] = g.x;
+            sg[i][1] = g.y;
+            ssum[i][0] = n.x;
+            ssum[i][1] = n.y;
+        }
+    }
+    __syncthreads();
+    if (t < 2 * S) {
+        // thread s: gate pair of token s; thread S + s: norm pair of token s
+        const int s = t < S ? t : t - S;
+        const int base = t < S ? 0 : 2 * S;
+        float u = 0.0f, w = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < GNW; ++i) {
+            u += red[base + s][i];
+            w += red[base + S + s][i];
+        }
+        if (t < S) {
+            const float beta = round_to<T>(1.0f / (1.0f + expf(-round_to<T>(w))));
+            const float aa = round_to<T>(u) + dt_bias[h];
+            const float sp = aa > 20.0f ? aa : log1pf(expf(aa));
+            const float gd = expf(g_decay[h] * sp);
+            sg[pending + s][0] = gd;
+            sg[pending + s][1] = beta;
+            if (rank == 0) {
+                float* g = gates_buf + ((par * static_cast<int64_t>(B) + b) * kSlotMax + s) * Hv * 2 + h * 2;
+                g[0] = gd;
+                g[1] = beta;
+            }
+        } else {
+            ssum[pending + s][0] = u;
+            ssum[pending + s][1] = w;
+            if (rank == 0 && h % gqa == 0) {
+                float* n = sumsq_buf + ((par * static_cast<int64_t>(B) + b) * kSlotMax + s) * Hk * 2 + hk * 2;
+                n[0] = u;
+                n[1] = w;
+            }
+        }
+    }
+    __syncthreads();
+    {
+        // thread t normalizes row 16 rg + 4 j + e of k (t < 128) or q, written at
+        // shared index i*DK + t so the store is conflict-free
+        const int tt = t & (DK - 1);
+        const int row = 16 * ((tt >> 2) & 7) + 4 * (tt >> 5) + (tt & 3);
+        const bool is_q = t >= DK;
+        const int64_t src = (is_q ? 0 : key_dim) + static_cast<int64_t>(hk) * DK + row;
+        float* dst = is_q ? sq : sk;
+        #pragma unroll
+        for (int i = 0; i < MAXT; ++i) {
+            if (i < pending + S) {
+                const T* buf = i < pending ? prev_qkv + i : cur_qkv + (i - pending);
+                const float ss = ssum[i][is_q ? 0 : 1];
+                const float n = fmaxf(sqrtf(ss), 1e-12f);
+                const float v = to_f<T>(buf[src * kSlotMax]);
+                dst[i * DK + tt] = is_q ? v / n * scale : v / n;
+            }
+        }
+        const int64_t vsrc = 2 * static_cast<int64_t>(key_dim) + static_cast<int64_t>(h) * DV + rank * COLS;
+        for (int e = t; e < MAXT * COLS; e += NT) {
+            const int i = e / COLS, cc = e - i * COLS;
+            if (i < pending + S) {
+                const T* buf = i < pending ? prev_qkv + i : cur_qkv + (i - pending);
+                sv[i][cc] = to_f<T>(buf[(vsrc + cc) * kSlotMax]);
+            }
+        }
+    }
+    __syncthreads();
+
+    auto step = [&](int i, bool emit, int s) {
+        const float4* __restrict__ skr = reinterpret_cast<const float4*>(sk + i * DK) + rg;
+        const float4* __restrict__ sqr = reinterpret_cast<const float4*>(sq + i * DK) + rg;
+        const float g_s = sg[i][0], b_s = sg[i][1];
+        float k[KPL], q[KPL], sgs[KPL];
+        #pragma unroll
+        for (int j = 0; j < KPL / 4; ++j) {
+            const float4 k4 = skr[j * RG], q4 = sqr[j * RG];
+            k[4 * j + 0] = k4.x; k[4 * j + 1] = k4.y; k[4 * j + 2] = k4.z; k[4 * j + 3] = k4.w;
+            q[4 * j + 0] = q4.x; q[4 * j + 1] = q4.y; q[4 * j + 2] = q4.z; q[4 * j + 3] = q4.w;
+        }
+        float kvm = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < KPL; ++r) {
+            sgs[r] = st[r] * g_s;
+            kvm = fmaf(k[r], sgs[r], kvm);
+        }
+        kvm += __shfl_xor_sync(0xffffffffu, kvm, 4);
+        kvm += __shfl_xor_sync(0xffffffffu, kvm, 8);
+        kvm += __shfl_xor_sync(0xffffffffu, kvm, 16);
+        const float delta = (sv[i][wid * 4 + col] - kvm) * b_s;
+        float o = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < KPL; ++r) {
+            const float n = fmaf(k[r], delta, sgs[r]);
+            st[r] = n;
+            o = fmaf(q[r], n, o);
+        }
+        if (emit) {
+            o += __shfl_xor_sync(0xffffffffu, o, 4);
+            o += __shfl_xor_sync(0xffffffffu, o, 8);
+            o += __shfl_xor_sync(0xffffffffu, o, 16);
+            if (rg == 0)
+                oc[s][wid * 4 + col] = round_to<T>(o);
+        }
+    };
+    // replay the accepted tokens of the previous step and commit
+    for (int i = 0; i < pending; ++i)
+        step(i, false, 0);
+    #pragma unroll
+    for (int r = 0; r < KPL; ++r)
+        state[state_off + tile_off + r * DV] = st[r];
+    // current tokens: outputs only, state stays uncommitted until the next step
+    #pragma unroll
+    for (int s = 0; s < S; ++s)
+        step(pending + s, true, s);
+    __syncthreads();
+
+    if (wid < S) {
+        const int64_t row = ((static_cast<int64_t>(b) * S + wid) * Hv + h) * DV;
+        out[row + rank * COLS + lane] = comfy::from_float<T>(oc[wid][lane]);
+    }
+}
+
+template <typename T>
+__global__ void gated_delta_deferred_norm_kernel(T* out, const T* z, const T* norm_w,
+                                                float eps, int Hv, int ldz) {
+    __shared__ float partial[4];
+    const int col = threadIdx.x, lane = col & 31, rank = col >> 5;
+    const int row = blockIdx.x, token = row / Hv, h = row % Hv;
+    const float value = to_f<T>(out[static_cast<int64_t>(row) * 128 + col]);
+    float ss = value * value;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if (lane == 0)
+        partial[rank] = ss;
+    __syncthreads();
+    ss = 0.0f;
+    #pragma unroll
+    for (int r = 0; r < 4; ++r)
+        ss += partial[r];
+    const float y = round_to<T>(value * rsqrtf(ss / 128.0f + eps) * to_f<T>(norm_w[col]));
+    const float zz = to_f<T>(z[static_cast<int64_t>(token) * ldz + h * 128 + col]);
+    const float gate = round_to<T>(zz / (1.0f + expf(-zz)));
+    out[static_cast<int64_t>(row) * 128 + col] = comfy::from_float<T>(round_to<T>(y * gate));
+}
+
 // opt the kernel into the device's full dynamic shared memory once per (device, kernel)
 bool fused_shmem_ok(const void* fn, int fn_slot, size_t shmem) {
     constexpr int MAX_DEV = 16, SLOTS = 3;
@@ -709,18 +967,28 @@ extern "C" bool launch_gated_delta_decode_deferred(
     int device = 0, cc_major = 0;
     if (cudaGetDevice(&device) != cudaSuccess
             || cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess
-            || cc_major < 9)
+            || cc_major < 8)
         return false;
     return DISPATCH_FP_DTYPE(dtype_code, T, [&] {
         auto launch = [&]<int Steps>() {
-            gated_delta_decode_deferred_kernel<T, 128, 128, Steps><<<static_cast<unsigned>(B * Hv * 4), 256, 0, stream>>>(
+            if (cc_major >= 9) {
+                gated_delta_decode_deferred_kernel<T, 128, 128, Steps><<<static_cast<unsigned>(B * Hv * 4), 256, 0, stream>>>(
+                    static_cast<const T*>(x), static_cast<const T*>(w_a), static_cast<const T*>(w_b),
+                    static_cast<const float*>(dt_bias), static_cast<const float*>(g_decay),
+                    static_cast<const T*>(qkv_buf), static_cast<float*>(gates_buf), static_cast<float*>(sumsq_buf),
+                    static_cast<const int*>(ctl), static_cast<float*>(state), static_cast<T*>(out),
+                    static_cast<const T*>(z), static_cast<const T*>(norm_w), eps,
+                    static_cast<int>(B), static_cast<int>(Hv), static_cast<int>(Hk),
+                    static_cast<int>(C), static_cast<int>(Hd), static_cast<int>(key_dim), scale, static_cast<int>(ldz));
+                return;
+            }
+            gated_delta_decode_deferred_flat_kernel<T, 128, 128, Steps><<<static_cast<unsigned>(B * Hv * 4), 256, 0, stream>>>(
                 static_cast<const T*>(x), static_cast<const T*>(w_a), static_cast<const T*>(w_b),
                 static_cast<const float*>(dt_bias), static_cast<const float*>(g_decay),
                 static_cast<const T*>(qkv_buf), static_cast<float*>(gates_buf), static_cast<float*>(sumsq_buf),
                 static_cast<const int*>(ctl), static_cast<float*>(state), static_cast<T*>(out),
-                static_cast<const T*>(z), static_cast<const T*>(norm_w), eps,
                 static_cast<int>(B), static_cast<int>(Hv), static_cast<int>(Hk),
-                static_cast<int>(C), static_cast<int>(Hd), static_cast<int>(key_dim), scale, static_cast<int>(ldz));
+                static_cast<int>(C), static_cast<int>(Hd), static_cast<int>(key_dim), scale);
         };
         switch (S) {
             case 1: launch.template operator()<1>(); break;
@@ -731,6 +999,13 @@ extern "C" bool launch_gated_delta_decode_deferred(
             case 6: launch.template operator()<6>(); break;
             case 7: launch.template operator()<7>(); break;
             default: launch.template operator()<8>(); break;
+        }
+        if (cc_major < 9) {
+            if (cudaGetLastError() != cudaSuccess)
+                return false;
+            gated_delta_deferred_norm_kernel<T><<<static_cast<unsigned>(B * S * Hv), 128, 0, stream>>>(
+                static_cast<T*>(out), static_cast<const T*>(z), static_cast<const T*>(norm_w),
+                eps, static_cast<int>(Hv), static_cast<int>(ldz));
         }
         return cudaGetLastError() == cudaSuccess;
     });
