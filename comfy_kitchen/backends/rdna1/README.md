@@ -65,14 +65,36 @@ kernels, and MIOpen has no CK grouped-conv library for it.
   512x512 0.42 in fp32 and fp16; 128 -> 3 over 512x512 0.93 in fp32 and 0.17 in fp16, 2.7-3.4x
   the implicit GEMM. MIOpen's fp32 kernels stay ahead past about 64 patch elements and at
   narrow outputs under 512x512 (1.5-2.4x); the implicit GEMM past 8 output channels.
+  It also serves 1x1 convs of a channels-first x (up to 512 input channels in fp32, 128 in
+  fp16), which the packed conv would first transpose.
+- A fused Winograd F(2x2, 3x3) kernel inside `fp16_packed_conv3d`, taken for `[T, 3, 3]`
+  filters at spatial stride 1 over a channels-first x with a multiple of 16 channels and
+  at least 64 output tiles: 0.5-0.9x the implicit GEMM's time, error 1.5e-3 against its
+  8.9e-4. x is first copied channel-blocked (`[N, C/16, D, H, W, 16]`) so patch gathers
+  coalesce.
+- `fp32_winograd_conv2d` / `fp32_winograd_conv_transpose2d`: MIOpen's own fp32 Winograd RxS
+  kernels for gfx10 (`Conv_Winograd_v30_3_1`, f2x3 and f3x2 at stride 1, stride 2 and
+  dilation 2; see [miopen_winograd/README.md](miopen_winograd/README.md)), assembled at build
+  time and launched from `dlpack_bindings.cpp` without MIOpen. f2x3 serves stride 1 up to 5x5
+  filters, f3x2 stride 2 and 7x7. The transposed conv runs them as MIOpen's backward data
+  does (filter reversed, K and C swapped). 0.72-1.06x MIOpen's warm time with no per-shape
+  search, error ~1e-7; extents must stay under 2^16.
+- `q8_0_linear` / `q4_k_linear`: GGUF Q8_0 and Q4_K weights read as their raw blocks by the
+  packed GEMM, which applies the per-32-element scales (and Q4_K's offsets, as the offset
+  times the row's sum over the 32 elements) as it folds each stage. No fp16 copy of the weight
+  is made; shapes the tiled kernel declines (64 rows or fewer, K not a multiple of 256 for
+  Q4_K) dequantize to fp16 for `fp16_packed_linear`.
 
-Where MIOpen or rocBLAS stay ahead (callers should route these to torch): 1x1 convs (a plain
-GEMM over x as it lies; the packed GEMM first transposes it), fp32 2D convs up to 5x5
-(MIOpen's Winograd kernels, 1.2-2.8x), transposed convs of up to 640 input positions and most
-fp32 ones, and GEMMs under about a GFLOP over a short K (the packed linear's floor is
-~0.15 ms against rocBLAS's ~0.1).
+Where MIOpen or rocBLAS stay ahead once warm: 1x1 convs past 256 channels (1.05-1.5x), heads
+of a few output channels (1.2-1.4x), small fp16 transposed convs (1.4x), and GEMMs under
+about a GFLOP over a short K (the packed linear's floor is ~0.15 ms against rocBLAS's ~0.1).
+MIOpen is only that fast after its first call with each shape, which searches for a kernel
+(0.2-5 s a shape; gfx1010 ships no find-db), so the RDNA1 ComfyUI fork sends every float conv
+here.
+
 - NA3D, Sage INT8 and Sol attention on a software 16x16 tile policy (`mma.h`), plus an
   fp16-FMA Sage kernel for unmasked head_dim 64/128 and `int8_block_sparse_attention`.
+- W4A8 linears take the `hip` backend's fused input activation and scaled residual.
 - Elementwise kernels: fp8/int8 quantize, RoPE, RMS-RoPE, AdaLN, GroupNorm+SiLU+pad.
 
 Not provided: NA2D, flash decode and the GatedDeltaNet decode (the last two need bf16

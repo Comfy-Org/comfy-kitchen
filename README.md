@@ -272,8 +272,8 @@ math, for few input or at most 8 output channels), `depthwise_conv3d` and
 
 The W4A8 ops, `fp16_linear`, `fp16_conv3d` and `group_norm_silu_pad3d` follow the
 `hip` backend's: W4A8 weights decode a column chunk at a time into the int8 GEMM, or
-into a GEMV for a few rows, and `fp16_linear` fuses bias and a scaled residual into the
-epilogue.
+into a GEMV for a few rows, and take the same fused input activation and scaled
+residual; `fp16_linear` fuses bias and a scaled residual into the epilogue.
 
 `int8_attention` has an fp16-FMA kernel for unmasked head dimensions 64 and 128,
 and `int8_block_sparse_attention` restricts each block of queries to a caller-chosen
@@ -312,7 +312,9 @@ COMFY_HIP_ARCHS=gfx1010 pip install .
 ```
 
 It is not part of the default target list, so a build that sees no GPU does not
-include it.
+include it. MIOpen's Winograd kernels in `miopen_winograd/` are assembled with the
+toolchain's `clang` for `gfx1010:xnack-` and embedded in the extension, so MIOpen itself
+is not needed at runtime.
 
 ```bash
 python -m pytest tests/test_rdna1.py
