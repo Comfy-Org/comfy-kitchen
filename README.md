@@ -43,9 +43,29 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `convrot_w4a4_linear`       | ✓     | ✓    |        | ✓   | ✓     | ✓*  |
 | `quantize_convrot_w4a4_weight` | ✓  | ✓    |        | ✓   | ✓     |     |
 | `dequantize_convrot_w4a4_weight` | ✓ | ✓   |        | ✓   | ✓     |     |
+| `quantize_w4a8_int8_weight` | ✓     | ✓    |        | ✓   | ✓     |     |
+| `dequantize_w4a8_int8_weight` | ✓   | ✓    |        | ✓   | ✓     |     |
+| `w4a8_int8_linear`          | ✓     | ✓    | ✓      | ✓   | ✓     |     |
+| `fp16_linear`               | ✓     | ✓    |        | ✓   | ✓     |     |
+| `fp16_conv3d`               | ✓     | ✓    |        | ✓   | ✓     |     |
+| `group_norm_silu_pad3d`     | ✓     | ✓    |        | ✓   | ✓     |     |
 | `fp16_packed_linear`        | ✓     |      |        |     | ✓     |     |
 | `fp16_packed_conv3d`        | ✓     |      |        |     | ✓     |     |
+| `fp16_packed_conv_transpose3d` | ✓  |      |        |     | ✓     |     |
+| `depthwise_conv3d`          | ✓     |      |        |     | ✓     |     |
+| `depthwise_conv_transpose3d` | ✓    |      |        |     | ✓     |     |
+| `direct_conv3d`             | ✓     |      |        |     | ✓     |     |
+| `fp32_winograd_conv2d`      | ✓     |      |        |     | ✓     |     |
+| `fp32_winograd_conv_transpose2d` | ✓ |     |        |     | ✓     |     |
+| `q8_0_linear`               | ✓     |      |        |     | ✓     |     |
+| `q4_k_linear`               | ✓     |      |        |     | ✓     |     |
 | `int8_block_sparse_attention` |       |      |        |     | ✓     |     |
+| `delaunay3d`                |       | ✓    |        |     |       |     |
+| `mesh_bvh`                  |       | ✓    |        |     |       |     |
+| `closest_point_on_mesh`     |       | ✓    |        |     |       |     |
+| `connected_components`      |       | ✓    |        |     |       |     |
+| `edge_collapse_checks`      |       | ✓    |        |     |       |     |
+| `min_cut`                   |       | ✓    |        |     |       |     |
 
 Each of the eight rope entries also has an in-place form (`apply_rope_`,
 `rms_rope_split_half1_`, ...) with the same backend coverage as the row above.
@@ -234,7 +254,26 @@ twice the multiply-accumulate rate of the fp32 path. Each activation row is scal
 by a power of two so that no fp16 partial sum overflows, and the partial sums are
 folded into fp32 every 32 products. ConvRot `int8_linear` with group size 256 runs
 on the same GEMM, since int8 weights are exact in fp16. The conv is an implicit GEMM
-with no im2col workspace.
+with no im2col workspace; a 3x3 conv over a contiguous input at spatial stride 1 runs
+a Winograd F(2x2, 3x3) kernel on the same packed FMAs instead. `fp16_conv3d` uses the
+packed GEMM too, and `fp16_packed_conv_transpose3d` splits a transposed conv into one
+stride-1 conv per output phase, so no zero-stuffed input is built.
+
+GGUF `q8_0_linear` and `q4_k_linear` read the raw block bytes: the blocks are repacked
+into int8 or centred int4 codes with per-32-element scale (and, for Q4_K, offset)
+tables that the packed GEMM applies as it folds each stage, with no fp16 copy of the
+weight. Shapes the tiled kernel declines dequantize to fp16 for `fp16_packed_linear`.
+
+The convs the implicit GEMM serves badly have their own kernels: `direct_conv3d` (fp32
+math, for few input or at most 8 output channels), `depthwise_conv3d` and
+`depthwise_conv_transpose3d` (one filter per channel), and `fp32_winograd_conv2d` /
+`fp32_winograd_conv_transpose2d`, which run MIOpen's fp32 Winograd kernels for gfx1010
+(embedded in `miopen_winograd/`) without MIOpen's per-shape search.
+
+The W4A8 ops, `fp16_linear`, `fp16_conv3d` and `group_norm_silu_pad3d` follow the
+`hip` backend's: W4A8 weights decode a column chunk at a time into the int8 GEMM, or
+into a GEMV for a few rows, and `fp16_linear` fuses bias and a scaled residual into the
+epilogue.
 
 `int8_attention` has an fp16-FMA kernel for unmasked head dimensions 64 and 128,
 and `int8_block_sparse_attention` restricts each block of queries to a caller-chosen
@@ -242,8 +281,10 @@ set of 64-key tiles.
 
 | What runs                      | How                                                         |
 |--------------------------------|-------------------------------------------------------------|
-| fp8, INT8, INT4/INT6, ConvRot, SVDQuant and AWQ linears | Thread-level GEMM              |
-| ConvRot INT8 (group 256), `fp16_packed_linear`, `fp16_packed_conv3d` | Packed fp16 GEMM  |
+| fp8, INT8, INT4/INT6, W4A8, ConvRot, SVDQuant and AWQ linears, `fp16_linear` | Thread-level GEMM |
+| ConvRot INT8 (group 256), `fp16_packed_linear`, `fp16_packed_conv3d`, `fp16_packed_conv_transpose3d`, `fp16_conv3d`, `q8_0_linear`, `q4_k_linear` | Packed fp16 GEMM |
+| `direct_conv3d`, `depthwise_conv3d`, `depthwise_conv_transpose3d` | Direct and gather conv kernels |
+| `fp32_winograd_conv2d`, `fp32_winograd_conv_transpose2d` | MIOpen's fp32 Winograd kernels |
 | `int8_attention`, `sol_attn`, `na3d` | Software tile policy; fp16-FMA kernel for `int8_attention` |
 | Quantizers, RoPE, RMS-RoPE, AdaLN, GroupNorm+SiLU+pad | Elementwise kernels              |
 | NVFP4, MXFP8, `na2d`, flash decode, GatedDeltaNet decode | Not provided; eager            |
