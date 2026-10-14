@@ -101,13 +101,14 @@ __forceinline__ __device__ void split_range(int length, int split, int num_split
 
 // GroupsPerPass query rows share every K and V read. Templated because the
 // per-group state has to stay in registers; a runtime bound spills it.
-template <int HeadDim, int GroupsPerPass, bool Split>
+// Plain decode must not pay for a per-row causal predicate in the key loop.
+template <int HeadDim, int GroupsPerPass, bool Split, bool Causal>
 __global__ __launch_bounds__(kBlockThreads) void flash_decode_kernel(
     const __bf16* __restrict__ q, const __bf16* __restrict__ k, const __bf16* __restrict__ v,
     const int* __restrict__ kv_lengths, __bf16* __restrict__ out,
     float* __restrict__ softmax_lse, float* __restrict__ out_accum,
     float* __restrict__ lse_accum, int rows, int query_length, int steps, int heads,
-    int kv_capacity, int num_splits, bool causal,
+    int kv_capacity, int num_splits,
     int64_t q_batch_stride, int64_t q_group_stride, int64_t q_step_stride, int64_t q_head_stride,
     int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
     int64_t o_batch_stride, int64_t o_group_stride, int64_t o_step_stride, int64_t o_head_stride) {
@@ -150,7 +151,7 @@ __global__ __launch_bounds__(kBlockThreads) void flash_decode_kernel(
         o_acc[i] = Vec{};
         m_run[i] = kNegInf;
         d_run[i] = 0.0f;
-        limit[i] = causal ? length - steps + s + 1 : length;
+        limit[i] = Causal ? length - steps + s + 1 : length;
     }
 
     const int64_t kv_base = static_cast<int64_t>(b) * k_batch_stride +
@@ -177,7 +178,7 @@ __global__ __launch_bounds__(kBlockThreads) void flash_decode_kernel(
             const int j = j0 + c;
 #pragma unroll
             for (int i = 0; i < GroupsPerPass; ++i) {
-                const bool valid = j < end && j < limit[i];
+                const bool valid = j < end && (!Causal || j < limit[i]);
                 float dot = 0.0f;
 #pragma unroll
                 for (int d = 0; d < kDimPerLane; ++d) dot += q_vec[i][d] * k_vec[c][d];
@@ -327,24 +328,23 @@ struct DecodeArgs {
     int heads;
     int kv_capacity;
     int num_splits;
-    bool causal;
     int64_t q_batch_stride, q_group_stride, q_step_stride, q_head_stride;
     int64_t k_batch_stride, k_row_stride, k_head_stride;
     int64_t o_batch_stride, o_group_stride, o_step_stride, o_head_stride;
     hipStream_t stream;
 };
 
-template <int HeadDim, int GroupsPerPass>
+template <int HeadDim, int GroupsPerPass, bool Causal>
 void launch_typed(const DecodeArgs& a) {
     const dim3 grid(a.query_length / GroupsPerPass, a.num_splits, a.batch * a.heads);
     const int rows = a.batch * a.heads * a.query_length;
     const bool split = a.num_splits > 1;
     if (split) {
-        flash_decode_kernel<HeadDim, GroupsPerPass, true><<<grid, kBlockThreads, 0, a.stream>>>(
+        flash_decode_kernel<HeadDim, GroupsPerPass, true, Causal><<<grid, kBlockThreads, 0, a.stream>>>(
             static_cast<const __bf16*>(a.q), static_cast<const __bf16*>(a.k),
             static_cast<const __bf16*>(a.v), a.kv_lengths, static_cast<__bf16*>(a.out),
             a.softmax_lse, a.out_accum, a.lse_accum, rows, a.query_length, a.steps, a.heads,
-            a.kv_capacity, a.num_splits, a.causal, a.q_batch_stride, a.q_group_stride,
+            a.kv_capacity, a.num_splits, a.q_batch_stride, a.q_group_stride,
             a.q_step_stride, a.q_head_stride, a.k_batch_stride, a.k_row_stride, a.k_head_stride,
             a.o_batch_stride, a.o_group_stride, a.o_step_stride, a.o_head_stride);
         flash_decode_combine_kernel<HeadDim><<<rows, HeadDim, 0, a.stream>>>(
@@ -352,31 +352,31 @@ void launch_typed(const DecodeArgs& a) {
             rows, a.query_length, a.steps, a.heads, a.o_batch_stride, a.o_group_stride,
             a.o_step_stride, a.o_head_stride);
     } else {
-        flash_decode_kernel<HeadDim, GroupsPerPass, false><<<grid, kBlockThreads, 0, a.stream>>>(
+        flash_decode_kernel<HeadDim, GroupsPerPass, false, Causal><<<grid, kBlockThreads, 0, a.stream>>>(
             static_cast<const __bf16*>(a.q), static_cast<const __bf16*>(a.k),
             static_cast<const __bf16*>(a.v), a.kv_lengths, static_cast<__bf16*>(a.out),
             a.softmax_lse, a.out_accum, a.lse_accum, rows, a.query_length, a.steps, a.heads,
-            a.kv_capacity, a.num_splits, a.causal, a.q_batch_stride, a.q_group_stride,
+            a.kv_capacity, a.num_splits, a.q_batch_stride, a.q_group_stride,
             a.q_step_stride, a.q_head_stride, a.k_batch_stride, a.k_row_stride, a.k_head_stride,
             a.o_batch_stride, a.o_group_stride, a.o_step_stride, a.o_head_stride);
     }
 }
 
-template <int HeadDim>
+template <int HeadDim, bool Causal>
 void launch_groups(const DecodeArgs& a) {
     switch (groups_per_pass(a.query_length)) {
         case 8:
             // Cap the 256-dimensional tile at four groups to stay within the LDS budget.
-            launch_typed<HeadDim, HeadDim == 128 ? 8 : 4>(a);
+            launch_typed<HeadDim, HeadDim == 128 ? 8 : 4, Causal>(a);
             break;
         case 4:
-            launch_typed<HeadDim, 4>(a);
+            launch_typed<HeadDim, 4, Causal>(a);
             break;
         case 2:
-            launch_typed<HeadDim, 2>(a);
+            launch_typed<HeadDim, 2, Causal>(a);
             break;
         default:
-            launch_typed<HeadDim, 1>(a);
+            launch_typed<HeadDim, 1, Causal>(a);
             break;
     }
 }
@@ -397,13 +397,15 @@ extern "C" void launch_flash_decode(const void* q, const void* k, const void* v,
                                     int64_t o_head_stride, hipStream_t stream) {
     const comfy::hip_backend::DecodeArgs a{
         q, k, v, kv_lengths, out, softmax_lse, out_accum, lse_accum, batch, query_length, steps,
-        heads, kv_capacity, num_splits, causal, q_batch_stride, q_group_stride, q_step_stride,
+        heads, kv_capacity, num_splits, q_batch_stride, q_group_stride, q_step_stride,
         q_head_stride, k_batch_stride, k_row_stride, k_head_stride, o_batch_stride,
         o_group_stride, o_step_stride, o_head_stride, stream};
     if (head_dim == 128) {
-        comfy::hip_backend::launch_groups<128>(a);
+        if (causal) comfy::hip_backend::launch_groups<128, true>(a);
+        else comfy::hip_backend::launch_groups<128, false>(a);
     } else {
-        comfy::hip_backend::launch_groups<256>(a);
+        if (causal) comfy::hip_backend::launch_groups<256, true>(a);
+        else comfy::hip_backend::launch_groups<256, false>(a);
     }
 }
 
