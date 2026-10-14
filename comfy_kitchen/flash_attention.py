@@ -4,7 +4,6 @@ import math
 
 import torch
 
-from .allocation import allocation_context
 from .backends import cuda as _cuda_backend
 
 if getattr(torch.version, "hip", None):
@@ -14,23 +13,14 @@ else:
 
 _MINIMUM_CAPABILITY = (8, 0)
 
-# Split-KV partials are folded by the last-arriving split CTA inside the decode kernel
-# (one launch) rather than by a second combine launch. Per-device arrival counters; the kernel
-# rearms them, so the buffer only needs zeroing once.
-# Calls must not overlap on a device. Keep the buffer alive: graphs capture its address.
 _COMBINE_COUNTERS = 4096
-_combine_counters: dict[torch.device, torch.Tensor] = {}
 
 
 def _counters(device: torch.device, needed: int, num_splits: int) -> torch.Tensor:
     if num_splits == 1 or needed > _COMBINE_COUNTERS:
         return _cuda_backend._empty_cuda_tensor(device, torch.int32)
-    counters = _combine_counters.get(device)
-    if counters is None:
-        with allocation_context():
-            counters = _combine_counters[device] = torch.zeros(
-                _COMBINE_COUNTERS, dtype=torch.int32, device=device)
-    return counters
+    # Overlapping calls and independently captured graphs must not share arrival counters.
+    return torch.zeros(_COMBINE_COUNTERS, dtype=torch.int32, device=device)
 
 
 def is_available(device: torch.device | None = None) -> bool:

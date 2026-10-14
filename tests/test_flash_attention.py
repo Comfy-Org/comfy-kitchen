@@ -221,6 +221,51 @@ def test_flash_attention_decode_cuda_graph_dynamic_lengths(head_dim):
 
 
 @requires_flash_decode
+@pytest.mark.skipif(bool(getattr(torch.version, "hip", None)), reason="uses CUDA sleep for overlap")
+@pytest.mark.parametrize("second_capacity", [4096, 512])
+def test_flash_attention_decode_concurrent_graphs(second_capacity):
+    torch.manual_seed(42)
+    states = []
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    graphs, outputs = [], []
+    for stream, capacity in zip(streams, [4096, second_capacity], strict=True):
+        state = _decode_operands(batch=1, capacity=capacity, kv_heads=4, groups=6, head_dim=256)
+        state[3].fill_(capacity - 128)
+        states.append(state)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            ck.flash_attention_decode(*state)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        # Independent pools: overlapping graphs cannot reuse each other's scratch.
+        with torch.cuda.graph(graph, stream=stream):
+            outputs.append(ck.flash_attention_decode(*state))
+        graphs.append(graph)
+
+    # Replay first to materialize graph allocations before touching outputs with cudaMallocAsync.
+    for graph in graphs:
+        graph.replay()
+    torch.cuda.synchronize()
+    for _ in range(40):
+        for state in states:
+            state[0].add_(0.0078125)
+        expected = [ck.flash_attention_decode(*state) for state in states]
+        for output in outputs:
+            output.fill_(float("nan"))
+        # Queue both replays behind one event so Python launch latency cannot serialize them.
+        torch.cuda._sleep(2_000_000)
+        ready = torch.cuda.Event()
+        ready.record()
+        for stream, graph in zip(streams, graphs, strict=True):
+            stream.wait_event(ready)
+            with torch.cuda.stream(stream):
+                graph.replay()
+        torch.cuda.synchronize()
+        for actual, reference in zip(outputs, expected, strict=True):
+            torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
+@requires_flash_decode
 @pytest.mark.parametrize(
     ("q_dim", "k_dim", "v_dim"),
     [(64, 64, 64), (192, 192, 192), (256, 128, 128), (128, 256, 256), (256, 256, 128)],
