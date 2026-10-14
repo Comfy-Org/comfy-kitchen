@@ -15,6 +15,35 @@ from comfy_kitchen.tensor import (
 from comfy_kitchen.tensor.base import nvfp4_mm_has_fast_path, quantized_mm_has_fast_path
 
 
+def _nvfp4_fused_gemm_available() -> bool:
+    """Whether this box can run the fused NVFP4 GEMM, for tests that call it.
+
+    Two predicates, because they answer two different questions and neither
+    answers the other's.
+
+    ``nvfp4_mm_has_fast_path`` is the gate the dispatch handlers themselves ask
+    (:func:`nvfp4_mm_has_fast_path` in tensor/nvfp4.py), so "no" there means
+    there is no fused path to assert on and the caller has already fallen back.
+    It is also the only one that can see the AMD cases: on ROCm
+    ``get_cuda_capability`` reports a gfx-shaped number (gfx1103 answers
+    (11, 0)), so ``supports_fast_matmul`` compares a gfx11xx capability against
+    NVFP4's (10, 0) and answers True on an arch outside the HIP manifest
+    (gfx1010), and on a gfx11 box whose HIP extension is not built. Neither has
+    a fused NVFP4 GEMM, so a test gated on the capability alone runs and fails.
+
+    ``supports_fast_matmul`` is what excludes NVIDIA below SM 10.0. There
+    ``nvfp4_mm_has_fast_path`` defers to ``quantized_mm_has_fast_path``, which
+    on a CUDA build is the FP8 ``torch._scaled_mm`` probe -- True on any SM89+
+    card, Ada included, where FP8 exists and FP4 does not, so
+    ``ck.scaled_mm_nvfp4`` raises. On AMD the capability half is vacuous rather
+    than wrong (every gfx1x part passes it), so it costs nothing there.
+    """
+    return (
+        nvfp4_mm_has_fast_path("cuda")
+        and TensorCoreNVFP4Layout.supports_fast_matmul()
+    )
+
+
 @pytest.mark.parametrize("bits", [4, 6, 8])
 @pytest.mark.parametrize("activation", ["rms_norm", "swiglu"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
@@ -1270,8 +1299,8 @@ class TestNVFP4LinearOperations:
         shape stays out: an unpadded N with a bias, which is what the padding exists
         for, has to keep the fused path.
         """
-        if not TensorCoreNVFP4Layout.supports_fast_matmul():
-            pytest.skip("NVFP4 matmul not supported on this hardware")
+        if not _nvfp4_fused_gemm_available():
+            pytest.skip("no fused NVFP4 GEMM on this hardware")
 
         import comfy_kitchen as ck
 
@@ -1385,8 +1414,8 @@ class TestNVFP4LinearOperations:
         tuning knob that changes the schedule can change the ANSWER, and nothing in a
         timing sweep notices. Hence this is a correctness test over the knob.
         """
-        if not TensorCoreNVFP4Layout.supports_fast_matmul():
-            pytest.skip("NVFP4 matmul not supported on this hardware")
+        if not _nvfp4_fused_gemm_available():
+            pytest.skip("no fused NVFP4 GEMM on this hardware")
         monkeypatch.setenv("COMFY_NVFP4_PIPE", pipe)
         # Read per launch by the launcher (getenv in nvfp4.hip's comfy_nvfp4_pipe),
         # so no rebuild is needed -- which is what makes a tuning knob reachable from
