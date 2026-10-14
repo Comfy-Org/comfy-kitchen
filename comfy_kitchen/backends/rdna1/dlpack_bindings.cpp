@@ -57,6 +57,9 @@ bool launch_fp16_gemm_kernel(const void*, const void*, void*, const void*, const
 bool launch_fp16_packed_linear_kernel(const void*, int, const void*, const void*, void*, void*,
                                       void*, const void*, int, void*, int, int, int, int,
                                       hipStream_t);
+bool launch_q4_k_packed_linear_kernel(const void*, int, const void*, const void*, void*, void*,
+                                      void*, void*, void*, void*, void*, const void*, int, void*,
+                                      int, int, int, int, hipStream_t);
 bool launch_q8_0_packed_linear_kernel(const void*, int, const void*, const void*, void*, void*,
                                       void*, void*, void*, const void*, int, void*, int, int, int,
                                       int, hipStream_t);
@@ -553,6 +556,56 @@ bool q8_0_packed_linear(nb::ndarray<> x, nb::ndarray<> raw, nb::ndarray<> w_amax
         x.data(), map_dtype_to_code(x.dtype()), raw.data(), w_amax.data(), x16.data(), x16t.data(),
         row_scale.data(), codes.data(), scales.data(), opt_data(bias), opt_code(bias), d.data(),
         out_code, M, N, K, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return served;
+}
+
+// Linear of x [M, K] against a GGUF Q4_K weight, raw [N, K / 256 * 144] bytes, as
+// q8_0_packed_linear (w_amax holds 8, the centred codes' bound), with offsets ([K / 32, N] fp16) and row_sums
+// ([K / 32, M] fp32) scratch besides. false means the caller serves the call.
+bool q4_k_packed_linear(nb::ndarray<> x, nb::ndarray<> raw, nb::ndarray<> w_amax,
+                        nb::ndarray<> x16, nb::ndarray<> x16t, nb::ndarray<> row_scale,
+                        nb::ndarray<> codes, nb::ndarray<> scales, nb::ndarray<> offsets,
+                        nb::ndarray<> row_sums, OptArray bias, nb::ndarray<> d, int M, int N, int K,
+                        int out_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "q4_k_packed_linear";
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_fp16_k(K, kFn);
+    if (K % 256 != 0) {
+        throw std::runtime_error(std::string(kFn) + ": K must be a multiple of 256");
+    }
+    require_dtype(x, 0, 2, kFn, "x");
+    require_dtype(w_amax, 0, 0, kFn, "w_amax");
+    require_dtype(x16, 1, 1, kFn, "x16");
+    require_dtype(x16t, 1, 1, kFn, "x16t");
+    require_dtype(row_scale, 0, 0, kFn, "row_scale");
+    require_dtype(scales, 1, 1, kFn, "scales");
+    require_dtype(offsets, 1, 1, kFn, "offsets");
+    require_dtype(row_sums, 0, 0, kFn, "row_sums");
+    require_dtype(d, 0, 2, kFn, "d");
+    require_out_matches(d, out_code, kFn);
+    if (raw.dtype() != nb::dtype<uint8_t>() || codes.dtype() != nb::dtype<int8_t>()) {
+        throw std::runtime_error(std::string(kFn) + ": raw must be uint8 and codes int8");
+    }
+    require_len(x, static_cast<int64_t>(M) * K, kFn, "x");
+    require_len(raw, static_cast<int64_t>(N) * (K / 256) * 144, kFn, "raw");
+    require_len(w_amax, 1, kFn, "w_amax");
+    require_len(x16, static_cast<int64_t>(M) * K, kFn, "x16");
+    require_len(x16t, static_cast<int64_t>((M + 127) / 128) * 128 * K, kFn, "x16t");
+    require_len(row_scale, M, kFn, "row_scale");
+    require_len(codes, static_cast<int64_t>(N) * K, kFn, "codes");
+    require_len(scales, static_cast<int64_t>(K / 32) * N, kFn, "scales");
+    require_len(offsets, static_cast<int64_t>(K / 32) * N, kFn, "offsets");
+    require_len(row_sums, static_cast<int64_t>(K / 32) * M, kFn, "row_sums");
+    require_len(d, static_cast<int64_t>(M) * N, kFn, "d");
+    require_bias(bias, N, kFn);
+    const bool served = launch_q4_k_packed_linear_kernel(
+        x.data(), map_dtype_to_code(x.dtype()), raw.data(), w_amax.data(), x16.data(), x16t.data(),
+        row_scale.data(), codes.data(), scales.data(), offsets.data(), row_sums.data(),
+        opt_data(bias), opt_code(bias), d.data(), out_code, M, N, K,
+        reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
     return served;
 }
@@ -2750,6 +2803,11 @@ NB_MODULE(_C, m) {
           nb::arg("w_amax"), nb::arg("x16"), nb::arg("x16t").none(), nb::arg("row_scale"),
           nb::arg("bias").none(), nb::arg("d"), nb::arg("M"), nb::arg("N"), nb::arg("K"), nb::arg("out_code"),
           nb::arg("stream_ptr"));
+    m.def("q4_k_packed_linear", &q4_k_packed_linear, nb::arg("x"), nb::arg("raw"),
+          nb::arg("w_amax"), nb::arg("x16"), nb::arg("x16t"), nb::arg("row_scale"),
+          nb::arg("codes"), nb::arg("scales"), nb::arg("offsets"), nb::arg("row_sums"),
+          nb::arg("bias").none(), nb::arg("d"), nb::arg("M"), nb::arg("N"), nb::arg("K"),
+          nb::arg("out_code"), nb::arg("stream_ptr"));
     m.def("q8_0_packed_linear", &q8_0_packed_linear, nb::arg("x"), nb::arg("raw"),
           nb::arg("w_amax"), nb::arg("x16"), nb::arg("x16t"), nb::arg("row_scale"),
           nb::arg("codes"), nb::arg("scales"), nb::arg("bias").none(), nb::arg("d"), nb::arg("M"),

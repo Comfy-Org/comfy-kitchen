@@ -68,6 +68,7 @@ __all__ = [
     "fp16_packed_conv_transpose3d",
     "fp16_packed_linear",
     "q8_0_linear",
+    "q4_k_linear",
     "depthwise_conv3d",
     "depthwise_conv_transpose3d",
     "direct_conv3d",
@@ -876,6 +877,48 @@ def q8_0_linear(
         ):
             return out.reshape(out_shape)
     weight = _eager.quantization.dequantize_q8_0(raw, n, k)
+    return fp16_packed_linear(x, weight, bias, out_dtype)
+
+
+def q4_k_linear(
+    x: torch.Tensor,
+    raw: torch.Tensor,
+    out_features: int,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Linear against a GGUF Q4_K weight (raw bytes), as q8_0_linear: the super-blocks are
+    repacked into centred codes (q - 8) and per-32-element scale and offset tables, and the tiled GEMM
+    applies each scale, and subtracts each offset times the row's sum over its 32 elements,
+    as it folds the stage they cover. Elsewhere the weight is dequantized to fp16 for
+    fp16_packed_linear."""
+    out_dtype = x.dtype if out_dtype is None else out_dtype
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    m, k = x_2d.shape
+    n = out_features
+    out_shape = (*x.shape[:-1], n)
+    if bias is not None:
+        bias = bias.to(device=x.device).contiguous()
+    if (m > 64 and k % 256 == 0 and n % 8 == 0 and raw.device == x.device and raw.is_contiguous()
+            and x.dtype in (torch.float32, torch.float16, torch.bfloat16)):
+        dev = x.device
+        x16 = torch.empty((m, k), dtype=torch.float16, device=dev)
+        x16t = torch.empty((-(-m // 128) * 128, k), dtype=torch.float16, device=dev)
+        row_scale = torch.empty(m, dtype=torch.float32, device=dev)
+        codes = torch.empty((n, k), dtype=torch.int8, device=dev)
+        scales = torch.empty((k // 32, n), dtype=torch.float16, device=dev)
+        offsets = torch.empty((k // 32, n), dtype=torch.float16, device=dev)
+        row_sums = torch.empty((k // 32, m), dtype=torch.float32, device=dev)
+        # the centred codes' bound, |q - 8| <= 8, stands in for the weight's largest element
+        w_amax = torch.full((1,), 8.0, dtype=torch.float32, device=dev)
+        out = torch.empty((m, n), dtype=out_dtype, device=dev)
+        if _C.q4_k_packed_linear(
+            _dl(x_2d), _dl(raw.reshape(-1)), _dl(w_amax), _dl(x16), _dl(x16t), _dl(row_scale),
+            _dl(codes), _dl(scales), _dl(offsets), _dl(row_sums),
+            None if bias is None else _dl(bias), _dl(out), m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
+        ):
+            return out.reshape(out_shape)
+    weight = _eager.quantization.dequantize_q4_k(raw, n, k)
     return fp16_packed_linear(x, weight, bias, out_dtype)
 
 
@@ -3495,6 +3538,14 @@ def _build_constraints() -> dict:
                 "weight": ParamConstraint(
                     dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(2),)
                 ),
+                "bias": ParamConstraint(dtypes=floats),
+            },
+            default_devices=dev,
+        ),
+        "q4_k_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=floats, shape_rules=(MinDims(2),)),
+                "raw": ParamConstraint(dtypes=frozenset({torch.uint8})),
                 "bias": ParamConstraint(dtypes=floats),
             },
             default_devices=dev,

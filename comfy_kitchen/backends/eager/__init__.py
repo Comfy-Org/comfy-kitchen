@@ -61,6 +61,7 @@ __all__ = [
     "fp16_linear",
     "fp16_packed_linear",
     "q8_0_linear",
+    "q4_k_linear",
     "int8_linear",
     "w4a8_int8_linear",
 ]
@@ -110,6 +111,7 @@ from .quantization import (
     fp16_linear,
     fp16_packed_linear,
     q8_0_linear,
+    q4_k_linear,
     int8_linear,
     quantize_and_rotate_rowwise,
     quantize_int8_convrot_weight,
@@ -598,6 +600,14 @@ def _build_constraints() -> dict:
             default_devices=all_devices,
         )
     out["q8_0_linear"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "raw": ParamConstraint(dtypes=frozenset({torch.uint8})),
+            "bias": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["q4_k_linear"] = FunctionConstraints(
         params={
             "x": ParamConstraint(dtypes=standard_floats),
             "raw": ParamConstraint(dtypes=frozenset({torch.uint8})),

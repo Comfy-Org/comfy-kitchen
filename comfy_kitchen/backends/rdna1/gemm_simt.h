@@ -43,8 +43,13 @@
 // BLOCK SCALES  An epilogue with a block_scale member ([K / 32, N] fp16, one per 64-byte
 // stage of K and column: a GGUF Q8_0 weight's block scales, B its int8 codes under BI8)
 // has the kernel multiply each stage's fp16 chains by their column's scale as it folds them
-// into fp32, so the GEMM computes A @ (scale * B)^T. Only a row-paired Op, which folds every
-// stage, takes them; every other epilogue compiles to the kernel as it was.
+// into fp32, so the GEMM computes A @ (scale * B)^T. With block_offset ([K / 32, N] fp16)
+// and row_sum ([K / 32, M] fp32, each 32 K elements of A summed) members too, it also
+// subtracts sum over stages of offset * row_sum, for B = scale * codes - offset (a GGUF
+// Q4_K weight's codes, scales and mins). That term runs after the main loop, from LDS in
+// chunks of the stages, when the fp16 chains' registers are free: applied at each fold, it
+// spilled the 8x16 block. Only a row-paired Op, which folds every stage, takes block scales;
+// every other epilogue compiles to the kernel as it was.
 //
 // A may instead be gathered (ASrc, an implicit-GEMM convolution's patch rows): the
 // source resolves each of a thread's rows once, ASrc::row(grow, valid), and each
@@ -368,6 +373,8 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
     constexpr bool kPairs = requires { Op::kRowPairs; };
     constexpr bool kBlockScaled = requires(const Epi& e) { e.block_scale; };
     static_assert(!kBlockScaled || kPairs, "block scales are applied at a per-stage fold");
+    constexpr bool kBlockOffset = requires(const Epi& e) { e.block_offset; e.row_sum; };
+    static_assert(!kBlockOffset || kBlockScaled, "block offsets come with block scales");
     // Rows of A to load: a row-paired A keeps the odd K of its last row in the row after it.
     const int a_rows = kPairs ? (M + 1) & ~1 : M;
     constexpr int kLdsWords = kSimtWords * kE;  // LDS words per row per stage
@@ -614,6 +621,47 @@ __global__ __launch_bounds__(kSimtThreads, 2) void gemm_simt_kernel(
             __syncthreads();  // every thread is done reading this tile
             store();
             __syncthreads();
+        }
+    }
+
+    if constexpr (kBlockOffset) {
+        // acc -= sum over this slice's stages of offset[col] * row_sum[row], kChunk stages
+        // at a time through LDS (As and Bs, free now): offsets [kChunk][BN] in Bs, row sums
+        // [kChunk][BM] in As, both read as float
+        constexpr int kChunk = kLdsWords;
+        static_assert(kChunk * BM <= kLdsWords * BM && kChunk * BN <= kLdsWords * BN, "the offset pass's LDS");
+        float* const Oc = reinterpret_cast<float*>(Bs);
+        float* const Rc = reinterpret_cast<float*>(As);
+        // this slice's stages, in the order the main loop took them, kChunk at a time
+        __shared__ int stages[kChunk];
+        int count = 0;
+        for (int kb = kb_begin; kb < kbytes; kb = next_k(kb)) {
+            if (tid == 0) stages[count] = kb / kBytes;
+            ++count;
+            if (count == kChunk || next_k(kb) >= kbytes) {
+                __syncthreads();  // the main loop's, or the previous chunk's, reads are done
+                for (int e = tid; e < count * BN; e += kSimtThreads) {
+                    const int st = e / BN, col = n0 + e % BN;
+                    Oc[e] = col < N ? __half2float(epi.block_offset[static_cast<int64_t>(stages[st]) * N + col]) : 0.0f;
+                }
+                for (int e = tid; e < count * BM; e += kSimtThreads) {
+                    const int st = e / BM, row = m0 + e % BM;
+                    Rc[e] = row < M ? epi.row_sum[static_cast<int64_t>(stages[st]) * M + row] : 0.0f;
+                }
+                __syncthreads();
+                for (int st = 0; st < count; ++st) {
+#pragma unroll
+                    for (int i = 0; i < TM; ++i) {
+                        const float rsum = Rc[st * BM + (i / 4) * (TY * 4) + ty * 4 + i % 4];
+#pragma unroll
+                        for (int j = 0; j < TN; ++j) {
+                            acc[i][j] = __builtin_fmaf(-Oc[st * BN + (j / 4) * (TX * 4) + tx * 4 + j % 4], rsum, acc[i][j]);
+                        }
+                    }
+                }
+                count = 0;
+                __syncthreads();  // every thread is done with this chunk's stages
+            }
         }
     }
 

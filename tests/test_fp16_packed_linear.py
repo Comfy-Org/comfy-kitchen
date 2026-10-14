@@ -155,3 +155,47 @@ class TestQ8_0Linear:
 
         raw, weight = self._q8_0(16, 64, "cpu")
         assert torch.equal(dequantize_q8_0(raw, 16, 64, torch.float32), weight)
+
+
+class TestQ4KLinear:
+    """q4_k_linear: a GGUF Q4_K weight given as raw super-blocks. rdna1 reads centred codes in
+    its tiled packed GEMM and applies each sub-block's scale and offset at its stage's fold;
+    small M falls back to the dequantized fp16 GEMM."""
+
+    @staticmethod
+    def _q4_k(n, k, device):
+        g = torch.Generator().manual_seed(0)
+        raw = torch.randint(0, 256, (n, k // 256, 144), dtype=torch.uint8, generator=g)
+        # d and dmin of a realistic magnitude (raw random bits would hit inf/nan halves)
+        d = (torch.rand(n, k // 256, generator=g) * 2e-3 + 1e-4).half()
+        dmin = (torch.rand(n, k // 256, generator=g) * 2e-3).half()
+        raw[..., 0:2] = d.view(torch.uint8).reshape(n, k // 256, 2)
+        raw[..., 2:4] = dmin.view(torch.uint8).reshape(n, k // 256, 2)
+        return raw.reshape(n, -1).contiguous().to(device)
+
+    @pytest.mark.parametrize("m,k,n", [(4224, 1024, 768), (300, 768, 512), (130, 2048, 1024), (64, 512, 256), (9, 256, 128)])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    def test_matches_dequantized(self, m, k, n, dtype, with_bias):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA/HIP required")
+        from comfy_kitchen.backends.eager.quantization import dequantize_q4_k
+
+        torch.manual_seed(0)
+        raw = self._q4_k(n, k, "cuda")
+        weight = dequantize_q4_k(raw, n, k, torch.float32)
+        x = (torch.randn(m, k, device="cuda") * 4).to(dtype)
+        bias = torch.randn(n, device="cuda") if with_bias else None
+        ref = x.double() @ weight.double().T + (0 if bias is None else bias.double())
+        out = ck.q4_k_linear(x, raw, n, bias)
+        assert out.shape == (m, n) and out.dtype == dtype
+        assert (out.double() - ref).norm() / ref.norm() < (2e-3 if dtype != torch.bfloat16 else 6e-3)
+
+    def test_eager_dequantize_matches_gguf(self):
+        gguf = pytest.importorskip("gguf")
+        from comfy_kitchen.backends.eager.quantization import dequantize_q4_k
+
+        raw = self._q4_k(8, 512, "cpu")
+        ref = gguf.quants.dequantize(raw.numpy(), gguf.GGMLQuantizationType.Q4_K)
+        out = dequantize_q4_k(raw, 8, 512, torch.float32)
+        assert torch.allclose(out, torch.from_numpy(ref).float(), rtol=0, atol=1e-6)

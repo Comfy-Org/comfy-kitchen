@@ -97,6 +97,13 @@ struct EpiRowScaleBlocks {
     }
 };
 
+// EpiRowScaleBlocks for B = block_scale * codes - block_offset (both [K / 32, N]), with
+// row_sum [K / 32, M] the A rows' sums over each 32 K elements: a GGUF Q4_K weight.
+struct EpiRowScaleBlocksOffset : EpiRowScaleBlocks {
+    const __half* block_offset;
+    const float* row_sum;
+};
+
 // Unscaled fp16 operands: out = acc + bias[col], or with resid set
 // out = resid[row * resid_stride + col] + rscale[col] * (acc + bias[col]).
 // resid_stride 0 broadcasts a single [N] residual row. All operands are fp16.

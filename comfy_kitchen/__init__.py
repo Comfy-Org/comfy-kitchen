@@ -135,6 +135,7 @@ __all__ = [
     "fp32_winograd_conv_transpose2d",
     "fp16_packed_linear",
     "q8_0_linear",
+    "q4_k_linear",
     "fp16_packed_linear_is_accelerated",
     "int8_linear",
     "w4a8_int8_linear",
@@ -1028,6 +1029,22 @@ def q8_0_linear(
     dtype for ``torch.nn.functional.linear``."""
     kwargs = {"x": x, "raw": raw, "out_features": out_features, "bias": bias, "out_dtype": out_dtype}
     impl = registry.get_implementation("q8_0_linear", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def q4_k_linear(
+    x: torch.Tensor,
+    raw: torch.Tensor,
+    out_features: int,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Linear against a GGUF Q4_K weight given as its raw bytes (uint8, [out_features,
+    in_features / 256 * 144]), stored as ``out_dtype`` (x's dtype by default). The rdna1
+    backend reads the 4-bit codes in its packed GEMM and applies the sub-block scales and
+    offsets there; elsewhere the weight is dequantized to x's dtype."""
+    kwargs = {"x": x, "raw": raw, "out_features": out_features, "bias": bias, "out_dtype": out_dtype}
+    impl = registry.get_implementation("q4_k_linear", kwargs=kwargs)
     return impl(**kwargs)
 
 

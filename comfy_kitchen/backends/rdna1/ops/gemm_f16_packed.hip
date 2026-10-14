@@ -41,10 +41,14 @@ __forceinline__ __device__ float load_f(const float* p, int64_t i) { return p[i]
 __forceinline__ __device__ float load_f(const __half* p, int64_t i) { return __half2float(p[i]); }
 __forceinline__ __device__ float load_f(const __bf16* p, int64_t i) { return static_cast<float>(p[i]); }
 
+// With sums set (K a multiple of 32), also sums[kb * M + row] = the scaled fp16 row's
+// elements 32 kb .. 32 kb + 31 in fp32, each 32 of them one wave's, for a Q4_K weight's
+// offset term: a separate pass reading the rows a thread per (row, kb) took 3.4 ms of a
+// 52 ms linear.
 template <typename InT>
 __global__ __launch_bounds__(kScaleThreads) void scale_rows_to_f16_kernel(
     const InT* __restrict__ x, __half* __restrict__ out, float* __restrict__ row_scale,
-    const float* __restrict__ w_amax, int K) {
+    const float* __restrict__ w_amax, int K, float* __restrict__ sums = nullptr, int M = 0) {
     __shared__ float wave_max[kScaleThreads / 32];
     __shared__ float row_inv;
     const int64_t base = static_cast<int64_t>(blockIdx.x) * K;
@@ -74,7 +78,18 @@ __global__ __launch_bounds__(kScaleThreads) void scale_rows_to_f16_kernel(
     }
     __syncthreads();
     const float inv = row_inv;
-    for (int i = tid; i < K; i += kScaleThreads) out[base + i] = __float2half(load_f(x, base + i) * inv);
+    for (int i = tid; i < K; i += kScaleThreads) {
+        const __half h = __float2half(load_f(x, base + i) * inv);
+        out[base + i] = h;
+        if (sums) {
+            // every lane of the wave takes part, so K being a multiple of 32 keeps the loop
+            // uniform across the wave
+            float v = __half2float(h);
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) v += __shfl_xor(v, offset, 32);
+            if ((tid & 31) == 0) sums[static_cast<int64_t>(i / 32) * M + blockIdx.x] = v;
+        }
+    }
 }
 
 // Bound on a row's largest element against weights of largest magnitude w_amax, the
@@ -84,9 +99,9 @@ constexpr float row_bound(float w_amax) { return kStageSumLimit / (w_amax * kSta
 
 template <typename InT>
 void launch_scale_rows(const void* x, __half* x16, float* row_scale, const float* w_amax, int M,
-                       int K, hipStream_t stream) {
+                       int K, hipStream_t stream, float* sums = nullptr) {
     scale_rows_to_f16_kernel<InT><<<M, kScaleThreads, 0, stream>>>(
-        static_cast<const InT*>(x), x16, row_scale, w_amax, K);
+        static_cast<const InT*>(x), x16, row_scale, w_amax, K, sums, M);
 }
 
 // fp16 rows x [R, K] into the GEMM's tiled layout (simt_tiled_offset) of their row-paired
@@ -127,6 +142,53 @@ __global__ __launch_bounds__(256) void repack_q8_0_kernel(
     codes[b * 2] = make_uint4(w[0], w[1], w[2], w[3]);
     codes[b * 2 + 1] = make_uint4(w[4], w[5], w[6], w[7]);
     scales[static_cast<int64_t>(kb) * N + n] = __ushort_as_half(src[0]);
+}
+
+// GGUF Q4_K super-blocks (256 elements, 144 bytes: fp16 d and dmin, 12 bytes of 6-bit
+// sub-block scales and mins, 128 bytes of nibbles) into the BI8 GEMM's operands, the codes
+// centred (q - 8, -8..7) as a row-major int8 [N, K] and, per 32-element sub-block j,
+// s = d * scale_j and o = dmin * min_j - 8 s as [K / 32, N] fp16, so w = s * (q - 8) - o.
+// Centring keeps the two terms the GEMM folds, s * sum(x * code) and o * sum(x), from being
+// large and nearly cancelling: with the raw codes (0..15) the error was 2.1-2.4e-3, against
+// 8.9e-4 for the dequantized fp16 weight. Sub-block j holds the low
+// (j even) or high nibbles of bytes 32 * (j / 2) .. + 31, as GGUF lays them out. One thread
+// per sub-block.
+constexpr int kQ4KBlock = 256, kQ4KBytes = 144;
+__global__ __launch_bounds__(256) void repack_q4_k_kernel(
+    const uint8_t* __restrict__ raw, uint4* __restrict__ codes, __half* __restrict__ scales,
+    __half* __restrict__ offsets, int N, int super_per_row) {
+    const int64_t t = static_cast<int64_t>(blockIdx.x) * 256 + threadIdx.x;
+    if (t >= static_cast<int64_t>(N) * super_per_row * 8) return;
+    const int j = static_cast<int>(t % 8);
+    const int64_t sb = t / 8;  // super-block index over all rows
+    const int n = static_cast<int>(sb / super_per_row), kb = static_cast<int>(sb % super_per_row) * 8 + j;
+    const uint8_t* b = raw + sb * kQ4KBytes;
+    const float d = __half2float(*reinterpret_cast<const __half*>(b));
+    const float dmin = __half2float(*reinterpret_cast<const __half*>(b + 2));
+    const uint8_t* sc = b + 4;
+    int scale, min;
+    if (j < 4) {
+        scale = sc[j] & 63, min = sc[j + 4] & 63;
+    } else {
+        scale = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4);
+        min = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4);
+    }
+    const uint4* q = reinterpret_cast<const uint4*>(b + 16 + 32 * (j / 2));
+    const int shift = 4 * (j % 2);
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        uint4 v = q[h];
+        uint32_t* w = reinterpret_cast<uint32_t*>(&v);
+#pragma unroll
+        // q - 8 in each byte as int8: q ^ 8, with the high nibble set where q < 8
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t q4 = (w[i] >> shift) & 0x0F0F0F0Fu;
+            w[i] = (q4 ^ 0x08080808u) | ((~(q4 >> 3) & 0x01010101u) * 0xF0u);
+        }
+        codes[t * 2 + h] = v;
+    }
+    scales[static_cast<int64_t>(kb) * N + n] = __float2half(d * scale);
+    offsets[static_cast<int64_t>(kb) * N + n] = __float2half(dmin * min - 8.0f * d * scale);
 }
 
 }  // namespace
@@ -189,6 +251,67 @@ extern "C" bool launch_q8_0_packed_linear_kernel(
         gemm(static_cast<__half*>(d));
     } else {
         throw std::runtime_error("q8_0_packed_linear: unsupported output dtype");
+    }
+    return true;
+}
+
+// Linear against a GGUF Q4_K weight (raw super-blocks [N, K / 256, 144 bytes]) on the tiled
+// SimtF16Pairs GEMM, as launch_q8_0_packed_linear_kernel: the codes (0..15) read in place,
+// each sub-block's scale applied and its offset times the row's sum over those 32 elements
+// subtracted as the kernel folds the stage (BLOCK SCALES in gemm_simt.h). Rows are scaled
+// against |code| <= 8. codes, scales and offsets are scratch for the repacked weight and
+// row_sums ([K / 32, M] fp32) for the scaled rows' sub-block sums.
+extern "C" bool launch_q4_k_packed_linear_kernel(
+    const void* x, int x_code, const void* raw, const void* w_amax, void* x16, void* x16t,
+    void* row_scale, void* codes, void* scales, void* offsets, void* row_sums, const void* bias,
+    int bias_code, void* d, int out_code, int M, int N, int K, hipStream_t stream) {
+
+    using namespace comfy::hip_backend;
+
+    if (M == 0 || N == 0) {
+        return true;
+    }
+    if (K % kQ4KBlock != 0 || N % 8 != 0 || !simt_square_tile(M, N)) {
+        return false;
+    }
+    const int64_t subs = static_cast<int64_t>(N) * (K / kQ4KBlock) * 8;
+    repack_q4_k_kernel<<<static_cast<unsigned>((subs + 255) / 256), 256, 0, stream>>>(
+        static_cast<const uint8_t*>(raw), static_cast<uint4*>(codes), static_cast<__half*>(scales),
+        static_cast<__half*>(offsets), N, K / kQ4KBlock);
+    auto* xh = static_cast<__half*>(x16);
+    auto* scale = static_cast<float*>(row_scale);
+    const auto* amax = static_cast<const float*>(w_amax);
+    auto* sums = static_cast<float*>(row_sums);
+    if (x_code == kF32) {
+        launch_scale_rows<float>(x, xh, scale, amax, M, K, stream, sums);
+    } else if (x_code == kF16) {
+        launch_scale_rows<__half>(x, xh, scale, amax, M, K, stream, sums);
+    } else if (x_code == kBF16) {
+        launch_scale_rows<__bf16>(x, xh, scale, amax, M, K, stream, sums);
+    } else {
+        throw std::runtime_error("q4_k_packed_linear: unsupported input dtype");
+    }
+    const int64_t chunks = static_cast<int64_t>((M + 1) & ~1) * (K / 8);
+    tile_rows_f16_kernel<<<static_cast<unsigned>((chunks + 255) / 256), 256, 0, stream>>>(
+        xh, static_cast<__half*>(x16t), M, K);
+
+    const EpiRowScaleBlocksOffset epi{{scale, bias, bias_code, static_cast<const __half*>(scales)},
+                                      static_cast<const __half*>(offsets),
+                                      static_cast<const float*>(row_sums)};
+    const auto* A = static_cast<const uint8_t*>(x16t);
+    const auto* B = static_cast<const uint8_t*>(codes);
+    const auto gemm = [&]<typename OutT>(OutT* out) {
+        launch_gemm_simt_tiled<SimtF16Pairs, EpiRowScaleBlocksOffset, OutT, true>(A, B, out, M, N, 2 * K,
+                                                                                  N, epi, stream);
+    };
+    if (out_code == kF32) {
+        gemm(static_cast<float*>(d));
+    } else if (out_code == kBF16) {
+        gemm(static_cast<__bf16*>(d));
+    } else if (out_code == kF16) {
+        gemm(static_cast<__half*>(d));
+    } else {
+        throw std::runtime_error("q4_k_packed_linear: unsupported output dtype");
     }
     return true;
 }
