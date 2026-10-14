@@ -43,6 +43,12 @@ constexpr int kLdsPad = 8;
 // is a multiple of 16, so a 16-byte chunk starting inside a row also ends inside
 // it. Out-of-range rows and the K tail are zero-filled.
 //
+// **The two bounds tests in the pointer overload look removable and are not.** When
+// the tile is whole (`row0 + ROWS <= rows_total && kbyte0 + BKB <= kbytes`) neither
+// can fire, so the obvious hoisted version is semantically identical -- and measured
+// 1.052x slower on gfx1103, 10/230 paired rounds. See the note in gemm_wmma_kernel's
+// writeback.
+//
 // PAD is the LDS row stride's padding; it must match what the policy's fragment
 // read assumes (Mma::kLdsPad). A PAD that is a multiple of 16 also lets store()
 // write whole 16-byte chunks, since every chunk then starts on a 16-byte
@@ -260,6 +266,34 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
     }
 
     epi.init();
+
+    // ---------------------------------------------------------------------------
+    // Measured: do NOT elide the two bounds tests below. PR 174 does, and it is a
+    // 5.2% regression on gfx1103.
+    //
+    // One process, three arms interleaved by round (canary = a byte-identical copy of
+    // the control, so the harness is shown to report "no difference" as such),
+    // 240 paired rounds x 5 reps, M=16384 K=4096 N=4096:
+    //
+    //   control (FASTPATH=false)   52.539 ms   1.000
+    //   canary  (identical)        52.559 ms   1.000   108/132  tie
+    //   FASTPATH=true              55.248 ms   1.052   10/230   worse
+    //
+    // Both arms are bit-identical (torch.equal) -- so this is purely a codegen cost,
+    // never a wrong answer. Removing the compare is supposed to be free and is not:
+    // the stager is inlined twice inside the K loop, and taking the whole-tile branch
+    // early returns out of the middle of it, which costs the compiler the unified
+    // schedule it had over the two prefetch streams. The ternary costs a compare per
+    // chunk and buys that schedule back.
+    //
+    // Second-order lesson, which is why the canary was needed at all: the first
+    // version gated this behind a runtime kernel *argument*, and measured 0.666x /
+    // 240:0 against its own control -- an apparent 33% *win*. A runtime bool keeps
+    // both copies of the stager's unrolled load live, so the control arm was carrying
+    // a branch it never took and ran 52% slower than the same shape measures here.
+    // The experiment was measuring its own instrumentation. Gate kernel variants on a
+    // *template* parameter so the control arm compiles to the pre-change code.
+    // ---------------------------------------------------------------------------
 
     // Row-major writeback: the TN column tiles of one accumulator row cover
     // TN*16 consecutive columns, keeping the stores of an iteration contiguous.
