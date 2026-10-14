@@ -710,13 +710,22 @@ inline int comfy_nvfp4_gfx10_tile_only() {
     return v;
 }
 
+// Read on every launch, like comfy_gemm_wmma_tile_override() above and the
+// ConvRot block overrides, and for the reason that one gives: the sweeps that
+// produced the table further down need to interleave candidates under one set of
+// clocks, and a rebuild per candidate is not usable here (cold clocks, 1.9x).
+//
+// A static here fixes the depth for the life of the process, which silently
+// defeats both of those. The parametrized test that checks the two depths were
+// correct sets the environment between its cases, so with the static the second
+// case ran at the first case's depth and passed without having exercised
+// anything -- and in a full-suite run it is worse than that, because an earlier
+// NVFP4 matmul in the same process initializes the static first and pins BOTH
+// cases to the default.
 inline int comfy_nvfp4_pipe() {
-    static const int v = [] {
-        const char* s = getenv("COMFY_NVFP4_PIPE");
-        const int p = (s && *s) ? atoi(s) : 2;
-        return (p == 1) ? 1 : 2;
-    }();
-    return v;
+    const char* s = getenv("COMFY_NVFP4_PIPE");
+    const int p = (s && *s) ? atoi(s) : 2;
+    return (p == 1) ? 1 : 2;
 }
 
 }  // namespace comfy::hip_backend
