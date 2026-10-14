@@ -227,23 +227,6 @@ class TensorWiseINT8Layout(QuantizedLayout):
         )
 
     @classmethod
-    def _fusion_operands(cls, weights):
-        """Resolve a compatible group of projections or return ``None``."""
-        operands = tuple(
-            cls._fusion_operand(weight) for weight in weights
-        )
-        if any(operand is None for operand in operands):
-            return None
-        qdata, _, convrot, group_size = operands[0]
-        if any(
-            operand[2:4] != (convrot, group_size)
-            or operand[0].shape != qdata.shape
-            for operand in operands[1:]
-        ):
-            return None
-        return operands
-
-    @classmethod
     def fused_rms_modulated(
         cls,
         x: torch.Tensor,
@@ -274,76 +257,6 @@ class TensorWiseINT8Layout(QuantizedLayout):
             x, norm_weight, norm_eps, modulation_scale, qdata, scale,
             bias, x.dtype, convrot=convrot,
             convrot_groupsize=group_size,
-        )
-
-    @classmethod
-    def fused_swiglu_ffn(
-        cls,
-        x: torch.Tensor,
-        gate_weight: QuantizedTensor,
-        up_weight: QuantizedTensor,
-        down_weight: QuantizedTensor,
-        gate_bias: torch.Tensor | None,
-        up_bias: torch.Tensor | None,
-        down_bias: torch.Tensor | None,
-        *,
-        norm_weight: torch.Tensor | None = None,
-        norm_eps: float = 0.0,
-        modulation_scale: torch.Tensor | None = None,
-    ):
-        # Modulation is only fused together with the RMSNorm, and only as one
-        # row shared by every token (see fused_rms_modulated).
-        width = x.shape[-1]
-        if (norm_weight is None) != (modulation_scale is None):
-            return NotImplemented
-        if norm_weight is not None and (
-            norm_weight.numel() != width or modulation_scale.numel() != width
-        ):
-            return NotImplemented
-        pair = cls._fusion_operands((gate_weight, up_weight))
-        down = cls._fusion_operand(down_weight)
-        if pair is None or down is None:
-            return NotImplemented
-        first, second = pair
-        qgate, gate_scale, convrot, group_size = first
-        qup, up_scale, _, _ = second
-        pair_op = (
-            "int8_linear_pair" if norm_weight is None
-            else "int8_linear_pair_rms_modulated"
-        )
-        if not (
-            _has_native_fusion(pair_op, {
-                "x": x, "norm_weight": norm_weight,
-                "modulation_scale": modulation_scale,
-                "weight0": qgate, "weight1": qup, "out_dtype": x.dtype,
-            })
-            and _has_native_fusion("int8_linear_swiglu_split", {
-                "weight": down[0], "out_dtype": x.dtype,
-            })
-        ):
-            return NotImplemented
-        if norm_weight is None:
-            from comfy_kitchen import int8_linear_pair
-
-            gate, up = int8_linear_pair(
-                x, qgate, qup, gate_scale, up_scale, gate_bias, up_bias,
-                x.dtype, convrot=convrot, convrot_groupsize=group_size,
-            )
-        else:
-            from comfy_kitchen import int8_linear_pair_rms_modulated
-
-            gate, up = int8_linear_pair_rms_modulated(
-                x, norm_weight, norm_eps, modulation_scale,
-                qgate, qup, gate_scale, up_scale, gate_bias, up_bias,
-                x.dtype, convrot=convrot, convrot_groupsize=group_size,
-            )
-
-        qdown, down_scale, down_convrot, down_group = down
-        from comfy_kitchen import int8_linear_swiglu_split
-
-        return int8_linear_swiglu_split(
-            gate, up, qdown, down_scale, down_bias, gate.dtype,
-            convrot=down_convrot, convrot_groupsize=down_group,
         )
 
     @classmethod

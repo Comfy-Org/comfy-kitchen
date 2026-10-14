@@ -367,57 +367,6 @@ def test_gfx12_fused_rms_modulated_matches_unfused(hip):
     _assert_weights_untouched([weight], snapshot)
 
 
-@needs_wmma
-@pytest.mark.parametrize("with_norm", [False, True])
-def test_gfx12_fused_swiglu_ffn_matches_unfused(hip, with_norm):
-    skip_unless_gfx12_wmma()
-
-    torch.manual_seed(38)
-    m, width, hidden = 256, 3840, 10240
-    eps = 1.0e-6
-    x = torch.randn((1, m, width), device=DEV, dtype=torch.bfloat16)
-    norm_weight = torch.rand(width, device=DEV, dtype=torch.bfloat16) + 0.5
-    modulation_scale = (
-        torch.randn((1, width), device=DEV, dtype=torch.bfloat16) * 0.25
-    )
-    weights = (
-        _convrot_int8_weight(hidden, width),
-        _convrot_int8_weight(hidden, width),
-        _convrot_int8_weight(width, hidden),
-    )
-    plain = [TensorWiseINT8Layout.get_plain_tensors(w) for w in weights]
-    snapshot = _snapshot_weights(weights)
-    fusion_kwargs = (
-        {"norm_weight": norm_weight, "norm_eps": eps,
-         "modulation_scale": modulation_scale}
-        if with_norm else {}
-    )
-
-    with torch.inference_mode(), ck.use_backend("hip"):
-        projected = (
-            _modulated_rms(x, norm_weight, eps, modulation_scale)
-            if with_norm else x
-        )
-        gate, up = (
-            ck.int8_linear(
-                projected, qdata, scale, None, torch.bfloat16,
-                convrot=True, convrot_groupsize=256,
-            )
-            for qdata, scale in plain[:2]
-        )
-        reference = ck.int8_linear(
-            torch.nn.functional.silu(gate) * up, plain[2][0], plain[2][1],
-            None, torch.bfloat16, convrot=True, convrot_groupsize=256,
-        )
-        candidate = TensorWiseINT8Layout.fused_swiglu_ffn(
-            x, *weights, None, None, None, **fusion_kwargs
-        )
-
-    assert candidate is not NotImplemented
-    assert torch.equal(candidate, reference)
-    _assert_weights_untouched(weights, snapshot)
-
-
 @pytest.mark.parametrize(
     ("rows", "width"),
     [(160, 3840), (4096, 3840), (97, 3072)],
