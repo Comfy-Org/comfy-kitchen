@@ -193,6 +193,7 @@ set(HIP_SOURCES
 set(CPP_SOURCES
     dlpack_bindings.cpp
     dlpack_bindings_gfx103x.cpp
+    int8_decode_bindings.cpp
 )
 
 # Keep HIP compilation independent of the Python extension target. The kernels

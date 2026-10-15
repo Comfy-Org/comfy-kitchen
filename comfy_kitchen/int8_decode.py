@@ -1,20 +1,25 @@
 """Paged CK integer attention over a growing, fixed-capacity decode prefix."""
 import torch
 
-from .backends import cuda
+if torch.version.hip:
+    from .backends import hip as backend
+    from .backends.hip import _dl as wrap_for_dlpack
+else:
+    from .backends import cuda as backend
+    from .backends.cuda import _wrap_for_dlpack as wrap_for_dlpack
 
 
 def is_available(device: torch.device | None = None) -> bool:
     """Return whether the native growing INT8 cache supports this device."""
     if device is not None and device.type != "cuda":
         return False
-    if torch.version.hip or not torch.cuda.is_available():
+    if not torch.cuda.is_available():
         return False
     return (
-        cuda._EXT_AVAILABLE
-        and hasattr(cuda._C, "_int8_decode_update")
-        and hasattr(cuda._C, "_int8_decode")
-        and torch.cuda.get_device_capability(device) >= (8, 0)
+        backend._EXT_AVAILABLE
+        and hasattr(backend._C, "_int8_decode_update")
+        and hasattr(backend._C, "_int8_decode")
+        and (backend.has_wmma() if torch.version.hip else torch.cuda.get_device_capability(device) >= (8, 0))
     )
 
 
@@ -36,8 +41,8 @@ class Int8DecodeCache:
         circular source: absolute row i lives at i % rows. The caller must retain both
         pages being refreshed, including through speculative writes and rollback.
         """
-        cuda._C._int8_decode_update(
-            *map(cuda._wrap_for_dlpack, (key, value, self.key, self.value, self.key_scale, self.value_scale, length)),
+        backend._C._int8_decode_update(
+            *map(wrap_for_dlpack, (key, value, self.key, self.value, self.key_scale, self.value_scale, length)),
             initialize, torch.cuda.current_stream(key.device).cuda_stream)
 
     def attend(self, query, length):
@@ -52,12 +57,13 @@ class Int8DecodeCache:
         q = query.reshape(batch, kv_heads, rows, dim).contiguous()
         qi = torch.empty_like(q, dtype=torch.int8)
         qs = torch.empty((batch, kv_heads, 64), dtype=torch.float32, device=q.device)
-        partial = torch.empty((batch, self.key.shape[1], kv_heads, rows, dim), dtype=q.dtype, device=q.device)
+        splits = self.key.shape[1] * (8 if torch.version.hip else 1)
+        partial = torch.empty((batch, splits, kv_heads, rows, dim), dtype=q.dtype, device=q.device)
         lse = torch.empty(partial.shape[:-1], dtype=torch.float32, device=q.device)
         out = torch.empty((batch, seq, heads * dim), dtype=q.dtype, device=q.device)
         out_lse = torch.empty((batch, heads, seq), dtype=torch.float32, device=q.device)
-        cuda._C._int8_decode(
-            *map(cuda._wrap_for_dlpack, (q, qi, qs, self.key, self.value, self.key_scale, self.value_scale,
+        backend._C._int8_decode(
+            *map(wrap_for_dlpack, (q, qi, qs, self.key, self.value, self.key_scale, self.value_scale,
                                        length, partial, lse, out, out_lse)),
             seq, torch.cuda.current_stream(q.device).cuda_stream)
         return out, out_lse

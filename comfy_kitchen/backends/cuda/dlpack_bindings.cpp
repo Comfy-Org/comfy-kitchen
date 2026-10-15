@@ -2509,7 +2509,7 @@ extern "C" {
         int batch, int query_length, int heads, int head_dim, int kv_capacity, int num_splits,
         int64_t q_batch_stride, int64_t q_row_stride, int64_t q_head_stride,
         int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
-        int* combine_counters, cudaStream_t stream);
+        cudaStream_t stream);
 
     void launch_flash_decode_gqa(
         const void* q, const void* k, const void* v, const int* kv_lengths,
@@ -2518,7 +2518,7 @@ extern "C" {
         int64_t q_batch_stride, int64_t q_row_stride, int64_t q_head_stride,
         int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
         int64_t o_batch_stride, int64_t o_row_stride, int64_t o_head_stride,
-        int* combine_counters, cudaStream_t stream);
+        cudaStream_t stream);
 
     void launch_flash_decode_step_merge(
         const void* out, const float* lse, const void* q, const void* k, const void* v, void* merged,
@@ -4218,7 +4218,6 @@ void flash_attention_decode(
     nb::ndarray<float, nb::device::cuda> softmax_lse,
     nb::ndarray<float, nb::device::cuda> softmax_lse_accum,
     nb::ndarray<float, nb::device::cuda> output_accum,
-    nb::ndarray<int32_t, nb::device::cuda> combine_counters,
     int num_splits,
     uintptr_t stream_ptr) {
     const int batch = k.shape(0);
@@ -4245,14 +4244,6 @@ void flash_attention_decode(
     if (k.stride(0) != v.stride(0) || k.stride(1) != v.stride(1) || k.stride(2) != v.stride(2) || k.stride(3) != 1 || v.stride(3) != 1 || q.stride(2) != 1 || output.stride(2) != 1) {
         throw std::runtime_error("Unsupported Flash Attention tensor strides");
     }
-    // In-kernel combine needs one zeroed counter per (batch * head, m_block); m_block is 1 here (seqlen_q <= 64).
-    int* counters = nullptr;
-    if (num_splits > 1 && combine_counters.size() > 0) {
-        if (combine_counters.size() < static_cast<size_t>(batch) * heads) {
-            throw std::runtime_error("Flash Attention combine counters too small");
-        }
-        counters = combine_counters.data();
-    }
 
     launch_flash_decode(
         q.data(), k.data(), v.data(), kv_lengths.data(), output.data(), softmax_lse.data(),
@@ -4260,7 +4251,7 @@ void flash_attention_decode(
         num_splits > 1 ? output_accum.data() : nullptr,
         batch, query_length, heads, head_dim, kv_capacity, num_splits,
         q.stride(0) * query_length, q.stride(0), q.stride(1),
-        k.stride(0), k.stride(1), k.stride(2), counters, reinterpret_cast<cudaStream_t>(stream_ptr));
+        k.stride(0), k.stride(1), k.stride(2), reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // GQA decode attention, head_dim 256, bottom-right causal over kv_lengths[b] slots:
@@ -4274,7 +4265,6 @@ void flash_attention_decode_gqa(
     nb::ndarray<float, nb::device::cuda> softmax_lse,
     nb::ndarray<float, nb::device::cuda> softmax_lse_accum,
     nb::ndarray<float, nb::device::cuda> output_accum,
-    nb::ndarray<int32_t, nb::device::cuda> combine_counters,
     int num_splits,
     uintptr_t stream_ptr) {
     constexpr int64_t kHeadDim = 256;
@@ -4302,14 +4292,6 @@ void flash_attention_decode_gqa(
     }
 
     const int64_t groups = heads / kv_heads;
-    // In-kernel combine needs one zeroed counter per (batch * head, m_block); m_block is 1 here (seqlen_q <= 64).
-    int* counters = nullptr;
-    if (num_splits > 1 && combine_counters.size() > 0) {
-        if (combine_counters.size() < static_cast<size_t>(batch * (query_length == 1 ? kv_heads : heads))) {
-            throw std::runtime_error("Flash Attention combine counters too small");
-        }
-        counters = combine_counters.data();
-    }
     if (query_length == 1) {
         // Every group head of a kv head attends the same slots: fold the groups into query rows
         // so K/V stream once per kv head. q [B, H, 1, D] viewed as [B, Hk, G, D]; output rows are
@@ -4321,7 +4303,7 @@ void flash_attention_decode_gqa(
             static_cast<int>(batch), static_cast<int>(groups), static_cast<int>(kv_heads), static_cast<int>(kv_heads), static_cast<int>(kv_capacity), num_splits, false,
             q.stride(0), q.stride(1), groups * q.stride(1),
             k.stride(0), k.stride(2), k.stride(1),
-            output.stride(0), kHeadDim, groups * kHeadDim, counters, reinterpret_cast<cudaStream_t>(stream_ptr));
+            output.stride(0), kHeadDim, groups * kHeadDim, reinterpret_cast<cudaStream_t>(stream_ptr));
         return;
     }
     launch_flash_decode_gqa(
@@ -4331,7 +4313,7 @@ void flash_attention_decode_gqa(
         static_cast<int>(batch), static_cast<int>(query_length), static_cast<int>(heads), static_cast<int>(kv_heads), static_cast<int>(kv_capacity), num_splits, true,
         q.stride(0), q.stride(2), q.stride(1),
         k.stride(0), k.stride(2), k.stride(1),
-        output.stride(0), output.stride(1), kHeadDim, counters, reinterpret_cast<cudaStream_t>(stream_ptr));
+        output.stride(0), output.stride(1), kHeadDim, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Current-step merge: out [B, S, H*256] and lse [B, H, S] come from a prefix-only
@@ -5241,12 +5223,12 @@ NB_MODULE(_C, m) {
           "Flash Attention decode over a fixed-capacity variable-length KV cache",
           nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("kv_lengths"),
           nb::arg("output"), nb::arg("softmax_lse"), nb::arg("softmax_lse_accum"),
-          nb::arg("output_accum"), nb::arg("combine_counters"), nb::arg("num_splits"), nb::arg("stream_ptr"));
+          nb::arg("output_accum"), nb::arg("num_splits"), nb::arg("stream_ptr"));
     m.def("flash_attention_decode_gqa", &flash_attention_decode_gqa,
           "Causal GQA decode attention (head_dim 256) over a [batch, kv_heads, capacity, 256] cache",
           nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("kv_lengths"),
           nb::arg("output"), nb::arg("softmax_lse"), nb::arg("softmax_lse_accum"),
-          nb::arg("output_accum"), nb::arg("combine_counters"), nb::arg("num_splits"), nb::arg("stream_ptr"));
+          nb::arg("output_accum"), nb::arg("num_splits"), nb::arg("stream_ptr"));
 
     m.def("flash_attention_decode_step_merge", &flash_attention_decode_step_merge,
           "Fold the current step's rows causally into a prefix-only GQA decode result using its log-sum-exp",
