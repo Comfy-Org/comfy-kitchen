@@ -1519,20 +1519,17 @@ __device__ __forceinline__ float torch_rms_rstd(
     return rsqrtf(buf[4] + eps);
 }
 
-template<typename InputType, int CL, int ACT>
-__global__ void CLUSTER_DIMS(CL) __launch_bounds__(kClusterQuantThreads)
-quantize_int8_convrot_cluster_kernel(
+template<typename InputType, int CL, int ACT, bool COOPERATIVE>
+__device__ __forceinline__ void quantize_int8_convrot_blocks(
     const InputType* __restrict__ x,
     const InputType* __restrict__ act_weight,
     float act_eps,
     int8_t* __restrict__ q,
     float* __restrict__ scales,
-    int K)
+    int K,
+    float* __restrict__ maxima)
 {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    namespace cg = cooperative_groups;
-    cg::cluster_group cluster = cg::this_cluster();
-    const int rank = static_cast<int>(cluster.block_rank());
+    const int rank = blockIdx.x % CL;
     constexpr int kWarps = kClusterQuantThreads / kThreadsPerWarp;
     constexpr int kSlots = CL * kClusterQuantGroups;
 
@@ -1611,14 +1608,24 @@ quantize_int8_convrot_cluster_kernel(
     }
 
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
-    if (tid == 0) cluster_max = abs_max;
-    cluster.sync();
     float row_max = 0.0f;
-    #pragma unroll
-    for (int r = 0; r < CL; ++r) {
-        row_max = fmaxf(row_max, cluster.map_shared_rank(&cluster_max, r)[0]);
+    if constexpr (COOPERATIVE) {
+        if (tid == 0) maxima[blockIdx.x] = abs_max;
+        cooperative_groups::this_grid().sync();
+        #pragma unroll
+        for (int r = 0; r < CL; ++r) row_max = fmaxf(row_max, maxima[row * CL + r]);
+    } else {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        auto cluster = cooperative_groups::this_cluster();
+        if (tid == 0) cluster_max = abs_max;
+        cluster.sync();
+        #pragma unroll
+        for (int r = 0; r < CL; ++r) {
+            row_max = fmaxf(row_max, cluster.map_shared_rank(&cluster_max, r)[0]);
+        }
+        cluster.sync();  // every peer has read cluster_max before anyone may exit
+#endif
     }
-    cluster.sync();  // every peer has read cluster_max before anyone may exit
 
     const float scale = fmaxf(
         finite_absmax_for_int8_scale<InputType>(row_max) * (1.0f / 127.0f),
@@ -1641,7 +1648,27 @@ quantize_int8_convrot_cluster_kernel(
             qg[i * 64] = static_cast<int8_t>(quantized);
         }
     }
+}
+
+template<typename InputType, int CL, int ACT>
+__global__ void CLUSTER_DIMS(CL) __launch_bounds__(kClusterQuantThreads)
+quantize_int8_convrot_cluster_kernel(
+    const InputType* x, const InputType* act_weight, float act_eps,
+    int8_t* q, float* scales, int K)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    quantize_int8_convrot_blocks<InputType, CL, ACT, false>(x, act_weight, act_eps, q, scales, K, nullptr);
 #endif
+}
+
+// Same dataflow as the cluster kernel: only block maxima leave the block.
+template<typename InputType, int CL, int ACT>
+__global__ void __launch_bounds__(kClusterQuantThreads)
+quantize_int8_convrot_cooperative_kernel(
+    const InputType* x, const InputType* act_weight, float act_eps,
+    int8_t* q, float* scales, float* maxima, int K)
+{
+    quantize_int8_convrot_blocks<InputType, CL, ACT, true>(x, act_weight, act_eps, q, scales, K, maxima);
 }
 
 } // namespace
@@ -2005,6 +2032,60 @@ bool launch_quantize_int8_convrot_cluster_kernel(
         throw std::runtime_error(std::string("CUDA INT8 cluster convrot quantization failed: ") + cudaGetErrorString(err));
     }
     return true;
+}
+
+bool launch_quantize_int8_convrot_cooperative_kernel(
+    const void* input, const void* act_weight, float act_eps, int act_code,
+    void* output, void* scales, void* maxima,
+    int64_t num_rows, int64_t num_cols, int input_dtype_code, cudaStream_t stream,
+    bool query_only)
+{
+    using namespace comfy;
+    if (input_dtype_code != DTYPE_CODE_BFLOAT16 || num_rows < 1 || num_rows > 8
+            || num_cols < 256 || num_cols > 24576 || num_cols % 256 != 0)
+        return false;
+    if (act_code != kActNone && act_code != kActSwiGLU && act_code != kActRmsNorm)
+        return false;
+    if (!query_only && act_code == kActRmsNorm && act_weight == nullptr)
+        return false;
+    int device = 0, major = 0, cooperative = 0, sms = 0;
+    if (cudaGetDevice(&device) != cudaSuccess
+            || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess
+            || major != 8
+            || cudaDeviceGetAttribute(&cooperative, cudaDevAttrCooperativeLaunch, device) != cudaSuccess
+            || !cooperative
+            || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
+        return false;
+    int cl = 1;
+    while (cl < 8 && num_cols / 256 > cl * kClusterQuantGroups) cl *= 2;
+    auto launch = [&]<int CL, int ACT>() {
+        auto kernel = quantize_int8_convrot_cooperative_kernel<nv_bfloat16, CL, ACT>;
+        int resident = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, kClusterQuantThreads, 0) != cudaSuccess
+                || num_rows * CL > resident * sms)
+            return false;
+        if (query_only) return true;
+        int k = static_cast<int>(num_cols);
+        void* args[] = {&input, &act_weight, &act_eps, &output, &scales, &maxima, &k};
+        const cudaError_t err = cudaLaunchCooperativeKernel(
+            reinterpret_cast<const void*>(kernel), dim3(num_rows * CL), dim3(kClusterQuantThreads), args, 0, stream);
+        if (err != cudaSuccess)
+            throw std::runtime_error(std::string("CUDA cooperative ConvRot quantization failed: ") + cudaGetErrorString(err));
+        return true;
+    };
+    auto launch_cl = [&]<int CL>() {
+        switch (act_code) {
+            case kActSwiGLU: return launch.template operator()<CL, kActSwiGLU>();
+            case kActRmsNorm: return launch.template operator()<CL, kActRmsNorm>();
+            default: return launch.template operator()<CL, kActNone>();
+        }
+    };
+    switch (cl) {
+        case 1: return launch_cl.template operator()<1>();
+        case 2: return launch_cl.template operator()<2>();
+        case 4: return launch_cl.template operator()<4>();
+        default: return launch_cl.template operator()<8>();
+    }
 }
 
 void launch_quantize_int8_rowwise_convrot64_kernel(

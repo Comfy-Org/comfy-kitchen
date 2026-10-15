@@ -2650,10 +2650,20 @@ def w4a8_packed_linear(
         raise ValueError("w4a8_int8_linear: residual requires residual_scale")
     n = s_channel.numel()
     k = x.shape[-1] // _input_act_width(input_act)
+    m = x.numel() // x.shape[-1]
+    cluster_quantizer = _w4a8_cluster_quantizer_ok(k, input_act, x.device)
+    cooperative_quantizer = False
+    if (m <= 8 and x.dtype == torch.bfloat16 and convrot_groupsize == 256
+            and qdata.numel() == n * k * w4a8_mma_record_bytes(4) // 512
+            and _cuda_device_capability(x.device.index)[0] == 8):
+        with torch.cuda.device(x.device):
+            cooperative_quantizer = _C.convrot_cooperative_supported(
+                m, k, DTYPE_TO_CODE[x.dtype], _input_act_code(input_act)
+            )
     fuse_act = (
         input_act is not None
-        and x.numel() <= 8 * x.shape[-1]
-        and _w4a8_cluster_quantizer_ok(k, input_act, x.device)
+        and m <= 8
+        and (cluster_quantizer or cooperative_quantizer)
     )
     if input_act is not None and not fuse_act:
         x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
@@ -2685,11 +2695,11 @@ def w4a8_packed_linear(
     xs = torch.empty(m, 1, dtype=torch.float32, device=x.device)
     out = torch.empty(m, n, dtype=out_dtype, device=x.device)
     if m <= 8:
-        # Staged-pair scratch is only needed where the single cluster quantizer
-        # cannot run (pre-sm_90, very wide K); a fused activation implies the cluster path.
+        # Cooperative blocks exchange maxima; only the staged fallback materializes rotation.
         rotated = partial_absmax = act_weight = None
-        if input_act is None and not _w4a8_cluster_quantizer_ok(k, None, x.device):
-            rotated = torch.empty_like(x_2d)
+        if not _w4a8_cluster_quantizer_ok(k, None, x.device):
+            if not cooperative_quantizer:
+                rotated = torch.empty_like(x_2d)
             partial_absmax = torch.empty(
                 m, k // convrot_groupsize, dtype=torch.float32, device=x.device
             )
@@ -4017,6 +4027,50 @@ def rms_rope_split_half_(
         split_half=True, inplace=True, rot_dim=rot_dim,
     )
 
+
+
+def rms_rope_kv_decode_is_available(device: torch.device | int | None = None) -> bool:
+    if device is not None and torch.device(device).type != "cuda":
+        return False
+    return _EXT_AVAILABLE and _C is not None and hasattr(_C, "rms_rope_kv_decode")
+
+
+def rms_rope_kv_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    position: torch.Tensor,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode step over S rows: RMSNorm + split-half RoPE of q [B,S,Hq,D] and k [B,S,Hkv,D]
+    over the first rot dims of each normed head, with rope(k) and v [B,S,Hkv,D] written
+    into key_cache/value_cache [B,Hkv,cap,D] at row position[b, s] (int64 [B|1, S|1]).
+    Returns rope(q) [B,Hq,S,D] and rope(k) [B,Hkv,S,D]. freqs_cis is the
+    [1|B,1,1|S,rot/2,2,2] rotation."""
+    batch, rows, q_heads, head_dim = q.shape
+    q_out = torch.empty((batch, q_heads, rows, head_dim), dtype=q.dtype, device=q.device)
+    k_out = torch.empty((batch, k.shape[2], rows, head_dim), dtype=q.dtype, device=q.device)
+    _C.rms_rope_kv_decode(
+        _wrap_for_dlpack(q),
+        _wrap_for_dlpack(k),
+        _wrap_for_dlpack(v),
+        _wrap_for_dlpack(freqs_cis),
+        _wrap_for_dlpack(q_scale),
+        _wrap_for_dlpack(k_scale),
+        _wrap_for_dlpack(q_out),
+        _wrap_for_dlpack(k_out),
+        _wrap_for_dlpack(key_cache),
+        _wrap_for_dlpack(value_cache),
+        _wrap_for_dlpack(position),
+        epsilon,
+        torch.cuda.current_stream(q.device).cuda_stream,
+    )
+    return q_out, k_out
 
 
 def apply_rope_split_half1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:

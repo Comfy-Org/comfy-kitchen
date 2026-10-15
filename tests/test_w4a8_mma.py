@@ -112,23 +112,6 @@ class TestW4A8PackedMMA:
                                             residual=big_res, residual_scale=scale)
         assert torch.equal(got, torch.addcmul(big_res, linear, scale))
 
-    @pytest.mark.parametrize("m", [1, 5, 8])
-    @pytest.mark.parametrize("act", ["rms_norm", "swiglu"])
-    @pytest.mark.parametrize("bits", [4, 6])
-    def test_fused_activation_matches_eager(self, m, act, bits, seed):
-        k = 4096
-        _, _, s_channel, _, packed = _packed_weight(4096, k, seed=1, bits=bits)
-        x = torch.randn(m, k * (2 if act == "swiglu" else 1), device="cuda", dtype=torch.bfloat16) * 3.0
-        w = torch.randn(k, device="cuda", dtype=torch.bfloat16)
-        eps = 1e-6
-        empty = torch.empty(0, device="cuda", dtype=torch.float8_e4m3fn)
-        activated = (torch.nn.functional.silu(x[:, :k]) * x[:, k:] if act == "swiglu"
-                     else torch.nn.functional.rms_norm(x, (k,), weight=w, eps=eps))
-        expected = ck.w4a8_int8_linear(activated, packed, empty, s_channel, mma_packed=True)
-        got = ck.w4a8_int8_linear(x, packed, empty, s_channel, mma_packed=True,
-                                           input_act=act, input_act_weight=w, input_act_eps=eps)
-        assert torch.equal(got, expected)
-
     def test_rows_are_independent(self, seed):
         # Row r of a 7-row call must equal row 0 of a 1-row call on the same input: the MMA
         # beat's padding rows must not leak into the real ones.
@@ -254,6 +237,38 @@ class TestW4A8PackedMMA:
             assert torch.equal(unpacked_q, q)
             assert torch.equal(unpacked_scales.view(torch.uint8), scales.view(torch.uint8))
             assert torch.all(storage[:64] == 73) and torch.all(storage[-128:] == 73)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+    reason="CUDA W4A8 linear needs sm_80+",
+)
+@pytest.mark.parametrize("m,k", [(1, 5120), (6, 17408), (8, 4096)])
+@pytest.mark.parametrize("act", ["rms_norm", "swiglu"])
+@pytest.mark.parametrize("bits", [4, 6])
+def test_fused_activation_matches_eager(m, k, act, bits, seed):
+    _, _, s_channel, _, packed = _packed_weight(256, k, seed=1, bits=bits)
+    x = torch.randn(m, k * (2 if act == "swiglu" else 1), device="cuda", dtype=torch.bfloat16) * 3.0
+    w = torch.randn(k, device="cuda", dtype=torch.bfloat16)
+    eps = 1e-6
+    empty = torch.empty(0, device="cuda", dtype=torch.float8_e4m3fn)
+
+    def fused():
+        return ck.w4a8_int8_linear(x, packed, empty, s_channel, mma_packed=True,
+                                  input_act=act, input_act_weight=w, input_act_eps=eps)
+
+    for _ in range(3):
+        fused()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = fused()
+    for magnitude in (0.125, 8.0):
+        x.normal_().mul_(magnitude)
+        activated = (torch.nn.functional.silu(x[:, :k]) * x[:, k:] if act == "swiglu"
+                     else torch.nn.functional.rms_norm(x, (k,), weight=w, eps=eps))
+        expected = ck.w4a8_int8_linear(activated, packed, empty, s_channel, mma_packed=True)
+        graph.replay()
+        assert torch.equal(got, expected)
 
 
 @pytest.mark.skipif(

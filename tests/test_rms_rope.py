@@ -538,3 +538,45 @@ class TestPartialRotary:
         assert torch.equal(q, q_ref) and torch.equal(k, k_ref)
         assert not torch.equal(q, q_orig), "q buffer was never written in place"
         assert not torch.equal(k, k_orig), "k buffer was never written in place"
+
+
+@requires_cuda_backend
+@pytest.mark.parametrize("rows", [1, 6])
+def test_decode_cache_partial_rope_graph(rows, seed):
+    batch, heads, kv_heads, dim, rot, capacity = 2, 6, 2, 256, 64, 19
+    qg = torch.randn(batch, rows, heads, dim * 2, device="cuda", dtype=torch.bfloat16)
+    q = qg[..., :dim]
+    k = torch.randn(batch, rows, kv_heads, dim, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    scales = [torch.randn(dim, device="cuda", dtype=q.dtype) for _ in range(2)]
+    freqs = torch.randn(batch, 1, rows, rot // 2, 2, 2, device="cuda")
+    caches = [torch.full((batch, kv_heads, capacity, dim), -7.0, device="cuda", dtype=q.dtype) for _ in range(2)]
+    position = torch.arange(rows, device="cuda").expand(batch, rows).clone()
+
+    def reference(x, scale):
+        norm = torch.nn.functional.rms_norm(x, (dim,), scale, 1e-6).transpose(1, 2)
+        rotated = ck.apply_rope_split_half1(norm[..., :rot], freqs)
+        return torch.cat((rotated, norm[..., rot:]), dim=-1)
+
+    for _ in range(3):
+        ck.rms_rope_kv_decode(q, k, v, freqs, *scales, *caches, position)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = ck.rms_rope_kv_decode(q, k, v, freqs, *scales, *caches, position)
+    for start in (capacity - 2, 1, capacity - 4):
+        qg.normal_()
+        k.normal_()
+        v.normal_()
+        for b in range(batch):
+            position[b].copy_((torch.arange(rows, device="cuda") + start + b) % capacity)
+        for cache in caches:
+            cache.fill_(-7)
+        expected_q, expected_k = reference(q, scales[0]), reference(k, scales[1])
+        expected_caches = [cache.clone() for cache in caches]
+        for b in range(batch):
+            expected_caches[0][b].index_copy_(1, position[b], expected_k[b])
+            expected_caches[1][b].index_copy_(1, position[b], v[b].transpose(0, 1))
+        graph.replay()
+        assert torch.equal(result[0], expected_q)
+        assert torch.equal(result[1], expected_k)
+        assert all(torch.equal(actual, expected) for actual, expected in zip(caches, expected_caches, strict=False))

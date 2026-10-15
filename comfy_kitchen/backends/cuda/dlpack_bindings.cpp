@@ -150,6 +150,20 @@ extern "C" {
         bool split_half,
         cudaStream_t stream);
 
+    void launch_rms_rope_kv_decode_kernel(
+        const void* q, const void* k, const void* v, const void* freqs,
+        const void* q_scale, const void* k_scale, void* q_out, void* k_out,
+        void* key_cache, void* value_cache, const int64_t* position,
+        int64_t batch, int64_t rows, int64_t q_heads, int64_t kv_heads,
+        int64_t head_dim, int64_t rot_dim, int64_t q_s0, int64_t q_s1,
+        int64_t q_s2, int64_t k_s0, int64_t k_s1, int64_t k_s2, int64_t v_s0,
+        int64_t v_s1, int64_t v_s2, int64_t qo_s0, int64_t qo_s1, int64_t qo_s2,
+        int64_t ko_s0, int64_t ko_s1, int64_t ko_s2, int64_t c_s0, int64_t c_s1,
+        int64_t c_s2, int64_t p_sb, int64_t p_ss, int64_t f_s0, int64_t f_s2,
+        int64_t f_s3, int64_t f_s4, int64_t f_s5, int64_t qs_stride,
+        int64_t ks_stride, float epsilon, int input_dtype_code,
+        int freqs_dtype_code, int scale_dtype_code, cudaStream_t stream);
+
     void launch_dequantize_nvfp4_kernel(
         const void* input,
         const void* global_scale,
@@ -933,6 +947,119 @@ void rms_rope1(nb::ndarray<nb::device::cuda> q,
       freqs.stride(4), freqs.stride(5), q_scale.stride(0), 0,
       epsilon, input_dtype_code,
       freqs_dtype_code, scale_dtype_code, false, split_half,
+      reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+// Decode-step fused q/k RMSNorm + split-half RoPE with the KV-cache scatter:
+// q [B,S,Hq,D] -> q_out [B,Hq,S,D]; k [B,S,Hkv,D] -> k_out [B,Hkv,S,D] and, with v,
+// key_cache/value_cache [B,Hkv,capacity,D] at row position[b, s].
+void rms_rope_kv_decode(nb::ndarray<nb::device::cuda> q,
+                        nb::ndarray<nb::device::cuda> k,
+                        nb::ndarray<nb::device::cuda> v,
+                        nb::ndarray<nb::device::cuda> freqs,
+                        nb::ndarray<nb::device::cuda> q_scale,
+                        nb::ndarray<nb::device::cuda> k_scale,
+                        nb::ndarray<nb::device::cuda> q_out,
+                        nb::ndarray<nb::device::cuda> k_out,
+                        nb::ndarray<nb::device::cuda> key_cache,
+                        nb::ndarray<nb::device::cuda> value_cache,
+                        nb::ndarray<int64_t, nb::device::cuda> position,
+                        float epsilon, uintptr_t stream_ptr) {
+  if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || q_out.ndim() != 4 || k_out.ndim() != 4) {
+    throw std::runtime_error("rms_rope_kv_decode q/k/v must be [B,S,H,D], q_out/k_out [B,H,S,D]");
+  }
+  const int64_t batch = q.shape(0);
+  const int64_t rows = q.shape(1);
+  const int64_t q_heads = q.shape(2);
+  const int64_t kv_heads = k.shape(2);
+  const int64_t head_dim = q.shape(3);
+  if (head_dim < 32 || head_dim % 32 != 0) {
+    throw std::runtime_error(
+        "rms_rope_kv_decode requires head_dim to be a positive multiple of 32");
+  }
+  if (k.shape(0) != batch || k.shape(1) != rows || k.shape(3) != head_dim) {
+    throw std::runtime_error("rms_rope_kv_decode k must be [B,S,Hkv,D]");
+  }
+  for (int axis = 0; axis < 4; ++axis) {
+    if (v.shape(axis) != k.shape(axis)) {
+      throw std::runtime_error("rms_rope_kv_decode v must match k");
+    }
+  }
+  if (q_out.shape(0) != batch || q_out.shape(1) != q_heads || q_out.shape(2) != rows || q_out.shape(3) != head_dim ||
+      k_out.shape(0) != batch || k_out.shape(1) != kv_heads || k_out.shape(2) != rows || k_out.shape(3) != head_dim) {
+    throw std::runtime_error("rms_rope_kv_decode q_out/k_out must be [B,H,S,D]");
+  }
+  if (key_cache.ndim() != 4 || value_cache.ndim() != 4 ||
+      key_cache.shape(0) != batch || key_cache.shape(1) != kv_heads ||
+      key_cache.shape(3) != head_dim) {
+    throw std::runtime_error(
+        "rms_rope_kv_decode caches must be [B,Hkv,capacity,D]");
+  }
+  for (int axis = 0; axis < 4; ++axis) {
+    if (value_cache.shape(axis) != key_cache.shape(axis) ||
+        value_cache.stride(axis) != key_cache.stride(axis)) {
+      throw std::runtime_error(
+          "rms_rope_kv_decode key/value caches must share shape and strides");
+    }
+  }
+  const nb::ndarray<nb::device::cuda>* paired[] = {&q, &k, &v, &q_out, &k_out, &key_cache, &value_cache};
+  for (const auto* t : paired) {
+    if (t->stride(3) != 1 || t->stride(0) % 2 != 0 || t->stride(1) % 2 != 0 || t->stride(2) % 2 != 0 ||
+        reinterpret_cast<uintptr_t>(t->data()) % 4 != 0) {
+      throw std::runtime_error(
+          "rms_rope_kv_decode requires contiguous head_dim, even leading strides and 4-byte alignment");
+    }
+  }
+  if (position.ndim() != 2 || (position.shape(0) != 1 && position.shape(0) != batch) ||
+      (position.shape(1) != 1 && position.shape(1) != rows)) {
+    throw std::runtime_error(
+        "rms_rope_kv_decode position must be an int64 [B|1, S|1] tensor");
+  }
+  if (freqs.ndim() != 6 || (freqs.shape(0) != 1 && freqs.shape(0) != batch) ||
+      freqs.shape(1) != 1 || (freqs.shape(2) != 1 && freqs.shape(2) != rows) ||
+      freqs.shape(3) < 2 || freqs.shape(3) % 2 != 0 || freqs.shape(3) * 2 > head_dim ||
+      freqs.shape(4) != 2 || freqs.shape(5) != 2) {
+    throw std::runtime_error(
+        "rms_rope_kv_decode freqs must be [1|B,1,1|S,rot/2,2,2] with rot a multiple of 4 up to head_dim");
+  }
+  const int64_t rot_dim = freqs.shape(3) * 2;
+  if (q_scale.ndim() != 1 || q_scale.shape(0) != head_dim ||
+      k_scale.ndim() != 1 || k_scale.shape(0) != head_dim) {
+    throw std::runtime_error(
+        "rms_rope_kv_decode scales must be 1D tensors of length head_dim");
+  }
+
+  const int input_dtype_code = map_dtype_to_code(q.dtype());
+  const int freqs_dtype_code = map_dtype_to_code(freqs.dtype());
+  const int scale_dtype_code = map_dtype_to_code(q_scale.dtype());
+  if ((input_dtype_code != 1 && input_dtype_code != 2) ||
+      map_dtype_to_code(k.dtype()) != input_dtype_code ||
+      map_dtype_to_code(v.dtype()) != input_dtype_code ||
+      map_dtype_to_code(q_out.dtype()) != input_dtype_code ||
+      map_dtype_to_code(k_out.dtype()) != input_dtype_code ||
+      map_dtype_to_code(key_cache.dtype()) != input_dtype_code ||
+      map_dtype_to_code(value_cache.dtype()) != input_dtype_code) {
+    throw std::runtime_error(
+        "rms_rope_kv_decode tensors must share an FP16/BF16 dtype");
+  }
+  if (freqs_dtype_code < 0 || scale_dtype_code < 0 ||
+      map_dtype_to_code(k_scale.dtype()) != scale_dtype_code) {
+    throw std::runtime_error(
+        "rms_rope_kv_decode freqs/scales must be FP32, FP16, or BF16");
+  }
+
+  launch_rms_rope_kv_decode_kernel(
+      q.data(), k.data(), v.data(), freqs.data(), q_scale.data(),
+      k_scale.data(), q_out.data(), k_out.data(), key_cache.data(), value_cache.data(),
+      position.data(), batch, rows, q_heads, kv_heads, head_dim, rot_dim,
+      q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2),
+      v.stride(0), v.stride(1), v.stride(2), q_out.stride(0), q_out.stride(1), q_out.stride(2),
+      k_out.stride(0), k_out.stride(1), k_out.stride(2),
+      key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+      position.shape(0) == 1 ? 0 : position.stride(0), position.shape(1) == 1 ? 0 : position.stride(1),
+      freqs.shape(0) == 1 ? 0 : freqs.stride(0), freqs.shape(2) == 1 ? 0 : freqs.stride(2),
+      freqs.stride(3), freqs.stride(4), freqs.stride(5), q_scale.stride(0), k_scale.stride(0), epsilon,
+      input_dtype_code, freqs_dtype_code, scale_dtype_code,
       reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
@@ -2415,6 +2542,12 @@ extern "C" {
         int input_dtype_code,
         cudaStream_t stream);
 
+    bool launch_quantize_int8_convrot_cooperative_kernel(
+        const void* input, const void* act_weight, float act_eps, int act_code,
+        void* output, void* scales, void* maxima,
+        int64_t num_rows, int64_t num_cols, int input_dtype_code, cudaStream_t stream,
+        bool query_only);
+
     void launch_quantize_int8_rowwise_convrot64_kernel(
         const void* input,
         void* output,
@@ -3529,12 +3662,13 @@ bool w4a8_codebook_mma_linear(
             && (!has_act_weight || act_weight->size() != K || act_weight->stride(0) != 1
                 || map_dtype_to_code(act_weight->dtype()) != input_dtype_code))
         throw std::runtime_error("w4a8_codebook_mma_linear rms_norm weight must be K contiguous elements in the input dtype");
-    if (rotated.has_value() != partial_absmax.has_value()
+    if ((rotated.has_value() && !partial_absmax.has_value())
             || (rotated.has_value()
                 && (rotated->shape(0) != M || rotated->shape(1) != K
                     || map_dtype_to_code(rotated->dtype()) != input_dtype_code
-                    || rotated->stride(1) != 1 || rotated->stride(0) != K
-                    || partial_absmax->shape(0) != M || partial_absmax->shape(1) != K / convrot_group_size
+                    || rotated->stride(1) != 1 || rotated->stride(0) != K))
+            || (partial_absmax.has_value()
+                && (partial_absmax->shape(0) != M || partial_absmax->shape(1) != K / convrot_group_size
                     || partial_absmax->stride(1) != 1
                     || partial_absmax->stride(0) != K / convrot_group_size)))
         throw std::runtime_error("w4a8_codebook_mma_linear staged scratch mismatch");
@@ -3570,11 +3704,15 @@ bool w4a8_codebook_mma_linear(
     if (!launch_quantize_int8_convrot_cluster_kernel(
             input.data(), has_act_weight ? act_weight->data() : nullptr,
             static_cast<float>(act_eps), static_cast<int>(act_code),
-            xq.data(), xs.data(), M, K, input_dtype_code, stream)) {
+            xq.data(), xs.data(), M, K, input_dtype_code, stream)
+            && !(bits == 4 && convrot_group_size == 256 && partial_absmax.has_value()
+                && launch_quantize_int8_convrot_cooperative_kernel(
+                    input.data(), has_act_weight ? act_weight->data() : nullptr,
+                    static_cast<float>(act_eps), static_cast<int>(act_code),
+                    xq.data(), xs.data(), partial_absmax->data(), M, K, input_dtype_code, stream, false))) {
         if (act_code != comfy::kActNone || !rotated.has_value())
             throw std::runtime_error(
-                "w4a8_codebook_mma_linear: fused activation quantizer unsupported here "
-                "(needs sm_90+ and K % 256 == 0); apply the activation eagerly");
+                "w4a8_codebook_mma_linear: fused activation quantizer unsupported here; apply the activation eagerly");
         launch_quantize_int8_convrot_staged_kernel(
             input.data(), rotated->data(), partial_absmax->data(), xq.data(), xs.data(), M, K,
             static_cast<int>(convrot_group_size), input_dtype_code, input_dtype_code,
@@ -4983,6 +5121,18 @@ NB_MODULE(_C, m) {
           nb::arg("q"), nb::arg("freqs"), nb::arg("q_scale"), nb::arg("q_out"),
           nb::arg("epsilon"), nb::arg("stream_ptr"),
           nb::arg("split_half") = false);
+
+    m.def("rms_rope_kv_decode", &rms_rope_kv_decode,
+          "Decode-step fused q/k RMSNorm + split-half RoPE with KV-cache scatter",
+          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("freqs"),
+          nb::arg("q_scale"), nb::arg("k_scale"), nb::arg("q_out"), nb::arg("k_out"),
+          nb::arg("key_cache"), nb::arg("value_cache"), nb::arg("position"),
+          nb::arg("epsilon"), nb::arg("stream_ptr"));
+
+    m.def("convrot_cooperative_supported", [](int64_t rows, int64_t cols, int dtype, int act) {
+        return launch_quantize_int8_convrot_cooperative_kernel(
+            nullptr, nullptr, 0.0f, act, nullptr, nullptr, nullptr, rows, cols, dtype, nullptr, true);
+    }, nb::arg("rows"), nb::arg("cols"), nb::arg("dtype"), nb::arg("act"));
 
     m.def("quantize_nvfp4", &quantize_nvfp4,
           "Quantize to FP4 E2M1 with E4M3 block scales using cuBLAS tiled layout",

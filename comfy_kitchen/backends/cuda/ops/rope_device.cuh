@@ -78,6 +78,34 @@ __device__ __forceinline__ float rms_sum(const T *row, int head_dim,
   return __shfl_sync(0xffffffffu, sum, 0);
 }
 
+// Mean of squares in the order of torch's fused rms_norm (vectorized_layer_norm_kernel with
+// 4 warps: lane l of warp w accumulates the 4-element vectors l + 32 w + 128 p in one fma
+// chain, each warp butterflies, the warp partials fold as (w0 + w2) + (w1 + w3)), divided
+// with IEEE rounding (the build's --use_fast_math would otherwise approximate it), so a fused
+// norm reproduces F.rms_norm bit for bit. head_dim must be a multiple of 4.
+template <typename T>
+__device__ __forceinline__ float rms_mean_sq_torch(const T *row, int head_dim, int lane) {
+  float warp_sum[4];
+#pragma unroll
+  for (int w = 0; w < 4; ++w) {
+    float sum = 0.0f;
+    for (int base = (w * 32 + lane) * 4; base < head_dim; base += 512) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const float value = static_cast<float>(row[base + i]);
+        sum = fmaf(value, value, sum);
+      }
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    warp_sum[w] = __shfl_sync(0xffffffffu, sum, 0);
+  }
+  return __fdiv_rn((warp_sum[0] + warp_sum[2]) + (warp_sum[1] + warp_sum[3]),
+                   static_cast<float>(head_dim));
+}
+
 template <typename F>
 __device__ __forceinline__ void load_rotation(const F *freqs, int64_t base,
                                               int64_t stride_rot,
