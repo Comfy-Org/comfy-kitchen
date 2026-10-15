@@ -98,7 +98,7 @@ struct Search {
     unsigned int* near_bits;  // (2, words) membership of the two near queues
     unsigned int* far_bits;   // (words) membership of the far pile
     int* items;               // (2, cap) near queues, step it takes the queue it & 1
-    int* far;                 // (2, cap) far piles
+    int* far_items;           // (2, cap) far piles
     int* counts;              // (7,) near sizes (step it takes counts[it % 3]), far sizes, index error, table full
     double* thr;              // (2, R) bucket end and the one before it
     double* low;              // (2, R) smallest far distance per row, the far phase f reads low[f & 1]
@@ -125,7 +125,7 @@ struct Step {
     int* items;               // the next near queue
     int* count;
     unsigned int* bits;
-    int* far;                 // the far pile and the row minima it feeds
+    int* far_items;           // the far pile and the row minima it feeds
     int* far_count;
     double* low;
 };
@@ -171,7 +171,7 @@ __device__ void visit(const Search& s, int item, int lane, const Step& out) {
             if (claim(out.bits, slot)) append(out.items, out.count, slot);
         } else {
             lower(out.low + r, c);
-            if (claim(s.far_bits, slot)) append(out.far, out.far_count, slot);
+            if (claim(s.far_bits, slot)) append(out.far_items, out.far_count, slot);
         }
     }
 }
@@ -194,7 +194,7 @@ __global__ void search_kernel(Search s) {
         const double d = __ldcg(s.dist + slot);
         if (!(d < INFINITY)) continue;                        // +inf reaches nothing
         lower(s.low + key / s.N, d);
-        if (claim(s.far_bits, slot)) append(s.far, s.counts + 3, slot);
+        if (claim(s.far_bits, slot)) append(s.far_items, s.counts + 3, slot);
     }
     grid.sync();
     for (int it = 0, pile = 0;; ++it) {                       // pile: the far phases done & 1
@@ -202,7 +202,7 @@ __global__ void search_kernel(Search s) {
         if ((count == 0 && far_count == 0) || __ldcg(s.counts + 6)) break;
         if (tid == 0) s.counts[(it + 2) % 3] = 0;            // round it - 1's near count becomes round it + 1's
         const Step out{s.items + ((it + 1) & 1) * s.cap, s.counts + (it + 1) % 3, s.near_bits + ((it + 1) & 1) * words,
-                       s.far + pile * s.cap, s.counts + 3 + pile, s.low + pile * s.R};
+                       s.far_items + pile * s.cap, s.counts + 3 + pile, s.low + pile * s.R};
         if (count) {
             const int* cur = s.items + (it & 1) * s.cap;
             unsigned int* cur_bits = s.near_bits + (it & 1) * words;
@@ -223,9 +223,9 @@ __global__ void search_kernel(Search s) {
         }
         if (tid == 0) s.counts[3 + (pile ^ 1)] = 0;
         grid.sync();
-        int* kept = s.far + (pile ^ 1) * s.cap;
+        int* kept = s.far_items + (pile ^ 1) * s.cap;
         for (int t = tid; t < far_count; t += stride) {
-            const int item = __ldcg(out.far + t);
+            const int item = __ldcg(out.far_items + t);
             const int r = static_cast<int>(s.key(item) / s.N);
             const double d = __ldcg(s.dist + item);
             if (d < __ldcg(prev + r) || d > __ldcg(s.bound + r) || (s.reach && d > s.reach[r])) {
