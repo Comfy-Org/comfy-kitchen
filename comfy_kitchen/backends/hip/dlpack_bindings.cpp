@@ -88,7 +88,8 @@ bool launch_gated_delta_decode_deferred_kernel(
     const void* x, const void* w_a, const void* w_b, const void* dt_bias, const void* g_decay,
     const void* qkv_buf, void* gates_buf, void* sumsq_buf, const void* ctl, void* state,
     void* out, const void* z, const void* norm_w, float eps, int B, int Hv, int Hk, int S, int DK,
-    int DV, int C, int Hd, int key_dim, float scale, int dtype_code, hipStream_t stream);
+    int DV, int C, int Hd, int key_dim, float scale, int tree, int dtype_code,
+    hipStream_t stream);
 bool launch_deltanet_conv_deferred_kernel(const void* proj, void* proj_buf, void* conv_state,
                                           const void* conv_w, const void* conv_b, void* qkv_buf,
                                           const void* ctl, int B, int C, int S, int KS,
@@ -1945,7 +1946,7 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
 void flash_attention_decode_gqa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
                                 nb::ndarray<> kv_lengths, nb::ndarray<> output,
                                 nb::ndarray<> softmax_lse, nb::ndarray<> softmax_lse_accum,
-                                nb::ndarray<> output_accum, int num_splits,
+                                nb::ndarray<> output_accum, int num_splits, bool causal,
                                 uintptr_t stream_ptr) {
     constexpr const char* kFn = "flash_attention_decode_gqa";
     constexpr int64_t kHeadDim = 256;
@@ -2039,23 +2040,23 @@ void flash_attention_decode_gqa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> 
         num_splits > 1 ? static_cast<float*>(softmax_lse_accum.data()) : nullptr,
         static_cast<int>(batch), static_cast<int>(groups * query_length),
         static_cast<int>(query_length), static_cast<int>(kv_heads), static_cast<int>(kHeadDim),
-        static_cast<int>(kv_capacity), num_splits, true, q.stride(0), q.stride(1), q.stride(2),
+        static_cast<int>(kv_capacity), num_splits, causal, q.stride(0), q.stride(1), q.stride(2),
         groups * q.stride(1), k.stride(0), k.stride(2), k.stride(1), output.stride(0), kHeadDim,
         output.stride(1), groups * kHeadDim, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
-// Current-step merge: out [B, S, H*256] and lse [B, H, S] come from a prefix-only
-// decode over the S step rows; q [B, H, S, 256]
-// and k/v [B, Hk, S, 256] are the rows' own rotated query/key/value, and row j folds
-// in step rows t <= j. merged [B, S, H*256] receives the result.
-void flash_attention_decode_step_merge(nb::ndarray<> out, nb::ndarray<> lse, nb::ndarray<> q,
-                                       nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> merged,
-                                       uintptr_t stream_ptr) {
-    constexpr const char* kFn = "flash_attention_decode_step_merge";
+// Verify-tree merge: out [B, S, H*256] and lse [B, H, S] come from a prefix-only
+// flash_attention_decode_gqa (causal = false) over the S verify rows; q [B, H, S, 256]
+// and k/v [B, Hk, S, 256] are the rows' own rotated query/key/value and mask [S] the
+// rows each row must fold in (bit t = row t). merged [B, S, H*256] receives the result.
+void flash_attention_decode_tree_merge(nb::ndarray<> out, nb::ndarray<> lse, nb::ndarray<> q,
+                                       nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> mask,
+                                       nb::ndarray<> merged, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "flash_attention_decode_tree_merge";
     constexpr int64_t kHeadDim = 256;
     if (out.ndim() != 3 || lse.ndim() != 3 || q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 ||
-        merged.ndim() != 3) {
+        mask.ndim() != 1 || merged.ndim() != 3) {
         throw std::runtime_error(std::string(kFn) + ": operand rank mismatch");
     }
     const int64_t batch = q.shape(0), heads = q.shape(1), rows = q.shape(2);
@@ -2063,7 +2064,8 @@ void flash_attention_decode_step_merge(nb::ndarray<> out, nb::ndarray<> lse, nb:
     if (batch <= 0 || heads <= 0 || rows <= 0 || rows > 8 || kv_heads <= 0 ||
         heads % kv_heads != 0 || q.shape(3) != kHeadDim || k.shape(0) != batch ||
         k.shape(2) != rows || k.shape(3) != kHeadDim || v.shape(0) != batch ||
-        v.shape(1) != kv_heads || v.shape(2) != rows || v.shape(3) != kHeadDim) {
+        v.shape(1) != kv_heads || v.shape(2) != rows || v.shape(3) != kHeadDim ||
+        mask.shape(0) != rows) {
         throw std::runtime_error(std::string(kFn) + ": shape mismatch");
     }
     if (out.shape(0) != batch || out.shape(1) != rows || out.shape(2) != heads * kHeadDim ||
@@ -2078,6 +2080,12 @@ void flash_attention_decode_step_merge(nb::ndarray<> out, nb::ndarray<> lse, nb:
     require_dtype(out, 2, 2, kFn, "out");
     require_dtype(merged, 2, 2, kFn, "merged");
     require_dtype(lse, 0, 0, kFn, "lse");
+    if (map_dtype_to_code(mask.dtype()) != -1 ||
+        mask.dtype().code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) ||
+        mask.dtype().bits != 32) {
+        throw std::runtime_error(std::string(kFn) + ": mask must be int32");
+    }
+    require_packed_contiguous(mask, kFn, "mask");
     require_packed_contiguous(lse, kFn, "lse");
     if (q.stride(3) != 1 || k.stride(3) != 1 || v.stride(3) != 1 || out.stride(2) != 1 ||
         merged.stride(2) != 1 || out.stride(1) != heads * kHeadDim ||
@@ -2093,16 +2101,16 @@ void flash_attention_decode_step_merge(nb::ndarray<> out, nb::ndarray<> lse, nb:
         }
     }
     constexpr int kDeviceRocm = nb::device::rocm::value;
-    const nb::ndarray<>* operands[] = {&out, &lse, &q, &k, &v, &merged};
+    const nb::ndarray<>* operands[] = {&out, &lse, &q, &k, &v, &mask, &merged};
     for (const nb::ndarray<>* t : operands) {
         if (t->device_type() != kDeviceRocm || t->device_id() != q.device_id()) {
             throw std::runtime_error(std::string(kFn) +
                                      ": every operand must be ROCm device memory on q's device");
         }
     }
-    launch_flash_decode_step_merge(
+    launch_flash_decode_tree_merge(
         out.data(), static_cast<const float*>(lse.data()), q.data(), k.data(), v.data(),
-        merged.data(), static_cast<int>(batch),
+        static_cast<const int*>(mask.data()), merged.data(), static_cast<int>(batch),
         static_cast<int>(rows), static_cast<int>(heads), static_cast<int>(kv_heads), q.stride(0),
         q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1),
         v.stride(2), out.stride(0), out.stride(1), merged.stride(0), merged.stride(1),
@@ -2485,10 +2493,11 @@ bool deltanet_conv_step(nb::ndarray<> proj, nb::ndarray<> conv_state, nb::ndarra
     return used;
 }
 
-// ctl is the deferred-decode control {pending, parity} the kernels index directly,
-// so it has to be a packed int32 vector of exactly that length.
+// ctl is the deferred-decode program {pending, parity, slot[8], parent[8], prog[8]}
+// the kernels index directly, so it has to be a packed int32 vector of exactly
+// that length.
 static constexpr int kDeferredSlots = 8;
-static constexpr int kDeferredCtlLen = 2;
+static constexpr int kDeferredCtlLen = 2 + 3 * kDeferredSlots;
 
 static void require_deferred_ctl(const nb::ndarray<>& ctl, const char* fn) {
     if (ctl.dtype().code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) ||
@@ -2501,14 +2510,14 @@ static void require_deferred_ctl(const nb::ndarray<>& ctl, const char* fn) {
 
 // GatedDeltaNet decode with the previous step's accepted tokens replayed from the
 // side buffers before the state is committed; the S current rows only produce
-// outputs and refill the buffers.
+// outputs and refill the buffers. tree selects the per-row commit program in ctl.
 bool gated_delta_decode_deferred(nb::ndarray<> x, nb::ndarray<> w_a, nb::ndarray<> w_b,
                                  nb::ndarray<> dt_bias, nb::ndarray<> g_decay,
                                  nb::ndarray<> qkv_buf, nb::ndarray<> gates_buf,
                                  nb::ndarray<> sumsq_buf, nb::ndarray<> ctl, nb::ndarray<> state,
                                  nb::ndarray<> out, nb::ndarray<> z, nb::ndarray<> norm_w,
                                  double eps, int key_dim, int num_key_heads, double scale,
-                                 uintptr_t stream_ptr) {
+                                 int tree, uintptr_t stream_ptr) {
     constexpr const char* kFn = "gated_delta_decode_deferred";
     if (x.ndim() != 3 || w_a.ndim() != 2 || w_b.ndim() != 2 || qkv_buf.ndim() != 4 ||
         gates_buf.ndim() != 5 || sumsq_buf.ndim() != 5 || state.ndim() != 4 || out.ndim() != 4 ||
@@ -2579,7 +2588,7 @@ bool gated_delta_decode_deferred(nb::ndarray<> x, nb::ndarray<> w_a, nb::ndarray
         x.data(), w_a.data(), w_b.data(), dt_bias.data(), g_decay.data(), qkv_buf.data(),
         gates_buf.data(), sumsq_buf.data(), ctl.data(), state.data(), out.data(), z.data(),
         norm_w.data(), static_cast<float>(eps), B, Hv, Hk, S, DK, DV, C, Hd, key_dim,
-        static_cast<float>(scale), dtype_code, reinterpret_cast<hipStream_t>(stream_ptr));
+        static_cast<float>(scale), tree, dtype_code, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
     return used;
 }
@@ -2718,7 +2727,8 @@ NB_MODULE(_C, m) {
           nb::arg("w_a"), nb::arg("w_b"), nb::arg("dt_bias"), nb::arg("g_decay"),
           nb::arg("qkv_buf"), nb::arg("gates_buf"), nb::arg("sumsq_buf"), nb::arg("ctl"),
           nb::arg("state"), nb::arg("out"), nb::arg("z"), nb::arg("norm_w"), nb::arg("eps"),
-          nb::arg("key_dim"), nb::arg("num_key_heads"), nb::arg("scale"), nb::arg("stream_ptr"));
+          nb::arg("key_dim"), nb::arg("num_key_heads"), nb::arg("scale"), nb::arg("tree"),
+          nb::arg("stream_ptr"));
     m.def("deltanet_conv_deferred", &deltanet_conv_deferred, nb::arg("proj"),
           nb::arg("proj_buf"), nb::arg("conv_state"), nb::arg("conv_w"),
           nb::arg("conv_b").none(), nb::arg("qkv_buf"), nb::arg("ctl"), nb::arg("stream_ptr"));
@@ -2730,10 +2740,10 @@ NB_MODULE(_C, m) {
     m.def("flash_attention_decode_gqa", &flash_attention_decode_gqa, nb::arg("q"), nb::arg("k"),
           nb::arg("v"), nb::arg("kv_lengths"), nb::arg("output"), nb::arg("softmax_lse"),
           nb::arg("softmax_lse_accum"), nb::arg("output_accum"), nb::arg("num_splits"),
-          nb::arg("stream_ptr"));
-    m.def("flash_attention_decode_step_merge", &flash_attention_decode_step_merge, nb::arg("out"),
-          nb::arg("lse"), nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("merged"),
-          nb::arg("stream_ptr"));
+          nb::arg("causal"), nb::arg("stream_ptr"));
+    m.def("flash_attention_decode_tree_merge", &flash_attention_decode_tree_merge, nb::arg("out"),
+          nb::arg("lse"), nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("mask"),
+          nb::arg("merged"), nb::arg("stream_ptr"));
     m.def("sage_prepare_key_mask", &sage_prepare_key_mask,
           nb::arg("mask"), nb::arg("packed"), nb::arg("stream_ptr"));
     m.def("sage_prepare_dense_mask", &sage_prepare_dense_mask,

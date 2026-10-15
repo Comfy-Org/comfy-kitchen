@@ -89,7 +89,7 @@ __all__ = [
     "flash_attention_decode_gqa_is_available",
     "flash_decode",
     "flash_decode_gqa",
-    "flash_decode_step_merge",
+    "flash_decode_tree_merge",
     "gated_delta_decode_fused",
     "gated_delta_decode_is_available",
     "deltanet_conv_step",
@@ -2947,7 +2947,7 @@ def flash_attention_decode_is_available() -> bool:
 
 
 def flash_attention_decode_gqa_is_available() -> bool:
-    """Whether the head-first GQA decode and step-merge kernels can run here."""
+    """Whether the head-first GQA decode and tree-merge kernels can run here."""
     return has_wmma() and hasattr(_C, "flash_attention_decode_gqa")
 
 
@@ -3117,6 +3117,7 @@ def gated_delta_decode_deferred(
     key_dim: int,
     num_key_heads: int,
     scale: float,
+    tree: int,
 ) -> bool:
     """Deferred-commit decode: see comfy_kitchen.gated_delta.gated_delta_decode_deferred.
 
@@ -3142,6 +3143,7 @@ def gated_delta_decode_deferred(
         key_dim,
         num_key_heads,
         float(scale),
+        int(tree),
         _stream(x),
     )
 
@@ -3186,6 +3188,7 @@ def flash_decode_gqa(
     softmax_lse_accum: torch.Tensor,
     output_accum: torch.Tensor,
     num_splits: int,
+    causal: bool,
 ) -> None:
     """Head-first GQA decode attention into ``output``. See ops/flash_decode.hip."""
     _C.flash_attention_decode_gqa(
@@ -3198,21 +3201,23 @@ def flash_decode_gqa(
         _dl(softmax_lse_accum),
         _dl(output_accum),
         num_splits,
+        causal,
         _stream(q),
     )
 
 
-def flash_decode_step_merge(
+def flash_decode_tree_merge(
     out: torch.Tensor,
     lse: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    mask: torch.Tensor,
     merged: torch.Tensor,
 ) -> None:
-    """Fold the current step's rows causally into a prefix-only decode result. See ops/flash_decode.hip."""
-    _C.flash_attention_decode_step_merge(
-        _dl(out), _dl(lse), _dl(q), _dl(k), _dl(v), _dl(merged), _stream(q))
+    """Fold a verify tree's own rows into a prefix-only decode result. See ops/flash_decode.hip."""
+    _C.flash_attention_decode_tree_merge(
+        _dl(out), _dl(lse), _dl(q), _dl(k), _dl(v), _dl(mask), _dl(merged), _stream(q))
 
 
 def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
