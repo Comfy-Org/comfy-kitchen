@@ -58,6 +58,28 @@ __forceinline__ __device__ float ptx_exp2(float x) {
 }
 
 /*!
+ * \brief Exact int32 -> FP32 for -2^22 <= x <= 2^22 (an S8xS8 dot over <= 256
+ * products stays within the range).
+ *
+ * Below sm_89 the conversion is an I2F on the XU pipe, which the softmax's ex2
+ * already saturates, so it is done with integer/FP32 arithmetic instead:
+ * 0x4B400000 is the bit pattern of 1.5 * 2^23; inside [2^23, 2^24) the FP32 ulp
+ * is exactly 1, so adding x to the pattern adds exactly x and subtracting
+ * 1.5 * 2^23 (one exact FADD) recovers float(x). Measured on an A6000 (sm_80
+ * cubin): int8 attention -16%, output bit-identical. From sm_89 on, ptxas emits
+ * the packed I2FP on the FMA pipe, which is already cheaper than two ALU/FMA
+ * instructions (measured +4% attention time with the arithmetic form on an RTX
+ * 5000 Ada), so the plain conversion is kept there.
+ */
+__forceinline__ __device__ float i32_to_f32_exact(int32_t x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+  return __int_as_float(x + 0x4B400000) - 12582912.0f;
+#else
+  return __int2float_rn(x);
+#endif
+}
+
+/*!
  * \brief Wrapper of PTX lg2.approx instruction, which computes log2(x)
  * \param x input
  */

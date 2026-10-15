@@ -785,6 +785,37 @@ __device__ __forceinline__ uint32_t pack_u8x4(float a, float b, float c,
   return packed;
 }
 
+/*! \brief pack_u8x4 for inputs already in [0, 255]: same bytes, cheaper where
+ * the cvt would land on the XU pipe.
+ *
+ * Below sm_89, cvt.rni.s32.f32 and cvt.pack run on the XU pipe that the
+ * softmax's ex2 already saturates, so the rounding is done arithmetically:
+ * adding 2^23 puts the value where the FP32 ulp is exactly 1, so the FADD rounds
+ * to the nearest integer with ties to even (as cvt.rni does) and leaves it in
+ * the low mantissa byte; three PRMTs gather the four low bytes in the same
+ * order as pack_u8x4 (a in the lowest byte). From sm_89 on, ptxas pairs the
+ * conversions into F2IP on the FMA pipe, which measured faster than the
+ * arithmetic form, so pack_u8x4 is used as is. The caller guarantees
+ * 0 <= x <= 255; the arithmetic form does not saturate. A masked score
+ * (-inf bias) is exp2(-inf) = 0 under both forms; a row masked across a whole
+ * tile has a NaN exponent, which cvt packs as 0 and this form as 0xFF, but
+ * update_mdo scales that tile's contribution by tile_scale = 0 either way.
+ */
+__device__ __forceinline__ uint32_t pack_u8x4_bounded(float a, float b, float c,
+                                                      float d) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+  const uint32_t qa = __float_as_uint(a + 8388608.0f);
+  const uint32_t qb = __float_as_uint(b + 8388608.0f);
+  const uint32_t qc = __float_as_uint(c + 8388608.0f);
+  const uint32_t qd = __float_as_uint(d + 8388608.0f);
+  const uint32_t ab = __byte_perm(qa, qb, 0x0040);  // {a0, b0, .., ..}
+  const uint32_t cd = __byte_perm(qc, qd, 0x0040);  // {c0, d0, .., ..}
+  return __byte_perm(ab, cd, 0x5410);               // {a0, b0, c0, d0}
+#else
+  return pack_u8x4(a, b, c, d);
+#endif
+}
+
 /*!
  * \brief Use mma instructions to compute rowsum.
  */

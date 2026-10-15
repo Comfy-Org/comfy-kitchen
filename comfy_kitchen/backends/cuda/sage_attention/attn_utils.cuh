@@ -697,18 +697,22 @@ __device__ __forceinline__ PackedU8RowSum
 pack_scaled_exp2_u8x4(const int32_t a, const int32_t b, const int32_t c,
                       const int32_t d, const float scale,
                       const float negative_m) {
+  // The exponent is <= S_U8_OFFSET = log2(255) after the tile-max subtraction,
+  // so every probability lies in [0, 255] and the bounded pack applies. Both
+  // conversions avoid the XU pipe: with ex2 on it, that pipe is the kernel's
+  // busiest and the tensor pipe idles behind it.
   const float probability_a =
-      math::ptx_exp2(fmaf(__int2float_rz(a), scale, negative_m));
+      math::ptx_exp2(fmaf(math::i32_to_f32_exact(a), scale, negative_m));
   const float probability_b =
-      math::ptx_exp2(fmaf(__int2float_rz(b), scale, negative_m));
+      math::ptx_exp2(fmaf(math::i32_to_f32_exact(b), scale, negative_m));
   const float probability_c =
-      math::ptx_exp2(fmaf(__int2float_rz(c), scale, negative_m));
+      math::ptx_exp2(fmaf(math::i32_to_f32_exact(c), scale, negative_m));
   const float probability_d =
-      math::ptx_exp2(fmaf(__int2float_rz(d), scale, negative_m));
-  const uint32_t probabilities = mma::pack_u8x4(
+      math::ptx_exp2(fmaf(math::i32_to_f32_exact(d), scale, negative_m));
+  const uint32_t probabilities = mma::pack_u8x4_bounded(
       probability_a, probability_b, probability_c, probability_d);
   const uint32_t denominator = __dp4a(probabilities, 0x01010101u, 0u);
-  return {probabilities, __uint2float_rn(denominator)};
+  return {probabilities, math::i32_to_f32_exact(static_cast<int32_t>(denominator))};
 }
 
 template <uint32_t num_tiles_q, uint32_t num_tiles_k,
@@ -782,12 +786,15 @@ __device__ __forceinline__ void update_mdo_i32_u8(
 __device__ __forceinline__ PackedU8RowSum
 pack_exp2_u8x4(const float a, const float b, const float c,
               const float d, const float negative_m) {
+  // Same [0, 255] bound as pack_scaled_exp2_u8x4: the tile max carries
+  // S_U8_OFFSET, so the bounded pack and the exact int->float apply.
   const float pa = math::ptx_exp2(a + negative_m);
   const float pb = math::ptx_exp2(b + negative_m);
   const float pc = math::ptx_exp2(c + negative_m);
   const float pd = math::ptx_exp2(d + negative_m);
-  const uint32_t packed = mma::pack_u8x4(pa, pb, pc, pd);
-  return {packed, __uint2float_rn(__dp4a(packed, 0x01010101u, 0u))};
+  const uint32_t packed = mma::pack_u8x4_bounded(pa, pb, pc, pd);
+  return {packed, math::i32_to_f32_exact(
+                      static_cast<int32_t>(__dp4a(packed, 0x01010101u, 0u)))};
 }
 
 template <uint32_t num_tiles_q, uint32_t num_tiles_k,
