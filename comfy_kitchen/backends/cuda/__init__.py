@@ -3544,16 +3544,16 @@ def min_cut(nbr: torch.Tensor, cap: torch.Tensor, s_cap: torch.Tensor, t_cap: to
     return h >= big
 
 
-def _shortest_paths(indptr, dst, weight, n, bound, delta, active, blocked, stop, end, closer, reach, dist, keys, front):
+def _shortest_paths(indptr, dst, weight, n, rows, delta, active, blocked, stop, end, closer, reach, dist, keys, front):
     """One search into dense rows (keys None) or a hash table (keys, dist); True when the table ran full."""
-    device, rows, cap = bound.device, bound.shape[0], dist.numel()
+    device, cap = dist.device, dist.numel()
     _check_shape("indptr", indptr, (n + 1,))
     _check_shape("weight", weight, (dst.shape[0],))
     for name, t in (("end", end), ("closer", closer), ("reach", reach)):
         if t is not None:
             _check_shape(name, t, (rows,))
-    if not dist.is_contiguous() or not bound.is_contiguous():
-        raise ValueError("dist and bound are updated in place and must be contiguous")
+    if not dist.is_contiguous():
+        raise ValueError("dist is updated in place and must be contiguous")
     if not delta > 0:
         raise ValueError(f"delta must be positive, got {delta}")
     bits = torch.zeros(3 * ((cap + 31) // 32), dtype=torch.int32, device=device)
@@ -3561,6 +3561,7 @@ def _shortest_paths(indptr, dst, weight, n, bound, delta, active, blocked, stop,
     counts = torch.zeros(7, dtype=torch.int32, device=device)
     levels = torch.full((4, rows), torch.inf, dtype=torch.float64, device=device)
     levels[:2] = -torch.inf
+    bound = torch.full((rows,), torch.inf, dtype=torch.float64, device=device)
     tensors = (indptr.to(torch.int32).contiguous(), dst.to(torch.int32).contiguous(), weight.contiguous(),
                _byte_mask("active", active, n), _byte_mask("blocked", blocked, n), _byte_mask("stop", stop, n),
                None if end is None else end.to(torch.int64).contiguous(),
@@ -3577,26 +3578,22 @@ def _shortest_paths(indptr, dst, weight, n, bound, delta, active, blocked, stop,
 
 
 def shortest_paths(indptr: torch.Tensor, dst: torch.Tensor, weight: torch.Tensor, dist: torch.Tensor,
-                   front: torch.Tensor, bound: torch.Tensor, delta: float, active: torch.Tensor | None = None,
-                   blocked: torch.Tensor | None = None, end: torch.Tensor | None = None,
+                   front: torch.Tensor, delta: float, active: torch.Tensor | None = None,
                    closer: torch.Tensor | None = None) -> None:
     rows, n = dist.shape
-    _check_shape("bound", bound, (rows,))
     if rows * n >= 2 ** 31:
         raise ValueError(f"dist must have fewer than 2**31 entries, got {rows} x {n}")
-    _shortest_paths(indptr, dst, weight, n, bound, delta, active, blocked, None, end, closer, None, dist, None, front)
+    _shortest_paths(indptr, dst, weight, n, rows, delta, active, None, None, None, closer, None, dist, None, front)
 
 
 def shortest_paths_sparse(indptr: torch.Tensor, dst: torch.Tensor, weight: torch.Tensor, starts: torch.Tensor,
-                          bound: torch.Tensor, delta: float, num_nodes: int, active: torch.Tensor | None = None,
+                          delta: float, num_nodes: int, active: torch.Tensor | None = None,
                           blocked: torch.Tensor | None = None, stop: torch.Tensor | None = None,
                           end: torch.Tensor | None = None, closer: torch.Tensor | None = None,
                           reach: torch.Tensor | None = None, max_slots: int = 2 ** 30) -> tuple[torch.Tensor, torch.Tensor]:
     device, rows, n = starts.device, starts.shape[0], _check_count("num_nodes", num_nodes)
-    _check_shape("bound", bound, (rows,))
     if rows == 0:
         return torch.empty(0, dtype=torch.int64, device=device), torch.empty(0, dtype=torch.float64, device=device)
-    start_bound = bound.clone()
     cap = 1 << (min(max_slots, 2 ** 30).bit_length() - 1)
     slots = min(cap, 1 << max(12, (64 * rows - 1).bit_length()))
     out_keys, out_vals = [], []
@@ -3607,10 +3604,9 @@ def shortest_paths_sparse(indptr: torch.Tensor, dst: torch.Tensor, weight: torch
         keys = torch.full((slots,), -1, dtype=torch.int64, device=device)
         vals = torch.full((slots,), torch.inf, dtype=torch.float64, device=device)
         per_row = (None if t is None else t[part] for t in (end, closer, reach))
-        if _shortest_paths(indptr, dst, weight, n, bound[part], delta, active, blocked, stop, *per_row, vals, keys,
+        if _shortest_paths(indptr, dst, weight, n, take, delta, active, blocked, stop, *per_row, vals, keys,
                            torch.arange(take, device=device) * n + starts[part]):
-            bound[part] = start_bound[part]                      # table full: retry with more slots or fewer rows
-            if slots < cap:
+            if slots < cap:                                      # table full: retry with more slots or fewer rows
                 slots = min(cap, slots * 4)
             elif take > 1:
                 take = (take + 1) // 2
@@ -4648,13 +4644,13 @@ def _build_constraints() -> dict:
             min_compute_capability=(7, 5),
         ),
         "shortest_paths": FunctionConstraints(
-            params={"indptr": index_1d, "dst": index_1d, "weight": f64_1d, "front": index_1d, "bound": f64_1d,
+            params={"indptr": index_1d, "dst": index_1d, "weight": f64_1d, "front": index_1d,
                     "dist": ParamConstraint(dtypes=frozenset({torch.float64}), shape_rules=(ExactDims(2),))},
             default_devices=cuda_devices,
             min_compute_capability=(7, 5),
         ),
         "shortest_paths_sparse": FunctionConstraints(
-            params={"indptr": index_1d, "dst": index_1d, "weight": f64_1d, "starts": index_1d, "bound": f64_1d},
+            params={"indptr": index_1d, "dst": index_1d, "weight": f64_1d, "starts": index_1d},
             default_devices=cuda_devices,
             min_compute_capability=(7, 5),
         ),
