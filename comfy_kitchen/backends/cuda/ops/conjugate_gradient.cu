@@ -15,13 +15,10 @@
  * limitations under the License.
  */
 
-// Conjugate gradients for A x = b with a symmetric positive definite CSR matrix A and k right-hand sides (columns of
-// the row-major (n, k) b and x), the whole solve in one cooperative kernel: per iteration a matrix-vector phase, an
-// update phase and a direction phase, each closed by a grid barrier. Dot products are summed per block (warp shuffles,
-// then warps in order) and the block partials in a fixed order by every block, so the result does not depend on
-// thread timing. Consecutive sums write alternate halves of the partials: a block may start the next sum while
-// others still read the last one, and the barrier inside that sum orders every read before the one after. All columns
-// iterate until every column's residual is within tol of its right-hand side. Indices are checked once at the start.
+// Conjugate gradients for A x = b with a symmetric positive definite CSR matrix and k <= kMaxCols right-hand sides
+// (columns of row-major b and x), in one cooperative kernel. Dot products are summed in a fixed order, so results
+// do not depend on thread timing. Consecutive sums use alternate halves of the partials, since a block may start the
+// next sum while others still read the last one. All columns iterate until every residual is within tol.
 
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
@@ -53,10 +50,10 @@ struct Solve {
     double* partial;  // (2, blocks, 2 * kMaxCols)
     int max_iters;
     double tol2;
-    int* error;       // set when indptr or cols holds an index out of range
+    int* error;       // set on an out-of-range index
 };
 
-// sums m <= 2 * kMaxCols values over the block into partial[blockIdx.x], then over all blocks into total
+// sums m values per block into partial[blockIdx.x], then over all blocks into total
 __device__ void grid_sum(const cg::grid_group& grid, double* partial, double* acc, int m, double* total) {
     __shared__ double warp_sums[kWarps][2 * kMaxCols];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -161,8 +158,8 @@ using namespace comfy::conjugate_gradient;
 
 extern "C" {
 
-// x holds the start and the solution on return; work is (3 * n * k + 4 * kMaxCols * SMs) scratch, error a zeroed int
-// set (and nothing solved) on an index out of range.
+// x: start in, solution out. work: (3 * n * k + 4 * kMaxCols * SMs) scratch. error: zeroed, set (nothing solved) on
+// an out-of-range index.
 void launch_conjugate_gradient(int n, int k, int nnz, const void* indptr, const void* cols, const void* vals,
                                const void* b, void* x, void* work, int max_iters, double tol, void* error,
                                cudaStream_t stream) {
