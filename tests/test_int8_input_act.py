@@ -213,7 +213,10 @@ class TestGatedInputAct:
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("shape", [(512, 256), (1024, 4096), (37, 14336)])
-    def test_at_least_as_accurate_as_eager_chain(self, act, dtype, shape, seed, cuda_available):
+    @pytest.mark.parametrize("near_zero", [False, True])
+    def test_at_least_as_accurate_as_eager_chain(self, act, dtype, shape, near_zero, seed, cuda_available):
+        """near_zero: the row scale adapts to tiny rows, so cancellation in the
+        activation near the origin would show up as wrong codes."""
         if not cuda_backend_available():
             pytest.skip("compiled CUDA backend required")
         from comfy_kitchen.backends import cuda as cuda_backend
@@ -221,6 +224,8 @@ class TestGatedInputAct:
         fn = _GATED_ACTS[act]
         m, k = shape
         h = _gated_input(act, m, k, dtype, "cuda")
+        if near_zero:
+            h = h * 1e-6
 
         g = fn(h.double())
         mat = _build_hadamard(_GROUP, device=h.device, dtype=torch.float64)

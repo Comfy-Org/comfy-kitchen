@@ -1209,6 +1209,14 @@ __device__ __forceinline__ float apply_input_act(float v) {
     return v;
 }
 
+// tanh that keeps its relative precision near zero and saturates without overflow:
+// --use_fast_math turns tanhf into tanh.approx (~2^-11 relative error), and
+// 1 - 2 / (1 + exp(2x)) cancels to 0 for small |x|. expm1f has no fast intrinsic.
+__device__ __forceinline__ float stable_tanh(float x) {
+    const float t = expm1f(-2.0f * fabsf(x));
+    return copysignf(-t / (t + 2.0f), x);
+}
+
 // Reads one activated value: column `col` of the K-wide activated row starting
 // at `in_row`. For SwiGLU and SiTU the raw row is 2*K wide (SwiGLU's gate in the
 // first half, SiTU's in the second); every other activation reads the same
@@ -1223,12 +1231,11 @@ __device__ __forceinline__ float load_input_act(
         const float up = to_float(x[in_row + K + col]);
         return (gate / (1.0f + expf(-gate))) * up;
     } else if constexpr (ACT == kActSiTU) {
-        // Matches torch 4 * tanh(gate / 4) * sigmoid(gate) * (25 * tanh(hidden / 25)). tanh goes
-        // through expf: --use_fast_math turns tanhf into tanh.approx (~2^-11 relative error).
+        // Matches torch 4 * tanh(gate / 4) * sigmoid(gate) * (25 * tanh(hidden / 25)).
         const float hidden = to_float(x[in_row + col]);
         const float gate = to_float(x[in_row + K + col]);
-        const float gate_cap = 4.0f * (1.0f - 2.0f / (1.0f + expf(gate * 0.5f)));
-        const float hidden_cap = 25.0f * (1.0f - 2.0f / (1.0f + expf(hidden * 0.08f)));
+        const float gate_cap = 4.0f * stable_tanh(gate / 4.0f);
+        const float hidden_cap = 25.0f * stable_tanh(hidden / 25.0f);
         return gate_cap / (1.0f + expf(-gate)) * hidden_cap;
     } else {
         return apply_input_act<ACT>(to_float(x[in_row + col]));
