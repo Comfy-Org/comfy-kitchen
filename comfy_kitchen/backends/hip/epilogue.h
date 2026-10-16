@@ -67,7 +67,7 @@ struct EpiRowwise {
     }
 };
 
-// Bias-free specialization for the pair and dual-M INT8 kernels. It uses the
+// Bias-free specialization for the dual-M INT8 kernels. It uses the
 // same left-to-right scale expression as EpiRowwise without the runtime bias
 // pointer/dtype branches in every unrolled output element.
 struct EpiRowwiseNoBias {

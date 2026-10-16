@@ -387,59 +387,6 @@ void int8_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> 
     check_hip_launch();
 }
 
-void int8_gemm_pair(
-    nb::ndarray<> a, nb::ndarray<> b0, nb::ndarray<> b1,
-    nb::ndarray<> c0, nb::ndarray<> c1, nb::ndarray<> scale_a,
-    nb::ndarray<> scale_b0, int scale_b_stride0,
-    nb::ndarray<> scale_b1, int scale_b_stride1,
-    OptArray bias0, OptArray bias1, int M, int N, int K,
-    int out_code, uintptr_t stream_ptr) {
-    constexpr const char* kFn = "int8_gemm_pair";
-    if ((scale_b_stride0 != 0 && scale_b_stride0 != 1) ||
-        (scale_b_stride1 != 0 && scale_b_stride1 != 1)) {
-        throw std::runtime_error(
-            std::string(kFn) + ": scale strides must be 0 or 1");
-    }
-    require_nonneg(M, kFn, "M");
-    require_nonneg(N, kFn, "N");
-    require_nonneg(K, kFn, "K");
-    if (M != 0 && (M < 96 || N < 96 || K == 0 || K % 64 != 0)) {
-        throw std::runtime_error(
-            std::string(kFn) +
-            ": requires M,N>=96 and positive K divisible by 64");
-    }
-    require_dtype(a, 4, 4, kFn, "a");
-    require_dtype(b0, 4, 4, kFn, "b0");
-    require_dtype(b1, 4, 4, kFn, "b1");
-    require_dtype(c0, 0, 2, kFn, "c0");
-    require_dtype(c1, 0, 2, kFn, "c1");
-    require_out_matches(c0, out_code, kFn);
-    require_out_matches(c1, out_code, kFn);
-    require_len(a, static_cast<int64_t>(M) * K, kFn, "a");
-    require_len(b0, static_cast<int64_t>(N) * K, kFn, "b0");
-    require_len(b1, static_cast<int64_t>(N) * K, kFn, "b1");
-    require_len(c0, static_cast<int64_t>(M) * N, kFn, "c0");
-    require_len(c1, static_cast<int64_t>(M) * N, kFn, "c1");
-    require_scale_len(scale_a, static_cast<size_t>(M), kFn, "scale_a");
-    require_scale_len(
-        scale_b0, scale_b_stride0 == 1 ? static_cast<size_t>(N) : 1,
-        kFn, "scale_b0");
-    require_scale_len(
-        scale_b1, scale_b_stride1 == 1 ? static_cast<size_t>(N) : 1,
-        kFn, "scale_b1");
-    require_bias(bias0, N, kFn);
-    require_bias(bias1, N, kFn);
-
-    launch_int8_gemm_pair_kernel(
-        a.data(), b0.data(), b1.data(), c0.data(), c1.data(),
-        scale_a.data(), scale_b0.data(), scale_b_stride0,
-        scale_b1.data(), scale_b_stride1,
-        opt_data(bias0), opt_code(bias0), opt_data(bias1), opt_code(bias1),
-        M, N, K, N /*ldc*/, out_code,
-        reinterpret_cast<hipStream_t>(stream_ptr));
-    check_hip_launch();
-}
-
 void rms_gated_residual_bf16(
     nb::ndarray<> activation, nb::ndarray<> norm_weight,
     nb::ndarray<> residual, nb::ndarray<> gate, nb::ndarray<> output,
@@ -2596,7 +2543,6 @@ NB_MODULE(_C, m) {
     m.def("stochastic_round_fp8", &stochastic_round_fp8);
     m.def("scaled_mm_fp8", &scaled_mm_fp8);
     m.def("int8_gemm", &int8_gemm);
-    m.def("int8_gemm_pair", &int8_gemm_pair);
     m.def("rms_gated_residual_bf16", &rms_gated_residual_bf16);
     m.def("int8_gemm_a_tiled128_down", &int8_gemm_a_tiled128_down);
     m.def("convrot_w4a4_gemm", &convrot_w4a4_gemm);

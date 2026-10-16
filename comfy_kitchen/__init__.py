@@ -102,9 +102,6 @@ __all__ = [
     "int8_linear",
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
-    "int8_linear_pair",
-    "int8_linear_pair_modulated",
-    "int8_linear_pair_rms_modulated",
     "int8_linear_swiglu_split",
     "w4a8_int8_linear",
     # Positional encoding
@@ -1143,110 +1140,6 @@ def int8_linear_rms_modulated(
             "weight": weight,
             "weight_scale": weight_scale,
             "bias": bias,
-            "out_dtype": out_dtype,
-            "convrot": convrot,
-            "convrot_groupsize": convrot_groupsize,
-        },
-    )
-
-
-def int8_linear_pair(
-    x: torch.Tensor,
-    weight0: torch.Tensor,
-    weight1: torch.Tensor,
-    weight_scale0: torch.Tensor,
-    weight_scale1: torch.Tensor,
-    bias0: torch.Tensor | None = None,
-    bias1: torch.Tensor | None = None,
-    out_dtype: torch.dtype | None = None,
-    convrot: bool = False,
-    convrot_groupsize: int = 256,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Two equal-width INT8 linears sharing activation quantization when supported."""
-    if out_dtype is None:
-        out_dtype = torch.bfloat16
-    return _call_backend(
-        "int8_linear_pair",
-        {
-            "x": x,
-            "weight0": weight0,
-            "weight1": weight1,
-            "weight_scale0": weight_scale0,
-            "weight_scale1": weight_scale1,
-            "bias0": bias0,
-            "bias1": bias1,
-            "out_dtype": out_dtype,
-            "convrot": convrot,
-            "convrot_groupsize": convrot_groupsize,
-        },
-    )
-
-
-def int8_linear_pair_modulated(
-    x: torch.Tensor,
-    modulation_scale: torch.Tensor,
-    weight0: torch.Tensor,
-    weight1: torch.Tensor,
-    weight_scale0: torch.Tensor,
-    weight_scale1: torch.Tensor,
-    bias0: torch.Tensor | None = None,
-    bias1: torch.Tensor | None = None,
-    out_dtype: torch.dtype | None = None,
-    convrot: bool = False,
-    convrot_groupsize: int = 256,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Two batch-one modulated linears sharing INT8 quantization."""
-    if out_dtype is None:
-        out_dtype = torch.bfloat16
-    return _call_backend(
-        "int8_linear_pair_modulated",
-        {
-            "x": x,
-            "modulation_scale": modulation_scale,
-            "weight0": weight0,
-            "weight1": weight1,
-            "weight_scale0": weight_scale0,
-            "weight_scale1": weight_scale1,
-            "bias0": bias0,
-            "bias1": bias1,
-            "out_dtype": out_dtype,
-            "convrot": convrot,
-            "convrot_groupsize": convrot_groupsize,
-        },
-    )
-
-
-def int8_linear_pair_rms_modulated(
-    x: torch.Tensor,
-    norm_weight: torch.Tensor,
-    norm_eps: float,
-    modulation_scale: torch.Tensor,
-    weight0: torch.Tensor,
-    weight1: torch.Tensor,
-    weight_scale0: torch.Tensor,
-    weight_scale1: torch.Tensor,
-    bias0: torch.Tensor | None = None,
-    bias1: torch.Tensor | None = None,
-    out_dtype: torch.dtype | None = None,
-    convrot: bool = False,
-    convrot_groupsize: int = 256,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Paired INT8 projections sharing RMSNorm, modulation, and quantization."""
-    if out_dtype is None:
-        out_dtype = torch.bfloat16
-    return _call_backend(
-        "int8_linear_pair_rms_modulated",
-        {
-            "x": x,
-            "norm_weight": norm_weight,
-            "norm_eps": norm_eps,
-            "modulation_scale": modulation_scale,
-            "weight0": weight0,
-            "weight1": weight1,
-            "weight_scale0": weight_scale0,
-            "weight_scale1": weight_scale1,
-            "bias0": bias0,
-            "bias1": bias1,
             "out_dtype": out_dtype,
             "convrot": convrot,
             "convrot_groupsize": convrot_groupsize,

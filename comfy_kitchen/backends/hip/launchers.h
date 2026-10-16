@@ -38,14 +38,6 @@ void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* 
                              int bias_code, int M, int N, int K, int ldc, int out_code,
                              hipStream_t stream);
 
-// Two equal-width row-major GEMMs sharing activation staging.
-void launch_int8_gemm_pair_kernel(
-    const void* a, const void* b0, const void* b1, void* c0, void* c1,
-    const void* scale_a, const void* scale_b0, int scale_b_stride0,
-    const void* scale_b1, int scale_b_stride1, const void* bias0,
-    int bias_code0, const void* bias1, int bias_code1, int M, int N, int K,
-    int ldc, int out_code, hipStream_t stream);
-
 // A is physically [M_tile, K_tile, 128, 128]; B is row-major.
 void launch_int8_gemm_a_tiled128_down_kernel(
     const void* a, const void* b, void* c, const void* scale_a,

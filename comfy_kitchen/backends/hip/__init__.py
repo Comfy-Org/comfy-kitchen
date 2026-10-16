@@ -90,9 +90,6 @@ __all__ = [
     "flash_decode",
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
-    "int8_linear_pair",
-    "int8_linear_pair_modulated",
-    "int8_linear_pair_rms_modulated",
     "int8_linear_swiglu_split",
     "gated_delta_decode_fused",
     "gated_delta_decode_is_available",
@@ -210,9 +207,6 @@ _WMMA_ONLY_OPS = frozenset({
     "int8_linear",
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
-    "int8_linear_pair",
-    "int8_linear_pair_modulated",
-    "int8_linear_pair_rms_modulated",
     "int8_linear_swiglu_split",
     "na3d",
     "sol_attn",
@@ -1140,255 +1134,6 @@ def int8_linear_rms_modulated(
         m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
     )
     return out.reshape(*orig_shape[:-1], n)
-
-
-def _int8_linear_pair_impl(
-    x: torch.Tensor,
-    weight0: torch.Tensor,
-    weight1: torch.Tensor,
-    weight_scale0: torch.Tensor,
-    weight_scale1: torch.Tensor,
-    bias0: torch.Tensor | None = None,
-    bias1: torch.Tensor | None = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    convrot: bool = False,
-    convrot_groupsize: int = 256,
-    modulation_scale: torch.Tensor | None = None,
-    norm_weight: torch.Tensor | None = None,
-    norm_eps: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Two INT8 linears sharing one row-wise activation quantization."""
-    if weight0.shape != weight1.shape or weight0.ndim != 2:
-        raise ValueError(
-            f"paired INT8 weights must have the same 2D shape, got "
-            f"{tuple(weight0.shape)} and {tuple(weight1.shape)}"
-        )
-    if x.shape[-1] != weight0.shape[-1]:
-        raise ValueError(
-            f"Input and weight inner dimensions must match, got {x.shape[-1]} "
-            f"and {weight0.shape[-1]}"
-        )
-    weight0 = _aligned(weight0.to(device=x.device).contiguous())
-    weight1 = _aligned(weight1.to(device=x.device).contiguous())
-    weight_scale0 = weight_scale0.to(device=x.device, dtype=torch.float32).reshape(-1)
-    weight_scale1 = weight_scale1.to(device=x.device, dtype=torch.float32).reshape(-1)
-    n, k = weight0.shape
-    for name, scale in (
-        ("weight_scale0", weight_scale0),
-        ("weight_scale1", weight_scale1),
-    ):
-        if scale.numel() not in (1, n):
-            raise ValueError(
-                f"{name} must be scalar or per-output-channel, got {tuple(scale.shape)}"
-            )
-
-    orig_shape = x.shape
-    x2d = x.reshape(-1, k).contiguous()
-    m = x2d.shape[0]
-    if k % 16 != 0:
-        raise ValueError(f"int8_linear_pair requires K divisible by 16, got {k}")
-
-    if convrot:
-        if convrot_groupsize not in (16, 64, 256):
-            raise ValueError(
-                f"ConvRot group size must be 16, 64 or 256, got {convrot_groupsize}"
-            )
-        if k % convrot_groupsize != 0:
-            raise ValueError(
-                f"ConvRot group size {convrot_groupsize} does not divide input features {k}"
-            )
-        if not _convrot_supported(
-            k, convrot_groupsize, x.device, x.dtype, int8_global_spill=True
-        ):
-            return _eager.int8_linear_pair(
-                x, weight0, weight1, weight_scale0, weight_scale1,
-                bias0, bias1, out_dtype, convrot, convrot_groupsize,
-            )
-        if norm_weight is not None:
-            if modulation_scale is None:
-                raise ValueError("RMS-modulated pair requires modulation_scale")
-            q, x_scale = _rotate_quant_int8_rms_modulated(
-                x2d, norm_weight, norm_eps, modulation_scale,
-                convrot_groupsize,
-            )
-        elif modulation_scale is None:
-            q, x_scale = _rotate_quant_int8(x2d, convrot_groupsize)
-        else:
-            q, x_scale = _rotate_quant_int8_modulated(
-                x2d, modulation_scale, convrot_groupsize
-            )
-    else:
-        q = torch.empty((m, k), dtype=torch.int8, device=x.device)
-        x_scale = torch.empty((m,), dtype=torch.float32, device=x.device)
-        _C.quantize_int8_rowwise(
-            _dl(x2d), _dl(q), _dl(x_scale), m, k, _stream(x)
-        )
-
-    x_scale = x_scale.reshape(-1).contiguous()
-    if bias0 is not None:
-        bias0 = _bias_operand(bias0, n, x.device)
-    if bias1 is not None:
-        bias1 = _bias_operand(bias1, n, x.device)
-
-    # Equal-width projections can share each activation tile once the output is
-    # large enough and N is not narrower than K.
-    output_tiles = ((m + 127) // 128) * ((n + 127) // 128)
-    use_paired_gemm = (
-        _has_nonduplicated_wmma(x.device)
-        and out_dtype == torch.bfloat16
-        and m >= 96
-        and n >= k
-        and k % 64 == 0
-        and output_tiles >= 96
-    )
-    if use_paired_gemm:
-        out0 = torch.empty((m, n), dtype=out_dtype, device=x.device)
-        out1 = torch.empty_like(out0)
-        _C.int8_gemm_pair(
-            _dl(q), _dl(weight0), _dl(weight1), _dl(out0), _dl(out1),
-            _dl(x_scale), _dl(weight_scale0),
-            0 if weight_scale0.numel() == 1 else 1,
-            _dl(weight_scale1), 0 if weight_scale1.numel() == 1 else 1,
-            None if bias0 is None else _dl(bias0),
-            None if bias1 is None else _dl(bias1),
-            m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
-        )
-        return (
-            out0.reshape(*orig_shape[:-1], n),
-            out1.reshape(*orig_shape[:-1], n),
-        )
-
-    outputs = []
-    for weight, weight_scale, bias in (
-        (weight0, weight_scale0, bias0),
-        (weight1, weight_scale1, bias1),
-    ):
-        out = torch.empty((m, n), dtype=out_dtype, device=x.device)
-        _C.int8_gemm(
-            _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
-            0 if weight_scale.numel() == 1 else 1,
-            None if bias is None else _dl(bias), m, n, k,
-            DTYPE_TO_CODE[out_dtype], _stream(x),
-        )
-        outputs.append(out.reshape(*orig_shape[:-1], n))
-    return outputs[0], outputs[1]
-
-
-def int8_linear_pair(
-    x: torch.Tensor,
-    weight0: torch.Tensor,
-    weight1: torch.Tensor,
-    weight_scale0: torch.Tensor,
-    weight_scale1: torch.Tensor,
-    bias0: torch.Tensor | None = None,
-    bias1: torch.Tensor | None = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    convrot: bool = False,
-    convrot_groupsize: int = 256,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _int8_linear_pair_impl(
-        x, weight0, weight1, weight_scale0, weight_scale1,
-        bias0, bias1, out_dtype, convrot, convrot_groupsize,
-    )
-
-
-def int8_linear_pair_modulated(
-    x: torch.Tensor,
-    modulation_scale: torch.Tensor,
-    weight0: torch.Tensor,
-    weight1: torch.Tensor,
-    weight_scale0: torch.Tensor,
-    weight_scale1: torch.Tensor,
-    bias0: torch.Tensor | None = None,
-    bias1: torch.Tensor | None = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    convrot: bool = False,
-    convrot_groupsize: int = 256,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Paired INT8 projection sharing exact modulated quantization."""
-    k = x.shape[-1]
-    if modulation_scale.numel() != k:
-        raise ValueError(
-            f"modulation_scale must contain one batch-one row of {k} values, "
-            f"got {modulation_scale.numel()}"
-        )
-    modulation_scale = modulation_scale.to(device=x.device).reshape(-1).contiguous()
-    m = x.numel() // k
-    use_fused = (
-        _has_nonduplicated_wmma(x.device)
-        and x.dtype == torch.bfloat16
-        and modulation_scale.dtype == torch.bfloat16
-        and out_dtype == torch.bfloat16
-        and convrot
-        and convrot_groupsize == 256
-        and m >= 96
-        and tuple(weight0.shape) == (10240, 3840)
-        and tuple(weight1.shape) == (10240, 3840)
-    )
-    if not use_fused:
-        scale_shape = (1,) * (x.ndim - 1) + (k,)
-        modulated = x * (1.0 + modulation_scale.reshape(scale_shape))
-        return int8_linear_pair(
-            modulated, weight0, weight1, weight_scale0, weight_scale1,
-            bias0, bias1, out_dtype, convrot, convrot_groupsize,
-        )
-    return _int8_linear_pair_impl(
-        x, weight0, weight1, weight_scale0, weight_scale1,
-        bias0, bias1, out_dtype, convrot, convrot_groupsize,
-        modulation_scale,
-    )
-
-
-def int8_linear_pair_rms_modulated(
-    x: torch.Tensor,
-    norm_weight: torch.Tensor,
-    norm_eps: float,
-    modulation_scale: torch.Tensor,
-    weight0: torch.Tensor,
-    weight1: torch.Tensor,
-    weight_scale0: torch.Tensor,
-    weight_scale1: torch.Tensor,
-    bias0: torch.Tensor | None = None,
-    bias1: torch.Tensor | None = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    convrot: bool = False,
-    convrot_groupsize: int = 256,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Paired projections sharing exact fused RMS/modulation quantization."""
-    k = x.shape[-1]
-    if norm_weight.numel() != k or modulation_scale.numel() != k:
-        raise ValueError(
-            f"norm_weight and modulation_scale must each contain {k} values"
-        )
-    norm_weight = norm_weight.to(device=x.device).reshape(-1).contiguous()
-    modulation_scale = modulation_scale.to(device=x.device).reshape(-1).contiguous()
-    m = x.numel() // k
-    use_fused = (
-        _has_nonduplicated_wmma(x.device)
-        and x.dtype == torch.bfloat16
-        and norm_weight.dtype == torch.bfloat16
-        and modulation_scale.dtype == torch.bfloat16
-        and out_dtype == torch.bfloat16
-        and convrot
-        and convrot_groupsize == 256
-        and m >= 96
-        and tuple(weight0.shape) == (10240, 3840)
-        and tuple(weight1.shape) == (10240, 3840)
-    )
-    if not use_fused:
-        normalized = torch.nn.functional.rms_norm(
-            x, (k,), norm_weight, norm_eps
-        )
-        return int8_linear_pair_modulated(
-            normalized, modulation_scale, weight0, weight1,
-            weight_scale0, weight_scale1, bias0, bias1, out_dtype,
-            convrot, convrot_groupsize,
-        )
-    return _int8_linear_pair_impl(
-        x, weight0, weight1, weight_scale0, weight_scale1,
-        bias0, bias1, out_dtype, convrot, convrot_groupsize,
-        modulation_scale, norm_weight, norm_eps,
-    )
 
 
 def int8_linear_swiglu_split(
@@ -3166,15 +2911,9 @@ def _build_constraints(has_wmma: bool = True) -> dict:
     divisible_bf16 = ParamConstraint(
         dtypes=frozenset({torch.bfloat16}), shape_rules=(DivisibleBy(-1, 16),)
     )
-    divisible_float = ParamConstraint(
-        dtypes=floats, shape_rules=(DivisibleBy(-1, 16),)
-    )
 
     def fusion(params):
         return FunctionConstraints(params=params, default_devices=dev)
-
-    def projection_weights(count):
-        return {f"weight{index}": int8_2d for index in range(count)}
 
     constraints = {
         "sol_attn": FunctionConstraints(
@@ -3288,20 +3027,6 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             "modulation_scale": bf16_param, "weight": int8_2d,
             "out_dtype": out_param,
         }),
-        "int8_linear_pair": fusion(
-            {"x": divisible_float, "out_dtype": out_param}
-            | projection_weights(2)
-        ),
-        "int8_linear_pair_modulated": fusion(
-            {"x": divisible_bf16, "modulation_scale": bf16_param,
-             "out_dtype": out_param}
-            | projection_weights(2)
-        ),
-        "int8_linear_pair_rms_modulated": fusion(
-            {"x": divisible_bf16, "norm_weight": bf16_param,
-             "modulation_scale": bf16_param, "out_dtype": out_param}
-            | projection_weights(2)
-        ),
         "int8_linear_swiglu_split": fusion({
             "gate": divisible_bf16, "up": divisible_bf16,
             "weight": int8_2d, "out_dtype": out_param,

@@ -179,42 +179,6 @@ def test_int8_linear_convrot_large_k_matches_eager(k):
 
 
 @needs_wmma
-def test_int8_linear_pair_reuses_exact_convrot_quantization():
-    torch.manual_seed(0)
-    m, n, k = 256, 512, 512
-    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
-    weights = [
-        torch.randn(n, k, device=DEV, dtype=torch.bfloat16)
-        for _ in range(2)
-    ]
-    quantized = [ck.quantize_int8_rowwise(weight) for weight in weights]
-    biases = [
-        torch.randn(n, device=DEV, dtype=torch.bfloat16)
-        for _ in range(2)
-    ]
-
-    with ck.use_backend("hip"):
-        refs = tuple(
-            ck.int8_linear(
-                x, weight_q, weight_scale.reshape(-1), bias,
-                torch.bfloat16, convrot=True, convrot_groupsize=256,
-            )
-            for (weight_q, weight_scale), bias in zip(
-                quantized, biases, strict=True
-            )
-        )
-        outputs = ck.int8_linear_pair(
-            x,
-            quantized[0][0], quantized[1][0],
-            quantized[0][1].reshape(-1), quantized[1][1].reshape(-1),
-            biases[0], biases[1], torch.bfloat16,
-            convrot=True, convrot_groupsize=256,
-        )
-    assert torch.equal(outputs[0], refs[0])
-    assert torch.equal(outputs[1], refs[1])
-
-
-@needs_wmma
 def test_gfx12_split_swiglu_down_is_exact(hip):
     skip_unless_gfx12_wmma()
 
@@ -268,42 +232,6 @@ def test_gfx12_modulated_qkv_is_exact(hip):
         )
 
     assert torch.equal(candidate, reference)
-
-
-@needs_wmma
-def test_gfx12_modulated_pair_is_exact(hip):
-    skip_unless_gfx12_wmma()
-
-    torch.manual_seed(35)
-    m, n, k = 256, 10240, 3840
-    x = torch.randn((1, m, k), device=DEV, dtype=torch.bfloat16)
-    modulation_scale = (
-        torch.randn((1, k), device=DEV, dtype=torch.bfloat16) * 0.25
-    )
-    weights = tuple(
-        torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
-        for _ in range(2)
-    )
-    scales = tuple(
-        torch.rand(n, device=DEV, dtype=torch.float32) + 0.25
-        for _ in range(2)
-    )
-
-    with ck.use_backend("hip"):
-        reference = ck.int8_linear_pair(
-            x * (1.0 + modulation_scale.unsqueeze(1)),
-            weights[0], weights[1], scales[0], scales[1],
-            None, None, torch.bfloat16,
-            convrot=True, convrot_groupsize=256,
-        )
-        candidate = ck.int8_linear_pair_modulated(
-            x, modulation_scale, weights[0], weights[1], scales[0], scales[1],
-            None, None, torch.bfloat16,
-            convrot=True, convrot_groupsize=256,
-        )
-
-    assert torch.equal(candidate[0], reference[0])
-    assert torch.equal(candidate[1], reference[1])
 
 
 def _convrot_int8_weight(n: int, k: int) -> QuantizedTensor:
@@ -388,41 +316,6 @@ def test_rms_gated_residual_is_exact(hip, rows, width):
             activation, norm_weight, residual, gate, eps)
 
     assert torch.equal(candidate, reference)
-
-
-@needs_wmma
-def test_gfx12_int8_linear_pair_shared_a_is_exact(hip):
-    skip_unless_gfx12_wmma()
-
-    torch.manual_seed(1)
-    m, n, k = 256, 10240, 3840
-    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
-    weights = tuple(
-        torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
-        for _ in range(2)
-    )
-    scales = tuple(
-        torch.rand(n, device=DEV, dtype=torch.float32) + 0.25
-        for _ in range(2)
-    )
-    biases = (
-        torch.randn(n, device=DEV, dtype=torch.bfloat16),
-        torch.randn(n, device=DEV, dtype=torch.bfloat16),
-    )
-
-    control = tuple(
-        hip.int8_linear(
-            x, weight, scale, bias, torch.bfloat16,
-        )
-        for weight, scale, bias in zip(weights, scales, biases, strict=True)
-    )
-    candidate = hip.int8_linear_pair(
-        x, weights[0], weights[1], scales[0], scales[1],
-        biases[0], biases[1], torch.bfloat16,
-    )
-
-    assert torch.equal(candidate[0], control[0])
-    assert torch.equal(candidate[1], control[1])
 
 
 @pytest.mark.parametrize(("m", "n"), [(160, 3840), (512, 3840), (512, 11520)])
