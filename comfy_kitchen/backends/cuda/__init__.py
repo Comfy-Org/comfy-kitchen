@@ -1630,8 +1630,8 @@ def quantize_int8_rowwise_convrot64(
 
     input_act applies an activation on the way in, so an MLP's
     `linear(act(proj(x)))` never materializes act's output in bf16. For the
-    gated "swiglu" pair the input rows are [gate | up] and the quantized rows
-    are half as wide. "rms_norm" normalizes each row with input_act_weight
+    gated pairs ("swiglu" on [gate | up], "situ" on [hidden | gate]) the quantized
+    rows are half as wide as the input rows. "rms_norm" normalizes each row with input_act_weight
     (K elements) and input_act_eps before rotating.
     """
     q_2d = torch.empty(

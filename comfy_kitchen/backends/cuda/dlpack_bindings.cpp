@@ -3510,7 +3510,7 @@ bool w4a8_codebook_mma_linear(
     int64_t convrot_group_size, int64_t G, int out_dtype_code, uintptr_t stream_ptr) {
     const int64_t M = xq.shape(0);
     const int64_t K = xq.shape(1);
-    const int64_t in_width = (act_code == comfy::kActSwiGLU) ? 2 : 1;
+    const int64_t in_width = comfy::input_act_width(static_cast<int>(act_code));
     const int64_t N = s_channel.size();
     const int input_dtype_code = map_dtype_to_code(input.dtype());
     if (M > 8 || convrot_group_size <= 0 || K % convrot_group_size != 0
@@ -3830,10 +3830,10 @@ void quantize_int8_rowwise_convrot64(
     uintptr_t stream_ptr) {
 
     const int64_t M = input.shape(0);
-    // K is the activated (quantized) row width; the SwiGLU pair reads a
-    // [gate | up] input row twice as wide.
+    // K is the activated (quantized) row width; the gated pairs (SwiGLU, SiTU)
+    // read an input row twice as wide.
     const int64_t K = output.shape(1);
-    const int64_t in_width = (act_code == comfy::kActSwiGLU) ? 2 : 1;
+    const int64_t in_width = comfy::input_act_width(static_cast<int>(act_code));
 
     if (output.shape(0) != M || input.shape(1) != K * in_width) {
         throw std::runtime_error("INT8 rowwise convrot64 output shape mismatch");
@@ -4029,11 +4029,11 @@ void int8_linear_m1(
         throw std::runtime_error("INT8 M=1 linear expects input M == 1");
     }
     // ConvRot fuses the quantizer (and input activation) into the GEMV: the raw
-    // row is K wide, or 2K for SwiGLU's [gate | up]; q_scratch/x_scales unused.
+    // row is K wide, or 2K for the gated pairs (SwiGLU, SiTU); q_scratch/x_scales unused.
     if (act_code != 0 && !convrot) {
         throw std::runtime_error("INT8 M=1 linear input activation requires convrot");
     }
-    const int64_t in_width = (act_code == comfy::kActSwiGLU) ? 2 : 1;
+    const int64_t in_width = comfy::input_act_width(act_code);
     if (input.shape(1) != K * in_width) {
         throw std::runtime_error("INT8 M=1 linear weight K mismatch");
     }
@@ -4888,7 +4888,7 @@ NB_MODULE(_C, m) {
           "Fused ConvRot rowwise INT8 quantization using 64-lane FHT groups. "
           "act_code applies an activation to the input first (the comfy::kAct* "
           "codes in input_act_codes.h: none, gelu tanh-approx, swiglu, "
-          "rms_norm), folding it into the quantizer instead of round-tripping "
+          "rms_norm, situ), folding it into the quantizer instead of round-tripping "
           "it through HBM. rms_norm "
           "reads its K-element weight from act_weight (same dtype as the "
           "input; pass an empty tensor otherwise) and eps from act_eps.",
