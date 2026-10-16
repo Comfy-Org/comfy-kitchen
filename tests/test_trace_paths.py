@@ -54,8 +54,7 @@ def test_matches_reference(seed, sparse):
     starts = torch.randint(0, n, (rows,), generator=gen)
     d = torch.full((rows, n), torch.inf, dtype=torch.float64, device="cuda")
     d[torch.arange(rows), starts] = 0
-    ck.shortest_paths(out_ptr.cuda(), dst.cuda(), w.cuda(), d, (torch.arange(rows) * n + starts).cuda(),
-                      torch.full((rows,), torch.inf, dtype=torch.float64, device="cuda"), 0.5)
+    ck.shortest_paths(out_ptr.cuda(), dst.cuda(), w.cuda(), d, (torch.arange(rows) * n + starts).cuda(), 0.5)
     d = d.cpu()
     ends = torch.randint(0, n, (rows,), generator=gen)
     ends[::5] = -1

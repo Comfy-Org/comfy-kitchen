@@ -1174,37 +1174,36 @@ def min_cut(nbr: torch.Tensor, cap: torch.Tensor, s_cap: torch.Tensor, t_cap: to
 
 
 def shortest_paths(indptr: torch.Tensor, dst: torch.Tensor, weight: torch.Tensor, dist: torch.Tensor,
-                   front: torch.Tensor, bound: torch.Tensor, delta: float, active: torch.Tensor | None = None,
-                   blocked: torch.Tensor | None = None, end: torch.Tensor | None = None,
+                   front: torch.Tensor, delta: float, active: torch.Tensor | None = None,
                    closer: torch.Tensor | None = None) -> None:
-    """Batched shortest paths on a CSR graph (delta-stepping), updating dist and bound in place.
+    """Batched shortest paths on a CSR graph (delta-stepping), updating dist in place.
 
     Node v's arcs go to dst[indptr[v]:indptr[v + 1]] with float64 weights >= 0. Each row of dist (R, N) float64 is one
     search: sources at 0, other nodes inf (or an earlier field to lower). It starts from the flat indices r * N + v in
-    front and enters only nodes within bound (R,); delta is the bucket width.
+    front; delta is the bucket width.
 
-    Optional: only active (N,) nodes are entered; blocked (N,) nodes only as the end; end (R,) is not expanded and
-    lowers bound[r]; arcs into closer (R,) lower bound[r] to their start distance instead. -1 disables end / closer.
-    Nodes within the final bound get their exact distance.
+    Optional: only active (N,) nodes are entered; an arc into closer[r] (R,, -1 for none) is not followed and bounds
+    row r to the distance it leaves from. Nodes within a row's bound get their exact distance.
     """
-    kwargs = {"indptr": indptr, "dst": dst, "weight": weight, "dist": dist, "front": front, "bound": bound,
-              "delta": delta, "active": active, "blocked": blocked, "end": end, "closer": closer}
+    kwargs = {"indptr": indptr, "dst": dst, "weight": weight, "dist": dist, "front": front, "delta": delta,
+              "active": active, "closer": closer}
     impl = registry.get_implementation("shortest_paths", kwargs=kwargs)
     return impl(**kwargs)
 
 
 def shortest_paths_sparse(indptr: torch.Tensor, dst: torch.Tensor, weight: torch.Tensor, starts: torch.Tensor,
-                          bound: torch.Tensor, delta: float, num_nodes: int, active: torch.Tensor | None = None,
+                          delta: float, num_nodes: int, active: torch.Tensor | None = None,
                           blocked: torch.Tensor | None = None, stop: torch.Tensor | None = None,
                           end: torch.Tensor | None = None, closer: torch.Tensor | None = None,
                           reach: torch.Tensor | None = None, max_slots: int = 2 ** 30) -> tuple[torch.Tensor, torch.Tensor]:
     """shortest_paths from one start node per row, stored in a hash table instead of dense rows.
 
-    Also: stop (N,) bool nodes act as an end for every row; nodes beyond reach (R,) are entered but not expanded. The
-    table grows up to max_slots slots (32 bytes each), then the rows run in smaller groups. Returns the sorted flat
-    keys r * num_nodes + v (int64) of the nodes reached and their distances.
+    Also: end[r] (R,, -1 for none) and stop (N,) bool nodes are entered but not expanded and bound row r to their
+    distance; blocked (N,) bool nodes are entered only as an end or stop node; nodes beyond reach (R,) are entered but
+    not expanded. The table grows up to max_slots slots (32 bytes each), then the rows run in smaller groups. Returns
+    the sorted flat keys r * num_nodes + v (int64) of the nodes reached and their distances.
     """
-    kwargs = {"indptr": indptr, "dst": dst, "weight": weight, "starts": starts, "bound": bound, "delta": delta,
+    kwargs = {"indptr": indptr, "dst": dst, "weight": weight, "starts": starts, "delta": delta,
               "num_nodes": num_nodes, "active": active, "blocked": blocked, "stop": stop, "end": end, "closer": closer,
               "reach": reach, "max_slots": max_slots}
     impl = registry.get_implementation("shortest_paths_sparse", kwargs=kwargs)
