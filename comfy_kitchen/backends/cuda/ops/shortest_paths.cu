@@ -15,22 +15,15 @@
  * limitations under the License.
  */
 
-// Batched shortest paths by delta-stepping with a near queue and a far pile on a CSR graph with non-negative double
-// arc weights, the whole search in one cooperative kernel. Row r is one search; the rows share the queues of slots
-// holding flat keys r * N + v, either dense (slot = key) or in an open-addressing table. A near round expands the near
-// queue (kTile lanes per item, one arc each): a lowered node below its row's bucket end joins the next near queue, any
-// other the far pile. When no row has near work left, a far phase moves every row's bucket end to its smallest far
-// distance + delta and splits the pile: entries below the old bucket end (already expanded), beyond the bound or
-// beyond reach are dropped, those below the new end go near, the rest stay. A slot joins each queue and the pile once
-// (a bit per slot, cleared when it leaves). Distances only decrease, through atomicMin on their bit patterns
-// (non-negative doubles order like unsigned integers), so every node within the final bound ends at its exact
-// shortest distance whatever the thread order.
+// Batched delta-stepping shortest paths on a CSR graph with non-negative double weights, in one cooperative kernel.
+// Each row is its own search over slots holding keys r * N + v: dense rows, or an open-addressing hash table.
+// Nodes below their row's bucket end go to the near queue, the rest to the far pile; once no row has near work,
+// each bucket end moves to the row's smallest far distance + delta. Distances only decrease (atomicMin on the bits
+// of non-negative doubles), so every node within the final bound gets its exact distance in any thread order.
 //
-// Per row: nodes farther than bound[r] are not entered and those farther than reach[r] are not expanded; the row's
-// end[r] and stop nodes (shared by all rows) are entered but not expanded (stop nodes the search starts from are),
-// and reaching one lowers bound[r]; an arc into closer[r] is not relaxed and lowers bound[r] to the distance it
-// leaves from; blocked nodes are entered only as an end or stop node. -1 disables end / closer. Indices are checked
-// where they are used, so repeated searches on one graph need no separate validation pass.
+// Per row: bound (nodes farther are not entered), reach (not expanded), end and stop nodes (entered, not expanded,
+// lower the bound), closer (arcs into it lower the bound instead), blocked nodes (entered only as an end or stop).
+// -1 disables end / closer. Indices are checked as they are read.
 
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
@@ -46,7 +39,7 @@ namespace shortest_paths {
 
 constexpr int kThreads = 256;
 constexpr int kTile = 16;
-constexpr int kProbes = 64;  // a key that finds no slot this close counts the table as full
+constexpr int kProbes = 64;  // a key not placed within this many probes marks the table full
 
 __device__ __forceinline__ double atomic_min_nonneg(double* addr, double v) {
     const unsigned long long old = atomicMin(reinterpret_cast<unsigned long long*>(addr),
@@ -54,12 +47,12 @@ __device__ __forceinline__ double atomic_min_nonneg(double* addr, double v) {
     return __longlong_as_double(static_cast<long long>(old));
 }
 
-// lowers *addr to v, reading first: most values are not a new minimum, and atomics on one address serialize
+// reads first: most values are not a new minimum, and atomics on one address serialize
 __device__ __forceinline__ void lower(double* addr, double v) {
     if (v < __ldcg(addr)) atomic_min_nonneg(addr, v);
 }
 
-// appends item to a list from divergent threads with one atomic per group
+// one atomic per group of divergent threads
 __device__ __forceinline__ void append(int* list, int* count, int item) {
     const cg::coalesced_group g = cg::coalesced_threads();
     int at = 0;
@@ -67,7 +60,7 @@ __device__ __forceinline__ void append(int* list, int* count, int item) {
     list[g.shfl(at, 0) + g.thread_rank()] = item;
 }
 
-// sets item's bit, true when it was clear
+// true when the bit was clear
 __device__ __forceinline__ bool claim(unsigned int* bits, int item) {
     const unsigned int bit = 1u << (item & 31);
     return !(atomicOr(bits + (item >> 5), bit) & bit);
@@ -82,7 +75,7 @@ struct Search {
     const int* indptr;
     const int* dst;
     const double* w;
-    const uint8_t* active;    // the options from here to reach may be null
+    const uint8_t* active;    // active .. reach may be null
     const uint8_t* blocked;
     const uint8_t* stop;
     const long long* end;
@@ -90,18 +83,18 @@ struct Search {
     const double* reach;
     double delta;
     double* bound;
-    const long long* front;   // flat keys to start from, at their stored distance (dense) or at 0 (table)
+    const long long* front;   // start keys, at their stored distance (dense) or 0 (table)
     int n_front;
     double* dist;             // (cap) distance per slot
-    long long* keys;          // (cap) the table's keys, -1 for a free slot; null for dense rows
+    long long* keys;          // (cap) table keys, -1 when free; null for dense rows
     long long cap;            // slots, a power of two for a table
-    unsigned int* near_bits;  // (2, words) membership of the two near queues
-    unsigned int* far_bits;   // (words) membership of the far pile
-    int* items;               // (2, cap) near queues, step it takes the queue it & 1
-    int* far_items;           // (2, cap) far piles
-    int* counts;              // (7,) near sizes (step it takes counts[it % 3]), far sizes, index error, table full
-    double* thr;              // (2, R) bucket end and the one before it
-    double* low;              // (2, R) smallest far distance per row, the far phase f reads low[f & 1]
+    unsigned int* near_bits;  // (2, words) near queue membership
+    unsigned int* far_bits;   // (words) far pile membership
+    int* items;               // (2, cap) near queues, alternating per step
+    int* far_items;           // (2, cap) far piles, alternating per far phase
+    int* counts;              // (7,) 3 near sizes, 2 far sizes, index error, table full
+    double* thr;              // (2, R) current and previous bucket end
+    double* low;              // (2, R) smallest far distance per row, per far pile
 
     __device__ int find(long long key) const {
         if (!keys) return static_cast<int>(key);
@@ -125,7 +118,7 @@ struct Step {
     int* items;               // the next near queue
     int* count;
     unsigned int* bits;
-    int* far_items;           // the far pile and the row minima it feeds
+    int* far_items;           // the current far pile
     int* far_count;
     double* low;
 };
@@ -197,10 +190,10 @@ __global__ void search_kernel(Search s) {
         if (claim(s.far_bits, slot)) append(s.far_items, s.counts + 3, slot);
     }
     grid.sync();
-    for (int it = 0, pile = 0;; ++it) {                       // pile: the far phases done & 1
+    for (int it = 0, pile = 0;; ++it) {                       // pile: which far pile is current
         const int count = __ldcg(s.counts + it % 3), far_count = __ldcg(s.counts + 3 + pile);
         if ((count == 0 && far_count == 0) || __ldcg(s.counts + 6)) break;
-        if (tid == 0) s.counts[(it + 2) % 3] = 0;            // round it - 1's near count becomes round it + 1's
+        if (tid == 0) s.counts[(it + 2) % 3] = 0;            // step it - 1's count is reused for step it + 1
         const Step out{s.items + ((it + 1) & 1) * s.cap, s.counts + (it + 1) % 3, s.near_bits + ((it + 1) & 1) * words,
                        s.far_items + pile * s.cap, s.counts + 3 + pile, s.low + pile * s.R};
         if (count) {
@@ -214,7 +207,7 @@ __global__ void search_kernel(Search s) {
             grid.sync();
             continue;
         }
-        // far phase: new bucket ends, then the pile split into the next near queue and the other pile
+        // far phase: move the bucket ends, then split the pile into the near queue and the other pile
         double* next_low = s.low + (pile ^ 1) * s.R;
         for (int r = tid; r < s.R; r += stride) {
             prev[r] = thr[r];
@@ -250,10 +243,9 @@ using namespace comfy::shortest_paths;
 
 extern "C" {
 
-// dist holds R dense rows of N (keys null) or the values of a table of cap keys (a power of two), keys -1 and dist
-// +inf on entry. bits (3, ceil(cap / 32)) and counts (7,) must hold 0, levels (4, R) -inf in its first two rows and
-// +inf in the others; queues is (4, cap) scratch. counts[5] is set when an index (front, end, closer, indptr or dst)
-// was out of range, the offending items left out, counts[6] when the table ran full, which stops the search.
+// dist: R dense rows of N (keys null) or a table of cap slots, a power of two (keys -1, dist +inf on entry).
+// bits (3, cap / 32) and counts (7,) zeroed, levels (4, R) = -inf, -inf, +inf, +inf, queues (4, cap) scratch.
+// Sets counts[5] on an out-of-range index (that item is skipped), counts[6] when the table is full (search stops).
 void launch_shortest_paths(int R, int N, int E, int n_front, long long cap, double delta, const void* indptr,
                            const void* dst, const void* w, const void* active, const void* blocked, const void* stop,
                            const void* end, const void* closer, const void* reach, void* bound, void* dist, void* keys,
@@ -271,7 +263,7 @@ void launch_shortest_paths(int R, int N, int E, int n_front, long long cap, doub
     int device = 0, sms = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-    // one block per SM: rounds are latency bound and the grid barrier gets slower with more blocks
+    // one block per SM: rounds are latency bound and grid syncs slow down with more blocks
     void* args[] = {&s};
     CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(search_kernel), sms, kThreads, args, 0, stream));
     CUDA_CHECK(cudaGetLastError());

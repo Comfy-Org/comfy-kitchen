@@ -3545,8 +3545,7 @@ def min_cut(nbr: torch.Tensor, cap: torch.Tensor, s_cap: torch.Tensor, t_cap: to
 
 
 def _shortest_paths(indptr, dst, weight, n, bound, delta, active, blocked, stop, end, closer, reach, dist, keys, front):
-    """One search into dense rows dist (keys None) or a table of keys and their distances dist; True when the table
-    ran full."""
+    """One search into dense rows (keys None) or a hash table (keys, dist); True when the table ran full."""
     device, rows, cap = bound.device, bound.shape[0], dist.numel()
     _check_shape("indptr", indptr, (n + 1,))
     _check_shape("weight", weight, (dst.shape[0],))
@@ -3610,7 +3609,7 @@ def shortest_paths_sparse(indptr: torch.Tensor, dst: torch.Tensor, weight: torch
         per_row = (None if t is None else t[part] for t in (end, closer, reach))
         if _shortest_paths(indptr, dst, weight, n, bound[part], delta, active, blocked, stop, *per_row, vals, keys,
                            torch.arange(take, device=device) * n + starts[part]):
-            bound[part] = start_bound[part]                      # a full table loses entries: more slots or fewer rows
+            bound[part] = start_bound[part]                      # table full: retry with more slots or fewer rows
             if slots < cap:
                 slots = min(cap, slots * 4)
             elif take > 1:

@@ -15,10 +15,9 @@
  * limitations under the License.
  */
 
-// Walks along a successor array, one thread per start: from starts[r] the walk steps to succ[cur] until it reaches a
-// stop node. It fails at a node without a successor, an inactive one, or one it already visited, where visiting a
-// node also visits its twin (when the twin is active). Visits are bits of a per-row bitmap. The first pass records the
-// path lengths, the second replays the walks that did not fail to write their nodes.
+// Follows succ from each start until a stop node, one thread per walk. A walk fails at a node with no successor,
+// an inactive node, or one already visited (visiting a node also visits its active twin). A first pass counts path
+// lengths using a visited bitmap per row, a second replays the successful walks to write their nodes.
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -32,8 +31,7 @@ constexpr int kThreads = 128;
 
 __device__ __forceinline__ void visit(unsigned int* row, int v) { row[v >> 5] |= 1u << (v & 31); }
 
-// out null: lengths[r] = node count of the walk from starts[r], 0 when it fails, with the visits marked in seen (R,
-// ceil(N / 32)), zero on entry; otherwise writes the walks of those lengths into out (R, L)
+// out null: fills lengths (0 for a failed walk) using seen (R, N / 32), zeroed; otherwise writes the walks to out (R, L)
 __global__ void walk_kernel(int R, int N, const int* succ, const uint8_t* stop, const uint8_t* active, const int* twin,
                             const long long* starts, unsigned int* seen, int* lengths, long long* out, int L) {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
