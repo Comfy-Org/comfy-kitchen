@@ -320,7 +320,7 @@ def test_rms_gated_residual_is_exact(hip, rows, width):
 
 @pytest.mark.parametrize(("m", "n"), [(160, 3840), (512, 3840), (512, 11520)])
 @needs_wmma
-def test_gfx12_int8_dual_m_shared_b_is_exact(hip, m, n):
+def test_gfx12_int8_gemm_is_exact(hip, m, n):
     skip_unless_gfx12_wmma()
 
     torch.manual_seed(2)
