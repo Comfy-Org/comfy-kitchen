@@ -1,0 +1,262 @@
+# 3.21 for the HIP language (CMAKE_HIP_ARCHITECTURES), 3.26 for the
+# Development.SABIModule component the abi3 module below needs.
+cmake_minimum_required(VERSION 3.26)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_HIP_STANDARD 20)
+set(CMAKE_HIP_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Keep this before project(): CMAKE_HIP_ARCHITECTURES must already be set.
+set(CMAKE_HIP_ARCHITECTURES gfx1010)
+
+# A pip-installed rocm-sdk places the device bitcode under
+# lib/llvm/amdgcn/bitcode rather than the <root>/amdgcn/bitcode clang probes for.
+# Must precede project(), which compiles a test program with these flags.
+if(DEFINED CMAKE_HIP_COMPILER_ROCM_ROOT)
+    set(_ck_devlib "${CMAKE_HIP_COMPILER_ROCM_ROOT}/lib/llvm/amdgcn/bitcode")
+    if(EXISTS "${_ck_devlib}" AND NOT EXISTS "${CMAKE_HIP_COMPILER_ROCM_ROOT}/amdgcn/bitcode")
+        # Quote the path: a ROCm root with spaces would otherwise split into extra
+        # compiler arguments and fail the project() HIP probe.
+        set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --rocm-device-lib-path=\"${_ck_devlib}\"")
+    endif()
+
+    # A stale HIP_PATH from an older SDK install outranks both the compiler's own
+    # search and --rocm-path, so pin the runtime to the root that was resolved.
+    if(EXISTS "${CMAKE_HIP_COMPILER_ROCM_ROOT}/include/hip/hip_version.h")
+        set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --hip-path=\"${CMAKE_HIP_COMPILER_ROCM_ROOT}\"")
+    endif()
+endif()
+
+project(comfy_kitchen_rdna1 LANGUAGES CXX HIP)
+
+message(STATUS "HIP architectures: ${CMAKE_HIP_ARCHITECTURES}")
+
+# After project(), so ccache never wraps the compiler detection probes. HIP is
+# the same clang++ driver as CXX here, so it defaults to the C++ launcher.
+if(DEFINED COMFY_CXX_COMPILER_LAUNCHER)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${COMFY_CXX_COMPILER_LAUNCHER}")
+    message(STATUS "C++ compiler launcher: ${CMAKE_CXX_COMPILER_LAUNCHER}")
+endif()
+if(NOT DEFINED COMFY_HIP_COMPILER_LAUNCHER)
+    set(COMFY_HIP_COMPILER_LAUNCHER "${COMFY_CXX_COMPILER_LAUNCHER}")
+endif()
+if(COMFY_HIP_COMPILER_LAUNCHER)
+    set(CMAKE_HIP_COMPILER_LAUNCHER "${COMFY_HIP_COMPILER_LAUNCHER}")
+    message(STATUS "HIP compiler launcher: ${CMAKE_HIP_COMPILER_LAUNCHER}")
+endif()
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O0")
+else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+endif()
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=hidden -fdiagnostics-color=always")
+
+# Same components as the CUDA backend. A wheel only keeps the abi3 tag if every
+# extension in it is abi3, so this has to match.
+find_package(Python REQUIRED COMPONENTS Interpreter Development.Module Development.SABIModule)
+
+execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c "import nanobind; print(nanobind.cmake_dir())"
+    OUTPUT_VARIABLE NB_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE NB_RESULT
+)
+
+if(NOT NB_RESULT EQUAL 0)
+    message(FATAL_ERROR "nanobind not found. Install with: pip install nanobind")
+endif()
+
+list(APPEND CMAKE_PREFIX_PATH "${NB_DIR}")
+find_package(nanobind CONFIG REQUIRED)
+
+# hip-config.cmake hard-errors ("Unexpected HIP_PLATFORM") when this is unset;
+# only some ROCm layouts default it. amd is the only platform these kernels target.
+if(NOT DEFINED HIP_PLATFORM)
+    set(HIP_PLATFORM "amd")
+endif()
+
+find_package(hip REQUIRED CONFIG)
+
+set(HIP_SOURCES
+    ops/per_tensor_fp8.hip
+    ops/stochastic_round_fp8.hip
+    ops/quantize_int8.hip
+    ops/gemm_fp8.hip
+    ops/gemv_fp8.hip
+    ops/gemm_int8.hip
+    ops/gemm_f16_packed.hip
+    ops/gemv_f16.hip
+    ops/gemm_fp16.hip
+    ops/conv3d_fp16.hip
+    ops/transpose_cast.hip
+    ops/depthwise_conv.hip
+    ops/direct_conv.hip
+    ops/winograd_conv.hip
+    ops/packed_scale.hip
+    ops/convrot_w4a4.hip
+    ops/adaln.hip
+    ops/group_norm_pad3d.hip
+    ops/na3d.hip
+    sage_attention/quant_qk_int8.hip
+    sage_attention/quant_v_int8.hip
+    sage_attention/int8_attn.hip
+    sage_attention/int8_attn_d64_f16.hip
+    sage_attention/int8_attn_d64_bf16.hip
+    sage_attention/int8_attn_d128_f16.hip
+    sage_attention/int8_attn_d128_bf16.hip
+    sage_attention/int8_attn_d256_f16.hip
+    sage_attention/int8_attn_d256_bf16.hip
+    sage_attention/int8_attn_fp16.hip
+    sage_attention/sol_attn.hip
+    sage_attention/sol_attn_preprocess.hip
+    sage_attention/sol_attn_vtranspose.hip
+    sage_attention/sol_attn_producer.hip
+    sage_attention/sol_attn_route.hip
+    sage_attention/sol_attn_exact.hip
+    sage_attention/sol_attn_token.hip
+    ops/apply_rope.hip
+    ops/rms_rope.hip
+    ops/gemv_awq.hip
+    ops/svdquant_w4a4.hip
+    ops/w4a8_dequant.hip
+    ops/w4a8_gemv.hip
+    ops/w4a8_requant.hip
+)
+
+# MIOpen's Winograd RxS kernels (miopen_winograd/README.md), assembled the way MIOpen
+# assembles them for gfx1010 and embedded in the module, in the order the bindings index
+# them (kWinoNames in dlpack_bindings.cpp).
+set(WINO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/miopen_winograd")
+set(WINO_KERNELS f2x3_stride1 f2x3_stride2 f3x2_stride1 f3x2_stride2 f2x3_dilation2 f3x2_dilation2)
+set(WINO_NAMES "")
+set(WINO_OBJECTS "")
+foreach(kernel IN LISTS WINO_KERNELS)
+    set(name "Conv_Winograd_v30_3_1_fp32_${kernel}")
+    set(object "${CMAKE_CURRENT_BINARY_DIR}/miopen_winograd/${name}.hsaco")
+    add_custom_command(
+        OUTPUT "${object}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/miopen_winograd"
+        COMMAND "${CMAKE_HIP_COMPILER}" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1010:xnack-
+                -mcumode -mwavefrontsize64 -Wa,-defsym,ROCM_METADATA_VERSION=5
+                -Wa,-defsym,FORCE_CACHE_BYPASS_ON_STORE=0 -I "${WINO_DIR}"
+                "${WINO_DIR}/${name}.s" -o "${object}"
+        DEPENDS "${WINO_DIR}/${name}.s" "${WINO_DIR}/Conv_Winograd_v30_3_1_gfx10_fp32_${kernel}.inc"
+                "${WINO_DIR}/Conv_Winograd_v30_3_1_metadata.inc"
+        VERBATIM
+    )
+    list(APPEND WINO_NAMES "${name}")
+    list(APPEND WINO_OBJECTS "${object}")
+endforeach()
+set(WINO_BLOBS "${CMAKE_CURRENT_BINARY_DIR}/miopen_winograd_blobs.cpp")
+add_custom_command(
+    OUTPUT "${WINO_BLOBS}"
+    COMMAND "${CMAKE_COMMAND}" -DOUT=${WINO_BLOBS} -DDIR=${CMAKE_CURRENT_BINARY_DIR}/miopen_winograd
+            "-DNAMES=${WINO_NAMES}" -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_hsaco.cmake"
+    DEPENDS ${WINO_OBJECTS} "${CMAKE_CURRENT_SOURCE_DIR}/embed_hsaco.cmake"
+    VERBATIM
+)
+
+set(CPP_SOURCES
+    dlpack_bindings.cpp
+    ${WINO_BLOBS}
+)
+
+# Keep HIP compilation independent of the Python extension target. The kernels
+# consume HIP and project headers only, so a compiler cache can reuse their
+# objects across CPython wheel builds.
+add_library(comfy_kitchen_rdna1_kernels OBJECT ${HIP_SOURCES})
+# The kernels index lanes and reduce warps at a width of 32. The wavefront size is
+# not a constant expression, so no kernel can assert it; the last flag wins, and
+# these follow CMAKE_HIP_FLAGS.
+target_compile_options(comfy_kitchen_rdna1_kernels PRIVATE
+    $<$<COMPILE_LANGUAGE:HIP>:-O3>
+    $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
+    $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64>
+)
+# Files whose kernels measured faster at wave64 on the RX 5600M (1.02-1.75x), mostly the
+# ones that stream global memory with little arithmetic per element. The GEMM, conv and
+# attention kernels measured 3-11% slower there and stay wave32. Source options follow
+# the target's.
+set_source_files_properties(
+    ops/per_tensor_fp8.hip
+    ops/quantize_int8.hip
+    ops/gemv_f16.hip
+    ops/gemv_fp8.hip
+    ops/transpose_cast.hip
+    ops/depthwise_conv.hip
+    ops/adaln.hip
+    ops/group_norm_pad3d.hip
+    sage_attention/quant_qk_int8.hip
+    sage_attention/quant_v_int8.hip
+    sage_attention/sol_attn_route.hip
+    sage_attention/sol_attn_exact.hip
+    ops/apply_rope.hip
+    ops/rms_rope.hip
+    ops/gemv_awq.hip
+    ops/svdquant_w4a4.hip
+    ops/w4a8_dequant.hip
+    ops/w4a8_gemv.hip
+    PROPERTIES COMPILE_OPTIONS "-mwavefrontsize64;-include;${CMAKE_CURRENT_SOURCE_DIR}/wave64.h"
+)
+if(COMFY_ENABLE_LINEINFO OR CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_options(
+        comfy_kitchen_rdna1_kernels PRIVATE
+        $<$<COMPILE_LANGUAGE:HIP>:-gline-tables-only>
+    )
+endif()
+target_include_directories(comfy_kitchen_rdna1_kernels PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/sage_attention
+)
+target_link_libraries(comfy_kitchen_rdna1_kernels PRIVATE hip::host)
+
+# NOMINSIZE: nanobind_add_module() otherwise puts -Os on the whole target, which the
+# kernel object target already avoids. Keep it off the binding translation unit too.
+if(Python_VERSION VERSION_GREATER_EQUAL "3.12")
+    message(STATUS "Python ${Python_VERSION} detected - enabling stable ABI (abi3)")
+    nanobind_add_module(_C NB_STATIC STABLE_ABI LTO NOMINSIZE ${CPP_SOURCES})
+    if(WIN32)
+        set_target_properties(_C PROPERTIES SUFFIX ".abi3.pyd")
+    else()
+        set_target_properties(_C PROPERTIES SUFFIX ".abi3.so")
+    endif()
+    target_compile_definitions(_C PRIVATE Py_LIMITED_API=0x030C0000)
+else()
+    message(STATUS "Python ${Python_VERSION} detected - building version-specific module")
+    nanobind_add_module(_C NB_STATIC LTO NOMINSIZE ${CPP_SOURCES})
+endif()
+
+target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_rdna1_kernels>)
+
+target_compile_definitions(_C PRIVATE NB_STATIC)
+
+target_include_directories(_C PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(_C PRIVATE hip::host)
+
+if(CMAKE_CONFIGURATION_TYPES)
+    set_target_properties(_C PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY_DEBUG "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+        LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+        LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+        LIBRARY_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+        RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+        RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+    )
+endif()
+
+install(TARGETS _C
+    LIBRARY DESTINATION .
+    RUNTIME DESTINATION .
+)

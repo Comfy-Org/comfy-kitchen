@@ -2,6 +2,13 @@ __all__ = [
     "adaln",
     "fp16_conv3d",
     "fp16_conv3d_out",
+    "fp16_packed_conv3d",
+    "fp16_packed_conv_transpose3d",
+    "depthwise_conv3d",
+    "depthwise_conv_transpose3d",
+    "direct_conv3d",
+    "fp32_winograd_conv2d",
+    "fp32_winograd_conv_transpose2d",
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
     "na3d",
@@ -52,6 +59,9 @@ __all__ = [
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
     "fp16_linear",
+    "fp16_packed_linear",
+    "q8_0_linear",
+    "q4_k_linear",
     "int8_linear",
     "w4a8_int8_linear",
     "w4a8_packed_linear",
@@ -72,7 +82,17 @@ from comfy_kitchen.registry import registry
 
 from .adaln import adaln, rms_adaln
 from .awq import gemv_awq_w4a16
-from .conv3d import fp16_conv3d, fp16_conv3d_out
+from .conv3d import (
+    depthwise_conv3d,
+    depthwise_conv_transpose3d,
+    direct_conv3d,
+    fp32_winograd_conv2d,
+    fp32_winograd_conv_transpose2d,
+    fp16_conv3d,
+    fp16_conv3d_out,
+    fp16_packed_conv3d,
+    fp16_packed_conv_transpose3d,
+)
 from .convrot_w4a4 import (
     convrot_w4a4_linear,
     dequantize_convrot_w4a4_weight,
@@ -91,6 +111,9 @@ from .quantization import (
     dequantize_nvfp4,
     dequantize_per_tensor_fp8,
     fp16_linear,
+    fp16_packed_linear,
+    q8_0_linear,
+    q4_k_linear,
     int8_linear,
     quantize_and_rotate_rowwise,
     quantize_int8_convrot_weight,
@@ -542,6 +565,64 @@ def _build_constraints() -> dict:
             "q": ParamConstraint(dtypes=frozenset({torch.int8})),
             "scale": ParamConstraint(dtypes=standard_floats),
             "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["fp16_packed_conv3d"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
+            "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
+            "bias": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["fp32_winograd_conv2d"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(4),)),
+            "weight": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(4),)),
+            "bias": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["fp32_winograd_conv_transpose2d"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(4),)),
+            "weight": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(4),)),
+            "bias": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    for name in ("fp16_packed_conv_transpose3d", "depthwise_conv3d", "depthwise_conv_transpose3d",
+                 "direct_conv3d"):
+        out[name] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
+                "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
+                "bias": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        )
+    out["q8_0_linear"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "raw": ParamConstraint(dtypes=frozenset({torch.uint8})),
+            "bias": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["q4_k_linear"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "raw": ParamConstraint(dtypes=frozenset({torch.uint8})),
+            "bias": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["fp16_packed_linear"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "weight": ParamConstraint(dtypes=standard_floats),
+            "bias": ParamConstraint(dtypes=standard_floats),
         },
         default_devices=all_devices,
     )
