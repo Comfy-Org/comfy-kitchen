@@ -60,8 +60,7 @@ def _random_graph(n, max_deg, gen, ties=False):
 
 
 def _run(n, rows, gen, sparse=False, ties=False, delta=0.5, max_slots=2 ** 30, use=(), previous=False):
-    """Searches from a start node per row (some dense rows from two) with the options named in use, against _reference;
-    previous starts dense rows from a finite earlier field."""
+    """The options named in use match _reference; previous starts dense rows from a finite earlier field."""
     indptr, dst, weight = _random_graph(n, 6, gen, ties)
     starts = torch.randint(0, n, (rows,), generator=gen)
     extra = torch.randint(0, n, (rows,), generator=gen)

@@ -15,12 +15,10 @@
  * limitations under the License.
  */
 
-// Jacobi Bellman-Ford over in-arc CSR lists (arcs grouped by head) in one cooperative kernel, a grid barrier per
-// sweep and kLanes lanes per node. A sweep sets every node to min(its distance, min over in-arcs of tail distance +
-// weight); a node that drops by more than kTol takes as parent the last of its in-arcs reaching the new value. Every
-// kCheck sweeps (and after the last one) the search stops when no node dropped by more than kTol in that sweep, or when
-// the parent graph has a cycle, found by pointer jumping: after 2^steps >= n - 1 jumps every node sits on the cycle
-// its parent walk ends in, and those nodes are marked in on_cycle.
+// Jacobi Bellman-Ford over in-arc CSR lists in one cooperative kernel, kLanes lanes per node. Each sweep lowers every
+// node to its best in-arc (tail distance + weight); a node that drops by more than kTol takes that arc as parent.
+// Every kCheck sweeps it stops if nothing dropped, or if the parent graph has a cycle: pointer jumping moves every
+// node onto the cycle its parent walk ends in, and those nodes are marked in on_cycle.
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -37,7 +35,7 @@ namespace comfy {
 namespace bellman_ford {
 
 constexpr int kThreads = 256;
-constexpr int kLanes = 8;  // lanes per node, splitting its in-arcs
+constexpr int kLanes = 8;  // lanes per node
 constexpr int kCheck = 16;
 constexpr double kTol = 1e-12;
 
@@ -46,10 +44,10 @@ struct Sweep {
     const int* indptr;
     const int* tail;
     const double* w;
-    double* dist;  // (2, n) Jacobi buffers, sweep it reads dist[it & 1]
+    double* dist;  // (2, n) Jacobi buffers
     int* parent;
     int* jump;     // (2, n) pointer-jumping buffers
-    int* flags;    // (5,) dropped in sweep it -> flags[it % 3], 1 when stopped on a cycle, 1 on a bad index
+    int* flags;    // (5,) 3 dropped flags, cycle found, bad index
     uint8_t* on_cycle;
     int max_iters, steps;
 };
@@ -114,7 +112,7 @@ __global__ void sweep_kernel(Sweep s) {
         grid.sync();
         if (__ldcg(s.flags + 3)) break;
     }
-    // the last sweep wrote the second buffer: move the result to the first
+    // the result belongs in the first buffer
     if (it < s.max_iters ? (it & 1) == 0 : (it & 1) == 1)
         for (int v = tid; v < s.n; v += stride) s.dist[v] = __ldcg(s.dist + s.n + v);
 }
@@ -126,8 +124,8 @@ using namespace comfy::bellman_ford;
 
 extern "C" {
 
-// dist (2, n) holds the start distances in its first row and the result on return; parent -1, flags and on_cycle 0
-// on entry. flags[4] is set (and nothing done) when indptr or tail holds an index out of range.
+// dist (2, n): start distances in, result out, both in the first row. parent -1, flags and on_cycle 0 on entry.
+// Sets flags[4] and does nothing on an out-of-range index.
 void launch_bellman_ford(int n, int E, const void* indptr, const void* tail, const void* w, void* dist, void* parent,
                          void* jump, void* flags, void* on_cycle, int max_iters, cudaStream_t stream) {
     if (n <= 0 || max_iters <= 0) return;

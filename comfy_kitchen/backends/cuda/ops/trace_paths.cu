@@ -15,13 +15,11 @@
  * limitations under the License.
  */
 
-// Shortest paths read back from distance fields, one warp per row. From ends[r] the walk steps to the tail of an
-// in-arc whose tail distance + weight equals the current node's distance, taking the smallest tail distance and then
-// the largest tail id (the predecessor Dijkstra settles a node from); tails beyond reach[r] and stop nodes other than
-// starts[r] do not count. The walk ends at starts[r]; it fails at an unreached node, without a predecessor or after
-// N steps. Distances come from dense rows (R, N) or from sorted flat keys r * N + v with their values (+inf when
-// absent). The first pass records the path lengths, the second writes the nodes start -> end. Indices out of range
-// set *error.
+// Reads shortest paths back from distance fields, one warp per row: from ends[r], step to the in-arc tail whose
+// distance + weight matches, preferring the smallest distance and then the largest id (Dijkstra's predecessor).
+// Tails beyond reach[r] and stop nodes other than starts[r] are skipped; a walk with no predecessor fails.
+// Distances are dense rows (R, N) or sorted keys r * N + v with values (+inf when absent). A first pass counts
+// path lengths, a second writes the nodes. Out-of-range indices set *error.
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -41,12 +39,12 @@ struct Fields {
     const int* indptr;
     const int* tail;
     const double* w;
-    const long long* keys;  // sorted keys of values, null for dense rows
+    const long long* keys;  // sorted, null for dense rows
     const double* values;
     const long long* starts;
     const long long* ends;
-    const double* reach;    // null for none
-    const uint8_t* stop;    // null for none
+    const double* reach;    // may be null
+    const uint8_t* stop;    // may be null
     int* error;
 };
 
@@ -64,7 +62,7 @@ __device__ __forceinline__ double dist_at(const Fields& f, int r, int v) {
     return lo < f.n_keys && f.keys[lo] == key ? f.values[lo] : INFINITY;
 }
 
-// lengths[r] = node count of the path (0 when there is none); with out, writes the nodes to out[offsets[r]:]
+// counts the path nodes into lengths, or with out, writes them to out[offsets[r]:]
 __global__ void walk_kernel(Fields f, int* lengths, const long long* offsets, long long* out) {
     const int r = blockIdx.x * kWarps + threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -75,7 +73,7 @@ __global__ void walk_kernel(Fields f, int* lengths, const long long* offsets, lo
         return;
     }
     const long long last = out ? offsets[r] + lengths[r] - 1 : 0;
-    int cur = static_cast<int>(end), steps = 0;               // cur -1 once the walk fails
+    int cur = static_cast<int>(end), steps = 0;               // -1 once the walk fails
     while (cur >= 0 && cur != start) {
         if (out && lane == 0) out[last - steps] = cur;
         const double dv = dist_at(f, r, cur);
@@ -128,7 +126,7 @@ using namespace comfy::trace_paths;
 
 extern "C" {
 
-// out null: fills lengths; otherwise writes the paths of those lengths into out at offsets (R,).
+// out null: fills lengths; otherwise writes the paths into out at offsets (R,).
 void launch_trace_paths(int R, int N, int E, long long n_keys, const void* indptr, const void* tail, const void* w,
                         const void* keys, const void* values, const void* starts, const void* ends, const void* reach,
                         const void* stop, void* error, void* lengths, const void* offsets, void* out,
