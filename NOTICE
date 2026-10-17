@@ -104,5 +104,12 @@ commit d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5.
 
 ================================================================================
 
+
+Register ConvRot256 CUDA layout
+------------------------------
+Derived from SGLang PR #38040, commit 3299804f81b686d3752287e19d9c9d2987d1afc1.
+Copyright 2026 SGLang Team. All Rights Reserved. License: Apache-2.0.
+Kitchen arithmetic association and BF16 quantization barriers are preserved.
+
 For full license texts of these dependencies, please refer to their respective
 project repositories or installation directories.
