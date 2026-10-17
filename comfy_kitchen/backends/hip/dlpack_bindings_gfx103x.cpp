@@ -347,6 +347,24 @@ void gfx103x_qk_int8_sv_attn(nb::ndarray<> query, nb::ndarray<> key, nb::ndarray
     require_ndim(k_scale, 3, fn, "k_scale");
     if (q_scale.size() > 0) {
         require_ndim(q_scale, 3, fn, "q_scale");
+    } else if (q_packed) {
+        // The empty form is only meaningful on the in-kernel-quantize path, where
+        // Q arrives as a source (q_fp), the kernel quantizes it and never reads a
+        // Q scale. With Q already packed the scale is what dequantizes it, and an
+        // empty tensor's data() is null -- so the kernel dereferences address zero
+        // and the whole context dies with an illegal memory access, at a
+        // synchronize the caller has no reason to connect to this call.
+        //
+        // Measured on the 6-CU gfx1035: packed Q with an empty q_scale faults
+        // (hipErrorIllegalAddress) while the same call with a [batch, heads, groups]
+        // scale returns finite values. The rank check above cannot see this, since
+        // there is no rank to be wrong on an empty buffer, and check_launch cannot
+        // either: the launch succeeds and the fault happens later on the device.
+        // Both real callers pair the empty form with a q_fp (rdna2_sageattn's
+        // skip_inq) or pass a real scale, so this is reachable only by a direct _C
+        // call -- which is the same reason the rank checks above exist.
+        fail(fn, "q_scale is required when Q is packed int8; an empty q_scale is only "
+                 "valid on the in-kernel-quantize path, which passes a Q source in q_fp");
     }
     // The pointers, not just the strides below. Both are needed for every call, and a
     // launcher that takes raw pointers cannot report a null one -- it dequantizes

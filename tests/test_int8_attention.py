@@ -37,6 +37,21 @@ skip_on_gfx1035_port = pytest.mark.skipif(
 )
 
 
+def _int8_decode_available() -> bool:
+    """Whether the paged INT8 decode kernels can run here.
+
+    Deliberately the decode module's own predicate rather than
+    ``requires_int8_attention``: the two disagree on exactly the device this
+    suite has to survive. int8 attention is available on RDNA2 through the
+    ported kernel, while the paged decode path is WMMA-only and traps there.
+    """
+    try:
+        from comfy_kitchen.int8_decode import is_available
+    except ImportError:
+        return False
+    return bool(is_available())
+
+
 def _head_dims(head_dims):
     """``head_dims`` minus the ones the RDNA2 port cannot instantiate.
 
@@ -1534,7 +1549,19 @@ def _call_use_direct(hip_backend, q, k, attn_mask):
     return hip_backend._sage_use_direct(q, k, attn_mask)
 
 
-@requires_int8_attention
+# The paged decode cache is a DIFFERENT capability from int8 attention, and
+# requires_int8_attention does not cover it. On RDNA2 int8 attention is available
+# through the ported SageAttention kernel, so that gate passes -- but the paged
+# path is a WMMA kernel that traps without matrix cores, so running it there
+# aborted the process rather than failing the test. Gate on the decode path's own
+# predicate instead, which is the one the class now enforces.
+requires_paged_int8_decode = pytest.mark.skipif(
+    not _int8_decode_available(),
+    reason="requires the paged INT8 decode kernels (WMMA-only; not available on RDNA2)",
+)
+
+
+@requires_paged_int8_decode
 @pytest.mark.parametrize("seq", [1, 6, 7])
 @pytest.mark.parametrize("circular", [False, True])
 def test_int8_decode_graph_growing_prefix_and_rollback(seq, circular):

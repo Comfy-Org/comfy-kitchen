@@ -249,7 +249,7 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
         // width ladder (COMFY_CONVROT_FUSED_BLOCK), M in {512, 1024, 2048, 4096,
         // 6144, 9216}. Best width and its gain over the dGPU heuristic:
         //
-        //   K=1024  ( 4 groups)  128    1.22x at M=512
+        //   K=1024  ( 4 groups)   64    see the re-measurement below
         //   K=1280  ( 5 groups)   64    2.33x / 2.92x / 2.98x  (M=1024/4096/6144)
         //   K=2048  ( 8 groups)   64    1.55x / 1.86x / 1.94x
         //   K=2560  (10 groups)   64    1.14x / 1.23x
@@ -265,14 +265,50 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
         // one process interleaving every width is the only way to read this on
         // this device.
         //
-        // **K=1024 is the one row the code does not follow.** It is folded into the
-        // groups <= 10 bucket and so launched at 64, not at the 128 the sweep found
-        // best. Left as it is on purpose: that row is the only one measured at a
-        // single M (512, where the gain is 1.22x) while every other row was agreed
-        // across several, and 128 at 4 groups against 64 at 5 is not the shape the
-        // "groups in flight" argument above predicts. Widening the gate is a
-        // re-measure, not a reading. It is also only a speed question -- the width
-        // changes no output bit, which tests/test_hip_convrot_quant_exact.py pins.
+        // **K=1024 is the one row the code does not follow, and re-measuring it
+        // says the code is right.** The table above lists 128 there, but 64 is
+        // what the `groups <= 10` bucket below answers, so the row and the code
+        // disagreed. Re-measured on this 6-CU gfx1035 in one process, 120 paired
+        // rounds x 24 back-to-back launches per round (one sync per round, so the
+        // host round-trip is amortized rather than timed), order rotated by round,
+        // canary arm included, outputs checked bit-identical at every width first.
+        // The override was verified live first -- convrot_fused_block reports the
+        // override under it, falls back to the heuristic on an uninstantiated
+        // width, and re-reads per launch -- so the widths really were different
+        // launches:
+        //
+        //   M=512    control 0.0842 ms, canary floor 1.0043x
+        //             64   0.0844 ms  1.0000x  (reproduces the control, as it must)
+        //             128  0.0846 ms  0.9954x  slower in 178/300 rounds, p=0.0015
+        //   M=1024..9216  128 measures 0.9949x-0.9960x of the control at every M
+        //
+        // So 128 is not 1.22x at M=512 here; it is ~0.5% slower, consistently
+        // enough across all six M that the direction is not in doubt. The row is
+        // corrected to 64 rather than the code widened, which is the fix the
+        // review of this table proposed and this measurement declines.
+        //
+        // **The positive controls did not reproduce either, so treat the whole
+        // table above as unreproduced rather than as refuted.** K=5120, where the
+        // table claims 256 wins by 1.27x, measures every width in the ladder
+        // within 0.5% of every other. The likely reason is that this part is
+        // bandwidth-starved in its present state: it sustains ~3.5-5 GB/s on a
+        // plain device-to-device copy, and the fused quantizer already runs at
+        // 4.4-4.6 GB/s -- 88-92% of that ceiling -- so width has nothing left to
+        // trade. Sampling rocm-smi under load shows sclk boosting to 2200 MHz
+        // while mclk stays pinned at 800 MHz, its lowest level (--showmclkrange
+        // reports no range on this part), which is what bounds the bus. A
+        // bandwidth-bound kernel cannot show the gains this table records, so
+        // either those were taken with memory clocked higher, or the conditions
+        // changed since. This does NOT establish the table wrong; it establishes
+        // that it does not reproduce here and should be re-measured on a part
+        // whose memory clock actually moves before anything here is changed on
+        // the strength of it.
+        //
+        // The heuristic is left exactly as it is either way: it is the safe
+        // answer, and where the widths tie, a tie is not a reason to retune.
+        //
+        // Either way it is only a speed question -- the width changes no output
+        // bit, which tests/test_hip_convrot_quant_exact.py pins at every width.
         const int groups = K / kConvRotGroup256;
         if (K == 10240) {
             return 640;
