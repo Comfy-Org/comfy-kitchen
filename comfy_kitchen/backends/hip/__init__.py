@@ -846,6 +846,11 @@ def fp16_linear(
 _HIP_FUSED_ACTS = (None, "none", "gelu_tanh", "swiglu")
 
 
+def _use_tiled_int8(m: int, n: int, k: int, device: torch.device) -> bool:
+    # Keep the small-M GEMV and the narrow/partial-K row-major tiles.
+    return m > 8 and n > 64 and k > 0 and k % 128 == 0 and _has_nonduplicated_wmma(device)
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -895,6 +900,7 @@ def int8_linear(
     m = x2d.shape[0]
     k = k_act
     n = weight.shape[0]
+    tiled = _use_tiled_int8(m, n, k, x.device)
 
     # The WMMA K-step and the small-M GEMV both read a row 16 bytes at a time.
     if k % 16 != 0:
@@ -911,23 +917,27 @@ def int8_linear(
             k, convrot_groupsize, x.device, x.dtype, int8_global_spill=True
         ):
             return _eager.int8_linear(
-                x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
+                x2d.reshape(*orig_shape[:-1], x2d.shape[-1]),
+                weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
                 input_act=input_act, residual=residual, residual_scale=residual_scale,
             )
         q, x_scale = _rotate_quant_int8(
-            x2d, convrot_groupsize, input_act, act_weight, input_act_eps)
+            x2d, convrot_groupsize, input_act, act_weight, input_act_eps,
+            tiled_output=tiled)
     else:
         x2d = _apply_input_act(x2d, input_act)
-        q = torch.empty((m, k), dtype=torch.int8, device=x.device)
+        q_rows = (m + 127) // 128 * 128 if tiled else m
+        q = torch.empty((q_rows, k), dtype=torch.int8, device=x.device)
         x_scale = torch.empty((m,), dtype=torch.float32, device=x.device)
-        _C.quantize_int8_rowwise(_dl(x2d), _dl(q), _dl(x_scale), m, k, _stream(x))
+        _C.quantize_int8_rowwise(_dl(x2d), _dl(q), _dl(x_scale), m, k, _stream(x), tiled)
 
     x_scale = x_scale.reshape(-1).contiguous()
     if bias is not None:
         bias = _bias_operand(bias, n, x.device)
 
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
-    _C.int8_gemm(
+    gemm = _C.int8_gemm_a_tiled128 if tiled else _C.int8_gemm
+    gemm(
         _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
         0 if weight_scale.numel() == 1 else 1,
         None if bias is None else _dl(bias), m, n, k,
@@ -1043,11 +1053,13 @@ def int8_linear_modulated(
     if bias is not None:
         bias = _bias_operand(bias, n, x.device)
 
+    tiled = _use_tiled_int8(m, n, k, x.device)
     q, x_scale = _rotate_quant_int8_modulated(
-        x2d, modulation_scale, convrot_groupsize
+        x2d, modulation_scale, convrot_groupsize, tiled_output=tiled,
     )
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
-    _C.int8_gemm(
+    gemm = _C.int8_gemm_a_tiled128 if tiled else _C.int8_gemm
+    gemm(
         _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
         0 if weight_scale.numel() == 1 else 1,
         None if bias is None else _dl(bias),
@@ -1117,11 +1129,14 @@ def int8_linear_rms_modulated(
     if bias is not None:
         bias = _bias_operand(bias, n, x.device)
 
+    tiled = _use_tiled_int8(m, n, k, x.device)
     q, x_scale = _rotate_quant_int8_rms_modulated(
-        x2d, norm_weight, norm_eps, modulation_scale, convrot_groupsize
+        x2d, norm_weight, norm_eps, modulation_scale, convrot_groupsize,
+        tiled_output=tiled,
     )
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
-    _C.int8_gemm(
+    gemm = _C.int8_gemm_a_tiled128 if tiled else _C.int8_gemm
+    gemm(
         _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
         0 if weight_scale.numel() == 1 else 1,
         None if bias is None else _dl(bias),

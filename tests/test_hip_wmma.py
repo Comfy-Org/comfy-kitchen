@@ -114,7 +114,7 @@ def test_scaled_mm_fp8_matches_reference(hip, m, n, k, bias):
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize(("m", "n", "k"), GEMM_SHAPES)
+@pytest.mark.parametrize(("m", "n", "k"), GEMM_SHAPES + [(257, 137, 1024)])
 @pytest.mark.parametrize("per_channel", [False, True])
 @needs_wmma
 def test_int8_linear_matches_eager(m, n, k, per_channel):
@@ -158,11 +158,11 @@ def test_int8_linear_convrot_matches_eager():
 
 
 @needs_wmma
-@pytest.mark.parametrize("k", [3840, 10240, 32768])
-def test_int8_linear_convrot_large_k_matches_eager(k):
+@pytest.mark.parametrize(("m", "k"), [(64, 3840), (64, 10240), (64, 32768), (513, 32768)])
+def test_int8_linear_convrot_large_k_matches_eager(m, k):
     """G=256 INT8 convrot: fused (3840, 10240), global spill (32768) vs eager."""
     torch.manual_seed(k)
-    m, n = 64, 256
+    n = 256
     x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
     w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16)
     wq, ws = ck.quantize_int8_rowwise(w)
@@ -176,6 +176,32 @@ def test_int8_linear_convrot_large_k_matches_eager(k):
 
     scale = ref.float().abs().max().item()
     assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
+
+
+@needs_wmma
+@pytest.mark.parametrize(("m", "k"), [(9, 3840), (511, 10240), (512, 10240), (513, 10240),
+                                       (129, 12288), (129, 14336), (3073, 14336)])
+def test_gfx12_swiglu_preserves_float_intermediates(hip, m, k):
+    skip_unless_gfx12_wmma()
+
+    n = 128
+    gate = torch.full((m, k), 0.5, device=DEV, dtype=torch.bfloat16)
+    up = torch.full_like(gate, 0.75)
+    weight = torch.zeros((n, k), device=DEV, dtype=torch.int8)
+    weight[:, 0] = 1
+    weight_scale = torch.ones(n, device=DEV, dtype=torch.float32)
+
+    with ck.use_backend("hip"):
+        output = ck.int8_linear(
+            torch.cat((gate, up), dim=-1), weight, weight_scale, None, torch.bfloat16,
+            convrot=True, convrot_groupsize=256, input_act="swiglu",
+        )
+
+    # Regular Hadamard rows sum to one, so a constant row is unchanged by
+    # rotation. The unit projection recovers its BF16-rounded value exactly.
+    # round_bf16(silu(0.5) * 0.75) = 0.2333984375; rounding SiLU first gives
+    # 0.232421875 instead. This distinguishes fused from eager arithmetic.
+    assert torch.equal(output, torch.full_like(output, 0.2333984375))
 
 
 @needs_wmma
