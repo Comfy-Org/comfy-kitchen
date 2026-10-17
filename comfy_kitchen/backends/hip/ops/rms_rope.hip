@@ -325,7 +325,8 @@ constexpr int kRmsRopeVecThreads = 256;
 template <typename T>
 __forceinline__ __device__ void load4(const void* p, int64_t i, float (&o)[4]) {
     const uint2 pack = *reinterpret_cast<const uint2*>(static_cast<const T*>(p) + i);
-    const T* e = reinterpret_cast<const T*>(&pack);
+    T e[4];
+    __builtin_memcpy(e, &pack, sizeof(pack));  // no T/uint2 type punning
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         if constexpr (std::is_same_v<T, __half>) {
@@ -347,7 +348,9 @@ __forceinline__ __device__ void store4(T* p, int64_t i, const float (&v)[4]) {
             e[j] = static_cast<__bf16>(v[j]);
         }
     }
-    *reinterpret_cast<uint2*>(p + i) = *reinterpret_cast<const uint2*>(e);
+    uint2 pack;
+    __builtin_memcpy(&pack, e, sizeof(pack));
+    *reinterpret_cast<uint2*>(p + i) = pack;
 }
 
 template <typename T, int TPR>
