@@ -39,7 +39,7 @@ void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* 
                              hipStream_t stream);
 
 // A is physically [M_tile, K_tile, 128, 128]; B is row-major.
-void launch_int8_gemm_a_tiled128_down_kernel(
+void launch_int8_gemm_a_tiled128_kernel(
     const void* a, const void* b, void* c, const void* scale_a,
     const void* scale_b, int scale_b_stride, const void* bias,
     int bias_code, int M, int N, int K, int ldc, int out_code,

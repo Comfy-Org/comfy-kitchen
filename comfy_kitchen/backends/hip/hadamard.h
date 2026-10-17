@@ -28,6 +28,15 @@ namespace comfy::hip_backend {
 typedef __bf16 convrot_bf16x2 __attribute__((ext_vector_type(2)));
 typedef __bf16 convrot_bf16x4 __attribute__((ext_vector_type(4)));
 
+template <bool TILED>
+__forceinline__ __device__ int64_t int8_quant_index(int row, int col, int K) {
+    if constexpr (TILED) {
+        return static_cast<int64_t>(row / 128) * K * 128 +
+               (col / 128) * 16384 + (row % 128) * 128 + col % 128;
+    }
+    return static_cast<int64_t>(row) * K + col;
+}
+
 // convrot_quant_kernel handles 256/G groups per pass and rotates in log4(G)
 // stages, so a G outside this set either divides to a zero-width pass or is not
 // a power of four. The dispatch wrappers fall back to eager before reaching here.
@@ -501,7 +510,7 @@ __global__ __launch_bounds__(GROUPS_PER_BLOCK* 64) void convrot_rotate_groups64_
 
 // Global spill pass 2: fold per-group absmax into the row scale, then quantize the
 // rotated row already in global memory (pass 1 is convrot_rotate_groups64_amax_kernel).
-template <typename RowT, int BLOCK_THREADS>
+template <typename RowT, int BLOCK_THREADS, bool TILED_QOUT>
 __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_from_partials_kernel(
     const RowT* __restrict__ rotated, const float* __restrict__ partial_absmax,
     int8_t* __restrict__ qout, float* __restrict__ scaleout, int K) {
@@ -531,11 +540,11 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_from_partials_ker
         const float v = load_row_value<RowT>(rotated[row_offset + col]);
         int q = static_cast<int>(rintf(v * inv));
         q = q < -127 ? -127 : (q > 127 ? 127 : q);
-        qout[row_offset + col] = static_cast<int8_t>(q);
+        qout[int8_quant_index<TILED_QOUT>(row, col, K)] = static_cast<int8_t>(q);
     }
 }
 
-template <typename RowT, int ACT>
+template <typename RowT, int ACT, bool TILED_QOUT = false>
 inline void launch_convrot_quant_global(
     const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
     RowT* rotated, float* partial_absmax, hipStream_t stream) {
@@ -549,22 +558,22 @@ inline void launch_convrot_quant_global(
 
     const int quant_threads = K >= 4096 ? 512 : 256;
     if (quant_threads == 512) {
-        convrot_quant_from_partials_kernel<RowT, 512>
+        convrot_quant_from_partials_kernel<RowT, 512, TILED_QOUT>
             <<<M, 512, 0, stream>>>(rotated, partial_absmax, qout, scaleout, K);
     } else {
-        convrot_quant_from_partials_kernel<RowT, 256>
+        convrot_quant_from_partials_kernel<RowT, 256, TILED_QOUT>
             <<<M, 256, 0, stream>>>(rotated, partial_absmax, qout, scaleout, K);
     }
 }
 
-template <int ACT>
+template <int ACT, bool TILED_QOUT = false>
 void launch_convrot_quant_global_managed(
     const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K, hipStream_t stream,
     void* spill_rotated, void* spill_partials);
 
 // Fused single-kernel path: FHT in LDS, vectorized loads, warp-shuffle absmax.
 // One block per row; the rotated row stays in shared memory as RowT.
-template <typename RowT, int BLOCK_THREADS, int ACT>
+template <typename RowT, int BLOCK_THREADS, int ACT, bool TILED_QOUT = false>
 __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     const void* __restrict__ x, int in_dtype, int8_t* __restrict__ qout,
     float* __restrict__ scaleout, int M, int K, const void* __restrict__ act_weight,
@@ -674,11 +683,11 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
         const float v = load_row_value(row_buf[col]);
         int q = static_cast<int>(rintf(v * inv));
         q = q < -127 ? -127 : (q > 127 ? 127 : q);
-        qout[row_offset + col] = static_cast<int8_t>(q);
+        qout[int8_quant_index<TILED_QOUT>(row, col, K)] = static_cast<int8_t>(q);
     }
 }
 
-template <typename RowT, int ACT, int BLOCK_THREADS>
+template <typename RowT, int ACT, int BLOCK_THREADS, bool TILED_QOUT>
 inline bool launch_convrot_quant_fused_impl(
     const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
     const void* act_weight, float act_eps, hipStream_t stream) {
@@ -686,7 +695,7 @@ inline bool launch_convrot_quant_fused_impl(
     const size_t shmem =
         static_cast<size_t>(K) * sizeof(RowT) +
         static_cast<size_t>(groups_in_flight) * 2 * kConvRotGroup256 * sizeof(float);
-    auto kernel = convrot_quant_fused_kernel<RowT, BLOCK_THREADS, ACT>;
+    auto kernel = convrot_quant_fused_kernel<RowT, BLOCK_THREADS, ACT, TILED_QOUT>;
     const hipError_t attr_err = hipFuncSetAttribute(
         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(shmem));
@@ -698,7 +707,7 @@ inline bool launch_convrot_quant_fused_impl(
     return hipGetLastError() == hipSuccess;
 }
 
-template <typename RowT, int ACT>
+template <typename RowT, int ACT, bool TILED_QOUT>
 struct LaunchConvrotQuantFusedForBlock {
     const void* x;
     int in_dtype;
@@ -713,12 +722,12 @@ struct LaunchConvrotQuantFusedForBlock {
 
     template <int BLOCK_THREADS>
     void operator()() const {
-        *launched = launch_convrot_quant_fused_impl<RowT, ACT, BLOCK_THREADS>(
+        *launched = launch_convrot_quant_fused_impl<RowT, ACT, BLOCK_THREADS, TILED_QOUT>(
             x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream);
     }
 };
 
-template <int ACT>
+template <int ACT, bool TILED_QOUT = false>
 struct LaunchConvrotQuantFusedForRow {
     const void* x;
     int in_dtype;
@@ -736,12 +745,12 @@ struct LaunchConvrotQuantFusedForRow {
     void operator()() const {
         dispatch_convrot_fused_block_threads(
             block_threads,
-            LaunchConvrotQuantFusedForBlock<RowT, ACT>{
+            LaunchConvrotQuantFusedForBlock<RowT, ACT, TILED_QOUT>{
                 x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream, launched});
     }
 };
 
-template <typename RowT, bool PACK_INT4, int ACT, int BLOCK_THREADS>
+template <typename RowT, bool PACK_INT4, int ACT, int BLOCK_THREADS, bool TILED_QOUT>
 __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_kernel(
     const void* __restrict__ x, int in_dtype,
     int8_t* __restrict__ qout, float* __restrict__ scaleout,
@@ -826,7 +835,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_kernel(
             const float v = load_row_value(rowbuf[j]);
             int q = static_cast<int>(rintf(v * inv));
             q = q < -127 ? -127 : (q > 127 ? 127 : q);
-            qout[static_cast<int64_t>(row) * K + j] = static_cast<int8_t>(q);
+            qout[int8_quant_index<TILED_QOUT>(row, j, K)] = static_cast<int8_t>(q);
         }
     }
 }
@@ -835,8 +844,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_kernel(
 // two radix-4 stages; the rest use ping-pong LDS (512 threads, two values each,
 // two barriers). Bank-aligned FP32 LDS. Not an arch-specific WMMA path; keep
 // separate from convrot_quant_kernel for other shapes and devices.
-template <int ACT, bool TILED_QOUT = false,
-          bool MODULATE = false, bool RMSNORM = false,
+template <int ACT, bool TILED_QOUT = false, bool MODULATE = false, bool RMSNORM = false,
           bool PACKED_ELEMENT_SCHEDULE = false>
 __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
     const void* __restrict__ x, const void* __restrict__ auxiliary, int in_dtype,
@@ -876,7 +884,7 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
     const int element = t % kGroup;
     const int group_count = K / kGroup;
     // Tile-major INT8 output is [M_tile, K_tile, row_in_tile, K_in_tile],
-    // so the tile-major down GEMM reads each 128x128 tile contiguously.
+    // so the GEMM reads each 128x128 activation tile contiguously.
     const int64_t qout_row_base = TILED_QOUT
         ? static_cast<int64_t>(row >> 7) * K * 128 + (row & 127) * 128
         : static_cast<int64_t>(row) * K;
@@ -1247,25 +1255,26 @@ inline bool convrot_512x2_supported(int K) {
         static_cast<size_t>(lds_bytes);
 }
 
+template <bool TILED_QOUT = false>
 inline void launch_convrot_quant_512x2_bf16_modulated(
     const void* x, const void* modulation_scale,
     int8_t* qout, float* scaleout, int M, int K, hipStream_t stream) {
-    convrot_quant_512x2_bf16_kernel<kActNone, false, true>
+    convrot_quant_512x2_bf16_kernel<kActNone, TILED_QOUT, true>
         <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
             x, modulation_scale, 2, qout, scaleout, M, K);
 }
 
-template <typename RowT, bool PACK_INT4, int ACT, int BLOCK_THREADS>
+template <typename RowT, bool PACK_INT4, int ACT, int BLOCK_THREADS, bool TILED_QOUT>
 inline void launch_convrot_quant_impl(
     const void* x, int in_dtype, int8_t* qout, float* scaleout,
     int M, int K, int group_size, hipStream_t stream) {
 
     const size_t shmem = static_cast<size_t>(K) * convrot_row_element_size(in_dtype);
-    convrot_quant_kernel<RowT, PACK_INT4, ACT, BLOCK_THREADS><<<M, BLOCK_THREADS, shmem, stream>>>(
+    convrot_quant_kernel<RowT, PACK_INT4, ACT, BLOCK_THREADS, TILED_QOUT><<<M, BLOCK_THREADS, shmem, stream>>>(
         x, in_dtype, qout, scaleout, M, K, group_size);
 }
 
-template <bool PACK_INT4, int ACT, int BLOCK_THREADS>
+template <bool PACK_INT4, int ACT, int BLOCK_THREADS, bool TILED_QOUT>
 struct LaunchConvrotQuantLegacyForBlock {
     const void* x;
     int in_dtype;
@@ -1278,26 +1287,27 @@ struct LaunchConvrotQuantLegacyForBlock {
 
     template <typename RowT>
     void operator()() const {
-        launch_convrot_quant_impl<RowT, PACK_INT4, ACT, BLOCK_THREADS>(
+        launch_convrot_quant_impl<RowT, PACK_INT4, ACT, BLOCK_THREADS, TILED_QOUT>(
             x, in_dtype, qout, scaleout, M, K, group_size, stream);
     }
 };
 
-template <bool PACK_INT4, int ACT, int BLOCK_THREADS>
+template <bool PACK_INT4, int ACT, int BLOCK_THREADS, bool TILED_QOUT>
 inline void launch_convrot_quant_for_block(
     const void* x, int in_dtype, int8_t* qout, float* scaleout,
     int M, int K, int group_size, hipStream_t stream) {
     dispatch_convrot_row_type(
         in_dtype,
-        LaunchConvrotQuantLegacyForBlock<PACK_INT4, ACT, BLOCK_THREADS>{
+        LaunchConvrotQuantLegacyForBlock<PACK_INT4, ACT, BLOCK_THREADS, TILED_QOUT>{
             x, in_dtype, qout, scaleout, M, K, group_size, stream});
 }
 
-template <bool PACK_INT4, int ACT = kActNone>
+template <bool PACK_INT4, int ACT = kActNone, bool TILED_QOUT = false>
 inline void launch_convrot_quant(
     const void* x, int in_dtype, int8_t* qout, float* scaleout,
     int M, int K, int group_size, hipStream_t stream,
     void* spill_rotated = nullptr, void* spill_partials = nullptr) {
+    static_assert(!PACK_INT4 || !TILED_QOUT);
 
     // INT8 G=256: fused when (M, K) fits in LDS, else caller-owned global spill.
     if (!PACK_INT4 && group_size == 256) {
@@ -1306,7 +1316,7 @@ inline void launch_convrot_quant(
             bool launched = false;
             dispatch_convrot_row_type(
                 in_dtype,
-                LaunchConvrotQuantFusedForRow<ACT>{
+                LaunchConvrotQuantFusedForRow<ACT, TILED_QOUT>{
                     x, in_dtype, qout, scaleout, M, K, nullptr, 0.0f, stream, block_threads,
                     &launched});
             if (launched) {
@@ -1317,7 +1327,7 @@ inline void launch_convrot_quant(
             throw std::runtime_error(
                 "convrot global spill requires caller-provided workspace buffers");
         }
-        launch_convrot_quant_global_managed<ACT>(
+        launch_convrot_quant_global_managed<ACT, TILED_QOUT>(
             x, in_dtype, qout, scaleout, M, K, stream, spill_rotated, spill_partials);
         return;
     }
@@ -1327,10 +1337,10 @@ inline void launch_convrot_quant(
     // 256 threads for occupancy on narrow K.
     const int block_threads = (group_size == 256 && K >= 512) ? 1024 : 256;
     if (block_threads == 1024) {
-        launch_convrot_quant_for_block<PACK_INT4, ACT, 1024>(
+        launch_convrot_quant_for_block<PACK_INT4, ACT, 1024, TILED_QOUT>(
             x, in_dtype, qout, scaleout, M, K, group_size, stream);
     } else {
-        launch_convrot_quant_for_block<PACK_INT4, ACT, 256>(
+        launch_convrot_quant_for_block<PACK_INT4, ACT, 256, TILED_QOUT>(
             x, in_dtype, qout, scaleout, M, K, group_size, stream);
     }
 }
@@ -1338,6 +1348,7 @@ inline void launch_convrot_quant(
 // INT8 G=256 with the row's RMSNorm folded in. Only the fused kernel implements it;
 // the Python layer applies the norm eagerly wherever convrot_int8_needs_spill says
 // that kernel will not run.
+template <bool TILED_QOUT = false>
 inline void launch_convrot_quant_rms_norm(
     const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
     const void* act_weight, float act_eps, hipStream_t stream) {
@@ -1349,7 +1360,7 @@ inline void launch_convrot_quant_rms_norm(
     if (block_threads > 0) {
         dispatch_convrot_row_type(
             in_dtype,
-            LaunchConvrotQuantFusedForRow<kActRmsNorm>{
+            LaunchConvrotQuantFusedForRow<kActRmsNorm, TILED_QOUT>{
                 x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream, block_threads,
                 &launched});
     }

@@ -348,7 +348,7 @@ def test_int8_generic_tiled_a_is_exact(hip):
         hip._dl(scale_b), 1, None, m, n, k,
         hip.DTYPE_TO_CODE[torch.bfloat16], stream,
     )
-    hip._C.int8_gemm_a_tiled128_down(
+    hip._C.int8_gemm_a_tiled128(
         hip._dl(tiled_a), hip._dl(b), hip._dl(row_major),
         hip._dl(tiled_scale_a), hip._dl(scale_b), 1, None, m, n, k,
         hip.DTYPE_TO_CODE[torch.bfloat16], stream,
@@ -3421,7 +3421,8 @@ def test_convrot_wide_global_is_exact_to_fused_lds(hip):
 
 
 @needs_wmma
-def test_convrot_wide_spill_chunks_are_exact(hip, monkeypatch):
+@pytest.mark.parametrize("tiled", [False, True])
+def test_convrot_wide_spill_chunks_are_exact(hip, monkeypatch, tiled):
     """Bounded row chunks write into the caller's q and scales in place."""
     torch.manual_seed(41)
     m, k = 257, 32768
@@ -3440,8 +3441,11 @@ def test_convrot_wide_spill_chunks_are_exact(hip, monkeypatch):
     )
     # 190 rows fit this cap, so the call runs two chunks of 129 and 128 rows;
     # the second chunk's scales slice starts at a 4-byte (not 16-byte) offset.
+    # Tiled output uses whole-tile chunks followed by a one-row tail instead.
     monkeypatch.setattr(hip, "_CONVROT_SPILL_WORKSPACE_BYTES", 12 << 20)
-    actual_q, actual_scales = hip._rotate_quant_int8(x, 256, "gelu_tanh")
+    actual_q, actual_scales = hip._rotate_quant_int8(x, 256, "gelu_tanh", tiled_output=tiled)
+    if tiled:
+        actual_q = actual_q.reshape(-1, k // 128, 128, 128).permute(0, 2, 1, 3).reshape(-1, k)[:m]
     torch.cuda.synchronize()
 
     assert torch.equal(actual_q, expected_q)

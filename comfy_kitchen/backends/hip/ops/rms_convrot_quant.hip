@@ -12,7 +12,7 @@
 extern "C" void launch_quantize_int8_convrot_rms_modulated_fused_stats_kernel(
     const void* x, const void* norm_weight, const void* modulation_scale,
     void* q, void* scales, int M, int K, int group_size, float eps,
-    hipStream_t stream) {
+    bool tiled_output, hipStream_t stream) {
 
     using namespace comfy::hip_backend;
     if (K != 3840 || group_size != 256) {
@@ -27,9 +27,15 @@ extern "C" void launch_quantize_int8_convrot_rms_modulated_fused_stats_kernel(
     if (M == 0) return;
 
     // <ACT, TILED_QOUT, MODULATE, RMSNORM, PACKED_ELEMENT_SCHEDULE>
-    convrot_quant_512x2_bf16_kernel<
-        kActNone, false, true, true, true>
-        <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
-            x, modulation_scale, 2, static_cast<int8_t*>(q),
-            static_cast<float*>(scales), M, K, norm_weight, eps);
+    if (tiled_output) {
+        convrot_quant_512x2_bf16_kernel<kActNone, true, true, true, true>
+            <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
+                x, modulation_scale, 2, static_cast<int8_t*>(q),
+                static_cast<float*>(scales), M, K, norm_weight, eps);
+    } else {
+        convrot_quant_512x2_bf16_kernel<kActNone, false, true, true, true>
+            <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
+                x, modulation_scale, 2, static_cast<int8_t*>(q),
+                static_cast<float*>(scales), M, K, norm_weight, eps);
+    }
 }

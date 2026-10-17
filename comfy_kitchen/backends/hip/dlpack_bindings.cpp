@@ -54,14 +54,14 @@ bool launch_fp16_conv3d_kernel(const void*, const void*, const void*, const void
                                int, int, int, int, int, int, int, int, int, int, int, int, int,
                                int, int, int, int, hipStream_t);
 
-void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, hipStream_t);
+void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, bool, hipStream_t);
 void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
-                                         int, int, const void*, float, hipStream_t);
+                                         int, int, const void*, float, bool, hipStream_t);
 void launch_quantize_int8_convrot_modulated_kernel(
-    const void*, const void*, void*, void*, int, int, int, hipStream_t);
+    const void*, const void*, void*, void*, int, int, int, bool, hipStream_t);
 void launch_quantize_int8_convrot_rms_modulated_fused_stats_kernel(
     const void*, const void*, const void*, void*, void*, int, int, int,
-    float, hipStream_t);
+    float, bool, hipStream_t);
 void launch_quantize_int8_tensorwise_kernel(const void*, int, void*, void*, void*, int64_t,
                                             hipStream_t);
 void launch_dequantize_int8_simple_kernel(const void*, const void*, void*, int64_t, int64_t, int,
@@ -427,11 +427,11 @@ void rms_gated_residual_bf16(
     check_hip_launch();
 }
 
-void int8_gemm_a_tiled128_down(
+void int8_gemm_a_tiled128(
     nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c,
     nb::ndarray<> scale_a, nb::ndarray<> scale_b, int scale_b_stride,
     OptArray bias, int M, int N, int K, int out_code, uintptr_t stream_ptr) {
-    constexpr const char* kFn = "int8_gemm_a_tiled128_down";
+    constexpr const char* kFn = "int8_gemm_a_tiled128";
     if (scale_b_stride != 0 && scale_b_stride != 1) {
         throw std::runtime_error(std::string(kFn) +
                                  ": scale_b_stride must be 0 or 1");
@@ -439,10 +439,10 @@ void int8_gemm_a_tiled128_down(
     require_nonneg(M, kFn, "M");
     require_nonneg(N, kFn, "N");
     require_nonneg(K, kFn, "K");
-    if (N <= 0 || K <= 0 || N % 128 != 0 || K % 128 != 0) {
+    if (N <= 0 || K <= 0 || K % 128 != 0) {
         throw std::runtime_error(
             std::string(kFn) +
-            ": requires positive N and K divisible by 128");
+            ": requires positive N/K and K divisible by 128");
     }
     require_dtype(a, 4, 4, kFn, "a");
     require_dtype(b, 4, 4, kFn, "b");
@@ -457,7 +457,7 @@ void int8_gemm_a_tiled128_down(
                       kFn, "scale_b");
     require_bias(bias, N, kFn);
 
-    launch_int8_gemm_a_tiled128_down_kernel(
+    launch_int8_gemm_a_tiled128_kernel(
         a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(),
         scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, N,
         out_code, reinterpret_cast<hipStream_t>(stream_ptr));
@@ -597,18 +597,19 @@ static void require_convrot_group(int k, int group_size, const char* fn) {
 }
 
 void quantize_int8_rowwise(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales, int M, int K,
-                           uintptr_t stream_ptr) {
+                           uintptr_t stream_ptr, bool tiled_output = false) {
     constexpr const char* kFn = "quantize_int8_rowwise";
     require_nonneg(M, kFn, "M");
     require_nonneg(K, kFn, "K");
     require_dtype(x, 0, 2, kFn, "x");
     require_dtype(q, 4, 4, kFn, "q");
     require_len(x, static_cast<int64_t>(M) * K, kFn, "x");
-    require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
+    const int64_t q_rows = tiled_output ? (static_cast<int64_t>(M) + 127) / 128 * 128 : M;
+    require_len(q, q_rows * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
 
     launch_quantize_int8_rowwise_kernel(x.data(), map_dtype_to_code(x.dtype()), q.data(),
-                                        scales.data(), M, K,
+                                        scales.data(), M, K, tiled_output,
                                         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
@@ -618,7 +619,8 @@ void quantize_int8_rowwise(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
 void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales,
                            OptArray spill_rotated, OptArray spill_partials, int M, int K,
                            int group_size, int act_code, uintptr_t stream_ptr,
-                           OptArray act_weight = std::nullopt, float act_eps = 0.0f) {
+                           OptArray act_weight = std::nullopt, float act_eps = 0.0f,
+                           bool tiled_output = false) {
     constexpr const char* kFn = "quantize_int8_convrot";
     require_nonneg(M, kFn, "M");
     require_convrot_group(K, group_size, kFn);
@@ -628,7 +630,8 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
     // reads a [gate | up] row twice as wide. The launcher rejects unknown codes.
     const int64_t in_width = act_code == 2 ? 2 : 1;
     require_len(x, static_cast<int64_t>(M) * K * in_width, kFn, "x");
-    require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
+    const int64_t q_rows = tiled_output ? (static_cast<int64_t>(M) + 127) / 128 * 128 : M;
+    require_len(q, q_rows * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
     require_packed_contiguous(x, kFn, "x");
     require_packed_contiguous(q, kFn, "q");
@@ -673,6 +676,7 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
                                         scales.data(), spill_rotated_ptr, spill_partials_ptr, M, K,
                                         group_size, act_code,
                                         act_code == 3 ? act_weight->data() : nullptr, act_eps,
+                                        tiled_output,
                                         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
@@ -680,7 +684,7 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
 void quantize_int8_convrot_modulated(
     nb::ndarray<> x, nb::ndarray<> modulation_scale, nb::ndarray<> q,
     nb::ndarray<> scales, int M, int K, int group_size,
-    uintptr_t stream_ptr) {
+    uintptr_t stream_ptr, bool tiled_output = false) {
     constexpr const char* kFn = "quantize_int8_convrot_modulated";
     require_nonneg(M, kFn, "M");
     require_convrot_group(K, group_size, kFn);
@@ -690,7 +694,8 @@ void quantize_int8_convrot_modulated(
     require_len(x, static_cast<int64_t>(M) * K, kFn, "x");
     require_len(modulation_scale, static_cast<int64_t>(K), kFn,
                 "modulation_scale");
-    require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
+    const int64_t q_rows = tiled_output ? (static_cast<int64_t>(M) + 127) / 128 * 128 : M;
+    require_len(q, q_rows * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
     require_packed_contiguous(x, kFn, "x");
     require_packed_contiguous(modulation_scale, kFn, "modulation_scale");
@@ -707,14 +712,15 @@ void quantize_int8_convrot_modulated(
 
     launch_quantize_int8_convrot_modulated_kernel(
         x.data(), modulation_scale.data(), q.data(), scales.data(),
-        M, K, group_size, reinterpret_cast<hipStream_t>(stream_ptr));
+        M, K, group_size, tiled_output, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
 void quantize_int8_convrot_rms_modulated_fused_stats(
     nb::ndarray<> x, nb::ndarray<> norm_weight,
     nb::ndarray<> modulation_scale, nb::ndarray<> q, nb::ndarray<> scales,
-    int M, int K, int group_size, float eps, uintptr_t stream_ptr) {
+    int M, int K, int group_size, float eps, uintptr_t stream_ptr,
+    bool tiled_output = false) {
     constexpr const char* kFn =
         "quantize_int8_convrot_rms_modulated_fused_stats";
     require_nonneg(M, kFn, "M");
@@ -726,7 +732,8 @@ void quantize_int8_convrot_rms_modulated_fused_stats(
     require_len(x, static_cast<int64_t>(M) * K, kFn, "x");
     require_len(norm_weight, K, kFn, "norm_weight");
     require_len(modulation_scale, K, kFn, "modulation_scale");
-    require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
+    const int64_t q_rows = tiled_output ? (static_cast<int64_t>(M) + 127) / 128 * 128 : M;
+    require_len(q, q_rows * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
     require_packed_contiguous(x, kFn, "x");
     require_packed_contiguous(norm_weight, kFn, "norm_weight");
@@ -743,7 +750,7 @@ void quantize_int8_convrot_rms_modulated_fused_stats(
     }
     launch_quantize_int8_convrot_rms_modulated_fused_stats_kernel(
         x.data(), norm_weight.data(), modulation_scale.data(), q.data(),
-        scales.data(), M, K, group_size, eps,
+        scales.data(), M, K, group_size, eps, tiled_output,
         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
@@ -2507,7 +2514,7 @@ NB_MODULE(_C, m) {
     m.def("scaled_mm_fp8", &scaled_mm_fp8);
     m.def("int8_gemm", &int8_gemm);
     m.def("rms_gated_residual_bf16", &rms_gated_residual_bf16);
-    m.def("int8_gemm_a_tiled128_down", &int8_gemm_a_tiled128_down);
+    m.def("int8_gemm_a_tiled128", &int8_gemm_a_tiled128);
     m.def("convrot_w4a4_gemm", &convrot_w4a4_gemm);
     m.def("fp16_gemm", &fp16_gemm, nb::arg("a"), nb::arg("b"), nb::arg("d"),
           nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),
@@ -2517,14 +2524,23 @@ NB_MODULE(_C, m) {
           nb::arg("W"), nb::arg("C"), nb::arg("K"), nb::arg("T"), nb::arg("R"), nb::arg("S"),
           nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("stream_ptr"), nb::arg("xs_w") = 0,
           nb::arg("xs_h") = 0, nb::arg("xs_d") = 0, nb::arg("xs_n") = 0);
-    m.def("quantize_int8_rowwise", &quantize_int8_rowwise);
+    m.def("quantize_int8_rowwise", &quantize_int8_rowwise, nb::arg("x"), nb::arg("q"),
+          nb::arg("scales"), nb::arg("M"), nb::arg("K"), nb::arg("stream_ptr"),
+          nb::arg("tiled_output") = false);
     m.def("quantize_int8_convrot", &quantize_int8_convrot, nb::arg("x"), nb::arg("q"),
           nb::arg("scales"), nb::arg("spill_rotated").none(), nb::arg("spill_partials").none(),
           nb::arg("M"), nb::arg("K"), nb::arg("group_size"), nb::arg("act_code"),
-          nb::arg("stream_ptr"), nb::arg("act_weight") = nb::none(), nb::arg("act_eps") = 0.0f);
-    m.def("quantize_int8_convrot_modulated", &quantize_int8_convrot_modulated);
+          nb::arg("stream_ptr"), nb::arg("act_weight") = nb::none(), nb::arg("act_eps") = 0.0f,
+          nb::arg("tiled_output") = false);
+    m.def("quantize_int8_convrot_modulated", &quantize_int8_convrot_modulated,
+          nb::arg("x"), nb::arg("modulation_scale"), nb::arg("q"), nb::arg("scales"),
+          nb::arg("M"), nb::arg("K"), nb::arg("group_size"), nb::arg("stream_ptr"),
+          nb::arg("tiled_output") = false);
     m.def("quantize_int8_convrot_rms_modulated_fused_stats",
-          &quantize_int8_convrot_rms_modulated_fused_stats);
+          &quantize_int8_convrot_rms_modulated_fused_stats, nb::arg("x"),
+          nb::arg("norm_weight"), nb::arg("modulation_scale"), nb::arg("q"),
+          nb::arg("scales"), nb::arg("M"), nb::arg("K"), nb::arg("group_size"),
+          nb::arg("eps"), nb::arg("stream_ptr"), nb::arg("tiled_output") = false);
     m.def("quantize_int8_tensorwise", &quantize_int8_tensorwise);
     m.def("dequantize_int8_simple", &dequantize_int8_simple);
     m.def("dequantize_int8_convrot_weight", &dequantize_int8_convrot_weight);

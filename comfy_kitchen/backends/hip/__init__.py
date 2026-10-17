@@ -598,11 +598,13 @@ def _convrot_supported(
 def _rotate_quant_int8(
     x2d: torch.Tensor, group_size: int, input_act: str | None = None,
     act_weight: torch.Tensor | None = None, act_eps: float = 0.0,
+    *, tiled_output: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     m, k_in = x2d.shape
     # swiglu halves the row: the [gate | up] input is twice the quantized width.
     k = k_in // _input_act_width(input_act)
-    q = torch.empty((m, k), dtype=torch.int8, device=x2d.device)
+    q_rows = (m + 127) // 128 * 128 if tiled_output else m
+    q = torch.empty((q_rows, k), dtype=torch.int8, device=x2d.device)
     scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
     x_arg = _operand(x2d, x2d.device, "x2d")
     # check_convrot_k queries the current device's LDS budget, so pin it to the
@@ -616,28 +618,32 @@ def _rotate_quant_int8(
                 None, None, m, k,
                 group_size, _input_act_code(input_act), _stream(x2d),
                 None if act_weight is None else _dl(act_weight),
-                float(act_eps),
+                float(act_eps), tiled_output,
             )
             return q, scales
 
         workspace_per_row = x_arg.element_size() * k + 4 * (k // 256)
-        row_cap = max(1, _CONVROT_SPILL_WORKSPACE_BYTES // workspace_per_row)
-        capacity_chunk_count = (m + row_cap - 1) // row_cap
+        # Tiled chunks start on an M-tile boundary. Reserve at least one tile
+        # of workspace, just as the row-major path reserves at least one row.
+        row_unit = 128 if tiled_output else 1
+        units = (m + row_unit - 1) // row_unit
+        unit_cap = max(1, _CONVROT_SPILL_WORKSPACE_BYTES // (workspace_per_row * row_unit))
+        capacity_chunk_count = (units + unit_cap - 1) // unit_cap
         # For wide rows the native policy picks the global implementation at
         # 96 rows or more; a shorter chunk would switch to the one-wave LDS
-        # schedule. Balance the chunks so none drops below that threshold and
-        # every row of one call runs the same kernel. Keep the capacity-safe
-        # count when rebalancing would exceed the workspace cap.
+        # schedule. Balance row-major chunks to avoid that switch when the
+        # workspace cap allows it. Tiled chunks must keep 128-row boundaries,
+        # so their final tail may still use the LDS schedule.
         balanced_chunk_count = min(capacity_chunk_count, max(1, m // 96))
         balanced_chunk_rows = (
-            m + balanced_chunk_count - 1
-        ) // balanced_chunk_count
+            units + balanced_chunk_count - 1
+        ) // balanced_chunk_count * row_unit
         chunk_count = (
             balanced_chunk_count
-            if balanced_chunk_rows <= row_cap
+            if balanced_chunk_rows <= unit_cap * row_unit
             else capacity_chunk_count
         )
-        chunk_rows = (m + chunk_count - 1) // chunk_count
+        chunk_rows = min(m, (units + chunk_count - 1) // chunk_count * row_unit)
         spill_rotated = torch.empty(
             (chunk_rows, k), dtype=x_arg.dtype, device=x2d.device
         )
@@ -646,14 +652,15 @@ def _rotate_quant_int8(
         )
         start = 0
         for chunk in range(chunk_count):
-            rows = m // chunk_count + (chunk < m % chunk_count)
+            rows = min(m - start, (units // chunk_count + (chunk < units % chunk_count)) * row_unit)
             end = start + rows
+            q_end = start + (rows + row_unit - 1) // row_unit * row_unit
             _C.quantize_int8_convrot(
                 # Row slices of x and q start on a 256-byte multiple (K % 256 == 0);
                 # the kernel writes scales[row] as scalars, so the scales slice needs
                 # no alignment. Output slices must be passed as views, never copied.
                 _dl(x_arg[start:end]),
-                _dl(q[start:end]),
+                _dl(q[start:q_end]),
                 _dl(scales[start:end]),
                 _dl(spill_rotated),
                 _dl(spill_partials),
@@ -664,23 +671,26 @@ def _rotate_quant_int8(
                 _stream(x2d),
                 None if act_weight is None else _dl(act_weight),
                 float(act_eps),
+                tiled_output,
             )
             start = end
     return q, scales
 
 
 def _rotate_quant_int8_modulated(
-    x2d: torch.Tensor, modulation_scale: torch.Tensor, group_size: int
+    x2d: torch.Tensor, modulation_scale: torch.Tensor, group_size: int,
+    *, tiled_output: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fold exact twice-rounded BF16 batch-one modulation into ConvRot."""
     m, k = x2d.shape
-    q = torch.empty((m, k), dtype=torch.int8, device=x2d.device)
+    q_rows = (m + 127) // 128 * 128 if tiled_output else m
+    q = torch.empty((q_rows, k), dtype=torch.int8, device=x2d.device)
     scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
     with torch.cuda.device(x2d.device):
         _C.quantize_int8_convrot_modulated(
             _dl(_aligned(x2d)), _dl(_aligned(modulation_scale)),
             _dl(q), _dl(scales),
-            m, k, group_size, _stream(x2d),
+            m, k, group_size, _stream(x2d), tiled_output,
         )
     return q, scales
 
@@ -691,16 +701,19 @@ def _rotate_quant_int8_rms_modulated(
     norm_eps: float,
     modulation_scale: torch.Tensor,
     group_size: int,
+    *, tiled_output: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fold exact BF16 RMSNorm and modulation into the ConvRot producer."""
     m, k = x2d.shape
-    q = torch.empty((m, k), dtype=torch.int8, device=x2d.device)
+    q_rows = (m + 127) // 128 * 128 if tiled_output else m
+    q = torch.empty((q_rows, k), dtype=torch.int8, device=x2d.device)
     scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
     with torch.cuda.device(x2d.device):
         _C.quantize_int8_convrot_rms_modulated_fused_stats(
             _dl(_aligned(x2d)), _dl(_aligned(norm_weight)),
             _dl(_aligned(modulation_scale)), _dl(q),
             _dl(scales), m, k, group_size, norm_eps, _stream(x2d),
+            tiled_output,
         )
     return q, scales
 
