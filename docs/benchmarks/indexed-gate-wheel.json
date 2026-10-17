@@ -1,0 +1,11 @@
+{
+  "wheel": "comfy_kitchen-0.2.36-cp312-abi3-linux_x86_64.whl",
+  "header": "comfy_kitchen/backends/cuda/ops/indexed_gate.cuh",
+  "full_license_present": true,
+  "native_extensions": [
+    "comfy_kitchen/backends/cuda/_C.abi3.so"
+  ],
+  "header_sha256": "752533dd1abbb45b29a57c3b04d09a3371f7a17601f79c174fe28e5aabadd3ac",
+  "wheel_sha256": "055250272aecf604e8f112670c2166c591bfa525f56dd00443a8869bb9a64f5d",
+  "method": "setuptools build_py and bdist_wheel --skip-build, reusing previously tested unchanged CUDA extension"
+}
