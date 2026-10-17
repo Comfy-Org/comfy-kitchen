@@ -123,7 +123,8 @@ __forceinline__ __device__ float to_float<__bf16>(__bf16 v) {
 template <typename T>
 __forceinline__ __device__ void load8(const void* p, int64_t i, float (&o)[8]) {
     const uint4 pack = *reinterpret_cast<const uint4*>(static_cast<const T*>(p) + i);
-    const T* e = reinterpret_cast<const T*>(&pack);
+    T e[8];
+    __builtin_memcpy(e, &pack, sizeof(pack));  // no T/uint4 type punning
 #pragma unroll
     for (int j = 0; j < 8; ++j) o[j] = to_float<T>(e[j]);
 }
@@ -219,7 +220,9 @@ __global__ __launch_bounds__(kAdaLNVecThreads) void adaln_vec_kernel(
                 o[e] = static_cast<__bf16>(r);
             }
         }
-        *reinterpret_cast<uint4*>(out + xbase + c * 8) = *reinterpret_cast<const uint4*>(o);
+        uint4 pack;
+        __builtin_memcpy(&pack, o, sizeof(pack));
+        *reinterpret_cast<uint4*>(out + xbase + c * 8) = pack;
     }
 }
 
