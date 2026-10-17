@@ -10,6 +10,31 @@ namespace comfy::hip_backend {
 
 constexpr float kInt8Max = 127.0f;
 
+inline bool use_convrot_transposed_bf16(int in_code, int M, int K, int group_size) {
+    if (in_code != 2 || group_size != 256 || M < 3072 || K < 2560 || K > 16384) {
+        return false;
+    }
+
+    // Small row counts favor the generic producer at several widths. Keep
+    // the transposed schedule within the measured large-row geometry range.
+    return use_nonduplicated_wmma_schedule() && convrot_512x2_supported(K);
+}
+
+template <int ACT, bool TILED_QOUT>
+static void launch_convrot_quant_int8(
+    const void* x, int in_code, int8_t* q, float* scales,
+    int M, int K, int group_size, hipStream_t stream,
+    void* spill_rotated, void* spill_partials) {
+    if (use_convrot_transposed_bf16(in_code, M, K, group_size)) {
+        launch_convrot_quant_transposed_bf16<ACT, TILED_QOUT>(
+            x, q, scales, M, K, stream);
+    } else {
+        launch_convrot_quant<false, ACT, TILED_QOUT>(
+            x, in_code, q, scales, M, K, group_size, stream,
+            spill_rotated, spill_partials);
+    }
+}
+
 __forceinline__ __device__ int8_t quant_round(float v, float inv) {
     // rintf is round-half-to-even, matching torch.round.
     int q = static_cast<int>(rintf(v * inv));
@@ -283,15 +308,15 @@ static void launch_quantize_int8_convrot(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
             M, K, act_weight, act_eps, stream);
     } else if (act_code == kActGeluTanh) {
-        launch_convrot_quant<false, kActGeluTanh, TILED_QOUT>(
+        launch_convrot_quant_int8<kActGeluTanh, TILED_QOUT>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
             M, K, group_size, stream, spill_rotated, spill_partials);
     } else if (act_code == kActSwiGLU) {
-        launch_convrot_quant<false, kActSwiGLU, TILED_QOUT>(
+        launch_convrot_quant_int8<kActSwiGLU, TILED_QOUT>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
             M, K, group_size, stream, spill_rotated, spill_partials);
     } else {
-        launch_convrot_quant<false, kActNone, TILED_QOUT>(
+        launch_convrot_quant_int8<kActNone, TILED_QOUT>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
             M, K, group_size, stream, spill_rotated, spill_partials);
     }

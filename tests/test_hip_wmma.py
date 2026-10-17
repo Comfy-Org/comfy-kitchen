@@ -205,6 +205,35 @@ def test_gfx12_swiglu_preserves_float_intermediates(hip, m, k):
 
 
 @needs_wmma
+@pytest.mark.parametrize("input_act", [None, "gelu_tanh", "swiglu"])
+@pytest.mark.parametrize("k", [3840, 10240, 14336])
+def test_int8_convrot_linear_is_row_independent(hip, input_act, k):
+    skip_unless_gfx12_wmma()
+    torch.manual_seed(414)
+    m, n = 3073, 128
+    width = k * (2 if input_act == "swiglu" else 1)
+    x = (torch.randn(m, width, device=DEV) *
+         torch.logspace(-3, 3, width, device=DEV)).bfloat16()
+    weight = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
+    scales = torch.rand(n, device=DEV)
+
+    with ck.use_backend("hip"):
+        def linear(rows):
+            return ck.int8_linear(
+                rows, weight, scales, None, torch.float32, convrot=True,
+                convrot_groupsize=256, input_act=input_act,
+            )
+
+        whole = linear(x)
+        # Both sides of the large-row dispatch boundary, plus a partial tile.
+        split = torch.cat((linear(x[:3071]), linear(x[3071:])))
+        boundary = linear(x[:3072])
+
+    assert torch.equal(whole, split)
+    assert torch.equal(whole[:3072], boundary)
+
+
+@needs_wmma
 def test_gfx12_modulated_qkv_is_exact(hip):
     skip_unless_gfx12_wmma()
 

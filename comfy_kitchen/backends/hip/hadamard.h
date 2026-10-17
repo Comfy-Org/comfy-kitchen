@@ -1255,6 +1255,129 @@ inline bool convrot_512x2_supported(int K) {
         static_cast<size_t>(lds_bytes);
 }
 
+template <int ACT, bool FIRST = false>
+__forceinline__ __device__ float convrot_ordered_stage(
+    int digit, float x0, float x1, float x2, float x3) {
+    // Preserve the generic producer's FP32 association, including its fused
+    // activation's first stage. Algebraic reassociation changes INT8 rounding.
+    #pragma clang fp reassociate(off)
+    #pragma clang fp contract(off)
+    float y0, y1, y2, y3;
+    if constexpr (FIRST && ACT != kActNone) {
+        y0 = (x2 - x3) + (x0 + x1);
+        y1 = (x3 - x2) + (x0 + x1);
+        y2 = ((x2 + x3) - x1) + x0;
+        y3 = ((x2 + x3) + x1) - x0;
+    } else {
+        y0 = ((x1 + x0) + x2) - x3;
+        y1 = ((x1 + x0) - x2) + x3;
+        if constexpr (FIRST) {
+            y2 = ((x3 + x2) + x0) - x1;
+            y3 = ((x3 + x2) - x0) + x1;
+        } else {
+            y2 = (x0 - x1) + (x3 + x2);
+            y3 = (x1 - x0) + (x3 + x2);
+        }
+    }
+    return 0.5f * (digit == 0 ? y0 : digit == 1 ? y1 : digit == 2 ? y2 : y3);
+}
+
+template <int SHIFT>
+__device__ __forceinline__ void convrot_transpose4(float (&v)[4], int lane) {
+    #pragma unroll
+    for (int bit = 1; bit <= 2; bit *= 2) {
+        float next[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float other = __shfl_xor(v[j ^ bit], bit << SHIFT, 32);
+            next[j] = (((lane >> SHIFT) ^ j) & bit) ? other : v[j];
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = next[j];
+    }
+}
+
+// Eight groups per pass: complete butterflies in registers, two lane/register
+// transposes, then one LDS exchange for the final stage across wave32 halves.
+template <int ACT, bool TILED_QOUT>
+__global__ __launch_bounds__(512) void convrot_quant_transposed_bf16_kernel(
+    const void* x, int8_t* qout, float* scaleout, int K) {
+    __shared__ float stage[2048];
+    __shared__ float maxima[16];
+    __shared__ float maximum;
+    extern __shared__ unsigned char raw[];
+    __bf16* rowbuf = reinterpret_cast<__bf16*>(raw);
+    const int t = threadIdx.x;
+    const int lane = t % 64;
+    const int local_group = t / 64;
+    const int row = blockIdx.x;
+    const int64_t input_row = static_cast<int64_t>(row) * K * (ACT == kActSwiGLU ? 2 : 1);
+    float localmax = 0.0f;
+    for (int base = 0; base < K / 256; base += 8) {
+        const int group = base + local_group;
+        const bool active = group < K / 256;
+        float v[4] = {};
+        if (active) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                v[j] = load_input_act<ACT>(x, input_row, group * 256 + lane * 4 + j, K, 2);
+                // Do not fold activation arithmetic into the first butterfly.
+                asm volatile("" : "+v"(v[j]));
+            }
+        }
+        float next[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            next[j] = convrot_ordered_stage<ACT, true>(j, v[0], v[1], v[2], v[3]);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = next[j];
+        convrot_transpose4<0>(v, lane);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            next[j] = convrot_ordered_stage<ACT>(j, v[0], v[1], v[2], v[3]);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = next[j];
+        convrot_transpose4<2>(v, lane);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            next[j] = convrot_ordered_stage<ACT>(j, v[0], v[1], v[2], v[3]);
+            stage[local_group * 256 + (lane % 16) + (lane / 16) * 64 + j * 16] = next[j];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = stage[local_group * 256 + lane + j * 64];
+        if (active) {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float value = round_bf16(convrot_ordered_stage<ACT>(j, v[0], v[1], v[2], v[3]));
+                rowbuf[group * 256 + lane + j * 64] = static_cast<__bf16>(value);
+                localmax = fmaxf(localmax, fabsf(value));
+            }
+        }
+        if (base + 8 < K / 256) __syncthreads();
+    }
+    const float rowmax = fmaxf(block_reduce_max<16>(localmax, maxima, &maximum), 1e-10f);
+    const float inv = 127.0f / rowmax;
+    if (t == 0) scaleout[row] = rowmax / 127.0f;
+    for (int pair = t; pair < K / 2; pair += 512) {
+        const convrot_bf16x2 values = *reinterpret_cast<const convrot_bf16x2*>(rowbuf + pair * 2);
+        const int a = static_cast<int>(rintf(static_cast<float>(values[0]) * inv));
+        const int b = static_cast<int>(rintf(static_cast<float>(values[1]) * inv));
+        const uint16_t packed = static_cast<uint8_t>(static_cast<int8_t>(a)) |
+            (static_cast<uint16_t>(static_cast<uint8_t>(static_cast<int8_t>(b))) << 8);
+        *reinterpret_cast<uint16_t*>(qout + int8_quant_index<TILED_QOUT>(row, pair * 2, K)) = packed;
+    }
+}
+
+template <int ACT, bool TILED_QOUT = false>
+inline void launch_convrot_quant_transposed_bf16(
+    const void* x, int8_t* qout, float* scaleout,
+    int M, int K, hipStream_t stream) {
+    convrot_quant_transposed_bf16_kernel<ACT, TILED_QOUT>
+        <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
+            x, qout, scaleout, K);
+}
+
 template <bool TILED_QOUT = false>
 inline void launch_convrot_quant_512x2_bf16_modulated(
     const void* x, const void* modulation_scale,
