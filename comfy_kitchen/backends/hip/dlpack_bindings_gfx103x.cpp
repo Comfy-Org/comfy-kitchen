@@ -20,6 +20,7 @@
 // a decision rather than a value -- the mask descriptor, the tile shape, whether Q
 // is quantized in-kernel -- stays next to the kernel, where it was measured.
 
+#include "launchers.h"
 #include "sage_attention/sage_attn_gfx103x.h"
 
 #include <nanobind/ndarray.h>
@@ -74,6 +75,27 @@ bool is_row_major(const nb::ndarray<>& t) {
         expect *= t.shape(i);
     }
     return true;
+}
+
+// Both entry points are RDNA2-only: the kernels behind these bindings compile to
+// empty bodies outside __GFX10__, so on any other architecture a call would
+// return success having written nothing and the caller would read back whatever
+// the output buffer happened to hold. The Python-side rdna2_is_available() keeps
+// them off a non-RDNA2 device; this makes a mistake here an error instead.
+void require_gfx103x(const char* fn) {
+    if (!comfy_is_gfx10()) {
+        fail(fn, "requires an RDNA2 (gfx103x) device");
+    }
+}
+
+// A launch that fails leaves the caller's output untouched, and every other
+// binding in this backend turns that into an exception rather than a plausible
+// buffer of whatever was there before.
+void check_launch(const char* fn) {
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fail(fn, std::string("kernel launch failed: ") + hipGetErrorString(err));
+    }
 }
 
 void require_ndim(const nb::ndarray<>& t, int want, const char* fn, const char* name) {
@@ -138,6 +160,7 @@ void gfx103x_quant_qk_int8(nb::ndarray<> query, nb::ndarray<> key, nb::ndarray<>
                            nb::ndarray<> k_scale, int64_t tensor_layout, double sm_scale,
                            int64_t skip_q, uintptr_t stream_ptr) {
     constexpr const char* fn = "gfx103x_quant_qk_int8";
+    require_gfx103x(fn);
 
     require_ndim(query, 4, fn, "query");
     require_ndim(key, 4, fn, "key");
@@ -208,6 +231,7 @@ void gfx103x_quant_qk_int8(nb::ndarray<> query, nb::ndarray<> key, nb::ndarray<>
     require_elems(k_scale, batch * kv_heads * a.k_groups, fn, "k_scale");
 
     sageattn_gfx103x::gfx103x_launch_quant_qk(a, as_stream(stream_ptr));
+    check_launch(fn);
 }
 
 // The attention itself.
@@ -225,6 +249,7 @@ void gfx103x_qk_int8_sv_attn(nb::ndarray<> query, nb::ndarray<> key, nb::ndarray
                              nb::ndarray<> q_fp, int64_t mask_mode, int64_t mask_dtype,
                              nb::ndarray<> mask, uintptr_t stream_ptr) {
     constexpr const char* fn = "gfx103x_qk_int8_sv_attn";
+    require_gfx103x(fn);
 
     require_ndim(key, 4, fn, "key");
     require_ndim(value, 4, fn, "value");
@@ -364,15 +389,16 @@ void gfx103x_qk_int8_sv_attn(nb::ndarray<> query, nb::ndarray<> key, nb::ndarray
     require_elems(output, a.batch * a.q_heads * a.qo_len * a.head_dim, fn, "output");
 
     sageattn_gfx103x::gfx103x_launch_attn(a, as_stream(stream_ptr));
+    check_launch(fn);
 }
 
 void register_gfx103x_ops(nb::module_& m) {
     // The names are the port's own rather than a mainline one, because the operand
     // layouts are its own: V read in place as fp16, a skip-Q flag, and the mask
     // modes below. Registration is unconditional and on every architecture, because
-    // a module has no per-arch scoping: outside __GFX10__ the kernels behind these
-    // compile to empty bodies, so on gfx11/gfx12 they exist and do nothing. The
-    // Python-side gate is what keeps them off a non-RDNA2 device.
+    // a module has no per-arch scoping; outside __GFX10__ the kernels behind these
+    // compile to empty bodies, so each binding refuses a non-RDNA2 device itself
+    // (require_gfx103x) rather than returning success having written nothing.
     m.def("gfx103x_quant_qk_int8", &gfx103x_quant_qk_int8, nb::arg("query"), nb::arg("key"),
           nb::arg("key_mean"), nb::arg("q_int8"), nb::arg("q_scale"), nb::arg("k_int8"),
           nb::arg("k_scale"), nb::arg("tensor_layout"), nb::arg("sm_scale"), nb::arg("skip_q"),
@@ -383,4 +409,3 @@ void register_gfx103x_ops(nb::module_& m) {
           nb::arg("tensor_layout"), nb::arg("is_causal"), nb::arg("sm_scale"), nb::arg("q_fp"),
           nb::arg("mask_mode"), nb::arg("mask_dtype"), nb::arg("mask"), nb::arg("stream_ptr"));
 }
-

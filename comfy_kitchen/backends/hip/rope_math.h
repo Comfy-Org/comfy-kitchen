@@ -76,18 +76,8 @@ __forceinline__ __device__ void rope_store<__bf16>(__bf16* p, int64_t i, float v
 }
 
 // out = f_a * x_a + f_b * x_b, evaluated in the freqs dtype with the same rounding
-// eager applies after upcasting x to the freqs dtype.
-//
-// Eager rounds exactly twice: the standalone product (apply_rope1's
-// `freqs[..., 0] * x_[..., 0]`, split-half's `t.unflatten * diagonal`) is
-// materialized as a tensor, so it is rounded to the freqs dtype; the addcmul_
-// that follows then evaluates `p + f_b * x_b` in fp32 opmath and rounds once.
-// The second product is never rounded on its own -- and does not need to be,
-// since the product of two fp16 (11-bit) or bf16 (8-bit) mantissas is exact in
-// fp32. Both eager layouts round identically, so split_half needs no special
-// case; rounding the second product here cost an extra rounding and desynced the
-// kernel from eager for apply_rope_split_half / rms_rope_split_half.
-// f_code: 0=fp32, 1=fp16, 2=bf16.
+// eager applies after upcasting x to the freqs dtype: the first product is rounded
+// and addcmul_ fuses the second into the add. f_code: 0=fp32, 1=fp16, 2=bf16.
 __forceinline__ __device__ float rope_combine(
     float f_a, float x_a, float f_b, float x_b, int f_code) {
     if (f_code == 2) {
@@ -101,18 +91,11 @@ __forceinline__ __device__ float rope_combine(
     return f_a * x_a + f_b * x_b;
 }
 
-// Output b of a rotation pair (out[b] = f_b * x_b + f_a * x_a). Which product is
-// rounded before the fused add depends on the layout, because eager rounds the
-// term it materializes as a tensor:
-//   interleaved (apply_rope1): x_out = f0 * x[a]; addcmul_(f1, x[b])  -> f_a*x_a
-//   split-half (apply_rope_split_half1): out = t * diagonal (f_b*x_b for the
-//     b output); addcmul_(t[a], f_a)                                  -> f_b*x_b
-// Same value either way, one rounding apart, so the two layouts need different
-// argument orders to stay bit-identical to eager.
+// Split-half eager rounds the x_b product of the second output and fuses x_a.
 __forceinline__ __device__ float rope_combine_b(
-    float f_a, float x_a, float f_b, float x_b, int f_code, bool split_half) {
-    return split_half ? rope_combine(f_b, x_b, f_a, x_a, f_code)
-                      : rope_combine(f_a, x_a, f_b, x_b, f_code);
+    float f10, float x_a, float f11, float x_b, int f_code, bool split_half) {
+    return split_half ? rope_combine(f11, x_b, f10, x_a, f_code)
+                      : rope_combine(f10, x_a, f11, x_b, f_code);
 }
 
 }  // namespace comfy::hip_backend

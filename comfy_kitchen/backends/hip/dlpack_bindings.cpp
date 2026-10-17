@@ -142,13 +142,7 @@ void launch_rms_rope_kernel(const void*, const void*, const void*, const void*, 
                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int, int,
                             int, float, bool, hipStream_t);
-void launch_quantize_nvfp4_kernel(const void*, const void*, void*, void*, int, int, int, int, int,
-                                 bool, hipStream_t);
-void launch_dequantize_nvfp4_kernel(const void*, const void*, const void*, void*, int, int, int, bool,
-                                   hipStream_t);
-void launch_scaled_mm_nvfp4_kernel(const void*, const void*, void*, const void*, const void*,
-                                  const void*, const void*, const void*, int, int, int, int, int,
-                                  int, hipStream_t);
+// The three NVFP4 launchers are declared in launchers.h, which this file includes.
 }
 
 static void check_hip_launch() {
@@ -741,9 +735,9 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
     require_convrot_group(K, group_size, kFn);
     require_dtype(x, 0, 2, kFn, "x");
     require_dtype(q, 4, 4, kFn, "q");
-    // K is the activated (written) width; swiglu (code 2, see INPUT_ACT_TO_CODE)
-    // reads a [gate | up] row twice as wide. The launcher rejects unknown codes.
-    const int64_t in_width = act_code == 2 ? 2 : 1;
+    // K is the activated (written) width; swiglu and situ (codes 2 and 4) read a row
+    // twice as wide. The launcher rejects unknown codes.
+    const int64_t in_width = (act_code == 2 || act_code == 4) ? 2 : 1;
     require_len(x, static_cast<int64_t>(M) * K * in_width, kFn, "x");
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");

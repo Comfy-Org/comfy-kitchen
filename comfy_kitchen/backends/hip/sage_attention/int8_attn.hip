@@ -350,8 +350,8 @@ __global__ void prepare_dense_bool_bits_kernel(
 // for every AMD arch, so this is a correctness fix for all of them, not a
 // per-device tuning choice.
 //
-// The sentinel is kDroppedBias rather than kMaskedScoreBase2, and that single choice
-// is what makes the rest of the dropped-key handling free: the bias is *added* to the
+// The sentinel is kDroppedBias rather than the base-two form of kMaskedScore, and
+// that single choice is what makes the rest of the dropped-key handling free: the bias is *added* to the
 // caller's Q*K rather than replacing it, so it only works as a floor if no score can
 // climb back out of it. A -50000 sentinel is climbed by any Q*K past a few hundred,
 // which is why per-element validity bits had to be carried beside the score and
@@ -468,9 +468,20 @@ __global__ __launch_bounds__((Shape<HD, kMask, Paged>::kThreads)) void int8_attn
     //     135.06. There the tile is DT=8 x KT=4, i.e. 64 conversions against 32
     //     MMAs, so removing them costs more than the bookkeeping adds.
     //
-    // Both are performance results, not correctness ones: ck_attn_check.py shows
-    // the relative error against a float32 SDPA unchanged (0.01370 at HD=64) when
-    // the HD=64 arm is enabled.
+    // The HD=64 arm below covers the masked/paged modes only, because the two
+    // directions above disagree there. Measured on gfx1103 through sage_int8_sdpa,
+    // two builds of this file, median of 30 (on -> off, ms):
+    //
+    //   B2 H20 1024x1024 D64 causal  3.83 -> 3.99   0.96x
+    //   B1 H16 2048x2048 D64 causal  5.87 -> 7.46   0.79x
+    //   B2 H20 1024x4096 D64 causal 13.63 -> 13.72   0.99x
+    //   B2 H10 1024x1024 D64 dense  3.54 -> 3.53   1.00x
+    //
+    // So the largest masked prefill wins by the most and the unmasked HD=64 path
+    // (the 0.89x above) stays off. Output is unchanged either way, so these are
+    // performance results and not correctness ones: ck_attn_check.py shows the
+    // relative error against a float32 SDPA unchanged (0.01370 at HD=64) when the
+    // HD=64 arm is enabled.
     constexpr bool kBiasPV = (HD == 128 && (!kCustomMask || kPrepared)) ||
                              (HD == 64 && (kPreparedKey || kDirectKey || kPreparedDense16));
     // Adding a signed integer x to these bits gives the exact FP32 value

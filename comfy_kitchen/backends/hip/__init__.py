@@ -917,7 +917,7 @@ def _rotate_quant_int8(
     act_weight: torch.Tensor | None = None, act_eps: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     m, k_in = x2d.shape
-    # swiglu halves the row: the [gate | up] input is twice the quantized width.
+    # swiglu and situ halve the row: the input is twice the quantized width.
     k = k_in // _input_act_width(input_act)
     q = torch.empty((m, k), dtype=torch.int8, device=x2d.device)
     scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
@@ -1043,10 +1043,12 @@ def fp16_linear(
         supported = weight.data_ptr() % 16 == 0
     if not supported:
         # the kernel path takes bias and residual from any device, so the fallback must too
-        # torch's linear needs the bias in the input dtype (addmm requires compatible
-        # operand dtypes), so cast a non-matching bias here; the kernel path keeps it
-        # as the caller's FP16.
-        bias = None if bias is None else bias.to(device=x.device, dtype=x.dtype)
+        # Upstream leaves the bias dtype alone here and lets torch's linear reject a
+        # mismatched pair; only the iGPU's bf16 envelope needs it cast, so the cast is
+        # gated like the dtype check above and every other device keeps upstream's
+        # spelling (.to(dtype=<its own dtype>) is the identity).
+        bias = None if bias is None else bias.to(
+            device=x.device, dtype=x.dtype if _is_small_igpu(x.device) else bias.dtype)
         if residual is not None:
             residual = residual.to(device=x.device)
             residual_scale = residual_scale.to(device=x.device)
@@ -1102,7 +1104,7 @@ def fp16_linear(
 # Acts the HIP fused quantizer implements; anything else is applied eagerly so
 # new act codes degrade gracefully instead of erroring in the kernel. rms_norm is
 # folded as well, but only where _fused_rms_norm_ok holds.
-_HIP_FUSED_ACTS = (None, "none", "gelu_tanh", "swiglu")
+_HIP_FUSED_ACTS = (None, "none", "gelu_tanh", "swiglu", "situ")
 
 
 def int8_linear(
@@ -1135,8 +1137,11 @@ def int8_linear(
     if input_act not in _HIP_FUSED_ACTS and act_weight is None:
         x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
         input_act = None
-    # k_act is the activated (quantized) row width: swiglu halves the raw row.
-    k_act = x.shape[-1] // _input_act_width(input_act)
+    # k_act is the activated (quantized) row width: swiglu and situ halve the raw row.
+    in_width = _input_act_width(input_act)
+    if x.shape[-1] % in_width != 0:
+        raise ValueError(f"input_act {input_act!r} needs an even input width, got {x.shape[-1]}")
+    k_act = x.shape[-1] // in_width
     if k_act != weight.shape[-1]:
         raise ValueError(
             f"Input and weight inner dimensions must match, got {k_act} and {weight.shape[-1]}"

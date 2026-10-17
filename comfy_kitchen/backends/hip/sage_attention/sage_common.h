@@ -38,18 +38,12 @@ constexpr float kLog2e = 1.44269504088896340736f;
 // them, and -ffast-math is on. See the fast-math note in the HIP backend README.
 constexpr float kMaskedScore = -50000.0f;
 
-// Masked-score sentinel in the base-two domain. tile_m is only compared with
-// m_run's kMaskedScore start after it has been brought to base two, so a fully
-// masked tile has to land below that start for tile_scale to underflow to zero.
-// 16-bit prepared biases are converted after the bias is added, which widens the
-// gap further.
-constexpr float kMaskedScoreBase2 = kMaskedScore * kLog2e;
-
-// The bias a prepared mask hands back for a dropped key, and why it is not
-// kMaskedScoreBase2: the score loop *adds* the bias to the caller's Q*K, so a
-// sentinel only works if no score can climb back out of it. -50000 cannot manage
-// that -- a Q*K of a few hundred already exceeds it -- which is why the dropped-key
-// fix had to carry per-element validity bits beside the score and select on them.
+// The bias a prepared mask hands back for a dropped key, and why it is not the
+// base-two form of kMaskedScore: the score loop *adds* the bias to the caller's
+// Q*K, so a sentinel only works if no score can climb back out of it. -50000
+// cannot manage that -- a Q*K of a few hundred already exceeds it -- which is why
+// the dropped-key fix had to carry per-element validity bits beside the score and
+// select on them.
 //
 // A sentinel large enough to be unrecoverable makes every one of those selects
 // unnecessary, because each consumer of the score already does the right thing with

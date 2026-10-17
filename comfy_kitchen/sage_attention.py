@@ -437,7 +437,7 @@ def prequantize_int8_attention(
         # buffers is the one that has to come back to attend over them. Taking the
         # CUDA-side constant here would only agree with the HIP choice by accident.
         hip_cta_k = _hip_backend._sage_cta_k(
-            kernel_head_dim, k.shape[2], attn_mask is not None
+            kernel_head_dim, k.shape[2], attn_mask is not None, q.device
         )
         packed = _hip_backend.sage_int8_quantize(q, k, v, cta_k=hip_cta_k)
         return PrequantizedInt8Attention(

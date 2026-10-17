@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
 // Tiled WMMA GEMM core, shared by the fp8, int8, int4 and fp16 paths and the fp16

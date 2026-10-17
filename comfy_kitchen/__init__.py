@@ -1042,7 +1042,7 @@ def int8_linear(
         convrot: If True, apply online activation rotation.
         convrot_groupsize: Group size for Hadamard rotation.
         input_act: Optional activation applied to x before quantization
-            ("gelu_tanh", "swiglu", "rms_norm", or None). When
+            ("gelu_tanh", "swiglu", "situ", "rms_norm", or None). When
             the fused ConvRot quantizer handles the shape it is folded in, so
             an MLP's ``linear(act(proj(x)))`` or a pre-norm block's
             ``linear(rms_norm(x))`` never writes the intermediate to HBM;

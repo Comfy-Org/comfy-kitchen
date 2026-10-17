@@ -269,32 +269,56 @@ def _swiglu(x):
     return torch.nn.functional.silu(gate) * up
 
 
-# swiglu is the gated pair: the input row is [gate | up] and the quantized row is
-# half as wide, so the shapes below give the raw (2 * K) width.
+def _situ(x):
+    hidden, gate = x.chunk(2, dim=-1)
+    return (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)) * (25.0 * torch.tanh(hidden / 25.0))
+
+
+_GATED_ACTS = {"swiglu": _swiglu, "situ": _situ}
+
+
+def _gated_input(act, m, k, dtype):
+    """situ adds extremes that overflow expf in both caps and the sigmoid."""
+    h = torch.randn(m, 2 * k, device=DEV, dtype=dtype)
+    if act == "swiglu":
+        return h * 2.0
+    h[:, :k] *= 60.0
+    h[:, k:] *= 8.0
+    flat = h.view(-1)
+    flat[::1021] = 2000.0
+    flat[511::1021] = -2000.0
+    return h
+
+
+# Shapes give the activated width K; the input row is 2 * K.
 @needs_wmma
+@pytest.mark.parametrize("act", ["swiglu", "situ"])
 @pytest.mark.parametrize(
     ("tag", "shape", "kwargs"),
     [
-        ("fused convrot", (256, 2 * 1024), {"convrot": True, "convrot_groupsize": 256}),
-        ("no convrot", (256, 2 * 1024), {"convrot": False}),
-        ("m == 1", (1, 2 * 1024), {"convrot": True, "convrot_groupsize": 256}),
+        ("fused convrot", (256, 1024), {"convrot": True, "convrot_groupsize": 256}),
+        ("convrot G=64", (256, 1024), {"convrot": True, "convrot_groupsize": 64}),
+        ("convrot G=16", (256, 1024), {"convrot": True, "convrot_groupsize": 16}),
+        ("global spill", (64, 32768), {"convrot": True, "convrot_groupsize": 256}),
+        ("no convrot", (256, 1024), {"convrot": False}),
+        ("m == 1", (1, 1024), {"convrot": True, "convrot_groupsize": 256}),
     ],
 )
-def test_int8_linear_swiglu_matches_the_eager_chain(tag, shape, kwargs):
-    """int8_linear(x, input_act="swiglu") == int8_linear(swiglu(x)) on every route."""
+def test_int8_linear_gated_act_matches_the_eager_chain(act, tag, shape, kwargs):
+    """int8_linear(x, input_act=act) == int8_linear(act(x)) on every route."""
     torch.manual_seed(0)
-    m, k2 = shape
-    k = k2 // 2
+    m, k = shape
     n = 256
-    x = torch.randn(m, k2, device=DEV, dtype=torch.bfloat16)
+    fn = _GATED_ACTS[act]
+    x = _gated_input(act, m, k, torch.bfloat16)
     w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16)
     wq, ws = ck.quantize_int8_rowwise(w)
     ws = ws.reshape(-1)
 
     with ck.use_backend("hip"):
-        ref = ck.int8_linear(_swiglu(x), wq, ws, None, torch.bfloat16, **kwargs)
+        ref = ck.int8_linear(fn(x), wq, ws, None, torch.bfloat16, **kwargs)
         out = ck.int8_linear(x, wq, ws, None, torch.bfloat16,
-                             input_act="swiglu", **kwargs)
+                             input_act=act, **kwargs)
 
     assert out.shape == (m, n), tag
     scale = ref.float().abs().max().item()
@@ -302,22 +326,41 @@ def test_int8_linear_swiglu_matches_the_eager_chain(tag, shape, kwargs):
 
 
 @needs_wmma
-def test_swiglu_quantizer_is_at_least_as_accurate_as_the_chain(hip):
-    """Fusing the gate into the rotation's load must not lose accuracy against
-    materializing silu(gate) * up in bf16 first."""
-    torch.manual_seed(0)
-    m, k, group = 512, 1024, 256
-    x = torch.randn(m, 2 * k, device=DEV, dtype=torch.bfloat16) * 2.0
+@pytest.mark.parametrize("act", ["swiglu", "situ"])
+def test_int8_linear_gated_act_rejects_an_odd_width(hip, act):
+    """The kernels stride rows by 2 * K, so a 2 * K + 1 row would read across rows."""
+    k = 1024
+    x = torch.randn(4, 2 * k + 1, device=DEV, dtype=torch.bfloat16)
+    wq, ws = ck.quantize_int8_rowwise(torch.randn(256, k, device=DEV, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="even input width"):
+        hip.int8_linear(x, wq, ws.reshape(-1), None, torch.bfloat16,
+                        convrot=True, convrot_groupsize=256, input_act=act)
 
-    xd = x.double()
-    activated = torch.nn.functional.silu(xd[:, :k]) * xd[:, k:]
+
+@needs_wmma
+@pytest.mark.parametrize("act", ["swiglu", "situ"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("group", [16, 64, 256])
+@pytest.mark.parametrize("near_zero", [False, True])
+def test_gated_act_quantizer_is_at_least_as_accurate_as_the_chain(
+        hip, act, dtype, group, near_zero):
+    """Fusing the activation must not lose accuracy against materializing it first.
+    near_zero catches cancellation near the origin, which the row scale exposes."""
+    torch.manual_seed(0)
+    m, k = 512, 1024
+    fn = _GATED_ACTS[act]
+    x = _gated_input(act, m, k, dtype)
+    if near_zero:
+        x = x * 1e-6
+
+    activated = fn(x.double())
     mat = _build_hadamard(group, device=x.device, dtype=torch.float64)
     rotated = (activated.reshape(-1, k // group, group) @ mat).reshape(-1, k)
     scale = (rotated.abs().amax(-1, keepdim=True) / 127.0).clamp(min=1e-30)
     exact = (rotated / scale).round().clamp(-128, 127)
 
-    chain_q, _ = hip._rotate_quant_int8(_swiglu(x).contiguous(), group)
-    fused_q, fused_s = hip._rotate_quant_int8(x, group, "swiglu")
+    chain_q, _ = hip._rotate_quant_int8(fn(x).contiguous(), group)
+    fused_q, fused_s = hip._rotate_quant_int8(x, group, act)
 
     err_chain = (chain_q.double() - exact).abs().mean().item()
     err_fused = (fused_q.double() - exact).abs().mean().item()
