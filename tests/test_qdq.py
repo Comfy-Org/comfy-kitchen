@@ -503,6 +503,36 @@ class TestQuantizeMXFP8:
                 )
 
 
+class TestDequantizeMXFP8:
+    """CUDA MXFP8 dequantization tests."""
+
+    @pytest.mark.cuda
+    @pytest.mark.parametrize("output_type", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("m,k", [(128, 64), (129, 128)])
+    def test_dequantize_mxfp8_cuda_matches_eager(self, device, seed, m, k, output_type):
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        if not cuda_backend._EXT_AVAILABLE:
+            pytest.skip("CUDA extension is not built")
+
+        x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+        needs_padding = (m % 32 != 0) or (k % 32 != 0)
+        with ck.use_backend("eager"):
+            qx, scales = ck.quantize_mxfp8(x, pad_32x=needs_padding)
+            expected = ck.dequantize_mxfp8(qx, scales, output_type=output_type)
+
+        with ck.use_backend("cuda"):
+            actual = ck.dequantize_mxfp8(qx, scales, output_type=output_type)
+
+        assert_values_close(
+            actual.float(),
+            expected.float(),
+            rtol=0.0,
+            atol=0.0,
+            name="CUDA MXFP8 dequantization",
+        )
+
+
 class TestScaledMMNVFP4:
     """NVFP4 matrix multiplication tests."""
 
