@@ -428,22 +428,23 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
     const bool skinny = (M <= 64 || N <= 64);
 
     if (!skinny && blocks_128 >= wgps) {
-        if (kbytes >= 4096) {
-            if constexpr (std::is_same_v<Mma, MmaInt8>) {
-                // RDNA4 INT8 deep-K: balanced 128x256 tile reduces operand
-                // LDS traffic while GroupM=8 improves B-tile L2 locality.
-                if (device_is_gfx12()) {
-                    constexpr int BM = 128, BN = 256, BKB = 64;
-                    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+        if constexpr (std::is_same_v<Mma, MmaInt8>) {
+            // RDNA4 INT8: the balanced 128x256 tile reduces operand LDS traffic,
+            // GroupM=8 improves B-tile L2 locality, and BKB=128 halves the K-loop
+            // barriers. At every K, including the shallow 3072 of DiT projections.
+            if (device_is_gfx12()) {
+                constexpr int BM = 128, BN = 256, BKB = 128;
+                dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
 
-                    gemm_wmma_kernel<Mma, Epi, OutT,
-                                     BM, BN, BKB,
-                                     2, 4, 4, 4, ASrc, 8>
-                        <<<grid, 256, 0, stream>>>(
-                            A, B, C, M, N, kbytes, ldc, epi);
-                    return;
-                }
+                gemm_wmma_kernel<Mma, Epi, OutT,
+                                 BM, BN, BKB,
+                                 2, 4, 4, 4, ASrc, 8>
+                    <<<grid, 256, 0, stream>>>(
+                        A, B, C, M, N, kbytes, ldc, epi);
+                return;
             }
+        }
+        if (kbytes >= 4096) {
             constexpr int BM = 128, BN = 128, BKB = 128;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
             // With few blocks per WGP there is nothing to interleave across, so
