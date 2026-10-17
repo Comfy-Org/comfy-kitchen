@@ -93,6 +93,12 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
     if (K == kConvRotGroup256) {
         return 64;
     }
+    // RDNA4 MOSS-Image widths (attention/FFN-in 3072, SiTU FFN-down 8192): with many
+    // rows, narrower blocks keep more rows resident per CU. Short M keeps the wide block.
+    if (M >= 1024) {
+        if (K == 3072) return 128;
+        if (K == 8192) return 256;
+    }
     if (K == 2560) {
         return 640;
     }
@@ -284,6 +290,13 @@ __forceinline__ __device__ float stable_tanh(float x) {
     return copysignf(-t / (t + 2.0f), x);
 }
 
+// Matches torch 4*tanh(gate/4)*sigmoid(gate) * 25*tanh(hidden/25).
+__forceinline__ __device__ float situ_value(float hidden, float gate) {
+    const float gate_cap = 4.0f * stable_tanh(gate / 4.0f);
+    const float hidden_cap = 25.0f * stable_tanh(hidden / 25.0f);
+    return gate_cap / (1.0f + expf(-gate)) * hidden_cap;
+}
+
 // One activated value: column `col` of the K-wide activated row starting at
 // `in_row`. SwiGLU and SiTU read a 2*K-wide row; every other activation reads the
 // K-wide row it writes.
@@ -296,12 +309,7 @@ __forceinline__ __device__ float load_input_act(
         const float up = load_in(x, in_row + K + col, code);
         return (gate / (1.0f + expf(-gate))) * up;
     } else if constexpr (ACT == kActSiTU) {
-        // Matches torch 4*tanh(gate/4)*sigmoid(gate) * 25*tanh(hidden/25).
-        const float hidden = load_in(x, in_row + col, code);
-        const float gate = load_in(x, in_row + K + col, code);
-        const float gate_cap = 4.0f * stable_tanh(gate / 4.0f);
-        const float hidden_cap = 25.0f * stable_tanh(hidden / 25.0f);
-        return gate_cap / (1.0f + expf(-gate)) * hidden_cap;
+        return situ_value(load_in(x, in_row + col, code), load_in(x, in_row + K + col, code));
     } else {
         return apply_input_act<ACT>(load_in(x, in_row + col, code));
     }
@@ -371,6 +379,39 @@ __forceinline__ __device__ void load_input_swiglu4_bf16(
     o1 = (g1 / (1.0f + expf(-g1))) * u1;
     o2 = (g2 / (1.0f + expf(-g2))) * u2;
     o3 = (g3 / (1.0f + expf(-g3))) * u3;
+}
+
+// [hidden | gate] counterpart of load_input_swiglu4_bf16: two 8-byte loads instead of
+// eight dtype-dispatched scalar ones, with the same per-element math.
+__forceinline__ __device__ void load_input_situ4_bf16(
+    const void* x, int64_t in_row, int col, int K,
+    float& o0, float& o1, float& o2, float& o3) {
+
+    const __bf16* row = static_cast<const __bf16*>(x) + in_row + col;
+    float h[4], g[4];
+    const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(row) |
+                                reinterpret_cast<std::uintptr_t>(row + K);
+    if ((addr & 7u) == 0) {
+        const uint64_t hidden_pack = *reinterpret_cast<const uint64_t*>(row);
+        const uint64_t gate_pack = *reinterpret_cast<const uint64_t*>(row + K);
+        const __bf16* hp = reinterpret_cast<const __bf16*>(&hidden_pack);
+        const __bf16* gp = reinterpret_cast<const __bf16*>(&gate_pack);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            h[j] = static_cast<float>(hp[j]);
+            g[j] = static_cast<float>(gp[j]);
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            h[j] = static_cast<float>(row[j]);
+            g[j] = static_cast<float>(row[K + j]);
+        }
+    }
+    o0 = situ_value(h[0], g[0]);
+    o1 = situ_value(h[1], g[1]);
+    o2 = situ_value(h[2], g[2]);
+    o3 = situ_value(h[3], g[3]);
 }
 
 template <typename RowT>
@@ -757,6 +798,8 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
                         xv2 = load_input_act<ACT>(x, in_row_offset, col + 2, K, in_dtype);
                         xv3 = load_input_act<ACT>(x, in_row_offset, col + 3, K, in_dtype);
                     }
+                } else if constexpr (ACT == kActSiTU && std::is_same_v<RowT, __bf16>) {
+                    load_input_situ4_bf16(x, in_row_offset, col, K, xv0, xv1, xv2, xv3);
                 } else {
                     xv0 = load_input_act<ACT>(x, in_row_offset, col, K, in_dtype);
                     xv1 = load_input_act<ACT>(x, in_row_offset, col + 1, K, in_dtype);
