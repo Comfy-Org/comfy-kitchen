@@ -56,7 +56,6 @@ __all__ = [
     "int8_linear",
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
-    "int8_linear_swiglu_split",
     "w4a8_int8_linear",
 ]
 
@@ -96,7 +95,6 @@ from .quantization import (
     int8_linear,
     int8_linear_modulated,
     int8_linear_rms_modulated,
-    int8_linear_swiglu_split,
     quantize_and_rotate_rowwise,
     quantize_int8_convrot_weight,
     quantize_int8_rowwise,
@@ -610,10 +608,6 @@ def _build_constraints() -> dict:
         "int8_linear_modulated": fusion_constraints(single | modulation),
         "int8_linear_rms_modulated": fusion_constraints(single | modulation | {
             "norm_weight": float_param, "norm_eps": float_value,
-        }),
-        "int8_linear_swiglu_split": fusion_constraints({
-            "gate": float_param, "up": float_param, "weight": int8_param,
-            "weight_scale": float_param, "bias": float_param,
         }),
     })
 

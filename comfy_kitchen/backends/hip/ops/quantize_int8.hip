@@ -317,28 +317,6 @@ extern "C" void launch_quantize_int8_convrot_kernel(
     }
 }
 
-// Consume separate BF16 gate/up projections,
-// reproduce the exact standalone SwiGLU rounding contract, and emit the
-// tile-major INT8 activation read by the tile-major down GEMM
-// (int8_gemm_a_tiled128_down).
-extern "C" void launch_quantize_int8_convrot_swiglu_split_tiled128_kernel(
-    const void* gate, const void* up, void* q, void* scales,
-    int M, int K, int group_size, hipStream_t stream) {
-
-    using namespace comfy::hip_backend;
-    if (K <= 0 || K % 128 != 0 || group_size != 256 ||
-        !convrot_512x2_supported(K)) {
-        throw std::runtime_error(
-            "convrot split swiglu tiled128: requires K divisible by 128, "
-            "group_size=256, and sufficient wave32/LDS capacity");
-    }
-    check_convrot_k(K, group_size, 2);
-    if (M == 0) return;
-    launch_convrot_quant_512x2_bf16_swiglu_split_tiled128(
-        gate, up, static_cast<int8_t*>(q), static_cast<float*>(scales),
-        M, K, stream);
-}
-
 // Fold exact batch-one BF16 scale modulation into the row-major ConvRot
 // producer.
 extern "C" void launch_quantize_int8_convrot_modulated_kernel(

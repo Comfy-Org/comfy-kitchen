@@ -1133,29 +1133,6 @@ def int8_linear_rms_modulated(
     )
 
 
-def int8_linear_swiglu_split(
-    gate: torch.Tensor,
-    up: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    convrot: bool = False,
-    convrot_groupsize: int = 256,
-) -> torch.Tensor:
-    """Portable reference for a down projection consuming split SwiGLU inputs."""
-    if gate.shape != up.shape:
-        raise ValueError(
-            f"split SwiGLU inputs must have the same shape, got "
-            f"{tuple(gate.shape)} and {tuple(up.shape)}"
-        )
-    activated = torch.nn.functional.silu(gate) * up
-    return int8_linear(
-        activated, weight, weight_scale, bias, out_dtype,
-        convrot, convrot_groupsize,
-    )
-
-
 # =============================================================================
 # torch.library Custom Op Definitions — INT8 Tensor-wise
 # =============================================================================

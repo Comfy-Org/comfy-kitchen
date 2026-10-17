@@ -57,8 +57,6 @@ bool launch_fp16_conv3d_kernel(const void*, const void*, const void*, const void
 void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, hipStream_t);
 void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
                                          int, int, const void*, float, hipStream_t);
-void launch_quantize_int8_convrot_swiglu_split_tiled128_kernel(
-    const void*, const void*, void*, void*, int, int, int, hipStream_t);
 void launch_quantize_int8_convrot_modulated_kernel(
     const void*, const void*, void*, void*, int, int, int, hipStream_t);
 void launch_quantize_int8_convrot_rms_modulated_fused_stats_kernel(
@@ -676,41 +674,6 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
                                         group_size, act_code,
                                         act_code == 3 ? act_weight->data() : nullptr, act_eps,
                                         reinterpret_cast<hipStream_t>(stream_ptr));
-    check_hip_launch();
-}
-
-void quantize_int8_convrot_swiglu_split_tiled128(
-    nb::ndarray<> gate, nb::ndarray<> up, nb::ndarray<> q,
-    nb::ndarray<> scales, int M, int K, int group_size,
-    uintptr_t stream_ptr) {
-    constexpr const char* kFn =
-        "quantize_int8_convrot_swiglu_split_tiled128";
-    require_nonneg(M, kFn, "M");
-    require_convrot_group(K, group_size, kFn);
-    require_dtype(gate, 2, 2, kFn, "gate");
-    require_dtype(up, 2, 2, kFn, "up");
-    require_dtype(q, 4, 4, kFn, "q");
-    require_len(gate, static_cast<int64_t>(M) * K, kFn, "gate");
-    require_len(up, static_cast<int64_t>(M) * K, kFn, "up");
-    const int64_t padded_m =
-        (static_cast<int64_t>(M) + 127) / 128 * 128;
-    require_len(q, padded_m * K, kFn, "q");
-    require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
-    require_packed_contiguous(gate, kFn, "gate");
-    require_packed_contiguous(up, kFn, "up");
-    require_packed_contiguous(q, kFn, "q");
-    require_packed_contiguous(scales, kFn, "scales");
-    const nb::ndarray<>* aligned_operands[] = {&gate, &up, &q};
-    for (const nb::ndarray<>* operand : aligned_operands) {
-        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
-            throw std::runtime_error(
-                std::string(kFn) + ": all operands must be 8-byte aligned");
-        }
-    }
-
-    launch_quantize_int8_convrot_swiglu_split_tiled128_kernel(
-        gate.data(), up.data(), q.data(), scales.data(), M, K, group_size,
-        reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -2559,8 +2522,6 @@ NB_MODULE(_C, m) {
           nb::arg("scales"), nb::arg("spill_rotated").none(), nb::arg("spill_partials").none(),
           nb::arg("M"), nb::arg("K"), nb::arg("group_size"), nb::arg("act_code"),
           nb::arg("stream_ptr"), nb::arg("act_weight") = nb::none(), nb::arg("act_eps") = 0.0f);
-    m.def("quantize_int8_convrot_swiglu_split_tiled128",
-          &quantize_int8_convrot_swiglu_split_tiled128);
     m.def("quantize_int8_convrot_modulated", &quantize_int8_convrot_modulated);
     m.def("quantize_int8_convrot_rms_modulated_fused_stats",
           &quantize_int8_convrot_rms_modulated_fused_stats);

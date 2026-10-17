@@ -22,7 +22,6 @@
 
 #include "device_arch.h"
 #include "rope_math.h"
-#include "swiglu_bf16.h"
 
 namespace comfy::hip_backend {
 
@@ -836,7 +835,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_kernel(
 // two radix-4 stages; the rest use ping-pong LDS (512 threads, two values each,
 // two barriers). Bank-aligned FP32 LDS. Not an arch-specific WMMA path; keep
 // separate from convrot_quant_kernel for other shapes and devices.
-template <int ACT, bool TILED_QOUT = false, bool SPLIT_SWIGLU = false,
+template <int ACT, bool TILED_QOUT = false,
           bool MODULATE = false, bool RMSNORM = false,
           bool PACKED_ELEMENT_SCHEDULE = false>
 __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
@@ -845,16 +844,10 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
     int M, int K, const void* __restrict__ norm_weight = nullptr,
     float rms_eps = 0.0f) {
 
-    static_assert(!SPLIT_SWIGLU || ACT == kActSwiGLU);
-    static_assert(!SPLIT_SWIGLU || PACKED_ELEMENT_SCHEDULE);
     static_assert(!MODULATE || ACT == kActNone);
-    static_assert(!MODULATE || !SPLIT_SWIGLU);
     static_assert(!RMSNORM || (MODULATE && PACKED_ELEMENT_SCHEDULE));
     static_assert(!PACKED_ELEMENT_SCHEDULE ||
-                  ((ACT == kActSwiGLU && TILED_QOUT && SPLIT_SWIGLU &&
-                    !MODULATE) ||
-                   (ACT == kActNone && !TILED_QOUT && !SPLIT_SWIGLU &&
-                    MODULATE == RMSNORM)));
+                  (ACT == kActNone && MODULATE == RMSNORM));
 
     constexpr int kThreads = 512;
     constexpr int kGroup = 256;
@@ -887,8 +880,7 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
     const int64_t qout_row_base = TILED_QOUT
         ? static_cast<int64_t>(row >> 7) * K * 128 + (row & 127) * 128
         : static_cast<int64_t>(row) * K;
-    constexpr int kInputWidth =
-        ACT == kActSwiGLU && !SPLIT_SWIGLU ? 2 : 1;
+    constexpr int kInputWidth = ACT == kActSwiGLU ? 2 : 1;
     const int64_t input_row = static_cast<int64_t>(row) * K * kInputWidth;
     const float norm = rsqrtf(static_cast<float>(kGroup));
 
@@ -966,19 +958,7 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
             if (active) {
                 const int64_t index = input_row + group * kGroup + element_base;
                 float input[kPackedElements];
-                if constexpr (SPLIT_SWIGLU) {
-                    const convrot_bf16x4 gates =
-                        *reinterpret_cast<const convrot_bf16x4*>(
-                            static_cast<const __bf16*>(x) + index);
-                    const convrot_bf16x4 ups =
-                        *reinterpret_cast<const convrot_bf16x4*>(
-                            static_cast<const __bf16*>(auxiliary) + index);
-                    #pragma unroll
-                    for (int element4 = 0; element4 < kPackedElements; ++element4) {
-                        input[element4] = static_cast<float>(
-                            swiglu_bf16_value(gates[element4], ups[element4]));
-                    }
-                } else if constexpr (MODULATE) {
+                if constexpr (MODULATE) {
                     const int column = group * kGroup + element_base;
                     const convrot_bf16x4 values =
                         *reinterpret_cast<const convrot_bf16x4*>(rowbuf + column);
@@ -1279,7 +1259,7 @@ inline void launch_convrot_quant_512x2_bf16(
     if constexpr (ACT == kActNone) {
         if (use_gfx12_convrot_packed_none()) {
             convrot_quant_512x2_bf16_kernel<
-                ACT, false, false, false, false, true>
+                ACT, false, false, false, true>
                 <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
                     x, nullptr, in_dtype, qout, scaleout, M, K);
             return;
@@ -1290,19 +1270,10 @@ inline void launch_convrot_quant_512x2_bf16(
             x, nullptr, in_dtype, qout, scaleout, M, K);
 }
 
-inline void launch_convrot_quant_512x2_bf16_swiglu_split_tiled128(
-    const void* gate, const void* up, int8_t* qout, float* scaleout,
-    int M, int K, hipStream_t stream) {
-    convrot_quant_512x2_bf16_kernel<
-        kActSwiGLU, true, true, false, false, true>
-        <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
-            gate, up, 2, qout, scaleout, M, K);
-}
-
 inline void launch_convrot_quant_512x2_bf16_modulated(
     const void* x, const void* modulation_scale,
     int8_t* qout, float* scaleout, int M, int K, hipStream_t stream) {
-    convrot_quant_512x2_bf16_kernel<kActNone, false, false, true>
+    convrot_quant_512x2_bf16_kernel<kActNone, false, true>
         <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
             x, modulation_scale, 2, qout, scaleout, M, K);
 }

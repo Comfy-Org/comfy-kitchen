@@ -179,35 +179,6 @@ def test_int8_linear_convrot_large_k_matches_eager(k):
 
 
 @needs_wmma
-def test_gfx12_split_swiglu_down_is_exact(hip):
-    skip_unless_gfx12_wmma()
-
-    torch.manual_seed(2)
-    m, n, k = 512, 3840, 10240
-    gate = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
-    up = torch.randn_like(gate)
-    gate[0, :4] = torch.tensor(
-        [5.9375, -87.5, -88.0, -88.5], device=DEV,
-        dtype=torch.bfloat16,
-    )
-    weight = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
-    weight_scale = torch.rand(n, device=DEV, dtype=torch.float32) + 0.25
-
-    with ck.use_backend("hip"):
-        reference = ck.int8_linear(
-            torch.nn.functional.silu(gate) * up,
-            weight, weight_scale, None, torch.bfloat16,
-            convrot=True, convrot_groupsize=256,
-        )
-        output = ck.int8_linear_swiglu_split(
-            gate, up, weight, weight_scale, None, torch.bfloat16,
-            convrot=True, convrot_groupsize=256,
-        )
-
-    assert torch.equal(output, reference)
-
-
-@needs_wmma
 def test_gfx12_modulated_qkv_is_exact(hip):
     skip_unless_gfx12_wmma()
 

@@ -90,7 +90,6 @@ __all__ = [
     "flash_decode",
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
-    "int8_linear_swiglu_split",
     "gated_delta_decode_fused",
     "gated_delta_decode_is_available",
     "deltanet_conv_step",
@@ -207,7 +206,6 @@ _WMMA_ONLY_OPS = frozenset({
     "int8_linear",
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
-    "int8_linear_swiglu_split",
     "na3d",
     "sol_attn",
     "convrot_w4a4_linear",
@@ -707,23 +705,6 @@ def _rotate_quant_int8_rms_modulated(
     return q, scales
 
 
-def _rotate_quant_int8_swiglu_split_tiled128(
-    gate2d: torch.Tensor, up2d: torch.Tensor, group_size: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply exact BF16 SwiGLU while emitting the down GEMM's tiled INT8 A."""
-    m, k = gate2d.shape
-    padded_m = (m + 127) // 128 * 128
-    q = torch.empty((padded_m, k), dtype=torch.int8, device=gate2d.device)
-    scales = torch.empty((m,), dtype=torch.float32, device=gate2d.device)
-    with torch.cuda.device(gate2d.device):
-        _C.quantize_int8_convrot_swiglu_split_tiled128(
-            _dl(_aligned(gate2d)), _dl(_aligned(up2d)),
-            _dl(q), _dl(scales),
-            m, k, group_size, _stream(gate2d),
-        )
-    return q, scales
-
-
 def _fused_rms_norm_ok(x: torch.Tensor, convrot: bool, group_size: int) -> bool:
     """Whether int8_linear's quantizer will run the fused G=256 kernel, the only
     one that implements rms_norm; the global spill and G=16/64 paths do not."""
@@ -1134,82 +1115,6 @@ def int8_linear_rms_modulated(
         m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
     )
     return out.reshape(*orig_shape[:-1], n)
-
-
-def int8_linear_swiglu_split(
-    gate: torch.Tensor,
-    up: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    convrot: bool = False,
-    convrot_groupsize: int = 256,
-) -> torch.Tensor:
-    """Down projection with exact split-BF16 SwiGLU folded into ConvRot."""
-    if gate.shape != up.shape:
-        raise ValueError(
-            f"split SwiGLU inputs must have the same shape, got "
-            f"{tuple(gate.shape)} and {tuple(up.shape)}"
-        )
-    if gate.device != up.device:
-        raise ValueError(
-            f"split SwiGLU inputs must share a device, got {gate.device} and {up.device}"
-        )
-    if weight.ndim != 2 or gate.shape[-1] != weight.shape[-1]:
-        raise ValueError(
-            f"Input and weight inner dimensions must match, got "
-            f"{gate.shape[-1]} and {weight.shape[-1] if weight.ndim == 2 else tuple(weight.shape)}"
-        )
-
-    orig_shape = gate.shape
-    k = orig_shape[-1]
-    m = gate.numel() // k
-    n = weight.shape[0]
-    use_split_tiled = (
-        _has_nonduplicated_wmma(gate.device)
-        and gate.dtype == torch.bfloat16
-        and up.dtype == torch.bfloat16
-        and out_dtype == torch.bfloat16
-        and convrot
-        and convrot_groupsize == 256
-        and m >= 512
-        and n == 3840
-        and k == 10240
-    )
-    if not use_split_tiled:
-        activated = torch.nn.functional.silu(gate) * up
-        return int8_linear(
-            activated, weight, weight_scale, bias, out_dtype,
-            convrot, convrot_groupsize,
-        )
-
-    weight = _aligned(weight.to(device=gate.device).contiguous())
-    weight_scale = weight_scale.to(
-        device=gate.device, dtype=torch.float32
-    ).reshape(-1)
-    if weight_scale.numel() not in (1, n):
-        raise ValueError(
-            f"INT8 weight scale must be scalar or per-output-channel, got "
-            f"{tuple(weight_scale.shape)}"
-        )
-    if bias is not None:
-        bias = _bias_operand(bias, n, gate.device)
-
-    gate2d = gate.reshape(m, k).contiguous()
-    up2d = up.reshape(m, k).contiguous()
-    q, x_scale = _rotate_quant_int8_swiglu_split_tiled128(
-        gate2d, up2d, convrot_groupsize
-    )
-    output = torch.empty((m, n), dtype=out_dtype, device=gate.device)
-    _C.int8_gemm_a_tiled128_down(
-        _dl(q), _dl(weight), _dl(output),
-        _dl(x_scale), _dl(weight_scale),
-        0 if weight_scale.numel() == 1 else 1,
-        None if bias is None else _dl(bias),
-        m, n, k, DTYPE_TO_CODE[out_dtype], _stream(gate2d),
-    )
-    return output.reshape(*orig_shape[:-1], n)
 
 
 # ---------------------------------------------------------------------------
@@ -3026,10 +2931,6 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             "x": divisible_bf16, "norm_weight": bf16_param,
             "modulation_scale": bf16_param, "weight": int8_2d,
             "out_dtype": out_param,
-        }),
-        "int8_linear_swiglu_split": fusion({
-            "gate": divisible_bf16, "up": divisible_bf16,
-            "weight": int8_2d, "out_dtype": out_param,
         }),
         "quantize_w4a8_int8_weight": FunctionConstraints(
             params={

@@ -26,9 +26,9 @@ extern "C" void launch_quantize_int8_convrot_rms_modulated_fused_stats_kernel(
     }
     if (M == 0) return;
 
-    // <ACT, TILED_QOUT, SPLIT_SWIGLU, MODULATE, RMSNORM, PACKED_ELEMENT_SCHEDULE>
+    // <ACT, TILED_QOUT, MODULATE, RMSNORM, PACKED_ELEMENT_SCHEDULE>
     convrot_quant_512x2_bf16_kernel<
-        kActNone, false, false, true, true, true>
+        kActNone, false, true, true, true>
         <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
             x, modulation_scale, 2, static_cast<int8_t*>(q),
             static_cast<float*>(scales), M, K, norm_weight, eps);
