@@ -28,6 +28,7 @@ from .gated_delta import deferred_buffers as gated_delta_deferred_buffers
 from .gated_delta import deltanet_conv_step_deferred, gated_delta_decode_deferred
 from .gated_delta import CTL_INTS as gated_delta_ctl_ints  # noqa: N811
 from .gated_delta import SLOT_MAX as gated_delta_slot_max  # noqa: N811
+from .h3_qkv import h3_qkv_prequantize
 from .registry import registry
 from .sage_attention import (
     PrequantizedInt8Attention,
@@ -69,6 +70,7 @@ __all__ = [
     "rms_adaln",
     # Attention
     "PrequantizedInt8Attention",
+    "h3_qkv_prequantize",
     "int8_attention",
     "int8_attention_from_prequantized",
     "int8_attention_is_available",
