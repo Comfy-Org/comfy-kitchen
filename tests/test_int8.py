@@ -132,6 +132,39 @@ def test_eager_int8_matmul_turing_n_alignment(monkeypatch):
     assert calls == [0]
 
 
+@pytest.mark.parametrize("k", [256, 1024, 2048, 4096])
+def test_exact_int8_mm_is_exact_past_the_fp32_integer_range(k):
+    """_exact_int8_mm must widen on K, not on M.
+
+    The int8 products are exact integers, so only the accumulation can lose them,
+    and only through the float format's integer range: fp32 represents integers
+    exactly up to 2**24. Each product is at most 128*128, so that budget runs out
+    at K = 1024 and anything deeper has to accumulate in fp64.
+
+    The operands are chosen so the exact total is odd and past 2**24, which is what
+    makes an fp32 accumulation observably wrong rather than merely imprecise: at
+    K = 2048 the sum is about -3.3e7, where an fp32 ulp is 4, so no rounding mode
+    recovers the last bit and the fp32 path returns -33032064 for -33032065. M is
+    32 throughout, which is what the padding in _int_matmul_accumulate produces --
+    so a check written on the M axis reads "32" and never widens.
+    """
+    from comfy_kitchen.backends.eager.quantization import _exact_int8_mm
+
+    lhs = torch.full((32, k), 127, dtype=torch.int8)
+    rhs = torch.full((k, 4), -127, dtype=torch.int8)
+    # One even product in an odd total: -127 * -127 is odd, so an all-odd sum past
+    # 2**24 is the case fp32 cannot represent at all.
+    rhs[-1] = -126
+
+    actual = _exact_int8_mm(lhs, rhs)
+    expected = (lhs.to(torch.int64) @ rhs.to(torch.int64)).to(torch.int32)
+
+    assert actual.dtype == torch.int32
+    assert torch.equal(actual, expected), (
+        f"K={k}: got {actual[0, 0].item()}, exact is {expected[0, 0].item()}"
+    )
+
+
 def test_cuda_int8_linear_does_not_retain_scratch_tensors():
     """CUDA INT8 linear uses per-call temporaries instead of retained scratch caches."""
     if not cuda_backend_available():
@@ -485,7 +518,25 @@ class TestTensorWiseINT8Layout:
 
     @pytest.mark.parametrize("backend", get_capable_backends("int8_linear", "cuda"))
     def test_int8_linear_correctness(self, seed, backend):
-        """Check int8_linear parity across all capable backends."""
+        """int8_linear matches the exact int8 arithmetic of its own activation.
+
+        A bitwise cross-backend comparison is not the right contract for the
+        compiled HIP backend: eager divides by the activation scale in the
+        activation dtype (fp16/bf16) while the HIP kernel divides in fp32, and
+        the library's own quantizer parity test accepts that as up to one int8
+        LSB on <=1% of codes (test_qdq.py::test_quantize_int8_rowwise_all_backends,
+        atol=1.0). One activation LSB propagates through the dot product, so the
+        two legitimately differ by more than fp32 rounding. Measured on gfx1035
+        the compiled HIP output is in fact the closer of the two to exact int8
+        arithmetic (4.8e-4 max relative, vs eager's 2.1e-1), so the meaningful
+        assertion is the exactness one below.
+
+        The relaxed cross-backend bound is therefore scoped to that backend only.
+        Upstream's 1% is kept for every other backend, because they do meet it and
+        a wider bound there would stop watching hardware this fork does not own.
+        Measured on gfx1035, mismatch ratio vs eager: hip 0.111, triton 0.000,
+        eager 0.000.
+        """
         import comfy_kitchen as ck
         from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
 
@@ -500,10 +551,23 @@ class TestTensorWiseINT8Layout:
 
         with ck.registry.use_backend(backend):
             out = ck.int8_linear(x, w_int8, w_scale, bias=bias, out_dtype=torch.float16)
+            q_x, s_x = ck.quantize_int8_rowwise(x)
 
-        # cuBLAS INT8 GEMM output compared to eager may have slight differences due to rounding
-        # However, eager vs triton vs cuda should be very close.
-        assert_values_close(out, ref_out, rtol=1e-2, atol=1e-2, name=f"int8_linear_{backend}", max_mismatch_ratio=0.01)
+        # Exact float32 arithmetic for this backend's own quantized activation:
+        # only the int32 accumulate, the two scales and the stored fp16 result
+        # may round, so the kernel must land within fp16 output rounding of it.
+        exact = (q_x.float() @ w_int8.float().t()) * (
+            s_x.float().reshape(-1, 1) * w_scale.float().reshape(1, -1)
+        ) + bias.float()
+        assert_values_close(
+            out.float(), exact, rtol=5e-3, atol=5e-3, name=f"int8_linear_{backend}_exact"
+        )
+        # And the backends agree, to upstream's bound except where the
+        # activation-dtype scale division above actually forces a wider one.
+        assert_values_close(
+            out, ref_out, rtol=1e-2, atol=1e-2, name=f"int8_linear_{backend}",
+            max_mismatch_ratio=0.15 if backend == "hip" else 0.01,
+        )
 
     def test_int8_linear_cuda_single_row_gemv(self, seed):
         """CUDA int8_linear uses the single-row GEMV path correctly."""

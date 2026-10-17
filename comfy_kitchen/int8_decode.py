@@ -25,6 +25,32 @@ def is_available(device: torch.device | None = None) -> bool:
 
 class Int8DecodeCache:
     def __init__(self, batch, heads, capacity, device):
+        # The attention half of this cache is a WMMA kernel (int8_attn_kernel with
+        # Paged=true), so it needs matrix cores: `has_wmma()` on ROCm, SM80 on CUDA.
+        # That is the same requirement `is_available` above reports, and this class
+        # has to enforce it rather than assume the caller did.
+        #
+        # Without the check, a cache built on a device without matrix cores -- RDNA2
+        # (gfx103x), where MmaInt8::mma compiles to __builtin_trap() and leaves the
+        # context unusable -- kills the process instead of raising. A trap is not a
+        # launch error either: hipGetLastError() reports success, so nothing catches
+        # it, and the failure surfaces later as "unspecified launch failure" at some
+        # unrelated synchronization. Checked here rather than in attend() because the
+        # cache is unusable from construction on such a device, and allocating the
+        # (large) buffers first would only delay the error.
+        #
+        # RDNA2 is not left without a decode path by this: it runs the ported
+        # SageAttention kernel for attention (rdna2_sageattn, head_dim <= 128) and
+        # the upstream flash-decode for KV, just not this paged int8 kernel.
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        if not is_available(dev):
+            raise RuntimeError(
+                "Int8DecodeCache requires the paged INT8 decode kernels, which are "
+                "WMMA-only: the HIP extension on an AMD device with matrix cores "
+                "(RDNA3 or newer), or the CUDA extension on SM80 or newer"
+                if torch.version.hip
+                else "Int8DecodeCache requires the CUDA extension on SM80 or newer"
+            )
         page_size = 512
         pages = (capacity + page_size - 1) // page_size
         self.key = torch.zeros((batch, pages, heads, page_size, 256), dtype=torch.int8, device=device)
