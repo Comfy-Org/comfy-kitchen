@@ -137,6 +137,27 @@ def test_int8_linear_matches_eager(m, n, k, per_channel):
 
 
 @needs_wmma
+def test_int8_gemm_no_bias_preserves_negative_zero(hip):
+    m, n, k = 1, 1, 64
+    a = torch.zeros((m, k), dtype=torch.int8, device=DEV)
+    b = torch.zeros((n, k), dtype=torch.int8, device=DEV)
+    scale_a = torch.full((m,), -1.0, dtype=torch.float32, device=DEV)
+    scale_b = torch.ones(1, dtype=torch.float32, device=DEV)
+    out = torch.empty((m, n), dtype=torch.float32, device=DEV)
+
+    # Use the raw GEMM so this tiny shape still exercises the WMMA epilogue
+    # instead of taking the public linear API's GEMV route.
+    hip._C.int8_gemm(
+        hip._dl(a), hip._dl(b), hip._dl(out),
+        hip._dl(scale_a), hip._dl(scale_b), 0, None,
+        m, n, k, hip.DTYPE_TO_CODE[torch.float32], hip._stream(a),
+    )
+
+    assert out.item() == 0.0
+    assert torch.signbit(out).item()
+
+
+@needs_wmma
 def test_int8_linear_convrot_matches_eager():
     torch.manual_seed(0)
     m, n, k = 256, 512, 512
