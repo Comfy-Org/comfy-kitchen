@@ -1247,29 +1247,6 @@ inline bool convrot_512x2_supported(int K) {
         static_cast<size_t>(lds_bytes);
 }
 
-inline bool use_gfx12_convrot_packed_none() {
-    return use_nonduplicated_wmma_schedule() && convrot_wave32_512_supported();
-}
-
-template <int ACT>
-inline void launch_convrot_quant_512x2_bf16(
-    const void* x, int in_dtype, int8_t* qout, float* scaleout,
-    int M, int K, hipStream_t stream) {
-    // gfx12: eight-group packed schedule for plain activation ConvRot.
-    if constexpr (ACT == kActNone) {
-        if (use_gfx12_convrot_packed_none()) {
-            convrot_quant_512x2_bf16_kernel<
-                ACT, false, false, false, true>
-                <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
-                    x, nullptr, in_dtype, qout, scaleout, M, K);
-            return;
-        }
-    }
-    convrot_quant_512x2_bf16_kernel<ACT>
-        <<<M, 512, static_cast<size_t>(K) * sizeof(__bf16), stream>>>(
-            x, nullptr, in_dtype, qout, scaleout, M, K);
-}
-
 inline void launch_convrot_quant_512x2_bf16_modulated(
     const void* x, const void* modulation_scale,
     int8_t* qout, float* scaleout, int M, int K, hipStream_t stream) {

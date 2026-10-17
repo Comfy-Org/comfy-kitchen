@@ -10,24 +10,6 @@ namespace comfy::hip_backend {
 
 constexpr float kInt8Max = 127.0f;
 
-inline bool use_convrot_512x2_bf16(int in_code, int K, int group_size) {
-    if (in_code != 2 || group_size != 256) {
-        return false;
-    }
-
-    // The 512-thread schedules (packed-element for plain activations, two
-    // groups per thread for gelu/swiglu) are used only at K=3840 and 10240,
-    // where they match the generic producer exactly and are faster. Other
-    // widths keep the generic producer.
-    if (K != 3840 && K != 10240) {
-        return false;
-    }
-
-    // Tuned for gfx12/gfx117; other targets keep the generic producer. The
-    // schedule also needs wave32, a 512-thread workgroup and LDS for the row.
-    return use_nonduplicated_wmma_schedule() && convrot_512x2_supported(K);
-}
-
 __forceinline__ __device__ int8_t quant_round(float v, float inv) {
     // rintf is round-half-to-even, matching torch.round.
     int q = static_cast<int>(rintf(v * inv));
@@ -278,42 +260,22 @@ extern "C" void launch_quantize_int8_convrot_kernel(
     if (M == 0) {
         return;  // a zero-block launch is hipErrorInvalidConfiguration
     }
-    const bool schedule_512x2 =
-        use_convrot_512x2_bf16(in_code, K, group_size);
     if (act_code == kActRmsNorm) {
         launch_convrot_quant_rms_norm(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
             M, K, act_weight, act_eps, stream);
     } else if (act_code == kActGeluTanh) {
-        if (schedule_512x2) {
-            launch_convrot_quant_512x2_bf16<kActGeluTanh>(
-                x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
-                M, K, stream);
-        } else {
-            launch_convrot_quant<false, kActGeluTanh>(
-                x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
-                M, K, group_size, stream, spill_rotated, spill_partials);
-        }
+        launch_convrot_quant<false, kActGeluTanh>(
+            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
+            M, K, group_size, stream, spill_rotated, spill_partials);
     } else if (act_code == kActSwiGLU) {
-        if (schedule_512x2) {
-            launch_convrot_quant_512x2_bf16<kActSwiGLU>(
-                x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
-                M, K, stream);
-        } else {
-            launch_convrot_quant<false, kActSwiGLU>(
-                x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
-                M, K, group_size, stream, spill_rotated, spill_partials);
-        }
+        launch_convrot_quant<false, kActSwiGLU>(
+            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
+            M, K, group_size, stream, spill_rotated, spill_partials);
     } else {
-        if (schedule_512x2) {
-            launch_convrot_quant_512x2_bf16<kActNone>(
-                x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
-                M, K, stream);
-        } else {
-            launch_convrot_quant<false, kActNone>(
-                x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
-                M, K, group_size, stream, spill_rotated, spill_partials);
-        }
+        launch_convrot_quant<false, kActNone>(
+            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
+            M, K, group_size, stream, spill_rotated, spill_partials);
     }
 }
 
