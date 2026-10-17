@@ -4153,10 +4153,14 @@ def _load_rdna2_module() -> None:
     # an RDNA2 iGPU and a dGPU, a first call made while the dGPU was current would
     # have cached "no RDNA2 device is visible" and every later call with a real
     # gfx1035 tensor would report the path unavailable until the process ended.
-    try:
-        from . import _C
-    except Exception as e:  # a broken extension must not break import
-        _rdna2_import_error = e
+    # `from . import _C` does not raise when the extension failed to load: the
+    # module body above leaves `_C = None`, and the import binds the attribute
+    # rather than going looking for a submodule. Without this check a broken build
+    # reaches rdna2_import_error with no recorded reason and is reported as
+    # "the requested device is not RDNA2" -- the one reading the comment there
+    # exists to rule out.
+    if not _EXT_AVAILABLE or _C is None:
+        _rdna2_import_error = RuntimeError(_EXT_ERROR or "HIP extension not built")
         return
 
     _rdna2_module = _C
@@ -4590,8 +4594,11 @@ def rdna2_sageattn(
         q = q.contiguous()
     q_fp = q
     if skip_inq and tensor_layout == "NHD":
-        b_, s_, h_, d_ = q.shape
-        q_fp = q.as_strided((b_, h_, s_, d_), (s_ * h_ * d_, d_, h_ * d_, 1))
+        # A transpose view, not as_strided with packed NHD strides: Q only has to
+        # be vector-readable to get here, which a merely strided NHD view is, and
+        # imposed strides over strided storage read the wrong elements. Same reason
+        # the V branch above tests is_contiguous() before its own as_strided.
+        q_fp = q.transpose(1, 2)
 
     # _C has no torch in it, so every buffer is built here. The quantizer always
     # writes packed [B, heads, seq, dim] whatever layout Q arrived in, which is why

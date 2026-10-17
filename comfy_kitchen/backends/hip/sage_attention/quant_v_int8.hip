@@ -291,6 +291,8 @@ extern "C" void launch_sage_transpose_v(const void* v, void* out, int B, int H, 
     }
     // The transpose serves the gfx1103 iGPU's direct-attention path only (the
     // binding gates the launch on comfy_small_igpu), so it stages the iGPU tile.
+    // That gate admits head_dim 64 and 128, both of which divide dtile: widening
+    // it to a dim that does not would turn the check below into a runtime refusal.
     const int dtile = kDTileIGpu;
     if (D <= 0 || D % dtile != 0) {
         throw std::runtime_error("sage int8 attention: head_dim must be a positive multiple of " +

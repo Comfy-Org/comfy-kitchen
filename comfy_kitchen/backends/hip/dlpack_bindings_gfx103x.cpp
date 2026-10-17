@@ -341,6 +341,13 @@ void gfx103x_qk_int8_sv_attn(nb::ndarray<> query, nb::ndarray<> key, nb::ndarray
     // which is how it said so before; the launcher zeroes the strides to match.
     require_dtype(q_scale, 0, fn, "q_scale");
     require_dtype(k_scale, 0, fn, "k_scale");
+    // Rank before the strides below: both are [batch, heads, groups], and
+    // nb::ndarray::stride() indexes the stride vector without checking it, so a
+    // 1-D scale of the right element count would be read past the end.
+    require_ndim(k_scale, 3, fn, "k_scale");
+    if (q_scale.size() > 0) {
+        require_ndim(q_scale, 3, fn, "q_scale");
+    }
     // The pointers, not just the strides below. Both are needed for every call, and a
     // launcher that takes raw pointers cannot report a null one -- it dequantizes
     // against address zero and returns a plausible-looking answer.

@@ -264,6 +264,15 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
         // answer. Re-measure before changing it, and keep the override above:
         // one process interleaving every width is the only way to read this on
         // this device.
+        //
+        // **K=1024 is the one row the code does not follow.** It is folded into the
+        // groups <= 10 bucket and so launched at 64, not at the 128 the sweep found
+        // best. Left as it is on purpose: that row is the only one measured at a
+        // single M (512, where the gain is 1.22x) while every other row was agreed
+        // across several, and 128 at 4 groups against 64 at 5 is not the shape the
+        // "groups in flight" argument above predicts. Widening the gate is a
+        // re-measure, not a reading. It is also only a speed question -- the width
+        // changes no output bit, which tests/test_hip_convrot_quant_exact.py pins.
         const int groups = K / kConvRotGroup256;
         if (K == 10240) {
             return 640;
