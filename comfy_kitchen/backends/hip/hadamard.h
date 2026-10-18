@@ -249,7 +249,7 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
         // width ladder (COMFY_CONVROT_FUSED_BLOCK), M in {512, 1024, 2048, 4096,
         // 6144, 9216}. Best width and its gain over the dGPU heuristic:
         //
-        //   K=1024  ( 4 groups)   64    see the re-measurement below
+        //   K=1024  ( 4 groups)  128    1.02x-1.06x at M=1024..4096, see below
         //   K=1280  ( 5 groups)   64    2.33x / 2.92x / 2.98x  (M=1024/4096/6144)
         //   K=2048  ( 8 groups)   64    1.55x / 1.86x / 1.94x
         //   K=2560  (10 groups)   64    1.14x / 1.23x
@@ -265,53 +265,77 @@ inline int convrot_quant_fused_block_threads(int M, int K) {
         // one process interleaving every width is the only way to read this on
         // this device.
         //
-        // **K=1024 is the one row the code does not follow, and re-measuring it
-        // says the code is right.** The table above lists 128 there, but 64 is
-        // what the `groups <= 10` bucket below answers, so the row and the code
-        // disagreed. Re-measured on this 6-CU gfx1035 in one process, 120 paired
-        // rounds x 24 back-to-back launches per round (one sync per round, so the
-        // host round-trip is amortized rather than timed), order rotated by round,
-        // canary arm included, outputs checked bit-identical at every width first.
-        // The override was verified live first -- convrot_fused_block reports the
-        // override under it, falls back to the heuristic on an uninstantiated
-        // width, and re-reads per launch -- so the widths really were different
-        // launches:
+        // **K=1024 IS the one row the code did not follow, and following it is a
+        // measured win.** It was folded into the `groups <= 10` bucket, so it
+        // launched at 64 while the table above says 128. Re-measured on this
+        // 6-CU gfx1035, 128 against 64, 150-250 paired rounds x 64 back-to-back
+        // launches per round, order rotated by round, outputs checked
+        // bit-identical at every width first, and repeated in independent
+        // processes:
         //
-        //   M=512    control 0.0842 ms, canary floor 1.0043x
-        //             64   0.0844 ms  1.0000x  (reproduces the control, as it must)
-        //             128  0.0846 ms  0.9954x  slower in 178/300 rounds, p=0.0015
-        //   M=1024..9216  128 measures 0.9949x-0.9960x of the control at every M
+        //   M=512    1.0005x  a tie (the noise floor is 0.03%-0.51% there)
+        //   M=1024   1.0434x - 1.0603x   faster, 3/3 and 5/5 processes, p <= 7e-08
+        //   M=2048   1.0270x - 1.0374x   faster, 3/3 and 5/5 processes, p <= 3e-05
+        //   M=4096   1.0120x - 1.0207x   faster, 5/5 processes
         //
-        // So 128 is not 1.22x at M=512 here; it is ~0.5% slower, consistently
-        // enough across all six M that the direction is not in doubt. The row is
-        // corrected to 64 rather than the code widened, which is the fix the
-        // review of this table proposed and this measurement declines.
+        // So 128 is never slower at this K and is up to 6% faster in the middle
+        // of the range. The table's own "1.22x at M=512" does NOT reproduce --
+        // M=512 is a tie here -- but the row's choice of width does, and that is
+        // the part that was wrong in the code.
         //
-        // **The positive controls did not reproduce either, so treat the whole
-        // table above as unreproduced rather than as refuted.** K=5120, where the
-        // table claims 256 wins by 1.27x, measures every width in the ladder
-        // within 0.5% of every other. The likely reason is that this part is
-        // bandwidth-starved in its present state: it sustains ~3.5-5 GB/s on a
-        // plain device-to-device copy, and the fused quantizer already runs at
-        // 4.4-4.6 GB/s -- 88-92% of that ceiling -- so width has nothing left to
-        // trade. Sampling rocm-smi under load shows sclk boosting to 2200 MHz
-        // while mclk stays pinned at 800 MHz, its lowest level (--showmclkrange
-        // reports no range on this part), which is what bounds the bus. A
-        // bandwidth-bound kernel cannot show the gains this table records, so
-        // either those were taken with memory clocked higher, or the conditions
-        // changed since. This does NOT establish the table wrong; it establishes
-        // that it does not reproduce here and should be re-measured on a part
-        // whose memory clock actually moves before anything here is changed on
-        // the strength of it.
+        // **K == 1024 exactly, NOT `groups <= 4`.** The review that flagged this
+        // proposed widening the gate to `groups <= 4`, which would also catch
+        // K=256, 512 and 768. Measured, that is a large loss, and it is the
+        // "groups in flight" argument above biting:
         //
-        // The heuristic is left exactly as it is either way: it is the safe
-        // answer, and where the widths tie, a tie is not a reason to retune.
+        //   K=256  (1 group)  128 is 0.57x  -- a 128-thread block has two
+        //   K=512  (2 groups) 128 is 0.89x-0.94x     subgroups in flight but the
+        //   K=768  (3 groups) 128 is 0.83x-0.99x     row only has one to three
+        //   K=1280 (5 groups) 128 is 0.93x-0.94x     groups, so the second one
+        //   K=1024 (4 groups) 128 is 1.02x-1.06x     idles AND the scratch doubles
+        //
+        // Four groups is the one width where the row has enough groups to keep
+        // two subgroups busy without leaving the second one empty, which is why
+        // the boundary is a single K and not a group count. Hence `K == 1024`.
+        //
+        // **A METHOD NOTE, because it changed the answer.** An earlier attempt at
+        // this measurement concluded the opposite -- that the widths tie -- and
+        // two separate mistakes produced that, both worth not repeating:
+        //
+        //   1. The harness set and cleared COMFY_CONVROT_FUSED_BLOCK on every
+        //      single call, which is a putenv/unsetenv syscall per launch, while
+        //      the control arm (no override) never touched the environment at
+        //      all. The control was therefore systematically favoured and every
+        //      candidate systematically penalised. Setting the variable once per
+        //      arm and keeping the timed region free of environment changes
+        //      fixed it; the sanity check that proves it is that the width-64
+        //      arm and the control arm are the same launch and now agree to
+        //      within the noise floor (0.03%-2.00%).
+        //   2. The measurement was taken while this part's memory clock was
+        //      stuck at its lowest level (mclk 800 MHz, sclk boosting to
+        //      2200 MHz), which caps it at ~3.5-5 GB/s and makes the kernel
+        //      bandwidth-bound with nothing for the width to trade. With the
+        //      memory clock moving, the same copy runs at ~67 GB/s and the
+        //      quantizer at 55-66 GB/s, and the widths separate. **Re-measure
+        //      this table before trusting any of it if the memory clock is not
+        //      moving** -- the numbers above are only meaningful on a part that
+        //      is actually getting its bandwidth.
         //
         // Either way it is only a speed question -- the width changes no output
         // bit, which tests/test_hip_convrot_quant_exact.py pins at every width.
         const int groups = K / kConvRotGroup256;
         if (K == 10240) {
             return 640;
+        }
+        // K=1024 is four Hadamard groups: the one row where a two-subgroup block
+        // pays, because the row has enough groups to keep the second subgroup
+        // busy while the LDS scratch it costs stays worth it. Measured 1.02x-1.06x
+        // over 64 at M=1024..4096 and a tie at M=512, never slower. It has to be
+        // this exact K: the same width at 1, 2, 3 or 5 groups is 0.57x-0.99x,
+        // because there the second subgroup idles and the scratch still doubles.
+        // See the measurement above.
+        if (K == 1024) {
+            return 128;
         }
         if (groups <= 10) {
             return 64;
