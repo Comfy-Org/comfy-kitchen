@@ -18,9 +18,16 @@ from .exceptions import (
 )
 from .flash_attention import flash_attention_decode
 from .flash_attention import is_available as flash_attention_decode_is_available
+from .flash_attention import flash_attention_decode_gqa, flash_attention_decode_gqa_is_available
+from .flash_attention import flash_attention_decode_step_merge
 from .float_utils import from_blocked, swap_nibbles, to_blocked
 from .gated_delta import deltanet_conv_step, gated_delta_decode_fused
 from .gated_delta import is_available as gated_delta_decode_is_available
+from .gated_delta import deferred_is_available as gated_delta_deferred_is_available
+from .gated_delta import deferred_buffers as gated_delta_deferred_buffers
+from .gated_delta import deltanet_conv_step_deferred, gated_delta_decode_deferred
+from .gated_delta import CTL_INTS as gated_delta_ctl_ints  # noqa: N811
+from .gated_delta import SLOT_MAX as gated_delta_slot_max  # noqa: N811
 from .registry import registry
 from .sage_attention import (
     PrequantizedInt8Attention,
@@ -68,9 +75,18 @@ __all__ = [
     "int8_attention_is_available",
     "prequantize_int8_attention",
     "flash_attention_decode",
+    "flash_attention_decode_gqa",
+    "flash_attention_decode_gqa_is_available",
+    "flash_attention_decode_step_merge",
     "gated_delta_decode_fused",
     "deltanet_conv_step",
     "gated_delta_decode_is_available",
+    "gated_delta_deferred_is_available",
+    "gated_delta_deferred_buffers",
+    "deltanet_conv_step_deferred",
+    "gated_delta_decode_deferred",
+    "gated_delta_ctl_ints",
+    "gated_delta_slot_max",
     "flash_attention_decode_is_available",
     "na2d",
     "na3d",
@@ -120,6 +136,13 @@ __all__ = [
     "rms_rope_split_half_",
     "rms_rope_split_half1",
     "rms_rope_split_half1_",
+    # Geometry
+    "delaunay3d",
+    "mesh_bvh",
+    "closest_point_on_mesh",
+    "connected_components",
+    "edge_collapse_checks",
+    "min_cut",
     # Utilities
     "swap_nibbles",
     "to_blocked",
@@ -1051,7 +1074,7 @@ def int8_linear(
         convrot: If True, apply online activation rotation.
         convrot_groupsize: Group size for Hadamard rotation.
         input_act: Optional activation applied to x before quantization
-            ("gelu_tanh", "swiglu", "rms_norm", or None). When
+            ("gelu_tanh", "swiglu", "situ", "rms_norm", or None). When
             the fused ConvRot quantizer handles the shape it is folded in, so
             an MLP's ``linear(act(proj(x)))`` or a pre-norm block's
             ``linear(rms_norm(x))`` never writes the intermediate to HBM;
@@ -1144,6 +1167,96 @@ def int8_linear_rms_modulated(
             "convrot_groupsize": convrot_groupsize,
         },
     )
+
+
+def delaunay3d(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """3D Delaunay tetrahedralization of distinct points (N, 3) float32/float64.
+
+    Returns (vertices (N + 4, 3) float64, tets (M, 4) int32, neighbors (M, 4) int32).
+    Vertices N..N+3 are the corners of a large bounding tet; tets using them fill the space
+    outside the convex hull. Tets satisfy (v1 - v0) . ((v2 - v0) x (v3 - v0)) > 0, and
+    neighbors[i, k] is the tet across the face opposite vertex k, or -1 on the bounding
+    tet's outer faces.
+
+    Like qhull's QJ, points are joggled by up to 1e-10 of their extent or largest
+    coordinate, whichever is larger, so no four are exactly coplanar; the returned vertices
+    are the joggled ones. A small fraction of faces may stay non-Delaunay, mostly on nearly
+    cospherical input, but the result is always a valid tetrahedralization.
+    """
+    kwargs = {"points": points}
+    impl = registry.get_implementation("delaunay3d", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def mesh_bvh(triangles: torch.Tensor):
+    """Linear BVH over triangles (F, 3, 3) float32 for closest_point_on_mesh.
+
+    Returns a reusable tuple (triangles in Morton order, their original ids, child links,
+    node boxes).
+    """
+    kwargs = {"triangles": triangles}
+    impl = registry.get_implementation("mesh_bvh", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def closest_point_on_mesh(
+    bvh, points: torch.Tensor, max_dist: float = float("inf")
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exact closest point on the `bvh` mesh to each of points (N, 3) float32.
+
+    Returns (distance (N,) float32, closest point (N, 3) float32, triangle id (N,) int64
+    into the triangles given to mesh_bvh). Points with nothing within `max_dist` get
+    distance max_dist, the point itself and triangle -1.
+    """
+    kwargs = {"bvh": bvh, "points": points, "max_dist": max_dist}
+    impl = registry.get_implementation("closest_point_on_mesh", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def connected_components(edges: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    """Connected components of an undirected graph with edges (E, 2) int32/int64 in
+    [0, num_nodes). Returns (num_nodes,) int64: the smallest node index in each node's
+    component.
+    """
+    kwargs = {"edges": edges, "num_nodes": num_nodes}
+    impl = registry.get_implementation("connected_components", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def edge_collapse_checks(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    edges: torch.Tensor,
+    positions: torch.Tensor,
+    cos_threshold: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Checks for collapsing each edge i = (a, b) into one vertex at positions[i].
+
+    vertices (V, 3) float32, faces (F, 3) int32/int64 with distinct corners, edges (E, 2)
+    int32/int64, positions (E, 3) float32. Returns per edge, over the faces that keep a or b:
+
+    - flips (E,) int32: faces with cos(old normal, new normal) < cos_threshold, skipping
+      faces with |normal| <= 1e-6 x their sum of squared edge lengths before or after.
+    - skinny (E,) float32: mean of 1 - clamp(4√3·area / sum of squared edge lengths, 0, 1),
+      0 for equilateral faces.
+    - link_ok (E,) bool: a and b share at most as many neighbours as faces on the edge, so
+      the collapse keeps the topology.
+    """
+    kwargs = {"vertices": vertices, "faces": faces, "edges": edges, "positions": positions,
+              "cos_threshold": cos_threshold}
+    impl = registry.get_implementation("edge_collapse_checks", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def min_cut(nbr: torch.Tensor, cap: torch.Tensor, s_cap: torch.Tensor, t_cap: torch.Tensor) -> torch.Tensor:
+    """Minimum s-t cut of a graph given as neighbour slots: nbr (N, K) int32/int64, -1 for an
+    empty slot, symmetric (j lists i whenever i lists j); cap (N, K) float32 symmetric edge
+    capacities; s_cap / t_cap (N,) float32 capacities to the source and the sink. Returns
+    (N,) bool, True on the source side (the largest source side among the minimum cuts).
+    """
+    kwargs = {"nbr": nbr, "cap": cap, "s_cap": s_cap, "t_cap": t_cap}
+    impl = registry.get_implementation("min_cut", kwargs=kwargs)
+    return impl(**kwargs)
 
 
 # =============================================================================

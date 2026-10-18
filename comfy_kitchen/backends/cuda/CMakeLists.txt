@@ -150,13 +150,20 @@ set(CUDA_SOURCES
     ops/adaln.cu
     ops/flash_decode.cu
     ops/gated_delta.cu
+    ops/delaunay3d.cu
+    ops/mesh_bvh.cu
+    ops/connected_components.cu
+    ops/edge_collapse.cu
+    ops/min_cut.cu
     sage_attention/quant_v_int8.cu
     sage_attention/quant_qk_int8.cu
     sage_attention/sage_attn_launcher.cu
+    sage_attention/int8_decode.cu
 )
 
 set(CPP_SOURCES
     dlpack_bindings.cpp
+    int8_decode_bindings.cpp
 )
 
 # Keep CUDA compilation independent of the Python extension target. The

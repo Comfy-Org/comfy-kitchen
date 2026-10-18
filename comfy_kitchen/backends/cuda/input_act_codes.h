@@ -8,8 +8,13 @@
 
 namespace comfy {
 
-// SwiGLU is the gated pair: the raw row is [gate | up] (2*K wide) and the
-// activated row silu(gate) * up is K wide. RmsNorm carries a weight pointer and eps.
-enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2, kActRmsNorm = 3 };
+// SwiGLU and SiTU are gated pairs: the raw row is two K-wide halves, [gate | up]
+// for silu(gate) * up and [hidden | gate] for SiTU's 4*tanh(gate/4)*sigmoid(gate) *
+// 25*tanh(hidden/25), and the activated row is K wide. RmsNorm carries a weight
+// pointer and eps.
+enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2, kActRmsNorm = 3, kActSiTU = 4 };
+
+// Raw input columns per activated column.
+constexpr int input_act_width(int act) { return (act == kActSwiGLU || act == kActSiTU) ? 2 : 1; }
 
 }  // namespace comfy

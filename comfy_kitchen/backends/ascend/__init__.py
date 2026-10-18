@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import torch
 
+from comfy_kitchen.backends._activations import INPUT_ACT_TO_CODE as _INPUT_ACT_TO_CODE
 from comfy_kitchen.backends._activations import (
     apply_input_act as _apply_input_act,
 )
@@ -272,7 +273,7 @@ def _validate_int8_linear(kwargs) -> ValidationResult:
     bias = kwargs.get("bias")
     input_act = kwargs.get("input_act")
 
-    if input_act not in (None, "none", "gelu_tanh", "swiglu", "rms_norm"):
+    if input_act not in _INPUT_ACT_TO_CODE:
         return ValidationResult.fail("input_act", f"unsupported value {input_act!r}")
     if not isinstance(x, torch.Tensor) or not isinstance(weight, torch.Tensor):
         return ValidationResult.ok()
