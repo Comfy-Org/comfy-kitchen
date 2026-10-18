@@ -449,14 +449,17 @@ def _max_dynamic_shared_memory_per_block(x: torch.Tensor) -> int:
 
 
 def _convrot_int8_fused_shared_memory_bytes(m: int, k: int) -> int:
+    # mirrors launch_quantize_int8_rowwise_convrot64_kernel's block-size rule
     if m == 1:
         block_threads = 512
     elif k == 256:
         block_threads = 64
-    elif k == 2560:
-        block_threads = 640
-    elif k == 6144:
-        block_threads = 768
+    elif k <= 3072:
+        block_threads = 128
+    elif k <= 6144:
+        block_threads = 256
+    elif k < 12288:
+        block_threads = 512
     else:
         block_threads = 1024
     groups_in_flight = block_threads // 64
