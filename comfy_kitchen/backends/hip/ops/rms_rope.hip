@@ -268,9 +268,9 @@ __global__ __launch_bounds__(ROWS_PER_BLOCK * 32) void rms_rope_wave32_128_kerne
         const float qb = round_to<T>(
             rms_rope_load_x<STATIC_BF16_TYPES>(q, ib_in, x_code) * rrms_q * sb);
         rope_store<T>(q_out, ia_out,
-                      rope_combine(f00, qa, f01, qb, f_code, split_half));
+                      rope_combine(f00, qa, f01, qb, f_code));
         rope_store<T>(q_out, ib_out,
-                      rope_combine(f10, qa, f11, qb, f_code, split_half));
+                      rope_combine_b(f10, qa, f11, qb, f_code, split_half));
 
         if (has_k) {
             const float ta = rms_rope_load_scale<STATIC_BF16_TYPES>(k_scale, ia, s_code);
@@ -280,9 +280,9 @@ __global__ __launch_bounds__(ROWS_PER_BLOCK * 32) void rms_rope_wave32_128_kerne
             const float kb = round_to<T>(
                 rms_rope_load_x<STATIC_BF16_TYPES>(k, ib_in, x_code) * rrms_k * tb);
             rope_store<T>(k_out, ia_out,
-                          rope_combine(f00, ka, f01, kb, f_code, split_half));
+                          rope_combine(f00, ka, f01, kb, f_code));
             rope_store<T>(k_out, ib_out,
-                          rope_combine(f10, ka, f11, kb, f_code, split_half));
+                          rope_combine_b(f10, ka, f11, kb, f_code, split_half));
         }
     }
 
