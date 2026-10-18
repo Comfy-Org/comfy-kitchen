@@ -48,6 +48,7 @@ import torch
 from comfy_kitchen.backends.hip import (
     _C,
     _EXT_AVAILABLE,
+    _gfx_arch,
     _visible_gfx_arches,
     rdna2_is_available,
     _EXT_ERROR,
@@ -355,13 +356,27 @@ def test_the_default_width_is_not_the_widest_one():
         "so this shape proves nothing about the table"
     )
     arches = {arch.split(":")[0] for arch in _visible_gfx_arches() if arch}
-    if "gfx1103" in arches or any(a.startswith("gfx103") for a in arches):
+    # The width the extension just reported belongs to the CURRENT device:
+    # convrot_fused_block_host answers through comfy_small_igpu() and
+    # comfy_is_gfx10(), which are the current-device overloads (hipGetDevice).
+    # The set of VISIBLE architectures is a different question -- on a host with
+    # both families it names an architecture the answer did not come from -- so
+    # the predicates below are about the device that was actually queried, and
+    # the visible set is kept only for the message.
+    #
+    # This is not a hypothetical. A host with a visible gfx103x and a current
+    # device of gfx1103 made the gfx103 branch below demand 128 from a gfx1103,
+    # which answers 64 at four groups. And a current device of gfx12 answered 1024
+    # at K=1280, which failed `width < 1024` in the branch that the visible set
+    # had selected. Both are the test being wrong about which device it asked.
+    queried_arch = _gfx_arch() or ""
+    if queried_arch == "gfx1103" or queried_arch.startswith("gfx103"):
         # The two families with a measured entry in the table. K=1280 is five
         # Hadamard groups and both answer 64 there, so the widest answer either can
         # give is the one this rules out.
         assert width < 1024, (
             f"the heuristic picked the widest width ({width}) at K={k}, which is 5 "
-            f"Hadamard groups, on {sorted(arches)}"
+            f"Hadamard groups, on {queried_arch} (visible: {sorted(arches)})"
         )
         # And the measured width at K=1024, which is four groups. The table says
         # 128 there and the code answered 64, because K=1024 was folded into the
@@ -371,15 +386,17 @@ def test_the_default_width_is_not_the_widest_one():
         # gfx103x only, and deliberately not gfx1103: the K==1024 arm lives in the
         # `comfy_is_gfx10()` branch of the heuristic, and the small-iGPU table
         # answers 64 at four groups, so this is not a claim about every family.
-        if any(a.startswith("gfx103") for a in arches):
+        if queried_arch.startswith("gfx103"):
             assert width_at_1024 == 128, (
                 f"the heuristic picked {width_at_1024} instead of the measured 128 at "
-                f"K=1024 (four Hadamard groups) on {sorted(arches)}"
+                f"K=1024 (four Hadamard groups) on {queried_arch} "
+                f"(visible: {sorted(arches)})"
             )
     else:
         # Elsewhere the table is the dGPU fallback and there is nothing narrower to
         # claim. What is still worth asserting is that the width is one the fused
         # kernel is instantiated at, since anything else silently becomes 1024.
         assert width in (64, 128, 256, 512, 640, 768, 1024), (
-            f"uninstantiated block width {width} at K={k} on {sorted(arches)}"
+            f"uninstantiated block width {width} at K={k} on {queried_arch} "
+            f"(visible: {sorted(arches)})"
         )
