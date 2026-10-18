@@ -5083,7 +5083,7 @@ NB_MODULE(_C, m) {
           nb::arg("sm_scale"),
           nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"),
-          nb::arg("attn_mask"));
+          nb::arg("attn_mask").none());
 
     m.def("sage_sdpa", &sage_sdpa,
           "Fused pure-INT8 SDPA: quant_qk + quant_v + attention in one call",
@@ -5102,7 +5102,7 @@ NB_MODULE(_C, m) {
           nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"),
           nb::arg("anchor_indices_ptr"),
-          nb::arg("attn_mask"),
+          nb::arg("attn_mask").none(),
           nb::arg("cta_k"));
 
     m.def("svdquant_quantize_w4a4", &svdquant_quantize_w4a4,
