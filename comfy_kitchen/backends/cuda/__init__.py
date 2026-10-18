@@ -449,14 +449,17 @@ def _max_dynamic_shared_memory_per_block(x: torch.Tensor) -> int:
 
 
 def _convrot_int8_fused_shared_memory_bytes(m: int, k: int) -> int:
+    # mirrors launch_quantize_int8_rowwise_convrot64_kernel's block-size rule
     if m == 1:
         block_threads = 512
     elif k == 256:
         block_threads = 64
-    elif k == 2560:
-        block_threads = 640
-    elif k == 6144:
-        block_threads = 768
+    elif k <= 3072:
+        block_threads = 128
+    elif k <= 6144:
+        block_threads = 256
+    elif k < 12288:
+        block_threads = 512
     else:
         block_threads = 1024
     groups_in_flight = block_threads // 64
@@ -2515,7 +2518,15 @@ def w4a8_int8_linear(
             residual,
             residual_scale,
         )
-    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    chunked = (
+        _W4A8_CHUNKED
+        and correction is None
+        and s_rel.dtype == torch.float8_e4m3fn
+    )
+    fuse_act = chunked and _w4a8_chunked_act_fusable(x, input_act, convrot_groupsize)
+    if not fuse_act:
+        x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+        input_act = None
     n, k, _bits = validate_w4a8_operands(
         qdata,
         s_rel,
@@ -2525,10 +2536,10 @@ def w4a8_int8_linear(
         group_size,
         convrot_groupsize,
     )
-    if x.shape[-1] != k:
+    if x.shape[-1] != k * _input_act_width(input_act):
         raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={k}")
     groups = k // group_size
-    x_2d = x.reshape(-1, k).contiguous()
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     m = x_2d.shape[0]
     output_dtype_code = DTYPE_TO_CODE[out_dtype]
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
@@ -2570,15 +2581,11 @@ def w4a8_int8_linear(
         if used:
             return out.reshape(*x.shape[:-1], n)
 
-    chunked = (
-        _W4A8_CHUNKED
-        and correction is None
-        and s_rel.dtype == torch.float8_e4m3fn
-    )
     if chunked:
         used, xq, xs = _w4a8_linear_chunked(
             x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
             convrot_groupsize, group_size, False,
+            input_act, input_act_weight, input_act_eps,
         )
         if used:
             return out.reshape(*x.shape[:-1], n)
@@ -2617,6 +2624,9 @@ def w4a8_int8_linear(
             group_size=group_size,
             convrot_groupsize=convrot_groupsize,
             out_dtype=out_dtype,
+            input_act=input_act,
+            input_act_weight=input_act_weight,
+            input_act_eps=input_act_eps,
         )
 
     if correction is not None:
@@ -2654,6 +2664,10 @@ def w4a8_packed_linear(
         input_act is not None
         and x.numel() <= 8 * x.shape[-1]
         and _w4a8_cluster_quantizer_ok(k, input_act, x.device)
+    ) or (
+        input_act is not None
+        and x.numel() > 8 * x.shape[-1]
+        and _w4a8_chunked_act_fusable(x, input_act, convrot_groupsize)
     )
     if input_act is not None and not fuse_act:
         x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
@@ -2711,33 +2725,61 @@ def w4a8_packed_linear(
         used, _, _ = _w4a8_linear_chunked(
             x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
             convrot_groupsize, group_size, True,
+            input_act, input_act_weight, input_act_eps,
         )
         if not used:
             raise RuntimeError("Packed W4A8 prefill is unsupported by the INT8 GEMM")
     return out.reshape(*x.shape[:-1], n)
 
 
+def _w4a8_fast_act_ok(x: torch.Tensor, m: int, k: int, convrot_groupsize: int) -> bool:
+    """Whether the chunked prefill path quantizes with the 64-lane ConvRot kernel (the one
+    that fuses input activations): large M and a K-wide activated row it can hold in
+    shared memory. x only supplies the device; m and k are the activated row count/width."""
+    return (
+        m >= 512
+        and convrot_groupsize == 256
+        and k % 256 == 0
+        and 256 <= k <= _CONVROT_FUSED_MAX_K
+        and (not x.is_cuda
+             or _convrot_int8_fused_shared_memory_bytes(m, k) < _max_dynamic_shared_memory_per_block(x))
+    )
+
+
+def _w4a8_chunked_act_fusable(x: torch.Tensor, input_act: str | None, convrot_groupsize: int) -> bool:
+    """Whether the chunked prefill path absorbs input_act; x is the raw input (2K wide for the gated pairs)."""
+    if input_act in (None, "none"):
+        return False
+    return _w4a8_fast_act_ok(x, x.numel() // x.shape[-1], x.shape[-1] // _input_act_width(input_act), convrot_groupsize)
+
+
 def _w4a8_linear_chunked(
     x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
     convrot_groupsize, group_size, mma_packed,
+    input_act=None, input_act_weight=None, input_act_eps=0.0,
 ):
-    """Shared bounded INT8 GEMM; the native dequantizer reads the selected storage format."""
+    """Shared bounded INT8 GEMM; the native dequantizer reads the selected storage format.
+
+    With input_act set, x_2d is the raw row (two K-wide halves for the gated pairs) and
+    the 64-lane quantizer applies the activation; callers check _w4a8_chunked_act_fusable.
+    """
+    if input_act in (None, "none"):
+        input_act = None
     m, k = x_2d.shape
+    k //= _input_act_width(input_act)
     n = s_channel.numel()
     output_dtype_code = DTYPE_TO_CODE[out.dtype]
     stream_ptr = torch.cuda.current_stream(x_2d.device).cuda_stream
     chunk_cols = _w4a8_weight_chunk_cols(m, n, x_2d.get_device())
     workspace = torch.empty(min(chunk_cols, n), k, dtype=torch.int8, device=x_2d.device)
     # The 64-lane quantizer is faster at large M; at small M its extra launch costs more.
-    fast_act = (
-        m >= 512
-        and convrot_groupsize == 256
-        and k % 256 == 0
-        and 256 <= k <= _CONVROT_FUSED_MAX_K
-        and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
-    )
+    fast_act = _w4a8_fast_act_ok(x_2d, m, k, convrot_groupsize)
+    if input_act is not None and not fast_act:
+        raise RuntimeError("w4a8 chunked linear: fused input activation needs the 64-lane quantizer")
     if fast_act:
-        xq, xs = quantize_int8_rowwise_convrot64(x_2d, convrot_groupsize)
+        xq, xs = quantize_int8_rowwise_convrot64(
+            x_2d, convrot_groupsize, input_act=input_act,
+            input_act_weight=input_act_weight, input_act_eps=input_act_eps)
     elif hasattr(_C, "w4a8_codebook_linear_chunked"):
         used = _C.w4a8_codebook_linear_chunked(
             _wrap_for_dlpack(x_2d),
