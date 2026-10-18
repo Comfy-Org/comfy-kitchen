@@ -339,6 +339,11 @@ def test_the_default_width_is_not_the_widest_one():
     try:
         os.environ.pop(OVERRIDE, None)
         width = _C.convrot_fused_block(m, k, DTYPE_TO_CODE[torch.float16])
+        # K=1024 is the row where the table and the code used to disagree, so it
+        # is asked separately: the K=1280 check below cannot see a wrong answer
+        # there, because `width < 1024` is satisfied by 64 just as well as by the
+        # measured 128. M is 1024 because the heuristic special-cases M == 1.
+        width_at_1024 = _C.convrot_fused_block(1024, 1024, DTYPE_TO_CODE[torch.float16])
     finally:
         if previous is None:
             os.environ.pop(OVERRIDE, None)
@@ -358,6 +363,19 @@ def test_the_default_width_is_not_the_widest_one():
             f"the heuristic picked the widest width ({width}) at K={k}, which is 5 "
             f"Hadamard groups, on {sorted(arches)}"
         )
+        # And the measured width at K=1024, which is four groups. The table says
+        # 128 there and the code answered 64, because K=1024 was folded into the
+        # `groups <= 10` bucket; the check above passed with the row wrong, which
+        # is the gap this closes.
+        #
+        # gfx103x only, and deliberately not gfx1103: the K==1024 arm lives in the
+        # `comfy_is_gfx10()` branch of the heuristic, and the small-iGPU table
+        # answers 64 at four groups, so this is not a claim about every family.
+        if any(a.startswith("gfx103") for a in arches):
+            assert width_at_1024 == 128, (
+                f"the heuristic picked {width_at_1024} instead of the measured 128 at "
+                f"K=1024 (four Hadamard groups) on {sorted(arches)}"
+            )
     else:
         # Elsewhere the table is the dGPU fallback and there is nothing narrower to
         # claim. What is still worth asserting is that the width is one the fused
