@@ -73,6 +73,7 @@ __all__ = [
     "int8_linear",
     "w4a8_int8_linear",
     "w4a8_packed_linear",
+    "pack_w4a8_mma_weights_",
     "int4_linear",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
@@ -2479,15 +2480,54 @@ def pack_w4a8_mma_weight_(dest: torch.Tensor, s_rel: torch.Tensor):
     Scratch is the saved group scales plus one 16-row slab. All work runs on
     the caller's stream; the output keeps slab/K order without a global permutation.
     """
-    n, groups = s_rel.shape
+    _pack_w4a8_mma_records_(dest, s_rel.view(torch.uint8).clone())
+
+
+def _pack_w4a8_mma_records_(dest: torch.Tensor, scales: torch.Tensor):
+    # scales: uint8 [N, K / 16], already saved outside dest
+    n, groups = scales.shape
     k = groups * 16
     bits = 4 if dest.numel() == n * k * 9 // 16 else 6
-    scales = s_rel.view(torch.uint8).clone()
     scratch = torch.empty(2 * k * bits, dtype=torch.uint8, device=dest.device)
     _C.pack_w4a8_mma_inplace(
         _wrap_for_dlpack(dest), _wrap_for_dlpack(scales), _wrap_for_dlpack(scratch),
         torch.cuda.current_stream(dest.device).cuda_stream,
     )
+
+
+_W4A8_MOVE_BYTES = 1 << 20
+
+
+def pack_w4a8_mma_weights_(
+    storage: torch.Tensor, qdata: list[torch.Tensor], s_rel: list[torch.Tensor]
+) -> torch.Tensor:
+    """Pack consecutive canonical weights in ``storage`` as one record stream at qdata[0].
+
+    The caller has validated that the code arrays are ordered, disjoint and inside
+    ``storage`` and share K and bit width. Group scales are saved first; codes are
+    then moved down to be contiguous, in chunks that never overlap their unread
+    source (bounced through a 1 MiB buffer when the shift is smaller), and the
+    concatenated rows are packed in place. All work runs on the caller's stream.
+    """
+    scales = torch.cat([s.view(torch.uint8) for s in s_rel])
+    base = dest = qdata[0].data_ptr() - storage.data_ptr()
+    bounce = None
+    for q in qdata:
+        src, size = q.data_ptr() - storage.data_ptr(), q.nbytes
+        shift = src - dest
+        step = max(shift, _W4A8_MOVE_BYTES)
+        for off in range(0, size if shift else 0, step):
+            n = min(step, size - off)
+            chunk = storage[src + off:src + off + n]
+            if n > shift:
+                if bounce is None:
+                    bounce = torch.empty(_W4A8_MOVE_BYTES, dtype=torch.uint8, device=storage.device)
+                chunk = bounce[:n].copy_(chunk)
+            storage[dest + off:dest + off + n].copy_(chunk)
+        dest += size
+    records = storage[base:dest + scales.numel()].view(torch.int8)
+    _pack_w4a8_mma_records_(records, scales)
+    return records
 
 
 def w4a8_int8_linear(
@@ -4857,6 +4897,16 @@ def _build_constraints() -> dict:
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
                 "output_dtype": ParamConstraint(
                     dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
+        ),
+        "pack_w4a8_mma_weights_": FunctionConstraints(
+            params={
+                "storage": ParamConstraint(
+                    dtypes=frozenset({torch.uint8}),
+                    shape_rules=(ExactDims(1),),
                 ),
             },
             default_devices=cuda_devices,

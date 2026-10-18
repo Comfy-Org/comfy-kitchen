@@ -17,7 +17,7 @@ from .convrot_w4a4 import (
     quantize_convrot_w4a4_weight,
 )
 from .fp8 import TensorCoreFP8Layout
-from .int8 import TensorWiseINT8Layout
+from .int8 import TensorWiseINT8Layout, try_relayout_int8_weights
 from .mxfp8 import TensorCoreMXFP8Layout
 from .nvfp4 import TensorCoreNVFP4Layout
 from .svdquant_w4a4 import (
@@ -31,6 +31,7 @@ from .w4a8_int8 import (
     AsymW4A8Int8Layout,
     dequantize_w4a8_int8_weight,
     quantize_w4a8_int8_weight,
+    try_relayout_w4a8_weights,
     w4a8_int8_linear,
 )
 
@@ -60,8 +61,30 @@ __all__ = [
     "svdquant_w4a4_fuse_linear_weights",
     "svdquant_w4a4_fused_grouped_linear",
     "svdquant_w4a4_grouped_linear",
+    "try_relayout_weights",
     "w4a8_int8_linear",
 ]
+
+
+def try_relayout_weights(weights, storage):
+    """Relayout consecutive resident weights into one combined weight in ``storage``.
+
+    ``weights`` is an ordered sequence of canonical quantized weights whose bytes lie
+    in ``storage``, a contiguous caller-owned uint8 span that the caller replaces as
+    a group. Returns ``(combined, views)``, where ``views`` slices ``combined`` by
+    output row in input order, or NotImplemented with ``storage`` unchanged.
+    """
+    weights = tuple(weights)
+    if weights and all(
+        isinstance(w, QuantizedTensor) and w._layout_cls == "AsymW4A8Int8Layout" for w in weights
+    ):
+        return try_relayout_w4a8_weights(weights, storage)
+    if weights and all(
+        isinstance(w, QuantizedTensor) and w._layout_cls == "TensorWiseINT8Layout" for w in weights
+    ):
+        return try_relayout_int8_weights(weights, storage)
+    return NotImplemented
+
 
 register_layout_class("AsymW4A8Int8Layout", AsymW4A8Int8Layout)
 register_layout_class("TensorCoreAWQW4A16Layout", TensorCoreAWQW4A16Layout)

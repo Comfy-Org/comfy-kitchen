@@ -36,6 +36,7 @@ from .sage_attention import (
     prequantize_int8_attention,
 )
 from .sage_attention import is_available as int8_attention_is_available
+from .tensor import try_relayout_weights
 from .tensor.convrot_w4a4 import (
     convrot_w4a4_linear,
     dequantize_convrot_w4a4_weight,
@@ -119,6 +120,7 @@ __all__ = [
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
     "w4a8_int8_linear",
+    "try_relayout_weights",
     # Positional encoding
     "apply_rope",
     "apply_rope_",

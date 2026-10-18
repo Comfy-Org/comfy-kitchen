@@ -28,6 +28,49 @@ def _packed_weight(n, k, seed=0, bits=4):
     return qdata, s_rel, s_channel, cb, packed
 
 
+def _resident_group(specs, seed=0):
+    """Canonical weights resident in one span like Core lays them out: per weight its
+    codes, a 1024-byte gap, scales, channel scales, codebook, then 1024 padding bytes.
+    The span starts with 256 foreign bytes and sits between canaries in ``buf``."""
+    torch.manual_seed(seed)
+    tensors, offsets, cursor = [], [], 256
+
+    def take(nbytes):
+        nonlocal cursor
+        offset = (cursor + 255) // 256 * 256
+        cursor = offset + nbytes
+        return offset
+
+    for n, k, bits in specs:
+        w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02
+        qdata, s_rel, s_channel, _, cb = eager_w4a8.quantize_w4a8_int8_weight(w, bits=bits)
+        cb = None if cb is None else cb.to("cuda", torch.float32)
+        tensors.append((qdata, s_rel, s_channel, cb))
+        q_offset = take(qdata.nbytes)
+        cursor += 1024
+        offsets.append((q_offset, take(s_rel.nbytes), take(s_channel.nbytes), cb is not None and take(cb.nbytes)))
+        cursor += 1024
+    buf = torch.full((64 + cursor + 128,), 73, dtype=torch.uint8, device="cuda")
+    span = buf[64:64 + cursor]
+    span.copy_(torch.randint(0, 256, (cursor,), dtype=torch.uint8, device="cuda"))
+
+    def put(t, offset):
+        view = span[offset:offset + t.nbytes].view(t.dtype).view(t.shape)
+        return view.copy_(t)
+
+    members, refs = [], []
+    for (n, k, _), (q, s, c, cb), (oq, os_, oc, ocb) in zip(specs, tensors, offsets, strict=True):
+        params = AsymW4A8Int8Layout.Params(
+            scale=s, s_channel=c, codebook=cb, orig_dtype=torch.bfloat16, orig_shape=(n, k),
+        )
+        refs.append(QuantizedTensor(q, "AsymW4A8Int8Layout", params))
+        resident = dataclasses.replace(
+            params, scale=put(s, os_), s_channel=put(c, oc), codebook=None if cb is None else put(cb, ocb),
+        )
+        members.append(QuantizedTensor(put(q, oq), "AsymW4A8Int8Layout", resident))
+    return buf, span, members, refs
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
     reason="packed W4A8 MMA decode needs sm_90+ (cluster quantizer)",
@@ -254,6 +297,111 @@ class TestW4A8PackedMMA:
             assert torch.equal(unpacked_q, q)
             assert torch.equal(unpacked_scales.view(torch.uint8), scales.view(torch.uint8))
             assert torch.all(storage[:64] == 73) and torch.all(storage[-128:] == 73)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+    reason="resident MMA relayout needs sm_80+",
+)
+class TestResidentRelayout:
+    @pytest.mark.parametrize("move_bytes", [1 << 20, 1 << 14, 1 << 12])
+    @pytest.mark.parametrize("bits", [4, 6])
+    def test_relayout_group_roundtrip(self, bits, move_bytes, seed, monkeypatch):
+        # Asymmetric row counts in one resident span become one packed weight at the
+        # first codes; the views are its row slices. The move buffer sizes cover single
+        # bounced chunks, several bounced chunks, and direct chunks of the shift size.
+        monkeypatch.setattr(cuda_backend, "_W4A8_MOVE_BYTES", move_bytes)
+        k, rows = 1024, (64, 256, 48)
+        buf, span, members, refs = _resident_group([(n, k, bits) for n in rows])
+        head = span[:256].clone()
+        xs = [torch.randn(m, k, device="cuda", dtype=torch.bfloat16) for m in (1, 8, 9)]
+        expected = [[torch.nn.functional.linear(x, ref) for ref in refs] for x in xs]
+        start = members[0]._qdata.data_ptr()
+        scale_bytes = sum(ref._params.scale.nbytes for ref in refs)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        allocated = torch.cuda.memory_allocated()
+        combined, views = ck.try_relayout_weights(tuple(members), span)
+        # Saved scales, the move buffer, one slab and channel scales; no weight copy.
+        assert torch.cuda.max_memory_allocated() - allocated <= scale_bytes + move_bytes + (64 << 10)
+
+        assert combined._qdata.data_ptr() == start and combined.shape == (sum(rows), k)
+        assert combined.params.mma_packed and len(views) == len(refs)
+        for t in (combined._qdata, combined.params.s_channel, combined.params.codebook):
+            if t is not None:
+                assert span.data_ptr() <= t.data_ptr() and t.data_ptr() + t.nbytes <= span.data_ptr() + span.nbytes
+        assert torch.equal(span[:256], head)
+        assert torch.all(buf[:64] == 73) and torch.all(buf[-128:] == 73)
+        q, s = unpack_w4a8_mma_weight(combined._qdata, sum(rows), k)
+        assert torch.equal(q, torch.cat([ref._qdata for ref in refs]))
+        assert torch.equal(s.view(torch.uint8), torch.cat([ref._params.scale for ref in refs]).view(torch.uint8))
+        assert torch.equal(combined.params.s_channel, torch.cat([ref._params.s_channel for ref in refs]))
+        if bits == 4:
+            assert torch.equal(combined.params.codebook.cpu(), refs[0]._params.codebook.cpu())
+        else:
+            assert combined.params.codebook is None
+        row = 0
+        for view, ref in zip(views, refs, strict=True):
+            n = ref.shape[0]
+            assert view.shape == ref.shape and view.params.codebook is combined.params.codebook
+            assert view._qdata.data_ptr() == start + row * k * (2 * bits + 1) // 16
+            q, s = unpack_w4a8_mma_weight(view._qdata, n, k)
+            assert torch.equal(q, ref._qdata)
+            assert torch.equal(s.view(torch.uint8), ref._params.scale.view(torch.uint8))
+            assert torch.equal(view.params.s_channel, ref._params.s_channel)
+            assert torch.equal(view.dequantize(), ref.dequantize())
+            row += n
+
+        for x, refs_out in zip(xs, expected, strict=True):
+            got_combined = torch.nn.functional.linear(x, combined)
+            row = 0
+            for view, ref_out in zip(views, refs_out, strict=True):
+                got = torch.nn.functional.linear(x, view)
+                torch.testing.assert_close(got.float(), ref_out.float(), atol=2e-2, rtol=1e-2)
+                torch.testing.assert_close(got_combined[:, row:row + got.shape[1]].float(), got.float(), atol=2e-2, rtol=1e-2)
+                row += got.shape[1]
+
+        # Decode graphs over the combined weight and its views follow input changes.
+        x = torch.randn(1, k, device="cuda", dtype=torch.bfloat16)
+
+        def decode():
+            return [torch.nn.functional.linear(x, w) for w in (combined, *views)]
+
+        decode()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = decode()
+        for _ in range(3):
+            x.copy_(torch.randn_like(x))
+            graph.replay()
+            for got, ref in zip(outputs, decode(), strict=True):
+                assert torch.equal(got, ref)
+
+    def test_relayout_rejects_without_writing(self, seed):
+        k = 512
+        buf, span, members, _ = _resident_group([(64, k, 4), (32, k, 4), (32, k, 6), (32, 256, 4)])
+        a, b, w6, narrow = members
+        before = buf.clone()
+        p = b.params
+        odd = QuantizedTensor(b._qdata[:24], "AsymW4A8Int8Layout", dataclasses.replace(
+            p, scale=p.scale[:24], s_channel=p.s_channel[:24], orig_shape=(24, k)))
+        other_codebook = QuantizedTensor(b._qdata, "AsymW4A8Int8Layout", dataclasses.replace(p, codebook=p.codebook * 1.01))
+        packed = QuantizedTensor(b._qdata, "AsymW4A8Int8Layout", dataclasses.replace(
+            p, scale=p.scale.new_empty(0), mma_packed=True))
+        transposed = b.t()
+        for group in ((a, w6), (w6, a), (a, narrow), (a, odd), (a, other_codebook), (a, packed),
+                      (a, transposed), (a, b._qdata), ()):
+            assert ck.try_relayout_weights(group, span) is NotImplemented
+        # Codes only, with scales outside the span: no room for records and metadata.
+        offset = a._qdata.data_ptr() - span.data_ptr()
+        assert ck.try_relayout_weights((a,), span[offset:offset + a._qdata.nbytes]) is NotImplemented
+        with pytest.raises(ValueError):
+            ck.try_relayout_weights((b, a), span)
+        with pytest.raises(ValueError):
+            ck.try_relayout_weights((a, b), span[:offset + a._qdata.nbytes])
+        torch.cuda.synchronize()
+        assert torch.equal(buf, before)
 
 
 @pytest.mark.skipif(

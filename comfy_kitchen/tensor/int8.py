@@ -42,6 +42,73 @@ def _dtype_code(dtype: torch.dtype) -> int:
         raise ValueError(f"Unsupported INT8 output dtype: {dtype}") from None
 
 
+def try_relayout_int8_weights(weights: tuple[QuantizedTensor, ...], storage: torch.Tensor):
+    """Compact resident INT8 rows and their scales without requantizing.
+
+    Returns one combined weight and its member views, or NotImplemented before
+    any write. All returned tensor storage stays inside the caller-owned span.
+    """
+    if storage.dtype != torch.uint8 or storage.ndim != 1 or not storage.is_contiguous():
+        raise ValueError("resident storage must be a contiguous 1D uint8 buffer")
+    first = weights[0]._params
+    if len(first.orig_shape) != 2:
+        return NotImplemented
+    k = first.orig_shape[1]
+    total_n, end = 0, None
+    for weight in weights:
+        qdata, params = weight._qdata, weight._params
+        if (
+            not params.is_weight or params.transposed
+            or len(params.orig_shape) != 2 or params.orig_shape[1] != k or k <= 0
+            or params.orig_shape[0] <= 0
+            or params.orig_dtype != first.orig_dtype
+            or params.convrot != first.convrot
+            or (params.convrot and params.convrot_groupsize != first.convrot_groupsize)
+            or qdata.dtype != torch.int8 or tuple(qdata.shape) != params.orig_shape
+            or not qdata.is_contiguous()
+            or params.scale.dtype != torch.float32 or params.scale.device != storage.device
+            or params.scale.numel() not in (1, params.orig_shape[0])
+        ):
+            return NotImplemented
+        offset = qdata.data_ptr() - storage.data_ptr()
+        if (qdata.device != storage.device or offset < (0 if end is None else end)
+                or offset + qdata.nbytes > storage.nbytes):
+            raise ValueError("resident weight codes must be ordered and disjoint inside storage")
+        if end is None:
+            start = offset
+        end = offset + qdata.nbytes
+        total_n += params.orig_shape[0]
+    codes_end = start + total_n * k
+    scale_start = codes_end + (-(storage.data_ptr() + codes_end)) % 4
+    scale_end = scale_start + total_n * 4
+    if scale_end > storage.nbytes:
+        return NotImplemented
+
+    # Save metadata before compaction overwrites it. Scalar scales become row
+    # scales so differently scaled projections share one ordinary INT8 linear.
+    scales = torch.cat([w._params.scale.reshape(-1).expand(w.shape[0]) for w in weights])
+    dest = start
+    for weight in weights:
+        qdata = weight._qdata
+        src = qdata.data_ptr() - storage.data_ptr()
+        if src != dest:
+            # Bounce bounded chunks: a direct overlapping copy can destroy unread codes.
+            for off in range(0, qdata.nbytes, 1 << 20):
+                size = min(1 << 20, qdata.nbytes - off)
+                storage[dest + off:dest + off + size].copy_(storage[src + off:src + off + size].clone())
+        dest += qdata.nbytes
+    codes = storage[start:codes_end].view(torch.int8).view(total_n, k)
+    scales = storage[scale_start:scale_end].view(torch.float32).copy_(scales).view(total_n, 1)
+    params = dataclasses.replace(first, scale=scales, orig_shape=(total_n, k))
+    views, row = [], 0
+    for weight in weights:
+        n = weight.shape[0]
+        view_params = dataclasses.replace(params, scale=scales[row:row + n], orig_shape=(n, k))
+        views.append(QuantizedTensor(codes[row:row + n], "TensorWiseINT8Layout", view_params))
+        row += n
+    return QuantizedTensor(codes, "TensorWiseINT8Layout", params), tuple(views)
+
+
 def _has_native_fusion(func_name: str, kwargs: dict) -> bool:
     """Whether ``func_name`` would dispatch to a native kernel for ``kwargs``.
 

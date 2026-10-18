@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for INT8 block-wise quantization."""
 
+import dataclasses
+
 import pytest
 import torch
 
 import comfy_kitchen as ck
 from comfy_kitchen.backends import cuda
-from comfy_kitchen.tensor import TensorWiseINT8Layout
+from comfy_kitchen.tensor import QuantizedTensor, TensorWiseINT8Layout
 
 from .conftest import (
     assert_values_close,
@@ -31,6 +33,78 @@ COMFYUI_NVIDIA_16_SERIES = (
     "T1000",
     "T1200",
 )
+
+
+@pytest.fixture
+def resident_int8_group(device):
+    rows, k = (16, 48, 32), 256
+    sizes = [n * k + 4 * n + 64 for n in rows]
+    buf = torch.full((128 + sum(sizes),), 73, dtype=torch.uint8, device=device)
+    span = buf[64:-64]
+    weights, offset = [], 0
+    for i, (n, size) in enumerate(zip(rows, sizes, strict=True)):
+        q = span[offset:offset + n * k].view(torch.int8).view(n, k)
+        q.copy_(torch.randint(-128, 128, q.shape, device=device, dtype=torch.int8))
+        scale = span[offset + n * k:offset + n * k + 4 * n].view(torch.float32)
+        scale.copy_(torch.linspace(0.01 * (i + 1), 0.03 * (i + 1), n, device=device))
+        params = TensorWiseINT8Layout.Params(
+            scale=scale.view(n, 1), orig_shape=(n, k), orig_dtype=torch.float32,
+        )
+        weights.append(QuantizedTensor(q, "TensorWiseINT8Layout", params))
+        offset += size
+    return buf, span, weights
+
+
+@pytest.mark.parametrize("convrot", [False, True])
+def test_resident_int8_relayout_preserves_weights_and_linear(resident_int8_group, convrot):
+    buf, span, weights = resident_int8_group
+    for i, w in enumerate(weights):
+        # Two different scalar scales plus row scales must not become one scalar.
+        scale = w.params.scale[:1].reshape(()) if not convrot and i < 2 else w.params.scale
+        weights[i] = QuantizedTensor(w._qdata, "TensorWiseINT8Layout", dataclasses.replace(
+            w.params, scale=scale, convrot=convrot,
+        ))
+    codes = torch.cat([w._qdata for w in weights])
+    scales = torch.cat([w.params.scale.reshape(-1).expand(w.shape[0]) for w in weights])
+    dense = torch.cat([w.dequantize() for w in weights])
+    x = torch.randn(3, 256, device=span.device)
+    expected = torch.cat([torch.nn.functional.linear(x, w) for w in weights], dim=-1)
+    combined, views = ck.try_relayout_weights(weights, span)
+    assert torch.equal(combined._qdata, codes)
+    assert torch.equal(combined.params.scale.flatten(), scales)
+    assert torch.equal(combined.dequantize(), dense)
+    assert combined.params.convrot == convrot
+    assert combined.data_ptr() == span.data_ptr()
+    assert torch.all(buf[:64] == 73) and torch.all(buf[-64:] == 73)
+    row = 0
+    for view, original in zip(views, weights, strict=True):
+        n = original.shape[0]
+        assert view.data_ptr() == combined.data_ptr() + row * 256
+        assert torch.equal(view.dequantize(), dense[row:row + n])
+        assert span.data_ptr() <= view.params.scale.data_ptr()
+        assert view.params.scale.data_ptr() + view.params.scale.nbytes <= span.data_ptr() + span.nbytes
+        torch.testing.assert_close(torch.nn.functional.linear(x, view), expected[:, row:row + n])
+        row += n
+    torch.testing.assert_close(torch.nn.functional.linear(x, combined), expected)
+
+
+def test_resident_int8_relayout_declines_without_writes(resident_int8_group):
+    buf, span, weights = resident_int8_group
+    a, b, _ = weights
+    before = buf.clone()
+    for change in ({"convrot": True}, {"orig_dtype": torch.float16}, {"is_weight": False},
+                   {"transposed": True}, {"orig_shape": (48, 128)}, {"scale": b.params.scale[:2]}):
+        incompatible = QuantizedTensor(b._qdata, "TensorWiseINT8Layout", dataclasses.replace(b.params, **change))
+        assert ck.try_relayout_weights((a, incompatible), span) is NotImplemented
+    rotated = [QuantizedTensor(w._qdata, "TensorWiseINT8Layout", dataclasses.replace(
+        w.params, convrot=True, convrot_groupsize=group,
+    )) for w, group in zip((a, b), (128, 256), strict=True)]
+    assert ck.try_relayout_weights(rotated, span) is NotImplemented
+    # Codes fit, but no room remains for the output row scales.
+    assert ck.try_relayout_weights((a,), span[:a._qdata.nbytes]) is NotImplemented
+    with pytest.raises(ValueError):
+        ck.try_relayout_weights((b, a), span)
+    assert torch.equal(buf, before)
 
 
 def test_cuda_int8_cublas_turing_n_alignment(monkeypatch):

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import torch
 
+from comfy_kitchen.exceptions import NoCapableBackendError
 from comfy_kitchen.registry import registry
 
 from .base import (
@@ -392,6 +393,100 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             # requantize reruns per layer under VRAM offload; the search is quantize-time only
             "scale_search": False,
         }
+
+
+def try_relayout_w4a8_weights(weights: tuple[QuantizedTensor, ...], storage: torch.Tensor):
+    """Pack canonical W4A8/W6A8 weights resident in ``storage`` into one MMA weight.
+
+    Codes must be ordered and disjoint inside ``storage``. The combined records
+    start at the first weight's codes and are followed by the codebook (W4) and
+    concatenated channel scales; every other byte of the source weights in
+    ``storage`` may be overwritten. Returns the combined weight and one row-slice
+    view per input, or NotImplemented before any write if the group is unsupported.
+    """
+    if storage.dtype != torch.uint8 or storage.ndim != 1 or not storage.is_contiguous():
+        raise ValueError("resident storage must be a contiguous 1D uint8 buffer")
+    first = weights[0]._params
+    k = first.orig_shape[1]
+    if torch.version.hip is not None or k <= 0 or k % 256 != 0:
+        return NotImplemented
+    bits = weights[0]._qdata.shape[-1] * 8 // k
+    if bits not in (4, 6):
+        return NotImplemented
+    default_codebook, checked_codebooks = default_w4a8_codebook(), set()
+    total_n, end = 0, None
+    for weight in weights:
+        qdata, params = weight._qdata, weight._params
+        n = params.orig_shape[0]
+        if (
+            params.mma_packed
+            or params.transposed
+            or params.correction is not None
+            or params.group_size != 16
+            or params.convrot_groupsize != first.convrot_groupsize
+            or params.orig_dtype != first.orig_dtype
+            or params.orig_shape[1] != k
+            or n % 16 != 0
+            or qdata.dtype != torch.int8
+            or tuple(qdata.shape) != (n, k * bits // 8)
+            or not qdata.is_contiguous()
+            or params.scale.dtype != torch.float8_e4m3fn
+            or params.s_channel.dtype != torch.float32
+            or params.scale.device != storage.device
+            or params.s_channel.device != storage.device
+            or (params.codebook is None) != (bits == 6)
+        ):
+            return NotImplemented
+        if params.codebook is not None and id(params.codebook) not in checked_codebooks:
+            if not torch.equal(params.codebook.float().cpu(), default_codebook):
+                return NotImplemented
+            checked_codebooks.add(id(params.codebook))
+        offset = qdata.data_ptr() - storage.data_ptr()
+        if (
+            qdata.device != storage.device
+            or offset < (0 if end is None else end)
+            or offset + qdata.nbytes > storage.nbytes
+        ):
+            raise ValueError("resident weight codes must be ordered and disjoint inside storage")
+        if end is None:
+            start = offset
+        end = offset + qdata.nbytes
+        total_n += n
+    records_end = start + total_n * k * (2 * bits + 1) // 16
+    meta_start = records_end + (-(storage.data_ptr() + records_end)) % 16
+    meta_end = meta_start + 4 * (total_n + (16 if bits == 4 else 0))
+    if meta_end > storage.nbytes:
+        return NotImplemented
+    try:
+        pack = registry.get_implementation("pack_w4a8_mma_weights_", kwargs={"storage": storage})
+    except NoCapableBackendError:
+        return NotImplemented
+    if torch.cuda.get_device_capability(storage.device) < (8, 0):
+        return NotImplemented
+
+    # Save everything the relayout may overwrite before the first write; all of it
+    # is ordered on the current stream with the backend's moves and pack.
+    s_channel = torch.cat([w._params.s_channel for w in weights])
+    codebook = first.codebook.to(storage.device, torch.float32, copy=True) if bits == 4 else None
+    records = pack(storage, [w._qdata for w in weights], [w._params.scale for w in weights])
+    meta = storage[meta_start:meta_end].view(torch.float32)
+    if codebook is not None:
+        codebook = meta[:16].copy_(codebook)
+        meta = meta[16:]
+    s_channel = meta.copy_(s_channel)
+
+    params = dataclasses.replace(
+        first, scale=first.scale.new_empty(0), s_channel=s_channel, codebook=codebook,
+        orig_shape=(total_n, k), mma_packed=True,
+    )
+    views, row = [], 0
+    for weight in weights:
+        n = weight._params.orig_shape[0]
+        lo, hi = row * k * (2 * bits + 1) // 16, (row + n) * k * (2 * bits + 1) // 16
+        view_params = dataclasses.replace(params, s_channel=s_channel[row:row + n], orig_shape=(n, k))
+        views.append(QuantizedTensor(records[lo:hi], "AsymW4A8Int8Layout", view_params))
+        row += n
+    return QuantizedTensor(records, "AsymW4A8Int8Layout", params), tuple(views)
 
 
 def _is_w4a8(weight: object) -> bool:
