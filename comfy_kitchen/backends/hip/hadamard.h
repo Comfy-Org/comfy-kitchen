@@ -508,6 +508,15 @@ __global__ __launch_bounds__(GROUPS_PER_BLOCK* 64) void convrot_rotate_groups64_
     }
 }
 
+__forceinline__ __device__ float convrot_int8_inverse_scale(float rowmax) {
+    float inv = 127.0f / rowmax;
+    // Keep the quantization multiplier rounded before multiplying each value.
+    // Fast-math can otherwise reassociate only an unrolled loop's tail into
+    // (value * 127) * rcp(rowmax), changing INT8 ties with layout or row width.
+    asm volatile("" : "+v"(inv));
+    return inv;
+}
+
 // Global spill pass 2: fold per-group absmax into the row scale, then quantize the
 // rotated row already in global memory (pass 1 is convrot_rotate_groups64_amax_kernel).
 template <typename RowT, int BLOCK_THREADS, bool TILED_QOUT>
@@ -531,7 +540,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_from_partials_ker
     abs_max = block_reduce_max<kWarps>(abs_max, warp_smem, &block_smem);
     const float rowmax = fmaxf(finite_absmax_for_quant<RowT>(abs_max), 1e-10f);
     const float scale = rowmax / 127.0f;
-    const float inv = 127.0f / rowmax;
+    const float inv = convrot_int8_inverse_scale(rowmax);
     if (tid == 0) {
         scaleout[row] = scale;
     }
@@ -674,7 +683,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     abs_max = block_reduce_max<kWarps>(abs_max, warp_smem, &block_smem);
     const float rowmax = fmaxf(finite_absmax_for_quant<RowT>(abs_max), 1e-10f);
     const float scale = rowmax / 127.0f;
-    const float inv = 127.0f / rowmax;
+    const float inv = convrot_int8_inverse_scale(rowmax);
     if (tid == 0) {
         scaleout[row] = scale;
     }
@@ -1198,7 +1207,7 @@ __global__ __launch_bounds__(512) void convrot_quant_512x2_bf16_kernel(
 
     const float row_max = fmaxf(wave_max[0], 1.0e-10f);
     const float scale = row_max / 127.0f;
-    const float inverse_scale = 127.0f / row_max;
+    const float inverse_scale = convrot_int8_inverse_scale(row_max);
     if (t == 0) scaleout[row] = scale;
 
     // One aligned dword LDS read covers two adjacent BF16
@@ -1357,7 +1366,7 @@ __global__ __launch_bounds__(512) void convrot_quant_transposed_bf16_kernel(
         if (base + 8 < K / 256) __syncthreads();
     }
     const float rowmax = fmaxf(block_reduce_max<16>(localmax, maxima, &maximum), 1e-10f);
-    const float inv = 127.0f / rowmax;
+    const float inv = convrot_int8_inverse_scale(rowmax);
     if (t == 0) scaleout[row] = rowmax / 127.0f;
     for (int pair = t; pair < K / 2; pair += 512) {
         const convrot_bf16x2 values = *reinterpret_cast<const convrot_bf16x2*>(rowbuf + pair * 2);

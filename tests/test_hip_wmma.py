@@ -205,6 +205,34 @@ def test_gfx12_swiglu_preserves_float_intermediates(hip, m, k):
 
 
 @needs_wmma
+def test_int8_convrot_linear_is_independent_of_zero_padding(hip):
+    skip_unless_gfx12_wmma()
+    torch.manual_seed(414)
+    m, n, k = 129, 128, 5376
+    x = (torch.randn(m, k, device=DEV) *
+         torch.logspace(-5, 5, k, device=DEV)).bfloat16()
+    weight = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
+    scales = torch.rand(n, device=DEV)
+
+    with ck.use_backend("hip"):
+        expected = ck.int8_linear(x, weight, scales, out_dtype=torch.float32, convrot=True)
+        # A whole zero Hadamard group changes neither rotation nor row maxima.
+        # This width changes the quantizer's unrolled-loop tail on Windows HIP.
+        padded = ck.int8_linear(
+            torch.nn.functional.pad(x, (0, 768)),
+            torch.nn.functional.pad(weight, (0, 768)),
+            scales, out_dtype=torch.float32, convrot=True,
+        )
+        # Narrowing the output also switches tiled/row-major activation storage.
+        narrow = ck.int8_linear(
+            x, weight[:64], scales[:64], out_dtype=torch.float32, convrot=True,
+        )
+
+    assert torch.equal(expected, padded)
+    assert torch.equal(expected[:, :64], narrow)
+
+
+@needs_wmma
 @pytest.mark.parametrize("input_act", [None, "gelu_tanh", "swiglu"])
 @pytest.mark.parametrize("k", [3840, 10240, 14336])
 def test_int8_convrot_linear_is_row_independent(hip, input_act, k):
