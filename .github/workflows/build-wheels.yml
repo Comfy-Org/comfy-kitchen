@@ -373,7 +373,15 @@ jobs:
 
       - name: Install compiler cache and Ninja
         shell: pwsh
-        run: choco install ccache ninja --no-progress --yes
+        # CI-only branch: community.chocolatey.org returned 503; fetch the same ccache 4.14.2 release from GitHub.
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "ccache.zip"
+          Invoke-WebRequest -Uri "https://github.com/ccache/ccache/releases/download/v4.14.2/ccache-4.14.2-windows-x86_64.zip" -OutFile $zip
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          $dir = Join-Path $env:RUNNER_TEMP "ccache-4.14.2-windows-x86_64"
+          echo $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $dir "ccache.exe") --version
+          ninja --version
       - name: Install CUDA Toolkit 13.0.2
         uses: Jimver/cuda-toolkit@v0.2.29
         id: cuda-toolkit
