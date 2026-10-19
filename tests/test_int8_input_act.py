@@ -477,7 +477,7 @@ class TestFusedGemvQuantizer:
                            convrot=True, convrot_groupsize=_GROUP, input_act="swiglu")
 
 
-@pytest.mark.parametrize("shape", [(3, 256), (129, 3840), (129, 6144)])
+@pytest.mark.parametrize("shape", [(1, 256), (3, 256), (129, 3840), (129, 6144)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", ["hip", "cuda"])
 def test_rms_modulated_preserves_fp32_affine(shape, dtype, backend, seed, cuda_available):
@@ -509,6 +509,11 @@ def test_rms_modulated_preserves_fp32_affine(shape, dtype, backend, seed, cuda_a
         actual = ck.int8_linear(x, weight, wscale, out_dtype=torch.float32,
                                convrot=True, input_act="rms_norm_modulated",
                                input_act_weight=packed, input_act_eps=1e-5)
+        if backend == "cuda":
+            normalized_fp32 = torch.nn.functional.rms_norm(x.float(), (k,), norm_weight, 1e-5)
+            separate = ck.int8_linear(normalized_fp32 * (1 + scale) + shift,
+                                     weight, wscale, out_dtype=torch.float32, convrot=True)
+            torch.testing.assert_close(actual, separate, rtol=0, atol=0)
     error = (actual.double() - expected).norm(dim=-1) / expected.norm(dim=-1)
     assert error.max() < 0.02
     assert actual.abs().max() > 0

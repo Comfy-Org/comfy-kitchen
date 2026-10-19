@@ -1242,6 +1242,21 @@ __device__ __forceinline__ float load_input_act(
     }
 }
 
+template<int ACT, typename InputType>
+__device__ __forceinline__ float apply_input_rms(
+    float x, float rstd, const void* weight, int col, int K)
+{
+    if constexpr (ACT == kActRmsNormModulated) {
+        // Packed FP32 [norm weight, scale, shift], even for BF16 input.
+        const float* affine = static_cast<const float*>(weight);
+        const float normalized = __fmul_rn(__fmul_rn(x, rstd), affine[col]);
+        return __fadd_rn(__fmul_rn(normalized, __fadd_rn(1.0f, affine[K + col])),
+                         affine[2 * K + col]);
+    } else {
+        return x * rstd * to_float(static_cast<const InputType*>(weight)[col]);
+    }
+}
+
 // One row of the ConvRot quantizer, run by a whole BLOCK_THREADS block: optional input
 // activation (SwiGLU reads a [gate | up] raw row twice as wide as the K it writes;
 // RmsNorm stages the raw row first for its mean of squares), 256-point FHT per group,
@@ -1254,7 +1269,7 @@ __device__ __forceinline__ float convrot64_quantize_row(
     int K,
     int64_t rng_base,
     uint64_t seed,
-    const InputType* __restrict__ act_weight,
+    const void* __restrict__ act_weight,
     float act_eps,
     float* row_buf,
     float* tmp,
@@ -1278,15 +1293,44 @@ __device__ __forceinline__ float convrot64_quantize_row(
     // row_buf; the FHT loop reads its 256-wide slice and overwrites it two stages
     // later, with __syncthreads between, so nothing is clobbered early.
     float rstd = 1.0f;
-    if constexpr (ACT == kActRmsNorm) {
+    if constexpr (ACT == kActRmsNorm || ACT == kActRmsNormModulated) {
         float sum_sq = 0.0f;
         for (int col = tid; col < K; col += BLOCK_THREADS) {
             const float v = to_float(x_row[col]);
             row_buf[col] = v;
-            sum_sq += v * v;
+            if constexpr (ACT == kActRmsNorm) sum_sq += v * v;
         }
-        sum_sq = block_reduce_sum_f32_t<kWarps>(sum_sq, warp_smem, block_smem);
-        rstd = rsqrtf(sum_sq / static_cast<float>(K) + act_eps);
+        if constexpr (ACT == kActRmsNormModulated) {
+            // Match PyTorch's FP32 vectorized RMSNorm reduction before the
+            // affine operations. A different tree can move INT8 rounding ties.
+            constexpr int stats_threads = BLOCK_THREADS < 128 ? BLOCK_THREADS : 128;
+            constexpr int stats_warps = stats_threads / 32;
+            __syncthreads();
+            if (tid < stats_threads) {
+                for (int col = tid * 4; col < K; col += stats_threads * 4) {
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float v = row_buf[col + j];
+                        sum_sq = __fmaf_rn(v, v, sum_sq);
+                    }
+                }
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    sum_sq = __fadd_rn(sum_sq, __shfl_down_sync(0xffffffffu, sum_sq, offset));
+                }
+                if ((tid & 31) == 0) warp_smem[tid / 32] = sum_sq;
+            }
+            __syncthreads();
+            for (int offset = stats_warps / 2; offset > 0; offset >>= 1) {
+                if (tid < offset) warp_smem[tid] = __fadd_rn(warp_smem[tid], warp_smem[tid + offset]);
+                __syncthreads();
+            }
+            if (tid == 0) *block_smem = rsqrtf(__fadd_rn(__fdiv_rn(warp_smem[0], static_cast<float>(K)), act_eps));
+            __syncthreads();
+            rstd = *block_smem;
+        } else {
+            sum_sq = block_reduce_sum_f32_t<kWarps>(sum_sq, warp_smem, block_smem);
+            rstd = rsqrtf(sum_sq / static_cast<float>(K) + act_eps);
+        }
     }
 
     const int iters = (n_groups + kGroupsInFlight - 1) / kGroupsInFlight;
@@ -1298,11 +1342,11 @@ __device__ __forceinline__ float convrot64_quantize_row(
         const int col = group_col + base;
 
         float x0, x1, x2, x3;
-        if constexpr (ACT == kActRmsNorm) {
-            x0 = active ? row_buf[col] * rstd * to_float(act_weight[col]) : 0.0f;
-            x1 = active ? row_buf[col + 1] * rstd * to_float(act_weight[col + 1]) : 0.0f;
-            x2 = active ? row_buf[col + 2] * rstd * to_float(act_weight[col + 2]) : 0.0f;
-            x3 = active ? row_buf[col + 3] * rstd * to_float(act_weight[col + 3]) : 0.0f;
+        if constexpr (ACT == kActRmsNorm || ACT == kActRmsNormModulated) {
+            x0 = active ? apply_input_rms<ACT, InputType>(row_buf[col], rstd, act_weight, col, K) : 0.0f;
+            x1 = active ? apply_input_rms<ACT, InputType>(row_buf[col + 1], rstd, act_weight, col + 1, K) : 0.0f;
+            x2 = active ? apply_input_rms<ACT, InputType>(row_buf[col + 2], rstd, act_weight, col + 2, K) : 0.0f;
+            x3 = active ? apply_input_rms<ACT, InputType>(row_buf[col + 3], rstd, act_weight, col + 3, K) : 0.0f;
         } else {
             x0 = active ? load_input_act<ACT>(x_row, 0, col, K) : 0.0f;
             x1 = active ? load_input_act<ACT>(x_row, 0, col + 1, K) : 0.0f;
@@ -1328,17 +1372,19 @@ __device__ __forceinline__ float convrot64_quantize_row(
         __syncthreads();
     }
 
+    // Modulated RMSNorm stays FP32 through rotation and quantization.
+    using QuantType = std::conditional_t<ACT == kActRmsNormModulated, float, InputType>;
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, block_smem);
     const float scale = fmaxf(
-        finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f),
+        finite_absmax_for_int8_scale<QuantType>(abs_max) * (1.0f / 127.0f),
         1.0e-30f);
 
     for (int col = tid; col < K; col += BLOCK_THREADS) {
-        const float scaled = quant_div_float_to_float<InputType>(row_buf[col], scale);
+        const float scaled = quant_div_float_to_float<QuantType>(row_buf[col], scale);
         float quantized;
         if constexpr (STOCHASTIC) {
-            const InputType noise = stochastic_rng_value<InputType>(rng_base + col, seed);
-            quantized = floorf(stochastic_sum_to_float<InputType>(scaled, noise));
+            const QuantType noise = stochastic_rng_value<QuantType>(rng_base + col, seed);
+            quantized = floorf(stochastic_sum_to_float<QuantType>(scaled, noise));
         } else {
             quantized = nearbyintf(scaled);
         }
@@ -1355,7 +1401,7 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     float* __restrict__ scales,
     int K,
     uint64_t seed,
-    const InputType* __restrict__ act_weight,
+    const void* __restrict__ act_weight,
     float act_eps)
 {
     constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
@@ -1387,7 +1433,7 @@ constexpr int kFusedGemvCols = kFusedGemvThreads / kThreadsPerWarp;
 template<typename InputType, typename OutputType, typename BiasType, int ACT>
 __global__ void __launch_bounds__(kFusedGemvThreads) int8_gemv_convrot_fused_kernel(
     const InputType* __restrict__ x,
-    const InputType* __restrict__ act_weight,
+    const void* __restrict__ act_weight,
     float act_eps,
     const int8_t* __restrict__ weight,
     const float* __restrict__ weight_scales,
@@ -2052,10 +2098,10 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
     }
     if (act_code != comfy::kActNone && act_code != comfy::kActGeluTanh
         && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm
-        && act_code != comfy::kActSiTU) {
+        && act_code != comfy::kActSiTU && act_code != comfy::kActRmsNormModulated) {
         throw std::runtime_error("convrot64 fused kernel: unsupported input activation code");
     }
-    if (act_code == comfy::kActRmsNorm && act_weight == nullptr) {
+    if ((act_code == comfy::kActRmsNorm || act_code == comfy::kActRmsNormModulated) && act_weight == nullptr) {
         throw std::runtime_error("convrot64 fused kernel: rms_norm activation requires a weight");
     }
 
@@ -2079,7 +2125,7 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                 static_cast<float*>(scales),
                 static_cast<int>(num_cols),
                 seed,
-                static_cast<const InputType*>(act_weight),
+                act_weight,
                 act_eps);
         };
 
@@ -2122,6 +2168,9 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                     break;
                 case comfy::kActRmsNorm:
                     launch_act(std::integral_constant<int, comfy::kActRmsNorm>{}, block_threads);
+                    break;
+                case comfy::kActRmsNormModulated:
+                    launch_act(std::integral_constant<int, comfy::kActRmsNormModulated>{}, block_threads);
                     break;
                 case comfy::kActSiTU:
                     launch_act(std::integral_constant<int, comfy::kActSiTU>{}, block_threads);
@@ -2390,10 +2439,10 @@ void launch_int8_gemv_convrot_fused_kernel(
     }
     if (act_code != comfy::kActNone && act_code != comfy::kActGeluTanh
         && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm
-        && act_code != comfy::kActSiTU) {
+        && act_code != comfy::kActSiTU && act_code != comfy::kActRmsNormModulated) {
         throw std::runtime_error("int8 fused convrot GEMV: unsupported input activation code");
     }
-    if (act_code == comfy::kActRmsNorm && act_weight == nullptr) {
+    if ((act_code == comfy::kActRmsNorm || act_code == comfy::kActRmsNormModulated) && act_weight == nullptr) {
         throw std::runtime_error("int8 fused convrot GEMV: rms_norm activation requires a weight");
     }
     if (has_bias && bias_dtype_code != output_dtype_code) {
@@ -2431,7 +2480,7 @@ void launch_int8_gemv_convrot_fused_kernel(
                 }
                 kernel<<<blocks, comfy::kFusedGemvThreads, smem_bytes, stream>>>(
                     static_cast<const InputType*>(input),
-                    static_cast<const InputType*>(act_weight),
+                    act_weight,
                     act_eps,
                     static_cast<const int8_t*>(weight),
                     static_cast<const float*>(weight_scales),
@@ -2453,6 +2502,9 @@ void launch_int8_gemv_convrot_fused_kernel(
                     break;
                 case comfy::kActRmsNorm:
                     launch(comfy::int8_gemv_convrot_fused_kernel<InputType, OutputType, OutputType, comfy::kActRmsNorm>);
+                    break;
+                case comfy::kActRmsNormModulated:
+                    launch(comfy::int8_gemv_convrot_fused_kernel<InputType, OutputType, OutputType, comfy::kActRmsNormModulated>);
                     break;
                 case comfy::kActSiTU:
                     launch(comfy::int8_gemv_convrot_fused_kernel<InputType, OutputType, OutputType, comfy::kActSiTU>);

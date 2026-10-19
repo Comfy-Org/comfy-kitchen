@@ -12,7 +12,8 @@ namespace comfy {
 // for silu(gate) * up and [hidden | gate] for SiTU's 4*tanh(gate/4)*sigmoid(gate) *
 // 25*tanh(hidden/25), and the activated row is K wide. RmsNorm carries a weight
 // pointer and eps.
-enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2, kActRmsNorm = 3, kActSiTU = 4 };
+enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2, kActRmsNorm = 3, kActSiTU = 4,
+             kActRmsNormModulated = 5 };
 
 // Raw input columns per activated column.
 constexpr int input_act_width(int act) { return (act == kActSwiGLU || act == kActSiTU) ? 2 : 1; }

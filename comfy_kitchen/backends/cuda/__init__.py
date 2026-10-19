@@ -1638,9 +1638,6 @@ def quantize_int8_rowwise_convrot64(
     rows are half as wide as the input rows. "rms_norm" normalizes each row with input_act_weight
     (K elements) and input_act_eps before rotating.
     """
-    if input_act == "rms_norm_modulated":
-        weight_2d = _apply_input_act(weight_2d, input_act, input_act_weight, input_act_eps)
-        input_act = None
     q_2d = torch.empty(
         (weight_2d.shape[0], weight_2d.shape[1] // _input_act_width(input_act)),
         dtype=torch.int8, device=weight_2d.device)
@@ -2120,6 +2117,10 @@ def _act_weight_arg(input_act, input_act_weight, device, dtype: torch.dtype) -> 
     that carry one, the empty placeholder otherwise."""
     if input_act == "rms_norm" and input_act_weight is not None:
         return input_act_weight.to(device=device, dtype=dtype).contiguous()
+    if input_act == "rms_norm_modulated":
+        if input_act_weight is None or input_act_weight.dtype != torch.float32:
+            raise ValueError("rms_norm_modulated requires FP32 input_act_weight")
+        return input_act_weight.to(device=device).contiguous()
     return _empty_cuda_tensor(device, dtype)
 
 
@@ -2141,9 +2142,6 @@ def int8_linear(
         raise ValueError("int8_linear: residual requires residual_scale")
     orig_shape = x.shape
     x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
-    if input_act == "rms_norm_modulated":
-        x_2d = _apply_input_act(x_2d, input_act, input_act_weight, input_act_eps)
-        input_act = None
     if not weight.is_contiguous():
         weight = weight.contiguous()
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream

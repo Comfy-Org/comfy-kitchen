@@ -3846,7 +3846,14 @@ void quantize_int8_rowwise_convrot64(
         throw std::runtime_error("Unsupported input dtype for INT8 rowwise convrot64 quantization");
     }
     const bool has_act_weight = act_weight.data() && act_weight.size() > 0;
-    if (act_code == comfy::kActRmsNorm) {
+    if (act_code == comfy::kActRmsNormModulated) {
+        if (act_weight.dtype() != nb::dtype<float>() || act_weight.ndim() != 2
+            || act_weight.shape(0) != 3 || act_weight.shape(1) != K
+            || act_weight.stride(0) != K || act_weight.stride(1) != 1
+            || act_weight.device_id() != input.device_id()) {
+            throw std::runtime_error("rms_norm_modulated requires contiguous FP32 [3, K] on the input device");
+        }
+    } else if (act_code == comfy::kActRmsNorm) {
         if (!has_act_weight || act_weight.size() != K) {
             throw std::runtime_error("INT8 rowwise convrot64 rms_norm weight must have K elements");
         }
@@ -4081,7 +4088,14 @@ void int8_linear_m1(
     }
     if (convrot) {
         const bool has_act_weight = act_weight.data() && act_weight.size() > 0;
-        if (has_act_weight) {
+        if (act_code == comfy::kActRmsNormModulated) {
+            if (act_weight.dtype() != nb::dtype<float>() || act_weight.ndim() != 2
+                || act_weight.shape(0) != 3 || act_weight.shape(1) != K
+                || act_weight.stride(0) != K || act_weight.stride(1) != 1
+                || act_weight.device_id() != input.device_id()) {
+                throw std::runtime_error("rms_norm_modulated requires contiguous FP32 [3, K] on the input device");
+            }
+        } else if (has_act_weight) {
             if (act_weight.shape(0) != K) {
                 throw std::runtime_error("INT8 M=1 linear act weight shape mismatch");
             }
