@@ -260,13 +260,8 @@ void launch_shortest_paths(int R, int N, int E, int n_front, long long cap, doub
              delta, static_cast<double*>(bound), static_cast<const long long*>(front), n_front, static_cast<double*>(dist),
              static_cast<long long*>(keys), cap, b, b + 2 * ((cap + 31) / 32), q, q + 2 * cap, static_cast<int*>(counts),
              l, l + 2 * R};
-    int device = 0, sms = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
     // one block per SM: rounds are latency bound and grid syncs slow down with more blocks
-    void* args[] = {&s};
-    CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(search_kernel), sms, kThreads, args, 0, stream));
-    CUDA_CHECK(cudaGetLastError());
+    comfy::launch_cooperative(search_kernel, comfy::sm_count(), kThreads, s, stream);
 }
 
 }  // extern "C"

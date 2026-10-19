@@ -47,7 +47,7 @@ struct Sweep {
     double* dist;  // (2, n) Jacobi buffers
     int* parent;
     int* jump;     // (2, n) pointer-jumping buffers
-    int* flags;    // (5,) 3 dropped flags, cycle found, bad index
+    int* flags;    // (6,) 3 dropped flags, cycle found, bad index, buffer holding the result
     uint8_t* on_cycle;
     int max_iters, steps;
 };
@@ -59,7 +59,7 @@ __global__ void sweep_kernel(Sweep s) {
     const cg::thread_block_tile<kLanes> tile = cg::tiled_partition<kLanes>(cg::this_thread_block());
     const int lane = tile.thread_rank();
     for (int h = tid; h <= s.n; h += stride)
-        if (s.indptr[h] < 0 || s.indptr[h] > s.E || (h < s.n && s.indptr[h + 1] < s.indptr[h])) s.flags[4] = 1;
+        if (s.indptr[h] < 0 || s.indptr[h] > s.E) s.flags[4] = 1;
     for (int a = tid; a < s.E; a += stride)
         if (s.tail[a] < 0 || s.tail[a] >= s.n) s.flags[4] = 1;
     grid.sync();
@@ -112,9 +112,7 @@ __global__ void sweep_kernel(Sweep s) {
         grid.sync();
         if (__ldcg(s.flags + 3)) break;
     }
-    // the result belongs in the first buffer
-    if (it < s.max_iters ? (it & 1) == 0 : (it & 1) == 1)
-        for (int v = tid; v < s.n; v += stride) s.dist[v] = __ldcg(s.dist + s.n + v);
+    if (tid == 0) s.flags[5] = it < s.max_iters ? (it + 1) & 1 : it & 1;    // the buffer the last sweep wrote
 }
 
 }  // namespace bellman_ford
@@ -124,7 +122,7 @@ using namespace comfy::bellman_ford;
 
 extern "C" {
 
-// dist (2, n): start distances in, result out, both in the first row. parent -1, flags and on_cycle 0 on entry.
+// dist (2, n): start distances in the first row; the result is in row flags[5]. parent -1, flags and on_cycle 0 on entry.
 // Sets flags[4] and does nothing on an out-of-range index.
 void launch_bellman_ford(int n, int E, const void* indptr, const void* tail, const void* w, void* dist, void* parent,
                          void* jump, void* flags, void* on_cycle, int max_iters, cudaStream_t stream) {
@@ -134,13 +132,8 @@ void launch_bellman_ford(int n, int E, const void* indptr, const void* tail, con
     Sweep s{n, E, static_cast<const int*>(indptr), static_cast<const int*>(tail), static_cast<const double*>(w),
             static_cast<double*>(dist), static_cast<int*>(parent), static_cast<int*>(jump), static_cast<int*>(flags),
             static_cast<uint8_t*>(on_cycle), max_iters, steps};
-    int device = 0, sms = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-    const int blocks = std::min(2 * sms, static_cast<int>((static_cast<long long>(n) * kLanes + kThreads - 1) / kThreads));
-    void* args[] = {&s};
-    CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(sweep_kernel), blocks, kThreads, args, 0, stream));
-    CUDA_CHECK(cudaGetLastError());
+    const int blocks = std::min(2 * comfy::sm_count(), static_cast<int>((static_cast<long long>(n) * kLanes + kThreads - 1) / kThreads));
+    comfy::launch_cooperative(sweep_kernel, blocks, kThreads, s, stream);
 }
 
 }  // extern "C"

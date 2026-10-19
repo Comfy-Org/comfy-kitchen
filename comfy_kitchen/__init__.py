@@ -1257,7 +1257,7 @@ def conjugate_gradient(indptr: torch.Tensor, cols: torch.Tensor, vals: torch.Ten
                        max_iters: int, tol: float) -> None:
     """Conjugate gradients for A x = b, updating x (the start) in place.
 
-    A is symmetric positive definite in CSR form (indptr, cols, float64 vals). b and x are (N,) or (N, k <= 4) float64;
+    A is symmetric positive definite in CSR form (indptr, cols, float64 vals). b and x are (N,) or (N, k <= 2) float64;
     all columns iterate until every residual is within tol of its right-hand side's norm, or for max_iters. Results
     reproduce exactly on one device.
     """

@@ -35,7 +35,7 @@ namespace conjugate_gradient {
 
 constexpr int kThreads = 256;
 constexpr int kWarps = kThreads / 32;
-constexpr int kMaxCols = 4;
+constexpr int kMaxCols = 2;
 
 struct Solve {
     int n, k, nnz;
@@ -50,7 +50,6 @@ struct Solve {
     double* partial;  // (2, blocks, 2 * kMaxCols)
     int max_iters;
     double tol2;
-    int* error;       // set on an out-of-range index
 };
 
 // sums m values per block into partial[blockIdx.x], then over all blocks into total
@@ -95,12 +94,6 @@ __global__ void cg_kernel(Solve s) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = gridDim.x * blockDim.x;
     const int k = s.k;
-    for (int i = tid; i <= s.n; i += stride)
-        if (s.indptr[i] < 0 || s.indptr[i] > s.nnz || (i < s.n && s.indptr[i + 1] < s.indptr[i])) *s.error = 1;
-    for (int a = tid; a < s.nnz; a += stride)
-        if (s.cols[a] < 0 || s.cols[a] >= s.n) *s.error = 1;
-    grid.sync();
-    if (__ldcg(s.error)) return;
     double acc[2 * kMaxCols], rs[kMaxCols], stop[kMaxCols], total[2 * kMaxCols];
     double* const half[2] = {s.partial, s.partial + gridDim.x * 2 * kMaxCols};
     int flip = 0;
@@ -158,24 +151,16 @@ using namespace comfy::conjugate_gradient;
 
 extern "C" {
 
-// x: start in, solution out. work: (3 * n * k + 4 * kMaxCols * SMs) scratch. error: zeroed, set (nothing solved) on
-// an out-of-range index.
+// x: start in, solution out. work: (3 * n * k + 4 * kMaxCols * SMs) scratch.
 void launch_conjugate_gradient(int n, int k, int nnz, const void* indptr, const void* cols, const void* vals,
-                               const void* b, void* x, void* work, int max_iters, double tol, void* error,
-                               cudaStream_t stream) {
+                               const void* b, void* x, void* work, int max_iters, double tol, cudaStream_t stream) {
     if (n <= 0) return;
     const long long nk = static_cast<long long>(n) * k;
     double* r = static_cast<double*>(work);
     Solve s{n, k, nnz, static_cast<const int*>(indptr), static_cast<const int*>(cols), static_cast<const double*>(vals),
             static_cast<const double*>(b), static_cast<double*>(x), r, r + nk, r + 2 * nk, r + 3 * nk, max_iters,
-            tol * tol, static_cast<int*>(error)};
-    int device = 0, sms = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-    void* args[] = {&s};
-    CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(cg_kernel), std::min(sms, (n + kThreads - 1) / kThreads),
-                                           kThreads, args, 0, stream));
-    CUDA_CHECK(cudaGetLastError());
+            tol * tol};
+    comfy::launch_cooperative(cg_kernel, std::min(comfy::sm_count(), (n + kThreads - 1) / kThreads), kThreads, s, stream);
 }
 
 }  // extern "C"

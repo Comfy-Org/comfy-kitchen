@@ -390,8 +390,7 @@ extern "C" {
     void launch_walk_successors(int R, int N, const void* succ, const void* stop, const void* active, const void* twin,
                                 const void* starts, void* seen, void* lengths, void* out, int L, cudaStream_t stream);
     void launch_conjugate_gradient(int n, int k, int nnz, const void* indptr, const void* cols, const void* vals,
-                                   const void* b, void* x, void* work, int max_iters, double tol, void* error,
-                                   cudaStream_t stream);
+                                   const void* b, void* x, void* work, int max_iters, double tol, cudaStream_t stream);
 }
 
 // Nanobind wrapper for quantize_per_tensor_fp8
@@ -1964,9 +1963,9 @@ void walk_successors(int R, int N, cuda_array succ, cuda_array stop, cuda_array 
 }
 
 void conjugate_gradient(int n, int k, int nnz, cuda_array indptr, cuda_array cols, cuda_array vals, cuda_array b,
-                        cuda_array x, cuda_array work, int max_iters, double tol, cuda_array error, uintptr_t stream_ptr) {
+                        cuda_array x, cuda_array work, int max_iters, double tol, uintptr_t stream_ptr) {
     launch_conjugate_gradient(n, k, nnz, indptr.data(), cols.data(), vals.data(), b.data(), x.data(), work.data(),
-                              max_iters, tol, error.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
+                              max_iters, tol, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // fp16-accumulate conv3d; all tensors fp16 NDHWC (validated in Python), residual is
@@ -5411,7 +5410,7 @@ NB_MODULE(_C, m) {
           nb::arg("lengths"), nb::arg("out").none(), nb::arg("L"), nb::arg("stream_ptr"));
     m.def("conjugate_gradient", &conjugate_gradient, "Conjugate gradients on a CSR matrix, in place", nb::arg("n"),
           nb::arg("k"), nb::arg("nnz"), nb::arg("indptr"), nb::arg("cols"), nb::arg("vals"), nb::arg("b"), nb::arg("x"),
-          nb::arg("work"), nb::arg("max_iters"), nb::arg("tol"), nb::arg("error"), nb::arg("stream_ptr"));
+          nb::arg("work"), nb::arg("max_iters"), nb::arg("tol"), nb::arg("stream_ptr"));
 
     // Feature availability flag (computed at module load time)
     m.attr("HAS_CUBLASLT") = comfy::CublasLtRuntime::instance().is_available();

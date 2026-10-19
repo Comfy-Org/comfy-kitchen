@@ -3689,16 +3689,17 @@ def bellman_ford(indptr: torch.Tensor, tail: torch.Tensor, weight: torch.Tensor,
     _check_count("max_iters", max_iters)
     parent = torch.full((n,), -1, dtype=torch.int32, device=device)
     on_cycle = torch.zeros(n, dtype=torch.bool, device=device)
-    work = dist.repeat(2, 1)                                    # Jacobi buffers, the result lands in the first
+    work = dist.repeat(2, 1)                                    # Jacobi buffers
     jump = torch.empty(2 * n, dtype=torch.int32, device=device)
-    flags = torch.zeros(5, dtype=torch.int32, device=device)
+    flags = torch.zeros(6, dtype=torch.int32, device=device)
     w = _wrap_for_dlpack
     _C.bellman_ford(n, tail.shape[0], w(indptr.to(torch.int32).contiguous()), w(tail.to(torch.int32).contiguous()),
                     w(weight.contiguous()), w(work), w(parent), w(jump), w(flags), w(on_cycle.view(torch.uint8)),
                     max_iters, torch.cuda.current_stream(device).cuda_stream)
-    if flags[4]:
+    bad, result = flags[4:].tolist()
+    if bad:
         raise ValueError("bellman_ford: indptr or tail holds an index out of range")
-    dist.copy_(work[0])
+    dist.copy_(work[result])
     return parent.long(), on_cycle
 
 
@@ -3763,19 +3764,18 @@ def conjugate_gradient(indptr: torch.Tensor, cols: torch.Tensor, vals: torch.Ten
     _check_shape("b", b, (n,) if b.dim() == 1 else (n, None))
     _check_shape("x", x, tuple(b.shape))
     _check_count("max_iters", max_iters)
-    if not 1 <= k <= 4:
-        raise ValueError(f"b must have 1 to 4 columns, got {k}")
+    _check_indices("cols", cols, n)
+    _check_indices("indptr", indptr, cols.shape[0] + 1)
+    if not 1 <= k <= 2:
+        raise ValueError(f"b must have 1 or 2 columns, got {k}")
     if not x.is_contiguous():
         raise ValueError("x is updated in place and must be contiguous")
     sms = torch.cuda.get_device_properties(device).multi_processor_count
-    work = torch.empty(3 * x.numel() + 16 * sms, dtype=torch.float64, device=device)    # r, p, A p, 2 x block partials
-    error = torch.zeros(1, dtype=torch.int32, device=device)
+    work = torch.empty(3 * x.numel() + 8 * sms, dtype=torch.float64, device=device)     # r, p, A p, 2 x block partials
     w = _wrap_for_dlpack
     _C.conjugate_gradient(n, k, cols.shape[0], w(indptr.to(torch.int32).contiguous()), w(cols.to(torch.int32).contiguous()),
-                          w(vals.contiguous()), w(b.contiguous()), w(x), w(work), max_iters, float(tol), w(error),
+                          w(vals.contiguous()), w(b.contiguous()), w(x), w(work), max_iters, float(tol),
                           torch.cuda.current_stream(device).cuda_stream)
-    if error.item():
-        raise ValueError("conjugate_gradient: indptr or cols holds an index out of range")
 
 
 _ZERO_VECTORS: dict[tuple, torch.Tensor] = {}
