@@ -1209,9 +1209,18 @@ __device__ __forceinline__ float apply_input_act(float v) {
     return v;
 }
 
+// tanh that keeps its relative precision near zero and saturates without overflow:
+// --use_fast_math turns tanhf into tanh.approx (~2^-11 relative error), and
+// 1 - 2 / (1 + exp(2x)) cancels to 0 for small |x|. expm1f has no fast intrinsic.
+__device__ __forceinline__ float stable_tanh(float x) {
+    const float t = expm1f(-2.0f * fabsf(x));
+    return copysignf(-t / (t + 2.0f), x);
+}
+
 // Reads one activated value: column `col` of the K-wide activated row starting
-// at `in_row`. For SwiGLU the raw row is 2*K wide with the gate in the first
-// half; every other activation reads the same K-wide row it writes.
+// at `in_row`. For SwiGLU and SiTU the raw row is 2*K wide (SwiGLU's gate in the
+// first half, SiTU's in the second); every other activation reads the same
+// K-wide row it writes.
 template<int ACT, typename InputType>
 __device__ __forceinline__ float load_input_act(
     const InputType* __restrict__ x, int64_t in_row, int col, int K)
@@ -1221,6 +1230,13 @@ __device__ __forceinline__ float load_input_act(
         const float gate = to_float(x[in_row + col]);
         const float up = to_float(x[in_row + K + col]);
         return (gate / (1.0f + expf(-gate))) * up;
+    } else if constexpr (ACT == kActSiTU) {
+        // Matches torch 4 * tanh(gate / 4) * sigmoid(gate) * (25 * tanh(hidden / 25)).
+        const float hidden = to_float(x[in_row + col]);
+        const float gate = to_float(x[in_row + K + col]);
+        const float gate_cap = 4.0f * stable_tanh(gate / 4.0f);
+        const float hidden_cap = 25.0f * stable_tanh(hidden / 25.0f);
+        return gate_cap / (1.0f + expf(-gate)) * hidden_cap;
     } else {
         return apply_input_act<ACT>(to_float(x[in_row + col]));
     }
@@ -1349,7 +1365,7 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
 
     const int row = static_cast<int>(blockIdx.x);
     const int64_t row_offset = static_cast<int64_t>(row) * K;
-    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
+    constexpr int kInWidth = input_act_width(ACT);
     const float scale = convrot64_quantize_row<InputType, BLOCK_THREADS, STOCHASTIC, ACT>(
         x + row_offset * kInWidth, q + row_offset, K, row_offset, seed, act_weight, act_eps,
         smem, smem + K, warp_smem, &block_smem);
@@ -1549,7 +1565,7 @@ quantize_int8_convrot_cluster_kernel(
     const int n_groups = K / kConvRotGroup;
     const int passes = (n_groups + kSlots - 1) / kSlots;
     const int64_t row_offset = static_cast<int64_t>(row) * K;
-    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
+    constexpr int kInWidth = input_act_width(ACT);
     const InputType* in_row = x + row_offset * kInWidth;
 
     float rstd = 1.0f;
@@ -2035,7 +2051,8 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
         throw std::runtime_error("convrot64 fused kernel only supports K <= INT_MAX");
     }
     if (act_code != comfy::kActNone && act_code != comfy::kActGeluTanh
-        && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm) {
+        && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm
+        && act_code != comfy::kActSiTU) {
         throw std::runtime_error("convrot64 fused kernel: unsupported input activation code");
     }
     if (act_code == comfy::kActRmsNorm && act_weight == nullptr) {
@@ -2105,6 +2122,9 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                     break;
                 case comfy::kActRmsNorm:
                     launch_act(std::integral_constant<int, comfy::kActRmsNorm>{}, block_threads);
+                    break;
+                case comfy::kActSiTU:
+                    launch_act(std::integral_constant<int, comfy::kActSiTU>{}, block_threads);
                     break;
                 default:
                     launch_act(std::integral_constant<int, comfy::kActNone>{}, block_threads);
@@ -2369,7 +2389,8 @@ void launch_int8_gemv_convrot_fused_kernel(
         throw std::runtime_error("INT8 GEMV weight scale must be scalar or per-output-channel");
     }
     if (act_code != comfy::kActNone && act_code != comfy::kActGeluTanh
-        && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm) {
+        && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm
+        && act_code != comfy::kActSiTU) {
         throw std::runtime_error("int8 fused convrot GEMV: unsupported input activation code");
     }
     if (act_code == comfy::kActRmsNorm && act_weight == nullptr) {
@@ -2432,6 +2453,9 @@ void launch_int8_gemv_convrot_fused_kernel(
                     break;
                 case comfy::kActRmsNorm:
                     launch(comfy::int8_gemv_convrot_fused_kernel<InputType, OutputType, OutputType, comfy::kActRmsNorm>);
+                    break;
+                case comfy::kActSiTU:
+                    launch(comfy::int8_gemv_convrot_fused_kernel<InputType, OutputType, OutputType, comfy::kActSiTU>);
                     break;
                 default:
                     launch(comfy::int8_gemv_convrot_fused_kernel<InputType, OutputType, OutputType, comfy::kActNone>);

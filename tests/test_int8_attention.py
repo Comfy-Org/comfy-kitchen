@@ -1179,8 +1179,7 @@ def test_block_sparse_rejects_lut_for_another_block_size():
 
 
 @requires_int8_attention
-@pytest.mark.skipif(bool(torch.version.hip), reason="CUDA paged decode kernel")
-@pytest.mark.parametrize("seq", [1, 7])
+@pytest.mark.parametrize("seq", [1, 6, 7])
 @pytest.mark.parametrize("circular", [False, True])
 def test_int8_decode_graph_growing_prefix_and_rollback(seq, circular):
     from comfy_kitchen.int8_decode import Int8DecodeCache

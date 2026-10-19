@@ -208,14 +208,17 @@ __forceinline__ __device__ float load_in(const void* x, int64_t idx, int code) {
     return static_cast<float>(static_cast<const __bf16*>(x)[idx]);
 }
 
-// Codes match comfy_kitchen.backends._activations.INPUT_ACT_TO_CODE. SwiGLU is
-// the gated pair: the raw row is [gate | up] (2*K wide) and the activated row
-// silu(gate) * up is K wide. RmsNorm is row-wise, carries a K-element weight and
-// eps, and only the fused INT8 G=256 kernel implements it.
-enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2, kActRmsNorm = 3 };
+// Codes match comfy_kitchen.backends._activations.INPUT_ACT_TO_CODE. SwiGLU
+// ([gate | up]) and SiTU ([hidden | gate]) read a 2*K-wide row and write K. RmsNorm
+// carries a K-element weight and eps, and only the fused INT8 G=256 kernel
+// implements it.
+enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2, kActRmsNorm = 3, kActSiTU = 4 };
+
+constexpr int input_act_width(int act) { return (act == kActSwiGLU || act == kActSiTU) ? 2 : 1; }
 
 inline void check_convrot_act(int act) {
-    if (act != kActNone && act != kActGeluTanh && act != kActSwiGLU && act != kActRmsNorm) {
+    if (act != kActNone && act != kActGeluTanh && act != kActSwiGLU && act != kActRmsNorm
+        && act != kActSiTU) {
         throw std::runtime_error("convrot: unsupported input activation code");
     }
 }
@@ -231,9 +234,15 @@ __forceinline__ __device__ float apply_input_act(float v) {
     return v;
 }
 
+// Keeps relative precision near zero, which tanhf loses under -ffast-math.
+__forceinline__ __device__ float stable_tanh(float x) {
+    const float t = expm1f(-2.0f * fabsf(x));
+    return copysignf(-t / (t + 2.0f), x);
+}
+
 // One activated value: column `col` of the K-wide activated row starting at
-// `in_row`. SwiGLU reads the gate at col and the up at K + col; every other
-// activation reads the same K-wide row it writes.
+// `in_row`. SwiGLU and SiTU read a 2*K-wide row; every other activation reads the
+// K-wide row it writes.
 template <int ACT>
 __forceinline__ __device__ float load_input_act(
     const void* x, int64_t in_row, int col, int K, int code) {
@@ -242,6 +251,13 @@ __forceinline__ __device__ float load_input_act(
         const float gate = load_in(x, in_row + col, code);
         const float up = load_in(x, in_row + K + col, code);
         return (gate / (1.0f + expf(-gate))) * up;
+    } else if constexpr (ACT == kActSiTU) {
+        // Matches torch 4*tanh(gate/4)*sigmoid(gate) * 25*tanh(hidden/25).
+        const float hidden = load_in(x, in_row + col, code);
+        const float gate = load_in(x, in_row + K + col, code);
+        const float gate_cap = 4.0f * stable_tanh(gate / 4.0f);
+        const float hidden_cap = 25.0f * stable_tanh(hidden / 25.0f);
+        return gate_cap / (1.0f + expf(-gate)) * hidden_cap;
     } else {
         return apply_input_act<ACT>(load_in(x, in_row + col, code));
     }
@@ -427,7 +443,7 @@ __global__ __launch_bounds__(GROUPS_PER_BLOCK* 64) void convrot_rotate_groups64_
     const int n_groups = K / kConvRotGroup256;
     const bool active = group < n_groups;
     const int64_t row_offset = row * K;
-    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
+    constexpr int kInWidth = input_act_width(ACT);
     const int64_t in_row_offset = row_offset * kInWidth;
     const int group_col = group * kConvRotGroup256;
 
@@ -572,7 +588,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
     const int sub = tid / kGroupThreads;
     const int lane = tid % kGroupThreads;
     const int64_t row_offset = static_cast<int64_t>(row) * K;
-    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
+    constexpr int kInWidth = input_act_width(ACT);
     const int64_t in_row_offset = row_offset * kInWidth;
     const int n_groups = K / kConvRotGroup256;
 
@@ -752,7 +768,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_kernel(
     const float norm = rsqrtf(static_cast<float>(G));
     const int ngrp = K / G;
     // SwiGLU reads a [gate | up] raw row twice as wide as the K it writes.
-    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
+    constexpr int kInWidth = input_act_width(ACT);
     const int64_t in_row = static_cast<int64_t>(row) * K * kInWidth;
 
     float lmax = 0.0f;

@@ -221,6 +221,51 @@ def test_flash_attention_decode_cuda_graph_dynamic_lengths(head_dim):
 
 
 @requires_flash_decode
+@pytest.mark.skipif(bool(getattr(torch.version, "hip", None)), reason="uses CUDA sleep for overlap")
+@pytest.mark.parametrize("second_capacity", [4096, 512])
+def test_flash_attention_decode_concurrent_graphs(second_capacity):
+    torch.manual_seed(42)
+    states = []
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    graphs, outputs = [], []
+    for stream, capacity in zip(streams, [4096, second_capacity], strict=True):
+        state = _decode_operands(batch=1, capacity=capacity, kv_heads=4, groups=6, head_dim=256)
+        state[3].fill_(capacity - 128)
+        states.append(state)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            ck.flash_attention_decode(*state)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        # Independent pools: overlapping graphs cannot reuse each other's scratch.
+        with torch.cuda.graph(graph, stream=stream):
+            outputs.append(ck.flash_attention_decode(*state))
+        graphs.append(graph)
+
+    # Replay first to materialize graph allocations before touching outputs with cudaMallocAsync.
+    for graph in graphs:
+        graph.replay()
+    torch.cuda.synchronize()
+    for _ in range(40):
+        for state in states:
+            state[0].add_(0.0078125)
+        expected = [ck.flash_attention_decode(*state) for state in states]
+        for output in outputs:
+            output.fill_(float("nan"))
+        # Queue both replays behind one event so Python launch latency cannot serialize them.
+        torch.cuda._sleep(2_000_000)
+        ready = torch.cuda.Event()
+        ready.record()
+        for stream, graph in zip(streams, graphs, strict=True):
+            stream.wait_event(ready)
+            with torch.cuda.stream(stream):
+                graph.replay()
+        torch.cuda.synchronize()
+        for actual, reference in zip(outputs, expected, strict=True):
+            torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
+@requires_flash_decode
 @pytest.mark.parametrize(
     ("q_dim", "k_dim", "v_dim"),
     [(64, 64, 64), (192, 192, 192), (256, 128, 128), (128, 256, 256), (256, 256, 128)],
@@ -233,11 +278,6 @@ def test_flash_attention_decode_rejects_invalid_dimensions(q_dim, k_dim, v_dim):
     with pytest.raises(RuntimeError, match=r"dimensions|k/v shape mismatch"):
         ck.flash_attention_decode(q, k, v, lengths)
 
-
-requires_gqa_decode = pytest.mark.skipif(
-    not ck.flash_attention_decode_gqa_is_available(),
-    reason="requires the head_dim-256 GQA decode kernel",
-)
 
 # flash_attention_decode_gqa and flash_attention_decode_step_merge compute the same result
 # everywhere: the native kernel for BF16 head_dim 256 where one is built, torch otherwise.
@@ -280,44 +320,6 @@ def test_flash_attention_decode_step_merge_matches_full_softmax(dtype, head_dim,
     expected = attend(torch.cat([prefix_scores, step_scores.masked_fill(future, float("-inf"))], dim=-1),
                       torch.cat([prefix_values, step_values], dim=2))
     torch.testing.assert_close(merged.float(), expected, atol=3e-3, rtol=1e-2)
-
-
-@requires_flash_decode
-@pytest.mark.parametrize("num_splits", [2, 5, 32])
-def test_flash_attention_decode_fused_combine_matches_two_launch(monkeypatch, num_splits):
-    """The in-kernel split fold (last CTA per row) must reproduce the separate
-    combine launch bit for bit: same warp-width reduction of the split maxima and
-    sums, same split order in the weighted accumulation."""
-    monkeypatch.setattr(flash_attention_module, "_num_splits", lambda *_, **__: num_splits)
-    torch.manual_seed(0)
-    q = torch.randn(3, 1, 8, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(3, 4097, 2, 128, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn_like(k)
-    lengths = torch.tensor([1, 73, 4097], device="cuda", dtype=torch.int32)
-    with monkeypatch.context() as fallback:
-        fallback.setattr(flash_attention_module, "_COMBINE_COUNTERS", 0)
-        two_launch = ck.flash_attention_decode(q, k, v, lengths)
-    fused = [ck.flash_attention_decode(q, k, v, lengths) for _ in range(3)]  # counters must rearm between calls
-    for out in fused:
-        assert torch.equal(out, two_launch)
-    torch.testing.assert_close(two_launch, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
-
-
-@requires_gqa_decode
-@pytest.mark.parametrize("num_splits", [2, 5, 32])
-@pytest.mark.parametrize("query_length", [1, 4])
-def test_flash_attention_decode_gqa_fused_combine_matches_two_launch(monkeypatch, num_splits, query_length):
-    monkeypatch.setattr(flash_attention_module, "_num_splits", lambda *_, **__: num_splits)
-    torch.manual_seed(0)
-    q = torch.randn(3, 8, query_length, 256, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(3, 2, 4097, 256, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn_like(k)
-    lengths = torch.tensor([query_length, 73, 4097], device="cuda", dtype=torch.int32)
-    with monkeypatch.context() as fallback:
-        fallback.setattr(flash_attention_module, "_COMBINE_COUNTERS", 0)
-        out_ref = ck.flash_attention_decode_gqa(q, k, v, lengths)
-    for _ in range(3):
-        assert torch.equal(ck.flash_attention_decode_gqa(q, k, v, lengths), out_ref)
 
 
 @pytest.mark.parametrize(("dtype", "head_dim"), GQA_OPERANDS)

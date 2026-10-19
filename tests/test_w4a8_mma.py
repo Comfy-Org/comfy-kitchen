@@ -260,6 +260,29 @@ class TestW4A8PackedMMA:
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
     reason="CUDA W4A8 linear needs sm_80+",
 )
+@requires_cuda_backend
+@pytest.mark.parametrize("act", ["rms_norm", "swiglu", "situ"])
+@pytest.mark.parametrize("bits", [4, 6])
+def test_prefill_fused_activation_matches_eager(act, bits, seed):
+    """M >= 512 quantizes with the 64-lane ConvRot kernel, which fuses the activation."""
+    m, n, k = 600, 512, 4096
+    qdata, s_rel, s_channel, cb, _ = _packed_weight(n, k, seed=1, bits=bits)
+    x = torch.randn(m, k * (1 if act == "rms_norm" else 2), device="cuda", dtype=torch.bfloat16) * 3.0
+    w = torch.randn(k, device="cuda", dtype=torch.bfloat16)
+    if act == "rms_norm":
+        activated = torch.nn.functional.rms_norm(x, (k,), weight=w, eps=1e-6)
+    elif act == "swiglu":
+        activated = torch.nn.functional.silu(x[:, :k]) * x[:, k:]
+    else:
+        hidden, gate = x.chunk(2, dim=-1)
+        activated = 4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate) * (25.0 * torch.tanh(hidden / 25.0))
+    eager = ck.w4a8_int8_linear(activated, qdata, s_rel, s_channel, codebook=cb)
+    fused = ck.w4a8_int8_linear(x, qdata, s_rel, s_channel, codebook=cb,
+                                input_act=act, input_act_weight=w, input_act_eps=1e-6)
+    # the kernel evaluates the activation in fp32, eager rounds it to bf16 first
+    assert ((fused.float() - eager.float()).norm() / eager.float().norm()).item() < 0.03
+
+
 @pytest.mark.parametrize("m", [1, 9])
 def test_canonical_residual_matches_addcmul(m, seed):
     # the canonical layout's decode GEMV and prefill routes apply the residual after the linear

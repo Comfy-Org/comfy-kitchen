@@ -61,9 +61,8 @@ def is_available(device: torch.device | None = None, key_head_dim: int = 128, va
 
 def deferred_is_available(device: torch.device | int | None = None, key_head_dim: int = 128, value_head_dim: int = 128) -> bool:
     """Return whether deltanet_conv_step_deferred and gated_delta_decode_deferred run their
-    native kernels on this device: DK = DV = 128 on CUDA sm_90+ (the decode kernel runs one
-    head per 4-block cluster) or on the HIP extension's supported GPUs. They otherwise compute
-    the same result in torch."""
+    native kernels on this device: DK = DV = 128 on CUDA sm_80+ or on the HIP extension's
+    supported GPUs. They otherwise compute the same result in torch."""
     if not torch.cuda.is_available():
         return False
     if device is not None and torch.device(device).type != "cuda":
@@ -75,7 +74,7 @@ def deferred_is_available(device: torch.device | int | None = None, key_head_dim
     ext = _cuda_backend._C if _cuda_backend._EXT_AVAILABLE else None
     if ext is None or not hasattr(ext, "gated_delta_decode_deferred") or not hasattr(ext, "deltanet_conv_deferred"):
         return False
-    return torch.cuda.get_device_capability(device) >= (9, 0)
+    return torch.cuda.get_device_capability(device) >= (8, 0)
 
 
 def deferred_buffers(batch: int, channels: int, heads: int, num_key_heads: int, dtype: torch.dtype, device: torch.device):

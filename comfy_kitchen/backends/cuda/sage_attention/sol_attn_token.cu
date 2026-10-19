@@ -123,8 +123,9 @@ __global__ void sol_token_tiles_kernel(const uint32_t* __restrict__ bits, uint16
     }
 }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
-#define SOL_TOKEN_BOUNDS __launch_bounds__(NTHREADS, 3)   // pass 2 sits at the exact kernel's 168 regs
+// 3 blocks/SM: no spill on sm_120; Ampere spills 56 B but is ~15% faster than at 2.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200 || (__CUDA_ARCH__ >= 800 && __CUDA_ARCH__ < 890))
+#define SOL_TOKEN_BOUNDS __launch_bounds__(NTHREADS, 3)
 #else
 #define SOL_TOKEN_BOUNDS __launch_bounds__(NTHREADS)
 #endif

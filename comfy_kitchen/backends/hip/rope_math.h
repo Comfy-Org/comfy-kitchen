@@ -76,24 +76,26 @@ __forceinline__ __device__ void rope_store<__bf16>(__bf16* p, int64_t i, float v
 }
 
 // out = f_a * x_a + f_b * x_b, evaluated in the freqs dtype with the same rounding
-// eager applies after upcasting x to the freqs dtype. The two eager layouts round
-// differently: split-half (apply_rope_split_half1) forms both products as separate
-// tensors, so each is rounded before the add; interleaved (apply_rope1) uses
-// addcmul_, which fuses the second product into the add under one rounding. Rounding
-// inputs first mirrors eager's cast of x. f_code: 0=fp32, 1=fp16, 2=bf16.
+// eager applies after upcasting x to the freqs dtype: the first product is rounded
+// and addcmul_ fuses the second into the add. f_code: 0=fp32, 1=fp16, 2=bf16.
 __forceinline__ __device__ float rope_combine(
-    float f_a, float x_a, float f_b, float x_b, int f_code, bool split_half) {
+    float f_a, float x_a, float f_b, float x_b, int f_code) {
     if (f_code == 2) {
         const float pa = round_bf16(round_bf16(f_a) * round_bf16(x_a));
-        const float second = round_bf16(f_b) * round_bf16(x_b);
-        return round_bf16(pa + (split_half ? round_bf16(second) : second));
+        return round_bf16(pa + round_bf16(f_b) * round_bf16(x_b));
     }
     if (f_code == 1) {
         const float pa = round_fp16(round_fp16(f_a) * round_fp16(x_a));
-        const float second = round_fp16(f_b) * round_fp16(x_b);
-        return round_fp16(pa + (split_half ? round_fp16(second) : second));
+        return round_fp16(pa + round_fp16(f_b) * round_fp16(x_b));
     }
     return f_a * x_a + f_b * x_b;
+}
+
+// Split-half eager rounds the x_b product of the second output and fuses x_a.
+__forceinline__ __device__ float rope_combine_b(
+    float f10, float x_a, float f11, float x_b, int f_code, bool split_half) {
+    return split_half ? rope_combine(f11, x_b, f10, x_a, f_code)
+                      : rope_combine(f10, x_a, f11, x_b, f_code);
 }
 
 }  // namespace comfy::hip_backend

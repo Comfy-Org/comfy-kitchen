@@ -449,14 +449,17 @@ def _max_dynamic_shared_memory_per_block(x: torch.Tensor) -> int:
 
 
 def _convrot_int8_fused_shared_memory_bytes(m: int, k: int) -> int:
+    # mirrors launch_quantize_int8_rowwise_convrot64_kernel's block-size rule
     if m == 1:
         block_threads = 512
     elif k == 256:
         block_threads = 64
-    elif k == 2560:
-        block_threads = 640
-    elif k == 6144:
-        block_threads = 768
+    elif k <= 3072:
+        block_threads = 128
+    elif k <= 6144:
+        block_threads = 256
+    elif k < 12288:
+        block_threads = 512
     else:
         block_threads = 1024
     groups_in_flight = block_threads // 64
@@ -1630,8 +1633,8 @@ def quantize_int8_rowwise_convrot64(
 
     input_act applies an activation on the way in, so an MLP's
     `linear(act(proj(x)))` never materializes act's output in bf16. For the
-    gated "swiglu" pair the input rows are [gate | up] and the quantized rows
-    are half as wide. "rms_norm" normalizes each row with input_act_weight
+    gated pairs ("swiglu" on [gate | up], "situ" on [hidden | gate]) the quantized
+    rows are half as wide as the input rows. "rms_norm" normalizes each row with input_act_weight
     (K elements) and input_act_eps before rotating.
     """
     q_2d = torch.empty(
@@ -2515,7 +2518,15 @@ def w4a8_int8_linear(
             residual,
             residual_scale,
         )
-    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    chunked = (
+        _W4A8_CHUNKED
+        and correction is None
+        and s_rel.dtype == torch.float8_e4m3fn
+    )
+    fuse_act = chunked and _w4a8_chunked_act_fusable(x, input_act, convrot_groupsize)
+    if not fuse_act:
+        x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+        input_act = None
     n, k, _bits = validate_w4a8_operands(
         qdata,
         s_rel,
@@ -2525,10 +2536,10 @@ def w4a8_int8_linear(
         group_size,
         convrot_groupsize,
     )
-    if x.shape[-1] != k:
+    if x.shape[-1] != k * _input_act_width(input_act):
         raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={k}")
     groups = k // group_size
-    x_2d = x.reshape(-1, k).contiguous()
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     m = x_2d.shape[0]
     output_dtype_code = DTYPE_TO_CODE[out_dtype]
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
@@ -2570,15 +2581,11 @@ def w4a8_int8_linear(
         if used:
             return out.reshape(*x.shape[:-1], n)
 
-    chunked = (
-        _W4A8_CHUNKED
-        and correction is None
-        and s_rel.dtype == torch.float8_e4m3fn
-    )
     if chunked:
         used, xq, xs = _w4a8_linear_chunked(
             x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
             convrot_groupsize, group_size, False,
+            input_act, input_act_weight, input_act_eps,
         )
         if used:
             return out.reshape(*x.shape[:-1], n)
@@ -2617,6 +2624,9 @@ def w4a8_int8_linear(
             group_size=group_size,
             convrot_groupsize=convrot_groupsize,
             out_dtype=out_dtype,
+            input_act=input_act,
+            input_act_weight=input_act_weight,
+            input_act_eps=input_act_eps,
         )
 
     if correction is not None:
@@ -2654,6 +2664,10 @@ def w4a8_packed_linear(
         input_act is not None
         and x.numel() <= 8 * x.shape[-1]
         and _w4a8_cluster_quantizer_ok(k, input_act, x.device)
+    ) or (
+        input_act is not None
+        and x.numel() > 8 * x.shape[-1]
+        and _w4a8_chunked_act_fusable(x, input_act, convrot_groupsize)
     )
     if input_act is not None and not fuse_act:
         x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
@@ -2711,33 +2725,61 @@ def w4a8_packed_linear(
         used, _, _ = _w4a8_linear_chunked(
             x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
             convrot_groupsize, group_size, True,
+            input_act, input_act_weight, input_act_eps,
         )
         if not used:
             raise RuntimeError("Packed W4A8 prefill is unsupported by the INT8 GEMM")
     return out.reshape(*x.shape[:-1], n)
 
 
+def _w4a8_fast_act_ok(x: torch.Tensor, m: int, k: int, convrot_groupsize: int) -> bool:
+    """Whether the chunked prefill path quantizes with the 64-lane ConvRot kernel (the one
+    that fuses input activations): large M and a K-wide activated row it can hold in
+    shared memory. x only supplies the device; m and k are the activated row count/width."""
+    return (
+        m >= 512
+        and convrot_groupsize == 256
+        and k % 256 == 0
+        and 256 <= k <= _CONVROT_FUSED_MAX_K
+        and (not x.is_cuda
+             or _convrot_int8_fused_shared_memory_bytes(m, k) < _max_dynamic_shared_memory_per_block(x))
+    )
+
+
+def _w4a8_chunked_act_fusable(x: torch.Tensor, input_act: str | None, convrot_groupsize: int) -> bool:
+    """Whether the chunked prefill path absorbs input_act; x is the raw input (2K wide for the gated pairs)."""
+    if input_act in (None, "none"):
+        return False
+    return _w4a8_fast_act_ok(x, x.numel() // x.shape[-1], x.shape[-1] // _input_act_width(input_act), convrot_groupsize)
+
+
 def _w4a8_linear_chunked(
     x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
     convrot_groupsize, group_size, mma_packed,
+    input_act=None, input_act_weight=None, input_act_eps=0.0,
 ):
-    """Shared bounded INT8 GEMM; the native dequantizer reads the selected storage format."""
+    """Shared bounded INT8 GEMM; the native dequantizer reads the selected storage format.
+
+    With input_act set, x_2d is the raw row (two K-wide halves for the gated pairs) and
+    the 64-lane quantizer applies the activation; callers check _w4a8_chunked_act_fusable.
+    """
+    if input_act in (None, "none"):
+        input_act = None
     m, k = x_2d.shape
+    k //= _input_act_width(input_act)
     n = s_channel.numel()
     output_dtype_code = DTYPE_TO_CODE[out.dtype]
     stream_ptr = torch.cuda.current_stream(x_2d.device).cuda_stream
     chunk_cols = _w4a8_weight_chunk_cols(m, n, x_2d.get_device())
     workspace = torch.empty(min(chunk_cols, n), k, dtype=torch.int8, device=x_2d.device)
     # The 64-lane quantizer is faster at large M; at small M its extra launch costs more.
-    fast_act = (
-        m >= 512
-        and convrot_groupsize == 256
-        and k % 256 == 0
-        and 256 <= k <= _CONVROT_FUSED_MAX_K
-        and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
-    )
+    fast_act = _w4a8_fast_act_ok(x_2d, m, k, convrot_groupsize)
+    if input_act is not None and not fast_act:
+        raise RuntimeError("w4a8 chunked linear: fused input activation needs the 64-lane quantizer")
     if fast_act:
-        xq, xs = quantize_int8_rowwise_convrot64(x_2d, convrot_groupsize)
+        xq, xs = quantize_int8_rowwise_convrot64(
+            x_2d, convrot_groupsize, input_act=input_act,
+            input_act_weight=input_act_weight, input_act_eps=input_act_eps)
     elif hasattr(_C, "w4a8_codebook_linear_chunked"):
         used = _C.w4a8_codebook_linear_chunked(
             _wrap_for_dlpack(x_2d),
@@ -2823,6 +2865,9 @@ def na3d(
 
 _SOL_HD = 128
 _SOL_VSCALE_MARGIN = 1.1   # clip headroom on last step's V absmax
+# Slice sizes that bound sol_attn's top-k temporaries
+_SOL_TOPK_SLICE_BYTES = 64 << 20
+_SOL_MEAN_SLICE_ROWS = 128 * 64   # whole 64-token blocks
 
 
 def _topk_from_pooled(c8, csc, kc, topk_ratio, log2s, sinks):
@@ -2836,15 +2881,22 @@ def _topk_from_pooled(c8, csc, kc, topk_ratio, log2s, sinks):
     n = kc.shape[1]
     ksc = (kc.abs().amax(-1, True) / 127.0).clamp_min(1e-12)     # prep_pooled_quant
     k8 = torch.round(kc / ksc).clamp_(-127, 127)
-    s = torch.bmm(c8, k8.transpose(1, 2))     # integer dot, exact in fp32
-    s = s * (csc * log2s).unsqueeze(-1) * ksc.squeeze(-1).unsqueeze(-2)
     s0, s1 = sinks
-    if s1 > s0:
-        s[..., s0:s1] = float("-inf")
     kk = _topk_count(n - _sink_count(n, s0, s1), topk_ratio)
     if kk == 0:   # nothing beyond the forced blocks: a threshold no finite score clears
-        return torch.full(s.shape[:-1], float("inf"), device=s.device, dtype=s.dtype)
-    kth = s.topk(kk, dim=-1, sorted=False).values.min(-1).values
+        return torch.full(c8.shape[:-1], float("inf"), device=c8.device, dtype=c8.dtype)
+    # Head slices, scaled in place: the whole [BH, N, N] scores spilled a 10 GB card at 109k tokens
+    step = max(1, _SOL_TOPK_SLICE_BYTES // (n * n * c8.element_size()))
+    row_scale = (csc * log2s).unsqueeze(-1)
+    col_scale = ksc.squeeze(-1).unsqueeze(-2)
+    kth = torch.empty(c8.shape[:-1], device=c8.device, dtype=c8.dtype)
+    for a in range(0, c8.shape[0], step):
+        b = a + step
+        s = torch.bmm(c8[a:b], k8[a:b].transpose(1, 2))     # integer dot, exact in fp32
+        s.mul_(row_scale[a:b]).mul_(col_scale[a:b])
+        if s1 > s0:
+            s[..., s0:s1] = float("-inf")
+        kth[a:b] = s.topk(kk, dim=-1, sorted=False).values.min(-1).values
     # backed off a few ulps: this replica of the kernel's scores is not bit-exact
     return (kth - kth.abs() * 1e-5).contiguous()
 
@@ -2862,12 +2914,18 @@ def _block_means(x, lengths=None, valid=None):
             tail = x[:, full:].sum(1, keepdim=True, dtype=torch.float32) / (t - full)
             m = torch.cat([m, tail], dim=1)
     else:
-        if valid is not None:
-            x = x * valid.view(1, -1, 1, 1).to(x.dtype)
-        m = x[:, :full].view(b, -1, 64, h, d).sum(2, dtype=torch.float32)
-        if full != t:
-            m = torch.cat([m, x[:, full:].sum(1, keepdim=True, dtype=torch.float32)], dim=1)
-        m = m / lengths.view(1, -1, 1, 1)
+        # masked in slices, not one full copy of x
+        parts = []
+        for a in range(0, t, _SOL_MEAN_SLICE_ROWS):
+            xs = x[:, a:a + _SOL_MEAN_SLICE_ROWS]
+            if valid is not None:
+                xs = xs * valid[a:a + _SOL_MEAN_SLICE_ROWS].view(1, -1, 1, 1).to(x.dtype)
+            f = (xs.shape[1] // 64) * 64
+            if f:
+                parts.append(xs[:, :f].view(b, -1, 64, h, d).sum(2, dtype=torch.float32))
+            if f != xs.shape[1]:
+                parts.append(xs[:, f:].sum(1, keepdim=True, dtype=torch.float32))
+        m = torch.cat(parts, dim=1) / lengths.view(1, -1, 1, 1)
     return m.permute(0, 2, 1, 3).reshape(b * h, -1, d)
 
 
@@ -3004,8 +3062,6 @@ def sol_attn(
                     f"is not a multiple of 8, so the 16-byte staging loads would "
                     f"be misaligned; call .contiguous() on it")
     sb, sq = _sink_pair(sink_blocks), _sink_pair(sink_q)
-    thr = (_topk_threshold(q, k, topk_ratio, scale, mean_lengths, valid, sb)
-           if topk_ratio else None)
     kb = None
     if key_bias is not None:
         # exact branch only, in log2 units; biased blocks must be sink-covered
@@ -3014,6 +3070,9 @@ def sol_attn(
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug))
     workspace = torch.empty(p["total"], dtype=torch.uint8, device=q.device)
+    # after the large buffers so its temporaries don't fragment the cache they reuse
+    thr = (_topk_threshold(q, k, topk_ratio, scale, mean_lengths, valid, sb)
+           if topk_ratio else None)
     _C.sol_attn(
         _wrap_for_dlpack(q),
         _wrap_for_dlpack(k),
@@ -3124,11 +3183,12 @@ def sol_attn_chunked(
     vscale = vscale.to(device=dev, dtype=torch.float32).clamp_min(1e-8).contiguous()
     produce(kmean, vscale)
     sb, sq = _sink_pair(sink_blocks), _sink_pair(sink_q)
-    threshold = (_topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sb)
-                 if topk_ratio else None)
     out = torch.empty(1, t, h, d, dtype=torch.bfloat16, device=dev)
     kmean_next = torch.empty(h, d, device=dev, dtype=torch.float32)
     vamax = torch.empty(h, d, device=dev, dtype=torch.float32)
+    # after out, as in sol_attn
+    threshold = (_topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sb)
+                 if topk_ratio else None)
     _C.sol_attn_core(
         _wrap_for_dlpack(ws), _wrap_for_dlpack(out), _wrap_for_dlpack(vscale),
         _wrap_for_dlpack(kmean_next), _wrap_for_dlpack(vamax),
