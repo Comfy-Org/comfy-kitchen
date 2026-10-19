@@ -11,12 +11,12 @@ namespace comfy::hip_backend {
 constexpr float kInt8Max = 127.0f;
 
 inline bool use_convrot_transposed_bf16(int in_code, int M, int K, int group_size) {
-    if (in_code != 2 || group_size != 256 || M < 3072 || K < 2560 || K > 16384) {
+    if (in_code != 2 || group_size != 256 || M < 1024 || K < 2560 || K > 16384) {
         return false;
     }
 
-    // Small row counts favor the generic producer at several widths. Keep
-    // the transposed schedule within the measured large-row geometry range.
+    // ROCm 10.1 model-shape sweep favors transposed from 1024 rows, including
+    // the 1088/1115-row image workloads. Keep one row cut, not a width table.
     return use_nonduplicated_wmma_schedule() && convrot_512x2_supported(K);
 }
 

@@ -238,7 +238,7 @@ def test_int8_convrot_linear_is_independent_of_zero_padding(hip):
 def test_int8_convrot_linear_is_row_independent(hip, input_act, k):
     skip_unless_gfx12_wmma()
     torch.manual_seed(414)
-    m, n = 3073, 128
+    m, n = 1153, 128
     width = k * (2 if input_act == "swiglu" else 1)
     x = (torch.randn(m, width, device=DEV) *
          torch.logspace(-3, 3, width, device=DEV)).bfloat16()
@@ -253,12 +253,14 @@ def test_int8_convrot_linear_is_row_independent(hip, input_act, k):
             )
 
         whole = linear(x)
-        # Both sides of the large-row dispatch boundary, plus a partial tile.
-        split = torch.cat((linear(x[:3071]), linear(x[3071:])))
-        boundary = linear(x[:3072])
+        # Both sides of the transposed dispatch boundary, plus partial tiles.
+        split = torch.cat((linear(x[:1023]), linear(x[1023:])))
+        boundary = linear(x[:1024])
+        tail = linear(x[:1025])
 
     assert torch.equal(whole, split)
-    assert torch.equal(whole[:3072], boundary)
+    assert torch.equal(whole[:1024], boundary)
+    assert torch.equal(whole[:1025], tail)
 
 
 @needs_wmma
