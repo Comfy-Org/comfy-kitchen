@@ -16,6 +16,10 @@ quantized row is half as wide as the raw input row.
 
 ``rms_norm`` is the row-wise ``x * rsqrt(mean(x^2) + eps) * w``; it carries a
 K-element weight and an eps alongside the code.
+
+``rms_norm_modulated`` evaluates RMSNorm and ``norm * (1 + scale) + shift``
+in FP32. Its weight is a packed FP32 [3, K] tensor: norm weight, scale, shift.
+There is no intermediate cast back to the input dtype before rotation.
 """
 
 import torch
@@ -29,6 +33,7 @@ INPUT_ACT_TO_CODE: dict[str | None, int] = {
     "swiglu": 2,
     "rms_norm": 3,
     "situ": 4,
+    "rms_norm_modulated": 5,
 }
 
 
@@ -75,6 +80,12 @@ def apply_input_act(
             raise ValueError("input_act 'rms_norm' requires act_weight")
         return torch.nn.functional.rms_norm(
             x, (x.shape[-1],), weight=act_weight.to(x.dtype), eps=act_eps)
+    if input_act == "rms_norm_modulated":
+        if act_weight is None or act_weight.shape != (3, x.shape[-1]) or act_weight.dtype != torch.float32:
+            raise ValueError("rms_norm_modulated requires FP32 act_weight with shape [3, K]")
+        weight, scale, shift = act_weight.unbind(0)
+        normalized = torch.nn.functional.rms_norm(x.float(), (x.shape[-1],), weight=weight, eps=act_eps)
+        return normalized * (1 + scale) + shift
     raise ValueError(_unsupported(input_act))
 
 

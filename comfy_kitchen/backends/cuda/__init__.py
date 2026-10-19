@@ -1638,6 +1638,9 @@ def quantize_int8_rowwise_convrot64(
     rows are half as wide as the input rows. "rms_norm" normalizes each row with input_act_weight
     (K elements) and input_act_eps before rotating.
     """
+    if input_act == "rms_norm_modulated":
+        weight_2d = _apply_input_act(weight_2d, input_act, input_act_weight, input_act_eps)
+        input_act = None
     q_2d = torch.empty(
         (weight_2d.shape[0], weight_2d.shape[1] // _input_act_width(input_act)),
         dtype=torch.int8, device=weight_2d.device)
@@ -2138,6 +2141,9 @@ def int8_linear(
         raise ValueError("int8_linear: residual requires residual_scale")
     orig_shape = x.shape
     x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
+    if input_act == "rms_norm_modulated":
+        x_2d = _apply_input_act(x_2d, input_act, input_act_weight, input_act_eps)
+        input_act = None
     if not weight.is_contiguous():
         weight = weight.contiguous()
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
@@ -2788,7 +2794,7 @@ def _w4a8_fast_act_ok(x: torch.Tensor, m: int, k: int, convrot_groupsize: int) -
 
 def _w4a8_chunked_act_fusable(x: torch.Tensor, input_act: str | None, convrot_groupsize: int) -> bool:
     """Whether the chunked prefill path absorbs input_act; x is the raw input (2K wide for the gated pairs)."""
-    if input_act in (None, "none"):
+    if input_act in (None, "none", "rms_norm_modulated"):
         return False
     return _w4a8_fast_act_ok(x, x.numel() // x.shape[-1], x.shape[-1] // _input_act_width(input_act), convrot_groupsize)
 

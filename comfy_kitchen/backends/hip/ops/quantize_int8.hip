@@ -300,7 +300,7 @@ static void launch_quantize_int8_convrot(
     check_convrot_group_size(group_size);
     check_convrot_k(K, group_size, in_code, /*int8_quant=*/true);
     check_convrot_act(act_code);
-    if (act_code == kActRmsNorm && group_size != 256) {
+    if ((act_code == kActRmsNorm || act_code == kActRmsModulated) && group_size != 256) {
         throw std::runtime_error("convrot: rms_norm activation requires group_size 256");
     }
     if (TILED_QOUT && K % 128 != 0) {
@@ -309,6 +309,10 @@ static void launch_quantize_int8_convrot(
     if (M == 0) return;
     if (act_code == kActRmsNorm) {
         launch_convrot_quant_rms_norm<TILED_QOUT>(
+            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
+            M, K, act_weight, act_eps, stream);
+    } else if (act_code == kActRmsModulated) {
+        launch_convrot_quant_rms_norm<TILED_QOUT, kActRmsModulated>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
             M, K, act_weight, act_eps, stream);
     } else if (act_code == kActGeluTanh) {

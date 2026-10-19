@@ -475,3 +475,52 @@ class TestFusedGemvQuantizer:
         with pytest.raises((AssertionError, RuntimeError, ValueError)):
             ck.int8_linear(h, weight, wscale, None, torch.bfloat16,
                            convrot=True, convrot_groupsize=_GROUP, input_act="swiglu")
+
+
+@pytest.mark.parametrize("shape", [(3, 256), (129, 3840), (129, 6144)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", ["hip", "cuda"])
+def test_rms_modulated_preserves_fp32_affine(shape, dtype, backend, seed, cuda_available):
+    """Downcasting a norm weight near 1 erases the signal after subtracting 1.
+
+    Compare to an independently formed FP64 rotated linear, not a second call
+    to the fused activation. The constant first row isolates weight precision;
+    asymmetric remaining rows exercise the full-row RMS reduction.
+    """
+    if not cuda_available or backend not in get_capable_backends("int8_linear", "cuda"):
+        pytest.skip(f"{backend} GPU required")
+    m, k = shape
+    x = torch.randn(m, k, device="cuda", dtype=dtype)
+    x[0].fill_(1)
+    x[1:, :k // 4] *= 3
+    channel = torch.arange(k, device="cuda", dtype=torch.float32)
+    norm_weight = 1 + (channel % 251) * 1e-5
+    scale = (channel % 3) * 0.125
+    shift = -(1 + scale)
+    packed = torch.stack((norm_weight, scale, shift))
+    weight = torch.randint(-127, 128, (128, k), device="cuda", dtype=torch.int8)
+    wscale = torch.linspace(0.001, 0.004, 128, device="cuda")
+    normalized = x.double() / (x.double().square().mean(-1, keepdim=True) + 1e-5).sqrt()
+    activated = normalized * norm_weight.double() * (1 + scale.double()) + shift.double()
+    hadamard = _build_hadamard(256, device=x.device, dtype=torch.float64)
+    rotated = (activated.reshape(-1, 256) @ hadamard).reshape(m, k)
+    expected = (rotated @ weight.double().T) * wscale.double()
+    with ck.use_backend(backend):
+        actual = ck.int8_linear(x, weight, wscale, out_dtype=torch.float32,
+                               convrot=True, input_act="rms_norm_modulated",
+                               input_act_weight=packed, input_act_eps=1e-5)
+    error = (actual.double() - expected).norm(dim=-1) / expected.norm(dim=-1)
+    assert error.max() < 0.02
+    assert actual.abs().max() > 0
+
+
+def test_rms_modulated_eager_keeps_fp32_weights():
+    from comfy_kitchen.backends._activations import apply_input_act
+
+    x = torch.tensor([[1, 2, 3, 4]], dtype=torch.bfloat16)
+    packed = torch.tensor([[1.001, 0.997, 1.003, 0.999], [0.1, -0.2, 0.3, -0.4], [2, -3, 5, -7]])
+    expected = x.double() / (x.double().square().mean(-1, keepdim=True) + 1e-5).sqrt()
+    expected = expected * packed[0].double() * (1 + packed[1].double()) + packed[2].double()
+    actual = apply_input_act(x, "rms_norm_modulated", packed, 1e-5)
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual.double(), expected, rtol=1e-6, atol=1e-6)

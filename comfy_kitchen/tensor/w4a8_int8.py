@@ -342,7 +342,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
                          input_act=None, input_act_weight=None, input_act_eps=0.0,
                          residual=None, residual_scale=None):
         params = weight._params
-        if params.transposed:
+        if params.transposed or input_act == "rms_norm_modulated":
             return NotImplemented
         qdata, s_rel, s_channel, correction, codebook = cls.get_plain_tensors(weight)
         return w4a8_int8_linear(

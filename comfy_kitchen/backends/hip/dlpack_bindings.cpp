@@ -671,20 +671,22 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
         require_packed_contiguous(*spill_partials, kFn, "spill_partials");
         spill_partials_ptr = spill_partials->data();
     }
-    if (act_code == 3) {
+    if (act_code == 3 || act_code == 5) {
         if (!act_weight.has_value()) {
             throw std::runtime_error(std::string(kFn) + ": rms_norm requires act_weight");
         }
-        if (map_dtype_to_code(act_weight->dtype()) != map_dtype_to_code(x.dtype())) {
-            throw std::runtime_error(std::string(kFn) + ": act_weight dtype must match x");
+        const int expected_dtype = act_code == 5 ? 0 : map_dtype_to_code(x.dtype());
+        if (map_dtype_to_code(act_weight->dtype()) != expected_dtype) {
+            throw std::runtime_error(std::string(kFn) + ": unexpected RMS activation weight dtype");
         }
-        require_len(*act_weight, K, kFn, "act_weight");
+        require_len(*act_weight, static_cast<int64_t>(K) * (act_code == 5 ? 3 : 1), kFn, "act_weight");
+        require_packed_contiguous(*act_weight, kFn, "act_weight");
     }
 
     launch_quantize_int8_convrot_kernel(x.data(), map_dtype_to_code(x.dtype()), q.data(),
                                         scales.data(), spill_rotated_ptr, spill_partials_ptr, M, K,
                                         group_size, act_code,
-                                        act_code == 3 ? act_weight->data() : nullptr, act_eps,
+                                        (act_code == 3 || act_code == 5) ? act_weight->data() : nullptr, act_eps,
                                         tiled_output,
                                         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();

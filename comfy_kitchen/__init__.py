@@ -1076,13 +1076,18 @@ def int8_linear(
         convrot: If True, apply online activation rotation.
         convrot_groupsize: Group size for Hadamard rotation.
         input_act: Optional activation applied to x before quantization
-            ("gelu_tanh", "swiglu", "situ", "rms_norm", or None). When
+            ("gelu_tanh", "swiglu", "situ", "rms_norm", "rms_norm_modulated", or None). When
             the fused ConvRot quantizer handles the shape it is folded in, so
             an MLP's ``linear(act(proj(x)))`` or a pre-norm block's
             ``linear(rms_norm(x))`` never writes the intermediate to HBM;
-            every other path applies it eagerly for identical results.
-        input_act_weight: K-element norm weight, required for "rms_norm".
-        input_act_eps: Norm eps for "rms_norm".
+            every other path applies it eagerly. Fused activation arithmetic
+            need not reproduce intermediate low-precision rounding.
+        input_act_weight: K-element norm weight for "rms_norm". For
+            "rms_norm_modulated", FP32 [3, K] containing norm weight, scale,
+            and shift; normalization and ``norm * (1 + scale) + shift`` stay
+            FP32, without intermediate downcasts. HIP can fuse this into the
+            G256 LDS quantizer; other paths evaluate it eagerly in FP32.
+        input_act_eps: Norm eps for either RMS activation.
         residual: Optional [..., N] tensor; the result becomes
             ``residual + residual_scale * linear(x)`` (a pre-norm block's
             addcmul), fused into the GEMM epilogue where supported.

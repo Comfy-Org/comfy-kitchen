@@ -875,7 +875,13 @@ def int8_linear(
     # Rejected here so every route fails the same way, not just the fused one.
     _input_act_code(input_act)
     act_weight = None
-    if input_act == "rms_norm":
+    if input_act == "rms_norm_modulated":
+        if (input_act_weight is None or input_act_weight.shape != (3, x.shape[-1])
+                or input_act_weight.dtype != torch.float32):
+            raise ValueError("rms_norm_modulated requires FP32 act_weight with shape [3, K]")
+        if _fused_rms_norm_ok(x, convrot, convrot_groupsize):
+            act_weight = _operand(input_act_weight, x.device, "input_act_weight")
+    elif input_act == "rms_norm":
         if input_act_weight is None:
             raise ValueError("input_act 'rms_norm' requires act_weight")
         if (

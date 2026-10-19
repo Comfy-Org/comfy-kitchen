@@ -235,13 +235,13 @@ __forceinline__ __device__ float load_in(const void* x, int64_t idx, int code) {
 // ([gate | up]) and SiTU ([hidden | gate]) read a 2*K-wide row and write K. RmsNorm
 // carries a K-element weight and eps, and only the fused INT8 G=256 kernel
 // implements it.
-enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2, kActRmsNorm = 3, kActSiTU = 4 };
+enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2, kActRmsNorm = 3, kActSiTU = 4, kActRmsModulated = 5 };
 
 constexpr int input_act_width(int act) { return (act == kActSwiGLU || act == kActSiTU) ? 2 : 1; }
 
 inline void check_convrot_act(int act) {
     if (act != kActNone && act != kActGeluTanh && act != kActSwiGLU && act != kActRmsNorm
-        && act != kActSiTU) {
+        && act != kActSiTU && act != kActRmsModulated) {
         throw std::runtime_error("convrot: unsupported input activation code");
     }
 }
@@ -630,7 +630,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
 
     // RmsNorm needs the row's mean square before the first group.
     float rstd = 1.0f;
-    if constexpr (ACT == kActRmsNorm) {
+    if constexpr (ACT == kActRmsNorm || ACT == kActRmsModulated) {
         float sum_sq = 0.0f;
         for (int c = tid; c < K; c += BLOCK_THREADS) {
             const float v = load_row_value(static_cast<const RowT*>(x)[row_offset + c]);
@@ -660,6 +660,15 @@ __global__ __launch_bounds__(BLOCK_THREADS) void convrot_quant_fused_kernel(
                 xv1 = load_row_value(xr[col + 1]) * rstd * load_row_value(wr[col + 1]);
                 xv2 = load_row_value(xr[col + 2]) * rstd * load_row_value(wr[col + 2]);
                 xv3 = load_row_value(xr[col + 3]) * rstd * load_row_value(wr[col + 3]);
+            } else if constexpr (ACT == kActRmsModulated) {
+                const RowT* xr = static_cast<const RowT*>(x) + in_row_offset;
+                const float* wr = static_cast<const float*>(act_weight);
+                const float* scale = wr + K;
+                const float* shift = scale + K;
+                xv0 = (load_row_value(xr[col]) * rstd * wr[col]) * (1.0f + scale[col]) + shift[col];
+                xv1 = (load_row_value(xr[col + 1]) * rstd * wr[col + 1]) * (1.0f + scale[col + 1]) + shift[col + 1];
+                xv2 = (load_row_value(xr[col + 2]) * rstd * wr[col + 2]) * (1.0f + scale[col + 2]) + shift[col + 2];
+                xv3 = (load_row_value(xr[col + 3]) * rstd * wr[col + 3]) * (1.0f + scale[col + 3]) + shift[col + 3];
             } else if constexpr (ACT == kActNone) {
                 if (in_dtype == 2) {
                     load_input_act4_bf16(x, in_row_offset, col, xv0, xv1, xv2, xv3);
@@ -1496,7 +1505,7 @@ inline void launch_convrot_quant(
 // INT8 G=256 with the row's RMSNorm folded in. Only the fused kernel implements it;
 // the Python layer applies the norm eagerly wherever convrot_int8_needs_spill says
 // that kernel will not run.
-template <bool TILED_QOUT = false>
+template <bool TILED_QOUT = false, int ACT = kActRmsNorm>
 inline void launch_convrot_quant_rms_norm(
     const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K,
     const void* act_weight, float act_eps, hipStream_t stream) {
@@ -1508,7 +1517,7 @@ inline void launch_convrot_quant_rms_norm(
     if (block_threads > 0) {
         dispatch_convrot_row_type(
             in_dtype,
-            LaunchConvrotQuantFusedForRow<kActRmsNorm, TILED_QOUT>{
+            LaunchConvrotQuantFusedForRow<ACT, TILED_QOUT>{
                 x, in_dtype, qout, scaleout, M, K, act_weight, act_eps, stream, block_threads,
                 &launched});
     }
