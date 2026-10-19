@@ -304,10 +304,15 @@ extern "C" {
         cudaStream_t stream);
 
     // Per-frame GroupNorm + SiLU + causal conv padding in NDHWC — see ops/group_norm_pad3d.cu.
+    // stats_in: per-frame (mean, rstd) float2 from launch_group_norm_stats3d, or nullptr.
     void launch_group_norm_silu_pad3d(
-        const void* x, const void* gamma, const void* beta, void* out, void* workspace,
+        const void* x, const void* gamma, const void* beta, void* out, void* workspace, const void* stats_in,
         int B, int C, int T, int H, int W, int G, float eps,
-        int left, int right, int top, int bottom, int front, bool silu, bool zero_pad,
+        int left, int right, int top, int bottom, int front, bool silu, bool zero_pad, int64_t row_stride,
+        int dtype_code, cudaStream_t stream);
+    void launch_group_norm_stats3d(
+        const void* x, void* workspace, void* stats,
+        int B, int C, int T, int H, int W, int G, float eps, int64_t row_stride,
         int dtype_code, cudaStream_t stream);
 
     // Fused AdaLN — see ops/adaln.cu. subtract_mean selects LayerNorm (true)
@@ -1958,42 +1963,82 @@ bool cutlass_fp16_conv3d(
 }
 
 // Nanobind wrapper for the fused per-frame GroupNorm + SiLU + causal padding.
-// weight/bias empty -> pad only; workspace empty is fine in that case.
+// weight/bias empty -> pad only; stats empty -> computed here (workspace needed), else
+// the given per-frame (mean, rstd) normalize x, which may be a row strip of their frame.
 void group_norm_silu_pad3d(
     nb::ndarray<nb::device::cuda> x,
     nb::ndarray<nb::device::cuda> weight,
     nb::ndarray<nb::device::cuda> bias,
     nb::ndarray<nb::device::cuda> out,
     nb::ndarray<nb::device::cuda> workspace,
+    nb::ndarray<nb::device::cuda> stats,
     int64_t B, int64_t C, int64_t T, int64_t H, int64_t W,
     int64_t num_groups,
     float eps,
     int64_t left, int64_t right, int64_t top, int64_t bottom, int64_t front,
     bool silu,
     bool zero_pad,
+    int64_t row_stride,
     int dtype_code,
     uintptr_t stream_ptr)
 {
     const bool norm = weight.size() > 0;
+    const bool given = stats.size() > 0;
+    if (row_stride < W * C) {
+        throw std::invalid_argument("group_norm_silu_pad3d: row stride is shorter than a row");
+    }
     if (norm && (static_cast<int64_t>(weight.size()) != C || static_cast<int64_t>(bias.size()) != C)) {
         throw std::invalid_argument("group_norm_silu_pad3d: weight and bias must have C elements");
+    }
+    if (given && static_cast<int64_t>(stats.size()) != 2 * B * T * num_groups) {
+        throw std::invalid_argument("group_norm_silu_pad3d: stats must hold B*T*num_groups (mean, rstd) pairs");
     }
     if (static_cast<int64_t>(x.size()) != B * C * T * H * W ||
         static_cast<int64_t>(out.size()) != B * C * (T + front) * (H + top + bottom) * (W + left + right)) {
         throw std::invalid_argument("group_norm_silu_pad3d: x/out sizes do not match the given shape");
     }
     const int64_t chunks = (H * W + 1023) / 1024;
-    if (norm && static_cast<int64_t>(workspace.size()) < 2 * B * T * (chunks * C + num_groups)) {
+    if (norm && !given && static_cast<int64_t>(workspace.size()) < 2 * B * T * (chunks * C + num_groups)) {
         throw std::invalid_argument("group_norm_silu_pad3d: workspace too small");
     }
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_group_norm_silu_pad3d(
         x.data(), norm ? weight.data() : nullptr, norm ? bias.data() : nullptr, out.data(),
-        workspace.size() > 0 ? workspace.data() : nullptr,
+        workspace.size() > 0 ? workspace.data() : nullptr, given ? stats.data() : nullptr,
         static_cast<int>(B), static_cast<int>(C), static_cast<int>(T), static_cast<int>(H), static_cast<int>(W),
         static_cast<int>(num_groups), eps,
         static_cast<int>(left), static_cast<int>(right), static_cast<int>(top), static_cast<int>(bottom),
-        static_cast<int>(front), silu, zero_pad, dtype_code, stream);
+        static_cast<int>(front), silu, zero_pad, row_stride, dtype_code, stream);
+}
+
+// Per-frame GroupNorm statistics into stats [B*T*num_groups] (mean, rstd) float2.
+// row_stride: elements between image rows, W * C for a packed NDHWC tensor.
+void group_norm_stats3d(
+    nb::ndarray<nb::device::cuda> x,
+    nb::ndarray<nb::device::cuda> workspace,
+    nb::ndarray<nb::device::cuda> stats,
+    int64_t B, int64_t C, int64_t T, int64_t H, int64_t W,
+    int64_t num_groups,
+    float eps,
+    int64_t row_stride,
+    int dtype_code,
+    uintptr_t stream_ptr)
+{
+    if (static_cast<int64_t>(x.size()) != B * C * T * H * W || row_stride < W * C) {
+        throw std::invalid_argument("group_norm_stats3d: x size or row stride does not match the given shape");
+    }
+    const int64_t chunks = (H * W + 1023) / 1024;
+    if (static_cast<int64_t>(workspace.size()) < 2 * B * T * chunks * C) {
+        throw std::invalid_argument("group_norm_stats3d: workspace too small");
+    }
+    if (static_cast<int64_t>(stats.size()) != 2 * B * T * num_groups) {
+        throw std::invalid_argument("group_norm_stats3d: stats must hold B*T*num_groups (mean, rstd) pairs");
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_group_norm_stats3d(
+        x.data(), workspace.data(), stats.data(),
+        static_cast<int>(B), static_cast<int>(C), static_cast<int>(T), static_cast<int>(H), static_cast<int>(W),
+        static_cast<int>(num_groups), eps, row_stride, dtype_code, stream);
 }
 
 // Python module definition
@@ -5246,11 +5291,17 @@ NB_MODULE(_C, m) {
 
     m.def("group_norm_silu_pad3d", &group_norm_silu_pad3d,
           "Per-frame GroupNorm + SiLU + causal conv padding, NDHWC",
-          nb::arg("x"), nb::arg("weight"), nb::arg("bias"), nb::arg("out"), nb::arg("workspace"),
+          nb::arg("x"), nb::arg("weight"), nb::arg("bias"), nb::arg("out"), nb::arg("workspace"), nb::arg("stats"),
           nb::arg("B"), nb::arg("C"), nb::arg("T"), nb::arg("H"), nb::arg("W"),
           nb::arg("num_groups"), nb::arg("eps"),
           nb::arg("left"), nb::arg("right"), nb::arg("top"), nb::arg("bottom"), nb::arg("front"),
-          nb::arg("silu"), nb::arg("zero_pad"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
+          nb::arg("silu"), nb::arg("zero_pad"), nb::arg("row_stride"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
+
+    m.def("group_norm_stats3d", &group_norm_stats3d,
+          "Per-frame GroupNorm (mean, rstd) statistics, NDHWC input",
+          nb::arg("x"), nb::arg("workspace"), nb::arg("stats"),
+          nb::arg("B"), nb::arg("C"), nb::arg("T"), nb::arg("H"), nb::arg("W"),
+          nb::arg("num_groups"), nb::arg("eps"), nb::arg("row_stride"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
 
     m.def("adaln", &adaln,
           "Fused AdaLN: layernorm(x) * (1 + scale) + shift",

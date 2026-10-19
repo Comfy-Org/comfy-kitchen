@@ -4,6 +4,7 @@ __all__ = [
     "fp16_conv3d_out",
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
+    "group_norm_stats3d",
     "na3d",
     "sol_attn",
     "rms_adaln",
@@ -79,7 +80,7 @@ from .convrot_w4a4 import (
     prepare_int4_weight_for_int8_linear,
     quantize_convrot_w4a4_weight,
 )
-from .group_norm_pad3d import group_norm_silu_pad3d, group_norm_silu_pad3d_out
+from .group_norm_pad3d import group_norm_silu_pad3d, group_norm_silu_pad3d_out, group_norm_stats3d
 from .na import na3d
 from .quantization import (
     dequantize_int8_convrot_weight,
@@ -168,6 +169,12 @@ def _build_constraints() -> dict:
                 "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
                 "weight": ParamConstraint(dtypes=standard_floats | {type(None)}),
                 "bias": ParamConstraint(dtypes=standard_floats | {type(None)}),
+            },
+            default_devices=all_devices,
+        ),
+        "group_norm_stats3d": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
             },
             default_devices=all_devices,
         ),
