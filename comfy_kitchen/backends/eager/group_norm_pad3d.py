@@ -74,8 +74,8 @@ def group_norm_silu_pad3d_out(
     pad: list[int],
     silu: bool,
     zero_pad: bool,
-    stats: Tensor | None,
     out: Tensor,
+    stats: Tensor | None = None,
 ) -> None:
     """group_norm_silu_pad3d written into ``out`` (the padded shape, NDHWC-ordered)."""
     out.copy_(group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, stats))
@@ -103,8 +103,8 @@ def _op_group_norm_silu_pad3d_out(
     pad: list[int],
     silu: bool,
     zero_pad: bool,
-    stats: torch.Tensor | None,
     out: torch.Tensor,
+    stats: torch.Tensor | None,
 ) -> None:
     # copy_ would broadcast or cast into a mismatched buffer instead of failing
     if min(pad) >= 0:
@@ -120,7 +120,7 @@ def _op_group_norm_silu_pad3d_out(
 
 
 @_op_group_norm_silu_pad3d_out.register_fake
-def _op_group_norm_silu_pad3d_out_fake(x, weight, bias, num_groups, eps, pad, silu, zero_pad, stats, out):
+def _op_group_norm_silu_pad3d_out_fake(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out, stats):
     return None
 
 

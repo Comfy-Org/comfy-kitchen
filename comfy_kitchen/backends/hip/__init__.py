@@ -1785,8 +1785,8 @@ def group_norm_silu_pad3d(
     pad: list[int],
     silu: bool,
     zero_pad: bool = False,
-    stats: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    stats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-frame GroupNorm + SiLU + causal conv padding in one pass; the result is
     channels_last_3d, like the CUDA kernel. Shapes it declines, and caller-supplied ``stats``,
@@ -1854,9 +1854,9 @@ def _writes_packed_ndhwc(out: torch.Tensor) -> bool:
     return b == 1 and st[1] == 1 and st[4] == c and st[3] == w * c and st[2] == h * w * c
 
 
-def group_norm_silu_pad3d_out(x, weight, bias, num_groups, eps, pad, silu, zero_pad, stats, out) -> None:
+def group_norm_silu_pad3d_out(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out, stats=None) -> None:
     """group_norm_silu_pad3d into ``out``; a frame-offset view leaves room for a caller's halo."""
-    group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, stats, out=out)
+    group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out, stats)
 
 
 def _effective_strides(t: torch.Tensor) -> tuple[int, ...]:

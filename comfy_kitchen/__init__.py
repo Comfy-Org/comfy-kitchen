@@ -368,8 +368,8 @@ def group_norm_silu_pad3d(
     pad: tuple[int, int, int, int, int] = (0, 0, 0, 0, 0),
     silu: bool = True,
     zero_pad: bool = False,
-    stats: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    stats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-frame GroupNorm, SiLU and causal conv3d padding in one pass.
 
@@ -384,7 +384,7 @@ def group_norm_silu_pad3d(
         return torch.ops.comfy_kitchen.group_norm_silu_pad3d(
             x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, stats)
     torch.ops.comfy_kitchen.group_norm_silu_pad3d_out(
-        x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, stats, out)
+        x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, out, stats)
     return out
 
 
