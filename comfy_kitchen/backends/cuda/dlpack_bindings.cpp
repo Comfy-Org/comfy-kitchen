@@ -1188,6 +1188,34 @@ SageAttentionMask parse_sage_attention_mask(
     return result;
 }
 
+// The attention epilogue honors output strides. These entry points accept the
+// dense layouts their frontends allocate: contiguous [B,H,Lq,D], or [B,Lq,H,D]
+// storage viewed as [B,H,Lq,D] so merging heads afterwards is free. Strides of
+// size-one extents carry no address and are not checked.
+void validate_sage_output(
+    const nb::ndarray<nb::device::cuda> &o, int B, int H, int Lq, int D,
+    const char *name)
+{
+    if (o.ndim() != 4 || o.shape(0) != B || o.shape(1) != H ||
+        o.shape(2) != Lq || o.shape(3) != D) {
+        throw std::runtime_error(std::string(name) + ": incompatible output shape");
+    }
+    const auto stride_is = [&](int dim, int64_t expected) {
+        return o.shape(dim) == 1 || o.stride(dim) == expected;
+    };
+    const bool heads_major = stride_is(2, D) && stride_is(1, static_cast<int64_t>(Lq) * D);
+    const bool sequence_major = stride_is(1, D) && stride_is(2, static_cast<int64_t>(H) * D);
+    if (o.stride(3) != 1 || !(heads_major || sequence_major) ||
+        !stride_is(0, static_cast<int64_t>(H) * Lq * D)) {
+        throw std::runtime_error(
+            std::string(name) + ": output must be dense [B,H,Lq,D] or [B,Lq,H,D] storage");
+    }
+    // The sequence stride feeds the 32-bit within-head tile iterators.
+    if (static_cast<int64_t>(Lq) * o.stride(2) > INT_MAX) {
+        throw std::overflow_error(std::string(name) + ": output sequence stride exceeds int32 range");
+    }
+}
+
 // Attention half of the split INT8 SDPA API.  The input tensors use the exact
 // packed layouts produced by sage_sdpa_quantize; no floating-point Q/K/V
 // tensor is retained or reconstructed.
@@ -1226,8 +1254,6 @@ void sage_sdpa_prequantized(
     const int padded_Lk = ((Lk + cta_k - 1) / cta_k) * cta_k;
 
     if (k_int8.shape(0) != B || k_int8.shape(3) != D ||
-        o.shape(0) != B || o.shape(1) != H_q || o.shape(2) != Lq ||
-        o.shape(3) != D ||
         v_int8.shape(0) != static_cast<size_t>(B) * H_kv * D ||
         v_int8.shape(1) != padded_Lk) {
         throw std::runtime_error(
@@ -1237,12 +1263,11 @@ void sage_sdpa_prequantized(
         q_int8.stride(1) != static_cast<int64_t>(Lq) * D ||
         k_int8.stride(3) != 1 || k_int8.stride(2) != D ||
         k_int8.stride(1) != static_cast<int64_t>(Lk) * D ||
-        v_int8.stride(1) != 1 || v_int8.stride(0) != padded_Lk ||
-        o.stride(3) != 1 || o.stride(2) != D ||
-        o.stride(1) != static_cast<int64_t>(Lq) * D) {
+        v_int8.stride(1) != 1 || v_int8.stride(0) != padded_Lk) {
         throw std::runtime_error(
-            "sage_sdpa_prequantized: quantized tensors and output must be contiguous");
+            "sage_sdpa_prequantized: quantized tensors must be contiguous");
     }
+    validate_sage_output(o, B, H_q, Lq, D, "sage_sdpa_prequantized");
 
     const int64_t qi_st_h = static_cast<int64_t>(Lq) * D;
     const int qi_st_n = D;
@@ -1253,9 +1278,6 @@ void sage_sdpa_prequantized(
     const int v_st_d = padded_Lk;
     const int64_t v_st_h = static_cast<int64_t>(D) * padded_Lk;
     const int64_t v_st_bz = H_kv * v_st_h;
-    const int64_t o_st_h = qi_st_h;
-    const int o_st_n = D;
-    const int64_t o_st_bz = qi_st_bz;
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
@@ -1268,7 +1290,7 @@ void sage_sdpa_prequantized(
         qi_st_bz, qi_st_n, qi_st_h,
         ki_st_bz, ki_st_n, ki_st_h,
         v_st_bz, v_st_h, v_st_d,
-        o_st_bz, o_st_n, o_st_h,
+        o.stride(0), static_cast<int>(o.stride(2)), o.stride(1),
         sm_scale, output_dtype_code, stream, mask.tile_bias);
 
     cudaError_t err = cudaGetLastError();
@@ -1368,6 +1390,7 @@ void sage_sdpa(
 
     const auto mask = parse_sage_attention_mask(
         attn_mask, B, H_q, Lq, Lk, D, cta_k, q.device_id());
+    validate_sage_output(o, B, H_q, Lq, D, "sage_sdpa");
 
     if (input_dtype_code < 0 || input_dtype_code > 2) {
         throw std::runtime_error("sage_sdpa: input_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
@@ -1410,8 +1433,7 @@ void sage_sdpa(
     const int64_t qi_st_bz = H_q * qi_st_h;
     const int64_t ki_st_h = static_cast<int64_t>(Lk) * D;
     const int64_t ki_st_bz = H_kv * ki_st_h;
-    const int64_t o_st_h = qi_st_h, o_st_bz = qi_st_bz;
-    const int qi_st_n = D, ki_st_n = D, o_st_n = D;
+    const int qi_st_n = D, ki_st_n = D;
     // v_int8 is [B*H_kv*D, padded_Lk] (2D from quant kernel).
     // Attention expects V as [B, H, D, padded_N].
     const int v_st_d  = padded_Lk;
@@ -1427,7 +1449,7 @@ void sage_sdpa(
         qi_st_bz, qi_st_n, qi_st_h,
         ki_st_bz, ki_st_n, ki_st_h,
         v_st_bz, v_st_h, v_st_d,
-        o_st_bz, o_st_n, o_st_h,
+        o.stride(0), static_cast<int>(o.stride(2)), o.stride(1),
         sm_scale, output_dtype_code, stream, mask.tile_bias);
 
     cudaError_t err = cudaGetLastError();

@@ -423,6 +423,37 @@ def test_int8_attention_torch_compile_fullgraph():
 
 
 @requires_int8_attention
+@pytest.mark.skipif(bool(torch.version.hip), reason="CUDA output layout")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_int8_attention_output_merges_heads_without_copy(dtype, head_dim):
+    """Callers merge heads with transpose(1, 2).reshape, which must stay a view."""
+    batch, heads, length = 2, 8, 193
+    q, k, v = _qkv(batch, heads, 2, length, 257, head_dim, dtype)
+    direct = ck.int8_attention(q, k, v)
+    split = ck.int8_attention_from_prequantized(ck.prequantize_int8_attention(q, k, v))
+    for output in (direct, split):
+        assert output.shape == q.shape and output.dtype == dtype
+        merged = output.transpose(1, 2).reshape(batch, length, heads * head_dim)
+        assert merged.data_ptr() == output.data_ptr()
+    assert torch.equal(direct, split)
+
+
+@requires_int8_attention
+@pytest.mark.skipif(bool(torch.version.hip), reason="CUDA output layout")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("head_dim", [96, 128])
+def test_int8_attention_fake_matches_real_layout(dtype, head_dim):
+    q, k, v = _qkv(2, 4, 2, 129, 129, head_dim, dtype)
+    mask = torch.zeros(1, 1, 1, 129, device="cuda", dtype=dtype)
+    ops = torch.ops.comfy_kitchen
+    torch.library.opcheck(ops.int8_attention.default, (q, k, v, None), test_utils="test_faketensor")
+    torch.library.opcheck(
+        ops.int8_attention_masked.default, (q, k, v, mask, None), test_utils="test_faketensor"
+    )
+
+
+@requires_int8_attention
 def test_int8_attention_cuda_graph():
     q, k, v = _qkv(1, 4, 4, 129, 129, 64)
     warmup_stream = torch.cuda.Stream()

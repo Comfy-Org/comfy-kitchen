@@ -284,8 +284,8 @@ def _int8_attention_cuda(
 
     output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
     output = torch.empty(
-        batch, q_heads, q_length, kernel_head_dim, dtype=output_dtype, device=q.device
-    )
+        batch, q_length, q_heads, kernel_head_dim, dtype=output_dtype, device=q.device
+    ).transpose(1, 2)
 
     anchor_indices = torch.empty(
         batch, kv_heads, dtype=torch.int32, device=q.device
@@ -509,12 +509,12 @@ def int8_attention_from_prequantized(
 
     output = torch.empty(
         batch,
-        q_heads,
         q_length,
+        q_heads,
         kernel_head_dim,
         dtype=output_dtype,
         device=quantized.q.device,
-    )
+    ).transpose(1, 2)
 
     stream_ptr = torch.cuda.current_stream(quantized.q.device).cuda_stream
     _cuda_backend._C.sage_sdpa_prequantized(
@@ -540,6 +540,19 @@ def int8_attention_from_prequantized(
     return output.float() if quantized.input_dtype == torch.float32 else output
 
 
+def _int8_attention_output_like(q: torch.Tensor) -> torch.Tensor:
+    """Mirror the dtype and strides of the real output for fake tensors."""
+    if _hip_backend is not None:
+        return q.new_empty(q.shape)
+    # CUDA writes [B, S, H, kernel_head_dim] storage viewed as [B, H, S, D].
+    batch, heads, length, head_dim = q.shape
+    kernel_head_dim = 64 if head_dim <= 64 else 128 if head_dim <= 128 else 256
+    output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
+    output = q.new_empty(batch, length, heads, kernel_head_dim, dtype=output_dtype)
+    output = output.transpose(1, 2)[..., :head_dim]
+    return output.float() if q.dtype == torch.float32 else output
+
+
 @torch.library.custom_op("comfy_kitchen::int8_attention", mutates_args=())
 def _op_int8_attention(
     q: torch.Tensor,
@@ -563,7 +576,7 @@ def _op_int8_attention_fake(
     v,
     scale,
 ):
-    return q.new_empty(q.shape)
+    return _int8_attention_output_like(q)
 
 
 @torch.library.custom_op("comfy_kitchen::int8_attention_masked", mutates_args=())
@@ -591,7 +604,7 @@ def _op_int8_attention_masked_fake(
     attn_mask,
     scale,
 ):
-    return q.new_empty(q.shape)
+    return _int8_attention_output_like(q)
 
 
 def int8_attention(
