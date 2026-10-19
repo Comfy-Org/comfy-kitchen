@@ -50,7 +50,6 @@ from comfy_kitchen.backends.hip import (
     _EXT_AVAILABLE,
     _gfx_arch,
     _visible_gfx_arches,
-    rdna2_is_available,
     _EXT_ERROR,
     _dl,
     _rotate_quant_int8,
@@ -140,12 +139,31 @@ PACK4_GROUP = 256
 # legacy paths agree" would hold for the uninteresting reason that only one of
 # them ran. A green test that cannot fail is worse than a skipped one, because it
 # reports coverage that does not exist.
+#
+# It asks the device under test, because that is the device the launcher asks.
+# pack4_takes_fused in hadamard.h is `comfy_small_igpu() || comfy_is_gfx10()`, both
+# current-device overloads (hipGetDevice), and _pack4_quant_at launches on x.device
+# -- which is DEV -- so DEV's architecture is the one that decides the routing.
+# Scanning the visible arches instead passes on a host whose current device is a
+# dGPU while a gfx1103 is also visible, and both arms there run the legacy kernel:
+# the same unpassable failure the gate exists to prevent, one level up. And
+# rdna2_is_available() was the wrong question for the other direction: it also
+# requires the RDNA2 SageAttention module to load, which has nothing to do with
+# ConvRot routing, so it skipped the int4 tests on a gfx103x box whose SageAttention
+# build was broken while the fused routing was live. This is the correction
+# test_the_default_width_is_not_the_widest_one below already got.
+#
+# gfx1103 plus the gfx103x family is the whole of that C++ predicate rather than a
+# spelling of it: comfy_small_igpu() matches gfx1103 and comfy_is_gfx10() accepts
+# gfx1030 through gfx1036 and nothing else, so the prefix below covers the entire
+# RDNA2 half.
+_PACK4_ARCH = _gfx_arch(DEV) or ""
 requires_pack4_fused = pytest.mark.skipif(
-    not any(
-        arch.split(":")[0] == "gfx1103" for arch in _visible_gfx_arches() if arch
-    )
-    and not rdna2_is_available(),
-    reason="the PACK_INT4 fused activation quantizer is routed only on gfx1103 and RDNA2",
+    not (_PACK4_ARCH == "gfx1103" or _PACK4_ARCH.startswith("gfx103")),
+    reason=(
+        "the PACK_INT4 fused activation quantizer is routed only on gfx1103 and RDNA2; "
+        f"device under test is {_PACK4_ARCH or 'unknown'}"
+    ),
 )
 
 PACK4_SHAPES = [
