@@ -44,6 +44,8 @@ def group_norm_silu_pad3d(
         if stats is None:
             y = functional.group_norm(y, num_groups, weight, bias, eps)
         else:
+            if stats.shape != (b * t, num_groups, 2):  # a short stats tensor would broadcast silently
+                raise ValueError(f"group_norm_silu_pad3d: stats must be [{b * t}, {num_groups}, 2]")
             # per-(frame, channel) scale and shift in fp32, rounded once like group_norm's output
             scale = stats[..., 1].repeat_interleave(c // num_groups, dim=1) * weight.float()
             shift = -stats[..., 0].repeat_interleave(c // num_groups, dim=1) * scale

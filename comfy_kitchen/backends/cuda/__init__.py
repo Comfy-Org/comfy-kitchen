@@ -23,6 +23,7 @@ from typing import NamedTuple
 import torch
 
 from comfy_kitchen._rope_utils import (
+    _tensors_overlap,
     check_rope_inplace,
     detect_rms_rope_bnhd,
     trim_rope_freqs,
@@ -3747,7 +3748,8 @@ def group_norm_silu_pad3d(
         out.copy_(res)
         return out
 
-    dst = out if out is not None and _writes_packed_ndhwc(out) and _aligned16(out) else None
+    # frames are written in no particular order, so an out overlapping x goes via a copy
+    dst = out if out is not None and _writes_packed_ndhwc(out) and _aligned16(out) and not _tensors_overlap(out, x) else None
     if dst is None:
         dst = torch.empty((b, c, t + front, h + top + bottom, w + left + right),
                           dtype=x.dtype, device=x.device, memory_format=torch.channels_last_3d)

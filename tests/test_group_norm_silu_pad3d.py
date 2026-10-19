@@ -321,3 +321,23 @@ class TestGroupNormStats3d:
             got = ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 0, 0), silu=True, zero_pad=True, stats=stats)
             ref = ck.group_norm_silu_pad3d(x.contiguous(memory_format=CL3D), weight, bias, 32, 1e-6, (1, 1, 1, 0, 0), silu=True, zero_pad=True, stats=stats)
             assert torch.equal(got, ref)
+
+    def test_out_overlapping_input_goes_via_copy(self, seed, cuda_available):
+        """An out view that shares storage with a row-interleaved x cannot be written in place."""
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        c, h, w = 128, 24, 40
+        buf = torch.randn(1, 2 * c, h, w, dtype=torch.float16, device="cuda").contiguous(memory_format=torch.channels_last)
+        flat = buf.permute(0, 2, 3, 1).reshape(-1)
+        part = flat.as_strided((1, c, h, w), (h * w * 2 * c, 1, w * 2 * c, c), flat.storage_offset() + w * c).unsqueeze(2)
+        ref = ck.group_norm_silu_pad3d(part.contiguous(memory_format=CL3D), None, None, 1, 0.0, (0, 0, 0, 0, 0), silu=True, zero_pad=True)
+        out = flat.narrow(0, 0, c * h * w).view(1, 1, h, w, c).permute(0, 4, 1, 2, 3)  # packed, over the same storage
+        ck.group_norm_silu_pad3d(part, None, None, 1, 0.0, (0, 0, 0, 0, 0), silu=True, zero_pad=True, out=out)
+        assert torch.equal(out, ref)
+
+    def test_eager_rejects_short_stats(self, seed, cuda_available):
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        x, weight, bias = _inputs(128, 2, 12, 16, torch.bfloat16)
+        with pytest.raises(ValueError):
+            eager_ref(x, weight, bias, 32, 1e-6, [0, 0, 0, 0, 0], True, stats=eager_stats(x[:, :, :1], 32, 1e-6))
