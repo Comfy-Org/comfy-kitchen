@@ -135,6 +135,7 @@ set(CUDA_SOURCES
     ops/convrot_w4a4.cu
     ops/turing_int4.cu
     ops/rms_rope.cu
+    ops/rms_gated_residual.cu
     ops/na3d.cu
     sage_attention/sol_attn.cu
     sage_attention/sol_attn_preprocess.cu
@@ -160,6 +161,9 @@ set(CUDA_SOURCES
     sage_attention/sage_attn_launcher.cu
     sage_attention/int8_decode.cu
 )
+
+# The BF16 post-op must retain subnormals just like the unfused PyTorch chain.
+set_source_files_properties(ops/rms_gated_residual.cu PROPERTIES COMPILE_OPTIONS "--ftz=false")
 
 set(CPP_SOURCES
     dlpack_bindings.cpp

@@ -326,6 +326,11 @@ extern "C" {
         bool        subtract_mean,
         cudaStream_t stream);
 
+    void launch_rms_gated_residual_bf16_kernel(
+        const void* activation, const void* norm_weight, const void* residual,
+        const void* gate, void* output, int rows, int width, float eps,
+        cudaStream_t stream);
+
     // 3D Delaunay steps, looped from Python — see ops/delaunay3d.cu.
     void launch_delaunay_vote(const void* pt_tet, const void* pt_prio, int n_pts, void* vote, cudaStream_t stream);
     void launch_delaunay_split(int n_tets, const void* vote, const void* split_rank, const void* prio_to_pt,
@@ -1791,6 +1796,33 @@ void rms_adaln(
     launch_adaln_kernel(
         x.data(), scale.data(), shift.data(), out.data(),
         N, D, scale_group, shift_group, eps, dtype_code, /*subtract_mean=*/false, stream);
+}
+
+void rms_gated_residual_bf16(
+    nb::ndarray<nb::device::cuda, nb::c_contig> activation,
+    nb::ndarray<nb::device::cuda, nb::c_contig> norm_weight,
+    nb::ndarray<nb::device::cuda, nb::c_contig> residual,
+    nb::ndarray<nb::device::cuda, nb::c_contig> gate,
+    nb::ndarray<nb::device::cuda, nb::c_contig> output,
+    int rows, int width, float eps, uintptr_t stream_ptr) {
+    if (rows < 0 || width <= 0 || width % 4 != 0 || width > 16384) {
+        throw std::runtime_error("rms_gated_residual_bf16: invalid row count or width");
+    }
+    const int64_t size = static_cast<int64_t>(rows) * width;
+    if (activation.size() != size || residual.size() != size || output.size() != size
+        || norm_weight.size() != width || gate.size() != width) {
+        throw std::runtime_error("rms_gated_residual_bf16: operand size mismatch");
+    }
+    for (const auto* operand : {&activation, &norm_weight, &residual, &gate, &output}) {
+        if (map_dtype_to_code(operand->dtype()) != 2
+            || operand->device_id() != activation.device_id()
+            || reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error("rms_gated_residual_bf16: expected aligned BF16 operands on one device");
+        }
+    }
+    launch_rms_gated_residual_bf16_kernel(
+        activation.data(), norm_weight.data(), residual.data(), gate.data(), output.data(),
+        rows, width, eps, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrappers for the 3D Delaunay steps (int32 / uint8 / float64 buffers owned by Python)
@@ -5279,6 +5311,8 @@ NB_MODULE(_C, m) {
           nb::arg("eps"),
           nb::arg("dtype_code"),
           nb::arg("stream_ptr"));
+
+    m.def("rms_gated_residual_bf16", &rms_gated_residual_bf16);
 
     m.def("rms_adaln", &rms_adaln,
           "Fused AdaLN: rmsnorm(x) * (1 + scale) + shift",

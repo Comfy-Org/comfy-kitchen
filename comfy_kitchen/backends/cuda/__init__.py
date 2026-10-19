@@ -45,6 +45,7 @@ __all__ = [
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
     "rms_adaln",
+    "rms_gated_residual",
     "apply_rope",
     "apply_rope_",
     "apply_rope1",
@@ -180,6 +181,7 @@ from comfy_kitchen.backends._activations import (  # noqa: E402
 )
 from comfy_kitchen.backends._modulation import adaln_prep_modulation  # noqa: E402
 from comfy_kitchen.backends.eager import rope as _eager_rope  # noqa: E402
+from comfy_kitchen.backends.eager import rms_gated_residual as _eager_rms_gated_residual  # noqa: E402
 from comfy_kitchen.backends.eager.group_norm_pad3d import (  # noqa: E402
     group_norm_silu_pad3d as _eager_group_norm_silu_pad3d,
 )
@@ -3322,6 +3324,42 @@ def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float 
 def rms_adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return _adaln_impl(_C.rms_adaln, x, scale, shift, eps)
 
+def rms_gated_residual(
+    activation: torch.Tensor,
+    norm_weight: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    width = activation.shape[-1] if activation.ndim else 0
+    if not (
+        activation.dtype == norm_weight.dtype == residual.dtype == gate.dtype == torch.bfloat16
+        and activation.device == norm_weight.device == residual.device == gate.device
+        and activation.ndim == 3 and activation.shape[0] == 1
+        and activation.shape == residual.shape
+        and 0 < width <= 16384 and width % 4 == 0
+        and norm_weight.numel() == width and norm_weight.shape[-1] == width
+        and gate.numel() == width and gate.shape[-1] == width
+    ):
+        return _eager_rms_gated_residual(activation, norm_weight, residual, gate, eps)
+
+    activation_2d = activation.reshape(-1, width).contiguous()
+    residual_2d = residual.reshape(-1, width).contiguous()
+    if not _aligned16(activation_2d):
+        activation_2d = activation_2d.clone()
+    if not _aligned16(residual_2d):
+        residual_2d = residual_2d.clone()
+    weight = _gemm_vector_arg(norm_weight, activation.device, activation.dtype)
+    gate = _gemm_vector_arg(gate, activation.device, activation.dtype)
+    output = torch.empty_like(activation_2d)
+    _C.rms_gated_residual_bf16(
+        _wrap_for_dlpack(activation_2d), _wrap_for_dlpack(weight),
+        _wrap_for_dlpack(residual_2d), _wrap_for_dlpack(gate), _wrap_for_dlpack(output),
+        activation_2d.shape[0], width, float(eps),
+        torch.cuda.current_stream(activation.device).cuda_stream,
+    )
+    return output.reshape(activation.shape)
+
 
 _INT32_MAX = 2**31 - 1
 _DELAUNAY_MAX_FLIP_PASSES = 256  # per insertion round; faces still bad after that are left
@@ -4581,6 +4619,13 @@ def _build_constraints() -> dict:
                 "shift": ParamConstraint(
                     dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
                 ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "rms_gated_residual": FunctionConstraints(
+            params={
+                name: ParamConstraint(dtypes=frozenset({torch.float16, torch.bfloat16, torch.float32}))
+                for name in ("activation", "norm_weight", "residual", "gate")
             },
             default_devices=cuda_devices,
         ),

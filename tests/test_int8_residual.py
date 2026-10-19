@@ -12,6 +12,32 @@ from tests.conftest import get_capable_backends, rel_err
 _GROUP = 256
 
 
+@pytest.mark.parametrize("width", [3072, 3840])
+@pytest.mark.parametrize("layout", ["contiguous", "strided", "offset", "batch"])
+def test_rms_gated_residual_rounding(width, layout, seed, cuda_available):
+    if not cuda_available or "cuda" not in get_capable_backends("rms_gated_residual", "cuda"):
+        pytest.skip("CUDA backend required")
+    shape = (2 if layout == "batch" else 1, 97, width)
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    if layout == "strided":
+        x = x.transpose(1, 2).contiguous().transpose(1, 2)
+    elif layout == "offset":
+        x = torch.cat((x.new_zeros(1), x.flatten()))[1:].view(shape)
+    residual = torch.randn_like(x)
+    weight = torch.randn(width, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn(shape[0], 1, width, device="cuda", dtype=torch.bfloat16)
+    # BF16 subnormals must survive the FP32 post-op arithmetic too.
+    weight[0] = 1e-38
+    residual[..., 0] = 0
+    gate[..., 0] = 1
+    before = residual.clone()
+    expected = residual + gate * torch.nn.functional.rms_norm(x, (width,), weight, eps=1e-5)
+    with ck.use_backend("cuda"):
+        actual = ck.rms_gated_residual(x, weight, residual, gate, eps=1e-5)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.equal(residual, before)
+
+
 def _linear_ref(x, weight, wscale, bias, **kwargs):
     return ck.int8_linear(x, weight, wscale, bias, torch.float16,
                           convrot=True, convrot_groupsize=_GROUP, **kwargs)
