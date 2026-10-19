@@ -902,6 +902,13 @@ __global__ void dequantize_int8_convrot_groups_kernel(
     }
 }
 
+// The FHT scratch buffers are stored XOR-swizzled: bits 5 and 6 of a 256-float
+// index flip low bits so that every butterfly stage below (strides 1, 4, 16, 64,
+// lane-major) touches 32 distinct banks per warp instead of up to 4-way conflicts.
+__device__ __forceinline__ int convrot_swz(int i) {
+    return i ^ (((i >> 5) & 1) * 5) ^ (((i >> 6) & 1) * 26);
+}
+
 template<int S>
 __device__ __forceinline__ void convrot_fht_stage64(
     const float* __restrict__ src,
@@ -909,14 +916,14 @@ __device__ __forceinline__ void convrot_fht_stage64(
     int lane)
 {
     const int base = (lane % S) + (lane / S) * (4 * S);
-    const float x0 = src[base];
-    const float x1 = src[base + S];
-    const float x2 = src[base + 2 * S];
-    const float x3 = src[base + 3 * S];
-    dst[base] = 0.5f * (x0 + x1 + x2 - x3);
-    dst[base + S] = 0.5f * (x0 + x1 - x2 + x3);
-    dst[base + 2 * S] = 0.5f * (x0 - x1 + x2 + x3);
-    dst[base + 3 * S] = 0.5f * (-x0 + x1 + x2 + x3);
+    const float x0 = src[convrot_swz(base)];
+    const float x1 = src[convrot_swz(base + S)];
+    const float x2 = src[convrot_swz(base + 2 * S)];
+    const float x3 = src[convrot_swz(base + 3 * S)];
+    dst[convrot_swz(base)] = 0.5f * (x0 + x1 + x2 - x3);
+    dst[convrot_swz(base + S)] = 0.5f * (x0 + x1 - x2 + x3);
+    dst[convrot_swz(base + 2 * S)] = 0.5f * (x0 - x1 + x2 + x3);
+    dst[convrot_swz(base + 3 * S)] = 0.5f * (-x0 + x1 + x2 + x3);
 }
 
 template<int S, typename OutputType>
@@ -926,10 +933,10 @@ __device__ __forceinline__ void convrot_fht_stage64_store(
     int lane)
 {
     const int base = (lane % S) + (lane / S) * (4 * S);
-    const float x0 = src[base];
-    const float x1 = src[base + S];
-    const float x2 = src[base + 2 * S];
-    const float x3 = src[base + 3 * S];
+    const float x0 = src[convrot_swz(base)];
+    const float x1 = src[convrot_swz(base + S)];
+    const float x2 = src[convrot_swz(base + 2 * S)];
+    const float x3 = src[convrot_swz(base + 3 * S)];
     output[base] = from_float<OutputType>(0.5f * (x0 + x1 + x2 - x3));
     output[base + S] = from_float<OutputType>(0.5f * (x0 + x1 - x2 + x3));
     output[base + 2 * S] = from_float<OutputType>(0.5f * (x0 - x1 + x2 + x3));
@@ -943,10 +950,10 @@ __device__ __forceinline__ float convrot_fht_stage64_store_absmax(
     int lane)
 {
     const int base = (lane % S) + (lane / S) * (4 * S);
-    const float x0 = src[base];
-    const float x1 = src[base + S];
-    const float x2 = src[base + 2 * S];
-    const float x3 = src[base + 3 * S];
+    const float x0 = src[convrot_swz(base)];
+    const float x1 = src[convrot_swz(base + S)];
+    const float x2 = src[convrot_swz(base + 2 * S)];
+    const float x3 = src[convrot_swz(base + 3 * S)];
     const float y0 = 0.5f * (x0 + x1 + x2 - x3);
     const float y1 = 0.5f * (x0 + x1 - x2 + x3);
     const float y2 = 0.5f * (x0 - x1 + x2 + x3);
@@ -987,10 +994,10 @@ __global__ void dequantize_int8_convrot_groups64_kernel(
     const float x1 = active ? static_cast<float>(q[q_offset + 1]) * scale : 0.0f;
     const float x2 = active ? static_cast<float>(q[q_offset + 2]) * scale : 0.0f;
     const float x3 = active ? static_cast<float>(q[q_offset + 3]) * scale : 0.0f;
-    buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
-    buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
-    buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
-    buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+    buf1[convrot_swz(base)] = 0.5f * (x0 + x1 + x2 - x3);
+    buf1[convrot_swz(base + 1)] = 0.5f * (x0 + x1 - x2 + x3);
+    buf1[convrot_swz(base + 2)] = 0.5f * (x0 - x1 + x2 + x3);
+    buf1[convrot_swz(base + 3)] = 0.5f * (-x0 + x1 + x2 + x3);
     __syncthreads();
 
     convrot_fht_stage64<4>(buf1, buf0, lane);
@@ -1035,10 +1042,10 @@ __global__ void dequantize_int8_convrot_g64_kernel(
     const float x1 = active ? static_cast<float>(q[offset + base + 1]) * scale : 0.0f;
     const float x2 = active ? static_cast<float>(q[offset + base + 2]) * scale : 0.0f;
     const float x3 = active ? static_cast<float>(q[offset + base + 3]) * scale : 0.0f;
-    buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
-    buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
-    buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
-    buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+    buf1[convrot_swz(base)] = 0.5f * (x0 + x1 + x2 - x3);
+    buf1[convrot_swz(base + 1)] = 0.5f * (x0 + x1 - x2 + x3);
+    buf1[convrot_swz(base + 2)] = 0.5f * (x0 - x1 + x2 + x3);
+    buf1[convrot_swz(base + 3)] = 0.5f * (-x0 + x1 + x2 + x3);
     __syncthreads();
 
     convrot_fht_stage64<4>(buf1, buf0, lane);
@@ -1077,10 +1084,10 @@ __global__ void rotate_int8_convrot_groups64_amax_kernel(
     const float x1 = active ? to_float(x[x_offset + 1]) : 0.0f;
     const float x2 = active ? to_float(x[x_offset + 2]) : 0.0f;
     const float x3 = active ? to_float(x[x_offset + 3]) : 0.0f;
-    buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
-    buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
-    buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
-    buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+    buf1[convrot_swz(base)] = 0.5f * (x0 + x1 + x2 - x3);
+    buf1[convrot_swz(base + 1)] = 0.5f * (x0 + x1 - x2 + x3);
+    buf1[convrot_swz(base + 2)] = 0.5f * (x0 - x1 + x2 + x3);
+    buf1[convrot_swz(base + 3)] = 0.5f * (-x0 + x1 + x2 + x3);
     __syncthreads();
 
     convrot_fht_stage64<4>(buf1, buf0, lane);
@@ -1131,10 +1138,10 @@ __global__ void rotate_int8_convrot_groups64_kernel(
     const float x1 = active ? to_float(x[x_offset + 1]) : 0.0f;
     const float x2 = active ? to_float(x[x_offset + 2]) : 0.0f;
     const float x3 = active ? to_float(x[x_offset + 3]) : 0.0f;
-    buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
-    buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
-    buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
-    buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+    buf1[convrot_swz(base)] = 0.5f * (x0 + x1 + x2 - x3);
+    buf1[convrot_swz(base + 1)] = 0.5f * (x0 + x1 - x2 + x3);
+    buf1[convrot_swz(base + 2)] = 0.5f * (x0 - x1 + x2 + x3);
+    buf1[convrot_swz(base + 3)] = 0.5f * (-x0 + x1 + x2 + x3);
     __syncthreads();
 
     convrot_fht_stage64<4>(buf1, buf0, lane);
@@ -1217,28 +1224,27 @@ __device__ __forceinline__ float stable_tanh(float x) {
     return copysignf(-t / (t + 2.0f), x);
 }
 
-// Reads one activated value: column `col` of the K-wide activated row starting
-// at `in_row`. For SwiGLU and SiTU the raw row is 2*K wide (SwiGLU's gate in the
-// first half, SiTU's in the second); every other activation reads the same
-// K-wide row it writes.
+// One activated value from its raw input: `lo` is the column of the K-wide (or
+// first-half) input, `hi` the same column of the second half. For SwiGLU and SiTU
+// the raw row is 2*K wide (SwiGLU's gate in the first half, SiTU's in the second);
+// every other activation reads only `lo`.
 template<int ACT, typename InputType>
-__device__ __forceinline__ float load_input_act(
-    const InputType* __restrict__ x, int64_t in_row, int col, int K)
+__device__ __forceinline__ float input_act_from_raw(InputType lo, InputType hi)
 {
     if constexpr (ACT == kActSwiGLU) {
         // Matches torch silu(gate) * up.
-        const float gate = to_float(x[in_row + col]);
-        const float up = to_float(x[in_row + K + col]);
+        const float gate = to_float(lo);
+        const float up = to_float(hi);
         return (gate / (1.0f + expf(-gate))) * up;
     } else if constexpr (ACT == kActSiTU) {
         // Matches torch 4 * tanh(gate / 4) * sigmoid(gate) * (25 * tanh(hidden / 25)).
-        const float hidden = to_float(x[in_row + col]);
-        const float gate = to_float(x[in_row + K + col]);
+        const float hidden = to_float(lo);
+        const float gate = to_float(hi);
         const float gate_cap = 4.0f * stable_tanh(gate / 4.0f);
         const float hidden_cap = 25.0f * stable_tanh(hidden / 25.0f);
         return gate_cap / (1.0f + expf(-gate)) * hidden_cap;
     } else {
-        return apply_input_act<ACT>(to_float(x[in_row + col]));
+        return apply_input_act<ACT>(to_float(lo));
     }
 }
 
@@ -1333,6 +1339,26 @@ __device__ __forceinline__ float convrot64_quantize_row(
         }
     }
 
+    // Without RmsNorm, the next group's raw input is loaded before this group's
+    // FHT and barriers, so its global-load latency overlaps them.
+    constexpr bool kRms = ACT == kActRmsNorm || ACT == kActRmsNormModulated;
+    constexpr int kInWidth = input_act_width(ACT);
+    InputType raw[kInWidth][4];
+    const auto load_raw = [&](int group) {
+        if (group < n_groups) {
+            #pragma unroll
+            for (int w = 0; w < kInWidth; ++w) {
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    raw[w][i] = x_row[w * K + group * kConvRotGroup + lane * 4 + i];
+                }
+            }
+        }
+    };
+    if constexpr (!kRms) {
+        load_raw(sub);
+    }
+
     const int iters = (n_groups + kGroupsInFlight - 1) / kGroupsInFlight;
     for (int it = 0; it < iters; ++it) {
         const int group = it * kGroupsInFlight + sub;
@@ -1342,21 +1368,22 @@ __device__ __forceinline__ float convrot64_quantize_row(
         const int col = group_col + base;
 
         float x0, x1, x2, x3;
-        if constexpr (ACT == kActRmsNorm || ACT == kActRmsNormModulated) {
+        if constexpr (kRms) {
             x0 = active ? apply_input_rms<ACT, InputType>(row_buf[col], rstd, act_weight, col, K) : 0.0f;
             x1 = active ? apply_input_rms<ACT, InputType>(row_buf[col + 1], rstd, act_weight, col + 1, K) : 0.0f;
             x2 = active ? apply_input_rms<ACT, InputType>(row_buf[col + 2], rstd, act_weight, col + 2, K) : 0.0f;
             x3 = active ? apply_input_rms<ACT, InputType>(row_buf[col + 3], rstd, act_weight, col + 3, K) : 0.0f;
         } else {
-            x0 = active ? load_input_act<ACT>(x_row, 0, col, K) : 0.0f;
-            x1 = active ? load_input_act<ACT>(x_row, 0, col + 1, K) : 0.0f;
-            x2 = active ? load_input_act<ACT>(x_row, 0, col + 2, K) : 0.0f;
-            x3 = active ? load_input_act<ACT>(x_row, 0, col + 3, K) : 0.0f;
+            x0 = active ? input_act_from_raw<ACT>(raw[0][0], raw[kInWidth - 1][0]) : 0.0f;
+            x1 = active ? input_act_from_raw<ACT>(raw[0][1], raw[kInWidth - 1][1]) : 0.0f;
+            x2 = active ? input_act_from_raw<ACT>(raw[0][2], raw[kInWidth - 1][2]) : 0.0f;
+            x3 = active ? input_act_from_raw<ACT>(raw[0][3], raw[kInWidth - 1][3]) : 0.0f;
+            load_raw(group + kGroupsInFlight);
         }
-        buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
-        buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
-        buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
-        buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+        buf1[convrot_swz(base)] = 0.5f * (x0 + x1 + x2 - x3);
+        buf1[convrot_swz(base + 1)] = 0.5f * (x0 + x1 - x2 + x3);
+        buf1[convrot_swz(base + 2)] = 0.5f * (x0 - x1 + x2 + x3);
+        buf1[convrot_swz(base + 3)] = 0.5f * (-x0 + x1 + x2 + x3);
         __syncthreads();
 
         convrot_fht_stage64<4>(buf1, buf0, lane);
@@ -1647,10 +1674,10 @@ quantize_int8_convrot_cluster_kernel(
         float* buf0 = fht[sub][0];
         float* buf1 = fht[sub][1];
         const int base = lane * 4;
-        buf1[base] = 0.5f * (v[0] + v[1] + v[2] - v[3]);
-        buf1[base + 1] = 0.5f * (v[0] + v[1] - v[2] + v[3]);
-        buf1[base + 2] = 0.5f * (v[0] - v[1] + v[2] + v[3]);
-        buf1[base + 3] = 0.5f * (-v[0] + v[1] + v[2] + v[3]);
+        buf1[convrot_swz(base)] = 0.5f * (v[0] + v[1] + v[2] - v[3]);
+        buf1[convrot_swz(base + 1)] = 0.5f * (v[0] + v[1] - v[2] + v[3]);
+        buf1[convrot_swz(base + 2)] = 0.5f * (v[0] - v[1] + v[2] + v[3]);
+        buf1[convrot_swz(base + 3)] = 0.5f * (-v[0] + v[1] + v[2] + v[3]);
         __syncthreads();
         convrot_fht_stage64<4>(buf1, buf0, lane);
         __syncthreads();
@@ -1659,7 +1686,8 @@ quantize_int8_convrot_cluster_kernel(
         {
             constexpr int S = 64;
             const int b = (lane % S) + (lane / S) * (4 * S);
-            const float x0 = buf1[b], x1 = buf1[b + S], x2 = buf1[b + 2 * S], x3 = buf1[b + 3 * S];
+            const float x0 = buf1[convrot_swz(b)], x1 = buf1[convrot_swz(b + S)];
+            const float x2 = buf1[convrot_swz(b + 2 * S)], x3 = buf1[convrot_swz(b + 3 * S)];
             y[p][0] = 0.5f * (x0 + x1 + x2 - x3);
             y[p][1] = 0.5f * (x0 + x1 - x2 + x3);
             y[p][2] = 0.5f * (x0 - x1 + x2 + x3);
