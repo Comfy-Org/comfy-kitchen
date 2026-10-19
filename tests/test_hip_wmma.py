@@ -235,7 +235,9 @@ def test_int8_convrot_linear_is_independent_of_zero_padding(hip):
 @needs_wmma
 @pytest.mark.parametrize("input_act", [None, "gelu_tanh", "swiglu"])
 @pytest.mark.parametrize("k", [3840, 10240, 14336])
-def test_int8_convrot_linear_is_row_independent(hip, input_act, k):
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_int8_convrot_linear_is_row_independent(hip, input_act, k, out_dtype, with_bias):
     skip_unless_gfx12_wmma()
     torch.manual_seed(414)
     m, n = 1153, 128
@@ -244,16 +246,17 @@ def test_int8_convrot_linear_is_row_independent(hip, input_act, k):
          torch.logspace(-3, 3, width, device=DEV)).bfloat16()
     weight = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
     scales = torch.rand(n, device=DEV)
+    bias = torch.randn(n, device=DEV) if with_bias else None
 
     with ck.use_backend("hip"):
         def linear(rows):
             return ck.int8_linear(
-                rows, weight, scales, None, torch.float32, convrot=True,
+                rows, weight, scales, bias, out_dtype, convrot=True,
                 convrot_groupsize=256, input_act=input_act,
             )
 
         whole = linear(x)
-        # Both sides of the transposed dispatch boundary, plus partial tiles.
+        # Both dispatch sides, plus an absent or partial second dual-M tile.
         split = torch.cat((linear(x[:1023]), linear(x[1023:])))
         boundary = linear(x[:1024])
         tail = linear(x[:1025])
