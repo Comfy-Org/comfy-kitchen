@@ -13,7 +13,7 @@ _GROUP = 256
 
 
 @pytest.mark.parametrize("width", [3072, 3840])
-@pytest.mark.parametrize("layout", ["contiguous", "strided", "offset", "batch"])
+@pytest.mark.parametrize("layout", ["contiguous", "strided", "offset", "weight_offset", "batch"])
 def test_rms_gated_residual_rounding(width, layout, seed, cuda_available):
     if not cuda_available or "cuda" not in get_capable_backends("rms_gated_residual", "cuda"):
         pytest.skip("CUDA backend required")
@@ -25,6 +25,8 @@ def test_rms_gated_residual_rounding(width, layout, seed, cuda_available):
         x = torch.cat((x.new_zeros(1), x.flatten()))[1:].view(shape)
     residual = torch.randn_like(x)
     weight = torch.randn(width, device="cuda", dtype=torch.bfloat16)
+    if layout == "weight_offset":
+        weight = torch.cat((weight.new_zeros(1), weight))[1:]
     gate = torch.randn(shape[0], 1, width, device="cuda", dtype=torch.bfloat16)
     # BF16 subnormals must survive the FP32 post-op arithmetic too.
     weight[0] = 1e-38

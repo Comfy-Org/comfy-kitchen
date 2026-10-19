@@ -3344,12 +3344,14 @@ def rms_gated_residual(
         return _eager_rms_gated_residual(activation, norm_weight, residual, gate, eps)
 
     activation_2d = activation.reshape(-1, width).contiguous()
+    weight = norm_weight.contiguous()
+    # PyTorch selects a different RMS reduction for unaligned four-BF16 vectors.
+    # Copying them into alignment would change the reference arithmetic.
+    if activation_2d.data_ptr() % 8 or weight.data_ptr() % 8:
+        return _eager_rms_gated_residual(activation, norm_weight, residual, gate, eps)
     residual_2d = residual.reshape(-1, width).contiguous()
-    if not _aligned16(activation_2d):
-        activation_2d = activation_2d.clone()
     if not _aligned16(residual_2d):
         residual_2d = residual_2d.clone()
-    weight = _gemm_vector_arg(norm_weight, activation.device, activation.dtype)
     gate = _gemm_vector_arg(gate, activation.device, activation.dtype)
     output = torch.empty_like(activation_2d)
     _C.rms_gated_residual_bf16(
