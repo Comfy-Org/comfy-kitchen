@@ -16,6 +16,15 @@ requires_hip_flash_decode = pytest.mark.skipif(
     reason="requires the HIP flash decode kernel",
 )
 
+# The hip backend's own binding contract. On gfx1010 the rdna1 backend serves decode
+# instead: it copies a misaligned operand rather than rejecting it.
+_serves_rdna1 = (getattr(flash_attention_module, "_amd", None) is not None and torch.cuda.is_available()
+                 and flash_attention_module._amd.backend_for(None)[0] == "rdna1")
+requires_hip_backend_flash_decode = pytest.mark.skipif(
+    not ck.flash_attention_decode_is_available() or not getattr(torch.version, "hip", None) or _serves_rdna1,
+    reason="requires the hip backend's flash decode kernel",
+)
+
 HEAD_DIMS = [128, 256]
 
 
@@ -38,7 +47,7 @@ def test_flash_attention_decode_rejects_host_lengths(head_dim):
     assert torch.isfinite(ck.flash_attention_decode(q, k, v, lengths).float()).all()
 
 
-@requires_hip_flash_decode
+@requires_hip_backend_flash_decode
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
 def test_flash_attention_decode_rejects_pinned_host_memory(head_dim):
     # Pinned host memory reports kDLCUDAHost rather than kDLCPU, so a check for
@@ -75,7 +84,7 @@ def test_flash_attention_decode_rejects_strided_lengths(head_dim):
         ck.flash_attention_decode(q, k, v, strided)
 
 
-@requires_hip_flash_decode
+@requires_hip_backend_flash_decode
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
 def test_flash_attention_decode_rejects_misaligned_operand(head_dim):
     q, k, v, lengths = _decode_operands(head_dim=head_dim)
@@ -268,7 +277,8 @@ def test_flash_attention_decode_concurrent_graphs(second_capacity):
 @requires_flash_decode
 @pytest.mark.parametrize(
     ("q_dim", "k_dim", "v_dim"),
-    [(64, 64, 64), (192, 192, 192), (256, 128, 128), (128, 256, 256), (256, 256, 128)],
+    [pytest.param(64, 64, 64, marks=pytest.mark.skipif(_serves_rdna1, reason="rdna1 decodes head_dim 64")),
+     (192, 192, 192), (256, 128, 128), (128, 256, 256), (256, 256, 128)],
 )
 def test_flash_attention_decode_rejects_invalid_dimensions(q_dim, k_dim, v_dim):
     q = torch.randn(1, 1, 24, q_dim, device="cuda", dtype=torch.bfloat16)

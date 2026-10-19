@@ -9,6 +9,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <hip/hip_runtime.h>
 #include <nanobind/nanobind.h>
@@ -160,6 +161,9 @@ void launch_rms_rope_kernel(const void*, const void*, const void*, const void*, 
                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int, int,
                             int, float, bool, hipStream_t);
+void launch_flash_attn(const void*, const void*, const void*, const void*, int, const int*, void*,
+                       float*, float*, int, int, int, int, int, int, int, int, const int64_t*,
+                       float, bool, hipStream_t);
 }
 
 static void check_hip_launch() {
@@ -477,8 +481,9 @@ bool fp16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias,
 }
 
 // D = (x @ w^T) + bias on packed fp16 math: x (fp32, fp16 or bf16) is scaled per row
-// into x16 (fp16 scratch, scale in row_scale) against w_amax, the largest |w|. false
-// means the caller serves the call.
+// into x16 (fp16 scratch, scale in row_scale) against w_amax, the largest |w|. Up to
+// kGemvF16MaxRows rows the GEMV also takes a bf16 or fp32 w in place. false means the
+// caller serves the call.
 bool fp16_packed_linear(nb::ndarray<> x, nb::ndarray<> w, nb::ndarray<> w_amax,
                         nb::ndarray<> x16, OptArray x16t, nb::ndarray<> row_scale, OptArray bias,
                         nb::ndarray<> d, int M, int N, int K, int out_code,
@@ -489,7 +494,8 @@ bool fp16_packed_linear(nb::ndarray<> x, nb::ndarray<> w, nb::ndarray<> w_amax,
     require_nonneg(K, kFn, "K");
     require_fp16_k(K, kFn);
     require_dtype(x, 0, 2, kFn, "x");
-    require_dtype(w, 1, 1, kFn, "w");
+    const int w_code = map_dtype_to_code(w.dtype());
+    require_dtype(w, M <= kGemvF16MaxRows ? 0 : 1, M <= kGemvF16MaxRows ? 2 : 1, kFn, "w");
     require_dtype(w_amax, 0, 0, kFn, "w_amax");
     require_dtype(x16, 1, 1, kFn, "x16");
     require_dtype(row_scale, 0, 0, kFn, "row_scale");
@@ -506,6 +512,17 @@ bool fp16_packed_linear(nb::ndarray<> x, nb::ndarray<> w, nb::ndarray<> w_amax,
     require_len(row_scale, M, kFn, "row_scale");
     require_len(d, static_cast<int64_t>(M) * N, kFn, "d");
     require_bias(bias, N, kFn);
+    if (w_code != 1) {
+        // Rows are read 16 bytes at a time.
+        if (K % 8 != 0) return false;
+        if (M > 0 && N > 0) {
+            launch_gemv_f16_kernel(x.data(), map_dtype_to_code(x.dtype()), w.data(), w_code,
+                                   opt_data(bias), opt_code(bias), d.data(), out_code, M, N, K,
+                                   reinterpret_cast<hipStream_t>(stream_ptr));
+            check_hip_launch();
+        }
+        return true;
+    }
     const bool served = launch_fp16_packed_linear_kernel(
         x.data(), map_dtype_to_code(x.dtype()), w.data(), w_amax.data(), x16.data(),
         x16t.has_value() ? x16t->data() : nullptr, row_scale.data(), opt_data(bias),
@@ -1818,6 +1835,111 @@ void rms_rope(nb::ndarray<> q, OptArray k, nb::ndarray<> freqs, nb::ndarray<> q_
     check_hip_launch();
 }
 
+// Float flash attention (ops/flash_attn.hip): q and o [B, Hq, Sq, D], k and v
+// [B, Hk, Sk, D] with Hq a multiple of Hk, any strides but a unit last one, D 64, 128 or 256.
+// q, k, v and o share fp32, fp16 or bf16. mask is an additive [B, Hq, Sq, Sk] float tensor
+// (broadcast dims as zero strides) or a uint8 keep mask; kv_lengths an int32 [B] count of
+// valid keys. With num_splits > 1 o_accum ([splits, B, Hq, Sq, D]) and lse_accum
+// ([splits, B, Hq, Sq]) are the fp32 scratch the combine pass reads.
+void flash_attention(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, OptArray mask,
+                     OptArray kv_lengths, nb::ndarray<> o, OptArray o_accum, OptArray lse_accum,
+                     int num_splits, float scale, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "flash_attention";
+    if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || o.ndim() != 4) {
+        throw std::runtime_error(std::string(kFn) + ": q, k, v and o must be 4D");
+    }
+    const int batch = static_cast<int>(q.shape(0));
+    const int heads_q = static_cast<int>(q.shape(1));
+    const int q_len = static_cast<int>(q.shape(2));
+    const int head_dim = static_cast<int>(q.shape(3));
+    const int heads_kv = static_cast<int>(k.shape(1));
+    const int kv_len = static_cast<int>(k.shape(2));
+    require_positive(batch, kFn, "batch");
+    require_positive(q_len, kFn, "q_len");
+    require_positive(kv_len, kFn, "kv_len");
+    require_positive(heads_kv, kFn, "heads_kv");
+    if ((head_dim != 64 && head_dim != 128 && head_dim != 256) || heads_q % heads_kv != 0 ||
+        static_cast<int>(k.shape(0)) != batch || static_cast<int>(k.shape(3)) != head_dim) {
+        throw std::runtime_error(std::string(kFn) + ": invalid q/k dimensions");
+    }
+    for (int d = 0; d < 4; ++d) {
+        if (v.shape(d) != k.shape(d)) throw std::runtime_error(std::string(kFn) + ": k/v shape mismatch");
+        if (o.shape(d) != q.shape(d)) throw std::runtime_error(std::string(kFn) + ": o must match q's shape");
+    }
+    const int code = map_dtype_to_code(q.dtype());
+    require_dtype(q, 0, 2, kFn, "q");
+    if (map_dtype_to_code(k.dtype()) != code || map_dtype_to_code(v.dtype()) != code ||
+        map_dtype_to_code(o.dtype()) != code) {
+        throw std::runtime_error(std::string(kFn) + ": q, k, v and o must share a dtype");
+    }
+    // Rows are read 8 elements (16 or 32 bytes) at a time and written 4 at a time.
+    const nb::ndarray<>* rowed[] = {&q, &k, &v};
+    for (const nb::ndarray<>* t : rowed) {
+        if (t->stride(3) != 1 || t->stride(0) % 8 || t->stride(1) % 8 || t->stride(2) % 8 ||
+            reinterpret_cast<uintptr_t>(t->data()) % 16) {
+            throw std::runtime_error(std::string(kFn) + ": q, k and v need a unit last stride, strides that are multiples of 8 and 16-byte aligned data");
+        }
+    }
+    if (o.stride(3) != 1 || o.stride(0) % 4 || o.stride(1) % 4 || o.stride(2) % 4 ||
+        reinterpret_cast<uintptr_t>(o.data()) % 8) {
+        throw std::runtime_error(std::string(kFn) + ": o needs a unit last stride and strides that are multiples of 4");
+    }
+    int mask_code = 0;
+    if (mask.has_value()) {
+        if (mask->ndim() != 4 || static_cast<int>(mask->shape(0)) != batch ||
+            static_cast<int>(mask->shape(1)) != heads_q || static_cast<int>(mask->shape(2)) != q_len ||
+            static_cast<int>(mask->shape(3)) != kv_len) {
+            throw std::runtime_error(std::string(kFn) + ": mask must be [B, Hq, Sq, Sk] (broadcast as zero strides)");
+        }
+        mask_code = map_dtype_to_code(mask->dtype());
+        require_code(mask_code, 0, 3, kFn, "mask dtype");
+    }
+    if (kv_lengths.has_value() &&
+        (kv_lengths->ndim() != 1 || kv_lengths->size() != static_cast<size_t>(batch) ||
+         kv_lengths->stride(0) != 1 ||
+         kv_lengths->dtype().code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) ||
+         kv_lengths->dtype().bits != 32)) {
+        throw std::runtime_error(std::string(kFn) + ": kv_lengths must be contiguous int32 [B]");
+    }
+    const size_t rows = static_cast<size_t>(batch) * heads_q * q_len;
+    if (num_splits < 1 || num_splits > 64 ||
+        (num_splits > 1 && (!o_accum.has_value() || !lse_accum.has_value() ||
+                            map_dtype_to_code(o_accum->dtype()) != 0 ||
+                            map_dtype_to_code(lse_accum->dtype()) != 0 ||
+                            o_accum->size() != rows * head_dim * num_splits ||
+                            lse_accum->size() != rows * num_splits))) {
+        throw std::runtime_error(std::string(kFn) + ": invalid split workspace");
+    }
+    // Pinned host memory reports kDLCUDAHost and is still a host pointer.
+    std::vector<const nb::ndarray<>*> operands = {&q, &k, &v, &o};
+    if (mask.has_value()) operands.push_back(&*mask);
+    if (kv_lengths.has_value()) operands.push_back(&*kv_lengths);
+    if (num_splits > 1) {
+        operands.push_back(&*o_accum);
+        operands.push_back(&*lse_accum);
+    }
+    for (const nb::ndarray<>* t : operands) {
+        if (t->device_type() != nb::device::rocm::value || t->device_id() != q.device_id()) {
+            throw std::runtime_error(std::string(kFn) + ": every operand must be ROCm device memory on q's device");
+        }
+    }
+    const int64_t strides[16] = {
+        q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2), o.stride(0), o.stride(1), o.stride(2),
+        mask.has_value() ? mask->stride(0) : 0, mask.has_value() ? mask->stride(1) : 0,
+        mask.has_value() ? mask->stride(2) : 0, mask.has_value() ? mask->stride(3) : 0};
+    launch_flash_attn(
+        q.data(), k.data(), v.data(), opt_data(mask), mask_code,
+        kv_lengths.has_value() ? static_cast<const int*>(kv_lengths->data()) : nullptr, o.data(),
+        num_splits > 1 ? static_cast<float*>(o_accum->data()) : nullptr,
+        num_splits > 1 ? static_cast<float*>(lse_accum->data()) : nullptr, batch, heads_kv,
+        heads_q / heads_kv, q_len, kv_len, head_dim, num_splits, code, strides, scale,
+        // one-wave blocks when a wave holds every row (16 at HD 64, 8 at HD 128)
+        static_cast<int64_t>(heads_q / heads_kv) * q_len <= 32 / (head_dim / 16) * 2,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
 void gemv_awq_w4a16(nb::ndarray<> x, nb::ndarray<> qweight, nb::ndarray<> wscales,
                     nb::ndarray<> wzeros, OptArray bias, nb::ndarray<> out, int M, int N, int K,
                     int group_size, uintptr_t stream_ptr) {
@@ -2905,6 +3027,10 @@ NB_MODULE(_C, m) {
           nb::arg("front"), nb::arg("silu"), nb::arg("zero_pad"), nb::arg("stream_ptr"));
     m.def("apply_rope", &apply_rope);
     m.def("rms_rope", &rms_rope);
+    m.def("flash_attention", &flash_attention, nb::arg("q"), nb::arg("k"), nb::arg("v"),
+          nb::arg("mask").none(), nb::arg("kv_lengths").none(), nb::arg("o"),
+          nb::arg("o_accum").none(), nb::arg("lse_accum").none(), nb::arg("num_splits"),
+          nb::arg("scale"), nb::arg("stream_ptr"));
     m.def("gemv_awq_w4a16", &gemv_awq_w4a16);
     m.def("svdquant_lora_down", &svdquant_lora_down);
     m.def("svdquant_quantize", &svdquant_quantize);

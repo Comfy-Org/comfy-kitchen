@@ -13,12 +13,12 @@
 
 extern "C" {
 
-// out[M, N] = x[M, K] @ w[N, K]^T + bias in fp32 math over a fp16 weight, for
-// M <= kGemvF16MaxRows. K is a multiple of 8. See ops/gemv_f16.hip.
+// out[M, N] = x[M, K] @ w[N, K]^T + bias in fp32 math over an fp16, bf16 or fp32 weight
+// (w_code), for M <= kGemvF16MaxRows. K is a multiple of 8. See ops/gemv_f16.hip.
 constexpr int kGemvF16MaxRows = 8;
-void launch_gemv_f16_kernel(const void* x, int x_code, const void* w, const void* bias,
-                            int bias_code, void* d, int out_code, int M, int N, int K,
-                            hipStream_t stream);
+void launch_gemv_f16_kernel(const void* x, int x_code, const void* w, int w_code,
+                            const void* bias, int bias_code, void* d, int out_code, int M, int N,
+                            int K, hipStream_t stream);
 
 // c[M, N] = (a[M, K] @ b[N, K]^T) * scale_a * scale_b + bias over e4m3 bytes, for M <= 8.
 // K is a multiple of 16. See ops/gemv_fp8.hip.

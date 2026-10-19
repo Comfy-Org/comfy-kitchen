@@ -338,7 +338,7 @@ extern "C" bool launch_fp16_packed_linear_kernel(
         return false;
     }
     if (M <= kGemvF16MaxRows) {
-        launch_gemv_f16_kernel(x, x_code, w, bias, bias_code, d, out_code, M, N, K, stream);
+        launch_gemv_f16_kernel(x, x_code, w, kF16, bias, bias_code, d, out_code, M, N, K, stream);
         return true;
     }
     auto* xh = static_cast<__half*>(x16);

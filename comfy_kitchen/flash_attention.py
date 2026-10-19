@@ -3,12 +3,15 @@ from __future__ import annotations
 import math
 
 import torch
+from torch.nn import functional
 
 from .backends import cuda as _cuda_backend
 
 if getattr(torch.version, "hip", None):
+    from .backends import amd as _amd
     from .backends import hip as _hip_backend
 else:
+    _amd = None
     _hip_backend = None
 
 _MINIMUM_CAPABILITY = (8, 0)
@@ -27,7 +30,8 @@ def is_available(device: torch.device | None = None) -> bool:
         # loaded. Ask the HIP backend instead, which answers for the process
         # rather than for one device: its arch gates take the intersection over
         # every visible device, the way int8 attention and the op registry do.
-        return _hip_backend.flash_attention_decode_is_available()
+        # rdna1 serves gfx1010 with its float flash attention kernel.
+        return _amd.backend_for(device)[1].flash_attention_decode_is_available()
     if (
         not _cuda_backend._EXT_AVAILABLE
         or _cuda_backend._C is None
@@ -62,10 +66,16 @@ def flash_attention_decode(
 ) -> torch.Tensor:
     """Decode BF16 [batch, 1, heads, head_dim] queries over a fixed KV cache.
 
-    CUDA and HIP support head dimensions 128 and 256.
+    CUDA and HIP support head dimensions 128 and 256; rdna1 (gfx1010) runs its float
+    flash attention instead (fp32, fp16 or bf16, head dims 64 and 128), in q's dtype.
     """
     batch, _, query_heads, head_dim = q.shape
     _, kv_capacity, kv_heads, _ = k.shape
+    if _amd is not None and _amd.backend_for(q.device)[0] == "rdna1":
+        # seq-first views of the cache: the kernel takes any strides
+        out = _amd.rdna1.flash_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                                         kv_lengths=kv_lengths)
+        return out.transpose(1, 2)
     if not is_available(q.device):
         raise RuntimeError(
             "flash_attention_decode requires the HIP extension on an AMD device "
@@ -104,7 +114,7 @@ def flash_attention_decode(
     else:
         softmax_lse_accum = output_accum = softmax_lse[:0]
     if _hip_backend is not None:
-        _hip_backend.flash_decode(
+        _amd.backend_for(q.device)[1].flash_decode(
             query, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum,
             num_splits,
         )
@@ -251,3 +261,38 @@ def flash_attention_decode_step_merge(
         torch.cuda.current_stream(q.device).cuda_stream,
     )
     return merged
+
+
+def float_attention_is_available(q: torch.Tensor, k: torch.Tensor) -> bool:
+    """Whether float_attention runs a native kernel for these operands: rdna1 (gfx1010)
+    for fp32, fp16 and bf16 at head dims 64 and 128."""
+    return (_amd is not None and _amd.backend_for(q.device)[0] == "rdna1"
+            and _amd.rdna1.flash_attention_supported(q, k))
+
+
+def float_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    scale: float | None = None,
+    kv_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Exact softmax(q k^T * scale + mask) v for q [B, Hq, Sq, D] over k, v [B, Hk, Sk, D]
+    with Hq a multiple of Hk (GQA), in q's dtype. attn_mask broadcasts to [B, Hq, Sq, Sk],
+    additive or bool (True attends); kv_lengths (int32 [B]) limits each batch to its first
+    keys. A row that attends no key is 0. The native kernel (float_attention_is_available)
+    computes fp32 inputs in fp32; elsewhere this is torch's SDPA."""
+    if float_attention_is_available(q, k):
+        return _amd.rdna1.flash_attention(q, k, v, attn_mask=attn_mask, scale=scale, kv_lengths=kv_lengths)
+    if kv_lengths is not None:
+        keep = torch.arange(k.shape[2], device=q.device) < kv_lengths.view(-1, 1, 1, 1)
+        if attn_mask is None:
+            attn_mask = keep
+        elif attn_mask.dtype == torch.bool:
+            attn_mask = attn_mask & keep
+        else:
+            attn_mask = attn_mask.masked_fill(~keep, float("-inf"))
+    out = functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=scale,
+                                                  enable_gqa=q.shape[1] != k.shape[1])
+    return out.nan_to_num(0.0) if attn_mask is not None else out

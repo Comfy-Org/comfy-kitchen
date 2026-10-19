@@ -20,6 +20,7 @@ from .flash_attention import flash_attention_decode
 from .flash_attention import is_available as flash_attention_decode_is_available
 from .flash_attention import flash_attention_decode_gqa, flash_attention_decode_gqa_is_available
 from .flash_attention import flash_attention_decode_step_merge
+from .flash_attention import float_attention, float_attention_is_available
 from .float_utils import from_blocked, swap_nibbles, to_blocked
 from .gated_delta import deltanet_conv_step, gated_delta_decode_fused
 from .gated_delta import is_available as gated_delta_decode_is_available
@@ -133,6 +134,8 @@ __all__ = [
     "direct_conv3d",
     "fp32_winograd_conv2d",
     "fp32_winograd_conv_transpose2d",
+    "float_attention",
+    "float_attention_is_available",
     "fp16_packed_linear",
     "q8_0_linear",
     "q4_k_linear",

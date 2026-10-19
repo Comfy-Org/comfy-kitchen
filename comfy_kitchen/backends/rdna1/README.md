@@ -94,11 +94,16 @@ here.
 
 - NA3D, Sage INT8 and Sol attention on a software 16x16 tile policy (`mma.h`), plus an
   fp16-FMA Sage kernel for unmasked head_dim 64/128 and `int8_block_sparse_attention`.
+- Float flash attention (`float_attention`, and `flash_attention_decode` over a KV cache):
+  fp32/bf16 in fp32 math, fp16 with exact products, head_dim 64/128/256, GQA, additive or
+  bool masks, per-batch KV lengths (`ops/flash_attn.hip`). Prefill reaches 2.9-3.1 TFLOPS
+  in fp32 and 3.8 in fp16 (1.2-1.9x torch's SDPA); decode streams the cache at 210-240 GB/s
+  from 9k tokens.
 - W4A8 linears take the `hip` backend's fused input activation and scaled residual.
 - Elementwise kernels: fp8/int8 quantize, RoPE, RMS-RoPE, AdaLN, GroupNorm+SiLU+pad.
 
-Not provided: NA2D, flash decode and the GatedDeltaNet decode (the last two need bf16
-arithmetic), and the NVFP4 and MXFP8 layouts. Those fall through to eager. Where the
+Not provided: NA2D, the GatedDeltaNet decode (it needs bf16 arithmetic), the head-first
+GQA decode (`flash_attention_decode_gqa`, torch here), and the NVFP4 and MXFP8 layouts. Those fall through to eager. Where the
 fused ConvRot quantizer cannot take K, the activation is rotated eagerly and quantized
 onto this backend's GEMM.
 
@@ -107,7 +112,7 @@ onto this backend's GEMM.
 The backend registers as `rdna1` when a gfx1010 is visible, and every op's call rule
 declines tensors on any other device, so it sits beside `hip` in one process. Where
 it registers, priority is `rdna1 -> hip -> eager`; Triton is left out. Calls that
-bypass the registry (fp8 `scaled_mm_v2`, Sage attention, `sol_attn_chunked`) resolve
+bypass the registry (fp8 `scaled_mm_v2`, Sage and float attention, `sol_attn_chunked`) resolve
 per device through `comfy_kitchen/backends/amd.py`. `COMFY_KITCHEN_DISABLE_RDNA1=1`
 removes the backend.
 
@@ -117,7 +122,8 @@ removes the backend.
 cd comfy-kitchen
 COMFY_HIP_ARCHS="gfx1010" python setup.py build_ext --inplace
 HIP_VISIBLE_DEVICES=0 python -m pytest -o addopts="" tests/test_rdna1.py \
-    tests/test_fp16_packed_linear.py tests/test_fp16_conv3d.py tests/test_int8_attention.py
+    tests/test_fp16_packed_linear.py tests/test_fp16_conv3d.py tests/test_int8_attention.py \
+    tests/test_float_attention.py tests/test_flash_attention.py
 ```
 
 The INT8 references in `tests/test_rdna1.py` run eager with an exact fp32 matmul in

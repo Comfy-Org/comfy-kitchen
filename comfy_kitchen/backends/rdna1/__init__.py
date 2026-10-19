@@ -798,7 +798,8 @@ def fp16_packed_linear(
     products (_PACKED_STAGE_PRODUCTS), stored as ``out_dtype`` (x's dtype by default). x (any float dtype, any range) is scaled per
     row by a power of two against ``weight_amax`` (the largest |weight|, computed when
     not given) so no fp16 partial sum overflows. Up to 8 rows run a GEMV in fp32 math over
-    the fp16 weight instead, and 9 to 16 rows over a large weight run it twice: the short-M
+    the weight instead, which also takes a bf16 or fp32 weight in place (exact in fp32, so
+    decode casts no weight), and 9 to 16 rows over a large weight run it twice: the short-M
     GEMM tiles fetch the weight at a fraction of the GEMV's rate (1.2-2.2x measured from
     2**24 weight elements). Shapes the kernel declines run torch."""
     out_dtype = x.dtype if out_dtype is None else out_dtype
@@ -813,7 +814,7 @@ def fp16_packed_linear(
     if bias is not None:
         bias = bias.to(device=x.device)
     if (
-        weight.dtype == torch.float16
+        (weight.dtype == torch.float16 or (m <= 8 and weight.dtype in (torch.bfloat16, torch.float32)))
         and weight.device == x.device
         and weight.is_contiguous()
         and weight.data_ptr() % 16 == 0
@@ -2655,6 +2656,84 @@ def apply_rope_(
     return _rope_pair(xq, xk, freqs_cis, False, inplace=True)
 
 
+def flash_attention_decode_is_available() -> bool:
+    return is_available()
+
+
+_FLASH_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+def flash_attention_supported(q: torch.Tensor, k: torch.Tensor) -> bool:
+    """Whether flash_attention runs the kernel for these operands rather than torch."""
+    return (q.dtype in _FLASH_DTYPES and k.dtype == q.dtype and q.shape[-1] in (64, 128, 256)
+            and q.ndim == 4 and q.shape[1] % k.shape[1] == 0 and serves(q.device))
+
+
+@functools.cache
+def _compute_units(device: torch.device) -> int:
+    # torch reports gfx10 WGPs, two CUs each
+    return 2 * torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _flash_rows_ready(t: torch.Tensor) -> torch.Tensor:
+    # the kernel reads rows 8 elements at a time off 16-byte aligned bases
+    if t.stride(-1) != 1 or any(s % 8 for s in t.stride()[:-1]) or t.data_ptr() % 16:
+        return t.contiguous()
+    return t
+
+
+def flash_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    scale: float | None = None,
+    kv_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """softmax(q k^T * scale + mask) v for q [B, Hq, Sq, D] over k, v [B, Hk, Sk, D], Hq a
+    multiple of Hk (GQA), in q's dtype. See ops/flash_attn.hip: fp32 and bf16 run exact
+    fp32 math, fp16 exact products with fp32 sums. attn_mask broadcasts to
+    [B, Hq, Sq, Sk], additive or bool (True attends). kv_lengths (int32 [B], on the device)
+    limits each batch to its first keys. A row that attends no key is 0. The result is
+    laid out [B, Sq, Hq, D] in memory, so its transpose(1, 2) reshapes to [B, Sq, Hq * D]
+    without a copy."""
+    batch, heads_q, q_len, head_dim = q.shape
+    heads_kv, kv_len = k.shape[1], k.shape[2]
+    q, k, v = _flash_rows_ready(q), _flash_rows_ready(k), _flash_rows_ready(v)
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_mask = attn_mask.view(torch.uint8)
+        while attn_mask.ndim < 4:
+            attn_mask = attn_mask.unsqueeze(0)
+        attn_mask = attn_mask.expand(batch, heads_q, q_len, kv_len)
+    out = torch.empty((batch, q_len, heads_q, head_dim), dtype=q.dtype, device=q.device).transpose(1, 2)
+
+    # mirrors ops/flash_attn.hip: a wave holds 16 rows at HD 64, 8 at 128 and 4 at 256. Rows that
+    # fit one wave at HD 64 and 128 run the direct kernel, one wave per KV head and split, over 16-key
+    # steps, which needs ~8 waves a CU to cover its global loads; otherwise blocks of four
+    # waves stage 16 KiB tiles of K and V.
+    rows = (heads_q // heads_kv) * q_len
+    rows_per_wave = 32 // (head_dim // 16) * 2
+    if rows <= rows_per_wave and head_dim <= 128:
+        blocks, target, steps = batch * heads_kv, 8 * _compute_units(q.device), -(-kv_len // 16)
+    else:
+        blocks = -(-rows // (4 * rows_per_wave)) * batch * heads_kv
+        tile = (64 if q.dtype == torch.float16 else 32) * 128 // max(head_dim, 128)
+        target, steps = 2 * _compute_units(q.device), -(-kv_len // tile)
+    num_splits = max(1, min(64, steps, -(-target // blocks))) if blocks < target else 1
+    o_accum = lse_accum = None
+    if num_splits > 1:
+        o_accum = torch.empty((num_splits, batch, heads_q, q_len, head_dim), dtype=torch.float32, device=q.device)
+        lse_accum = torch.empty((num_splits, batch, heads_q, q_len), dtype=torch.float32, device=q.device)
+    _C.flash_attention(
+        _dl(q), _dl(k), _dl(v), None if attn_mask is None else _dl(attn_mask),
+        None if kv_lengths is None else _dl(kv_lengths), _dl(out),
+        None if o_accum is None else _dl(o_accum), None if lse_accum is None else _dl(lse_accum),
+        num_splits, head_dim ** -0.5 if scale is None else float(scale), _stream(q),
+    )
+    return out
+
+
 def apply_rope_split_half1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return _rope(x, None, freqs_cis, True)[0]
 
@@ -3551,9 +3630,8 @@ def _build_constraints() -> dict:
         "fp16_packed_linear": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=floats, shape_rules=(MinDims(2),)),
-                "weight": ParamConstraint(
-                    dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(2),)
-                ),
+                # bf16 and fp32 weights reach the GEMV only (up to 8 rows); larger x runs eager
+                "weight": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
                 "bias": ParamConstraint(dtypes=floats),
             },
             default_devices=dev,

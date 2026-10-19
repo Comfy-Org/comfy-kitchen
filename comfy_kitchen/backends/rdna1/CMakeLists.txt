@@ -123,6 +123,7 @@ set(HIP_SOURCES
     sage_attention/sol_attn_token.hip
     ops/apply_rope.hip
     ops/rms_rope.hip
+    ops/flash_attn.hip
     ops/gemv_awq.hip
     ops/svdquant_w4a4.hip
     ops/w4a8_dequant.hip
