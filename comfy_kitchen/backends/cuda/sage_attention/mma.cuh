@@ -785,14 +785,16 @@ __device__ __forceinline__ uint32_t pack_u8x4(float a, float b, float c,
   return packed;
 }
 
-/*! \brief pack_u8x4 off the XU pipe below sm_89, same bytes for every input.
+/*! \brief pack_u8x4 off the XU pipe below sm_86, same bytes for every input.
  *
  * The clamp saturates (and maps NaN to 0, like cvt.rni); adding 2^23 rounds to nearest even
- * into the low byte. sm_89+ keeps pack_u8x4.
+ * into the low byte. From sm_86 on the cvt pair becomes F2IP, which is not XU-bound and packs
+ * faster than any arithmetic form (A6000, sm_86 cubin: 23.8 vs 19.3 four-value packs per SM per
+ * clock), so pack_u8x4 stays.
  */
 __device__ __forceinline__ uint32_t pack_u8x4_exact(float a, float b, float c,
                                                     float d) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 860
   const uint32_t qa = __float_as_uint(fminf(fmaxf(a, 0.f), 255.f) + 8388608.0f);
   const uint32_t qb = __float_as_uint(fminf(fmaxf(b, 0.f), 255.f) + 8388608.0f);
   const uint32_t qc = __float_as_uint(fminf(fmaxf(c, 0.f), 255.f) + 8388608.0f);
@@ -806,7 +808,7 @@ __device__ __forceinline__ uint32_t pack_u8x4_exact(float a, float b, float c,
 /*! \brief pack_u8x4_exact for inputs >= 0 and not NaN: no clamp at 0. */
 __device__ __forceinline__ uint32_t pack_u8x4_exact_nonneg(float a, float b, float c,
                                                            float d) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 860
   const uint32_t qa = __float_as_uint(fminf(a, 255.f) + 8388608.0f);
   const uint32_t qb = __float_as_uint(fminf(b, 255.f) + 8388608.0f);
   const uint32_t qc = __float_as_uint(fminf(c, 255.f) + 8388608.0f);
