@@ -16,7 +16,7 @@ requires_hip_flash_decode = pytest.mark.skipif(
     reason="requires the HIP flash decode kernel",
 )
 
-HEAD_DIMS = [128, 256]
+HEAD_DIMS = [64, 128, 256]
 
 
 def _decode_operands(batch=2, capacity=256, kv_heads=2, groups=4, head_dim=128):
@@ -82,17 +82,27 @@ def test_flash_attention_decode_rejects_misaligned_operand(head_dim):
     elements = k.numel()
     storage = torch.randn(elements + 8, device="cuda", dtype=torch.bfloat16)
     misaligned = storage[1 : 1 + elements].view_as(k)
-    assert misaligned.is_contiguous() and misaligned.data_ptr() % 8
-    with pytest.raises(RuntimeError, match="8-byte aligned"):
+    load_bytes = 4 if head_dim == 64 else 8
+    assert misaligned.is_contiguous() and misaligned.data_ptr() % load_bytes
+    with pytest.raises(RuntimeError, match=f"{load_bytes}-byte aligned"):
         ck.flash_attention_decode(q, misaligned, v, lengths)
 
 
 @requires_hip_flash_decode
-def test_flash_attention_decode_256_with_eight_byte_alignment():
-    q, k, v, lengths = _decode_operands(head_dim=256)
-    storage = torch.randn(k.numel() + 4, device="cuda", dtype=torch.bfloat16)
-    k = storage[4:].view_as(k)
-    assert k.data_ptr() % 16 == 8
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("padded_rows", [False, True])
+def test_flash_attention_decode_with_minimum_load_alignment(head_dim, padded_rows):
+    q, k, v, lengths = _decode_operands(head_dim=head_dim)
+    elems_per_load = 2 if head_dim == 64 else 4
+    padding = elems_per_load if padded_rows else 0
+    shape = (*k.shape[:-1], head_dim + padding)
+    elements = k.shape[0] * k.shape[1] * k.shape[2] * shape[-1]
+    storage = torch.randn(elements + elems_per_load, device="cuda", dtype=torch.bfloat16)
+    k = storage[elems_per_load:].view(shape)[..., :head_dim]
+    v_storage = torch.randn_like(storage)
+    v = v_storage[elems_per_load:].view(shape)[..., :head_dim]
+    load_bytes = elems_per_load * k.element_size()
+    assert k.data_ptr() % (2 * load_bytes) == load_bytes
     actual = ck.flash_attention_decode(q, k, v, lengths)
     torch.testing.assert_close(actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
 
@@ -167,7 +177,7 @@ def test_flash_attention_decode_hip_gate_follows_bf16_arch(monkeypatch, has_wmma
 @requires_flash_decode
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
 @pytest.mark.parametrize(("heads", "kv_heads"), [(4, 4), (8, 2), (24, 4), (32, 4)])
-@pytest.mark.parametrize("capacity", [257, 32768])
+@pytest.mark.parametrize("capacity", [128, 257, 32768])
 @pytest.mark.parametrize("transposed_cache", [False, True])
 def test_flash_attention_decode(head_dim, heads, kv_heads, capacity, transposed_cache):
     torch.manual_seed(0)
@@ -184,7 +194,7 @@ def test_flash_attention_decode(head_dim, heads, kv_heads, capacity, transposed_
 
 @requires_flash_decode
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
-@pytest.mark.parametrize("num_splits", [1, 2, 5, 8, 16, 32])
+@pytest.mark.parametrize("num_splits", [1, 2, 4, 5, 8, 16, 32])
 def test_flash_attention_decode_split_counts(monkeypatch, num_splits, head_dim):
     # num_splits comes from a heuristic over multi_processor_count, so on a wide
     # enough GPU it returns 1 and the split accumulators, the combine pass and
@@ -195,6 +205,19 @@ def test_flash_attention_decode_split_counts(monkeypatch, num_splits, head_dim):
     k = torch.randn(3, 257, 4, head_dim, device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
     lengths = torch.tensor([1, 73, 257], device="cuda", dtype=torch.int32)
+    actual = ck.flash_attention_decode(q, k, v, lengths)
+    torch.testing.assert_close(actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
+
+
+@requires_flash_decode
+@pytest.mark.parametrize("groups", [1, 3, 9])
+@pytest.mark.parametrize("num_splits", [2, 32])
+def test_flash_attention_decode_64_partial_merge_tile(monkeypatch, groups, num_splits):
+    torch.manual_seed(0)
+    monkeypatch.setattr(flash_attention_module, "_num_splits", lambda *_, **__: num_splits)
+    q, k, v, lengths = _decode_operands(
+        batch=1, capacity=257, kv_heads=1, groups=groups, head_dim=64
+    )
     actual = ck.flash_attention_decode(q, k, v, lengths)
     torch.testing.assert_close(actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
 
@@ -268,7 +291,11 @@ def test_flash_attention_decode_concurrent_graphs(second_capacity):
 @requires_flash_decode
 @pytest.mark.parametrize(
     ("q_dim", "k_dim", "v_dim"),
-    [(64, 64, 64), (192, 192, 192), (256, 128, 128), (128, 256, 256), (256, 256, 128)],
+    [
+        (32, 32, 32), (96, 96, 96), (192, 192, 192),
+        (64, 128, 128), (128, 64, 64), (64, 64, 128), (128, 128, 64),
+        (256, 128, 128), (128, 256, 256), (256, 256, 128),
+    ],
 )
 def test_flash_attention_decode_rejects_invalid_dimensions(q_dim, k_dim, v_dim):
     q = torch.randn(1, 1, 24, q_dim, device="cuda", dtype=torch.bfloat16)

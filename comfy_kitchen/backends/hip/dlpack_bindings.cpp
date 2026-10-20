@@ -1813,14 +1813,13 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
 // BF16 decode attention. Every extent below is derived from the operands rather
 // than taken from the caller, and the kernel indexes with the strides passed
 // here, so a mismatch is an out-of-bounds device access. Mirrors the checks in
-// the CUDA binding and adds the two the HIP kernel needs: it reads four
+// the CUDA binding and adds the two the HIP kernel needs: it reads two or four
 // elements at a time, and it addresses the output with q's strides.
 void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
                             nb::ndarray<> kv_lengths, nb::ndarray<> output,
                             nb::ndarray<> softmax_lse, nb::ndarray<> softmax_lse_accum,
                             nb::ndarray<> output_accum, int num_splits, uintptr_t stream_ptr) {
     constexpr const char* kFn = "flash_attention_decode";
-    constexpr int kElemsPerLoad = 4;
     if (q.ndim() != 3 || k.ndim() != 4 || v.ndim() != 4 || output.ndim() != 3 ||
         kv_lengths.ndim() != 1) {
         throw std::runtime_error(std::string(kFn) + ": operand rank mismatch");
@@ -1833,9 +1832,10 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
     require_positive(heads, kFn, "heads");
     const int query_length = static_cast<int>(q.shape(0)) / batch;
     const int head_dim = static_cast<int>(q.shape(2));
+    const int elems_per_load = head_dim == 64 ? 2 : 4;
     require_positive(query_length, kFn, "query_length");
     if (static_cast<int64_t>(q.shape(0)) != static_cast<int64_t>(batch) * query_length ||
-        static_cast<int>(q.shape(1)) != heads || (head_dim != 128 && head_dim != 256) ||
+        static_cast<int>(q.shape(1)) != heads || (head_dim != 64 && head_dim != 128 && head_dim != 256) ||
         static_cast<int>(k.shape(3)) != head_dim) {
         throw std::runtime_error(std::string(kFn) + ": invalid q/k dimensions");
     }
@@ -1886,21 +1886,23 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
     if (output.stride(0) != q.stride(0) || output.stride(1) != q.stride(1)) {
         throw std::runtime_error(std::string(kFn) + ": output strides must match q");
     }
-    // Rows are read four elements at a time, so every row start has to stay on
+    // Rows are read two or four elements at a time, so every row start has to stay on
     // that boundary.
     const int64_t vectored[] = {q.stride(0), q.stride(1), k.stride(0), k.stride(1), k.stride(2)};
     for (int64_t stride : vectored) {
-        if (stride % kElemsPerLoad != 0) {
-            throw std::runtime_error(std::string(kFn) + ": strides must be a multiple of 4");
+        if (stride % elems_per_load != 0) {
+            throw std::runtime_error(std::string(kFn) + ": strides must be a multiple of " +
+                                     std::to_string(elems_per_load));
         }
     }
     // A view carries a byte offset, so operands with aligned strides can still
-    // begin off the boundary the four-element load needs.
-    constexpr uintptr_t kLoadBytes = kElemsPerLoad * sizeof(uint16_t);
+    // begin off the boundary the vector load needs.
+    const uintptr_t load_bytes = elems_per_load * sizeof(uint16_t);
     const void* row_starts[] = {q.data(), k.data(), v.data(), output.data()};
     for (const void* base : row_starts) {
-        if (reinterpret_cast<uintptr_t>(base) % kLoadBytes != 0) {
-            throw std::runtime_error(std::string(kFn) + ": q, k, v and output must be 8-byte aligned");
+        if (reinterpret_cast<uintptr_t>(base) % load_bytes != 0) {
+            throw std::runtime_error(std::string(kFn) + ": q, k, v and output must be " +
+                                     std::to_string(load_bytes) + "-byte aligned");
         }
     }
     // The launcher takes raw pointers, so anything but ROCm device memory would

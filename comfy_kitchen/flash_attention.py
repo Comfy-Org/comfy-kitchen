@@ -62,7 +62,7 @@ def flash_attention_decode(
 ) -> torch.Tensor:
     """Decode BF16 [batch, 1, heads, head_dim] queries over a fixed KV cache.
 
-    CUDA and HIP support head dimensions 128 and 256.
+    CUDA and HIP support head dimensions 64, 128 and 256.
     """
     batch, _, query_heads, head_dim = q.shape
     _, kv_capacity, kv_heads, _ = k.shape
@@ -81,11 +81,13 @@ def flash_attention_decode(
         .reshape(batch * groups, kv_heads, head_dim)
     )
     output = torch.empty_like(query)
+    # Match the CUDA split-KV tile width; HIP uses the same estimate for every head size.
+    block_n = 128 if _hip_backend is not None else {64: 256, 128: 128, 256: 64}.get(head_dim, 128)
     num_splits = _num_splits(
         batch * kv_heads,
         kv_capacity,
         torch.cuda.get_device_properties(q.device).multi_processor_count,
-        64 if head_dim == 256 and _hip_backend is None else 128,
+        block_n,
     )
     softmax_lse = torch.empty(batch * kv_heads * groups, dtype=torch.float32, device=q.device)
     if num_splits > 1:

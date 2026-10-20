@@ -4225,7 +4225,7 @@ void flash_attention_decode(
     const int heads = k.shape(2);
     const int query_length = q.shape(0) / batch;
     const int head_dim = q.shape(2);
-    if (batch <= 0 || kv_capacity <= 0 || heads <= 0 || query_length <= 0 || q.shape(0) != batch * query_length || q.shape(1) != heads || (head_dim != 128 && head_dim != 256)) {
+    if (batch <= 0 || kv_capacity <= 0 || heads <= 0 || query_length <= 0 || q.shape(0) != batch * query_length || q.shape(1) != heads || (head_dim != 64 && head_dim != 128 && head_dim != 256)) {
         throw std::runtime_error("Invalid Flash Attention decode dimensions");
     }
     if (v.shape(0) != batch || v.shape(1) != kv_capacity || v.shape(2) != heads || v.shape(3) != head_dim || k.shape(3) != head_dim) {
