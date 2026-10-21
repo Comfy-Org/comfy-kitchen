@@ -60,11 +60,13 @@ __forceinline__ __device__ float ptx_exp2(float x) {
 /*!
  * \brief int32 -> FP32, exact for |x| <= 2^22.
  *
- * Below sm_89 I2F shares the XU pipe with the softmax's ex2, so this adds x to the bits of
- * 1.5 * 2^23 and subtracts 1.5 * 2^23 instead. sm_89+ already converts on the FMA pipe.
+ * sm_75 and sm_80 convert with I2F on the XU pipe, which the softmax's ex2 already saturates, so
+ * there this adds x to the bits of 1.5 * 2^23 and subtracts 1.5 * 2^23 instead. From sm_86 on
+ * ptxas emits I2FP, which is not XU-bound and beats the two-instruction form (A6000, elements per
+ * SM per clock: sm_86 cubin 28.3 vs 24.3, sm_80 cubin 15.6 vs 29.3).
  */
 __forceinline__ __device__ float i2f_exact(int32_t x) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 860
   return __int_as_float(x + 0x4B400000) - 12582912.0f;
 #else
   return __int2float_rn(x);
