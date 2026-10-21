@@ -184,14 +184,13 @@ def gated_delta_decode_deferred(
     gates_buf: torch.Tensor,
     sumsq_buf: torch.Tensor,
     ctl: torch.Tensor,
-    tree: int = 0,
 ) -> torch.Tensor:
-    """S GatedDeltaNet decode steps from qkv_buf[ctl[1]] written by deltanet_conv_step_deferred.
+    """1, 4 or 8 GatedDeltaNet rows from qkv_buf[ctl[1]] written by deltanet_conv_step_deferred.
 
     Replays the `ctl[0]` accepted tokens of the previous step from the [1 - parity] side
     buffers (at the slots named by ctl), writes the committed fp32 state [B, Hv, DK, DV] in
-    place, then returns the outputs of the S current rows without committing them. tree != 0
-    runs the rows through ctl's program (entry = row | commit << 5, in depth-first order: a
+    place, then returns the outputs of the S current rows without committing them. Runs
+    the rows through ctl's program (entry = row | commit << 5, in depth-first order: a
     chain row commits, the leaves off it then run without committing) instead of as a straight
     chain; a row's ancestors are ctl's parent[]
     (see deltanet_conv_step_deferred). State, dt_bias and g_decay must be contiguous.
@@ -201,20 +200,20 @@ def gated_delta_decode_deferred(
     z = z.reshape(batch, seq, heads * value_dim)
     if not deferred_is_available(x.device, key_dim_head, value_dim):
         return _decode_deferred_torch(x, w_a, w_b, dt_bias, g_decay, state, key_dim, num_key_heads, scale,
-                                      z, norm_weight, eps, qkv_buf, gates_buf, sumsq_buf, ctl, tree)
+                                      z, norm_weight, eps, qkv_buf, gates_buf, sumsq_buf, ctl)
     out = torch.empty((batch, seq, heads, value_dim), dtype=x.dtype, device=x.device)
     if _hip_backend is not None:
         ok = _hip_backend.gated_delta_decode_deferred(
             x.contiguous(), w_a.contiguous(), w_b.contiguous(), dt_bias, g_decay,
             qkv_buf, gates_buf, sumsq_buf, ctl, state, out, z, norm_weight.contiguous(), eps,
-            key_dim, num_key_heads, scale, tree)
+            key_dim, num_key_heads, scale)
     else:
         wrap = _cuda_backend._wrap_for_dlpack
         ok = _cuda_backend._C.gated_delta_decode_deferred(
             wrap(x.contiguous()), wrap(w_a.contiguous()), wrap(w_b.contiguous()),
             wrap(dt_bias), wrap(g_decay), wrap(qkv_buf), wrap(gates_buf), wrap(sumsq_buf), wrap(ctl),
             wrap(state), wrap(out), wrap(z), wrap(norm_weight.contiguous()), eps,
-            key_dim, num_key_heads, scale, tree,
+            key_dim, num_key_heads, scale,
             torch.cuda.current_stream(x.device).cuda_stream,
         )
     if not ok:
@@ -223,7 +222,7 @@ def gated_delta_decode_deferred(
 
 
 def _decode_deferred_torch(x, w_a, w_b, dt_bias, g_decay, state, key_dim, num_key_heads, scale,
-                           z, norm_weight, eps, qkv_buf, gates_buf, sumsq_buf, ctl, tree):
+                           z, norm_weight, eps, qkv_buf, gates_buf, sumsq_buf, ctl):
     # the kernel's semantics in torch ops only, rounding where it rounds; ctl stays on its
     # device, so the pending replay runs all SLOT_MAX slots with the gates of the slots past
     # `pending` neutralized (decay 1, beta 0)
@@ -285,18 +284,14 @@ def _decode_deferred_torch(x, w_a, w_b, dt_bias, g_decay, state, key_dim, num_ke
     state.copy_(st)
 
     q, k = normalized(cur_q, cur_k, cur_ss)
-    if tree:
-        for e in range(seq):
-            row = (prog[e] & 15).view(1)
-            commit = (prog[e] & 32) != 0
-            n, o = step(st, q.index_select(3, row)[..., 0], k.index_select(3, row)[..., 0],
-                        cur_v.index_select(3, row)[..., 0],
-                        decay.index_select(1, row)[:, 0], beta.index_select(1, row)[:, 0])
-            st = torch.where(commit, n, st)
-            oc.index_copy_(1, row, o.unsqueeze(1))
-    else:
-        for s in range(seq):
-            st, oc[:, s] = step(st, q[..., s], k[..., s], cur_v[..., s], decay[:, s], beta[:, s])
+    for e in range(seq):
+        row = (prog[e] & 15).view(1)
+        commit = (prog[e] & 32) != 0
+        n, o = step(st, q.index_select(3, row)[..., 0], k.index_select(3, row)[..., 0],
+                    cur_v.index_select(3, row)[..., 0],
+                    decay.index_select(1, row)[:, 0], beta.index_select(1, row)[:, 0])
+        st = torch.where(commit, n, st)
+        oc.index_copy_(1, row, o.unsqueeze(1))
 
     # torch rms_norm (fp32 compute, one rounding) times a bf16 silu gate
     oc = oc.to(dtype).float()

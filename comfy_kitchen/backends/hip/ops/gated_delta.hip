@@ -424,9 +424,9 @@ __global__ void deltanet_conv_deferred_kernel(
 // snapshot kernel above (thread r * DV + v owns a KPT slice of one value column).
 // The pending accepted tokens of the previous step are replayed from the side
 // buffers (their gates and q/k norms were saved there) and committed to global
-// state; the S current rows then only produce outputs. ctl's program (tree != 0)
-// runs the rows depth-first with per-row commit flags: a chain row commits into the
-// running registers, the leaves off it run against that state without committing.
+// state; the S current rows then only produce outputs. ctl's program runs the rows
+// depth-first with per-row commit flags: a chain row commits into the running
+// registers, the leaves off it run against that state without committing.
 template <typename T, int KPT>
 __global__ void gated_delta_decode_deferred_kernel(
     const T* __restrict__ x,            // [B, S, Hd]
@@ -442,8 +442,7 @@ __global__ void gated_delta_decode_deferred_kernel(
     T* __restrict__ out,                // [B, S, Hv, DV]
     const T* __restrict__ z,            // [B, S, Hv*DV] norm gate
     const T* __restrict__ norm_w,       // [DV]
-    float eps, int B, int Hv, int Hk, int S, int DV, int C, int Hd, int key_dim, float scale,
-    int tree) {
+    float eps, int B, int Hv, int Hk, int S, int DV, int C, int Hd, int key_dim, float scale) {
 
     constexpr int DK = kDeltaKeyDim;
     constexpr int R = DK / KPT;
@@ -670,15 +669,9 @@ __global__ void gated_delta_decode_deferred_kernel(
         state[state_off + static_cast<int64_t>(kk0 + j) * DV + v] = st[j];
     }
     // current rows: outputs only, the state stays uncommitted until the next step
-    if (tree != 0) {
-        for (int e = 0; e < S; ++e) {
-            const int p = prog[e];  // row | commit << 5, in depth-first order
-            step(pending + (p & 15), true, p & 15, (p & 32) != 0);
-        }
-    } else {
-        for (int s = 0; s < S; ++s) {
-            step(pending + s, true, s, true);
-        }
+    for (int e = 0; e < S; ++e) {
+        const int p = prog[e];  // row | commit << 5, in depth-first order
+        step(pending + (p & 15), true, p & 15, (p & 32) != 0);
     }
 }
 
@@ -818,13 +811,13 @@ extern "C" bool launch_gated_delta_decode_deferred_kernel(
     const void* x, const void* w_a, const void* w_b, const void* dt_bias, const void* g_decay,
     const void* qkv_buf, void* gates_buf, void* sumsq_buf, const void* ctl, void* state,
     void* out, const void* z, const void* norm_w, float eps, int B, int Hv, int Hk, int S, int DK,
-    int DV, int C, int Hd, int key_dim, float scale, int tree, int dtype_code,
-    hipStream_t stream) {
+    int DV, int C, int Hd, int key_dim, float scale, int dtype_code, hipStream_t stream) {
 
     using namespace comfy::hip_backend;
     // DV = DK = 128 is the shape the side buffers and Core serve; KPT = 16 then puts
-    // the state in 1024 threads as the snapshot kernel does
-    if (DK != kDeltaKeyDim || DV != kDeltaKeyDim || S < 1 || S > kDeltaSlotMax || Hk <= 0 ||
+    // the state in 1024 threads as the snapshot kernel does. S is the physical row
+    // count: 1, 4 or 8.
+    if (DK != kDeltaKeyDim || DV != kDeltaKeyDim || (S != 1 && S != 4 && S != 8) || Hk <= 0 ||
         Hv <= 0 || Hv % Hk != 0 || B <= 0 || dtype_code < 0 || dtype_code > 2) {
         return false;
     }
@@ -844,7 +837,7 @@ extern "C" bool launch_gated_delta_decode_deferred_kernel(
             static_cast<const T*>(qkv_buf), static_cast<float*>(gates_buf),                    \
             static_cast<float*>(sumsq_buf), static_cast<const int*>(ctl),                      \
             static_cast<float*>(state), static_cast<T*>(out), static_cast<const T*>(z),        \
-            static_cast<const T*>(norm_w), eps, B, Hv, Hk, S, DV, C, Hd, key_dim, scale, tree)
+            static_cast<const T*>(norm_w), eps, B, Hv, Hk, S, DV, C, Hd, key_dim, scale)
 
     if (dtype_code == 0) {
         CK_DELTA_DEFERRED_LAUNCH(float);

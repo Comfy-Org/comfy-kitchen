@@ -395,7 +395,7 @@ __global__ void deltanet_conv_deferred_kernel(
 #define CLUSTER_DIMS(cl) __cluster_dims__(cl, 1, 1)
 #endif
 
-template <typename T, int DK, int DV, int S, bool Tree>
+template <typename T, int DK, int DV, int S>
 __global__ void CLUSTER_DIMS(4) __launch_bounds__(256, 2)
 gated_delta_decode_deferred_kernel(
     const T* __restrict__ x,           // [B, S, Hd]
@@ -617,16 +617,10 @@ gated_delta_decode_deferred_kernel(
     for (int r = 0; r < KPL; ++r)
         state[state_off + tile_off + r * DV] = st[r];
     // current tokens: outputs only, state stays uncommitted until the next step
-    if constexpr (Tree) {
-        // prog[e] = row | commit << 5, in depth-first order
-        for (int e = 0; e < S; ++e) {
-            const int p = prog[e];
-            step(pending + (p & 15), true, p & 15, (p & 32) != 0);
-        }
-    } else {
-        #pragma unroll
-        for (int s = 0; s < S; ++s)
-            step(pending + s, true, s);
+    // prog[e] = row | commit << 5, in depth-first order
+    for (int e = 0; e < S; ++e) {
+        const int p = prog[e];
+        step(pending + (p & 15), true, p & 15, (p & 32) != 0);
     }
     __syncthreads();
 
@@ -670,7 +664,7 @@ gated_delta_decode_deferred_kernel(
 // replay tokens and the S current tokens into shared memory, laid out so a lane's
 // 16-row slice is 4 conflict-free 128-bit reads.
 
-template <typename T, int DK, int DV, int S, bool Tree>
+template <typename T, int DK, int DV, int S>
 __global__ void __launch_bounds__(256, 2)
 gated_delta_decode_deferred_flat_kernel(
     const T* __restrict__ x,           // [B, S, Hd]
@@ -884,15 +878,9 @@ gated_delta_decode_deferred_flat_kernel(
     for (int r = 0; r < KPL; ++r)
         state[state_off + tile_off + r * DV] = st[r];
     // current tokens: outputs only, state stays uncommitted until the next step
-    if constexpr (Tree) {
-        for (int e = 0; e < S; ++e) {
-            const int p = prog[e];
-            step(pending + (p & 15), true, p & 15, (p & 32) != 0);
-        }
-    } else {
-        #pragma unroll
-        for (int s = 0; s < S; ++s)
-            step(pending + s, true, s);
+    for (int e = 0; e < S; ++e) {
+        const int p = prog[e];
+        step(pending + (p & 15), true, p & 15, (p & 32) != 0);
     }
     __syncthreads();
 
@@ -1002,9 +990,9 @@ extern "C" bool launch_gated_delta_decode_deferred(
     const void* qkv_buf, void* gates_buf, void* sumsq_buf, const void* ctl,
     void* state, void* out, const void* z, const void* norm_w, float eps,
     int64_t B, int64_t Hv, int64_t Hk, int64_t S, int64_t DK, int64_t DV, int64_t C, int64_t Hd,
-    int64_t key_dim, float scale, int64_t ldz, int dtype_code, int64_t tree, cudaStream_t stream)
+    int64_t key_dim, float scale, int64_t ldz, int dtype_code, cudaStream_t stream)
 {
-    if (DK != 128 || DV != 128 || S < 1 || S > kSlotMax || Hk <= 0 || Hv % Hk != 0 || Hd % 8 != 0
+    if (DK != 128 || DV != 128 || (S != 1 && S != 4 && S != 8) || Hk <= 0 || Hv % Hk != 0 || Hd % 8 != 0
             || dtype_code < 0 || dtype_code > 2)
         return false;
     int device = 0, cc_major = 0;
@@ -1013,9 +1001,9 @@ extern "C" bool launch_gated_delta_decode_deferred(
             || cc_major < 8)
         return false;
     return DISPATCH_FP_DTYPE(dtype_code, T, [&] {
-        auto launch = [&]<int Steps, bool IsTree = false>() {
+        auto launch = [&]<int Steps>() {
             if (cc_major >= 9) {
-                gated_delta_decode_deferred_kernel<T, 128, 128, Steps, IsTree><<<static_cast<unsigned>(B * Hv * 4), 256, 0, stream>>>(
+                gated_delta_decode_deferred_kernel<T, 128, 128, Steps><<<static_cast<unsigned>(B * Hv * 4), 256, 0, stream>>>(
                     static_cast<const T*>(x), static_cast<const T*>(w_a), static_cast<const T*>(w_b),
                     static_cast<const float*>(dt_bias), static_cast<const float*>(g_decay),
                     static_cast<const T*>(qkv_buf), static_cast<float*>(gates_buf), static_cast<float*>(sumsq_buf),
@@ -1025,7 +1013,7 @@ extern "C" bool launch_gated_delta_decode_deferred(
                     static_cast<int>(C), static_cast<int>(Hd), static_cast<int>(key_dim), scale, static_cast<int>(ldz));
                 return;
             }
-            gated_delta_decode_deferred_flat_kernel<T, 128, 128, Steps, IsTree><<<static_cast<unsigned>(B * Hv * 4), 256, 0, stream>>>(
+            gated_delta_decode_deferred_flat_kernel<T, 128, 128, Steps><<<static_cast<unsigned>(B * Hv * 4), 256, 0, stream>>>(
                 static_cast<const T*>(x), static_cast<const T*>(w_a), static_cast<const T*>(w_b),
                 static_cast<const float*>(dt_bias), static_cast<const float*>(g_decay),
                 static_cast<const T*>(qkv_buf), static_cast<float*>(gates_buf), static_cast<float*>(sumsq_buf),
@@ -1033,24 +1021,9 @@ extern "C" bool launch_gated_delta_decode_deferred(
                 static_cast<int>(B), static_cast<int>(Hv), static_cast<int>(Hk),
                 static_cast<int>(C), static_cast<int>(Hd), static_cast<int>(key_dim), scale);
         };
-        if (tree != 0) {
-            switch (S) {
-                case 3: launch.template operator()<3, true>(); break;
-                case 4: launch.template operator()<4, true>(); break;
-                case 5: launch.template operator()<5, true>(); break;
-                case 6: launch.template operator()<6, true>(); break;
-                case 7: launch.template operator()<7, true>(); break;
-                case 8: launch.template operator()<8, true>(); break;
-                default: return false;
-            }
-        } else switch (S) {
+        switch (S) {
             case 1: launch.template operator()<1>(); break;
-            case 2: launch.template operator()<2>(); break;
-            case 3: launch.template operator()<3>(); break;
             case 4: launch.template operator()<4>(); break;
-            case 5: launch.template operator()<5>(); break;
-            case 6: launch.template operator()<6>(); break;
-            case 7: launch.template operator()<7>(); break;
             default: launch.template operator()<8>(); break;
         }
         if (cc_major < 9) {

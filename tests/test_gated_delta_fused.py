@@ -159,6 +159,7 @@ def _ctl(pending, parity, slots=None, parent=None, prog=None, device="cuda"):
     t[2:10] = torch.tensor(list(slots) + list(range(len(slots), 8)) if slots else list(range(8)), dtype=torch.int32)
     t[10:18] = torch.tensor(list(parent) + [-1] * (8 - len(parent)) if parent else [r - 1 for r in range(8)],
                             dtype=torch.int32)
+    t[18:] = torch.tensor([r | 32 for r in range(8)], dtype=torch.int32)
     if prog:
         t[18:18 + len(prog)] = torch.tensor(prog, dtype=torch.int32)
     return t.to(device)
@@ -173,7 +174,7 @@ def _deferred_devices():
 class TestGatedDeltaDeferred:
     # (tokens in the verify step, tokens the verifier accepted) per step; the
     # committed tokens of a step are the accepted drafts plus the correction
-    STEPS = ((4, 0), (4, 3), (4, 1), (6, 5), (6, 2), (1, 0), (8, 7), (3, 0), (1, 0))
+    STEPS = ((4, 0), (4, 3), (4, 1), (8, 5), (8, 2), (1, 0), (8, 7), (4, 0), (1, 0))
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
     def test_matches_eager_with_rollback(self, dev, dtype, seed):
@@ -216,11 +217,13 @@ class TestGatedDeltaDeferred:
                         ref_state, z[:, :pending], norm_w, pending)
             parity ^= 1
 
-    # M = 7 "tree2s2": rows c(0), d1(1), d2(2) chain; a1(5), a2(6) runner-up siblings of d1;
+    # M = 8 "tree2s2": rows c(0), d1(1), d2(2) chain; a1(5), a2(6) runner-up siblings of d1;
     # b1(3), b2(4) runner-up siblings of d2 (rows numbered depth-first). Program: a chain row
     # commits, then the leaves hanging off it run against that state without committing.
-    TREE_PARENT = (-1, 0, 1, 1, 1, 0, 0)
+    # Row 7 is padding: a disconnected root, evaluated before the committing rows.
+    TREE_PARENT = (-1, 0, 1, 1, 1, 0, 0, -1)
     TREE_PROG = (
+        7,             # disconnected padding, never committed
         0 | 32,        # c: commit
         5,             # a1: leaf off c
         6,             # a2: leaf off c
@@ -251,11 +254,11 @@ class TestGatedDeltaDeferred:
         ctl = torch.zeros((ck.gated_delta_ctl_ints,), dtype=torch.int32, device=dev)
         tol = 1e-5 if dtype == torch.float32 else 5e-3
 
-        def run(proj, x, z, ctl_host, tree):
+        def run(proj, x, z, ctl_host):
             ctl.copy_(ctl_host)
             ck.deltanet_conv_step_deferred(proj, conv_state, w, b, proj_buf, qkv_buf, ctl)
             got = ck.gated_delta_decode_deferred(x, w_a, w_b, dt_bias, g_decay, state, KEY_DIM, HK, SCALE,
-                                                 z, norm_w, EPS, qkv_buf, gates_buf, sumsq_buf, ctl, tree)
+                                                 z, norm_w, EPS, qkv_buf, gates_buf, sumsq_buf, ctl)
             return got
 
         def path(r):
@@ -270,14 +273,14 @@ class TestGatedDeltaDeferred:
         proj = torch.randn(B, seq, C, device=dev, dtype=dtype)
         x = torch.randn(B, seq, HD, device=dev, dtype=dtype)
         z = torch.randn(B, seq, HV * DV, device=dev, dtype=dtype)
-        run(proj, x, z, _ctl(0, 0, device=dev), 0)
+        run(proj, x, z, _ctl(0, 0, device=dev))
         _eager_step(proj[:, :2], ref_conv_state, w, b, x[:, :2], w_a, w_b, dt_bias, g_decay, ref_state, z[:, :2], norm_w, 2)
 
         # step 1: the tree
         proj = torch.randn(B, rows_n, C, device=dev, dtype=dtype)
         x = torch.randn(B, rows_n, HD, device=dev, dtype=dtype)
         z = torch.randn(B, rows_n, HV * DV, device=dev, dtype=dtype)
-        got = run(proj, x, z, _ctl(2, 1, parent=parent, prog=prog, device=dev), 1)
+        got = run(proj, x, z, _ctl(2, 1, parent=parent, prog=prog, device=dev))
         assert torch.equal(conv_state, ref_conv_state), "tree step: conv state"
         assert rel_err(state, ref_state) < tol, "tree step: recurrent state"
         for r in range(rows_n):
@@ -286,15 +289,15 @@ class TestGatedDeltaDeferred:
                               g_decay, ref_state.clone(), z[:, rows], norm_w, len(rows))
             assert rel_err(got[:, r].float(), ref[:, -1].float()) < tol, f"tree step: row {r}"
 
-        # step 2: commit the accepted path c -> d1 -> b2 (rows 0, 1, 4), then verify 3 plain tokens
+        # step 2: commit the accepted path c -> d1 -> b2 (rows 0, 1, 4), then verify 4 plain tokens
         accepted = [0, 1, 4]
         _eager_step(proj[:, accepted], ref_conv_state, w, b, x[:, accepted], w_a, w_b, dt_bias, g_decay,
                     ref_state, z[:, accepted], norm_w, len(accepted))
-        seq = 3
+        seq = 4
         proj = torch.randn(B, seq, C, device=dev, dtype=dtype)
         x = torch.randn(B, seq, HD, device=dev, dtype=dtype)
         z = torch.randn(B, seq, HV * DV, device=dev, dtype=dtype)
-        got = run(proj, x, z, _ctl(len(accepted), 0, slots=accepted, device=dev), 0)
+        got = run(proj, x, z, _ctl(len(accepted), 0, slots=accepted, device=dev))
         assert torch.equal(conv_state, ref_conv_state), "path commit: conv state"
         assert rel_err(state, ref_state) < tol, "path commit: recurrent state"
         ref_out = _eager_step(proj, ref_conv_state.clone(), w, b, x, w_a, w_b, dt_bias, g_decay,

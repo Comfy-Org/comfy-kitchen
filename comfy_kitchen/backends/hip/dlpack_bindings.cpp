@@ -88,8 +88,7 @@ bool launch_gated_delta_decode_deferred_kernel(
     const void* x, const void* w_a, const void* w_b, const void* dt_bias, const void* g_decay,
     const void* qkv_buf, void* gates_buf, void* sumsq_buf, const void* ctl, void* state,
     void* out, const void* z, const void* norm_w, float eps, int B, int Hv, int Hk, int S, int DK,
-    int DV, int C, int Hd, int key_dim, float scale, int tree, int dtype_code,
-    hipStream_t stream);
+    int DV, int C, int Hd, int key_dim, float scale, int dtype_code, hipStream_t stream);
 bool launch_deltanet_conv_deferred_kernel(const void* proj, void* proj_buf, void* conv_state,
                                           const void* conv_w, const void* conv_b, void* qkv_buf,
                                           const void* ctl, int B, int C, int S, int KS,
@@ -2510,14 +2509,14 @@ static void require_deferred_ctl(const nb::ndarray<>& ctl, const char* fn) {
 
 // GatedDeltaNet decode with the previous step's accepted tokens replayed from the
 // side buffers before the state is committed; the S current rows only produce
-// outputs and refill the buffers. tree selects the per-row commit program in ctl.
+// outputs and refill the buffers, run in the per-row commit program in ctl.
 bool gated_delta_decode_deferred(nb::ndarray<> x, nb::ndarray<> w_a, nb::ndarray<> w_b,
                                  nb::ndarray<> dt_bias, nb::ndarray<> g_decay,
                                  nb::ndarray<> qkv_buf, nb::ndarray<> gates_buf,
                                  nb::ndarray<> sumsq_buf, nb::ndarray<> ctl, nb::ndarray<> state,
                                  nb::ndarray<> out, nb::ndarray<> z, nb::ndarray<> norm_w,
                                  double eps, int key_dim, int num_key_heads, double scale,
-                                 int tree, uintptr_t stream_ptr) {
+                                 uintptr_t stream_ptr) {
     constexpr const char* kFn = "gated_delta_decode_deferred";
     if (x.ndim() != 3 || w_a.ndim() != 2 || w_b.ndim() != 2 || qkv_buf.ndim() != 4 ||
         gates_buf.ndim() != 5 || sumsq_buf.ndim() != 5 || state.ndim() != 4 || out.ndim() != 4 ||
@@ -2588,7 +2587,7 @@ bool gated_delta_decode_deferred(nb::ndarray<> x, nb::ndarray<> w_a, nb::ndarray
         x.data(), w_a.data(), w_b.data(), dt_bias.data(), g_decay.data(), qkv_buf.data(),
         gates_buf.data(), sumsq_buf.data(), ctl.data(), state.data(), out.data(), z.data(),
         norm_w.data(), static_cast<float>(eps), B, Hv, Hk, S, DK, DV, C, Hd, key_dim,
-        static_cast<float>(scale), tree, dtype_code, reinterpret_cast<hipStream_t>(stream_ptr));
+        static_cast<float>(scale), dtype_code, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
     return used;
 }
@@ -2727,8 +2726,7 @@ NB_MODULE(_C, m) {
           nb::arg("w_a"), nb::arg("w_b"), nb::arg("dt_bias"), nb::arg("g_decay"),
           nb::arg("qkv_buf"), nb::arg("gates_buf"), nb::arg("sumsq_buf"), nb::arg("ctl"),
           nb::arg("state"), nb::arg("out"), nb::arg("z"), nb::arg("norm_w"), nb::arg("eps"),
-          nb::arg("key_dim"), nb::arg("num_key_heads"), nb::arg("scale"), nb::arg("tree"),
-          nb::arg("stream_ptr"));
+          nb::arg("key_dim"), nb::arg("num_key_heads"), nb::arg("scale"), nb::arg("stream_ptr"));
     m.def("deltanet_conv_deferred", &deltanet_conv_deferred, nb::arg("proj"),
           nb::arg("proj_buf"), nb::arg("conv_state"), nb::arg("conv_w"),
           nb::arg("conv_b").none(), nb::arg("qkv_buf"), nb::arg("ctl"), nb::arg("stream_ptr"));
