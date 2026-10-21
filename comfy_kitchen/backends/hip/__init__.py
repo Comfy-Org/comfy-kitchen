@@ -3189,6 +3189,7 @@ def flash_decode_gqa(
     softmax_lse_accum: torch.Tensor,
     output_accum: torch.Tensor,
     num_splits: int,
+    causal: bool,
 ) -> None:
     """Head-first GQA decode attention into ``output``. See ops/flash_decode.hip."""
     _C.flash_attention_decode_gqa(
@@ -3201,6 +3202,7 @@ def flash_decode_gqa(
         _dl(softmax_lse_accum),
         _dl(output_accum),
         num_splits,
+        causal,
         _stream(q),
     )
 

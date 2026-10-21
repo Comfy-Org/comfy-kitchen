@@ -4266,6 +4266,7 @@ void flash_attention_decode_gqa(
     nb::ndarray<float, nb::device::cuda> softmax_lse_accum,
     nb::ndarray<float, nb::device::cuda> output_accum,
     int num_splits,
+    bool causal,
     uintptr_t stream_ptr) {
     constexpr int64_t kHeadDim = 256;
     const int64_t batch = q.shape(0), heads = q.shape(1), query_length = q.shape(2);
@@ -4310,7 +4311,7 @@ void flash_attention_decode_gqa(
         q.data(), k.data(), v.data(), kv_lengths.data(), output.data(), softmax_lse.data(),
         num_splits > 1 ? softmax_lse_accum.data() : nullptr,
         num_splits > 1 ? output_accum.data() : nullptr,
-        static_cast<int>(batch), static_cast<int>(query_length), static_cast<int>(heads), static_cast<int>(kv_heads), static_cast<int>(kv_capacity), num_splits, true,
+        static_cast<int>(batch), static_cast<int>(query_length), static_cast<int>(heads), static_cast<int>(kv_heads), static_cast<int>(kv_capacity), num_splits, causal,
         q.stride(0), q.stride(2), q.stride(1),
         k.stride(0), k.stride(2), k.stride(1),
         output.stride(0), output.stride(1), kHeadDim, reinterpret_cast<cudaStream_t>(stream_ptr));
@@ -5225,10 +5226,10 @@ NB_MODULE(_C, m) {
           nb::arg("output"), nb::arg("softmax_lse"), nb::arg("softmax_lse_accum"),
           nb::arg("output_accum"), nb::arg("num_splits"), nb::arg("stream_ptr"));
     m.def("flash_attention_decode_gqa", &flash_attention_decode_gqa,
-          "Causal GQA decode attention (head_dim 256) over a [batch, kv_heads, capacity, 256] cache",
+          "GQA decode attention (head_dim 256) over a [batch, kv_heads, capacity, 256] cache; causal = the verify staircase",
           nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("kv_lengths"),
           nb::arg("output"), nb::arg("softmax_lse"), nb::arg("softmax_lse_accum"),
-          nb::arg("output_accum"), nb::arg("num_splits"), nb::arg("stream_ptr"));
+          nb::arg("output_accum"), nb::arg("num_splits"), nb::arg("causal"), nb::arg("stream_ptr"));
 
     m.def("flash_attention_decode_step_merge", &flash_attention_decode_step_merge,
           "Fold the current step's rows causally into a prefix-only GQA decode result using its log-sum-exp",

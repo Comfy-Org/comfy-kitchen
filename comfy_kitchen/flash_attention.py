@@ -147,7 +147,7 @@ def _hip_groups_per_pass(rows: int, head_dim: int) -> int:
     return gpp
 
 
-def _decode_gqa_torch(q, k, v, kv_lengths):
+def _decode_gqa_torch(q, k, v, kv_lengths, causal):
     batch, heads, query_length, head_dim = q.shape
     _, kv_heads, kv_capacity, _ = k.shape
     groups = heads // kv_heads
@@ -155,28 +155,37 @@ def _decode_gqa_torch(q, k, v, kv_lengths):
                           k.float().transpose(-1, -2)) * head_dim ** -0.5
     # the kernels' kv_lengths clamp and bottom-right causal staircase, per (batch, row)
     limit = kv_lengths.to(torch.int64).clamp(0, kv_capacity).view(batch, 1, 1)
-    limit = limit - query_length + 1 + torch.arange(query_length, device=q.device)
+    if causal:
+        limit = limit - query_length + 1 + torch.arange(query_length, device=q.device)
     limit = limit.expand(batch, 1, query_length).repeat(1, 1, groups).unsqueeze(-1)
     scores.masked_fill_(torch.arange(kv_capacity, device=q.device) >= limit, float("-inf"))
     lse = scores.logsumexp(-1)
     # an empty range (no slot) is written as zeros, not 0/0
     probs = torch.exp(scores - lse.masked_fill(lse == float("-inf"), 0.0).unsqueeze(-1))
     out = torch.matmul(probs, v.float()).view(batch, kv_heads, groups, query_length, head_dim)
-    return out.permute(0, 3, 1, 2, 4).reshape(batch, query_length, heads * head_dim).to(q.dtype)
+    return (out.permute(0, 3, 1, 2, 4).reshape(batch, query_length, heads * head_dim).to(q.dtype),
+            lse.view(batch, heads, query_length))
 
 
 def flash_attention_decode_gqa(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_lengths: torch.Tensor,
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_lengths: torch.Tensor, return_lse: bool = False,
+    causal: bool = True,
 ) -> torch.Tensor:
     """GQA decode attention for q [B, H, S, D] over k/v [B, Hk, capacity, D].
 
-    Query row j of batch b attends cache slots < kv_lengths[b] - S + j + 1 (the
-    speculative verify staircase; S == 1 is plain decode). Returns [B, S, H*D].
-    BF16 head_dim 256 runs the CUDA or HIP kernel; anything else the same computation in torch."""
+    Causal: query row j of batch b attends cache slots < kv_lengths[b] - S + j + 1 (the
+    speculative verify staircase; S == 1 is plain decode). Otherwise every row attends slots <
+    kv_lengths[b], which is how a verify tree reads its committed prefix. Returns
+    [B, S, H*D], with the fp32 log-sum-exp of the scaled scores [B, H, S] as a second value
+    when return_lse. BF16 head_dim 256 runs the CUDA or HIP kernel; anything else the same
+    computation in torch."""
     batch, heads, query_length, head_dim = q.shape
     _, kv_heads, kv_capacity, _ = k.shape
     if head_dim != 256 or not flash_attention_decode_gqa_is_available(q.device, q.dtype):
-        return _decode_gqa_torch(q, k, v, kv_lengths)
+        output, softmax_lse = _decode_gqa_torch(q, k, v, kv_lengths, causal)
+        if return_lse:
+            return output, softmax_lse
+        return output
     output = torch.empty((batch, query_length, heads * head_dim), dtype=q.dtype, device=q.device)
     multiprocessors = torch.cuda.get_device_properties(q.device).multi_processor_count
     rows = batch * heads * query_length
@@ -200,7 +209,8 @@ def flash_attention_decode_gqa(
         softmax_lse_accum = output_accum = softmax_lse[:0]
     if _hip_backend is not None:
         _hip_backend.flash_decode_gqa(
-            q, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum, num_splits)
+            q, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum, num_splits,
+            causal)
     else:
         _cuda_backend._C.flash_attention_decode_gqa(
             *map(
@@ -208,8 +218,11 @@ def flash_attention_decode_gqa(
                 (q, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum),
             ),
             num_splits,
+            causal,
             torch.cuda.current_stream(q.device).cuda_stream,
         )
+    if return_lse:
+        return output, softmax_lse.view(batch, heads, query_length)
     return output
 
 

@@ -1945,7 +1945,7 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
 void flash_attention_decode_gqa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
                                 nb::ndarray<> kv_lengths, nb::ndarray<> output,
                                 nb::ndarray<> softmax_lse, nb::ndarray<> softmax_lse_accum,
-                                nb::ndarray<> output_accum, int num_splits,
+                                nb::ndarray<> output_accum, int num_splits, bool causal,
                                 uintptr_t stream_ptr) {
     constexpr const char* kFn = "flash_attention_decode_gqa";
     constexpr int64_t kHeadDim = 256;
@@ -2039,7 +2039,7 @@ void flash_attention_decode_gqa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> 
         num_splits > 1 ? static_cast<float*>(softmax_lse_accum.data()) : nullptr,
         static_cast<int>(batch), static_cast<int>(groups * query_length),
         static_cast<int>(query_length), static_cast<int>(kv_heads), static_cast<int>(kHeadDim),
-        static_cast<int>(kv_capacity), num_splits, true, q.stride(0), q.stride(1), q.stride(2),
+        static_cast<int>(kv_capacity), num_splits, causal, q.stride(0), q.stride(1), q.stride(2),
         groups * q.stride(1), k.stride(0), k.stride(2), k.stride(1), output.stride(0), kHeadDim,
         output.stride(1), groups * kHeadDim, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
@@ -2730,7 +2730,7 @@ NB_MODULE(_C, m) {
     m.def("flash_attention_decode_gqa", &flash_attention_decode_gqa, nb::arg("q"), nb::arg("k"),
           nb::arg("v"), nb::arg("kv_lengths"), nb::arg("output"), nb::arg("softmax_lse"),
           nb::arg("softmax_lse_accum"), nb::arg("output_accum"), nb::arg("num_splits"),
-          nb::arg("stream_ptr"));
+          nb::arg("causal"), nb::arg("stream_ptr"));
     m.def("flash_attention_decode_step_merge", &flash_attention_decode_step_merge, nb::arg("out"),
           nb::arg("lse"), nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("merged"),
           nb::arg("stream_ptr"));
