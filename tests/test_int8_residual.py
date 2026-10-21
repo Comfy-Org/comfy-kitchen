@@ -207,3 +207,31 @@ def test_residual_inplace_preserves_storage(operation, scale_kind, layout, seed,
     actual = linear(residual=residual, residual_scale=scale, residual_inplace=True)
     assert actual is residual
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("m,k,n", [(1, 256, 192), (9, 272, 79), (513, 256, 192),
+                                    (1023, 256, 192), (1024, 256, 192), (1153, 256, 192)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_hip_residual_matches_separate_add_bitwise(m, k, n, dtype, with_bias, seed):
+    if not torch.version.hip or "hip" not in get_capable_backends("int8_linear", "cuda"):
+        pytest.skip("HIP WMMA required")
+    # GEMV, row-major tails, tiled-A, and both sides of the dual-M threshold.
+    x = torch.randn(m, k, device="cuda", dtype=dtype)
+    weight = torch.randint(-127, 127, (n, k), device="cuda", dtype=torch.int8)
+    wscale = torch.linspace(0.001, 0.017, n, device="cuda")
+    bias = torch.randn(n, device="cuda", dtype=dtype) if with_bias else None
+    residual = torch.randn(m, n, device="cuda", dtype=dtype)
+    kwargs = {"out_dtype": dtype, "convrot": k == 256 and dtype != torch.float32}
+    with ck.use_backend("hip"):
+        plain = ck.int8_linear(x, weight, wscale, bias, **kwargs)
+        for scale in (1.0, torch.linspace(-0.7, 1.3, n, device="cuda", dtype=dtype)):
+            expected = residual + plain if isinstance(scale, float) else torch.addcmul(residual, plain, scale)
+            actual = ck.int8_linear(x, weight, wscale, bias, residual=residual,
+                                    residual_scale=scale, **kwargs)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            destination = residual.clone()
+            actual = ck.int8_linear(x, weight, wscale, bias, residual=destination,
+                                    residual_scale=scale, residual_inplace=True, **kwargs)
+            assert actual is destination
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)

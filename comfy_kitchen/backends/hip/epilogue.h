@@ -81,6 +81,26 @@ struct EpiRowwiseNoBias {
     }
 };
 
+// Round the linear result as the separate GEMM store would, then apply addcmul.
+// Each output element reads its own residual before overwriting it; no split-K.
+template <typename OutT>
+struct EpiRowwiseResidual : EpiRowwise {
+    static constexpr bool kOutputMayAlias = true;
+    const OutT* residual;
+    const OutT* rscale;
+    int residual_stride;
+
+    __forceinline__ __device__ float finish(int row, int col, float value) const {
+        const float linear = static_cast<float>(static_cast<OutT>(value));
+        const float res = static_cast<float>(residual[static_cast<int64_t>(row) * residual_stride + col]);
+        return rscale ? fmaf(static_cast<float>(rscale[col]), linear, res) : res + linear;
+    }
+
+    __forceinline__ __device__ float operator()(int row, int col, float acc) const {
+        return finish(row, col, EpiRowwise::operator()(row, col, acc));
+    }
+};
+
 // Unscaled fp16 operands: out = acc + bias[col], or with resid set
 // out = resid[row * resid_stride + col] + rscale[col] * (acc + bias[col]).
 // resid_stride 0 broadcasts a single [N] residual row. All operands are fp16.

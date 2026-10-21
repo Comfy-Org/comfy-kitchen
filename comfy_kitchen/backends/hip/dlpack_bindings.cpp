@@ -363,9 +363,33 @@ void scaled_mm_fp8(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarra
     check_hip_launch();
 }
 
+static void require_int8_residual(const OptArray& residual, const OptArray& rscale,
+                                  const nb::ndarray<>& c, int M, int N, int out_code,
+                                  const char* fn) {
+    if (rscale && !residual) {
+        throw std::runtime_error(std::string(fn) + ": rscale requires residual");
+    }
+    if (!residual) return;
+    require_out_matches(*residual, out_code, fn);
+    require_len(*residual, static_cast<int64_t>(M) * N, fn, "residual");
+    require_packed_contiguous(*residual, fn, "residual");
+    require_packed_contiguous(c, fn, "c");
+    if (residual->device_type() != c.device_type() || residual->device_id() != c.device_id()) {
+        throw std::runtime_error(std::string(fn) + ": residual must be on the output device");
+    }
+    if (rscale) {
+        require_out_matches(*rscale, out_code, fn);
+        require_len(*rscale, N, fn, "rscale");
+        require_packed_contiguous(*rscale, fn, "rscale");
+        if (rscale->device_type() != c.device_type() || rscale->device_id() != c.device_id()) {
+            throw std::runtime_error(std::string(fn) + ": rscale must be on the output device");
+        }
+    }
+}
+
 void int8_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> scale_a,
                nb::ndarray<> scale_b, int scale_b_stride, OptArray bias, int M, int N, int K,
-               int out_code, uintptr_t stream_ptr) {
+               int out_code, uintptr_t stream_ptr, OptArray residual, OptArray rscale) {
     constexpr const char* kFn = "int8_gemm";
     // EpiRowwise reads scale_a[row] over M rows and scale_b[col * stride] over N
     // columns; a stride of 0 collapses the weight scale to a single scalar.
@@ -387,10 +411,12 @@ void int8_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> 
     require_scale_len(scale_a, static_cast<size_t>(M), kFn, "scale_a");
     require_scale_len(scale_b, scale_b_stride == 1 ? static_cast<size_t>(N) : 1, kFn, "scale_b");
     require_bias(bias, N, kFn);
+    require_int8_residual(residual, rscale, c, M, N, out_code, kFn);
 
     launch_int8_gemm_kernel(a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(),
                             scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, N /*ldc*/,
-                            out_code, reinterpret_cast<hipStream_t>(stream_ptr));
+                            out_code, reinterpret_cast<hipStream_t>(stream_ptr),
+                            opt_data(residual), opt_data(rscale));
     check_hip_launch();
 }
 
@@ -439,7 +465,8 @@ void rms_gated_residual_bf16(
 void int8_gemm_a_tiled128(
     nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c,
     nb::ndarray<> scale_a, nb::ndarray<> scale_b, int scale_b_stride,
-    OptArray bias, int M, int N, int K, int out_code, uintptr_t stream_ptr) {
+    OptArray bias, int M, int N, int K, int out_code, uintptr_t stream_ptr,
+    OptArray residual, OptArray rscale) {
     constexpr const char* kFn = "int8_gemm_a_tiled128";
     if (scale_b_stride != 0 && scale_b_stride != 1) {
         throw std::runtime_error(std::string(kFn) +
@@ -465,11 +492,12 @@ void int8_gemm_a_tiled128(
     require_scale_len(scale_b, scale_b_stride == 1 ? static_cast<size_t>(N) : 1,
                       kFn, "scale_b");
     require_bias(bias, N, kFn);
+    require_int8_residual(residual, rscale, c, M, N, out_code, kFn);
 
     launch_int8_gemm_a_tiled128_kernel(
         a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(),
         scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, N,
-        out_code, reinterpret_cast<hipStream_t>(stream_ptr));
+        out_code, reinterpret_cast<hipStream_t>(stream_ptr), opt_data(residual), opt_data(rscale));
     check_hip_launch();
 }
 
@@ -2854,9 +2882,17 @@ NB_MODULE(_C, m) {
     m.def("dequantize_per_tensor_fp8", &dequantize_per_tensor_fp8);
     m.def("stochastic_round_fp8", &stochastic_round_fp8);
     m.def("scaled_mm_fp8", &scaled_mm_fp8);
-    m.def("int8_gemm", &int8_gemm);
+    m.def("int8_gemm", &int8_gemm,
+          nb::arg("a"), nb::arg("b"), nb::arg("c"), nb::arg("scale_a"), nb::arg("scale_b"),
+          nb::arg("scale_b_stride"), nb::arg("bias").none(), nb::arg("M"), nb::arg("N"),
+          nb::arg("K"), nb::arg("out_code"), nb::arg("stream_ptr"),
+          nb::arg("residual").none() = nb::none(), nb::arg("rscale").none() = nb::none());
     m.def("rms_gated_residual_bf16", &rms_gated_residual_bf16);
-    m.def("int8_gemm_a_tiled128", &int8_gemm_a_tiled128);
+    m.def("int8_gemm_a_tiled128", &int8_gemm_a_tiled128,
+          nb::arg("a"), nb::arg("b"), nb::arg("c"), nb::arg("scale_a"), nb::arg("scale_b"),
+          nb::arg("scale_b_stride"), nb::arg("bias").none(), nb::arg("M"), nb::arg("N"),
+          nb::arg("K"), nb::arg("out_code"), nb::arg("stream_ptr"),
+          nb::arg("residual").none() = nb::none(), nb::arg("rscale").none() = nb::none());
     m.def("convrot_w4a4_gemm", &convrot_w4a4_gemm);
     m.def("fp16_gemm", &fp16_gemm, nb::arg("a"), nb::arg("b"), nb::arg("d"),
           nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),

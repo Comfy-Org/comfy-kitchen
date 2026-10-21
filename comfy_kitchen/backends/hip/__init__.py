@@ -923,6 +923,22 @@ def int8_linear(
     k = k_act
     n = weight.shape[0]
     tiled = _use_tiled_int8(m, n, k, x.device)
+    inplace_out = (_residual_output(
+        residual, (*orig_shape[:-1], n), out_dtype, x.device,
+        x, weight, weight_scale, bias, residual_scale,
+    ) if residual_inplace else None)
+    unit_scale = isinstance(residual_scale, (float, int)) and residual_scale == 1.0
+    scale_supported = unit_scale or (
+        isinstance(residual_scale, torch.Tensor)
+        and residual_scale.dtype == out_dtype and residual_scale.device == x.device
+        and residual_scale.ndim <= len(orig_shape) and residual_scale.shape[-1:] == (n,)
+        and residual_scale.numel() == n and residual_scale.is_contiguous()
+    )
+    fuse_residual = (
+        residual is not None and residual.dtype == out_dtype and residual.device == x.device
+        and residual.shape == (*orig_shape[:-1], n) and residual.is_contiguous()
+        and scale_supported and (not residual_inplace or inplace_out is not None)
+    )
 
     # The WMMA K-step and the small-M GEMV both read a row 16 bytes at a time.
     if k % 16 != 0:
@@ -958,17 +974,19 @@ def int8_linear(
     if bias is not None:
         bias = _bias_operand(bias, n, x.device)
 
-    out = torch.empty((m, n), dtype=out_dtype, device=x.device)
+    out = (inplace_out.view(m, n) if fuse_residual and inplace_out is not None
+           else torch.empty((m, n), dtype=out_dtype, device=x.device))
     gemm = _C.int8_gemm_a_tiled128 if tiled else _C.int8_gemm
     gemm(
         _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
         0 if weight_scale.numel() == 1 else 1,
         None if bias is None else _dl(bias), m, n, k,
         DTYPE_TO_CODE[out_dtype], _stream(x),
+        _dl(residual) if fuse_residual else None,
+        _dl(residual_scale) if fuse_residual and not unit_scale else None,
     )
-    # Unlike CUDA, the residual is not folded into the epilogue: the per-element
-    # residual reads there cost more than a separate addcmul at the output widths
-    # pre-norm blocks apply it to.
+    if fuse_residual:
+        return residual if residual_inplace else out.reshape(*orig_shape[:-1], n)
     return _apply_residual(out.reshape(*orig_shape[:-1], n), residual, residual_scale, residual_inplace)
 
 

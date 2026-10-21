@@ -14,10 +14,11 @@
 namespace comfy::hip_backend {
 
 // Small-M path: reduce K across the wave, one wave per output column.
-template <typename OutT>
+template <typename OutT, typename Epi>
 __global__ __launch_bounds__(256) void gemv_int8_kernel(
-    const int8_t* __restrict__ A, const int8_t* __restrict__ B, OutT* __restrict__ C,
-    int M, int N, int K, int ldc, EpiRowwise epi) {
+    const int8_t* __restrict__ A, const int8_t* __restrict__ B,
+    typename GemmOutput<Epi, OutT>::type C,
+    int M, int N, int K, int ldc, Epi epi) {
 
     const int col = blockIdx.x * blockDim.y + threadIdx.y;
     const int row = blockIdx.y;
@@ -44,19 +45,19 @@ __global__ __launch_bounds__(256) void gemv_int8_kernel(
     }
 }
 
-template <typename OutT>
+template <typename OutT, typename Epi>
 static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N, int K, int ldc,
-                        EpiRowwise epi, hipStream_t stream) {
+                        Epi epi, hipStream_t stream) {
     const uint8_t* Au = reinterpret_cast<const uint8_t*>(A);
     const uint8_t* Bu = reinterpret_cast<const uint8_t*>(B);
 
     if (M <= 8) {
         dim3 block(kWave, 8);
         dim3 grid((N + 7) / 8, M);
-        gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
+        gemv_int8_kernel<OutT, Epi><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
         return;
     }
-    launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
+    launch_gemm_wmma<MmaInt8, Epi, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
 }
 
 }  // namespace comfy::hip_backend
@@ -66,7 +67,8 @@ extern "C" void launch_int8_gemm_kernel(
     const void* a, const void* b, void* c,
     const void* scale_a, const void* scale_b, int scale_b_stride,
     const void* bias, int bias_code,
-    int M, int N, int K, int ldc, int out_code, hipStream_t stream) {
+    int M, int N, int K, int ldc, int out_code, hipStream_t stream,
+    const void* residual, const void* rscale) {
 
     using namespace comfy::hip_backend;
 
@@ -90,13 +92,23 @@ extern "C" void launch_int8_gemm_kernel(
 
     const int8_t* A = static_cast<const int8_t*>(a);
     const int8_t* B = static_cast<const int8_t*>(b);
+    auto launch = [&](auto* output) {
+        using OutT = std::remove_pointer_t<decltype(output)>;
+        if (residual) {
+            EpiRowwiseResidual<OutT> fused{
+                epi, static_cast<const OutT*>(residual), static_cast<const OutT*>(rscale), ldc};
+            launch_int8(A, B, output, M, N, K, ldc, fused, stream);
+        } else {
+            launch_int8(A, B, output, M, N, K, ldc, epi, stream);
+        }
+    };
 
     if (out_code == kBF16) {
-        launch_int8<__bf16>(A, B, static_cast<__bf16*>(c), M, N, K, ldc, epi, stream);
+        launch(static_cast<__bf16*>(c));
     } else if (out_code == kF16) {
-        launch_int8<__half>(A, B, static_cast<__half*>(c), M, N, K, ldc, epi, stream);
+        launch(static_cast<__half*>(c));
     } else if (out_code == kF32) {
-        launch_int8<float>(A, B, static_cast<float*>(c), M, N, K, ldc, epi, stream);
+        launch(static_cast<float*>(c));
     } else {
         throw std::runtime_error("int8_gemm: unsupported output dtype");
     }
@@ -110,7 +122,7 @@ namespace comfy::hip_backend {
 template <typename Epi>
 __global__ __launch_bounds__(512) void gemm_int8_dual_m_tiled_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
-    __bf16* __restrict__ C, int M, int N, int K, int ldc, Epi epi) {
+    typename GemmOutput<Epi, __bf16>::type C, int M, int N, int K, int ldc, Epi epi) {
     #pragma clang fp contract(off)
     #pragma clang fp reassociate(off)
     constexpr int BM = 128, BN = 128, BK = 128, stride = BK + kLdsPad;
@@ -235,6 +247,8 @@ __global__ __launch_bounds__(512) void gemm_int8_dual_m_tiled_kernel(
                 value *= col_scale[j];
                 if constexpr (!std::is_same_v<Epi, EpiRowwiseNoBias>)
                     value += col_bias[j];
+                if constexpr (std::is_same_v<Epi, EpiRowwiseResidual<__bf16>>)
+                    value = epi.finish(r, col, value);
                 C[static_cast<int64_t>(r) * ldc + col] = static_cast<__bf16>(value);
             }
         }
@@ -269,7 +283,8 @@ extern "C" void launch_int8_gemm_a_tiled128_kernel(
     const void* a, const void* b, void* c,
     const void* scale_a, const void* scale_b, int scale_b_stride,
     const void* bias, int bias_code,
-    int M, int N, int K, int ldc, int out_code, hipStream_t stream) {
+    int M, int N, int K, int ldc, int out_code, hipStream_t stream,
+    const void* residual, const void* rscale) {
 
     using namespace comfy::hip_backend;
     if (M == 0) return;
@@ -282,21 +297,28 @@ extern "C" void launch_int8_gemm_a_tiled128_kernel(
         scale_b_stride, bias, bias_code};
     const uint8_t* A = static_cast<const uint8_t*>(a);
     const uint8_t* B = static_cast<const uint8_t*>(b);
+    auto launch = [&](auto* output) {
+        using OutT = std::remove_pointer_t<decltype(output)>;
+        if (residual) {
+            EpiRowwiseResidual<OutT> fused{
+                epi, static_cast<const OutT*>(residual), static_cast<const OutT*>(rscale), ldc};
+            launch_int8_tiled_a(A, B, output, M, N, K, ldc, fused, stream);
+        } else {
+            launch_int8_tiled_a(A, B, output, M, N, K, ldc, epi, stream);
+        }
+    };
     if (out_code == kBF16) {
-        if (epi.bias == nullptr && epi.scale_b_stride == 1) {
+        if (!residual && epi.bias == nullptr && epi.scale_b_stride == 1) {
             EpiRowwiseNoBias no_bias{epi.scale_a, epi.scale_b};
             launch_int8_tiled_a(
                 A, B, static_cast<__bf16*>(c), M, N, K, ldc, no_bias, stream);
         } else {
-            launch_int8_tiled_a(
-                A, B, static_cast<__bf16*>(c), M, N, K, ldc, epi, stream);
+            launch(static_cast<__bf16*>(c));
         }
     } else if (out_code == kF16) {
-        launch_int8_tiled_a(
-            A, B, static_cast<__half*>(c), M, N, K, ldc, epi, stream);
+        launch(static_cast<__half*>(c));
     } else if (out_code == kF32) {
-        launch_int8_tiled_a(
-            A, B, static_cast<float*>(c), M, N, K, ldc, epi, stream);
+        launch(static_cast<float*>(c));
     } else {
         throw std::runtime_error("tiled-A int8 GEMM: unsupported output dtype");
     }
