@@ -796,8 +796,8 @@ def test_group_norm_silu_pad3d_fp32_affine_and_ncdhw_input(hip, monkeypatch):
 def test_group_norm_silu_pad3d_declined_shapes_fall_back(hip, case):
     torch.manual_seed(0)
     if case == "channels":
-        x, weight, bias = _gn_inputs(1, 96, 2, 12, 12, torch.float16)
-        groups = 32
+        x, weight, bias = _gn_inputs(1, 2056, 1, 4, 4, torch.float16)
+        groups = 8
     elif case == "groups":
         x, weight, bias = _gn_inputs(1, 2048, 1, 4, 4, torch.float16)
         groups = 2048
@@ -1036,9 +1036,9 @@ def test_group_norm_silu_pad3d_binding_rejects_negative_padding(hip, side):
     pads[side] = -2 if side == "front" else -4
     with pytest.raises(RuntimeError, match=f"{side} must be non-negative"):
         hip._C.group_norm_silu_pad3d(
-            hip._dl(x), None, None, hip._dl(out), None, 1, 8, 2, 4, 4, 1, 0.0,
+            hip._dl(x), None, None, hip._dl(out), None, None, 1, 8, 2, 4, 4, 1, 0.0,
             pads["left"], pads["right"], pads["top"], pads["bottom"], pads["front"], False, False,
-            hip._stream(x))
+            32, hip._stream(x))
 
 
 @needs_wmma
@@ -1508,6 +1508,40 @@ def test_w4a8_linear_chunking_does_not_change_the_result(hip, monkeypatch, n, ch
 
     assert chunked.shape == (m, n)
     assert torch.equal(chunked, one_pass)
+
+
+@pytest.mark.parametrize("act", ["gelu_tanh", "rms_norm", "swiglu", "situ"])
+@pytest.mark.parametrize("bits", [4, 6])
+@pytest.mark.parametrize("m", [1, 9, 600], ids=["gemv", "small", "prefill"])
+@needs_wmma
+def test_w4a8_linear_fuses_the_input_act(hip, monkeypatch, act, bits, m):
+    """The ConvRot quantizer applies the activation on every row count, so the
+    eager activation must never run."""
+    torch.manual_seed(0)
+    n, k = 512, 4096
+    _, (qdata, s_rel, s_channel, _, cb) = _quantize_w4a8(n, k, bits=bits)
+    w = torch.randn(k, device=DEV, dtype=torch.bfloat16)
+    if act in _GATED_ACTS:
+        x = _gated_input(act, m, k, torch.bfloat16)
+        activated = _GATED_ACTS[act](x)
+    else:
+        x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16) * 3.0
+        activated = (torch.nn.functional.rms_norm(x, (k,), weight=w, eps=1e-6)
+                     if act == "rms_norm" else torch.nn.functional.gelu(x, approximate="tanh"))
+
+    ref = hip.w4a8_int8_linear(activated, qdata, s_rel, s_channel, codebook=cb)
+
+    def eager_act(x, input_act, *args):
+        assert input_act in (None, "none"), input_act
+        return x
+
+    monkeypatch.setattr(hip, "_apply_input_act", eager_act)
+    out = hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, codebook=cb,
+                               input_act=act, input_act_weight=w, input_act_eps=1e-6)
+
+    assert out.shape == (m, n)
+    # the kernel evaluates the activation in fp32, the reference rounds it to bf16 first
+    assert ((out.float() - ref.float()).norm() / ref.float().norm()).item() < 0.03
 
 
 @pytest.mark.parametrize(("m", "n", "k", "group_size"),

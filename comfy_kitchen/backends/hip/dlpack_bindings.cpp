@@ -120,9 +120,11 @@ void launch_sage_int8_attn(const void*, const void*, const void*, void*, const v
 
 void launch_adaln_kernel(const void*, const void*, const void*, void*, int, int, int, int, float,
                          int, int, int, bool, hipStream_t);
-void launch_group_norm_silu_pad3d(const void*, const void*, const void*, void*, void*, int, int,
-                                  int, int, int, int, float, int, int, int, int, int, bool, bool,
-                                  int, hipStream_t);
+void launch_group_norm_silu_pad3d(const void*, const void*, const void*, void*, void*,
+                                  const void*, int, int, int, int, int, int, float, int, int, int,
+                                  int, int, bool, bool, int64_t, int, hipStream_t);
+void launch_group_norm_stats3d(const void*, void*, void*, int, int, int, int, int, int, float,
+                               int64_t, int, hipStream_t);
 void launch_gemv_awq_kernel(const void*, const void*, const void*, const void*, const void*, void*,
                             int, int, int, int, int, int, int, int, hipStream_t);
 void launch_svdquant_lora_down_kernel(const void*, const void*, void*, int, int, int, int, int,
@@ -1144,12 +1146,39 @@ static void adaln_impl(const char* kFn, nb::ndarray<>& x, nb::ndarray<>& scale,
     check_hip_launch();
 }
 
+// x is read with image rows row_stride elements apart, so a row-interleaved view spans
+// more storage than its element count; that span is measured from x's own strides.
+static void require_row_strided(const nb::ndarray<>& x, int64_t frames, int H, int W, int C,
+                                int64_t row_stride, const char* fn) {
+    if (row_stride < static_cast<int64_t>(W) * C || row_stride % 8 != 0) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": row stride must be a multiple of 8 and at least W * C");
+    }
+    require_len(x, frames * H * W * C, fn, "x");
+    const int64_t rows = frames * H;
+    if (rows == 0 || W == 0) {
+        return;
+    }
+    int64_t span = 1;
+    for (size_t i = 0; i < x.ndim(); ++i) {
+        if (x.shape(i) > 1) {
+            span += (static_cast<int64_t>(x.shape(i)) - 1) * x.stride(i);
+        }
+    }
+    if (span < (rows - 1) * row_stride + static_cast<int64_t>(W) * C) {
+        throw std::runtime_error(std::string(fn) + ": x does not span its rows at row_stride");
+    }
+}
+
 // Per-frame GroupNorm + SiLU + causal conv padding over NDHWC storage. weight and
-// bias absent -> pad only, and the workspace is not read.
+// bias absent -> pad only, and the workspace is not read. stats given -> those per-frame
+// (mean, rstd) normalize x, which may be a row strip of their frame, and the workspace is
+// not read either.
 void group_norm_silu_pad3d(nb::ndarray<> x, OptArray weight, OptArray bias, nb::ndarray<> out,
-                           OptArray workspace, int B, int C, int T, int H, int W, int num_groups,
-                           float eps, int left, int right, int top, int bottom, int front,
-                           bool silu, bool zero_pad, uintptr_t stream_ptr) {
+                           OptArray workspace, OptArray stats, int B, int C, int T, int H, int W,
+                           int num_groups, float eps, int left, int right, int top, int bottom,
+                           int front, bool silu, bool zero_pad, int64_t row_stride,
+                           uintptr_t stream_ptr) {
     constexpr const char* kFn = "group_norm_silu_pad3d";
     require_nonneg(B, kFn, "B");
     require_positive(C, kFn, "C");
@@ -1166,7 +1195,7 @@ void group_norm_silu_pad3d(nb::ndarray<> x, OptArray weight, OptArray bias, nb::
         throw std::runtime_error(std::string(kFn) + ": x must be float16 or bfloat16");
     }
     require_dtype(out, code, code, kFn, "out");
-    require_len(x, static_cast<int64_t>(B) * C * T * H * W, kFn, "x");
+    require_row_strided(x, static_cast<int64_t>(B) * T, H, W, C, row_stride, kFn);
     require_len(out,
                 static_cast<int64_t>(B) * C * (T + static_cast<int64_t>(front)) *
                     (H + static_cast<int64_t>(top) + bottom) *
@@ -1181,18 +1210,51 @@ void group_norm_silu_pad3d(nb::ndarray<> x, OptArray weight, OptArray bias, nb::
         require_dtype(*bias, code, code, kFn, "bias");
         require_len(*weight, C, kFn, "weight");
         require_len(*bias, C, kFn, "bias");
-        if (!workspace.has_value()) {
-            throw std::runtime_error(std::string(kFn) + ": the norm needs a workspace");
+        if (stats.has_value()) {
+            require_dtype(*stats, 0, 0, kFn, "stats");
+            require_len(*stats, 2 * static_cast<int64_t>(B) * T * num_groups, kFn, "stats");
+        } else {
+            if (!workspace.has_value()) {
+                throw std::runtime_error(std::string(kFn) + ": the norm needs a workspace");
+            }
+            require_dtype(*workspace, 0, 0, kFn, "workspace");
+            const int64_t chunks = (static_cast<int64_t>(H) * W + 1023) / 1024;
+            require_len(*workspace, 2 * static_cast<int64_t>(B) * T * (chunks * C + num_groups),
+                        kFn, "workspace");
         }
-        require_dtype(*workspace, 0, 0, kFn, "workspace");
-        const int64_t chunks = (static_cast<int64_t>(H) * W + 1023) / 1024;
-        require_len(*workspace, 2 * static_cast<int64_t>(B) * T * (chunks * C + num_groups), kFn,
-                    "workspace");
     }
+    const bool own_stats = weight.has_value() && !stats.has_value();
     launch_group_norm_silu_pad3d(x.data(), opt_data(weight), opt_data(bias), out.data(),
-                                 weight.has_value() ? workspace->data() : nullptr, B, C, T, H, W,
+                                 own_stats ? workspace->data() : nullptr,
+                                 weight.has_value() ? opt_data(stats) : nullptr, B, C, T, H, W,
                                  num_groups, eps, left, right, top, bottom, front, silu, zero_pad,
-                                 code, reinterpret_cast<hipStream_t>(stream_ptr));
+                                 row_stride, code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// Per-frame GroupNorm (mean, rstd) of NDHWC x into stats [B*T*num_groups] float2.
+void group_norm_stats3d(nb::ndarray<> x, nb::ndarray<> workspace, nb::ndarray<> stats, int B,
+                        int C, int T, int H, int W, int num_groups, float eps, int64_t row_stride,
+                        uintptr_t stream_ptr) {
+    constexpr const char* kFn = "group_norm_stats3d";
+    require_nonneg(B, kFn, "B");
+    require_positive(C, kFn, "C");
+    require_nonneg(T, kFn, "T");
+    require_positive(H, kFn, "H");
+    require_positive(W, kFn, "W");
+    require_positive(num_groups, kFn, "num_groups");
+    const int code = map_dtype_to_code(x.dtype());
+    if (code != 1 && code != 2) {
+        throw std::runtime_error(std::string(kFn) + ": x must be float16 or bfloat16");
+    }
+    require_row_strided(x, static_cast<int64_t>(B) * T, H, W, C, row_stride, kFn);
+    require_dtype(workspace, 0, 0, kFn, "workspace");
+    require_dtype(stats, 0, 0, kFn, "stats");
+    const int64_t chunks = (static_cast<int64_t>(H) * W + 1023) / 1024;
+    require_len(workspace, 2 * static_cast<int64_t>(B) * T * chunks * C, kFn, "workspace");
+    require_len(stats, 2 * static_cast<int64_t>(B) * T * num_groups, kFn, "stats");
+    launch_group_norm_stats3d(x.data(), workspace.data(), stats.data(), B, C, T, H, W, num_groups,
+                              eps, row_stride, code, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -1987,14 +2049,13 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
 // BF16 decode attention. Every extent below is derived from the operands rather
 // than taken from the caller, and the kernel indexes with the strides passed
 // here, so a mismatch is an out-of-bounds device access. Mirrors the checks in
-// the CUDA binding and adds the two the HIP kernel needs: it reads four
+// the CUDA binding and adds the two the HIP kernel needs: it reads two or four
 // elements at a time, and it addresses the output with q's strides.
 void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
                             nb::ndarray<> kv_lengths, nb::ndarray<> output,
                             nb::ndarray<> softmax_lse, nb::ndarray<> softmax_lse_accum,
                             nb::ndarray<> output_accum, int num_splits, uintptr_t stream_ptr) {
     constexpr const char* kFn = "flash_attention_decode";
-    constexpr int kElemsPerLoad = 4;
     if (q.ndim() != 3 || k.ndim() != 4 || v.ndim() != 4 || output.ndim() != 3 ||
         kv_lengths.ndim() != 1) {
         throw std::runtime_error(std::string(kFn) + ": operand rank mismatch");
@@ -2007,9 +2068,10 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
     require_positive(heads, kFn, "heads");
     const int query_length = static_cast<int>(q.shape(0)) / batch;
     const int head_dim = static_cast<int>(q.shape(2));
+    const int elems_per_load = head_dim == 64 ? 2 : 4;
     require_positive(query_length, kFn, "query_length");
     if (static_cast<int64_t>(q.shape(0)) != static_cast<int64_t>(batch) * query_length ||
-        static_cast<int>(q.shape(1)) != heads || (head_dim != 128 && head_dim != 256) ||
+        static_cast<int>(q.shape(1)) != heads || (head_dim != 64 && head_dim != 128 && head_dim != 256) ||
         static_cast<int>(k.shape(3)) != head_dim) {
         throw std::runtime_error(std::string(kFn) + ": invalid q/k dimensions");
     }
@@ -2060,21 +2122,23 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
     if (output.stride(0) != q.stride(0) || output.stride(1) != q.stride(1)) {
         throw std::runtime_error(std::string(kFn) + ": output strides must match q");
     }
-    // Rows are read four elements at a time, so every row start has to stay on
+    // Rows are read two or four elements at a time, so every row start has to stay on
     // that boundary.
     const int64_t vectored[] = {q.stride(0), q.stride(1), k.stride(0), k.stride(1), k.stride(2)};
     for (int64_t stride : vectored) {
-        if (stride % kElemsPerLoad != 0) {
-            throw std::runtime_error(std::string(kFn) + ": strides must be a multiple of 4");
+        if (stride % elems_per_load != 0) {
+            throw std::runtime_error(std::string(kFn) + ": strides must be a multiple of " +
+                                     std::to_string(elems_per_load));
         }
     }
     // A view carries a byte offset, so operands with aligned strides can still
-    // begin off the boundary the four-element load needs.
-    constexpr uintptr_t kLoadBytes = kElemsPerLoad * sizeof(uint16_t);
+    // begin off the boundary the vector load needs.
+    const uintptr_t load_bytes = elems_per_load * sizeof(uint16_t);
     const void* row_starts[] = {q.data(), k.data(), v.data(), output.data()};
     for (const void* base : row_starts) {
-        if (reinterpret_cast<uintptr_t>(base) % kLoadBytes != 0) {
-            throw std::runtime_error(std::string(kFn) + ": q, k, v and output must be 8-byte aligned");
+        if (reinterpret_cast<uintptr_t>(base) % load_bytes != 0) {
+            throw std::runtime_error(std::string(kFn) + ": q, k, v and output must be " +
+                                     std::to_string(load_bytes) + "-byte aligned");
         }
     }
     // The launcher takes raw pointers, so anything but ROCm device memory would
@@ -2943,10 +3007,14 @@ NB_MODULE(_C, m) {
     m.def("adaln", &adaln);
     m.def("rms_adaln", &rms_adaln);
     m.def("group_norm_silu_pad3d", &group_norm_silu_pad3d, nb::arg("x"), nb::arg("weight").none(),
-          nb::arg("bias").none(), nb::arg("out"), nb::arg("workspace").none(), nb::arg("B"),
-          nb::arg("C"), nb::arg("T"), nb::arg("H"), nb::arg("W"), nb::arg("num_groups"),
-          nb::arg("eps"), nb::arg("left"), nb::arg("right"), nb::arg("top"), nb::arg("bottom"),
-          nb::arg("front"), nb::arg("silu"), nb::arg("zero_pad"), nb::arg("stream_ptr"));
+          nb::arg("bias").none(), nb::arg("out"), nb::arg("workspace").none(),
+          nb::arg("stats").none(), nb::arg("B"), nb::arg("C"), nb::arg("T"), nb::arg("H"),
+          nb::arg("W"), nb::arg("num_groups"), nb::arg("eps"), nb::arg("left"), nb::arg("right"),
+          nb::arg("top"), nb::arg("bottom"), nb::arg("front"), nb::arg("silu"),
+          nb::arg("zero_pad"), nb::arg("row_stride"), nb::arg("stream_ptr"));
+    m.def("group_norm_stats3d", &group_norm_stats3d, nb::arg("x"), nb::arg("workspace"),
+          nb::arg("stats"), nb::arg("B"), nb::arg("C"), nb::arg("T"), nb::arg("H"), nb::arg("W"),
+          nb::arg("num_groups"), nb::arg("eps"), nb::arg("row_stride"), nb::arg("stream_ptr"));
     m.def("apply_rope", &apply_rope);
     m.def("rms_rope", &rms_rope);
     m.def("gemv_awq_w4a16", &gemv_awq_w4a16);
