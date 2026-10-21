@@ -114,7 +114,7 @@ def test_scaled_mm_fp8_matches_reference(hip, m, n, k, bias):
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize(("m", "n", "k"), GEMM_SHAPES + [(257, 137, 1024)])
+@pytest.mark.parametrize(("m", "n", "k"), [*GEMM_SHAPES, (257, 137, 1024)])
 @pytest.mark.parametrize("per_channel", [False, True])
 @needs_wmma
 def test_int8_linear_matches_eager(m, n, k, per_channel):
