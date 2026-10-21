@@ -2570,7 +2570,9 @@ def test_gemv_awq_w4a16_matches_eager(m, n, k):
 
 
 @pytest.mark.parametrize("act_unsigned", [False, True])
-@pytest.mark.parametrize(("m", "n", "k", "r"), [(256, 1024, 1024, 32), (333, 512, 512, 16)])
+@pytest.mark.parametrize(
+    ("m", "n", "k", "r"), [(256, 1024, 1024, 32), (333, 512, 512, 16), (333, 200, 320, 40)]
+)
 @needs_wmma
 def test_svdquant_w4a4_beats_eager_against_fp32_truth(m, n, k, r, act_unsigned):
     """HIP quantizes in fp32 where eager quantizes in bf16, so the two do not
@@ -3072,6 +3074,34 @@ def test_svdquant_tail_group_stays_in_bounds(hip, k):
 
     assert out.shape[1] == n
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_svdquant_lora_down_without_matrix_cores(hip, monkeypatch, dtype):
+    """RDNA2 registers the quantizer but has no WMMA, where the GEMM core's stub
+    traps, so a 16-bit LoRA-down has to run on the fp32 kernel."""
+    torch.manual_seed(0)
+    m, k, r = 100, 320, 40
+    x = torch.randn(m, k, device=DEV, dtype=dtype)
+    smooth = torch.rand(k, device=DEV, dtype=dtype) + 0.5
+    lora_down = torch.randn(k, r, device=DEV, dtype=dtype) * 0.05
+
+    real_dl = hip._dl
+    dtypes = []
+
+    def record(t):
+        dtypes.append(t.dtype)
+        return real_dl(t)
+
+    monkeypatch.setattr(hip, "_dl", record)
+    monkeypatch.setattr(hip, "has_wmma", lambda: False)
+    _, _, lora_act = hip.quantize_svdquant_w4a4(x, smooth, lora_down)
+    torch.cuda.synchronize()
+
+    # x, proj_down^T and lora_act are the last operands handed to the kernel.
+    assert dtypes[-3:] == [torch.float32] * 3
+    ref = x.double() @ lora_down.double()
+    torch.testing.assert_close(lora_act[:m].double(), ref, rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize("split_half", [False, True])

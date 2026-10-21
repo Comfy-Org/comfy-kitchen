@@ -1548,8 +1548,13 @@ def quantize_svdquant_w4a4(
         _dl(xc), _dl(smooth), _dl(q), _dl(ascales),
         m, m_pad, k, act_unsigned, _stream(x),
     )
+    # The kernel takes proj_down as (R, K) in x's dtype: the (N, K) weight layout of
+    # the WMMA GEMM core. Without matrix cores a 16-bit x takes the fp32 kernel.
+    if lora_src.dtype != torch.float32 and not has_wmma():
+        lora_src = lora_src.float()
+    down_t =_aligned(lora_down.to(lora_src.dtype).t().contiguous())
     _C.svdquant_lora_down(
-        _dl(lora_src), _dl(lora_down), _dl(lora_act[:m]), m, k, r, _stream(x)
+        _dl(lora_src), _dl(down_t), _dl(lora_act[:m]), m, k, r, _stream(x)
     )
     return q, ascales, lora_act
 
