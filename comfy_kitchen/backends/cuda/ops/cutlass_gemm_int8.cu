@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
+#include <type_traits>
 
 #ifdef COMFY_HAVE_CUTLASS
 
@@ -121,7 +122,9 @@ struct FusedInt8Gemm {
 
 // FusedInt8Gemm with the pre-norm block's addcmul in the epilogue:
 //   D = residual + rscale[n] * (acc * xs * ws + bias); rscale and residual in the output dtype.
-template <typename ElementOutput, int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages,
+// Scaled = false drops the rscale node: D = residual + (acc * xs * ws + bias) for a unit
+// scale. residual may be D itself: each element is loaded and stored by the same thread.
+template <bool Scaled, typename ElementOutput, int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages,
           typename ArchTag = cutlass::arch::Sm80,
           bool ScalarWeightScale = false, int AlignmentAB = 16,
           typename ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>>
@@ -155,8 +158,9 @@ struct FusedInt8GemmResidual {
     using EVT2 = cutlass::epilogue::threadblock::Sm80EVT<Add2, EVT1, Bias>;
     using Mul3 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, ElementCompute, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
     using EVT3 = cutlass::epilogue::threadblock::Sm80EVT<Mul3, EVT2, RScale>;
+    using Branch = std::conditional_t<Scaled, EVT3, EVT2>;
     using Add4 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::plus, ElementOutput, ElementCompute, cutlass::FloatRoundStyle::round_to_nearest>;
-    using EVT4 = cutlass::epilogue::threadblock::Sm80EVT<Add4, EVT3, Resid>;
+    using EVT4 = cutlass::epilogue::threadblock::Sm80EVT<Add4, Branch, Resid>;
     using StoreD = cutlass::epilogue::threadblock::VisitorAuxStore<ThreadMap, ElementOutput, cutlass::FloatRoundStyle::round_to_nearest, cute::Stride<int64_t, _1, int64_t>>;
     using EVTD = cutlass::epilogue::threadblock::Sm80EVT<StoreD, EVT4>;
 
@@ -175,12 +179,20 @@ struct FusedInt8GemmResidual {
                     const ElementOutput* bias, const ElementOutput* rscale, const ElementOutput* resid,
                     ElementOutput* D, int M, int N, int K, cudaStream_t stream) {
         const auto weight_scale_args = WeightScaleBroadcast<ThreadMap, ScalarWeightScale>::arguments(ws, N);
+        const typename EVT2::Arguments linear{
+            {  { {}, {const_cast<float*>(xs), 0.f, {_1{}, _0{}, M}}, {} },
+               weight_scale_args, {} },
+            {const_cast<ElementOutput*>(bias), ElementOutput(0), {_0{}, _1{}, N}}, {} };
+        const auto branch = [&] {
+            if constexpr (Scaled) {
+                return typename EVT3::Arguments{
+                    linear, {const_cast<ElementOutput*>(rscale), ElementOutput(0), {_0{}, _1{}, N}}, {} };
+            } else {
+                return linear;
+            }
+        }();
         typename EVTD::Arguments cb{
-            { { { {  { {}, {const_cast<float*>(xs), 0.f, {_1{}, _0{}, M}}, {} },
-                     weight_scale_args, {} },
-                  {const_cast<ElementOutput*>(bias), ElementOutput(0), {_0{}, _1{}, N}}, {} },
-                {const_cast<ElementOutput*>(rscale), ElementOutput(0), {_0{}, _1{}, N}}, {} },
-              {const_cast<ElementOutput*>(resid), ElementOutput(0), {int64_t(N), _1{}, int64_t(M) * N}}, {} },
+            { branch, {const_cast<ElementOutput*>(resid), ElementOutput(0), {int64_t(N), _1{}, int64_t(M) * N}}, {} },
             {D, {int64_t(N), _1{}, int64_t(M) * N}} };
         return comfy_cutlass::launch_universal<Gemm>(
             A, B, cb, M, N, K, stream);
@@ -273,8 +285,8 @@ template <typename OutT, typename C>
 using PlainGemm = FusedInt8Gemm<OutT, C::TBM, C::TBN, C::TBK, C::WM, C::WN, C::WK, C::NumStages,
                                 cutlass::arch::Sm80, false, C::AlignmentAB,
                                 typename C::ThreadblockSwizzle>;
-template <typename OutT, typename C>
-using ResidualGemm = FusedInt8GemmResidual<OutT, C::TBM, C::TBN, C::TBK, C::WM, C::WN, C::WK,
+template <bool Scaled, typename OutT, typename C>
+using ResidualGemm = FusedInt8GemmResidual<Scaled, OutT, C::TBM, C::TBN, C::TBK, C::WM, C::WN, C::WK,
                                            C::NumStages, cutlass::arch::Sm80, false,
                                            C::AlignmentAB, typename C::ThreadblockSwizzle>;
 
@@ -294,9 +306,9 @@ const FusedFn<OutT>* make_fused_runners(ConfigList<Cs...>) {
     return runners;
 }
 
-template <typename OutT, typename... Cs>
+template <bool Scaled, typename OutT, typename... Cs>
 const FusedResidualFn<OutT>* make_fused_residual_runners(ConfigList<Cs...>) {
-    static const FusedResidualFn<OutT> runners[sizeof...(Cs)] = {&ResidualGemm<OutT, Cs>::run...};
+    static const FusedResidualFn<OutT> runners[sizeof...(Cs)] = {&ResidualGemm<Scaled, OutT, Cs>::run...};
     return runners;
 }
 
@@ -332,7 +344,10 @@ template <typename OutT>
 bool dispatch_fused_residual(const int8_t* A, const int8_t* B, const float* xs, const float* ws,
                              const OutT* bias, const OutT* rscale, const OutT* resid,
                              OutT* D, int M, int N, int K, cudaStream_t stream) {
-    const FusedResidualFn<OutT>* runners = make_fused_residual_runners<OutT>(FusedInt8Configs{});
+    // rscale == nullptr is a unit scale: the unscaled epilogue neither loads nor multiplies it.
+    const FusedResidualFn<OutT>* runners = rscale != nullptr
+        ? make_fused_residual_runners<true, OutT>(FusedInt8Configs{})
+        : make_fused_residual_runners<false, OutT>(FusedInt8Configs{});
     return launch_fused_int8_heuristic(M, N, K, [&](int config) {
         return runners[config](A, B, xs, ws, bias, rscale, resid, D, M, N, K, stream);
     });
@@ -354,7 +369,8 @@ bool launch_cutlass_int8_dequant_residual(
     // Declining K == 0 keeps the caller's eager residual+bias fallback correct.
     if (K == 0) return false;
     // bias may be nullptr: the RowBroadcast visitor broadcasts null_default(0).
-    if (rscale == nullptr || resid == nullptr) return false;
+    // rscale may be nullptr: a unit residual scale. resid may equal D.
+    if (resid == nullptr) return false;
     const int8_t* a = static_cast<const int8_t*>(A);
     const int8_t* b = static_cast<const int8_t*>(B);
     const float* x = static_cast<const float*>(xs);

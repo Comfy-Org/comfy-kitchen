@@ -641,10 +641,11 @@ def w4a8_int8_linear(
     input_act_weight: torch.Tensor | None = None,
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | float | None = None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     """Compute x @ W.T + bias (then residual + residual_scale * that) using portable W4A8 operations."""
-    if residual is not None:
+    if residual is not None or residual_inplace:
         return apply_residual(
             w4a8_int8_linear(
                 x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
@@ -653,6 +654,7 @@ def w4a8_int8_linear(
             ),
             residual,
             residual_scale,
+            residual_inplace,
         )
     x = apply_input_act(x, input_act, input_act_weight, input_act_eps)
     _n, k, _bits = validate_w4a8_operands(

@@ -30,6 +30,7 @@ from comfy_kitchen.allocation import allocation_context
 from comfy_kitchen.backends import eager as _eager
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
 from comfy_kitchen.backends._activations import apply_residual as _apply_residual
+from comfy_kitchen.backends._activations import residual_output as _residual_output
 from comfy_kitchen.backends._activations import input_act_code as _input_act_code
 from comfy_kitchen.backends._activations import input_act_width as _input_act_width
 from comfy_kitchen.backends.eager import rope as _eager_rope
@@ -792,7 +793,8 @@ def fp16_linear(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
     residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | float | None = None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     """FP16 WMMA GEMM with bias and an optional ``residual + residual_scale * out``
     fused into the epilogue; torch's linear where the kernel declines the shape."""
@@ -803,6 +805,12 @@ def fp16_linear(
     x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
     m = x_2d.shape[0]
     n, k = weight.shape
+    inplace_out = (_residual_output(residual, (*orig_shape[:-1], n), x.dtype, x.device,
+                                    x, weight, bias, residual_scale) if residual_inplace else None)
+    unit_scale = isinstance(residual_scale, (float, int)) and residual_scale == 1.0
+    scale_supported = unit_scale or (isinstance(residual_scale, torch.Tensor)
+                                     and residual_scale.dtype == torch.float16
+                                     and residual_scale.numel() == n)
 
     supported = (
         x.dtype == torch.float16
@@ -813,7 +821,8 @@ def fp16_linear(
         and x_2d.data_ptr() % 16 == 0
         and (bias is None or bias.dtype == torch.float16)
         and (residual is None or (residual.dtype == torch.float16
-                                  and residual_scale.dtype == torch.float16))
+                                  and residual.numel() == m * n and scale_supported))
+        and (not residual_inplace or inplace_out is not None)
     )
     if supported:
         weight = weight if weight.is_contiguous() else weight.contiguous()
@@ -823,16 +832,17 @@ def fp16_linear(
         bias = None if bias is None else bias.to(device=x.device)
         if residual is not None:
             residual = residual.to(device=x.device)
-            residual_scale = residual_scale.to(device=x.device)
+            if isinstance(residual_scale, torch.Tensor):
+                residual_scale = residual_scale.to(device=x.device)
         out = torch.nn.functional.linear(x, weight, bias)
-        return _apply_residual(out, residual, residual_scale)
+        return _apply_residual(out, residual, residual_scale, residual_inplace)
 
-    out = torch.empty((m, n), dtype=torch.float16, device=x.device)
+    out = inplace_out.reshape(m, n) if inplace_out is not None else torch.empty((m, n), dtype=torch.float16, device=x.device)
     bias_arg = None if bias is None else _vector_operand(bias, x.device, torch.float16)
     resid_arg = rscale_arg = None
     if residual is not None:
         resid_arg = residual.to(device=x.device).reshape(m, n).contiguous()
-        rscale_arg = _vector_operand(residual_scale, x.device, torch.float16)
+        rscale_arg = None if unit_scale else _vector_operand(residual_scale, x.device, torch.float16)
     served = _C.fp16_gemm(
         _dl(x_2d), _dl(weight), _dl(out),
         None if bias_arg is None else _dl(bias_arg),
@@ -841,8 +851,10 @@ def fp16_linear(
         m, n, k, _stream(x),
     )
     if not served:
-        out = _apply_residual(torch.nn.functional.linear(x_2d, weight, bias_arg), resid_arg,
-                              rscale_arg)
+        out = _apply_residual(torch.nn.functional.linear(x, weight, bias_arg), residual,
+                              residual_scale, residual_inplace)
+    if residual_inplace:
+        return residual
     return out if len(orig_shape) == 2 else out.reshape(*orig_shape[:-1], n)
 
 
@@ -869,7 +881,8 @@ def int8_linear(
     input_act_weight: torch.Tensor | None = None,
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | float | None = None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     """INT8 linear with dynamic row-wise activation quantization, on WMMA."""
     # Rejected here so every route fails the same way, not just the fused one.
@@ -929,6 +942,7 @@ def int8_linear(
                 x2d.reshape(*orig_shape[:-1], x2d.shape[-1]),
                 weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
                 input_act=input_act, residual=residual, residual_scale=residual_scale,
+                residual_inplace=residual_inplace,
             )
         q, x_scale = _rotate_quant_int8(
             x2d, convrot_groupsize, input_act, act_weight, input_act_eps,
@@ -955,7 +969,7 @@ def int8_linear(
     # Unlike CUDA, the residual is not folded into the epilogue: the per-element
     # residual reads there cost more than a separate addcmul at the output widths
     # pre-norm blocks apply it to.
-    return _apply_residual(out.reshape(*orig_shape[:-1], n), residual, residual_scale)
+    return _apply_residual(out.reshape(*orig_shape[:-1], n), residual, residual_scale, residual_inplace)
 
 
 def rms_gated_residual(
@@ -1555,7 +1569,8 @@ def w4a8_int8_linear(
     input_act_weight: torch.Tensor | None = None,
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | float | None = None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     """``x @ W.T + bias`` via the HIP INT4/INT6 decode feeding the WMMA INT8 GEMM.
 
@@ -1565,7 +1580,7 @@ def w4a8_int8_linear(
     packed weight itself, so a few rows take a GEMV that dequantizes in registers
     and never writes the INT8 weight at all.
     """
-    if residual is not None:
+    if residual is not None or residual_inplace:
         return _apply_residual(
             w4a8_int8_linear(
                 x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
@@ -1574,6 +1589,7 @@ def w4a8_int8_linear(
             ),
             residual,
             residual_scale,
+            residual_inplace,
         )
     x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
     _n, k, _bits = validate_w4a8_operands(
@@ -3117,7 +3133,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 ),
                 "bias": ParamConstraint(dtypes=frozenset({torch.float16})),
                 "residual": ParamConstraint(dtypes=frozenset({torch.float16})),
-                "residual_scale": ParamConstraint(dtypes=frozenset({torch.float16})),
+                "residual_scale": ParamConstraint(dtypes=frozenset({torch.float16, float, int})),
             },
             default_devices=dev,
         ),

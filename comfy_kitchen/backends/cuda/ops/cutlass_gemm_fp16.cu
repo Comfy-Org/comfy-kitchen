@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <type_traits>
 
 #ifdef COMFY_HAVE_CUTLASS
 
@@ -81,8 +82,10 @@ struct Fp16Gemm {
 };
 
 // D = resid + rscale[n] * (acc + bias[n]) -- a pre-norm block's addcmul.
-// The multiply and adds run in float; only loads/stores are half.
-template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages,
+// The multiply and adds run in float; only loads/stores are half. Scaled = false
+// drops the rscale node: D = resid + (acc + bias[n]) for a unit residual scale.
+// resid may be D itself: each element is loaded and stored by the same thread.
+template <bool Scaled, int TBM, int TBN, int TBK, int WM, int WN, int WK, int NumStages,
           typename ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>>
 struct Fp16GemmResidual {
     using TB   = cutlass::gemm::GemmShape<TBM, TBN, TBK>;
@@ -96,8 +99,9 @@ struct Fp16GemmResidual {
     using EVT0 = cutlass::epilogue::threadblock::Sm80EVT<Add0, Accum, Bias>;
     using Mul1 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::multiplies, float, float, cutlass::FloatRoundStyle::round_to_nearest>;
     using EVT1 = cutlass::epilogue::threadblock::Sm80EVT<Mul1, EVT0, RScale>;
+    using Branch = std::conditional_t<Scaled, EVT1, EVT0>;
     using Add2 = cutlass::epilogue::threadblock::VisitorCompute<cutlass::plus, half_t, float, cutlass::FloatRoundStyle::round_to_nearest>;
-    using EVT2 = cutlass::epilogue::threadblock::Sm80EVT<Add2, EVT1, Resid>;
+    using EVT2 = cutlass::epilogue::threadblock::Sm80EVT<Add2, Branch, Resid>;
     using StoreD = cutlass::epilogue::threadblock::VisitorAuxStore<ThreadMap, half_t, cutlass::FloatRoundStyle::round_to_nearest, cute::Stride<int64_t, _1, int64_t>>;
     using EVTD = cutlass::epilogue::threadblock::Sm80EVT<StoreD, EVT2>;
     using Base = Fp16GemmBase<TBM, TBN, TBK, WM, WN, WK, NumStages, EVTD, ThreadblockSwizzle>;
@@ -105,10 +109,18 @@ struct Fp16GemmResidual {
     static bool run(const half_t* A, const half_t* B, const half_t* bias,
                     const half_t* rscale, const half_t* resid,
                     half_t* D, int M, int N, int K, cudaStream_t stream) {
+        const typename EVT0::Arguments linear{
+            {}, {const_cast<half_t*>(bias), half_t(0), {_0{}, _1{}, N}}, {} };
+        const auto branch = [&] {
+            if constexpr (Scaled) {
+                return typename EVT1::Arguments{
+                    linear, {const_cast<half_t*>(rscale), half_t(0), {_0{}, _1{}, N}}, {} };
+            } else {
+                return linear;
+            }
+        }();
         typename EVTD::Arguments cb{
-            { { { {}, {const_cast<half_t*>(bias), half_t(0), {_0{}, _1{}, N}}, {} },
-                {const_cast<half_t*>(rscale), half_t(0), {_0{}, _1{}, N}}, {} },
-              {const_cast<half_t*>(resid), half_t(0), {int64_t(N), _1{}, int64_t(M) * N}}, {} },
+            { branch, {const_cast<half_t*>(resid), half_t(0), {int64_t(N), _1{}, int64_t(M) * N}}, {} },
             {D, {int64_t(N), _1{}, int64_t(M) * N}} };
         return Base::launch(A, B, cb, M, N, K, stream);
     }
@@ -150,9 +162,9 @@ bool launch_fp16_heuristic(int m, int n, int k, Launch launch) {
 template <typename C>
 using PlainGemm = Fp16Gemm<C::TBM, C::TBN, C::TBK, C::WM, C::WN, C::WK, C::NumStages,
                            typename C::ThreadblockSwizzle>;
-template <typename C>
-using ResidualGemm = Fp16GemmResidual<C::TBM, C::TBN, C::TBK, C::WM, C::WN, C::WK, C::NumStages,
-                                      typename C::ThreadblockSwizzle>;
+template <bool Scaled, typename C>
+using ResidualGemm = Fp16GemmResidual<Scaled, C::TBM, C::TBN, C::TBK, C::WM, C::WN, C::WK,
+                                      C::NumStages, typename C::ThreadblockSwizzle>;
 
 using Fp16Fn = bool (*)(const half_t*, const half_t*, const half_t*, half_t*, int, int, int, cudaStream_t);
 using Fp16ResidualFn = bool (*)(const half_t*, const half_t*, const half_t*, const half_t*,
@@ -164,9 +176,9 @@ const Fp16Fn* fp16_runners(ConfigList<Cs...>) {
     return runners;
 }
 
-template <typename... Cs>
+template <bool Scaled, typename... Cs>
 const Fp16ResidualFn* fp16_residual_runners(ConfigList<Cs...>) {
-    static const Fp16ResidualFn runners[sizeof...(Cs)] = {&ResidualGemm<Cs>::run...};
+    static const Fp16ResidualFn runners[sizeof...(Cs)] = {&ResidualGemm<Scaled, Cs>::run...};
     return runners;
 }
 
@@ -183,7 +195,10 @@ bool dispatch_fp16(const half_t* A, const half_t* B, const half_t* bias,
 bool dispatch_fp16_residual(const half_t* A, const half_t* B, const half_t* bias,
                             const half_t* rscale, const half_t* resid,
                             half_t* D, int M, int N, int K, cudaStream_t stream) {
-    const Fp16ResidualFn* runners = fp16_residual_runners(Fp16Configs{});
+    // rscale == nullptr is a unit scale: the unscaled epilogue neither loads nor multiplies it.
+    const Fp16ResidualFn* runners = rscale != nullptr
+        ? fp16_residual_runners<true>(Fp16Configs{})
+        : fp16_residual_runners<false>(Fp16Configs{});
     return launch_fp16_heuristic(M, N, K, [&](int config) {
         return runners[config](A, B, bias, rscale, resid, D, M, N, K, stream);
     });
@@ -219,7 +234,8 @@ bool launch_cutlass_fp16_linear_residual(
     if (M == 0 || N == 0) return true;
     if (!fp16_gemm_shape_ok(M, N, K)) return false;
     // bias may be nullptr: the RowBroadcast visitor broadcasts null_default(0).
-    if (rscale == nullptr || resid == nullptr) return false;
+    // rscale may be nullptr: a unit residual scale. resid may equal D.
+    if (resid == nullptr) return false;
     return dispatch_fp16_residual(
         static_cast<const half_t*>(A), static_cast<const half_t*>(B),
         static_cast<const half_t*>(bias), static_cast<const half_t*>(rscale),

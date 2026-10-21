@@ -7,6 +7,7 @@ from .backends import cuda as _cuda_backend
 from .backends import ascend as _ascend_backend  # noqa: F401
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
+from .backends._activations import apply_residual
 from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
@@ -1013,28 +1014,28 @@ def fp16_linear(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
     residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | float | None = None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     """fp16-accumulate linear, optionally with ``residual + residual_scale * out`` fused.
 
     Same numerics as ``torch.backends.cuda.matmul.allow_fp16_accumulation``, so
-    route here only when the user opted into that mode.
+    route here only when the user opted into that mode. Scalar scale 1.0 omits
+    the scale load/multiply. residual_inplace updates and returns residual,
+    which must have the exact output shape, dtype and device.
     """
     if not _fp16_linear_fills_gpu(x.shape[:-1].numel(), weight.shape[0], weight.shape[1]):
         # cuBLAS (already fp16-accumulate when the caller opted in) wins outright
         # below these sizes, and the dispatch alone would cost more than the call
         out = torch.nn.functional.linear(x, weight, bias)
-        if residual is None:
-            return out
-        if residual_scale is None:
-            raise ValueError("fp16_linear: residual requires residual_scale")
-        return torch.addcmul(residual.to(out.dtype), out, residual_scale.to(out.dtype))
+        return apply_residual(out, residual, residual_scale, residual_inplace)
     kwargs = {
         "x": x,
         "weight": weight,
         "bias": bias,
         "residual": residual,
         "residual_scale": residual_scale,
+        "residual_inplace": residual_inplace,
     }
     impl = registry.get_implementation("fp16_linear", kwargs=kwargs)
     return impl(**kwargs)
@@ -1061,7 +1062,8 @@ def int8_linear(
     input_act_weight: torch.Tensor | None = None,
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | float | None = None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     """INT8 linear layer dynamically quantized.
 
@@ -1084,7 +1086,10 @@ def int8_linear(
         residual: Optional [..., N] tensor; the result becomes
             ``residual + residual_scale * linear(x)`` (a pre-norm block's
             addcmul), fused into the GEMM epilogue where supported.
-        residual_scale: Per-channel [N] scale for the residual form.
+        residual_scale: Per-channel [N] tensor or scalar scale. Scalar 1.0
+            omits the scale load/multiply in fused epilogues.
+        residual_inplace: Update and return residual. It must have the exact
+            output shape, dtype and device; other inputs are read before updating.
 
     Returns:
         Result tensor.
@@ -1104,6 +1109,7 @@ def int8_linear(
         "input_act_eps": input_act_eps,
         "residual": residual,
         "residual_scale": residual_scale,
+        "residual_inplace": residual_inplace,
     }
     impl = registry.get_implementation("int8_linear", kwargs=kwargs)
     return impl(**kwargs)

@@ -630,7 +630,10 @@ __global__ void int8_gemv_dequant_kernel(
 // One warp per output column. Vec16: 16-byte weight/activation loads (K % 16 == 0), the
 // integer accumulation is order-independent so the result matches the 4-byte loop exactly.
 // residual (nullable): out = residual + residual_scale * out, with the linear rounded to
-// OutputType first, as the unfused addcmul sees it.
+// OutputType first, as the unfused addcmul sees it. A null residual_scale is a unit scale:
+// omit its load and multiply; explicit fmaf preserves the scaled path's rounding.
+// residual may alias output (no __restrict__): lane 0 of column n's warp is the only
+// thread that reads residual[n] and writes output[n], and it reads first.
 template<int WARPS_PER_BLOCK, typename OutputType, typename BiasType, bool Vec16>
 __global__ void int8_gemv_dequant_warp_kernel(
     const int8_t* __restrict__ x,
@@ -638,12 +641,12 @@ __global__ void int8_gemv_dequant_warp_kernel(
     const float* __restrict__ x_scales,
     const float* __restrict__ weight_scales,
     const BiasType* __restrict__ bias,
-    OutputType* __restrict__ output,
+    OutputType* output,
     int N,
     int K,
     int weight_scale_size,
     bool has_bias,
-    const OutputType* __restrict__ residual,
+    const OutputType* residual,
     const OutputType* __restrict__ residual_scale)
 {
     const int lane = threadIdx.x & (kThreadsPerWarp - 1);
@@ -684,7 +687,8 @@ __global__ void int8_gemv_dequant_warp_kernel(
         }
         if (residual != nullptr) {
             const float linear = to_float(from_float<OutputType>(value));
-            value = to_float(residual[n]) + to_float(residual_scale[n]) * linear;
+            const float res = to_float(residual[n]);
+            value = residual_scale ? fmaf(to_float(residual_scale[n]), linear, res) : res + linear;
         }
         output[n] = from_float<OutputType>(value);
     }
@@ -1392,12 +1396,12 @@ __global__ void __launch_bounds__(kFusedGemvThreads) int8_gemv_convrot_fused_ker
     const int8_t* __restrict__ weight,
     const float* __restrict__ weight_scales,
     const BiasType* __restrict__ bias,
-    OutputType* __restrict__ output,
+    OutputType* output,
     int N,
     int K,
     int weight_scale_size,
     bool has_bias,
-    const OutputType* __restrict__ residual,
+    const OutputType* residual,
     const OutputType* __restrict__ residual_scale)
 {
     constexpr int kWarps = kFusedGemvThreads / kThreadsPerWarp;
@@ -1442,7 +1446,8 @@ __global__ void __launch_bounds__(kFusedGemvThreads) int8_gemv_convrot_fused_ker
                 }
                 if (residual != nullptr) {
                     const float linear = to_float(from_float<OutputType>(value));
-                    value = to_float(residual[n]) + to_float(residual_scale[n]) * linear;
+                    const float res = to_float(residual[n]);
+                    value = residual_scale ? fmaf(to_float(residual_scale[n]), linear, res) : res + linear;
                 }
                 output[n] = from_float<OutputType>(value);
             }

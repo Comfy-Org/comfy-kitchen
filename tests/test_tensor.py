@@ -17,7 +17,9 @@ from comfy_kitchen.tensor import (
 @pytest.mark.parametrize("bits", [4, 6, 8])
 @pytest.mark.parametrize("activation", ["rms_norm", "swiglu"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
-def test_linear_input_act(bits, activation, input_dtype):
+@pytest.mark.parametrize("inplace", [False, True])
+@pytest.mark.parametrize("unit_scale", [False, True])
+def test_linear_input_act(bits, activation, input_dtype, inplace, unit_scale):
     torch.manual_seed(7)
     w = torch.randn(32, 256, dtype=torch.bfloat16)
     weight = (QuantizedTensor.from_float(w, "TensorWiseINT8Layout", convrot=True, per_channel=True)
@@ -27,11 +29,14 @@ def test_linear_input_act(bits, activation, input_dtype):
     bias = torch.randn(32, dtype=input_dtype)
     out_dtype = input_dtype if bits == 8 else w.dtype
     residual = torch.randn(3, 32, dtype=out_dtype)
-    scale = torch.linspace(-1, 2, 32, dtype=out_dtype)
+    scale = 1.0 if unit_scale else torch.linspace(-1, 2, 32, dtype=out_dtype)
     activated = (torch.nn.functional.rms_norm(x, (256,), norm, 1e-6) if activation == "rms_norm"
                  else torch.nn.functional.silu(x[:, :256]) * x[:, 256:])
-    expected = torch.addcmul(residual, torch.nn.functional.linear(activated, weight, bias), scale)
-    got = weight.linear_input_act(x, bias, activation, norm, 1e-6, residual, scale)
+    plain = torch.nn.functional.linear(activated, weight, bias)
+    expected = residual + plain if unit_scale else torch.addcmul(residual, plain, scale)
+    got = weight.linear_input_act(x, bias, activation, norm, 1e-6, residual, scale, residual_inplace=inplace)
+    if inplace:
+        assert got is residual
     assert got.dtype == out_dtype
     assert torch.equal(got, expected)
 

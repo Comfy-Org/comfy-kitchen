@@ -507,7 +507,8 @@ static void require_fp16(const nb::ndarray<>& t, const char* fn, const char* nam
 }
 
 // D = A @ B^T + bias, or resid + rscale * (that). Every operand is fp16; false means
-// the caller serves the shape.
+// the caller serves the shape. A missing or empty rscale with resid is a unit scale,
+// and resid may be d itself.
 bool fp16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias, OptArray rscale,
                OptArray resid, int M, int N, int K, uintptr_t stream_ptr) {
     constexpr const char* kFn = "fp16_gemm";
@@ -524,17 +525,21 @@ bool fp16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias,
         require_fp16(*bias, kFn, "bias");
         require_len(*bias, N, kFn, "bias");
     }
-    if (rscale.has_value() != resid.has_value()) {
-        throw std::runtime_error(std::string(kFn) + ": rscale and resid must be given together");
+    const bool has_rscale = rscale.has_value() && rscale->size() > 0;
+    if (has_rscale && !resid.has_value()) {
+        throw std::runtime_error(std::string(kFn) + ": rscale requires resid");
     }
     if (resid.has_value()) {
-        require_fp16(*rscale, kFn, "rscale");
         require_fp16(*resid, kFn, "resid");
-        require_len(*rscale, N, kFn, "rscale");
         require_len(*resid, static_cast<int64_t>(M) * N, kFn, "resid");
     }
+    if (has_rscale) {
+        require_fp16(*rscale, kFn, "rscale");
+        require_len(*rscale, N, kFn, "rscale");
+    }
     const bool served = launch_fp16_gemm_kernel(
-        a.data(), b.data(), d.data(), opt_data(bias), opt_data(rscale), opt_data(resid), M, N, K,
+        a.data(), b.data(), d.data(), opt_data(bias), has_rscale ? rscale->data() : nullptr,
+        opt_data(resid), M, N, K,
         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
     return served;

@@ -259,7 +259,10 @@ template <int N> __device__ __forceinline__ void cp_async_wait() {
 // the workspace tile and counter to zero. So the workspace and counters are zero
 // on entry and on exit, and the caller keeps both across launches.
 // residual (nullable): out = residual + residual_scale * out, with the linear rounded
-// to OutputT first, as the unfused addcmul sees it (int8_linear.cu's contract).
+// to OutputT first, as the unfused addcmul sees it (int8_linear.cu's contract). A null
+// residual_scale omits the load and multiply; explicit fmaf retains scaled rounding.
+// residual may alias output (no __restrict__): only the finishing warp reads an
+// aliased residual, with each element read and written by the same lane.
 constexpr int kStreamStages = 4;
 constexpr int kMmaWarps = 8;
 
@@ -284,11 +287,11 @@ void w4a8_codebook_mma_stream_kernel(
     const float* __restrict__ s_channel,
     const float* __restrict__ x_scales,
     const float* __restrict__ bias,
-    const OutputT* __restrict__ residual,
+    const OutputT* residual,
     const OutputT* __restrict__ residual_scale,
     int* __restrict__ workspace,
     int* __restrict__ counters,
-    OutputT* __restrict__ output,
+    OutputT* output,
     int M, int N, int K, int rows)
 {
     constexpr int S = kStreamStages;
@@ -399,16 +402,18 @@ void w4a8_codebook_mma_stream_kernel(
     int* ws10 = &workspace[static_cast<int64_t>(token1) * N + n_top];
     int* ws11 = &workspace[static_cast<int64_t>(token1) * N + n_bottom];
     // Residual operands are issued here so they are in flight behind the atomics and
-    // fences below instead of on the finishing warp's dependent tail.
-    float r00 = 0.f, r01 = 0.f, r10 = 0.f, r11 = 0.f, rs_top = 0.f, rs_bottom = 0.f;
+    // fences below. An aliased residual is read only by the finishing warp below.
+    float r00 = 0.f, r01 = 0.f, r10 = 0.f, r11 = 0.f, rs_top = 1.f, rs_bottom = 1.f;
     if (residual) {
-        rs_top = static_cast<float>(residual_scale[n_top]);
-        rs_bottom = static_cast<float>(residual_scale[n_bottom]);
-        if (token0 < M) {
+        if (residual_scale) {
+            rs_top = static_cast<float>(residual_scale[n_top]);
+            rs_bottom = static_cast<float>(residual_scale[n_bottom]);
+        }
+        if (residual != output && token0 < M) {
             r00 = static_cast<float>(residual[static_cast<int64_t>(token0) * N + n_top]);
             r01 = static_cast<float>(residual[static_cast<int64_t>(token0) * N + n_bottom]);
         }
-        if (token1 < M) {
+        if (residual != output && token1 < M) {
             r10 = static_cast<float>(residual[static_cast<int64_t>(token1) * N + n_top]);
             r11 = static_cast<float>(residual[static_cast<int64_t>(token1) * N + n_bottom]);
         }
@@ -437,8 +442,9 @@ void w4a8_codebook_mma_stream_kernel(
         float value = static_cast<float>(__ldcg(ws)) * x_scales[tok] * s_channel[n];
         if (bias) value += bias[n];
         if (residual) {
+            if (residual == output) res = static_cast<float>(residual[static_cast<int64_t>(tok) * N + n]);
             const float linear = static_cast<float>(store_output<OutputT>(value));
-            value = res + res_scale * linear;
+            value = residual_scale ? fmaf(res_scale, linear, res) : res + linear;
         }
         output[static_cast<int64_t>(tok) * N + n] = store_output<OutputT>(value);
         *ws = 0;
@@ -674,8 +680,8 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
 
 // bits (4 or 6) is the code width. The workspace [M, N] int32 and counters [N/16] int32 must
 // be zero on entry and are zero again on exit, so the caller keeps both across
-// launches. residual [M, N] and residual_scale [N] are in the output dtype (both or
-// neither).
+// launches. residual [M, N] and residual_scale [N] are in the output dtype; a null
+// residual_scale with a residual is a unit scale. residual may be out itself.
 extern "C" bool launch_w4a8_codebook_mma(
     const void* xq, const void* weight, const void* decode_lut,
     const void* s_channel, const void* xs, const void* bias, const void* residual,

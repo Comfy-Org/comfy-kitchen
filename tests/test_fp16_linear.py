@@ -45,7 +45,9 @@ class TestFp16Linear:
 
     @pytest.mark.parametrize("m,n,k", [(1797, 2048, 2048), (1797, 2048, 8192), (512, 512, 512)])
     @pytest.mark.parametrize("with_bias", [True, False])
-    def test_residual_matches_eager_addcmul(self, m, n, k, with_bias, seed, cuda_available):
+    @pytest.mark.parametrize("inplace", [True, False])
+    @pytest.mark.parametrize("unit_scale", [True, False])
+    def test_residual_matches_eager_addcmul(self, m, n, k, with_bias, inplace, unit_scale, seed, cuda_available):
         if not cuda_available:
             pytest.skip("CUDA required")
 
@@ -53,12 +55,15 @@ class TestFp16Linear:
         w = torch.randn(n, k, dtype=torch.float16, device="cuda") * 0.02
         b = torch.randn(n, dtype=torch.float16, device="cuda") if with_bias else None
         resid = torch.randn(m, n, dtype=torch.float16, device="cuda")
-        rscale = torch.randn(n, dtype=torch.float16, device="cuda")
+        rscale = 1.0 if unit_scale else torch.randn(n, dtype=torch.float16, device="cuda")
 
         # same fp16-accum GEMM either way; only the epilogue rounding differs
         plain = ck.fp16_linear(x, w, b)
-        ref = torch.addcmul(resid, plain, rscale).float()
-        got = ck.fp16_linear(x, w, b, residual=resid, residual_scale=rscale).float()
+        ref = (resid + plain if unit_scale else torch.addcmul(resid, plain, rscale)).float()
+        got = ck.fp16_linear(x, w, b, residual=resid, residual_scale=rscale, residual_inplace=inplace)
+        if inplace:
+            assert got is resid
+        got = got.float()
         rel = rel_err(got, ref)
         assert rel < 1e-2, f"rel={rel:.3e}"
 

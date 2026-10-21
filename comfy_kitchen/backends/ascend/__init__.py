@@ -476,7 +476,8 @@ def int8_linear(
     input_act_weight: torch.Tensor | None = None,
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | float | None = None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     """Run dynamically quantized INT8 linear on Ascend NPU.
 
@@ -528,7 +529,7 @@ def int8_linear(
         output_dtype=out_dtype,
     )
     result = result.reshape(*orig_shape[:-1], weight.shape[0])
-    return _apply_residual(result, residual, residual_scale)
+    return _apply_residual(result, residual, residual_scale, residual_inplace)
 
 
 def convrot_w4a4_linear(
@@ -623,7 +624,7 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
                 "input_act_weight": ParamConstraint(dtypes=ascend_linear_floats),
                 "input_act_eps": ParamConstraint(dtypes=frozenset({float, int})),
                 "residual": ParamConstraint(dtypes=ascend_linear_floats),
-                "residual_scale": ParamConstraint(dtypes=ascend_linear_floats),
+                "residual_scale": ParamConstraint(dtypes=ascend_linear_floats | {float, int}),
             },
             default_devices=ascend_devices,
             call_rules=(_validate_int8_linear,),

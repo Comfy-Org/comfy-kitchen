@@ -124,7 +124,7 @@ class QuantizedLayout(ABC):
     @classmethod
     def linear_input_act(cls, weight: QuantizedTensor, x: torch.Tensor, bias=None,
                          input_act=None, input_act_weight=None, input_act_eps=0.0,
-                         residual=None, residual_scale=None):
+                         residual=None, residual_scale=None, residual_inplace=False):
         """Return the activated linear result, or NotImplemented without modifying inputs."""
         return NotImplemented
 
@@ -295,7 +295,7 @@ class QuantizedTensor(torch.Tensor):
 
     def linear_input_act(self, x: torch.Tensor, bias=None, input_act=None,
                          input_act_weight=None, input_act_eps=0.0,
-                         residual=None, residual_scale=None):
+                         residual=None, residual_scale=None, residual_inplace=False):
         """Compute linear(act(x), self, bias), optionally followed by residual addcmul.
 
         Return NotImplemented when the layout cannot handle this operation; the caller
@@ -303,6 +303,7 @@ class QuantizedTensor(torch.Tensor):
         """
         return self.layout_cls.linear_input_act(
             self, x, bias, input_act, input_act_weight, input_act_eps, residual, residual_scale,
+            residual_inplace,
         )
 
     def dequantize(self) -> torch.Tensor:

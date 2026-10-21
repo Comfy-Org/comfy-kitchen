@@ -115,19 +115,23 @@ class TestGemvResidualEpilogue:
     @pytest.mark.parametrize("k,n,convrot", [(2048, 2048, True), (6144, 2048, True), (2048, 512, False)])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     @pytest.mark.parametrize("unit_scale", [True, False])
-    def test_matches_unfused_bitwise(self, k, n, convrot, dtype, unit_scale, seed, cuda_available):
+    @pytest.mark.parametrize("inplace", [True, False])
+    def test_matches_unfused_bitwise(self, k, n, convrot, dtype, unit_scale, inplace, seed, cuda_available):
         if not cuda_available:
             pytest.skip("CUDA required")
         x = torch.randn(1, k, dtype=dtype, device="cuda")
         weight = torch.randint(-127, 127, (n, k), dtype=torch.int8, device="cuda")
         wscale = torch.tensor(0.01, dtype=torch.float32, device="cuda")
         resid = torch.randn(1, n, dtype=dtype, device="cuda")
-        rscale = torch.ones(n, dtype=dtype, device="cuda") if unit_scale else torch.randn(n, dtype=dtype, device="cuda")
+        rscale = 1.0 if unit_scale else torch.randn(n, dtype=dtype, device="cuda")
 
         kwargs = {"convrot": convrot, "convrot_groupsize": _GROUP}
         plain = ck.int8_linear(x, weight, wscale, None, dtype, **kwargs)
         ref = resid + plain if unit_scale else torch.addcmul(resid, plain, rscale)
-        got = ck.int8_linear(x, weight, wscale, None, dtype, residual=resid, residual_scale=rscale, **kwargs)
+        got = ck.int8_linear(x, weight, wscale, None, dtype, residual=resid, residual_scale=rscale,
+                            residual_inplace=inplace, **kwargs)
+        if inplace:
+            assert got is resid
         assert got.dtype == dtype and got.shape == ref.shape
         assert torch.equal(got, ref)
 
@@ -161,3 +165,45 @@ class TestGemvResidualEpilogue:
             got = ck.int8_linear(x, weight, wscale, None, torch.bfloat16, residual=resid,
                                  residual_scale=half, **kwargs)
             assert torch.equal(got, torch.addcmul(resid, plain, half))
+
+
+@pytest.mark.parametrize("operation", ["int8", "fp16"])
+@pytest.mark.parametrize("scale_kind", ["channel", "batch", "unit", "scalar", "alias"])
+@pytest.mark.parametrize("layout", ["contiguous", "strided", "input_alias"])
+def test_residual_inplace_preserves_storage(operation, scale_kind, layout, seed, device):
+    x = torch.randn(2, 3, 64, device=device)
+    weight = torch.randn(64, 64, device=device) * 0.1
+    if operation == "int8":
+        weight = (weight * 100).to(torch.int8)
+        weight_scale = torch.tensor(0.01, device=device)
+
+        def linear(**kwargs):
+            return ck.int8_linear(x, weight, weight_scale, out_dtype=x.dtype, **kwargs)
+    else:
+        def linear(**kwargs):
+            return ck.fp16_linear(x, weight, **kwargs)
+
+    if layout == "input_alias":
+        residual = x
+    elif layout == "strided":
+        residual = torch.randn(2, 3, 128, device=device)[..., ::2]
+    else:
+        residual = torch.randn_like(x)
+    if scale_kind == "channel":
+        scale = torch.linspace(-0.7, 1.3, 64, device=device)
+    elif scale_kind == "batch":
+        scale = torch.tensor([0.25, -0.75], device=device).reshape(2, 1, 1)
+    elif scale_kind == "alias":
+        scale = residual[0, 0]
+    else:
+        scale = 1.0 if scale_kind == "unit" else -0.375
+    before = residual.clone()
+    plain = linear()
+    expected = (torch.addcmul(before, plain, scale) if isinstance(scale, torch.Tensor)
+                else torch.add(before, plain, alpha=scale))
+    regular = linear(residual=residual, residual_scale=scale)
+    torch.testing.assert_close(regular, expected, rtol=0, atol=0)
+    torch.testing.assert_close(residual, before, rtol=0, atol=0)
+    actual = linear(residual=residual, residual_scale=scale, residual_inplace=True)
+    assert actual is residual
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

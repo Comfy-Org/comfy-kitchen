@@ -170,6 +170,7 @@ from comfy_kitchen.backends._activations import (  # noqa: E402
 )
 from comfy_kitchen.backends._activations import (  # noqa: E402
     apply_residual as _apply_residual,
+    residual_output as _residual_output,
 )
 from comfy_kitchen.backends._activations import (  # noqa: E402
     input_act_code as _input_act_code,
@@ -2000,7 +2001,8 @@ def fp16_linear(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
     residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | float | None = None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     """CUTLASS fp16-accumulate GEMM with fused bias/residual; cuBLAS when the
     kernel cannot serve the shape.
@@ -2012,6 +2014,12 @@ def fp16_linear(
     x_2d = x if x.dim() == 2 and x.is_contiguous() else x.reshape(-1, x.shape[-1]).contiguous()
     m = x_2d.shape[0]
     n = weight.shape[0]
+    inplace_out = (_residual_output(residual, (*orig_shape[:-1], n), x.dtype, x.device,
+                                    x, weight, bias, residual_scale) if residual_inplace else None)
+    unit_scale = isinstance(residual_scale, (float, int)) and residual_scale == 1.0
+    scale_supported = unit_scale or (isinstance(residual_scale, torch.Tensor)
+                                     and residual_scale.dtype == torch.float16
+                                     and residual_scale.numel() == n)
 
     supported = (
         x.dtype == torch.float16
@@ -2023,17 +2031,18 @@ def fp16_linear(
         and _aligned16(weight)
         and (bias is None or bias.dtype == torch.float16)
         and (residual is None or (residual.dtype == torch.float16
-                                  and residual_scale.dtype == torch.float16
+                                  and scale_supported and residual.numel() == m * n
                                   and _aligned16(residual)))
+        and (not residual_inplace or inplace_out is not None)
     )
     if not supported:
         out = torch.nn.functional.linear(x, weight, bias)
-        return _apply_residual(out, residual, residual_scale)
+        return _apply_residual(out, residual, residual_scale, residual_inplace)
 
     if not weight.is_contiguous():
         weight = weight.contiguous()
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
-    out = torch.empty((m, n), dtype=torch.float16, device=x.device)
+    out = inplace_out.reshape(m, n) if inplace_out is not None else torch.empty((m, n), dtype=torch.float16, device=x.device)
     bias_arg = (_gemm_vector_arg(bias, x.device, torch.float16) if bias is not None
                 else _empty_cuda_tensor(x.device, torch.float16))
     resid_2d = None if residual is None else residual.reshape(m, n).contiguous()
@@ -2041,11 +2050,14 @@ def fp16_linear(
         _wrap_for_dlpack(x_2d),
         _wrap_for_dlpack(weight),
         _wrap_for_dlpack(bias_arg),
-        _wrap_for_dlpack(_gemm_vector_arg(residual_scale, x.device, torch.float16)),
+        _wrap_for_dlpack(_empty_cuda_tensor(x.device, torch.float16) if unit_scale
+                         else _gemm_vector_arg(residual_scale, x.device, torch.float16)),
         _wrap_for_dlpack(resid_2d),
         _wrap_for_dlpack(out),
         stream_ptr,
     ):
+        if residual_inplace:
+            out = torch.empty((m, n), dtype=torch.float16, device=x.device)
         ok = _C.cutlass_fp16_linear(
             _wrap_for_dlpack(x_2d),
             _wrap_for_dlpack(weight),
@@ -2055,8 +2067,10 @@ def fp16_linear(
         )
         if not ok:
             out = torch.nn.functional.linear(x_2d, weight, bias)
-        out = _apply_residual(out, resid_2d, residual_scale)
+        out = _apply_residual(out.reshape(*orig_shape[:-1], n), residual, residual_scale, residual_inplace)
 
+    if residual_inplace:
+        return residual
     return out if len(orig_shape) == 2 else out.reshape(*orig_shape[:-1], n)
 
 
@@ -2131,7 +2145,8 @@ def int8_linear(
     input_act_weight: torch.Tensor | None = None,
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | float | None = None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     if residual is not None and residual_scale is None:
         raise ValueError("int8_linear: residual requires residual_scale")
@@ -2164,6 +2179,13 @@ def int8_linear(
     out_dtype = out_dtype or x.dtype
     output_dtype_code = DTYPE_TO_CODE[out_dtype]
     is_2d_output = len(orig_shape) == 2
+    inplace_out = (_residual_output(residual, (*orig_shape[:-1], n), out_dtype, x.device,
+                                    x, weight, bias, weight_scale, input_act_weight,
+                                    residual_scale) if residual_inplace else None)
+    unit_scale = isinstance(residual_scale, (float, int)) and residual_scale == 1.0
+    scale_supported = unit_scale or (isinstance(residual_scale, torch.Tensor)
+                                     and residual_scale.dtype == out_dtype
+                                     and residual_scale.numel() == n)
 
     # The residual is fused into the CUTLASS epilogue and the M=1 GEMV when those
     # paths run; every other route applies it eagerly here so all paths agree.
@@ -2173,18 +2195,18 @@ def int8_linear(
         # the GEMV epilogue takes residual [1, n] and scale [n] in the output dtype;
         # anything broadcast is left to the eager addcmul in _finish
         nonlocal fused_residual_done
-        if (residual is None or residual.dtype != out_dtype or residual_scale.dtype != out_dtype
-                or residual.numel() != n or residual_scale.numel() != n):
+        if (residual is None or residual.dtype != out_dtype or not scale_supported
+                or residual.numel() != n or (residual_inplace and inplace_out is None)):
             return None, None
         fused_residual_done = True
         return (_wrap_for_dlpack(residual.reshape(1, n).contiguous()),
-                _wrap_for_dlpack(_gemm_vector_arg(residual_scale, x.device, out_dtype)))
+                None if unit_scale else _wrap_for_dlpack(_gemm_vector_arg(residual_scale, x.device, out_dtype)))
 
     def _finish(o):
+        o = o if is_2d_output else o.reshape(*orig_shape[:-1], n)
         if not fused_residual_done:
-            o = _apply_residual(o, None if residual is None else residual.reshape(o.shape),
-                                residual_scale)
-        return o if is_2d_output else o.reshape(*orig_shape[:-1], n)
+            o = _apply_residual(o, residual, residual_scale, residual_inplace)
+        return residual if residual_inplace else o
 
     # The fused GEMV needs aligned weight rows and an extra shared-memory INT8 row.
     convrot_m1_supported = (
@@ -2212,11 +2234,12 @@ def int8_linear(
             x_scale = torch.empty((1, 1), dtype=torch.float32, device=x.device)
             act_weight_arg = _empty_cuda_tensor(x.device, x_2d.dtype)
         weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
-        out = torch.empty((1, n), dtype=out_dtype, device=x.device)
         bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
         if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
             bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
         resid_arg, resid_scale_arg = _gemv_residual_args()
+        out = (inplace_out.reshape(1, n) if fused_residual_done and inplace_out is not None
+               else torch.empty((1, n), dtype=out_dtype, device=x.device))
         _C.int8_linear_m1(
             _wrap_for_dlpack(x_2d),
             _wrap_for_dlpack(x_qdata),
@@ -2283,7 +2306,6 @@ def int8_linear(
         if m == 2 and not _aligned16(weight):
             weight = weight.clone()
         weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
-        out = torch.empty((m, n), dtype=out_dtype, device=x.device)
         bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
         if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
             bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()
@@ -2291,6 +2313,8 @@ def int8_linear(
             resid_arg, resid_scale_arg = _gemv_residual_args()
         else:
             resid_arg = resid_scale_arg = None
+        out = (inplace_out.reshape(m, n) if fused_residual_done and inplace_out is not None
+               else torch.empty((m, n), dtype=out_dtype, device=x.device))
         _C.int8_gemv_dequant(
             _wrap_for_dlpack(x_qdata),
             _wrap_for_dlpack(weight),
@@ -2305,7 +2329,7 @@ def int8_linear(
         )
         return _finish(out)
 
-    out = torch.empty((m, n), dtype=out_dtype, device=x.device)
+    out = None
     weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
     bias_arg = (_gemm_vector_arg(bias, x.device, out_dtype) if bias is not None
                 else _empty_cuda_tensor(x.device, out_dtype))
@@ -2342,18 +2366,22 @@ def int8_linear(
         # the residual is fused only in the output dtype and 16-byte aligned
         # (the epilogue's vector loads); the per-channel scale is realigned instead
         resid_2d = None
-        if residual is not None and residual.dtype == out_dtype and residual_scale.dtype == out_dtype:
+        if (residual is not None and residual.dtype == out_dtype and scale_supported
+                and residual.numel() == m * n and (not residual_inplace or inplace_out is not None)):
             resid_2d = residual.reshape(m, n).contiguous()
             if not _aligned16(resid_2d):
                 resid_2d = None
         if resid_2d is not None:
+            out = (inplace_out.reshape(m, n) if inplace_out is not None
+                   else torch.empty((m, n), dtype=out_dtype, device=x.device))
             used_cutlass = _C.cutlass_int8_dequant_residual(
                 _wrap_for_dlpack(x_qdata),
                 _wrap_for_dlpack(weight),
                 _wrap_for_dlpack(x_scale),
                 _wrap_for_dlpack(ws_cutlass),
                 _wrap_for_dlpack(bias_arg),
-                _wrap_for_dlpack(_gemm_vector_arg(residual_scale, x.device, out_dtype)),
+                _wrap_for_dlpack(_empty_cuda_tensor(x.device, out_dtype) if unit_scale
+                                 else _gemm_vector_arg(residual_scale, x.device, out_dtype)),
                 _wrap_for_dlpack(resid_2d),
                 _wrap_for_dlpack(out),
                 output_dtype_code,
@@ -2361,6 +2389,8 @@ def int8_linear(
             )
             fused_residual_done = used_cutlass
         if not used_cutlass:
+            if out is None or inplace_out is not None:
+                out = torch.empty((m, n), dtype=out_dtype, device=x.device)
             used_cutlass = _C.cutlass_int8_dequant(
                 _wrap_for_dlpack(x_qdata),
                 _wrap_for_dlpack(weight),
@@ -2373,6 +2403,8 @@ def int8_linear(
             )
     if not used_cutlass:
         # Fallback: cuBLAS int8 GEMM (int32) + separate dequant kernel.
+        if out is None:
+            out = torch.empty((m, n), dtype=out_dtype, device=x.device)
         use_turing_padding = x_qdata.is_cuda and _cuda_device_is_turing(x_qdata.get_device())
         if use_turing_padding:
             padded_k = _round_up(k, 16)
@@ -2505,10 +2537,11 @@ def w4a8_int8_linear(
     input_act_weight: torch.Tensor | None = None,
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | float | None = None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     """CUDA W4A8/W6A8 linear using chunked INT4/INT6 decode and the tuned INT8 GEMM."""
-    if residual is not None:
+    if residual is not None or residual_inplace:
         return _apply_residual(
             w4a8_int8_linear(
                 x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
@@ -2517,6 +2550,7 @@ def w4a8_int8_linear(
             ),
             residual,
             residual_scale,
+            residual_inplace,
         )
     chunked = (
         _W4A8_CHUNKED
@@ -2651,7 +2685,8 @@ def w4a8_packed_linear(
     input_act_weight: torch.Tensor | None = None,
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | float | None = None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     """Resident packed W4A8/W6A8: small-M MMA or direct packed dequantization for prefill."""
     if input_act in (None, "none"):
@@ -2660,6 +2695,11 @@ def w4a8_packed_linear(
         raise ValueError("w4a8_int8_linear: residual requires residual_scale")
     n = s_channel.numel()
     k = x.shape[-1] // _input_act_width(input_act)
+    inplace_out = (_residual_output(residual, (*x.shape[:-1], n), out_dtype, x.device,
+                                    x, qdata, s_rel, s_channel, codebook, correction, bias,
+                                    input_act_weight, residual_scale) if residual_inplace else None)
+    unit_scale = isinstance(residual_scale, (float, int)) and residual_scale == 1.0
+    scale_supported = unit_scale or (isinstance(residual_scale, torch.Tensor) and residual_scale.numel() == n)
     fuse_act = (
         input_act is not None
         and x.numel() <= 8 * x.shape[-1]
@@ -2685,7 +2725,8 @@ def w4a8_packed_linear(
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     m = x_2d.shape[0]
     if residual is not None and not (
-        m <= 8 and residual.numel() == m * n and residual_scale.numel() == n
+        m <= 8 and residual.numel() == m * n and scale_supported
+        and (not residual_inplace or inplace_out is not None)
     ):
         return _apply_residual(
             w4a8_packed_linear(
@@ -2694,10 +2735,11 @@ def w4a8_packed_linear(
             ),
             residual,
             residual_scale,
+            residual_inplace,
         )
     xq = torch.empty(m, k, dtype=torch.int8, device=x.device)
     xs = torch.empty(m, 1, dtype=torch.float32, device=x.device)
-    out = torch.empty(m, n, dtype=out_dtype, device=x.device)
+    out = inplace_out.reshape(m, n) if inplace_out is not None else torch.empty(m, n, dtype=out_dtype, device=x.device)
     if m <= 8:
         # Staged-pair scratch is only needed where the single cluster quantizer
         # cannot run (pre-sm_90, very wide K); a fused activation implies the cluster path.
@@ -2712,7 +2754,7 @@ def w4a8_packed_linear(
         resid_2d = resid_scale = None
         if residual is not None:
             resid_2d = residual.reshape(m, n).to(out_dtype).contiguous()
-            resid_scale = _gemm_vector_arg(residual_scale, x.device, out_dtype)
+            resid_scale = None if unit_scale else _gemm_vector_arg(residual_scale, x.device, out_dtype)
         bias_float = bias.float().contiguous() if bias is not None else None
         _w4a8_mma_linear(
             x_2d, rotated, partial_absmax, act_weight, input_act_eps, input_act, xq, xs,
@@ -2729,7 +2771,7 @@ def w4a8_packed_linear(
         )
         if not used:
             raise RuntimeError("Packed W4A8 prefill is unsupported by the INT8 GEMM")
-    return out.reshape(*x.shape[:-1], n)
+    return residual if residual_inplace else out.reshape(*x.shape[:-1], n)
 
 
 def _w4a8_fast_act_ok(x: torch.Tensor, m: int, k: int, convrot_groupsize: int) -> bool:
@@ -5106,7 +5148,7 @@ def _build_constraints() -> dict:
             ),
             "bias": ParamConstraint(dtypes=frozenset({torch.float16})),
             "residual": ParamConstraint(dtypes=frozenset({torch.float16})),
-            "residual_scale": ParamConstraint(dtypes=frozenset({torch.float16})),
+            "residual_scale": ParamConstraint(dtypes=frozenset({torch.float16, float, int})),
         },
         default_devices=cuda_devices,
         min_compute_capability=(8, 0),

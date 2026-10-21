@@ -1029,7 +1029,8 @@ def int8_linear(
     input_act_weight: torch.Tensor | None = None,
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | float | None = None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     """INT8 linear layer using fused Triton kernel.
 
@@ -1114,4 +1115,4 @@ def int8_linear(
             has_bias=has_bias
         )
 
-    return _apply_residual(output.reshape(*orig_shape[:-1], n), residual, residual_scale)
+    return _apply_residual(output.reshape(*orig_shape[:-1], n), residual, residual_scale, residual_inplace)

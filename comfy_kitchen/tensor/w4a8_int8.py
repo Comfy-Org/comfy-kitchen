@@ -119,7 +119,8 @@ def w4a8_int8_linear(
     input_act_weight: torch.Tensor | None = None,
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | float | None = None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     """Compute ``x @ W.T + bias`` with the selected W4A8 backend.
 
@@ -147,6 +148,7 @@ def w4a8_int8_linear(
         "input_act_eps": input_act_eps,
         "residual": residual,
         "residual_scale": residual_scale,
+        "residual_inplace": residual_inplace,
     }
     operation = "w4a8_packed_linear" if mma_packed else "w4a8_int8_linear"
     impl = registry.get_implementation(operation, kwargs=kwargs)
@@ -339,7 +341,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
     @classmethod
     def linear_input_act(cls, weight: QuantizedTensor, x: torch.Tensor, bias=None,
                          input_act=None, input_act_weight=None, input_act_eps=0.0,
-                         residual=None, residual_scale=None):
+                         residual=None, residual_scale=None, residual_inplace=False):
         params = weight._params
         if params.transposed:
             return NotImplemented
@@ -349,7 +351,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             group_size=params.group_size, convrot_groupsize=params.convrot_groupsize,
             out_dtype=params.orig_dtype, mma_packed=params.mma_packed,
             input_act=input_act, input_act_weight=input_act_weight, input_act_eps=input_act_eps,
-            residual=residual, residual_scale=residual_scale,
+            residual=residual, residual_scale=residual_scale, residual_inplace=residual_inplace,
         )
 
     @classmethod

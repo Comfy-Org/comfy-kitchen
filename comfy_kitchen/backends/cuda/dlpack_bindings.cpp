@@ -3063,18 +3063,19 @@ bool cutlass_fp16_linear_residual(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> a,       // [M, K] half
     nb::ndarray<nb::ndim<2>, nb::device::cuda> b,       // [N, K] half
     nb::ndarray<nb::device::cuda> bias,                 // [N] half or empty
-    nb::ndarray<nb::device::cuda> rscale,               // [N] half residual branch scale
+    nb::ndarray<nb::device::cuda> rscale,               // [N] half residual branch scale, or empty for 1
     nb::ndarray<nb::ndim<2>, nb::device::cuda> resid,   // [M, N] half
     nb::ndarray<nb::ndim<2>, nb::device::cuda> d,       // [M, N] half output
     uintptr_t stream_ptr) {
     const auto [M, N, K] = check_fp16_gemm_operands("cutlass_fp16_linear_residual", a, b, bias, d);
     if (resid.shape(0) != M || resid.shape(1) != N || map_dtype_to_code(resid.dtype()) != 1)
         throw std::runtime_error("cutlass_fp16_linear_residual: residual must be [M, N] fp16");
-    if (static_cast<int64_t>(rscale.size()) != N || map_dtype_to_code(rscale.dtype()) != 1)
-        throw std::runtime_error("cutlass_fp16_linear_residual: rscale must be a length-N fp16 vector");
+    if (rscale.size() != 0 && (static_cast<int64_t>(rscale.size()) != N || map_dtype_to_code(rscale.dtype()) != 1))
+        throw std::runtime_error("cutlass_fp16_linear_residual: rscale must be empty or a length-N fp16 vector");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     return launch_cutlass_fp16_linear_residual(
-        a.data(), b.data(), bias.size() > 0 ? bias.data() : nullptr, rscale.data(),
+        a.data(), b.data(), bias.size() > 0 ? bias.data() : nullptr,
+        rscale.size() > 0 ? rscale.data() : nullptr,
         resid.data(), d.data(), M, N, K, stream);
 }
 
@@ -3084,7 +3085,7 @@ bool cutlass_int8_dequant_residual(
     nb::ndarray<float, nb::device::cuda> xs,                // [M] per-row act scale
     nb::ndarray<float, nb::device::cuda> ws,                // [N] per-col weight scale
     nb::ndarray<nb::device::cuda> bias,                     // [N] output dtype, or empty
-    nb::ndarray<nb::device::cuda> rscale,                   // [N] residual branch scale, output dtype
+    nb::ndarray<nb::device::cuda> rscale,                   // [N] residual branch scale, output dtype, or empty for 1
     nb::ndarray<nb::ndim<2>, nb::device::cuda> resid,       // [M, N], same dtype as d
     nb::ndarray<nb::ndim<2>, nb::device::cuda> d,           // [M, N] output
     int out_dtype_code,
@@ -3092,12 +3093,12 @@ bool cutlass_int8_dequant_residual(
     const auto [M, N, K] = check_int8_gemm_operands("cutlass_int8_dequant_residual", a, b, xs, ws, bias, d, out_dtype_code);
     if (resid.shape(0) != M || resid.shape(1) != N || map_dtype_to_code(resid.dtype()) != out_dtype_code)
         throw std::runtime_error("cutlass_int8_dequant_residual: residual must be [M, N] in the output dtype");
-    if (static_cast<int64_t>(rscale.size()) != N || map_dtype_to_code(rscale.dtype()) != out_dtype_code)
-        throw std::runtime_error("cutlass_int8_dequant_residual: rscale must be a length-N vector in the output dtype");
+    if (rscale.size() != 0 && (static_cast<int64_t>(rscale.size()) != N || map_dtype_to_code(rscale.dtype()) != out_dtype_code))
+        throw std::runtime_error("cutlass_int8_dequant_residual: rscale must be empty or a length-N vector in the output dtype");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     return launch_cutlass_int8_dequant_residual(
         a.data(), b.data(), xs.data(), ws.data(), bias.size() > 0 ? bias.data() : nullptr,
-        rscale.data(), resid.data(), d.data(), M, N, K, out_dtype_code, stream);
+        rscale.size() > 0 ? rscale.data() : nullptr, resid.data(), d.data(), M, N, K, out_dtype_code, stream);
 }
 
 bool cutlass_int8_dequant_config(
@@ -3548,14 +3549,17 @@ bool w4a8_codebook_mma_linear(
             || out.shape(0) != M || out.shape(1) != N
             || map_dtype_to_code(out.dtype()) != out_dtype_code)
         throw std::runtime_error("w4a8_codebook_mma_linear workspace, counters, output, or bias mismatch");
-    if (residual.has_value() != residual_scale.has_value()
+    // A missing or empty residual_scale with a residual is a unit scale.
+    const bool has_residual_scale = residual_scale.has_value() && residual_scale->size() > 0;
+    if ((has_residual_scale && !residual.has_value())
             || (residual.has_value()
                 && (residual->shape(0) != M || residual->shape(1) != N
                     || residual->stride(1) != 1 || residual->stride(0) != N
-                    || map_dtype_to_code(residual->dtype()) != out_dtype_code
-                    || residual_scale->size() != N || residual_scale->stride(0) != 1
+                    || map_dtype_to_code(residual->dtype()) != out_dtype_code))
+            || (has_residual_scale
+                && (residual_scale->size() != N || residual_scale->stride(0) != 1
                     || map_dtype_to_code(residual_scale->dtype()) != out_dtype_code)))
-        throw std::runtime_error("w4a8_codebook_mma_linear residual must be [M, N] contiguous with a [N] scale, both in the output dtype");
+        throw std::runtime_error("w4a8_codebook_mma_linear residual must be [M, N] contiguous with an optional [N] scale, both in the output dtype");
     if (input.stride(1) != 1 || input.stride(0) != K * in_width
             || xq.stride(1) != 1 || xq.stride(0) != K
             || weight.stride(0) != 1 || s_channel.stride(0) != 1
@@ -3584,7 +3588,7 @@ bool w4a8_codebook_mma_linear(
         xq.data(), weight.data(), decode_lut.has_value() ? decode_lut->data() : nullptr, s_channel.data(), xs.data(),
         bias.has_value() ? bias->data() : nullptr,
         residual.has_value() ? residual->data() : nullptr,
-        residual_scale.has_value() ? residual_scale->data() : nullptr,
+        has_residual_scale ? residual_scale->data() : nullptr,
         workspace.data(), counters.data(),
         out.data(), M, N, K, G, bits, out_dtype_code, stream);
 }
@@ -3923,20 +3927,25 @@ void dequantize_int8_linear(
 }
 
 // Fused GEMV residual: residual [1, N] and residual_scale [N], both in the output dtype;
-// an omitted residual disables the epilogue.
-static void check_gemv_residual(
+// an omitted residual disables the epilogue, an omitted or empty scale is a unit scale.
+// Returns the scale pointer for the launch (nullptr for a unit scale).
+static const void* check_gemv_residual(
     const std::optional<nb::ndarray<nb::device::cuda>>& residual,
     const std::optional<nb::ndarray<nb::device::cuda>>& residual_scale,
     int64_t N, int output_dtype_code) {
     if (!residual) {
-        return;
+        return nullptr;
     }
     if (residual->size() != static_cast<size_t>(N) || map_dtype_to_code(residual->dtype()) != output_dtype_code) {
         throw std::runtime_error("INT8 GEMV residual must have N elements in the output dtype");
     }
-    if (!residual_scale || residual_scale->size() != static_cast<size_t>(N) || map_dtype_to_code(residual_scale->dtype()) != output_dtype_code) {
-        throw std::runtime_error("INT8 GEMV residual scale must have N elements in the output dtype");
+    if (!residual_scale || residual_scale->size() == 0) {
+        return nullptr;
     }
+    if (residual_scale->size() != static_cast<size_t>(N) || map_dtype_to_code(residual_scale->dtype()) != output_dtype_code) {
+        throw std::runtime_error("INT8 GEMV residual scale must be empty or have N elements in the output dtype");
+    }
+    return residual_scale->data();
 }
 
 void int8_gemv_dequant(
@@ -3982,7 +3991,7 @@ void int8_gemv_dequant(
         }
     }
 
-    check_gemv_residual(residual, residual_scale, N, output_dtype_code);
+    const void* residual_scale_ptr = check_gemv_residual(residual, residual_scale, N, output_dtype_code);
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_int8_gemv_dequant_kernel(
@@ -4000,7 +4009,7 @@ void int8_gemv_dequant(
         output_dtype_code,
         bias_dtype_code,
         residual ? residual->data() : nullptr,
-        residual ? residual_scale->data() : nullptr,
+        residual_scale_ptr,
         stream);
 }
 
@@ -4075,7 +4084,7 @@ void int8_linear_m1(
     }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    check_gemv_residual(residual, residual_scale, N, output_dtype_code);
+    const void* residual_scale_ptr = check_gemv_residual(residual, residual_scale, N, output_dtype_code);
     if (residual && (K & 3) != 0) {
         throw std::runtime_error("INT8 M=1 linear fused residual requires K divisible by 4");
     }
@@ -4106,7 +4115,7 @@ void int8_linear_m1(
             K,
             static_cast<int64_t>(weight_scales.size()),
             residual ? residual->data() : nullptr,
-            residual ? residual_scale->data() : nullptr,
+            residual_scale_ptr,
             stream);
         return;
     }
@@ -4135,7 +4144,7 @@ void int8_linear_m1(
         output_dtype_code,
         bias_dtype_code,
         residual ? residual->data() : nullptr,
-        residual ? residual_scale->data() : nullptr,
+        residual_scale_ptr,
         stream);
 }
 

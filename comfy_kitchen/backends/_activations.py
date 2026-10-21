@@ -81,15 +81,45 @@ def apply_input_act(
 def apply_residual(
     out: torch.Tensor,
     residual: torch.Tensor | None,
-    residual_scale: torch.Tensor | None,
+    residual_scale: torch.Tensor | float | None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     """``residual + residual_scale * out`` in out's dtype (addcmul's type
-    promotion would otherwise widen it)."""
+    promotion would otherwise widen it). In-place updates retain residual's storage."""
     if residual is None:
+        if residual_inplace:
+            raise ValueError("residual_inplace requires residual")
         return out
     if residual_scale is None:
         raise ValueError("residual requires residual_scale")
-    return torch.addcmul(residual.to(out.dtype), out, residual_scale.to(out.dtype))
+    if residual_inplace:
+        if residual.shape != out.shape or residual.dtype != out.dtype or residual.device != out.device:
+            raise ValueError("residual_inplace requires the output shape, dtype and device")
+    else:
+        residual = residual.to(out.dtype)
+    if isinstance(residual_scale, (float, int)):
+        return residual.add_(out, alpha=residual_scale) if residual_inplace else torch.add(residual, out, alpha=residual_scale)
+    scale = residual_scale.to(out.dtype)
+    if residual_inplace and torch._C._overlaps(residual, scale):
+        scale = scale.clone()
+    return residual.addcmul_(out, scale) if residual_inplace else torch.addcmul(residual, out, scale)
+
+
+def residual_output(residual, shape, dtype, device, *inputs):
+    """Use residual as a native epilogue destination only without GEMM input aliasing.
+
+    Otherwise the caller computes a separate linear output and applies the residual
+    in place afterward. Noncontiguous destinations take that path too.
+    """
+    if residual is None:
+        raise ValueError("residual_inplace requires residual")
+    if residual.shape != shape or residual.dtype != dtype or residual.device != device:
+        raise ValueError("residual_inplace requires the output shape, dtype and device")
+    if not residual.is_contiguous() or residual.data_ptr() % 16 or any(
+        isinstance(x, torch.Tensor) and torch._C._overlaps(residual, x) for x in inputs
+    ):
+        return None
+    return residual
 
 
 def _unsupported(input_act) -> str:

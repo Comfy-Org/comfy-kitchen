@@ -84,7 +84,10 @@ struct EpiRowwiseNoBias {
 // Unscaled fp16 operands: out = acc + bias[col], or with resid set
 // out = resid[row * resid_stride + col] + rscale[col] * (acc + bias[col]).
 // resid_stride 0 broadcasts a single [N] residual row. All operands are fp16.
+// rscale == nullptr is a unit scale. resid may be the GEMM output (see GemmOutput).
 struct EpiFp16 {
+    static constexpr bool kOutputMayAlias = true;
+
     const __half* bias;
     const __half* rscale;
     const __half* resid;

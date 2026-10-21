@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // FP16 GEMM on WMMA (v_wmma_f32_16x16x16_f16), gfx11 and gfx12. See mma.h.
-//   D[M, N] = A[M, K] @ B[N, K]^T + bias, or resid + rscale * (that) fused.
+//   D[M, N] = A[M, K] @ B[N, K]^T + bias, or resid + rscale * (that) fused; a null
+//   rscale is a unit scale and resid may be D.
 // The accumulators are fp32, so this is at least as accurate as the fp16-accumulate
 // contract fp16_linear promises. Returns false for shapes the caller must serve.
 #include "../epilogue.h"

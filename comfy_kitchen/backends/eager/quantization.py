@@ -974,12 +974,13 @@ def fp16_linear(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
     residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | float | None = None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     """``linear(x)``, or ``residual + residual_scale * linear(x)``; accumulates
     in torch's configured mode."""
     out = torch.nn.functional.linear(x, weight, bias)
-    return _apply_residual(out, residual, residual_scale)
+    return _apply_residual(out, residual, residual_scale, residual_inplace)
 
 
 def int8_linear(
@@ -994,7 +995,8 @@ def int8_linear(
     input_act_weight: torch.Tensor | None = None,
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | float | None = None,
+    residual_inplace: bool = False,
 ) -> torch.Tensor:
     """INT8 linear layer using torch.int8_mm with memory-efficient scaling.
 
@@ -1078,7 +1080,7 @@ def int8_linear(
         result = result + bias.to(device=result.device, dtype=result.dtype).reshape(1, -1)
 
     result = result.reshape(*orig_shape[:-1], weight.shape[0])
-    return _apply_residual(result, residual, residual_scale)
+    return _apply_residual(result, residual, residual_scale, residual_inplace)
 
 
 def _modulate_int8_input(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:

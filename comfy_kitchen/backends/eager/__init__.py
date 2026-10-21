@@ -567,7 +567,7 @@ def _build_constraints() -> dict:
             "weight": ParamConstraint(dtypes=standard_floats),
             "bias": ParamConstraint(dtypes=standard_floats),
             "residual": ParamConstraint(dtypes=standard_floats),
-            "residual_scale": ParamConstraint(dtypes=standard_floats),
+            "residual_scale": ParamConstraint(dtypes=standard_floats | {float, int}),
         },
         default_devices=all_devices,
     )

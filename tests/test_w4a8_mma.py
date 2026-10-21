@@ -85,7 +85,8 @@ class TestW4A8PackedMMA:
     @pytest.mark.parametrize("m", [1, 7])
     @pytest.mark.parametrize("bias", [False, True])
     @pytest.mark.parametrize("bits", [4, 6])
-    def test_fused_residual_matches_addcmul(self, m, bias, bits, seed):
+    @pytest.mark.parametrize("inplace", [False, True])
+    def test_fused_residual_matches_addcmul(self, m, bias, bits, inplace, seed):
         # The epilogue's residual + scale * linear must be bit-identical to the unfused
         # addcmul on the same bf16-rounded linear; a scale of exactly 1 must reduce
         # to torch.add(residual, linear).
@@ -97,20 +98,28 @@ class TestW4A8PackedMMA:
         residual = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
         scale = torch.rand(n, device="cuda", dtype=torch.bfloat16) + 0.5
         linear = ck.w4a8_int8_linear(x, packed, empty, s_channel, bias=b, mma_packed=True)
+        expected = torch.addcmul(residual, linear, scale)
         got = ck.w4a8_int8_linear(x, packed, empty, s_channel, bias=b, mma_packed=True,
-                                            residual=residual, residual_scale=scale)
-        assert torch.equal(got, torch.addcmul(residual, linear, scale))
-        ones = torch.ones(n, device="cuda", dtype=torch.bfloat16)
+                                            residual=residual, residual_scale=scale, residual_inplace=inplace)
+        assert torch.equal(got, expected)
+        if inplace:
+            assert got is residual
+        expected = residual + linear
         got = ck.w4a8_int8_linear(x, packed, empty, s_channel, bias=b, mma_packed=True,
-                                            residual=residual, residual_scale=ones)
-        assert torch.equal(got, residual + linear)
+                                            residual=residual, residual_scale=1.0, residual_inplace=inplace)
+        assert torch.equal(got, expected)
+        if inplace:
+            assert got is residual
         # the prefill-shaped (unfused) route applies the same contract
         big = torch.randn(9, k, device="cuda", dtype=torch.bfloat16)
         big_res = torch.randn(9, n, device="cuda", dtype=torch.bfloat16)
         linear = ck.w4a8_int8_linear(big, packed, empty, s_channel, bias=b, mma_packed=True)
+        expected = torch.addcmul(big_res, linear, scale)
         got = ck.w4a8_int8_linear(big, packed, empty, s_channel, bias=b, mma_packed=True,
-                                            residual=big_res, residual_scale=scale)
-        assert torch.equal(got, torch.addcmul(big_res, linear, scale))
+                                            residual=big_res, residual_scale=scale, residual_inplace=inplace)
+        assert torch.equal(got, expected)
+        if inplace:
+            assert got is big_res
 
     @pytest.mark.parametrize("m", [1, 5, 8])
     @pytest.mark.parametrize("act", ["rms_norm", "swiglu"])

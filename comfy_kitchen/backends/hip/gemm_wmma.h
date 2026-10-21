@@ -128,14 +128,26 @@ struct GemmOperandA<const uint8_t*> {
     using type = const uint8_t* __restrict__;
 };
 
+// C carries __restrict__ unless the epilogue declares kOutputMayAlias: it reads a
+// caller buffer (EpiFp16's residual) that may be C itself. The writeback below reads
+// and then writes each element in the same thread, and no other block touches it.
+template <typename Epi, typename OutT, typename = void>
+struct GemmOutput {
+    using type = OutT* __restrict__;
+};
+template <typename Epi, typename OutT>
+struct GemmOutput<Epi, OutT, std::enable_if_t<Epi::kOutputMayAlias>> {
+    using type = OutT*;
+};
+
 // Epi is a functor: float operator()(int row, int col, float acc) const.
 template <typename Mma, typename Epi, typename OutT,
           int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN,
           typename ASrc = const uint8_t*,
           bool COALESCED_STAGING = false, bool TILED_A = false>
 __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
-    typename GemmOperandA<ASrc>::type A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
-    int M, int N, int kbytes, int ldc, Epi epi) {
+    typename GemmOperandA<ASrc>::type A, const uint8_t* __restrict__ B,
+    typename GemmOutput<Epi, OutT>::type C, int M, int N, int kbytes, int ldc, Epi epi) {
 
     constexpr int kThreads = WARPS_M * WARPS_N * kWave;
     constexpr int kStride = BKB + kLdsPad;

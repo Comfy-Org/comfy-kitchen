@@ -263,7 +263,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
     @classmethod
     def linear_input_act(cls, weight: QuantizedTensor, x: torch.Tensor, bias=None,
                          input_act=None, input_act_weight=None, input_act_eps=0.0,
-                         residual=None, residual_scale=None):
+                         residual=None, residual_scale=None, residual_inplace=False):
         params = weight._params
         if params.transposed:
             return NotImplemented
@@ -272,7 +272,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
             x, qdata, scale, bias, x.dtype,
             convrot=params.convrot, convrot_groupsize=params.convrot_groupsize,
             input_act=input_act, input_act_weight=input_act_weight, input_act_eps=input_act_eps,
-            residual=residual, residual_scale=residual_scale,
+            residual=residual, residual_scale=residual_scale, residual_inplace=residual_inplace,
         )
 
     @classmethod
