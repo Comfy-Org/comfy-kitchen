@@ -3213,11 +3213,12 @@ def flash_decode_tree_merge(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    mask: torch.Tensor,
     merged: torch.Tensor,
 ) -> None:
-    """Fold the current step's rows causally into a prefix-only decode result. See ops/flash_decode.hip."""
+    """Fold a verify tree's own rows into a prefix-only decode result. See ops/flash_decode.hip."""
     _C.flash_attention_decode_tree_merge(
-        _dl(out), _dl(lse), _dl(q), _dl(k), _dl(v), _dl(merged), _stream(q))
+        _dl(out), _dl(lse), _dl(q), _dl(k), _dl(v), _dl(mask), _dl(merged), _stream(q))
 
 
 def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):

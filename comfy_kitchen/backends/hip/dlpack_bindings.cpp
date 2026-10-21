@@ -2045,17 +2045,17 @@ void flash_attention_decode_gqa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> 
     check_hip_launch();
 }
 
-// Current-step merge: out [B, S, H*256] and lse [B, H, S] come from a prefix-only
-// decode over the S step rows; q [B, H, S, 256]
-// and k/v [B, Hk, S, 256] are the rows' own rotated query/key/value, and row j folds
-// in step rows t <= j. merged [B, S, H*256] receives the result.
+// Verify-tree merge: out [B, S, H*256] and lse [B, H, S] come from a prefix-only
+// flash_attention_decode_gqa (causal = false) over the S verify rows; q [B, H, S, 256]
+// and k/v [B, Hk, S, 256] are the rows' own rotated query/key/value and mask [S] the
+// rows each row must fold in (bit t = row t). merged [B, S, H*256] receives the result.
 void flash_attention_decode_tree_merge(nb::ndarray<> out, nb::ndarray<> lse, nb::ndarray<> q,
-                                       nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> merged,
-                                       uintptr_t stream_ptr) {
+                                       nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> mask,
+                                       nb::ndarray<> merged, uintptr_t stream_ptr) {
     constexpr const char* kFn = "flash_attention_decode_tree_merge";
     constexpr int64_t kHeadDim = 256;
     if (out.ndim() != 3 || lse.ndim() != 3 || q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 ||
-        merged.ndim() != 3) {
+        mask.ndim() != 1 || merged.ndim() != 3) {
         throw std::runtime_error(std::string(kFn) + ": operand rank mismatch");
     }
     const int64_t batch = q.shape(0), heads = q.shape(1), rows = q.shape(2);
@@ -2063,7 +2063,8 @@ void flash_attention_decode_tree_merge(nb::ndarray<> out, nb::ndarray<> lse, nb:
     if (batch <= 0 || heads <= 0 || rows <= 0 || rows > 8 || kv_heads <= 0 ||
         heads % kv_heads != 0 || q.shape(3) != kHeadDim || k.shape(0) != batch ||
         k.shape(2) != rows || k.shape(3) != kHeadDim || v.shape(0) != batch ||
-        v.shape(1) != kv_heads || v.shape(2) != rows || v.shape(3) != kHeadDim) {
+        v.shape(1) != kv_heads || v.shape(2) != rows || v.shape(3) != kHeadDim ||
+        mask.shape(0) != rows) {
         throw std::runtime_error(std::string(kFn) + ": shape mismatch");
     }
     if (out.shape(0) != batch || out.shape(1) != rows || out.shape(2) != heads * kHeadDim ||
@@ -2078,6 +2079,12 @@ void flash_attention_decode_tree_merge(nb::ndarray<> out, nb::ndarray<> lse, nb:
     require_dtype(out, 2, 2, kFn, "out");
     require_dtype(merged, 2, 2, kFn, "merged");
     require_dtype(lse, 0, 0, kFn, "lse");
+    if (map_dtype_to_code(mask.dtype()) != -1 ||
+        mask.dtype().code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) ||
+        mask.dtype().bits != 32) {
+        throw std::runtime_error(std::string(kFn) + ": mask must be int32");
+    }
+    require_packed_contiguous(mask, kFn, "mask");
     require_packed_contiguous(lse, kFn, "lse");
     if (q.stride(3) != 1 || k.stride(3) != 1 || v.stride(3) != 1 || out.stride(2) != 1 ||
         merged.stride(2) != 1 || out.stride(1) != heads * kHeadDim ||
@@ -2093,7 +2100,7 @@ void flash_attention_decode_tree_merge(nb::ndarray<> out, nb::ndarray<> lse, nb:
         }
     }
     constexpr int kDeviceRocm = nb::device::rocm::value;
-    const nb::ndarray<>* operands[] = {&out, &lse, &q, &k, &v, &merged};
+    const nb::ndarray<>* operands[] = {&out, &lse, &q, &k, &v, &mask, &merged};
     for (const nb::ndarray<>* t : operands) {
         if (t->device_type() != kDeviceRocm || t->device_id() != q.device_id()) {
             throw std::runtime_error(std::string(kFn) +
@@ -2102,7 +2109,7 @@ void flash_attention_decode_tree_merge(nb::ndarray<> out, nb::ndarray<> lse, nb:
     }
     launch_flash_decode_tree_merge(
         out.data(), static_cast<const float*>(lse.data()), q.data(), k.data(), v.data(),
-        merged.data(), static_cast<int>(batch),
+        static_cast<const int*>(mask.data()), merged.data(), static_cast<int>(batch),
         static_cast<int>(rows), static_cast<int>(heads), static_cast<int>(kv_heads), q.stride(0),
         q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1),
         v.stride(2), out.stride(0), out.stride(1), merged.stride(0), merged.stride(1),
@@ -2732,8 +2739,8 @@ NB_MODULE(_C, m) {
           nb::arg("softmax_lse_accum"), nb::arg("output_accum"), nb::arg("num_splits"),
           nb::arg("causal"), nb::arg("stream_ptr"));
     m.def("flash_attention_decode_tree_merge", &flash_attention_decode_tree_merge, nb::arg("out"),
-          nb::arg("lse"), nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("merged"),
-          nb::arg("stream_ptr"));
+          nb::arg("lse"), nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("mask"),
+          nb::arg("merged"), nb::arg("stream_ptr"));
     m.def("sage_prepare_key_mask", &sage_prepare_key_mask,
           nb::arg("mask"), nb::arg("packed"), nb::arg("stream_ptr"));
     m.def("sage_prepare_dense_mask", &sage_prepare_dense_mask,

@@ -226,14 +226,14 @@ def flash_attention_decode_gqa(
     return output
 
 
-def _tree_merge_torch(out, lse, q, k, v, merged):
+def _tree_merge_torch(out, lse, q, k, v, mask, merged):
     batch, heads, rows, head_dim = q.shape
     groups = heads // k.shape[1]
     kf = k.float().repeat_interleave(groups, dim=1)
     vf = v.float().repeat_interleave(groups, dim=1)
     scores = torch.matmul(q.float(), kf.transpose(-1, -2)) * head_dim ** -0.5  # [B, H, row, t]
-    causal = torch.ones(rows, rows, dtype=torch.bool, device=q.device).tril()
-    scores.masked_fill_(~causal, float("-inf"))
+    allowed = (mask.view(rows, 1) >> torch.arange(rows, device=q.device)) & 1
+    scores.masked_fill_(allowed == 0, float("-inf"))
     m = torch.maximum(lse, scores.amax(-1))
     w_flash = torch.exp(lse - m)
     w = torch.exp(scores - m.unsqueeze(-1))
@@ -246,21 +246,21 @@ def _tree_merge_torch(out, lse, q, k, v, merged):
 
 def flash_attention_decode_tree_merge(
     out: torch.Tensor, lse: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-    merged: torch.Tensor,
+    mask: torch.Tensor, merged: torch.Tensor,
 ) -> torch.Tensor:
-    """Fold the current step's own rows causally into a prefix-only decode result.
+    """Fold a verify tree's own rows into a prefix-only decode result.
 
-    ``out`` [B, S, H*D] and ``lse`` [B, H, S] describe attention over the committed
-    prefix; q [B, H, S, D] and k/v [B, Hk, S, D] are the step
-    rows' own rotated query/key/value, and row j additionally attends step rows t <= j.
-    Writes and returns ``merged`` [B, S, H*D]."""
+    ``out`` [B, S, H*D] and ``lse`` [B, H, S] come from flash_attention_decode_gqa over the
+    committed prefix with causal=False; q [B, H, S, D] and k/v [B, Hk, S, D] are the verify
+    rows' own rotated query/key/value, and mask [S] int32 the rows each row attends inside the
+    step (bit t = row t, including itself). Writes and returns ``merged`` [B, S, H*D]."""
     if q.shape[-1] != 256 or not flash_attention_decode_gqa_is_available(q.device, q.dtype):
-        return _tree_merge_torch(out, lse, q, k, v, merged)
+        return _tree_merge_torch(out, lse, q, k, v, mask, merged)
     if _hip_backend is not None:
-        _hip_backend.flash_decode_tree_merge(out, lse, q, k, v, merged)
+        _hip_backend.flash_decode_tree_merge(out, lse, q, k, v, mask, merged)
         return merged
     _cuda_backend._C.flash_attention_decode_tree_merge(
-        *map(_cuda_backend._wrap_for_dlpack, (out, lse, q, k, v, merged)),
+        *map(_cuda_backend._wrap_for_dlpack, (out, lse, q, k, v, mask, merged)),
         torch.cuda.current_stream(q.device).cuda_stream,
     )
     return merged
@@ -271,4 +271,5 @@ def flash_attention_decode_step_merge(
     merged: torch.Tensor,
 ) -> torch.Tensor:
     """Fold the current step's rows causally into a prefix-only decode result."""
-    return flash_attention_decode_tree_merge(out, lse, q, k, v, merged)
+    mask = (1 << torch.arange(1, q.shape[2] + 1, device=q.device, dtype=torch.int32)) - 1
+    return flash_attention_decode_tree_merge(out, lse, q, k, v, mask, merged)
