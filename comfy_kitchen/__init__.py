@@ -141,6 +141,12 @@ __all__ = [
     "connected_components",
     "edge_collapse_checks",
     "min_cut",
+    "shortest_paths",
+    "shortest_paths_sparse",
+    "bellman_ford",
+    "trace_paths",
+    "walk_successors",
+    "conjugate_gradient",
     # Utilities
     "swap_nibbles",
     "to_blocked",
@@ -1174,6 +1180,99 @@ def min_cut(nbr: torch.Tensor, cap: torch.Tensor, s_cap: torch.Tensor, t_cap: to
     """
     kwargs = {"nbr": nbr, "cap": cap, "s_cap": s_cap, "t_cap": t_cap}
     impl = registry.get_implementation("min_cut", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def shortest_paths(indptr: torch.Tensor, dst: torch.Tensor, weight: torch.Tensor, dist: torch.Tensor,
+                   front: torch.Tensor, delta: float, active: torch.Tensor | None = None,
+                   closer: torch.Tensor | None = None) -> None:
+    """Batched shortest paths on a CSR graph (delta-stepping), updating dist in place.
+
+    Node v's arcs go to dst[indptr[v]:indptr[v + 1]] with float64 weights >= 0. Each row of dist (R, N) float64 is one
+    search: sources at 0, other nodes inf (or an earlier field to lower). It starts from the flat indices r * N + v in
+    front; delta is the bucket width.
+
+    Optional: only active (N,) nodes are entered; an arc into closer[r] (R,, -1 for none) is not followed and bounds
+    row r to the distance it leaves from. Nodes within a row's bound get their exact distance.
+    """
+    kwargs = {"indptr": indptr, "dst": dst, "weight": weight, "dist": dist, "front": front, "delta": delta,
+              "active": active, "closer": closer}
+    impl = registry.get_implementation("shortest_paths", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def shortest_paths_sparse(indptr: torch.Tensor, dst: torch.Tensor, weight: torch.Tensor, starts: torch.Tensor,
+                          delta: float, num_nodes: int, active: torch.Tensor | None = None,
+                          blocked: torch.Tensor | None = None, stop: torch.Tensor | None = None,
+                          end: torch.Tensor | None = None, closer: torch.Tensor | None = None,
+                          reach: torch.Tensor | None = None, max_slots: int = 2 ** 30) -> tuple[torch.Tensor, torch.Tensor]:
+    """shortest_paths from one start node per row, stored in a hash table instead of dense rows.
+
+    Also: end[r] (R,, -1 for none) and stop (N,) bool nodes are entered but not expanded and bound row r to their
+    distance; blocked (N,) bool nodes are entered only as an end or stop node; nodes beyond reach (R,) are entered but
+    not expanded. The table grows up to max_slots slots (32 bytes each), then the rows run in smaller groups. Returns
+    the sorted flat keys r * num_nodes + v (int64) of the nodes reached and their distances.
+    """
+    kwargs = {"indptr": indptr, "dst": dst, "weight": weight, "starts": starts, "delta": delta,
+              "num_nodes": num_nodes, "active": active, "blocked": blocked, "stop": stop, "end": end, "closer": closer,
+              "reach": reach, "max_slots": max_slots}
+    impl = registry.get_implementation("shortest_paths_sparse", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def bellman_ford(indptr: torch.Tensor, tail: torch.Tensor, weight: torch.Tensor, dist: torch.Tensor,
+                 max_iters: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Jacobi Bellman-Ford from per-node start distances, updating dist (N,) float64 in place.
+
+    Node h's in-arcs come from tail[indptr[h]:indptr[h + 1]] with float64 weights (negative allowed). Stops when no
+    node improves by more than 1e-12, when the parent graph has a (negative) cycle, or after max_iters. Returns the
+    parent arc per node (-1 for none) and an (N,) bool mask of the nodes on parent cycles.
+    """
+    kwargs = {"indptr": indptr, "tail": tail, "weight": weight, "dist": dist, "max_iters": max_iters}
+    impl = registry.get_implementation("bellman_ford", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def trace_paths(indptr: torch.Tensor, tail: torch.Tensor, weight: torch.Tensor, starts: torch.Tensor,
+                ends: torch.Tensor, dist: torch.Tensor | tuple[torch.Tensor, torch.Tensor], num_nodes: int,
+                reach: torch.Tensor | None = None, stop: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Shortest paths starts[r] -> ends[r] read back from per-row distance fields, as left by shortest_paths.
+
+    Node h's in-arcs come from tail[indptr[h]:indptr[h + 1]] with float64 weights. dist is dense (R, num_nodes) or
+    sorted flat keys r * num_nodes + v (int64) with their distances. Each step back takes the matching in-arc with the
+    smallest tail distance, then the largest tail id; tails beyond reach (R,) and stop (N,) nodes other than the start
+    are skipped. Returns the paths concatenated in row order (start first) and their lengths (R,), 0 where ends[r] is
+    -1 or there is no path.
+    """
+    kwargs = {"indptr": indptr, "tail": tail, "weight": weight, "starts": starts, "ends": ends, "dist": dist,
+              "num_nodes": num_nodes, "reach": reach, "stop": stop}
+    impl = registry.get_implementation("trace_paths", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def walk_successors(succ: torch.Tensor, starts: torch.Tensor, stop: torch.Tensor, active: torch.Tensor,
+                    twin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Follows succ (N,) from each of starts (R,) until a stop (N,) bool node other than the start.
+
+    A walk fails at a node without a successor (-1), an inactive node, or one already visited; visiting a node also
+    visits its active twin (-1 for none). Returns paths (R, L) int64 padded with -1 and their lengths (R,), 0 for a
+    failed walk.
+    """
+    kwargs = {"succ": succ, "starts": starts, "stop": stop, "active": active, "twin": twin}
+    impl = registry.get_implementation("walk_successors", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def conjugate_gradient(indptr: torch.Tensor, cols: torch.Tensor, vals: torch.Tensor, b: torch.Tensor, x: torch.Tensor,
+                       max_iters: int, tol: float) -> None:
+    """Conjugate gradients for A x = b, updating x (the start) in place.
+
+    A is symmetric positive definite in CSR form (indptr, cols, float64 vals). b and x are (N,) or (N, k <= 2) float64;
+    all columns iterate until every residual is within tol of its right-hand side's norm, or for max_iters. Results
+    reproduce exactly on one device.
+    """
+    kwargs = {"indptr": indptr, "cols": cols, "vals": vals, "b": b, "x": x, "max_iters": max_iters, "tol": tol}
+    impl = registry.get_implementation("conjugate_gradient", kwargs=kwargs)
     return impl(**kwargs)
 
 

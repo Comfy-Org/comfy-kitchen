@@ -83,6 +83,20 @@ __device__ __constant__ float zero_device;
     } \
   } while (0)
 
+inline int sm_count() {
+    int device = 0, sms = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+    return sms;
+}
+
+// launches kernel(params) with every block resident at once, as grid.sync() needs
+template <typename Params>
+inline void launch_cooperative(void (*kernel)(Params), int blocks, int threads, Params params, cudaStream_t stream) {
+    void* args[] = {&params};
+    CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(kernel), blocks, threads, args, 0, stream));
+}
+
 inline float* GetScalarOne() {
   static std::once_flag init_flag;
   std::call_once(init_flag, []() {

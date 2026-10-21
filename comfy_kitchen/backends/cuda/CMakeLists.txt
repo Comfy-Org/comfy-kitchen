@@ -155,6 +155,11 @@ set(CUDA_SOURCES
     ops/connected_components.cu
     ops/edge_collapse.cu
     ops/min_cut.cu
+    ops/shortest_paths.cu
+    ops/bellman_ford.cu
+    ops/trace_paths.cu
+    ops/walk_successors.cu
+    ops/conjugate_gradient.cu
     sage_attention/quant_v_int8.cu
     sage_attention/quant_qk_int8.cu
     sage_attention/sage_attn_launcher.cu
