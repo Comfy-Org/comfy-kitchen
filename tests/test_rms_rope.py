@@ -538,3 +538,31 @@ class TestPartialRotary:
         assert torch.equal(q, q_ref) and torch.equal(k, k_ref)
         assert not torch.equal(q, q_orig), "q buffer was never written in place"
         assert not torch.equal(k, k_orig), "k buffer was never written in place"
+
+
+@pytest.mark.parametrize(
+    "seq_len", [65535, 65536], ids=["at_grid_limit", "over_grid_limit"]
+)
+def test_rms_rope_triton_long_sequence(seq_len, device, seed):
+    if "triton" not in get_capable_backends("rms_rope1", device):
+        pytest.skip(f"triton does not support rms_rope1 on {device}")
+
+    batch, heads, head_dim = 2, 1, 64
+    x = torch.randn(batch, seq_len, heads, head_dim, device=device, dtype=torch.bfloat16)
+    freqs = torch.randn(
+        1, seq_len, 1, head_dim // 2, 2, 2, device=device, dtype=torch.float32
+    )
+    scale = torch.randn(head_dim, device=device, dtype=torch.float32)
+
+    reference = _reference_rms_rope(x, freqs, scale, 1e-6)
+    with ck.use_backend("triton"):
+        actual = ck.rms_rope1(x, freqs, scale)
+
+    assert_values_close(
+        actual,
+        reference,
+        rtol=1e-3,
+        atol=1e-3,
+        max_mismatch_ratio=_max_mismatch(torch.float32, torch.bfloat16),
+        name=f"long sequence seq_len={seq_len} (triton vs reference)",
+    )
