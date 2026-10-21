@@ -162,13 +162,13 @@ extern "C" void launch_flash_decode_gqa(
 //   o = (out * e^(lse - m) + sum_t v_t * e^(s_t - m)) / (e^(lse - m) + sum_t e^(s_t - m))
 // over the step rows t <= j.
 // One warp per (batch, row, head), eight dims per lane, fp32 math, bf16 out.
-namespace step_merge {
+namespace tree_merge {
 
 constexpr int kMergeHeadDim = 256;
 constexpr int kMergeWarps = 8;
 constexpr int kMaxRows = 8;
 
-__global__ void __launch_bounds__(kMergeWarps * 32) flash_decode_step_merge_kernel(
+__global__ void __launch_bounds__(kMergeWarps * 32) flash_decode_tree_merge_kernel(
     const __nv_bfloat16* __restrict__ out, const float* __restrict__ lse,
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     __nv_bfloat16* __restrict__ merged,
@@ -247,9 +247,9 @@ __global__ void __launch_bounds__(kMergeWarps * 32) flash_decode_step_merge_kern
     *reinterpret_cast<uint4*>(merged + b * m_bs + j * m_rs + h * kMergeHeadDim + d0) = res;
 }
 
-} // namespace step_merge
+} // namespace tree_merge
 
-extern "C" void launch_flash_decode_step_merge(
+extern "C" void launch_flash_decode_tree_merge(
     const void* out, const float* lse, const void* q, const void* k, const void* v, void* merged,
     int batch, int rows, int heads, int kv_heads,
     int64_t q_batch_stride, int64_t q_head_stride, int64_t q_row_stride,
@@ -258,9 +258,9 @@ extern "C" void launch_flash_decode_step_merge(
     int64_t o_batch_stride, int64_t o_row_stride,
     int64_t m_batch_stride, int64_t m_row_stride,
     cudaStream_t stream) {
-    using namespace step_merge;
+    using namespace tree_merge;
     const int warps = batch * rows * heads;
-    flash_decode_step_merge_kernel<<<(warps + kMergeWarps - 1) / kMergeWarps, kMergeWarps * 32, 0, stream>>>(
+    flash_decode_tree_merge_kernel<<<(warps + kMergeWarps - 1) / kMergeWarps, kMergeWarps * 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(out), lse,
         static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(k), static_cast<const __nv_bfloat16*>(v),
         static_cast<__nv_bfloat16*>(merged),

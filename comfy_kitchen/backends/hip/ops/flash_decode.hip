@@ -424,7 +424,7 @@ constexpr int kMergeWaves = 8;
 constexpr int kMergeMaxRows = 8;
 constexpr int kMergeDims = kMergeHeadDim / kWave;
 
-__global__ __launch_bounds__(kMergeWaves * kWave) void flash_decode_step_merge_kernel(
+__global__ __launch_bounds__(kMergeWaves * kWave) void flash_decode_tree_merge_kernel(
     const __bf16* __restrict__ out, const float* __restrict__ lse, const __bf16* __restrict__ q,
     const __bf16* __restrict__ k, const __bf16* __restrict__ v, __bf16* __restrict__ merged,
     int total, int rows, int heads, int groups, float scale,
@@ -481,7 +481,7 @@ __global__ __launch_bounds__(kMergeWaves * kWave) void flash_decode_step_merge_k
 }  // namespace
 }  // namespace comfy::hip_backend
 
-extern "C" void launch_flash_decode_step_merge(
+extern "C" void launch_flash_decode_tree_merge(
     const void* out, const float* lse, const void* q, const void* k, const void* v,
     void* merged, int batch, int rows, int heads, int kv_heads, int64_t q_batch_stride,
     int64_t q_head_stride, int64_t q_row_stride, int64_t k_batch_stride, int64_t k_head_stride,
@@ -490,7 +490,7 @@ extern "C" void launch_flash_decode_step_merge(
     hipStream_t stream) {
     using namespace comfy::hip_backend;
     const int waves = batch * rows * heads;
-    flash_decode_step_merge_kernel<<<(waves + kMergeWaves - 1) / kMergeWaves, kMergeWaves * kWave, 0,
+    flash_decode_tree_merge_kernel<<<(waves + kMergeWaves - 1) / kMergeWaves, kMergeWaves * kWave, 0,
                                      stream>>>(
         static_cast<const __bf16*>(out), lse, static_cast<const __bf16*>(q),
         static_cast<const __bf16*>(k), static_cast<const __bf16*>(v),

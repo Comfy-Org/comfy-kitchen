@@ -89,7 +89,7 @@ __all__ = [
     "flash_attention_decode_gqa_is_available",
     "flash_decode",
     "flash_decode_gqa",
-    "flash_decode_step_merge",
+    "flash_decode_tree_merge",
     "gated_delta_decode_fused",
     "gated_delta_decode_is_available",
     "deltanet_conv_step",
@@ -2950,7 +2950,7 @@ def flash_attention_decode_is_available() -> bool:
 
 
 def flash_attention_decode_gqa_is_available() -> bool:
-    """Whether the head-first GQA decode and step-merge kernels can run here."""
+    """Whether the head-first GQA decode and tree-merge kernels can run here."""
     return has_wmma() and hasattr(_C, "flash_attention_decode_gqa")
 
 
@@ -3207,7 +3207,7 @@ def flash_decode_gqa(
     )
 
 
-def flash_decode_step_merge(
+def flash_decode_tree_merge(
     out: torch.Tensor,
     lse: torch.Tensor,
     q: torch.Tensor,
@@ -3216,7 +3216,7 @@ def flash_decode_step_merge(
     merged: torch.Tensor,
 ) -> None:
     """Fold the current step's rows causally into a prefix-only decode result. See ops/flash_decode.hip."""
-    _C.flash_attention_decode_step_merge(
+    _C.flash_attention_decode_tree_merge(
         _dl(out), _dl(lse), _dl(q), _dl(k), _dl(v), _dl(merged), _stream(q))
 
 

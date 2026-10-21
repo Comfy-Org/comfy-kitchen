@@ -36,7 +36,7 @@ void launch_flash_decode(const void* q, const void* k, const void* v, const int*
 
 // Folds the current step's rows causally (row j attends rows t <= j) into a
 // prefix-only decode result; see ops/flash_decode.hip. heads is the query head count.
-void launch_flash_decode_step_merge(
+void launch_flash_decode_tree_merge(
     const void* out, const float* lse, const void* q, const void* k, const void* v, void* merged,
     int batch, int rows, int heads, int kv_heads, int64_t q_batch_stride,
     int64_t q_head_stride, int64_t q_row_stride, int64_t k_batch_stride, int64_t k_head_stride,

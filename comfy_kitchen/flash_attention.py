@@ -123,7 +123,7 @@ def flash_attention_decode(
 def flash_attention_decode_gqa_is_available(
     device: torch.device | int | None = None, dtype: torch.dtype = torch.bfloat16
 ) -> bool:
-    """Return whether flash_attention_decode_gqa and flash_attention_decode_step_merge run
+    """Return whether flash_attention_decode_gqa and flash_attention_decode_tree_merge run
     their native kernel on ``device`` for ``dtype`` inputs: BF16, head_dim 256, the CUDA
     extension on SM80 or newer or the HIP extension on RDNA3 or newer. Both functions
     otherwise compute the same result in torch."""
@@ -226,7 +226,7 @@ def flash_attention_decode_gqa(
     return output
 
 
-def _step_merge_torch(out, lse, q, k, v, merged):
+def _tree_merge_torch(out, lse, q, k, v, merged):
     batch, heads, rows, head_dim = q.shape
     groups = heads // k.shape[1]
     kf = k.float().repeat_interleave(groups, dim=1)
@@ -244,7 +244,7 @@ def _step_merge_torch(out, lse, q, k, v, merged):
     return merged
 
 
-def flash_attention_decode_step_merge(
+def flash_attention_decode_tree_merge(
     out: torch.Tensor, lse: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     merged: torch.Tensor,
 ) -> torch.Tensor:
@@ -255,12 +255,20 @@ def flash_attention_decode_step_merge(
     rows' own rotated query/key/value, and row j additionally attends step rows t <= j.
     Writes and returns ``merged`` [B, S, H*D]."""
     if q.shape[-1] != 256 or not flash_attention_decode_gqa_is_available(q.device, q.dtype):
-        return _step_merge_torch(out, lse, q, k, v, merged)
+        return _tree_merge_torch(out, lse, q, k, v, merged)
     if _hip_backend is not None:
-        _hip_backend.flash_decode_step_merge(out, lse, q, k, v, merged)
+        _hip_backend.flash_decode_tree_merge(out, lse, q, k, v, merged)
         return merged
-    _cuda_backend._C.flash_attention_decode_step_merge(
+    _cuda_backend._C.flash_attention_decode_tree_merge(
         *map(_cuda_backend._wrap_for_dlpack, (out, lse, q, k, v, merged)),
         torch.cuda.current_stream(q.device).cuda_stream,
     )
     return merged
+
+
+def flash_attention_decode_step_merge(
+    out: torch.Tensor, lse: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    merged: torch.Tensor,
+) -> torch.Tensor:
+    """Fold the current step's rows causally into a prefix-only decode result."""
+    return flash_attention_decode_tree_merge(out, lse, q, k, v, merged)

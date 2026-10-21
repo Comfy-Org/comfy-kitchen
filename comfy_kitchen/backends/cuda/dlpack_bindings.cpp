@@ -2520,7 +2520,7 @@ extern "C" {
         int64_t o_batch_stride, int64_t o_row_stride, int64_t o_head_stride,
         cudaStream_t stream);
 
-    void launch_flash_decode_step_merge(
+    void launch_flash_decode_tree_merge(
         const void* out, const float* lse, const void* q, const void* k, const void* v, void* merged,
         int batch, int rows, int heads, int kv_heads,
         int64_t q_batch_stride, int64_t q_head_stride, int64_t q_row_stride,
@@ -4321,7 +4321,7 @@ void flash_attention_decode_gqa(
 // decode over the S step rows; q [B, H, S, 256] and
 // k/v [B, Hk, S, 256] are the rows' own rotated query/key/value, and row j folds in step
 // rows t <= j. merged [B, S, H*256] receives the result.
-void flash_attention_decode_step_merge(
+void flash_attention_decode_tree_merge(
     nb::ndarray<nb::ndim<3>, nb::device::cuda> out,
     nb::ndarray<float, nb::ndim<3>, nb::device::cuda> lse,
     nb::ndarray<nb::ndim<4>, nb::device::cuda> q,
@@ -4335,18 +4335,18 @@ void flash_attention_decode_step_merge(
     if (batch <= 0 || heads <= 0 || rows <= 0 || rows > 8 || kv_heads <= 0 || heads % kv_heads != 0
         || q.shape(3) != kHeadDim || k.shape(0) != batch || k.shape(2) != rows || k.shape(3) != kHeadDim
         || v.shape(0) != batch || v.shape(1) != kv_heads || v.shape(2) != rows || v.shape(3) != kHeadDim)
-        throw std::runtime_error("Step merge shape mismatch");
+        throw std::runtime_error("Tree merge shape mismatch");
     if (out.shape(0) != batch || out.shape(1) != rows || out.shape(2) != heads * kHeadDim
         || merged.shape(0) != batch || merged.shape(1) != rows || merged.shape(2) != heads * kHeadDim
         || lse.shape(0) != batch || lse.shape(1) != heads || lse.shape(2) != rows)
-        throw std::runtime_error("Step merge output or lse shape mismatch");
+        throw std::runtime_error("Tree merge output or lse shape mismatch");
     if (map_dtype_to_code(q.dtype()) != 2 || map_dtype_to_code(k.dtype()) != 2 || map_dtype_to_code(v.dtype()) != 2
         || map_dtype_to_code(out.dtype()) != 2 || map_dtype_to_code(merged.dtype()) != 2)
-        throw std::runtime_error("Step merge tensors must have bfloat16 dtype");
+        throw std::runtime_error("Tree merge tensors must have bfloat16 dtype");
     if (q.stride(3) != 1 || k.stride(3) != 1 || v.stride(3) != 1 || out.stride(2) != 1 || merged.stride(2) != 1
         || out.stride(1) != heads * kHeadDim || merged.stride(1) != heads * kHeadDim)
-        throw std::runtime_error("Unsupported step merge strides");
-    launch_flash_decode_step_merge(
+        throw std::runtime_error("Unsupported tree merge strides");
+    launch_flash_decode_tree_merge(
         out.data(), lse.data(), q.data(), k.data(), v.data(), merged.data(),
         static_cast<int>(batch), static_cast<int>(rows), static_cast<int>(heads), static_cast<int>(kv_heads),
         q.stride(0), q.stride(1), q.stride(2),
@@ -5231,7 +5231,7 @@ NB_MODULE(_C, m) {
           nb::arg("output"), nb::arg("softmax_lse"), nb::arg("softmax_lse_accum"),
           nb::arg("output_accum"), nb::arg("num_splits"), nb::arg("causal"), nb::arg("stream_ptr"));
 
-    m.def("flash_attention_decode_step_merge", &flash_attention_decode_step_merge,
+    m.def("flash_attention_decode_tree_merge", &flash_attention_decode_tree_merge,
           "Fold the current step's rows causally into a prefix-only GQA decode result using its log-sum-exp",
           nb::arg("out"), nb::arg("lse"), nb::arg("q"), nb::arg("k"), nb::arg("v"),
           nb::arg("merged"), nb::arg("stream_ptr"));

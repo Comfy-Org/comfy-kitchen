@@ -2049,10 +2049,10 @@ void flash_attention_decode_gqa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> 
 // decode over the S step rows; q [B, H, S, 256]
 // and k/v [B, Hk, S, 256] are the rows' own rotated query/key/value, and row j folds
 // in step rows t <= j. merged [B, S, H*256] receives the result.
-void flash_attention_decode_step_merge(nb::ndarray<> out, nb::ndarray<> lse, nb::ndarray<> q,
+void flash_attention_decode_tree_merge(nb::ndarray<> out, nb::ndarray<> lse, nb::ndarray<> q,
                                        nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> merged,
                                        uintptr_t stream_ptr) {
-    constexpr const char* kFn = "flash_attention_decode_step_merge";
+    constexpr const char* kFn = "flash_attention_decode_tree_merge";
     constexpr int64_t kHeadDim = 256;
     if (out.ndim() != 3 || lse.ndim() != 3 || q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 ||
         merged.ndim() != 3) {
@@ -2100,7 +2100,7 @@ void flash_attention_decode_step_merge(nb::ndarray<> out, nb::ndarray<> lse, nb:
                                      ": every operand must be ROCm device memory on q's device");
         }
     }
-    launch_flash_decode_step_merge(
+    launch_flash_decode_tree_merge(
         out.data(), static_cast<const float*>(lse.data()), q.data(), k.data(), v.data(),
         merged.data(), static_cast<int>(batch),
         static_cast<int>(rows), static_cast<int>(heads), static_cast<int>(kv_heads), q.stride(0),
@@ -2731,7 +2731,7 @@ NB_MODULE(_C, m) {
           nb::arg("v"), nb::arg("kv_lengths"), nb::arg("output"), nb::arg("softmax_lse"),
           nb::arg("softmax_lse_accum"), nb::arg("output_accum"), nb::arg("num_splits"),
           nb::arg("causal"), nb::arg("stream_ptr"));
-    m.def("flash_attention_decode_step_merge", &flash_attention_decode_step_merge, nb::arg("out"),
+    m.def("flash_attention_decode_tree_merge", &flash_attention_decode_tree_merge, nb::arg("out"),
           nb::arg("lse"), nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("merged"),
           nb::arg("stream_ptr"));
     m.def("sage_prepare_key_mask", &sage_prepare_key_mask,
