@@ -3,10 +3,12 @@
 
 #if @COMFY_HIP_GFX12_CONDITION@
 #define COMFY_MMA_GFX12 1
+#elif @COMFY_HIP_GFX117_CONDITION@
+#define COMFY_MMA_GFX117 1
 #elif @COMFY_HIP_GFX11_CONDITION@
 #define COMFY_MMA_GFX11 1
 #endif
 
-#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX11)
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX11) || defined(COMFY_MMA_GFX117)
 #define COMFY_HAS_WMMA 1
 #endif
