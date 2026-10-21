@@ -3120,6 +3120,7 @@ def gated_delta_decode_deferred(
     key_dim: int,
     num_key_heads: int,
     scale: float,
+    tree: int,
 ) -> bool:
     """Deferred-commit decode: see comfy_kitchen.gated_delta.gated_delta_decode_deferred.
 
@@ -3145,6 +3146,7 @@ def gated_delta_decode_deferred(
         key_dim,
         num_key_heads,
         float(scale),
+        int(tree),
         _stream(x),
     )
 
