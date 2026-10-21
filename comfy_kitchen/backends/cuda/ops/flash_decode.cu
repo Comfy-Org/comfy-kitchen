@@ -24,6 +24,7 @@ namespace flash {
 // Single-query decode and bottom-right causal multi-query decode (a speculative verify
 // step, seqlen_q <= kBlockM) share the split-KV kernel; both predicate their Q/K/V loads
 // and O stores (Is_even_MN=false) since seqlen_q and kv_length are never tile multiples.
+using Traits64 = Flash_fwd_kernel_traits<64, 64, 256, 4, false, false, cutlass::bfloat16_t>;
 using Traits128 = Flash_fwd_kernel_traits<128, 64, 128, 4, false, false, cutlass::bfloat16_t>;
 using Traits256 = Flash_fwd_kernel_traits<256, 64, 64, 4, false, false, cutlass::bfloat16_t>;
 
@@ -34,7 +35,9 @@ __global__ void flash_decode_kernel(COMFY_FLASH_PARAM const Flash_fwd_params par
 
 template<typename Traits, int LogMaxSplits>
 __global__ void flash_decode_combine_kernel(COMFY_FLASH_PARAM const Flash_fwd_params params) {
-    COMFY_FLASH_BODY((combine_attn_seqk_parallel<Traits, 4, LogMaxSplits, true>(params));)
+    // 128 threads each copy four values: a 64-wide head needs eight rows per tile.
+    constexpr int kCombineRows = Traits::kHeadDim == 64 ? 8 : 4;
+    COMFY_FLASH_BODY((combine_attn_seqk_parallel<Traits, kCombineRows, LogMaxSplits, true>(params));)
 }
 
 template<typename Traits, bool Is_causal>
@@ -48,7 +51,8 @@ void launch_flash_decode_typed(Flash_fwd_params& params, cudaStream_t stream) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         kernel<<<grid, Traits::kNThreads, smem_size, stream>>>(params);
 
-        const dim3 combine_grid((params.b * params.h * params.seqlen_q + 3) / 4);
+        constexpr int kCombineRows = Traits::kHeadDim == 64 ? 8 : 4;
+        const dim3 combine_grid((params.b * params.h * params.seqlen_q + kCombineRows - 1) / kCombineRows);
         if (params.num_splits <= 2) {
             flash_decode_combine_kernel<Traits, 1><<<combine_grid, Traits::kNThreads, 0, stream>>>(params);
         } else if (params.num_splits <= 4) {
@@ -104,8 +108,8 @@ static flash::Flash_fwd_params decode_params(
     params.d = params.d_rounded = head_dim;
     params.seqlen_q_rounded = ((query_length + 127) / 128) * 128;
     params.total_q = batch * query_length;
-    params.scale_softmax = head_dim == 128 ? 0.08838834764831845f : 0.0625f;
-    params.scale_softmax_log2 = head_dim == 128 ? 0.12751743082871335f : 0.09016844005556021f;
+    params.scale_softmax = head_dim == 64 ? 0.125f : (head_dim == 128 ? 0.08838834764831845f : 0.0625f);
+    params.scale_softmax_log2 = head_dim == 64 ? 0.18033688011112042f : (head_dim == 128 ? 0.12751743082871335f : 0.09016844005556021f);
     params.window_size_left = params.window_size_right = -1;
     params.num_splits = num_splits;
     params.is_bf16 = true;
@@ -124,7 +128,12 @@ extern "C" void launch_flash_decode(
                                 q_batch_stride, q_row_stride, q_head_stride,
                                 k_batch_stride, k_row_stride, k_head_stride,
                                 q_batch_stride, q_row_stride, q_head_stride);
-    if (head_dim == 128) {
+    if (head_dim == 64) {
+        // The unpadded LSE path guards the final partial merge tile. LSE is internal
+        // scratch for this entry point; its head-first layout is not returned.
+        params.unpadded_lse = true;
+        flash::launch_flash_decode_typed<flash::Traits64, false>(params, stream);
+    } else if (head_dim == 128) {
         flash::launch_flash_decode_typed<flash::Traits128, false>(params, stream);
     } else {
         flash::launch_flash_decode_typed<flash::Traits256, false>(params, stream);

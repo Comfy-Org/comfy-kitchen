@@ -66,6 +66,7 @@ __all__ = [
     "adaln",
     "fp16_conv3d",
     "group_norm_silu_pad3d",
+    "group_norm_stats3d",
     "rms_adaln",
     # Attention
     "PrequantizedInt8Attention",
@@ -368,20 +369,29 @@ def group_norm_silu_pad3d(
     silu: bool = True,
     zero_pad: bool = False,
     out: torch.Tensor | None = None,
+    stats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-frame GroupNorm, SiLU and causal conv3d padding in one pass.
 
     x [B, C, T, H, W]; pad is (left, right, top, bottom, front). The spatial border
     reflects, or is zero when zero_pad; the front frames are always zero. weight=None is
-    pad-only. Output is channels_last_3d, into out when given, which is returned; for a
-    batch of one out may be a frame-offset view, leaving room for a caller's real halo.
+    pad-only. stats from group_norm_stats3d normalizes with those per-frame statistics
+    instead of x's own, so x may be a row strip of the frame they describe. Output is
+    channels_last_3d, into out when given, which is returned; for a batch of one out may
+    be a frame-offset view, leaving room for a caller's real halo.
     """
     if out is None:
         return torch.ops.comfy_kitchen.group_norm_silu_pad3d(
-            x, weight, bias, num_groups, eps, list(pad), silu, zero_pad)
+            x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, stats)
     torch.ops.comfy_kitchen.group_norm_silu_pad3d_out(
-        x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, out)
+        x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, out, stats)
     return out
+
+
+def group_norm_stats3d(x: torch.Tensor, num_groups: int = 32, eps: float = 1e-6) -> torch.Tensor:
+    """Per-frame GroupNorm statistics of x [B, C, T, H, W]: float32 [B*T, num_groups, 2]
+    of (mean, rstd), for group_norm_silu_pad3d's stats argument."""
+    return torch.ops.comfy_kitchen.group_norm_stats3d(x, num_groups, eps)
 
 
 def rms_adaln(

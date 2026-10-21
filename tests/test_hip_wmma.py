@@ -1257,6 +1257,40 @@ def test_w4a8_linear_chunking_does_not_change_the_result(hip, monkeypatch, n, ch
     assert torch.equal(chunked, one_pass)
 
 
+@pytest.mark.parametrize("act", ["gelu_tanh", "rms_norm", "swiglu", "situ"])
+@pytest.mark.parametrize("bits", [4, 6])
+@pytest.mark.parametrize("m", [1, 9, 600], ids=["gemv", "small", "prefill"])
+@needs_wmma
+def test_w4a8_linear_fuses_the_input_act(hip, monkeypatch, act, bits, m):
+    """The ConvRot quantizer applies the activation on every row count, so the
+    eager activation must never run."""
+    torch.manual_seed(0)
+    n, k = 512, 4096
+    _, (qdata, s_rel, s_channel, _, cb) = _quantize_w4a8(n, k, bits=bits)
+    w = torch.randn(k, device=DEV, dtype=torch.bfloat16)
+    if act in _GATED_ACTS:
+        x = _gated_input(act, m, k, torch.bfloat16)
+        activated = _GATED_ACTS[act](x)
+    else:
+        x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16) * 3.0
+        activated = (torch.nn.functional.rms_norm(x, (k,), weight=w, eps=1e-6)
+                     if act == "rms_norm" else torch.nn.functional.gelu(x, approximate="tanh"))
+
+    ref = hip.w4a8_int8_linear(activated, qdata, s_rel, s_channel, codebook=cb)
+
+    def eager_act(x, input_act, *args):
+        assert input_act in (None, "none"), input_act
+        return x
+
+    monkeypatch.setattr(hip, "_apply_input_act", eager_act)
+    out = hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, codebook=cb,
+                               input_act=act, input_act_weight=w, input_act_eps=1e-6)
+
+    assert out.shape == (m, n)
+    # the kernel evaluates the activation in fp32, the reference rounds it to bf16 first
+    assert ((out.float() - ref.float()).norm() / ref.float().norm()).item() < 0.03
+
+
 @pytest.mark.parametrize(("m", "n", "k", "group_size"),
                          [(1, 256, 512, 16), (3, 768, 1024, 16), (8, 512, 2048, 32),
                           (2, 384, 2048, 128), (1, 512, 1104, 16)])

@@ -42,7 +42,8 @@ constexpr int kBlockThreads = kWavesPerBlock * kWave;
 // Wider heads and group tiles leave fewer registers for prefetched K/V.
 template <int HeadDim, int GroupsPerPass>
 constexpr int keys_per_iter() {
-    return (GroupsPerPass >= 8 ? 4 : (GroupsPerPass >= 4 ? 8 : 16)) * 128 / HeadDim;
+    return (GroupsPerPass >= 8 ? 4 : (GroupsPerPass >= 4 ? 8 : 16)) * 128 /
+           (HeadDim < 128 ? 128 : HeadDim);
 }
 
 constexpr float kLn2 = 0.693147180559945309417f;
@@ -50,18 +51,20 @@ constexpr float kLn2 = 0.693147180559945309417f;
 // Finite, not -inf: under -ffast-math the first m - m would be NaN.
 constexpr float kNegInf = -FLT_MAX / 4.0f;
 
-typedef __bf16 v4bf __attribute__((ext_vector_type(4)));
+template <int Width>
+using BFloatVec = __bf16 __attribute__((ext_vector_type(Width)));
 template <int Width>
 using FloatVec = float __attribute__((ext_vector_type(Width)));
 
 template <int Width>
 __forceinline__ __device__ FloatVec<Width> load_bf16(const __bf16* p) {
+    constexpr int kLoadWidth = Width < 4 ? Width : 4;
     FloatVec<Width> result;
 #pragma unroll
-    for (int i = 0; i < Width; i += 4) {
-        const v4bf raw = *reinterpret_cast<const v4bf*>(p + i);
+    for (int i = 0; i < Width; i += kLoadWidth) {
+        const auto raw = *reinterpret_cast<const BFloatVec<kLoadWidth>*>(p + i);
 #pragma unroll
-        for (int d = 0; d < 4; ++d) result[i + d] = static_cast<float>(raw[d]);
+        for (int d = 0; d < kLoadWidth; ++d) result[i + d] = static_cast<float>(raw[d]);
     }
     return result;
 }
@@ -114,7 +117,8 @@ __global__ __launch_bounds__(kBlockThreads) void flash_decode_kernel(
     int64_t o_batch_stride, int64_t o_group_stride, int64_t o_step_stride, int64_t o_head_stride) {
     constexpr int kDimPerLane = HeadDim / kWave;
     constexpr int kKeysPerIter = keys_per_iter<HeadDim, GroupsPerPass>();
-    constexpr float kSoftmaxScaleLog2 = HeadDim == 128 ? 0.12751743082871335f : 0.09016844005556021f;
+    constexpr float kSoftmaxScaleLog2 = HeadDim == 64 ? 0.18033688011112042f :
+                                      (HeadDim == 128 ? 0.12751743082871335f : 0.09016844005556021f);
     using Vec = FloatVec<kDimPerLane>;
     const int lane = static_cast<int>(threadIdx.x) % kWave;
     const int wave = static_cast<int>(threadIdx.x) / kWave;
@@ -364,10 +368,17 @@ void launch_typed(const DecodeArgs& a) {
 
 template <int HeadDim, bool Causal>
 void launch_groups(const DecodeArgs& a) {
+    if constexpr (HeadDim == 64) {
+        // Short caches need more independent blocks to occupy the GPU.
+        if (a.kv_capacity <= 128) {
+            launch_typed<HeadDim, 1, Causal>(a);
+            return;
+        }
+    }
     switch (groups_per_pass(a.query_length)) {
         case 8:
             // Cap the 256-dimensional tile at four groups to stay within the LDS budget.
-            launch_typed<HeadDim, HeadDim == 128 ? 8 : 4, Causal>(a);
+            launch_typed<HeadDim, HeadDim == 256 ? 4 : 8, Causal>(a);
             break;
         case 4:
             launch_typed<HeadDim, 4, Causal>(a);
@@ -400,7 +411,10 @@ extern "C" void launch_flash_decode(const void* q, const void* k, const void* v,
         heads, kv_capacity, num_splits, q_batch_stride, q_group_stride, q_step_stride,
         q_head_stride, k_batch_stride, k_row_stride, k_head_stride, o_batch_stride,
         o_group_stride, o_step_stride, o_head_stride, stream};
-    if (head_dim == 128) {
+    if (head_dim == 64) {
+        if (causal) comfy::hip_backend::launch_groups<64, true>(a);
+        else comfy::hip_backend::launch_groups<64, false>(a);
+    } else if (head_dim == 128) {
         if (causal) comfy::hip_backend::launch_groups<128, true>(a);
         else comfy::hip_backend::launch_groups<128, false>(a);
     } else {
