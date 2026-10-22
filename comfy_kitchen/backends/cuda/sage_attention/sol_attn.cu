@@ -23,7 +23,7 @@
 // Entry paths: `launch_sol_attn` (post-rope q/k/v) or the chunked producer
 // (`sol_producer_begin/chunk`, then `launch_sol_attn_core`). sm_80+, tuned
 // for sm_120; tensors are (B, T, H, 128) bf16 or fp16 (the chunked producer
-// takes bf16 only).
+// takes bf16 only). Caller block lists can replace route (block-sparse, no tail).
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -81,7 +81,7 @@ struct Plan {
     size_t tokTiles, tokTileCnt, gCen8, gCens, gRef, gBits;
     size_t tokPartO, tokPartM, tokPartL, scratch, total;
 
-    Plan(int B, int T, int H, int n_tok) {
+    Plan(int B, int T, int H, int n_tok, bool routed = true) {
         NTB = (T + BLK - 1) / BLK;
         Tp = NTB * BLK;
         NPAD = ((NTB + 63) / 64) * 64;      // route reads pooled keys in 64-block groups
@@ -99,7 +99,7 @@ struct Plan {
         kcs     = take(bh * NPAD * sizeof(float));
         vcT     = take(bh * HD * NPAD * sizeof(uint16_t));
         thr     = take(bh * NQ * sizeof(float));
-        idx     = take(bh * NQ * NTB * sizeof(uint16_t));   // the only T^2 term
+        idx     = take(routed ? bh * NQ * NTB * sizeof(uint16_t) : 0);   // the only T^2 term
         cnt     = take(bh * NQ * sizeof(int32_t));
         cen8    = take(bh * NQ * HD);
         cens    = take(bh * NQ * sizeof(float));
@@ -148,23 +148,36 @@ void validate_shape(int batch, int seq_len, int num_heads) {
         throw std::runtime_error("sol_attn: batch * num_heads exceeds the 65535 grid limit");
 }
 
+__global__ void sol_fill_kernel(float* x, float value, int64_t n) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = value;
+}
+
 // route + exact over a populated workspace. The cudaGetLastError covers every
 // stage launched before it; without it a rejected launch leaves route's
-// handover values in `out`.
+// handover values in `out`. blk_idx / blk_cnt: caller block lists in place of route.
 void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* out,
                      const void* blen, int tail,
                      int batch, int seq_len, int num_heads,
                      int sink_start, int sink_end, int sink_q_start, int sink_q_end,
-                     float scale_log2, int elem, int n_tok, cudaStream_t stream)
+                     float scale_log2, int elem, int n_tok, cudaStream_t stream,
+                     const void* blk_idx = nullptr, const void* blk_cnt = nullptr, int max_blocks = 0)
 {
-    // top-k mode: the caller supplies the per-query-block threshold
-    const void* thr = ext_threshold ? ext_threshold : (const void*)(w + p.thr);
-    // with token routing route also flags the unrouted blocks and leaves their tail to the token stage
-    launch_sol_route(w + p.cen8, w + p.cens, w + p.kciP, w + p.kcs, w + p.vcT, w + p.vsc,
-                     thr, w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart,
-                     n_tok ? w + p.tokRef : nullptr, n_tok ? w + p.tokBits : nullptr,
-                     blen, tail, batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ,
-                     sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
+    if (blk_idx) {
+        const int64_t rows = (int64_t)batch * num_heads * p.NQ;
+        cudaMemsetAsync(w + p.oPart, 0, rows * HD * sizeof(uint16_t), stream);
+        cudaMemsetAsync(w + p.lPart, 0, rows * sizeof(float), stream);
+        sol_fill_kernel<<<(unsigned)((rows + 255) / 256), 256, 0, stream>>>(reinterpret_cast<float*>(w + p.mPart), sol::NEG, rows);
+    } else {
+        // top-k mode: the caller supplies the per-query-block threshold
+        const void* thr = ext_threshold ? ext_threshold : (const void*)(w + p.thr);
+        // with token routing route also flags the unrouted blocks and leaves their tail to the token stage
+        launch_sol_route(w + p.cen8, w + p.cens, w + p.kciP, w + p.kcs, w + p.vcT, w + p.vsc,
+                         thr, w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart,
+                         n_tok ? w + p.tokRef : nullptr, n_tok ? w + p.tokBits : nullptr,
+                         blen, tail, batch, seq_len, num_heads, p.NTB, p.NPAD, p.NQ,
+                         sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, stream);
+    }
     if (n_tok)
         launch_sol_token(w + p.qmean, w + p.tokRef, w + p.tokBits,
                          w + p.gCen8, w + p.gCens, w + p.gRef, w + p.gBits,
@@ -175,9 +188,10 @@ void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* ou
                          batch, p.Tp, num_heads, p.NQ, p.NPAD, p.NTB, n_tok, tail,
                          sink_q_start, sink_q_end, scale_log2, stream);
     launch_sol_exact(w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb, w + p.vTi, w + p.vsc,
-                     w + p.idx, w + p.cnt, w + p.oPart, w + p.mPart, w + p.lPart,
+                     blk_idx ? blk_idx : w + p.idx, blk_idx ? blk_cnt : w + p.cnt,
+                     w + p.oPart, w + p.mPart, w + p.lPart,
                      w + p.vRow, w + p.tokIdx, w + p.tokCnt, n_tok, out,
-                     batch, seq_len, p.Tp, num_heads, p.NQ, p.NTB,
+                     batch, seq_len, p.Tp, num_heads, p.NQ, blk_idx ? max_blocks : p.NTB,
                      scale_log2, elem, stream);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
@@ -198,9 +212,9 @@ extern "C" const char* const sol_attn_plan_names[] = {
 };
 // Writes the values into out[0..count) and returns count; writes nothing if
 // cap < count, so a caller with a fixed buffer can detect a grown Plan.
-extern "C" int sol_attn_plan(int batch, int seq_len, int num_heads, int n_tok, int64_t* out, int cap) {
+extern "C" int sol_attn_plan(int batch, int seq_len, int num_heads, int n_tok, int routed, int64_t* out, int cap) {
     validate_token_aug(n_tok);
-    const Plan p(batch, seq_len, num_heads, n_tok);
+    const Plan p(batch, seq_len, num_heads, n_tok, routed != 0);
     const int64_t v[] = {
         p.Tp, p.NTB, p.NPAD, p.NQ,
         (int64_t)p.qiP, (int64_t)p.qs, (int64_t)p.kiP, (int64_t)p.ksb, (int64_t)p.vTi,
@@ -285,14 +299,15 @@ extern "C" void launch_sol_attn(
     int64_t qs_b, int64_t qs_t, int64_t qs_h,
     int64_t ks_b, int64_t ks_t, int64_t ks_h,
     int64_t vs_b, int64_t vs_t, int64_t vs_h,
-    int n_tok, cudaStream_t stream)
+    int n_tok, cudaStream_t stream,
+    const void* blk_idx, const void* blk_cnt, int max_blocks)
 {
     if (head_dim != HD)
         throw std::runtime_error("sol_attn supports head_dim 128, got " + std::to_string(head_dim));
     validate_shape(batch, seq_len, num_heads);
     validate_token_aug(n_tok);
 
-    const Plan p(batch, seq_len, num_heads, n_tok);
+    const Plan p(batch, seq_len, num_heads, n_tok, blk_idx == nullptr);
     char* w = reinterpret_cast<char*>(workspace);
     const float scale_log2 = scale * 1.4426950408889634f;
     launch_sol_preprocess(q, k, v, w + p.qiP, w + p.qs, w + p.kiP, w + p.ksb,
@@ -305,5 +320,6 @@ extern "C" void launch_sol_attn(
     launch_sol_vtranspose(v, w + p.vsc, w + p.vTi, n_tok ? w + p.vRow : nullptr, batch, seq_len, p.Tp, num_heads,
                           vs_b, vs_t, vs_h, elem, stream);
     run_route_exact(p, w, ext_threshold, out, blen, tail, batch, seq_len, num_heads,
-                    sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, elem, n_tok, stream);
+                    sink_start, sink_end, sink_q_start, sink_q_end, scale_log2, elem, n_tok, stream,
+                    blk_idx, blk_cnt, max_blocks);
 }

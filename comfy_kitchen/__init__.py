@@ -190,6 +190,8 @@ def sol_attn(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    kv_indices: torch.Tensor | None = None,
+    kv_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn training-free sparse attention (arXiv 2607.24027).
 
@@ -226,6 +228,10 @@ def sol_attn(
             query block are routed individually, the highest-scoring ones outside
             the routed blocks, and attended exactly. The eager reference ignores
             it.
+        kv_indices, kv_counts: block lists in place of routing (block-sparse
+            attention, CUDA only): ``(B, H, ceil(T/64), max_blocks)`` distinct
+            16-bit key-block ids and ``(B, H, ceil(T/64))`` counts. No sinks or
+            tail; a query block with no ids returns zeros.
 
     Returns:
         ``(B, T, H, 128)`` attention output.
@@ -240,18 +246,23 @@ def sol_attn(
         block_len,
         coarse_gate,
         int(token_aug),
+        kv_indices,
+        kv_counts,
     )
 
 
-def sol_attn_is_available(device: torch.device | None = None) -> bool:
+def sol_attn_is_available(device: torch.device | None = None, block_lists: bool = False) -> bool:
     """Whether the compiled Sol-Attn kernels can run on ``device``: the CUDA
-    backend on sm_80+, or the HIP backend on a GPU with matrix cores. The
-    per-call rules (bf16/fp16, head_dim 128, matching q/k/v) still apply."""
+    backend on sm_80+, or the HIP backend on a GPU with matrix cores; CUDA only
+    with ``block_lists``. The per-call rules (bf16/fp16, head_dim 128, matching
+    q/k/v) still apply."""
     if device is not None and device.type != "cuda":
         return False
     if not torch.cuda.is_available():
         return False
     if getattr(torch.version, "hip", None):
+        if block_lists:
+            return False
         # torch.cuda is the ROCm API here; the HIP backend advertises sol_attn
         # only on WMMA parts, so its registration is the answer
         return registry.is_available("hip") and registry.get_constraints("hip", "sol_attn") is not None
