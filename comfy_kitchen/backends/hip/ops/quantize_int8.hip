@@ -37,6 +37,7 @@ namespace comfy::hip_backend {
 
 constexpr float kInt8Max = 127.0f;
 
+// Upstream's answer: the transposed schedule on the gfx12/gfx117 WMMA layout.
 inline bool use_convrot_transposed_bf16(int in_code, int M, int K, int group_size) {
     if (in_code != 2 || group_size != 256 || M < 1024 || K < 2560 || K > 16384) {
         return false;
@@ -47,12 +48,39 @@ inline bool use_convrot_transposed_bf16(int in_code, int M, int K, int group_siz
     return use_nonduplicated_wmma_schedule() && convrot_512x2_supported(K);
 }
 
+// The fork's answer for the small iGPU: the same schedule, but only from
+// K=12288 up.
+//
+// The transposed schedule runs one 512-thread block per row and keeps the
+// butterfly in registers, so its block holds the row and little else. The
+// fork's own fused schedule runs a 64- or 256-thread block, which is the
+// better choice while the row is short (the block then costs little LDS and
+// many of them stay resident) and the worse one once the row dominates the
+// block. The crossover on the 6-WGP 780M, one process, order-rotated, output
+// bit-identical in every case:
+//
+//   K= 5120   1.06x .. 1.22x slower with the transposed schedule
+//   K= 8192   1.09x .. 1.15x slower
+//   K=10240   0.94x .. 1.06x, a tie
+//   K=12288   0.83x .. 0.94x faster   (gelu_tanh 0.83x, none 0.89x, swiglu 0.93x)
+//   K=16384   0.84x .. 0.99x faster
+//
+// K=12288 is where the fork's own wide-row boundary already sits, and it is
+// where the transposed schedule's row-dominant block starts to pay.
+inline bool use_convrot_transposed_small_igpu(int in_code, int M, int K, int group_size) {
+    if (in_code != 2 || group_size != 256 || M < 1024 || K < 12288 || K > 16384) {
+        return false;
+    }
+    return comfy_small_igpu() && convrot_512x2_supported(K);
+}
+
 template <int ACT, bool TILED_QOUT>
 static void launch_convrot_quant_int8(
     const void* x, int in_code, int8_t* q, float* scales,
     int M, int K, int group_size, hipStream_t stream,
     void* spill_rotated, void* spill_partials) {
-    if (use_convrot_transposed_bf16(in_code, M, K, group_size)) {
+    if (use_convrot_transposed_bf16(in_code, M, K, group_size) ||
+        use_convrot_transposed_small_igpu(in_code, M, K, group_size)) {
         launch_convrot_quant_transposed_bf16<ACT, TILED_QOUT>(
             x, q, scales, M, K, stream);
     } else {

@@ -78,6 +78,16 @@ struct TileStager {
             // A thread-strided assignment makes every load instruction cover
             // consecutive 16-byte chunks across a wave. The thread-major
             // order stays the default; COALESCED_STAGING opts in.
+            //
+            // **The thread-major order is the right one on this part.** The
+            // wave-coalesced order issues fewer memory transactions (one
+            // instruction covers one contiguous run instead of 32 addresses
+            // kPerThread*16 bytes apart), and it measured 1.03x-1.08x SLOWER
+            // here on the deep-K int8 shapes: the saved transactions are worth
+            // less than the LDS bank conflicts the new store order costs,
+            // because this GEMM is WMMA- and LDS-bound rather than DRAM-bound.
+            // Upstream uses it for the tiled-A layout, where the A operand is
+            // physically contiguous and the order is what makes it dense.
             const int c = COALESCED_STAGING ? tid + i * THREADS
                                              : tid * kPerThread + i;
             const int grow = row0 + c / kChunksPerRow;
