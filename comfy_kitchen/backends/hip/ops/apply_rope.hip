@@ -63,14 +63,14 @@ __global__ void apply_rope_kernel(
 
     const float qa = load_in(xq, ia_in, x_code);
     const float qb = load_in(xq, ib_in, x_code);
-    rope_store<T>(xq_out, ia_out, rope_combine(f00, qa, f01, qb, f_code, split_half));
-    rope_store<T>(xq_out, ib_out, rope_combine(f10, qa, f11, qb, f_code, split_half));
+    rope_store<T>(xq_out, ia_out, rope_combine(f00, qa, f01, qb, f_code));
+    rope_store<T>(xq_out, ib_out, rope_combine_b(f10, qa, f11, qb, f_code, split_half));
 
     if (xk != nullptr) {
         const float ka = load_in(xk, ia_in, x_code);
         const float kb = load_in(xk, ib_in, x_code);
-        rope_store<T>(xk_out, ia_out, rope_combine(f00, ka, f01, kb, f_code, split_half));
-        rope_store<T>(xk_out, ib_out, rope_combine(f10, ka, f11, kb, f_code, split_half));
+        rope_store<T>(xk_out, ia_out, rope_combine(f00, ka, f01, kb, f_code));
+        rope_store<T>(xk_out, ib_out, rope_combine_b(f10, ka, f11, kb, f_code, split_half));
     }
 }
 

@@ -1,9 +1,11 @@
 __all__ = [
     "adaln",
+    "rms_gated_residual",
     "fp16_conv3d",
     "fp16_conv3d_out",
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
+    "group_norm_stats3d",
     "na3d",
     "sol_attn",
     "rms_adaln",
@@ -53,7 +55,10 @@ __all__ = [
     "stochastic_rounding_fp8",
     "fp16_linear",
     "int8_linear",
+    "int8_linear_modulated",
+    "int8_linear_rms_modulated",
     "w4a8_int8_linear",
+    "w4a8_packed_linear",
 ]
 
 import torch
@@ -65,6 +70,7 @@ from comfy_kitchen.constraints import (
     na3d_common_call_rule,
     sol_attn_common_call_rule,
     with_out_param,
+    with_w4a8_packed_storage,
 )
 from comfy_kitchen.registry import registry
 
@@ -77,7 +83,7 @@ from .convrot_w4a4 import (
     prepare_int4_weight_for_int8_linear,
     quantize_convrot_w4a4_weight,
 )
-from .group_norm_pad3d import group_norm_silu_pad3d, group_norm_silu_pad3d_out
+from .group_norm_pad3d import group_norm_silu_pad3d, group_norm_silu_pad3d_out, group_norm_stats3d
 from .na import na3d
 from .quantization import (
     dequantize_int8_convrot_weight,
@@ -90,6 +96,8 @@ from .quantization import (
     dequantize_per_tensor_fp8,
     fp16_linear,
     int8_linear,
+    int8_linear_modulated,
+    int8_linear_rms_modulated,
     quantize_and_rotate_rowwise,
     quantize_int8_convrot_weight,
     quantize_int8_rowwise,
@@ -102,6 +110,7 @@ from .quantization import (
     scaled_mm_nvfp4,
     stochastic_rounding_fp8,
 )
+from .residual import rms_gated_residual
 from .rope import (
     apply_rope,
     apply_rope1,
@@ -126,6 +135,7 @@ from .w4a8_int8 import (
     dequantize_w4a8_int8_weight,
     quantize_w4a8_int8_weight,
     w4a8_int8_linear,
+    w4a8_packed_linear,
 )
 
 
@@ -165,6 +175,12 @@ def _build_constraints() -> dict:
                 "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
                 "weight": ParamConstraint(dtypes=standard_floats | {type(None)}),
                 "bias": ParamConstraint(dtypes=standard_floats | {type(None)}),
+            },
+            default_devices=all_devices,
+        ),
+        "group_norm_stats3d": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
             },
             default_devices=all_devices,
         ),
@@ -469,6 +485,16 @@ def _build_constraints() -> dict:
         },
         default_devices=all_devices,
     )
+    out["rms_gated_residual"] = FunctionConstraints(
+        params={
+            "activation": ParamConstraint(dtypes=standard_floats),
+            "norm_weight": ParamConstraint(dtypes=standard_floats),
+            "residual": ParamConstraint(dtypes=standard_floats),
+            "gate": ParamConstraint(dtypes=standard_floats),
+            "eps": ParamConstraint(dtypes=frozenset({float})),
+        },
+        default_devices=all_devices,
+    )
     out["quantize_int8_rowwise"] = FunctionConstraints(
         params={
             "x": ParamConstraint(dtypes=standard_floats),
@@ -563,6 +589,37 @@ def _build_constraints() -> dict:
         },
         default_devices=all_devices,
     )
+    float_param = ParamConstraint(dtypes=standard_floats)
+    int8_param = ParamConstraint(dtypes=frozenset({torch.int8}))
+    int_param = ParamConstraint(dtypes=frozenset({int}))
+    float_value = ParamConstraint(dtypes=frozenset({float}))
+    bool_param = ParamConstraint(dtypes=frozenset({bool}))
+    fusion_options = {
+        "out_dtype": float_param,
+        "convrot": bool_param,
+        "convrot_groupsize": int_param,
+    }
+
+    def fusion_constraints(params):
+        return FunctionConstraints(
+            params=params | fusion_options, default_devices=all_devices
+        )
+
+    single = {
+        "x": float_param,
+        "weight": int8_param,
+        "weight_scale": float_param,
+        "bias": float_param,
+    }
+    modulation = {
+        "modulation_scale": float_param,
+    }
+    out.update({
+        "int8_linear_modulated": fusion_constraints(single | modulation),
+        "int8_linear_rms_modulated": fusion_constraints(single | modulation | {
+            "norm_weight": float_param, "norm_eps": float_value,
+        }),
+    })
 
     if hasattr(torch, "float8_e8m0fnu"):
         out["quantize_mxfp8"] = FunctionConstraints(
@@ -639,6 +696,7 @@ def _build_constraints() -> dict:
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in out:
             out[name + "_out"] = with_out_param(out[name])
+    out["w4a8_packed_linear"] = with_w4a8_packed_storage(out["w4a8_int8_linear"])
     return out
 
 
