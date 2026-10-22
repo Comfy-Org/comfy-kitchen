@@ -165,12 +165,22 @@ def test_missing_scale_is_left_to_eager():
 def test_shader_compile_failure_falls_back_to_eager(monkeypatch):
     from comfy_kitchen.backends.mps import kernels
 
+    attempts = 0
+    compile_shader = torch.mps.compile_shader
+
+    def counting_compile(src):
+        nonlocal attempts
+        attempts += 1
+        return compile_shader(src)
+
     monkeypatch.setattr(kernels, "_lib", None)
     monkeypatch.setattr(kernels, "_compile_error", None)
     monkeypatch.setattr(kernels, "_SRC", "this is not Metal")
+    monkeypatch.setattr(torch.mps, "compile_shader", counting_compile)
     x = torch.randn(1, 8, 2, 64, device=DEV, dtype=torch.bfloat16)
     fr = freqs_for((1, 8, 1), 32)
     for _ in range(2):  # the failure is cached, not retried and raised
         assert registry.get_capable_backend("apply_rope1", {"x": x, "freqs_cis": fr}) == "eager"
         assert torch.equal(ck.apply_rope1(x, fr), eager.apply_rope1(x, fr))
+    assert attempts == 1
     assert "compilation failed" in kernels._compile_error
