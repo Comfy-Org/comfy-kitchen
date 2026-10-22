@@ -293,5 +293,5 @@ def test_ray_watertight_at_vertices_and_edges():
     bvh = ck.mesh_bvh(tris)
     for origin in (torch.zeros(3, device="cuda"), torch.rand(3, device="cuda", generator=gen) * 0.6 - 0.3):
         origins = origin.expand(targets.shape[0], 3).contiguous()
-        t, face = ck.closest_hit_on_mesh(bvh, origins, targets - origins)
+        _, face = ck.closest_hit_on_mesh(bvh, origins, targets - origins)
         assert int((face < 0).sum()) == 0
