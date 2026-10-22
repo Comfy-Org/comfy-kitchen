@@ -147,3 +147,30 @@ def test_unsupported_calls_fall_back_to_eager():
     assert registry.get_capable_backend("apply_rope1", {"x": x.cpu(), "freqs_cis": fr.cpu()}) == "eager"
     xt = x.transpose(-1, -2).contiguous().transpose(-1, -2)
     assert torch.equal(ck.apply_rope1(xt, fr), eager.apply_rope1(xt, fr))
+
+
+def test_missing_scale_is_left_to_eager():
+    # eager reads scale=None as an RMSNorm without weight; the kernel would skip the norm
+    x = torch.randn(1, 8, 2, 64, device=DEV, dtype=torch.bfloat16)
+    fr = freqs_for((1, 8, 1), 32)
+    w = torch.ones(64, device=DEV, dtype=torch.bfloat16)
+    kwargs = {"x": x, "freqs_cis": fr, "scale": None, "epsilon": 1e-6}
+    assert registry.get_capable_backend("rms_rope1", kwargs) == "eager"
+    pair = {"q": x, "k": x, "freqs_cis": fr, "q_scale": None, "k_scale": w, "epsilon": 1e-6}
+    assert registry.get_capable_backend("rms_rope", pair) == "eager"
+    pair = {"q": x, "k": x, "freqs_cis": fr, "q_scale": w, "k_scale": None, "epsilon": 1e-6}
+    assert registry.get_capable_backend("rms_rope", pair) == "mps"
+
+
+def test_shader_compile_failure_falls_back_to_eager(monkeypatch):
+    from comfy_kitchen.backends.mps import kernels
+
+    monkeypatch.setattr(kernels, "_lib", None)
+    monkeypatch.setattr(kernels, "_compile_error", None)
+    monkeypatch.setattr(kernels, "_SRC", "this is not Metal")
+    x = torch.randn(1, 8, 2, 64, device=DEV, dtype=torch.bfloat16)
+    fr = freqs_for((1, 8, 1), 32)
+    for _ in range(2):  # the failure is cached, not retried and raised
+        assert registry.get_capable_backend("apply_rope1", {"x": x, "freqs_cis": fr}) == "eager"
+        assert torch.equal(ck.apply_rope1(x, fr), eager.apply_rope1(x, fr))
+    assert "compilation failed" in kernels._compile_error

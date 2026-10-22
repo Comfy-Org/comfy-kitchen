@@ -122,9 +122,12 @@ def _rule(*tensors, scales=(), rot=False):
         for i, name in enumerate(tensors):
             scale = None
             if scales:
+                # only the second scale (k_scale) may be None, meaning "same as the first"
                 scale = kwargs.get(scales[i])
-                if scale is None:
+                if scale is None and i > 0:
                     scale = kwargs.get(scales[0])
+                if scale is None:
+                    return ValidationResult.fail(scales[i], "scale is required")
             result = _check(name, kwargs.get(name), kwargs.get("freqs_cis"), scale, rot_dim)
             if not result.success:
                 return result

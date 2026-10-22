@@ -69,7 +69,8 @@ def _build_constraints() -> dict:
 
     def rope(names, rule, scales=()):
         params = {name: ParamConstraint(dtypes=floats) for name in names}
-        params.update({name: ParamConstraint(dtypes=floats | {type(None)}) for name in scales})
+        params.update({name: ParamConstraint(dtypes=floats) for name in scales[:1]})
+        params.update({name: ParamConstraint(dtypes=floats | {type(None)}) for name in scales[1:]})
         return FunctionConstraints(params={**params, **freqs}, default_devices=mps, call_rules=(rule,))
 
     norm = FunctionConstraints(

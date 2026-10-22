@@ -144,6 +144,7 @@ _MAX_LEAD = 4
 _MAX_ROPE_DIM = 1024
 _ROWS_PER_GROUP = 8
 _lib = None
+_compile_error = None
 _tables: dict = {}
 
 
@@ -152,6 +153,17 @@ def _kernels():
     if _lib is None:
         _lib = torch.mps.compile_shader(_SRC)
     return _lib
+
+
+def _kernels_unavailable():
+    """Why the Metal library cannot be built here, or None. A failure is cached."""
+    global _compile_error
+    if _lib is None and _compile_error is None:
+        try:
+            _kernels()
+        except Exception as exc:
+            _compile_error = f"Metal shader compilation failed: {exc}"
+    return _compile_error
 
 
 def _table(values, dtype, device):
@@ -207,6 +219,8 @@ def rope_unsupported(x, freqs, weight=None, rot_dim=0):
         return "x and freqs_cis must be tensors"
     if x.device.type != "mps" or freqs.device != x.device:
         return "tensors must be on the same MPS device"
+    if (reason := _kernels_unavailable()) is not None:
+        return reason
     if x.dtype not in _NAMES:
         return f"unsupported dtype {x.dtype}"
     if x.dim() < 2 or x.numel() == 0 or x.stride(-1) != 1:
@@ -266,6 +280,8 @@ def adaln_unsupported(x, scale, shift):
         return "x, scale and shift must be tensors"
     if any(t.device.type != "mps" or t.device != x.device for t in tensors):
         return "tensors must be on the same MPS device"
+    if (reason := _kernels_unavailable()) is not None:
+        return reason
     if x.dtype not in _NAMES or not (x.dtype == scale.dtype == shift.dtype):
         return "x, scale and shift must share one float dtype"
     if x.dim() < 1 or x.numel() == 0 or x.stride(-1) != 1:
