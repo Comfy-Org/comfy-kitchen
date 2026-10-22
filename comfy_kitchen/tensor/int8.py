@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 import torch
 
+import comfy_kitchen as ck
+from comfy_kitchen.exceptions import NoCapableBackendError
 from comfy_kitchen.registry import registry
 
 from .base import (
@@ -34,13 +36,25 @@ _INT8_DEQUANT_DTYPE_TO_CODE = {
 
 
 def _dtype_code(dtype: torch.dtype) -> int:
-    if dtype == torch.float32:
-        return 0
-    if dtype == torch.float16:
-        return 1
-    if dtype == torch.bfloat16:
-        return 2
-    raise ValueError(f"Unsupported INT8 output dtype: {dtype}")
+    try:
+        return _INT8_DEQUANT_DTYPE_TO_CODE[dtype]
+    except KeyError:
+        raise ValueError(f"Unsupported INT8 output dtype: {dtype}") from None
+
+
+def _has_native_fusion(func_name: str, kwargs: dict) -> bool:
+    """Whether ``func_name`` would dispatch to a native kernel for ``kwargs``.
+
+    The eager fused ops only re-compose the unfused ops, so without a native
+    kernel the caller's unfused path is at least as fast. An explicit backend
+    override (e.g. ``use_backend("eager")`` in tests) is honored.
+    """
+    if getattr(registry._thread_local, "backend_override", None) is not None:
+        return True
+    try:
+        return registry.get_capable_backend(func_name, kwargs) != "eager"
+    except NoCapableBackendError:
+        return False
 
 
 class TensorWiseINT8Layout(QuantizedLayout):
@@ -75,12 +89,8 @@ class TensorWiseINT8Layout(QuantizedLayout):
         convrot: bool = False
         convrot_groupsize: int = 256
         transposed: bool = False
-
         def _tensor_fields(self) -> list[str]:
             return ["scale"]
-
-        def _validate_tensor_fields(self):
-            pass
 
     @classmethod
     def quantize(
@@ -201,6 +211,69 @@ class TensorWiseINT8Layout(QuantizedLayout):
             Tuple of (quantized_data, scale).
         """
         return qtensor._qdata, qtensor._params.scale
+
+    @classmethod
+    def _fusion_operand(cls, weight: QuantizedTensor):
+        """Resolve row-major storage needed by compound INT8 operations."""
+        if not isinstance(weight, QuantizedTensor) or weight._layout_cls != cls.__name__:
+            return None
+        params = weight._params
+        if getattr(params, "transposed", False):
+            return None
+        return (
+            weight._qdata.contiguous(),
+            params.scale,
+            bool(getattr(params, "convrot", False)),
+            int(getattr(params, "convrot_groupsize", 256)),
+        )
+
+    @classmethod
+    def fused_rms_modulated(
+        cls,
+        x: torch.Tensor,
+        weight: QuantizedTensor,
+        bias: torch.Tensor | None,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+        modulation_scale: torch.Tensor,
+    ):
+        # The fused kernels apply one modulation row to every token; a batched
+        # (e.g. CFG, B > 1) modulation falls back to the unfused composition.
+        width = x.shape[-1]
+        if modulation_scale.numel() != width or norm_weight.numel() != width:
+            return NotImplemented
+        operand = cls._fusion_operand(weight)
+        if operand is None:
+            return NotImplemented
+        qdata, scale, convrot, group_size = operand
+        if not _has_native_fusion("int8_linear_rms_modulated", {
+            "x": x, "norm_weight": norm_weight,
+            "modulation_scale": modulation_scale, "weight": qdata,
+            "out_dtype": x.dtype,
+        }):
+            return NotImplemented
+        from comfy_kitchen import int8_linear_rms_modulated
+
+        return int8_linear_rms_modulated(
+            x, norm_weight, norm_eps, modulation_scale, qdata, scale,
+            bias, x.dtype, convrot=convrot,
+            convrot_groupsize=group_size,
+        )
+
+    @classmethod
+    def linear_input_act(cls, weight: QuantizedTensor, x: torch.Tensor, bias=None,
+                         input_act=None, input_act_weight=None, input_act_eps=0.0,
+                         residual=None, residual_scale=None):
+        params = weight._params
+        if params.transposed:
+            return NotImplemented
+        qdata, scale = cls.get_plain_tensors(weight)
+        return ck.int8_linear(
+            x, qdata, scale, bias, x.dtype,
+            convrot=params.convrot, convrot_groupsize=params.convrot_groupsize,
+            input_act=input_act, input_act_weight=input_act_weight, input_act_eps=input_act_eps,
+            residual=residual, residual_scale=residual_scale,
+        )
 
     @classmethod
     def state_dict_tensors(cls, qdata: torch.Tensor, params: Params) -> dict[str, torch.Tensor]:

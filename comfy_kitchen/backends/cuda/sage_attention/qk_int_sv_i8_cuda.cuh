@@ -109,6 +109,8 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
                     std::is_same<DTypeOut, nv_bfloat16>::value,
                 "DTypeOut must be half or nv_bfloat16");
   static_assert(CTA_K % 64 == 0);
+  static_assert(head_dim <= 256 && CTA_K <= 128,
+                "math::i2f_exact needs |Q.K| and |P.V| <= 2^22");
   static_assert(CTA_Q / CTA_K <= 2); // for efficient causal implementation
 
   constexpr uint32_t num_warps_q = CTA_Q / WARP_Q;
@@ -485,7 +487,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
           for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
             for (uint32_t k = 0; k < 8; k++)
-              scores[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
+              scores[fq][fk][k] = math::i2f_exact(RS[fq][fk][k]);
           }
         }
         apply_prepared_key_mask<num_tiles_q, num_tiles_k>(K_idx_lane_base, scores,
@@ -509,7 +511,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
             for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
               for (uint32_t k = 0; k < 8; k++)
-                scores[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
+                scores[fq][fk][k] = math::i2f_exact(RS[fq][fk][k]);
             }
           }
           apply_prepared_key_mask<num_tiles_q, num_tiles_k>(
@@ -628,7 +630,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
               for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
                 for (uint32_t k = 0; k < 8; k++)
-                  scores[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
+                  scores[fq][fk][k] = math::i2f_exact(RS[fq][fk][k]);
               }
             }
             apply_prepared_key_mask<num_tiles_q, num_tiles_k>(
@@ -649,7 +651,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
             for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
               for (uint32_t k = 0; k < 8; k++) {
-                const float score = __int2float_rz(RS[fq][fk][k]);
+                const float score = math::i2f_exact(RS[fq][fk][k]);
                 RS_soft[fq][fk][k] =
                     pre_scale_scores ? score * sm_scale : score;
               }
@@ -794,7 +796,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
               for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
                 for (uint32_t k = 0; k < 8; k++)
-                  scores[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
+                  scores[fq][fk][k] = math::i2f_exact(RS[fq][fk][k]);
               }
             }
             apply_prepared_key_mask<num_tiles_q, num_tiles_k>(
@@ -815,7 +817,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
             for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
               for (uint32_t k = 0; k < 8; k++) {
-                const float score = __int2float_rz(RS[fq][fk][k]);
+                const float score = math::i2f_exact(RS[fq][fk][k]);
                 RS_soft[fq][fk][k] =
                     pre_scale_scores ? score * sm_scale : score;
               }
@@ -947,7 +949,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
             for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
               for (uint32_t k = 0; k < 8; k++)
-                scores[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
+                scores[fq][fk][k] = math::i2f_exact(RS[fq][fk][k]);
             }
           }
           apply_prepared_key_mask<num_tiles_q, num_tiles_k>(
@@ -963,7 +965,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
             for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
 #pragma unroll
               for (uint32_t k = 0; k < 8; k++) {
-                const float score = __int2float_rz(RS[fq][fk][k]);
+                const float score = math::i2f_exact(RS[fq][fk][k]);
                 RS_soft[fq][fk][k] =
                     pre_scale_scores ? score * sm_scale : score;
               }

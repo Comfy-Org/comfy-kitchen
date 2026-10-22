@@ -19,7 +19,9 @@
 #pragma once
 
 #include <atomic>
+#include <type_traits>
 
+#include "device_arch.h"
 #include "mma.h"
 
 namespace comfy::hip_backend {
@@ -35,7 +37,7 @@ constexpr int kLdsPad = 8;
 // kbytes is the source row length in bytes (K for 8-bit types, K/2 for int4) and
 // is a multiple of 16, so a 16-byte chunk starting inside a row also ends inside
 // it. Out-of-range rows and the K tail are zero-filled.
-template <int ROWS, int BKB, int THREADS>
+template <int ROWS, int BKB, int THREADS, bool COALESCED_STAGING = false>
 struct TileStager {
     static constexpr int kChunksPerRow = BKB / 16;
     static constexpr int kChunks = ROWS * kChunksPerRow;
@@ -53,7 +55,11 @@ struct TileStager {
         const int tid = threadIdx.x;
         #pragma unroll
         for (int i = 0; i < kPerThread; ++i) {
-            const int c = tid * kPerThread + i;
+            // A thread-strided assignment makes every load instruction cover
+            // consecutive 16-byte chunks across a wave. The thread-major
+            // order stays the default; COALESCED_STAGING opts in.
+            const int c = COALESCED_STAGING ? tid + i * THREADS
+                                             : tid * kPerThread + i;
             const int grow = row0 + c / kChunksPerRow;
             const int gk = kbyte0 + (c % kChunksPerRow) * 16;
 
@@ -61,6 +67,22 @@ struct TileStager {
                           ? *reinterpret_cast<const uint4*>(
                                 src + static_cast<int64_t>(grow) * kbytes + gk)
                           : make_uint4(0, 0, 0, 0);
+        }
+    }
+
+    // Load one physically contiguous [ROWS, BKB] activation tile. The caller
+    // supplies A as [M_tile, K_tile, ROWS, BKB], so the wave-coalesced chunk
+    // assignment becomes a dense global-memory span instead of touching four
+    // K-strided rows per wave instruction.
+    __forceinline__ __device__ void load_contiguous(
+        const uint8_t* __restrict__ tile) {
+        const int tid = threadIdx.x;
+        #pragma unroll
+        for (int i = 0; i < kPerThread; ++i) {
+            const int c = COALESCED_STAGING ? tid + i * THREADS
+                                             : tid * kPerThread + i;
+            const uint8_t* const p = tile + static_cast<int64_t>(c) * 16;
+            regs[i] = *reinterpret_cast<const uint4*>(p);
         }
     }
 
@@ -85,7 +107,8 @@ struct TileStager {
         const int tid = threadIdx.x;
         #pragma unroll
         for (int i = 0; i < kPerThread; ++i) {
-            const int c = tid * kPerThread + i;
+            const int c = COALESCED_STAGING ? tid + i * THREADS
+                                             : tid * kPerThread + i;
             uint8_t* dst = lds + (c / kChunksPerRow) * kStride + (c % kChunksPerRow) * 16;
             // 8-byte stores: kLdsPad breaks 16-byte LDS alignment.
             *reinterpret_cast<uint2*>(dst) = make_uint2(regs[i].x, regs[i].y);
@@ -108,7 +131,8 @@ struct GemmOperandA<const uint8_t*> {
 // Epi is a functor: float operator()(int row, int col, float acc) const.
 template <typename Mma, typename Epi, typename OutT,
           int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN,
-          typename ASrc = const uint8_t*>
+          typename ASrc = const uint8_t*,
+          bool COALESCED_STAGING = false, bool TILED_A = false>
 __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
     typename GemmOperandA<ASrc>::type A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
     int M, int N, int kbytes, int ldc, Epi epi) {
@@ -164,10 +188,15 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
 
     const int row = frag_row(lane);
 
-    TileStager<BM, BKB, kThreads> sa;
-    TileStager<BN, BKB, kThreads> sb;
+    TileStager<BM, BKB, kThreads, COALESCED_STAGING> sa;
+    TileStager<BN, BKB, kThreads, COALESCED_STAGING> sb;
 
-    sa.load(A, m0, M, 0, kbytes);
+    if constexpr (TILED_A) {
+        const int64_t tile = static_cast<int64_t>(bm) * (kbytes / BKB);
+        sa.load_contiguous(A + tile * BM * BKB);
+    } else {
+        sa.load(A, m0, M, 0, kbytes);
+    }
     sb.load(B, n0, N, 0, kbytes);
     sa.store(As);
     sb.store(Bs);
@@ -179,7 +208,13 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
 
         // Prefetch the next tile's global reads ahead of the current tile's math.
         if (has_next) {
-            sa.load(A, m0, M, knext, kbytes);
+            if constexpr (TILED_A) {
+                const int64_t tile =
+                    static_cast<int64_t>(bm) * (kbytes / BKB) + knext / BKB;
+                sa.load_contiguous(A + tile * BM * BKB);
+            } else {
+                sa.load(A, m0, M, knext, kbytes);
+            }
             sb.load(B, n0, N, knext, kbytes);
         }
 
@@ -275,6 +310,27 @@ inline int device_wgp_count() {
     return n;
 }
 
+// Workgroups of Kernel at kThreads resident on one WGP, limited by its VGPR and
+// LDS use. Cached per ordinal like device_wgp_count; the fallback of two keeps
+// the default schedules.
+template <auto Kernel, int kThreads>
+inline int resident_blocks() {
+    constexpr int kMaxDevices = 16;
+    static std::atomic<int> cache[kMaxDevices] = {};
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDevices) return 2;
+    int n = cache[dev].load(std::memory_order_relaxed);
+    if (n == 0) {
+        if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
+                &n, reinterpret_cast<const void*>(Kernel), kThreads, 0) != hipSuccess ||
+            n <= 0) {
+            n = 2;
+        }
+        cache[dev].store(n, std::memory_order_relaxed);
+    }
+    return n;
+}
+
 // Pick and launch a tile for C[M, N] = A[M, K] @ B[N, K]^T, selecting on grid
 // coverage, K depth and warp grid. 128x128 has the best arithmetic intensity but
 // wastes the device when it yields fewer blocks than there are WGPs; BKB=128
@@ -298,8 +354,13 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
             constexpr int BM = 128, BN = 128, BKB = 128;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
             // With few blocks per WGP there is nothing to interleave across, so
-            // the 16-wave grid hides latency within a block instead.
-            if (blocks_128 <= 4 * wgps) {
+            // the 16-wave grid hides latency within a block instead. The same
+            // holds when the 8-wave kernel fits only once per WGP (gfx1170).
+            constexpr auto kEightWave =
+                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>;
+            if (blocks_128 <= 4 * wgps ||
+                (use_nonduplicated_wmma_schedule() &&
+                 resident_blocks<kEightWave, 256>() < 2)) {
                 gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
                     <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
             } else {

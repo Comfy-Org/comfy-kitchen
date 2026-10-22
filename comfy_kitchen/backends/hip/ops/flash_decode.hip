@@ -42,7 +42,8 @@ constexpr int kBlockThreads = kWavesPerBlock * kWave;
 // Wider heads and group tiles leave fewer registers for prefetched K/V.
 template <int HeadDim, int GroupsPerPass>
 constexpr int keys_per_iter() {
-    return (GroupsPerPass >= 8 ? 4 : (GroupsPerPass >= 4 ? 8 : 16)) * 128 / HeadDim;
+    return (GroupsPerPass >= 8 ? 4 : (GroupsPerPass >= 4 ? 8 : 16)) * 128 /
+           (HeadDim < 128 ? 128 : HeadDim);
 }
 
 constexpr float kLn2 = 0.693147180559945309417f;
@@ -50,18 +51,20 @@ constexpr float kLn2 = 0.693147180559945309417f;
 // Finite, not -inf: under -ffast-math the first m - m would be NaN.
 constexpr float kNegInf = -FLT_MAX / 4.0f;
 
-typedef __bf16 v4bf __attribute__((ext_vector_type(4)));
+template <int Width>
+using BFloatVec = __bf16 __attribute__((ext_vector_type(Width)));
 template <int Width>
 using FloatVec = float __attribute__((ext_vector_type(Width)));
 
 template <int Width>
 __forceinline__ __device__ FloatVec<Width> load_bf16(const __bf16* p) {
+    constexpr int kLoadWidth = Width < 4 ? Width : 4;
     FloatVec<Width> result;
 #pragma unroll
-    for (int i = 0; i < Width; i += 4) {
-        const v4bf raw = *reinterpret_cast<const v4bf*>(p + i);
+    for (int i = 0; i < Width; i += kLoadWidth) {
+        const auto raw = *reinterpret_cast<const BFloatVec<kLoadWidth>*>(p + i);
 #pragma unroll
-        for (int d = 0; d < 4; ++d) result[i + d] = static_cast<float>(raw[d]);
+        for (int d = 0; d < kLoadWidth; ++d) result[i + d] = static_cast<float>(raw[d]);
     }
     return result;
 }
@@ -101,19 +104,21 @@ __forceinline__ __device__ void split_range(int length, int split, int num_split
 
 // GroupsPerPass query rows share every K and V read. Templated because the
 // per-group state has to stay in registers; a runtime bound spills it.
-template <int HeadDim, int GroupsPerPass, bool Split>
+// Plain decode must not pay for a per-row causal predicate in the key loop.
+template <int HeadDim, int GroupsPerPass, bool Split, bool Causal>
 __global__ __launch_bounds__(kBlockThreads) void flash_decode_kernel(
     const __bf16* __restrict__ q, const __bf16* __restrict__ k, const __bf16* __restrict__ v,
     const int* __restrict__ kv_lengths, __bf16* __restrict__ out,
     float* __restrict__ softmax_lse, float* __restrict__ out_accum,
     float* __restrict__ lse_accum, int rows, int query_length, int steps, int heads,
-    int kv_capacity, int num_splits, bool causal,
+    int kv_capacity, int num_splits,
     int64_t q_batch_stride, int64_t q_group_stride, int64_t q_step_stride, int64_t q_head_stride,
     int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
     int64_t o_batch_stride, int64_t o_group_stride, int64_t o_step_stride, int64_t o_head_stride) {
     constexpr int kDimPerLane = HeadDim / kWave;
     constexpr int kKeysPerIter = keys_per_iter<HeadDim, GroupsPerPass>();
-    constexpr float kSoftmaxScaleLog2 = HeadDim == 128 ? 0.12751743082871335f : 0.09016844005556021f;
+    constexpr float kSoftmaxScaleLog2 = HeadDim == 64 ? 0.18033688011112042f :
+                                      (HeadDim == 128 ? 0.12751743082871335f : 0.09016844005556021f);
     using Vec = FloatVec<kDimPerLane>;
     const int lane = static_cast<int>(threadIdx.x) % kWave;
     const int wave = static_cast<int>(threadIdx.x) / kWave;
@@ -150,7 +155,7 @@ __global__ __launch_bounds__(kBlockThreads) void flash_decode_kernel(
         o_acc[i] = Vec{};
         m_run[i] = kNegInf;
         d_run[i] = 0.0f;
-        limit[i] = causal ? length - steps + s + 1 : length;
+        limit[i] = Causal ? length - steps + s + 1 : length;
     }
 
     const int64_t kv_base = static_cast<int64_t>(b) * k_batch_stride +
@@ -177,7 +182,7 @@ __global__ __launch_bounds__(kBlockThreads) void flash_decode_kernel(
             const int j = j0 + c;
 #pragma unroll
             for (int i = 0; i < GroupsPerPass; ++i) {
-                const bool valid = j < end && j < limit[i];
+                const bool valid = j < end && (!Causal || j < limit[i]);
                 float dot = 0.0f;
 #pragma unroll
                 for (int d = 0; d < kDimPerLane; ++d) dot += q_vec[i][d] * k_vec[c][d];
@@ -327,24 +332,23 @@ struct DecodeArgs {
     int heads;
     int kv_capacity;
     int num_splits;
-    bool causal;
     int64_t q_batch_stride, q_group_stride, q_step_stride, q_head_stride;
     int64_t k_batch_stride, k_row_stride, k_head_stride;
     int64_t o_batch_stride, o_group_stride, o_step_stride, o_head_stride;
     hipStream_t stream;
 };
 
-template <int HeadDim, int GroupsPerPass>
+template <int HeadDim, int GroupsPerPass, bool Causal>
 void launch_typed(const DecodeArgs& a) {
     const dim3 grid(a.query_length / GroupsPerPass, a.num_splits, a.batch * a.heads);
     const int rows = a.batch * a.heads * a.query_length;
     const bool split = a.num_splits > 1;
     if (split) {
-        flash_decode_kernel<HeadDim, GroupsPerPass, true><<<grid, kBlockThreads, 0, a.stream>>>(
+        flash_decode_kernel<HeadDim, GroupsPerPass, true, Causal><<<grid, kBlockThreads, 0, a.stream>>>(
             static_cast<const __bf16*>(a.q), static_cast<const __bf16*>(a.k),
             static_cast<const __bf16*>(a.v), a.kv_lengths, static_cast<__bf16*>(a.out),
             a.softmax_lse, a.out_accum, a.lse_accum, rows, a.query_length, a.steps, a.heads,
-            a.kv_capacity, a.num_splits, a.causal, a.q_batch_stride, a.q_group_stride,
+            a.kv_capacity, a.num_splits, a.q_batch_stride, a.q_group_stride,
             a.q_step_stride, a.q_head_stride, a.k_batch_stride, a.k_row_stride, a.k_head_stride,
             a.o_batch_stride, a.o_group_stride, a.o_step_stride, a.o_head_stride);
         flash_decode_combine_kernel<HeadDim><<<rows, HeadDim, 0, a.stream>>>(
@@ -352,31 +356,38 @@ void launch_typed(const DecodeArgs& a) {
             rows, a.query_length, a.steps, a.heads, a.o_batch_stride, a.o_group_stride,
             a.o_step_stride, a.o_head_stride);
     } else {
-        flash_decode_kernel<HeadDim, GroupsPerPass, false><<<grid, kBlockThreads, 0, a.stream>>>(
+        flash_decode_kernel<HeadDim, GroupsPerPass, false, Causal><<<grid, kBlockThreads, 0, a.stream>>>(
             static_cast<const __bf16*>(a.q), static_cast<const __bf16*>(a.k),
             static_cast<const __bf16*>(a.v), a.kv_lengths, static_cast<__bf16*>(a.out),
             a.softmax_lse, a.out_accum, a.lse_accum, rows, a.query_length, a.steps, a.heads,
-            a.kv_capacity, a.num_splits, a.causal, a.q_batch_stride, a.q_group_stride,
+            a.kv_capacity, a.num_splits, a.q_batch_stride, a.q_group_stride,
             a.q_step_stride, a.q_head_stride, a.k_batch_stride, a.k_row_stride, a.k_head_stride,
             a.o_batch_stride, a.o_group_stride, a.o_step_stride, a.o_head_stride);
     }
 }
 
-template <int HeadDim>
+template <int HeadDim, bool Causal>
 void launch_groups(const DecodeArgs& a) {
+    if constexpr (HeadDim == 64) {
+        // Short caches need more independent blocks to occupy the GPU.
+        if (a.kv_capacity <= 128) {
+            launch_typed<HeadDim, 1, Causal>(a);
+            return;
+        }
+    }
     switch (groups_per_pass(a.query_length)) {
         case 8:
             // Cap the 256-dimensional tile at four groups to stay within the LDS budget.
-            launch_typed<HeadDim, HeadDim == 128 ? 8 : 4>(a);
+            launch_typed<HeadDim, HeadDim == 256 ? 4 : 8, Causal>(a);
             break;
         case 4:
-            launch_typed<HeadDim, 4>(a);
+            launch_typed<HeadDim, 4, Causal>(a);
             break;
         case 2:
-            launch_typed<HeadDim, 2>(a);
+            launch_typed<HeadDim, 2, Causal>(a);
             break;
         default:
-            launch_typed<HeadDim, 1>(a);
+            launch_typed<HeadDim, 1, Causal>(a);
             break;
     }
 }
@@ -397,22 +408,28 @@ extern "C" void launch_flash_decode(const void* q, const void* k, const void* v,
                                     int64_t o_head_stride, hipStream_t stream) {
     const comfy::hip_backend::DecodeArgs a{
         q, k, v, kv_lengths, out, softmax_lse, out_accum, lse_accum, batch, query_length, steps,
-        heads, kv_capacity, num_splits, causal, q_batch_stride, q_group_stride, q_step_stride,
+        heads, kv_capacity, num_splits, q_batch_stride, q_group_stride, q_step_stride,
         q_head_stride, k_batch_stride, k_row_stride, k_head_stride, o_batch_stride,
         o_group_stride, o_step_stride, o_head_stride, stream};
-    if (head_dim == 128) {
-        comfy::hip_backend::launch_groups<128>(a);
+    if (head_dim == 64) {
+        if (causal) comfy::hip_backend::launch_groups<64, true>(a);
+        else comfy::hip_backend::launch_groups<64, false>(a);
+    } else if (head_dim == 128) {
+        if (causal) comfy::hip_backend::launch_groups<128, true>(a);
+        else comfy::hip_backend::launch_groups<128, false>(a);
     } else {
-        comfy::hip_backend::launch_groups<256>(a);
+        if (causal) comfy::hip_backend::launch_groups<256, true>(a);
+        else comfy::hip_backend::launch_groups<256, false>(a);
     }
 }
 
-// Current-step rows: the prefix decode pass returned its output and natural-log LSE; row j's own token and
-// the earlier rows of this step are the slots that prefix skips. Fold them in as
+// Tree-verify rows: the GQA pass above attended only the committed prefix
+// (causal = false) and returned its natural-log log-sum-exp; a row's own token and
+// its ancestors inside this step are the slots that prefix skips. Fold them in as
 // further softmax columns, the same arithmetic as the CUDA kernel:
 //   s_t = scale * q . k_t;  m = max(lse, max_t s_t)
 //   o = (out * e^(lse - m) + sum_t v_t * e^(s_t - m)) / (e^(lse - m) + sum_t e^(s_t - m))
-// over the step rows t <= j.
+// mask[j] holds the rows to fold into row j (bit t = row t, always including j).
 // One wave per (batch, row, head), eight dims per lane, fp32 math, bf16 out.
 namespace comfy::hip_backend {
 namespace {
@@ -422,10 +439,10 @@ constexpr int kMergeWaves = 8;
 constexpr int kMergeMaxRows = 8;
 constexpr int kMergeDims = kMergeHeadDim / kWave;
 
-__global__ __launch_bounds__(kMergeWaves * kWave) void flash_decode_step_merge_kernel(
+__global__ __launch_bounds__(kMergeWaves * kWave) void flash_decode_tree_merge_kernel(
     const __bf16* __restrict__ out, const float* __restrict__ lse, const __bf16* __restrict__ q,
-    const __bf16* __restrict__ k, const __bf16* __restrict__ v, __bf16* __restrict__ merged,
-    int total, int rows, int heads, int groups, float scale,
+    const __bf16* __restrict__ k, const __bf16* __restrict__ v, const int* __restrict__ mask,
+    __bf16* __restrict__ merged, int total, int rows, int heads, int groups, float scale,
     int64_t q_bs, int64_t q_hs, int64_t q_rs, int64_t k_bs, int64_t k_hs, int64_t k_rs,
     int64_t v_bs, int64_t v_hs, int64_t v_rs, int64_t o_bs, int64_t o_rs, int64_t m_bs,
     int64_t m_rs) {
@@ -437,6 +454,7 @@ __global__ __launch_bounds__(kMergeWaves * kWave) void flash_decode_step_merge_k
     const int b = idx / (heads * rows);
     const int kh = h / groups;
     const int d0 = lane * kMergeDims;
+    const int bits = mask[j];
 
     const FloatVec<kMergeDims> qv = load_bf16<kMergeDims>(q + b * q_bs + h * q_hs + j * q_rs + d0);
     float s[kMergeMaxRows];
@@ -445,7 +463,7 @@ __global__ __launch_bounds__(kMergeWaves * kWave) void flash_decode_step_merge_k
 #pragma unroll
     for (int t = 0; t < kMergeMaxRows; ++t) {
         s[t] = -INFINITY;
-        if (t <= j) {
+        if (t < rows && (bits & (1 << t))) {
             const FloatVec<kMergeDims> kv = load_bf16<kMergeDims>(k + b * k_bs + kh * k_hs + t * k_rs + d0);
             float dot = 0.0f;
 #pragma unroll
@@ -462,7 +480,7 @@ __global__ __launch_bounds__(kMergeWaves * kWave) void flash_decode_step_merge_k
     for (int d = 0; d < kMergeDims; ++d) acc[d] *= w_flash;
 #pragma unroll
     for (int t = 0; t < kMergeMaxRows; ++t) {
-        if (t <= j) {
+        if (t < rows && (bits & (1 << t))) {
             const float w = expf(s[t] - m);
             denom += w;
             const FloatVec<kMergeDims> vv = load_bf16<kMergeDims>(v + b * v_bs + kh * v_hs + t * v_rs + d0);
@@ -479,8 +497,8 @@ __global__ __launch_bounds__(kMergeWaves * kWave) void flash_decode_step_merge_k
 }  // namespace
 }  // namespace comfy::hip_backend
 
-extern "C" void launch_flash_decode_step_merge(
-    const void* out, const float* lse, const void* q, const void* k, const void* v,
+extern "C" void launch_flash_decode_tree_merge(
+    const void* out, const float* lse, const void* q, const void* k, const void* v, const int* mask,
     void* merged, int batch, int rows, int heads, int kv_heads, int64_t q_batch_stride,
     int64_t q_head_stride, int64_t q_row_stride, int64_t k_batch_stride, int64_t k_head_stride,
     int64_t k_row_stride, int64_t v_batch_stride, int64_t v_head_stride, int64_t v_row_stride,
@@ -488,10 +506,10 @@ extern "C" void launch_flash_decode_step_merge(
     hipStream_t stream) {
     using namespace comfy::hip_backend;
     const int waves = batch * rows * heads;
-    flash_decode_step_merge_kernel<<<(waves + kMergeWaves - 1) / kMergeWaves, kMergeWaves * kWave, 0,
+    flash_decode_tree_merge_kernel<<<(waves + kMergeWaves - 1) / kMergeWaves, kMergeWaves * kWave, 0,
                                      stream>>>(
         static_cast<const __bf16*>(out), lse, static_cast<const __bf16*>(q),
-        static_cast<const __bf16*>(k), static_cast<const __bf16*>(v),
+        static_cast<const __bf16*>(k), static_cast<const __bf16*>(v), mask,
         static_cast<__bf16*>(merged), waves, rows, heads, heads / kv_heads,
         1.0f / sqrtf(static_cast<float>(kMergeHeadDim)), q_batch_stride, q_head_stride,
         q_row_stride, k_batch_stride, k_head_stride, k_row_stride, v_batch_stride, v_head_stride,
