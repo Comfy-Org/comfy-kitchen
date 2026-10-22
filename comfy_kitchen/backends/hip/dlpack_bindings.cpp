@@ -131,6 +131,8 @@ void launch_group_norm_silu_pad3d(const void*, const void*, const void*, void*, 
                                   int, int, bool, bool, int64_t, int, hipStream_t);
 void launch_group_norm_stats3d(const void*, void*, void*, int, int, int, int, int, int, float,
                                int64_t, int, hipStream_t);
+void launch_ndhwc_to_nchw_transpose(const void*, void*, int64_t, int64_t, int, int64_t, int,
+                                   hipStream_t);
 void launch_gemv_awq_kernel(const void*, const void*, const void*, const void*, const void*, void*,
                             int, int, int, int, int, int, int, int, hipStream_t);
 void launch_svdquant_lora_down_kernel(const void*, const void*, void*, int, int, int, int, int,
@@ -1454,6 +1456,37 @@ void group_norm_stats3d(nb::ndarray<> x, nb::ndarray<> workspace, nb::ndarray<> 
     require_len(stats, 2 * static_cast<int64_t>(B) * T * num_groups, kFn, "stats");
     launch_group_norm_stats3d(x.data(), workspace.data(), stats.data(), B, C, T, H, W, num_groups,
                               eps, row_stride, code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// Transpose a channels_last_3d [B, C, T, H, W] into an NCDHW-contiguous one.
+// The destination's inner dimension is the source's outer one, so a plain copy
+// writes one element at a time into a sector it cannot share.
+void ndhwc_to_nchw(nb::ndarray<> src, nb::ndarray<> dst, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "ndhwc_to_nchw";
+    if (src.ndim() != 5 || dst.ndim() != 5) {
+        throw std::runtime_error(std::string(kFn) + ": both operands must be 5-D");
+    }
+    for (int i = 0; i < 5; ++i) {
+        if (src.shape(i) != dst.shape(i)) {
+            throw std::runtime_error(std::string(kFn) + ": the operands must have the same shape");
+        }
+    }
+    const int code = map_dtype_to_code(src.dtype());
+    if (code != 1 && code != 2) {
+        throw std::runtime_error(std::string(kFn) + ": only float16 and bfloat16 are supported");
+    }
+    require_dtype(dst, code, code, kFn, "dst");
+    const int64_t b = src.shape(0);
+    const int64_t c = src.shape(1);
+    const int64_t t = src.shape(2);
+    const int64_t h = src.shape(3);
+    const int64_t w = src.shape(4);
+    if (c % 8 != 0) {
+        throw std::runtime_error(std::string(kFn) + ": the channel count must be a multiple of 8");
+    }
+    launch_ndhwc_to_nchw_transpose(src.data(), dst.data(), b * t, h * w, static_cast<int>(c), t,
+                                   code, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -3372,6 +3405,8 @@ m.def("int4_gemm", &int4_gemm);
     m.def("group_norm_stats3d", &group_norm_stats3d, nb::arg("x"), nb::arg("workspace"),
           nb::arg("stats"), nb::arg("B"), nb::arg("C"), nb::arg("T"), nb::arg("H"), nb::arg("W"),
           nb::arg("num_groups"), nb::arg("eps"), nb::arg("row_stride"), nb::arg("stream_ptr"));
+    m.def("ndhwc_to_nchw", &ndhwc_to_nchw, nb::arg("src"), nb::arg("dst"),
+          nb::arg("stream_ptr"));
     m.def("apply_rope", &apply_rope);
     m.def("rms_rope", &rms_rope);
     m.def("gemv_awq_w4a16", &gemv_awq_w4a16);

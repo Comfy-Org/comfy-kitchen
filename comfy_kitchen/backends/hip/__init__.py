@@ -2565,6 +2565,14 @@ def group_norm_silu_pad3d(
     dst = (out if out is not None and _writes_packed_ndhwc(out) and out.data_ptr() % 16 == 0
            and not any(t is not None and _tensors_overlap(out, t) for t in (x, weight, bias))
            else None)
+    # An NCDHW out cannot be written by the kernel (it writes channels_last), and a
+    # plain copy into it is the slow direction on this part: the destination's inner
+    # dimension is the source's outer one, so every element lands in a sector it
+    # cannot share. Measured on the 6-WGP 780M, a 268 MB copy runs at 2.3 GB/s that
+    # way round against 58.7 GB/s the other way. The kernel's own transpose does it
+    # in two coalesced passes.
+    ncdhw_out = (out is not None and dst is None and out.is_contiguous()
+                 and out.dtype in (torch.float16, torch.bfloat16) and c % 8 == 0)
     if dst is None:
         dst = torch.empty(oshape, dtype=x.dtype, device=x.device,
                           memory_format=torch.channels_last_3d)
@@ -2585,6 +2593,9 @@ def group_norm_silu_pad3d(
     )
     if out is None or dst is out:
         return dst
+    if ncdhw_out:
+        _C.ndhwc_to_nchw(_dl(dst), _dl(out), _stream(x))
+        return out
     out.copy_(dst)
     return out
 

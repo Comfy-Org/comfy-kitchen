@@ -255,6 +255,26 @@ class TestOutParameter:
         ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), True, zero_pad=True, out=buf[:, :, 2:])
         assert torch.equal(buf[:, :, 2:], ref) and bool((buf[:, :, :2] == 7.0).all())
 
+    @pytest.mark.parametrize("c,t,h,w", [(128, 3, 40, 56), (96, 2, 33, 17), (192, 1, 9, 9)])
+    def test_ncdhw_out_matches_the_channels_last_result(self, c, t, h, w, seed, cuda_available):
+        """An NCDHW out gets the same values as the channels_last one.
+
+        The kernel writes channels_last, so the NCDHW out is filled by the
+        backend's own transpose: a plain copy into an NCDHW destination is the
+        scattered-write direction and runs at 2.3 GB/s on this part. The shapes
+        cover the transpose's tails: a pixel count that is not a multiple of its
+        tile, a channel count that is not a multiple of its tile, and both.
+        """
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        x, weight, bias = _inputs(c, t, h, w, torch.float16)
+        ref = ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), silu=True, zero_pad=True)
+        out = torch.empty(ref.shape, dtype=ref.dtype, device=ref.device)
+        got = ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), silu=True,
+                                       zero_pad=True, out=out)
+        assert got.data_ptr() == out.data_ptr()
+        assert torch.equal(out, ref)
+
     def test_wrong_shape_is_rejected(self, cuda_available):
         if not cuda_available:
             pytest.skip("CUDA required")
