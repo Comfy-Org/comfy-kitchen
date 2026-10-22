@@ -46,6 +46,17 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
       QuantGranularity::kPerThread, QuantGranularity::kPerThread, float, false,
       DTypeOut, ComputeUnit::kCudaCore, mask_mode, false, true, false, false,
       fuse_fp32_probabilities, Offset>;
+  if constexpr (mask_mode == MaskMode::kNone) {
+    // Preserve the positive-scale kernel and its hot loop. Only the uncommon
+    // nonpositive case scales logits before both the max reduction and masks.
+    if (sm_scale <= 0.0f) {
+      kernel = qk_int_sv_i8_attn_kernel<
+          CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8,
+          QuantGranularity::kPerThread, QuantGranularity::kPerThread, float, false,
+          DTypeOut, ComputeUnit::kCudaCore, mask_mode, false, true, false, false,
+          fuse_fp32_probabilities, Offset, false>;
+    }
+  }
 
   cudaError_t error = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
