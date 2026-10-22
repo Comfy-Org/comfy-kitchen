@@ -14,6 +14,24 @@
 // of pixels at once, so both sides of the copy are coalesced. The read is one
 // 16-byte chunk per lane, the write is two bytes per lane, and the tile's
 // padding puts the eight channels of a pixel on eight banks.
+//
+// How much a write pattern costs on this part, measured with a store-only
+// kernel over a 256 MiB footprint (store_patterns.hip in the fork's benchmark
+// folder):
+//
+//     16 bytes per lane, contiguous     54.2 GB/s
+//      4 bytes per lane, contiguous     25.9 GB/s
+//      2 bytes per lane, contiguous     16.8 GB/s
+//      1 byte  per lane, contiguous     16.2 GB/s
+//      1 byte  per lane, 32 B stride    1.7 GB/s
+//      2 bytes per lane, 32 B stride    3.5 GB/s
+//
+// So a store that moves less than 16 bytes per lane leaves bandwidth on the
+// table even when it fills its sector, and one that strides past a sector
+// loses an order of magnitude. The kernels in this backend that write narrow
+// (the attention's V quantizer writes one byte per lane) sit at the 16 GB/s
+// end of that table; the ones that write wide (the ConvRot quantizers, the Q
+// and K quantizers at four bytes per lane) are at 26.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
