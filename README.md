@@ -17,6 +17,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `scaled_mm_mxfp8`           | ✓     |      |        |     |     |     |
 | `adaln`                     | ✓     | ✓    | ✓      | ✓   |     | ✓   |
 | `rms_adaln`                 | ✓     | ✓    | ✓      | ✓   |     | ✓   |
+| `input_act`                 | ✓     |      |        |     |     | ✓   |
 | `na3d`                      | ✓     | ✓    | ✓      | ✓   |     |     |
 | `na2d`                      | ✓     | ✓    | ✓      | ✓   |     |     |
 | `sol_attn`                  | ✓     | ✓    |        | ✓   |     |     |
@@ -67,9 +68,10 @@ corresponding operator is available.
 On Apple GPUs the eager RoPE and AdaLN paths run as chains of small ops (a norm,
 casts, broadcasts, multiply-adds), each its own kernel launch and pass over memory.
 The `mps` backend runs the rope entries above (and their in-place forms,
-including `rot_dim`) and `adaln` / `rms_adaln` as one Metal kernel per tensor,
-compiled with `torch.mps.compile_shader`: a single launch for the single-tensor
-entries and AdaLN, two for the paired `(xq, xk)` entries. Each takes float32,
+including `rot_dim`), `adaln` / `rms_adaln` and the gated `input_act` pairs
+(`swiglu`, `situ`) as one Metal kernel per tensor, compiled with
+`torch.mps.compile_shader`: a single launch for the single-tensor entries, AdaLN
+and `input_act`, two for the paired `(xq, xk)` rope entries. Each takes float32,
 float16 and bfloat16, and strided views with a contiguous last dim, so
 packed-qkv slices and `(B, H, N, D)` layouts need no copies. Calls outside that
 are declined by the call rules and run on eager: other dtypes or layouts, more
@@ -77,6 +79,11 @@ than four leading dims that cannot be merged, and for RoPE a `freqs_cis` that is
 not float32, an odd head dim or `rot_dim`, or a head dim above 1024. The
 backend is registered when MPS is available and `torch.mps.compile_shader`
 exists.
+
+`input_act` is the standalone form of the activations the quantized linears
+take as `input_act` (`gelu_tanh`, `swiglu`, `situ`, `rms_norm`), for callers
+whose linear is not quantized. It runs on eager everywhere; `mps` takes the
+gated pairs.
 
 ## Huawei Ascend backend
 

@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Metal kernels for RoPE and AdaLN on Apple GPUs.
+"""Metal kernels for RoPE, AdaLN and the gated input activations on Apple GPUs.
 
 Inputs may be strided views as long as the last dim is contiguous: the leading
 dims are addressed through a small shape/stride table (merged where every
 operand allows, at most four after merging), so packed-qkv slices, (B, H, N, D)
-layouts and broadcast operands need no copies. ``rope_unsupported`` and
-``adaln_unsupported`` are the single source of truth for what the kernels take;
-the registry's call rules use them, so anything else goes to eager.
+layouts and broadcast operands need no copies. ``rope_unsupported``,
+``adaln_unsupported`` and ``gated_unsupported`` are the single source of truth
+for what the kernels take; the registry's call rules use them, so anything
+else goes to eager.
 """
 import math
 
@@ -131,9 +132,33 @@ kernel void adaln(device const T* x [[buffer(0)]],
     }
 }
 
+// Gated pair over the two halves of each row. mode 0: swiglu, silu(first) * second.
+// mode 1: situ (MOSS-Image), 4*tanh(g/4)*sigmoid(g) * 25*tanh(h/25), h = first, g = second.
+// cfg: H, mode, rows
+template <typename T>
+kernel void gated(device const T* x [[buffer(0)]],
+                  device T* out [[buffer(1)]],
+                  constant long* meta [[buffer(2)]],
+                  constant int* cfg [[buffer(3)]],
+                  uint i [[thread_position_in_grid]]) {
+    const int H = cfg[0], mode = cfg[1], rows = cfg[2];
+    const uint row = i / uint(H), c = i % uint(H);
+    if (row >= uint(rows)) return;
+    device const T* xr = x + row_offset(meta, row, 0);
+    const float a = float(xr[c]), b = float(xr[c + H]);
+    float o;
+    if (mode == 0) {
+        o = float(T(a / (1.f + exp(-a)))) * b;
+    } else {
+        o = 4.f * precise::tanh(b * 0.25f) / (1.f + exp(-b)) * (25.f * precise::tanh(a * 0.04f));
+    }
+    out[i] = T(o);
+}
+
 #define INSTANTIATE(T, N) \
 template [[host_name("rope_" #N)]] kernel void rope<T>(device const T*, device const float*, device const float*, device T*, constant long*, constant int*, constant float&, uint, uint, uint, uint); \
-template [[host_name("adaln_" #N)]] kernel void adaln<T>(device const T*, device const T*, device const T*, device T*, constant long*, constant int*, constant float&, uint, uint, uint, uint, uint, uint);
+template [[host_name("adaln_" #N)]] kernel void adaln<T>(device const T*, device const T*, device const T*, device T*, constant long*, constant int*, constant float&, uint, uint, uint, uint, uint, uint); \
+template [[host_name("gated_" #N)]] kernel void gated<T>(device const T*, device T*, constant long*, constant int*, uint);
 INSTANTIATE(bfloat, bf16)
 INSTANTIATE(half, f16)
 INSTANTIATE(float, f32)
@@ -311,4 +336,42 @@ def adaln(x, scale, shift, eps=1e-6, rms=False):
     tg = min(256, (dim + 31) // 32 * 32)
     getattr(_kernels(), "adaln_" + _NAMES[x.dtype])(
         x, sc, sh, out, meta, cfg, float(eps), threads=rows * tg, group_size=tg)
+    return out
+
+
+GATED_MODES = {"swiglu": 0, "situ": 1}
+
+
+def gated_unsupported(x, input_act):
+    """Why the gated-activation kernel cannot take this call, or None when it can."""
+    if input_act not in GATED_MODES:
+        return f"input_act {input_act!r} runs on eager"
+    if not isinstance(x, torch.Tensor) or x.device.type != "mps":
+        return "x must be an MPS tensor"
+    if (reason := _kernels_unavailable()) is not None:
+        return reason
+    if x.dtype not in _NAMES:
+        return f"unsupported dtype {x.dtype}"
+    if x.dim() < 1 or x.numel() == 0 or x.stride(-1) != 1 or x.shape[-1] % 2:
+        return "x needs a contiguous, even last dim"
+    lead = x.shape[:-1]
+    if math.prod(lead) * (x.shape[-1] // 2) >= 2**31:
+        return "too many output elements for one launch"
+    if _lead(lead, x.stride()[:-1]) is None:
+        return "more than four non-mergeable leading dims"
+    return None
+
+
+def gated(x, input_act):
+    """swiglu (silu(first) * second) or situ over the two halves of the last dim."""
+    half = x.shape[-1] // 2
+    lead = x.shape[:-1]
+    rows = math.prod(lead)
+    out = torch.empty(*lead, half, dtype=x.dtype, device=x.device)
+    table = _lead(lead, x.stride()[:-1])
+    if table is None:
+        raise ValueError("gated: unsupported layout (check gated_unsupported first)")
+    meta = _table(table, torch.int64, x.device)
+    cfg = _table([half, GATED_MODES[input_act], rows], torch.int32, x.device)
+    getattr(_kernels(), "gated_" + _NAMES[x.dtype])(x, out, meta, cfg, threads=rows * half)
     return out
