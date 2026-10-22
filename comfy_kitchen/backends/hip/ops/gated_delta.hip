@@ -330,8 +330,9 @@ __global__ void deltanet_conv_step_kernel(
 constexpr int kDeltaSlotMax = 8;  // token slots per deferred side buffer, as in CUDA
 
 // Deferred-commit conv step: one thread per (batch, channel). The window after the
-// first pending tokens of the previous step is committed first, then the current S
-// tokens are convolved on top of it in sequence.
+// pending accepted tokens of the previous step (at their side-buffer slots) is
+// committed first, then the current S rows are convolved on top of it, each over
+// its own ancestor rows (parent[r], -1 for the committed window).
 template <typename T>
 __global__ void deltanet_conv_deferred_kernel(
     const T* __restrict__ proj,    // [B, S, C] projection output
@@ -340,7 +341,7 @@ __global__ void deltanet_conv_deferred_kernel(
     const T* __restrict__ conv_w,  // [C, KS] depthwise taps
     const T* __restrict__ conv_b,  // [C] or null
     T* __restrict__ qkv_buf,       // [2, B, C, kDeltaSlotMax] silu(conv) of the previous / current step
-    const int* __restrict__ ctl,   // {pending, parity}
+    const int* __restrict__ ctl,   // {pending, parity, slot[8], parent[8], prog[8]}
     int B, int C, int S, int KS) {
 
     const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -350,6 +351,8 @@ __global__ void deltanet_conv_deferred_kernel(
     const int b = idx / C;
     const int c = idx - b * C;
     const int pending = ctl[0], par = ctl[1];
+    const int* __restrict__ slot = ctl + 2;
+    const int* __restrict__ parent = ctl + 2 + kDeltaSlotMax;
     const int L = KS - 1;
     const int64_t proj_slab = static_cast<int64_t>(B) * kDeltaSlotMax * C;
     const T* __restrict__ prev_proj =
@@ -362,10 +365,10 @@ __global__ void deltanet_conv_deferred_kernel(
 #pragma unroll
     for (int j = 0; j < kDeltaConvMaxWindow; ++j) {
         if (j < L) {
-            // committed window = the last L of [conv_state, prev_proj[0..pending)]
+            // committed window = the last L of [conv_state, prev_proj[slot[0..pending)]]
             const int i = pending + j;
             win[j] = i < L ? to_f<T>(state_row[i])
-                           : to_f<T>(prev_proj[static_cast<int64_t>(i - L) * C]);
+                           : to_f<T>(prev_proj[static_cast<int64_t>(slot[i - L]) * C]);
         } else if (j < L + S) {
             win[j] = to_f<T>(proj[(static_cast<int64_t>(b) * S + (j - L)) * C + c]);
         } else {
@@ -390,12 +393,24 @@ __global__ void deltanet_conv_deferred_kernel(
 #pragma unroll
     for (int s = 0; s < kDeltaSlotMax; ++s) {
         if (s < S) {
-            // Sum oldest tap first, preserving the direct path's FMA order.
+            // row s convolves over its own ancestors: tap 0 is its own projection, the
+            // older taps walk parent[] and then fall back to the committed window. The
+            // sum runs oldest tap first, as a contiguous window does.
+            float tap[8];
+            tap[0] = win[L + s];
+            int p = s, back = 0;
+#pragma unroll
+            for (int d = 1; d < 8; ++d) {
+                if (d < KS) {
+                    p = p >= 0 ? parent[p] : -1;
+                    tap[d] = p >= 0 ? win[L + p] : win[L - 1 - back++];
+                }
+            }
             float acc = 0.0f;
 #pragma unroll
             for (int d = 7; d >= 0; --d) {
                 if (d < KS) {
-                    acc = fmaf(w[d], win[L + s - d], acc);
+                    acc = fmaf(w[d], tap[d], acc);
                 }
             }
             const float y = round_to<T>(acc + bias);
@@ -409,7 +424,9 @@ __global__ void deltanet_conv_deferred_kernel(
 // snapshot kernel above (thread r * DV + v owns a KPT slice of one value column).
 // The pending accepted tokens of the previous step are replayed from the side
 // buffers (their gates and q/k norms were saved there) and committed to global
-// state; the S current chain tokens then only produce outputs.
+// state; the S current rows then only produce outputs. ctl's program runs the rows
+// depth-first with per-row commit flags: a chain row commits into the running
+// registers, the leaves off it run against that state without committing.
 template <typename T, int KPT>
 __global__ void gated_delta_decode_deferred_kernel(
     const T* __restrict__ x,            // [B, S, Hd]
@@ -420,7 +437,7 @@ __global__ void gated_delta_decode_deferred_kernel(
     const T* __restrict__ qkv_buf,      // [2, B, C, kDeltaSlotMax] conv+silu output, previous / current step
     float* __restrict__ gates_buf,      // [2, B, kDeltaSlotMax, Hv, 2]: decay g, beta
     float* __restrict__ sumsq_buf,      // [2, B, kDeltaSlotMax, Hk, 2]: sum q^2, sum k^2
-    const int* __restrict__ ctl,        // {pending, parity}
+    const int* __restrict__ ctl,        // {pending, parity, slot[8], parent[8], prog[8]}
     float* __restrict__ state,          // [B, Hv, DK, DV] committed state, updated in place
     T* __restrict__ out,                // [B, S, Hv, DV]
     const T* __restrict__ z,            // [B, S, Hv*DV] norm gate
@@ -450,6 +467,8 @@ __global__ void gated_delta_decode_deferred_kernel(
     const int gqa = Hv / Hk;
     const int hk = h / gqa;
     const int pending = ctl[0], par = ctl[1];
+    const int* __restrict__ prev_slot = ctl + 2;
+    const int* __restrict__ prog = ctl + 2 + 2 * kDeltaSlotMax;
     const int64_t qkv_slab = static_cast<int64_t>(B) * C * kDeltaSlotMax;
     const T* __restrict__ prev_qkv =
         qkv_buf + (1 - par) * qkv_slab + static_cast<int64_t>(b) * C * kDeltaSlotMax;
@@ -526,10 +545,10 @@ __global__ void gated_delta_decode_deferred_kernel(
     // gates and norms of the previous step's pending tokens come from the side buffers
     if (t < kDeltaSlotMax && t < pending) {
         const float* g = gates_buf +
-                         (((1 - par) * static_cast<int64_t>(B) + b) * kDeltaSlotMax + t) * Hv * 2 +
+                         (((1 - par) * static_cast<int64_t>(B) + b) * kDeltaSlotMax + prev_slot[t]) * Hv * 2 +
                          h * 2;
         const float* n = sumsq_buf +
-                         (((1 - par) * static_cast<int64_t>(B) + b) * kDeltaSlotMax + t) * Hk * 2 +
+                         (((1 - par) * static_cast<int64_t>(B) + b) * kDeltaSlotMax + prev_slot[t]) * Hk * 2 +
                          hk * 2;
         sg[t * 2 + 0] = g[0];
         sg[t * 2 + 1] = g[1];
@@ -574,7 +593,7 @@ __global__ void gated_delta_decode_deferred_kernel(
         const int64_t src = (is_q ? 0 : key_dim) + static_cast<int64_t>(hk) * DK + tt;
         float* dst = is_q ? sq : sk;
         for (int i = 0; i < pending + S; ++i) {
-            const T* buf = i < pending ? prev_qkv + i : cur_qkv + (i - pending);
+            const T* buf = i < pending ? prev_qkv + prev_slot[i] : cur_qkv + (i - pending);
             const float n = fmaxf(sqrtf(ssum[i * 2 + (is_q ? 0 : 1)]), 1e-12f);
             const float val = to_f<T>(buf[src * kDeltaSlotMax]);
             dst[i * DK + tt] = is_q ? val / n * scale : val / n;
@@ -584,14 +603,15 @@ __global__ void gated_delta_decode_deferred_kernel(
         const int64_t vsrc = 2 * static_cast<int64_t>(key_dim) + static_cast<int64_t>(h) * DV;
         for (int e = t; e < (pending + S) * DV; e += blockDim.x) {
             const int i = e / DV, cc = e - i * DV;
-            const T* buf = i < pending ? prev_qkv + i : cur_qkv + (i - pending);
+            const T* buf = i < pending ? prev_qkv + prev_slot[i] : cur_qkv + (i - pending);
             sv[i * DV + cc] = to_f<T>(buf[(vsrc + cc) * kDeltaSlotMax]);
         }
     }
     __syncthreads();
 
-    // one delta-rule step over shared row i; emit writes output row s
-    auto step = [&](int i, bool emit, int s) {
+    // one delta-rule step over shared row i; commit = false leaves st untouched (a
+    // sibling's output from the same pre-state), emit writes output row s
+    auto step = [&](int i, bool emit, int s, bool commit) {
         const float* __restrict__ skr = sk + i * DK + kk0;
         const float* __restrict__ sqr = sq + i * DK + kk0;
         const float g_s = sg[i * 2 + 0], b_s = sg[i * 2 + 1];
@@ -613,7 +633,9 @@ __global__ void gated_delta_decode_deferred_kernel(
 #pragma unroll
         for (int j = 0; j < KPT; ++j) {
             const float n = fmaf(skr[j], delta, sgs[j]);
-            st[j] = n;
+            if (commit) {
+                st[j] = n;
+            }
             o = fmaf(sqr[j], n, o);
         }
         __syncthreads();
@@ -640,15 +662,16 @@ __global__ void gated_delta_decode_deferred_kernel(
     };
     // replay the accepted tokens of the previous step and commit
     for (int i = 0; i < pending; ++i) {
-        step(i, false, 0);
+        step(i, false, 0, true);
     }
 #pragma unroll
     for (int j = 0; j < KPT; ++j) {
         state[state_off + static_cast<int64_t>(kk0 + j) * DV + v] = st[j];
     }
-    // current tokens: outputs only, the state stays uncommitted until the next step
-    for (int s = 0; s < S; ++s) {
-        step(pending + s, true, s);
+    // current rows: outputs only, the state stays uncommitted until the next step
+    for (int e = 0; e < S; ++e) {
+        const int p = prog[e];  // row | commit << 5, in depth-first order
+        step(pending + (p & 15), true, p & 15, (p & 32) != 0);
     }
 }
 
@@ -792,8 +815,9 @@ extern "C" bool launch_gated_delta_decode_deferred_kernel(
 
     using namespace comfy::hip_backend;
     // DV = DK = 128 is the shape the side buffers and Core serve; KPT = 16 then puts
-    // the state in 1024 threads as the snapshot kernel does
-    if (DK != kDeltaKeyDim || DV != kDeltaKeyDim || S < 1 || S > kDeltaSlotMax || Hk <= 0 ||
+    // the state in 1024 threads as the snapshot kernel does. S is the physical row
+    // count: 1, 4 or 8.
+    if (DK != kDeltaKeyDim || DV != kDeltaKeyDim || (S != 1 && S != 4 && S != 8) || Hk <= 0 ||
         Hv <= 0 || Hv % Hk != 0 || B <= 0 || dtype_code < 0 || dtype_code > 2) {
         return false;
     }

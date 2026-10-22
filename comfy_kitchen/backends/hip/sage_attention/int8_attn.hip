@@ -14,9 +14,10 @@
 // element, so P never goes through LDS; gfx11 interleaves the accumulator rows
 // across half-waves and pays two shuffles and two byte permutes for it.
 //
-// Tiling: 16 queries per wave and 64 keys per iteration; LDS holds only K and V.
+// Tiling: 16 queries per wave and 64 keys per iteration (32 for paged decode);
+// LDS holds only K and V.
 // Dense masks at D64/D128 use 256-query blocks to reuse each K/V tile across
-// more waves. Other paths retain the 128-query schedule.
+// more waves. Paged decode uses 64-query blocks; other paths use 128.
 #include <hip/hip_runtime.h>
 
 #include <stdexcept>
@@ -38,6 +39,7 @@ enum class MaskMode {
 namespace {
 
 constexpr int kCtaQ = 128;
+constexpr int kDecodeSplits = 8;
 constexpr int kMaxDirectKeyLength = 2048;
 // gfx11 reads a whole 16-byte K-step per lane, so a 16-byte row keeps that to one
 // LDS instruction; the wider pad costs a two-way bank conflict and buys back four
@@ -67,12 +69,12 @@ constexpr float kSoftmaxHeadroom = 8.0f;
 // 16 queries per wave at every head_dim. The CUDA launcher widens D64 to 32 to
 // halve its shared-memory traffic; here the output accumulator is transposed, so
 // a wider query tile grows the live FP32 set instead and spills on both families.
-template <int HD, MaskMode kMask = MaskMode::kNone>
+template <int HD, MaskMode kMask = MaskMode::kNone, bool Paged = false>
 struct Shape {
     static constexpr bool kWideDense = kMask == MaskMode::kPreparedDense ||
         kMask == MaskMode::kPreparedDenseBool || kMask == MaskMode::kPreparedDenseBF16 ||
         kMask == MaskMode::kPreparedDenseF16;
-    static constexpr int kBlockQ = kWideDense && HD <= 128 ? 256 : kCtaQ;
+    static constexpr int kBlockQ = Paged ? 64 : (kWideDense && HD <= 128 ? 256 : kCtaQ);
     static constexpr int kWarpQ = 16;
     static constexpr int kWaves = kBlockQ / kWarpQ;
     static constexpr int kThreads = kWaves * 32;
@@ -282,8 +284,8 @@ __forceinline__ __device__ float bool_mask_bias(uint32_t keep_bits, int bit) {
     return __uint_as_float(static_cast<uint32_t>(dropped) & 0xff800000u);
 }
 
-template <int HD, int CTA_K, MaskMode kMask, typename OutT>
-__global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel(
+template <int HD, int CTA_K, MaskMode kMask, typename OutT, bool Paged = false>
+__global__ __launch_bounds__((Shape<HD, kMask, Paged>::kThreads)) void int8_attn_kernel(
     const int8_t* __restrict__ q, const int8_t* __restrict__ k, const int8_t* __restrict__ v,
     OutT* __restrict__ o, const float* __restrict__ q_scale, const float* __restrict__ k_scale,
     const float* __restrict__ v_scale, const void* __restrict__ mask, int64_t mask_stride_b,
@@ -291,9 +293,28 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
     int qo_len, int kv_len, int qo_len_padded, int k_groups_per_head, int num_kv_groups,
     int64_t q_stride_b, int64_t q_stride_h, int64_t k_stride_b, int64_t k_stride_h,
     int64_t v_stride_b, int64_t v_stride_h, int64_t v_stride_d, int64_t o_stride_b,
-    int64_t o_stride_h, int64_t o_stride_n, float sm_scale) {
+    int64_t o_stride_h, int64_t o_stride_n, float sm_scale,
+    const int64_t* length = nullptr, float* lse = nullptr, int pages = 0) {
 
-    using S = Shape<HD, kMask>;
+    if constexpr (Paged) {
+        const int page_size = kv_len;
+        const int split_size = page_size / kDecodeSplits;
+        const int page = blockIdx.x / kDecodeSplits;
+        const int start = (blockIdx.x % kDecodeSplits) * split_size;
+        kv_len = min(split_size, max(0, static_cast<int>(length[0]) - static_cast<int>(blockIdx.x) * split_size));
+        if (!kv_len) return;
+        const int64_t slab = (static_cast<int64_t>(blockIdx.z) * pages + page) * gridDim.y;
+        const int64_t out_slab = (static_cast<int64_t>(blockIdx.z) * pages * kDecodeSplits + blockIdx.x) * gridDim.y;
+        q += static_cast<int64_t>(blockIdx.z) * gridDim.y * qo_len * HD;
+        q_scale += static_cast<int64_t>(blockIdx.z) * gridDim.y * qo_len_padded;
+        k += slab * page_size * HD + start * HD;
+        v += slab * page_size * HD + start;
+        k_scale += slab * k_groups_per_head + start / 16;
+        v_scale += slab * HD;
+        o += out_slab * qo_len * HD;
+        lse += out_slab * qo_len;
+    }
+    using S = Shape<HD, kMask, Paged>;
     constexpr int QT = S::kQueryTiles;
     constexpr int KT = CTA_K / 16;
     constexpr int DT = S::kDimTiles;
@@ -337,7 +358,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
     const int wave = tid >> 5;
     const int r = frag_row(lane);
 
-    int query_block = blockIdx.x;
+    int query_block = Paged ? 0 : blockIdx.x;
     int head = blockIdx.y;
     if constexpr (kDense) {
         // Keep a few query blocks adjacent within each head while reusing the
@@ -351,7 +372,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
         query_block = base_query + within_group % group_size;
     }
     const int block_q = query_block * S::kBlockQ;
-    const int batch = blockIdx.z;
+    const int batch = Paged ? 0 : blockIdx.z;
     const int num_qo_heads = gridDim.y;
     const int kv_head = head / num_kv_groups;
     const float* key_mask = nullptr;
@@ -404,7 +425,8 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
     // gfx11 fragments are twice as wide, and 16 of them at D256 sit on top of an
     // output accumulator that is already half the file. Past that the wave
     // reloads Q from global, which beats spilling the accumulator.
-    constexpr bool kCacheQ = DT * static_cast<int>(sizeof(typename MmaInt8::Frag)) / 4 <= 32;
+    // Paged D256 decode also reloads Q, matching the CUDA decode path.
+    constexpr bool kCacheQ = !Paged && DT * static_cast<int>(sizeof(typename MmaInt8::Frag)) / 4 <= 32;
     typename MmaInt8::Frag q_frag[QT][kCacheQ ? DT : 1];
     const int8_t* q_rows[QT];
     float q_lane_scale[QT];
@@ -844,6 +866,9 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
     for (int fq = 0; fq < QT; ++fq) {
         const int q_idx = q_lane_idx[fq];
         if (q_idx >= qo_len) continue;
+        if constexpr (Paged) {
+            if (lane < 16) lse[head * qo_len + q_idx] = m_run[fq] + log2f(d_run[fq]);
+        }
         const float inv_d = row_valid[fq] ? 1.0f / d_run[fq] : 0.0f;
         OutT* row = o + static_cast<int64_t>(batch) * o_stride_b +
                     static_cast<int64_t>(head) * o_stride_h +
@@ -1018,4 +1043,63 @@ extern "C" void launch_sage_int8_attn(
 #undef SAGE_ATTN_OUT
 #undef SAGE_ATTN_CTA
 #undef SAGE_ATTN_LAUNCH
+}
+
+namespace {
+__global__ void int8_decode_combine(
+    const __bf16* partial, const float* lse, const int64_t* length,
+    __bf16* out, float* out_lse, int heads, int rows, int pages, int page_size, int seq) {
+    const int row = blockIdx.x % rows, h = blockIdx.x / rows % heads;
+    const int b = blockIdx.x / (heads * rows), d = threadIdx.x;
+    const int live_pages = (static_cast<int>(length[0]) + page_size - 1) / page_size;
+    const int64_t base = (static_cast<int64_t>(b) * pages * heads + h) * rows + row;
+    const int lane = d & 31;
+    float m = -INFINITY;
+    for (int p = lane; p < live_pages; p += 32)
+        m = fmaxf(m, lse[base + static_cast<int64_t>(p) * heads * rows]);
+    m = row_reduce_fmax<32>(m);
+    float sum = 0.0f;
+    for (int p = lane; p < live_pages; p += 32)
+        sum += exp2f(lse[base + static_cast<int64_t>(p) * heads * rows] - m);
+#pragma unroll
+    for (int shift = 16; shift; shift >>= 1) sum += __shfl_xor(sum, shift);
+
+    const int part = d / 64, column = d % 64;
+    float values[4] = {};
+    for (int p = part; p < live_pages; p += 4) {
+        const int64_t offset = base + static_cast<int64_t>(p) * heads * rows;
+        const float w = exp2f(lse[offset] - m);
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            values[i] = fmaf(w, static_cast<float>(partial[offset * 256 + column + i * 64]), values[i]);
+    }
+    __shared__ float combined[4][256];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) combined[part][column + i * 64] = values[i];
+    __syncthreads();
+    const float val = (combined[0][d] + combined[1][d]) + (combined[2][d] + combined[3][d]);
+    const int groups = rows / seq, query_head = h * groups + row / seq, token = row % seq;
+    out[((static_cast<int64_t>(b) * seq + token) * heads * groups + query_head) * 256 + d] =
+        static_cast<__bf16>(sum > 0 ? val / sum : 0.0f);
+    if (d == 0)
+        out_lse[(b * heads * groups + query_head) * seq + token] =
+            sum > 0 ? (m + log2f(sum)) * 0.6931471805599453f : -INFINITY;
+}
+}
+
+extern "C" void launch_int8_decode(
+    int8_t* q, int8_t* k, int8_t* v, float* qs, float* ks, float* vs, const int64_t* length,
+    void* partial, float* lse, void* out, float* out_lse,
+    int batch, int heads, int rows, int pages, int page_size, int seq, hipStream_t stream) {
+    // A 32-key tile keeps the transposed D256 accumulator out of scratch on gfx12.
+    int8_attn_kernel<256, 32, MaskMode::kNone, __bf16, true><<<dim3(pages * kDecodeSplits, heads, batch), 128, 0, stream>>>(
+        q, k, v, static_cast<__bf16*>(partial), qs, ks, vs, nullptr, 0, 0, 0, 0, 0,
+        rows, page_size, 64, page_size / 16, 1,
+        0, rows * 256, 0, page_size * 256, 0, page_size * 256, page_size,
+        0, rows * 256, 256, 0.0625f, length, lse, pages);
+    int8_decode_combine<<<batch * heads * rows, 256, 0, stream>>>(
+        static_cast<const __bf16*>(partial), lse, length, static_cast<__bf16*>(out), out_lse,
+        heads, rows, pages * kDecodeSplits, page_size / kDecodeSplits, seq);
+    const auto error = hipGetLastError();
+    if (error != hipSuccess) throw std::runtime_error(hipGetErrorString(error));
 }
