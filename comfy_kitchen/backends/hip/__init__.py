@@ -137,6 +137,22 @@ _C = None
 _EXT_AVAILABLE = False
 _EXT_ERROR = None
 
+# The C entry points behind _dl and _stream, with the public Python ones as the
+# fallback. Both are per-call costs on a path that makes dozens of them: a
+# ConvRot decode calls int8_linear about 250 times per token, and each call
+# spends 62 us of CPU in the dispatch.
+#
+#   torch._C._to_dlpack             0.4 us   against Tensor.__dlpack__'s 2.6
+#   torch._C._cuda_getCurrentRawStream 0.2 us  against current_stream()'s 3.8
+#
+# _to_dlpack is the legacy DLPack producer: where __dlpack__(stream=-1) skips
+# the stream recording, it records the current stream of the tensor's device on
+# the allocator, which is the stream the kernels here launch on. Neither blocks
+# (with thirty matmuls queued both return in twenty microseconds), and the
+# recorded form is the stricter of the two.
+_dlpack = getattr(torch._C, "_to_dlpack", None)
+_current_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
 try:
     _dir = os.path.dirname(__file__)
     # Only consider suffixes this interpreter can actually load. A stale
@@ -450,6 +466,11 @@ def has_wmma() -> bool:
 
 
 def _stream(t: torch.Tensor) -> int:
+    # torch.cuda.current_stream() builds a Stream object to read one integer out
+    # of it, and that costs 3.8 us. The C entry point returns the same pointer
+    # for a fifth of that.
+    if _current_stream is not None:
+        return _current_stream(t.device.index)
     return torch.cuda.current_stream(t.device).cuda_stream
 
 
@@ -502,7 +523,20 @@ def _dl(t: torch.Tensor):
     # shares storage, so it costs nothing.
     if t.requires_grad:
         t = t.detach()
-    # stream=-1 tells PyTorch to skip synchronization (DLPack spec)
+    # The C entry point, not the Python method: Tensor.__dlpack__ is a Python
+    # function with four optional arguments, and it costs 2.6 us per tensor
+    # against this one's 0.4 us. A decode of a ConvRot model makes nine of
+    # these per int8_linear call, and the call itself is 62 us of CPU, so the
+    # difference is a third of the dispatch.
+    #
+    # The two differ in what they do about the stream: the method with
+    # stream=-1 skips the recording (the DLPack spec's "the consumer will
+    # synchronize" form) and this one records the current stream of the
+    # tensor's device on the allocator, which is the same stream the kernels
+    # here launch on (_stream). Neither blocks: with thirty matmuls queued,
+    # both return in twenty microseconds.
+    if _dlpack is not None:
+        return _dlpack(t)
     return t.__dlpack__(stream=-1)
 
 
@@ -906,7 +940,9 @@ def _convrot_int8_needs_spill(
     m: int, k: int, input_dtype_code: int, device: torch.device
 ) -> bool:
     """Query the ConvRot capability for the operand's device."""
-    with torch.cuda.device(device):
+    # _device_pin is free when the process has one device, which is the same
+    # condition under which the current device is the operand's.
+    with _device_pin(device):
         return bool(_C.convrot_int8_needs_spill(m, k, input_dtype_code))
 
 
@@ -953,12 +989,14 @@ def _rotate_quant_int8(
     # swiglu and situ halve the row: the input is twice the quantized width.
     k = k_in // _input_act_width(input_act)
     q_rows = (m + 127) // 128 * 128 if tiled_output else m
-    q = torch.empty((q_rows, k), dtype=torch.int8, device=x2d.device)
-    scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
+    q = x2d.new_empty((q_rows, k), dtype=torch.int8)
+    scales = x2d.new_empty((m,), dtype=torch.float32)
     x_arg = _operand(x2d, x2d.device, "x2d")
     # check_convrot_k queries the current device's LDS budget, so pin it to the
     # operand's device rather than trusting the caller thread's current device.
-    with torch.cuda.device(x2d.device):
+    # _device_pin is free when the process has one device, which is when the
+    # current device is the operand's anyway.
+    with _device_pin(x2d.device):
         if group_size != 256 or not _convrot_int8_needs_spill(
             m, k, DTYPE_TO_CODE[x2d.dtype], x2d.device
         ):
@@ -1287,15 +1325,23 @@ def int8_linear(
             f"Input and weight inner dimensions must match, got {k_act} and {weight.shape[-1]}"
         )
 
-    weight = _aligned(weight.to(device=x.device).contiguous())
-    weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1)
+    # The weight and the scale are already where they belong in the common
+    # case, and each of these round trips is a dispatcher call: the scale's
+    # alone is 1.9 us, and a decode makes one of these per layer per token.
+    if weight.device != x.device:
+        weight = weight.to(device=x.device)
+    weight = _aligned(weight.contiguous())
+    if weight_scale.dtype != torch.float32 or weight_scale.device != x.device:
+        weight_scale = weight_scale.to(device=x.device, dtype=torch.float32)
+    if weight_scale.dim() != 1:
+        weight_scale = weight_scale.reshape(-1)
     if weight_scale.numel() not in (1, weight.shape[0]):
         raise ValueError(
             f"INT8 weight scale must be scalar or per-output-channel, got {tuple(weight_scale.shape)}"
         )
 
     orig_shape = x.shape
-    x2d = x.reshape(-1, orig_shape[-1]).contiguous()
+    x2d = x if x.dim() == 2 else x.reshape(-1, orig_shape[-1]).contiguous()
     m = x2d.shape[0]
     k = k_act
     n = weight.shape[0]
@@ -1326,15 +1372,18 @@ def int8_linear(
     else:
         x2d = _apply_input_act(x2d, input_act)
         q_rows = (m + 127) // 128 * 128 if tiled else m
-        q = torch.empty((q_rows, k), dtype=torch.int8, device=x.device)
-        x_scale = torch.empty((m,), dtype=torch.float32, device=x.device)
+        # new_empty inherits the device and skips the device parsing that
+        # torch.empty does; the allocations are 2.5 us each.
+        q = x2d.new_empty((q_rows, k), dtype=torch.int8)
+        x_scale = x2d.new_empty((m,), dtype=torch.float32)
         _C.quantize_int8_rowwise(_dl(x2d), _dl(q), _dl(x_scale), m, k, _stream(x), tiled)
 
-    x_scale = x_scale.reshape(-1).contiguous()
+    if x_scale.dim() != 1:
+        x_scale = x_scale.reshape(-1)
     if bias is not None:
         bias = _bias_operand(bias, n, x.device)
 
-    out = torch.empty((m, n), dtype=out_dtype, device=x.device)
+    out = x2d.new_empty((m, n), dtype=out_dtype)
     # launch_int8_gemm_kernel picks its tile family from comfy_is_gfx10(), which
     # reads the *current* device, while _stream(x) names a stream on x.device. See
     # _device_pin for why the pin is skipped when it cannot matter.
