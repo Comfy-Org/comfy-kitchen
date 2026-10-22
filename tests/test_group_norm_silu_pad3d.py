@@ -291,6 +291,41 @@ class TestGroupNormStats3d:
         got = torch.cat(rows, dim=3)
         assert torch.equal(got, whole)
 
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_strips_op_equals_whole_frame(self, dtype, seed, cuda_available):
+        """The strips op reproduces the whole-frame kernel exactly.
+
+        It hands every strip the frame's statistics, so the strips together are
+        the whole-frame result and not a per-strip normalization.
+        """
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        x, weight, bias = _inputs(128, 1, 64, 40, dtype)
+        whole = ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), silu=True, zero_pad=True)
+        strips = [
+            (0, 24, (1, 1, 1, 0, 0)),
+            (24, 48, (1, 1, 0, 0, 0)),
+            (48, 64, (1, 1, 0, 1, 0)),
+        ]
+        rows = ck.group_norm_silu_pad3d_strips(x, weight, bias, 32, 1e-6, strips,
+                                                silu=True, zero_pad=True)
+        got = torch.cat(rows, dim=3)
+        assert torch.equal(got, whole)
+
+    def test_strips_op_writes_the_given_outputs(self, seed, cuda_available):
+        """The strips op writes into the caller's buffers instead of allocating."""
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        x, weight, bias = _inputs(128, 1, 64, 40, torch.bfloat16)
+        strips = [(0, 32, (1, 1, 1, 0, 0)), (32, 64, (1, 1, 0, 1, 0))]
+        outs = [torch.empty(1, 128, 1, 33, 42, dtype=torch.bfloat16, device="cuda").contiguous(
+            memory_format=CL3D) for _ in strips]
+        rows = ck.group_norm_silu_pad3d_strips(x, weight, bias, 32, 1e-6, strips,
+                                                outs=outs, silu=True, zero_pad=True)
+        assert all(r.data_ptr() == o.data_ptr() for r, o in zip(rows, outs, strict=True))
+        whole = ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), silu=True, zero_pad=True)
+        assert torch.equal(torch.cat(outs, dim=3), whole)
+
     def test_eager_stats_path_matches_eager_group_norm(self, seed, cuda_available):
         """The eager fallback with given stats rounds like torch's group_norm."""
         if not cuda_available:

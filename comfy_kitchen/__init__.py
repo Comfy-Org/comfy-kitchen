@@ -1,5 +1,7 @@
 import torch
 
+from collections.abc import Sequence
+
 from .allocation import set_allocation_context
 from .backends import cuda as _cuda_backend
 
@@ -67,6 +69,7 @@ __all__ = [
     "rms_gated_residual",
     "fp16_conv3d",
     "group_norm_silu_pad3d",
+    "group_norm_silu_pad3d_strips",
     "group_norm_stats3d",
     "rms_adaln",
     # Attention
@@ -402,6 +405,51 @@ def group_norm_stats3d(x: torch.Tensor, num_groups: int = 32, eps: float = 1e-6)
     """Per-frame GroupNorm statistics of x [B, C, T, H, W]: float32 [B*T, num_groups, 2]
     of (mean, rstd), for group_norm_silu_pad3d's stats argument."""
     return torch.ops.comfy_kitchen.group_norm_stats3d(x, num_groups, eps)
+
+
+def group_norm_silu_pad3d_strips(
+    x: torch.Tensor,
+    weight: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    num_groups: int = 32,
+    eps: float = 1e-6,
+    strips: Sequence[tuple[int, int, tuple[int, int, int, int, int]]] = (),
+    outs: Sequence[torch.Tensor] | None = None,
+    silu: bool = True,
+    zero_pad: bool = False,
+) -> list[torch.Tensor]:
+    """Normalize a frame's row strips with the frame's own statistics.
+
+    A strip of a frame is normalized with the *frame's* statistics, so the
+    statistics are computed once for the whole frame and handed to every strip.
+    Each strip is read where it lies -- a row strip of a channels_last frame is
+    a view, not a copy -- so a frame split into strips moves the same bytes
+    over the bus as the whole-frame call.
+
+    Measured on the 6-WGP 780M, the strip workflow against the whole-frame
+    call at 1024x1024: 0.99x with 4 strips, 0.89x with 16 (the difference
+    is the per-strip launch), 0.90x at 512x512 with 8 strips and 0.87x at
+    256x256 with 4. The statistics are 30-38% of it.
+
+    strips: one (first_row, last_row, pad) per strip, where pad is the
+        (left, right, top, bottom, front) that strip needs: the frame's top and
+        bottom padding belong to the first and the last strip.
+    outs: one output buffer per strip, or None to allocate.
+
+    The per-strip results are returned; with outs they are written into those
+    buffers instead.
+    """
+    stats = group_norm_stats3d(x, num_groups, eps) if weight is not None else None
+    results = []
+    for i, (first, last, pad) in enumerate(strips):
+        out = None if outs is None else outs[i]
+        results.append(
+            group_norm_silu_pad3d(
+                x[:, :, :, first:last], weight, bias, num_groups, eps, list(pad),
+                silu, zero_pad, out, stats,
+            )
+        )
+    return results
 
 
 def rms_adaln(
