@@ -86,8 +86,22 @@ extern "C" bool launch_fp16_conv3d_kernel(
     const ConvPatchSrc src{static_cast<const uint8_t*>(x), Z * P * Q, P * Q, Q, C, xw, xh, xd, xn,
                            R * S, S, sd, sh, sw};
     EpiFp16 epi{static_cast<const __half*>(bias), nullptr, static_cast<const __half*>(resid), K};
+    // `kbytes` here is 2 * depth -- a **patch volume** (output positions times the
+    // filter extent), not a K -- so the heuristic's K bands, which were calibrated
+    // on the plain GEMMs, do not transfer to this caller's units. Declining
+    // kstep32 keeps that from silently re-banding a conv by a quantity it was
+    // never measured in. See GemmPolicy in gemm_wmma.h.
+    //
+    // Measured to be a no-op either way, not just precaution: depth is at least
+    // Z*P*Q*R*S, so kbytes is far above both band edges for every conv shape in
+    // tests/test_fp16_conv3d.py, and the kstep32 arm's `else` (deep K) selects the
+    // same 128x128 BKB128 4x4 grid the plain path does. The shapes where a conv
+    // *does* diverge (c=k=320, 32^3, 3x3x3: 25.5 ms) do so through the pre-existing
+    // `padding_waste` -> skinny test, which is evaluated before any tile branch,
+    // so no value of this flag reaches them. Seven conv shapes, interleaved,
+    // identical with kstep32 true and false.
     launch_gemm_wmma<MmaF16, EpiFp16, __half, ConvPatchSrc>(
         src, static_cast<const uint8_t*>(w), static_cast<__half*>(out), M, K,
-        static_cast<int>(2 * depth), K, epi, stream);
+        static_cast<int>(2 * depth), K, epi, stream, GemmPolicy{false, false});
     return true;
 }

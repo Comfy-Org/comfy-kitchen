@@ -177,6 +177,10 @@ def _build_constraints() -> dict:
                 "per_tensor_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
             },
             default_devices=cuda_devices,
+            # Same SM100-only PTX as dequantize_nvfp4 below; see the note there.
+            min_compute_capability=(
+                None if getattr(torch.version, "hip", None) else (10, 0)
+            ),
         ),
         "quantize_mxfp8": FunctionConstraints(
             params={
@@ -187,7 +191,6 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
         ),
-        # Uses inline PTX: cvt.rn.f16x2.e2m1x2 (SM100/Blackwell instruction)
         "dequantize_nvfp4": FunctionConstraints(
             params={
                 "qx": ParamConstraint(
@@ -201,7 +204,16 @@ def _build_constraints() -> dict:
                 "output_type": ParamConstraint(dtypes=standard_floats),
             },
             default_devices=cuda_devices,
-            min_compute_capability=(10, 0),  # SM100 required for cvt.rn.f16x2.e2m1x2
+            # SM100 on NVIDIA: the kernel emits the cvt.rn.*.e2m1x2 PTX there
+            # (see _NVFP4_INLINE_PTX in quantization.py), and that build has no
+            # portable equivalent. Upstream gated this unconditionally; this fork
+            # dropped the gate to open the AMD path, which does have the portable
+            # conversion, but that also removed NVIDIA's only guard. Restore it
+            # where it means something: on ROCm the capability number is a gfx
+            # shape (gfx1103 reports 11.0), so a (10, 0) floor gates nothing.
+            min_compute_capability=(
+                None if getattr(torch.version, "hip", None) else (10, 0)
+            ),
         ),
         "apply_rope1": FunctionConstraints(
             params={

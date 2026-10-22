@@ -14,6 +14,7 @@ AdaLN and RMS-AdaLN, the quantizers, stochastic rounding, the AWQ GEMV) and
 declines the GEMMs, which fall through to triton/eager.
 """
 import functools
+import importlib.machinery
 import importlib.util
 import json
 import logging
@@ -22,6 +23,7 @@ import pathlib
 import sys
 import weakref
 from collections.abc import Sequence
+from contextlib import nullcontext
 
 import torch
 
@@ -53,6 +55,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
+from comfy_kitchen.float_utils import roundup
 
 logger = logging.getLogger("comfy_kitchen.hip")
 
@@ -67,6 +70,9 @@ __all__ = [
     "rms_gated_residual",
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
+"quantize_nvfp4",
+    "dequantize_nvfp4",
+    "scaled_mm_nvfp4",
     "group_norm_stats3d",
     "quantize_svdquant_w4a4",
     "scaled_mm_svdquant_w4a4",
@@ -84,6 +90,7 @@ __all__ = [
     "dequantize_int8_simple_dtype",
     "dequantize_per_tensor_fp8",
     "dequantize_w4a8_int8_weight",
+    "has_valu_gemm",
     "has_wmma",
     "int8_linear",
     "int8_attention_is_available",
@@ -132,9 +139,15 @@ _EXT_ERROR = None
 
 try:
     _dir = os.path.dirname(__file__)
+    # Only consider suffixes this interpreter can actually load. A stale
+    # cross-platform artifact (a Windows .pyd left in the tree by a cross build)
+    # is otherwise picked up by listdir order, and spec_from_file_location then
+    # returns None for it, which used to surface as a bare AttributeError below
+    # and left the backend silently disabled.
+    _ext_suffixes = tuple(importlib.machinery.EXTENSION_SUFFIXES)
     _module_path = None
-    for _fn in os.listdir(_dir):
-        if _fn.startswith("_C.") and _fn.endswith((".so", ".pyd")):
+    for _fn in sorted(os.listdir(_dir)):
+        if _fn.startswith("_C.") and _fn.endswith(_ext_suffixes):
             _module_path = os.path.join(_dir, _fn)
             break
 
@@ -142,6 +155,8 @@ try:
         _EXT_ERROR = "HIP extension not built (no _C module in backends/hip)"
     else:
         _spec = importlib.util.spec_from_file_location("comfy_kitchen.backends.hip._C", _module_path)
+        if _spec is None or _spec.loader is None:
+            raise ImportError(f"no extension loader for {_module_path}")
         _C = importlib.util.module_from_spec(_spec)
         sys.modules["comfy_kitchen.backends.hip._C"] = _C
         _spec.loader.exec_module(_C)
@@ -166,12 +181,52 @@ def _gfx_arch(device: torch.device | int | None = None) -> str | None:
         return None
 
 
+def _is_small_igpu(device: torch.device | int | None = None) -> bool:
+    """True on the small RDNA3 iGPU (Radeon 780M, gfx1103) whose 6-WGP tuning
+    this tree carries. dGPUs keep the upstream schedules: several block-size
+    and dispatch choices measured here are a regression on 60-96 CU parts.
+
+    Resolved for ``device`` (defaulting to the current device) and cached per
+    device index (matching the C++ comfy_small_igpu), so a mixed iGPU + dGPU box
+    answers for the device a tensor actually lives on, not whichever was current
+    the first time this ran.
+    """
+    if not torch.cuda.is_available() or not getattr(torch.version, "hip", None):
+        return False
+    if device is None:
+        index = torch.cuda.current_device()
+    elif isinstance(device, int):
+        index = device
+    else:
+        index = device.index
+        if index is None:
+            # torch.device("cuda") means the current device, same as None -- the
+            # docstring above has always said so. Returning False here instead made
+            # that a lie, and silently disabled anything gated on it: the int8
+            # attention key-tile override returned 64 even on a 780M with
+            # COMFY_SAGE_CTA_K=128 set. No existing caller was affected, because a
+            # tensor's .device always carries an index, which is why this stayed
+            # hidden.
+            index = torch.cuda.current_device()
+    return _is_small_igpu_index(index)
+
+
+@functools.cache
+def _is_small_igpu_index(index: int) -> bool:
+    arch = _gfx_arch(index)
+    return arch is not None and arch == "gfx1103"
+
+
 @functools.lru_cache(maxsize=1)
 def _visible_gfx_arches() -> tuple[str | None, ...]:
     """One entry per visible device; None where the architecture could not be read.
 
-    Cached: the visible device set is fixed for the life of the process, and
-    scaled_mm_v2 consults has_wmma() on every candidate GEMM.
+    Cheap, but not free and not because of anything in here: the visible device set
+    is fixed for the life of the process, and torch caches get_device_properties, so
+    the whole call is a current_device(), a device_count() and a tuple build. It was
+    measured at 0.05 us against 2.97 us for a bare _gfx_arch(0), which is the whole
+    argument for calling it once per predicate rather than once per term -- see
+    has_wmma and has_valu_gemm, which both hoist it for exactly this reason.
     """
     if not torch.cuda.is_available() or not getattr(torch.version, "hip", None):
         return ()
@@ -180,6 +235,37 @@ def _visible_gfx_arches() -> tuple[str | None, ...]:
     torch.cuda.current_device()
 
     return tuple(_gfx_arch(i) for i in range(torch.cuda.device_count()))
+
+
+# Why the launchers below need the *current* device pinned: launch_int8_gemm_kernel,
+# gemm_fp16's launcher and convrot_w4a4's all pick their tile family from
+# comfy_is_gfx10(), which reads the current device, while the stream they are handed
+# comes from _stream(x) and names a stream on x.device. On a box holding both an
+# RDNA2 iGPU and a matrix-core dGPU those can be different devices, and the kernel
+# then runs a v_dot4 tile that traps on the operand's part (or the WMMA tile on the
+# iGPU).
+#
+# Entering torch.cuda.device() is not free, though: measured 1.87 us per call on
+# gfx1103 (1.42 us of it just constructing the context manager, against 0.03 us for
+# a bare `pass`). The quantized GEMMs call this once per layer, so on an SDXL
+# txt2img that is ~700 pin/unpin pairs per step and ~39 ms per image of pure
+# overhead. With a single visible device the pin is provably a no-op -- x.device is
+# that device and current_device() is always it -- so it is only entered when the
+# box can actually disagree.
+@functools.cache
+def _device_pin_can_matter() -> bool:
+    """Whether a caller's tensor can live on a device other than the current one."""
+    # torch.cuda.current_device() first, for ROCm lazy init: device_count() may
+    # return 0 until HIP is initialized. Same ordering as _visible_gfx_arches.
+    torch.cuda.current_device()
+    return torch.cuda.device_count() > 1
+
+
+def _device_pin(device: torch.device | int):
+    """Context manager pinning ``device`` as current, free when it cannot matter."""
+    if _device_pin_can_matter():
+        return torch.cuda.device(device)
+    return nullcontext()
 
 
 # RDNA2 has no matrix cores; RDNA3/3.5, gfx117x and RDNA4 do. This exact manifest
@@ -196,28 +282,83 @@ _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
 _ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX117 | _ARCH_WMMA_GFX12
 _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 
+# The RDNA2 manifest group, read back out of the same file rather than spelled as a
+# literal list, because this gate has to move in lockstep with _has_wmma's: both
+# derive from architectures.json, and a second hand-written gfx103x list is a second
+# place for the manifest and the gate to disagree.
+_ARCH_VALU_GEMM = _ARCH_ELEMENTWISE_ONLY
+
+# The GEMMs that need matrix cores and have no RDNA2 fallback. Everything else
+# either has a VALU path behind __GFX10__ (int8_linear, fp16_linear,
+# w4a8_int8_linear, convrot_w4a4_linear) or runs on any supported architecture.
+# This set names the registry-dispatched GEMMs that _build_constraints drops on
+# RDNA2; the fp8 GEMM is not among them because it is reached through
+# scaled_mm_v2's _hip_fp8_gemm, which gates on has_wmma() itself rather than
+# through the registry.
+#
+# w4a8_int8_linear used to be here and was wrong. Its GEMM is not one of the
+# WMMA-only kernels: w4a8_dequant.hip's launcher finishes each decoded column
+# chunk with launch_int8_gemm_kernel, and that one already branches to the VALU
+# tile on comfy_is_gfx10() (ops/gemm_int8.hip). The grouped INT4/INT6 decode is
+# architecture-independent and templates on BITS, so the whole W4A8 and W6A8
+# stack runs on RDNA2 as it stands -- it was only unreachable, which sent those
+# models to triton and made a dequantize-the-whole-weight-then-Triton-GEMM pass
+# out of a decode the HIP backend does in column chunks. Measured on the 6-CU
+# gfx1035 at the Anima W4A8 shapes: 8.85 -> 6.55 ms per (4096, 2048, 2048) call.
+#
+# convrot_w4a4_linear is here for the same reason of arrival and not of truth:
+# it reached for MmaInt4, and MmaInt4 is a __builtin_trap() without matrix
+# cores. Its launcher now branches on the launching device the way
+# launch_int8_gemm_kernel does, so RDNA2 reaches gemm_int4_valu_kernel -- the
+# same product sum on v_dot8_i32_i4, ~1.9x the int8 tile here -- and everything
+# else reaches MmaInt4 exactly as before. Removing it here only stops the whole
+# op being withheld from RDNA2; the WMMA path is untouched.
+#
+# scaled_mm_nvfp4 is in this set for a different reason than the rest. The WMMA tile
+# kernel needs matrix cores, and mma.h's no-matrix-core fallback for MmaF16::mma is
+# __builtin_trap() rather than a plausible wrong answer -- so on an architecture with
+# neither matrix cores nor a VALU NVFP4 kernel, that kernel is compiled (the TU must
+# build in every device pass) but must never be launched.
+#
+# RDNA2 is no longer that architecture. nvfp4_gfx10.h gives it a VALU GEMM on
+# v_dot4_i32_i8 -- a GEMV for M <= 4 and a register tile above it, both reached
+# behind the same comfy_is_gfx10() gate as every other gfx103x VALU path -- so
+# _WMMA_ONLY_OPS drops scaled_mm_nvfp4 only for devices outside _ARCH_VALU_GEMM, and
+# _build_constraints puts it back for those inside it. The distinction the set is
+# drawing is "this op's only implementation is a matrix-core kernel" and not "this op
+# needs a matrix core", which is what w4a8_int8_linear and convrot_w4a4_linear were
+# both wrongly filed under above.
+#
+# quantize_nvfp4 and dequantize_nvfp4 stay out of this set deliberately: they are
+# VALU and LDS work with no matrix instruction in them, and they are the ops that
+# make the packed representation usable at all when the GEMM has to fall back.
+#
+# int8_linear_modulated and int8_linear_rms_modulated are NOT in the set, although
+# upstream lists them. Upstream's int8_linear has no RDNA2 path, so their fallback
+# into it is a matrix-core kernel there and withholding them is the only safe
+# answer. Here int8_linear reaches the VALU tile on gfx10, and both modulated ops
+# fall back into int8_linear whenever their own fused path (gfx12 only) is
+# unavailable, so RDNA2 can serve them.
+
 def _has_nonduplicated_wmma(device: torch.device | int | None = None) -> bool:
     """Whether WMMA operands use the gfx12 128-bit layout."""
     return _gfx_arch(device) in (_ARCH_WMMA_GFX12 | _ARCH_WMMA_GFX117)
 
 
-# The GEMMs, and only the GEMMs, need matrix cores. Everything else is elementwise
-# or a scalar reduction and runs on any supported architecture. This set names the
-# registry-dispatched GEMMs so _build_constraints can drop them on RDNA2; the fp8
-# GEMM is not among them because it is reached through scaled_mm_v2's _hip_fp8_gemm,
-# which gates on has_wmma() itself rather than through the registry.
 _WMMA_ONLY_OPS = frozenset({
     "fp16_conv3d",
     "fp16_conv3d_out",
-    "fp16_linear",
-    "int8_linear",
-    "int8_linear_modulated",
-    "int8_linear_rms_modulated",
     "na3d",
     "sol_attn",
-    "convrot_w4a4_linear",
     "scaled_mm_svdquant_w4a4",
-    "w4a8_int8_linear",
+    "scaled_mm_nvfp4",
+})
+
+# The subset of _WMMA_ONLY_OPS that has a VALU implementation on _ARCH_VALU_GEMM, and
+# so is re-advertised there. Only scaled_mm_nvfp4 is in it: the others' VALU
+# fallbacks (conv3d, na3d, sol_attn, svdquant w4a4) do not exist on this backend.
+_VALU_GEMM_OPS = frozenset({
+    "scaled_mm_nvfp4",
 })
 
 
@@ -247,8 +388,49 @@ def _has_wmma(arches: Sequence[str | None]) -> bool:
     return bool(arches) and all(a in _ARCH_WMMA for a in arches)
 
 
+def _has_valu_gemm(arches: Sequence[str | None]) -> bool:
+    """Whether every visible device has the RDNA2 VALU GEMM set.
+
+    The same intersection _has_wmma takes and for the same reason: registration is
+    per-process while kernels launch on the tensor's own device, so the capability
+    set has to hold for all of them. False on a mixed box, which is what sends an
+    NVFP4 matmul back to dequantize there -- the safe answer, and the same one
+    _has_wmma gives.
+    """
+    return bool(arches) and all(a in _ARCH_VALU_GEMM for a in arches)
+
+
 def is_available() -> bool:
     return _EXT_AVAILABLE and _unsupported_arch_reason(_visible_gfx_arches()) is None
+
+
+def has_valu_gemm() -> bool:
+    """Whether every visible device has the RDNA2 VALU GEMM set (gfx103x).
+
+    False when the extension is unavailable, when the architectures are not all in
+    the validated manifest, or when the process has a mix of RDNA2 and matrix-core
+    cards -- the same intersection :func:`has_wmma` takes, and for the same reason:
+    registration is per-process while kernels launch on the tensor's own device.
+
+    This is what makes the NVFP4 GEMM reachable on RDNA2. ``scaled_mm_nvfp4``'s
+    launcher branches on ``comfy_is_gfx10()`` and reaches nvfp4_gfx10.h's GEMV or
+    register tile there, so the op is advertised on gfx103x as well as on the
+    matrix-core parts; this predicate is the Python-side half of that, and
+    :func:`comfy_kitchen.tensor.base.nvfp4_mm_has_fast_path` is what consults it.
+
+    One arch snapshot per call, and the snapshot is hoisted for the same reason
+    :func:`has_wmma` hoists it: this sits on the per-matmul dispatch path, and
+    ``_visible_gfx_arches`` is not free -- it reads the current device and builds a
+    properties object per device. Calling it twice is not a style question either.
+    It is not what made a call cost 170 us on this stack, but it is free to be
+    wrong here and the fix is one line.
+    """
+    arches = _visible_gfx_arches()
+    return (
+        _EXT_AVAILABLE
+        and _unsupported_arch_reason(arches) is None
+        and _has_valu_gemm(arches)
+    )
 
 
 def has_wmma() -> bool:
@@ -442,6 +624,166 @@ def scaled_mm_fp8(
         _dl(a.view(torch.uint8)), _dl(b_nk.view(torch.uint8)), _dl(out),
         _dl(scale_a), _dl(scale_b), None if bias is None else _dl(bias),
         m, n, k, DTYPE_TO_CODE[out_dtype], _stream(a),
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# NVFP4 (E2M1 + per-16 e4m3 block scales)
+# ---------------------------------------------------------------------------
+
+# The blocked scale buffer's shape: one byte per 16 columns, in cuBLAS's "D block
+# scaling factors layout" over (RoundUp(rows, 128), RoundUp(cols/16, 4)). Mirrors
+# cuda/__init__.py:663-686 and the kernel's nvfp4_scale_offset, which is the exact
+# inverse of comfy_kitchen.float_utils.to_blocked.
+def _nvfp4_scale_shape(rows: int, cols: int) -> tuple[int, int]:
+    return (roundup(rows, 128), roundup(cols // 16, 4))
+
+
+def _nvfp4_scale_operand(block_scale: torch.Tensor, rows: int, cols: int,
+                         device: torch.device) -> torch.Tensor:
+    """``block_scale`` as the contiguous raw e4m3 bytes the kernels index.
+
+    The kernels address the scales through the blocked layout rather than as a 2D
+    grid, so what they need is the raw byte buffer with the right length. A
+    ``float8_e4m3fn`` tensor is already that storage; anything else has to be cast,
+    and the cast has to be a real copy because a same-itemcount reinterpret of a
+    differently shaped tensor would change which byte a logical cell lands on.
+    """
+    want = _nvfp4_scale_shape(rows, cols)
+    if block_scale.shape != want:
+        raise ValueError(
+            f"block_scale must have shape {want} for a ({rows}, {cols}) NVFP4 tensor, "
+            f"got {tuple(block_scale.shape)}"
+        )
+    # e4m3 crosses DLPack as uint8 (map_dtype_to_code has no name for codes 10/12).
+    return _operand(block_scale.view(torch.uint8), device, "block_scale", shape=want)
+
+
+def quantize_nvfp4(
+    x: torch.Tensor,
+    per_tensor_scale: torch.Tensor,
+    epsilon: float = 0.0,
+    pad_16x: bool = False,
+    hi_first: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """E2M1 block quantize: two nibbles per byte, one e4m3 scale per 16 columns.
+
+    ``epsilon`` is accepted and ignored, exactly as it is on the eager and triton
+    paths -- no reference implementation uses it either (see triton/quantization.py:395).
+    """
+    del epsilon  # unused by every implementation of this op; see above
+    x = x.contiguous()
+    if x.dim() != 2:
+        raise ValueError(f"quantize_nvfp4 expects a 2D tensor, got {x.dim()}D")
+    orig_rows, orig_cols = x.shape
+    # The block scale covers 16 elements and a packed byte covers 2, so the width
+    # has to be a whole number of blocks -- of the PADDED width, which is the whole
+    # point of pad_16x. An unpadded call therefore still needs orig_cols % 16 == 0.
+    if not pad_16x and orig_cols % 16 != 0:
+        raise ValueError(
+            f"quantize_nvfp4 requires the column count divisible by 16 "
+            f"(or pad_16x=True), got {orig_cols}"
+        )
+    rows = roundup(orig_rows, 16) if pad_16x else orig_rows
+    cols = roundup(orig_cols, 16) if pad_16x else orig_cols
+
+    scale = _scale_operand(per_tensor_scale, x.device)
+    out = torch.empty((rows, cols // 2), dtype=torch.uint8, device=x.device)
+    # Zeroed, not empty: the blocked buffer pads both dimensions up, and the padding
+    # is part of the layout rather than a hole. cuda/__init__.py:662 says so too.
+    scales = torch.zeros(_nvfp4_scale_shape(rows, cols), dtype=torch.uint8, device=x.device)
+    _C.quantize_nvfp4(
+        _dl(x), _dl(scale), _dl(out), _dl(scales),
+        rows, cols, orig_rows, orig_cols, DTYPE_TO_CODE[x.dtype], hi_first, _stream(x),
+    )
+    return out, scales.view(torch.float8_e4m3fn)
+
+
+def dequantize_nvfp4(
+    qx: torch.Tensor,
+    per_tensor_scale: torch.Tensor,
+    block_scales: torch.Tensor,
+    output_type: torch.dtype = torch.bfloat16,
+    hi_first: bool = True,
+) -> torch.Tensor:
+    """``e2m1(qx) * block_scale * per_tensor_scale`` back to a float tensor."""
+    qx = qx.contiguous()
+    if qx.dim() != 2:
+        raise ValueError(f"dequantize_nvfp4 expects a 2D tensor, got {qx.dim()}D")
+    rows, packed_cols = qx.shape
+    cols = packed_cols * 2
+    if cols % 16 != 0:
+        raise ValueError(f"dequantize_nvfp4 requires the column count divisible by 16, got {cols}")
+
+    scale = _scale_operand(per_tensor_scale, qx.device)
+    scales = _nvfp4_scale_operand(block_scales, rows, cols, qx.device)
+    out = torch.empty((rows, cols), dtype=output_type, device=qx.device)
+    _C.dequantize_nvfp4(
+        _dl(qx), _dl(scale), _dl(scales), _dl(out),
+        rows, cols, DTYPE_TO_CODE[output_type], hi_first, _stream(qx),
+    )
+    return out
+
+
+def scaled_mm_nvfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    tensor_scale_a: torch.Tensor,
+    tensor_scale_b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    alpha: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """out = (a @ b.T) * (tensor_scale_a * tensor_scale_b) + bias, on NVFP4 operands.
+
+    a is (M, K/2) and b is (N, K/2) uint8, two e2m1 values per byte. Both block
+    scales are in the blocked layout the kernels index; the per-tensor scales are
+    the global half of the decomposition and are applied once in the epilogue.
+
+    ``alpha`` is accepted for signature compatibility with the eager and CUDA paths
+    and ignored: it means the same thing ``tensor_scale_a * tensor_scale_b`` already
+    says, and cuda/__init__.py:1858-1859 defaults it to exactly that. Passing a
+    different alpha would silently disagree with the reference, so the kernels take
+    only the two scales.
+    """
+    del alpha  # equals tensor_scale_a * tensor_scale_b; see docstring
+    out_dtype = torch.bfloat16 if out_dtype is None else out_dtype
+    if a.dim() != 2 or b.dim() != 2:
+        raise ValueError("scaled_mm_nvfp4 expects two 2D operands")
+
+    a = _aligned(a.to(torch.uint8).contiguous())
+    # The device move is not optional. Every scale and bias below is placed with
+    # a.device and the kernel is launched on a's stream, so a `b` left on another
+    # device hands the kernel a foreign pointer to dereference there. This is not
+    # hypothetical on a part that offloads: the text-encoder runs with
+    # offload_device="cpu", so weights do arrive on the host.
+    # scaled_mm_fp8 already does this (b.to(device=a.device)).
+    b = _aligned(b.to(device=a.device, dtype=torch.uint8).contiguous())
+    m, k_packed = a.shape
+    n, b_k_packed = b.shape
+    if b_k_packed != k_packed:
+        raise ValueError(f"inner dimension mismatch: a K={2 * k_packed}, b K={2 * b_k_packed}")
+    k = 2 * k_packed
+    # Both paths read a packed row a 16-byte chunk at a time, and one scale covers
+    # 16 elements, so K must be a whole number of blocks and of chunks.
+    if k % 32 != 0:
+        raise ValueError(f"scaled_mm_nvfp4 requires K divisible by 32, got {k}")
+
+    sa = _nvfp4_scale_operand(block_scale_a, m, k, a.device)
+    sb = _nvfp4_scale_operand(block_scale_b, n, k, a.device)
+    tsa = _scale_operand(tensor_scale_a, a.device)
+    tsb = _scale_operand(tensor_scale_b, a.device)
+    if bias is not None:
+        bias = _bias_operand(bias, n, a.device)
+
+    out = torch.empty((m, n), dtype=out_dtype, device=a.device)
+    _C.scaled_mm_nvfp4(
+        _dl(a), _dl(b), _dl(out), _dl(sa), _dl(sb), _dl(tsa), _dl(tsb),
+        None if bias is None else _dl(bias),
+        m, n, k, n, DTYPE_TO_CODE[out_dtype], _stream(a),
     )
     return out
 
@@ -795,7 +1137,7 @@ def fp16_linear(
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """FP16 WMMA GEMM with bias and an optional ``residual + residual_scale * out``
+    """FP16/BF16 WMMA GEMM with bias and an optional ``residual + residual_scale * out``
     fused into the epilogue; torch's linear where the kernel declines the shape."""
     if residual is not None and residual_scale is None:
         raise ValueError("fp16_linear: residual requires residual_scale")
@@ -806,8 +1148,8 @@ def fp16_linear(
     n, k = weight.shape
 
     supported = (
-        x.dtype == torch.float16
-        and weight.dtype == torch.float16
+        x.dtype in (torch.float16, torch.bfloat16 if _is_small_igpu(x.device) else torch.float16)
+        and weight.dtype == x.dtype
         and weight.device == x.device
         and x_2d.shape[1] == k
         # the tile stager issues 16-byte row loads; a misaligned view falls back, as on CUDA
@@ -821,28 +1163,60 @@ def fp16_linear(
         supported = weight.data_ptr() % 16 == 0
     if not supported:
         # the kernel path takes bias and residual from any device, so the fallback must too
-        bias = None if bias is None else bias.to(device=x.device)
+        # Upstream leaves the bias dtype alone here and lets torch's linear reject a
+        # mismatched pair; only the iGPU's bf16 envelope needs it cast, so the cast is
+        # gated like the dtype check above and every other device keeps upstream's
+        # spelling (.to(dtype=<its own dtype>) is the identity).
+        bias = None if bias is None else bias.to(
+            device=x.device, dtype=x.dtype if _is_small_igpu(x.device) else bias.dtype)
         if residual is not None:
             residual = residual.to(device=x.device)
             residual_scale = residual_scale.to(device=x.device)
         out = torch.nn.functional.linear(x, weight, bias)
         return _apply_residual(out, residual, residual_scale)
 
-    out = torch.empty((m, n), dtype=torch.float16, device=x.device)
+    out = torch.empty((m, n), dtype=x.dtype, device=x.device)
     bias_arg = None if bias is None else _vector_operand(bias, x.device, torch.float16)
     resid_arg = rscale_arg = None
     if residual is not None:
         resid_arg = residual.to(device=x.device).reshape(m, n).contiguous()
         rscale_arg = _vector_operand(residual_scale, x.device, torch.float16)
-    served = _C.fp16_gemm(
-        _dl(x_2d), _dl(weight), _dl(out),
-        None if bias_arg is None else _dl(bias_arg),
-        None if rscale_arg is None else _dl(rscale_arg),
-        None if resid_arg is None else _dl(resid_arg),
-        m, n, k, _stream(x),
-    )
+    # The stream comes from x, but both launchers pick their architecture from the
+    # CURRENT device -- launch_fp16_gemm_kernel branches on comfy_is_gfx10() to reach
+    # the VALU v_dot2_f32_f16 kernel and falls through to launch_gemm_wmma<MmaF16>
+    # otherwise, and fp16_shape_served reads the same device. On a box where those
+    # two devices differ, a gfx11 current device sends a gfx103x stream to a WMMA
+    # launch, and MmaF16 does not exist there. The reverse direction is milder and
+    # asymmetric by dtype: the bf16 launcher declines gfx10 outright (there is no
+    # v_dot2_f32_bf16 below gfx11) while fp16 has a VALU kernel, so a gfx10 current
+    # device with a gfx11 stream declines one and mis-serves the other.
+    #
+    # This is the same pin int8_linear, _w4a8_int8_linear_chunked and
+    # convrot_w4a4_linear already apply for the same reason, and it is free where it
+    # cannot matter: _device_pin is a nullcontext when only one device is visible.
+    with _device_pin(x.device):
+        if x.dtype == torch.float16:
+            served = _C.fp16_gemm(
+                _dl(x_2d), _dl(weight), _dl(out),
+                None if bias_arg is None else _dl(bias_arg),
+                None if rscale_arg is None else _dl(rscale_arg),
+                None if resid_arg is None else _dl(resid_arg),
+                m, n, k, _stream(x),
+            )
+        else:
+            served = _C.bf16_gemm(
+                _dl(x_2d), _dl(weight), _dl(out),
+                None if bias_arg is None else _dl(bias_arg),
+                None if rscale_arg is None else _dl(rscale_arg),
+                None if resid_arg is None else _dl(resid_arg),
+                m, n, k, _stream(x),
+            )
     if not served:
-        out = _apply_residual(torch.nn.functional.linear(x_2d, weight, bias_arg), resid_arg,
+        # The GEMM declined the shape; torch's linear needs the bias in the input
+        # dtype (addmm requires compatible operand dtypes), so cast the FP16 bias
+        # here while keeping it FP16 on the kernel path.
+        bias_fb = None if bias_arg is None else bias_arg.to(dtype=x.dtype)
+        out = _apply_residual(torch.nn.functional.linear(x_2d, weight, bias_fb), resid_arg,
                               rscale_arg)
     return out if len(orig_shape) == 2 else out.reshape(*orig_shape[:-1], n)
 
@@ -961,13 +1335,17 @@ def int8_linear(
         bias = _bias_operand(bias, n, x.device)
 
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
+    # launch_int8_gemm_kernel picks its tile family from comfy_is_gfx10(), which
+    # reads the *current* device, while _stream(x) names a stream on x.device. See
+    # _device_pin for why the pin is skipped when it cannot matter.
     gemm = _C.int8_gemm_a_tiled128 if tiled else _C.int8_gemm
-    gemm(
-        _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
-        0 if weight_scale.numel() == 1 else 1,
-        None if bias is None else _dl(bias), m, n, k,
-        DTYPE_TO_CODE[out_dtype], _stream(x),
-    )
+    with _device_pin(x.device):
+        gemm(
+            _dl(q), _dl(weight), _dl(out),
+            _dl(x_scale), _dl(weight_scale), 0 if weight_scale.numel() == 1 else 1,
+            None if bias is None else _dl(bias),
+            m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
+        )
     # Unlike CUDA, the residual is not folded into the epilogue: the per-element
     # residual reads there cost more than a separate addcmul at the output widths
     # pre-norm blocks apply it to.
@@ -1334,25 +1712,29 @@ def _w4a8_int8_linear_chunked(
     # An empty weight has no chunk to size; the loop then has nothing to walk.
     chunk_cols = max(1, _w4a8_chunk_cols(m, n, k, device))
     workspace = torch.empty((chunk_cols, k), dtype=torch.int8, device=device)
-    _C.w4a8_int8_gemm_chunked(
-        _dl(xq),
-        _dl(qdata_arg),
-        _dl(s_rel_arg),
-        scale_code,
-        None if codebook_arg is None else _dl(codebook_arg),
-        _dl(s_channel_arg),
-        _dl(xs_arg),
-        None if bias_arg is None else _dl(bias_arg),
-        _dl(workspace),
-        _dl(out),
-        m,
-        n,
-        k,
-        group_size,
-        chunk_cols,
-        DTYPE_TO_CODE[out_dtype],
-        _stream(x),
-    )
+    # Same reason as int8_linear's int8_gemm: the chunked path reaches
+    # launch_int8_gemm_kernel, whose gfx10 test reads the current device while the
+    # stream is the one for x.device. See _device_pin.
+    with _device_pin(x.device):
+        _C.w4a8_int8_gemm_chunked(
+            _dl(xq),
+            _dl(qdata_arg),
+            _dl(s_rel_arg),
+            scale_code,
+            None if codebook_arg is None else _dl(codebook_arg),
+            _dl(s_channel_arg),
+            _dl(xs_arg),
+            None if bias is None else _dl(bias_arg),
+            _dl(workspace),
+            _dl(out),
+            m,
+            n,
+            k,
+            group_size,
+            chunk_cols,
+            DTYPE_TO_CODE[out_dtype],
+            _stream(x),
+        )
     return out.reshape(*orig_shape[:-1], n)
 
 
@@ -1767,11 +2149,20 @@ def convrot_w4a4_linear(
     qw = _operand(qweight, x.device, "qweight", shape=(n, k // 2))
 
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-    _C.convrot_w4a4_gemm(
-        _dl(qact), _dl(qw), _dl(out),
-        _dl(x_scale), _dl(wscales), None if bias is None else _dl(bias),
-        m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
-    )
+    # The launcher picks the tile from the launching device's own architecture:
+    # MmaInt4 where there are matrix cores, the VALU v_dot8_i32_i4 tile on RDNA2.
+    # Deciding here instead would be wrong on a box with both an iGPU and a dGPU,
+    # because has_wmma() is the intersection over every visible device and so
+    # reports false for the whole process -- which would send the dGPU's calls to
+    # an instruction it does not have. That makes "the launching device" load
+    # bearing, so pin it. See _device_pin for why it is skipped when there is
+    # only one visible device.
+    with _device_pin(x.device):
+        _C.convrot_w4a4_gemm(
+            _dl(qact), _dl(qw), _dl(out),
+            _dl(x_scale), _dl(wscales), None if bias is None else _dl(bias),
+            m, n, k, DTYPE_TO_CODE[x.dtype], _stream(x),
+        )
     return out.reshape(*orig_shape[:-1], n)
 
 
@@ -2893,7 +3284,7 @@ def _topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sinks):
 # Registration
 # ---------------------------------------------------------------------------
 
-def _build_constraints(has_wmma: bool = True) -> dict:
+def _build_constraints(has_wmma: bool = True, has_valu_gemm: bool = False) -> dict:
     from comfy_kitchen.constraints import (
         DivisibleBy,
         ExactDims,
@@ -2926,6 +3317,26 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 return ValidationResult.fail("q", "head_dim must be a multiple of 16 and <= 64")
             if q.shape[1] * q.shape[2] > 65535 or q.shape[0] * q.shape[4] > 65535:
                 return ValidationResult.fail("q", "grid dims exceed HIP limits")
+        return ValidationResult.ok()
+
+    def _fp16_linear_call_rule(kwargs):
+        # bf16 for x/weight is the gfx1103 iGPU's own bf16 GEMM path. It cannot be
+        # decided in the envelope below: _build_constraints runs once, at
+        # registration, so the device current *then* is not necessarily the device
+        # these tensors live on. A process-wide _is_small_igpu() therefore rejects
+        # valid gfx1103 bf16 calls (losing the fast path outright) or admits dGPU bf16
+        # ones (a wasted dispatch, since fp16_linear declines those and falls back to
+        # torch). Decide per call, off x's own device, which is what fp16_linear's own
+        # check already does -- so a call refused here still has somewhere correct to
+        # go rather than being admitted to a fallback.
+        #
+        # weight is not tested separately: the kernel path requires
+        # weight.dtype == x.dtype, so x alone decides the pair.
+        x = kwargs.get("x")
+        if (isinstance(x, torch.Tensor) and x.dtype == torch.bfloat16
+                and not _is_small_igpu(x.device)):
+            return ValidationResult.fail(
+                "x", f"bf16 needs the gfx1103 iGPU; {x.device} would fall back to torch")
         return ValidationResult.ok()
 
     bf16_param = ParamConstraint(dtypes=frozenset({torch.bfloat16}))
@@ -2968,6 +3379,49 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             },
             default_devices=dev,
             call_rules=(_na3d_call_rule,),
+        ),
+        # NVFP4. The three ops together are the whole NVFP4 story on this backend:
+        # with scaled_mm_nvfp4 registered, an NVFP4 linear no longer has to
+        # dequantize its weight to a float tensor first, which is what the
+        # dequantize-and-matmul fallback costs (measured on the shapes in
+        # qwen3vl_32b_minimax_h3_nvfp4_awq: 12.6 ms against a 0.29 ms roofline for
+        # q_proj at M=1, 38 ms against 0.90 for up_proj at M=512).
+        #
+        # K is not constrained here beyond what the kernels demand, because the
+        # shape rules cannot see K for the GEMM (it is packed two values per byte in
+        # a, b) and quantize/dequantize are told cols/rows directly. The wrappers
+        # and the bindings both check the divisibility they need, so a call that
+        # would read past a row is refused there rather than admitted and
+        # miscompiled.
+        "quantize_nvfp4": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
+                "per_tensor_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+            },
+            default_devices=dev,
+        ),
+        "dequantize_nvfp4": FunctionConstraints(
+            params={
+                "qx": ParamConstraint(
+                    dtypes=frozenset({torch.uint8}), shape_rules=(ExactDims(2),)
+                ),
+                "per_tensor_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "block_scales": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn})),
+                "output_type": ParamConstraint(dtypes=out_floats),
+            },
+            default_devices=dev,
+        ),
+        "scaled_mm_nvfp4": FunctionConstraints(
+            params={
+                "a": ParamConstraint(dtypes=frozenset({torch.uint8}), shape_rules=(ExactDims(2),)),
+                "b": ParamConstraint(dtypes=frozenset({torch.uint8}), shape_rules=(ExactDims(2),)),
+                "tensor_scale_a": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "tensor_scale_b": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "block_scale_a": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn})),
+                "block_scale_b": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn})),
+                "out_dtype": ParamConstraint(dtypes=out_floats),
+            },
+            default_devices=dev,
         ),
         "quantize_per_tensor_fp8": FunctionConstraints(
             params={
@@ -3178,15 +3632,18 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ),
         "fp16_linear": FunctionConstraints(
             params={
-                "x": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(MinDims(2),)),
-                "weight": ParamConstraint(
-                    dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(2),)
-                ),
+                # bf16 is admitted in the envelope for x and weight only, and
+                # _fp16_linear_call_rule decides it per call from x's device. The
+                # auxiliary operands stay FP16 because the launcher requires it and
+                # the fast path enforces it.
+                "x": ParamConstraint(dtypes=half_floats, shape_rules=(MinDims(2),)),
+                "weight": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(2),)),
                 "bias": ParamConstraint(dtypes=frozenset({torch.float16})),
                 "residual": ParamConstraint(dtypes=frozenset({torch.float16})),
                 "residual_scale": ParamConstraint(dtypes=frozenset({torch.float16})),
             },
             default_devices=dev,
+            call_rules=(_fp16_linear_call_rule,),
         ),
         "fp16_conv3d": FunctionConstraints(
             params={
@@ -3308,10 +3765,24 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         constraints[inplace_name] = constraints[functional_name]
 
     if not has_wmma:
-        # RDNA2: the GEMM kernels are compiled but trap, so they must not be
-        # advertised. Dropping them here routes those ops to triton/eager while the
-        # elementwise kernels below still dispatch to HIP.
+        # RDNA2: the WMMA GEMM kernels are compiled but trap, so they must not be
+        # advertised. Dropping the ops in _WMMA_ONLY_OPS here routes those to
+        # triton/eager while the elementwise kernels below, and the GEMMs that have
+        # a VALU path (int8_linear, fp16_linear, w4a8_int8_linear), still dispatch
+        # to HIP.
+        #
+        # _VALU_GEMM_OPS is put back out of the pre-drop dict rather than out of the
+        # filtered one, which is empty of them by construction -- reading it back out
+        # of `constraints` here silently does nothing and would leave the gate closed
+        # with nothing to show for it. This is the same shape w4a8_int8_linear and
+        # convrot_w4a4_linear were removed for: the launcher behind
+        # scaled_mm_nvfp4 branches on comfy_is_gfx10() exactly as the other RDNA2 VALU
+        # paths do, so the same call reaches the WMMA tile on gfx11 and the GEMV or
+        # the register tile on gfx103x with nothing else having to know which is which.
+        valu_gemm = {k: v for k, v in constraints.items() if k in _VALU_GEMM_OPS}
         constraints = {k: v for k, v in constraints.items() if k not in _WMMA_ONLY_OPS}
+        if has_valu_gemm:
+            constraints.update(valu_gemm)
 
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in constraints:
@@ -3336,15 +3807,54 @@ _SAGE_KEY_GROUP = 16
 _SAGE_HEAD_DIMS = (64, 128, 256)
 
 
-def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool) -> int:
-    """Keys per attention iteration.
+def _sage_cta_k(head_dim: int, kv_length: int, has_mask: bool,
+                device: torch.device | int | None = None) -> int:
+    """Keys per attention iteration: 64. 128 is implemented, measured, and not used.
 
-    Always 64. The CUDA backend widens this to 128 for long unmasked keys; the
-    wide tile is implemented here too and measures slower on RDNA, where V is
-    staged transposed and the tile doubles both LDS allocations at once. Kept as
-    a function because the choice belongs with the buffer padding it decides.
+    The kernel used to discard this outright (``(void)cta_k;`` with the launch
+    macro hardcoding 64), so the ~15% figure and the later 0.99x-1.01x A/B that
+    retired the wide tile were both reading an identical launch -- there was
+    nothing for the value to select. The argument is honoured now, and with it a
+    real choice: ``COMFY_SAGE_CTA_K=128`` picks the wide tile. That override is
+    **gfx1103-only**, which is not the same as "off by default": before the
+    argument was honoured the 128-key tile existed nowhere, so a global override
+    would hand every other architecture a schedule that has never run on it.
+
+    Measured, that choice loses. Interleaved in one process at H=48/D=128/no
+    mask, one sequence length per process: 0.997x at S=512, 1.028x at 1024,
+    1.001x at 2048, 0.986x at 3072, 0.987x at 5120, 1.003x at 8192, and at the
+    three sequence lengths Krea2 ships -- 1.009x (S=4138), 1.027x (6186),
+    1.038x (9258). Never a win, and consistently worse where this checkpoint
+    lives, by more as S grows. So 64 stays the default and this function exists
+    only to keep the two sides of the contract in step.
+
+    It stays a function because two things depend on it agreeing with the kernel:
+    the V scratch is padded to a multiple of it, and the k-scale buffer is sized
+    ``padded_k // _SAGE_KEY_GROUP``. A 128 here at D256 would pad buffers for a
+    tile the kernel never launches -- it only instantiates the wide tile up to
+    D128, 69,632 B of LDS against a 64 KB limit -- so that falls back to 64.
+
+    The kernel additionally ignores a 128 request when a mask is present: the
+    mask staging is sized for the 64-key schedule and reading it back at
+    CTA_K=128 walks off the end (7.2e-01 worst relative error against a float
+    softmax reference, where the 64-key tile gives 1.3e-02). Krea2's DiT is
+    unmasked and this only concerns the override, but the two sides have to agree
+    on *when* 128 applies as well as *whether*, or the buffer padding and the
+    launch disagree.
     """
-    del head_dim, kv_length, has_mask
+    # Module-level `os`, not a function-local import: this runs on every attention
+    # call, which is the hottest path in the quantised attention stack.
+    #
+    # **gfx1103 only**, which is a different claim from "off by default". The
+    # override exists because the 128-key tile was measured here; before this it
+    # was not instantiated on *any* target, so honouring the value unconditionally
+    # would hand every other architecture a schedule nothing has ever run on it --
+    # an env var should not be able to do that. comfy_small_igpu() resolves for
+    # the device the tensors live on, so a mixed iGPU + dGPU box answers per
+    # device rather than for whichever was current.
+    if ((not has_mask) and os.environ.get("COMFY_SAGE_CTA_K") == "128"
+            and head_dim <= 128 and _is_small_igpu(device)):
+        return _SAGE_LARGE_CTA_K
     return _SAGE_CTA_K
 
 
@@ -3661,9 +4171,17 @@ def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
         "k_scale": torch.empty(
             batch, kv_heads, padded_k // _SAGE_KEY_GROUP, dtype=torch.float32, device=device
         ),
-        # V is stored transposed, [B * H * D, padded_K], with the tail zero filled.
+        # V is stored transposed, [B * H * D, padded_K], with the tail zero
+        # filled (pure-int8 path). On the gfx1103 iGPU the buffer is twice the
+        # int8 width: the int8 kernels read the first padded_K columns (int8
+        # stride), while the short-key direct path writes the fp16 transposed V
+        # over the full 2*padded_K byte width. dGPUs allocate the upstream
+        # single-width buffer (no direct path there).
         "v_int8": torch.empty(
-            batch * kv_heads * head_dim, padded_k, dtype=torch.int8, device=device
+            batch * kv_heads * head_dim,
+            padded_k * (2 if _is_small_igpu(q.device) else 1),
+            dtype=torch.int8,
+            device=device,
         ),
         "v_scale": torch.empty(batch * kv_heads * head_dim, dtype=torch.float32, device=device),
     }
@@ -3672,6 +4190,44 @@ def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
     # and read by the K quantizer. It is scratch, not part of the packed form, so
     # it stays out of the buffers the split API hands back.
     anchor_indices = torch.empty(batch, kv_heads, dtype=torch.int32, device=device)
+    return buffers, anchor_indices
+
+
+def _sage_buffers_direct(q: torch.Tensor, k: torch.Tensor, cta_k: int):
+    """Allocate only the V scratch the short-key direct path reads.
+
+    sage_sdpa's use_direct branch runs launch_sage_transpose_v into v_int8 and
+    then launch_sage_direct_attn straight from q, k and v: the int8 prepass never
+    runs, so q_int8, k_int8, the three scales and anchor_indices are written by
+    nothing and require_len only looks at v_int8. The binding still demands a
+    tensor per argument, so the six unfilled slots share one 16-byte stub instead
+    of six real allocations (six torch.empty calls per attention).
+    """
+    batch, _, _, head_dim = q.shape
+    _, kv_heads, kv_length, _ = k.shape
+    if head_dim not in _SAGE_HEAD_DIMS:
+        raise ValueError(f"int8 attention head_dim must be one of {_SAGE_HEAD_DIMS}")
+
+    padded_k = -(-kv_length // cta_k) * cta_k
+    device = q.device
+    stub = torch.empty(16, dtype=torch.int8, device=device)
+    buffers = {
+        "q_int8": stub,
+        "k_int8": stub,
+        "q_scale": stub,
+        "k_scale": stub,
+        "v_scale": stub,
+        # Always the doubled width: only the iGPU has a direct path (sage_int8_sdpa
+        # gates on _is_small_igpu before choosing this allocator), and its C++
+        # branch requires 2 * padded_k bytes for the fp16 transposed V.
+        "v_int8": torch.empty(
+            batch * kv_heads * head_dim,
+            padded_k * 2,
+            dtype=torch.int8,
+            device=device,
+        ),
+    }
+    anchor_indices = torch.empty(16, dtype=torch.int32, device=device)
     return buffers, anchor_indices
 
 
@@ -3700,6 +4256,37 @@ def _sage_dense_mask_buffer(attn_mask: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _sage_use_direct(
+    q: torch.Tensor, k: torch.Tensor, attn_mask: torch.Tensor | None
+) -> bool:
+    """Whether sage_int8_sdpa takes the iGPU direct-V branch.
+
+    Mirrors sage_sdpa's use_direct in dlpack_bindings.cpp exactly; keep the two in
+    step. The C++ decides which kernel runs, so the Python gate must agree or the
+    buffers will not match: qo=1024 kv=4096 would allocate the direct stubs while
+    the int8 kernel demands full q_int8/k_int8 and throw.
+
+    Its own function rather than an inline expression in sage_int8_sdpa because
+    the gate is a contract with two implementations on either side of it, and
+    test_use_direct_gate_matches_the_direct_buffer_contract has to be able to ask
+    this one. A test that re-derives the rule compares two copies of it and
+    passes when only one of them drifts, which is exactly the drift it exists to
+    catch.
+    """
+    _, _, q_length, head_dim = q.shape
+    _, _, kv_length, _ = k.shape
+    output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
+    d64_short_keys = head_dim == 64 and kv_length <= 2048 and not (
+        q_length == kv_length and kv_length <= 1024
+    )
+    return (
+        _is_small_igpu(q.device)
+        and attn_mask is None
+        and q.dtype == output_dtype
+        and (d64_short_keys or (head_dim == 128 and kv_length <= 256))
+    )
+
+
 def sage_int8_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3709,15 +4296,45 @@ def sage_int8_sdpa(
     attn_mask: torch.Tensor | None,
 ) -> torch.Tensor:
     """Quantize and attend in one call. q, k and v are already padded to a
-    supported head dimension; the output keeps that width."""
-    batch, q_heads, q_length, head_dim = q.shape
-    output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
-    output = torch.empty(
-        batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q.device
-    )
+    supported head dimension; the output keeps that width.
 
-    cta_k = _sage_cta_k(head_dim, k.shape[2], attn_mask is not None)
-    buffers, anchor_indices = _sage_buffers(q, k, cta_k)
+    Operands are [B, H, L, D], the kernels' native packing.
+    """
+    batch, q_heads, q_length, head_dim = q.shape
+    _, _, kv_length, _ = k.shape
+    output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
+    cta_k = _sage_cta_k(head_dim, kv_length, attn_mask is not None, q.device)
+    use_direct = _sage_use_direct(q, k, attn_mask)
+
+    # ComfyUI's attention_comfy_kitchen_int8 finishes with
+    # out.transpose(1, 2).reshape(b, -1, heads * dim_head). HND-packed storage
+    # makes that transpose non-contiguous, so the reshape materialises a copy of
+    # the whole output: 0.65 ms at SDXL cross-attention 4096x77x10x64, more than
+    # the attention itself. NHD-packed storage presented to the kernels as
+    # [B, H, S, D] makes the transpose contiguous and the reshape a free view.
+    # Both the direct kernel (explicit o strides) and sage_attend (which reads
+    # o.stride(0..2) off the tensor) accept the packing.
+    #
+    # gfx1103 only (fork principle 1): the 0.65 ms figure is a 780M measurement, and
+    # the change is not a pure win elsewhere -- it alters the contiguity of the
+    # tensor returned for layout="HND", which dGPU callers may rely on. Upstream's
+    # HND packing is what every other device keeps.
+    if _is_small_igpu(q.device):
+        out_nhd = torch.empty(
+            batch, q_length, q_heads, head_dim, dtype=output_dtype, device=q.device
+        )
+        output = out_nhd.as_strided(
+            (batch, q_heads, q_length, head_dim),
+            (q_length * q_heads * head_dim, head_dim, q_heads * head_dim, 1),
+        )
+    else:
+        output = torch.empty(
+            batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q.device
+        )
+
+    buffers, anchor_indices = (
+        _sage_buffers_direct(q, k, cta_k) if use_direct else _sage_buffers(q, k, cta_k)
+    )
     raw_dense_mask = None
     if head_dim <= 128 and _sage_can_fuse_dense_mask(attn_mask):
         raw_dense_mask = attn_mask
@@ -3742,6 +4359,11 @@ def sage_int8_sdpa(
         None if attn_mask is None else _dl(attn_mask),
         None if raw_dense_mask is None else _dl(raw_dense_mask),
     )
+    # The NHD-packed branch (gfx1103 only) already stores the output so that
+    # ComfyUI's out.transpose(1, 2) lands contiguous; the HND branch is packed
+    # [B, H, S, D], whose transpose is the correct non-contiguous view of the same
+    # bytes. Either way the caller gets the bytes and decides the view, so the
+    # layout='HND' contract returns the [B, H, S, D] tensor unchanged.
     return output
 
 
@@ -3750,9 +4372,27 @@ def sage_int8_quantize(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    cta_k: int = _SAGE_CTA_K,
+    cta_k: int | None = None,
 ) -> dict:
-    """Quantize q, k and v without allocating the attention output."""
+    """Quantize q, k and v without allocating the attention output.
+
+    **``cta_k`` here and in :func:`sage_int8_attend` must be the same number.**
+    This half pads the k-scale buffer and the V scratch to a multiple of it; the
+    attend half tells the kernel the tile width and the kernel then reads a scale
+    for every lane of its last tile. A buffer sized for 64 read by a 128-wide
+    kernel walks off the end -- four floats at Krea2's 1024x1536 sequence. That
+    was harmless while the kernel discarded the argument outright; it is not now
+    that the tile is really selected.
+
+    So both halves default to ``None``: this one asks :func:`_sage_cta_k`, and
+    :func:`sage_int8_attend` reads the width back out of the buffer this one built.
+    A caller passing two *different* explicit values is the remaining hazard, so
+    that is what the note above is for. The returned dict stays a dict of tensors;
+    it is the prequantised-buffer contract and must not gain a metadata key.
+    """
+    batch, _, _, head_dim = q.shape
+    if cta_k is None:
+        cta_k = _sage_cta_k(head_dim, k.shape[2], False, q.device)
     buffers, anchor_indices = _sage_buffers(q, k, cta_k)
     _C.sage_sdpa_quantize(
         _dl(q),
@@ -3769,6 +4409,22 @@ def sage_int8_quantize(
         DTYPE_TO_CODE[q.dtype],
         _stream(q),
     )
+    # _sage_buffers allocates the V scratch [B*H_kv*D, 2*padded_k] on the iGPU so
+    # _C.sage_sdpa's direct fp16 transpose has the doubled width. The V quantizer
+    # packs rows at padded_k stride, so the first B*H_kv*D*padded_k elements are
+    # the contiguous single-width int8 V that sage_attend reads with a padded_k
+    # stride. Hand that single-width view to the packed form: the prequantized
+    # contract is a padded_k-wide row, and presenting the wider scratch would make
+    # the attention kernel read the second half of one row as the next.
+    kv_heads = k.shape[1]
+    padded_k = -(-k.shape[2] // cta_k) * cta_k
+    v_rows = batch * kv_heads * head_dim
+    v_need = v_rows * padded_k
+    buffers["v_int8"] = (
+        buffers["v_int8"].reshape(-1)[:v_need].reshape(v_rows, padded_k)
+        if buffers["v_int8"].numel() > v_need
+        else buffers["v_int8"]
+    )
     return buffers
 
 
@@ -3783,10 +4439,39 @@ def sage_int8_attend(
     attention_scale: float,
     attn_mask: torch.Tensor | None,
     output_dtype: torch.dtype,
-    cta_k: int = _SAGE_CTA_K,
+    cta_k: int | None = None,
 ) -> torch.Tensor:
-    """Attend over the packed layouts sage_int8_quantize produced."""
+    """Attend over the packed layouts sage_int8_quantize produced.
+
+    ``cta_k`` must equal what the quantise half used. Left at ``None`` it is read
+    back out of ``v_int8``'s row width rather than asked a second time, because the
+    two halves cannot always be asked consistently: the quantise half runs before
+    the caller has a mask, so under ``COMFY_SAGE_CTA_K=128`` it pads for 128 while
+    a masked attend wants 64 -- and the C++ side checks the row against
+    ``sage_padded_k(kv_len, cta_k)`` by equality, so guessing wrong there is a hard
+    error rather than a slow path. Deriving it makes the buffer the single source
+    of truth and every combination agree.
+
+    **The narrow tile is tried first, and that order is load-bearing.** When
+    ``kv_len`` is a multiple of 128 the two candidates pad to the *same* width, so
+    the row cannot say which one built it; asking 128 first would answer 128
+    always, and the 128-key schedule -- which is opt-in, and is not even
+    instantiated on an architecture that never asked for it -- would become the
+    default everywhere for those sequence lengths. Narrow-first pins the answer to
+    ``_SAGE_CTA_K`` whenever the two are indistinguishable, which is the upstream
+    behaviour. The cost is that the override is then a no-op for
+    ``kv_len % 128 == 0``; the buffers are byte-identical there, so nothing is lost
+    but the experiment.
+    """
     batch, q_heads, q_length, head_dim = q_int8.shape
+    if cta_k is None:
+        kv_len = k_int8.shape[2]
+        row = v_int8.shape[-1]
+        cta_k = _SAGE_CTA_K
+        for candidate in (_SAGE_CTA_K, _SAGE_LARGE_CTA_K):
+            if row == -(-kv_len // candidate) * candidate:
+                cta_k = candidate
+                break
     output = torch.empty(
         batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q_int8.device
     )
@@ -3831,16 +4516,702 @@ def _register():
         return
 
     has_wmma = _has_wmma(arches)
+    has_valu_gemm = _has_valu_gemm(arches)
     registry.register(
         name="hip",
         module=sys.modules[__name__],
-        capabilities=_build_constraints(has_wmma),
+        capabilities=_build_constraints(has_wmma, has_valu_gemm),
     )
     logger.debug(
         "registered HIP backend for %s (%s)",
         ", ".join(sorted({a for a in arches if a})),
-        "with WMMA" if has_wmma else "elementwise only, no matrix cores",
+        "with WMMA"
+        if has_wmma
+        else ("no matrix cores, VALU GEMMs" if has_valu_gemm else "elementwise only"),
     )
 
+
+# ---------------------------------------------------------------------------
+# RDNA2 (gfx103x) SageAttention: INT8 QK^T + FP16 P*V on VALU
+# ---------------------------------------------------------------------------
+# RDNA2 has no matrix cores, so the WMMA sage_attention/*.hip sources above neither
+# build nor run for gfx103x. These are the ported RDNA2 kernels, exposing the same
+# call shape as the external SageAttention package so callers can treat them as a
+# drop-in backend. Kernels in sage_attention/sage_attn_gfx103x.hip, tile in
+# mma_gfx103x.h, entry points on _C as gfx103x_quant_qk_int8 and
+# gfx103x_qk_int8_sv_attn.
+#
+# The gate in rdna2_is_available is deliberately architecture-strict, and it covers
+# the whole RDNA2 family (gfx1030-1036), not just the gfx1035 this path was named
+# after: every gfx103x part lacks matrix cores, so every one of them needs the port.
+# Outside __GFX10__ the tile body compiles to nothing, so the entry points exist on
+# every build and do nothing; this gate is what keeps them off a non-RDNA2 device.
+# Supported head dimensions for the ported kernels.
+_RDNA2_SUPPORTED_HEAD_DIMS = (64, 128)
+
+_rdna2_module = None
+_rdna2_import_error: Exception | None = None
+_rdna2_arch_loaded: str | None = None
+
+
+def _rdna2_arch(device: torch.device | int | None = None) -> str | None:
+    """Return the RDNA2 (gfx103x) architecture name of ``device``, or None.
+
+    Covers the whole RDNA2 family, not just gfx1035: gfx1030-1036 all lack matrix
+    cores, so all of them need this port and all of them are accepted by the
+    extension's CMake target. The historical ``gfx1035`` name lives on in the
+    directory, module and build-suffix for compatibility, but the *gate* is
+    architecture-class, not a single part.
+    """
+    arch = _gfx_arch(device)
+    return arch if isinstance(arch, str) and arch.startswith("gfx103") else None
+
+
+def _load_rdna2_module() -> None:
+    """Import the compiled extension; caches success and the first failure."""
+    global _rdna2_module, _rdna2_import_error, _rdna2_arch_loaded
+    if _rdna2_module is not None or _rdna2_import_error is not None:
+        return
+
+    # The entry points live on _C with every other kernel in this backend, so there
+    # is nothing to locate: one extension, built for whichever architectures
+    # COMFY_HIP_ARCHS named, and registered whether or not this device can use it.
+    #
+    # Deliberately no architecture test of the current device here. Which device can
+    # use it is already the per-device gate in rdna2_is_available, and this loader
+    # caches whatever it decides for the rest of the process: on a box holding both
+    # an RDNA2 iGPU and a dGPU, a first call made while the dGPU was current would
+    # have cached "no RDNA2 device is visible" and every later call with a real
+    # gfx1035 tensor would report the path unavailable until the process ended.
+    # `from . import _C` does not raise when the extension failed to load: the
+    # module body above leaves `_C = None`, and the import binds the attribute
+    # rather than going looking for a submodule. Without this check a broken build
+    # reaches rdna2_import_error with no recorded reason and is reported as
+    # "the requested device is not RDNA2" -- the one reading the comment there
+    # exists to rule out.
+    if not _EXT_AVAILABLE or _C is None:
+        _rdna2_import_error = RuntimeError(_EXT_ERROR or "HIP extension not built")
+        return
+
+    _rdna2_module = _C
+    # Recorded for the message, not for the gate: _rdna2_arch_loaded names the
+    # architecture this module was loaded for, and there is only one per process.
+    _rdna2_arch_loaded = _rdna2_arch()
+
+
+def rdna2_is_available(device: torch.device | int | None = None) -> bool:
+    """Whether the gfx1035 SageAttention path can run for this device."""
+    if not torch.cuda.is_available() or not getattr(torch.version, "hip", None):
+        return False
+    if _rdna2_arch(device) is None:
+        return False
+    _load_rdna2_module()
+    return _rdna2_module is not None
+
+
+def rdna2_import_error() -> str | None:
+    """Why the extension is unavailable, for error messages."""
+    _load_rdna2_module()
+    if _rdna2_module is not None:
+        return None
+    if _rdna2_import_error is not None:
+        return str(_rdna2_import_error)
+    # The extension loaded and this call was still refused: the gate was the
+    # per-device architecture check in rdna2_is_available, not the loader. Saying
+    # so keeps the message from reading as a broken build.
+    return "the requested device is not RDNA2 (gfx103x)"
+
+
+def _rdna2_ext():
+    """The shared extension module, checked.
+
+    Named for what it returns rather than renamed outright: every call site below
+    goes through here, so the availability check stays in one place.
+    """
+    if _rdna2_module is None:
+        _load_rdna2_module()
+    if _rdna2_module is None:
+        raise RuntimeError(f"RDNA2 sage attention unavailable: {_rdna2_import_error}")
+    return _rdna2_module
+
+
+# The granularity the Q/K quantizer writes its per-block scales at: one per this
+# many keys. Mirrors sageattn_gfx103x::kQuantGroupQ / kQuantGroupK, which fix the
+# scale shapes the C++ used to derive itself.
+_RDNA2_QUANT_GROUP_Q = 32
+_RDNA2_QUANT_GROUP_K = 16
+
+# Mask representations, mirroring sageattn_gfx10::MaskMode in mma_gfx103x.h and
+# the WMMA backend's own MaskMode. The values are shared on purpose: the RDNA2
+# port reads the buffers the main HIP backend's sage_prepare_* kernels produce,
+# so a prepared mask is the same object on either backend.
+_RDNA2_MASK_NONE = 0
+_RDNA2_MASK_RAW = 2
+_RDNA2_MASK_PREPARED_KEY = 4
+_RDNA2_MASK_PREPARED_DENSE = 5
+_RDNA2_MASK_PREPARED_DENSE_BOOL = 7
+_RDNA2_MASK_PREPARED_DENSE_BF16 = 8
+_RDNA2_MASK_PREPARED_DENSE_F16 = 9
+
+# Dtype codes, matching the main HIP backend's mask helpers: 0 fp32, 1 fp16,
+# 2 bf16, 3 bool.
+_RDNA2_MASK_DTYPE_CODE = {
+    torch.float32: 0,
+    torch.float16: 1,
+    torch.bfloat16: 2,
+    torch.bool: 3,
+}
+
+# The producer's key tile, which is the WMMA backend's, not this kernel's: one
+# 64-key tile contributes 64 biases plus one "kept anything" descriptor.
+_RDNA2_MASK_TILE_K = 64
+
+
+def _rdna2_prepared_mask_width(kv_length: int) -> int:
+    """Element width of the 3D key-mask buffer for ``kv_length`` keys.
+
+    Each 64-key tile contributes 64 biases plus one descriptor saying whether
+    the tile kept anything at all, and the row is padded so the producer's
+    vector loads stay aligned. Mirrors sage_attention.py's allocation.
+    """
+    tiles = (kv_length + _RDNA2_MASK_TILE_K - 1) // _RDNA2_MASK_TILE_K
+    return ((tiles * (_RDNA2_MASK_TILE_K + 1) + 3) // 4) * 4
+
+
+def _rdna2_vector_readable(t: torch.Tensor) -> bool:
+    """Whether a 16-byte vector load can address every element of ``t``.
+
+    The kernels read whole rows with 16-byte loads whose offsets are computed
+    from the strides, so every stride has to be a multiple of 8 halfs and the
+    base has to be 16-byte aligned. A tensor from permute/slice often is and
+    often is not, so this is asked rather than assumed -- it is what decides
+    whether a strided Q can be read in place instead of copied.
+    """
+    if t.data_ptr() % 16 != 0:
+        return False
+    return all(stride % 8 == 0 for stride in t.stride()[:-1])
+
+
+def _rdna2_prepare_key_mask(mask: torch.Tensor) -> torch.Tensor:
+    """Pack a key-broadcast mask into the 3D fp32 layout the kernel reads.
+
+    Delegates to the main HIP backend's producer rather than packing it here: the
+    layout is defined by that kernel, and two copies of the same packing would be
+    two things to keep in step. It is a pure memory shuffle with no matrix cores,
+    so it runs on RDNA2.
+
+    The producer sizes the output buffer from the mask's own batch and head
+    strides, so it is handed [B,H,1,K] with a query axis that never had more than
+    one row. A mask that arrived already broadcast to the full query length is
+    compacted first, because slicing a stride-0 view leaves a stride-0 view and
+    the producer would size the buffer from the wrong extents.
+    """
+    from . import _dl
+
+    mask_batch = 1 if mask.stride(0) == 0 else mask.shape[0]
+    mask_heads = 1 if mask.stride(1) == 0 else mask.shape[1]
+    packed = torch.empty(
+        (mask_batch, mask_heads, _rdna2_prepared_mask_width(mask.shape[-1])),
+        dtype=torch.float32,
+        device=mask.device,
+    )
+    key_only = mask[:mask_batch, :mask_heads, :1, :]
+    if key_only.stride(2) == 0:
+        # Still a broadcast on the query axis: materialise the row so the
+        # producer sees a real address rather than a zero stride it rejects.
+        key_only = key_only.contiguous()
+    _C.sage_prepare_key_mask(_dl(key_only), _dl(packed), _stream(mask))
+    return packed
+
+
+def _rdna2_prepare_attn_mask(
+    mask: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    kv_length: int | None = None,
+) -> tuple[int, int, torch.Tensor]:
+    """Turn a caller-supplied mask into a (mode, dtype code, buffer) triple.
+
+    A mask that varies along the query axis is read raw: the kernel indexes it
+    with the caller's own strides, so there is no packing pass at all. That is
+    the trade the RDNA2 port can make and the WMMA backends cannot -- their MMA
+    fragment layout only sees a key's bias from one specific slot, so they have
+    to permute the mask into a packed tile first, which is what
+    ``sage_int8_sdpa``'s fused short-dense-mask path exists to hide. A strided
+    read inside the attention loop replaces that pass outright here.
+
+    A mask that does *not* vary along queries is still packed, because there the
+    packed form is strictly less work: one element per key, read once, instead of
+    a strided read per key per query block.
+
+    Reading raw and reading the packed form give bit-identical results. Both
+    decode the same bias in the same units and add it to the same rounded score
+    product, so a fused call and a prequantized snapshot of one mask agree
+    exactly -- which test_hip_compact_dense_bool_matches_float_bias pins.
+    """
+    if mask.dtype not in _RDNA2_MASK_DTYPE_CODE:
+        raise TypeError(
+            f"attn_mask must be bool, float16, bfloat16 or float32, got {mask.dtype}"
+        )
+    if mask.device != q.device:
+        raise ValueError("attn_mask must be on the same device as q, k and v")
+    # The key length, from the axis the caller's layout puts it on. It cannot be
+    # derived from k alone: tensor_layout="HND" is [B, H, S, D] and tensor_layout=
+    # "NHD" is [B, S, H, D], so k.shape[2] is the key length under the first and the
+    # HEAD COUNT under the second. Reading the wrong one is not a crash and not a
+    # wrong answer -- it is a wrong axis feeding two decisions below, so the failure
+    # is a ValueError rejecting a valid mask whenever the head count differs from the
+    # key length, and the prepared-key packing being chosen against the head count
+    # rather than the key count. Defaulted rather than required so the HND behaviour
+    # is unchanged for any other caller.
+    if kv_length is None:
+        kv_length = k.shape[2]
+    if mask.shape[-1] not in (kv_length, 1):
+        raise ValueError(
+            f"attn_mask's last extent must be {kv_length} or 1, got {mask.shape[-1]}"
+        )
+
+    # A key-only mask is one whose query axis carries no per-query structure:
+    # either a single row, or a stride-0 broadcast. Checked before any broadcast
+    # view is taken, which would flatten both cases into [B,H,Q,K] and hide the
+    # distinction.
+    key_only = mask.ndim == 4 and (mask.shape[2] == 1 or mask.stride(2) == 0)
+    if key_only and kv_length > _RDNA2_MASK_TILE_K:
+        return (
+            _RDNA2_MASK_PREPARED_KEY,
+            _RDNA2_MASK_DTYPE_CODE[mask.dtype],
+            _rdna2_prepare_key_mask(mask),
+        )
+    # Narrower than one mask tile: there is nothing a packed tile would save,
+    # and the kernel already treats the keys past the end as dropped.
+    return _RDNA2_MASK_RAW, _RDNA2_MASK_DTYPE_CODE[mask.dtype], mask
+
+
+def rdna2_pack_attn_mask(
+    mask: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    attention_scale: float,
+) -> torch.Tensor:
+    """Pack ``mask`` into the snapshot form a prequantized call stores.
+
+    The result is a 3D fp32 buffer in the key layout, or a 5D dense buffer whose
+    trailing width says which of the dense forms it is. Callers pass it back with
+    ``prequantized=True``, and the rank plus trailing width are what the consumer
+    reads to decide how.
+    """
+    from comfy_kitchen.sage_attention import _prepare_attn_mask as _shared_prepare
+    # Named without the rdna2_ prefix on purpose: this is
+    # sage_attention's mask packer, not the wrapper above, which is a different
+    # function that happens to share its name. The prefix on the local one is
+    # what keeps the two apart.
+
+
+    return _shared_prepare(mask, attention_scale)
+
+
+def _rdna2_unpack_prepared_mask(
+    packed: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    kv_length: int | None = None,
+) -> tuple[int, int, torch.Tensor]:
+    """Recognise a packed mask buffer and return the mode to read it with.
+
+    The packed forms are self-describing by rank and trailing width, which is
+    what lets PrequantizedInt8Attention carry a mask as a bare tensor: a 3D
+    buffer is the key layout, a 5D buffer is dense with the last extent saying
+    whether it holds keep bits or 16-bit values, and a 4D buffer is still a raw
+    mask -- the shared preparer declines to pack one that is too narrow to tile.
+    """
+    if packed.dim() == 4:
+        return _RDNA2_MASK_RAW, _RDNA2_MASK_DTYPE_CODE[packed.dtype], packed
+    if packed.dim() == 3:
+        # Same axis question as _rdna2_prepare_attn_mask, and it is not only the
+        # message here: _rdna2_prepared_mask_width derives the expected packed width
+        # from the key length, so reading the head count under NHD sizes the check
+        # against the wrong number of 64-key tiles and it both rejects masks packed
+        # for the real key length and accepts ones packed for the head count.
+        if kv_length is None:
+            kv_length = k.shape[2]
+        expected = _rdna2_prepared_mask_width(kv_length)
+        if packed.shape[-1] != expected:
+            raise ValueError(
+                f"prepared key mask must be {expected} wide for kv_length "
+                f"{kv_length}, got {packed.shape[-1]}"
+            )
+        if packed.dtype != torch.float32:
+            raise ValueError("prepared key mask must be float32")
+        return _RDNA2_MASK_PREPARED_KEY, 0, packed
+    if packed.dim() == 5:
+        if packed.shape[-1] == 32:
+            if packed.dtype != torch.int32:
+                raise ValueError("a bit-packed dense mask must be int32")
+            return _RDNA2_MASK_PREPARED_DENSE_BOOL, 3, packed
+        if packed.shape[-1] != 1024:
+            raise ValueError(
+                f"prepared dense mask must be 32 (bit-packed) or 1024 wide, "
+                f"got {packed.shape[-1]}"
+            )
+        if packed.dtype == torch.bfloat16:
+            return _RDNA2_MASK_PREPARED_DENSE_BF16, 2, packed
+        if packed.dtype == torch.float16:
+            return _RDNA2_MASK_PREPARED_DENSE_F16, 1, packed
+        if packed.dtype == torch.float32:
+            return _RDNA2_MASK_PREPARED_DENSE, 0, packed
+        raise ValueError(
+            f"prepared dense mask must be float32, float16 or bfloat16, got {packed.dtype}"
+        )
+    raise ValueError(
+        "a prepared attn_mask must be 3D (key layout) or 5D (dense layout), got "
+        f"{packed.dim()}D"
+    )
+
+
+def rdna2_sageattn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    sm_scale: float | None = None,
+    attn_mask: torch.Tensor | None = None,
+    prequantized: bool = False,
+) -> torch.Tensor:
+    """SDPA with INT8 Q·K^T and FP16 P·V on RDNA2.
+
+    Shapes and layout semantics match SageAttention's ``rdna2_sageattn``:
+    ``tensor_layout="HND"`` takes ``[batch, heads, seq, head_dim]`` and
+    ``"NHD"`` takes ``[batch, seq, heads, head_dim]``. Only head_dim 64 and 128
+    are supported, matching the ported kernels.
+
+    ``attn_mask`` takes the same mask ComfyUI hands to the other backends: bool
+    or a float mask broadcastable to ``[batch, heads, q_len, kv_len]``, where a
+    False or non-finite entry drops the key. ``prequantized=True`` says the mask
+    is already a packed buffer produced by :func:`rdna2_pack_attn_mask` and is read as
+    such; that is how :func:`comfy_kitchen.sage_attention.int8_attention_from_prequantized`
+    consumes a snapshot without rebuilding it.
+    """
+    if not rdna2_is_available(q.device):
+        raise RuntimeError(
+            f"RDNA2 sage attention is unavailable: {rdna2_import_error()}"
+        )
+
+    dtype = q.dtype
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError(f"inputs must be fp16, bf16 or fp32, got {dtype}")
+    if not (q.dtype == k.dtype == v.dtype):
+        raise TypeError("q, k, v must share one dtype")
+    if not (q.device == k.device == v.device):
+        raise ValueError("q, k, v must be on the same device")
+    if not q.is_cuda:
+        raise ValueError("q, k, v must be on a CUDA/HIP device")
+
+    head_dim = q.size(-1)
+    if head_dim not in _RDNA2_SUPPORTED_HEAD_DIMS:
+        raise ValueError(f"head_dim must be 64 or 128, got {head_dim}")
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        if tensor.stride(-1) != 1:
+            raise ValueError(f"{name} must be contiguous along head_dim")
+
+    # Resolve the mask to (mode, dtype code, buffer) once, so the raw and packed
+    # forms are the same object to the kernel.
+    mask_mode = _RDNA2_MASK_NONE
+    mask_dtype = 0
+    mask_buffer = torch.empty(0, device=q.device, dtype=q.dtype)
+    # True when this call built the mask itself, and so owns a temporary the
+    # pending kernel still reads.
+    owns_mask_buffer = False
+    # The key length, from the axis tensor_layout puts it on, derived ONCE here
+    # because two helpers below need it and deriving it from k alone gets the head
+    # count under NHD: HND is [B, H, S, D] so k.size(2) is the key length, and NHD is
+    # [B, S, H, D] so it is k.size(1). The mask helpers read it to validate the mask's
+    # last extent and to size the prepared-key packing.
+    kv_len = k.size(2) if tensor_layout == "HND" else k.size(1)
+    if attn_mask is not None:
+        if prequantized:
+            mask_mode, mask_dtype, mask_buffer = _rdna2_unpack_prepared_mask(
+                attn_mask, q, k, kv_len
+            )
+        else:
+            mask_mode, mask_dtype, mask_buffer = _rdna2_prepare_attn_mask(
+                attn_mask, q, k, kv_len
+            )
+            owns_mask_buffer = True
+
+    input_dtype = dtype
+    if dtype == torch.float32:
+        q, k, v = (t.half() for t in (q, k, v))
+        dtype = torch.float16
+
+    ops = _rdna2_ext()
+    layout_code = 1 if tensor_layout == "HND" else 0
+
+    if sm_scale is None:
+        sm_scale = head_dim ** -0.5
+
+    # The prepass quantizer and the V staging read their operands with 16-byte
+    # vector loads, so K and V have to be laid out for that.
+    if not k.is_contiguous():
+        k = k.contiguous()
+    if not v.is_contiguous():
+        v = v.contiguous()
+
+    # The result is packed [B, S, H, D] and handed back as a [B, H, S, D] view.
+    # Every ComfyUI attention path ends with
+    # `out.transpose(1, 2).reshape(batch, -1, heads * dim)`, and on
+    # HND-contiguous storage that reshape is a full copy of the result: on the
+    # short-KV cross-attention shapes it cost as much as the attention itself.
+    # The kernel writes through the strides the tensor reports, so producing the
+    # layout the caller wants is free, and the reshape becomes a view.
+    batch = q.size(0)
+    q_heads = q.size(1) if tensor_layout == "HND" else q.size(2)
+    qo_len = q.size(2) if tensor_layout == "HND" else q.size(1)
+    out = torch.empty(
+        batch, qo_len, q_heads, head_dim,
+        dtype=dtype if input_dtype != torch.float32 else torch.float16,
+        device=q.device,
+    )
+    o = out.transpose(1, 2) if tensor_layout == "HND" else out
+
+    # gfx103x reads native [B,H,N,D] V directly; no transpose is needed, and the
+    # v_scale argument is a placeholder the kernel does not read. The kernel
+    # itself is FP16-only, so bf16 V is converted here (a single cast kernel,
+    # which the direct-fp16 path avoids by folding the cast into its transpose).
+    if tensor_layout == "NHD":
+        v16 = v if v.dtype == torch.float16 else v.half()
+        if v16.is_contiguous():
+            b_, n_, h_, d_ = v16.shape
+            v_for_attn = v16.as_strided(
+                (b_, h_, n_, d_), (n_ * h_ * d_, d_, h_ * d_, 1)
+            )
+        else:
+            v_for_attn = v16.permute(0, 2, 1, 3).contiguous()
+    else:
+        v_for_attn = v if v.dtype == torch.float16 else v.half()
+    # smooth_k went with the mean-seq kernel it needed. Nothing in the tree set
+    # it, the only caller of rdna2_sageattn passes nothing, and int8_attention lists it
+    # among the options it must reject, so the feature is absent from the public
+    # surface rather than merely unused. quant_qk_int8 still takes a key_mean and
+    # subtracts it when it gets one; nothing produces one now.
+    k_mean = torch.empty(0, device=q.device, dtype=q.dtype)
+
+    # In-kernel Q quantization lets the attention kernel quantize Q itself, so Q
+    # never has to be materialized. It is off by default and the env override
+    # exists only to measure it, for two reasons.
+    #
+    # It does not agree with the prepass: the kernel scales each query row
+    # against its own amax while the prepass scales MIN_BLK_Q rows together, so
+    # the int8 differs and a prequantized snapshot -- which is packed by the
+    # prepass -- would not match the fused call it came from.
+    # test_prequantized_attention_is_bitwise_identical_to_fused pins that match.
+    # And with the output packed it measured no faster anyway (1.80 vs 1.78 ms
+    # on SDXL cross-attention at 6144x77x10x64), the Q round-trip not being what
+    # the short-KV shapes spend their time on.
+    skip_inq = bool(
+        head_dim in _RDNA2_SUPPORTED_HEAD_DIMS
+        and not is_causal
+        and kv_len <= 1024
+        and _rdna2_vector_readable(q)
+        and os.getenv("CK_GFX1035_INQ") == "1"
+    )
+    if not _rdna2_vector_readable(q):
+        # The quantizer reads whole 8-element packs whose offsets come from the
+        # strides, so a Q whose strides are not multiples of 8 halfs (or whose
+        # base is misaligned) has to be repacked. A Q that is merely *strided* --
+        # the usual [B,S,H,D].transpose(1,2) -- is read in place: on the
+        # short-KV cross-attention shapes this copy was a third of the call.
+        q = q.contiguous()
+    q_fp = q
+    if skip_inq and tensor_layout == "NHD":
+        # A transpose view, not as_strided with packed NHD strides: Q only has to
+        # be vector-readable to get here, which a merely strided NHD view is, and
+        # imposed strides over strided storage read the wrong elements. Same reason
+        # the V branch above tests is_contiguous() before its own as_strided.
+        q_fp = q.transpose(1, 2)
+
+    # _C has no torch in it, so every buffer is built here. The quantizer always
+    # writes packed [B, heads, seq, dim] whatever layout Q arrived in, which is why
+    # q_int8 is HND even on the NHD path.
+    kv_heads = k.size(1) if tensor_layout == "HND" else k.size(2)
+    if skip_inq:
+        # Q is quantized inside the attention kernel, so it is never materialized.
+        q_int8 = torch.empty(0, device=q.device, dtype=torch.int8)
+        q_scale = torch.empty(0, device=q.device, dtype=torch.float32)
+    else:
+        q_int8 = torch.empty(batch, q_heads, qo_len, head_dim,
+                             device=q.device, dtype=torch.int8)
+        q_scale = torch.empty(batch, q_heads,
+                              (qo_len + _RDNA2_QUANT_GROUP_Q - 1) // _RDNA2_QUANT_GROUP_Q,
+                              device=q.device, dtype=torch.float32)
+    k_int8 = torch.empty(batch, kv_heads, kv_len, head_dim,
+                         device=q.device, dtype=torch.int8)
+    k_scale = torch.empty(batch, kv_heads,
+                          (kv_len + _RDNA2_QUANT_GROUP_K - 1) // _RDNA2_QUANT_GROUP_K,
+                          device=q.device, dtype=torch.float32)
+
+    ops.gfx103x_quant_qk_int8(
+        q, k, k_mean, q_int8, q_scale, k_int8, k_scale,
+        layout_code, float(sm_scale), int(skip_inq), _stream(q),
+    )
+    ops.gfx103x_qk_int8_sv_attn(
+        q_int8, k_int8, v_for_attn, o,
+        q_scale, k_scale,
+        layout_code, int(is_causal), float(sm_scale),
+        q_fp if skip_inq else torch.empty(0, device=q.device, dtype=q.dtype),
+        mask_mode, mask_dtype, mask_buffer, _stream(q),
+    )
+
+    if input_dtype == torch.float32:
+        o = o.to(torch.float32)
+    if owns_mask_buffer:
+        # The packed mask is a temporary built for this call, and the attention
+        # kernel that reads it is only *enqueued* here. Dropping the last
+        # reference would let the caching allocator hand the block to the next
+        # call before the pending kernel has run, which made back-to-back masked
+        # calls return different answers. Attaching it to the output keeps it
+        # alive for exactly as long as the result that depends on it.
+        o._gfx1035_mask = mask_buffer
+    return o
+
+
+def rdna2_prequantize(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    original_head_dim: int,
+    input_dtype: torch.dtype,
+    attention_scale: float,
+    attn_mask: torch.Tensor | None,
+):
+    """Quantize Q/K and snapshot the mask, without running attention.
+
+    The RDNA2 kernel reads V straight from memory in fp16 -- it is the
+    P·V product, not a quantized one -- so the snapshot keeps V as the fp16
+    buffer the kernel wants rather than an int8 copy of it. That is what the
+    ``v`` field holds here, and ``v_scale`` stays empty: the kernel has no
+    per-row V scale to apply. The Q/K half is the ordinary packed int8 with
+    per-row and per-16-key scales, produced by the same quantizer the fused path
+    uses, so a snapshot and a fused call over the same inputs agree exactly.
+    """
+    from comfy_kitchen.sage_attention import PrequantizedInt8Attention
+
+    if not rdna2_is_available(q.device):
+        raise RuntimeError(f"RDNA2 sage attention is unavailable: {rdna2_import_error()}")
+
+    head_dim = q.size(-1)
+    if head_dim not in _RDNA2_SUPPORTED_HEAD_DIMS:
+        raise NotImplementedError(
+            "prequantize_int8_attention on RDNA2 (gfx103x) requires head_dim 64 or "
+            f"128, got {head_dim}."
+        )
+
+    mask_snapshot: torch.Tensor | None = None
+    if attn_mask is not None:
+        mask_snapshot = rdna2_pack_attn_mask(attn_mask, q, k, attention_scale)
+
+    work_q = q if q.dtype != torch.float32 else q.half()
+    work_k = k if k.dtype != torch.float32 else k.half()
+    if not work_q.is_contiguous():
+        work_q = work_q.contiguous()
+    if not work_k.is_contiguous():
+        work_k = work_k.contiguous()
+
+    ops = _rdna2_ext()
+    k_mean = torch.empty(0, device=q.device, dtype=work_k.dtype)
+    # skip_q=0: the snapshot is the whole point, so Q has to be packed here
+    # rather than left for the attention pass to quantize in place.
+    #
+    # The snapshot is always HND -- layout 1 below -- and the quantizer writes
+    # packed [B, heads, seq, dim] regardless, so the shapes follow from work_q and
+    # work_k directly with no layout arithmetic to get wrong.
+    batch, q_heads, q_len, head_dim = work_q.shape
+    k_batch, kv_heads, kv_len, _ = work_k.shape
+    q_int8 = torch.empty(batch, q_heads, q_len, head_dim,
+                         device=q.device, dtype=torch.int8)
+    q_scale = torch.empty(batch, q_heads,
+                          (q_len + _RDNA2_QUANT_GROUP_Q - 1) // _RDNA2_QUANT_GROUP_Q,
+                          device=q.device, dtype=torch.float32)
+    k_int8 = torch.empty(k_batch, kv_heads, kv_len, head_dim,
+                         device=q.device, dtype=torch.int8)
+    k_scale = torch.empty(k_batch, kv_heads,
+                          (kv_len + _RDNA2_QUANT_GROUP_K - 1) // _RDNA2_QUANT_GROUP_K,
+                          device=q.device, dtype=torch.float32)
+    ops.gfx103x_quant_qk_int8(
+        work_q, work_k, k_mean, q_int8, q_scale, k_int8, k_scale,
+        1, float(attention_scale), 0, _stream(work_q),
+    )
+    v_fp16 = v if v.dtype == torch.float16 else v.half()
+    if not v_fp16.is_contiguous():
+        v_fp16 = v_fp16.contiguous()
+
+    return PrequantizedInt8Attention(
+        q=q_int8,
+        k=k_int8,
+        v=v_fp16,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=torch.empty(0, device=q.device, dtype=torch.float32),
+        original_head_dim=original_head_dim,
+        input_dtype=input_dtype,
+        attention_scale=attention_scale,
+        # cta_k is a WMMA scheduling parameter; the RDNA2 kernel fixes its own
+        # tile and ignores it, but the field is part of the shared dataclass.
+        cta_k=64,
+        attn_mask=mask_snapshot,
+    )
+
+
+def rdna2_attend_prequantized(quantized) -> torch.Tensor:
+    """Attend over a snapshot taken by :func:`rdna2_prequantize`.
+
+    The packed Q/K go back through the same op the fused path uses, with the
+    snapshot's mask handed over already packed, so no part of the result depends
+    on the float inputs still being alive.
+    """
+    if not rdna2_is_available(quantized.q.device):
+        raise RuntimeError(f"RDNA2 sage attention is unavailable: {rdna2_import_error()}")
+
+    if quantized.q.dtype != torch.int8:
+        raise ValueError(
+            "a prequantized INT8 attention snapshot on RDNA2 must carry packed "
+            f"int8 Q, got {quantized.q.dtype}"
+        )
+
+    mask_mode = _RDNA2_MASK_NONE
+    mask_dtype = 0
+    mask_buffer = torch.empty(0, device=quantized.q.device, dtype=quantized.q.dtype)
+    if quantized.attn_mask is not None:
+        mask_mode, mask_dtype, mask_buffer = _rdna2_unpack_prepared_mask(
+            quantized.attn_mask, quantized.q, quantized.k
+        )
+
+    q = quantized.q
+    if not q.is_contiguous():
+        q = q.contiguous()
+    k = quantized.k
+    if not k.is_contiguous():
+        k = k.contiguous()
+
+    batch, q_heads, q_length, head_dim = q.shape
+    # The RDNA2 kernel is fp16-only, so a float32 input accumulates and writes
+    # fp16 here and is widened on return -- the same thing rdna2_sageattn() does. Using
+    # bf16 instead (as the WMMA backends do, having a bf16 path) would round the
+    # result differently, and a snapshot has to match its fused counterpart
+    # bit for bit.
+    output_dtype = torch.float16 if quantized.input_dtype == torch.float32 \
+        else quantized.input_dtype
+    o = torch.empty(batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q.device)
+    # q_fp is empty: that is how the op is told Q is already packed int8.
+    _rdna2_ext().gfx103x_qk_int8_sv_attn(
+        q, k, quantized.v, o,
+        quantized.q_scale, quantized.k_scale,
+        1, 0, float(quantized.attention_scale),
+        torch.empty(0, device=q.device, dtype=torch.float16),
+        mask_mode, mask_dtype, mask_buffer, _stream(q),
+    )
+    o = o[..., : quantized.original_head_dim]
+    return o.to(torch.float32) if quantized.input_dtype == torch.float32 else o
 
 _register()
