@@ -4333,7 +4333,8 @@ void flash_attention_decode_gqa(
         throw std::runtime_error("Invalid Flash Attention split workspace");
     }
     if (k.stride(0) != v.stride(0) || k.stride(1) != v.stride(1) || k.stride(2) != v.stride(2) || k.stride(3) != 1 || v.stride(3) != 1 || q.stride(3) != 1
-        || output.stride(2) != 1 || output.stride(1) != heads * kHeadDim || output.stride(0) != query_length * heads * kHeadDim) {
+        || output.stride(2) != 1 || (query_length > 1 && output.stride(1) != heads * kHeadDim)
+        || (batch > 1 && output.stride(0) != query_length * heads * kHeadDim)) {
         throw std::runtime_error("Unsupported Flash Attention tensor strides");
     }
 
@@ -4391,7 +4392,7 @@ void flash_attention_decode_tree_merge(
         || map_dtype_to_code(out.dtype()) != 2 || map_dtype_to_code(merged.dtype()) != 2)
         throw std::runtime_error("Tree merge tensors must have bfloat16 dtype");
     if (q.stride(3) != 1 || k.stride(3) != 1 || v.stride(3) != 1 || out.stride(2) != 1 || merged.stride(2) != 1
-        || out.stride(1) != heads * kHeadDim || merged.stride(1) != heads * kHeadDim)
+        || (rows > 1 && (out.stride(1) != heads * kHeadDim || merged.stride(1) != heads * kHeadDim)))
         throw std::runtime_error("Unsupported tree merge strides");
     need_contiguous(mask, "flash_attention_decode_tree_merge", "mask");
     launch_flash_decode_tree_merge(

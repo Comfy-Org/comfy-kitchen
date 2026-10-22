@@ -390,6 +390,44 @@ def test_flash_attention_decode_gqa_matches_reference(query_length, causal, dtyp
     torch.testing.assert_close(lse, scores.logsumexp(-1), atol=1e-3, rtol=1e-4)
 
 
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("rows", [1, 3])
+@pytest.mark.parametrize("num_splits", [1, 2])
+def test_flash_attention_decode_singleton_strides(monkeypatch, batch, rows, num_splits):
+    if getattr(torch.version, "hip", None) or not ck.flash_attention_decode_gqa_is_available():
+        pytest.skip("requires the CUDA GQA flash decode kernel")
+
+    backend = flash_attention_module._cuda_backend
+    wrap = backend._wrap_for_dlpack
+
+    def singleton_strides(tensor):
+        # PyTorch 2.8 exports singleton dimensions through DLPack with stride 1.
+        strides = tuple(1 if size == 1 else stride for size, stride in zip(tensor.shape, tensor.stride(), strict=True))
+        return wrap(tensor.as_strided(tensor.shape, strides))
+
+    monkeypatch.setattr(backend, "_wrap_for_dlpack", singleton_strides)
+    monkeypatch.setattr(flash_attention_module, "_num_splits", lambda *_, **__: num_splits)
+    torch.manual_seed(0)
+    q = torch.randn(batch, 8, rows, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, 2, 257, 256, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    lengths = torch.full((batch,), 193, device="cuda", dtype=torch.int32)
+
+    out, lse = ck.flash_attention_decode_gqa(q, k, v, lengths, return_lse=True, causal=False)
+    expected, expected_lse = flash_attention_module._decode_gqa_torch(
+        q.float(), k.float(), v.float(), lengths, causal=False)
+    torch.testing.assert_close(out.float(), expected, atol=3e-3, rtol=1e-2)
+    torch.testing.assert_close(lse, expected_lse, atol=1e-3, rtol=1e-4)
+
+    xk, xv = k[:, :, 193:193 + rows], v[:, :, 193:193 + rows]
+    mask = (1 << torch.arange(1, rows + 1, device="cuda", dtype=torch.int32)) - 1
+    merged = torch.empty_like(out)
+    assert ck.flash_attention_decode_tree_merge(out, lse, q, xk, xv, mask, merged) is merged
+    expected_merged = torch.empty_like(expected)
+    flash_attention_module._tree_merge_torch(expected, expected_lse, q, xk, xv, mask, expected_merged)
+    torch.testing.assert_close(merged.float(), expected_merged, atol=3e-3, rtol=1e-2)
+
+
 def test_flash_attention_decode_gqa_native_is_bf16_only():
     assert not ck.flash_attention_decode_gqa_is_available(dtype=torch.float16)
     assert not ck.flash_attention_decode_gqa_is_available(dtype=torch.float32)
