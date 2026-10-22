@@ -54,24 +54,18 @@ static void launch_w4a4(const uint8_t* A, const uint8_t* B, OutT* C, int M, int 
     }
     if (M >= 512 && N >= 128 && K > N) {
         // The deep-K branch now takes BKB=128 instead of 64, and that is the whole
-        // point. gfx11's MmaInt4 has **kStepBytes = 8** (gfx12's is 16 -- mma.h's
-        // two MmaInt4 differ exactly there, because gfx11 does K=16 per MMA and
-        // gfx12 K=32), so BKB=64 gives kSteps = 64/8 = 8, and K=8192 (kbytes 4096)
-        // walks **512** K-iterations, each staging only 8 bytes per row. BKB=128
-        // doubles that to 16 steps per iteration and halves the trip count -- the
-        // same trade the int8 heuristic already makes for the same reason ("BKB=128
-        // halves the LDS round trips per K element once K amortizes the coarser
-        // tail", gemm_wmma.h).
+        // point. gfx11's MmaInt4 has **kStepBytes = 8** (gfx12's is 16), so BKB=64
+        // gives 8 steps per iteration and K=8192 walks 512 K-iterations, each
+        // staging only 8 bytes per row. BKB=128 doubles that to 16 steps and
+        // halves the trip count -- the same trade the int8 heuristic makes.
         //
         // The tile is the shallow-K one, 64x64x128 with 2x2 warps of 2x2. On deep K
-        // it beats 256x128 on a second axis too: 64x64 at BKB=128 stages
-        // (64+64)*128 = 16 KB of LDS against 256x128's (256+128)*64 = 24 KB, and
-        // 24 KB is already over a third of this part's 64 KB, so 256x128 runs few
-        // blocks per CU and has nothing to overlap the K loop with.
+        // it beats 256x128 on a second axis too: 64x64 at BKB=128 stages 16 KB of
+        // LDS against 256x128's 24 KB, which is already over a third of this
+        // part's 64 KB, so 256x128 runs few blocks per CU.
         //
         // Measured on the 6-WGP 780M, interleaved in one process against the old
-        // 256x128, output bit-identical in every case (6-10 samples per point).
-        // benchmark_attn/ab_w4a4_deepk.py, K/N/M swept:
+        // 256x128, output bit-identical in every case (6-10 samples per point):
         //
         //   M=8192  N=2048  K=2048    0.985x  <- shallow: BKB=128's coarser tail
         //   M=8192  N=2048  K=4096    1.317x     wins, so the old tile stays
@@ -83,31 +77,18 @@ static void launch_w4a4(const uint8_t* A, const uint8_t* B, OutT* C, int M, int 
         //   M=16384 K=8192  N=2048    1.369x
         //
         // benchmark_attn/ab_w4a4_deepk2.py is the version to re-run: it fixes the
-        // control arm (that launcher could not name its own old tile until
-        // launch_gemm_wmma_forced above learned it), adds a **positive control** at
-        // kbytes < 2048 where both arms run the same tile and the ratio must land
-        // inside noise (it does: 1.000x / 1.003x), and covers the two points the
-        // int8 heuristic's own failed retune missed:
+        // control arm, adds a positive control at kbytes < 2048 where both arms
+        // run the same tile (1.000x / 1.003x), and covers the two points the
+        // int8 heuristic's own failed retune missed -- K=5120 at 1.116x and
+        // M=18432 at 1.343x. 20 of 20 shapes bit-identical, no shape slower.
         //
-        //   K=5120  (SDXL adaLN, inside the int8 regression band)  1.116x
-        //   M=18432 (what ComfyUI CFG at B=2 actually reaches)      1.343x
-        //   M=2048..16384 at K=8192                                  1.343-1.386x
-        //
-        // 20 of 20 shapes bit-identical, no shape slower.
-        //
-        // So the switch is on kbytes. The threshold sits between K=2048 (kbytes
-        // 1024, where one BKB=128 tile is most of the row) and K=4096 (kbytes 2048,
-        // eight tiles); 2048 is the midpoint of that gap and the measured crossing
-        // is there. No Anima or SDXL shape has a K between them, so the exact value
-        // only has to be right for the two shapes that exist.
+        // So the switch is on kbytes, and the threshold sits between K=2048 (one
+        // BKB=128 tile is most of the row) and K=4096 (eight tiles); 2048 is the
+        // midpoint of that gap and the measured crossing is there.
         //
         // **Gated to gfx1103, like the int8 arm beside it in gemm_wmma.h.** Every
-        // number above comes from one 6-WGP part, and the same file's int8 heuristic
-        // already records what happens when a gfx1103-tuned tile is let loose on the
-        // other architectures: "the branch above was tuned against 6 WGPs and is a
-        // regression elsewhere." Nothing here is measured on gfx1035 or gfx12, so
-        // every other architecture keeps upstream's 256x128x64 unchanged -- which is
-        // the only claim backed by a measurement on all of them.
+        // number above comes from one 6-WGP part, so every other architecture keeps
+        // upstream's 256x128x64 unchanged.
         if (comfy_small_igpu() && kbytes >= 2048) {
             constexpr int BM = 64, BN = 64, BKB = 128;
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);

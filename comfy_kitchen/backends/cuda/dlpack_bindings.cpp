@@ -2565,8 +2565,8 @@ extern "C" {
         int64_t o_batch_stride, int64_t o_row_stride, int64_t o_head_stride,
         cudaStream_t stream);
 
-    void launch_flash_decode_step_merge(
-        const void* out, const float* lse, const void* q, const void* k, const void* v, void* merged,
+    void launch_flash_decode_tree_merge(
+        const void* out, const float* lse, const void* q, const void* k, const void* v, const int* mask, void* merged,
         int batch, int rows, int heads, int kv_heads,
         int64_t q_batch_stride, int64_t q_head_stride, int64_t q_row_stride,
         int64_t k_batch_stride, int64_t k_head_stride, int64_t k_row_stride,
@@ -4311,6 +4311,7 @@ void flash_attention_decode_gqa(
     nb::ndarray<float, nb::device::cuda> softmax_lse_accum,
     nb::ndarray<float, nb::device::cuda> output_accum,
     int num_splits,
+    bool causal,
     uintptr_t stream_ptr) {
     constexpr int64_t kHeadDim = 256;
     const int64_t batch = q.shape(0), heads = q.shape(1), query_length = q.shape(2);
@@ -4355,22 +4356,23 @@ void flash_attention_decode_gqa(
         q.data(), k.data(), v.data(), kv_lengths.data(), output.data(), softmax_lse.data(),
         num_splits > 1 ? softmax_lse_accum.data() : nullptr,
         num_splits > 1 ? output_accum.data() : nullptr,
-        static_cast<int>(batch), static_cast<int>(query_length), static_cast<int>(heads), static_cast<int>(kv_heads), static_cast<int>(kv_capacity), num_splits, true,
+        static_cast<int>(batch), static_cast<int>(query_length), static_cast<int>(heads), static_cast<int>(kv_heads), static_cast<int>(kv_capacity), num_splits, causal,
         q.stride(0), q.stride(2), q.stride(1),
         k.stride(0), k.stride(2), k.stride(1),
         output.stride(0), output.stride(1), kHeadDim, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
-// Current-step merge: out [B, S, H*256] and lse [B, H, S] come from a prefix-only
-// decode over the S step rows; q [B, H, S, 256] and
-// k/v [B, Hk, S, 256] are the rows' own rotated query/key/value, and row j folds in step
-// rows t <= j. merged [B, S, H*256] receives the result.
-void flash_attention_decode_step_merge(
+// Verify-tree merge: out [B, S, H*256] and lse [B, H, S] come from a prefix-only
+// flash_attention_decode_gqa (causal = false) over the S verify rows; q [B, H, S, 256] and
+// k/v [B, Hk, S, 256] are the rows' own rotated query/key/value and mask [S] the rows each
+// row must fold in (bit t = row t). merged [B, S, H*256] receives the result.
+void flash_attention_decode_tree_merge(
     nb::ndarray<nb::ndim<3>, nb::device::cuda> out,
     nb::ndarray<float, nb::ndim<3>, nb::device::cuda> lse,
     nb::ndarray<nb::ndim<4>, nb::device::cuda> q,
     nb::ndarray<nb::ndim<4>, nb::device::cuda> k,
     nb::ndarray<nb::ndim<4>, nb::device::cuda> v,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> mask,
     nb::ndarray<nb::ndim<3>, nb::device::cuda> merged,
     uintptr_t stream_ptr) {
     constexpr int64_t kHeadDim = 256;
@@ -4378,20 +4380,22 @@ void flash_attention_decode_step_merge(
     const int64_t kv_heads = k.shape(1);
     if (batch <= 0 || heads <= 0 || rows <= 0 || rows > 8 || kv_heads <= 0 || heads % kv_heads != 0
         || q.shape(3) != kHeadDim || k.shape(0) != batch || k.shape(2) != rows || k.shape(3) != kHeadDim
-        || v.shape(0) != batch || v.shape(1) != kv_heads || v.shape(2) != rows || v.shape(3) != kHeadDim)
-        throw std::runtime_error("Step merge shape mismatch");
+        || v.shape(0) != batch || v.shape(1) != kv_heads || v.shape(2) != rows || v.shape(3) != kHeadDim
+        || mask.shape(0) != rows)
+        throw std::runtime_error("Tree merge shape mismatch");
     if (out.shape(0) != batch || out.shape(1) != rows || out.shape(2) != heads * kHeadDim
         || merged.shape(0) != batch || merged.shape(1) != rows || merged.shape(2) != heads * kHeadDim
         || lse.shape(0) != batch || lse.shape(1) != heads || lse.shape(2) != rows)
-        throw std::runtime_error("Step merge output or lse shape mismatch");
+        throw std::runtime_error("Tree merge output or lse shape mismatch");
     if (map_dtype_to_code(q.dtype()) != 2 || map_dtype_to_code(k.dtype()) != 2 || map_dtype_to_code(v.dtype()) != 2
         || map_dtype_to_code(out.dtype()) != 2 || map_dtype_to_code(merged.dtype()) != 2)
-        throw std::runtime_error("Step merge tensors must have bfloat16 dtype");
+        throw std::runtime_error("Tree merge tensors must have bfloat16 dtype");
     if (q.stride(3) != 1 || k.stride(3) != 1 || v.stride(3) != 1 || out.stride(2) != 1 || merged.stride(2) != 1
         || out.stride(1) != heads * kHeadDim || merged.stride(1) != heads * kHeadDim)
-        throw std::runtime_error("Unsupported step merge strides");
-    launch_flash_decode_step_merge(
-        out.data(), lse.data(), q.data(), k.data(), v.data(), merged.data(),
+        throw std::runtime_error("Unsupported tree merge strides");
+    need_contiguous(mask, "flash_attention_decode_tree_merge", "mask");
+    launch_flash_decode_tree_merge(
+        out.data(), lse.data(), q.data(), k.data(), v.data(), mask.data(), merged.data(),
         static_cast<int>(batch), static_cast<int>(rows), static_cast<int>(heads), static_cast<int>(kv_heads),
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
@@ -4505,7 +4509,7 @@ bool gated_delta_decode_deferred(
     nb::ndarray<nb::ndim<4>, nb::device::cuda> qkv_buf,        // [2, B, C, 8] conv+silu output
     nb::ndarray<float, nb::ndim<5>, nb::device::cuda> gates_buf,   // [2, B, 8, Hv, 2]
     nb::ndarray<float, nb::ndim<5>, nb::device::cuda> sumsq_buf,   // [2, B, 8, Hk, 2]
-    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> ctl,   // {pending, parity}
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> ctl,   // {pending, parity, slot[8], parent[8], prog[8]}
     nb::ndarray<float, nb::ndim<4>, nb::device::cuda> state,   // [B, Hv, DK, DV]
     nb::ndarray<nb::ndim<4>, nb::device::cuda> out,            // [B, S, Hv, DV]
     nb::ndarray<nb::ndim<3>, nb::device::cuda> z,              // [B, S, Hv*DV] norm gate
@@ -4531,7 +4535,7 @@ bool gated_delta_decode_deferred(
         || qkv_buf.shape(0) != 2 || qkv_buf.shape(1) != B || qkv_buf.shape(3) != 8
         || gates_buf.shape(0) != 2 || gates_buf.shape(1) != B || gates_buf.shape(2) != 8 || gates_buf.shape(3) != Hv || gates_buf.shape(4) != 2
         || sumsq_buf.shape(0) != 2 || sumsq_buf.shape(1) != B || sumsq_buf.shape(2) != 8 || sumsq_buf.shape(3) != num_key_heads || sumsq_buf.shape(4) != 2
-        || ctl.shape(0) != 2)
+        || ctl.shape(0) != 26)
         throw std::runtime_error(std::string(who) + ": shape mismatch");
     need_contiguous(x, who, "x");
     need_contiguous(w_a, who, "w_a");
@@ -4561,7 +4565,7 @@ bool deltanet_conv_deferred(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> conv_w,      // [C, KS]
     std::optional<nb::ndarray<nb::ndim<1>, nb::device::cuda>> conv_b,  // [C]
     nb::ndarray<nb::ndim<4>, nb::device::cuda> qkv_buf,     // [2, B, C, 8]
-    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> ctl,   // {pending, parity}
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> ctl,   // {pending, parity, slot[8], parent[8], prog[8]}
     uintptr_t stream_ptr) {
     const char* who = "deltanet_conv_deferred";
     const int64_t B = proj.shape(0), S = proj.shape(1), C = proj.shape(2);
@@ -4575,7 +4579,7 @@ bool deltanet_conv_deferred(
     if (conv_state.shape(0) != B || conv_state.shape(1) != C || L != KS - 1 || conv_w.shape(0) != C
         || proj_buf.shape(0) != 2 || proj_buf.shape(1) != B || proj_buf.shape(2) != 8 || proj_buf.shape(3) != C
         || qkv_buf.shape(0) != 2 || qkv_buf.shape(1) != B || qkv_buf.shape(2) != C || qkv_buf.shape(3) != 8
-        || ctl.shape(0) != 2
+        || ctl.shape(0) != 26
         || (conv_b.has_value() && conv_b->shape(0) != C))
         throw std::runtime_error(std::string(who) + ": shape mismatch");
     const int64_t ldp = row_stride_3d(proj, who, "proj");
@@ -5270,14 +5274,14 @@ NB_MODULE(_C, m) {
           nb::arg("output"), nb::arg("softmax_lse"), nb::arg("softmax_lse_accum"),
           nb::arg("output_accum"), nb::arg("num_splits"), nb::arg("stream_ptr"));
     m.def("flash_attention_decode_gqa", &flash_attention_decode_gqa,
-          "Causal GQA decode attention (head_dim 256) over a [batch, kv_heads, capacity, 256] cache",
+          "GQA decode attention (head_dim 256) over a [batch, kv_heads, capacity, 256] cache; causal = the verify staircase",
           nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("kv_lengths"),
           nb::arg("output"), nb::arg("softmax_lse"), nb::arg("softmax_lse_accum"),
-          nb::arg("output_accum"), nb::arg("num_splits"), nb::arg("stream_ptr"));
+          nb::arg("output_accum"), nb::arg("num_splits"), nb::arg("causal"), nb::arg("stream_ptr"));
 
-    m.def("flash_attention_decode_step_merge", &flash_attention_decode_step_merge,
-          "Fold the current step's rows causally into a prefix-only GQA decode result using its log-sum-exp",
-          nb::arg("out"), nb::arg("lse"), nb::arg("q"), nb::arg("k"), nb::arg("v"),
+    m.def("flash_attention_decode_tree_merge", &flash_attention_decode_tree_merge,
+          "Fold a verify tree's own rows into a prefix-only GQA decode result using its log-sum-exp",
+          nb::arg("out"), nb::arg("lse"), nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("mask"),
           nb::arg("merged"), nb::arg("stream_ptr"));
 
     m.def("cutlass_fp16_conv3d", &cutlass_fp16_conv3d,

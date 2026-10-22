@@ -125,7 +125,7 @@ def flash_attention_decode(
 def flash_attention_decode_gqa_is_available(
     device: torch.device | int | None = None, dtype: torch.dtype = torch.bfloat16
 ) -> bool:
-    """Return whether flash_attention_decode_gqa and flash_attention_decode_step_merge run
+    """Return whether flash_attention_decode_gqa and flash_attention_decode_tree_merge run
     their native kernel on ``device`` for ``dtype`` inputs: BF16, head_dim 256, the CUDA
     extension on SM80 or newer or the HIP extension on RDNA3 or newer. Both functions
     otherwise compute the same result in torch."""
@@ -149,7 +149,7 @@ def _hip_groups_per_pass(rows: int, head_dim: int) -> int:
     return gpp
 
 
-def _decode_gqa_torch(q, k, v, kv_lengths):
+def _decode_gqa_torch(q, k, v, kv_lengths, causal):
     batch, heads, query_length, head_dim = q.shape
     _, kv_heads, kv_capacity, _ = k.shape
     groups = heads // kv_heads
@@ -157,28 +157,37 @@ def _decode_gqa_torch(q, k, v, kv_lengths):
                           k.float().transpose(-1, -2)) * head_dim ** -0.5
     # the kernels' kv_lengths clamp and bottom-right causal staircase, per (batch, row)
     limit = kv_lengths.to(torch.int64).clamp(0, kv_capacity).view(batch, 1, 1)
-    limit = limit - query_length + 1 + torch.arange(query_length, device=q.device)
+    if causal:
+        limit = limit - query_length + 1 + torch.arange(query_length, device=q.device)
     limit = limit.expand(batch, 1, query_length).repeat(1, 1, groups).unsqueeze(-1)
     scores.masked_fill_(torch.arange(kv_capacity, device=q.device) >= limit, float("-inf"))
     lse = scores.logsumexp(-1)
     # an empty range (no slot) is written as zeros, not 0/0
     probs = torch.exp(scores - lse.masked_fill(lse == float("-inf"), 0.0).unsqueeze(-1))
     out = torch.matmul(probs, v.float()).view(batch, kv_heads, groups, query_length, head_dim)
-    return out.permute(0, 3, 1, 2, 4).reshape(batch, query_length, heads * head_dim).to(q.dtype)
+    return (out.permute(0, 3, 1, 2, 4).reshape(batch, query_length, heads * head_dim).to(q.dtype),
+            lse.view(batch, heads, query_length))
 
 
 def flash_attention_decode_gqa(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_lengths: torch.Tensor,
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_lengths: torch.Tensor, return_lse: bool = False,
+    causal: bool = True,
 ) -> torch.Tensor:
     """GQA decode attention for q [B, H, S, D] over k/v [B, Hk, capacity, D].
 
-    Query row j of batch b attends cache slots < kv_lengths[b] - S + j + 1 (the
-    speculative verify staircase; S == 1 is plain decode). Returns [B, S, H*D].
-    BF16 head_dim 256 runs the CUDA or HIP kernel; anything else the same computation in torch."""
+    Causal: query row j of batch b attends cache slots < kv_lengths[b] - S + j + 1 (the
+    speculative verify staircase; S == 1 is plain decode). Otherwise every row attends slots <
+    kv_lengths[b], which is how a verify tree reads its committed prefix. Returns
+    [B, S, H*D], with the fp32 log-sum-exp of the scaled scores [B, H, S] as a second value
+    when return_lse. BF16 head_dim 256 runs the CUDA or HIP kernel; anything else the same
+    computation in torch."""
     batch, heads, query_length, head_dim = q.shape
     _, kv_heads, kv_capacity, _ = k.shape
     if head_dim != 256 or not flash_attention_decode_gqa_is_available(q.device, q.dtype):
-        return _decode_gqa_torch(q, k, v, kv_lengths)
+        output, softmax_lse = _decode_gqa_torch(q, k, v, kv_lengths, causal)
+        if return_lse:
+            return output, softmax_lse
+        return output
     output = torch.empty((batch, query_length, heads * head_dim), dtype=q.dtype, device=q.device)
     multiprocessors = torch.cuda.get_device_properties(q.device).multi_processor_count
     rows = batch * heads * query_length
@@ -202,7 +211,8 @@ def flash_attention_decode_gqa(
         softmax_lse_accum = output_accum = softmax_lse[:0]
     if _hip_backend is not None:
         _hip_backend.flash_decode_gqa(
-            q, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum, num_splits)
+            q, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum, num_splits,
+            causal)
     else:
         _cuda_backend._C.flash_attention_decode_gqa(
             *map(
@@ -210,19 +220,22 @@ def flash_attention_decode_gqa(
                 (q, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum),
             ),
             num_splits,
+            causal,
             torch.cuda.current_stream(q.device).cuda_stream,
         )
+    if return_lse:
+        return output, softmax_lse.view(batch, heads, query_length)
     return output
 
 
-def _step_merge_torch(out, lse, q, k, v, merged):
+def _tree_merge_torch(out, lse, q, k, v, mask, merged):
     batch, heads, rows, head_dim = q.shape
     groups = heads // k.shape[1]
     kf = k.float().repeat_interleave(groups, dim=1)
     vf = v.float().repeat_interleave(groups, dim=1)
     scores = torch.matmul(q.float(), kf.transpose(-1, -2)) * head_dim ** -0.5  # [B, H, row, t]
-    causal = torch.ones(rows, rows, dtype=torch.bool, device=q.device).tril()
-    scores.masked_fill_(~causal, float("-inf"))
+    allowed = (mask.view(rows, 1) >> torch.arange(rows, device=q.device)) & 1
+    scores.masked_fill_(allowed == 0, float("-inf"))
     m = torch.maximum(lse, scores.amax(-1))
     w_flash = torch.exp(lse - m)
     w = torch.exp(scores - m.unsqueeze(-1))
@@ -233,23 +246,32 @@ def _step_merge_torch(out, lse, q, k, v, merged):
     return merged
 
 
+def flash_attention_decode_tree_merge(
+    out: torch.Tensor, lse: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    mask: torch.Tensor, merged: torch.Tensor,
+) -> torch.Tensor:
+    """Fold a verify tree's own rows into a prefix-only decode result.
+
+    ``out`` [B, S, H*D] and ``lse`` [B, H, S] come from flash_attention_decode_gqa over the
+    committed prefix with causal=False; q [B, H, S, D] and k/v [B, Hk, S, D] are the verify
+    rows' own rotated query/key/value, and mask [S] int32 the rows each row attends inside the
+    step (bit t = row t, including itself). Writes and returns ``merged`` [B, S, H*D]."""
+    if q.shape[-1] != 256 or not flash_attention_decode_gqa_is_available(q.device, q.dtype):
+        return _tree_merge_torch(out, lse, q, k, v, mask, merged)
+    if _hip_backend is not None:
+        _hip_backend.flash_decode_tree_merge(out, lse, q, k, v, mask, merged)
+        return merged
+    _cuda_backend._C.flash_attention_decode_tree_merge(
+        *map(_cuda_backend._wrap_for_dlpack, (out, lse, q, k, v, mask, merged)),
+        torch.cuda.current_stream(q.device).cuda_stream,
+    )
+    return merged
+
+
 def flash_attention_decode_step_merge(
     out: torch.Tensor, lse: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     merged: torch.Tensor,
 ) -> torch.Tensor:
-    """Fold the current step's own rows causally into a prefix-only decode result.
-
-    ``out`` [B, S, H*D] and ``lse`` [B, H, S] describe attention over the committed
-    prefix; q [B, H, S, D] and k/v [B, Hk, S, D] are the step
-    rows' own rotated query/key/value, and row j additionally attends step rows t <= j.
-    Writes and returns ``merged`` [B, S, H*D]."""
-    if q.shape[-1] != 256 or not flash_attention_decode_gqa_is_available(q.device, q.dtype):
-        return _step_merge_torch(out, lse, q, k, v, merged)
-    if _hip_backend is not None:
-        _hip_backend.flash_decode_step_merge(out, lse, q, k, v, merged)
-        return merged
-    _cuda_backend._C.flash_attention_decode_step_merge(
-        *map(_cuda_backend._wrap_for_dlpack, (out, lse, q, k, v, merged)),
-        torch.cuda.current_stream(q.device).cuda_stream,
-    )
-    return merged
+    """Fold the current step's rows causally into a prefix-only decode result."""
+    mask = (1 << torch.arange(1, q.shape[2] + 1, device=q.device, dtype=torch.int32)) - 1
+    return flash_attention_decode_tree_merge(out, lse, q, k, v, mask, merged)

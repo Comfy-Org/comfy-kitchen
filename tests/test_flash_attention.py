@@ -306,7 +306,7 @@ def test_flash_attention_decode_rejects_invalid_dimensions(q_dim, k_dim, v_dim):
         ck.flash_attention_decode(q, k, v, lengths)
 
 
-# flash_attention_decode_gqa and flash_attention_decode_step_merge compute the same result
+# flash_attention_decode_gqa and flash_attention_decode_tree_merge compute the same result
 # everywhere: the native kernel for BF16 head_dim 256 where one is built, torch otherwise.
 # The reference tests run on the GPU when there is one (native for bf16/256, torch for the
 # other operands) and on the CPU otherwise.
@@ -315,44 +315,57 @@ GQA_OPERANDS = [(torch.bfloat16, 256), (torch.float32, 256), (torch.bfloat16, 12
 
 
 @pytest.mark.parametrize(("dtype", "head_dim"), GQA_OPERANDS)
-@pytest.mark.parametrize("rows", [1, 8])
-def test_flash_attention_decode_step_merge_matches_full_softmax(dtype, head_dim, rows):
-    # Verify rows read the committed prefix through one decode pass and fold the step's own
-    # rows in afterwards, row r seeing step rows t <= r. Row r must then equal a plain softmax
-    # over the prefix plus step rows 0..r.
+@pytest.mark.parametrize("parent", [[-1], [-1, 0, 1, 2, 3, 4, 5, 6], [-1, 0, 1, 2, 0, 1, 4, 4]])
+def test_flash_attention_decode_tree_merge_matches_full_softmax(dtype, head_dim, parent):
+    # A verify tree's rows read the committed prefix through one non-causal decode pass and
+    # fold their own ancestors in afterwards. Row r must then equal a plain softmax over the
+    # prefix plus exactly the slots on its root-to-r path.
     torch.manual_seed(0)
-    batch, kv_heads, groups, prefix = 2, 2, 4, 37
+    batch, kv_heads, groups, capacity, prefix = 2, 2, 4, 96, 37
     heads = kv_heads * groups
-    prefix_k = torch.randn(batch, kv_heads, prefix, head_dim, device=GQA_DEVICE, dtype=dtype)
-    prefix_v = torch.randn_like(prefix_k)
+    rows = len(parent)
+    key = torch.randn(batch, kv_heads, capacity, head_dim, device=GQA_DEVICE, dtype=dtype)
+    value = torch.randn_like(key)
     q = torch.randn(batch, heads, rows, head_dim, device=GQA_DEVICE, dtype=dtype)
     xk = torch.randn(batch, kv_heads, rows, head_dim, device=GQA_DEVICE, dtype=dtype)
     xv = torch.randn_like(xk)
+    key[:, :, prefix:prefix + rows] = xk
+    value[:, :, prefix:prefix + rows] = xv
 
-    def scores_values(k, v):
-        scores = torch.einsum("bhsd,bhcd->bhsc", q.float(), k.repeat_interleave(groups, dim=1).float())
-        return scores * head_dim ** -0.5, v.repeat_interleave(groups, dim=1).float()
+    def path(r):
+        out = []
+        while r >= 0:
+            out.append(r)
+            r = parent[r]
+        return out[::-1]
 
-    def attend(scores, values):
-        return torch.einsum("bhsc,bhcd->bshd", scores.softmax(-1), values).reshape(batch, rows, -1)
-
-    # the prefix-only decode result in the layout flash_attention_decode_gqa writes
-    prefix_scores, prefix_values = scores_values(prefix_k, prefix_v)
-    out = attend(prefix_scores, prefix_values).to(dtype)
+    mask = torch.tensor([sum(1 << t for t in path(r)) for r in range(rows)], dtype=torch.int32, device=GQA_DEVICE)
+    lengths = torch.full((batch,), prefix, device=GQA_DEVICE, dtype=torch.int32)
+    out, lse = ck.flash_attention_decode_gqa(q, key, value, lengths, return_lse=True, causal=False)
     merged = torch.empty_like(out)
-    ck.flash_attention_decode_step_merge(out, prefix_scores.logsumexp(-1), q, xk, xv, merged)
+    ck.flash_attention_decode_tree_merge(out, lse, q, xk, xv, mask, merged)
 
-    step_scores, step_values = scores_values(xk, xv)
-    future = torch.ones(rows, rows, dtype=torch.bool, device=GQA_DEVICE).triu(1)
-    expected = attend(torch.cat([prefix_scores, step_scores.masked_fill(future, float("-inf"))], dim=-1),
-                      torch.cat([prefix_values, step_values], dim=2))
+    kf = key.repeat_interleave(groups, dim=1).float()
+    vf = value.repeat_interleave(groups, dim=1).float()
+    expected = torch.empty(batch, rows, heads * head_dim, device=GQA_DEVICE, dtype=torch.float32)
+    for r in range(rows):
+        cols = list(range(prefix)) + [prefix + t for t in path(r)]
+        scores = (q[:, :, r].float().unsqueeze(2) * kf[:, :, cols]).sum(-1) * head_dim ** -0.5
+        probs = scores.softmax(dim=-1)
+        expected[:, r] = (probs.unsqueeze(-1) * vf[:, :, cols]).sum(2).reshape(batch, heads * head_dim)
     torch.testing.assert_close(merged.float(), expected, atol=3e-3, rtol=1e-2)
+
+    if parent == list(range(-1, rows - 1)):
+        causal = torch.empty_like(out)
+        assert ck.flash_attention_decode_step_merge(out, lse, q, xk, xv, causal) is causal
+        torch.testing.assert_close(causal.float(), expected, atol=3e-3, rtol=1e-2)
 
 
 @pytest.mark.parametrize(("dtype", "head_dim"), GQA_OPERANDS)
 @pytest.mark.parametrize("query_length", [1, 3, 7, 8])
-def test_flash_attention_decode_gqa_matches_reference(query_length, dtype, head_dim):
-    # row j of batch b sees slots < kv_lengths[b] - S + j + 1
+@pytest.mark.parametrize("causal", [True, False])
+def test_flash_attention_decode_gqa_matches_reference(query_length, causal, dtype, head_dim):
+    # Causal rows see the staircase; non-causal rows all see the committed prefix.
     torch.manual_seed(0)
     batch, kv_heads, groups, capacity = 2, 2, 4, 300
     heads = kv_heads * groups
@@ -360,17 +373,21 @@ def test_flash_attention_decode_gqa_matches_reference(query_length, dtype, head_
     k = torch.randn(batch, kv_heads, capacity, head_dim, device=GQA_DEVICE, dtype=dtype)
     v = torch.randn_like(k)
     lengths = [query_length + 5, 281]
-    out = ck.flash_attention_decode_gqa(q, k, v, torch.tensor(lengths, device=GQA_DEVICE, dtype=torch.int32))
+    out, lse = ck.flash_attention_decode_gqa(
+        q, k, v, torch.tensor(lengths, device=GQA_DEVICE, dtype=torch.int32), return_lse=True, causal=causal)
 
     kf = k.repeat_interleave(groups, dim=1).float()
     vf = v.repeat_interleave(groups, dim=1).float()
     scores = torch.einsum("bhsd,bhcd->bhsc", q.float(), kf) * head_dim ** -0.5
     cols = torch.arange(capacity, device=GQA_DEVICE)
     for b, length in enumerate(lengths):
-        limit = length - query_length + 1 + torch.arange(query_length, device=GQA_DEVICE)
+        limit = torch.full((query_length,), length, device=GQA_DEVICE)
+        if causal:
+            limit = limit - query_length + 1 + torch.arange(query_length, device=GQA_DEVICE)
         scores[b].masked_fill_(cols[None, None, :] >= limit[None, :, None], float("-inf"))
     expected = torch.einsum("bhsc,bhcd->bshd", scores.softmax(-1), vf).reshape(batch, query_length, -1)
     torch.testing.assert_close(out.float(), expected, atol=3e-3, rtol=1e-2)
+    torch.testing.assert_close(lse, scores.logsumexp(-1), atol=1e-3, rtol=1e-4)
 
 
 def test_flash_attention_decode_gqa_native_is_bf16_only():
@@ -383,5 +400,5 @@ def test_flash_attention_decode_gqa_torch_empty_prefix_is_zero():
     q = torch.randn(1, 4, 1, 256, device=GQA_DEVICE, dtype=torch.float32)
     k = torch.randn(1, 2, 64, 256, device=GQA_DEVICE, dtype=torch.float32)
     lengths = torch.zeros(1, device=GQA_DEVICE, dtype=torch.int32)
-    out = ck.flash_attention_decode_gqa(q, k, k, lengths)
+    out = ck.flash_attention_decode_gqa(q, k, k, lengths, causal=False)
     assert torch.equal(out, torch.zeros_like(out))

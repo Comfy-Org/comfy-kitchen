@@ -177,7 +177,7 @@ def test_valu_gemm_gate_is_the_gfx103x_gate_and_not_a_parallel_one():
     So this asserts the two agree, exactly, rather than asserting that the constant
     is a plausible-looking set of gfx103x parts.
     """
-    assert hip_backend._ARCH_VALU_GEMM == _comfy_is_gfx10_archs()
+    assert _comfy_is_gfx10_archs() == hip_backend._ARCH_VALU_GEMM
     assert hip_backend._ARCH_VALU_GEMM == hip_backend._ARCH_ELEMENTWISE_ONLY
 
 
@@ -442,6 +442,8 @@ def test_architecture_manifest_is_unique_and_shared_by_setup_and_runtime():
     assert set(groups["elementwise_only"]) == hip_backend._ARCH_ELEMENTWISE_ONLY
     assert set(groups["wmma_gfx11"]) == hip_backend._ARCH_WMMA_GFX11
     assert set(groups["wmma_gfx12"]) == hip_backend._ARCH_WMMA_GFX12
+    assert "gfx1200" in groups["wmma_gfx12"]
+    assert "gfx1201" in groups["wmma_gfx12"]
     assert set(manifest_archs) == hip_backend._ARCH_SUPPORTED
 
 
@@ -462,6 +464,19 @@ def test_cmake_reads_and_validates_the_shared_architecture_manifest():
     assert "IN_LIST COMFY_HIP_SUPPORTED_ARCHS" in text
     assert "configure_file(" in text
     assert not re.search(r'"gfx\d', text)
+
+    read_groups = re.findall(r"_ck_read_arch_group\(\w+ (\w+)\)", text)
+    assert tuple(read_groups) == _HIP_ARCH_GROUP_NAMES
+
+
+def test_cmake_uses_only_gfx12_group_for_gfx12_wmma_policy():
+    text = _HIP_CMAKE.read_text(encoding="utf-8")
+
+    gfx12_condition = re.search(
+        r"_ck_make_arch_condition\(COMFY_HIP_GFX12_CONDITION(.*?)\)", text, re.DOTALL
+    )
+    assert gfx12_condition is not None
+    assert "COMFY_HIP_WMMA_GFX12_ARCHS" in gfx12_condition.group(1)
 
 
 def test_mma_architecture_macros_are_generated_from_the_manifest():

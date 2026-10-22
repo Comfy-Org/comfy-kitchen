@@ -6,36 +6,28 @@
 // Where this stands against the memory system, so nobody re-derives it.
 //
 // Measured streaming ceilings on the 6-CU gfx1035 (16 B per lane per request,
-// footprints past the 2 MiB L2, so DRAM not cache):
+// footprints past the 2 MiB L2, so DRAM not cache): read only 88.2 GB/s, copy
+// (read+write) 70.1 GB/s, write only 69.9 GB/s, triad 69.0 GB/s. An earlier note
+// in this project recorded "89.7 GB/s" as *the* ceiling -- that is the read
+// number, and it was wrong the moment it was used as the denominator for a kernel
+// that also writes. The rowwise quantiser has a 2:1 read:write ratio, so its
+// ceiling is the copy number.
 //
-//   read only             88.2 GB/s
-//   copy    (read+write)  70.1 GB/s
-//   write only            69.9 GB/s
-//   triad   (2r + 1w)     69.0 GB/s
-//   copy at 4 B per lane  64.4 GB/s
-//
-// An earlier note in this project recorded "89.7 GB/s" as *the* ceiling. That is
-// the read number, so it was right as a read ceiling and wrong the moment it was
-// used as the denominator for a kernel that also writes -- read+write tops out at
-// 70, and the rowwise quantiser has a 2:1 read:write ratio, so its ceiling is the
-// copy number and nothing above it.
-//
-// Against that ceiling, the rowwise quantiser's own traffic is exact and small:
-// read M*K*esize, write M*K int8 plus 4*M of scales, so 3*M*K + 4*M bytes for
-// fp16 in. Measured:
+// Its own traffic is exact and small: read M*K*esize, write M*K int8 plus 4*M of
+// scales, so 3*M*K + 4*M bytes for fp16 in. Measured:
 //
 //   12288 x 8192   302.0 MB   3.957 ms   76.3 GB/s   109% of copy
 //    4096 x 4096    50.3 MB   0.659 ms   76.4 GB/s   109%
 //   12288 x 2048    75.5 MB   1.023 ms   73.8 GB/s   105%
 //    3072 x 1280    11.8 MB   0.192 ms   61.6 GB/s    88%
 //
-// It is at the memory limit and reads above the copy ceiling because its writes
-// are dense int8 and its read:write ratio is 2:1 rather than 1:1, which leaves
-// more of the read headroom. There is no headroom left here; the vectorised
-// 16-byte path below is what put it there (it was 0.56x of triton's before, and
-// 68.9 GB/s instead of 148). The only remaining overhead is the two torch.empty
-// calls in the public wrapper, 1.01-1.17x on top, which is allocator cost and not
-// worth an aliasing buffer to avoid.
+// It reads above the copy ceiling because its writes are dense int8 and its
+// read:write ratio is 2:1 rather than 1:1, which leaves more of the read
+// headroom. There is no headroom left here; the vectorised 16-byte path below is
+// what put it there (it was 0.56x of triton's before, and 68.9 GB/s instead of
+// 148). The only remaining overhead is the two torch.empty calls in the public
+// wrapper, 1.01-1.17x on top, which is allocator cost and not worth an aliasing
+// buffer to avoid.
 #include <stdexcept>
 
 #include "../hadamard.h"
@@ -44,6 +36,31 @@
 namespace comfy::hip_backend {
 
 constexpr float kInt8Max = 127.0f;
+
+inline bool use_convrot_transposed_bf16(int in_code, int M, int K, int group_size) {
+    if (in_code != 2 || group_size != 256 || M < 1024 || K < 2560 || K > 16384) {
+        return false;
+    }
+
+    // ROCm 10.1 model-shape sweep favors transposed from 1024 rows, including
+    // the 1088/1115-row image workloads. Keep one row cut, not a width table.
+    return use_nonduplicated_wmma_schedule() && convrot_512x2_supported(K);
+}
+
+template <int ACT, bool TILED_QOUT>
+static void launch_convrot_quant_int8(
+    const void* x, int in_code, int8_t* q, float* scales,
+    int M, int K, int group_size, hipStream_t stream,
+    void* spill_rotated, void* spill_partials) {
+    if (use_convrot_transposed_bf16(in_code, M, K, group_size)) {
+        launch_convrot_quant_transposed_bf16<ACT, TILED_QOUT>(
+            x, q, scales, M, K, stream);
+    } else {
+        launch_convrot_quant<false, ACT, TILED_QOUT>(
+            x, in_code, q, scales, M, K, group_size, stream,
+            spill_rotated, spill_partials);
+    }
+}
 
 __forceinline__ __device__ int8_t quant_round(float v, float inv) {
     // rintf is round-half-to-even, matching torch.round.
@@ -288,6 +305,7 @@ __global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel_staged(
 // reduction.
 //
 // Output is bit-identical to the scalar version for all three input dtypes.
+template <bool TILED_QOUT>
 __global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel(
     const void* __restrict__ x, int in_code, int8_t* __restrict__ q,
     float* __restrict__ scales, int M, int K) {
@@ -339,12 +357,13 @@ __global__ __launch_bounds__(256) void quantize_int8_rowwise_kernel(
                               static_cast<const char*>(x) + (base + j * width) *
                                   (in_code == 0 ? 4 : 2)),
                           tmp, in_code);
-            quant_store_vec_rt(tmp, q + base + j * width, inv, width);
+            quant_store_vec_rt(tmp, q + int8_quant_index<TILED_QOUT>(row, j * width, K),
+                                inv, width);
         }
     } else {
         for (int j = t; j < K; j += 256) {
             const float v = load_in(x, base + j, in_code);
-            q[base + j] = quant_round(v, inv);
+            q[int8_quant_index<TILED_QOUT>(row, j, K)] = quant_round(v, inv);
         }
     }
 }
@@ -481,7 +500,7 @@ __global__ __launch_bounds__(256) void dequantize_int8_convrot_weight_kernel(
 
 namespace comfy::hip_backend {
 
-template <int ACT>
+template <int ACT, bool TILED_QOUT>
 struct LaunchConvrotQuantGlobalManaged {
     const void* x;
     int in_dtype;
@@ -495,14 +514,14 @@ struct LaunchConvrotQuantGlobalManaged {
 
     template <typename RowT>
     void operator()() const {
-        launch_convrot_quant_global<RowT, ACT>(
+        launch_convrot_quant_global<RowT, ACT, TILED_QOUT>(
             x, in_dtype, qout, scaleout, M, K,
             static_cast<RowT*>(spill_rotated),
             static_cast<float*>(spill_partials), stream);
     }
 };
 
-template <int ACT>
+template <int ACT, bool TILED_QOUT>
 void launch_convrot_quant_global_managed(
     const void* x, int in_dtype, int8_t* qout, float* scaleout, int M, int K, hipStream_t stream,
     void* spill_rotated, void* spill_partials) {
@@ -512,7 +531,7 @@ void launch_convrot_quant_global_managed(
 
     dispatch_convrot_row_type(
         in_dtype,
-        LaunchConvrotQuantGlobalManaged<ACT>{
+        LaunchConvrotQuantGlobalManaged<ACT, TILED_QOUT>{
             x,
             in_dtype,
             qout,
@@ -532,23 +551,38 @@ template void launch_convrot_quant_global_managed<kActSwiGLU>(
     const void*, int, int8_t*, float*, int, int, hipStream_t, void*, void*);
 template void launch_convrot_quant_global_managed<kActSiTU>(
     const void*, int, int8_t*, float*, int, int, hipStream_t, void*, void*);
+template void launch_convrot_quant_global_managed<kActNone, true>(
+    const void*, int, int8_t*, float*, int, int, hipStream_t, void*, void*);
+template void launch_convrot_quant_global_managed<kActGeluTanh, true>(
+    const void*, int, int8_t*, float*, int, int, hipStream_t, void*, void*);
+template void launch_convrot_quant_global_managed<kActSwiGLU, true>(
+    const void*, int, int8_t*, float*, int, int, hipStream_t, void*, void*);
+template void launch_convrot_quant_global_managed<kActSiTU, true>(
+    const void*, int, int8_t*, float*, int, int, hipStream_t, void*, void*);
 
 }  // namespace comfy::hip_backend
 
 extern "C" void launch_quantize_int8_rowwise_kernel(
-    const void* x, int in_code, void* q, void* scales, int M, int K, hipStream_t stream) {
+    const void* x, int in_code, void* q, void* scales, int M, int K,
+    bool tiled_output, hipStream_t stream) {
 
     using namespace comfy::hip_backend;
+    if (tiled_output && K % 128 != 0) {
+        throw std::runtime_error("quantize_int8: tiled output requires K divisible by 128");
+    }
     if (M == 0) {
         return;  // a zero-block launch is hipErrorInvalidConfiguration
     }
     // Architecture dispatch: the staged kernel is the gfx1103 iGPU tuning; every
-    // other GPU runs the upstream scalar kernel above.
-    if (comfy_small_igpu()) {
+    // other GPU runs the shared kernel above.
+    if (comfy_small_igpu() && !tiled_output) {
         quantize_int8_rowwise_kernel_staged<<<M, 256, 0, stream>>>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales), M, K);
+    } else if (tiled_output) {
+        quantize_int8_rowwise_kernel<true><<<M, 256, 0, stream>>>(
+            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales), M, K);
     } else {
-        quantize_int8_rowwise_kernel<<<M, 256, 0, stream>>>(
+        quantize_int8_rowwise_kernel<false><<<M, 256, 0, stream>>>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales), M, K);
     }
 }
@@ -556,7 +590,8 @@ extern "C" void launch_quantize_int8_rowwise_kernel(
 // Fused ConvRot rotation + rowwise int8 quantize. act_code: 0 none, 1 gelu tanh,
 // 2 swiglu, 3 rms_norm (G=256 only, weight in the input dtype), 4 situ. K is the
 // activated (written) width; swiglu and situ read a row twice as wide.
-extern "C" void launch_quantize_int8_convrot_kernel(
+template <bool TILED_QOUT>
+static void launch_quantize_int8_convrot(
     const void* x, int in_code, void* q, void* scales, void* spill_rotated, void* spill_partials,
     int M, int K, int group_size, int act_code, const void* act_weight, float act_eps,
     hipStream_t stream) {
@@ -568,33 +603,75 @@ extern "C" void launch_quantize_int8_convrot_kernel(
     if (act_code == kActRmsNorm && group_size != 256) {
         throw std::runtime_error("convrot: rms_norm activation requires group_size 256");
     }
-    if (M == 0) {
-        return;  // a zero-block launch is hipErrorInvalidConfiguration
+    if (TILED_QOUT && K % 128 != 0) {
+        throw std::runtime_error("convrot: tiled output requires K divisible by 128");
     }
+    if (M == 0) return;
     if (act_code == kActRmsNorm) {
-        launch_convrot_quant_rms_norm(
+        launch_convrot_quant_rms_norm<TILED_QOUT>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
             M, K, act_weight, act_eps, stream);
     } else if (act_code == kActGeluTanh) {
-        launch_convrot_quant<false, kActGeluTanh>(
+        launch_convrot_quant_int8<kActGeluTanh, TILED_QOUT>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
             M, K, group_size, stream, spill_rotated, spill_partials);
     } else if (act_code == kActSwiGLU) {
-        launch_convrot_quant<false, kActSwiGLU>(
+        launch_convrot_quant_int8<kActSwiGLU, TILED_QOUT>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
             M, K, group_size, stream, spill_rotated, spill_partials);
     } else if (act_code == kActSiTU) {
-        launch_convrot_quant<false, kActSiTU>(
+        launch_convrot_quant<false, kActSiTU, TILED_QOUT>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
             M, K, group_size, stream, spill_rotated, spill_partials);
     } else {
-        launch_convrot_quant<false, kActNone>(
+        launch_convrot_quant_int8<kActNone, TILED_QOUT>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
             M, K, group_size, stream, spill_rotated, spill_partials);
     }
 }
 
-// Returns 1 when INT8 G=256 must use the global spill path for (M, K, in_dtype).
+extern "C" void launch_quantize_int8_convrot_kernel(
+    const void* x, int in_code, void* q, void* scales, void* spill_rotated, void* spill_partials,
+    int M, int K, int group_size, int act_code, const void* act_weight, float act_eps,
+    bool tiled_output, hipStream_t stream) {
+    if (tiled_output) {
+        launch_quantize_int8_convrot<true>(
+            x, in_code, q, scales, spill_rotated, spill_partials, M, K,
+            group_size, act_code, act_weight, act_eps, stream);
+    } else {
+        launch_quantize_int8_convrot<false>(
+            x, in_code, q, scales, spill_rotated, spill_partials, M, K,
+            group_size, act_code, act_weight, act_eps, stream);
+    }
+}
+
+// Fold exact batch-one BF16 scale modulation into the ConvRot producer.
+extern "C" void launch_quantize_int8_convrot_modulated_kernel(
+    const void* x, const void* modulation_scale, void* q, void* scales,
+    int M, int K, int group_size, bool tiled_output, hipStream_t stream) {
+
+    using namespace comfy::hip_backend;
+    if (K <= 0 || group_size != 256 || !convrot_512x2_supported(K)) {
+        throw std::runtime_error(
+            "convrot modulated: requires positive K, group_size=256, and "
+            "sufficient wave32/LDS capacity");
+    }
+    check_convrot_k(K, group_size, 2);
+    if (M == 0) return;
+    if (tiled_output) {
+        launch_convrot_quant_512x2_bf16_modulated<true>(
+            x, modulation_scale, static_cast<int8_t*>(q),
+            static_cast<float*>(scales), M, K, stream);
+    } else {
+        launch_convrot_quant_512x2_bf16_modulated<false>(
+            x, modulation_scale, static_cast<int8_t*>(q),
+            static_cast<float*>(scales), M, K, stream);
+    }
+}
+
+// Returns 1 when no fused-LDS block size fits an INT8 G=256 row of (M, K) on
+// this device, so the generic global-spill path runs and the caller must
+// allocate its workspace.
 extern "C" int convrot_int8_needs_spill_host(int M, int K, int in_code) {
     using namespace comfy::hip_backend;
     return convrot_int8_needs_spill_buffers(M, K, in_code) ? 1 : 0;

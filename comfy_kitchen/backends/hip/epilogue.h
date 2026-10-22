@@ -119,6 +119,26 @@ struct EpiRowwise {
     COMFY_EPI_UNHOISTED(EpiRowwise)
 };
 
+// Bias-free specialization for INT8 GEMM. It uses the
+// same left-to-right scale expression as EpiRowwise without the runtime bias
+// pointer/dtype branches in every unrolled output element.
+struct EpiRowwiseNoBias {
+    const float* scale_a;
+    const float* scale_b;
+
+    __forceinline__ __device__ void init() {}
+
+    __forceinline__ __device__ float row_scale(int row) const { return scale_a[row]; }
+    __forceinline__ __device__ float col_scale(int col) const { return scale_b[col]; }
+    __forceinline__ __device__ float col_bias(int) const { return 0.0f; }
+
+    __forceinline__ __device__ float operator()(int row, int col, float acc, float rs, float cs,
+                                                float cb) const {
+        return acc * rs * cs;
+    }
+    COMFY_EPI_UNHOISTED(EpiRowwiseNoBias)
+};
+
 // Unscaled fp16 operands: out = acc + bias[col], or with resid set
 // out = resid[row * resid_stride + col] + (rscale[col] * (acc + bias[col])).
 // resid_stride 0 broadcasts a single [N] residual row. All operands are fp16.

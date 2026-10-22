@@ -195,7 +195,7 @@ __forceinline__ __device__ typename Mma::Frag load_frag_16bit(const typename Mma
 // Policies
 // ---------------------------------------------------------------------------
 
-#if defined(COMFY_MMA_GFX12)
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX117)
 
 struct MmaFp8 : LdsPad8 {
     using Acc = v8f;

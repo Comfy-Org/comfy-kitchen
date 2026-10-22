@@ -24,61 +24,42 @@
 // ---------------------------------------------------------------------------
 // With no usable profiler on Windows and no counters on this iGPU, the generated
 // code is the instrument. Counting the innermost key loop out of
-// `--cuda-device-only -S`, for HD=128 / MaskMode::kNone / CTA_K=64, in **disjoint**
-// buckets (the first pass at this overlapped -- `v_int` and `f32` both matched
-// v_mul_f32 -- and double-counted the float column into a bigger headline than the
-// data supports):
+// `--cuda-device-only -S`, for HD=128 / MaskMode::kNone / CTA_K=64, in disjoint
+// buckets: 2379 loop instructions, of which 128 are the WMMA (4.7% matrix
+// density), 1066 are softmax-ish (44.8%) and 296 are waits.
 //
-//   loop instructions 2379, of which
-//     v_wmma_i32_16x16x16_iu8  128  -> 4.7% matrix density
-//     softmax-ish             1066  -> 44.8%   (exp2, cvt, f32, mov)
-//     s_waitcnt + s_delay_alu  296  -> 12.4%
-//     integer                   580  -> 24.4%
-//     ds_load_b128 / global     214
+// **The kernel is softmax-bound, not matrix-bound.** At S=4138 the loop count
+// works out to ~7.2e10 thread-instructions against ~2.2e12/s issued, so 33 ms
+// against the 45.5 ms then measured: the kernel is within ~1.4x of its own issue
+// limit while spending under a twentieth of its slots on the matrix.
 //
-// **The kernel is softmax-bound, not matrix-bound.** Cross-check: at S=4138 the
-// loop count works out to ~7.2e10 thread-instructions, and 6 CU x 4 SIMD x 32
-// lanes at ~2.9 GHz issues ~2.2e12/s -- 33 ms against the 45.5 ms then measured.
-// The gap between those two numbers is the whole story: the kernel is within ~1.4x
-// of its own issue limit while spending under a twentieth of its slots on the
-// matrix.
-//
-// The cost is per *probability*, and it is set by head_dim, not by the key tile:
-// a lane holds a DT x 8 accumulator with DT = HD/16 = 8, so every key tile does
-// 8 x 8 = 64 conversions and 64 FMAs to fold the INT32 partial into the running
-// output. CTA_K does not change that count, it only divides how many times it
-// happens -- which is why the wider key tile improves the *ratio* (14.1
-// instructions per WMMA at CTA_K=128 against 21.3 here) and still loses: its LDS
-// footprint of 36,864 B drops resident blocks per CU from 3 to 1, and 280
-// s_waitcnt per 256 WMMA is not worth one block's worth of concurrency.
+// The cost is per *probability*, set by head_dim rather than by the key tile: a
+// lane holds a DT x 8 accumulator with DT = HD/16 = 8, so every key tile does
+// 8 x 8 = 64 conversions and 64 FMAs. CTA_K only divides how many times that
+// happens, which is why the wider key tile improves the ratio (14.1 instructions
+// per WMMA at CTA_K=128 against 21.3) and still loses: its 36,864 B of LDS drops
+// resident blocks per CU from 3 to 1.
 //
 // **What that buys.** If the loop is issue-bound, removing an instruction from it
-// removes it everywhere, and the one place where a whole block of them was
-// removable turned out to be the probability *sum*, not the quantize: the tile's
-// denominator was accumulating eight float bytes per step, a convert and an add
-// each, where sad_u8 does two integer adds and one convert at the end. Exact
-// either way -- the bytes are integers in [0, 255] and 255 * 8 = 2040 never leaves
-// f32's range. In the ISA: v_cvt_f32_u32 38 -> 2 and v_add_f32 47 -> 4 against
-// v_sad_u8 0 -> 16, so the innermost loop goes 2379 -> 2340 instructions and the
-// matrix density 5.4% -> 5.5%. Worth 2.3-2.7% on this kernel at Krea2's three
-// sequence lengths (45.53 -> 44.34 ms at S=4138, 95.30 -> 92.69 at 6186,
-// 206.87 -> 202.15 at 9258), which is under half a percent of a Krea2 step but
-// more of one for the attention-heavier checkpoints.
+// removes it everywhere, and the one removable block was the probability *sum*,
+// not the quantize: the tile's denominator accumulated eight float bytes per
+// step, a convert and an add each, where sad_u8 does two integer adds and one
+// convert at the end. Exact either way -- the bytes are integers in [0, 255]
+// and 255 * 8 = 2040 never leaves f32's range. Worth 2.3-2.7% on this kernel at
+// Krea2's three sequence lengths (45.53 -> 44.34 ms at S=4138, 95.30 -> 92.69 at
+// 6186, 206.87 -> 202.15 at 9258).
 //
 // The quantize next to it looks like the same kind of win and is not: prob_to_u8
 // already compiles to two instructions, because the compiler folds both float
 // clamps into the convert's saturation. See the note there -- the rint in that
 // expression is load-bearing, and taking it out is faster and wrong.
 //
-// So the remaining ~1.3x here is **algorithmic, not a tuning knob**: a blocked
+// The remaining ~1.3x here is **algorithmic, not a tuning knob**: a blocked
 // online softmax that rescales on a schedule rather than every tile, or an
-// accumulator held in a form that does not need a float rescale per tile. That is
-// a redesign of the score/output loop, it moves the numerics, and this kernel
-// serves every model in the tree -- SDXL, Anima and Krea2 all quantise attention
-// through it -- so it wants its own branch and its own error budget. Tuning what
-// is here cannot reach it: the two levers that exist (key tile width, LDS pad)
-// have both been measured, and the pad already matches what the int8 GEMM core
-// now uses.
+// accumulator that needs no float rescale per tile. That redesign moves the
+// numerics of a kernel every model in the tree quantises attention through, so
+// it wants its own branch and its own error budget. The two levers that exist
+// here (key tile width, LDS pad) have both been measured.
 #include <hip/hip_runtime.h>
 
 #include <stdexcept>
