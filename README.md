@@ -4,51 +4,51 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 
 ## Backend Capabilities Matrix
 
-| Function                    | eager | cuda | triton | hip | ascend |
-|-----------------------------|-------|------|--------|-----|-----|
-| `quantize_per_tensor_fp8`   | ✓     | ✓    | ✓      | ✓   |     |
-| `dequantize_per_tensor_fp8` | ✓     | ✓    | ✓      | ✓   |     |
-| `stochastic_rounding_fp8`   | ✓     | ✓    |        | ✓   |     |
-| `quantize_nvfp4`            | ✓     | ✓    | ✓      |     |     |
-| `dequantize_nvfp4`          | ✓     | ✓    | ✓      |     |     |
-| `scaled_mm_nvfp4`           | ✓     | ✓    |        |     |     |
-| `quantize_mxfp8`            | ✓     | ✓    | ✓      |     |     |
-| `dequantize_mxfp8`          | ✓     |      |        |     |     |
-| `scaled_mm_mxfp8`           | ✓     |      |        |     |     |
-| `adaln`                     | ✓     | ✓    | ✓      | ✓   |     |
-| `rms_adaln`                 | ✓     | ✓    | ✓      | ✓   |     |
-| `na3d`                      | ✓     | ✓    | ✓      | ✓   |     |
-| `na2d`                      | ✓     | ✓    | ✓      | ✓   |     |
-| `sol_attn`                  | ✓     | ✓    |        | ✓   |     |
-| `int8_attention`            |       | ✓    |        | ✓   |     |
-| `apply_rope`                | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `apply_rope1`               | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `apply_rope_split_half1`    | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `rms_rope`                  | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `rms_rope1`                 | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `rms_rope_split_half`       | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `rms_rope_split_half1`      | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `quantize_int8_rowwise`     | ✓     | ✓    | ✓      | ✓   | ✓   |
-| `quantize_int8_tensorwise`  | ✓     | ✓    |        | ✓   | ✓   |
-| `quantize_and_rotate_rowwise` | ✓   | ✓    | ✓      | ✓   | ✓*  |
-| `quantize_int8_convrot_weight` | ✓  | ✓    |        | ✓   |     |
-| `dequantize_int8_simple`    | ✓     | ✓    |        | ✓   | ✓   |
-| `dequantize_int8_simple_dtype` | ✓  | ✓    |        | ✓   | ✓   |
-| `dequantize_int8_convrot_weight_dtype` | ✓ | ✓ |    | ✓   |     |
-| `int8_linear`               | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `gemv_awq_w4a16`            | ✓     | ✓    |        | ✓   |     |
-| `quantize_svdquant_w4a4`    | ✓     | ✓    |        | ✓   |     |
-| `scaled_mm_svdquant_w4a4`   | ✓     | ✓    |        | ✓   |     |
-| `convrot_w4a4_linear`       | ✓     | ✓    |        | ✓   | ✓*  |
-| `quantize_convrot_w4a4_weight` | ✓  | ✓    |        | ✓   |     |
-| `dequantize_convrot_w4a4_weight` | ✓ | ✓   |        | ✓   |     |
-| `delaunay3d`                |       | ✓    |        |     |     |
-| `mesh_bvh`                  |       | ✓    |        |     |     |
-| `closest_point_on_mesh`     |       | ✓    |        |     |     |
-| `connected_components`      |       | ✓    |        |     |     |
-| `edge_collapse_checks`      |       | ✓    |        |     |     |
-| `min_cut`                   |       | ✓    |        |     |     |
+| Function                    | eager | cuda | triton | hip | ascend | mps |
+|-----------------------------|-------|------|--------|-----|-----|-----|
+| `quantize_per_tensor_fp8`   | ✓     | ✓    | ✓      | ✓   |     |     |
+| `dequantize_per_tensor_fp8` | ✓     | ✓    | ✓      | ✓   |     |     |
+| `stochastic_rounding_fp8`   | ✓     | ✓    |        | ✓   |     |     |
+| `quantize_nvfp4`            | ✓     | ✓    | ✓      |     |     |     |
+| `dequantize_nvfp4`          | ✓     | ✓    | ✓      |     |     |     |
+| `scaled_mm_nvfp4`           | ✓     | ✓    |        |     |     |     |
+| `quantize_mxfp8`            | ✓     | ✓    | ✓      |     |     |     |
+| `dequantize_mxfp8`          | ✓     |      |        |     |     |     |
+| `scaled_mm_mxfp8`           | ✓     |      |        |     |     |     |
+| `adaln`                     | ✓     | ✓    | ✓      | ✓   |     | ✓   |
+| `rms_adaln`                 | ✓     | ✓    | ✓      | ✓   |     | ✓   |
+| `na3d`                      | ✓     | ✓    | ✓      | ✓   |     |     |
+| `na2d`                      | ✓     | ✓    | ✓      | ✓   |     |     |
+| `sol_attn`                  | ✓     | ✓    |        | ✓   |     |     |
+| `int8_attention`            |       | ✓    |        | ✓   |     |     |
+| `apply_rope`                | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
+| `apply_rope1`               | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
+| `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
+| `apply_rope_split_half1`    | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
+| `rms_rope`                  | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
+| `rms_rope1`                 | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
+| `rms_rope_split_half`       | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
+| `rms_rope_split_half1`      | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
+| `quantize_int8_rowwise`     | ✓     | ✓    | ✓      | ✓   | ✓   |     |
+| `quantize_int8_tensorwise`  | ✓     | ✓    |        | ✓   | ✓   |     |
+| `quantize_and_rotate_rowwise` | ✓   | ✓    | ✓      | ✓   | ✓*  |     |
+| `quantize_int8_convrot_weight` | ✓  | ✓    |        | ✓   |     |     |
+| `dequantize_int8_simple`    | ✓     | ✓    |        | ✓   | ✓   |     |
+| `dequantize_int8_simple_dtype` | ✓  | ✓    |        | ✓   | ✓   |     |
+| `dequantize_int8_convrot_weight_dtype` | ✓ | ✓ |    | ✓   |     |     |
+| `int8_linear`               | ✓     | ✓    | ✓      | ✓   | ✓*  |     |
+| `gemv_awq_w4a16`            | ✓     | ✓    |        | ✓   |     |     |
+| `quantize_svdquant_w4a4`    | ✓     | ✓    |        | ✓   |     |     |
+| `scaled_mm_svdquant_w4a4`   | ✓     | ✓    |        | ✓   |     |     |
+| `convrot_w4a4_linear`       | ✓     | ✓    |        | ✓   | ✓*  |     |
+| `quantize_convrot_w4a4_weight` | ✓  | ✓    |        | ✓   |     |     |
+| `dequantize_convrot_w4a4_weight` | ✓ | ✓   |        | ✓   |     |     |
+| `delaunay3d`                |       | ✓    |        |     |     |     |
+| `mesh_bvh`                  |       | ✓    |        |     |     |     |
+| `closest_point_on_mesh`     |       | ✓    |        |     |     |     |
+| `connected_components`      |       | ✓    |        |     |     |     |
+| `edge_collapse_checks`      |       | ✓    |        |     |     |     |
+| `min_cut`                   |       | ✓    |        |     |     |     |
 
 Each of the eight rope entries also has an in-place form (`apply_rope_`,
 `rms_rope_split_half1_`, ...) with the same backend coverage as the row above.
@@ -61,6 +61,18 @@ Ascend support for `quantize_and_rotate_rowwise` requires
 `convrot_w4a4_linear` requires only `torch_npu.npu_quant_matmul`.
 These capabilities are registered only when the
 corresponding operator is available.
+
+## Apple GPU (mps) backend
+
+On Apple GPUs the eager RoPE and AdaLN paths run as chains of small ops (a norm,
+casts, broadcasts, multiply-adds), each its own kernel launch and pass over memory.
+The `mps` backend runs each of the rope entries above (and their in-place forms,
+including `rot_dim`) and `adaln` / `rms_adaln` as a single Metal kernel compiled
+with `torch.mps.compile_shader`, in float32, float16 and bfloat16. Inputs may be
+strided views with a contiguous last dim, so packed-qkv slices and `(B, H, N, D)`
+layouts need no copies. Calls outside that (other dtypes, layouts, or head dims
+above 1024) are declined by the call rules and run on eager. The backend is
+registered when MPS is available and `torch.mps.compile_shader` exists.
 
 ## Huawei Ascend backend
 
