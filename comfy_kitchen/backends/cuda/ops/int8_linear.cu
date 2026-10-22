@@ -6,7 +6,9 @@
 #include "utils.cuh"
 #include "dtype_dispatch.cuh"
 #include "input_act_codes.h"
+#include <cooperative_groups.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cfloat>
 #include <cstdint>
@@ -625,7 +627,11 @@ __global__ void int8_gemv_dequant_kernel(
     }
 }
 
-template<int WARPS_PER_BLOCK, typename OutputType, typename BiasType>
+// One warp per output column. Vec16: 16-byte weight/activation loads (K % 16 == 0), the
+// integer accumulation is order-independent so the result matches the 4-byte loop exactly.
+// residual (nullable): out = residual + residual_scale * out, with the linear rounded to
+// OutputType first, as the unfused addcmul sees it.
+template<int WARPS_PER_BLOCK, typename OutputType, typename BiasType, bool Vec16>
 __global__ void int8_gemv_dequant_warp_kernel(
     const int8_t* __restrict__ x,
     const int8_t* __restrict__ weight,
@@ -636,7 +642,9 @@ __global__ void int8_gemv_dequant_warp_kernel(
     int N,
     int K,
     int weight_scale_size,
-    bool has_bias)
+    bool has_bias,
+    const OutputType* __restrict__ residual,
+    const OutputType* __restrict__ residual_scale)
 {
     const int lane = threadIdx.x & (kThreadsPerWarp - 1);
     const int warp = threadIdx.x >> 5;
@@ -645,13 +653,26 @@ __global__ void int8_gemv_dequant_warp_kernel(
         return;
     }
 
-    const int K4 = K >> 2;
-    const int* __restrict__ x4 = reinterpret_cast<const int*>(x);
-    const int* __restrict__ w4 = reinterpret_cast<const int*>(weight + static_cast<int64_t>(n) * K);
-
+    const int8_t* __restrict__ w_row = weight + static_cast<int64_t>(n) * K;
     int acc = 0;
-    for (int k4 = lane; k4 < K4; k4 += kThreadsPerWarp) {
-        acc = __dp4a(x4[k4], w4[k4], acc);
+    if constexpr (Vec16) {
+        const int4* __restrict__ x16 = reinterpret_cast<const int4*>(x);
+        const int4* __restrict__ w16 = reinterpret_cast<const int4*>(w_row);
+        const int K16 = K >> 4;
+        for (int i = lane; i < K16; i += kThreadsPerWarp) {
+            const int4 w = w16[i];
+            const int4 xv = x16[i];
+            acc = __dp4a(xv.x, w.x, acc);
+            acc = __dp4a(xv.y, w.y, acc);
+            acc = __dp4a(xv.z, w.z, acc);
+            acc = __dp4a(xv.w, w.w, acc);
+        }
+    } else {
+        const int* __restrict__ x4 = reinterpret_cast<const int*>(x);
+        const int* __restrict__ w4 = reinterpret_cast<const int*>(w_row);
+        for (int k4 = lane; k4 < (K >> 2); k4 += kThreadsPerWarp) {
+            acc = __dp4a(x4[k4], w4[k4], acc);
+        }
     }
     acc = warp_reduce_sum_i32(acc);
 
@@ -660,6 +681,10 @@ __global__ void int8_gemv_dequant_warp_kernel(
         float value = static_cast<float>(acc) * x_scales[0] * weight_scale;
         if (has_bias) {
             value += to_float(bias[n]);
+        }
+        if (residual != nullptr) {
+            const float linear = to_float(from_float<OutputType>(value));
+            value = to_float(residual[n]) + to_float(residual_scale[n]) * linear;
         }
         output[n] = from_float<OutputType>(value);
     }
@@ -1184,9 +1209,18 @@ __device__ __forceinline__ float apply_input_act(float v) {
     return v;
 }
 
+// tanh that keeps its relative precision near zero and saturates without overflow:
+// --use_fast_math turns tanhf into tanh.approx (~2^-11 relative error), and
+// 1 - 2 / (1 + exp(2x)) cancels to 0 for small |x|. expm1f has no fast intrinsic.
+__device__ __forceinline__ float stable_tanh(float x) {
+    const float t = expm1f(-2.0f * fabsf(x));
+    return copysignf(-t / (t + 2.0f), x);
+}
+
 // Reads one activated value: column `col` of the K-wide activated row starting
-// at `in_row`. For SwiGLU the raw row is 2*K wide with the gate in the first
-// half; every other activation reads the same K-wide row it writes.
+// at `in_row`. For SwiGLU and SiTU the raw row is 2*K wide (SwiGLU's gate in the
+// first half, SiTU's in the second); every other activation reads the same
+// K-wide row it writes.
 template<int ACT, typename InputType>
 __device__ __forceinline__ float load_input_act(
     const InputType* __restrict__ x, int64_t in_row, int col, int K)
@@ -1196,40 +1230,44 @@ __device__ __forceinline__ float load_input_act(
         const float gate = to_float(x[in_row + col]);
         const float up = to_float(x[in_row + K + col]);
         return (gate / (1.0f + expf(-gate))) * up;
+    } else if constexpr (ACT == kActSiTU) {
+        // Matches torch 4 * tanh(gate / 4) * sigmoid(gate) * (25 * tanh(hidden / 25)).
+        const float hidden = to_float(x[in_row + col]);
+        const float gate = to_float(x[in_row + K + col]);
+        const float gate_cap = 4.0f * stable_tanh(gate / 4.0f);
+        const float hidden_cap = 25.0f * stable_tanh(hidden / 25.0f);
+        return gate_cap / (1.0f + expf(-gate)) * hidden_cap;
     } else {
         return apply_input_act<ACT>(to_float(x[in_row + col]));
     }
 }
 
-template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC, int ACT = kActNone>
-__global__ void quantize_int8_rowwise_convrot64_kernel(
-    const InputType* __restrict__ x,
-    int8_t* __restrict__ q,
-    float* __restrict__ scales,
+// One row of the ConvRot quantizer, run by a whole BLOCK_THREADS block: optional input
+// activation (SwiGLU reads a [gate | up] raw row twice as wide as the K it writes;
+// RmsNorm stages the raw row first for its mean of squares), 256-point FHT per group,
+// row absmax -> scale, int8 store into `q_row` (global or shared). Returns the scale.
+// Shared by the standalone quantizer and the GEMV prologue, so both round identically.
+template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC, int ACT>
+__device__ __forceinline__ float convrot64_quantize_row(
+    const InputType* __restrict__ x_row,
+    int8_t* q_row,
     int K,
+    int64_t rng_base,
     uint64_t seed,
     const InputType* __restrict__ act_weight,
-    float act_eps)
+    float act_eps,
+    float* row_buf,
+    float* tmp,
+    float* warp_smem,
+    float* block_smem)
 {
     constexpr int kGroupThreads = 64;
     constexpr int kGroupsInFlight = BLOCK_THREADS / kGroupThreads;
     constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
 
-    extern __shared__ float smem[];
-    float* row_buf = smem;
-    float* tmp = smem + K;
-
-    __shared__ float warp_smem[kWarps];
-    __shared__ float block_smem;
-
-    const int row = static_cast<int>(blockIdx.x);
     const int tid = threadIdx.x;
     const int sub = tid / kGroupThreads;
     const int lane = tid % kGroupThreads;
-    const int64_t row_offset = static_cast<int64_t>(row) * K;
-    // SwiGLU reads a [gate | up] raw row twice as wide as the K it writes.
-    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
-    const int64_t in_row_offset = row_offset * kInWidth;
     const int n_groups = K / kConvRotGroup;
 
     float* buf0 = tmp + sub * (2 * kConvRotGroup);
@@ -1243,11 +1281,11 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     if constexpr (ACT == kActRmsNorm) {
         float sum_sq = 0.0f;
         for (int col = tid; col < K; col += BLOCK_THREADS) {
-            const float v = to_float(x[row_offset + col]);
+            const float v = to_float(x_row[col]);
             row_buf[col] = v;
             sum_sq += v * v;
         }
-        sum_sq = block_reduce_sum_f32_t<kWarps>(sum_sq, warp_smem, &block_smem);
+        sum_sq = block_reduce_sum_f32_t<kWarps>(sum_sq, warp_smem, block_smem);
         rstd = rsqrtf(sum_sq / static_cast<float>(K) + act_eps);
     }
 
@@ -1266,10 +1304,10 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
             x2 = active ? row_buf[col + 2] * rstd * to_float(act_weight[col + 2]) : 0.0f;
             x3 = active ? row_buf[col + 3] * rstd * to_float(act_weight[col + 3]) : 0.0f;
         } else {
-            x0 = active ? load_input_act<ACT>(x, in_row_offset, col, K) : 0.0f;
-            x1 = active ? load_input_act<ACT>(x, in_row_offset, col + 1, K) : 0.0f;
-            x2 = active ? load_input_act<ACT>(x, in_row_offset, col + 2, K) : 0.0f;
-            x3 = active ? load_input_act<ACT>(x, in_row_offset, col + 3, K) : 0.0f;
+            x0 = active ? load_input_act<ACT>(x_row, 0, col, K) : 0.0f;
+            x1 = active ? load_input_act<ACT>(x_row, 0, col + 1, K) : 0.0f;
+            x2 = active ? load_input_act<ACT>(x_row, 0, col + 2, K) : 0.0f;
+            x3 = active ? load_input_act<ACT>(x_row, 0, col + 3, K) : 0.0f;
         }
         buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
         buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
@@ -1290,27 +1328,336 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
         __syncthreads();
     }
 
-    abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
+    abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, block_smem);
     const float scale = fmaxf(
         finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f),
         1.0e-30f);
-    if (tid == 0) {
-        scales[row] = scale;
-    }
 
     for (int col = tid; col < K; col += BLOCK_THREADS) {
-        const int64_t idx = row_offset + col;
         const float scaled = quant_div_float_to_float<InputType>(row_buf[col], scale);
         float quantized;
         if constexpr (STOCHASTIC) {
-            const InputType noise = stochastic_rng_value<InputType>(idx, seed);
+            const InputType noise = stochastic_rng_value<InputType>(rng_base + col, seed);
             quantized = floorf(stochastic_sum_to_float<InputType>(scaled, noise));
         } else {
             quantized = nearbyintf(scaled);
         }
         quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
-        q[idx] = static_cast<int8_t>(quantized);
+        q_row[col] = static_cast<int8_t>(quantized);
     }
+    return scale;
+}
+
+template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC, int ACT = kActNone>
+__global__ void quantize_int8_rowwise_convrot64_kernel(
+    const InputType* __restrict__ x,
+    int8_t* __restrict__ q,
+    float* __restrict__ scales,
+    int K,
+    uint64_t seed,
+    const InputType* __restrict__ act_weight,
+    float act_eps)
+{
+    constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
+    extern __shared__ float smem[];
+    __shared__ float warp_smem[kWarps];
+    __shared__ float block_smem;
+
+    const int row = static_cast<int>(blockIdx.x);
+    const int64_t row_offset = static_cast<int64_t>(row) * K;
+    constexpr int kInWidth = input_act_width(ACT);
+    const float scale = convrot64_quantize_row<InputType, BLOCK_THREADS, STOCHASTIC, ACT>(
+        x + row_offset * kInWidth, q + row_offset, K, row_offset, seed, act_weight, act_eps,
+        smem, smem + K, warp_smem, &block_smem);
+    if (threadIdx.x == 0) {
+        scales[row] = scale;
+    }
+}
+
+// M=1 ConvRot GEMV with the activation quantizer as its prologue: every block
+// re-quantizes the (L2-resident) input row into shared memory with the same
+// 512-thread convrot64_quantize_row the standalone quantizer runs for one row, so
+// the int8 operands and scale are identical and the separate launch disappears.
+// The prologue is compute the blocks on one SM would repeat, so the launcher runs
+// few blocks per SM and each walks column groups grid-stride, one warp per column
+// over all of K exactly as int8_gemv_dequant_warp_kernel does. Epilogue as there.
+constexpr int kFusedGemvThreads = 512;
+constexpr int kFusedGemvCols = kFusedGemvThreads / kThreadsPerWarp;
+
+template<typename InputType, typename OutputType, typename BiasType, int ACT>
+__global__ void __launch_bounds__(kFusedGemvThreads) int8_gemv_convrot_fused_kernel(
+    const InputType* __restrict__ x,
+    const InputType* __restrict__ act_weight,
+    float act_eps,
+    const int8_t* __restrict__ weight,
+    const float* __restrict__ weight_scales,
+    const BiasType* __restrict__ bias,
+    OutputType* __restrict__ output,
+    int N,
+    int K,
+    int weight_scale_size,
+    bool has_bias,
+    const OutputType* __restrict__ residual,
+    const OutputType* __restrict__ residual_scale)
+{
+    constexpr int kWarps = kFusedGemvThreads / kThreadsPerWarp;
+    extern __shared__ float smem[];
+    __shared__ float warp_smem[kWarps];
+    __shared__ float block_smem;
+
+    float* row_buf = smem;
+    float* tmp = smem + K;
+    int8_t* q_smem = reinterpret_cast<int8_t*>(tmp + (kFusedGemvThreads / 64) * 2 * kConvRotGroup);
+
+    const int lane = threadIdx.x & (kThreadsPerWarp - 1);
+    const int warp = threadIdx.x >> 5;
+    const int K16 = K >> 4;
+
+    const float x_scale = convrot64_quantize_row<InputType, kFusedGemvThreads, false, ACT>(
+        x, q_smem, K, 0, 0, act_weight, act_eps, row_buf, tmp, warp_smem, &block_smem);
+    __syncthreads();
+
+    const int4* __restrict__ x16 = reinterpret_cast<const int4*>(q_smem);
+
+    for (int n0 = static_cast<int>(blockIdx.x) * kFusedGemvCols; n0 < N; n0 += gridDim.x * kFusedGemvCols) {
+        const int n = n0 + warp;
+        if (n < N) {
+            const int4* __restrict__ w16 = reinterpret_cast<const int4*>(weight + static_cast<int64_t>(n) * K);
+            int acc = 0;
+            #pragma unroll 4
+            for (int i = lane; i < K16; i += kThreadsPerWarp) {
+                const int4 w = w16[i];
+                const int4 xv = x16[i];
+                acc = __dp4a(xv.x, w.x, acc);
+                acc = __dp4a(xv.y, w.y, acc);
+                acc = __dp4a(xv.z, w.z, acc);
+                acc = __dp4a(xv.w, w.w, acc);
+            }
+            acc = warp_reduce_sum_i32(acc);
+            if (lane == 0) {
+                const float weight_scale = weight_scales[weight_scale_size == 1 ? 0 : n];
+                float value = static_cast<float>(acc) * x_scale * weight_scale;
+                if (has_bias) {
+                    value += to_float(bias[n]);
+                }
+                if (residual != nullptr) {
+                    const float linear = to_float(from_float<OutputType>(value));
+                    value = to_float(residual[n]) + to_float(residual_scale[n]) * linear;
+                }
+                output[n] = from_float<OutputType>(value);
+            }
+        }
+    }
+}
+
+// Decode-shape (M <= 16) ConvRot quantizer in one launch: the row is split over a
+// cluster of CL blocks (8 groups of 256 per block per pass), each block rotates its
+// groups into registers, the row absmax is exchanged over DSMEM, and the same
+// registers are quantized. Numerically identical to the staged rotate+quantize pair
+// (fp32 absmax of the unrounded rotation, bf16-rounded rotated value, same divide and
+// rounding). Optional input activations are folded in and match the eager torch ops
+// bit for bit: RmsNorm reproduces torch's vectorized rms_norm reduction (128 threads,
+// vec4, warp shfl_down tree, 4-warp merge) and rounds gamma*(rstd*x) to the input
+// dtype; SwiGLU rounds silu(gate) and silu(gate)*up to the input dtype. Requires
+// clusters (sm_90+).
+constexpr int kClusterQuantThreads = 512;
+constexpr int kClusterQuantGroups = kClusterQuantThreads / 64;
+// the attribute itself is rejected by the pre-sm_90 device passes of a multi-arch build
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define CLUSTER_DIMS(cl)
+#else
+#define CLUSTER_DIMS(cl) __cluster_dims__(cl, 1, 1)
+#endif
+constexpr int kClusterQuantMaxPasses = 4;
+
+// torch's silu, x / (1 + exp(-x)), bit for bit. This file is compiled with
+// --use_fast_math, which would turn expf into ex2.approx(x*log2e) and the
+// division into an approximate reciprocal; torch is not. Every step below is
+// pinned with a rounding-mode intrinsic so fast-math cannot rewrite it, and it
+// follows the SASS nvcc emits for torch's kernel: the precise expf range
+// reduction (saturating j = floor(a*log2e) via the 1.5*2^23 trick, 2^j from the
+// mantissa bits, ex2.approx of the residual) with the trailing "+ 1" contracted
+// into the scale multiply exactly as nvcc's default fmad does for torch. The
+// final division is non-ftz so bf16 denormal inputs keep their denormal result.
+// Verified exhaustively against torch over all 65536 fp16 and bf16 inputs.
+__device__ __forceinline__ float torch_silu(float x)
+{
+    const float a = -x;
+    const float t = __saturatef(__fmaf_rn(a, __uint_as_float(0x3bbb989du) /* log2e/252 */, 0.5f));
+    const float u = __fmaf_rd(t, 252.0f, 12582913.0f);
+    const float j = __fadd_rn(u, -12583039.0f);
+    float f = __fmaf_rn(a, 1.4426950216293334961f, -j);
+    f = __fmaf_rn(a, 1.925963033500011079e-08f, f);
+    float r;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(f));
+    const float scale = __uint_as_float(__float_as_uint(u) << 23);
+    const float denom = __fmaf_rn(scale, r, 1.0f);
+    float y;
+    asm("div.rn.f32 %0, %1, %2;" : "=f"(y) : "f"(x), "f"(denom));
+    return y;
+}
+
+template<typename InputType>
+__device__ __forceinline__ float torch_rms_rstd(
+    const InputType* __restrict__ row, int K, float eps, float* buf /* >= 6 floats */)
+{
+    // Mirrors PyTorch vectorized_layer_norm_kernel<rms_norm=true>: blockDim (32, 4).
+    constexpr int kNumThreads = 128;
+    constexpr int kVec = 4;
+    const int tid = threadIdx.x;
+    float sigma2 = 0.0f;
+    if (tid < kNumThreads) {
+        const int n_vec = K / kVec;
+        for (int i = tid; i < n_vec; i += kNumThreads) {
+            const InputType* v = row + static_cast<int64_t>(i) * kVec;
+            #pragma unroll
+            for (int ii = 0; ii < kVec; ++ii) {
+                const float val = to_float(v[ii]);
+                sigma2 = __fmaf_rn(val, val, sigma2);
+            }
+        }
+        for (int offset = kThreadsPerWarp / 2; offset > 0; offset >>= 1) {
+            sigma2 = sigma2 + __shfl_down_sync(0xffffffffu, sigma2, offset);
+        }
+    }
+    const int lane = tid & (kThreadsPerWarp - 1);
+    const int wid = tid >> 5;
+    // inter-warp merge over warps 0..3 in torch's order
+    for (int offset = 2; offset > 0; offset /= 2) {
+        if (lane == 0 && wid >= offset && wid < 2 * offset) buf[wid - offset] = sigma2;
+        __syncthreads();
+        if (lane == 0 && wid < offset) sigma2 = sigma2 + buf[wid];
+        __syncthreads();
+    }
+    // IEEE divide like torch's; --use_fast_math would make it approximate
+    if (tid == 0) buf[4] = __fdiv_rn(sigma2, static_cast<float>(K));
+    __syncthreads();
+    return rsqrtf(buf[4] + eps);
+}
+
+template<typename InputType, int CL, int ACT>
+__global__ void CLUSTER_DIMS(CL) __launch_bounds__(kClusterQuantThreads)
+quantize_int8_convrot_cluster_kernel(
+    const InputType* __restrict__ x,
+    const InputType* __restrict__ act_weight,
+    float act_eps,
+    int8_t* __restrict__ q,
+    float* __restrict__ scales,
+    int K)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    namespace cg = cooperative_groups;
+    cg::cluster_group cluster = cg::this_cluster();
+    const int rank = static_cast<int>(cluster.block_rank());
+    constexpr int kWarps = kClusterQuantThreads / kThreadsPerWarp;
+    constexpr int kSlots = CL * kClusterQuantGroups;
+
+    __shared__ float fht[kClusterQuantGroups][2][kConvRotGroup];
+    __shared__ float warp_smem[kWarps];
+    __shared__ float block_smem;
+    __shared__ float norm_buf[6];
+    __shared__ float cluster_max;
+
+    const int tid = threadIdx.x;
+    const int sub = tid / 64;
+    const int lane = tid % 64;
+    const int row = static_cast<int>(blockIdx.x) / CL;
+    const int n_groups = K / kConvRotGroup;
+    const int passes = (n_groups + kSlots - 1) / kSlots;
+    const int64_t row_offset = static_cast<int64_t>(row) * K;
+    constexpr int kInWidth = input_act_width(ACT);
+    const InputType* in_row = x + row_offset * kInWidth;
+
+    float rstd = 1.0f;
+    if constexpr (ACT == kActRmsNorm) {
+        rstd = torch_rms_rstd<InputType>(in_row, K, act_eps, norm_buf);
+    }
+
+    float y[kClusterQuantMaxPasses][4];
+    float abs_max = 0.0f;
+    #pragma unroll
+    for (int p = 0; p < kClusterQuantMaxPasses; ++p) {
+        if (p >= passes) break;
+        const int group = p * kSlots + rank * kClusterQuantGroups + sub;
+        const bool active = group < n_groups;
+        const int col = group * kConvRotGroup + lane * 4;
+        float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (active) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                if constexpr (ACT == kActRmsNorm) {
+                    const float g = to_float(act_weight[col + i]);
+                    v[i] = to_float(from_float<InputType>(g * (rstd * to_float(in_row[col + i]))));
+                } else if constexpr (ACT == kActSwiGLU) {
+                    const float gate = to_float(in_row[col + i]);
+                    const float up = to_float(in_row[K + col + i]);
+                    const float s = to_float(from_float<InputType>(torch_silu(gate)));
+                    v[i] = to_float(from_float<InputType>(s * up));
+                } else {
+                    v[i] = to_float(in_row[col + i]);
+                }
+            }
+        }
+        float* buf0 = fht[sub][0];
+        float* buf1 = fht[sub][1];
+        const int base = lane * 4;
+        buf1[base] = 0.5f * (v[0] + v[1] + v[2] - v[3]);
+        buf1[base + 1] = 0.5f * (v[0] + v[1] - v[2] + v[3]);
+        buf1[base + 2] = 0.5f * (v[0] - v[1] + v[2] + v[3]);
+        buf1[base + 3] = 0.5f * (-v[0] + v[1] + v[2] + v[3]);
+        __syncthreads();
+        convrot_fht_stage64<4>(buf1, buf0, lane);
+        __syncthreads();
+        convrot_fht_stage64<16>(buf0, buf1, lane);
+        __syncthreads();
+        {
+            constexpr int S = 64;
+            const int b = (lane % S) + (lane / S) * (4 * S);
+            const float x0 = buf1[b], x1 = buf1[b + S], x2 = buf1[b + 2 * S], x3 = buf1[b + 3 * S];
+            y[p][0] = 0.5f * (x0 + x1 + x2 - x3);
+            y[p][1] = 0.5f * (x0 + x1 - x2 + x3);
+            y[p][2] = 0.5f * (x0 - x1 + x2 + x3);
+            y[p][3] = 0.5f * (-x0 + x1 + x2 + x3);
+        }
+        if (active) {
+            abs_max = fmaxf(abs_max, fmaxf(fmaxf(fabsf(y[p][0]), fabsf(y[p][1])),
+                                           fmaxf(fabsf(y[p][2]), fabsf(y[p][3]))));
+        }
+        __syncthreads();
+    }
+
+    abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
+    if (tid == 0) cluster_max = abs_max;
+    cluster.sync();
+    float row_max = 0.0f;
+    #pragma unroll
+    for (int r = 0; r < CL; ++r) {
+        row_max = fmaxf(row_max, cluster.map_shared_rank(&cluster_max, r)[0]);
+    }
+    cluster.sync();  // every peer has read cluster_max before anyone may exit
+
+    const float scale = fmaxf(
+        finite_absmax_for_int8_scale<InputType>(row_max) * (1.0f / 127.0f),
+        1.0e-30f);
+    if (rank == 0 && tid == 0) {
+        scales[row] = scale;
+    }
+    #pragma unroll
+    for (int p = 0; p < kClusterQuantMaxPasses; ++p) {
+        if (p >= passes) break;
+        const int group = p * kSlots + rank * kClusterQuantGroups + sub;
+        if (group >= n_groups) continue;
+        // The last FHT stage leaves lane l holding output columns l, l+64, l+128,
+        // l+192 of its group (same layout as convrot_fht_stage64_store_absmax).
+        int8_t* qg = q + row_offset + group * kConvRotGroup + lane;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float scaled = quant_div_float_to_float<InputType>(y[p][i], scale);
+            const float quantized = fminf(127.0f, fmaxf(-128.0f, nearbyintf(scaled)));
+            qg[i * 64] = static_cast<int8_t>(quantized);
+        }
+    }
+#endif
 }
 
 } // namespace
@@ -1606,6 +1953,76 @@ void launch_quantize_int8_convrot_staged_kernel(
     }
 }
 
+// Single-launch replacement for the staged pair on sm_90+ (same int8/scale output,
+// optional fused input activation). Returns false when the shape or device is not
+// covered so the caller can fall back.
+bool launch_quantize_int8_convrot_cluster_kernel(
+    const void* input,
+    const void* act_weight,
+    float act_eps,
+    int act_code,
+    void* output,
+    void* scales,
+    int64_t num_rows,
+    int64_t num_cols,
+    int input_dtype_code,
+    cudaStream_t stream)
+{
+    using namespace comfy;
+    if (num_rows <= 0 || num_rows > 16 || num_cols <= 0 || num_cols % kConvRotGroup != 0
+            || input_dtype_code < 0 || input_dtype_code > 2)
+        return false;
+    if (act_code != kActNone && act_code != kActSwiGLU && act_code != kActRmsNorm)
+        return false;
+    if (act_code == kActRmsNorm && act_weight == nullptr)
+        return false;
+    const int64_t n_groups = num_cols / kConvRotGroup;
+    // Smallest cluster that covers the row in one pass; otherwise the widest cluster
+    // and as many passes as it takes (bounded by the register file the kernel holds).
+    int cl = 8;
+    for (int c = 1; c <= 8; c *= 2) {
+        if (n_groups <= static_cast<int64_t>(c) * kClusterQuantGroups) { cl = c; break; }
+    }
+    if (n_groups > static_cast<int64_t>(cl) * kClusterQuantGroups * kClusterQuantMaxPasses)
+        return false;
+    int device = 0, cc_major = 0;
+    if (cudaGetDevice(&device) != cudaSuccess
+            || cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess
+            || cc_major < 9)
+        return false;
+
+    DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
+        auto launch = [&]<int CL, int ACT>() {
+            quantize_int8_convrot_cluster_kernel<InputType, CL, ACT>
+                <<<static_cast<unsigned>(num_rows * CL), kClusterQuantThreads, 0, stream>>>(
+                    static_cast<const InputType*>(input),
+                    static_cast<const InputType*>(act_weight),
+                    act_eps,
+                    static_cast<int8_t*>(output),
+                    static_cast<float*>(scales),
+                    static_cast<int>(num_cols));
+        };
+        auto launch_cl = [&]<int CL>() {
+            switch (act_code) {
+                case kActSwiGLU: launch.template operator()<CL, kActSwiGLU>(); break;
+                case kActRmsNorm: launch.template operator()<CL, kActRmsNorm>(); break;
+                default: launch.template operator()<CL, kActNone>(); break;
+            }
+        };
+        switch (cl) {
+            case 1: launch_cl.template operator()<1>(); break;
+            case 2: launch_cl.template operator()<2>(); break;
+            case 4: launch_cl.template operator()<4>(); break;
+            default: launch_cl.template operator()<8>(); break;
+        }
+    });
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA INT8 cluster convrot quantization failed: ") + cudaGetErrorString(err));
+    }
+    return true;
+}
+
 void launch_quantize_int8_rowwise_convrot64_kernel(
     const void* input,
     void* output,
@@ -1634,7 +2051,8 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
         throw std::runtime_error("convrot64 fused kernel only supports K <= INT_MAX");
     }
     if (act_code != comfy::kActNone && act_code != comfy::kActGeluTanh
-        && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm) {
+        && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm
+        && act_code != comfy::kActSiTU) {
         throw std::runtime_error("convrot64 fused kernel: unsupported input activation code");
     }
     if (act_code == comfy::kActRmsNorm && act_weight == nullptr) {
@@ -1704,6 +2122,9 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                     break;
                 case comfy::kActRmsNorm:
                     launch_act(std::integral_constant<int, comfy::kActRmsNorm>{}, block_threads);
+                    break;
+                case comfy::kActSiTU:
+                    launch_act(std::integral_constant<int, comfy::kActSiTU>{}, block_threads);
                     break;
                 default:
                     launch_act(std::integral_constant<int, comfy::kActNone>{}, block_threads);
@@ -1811,6 +2232,8 @@ void launch_int8_gemv_dequant_kernel(
     bool has_bias,
     int output_dtype_code,
     int bias_dtype_code,
+    const void* residual,
+    const void* residual_scale,
     cudaStream_t stream)
 {
     if (num_cols == 0 || K == 0) {
@@ -1823,6 +2246,13 @@ void launch_int8_gemv_dequant_kernel(
     if (weight_scale_size != 1 && weight_scale_size != num_cols) {
         throw std::runtime_error("INT8 GEMV weight scale must be scalar or per-output-channel");
     }
+    if (residual != nullptr && (num_rows != 1 || (K & 3) != 0)) {
+        throw std::runtime_error("INT8 GEMV fused residual requires M == 1 and K divisible by 4");
+    }
+    // 16-byte loads need K % 16 == 0 and 16-byte aligned activation and weight bases.
+    const bool vec16 = (K & 15) == 0
+        && (reinterpret_cast<uintptr_t>(input) & 15) == 0
+        && (reinterpret_cast<uintptr_t>(weight) & 15) == 0;
 
     if (num_rows == 2) {
         if (K % 16 != 0) {
@@ -1854,23 +2284,31 @@ void launch_int8_gemv_dequant_kernel(
     }
 
     DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+        auto launch_warp = [&](auto bias_ptr, bool bias_flag) {
+            using BiasType = std::remove_cv_t<std::remove_pointer_t<decltype(bias_ptr)>>;
+            constexpr int kWarpsPerBlock = 8;
+            const unsigned int blocks =
+                static_cast<unsigned int>((num_cols + kWarpsPerBlock - 1) / kWarpsPerBlock);
+            auto kernel = vec16
+                ? comfy::int8_gemv_dequant_warp_kernel<kWarpsPerBlock, OutputType, BiasType, true>
+                : comfy::int8_gemv_dequant_warp_kernel<kWarpsPerBlock, OutputType, BiasType, false>;
+            kernel<<<blocks, kWarpsPerBlock * comfy::kThreadsPerWarp, 0, stream>>>(
+                static_cast<const int8_t*>(input),
+                static_cast<const int8_t*>(weight),
+                static_cast<const float*>(x_scales),
+                static_cast<const float*>(weight_scales),
+                bias_ptr,
+                static_cast<OutputType*>(output),
+                static_cast<int>(num_cols),
+                static_cast<int>(K),
+                static_cast<int>(weight_scale_size),
+                bias_flag,
+                static_cast<const OutputType*>(residual),
+                static_cast<const OutputType*>(residual_scale));
+        };
         if (!has_bias) {
             if ((K & 3) == 0) {
-                constexpr int kWarpsPerBlock = 8;
-                const unsigned int blocks =
-                    static_cast<unsigned int>((num_cols + kWarpsPerBlock - 1) / kWarpsPerBlock);
-                comfy::int8_gemv_dequant_warp_kernel<kWarpsPerBlock, OutputType, float>
-                    <<<blocks, kWarpsPerBlock * comfy::kThreadsPerWarp, 0, stream>>>(
-                        static_cast<const int8_t*>(input),
-                        static_cast<const int8_t*>(weight),
-                        static_cast<const float*>(x_scales),
-                        static_cast<const float*>(weight_scales),
-                        nullptr,
-                        static_cast<OutputType*>(output),
-                        static_cast<int>(num_cols),
-                        static_cast<int>(K),
-                        static_cast<int>(weight_scale_size),
-                        false);
+                launch_warp(static_cast<const float*>(nullptr), false);
             } else {
                 comfy::int8_gemv_dequant_kernel<comfy::kInt8Threads, OutputType, float>
                     <<<static_cast<unsigned int>(num_cols), comfy::kInt8Threads, 0, stream>>>(
@@ -1890,21 +2328,7 @@ void launch_int8_gemv_dequant_kernel(
 
         DISPATCH_FP_DTYPE(bias_dtype_code, BiasType, [&] {
             if ((K & 3) == 0) {
-                constexpr int kWarpsPerBlock = 8;
-                const unsigned int blocks =
-                    static_cast<unsigned int>((num_cols + kWarpsPerBlock - 1) / kWarpsPerBlock);
-                comfy::int8_gemv_dequant_warp_kernel<kWarpsPerBlock, OutputType, BiasType>
-                    <<<blocks, kWarpsPerBlock * comfy::kThreadsPerWarp, 0, stream>>>(
-                        static_cast<const int8_t*>(input),
-                        static_cast<const int8_t*>(weight),
-                        static_cast<const float*>(x_scales),
-                        static_cast<const float*>(weight_scales),
-                        static_cast<const BiasType*>(bias),
-                        static_cast<OutputType*>(output),
-                        static_cast<int>(num_cols),
-                        static_cast<int>(K),
-                        static_cast<int>(weight_scale_size),
-                        true);
+                launch_warp(static_cast<const BiasType*>(bias), true);
             } else {
                 comfy::int8_gemv_dequant_kernel<comfy::kInt8Threads, OutputType, BiasType>
                     <<<static_cast<unsigned int>(num_cols), comfy::kInt8Threads, 0, stream>>>(
@@ -1925,6 +2349,124 @@ void launch_int8_gemv_dequant_kernel(
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string("CUDA INT8 GEMV dequantization failed: ") + cudaGetErrorString(err));
+    }
+}
+
+void launch_int8_gemv_convrot_fused_kernel(
+    const void* input,
+    int input_dtype_code,
+    int act_code,
+    const void* act_weight,
+    float act_eps,
+    const void* weight,
+    const void* weight_scales,
+    const void* bias,
+    bool has_bias,
+    int bias_dtype_code,
+    void* output,
+    int output_dtype_code,
+    int64_t N,
+    int64_t K,
+    int64_t weight_scale_size,
+    const void* residual,
+    const void* residual_scale,
+    cudaStream_t stream)
+{
+    if (N == 0 || K == 0) {
+        return;
+    }
+    if (N > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
+        K > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("int8 fused convrot GEMV only supports N,K <= INT_MAX");
+    }
+    if (K % comfy::kConvRotGroup != 0) {
+        throw std::runtime_error("int8 fused convrot GEMV requires K divisible by 256");
+    }
+    if ((reinterpret_cast<uintptr_t>(weight) & 15) != 0) {
+        throw std::runtime_error("int8 fused convrot GEMV requires a 16-byte aligned weight");
+    }
+    if (weight_scale_size != 1 && weight_scale_size != N) {
+        throw std::runtime_error("INT8 GEMV weight scale must be scalar or per-output-channel");
+    }
+    if (act_code != comfy::kActNone && act_code != comfy::kActGeluTanh
+        && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm
+        && act_code != comfy::kActSiTU) {
+        throw std::runtime_error("int8 fused convrot GEMV: unsupported input activation code");
+    }
+    if (act_code == comfy::kActRmsNorm && act_weight == nullptr) {
+        throw std::runtime_error("int8 fused convrot GEMV: rms_norm activation requires a weight");
+    }
+    if (has_bias && bias_dtype_code != output_dtype_code) {
+        throw std::runtime_error("int8 fused convrot GEMV expects the bias in the output dtype");
+    }
+
+    int device = 0;
+    int sm_count = 0;
+    if (cudaGetDevice(&device) != cudaSuccess
+        || cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+        throw std::runtime_error("int8 fused convrot GEMV: failed to query SM count");
+    }
+    // Every block repeats the quantizer prologue, so cap the blocks per SM and let
+    // each walk more column groups instead (2 measured best on sm_120 for the
+    // 2048..12288 x 2048..6144 decode shapes).
+    constexpr int blocks_per_sm = 2;
+    const int64_t col_groups = (N + comfy::kFusedGemvCols - 1) / comfy::kFusedGemvCols;
+    const unsigned int blocks =
+        static_cast<unsigned int>(std::min<int64_t>(col_groups, static_cast<int64_t>(blocks_per_sm) * sm_count));
+    // fp32 row + FHT scratch + int8 row (int8 offset stays 16-byte aligned since K % 256 == 0)
+    const size_t smem_bytes =
+        (static_cast<size_t>(K) + (comfy::kFusedGemvThreads / 64) * 2 * comfy::kConvRotGroup) * sizeof(float)
+        + static_cast<size_t>(K);
+
+    DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
+        DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+            // the M=1 binding hands the bias over in the output dtype
+            auto launch = [&](auto kernel) {
+                cudaError_t attr_err = cudaFuncSetAttribute(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+                if (attr_err != cudaSuccess) {
+                    throw std::runtime_error(
+                        std::string("int8 fused convrot GEMV shared memory request (") +
+                        std::to_string(smem_bytes) + " bytes) failed: " + cudaGetErrorString(attr_err));
+                }
+                kernel<<<blocks, comfy::kFusedGemvThreads, smem_bytes, stream>>>(
+                    static_cast<const InputType*>(input),
+                    static_cast<const InputType*>(act_weight),
+                    act_eps,
+                    static_cast<const int8_t*>(weight),
+                    static_cast<const float*>(weight_scales),
+                    static_cast<const OutputType*>(bias),
+                    static_cast<OutputType*>(output),
+                    static_cast<int>(N),
+                    static_cast<int>(K),
+                    static_cast<int>(weight_scale_size),
+                    has_bias,
+                    static_cast<const OutputType*>(residual),
+                    static_cast<const OutputType*>(residual_scale));
+            };
+            switch (act_code) {
+                case comfy::kActGeluTanh:
+                    launch(comfy::int8_gemv_convrot_fused_kernel<InputType, OutputType, OutputType, comfy::kActGeluTanh>);
+                    break;
+                case comfy::kActSwiGLU:
+                    launch(comfy::int8_gemv_convrot_fused_kernel<InputType, OutputType, OutputType, comfy::kActSwiGLU>);
+                    break;
+                case comfy::kActRmsNorm:
+                    launch(comfy::int8_gemv_convrot_fused_kernel<InputType, OutputType, OutputType, comfy::kActRmsNorm>);
+                    break;
+                case comfy::kActSiTU:
+                    launch(comfy::int8_gemv_convrot_fused_kernel<InputType, OutputType, OutputType, comfy::kActSiTU>);
+                    break;
+                default:
+                    launch(comfy::int8_gemv_convrot_fused_kernel<InputType, OutputType, OutputType, comfy::kActNone>);
+                    break;
+            }
+        });
+    });
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA INT8 fused convrot GEMV failed: ") + cudaGetErrorString(err));
     }
 }
 

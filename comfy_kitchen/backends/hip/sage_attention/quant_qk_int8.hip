@@ -198,18 +198,19 @@ __global__ __launch_bounds__(kQuantWaves * 32) void quant_q_mask_int8_kernel(
 // ---------------------------------------------------------------------------
 // K: one scale per 16 adjacent keys. A whole scale group lives in one wave, so
 // the reduction never leaves it and the kernel needs no barrier at all. The
-// group is read twice rather than held: 16 rows of registers is affordable at
-// D64 and D128 but not at D256, and the second read is cheaper than the
-// occupancy the widest case would lose.
+// general path rereads the group to limit register pressure. Paged decode
+// retains the rotated rows, as CUDA does: with only two pages to refresh,
+// avoiding the second rotation matters more than occupancy.
 // ---------------------------------------------------------------------------
 
 constexpr int kKeyGroupsPerBlock = kQuantWaves;
 
-template <typename T, int HD, int Rotation>
+template <typename T, int HD, int Rotation, bool Paged = false>
 __global__ __launch_bounds__(kQuantWaves * 32) void quant_k_int8_kernel(
     const T* __restrict__ k, int8_t* __restrict__ k_out, float* __restrict__ k_scale,
     const int* __restrict__ anchor_indices, int Lk, int H_kv, int groups_per_head,
-    int64_t stride_b, int64_t stride_h, int64_t stride_n) {
+    int64_t stride_b, int64_t stride_h, int64_t stride_n,
+    const int64_t* position = nullptr, int pages = 0, bool initialize = false) {
 
     using Tile = RowTile<HD>;
     constexpr int kRowPasses = 16 / Tile::kRowsPerWave;
@@ -223,7 +224,23 @@ __global__ __launch_bounds__(kQuantWaves * 32) void quant_k_int8_kernel(
     if (group >= groups_per_head) return;
 
     const int h = blockIdx.y;
-    const int b = blockIdx.z;
+    int b = blockIdx.z;
+    const int padded_Lk = Lk;
+    if constexpr (Paged) {
+        const int count = initialize ? pages : 2;
+        b = blockIdx.z / count;
+        const int length = static_cast<int>(position[0]);
+        const int page = initialize ? blockIdx.z % count :
+            max(0, (length - 1) / padded_Lk - 1) + blockIdx.z % count;
+        if (page >= pages || page * padded_Lk >= length) return;
+        Lk = min(padded_Lk, length - page * padded_Lk);
+        const int source_row = initialize ? page * padded_Lk :
+            page * padded_Lk % (stride_h / stride_n);
+        k += static_cast<int64_t>(source_row) * stride_n;
+        const int64_t offset = (static_cast<int64_t>(b) * (pages - 1) + page) * H_kv;
+        k_out += offset * padded_Lk * HD;
+        k_scale += offset * groups_per_head;
+    }
     const int64_t bh = static_cast<int64_t>(b) * H_kv + h;
     const T* head = k + static_cast<int64_t>(b) * stride_b + static_cast<int64_t>(h) * stride_h;
     const int key0 = group * 16;
@@ -231,7 +248,7 @@ __global__ __launch_bounds__(kQuantWaves * 32) void quant_k_int8_kernel(
     // A negative index means the detector found no anchor worth subtracting. The
     // subtraction stays unconditional either way, with a zero bias standing in,
     // so the anchor never has to be reached through a pointer.
-    const int anchor_index = anchor_indices[bh];
+    const int anchor_index = Paged ? -1 : anchor_indices[bh];
     float bias[Tile::kValsPerLane];
     if (anchor_index >= 0) {
         load_row<HD, T>(head + static_cast<int64_t>(anchor_index) * stride_n, lane_in_row, bias);
@@ -241,6 +258,7 @@ __global__ __launch_bounds__(kQuantWaves * 32) void quant_k_int8_kernel(
     }
 
     float vals[Tile::kValsPerLane];
+    float rotated[Paged ? kRowPasses : 1][Tile::kValsPerLane];
     float mx = 0.0f;
 #pragma unroll
     for (int pass = 0; pass < kRowPasses; ++pass) {
@@ -250,6 +268,10 @@ __global__ __launch_bounds__(kQuantWaves * 32) void quant_k_int8_kernel(
 #pragma unroll
             for (int i = 0; i < Tile::kValsPerLane; ++i) vals[i] -= bias[i];
             mx = fmaxf(mx, rotate_row<HD, Rotation>(vals));
+            if constexpr (Paged) {
+#pragma unroll
+                for (int i = 0; i < Tile::kValsPerLane; ++i) rotated[pass][i] = vals[i];
+            }
         }
     }
 
@@ -262,11 +284,16 @@ __global__ __launch_bounds__(kQuantWaves * 32) void quant_k_int8_kernel(
     for (int pass = 0; pass < kRowPasses; ++pass) {
         const int key = key0 + pass * Tile::kRowsPerWave + row_in_wave;
         if (key < Lk) {
-            load_row<HD, T>(head + static_cast<int64_t>(key) * stride_n, lane_in_row, vals);
+            if constexpr (Paged) {
 #pragma unroll
-            for (int i = 0; i < Tile::kValsPerLane; ++i) vals[i] -= bias[i];
-            rotate_row<HD, Rotation>(vals);
-            store_row<HD, T>(k_out + (bh * Lk + key) * HD, lane_in_row, vals, inv_scale);
+                for (int i = 0; i < Tile::kValsPerLane; ++i) vals[i] = rotated[pass][i];
+            } else {
+                load_row<HD, T>(head + static_cast<int64_t>(key) * stride_n, lane_in_row, vals);
+#pragma unroll
+                for (int i = 0; i < Tile::kValsPerLane; ++i) vals[i] -= bias[i];
+                rotate_row<HD, Rotation>(vals);
+            }
+            store_row<HD, T>(k_out + (bh * padded_Lk + key) * HD, lane_in_row, vals, inv_scale);
         }
     }
 }
@@ -589,4 +616,23 @@ extern "C" void launch_sage_quant_qk_int8(const void* q, void* q_int8, void* q_s
         throw std::runtime_error(std::string("sage int8 quantize kernel launch failed: ") +
                                  hipGetErrorString(error));
     }
+}
+
+// Fixed H128 rotations without sequence-wide centering keep sealed pages reusable.
+extern "C" void launch_int8_decode_quant_q(
+    const void* q, int8_t* out, float* scales, int B, int H, int rows, hipStream_t stream) {
+    quant_q_int8_kernel<__bf16, 256, 129><<<dim3(1, H, B), kQuantWaves * 32, 0, stream>>>(
+        static_cast<const __bf16*>(q), out, scales, rows, 64, H,
+        static_cast<int64_t>(H) * rows * 256, static_cast<int64_t>(rows) * 256, 256);
+}
+
+extern "C" void launch_int8_decode_quant_k(
+    const void* k, int8_t* out, float* scales, const int64_t* position,
+    int B, int H, int capacity, int pages, int page_size, bool initialize, hipStream_t stream) {
+    quant_k_int8_kernel<__bf16, 256, 129, true>
+        <<<dim3(page_size / (16 * kKeyGroupsPerBlock), H, B * (initialize ? pages : 2)),
+           kQuantWaves * 32, 0, stream>>>(
+        static_cast<const __bf16*>(k), out, scales, nullptr, page_size, H, page_size / 16,
+        static_cast<int64_t>(H) * capacity * 256, static_cast<int64_t>(capacity) * 256, 256,
+        position, pages, initialize);
 }

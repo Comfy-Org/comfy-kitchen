@@ -20,16 +20,29 @@ void launch_na3d_kernel(const void* q, const void* k, const void* v, void* out, 
                         int kh, int kw, int causal_t, int causal_h, int causal_w, float scale,
                         int dtype_code, hipStream_t stream);
 
-// BF16 decode attention over a fixed-capacity KV cache. query_length is the GQA
-// group count folded into the query sequence dimension by the Python layer, and
-// head_dim is 128 or 256. out_accum and lse_accum are read only when
-// num_splits > 1. See ops/flash_decode.hip.
+// BF16 decode attention over a fixed-capacity KV cache. The rows of one KV head
+// are a (group, step) grid of query_length = groups * steps rows; `causal` gives
+// row (g, s) the slot limit kv_lengths[b] - steps + s + 1. head_dim is 128 or
+// 256. out_accum and lse_accum are read only when num_splits > 1. See
+// ops/flash_decode.hip.
 void launch_flash_decode(const void* q, const void* k, const void* v, const int* kv_lengths,
                          void* out, float* softmax_lse, float* out_accum, float* lse_accum,
-                         int batch, int query_length, int heads, int head_dim, int kv_capacity, int num_splits,
-                         int64_t q_batch_stride, int64_t q_row_stride, int64_t q_head_stride,
-                         int64_t k_batch_stride, int64_t k_row_stride, int64_t k_head_stride,
-                         hipStream_t stream);
+                         int batch, int query_length, int steps, int heads, int head_dim,
+                         int kv_capacity, int num_splits, bool causal,
+                         int64_t q_batch_stride, int64_t q_group_stride, int64_t q_step_stride,
+                         int64_t q_head_stride, int64_t k_batch_stride, int64_t k_row_stride,
+                         int64_t k_head_stride, int64_t o_batch_stride, int64_t o_group_stride,
+                         int64_t o_step_stride, int64_t o_head_stride, hipStream_t stream);
+
+// Folds a verify tree's own rows (mask bit t = row t) into a prefix-only decode
+// result; see ops/flash_decode.hip. heads is the query head count.
+void launch_flash_decode_tree_merge(
+    const void* out, const float* lse, const void* q, const void* k, const void* v, const int* mask,
+    void* merged, int batch, int rows, int heads, int kv_heads, int64_t q_batch_stride,
+    int64_t q_head_stride, int64_t q_row_stride, int64_t k_batch_stride, int64_t k_head_stride,
+    int64_t k_row_stride, int64_t v_batch_stride, int64_t v_head_stride, int64_t v_row_stride,
+    int64_t o_batch_stride, int64_t o_row_stride, int64_t m_batch_stride, int64_t m_row_stride,
+    hipStream_t stream);
 
 // ldc is c's row stride, so a caller writing an N-column slice of a wider output
 // passes that output's width; a whole GEMM passes N.
@@ -37,6 +50,19 @@ void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* 
                              const void* scale_b, int scale_b_stride, const void* bias,
                              int bias_code, int M, int N, int K, int ldc, int out_code,
                              hipStream_t stream);
+
+// A is physically [M_tile, K_tile, 128, 128]; B is row-major.
+void launch_int8_gemm_a_tiled128_kernel(
+    const void* a, const void* b, void* c, const void* scale_a,
+    const void* scale_b, int scale_b_stride, const void* bias,
+    int bias_code, int M, int N, int K, int ldc, int out_code,
+    hipStream_t stream);
+
+// Exact BF16 RMSNorm followed by gate multiplication and residual add.
+void launch_rms_gated_residual_bf16_kernel(
+    const void* activation, const void* norm_weight, const void* residual,
+    const void* gate, void* output, int rows, int width, float eps,
+    hipStream_t stream);
 
 // scale_code is a DTYPE_TO_CODE value: 0 float32, 5 e4m3 (passed as raw bytes).
 // codebook is 16 floats, or null for the uniform levels. bits is 4 or 6.
@@ -53,6 +79,13 @@ void launch_quantize_wxa8_convrot_fused_kernel(const void* weight, const void* c
                                                int64_t n, int64_t k, int bits, int g,
                                                int in_dtype_code, bool stochastic, uint64_t seed,
                                                hipStream_t stream);
+
+// Staged 4-bit requantize of an already rotated [N, K] weight, in_dtype_code 0 float32,
+// 1 float16 or 2 bfloat16. Throws when the K/16 group scales do not fit in LDS.
+void launch_quantize_w4a8_convrot_kernel(const void* rotated, const void* codebook, void* packed,
+                                         void* s_rel, void* s_channel, int64_t n, int64_t k,
+                                         int in_dtype_code, bool stochastic, uint64_t seed,
+                                         hipStream_t stream);
 
 // Widest K the fused requantize can take at this group size on the current device,
 // 0 if unknown.
