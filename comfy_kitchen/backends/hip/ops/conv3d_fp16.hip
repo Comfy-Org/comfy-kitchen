@@ -82,7 +82,19 @@ extern "C" bool launch_fp16_conv3d_kernel(
     const bool served = depth > 16384 || (small_launch && depth > 8192)
                             ? small_launch && tiles(64, 64) >= 16
                             : !small_launch;
-    if (!served) {
+    // The envelope sends a small launch to the framework's conv, which is the
+    // right call where the framework's conv is good. On this part it is not:
+    // MIOpen has no optimized gfx1103 kernel for the grouped case and falls
+    // back to one that runs at 0.7-1.3 TOPS, while the kernel here runs at
+    // 1.1-8 TOPS on the same shapes. The VAE's own convolutions are the small
+    // ones this drops -- C=128 or 256 at 64x64 is 32 or 64 tiles of 128x128 --
+    // so they ran MIOpen's fallback at four to eleven times the cost.
+    //
+    // The tile choice is not this launcher's to make: the GEMM's own policy
+    // already takes the narrow tile for a launch this small (see the padding
+    // waste test in gemm_wmma.h), and the shapes that reach here keep the
+    // kernel's numbers.
+    if (!served && !comfy_small_igpu()) {
         return false;
     }
 

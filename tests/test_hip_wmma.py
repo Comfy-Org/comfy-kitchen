@@ -984,7 +984,12 @@ def test_fp16_conv3d_declines_like_cuda(hip):
     # a token launch, and a deep (C*T*R*S > 16384) launch large enough to fill the device
     for shape in [(64, 64, 3, 6, 6), (640, 640, 5, 66, 66)]:
         x, weight, bias, residual = _conv_inputs(*shape, (3, 3, 3), with_residual=True)
-        assert hip._wmma_fp16_conv3d(x, weight, bias, residual, [1, 1, 1]) is None
+        # The small iGPU serves both: MIOpen has no optimized gfx1103 kernel for
+        # the grouped case, so the framework's conv it would fall back to runs
+        # at 0.7-1.3 TOPS against the fused kernel's 1.1-8, and the VAE's own
+        # convolutions are the small launches the envelope drops.
+        if not hip._is_small_igpu():
+            assert hip._wmma_fp16_conv3d(x, weight, bias, residual, [1, 1, 1]) is None
         got = hip.fp16_conv3d(x, weight, bias, residual, [1, 1, 1])
         assert _rel_err(got, _conv_ref(x, weight, bias, residual, (1, 1, 1))) < 5e-3
     # a residual that does not match the output shape

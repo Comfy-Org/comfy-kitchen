@@ -76,6 +76,43 @@ class TestFp16Conv3d:
         ref = _ref(x, weight, bias, residual, (1, 1, 1))
         assert rel_err(got.float(), ref) < fp16_accum_tol(512 * 27)
 
+    @pytest.mark.parametrize(
+        "c,k,d,h,w,ksize",
+        [
+            (128, 128, 1, 64, 64, (3, 3, 3)),
+            (256, 256, 1, 32, 32, (3, 3, 3)),
+            (64, 64, 1, 16, 1, (3, 3, 3)),
+        ],
+    )
+    def test_hip_small_launch_is_served(self, c, k, d, h, w, ksize, seed, cuda_available):
+        """A launch too small for the 128-row tiles is served by the fused kernel.
+
+        The HIP backend's envelope used to hand these to the framework's conv.
+        That is the right call where the framework's conv is good; on this part
+        it is not -- MIOpen has no optimized gfx1103 kernel for the grouped case
+        and falls back to one that runs at 0.7-1.3 TOPS against the fused
+        kernel's 1.1-8 -- and the VAE's own convolutions are exactly these
+        small ones.
+        """
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        if not getattr(torch.version, "hip", None):
+            pytest.skip("requires HIP")
+        from comfy_kitchen.backends import hip as hip_backend
+
+        if not ck.list_backends().get("hip", {}).get("available", False):
+            pytest.skip("compiled HIP backend required")
+        x, weight, bias, _ = _inputs(c, k, d, h, w, ksize)
+        # The fused kernel computes a valid convolution, so the input carries
+        # the pad the callers add.
+        xp = functional.pad(x, (0, ksize[2] - 1, 0, ksize[1] - 1, 0, ksize[0] - 1)).contiguous(
+            memory_format=CL3D)
+        got = hip_backend._wmma_fp16_conv3d(xp, weight, bias, None, [1, 1, 1])
+        assert got is not None, "the small launch was declined"
+        ref = functional.conv3d(xp.float(), weight.float(), bias.float())
+        kdim = c * math.prod(ksize)
+        assert rel_err(got.float(), ref) < fp16_accum_tol(kdim)
+
     def test_token_launch_declined(self, seed, cuda_available):
         """A launch below even the smallest config's threshold stays on cuDNN;
         the public op must still return the right answer."""
