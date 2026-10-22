@@ -8,6 +8,14 @@
 // buffer exists; B is the weight in its channels_last_3d (K, T, R, S, C) layout and
 // the output is written NZPQK. Accumulation is fp32. x may be an NDHWC-ordered view of a
 // larger tensor, so a tiled convolution reads its tile in place.
+//
+// On the 6-WGP 780M this is 6x-11x faster than MIOpen's conv3d on the same shapes
+// (9.5 ms against 80.6 ms at C=128 256x256, 6.10 TOPS against 0.72), because
+// MIOpen has no optimized gfx1103 kernel for the grouped case. The gather is
+// instruction-bound: the inner loop issues its WMMA in about one percent of the
+// slots, and the staging path's six integer divisions by launch-time constants
+// are 43% of that path's instructions (RDNA has no integer divider, so each one
+// is a float-reciprocal sequence of about twenty).
 #include "../epilogue.h"
 #include "../gemm_wmma.h"
 
