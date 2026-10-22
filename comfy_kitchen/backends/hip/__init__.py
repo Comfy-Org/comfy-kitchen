@@ -2508,7 +2508,31 @@ def fp16_conv3d_out(
     """fp16_conv3d into ``out``; computed then copied when the kernel cannot index ``out``."""
     if _wmma_fp16_conv3d(x, weight, bias, residual, stride, out=out) is not None:
         return
-    out.copy_(fp16_conv3d(x, weight, bias, residual, stride))
+    res = fp16_conv3d(x, weight, bias, residual, stride)
+    if (_wants_nchw_transpose(out) and out.shape == res.shape
+            and out.dtype == res.dtype
+            and res.is_contiguous(memory_format=torch.channels_last_3d)):
+        _C.ndhwc_to_nchw(_dl(res), _dl(out), _stream(x))
+        return
+    out.copy_(res)
+
+
+def _wants_nchw_transpose(out: torch.Tensor) -> bool:
+    """Whether filling an NCDHW ``out`` from a channels_last result wants the transpose kernel.
+
+    The kernels here write channels_last. A caller who wants an NCDHW ``out``
+    has it copied, and on this part that copy is the slow direction: the
+    destination's inner dimension is the source's outer one, so every element
+    lands in a 32-byte sector it cannot share with a neighbour. Measured on the
+    6-WWP 780M, 268 MB: 2.3 GB/s that way round against 58.7 GB/s the other
+    way. The transpose kernel does it in two coalesced passes.
+    """
+    return (out.is_contiguous()
+            and not out.is_contiguous(memory_format=torch.channels_last_3d)
+            and out.dtype in (torch.float16, torch.bfloat16)
+            and out.dim() == 5
+            and out.shape[1] % 8 == 0
+            and out.data_ptr() % 16 == 0)
 
 
 def group_norm_silu_pad3d(
@@ -2558,6 +2582,8 @@ def group_norm_silu_pad3d(
         res = _eager.group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, stats)
         if out is None:
             return res
+        # The eager result keeps the channel axis between the time and the
+        # height, so its copy into out is not the scattered direction.
         out.copy_(res)
         return out
 
@@ -2571,8 +2597,7 @@ def group_norm_silu_pad3d(
     # cannot share. Measured on the 6-WGP 780M, a 268 MB copy runs at 2.3 GB/s that
     # way round against 58.7 GB/s the other way. The kernel's own transpose does it
     # in two coalesced passes.
-    ncdhw_out = (out is not None and dst is None and out.is_contiguous()
-                 and out.dtype in (torch.float16, torch.bfloat16) and c % 8 == 0)
+    ncdhw_out = (out is not None and dst is None and _wants_nchw_transpose(out))
     if dst is None:
         dst = torch.empty(oshape, dtype=x.dtype, device=x.device,
                           memory_format=torch.channels_last_3d)
