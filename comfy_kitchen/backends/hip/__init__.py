@@ -2685,6 +2685,8 @@ def sol_attn(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    kv_indices: torch.Tensor | None = None,
+    kv_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
     See sage_attention/sol_attn.hip and the public docstring for ``tail``,
@@ -2704,6 +2706,8 @@ def sol_attn(
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
     _check_sol_args(sink_blocks, sink_q, topk_ratio, q=q, k=k, v=v,
                     block_len=block_len, coarse_gate=coarse_gate)
+    if kv_indices is not None:
+        raise ValueError("sol_attn: kv_indices block lists are CUDA only")
     if scale is None:
         scale = d ** -0.5
     if block_len is not None:

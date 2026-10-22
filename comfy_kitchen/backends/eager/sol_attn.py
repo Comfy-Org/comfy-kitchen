@@ -132,6 +132,8 @@ def sol_attn(
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,   # ignored: the reference is exact arithmetic over the same
                           # block selection, so there is no token routing stage to model
+    kv_indices: torch.Tensor | None = None,
+    kv_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn over ``(B, T, H, D)`` tensors. See the module docstring.
 
@@ -142,6 +144,7 @@ def sol_attn(
     clamped to [1, rows in the block]; dead rows are never keys and their
     output rows are unspecified), and ``coarse_gate`` adds VSA's gated coarse
     branch: ``gate * softmax(q_mean k_mean^T * scale) v_mean`` per block.
+    ``kv_indices``/``kv_counts`` replace routing, with no forced blocks or tail.
     """
     b, t, h, d = q.shape
     n = (t + BLOCK - 1) // BLOCK
@@ -199,7 +202,12 @@ def sol_attn(
     colmean.scatter_add_(2, qblk.view(1, 1, t, 1).expand(b, h, t, n), s_blk)
     colmean = colmean / lengths.view(1, 1, n, 1)
     idx = torch.arange(n, device=q.device)
-    if topk_ratio:
+    if kv_indices is not None:
+        listed = torch.arange(kv_indices.shape[-1], device=q.device) < kv_counts[..., None]
+        exact = torch.zeros(b, h, n, n + 1, dtype=torch.bool, device=q.device)
+        exact = exact.scatter_(-1, torch.where(listed, kv_indices.long() & 0xFFFF, n), True)[..., :n]
+        tail = False
+    elif topk_ratio:
         # sink blocks are always exact, so they neither count toward nor consume the budget
         ranked = colmean.clone()
         ranked[..., sink_kv0:sink_kv1] = float("-inf")
@@ -215,9 +223,10 @@ def sol_attn(
         var = (centroid.pow(2) * kc_var.unsqueeze(1)).sum(-1)      # (B, N, H)
         thr = tau * torch.sqrt(var * log2s * log2s + 1e-6)
         exact = colmean > thr.permute(0, 2, 1).unsqueeze(-1)            # (B, H, NQ, N)
-    exact |= ((idx.view(1, -1) - idx.view(-1, 1)).abs() <= 1).view(1, 1, n, n)
-    exact |= ((idx >= sink_kv0) & (idx < sink_kv1)).view(1, 1, 1, n)
-    exact |= ((idx >= sink_q0) & (idx < sink_q1)).view(1, 1, n, 1)
+    if kv_indices is None:
+        exact |= ((idx.view(1, -1) - idx.view(-1, 1)).abs() <= 1).view(1, 1, n, n)
+        exact |= ((idx >= sink_kv0) & (idx < sink_kv1)).view(1, 1, 1, n)
+        exact |= ((idx >= sink_q0) & (idx < sink_q1)).view(1, 1, n, 1)
 
     ex_tok = exact.gather(2, qblk.view(1, 1, t, 1).expand(b, h, t, n))   # (B,H,T,N)
     keep_tok = ex_tok.repeat_interleave(BLOCK, dim=-1)[..., :t]
@@ -260,13 +269,15 @@ def _op_sol_attn(
     block_len: torch.Tensor | None,
     coarse_gate: torch.Tensor | None,
     token_aug: int = 0,
+    kv_indices: torch.Tensor | None = None,
+    kv_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     kwargs = {
         "q": q, "k": k, "v": v, "tau": tau, "scale": scale,
         "sink_blocks": sink_blocks, "sink_q": sink_q,
         "key_bias": key_bias, "topk_ratio": topk_ratio,
         "tail": tail, "block_len": block_len, "coarse_gate": coarse_gate,
-        "token_aug": token_aug,
+        "token_aug": token_aug, "kv_indices": kv_indices, "kv_counts": kv_counts,
     }
     impl = registry.get_implementation("sol_attn", kwargs=kwargs)
     return impl(**kwargs)
@@ -274,6 +285,7 @@ def _op_sol_attn(
 
 @_op_sol_attn.register_fake
 def _op_sol_attn_fake(q, k, v, tau, scale, sink_blocks, sink_q,
-                      key_bias, topk_ratio, tail, block_len, coarse_gate, token_aug=0):
+                      key_bias, topk_ratio, tail, block_len, coarse_gate, token_aug=0,
+                      kv_indices=None, kv_counts=None):
     # contiguous, NOT empty_like(v): both real implementations return contiguous
     return torch.empty(v.shape, dtype=v.dtype, device=v.device)

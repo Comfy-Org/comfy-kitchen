@@ -295,6 +295,17 @@ def sol_attn_common_call_rule(kwargs):
                     "coarse_gate", f"must have q's shape {tuple(q.shape)}, got {tuple(coarse_gate.shape)}")
             if coarse_gate.device != q.device:
                 return ValidationResult.fail("coarse_gate", f"must be on {q.device}, got {coarse_gate.device}")
+        kv_indices, kv_counts = kwargs.get("kv_indices"), kwargs.get("kv_counts")
+        if (kv_indices is None) != (kv_counts is None) or (kv_indices is not None and kwargs.get("token_aug")):
+            return ValidationResult.fail("kv_indices", "kv_indices and kv_counts go together and replace routing (no token_aug)")
+        rows = (q.shape[0], q.shape[2], (q.shape[1] + 63) // 64)
+        for name, value, ndim in (("kv_indices", kv_indices, 4), ("kv_counts", kv_counts, 3)):
+            if value is None:
+                continue
+            if value.dim() != ndim or tuple(value.shape[:3]) != rows or value.dtype.is_floating_point or value.dtype == torch.bool:
+                return ValidationResult.fail(name, f"must be an integer tensor with leading shape {rows}, got {value.dtype} {tuple(value.shape)}")
+            if value.device != q.device:
+                return ValidationResult.fail(name, f"must be on {q.device}, got {value.device}")
     # Both sinks are half-open [start, end) block ranges.
     for name in ("sink_blocks", "sink_q"):
         value = kwargs.get(name)

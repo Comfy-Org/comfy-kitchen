@@ -3019,6 +3019,8 @@ def sol_attn(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    kv_indices: torch.Tensor | None = None,
+    kv_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
     See sage_attention/sol_attn.cu and the public docstring for ``tail``,
@@ -3039,9 +3041,12 @@ def sol_attn(
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
     _check_sol_args(q.device, sink_blocks, sink_q, topk_ratio, q=q, k=k, v=v,
-                    block_len=block_len, coarse_gate=coarse_gate)
+                    block_len=block_len, coarse_gate=coarse_gate, kv_indices=kv_indices, kv_counts=kv_counts)
     if scale is None:
         scale = d ** -0.5
+    if kv_indices is not None:
+        kv_indices = kv_indices.to(torch.int16).contiguous()
+        kv_counts = kv_counts.to(torch.int32).contiguous()
     if block_len is not None:
         block_len = block_len.contiguous()
     lengths = _block_lengths(t, (t + 63) // 64, q.device, block_len)
@@ -3071,7 +3076,7 @@ def sol_attn(
         kb = _normalize_key_bias(key_bias, batch, t, q.device)
         kb = (kb * _LOG2E).expand(batch, t).contiguous()
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug))
+    p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug), routed=kv_indices is None)
     workspace = torch.empty(p["total"], dtype=torch.uint8, device=q.device)
     # after the large buffers so its temporaries don't fragment the cache they reuse
     thr = (_topk_threshold(q, k, topk_ratio, scale, mean_lengths, valid, sb)
@@ -3090,6 +3095,8 @@ def sol_attn(
         threshold=None if thr is None else _wrap_for_dlpack(thr),
         block_len=None if block_len is None else _wrap_for_dlpack(block_len),
         tail=bool(tail), token_aug=int(token_aug),
+        kv_indices=None if kv_indices is None else _wrap_for_dlpack(kv_indices),
+        kv_counts=None if kv_counts is None else _wrap_for_dlpack(kv_counts),
     )
     if coarse_gate is not None:
         add_coarse_(out, coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale),

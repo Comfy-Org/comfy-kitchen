@@ -972,3 +972,43 @@ def test_block_len_validation():
     c = _chunked_case(seed=11, rot=64)
     with pytest.raises(ValueError, match="block_len"):
         backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], block_len=bad_dtype)
+
+def _block_lists(b, h, t, density, seed=0):
+    n = (t + 63) // 64
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    mask = (torch.rand(b, h, n, n, device="cuda", generator=g) < density) | torch.eye(n, dtype=torch.bool, device="cuda")
+    counts = mask.sum(-1, dtype=torch.int32)
+    return torch.argsort((~mask).to(torch.uint8), dim=-1, stable=True)[..., :int(counts.max())], counts
+
+
+block_lists = pytest.mark.skipif(backend is not cuda_backend, reason="caller block lists are CUDA only")
+
+
+@block_lists
+@pytest.mark.parametrize("b,h", [(1, 2), (2, 3)])
+@pytest.mark.parametrize("t,density", [(1024, 0.05), (1024, 1.0), (1000, 0.3)])
+def test_block_lists_match_eager(b, h, t, density):
+    q, k, v = _qkv(b, t, h)
+    ids, counts = _block_lists(b, h, t, density, seed=t + b)
+    out = ck.sol_attn(q, k, v, kv_indices=ids, kv_counts=counts)
+    assert _cos(out, sol_attn_eager(q, k, v, kv_indices=ids, kv_counts=counts)) > 0.999
+
+
+@block_lists
+def test_block_lists_ignore_padding_and_zero_empty_rows():
+    q, k, v = _qkv(1, 512, 2)
+    ids, counts = _block_lists(1, 2, 512, 0.3)
+    counts[:, :, 2] = 0
+    padded = torch.cat([ids, torch.full_like(ids[..., :3], 5)], dim=-1)
+    out = backend.sol_attn(q, k, v, kv_indices=padded, kv_counts=counts)
+    assert torch.equal(out, backend.sol_attn(q, k, v, kv_indices=ids, kv_counts=counts))
+    assert torch.all(out[:, 128:192] == 0) and torch.all(out[:, 192:256] != 0)
+
+
+@block_lists
+def test_block_lists_validation():
+    q, k, v = _qkv(1, 512, 2)
+    ids, counts = _block_lists(1, 2, 512, 0.3)
+    for bad in ({"kv_indices": ids[:, :, :-1], "kv_counts": counts}, {"kv_indices": ids}, {"kv_indices": ids.float(), "kv_counts": counts}):
+        with pytest.raises(ValueError, match="kv_"):
+            backend.sol_attn(q, k, v, **bad)
