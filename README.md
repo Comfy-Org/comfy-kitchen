@@ -46,6 +46,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `delaunay3d`                |       | ✓    |        |     |     |
 | `mesh_bvh`                  |       | ✓    |        |     |     |
 | `closest_point_on_mesh`     |       | ✓    |        |     |     |
+| `closest_hit_on_mesh`       |       | ✓    |        |     |     |
 | `connected_components`      |       | ✓    |        |     |     |
 | `edge_collapse_checks`      |       | ✓    |        |     |     |
 | `min_cut`                   |       | ✓    |        |     |     |
