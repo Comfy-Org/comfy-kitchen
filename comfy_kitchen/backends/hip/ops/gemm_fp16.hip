@@ -12,6 +12,67 @@
 
 namespace comfy::hip_backend {
 
+template <typename T>
+__forceinline__ __device__ float gemv_to_float(T v) {
+    return static_cast<float>(v);
+}
+template <>
+__forceinline__ __device__ float gemv_to_float<__half>(__half v) {
+    return __half2float(v);
+}
+
+// Small-M path: one wave per output column, the K reduction inside the wave.
+//
+// The WMMA path stages a 128-row tile for a single row. The weight traffic is
+// the same -- one pass over the weight either way -- but the stager's loop
+// runs over 128 rows to drop 127 of them, and the tile's shape is a poor fit
+// for one row. Measured on the 6-WGP 780M with K=4096, against the int8
+// GEMV's rate on the same bytes:
+//
+//     N=1024    17.3 GB/s    the WMMA path
+//     N=4096    26.7 GB/s
+//     N=12288   45.6 GB/s
+//     N=151936  70.0 GB/s    (the weight is big enough that the stager's waste
+//                             is a small part of it)
+//
+// The GEMV reaches the int8 GEMV's 57-80 GB/s at the small and middle sizes.
+//
+// Eight elements per lane is four 16-byte loads' worth of reduction; the
+// conversions and the multiplies are 24 instructions per 16 bytes, which at
+// 50 GB/s of weight is about half the memory time, so the kernel stays
+// bandwidth-bound.
+template <typename T, typename OutT>
+__global__ __launch_bounds__(256) void gemv_fp16_kernel(
+    const T* __restrict__ A, const T* __restrict__ B, OutT* __restrict__ C,
+    int M, int N, int K, int ldc, EpiFp16 epi) {
+
+    const int col = blockIdx.x * blockDim.y + threadIdx.y;
+    const int row = blockIdx.y;
+    if (col >= N || row >= M) return;
+
+    const T* a = A + static_cast<int64_t>(row) * K;
+    const T* b = B + static_cast<int64_t>(col) * K;
+
+    float sum = 0.0f;
+    for (int k = threadIdx.x * 8; k < K; k += kWave * 8) {
+        const uint4 av = *reinterpret_cast<const uint4*>(a + k);
+        const uint4 bv = *reinterpret_cast<const uint4*>(b + k);
+        const T* ah = reinterpret_cast<const T*>(&av);
+        const T* bh = reinterpret_cast<const T*>(&bv);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            sum += gemv_to_float<T>(ah[i]) * gemv_to_float<T>(bh[i]);
+        }
+    }
+    sum = wave_reduce_sum(sum);
+
+    if (threadIdx.x == 0) {
+        epi.init();
+        C[static_cast<int64_t>(row) * ldc + col] = static_cast<OutT>(
+            epi(row, col, sum, epi.row_scale(row), epi.col_scale(col), epi.col_bias(col)));
+    }
+}
+
 // Both launchers share the shape envelope. Every device but the gfx1103 iGPU
 // keeps upstream's: the vendor GEMM is preferred for shallow K and M > 8192
 // (CUDA's envelope; below the deep-K boundary where CUDA moves to stream-K, and
@@ -65,6 +126,39 @@ inline bool fp16_shape_served(int M, int N, int K) {
     return true;
 }
 
+// Whether the one-row GEMV beats the WMMA path for an output of N columns.
+//
+// The GEMV reads the weight once, like the WMMA path, but it does the products
+// in the vector unit rather than the matrix pipe, and it has no 128-row tile to
+// stage. Which of those matters depends on how much weight there is to read.
+//
+// Measured on the 6-WGP 780M at K=4096, the two paths interleaved in one
+// process (M=9 leaves the GEMV, whose cutoff is M <= 8, and takes the WMMA
+// path, so the comparison is at the same shape):
+//
+//     N=1024    16.7 GB/s   against 17.2    0.97x
+//     N=4096    27.1        against 35.1    0.77x
+//     N=12288   45.2        against 51.7    0.87x
+//     N=24576   78.3        against 66.8    1.17x
+//     N=32768   80.2        against 68.0    1.18x
+//     N=65536   80.0        against 66.7    1.20x
+//     N=151936  80.5        against 67.4    1.19x
+//
+// The crossover is a step, not a slope: below it the WMMA path's matrix pipe
+// is worth more than the GEMV's simpler staging, above it the weight traffic
+// is the whole cost and the GEMV reaches the roofline where the WMMA path
+// does not.
+//
+// The lm_head of a ConvRot text encoder is the shape that wants this: M=1,
+// K=4096, N=151936, which is 1.24 GB of weight per token. The projections
+// below it (N=12288 and under) are better on the WMMA path.
+//
+// iGPU only: the crossover is a property of this part's vector and matrix
+// pipes, and the dGPU path is not measured here.
+inline bool fp16_gemv_preferred(int N) {
+    return comfy_small_igpu() && N >= 24576;
+}
+
 }  // namespace comfy::hip_backend
 
 extern "C" bool launch_fp16_gemm_kernel(
@@ -104,6 +198,17 @@ extern "C" bool launch_fp16_gemm_kernel(
     } else {
         EpiFp16 epi{static_cast<const __half*>(bias), static_cast<const __half*>(rscale),
                     static_cast<const __half*>(resid), N};
+        if (M <= 8 && fp16_gemv_preferred(N)) {
+            // One wave per output column. The int8 launcher has taken this path
+            // for M <= 8 since it was written; see gemv_fp16_kernel for what the
+            // WMMA path costs at one row.
+            dim3 block(kWave, 8);
+            dim3 grid((N + 7) / 8, M);
+            gemv_fp16_kernel<__half, __half><<<grid, block, 0, stream>>>(
+                static_cast<const __half*>(a), static_cast<const __half*>(b),
+                static_cast<__half*>(d), M, N, K, N, epi);
+            return true;
+        }
         launch_gemm_wmma<MmaF16, EpiFp16, __half>(
             static_cast<const uint8_t*>(a), static_cast<const uint8_t*>(b), static_cast<__half*>(d),
             M, N, 2 * K, N, epi, stream, GemmPolicy{true, false});
@@ -139,6 +244,15 @@ extern "C" bool launch_bf16_gemm_kernel(
 
     EpiFp16 epi{static_cast<const __half*>(bias), static_cast<const __half*>(rscale),
                 static_cast<const __half*>(resid), N};
+    if (M <= 8 && fp16_gemv_preferred(N)) {
+        // One wave per output column; see gemv_fp16_kernel.
+        dim3 block(kWave, 8);
+        dim3 grid((N + 7) / 8, M);
+        gemv_fp16_kernel<__bf16, __bf16><<<grid, block, 0, stream>>>(
+            static_cast<const __bf16*>(a), static_cast<const __bf16*>(b),
+            static_cast<__bf16*>(d), M, N, K, N, epi);
+        return true;
+    }
     launch_gemm_wmma<MmaBf16G, EpiFp16, __bf16>(
         static_cast<const uint8_t*>(a), static_cast<const uint8_t*>(b), static_cast<__bf16*>(d),
         M, N, 2 * K, N, epi, stream, GemmPolicy{true, false});
