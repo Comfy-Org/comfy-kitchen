@@ -17,6 +17,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `scaled_mm_mxfp8`           | ✓     |      |        |     |     |     |
 | `adaln`                     | ✓     | ✓    | ✓      | ✓   |     | ✓   |
 | `rms_adaln`                 | ✓     | ✓    | ✓      | ✓   |     | ✓   |
+| `input_act`                 | ✓     |      |        |     |     | ✓   |
 | `na3d`                      | ✓     | ✓    | ✓      | ✓   |     |     |
 | `na2d`                      | ✓     | ✓    | ✓      | ✓   |     |     |
 | `sol_attn`                  | ✓     | ✓    |        | ✓   |     |     |
@@ -65,10 +66,15 @@ corresponding operator is available.
 
 ## Apple GPU (mps) backend
 
-The `mps` backend runs the rope entries (including in-place forms and `rot_dim`)
-and `adaln` / `rms_adaln` as Metal kernels compiled with `torch.mps.compile_shader`,
-for float32/float16/bfloat16 and strided views with a contiguous last dim. Other
-calls are declined and run on eager.
+The `mps` backend runs the rope entries (including in-place forms and `rot_dim`),
+`adaln` / `rms_adaln` and the gated `input_act` pairs (`swiglu`, `situ`) as Metal
+kernels compiled with `torch.mps.compile_shader`, for float32/float16/bfloat16 and
+strided views with a contiguous last dim. Other calls are declined and run on eager.
+
+`input_act` is the standalone form of the activations the quantized linears
+take as `input_act` (`gelu_tanh`, `swiglu`, `situ`, `rms_norm`), for callers
+whose linear is not quantized. It runs on eager everywhere; `mps` takes the
+gated pairs.
 
 ## Huawei Ascend backend
 
