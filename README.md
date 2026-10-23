@@ -66,13 +66,15 @@ corresponding operator is available.
 
 On Apple GPUs the eager RoPE and AdaLN paths run as chains of small ops (a norm,
 casts, broadcasts, multiply-adds), each its own kernel launch and pass over memory.
-The `mps` backend runs each of the rope entries above (and their in-place forms,
-including `rot_dim`) and `adaln` / `rms_adaln` as a single Metal kernel compiled
-with `torch.mps.compile_shader`, in float32, float16 and bfloat16. Inputs may be
-strided views with a contiguous last dim, so packed-qkv slices and `(B, H, N, D)`
-layouts need no copies. Calls outside that (other dtypes, layouts, or head dims
-above 1024) are declined by the call rules and run on eager. The backend is
-registered when MPS is available and `torch.mps.compile_shader` exists.
+The `mps` backend runs the rope entries above (and their in-place forms,
+including `rot_dim`) and `adaln` / `rms_adaln` as one Metal kernel per tensor,
+compiled with `torch.mps.compile_shader`: a single launch for the single-tensor
+entries and AdaLN, two for the paired `(xq, xk)` entries. Each takes float32,
+float16 and bfloat16, and strided views with a contiguous last dim, so
+packed-qkv slices and `(B, H, N, D)` layouts need no copies. Calls outside that
+(other dtypes, layouts, or head dims above 1024) are declined by the call rules
+and run on eager. The backend is registered when MPS is available and
+`torch.mps.compile_shader` exists.
 
 ## Huawei Ascend backend
 

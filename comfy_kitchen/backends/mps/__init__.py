@@ -3,8 +3,9 @@
 
 On MPS the eager RoPE and AdaLN implementations run as chains of small ops
 (a norm, casts, broadcasts, multiply-adds), each a separate kernel launch and a
-full pass over memory. This backend runs each call as one Metal kernel compiled
-with ``torch.mps.compile_shader``: every RoPE variant (interleaved and
+full pass over memory. This backend runs them as one Metal kernel per tensor
+(two launches for the paired ``(xq, xk)`` RoPE entries), compiled with
+``torch.mps.compile_shader``: every RoPE variant (interleaved and
 split-half, with or without the RMSNorm, partial ``rot_dim``, in place) and
 ``adaln`` / ``rms_adaln``, in float32, float16 and bfloat16. Calls the kernels
 do not take (other devices, dtypes or layouts) are declined by the call rules
