@@ -158,8 +158,10 @@ def test_missing_scale_is_left_to_eager():
     assert registry.get_capable_backend("rms_rope1", kwargs) == "eager"
     pair = {"q": x, "k": x, "freqs_cis": fr, "q_scale": None, "k_scale": w, "epsilon": 1e-6}
     assert registry.get_capable_backend("rms_rope", pair) == "eager"
+    assert registry.get_capable_backend("rms_rope_split_half", pair) == "eager"
     pair = {"q": x, "k": x, "freqs_cis": fr, "q_scale": w, "k_scale": None, "epsilon": 1e-6}
     assert registry.get_capable_backend("rms_rope", pair) == "mps"
+    assert registry.get_capable_backend("rms_rope_split_half", pair) == "mps"
 
 
 def test_shader_compile_failure_falls_back_to_eager(monkeypatch):
@@ -182,5 +184,10 @@ def test_shader_compile_failure_falls_back_to_eager(monkeypatch):
     for _ in range(2):  # the failure is cached, not retried and raised
         assert registry.get_capable_backend("apply_rope1", {"x": x, "freqs_cis": fr}) == "eager"
         assert torch.equal(ck.apply_rope1(x, fr), eager.apply_rope1(x, fr))
+    ax = torch.randn(1, 8, 64, device=DEV, dtype=torch.bfloat16)
+    sc = torch.ones(64, device=DEV, dtype=torch.bfloat16)
+    sh = torch.zeros(64, device=DEV, dtype=torch.bfloat16)
+    assert registry.get_capable_backend("adaln", {"x": ax, "scale": sc, "shift": sh}) == "eager"
+    assert torch.equal(ck.adaln(ax, sc, sh), eager.adaln(ax, sc, sh))
     assert attempts == 1
     assert "compilation failed" in kernels._compile_error
