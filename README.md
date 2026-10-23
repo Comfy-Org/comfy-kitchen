@@ -328,7 +328,7 @@ python setup.py build_ext --debug-build --lineinfo bdist_wheel
 import comfy_kitchen as ck
 import torch
 
-# Automatic backend selection (mps -> hip -> cuda -> triton -> eager)
+# Automatic backend selection (runtime priority order, mps first when available)
 x = torch.randn(100, 100, device="cuda")
 scale = torch.tensor([1.0], device="cuda")
 result = ck.quantize_per_tensor_fp8(x, scale)
@@ -354,7 +354,7 @@ The library supports multiple backends:
 
 ### Automatic Backend Selection
 
-When you call a function, the registry selects the best backend by checking **constraints** in priority order (`mps` → `hip` → `cuda` → `triton` → `eager`):
+When you call a function, the registry selects the best backend by checking **constraints** in priority order. The order depends on the runtime (`hip` → `cuda` → `triton` → `eager` on ROCm builds, `ascend` → `cuda` → `triton` → `eager` otherwise), and `mps` goes first when it is available:
 
 ```python
 # Backend is selected automatically based on input constraints
