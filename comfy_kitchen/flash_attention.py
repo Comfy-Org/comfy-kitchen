@@ -41,9 +41,7 @@ def is_available(device: torch.device | None = None) -> bool:
     return torch.cuda.get_device_capability(device) >= _MINIMUM_CAPABILITY
 
 
-def _num_splits(
-    batch_heads: int, kv_capacity: int, multiprocessors: int, block_n: int
-) -> int:
+def _num_splits(batch_heads: int, kv_capacity: int, multiprocessors: int, block_n: int) -> int:
     blocks = (kv_capacity + block_n - 1) // block_n
     max_splits = min(32, multiprocessors * 2, blocks)
     best = 0.0
@@ -68,18 +66,15 @@ def flash_attention_decode(
 ) -> torch.Tensor:
     """Decode BF16 [batch, 1, heads, head_dim] queries over a fixed KV cache.
 
-    CUDA and HIP support head dimensions 64, 128 and 256.
+    CUDA and HIP support head dimensions 64, 128 and 256; rdna1 (gfx1010) runs its float
+    flash attention instead (fp32, fp16 or bf16, head dims 64 and 128), in q's dtype.
     """
     batch, _, query_heads, head_dim = q.shape
     _, kv_capacity, kv_heads, _ = k.shape
     if _amd is not None and _amd.backend_for(q.device)[0] == "rdna1":
         # seq-first views of the cache: the kernel takes any strides
-        out = _amd.rdna1.flash_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            kv_lengths=kv_lengths,
-        )
+        out = _amd.rdna1.flash_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                                         kv_lengths=kv_lengths)
         return out.transpose(1, 2)
     if not is_available(q.device):
         raise RuntimeError(
@@ -97,20 +92,14 @@ def flash_attention_decode(
     )
     output = torch.empty_like(query)
     # Match the CUDA split-KV tile width; HIP uses the same estimate for every head size.
-    block_n = (
-        128
-        if _hip_backend is not None
-        else {64: 256, 128: 128, 256: 64}.get(head_dim, 128)
-    )
+    block_n = 128 if _hip_backend is not None else {64: 256, 128: 128, 256: 64}.get(head_dim, 128)
     num_splits = _num_splits(
         batch * kv_heads,
         kv_capacity,
         torch.cuda.get_device_properties(q.device).multi_processor_count,
         block_n,
     )
-    softmax_lse = torch.empty(
-        batch * kv_heads * groups, dtype=torch.float32, device=q.device
-    )
+    softmax_lse = torch.empty(batch * kv_heads * groups, dtype=torch.float32, device=q.device)
     if num_splits > 1:
         softmax_lse_accum = torch.empty(
             num_splits, batch, kv_heads, groups, dtype=torch.float32, device=q.device
@@ -128,30 +117,14 @@ def flash_attention_decode(
         softmax_lse_accum = output_accum = softmax_lse[:0]
     if _hip_backend is not None:
         _amd.backend_for(q.device)[1].flash_decode(
-            query,
-            k,
-            v,
-            kv_lengths,
-            output,
-            softmax_lse,
-            softmax_lse_accum,
-            output_accum,
+            query, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum,
             num_splits,
         )
     else:
         _cuda_backend._C.flash_attention_decode(
             *map(
                 _cuda_backend._wrap_for_dlpack,
-                (
-                    query,
-                    k,
-                    v,
-                    kv_lengths,
-                    output,
-                    softmax_lse,
-                    softmax_lse_accum,
-                    output_accum,
-                ),
+                (query, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum),
             ),
             num_splits,
             torch.cuda.current_stream(q.device).cuda_stream,
@@ -190,41 +163,24 @@ def _decode_gqa_torch(q, k, v, kv_lengths, causal):
     batch, heads, query_length, head_dim = q.shape
     _, kv_heads, kv_capacity, _ = k.shape
     groups = heads // kv_heads
-    scores = (
-        torch.matmul(
-            q.float().reshape(batch, kv_heads, groups * query_length, head_dim),
-            k.float().transpose(-1, -2),
-        )
-        * head_dim**-0.5
-    )
+    scores = torch.matmul(q.float().reshape(batch, kv_heads, groups * query_length, head_dim),
+                          k.float().transpose(-1, -2)) * head_dim ** -0.5
     # the kernels' kv_lengths clamp and bottom-right causal staircase, per (batch, row)
     limit = kv_lengths.to(torch.int64).clamp(0, kv_capacity).view(batch, 1, 1)
     if causal:
         limit = limit - query_length + 1 + torch.arange(query_length, device=q.device)
     limit = limit.expand(batch, 1, query_length).repeat(1, 1, groups).unsqueeze(-1)
-    scores.masked_fill_(
-        torch.arange(kv_capacity, device=q.device) >= limit, float("-inf")
-    )
+    scores.masked_fill_(torch.arange(kv_capacity, device=q.device) >= limit, float("-inf"))
     lse = scores.logsumexp(-1)
     # an empty range (no slot) is written as zeros, not 0/0
     probs = torch.exp(scores - lse.masked_fill(lse == float("-inf"), 0.0).unsqueeze(-1))
-    out = torch.matmul(probs, v.float()).view(
-        batch, kv_heads, groups, query_length, head_dim
-    )
-    return (
-        out.permute(0, 3, 1, 2, 4)
-        .reshape(batch, query_length, heads * head_dim)
-        .to(q.dtype),
-        lse.view(batch, heads, query_length),
-    )
+    out = torch.matmul(probs, v.float()).view(batch, kv_heads, groups, query_length, head_dim)
+    return (out.permute(0, 3, 1, 2, 4).reshape(batch, query_length, heads * head_dim).to(q.dtype),
+            lse.view(batch, heads, query_length))
 
 
 def flash_attention_decode_gqa(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    kv_lengths: torch.Tensor,
-    return_lse: bool = False,
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_lengths: torch.Tensor, return_lse: bool = False,
     causal: bool = True,
 ) -> torch.Tensor:
     """GQA decode attention for q [B, H, S, D] over k/v [B, Hk, capacity, D].
@@ -237,16 +193,12 @@ def flash_attention_decode_gqa(
     computation in torch."""
     batch, heads, query_length, head_dim = q.shape
     _, kv_heads, kv_capacity, _ = k.shape
-    if head_dim != 256 or not flash_attention_decode_gqa_is_available(
-        q.device, q.dtype
-    ):
+    if head_dim != 256 or not flash_attention_decode_gqa_is_available(q.device, q.dtype):
         output, softmax_lse = _decode_gqa_torch(q, k, v, kv_lengths, causal)
         if return_lse:
             return output, softmax_lse
         return output
-    output = torch.empty(
-        (batch, query_length, heads * head_dim), dtype=q.dtype, device=q.device
-    )
+    output = torch.empty((batch, query_length, heads * head_dim), dtype=q.dtype, device=q.device)
     multiprocessors = torch.cuda.get_device_properties(q.device).multi_processor_count
     rows = batch * heads * query_length
     softmax_lse = torch.empty(rows, dtype=torch.float32, device=q.device)
@@ -256,55 +208,26 @@ def flash_attention_decode_gqa(
         per_head = heads // kv_heads * query_length
         num_splits = _num_splits(
             batch * kv_heads * (per_head // _hip_groups_per_pass(per_head, head_dim)),
-            kv_capacity,
-            multiprocessors,
-            128,
-        )
+            kv_capacity, multiprocessors, 128)
     else:
         # S == 1 folds the group heads into query rows (one pass over K/V per kv head), so the
         # kernel then runs kv_heads CTAs per split rather than heads.
         num_splits = _num_splits(
-            batch * (kv_heads if query_length == 1 else heads),
-            kv_capacity,
-            multiprocessors,
-            64,
-        )
+            batch * (kv_heads if query_length == 1 else heads), kv_capacity, multiprocessors, 64)
     if num_splits > 1:
-        softmax_lse_accum = torch.empty(
-            num_splits * rows, dtype=torch.float32, device=q.device
-        )
-        output_accum = torch.empty(
-            num_splits * rows * head_dim, dtype=torch.float32, device=q.device
-        )
+        softmax_lse_accum = torch.empty(num_splits * rows, dtype=torch.float32, device=q.device)
+        output_accum = torch.empty(num_splits * rows * head_dim, dtype=torch.float32, device=q.device)
     else:
         softmax_lse_accum = output_accum = softmax_lse[:0]
     if _hip_backend is not None:
         _hip_backend.flash_decode_gqa(
-            q,
-            k,
-            v,
-            kv_lengths,
-            output,
-            softmax_lse,
-            softmax_lse_accum,
-            output_accum,
-            num_splits,
-            causal,
-        )
+            q, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum, num_splits,
+            causal)
     else:
         _cuda_backend._C.flash_attention_decode_gqa(
             *map(
                 _cuda_backend._wrap_for_dlpack,
-                (
-                    q,
-                    k,
-                    v,
-                    kv_lengths,
-                    output,
-                    softmax_lse,
-                    softmax_lse_accum,
-                    output_accum,
-                ),
+                (q, k, v, kv_lengths, output, softmax_lse, softmax_lse_accum, output_accum),
             ),
             num_splits,
             causal,
@@ -320,46 +243,30 @@ def _tree_merge_torch(out, lse, q, k, v, mask, merged):
     groups = heads // k.shape[1]
     kf = k.float().repeat_interleave(groups, dim=1)
     vf = v.float().repeat_interleave(groups, dim=1)
-    scores = (
-        torch.matmul(q.float(), kf.transpose(-1, -2)) * head_dim**-0.5
-    )  # [B, H, row, t]
+    scores = torch.matmul(q.float(), kf.transpose(-1, -2)) * head_dim ** -0.5  # [B, H, row, t]
     allowed = (mask.view(rows, 1) >> torch.arange(rows, device=q.device)) & 1
     scores.masked_fill_(allowed == 0, float("-inf"))
     m = torch.maximum(lse, scores.amax(-1))
     w_flash = torch.exp(lse - m)
     w = torch.exp(scores - m.unsqueeze(-1))
     denom = w_flash + w.sum(-1)
-    acc = out.view(batch, rows, heads, head_dim).transpose(
-        1, 2
-    ).float() * w_flash.unsqueeze(-1)
+    acc = out.view(batch, rows, heads, head_dim).transpose(1, 2).float() * w_flash.unsqueeze(-1)
     acc = acc + torch.matmul(w, vf)
-    merged.copy_(
-        (acc / denom.unsqueeze(-1))
-        .transpose(1, 2)
-        .reshape(batch, rows, heads * head_dim)
-    )
+    merged.copy_((acc / denom.unsqueeze(-1)).transpose(1, 2).reshape(batch, rows, heads * head_dim))
     return merged
 
 
 def flash_attention_decode_tree_merge(
-    out: torch.Tensor,
-    lse: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    mask: torch.Tensor,
-    merged: torch.Tensor,
+    out: torch.Tensor, lse: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    mask: torch.Tensor, merged: torch.Tensor,
 ) -> torch.Tensor:
     """Fold a verify tree's own rows into a prefix-only decode result.
 
     ``out`` [B, S, H*D] and ``lse`` [B, H, S] come from flash_attention_decode_gqa over the
     committed prefix with causal=False; q [B, H, S, D] and k/v [B, Hk, S, D] are the verify
     rows' own rotated query/key/value, and mask [S] int32 the rows each row attends inside the
-    step (bit t = row t, including itself). Writes and returns ``merged`` [B, S, H*D].
-    """
-    if q.shape[-1] != 256 or not flash_attention_decode_gqa_is_available(
-        q.device, q.dtype
-    ):
+    step (bit t = row t, including itself). Writes and returns ``merged`` [B, S, H*D]."""
+    if q.shape[-1] != 256 or not flash_attention_decode_gqa_is_available(q.device, q.dtype):
         return _tree_merge_torch(out, lse, q, k, v, mask, merged)
     if _hip_backend is not None:
         _hip_backend.flash_decode_tree_merge(out, lse, q, k, v, mask, merged)
@@ -371,16 +278,45 @@ def flash_attention_decode_tree_merge(
     return merged
 
 
-def flash_attention_decode_step_merge(
-    out: torch.Tensor,
-    lse: torch.Tensor,
+def float_attention_is_available(q: torch.Tensor, k: torch.Tensor) -> bool:
+    """Whether float_attention runs a native kernel for these operands: rdna1 (gfx1010)
+    for fp32, fp16 and bf16 at head dims 64, 128 and 256."""
+    return (_amd is not None and _amd.backend_for(q.device)[0] == "rdna1"
+            and _amd.rdna1.flash_attention_supported(q, k))
+
+
+def float_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    scale: float | None = None,
+    kv_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Exact softmax(q k^T * scale + mask) v for q [B, Hq, Sq, D] over k, v [B, Hk, Sk, D]
+    with Hq a multiple of Hk (GQA), in q's dtype. attn_mask broadcasts to [B, Hq, Sq, Sk],
+    additive or bool (True attends); kv_lengths (int32 [B]) limits each batch to its first
+    keys. A row that attends no key is 0. The native kernel (float_attention_is_available)
+    computes fp32 inputs in fp32; elsewhere this is torch's SDPA."""
+    if float_attention_is_available(q, k):
+        return _amd.rdna1.flash_attention(q, k, v, attn_mask=attn_mask, scale=scale, kv_lengths=kv_lengths)
+    if kv_lengths is not None:
+        keep = torch.arange(k.shape[2], device=q.device) < kv_lengths.view(-1, 1, 1, 1)
+        if attn_mask is None:
+            attn_mask = keep
+        elif attn_mask.dtype == torch.bool:
+            attn_mask = attn_mask & keep
+        else:
+            attn_mask = attn_mask.masked_fill(~keep, float("-inf"))
+    out = functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=scale,
+                                                  enable_gqa=q.shape[1] != k.shape[1])
+    return out.nan_to_num(0.0) if attn_mask is not None else out
+
+
+def flash_attention_decode_step_merge(
+    out: torch.Tensor, lse: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     merged: torch.Tensor,
 ) -> torch.Tensor:
     """Fold the current step's rows causally into a prefix-only decode result."""
-    mask = (
-        1 << torch.arange(1, q.shape[2] + 1, device=q.device, dtype=torch.int32)
-    ) - 1
+    mask = (1 << torch.arange(1, q.shape[2] + 1, device=q.device, dtype=torch.int32)) - 1
     return flash_attention_decode_tree_merge(out, lse, q, k, v, mask, merged)

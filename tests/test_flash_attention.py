@@ -12,9 +12,17 @@ requires_flash_decode = pytest.mark.skipif(
 # The HIP binding takes plain ndarrays rather than device-typed ones, so it has
 # to reject a host operand and an off-boundary base itself.
 requires_hip_flash_decode = pytest.mark.skipif(
-    not ck.flash_attention_decode_is_available()
-    or not getattr(torch.version, "hip", None),
+    not ck.flash_attention_decode_is_available() or not getattr(torch.version, "hip", None),
     reason="requires the HIP flash decode kernel",
+)
+
+# The hip backend's own binding contract. On gfx1010 the rdna1 backend serves decode
+# instead: it copies a misaligned operand rather than rejecting it.
+_serves_rdna1 = (getattr(flash_attention_module, "_amd", None) is not None and torch.cuda.is_available()
+                 and flash_attention_module._amd.backend_for(None)[0] == "rdna1")
+requires_hip_backend_flash_decode = pytest.mark.skipif(
+    not ck.flash_attention_decode_is_available() or not getattr(torch.version, "hip", None) or _serves_rdna1,
+    reason="requires the hip backend's flash decode kernel",
 )
 
 HEAD_DIMS = [64, 128, 256]
@@ -23,9 +31,7 @@ HEAD_DIMS = [64, 128, 256]
 def _decode_operands(batch=2, capacity=256, kv_heads=2, groups=4, head_dim=128):
     heads = kv_heads * groups
     q = torch.randn(batch, 1, heads, head_dim, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(
-        batch, capacity, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
-    )
+    k = torch.randn(batch, capacity, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
     lengths = torch.full((batch,), capacity, device="cuda", dtype=torch.int32)
     return q, k, v, lengths
@@ -52,19 +58,11 @@ def test_flash_attention_decode_rejects_pinned_host_memory(head_dim):
 
     batch, capacity, kv_heads, groups = 2, 128, 2, 4
     pinned = [
-        torch.randn(
-            batch * groups, kv_heads, head_dim, dtype=torch.bfloat16
-        ).pin_memory(),
-        torch.randn(
-            batch, capacity, kv_heads, head_dim, dtype=torch.bfloat16
-        ).pin_memory(),
-        torch.randn(
-            batch, capacity, kv_heads, head_dim, dtype=torch.bfloat16
-        ).pin_memory(),
+        torch.randn(batch * groups, kv_heads, head_dim, dtype=torch.bfloat16).pin_memory(),
+        torch.randn(batch, capacity, kv_heads, head_dim, dtype=torch.bfloat16).pin_memory(),
+        torch.randn(batch, capacity, kv_heads, head_dim, dtype=torch.bfloat16).pin_memory(),
         torch.full((batch,), capacity, dtype=torch.int32).pin_memory(),
-        torch.empty(
-            batch * groups, kv_heads, head_dim, dtype=torch.bfloat16
-        ).pin_memory(),
+        torch.empty(batch * groups, kv_heads, head_dim, dtype=torch.bfloat16).pin_memory(),
         torch.empty(batch * kv_heads * groups, dtype=torch.float32).pin_memory(),
     ]
     assert pinned[0].__dlpack_device__()[0] != 1
@@ -108,18 +106,15 @@ def test_flash_attention_decode_with_minimum_load_alignment(head_dim, padded_row
     padding = elems_per_load if padded_rows else 0
     shape = (*k.shape[:-1], head_dim + padding)
     elements = k.shape[0] * k.shape[1] * k.shape[2] * shape[-1]
-    storage = torch.randn(
-        elements + elems_per_load, device="cuda", dtype=torch.bfloat16
-    )
+    storage = torch.randn(elements + elems_per_load, device="cuda", dtype=torch.bfloat16)
     k = storage[elems_per_load:].view(shape)[..., :head_dim]
     v_storage = torch.randn_like(storage)
     v = v_storage[elems_per_load:].view(shape)[..., :head_dim]
     load_bytes = elems_per_load * k.element_size()
     assert k.data_ptr() % (2 * load_bytes) == load_bytes
     actual = ck.flash_attention_decode(q, k, v, lengths)
-    torch.testing.assert_close(
-        actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2
-    )
+    torch.testing.assert_close(actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
+
 
 
 def _reference(q, k, v, lengths):
@@ -127,18 +122,8 @@ def _reference(q, k, v, lengths):
     outputs = []
     for batch, length in enumerate(lengths.tolist()):
         query = q[batch].transpose(0, 1).unsqueeze(0)
-        key = (
-            k[batch, :length]
-            .transpose(0, 1)
-            .repeat_interleave(groups, dim=0)
-            .unsqueeze(0)
-        )
-        value = (
-            v[batch, :length]
-            .transpose(0, 1)
-            .repeat_interleave(groups, dim=0)
-            .unsqueeze(0)
-        )
+        key = k[batch, :length].transpose(0, 1).repeat_interleave(groups, dim=0).unsqueeze(0)
+        value = v[batch, :length].transpose(0, 1).repeat_interleave(groups, dim=0).unsqueeze(0)
         output = torch.nn.functional.scaled_dot_product_attention(query, key, value)
         outputs.append(output.squeeze(0).transpose(0, 1))
     return torch.stack(outputs)
@@ -206,18 +191,14 @@ def test_flash_attention_decode_hip_gate_follows_bf16_arch(monkeypatch, has_wmma
 def test_flash_attention_decode(head_dim, heads, kv_heads, capacity, transposed_cache):
     torch.manual_seed(0)
     q = torch.randn(3, 1, heads, head_dim, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(
-        3, capacity, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
-    )
+    k = torch.randn(3, capacity, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
     if transposed_cache:
         k = k.transpose(1, 2).contiguous().transpose(1, 2)
         v = v.transpose(1, 2).contiguous().transpose(1, 2)
     lengths = torch.tensor([1, 73, capacity], device="cuda", dtype=torch.int32)
     actual = ck.flash_attention_decode(q, k, v, lengths)
-    torch.testing.assert_close(
-        actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2
-    )
+    torch.testing.assert_close(actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
 
 
 @requires_flash_decode
@@ -227,18 +208,14 @@ def test_flash_attention_decode_split_counts(monkeypatch, num_splits, head_dim):
     # num_splits comes from a heuristic over multi_processor_count, so on a wide
     # enough GPU it returns 1 and the split accumulators, the combine pass and
     # its row decomposition never run. Pin it instead of hoping.
-    monkeypatch.setattr(
-        flash_attention_module, "_num_splits", lambda *_, **__: num_splits
-    )
+    monkeypatch.setattr(flash_attention_module, "_num_splits", lambda *_, **__: num_splits)
     torch.manual_seed(0)
     q = torch.randn(3, 1, 24, head_dim, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(3, 257, 4, head_dim, device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
     lengths = torch.tensor([1, 73, 257], device="cuda", dtype=torch.int32)
     actual = ck.flash_attention_decode(q, k, v, lengths)
-    torch.testing.assert_close(
-        actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2
-    )
+    torch.testing.assert_close(actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
 
 
 @requires_flash_decode
@@ -246,16 +223,12 @@ def test_flash_attention_decode_split_counts(monkeypatch, num_splits, head_dim):
 @pytest.mark.parametrize("num_splits", [2, 32])
 def test_flash_attention_decode_64_partial_merge_tile(monkeypatch, groups, num_splits):
     torch.manual_seed(0)
-    monkeypatch.setattr(
-        flash_attention_module, "_num_splits", lambda *_, **__: num_splits
-    )
+    monkeypatch.setattr(flash_attention_module, "_num_splits", lambda *_, **__: num_splits)
     q, k, v, lengths = _decode_operands(
         batch=1, capacity=257, kv_heads=1, groups=groups, head_dim=64
     )
     actual = ck.flash_attention_decode(q, k, v, lengths)
-    torch.testing.assert_close(
-        actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2
-    )
+    torch.testing.assert_close(actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
 
 
 @requires_flash_decode
@@ -276,15 +249,11 @@ def test_flash_attention_decode_cuda_graph_dynamic_lengths(head_dim):
     for current_lengths in [[17, 333], [511, 1], [129, 257]]:
         lengths.copy_(torch.tensor(current_lengths, device="cuda", dtype=torch.int32))
         graph.replay()
-        torch.testing.assert_close(
-            actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2
-        )
+        torch.testing.assert_close(actual, _reference(q, k, v, lengths), atol=2e-3, rtol=1e-2)
 
 
 @requires_flash_decode
-@pytest.mark.skipif(
-    bool(getattr(torch.version, "hip", None)), reason="uses CUDA sleep for overlap"
-)
+@pytest.mark.skipif(bool(getattr(torch.version, "hip", None)), reason="uses CUDA sleep for overlap")
 @pytest.mark.parametrize("second_capacity", [4096, 512])
 def test_flash_attention_decode_concurrent_graphs(second_capacity):
     torch.manual_seed(42)
@@ -292,9 +261,7 @@ def test_flash_attention_decode_concurrent_graphs(second_capacity):
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     graphs, outputs = [], []
     for stream, capacity in zip(streams, [4096, second_capacity], strict=True):
-        state = _decode_operands(
-            batch=1, capacity=capacity, kv_heads=4, groups=6, head_dim=256
-        )
+        state = _decode_operands(batch=1, capacity=capacity, kv_heads=4, groups=6, head_dim=256)
         state[3].fill_(capacity - 128)
         states.append(state)
         stream.wait_stream(torch.cuda.current_stream())
@@ -334,16 +301,9 @@ def test_flash_attention_decode_concurrent_graphs(second_capacity):
 @pytest.mark.parametrize(
     ("q_dim", "k_dim", "v_dim"),
     [
-        (32, 32, 32),
-        (96, 96, 96),
-        (192, 192, 192),
-        (64, 128, 128),
-        (128, 64, 64),
-        (64, 64, 128),
-        (128, 128, 64),
-        (256, 128, 128),
-        (128, 256, 256),
-        (256, 256, 128),
+        (32, 32, 32), (96, 96, 96), (192, 192, 192),
+        (64, 128, 128), (128, 64, 64), (64, 64, 128), (128, 128, 64),
+        (256, 128, 128), (128, 256, 256), (256, 256, 128),
     ],
 )
 def test_flash_attention_decode_rejects_invalid_dimensions(q_dim, k_dim, v_dim):
@@ -364,12 +324,8 @@ GQA_OPERANDS = [(torch.bfloat16, 256), (torch.float32, 256), (torch.bfloat16, 12
 
 
 @pytest.mark.parametrize(("dtype", "head_dim"), GQA_OPERANDS)
-@pytest.mark.parametrize(
-    "parent", [[-1], [-1, 0, 1, 2, 3, 4, 5, 6], [-1, 0, 1, 2, 0, 1, 4, 4]]
-)
-def test_flash_attention_decode_tree_merge_matches_full_softmax(
-    dtype, head_dim, parent
-):
+@pytest.mark.parametrize("parent", [[-1], [-1, 0, 1, 2, 3, 4, 5, 6], [-1, 0, 1, 2, 0, 1, 4, 4]])
+def test_flash_attention_decode_tree_merge_matches_full_softmax(dtype, head_dim, parent):
     # A verify tree's rows read the committed prefix through one non-causal decode pass and
     # fold their own ancestors in afterwards. Row r must then equal a plain softmax over the
     # prefix plus exactly the slots on its root-to-r path.
@@ -377,15 +333,13 @@ def test_flash_attention_decode_tree_merge_matches_full_softmax(
     batch, kv_heads, groups, capacity, prefix = 2, 2, 4, 96, 37
     heads = kv_heads * groups
     rows = len(parent)
-    key = torch.randn(
-        batch, kv_heads, capacity, head_dim, device=GQA_DEVICE, dtype=dtype
-    )
+    key = torch.randn(batch, kv_heads, capacity, head_dim, device=GQA_DEVICE, dtype=dtype)
     value = torch.randn_like(key)
     q = torch.randn(batch, heads, rows, head_dim, device=GQA_DEVICE, dtype=dtype)
     xk = torch.randn(batch, kv_heads, rows, head_dim, device=GQA_DEVICE, dtype=dtype)
     xv = torch.randn_like(xk)
-    key[:, :, prefix : prefix + rows] = xk
-    value[:, :, prefix : prefix + rows] = xv
+    key[:, :, prefix:prefix + rows] = xk
+    value[:, :, prefix:prefix + rows] = xv
 
     def path(r):
         out = []
@@ -394,85 +348,53 @@ def test_flash_attention_decode_tree_merge_matches_full_softmax(
             r = parent[r]
         return out[::-1]
 
-    mask = torch.tensor(
-        [sum(1 << t for t in path(r)) for r in range(rows)],
-        dtype=torch.int32,
-        device=GQA_DEVICE,
-    )
+    mask = torch.tensor([sum(1 << t for t in path(r)) for r in range(rows)], dtype=torch.int32, device=GQA_DEVICE)
     lengths = torch.full((batch,), prefix, device=GQA_DEVICE, dtype=torch.int32)
-    out, lse = ck.flash_attention_decode_gqa(
-        q, key, value, lengths, return_lse=True, causal=False
-    )
+    out, lse = ck.flash_attention_decode_gqa(q, key, value, lengths, return_lse=True, causal=False)
     merged = torch.empty_like(out)
     ck.flash_attention_decode_tree_merge(out, lse, q, xk, xv, mask, merged)
 
     kf = key.repeat_interleave(groups, dim=1).float()
     vf = value.repeat_interleave(groups, dim=1).float()
-    expected = torch.empty(
-        batch, rows, heads * head_dim, device=GQA_DEVICE, dtype=torch.float32
-    )
+    expected = torch.empty(batch, rows, heads * head_dim, device=GQA_DEVICE, dtype=torch.float32)
     for r in range(rows):
         cols = list(range(prefix)) + [prefix + t for t in path(r)]
-        scores = (q[:, :, r].float().unsqueeze(2) * kf[:, :, cols]).sum(
-            -1
-        ) * head_dim**-0.5
+        scores = (q[:, :, r].float().unsqueeze(2) * kf[:, :, cols]).sum(-1) * head_dim ** -0.5
         probs = scores.softmax(dim=-1)
-        expected[:, r] = (
-            (probs.unsqueeze(-1) * vf[:, :, cols])
-            .sum(2)
-            .reshape(batch, heads * head_dim)
-        )
+        expected[:, r] = (probs.unsqueeze(-1) * vf[:, :, cols]).sum(2).reshape(batch, heads * head_dim)
     torch.testing.assert_close(merged.float(), expected, atol=3e-3, rtol=1e-2)
 
     if parent == list(range(-1, rows - 1)):
         causal = torch.empty_like(out)
-        assert (
-            ck.flash_attention_decode_step_merge(out, lse, q, xk, xv, causal) is causal
-        )
+        assert ck.flash_attention_decode_step_merge(out, lse, q, xk, xv, causal) is causal
         torch.testing.assert_close(causal.float(), expected, atol=3e-3, rtol=1e-2)
 
 
 @pytest.mark.parametrize(("dtype", "head_dim"), GQA_OPERANDS)
 @pytest.mark.parametrize("query_length", [1, 3, 7, 8])
 @pytest.mark.parametrize("causal", [True, False])
-def test_flash_attention_decode_gqa_matches_reference(
-    query_length, causal, dtype, head_dim
-):
+def test_flash_attention_decode_gqa_matches_reference(query_length, causal, dtype, head_dim):
     # Causal rows see the staircase; non-causal rows all see the committed prefix.
     torch.manual_seed(0)
     batch, kv_heads, groups, capacity = 2, 2, 4, 300
     heads = kv_heads * groups
-    q = torch.randn(
-        batch, query_length, heads, head_dim, device=GQA_DEVICE, dtype=dtype
-    ).transpose(1, 2)
+    q = torch.randn(batch, query_length, heads, head_dim, device=GQA_DEVICE, dtype=dtype).transpose(1, 2)
     k = torch.randn(batch, kv_heads, capacity, head_dim, device=GQA_DEVICE, dtype=dtype)
     v = torch.randn_like(k)
     lengths = [query_length + 5, 281]
     out, lse = ck.flash_attention_decode_gqa(
-        q,
-        k,
-        v,
-        torch.tensor(lengths, device=GQA_DEVICE, dtype=torch.int32),
-        return_lse=True,
-        causal=causal,
-    )
+        q, k, v, torch.tensor(lengths, device=GQA_DEVICE, dtype=torch.int32), return_lse=True, causal=causal)
 
     kf = k.repeat_interleave(groups, dim=1).float()
     vf = v.repeat_interleave(groups, dim=1).float()
-    scores = torch.einsum("bhsd,bhcd->bhsc", q.float(), kf) * head_dim**-0.5
+    scores = torch.einsum("bhsd,bhcd->bhsc", q.float(), kf) * head_dim ** -0.5
     cols = torch.arange(capacity, device=GQA_DEVICE)
     for b, length in enumerate(lengths):
         limit = torch.full((query_length,), length, device=GQA_DEVICE)
         if causal:
-            limit = (
-                limit - query_length + 1 + torch.arange(query_length, device=GQA_DEVICE)
-            )
-        scores[b].masked_fill_(
-            cols[None, None, :] >= limit[None, :, None], float("-inf")
-        )
-    expected = torch.einsum("bhsc,bhcd->bshd", scores.softmax(-1), vf).reshape(
-        batch, query_length, -1
-    )
+            limit = limit - query_length + 1 + torch.arange(query_length, device=GQA_DEVICE)
+        scores[b].masked_fill_(cols[None, None, :] >= limit[None, :, None], float("-inf"))
+    expected = torch.einsum("bhsc,bhcd->bshd", scores.softmax(-1), vf).reshape(batch, query_length, -1)
     torch.testing.assert_close(out.float(), expected, atol=3e-3, rtol=1e-2)
     torch.testing.assert_close(lse, scores.logsumexp(-1), atol=1e-3, rtol=1e-4)
 
