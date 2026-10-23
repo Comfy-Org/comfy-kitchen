@@ -34,11 +34,11 @@ void launch_flash_decode(const void* q, const void* k, const void* v, const int*
                          int64_t k_head_stride, int64_t o_batch_stride, int64_t o_group_stride,
                          int64_t o_step_stride, int64_t o_head_stride, hipStream_t stream);
 
-// Folds the current step's rows causally (row j attends rows t <= j) into a
-// prefix-only decode result; see ops/flash_decode.hip. heads is the query head count.
-void launch_flash_decode_step_merge(
-    const void* out, const float* lse, const void* q, const void* k, const void* v, void* merged,
-    int batch, int rows, int heads, int kv_heads, int64_t q_batch_stride,
+// Folds a verify tree's own rows (mask bit t = row t) into a prefix-only decode
+// result; see ops/flash_decode.hip. heads is the query head count.
+void launch_flash_decode_tree_merge(
+    const void* out, const float* lse, const void* q, const void* k, const void* v, const int* mask,
+    void* merged, int batch, int rows, int heads, int kv_heads, int64_t q_batch_stride,
     int64_t q_head_stride, int64_t q_row_stride, int64_t k_batch_stride, int64_t k_head_stride,
     int64_t k_row_stride, int64_t v_batch_stride, int64_t v_head_stride, int64_t v_row_stride,
     int64_t o_batch_stride, int64_t o_row_stride, int64_t m_batch_stride, int64_t m_row_stride,
@@ -50,6 +50,19 @@ void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* 
                              const void* scale_b, int scale_b_stride, const void* bias,
                              int bias_code, int M, int N, int K, int ldc, int out_code,
                              hipStream_t stream);
+
+// A is physically [M_tile, K_tile, 128, 128]; B is row-major.
+void launch_int8_gemm_a_tiled128_kernel(
+    const void* a, const void* b, void* c, const void* scale_a,
+    const void* scale_b, int scale_b_stride, const void* bias,
+    int bias_code, int M, int N, int K, int ldc, int out_code,
+    hipStream_t stream);
+
+// Exact BF16 RMSNorm followed by gate multiplication and residual add.
+void launch_rms_gated_residual_bf16_kernel(
+    const void* activation, const void* norm_weight, const void* residual,
+    const void* gate, void* output, int rows, int width, float eps,
+    hipStream_t stream);
 
 // scale_code is a DTYPE_TO_CODE value: 0 float32, 5 e4m3 (passed as raw bytes).
 // codebook is 16 floats, or null for the uniform levels. bits is 4 or 6.

@@ -7,7 +7,9 @@ from .backends import cuda as _cuda_backend
 from .backends import ascend as _ascend_backend  # noqa: F401
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
-from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
+from .backends.cuda import (
+    sol_attn_chunked,
+)  # chunked-producer form of sol_attn (HIP's below)
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
 from .exceptions import (
@@ -18,9 +20,14 @@ from .exceptions import (
 )
 from .flash_attention import flash_attention_decode
 from .flash_attention import is_available as flash_attention_decode_is_available
-from .flash_attention import flash_attention_decode_gqa, flash_attention_decode_gqa_is_available
-from .flash_attention import flash_attention_decode_step_merge
-from .flash_attention import float_attention, float_attention_is_available
+from .flash_attention import (
+    flash_attention_decode_gqa,
+    flash_attention_decode_gqa_is_available,
+)
+from .flash_attention import (
+    flash_attention_decode_step_merge,
+    flash_attention_decode_tree_merge,
+)
 from .float_utils import from_blocked, swap_nibbles, to_blocked
 from .gated_delta import deltanet_conv_step, gated_delta_decode_fused
 from .gated_delta import is_available as gated_delta_decode_is_available
@@ -38,7 +45,9 @@ from .sage_attention import (
     prequantize_int8_attention,
 )
 from .sage_attention import is_available as int8_attention_is_available
-from .sage_attention import is_block_sparse_available as int8_block_sparse_attention_is_available
+from .sage_attention import (
+    is_block_sparse_available as int8_block_sparse_attention_is_available,
+)
 from .tensor.convrot_w4a4 import (
     convrot_w4a4_linear,
     dequantize_convrot_w4a4_weight,
@@ -75,8 +84,10 @@ else:
 __all__ = [
     # Normalization
     "adaln",
+    "rms_gated_residual",
     "fp16_conv3d",
     "group_norm_silu_pad3d",
+    "group_norm_stats3d",
     "rms_adaln",
     # Attention
     "PrequantizedInt8Attention",
@@ -90,6 +101,7 @@ __all__ = [
     "flash_attention_decode_gqa",
     "flash_attention_decode_gqa_is_available",
     "flash_attention_decode_step_merge",
+    "flash_attention_decode_tree_merge",
     "gated_delta_decode_fused",
     "deltanet_conv_step",
     "gated_delta_decode_is_available",
@@ -141,6 +153,8 @@ __all__ = [
     "q4_k_linear",
     "fp16_packed_linear_is_accelerated",
     "int8_linear",
+    "int8_linear_modulated",
+    "int8_linear_rms_modulated",
     "w4a8_int8_linear",
     # Positional encoding
     "apply_rope",
@@ -189,6 +203,12 @@ __all__ = [
 # =============================================================================
 # Public API Functions
 # =============================================================================
+
+
+def _call_backend(name: str, kwargs: dict):
+    """Dispatch a thin public wrapper whose signature matches its backends."""
+    impl = registry.get_implementation(name, kwargs=kwargs)
+    return impl(**kwargs)
 
 
 def sol_attn(
@@ -246,7 +266,11 @@ def sol_attn(
         ``(B, T, H, 128)`` attention output.
     """
     return torch.ops.comfy_kitchen.sol_attn(
-        q, k, v, tau, scale,
+        q,
+        k,
+        v,
+        tau,
+        scale,
         [0, 0] if sink_blocks is None else list(sink_blocks),
         [0, 0] if sink_q is None else list(sink_q),
         key_bias,
@@ -270,12 +294,19 @@ def sol_attn_is_available(device: torch.device | None = None) -> bool:
         # torch.cuda is the ROCm API here; the AMD backend serving the device
         # advertises sol_attn only where it runs, so its registration is the answer
         name, _ = _amd.backend_for(device)
-        return registry.is_available(name) and registry.get_constraints(name, "sol_attn") is not None
+        return (
+            registry.is_available(name)
+            and registry.get_constraints(name, "sol_attn") is not None
+        )
     rules = registry.get_constraints("cuda", "sol_attn")
     ext = getattr(_cuda_backend, "_C", None)
-    return (registry.is_available("cuda") and _cuda_backend._EXT_AVAILABLE and hasattr(ext, "sol_attn")
-            and rules is not None
-            and torch.cuda.get_device_capability(device) >= rules.min_compute_capability)
+    return (
+        registry.is_available("cuda")
+        and _cuda_backend._EXT_AVAILABLE
+        and hasattr(ext, "sol_attn")
+        and rules is not None
+        and torch.cuda.get_device_capability(device) >= rules.min_compute_capability
+    )
 
 
 def na3d(
@@ -334,12 +365,18 @@ def na2d(
         is_causal = [is_causal] * 2
     # Checked here: both lists gain a T entry below, hiding a wrong length.
     if len(kernel_size) != 2:
-        raise ValueError(f"na2d kernel_size must have 2 elements, got {len(kernel_size)}")
+        raise ValueError(
+            f"na2d kernel_size must have 2 elements, got {len(kernel_size)}"
+        )
     if len(is_causal) != 2:
         raise ValueError(f"na2d is_causal must have 2 elements, got {len(is_causal)}")
     out = torch.ops.comfy_kitchen.na3d(
-        q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1),
-        [1, *kernel_size], [False, *is_causal], scale,
+        q.unsqueeze(1),
+        k.unsqueeze(1),
+        v.unsqueeze(1),
+        [1, *kernel_size],
+        [False, *is_causal],
+        scale,
     )
     return out.squeeze(1)
 
@@ -395,20 +432,33 @@ def group_norm_silu_pad3d(
     silu: bool = True,
     zero_pad: bool = False,
     out: torch.Tensor | None = None,
+    stats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-frame GroupNorm, SiLU and causal conv3d padding in one pass.
 
     x [B, C, T, H, W]; pad is (left, right, top, bottom, front). The spatial border
     reflects, or is zero when zero_pad; the front frames are always zero. weight=None is
-    pad-only. Output is channels_last_3d, into out when given, which is returned; for a
-    batch of one out may be a frame-offset view, leaving room for a caller's real halo.
+    pad-only. stats from group_norm_stats3d normalizes with those per-frame statistics
+    instead of x's own, so x may be a row strip of the frame they describe. Output is
+    channels_last_3d, into out when given, which is returned; for a batch of one out may
+    be a frame-offset view, leaving room for a caller's real halo.
     """
     if out is None:
         return torch.ops.comfy_kitchen.group_norm_silu_pad3d(
-            x, weight, bias, num_groups, eps, list(pad), silu, zero_pad)
+            x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, stats
+        )
     torch.ops.comfy_kitchen.group_norm_silu_pad3d_out(
-        x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, out)
+        x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, out, stats
+    )
     return out
+
+
+def group_norm_stats3d(
+    x: torch.Tensor, num_groups: int = 32, eps: float = 1e-6
+) -> torch.Tensor:
+    """Per-frame GroupNorm statistics of x [B, C, T, H, W]: float32 [B*T, num_groups, 2]
+    of (mean, rstd), for group_norm_silu_pad3d's stats argument."""
+    return torch.ops.comfy_kitchen.group_norm_stats3d(x, num_groups, eps)
 
 
 def rms_adaln(
@@ -513,7 +563,9 @@ def quantize_nvfp4(
     Returns:
         Tuple of (quantized_tensor, block_scales)
     """
-    return torch.ops.comfy_kitchen.quantize_nvfp4(x, per_tensor_scale, epsilon, pad_16x, hi_first)
+    return torch.ops.comfy_kitchen.quantize_nvfp4(
+        x, per_tensor_scale, epsilon, pad_16x, hi_first
+    )
 
 
 def dequantize_nvfp4(
@@ -538,7 +590,9 @@ def dequantize_nvfp4(
         Dequantized tensor in specified output format
     """
     dtype_code = DTYPE_TO_CODE[output_type]
-    return torch.ops.comfy_kitchen.dequantize_nvfp4(qx, per_tensor_scale, block_scales, dtype_code, hi_first)
+    return torch.ops.comfy_kitchen.dequantize_nvfp4(
+        qx, per_tensor_scale, block_scales, dtype_code, hi_first
+    )
 
 
 def scaled_mm_nvfp4(
@@ -574,8 +628,15 @@ def scaled_mm_nvfp4(
         out_dtype = torch.bfloat16
     dtype_code = DTYPE_TO_CODE[out_dtype]
     return torch.ops.comfy_kitchen.scaled_mm_nvfp4(
-        a, b, tensor_scale_a, tensor_scale_b,
-        block_scale_a, block_scale_b, bias, dtype_code, alpha
+        a,
+        b,
+        tensor_scale_a,
+        tensor_scale_b,
+        block_scale_a,
+        block_scale_b,
+        bias,
+        dtype_code,
+        alpha,
     )
 
 
@@ -678,7 +739,12 @@ def quantize_svdquant_w4a4(
     as bf16/fp16; this avoids an otherwise redundant cast/allocation.
     """
     return torch.ops.comfy_kitchen.quantize_svdquant_w4a4(
-        x, smooth, lora_down, pad_size, act_unsigned, lora_x,
+        x,
+        smooth,
+        lora_down,
+        pad_size,
+        act_unsigned,
+        lora_x,
     )
 
 
@@ -802,8 +868,11 @@ def rms_rope(
 
 
 def rms_rope_(
-    q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor,
-    q_scale: torch.Tensor, k_scale: torch.Tensor | None = None,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
     epsilon: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply RMSNorm and interleaved RoPE in place (inference only)."""
@@ -822,7 +891,9 @@ def rms_rope1(
 
 
 def rms_rope1_(
-    x: torch.Tensor, freqs_cis: torch.Tensor, scale: torch.Tensor,
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
     epsilon: float = 1e-6,
 ) -> torch.Tensor:
     """Apply RMSNorm and interleaved RoPE in place (inference only)."""
@@ -845,13 +916,19 @@ def rms_rope_split_half(
     restricts the rotation to a head-dim prefix (partial rotary; the norm
     always spans the full head_dim); 0 rotates everything.
     """
-    return torch.ops.comfy_kitchen.rms_rope_split_half(q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim)
+    return torch.ops.comfy_kitchen.rms_rope_split_half(
+        q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim
+    )
 
 
 def rms_rope_split_half_(
-    q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor,
-    q_scale: torch.Tensor, k_scale: torch.Tensor | None = None,
-    epsilon: float = 1e-6, rot_dim: int = 0,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    epsilon: float = 1e-6,
+    rot_dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply RMSNorm and split-half RoPE in place (inference only).
 
@@ -878,7 +955,9 @@ def rms_rope_split_half1(
 
 
 def rms_rope_split_half1_(
-    x: torch.Tensor, freqs_cis: torch.Tensor, scale: torch.Tensor,
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
     epsilon: float = 1e-6,
 ) -> torch.Tensor:
     """Apply RMSNorm and split-half RoPE in place (inference only)."""
@@ -964,9 +1043,7 @@ def apply_rope_split_half1(
     return torch.ops.comfy_kitchen.apply_rope_split_half1(x, freqs_cis)
 
 
-def apply_rope_split_half1_(
-    x: torch.Tensor, freqs_cis: torch.Tensor
-) -> torch.Tensor:
+def apply_rope_split_half1_(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """Apply split-half RoPE in place (inference only)."""
     torch.ops.comfy_kitchen.apply_rope_split_half1_(x, freqs_cis)
     return x
@@ -1003,203 +1080,27 @@ def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return _mm_int8(a, b)
 
 
-def fp16_packed_linear(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    out_dtype: torch.dtype | None = None,
-    weight_amax: torch.Tensor | None = None,
+def rms_gated_residual(
+    activation: torch.Tensor,
+    norm_weight: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float = 1.0e-5,
 ) -> torch.Tensor:
-    """Linear with fp16 weights on packed fp16 math, each fp16 partial sum folded into
-    fp32 every 32 products and stored as ``out_dtype`` (x's dtype by default).
+    """Compute ``residual + gate * rms_norm(activation, norm_weight)``.
 
-    The rdna1 (gfx1010) backend serves it; that part lacks matrix cores and dot
-    instructions. x of any float dtype and range is scaled per row by a
-    power of two against ``weight_amax`` (the largest |weight|, computed when not
-    given) so that no fp16 partial sum overflows. Elsewhere this is
-    ``torch.nn.functional.linear``.
+    Each step is rounded to the input dtype as in the unfused PyTorch ops.
     """
-    kwargs = {"x": x, "weight": weight, "bias": bias, "out_dtype": out_dtype,
-              "weight_amax": weight_amax}
-    impl = registry.get_implementation("fp16_packed_linear", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-def q8_0_linear(
-    x: torch.Tensor,
-    raw: torch.Tensor,
-    out_features: int,
-    bias: torch.Tensor | None = None,
-    out_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Linear against a GGUF Q8_0 weight given as its raw bytes (uint8, [out_features,
-    in_features / 32 * 34]: per 32-element block an fp16 scale and 32 int8 codes), stored as
-    ``out_dtype`` (x's dtype by default). The rdna1 backend reads the codes in its packed
-    GEMM and applies the block scales there; elsewhere the weight is dequantized to x's
-    dtype for ``torch.nn.functional.linear``."""
-    kwargs = {"x": x, "raw": raw, "out_features": out_features, "bias": bias, "out_dtype": out_dtype}
-    impl = registry.get_implementation("q8_0_linear", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-def q4_k_linear(
-    x: torch.Tensor,
-    raw: torch.Tensor,
-    out_features: int,
-    bias: torch.Tensor | None = None,
-    out_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Linear against a GGUF Q4_K weight given as its raw bytes (uint8, [out_features,
-    in_features / 256 * 144]), stored as ``out_dtype`` (x's dtype by default). The rdna1
-    backend reads the 4-bit codes in its packed GEMM and applies the sub-block scales and
-    offsets there; elsewhere the weight is dequantized to x's dtype."""
-    kwargs = {"x": x, "raw": raw, "out_features": out_features, "bias": bias, "out_dtype": out_dtype}
-    impl = registry.get_implementation("q4_k_linear", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-def fp16_packed_conv3d(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    stride: int | tuple[int, int, int] = 1,
-    padding: int | tuple[int, int, int] = 0,
-    dilation: int | tuple[int, int, int] = 1,
-) -> torch.Tensor:
-    """conv3d with an fp16 weight on the packed fp16 math of :func:`fp16_packed_linear`,
-    zero padding, the result in x's dtype and, on rdna1, its memory format.
-
-    rdna1 serves it with an implicit GEMM (no im2col workspace) when x has a
-    multiple of 32 channels: x of any float dtype and range is scaled by a power of
-    two so that no fp16 partial sum overflows. Elsewhere this is torch's conv3d in x's
-    dtype.
-    """
-    stride, padding, dilation = ([v] * 3 if isinstance(v, int) else list(v)
-                                 for v in (stride, padding, dilation))
-    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": stride, "padding": padding,
-              "dilation": dilation}
-    impl = registry.get_implementation("fp16_packed_conv3d", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-def _pair(v):
-    return [v] * 2 if isinstance(v, int) else list(v)
-
-
-def _triple(v):
-    return [v] * 3 if isinstance(v, int) else list(v)
-
-
-def fp16_packed_conv_transpose3d(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    stride: int | tuple[int, int, int] = 1,
-    padding: int | tuple[int, int, int] = 0,
-    output_padding: int | tuple[int, int, int] = 0,
-) -> torch.Tensor:
-    """conv_transpose3d (one group, no dilation) with an fp16 ``[C, K, T, R, S]`` weight on
-    the packed fp16 math of :func:`fp16_packed_linear`, the result in x's dtype.
-
-    rdna1 serves it as one stride-1 implicit GEMM per output residue, with no zero-stuffed
-    input and no im2col workspace. Elsewhere this is torch's conv_transpose3d in x's dtype.
-    """
-    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _triple(stride),
-              "padding": _triple(padding), "output_padding": _triple(output_padding)}
-    impl = registry.get_implementation("fp16_packed_conv_transpose3d", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-def depthwise_conv3d(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    stride: int | tuple[int, int, int] = 1,
-    padding: int | tuple[int, int, int] = 0,
-    dilation: int | tuple[int, int, int] = 1,
-) -> torch.Tensor:
-    """conv3d with one ``[1, T, R, S]`` filter per channel (groups == channels) and zero
-    padding, the result in x's dtype. rdna1 serves it with a gather kernel accumulating in
-    fp32; elsewhere this is torch's grouped conv3d."""
-    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _triple(stride),
-              "padding": _triple(padding), "dilation": _triple(dilation)}
-    impl = registry.get_implementation("depthwise_conv3d", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-def direct_conv3d(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    stride: int | tuple[int, int, int] = 1,
-    padding: int | tuple[int, int, int] = 0,
-    dilation: int | tuple[int, int, int] = 1,
-) -> torch.Tensor:
-    """conv3d with zero padding, the result contiguous in x's dtype. rdna1 serves it with a
-    direct kernel in fp32 math that reads x in place, for convs with few input or few output
-    channels; elsewhere this is torch's conv3d."""
-    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _triple(stride),
-              "padding": _triple(padding), "dilation": _triple(dilation)}
-    impl = registry.get_implementation("direct_conv3d", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-def fp32_winograd_conv2d(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    stride: int | tuple[int, int] = 1,
-    padding: int | tuple[int, int] = 0,
-) -> torch.Tensor:
-    """fp32 conv2d with zero padding. rdna1 serves stride 1 and 2 with MIOpen's Winograd RxS
-    kernels, built into the backend so no MIOpen search runs; elsewhere this is torch's
-    conv2d."""
-    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _pair(stride), "padding": _pair(padding)}
-    impl = registry.get_implementation("fp32_winograd_conv2d", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-def fp32_winograd_conv_transpose2d(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    stride: int | tuple[int, int] = 1,
-    padding: int | tuple[int, int] = 0,
-    output_padding: int | tuple[int, int] = 0,
-) -> torch.Tensor:
-    """fp32 conv_transpose2d (one group, no dilation) with a [C, K, R, S] weight. rdna1 serves
-    stride 1 and 2 with MIOpen's Winograd RxS kernels as its backward-data solver runs them;
-    elsewhere this is torch's conv_transpose2d."""
-    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _pair(stride),
-              "padding": _pair(padding), "output_padding": _pair(output_padding)}
-    impl = registry.get_implementation("fp32_winograd_conv_transpose2d", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-def depthwise_conv_transpose3d(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    stride: int | tuple[int, int, int] = 1,
-    padding: int | tuple[int, int, int] = 0,
-    output_padding: int | tuple[int, int, int] = 0,
-) -> torch.Tensor:
-    """conv_transpose3d with one ``[1, T, R, S]`` filter per channel (groups == channels) and
-    no dilation, the result in x's dtype; see :func:`depthwise_conv3d`."""
-    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _triple(stride),
-              "padding": _triple(padding), "output_padding": _triple(output_padding)}
-    impl = registry.get_implementation("depthwise_conv_transpose3d", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-def fp16_packed_linear_is_accelerated(device: torch.device) -> bool:
-    """Whether :func:`fp16_packed_linear` on ``device`` runs a kernel that outruns the
-    device's fp32 GEMM, so a model computing in fp32 only for want of bf16 arithmetic
-    gains by using it."""
-    if device.type != "cuda" or _amd is None:
-        return False
-    name, _ = _amd.backend_for(device)
-    return registry.is_available(name) and registry.get_constraints(name, "fp16_packed_linear") is not None
+    return _call_backend(
+        "rms_gated_residual",
+        {
+            "activation": activation,
+            "norm_weight": norm_weight,
+            "residual": residual,
+            "gate": gate,
+            "eps": eps,
+        },
+    )
 
 
 def fp16_linear(
@@ -1214,7 +1115,9 @@ def fp16_linear(
     Same numerics as ``torch.backends.cuda.matmul.allow_fp16_accumulation``, so
     route here only when the user opted into that mode.
     """
-    if not _fp16_linear_fills_gpu(x.shape[:-1].numel(), weight.shape[0], weight.shape[1]):
+    if not _fp16_linear_fills_gpu(
+        x.shape[:-1].numel(), weight.shape[0], weight.shape[1]
+    ):
         # cuBLAS (already fp16-accumulate when the caller opted in) wins outright
         # below these sizes, and the dispatch alone would cost more than the call
         out = torch.nn.functional.linear(x, weight, bias)
@@ -1303,6 +1206,66 @@ def int8_linear(
     return impl(**kwargs)
 
 
+def int8_linear_modulated(
+    x: torch.Tensor,
+    modulation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """Batch-one modulation with fused INT8 quantization."""
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    return _call_backend(
+        "int8_linear_modulated",
+        {
+            "x": x,
+            "modulation_scale": modulation_scale,
+            "weight": weight,
+            "weight_scale": weight_scale,
+            "bias": bias,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+        },
+    )
+
+
+def int8_linear_rms_modulated(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    modulation_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> torch.Tensor:
+    """INT8 projection with RMSNorm and batch-one modulation in its producer."""
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    return _call_backend(
+        "int8_linear_rms_modulated",
+        {
+            "x": x,
+            "norm_weight": norm_weight,
+            "norm_eps": norm_eps,
+            "modulation_scale": modulation_scale,
+            "weight": weight,
+            "weight_scale": weight_scale,
+            "bias": bias,
+            "out_dtype": out_dtype,
+            "convrot": convrot,
+            "convrot_groupsize": convrot_groupsize,
+        },
+    )
+
+
 def delaunay3d(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """3D Delaunay tetrahedralization of distinct points (N, 3) float32/float64.
 
@@ -1376,13 +1339,20 @@ def edge_collapse_checks(
     - link_ok (E,) bool: a and b share at most as many neighbours as faces on the edge, so
       the collapse keeps the topology.
     """
-    kwargs = {"vertices": vertices, "faces": faces, "edges": edges, "positions": positions,
-              "cos_threshold": cos_threshold}
+    kwargs = {
+        "vertices": vertices,
+        "faces": faces,
+        "edges": edges,
+        "positions": positions,
+        "cos_threshold": cos_threshold,
+    }
     impl = registry.get_implementation("edge_collapse_checks", kwargs=kwargs)
     return impl(**kwargs)
 
 
-def min_cut(nbr: torch.Tensor, cap: torch.Tensor, s_cap: torch.Tensor, t_cap: torch.Tensor) -> torch.Tensor:
+def min_cut(
+    nbr: torch.Tensor, cap: torch.Tensor, s_cap: torch.Tensor, t_cap: torch.Tensor
+) -> torch.Tensor:
     """Minimum s-t cut of a graph given as neighbour slots: nbr (N, K) int32/int64, -1 for an
     empty slot, symmetric (j lists i whenever i lists j); cap (N, K) float32 symmetric edge
     capacities; s_cap / t_cap (N,) float32 capacities to the source and the sink. Returns

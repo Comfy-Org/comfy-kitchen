@@ -24,6 +24,7 @@ namespace flash {
 // Single-query decode and bottom-right causal multi-query decode (a speculative verify
 // step, seqlen_q <= kBlockM) share the split-KV kernel; both predicate their Q/K/V loads
 // and O stores (Is_even_MN=false) since seqlen_q and kv_length are never tile multiples.
+using Traits64 = Flash_fwd_kernel_traits<64, 64, 256, 4, false, false, cutlass::bfloat16_t>;
 using Traits128 = Flash_fwd_kernel_traits<128, 64, 128, 4, false, false, cutlass::bfloat16_t>;
 using Traits256 = Flash_fwd_kernel_traits<256, 64, 64, 4, false, false, cutlass::bfloat16_t>;
 
@@ -34,7 +35,9 @@ __global__ void flash_decode_kernel(COMFY_FLASH_PARAM const Flash_fwd_params par
 
 template<typename Traits, int LogMaxSplits>
 __global__ void flash_decode_combine_kernel(COMFY_FLASH_PARAM const Flash_fwd_params params) {
-    COMFY_FLASH_BODY((combine_attn_seqk_parallel<Traits, 4, LogMaxSplits, true>(params));)
+    // 128 threads each copy four values: a 64-wide head needs eight rows per tile.
+    constexpr int kCombineRows = Traits::kHeadDim == 64 ? 8 : 4;
+    COMFY_FLASH_BODY((combine_attn_seqk_parallel<Traits, kCombineRows, LogMaxSplits, true>(params));)
 }
 
 template<typename Traits, bool Is_causal>
@@ -48,7 +51,8 @@ void launch_flash_decode_typed(Flash_fwd_params& params, cudaStream_t stream) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         kernel<<<grid, Traits::kNThreads, smem_size, stream>>>(params);
 
-        const dim3 combine_grid((params.b * params.h * params.seqlen_q + 3) / 4);
+        constexpr int kCombineRows = Traits::kHeadDim == 64 ? 8 : 4;
+        const dim3 combine_grid((params.b * params.h * params.seqlen_q + kCombineRows - 1) / kCombineRows);
         if (params.num_splits <= 2) {
             flash_decode_combine_kernel<Traits, 1><<<combine_grid, Traits::kNThreads, 0, stream>>>(params);
         } else if (params.num_splits <= 4) {
@@ -104,8 +108,8 @@ static flash::Flash_fwd_params decode_params(
     params.d = params.d_rounded = head_dim;
     params.seqlen_q_rounded = ((query_length + 127) / 128) * 128;
     params.total_q = batch * query_length;
-    params.scale_softmax = head_dim == 128 ? 0.08838834764831845f : 0.0625f;
-    params.scale_softmax_log2 = head_dim == 128 ? 0.12751743082871335f : 0.09016844005556021f;
+    params.scale_softmax = head_dim == 64 ? 0.125f : (head_dim == 128 ? 0.08838834764831845f : 0.0625f);
+    params.scale_softmax_log2 = head_dim == 64 ? 0.18033688011112042f : (head_dim == 128 ? 0.12751743082871335f : 0.09016844005556021f);
     params.window_size_left = params.window_size_right = -1;
     params.num_splits = num_splits;
     params.is_bf16 = true;
@@ -124,7 +128,12 @@ extern "C" void launch_flash_decode(
                                 q_batch_stride, q_row_stride, q_head_stride,
                                 k_batch_stride, k_row_stride, k_head_stride,
                                 q_batch_stride, q_row_stride, q_head_stride);
-    if (head_dim == 128) {
+    if (head_dim == 64) {
+        // The unpadded LSE path guards the final partial merge tile. LSE is internal
+        // scratch for this entry point; its head-first layout is not returned.
+        params.unpadded_lse = true;
+        flash::launch_flash_decode_typed<flash::Traits64, false>(params, stream);
+    } else if (head_dim == 128) {
         flash::launch_flash_decode_typed<flash::Traits128, false>(params, stream);
     } else {
         flash::launch_flash_decode_typed<flash::Traits256, false>(params, stream);
@@ -155,23 +164,24 @@ extern "C" void launch_flash_decode_gqa(
     }
 }
 
-// Current-step rows: the prefix decode pass returned its output and log-sum-exp; row j's
-// own token and the earlier rows of this step are the slots that prefix skips. Fold them in
+// Tree-verify rows: the GQA decode pass above attended only the committed prefix
+// (kv_lengths = the committed length, causal = false) and returned its log-sum-exp; a row's
+// own token and its ancestors inside this step are the slots that prefix skips. Fold them in
 // exactly as further softmax columns:
 //   s_t = scale * q . k_t;  m = max(lse, max_t s_t)
 //   o = (out * e^(lse - m) + sum_t v_t * e^(s_t - m)) / (e^(lse - m) + sum_t e^(s_t - m))
-// over the step rows t <= j.
+// mask[j] holds the rows to fold into row j (bit t = row t, always including j itself).
 // One warp per (batch, row, head), eight dims per lane, fp32 math, bf16 out.
-namespace step_merge {
+namespace tree_merge {
 
 constexpr int kMergeHeadDim = 256;
 constexpr int kMergeWarps = 8;
 constexpr int kMaxRows = 8;
 
-__global__ void __launch_bounds__(kMergeWarps * 32) flash_decode_step_merge_kernel(
+__global__ void __launch_bounds__(kMergeWarps * 32) flash_decode_tree_merge_kernel(
     const __nv_bfloat16* __restrict__ out, const float* __restrict__ lse,
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
-    __nv_bfloat16* __restrict__ merged,
+    const int* __restrict__ mask, __nv_bfloat16* __restrict__ merged,
     int total, int rows, int heads, int groups, float scale,
     int64_t q_bs, int64_t q_hs, int64_t q_rs,
     int64_t k_bs, int64_t k_hs, int64_t k_rs,
@@ -186,6 +196,7 @@ __global__ void __launch_bounds__(kMergeWarps * 32) flash_decode_step_merge_kern
     const int b = idx / (heads * rows);
     const int kh = h / groups;
     const int d0 = lane * 8;
+    const int bits = mask[j];
 
     const uint4 qv = *reinterpret_cast<const uint4*>(q + b * q_bs + h * q_hs + j * q_rs + d0);
     const auto* q2 = reinterpret_cast<const __nv_bfloat162*>(&qv);
@@ -196,7 +207,7 @@ __global__ void __launch_bounds__(kMergeWarps * 32) flash_decode_step_merge_kern
 #pragma unroll
     for (int t = 0; t < kMaxRows; ++t) {
         s[t] = -INFINITY;
-        if (t <= j) {
+        if (t < rows && (bits & (1 << t))) {
             const uint4 kv4 = *reinterpret_cast<const uint4*>(k + b * k_bs + kh * k_hs + t * k_rs + d0);
             const auto* k2 = reinterpret_cast<const __nv_bfloat162*>(&kv4);
             float dot = 0.f;
@@ -225,7 +236,7 @@ __global__ void __launch_bounds__(kMergeWarps * 32) flash_decode_step_merge_kern
     }
 #pragma unroll
     for (int t = 0; t < kMaxRows; ++t) {
-        if (t <= j) {
+        if (t < rows && (bits & (1 << t))) {
             const float w = expf(s[t] - m);
             denom += w;
             const uint4 vv = *reinterpret_cast<const uint4*>(v + b * v_bs + kh * v_hs + t * v_rs + d0);
@@ -247,10 +258,10 @@ __global__ void __launch_bounds__(kMergeWarps * 32) flash_decode_step_merge_kern
     *reinterpret_cast<uint4*>(merged + b * m_bs + j * m_rs + h * kMergeHeadDim + d0) = res;
 }
 
-} // namespace step_merge
+} // namespace tree_merge
 
-extern "C" void launch_flash_decode_step_merge(
-    const void* out, const float* lse, const void* q, const void* k, const void* v, void* merged,
+extern "C" void launch_flash_decode_tree_merge(
+    const void* out, const float* lse, const void* q, const void* k, const void* v, const int* mask, void* merged,
     int batch, int rows, int heads, int kv_heads,
     int64_t q_batch_stride, int64_t q_head_stride, int64_t q_row_stride,
     int64_t k_batch_stride, int64_t k_head_stride, int64_t k_row_stride,
@@ -258,12 +269,12 @@ extern "C" void launch_flash_decode_step_merge(
     int64_t o_batch_stride, int64_t o_row_stride,
     int64_t m_batch_stride, int64_t m_row_stride,
     cudaStream_t stream) {
-    using namespace step_merge;
+    using namespace tree_merge;
     const int warps = batch * rows * heads;
-    flash_decode_step_merge_kernel<<<(warps + kMergeWarps - 1) / kMergeWarps, kMergeWarps * 32, 0, stream>>>(
+    flash_decode_tree_merge_kernel<<<(warps + kMergeWarps - 1) / kMergeWarps, kMergeWarps * 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(out), lse,
         static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(k), static_cast<const __nv_bfloat16*>(v),
-        static_cast<__nv_bfloat16*>(merged),
+        mask, static_cast<__nv_bfloat16*>(merged),
         warps, rows, heads, heads / kv_heads, 1.0f / sqrtf(float(kMergeHeadDim)),
         q_batch_stride, q_head_stride, q_row_stride,
         k_batch_stride, k_head_stride, k_row_stride,

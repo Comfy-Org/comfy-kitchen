@@ -155,12 +155,14 @@ set(HIP_SOURCES
     ops/per_tensor_fp8.hip
     ops/stochastic_round_fp8.hip
     ops/quantize_int8.hip
+    ops/rms_gated_residual.hip
     ops/gemm_fp8.hip
     ops/gemm_int8.hip
     ops/gemm_fp16.hip
     ops/conv3d_fp16.hip
     ops/convrot_w4a4.hip
     ops/adaln.hip
+    ops/rms_convrot_quant.hip
     ops/group_norm_pad3d.hip
     ops/na3d.hip
     sage_attention/quant_qk_int8.hip

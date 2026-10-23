@@ -16,7 +16,7 @@ _MAX_STEPS = 8
 _NATIVE_MINIMUM_CAPABILITY = (7, 5)
 _device_optin: dict[int, int] = {}
 SLOT_MAX = 8  # token slots per deferred side buffer; verify steps run S <= SLOT_MAX tokens
-CTL_INTS = 2  # ctl = {pending, parity}
+CTL_INTS = 2 + 3 * SLOT_MAX  # ctl = {pending, parity, slot[8], parent[8], prog[8]}
 
 
 def _fused_shmem_bytes(key_head_dim: int, value_head_dim: int) -> int:
@@ -100,9 +100,12 @@ def deltanet_conv_step_deferred(
 ) -> None:
     """Depthwise causal conv + silu over proj [B, S, C] into qkv_buf[ctl[1]] (stride SLOT_MAX).
 
-    ctl is an int32 device vector {pending, parity}: the first `pending` tokens of
-    proj_buf[1 - parity] are committed into conv_state before convolving the current
-    chain. The current projections are saved to proj_buf[parity] for the next step.
+    ctl is an int32 device vector of CTL_INTS entries {pending, parity, slot[8], parent[8],
+    prog[8]}: the `pending` accepted tokens of the previous step, at its side-buffer slots
+    slot[0..pending) of proj_buf[1 - parity], are committed into conv_state first; then each
+    current row is convolved over its own ancestors, parent[r] naming the row that row r
+    extends (-1: the committed window). The current projections are saved to proj_buf[parity]
+    for the next step.
     """
     channels = proj.shape[2]
     conv_w = conv_w.reshape(channels, -1).contiguous()
@@ -136,15 +139,24 @@ def _conv_deferred_torch(proj, conv_state, conv_w, conv_b, proj_buf, qkv_buf, ct
     taps = conv_w.shape[1]
     ctl = ctl.long()  # index_copy_ wants int64 indices
     pending, parity = ctl[0], ctl[1]
-    prev = _slab(proj_buf, 1 - parity).transpose(1, 2)  # [B, C, 8]
+    slots, parent = ctl[2:2 + SLOT_MAX], ctl[2 + SLOT_MAX:2 + 2 * SLOT_MAX]
+    prev = _slab(proj_buf, 1 - parity).index_select(1, slots).transpose(1, 2)  # [B, C, 8] at slot order
     # committed window = the last `window` of [conv_state, prev[0..pending)]
     combined = torch.cat([conv_state, prev], dim=2)
     committed = combined.index_select(2, pending + torch.arange(window, device=ctl.device))
     conv_state.copy_(committed)
     win = torch.cat([committed, proj.transpose(1, 2)], dim=2).float()  # [B, C, window + S]
-    # tap d of row s: the token d steps back in the committed window followed by the chain
+    # tap d of row s: its own projection, then its ancestors through parent[], then the
+    # committed window, newest first
     rows = torch.arange(seq, dtype=ctl.dtype, device=ctl.device)
-    src = window + rows.view(seq, 1) - torch.arange(taps, dtype=ctl.dtype, device=ctl.device)  # [S, taps] in distance order
+    src = [window + rows]
+    p = rows
+    missing = torch.zeros_like(rows)
+    for _ in range(1, taps):
+        p = torch.where(p >= 0, parent.index_select(0, p.clamp(min=0)), -1)
+        missing = missing + (p < 0).to(missing.dtype)
+        src.append(torch.where(p >= 0, window + p, window - missing))
+    src = torch.stack(src, dim=1)  # [S, taps] in distance order
     gathered = win.index_select(2, src.view(-1)).view(batch, channels, seq, taps)
     acc = (gathered * conv_w.float().flip(1).view(1, channels, 1, taps)).sum(-1)
     if conv_b is not None:
@@ -173,12 +185,15 @@ def gated_delta_decode_deferred(
     sumsq_buf: torch.Tensor,
     ctl: torch.Tensor,
 ) -> torch.Tensor:
-    """S GatedDeltaNet decode steps from qkv_buf[ctl[1]] written by deltanet_conv_step_deferred.
+    """1, 4 or 8 GatedDeltaNet rows from qkv_buf[ctl[1]] written by deltanet_conv_step_deferred.
 
-    Replays the first `ctl[0]` tokens of the previous step from the [1 - parity] side
-    buffers, writes the committed fp32 state [B, Hv, DK, DV] in place, then returns the
-    outputs of the S current chain tokens without committing them.
-    State, dt_bias and g_decay must be contiguous.
+    Replays the `ctl[0]` accepted tokens of the previous step from the [1 - parity] side
+    buffers (at the slots named by ctl), writes the committed fp32 state [B, Hv, DK, DV] in
+    place, then returns the outputs of the S current rows without committing them. Runs
+    the rows through ctl's program (entry = row | commit << 5, in depth-first order: a
+    chain row commits, the leaves off it then run without committing) instead of as a straight
+    chain; a row's ancestors are ctl's parent[]
+    (see deltanet_conv_step_deferred). State, dt_bias and g_decay must be contiguous.
     """
     batch, seq, _ = x.shape
     heads, key_dim_head, value_dim = state.shape[1], state.shape[2], state.shape[3]
@@ -217,6 +232,7 @@ def _decode_deferred_torch(x, w_a, w_b, dt_bias, g_decay, state, key_dim, num_ke
     dtype = x.dtype
     ctl = ctl.long()  # index_copy_ wants int64 indices
     pending, parity = ctl[0], ctl[1]
+    slots, prog = ctl[2:2 + SLOT_MAX], ctl[2 + 2 * SLOT_MAX:2 + 3 * SLOT_MAX]
 
     # gates of the current rows: bf16 projections and sigmoid, fp32 softplus and exp
     beta = torch.nn.functional.linear(x, w_b).sigmoid().float()  # [B, S, Hv]
@@ -232,15 +248,16 @@ def _decode_deferred_torch(x, w_a, w_b, dt_bias, g_decay, state, key_dim, num_ke
     sumsq_buf.index_copy_(0, parity.view(1), torch.nn.functional.pad(
         cur_ss.transpose(1, 2), (0, 0, 0, 0, 0, SLOT_MAX - seq)).unsqueeze(0))
 
-    # the previous step's rows; the slots past `pending` are zeroed (the kernels never read them)
+    # the previous step's rows at their accepted slots; the slots past `pending` were never
+    # written and are zeroed (the kernels never read them)
     live = pending > torch.arange(SLOT_MAX, device=ctl.device)
-    prev = torch.where(live.view(1, 1, SLOT_MAX), _slab(qkv_buf, 1 - parity), 0.0)
+    prev = torch.where(live.view(1, 1, SLOT_MAX), _slab(qkv_buf, 1 - parity).index_select(2, slots), 0.0)
     prev_q = prev[:, :key_dim].reshape(batch, num_key_heads, key_dim_head, SLOT_MAX).float()
     prev_k = prev[:, key_dim:2 * key_dim].reshape(batch, num_key_heads, key_dim_head, SLOT_MAX).float()
     prev_v = prev[:, 2 * key_dim:].reshape(batch, heads, value_dim, SLOT_MAX).float()
-    prev_gates = _slab(gates_buf, 1 - parity)  # [B, 8, Hv, 2]
+    prev_gates = _slab(gates_buf, 1 - parity).index_select(1, slots)  # [B, 8, Hv, 2]
     prev_ss = torch.where(live.view(1, 1, SLOT_MAX, 1),
-                          _slab(sumsq_buf, 1 - parity).transpose(1, 2), 1.0)  # [B, Hk, 8, 2]
+                          _slab(sumsq_buf, 1 - parity).index_select(1, slots).transpose(1, 2), 1.0)  # [B, Hk, 8, 2]
     prev_decay = torch.where(live.view(1, SLOT_MAX, 1), prev_gates[..., 0], 1.0)
     prev_beta = torch.where(live.view(1, SLOT_MAX, 1), prev_gates[..., 1], 0.0)
 
@@ -267,8 +284,14 @@ def _decode_deferred_torch(x, w_a, w_b, dt_bias, g_decay, state, key_dim, num_ke
     state.copy_(st)
 
     q, k = normalized(cur_q, cur_k, cur_ss)
-    for s in range(seq):
-        st, oc[:, s] = step(st, q[..., s], k[..., s], cur_v[..., s], decay[:, s], beta[:, s])
+    for e in range(seq):
+        row = (prog[e] & 15).view(1)
+        commit = (prog[e] & 32) != 0
+        n, o = step(st, q.index_select(3, row)[..., 0], k.index_select(3, row)[..., 0],
+                    cur_v.index_select(3, row)[..., 0],
+                    decay.index_select(1, row)[:, 0], beta.index_select(1, row)[:, 0])
+        st = torch.where(commit, n, st)
+        oc.index_copy_(1, row, o.unsqueeze(1))
 
     # torch rms_norm (fp32 compute, one rounding) times a bf16 silu gate
     oc = oc.to(dtype).float()

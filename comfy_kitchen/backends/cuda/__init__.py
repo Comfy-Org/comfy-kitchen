@@ -23,6 +23,7 @@ from typing import NamedTuple
 import torch
 
 from comfy_kitchen._rope_utils import (
+    _tensors_overlap,
     check_rope_inplace,
     detect_rms_rope_bnhd,
     trim_rope_freqs,
@@ -44,6 +45,7 @@ __all__ = [
     "fp16_conv3d_out",
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
+    "group_norm_stats3d",
     "rms_adaln",
     "apply_rope",
     "apply_rope_",
@@ -181,6 +183,7 @@ from comfy_kitchen.backends._modulation import adaln_prep_modulation  # noqa: E4
 from comfy_kitchen.backends.eager import rope as _eager_rope  # noqa: E402
 from comfy_kitchen.backends.eager.group_norm_pad3d import (  # noqa: E402
     group_norm_silu_pad3d as _eager_group_norm_silu_pad3d,
+    group_norm_stats3d as _eager_group_norm_stats3d,
 )
 from comfy_kitchen.backends.eager.quantization import (  # noqa: E402
     DTYPE_CODE_TO_DTYPE,
@@ -3716,9 +3719,11 @@ def group_norm_silu_pad3d(
     silu: bool,
     zero_pad: bool = False,
     out: torch.Tensor | None = None,
+    stats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-frame GroupNorm + SiLU + causal conv padding in one pass, channels_last_3d out.
-    ``out`` is written in place where the kernel can index it, else copied into."""
+    ``stats`` from group_norm_stats3d normalizes a row strip of a frame with that frame's
+    statistics. ``out`` is written in place where the kernel can index it, else copied into."""
     b, c, t, h, w = x.shape
     left, right, top, bottom, front = pad
     if min(pad) < 0:
@@ -3726,39 +3731,78 @@ def group_norm_silu_pad3d(
     if weight is not None:  # the affine params may be fp32; every path wants x's dtype
         weight = weight.to(x.dtype).contiguous()
         bias = _zero_vector(c, x.device, x.dtype) if bias is None else bias.to(x.dtype).contiguous()
-    served = not (c % 8 or 256 % (c // 8) or (weight is not None and (c % num_groups or num_groups > 1024))
+    if stats is not None and (stats.shape, stats.dtype, stats.device) != ((b * t, num_groups, 2), torch.float32, x.device):
+        raise ValueError(f"group_norm_silu_pad3d: stats must be float32 [{b * t}, {num_groups}, 2] on {x.device}")
+    served = not (c % 8 or c > 2048 or (weight is not None and (c % num_groups or num_groups > 1024))
                   or (not zero_pad and (max(left, right) >= w or max(top, bottom) >= h))
                   or b * (t + front) > 65535)
-    if served:
+    row_stride = _ndhwc_row_stride(x) if served else None
+    if served and row_stride is None:
+        row_stride = w * c
         x = x.contiguous(memory_format=torch.channels_last_3d)
-        served = _aligned16(x)  # the kernels issue 16-byte vector loads
+    served = served and _aligned16(x)  # the kernels issue 16-byte vector loads
     if not served:
-        res = _eager_group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad)
+        res = _eager_group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, stats)
         if out is None:
             return res
         out.copy_(res)
         return out
 
-    dst = out if out is not None and _writes_packed_ndhwc(out) and _aligned16(out) else None
+    # frames are written in no particular order, so an out overlapping x goes via a copy
+    dst = out if out is not None and _writes_packed_ndhwc(out) and _aligned16(out) and not _tensors_overlap(out, x) else None
     if dst is None:
         dst = torch.empty((b, c, t + front, h + top + bottom, w + left + right),
                           dtype=x.dtype, device=x.device, memory_format=torch.channels_last_3d)
     placeholder = _empty_cuda_tensor(x.device, torch.float32)
-    if weight is not None:
+    workspace = placeholder
+    if weight is None:
+        weight = bias = placeholder
+    elif stats is None:
         chunks = -(-(h * w) // 1024)
         workspace = torch.empty(2 * b * t * (chunks * c + num_groups), dtype=torch.float32, device=x.device)
-    else:
-        weight = bias = workspace = placeholder
     _C.group_norm_silu_pad3d(
         _wrap_for_dlpack(x), _wrap_for_dlpack(weight), _wrap_for_dlpack(bias),
         _wrap_for_dlpack(dst), _wrap_for_dlpack(workspace),
-        b, c, t, h, w, num_groups, eps, left, right, top, bottom, front, silu, zero_pad,
+        _wrap_for_dlpack(placeholder if stats is None else stats.contiguous()),
+        b, c, t, h, w, num_groups, eps, left, right, top, bottom, front, silu, zero_pad, row_stride,
         DTYPE_TO_CODE[x.dtype], torch.cuda.current_stream(x.device).cuda_stream,
     )
     if out is None or dst is out:
         return dst
     out.copy_(dst)
     return out
+
+
+def _ndhwc_row_stride(x: torch.Tensor):
+    """Elements between image rows when x is a single frame with packed NHWC rows that sit farther
+    apart than W * C (a row-interleaved view the kernels read in place); None otherwise."""
+    b, c, t, h, w = x.shape
+    if (t == 1 and x.stride(1) == 1 and x.stride(4) == c and x.stride(3) > w * c and x.stride(3) % 8 == 0
+            and (b == 1 or x.stride(0) == h * x.stride(3))):
+        return x.stride(3)
+    return None
+
+
+def group_norm_stats3d(x: torch.Tensor, num_groups: int, eps: float) -> torch.Tensor:
+    """Per-frame GroupNorm (mean, rstd) of x [B, C, T, H, W] as float32 [B*T, num_groups, 2],
+    the same statistics group_norm_silu_pad3d computes for itself."""
+    b, c, t, h, w = x.shape
+    served = not (c % 8 or c > 2048 or c % num_groups or num_groups > 1024 or b * t > 65535)
+    row_stride = _ndhwc_row_stride(x) if served else None
+    if served and row_stride is None:
+        row_stride = w * c
+        x = x.contiguous(memory_format=torch.channels_last_3d)
+    served = served and _aligned16(x)
+    if not served:
+        return _eager_group_norm_stats3d(x, num_groups, eps)
+    chunks = -(-(h * w) // 1024)
+    workspace = torch.empty(2 * b * t * chunks * c, dtype=torch.float32, device=x.device)
+    stats = torch.empty((b * t, num_groups, 2), dtype=torch.float32, device=x.device)
+    _C.group_norm_stats3d(
+        _wrap_for_dlpack(x), _wrap_for_dlpack(workspace), _wrap_for_dlpack(stats),
+        b, c, t, h, w, num_groups, eps, row_stride, DTYPE_TO_CODE[x.dtype], torch.cuda.current_stream(x.device).cuda_stream,
+    )
+    return stats
 
 
 def _writes_packed_ndhwc(out: torch.Tensor) -> bool:
@@ -3770,9 +3814,9 @@ def _writes_packed_ndhwc(out: torch.Tensor) -> bool:
     return b == 1 and st[1] == 1 and st[4] == c and st[3] == w * c and st[2] == h * w * c
 
 
-def group_norm_silu_pad3d_out(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out) -> None:
+def group_norm_silu_pad3d_out(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out, stats=None) -> None:
     """group_norm_silu_pad3d into ``out``; a frame-offset view leaves room for a caller's halo."""
-    group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out=out)
+    group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out, stats)
 
 
 def _apply_rope1_cuda(
@@ -4546,6 +4590,15 @@ def _build_constraints() -> dict:
                 "weight": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(5),)),
                 "bias": ParamConstraint(dtypes=frozenset({torch.float16, type(None)})),
                 "residual": ParamConstraint(dtypes=frozenset({torch.float16, type(None)})),
+            },
+            default_devices=cuda_devices,
+        ),
+        "group_norm_stats3d": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(5),),
+                ),
             },
             default_devices=cuda_devices,
         ),
