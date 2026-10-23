@@ -1126,6 +1126,7 @@ def int8_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    weight_tiled: bool = False,
 ) -> torch.Tensor:
     """INT8 linear layer dynamically quantized.
 
@@ -1149,6 +1150,8 @@ def int8_linear(
             ``residual + residual_scale * linear(x)`` (a pre-norm block's
             addcmul), fused into the GEMM epilogue where supported.
         residual_scale: Per-channel [N] scale for the residual form.
+        weight_tiled: ``weight`` uses the resident tiled layout produced by
+            ``TensorWiseINT8Layout.optimize_for_gemm``.
 
     Returns:
         Result tensor.
@@ -1169,7 +1172,8 @@ def int8_linear(
         "residual": residual,
         "residual_scale": residual_scale,
     }
-    impl = registry.get_implementation("int8_linear", kwargs=kwargs)
+    operation = "int8_linear_tiled_weight" if weight_tiled else "int8_linear"
+    impl = registry.get_implementation(operation, kwargs=kwargs)
     return impl(**kwargs)
 
 

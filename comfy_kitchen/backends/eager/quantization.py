@@ -1293,6 +1293,7 @@ def _op_int8_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    weight_tiled: bool = False,
 ) -> torch.Tensor:
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {
@@ -1309,7 +1310,8 @@ def _op_int8_linear(
         "residual": residual,
         "residual_scale": residual_scale,
     }
-    impl = registry.get_implementation("int8_linear", kwargs=kwargs)
+    operation = "int8_linear_tiled_weight" if weight_tiled else "int8_linear"
+    impl = registry.get_implementation(operation, kwargs=kwargs)
     return impl(**kwargs)
 
 
@@ -1317,6 +1319,6 @@ def _op_int8_linear(
 def _op_int8_linear_fake(x, weight, weight_scale, bias, output_dtype_code,
                          convrot=False, convrot_groupsize=256, input_act=None,
                          input_act_weight=None, input_act_eps=0.0,
-                         residual=None, residual_scale=None):
+                         residual=None, residual_scale=None, weight_tiled=False):
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     return torch.empty(*x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device)
