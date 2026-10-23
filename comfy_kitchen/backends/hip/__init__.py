@@ -853,8 +853,16 @@ def fp16_linear(
 _HIP_FUSED_ACTS = (None, "none", "gelu_tanh", "swiglu", "situ")
 
 
+# gfx12 keeps the row-major route, whose 128x256 BKB=128 INT8 tile is faster than
+# the tiled-A producer/GEMM pair at model-sized shapes. gfx117 keeps tiled-A.
+# COMFY_KITCHEN_INT8_TILED_A=1 selects tiled-A on gfx12 as well.
+_INT8_TILED_A_ON_GFX12 = os.environ.get("COMFY_KITCHEN_INT8_TILED_A") == "1"
+
+
 def _use_tiled_int8(m: int, n: int, k: int, device: torch.device) -> bool:
     # Keep the small-M GEMV and the narrow/partial-K row-major tiles.
+    if not _INT8_TILED_A_ON_GFX12 and _gfx_arch(device) in _ARCH_WMMA_GFX12:
+        return False
     return m > 8 and n > 64 and k > 0 and k % 128 == 0 and _has_nonduplicated_wmma(device)
 
 
