@@ -561,11 +561,11 @@ def _gated_input(act, m, k, dtype):
 
 
 def test_swiglu_convrot_direct_binding_handles_bf16_offset_input(hip):
-    """The low-level binding must also accept a contiguous BF16 view whose
-    logical data pointer is not 8-byte aligned.
+    """A contiguous BF16 view whose data pointer is not 8-byte aligned.
 
-    The public wrapper realigns such inputs, so call the binding directly to
-    exercise the packed-load fallback itself.
+    Since v0.2.40 the binding rejects such a pointer and the public wrapper
+    realigns it, so check both halves of that contract: the binding refuses the
+    offset view, and the wrapper quantizes it exactly like the aligned copy.
     """
     torch.manual_seed(0)
     m, k, group = 17, 1024, 256
@@ -578,28 +578,17 @@ def test_swiglu_convrot_direct_binding_handles_bf16_offset_input(hip):
     assert aligned.data_ptr() % 8 == 0
     assert offset.data_ptr() % 8 != 0
 
-    def run(x):
-        q = torch.empty((m, k), dtype=torch.int8, device=x.device)
-        scales = torch.empty((m,), dtype=torch.float32, device=x.device)
+    q = torch.empty((m, k), dtype=torch.int8, device=DEV)
+    scales = torch.empty((m,), dtype=torch.float32, device=DEV)
+    with pytest.raises(RuntimeError, match="8-byte aligned"):
         hip._C.quantize_int8_convrot(
-            hip._dl(x),
-            hip._dl(q),
-            hip._dl(scales),
-            None,
-            None,
-            m,
-            k,
-            group,
-            2,  # kActSwiGLU
-            hip._stream(x),
-            None,
-            0.0,
+            hip._dl(offset), hip._dl(q), hip._dl(scales), None, None,
+            m, k, group, 2, hip._stream(offset), None, 0.0,  # 2 = kActSwiGLU
         )
-        torch.cuda.synchronize()
-        return q, scales
 
-    q_aligned, s_aligned = run(aligned)
-    q_offset, s_offset = run(offset)
+    q_aligned, s_aligned = hip._rotate_quant_int8(aligned, group, "swiglu")
+    q_offset, s_offset = hip._rotate_quant_int8(offset, group, "swiglu")
+    torch.cuda.synchronize()
 
     assert torch.equal(q_offset, q_aligned)
     assert torch.equal(s_offset, s_aligned)
@@ -3595,7 +3584,9 @@ def test_convrot_int8_needs_spill_probe(hip):
 def test_convrot_wide_global_is_exact_to_fused_lds(hip):
     """The global-spill implementation matches the fused-LDS one row for row."""
     torch.manual_seed(37)
-    m, k = 96, 24576
+    # The single-buffer fused producer (PR #183) still fits 24576 in LDS at 768
+    # threads, so use the first width whose narrowest multi-wave block overflows.
+    m, k = 96, 28672
     in_code = hip.DTYPE_TO_CODE[torch.bfloat16]
     with torch.cuda.device(DEV):
         # 96 rows of this width take the global path; 64 fit the one-wave
