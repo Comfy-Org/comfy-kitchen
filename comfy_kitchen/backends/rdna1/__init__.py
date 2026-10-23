@@ -3878,6 +3878,49 @@ def _sage_dense_mask_buffer(attn_mask: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _sage_f16_wanted(q: torch.Tensor) -> bool:
+    """Whether the int8 entry points run q, k and v unquantized on the fp16 FMA kernel.
+
+    gfx1010 has no int8 dot or matrix instruction, so the int8 kernel converts the codes
+    back to fp16 and multiplies on v_pk_fma_f16: quantizing buys it nothing but the
+    error. On Flux2 Klein at 1 MP the per-channel V scale alone left 2-3% error in
+    attention, against ~2e-4 for fp16 SDPA, and the fp16 kernel reads fp16 in place."""
+    return q.dtype == torch.float16 and q.shape[-1] in (64, 128)
+
+
+_SAGE_PACKED_KEYS = ("q_int8", "k_int8", "v_int8", "q_scale", "k_scale", "v_scale")
+
+
+def _sage_f16_scale(t: torch.Tensor, bound: float) -> torch.Tensor:
+    """Per (batch, head) power of two that brings max |t| to at most bound, capped where
+    fp16 still holds it. |q|, |k| <= 32 and |v| <= 256 keep the fp16 kernel's packed
+    chains below 65504 (sage_attention/int8_attn_fp16.hip)."""
+    amax = torch.linalg.vector_norm(t, float("inf"), dim=(2, 3), dtype=torch.float32)
+    return torch.exp2(torch.floor(torch.log2(bound / amax.clamp_min(2**-24)))).clamp_max(2**15)
+
+
+def _sage_f16_inputs(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> dict:
+    """q, k and v as the fp16 kernel reads them, in sage_int8_quantize's keys."""
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    return {
+        "q_int8": q,
+        "k_int8": k,
+        "v_int8": v,
+        "q_scale": _sage_f16_scale(q, 32.0),
+        "k_scale": _sage_f16_scale(k, 32.0),
+        "v_scale": _sage_f16_scale(v, 256.0),
+    }
+
+
+def _sage_f16_attend(q, k, v, q_scale, k_scale, v_scale, attention_scale: float) -> torch.Tensor:
+    output = torch.empty_like(q)
+    _C.sage_f16_sdpa(
+        _dl(q), _dl(k), _dl(v), _dl(output), _dl(q_scale), _dl(k_scale), _dl(v_scale),
+        float(attention_scale), _stream(q),
+    )
+    return output
+
+
 def sage_int8_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3887,7 +3930,11 @@ def sage_int8_sdpa(
     attn_mask: torch.Tensor | None,
 ) -> torch.Tensor:
     """Quantize and attend in one call. q, k and v are already padded to a
-    supported head dimension; the output keeps that width."""
+    supported head dimension; the output keeps that width. Unmasked fp16 runs
+    unquantized (_sage_f16_wanted)."""
+    if attn_mask is None and _sage_f16_wanted(q):
+        inputs = _sage_f16_inputs(q, k, v)
+        return _sage_f16_attend(*(inputs[n] for n in _SAGE_PACKED_KEYS), attention_scale)
     batch, q_heads, q_length, head_dim = q.shape
     output_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
     output = torch.empty(
@@ -3930,7 +3977,16 @@ def sage_int8_quantize(
     *,
     cta_k: int = _SAGE_CTA_K,
 ) -> dict:
-    """Quantize q, k and v without allocating the attention output."""
+    """Quantize q, k and v without allocating the attention output. fp16 inputs that
+    _sage_f16_wanted takes are kept unquantized, with the fp16 kernel's scales; the
+    attend functions quantize them only if a mask or block sparsity needs the int8
+    kernels."""
+    if _sage_f16_wanted(q):
+        return _sage_f16_inputs(q, k, v)
+    return _sage_int8_pack(q, k, v, cta_k)
+
+
+def _sage_int8_pack(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cta_k: int) -> dict:
     buffers, anchor_indices = _sage_buffers(q, k, cta_k)
     _C.sage_sdpa_quantize(
         _dl(q),
@@ -3964,6 +4020,11 @@ def sage_int8_attend(
     cta_k: int = _SAGE_CTA_K,
 ) -> torch.Tensor:
     """Attend over the packed layouts sage_int8_quantize produced."""
+    if q_int8.dtype == torch.float16:
+        if attn_mask is None:
+            return _sage_f16_attend(q_int8, k_int8, v_int8, q_scale, k_scale, v_scale, attention_scale)
+        packed = _sage_int8_pack(q_int8, k_int8, v_int8, cta_k)
+        q_int8, k_int8, v_int8, q_scale, k_scale, v_scale = (packed[n] for n in _SAGE_PACKED_KEYS)
     batch, q_heads, q_length, head_dim = q_int8.shape
     output = torch.empty(
         batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q_int8.device
@@ -4002,6 +4063,9 @@ def sage_int8_block_sparse_attend(
     """Attend over sage_int8_quantize's packed layouts (cta_k 64), with query block b
     of each head reading only the 64-key tiles lut[..., b, :]. out, when
     given, is a [B, H, L, D] tensor of output_dtype, contiguous along D, written in place."""
+    if q_int8.dtype == torch.float16:
+        packed = _sage_int8_pack(q_int8, k_int8, v_int8, _SAGE_CTA_K)
+        q_int8, k_int8, v_int8, q_scale, k_scale, v_scale = (packed[n] for n in _SAGE_PACKED_KEYS)
     batch, q_heads, q_length, head_dim = q_int8.shape
     output = out if out is not None else torch.empty(
         batch, q_heads, q_length, head_dim, dtype=output_dtype, device=q_int8.device

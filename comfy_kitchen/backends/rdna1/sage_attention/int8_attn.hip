@@ -310,3 +310,22 @@ extern "C" void launch_sage_int8_block_sparse_attn(
     launch_int8_attn_fp16(a, head_dim, output_dtype_code, static_cast<const int*>(lut), topk,
                           block_q);
 }
+
+// Unquantized attention over fp16 Q, K and V on the fp16 FMA kernel (gfx1010): q, k, v
+// and o are [B, H, L, D] contiguous, head_dim 64 or 128; q_scale [B * H_q] and k_scale,
+// v_scale [B * H_kv] are the powers of two the kernel scales each head's inputs by.
+extern "C" void launch_sage_f16_attn(
+    const void* q, const void* k, const void* v, void* o, const void* q_scale,
+    const void* k_scale, const void* v_scale, int batch, int qo_len, int kv_len,
+    int num_qo_heads, int num_kv_heads, int head_dim, float sm_scale, hipStream_t stream) {
+    if (reinterpret_cast<uintptr_t>(q) % 16 != 0 || reinterpret_cast<uintptr_t>(k) % 16 != 0 ||
+        reinterpret_cast<uintptr_t>(v) % 16 != 0) {
+        throw std::runtime_error("sage f16 attention: q, k and v must be 16-byte aligned");
+    }
+    const F16AttnLaunch a{
+        .q = q, .k = k, .v = v, .o = o, .q_scale = static_cast<const float*>(q_scale),
+        .k_scale = static_cast<const float*>(k_scale), .v_scale = static_cast<const float*>(v_scale),
+        .batch = batch, .qo_len = qo_len, .kv_len = kv_len, .num_qo_heads = num_qo_heads,
+        .num_kv_heads = num_kv_heads, .sm_scale = sm_scale, .stream = stream};
+    launch_f16_attn_fp16(a, head_dim);
+}

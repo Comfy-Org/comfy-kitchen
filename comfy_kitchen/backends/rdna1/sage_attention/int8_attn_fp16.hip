@@ -85,9 +85,19 @@ __forceinline__ __device__ float fma_h(_Float16 a, _Float16 b, float c) {
 // kWaves waves of 16 queries make a block. With a lut ([B, H_q, query blocks, topk]
 // key-tile indices, as block-sparse attention selects them), a block attends to only
 // those 64-key tiles of K, in the order given; without one, to all of K.
-template <int HD, bool PK, int kWaves, typename OutT>
+//
+// InT int8_t reads the quantized layouts. InT _Float16 reads fp16 Q, K and V as they are,
+// [B, H, L, D] contiguous, and q_scale, k_scale and v_scale then hold one power of two per
+// (batch, head) that the kernel multiplies Q, K and V by (exact): chosen so |q|, |k| <= 32
+// and |v| <= 256, the PK chains keep the int8 path's bounds (32 * 32 * 32 for QK, 8 * 16 *
+// 256 for PV). Keys past kv_len are zeroed as the tiles are staged, and V is transposed
+// into LDS there, so no packed copy of K or V is made. On Flux2 Klein at 1 MP this is
+// 2.1e-3 off fp32 attention (int8: 0.6-2.1e-2, fp16 SDPA 2.1e-4), nearly all of it from
+// the f16 QK chains; QK on fma_mix instead reached 4.6e-4 but ran no faster than
+// ops/flash_attn.hip.
+template <int HD, bool PK, int kWaves, typename OutT, typename InT>
 __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
-    const int8_t* __restrict__ q, const int8_t* __restrict__ k, const int8_t* __restrict__ v,
+    const InT* __restrict__ q, const InT* __restrict__ k, const InT* __restrict__ v,
     OutT* __restrict__ o, const float* __restrict__ q_scale, const float* __restrict__ k_scale,
     const float* __restrict__ v_scale, const int* __restrict__ lut, int topk, int qo_len,
     int kv_len, int qo_len_padded, int k_groups_per_head, int num_kv_groups, int64_t q_stride_b,
@@ -95,6 +105,7 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
     int64_t v_stride_h, int64_t v_stride_d, int64_t o_stride_b, int64_t o_stride_h,
     int64_t o_stride_n, float sm_scale) {
 #if defined(COMFY_SAGE_FP16_SIMT)
+    constexpr bool kF16In = std::is_same_v<InT, _Float16>;
     constexpr int kL = 4;                    // lanes per query group
     constexpr int kR = 2;                    // queries per query group
     static_assert(32 / kL * kR == 16, "a wave holds 16 queries");
@@ -126,12 +137,17 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
     const int kv_head = head / num_kv_groups;
     const int q0 = blockIdx.x * kBlockQ + wave * 16 + (lane / kL) * kR;
 
-    const int8_t* q_head = q + static_cast<int64_t>(batch) * q_stride_b +
-                           static_cast<int64_t>(head) * q_stride_h;
-    const int8_t* k_head = k + static_cast<int64_t>(batch) * k_stride_b +
-                           static_cast<int64_t>(kv_head) * k_stride_h;
-    const int8_t* v_head = v + static_cast<int64_t>(batch) * v_stride_b +
-                           static_cast<int64_t>(kv_head) * v_stride_h;
+    const InT* q_head = q + static_cast<int64_t>(batch) * q_stride_b +
+                        static_cast<int64_t>(head) * q_stride_h;
+    const InT* k_head = k + static_cast<int64_t>(batch) * k_stride_b +
+                        static_cast<int64_t>(kv_head) * k_stride_h;
+    const InT* v_head = v + static_cast<int64_t>(batch) * v_stride_b +
+                        static_cast<int64_t>(kv_head) * v_stride_h;
+    const int64_t kv_bh = static_cast<int64_t>(batch) * (num_qo_heads / num_kv_groups) + kv_head;
+    const _Float16 k_mult16 = kF16In ? static_cast<_Float16>(k_scale[kv_bh]) : _Float16{1};
+    const _Float16 v_mult16 = kF16In ? static_cast<_Float16>(v_scale[kv_bh]) : _Float16{1};
+    const half2_t k_mult = {k_mult16, k_mult16};
+    const half2_t v_mult = {v_mult16, v_mult16};
 
     // The softmax runs in base 2 (exp2 is the hardware's native exponential), so the
     // scores' scale absorbs log2(e).
@@ -141,24 +157,36 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
     float q_lane_scale[kR];
 #pragma unroll
     for (int r = 0; r < kR; ++r) {
-        const int8_t* q_row = q_head + static_cast<int64_t>(imin(q0 + r, qo_len - 1)) * HD;
+        const InT* q_row = q_head + static_cast<int64_t>(imin(q0 + r, qo_len - 1)) * HD;
+        if constexpr (kF16In) {
+            const float q_mult = q_scale[static_cast<int64_t>(batch) * num_qo_heads + head];
+            const half2_t mult = {static_cast<_Float16>(q_mult), static_cast<_Float16>(q_mult)};
 #pragma unroll
-        for (int c = 0; c < kChunks; ++c) {
-            const uint2 raw = *reinterpret_cast<const uint2*>(q_row + (kL * c + part) * 8);
-            i8x4_to_half2(raw.x, qh[r][4 * c], qh[r][4 * c + 1]);
-            i8x4_to_half2(raw.y, qh[r][4 * c + 2], qh[r][4 * c + 3]);
-        }
-        if constexpr (PK) {
-            const half2_t sixteenth = {static_cast<_Float16>(0.0625f), static_cast<_Float16>(0.0625f)};
+            for (int c = 0; c < kChunks; ++c) {
+                const Half8 raw = *reinterpret_cast<const Half8*>(q_row + (kL * c + part) * 8);
 #pragma unroll
-            for (int i = 0; i < kChunks * 4; ++i) qh[r][i] = qh[r][i] * sixteenth;
+                for (int e = 0; e < 4; ++e) qh[r][4 * c + e] = raw.v[e] * mult;
+            }
+            q_lane_scale[r] = sm_scale / (q_mult * static_cast<float>(k_mult16));
+        } else {
+#pragma unroll
+            for (int c = 0; c < kChunks; ++c) {
+                const uint2 raw = *reinterpret_cast<const uint2*>(q_row + (kL * c + part) * 8);
+                i8x4_to_half2(raw.x, qh[r][4 * c], qh[r][4 * c + 1]);
+                i8x4_to_half2(raw.y, qh[r][4 * c + 2], qh[r][4 * c + 3]);
+            }
+            if constexpr (PK) {
+                const half2_t sixteenth = {static_cast<_Float16>(0.0625f), static_cast<_Float16>(0.0625f)};
+#pragma unroll
+                for (int i = 0; i < kChunks * 4; ++i) qh[r][i] = qh[r][i] * sixteenth;
+            }
+            // The scores are integer dot products of the int8 codes; this scale (Q's
+            // dequant scale, the softmax scale, and the 16 the PK path divided Q by) is
+            // applied once per score, in the softmax, rather than to Q or K.
+            q_lane_scale[r] = (PK ? 16.0f : 1.0f) * sm_scale *
+                q_scale[(static_cast<int64_t>(batch) * num_qo_heads + head) * qo_len_padded +
+                        imin(q0 + r, qo_len_padded - 1)];
         }
-        // The scores are integer dot products of the int8 codes; this scale (Q's
-        // dequant scale, the softmax scale, and the 16 the PK path divided Q by) is
-        // applied once per score, in the softmax, rather than to Q or K.
-        q_lane_scale[r] = (PK ? 16.0f : 1.0f) * sm_scale *
-            q_scale[(static_cast<int64_t>(batch) * num_qo_heads + head) * qo_len_padded +
-                    imin(q0 + r, qo_len_padded - 1)];
     }
 
     float o_val[kR][kDims];
@@ -182,6 +210,51 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
         const int kb0 = iter * CTA_K;
 
         __syncthreads();
+        if constexpr (kF16In) {
+#pragma unroll
+            for (int idx = tid; idx < CTA_K * (HD / 8); idx += kThreads) {
+                const int row = idx / (HD / 8);
+                const int unit = idx % (HD / 8);
+                const int key = kb0 + row;
+                Half8 a = {};
+                if (!kBoundary || key < kv_len) {
+                    a = *reinterpret_cast<const Half8*>(k_head + static_cast<int64_t>(key) * HD + unit * 8);
+                }
+#pragma unroll
+                for (int e = 0; e < 4; ++e) a.v[e] = a.v[e] * k_mult;
+                *reinterpret_cast<Half8*>(smem_k + row * kKStride + unit * 8) = a;
+            }
+            // A thread takes two adjacent keys of 8 dims and writes each dim's key pair
+            // as one word of that dim's [dim][key] row. The 32 lanes of a wave take 32
+            // key pairs of the same dims, so a write is one full row: no bank conflict.
+#pragma unroll
+            for (int idx = tid; idx < (CTA_K / 2) * (HD / 8); idx += kThreads) {
+                const int pair = idx % (CTA_K / 2);
+                const int unit = idx / (CTA_K / 2);
+                const int key = kb0 + 2 * pair;
+                Half8 a = {}, b = {};
+                if (!kBoundary || key < kv_len) {
+                    a = *reinterpret_cast<const Half8*>(v_head + static_cast<int64_t>(key) * HD + unit * 8);
+                }
+                if (!kBoundary || key + 1 < kv_len) {
+                    b = *reinterpret_cast<const Half8*>(v_head + static_cast<int64_t>(key + 1) * HD + unit * 8);
+                }
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    a.v[e] = a.v[e] * v_mult;
+                    b.v[e] = b.v[e] * v_mult;
+                }
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int row = unit * 8 + e;
+                    const half2_t word = e % 2 ? half2_t{a.v[e / 2].y, b.v[e / 2].y}
+                                               : half2_t{a.v[e / 2].x, b.v[e / 2].x};
+                    *reinterpret_cast<half2_t*>(reinterpret_cast<_Float16*>(v_granule(row, pair / 4)) +
+                                                (pair % 4) * 2) = word;
+                }
+            }
+            __syncthreads();
+        } else {
 #pragma unroll
         for (int idx = tid; idx < CTA_K * (HD / 16); idx += kThreads) {
             const int row = idx / (HD / 16);
@@ -213,6 +286,7 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
             *v_granule(row, 2 * unit + 1) = b;
         }
         __syncthreads();
+        }
 
 #pragma unroll 1
         for (int sub = 0; sub < CTA_K / kSub; ++sub) {
@@ -290,7 +364,7 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
             // Keep the scheduler from interleaving QK, softmax and PV: hoisting across them
             // spilled more registers (at the tile staging) and measured ~1% slower.
             __builtin_amdgcn_sched_barrier(0);
-            const float k_group_scale = k_scale_head[iter * (CTA_K / kSub) + sub];
+            const float k_group_scale = kF16In ? 1.0f : k_scale_head[iter * (CTA_K / kSub) + sub];
             const int key_base = key0 + group * 4;
             uint32_t own[kR][2];
 #pragma unroll
@@ -414,8 +488,8 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
         d_run[r] += swap_pair_of_pairs(d_run[r]);
     }
 
-    const float* v_scale_head =
-        v_scale + (static_cast<int64_t>(batch) * (num_qo_heads / num_kv_groups) + kv_head) * HD;
+    const float* v_scale_head = v_scale + kv_bh * HD;
+    const float inv_v_mult = 1.0f / static_cast<float>(v_mult16);
 #pragma unroll
     for (int r = 0; r < kR; ++r) {
         if (q0 + r >= qo_len) break;
@@ -428,7 +502,7 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
 #pragma unroll
         for (int t = 0; t < kDims; ++t) {
             const int d = kL * t + part;
-            row[d] = static_cast<OutT>(o_val[r][t] * v_scale_head[d] * inv_d);
+            row[d] = static_cast<OutT>(o_val[r][t] * (kF16In ? inv_v_mult : v_scale_head[d]) * inv_d);
         }
     }
 #endif
@@ -437,7 +511,7 @@ __global__ __launch_bounds__(kWaves * 32) void int8_attn_fp16_kernel(
 template <int HD, bool PK, int kWaves, typename OutT>
 void launch_fp16(const Int8AttnLaunch& a, const int* lut, int topk) {
     const dim3 grid(div_ceil_host(a.qo_len, kWaves * 16), a.num_qo_heads, a.batch);
-    int8_attn_fp16_kernel<HD, PK, kWaves, OutT><<<grid, kWaves * 32, 0, a.stream>>>(
+    int8_attn_fp16_kernel<HD, PK, kWaves, OutT, int8_t><<<grid, kWaves * 32, 0, a.stream>>>(
         a.q, a.k, a.v, static_cast<OutT*>(a.o), a.q_scale, a.k_scale, a.v_scale, lut, topk,
         a.qo_len, a.kv_len, a.qo_len_padded, a.k_groups_per_head, a.num_kv_groups, a.q_stride_b,
         a.q_stride_h, a.k_stride_b, a.k_stride_h, a.v_stride_b, a.v_stride_h, a.v_stride_d,
@@ -456,7 +530,25 @@ void launch_fp16_out(const Int8AttnLaunch& a, int output_dtype_code, const int* 
     }
 }
 
+template <int HD, bool PK>
+void launch_f16_in(const F16AttnLaunch& a) {
+    const int64_t q_stride_h = static_cast<int64_t>(a.qo_len) * HD;
+    const int64_t kv_stride_h = static_cast<int64_t>(a.kv_len) * HD;
+    const dim3 grid(div_ceil_host(a.qo_len, 128), a.num_qo_heads, a.batch);
+    int8_attn_fp16_kernel<HD, PK, 8, __half, _Float16><<<grid, 256, 0, a.stream>>>(
+        static_cast<const _Float16*>(a.q), static_cast<const _Float16*>(a.k),
+        static_cast<const _Float16*>(a.v), static_cast<__half*>(a.o), a.q_scale, a.k_scale,
+        a.v_scale, nullptr, 0, a.qo_len, a.kv_len, 0, 0, a.num_qo_heads / a.num_kv_heads,
+        a.num_qo_heads * q_stride_h, q_stride_h, a.num_kv_heads * kv_stride_h, kv_stride_h,
+        a.num_kv_heads * kv_stride_h, kv_stride_h, 0, a.num_qo_heads * q_stride_h, q_stride_h, HD,
+        a.sm_scale);
+}
+
 }  // namespace
+
+void launch_f16_attn_fp16(const F16AttnLaunch& a, int head_dim) {
+    head_dim == 64 ? launch_f16_in<64, false>(a) : launch_f16_in<128, true>(a);
+}
 
 void launch_int8_attn_fp16(const Int8AttnLaunch& a, int head_dim, int output_dtype_code,
                            const int* lut, int topk, int block_q) {

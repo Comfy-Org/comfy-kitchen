@@ -700,5 +700,22 @@ extern template void launch_int8_attn<256, __bf16>(const Int8AttnLaunch&);
 void launch_int8_attn_fp16(const Int8AttnLaunch& a, int head_dim, int output_dtype_code,
                            const int* lut, int topk, int block_q);
 
+// The same kernel over fp16 Q, K and V, [B, H, L, D] contiguous, unmasked, head_dim 64 or
+// 128, fp16 out; q_scale [B * H_q], k_scale and v_scale [B * H_kv] are the powers of two
+// it multiplies each head's Q, K and V by (see int8_attn_fp16_kernel).
+struct F16AttnLaunch {
+    const void* q;
+    const void* k;
+    const void* v;
+    void* o;
+    const float* q_scale;
+    const float* k_scale;
+    const float* v_scale;
+    int batch, qo_len, kv_len, num_qo_heads, num_kv_heads;
+    float sm_scale;
+    hipStream_t stream;
+};
+void launch_f16_attn_fp16(const F16AttnLaunch& a, int head_dim);
+
 }  // namespace int8_attn
 }  // namespace comfy::hip_backend::sage

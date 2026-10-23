@@ -132,6 +132,8 @@ void launch_sage_int8_attn(const void*, const void*, const void*, void*, const v
                            int, int, int, int, int, int, int, int, int64_t, int64_t, int64_t,
                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                            float, int, hipStream_t);
+void launch_sage_f16_attn(const void*, const void*, const void*, void*, const void*, const void*,
+                          const void*, int, int, int, int, int, int, float, hipStream_t);
 void launch_sage_int8_block_sparse_attn(const void*, const void*, const void*, void*, const void*,
                                         const void*, const void*, const void*, int, int, int, int,
                                         int, int, int, int, int, int, int64_t, int64_t, int64_t,
@@ -2558,6 +2560,42 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
                 reinterpret_cast<hipStream_t>(stream_ptr), kFn);
 }
 
+// Unquantized attention over fp16 q, k and v on the fp16 FMA kernel. q_scale ([B, H_q])
+// and k_scale, v_scale ([B, H_kv]) are fp32 powers of two that keep the kernel's fp16
+// chains in range (see int8_attn_fp16_kernel); the Python layer computes them.
+void sage_f16_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> o,
+                   nb::ndarray<> q_scale, nb::ndarray<> k_scale, nb::ndarray<> v_scale,
+                   float sm_scale, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "sage_f16_sdpa";
+    sage_require_supported_arch(q, kFn);
+    sage_check_shapes(q, k, v, kFn);
+    const int batch = static_cast<int>(q.shape(0));
+    const int q_heads = static_cast<int>(q.shape(1));
+    const int qo_len = static_cast<int>(q.shape(2));
+    const int head_dim = static_cast<int>(q.shape(3));
+    const int kv_heads = static_cast<int>(k.shape(1));
+    const int kv_len = static_cast<int>(k.shape(2));
+    if (head_dim == 256 || sm_scale < 0.0f) {
+        throw std::runtime_error(std::string(kFn) + ": needs head_dim 64 or 128 and a nonnegative scale");
+    }
+    const nb::ndarray<>* tensors[] = {&q, &k, &v, &o};
+    const char* names[] = {"q", "k", "v", "o"};
+    for (int i = 0; i < 4; ++i) {
+        require_dtype(*tensors[i], 1, 1, kFn, names[i]);
+        require_packed_contiguous(*tensors[i], kFn, names[i]);
+    }
+    require_len(o, static_cast<int64_t>(batch) * q_heads * qo_len * head_dim, kFn, "o");
+    require_len(q_scale, static_cast<int64_t>(batch) * q_heads, kFn, "q_scale");
+    require_len(k_scale, static_cast<int64_t>(batch) * kv_heads, kFn, "k_scale");
+    require_len(v_scale, static_cast<int64_t>(batch) * kv_heads, kFn, "v_scale");
+    require_dtype(q_scale, 0, 0, kFn, "q_scale");
+    require_dtype(k_scale, 0, 0, kFn, "k_scale");
+    require_dtype(v_scale, 0, 0, kFn, "v_scale");
+    launch_sage_f16_attn(q.data(), k.data(), v.data(), o.data(), q_scale.data(), k_scale.data(),
+                         v_scale.data(), batch, qo_len, kv_len, q_heads, kv_heads, head_dim,
+                         sm_scale, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
 
 // Block-sparse attention over packed layouts from sage_sdpa_quantize at cta_k 64:
 // query block b of head h reads the key tiles lut[batch, h, b, :]. The kernel trusts
@@ -3018,6 +3056,9 @@ NB_MODULE(_C, m) {
           nb::arg("v_scale"), nb::arg("cta_k"), nb::arg("sm_scale"),
           nb::arg("output_dtype_code"), nb::arg("stream_ptr"), nb::arg("attn_mask") = nb::none());
     m.def("sage_block_sparse_prequantized", &sage_block_sparse_prequantized);
+    m.def("sage_f16_sdpa", &sage_f16_sdpa, nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("o"),
+          nb::arg("q_scale"), nb::arg("k_scale"), nb::arg("v_scale"), nb::arg("sm_scale"),
+          nb::arg("stream_ptr"));
     m.def("adaln", &adaln);
     m.def("rms_adaln", &rms_adaln);
     m.def("group_norm_silu_pad3d", &group_norm_silu_pad3d, nb::arg("x"), nb::arg("weight").none(),
