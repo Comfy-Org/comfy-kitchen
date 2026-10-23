@@ -351,6 +351,7 @@ The library supports multiple backends:
 - **cuda**: Custom CUDA C kernels (CUDA only)
 - **hip**: Custom HIP kernels (WMMA GEMMs on RDNA3/3.5/4; non-WMMA kernels also on RDNA2)
 - **triton**: Triton JIT-compiled kernels
+- **mps**: Metal kernels for Apple GPUs (compiled with `torch.mps.compile_shader`)
 
 ### Automatic Backend Selection
 
