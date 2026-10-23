@@ -57,7 +57,7 @@ bool launch_fp16_gemm_kernel(const void*, const void*, void*, const void*, const
                              const void*, int, int, int, hipStream_t);
 bool launch_fp16_conv3d_kernel(const void*, const void*, const void*, const void*, void*, int, int,
                                int, int, int, int, int, int, int, int, int, int, int, int, int,
-                               int, int, int, int, hipStream_t);
+                               int, int, int, int, bool, hipStream_t);
 
 void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, bool, hipStream_t);
 void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
@@ -748,7 +748,7 @@ bool bf16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias,
 bool fp16_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, OptArray resid,
                  nb::ndarray<> out, int N, int D, int H, int W, int C, int K, int T, int R, int S,
                  int sd, int sh, int sw, uintptr_t stream_ptr, int64_t xs_w, int64_t xs_h,
-                 int64_t xs_d, int64_t xs_n) {
+                 int64_t xs_d, int64_t xs_n, bool zero_border) {
     constexpr const char* kFn = "fp16_conv3d";
     for (int64_t st : {xs_w, xs_h, xs_d, xs_n}) {
         if (st < 0 || st > INT32_MAX) {
@@ -768,7 +768,12 @@ bool fp16_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, OptArray resid
         throw std::runtime_error(std::string(kFn) + ": input smaller than the filter");
     }
     const int Z = (D - T) / sd + 1, P = (H - R) / sh + 1, Q = (W - S) / sw + 1;
-    const int64_t outs = static_cast<int64_t>(N) * Z * P * Q * K;
+    // With a zero border the output is the input's size: the border is
+    // (R-1)/2 and (S-1)/2.
+    const int Zo = Z;  // the zero border covers the spatial dims only
+    const int Po = zero_border ? (H + 2 * ((R - 1) / 2) - R) / sh + 1 : P;
+    const int Qo = zero_border ? (W + 2 * ((S - 1) / 2) - S) / sw + 1 : Q;
+    const int64_t outs = static_cast<int64_t>(N) * Zo * Po * Qo * K;
     require_fp16(x, kFn, "x");
     require_fp16(w, kFn, "w");
     require_fp16(out, kFn, "out");
@@ -785,8 +790,9 @@ bool fp16_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, OptArray resid
     }
     const bool served = launch_fp16_conv3d_kernel(
         x.data(), w.data(), opt_data(bias), opt_data(resid), out.data(), N, D, H, W, C, K, T, R, S,
-        Z, P, Q, sd, sh, sw, static_cast<int>(xs_w), static_cast<int>(xs_h),
-        static_cast<int>(xs_d), static_cast<int>(xs_n), reinterpret_cast<hipStream_t>(stream_ptr));
+        Zo, Po, Qo, sd, sh, sw, static_cast<int>(xs_w), static_cast<int>(xs_h),
+        static_cast<int>(xs_d), static_cast<int>(xs_n), zero_border,
+        reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
     return served;
 }
@@ -3312,7 +3318,8 @@ m.def("int4_gemm", &int4_gemm);
           nb::arg("resid").none(), nb::arg("out"), nb::arg("N"), nb::arg("D"), nb::arg("H"),
           nb::arg("W"), nb::arg("C"), nb::arg("K"), nb::arg("T"), nb::arg("R"), nb::arg("S"),
           nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("stream_ptr"), nb::arg("xs_w") = 0,
-          nb::arg("xs_h") = 0, nb::arg("xs_d") = 0, nb::arg("xs_n") = 0);
+          nb::arg("xs_h") = 0, nb::arg("xs_d") = 0, nb::arg("xs_n") = 0,
+          nb::arg("zero_border") = false);
     m.def("quantize_int8_rowwise", &quantize_int8_rowwise, nb::arg("x"), nb::arg("q"),
           nb::arg("scales"), nb::arg("M"), nb::arg("K"), nb::arg("stream_ptr"),
           nb::arg("tiled_output") = false);

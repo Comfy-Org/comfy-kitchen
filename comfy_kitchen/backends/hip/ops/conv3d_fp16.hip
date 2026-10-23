@@ -22,6 +22,14 @@
 namespace comfy::hip_backend {
 
 // One 16-byte chunk (8 fp16 channels) of the patch row under output position `row`.
+//
+// zero_border makes the kernel read the border as zeros instead of requiring
+// the caller to pad: a VAE decoder's convolution wants a zero border, and
+// padding it means copying the whole activation into a padded buffer, which
+// is the slow direction on this part (the destination's inner dimension is
+// the source's outer one). The check is per chunk, not per element: a chunk is
+// eight channels of one spatial position, so it is inside or outside as a
+// whole.
 struct ConvPatchSrc {
     const uint8_t* x;
     int zpq, pq, q_out;
@@ -29,6 +37,9 @@ struct ConvPatchSrc {
     int64_t xw, xh, xd, xn;  // element strides
     int rs, s_taps;
     int sd, sh, sw;
+    int in_h, in_w;  // the input's spatial extents
+    int pad_h, pad_w;  // the zero border's size
+    bool zero_border;
 
     __forceinline__ __device__ uint4 chunk(int row, int kbyte) const {
         const int n = row / zpq;
@@ -45,7 +56,12 @@ struct ConvPatchSrc {
         const int r = (tap - t * rs) / s_taps;
         const int s = tap - t * rs - r * s_taps;
 
-        const int64_t idx = n * xn + (z * sd + t) * xd + (p * sh + r) * xh + (q * sw + s) * xw + c0;
+        const int py = p * sh + r - pad_h;
+        const int px = q * sw + s - pad_w;
+        if (zero_border && (py < 0 || py >= in_h || px < 0 || px >= in_w)) {
+            return make_uint4(0, 0, 0, 0);
+        }
+        const int64_t idx = n * xn + (z * sd + t) * xd + py * xh + px * xw + c0;
         return *reinterpret_cast<const uint4*>(x + 2 * idx);
     }
 };
@@ -53,11 +69,13 @@ struct ConvPatchSrc {
 }  // namespace comfy::hip_backend
 
 // resid is the full NZPQK output-shaped residual, or null. xs_* are the element strides of
-// x; xs_h == 0 means packed NDHWC.
+// x; xs_h == 0 means packed NDHWC. zero_border reads a border of zeros around x
+// instead of asking the caller to pad it; the border is (R-1)/2 and (S-1)/2, so
+// the output is the input's size.
 extern "C" bool launch_fp16_conv3d_kernel(
     const void* x, const void* w, const void* bias, const void* resid, void* out, int N, int D,
     int H, int W, int C, int K, int T, int R, int S, int Z, int P, int Q, int sd, int sh, int sw,
-    int xs_w, int xs_h, int xs_d, int xs_n, hipStream_t stream) {
+    int xs_w, int xs_h, int xs_d, int xs_n, bool zero_border, hipStream_t stream) {
 
     using namespace comfy::hip_backend;
 
@@ -104,7 +122,8 @@ extern "C" bool launch_fp16_conv3d_kernel(
     const int64_t xd = packed ? static_cast<int64_t>(H) * W * C : xs_d;
     const int64_t xn = packed ? static_cast<int64_t>(D) * H * W * C : xs_n;
     const ConvPatchSrc src{static_cast<const uint8_t*>(x), Z * P * Q, P * Q, Q, C, xw, xh, xd, xn,
-                           R * S, S, sd, sh, sw};
+                           R * S, S, sd, sh, sw, H, W, zero_border ? (R - 1) / 2 : 0,
+                           zero_border ? (S - 1) / 2 : 0, zero_border};
     EpiFp16 epi{static_cast<const __half*>(bias), nullptr, static_cast<const __half*>(resid), K};
     // `kbytes` here is 2 * depth -- a **patch volume** (output positions times the
     // filter extent), not a K -- so the heuristic's K bands, which were calibrated

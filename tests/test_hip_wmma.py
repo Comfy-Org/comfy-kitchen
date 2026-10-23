@@ -978,6 +978,45 @@ def test_fp16_conv3d_matches_fp32_reference(hip, c, k, d, h, w, ksize, stride, w
     assert _rel_err(got, _conv_ref(x, weight, bias, residual, stride)) < 5e-3
 
 
+# The zero border reads a border of zeros on the spatial dims instead of asking
+# the caller to pad: a VAE decoder's convolution wants that, and padding it
+# means copying the whole activation into a padded buffer, which on this part
+# is the scattered direction. The border is (R-1)/2 and (S-1)/2 at stride one,
+# so the output is the input's spatial size; the depth stays the caller's.
+@needs_wmma
+@pytest.mark.parametrize(
+    ("c", "k", "d", "h", "w", "ksize"),
+    [
+        (128, 128, 1, 64, 64, (1, 3, 3)),
+        (64, 32, 1, 33, 17, (1, 3, 3)),  # odd spatial sizes
+        (32, 16, 1, 8, 8, (1, 3, 3)),
+        (128, 256, 5, 18, 18, (1, 3, 3)),  # a real depth, unpadded
+    ],
+)
+@pytest.mark.parametrize("with_bias", [True, False])
+def test_fp16_conv3d_zero_border_matches_padded_reference(hip, c, k, d, h, w, ksize, with_bias):
+    torch.manual_seed(0)
+    x, weight, bias, _ = _conv_inputs(c, k, d, h, w, ksize, with_bias)
+    got = hip._wmma_fp16_conv3d(x, weight, bias, None, [1, 1, 1], zero_border=True)
+    assert got is not None, "the kernel declined a zero-border shape it should serve"
+    assert tuple(got.shape) == (1, k, d, h, w)
+    r, s = ksize[1], ksize[2]
+    xp = torch.nn.functional.pad(x.float(), (s // 2, s // 2, r // 2, r // 2, 0, 0))
+    ref = _conv_ref(xp, weight, bias, None, (1, 1, 1))
+    assert _rel_err(got, ref) < 5e-3
+
+
+@needs_wmma
+def test_fp16_conv3d_zero_border_default_off(hip):
+    # The existing callers pad themselves, so the default call must not shift
+    # a single row the way the border flag does.
+    torch.manual_seed(0)
+    x, weight, bias, _ = _conv_inputs(128, 128, 5, 130, 130, (3, 3, 3))
+    got = hip._wmma_fp16_conv3d(x, weight, bias, None, [1, 1, 1])
+    assert got is not None
+    assert _rel_err(got, _conv_ref(x, weight, bias, None, (1, 1, 1))) < 5e-3
+
+
 @needs_wmma
 def test_fp16_conv3d_declines_like_cuda(hip):
     torch.manual_seed(0)

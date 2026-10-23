@@ -2468,15 +2468,24 @@ def _ndhwc_strides(t: torch.Tensor):
     return strides
 
 
-def _wmma_fp16_conv3d(x, weight, bias, residual, stride, out=None):
+def _wmma_fp16_conv3d(x, weight, bias, residual, stride, out=None, zero_border=False):
     """The fused kernel's result, or None when it does not apply to this call. x and out may
-    be NDHWC-ordered views of larger tensors, so a tiled convolution needs no per-tile copies."""
+    be NDHWC-ordered views of larger tensors, so a tiled convolution needs no per-tile copies.
+
+    zero_border reads a border of zeros around x instead of asking the caller to
+    pad it; the border is (R-1)/2 and (S-1)/2, so the output is x's size.
+    """
     n, c, d, h, w = x.shape
     k, _, t, r, s = weight.shape
     sd, sh, sw = stride
     if min(sd, sh, sw) < 1:
         return None  # torch's conv reports the bad stride
     z, p, q = (d - t) // sd + 1, (h - r) // sh + 1, (w - s) // sw + 1
+    if zero_border:
+        # the zero border covers the spatial dims; the depth is the caller's.
+        # The pads follow the kernel's: (R-1)//2 and (S-1)//2.
+        p = (h + 2 * ((r - 1) // 2) - r) // sh + 1
+        q = (w + 2 * ((s - 1) // 2) - s) // sw + 1
     supported = (
         x.dtype == torch.float16 and weight.dtype == torch.float16
         and weight.device == x.device and weight.shape[1] == c
@@ -2521,7 +2530,7 @@ def _wmma_fp16_conv3d(x, weight, bias, residual, stride, out=None):
     served = _C.fp16_conv3d(
         _dl(x), _dl(weight), None if bias is None else _dl(bias),
         None if residual is None else _dl(residual), _dl(out),
-        n, d, h, w, c, k, t, r, s, sd, sh, sw, _stream(x), *xs,
+        n, d, h, w, c, k, t, r, s, sd, sh, sw, _stream(x), *xs, zero_border,
     )
     return out if served else None
 
@@ -2532,15 +2541,19 @@ def fp16_conv3d(
     bias: torch.Tensor | None,
     residual: torch.Tensor | None,
     stride: list[int],
+    zero_border: bool = False,
 ) -> torch.Tensor:
     """FP16 conv3d with fused bias/residual, channels_last_3d in and out; torch's
     conv when the kernel declines the shape."""
-    out = _wmma_fp16_conv3d(x, weight, bias, residual, stride)
+    out = _wmma_fp16_conv3d(x, weight, bias, residual, stride, zero_border=zero_border)
     if out is not None:
         return out
     # the kernel path takes bias and residual from any device, so the fallback must too
     bias = None if bias is None else bias.to(device=x.device)
     residual = None if residual is None else residual.to(device=x.device)
+    if zero_border:
+        _, _, _, r, s = weight.shape
+        x = torch.nn.functional.pad(x, (s // 2, s // 2, r // 2, r // 2, 0, 0))
     out = torch.nn.functional.conv3d(x, weight, bias, stride=stride).contiguous(
         memory_format=torch.channels_last_3d)
     return out if residual is None else out + residual
@@ -2582,6 +2595,24 @@ def _wants_nchw_transpose(out: torch.Tensor) -> bool:
             and out.dim() == 5
             and out.shape[1] % 8 == 0
             and out.data_ptr() % 16 == 0)
+
+
+def ndhwc_to_nchw(src: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """Transpose a channels_last_3d tensor into an NCDHW-contiguous one.
+
+    The destination's inner dimension is the source's outer one, so a plain
+    copy writes one element at a time into a 32-byte sector it cannot share
+    with a neighbour. Measured on the 6-WGP 780M, 268 MB: 2.3 GB/s that way
+    round against 58.7 GB/s the other way. The kernel does it in two coalesced
+    passes, at 49 GB/s.
+
+    The source must be channels_last_3d and 16-bit with a channel count that
+    is a multiple of 8; anything else is left to the caller.
+    """
+    if out is None:
+        out = torch.empty(src.shape, dtype=src.dtype, device=src.device)
+    _C.ndhwc_to_nchw(_dl(src), _dl(out), _stream(src))
+    return out
 
 
 def group_norm_silu_pad3d(
