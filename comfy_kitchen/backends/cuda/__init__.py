@@ -2028,6 +2028,8 @@ def fp16_linear(
         and (residual is None or (residual.dtype == torch.float16
                                   and residual_scale.dtype == torch.float16
                                   and _aligned16(residual)))
+        # the CUTLASS kernels are sm_80 (cp.async multistage); sub-sm_80 falls back
+        and _cuda_device_capability(x.get_device())[0] >= 8
     )
     if not supported:
         out = torch.nn.functional.linear(x, weight, bias)
@@ -3637,6 +3639,8 @@ def _cutlass_fp16_conv3d(x, weight, bias, residual, stride, config=-1, out=None)
         and (c % 8 == 0 or c < 8) and k % 8 == 0 and d >= t and h >= r and w >= s
         and (bias is None or (bias.dtype == torch.float16 and bias.shape == (k,)))
         and (residual is None or (residual.dtype == torch.float16 and residual.shape == (n, k, z, p, q)))
+        # the CUTLASS kernel is sm_80 (cp.async multistage); sub-sm_80 falls back
+        and _cuda_device_capability(x.get_device())[0] >= 8
     )
     if not supported:
         return None
@@ -4592,6 +4596,7 @@ def _build_constraints() -> dict:
                 "residual": ParamConstraint(dtypes=frozenset({torch.float16, type(None)})),
             },
             default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
         ),
         "group_norm_stats3d": FunctionConstraints(
             params={
