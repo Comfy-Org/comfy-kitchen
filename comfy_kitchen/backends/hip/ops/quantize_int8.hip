@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // INT8 quantization kernels for the WMMA int8 GEMM.
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 #include "../hadamard.h"
@@ -10,6 +12,20 @@ namespace comfy::hip_backend {
 
 constexpr float kInt8Max = 127.0f;
 
+inline bool select_gfx12_arch(int device) {
+    hipDeviceProp_t properties{};
+    return hipGetDeviceProperties(&properties, device) == hipSuccess &&
+        std::strncmp(properties.gcnArchName, "gfx12", 5) == 0;
+}
+
+inline bool convrot_transposed_forced() {
+    static const bool forced = [] {
+        const char* value = std::getenv("COMFY_KITCHEN_CONVROT_TRANSPOSED");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return forced;
+}
+
 inline bool use_convrot_transposed_bf16(int in_code, int M, int K, int group_size) {
     if (in_code != 2 || group_size != 256 || M < 1024 || K < 2560 || K > 16384) {
         return false;
@@ -17,6 +33,11 @@ inline bool use_convrot_transposed_bf16(int in_code, int M, int K, int group_siz
 
     // ROCm 10.1 model-shape sweep favors transposed from 1024 rows, including
     // the 1088/1115-row image workloads. Keep one row cut, not a width table.
+    // On gfx12 the fused producer is faster at these widths and bit-identical, so
+    // it stays the default there; COMFY_KITCHEN_CONVROT_TRANSPOSED=1 opts back in.
+    if (cached_device_query<select_gfx12_arch>() && !convrot_transposed_forced()) {
+        return false;
+    }
     return use_nonduplicated_wmma_schedule() && convrot_512x2_supported(K);
 }
 
