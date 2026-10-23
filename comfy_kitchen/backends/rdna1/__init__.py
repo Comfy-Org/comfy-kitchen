@@ -2657,7 +2657,9 @@ def apply_rope_(
 
 
 def flash_attention_decode_is_available() -> bool:
-    return is_available()
+    # TODO: YuE2 workflow decode with this kernel hung the 5600M twice on 2026-10-19 (GPU reset at
+    # 84 C, ABC token 1883 and music token 2663); torch attention completes the same runs
+    return False
 
 
 _FLASH_DTYPES = (torch.float32, torch.float16, torch.bfloat16)

@@ -265,7 +265,7 @@ def flash_attention_decode_step_merge(
 
 def float_attention_is_available(q: torch.Tensor, k: torch.Tensor) -> bool:
     """Whether float_attention runs a native kernel for these operands: rdna1 (gfx1010)
-    for fp32, fp16 and bf16 at head dims 64 and 128."""
+    for fp32, fp16 and bf16 at head dims 64, 128 and 256."""
     return (_amd is not None and _amd.backend_for(q.device)[0] == "rdna1"
             and _amd.rdna1.flash_attention_supported(q, k))
 
