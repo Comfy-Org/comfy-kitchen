@@ -982,6 +982,76 @@ def fp16_linear(
     return _apply_residual(out, residual, residual_scale)
 
 
+def fp16_packed_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    weight_amax: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``linear(x)`` in x's dtype, stored as ``out_dtype``."""
+    del weight_amax
+    out = torch.nn.functional.linear(
+        x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
+    )
+    return out if out_dtype is None else out.to(out_dtype)
+
+
+def dequantize_q8_0(raw: torch.Tensor, out_features: int, in_features: int,
+                    dtype: torch.dtype = torch.float16) -> torch.Tensor:
+    """A GGUF Q8_0 weight, raw [out_features, in_features / 32 * 34] bytes (each block an
+    fp16 scale then 32 int8 codes), as a dense [out_features, in_features] tensor."""
+    blocks = raw.reshape(out_features, in_features // 32, 34)
+    scale = blocks[..., :2].contiguous().view(torch.float16).to(dtype)
+    codes = blocks[..., 2:].contiguous().view(torch.int8).to(dtype)
+    return (codes * scale).reshape(out_features, in_features)
+
+
+def dequantize_q4_k(raw: torch.Tensor, out_features: int, in_features: int,
+                    dtype: torch.dtype = torch.float16) -> torch.Tensor:
+    """A GGUF Q4_K weight, raw [out_features, in_features / 256 * 144] bytes, as a dense
+    [out_features, in_features] tensor: per 256-element super-block fp16 d and dmin, 12
+    bytes of 6-bit sub-block scales and mins, then 128 bytes whose low and high nibbles hold
+    each 64 elements' first and second 32; w = d * scale * q - dmin * min."""
+    blocks = raw.reshape(out_features, in_features // 256, 144)
+    d = blocks[..., 0:2].contiguous().view(torch.float16).float()
+    dmin = blocks[..., 2:4].contiguous().view(torch.float16).float()
+    sc = blocks[..., 4:16].long()
+    lo, hi, md = sc[..., 0:4], sc[..., 4:8], sc[..., 8:12]
+    scale = torch.cat([lo & 63, (md & 0xF) | ((lo >> 6) << 4)], dim=-1).float()
+    mins = torch.cat([hi & 63, (md >> 4) | ((hi >> 6) << 4)], dim=-1).float()
+    qs = blocks[..., 16:].reshape(out_features, in_features // 256, 4, 1, 32)
+    q = torch.cat([qs & 0xF, qs >> 4], dim=3).reshape(out_features, in_features // 256, 8, 32).float()
+    w = (d * scale)[..., None] * q - (dmin * mins)[..., None]
+    return w.reshape(out_features, in_features).to(dtype)
+
+
+def q4_k_linear(
+    x: torch.Tensor,
+    raw: torch.Tensor,
+    out_features: int,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """``linear(x)`` against a GGUF Q4_K weight, dequantized to x's dtype."""
+    weight = dequantize_q4_k(raw, out_features, x.shape[-1], x.dtype)
+    out = torch.nn.functional.linear(x, weight, None if bias is None else bias.to(x.dtype))
+    return out if out_dtype is None else out.to(out_dtype)
+
+
+def q8_0_linear(
+    x: torch.Tensor,
+    raw: torch.Tensor,
+    out_features: int,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """``linear(x)`` against a GGUF Q8_0 weight, dequantized to x's dtype."""
+    weight = dequantize_q8_0(raw, out_features, x.shape[-1], x.dtype)
+    out = torch.nn.functional.linear(x, weight, None if bias is None else bias.to(x.dtype))
+    return out if out_dtype is None else out.to(out_dtype)
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
