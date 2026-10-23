@@ -75,6 +75,10 @@ struct EpiRowwise {
     __forceinline__ __device__ float apply_cached(
         float acc, float sa, float sb, float b
     ) const {
+        // Fast-math would otherwise fold the cached scales into acc * (sa * sb),
+        // which rounds differently from the reference (acc * sa) * sb.
+        #pragma clang fp reassociate(off)
+        #pragma clang fp contract(off)
         float v = acc * sa;
         v *= sb;
         if (bias) v += b;
