@@ -61,6 +61,15 @@ if getattr(torch.version, "hip", None):
 else:
     registry.mark_unavailable("hip", "PyTorch ROCm/HIP runtime not available")
 
+# Apple GPUs: a Metal backend, preferred over eager where it registers.
+if torch.backends.mps.is_available():
+    from .backends import mps as _mps_backend  # noqa: F401
+
+    if registry.is_available("mps"):
+        registry.set_priority(["mps", *[b for b in registry._priority if b != "mps"]])
+else:
+    registry.mark_unavailable("mps", "PyTorch MPS runtime not available")
+
 __all__ = [
     # Normalization
     "adaln",
@@ -69,6 +78,8 @@ __all__ = [
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
     "rms_adaln",
+    # Activations
+    "input_act",
     # Attention
     "PrequantizedInt8Attention",
     "int8_attention",
@@ -425,6 +436,33 @@ def rms_adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.rms_adaln(x, scale, shift, eps)
+
+
+def input_act(
+    x: torch.Tensor,
+    input_act: str | None,
+    act_weight: torch.Tensor | None = None,
+    act_eps: float = 0.0,
+) -> torch.Tensor:
+    """Apply one of the linear input activations on its own (unquantized paths).
+
+    The same activations the quantized linears accept as ``input_act``, for a
+    caller whose linear is not quantized: "gelu_tanh", "swiglu" and "situ" (the
+    gated pairs halve the last dim), or "rms_norm" with ``act_weight`` and
+    ``act_eps``. ``None`` / "none" returns ``x`` unchanged.
+
+    Args:
+        x: Input tensor (..., K).
+        input_act: Activation name.
+        act_weight: K-element weight, required for "rms_norm".
+        act_eps: Epsilon for "rms_norm".
+
+    Returns:
+        The activated tensor; (..., K // 2) for "swiglu" and "situ".
+    """
+    if input_act in (None, "none"):
+        return x
+    return torch.ops.comfy_kitchen.input_act(x, input_act, act_weight, float(act_eps))
 
 
 def quantize_per_tensor_fp8(
