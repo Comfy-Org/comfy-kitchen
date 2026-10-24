@@ -72,9 +72,11 @@ compiled with `torch.mps.compile_shader`: a single launch for the single-tensor
 entries and AdaLN, two for the paired `(xq, xk)` entries. Each takes float32,
 float16 and bfloat16, and strided views with a contiguous last dim, so
 packed-qkv slices and `(B, H, N, D)` layouts need no copies. Calls outside that
-(other dtypes or layouts, or a RoPE head dim above 1024) are declined by the
-call rules and run on eager. The backend is registered when MPS is available and
-`torch.mps.compile_shader` exists.
+are declined by the call rules and run on eager: other dtypes or layouts, more
+than four leading dims that cannot be merged, and for RoPE a `freqs_cis` that is
+not float32, an odd head dim or `rot_dim`, or a head dim above 1024. The
+backend is registered when MPS is available and `torch.mps.compile_shader`
+exists.
 
 ## Huawei Ascend backend
 
