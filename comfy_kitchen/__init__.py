@@ -413,7 +413,7 @@ def rms_adaln(
     """Fused Adaptive Layer Normalization with RMSNorm: rmsnorm(x) * (1 + scale) + shift.
 
     Same modulation as :func:`adaln`, but normalizing by the root mean square
-    instead of subtracting the mean — the form used by LTX/LTX2-style DiTs.
+    instead of subtracting the mean 鈥?the form used by LTX/LTX2-style DiTs.
 
     Args:
         x: Input tensor of any shape (..., D)
@@ -658,7 +658,7 @@ def quantize_svdquant_w4a4(
         lora_down: (K, R) low-rank down projection weight.
         pad_size: pad M to multiple of this value (default 256).
         act_unsigned: if True, quantize into uint4 [0, 15] (scale=max/15) for u4
-            MMA downstream. Caller must ensure x is non-negative — the shift
+            MMA downstream. Caller must ensure x is non-negative 鈥?the shift
             constant is a model-topology concern, not part of this op.
         lora_x: (M, K) optional pre-shift activation for LoRA. Defaults to x.
             Pass raw (un-shifted) x when x has been pre-shifted for unsigned path.
@@ -1120,6 +1120,64 @@ def int8_linear(
     return impl(**kwargs)
 
 
+def int8_linear_fp16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """INT8 linear layer that runs the GEMM on the FP16 tensor cores.
+
+    The INT8 weights are dequantized to FP16 on the fly, so the memory
+    footprint matches the INT8 path. On devices without INT8 tensor cores
+    (Volta/sm_70) this is much faster than the DP4A-emulated INT8 GEMM.
+
+    Args:
+        x: Input tensor [..., K].
+        weight: INT8 weight tensor [N, K].
+        weight_scale: Scalar or per-output-channel weight scale.
+        bias: Optional bias [N].
+        out_dtype: Output dtype.
+        convrot: If True, apply online activation rotation.
+        convrot_groupsize: Group size for Hadamard rotation.
+        input_act: Optional activation folded in before quantization.
+        input_act_weight: K-element norm weight, required for "rms_norm".
+        input_act_eps: Norm eps for "rms_norm".
+        residual: Optional [..., N] tensor; the result becomes
+            ``residual + residual_scale * linear(x)``.
+        residual_scale: Per-channel [N] scale for the residual form.
+
+    Returns:
+        Result tensor [..., N].
+    """
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    kwargs = {
+        "x": x,
+        "weight": weight,
+        "weight_scale": weight_scale,
+        "bias": bias,
+        "out_dtype": out_dtype,
+        "convrot": convrot,
+        "convrot_groupsize": convrot_groupsize,
+        "input_act": input_act,
+        "input_act_weight": input_act_weight,
+        "input_act_eps": input_act_eps,
+        "residual": residual,
+        "residual_scale": residual_scale,
+    }
+    impl = registry.get_implementation("int8_linear_fp16", kwargs=kwargs)
+    return impl(**kwargs)
+
+
 def int8_linear_modulated(
     x: torch.Tensor,
     modulation_scale: torch.Tensor,
@@ -1248,7 +1306,7 @@ def edge_collapse_checks(
 
     - flips (E,) int32: faces with cos(old normal, new normal) < cos_threshold, skipping
       faces with |normal| <= 1e-6 x their sum of squared edge lengths before or after.
-    - skinny (E,) float32: mean of 1 - clamp(4√3·area / sum of squared edge lengths, 0, 1),
+    - skinny (E,) float32: mean of 1 - clamp(4鈭?路area / sum of squared edge lengths, 0, 1),
       0 for equilateral faces.
     - link_ok (E,) bool: a and b share at most as many neighbours as faces on the edge, so
       the collapse keeps the topology.
