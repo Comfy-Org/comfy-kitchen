@@ -168,6 +168,7 @@ set(HIP_SOURCES
     ops/adaln.hip
     ops/rms_convrot_quant.hip
     ops/group_norm_pad3d.hip
+    ops/group_norm_nchw.hip
     ops/ndhwc_transpose.hip
     ops/na3d.hip
     sage_attention/quant_qk_int8.hip

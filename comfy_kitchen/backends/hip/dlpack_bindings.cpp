@@ -131,6 +131,8 @@ void launch_group_norm_silu_pad3d(const void*, const void*, const void*, void*, 
                                   int, int, bool, bool, int64_t, int, hipStream_t);
 void launch_group_norm_stats3d(const void*, void*, void*, int, int, int, int, int, int, float,
                                int64_t, int, hipStream_t);
+void launch_group_norm_silu_nchw(const void*, const void*, const void*, void*, int64_t, int64_t,
+                                 int64_t, int64_t, int, float, int, hipStream_t);
 void launch_ndhwc_to_nchw_transpose(const void*, void*, int64_t, int64_t, int, int64_t, int,
                                    hipStream_t);
 void launch_gemv_awq_kernel(const void*, const void*, const void*, const void*, const void*, void*,
@@ -1493,6 +1495,39 @@ void ndhwc_to_nchw(nb::ndarray<> src, nb::ndarray<> dst, uintptr_t stream_ptr) {
     }
     launch_ndhwc_to_nchw_transpose(src.data(), dst.data(), b * t, h * w, static_cast<int>(c), t,
                                    code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// GroupNorm over a packed NCHW x [B, C, H, W] with SiLU fused into the apply
+// pass. The fused pass is what makes it worth a kernel: torch's pair costs four
+// streaming passes over the activation, this one three.
+void group_norm_silu_nchw(nb::ndarray<> x, nb::ndarray<> weight, nb::ndarray<> bias,
+                          nb::ndarray<> out, int B, int C, int H, int W, int num_groups,
+                          float eps, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "group_norm_silu_nchw";
+    require_positive(B, kFn, "B");
+    require_positive(C, kFn, "C");
+    require_positive(H, kFn, "H");
+    require_positive(W, kFn, "W");
+    require_positive(num_groups, kFn, "num_groups");
+    const int code = map_dtype_to_code(x.dtype());
+    if (code != 1 && code != 2) {
+        throw std::runtime_error(std::string(kFn) + ": x must be float16 or bfloat16");
+    }
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(out, kFn, "out");
+    require_dtype(out, code, code, kFn, "out");
+    require_dtype(weight, code, code, kFn, "weight");
+    require_dtype(bias, code, code, kFn, "bias");
+    require_len(out, static_cast<int64_t>(B) * C * H * W, kFn, "out");
+    if (C % num_groups != 0) {
+        throw std::runtime_error(std::string(kFn) + ": num_groups must divide C");
+    }
+    require_len(weight, C, kFn, "weight");
+    require_len(bias, C, kFn, "bias");
+    launch_group_norm_silu_nchw(x.data(), weight.data(), bias.data(), out.data(), B, C, H, W,
+                                num_groups, eps, code,
+                                reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -3414,6 +3449,9 @@ m.def("int4_gemm", &int4_gemm);
           nb::arg("num_groups"), nb::arg("eps"), nb::arg("row_stride"), nb::arg("stream_ptr"));
     m.def("ndhwc_to_nchw", &ndhwc_to_nchw, nb::arg("src"), nb::arg("dst"),
           nb::arg("stream_ptr"));
+    m.def("group_norm_silu_nchw", &group_norm_silu_nchw, nb::arg("x"), nb::arg("weight"),
+          nb::arg("bias"), nb::arg("out"), nb::arg("B"), nb::arg("C"), nb::arg("H"),
+          nb::arg("W"), nb::arg("num_groups"), nb::arg("eps"), nb::arg("stream_ptr"));
     m.def("apply_rope", &apply_rope);
     m.def("rms_rope", &rms_rope);
     m.def("gemv_awq_w4a16", &gemv_awq_w4a16);
