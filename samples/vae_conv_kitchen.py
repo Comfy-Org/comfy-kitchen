@@ -34,6 +34,11 @@ them; the new table replaces that expectation.
 The last convolution of the decoder (128 channels to 3) and the mid block's
 1x1 convolutions never qualify and stay on MIOpen.
 
+The diffusion model's convolutions are not in scope, and not for lack of trying:
+on their own shapes (batch 2, 320-1280 channels at 128^2-32^2) MIOpen runs at
+10-12 TFLOPS while the kernel reaches 6.4-8.8, so the route measured 0.49-0.87x
+there even before its two layout copies.
+
 The kernel is fp16-only. fp16 VAEs run as is. bf16 VAEs cast into fp16 fused
 into the two layout copies (`copy_` converts dtype while it lays out, so the
 NCHW into NDHWC convert takes the cast along, and the output casts back
