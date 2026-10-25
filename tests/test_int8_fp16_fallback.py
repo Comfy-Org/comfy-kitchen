@@ -207,15 +207,15 @@ def test_int8_linear_keeps_int8_path_with_int8_tensor_core(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_int8_fp16_compute_dtype_prefers_fp16_without_int8_tensor_core(monkeypatch):
-    """A device without INT8 tensor cores must not run the GEMM in BF16.
+def test_int8_fp16_compute_dtype_prefers_fp16_without_bf16_tensor_core(monkeypatch):
+    """A device without BF16 tensor cores must not run the GEMM in BF16.
 
     Volta has no BF16 tensor core, so a BF16 GEMM there falls back to a slow
     conversion path (measured 13.449 ms for 4096^3 against 1.535 ms for FP16
     and 2.909 ms for the DP4A INT8 path the fallback replaces).
     """
     monkeypatch.setattr(
-        eager_quant, "_cuda_device_has_int8_tensor_core", lambda _index: False
+        eager_quant, "_cuda_device_has_bf16_tensor_core", lambda _index: False
     )
     bf16 = torch.zeros(4, dtype=torch.bfloat16, device="cuda")
     fp32 = torch.zeros(4, dtype=torch.float32, device="cuda")
@@ -224,14 +224,27 @@ def test_int8_fp16_compute_dtype_prefers_fp16_without_int8_tensor_core(monkeypat
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_int8_fp16_compute_dtype_keeps_bf16_with_int8_tensor_core(monkeypatch):
-    """Devices with INT8 tensor cores (and therefore BF16 ones) keep BF16."""
+def test_int8_fp16_compute_dtype_keeps_bf16_with_bf16_tensor_core(monkeypatch):
+    """Devices with BF16 tensor cores keep the activation's own BF16 dtype."""
     monkeypatch.setattr(
-        eager_quant, "_cuda_device_has_int8_tensor_core", lambda _index: True
+        eager_quant, "_cuda_device_has_bf16_tensor_core", lambda _index: True
     )
     assert eager_quant._int8_fp16_compute_dtype(
         torch.zeros(4, dtype=torch.bfloat16, device="cuda")
     ) == torch.bfloat16
+
+
+@pytest.mark.parametrize(
+    "capability,has_bf16_tensor_core",
+    [((6, 1), False), ((7, 0), False), ((7, 5), False), ((8, 0), True), ((9, 0), True)],
+)
+def test_bf16_tensor_core_detection(monkeypatch, capability, has_bf16_tensor_core):
+    """BF16 tensor cores start at Ampere; Pascal, Volta and Turing are excluded."""
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda _index: capability
+    )
+    eager_quant._bf16_tensor_core_cache.clear()
+    assert eager_quant._cuda_device_has_bf16_tensor_core(0) is has_bf16_tensor_core
 
 
 def test_int8_fp16_fallback_can_be_disabled(monkeypatch):

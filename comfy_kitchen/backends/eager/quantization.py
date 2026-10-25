@@ -784,6 +784,31 @@ def _cuda_device_has_fp16_tensor_core(device_index: int) -> bool:
     return has_fp16
 
 
+_bf16_tensor_core_cache: dict[int, bool] = {}
+
+
+def _cuda_device_has_bf16_tensor_core(device_index: int) -> bool:
+    """True when the device runs BF16 GEMMs on tensor cores (Ampere/sm_80+).
+
+    BF16 matrix instructions arrive with Ampere. Volta (sm_70) and Turing
+    (sm_75) can execute BF16 only through a conversion path, so a BF16 GEMM
+    there is slower than the FP16 one -- Turing is a narrow case because
+    ``int8_linear`` never routes to the fallback on a device that has INT8
+    tensor cores, but an explicit ``int8_linear_fp16`` call can still ask for
+    it.
+    """
+    cached = _bf16_tensor_core_cache.get(device_index)
+    if cached is not None:
+        return cached
+    try:
+        major, _minor = torch.cuda.get_device_capability(device_index)
+        has_bf16 = major >= 8
+    except RuntimeError:
+        has_bf16 = False
+    _bf16_tensor_core_cache[device_index] = has_bf16
+    return has_bf16
+
+
 def _int8_fp16_fallback_enabled() -> bool:
     """Whether ``int8_linear`` may delegate to the FP16 fallback.
 
@@ -1077,16 +1102,16 @@ def fp16_linear(
 def _int8_fp16_compute_dtype(x: torch.Tensor) -> torch.dtype:
     """Pick the GEMM dtype for :func:`int8_linear_fp16`.
 
-    FP16 is the target on every device that lacks an INT8 tensor core: Volta
-    (sm_70) has no BF16 tensor core either, so a BF16 GEMM there takes a slow
-    conversion path (measured 13.449 ms for 4096^3 against 1.535 ms for FP16
-    and 2.909 ms for the DP4A INT8 path this fallback replaces). Devices that
-    do have BF16 tensor cores keep the activation's own dtype.
+    BF16 is kept only where the GEMM can actually run on BF16 tensor cores
+    (Ampere/sm_80+). Below that threshold -- Volta (sm_70) and Turing (sm_75)
+    -- BF16 goes through a conversion path, measured at 13.449 ms for 4096^3
+    on Volta against 1.535 ms for FP16 and 2.909 ms for the DP4A INT8 path
+    this fallback replaces.
     """
     dtype = x.dtype
     if dtype not in (torch.float16, torch.bfloat16):
         dtype = torch.float16
-    if x.is_cuda and not _cuda_device_has_int8_tensor_core(x.get_device()):
+    if x.is_cuda and not _cuda_device_has_bf16_tensor_core(x.get_device()):
         dtype = torch.float16
     return dtype
 
