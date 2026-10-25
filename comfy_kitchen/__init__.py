@@ -413,7 +413,7 @@ def rms_adaln(
     """Fused Adaptive Layer Normalization with RMSNorm: rmsnorm(x) * (1 + scale) + shift.
 
     Same modulation as :func:`adaln`, but normalizing by the root mean square
-    instead of subtracting the mean 鈥?the form used by LTX/LTX2-style DiTs.
+    instead of subtracting the mean —the form used by LTX/LTX2-style DiTs.
 
     Args:
         x: Input tensor of any shape (..., D)
@@ -658,7 +658,7 @@ def quantize_svdquant_w4a4(
         lora_down: (K, R) low-rank down projection weight.
         pad_size: pad M to multiple of this value (default 256).
         act_unsigned: if True, quantize into uint4 [0, 15] (scale=max/15) for u4
-            MMA downstream. Caller must ensure x is non-negative 鈥?the shift
+            MMA downstream. Caller must ensure x is non-negative —the shift
             constant is a model-topology concern, not part of this op.
         lora_x: (M, K) optional pre-shift activation for LoRA. Defaults to x.
             Pass raw (un-shifted) x when x has been pre-shifted for unsigned path.
@@ -1306,7 +1306,7 @@ def edge_collapse_checks(
 
     - flips (E,) int32: faces with cos(old normal, new normal) < cos_threshold, skipping
       faces with |normal| <= 1e-6 x their sum of squared edge lengths before or after.
-    - skinny (E,) float32: mean of 1 - clamp(4鈭?路area / sum of squared edge lengths, 0, 1),
+    - skinny (E,) float32: mean of 1 - clamp(4√3·area / sum of squared edge lengths, 0, 1),
       0 for equilateral faces.
     - link_ok (E,) bool: a and b share at most as many neighbours as faces on the edge, so
       the collapse keeps the topology.

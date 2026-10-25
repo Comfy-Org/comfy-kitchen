@@ -6,6 +6,8 @@
 #   Copyright (c) Meta Platforms, Inc. and affiliates.
 #   Licensed under the BSD 3-Clause License (see NOTICE file for details)
 
+import os
+
 import torch
 
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
@@ -758,6 +760,21 @@ def _cuda_device_has_int8_tensor_core(device_index: int) -> bool:
     return has_int8
 
 
+def _int8_fp16_fallback_enabled() -> bool:
+    """Whether ``int8_linear`` may delegate to the FP16 fallback.
+
+    The fallback is the right default on devices where the FP16 tensor cores
+    outrun the DP4A-emulated INT8 GEMM. Devices without FP16 tensor cores of
+    their own (Pascal, Maxwell) are not covered by that argument, so this
+    escape hatch lets them keep the original INT8 path::
+
+        COMFY_KITCHEN_INT8_FP16_FALLBACK=0
+
+    The same switch makes it possible to A/B the two paths.
+    """
+    return os.environ.get("COMFY_KITCHEN_INT8_FP16_FALLBACK", "1") != "0"
+
+
 def _int8_mm_n_alignment(tensor: torch.Tensor) -> int:
     # Turing cuBLASLt INT8 rejects some skinny-N shapes, e.g. N=17.
     return 32 if tensor.is_cuda and _cuda_device_is_turing(tensor.get_device()) else 8
@@ -1002,6 +1019,24 @@ def fp16_linear(
     return _apply_residual(out, residual, residual_scale)
 
 
+
+def _int8_fp16_compute_dtype(x: torch.Tensor) -> torch.dtype:
+    """Pick the GEMM dtype for :func:`int8_linear_fp16`.
+
+    FP16 is the target on every device that lacks an INT8 tensor core: Volta
+    (sm_70) has no BF16 tensor core either, so a BF16 GEMM there takes a slow
+    conversion path (measured 13.449 ms for 4096^3 against 1.535 ms for FP16
+    and 2.909 ms for the DP4A INT8 path this fallback replaces). Devices that
+    do have BF16 tensor cores keep the activation's own dtype.
+    """
+    dtype = x.dtype
+    if dtype not in (torch.float16, torch.bfloat16):
+        dtype = torch.float16
+    if x.is_cuda and not _cuda_device_has_int8_tensor_core(x.get_device()):
+        dtype = torch.float16
+    return dtype
+
+
 def int8_linear_fp16(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1083,9 +1118,7 @@ def int8_linear_fp16(
     # stays on the INT8 quantization grid.
     x_8, x_scale = quantize_int8_rowwise(x_2d)
 
-    compute_dtype = x.dtype
-    if compute_dtype not in (torch.float16, torch.bfloat16):
-        compute_dtype = torch.float16
+    compute_dtype = _int8_fp16_compute_dtype(x)
 
     # Dequantize both operands to FP16 and use the FP16 tensor cores.
     # The weight stays in the rotated basis on purpose (see the docstring).
@@ -1127,7 +1160,7 @@ def int8_linear(
     On CUDA devices without INT8 tensor cores (Volta/sm_70) the INT8 GEMM is
     DP4A-emulated and slower than the FP16 tensor cores, so this delegates to
     :func:`int8_linear_fp16`, which keeps the INT8 weights in memory but runs
-    the GEMM in FP16.
+    the GEMM in FP16. Set ``COMFY_KITCHEN_INT8_FP16_FALLBACK=0`` to opt out.
 
     Args:
         x: Input tensor [..., K].
@@ -1150,6 +1183,7 @@ def int8_linear(
     if (
         x.is_cuda
         and weight.is_cuda
+        and _int8_fp16_fallback_enabled()
         and not _cuda_device_has_int8_tensor_core(x.get_device())
     ):
         return int8_linear_fp16(
@@ -1274,7 +1308,7 @@ def int8_linear_rms_modulated(
 
 
 # =============================================================================
-# torch.library Custom Op Definitions 鈥?INT8 Tensor-wise
+# torch.library Custom Op Definitions —INT8 Tensor-wise
 # =============================================================================
 
 

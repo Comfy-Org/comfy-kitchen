@@ -204,3 +204,39 @@ def test_int8_linear_keeps_int8_path_with_int8_tensor_core(monkeypatch):
     # The INT8 path accumulates in int32, the FP16 path in FP16, so they differ
     # slightly -- but the INT8 path must not be the FP16 one.
     assert not torch.equal(int8_out, fp16_out)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_int8_fp16_compute_dtype_prefers_fp16_without_int8_tensor_core(monkeypatch):
+    """A device without INT8 tensor cores must not run the GEMM in BF16.
+
+    Volta has no BF16 tensor core, so a BF16 GEMM there falls back to a slow
+    conversion path (measured 13.449 ms for 4096^3 against 1.535 ms for FP16
+    and 2.909 ms for the DP4A INT8 path the fallback replaces).
+    """
+    monkeypatch.setattr(
+        eager_quant, "_cuda_device_has_int8_tensor_core", lambda _index: False
+    )
+    bf16 = torch.zeros(4, dtype=torch.bfloat16, device="cuda")
+    fp32 = torch.zeros(4, dtype=torch.float32, device="cuda")
+    assert eager_quant._int8_fp16_compute_dtype(bf16) == torch.float16
+    assert eager_quant._int8_fp16_compute_dtype(fp32) == torch.float16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_int8_fp16_compute_dtype_keeps_bf16_with_int8_tensor_core(monkeypatch):
+    """Devices with INT8 tensor cores (and therefore BF16 ones) keep BF16."""
+    monkeypatch.setattr(
+        eager_quant, "_cuda_device_has_int8_tensor_core", lambda _index: True
+    )
+    assert eager_quant._int8_fp16_compute_dtype(
+        torch.zeros(4, dtype=torch.bfloat16, device="cuda")
+    ) == torch.bfloat16
+
+
+def test_int8_fp16_fallback_can_be_disabled(monkeypatch):
+    """The escape hatch lets a device keep the original INT8 path."""
+    monkeypatch.setenv("COMFY_KITCHEN_INT8_FP16_FALLBACK", "0")
+    assert eager_quant._int8_fp16_fallback_enabled() is False
+    monkeypatch.setenv("COMFY_KITCHEN_INT8_FP16_FALLBACK", "1")
+    assert eager_quant._int8_fp16_fallback_enabled() is True
