@@ -760,6 +760,30 @@ def _cuda_device_has_int8_tensor_core(device_index: int) -> bool:
     return has_int8
 
 
+_fp16_tensor_core_cache: dict[int, bool] = {}
+
+
+def _cuda_device_has_fp16_tensor_core(device_index: int) -> bool:
+    """True when the device has FP16 tensor cores (Volta/sm_70 and later).
+
+    The fallback only pays off when the GEMM it moves to actually runs on
+    tensor cores. Pre-Volta parts (Pascal sm_61, Maxwell sm_52) execute FP16
+    at a fraction of their DP4A INT8 rate -- measured at 1/64 on the GTX 1080
+    -- so routing them through the FP16 fallback would be a large regression
+    rather than the speedup it is on Volta.
+    """
+    cached = _fp16_tensor_core_cache.get(device_index)
+    if cached is not None:
+        return cached
+    try:
+        major, _minor = torch.cuda.get_device_capability(device_index)
+        has_fp16 = major >= 7
+    except RuntimeError:
+        has_fp16 = False
+    _fp16_tensor_core_cache[device_index] = has_fp16
+    return has_fp16
+
+
 def _int8_fp16_fallback_enabled() -> bool:
     """Whether ``int8_linear`` may delegate to the FP16 fallback.
 
@@ -1198,6 +1222,10 @@ def int8_linear(
     trade 13 mantissa bits for a 2.27x speedup. Opt in with
     ``COMFY_KITCHEN_INT8_FP16_FALLBACK_FP32=1`` if the speed is wanted anyway.
 
+    Pre-Volta parts keep the INT8 path too: without FP16 tensor cores the
+    moved GEMM would run *slower* than the DP4A one it replaces, so the
+    fallback is limited to sm_70 and later.
+
     Args:
         x: Input tensor [..., K].
         weight: INT8 weight tensor [N, K].
@@ -1222,6 +1250,7 @@ def int8_linear(
         and _int8_fp16_fallback_enabled()
         and (x.dtype != torch.float32 or _int8_fp16_fallback_for_fp32_input())
         and not _cuda_device_has_int8_tensor_core(x.get_device())
+        and _cuda_device_has_fp16_tensor_core(x.get_device())
     ):
         return int8_linear_fp16(
             x, weight, weight_scale, bias, out_dtype,

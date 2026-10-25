@@ -257,6 +257,48 @@ def test_fp32_input_can_opt_in_to_the_fp16_fallback(monkeypatch):
     assert eager_quant._int8_fp16_fallback_for_fp32_input() is True
 
 
+@pytest.mark.parametrize(
+    "capability,has_fp16_tensor_core",
+    [((6, 1), False), ((5, 2), False), ((7, 0), True), ((7, 5), True), ((8, 0), True)],
+)
+def test_fp16_tensor_core_detection(monkeypatch, capability, has_fp16_tensor_core):
+    """Only Volta and later have FP16 tensor cores; Pascal/Maxwell do not."""
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda _index: capability
+    )
+    eager_quant._fp16_tensor_core_cache.clear()
+    assert eager_quant._cuda_device_has_fp16_tensor_core(0) is has_fp16_tensor_core
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_pre_volta_device_keeps_the_int8_path(monkeypatch):
+    """A Pascal device must not be routed through the FP16 fallback.
+
+    FP16 there runs at a fraction of the DP4A INT8 rate (1/64 on the GTX 1080),
+    so the fallback would be a regression rather than the Volta speedup.
+    """
+    monkeypatch.setattr(eager_quant, "_cuda_device_has_int8_tensor_core", lambda _i: False)
+    monkeypatch.setattr(eager_quant, "_cuda_device_has_fp16_tensor_core", lambda _i: False)
+    monkeypatch.setenv("COMFY_KITCHEN_INT8_FP16_FALLBACK", "1")
+
+    x = torch.randn(8, 32, device="cuda", dtype=torch.float16)
+    weight = torch.randint(-8, 8, (16, 32), dtype=torch.int8, device="cuda")
+    weight_scale = torch.full((16,), 0.05, device="cuda")
+
+    calls = []
+    monkeypatch.setattr(
+        eager_quant,
+        "int8_linear_fp16",
+        lambda *a, **k: calls.append(True) or torch.zeros(8, 16, device="cuda"),
+    )
+    eager_quant.int8_linear(x, weight, weight_scale, out_dtype=torch.float16)
+    assert calls == [], "a pre-Volta device was routed to the FP16 fallback"
+
+    monkeypatch.setattr(eager_quant, "_cuda_device_has_fp16_tensor_core", lambda _i: True)
+    eager_quant.int8_linear(x, weight, weight_scale, out_dtype=torch.float16)
+    assert len(calls) == 1, "a Volta+ device should use the FP16 fallback"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_int8_linear_keeps_fp32_on_the_int8_path(monkeypatch):
     """End-to-end: an FP32 activation must not reach the FP16 fallback."""
