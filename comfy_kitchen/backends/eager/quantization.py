@@ -775,6 +775,36 @@ def _int8_fp16_fallback_enabled() -> bool:
     return os.environ.get("COMFY_KITCHEN_INT8_FP16_FALLBACK", "1") != "0"
 
 
+def _int8_fp16_fallback_for_fp32_input() -> bool:
+    """Whether an FP32 activation may also be routed through the FP16 fallback.
+
+    Default **off**: an FP32 activation is the caller explicitly asking for
+    FP32 numerics, usually on purpose (a NaN/overflow fuse re-running a block
+    in FP32, or a model whose compute dtype is pinned to FP32). Downgrading
+    that to FP16 trades away 13 mantissa bits; it is measurably faster, but
+    the caller asked for accuracy, not speed.
+
+    Measured on Volta (sm_70, MiniMax H3 INT8 ConvRot, 4 layers, M=4096,
+    FP32 activation in):
+
+    ==============================  ==========  ==========
+    path                            total       vs INT8
+    ==============================  ==========  ==========
+    INT8 (DP4A)                     86.64 ms    1.00x
+    FP16 fallback                   38.30 ms    0.44x
+    ==============================  ==========  ==========
+
+    Callers who want that 2.27x anyway can opt in explicitly::
+
+        COMFY_KITCHEN_INT8_FP16_FALLBACK_FP32=1
+
+    FP16/BF16 activations are unaffected by this switch: BF16 in particular
+    *gains* precision by moving to FP16 on Volta (10 vs 8 mantissa bits) while
+    avoiding the slow BF16 conversion path (measured 7.4x faster).
+    """
+    return os.environ.get("COMFY_KITCHEN_INT8_FP16_FALLBACK_FP32", "0") == "1"
+
+
 def _int8_mm_n_alignment(tensor: torch.Tensor) -> int:
     # Turing cuBLASLt INT8 rejects some skinny-N shapes, e.g. N=17.
     return 32 if tensor.is_cuda and _cuda_device_is_turing(tensor.get_device()) else 8
@@ -1162,6 +1192,12 @@ def int8_linear(
     :func:`int8_linear_fp16`, which keeps the INT8 weights in memory but runs
     the GEMM in FP16. Set ``COMFY_KITCHEN_INT8_FP16_FALLBACK=0`` to opt out.
 
+    An FP32 activation keeps the INT8 path by default: FP32 numerics are
+    normally requested on purpose (a NaN/overflow fuse re-running a block in
+    FP32, or a model pinned to FP32 compute), and the FP16 fallback would
+    trade 13 mantissa bits for a 2.27x speedup. Opt in with
+    ``COMFY_KITCHEN_INT8_FP16_FALLBACK_FP32=1`` if the speed is wanted anyway.
+
     Args:
         x: Input tensor [..., K].
         weight: INT8 weight tensor [N, K].
@@ -1184,6 +1220,7 @@ def int8_linear(
         x.is_cuda
         and weight.is_cuda
         and _int8_fp16_fallback_enabled()
+        and (x.dtype != torch.float32 or _int8_fp16_fallback_for_fp32_input())
         and not _cuda_device_has_int8_tensor_core(x.get_device())
     ):
         return int8_linear_fp16(

@@ -238,5 +238,49 @@ def test_int8_fp16_fallback_can_be_disabled(monkeypatch):
     """The escape hatch lets a device keep the original INT8 path."""
     monkeypatch.setenv("COMFY_KITCHEN_INT8_FP16_FALLBACK", "0")
     assert eager_quant._int8_fp16_fallback_enabled() is False
+
+
+def test_fp32_input_is_not_downgraded_by_default(monkeypatch):
+    """An FP32 activation keeps the INT8 path unless the caller opts in.
+
+    FP32 numerics are usually requested on purpose (a NaN/overflow fuse
+    re-running a block in FP32, or a model pinned to FP32 compute), so the
+    fallback must not silently trade 13 mantissa bits for a 2.27x speedup.
+    """
+    monkeypatch.delenv("COMFY_KITCHEN_INT8_FP16_FALLBACK_FP32", raising=False)
+    assert eager_quant._int8_fp16_fallback_for_fp32_input() is False
+
+
+def test_fp32_input_can_opt_in_to_the_fp16_fallback(monkeypatch):
+    """COMFY_KITCHEN_INT8_FP16_FALLBACK_FP32=1 routes FP32 through FP16 too."""
+    monkeypatch.setenv("COMFY_KITCHEN_INT8_FP16_FALLBACK_FP32", "1")
+    assert eager_quant._int8_fp16_fallback_for_fp32_input() is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_int8_linear_keeps_fp32_on_the_int8_path(monkeypatch):
+    """End-to-end: an FP32 activation must not reach the FP16 fallback."""
+    monkeypatch.setattr(
+        eager_quant, "_cuda_device_has_int8_tensor_core", lambda _index: False
+    )
+    monkeypatch.setenv("COMFY_KITCHEN_INT8_FP16_FALLBACK", "1")
+    monkeypatch.delenv("COMFY_KITCHEN_INT8_FP16_FALLBACK_FP32", raising=False)
+
+    x = torch.randn(8, 32, device="cuda", dtype=torch.float32) * 0.5
+    weight = torch.randint(-8, 8, (16, 32), dtype=torch.int8, device="cuda")
+    weight_scale = torch.full((16,), 0.05, device="cuda")
+
+    calls = []
+    monkeypatch.setattr(
+        eager_quant,
+        "int8_linear_fp16",
+        lambda *a, **k: calls.append(True) or torch.zeros(8, 16, device="cuda"),
+    )
+    eager_quant.int8_linear(x, weight, weight_scale, out_dtype=torch.float32)
+    assert calls == [], "FP32 activation was routed to the FP16 fallback"
+
+    monkeypatch.setenv("COMFY_KITCHEN_INT8_FP16_FALLBACK_FP32", "1")
+    eager_quant.int8_linear(x, weight, weight_scale, out_dtype=torch.float32)
+    assert len(calls) == 1, "opt-in did not route the FP32 activation to FP16"
     monkeypatch.setenv("COMFY_KITCHEN_INT8_FP16_FALLBACK", "1")
     assert eager_quant._int8_fp16_fallback_enabled() is True
