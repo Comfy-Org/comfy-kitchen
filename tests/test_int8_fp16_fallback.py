@@ -239,11 +239,16 @@ def test_int8_fp16_compute_dtype_keeps_bf16_with_bf16_tensor_core(monkeypatch):
     [((6, 1), False), ((7, 0), False), ((7, 5), False), ((8, 0), True), ((9, 0), True)],
 )
 def test_bf16_tensor_core_detection(monkeypatch, capability, has_bf16_tensor_core):
-    """BF16 tensor cores start at Ampere; Pascal, Volta and Turing are excluded."""
+    """BF16 tensor cores start at Ampere; Pascal, Volta and Turing are excluded.
+
+    The cache is swapped out for the duration of the test so the simulated
+    capability cannot survive into a later test that asks about the real
+    device.
+    """
     monkeypatch.setattr(
         torch.cuda, "get_device_capability", lambda _index: capability
     )
-    eager_quant._bf16_tensor_core_cache.clear()
+    monkeypatch.setattr(eager_quant, "_bf16_tensor_core_cache", {})
     assert eager_quant._cuda_device_has_bf16_tensor_core(0) is has_bf16_tensor_core
 
 
@@ -275,11 +280,16 @@ def test_fp32_input_can_opt_in_to_the_fp16_fallback(monkeypatch):
     [((6, 1), False), ((5, 2), False), ((7, 0), True), ((7, 5), True), ((8, 0), True)],
 )
 def test_fp16_tensor_core_detection(monkeypatch, capability, has_fp16_tensor_core):
-    """Only Volta and later have FP16 tensor cores; Pascal/Maxwell do not."""
+    """Only Volta and later have FP16 tensor cores; Pascal/Maxwell do not.
+
+    The cache is swapped out for the duration of the test so the simulated
+    capability cannot survive into a later test that asks about the real
+    device.
+    """
     monkeypatch.setattr(
         torch.cuda, "get_device_capability", lambda _index: capability
     )
-    eager_quant._fp16_tensor_core_cache.clear()
+    monkeypatch.setattr(eager_quant, "_fp16_tensor_core_cache", {})
     assert eager_quant._cuda_device_has_fp16_tensor_core(0) is has_fp16_tensor_core
 
 
