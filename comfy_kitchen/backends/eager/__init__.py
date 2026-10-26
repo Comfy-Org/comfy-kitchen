@@ -55,6 +55,7 @@ __all__ = [
     "stochastic_rounding_fp8",
     "fp16_linear",
     "int8_linear",
+    "int8_linear_fp16",
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
     "w4a8_int8_linear",
@@ -96,6 +97,7 @@ from .quantization import (
     dequantize_per_tensor_fp8,
     fp16_linear,
     int8_linear,
+    int8_linear_fp16,
     int8_linear_modulated,
     int8_linear_rms_modulated,
     quantize_and_rotate_rowwise,
@@ -579,6 +581,17 @@ def _build_constraints() -> dict:
         default_devices=all_devices,
     )
     out["int8_linear"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
+            "weight_scale": ParamConstraint(dtypes=standard_floats),
+            "bias": ParamConstraint(dtypes=standard_floats),
+            "convrot": ParamConstraint(dtypes=frozenset({bool})),
+            "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["int8_linear_fp16"] = FunctionConstraints(
         params={
             "x": ParamConstraint(dtypes=standard_floats),
             "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
