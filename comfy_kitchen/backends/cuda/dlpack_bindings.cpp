@@ -4348,8 +4348,15 @@ void flash_attention_decode_gqa(
     if (softmax_lse.size() != lse_size || num_splits < 1 || num_splits > 32 || (num_splits > 1 && (softmax_lse_accum.size() != lse_size * num_splits || output_accum.size() != lse_size * kHeadDim * num_splits))) {
         throw std::runtime_error("Invalid Flash Attention split workspace");
     }
+    // DLPack exports may normalize the strides of size-1 dimensions to 1. Such
+    // strides never participate in addressing, so only constrain the others.
+    auto stride_matches = [](int64_t actual, int64_t expected, int64_t dim_size) {
+        return dim_size == 1 || actual == expected;
+    };
     if (k.stride(0) != v.stride(0) || k.stride(1) != v.stride(1) || k.stride(2) != v.stride(2) || k.stride(3) != 1 || v.stride(3) != 1 || q.stride(3) != 1
-        || output.stride(2) != 1 || output.stride(1) != heads * kHeadDim || output.stride(0) != query_length * heads * kHeadDim) {
+        || output.stride(2) != 1
+        || !stride_matches(output.stride(1), heads * kHeadDim, output.shape(1))
+        || !stride_matches(output.stride(0), query_length * heads * kHeadDim, output.shape(0))) {
         throw std::runtime_error("Unsupported Flash Attention tensor strides");
     }
 
