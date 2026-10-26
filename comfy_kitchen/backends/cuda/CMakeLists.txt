@@ -131,6 +131,9 @@ set(CUDA_SOURCES
     ops/cutlass_conv3d_fp16.cu
     ops/group_norm_pad3d.cu
     ops/turing_int8.cu
+    ops/h3_qkv/qkv_quant.cu
+    ops/h3_qkv/sample_k.cu
+    ops/h3_qkv/anchor_v.cu
     ops/int8_linear.cu
     ops/convrot_w4a4.cu
     ops/turing_int4.cu
