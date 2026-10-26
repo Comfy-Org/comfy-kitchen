@@ -74,11 +74,21 @@ def _valid_rows(t: int, lengths: torch.Tensor) -> torch.Tensor:
     return (pos % BLOCK) < lengths[pos // BLOCK]
 
 
-def coarse_output(qm, km, vm, scale):
+def coarse_output(qm, km, vm, scale, query_chunk=None):
     """VSA coarse branch: dense attention over the block means. qm/km/vm are
-    ``[BH, N, D]`` fp32; returns ``[BH, N, D]`` fp32."""
-    s = torch.bmm(qm, km.transpose(1, 2)) * scale
-    return torch.bmm(torch.softmax(s, dim=-1), vm)
+    ``[BH, N, D]`` fp32; returns ``[BH, N, D]`` fp32. ``query_chunk``
+    bounds the score tensor's query dimension without changing the complete
+    key set or per-query softmax denominator."""
+    kt = km.transpose(1, 2)
+    if query_chunk is None or qm.shape[1] <= query_chunk:
+        s = torch.bmm(qm, kt) * scale
+        return torch.bmm(torch.softmax(s, dim=-1), vm)
+    out = torch.empty_like(qm)
+    for begin in range(0, qm.shape[1], query_chunk):
+        end = min(begin + query_chunk, qm.shape[1])
+        s = torch.bmm(qm[:, begin:end], kt) * scale
+        out[:, begin:end] = torch.bmm(torch.softmax(s, dim=-1), vm)
+    return out
 
 
 def add_coarse_(out, oc, gate):
