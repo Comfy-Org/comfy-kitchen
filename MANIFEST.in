@@ -1,2 +1,4 @@
 include comfy_kitchen/backends/hip/CMakeLists.txt
 recursive-include comfy_kitchen/backends/hip *.cpp *.h *.hip *.in *.json
+include comfy_kitchen/backends/rdna1/CMakeLists.txt
+recursive-include comfy_kitchen/backends/rdna1 *.cpp *.h *.hip

@@ -21,6 +21,7 @@ from .flash_attention import flash_attention_decode
 from .flash_attention import is_available as flash_attention_decode_is_available
 from .flash_attention import flash_attention_decode_gqa, flash_attention_decode_gqa_is_available
 from .flash_attention import flash_attention_decode_step_merge, flash_attention_decode_tree_merge
+from .flash_attention import float_attention, float_attention_is_available
 from .float_utils import from_blocked, swap_nibbles, to_blocked
 from .gated_delta import deltanet_conv_step, gated_delta_decode_fused
 from .gated_delta import is_available as gated_delta_decode_is_available
@@ -34,9 +35,11 @@ from .sage_attention import (
     PrequantizedInt8Attention,
     int8_attention,
     int8_attention_from_prequantized,
+    int8_block_sparse_attention,
     prequantize_int8_attention,
 )
 from .sage_attention import is_available as int8_attention_is_available
+from .sage_attention import is_block_sparse_available as int8_block_sparse_attention_is_available
 from .tensor.convrot_w4a4 import (
     convrot_w4a4_linear,
     dequantize_convrot_w4a4_weight,
@@ -52,16 +55,24 @@ from .tensor.w4a8_int8 import (
 # ROCm PyTorch build so CUDA/CPU processes do not pay the import cost or acquire
 # an unrelated GPU runtime merely because a combined wheel contains the module.
 if getattr(torch.version, "hip", None):
+    from .backends import amd as _amd
     from .backends import hip as _hip_backend
 
     # The HIP backend registers only on a supported AMD device (RDNA2/3/3.5/4),
     # and advertises only the ops that device can run; prefer it where it registers.
-    if registry.is_available("hip"):
+    # rdna1 registers beside it for gfx1010. Triton miscompiles there, so it is
+    # left out of dispatch wherever rdna1 registers.
+    if registry.is_available("rdna1"):
+        registry.set_priority(["rdna1", "hip", "eager"])
+        sol_attn_chunked = _amd.sol_attn_chunked
+    elif registry.is_available("hip"):
         registry.set_priority(["hip", "cuda", "triton", "eager"])
         sol_attn_chunked = _hip_backend.sol_attn_chunked
         _memmove_ = _hip_backend.memmove_
 else:
+    _amd = None
     registry.mark_unavailable("hip", "PyTorch ROCm/HIP runtime not available")
+    registry.mark_unavailable("rdna1", "PyTorch ROCm/HIP runtime not available")
 
 __all__ = [
     # Normalization
@@ -76,6 +87,8 @@ __all__ = [
     "int8_attention",
     "int8_attention_from_prequantized",
     "int8_attention_is_available",
+    "int8_block_sparse_attention",
+    "int8_block_sparse_attention_is_available",
     "prequantize_int8_attention",
     "flash_attention_decode",
     "flash_attention_decode_gqa",
@@ -119,6 +132,19 @@ __all__ = [
     "dequantize_w4a8_int8_weight",
     "gemv_awq_w4a16",
     "fp16_linear",
+    "fp16_packed_conv3d",
+    "fp16_packed_conv_transpose3d",
+    "depthwise_conv3d",
+    "depthwise_conv_transpose3d",
+    "direct_conv3d",
+    "fp32_winograd_conv2d",
+    "fp32_winograd_conv_transpose2d",
+    "float_attention",
+    "float_attention_is_available",
+    "fp16_packed_linear",
+    "q8_0_linear",
+    "q4_k_linear",
+    "fp16_packed_linear_is_accelerated",
     "int8_linear",
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
@@ -262,9 +288,10 @@ def sol_attn_is_available(device: torch.device | None = None) -> bool:
     if not torch.cuda.is_available():
         return False
     if getattr(torch.version, "hip", None):
-        # torch.cuda is the ROCm API here; the HIP backend advertises sol_attn
-        # only on WMMA parts, so its registration is the answer
-        return registry.is_available("hip") and registry.get_constraints("hip", "sol_attn") is not None
+        # torch.cuda is the ROCm API here; the AMD backend serving the device
+        # advertises sol_attn only where it runs, so its registration is the answer
+        name, _ = _amd.backend_for(device)
+        return registry.is_available(name) and registry.get_constraints(name, "sol_attn") is not None
     rules = registry.get_constraints("cuda", "sol_attn")
     ext = getattr(_cuda_backend, "_C", None)
     return (registry.is_available("cuda") and _cuda_backend._EXT_AVAILABLE and hasattr(ext, "sol_attn")
@@ -1004,6 +1031,205 @@ def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
 def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N]."""
     return _mm_int8(a, b)
+
+
+def fp16_packed_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    weight_amax: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Linear with fp16 weights on packed fp16 math, each fp16 partial sum folded into
+    fp32 every 32 products and stored as ``out_dtype`` (x's dtype by default).
+
+    The rdna1 (gfx1010) backend serves it; that part lacks matrix cores and dot
+    instructions. x of any float dtype and range is scaled per row by a
+    power of two against ``weight_amax`` (the largest |weight|, computed when not
+    given) so that no fp16 partial sum overflows. Elsewhere this is
+    ``torch.nn.functional.linear``.
+    """
+    kwargs = {"x": x, "weight": weight, "bias": bias, "out_dtype": out_dtype,
+              "weight_amax": weight_amax}
+    impl = registry.get_implementation("fp16_packed_linear", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def q8_0_linear(
+    x: torch.Tensor,
+    raw: torch.Tensor,
+    out_features: int,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Linear against a GGUF Q8_0 weight given as its raw bytes (uint8, [out_features,
+    in_features / 32 * 34]: per 32-element block an fp16 scale and 32 int8 codes), stored as
+    ``out_dtype`` (x's dtype by default). The rdna1 backend reads the codes in its packed
+    GEMM and applies the block scales there; elsewhere the weight is dequantized to x's
+    dtype for ``torch.nn.functional.linear``."""
+    kwargs = {"x": x, "raw": raw, "out_features": out_features, "bias": bias, "out_dtype": out_dtype}
+    impl = registry.get_implementation("q8_0_linear", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def q4_k_linear(
+    x: torch.Tensor,
+    raw: torch.Tensor,
+    out_features: int,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Linear against a GGUF Q4_K weight given as its raw bytes (uint8, [out_features,
+    in_features / 256 * 144]), stored as ``out_dtype`` (x's dtype by default). The rdna1
+    backend reads the 4-bit codes in its packed GEMM and applies the sub-block scales and
+    offsets there; elsewhere the weight is dequantized to x's dtype."""
+    kwargs = {"x": x, "raw": raw, "out_features": out_features, "bias": bias, "out_dtype": out_dtype}
+    impl = registry.get_implementation("q4_k_linear", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def fp16_packed_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: int | tuple[int, int, int] = 1,
+    padding: int | tuple[int, int, int] = 0,
+    dilation: int | tuple[int, int, int] = 1,
+) -> torch.Tensor:
+    """conv3d with an fp16 weight on the packed fp16 math of :func:`fp16_packed_linear`,
+    zero padding, the result in x's dtype and, on rdna1, its memory format.
+
+    rdna1 serves it with an implicit GEMM (no im2col workspace) when x has a
+    multiple of 32 channels: x of any float dtype and range is scaled by a power of
+    two so that no fp16 partial sum overflows. Elsewhere this is torch's conv3d in x's
+    dtype.
+    """
+    stride, padding, dilation = ([v] * 3 if isinstance(v, int) else list(v)
+                                 for v in (stride, padding, dilation))
+    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": stride, "padding": padding,
+              "dilation": dilation}
+    impl = registry.get_implementation("fp16_packed_conv3d", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def _pair(v):
+    return [v] * 2 if isinstance(v, int) else list(v)
+
+
+def _triple(v):
+    return [v] * 3 if isinstance(v, int) else list(v)
+
+
+def fp16_packed_conv_transpose3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: int | tuple[int, int, int] = 1,
+    padding: int | tuple[int, int, int] = 0,
+    output_padding: int | tuple[int, int, int] = 0,
+) -> torch.Tensor:
+    """conv_transpose3d (one group, no dilation) with an fp16 ``[C, K, T, R, S]`` weight on
+    the packed fp16 math of :func:`fp16_packed_linear`, the result in x's dtype.
+
+    rdna1 serves it as one stride-1 implicit GEMM per output residue, with no zero-stuffed
+    input and no im2col workspace. Elsewhere this is torch's conv_transpose3d in x's dtype.
+    """
+    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _triple(stride),
+              "padding": _triple(padding), "output_padding": _triple(output_padding)}
+    impl = registry.get_implementation("fp16_packed_conv_transpose3d", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def depthwise_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: int | tuple[int, int, int] = 1,
+    padding: int | tuple[int, int, int] = 0,
+    dilation: int | tuple[int, int, int] = 1,
+) -> torch.Tensor:
+    """conv3d with one ``[1, T, R, S]`` filter per channel (groups == channels) and zero
+    padding, the result in x's dtype. rdna1 serves it with a gather kernel accumulating in
+    fp32; elsewhere this is torch's grouped conv3d."""
+    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _triple(stride),
+              "padding": _triple(padding), "dilation": _triple(dilation)}
+    impl = registry.get_implementation("depthwise_conv3d", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def direct_conv3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: int | tuple[int, int, int] = 1,
+    padding: int | tuple[int, int, int] = 0,
+    dilation: int | tuple[int, int, int] = 1,
+) -> torch.Tensor:
+    """conv3d with zero padding, the result contiguous in x's dtype. rdna1 serves it with a
+    direct kernel in fp32 math that reads x in place, for convs with few input or few output
+    channels; elsewhere this is torch's conv3d."""
+    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _triple(stride),
+              "padding": _triple(padding), "dilation": _triple(dilation)}
+    impl = registry.get_implementation("direct_conv3d", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def fp32_winograd_conv2d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: int | tuple[int, int] = 1,
+    padding: int | tuple[int, int] = 0,
+) -> torch.Tensor:
+    """fp32 conv2d with zero padding. rdna1 serves stride 1 and 2 with MIOpen's Winograd RxS
+    kernels, built into the backend so no MIOpen search runs; elsewhere this is torch's
+    conv2d."""
+    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _pair(stride), "padding": _pair(padding)}
+    impl = registry.get_implementation("fp32_winograd_conv2d", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def fp32_winograd_conv_transpose2d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: int | tuple[int, int] = 1,
+    padding: int | tuple[int, int] = 0,
+    output_padding: int | tuple[int, int] = 0,
+) -> torch.Tensor:
+    """fp32 conv_transpose2d (one group, no dilation) with a [C, K, R, S] weight. rdna1 serves
+    stride 1 and 2 with MIOpen's Winograd RxS kernels as its backward-data solver runs them;
+    elsewhere this is torch's conv_transpose2d."""
+    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _pair(stride),
+              "padding": _pair(padding), "output_padding": _pair(output_padding)}
+    impl = registry.get_implementation("fp32_winograd_conv_transpose2d", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def depthwise_conv_transpose3d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: int | tuple[int, int, int] = 1,
+    padding: int | tuple[int, int, int] = 0,
+    output_padding: int | tuple[int, int, int] = 0,
+) -> torch.Tensor:
+    """conv_transpose3d with one ``[1, T, R, S]`` filter per channel (groups == channels) and
+    no dilation, the result in x's dtype; see :func:`depthwise_conv3d`."""
+    kwargs = {"x": x, "weight": weight, "bias": bias, "stride": _triple(stride),
+              "padding": _triple(padding), "output_padding": _triple(output_padding)}
+    impl = registry.get_implementation("depthwise_conv_transpose3d", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def fp16_packed_linear_is_accelerated(device: torch.device) -> bool:
+    """Whether :func:`fp16_packed_linear` on ``device`` runs a kernel that outruns the
+    device's fp32 GEMM, so a model computing in fp32 only for want of bf16 arithmetic
+    gains by using it."""
+    if device.type != "cuda" or _amd is None:
+        return False
+    name, _ = _amd.backend_for(device)
+    return registry.is_available(name) and registry.get_constraints(name, "fp16_packed_linear") is not None
 
 
 def rms_gated_residual(
