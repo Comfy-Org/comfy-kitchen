@@ -2493,6 +2493,15 @@ def pack_w4a8_mma_weight_(dest: torch.Tensor, s_rel: torch.Tensor):
     )
 
 
+def memmove_(dst: torch.Tensor, src: torch.Tensor):
+    """Copy src's bytes to dst on the current stream; the ranges may overlap."""
+    flags = torch.zeros(dst.nbytes // 65536 + 2, dtype=torch.int32, device=dst.device)
+    _C.memmove(
+        _wrap_for_dlpack(dst.view(torch.uint8).view(-1)), _wrap_for_dlpack(src.view(torch.uint8).view(-1)), _wrap_for_dlpack(flags),
+        torch.cuda.current_stream(dst.device).cuda_stream,
+    )
+
+
 def w4a8_int8_linear(
     x: torch.Tensor,
     qdata: torch.Tensor,

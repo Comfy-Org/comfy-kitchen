@@ -450,6 +450,12 @@ def scaled_mm_fp8(
 # INT8 quantization + GEMM (v_wmma_i32_16x16x16_iu8)
 # ---------------------------------------------------------------------------
 
+def memmove_(dst: torch.Tensor, src: torch.Tensor):
+    """Copy src's bytes to dst on the current stream; the ranges may overlap."""
+    flags = torch.zeros(dst.nbytes // 65536 + 2, dtype=torch.int32, device=dst.device)
+    _C.memmove(_dl(dst.view(torch.uint8).view(-1)), _dl(src.view(torch.uint8).view(-1)), _dl(flags), _stream(dst))
+
+
 def quantize_int8_rowwise(
     x: torch.Tensor,
     stochastic_rounding: int | None = 0,

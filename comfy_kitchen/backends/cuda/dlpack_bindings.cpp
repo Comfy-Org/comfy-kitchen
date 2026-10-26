@@ -2330,6 +2330,9 @@ extern "C" {
         void* data, const void* scales, void* scratch,
         int64_t N, int64_t K, int bits, cudaStream_t stream);
 
+    int64_t memmove_flag_count(int64_t nbytes);
+    void launch_memmove(void* dst, const void* src, int64_t nbytes, void* flags, cudaStream_t stream);
+
     bool launch_w4a8_codebook_gemm_chunked(
         const void* xq,
         const void* weight,
@@ -3440,6 +3443,19 @@ void pack_w4a8_mma_inplace(
         throw std::runtime_error("pack_w4a8_mma_inplace: invalid storage or scratch geometry");
     launch_pack_w4a8_mma_inplace(data.data(), scales.data(), scratch.data(),
         N, K, bits, reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void memmove_bytes(
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> dst,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> src,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> flags,
+    uintptr_t stream_ptr) {
+    const int64_t nbytes = dst.size();
+    if (src.size() != static_cast<size_t>(nbytes) || nbytes % 16 || dst.stride(0) != 1 || src.stride(0) != 1
+            || reinterpret_cast<uintptr_t>(dst.data()) % 16 || reinterpret_cast<uintptr_t>(src.data()) % 16
+            || flags.stride(0) != 1 || flags.size() < static_cast<size_t>(memmove_flag_count(nbytes)))
+        throw std::runtime_error("memmove: ranges must be equal, 16-byte aligned multiples of 16 bytes with enough flags");
+    launch_memmove(dst.data(), src.data(), nbytes, flags.data(), reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Returns the code width (4 or 6) implied by the packed weight row.
@@ -4870,6 +4886,10 @@ NB_MODULE(_C, m) {
     m.def("pack_w4a8_mma_inplace", &pack_w4a8_mma_inplace,
           "In-place backwards slab expansion into tiled codes and interleaved scales",
           nb::arg("data"), nb::arg("scales"), nb::arg("scratch"), nb::arg("stream_ptr"));
+
+    m.def("memmove", &memmove_bytes,
+          "Overlap-safe byte move; flags is zeroed int32 scratch of nbytes // 65536 + 2 entries",
+          nb::arg("dst"), nb::arg("src"), nb::arg("flags"), nb::arg("stream_ptr"));
 
     m.def("w4a8_codebook_gemm_chunked", &w4a8_codebook_gemm_chunked,
           "Chunked fused W4A8: per-chunk codebook+s_rel dequant -> L2-hot int8 -> strided int8 GEMM",
