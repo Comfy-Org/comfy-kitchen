@@ -59,6 +59,24 @@ __all__ = [
     "int8_linear_rms_modulated",
     "w4a8_int8_linear",
     "w4a8_packed_linear",
+    "lora_bypass",
+    "lora_bypass_backward",
+    "lora_merge",
+    "lora_merge_backward",
+    "loha_bypass",
+    "loha_bypass_backward",
+    "loha_merge",
+    "loha_merge_backward",
+    "lokr_bypass",
+    "lokr_bypass_backward",
+    "lokr_merge",
+    "lokr_merge_backward",
+    "oft_apply",
+    "oft_apply_backward",
+    "weight_decompose",
+    "weight_decompose_backward",
+    "channel_scale",
+    "channel_scale_backward",
 ]
 
 import torch
@@ -74,6 +92,27 @@ from comfy_kitchen.constraints import (
 )
 from comfy_kitchen.registry import registry
 
+from .adapters import (
+    adapter_constraints,
+    channel_scale,
+    channel_scale_backward,
+    loha_bypass,
+    loha_bypass_backward,
+    loha_merge,
+    loha_merge_backward,
+    lokr_bypass,
+    lokr_bypass_backward,
+    lokr_merge,
+    lokr_merge_backward,
+    lora_bypass,
+    lora_bypass_backward,
+    lora_merge,
+    lora_merge_backward,
+    oft_apply,
+    oft_apply_backward,
+    weight_decompose,
+    weight_decompose_backward,
+)
 from .adaln import adaln, rms_adaln
 from .awq import gemv_awq_w4a16
 from .conv3d import fp16_conv3d, fp16_conv3d_out
@@ -697,6 +736,7 @@ def _build_constraints() -> dict:
         if name in out:
             out[name + "_out"] = with_out_param(out[name])
     out["w4a8_packed_linear"] = with_w4a8_packed_storage(out["w4a8_int8_linear"])
+    out.update(adapter_constraints(all_devices))
     return out
 
 

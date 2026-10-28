@@ -1,11 +1,13 @@
 import torch
 
+from . import adapters
 from .allocation import set_allocation_context
 from .backends import cuda as _cuda_backend
 
 # Import backends to trigger auto-registration
 from .backends import ascend as _ascend_backend  # noqa: F401
 from .backends import eager as _eager_backend  # noqa: F401
+from .backends import tilelang as _tilelang_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
 from .backends.cuda import memmove_ as _memmove_
@@ -148,6 +150,8 @@ __all__ = [
     "connected_components",
     "edge_collapse_checks",
     "min_cut",
+    # Weight adapters (LoRA, LoHa, LoKr, OFT, DoRA, IA3)
+    "adapters",
     # Utilities
     "swap_nibbles",
     "to_blocked",
