@@ -158,7 +158,7 @@ def test_hip_drops_gemms_without_matrix_cores():
     assert "na3d" in hip_backend._WMMA_ONLY_OPS
     # The elementwise kernels need no matrix cores and must survive.
     for op in ("apply_rope", "apply_rope_", "rms_rope", "rms_rope_split_half1_", "adaln",
-               "rms_adaln", "quantize_per_tensor_fp8", "gemv_awq_w4a16",
+               "rms_adaln", "group_norm_silu_pad3d", "quantize_per_tensor_fp8", "gemv_awq_w4a16",
                "dequantize_int8_simple_dtype",
                "dequantize_int8_convrot_weight_dtype"):
         assert op in without
@@ -275,6 +275,8 @@ def test_architecture_manifest_is_unique_and_shared_by_setup_and_runtime():
     assert set(groups["wmma_gfx11"]) == hip_backend._ARCH_WMMA_GFX11
     assert set(groups["wmma_gfx117"]) == hip_backend._ARCH_WMMA_GFX117
     assert set(groups["wmma_gfx12"]) == hip_backend._ARCH_WMMA_GFX12
+    assert "gfx1200" in groups["wmma_gfx12"]
+    assert "gfx1201" in groups["wmma_gfx12"]
     assert set(manifest_archs) == hip_backend._ARCH_SUPPORTED
 
 
@@ -297,6 +299,19 @@ def test_cmake_reads_and_validates_the_shared_architecture_manifest():
     assert "IN_LIST COMFY_HIP_SUPPORTED_ARCHS" in text
     assert "configure_file(" in text
     assert not re.search(r'"gfx\d', text)
+
+    read_groups = re.findall(r"_ck_read_arch_group\(\w+ (\w+)\)", text)
+    assert tuple(read_groups) == _HIP_ARCH_GROUP_NAMES
+
+
+def test_cmake_uses_only_gfx12_group_for_gfx12_wmma_policy():
+    text = _HIP_CMAKE.read_text(encoding="utf-8")
+
+    gfx12_condition = re.search(
+        r"_ck_make_arch_condition\(COMFY_HIP_GFX12_CONDITION(.*?)\)", text, re.DOTALL
+    )
+    assert gfx12_condition is not None
+    assert "COMFY_HIP_WMMA_GFX12_ARCHS" in gfx12_condition.group(1)
 
 
 def test_mma_architecture_macros_are_generated_from_the_manifest():

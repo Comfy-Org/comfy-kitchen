@@ -21,6 +21,8 @@
 
 #include <cuda.h>
 #include <cuda_fp8.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #if CUDA_VERSION >= 12080
 #include <cuda_fp4.h>
 #endif
@@ -59,6 +61,13 @@ __device__ __forceinline__ void store4_i8(int8_t *ptr, int8_t a, int8_t b,
       (uint32_t)(uint8_t)a | ((uint32_t)(uint8_t)b << 8) |
       ((uint32_t)(uint8_t)c << 16) | ((uint32_t)(uint8_t)d << 24);
 }
+
+// fp32 -> output element type conversion for kernel epilogues (round to
+// nearest even for the half types).
+template <typename T> __device__ __forceinline__ T from_float(float v);
+template <> __device__ __forceinline__ float from_float<float>(float v) { return v; }
+template <> __device__ __forceinline__ __half from_float<__half>(float v) { return __float2half(v); }
+template <> __device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
 
 // FP8 type traits for max values
 template <typename T>

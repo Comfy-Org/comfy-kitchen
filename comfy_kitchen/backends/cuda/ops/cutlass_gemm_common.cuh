@@ -1,0 +1,280 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+  * Shared by the CUTLASS GEMM units (int8, fp16): stream-ordered workspace,
+  * lean stream-K swizzle, GemmUniversal launch tail.
+ */
+#pragma once
+
+#include <cuda_runtime.h>
+#include <cmath>
+#include <cstdint>
+#include <type_traits>
+
+#include "cutlass/cutlass.h"
+#include "cutlass/gemm_coord.h"
+#include "cutlass/gemm/gemm_enumerated_types.h"
+#include "cutlass/gemm/threadblock/threadblock_swizzle.h"
+
+namespace comfy_cutlass {
+
+template <cudaDeviceAttr Attr>
+inline int cached_device_attribute(int fallback) {
+    static int values[64] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return fallback;
+    if (values[dev] == 0) {
+        cudaDeviceGetAttribute(&values[dev], Attr, dev);
+        if (values[dev] <= 0) values[dev] = fallback;
+    }
+    return values[dev];
+}
+inline int device_sm_count() { return cached_device_attribute<cudaDevAttrMultiProcessorCount>(1); }
+inline int device_l2_bytes() { return cached_device_attribute<cudaDevAttrL2CacheSize>(1 << 30); }
+
+// Splits the measured cards: 36 and 96 MB of L2 were tuned at the full band, 5 MB cannot
+// keep a band of weights from one wave to the next.
+constexpr int kBandRetainL2Bytes = 16 << 20;
+
+// Band width in N tiles: `retained` where the L2 holds a band. Where it cannot, the width
+// that leaves one wave of blocks the least to read, sms / band activation tiles plus band
+// weight tiles. A 3080 (68 SMs, 5 MB) runs within 2% of its best from 4 to 12 tiles at any
+// K, and takes up to 47% longer at 32.
+inline int stream_k_band_tiles(int retained, int sms, cutlass::gemm::GemmCoord tile_size) {
+    if (device_l2_bytes() >= kBandRetainL2Bytes) return retained;
+    const int band = static_cast<int>(
+        std::lround(std::sqrt(double(sms) * tile_size.m() / tile_size.n())));
+    return band < 1 ? 1 : band;
+}
+
+// BandN > 0: walk N in bands so a wave's weight slice stays in L2, BandN tiles wide where
+// the L2 holds a band.
+template <int BandN = 0>
+struct ThreadblockSwizzleLeanStreamKT {
+    using StreamkFeature = void;
+
+    template <typename GemmKernel>
+    struct KernelTraits {};
+
+    enum ReductionStrategy {
+        kNone,
+        kAtomic,
+        kMixed,
+    };
+
+    static constexpr ReductionStrategy kReductionStrategy = kAtomic;
+
+    cutlass::gemm::GemmCoord problem_size;
+    cutlass::gemm::GemmCoord tiled_shape_;
+    int iterations_per_tile;
+    int sk_blocks;
+    int sk_iterations;
+    int avail_sms;
+    int dp_blocks;
+    int dp_first_wave_tiles = 1;
+    int reduction_blocks = 0;
+    int sk_tiles;
+    int sk_waves;
+    bool cohort_raster = false;
+    int band_tiles = BandN;
+
+    ThreadblockSwizzleLeanStreamKT() = default;
+
+    ThreadblockSwizzleLeanStreamKT(
+        cutlass::gemm::GemmUniversalMode,
+        cutlass::gemm::GemmCoord problem_size_arg,
+        cutlass::gemm::GemmCoord tile_size,
+        int,
+        int,
+        int device_sms,
+        int available_sms,
+        size_t,
+        size_t,
+        size_t,
+        int)
+        : problem_size(problem_size_arg),
+          tiled_shape_(
+              (problem_size.m() + tile_size.m() - 1) / tile_size.m(),
+              (problem_size.n() + tile_size.n() - 1) / tile_size.n(),
+              1),
+          iterations_per_tile(
+              (problem_size.k() + tile_size.k() - 1) / tile_size.k()),
+          avail_sms(available_sms < 0 || available_sms > device_sms
+                        ? device_sms
+                        : available_sms) {
+        if constexpr (BandN > 0) {
+            band_tiles = stream_k_band_tiles(BandN, avail_sms, tile_size);
+        }
+        const int output_tiles = tiled_shape_.m() * tiled_shape_.n();
+        const int partial_wave_tiles = output_tiles % avail_sms;
+        if (partial_wave_tiles == 0) {
+            sk_tiles = 0;
+            sk_blocks = 0;
+            sk_waves = 0;
+            dp_blocks = output_tiles;
+        } else {
+            sk_tiles = output_tiles < avail_sms
+                ? output_tiles
+                : avail_sms + partial_wave_tiles;
+            sk_iterations = sk_tiles * iterations_per_tile;
+            sk_blocks = sk_iterations / 2 < avail_sms
+                ? sk_iterations / 2
+                : avail_sms;
+            if (sk_blocks < 1) sk_blocks = 1;
+            sk_waves = (sk_blocks + avail_sms - 1) / avail_sms;
+            dp_blocks = output_tiles - sk_tiles;
+        }
+        sk_iterations = sk_tiles * iterations_per_tile;
+    }
+
+    CUTLASS_HOST_DEVICE
+    cutlass::gemm::GemmCoord tiled_shape() const {
+        return tiled_shape_;
+    }
+
+    CUTLASS_HOST_DEVICE
+    int iters_per_tile() const {
+        return iterations_per_tile;
+    }
+
+    CUTLASS_HOST_DEVICE
+    int sk_regions() const {
+        return sk_blocks == 0 ? 0 : 1;
+    }
+
+    CUTLASS_HOST_DEVICE
+    int sk_blocks_per_region() const {
+        return sk_blocks;
+    }
+
+    dim3 get_grid_dims() const {
+        return dim3(sk_waves * avail_sms + dp_blocks, 1, 1);
+    }
+
+    CUTLASS_DEVICE
+    int get_sk_tile_idx(int iteration) const {
+        return iteration / iterations_per_tile;
+    }
+
+    CUTLASS_DEVICE
+    cutlass::gemm::GemmCoord get_tile_offset(int tile_index) const {
+        int tile_m;
+        int tile_n;
+        if (tiled_shape_.m() < tiled_shape_.n()) {
+            tile_n = tile_index / tiled_shape_.m();
+            tile_m = tile_index - tile_n * tiled_shape_.m();
+        } else if (band_tiles > 0) {
+            const int band = tile_index / (band_tiles * tiled_shape_.m());
+            const int band_n = min(band_tiles, tiled_shape_.n() - band * band_tiles);
+            const int r = tile_index - band * band_tiles * tiled_shape_.m();
+            tile_m = r / band_n;
+            tile_n = band * band_tiles + (r - tile_m * band_n);
+        } else {
+            tile_m = tile_index / tiled_shape_.n();
+            tile_n = tile_index - tile_m * tiled_shape_.n();
+        }
+        return {tile_m, tile_n, 0};
+    }
+
+    CUTLASS_DEVICE
+    int get_block_idx() const {
+        return blockIdx.x;
+    }
+
+    CUTLASS_DEVICE
+    int get_sk_block_idx(int iteration) const {
+        const int small_iterations = sk_iterations / sk_blocks;
+        const int big_blocks = sk_iterations - small_iterations * sk_blocks;
+        const int big_iterations = small_iterations + 1;
+        if (iteration < big_blocks * big_iterations) {
+            return iteration / big_iterations;
+        }
+        return big_blocks +
+            (iteration - big_blocks * big_iterations) / small_iterations;
+    }
+
+    CUTLASS_DEVICE
+    void get_iter_extents(
+        int block_index,
+        int& iteration_begin,
+        int& iteration_end) const {
+        const int small_iterations = sk_iterations / sk_blocks;
+        const int big_blocks = sk_iterations - small_iterations * sk_blocks;
+        iteration_begin = block_index * small_iterations +
+            (block_index < big_blocks ? block_index : big_blocks);
+        iteration_end = iteration_begin + small_iterations +
+            (block_index < big_blocks ? 1 : 0);
+    }
+
+    CUTLASS_DEVICE
+    int get_first_block_idx(int tile_index, int block_index) const {
+        return tile_index < sk_tiles
+            ? get_sk_block_idx(tile_index * iterations_per_tile)
+            : block_index;
+    }
+};
+
+using ThreadblockSwizzleLeanStreamK = ThreadblockSwizzleLeanStreamKT<0>;
+
+template <typename T, typename = void>
+struct IsStreamKSwizzle : std::false_type {};
+
+template <typename T>
+struct IsStreamKSwizzle<T, std::void_t<typename T::StreamkFeature>> : std::true_type {};
+
+// A tile configuration; each kernel file instantiates every epilogue variant
+// from one list of these, so heuristic indices mean the same tile in every table.
+template <int TBM_, int TBN_, int TBK_, int WM_, int WN_, int WK_, int NumStages_,
+          int AlignmentAB_ = 16,
+          typename ThreadblockSwizzle_ = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>>
+struct TileConfig {
+    static constexpr int TBM = TBM_, TBN = TBN_, TBK = TBK_;
+    static constexpr int WM = WM_, WN = WN_, WK = WK_;
+    static constexpr int NumStages = NumStages_;
+    static constexpr int AlignmentAB = AlignmentAB_;
+    using ThreadblockSwizzle = ThreadblockSwizzle_;
+};
+
+template <typename... Configs>
+struct ConfigList {
+    static constexpr int size = sizeof...(Configs);
+};
+
+// GemmUniversal launch tail: A [M,K] row-major x B [N,K] (column-major view),
+// can_implement / workspace / initialize / run. Stream-K takes one extra argument.
+template <typename Gemm, typename Callback, typename ElementA, typename ElementB>
+bool launch_universal(const ElementA* A, const ElementB* B, const Callback& cb,
+                      int M, int N, int K, cudaStream_t stream) {
+    using Swizzle = typename Gemm::ThreadblockSwizzle;
+    cutlass::gemm::GemmCoord problem(M, N, K);
+    const auto make_args = [&]() {
+        if constexpr (IsStreamKSwizzle<Swizzle>::value) {
+            return typename Gemm::Arguments(
+                cutlass::gemm::GemmUniversalMode::kGemm, problem, 1, cb,
+                const_cast<ElementA*>(A), const_cast<ElementB*>(B), nullptr, nullptr,
+                (int64_t)M * K, (int64_t)N * K, 0, 0, K, K, 0, 0, -1);
+        } else {
+            return typename Gemm::Arguments(
+                cutlass::gemm::GemmUniversalMode::kGemm, problem, 1, cb,
+                const_cast<ElementA*>(A), const_cast<ElementB*>(B), nullptr, nullptr,
+                (int64_t)M * K, (int64_t)N * K, 0, 0, K, K, 0, 0);
+        }
+    };
+    typename Gemm::Arguments args = make_args();
+
+    Gemm gemm;
+    if (gemm.can_implement(args) != cutlass::Status::kSuccess) return false;
+    const size_t workspace_size = Gemm::get_workspace_size(args);
+    void* workspace = nullptr;
+    // Scope scratch storage to this launch. Capture owns its allocation/free nodes;
+    // an allocator interceptor sees the same sequence in eager warmup and capture.
+    if (workspace_size != 0 && cudaMallocAsync(&workspace, workspace_size, stream) != cudaSuccess) return false;
+    auto status = gemm.initialize(args, workspace, stream);
+    if (status == cutlass::Status::kSuccess) status = gemm(stream);
+    if (workspace != nullptr && cudaFreeAsync(workspace, stream) != cudaSuccess) return false;
+    return status == cutlass::Status::kSuccess;
+}
+
+}  // namespace comfy_cutlass

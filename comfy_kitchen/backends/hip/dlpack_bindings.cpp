@@ -12,6 +12,7 @@
 #include <nanobind/stl/optional.h>
 
 #include "launchers.h"
+#include "sage_attention/dense_mask.h"
 
 namespace nb = nanobind;
 
@@ -47,10 +48,20 @@ void launch_scaled_mm_fp8_kernel(const void*, const void*, void*, const void*, c
                                  const void*, int, int, int, int, int, hipStream_t);
 void launch_convrot_w4a4_gemm_kernel(const void*, const void*, void*, const void*, const void*,
                                      const void*, int, int, int, int, int, hipStream_t);
+bool launch_fp16_gemm_kernel(const void*, const void*, void*, const void*, const void*,
+                             const void*, int, int, int, hipStream_t);
+bool launch_fp16_conv3d_kernel(const void*, const void*, const void*, const void*, void*, int, int,
+                               int, int, int, int, int, int, int, int, int, int, int, int, int,
+                               int, int, int, int, hipStream_t);
 
-void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, hipStream_t);
+void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, bool, hipStream_t);
 void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
-                                         int, int, hipStream_t);
+                                         int, int, const void*, float, bool, hipStream_t);
+void launch_quantize_int8_convrot_modulated_kernel(
+    const void*, const void*, void*, void*, int, int, int, bool, hipStream_t);
+void launch_quantize_int8_convrot_rms_modulated_fused_stats_kernel(
+    const void*, const void*, const void*, void*, void*, int, int, int,
+    float, bool, hipStream_t);
 void launch_quantize_int8_tensorwise_kernel(const void*, int, void*, void*, void*, int64_t,
                                             hipStream_t);
 void launch_dequantize_int8_simple_kernel(const void*, const void*, void*, int64_t, int64_t, int,
@@ -62,17 +73,45 @@ void launch_unpack_int4_kernel(const void*, void*, int64_t, hipStream_t);
 int convrot_max_k_host(int);
 int convrot_int8_needs_spill_host(int, int, int);
 
-void launch_quantize_w4a8_convrot_kernel(const void*, const void*, void*, void*, void*, int64_t,
-                                         int64_t, int, bool, uint64_t, hipStream_t);
-int w4a8_requant_max_k_kernel();
+void launch_quantize_wxa8_convrot_fused_kernel(const void*, const void*, void*, void*, void*,
+                                               int64_t, int64_t, int, int, int, bool, uint64_t,
+                                               hipStream_t);
+bool launch_w4a8_codebook_gemv_kernel(const void* xq, const void* qw, const void* s_rel,
+                                      const void* codebook, const void* s_channel, const void* xs,
+                                      const void* bias, int bias_code, void* out, int out_code,
+                                      int M, int N, int K, int group_size, int bits,
+                                      hipStream_t stream);
+bool launch_gated_delta_decode_fused_kernel(
+    const void* mixed_qkv, const void* x, const void* w_a, const void* w_b, const void* dt_bias,
+    const void* g_decay, void* state, void* out, void* snapshots, const void* z,
+    const void* norm_w, float eps, int B, int Hv, int Hk, int S, int DK, int DV, int C, int Hd,
+    int key_dim, float scale, int dtype_code, hipStream_t stream);
+bool launch_deltanet_conv_step_kernel(const void* proj, void* conv_state, const void* conv_w,
+                                      const void* conv_b, void* conv_out, void* conv_snaps, int B,
+                                      int C, int S, int KS, int dtype_code, hipStream_t stream);
+bool launch_gated_delta_decode_deferred_kernel(
+    const void* x, const void* w_a, const void* w_b, const void* dt_bias, const void* g_decay,
+    const void* qkv_buf, void* gates_buf, void* sumsq_buf, const void* ctl, void* state,
+    void* out, const void* z, const void* norm_w, float eps, int B, int Hv, int Hk, int S, int DK,
+    int DV, int C, int Hd, int key_dim, float scale, int dtype_code, hipStream_t stream);
+bool launch_deltanet_conv_deferred_kernel(const void* proj, void* proj_buf, void* conv_state,
+                                          const void* conv_w, const void* conv_b, void* qkv_buf,
+                                          const void* ctl, int B, int C, int S, int KS,
+                                          int dtype_code, hipStream_t stream);
+int wxa8_requant_max_k_kernel(int);
 void launch_na3d_kernel(const void*, const void*, const void*, void*, int, int, int, int, int, int,
                         int, int, int, int, int, int, float, int, hipStream_t);
 
 void launch_sage_quant_qk_int8(const void*, void*, void*, const void*, void*, void*, void*, int,
                                int, int, int, int, int, int, int, int64_t, int64_t, int64_t,
-                               int64_t, int64_t, int64_t, int, int, hipStream_t);
+                               int64_t, int64_t, int64_t, int, int, hipStream_t,
+                               const SageDenseMask16*);
 void launch_sage_quant_v_int8(const void*, void*, void*, int, int, int, int, int, int64_t, int64_t,
                               int64_t, int, hipStream_t);
+void launch_sage_prepare_key_mask(const void*, float*, int, int, int, int64_t, int64_t,
+                                  int64_t, int, int, hipStream_t);
+void launch_sage_prepare_dense_mask(const void*, void*, int, int, int, int, int64_t, int64_t,
+                                    int64_t, int64_t, int, int, hipStream_t);
 void launch_sage_int8_attn(const void*, const void*, const void*, void*, const void*, const void*,
                            const void*, const void*, int64_t, int64_t, int64_t, int64_t, int, int,
                            int, int, int, int, int, int, int, int, int64_t, int64_t, int64_t,
@@ -81,6 +120,11 @@ void launch_sage_int8_attn(const void*, const void*, const void*, void*, const v
 
 void launch_adaln_kernel(const void*, const void*, const void*, void*, int, int, int, int, float,
                          int, int, int, bool, hipStream_t);
+void launch_group_norm_silu_pad3d(const void*, const void*, const void*, void*, void*,
+                                  const void*, int, int, int, int, int, int, float, int, int, int,
+                                  int, int, bool, bool, int64_t, int, hipStream_t);
+void launch_group_norm_stats3d(const void*, void*, void*, int, int, int, int, int, int, float,
+                               int64_t, int, hipStream_t);
 void launch_gemv_awq_kernel(const void*, const void*, const void*, const void*, const void*, void*,
                             int, int, int, int, int, int, int, int, hipStream_t);
 void launch_svdquant_lora_down_kernel(const void*, const void*, void*, int, int, int, int, int,
@@ -99,6 +143,8 @@ void launch_rms_rope_kernel(const void*, const void*, const void*, const void*, 
                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int, int,
                             int, float, bool, hipStream_t);
+int64_t memmove_flag_count(int64_t);
+void launch_memmove(void*, const void*, int64_t, void*, hipStream_t);
 }
 
 static void check_hip_launch() {
@@ -159,6 +205,19 @@ static void require_dtype(const nb::ndarray<>& t, int lo, int hi, const char* fn
     const int code = map_dtype_to_code(t.dtype());
     if (code < lo || code > hi) {
         throw std::runtime_error(std::string(fn) + ": " + name + " has an unsupported dtype");
+    }
+}
+
+// Kernels that synthesize strides from extents instead of reading tensor strides
+// require packed row-major operands, including views passed directly to _C.
+static void require_packed_contiguous(const nb::ndarray<>& t, const char* fn, const char* name) {
+    int64_t expected = 1;
+    for (int axis = static_cast<int>(t.ndim()) - 1; axis >= 0; --axis) {
+        if (t.shape(axis) != 1 && t.stride(axis) != expected) {
+            throw std::runtime_error(std::string(fn) + ": " + name +
+                                     " must be contiguous in the packed layout");
+        }
+        expected *= static_cast<int64_t>(t.shape(axis));
     }
 }
 
@@ -339,6 +398,85 @@ void int8_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> 
     check_hip_launch();
 }
 
+void rms_gated_residual_bf16(
+    nb::ndarray<> activation, nb::ndarray<> norm_weight,
+    nb::ndarray<> residual, nb::ndarray<> gate, nb::ndarray<> output,
+    int rows, int width, float eps, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "rms_gated_residual_bf16";
+    require_nonneg(rows, kFn, "rows");
+    if (width <= 0 || width % 4 != 0) {
+        throw std::runtime_error(
+            std::string(kFn) + ": width must be positive and divisible by 4");
+    }
+    require_dtype(activation, 2, 2, kFn, "activation");
+    require_dtype(norm_weight, 2, 2, kFn, "norm_weight");
+    require_dtype(residual, 2, 2, kFn, "residual");
+    require_dtype(gate, 2, 2, kFn, "gate");
+    require_dtype(output, 2, 2, kFn, "output");
+    const int64_t numel = static_cast<int64_t>(rows) * width;
+    require_len(activation, numel, kFn, "activation");
+    require_len(norm_weight, width, kFn, "norm_weight");
+    require_len(residual, numel, kFn, "residual");
+    require_len(gate, width, kFn, "gate");
+    require_len(output, numel, kFn, "output");
+    require_packed_contiguous(activation, kFn, "activation");
+    require_packed_contiguous(norm_weight, kFn, "norm_weight");
+    require_packed_contiguous(residual, kFn, "residual");
+    require_packed_contiguous(gate, kFn, "gate");
+    require_packed_contiguous(output, kFn, "output");
+    const nb::ndarray<>* vector_operands[] = {
+        &activation, &norm_weight, &residual, &gate, &output};
+    for (const nb::ndarray<>* operand : vector_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
+
+    launch_rms_gated_residual_bf16_kernel(
+        activation.data(), norm_weight.data(), residual.data(), gate.data(),
+        output.data(), rows, width, eps,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void int8_gemm_a_tiled128(
+    nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c,
+    nb::ndarray<> scale_a, nb::ndarray<> scale_b, int scale_b_stride,
+    OptArray bias, int M, int N, int K, int out_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "int8_gemm_a_tiled128";
+    if (scale_b_stride != 0 && scale_b_stride != 1) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": scale_b_stride must be 0 or 1");
+    }
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    if (N <= 0 || K <= 0 || K % 128 != 0) {
+        throw std::runtime_error(
+            std::string(kFn) +
+            ": requires positive N/K and K divisible by 128");
+    }
+    require_dtype(a, 4, 4, kFn, "a");
+    require_dtype(b, 4, 4, kFn, "b");
+    require_dtype(c, 0, 2, kFn, "c");
+    require_out_matches(c, out_code, kFn);
+    const int64_t padded_m = (static_cast<int64_t>(M) + 127) / 128 * 128;
+    require_len(a, padded_m * K, kFn, "a");
+    require_len(b, static_cast<int64_t>(N) * K, kFn, "b");
+    require_len(c, static_cast<int64_t>(M) * N, kFn, "c");
+    require_scale_len(scale_a, static_cast<size_t>(M), kFn, "scale_a");
+    require_scale_len(scale_b, scale_b_stride == 1 ? static_cast<size_t>(N) : 1,
+                      kFn, "scale_b");
+    require_bias(bias, N, kFn);
+
+    launch_int8_gemm_a_tiled128_kernel(
+        a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(),
+        scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, N,
+        out_code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
 void convrot_w4a4_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> x_scale,
                        nb::ndarray<> w_scale, OptArray bias, int M, int N, int K, int out_code,
                        uintptr_t stream_ptr) {
@@ -368,6 +506,92 @@ void convrot_w4a4_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::nd
     check_hip_launch();
 }
 
+static void require_fp16(const nb::ndarray<>& t, const char* fn, const char* name) {
+    require_dtype(t, 1, 1, fn, name);
+}
+
+// D = A @ B^T + bias, or resid + rscale * (that). Every operand is fp16; false means
+// the caller serves the shape.
+bool fp16_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> d, OptArray bias, OptArray rscale,
+               OptArray resid, int M, int N, int K, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "fp16_gemm";
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_fp16(a, kFn, "a");
+    require_fp16(b, kFn, "b");
+    require_fp16(d, kFn, "d");
+    require_len(a, static_cast<int64_t>(M) * K, kFn, "a");
+    require_len(b, static_cast<int64_t>(N) * K, kFn, "b");
+    require_len(d, static_cast<int64_t>(M) * N, kFn, "d");
+    if (bias.has_value()) {
+        require_fp16(*bias, kFn, "bias");
+        require_len(*bias, N, kFn, "bias");
+    }
+    if (rscale.has_value() != resid.has_value()) {
+        throw std::runtime_error(std::string(kFn) + ": rscale and resid must be given together");
+    }
+    if (resid.has_value()) {
+        require_fp16(*rscale, kFn, "rscale");
+        require_fp16(*resid, kFn, "resid");
+        require_len(*rscale, N, kFn, "rscale");
+        require_len(*resid, static_cast<int64_t>(M) * N, kFn, "resid");
+    }
+    const bool served = launch_fp16_gemm_kernel(
+        a.data(), b.data(), d.data(), opt_data(bias), opt_data(rscale), opt_data(resid), M, N, K,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return served;
+}
+
+// NDHWC conv3d, zero padding, x [N, D, H, W, C] and w [K, T, R, S, C] fp16 in that
+// memory order; out and resid are [N, Z, P, Q, K]. false means the caller serves it.
+bool fp16_conv3d(nb::ndarray<> x, nb::ndarray<> w, OptArray bias, OptArray resid,
+                 nb::ndarray<> out, int N, int D, int H, int W, int C, int K, int T, int R, int S,
+                 int sd, int sh, int sw, uintptr_t stream_ptr, int64_t xs_w, int64_t xs_h,
+                 int64_t xs_d, int64_t xs_n) {
+    constexpr const char* kFn = "fp16_conv3d";
+    for (int64_t st : {xs_w, xs_h, xs_d, xs_n}) {
+        if (st < 0 || st > INT32_MAX) {
+            throw std::runtime_error(std::string(kFn) + ": stride out of range");
+        }
+    }
+    require_nonneg(N, kFn, "N");
+    require_positive(C, kFn, "C");
+    require_nonneg(K, kFn, "K");
+    require_positive(T, kFn, "T");
+    require_positive(R, kFn, "R");
+    require_positive(S, kFn, "S");
+    require_positive(sd, kFn, "sd");
+    require_positive(sh, kFn, "sh");
+    require_positive(sw, kFn, "sw");
+    if (D < T || H < R || W < S) {
+        throw std::runtime_error(std::string(kFn) + ": input smaller than the filter");
+    }
+    const int Z = (D - T) / sd + 1, P = (H - R) / sh + 1, Q = (W - S) / sw + 1;
+    const int64_t outs = static_cast<int64_t>(N) * Z * P * Q * K;
+    require_fp16(x, kFn, "x");
+    require_fp16(w, kFn, "w");
+    require_fp16(out, kFn, "out");
+    require_len(x, static_cast<int64_t>(N) * D * H * W * C, kFn, "x");
+    require_len(w, static_cast<int64_t>(K) * T * R * S * C, kFn, "w");
+    require_len(out, outs, kFn, "out");
+    if (bias.has_value()) {
+        require_fp16(*bias, kFn, "bias");
+        require_len(*bias, K, kFn, "bias");
+    }
+    if (resid.has_value()) {
+        require_fp16(*resid, kFn, "resid");
+        require_len(*resid, outs, kFn, "resid");
+    }
+    const bool served = launch_fp16_conv3d_kernel(
+        x.data(), w.data(), opt_data(bias), opt_data(resid), out.data(), N, D, H, W, C, K, T, R, S,
+        Z, P, Q, sd, sh, sw, static_cast<int>(xs_w), static_cast<int>(xs_h),
+        static_cast<int>(xs_d), static_cast<int>(xs_n), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return served;
+}
+
 // The int4 quantizers pack two nibbles per byte, so the packed row is K / 2 bytes
 // and an odd K would round it down and drop the tail.
 static void require_convrot_group(int k, int group_size, const char* fn) {
@@ -385,38 +609,66 @@ static void require_convrot_group(int k, int group_size, const char* fn) {
     }
 }
 
+void memmove_bytes(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::rocm> dst,
+                   nb::ndarray<uint8_t, nb::ndim<1>, nb::device::rocm> src,
+                   nb::ndarray<int32_t, nb::ndim<1>, nb::device::rocm> flags, uintptr_t stream_ptr) {
+    const int64_t nbytes = dst.size();
+    if (src.size() != static_cast<size_t>(nbytes) || nbytes % 16 || dst.stride(0) != 1 || src.stride(0) != 1
+            || reinterpret_cast<uintptr_t>(dst.data()) % 16 || reinterpret_cast<uintptr_t>(src.data()) % 16
+            || flags.stride(0) != 1 || flags.size() < static_cast<size_t>(memmove_flag_count(nbytes)))
+        throw std::runtime_error("memmove: ranges must be equal, 16-byte aligned multiples of 16 bytes with enough flags");
+    launch_memmove(dst.data(), src.data(), nbytes, flags.data(), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
 void quantize_int8_rowwise(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales, int M, int K,
-                           uintptr_t stream_ptr) {
+                           uintptr_t stream_ptr, bool tiled_output = false) {
     constexpr const char* kFn = "quantize_int8_rowwise";
     require_nonneg(M, kFn, "M");
     require_nonneg(K, kFn, "K");
     require_dtype(x, 0, 2, kFn, "x");
     require_dtype(q, 4, 4, kFn, "q");
     require_len(x, static_cast<int64_t>(M) * K, kFn, "x");
-    require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
+    const int64_t q_rows = tiled_output ? (static_cast<int64_t>(M) + 127) / 128 * 128 : M;
+    require_len(q, q_rows * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
 
     launch_quantize_int8_rowwise_kernel(x.data(), map_dtype_to_code(x.dtype()), q.data(),
-                                        scales.data(), M, K,
+                                        scales.data(), M, K, tiled_output,
                                         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
-// act_code folds an elementwise activation into the rotation's load.
+// act_code folds an activation into the rotation's load. rms_norm (code 3) reads a
+// K-element act_weight in x's dtype and act_eps.
 void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales,
                            OptArray spill_rotated, OptArray spill_partials, int M, int K,
-                           int group_size, int act_code, uintptr_t stream_ptr) {
+                           int group_size, int act_code, uintptr_t stream_ptr,
+                           OptArray act_weight = std::nullopt, float act_eps = 0.0f,
+                           bool tiled_output = false) {
     constexpr const char* kFn = "quantize_int8_convrot";
     require_nonneg(M, kFn, "M");
     require_convrot_group(K, group_size, kFn);
     require_dtype(x, 0, 2, kFn, "x");
     require_dtype(q, 4, 4, kFn, "q");
-    // K is the activated (written) width; swiglu (code 2, see INPUT_ACT_TO_CODE)
-    // reads a [gate | up] row twice as wide. The launcher rejects unknown codes.
-    const int64_t in_width = act_code == 2 ? 2 : 1;
+    // K is the activated (written) width; swiglu and situ (codes 2 and 4) read a row
+    // twice as wide. The launcher rejects unknown codes.
+    const int64_t in_width = (act_code == 2 || act_code == 4) ? 2 : 1;
     require_len(x, static_cast<int64_t>(M) * K * in_width, kFn, "x");
-    require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
+    const int64_t q_rows = tiled_output ? (static_cast<int64_t>(M) + 127) / 128 * 128 : M;
+    require_len(q, q_rows * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(q, kFn, "q");
+    require_packed_contiguous(scales, kFn, "scales");
+    // scales is written one float per row, so a row slice of it needs no alignment.
+    const nb::ndarray<>* aligned_operands[] = {&x, &q};
+    for (const nb::ndarray<>* operand : aligned_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
 
     void* spill_rotated_ptr = nullptr;
     void* spill_partials_ptr = nullptr;
@@ -426,18 +678,105 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
         if (map_dtype_to_code(spill_rotated->dtype()) != map_dtype_to_code(x.dtype())) {
             throw std::runtime_error(std::string(kFn) + ": spill_rotated dtype must match x");
         }
+        require_packed_contiguous(*spill_rotated, kFn, "spill_rotated");
         spill_rotated_ptr = spill_rotated->data();
     }
     if (spill_partials.has_value()) {
         require_dtype(*spill_partials, 0, 0, kFn, "spill_partials");
         require_len(*spill_partials, static_cast<int64_t>(M) * (K / 256), kFn, "spill_partials");
+        require_packed_contiguous(*spill_partials, kFn, "spill_partials");
         spill_partials_ptr = spill_partials->data();
+    }
+    if (act_code == 3) {
+        if (!act_weight.has_value()) {
+            throw std::runtime_error(std::string(kFn) + ": rms_norm requires act_weight");
+        }
+        if (map_dtype_to_code(act_weight->dtype()) != map_dtype_to_code(x.dtype())) {
+            throw std::runtime_error(std::string(kFn) + ": act_weight dtype must match x");
+        }
+        require_len(*act_weight, K, kFn, "act_weight");
     }
 
     launch_quantize_int8_convrot_kernel(x.data(), map_dtype_to_code(x.dtype()), q.data(),
                                         scales.data(), spill_rotated_ptr, spill_partials_ptr, M, K,
                                         group_size, act_code,
+                                        act_code == 3 ? act_weight->data() : nullptr, act_eps,
+                                        tiled_output,
                                         reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void quantize_int8_convrot_modulated(
+    nb::ndarray<> x, nb::ndarray<> modulation_scale, nb::ndarray<> q,
+    nb::ndarray<> scales, int M, int K, int group_size,
+    uintptr_t stream_ptr, bool tiled_output = false) {
+    constexpr const char* kFn = "quantize_int8_convrot_modulated";
+    require_nonneg(M, kFn, "M");
+    require_convrot_group(K, group_size, kFn);
+    require_dtype(x, 2, 2, kFn, "x");
+    require_dtype(modulation_scale, 2, 2, kFn, "modulation_scale");
+    require_dtype(q, 4, 4, kFn, "q");
+    require_len(x, static_cast<int64_t>(M) * K, kFn, "x");
+    require_len(modulation_scale, static_cast<int64_t>(K), kFn,
+                "modulation_scale");
+    const int64_t q_rows = tiled_output ? (static_cast<int64_t>(M) + 127) / 128 * 128 : M;
+    require_len(q, q_rows * K, kFn, "q");
+    require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(modulation_scale, kFn, "modulation_scale");
+    require_packed_contiguous(q, kFn, "q");
+    require_packed_contiguous(scales, kFn, "scales");
+    const nb::ndarray<>* aligned_operands[] = {
+        &x, &modulation_scale, &q, &scales};
+    for (const nb::ndarray<>* operand : aligned_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
+
+    launch_quantize_int8_convrot_modulated_kernel(
+        x.data(), modulation_scale.data(), q.data(), scales.data(),
+        M, K, group_size, tiled_output, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void quantize_int8_convrot_rms_modulated_fused_stats(
+    nb::ndarray<> x, nb::ndarray<> norm_weight,
+    nb::ndarray<> modulation_scale, nb::ndarray<> q, nb::ndarray<> scales,
+    int M, int K, int group_size, float eps, uintptr_t stream_ptr,
+    bool tiled_output = false) {
+    constexpr const char* kFn =
+        "quantize_int8_convrot_rms_modulated_fused_stats";
+    require_nonneg(M, kFn, "M");
+    require_convrot_group(K, group_size, kFn);
+    require_dtype(x, 2, 2, kFn, "x");
+    require_dtype(norm_weight, 2, 2, kFn, "norm_weight");
+    require_dtype(modulation_scale, 2, 2, kFn, "modulation_scale");
+    require_dtype(q, 4, 4, kFn, "q");
+    require_len(x, static_cast<int64_t>(M) * K, kFn, "x");
+    require_len(norm_weight, K, kFn, "norm_weight");
+    require_len(modulation_scale, K, kFn, "modulation_scale");
+    const int64_t q_rows = tiled_output ? (static_cast<int64_t>(M) + 127) / 128 * 128 : M;
+    require_len(q, q_rows * K, kFn, "q");
+    require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(norm_weight, kFn, "norm_weight");
+    require_packed_contiguous(modulation_scale, kFn, "modulation_scale");
+    require_packed_contiguous(q, kFn, "q");
+    require_packed_contiguous(scales, kFn, "scales");
+    const nb::ndarray<>* aligned_operands[] = {
+        &x, &norm_weight, &modulation_scale, &q, &scales};
+    for (const nb::ndarray<>* operand : aligned_operands) {
+        if (reinterpret_cast<uintptr_t>(operand->data()) % 8 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": all operands must be 8-byte aligned");
+        }
+    }
+    launch_quantize_int8_convrot_rms_modulated_fused_stats_kernel(
+        x.data(), norm_weight.data(), modulation_scale.data(), q.data(),
+        scales.data(), M, K, group_size, eps, tiled_output,
+        reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -567,8 +906,50 @@ void unpack_int4(nb::ndarray<> q, nb::ndarray<> out, int64_t nbytes, uintptr_t s
 
 // scale_code names the s_rel storage: 0 float32, 5 e4m3 (crossing as uint8, as
 // elsewhere). codebook is optional; without it the levels are uniform.
-// Fused W4A8 requantize (group_size 16): a rotated weight [N, K] becomes packed
-// int4 [N, K/2], raw e4m3 s_rel [N, K/16] and f32 s_channel [N] in one launch.
+// Fused ConvRot + W4A8/W6A8 requantize from the raw weight [N, K]: packed codes
+// [N, K*bits/8], raw e4m3 s_rel [N, K/group_size] and f32 s_channel [N] in one launch.
+// codebook is 16 floats at 4 bits and ignored at 6. The rotation reads 16-byte
+// vectors, so the weight has to start 16-byte aligned.
+void quantize_wxa8_convrot_fused(nb::ndarray<> weight, nb::ndarray<> codebook,
+                                 nb::ndarray<> packed, nb::ndarray<> s_rel,
+                                 nb::ndarray<> s_channel, int N, int K, int bits, int group_size,
+                                 bool stochastic, uint64_t seed, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "quantize_wxa8_convrot_fused";
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    if (!((bits == 4 && group_size == 16) ||
+          (bits == 6 && (group_size == 16 || group_size == 32 || group_size == 64)))) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": bits/group_size must be 4/16 or 6/{16,32,64}");
+    }
+    if (K % 256 != 0 || K % group_size != 0) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": K must be a multiple of 256 and of group_size");
+    }
+    require_dtype(weight, 1, 2, kFn, "weight");
+    require_dtype(packed, 4, 4, kFn, "packed");
+    require_dtype(s_rel, 3, 3, kFn, "s_rel");
+    require_scale_len(s_channel, static_cast<size_t>(N), kFn, "s_channel");
+    if (bits == 4) {
+        require_scale_len(codebook, 16, kFn, "codebook");
+    }
+    require_len(weight, static_cast<int64_t>(N) * K, kFn, "weight");
+    require_len(packed, static_cast<int64_t>(N) * K * bits / 8, kFn, "packed");
+    require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
+    if (reinterpret_cast<uintptr_t>(weight.data()) % 16 != 0) {
+        throw std::runtime_error(std::string(kFn) + ": weight must be 16-byte aligned");
+    }
+
+    launch_quantize_wxa8_convrot_fused_kernel(
+        weight.data(), bits == 4 ? codebook.data() : nullptr, packed.data(), s_rel.data(),
+        s_channel.data(), N, K, bits, group_size, map_dtype_to_code(weight.dtype()), stochastic,
+        seed, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// Staged W4A8 requantize of an already rotated [N, K] weight (float32, float16 or
+// bfloat16): packed int4 codes [N, K/2], raw e4m3 s_rel [N, K/16], f32 s_channel [N].
+// Takes what the fused kernel declines: fp32 weights and rows too wide for its LDS row.
 void quantize_w4a8_convrot(nb::ndarray<> rotated, nb::ndarray<> codebook, nb::ndarray<> packed,
                            nb::ndarray<> s_rel, nb::ndarray<> s_channel, int N, int K,
                            bool stochastic, uint64_t seed, uintptr_t stream_ptr) {
@@ -594,6 +975,36 @@ void quantize_w4a8_convrot(nb::ndarray<> rotated, nb::ndarray<> codebook, nb::nd
     check_hip_launch();
 }
 
+// Code width implied by the packed [N, K * bits / 8] row: K/2 bytes at 4 bits,
+// 3K/4 at 6. The length checks only bound the buffer from below, so the width is
+// read from the shape rather than inferred from the element count. 6-bit storage
+// is uniform, needs K % 32 so rows and the high plane stay aligned, and a group a
+// multiple of 16 so one scale covers each decode vector.
+static int w4a8_bits(const nb::ndarray<>& qdata, int N, int K, int group_size,
+                     bool has_codebook, const char* fn) {
+    if (qdata.ndim() != 2 || static_cast<int64_t>(qdata.shape(0)) != N) {
+        throw std::runtime_error(std::string(fn) + ": qdata must be [N, K * bits / 8]");
+    }
+    const int64_t cols = static_cast<int64_t>(qdata.shape(1));
+    if (K == 0) {
+        return 4;
+    }
+    const int64_t bits = cols * 8 / K;
+    if ((bits != 4 && bits != 6) || cols * 8 != static_cast<int64_t>(K) * bits) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": packed width must be K/2 (4-bit) or 3K/4 (6-bit)");
+    }
+    if (bits == 6 && (K % 32 != 0 || group_size < 16 || group_size % 16 != 0)) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": 6-bit storage needs K % 32 == 0 and group_size a "
+                                 "multiple of 16");
+    }
+    if (bits == 6 && has_codebook) {
+        throw std::runtime_error(std::string(fn) + ": 6-bit storage has no codebook");
+    }
+    return static_cast<int>(bits);
+}
+
 void dequant_int4_grouped_to_int8(nb::ndarray<> qdata, nb::ndarray<> s_rel, int scale_code,
                                   OptArray codebook, nb::ndarray<> out, int N, int K,
                                   int group_size, uintptr_t stream_ptr) {
@@ -610,7 +1021,8 @@ void dequant_int4_grouped_to_int8(nb::ndarray<> qdata, nb::ndarray<> s_rel, int 
     require_dtype(qdata, 4, 4, kFn, "qdata");
     require_dtype(out, 4, 4, kFn, "out");
     require_dtype(s_rel, scale_code == 0 ? 0 : 3, scale_code == 0 ? 0 : 3, kFn, "s_rel");
-    require_len(qdata, static_cast<int64_t>(N) * (K / 2), kFn, "qdata");
+    const int bits = w4a8_bits(qdata, N, K, group_size, codebook.has_value(), kFn);
+    require_len(qdata, static_cast<int64_t>(N) * K * bits / 8, kFn, "qdata");
     require_len(out, static_cast<int64_t>(N) * K, kFn, "out");
     require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
     if (codebook.has_value()) {
@@ -619,7 +1031,7 @@ void dequant_int4_grouped_to_int8(nb::ndarray<> qdata, nb::ndarray<> s_rel, int 
 
     launch_dequant_int4_grouped_to_int8_kernel(
         qdata.data(), s_rel.data(), scale_code, opt_data(codebook), out.data(), N, K, group_size,
-        reinterpret_cast<hipStream_t>(stream_ptr));
+        bits, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -650,7 +1062,8 @@ void w4a8_int8_gemm_chunked(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<>
     require_out_matches(out, out_code, kFn);
     require_dtype(s_rel, scale_code == 0 ? 0 : 3, scale_code == 0 ? 0 : 3, kFn, "s_rel");
     require_len(xq, static_cast<int64_t>(M) * K, kFn, "xq");
-    require_len(qdata, static_cast<int64_t>(N) * (K / 2), kFn, "qdata");
+    const int bits = w4a8_bits(qdata, N, K, group_size, codebook.has_value(), kFn);
+    require_len(qdata, static_cast<int64_t>(N) * K * bits / 8, kFn, "qdata");
     require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
     require_len(out, static_cast<int64_t>(M) * N, kFn, "out");
     // Every chunk decodes into the same scratch, so it has to hold the widest one.
@@ -666,8 +1079,51 @@ void w4a8_int8_gemm_chunked(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<>
     launch_w4a8_int8_gemm_chunked_kernel(
         xq.data(), qdata.data(), s_rel.data(), scale_code, opt_data(codebook), s_channel.data(),
         xs.data(), opt_data(bias), opt_code(bias), workspace.data(), out.data(), M, N, K,
-        group_size, chunk_cols, out_code, reinterpret_cast<hipStream_t>(stream_ptr));
+        group_size, chunk_cols, bits, out_code, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
+}
+
+// Decode W4A8: one wave per output column dequantizes the INT4 weight in registers
+// and dots it against the INT8 activation, with no workspace in between. Returns
+// false when the shape is outside its envelope so the caller runs the chunked
+// path instead; the two agree bit for bit where both apply.
+bool w4a8_codebook_gemv(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<> s_rel,
+                        OptArray codebook, nb::ndarray<> s_channel, nb::ndarray<> xs,
+                        OptArray bias, nb::ndarray<> out, int M, int N, int K, int group_size,
+                        int out_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "w4a8_codebook_gemv";
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_positive(group_size, kFn, "group_size");
+    if (K % group_size != 0) {
+        throw std::runtime_error(std::string(kFn) + ": group_size must divide K");
+    }
+    require_dtype(xq, 4, 4, kFn, "xq");
+    require_dtype(qdata, 4, 4, kFn, "qdata");
+    require_dtype(out, 0, 2, kFn, "out");
+    require_out_matches(out, out_code, kFn);
+    // The kernel reads the group scale as raw e4m3 bytes; an fp32 s_rel stays on
+    // the chunked path, which dispatches on scale_code.
+    require_dtype(s_rel, 3, 3, kFn, "s_rel");
+    require_len(xq, static_cast<int64_t>(M) * K, kFn, "xq");
+    const int bits = w4a8_bits(qdata, N, K, group_size, codebook.has_value(), kFn);
+    require_len(qdata, static_cast<int64_t>(N) * K * bits / 8, kFn, "qdata");
+    require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
+    require_len(out, static_cast<int64_t>(M) * N, kFn, "out");
+    require_scale_len(s_channel, static_cast<size_t>(N), kFn, "s_channel");
+    require_scale_len(xs, static_cast<size_t>(M), kFn, "xs");
+    require_bias(bias, N, kFn);
+    if (codebook.has_value()) {
+        require_scale_len(*codebook, 16, kFn, "codebook");
+    }
+
+    const bool used = launch_w4a8_codebook_gemv_kernel(
+        xq.data(), qdata.data(), s_rel.data(), opt_data(codebook), s_channel.data(), xs.data(),
+        opt_data(bias), opt_code(bias), out.data(), out_code, M, N, K, group_size, bits,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return used;
 }
 
 // subtract_mean selects LayerNorm (adaln) or RMSNorm (rms_adaln) statistics.
@@ -701,6 +1157,118 @@ static void adaln_impl(const char* kFn, nb::ndarray<>& x, nb::ndarray<>& scale,
                         shift_group, eps, map_dtype_to_code(x.dtype()),
                         map_dtype_to_code(scale.dtype()), map_dtype_to_code(shift.dtype()),
                         subtract_mean, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// x is read with image rows row_stride elements apart, so a row-interleaved view spans
+// more storage than its element count; that span is measured from x's own strides.
+static void require_row_strided(const nb::ndarray<>& x, int64_t frames, int H, int W, int C,
+                                int64_t row_stride, const char* fn) {
+    if (row_stride < static_cast<int64_t>(W) * C || row_stride % 8 != 0) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": row stride must be a multiple of 8 and at least W * C");
+    }
+    require_len(x, frames * H * W * C, fn, "x");
+    const int64_t rows = frames * H;
+    if (rows == 0 || W == 0) {
+        return;
+    }
+    int64_t span = 1;
+    for (size_t i = 0; i < x.ndim(); ++i) {
+        if (x.shape(i) > 1) {
+            span += (static_cast<int64_t>(x.shape(i)) - 1) * x.stride(i);
+        }
+    }
+    if (span < (rows - 1) * row_stride + static_cast<int64_t>(W) * C) {
+        throw std::runtime_error(std::string(fn) + ": x does not span its rows at row_stride");
+    }
+}
+
+// Per-frame GroupNorm + SiLU + causal conv padding over NDHWC storage. weight and
+// bias absent -> pad only, and the workspace is not read. stats given -> those per-frame
+// (mean, rstd) normalize x, which may be a row strip of their frame, and the workspace is
+// not read either.
+void group_norm_silu_pad3d(nb::ndarray<> x, OptArray weight, OptArray bias, nb::ndarray<> out,
+                           OptArray workspace, OptArray stats, int B, int C, int T, int H, int W,
+                           int num_groups, float eps, int left, int right, int top, int bottom,
+                           int front, bool silu, bool zero_pad, int64_t row_stride,
+                           uintptr_t stream_ptr) {
+    constexpr const char* kFn = "group_norm_silu_pad3d";
+    require_nonneg(B, kFn, "B");
+    require_positive(C, kFn, "C");
+    require_nonneg(T, kFn, "T");
+    require_nonneg(H, kFn, "H");
+    require_nonneg(W, kFn, "W");
+    require_nonneg(left, kFn, "left");
+    require_nonneg(right, kFn, "right");
+    require_nonneg(top, kFn, "top");
+    require_nonneg(bottom, kFn, "bottom");
+    require_nonneg(front, kFn, "front");
+    const int code = map_dtype_to_code(x.dtype());
+    if (code != 1 && code != 2) {
+        throw std::runtime_error(std::string(kFn) + ": x must be float16 or bfloat16");
+    }
+    require_dtype(out, code, code, kFn, "out");
+    require_row_strided(x, static_cast<int64_t>(B) * T, H, W, C, row_stride, kFn);
+    require_len(out,
+                static_cast<int64_t>(B) * C * (T + static_cast<int64_t>(front)) *
+                    (H + static_cast<int64_t>(top) + bottom) *
+                    (W + static_cast<int64_t>(left) + right),
+                kFn, "out");
+    if (weight.has_value() != bias.has_value()) {
+        throw std::runtime_error(std::string(kFn) + ": weight and bias must be given together");
+    }
+    if (weight.has_value()) {
+        require_positive(num_groups, kFn, "num_groups");
+        require_dtype(*weight, code, code, kFn, "weight");
+        require_dtype(*bias, code, code, kFn, "bias");
+        require_len(*weight, C, kFn, "weight");
+        require_len(*bias, C, kFn, "bias");
+        if (stats.has_value()) {
+            require_dtype(*stats, 0, 0, kFn, "stats");
+            require_len(*stats, 2 * static_cast<int64_t>(B) * T * num_groups, kFn, "stats");
+        } else {
+            if (!workspace.has_value()) {
+                throw std::runtime_error(std::string(kFn) + ": the norm needs a workspace");
+            }
+            require_dtype(*workspace, 0, 0, kFn, "workspace");
+            const int64_t chunks = (static_cast<int64_t>(H) * W + 1023) / 1024;
+            require_len(*workspace, 2 * static_cast<int64_t>(B) * T * (chunks * C + num_groups),
+                        kFn, "workspace");
+        }
+    }
+    const bool own_stats = weight.has_value() && !stats.has_value();
+    launch_group_norm_silu_pad3d(x.data(), opt_data(weight), opt_data(bias), out.data(),
+                                 own_stats ? workspace->data() : nullptr,
+                                 weight.has_value() ? opt_data(stats) : nullptr, B, C, T, H, W,
+                                 num_groups, eps, left, right, top, bottom, front, silu, zero_pad,
+                                 row_stride, code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// Per-frame GroupNorm (mean, rstd) of NDHWC x into stats [B*T*num_groups] float2.
+void group_norm_stats3d(nb::ndarray<> x, nb::ndarray<> workspace, nb::ndarray<> stats, int B,
+                        int C, int T, int H, int W, int num_groups, float eps, int64_t row_stride,
+                        uintptr_t stream_ptr) {
+    constexpr const char* kFn = "group_norm_stats3d";
+    require_nonneg(B, kFn, "B");
+    require_positive(C, kFn, "C");
+    require_nonneg(T, kFn, "T");
+    require_positive(H, kFn, "H");
+    require_positive(W, kFn, "W");
+    require_positive(num_groups, kFn, "num_groups");
+    const int code = map_dtype_to_code(x.dtype());
+    if (code != 1 && code != 2) {
+        throw std::runtime_error(std::string(kFn) + ": x must be float16 or bfloat16");
+    }
+    require_row_strided(x, static_cast<int64_t>(B) * T, H, W, C, row_stride, kFn);
+    require_dtype(workspace, 0, 0, kFn, "workspace");
+    require_dtype(stats, 0, 0, kFn, "stats");
+    const int64_t chunks = (static_cast<int64_t>(H) * W + 1023) / 1024;
+    require_len(workspace, 2 * static_cast<int64_t>(B) * T * chunks * C, kFn, "workspace");
+    require_len(stats, 2 * static_cast<int64_t>(B) * T * num_groups, kFn, "stats");
+    launch_group_norm_stats3d(x.data(), workspace.data(), stats.data(), B, C, T, H, W, num_groups,
+                              eps, row_stride, code, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -1104,21 +1672,6 @@ static void sage_check_shapes(const nb::ndarray<>& q, const nb::ndarray<>& k,
     }
 }
 
-// sage_attend synthesizes Q/K/V/O strides from the extents rather than reading
-// them, so anything but the packed row-major layout is read as though it were
-// packed. The Python layer only ever allocates fresh contiguous buffers; a caller
-// reaching _C directly can pass a view.
-static void require_packed_contiguous(const nb::ndarray<>& t, const char* fn, const char* name) {
-    int64_t expected = 1;
-    for (int axis = static_cast<int>(t.ndim()) - 1; axis >= 0; --axis) {
-        if (t.shape(axis) != 1 && t.stride(axis) != expected) {
-            throw std::runtime_error(std::string(fn) + ": " + name +
-                                     " must be contiguous in the packed layout");
-        }
-        expected *= static_cast<int64_t>(t.shape(axis));
-    }
-}
-
 static void sage_check_quantized(const nb::ndarray<>& q_int8, const nb::ndarray<>& q_scale,
                                  const nb::ndarray<>& k_int8, const nb::ndarray<>& k_scale,
                                  const nb::ndarray<>& v_int8, const nb::ndarray<>& v_scale,
@@ -1153,7 +1706,8 @@ static void sage_quantize(const nb::ndarray<>& q, const nb::ndarray<>& k, const 
                           const nb::ndarray<>& k_int8, const nb::ndarray<>& k_scale,
                           const nb::ndarray<>& v_int8, const nb::ndarray<>& v_scale,
                           const nb::ndarray<>& anchor_indices, int input_dtype_code, int cta_k,
-                          hipStream_t stream, const char* fn) {
+                          hipStream_t stream, const char* fn,
+                          const SageDenseMask16* dense_mask = nullptr) {
     const int batch = static_cast<int>(q.shape(0));
     const int q_heads = static_cast<int>(q.shape(1));
     const int qo_len = static_cast<int>(q.shape(2));
@@ -1187,16 +1741,20 @@ static void sage_quantize(const nb::ndarray<>& q, const nb::ndarray<>& k, const 
                               sage_padded_q(qo_len), kv_heads, kv_len, padded_k / kSageKeyGroup,
                               head_dim, q.stride(0), q.stride(1), q.stride(2), k.stride(0),
                               k.stride(1), k.stride(2), input_dtype_code,
-                              sage_rotation(kv_len, head_dim), stream);
+                              sage_rotation(kv_len, head_dim), stream, dense_mask);
 
     launch_sage_quant_v_int8(v.data(), v_int8.data(), v_scale.data(), batch, kv_heads, kv_len,
                              head_dim, padded_k, v.stride(0), v.stride(1), v.stride(2),
                              input_dtype_code, stream);
 }
 
-// An expanded mask carries zero strides, so a per-key mask arrives with
-// mask_stride_q == 0 and its query term drops out of the kernel's addressing on
-// its own. That needs no separate mask mode.
+static int sage_prepared_mask_width(int kv_len) {
+    const int tiles = (kv_len + kSageCtaK - 1) / kSageCtaK;
+    return ((tiles * (kSageCtaK + 1) + 3) / 4) * 4;
+}
+
+// A prepared row holds padded FP32 key biases followed by one descriptor per
+// 64-key tile. Dtype code 4 is internal to this layout, never a public mask dtype.
 static void sage_mask_info(const OptArray& attn_mask, int batch, int q_heads, int qo_len,
                            int kv_len, const void*& ptr, int64_t& stride_b, int64_t& stride_h,
                            int64_t& stride_q, int64_t& stride_k, int& dtype_code,
@@ -1207,6 +1765,43 @@ static void sage_mask_info(const OptArray& attn_mask, int batch, int q_heads, in
     if (!attn_mask.has_value()) return;
 
     const auto& mask = attn_mask.value();
+    if (mask.ndim() == 5) {
+        const bool bit_packed =
+            mask.dtype().code == static_cast<uint8_t>(nb::dlpack::dtype_code::Int) &&
+            mask.dtype().bits == 32;
+        if ((mask.shape(0) != 1 && mask.shape(0) != batch) ||
+            (mask.shape(1) != 1 && mask.shape(1) != q_heads) ||
+            mask.shape(2) != (qo_len + 15) / 16 || mask.shape(3) != (kv_len + 63) / 64 ||
+            mask.shape(4) != (bit_packed ? 32 : 1024)) {
+            throw std::runtime_error(std::string(fn) + ": invalid prepared dense mask shape");
+        }
+        const int packed_dtype = map_dtype_to_code(mask.dtype());
+        if ((packed_dtype < 0 || packed_dtype > 2) && !bit_packed) {
+            throw std::runtime_error(std::string(fn) + ": prepared dense mask must be float32, float16, bfloat16 or int32");
+        }
+        require_packed_contiguous(mask, fn, "prepared dense mask");
+        ptr = mask.data();
+        stride_b = mask.shape(0) == 1 ? 0 : mask.stride(0);
+        stride_h = mask.shape(1) == 1 ? 0 : mask.stride(1);
+        stride_k = 1;
+        dtype_code = bit_packed ? 7 : (packed_dtype == 2 ? 8 : (packed_dtype == 1 ? 9 : 5));
+        return;
+    }
+    if (mask.ndim() == 3) {
+        if ((mask.shape(0) != 1 && mask.shape(0) != batch) ||
+            (mask.shape(1) != 1 && mask.shape(1) != q_heads) ||
+            mask.shape(2) != sage_prepared_mask_width(kv_len)) {
+            throw std::runtime_error(std::string(fn) + ": invalid prepared key mask shape");
+        }
+        require_dtype(mask, 0, 0, fn, "prepared key mask");
+        require_packed_contiguous(mask, fn, "prepared key mask");
+        ptr = mask.data();
+        stride_b = mask.shape(0) == 1 ? 0 : mask.stride(0);
+        stride_h = mask.shape(1) == 1 ? 0 : mask.stride(1);
+        stride_k = 1;
+        dtype_code = 4;
+        return;
+    }
     if (mask.ndim() != 4 || static_cast<int>(mask.shape(0)) != batch ||
         static_cast<int>(mask.shape(1)) != q_heads || static_cast<int>(mask.shape(2)) != qo_len ||
         static_cast<int>(mask.shape(3)) != kv_len) {
@@ -1231,6 +1826,60 @@ static void sage_mask_info(const OptArray& attn_mask, int batch, int q_heads, in
     stride_h = mask.stride(1);
     stride_q = mask.stride(2);
     stride_k = mask.stride(3);
+}
+
+void sage_prepare_key_mask(nb::ndarray<> mask, nb::ndarray<> packed, uintptr_t stream_ptr) {
+    constexpr const char* fn = "sage_prepare_key_mask";
+    if (mask.ndim() != 4 || mask.shape(0) == 0 || mask.shape(1) == 0 ||
+        mask.shape(2) != 1 || mask.shape(3) == 0 ||
+        mask.device_type() != nb::device::rocm::value ||
+        mask.device_type() != packed.device_type() || mask.device_id() != packed.device_id()) {
+        throw std::runtime_error(std::string(fn) + ": expected [B,H,1,K] on the output device");
+    }
+    const void* ptr;
+    int64_t sb, sh, sq, sk;
+    int dtype;
+    const int batch = mask.shape(0), heads = mask.shape(1), kv_len = mask.shape(3);
+    sage_mask_info(mask, batch, heads, 1, kv_len, ptr, sb, sh, sq, sk, dtype, fn);
+    if (packed.ndim() != 3 || packed.shape(0) != batch || packed.shape(1) != heads ||
+        packed.shape(2) != sage_prepared_mask_width(kv_len)) {
+        throw std::runtime_error(std::string(fn) + ": invalid prepared key mask shape");
+    }
+    require_dtype(packed, 0, 0, fn, "packed");
+    require_packed_contiguous(packed, fn, "packed");
+    launch_sage_prepare_key_mask(ptr, static_cast<float*>(packed.data()), batch, heads, kv_len,
+                                sb, sh, sk, dtype, packed.shape(2),
+                                reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void sage_prepare_dense_mask(nb::ndarray<> mask, nb::ndarray<> packed, uintptr_t stream_ptr) {
+    constexpr const char* fn = "sage_prepare_dense_mask";
+    if (mask.ndim() != 4 || mask.shape(0) == 0 || mask.shape(1) == 0 ||
+        mask.shape(2) == 0 || mask.shape(3) == 0 ||
+        mask.device_type() != nb::device::rocm::value ||
+        mask.device_type() != packed.device_type() || mask.device_id() != packed.device_id()) {
+        throw std::runtime_error(std::string(fn) + ": expected [B,H,Q,K] on the output device");
+    }
+    const void* ptr;
+    int64_t sb, sh, sq, sk;
+    int dtype;
+    const int batch = mask.shape(0), heads = mask.shape(1), qo_len = mask.shape(2), kv_len = mask.shape(3);
+    sage_mask_info(mask, batch, heads, qo_len, kv_len, ptr, sb, sh, sq, sk, dtype, fn);
+    const void* out_ptr;
+    int64_t ob, oh, oq, ok;
+    int out_dtype;
+    if (packed.ndim() != 5 || packed.shape(0) != batch || packed.shape(1) != heads) {
+        throw std::runtime_error(std::string(fn) + ": invalid prepared dense mask shape");
+    }
+    sage_mask_info(packed, batch, heads, qo_len, kv_len, out_ptr, ob, oh, oq, ok, out_dtype, fn);
+    if (out_dtype == 7 && dtype != 3) {
+        throw std::runtime_error(std::string(fn) + ": bit-packed preparation requires a Boolean mask");
+    }
+    launch_sage_prepare_dense_mask(ptr, packed.data(), batch, heads, qo_len, kv_len,
+                                  sb, sh, sq, sk, dtype, out_dtype,
+                                  reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
 }
 
 static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8,
@@ -1258,6 +1907,11 @@ static void sage_attend(const nb::ndarray<>& q_int8, const nb::ndarray<>& k_int8
     const void* mask_ptr = nullptr;
     int64_t mask_stride_b, mask_stride_h, mask_stride_q, mask_stride_k;
     int mask_dtype_code;
+    if (attn_mask.has_value() &&
+        (attn_mask->device_type() != nb::device::rocm::value ||
+         attn_mask->device_id() != q_int8.device_id())) {
+        throw std::runtime_error(std::string(fn) + ": attention mask must be on q's ROCm device");
+    }
     sage_mask_info(attn_mask, batch, q_heads, qo_len, kv_len, mask_ptr, mask_stride_b,
                    mask_stride_h, mask_stride_q, mask_stride_k, mask_dtype_code, fn);
 
@@ -1283,7 +1937,8 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
                nb::ndarray<> q_int8, nb::ndarray<> q_scale, nb::ndarray<> k_int8,
                nb::ndarray<> k_scale, nb::ndarray<> v_int8, nb::ndarray<> v_scale,
                nb::ndarray<> anchor_indices, float sm_scale, int cta_k, int input_dtype_code,
-               int output_dtype_code, uintptr_t stream_ptr, OptArray attn_mask = std::nullopt) {
+               int output_dtype_code, uintptr_t stream_ptr, OptArray attn_mask = std::nullopt,
+               OptArray raw_dense_mask = std::nullopt) {
     constexpr const char* kFn = "sage_sdpa";
     sage_check_shapes(q, k, v, kFn);
     sage_check_cta_k(cta_k, kFn);
@@ -1295,8 +1950,47 @@ void sage_sdpa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> 
     const int kv_heads = static_cast<int>(k.shape(1));
     const int kv_len = static_cast<int>(k.shape(2));
 
+    SageDenseMask16 fused_mask;
+    if (raw_dense_mask.has_value()) {
+        const auto& raw = raw_dense_mask.value();
+        const auto fail = [kFn](const char* message) {
+            throw std::runtime_error(std::string(kFn) + ": fused dense mask " + message);
+        };
+        if (!attn_mask.has_value() || raw.ndim() != 4 ||
+            head_dim > 128 || qo_len <= 1 || qo_len > 256 || kv_len <= 64 || kv_len > 2048 ||
+            raw.stride(2) == 0) {
+            fail("requires a short dense input and a prepared output");
+        }
+        const auto& prepared = attn_mask.value();
+        if (raw.device_type() != nb::device::rocm::value ||
+            raw.device_type() != q.device_type() || raw.device_id() != q.device_id() ||
+            prepared.device_type() != q.device_type() || prepared.device_id() != q.device_id()) {
+            fail("buffers must be on the Q device");
+        }
+        const void* ptr;
+        const void* prepared_ptr;
+        int64_t sb, sh, sq, sk, pb, ph, pq, pk;
+        int code, prepared_code;
+        sage_mask_info(raw_dense_mask, batch, q_heads, qo_len, kv_len,
+                       ptr, sb, sh, sq, sk, code, kFn);
+        sage_mask_info(attn_mask, batch, q_heads, qo_len, kv_len,
+                       prepared_ptr, pb, ph, pq, pk, prepared_code, kFn);
+        if ((code != 1 && code != 2) || prepared_code != (code == 1 ? 9 : 8)) {
+            fail("input and output must have the same float16 or bfloat16 dtype");
+        }
+        const int mask_batch = sb == 0 ? 1 : batch;
+        const int mask_heads = sh == 0 ? 1 : q_heads;
+        if (prepared.shape(0) != mask_batch || prepared.shape(1) != mask_heads) {
+            fail("output must match the compact input batch and head counts");
+        }
+        if (reinterpret_cast<uintptr_t>(prepared.data()) % 8 != 0) {
+            fail("output must be eight-byte aligned");
+        }
+        fused_mask = {static_cast<const uint16_t*>(ptr), static_cast<uint16_t*>(prepared.data()),
+                      mask_batch, mask_heads, qo_len, kv_len, code, sb, sh, sq, sk};
+    }
     sage_quantize(q, k, v, q_int8, q_scale, k_int8, k_scale, v_int8, v_scale, anchor_indices,
-                  input_dtype_code, cta_k, stream, kFn);
+                  input_dtype_code, cta_k, stream, kFn, &fused_mask);
     check_hip_launch();
     sage_attend(q_int8, k_int8, v_int8, o, q_scale, k_scale, v_scale, attn_mask, batch, q_heads,
                 kv_heads, qo_len, kv_len, head_dim, cta_k, sm_scale, output_dtype_code, stream,
@@ -1366,19 +2060,16 @@ void sage_sdpa_prequantized(nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndar
                 reinterpret_cast<hipStream_t>(stream_ptr), kFn);
 }
 
-
 // BF16 decode attention. Every extent below is derived from the operands rather
 // than taken from the caller, and the kernel indexes with the strides passed
 // here, so a mismatch is an out-of-bounds device access. Mirrors the checks in
-// the CUDA binding and adds the two the HIP kernel needs: it reads four
+// the CUDA binding and adds the two the HIP kernel needs: it reads two or four
 // elements at a time, and it addresses the output with q's strides.
 void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
                             nb::ndarray<> kv_lengths, nb::ndarray<> output,
                             nb::ndarray<> softmax_lse, nb::ndarray<> softmax_lse_accum,
                             nb::ndarray<> output_accum, int num_splits, uintptr_t stream_ptr) {
     constexpr const char* kFn = "flash_attention_decode";
-    constexpr int kHeadDim = 128;
-    constexpr int kElemsPerLoad = 4;
     if (q.ndim() != 3 || k.ndim() != 4 || v.ndim() != 4 || output.ndim() != 3 ||
         kv_lengths.ndim() != 1) {
         throw std::runtime_error(std::string(kFn) + ": operand rank mismatch");
@@ -1390,18 +2081,20 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
     require_positive(kv_capacity, kFn, "kv_capacity");
     require_positive(heads, kFn, "heads");
     const int query_length = static_cast<int>(q.shape(0)) / batch;
+    const int head_dim = static_cast<int>(q.shape(2));
+    const int elems_per_load = head_dim == 64 ? 2 : 4;
     require_positive(query_length, kFn, "query_length");
     if (static_cast<int64_t>(q.shape(0)) != static_cast<int64_t>(batch) * query_length ||
-        static_cast<int>(q.shape(1)) != heads || static_cast<int>(q.shape(2)) != kHeadDim ||
-        static_cast<int>(k.shape(3)) != kHeadDim) {
+        static_cast<int>(q.shape(1)) != heads || (head_dim != 64 && head_dim != 128 && head_dim != 256) ||
+        static_cast<int>(k.shape(3)) != head_dim) {
         throw std::runtime_error(std::string(kFn) + ": invalid q/k dimensions");
     }
     if (static_cast<int>(v.shape(0)) != batch || static_cast<int>(v.shape(1)) != kv_capacity ||
-        static_cast<int>(v.shape(2)) != heads || static_cast<int>(v.shape(3)) != kHeadDim) {
+        static_cast<int>(v.shape(2)) != heads || static_cast<int>(v.shape(3)) != head_dim) {
         throw std::runtime_error(std::string(kFn) + ": k/v shape mismatch");
     }
     if (output.shape(0) != q.shape(0) || static_cast<int>(output.shape(1)) != heads ||
-        static_cast<int>(output.shape(2)) != kHeadDim ||
+        static_cast<int>(output.shape(2)) != head_dim ||
         kv_lengths.size() != static_cast<size_t>(batch)) {
         throw std::runtime_error(std::string(kFn) + ": output or length shape mismatch");
     }
@@ -1419,7 +2112,7 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
     if (softmax_lse.size() != lse_size || num_splits < 1 || num_splits > 32 ||
         (num_splits > 1 &&
          (softmax_lse_accum.size() != lse_size * num_splits ||
-          output_accum.size() != lse_size * kHeadDim * num_splits))) {
+          output_accum.size() != lse_size * head_dim * num_splits))) {
         throw std::runtime_error(std::string(kFn) + ": invalid split workspace");
     }
     require_dtype(softmax_lse, 0, 0, kFn, "softmax_lse");
@@ -1443,21 +2136,23 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
     if (output.stride(0) != q.stride(0) || output.stride(1) != q.stride(1)) {
         throw std::runtime_error(std::string(kFn) + ": output strides must match q");
     }
-    // Rows are read four elements at a time, so every row start has to stay on
+    // Rows are read two or four elements at a time, so every row start has to stay on
     // that boundary.
     const int64_t vectored[] = {q.stride(0), q.stride(1), k.stride(0), k.stride(1), k.stride(2)};
     for (int64_t stride : vectored) {
-        if (stride % kElemsPerLoad != 0) {
-            throw std::runtime_error(std::string(kFn) + ": strides must be a multiple of 4");
+        if (stride % elems_per_load != 0) {
+            throw std::runtime_error(std::string(kFn) + ": strides must be a multiple of " +
+                                     std::to_string(elems_per_load));
         }
     }
     // A view carries a byte offset, so operands with aligned strides can still
-    // begin off the boundary the four-element load needs.
-    constexpr uintptr_t kLoadBytes = kElemsPerLoad * sizeof(uint16_t);
+    // begin off the boundary the vector load needs.
+    const uintptr_t load_bytes = elems_per_load * sizeof(uint16_t);
     const void* row_starts[] = {q.data(), k.data(), v.data(), output.data()};
     for (const void* base : row_starts) {
-        if (reinterpret_cast<uintptr_t>(base) % kLoadBytes != 0) {
-            throw std::runtime_error(std::string(kFn) + ": q, k, v and output must be 8-byte aligned");
+        if (reinterpret_cast<uintptr_t>(base) % load_bytes != 0) {
+            throw std::runtime_error(std::string(kFn) + ": q, k, v and output must be " +
+                                     std::to_string(load_bytes) + "-byte aligned");
         }
     }
     // The launcher takes raw pointers, so anything but ROCm device memory would
@@ -1488,8 +2183,188 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
         static_cast<float*>(softmax_lse.data()),
         num_splits > 1 ? static_cast<float*>(output_accum.data()) : nullptr,
         num_splits > 1 ? static_cast<float*>(softmax_lse_accum.data()) : nullptr, batch,
-        query_length, heads, kv_capacity, num_splits, q.stride(0) * query_length, q.stride(0),
-        q.stride(1), k.stride(0), k.stride(1), k.stride(2),
+        query_length, 1, heads, head_dim, kv_capacity, num_splits, false,
+        q.stride(0) * query_length, q.stride(0), 0, q.stride(1), k.stride(0), k.stride(1),
+        k.stride(2), q.stride(0) * query_length, q.stride(0), 0, q.stride(1),
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// The head-first GQA entry: q [B, H, S, 256] over k/v [B, Hk, capacity, 256] into
+// output [B, S, H*256] (contiguous), bottom-right causal over kv_lengths[b] slots
+// when `causal`. The kernel runs the G*S rows of one kv head together, so K/V
+// stream once per kv head.
+void flash_attention_decode_gqa(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
+                                nb::ndarray<> kv_lengths, nb::ndarray<> output,
+                                nb::ndarray<> softmax_lse, nb::ndarray<> softmax_lse_accum,
+                                nb::ndarray<> output_accum, int num_splits, bool causal,
+                                uintptr_t stream_ptr) {
+    constexpr const char* kFn = "flash_attention_decode_gqa";
+    constexpr int64_t kHeadDim = 256;
+    constexpr int kElemsPerLoad = 4;
+    if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || output.ndim() != 3 ||
+        kv_lengths.ndim() != 1) {
+        throw std::runtime_error(std::string(kFn) + ": operand rank mismatch");
+    }
+    const int64_t batch = q.shape(0), heads = q.shape(1), query_length = q.shape(2);
+    const int64_t kv_heads = k.shape(1), kv_capacity = k.shape(2);
+    if (batch <= 0 || heads <= 0 || query_length <= 0 || query_length > 64 || kv_heads <= 0 ||
+        heads % kv_heads != 0 || kv_capacity <= 0 || q.shape(3) != kHeadDim) {
+        throw std::runtime_error(std::string(kFn) + ": invalid q dimensions");
+    }
+    if (k.shape(0) != batch || k.shape(3) != kHeadDim || v.shape(0) != batch ||
+        v.shape(1) != kv_heads || v.shape(2) != kv_capacity || v.shape(3) != kHeadDim) {
+        throw std::runtime_error(std::string(kFn) + ": k/v shape mismatch");
+    }
+    if (output.shape(0) != batch || output.shape(1) != query_length ||
+        output.shape(2) != heads * kHeadDim || kv_lengths.size() != static_cast<size_t>(batch)) {
+        throw std::runtime_error(std::string(kFn) + ": output or length shape mismatch");
+    }
+    require_dtype(q, 2, 2, kFn, "q");
+    require_dtype(k, 2, 2, kFn, "k");
+    require_dtype(v, 2, 2, kFn, "v");
+    require_dtype(output, 2, 2, kFn, "output");
+    if (map_dtype_to_code(kv_lengths.dtype()) != -1 ||
+        kv_lengths.dtype().code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) ||
+        kv_lengths.dtype().bits != 32) {
+        throw std::runtime_error(std::string(kFn) + ": kv_lengths must be int32");
+    }
+    const size_t lse_size = static_cast<size_t>(batch) * heads * query_length;
+    if (softmax_lse.size() != lse_size || num_splits < 1 || num_splits > 32 ||
+        (num_splits > 1 &&
+         (softmax_lse_accum.size() != lse_size * num_splits ||
+          output_accum.size() != lse_size * kHeadDim * num_splits))) {
+        throw std::runtime_error(std::string(kFn) + ": invalid split workspace");
+    }
+    require_dtype(softmax_lse, 0, 0, kFn, "softmax_lse");
+    require_packed_contiguous(kv_lengths, kFn, "kv_lengths");
+    require_packed_contiguous(softmax_lse, kFn, "softmax_lse");
+    if (num_splits > 1) {
+        require_dtype(softmax_lse_accum, 0, 0, kFn, "softmax_lse_accum");
+        require_dtype(output_accum, 0, 0, kFn, "output_accum");
+        require_packed_contiguous(softmax_lse_accum, kFn, "softmax_lse_accum");
+        require_packed_contiguous(output_accum, kFn, "output_accum");
+    }
+    if (k.stride(0) != v.stride(0) || k.stride(1) != v.stride(1) || k.stride(2) != v.stride(2) ||
+        k.stride(3) != 1 || v.stride(3) != 1 || q.stride(3) != 1 || output.stride(2) != 1 ||
+        output.stride(1) != heads * kHeadDim || output.stride(0) != query_length * heads * kHeadDim) {
+        throw std::runtime_error(std::string(kFn) + ": unsupported tensor strides");
+    }
+    const int64_t vectored[] = {q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2)};
+    for (int64_t stride : vectored) {
+        if (stride % kElemsPerLoad != 0) {
+            throw std::runtime_error(std::string(kFn) + ": strides must be a multiple of 4");
+        }
+    }
+    constexpr uintptr_t kLoadBytes = kElemsPerLoad * sizeof(uint16_t);
+    const void* row_starts[] = {q.data(), k.data(), v.data(), output.data()};
+    for (const void* base : row_starts) {
+        if (reinterpret_cast<uintptr_t>(base) % kLoadBytes != 0) {
+            throw std::runtime_error(std::string(kFn) + ": q, k, v and output must be 8-byte aligned");
+        }
+    }
+    constexpr int kDeviceRocm = nb::device::rocm::value;
+    const nb::ndarray<>* operands[] = {&q, &k, &v, &output, &kv_lengths, &softmax_lse};
+    for (const nb::ndarray<>* t : operands) {
+        if (t->device_type() != kDeviceRocm || t->device_id() != q.device_id()) {
+            throw std::runtime_error(std::string(kFn) +
+                                     ": every operand must be ROCm device memory on q's device");
+        }
+    }
+    if (num_splits > 1 &&
+        (softmax_lse_accum.device_type() != kDeviceRocm ||
+         output_accum.device_type() != kDeviceRocm ||
+         softmax_lse_accum.device_id() != q.device_id() ||
+         output_accum.device_id() != q.device_id())) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": split workspace must be ROCm device memory on q's device");
+    }
+
+    // Query head h of kv head kh is kh * groups + g, so the group stride is q's head
+    // stride and the kv-head stride is groups of those. Output rows are already
+    // [B, S, (Hk, G, D)].
+    const int64_t groups = heads / kv_heads;
+    launch_flash_decode(
+        q.data(), k.data(), v.data(), static_cast<const int*>(kv_lengths.data()), output.data(),
+        static_cast<float*>(softmax_lse.data()),
+        num_splits > 1 ? static_cast<float*>(output_accum.data()) : nullptr,
+        num_splits > 1 ? static_cast<float*>(softmax_lse_accum.data()) : nullptr,
+        static_cast<int>(batch), static_cast<int>(groups * query_length),
+        static_cast<int>(query_length), static_cast<int>(kv_heads), static_cast<int>(kHeadDim),
+        static_cast<int>(kv_capacity), num_splits, causal, q.stride(0), q.stride(1), q.stride(2),
+        groups * q.stride(1), k.stride(0), k.stride(2), k.stride(1), output.stride(0), kHeadDim,
+        output.stride(1), groups * kHeadDim, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// Verify-tree merge: out [B, S, H*256] and lse [B, H, S] come from a prefix-only
+// flash_attention_decode_gqa (causal = false) over the S verify rows; q [B, H, S, 256]
+// and k/v [B, Hk, S, 256] are the rows' own rotated query/key/value and mask [S] the
+// rows each row must fold in (bit t = row t). merged [B, S, H*256] receives the result.
+void flash_attention_decode_tree_merge(nb::ndarray<> out, nb::ndarray<> lse, nb::ndarray<> q,
+                                       nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> mask,
+                                       nb::ndarray<> merged, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "flash_attention_decode_tree_merge";
+    constexpr int64_t kHeadDim = 256;
+    if (out.ndim() != 3 || lse.ndim() != 3 || q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 ||
+        mask.ndim() != 1 || merged.ndim() != 3) {
+        throw std::runtime_error(std::string(kFn) + ": operand rank mismatch");
+    }
+    const int64_t batch = q.shape(0), heads = q.shape(1), rows = q.shape(2);
+    const int64_t kv_heads = k.shape(1);
+    if (batch <= 0 || heads <= 0 || rows <= 0 || rows > 8 || kv_heads <= 0 ||
+        heads % kv_heads != 0 || q.shape(3) != kHeadDim || k.shape(0) != batch ||
+        k.shape(2) != rows || k.shape(3) != kHeadDim || v.shape(0) != batch ||
+        v.shape(1) != kv_heads || v.shape(2) != rows || v.shape(3) != kHeadDim ||
+        mask.shape(0) != rows) {
+        throw std::runtime_error(std::string(kFn) + ": shape mismatch");
+    }
+    if (out.shape(0) != batch || out.shape(1) != rows || out.shape(2) != heads * kHeadDim ||
+        merged.shape(0) != batch || merged.shape(1) != rows ||
+        merged.shape(2) != heads * kHeadDim || lse.shape(0) != batch || lse.shape(1) != heads ||
+        lse.shape(2) != rows) {
+        throw std::runtime_error(std::string(kFn) + ": output or lse shape mismatch");
+    }
+    require_dtype(q, 2, 2, kFn, "q");
+    require_dtype(k, 2, 2, kFn, "k");
+    require_dtype(v, 2, 2, kFn, "v");
+    require_dtype(out, 2, 2, kFn, "out");
+    require_dtype(merged, 2, 2, kFn, "merged");
+    require_dtype(lse, 0, 0, kFn, "lse");
+    if (map_dtype_to_code(mask.dtype()) != -1 ||
+        mask.dtype().code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) ||
+        mask.dtype().bits != 32) {
+        throw std::runtime_error(std::string(kFn) + ": mask must be int32");
+    }
+    require_packed_contiguous(mask, kFn, "mask");
+    require_packed_contiguous(lse, kFn, "lse");
+    if (q.stride(3) != 1 || k.stride(3) != 1 || v.stride(3) != 1 || out.stride(2) != 1 ||
+        merged.stride(2) != 1 || out.stride(1) != heads * kHeadDim ||
+        merged.stride(1) != heads * kHeadDim) {
+        throw std::runtime_error(std::string(kFn) + ": unsupported tensor strides");
+    }
+    const int64_t vectored[] = {q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1),
+                                k.stride(2), v.stride(0), v.stride(1), v.stride(2),
+                                out.stride(0), merged.stride(0)};
+    for (int64_t stride : vectored) {
+        if (stride % 4 != 0) {
+            throw std::runtime_error(std::string(kFn) + ": strides must be a multiple of 4");
+        }
+    }
+    constexpr int kDeviceRocm = nb::device::rocm::value;
+    const nb::ndarray<>* operands[] = {&out, &lse, &q, &k, &v, &mask, &merged};
+    for (const nb::ndarray<>* t : operands) {
+        if (t->device_type() != kDeviceRocm || t->device_id() != q.device_id()) {
+            throw std::runtime_error(std::string(kFn) +
+                                     ": every operand must be ROCm device memory on q's device");
+        }
+    }
+    launch_flash_decode_tree_merge(
+        out.data(), static_cast<const float*>(lse.data()), q.data(), k.data(), v.data(),
+        static_cast<const int*>(mask.data()), merged.data(), static_cast<int>(batch),
+        static_cast<int>(rows), static_cast<int>(heads), static_cast<int>(kv_heads), q.stride(0),
+        q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1),
+        v.stride(2), out.stride(0), out.stride(1), merged.stride(0), merged.stride(1),
         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
@@ -1739,8 +2614,294 @@ void sol_attn_core_py(nb::ndarray<> workspace, nb::ndarray<> out, nb::ndarray<> 
     check_hip_launch();
 }
 
+// Every operand of the DeltaNet kernels is read at one width picked from the
+// activation dtype, so a mismatched one is an out-of-bounds device read.
+static void require_same_dtype(const nb::ndarray<>& t, int dtype_code, const char* fn,
+                               const char* name) {
+    if (map_dtype_to_code(t.dtype()) != dtype_code) {
+        throw std::runtime_error(std::string(fn) + ": " + name +
+                                 " must share the activation dtype");
+    }
+}
+
+// GatedDeltaNet decode: S <= 8 steps of the delta rule for one (batch, value head)
+// per block, with the gate projections, q/k normalization and the gated RMSNorm
+// folded in. state is updated in place; snapshots, when given, records it after
+// steps 0..S-2 for the speculative-decode rollback.
+bool gated_delta_decode_fused(nb::ndarray<> mixed_qkv, nb::ndarray<> x, nb::ndarray<> w_a,
+                              nb::ndarray<> w_b, nb::ndarray<> dt_bias, nb::ndarray<> g_decay,
+                              nb::ndarray<> state, nb::ndarray<> out, OptArray snapshots,
+                              nb::ndarray<> z, nb::ndarray<> norm_w, double eps, int B, int Hv,
+                              int Hk, int S, int DK, int DV, int C, int Hd, int key_dim,
+                              double scale, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "gated_delta_decode_fused";
+    require_positive(B, kFn, "B");
+    require_positive(Hv, kFn, "Hv");
+    require_positive(Hk, kFn, "Hk");
+    require_positive(S, kFn, "S");
+    require_positive(DK, kFn, "DK");
+    require_positive(DV, kFn, "DV");
+    require_positive(Hd, kFn, "Hd");
+    require_positive(key_dim, kFn, "key_dim");
+    if (Hv % Hk != 0 || key_dim != Hk * DK) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": Hk must divide Hv and key_dim must be Hk * DK");
+    }
+    // The kernel splits q, k and v out of one [B, C, S] buffer at fixed offsets.
+    if (C < 2 * key_dim + Hv * DV) {
+        throw std::runtime_error(std::string(kFn) + ": C is too small for 2 * key_dim + Hv * DV");
+    }
+    const int dtype_code = map_dtype_to_code(mixed_qkv.dtype());
+    require_code(dtype_code, 0, 2, kFn, "activation dtype");
+    require_same_dtype(x, dtype_code, kFn, "x");
+    require_same_dtype(w_a, dtype_code, kFn, "w_a");
+    require_same_dtype(w_b, dtype_code, kFn, "w_b");
+    require_same_dtype(out, dtype_code, kFn, "out");
+    require_same_dtype(z, dtype_code, kFn, "z");
+    require_same_dtype(norm_w, dtype_code, kFn, "norm_w");
+    require_len(mixed_qkv, static_cast<int64_t>(B) * C * S, kFn, "mixed_qkv");
+    require_len(x, static_cast<int64_t>(B) * S * Hd, kFn, "x");
+    require_len(w_a, static_cast<int64_t>(Hv) * Hd, kFn, "w_a");
+    require_len(w_b, static_cast<int64_t>(Hv) * Hd, kFn, "w_b");
+    require_len(out, static_cast<int64_t>(B) * S * Hv * DV, kFn, "out");
+    require_len(z, static_cast<int64_t>(B) * S * Hv * DV, kFn, "z");
+    require_len(norm_w, DV, kFn, "norm_w");
+    require_scale_len(dt_bias, static_cast<size_t>(Hv), kFn, "dt_bias");
+    require_scale_len(g_decay, static_cast<size_t>(Hv), kFn, "g_decay");
+    require_scale_len(state, static_cast<size_t>(B) * Hv * DK * DV, kFn, "state");
+    // Reject strided buffers before launch: copying mutable state or snapshots
+    // would lose the in-place update, and treating a view as packed corrupts it.
+    require_packed_contiguous(mixed_qkv, kFn, "mixed_qkv");
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(w_a, kFn, "w_a");
+    require_packed_contiguous(w_b, kFn, "w_b");
+    require_packed_contiguous(dt_bias, kFn, "dt_bias");
+    require_packed_contiguous(g_decay, kFn, "g_decay");
+    require_packed_contiguous(state, kFn, "state");
+    require_packed_contiguous(out, kFn, "out");
+    require_packed_contiguous(z, kFn, "z");
+    require_packed_contiguous(norm_w, kFn, "norm_w");
+    void* snap_ptr = nullptr;
+    if (snapshots.has_value() && S > 1) {
+        require_scale_len(*snapshots, static_cast<size_t>(S - 1) * B * Hv * DK * DV, kFn,
+                          "snapshots");
+        require_packed_contiguous(*snapshots, kFn, "snapshots");
+        snap_ptr = snapshots->data();
+    }
+
+    const bool used = launch_gated_delta_decode_fused_kernel(
+        mixed_qkv.data(), x.data(), w_a.data(), w_b.data(), dt_bias.data(), g_decay.data(),
+        state.data(), out.data(), snap_ptr, z.data(), norm_w.data(), static_cast<float>(eps), B,
+        Hv, Hk, S, DK, DV, C, Hd, key_dim, static_cast<float>(scale), dtype_code,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return used;
+}
+
+// Depthwise causal conv decode step with silu. conv_state is updated in place and
+// conv_snaps, when given, records it after steps 0..S-2.
+bool deltanet_conv_step(nb::ndarray<> proj, nb::ndarray<> conv_state, nb::ndarray<> conv_w,
+                        OptArray conv_b, nb::ndarray<> conv_out, OptArray conv_snaps, int B,
+                        int C, int S, int KS, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "deltanet_conv_step";
+    require_positive(B, kFn, "B");
+    require_positive(C, kFn, "C");
+    require_positive(S, kFn, "S");
+    if (KS < 2) {
+        throw std::runtime_error(std::string(kFn) + ": KS must be at least 2");
+    }
+    const int dtype_code = map_dtype_to_code(proj.dtype());
+    require_code(dtype_code, 0, 2, kFn, "activation dtype");
+    require_same_dtype(conv_state, dtype_code, kFn, "conv_state");
+    require_same_dtype(conv_w, dtype_code, kFn, "conv_w");
+    require_same_dtype(conv_out, dtype_code, kFn, "conv_out");
+    require_len(proj, static_cast<int64_t>(B) * S * C, kFn, "proj");
+    require_len(conv_state, static_cast<int64_t>(B) * C * (KS - 1), kFn, "conv_state");
+    require_len(conv_w, static_cast<int64_t>(C) * KS, kFn, "conv_w");
+    require_len(conv_out, static_cast<int64_t>(B) * C * S, kFn, "conv_out");
+    require_packed_contiguous(proj, kFn, "proj");
+    require_packed_contiguous(conv_state, kFn, "conv_state");
+    require_packed_contiguous(conv_w, kFn, "conv_w");
+    require_packed_contiguous(conv_out, kFn, "conv_out");
+    if (conv_b.has_value()) {
+        require_same_dtype(*conv_b, dtype_code, kFn, "conv_b");
+        require_len(*conv_b, C, kFn, "conv_b");
+        require_packed_contiguous(*conv_b, kFn, "conv_b");
+    }
+    void* snaps = nullptr;
+    if (conv_snaps.has_value() && S > 1) {
+        require_same_dtype(*conv_snaps, dtype_code, kFn, "conv_snaps");
+        require_len(*conv_snaps, static_cast<int64_t>(S - 1) * B * C * (KS - 1), kFn,
+                    "conv_snaps");
+        require_packed_contiguous(*conv_snaps, kFn, "conv_snaps");
+        snaps = conv_snaps->data();
+    }
+
+    const bool used = launch_deltanet_conv_step_kernel(
+        proj.data(), conv_state.data(), conv_w.data(), opt_data(conv_b), conv_out.data(), snaps,
+        B, C, S, KS, dtype_code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return used;
+}
+
+// ctl is the deferred-decode program {pending, parity, slot[8], parent[8], prog[8]}
+// the kernels index directly, so it has to be a packed int32 vector of exactly
+// that length.
+static constexpr int kDeferredSlots = 8;
+static constexpr int kDeferredCtlLen = 2 + 3 * kDeferredSlots;
+
+static void require_deferred_ctl(const nb::ndarray<>& ctl, const char* fn) {
+    if (ctl.dtype().code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) ||
+        ctl.dtype().bits != 32 || ctl.ndim() != 1 || ctl.shape(0) != kDeferredCtlLen) {
+        throw std::runtime_error(std::string(fn) + ": ctl must be an int32 vector of " +
+                                 std::to_string(kDeferredCtlLen) + " elements");
+    }
+    require_packed_contiguous(ctl, fn, "ctl");
+}
+
+// GatedDeltaNet decode with the previous step's accepted tokens replayed from the
+// side buffers before the state is committed; the S current rows only produce
+// outputs and refill the buffers, run in the per-row commit program in ctl.
+bool gated_delta_decode_deferred(nb::ndarray<> x, nb::ndarray<> w_a, nb::ndarray<> w_b,
+                                 nb::ndarray<> dt_bias, nb::ndarray<> g_decay,
+                                 nb::ndarray<> qkv_buf, nb::ndarray<> gates_buf,
+                                 nb::ndarray<> sumsq_buf, nb::ndarray<> ctl, nb::ndarray<> state,
+                                 nb::ndarray<> out, nb::ndarray<> z, nb::ndarray<> norm_w,
+                                 double eps, int key_dim, int num_key_heads, double scale,
+                                 uintptr_t stream_ptr) {
+    constexpr const char* kFn = "gated_delta_decode_deferred";
+    if (x.ndim() != 3 || w_a.ndim() != 2 || w_b.ndim() != 2 || qkv_buf.ndim() != 4 ||
+        gates_buf.ndim() != 5 || sumsq_buf.ndim() != 5 || state.ndim() != 4 || out.ndim() != 4 ||
+        z.ndim() != 3 || norm_w.ndim() != 1) {
+        throw std::runtime_error(std::string(kFn) + ": unexpected tensor rank");
+    }
+    const int B = static_cast<int>(x.shape(0)), S = static_cast<int>(x.shape(1)),
+              Hd = static_cast<int>(x.shape(2));
+    const int C = static_cast<int>(qkv_buf.shape(2));
+    const int Hv = static_cast<int>(state.shape(1)), DK = static_cast<int>(state.shape(2)),
+              DV = static_cast<int>(state.shape(3));
+    const int Hk = num_key_heads;
+    require_positive(B, kFn, "B");
+    require_positive(S, kFn, "S");
+    require_positive(Hd, kFn, "Hd");
+    require_positive(Hv, kFn, "Hv");
+    require_positive(Hk, kFn, "num_key_heads");
+    require_positive(key_dim, kFn, "key_dim");
+    if (Hv % Hk != 0 || key_dim != Hk * DK) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": num_key_heads must divide Hv and key_dim must be Hk * DK");
+    }
+    if (C < 2 * key_dim + Hv * DV) {
+        throw std::runtime_error(std::string(kFn) + ": C is too small for 2 * key_dim + Hv * DV");
+    }
+    const int dtype_code = map_dtype_to_code(x.dtype());
+    require_code(dtype_code, 0, 2, kFn, "activation dtype");
+    require_same_dtype(w_a, dtype_code, kFn, "w_a");
+    require_same_dtype(w_b, dtype_code, kFn, "w_b");
+    require_same_dtype(qkv_buf, dtype_code, kFn, "qkv_buf");
+    require_same_dtype(out, dtype_code, kFn, "out");
+    require_same_dtype(z, dtype_code, kFn, "z");
+    require_same_dtype(norm_w, dtype_code, kFn, "norm_w");
+    if (w_a.shape(0) != Hv || w_a.shape(1) != Hd || w_b.shape(0) != Hv || w_b.shape(1) != Hd ||
+        state.shape(0) != B || out.shape(0) != B || out.shape(1) != S || out.shape(2) != Hv ||
+        out.shape(3) != DV || z.shape(0) != B || z.shape(1) != S ||
+        z.shape(2) != static_cast<size_t>(Hv) * DV || norm_w.shape(0) != DV ||
+        qkv_buf.shape(0) != 2 || qkv_buf.shape(1) != B || qkv_buf.shape(3) != kDeferredSlots ||
+        gates_buf.shape(0) != 2 || gates_buf.shape(1) != B ||
+        gates_buf.shape(2) != kDeferredSlots || gates_buf.shape(3) != Hv ||
+        gates_buf.shape(4) != 2 || sumsq_buf.shape(0) != 2 || sumsq_buf.shape(1) != B ||
+        sumsq_buf.shape(2) != kDeferredSlots || sumsq_buf.shape(3) != Hk ||
+        sumsq_buf.shape(4) != 2) {
+        throw std::runtime_error(std::string(kFn) + ": shape mismatch");
+    }
+    require_scale_len(dt_bias, static_cast<size_t>(Hv), kFn, "dt_bias");
+    require_scale_len(g_decay, static_cast<size_t>(Hv), kFn, "g_decay");
+    require_scale_len(gates_buf, static_cast<size_t>(2) * B * kDeferredSlots * Hv * 2, kFn,
+                      "gates_buf");
+    require_scale_len(sumsq_buf, static_cast<size_t>(2) * B * kDeferredSlots * Hk * 2, kFn,
+                      "sumsq_buf");
+    require_scale_len(state, static_cast<size_t>(B) * Hv * DK * DV, kFn, "state");
+    require_deferred_ctl(ctl, kFn);
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(w_a, kFn, "w_a");
+    require_packed_contiguous(w_b, kFn, "w_b");
+    require_packed_contiguous(dt_bias, kFn, "dt_bias");
+    require_packed_contiguous(g_decay, kFn, "g_decay");
+    require_packed_contiguous(qkv_buf, kFn, "qkv_buf");
+    require_packed_contiguous(gates_buf, kFn, "gates_buf");
+    require_packed_contiguous(sumsq_buf, kFn, "sumsq_buf");
+    require_packed_contiguous(state, kFn, "state");
+    require_packed_contiguous(out, kFn, "out");
+    require_packed_contiguous(z, kFn, "z");
+    require_packed_contiguous(norm_w, kFn, "norm_w");
+
+    const bool used = launch_gated_delta_decode_deferred_kernel(
+        x.data(), w_a.data(), w_b.data(), dt_bias.data(), g_decay.data(), qkv_buf.data(),
+        gates_buf.data(), sumsq_buf.data(), ctl.data(), state.data(), out.data(), z.data(),
+        norm_w.data(), static_cast<float>(eps), B, Hv, Hk, S, DK, DV, C, Hd, key_dim,
+        static_cast<float>(scale), dtype_code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return used;
+}
+
+// Depthwise causal conv decode step with silu that first commits the previous
+// step's accepted window from proj_buf into conv_state, then writes silu(conv) of
+// the S current rows into the current side of qkv_buf.
+bool deltanet_conv_deferred(nb::ndarray<> proj, nb::ndarray<> proj_buf, nb::ndarray<> conv_state,
+                            nb::ndarray<> conv_w, OptArray conv_b, nb::ndarray<> qkv_buf,
+                            nb::ndarray<> ctl, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "deltanet_conv_deferred";
+    if (proj.ndim() != 3 || proj_buf.ndim() != 4 || conv_state.ndim() != 3 || conv_w.ndim() != 2 ||
+        qkv_buf.ndim() != 4) {
+        throw std::runtime_error(std::string(kFn) + ": unexpected tensor rank");
+    }
+    const int B = static_cast<int>(proj.shape(0)), S = static_cast<int>(proj.shape(1)),
+              C = static_cast<int>(proj.shape(2));
+    const int KS = static_cast<int>(conv_w.shape(1));
+    require_positive(B, kFn, "B");
+    require_positive(S, kFn, "S");
+    require_positive(C, kFn, "C");
+    if (KS < 2) {
+        throw std::runtime_error(std::string(kFn) + ": KS must be at least 2");
+    }
+    const int dtype_code = map_dtype_to_code(proj.dtype());
+    require_code(dtype_code, 0, 2, kFn, "activation dtype");
+    require_same_dtype(proj_buf, dtype_code, kFn, "proj_buf");
+    require_same_dtype(conv_state, dtype_code, kFn, "conv_state");
+    require_same_dtype(conv_w, dtype_code, kFn, "conv_w");
+    require_same_dtype(qkv_buf, dtype_code, kFn, "qkv_buf");
+    if (conv_state.shape(0) != B || conv_state.shape(1) != C ||
+        conv_state.shape(2) != static_cast<size_t>(KS - 1) || conv_w.shape(0) != C ||
+        proj_buf.shape(0) != 2 || proj_buf.shape(1) != B || proj_buf.shape(2) != kDeferredSlots ||
+        proj_buf.shape(3) != C || qkv_buf.shape(0) != 2 || qkv_buf.shape(1) != B ||
+        qkv_buf.shape(2) != C || qkv_buf.shape(3) != kDeferredSlots) {
+        throw std::runtime_error(std::string(kFn) + ": shape mismatch");
+    }
+    require_deferred_ctl(ctl, kFn);
+    require_packed_contiguous(proj, kFn, "proj");
+    require_packed_contiguous(proj_buf, kFn, "proj_buf");
+    require_packed_contiguous(conv_state, kFn, "conv_state");
+    require_packed_contiguous(conv_w, kFn, "conv_w");
+    require_packed_contiguous(qkv_buf, kFn, "qkv_buf");
+    if (conv_b.has_value()) {
+        require_same_dtype(*conv_b, dtype_code, kFn, "conv_b");
+        require_len(*conv_b, C, kFn, "conv_b");
+        require_packed_contiguous(*conv_b, kFn, "conv_b");
+    }
+
+    const bool used = launch_deltanet_conv_deferred_kernel(
+        proj.data(), proj_buf.data(), conv_state.data(), conv_w.data(), opt_data(conv_b),
+        qkv_buf.data(), ctl.data(), B, C, S, KS, dtype_code,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+    return used;
+}
+
+void register_int8_decode(nb::module_& m);
+
 NB_MODULE(_C, m) {
     m.doc() = "ComfyKitchen HIP backend native operations (RDNA2-RDNA4, WMMA on gfx11/gfx12)";
+    register_int8_decode(m);
     m.def("sol_attn_plan", &sol_attn_plan_py,
           "Workspace dims, slot byte offsets and total bytes for this shape and token budget",
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
@@ -1775,9 +2936,36 @@ NB_MODULE(_C, m) {
     m.def("stochastic_round_fp8", &stochastic_round_fp8);
     m.def("scaled_mm_fp8", &scaled_mm_fp8);
     m.def("int8_gemm", &int8_gemm);
+    m.def("rms_gated_residual_bf16", &rms_gated_residual_bf16);
+    m.def("int8_gemm_a_tiled128", &int8_gemm_a_tiled128);
     m.def("convrot_w4a4_gemm", &convrot_w4a4_gemm);
-    m.def("quantize_int8_rowwise", &quantize_int8_rowwise);
-    m.def("quantize_int8_convrot", &quantize_int8_convrot);
+    m.def("fp16_gemm", &fp16_gemm, nb::arg("a"), nb::arg("b"), nb::arg("d"),
+          nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),
+          nb::arg("N"), nb::arg("K"), nb::arg("stream_ptr"));
+    m.def("fp16_conv3d", &fp16_conv3d, nb::arg("x"), nb::arg("w"), nb::arg("bias").none(),
+          nb::arg("resid").none(), nb::arg("out"), nb::arg("N"), nb::arg("D"), nb::arg("H"),
+          nb::arg("W"), nb::arg("C"), nb::arg("K"), nb::arg("T"), nb::arg("R"), nb::arg("S"),
+          nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("stream_ptr"), nb::arg("xs_w") = 0,
+          nb::arg("xs_h") = 0, nb::arg("xs_d") = 0, nb::arg("xs_n") = 0);
+    m.def("memmove", &memmove_bytes, nb::arg("dst"), nb::arg("src"), nb::arg("flags"),
+          nb::arg("stream_ptr"));
+    m.def("quantize_int8_rowwise", &quantize_int8_rowwise, nb::arg("x"), nb::arg("q"),
+          nb::arg("scales"), nb::arg("M"), nb::arg("K"), nb::arg("stream_ptr"),
+          nb::arg("tiled_output") = false);
+    m.def("quantize_int8_convrot", &quantize_int8_convrot, nb::arg("x"), nb::arg("q"),
+          nb::arg("scales"), nb::arg("spill_rotated").none(), nb::arg("spill_partials").none(),
+          nb::arg("M"), nb::arg("K"), nb::arg("group_size"), nb::arg("act_code"),
+          nb::arg("stream_ptr"), nb::arg("act_weight") = nb::none(), nb::arg("act_eps") = 0.0f,
+          nb::arg("tiled_output") = false);
+    m.def("quantize_int8_convrot_modulated", &quantize_int8_convrot_modulated,
+          nb::arg("x"), nb::arg("modulation_scale"), nb::arg("q"), nb::arg("scales"),
+          nb::arg("M"), nb::arg("K"), nb::arg("group_size"), nb::arg("stream_ptr"),
+          nb::arg("tiled_output") = false);
+    m.def("quantize_int8_convrot_rms_modulated_fused_stats",
+          &quantize_int8_convrot_rms_modulated_fused_stats, nb::arg("x"),
+          nb::arg("norm_weight"), nb::arg("modulation_scale"), nb::arg("q"),
+          nb::arg("scales"), nb::arg("M"), nb::arg("K"), nb::arg("group_size"),
+          nb::arg("eps"), nb::arg("stream_ptr"), nb::arg("tiled_output") = false);
     m.def("quantize_int8_tensorwise", &quantize_int8_tensorwise);
     m.def("dequantize_int8_simple", &dequantize_int8_simple);
     m.def("dequantize_int8_convrot_weight", &dequantize_int8_convrot_weight);
@@ -1787,19 +2975,51 @@ NB_MODULE(_C, m) {
           nb::arg("k"), nb::arg("in_code"));
     m.def("unpack_int4", &unpack_int4);
     m.def("dequant_int4_grouped_to_int8", &dequant_int4_grouped_to_int8);
+    m.def("quantize_wxa8_convrot_fused", &quantize_wxa8_convrot_fused);
+    m.def("wxa8_requant_max_k", &wxa8_requant_max_k_kernel, nb::arg("group_size"));
     m.def("quantize_w4a8_convrot", &quantize_w4a8_convrot);
-    m.def("w4a8_requant_max_k", &w4a8_requant_max_k_kernel);
     m.def("w4a8_int8_gemm_chunked", &w4a8_int8_gemm_chunked);
+    m.def("w4a8_codebook_gemv", &w4a8_codebook_gemv);
+    m.def("gated_delta_decode_fused", &gated_delta_decode_fused, nb::arg("mixed_qkv"),
+          nb::arg("x"), nb::arg("w_a"), nb::arg("w_b"), nb::arg("dt_bias"), nb::arg("g_decay"),
+          nb::arg("state"), nb::arg("out"), nb::arg("snapshots").none(), nb::arg("z"),
+          nb::arg("norm_w"), nb::arg("eps"), nb::arg("B"), nb::arg("Hv"), nb::arg("Hk"),
+          nb::arg("S"), nb::arg("DK"), nb::arg("DV"), nb::arg("C"), nb::arg("Hd"),
+          nb::arg("key_dim"), nb::arg("scale"), nb::arg("stream_ptr"));
+    m.def("deltanet_conv_step", &deltanet_conv_step, nb::arg("proj"), nb::arg("conv_state"),
+          nb::arg("conv_w"), nb::arg("conv_b").none(), nb::arg("conv_out"),
+          nb::arg("conv_snaps").none(), nb::arg("B"), nb::arg("C"), nb::arg("S"), nb::arg("KS"),
+          nb::arg("stream_ptr"));
+    m.def("gated_delta_decode_deferred", &gated_delta_decode_deferred, nb::arg("x"),
+          nb::arg("w_a"), nb::arg("w_b"), nb::arg("dt_bias"), nb::arg("g_decay"),
+          nb::arg("qkv_buf"), nb::arg("gates_buf"), nb::arg("sumsq_buf"), nb::arg("ctl"),
+          nb::arg("state"), nb::arg("out"), nb::arg("z"), nb::arg("norm_w"), nb::arg("eps"),
+          nb::arg("key_dim"), nb::arg("num_key_heads"), nb::arg("scale"), nb::arg("stream_ptr"));
+    m.def("deltanet_conv_deferred", &deltanet_conv_deferred, nb::arg("proj"),
+          nb::arg("proj_buf"), nb::arg("conv_state"), nb::arg("conv_w"),
+          nb::arg("conv_b").none(), nb::arg("qkv_buf"), nb::arg("ctl"), nb::arg("stream_ptr"));
     m.def("na3d", &na3d);
     m.def("flash_attention_decode", &flash_attention_decode, nb::arg("q"), nb::arg("k"),
           nb::arg("v"), nb::arg("kv_lengths"), nb::arg("output"), nb::arg("softmax_lse"),
           nb::arg("softmax_lse_accum"), nb::arg("output_accum"), nb::arg("num_splits"),
           nb::arg("stream_ptr"));
+    m.def("flash_attention_decode_gqa", &flash_attention_decode_gqa, nb::arg("q"), nb::arg("k"),
+          nb::arg("v"), nb::arg("kv_lengths"), nb::arg("output"), nb::arg("softmax_lse"),
+          nb::arg("softmax_lse_accum"), nb::arg("output_accum"), nb::arg("num_splits"),
+          nb::arg("causal"), nb::arg("stream_ptr"));
+    m.def("flash_attention_decode_tree_merge", &flash_attention_decode_tree_merge, nb::arg("out"),
+          nb::arg("lse"), nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("mask"),
+          nb::arg("merged"), nb::arg("stream_ptr"));
+    m.def("sage_prepare_key_mask", &sage_prepare_key_mask,
+          nb::arg("mask"), nb::arg("packed"), nb::arg("stream_ptr"));
+    m.def("sage_prepare_dense_mask", &sage_prepare_dense_mask,
+          nb::arg("mask"), nb::arg("packed"), nb::arg("stream_ptr"));
     m.def("sage_sdpa", &sage_sdpa, nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("o"),
           nb::arg("q_int8"), nb::arg("q_scale"), nb::arg("k_int8"), nb::arg("k_scale"),
           nb::arg("v_int8"), nb::arg("v_scale"), nb::arg("anchor_indices"), nb::arg("sm_scale"),
           nb::arg("cta_k"), nb::arg("input_dtype_code"), nb::arg("output_dtype_code"),
-          nb::arg("stream_ptr"), nb::arg("attn_mask") = nb::none());
+          nb::arg("stream_ptr"), nb::arg("attn_mask") = nb::none(),
+          nb::arg("raw_dense_mask") = nb::none());
     m.def("sage_sdpa_quantize", &sage_sdpa_quantize, nb::arg("q"), nb::arg("k"), nb::arg("v"),
           nb::arg("q_int8"), nb::arg("q_scale"), nb::arg("k_int8"), nb::arg("k_scale"),
           nb::arg("v_int8"), nb::arg("v_scale"), nb::arg("anchor_indices"), nb::arg("cta_k"),
@@ -1810,6 +3030,15 @@ NB_MODULE(_C, m) {
           nb::arg("output_dtype_code"), nb::arg("stream_ptr"), nb::arg("attn_mask") = nb::none());
     m.def("adaln", &adaln);
     m.def("rms_adaln", &rms_adaln);
+    m.def("group_norm_silu_pad3d", &group_norm_silu_pad3d, nb::arg("x"), nb::arg("weight").none(),
+          nb::arg("bias").none(), nb::arg("out"), nb::arg("workspace").none(),
+          nb::arg("stats").none(), nb::arg("B"), nb::arg("C"), nb::arg("T"), nb::arg("H"),
+          nb::arg("W"), nb::arg("num_groups"), nb::arg("eps"), nb::arg("left"), nb::arg("right"),
+          nb::arg("top"), nb::arg("bottom"), nb::arg("front"), nb::arg("silu"),
+          nb::arg("zero_pad"), nb::arg("row_stride"), nb::arg("stream_ptr"));
+    m.def("group_norm_stats3d", &group_norm_stats3d, nb::arg("x"), nb::arg("workspace"),
+          nb::arg("stats"), nb::arg("B"), nb::arg("C"), nb::arg("T"), nb::arg("H"), nb::arg("W"),
+          nb::arg("num_groups"), nb::arg("eps"), nb::arg("row_stride"), nb::arg("stream_ptr"));
     m.def("apply_rope", &apply_rope);
     m.def("rms_rope", &rms_rope);
     m.def("gemv_awq_w4a16", &gemv_awq_w4a16);

@@ -13,6 +13,8 @@ from .conftest import (
     assert_values_close,
     cuda_backend_available,
     get_capable_backends,
+    rel_err,
+    requires_cuda_backend,
 )
 
 COMFYUI_NVIDIA_16_SERIES = (
@@ -345,6 +347,29 @@ class TestTensorWiseINT8Layout:
             assert dq.dtype == dtype
             assert dq.shape == w.shape
 
+    @pytest.mark.parametrize("group_size", [64, 256])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    def test_convrot_dequant_kernel_matches_float32_reference(self, seed, group_size, dtype):
+        """The fused ConvRot dequant rotates in float32 and rounds to the output dtype once, like the
+        float32 rotate-then-cast reference, including rows whose scale is near zero."""
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
+        from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_weight
+
+        rows, k = 257, 3 * group_size
+        q = torch.randint(-127, 128, (rows, k), device="cuda", dtype=torch.int8)
+        scale = torch.rand(rows, 1, device="cuda") * 1e-2
+        scale[0] = 1e-9
+        assert cuda._should_use_convrot_dequant_kernel(q, k, group_size)
+        out = cuda.dequantize_int8_convrot_weight_dtype(q, scale, group_size, cuda.DTYPE_TO_CODE[dtype])
+        h = _build_hadamard(group_size, device="cuda", dtype=torch.float32)
+        ref = _rotate_weight(q.float() * scale, h, group_size)
+        assert out.dtype == dtype
+        # a single rounding of a value within float32 summation-order tolerance of the reference
+        tol = 8 * torch.finfo(torch.float32).eps * ref.abs().amax(dim=1, keepdim=True)
+        lo, hi = (ref - tol).to(dtype).float(), (ref + tol).to(dtype).float()
+        assert ((out.float() >= lo) & (out.float() <= hi)).all()
+
     def test_weight_roundtrip_error(self, seed):
         """Roundtrip error stays within INT8 quantization tolerance."""
         from comfy_kitchen.tensor import QuantizedTensor
@@ -367,6 +392,31 @@ class TestTensorWiseINT8Layout:
         assert set(sd.keys()) == {"", "_scale"}
         assert sd[""].dtype == torch.int8
         assert sd["_scale"].numel() == 1
+
+    @pytest.mark.parametrize(("n", "k"), [(128, 1024), (512, 1024), (11520, 3840)])
+    def test_linear_never_relayouts_weight_storage(self, seed, n, k):
+        """Dynamic VRAM owns the weight buffer: linear must read it in place."""
+        import comfy_kitchen as ck
+        from comfy_kitchen.tensor import QuantizedTensor, TensorWiseINT8Layout
+
+        x = torch.randn(512, k, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(
+            w, "TensorWiseINT8Layout", per_channel=True
+        )
+        row_major, scale = TensorWiseINT8Layout.get_plain_tensors(qt)
+        ptr = qt._qdata.data_ptr()
+        snapshot = qt._qdata.clone()
+
+        with torch.inference_mode():
+            reference = ck.int8_linear(
+                x, row_major.clone(), scale, out_dtype=x.dtype
+            )
+            candidate = torch.nn.functional.linear(x, qt)
+
+        assert torch.equal(candidate, reference)
+        assert qt._qdata.data_ptr() == ptr
+        assert torch.equal(qt._qdata, snapshot)
 
     def test_supports_fast_matmul(self):
         """supports_fast_matmul returns True on CUDA SM >= 7.5."""
@@ -920,3 +970,146 @@ class TestTensorWisePublicAPI:
 
         assert out.shape == (17, 1)
         assert out.dtype == torch.bfloat16
+
+
+def test_fused_rms_modulated_declines_batched_modulation():
+    """A per-sample (B > 1) modulation falls back to the unfused composition."""
+    width = 256
+    x = torch.randn(2, 4, width, dtype=torch.bfloat16)
+    norm_weight = torch.ones(width, dtype=torch.bfloat16)
+    modulation_scale = torch.zeros(2, width, dtype=torch.bfloat16)
+
+    # The shape checks run before any weight is inspected.
+    assert (
+        TensorWiseINT8Layout.fused_rms_modulated(
+            x, None, None, norm_weight, 1.0e-6, modulation_scale
+        )
+        is NotImplemented
+    )
+
+
+def test_fused_rms_modulated_declines_without_native_backend():
+    """Without a native kernel the fused method leaves the unfused path to the caller."""
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    torch.manual_seed(0)
+    width = 256
+    x = torch.randn(1, 4, width, dtype=torch.bfloat16)
+    norm_weight = torch.rand(width, dtype=torch.bfloat16) + 0.5
+    modulation_scale = torch.randn(1, width, dtype=torch.bfloat16) * 0.25
+
+    def weight(n, k):
+        return QuantizedTensor.from_float(
+            torch.randn(n, k, dtype=torch.bfloat16), "TensorWiseINT8Layout",
+            per_channel=True, convrot=True, convrot_groupsize=256,
+        )
+
+    qkv = weight(3 * width, width)
+
+    # CPU tensors only match the eager backend.
+    assert TensorWiseINT8Layout.fused_rms_modulated(
+        x, qkv, None, norm_weight, 1.0e-6, modulation_scale
+    ) is NotImplemented
+
+    # An explicit eager override still runs the reference composition.
+    with ck.use_backend("eager"):
+        out = TensorWiseINT8Layout.fused_rms_modulated(
+            x, qkv, None, norm_weight, 1.0e-6, modulation_scale
+        )
+    assert out is not NotImplemented
+    assert out.shape == (1, 4, 3 * width)
+class TestBandedStreamK:
+    """The banded stream-K tile order must give bit-identical output to the identity order."""
+
+    @requires_cuda_backend
+    def test_captured_workspace_survives_larger_gemms(self, seed):
+        """Later GEMMs and captures must not replace a live graph's scratch storage."""
+        if torch.cuda.get_device_capability()[0] < 8:
+            pytest.skip("CUTLASS stream-K requires SM80 or newer")
+
+        from comfy_kitchen.backends import cuda as cuda_backend
+
+        wrap = cuda_backend._wrap_for_dlpack
+        stream = torch.cuda.Stream()
+        cases = []
+        for k, config in [(128, 12), (1024, 12), (4096, 13), (8192, 13)]:
+            a = torch.randint(-8, 8, (128, k), dtype=torch.int8, device="cuda")
+            b = torch.randint(-8, 8, (256, k), dtype=torch.int8, device="cuda")
+            xs = torch.full((128, 1), 0.125, device="cuda")
+            ws = torch.full((256,), 0.0625, device="cuda")
+            out = torch.empty((128, 256), dtype=torch.bfloat16, device="cuda")
+            expected = ((a.float() @ b.float().t()) * xs * ws).bfloat16()
+            cases.append((a, b, xs, ws, out, expected, config))
+        stream.wait_stream(torch.cuda.current_stream())
+
+        def run(case):
+            a, b, xs, ws, out, _, config = case
+            assert cuda_backend._C.cutlass_int8_dequant_config(
+                wrap(a), wrap(b), wrap(xs), wrap(ws), wrap(out), 2, config, stream.cuda_stream
+            )
+
+        first, second = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream):
+            # No workspace warmup: capture must handle the first allocation and growth.
+            with torch.cuda.graph(first, stream=stream):
+                run(cases[0])
+                run(cases[1])
+            with torch.cuda.graph(second, stream=stream):
+                run(cases[2])
+            run(cases[3])
+            for _ in range(5):
+                for case in cases[:3]:
+                    case[4].fill_(float("nan"))
+                second.replay()
+                first.replay()
+                stream.synchronize()
+                for case in cases:
+                    torch.testing.assert_close(case[4], case[5], rtol=0, atol=0)
+            second.reset()
+            run(cases[3])
+            first.replay()
+            stream.synchronize()
+            for case in cases[:2]:
+                torch.testing.assert_close(case[4], case[5], rtol=0, atol=0)
+
+    @staticmethod
+    def _run(m, n, k, config):
+        from comfy_kitchen.backends import cuda as cuda_backend
+        c, wrap = cuda_backend._C, cuda_backend._wrap_for_dlpack
+        stream = torch.cuda.current_stream().cuda_stream
+        a = torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda")
+        b = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+        xs = torch.rand(m, 1, device="cuda") * 0.01
+        ws = torch.rand(n, device="cuda") * 0.01
+        outs = {}
+        for cfg in config:
+            out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+            if cfg == "auto":
+                empty = cuda_backend._empty_cuda_tensor(a.device, torch.bfloat16)
+                assert c.cutlass_int8_dequant(wrap(a), wrap(b), wrap(xs), wrap(ws), wrap(empty), wrap(out), 2, stream)
+            else:
+                assert c.cutlass_int8_dequant_config(wrap(a), wrap(b), wrap(xs), wrap(ws), wrap(out), 2, cfg, stream)
+            outs[cfg] = out
+        ref = (a.float() @ b.float().t()) * xs * ws
+        return outs, ref
+
+    # 37 / 74 N tiles: a short last band; M has enough tiles that both configs band
+    @requires_cuda_backend
+    @pytest.mark.parametrize("m,n,k", [(9600, 9408, 128), (19100, 9408, 128)])
+    def test_bands_match_identity_order(self, m, n, k, seed):
+        outs, ref = self._run(m, n, k, config=[0, 12, 13])
+        assert torch.equal(outs[12], outs[0]) and torch.equal(outs[13], outs[0])
+        assert rel_err(outs[0].float(), ref) < 1e-2
+
+    @requires_cuda_backend
+    def test_large_activation_reroutes_to_banded_stream_k(self):
+        """Config 0 shapes move to banded stream-K past the L2-derived activation size."""
+        from comfy_kitchen.backends import cuda as cuda_backend
+        pick = cuda_backend._C.cutlass_int8_selected_config
+        l2 = torch.cuda.get_device_properties(0).L2_cache_size
+        threshold = max(l2 * 3 // 4, 48 << 20)
+        n, k = 16384, 8192
+        assert pick(2048, n, k) in (0, 1)                 # 16.8 MB: below any threshold
+        m = 9216                                          # 75.5 MB
+        assert pick(m, n, k) == (13 if m * k > threshold else 0)
+        assert pick(4096, 24576, 32768) in (0, 1)         # fewer M tiles than N: no reroute

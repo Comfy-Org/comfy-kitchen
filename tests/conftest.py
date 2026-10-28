@@ -1,3 +1,4 @@
+import math
 import sys
 
 import pytest
@@ -61,6 +62,17 @@ requires_cuda_backend = pytest.mark.skipif(
 )
 
 
+def skip_unless_gfx12_wmma() -> None:
+    if not getattr(torch.version, "hip", None):
+        pytest.skip("requires HIP")
+    if not ck.list_backends().get("hip", {}).get("available", False):
+        pytest.skip("compiled HIP backend required")
+    from comfy_kitchen.backends import hip
+
+    if not hip._has_nonduplicated_wmma():
+        pytest.skip("requires non-duplicated WMMA (gfx12 or gfx117)")
+
+
 @pytest.fixture(scope="session")
 def cuda_available():
     return torch.cuda.is_available()
@@ -103,7 +115,7 @@ def get_capable_backends(func_name: str, device: str | None = None) -> list[str]
     capable = []
     backends = ck.list_backends()
 
-    for backend_name in ["cuda", "hip", "triton", "eager"]:
+    for backend_name in ["ascend", "cuda", "hip", "triton", "eager"]:
         if not backends.get(backend_name, {}).get("available", False):
             continue
 
@@ -125,7 +137,7 @@ def get_supported_devices(func_name: str) -> set[str]:
     devices = set()
     backends = ck.list_backends()
 
-    for backend_name in ["cuda", "hip", "triton", "eager"]:
+    for backend_name in ["ascend", "cuda", "hip", "triton", "eager"]:
         if not backends.get(backend_name, {}).get("available", False):
             continue
 
@@ -259,3 +271,18 @@ def assert_values_close(values, ref_values, rtol, atol, name="values", max_misma
         raise ValueError(
             f"{num_failures} {name} are not close (rtol={rtol}, atol={atol})"
         )
+
+
+def rel_err(got, ref) -> float:
+    """max |got - ref| / max |ref|, in float32 -- the tolerance metric the int8/
+    fp16 GEMM tests use (a single-LSB change in a quantized activation moves
+    whole accumulated sums, so elementwise tolerances are meaningless there)."""
+    got, ref = got.float(), ref.float()
+    return ((got - ref).abs().max() / ref.abs().max().clamp(min=1e-9)).item()
+
+
+def fp16_accum_tol(k: int) -> float:
+    """rel_err tolerance for a kernel that accumulates K fp16 products in fp16
+    against a fp32-accumulate reference: rounding error compounds roughly with
+    sqrt(K) * 2^-11 (3 sigma), floored at 0.5% for short reductions."""
+    return max(0.005, 3.0 * math.sqrt(k) * 2.0 ** -11)

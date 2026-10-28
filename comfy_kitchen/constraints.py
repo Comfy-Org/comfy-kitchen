@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
 __all__ = [
+    "with_out_param",
     "DivisibleBy",
     "ExactDims",
     "FunctionConstraints",
@@ -16,6 +17,7 @@ __all__ = [
     "ValidationResult",
     "validate_function_call",
     "validate_param",
+    "with_w4a8_packed_storage",
 ]
 
 
@@ -350,3 +352,17 @@ def na3d_common_call_rule(kwargs):
             "kernel_size", f"entries must be positive, got {list(kernel_size)}"
         )
     return ValidationResult.ok()
+
+
+def with_out_param(base: FunctionConstraints) -> FunctionConstraints:
+    """The ``_out`` form of an op: base constraints plus a 5-D ``out`` in x's dtypes."""
+    out = ParamConstraint(dtypes=base.params["x"].dtypes, shape_rules=(ExactDims(5),))
+    return replace(base, params={**base.params, "out": out})
+
+
+def with_w4a8_packed_storage(base: FunctionConstraints) -> FunctionConstraints:
+    """Packed linear uses 1D records and empty scales instead of canonical 2D storage."""
+    params = dict(base.params)
+    for name in ("qdata", "s_rel"):
+        params[name] = replace(params[name], shape_rules=(ExactDims(1),))
+    return replace(base, params=params)

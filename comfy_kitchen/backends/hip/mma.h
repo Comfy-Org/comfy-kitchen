@@ -66,6 +66,23 @@ __forceinline__ __device__ T wave_reduce_sum(T v) {
     return v;
 }
 
+// Four int8 products accumulated into a 32-bit sum, the operands packed one per
+// byte. RDNA3/4 spell it v_dot4_i32_iu8 with both operands marked signed; RDNA2
+// has the older v_dot4c_i32_i8 under a different builtin, and the host pass has
+// neither, so both fall back to the arithmetic the instruction performs.
+__forceinline__ __device__ int dot4_i8(int a, int b, int c) {
+#if defined(COMFY_HAS_WMMA)
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#else
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        c += static_cast<int>(static_cast<int8_t>((a >> (i * 8)) & 0xFF)) *
+             static_cast<int>(static_cast<int8_t>((b >> (i * 8)) & 0xFF));
+    }
+    return c;
+#endif
+}
+
 __forceinline__ __device__ int frag_row(int lane) { return lane % 16; }
 
 // Row of accumulator element `e` for this lane; the column is lane % 16. The two
@@ -242,7 +259,15 @@ struct MmaF16 {
     using Frag = v8h;
     using Elem = _Float16;
     static constexpr int kFragElems = 8;
+    // The GEMM core's byte-addressed view: 16 fp16 elements are 32 bytes.
+    static constexpr int kStepBytes = 32;
     static __forceinline__ __device__ int frag_base(int lane) { return 8 * (lane / 16); }
+    static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
+                                                int lane) {
+        return load_frag_16bit<MmaF16>(
+            reinterpret_cast<const _Float16*>(static_cast<const char*>(lds) + row * stride + kbyte),
+            lane);
+    }
     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
     static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
         return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
@@ -345,7 +370,14 @@ struct MmaF16 {
     using Frag = v16h;
     using Elem = _Float16;
     static constexpr int kFragElems = 16;
+    static constexpr int kStepBytes = 32;
     static __forceinline__ __device__ int frag_base(int) { return 0; }
+    static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
+                                                int lane) {
+        return load_frag_16bit<MmaF16>(
+            reinterpret_cast<const _Float16*>(static_cast<const char*>(lds) + row * stride + kbyte),
+            lane);
+    }
     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
     static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
         return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
@@ -408,7 +440,9 @@ struct MmaF16 {
     using Frag = v8h;
     using Elem = _Float16;
     static constexpr int kFragElems = 8;
+    static constexpr int kStepBytes = 32;
     static __forceinline__ __device__ int frag_base(int) { return 0; }
+    static __forceinline__ __device__ Frag load(const void*, int, int, int, int) { return Frag{}; }
     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
     static __forceinline__ __device__ Acc mma(Frag, Frag, Acc c) { COMFY_MMA_STUB_BODY }
     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
