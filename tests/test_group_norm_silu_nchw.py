@@ -4,7 +4,7 @@
 
 import pytest
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as functional
 
 from comfy_kitchen.backends import hip as hip_backend
 from tests.conftest import rel_err
@@ -35,7 +35,7 @@ class TestGroupNormSiluNchw:
         if not cuda_available:
             pytest.skip("CUDA required")
         x, weight, bias = _inputs(b, c, h, w, dtype, groups)
-        ref = F.silu(F.group_norm(x, groups, weight, bias, 1e-6))
+        ref = functional.silu(functional.group_norm(x, groups, weight, bias, 1e-6))
         got = hip_backend.group_norm_silu_nchw(x, weight, bias, groups)
 
         assert got.shape == ref.shape
@@ -53,7 +53,7 @@ class TestGroupNormSiluNchw:
         out = torch.empty_like(x)
         got = hip_backend.group_norm_silu_nchw(x, weight, bias, 32, out=out)
         assert got.data_ptr() == out.data_ptr()
-        assert rel_err(got, F.silu(F.group_norm(x, 32, weight, bias, 1e-6))) < 5 * torch.finfo(
+        assert rel_err(got, functional.silu(functional.group_norm(x, 32, weight, bias, 1e-6))) < 5 * torch.finfo(
             torch.float16
         ).eps
 

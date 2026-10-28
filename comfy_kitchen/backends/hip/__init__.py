@@ -70,7 +70,7 @@ __all__ = [
     "rms_gated_residual",
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
-"quantize_nvfp4",
+    "quantize_nvfp4",
     "dequantize_nvfp4",
     "scaled_mm_nvfp4",
     "group_norm_stats3d",
@@ -825,6 +825,12 @@ def scaled_mm_nvfp4(
 # ---------------------------------------------------------------------------
 # INT8 quantization + GEMM (v_wmma_i32_16x16x16_iu8)
 # ---------------------------------------------------------------------------
+
+def memmove_(dst: torch.Tensor, src: torch.Tensor):
+    """Copy src's bytes to dst on the current stream; the ranges may overlap."""
+    flags = torch.zeros(dst.nbytes // 65536 + 2, dtype=torch.int32, device=dst.device)
+    _C.memmove(_dl(dst.view(torch.uint8).view(-1)), _dl(src.view(torch.uint8).view(-1)), _dl(flags), _stream(dst))
+
 
 def quantize_int8_rowwise(
     x: torch.Tensor,

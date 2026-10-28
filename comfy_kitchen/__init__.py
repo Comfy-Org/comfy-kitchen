@@ -1,7 +1,5 @@
 import torch
 
-from collections.abc import Sequence
-
 from .allocation import set_allocation_context
 from .backends import cuda as _cuda_backend
 
@@ -10,6 +8,7 @@ from .backends import ascend as _ascend_backend  # noqa: F401
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
+from .backends.cuda import memmove_ as _memmove_
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
 from .exceptions import (
@@ -60,6 +59,7 @@ if getattr(torch.version, "hip", None):
     if registry.is_available("hip"):
         registry.set_priority(["hip", "cuda", "triton", "eager"])
         sol_attn_chunked = _hip_backend.sol_attn_chunked
+        _memmove_ = _hip_backend.memmove_
 else:
     registry.mark_unavailable("hip", "PyTorch ROCm/HIP runtime not available")
 
@@ -69,7 +69,6 @@ __all__ = [
     "rms_gated_residual",
     "fp16_conv3d",
     "group_norm_silu_pad3d",
-    "group_norm_silu_pad3d_strips",
     "group_norm_stats3d",
     "rms_adaln",
     # Attention
@@ -153,6 +152,7 @@ __all__ = [
     "to_blocked",
     "from_blocked",
     "set_allocation_context",
+    "memmove",
     # Backend configuration
     "list_backends",
     "set_backend_priority",
@@ -244,6 +244,13 @@ def sol_attn(
         coarse_gate,
         int(token_aug),
     )
+
+
+def memmove(dst: torch.Tensor, src: torch.Tensor):
+    """Copy src's bytes into dst in place; the two ranges may overlap."""
+    if dst.device.type == "cuda" and registry.is_available("hip" if torch.version.hip else "cuda"):
+        return _memmove_(dst, src)
+    dst.copy_(src.clone())
 
 
 def sol_attn_is_available(device: torch.device | None = None) -> bool:
@@ -411,51 +418,6 @@ def group_norm_stats3d(x: torch.Tensor, num_groups: int = 32, eps: float = 1e-6)
     """Per-frame GroupNorm statistics of x [B, C, T, H, W]: float32 [B*T, num_groups, 2]
     of (mean, rstd), for group_norm_silu_pad3d's stats argument."""
     return torch.ops.comfy_kitchen.group_norm_stats3d(x, num_groups, eps)
-
-
-def group_norm_silu_pad3d_strips(
-    x: torch.Tensor,
-    weight: torch.Tensor | None = None,
-    bias: torch.Tensor | None = None,
-    num_groups: int = 32,
-    eps: float = 1e-6,
-    strips: Sequence[tuple[int, int, tuple[int, int, int, int, int]]] = (),
-    outs: Sequence[torch.Tensor] | None = None,
-    silu: bool = True,
-    zero_pad: bool = False,
-) -> list[torch.Tensor]:
-    """Normalize a frame's row strips with the frame's own statistics.
-
-    A strip of a frame is normalized with the *frame's* statistics, so the
-    statistics are computed once for the whole frame and handed to every strip.
-    Each strip is read where it lies -- a row strip of a channels_last frame is
-    a view, not a copy -- so a frame split into strips moves the same bytes
-    over the bus as the whole-frame call.
-
-    Measured on the 6-WGP 780M, the strip workflow against the whole-frame
-    call at 1024x1024: 0.99x with 4 strips, 0.89x with 16 (the difference
-    is the per-strip launch), 0.90x at 512x512 with 8 strips and 0.87x at
-    256x256 with 4. The statistics are 30-38% of it.
-
-    strips: one (first_row, last_row, pad) per strip, where pad is the
-        (left, right, top, bottom, front) that strip needs: the frame's top and
-        bottom padding belong to the first and the last strip.
-    outs: one output buffer per strip, or None to allocate.
-
-    The per-strip results are returned; with outs they are written into those
-    buffers instead.
-    """
-    stats = group_norm_stats3d(x, num_groups, eps) if weight is not None else None
-    results = []
-    for i, (first, last, pad) in enumerate(strips):
-        out = None if outs is None else outs[i]
-        results.append(
-            group_norm_silu_pad3d(
-                x[:, :, :, first:last], weight, bias, num_groups, eps, list(pad),
-                silu, zero_pad, out, stats,
-            )
-        )
-    return results
 
 
 def rms_adaln(
