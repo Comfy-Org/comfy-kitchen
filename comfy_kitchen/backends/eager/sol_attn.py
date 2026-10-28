@@ -58,7 +58,7 @@ def _block_lengths(t: int, n: int, device, block_len=None) -> torch.Tensor:
         return lengths
     lengths = torch.full((n,), float(BLOCK), device=device)
     if tail < BLOCK:
-        lengths[-1] = float(tail)
+        lengths[-1:].fill_(float(tail))
     return lengths
 
 
