@@ -2621,46 +2621,6 @@ def ndhwc_to_nchw(src: torch.Tensor, out: torch.Tensor | None = None) -> torch.T
     return out
 
 
-def group_norm_silu_nchw(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    num_groups: int,
-    eps: float = 1e-6,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """GroupNorm over a packed NCHW x [B, C, H, W] with SiLU fused into the
-    apply pass.
-
-    torch's `silu(group_norm(x))` costs four streaming passes over the
-    activation: the norm reads x and writes its output, the SiLU reads that and
-    writes again. The group statistics cannot be known before the whole group is
-    read, so the fused kernel still needs two reads and one write -- but it
-    never materializes the intermediate. Measured on the 6-WGP 780M, fp16, the
-    pair runs at 19-36 GB/s of four passes and the kernel at 83-99 GB/s of three,
-    which is 1.8-3.0x on the SDXL resnet shapes (2.1x on the largest ones, where
-    both sides are limited by main memory).
-
-    x, weight, bias and out must be float16 or bfloat16 and packed-contiguous;
-    anything else is left to the caller.
-    """
-    if out is None:
-        out = torch.empty_like(x)
-    _C.group_norm_silu_nchw(_dl(x), _dl(weight), _dl(bias), _dl(out), x.shape[0],
-                            x.shape[1], x.shape[2], x.shape[3], num_groups, eps,
-                            _stream(x))
-    return out
-
-
-def group_norm_silu_nchw_is_available() -> bool:
-    """Whether the extension in this build carries the fused NCHW GroupNorm+SiLU.
-
-    The kernel is elementwise, so every architecture the extension builds for
-    can run it; this only catches an extension built before the kernel existed.
-    """
-    return _EXT_AVAILABLE and hasattr(_C, "group_norm_silu_nchw")
-
-
 def group_norm_silu_pad3d(
     x: torch.Tensor,
     weight: torch.Tensor | None,
