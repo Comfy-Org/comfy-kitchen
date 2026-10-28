@@ -366,16 +366,22 @@ def fp16_conv3d(
     residual: torch.Tensor | None = None,
     stride: int | tuple[int, int, int] = 1,
     out: torch.Tensor | None = None,
+    zero_border: bool = False,
 ) -> torch.Tensor:
     """fp16-accumulate conv3d with bias and residual fused into the epilogue.
 
     x [N, C, D, H, W], weight [K, C, T, R, S], zero padding only. Same opt-in
     numerics as fp16_linear; shapes the kernel declines run torch's conv. x and out may be
     NDHWC-ordered views of larger tensors, so a tiled conv needs no per-tile copies.
+
+    zero_border reads a border of zeros around x instead of asking the caller to
+    pad it: the border is (R-1)/2 and (S-1)/2, so the output is x's size. It
+    saves the caller a copy of the whole activation, which on this part is the
+    scattered direction.
     """
     stride = [stride] * 3 if isinstance(stride, int) else list(stride)
     if out is None:
-        return torch.ops.comfy_kitchen.fp16_conv3d(x, weight, bias, residual, stride)
+        return torch.ops.comfy_kitchen.fp16_conv3d(x, weight, bias, residual, stride, zero_border)
     torch.ops.comfy_kitchen.fp16_conv3d_out(x, weight, bias, residual, stride, out)
     return out
 
