@@ -361,6 +361,9 @@ extern "C" {
     void launch_closest_point_on_mesh(const void* points, int n_points, const void* tris, const void* tri_index,
                                       int n_leaves, const void* child, const void* box, float max_dist, void* dist,
                                       void* closest, void* face, cudaStream_t stream);
+    void launch_closest_hit_on_mesh(const void* origins, const void* directions, int n_rays, const void* tris,
+                                    const void* tri_index, int n_leaves, const void* child, const void* box, float tmin,
+                                    float tmax, bool cull_backface, void* t, void* face, cudaStream_t stream);
 
     // Union-find connected components — see ops/connected_components.cu.
     void launch_connected_components(const void* edges, int64_t n_edges, bool edges_int64, int n_nodes,
@@ -1875,6 +1878,14 @@ void closest_point_on_mesh(cuda_array points, int n_points, cuda_array tris, cud
     launch_closest_point_on_mesh(points.data(), n_points, tris.data(), tri_index.data(), n_leaves, child.data(),
                                  box.data(), max_dist, dist.data(), closest.data(), face.data(),
                                  reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void closest_hit_on_mesh(cuda_array origins, cuda_array directions, int n_rays, cuda_array tris, cuda_array tri_index,
+                         int n_leaves, cuda_array child, cuda_array box, float tmin, float tmax, bool cull_backface,
+                         cuda_array t, cuda_array face, uintptr_t stream_ptr) {
+    launch_closest_hit_on_mesh(origins.data(), directions.data(), n_rays, tris.data(), tri_index.data(), n_leaves,
+                               child.data(), box.data(), tmin, tmax, cull_backface, t.data(), face.data(),
+                               reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 void connected_components(cuda_array edges, int64_t n_edges, bool edges_int64, int n_nodes, cuda_array parent,
@@ -5391,6 +5402,10 @@ NB_MODULE(_C, m) {
           nb::arg("points"), nb::arg("n_points"), nb::arg("tris"), nb::arg("tri_index"), nb::arg("n_leaves"),
           nb::arg("child"), nb::arg("box"), nb::arg("max_dist"), nb::arg("dist"), nb::arg("closest"), nb::arg("face"),
           nb::arg("stream_ptr"));
+    m.def("closest_hit_on_mesh", &closest_hit_on_mesh, "Nearest ray hit on a BVH'd triangle mesh per ray",
+          nb::arg("origins"), nb::arg("directions"), nb::arg("n_rays"), nb::arg("tris"), nb::arg("tri_index"),
+          nb::arg("n_leaves"), nb::arg("child"), nb::arg("box"), nb::arg("tmin"), nb::arg("tmax"),
+          nb::arg("cull_backface"), nb::arg("t"), nb::arg("face"), nb::arg("stream_ptr"));
     m.def("connected_components", &connected_components, "Union-find connected components of an edge list",
           nb::arg("edges"), nb::arg("n_edges"), nb::arg("edges_int64"), nb::arg("n_nodes"), nb::arg("parent"),
           nb::arg("labels"), nb::arg("stream_ptr"));

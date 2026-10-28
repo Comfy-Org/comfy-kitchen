@@ -896,7 +896,7 @@ jobs:
 
       - name: Build CUDA abi3 wheel
         env:
-          COMFY_CUDA_ARCHS: "100f;120f"
+          COMFY_CUDA_ARCHS: "120f"
         shell: bash
         run: |
           set -x

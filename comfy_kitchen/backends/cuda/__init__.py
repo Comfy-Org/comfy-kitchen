@@ -35,6 +35,7 @@ __all__ = [
     "delaunay3d",
     "mesh_bvh",
     "closest_point_on_mesh",
+    "closest_hit_on_mesh",
     "connected_components",
     "edge_collapse_checks",
     "min_cut",
@@ -3483,6 +3484,25 @@ def closest_point_on_mesh(
     return dist, closest, face
 
 
+def closest_hit_on_mesh(
+    bvh: MeshBVH, origins: torch.Tensor, directions: torch.Tensor, tmin: float = 0.0, tmax: float = float("inf"),
+    cull_backface: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _check_shape("origins", origins, (None, 3))
+    _check_shape("directions", directions, (origins.shape[0], 3))
+    if bvh.triangles.device != origins.device or directions.device != origins.device:
+        raise ValueError(f"bvh is on {bvh.triangles.device}, origins on {origins.device} and directions on "
+                         f"{directions.device}")
+    n = origins.shape[0]
+    t = torch.empty(n, dtype=torch.float32, device=origins.device)
+    face = torch.empty(n, dtype=torch.int64, device=origins.device)
+    w = _wrap_for_dlpack
+    _C.closest_hit_on_mesh(w(origins.contiguous()), w(directions.contiguous()), n, w(bvh.triangles), w(bvh.index),
+                           bvh.triangles.shape[0], w(bvh.child), w(bvh.box), float(tmin), float(tmax),
+                           bool(cull_backface), w(t), w(face), torch.cuda.current_stream(origins.device).cuda_stream)
+    return t, face
+
+
 def _check_count(name: str, value) -> int:
     """A size the kernels index with: a non-negative integer."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -4538,6 +4558,14 @@ def _build_constraints() -> dict:
         ),
         "closest_point_on_mesh": FunctionConstraints(
             params={"points": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(2),))},
+            default_devices=cuda_devices,
+            min_compute_capability=(7, 5),
+        ),
+        "closest_hit_on_mesh": FunctionConstraints(
+            params={
+                "origins": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(2),)),
+                "directions": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(2),)),
+            },
             default_devices=cuda_devices,
             min_compute_capability=(7, 5),
         ),
