@@ -22,7 +22,8 @@ class BackendRegistry:
         self._backends = {}  # {name: backend_module}
         self._capabilities = {}  # {name: set of function names}
         self._constraints = {}  # {(backend_name, func_name): FunctionConstraints}
-        self._priority = ["ascend", "cuda", "triton", "eager"]
+        # tilelang takes fp16 adapter calls on NVIDIA sm_70+ and times triton's kernel against its own.
+        self._priority = ["ascend", "cuda", "tilelang", "triton", "eager"]
         self._disabled = set()  # Manually disabled backends
         self._unavailable = {}  # {name: error_message} for failed backends
         self._lock = threading.Lock()
@@ -91,6 +92,16 @@ class BackendRegistry:
         """
         with self._lock:
             self._disabled.discard(backend_name)
+
+    def selection_state(self) -> tuple:
+        """Everything backend selection depends on besides the call itself:
+        priority, registered and disabled backends, this thread's override."""
+        return (
+            tuple(self._priority),
+            frozenset(self._backends),
+            frozenset(self._disabled),
+            getattr(self._thread_local, "backend_override", None),
+        )
 
     def set_priority(self, priority_list: list[str]):
         """Set backend selection priority order.
