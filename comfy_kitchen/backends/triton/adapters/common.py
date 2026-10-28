@@ -144,11 +144,19 @@ def measurer(
             state["ref"] = run(TORCH, state["sets"][0])()
         sets = state["sets"]
 
-        # Compile every kernel config of the shortlist concurrently.
+        # Compile every kernel config of the shortlist concurrently, each worker on the operands' device.
         kernels = [c for c in configs if "impl" not in c]
         if len(kernels) > 1:
+            api = getattr(torch, dev.kind)
+            api.synchronize(dev.index)
+
+            def warm(c):
+                with api.device(dev.index):
+                    _warm(run, c, sets[0])
+                    api.synchronize(dev.index)
+
             with ThreadPoolExecutor(len(kernels)) as pool:
-                list(pool.map(lambda c: _warm(run, c, sets[0]), kernels))
+                list(pool.map(warm, kernels))
 
         valid = []
         for c in configs:

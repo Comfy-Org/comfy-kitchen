@@ -582,7 +582,8 @@ def _merge_bwd_run(cfg, g2, f1, f2, scale):
             torch.einsum("acbd,cd->ab", g4, f2).mul_(scale),
             torch.einsum("acbd,ab->cd", g4, f1).mul_(scale),
         )
-    gw1 = torch.empty_like(f1)
+    # Row-major whatever f1's strides: the kernel stores g_w1[u, v] at u * b + v.
+    gw1 = torch.empty(a, b, device=f1.device, dtype=f1.dtype)
     split = min(cfg["SPLIT"], a * b)
     part = torch.empty(split, c, d, device=f2.device, dtype=torch.float32)
     nc, nd = triton.cdiv(c, cfg["BLOCK_M"]), triton.cdiv(d, cfg["BLOCK_N"])

@@ -597,9 +597,17 @@ def _bwd_run(
     rows, cols, sr, k2, s1, s2 = _axes(w, on_output)
     gw = torch.empty_like(w)
     gd = torch.empty(rows, device=w.device, dtype=dora_scale.dtype)
-    gb = torch.empty_like(base) if b_role == eager.GIVEN else absent(w)
-    gn = torch.empty_like(norm_weight) if n_role == eager.GIVEN else absent(w)
-    gdl = torch.empty_like(delta) if delta is not None else absent(w)
+    # The kernel writes contiguous offsets: a channels_last input still gets a contiguous grad.
+    cf = torch.contiguous_format
+    gb = (
+        torch.empty_like(base, memory_format=cf) if b_role == eager.GIVEN else absent(w)
+    )
+    gn = (
+        torch.empty_like(norm_weight, memory_format=cf)
+        if n_role == eager.GIVEN
+        else absent(w)
+    )
+    gdl = torch.empty_like(delta, memory_format=cf) if delta is not None else absent(w)
     _decompose_bwd_kernel[(triton.cdiv(rows, cfg["BLOCK_M"]),)](
         g,
         w,

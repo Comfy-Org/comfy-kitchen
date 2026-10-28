@@ -40,6 +40,9 @@ cublas = [
 # fp16 adapter kernels on NVIDIA sm_70+ (the tensor-core path below sm_80).
 tilelang = [
     "tilelang>=0.1.15",
+    # The TileLang backend shares the triton adapters' tuner and whole-op candidates.
+    "triton; sys_platform == 'linux'",
+    "triton-windows; sys_platform == 'win32'",
 ]
 dev = [
     "pytest>=7.0.0",

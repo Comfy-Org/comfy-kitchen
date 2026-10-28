@@ -184,10 +184,16 @@ def _measure(dev: DeviceInfo) -> Throughput:
 
 
 def throughput(dev: DeviceInfo) -> Throughput | None:
-    """Measured DRAM bandwidth and matmul rates; None while capturing before the first measurement."""
+    """Measured DRAM bandwidth and matmul rates; None while capturing before the first
+    measurement, or when the device has no room for it (measured again on a later call).
+    """
     if _measure.cache_info().currsize == 0 and _capturing(dev):
         return None
-    return _measure(dev)
+    try:
+        return _measure(dev)
+    except torch.OutOfMemoryError:
+        getattr(torch, dev.kind).empty_cache()
+        return None
 
 
 def _smem_unit(dev: DeviceInfo) -> int:

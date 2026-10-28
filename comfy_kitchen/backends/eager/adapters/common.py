@@ -12,9 +12,9 @@ _CHOICES: dict[tuple, object] = {}
 
 
 def _signature(kwargs) -> tuple:
-    """Dispatch cache key: each tensor's dtype, device and rank, every other argument's value."""
+    """Dispatch cache key: each tensor's dtype, device and rank, every other argument's type."""
     return tuple(
-        (k, v.dtype, v.device, v.dim()) if isinstance(v, Tensor) else (k, v)
+        (k, v.dtype, v.device, v.dim()) if isinstance(v, Tensor) else (k, type(v))
         for k, v in kwargs.items()
     )
 

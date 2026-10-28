@@ -191,8 +191,12 @@ class Tuner:
         self._failures[_freeze(config)] = reason
 
     def demote(self, dev: DeviceInfo, key: Key) -> None:
-        """A config this device could not build: the key runs torch from now on."""
-        self._chosen[(dev.arch, key)] = TORCH
+        """A config this device could not build: the key runs torch from now on,
+        and its cached winner is dropped so a later process tunes it again."""
+        with self._lock:
+            self._chosen[(dev.arch, key)] = TORCH
+            if self._cache(dev).pop(key, None) is not None:
+                self._persist(dev)
 
     def reset(self) -> None:
         with self._lock:
