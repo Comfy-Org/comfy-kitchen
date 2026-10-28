@@ -185,7 +185,7 @@ def _measure(dev: DeviceInfo) -> Throughput:
 
 def throughput(dev: DeviceInfo) -> Throughput | None:
     """Measured DRAM bandwidth and matmul rates; None while capturing before the first
-    measurement, or when the device has no room for it (measured again on a later call).
+    measurement, or when the device has no room for it (measured again on a later ranking pass).
     """
     if _measure.cache_info().currsize == 0 and _capturing(dev):
         return None
@@ -233,15 +233,14 @@ def blocks_per_sm(dev: DeviceInfo, w: Work) -> int:
     )
 
 
-def predict(dev: DeviceInfo, w: Work) -> float | None:
-    """Model seconds of one launch, or None when a program cannot be resident."""
+def predict(dev: DeviceInfo, w: Work, rates: Throughput | None) -> float | None:
+    """Model seconds of one launch at rates (throughput(dev)), or None when a program cannot be resident."""
     blocks = blocks_per_sm(dev, w)
     if blocks < 1:
         return None
     slots = dev.units * blocks
     waves = max(1, math.ceil(w.grid / slots))
     wave_eff = w.grid / (waves * slots)
-    rates = throughput(dev)
 
     # Programs resident in each wave: full waves, then the remainder.
     full, rest = divmod(w.grid, slots)
@@ -277,6 +276,8 @@ def predict(dev: DeviceInfo, w: Work) -> float | None:
 
 def rank(dev: DeviceInfo, configs: list[dict], work) -> list[dict]:
     """Kernel configs (no "impl" key) that fit, best first; work(config) -> Work."""
+    # One measurement (or one failed one) serves the whole ranking pass.
+    rates = throughput(dev) if ORDER["by"] == "time" else None
     scored = []
     for c in configs:
         if "impl" in c:
@@ -288,7 +289,7 @@ def rank(dev: DeviceInfo, configs: list[dict], work) -> list[dict]:
             regs, smem = footprint(dev, w)
             score = (smem, regs * w.warps, w.warps)
         else:
-            t = predict(dev, w)
+            t = predict(dev, w, rates)
             if t is None:
                 continue
             score = (t,)

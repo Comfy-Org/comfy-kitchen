@@ -138,10 +138,15 @@ def measurer(
 
     def measure(configs: list[dict]) -> list[float]:
         if not state:
-            state["sets"] = [
-                make_inputs() for _ in range(buffer_sets(bytes_per_call, dev))
-            ]
-            state["ref"] = run(TORCH, state["sets"][0])()
+            # Input copies and the torch reference; on OOM nothing stays allocated and the tuner falls back.
+            try:
+                state["sets"] = [
+                    make_inputs() for _ in range(buffer_sets(bytes_per_call, dev))
+                ]
+                state["ref"] = run(TORCH, state["sets"][0])()
+            except torch.OutOfMemoryError:
+                state.clear()
+                raise
         sets = state["sets"]
 
         # Compile every kernel config of the shortlist concurrently, each worker on the operands' device.

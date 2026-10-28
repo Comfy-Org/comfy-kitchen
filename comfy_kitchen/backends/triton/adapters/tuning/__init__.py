@@ -123,7 +123,12 @@ class Tuner:
                 if self.mode == "off" or _capturing(dev):
                     # Not remembered: the key is timed once timing is possible.
                     return _model_pick(ranked)
-                config = self.tune(dev, key, ranked, measure)
+                try:
+                    config = self.tune(dev, key, ranked, measure)
+                except torch.OutOfMemoryError:
+                    # No room to time candidates: torch for this process, nothing written to disk.
+                    getattr(torch, dev.kind).empty_cache()
+                    config = TORCH
             self._chosen[memo] = config
             return config
 
