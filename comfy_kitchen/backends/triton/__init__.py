@@ -27,6 +27,9 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "flash_attn",
+    "l2_norm_silu",
+    "conv3d_hw_same",
 ]
 
 # Try to import triton and register if available
@@ -54,6 +57,9 @@ try:
     )
 
     from .adaln import adaln, rms_adaln
+    from .attention import flash_attn
+    from .conv3d_hw_same import conv3d_hw_same
+    from .l2_norm_silu import l2_norm_silu
     from .na import na3d
     from .quantization import (
         dequantize_nvfp4,
@@ -125,6 +131,73 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _rms_rope_call_rule(kwargs):
+        # only the norm_over_heads form has extra layout needs; the per-head form is unchanged
+        if not kwargs.get("norm_over_heads"):
+            return ValidationResult.ok()
+        q, k, freqs = kwargs.get("q"), kwargs.get("k"), kwargs.get("freqs_cis")
+        q_scale = kwargs.get("q_scale")
+        k_scale = kwargs.get("k_scale") if kwargs.get("k_scale") is not None else q_scale
+        if q is None or k is None or freqs is None or q_scale is None:
+            return ValidationResult.ok()
+        if q.dim() != 4 or k.shape != q.shape or k.dtype != q.dtype:
+            return ValidationResult.fail("k", "norm_over_heads: q and k must be [B, S, H, head_dim] of one shape and dtype")
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            return ValidationResult.fail("q", f"norm_over_heads: fp16/bf16 only, got {q.dtype}")
+        if not q.is_contiguous() or not k.is_contiguous():
+            return ValidationResult.fail("q", "norm_over_heads: q and k must be contiguous")
+        _, seq_len, heads, head_dim = q.shape
+        if head_dim % 2 or heads * head_dim > 16384:
+            return ValidationResult.fail("q", f"norm_over_heads: H * head_dim {heads * head_dim} too wide or head_dim odd")
+        if (freqs.dim() != 6 or freqs.dtype != torch.float32 or freqs.shape[0] != 1
+                or freqs.shape[1] not in (1, seq_len) or freqs.shape[2] != 1
+                or freqs.shape[3:] != (head_dim // 2, 2, 2)):
+            return ValidationResult.fail("freqs_cis", "norm_over_heads: freqs must be float32 [1, S | 1, 1, head_dim/2, 2, 2]")
+        if q_scale.numel() != heads * head_dim or k_scale.numel() != heads * head_dim:
+            return ValidationResult.fail("q_scale", "norm_over_heads: scales need H * head_dim elements")
+        return ValidationResult.ok()
+
+    def _flash_attn_call_rule(kwargs):
+        q, k, v = kwargs.get("q"), kwargs.get("k"), kwargs.get("v")
+        if q is None or k is None or v is None:
+            return ValidationResult.ok()
+        if k.shape != v.shape or q.shape[0] != k.shape[0] or q.shape[2:] != k.shape[2:]:
+            return ValidationResult.fail("k", "q [B, S_q, H, D] and k, v [B, S_k, H, D] must agree")
+        if k.dtype != q.dtype or v.dtype != q.dtype:
+            return ValidationResult.fail("k", "q, k, v must share one dtype")
+        if q.shape[-1] not in (64, 128):
+            return ValidationResult.fail("q", f"head_dim must be 64 or 128, got {q.shape[-1]}")
+        if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+            return ValidationResult.fail("q", "q, k, v need a unit stride on head_dim")
+        return ValidationResult.ok()
+
+    def _conv3d_hw_same_call_rule(kwargs):
+        x, weight, bias = kwargs.get("x"), kwargs.get("weight"), kwargs.get("bias")
+        if x is None or weight is None:
+            return ValidationResult.ok()
+        if x.shape[0] != 1:
+            return ValidationResult.fail("x", f"batch 1 only, got {x.shape[0]}")
+        if weight.dtype != x.dtype or (bias is not None and bias.device != x.device):
+            return ValidationResult.fail("weight", "weight must have x's dtype, bias x's device")
+        if weight.shape[1] != x.shape[1] or weight.shape[3] % 2 == 0 or weight.shape[4] % 2 == 0:
+            return ValidationResult.fail("weight", "weight must be [Co, Ci, kt, odd kh, odd kw]")
+        if weight.shape[2] > x.shape[2]:
+            return ValidationResult.fail("weight", "kt > T")
+        upsample = kwargs.get("upsample", 1)
+        if upsample not in (1, 2) or (upsample == 2 and tuple(weight.shape[2:]) != (1, 3, 3)):
+            return ValidationResult.fail("upsample", "upsample is 1, or 2 with a [Co, Ci, 1, 3, 3] weight")
+        return ValidationResult.ok()
+
+    def _l2_norm_silu_call_rule(kwargs):
+        x, weight = kwargs.get("x"), kwargs.get("weight")
+        if x is None or weight is None:
+            return ValidationResult.ok()
+        if x.dim() < 3:
+            return ValidationResult.fail("x", "x must be [B, C, *spatial]")
+        if weight.numel() != x.shape[1]:
+            return ValidationResult.fail("weight", f"weight needs {x.shape[1]} elements")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -235,6 +308,7 @@ def _build_constraints() -> dict:
                 "k_scale": ParamConstraint(dtypes=standard_floats),
             },
             default_devices=triton_devices,
+            call_rules=(_rms_rope_call_rule,),
         ),
         "int8_linear": FunctionConstraints(
             params={
@@ -326,6 +400,33 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
+    half_floats = frozenset({torch.float16, torch.bfloat16})
+    out["flash_attn"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(4),)),
+            "k": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(4),)),
+            "v": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(4),)),
+        },
+        default_devices=triton_devices,
+        call_rules=(_flash_attn_call_rule,),
+    )
+    out["conv3d_hw_same"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(5),)),
+            "weight": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(5),)),
+            "bias": ParamConstraint(dtypes=standard_floats | {type(None)}),
+        },
+        default_devices=triton_devices,
+        call_rules=(_conv3d_hw_same_call_rule,),
+    )
+    out["l2_norm_silu"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=half_floats),
+            "weight": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=triton_devices,
+        call_rules=(_l2_norm_silu_call_rule,),
+    )
     out["na3d"] = FunctionConstraints(
         params={
             "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),

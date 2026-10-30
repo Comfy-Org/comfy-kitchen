@@ -231,6 +231,7 @@ from comfy_kitchen.constraints import (  # noqa: E402
     ParamConstraint,
     ValidationResult,
     na3d_common_call_rule,
+    rms_rope_norm_over_heads_call_rule,
     sol_attn_common_call_rule,
     with_out_param,
     with_w4a8_packed_storage,
@@ -4787,7 +4788,7 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
-            call_rules=(_validate_cuda_rms_rope,),
+            call_rules=(rms_rope_norm_over_heads_call_rule, _validate_cuda_rms_rope),
         ),
         "rms_rope1": FunctionConstraints(
             params={
