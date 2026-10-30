@@ -63,7 +63,7 @@ class TestLinearQkRmsNormTriton:
         ref32 = eager_backend.linear_qk_rms_norm(x.float(), w.float(), None if bb is None else bb.float(),
                                                  qs.float(), ks.float(), head_dim, 1e-6)
         tol = 1e-2 if dtype == torch.bfloat16 else 2e-3
-        for g, r, r32 in zip(got, ref, ref32):
+        for g, r, r32 in zip(got, ref, ref32, strict=True):
             assert g.shape == r.shape and g.dtype == r.dtype
             assert _rel(g, r) < tol
             assert _rel(g, r32) < tol
