@@ -70,8 +70,10 @@ __all__ = [
     "fp16_conv3d",
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
+    "l2_norm_silu",
     "rms_adaln",
     # Attention
+    "flash_attn",
     "PrequantizedInt8Attention",
     "int8_attention",
     "int8_attention_from_prequantized",
@@ -407,6 +409,45 @@ def group_norm_silu_pad3d(
     torch.ops.comfy_kitchen.group_norm_silu_pad3d_out(
         x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, out, stats)
     return out
+
+
+def l2_norm_silu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: float,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Channel L2 norm, scale, weight and SiLU in one pass.
+
+    ``silu(x / max(||x||_2, eps) * scale * weight)`` with the norm over dim 1 of a
+    channel-first x ``[B, C, *spatial]`` and one weight per channel: the
+    ``F.normalize(x, dim=1) * scale * gamma`` RMS norm of the Wan VAE (scale
+    ``sqrt(C)``, eps as in ``F.normalize``) followed by its SiLU. The weight is
+    rounded to x's dtype first.
+    """
+    return torch.ops.comfy_kitchen.l2_norm_silu(x, weight, float(scale), eps)
+
+
+def flash_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Dense non-causal attention, no mask, on ``[B, S, H, head_dim]`` tensors.
+
+    Args:
+        q: ``(B, S_q, H, head_dim)``.
+        k, v: ``(B, S_k, H, head_dim)``.
+        scale: Score scale; None means ``head_dim ** -0.5``. The Triton kernel
+            applies it to the fp32 scores, so q is not prescaled.
+
+    Returns:
+        ``(B, S_q, H, head_dim)`` contiguous output. Triton takes fp16/bf16 with
+        head_dim 64 or 128 and a unit stride on head_dim; anything else runs
+        SDPA (eager).
+    """
+    return torch.ops.comfy_kitchen.flash_attn(q, k, v, scale)
 
 
 def group_norm_stats3d(x: torch.Tensor, num_groups: int = 32, eps: float = 1e-6) -> torch.Tensor:
@@ -786,6 +827,7 @@ def rms_rope(
     q_scale: torch.Tensor,
     k_scale: torch.Tensor | None = None,
     epsilon: float = 1e-6,
+    norm_over_heads: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply per-head RMSNorm followed by interleaved RoPE to query and key tensors.
 
@@ -798,11 +840,17 @@ def rms_rope(
         q_scale: Per-dimension RMSNorm scale for q.
         k_scale: Optional per-dimension RMSNorm scale for k. Defaults to q_scale.
         epsilon: RMSNorm numerical-stability epsilon.
+        norm_over_heads: Normalize over each token's whole ``H * head_dim`` row instead
+            of per head: an ``RMSNorm(dim)`` applied before the head split (Wan). q and k
+            are then ``[B, S, H, head_dim]``, the scales have ``H * head_dim`` entries and
+            freqs broadcast over the heads. Backends without it (CUDA, HIP, Ascend)
+            decline, so it runs on Triton or eager.
 
     Returns:
         Tuple of normalized and rotated (query, key) tensors.
     """
-    return torch.ops.comfy_kitchen.rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon)
+    return torch.ops.comfy_kitchen.rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon,
+                                            norm_over_heads)
 
 
 def rms_rope_(

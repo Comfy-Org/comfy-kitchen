@@ -6,7 +6,9 @@ __all__ = [
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
     "group_norm_stats3d",
+    "l2_norm_silu",
     "na3d",
+    "flash_attn",
     "sol_attn",
     "rms_adaln",
     "apply_rope",
@@ -75,6 +77,7 @@ from comfy_kitchen.constraints import (
 from comfy_kitchen.registry import registry
 
 from .adaln import adaln, rms_adaln
+from .attention import flash_attn
 from .awq import gemv_awq_w4a16
 from .conv3d import fp16_conv3d, fp16_conv3d_out
 from .convrot_w4a4 import (
@@ -84,6 +87,7 @@ from .convrot_w4a4 import (
     quantize_convrot_w4a4_weight,
 )
 from .group_norm_pad3d import group_norm_silu_pad3d, group_norm_silu_pad3d_out, group_norm_stats3d
+from .l2_norm_silu import l2_norm_silu
 from .na import na3d
 from .quantization import (
     dequantize_int8_convrot_weight,
@@ -692,6 +696,21 @@ def _build_constraints() -> dict:
         },
         default_devices=all_devices,
         call_rules=(na3d_common_call_rule,),
+    )
+    out["flash_attn"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(4),)),
+            "k": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(4),)),
+            "v": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(4),)),
+        },
+        default_devices=all_devices,
+    )
+    out["l2_norm_silu"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "weight": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
     )
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in out:

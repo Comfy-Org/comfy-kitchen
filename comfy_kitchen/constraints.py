@@ -354,6 +354,15 @@ def na3d_common_call_rule(kwargs):
     return ValidationResult.ok()
 
 
+def rms_rope_norm_over_heads_call_rule(kwargs):
+    """For backends whose ``rms_rope`` normalizes each head on its own: decline
+    ``norm_over_heads`` (one RMS over the whole H * head_dim row), which only the
+    eager and Triton backends implement."""
+    if kwargs.get("norm_over_heads"):
+        return ValidationResult.fail("norm_over_heads", "full-row RMSNorm not implemented")
+    return ValidationResult.ok()
+
+
 def with_out_param(base: FunctionConstraints) -> FunctionConstraints:
     """The ``_out`` form of an op: base constraints plus a 5-D ``out`` in x's dtypes."""
     out = ParamConstraint(dtypes=base.params["x"].dtypes, shape_rules=(ExactDims(5),))

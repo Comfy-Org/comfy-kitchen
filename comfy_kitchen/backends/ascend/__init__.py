@@ -28,6 +28,7 @@ from comfy_kitchen.constraints import (
     MinDims,
     ParamConstraint,
     ValidationResult,
+    rms_rope_norm_over_heads_call_rule,
 )
 from comfy_kitchen.registry import registry
 from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
@@ -738,7 +739,7 @@ def _build_constraints() -> dict[str, FunctionConstraints]:
                         "k_scale": scale_constraint,
                     },
                     default_devices=ascend_devices,
-                    call_rules=(validate_rms_rope,),
+                    call_rules=(rms_rope_norm_over_heads_call_rule, validate_rms_rope),
                 ),
                 "rms_rope_split_half1": FunctionConstraints(
                     params={
