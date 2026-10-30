@@ -36,6 +36,8 @@ __all__ = [
     "dequantize_convrot_w4a4_weight",
     "dequantize_w4a8_int8_weight",
     "gemv_awq_w4a16",
+    "linear_geglu",
+    "linear_swiglu",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
     "quantize_mxfp8",
@@ -84,6 +86,7 @@ from .convrot_w4a4 import (
     quantize_convrot_w4a4_weight,
 )
 from .group_norm_pad3d import group_norm_silu_pad3d, group_norm_silu_pad3d_out, group_norm_stats3d
+from .linear_act import linear_geglu, linear_swiglu
 from .na import na3d
 from .quantization import (
     dequantize_int8_convrot_weight,
@@ -575,6 +578,25 @@ def _build_constraints() -> dict:
             "bias": ParamConstraint(dtypes=standard_floats),
             "residual": ParamConstraint(dtypes=standard_floats),
             "residual_scale": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["linear_geglu"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+            "bias": ParamConstraint(dtypes=standard_floats),
+            "approximate": ParamConstraint(dtypes=frozenset({str})),
+        },
+        default_devices=all_devices,
+    )
+    out["linear_swiglu"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "w1": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+            "w3": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+            "b1": ParamConstraint(dtypes=standard_floats),
+            "b3": ParamConstraint(dtypes=standard_floats),
         },
         default_devices=all_devices,
     )

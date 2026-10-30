@@ -122,6 +122,8 @@ __all__ = [
     "int8_linear",
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
+    "linear_geglu",
+    "linear_swiglu",
     "w4a8_int8_linear",
     # Positional encoding
     "apply_rope",
@@ -1069,6 +1071,70 @@ def _fp16_linear_fills_gpu(m: int, n: int, k: int) -> bool:
         return ((m + 127) // 128) * ((n + 127) // 128) >= 32
     tile_n = 256 if n <= 3072 or n > 8192 else 128
     return ((m + 127) // 128) * ((n + tile_n - 1) // tile_n) >= 96
+
+
+def linear_geglu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    approximate: str = "none",
+) -> torch.Tensor:
+    """GEGLU up projection with the gate fused into the GEMM epilogue.
+
+    Computes ``h * F.gelu(gate, approximate=approximate)`` where
+    ``h, gate = F.linear(x, weight, bias).chunk(2, dim=-1)``: the GEGLU of SD/SDXL
+    transformer blocks, whose single projection stores the ``[h | gate]`` halves
+    stacked along ``out_features``. Neither half of the (..., 2 * N) projection is
+    written to memory; the kernel reads the two weight halves by offset, so pass
+    the module's packed weight and bias as they are.
+
+    The fused (triton) path takes fp16/bf16 ``x``/``weight``/``bias`` of one dtype,
+    ``approximate`` "none" or "tanh", weight rows contiguous with
+    ``out_features % 128 == 0`` and ``in_features % 64 == 0``, and at least 256
+    rows of ``x``. Everything else runs the eager reference.
+
+    Args:
+        x: Input tensor (..., in_features).
+        weight: Packed weight (2 * N, in_features), rows ``[h | gate]``.
+        bias: Optional packed bias (2 * N,).
+        approximate: GELU form, "none" (default, as ``F.gelu``) or "tanh".
+
+    Returns:
+        Tensor (..., N) in x's dtype.
+    """
+    return torch.ops.comfy_kitchen.linear_geglu(x, weight, bias, approximate)
+
+
+def linear_swiglu(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w3: torch.Tensor,
+    b1: torch.Tensor | None = None,
+    b3: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """SwiGLU up projection: two GEMMs and the gate fused into one kernel.
+
+    Computes ``F.silu(F.linear(x, w1, b1)) * F.linear(x, w3, b3)``, the up half of
+    a LLaMA-style FFN (``w2(silu(w1(x)) * w3(x))``, e.g. Z-Image / Lumina) whose gate
+    and up projections are separate Linear layers. Neither (..., N) projection is
+    written to memory, and x is read once for both.
+
+    The fused (triton) path takes fp16/bf16 tensors of one dtype, ``w1`` and ``w3``
+    of the same shape with contiguous rows, ``out_features % 64 == 0`` and
+    ``in_features % 64 == 0``, and at least 256 rows of ``x``. Everything else
+    runs the eager reference.
+
+    Args:
+        x: Input tensor (..., in_features).
+        w1: Gate weight (N, in_features); silu is applied to ``x @ w1.T``.
+        w3: Up weight (N, in_features).
+        b1: Optional gate bias (N,).
+        b3: Optional up bias (N,).
+
+    Returns:
+        Tensor (..., N) in x's dtype.
+    """
+    return torch.ops.comfy_kitchen.linear_swiglu(x, w1, w3, b1, b3)
 
 
 def int8_linear(
