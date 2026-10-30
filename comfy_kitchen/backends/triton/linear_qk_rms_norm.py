@@ -115,6 +115,8 @@ def linear_qk_rms_norm(
     x2 = x.reshape(b * s, kdim)
     m = b * s
     has_bias = bias is not None
+    if has_bias:
+        bias = bias.contiguous()
     qs = q_scale.contiguous()
     ks = k_scale.contiguous()
     q, k, v = (torch.empty((b, s, dim // head_dim, head_dim), device=x.device, dtype=x.dtype) for _ in range(3))

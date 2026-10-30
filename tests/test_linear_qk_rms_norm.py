@@ -67,3 +67,11 @@ class TestLinearQkRmsNormTriton:
             assert g.shape == r.shape and g.dtype == r.dtype
             assert _rel(g, r) < tol
             assert _rel(g, r32) < tol
+
+    @pytest.mark.parametrize("dtype,head_dim", [(torch.float32, 64), (torch.float16, 96)])
+    def test_falls_back_to_eager(self, dtype, head_dim):
+        x, w, bb, qs, ks = _make(1, 33, 192, 4, head_dim, dtype, True)
+        got = ck.linear_qk_rms_norm(x, w, bb, qs, ks, head_dim)
+        ref = eager_backend.linear_qk_rms_norm(x, w, bb, qs, ks, head_dim, 1e-6)
+        for g, r in zip(got, ref, strict=True):
+            assert torch.equal(g, r)
