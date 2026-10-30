@@ -4,9 +4,11 @@
 
 M = To * H * W output positions by N = Co channels, K = kt * kh * kw * Ci, accumulated in fp32.
 The input is read straight from x [1, Ci, T, Hin, Win] (with upsample=2 the nearest x2 upsample
-is folded into the load addresses: input row ih // 2, column iw // 2), and the weight from its
-own [Co, Ci, kt, kh, kw] layout through its strides, so a sliced weight (the T == 1
-``weight[:, :, -1:]`` path) needs no copy. Offsets are int64.
+is folded into the load addresses: input row ih // 2, column iw // 2). The weight is copied to a
+[kt, kh, kw, Ci, Co] contiguous buffer on every call (no cache) so the weight tile is read with a
+unit stride along Co; the kernel takes it through strides as a [Co, Ci, kt, kh, kw] view. Reading
+the native layout directly made the weight loads scattered (Wan2.2 VAE decode 129.5 s vs 25.6 s on
+gfx1201); the copy costs about 1 s per decode. Offsets are int64.
 """
 
 import torch
@@ -85,6 +87,8 @@ def conv3d_hw_same(
 ) -> torch.Tensor:
     # x [1, Ci, T, Hin, Win]; weight [Co, Ci, kt, kh, kw] any strides (call rule: batch 1, fp16/bf16)
     x = x.contiguous()
+    # [kt, kh, kw, Ci, Co] contiguous, viewed back as [Co, Ci, kt, kh, kw]: Co is the unit-stride axis
+    weight = weight.permute(2, 3, 4, 1, 0).contiguous().permute(4, 3, 0, 1, 2)
     _, ci, t_in, h_in, w_in = x.shape
     co, _, kt, kh, kw = weight.shape
     h, w = h_in * upsample, w_in * upsample

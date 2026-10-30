@@ -444,7 +444,7 @@ def conv3d_hw_same(
     Upsample + Conv2d(3, padding=1) frame upsampler.
 
     Triton: batch 1, fp16/bf16 with the weight in x's dtype, fp32 accumulation; the upsample is
-    folded into the input loads and the weight is read through its strides in its own layout.
+    folded into the input loads and the weight is copied to a Co-contiguous layout on every call.
     Anything else runs F.conv3d (eager).
     """
     return torch.ops.comfy_kitchen.conv3d_hw_same(x, weight, bias, int(upsample))
