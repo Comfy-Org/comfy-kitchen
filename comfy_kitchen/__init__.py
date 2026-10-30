@@ -67,6 +67,7 @@ __all__ = [
     # Normalization
     "adaln",
     "rms_gated_residual",
+    "linear_qk_rms_norm",
     "fp16_conv3d",
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
@@ -378,6 +379,24 @@ def fp16_conv3d(
         return torch.ops.comfy_kitchen.fp16_conv3d(x, weight, bias, residual, stride)
     torch.ops.comfy_kitchen.fp16_conv3d_out(x, weight, bias, residual, stride, out)
     return out
+
+
+def linear_qk_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    head_dim: int,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """QKV projection with per-head RMSNorm on q and k, the pre-attention of a joint DiT block.
+
+    ``x @ weight.T + bias`` ([B, S, 3 * H * head_dim]) is split into q, k, v; q and k get
+    ``F.rms_norm`` over each head with ``q_scale`` / ``k_scale``. Returns q, k, v as
+    [B, S, H, head_dim].
+    """
+    return torch.ops.comfy_kitchen.linear_qk_rms_norm(x, weight, bias, q_scale, k_scale, head_dim, eps)
 
 
 def group_norm_silu_pad3d(

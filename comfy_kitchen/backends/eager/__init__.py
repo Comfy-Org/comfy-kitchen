@@ -1,6 +1,7 @@
 __all__ = [
     "adaln",
     "rms_gated_residual",
+    "linear_qk_rms_norm",
     "fp16_conv3d",
     "fp16_conv3d_out",
     "group_norm_silu_pad3d",
@@ -77,6 +78,7 @@ from comfy_kitchen.registry import registry
 from .adaln import adaln, rms_adaln
 from .awq import gemv_awq_w4a16
 from .conv3d import fp16_conv3d, fp16_conv3d_out
+from .linear_qk_rms_norm import linear_qk_rms_norm
 from .convrot_w4a4 import (
     convrot_w4a4_linear,
     dequantize_convrot_w4a4_weight,
@@ -692,6 +694,16 @@ def _build_constraints() -> dict:
         },
         default_devices=all_devices,
         call_rules=(na3d_common_call_rule,),
+    )
+    out["linear_qk_rms_norm"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(3),)),
+            "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+            "bias": ParamConstraint(dtypes=standard_floats | {type(None)}),
+            "q_scale": ParamConstraint(dtypes=standard_floats),
+            "k_scale": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
     )
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in out:
