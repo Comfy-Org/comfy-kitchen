@@ -122,6 +122,7 @@ __all__ = [
     "int8_linear",
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
+    "linear_gelu",
     "w4a8_int8_linear",
     # Positional encoding
     "apply_rope",
@@ -1069,6 +1070,38 @@ def _fp16_linear_fills_gpu(m: int, n: int, k: int) -> bool:
         return ((m + 127) // 128) * ((n + 127) // 128) >= 32
     tile_n = 256 if n <= 3072 or n > 8192 else 128
     return ((m + 127) // 128) * ((n + tile_n - 1) // tile_n) >= 96
+
+
+def linear_gelu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    approximate: str = "tanh",
+) -> torch.Tensor:
+    """Linear layer with GELU fused into the GEMM epilogue.
+
+    Computes ``F.gelu(F.linear(x, weight, bias), approximate=approximate)``, the
+    up projection of a GELU MLP (e.g. Wan's FFN), without writing the
+    pre-activation to memory and reading it back for a separate GELU.
+
+    The fused (triton) path takes fp16/bf16 ``x``/``weight``/``bias`` of one dtype,
+    ``approximate="tanh"``, weight rows contiguous with ``out_features % 128 == 0``
+    and ``in_features % 64 == 0``, and at least 256 rows of ``x``. Everything else
+    runs the eager reference, so the result is always defined.
+
+    Note the default ``approximate`` is "tanh" (the form DiT MLPs use), unlike
+    ``F.gelu``'s "none".
+
+    Args:
+        x: Input tensor (..., in_features).
+        weight: Weight (out_features, in_features).
+        bias: Optional bias (out_features,).
+        approximate: GELU form, "tanh" or "none".
+
+    Returns:
+        Tensor (..., out_features) in x's dtype.
+    """
+    return torch.ops.comfy_kitchen.linear_gelu(x, weight, bias, approximate)
 
 
 def int8_linear(
