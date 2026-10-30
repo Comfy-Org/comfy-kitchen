@@ -3,6 +3,7 @@ __all__ = [
     "rms_gated_residual",
     "fp16_conv3d",
     "fp16_conv3d_out",
+    "conv3d_hw_same",
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
     "group_norm_stats3d",
@@ -80,6 +81,7 @@ from .adaln import adaln, rms_adaln
 from .attention import flash_attn
 from .awq import gemv_awq_w4a16
 from .conv3d import fp16_conv3d, fp16_conv3d_out
+from .conv3d_hw_same import conv3d_hw_same
 from .convrot_w4a4 import (
     convrot_w4a4_linear,
     dequantize_convrot_w4a4_weight,
@@ -702,6 +704,14 @@ def _build_constraints() -> dict:
             "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(4),)),
             "k": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(4),)),
             "v": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(4),)),
+        },
+        default_devices=all_devices,
+    )
+    out["conv3d_hw_same"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
+            "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
+            "bias": ParamConstraint(dtypes=standard_floats | {type(None)}),
         },
         default_devices=all_devices,
     )

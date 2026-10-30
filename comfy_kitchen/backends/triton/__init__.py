@@ -29,6 +29,7 @@ __all__ = [
     "w4a8_int8_linear",
     "flash_attn",
     "l2_norm_silu",
+    "conv3d_hw_same",
 ]
 
 # Try to import triton and register if available
@@ -57,6 +58,7 @@ try:
 
     from .adaln import adaln, rms_adaln
     from .attention import flash_attn
+    from .conv3d_hw_same import conv3d_hw_same
     from .l2_norm_silu import l2_norm_silu
     from .na import na3d
     from .quantization import (
@@ -169,6 +171,23 @@ def _build_constraints() -> dict:
             return ValidationResult.fail("q", f"head_dim must be 64 or 128, got {q.shape[-1]}")
         if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
             return ValidationResult.fail("q", "q, k, v need a unit stride on head_dim")
+        return ValidationResult.ok()
+
+    def _conv3d_hw_same_call_rule(kwargs):
+        x, weight, bias = kwargs.get("x"), kwargs.get("weight"), kwargs.get("bias")
+        if x is None or weight is None:
+            return ValidationResult.ok()
+        if x.shape[0] != 1:
+            return ValidationResult.fail("x", f"batch 1 only, got {x.shape[0]}")
+        if weight.dtype != x.dtype or (bias is not None and bias.device != x.device):
+            return ValidationResult.fail("weight", "weight must have x's dtype, bias x's device")
+        if weight.shape[1] != x.shape[1] or weight.shape[3] % 2 == 0 or weight.shape[4] % 2 == 0:
+            return ValidationResult.fail("weight", "weight must be [Co, Ci, kt, odd kh, odd kw]")
+        if weight.shape[2] > x.shape[2]:
+            return ValidationResult.fail("weight", "kt > T")
+        upsample = kwargs.get("upsample", 1)
+        if upsample not in (1, 2) or (upsample == 2 and tuple(weight.shape[2:]) != (1, 3, 3)):
+            return ValidationResult.fail("upsample", "upsample is 1, or 2 with a [Co, Ci, 1, 3, 3] weight")
         return ValidationResult.ok()
 
     def _l2_norm_silu_call_rule(kwargs):
@@ -390,6 +409,15 @@ def _build_constraints() -> dict:
         },
         default_devices=triton_devices,
         call_rules=(_flash_attn_call_rule,),
+    )
+    out["conv3d_hw_same"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(5),)),
+            "weight": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(5),)),
+            "bias": ParamConstraint(dtypes=standard_floats | {type(None)}),
+        },
+        default_devices=triton_devices,
+        call_rules=(_conv3d_hw_same_call_rule,),
     )
     out["l2_norm_silu"] = FunctionConstraints(
         params={

@@ -68,6 +68,7 @@ __all__ = [
     "adaln",
     "rms_gated_residual",
     "fp16_conv3d",
+    "conv3d_hw_same",
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
     "l2_norm_silu",
@@ -426,6 +427,27 @@ def l2_norm_silu(
     rounded to x's dtype first.
     """
     return torch.ops.comfy_kitchen.l2_norm_silu(x, weight, float(scale), eps)
+
+
+def conv3d_hw_same(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    upsample: int = 1,
+) -> torch.Tensor:
+    """3D convolution with "same" H/W padding and no T padding, optionally after a nearest x2 upsample.
+
+    ``conv3d(up(x), weight, bias, padding=(0, kh // 2, kw // 2))``: x ``[B, Ci, T, H, W]``, weight
+    ``[Co, Ci, kt, kh, kw]`` with odd kh and kw, output ``[B, Co, T - kt + 1, H * upsample,
+    W * upsample]``. ``upsample=2`` (only with a ``[Co, Ci, 1, 3, 3]`` weight) is the nearest x2
+    upsample of H and W, T unchanged. This is the Wan VAE CausalConv3d (caller pads T) and its
+    Upsample + Conv2d(3, padding=1) frame upsampler.
+
+    Triton: batch 1, fp16/bf16 with the weight in x's dtype, fp32 accumulation; the upsample is
+    folded into the input loads and the weight is read through its strides in its own layout.
+    Anything else runs F.conv3d (eager).
+    """
+    return torch.ops.comfy_kitchen.conv3d_hw_same(x, weight, bias, int(upsample))
 
 
 def flash_attn(
