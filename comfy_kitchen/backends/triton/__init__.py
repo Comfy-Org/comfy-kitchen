@@ -27,6 +27,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "linear_qk_rms_norm",
 ]
 
 # Try to import triton and register if available
@@ -89,6 +90,7 @@ try:
         apply_rope_split_half1_,
         apply_rope_split_half_,
     )
+    from .linear_qk_rms_norm import linear_qk_rms_norm
     from .w4a8_int8 import w4a8_int8_linear
 except ImportError as e:
     _TRITON_AVAILABLE = False
@@ -125,6 +127,21 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _linear_qk_rms_norm_call_rule(kwargs):
+        x, weight, head_dim = kwargs.get("x"), kwargs.get("weight"), kwargs.get("head_dim")
+        if x is None or weight is None or head_dim is None:
+            return ValidationResult.ok()
+        if x.dim() != 3 or weight.dim() != 2:
+            return ValidationResult.fail("x", "x must be [B, S, K] and weight [3 * D, K]")
+        if head_dim not in (64, 128):
+            return ValidationResult.fail("head_dim", f"triton kernel supports head_dim 64 or 128, got {head_dim}")
+        dim = weight.shape[0] // 3
+        if weight.shape[0] % 3 or dim % head_dim:
+            return ValidationResult.fail("weight", "weight rows must be 3 * H * head_dim")
+        if weight.dtype != x.dtype:
+            return ValidationResult.fail("weight", f"weight dtype {weight.dtype} must match x {x.dtype}")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -315,6 +332,18 @@ def _build_constraints() -> dict:
             default_devices=triton_devices,
         ),
     }
+    half_floats = frozenset({torch.float16, torch.bfloat16})
+    out["linear_qk_rms_norm"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(3),)),
+            "weight": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(2),)),
+            "bias": ParamConstraint(dtypes=half_floats | {type(None)}),
+            "q_scale": ParamConstraint(dtypes=standard_floats),
+            "k_scale": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=triton_devices,
+        call_rules=(_linear_qk_rms_norm_call_rule,),
+    )
     for inplace_name, functional_name in {
         "apply_rope_": "apply_rope",
         "apply_rope1_": "apply_rope1",
