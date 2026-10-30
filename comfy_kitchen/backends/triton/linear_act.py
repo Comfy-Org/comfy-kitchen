@@ -17,7 +17,9 @@ activation dtype (what F.linear returns), GELU is evaluated in fp32 on that valu
 and rounded once more, as PyTorch's GELU kernel does with its fp32 opmath.
 
 Requirements (checked by the backend's constraints, otherwise dispatch falls back):
-weight rows contiguous, N % N_MULTIPLE == 0, K % K_MULTIPLE == 0. M is masked.
+weight rows contiguous, N % N_MULTIPLE == 0, K % K_MULTIPLE == 0. M is masked;
+so is N whenever the tile width BN of the chosen config does not divide it, so
+no autotune config can leave output columns unwritten.
 """
 
 import torch
@@ -25,7 +27,8 @@ import torch
 import triton
 import triton.language as tl
 
-# Every autotune config below tiles N and K evenly when these hold.
+# Every autotune config below tiles K evenly when K_MULTIPLE holds. N tiles
+# that run past N are masked (EVEN_N below), so BN need not divide N.
 N_MULTIPLE = 128
 K_MULTIPLE = 64
 # Below this many rows the GEMM is too small for the fused kernel to be worth
@@ -42,6 +45,10 @@ _CONFIGS = [
     triton.Config({"BM": 64, "BN": 128, "BK": 64, "GROUP_M": 8}, num_warps=4, num_stages=2),
     triton.Config({"BM": 128, "BN": 64, "BK": 32, "GROUP_M": 8}, num_warps=4, num_stages=2),
     triton.Config({"BM": 128, "BN": 128, "BK": 32, "GROUP_M": 8}, num_warps=8, num_stages=2),
+    # Tuned on AMD Radeon AI PRO R9700 (gfx1201, 64 KB LDS) for the Wan2.1 shape
+    # above. BN 256 does not divide every served N (N % 128 == 0); partial N tiles
+    # are masked.
+    triton.Config({"BM": 128, "BN": 256, "BK": 32, "GROUP_M": 8}, num_warps=8, num_stages=1),
 ]
 
 
@@ -66,12 +73,15 @@ def _gelu_tanh(x):
 
 
 @triton.autotune(configs=_CONFIGS, key=["M", "N", "K"])
+# EVEN_N follows the BN of whichever config the autotuner runs; when BN divides
+# N the kernel compiles without the N wrap and mask.
+@triton.heuristics({"EVEN_N": lambda args: args["N"] % args["BN"] == 0})
 @triton.jit
 def _linear_gelu_tanh_kernel(
     x_ptr, w_ptr, b_ptr, o_ptr,
     M, N, K,
     stride_xm, stride_wn, stride_om,
-    HAS_BIAS: tl.constexpr,
+    HAS_BIAS: tl.constexpr, EVEN_N: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP_M: tl.constexpr,
 ):
     # Grouped tile order: GROUP_M row tiles sweep the N tiles together for L2 reuse.
@@ -87,9 +97,17 @@ def _linear_gelu_tanh_kernel(
 
     rm = pm * BM + tl.arange(0, BM)
     rn = pn * BN + tl.arange(0, BN)
+    if EVEN_N:
+        rn_ld = rn
+        o_mask = rm[:, None] < M
+    else:
+        # Last N tile runs past N: wrap its weight / bias reads onto valid rows
+        # (no masks in the K loop) and drop those columns at the store.
+        rn_ld = rn % N
+        o_mask = (rm[:, None] < M) & (rn[None, :] < N)
     rk = tl.arange(0, BK)
     a_p = x_ptr + rm[:, None].to(tl.int64) * stride_xm + rk[None, :]
-    b_p = w_ptr + rn[None, :].to(tl.int64) * stride_wn + rk[:, None]
+    b_p = w_ptr + rn_ld[None, :].to(tl.int64) * stride_wn + rk[:, None]
     m_mask = rm[:, None] < M
 
     acc = tl.zeros([BM, BN], tl.float32)
@@ -102,9 +120,9 @@ def _linear_gelu_tanh_kernel(
 
     dt = o_ptr.dtype.element_ty
     if HAS_BIAS:
-        acc = acc + tl.load(b_ptr + rn).to(tl.float32)[None, :]
+        acc = acc + tl.load(b_ptr + rn_ld).to(tl.float32)[None, :]
     o = _gelu_tanh(_round_to(acc, dt)).to(dt)
-    tl.store(o_ptr + rm[:, None].to(tl.int64) * stride_om + rn[None, :], o, mask=m_mask)
+    tl.store(o_ptr + rm[:, None].to(tl.int64) * stride_om + rn[None, :], o, mask=o_mask)
 
 
 def linear_gelu(
@@ -128,7 +146,7 @@ def linear_gelu(
     has_bias = bias is not None
 
     def grid(meta):
-        return (triton.cdiv(m, meta["BM"]) * (n // meta["BN"]),)
+        return (triton.cdiv(m, meta["BM"]) * triton.cdiv(n, meta["BN"]),)
 
     _linear_gelu_tanh_kernel[grid](
         x2, weight, bias if has_bias else weight, out,

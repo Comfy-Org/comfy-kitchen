@@ -124,6 +124,46 @@ class TestLinearGelu:
         assert_values_close(out.float(), ref.float(), rtol=rtol, atol=atol,
                             name="linear_gelu[non-contiguous x]")
 
+    @pytest.mark.parametrize("n", [384, 640])
+    def test_partial_n_tile_vs_eager(self, n, seed, cuda_available):
+        """A served N (multiple of 128) that the BN 256 config does not divide: the
+        kernel must still write every output column. The config is forced so the
+        result does not depend on what the autotuner would pick."""
+        device = "cuda" if cuda_available else "cpu"
+        capable = get_capable_backends("linear_gelu", device)
+        if "triton" not in capable or "eager" not in capable:
+            pytest.skip("triton and eager backends needed")
+        import triton
+
+        from comfy_kitchen.backends.triton import linear_act
+
+        dtype = torch.float16
+        x, weight, bias = _inputs((300,), 256, n, dtype, device)
+        assert ck.registry.validate_backend_for_call(
+            "triton", "linear_gelu", _kwargs(x, weight, bias)
+        ).success
+        with ck.use_backend("eager"):
+            eager = ck.linear_gelu(x, weight, bias)
+
+        tuner = linear_act._linear_gelu_tanh_kernel
+        saved = tuner.configs, tuner.cache
+        tuner.configs = [triton.Config({"BM": 128, "BN": 256, "BK": 32, "GROUP_M": 8},
+                                       num_warps=8, num_stages=1)]
+        tuner.cache = {}
+        try:
+            # Hand the output allocation a NaN-filled block, so columns the
+            # kernel never writes cannot pass by matching stale memory.
+            torch.full((300, n), float("nan"), dtype=dtype, device=device)
+            with ck.use_backend("triton"):
+                out = ck.linear_gelu(x, weight, bias)
+            torch.cuda.synchronize()
+        finally:
+            tuner.configs, tuner.cache = saved
+
+        rtol, atol = _tol(dtype)
+        assert_values_close(out.float(), eager.float(), rtol=rtol, atol=atol,
+                            name=f"linear_gelu[BN 256 / N {n} vs eager]")
+
     @pytest.mark.parametrize(
         "case",
         ["n_not_multiple", "k_not_multiple", "few_rows", "float32", "erf",
