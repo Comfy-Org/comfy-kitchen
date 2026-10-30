@@ -29,7 +29,8 @@ opmath.
 
 Requirements (checked by the backend's constraints, otherwise dispatch falls back):
 weight rows contiguous, N % GLU_N_MULTIPLE == 0, K % K_MULTIPLE == 0. M is
-masked.
+masked; so is N whenever the tile width BN of the chosen config does not divide
+it, so no autotune config can leave output columns unwritten.
 """
 
 import torch
@@ -37,7 +38,8 @@ import torch
 import triton
 import triton.language as tl
 
-# Every autotune config below tiles N and K evenly when these hold.
+# Every autotune config below tiles K evenly when K_MULTIPLE holds. N tiles
+# that run past N are masked (EVEN_N below), so BN need not divide N.
 GLU_N_MULTIPLE = 64  # N of one half (the output width) for the gated forms
 K_MULTIPLE = 64
 # Below this many rows the GEMM is too small for the fused kernel to be worth
@@ -61,6 +63,11 @@ _GLU_CONFIGS = [
     triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 32}, num_warps=4, num_stages=2),
     # Smaller footprint, not tuned on any particular GPU.
     triton.Config({"BM": 64, "BN": 64, "BK": 64, "GROUP_M": 8}, num_warps=4, num_stages=2),
+    # Tuned on AMD Radeon AI PRO R9700 (gfx1201, 64 KB LDS) for the SDXL GEGLU
+    # shapes above. There the BM 128 dual tiles need 8 warps: with 4 warps the two
+    # fp16 accumulators hit the 256-VGPR limit and spill.
+    triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 16}, num_warps=8, num_stages=1),
+    triton.Config({"BM": 128, "BN": 64, "BK": 32, "GROUP_M": 16}, num_warps=8, num_stages=3),
 ]
 
 
@@ -97,6 +104,7 @@ def _linear_act_kernel(
     stride_xm, stride_w1n, stride_w2n, stride_om,
     w2_row0,
     ACT: tl.constexpr, HAS_B1: tl.constexpr, HAS_B2: tl.constexpr,
+    EVEN_N: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP_M: tl.constexpr,
 ):
     # Second accumulator: rows w2_row0 .. w2_row0 + N of w2 (and the same
@@ -116,10 +124,18 @@ def _linear_act_kernel(
 
     rm = pm * BM + tl.arange(0, BM)
     rn = pn * BN + tl.arange(0, BN)
+    if EVEN_N:
+        rn_ld = rn
+        o_mask = rm[:, None] < M
+    else:
+        # Last N tile runs past N: wrap its weight / bias reads onto valid rows
+        # (no masks in the K loop) and drop those columns at the store.
+        rn_ld = rn % N
+        o_mask = (rm[:, None] < M) & (rn[None, :] < N)
     rk = tl.arange(0, BK)
     a_p = x_ptr + rm[:, None].to(tl.int64) * stride_xm + rk[None, :]
-    b1_p = w1_ptr + rn[None, :].to(tl.int64) * stride_w1n + rk[:, None]
-    b2_p = w2_ptr + (rn[None, :] + w2_row0).to(tl.int64) * stride_w2n + rk[:, None]
+    b1_p = w1_ptr + rn_ld[None, :].to(tl.int64) * stride_w1n + rk[:, None]
+    b2_p = w2_ptr + (rn_ld[None, :] + w2_row0).to(tl.int64) * stride_w2n + rk[:, None]
     m_mask = rm[:, None] < M
 
     acc1 = tl.zeros([BM, BN], tl.float32)
@@ -140,9 +156,9 @@ def _linear_act_kernel(
 
     dt = o_ptr.dtype.element_ty
     if HAS_B1:
-        acc1 = acc1 + tl.load(b1_ptr + rn).to(tl.float32)[None, :]
+        acc1 = acc1 + tl.load(b1_ptr + rn_ld).to(tl.float32)[None, :]
     if HAS_B2:
-        acc2 = acc2 + tl.load(b2_ptr + w2_row0 + rn).to(tl.float32)[None, :]
+        acc2 = acc2 + tl.load(b2_ptr + w2_row0 + rn_ld).to(tl.float32)[None, :]
     if ACT == 0:
         o = _gelu_tanh(_round_to(acc1, dt)).to(dt)
     elif ACT == 3:
@@ -160,11 +176,14 @@ def _linear_act_kernel(
         else:
             g = _round_to(_gelu_tanh(gate), dt)
         o = (h * g).to(dt)
-    tl.store(o_ptr + rm[:, None].to(tl.int64) * stride_om + rn[None, :], o, mask=m_mask)
+    tl.store(o_ptr + rm[:, None].to(tl.int64) * stride_om + rn[None, :], o, mask=o_mask)
 
 
+# EVEN_N follows the BN of whichever config the autotuner runs; when BN divides
+# N (every shape the configs were tuned on) the kernel compiles without the N
+# wrap and mask, i.e. exactly as before.
 _linear_glu_kernel = triton.autotune(configs=_GLU_CONFIGS, key=["M", "N", "K", "ACT"])(
-    _linear_act_kernel
+    triton.heuristics({"EVEN_N": lambda args: args["N"] % args["BN"] == 0})(_linear_act_kernel)
 )
 
 
@@ -177,7 +196,7 @@ def _launch(kernel, x, w1, w2, w2_row0, b1, b2, n, act):
     out = torch.empty((m, n), device=x.device, dtype=x.dtype)
 
     def grid(meta):
-        return (triton.cdiv(m, meta["BM"]) * (n // meta["BN"]),)
+        return (triton.cdiv(m, meta["BM"]) * triton.cdiv(n, meta["BN"]),)
 
     kernel[grid](
         x2, w1, w2, w1 if b1 is None else b1, w1 if b2 is None else b2, out,

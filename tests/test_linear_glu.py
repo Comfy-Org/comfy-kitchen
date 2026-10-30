@@ -398,3 +398,65 @@ class TestLinearSwiglu:
 
     def test_public_api(self):
         assert "linear_swiglu" in ck.__all__
+
+
+# ---------------------------------------------------------------------------
+# Autotune configs whose tile width BN does not divide N
+# ---------------------------------------------------------------------------
+
+# (forced config, N): a served N (multiple of 64) that is not a multiple of the
+# config's BN, so the last N tile is partial.
+_PARTIAL_N_TILE = [
+    ({"BM": 64, "BN": 128, "BK": 32, "GROUP_M": 8}, 4, 192),
+    ({"BM": 64, "BN": 256, "BK": 32, "GROUP_M": 8}, 8, 384),
+]
+
+
+class TestPartialNTile:
+    @pytest.mark.parametrize("op", ["geglu", "swiglu"])
+    @pytest.mark.parametrize("case", _PARTIAL_N_TILE)
+    def test_forced_config_vs_eager(self, op, case, seed, cuda_available):
+        """The kernel must cover every output column for any config the autotuner
+        may pick, not only for configs whose BN divides N."""
+        device = "cuda" if cuda_available else "cpu"
+        _require(f"linear_{op}", "triton", device)
+        _require(f"linear_{op}", "eager", device)
+        import triton
+
+        from comfy_kitchen.backends.triton import linear_act
+
+        kwargs, num_warps, n = case
+        lead, k, dtype = (300,), 256, torch.float16
+        if op == "geglu":
+            x, weight, bias = _geglu_inputs(lead, k, n, dtype, device)
+            args = (x, weight, bias)
+            assert ck.registry.validate_backend_for_call(
+                "triton", "linear_geglu", _geglu_kwargs(x, weight, bias)
+            ).success
+        else:
+            x, w1, w3, b1, b3 = _swiglu_inputs(lead, k, n, dtype, device, bias=True)
+            args = (x, w1, w3, b1, b3)
+            assert ck.registry.validate_backend_for_call(
+                "triton", "linear_swiglu", _swiglu_kwargs(x, w1, w3, b1, b3)
+            ).success
+        fn = getattr(ck, f"linear_{op}")
+        with ck.use_backend("eager"):
+            eager = fn(*args)
+
+        tuner = linear_act._linear_glu_kernel
+        saved = tuner.configs, tuner.cache
+        tuner.configs = [triton.Config(kwargs, num_warps=num_warps, num_stages=1)]
+        tuner.cache = {}
+        try:
+            # Hand the output allocation a NaN-filled block, so columns the
+            # kernel never writes cannot pass by matching stale memory.
+            torch.full((x.shape[0], n), float("nan"), dtype=dtype, device=device)
+            with ck.use_backend("triton"):
+                out = fn(*args)
+            torch.cuda.synchronize()
+        finally:
+            tuner.configs, tuner.cache = saved
+
+        rtol, atol = _tol(dtype)
+        assert_values_close(out.float(), eager.float(), rtol=rtol, atol=atol,
+                            name=f"linear_{op}[BN {kwargs['BN']} / N {n} vs eager]")
