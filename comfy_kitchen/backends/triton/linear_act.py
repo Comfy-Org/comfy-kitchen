@@ -49,24 +49,40 @@ _ACT_GEGLU_TANH = 1
 _ACT_SWIGLU = 2
 
 # The dual-accumulator kernel holds two (BM, BN) accumulators and streams two
-# weight tiles per K step, so it uses narrow N tiles.
-_GLU_CONFIGS = [
+# weight tiles per K step, so it uses narrow N tiles. GEGLU and SwiGLU get one
+# list each: they run in different dtypes (SDXL GEGLU fp16, Z-Image SwiGLU bf16)
+# at different shapes and weight layouts, and a config tuned for one can win the
+# other's autotune run without being the fastest there.
+_GEGLU_CONFIGS = [
     # Tuned on NVIDIA RTX 5090 (sm_120): SDXL GEGLU at K 1280 (M 2048, N 5120)
-    # and K 640 (M 8192, N 2560), fp16 ...
+    # and K 640 (M 8192, N 2560), fp16.
     triton.Config({"BM": 128, "BN": 64, "BK": 32, "GROUP_M": 8}, num_warps=4, num_stages=3),
     triton.Config({"BM": 64, "BN": 64, "BK": 32, "GROUP_M": 8}, num_warps=4, num_stages=3),
-    # ... and the Z-Image SwiGLU FFN (M 4160, K 3840, N 10240, bf16).
+    # Tuned for SwiGLU (RTX 5090); not picked for GEGLU on the GPUs measured.
     triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 32}, num_warps=4, num_stages=2),
-    # Smaller footprint, not tuned on any particular GPU.
+    # Smaller footprint; the pick on AMD Radeon 8060S (gfx1151) at both shapes.
     triton.Config({"BM": 64, "BN": 64, "BK": 64, "GROUP_M": 8}, num_warps=4, num_stages=2),
     # Tuned on AMD Radeon AI PRO R9700 (gfx1201, 64 KB LDS) for the SDXL GEGLU
     # shapes above. There the BM 128 dual tiles need 8 warps: with 4 warps the two
     # fp16 accumulators hit the 256-VGPR limit and spill.
     triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 16}, num_warps=8, num_stages=1),
     triton.Config({"BM": 128, "BN": 64, "BK": 32, "GROUP_M": 16}, num_warps=8, num_stages=3),
-    # Tuned on AMD Radeon 8060S (gfx1151, 2 MB L2) for the Z-Image SwiGLU FFN. In
-    # bf16 the 4-warp BM 128 tile does not spill there; GROUP_M 32 (the RTX 5090
-    # SwiGLU config) is about 45% slower on the small L2.
+    # Tuned for SwiGLU (gfx1151); not picked for GEGLU on the GPUs measured (it
+    # spills in fp16).
+    triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 8}, num_warps=4, num_stages=2),
+]
+
+# SwiGLU, tuned on the Z-Image FFN (M 4160, K 3840, N 10240, bf16). Only configs
+# that measured fastest, or within about 1% of the fastest, on one of the GPUs
+# below.
+_SWIGLU_CONFIGS = [
+    # Fastest on NVIDIA RTX 5090 (sm_120); within 1% on AMD Radeon AI PRO R9700.
+    triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 32}, num_warps=4, num_stages=2),
+    # Fastest on AMD Radeon AI PRO R9700 (gfx1201).
+    triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 16}, num_warps=8, num_stages=1),
+    # Tuned on AMD Radeon 8060S (gfx1151, 2 MB L2): within 1% of the fastest
+    # config measured there, while GROUP_M 32 is about 45% slower on the small
+    # L2. Within 1% on the R9700.
     triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 8}, num_warps=4, num_stages=2),
 ]
 
@@ -176,10 +192,16 @@ def _linear_act_kernel(
 
 # EVEN_N follows the BN of whichever config the autotuner runs; when BN divides
 # N (every shape the configs were tuned on) the kernel compiles without the N
-# wrap and mask, i.e. exactly as before.
-_linear_glu_kernel = triton.autotune(configs=_GLU_CONFIGS, key=["M", "N", "K", "ACT"])(
-    triton.heuristics({"EVEN_N": lambda args: args["N"] % args["BN"] == 0})(_linear_act_kernel)
-)
+# wrap and mask, i.e. exactly as before. One autotuner per op (own config list
+# and timing cache), both over the same kernel.
+def _autotuned(configs):
+    return triton.autotune(configs=configs, key=["M", "N", "K", "ACT"])(
+        triton.heuristics({"EVEN_N": lambda args: args["N"] % args["BN"] == 0})(_linear_act_kernel)
+    )
+
+
+_linear_geglu_kernel = _autotuned(_GEGLU_CONFIGS)
+_linear_swiglu_kernel = _autotuned(_SWIGLU_CONFIGS)
 
 
 def _launch(kernel, x, w1, w2, w2_row0, b1, b2, n, act):
@@ -214,7 +236,7 @@ def linear_geglu(
         raise ValueError(f"approximate must be 'none' or 'tanh', got {approximate!r}")
     n = weight.shape[0] // 2
     act = _ACT_GEGLU_ERF if approximate == "none" else _ACT_GEGLU_TANH
-    return _launch(_linear_glu_kernel, x, weight, weight, n, bias, bias, n, act)
+    return _launch(_linear_geglu_kernel, x, weight, weight, n, bias, bias, n, act)
 
 
 def linear_swiglu(
@@ -225,4 +247,4 @@ def linear_swiglu(
     b3: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """silu(linear(x, w1, b1)) * linear(x, w3, b3) in one GEMM."""
-    return _launch(_linear_glu_kernel, x, w1, w3, 0, b1, b3, w1.shape[0], _ACT_SWIGLU)
+    return _launch(_linear_swiglu_kernel, x, w1, w3, 0, b1, b3, w1.shape[0], _ACT_SWIGLU)

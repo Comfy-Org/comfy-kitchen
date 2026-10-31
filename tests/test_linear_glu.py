@@ -443,7 +443,7 @@ class TestPartialNTile:
         with ck.use_backend("eager"):
             eager = fn(*args)
 
-        tuner = linear_act._linear_glu_kernel
+        tuner = getattr(linear_act, f"_linear_{op}_kernel")
         saved = tuner.configs, tuner.cache
         tuner.configs = [triton.Config(kwargs, num_warps=num_warps, num_stages=1)]
         tuner.cache = {}
