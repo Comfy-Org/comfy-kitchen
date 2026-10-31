@@ -2,15 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Triton GEMMs with a fused activation epilogue.
 
-One "linear + activation epilogue" kernel template, selected by ACT. The gated
-FFN up projections use its dual-accumulator mode:
+One dual-accumulator GEMM kernel with the activation fused into its epilogue,
+selected by ACT:
 
     linear_geglu:  h, gate = x @ W^T + b (W = [W_h; W_gate], packed by rows)
                    out = h * gelu(gate)
     linear_swiglu: out = silu(x @ W1^T + b1) * (x @ W3^T + b3)
-
-(ACT = 0 is the template's single-accumulator mode, gelu_tanh(x @ W^T + b);
-no op in this module routes to it.)
 
 fp16 / bf16 in and out, fp32 accumulate. The point is the epilogue: a gated FFN
 up projection writes two (M, N) projections to memory and a separate activation
@@ -47,10 +44,9 @@ K_MULTIPLE = 64
 MIN_M = 256
 
 # Epilogue selector (constexpr).
-_ACT_GELU_TANH = 0  # single accumulator (template mode, not routed to here)
-_ACT_GEGLU_ERF = 1  # dual accumulators from here on
-_ACT_GEGLU_TANH = 2
-_ACT_SWIGLU = 3
+_ACT_GEGLU_ERF = 0
+_ACT_GEGLU_TANH = 1
+_ACT_SWIGLU = 2
 
 # The dual-accumulator kernel holds two (BM, BN) accumulators and streams two
 # weight tiles per K step, so it uses narrow N tiles.
@@ -114,7 +110,6 @@ def _linear_act_kernel(
     # Second accumulator: rows w2_row0 .. w2_row0 + N of w2 (and the same
     # elements of b2). GEGLU passes the packed weight as both w1 and w2 with
     # w2_row0 = N, so its halves are read by offset, without per-call views.
-    DUAL: tl.constexpr = ACT != 0
     # Grouped tile order: GROUP_M row tiles sweep the N tiles together for L2 reuse.
     pid = tl.program_id(0)
     num_m = tl.cdiv(M, BM)
@@ -146,14 +141,12 @@ def _linear_act_kernel(
     acc2 = tl.zeros([BM, BN], tl.float32)
     for _ in range(0, K, BK):
         # All loads first, then the dots: loading the second weight tile after
-        # the first dot measured 2-7% slower for the dual forms.
+        # the first dot measured 2-7% slower.
         a = tl.load(a_p, mask=m_mask, other=0.0)
         b1 = tl.load(b1_p)
-        if DUAL:
-            b2 = tl.load(b2_p)
+        b2 = tl.load(b2_p)
         acc1 = tl.dot(a, b1, acc1)
-        if DUAL:
-            acc2 = tl.dot(a, b2, acc2)
+        acc2 = tl.dot(a, b2, acc2)
         a_p += BK
         b1_p += BK
         b2_p += BK
@@ -163,9 +156,7 @@ def _linear_act_kernel(
         acc1 = acc1 + tl.load(b1_ptr + rn_ld).to(tl.float32)[None, :]
     if HAS_B2:
         acc2 = acc2 + tl.load(b2_ptr + w2_row0 + rn_ld).to(tl.float32)[None, :]
-    if ACT == 0:
-        o = _gelu_tanh(_round_to(acc1, dt)).to(dt)
-    elif ACT == 3:
+    if ACT == 2:
         # silu(c1) * c3, each eager intermediate rounded.
         c1 = _round_to(acc1, dt)
         c3 = _round_to(acc2, dt)
@@ -175,7 +166,7 @@ def _linear_act_kernel(
         # h * gelu(gate), each eager intermediate rounded.
         h = _round_to(acc1, dt)
         gate = _round_to(acc2, dt)
-        if ACT == 1:
+        if ACT == 0:
             g = _round_to(_gelu_erf(gate), dt)
         else:
             g = _round_to(_gelu_tanh(gate), dt)
