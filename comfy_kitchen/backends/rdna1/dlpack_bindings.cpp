@@ -1839,7 +1839,8 @@ void rms_rope(nb::ndarray<> q, OptArray k, nb::ndarray<> freqs, nb::ndarray<> q_
 
 // Float flash attention (ops/flash_attn.hip): q and o [B, Hq, Sq, D], k and v
 // [B, Hk, Sk, D] with Hq a multiple of Hk, any strides but a unit last one, D 64, 128 or 256.
-// q, k, v and o share fp32, fp16 or bf16. mask is an additive [B, Hq, Sq, Sk] float tensor
+// q, k, v and o share fp32, fp16 or bf16, or decode rows at D 64/128 take fp32 q and o over
+// fp16 k and v. mask is an additive [B, Hq, Sq, Sk] float tensor
 // (broadcast dims as zero strides) or a uint8 keep mask; kv_lengths an int32 [B] count of
 // valid keys. With num_splits > 1 o_accum ([splits, B, Hq, Sq, D]) and lse_accum
 // ([splits, B, Hq, Sq]) are the fp32 scratch the combine pass reads.
@@ -1868,11 +1869,18 @@ void flash_attention(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, OptArray
         if (v.shape(d) != k.shape(d)) throw std::runtime_error(std::string(kFn) + ": k/v shape mismatch");
         if (o.shape(d) != q.shape(d)) throw std::runtime_error(std::string(kFn) + ": o must match q's shape");
     }
-    const int code = map_dtype_to_code(q.dtype());
+    int code = map_dtype_to_code(q.dtype());
     require_dtype(q, 0, 2, kFn, "q");
-    if (map_dtype_to_code(k.dtype()) != code || map_dtype_to_code(v.dtype()) != code ||
-        map_dtype_to_code(o.dtype()) != code) {
-        throw std::runtime_error(std::string(kFn) + ": q, k, v and o must share a dtype");
+    // one-wave blocks when a wave holds every row (16 at HD 64, 8 at HD 128)
+    const bool few_rows = static_cast<int64_t>(heads_q / heads_kv) * q_len <= 32 / (head_dim / 16) * 2;
+    const int kv_code = map_dtype_to_code(k.dtype());
+    if (map_dtype_to_code(v.dtype()) != kv_code || map_dtype_to_code(o.dtype()) != code) {
+        throw std::runtime_error(std::string(kFn) + ": k and v, and q and o, must share a dtype");
+    }
+    if (code == 0 && kv_code == 1 && few_rows && head_dim <= 128) {
+        code = 3;  // fp32 decode over an fp16 KV cache
+    } else if (kv_code != code) {
+        throw std::runtime_error(std::string(kFn) + ": q, k, v and o must share a dtype (or fp32 q and o with fp16 k and v for decode rows at head dim 64 or 128)");
     }
     // Rows are read 8 elements (16 or 32 bytes) at a time and written 4 at a time.
     const nb::ndarray<>* rowed[] = {&q, &k, &v};
@@ -1935,9 +1943,7 @@ void flash_attention(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, OptArray
         kv_lengths.has_value() ? static_cast<const int*>(kv_lengths->data()) : nullptr, o.data(),
         num_splits > 1 ? static_cast<float*>(o_accum->data()) : nullptr,
         num_splits > 1 ? static_cast<float*>(lse_accum->data()) : nullptr, batch, heads_kv,
-        heads_q / heads_kv, q_len, kv_len, head_dim, num_splits, code, strides, scale,
-        // one-wave blocks when a wave holds every row (16 at HD 64, 8 at HD 128)
-        static_cast<int64_t>(heads_q / heads_kv) * q_len <= 32 / (head_dim / 16) * 2,
+        heads_q / heads_kv, q_len, kv_len, head_dim, num_splits, code, strides, scale, few_rows,
         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }

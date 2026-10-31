@@ -441,10 +441,11 @@ __global__ __launch_bounds__(kWaves * 32) void flash_attn_kernel(Args a) {
 // slices-th 16-key step of the block's range. A group reads keys in order, so its lanes
 // read one contiguous row; each score is all-reduced over the group and every lane runs
 // the softmax of all 16 keys, which needs no probability broadcast. The slices merge at
-// the end.
-template <typename InT, int HD>
+// the end. Q and O are QT, K and V KVT: fp32 Q over an fp16 cache widens each K and V
+// element exactly, so the math stays fp32.
+template <typename QT, typename KVT, int HD>
 __global__ __launch_bounds__(32) void flash_attn_direct_kernel(Args a, int row_groups) {
-    using S = StageOf<InT>;
+    using S = StageOf<KVT>;
     constexpr int kR = 2;
     constexpr int kL = HD / 16;
     constexpr int kGroups = 32 / kL;
@@ -466,12 +467,12 @@ __global__ __launch_bounds__(32) void flash_attn_direct_kernel(Args a, int row_g
     const int step_begin = imin(split * steps_per_split, steps);
     const int step_end = imin(step_begin + steps_per_split, steps);
 
-    const InT* k_head = static_cast<const InT*>(a.k) + b * a.k_sb + kvh * a.k_sh;
-    const InT* v_head = static_cast<const InT*>(a.v) + b * a.v_sb + kvh * a.v_sh;
+    const KVT* k_head = static_cast<const KVT*>(a.k) + b * a.k_sb + kvh * a.k_sh;
+    const KVT* v_head = static_cast<const KVT*>(a.v) + b * a.v_sb + kvh * a.v_sh;
     const float scale = a.scale * kLog2e;
     float qf[kR][16];
     int qhead[kR], qpos[kR];
-    load_q_rows<InT, kR, 2, kL>(a, b, kvh, r0, part, qf, qhead, qpos);
+    load_q_rows<QT, kR, 2, kL>(a, b, kvh, r0, part, qf, qhead, qpos);
 
     float o_val[kR][16];
     float m_run[kR], d_run[kR];
@@ -494,9 +495,9 @@ __global__ __launch_bounds__(32) void flash_attn_direct_kernel(Args a, int row_g
             Vec8<S> kv[kAhead][2];
 #pragma unroll
             for (int j = 0; j < kAhead; ++j) {
-                const InT* k_row = k_head + imin(key0 + j0 + j, length - 1) * a.k_sn;
+                const KVT* k_row = k_head + imin(key0 + j0 + j, length - 1) * a.k_sn;
 #pragma unroll
-                for (int c = 0; c < 2; ++c) kv[j][c] = load8<InT>(k_row + (kL * c + part) * 8);
+                for (int c = 0; c < 2; ++c) kv[j][c] = load8<KVT>(k_row + (kL * c + part) * 8);
             }
 #pragma unroll
             for (int j = 0; j < kAhead; ++j) {
@@ -549,9 +550,9 @@ __global__ __launch_bounds__(32) void flash_attn_direct_kernel(Args a, int row_g
             Vec8<S> vv[kAhead][2];
 #pragma unroll
             for (int j = 0; j < kAhead; ++j) {
-                const InT* v_row = v_head + imin(key0 + j0 + j, length - 1) * a.v_sn;
+                const KVT* v_row = v_head + imin(key0 + j0 + j, length - 1) * a.v_sn;
 #pragma unroll
-                for (int c = 0; c < 2; ++c) vv[j][c] = load8<InT>(v_row + (kL * c + part) * 8);
+                for (int c = 0; c < 2; ++c) vv[j][c] = load8<KVT>(v_row + (kL * c + part) * 8);
             }
 #pragma unroll
             for (int j = 0; j < kAhead; ++j)
@@ -586,7 +587,7 @@ __global__ __launch_bounds__(32) void flash_attn_direct_kernel(Args a, int row_g
 #pragma unroll
     for (int r = 0; r < kR; ++r) {
         if (r0 + r >= rows) break;
-        store_row<InT, HD, 16, kL>(a, b, split, part, qhead[r], qpos[r], o_val[r], m_run[r], d_run[r],
+        store_row<QT, HD, 16, kL>(a, b, split, part, qhead[r], qpos[r], o_val[r], m_run[r], d_run[r],
                                    gridDim.z * rows);
     }
 }
@@ -630,23 +631,23 @@ void launch_tiled(const Args& a, int batch) {
     launch_combine<InT, HD>(a, batch);
 }
 
-template <typename InT, int HD>
+template <typename QT, typename KVT, int HD>
 void launch_direct(const Args& a, int batch) {
     const int rows = a.groups * a.q_len;
     int row_groups = 1;
     while (row_groups * 2 < rows) row_groups *= 2;
     const dim3 grid(1, a.num_splits, batch * a.heads_kv);
-    flash_attn_direct_kernel<InT, HD><<<grid, 32, 0, a.stream>>>(a, row_groups);
-    launch_combine<InT, HD>(a, batch);
+    flash_attn_direct_kernel<QT, KVT, HD><<<grid, 32, 0, a.stream>>>(a, row_groups);
+    launch_combine<QT, HD>(a, batch);
 }
 
 template <typename InT>
 void launch_dims(const Args& a, int batch, int head_dim, bool few_rows) {
     // Rows that fit one wave of the direct kernel (decode) take it; splits make the blocks.
     if (head_dim == 64) {
-        few_rows ? launch_direct<InT, 64>(a, batch) : launch_tiled<InT, 64>(a, batch);
+        few_rows ? launch_direct<InT, InT, 64>(a, batch) : launch_tiled<InT, 64>(a, batch);
     } else if (head_dim == 128) {
-        few_rows ? launch_direct<InT, 128>(a, batch) : launch_tiled<InT, 128>(a, batch);
+        few_rows ? launch_direct<InT, InT, 128>(a, batch) : launch_tiled<InT, 128>(a, batch);
     } else {
         // The direct kernel at HD 256 (fp16) crashes LLVM's instruction selection
         // ("Cannot select: f32 = Constant<-1>"); the tiled kernel takes any row count.
@@ -669,7 +670,9 @@ extern "C" void launch_flash_attn(const void* q, const void* k, const void* v, c
            strides[0], strides[1], strides[2], strides[3], strides[4], strides[5],
            strides[6], strides[7], strides[8], strides[9], strides[10], strides[11],
            strides[12], strides[13], strides[14], strides[15], scale, stream};
-    if (dtype_code == 0) launch_dims<float>(a, batch, head_dim, few_rows);
+    // 3: fp32 Q and O over an fp16 KV cache, decode rows at HD 64 and 128 only
+    if (dtype_code == 3) head_dim == 64 ? launch_direct<float, __half, 64>(a, batch) : launch_direct<float, __half, 128>(a, batch);
+    else if (dtype_code == 0) launch_dims<float>(a, batch, head_dim, few_rows);
     else if (dtype_code == 1) launch_dims<__half>(a, batch, head_dim, few_rows);
     else launch_dims<__bf16>(a, batch, head_dim, few_rows);
 }

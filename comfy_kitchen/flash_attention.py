@@ -67,7 +67,8 @@ def flash_attention_decode(
     """Decode BF16 [batch, 1, heads, head_dim] queries over a fixed KV cache.
 
     CUDA and HIP support head dimensions 64, 128 and 256; rdna1 (gfx1010) runs its float
-    flash attention instead (fp32, fp16 or bf16, head dims 64 and 128), in q's dtype.
+    flash attention instead (fp32, fp16 or bf16, head dims 64 and 128, or fp32 q over an
+    fp16 cache), in q's dtype.
     """
     batch, _, query_heads, head_dim = q.shape
     _, kv_capacity, kv_heads, _ = k.shape
