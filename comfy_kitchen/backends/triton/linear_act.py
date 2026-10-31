@@ -68,6 +68,10 @@ _GLU_CONFIGS = [
     # fp16 accumulators hit the 256-VGPR limit and spill.
     triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 16}, num_warps=8, num_stages=1),
     triton.Config({"BM": 128, "BN": 64, "BK": 32, "GROUP_M": 16}, num_warps=8, num_stages=3),
+    # Tuned on AMD Radeon 8060S (gfx1151, 2 MB L2) for the Z-Image SwiGLU FFN. In
+    # bf16 the 4-warp BM 128 tile does not spill there; GROUP_M 32 (the RTX 5090
+    # SwiGLU config) is about 45% slower on the small L2.
+    triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 8}, num_warps=4, num_stages=2),
 ]
 
 
