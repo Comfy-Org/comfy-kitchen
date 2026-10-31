@@ -58,8 +58,6 @@ _GEGLU_CONFIGS = [
     # and K 640 (M 8192, N 2560), fp16.
     triton.Config({"BM": 128, "BN": 64, "BK": 32, "GROUP_M": 8}, num_warps=4, num_stages=3),
     triton.Config({"BM": 64, "BN": 64, "BK": 32, "GROUP_M": 8}, num_warps=4, num_stages=3),
-    # Tuned for SwiGLU (RTX 5090); not picked for GEGLU on the GPUs measured.
-    triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 32}, num_warps=4, num_stages=2),
     # Smaller footprint; the pick on AMD Radeon 8060S (gfx1151) at both shapes.
     triton.Config({"BM": 64, "BN": 64, "BK": 64, "GROUP_M": 8}, num_warps=4, num_stages=2),
     # Tuned on AMD Radeon AI PRO R9700 (gfx1201, 64 KB LDS) for the SDXL GEGLU
@@ -67,9 +65,6 @@ _GEGLU_CONFIGS = [
     # fp16 accumulators hit the 256-VGPR limit and spill.
     triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 16}, num_warps=8, num_stages=1),
     triton.Config({"BM": 128, "BN": 64, "BK": 32, "GROUP_M": 16}, num_warps=8, num_stages=3),
-    # Tuned for SwiGLU (gfx1151); not picked for GEGLU on the GPUs measured (it
-    # spills in fp16).
-    triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 8}, num_warps=4, num_stages=2),
 ]
 
 # SwiGLU, tuned on the Z-Image FFN (M 4160, K 3840, N 10240, bf16). Only configs
