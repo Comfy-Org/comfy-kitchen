@@ -3,7 +3,7 @@
 """Triton GEMMs with a fused activation epilogue.
 
 One dual-accumulator GEMM kernel with the activation fused into its epilogue,
-selected by ACT:
+selected by act:
 
     linear_geglu:  h, gate = x @ W^T + b (W = [W_h; W_gate], packed by rows)
                    out = h * gelu(gate)
@@ -36,7 +36,7 @@ import triton
 import triton.language as tl
 
 # Every autotune config below tiles K evenly when K_MULTIPLE holds. N tiles
-# that run past N are masked (EVEN_N below), so BN need not divide N.
+# that run past N are masked (even_n below), so BN need not divide N.
 GLU_N_MULTIPLE = 64  # N of one half (the output width) for the gated forms
 K_MULTIPLE = 64
 # Below this many rows the GEMM is too small for the fused kernel to be worth
@@ -56,15 +56,15 @@ _ACT_SWIGLU = 2
 _GEGLU_CONFIGS = [
     # Tuned on NVIDIA RTX 5090 (sm_120): SDXL GEGLU at K 1280 (M 2048, N 5120)
     # and K 640 (M 8192, N 2560), fp16.
-    triton.Config({"BM": 128, "BN": 64, "BK": 32, "GROUP_M": 8}, num_warps=4, num_stages=3),
-    triton.Config({"BM": 64, "BN": 64, "BK": 32, "GROUP_M": 8}, num_warps=4, num_stages=3),
+    triton.Config({"block_m": 128, "block_n": 64, "block_k": 32, "group_size_m": 8}, num_warps=4, num_stages=3),
+    triton.Config({"block_m": 64, "block_n": 64, "block_k": 32, "group_size_m": 8}, num_warps=4, num_stages=3),
     # Smaller footprint; the pick on AMD Radeon 8060S (gfx1151) at both shapes.
-    triton.Config({"BM": 64, "BN": 64, "BK": 64, "GROUP_M": 8}, num_warps=4, num_stages=2),
+    triton.Config({"block_m": 64, "block_n": 64, "block_k": 64, "group_size_m": 8}, num_warps=4, num_stages=2),
     # Tuned on AMD Radeon AI PRO R9700 (gfx1201, 64 KB LDS) for the SDXL GEGLU
     # shapes above. There the BM 128 dual tiles need 8 warps: with 4 warps the two
     # fp16 accumulators hit the 256-VGPR limit and spill.
-    triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 16}, num_warps=8, num_stages=1),
-    triton.Config({"BM": 128, "BN": 64, "BK": 32, "GROUP_M": 16}, num_warps=8, num_stages=3),
+    triton.Config({"block_m": 128, "block_n": 64, "block_k": 64, "group_size_m": 16}, num_warps=8, num_stages=1),
+    triton.Config({"block_m": 128, "block_n": 64, "block_k": 32, "group_size_m": 16}, num_warps=8, num_stages=3),
 ]
 
 # SwiGLU, tuned on the Z-Image FFN (M 4160, K 3840, N 10240, bf16). Only configs
@@ -72,13 +72,13 @@ _GEGLU_CONFIGS = [
 # below.
 _SWIGLU_CONFIGS = [
     # Fastest on NVIDIA RTX 5090 (sm_120); within 1% on AMD Radeon AI PRO R9700.
-    triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 32}, num_warps=4, num_stages=2),
+    triton.Config({"block_m": 128, "block_n": 64, "block_k": 64, "group_size_m": 32}, num_warps=4, num_stages=2),
     # Fastest on AMD Radeon AI PRO R9700 (gfx1201).
-    triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 16}, num_warps=8, num_stages=1),
+    triton.Config({"block_m": 128, "block_n": 64, "block_k": 64, "group_size_m": 16}, num_warps=8, num_stages=1),
     # Tuned on AMD Radeon 8060S (gfx1151, 2 MB L2): within 1% of the fastest
     # config measured there, while GROUP_M 32 is about 45% slower on the small
     # L2. Within 1% on the R9700.
-    triton.Config({"BM": 128, "BN": 64, "BK": 64, "GROUP_M": 8}, num_warps=4, num_stages=2),
+    triton.Config({"block_m": 128, "block_n": 64, "block_k": 64, "group_size_m": 8}, num_warps=4, num_stages=2),
 ]
 
 
@@ -111,46 +111,46 @@ def _gelu_erf(x):
 @triton.jit
 def _linear_act_kernel(
     x_ptr, w1_ptr, w2_ptr, b1_ptr, b2_ptr, o_ptr,
-    M, N, K,
+    m, n, k,
     stride_xm, stride_w1n, stride_w2n, stride_om,
     w2_row0,
-    ACT: tl.constexpr, HAS_B1: tl.constexpr, HAS_B2: tl.constexpr,
-    EVEN_N: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP_M: tl.constexpr,
+    act: tl.constexpr, has_b1: tl.constexpr, has_b2: tl.constexpr,
+    even_n: tl.constexpr,
+    block_m: tl.constexpr, block_n: tl.constexpr, block_k: tl.constexpr, group_size_m: tl.constexpr,
 ):
     # Second accumulator: rows w2_row0 .. w2_row0 + N of w2 (and the same
     # elements of b2). GEGLU passes the packed weight as both w1 and w2 with
     # w2_row0 = N, so its halves are read by offset, without per-call views.
-    # Grouped tile order: GROUP_M row tiles sweep the N tiles together for L2 reuse.
+    # Grouped tile order: group_size_m row tiles sweep the N tiles together for L2 reuse.
     pid = tl.program_id(0)
-    num_m = tl.cdiv(M, BM)
-    num_n = tl.cdiv(N, BN)
-    group = GROUP_M * num_n
+    num_m = tl.cdiv(m, block_m)
+    num_n = tl.cdiv(n, block_n)
+    group = group_size_m * num_n
     gid = pid // group
-    first_m = gid * GROUP_M
-    gsz = tl.minimum(num_m - first_m, GROUP_M)
+    first_m = gid * group_size_m
+    gsz = tl.minimum(num_m - first_m, group_size_m)
     pm = first_m + (pid % group) % gsz
     pn = (pid % group) // gsz
 
-    rm = pm * BM + tl.arange(0, BM)
-    rn = pn * BN + tl.arange(0, BN)
-    if EVEN_N:
+    rm = pm * block_m + tl.arange(0, block_m)
+    rn = pn * block_n + tl.arange(0, block_n)
+    if even_n:
         rn_ld = rn
-        o_mask = rm[:, None] < M
+        o_mask = rm[:, None] < m
     else:
         # Last N tile runs past N: wrap its weight / bias reads onto valid rows
         # (no masks in the K loop) and drop those columns at the store.
-        rn_ld = rn % N
-        o_mask = (rm[:, None] < M) & (rn[None, :] < N)
-    rk = tl.arange(0, BK)
+        rn_ld = rn % n
+        o_mask = (rm[:, None] < m) & (rn[None, :] < n)
+    rk = tl.arange(0, block_k)
     a_p = x_ptr + rm[:, None].to(tl.int64) * stride_xm + rk[None, :]
     b1_p = w1_ptr + rn_ld[None, :].to(tl.int64) * stride_w1n + rk[:, None]
     b2_p = w2_ptr + (rn_ld[None, :] + w2_row0).to(tl.int64) * stride_w2n + rk[:, None]
-    m_mask = rm[:, None] < M
+    m_mask = rm[:, None] < m
 
-    acc1 = tl.zeros([BM, BN], tl.float32)
-    acc2 = tl.zeros([BM, BN], tl.float32)
-    for _ in range(0, K, BK):
+    acc1 = tl.zeros([block_m, block_n], tl.float32)
+    acc2 = tl.zeros([block_m, block_n], tl.float32)
+    for _ in range(0, k, block_k):
         # All loads first, then the dots: loading the second weight tile after
         # the first dot measured 2-7% slower.
         a = tl.load(a_p, mask=m_mask, other=0.0)
@@ -158,16 +158,16 @@ def _linear_act_kernel(
         b2 = tl.load(b2_p)
         acc1 = tl.dot(a, b1, acc1)
         acc2 = tl.dot(a, b2, acc2)
-        a_p += BK
-        b1_p += BK
-        b2_p += BK
+        a_p += block_k
+        b1_p += block_k
+        b2_p += block_k
 
     dt = o_ptr.dtype.element_ty
-    if HAS_B1:
+    if has_b1:
         acc1 = acc1 + tl.load(b1_ptr + rn_ld).to(tl.float32)[None, :]
-    if HAS_B2:
+    if has_b2:
         acc2 = acc2 + tl.load(b2_ptr + w2_row0 + rn_ld).to(tl.float32)[None, :]
-    if ACT == 2:
+    if act == 2:
         # silu(c1) * c3, each eager intermediate rounded.
         c1 = _round_to(acc1, dt)
         c3 = _round_to(acc2, dt)
@@ -177,7 +177,7 @@ def _linear_act_kernel(
         # h * gelu(gate), each eager intermediate rounded.
         h = _round_to(acc1, dt)
         gate = _round_to(acc2, dt)
-        if ACT == 0:
+        if act == 0:
             g = _round_to(_gelu_erf(gate), dt)
         else:
             g = _round_to(_gelu_tanh(gate), dt)
@@ -185,13 +185,13 @@ def _linear_act_kernel(
     tl.store(o_ptr + rm[:, None].to(tl.int64) * stride_om + rn[None, :], o, mask=o_mask)
 
 
-# EVEN_N follows the BN of whichever config the autotuner runs; when BN divides
+# even_n follows the BN of whichever config the autotuner runs; when BN divides
 # N (every shape the configs were tuned on) the kernel compiles without the N
 # wrap and mask, i.e. exactly as before. One autotuner per op (own config list
 # and timing cache), both over the same kernel.
 def _autotuned(configs):
-    return triton.autotune(configs=configs, key=["M", "N", "K", "ACT"])(
-        triton.heuristics({"EVEN_N": lambda args: args["N"] % args["BN"] == 0})(_linear_act_kernel)
+    return triton.autotune(configs=configs, key=["m", "n", "k", "act"])(
+        triton.heuristics({"even_n": lambda args: args["n"] % args["block_n"] == 0})(_linear_act_kernel)
     )
 
 
@@ -208,14 +208,14 @@ def _launch(kernel, x, w1, w2, w2_row0, b1, b2, n, act):
     out = torch.empty((m, n), device=x.device, dtype=x.dtype)
 
     def grid(meta):
-        return (triton.cdiv(m, meta["BM"]) * triton.cdiv(n, meta["BN"]),)
+        return (triton.cdiv(m, meta["block_m"]) * triton.cdiv(n, meta["block_n"]),)
 
     kernel[grid](
         x2, w1, w2, w1 if b1 is None else b1, w1 if b2 is None else b2, out,
         m, n, k,
         x2.stride(0), w1.stride(0), w2.stride(0), out.stride(0),
         w2_row0,
-        ACT=act, HAS_B1=b1 is not None, HAS_B2=b2 is not None,
+        act=act, has_b1=b1 is not None, has_b2=b2 is not None,
     )
     return out.view(*x.shape[:-1], n)
 

@@ -407,8 +407,8 @@ class TestLinearSwiglu:
 # (forced config, N): a served N (multiple of 64) that is not a multiple of the
 # config's BN, so the last N tile is partial.
 _PARTIAL_N_TILE = [
-    ({"BM": 64, "BN": 128, "BK": 32, "GROUP_M": 8}, 4, 192),
-    ({"BM": 64, "BN": 256, "BK": 32, "GROUP_M": 8}, 8, 384),
+    ({"block_m": 64, "block_n": 128, "block_k": 32, "group_size_m": 8}, 4, 192),
+    ({"block_m": 64, "block_n": 256, "block_k": 32, "group_size_m": 8}, 8, 384),
 ]
 
 
@@ -459,4 +459,4 @@ class TestPartialNTile:
 
         rtol, atol = _tol(dtype)
         assert_values_close(out.float(), eager.float(), rtol=rtol, atol=atol,
-                            name=f"linear_{op}[BN {kwargs['BN']} / N {n} vs eager]")
+                            name=f"linear_{op}[BN {kwargs['block_n']} / N {n} vs eager]")
