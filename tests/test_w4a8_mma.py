@@ -170,6 +170,20 @@ class TestW4A8PackedMMA:
             for got, ref in zip(outputs, expected, strict=False):
                 assert torch.equal(got, ref)
 
+    def test_first_decode_under_graph_capture(self, monkeypatch, seed):
+        # Prefill takes the chunked path, so the first MMA decode can be the captured one:
+        # packing must already have built the decode table (its host copy fails in capture).
+        monkeypatch.setattr(cuda_backend, "_W4A8_FIXED_DECODE_LUTS", {})
+        _, _, s_channel, _, packed = _packed_weight(1024, 4096)
+        x = torch.randn(1, 4096, device="cuda", dtype=torch.bfloat16)
+        empty = torch.empty(0, device="cuda", dtype=torch.float8_e4m3fn)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = ck.w4a8_int8_linear(x, packed, empty, s_channel, mma_packed=True)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, ck.w4a8_int8_linear(x, packed, empty, s_channel, mma_packed=True))
+
     @pytest.mark.parametrize("bits", [4, 6])
     def test_gemv_optimization_roundtrip(self, bits, seed):
         # Kitchen packs a resident canonical weight in place of its qdata + s_rel
