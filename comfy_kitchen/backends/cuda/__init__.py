@@ -219,7 +219,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
-from comfy_kitchen.tensor.w4a8_packed import _FIXED_LUT, _mma_bits, w4a8_mma_record_bytes  # noqa: E402
+from comfy_kitchen.tensor.w4a8_packed import _mma_bits, default_w4a8_codebook, w4a8_mma_record_bytes  # noqa: E402
 from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     w4a8_int8_linear as eager_w4a8_int8_linear,
 )
@@ -258,12 +258,13 @@ _FORCE_INT4_INT8_FALLBACK = os.environ.get("COMFY_KITCHEN_FORCE_INT4_INT8_FALLBA
 _INT4_PACKED_WEIGHT_SMALL_M_MAX = 8
 _INT4_INT8_WEIGHT_CHUNK_N = max(1, int(os.environ.get("COMFY_KITCHEN_INT4_INT8_WEIGHT_CHUNK_N", "4096")))
 _W4A8_CHUNKED = os.environ.get("COMFY_KITCHEN_W4A8_CHUNKED", "1") != "0"
-_W4A8_FIXED_DECODE_LUTS: dict[torch.device, torch.Tensor] = {}
+_W4A8_FIXED_DECODE_LUTS: dict[tuple[torch.device, int], torch.Tensor] = {}
 
 
-def _w4a8_fixed_decode_lut(device: torch.device) -> torch.Tensor:
-    if (decode_lut := _W4A8_FIXED_DECODE_LUTS.get(device)) is None:
-        codebook = torch.tensor(_FIXED_LUT, dtype=torch.float32)
+def _w4a8_fixed_decode_lut(device: torch.device, bits: int = 4) -> torch.Tensor:
+    """[256 fp8 scales, 2^bits codes] int8 table for the fixed 3- or 4-bit codebook."""
+    if (decode_lut := _W4A8_FIXED_DECODE_LUTS.get((device, bits))) is None:
+        codebook = default_w4a8_codebook(bits)
         scales = torch.arange(256, dtype=torch.uint8)
         scales = scales.view(torch.float8_e4m3fn).float()
         table = (
@@ -277,7 +278,7 @@ def _w4a8_fixed_decode_lut(device: torch.device) -> torch.Tensor:
         # stream can read it, and keep it outside execution-scoped allocations.
         with allocation_context():
             decode_lut = table.to(device)
-        _W4A8_FIXED_DECODE_LUTS[device] = decode_lut
+        _W4A8_FIXED_DECODE_LUTS[(device, bits)] = decode_lut
     return decode_lut
 
 
@@ -2087,7 +2088,7 @@ def _w4a8_mma_linear(
     scratch = torch.zeros(m * n + n // 16, dtype=torch.int32, device=out.device)
     workspace, counters = scratch[:m * n].view(m, n), scratch[m * n:]
     bits = _mma_bits(qdata.numel(), n, xq.shape[1])
-    decode_lut = _w4a8_fixed_decode_lut(qdata.device) if bits == 4 else None
+    decode_lut = _w4a8_fixed_decode_lut(qdata.device, bits) if bits != 6 else None
     used = _C.w4a8_codebook_mma_linear(
         _wrap_for_dlpack(x_2d),
         _wrap_for_dlpack(rotated) if rotated is not None else None,
@@ -2485,11 +2486,11 @@ def pack_w4a8_mma_weight_(dest: torch.Tensor, s_rel: torch.Tensor):
     """
     n, groups = s_rel.shape
     k = groups * 16
-    bits = 4 if dest.numel() == n * k * 9 // 16 else 6
-    if bits == 4:
+    bits = _mma_bits(dest.numel(), n, k)
+    if bits != 6:
         # Packing runs eagerly; build the decode table here so a first decode that
         # lands inside CUDA graph capture does not copy it from pageable host memory.
-        _w4a8_fixed_decode_lut(dest.device)
+        _w4a8_fixed_decode_lut(dest.device, bits)
     scales = s_rel.view(torch.uint8).clone()
     scratch = torch.empty(2 * k * bits, dtype=torch.uint8, device=dest.device)
     _C.pack_w4a8_mma_inplace(
@@ -2693,7 +2694,7 @@ def w4a8_packed_linear(
         qdata.dim() != 1
         or qdata.dtype != torch.int8
         or n % 16
-        or qdata.numel() not in (n * k * w4a8_mma_record_bytes(4) // 512, n * k * w4a8_mma_record_bytes(6) // 512)
+        or qdata.numel() not in tuple(n * k * w4a8_mma_record_bytes(b) // 512 for b in (3, 4, 6))
         or s_rel.numel() != 0
         or group_size != 16
         or correction is not None
