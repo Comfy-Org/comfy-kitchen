@@ -110,6 +110,34 @@ def rms_rope1(
     return _rms_rope1(x, freqs_cis, scale, epsilon, split_half=False)
 
 
+def check_norm_over_heads(x: torch.Tensor, freqs_cis: torch.Tensor, scale: torch.Tensor) -> None:
+    """norm_over_heads takes x as [B, S, H, head_dim] with freqs broadcast over the heads."""
+    if x.ndim != 4 or freqs_cis.ndim != 6:
+        raise ValueError("rms_rope(norm_over_heads=True): x must be [B, S, H, head_dim] and freqs 6D")
+    if (freqs_cis.shape[0] not in (1, x.shape[0]) or freqs_cis.shape[1] not in (1, x.shape[1])
+            or freqs_cis.shape[2] != 1 or freqs_cis.shape[3:] != (x.shape[3] // 2, 2, 2)):
+        raise ValueError(f"rms_rope(norm_over_heads=True): freqs {tuple(freqs_cis.shape)} do not "
+                         f"broadcast to [B, S, H, head_dim] {tuple(x.shape)}")
+    if scale.numel() != x.shape[2] * x.shape[3]:
+        raise ValueError(f"rms_rope(norm_over_heads=True): scale needs H * head_dim = "
+                         f"{x.shape[2] * x.shape[3]} elements, got {scale.numel()}")
+
+
+def _rms_rope1_over_heads(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float,
+) -> torch.Tensor:
+    # one RMS over each token's whole H * head_dim row (an RMSNorm(dim) applied before
+    # the head split, as in Wan), then interleaved RoPE per head
+    check_norm_over_heads(x, freqs_cis, scale)
+    heads, head_dim = x.shape[2], x.shape[3]
+    x_norm = torch.nn.functional.rms_norm(
+        x, (heads, head_dim), weight=scale.reshape(heads, head_dim), eps=epsilon)
+    return apply_rope1(x_norm, freqs_cis)
+
+
 def rms_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -117,9 +145,15 @@ def rms_rope(
     q_scale: torch.Tensor,
     k_scale: torch.Tensor | None = None,
     epsilon: float = 1e-6,
+    norm_over_heads: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k_scale is None:
         k_scale = q_scale
+    if norm_over_heads:
+        return (
+            _rms_rope1_over_heads(q, freqs_cis, q_scale, epsilon),
+            _rms_rope1_over_heads(k, freqs_cis, k_scale, epsilon),
+        )
     return (
         _rms_rope1(q, freqs_cis, q_scale, epsilon, split_half=False),
         _rms_rope1(k, freqs_cis, k_scale, epsilon, split_half=False),
@@ -227,6 +261,7 @@ def _op_rms_rope(
     q_scale: torch.Tensor,
     k_scale: torch.Tensor | None = None,
     epsilon: float = 1e-6,
+    norm_over_heads: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     kwargs = {
         "q": q,
@@ -236,12 +271,16 @@ def _op_rms_rope(
         "k_scale": k_scale,
         "epsilon": epsilon,
     }
+    if norm_over_heads:
+        # Only passed when set: backends that implement the full-row norm take the flag,
+        # the per-head ones decline it (rms_rope_norm_over_heads_call_rule).
+        kwargs["norm_over_heads"] = True
     impl = registry.get_implementation("rms_rope", kwargs=kwargs)
     return impl(**kwargs)
 
 
 @_op_rms_rope.register_fake
-def _op_rms_rope_fake(q, k, freqs_cis, q_scale, k_scale=None, epsilon=1e-6):
+def _op_rms_rope_fake(q, k, freqs_cis, q_scale, k_scale=None, epsilon=1e-6, norm_over_heads=False):
     return torch.empty_like(q), torch.empty_like(k)
 
 
