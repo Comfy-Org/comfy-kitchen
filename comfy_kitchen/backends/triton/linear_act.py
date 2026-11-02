@@ -53,33 +53,89 @@ _ACT_SWIGLU = 2
 # list each: they run in different dtypes (SDXL GEGLU fp16, Z-Image SwiGLU bf16)
 # at different shapes and weight layouts, and a config tuned for one can win the
 # other's autotune run without being the fastest there.
-_GEGLU_CONFIGS = [
+#
+# Each config is tagged with the GPU archs it measured fastest, or within about
+# 1% of the fastest, on (for its op at the shapes below). On a tagged arch the
+# autotuner only times that arch's configs (_prune_to_arch); on any other arch
+# it times the whole list.
+_SM120 = "sm_120"  # NVIDIA RTX 5090
+_GFX1151 = "gfx1151"  # AMD Radeon 8060S
+_GFX1201 = "gfx1201"  # AMD Radeon AI PRO R9700
+
+_GEGLU_TAGGED = [
     # Tuned on NVIDIA RTX 5090 (sm_120): SDXL GEGLU at K 1280 (M 2048, N 5120)
-    # and K 640 (M 8192, N 2560), fp16.
-    triton.Config({"block_m": 128, "block_n": 64, "block_k": 32, "group_size_m": 8}, num_warps=4, num_stages=3),
-    triton.Config({"block_m": 64, "block_n": 64, "block_k": 32, "group_size_m": 8}, num_warps=4, num_stages=3),
-    # Smaller footprint; the pick on AMD Radeon 8060S (gfx1151) at both shapes.
-    triton.Config({"block_m": 64, "block_n": 64, "block_k": 64, "group_size_m": 8}, num_warps=4, num_stages=2),
+    # and K 640 (M 8192, N 2560), fp16. Fastest there at both shapes.
+    (triton.Config({"block_m": 128, "block_n": 64, "block_k": 32, "group_size_m": 8}, num_warps=4, num_stages=3),
+     (_SM120,)),
+    # Tuned on the RTX 5090 for K 640. Back to back it measured 4-6% slower than
+    # the config above there, and it is not within 1% on the other two GPUs
+    # either, so no arch is tagged; it stays in the list for untagged archs.
+    (triton.Config({"block_m": 64, "block_n": 64, "block_k": 32, "group_size_m": 8}, num_warps=4, num_stages=3),
+     ()),
+    # Smaller footprint; the fastest of the list on AMD Radeon 8060S (gfx1151) at
+    # both shapes.
+    (triton.Config({"block_m": 64, "block_n": 64, "block_k": 64, "group_size_m": 8}, num_warps=4, num_stages=2),
+     (_GFX1151,)),
     # Tuned on AMD Radeon AI PRO R9700 (gfx1201, 64 KB LDS) for the SDXL GEGLU
-    # shapes above. There the BM 128 dual tiles need 8 warps: with 4 warps the two
-    # fp16 accumulators hit the 256-VGPR limit and spill.
-    triton.Config({"block_m": 128, "block_n": 64, "block_k": 64, "group_size_m": 16}, num_warps=8, num_stages=1),
-    triton.Config({"block_m": 128, "block_n": 64, "block_k": 32, "group_size_m": 16}, num_warps=8, num_stages=3),
+    # shapes above (fastest there at K 1280 and K 640 respectively). There the BM
+    # 128 dual tiles need 8 warps: with 4 warps the two fp16 accumulators hit the
+    # 256-VGPR limit and spill.
+    (triton.Config({"block_m": 128, "block_n": 64, "block_k": 64, "group_size_m": 16}, num_warps=8, num_stages=1),
+     (_GFX1201,)),
+    (triton.Config({"block_m": 128, "block_n": 64, "block_k": 32, "group_size_m": 16}, num_warps=8, num_stages=3),
+     (_GFX1201,)),
 ]
 
 # SwiGLU, tuned on the Z-Image FFN (M 4160, K 3840, N 10240, bf16). Only configs
 # that measured fastest, or within about 1% of the fastest, on one of the GPUs
 # below.
-_SWIGLU_CONFIGS = [
+_SWIGLU_TAGGED = [
     # Fastest on NVIDIA RTX 5090 (sm_120); within 1% on AMD Radeon AI PRO R9700.
-    triton.Config({"block_m": 128, "block_n": 64, "block_k": 64, "group_size_m": 32}, num_warps=4, num_stages=2),
+    (triton.Config({"block_m": 128, "block_n": 64, "block_k": 64, "group_size_m": 32}, num_warps=4, num_stages=2),
+     (_SM120, _GFX1201)),
     # Fastest on AMD Radeon AI PRO R9700 (gfx1201).
-    triton.Config({"block_m": 128, "block_n": 64, "block_k": 64, "group_size_m": 16}, num_warps=8, num_stages=1),
+    (triton.Config({"block_m": 128, "block_n": 64, "block_k": 64, "group_size_m": 16}, num_warps=8, num_stages=1),
+     (_GFX1201,)),
     # Tuned on AMD Radeon 8060S (gfx1151, 2 MB L2): within 1% of the fastest
     # config measured there, while GROUP_M 32 is about 45% slower on the small
     # L2. Within 1% on the R9700.
-    triton.Config({"block_m": 128, "block_n": 64, "block_k": 64, "group_size_m": 8}, num_warps=4, num_stages=2),
+    (triton.Config({"block_m": 128, "block_n": 64, "block_k": 64, "group_size_m": 8}, num_warps=4, num_stages=2),
+     (_GFX1151, _GFX1201)),
 ]
+
+_GEGLU_CONFIGS = [c for c, _ in _GEGLU_TAGGED]
+_SWIGLU_CONFIGS = [c for c, _ in _SWIGLU_TAGGED]
+
+
+def _arch_name(target) -> str | None:
+    """'sm_<major><minor>' (NVIDIA) or 'gfxNNNN' (AMD, feature suffixes such as
+    ':sramecc+' dropped) of a Triton GPUTarget; None for other backends."""
+    if target.backend == "cuda":
+        return f"sm_{target.arch}"
+    if target.backend == "hip":
+        return str(target.arch).split(":")[0]
+    return None
+
+
+def _current_arch() -> str | None:
+    try:
+        return _arch_name(triton.runtime.driver.active.get_current_target())
+    except Exception:  # Triton without get_current_target, or no active GPU driver
+        return None
+
+
+def _configs_for_arch(configs, tagged, arch):
+    """The configs tagged with arch, in list order; all configs if none is."""
+    allowed = [c for c, archs in tagged if arch in archs]
+    return [c for c in configs if c in allowed] or configs
+
+
+def _prune_to_arch(tagged):
+    # early_config_prune runs when the autotuner meets a new key, so the arch is
+    # that of the device the call runs on.
+    def prune(configs, named_args, **kwargs):
+        return _configs_for_arch(configs, tagged, _current_arch())
+    return prune
 
 
 @triton.jit
@@ -189,14 +245,15 @@ def _linear_act_kernel(
 # N (every shape the configs were tuned on) the kernel compiles without the N
 # wrap and mask, i.e. exactly as before. One autotuner per op (own config list
 # and timing cache), both over the same kernel.
-def _autotuned(configs):
-    return triton.autotune(configs=configs, key=["m", "n", "k", "act"])(
-        triton.heuristics({"even_n": lambda args: args["n"] % args["block_n"] == 0})(_linear_act_kernel)
-    )
+def _autotuned(configs, tagged):
+    return triton.autotune(
+        configs=configs, key=["m", "n", "k", "act"],
+        prune_configs_by={"early_config_prune": _prune_to_arch(tagged)},
+    )(triton.heuristics({"even_n": lambda args: args["n"] % args["block_n"] == 0})(_linear_act_kernel))
 
 
-_linear_geglu_kernel = _autotuned(_GEGLU_CONFIGS)
-_linear_swiglu_kernel = _autotuned(_SWIGLU_CONFIGS)
+_linear_geglu_kernel = _autotuned(_GEGLU_CONFIGS, _GEGLU_TAGGED)
+_linear_swiglu_kernel = _autotuned(_SWIGLU_CONFIGS, _SWIGLU_TAGGED)
 
 
 def _launch(kernel, x, w1, w2, w2_row0, b1, b2, n, act):
