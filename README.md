@@ -22,14 +22,14 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `na2d`                      | ✓     | ✓    | ✓      | ✓   |     |     |
 | `sol_attn`                  | ✓     | ✓    |        | ✓   |     |     |
 | `int8_attention`            |       | ✓    |        | ✓   |     |     |
-| `apply_rope`                | ✓     | ✓    | ✓      | ✓   | ✓*  |     |
-| `apply_rope1`               | ✓     | ✓    | ✓      | ✓   | ✓*  |     |
-| `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   | ✓*  |     |
-| `apply_rope_split_half1`    | ✓     | ✓    | ✓      | ✓   | ✓*  |     |
-| `rms_rope`                  | ✓     | ✓    | ✓      | ✓   | ✓*  |     |
-| `rms_rope1`                 | ✓     | ✓    | ✓      | ✓   | ✓*  |     |
-| `rms_rope_split_half`       | ✓     | ✓    | ✓      | ✓   | ✓*  |     |
-| `rms_rope_split_half1`      | ✓     | ✓    | ✓      | ✓   | ✓*  |     |
+| `apply_rope`                | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
+| `apply_rope1`               | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
+| `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
+| `apply_rope_split_half1`    | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
+| `rms_rope`                  | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
+| `rms_rope1`                 | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
+| `rms_rope_split_half`       | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
+| `rms_rope_split_half1`      | ✓     | ✓    | ✓      | ✓   | ✓*  | ✓   |
 | `quantize_int8_rowwise`     | ✓     | ✓    | ✓      | ✓   | ✓   |     |
 | `quantize_int8_tensorwise`  | ✓     | ✓    |        | ✓   | ✓   |     |
 | `quantize_and_rotate_rowwise` | ✓   | ✓    | ✓      | ✓   | ✓*  |     |
@@ -66,9 +66,10 @@ corresponding operator is available.
 
 ## Apple GPU (mps) backend
 
-The `mps` backend runs `adaln` / `rms_adaln` as Metal kernels compiled with
-`torch.mps.compile_shader`, for float32/float16/bfloat16 and strided views with a
-contiguous last dim. Other calls are declined and run on eager.
+The `mps` backend runs the rope entries (including in-place forms and `rot_dim`)
+and `adaln` / `rms_adaln` as Metal kernels compiled with `torch.mps.compile_shader`,
+for float32/float16/bfloat16 and strided views with a contiguous last dim. Other
+calls are declined and run on eager.
 
 ## Huawei Ascend backend
 
