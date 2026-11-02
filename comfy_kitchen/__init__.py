@@ -70,6 +70,7 @@ __all__ = [
     "fp16_conv3d",
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
+    "l2_norm_silu",
     "rms_adaln",
     # Attention
     "PrequantizedInt8Attention",
@@ -407,6 +408,23 @@ def group_norm_silu_pad3d(
     torch.ops.comfy_kitchen.group_norm_silu_pad3d_out(
         x, weight, bias, num_groups, eps, list(pad), silu, zero_pad, out, stats)
     return out
+
+
+def l2_norm_silu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: float,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Channel L2 norm, scale, weight and SiLU in one pass.
+
+    ``silu(x / max(||x||_2, eps) * scale * weight)`` with the norm over dim 1 of a
+    channel-first x ``[B, C, *spatial]`` and one weight per channel: the
+    ``F.normalize(x, dim=1) * scale * gamma`` RMS norm of the Wan VAE (scale
+    ``sqrt(C)``, eps as in ``F.normalize``) followed by its SiLU. The weight is
+    rounded to x's dtype first.
+    """
+    return torch.ops.comfy_kitchen.l2_norm_silu(x, weight, float(scale), eps)
 
 
 def group_norm_stats3d(x: torch.Tensor, num_groups: int = 32, eps: float = 1e-6) -> torch.Tensor:
