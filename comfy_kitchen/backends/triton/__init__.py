@@ -122,7 +122,7 @@ if _TRITON_AVAILABLE:
         return _triton_quantize_and_rotate_rowwise(x, h, group_size)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _hip_gfx12(device_index: int | None) -> bool:
     """ROCm device with OCP fp8 conversions (RDNA4); the fused fp8 kernels are only
     served (and validated) there."""

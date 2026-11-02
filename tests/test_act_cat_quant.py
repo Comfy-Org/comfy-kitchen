@@ -115,8 +115,8 @@ def _triton(x, h, scale, act):
         return ck.act_cat_quantize_fp8(x, h, scale, act)
 
 
-# (leading dims, Dx, Dm): Dx and Dm not multiples of the 512-column tile, rows
-# not a multiple of the 8-row tile, no leading dims, and Flux's widths.
+# (leading dims, Dx, Dm): Dx and Dm not multiples of the 1024-column tile, rows
+# not a multiple of the 2-row tile, no leading dims, and Flux's widths.
 _SHAPES = [
     ((37,), 200, 300),
     ((2, 45), 512, 1024),
@@ -297,12 +297,10 @@ class TestActCatQuantizeFp8Eager:
         x = torch.zeros(4, 8, device=device)
         h = torch.zeros(4, 16, device=device)
         st = _scale(1.0, device)
-        with pytest.raises(ValueError, match="unsupported act"):
-            with ck.use_backend("eager"):
-                ck.act_cat_quantize_fp8(x, h, st, "relu")
-        with pytest.raises(ValueError, match="even number"):
-            with ck.use_backend("eager"):
-                ck.act_cat_quantize_fp8(x, h[:, :15], st, "swiglu")
+        with pytest.raises(ValueError, match="unsupported act"), ck.use_backend("eager"):
+            ck.act_cat_quantize_fp8(x, h, st, "relu")
+        with pytest.raises(ValueError, match="even number"), ck.use_backend("eager"):
+            ck.act_cat_quantize_fp8(x, h[:, :15], st, "swiglu")
 
     @pytest.mark.parametrize("act", ACTS)
     def test_fake_shape(self, act):
