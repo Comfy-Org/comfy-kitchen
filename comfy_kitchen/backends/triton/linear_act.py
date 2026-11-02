@@ -22,6 +22,8 @@ so is N whenever the tile width BN of the chosen config does not divide it, so
 no autotune config can leave output columns unwritten.
 """
 
+import inspect
+
 import torch
 
 import triton
@@ -100,6 +102,49 @@ def _prune_to_arch(configs, named_args, **kwargs):
     return _configs_for_arch(configs, _TAGGED, _current_arch())
 
 
+def _bench_warm(kernel_call, quantiles, warmup=250, rep=100):
+    """Autotune timer (ms at the given quantiles): triton.testing.do_bench's
+    loop (warmup / rep in ms, one event pair per call, calls back to back)
+    without its cache clear, and with a longer warmup.
+
+    Triton's default timer zero-fills a 256 MB buffer before every timed call,
+    so each call starts with cold, dirty caches, while the GEMM runs back to
+    back in a model. Warmup: after an idle gap (such as compiling the config
+    about to be timed) a GPU can run faster for the first 100-200 ms of load
+    (about 5% on the RTX 5090), so 25 ms of warmup times every config in that
+    window; 250 ms reaches the back-to-back speed.
+    """
+    di = triton.runtime.driver.active.get_device_interface()
+    kernel_call()
+    di.synchronize()
+    start, end = di.Event(enable_timing=True), di.Event(enable_timing=True)
+    start.record()
+    for _ in range(5):
+        kernel_call()
+    end.record()
+    di.synchronize()
+    estimate = max(start.elapsed_time(end) / 5, 1e-3)
+    for _ in range(max(1, int(warmup / estimate))):
+        kernel_call()
+    n = max(5, int(rep / estimate))
+    starts = [di.Event(enable_timing=True) for _ in range(n)]
+    ends = [di.Event(enable_timing=True) for _ in range(n)]
+    for s, e in zip(starts, ends, strict=True):
+        s.record()
+        kernel_call()
+        e.record()
+    di.synchronize()
+    times = torch.tensor([s.elapsed_time(e) for s, e in zip(starts, ends, strict=True)])
+    return [torch.quantile(times, q).item() for q in quantiles]
+
+
+# triton.autotune takes do_bench since Triton 3.2; older versions keep their
+# default timer.
+_AUTOTUNE_TIMER = (
+    {"do_bench": _bench_warm} if "do_bench" in inspect.signature(triton.autotune).parameters else {}
+)
+
+
 @triton.jit
 def _round_to(v, dt: tl.constexpr):
     # Round fp32 to dt and back. Goes through an integer bitcast because Triton
@@ -122,6 +167,7 @@ def _gelu_tanh(x):
 
 @triton.autotune(
     configs=_CONFIGS, key=["m", "n", "k"], prune_configs_by={"early_config_prune": _prune_to_arch},
+    **_AUTOTUNE_TIMER,
 )
 # even_n follows the BN of whichever config the autotuner runs; when BN divides
 # N the kernel compiles without the N wrap and mask.
