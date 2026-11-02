@@ -30,3 +30,13 @@ def test_compiles_with_the_right_output_shape(act, width):
     out = fn(x)
     assert out.shape == (2, width)
     assert torch.equal(out, apply_input_act(x, act))
+
+
+def test_gradients_flow_through_the_eager_path():
+    x = torch.randn(2, 8, dtype=torch.double, requires_grad=True)
+    w = torch.rand(8, dtype=torch.double, requires_grad=True)
+    assert torch.autograd.gradcheck(lambda x, w: ck.input_act(x, "rms_norm", w, 1e-6), (x, w))
+
+    for act in ("swiglu", "situ"):
+        y = torch.randn(2, 16, dtype=torch.double, requires_grad=True)
+        assert torch.autograd.gradcheck(lambda y: ck.input_act(y, act), (y,))
