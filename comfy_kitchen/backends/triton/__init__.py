@@ -27,6 +27,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "l2_norm_silu",
 ]
 
 # Try to import triton and register if available
@@ -54,6 +55,7 @@ try:
     )
 
     from .adaln import adaln, rms_adaln
+    from .l2_norm_silu import l2_norm_silu
     from .na import na3d
     from .quantization import (
         dequantize_nvfp4,
@@ -125,6 +127,16 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _l2_norm_silu_call_rule(kwargs):
+        x, weight = kwargs.get("x"), kwargs.get("weight")
+        if x is None or weight is None:
+            return ValidationResult.ok()
+        if x.dim() < 3:
+            return ValidationResult.fail("x", "x must be [B, C, *spatial]")
+        if weight.numel() != x.shape[1]:
+            return ValidationResult.fail("weight", f"weight needs {x.shape[1]} elements")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -326,6 +338,15 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
+    half_floats = frozenset({torch.float16, torch.bfloat16})
+    out["l2_norm_silu"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=half_floats),
+            "weight": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=triton_devices,
+        call_rules=(_l2_norm_silu_call_rule,),
+    )
     out["na3d"] = FunctionConstraints(
         params={
             "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
