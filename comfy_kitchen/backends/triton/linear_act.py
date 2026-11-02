@@ -30,6 +30,8 @@ masked; so is N whenever the tile width BN of the chosen config does not divide
 it, so no autotune config can leave output columns unwritten.
 """
 
+import inspect
+
 import torch
 
 import triton
@@ -241,6 +243,56 @@ def _linear_act_kernel(
     tl.store(o_ptr + rm[:, None].to(tl.int64) * stride_om + rn[None, :], o, mask=o_mask)
 
 
+def _bench_warm(kernel_call, quantiles, warmup=250, rep=100):
+    """Autotune timer (ms at the given quantiles): triton.testing.do_bench's
+    loop (warmup / rep in ms, one event pair per call, calls back to back)
+    without its cache clear, and with a longer warmup.
+
+    Triton's default timer zero-fills a 256 MB buffer before every timed call,
+    so each call starts with cold, dirty caches. These GEMMs run back to back
+    in a model, with their weights and the activations of the previous call
+    in L2, and the cold timing does not rank the configs that way: on the RTX
+    5090 at SDXL GEGLU K 640 it timed 128x64x32 and 64x64x32 within 0.1% of
+    each other and picked 64x64x32 in 3 of 10 processes, while back to back
+    it is 6% slower.
+
+    Warmup: after an idle gap (such as compiling the config about to be
+    timed) the RTX 5090 runs these kernels about 5% faster for the first
+    100-200 ms of load. With Triton's 25 ms warmup every config is timed in
+    that window, where SwiGLU GROUP_M 32 and GROUP_M 8 came out within 0.1-1%
+    of each other; after 250 ms they are 2% apart, as back to back.
+    """
+    di = triton.runtime.driver.active.get_device_interface()
+    kernel_call()
+    di.synchronize()
+    start, end = di.Event(enable_timing=True), di.Event(enable_timing=True)
+    start.record()
+    for _ in range(5):
+        kernel_call()
+    end.record()
+    di.synchronize()
+    estimate = max(start.elapsed_time(end) / 5, 1e-3)
+    for _ in range(max(1, int(warmup / estimate))):
+        kernel_call()
+    n = max(5, int(rep / estimate))
+    starts = [di.Event(enable_timing=True) for _ in range(n)]
+    ends = [di.Event(enable_timing=True) for _ in range(n)]
+    for s, e in zip(starts, ends, strict=True):
+        s.record()
+        kernel_call()
+        e.record()
+    di.synchronize()
+    times = torch.tensor([s.elapsed_time(e) for s, e in zip(starts, ends, strict=True)])
+    return [torch.quantile(times, q).item() for q in quantiles]
+
+
+# triton.autotune takes do_bench since Triton 3.2; older versions keep their
+# default timer.
+_AUTOTUNE_TIMER = (
+    {"do_bench": _bench_warm} if "do_bench" in inspect.signature(triton.autotune).parameters else {}
+)
+
+
 # even_n follows the BN of whichever config the autotuner runs; when BN divides
 # N (every shape the configs were tuned on) the kernel compiles without the N
 # wrap and mask, i.e. exactly as before. One autotuner per op (own config list
@@ -249,6 +301,7 @@ def _autotuned(configs, tagged):
     return triton.autotune(
         configs=configs, key=["m", "n", "k", "act"],
         prune_configs_by={"early_config_prune": _prune_to_arch(tagged)},
+        **_AUTOTUNE_TIMER,
     )(triton.heuristics({"even_n": lambda args: args["n"] % args["block_n"] == 0})(_linear_act_kernel))
 
 
