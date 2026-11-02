@@ -15,6 +15,7 @@ never materialized on CUDA.
 """
 
 import math
+import typing
 
 import torch
 import torch.nn.functional as functional
@@ -89,8 +90,8 @@ def na3d(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    kernel_size: list[int],
-    is_causal: list[bool] | None = None,
+    kernel_size: typing.List[int],
+    is_causal: typing.List[bool] | None = None,
     scale: float | None = None,
 ) -> torch.Tensor:
     """3D neighborhood attention over ``(B, T, H, W, NH, HD)`` tensors."""
@@ -165,8 +166,8 @@ def _op_na3d(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    kernel_size: list[int],
-    is_causal: list[bool],
+    kernel_size: typing.List[int],
+    is_causal: typing.List[bool],
     scale: float | None,
 ) -> torch.Tensor:
     kwargs = {"q": q, "k": k, "v": v, "kernel_size": kernel_size, "is_causal": is_causal, "scale": scale}
