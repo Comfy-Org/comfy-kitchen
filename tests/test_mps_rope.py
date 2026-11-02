@@ -30,14 +30,21 @@ def freqs_for(lead, pairs):
         [torch.stack([ang.cos(), -ang.sin()], -1), torch.stack([ang.sin(), ang.cos()], -1)], -2)
 
 
-def layouts(b, n, h, d, dtype):
-    """(name, tensor, freqs leading shape) for the layouts models use."""
-    yield "BNHD", torch.randn(b, n, h, d, device=DEV, dtype=dtype) * 2, (1, n, 1)
-    yield "BHND", torch.randn(b, h, n, d, device=DEV, dtype=dtype) * 2, (1, 1, n)
-    qkv = torch.randn(b, n, 3 * h * d, device=DEV, dtype=dtype) * 2
-    yield "packed-qkv k slice", qkv.chunk(3, dim=-1)[1].view(b, n, h, d), (1, n, 1)
-    yield "per-batch freqs", torch.randn(b, n, h, d, device=DEV, dtype=dtype) * 2, (b, n, 1)
-    yield "2-D", torch.randn(n, d, device=DEV, dtype=dtype) * 2, (n,)
+LAYOUTS = ["BNHD", "BHND", "packed-qkv k slice", "per-batch freqs", "2-D"]
+
+
+def make_case(layout, b, n, h, d, dtype):
+    """(tensor, freqs leading shape) for the layouts models use."""
+    if layout == "BNHD":
+        return torch.randn(b, n, h, d, device=DEV, dtype=dtype) * 2, (1, n, 1)
+    if layout == "BHND":
+        return torch.randn(b, h, n, d, device=DEV, dtype=dtype) * 2, (1, 1, n)
+    if layout == "packed-qkv k slice":
+        qkv = torch.randn(b, n, 3 * h * d, device=DEV, dtype=dtype) * 2
+        return qkv.chunk(3, dim=-1)[1].view(b, n, h, d), (1, n, 1)
+    if layout == "per-batch freqs":
+        return torch.randn(b, n, h, d, device=DEV, dtype=dtype) * 2, (b, n, 1)
+    return torch.randn(n, d, device=DEV, dtype=dtype) * 2, (n,)
 
 
 def assert_close_to_reference(got, stock, ref):
@@ -49,17 +56,19 @@ def assert_close_to_reference(got, stock, ref):
     assert err <= max(stock_err * 1.05, floor), f"kernel {err:.3g} vs eager on mps {stock_err:.3g}"
 
 
-def cases():
-    for dtype in DTYPES:
-        for shape in SHAPES:
-            for name, x, lead in layouts(*shape, dtype):
-                yield pytest.param(x, lead, id=f"{str(dtype)[6:]}-{name}-D{shape[-1]}")
+CASES = [
+    pytest.param(dtype, shape, layout, id=f"{str(dtype)[6:]}-{layout}-D{shape[-1]}")
+    for dtype in DTYPES
+    for shape in SHAPES
+    for layout in LAYOUTS
+]
 
 
 @pytest.mark.parametrize("split_half", [False, True], ids=["interleaved", "split_half"])
-@pytest.mark.parametrize(("x", "lead"), list(cases()))
-def test_rope_matches_eager(x, lead, split_half):
+@pytest.mark.parametrize(("dtype", "shape", "layout"), CASES)
+def test_rope_matches_eager(dtype, shape, layout, split_half):
     torch.manual_seed(0)
+    x, lead = make_case(layout, *shape, dtype)
     fr = freqs_for(lead, x.shape[-1] // 2)
     w = (torch.rand(x.shape[-1], device=DEV) + 0.5).to(x.dtype)
     plain, plain_ck = (
