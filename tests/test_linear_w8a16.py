@@ -65,8 +65,8 @@ def _rocm_gate_lifted():
     from comfy_kitchen.backends.triton import w8a16 as mod
 
     rows, weight = dict(mod.HIP_MAX_ROWS), dict(mod.HIP_MIN_WEIGHT)
-    mod.HIP_MAX_ROWS.update({a: 1 << 62 for a in rows})
-    mod.HIP_MIN_WEIGHT.update({a: 0 for a in weight})
+    mod.HIP_MAX_ROWS.update(dict.fromkeys(rows, 1 << 62))
+    mod.HIP_MIN_WEIGHT.update(dict.fromkeys(weight, 0))
     try:
         yield
     finally:
@@ -184,7 +184,7 @@ class TestLinearW8A16Triton:
         m = 5 if path == "small_m" else 77
         x, w, b = _inputs(m, 512, 200, torch.bfloat16, "fp8")
         configs = list(tuner.configs)
-        valid = mod._prune(configs, {"K": 512, "x_ptr": x})
+        valid = mod._prune(configs, {"k": 512, "x_ptr": x})
         assert valid
         try:
             for cfg in valid:
@@ -206,11 +206,13 @@ class TestLinearW8A16Triton:
         limit = mod._max_shared_mem(x.device.index)
         huge = mod._mm(256, 256, 256, 8, 8, 4)  # 3 x 192 KB
         for configs in (mod._SMALL_M_CONFIGS, mod._LARGE_M_CONFIGS):
-            kept = mod._prune(list(configs) + [huge], {"K": 256, "x_ptr": x})
+            kept = mod._prune([*configs, huge], {"k": 256, "x_ptr": x})
             assert kept
             assert huge not in kept
-            assert all(mod._smem_bytes(c) <= limit and 256 % c.kwargs["BK"] == 0 for c in kept)
-        assert mod._prune([huge], {"K": 256, "x_ptr": x}) == [huge]  # last resort, never empty
+            assert all(
+                mod._smem_bytes(c) <= limit and 256 % c.kwargs["block_k"] == 0 for c in kept
+            )
+        assert mod._prune([huge], {"k": 256, "x_ptr": x}) == [huge]  # last resort, never empty
 
     def test_read_flush_bench(self, seed):
         """The ROCm autotune timer returns one time (ms) per requested quantile, in order,

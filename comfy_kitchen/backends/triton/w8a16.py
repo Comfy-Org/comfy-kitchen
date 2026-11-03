@@ -13,10 +13,10 @@ the ones the eager path multiplies; the bias is added to the fp32 accumulator
 before the single rounding to the output dtype (as a GEMM bias epilogue does).
 Results differ from cuBLAS / hipBLASLt only by the fp32 summation order.
 
-One kernel, two shapes of work, chosen per config (constexpr ``GEMV``):
+One kernel, two shapes of work, chosen per config (constexpr ``gemv``):
 
-- tiled GEMM: grouped tile order, M and N masked, K stepped by BK (K % BK == 0).
-- GEMV (a few rows): one program per (row, BN outputs); [BN, BK] FP8 tiles are
+- tiled GEMM: grouped tile order, M and N masked, K stepped by block_k (K % block_k == 0).
+- GEMV (a few rows): one program per (row, block_n outputs); [block_n, block_k] FP8 tiles are
   converted to fp32, multiplied by the x chunk and row-summed at the end. Bound
   by reading the FP8 weight (modulation / time-embedding layers, M = 1, and the
   short text streams of CFG's unconditional pass).
@@ -27,10 +27,10 @@ descriptors or inline asm), so the same kernel compiles for NVIDIA and AMD GPUs.
 Configs are picked by ``triton.autotune``. Rows <= SMALL_M use one list (GEMV
 configs plus small GEMM tiles), more rows another (GEMM tiles), keyed on N, K
 and the row count (rounded up to a power of two above SMALL_M, so a new text
-length does not trigger a new tuning run). Configs whose BK does not divide K,
+length does not trigger a new tuning run). Configs whose block_k does not divide K,
 or whose pipelined tiles do not fit the device's shared memory (64 KB of LDS on
 gfx1151 vs ~99 KB on an RTX 5090), are pruned before tuning; every list has
-a small BK 32 entry, so K % K_MULTIPLE == 0 always leaves at least one.
+a small block_k 32 entry, so K % K_MULTIPLE == 0 always leaves at least one.
 """
 
 import functools
@@ -61,14 +61,14 @@ HIP_MIN_WEIGHT = {"gfx1151": 1 << 21}
 
 def _mm(bm, bn, bk, group_m, num_warps, num_stages):
     return triton.Config(
-        {"GEMV": False, "BM": bm, "BN": bn, "BK": bk, "GROUP_M": group_m},
+        {"gemv": False, "block_m": bm, "block_n": bn, "block_k": bk, "group_size_m": group_m},
         num_warps=num_warps, num_stages=num_stages,
     )
 
 
 def _gemv(bn, bk, num_warps, num_stages=3):
     return triton.Config(
-        {"GEMV": True, "BM": 1, "BN": bn, "BK": bk, "GROUP_M": 1},
+        {"gemv": True, "block_m": 1, "block_n": bn, "block_k": bk, "group_size_m": 1},
         num_warps=num_warps, num_stages=num_stages,
     )
 
@@ -86,8 +86,8 @@ _LARGE_M_CONFIGS = [
     _mm(64, 128, 64, 8, 4, 3),  # text M 262, FFN up
     _mm(64, 64, 64, 8, 4, 3),  # text M 256, FFN up (Flux)
     _mm(16, 64, 128, 8, 4, 3),  # M 9..64 (Qwen-Image 2512 uncond text M 46)
-    # Tuned on AMD Radeon 8060S (gfx1151, 64 KB LDS: the 5090's 3+ stage BK 128 and
-    # BK 32 x 5 stage tiles do not fit) at the text M 256 / 262 shapes.
+    # Tuned on AMD Radeon 8060S (gfx1151, 64 KB LDS: the 5090's 3+ stage block_k 128 and
+    # block_k 32 x 5 stage tiles do not fit) at the text M 256 / 262 shapes.
     _mm(64, 128, 64, 8, 4, 2),  # N 3072 / 12288 at K 3072, K 3584
     _mm(128, 64, 64, 8, 4, 2),  # N 9216 / 12288 (Flux)
     _mm(128, 128, 64, 8, 8, 2),  # K 12288 / 4096
@@ -110,84 +110,85 @@ _SMALL_M_CONFIGS = [
 
 @triton.jit
 def _mm_tiles(
-    x_ptr, w_ptr, b_ptr, o_ptr, M, N, K, stride_xm, stride_wn, stride_om,
-    HAS_BIAS: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-    GROUP_M: tl.constexpr,
+    x_ptr, w_ptr, b_ptr, o_ptr, m, n, k, stride_xm, stride_wn, stride_om,
+    has_bias: tl.constexpr, block_m: tl.constexpr, block_n: tl.constexpr,
+    block_k: tl.constexpr, group_size_m: tl.constexpr,
 ):
-    # Grouped tile order: GROUP_M row tiles sweep the N tiles together for L2 reuse.
+    # Grouped tile order: group_size_m row tiles sweep the N tiles together for L2 reuse.
     pid = tl.program_id(0)
-    num_m = tl.cdiv(M, BM)
-    num_n = tl.cdiv(N, BN)
-    group = GROUP_M * num_n
-    first_m = (pid // group) * GROUP_M
-    gsz = tl.minimum(num_m - first_m, GROUP_M)
+    num_m = tl.cdiv(m, block_m)
+    num_n = tl.cdiv(n, block_n)
+    group = group_size_m * num_n
+    first_m = (pid // group) * group_size_m
+    gsz = tl.minimum(num_m - first_m, group_size_m)
     pm = first_m + (pid % group) % gsz
     pn = (pid % group) // gsz
 
-    rm = pm * BM + tl.arange(0, BM)
-    rn = pn * BN + tl.arange(0, BN)
-    rk = tl.arange(0, BK)
-    m_mask = rm[:, None] < M
-    n_mask = rn[None, :] < N
+    rm = pm * block_m + tl.arange(0, block_m)
+    rn = pn * block_n + tl.arange(0, block_n)
+    rk = tl.arange(0, block_k)
+    m_mask = rm[:, None] < m
+    n_mask = rn[None, :] < n
     a_p = x_ptr + rm[:, None].to(tl.int64) * stride_xm + rk[None, :]
-    # [BK, BN] view of the row-major [N, K] FP8 weight
+    # [block_k, block_n] view of the row-major [N, K] FP8 weight
     b_p = w_ptr + rn[None, :].to(tl.int64) * stride_wn + rk[:, None]
     dt = o_ptr.dtype.element_ty
-    acc = tl.zeros([BM, BN], tl.float32)
-    for _ in range(0, K, BK):
+    acc = tl.zeros([block_m, block_n], tl.float32)
+    for _ in range(0, k, block_k):
         a = tl.load(a_p, mask=m_mask, other=0.0)
         b = tl.load(b_p, mask=n_mask, other=0.0)
         acc = tl.dot(a, b.to(dt), acc)  # exact e4m3 -> bf16 / fp16 in registers
-        a_p += BK
-        b_p += BK
-    if HAS_BIAS:
-        acc = acc + tl.load(b_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)[None, :]
+        a_p += block_k
+        b_p += block_k
+    if has_bias:
+        acc = acc + tl.load(b_ptr + rn, mask=rn < n, other=0.0).to(tl.float32)[None, :]
     o_p = o_ptr + rm[:, None].to(tl.int64) * stride_om + rn[None, :]
     tl.store(o_p, acc.to(dt), mask=m_mask & n_mask)
 
 
 @triton.jit
 def _gemv_rows(
-    x_ptr, w_ptr, b_ptr, o_ptr, N, K, stride_xm, stride_wn, stride_om,
-    HAS_BIAS: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    x_ptr, w_ptr, b_ptr, o_ptr, n, k, stride_xm, stride_wn, stride_om,
+    has_bias: tl.constexpr, block_n: tl.constexpr, block_k: tl.constexpr,
 ):
     pn = tl.program_id(0)
     m = tl.program_id(1)
-    rn = pn * BN + tl.arange(0, BN)
-    rk = tl.arange(0, BK)
-    n_mask = rn < N
+    rn = pn * block_n + tl.arange(0, block_n)
+    rk = tl.arange(0, block_k)
+    n_mask = rn < n
     w_p = w_ptr + rn[:, None].to(tl.int64) * stride_wn + rk[None, :]
     x_p = x_ptr + m.to(tl.int64) * stride_xm + rk
-    acc = tl.zeros([BN, BK], tl.float32)
-    for _ in range(0, K, BK):
+    acc = tl.zeros([block_n, block_k], tl.float32)
+    for _ in range(0, k, block_k):
         w = tl.load(w_p, mask=n_mask[:, None], other=0.0).to(tl.float32)
         x = tl.load(x_p).to(tl.float32)
         acc += w * x[None, :]
-        w_p += BK
-        x_p += BK
+        w_p += block_k
+        x_p += block_k
     out = tl.sum(acc, axis=1)
-    if HAS_BIAS:
+    if has_bias:
         out = out + tl.load(b_ptr + rn, mask=n_mask, other=0.0).to(tl.float32)
     tl.store(o_ptr + m.to(tl.int64) * stride_om + rn, out.to(o_ptr.dtype.element_ty), mask=n_mask)
 
 
 @triton.jit
 def _linear_w8a16_kernel(
-    x_ptr, w_ptr, b_ptr, o_ptr, M, N, K, M_BUCKET,
+    x_ptr, w_ptr, b_ptr, o_ptr, m, n, k, m_bucket,
     stride_xm, stride_wn, stride_om,
-    HAS_BIAS: tl.constexpr, GEMV: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP_M: tl.constexpr,
+    has_bias: tl.constexpr, gemv: tl.constexpr,
+    block_m: tl.constexpr, block_n: tl.constexpr, block_k: tl.constexpr,
+    group_size_m: tl.constexpr,
 ):
-    # M_BUCKET is only an autotune key (row count rounded up); unused here.
-    if GEMV:
-        _gemv_rows(x_ptr, w_ptr, b_ptr, o_ptr, N, K, stride_xm, stride_wn, stride_om,
-                   HAS_BIAS, BN, BK)
+    # m_bucket is only an autotune key (row count rounded up); unused here.
+    if gemv:
+        _gemv_rows(x_ptr, w_ptr, b_ptr, o_ptr, n, k, stride_xm, stride_wn, stride_om,
+                   has_bias, block_n, block_k)
     else:
-        _mm_tiles(x_ptr, w_ptr, b_ptr, o_ptr, M, N, K, stride_xm, stride_wn, stride_om,
-                  HAS_BIAS, BM, BN, BK, GROUP_M)
+        _mm_tiles(x_ptr, w_ptr, b_ptr, o_ptr, m, n, k, stride_xm, stride_wn, stride_om,
+                  has_bias, block_m, block_n, block_k, group_size_m)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _max_shared_mem(device_index: int) -> int:
     props = triton.runtime.driver.active.utils.get_device_properties(device_index)
     return props["max_shared_mem"]
@@ -196,19 +197,20 @@ def _max_shared_mem(device_index: int) -> int:
 def _smem_bytes(config) -> int:
     """Shared memory of a config's pipelined K loop: num_stages - 1 buffered copies of
     the 16-bit x tile and the FP8 weight tile. (That is what Triton reports for the
-    configs that do not fit: BM 128 x BN 128 x BK 128 at 3 stages needs 98304 B.)"""
+    configs that do not fit: block_m 128 x block_n 128 x block_k 128 at 3 stages needs
+    98304 B.)"""
     kw = config.kwargs
-    if kw["GEMV"]:
-        per_stage = kw["BN"] * kw["BK"] + 2 * kw["BK"]
+    if kw["gemv"]:
+        per_stage = kw["block_n"] * kw["block_k"] + 2 * kw["block_k"]
     else:
-        per_stage = 2 * kw["BM"] * kw["BK"] + kw["BK"] * kw["BN"]
+        per_stage = 2 * kw["block_m"] * kw["block_k"] + kw["block_k"] * kw["block_n"]
     return max(config.num_stages - 1, 1) * per_stage
 
 
 def _prune(configs, named_args, **kwargs):
     """Configs that tile K evenly and fit the device's shared memory (LDS)."""
-    k = named_args["K"]
-    tiled = [c for c in configs if k % c.kwargs["BK"] == 0]
+    k = named_args["k"]
+    tiled = [c for c in configs if k % c.kwargs["block_k"] == 0]
     limit = _max_shared_mem(named_args["x_ptr"].device.index)
     fit = [c for c in tiled if _smem_bytes(c) <= limit]
     return fit or [min(tiled, key=_smem_bytes)]
@@ -254,15 +256,15 @@ def _autotuned(configs, key):
     )(_linear_w8a16_kernel)
 
 
-_small_m_kernel = _autotuned(_SMALL_M_CONFIGS, ["M", "N", "K"])
-_large_m_kernel = _autotuned(_LARGE_M_CONFIGS, ["M_BUCKET", "N", "K"])
+_small_m_kernel = _autotuned(_SMALL_M_CONFIGS, ["m", "n", "k"])
+_large_m_kernel = _autotuned(_LARGE_M_CONFIGS, ["m_bucket", "n", "k"])
 
 
 def _grid(m, n):
     def grid(meta):
-        if meta["GEMV"]:
-            return (triton.cdiv(n, meta["BN"]), m)
-        return (triton.cdiv(m, meta["BM"]) * triton.cdiv(n, meta["BN"]), 1)
+        if meta["gemv"]:
+            return (triton.cdiv(n, meta["block_n"]), m)
+        return (triton.cdiv(m, meta["block_m"]) * triton.cdiv(n, meta["block_n"]), 1)
 
     return grid
 
@@ -295,6 +297,6 @@ def linear_w8a16(
     kernel[_grid(m, n)](
         x2, weight, weight if bias is None else bias, out, m, n, k, m_bucket,
         x2.stride(0), weight.stride(0), out.stride(0),
-        HAS_BIAS=bias is not None,
+        has_bias=bias is not None,
     )
     return out.view(*x.shape[:-1], n)

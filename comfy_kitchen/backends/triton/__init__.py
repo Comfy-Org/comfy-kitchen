@@ -126,7 +126,7 @@ def _arch_name(gcn_arch_name: str) -> str:
     return gcn_arch_name.split(":")[0]
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _hip_arch(device_index: int | None) -> str:
     index = torch.cuda.current_device() if device_index is None else device_index
     return _arch_name(torch.cuda.get_device_properties(index).gcnArchName)
