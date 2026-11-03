@@ -5,6 +5,8 @@
 // folded in here so the result feeds the WMMA int8 GEMM directly; the
 // per-channel scale stays for that GEMM's epilogue. Memory-bound.
 #include <stdexcept>
+#include <string>
+#include <type_traits>
 
 #include "../launchers.h"
 #include "../w4a8_codec.h"
@@ -33,8 +35,8 @@ __global__ void dequant_grouped_to_int8_kernel(
     int64_t vec_count, int k_half, int k, int group_size) {
 
     __shared__ float cb[16];
-    if constexpr (BITS == 4) {
-        if (codebook && threadIdx.x < 16) {
+    if constexpr (BITS == 4 || BITS == 3) {
+        if (codebook && threadIdx.x < (BITS == 4 ? 16 : 8)) {
             cb[threadIdx.x] = codebook[threadIdx.x];
         }
         if (codebook) {
@@ -47,14 +49,19 @@ __global__ void dequant_grouped_to_int8_kernel(
         return;
     }
 
-    const int vec_per_row = k_half / 8;
+    const int vec_per_row = k / 16;   // one 16-column vector per thread at every width
     const int64_t row = vec / vec_per_row;
     const int vec_in_row = static_cast<int>(vec % vec_per_row);
-    const int byte_base = vec_in_row * 8;
-    const int col_base = byte_base * 2;
+    const int byte_base = vec_in_row * 8;   // nibble-plane byte offset (4/5/6 bits)
+    const int col_base = vec_in_row * 16;
 
     const int8_t* __restrict__ wrow = qw + row * (static_cast<int64_t>(k) * BITS / 8);
-    const uint2 packed = *reinterpret_cast<const uint2*>(wrow + byte_base);
+    uint2 packed;
+    if constexpr (BITS == 3) {
+        packed = make_uint2(*reinterpret_cast<const unsigned*>(wrow + vec_in_row * 4), 0u);  // 2-bit plane
+    } else {
+        packed = *reinterpret_cast<const uint2*>(wrow + byte_base);
+    }
 
     const int64_t scale_row = row * (k / group_size);
     const int group_base = col_base / group_size;
@@ -72,6 +79,10 @@ __global__ void dequant_grouped_to_int8_kernel(
     unsigned hi = 0u;
     if constexpr (BITS == 6) {
         hi = *reinterpret_cast<const unsigned*>(wrow + k_half + vec_in_row * 4);
+    } else if constexpr (BITS == 5) {
+        hi = *reinterpret_cast<const unsigned short*>(wrow + k_half + vec_in_row * 2);
+    } else if constexpr (BITS == 3) {
+        hi = *reinterpret_cast<const unsigned short*>(wrow + k / 4 + vec_in_row * 2);
     }
 
     *reinterpret_cast<uint4*>(&out[row * k + col_base]) = dequant16_to_int8<BITS>(
@@ -84,15 +95,18 @@ void launch_dequant_grouped(const void* qw, const void* s_rel, const void* codeb
                             hipStream_t stream) {
     constexpr int threads = 256;
     const auto blocks = static_cast<unsigned int>((vec_count + threads - 1) / threads);
-    if (bits == 6) {
-        dequant_grouped_to_int8_kernel<ScaleT, 6><<<blocks, threads, 0, stream>>>(
-            static_cast<const int8_t*>(qw), static_cast<const ScaleT*>(s_rel), nullptr,
-            static_cast<int8_t*>(out), vec_count, k_half, k, group_size);
-    } else {
-        dequant_grouped_to_int8_kernel<ScaleT, 4><<<blocks, threads, 0, stream>>>(
+    auto launch = [&](auto bits_tag) {
+        constexpr int B = decltype(bits_tag)::value;
+        dequant_grouped_to_int8_kernel<ScaleT, B><<<blocks, threads, 0, stream>>>(
             static_cast<const int8_t*>(qw), static_cast<const ScaleT*>(s_rel),
-            static_cast<const float*>(codebook), static_cast<int8_t*>(out), vec_count, k_half,
-            k, group_size);
+            (B == 4 || B == 3) ? static_cast<const float*>(codebook) : nullptr,
+            static_cast<int8_t*>(out), vec_count, k_half, k, group_size);
+    };
+    switch (bits) {
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        case 6: launch(std::integral_constant<int, 6>{}); break;
+        default: launch(std::integral_constant<int, 4>{}); break;
     }
 }
 
@@ -148,16 +162,22 @@ extern "C" void launch_dequant_int4_grouped_to_int8_kernel(
             "dequant_int4_grouped_to_int8: group_size must be >=4 and divide 16 or be a "
             "multiple of 16");
     }
-    if (bits != 4 && bits != 6) {
-        throw std::runtime_error("dequant_int4_grouped_to_int8: bits must be 4 or 6");
+    if (bits < 3 || bits > 6) {
+        throw std::runtime_error("dequant_int4_grouped_to_int8: bits must be 3, 4, 5 or 6");
     }
-    // K % 32 keeps each 3K/4-byte row and its high plane aligned for the vector
-    // loads, and one scale covers a 16-column vector only when groups are whole
-    // multiples of 16.
-    if (bits == 6 && (k % 32 != 0 || group_size < 16 || group_size % 16 != 0 || codebook)) {
-        throw std::runtime_error(
-            "dequant_int4_grouped_to_int8: 6-bit storage needs K % 32 == 0, group_size a "
-            "multiple of 16 and no codebook");
+    // Multi-plane rows: K % 32 (6-bit) or K % 64 (3/5-bit) keeps each row and its high
+    // plane aligned for the vector loads, and one scale covers a 16-column vector only
+    // when groups are whole multiples of 16. 5/6-bit are uniform (no codebook); 3-bit
+    // needs its 8-entry table.
+    if (bits != 4) {
+        const int k_align = bits == 6 ? 32 : 64;
+        const bool codebook_ok = bits == 3 ? (codebook != nullptr) : (codebook == nullptr);
+        if (k % k_align != 0 || group_size < 16 || group_size % 16 != 0 || !codebook_ok) {
+            throw std::runtime_error(
+                "dequant_int4_grouped_to_int8: " + std::to_string(bits) + "-bit storage needs K % "
+                + std::to_string(k_align) + " == 0, group_size a multiple of 16 and "
+                + (bits == 3 ? "its 8-entry codebook" : "no codebook"));
+        }
     }
     if (n == 0 || k == 0) {
         return;  // a zero-block launch is hipErrorInvalidConfiguration

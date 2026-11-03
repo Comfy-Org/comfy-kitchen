@@ -3310,20 +3310,37 @@ bool cutlass_turing_int4_dequant(
         a.data(), b.data(), xs.data(), ws.data(), bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
 }
 
-// Code width implied by the packed row: K/2 bytes at 4 bits, 3K/4 at 6. The 6-bit layout is
-// uniform (no codebook), needs K % 32 so its rows and high plane stay 8-byte aligned, and
-// G a multiple of 16 because its decoder applies one scale per 16-col vector (the C++ twin
-// of the eager _check_six_bit_layout rule).
+// Code width implied by an MMA record stream's size: N*K*(512*bits/8+32)/512 bytes, i.e.
+// 7/16 (3-bit), 9/16 (4), 11/16 (5), 13/16 (6) of N*K. 0 when no width matches.
+static int64_t w4a8_mma_bits_from_size(int64_t size, int64_t N, int64_t K) {
+    for (int64_t bits = 3; bits <= 6; ++bits)
+        if (size == N * K * (2 * bits + 1) / 16) return bits;
+    return 0;
+}
+
+// Code width implied by the packed row: 3K/8 bytes at 3 bits, K/2 at 4, 5K/8 at 5, 3K/4 at 6.
+// Multi-plane rows need K % 32 (6) or K % 64 (3/5) so the row and its high plane stay
+// aligned, and G a multiple of 16 because their decoders apply one scale per 16-col vector
+// (the C++ twin of the eager _check_plane_layout rule). 5/6-bit are uniform (no codebook);
+// 3-bit needs its 8-entry table.
 static int64_t w4a8_bits_from_width(int64_t cols, int64_t K, int64_t G, bool has_codebook, const char* who) {
     const int64_t bits = (K > 0) ? (cols * 8) / K : 0;
-    if ((bits != 4 && bits != 6) || cols * 8 != K * bits)
-        throw std::runtime_error(std::string(who) + ": packed width must be K/2 (4-bit) or 3K/4 (6-bit)");
-    if (bits == 6 && (K % 32 != 0 || G < 16 || G % 16 != 0))
-        throw std::runtime_error(std::string(who) + ": 6-bit storage needs K % 32 == 0 and G a multiple of 16");
-    if (bits == 6 && has_codebook)
-        throw std::runtime_error(std::string(who) + ": 6-bit storage has no codebook");
+    if ((bits != 3 && bits != 4 && bits != 5 && bits != 6) || cols * 8 != K * bits)
+        throw std::runtime_error(std::string(who) + ": packed width must be 3K/8, K/2, 5K/8 or 3K/4 (3/4/5/6-bit)");
+    if (bits != 4) {
+        const int64_t k_align = bits == 6 ? 32 : 64;
+        if (K % k_align != 0 || G < 16 || G % 16 != 0)
+            throw std::runtime_error(std::string(who) + ": " + std::to_string(bits) + "-bit storage needs K % "
+                                     + std::to_string(k_align) + " == 0 and G a multiple of 16");
+    }
+    if ((bits == 5 || bits == 6) && has_codebook)
+        throw std::runtime_error(std::string(who) + ": " + std::to_string(bits) + "-bit storage has no codebook");
+    if (bits == 3 && !has_codebook)
+        throw std::runtime_error(std::string(who) + ": 3-bit storage needs its 8-entry codebook");
     return bits;
 }
+
+static int64_t w4a8_codebook_entries(int64_t bits) { return bits == 3 ? 8 : 16; }
 
 // Grouped int4/int6 -> int8 dequant (group scale folded; per-channel scale applied in GEMM).
 void dequant_int4_grouped_to_int8(
@@ -3343,8 +3360,8 @@ void dequant_int4_grouped_to_int8(
         throw std::runtime_error("dequant_int4_grouped: s_rel must have shape [N, K/G]");
     if (static_cast<int64_t>(out.shape(0)) != N)
         throw std::runtime_error("dequant_int4_grouped: out must be [N, K]");
-    if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != 16)
-        throw std::runtime_error("dequant_int4_grouped: codebook must be [16]");
+    if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != w4a8_codebook_entries(bits))
+        throw std::runtime_error("dequant_int4_grouped: codebook must be [16] (4-bit) or [8] (3-bit)");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const void* cb = codebook.has_value() ? codebook->data() : nullptr;
     launch_dequant_int4_grouped_to_int8(qw.data(), s_rel.data(), cb, out.data(), N, K, G, bits, stream);
@@ -3368,8 +3385,8 @@ void dequant_int4_grouped_to_int8_e4m3(
         throw std::runtime_error("dequant_int4_grouped: s_rel must have shape [N, K/G]");
     if (static_cast<int64_t>(out.shape(0)) != N)
         throw std::runtime_error("dequant_int4_grouped: out must be [N, K]");
-    if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != 16)
-        throw std::runtime_error("dequant_int4_grouped: codebook must be [16]");
+    if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != w4a8_codebook_entries(bits))
+        throw std::runtime_error("dequant_int4_grouped: codebook must be [16] (4-bit) or [8] (3-bit)");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const void* cb = codebook.has_value() ? codebook->data() : nullptr;
     launch_dequant_int4_grouped_to_int8_e4m3(qw.data(), s_rel.data(), cb, out.data(), N, K, G, bits, stream);
@@ -3423,8 +3440,9 @@ bool quantize_wxa8_convrot_fused(
     if (in_code < 0 || in_code > 2)
         throw std::runtime_error("quantize_wxa8_convrot_fused: weight must be fp32/fp16/bf16");
     if (N <= 0) throw std::runtime_error("quantize_wxa8_convrot_fused: N must be positive");
-    if (!((bits == 4 && group_size == 16) || (bits == 6 && (group_size == 16 || group_size == 32 || group_size == 64))))
-        throw std::runtime_error("quantize_wxa8_convrot_fused: bits/group_size must be 4/16 or 6/{16,32,64}");
+    const bool codebook_bits = bits == 4 || bits == 3, uniform_bits = bits == 6 || bits == 5;
+    if (!((codebook_bits && group_size == 16) || (uniform_bits && (group_size == 16 || group_size == 32 || group_size == 64))))
+        throw std::runtime_error("quantize_wxa8_convrot_fused: bits/group_size must be 4/16, 3/16, 6/{16,32,64} or 5/{16,32,64}");
     if (K % 256 != 0 || K % group_size != 0)
         throw std::runtime_error("quantize_wxa8_convrot_fused: K must be a multiple of 256 and of group_size");
     if (static_cast<int64_t>(packed.shape(0)) != N || static_cast<int64_t>(packed.shape(1)) != K * bits / 8)
@@ -3433,10 +3451,10 @@ bool quantize_wxa8_convrot_fused(
         throw std::runtime_error("quantize_wxa8_convrot_fused: s_rel must be [N, K/group_size]");
     if (static_cast<int64_t>(s_channel.shape(0)) != N)
         throw std::runtime_error("quantize_wxa8_convrot_fused: s_channel must be [N]");
-    if (bits == 4 && static_cast<int64_t>(codebook.size()) != 16)
-        throw std::runtime_error("quantize_wxa8_convrot_fused: codebook must be [16] at 4 bits");
+    if (codebook_bits && static_cast<int64_t>(codebook.size()) != w4a8_codebook_entries(bits))
+        throw std::runtime_error("quantize_wxa8_convrot_fused: codebook must be [16] at 4 bits, [8] at 3");
     return launch_quantize_wxa8_convrot_fused(
-        weight.data(), bits == 4 ? codebook.data() : nullptr, packed.data(), s_rel.data(), s_channel.data(),
+        weight.data(), codebook_bits ? codebook.data() : nullptr, packed.data(), s_rel.data(), s_channel.data(),
         N, K, static_cast<int>(bits), static_cast<int>(group_size), in_code, stochastic, seed,
         reinterpret_cast<cudaStream_t>(stream_ptr));
 }
@@ -3447,7 +3465,7 @@ void pack_w4a8_mma_inplace(
     nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> scratch,
     uintptr_t stream_ptr) {
     const int64_t N = scales.shape(0), K = scales.shape(1) * 16;
-    const int bits = data.size() == N * K * 9 / 16 ? 4 : (data.size() == N * K * 13 / 16 ? 6 : 0);
+    const int bits = static_cast<int>(w4a8_mma_bits_from_size(static_cast<int64_t>(data.size()), N, K));
     if (!bits || N <= 0 || N % 16 || K <= 0 || K % 256
             || data.stride(0) != 1 || scales.stride(1) != 1 || scales.stride(0) != K / 16
             || scratch.stride(0) != 1 || scratch.size() < static_cast<size_t>(2 * K * bits))
@@ -3489,9 +3507,11 @@ static int64_t validate_w4a8_codebook_gemm_contract(
         if (N <= 0 || N % 16 || K <= 0 || K % 256 || G != 16
                 || weight.ndim() != 1 || weight.stride(0) != 1 || s_rel.size() != 0)
             throw std::runtime_error("w4a8_codebook_gemm: invalid packed storage geometry");
-        bits = weight.size() == N * K * 9 / 16 ? 4 : (weight.size() == N * K * 13 / 16 ? 6 : 0);
+        bits = w4a8_mma_bits_from_size(static_cast<int64_t>(weight.size()), N, K);
         if (!bits)
             throw std::runtime_error("w4a8_codebook_gemm: invalid packed weight size");
+        if (bits == 3 && codebook_size < 0)
+            throw std::runtime_error("w4a8_codebook_gemm: 3-bit record streams need their 8-entry codebook");
     } else {
         if (weight.ndim() != 2 || weight.shape(0) != N || s_rel.ndim() != 2
                 || weight.stride(1) != 1 || weight.stride(0) != weight.shape(1)
@@ -3507,8 +3527,8 @@ static int64_t validate_w4a8_codebook_gemm_contract(
         throw std::runtime_error("w4a8_codebook_gemm: xs must have M values");
     if (s_channel_size != N)
         throw std::runtime_error("w4a8_codebook_gemm: s_channel must be [N]");
-    if (codebook_size >= 0 && codebook_size != 16)
-        throw std::runtime_error("w4a8_codebook_gemm: codebook must be [16]");
+    if (codebook_size >= 0 && codebook_size != w4a8_codebook_entries(bits))
+        throw std::runtime_error("w4a8_codebook_gemm: codebook must be [16] (4-bit) or [8] (3-bit)");
     // the strided int8 GEMM reads bias in the output dtype
     if (bias_size >= 0 && (bias_size != N || bias_dtype_code != out_dtype_code))
         throw std::runtime_error("w4a8_codebook_gemm: bias must be [N] in the output dtype");
@@ -3590,10 +3610,10 @@ bool w4a8_codebook_mma_linear(
             || xs.shape(0) != M || xs.shape(1) != 1
             || N % 16 != 0 || K % G != 0)
         throw std::runtime_error("w4a8_codebook_mma_linear shape mismatch or M > 8");
-    // record stream size implies the code width: 288-byte records at 4 bits, 416 at 6
-    const int64_t bits = weight.size() == N * K * 9 / 16 ? 4 : (weight.size() == N * K * 13 / 16 ? 6 : 0);
+    // record stream size implies the code width: 224-byte records at 3 bits, 288 at 4, 352 at 5, 416 at 6
+    const int64_t bits = w4a8_mma_bits_from_size(static_cast<int64_t>(weight.size()), N, K);
     if (bits == 0)
-        throw std::runtime_error("w4a8_codebook_mma_linear weight is not a 4- or 6-bit record stream");
+        throw std::runtime_error("w4a8_codebook_mma_linear weight is not a 3..6-bit record stream");
     if (act_code != comfy::kActNone && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm)
         throw std::runtime_error("w4a8_codebook_mma_linear act_code must be none, swiglu, or rms_norm");
     const bool has_act_weight = act_weight.has_value() && act_weight->size() > 0;
@@ -3610,10 +3630,10 @@ bool w4a8_codebook_mma_linear(
                     || partial_absmax->stride(1) != 1
                     || partial_absmax->stride(0) != K / convrot_group_size)))
         throw std::runtime_error("w4a8_codebook_mma_linear staged scratch mismatch");
-    if (bits == 4 && (!decode_lut.has_value()
-            || decode_lut->shape(0) != 256 || decode_lut->shape(1) != 16
-            || decode_lut->stride(1) != 1 || decode_lut->stride(0) != 16))
-        throw std::runtime_error("w4a8_codebook_mma_linear decode LUT must be contiguous [256, 16]");
+    if ((bits == 4 || bits == 3) && (!decode_lut.has_value()
+            || decode_lut->shape(0) != 256 || decode_lut->shape(1) != w4a8_codebook_entries(bits)
+            || decode_lut->stride(1) != 1 || decode_lut->stride(0) != w4a8_codebook_entries(bits)))
+        throw std::runtime_error("w4a8_codebook_mma_linear decode LUT must be contiguous [256, 16] (4-bit) or [256, 8] (3-bit)");
     if ((bias.has_value() && bias->size() != N)
             || workspace.shape(0) != M || workspace.shape(1) != N
             || counters.size() != N / 16 || counters.stride(0) != 1

@@ -6,8 +6,11 @@
 // decode GEMV keeps it in registers. Both must land on the same int8 grid, so
 // the rounding and the level table live here rather than in either kernel.
 //
-// Storage, bits = 4 or 6, implied by the packed row width K * bits / 8:
-//   bytes [0, K/2):     nibble plane, even column in the low nibble (both widths)
+// Storage, bits = 3, 4, 5 or 6, implied by the packed row width K * bits / 8 (5 bits: the
+// nibble plane then a K/8-byte 1-bit plane of the top bit, col c -> byte c/8, bit c%8;
+// 3 bits: a K/4-byte 2-bit plane of the low 2 bits then that 1-bit plane; 3-bit codes
+// index an 8-entry codebook, 5-bit levels are uniform code - 16):
+//   bytes [0, K/2):     nibble plane, even column in the low nibble (4/5/6 bits)
 //   bytes [K/2, 3K/4):  6-bit only, the top two bits: column c -> byte c/4, bit 2*(c%4)
 #pragma once
 
@@ -54,9 +57,20 @@ __forceinline__ __device__ uint4 dequant16_to_int8(
     uint2 packed, unsigned hi, const float* __restrict__ cb, float sc0, float sc1, float sc2,
     float sc3, int group_size) {
 
-    static_assert(BITS == 4 || BITS == 6, "W4A8 storage is 4 or 6 bits");
+    static_assert(BITS == 3 || BITS == 4 || BITS == 5 || BITS == 6, "W4A8 storage is 3, 4, 5 or 6 bits");
     const unsigned words[2] = {packed.x, packed.y};
     unsigned d[4] = {0u, 0u, 0u, 0u};
+    if constexpr (BITS == 3) {
+        // packed.x: the 2-bit plane (col i's low 2 bits at bit 2*i); hi: the 1-bit plane
+        // (col i's top bit at bit i); cb: the 8-entry table; one scale per vector.
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const unsigned c = ((packed.x >> (2 * i)) & 3u) | (((hi >> i) & 1u) << 2);
+            const unsigned q = static_cast<unsigned>(dequant_round(cb[c] * sc0)) & 0xFFu;
+            d[i >> 2] |= q << ((i & 3) * 8);
+        }
+        return make_uint4(d[0], d[1], d[2], d[3]);
+    }
 #pragma unroll
     for (int w = 0; w < 2; ++w) {
 #pragma unroll
@@ -69,6 +83,13 @@ __forceinline__ __device__ uint4 dequant16_to_int8(
                 const unsigned c1 = ((byte >> 4) & 0xFu) | (((hi >> (4 * pair + 2)) & 3u) << 4);
                 v0 = static_cast<float>(c0) - 32.0f;
                 v1 = static_cast<float>(c1) - 32.0f;
+                s = sc0;
+            } else if constexpr (BITS == 5) {
+                // hi: the 1-bit plane for these 16 columns, column i's top bit at bit i
+                const unsigned c0 = (byte & 0xFu) | (((hi >> (2 * pair)) & 1u) << 4);
+                const unsigned c1 = ((byte >> 4) & 0xFu) | (((hi >> (2 * pair + 1)) & 1u) << 4);
+                v0 = static_cast<float>(c0) - 16.0f;
+                v1 = static_cast<float>(c1) - 16.0f;
                 s = sc0;
             } else {
                 const int local = (group_size >= 16) ? 0 : ((pair * 2) / group_size);
