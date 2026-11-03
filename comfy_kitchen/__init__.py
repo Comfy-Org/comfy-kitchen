@@ -451,8 +451,8 @@ def input_act(
 
     The same activations the quantized linears accept as ``input_act``, for a
     caller whose linear is not quantized: "gelu_tanh", "swiglu" and "situ" (the
-    gated pairs halve the last dim), or "rms_norm" with ``act_weight`` and
-    ``act_eps``. ``None`` / "none" returns ``x`` unchanged.
+    gated pairs halve the last dim and need an even one), or "rms_norm" with
+    ``act_weight`` and ``act_eps``. ``None`` / "none" returns ``x`` unchanged.
 
     Args:
         x: Input tensor (..., K).
@@ -465,6 +465,8 @@ def input_act(
     """
     if input_act in (None, "none"):
         return x
+    if input_act in ("swiglu", "situ") and x.shape[-1] % 2:
+        raise ValueError(f"input_act {input_act!r} needs an even last dim, got {x.shape[-1]}")
     # The custom op has no autograd formula; keep gradient-tracked calls on the
     # differentiable eager implementation instead of detaching them.
     if torch.is_grad_enabled() and (x.requires_grad or (act_weight is not None and act_weight.requires_grad)):

@@ -27,6 +27,10 @@ def _op_input_act(
     act_weight: torch.Tensor | None,
     act_eps: float,
 ) -> torch.Tensor:
+    if input_act == "none":
+        # The op is registered as functional (mutates_args=()), so it must not
+        # return an alias of an input; the eager path returns x for this mode.
+        return x.clone()
     kwargs = {"x": x, "input_act": input_act, "act_weight": act_weight, "act_eps": act_eps}
     impl = registry.get_implementation("input_act", kwargs=kwargs)
     return impl(**kwargs)
@@ -34,6 +38,8 @@ def _op_input_act(
 
 @_op_input_act.register_fake
 def _op_input_act_fake(x, input_act, act_weight, act_eps):
+    if input_act == "none":
+        return x.clone()
     # Run the eager chain on the fake tensor so the metadata (shape and strides)
     # matches what the real kernel returns; `new_empty` would claim contiguous
     # strides for an activation that preserves a transposed input's layout.
