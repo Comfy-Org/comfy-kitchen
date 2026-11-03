@@ -13,9 +13,9 @@ from comfy_kitchen.backends import cuda as cuda_backend
 from comfy_kitchen.backends.eager import w4a8_int8 as eager_w4a8
 from comfy_kitchen.tensor import AsymW4A8Int8Layout, QuantizedTensor
 from comfy_kitchen.tensor.w4a8_packed import unpack_w4a8_mma_weight
-from tests.conftest import requires_cuda_backend
+from tests.conftest import requires_int8, requires_cuda_backend
 
-pytestmark = requires_cuda_backend
+pytestmark = [requires_cuda_backend, requires_int8]
 
 
 def _packed_weight(n, k, seed=0, bits=4):

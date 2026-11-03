@@ -29,6 +29,7 @@ from comfy_kitchen._rope_utils import (
     trim_rope_freqs,
 )
 from comfy_kitchen.allocation import allocation_context
+from comfy_kitchen.constraints import INT8_MAX_COMPUTE_CAPABILITY
 
 __all__ = [
     "na3d",
@@ -3042,12 +3043,11 @@ def _sink_pair(value):
 
 def _check_sol_args(device, sink_blocks, sink_q, topk_ratio, **tensors):
     """Shared by both CUDA entries (callers may bypass the registry): the
-    registry rule plus a per-device sm_80 check -- the registry gate caches the
-    CURRENT device's capability, and sub-sm_80 cubins return garbage."""
+    registry rule plus a per-device SM80-SM102 check for its INT8 MMA path."""
     cap = torch.cuda.get_device_capability(device)
-    if cap < (8, 0):
+    if not (8, 0) <= cap <= INT8_MAX_COMPUTE_CAPABILITY:
         raise RuntimeError(
-            f"sol_attn: requires sm_80+ (cp.async, INT8 MMA); {device} is "
+            f"sol_attn: requires sm_80 through sm_102 (INT8 is disabled on SM103+); {device} is "
             f"sm_{cap[0]}{cap[1]}")
     check = sol_attn_common_call_rule(
         {"sink_blocks": sink_blocks, "sink_q": sink_q, "topk_ratio": topk_ratio, **tensors})

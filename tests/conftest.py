@@ -62,6 +62,13 @@ requires_cuda_backend = pytest.mark.skipif(
 )
 
 
+requires_int8 = pytest.mark.skipif(
+    torch.cuda.is_available() and not getattr(torch.version, "hip", None)
+    and torch.cuda.get_device_capability() >= (10, 3),
+    reason="INT8 execution is disabled on NVIDIA SM103+",
+)
+
+
 def skip_unless_gfx12_wmma() -> None:
     if not getattr(torch.version, "hip", None):
         pytest.skip("requires HIP")
@@ -141,6 +148,11 @@ def get_capable_backends(func_name: str, device: str | None = None) -> list[str]
         if device is not None:
             constraints = ck.registry.get_constraints(backend_name, func_name)
             if constraints is not None and device not in constraints.default_devices:
+                continue
+            if (device == "cuda" and constraints is not None
+                    and constraints.max_compute_capability is not None
+                    and torch.cuda.is_available() and not getattr(torch.version, "hip", None)
+                    and torch.cuda.get_device_capability() > constraints.max_compute_capability):
                 continue
 
         capable.append(backend_name)

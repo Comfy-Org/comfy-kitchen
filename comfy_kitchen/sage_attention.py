@@ -12,6 +12,7 @@ from torch.nn import functional
 
 from .backends import cuda as _cuda_backend
 from .backends.eager.quantization import DTYPE_TO_CODE
+from .constraints import INT8_MAX_COMPUTE_CAPABILITY
 
 if getattr(torch.version, "hip", None):
     from .backends import hip as _hip_backend
@@ -145,7 +146,7 @@ def is_available(device: torch.device | None = None) -> bool:
         # loaded. Ask the HIP backend instead.
         return _hip_backend.int8_attention_is_available()
     capability = torch.cuda.get_device_capability(device)
-    return capability >= _NATIVE_MINIMUM_CAPABILITY and _cuda_backend._EXT_AVAILABLE
+    return _NATIVE_MINIMUM_CAPABILITY <= capability <= INT8_MAX_COMPUTE_CAPABILITY and _cuda_backend._EXT_AVAILABLE
 
 
 def _validate_inputs(
@@ -166,7 +167,7 @@ def _validate_inputs(
         raise ValueError("q, k, and v must be on the same CUDA device")
     if not is_available(q.device):
         raise RuntimeError(
-            "INT8 attention requires the comfy-kitchen CUDA extension on SM75 or newer, "
+            "INT8 attention requires the comfy-kitchen CUDA extension on SM75-SM102 (INT8 is disabled on SM103+), "
             "or the HIP extension on an AMD device with matrix cores (RDNA3 or newer)"
         )
 
@@ -482,7 +483,7 @@ def int8_attention_from_prequantized(
         raise ValueError("attn_mask must be on the same CUDA device as the packed tensors")
     if not is_available(quantized.q.device):
         raise RuntimeError(
-            "INT8 attention requires the comfy-kitchen CUDA extension on SM75 or newer, "
+            "INT8 attention requires the comfy-kitchen CUDA extension on SM75-SM102 (INT8 is disabled on SM103+), "
             "or the HIP extension on an AMD device with matrix cores (RDNA3 or newer)"
         )
 

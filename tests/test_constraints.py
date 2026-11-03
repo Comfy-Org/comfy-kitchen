@@ -415,3 +415,98 @@ class TestINT8Constraints:
         )
         assert result.success is False
         assert "torch.int8" in str(result.failure_reason)
+
+
+@pytest.mark.parametrize(
+    "capability, allowed",
+    [((8, 9), True), ((9, 0), True), ((10, 0), True), ((10, 1), True),
+     ((10, 2), True), ((10, 3), False), ((11, 0), False), ((12, 0), False)],
+)
+def test_int8_sm_guard_blocks_fallbacks_and_direct_calls(monkeypatch, capability, allowed):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from comfy_kitchen.registry import BackendRegistry
+
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+    # Never consult a process-global current device: the input selects cuda:1.
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: pytest.fail("current device queried"))
+    x = Mock(spec=torch.Tensor, device=torch.device("cuda:1"))
+    registry = BackendRegistry()
+    modules = []
+    for name in ("cuda", "triton", "eager"):
+        module = SimpleNamespace(quantize_int8_rowwise=Mock(return_value="called"),
+                                 quantize_int8_convrot_staged=Mock(return_value="called"))
+        registry.register(name, module, {"quantize_int8_rowwise": FunctionConstraints()})
+        modules.append(module)
+    if allowed:
+        assert registry.get_implementation("quantize_int8_rowwise", kwargs={"x": x})(x) == "called"
+    else:
+        with pytest.raises(NoCapableBackendError, match=r"maximum supported 10\.2"):
+            registry.get_implementation("quantize_int8_rowwise", kwargs={"x": x})
+        for name, module in zip(("cuda", "triton", "eager"), modules, strict=True):
+            with registry.use_backend(name), pytest.raises(NoCapableBackendError):
+                registry.get_implementation("quantize_int8_rowwise", kwargs={"x": x})
+            impl = registry.get_implementation("quantize_int8_rowwise", backend=name)
+            with pytest.raises(RuntimeError, match=r"maximum supported 10\.2"):
+                impl(x)
+            assert module.quantize_int8_rowwise.__wrapped__.call_count == 0
+            with pytest.raises(RuntimeError, match=r"maximum supported 10\.2"):
+                module.quantize_int8_convrot_staged(x)
+
+
+def test_sm_guard_is_per_device_and_preserves_other_formats(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from comfy_kitchen.registry import BackendRegistry
+
+    monkeypatch.setattr(torch.version, "hip", None)
+    caps = {0: (10, 3), 1: (9, 0)}
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: caps[device.index])
+    tensors = [Mock(spec=torch.Tensor, device=torch.device(f"cuda:{i}")) for i in (0, 1)]
+    registry = BackendRegistry()
+    names = ("int8_linear", "w4a8_packed_linear", "quantize_nvfp4", "quantize_mxfp8",
+             "scaled_mm_svdquant_w4a4", "rotate_int8_convrot_weight")
+    module = SimpleNamespace(**{name: Mock(return_value=True) for name in names})
+    registry.register("eager", module, {name: FunctionConstraints() for name in names})
+    for name in names[:2]:
+        assert registry.validate_backend_for_call("eager", name, {"x": tensors[1]}).success
+        assert not registry.validate_backend_for_call("eager", name, {"x": tensors[0]}).success
+        assert not registry.validate_backend_for_call("eager", name, {"x": tensors[1], "weight": tensors[0]}).success
+    for name in names[2:]:
+        assert registry.validate_backend_for_call("eager", name, {"x": tensors[0]}).success
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: pytest.fail("CUDA probe"))
+    assert module.int8_linear(torch.ones(1))  # CPU stays supported.
+    monkeypatch.setattr(torch.version, "hip", "6.4")
+    assert module.int8_linear(tensors[0])  # ROCm's CUDA-shaped API is not an NVIDIA SM.
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
+    registry.register("triton", module, {"int8_linear": FunctionConstraints(min_compute_capability=(8, 0))})
+    assert registry.validate_backend_for_call("triton", "int8_linear", {"x": tensors[0]}).success
+
+
+def test_standalone_int8_matmul_and_attention_are_guarded(monkeypatch):
+    from unittest.mock import Mock
+
+    import comfy_kitchen.sage_attention as sage
+
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
+    monkeypatch.setattr(sage, "_hip_backend", None)
+    monkeypatch.setattr(sage._cuda_backend, "_EXT_AVAILABLE", True)
+    assert not ck.int8_attention_is_available(torch.device("cuda:0"))
+    x = Mock(spec=torch.Tensor, device=torch.device("cuda:0"))
+    with pytest.raises(RuntimeError, match=r"maximum supported 10\.2"):
+        ck.mm_int8(x, x)
+
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(sage._cuda_backend, "_C", SimpleNamespace(sol_attn=Mock()), raising=False)
+    monkeypatch.setattr(ck.registry, "is_available", lambda name: name == "cuda")
+    monkeypatch.setattr(ck.registry, "get_constraints", lambda *args: FunctionConstraints(
+        min_compute_capability=(8, 0), max_compute_capability=(10, 2)))
+    assert not ck.sol_attn_is_available(torch.device("cuda:0"))
+    with pytest.raises(RuntimeError, match="SM103"):
+        sage._cuda_backend._check_sol_args(torch.device("cuda:0"), None, None, 0.0)
