@@ -2482,10 +2482,11 @@ def group_norm_silu_pad3d(
     silu: bool,
     zero_pad: bool = False,
     out: torch.Tensor | None = None,
+    stats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-frame GroupNorm + SiLU + causal conv padding in one pass; the result is
-    channels_last_3d, like the CUDA kernel. Shapes it declines run the eager op. ``out`` is
-    written in place where the kernel can index it, else copied into."""
+    channels_last_3d, like the CUDA kernel. Shapes it declines, and given ``stats``, run the
+    eager op. ``out`` is written in place where the kernel can index it, else copied into."""
     b, c, t, h, w = x.shape
     left, right, top, bottom, front = pad
     if min(pad) < 0:
@@ -2501,7 +2502,7 @@ def group_norm_silu_pad3d(
     else:
         bias = None  # pad-only ignores bias, as eager and CUDA do
     # an empty frame still has a zero border to write, which the launcher skips
-    served = not (c % 8 or 256 % (c // 8) or h == 0 or w == 0
+    served = not (stats is not None or c % 8 or 256 % (c // 8) or h == 0 or w == 0
                   or (weight is not None and (c % num_groups or num_groups > 1024))
                   or (not zero_pad and (max(left, right) >= w or max(top, bottom) >= h))
                   or b * (t + front) > 65535)
@@ -2510,7 +2511,7 @@ def group_norm_silu_pad3d(
         # the kernel loads whole 16-byte registers; a misaligned view takes eager, as on CUDA
         served = x.data_ptr() % 16 == 0
     if not served:
-        res = _eager.group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad)
+        res = _eager.group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, stats)
         if out is None:
             return res
         out.copy_(res)
@@ -2549,9 +2550,9 @@ def _writes_packed_ndhwc(out: torch.Tensor) -> bool:
     return b == 1 and st[1] == 1 and st[4] == c and st[3] == w * c and st[2] == h * w * c
 
 
-def group_norm_silu_pad3d_out(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out) -> None:
+def group_norm_silu_pad3d_out(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out, stats=None) -> None:
     """group_norm_silu_pad3d into ``out``; a frame-offset view leaves room for a caller's halo."""
-    group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out=out)
+    group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, out=out, stats=stats)
 
 
 def _effective_strides(t: torch.Tensor) -> tuple[int, ...]:
