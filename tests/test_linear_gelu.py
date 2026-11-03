@@ -50,6 +50,15 @@ def _kwargs(x, weight, bias, approximate="tanh"):
     return {"x": x, "weight": weight, "bias": bias, "approximate": approximate}
 
 
+def _skip_unless_served(backend, kwargs):
+    # get_capable_backends does not check constraints such as
+    # min_compute_capability, so ask the registry the same question dispatch does.
+    valid = ck.registry.validate_backend_for_call(backend, "linear_gelu", kwargs)
+    if not valid.success:
+        why = f"{valid.failed_param}: {valid.failure_reason}"
+        pytest.skip(f"{backend} refuses this call here: {why}")
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -71,9 +80,7 @@ class TestLinearGelu:
         lead, k, n = shape
         x, weight, bias = _inputs(lead, k, n, dtype, device, bias=has_bias)
         if backend != "eager":
-            assert ck.registry.validate_backend_for_call(
-                backend, "linear_gelu", _kwargs(x, weight, bias)
-            ).success
+            _skip_unless_served(backend, _kwargs(x, weight, bias))
 
         with ck.use_backend(backend):
             out = ck.linear_gelu(x, weight, bias)
@@ -98,6 +105,7 @@ class TestLinearGelu:
             pytest.skip("eager backend not capable (reference unavailable)")
 
         x, weight, bias = _inputs((2, 384), 1536, 1024, dtype, device)
+        _skip_unless_served(backend, _kwargs(x, weight, bias))
         with ck.use_backend("eager"):
             ref = ck.linear_gelu(x, weight, bias)
         with ck.use_backend(backend):
@@ -139,9 +147,7 @@ class TestLinearGelu:
 
         dtype = torch.float16
         x, weight, bias = _inputs((300,), 256, n, dtype, device)
-        assert ck.registry.validate_backend_for_call(
-            "triton", "linear_gelu", _kwargs(x, weight, bias)
-        ).success
+        _skip_unless_served("triton", _kwargs(x, weight, bias))
         with ck.use_backend("eager"):
             eager = ck.linear_gelu(x, weight, bias)
 
