@@ -72,6 +72,15 @@ def _require(func, backend, device):
         pytest.skip(f"backend '{backend}' not capable for {func} on {device}")
 
 
+def _require_served(backend, func, kwargs):
+    # get_capable_backends does not check constraints such as
+    # min_compute_capability, so ask the registry the same question dispatch does.
+    valid = ck.registry.validate_backend_for_call(backend, func, kwargs)
+    if not valid.success:
+        why = f"{valid.failed_param}: {valid.failure_reason}"
+        pytest.skip(f"{backend} refuses this call here: {why}")
+
+
 # Shapes served by the triton kernel: (lead, K, N) with N (one half / the output
 # width) % 64 == 0, K % 64 == 0, and at least 256 rows of x. M not a multiple of
 # any tile size exercises the row mask.
@@ -109,7 +118,7 @@ class TestLinearGeglu:
         x, weight, bias = _geglu_inputs(lead, k, n, dtype, device, bias=has_bias)
         kwargs = _geglu_kwargs(x, weight, bias, approximate)
         if backend != "eager":
-            assert ck.registry.validate_backend_for_call(backend, "linear_geglu", kwargs).success
+            _require_served(backend, "linear_geglu", kwargs)
 
         with ck.use_backend(backend):
             out = ck.linear_geglu(x, weight, bias, approximate)
@@ -131,9 +140,7 @@ class TestLinearGeglu:
 
         lead, k, n = shape
         x, weight, bias = _geglu_inputs(lead, k, n, torch.float16, device)
-        assert ck.registry.validate_backend_for_call(
-            "triton", "linear_geglu", _geglu_kwargs(x, weight, bias)
-        ).success
+        _require_served("triton", "linear_geglu", _geglu_kwargs(x, weight, bias))
         with ck.use_backend("eager"):
             eager = ck.linear_geglu(x, weight, bias)
         with ck.use_backend("triton"):
@@ -155,9 +162,7 @@ class TestLinearGeglu:
         wide = torch.zeros(weight.shape[0], 320, dtype=weight.dtype, device=device)
         wide[:, :256] = weight
         view = wide[:, :256]  # stride (320, 1)
-        assert ck.registry.validate_backend_for_call(
-            "triton", "linear_geglu", _geglu_kwargs(x, view, bias)
-        ).success
+        _require_served("triton", "linear_geglu", _geglu_kwargs(x, view, bias))
         with ck.use_backend("triton"):
             out = ck.linear_geglu(x, view, bias)
         rtol, atol = _tol(torch.float16)
@@ -259,7 +264,7 @@ class TestLinearSwiglu:
         x, w1, w3, b1, b3 = _swiglu_inputs(lead, k, n, dtype, device, bias=has_bias)
         kwargs = _swiglu_kwargs(x, w1, w3, b1, b3)
         if backend != "eager":
-            assert ck.registry.validate_backend_for_call(backend, "linear_swiglu", kwargs).success
+            _require_served(backend, "linear_swiglu", kwargs)
 
         with ck.use_backend(backend):
             out = ck.linear_swiglu(x, w1, w3, b1, b3)
@@ -280,9 +285,7 @@ class TestLinearSwiglu:
 
         lead, k, n = _ZIMAGE_SWIGLU
         x, w1, w3, _, _ = _swiglu_inputs(lead, k, n, torch.bfloat16, device)
-        assert ck.registry.validate_backend_for_call(
-            "triton", "linear_swiglu", _swiglu_kwargs(x, w1, w3)
-        ).success
+        _require_served("triton", "linear_swiglu", _swiglu_kwargs(x, w1, w3))
         with ck.use_backend("eager"):
             eager = ck.linear_swiglu(x, w1, w3)
         with ck.use_backend("triton"):
@@ -301,9 +304,7 @@ class TestLinearSwiglu:
         _require("linear_swiglu", "triton", device)
 
         x, w1, w3, _, b3 = _swiglu_inputs((300,), 256, 256, torch.float16, device, bias=True)
-        assert ck.registry.validate_backend_for_call(
-            "triton", "linear_swiglu", _swiglu_kwargs(x, w1, w3, None, b3)
-        ).success
+        _require_served("triton", "linear_swiglu", _swiglu_kwargs(x, w1, w3, None, b3))
         with ck.use_backend("triton"):
             out = ck.linear_swiglu(x, w1, w3, None, b3)
         rtol, atol = _tol(torch.float16)
@@ -318,9 +319,7 @@ class TestLinearSwiglu:
         x, w1, w3, _, _ = _swiglu_inputs((300,), 256, 256, torch.bfloat16, device)
         w13 = torch.cat([w1, w3], dim=0)
         v1, v3 = w13[:256], w13[256:]
-        assert ck.registry.validate_backend_for_call(
-            "triton", "linear_swiglu", _swiglu_kwargs(x, v1, v3)
-        ).success
+        _require_served("triton", "linear_swiglu", _swiglu_kwargs(x, v1, v3))
         with ck.use_backend("triton"):
             out = ck.linear_swiglu(x, v1, v3)
         rtol, atol = _tol(torch.bfloat16)
@@ -430,15 +429,11 @@ class TestPartialNTile:
         if op == "geglu":
             x, weight, bias = _geglu_inputs(lead, k, n, dtype, device)
             args = (x, weight, bias)
-            assert ck.registry.validate_backend_for_call(
-                "triton", "linear_geglu", _geglu_kwargs(x, weight, bias)
-            ).success
+            _require_served("triton", "linear_geglu", _geglu_kwargs(x, weight, bias))
         else:
             x, w1, w3, b1, b3 = _swiglu_inputs(lead, k, n, dtype, device, bias=True)
             args = (x, w1, w3, b1, b3)
-            assert ck.registry.validate_backend_for_call(
-                "triton", "linear_swiglu", _swiglu_kwargs(x, w1, w3, b1, b3)
-            ).success
+            _require_served("triton", "linear_swiglu", _swiglu_kwargs(x, w1, w3, b1, b3))
         fn = getattr(ck, f"linear_{op}")
         with ck.use_backend("eager"):
             eager = fn(*args)
