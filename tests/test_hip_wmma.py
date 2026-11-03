@@ -2141,7 +2141,7 @@ def test_w6a8_linear_matches_int8_linear_on_the_decoded_weight(hip, monkeypatch,
 
 @pytest.mark.parametrize(
     ("cols", "group_size", "codebook", "match"),
-    [(3 * 512 // 8, 16, False, "packed width"),
+    [(7 * 512 // 8, 16, False, "packed width"),   # 7-bit: no such storage (3K/8 is 3-bit)
      (3 * 512 // 4, 8, False, "6-bit storage needs"),
      (3 * 512 // 4, 16, True, "no codebook")],
     ids=["width", "group", "codebook"],
