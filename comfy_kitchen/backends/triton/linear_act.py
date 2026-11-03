@@ -37,69 +37,22 @@ K_MULTIPLE = 64
 # routing to; dispatch keeps those on eager (cuBLAS / hipBLASLt + GELU).
 MIN_M = 256
 
-# Each config is tagged with the GPU archs it measured fastest, or within about
-# 1% of the fastest, on at the Wan2.1 shape below. On a tagged arch the
-# autotuner only times that arch's configs (_prune_to_arch); on any other arch
-# it times the whole list.
-_SM120 = "sm_120"  # NVIDIA RTX 5090
-_GFX1151 = "gfx1151"  # AMD Radeon 8060S
-_GFX1201 = "gfx1201"  # AMD Radeon AI PRO R9700
-
-_TAGGED = [
+_CONFIGS = [
     # Tuned on NVIDIA RTX 5090 (sm_120, ~99 KB shared memory per block) for the
-    # Wan2.1-1.3B FFN up projection (M 28080, K 1536, N 8960, fp16). Fastest
-    # there; also fastest of the list on AMD Radeon 8060S (gfx1151).
-    (triton.Config({"block_m": 128, "block_n": 128, "block_k": 64, "group_size_m": 8}, num_warps=4, num_stages=2),
-     (_SM120, _GFX1151)),
+    # Wan2.1-1.3B FFN up projection (M 28080, K 1536, N 8960, fp16); also the
+    # fastest of the list on AMD Radeon 8060S (gfx1151).
+    triton.Config({"block_m": 128, "block_n": 128, "block_k": 64, "group_size_m": 8}, num_warps=4, num_stages=2),
     # Smaller-footprint configs so the kernel also runs where shared memory / LDS
     # is tighter (e.g. 64 KB on AMD GPUs). Not tuned on any particular GPU.
-    # Within 1% of the fastest on the RTX 5090.
-    (triton.Config({"block_m": 128, "block_n": 128, "block_k": 32, "group_size_m": 8}, num_warps=4, num_stages=2),
-     (_SM120,)),
-    # Within 1% of the fastest on the Radeon 8060S.
-    (triton.Config({"block_m": 64, "block_n": 128, "block_k": 64, "group_size_m": 8}, num_warps=4, num_stages=2),
-     (_GFX1151,)),
-    (triton.Config({"block_m": 128, "block_n": 64, "block_k": 32, "group_size_m": 8}, num_warps=4, num_stages=2),
-     ()),
-    (triton.Config({"block_m": 128, "block_n": 128, "block_k": 32, "group_size_m": 8}, num_warps=8, num_stages=2),
-     ()),
+    triton.Config({"block_m": 128, "block_n": 128, "block_k": 32, "group_size_m": 8}, num_warps=4, num_stages=2),
+    triton.Config({"block_m": 64, "block_n": 128, "block_k": 64, "group_size_m": 8}, num_warps=4, num_stages=2),
+    triton.Config({"block_m": 128, "block_n": 64, "block_k": 32, "group_size_m": 8}, num_warps=4, num_stages=2),
+    triton.Config({"block_m": 128, "block_n": 128, "block_k": 32, "group_size_m": 8}, num_warps=8, num_stages=2),
     # Tuned on AMD Radeon AI PRO R9700 (gfx1201, 64 KB LDS) for the Wan2.1 shape
-    # above; fastest there. BN 256 does not divide every served N (N % 128 ==
-    # 0); partial N tiles are masked.
-    (triton.Config({"block_m": 128, "block_n": 256, "block_k": 32, "group_size_m": 8}, num_warps=8, num_stages=1),
-     (_GFX1201,)),
+    # above; fastest there. BN 256 does not divide every served N (N % 128 == 0);
+    # partial N tiles are masked.
+    triton.Config({"block_m": 128, "block_n": 256, "block_k": 32, "group_size_m": 8}, num_warps=8, num_stages=1),
 ]
-
-_CONFIGS = [c for c, _ in _TAGGED]
-
-
-def _arch_name(target) -> str | None:
-    """'sm_<major><minor>' (NVIDIA) or 'gfxNNNN' (AMD, feature suffixes such as
-    ':sramecc+' dropped) of a Triton GPUTarget; None for other backends."""
-    if target.backend == "cuda":
-        return f"sm_{target.arch}"
-    if target.backend == "hip":
-        return str(target.arch).split(":")[0]
-    return None
-
-
-def _current_arch() -> str | None:
-    try:
-        return _arch_name(triton.runtime.driver.active.get_current_target())
-    except Exception:  # Triton without get_current_target, or no active GPU driver
-        return None
-
-
-def _configs_for_arch(configs, tagged, arch):
-    """The configs tagged with arch, in list order; all configs if none is."""
-    allowed = [c for c, archs in tagged if arch in archs]
-    return [c for c in configs if c in allowed] or configs
-
-
-def _prune_to_arch(configs, named_args, **kwargs):
-    # early_config_prune runs when the autotuner meets a new key, so the arch is
-    # that of the device the call runs on.
-    return _configs_for_arch(configs, _TAGGED, _current_arch())
 
 
 def _bench_warm(kernel_call, quantiles, warmup=250, rep=100):
@@ -165,10 +118,7 @@ def _gelu_tanh(x):
     return x / (1.0 + tl.math.exp2(-2.8853900817779268 * u))
 
 
-@triton.autotune(
-    configs=_CONFIGS, key=["m", "n", "k"], prune_configs_by={"early_config_prune": _prune_to_arch},
-    **_AUTOTUNE_TIMER,
-)
+@triton.autotune(configs=_CONFIGS, key=["m", "n", "k"], **_AUTOTUNE_TIMER)
 # even_n follows the BN of whichever config the autotuner runs; when BN divides
 # N the kernel compiles without the N wrap and mask.
 @triton.heuristics({"even_n": lambda args: args["n"] % args["block_n"] == 0})

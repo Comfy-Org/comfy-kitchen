@@ -259,7 +259,7 @@ class TestLinearGelu:
 
 
 # ---------------------------------------------------------------------------
-# Autotune: per-arch config list and the autotune timer
+# Autotune timer
 # ---------------------------------------------------------------------------
 
 
@@ -268,89 +268,6 @@ def _linear_act():
     from comfy_kitchen.backends.triton import linear_act
 
     return linear_act
-
-
-def _cfg(c):
-    k = c.kwargs
-    return (k["block_m"], k["block_n"], k["block_k"], k["group_size_m"], c.num_warps, c.num_stages)
-
-
-_BK64 = (128, 128, 64, 8, 4, 2)
-_BK32 = (128, 128, 32, 8, 4, 2)
-_BM64 = (64, 128, 64, 8, 4, 2)
-_BN64 = (128, 64, 32, 8, 4, 2)
-_BK32_W8 = (128, 128, 32, 8, 8, 2)
-_BN256 = (128, 256, 32, 8, 8, 1)
-_ALL = [_BK64, _BK32, _BM64, _BN64, _BK32_W8, _BN256]
-
-# arch -> configs timed. Untagged archs get the full list.
-_ARCH_LISTS = {
-    "sm_120": [_BK64, _BK32],
-    "gfx1151": [_BK64, _BM64],
-    "gfx1201": [_BN256],
-    "sm_90": _ALL,
-    "sm_89": _ALL,
-    "gfx942": _ALL,
-    "gfx1200": _ALL,
-    None: _ALL,
-}
-
-
-class TestAutotuneArch:
-    def test_full_list(self):
-        la = _linear_act()
-        assert [_cfg(c) for c in la._CONFIGS] == _ALL
-
-    @pytest.mark.parametrize("arch", list(_ARCH_LISTS))
-    def test_configs_for_arch(self, arch):
-        la = _linear_act()
-        got = la._configs_for_arch(la._CONFIGS, la._TAGGED, arch)
-        assert [_cfg(c) for c in got] == _ARCH_LISTS[arch]
-
-    def test_configs_not_in_tagged_list_are_kept(self):
-        """A config list the tags do not cover (a test forcing its own config)
-        is returned unchanged."""
-        la = _linear_act()
-        import triton
-
-        own = [triton.Config({"block_m": 64, "block_n": 64, "block_k": 32, "group_size_m": 8},
-                             num_warps=4, num_stages=1)]
-        for arch in ("sm_120", "gfx1151", "gfx1201", None):
-            assert la._configs_for_arch(own, la._TAGGED, arch) == own
-
-    @pytest.mark.parametrize(
-        ("backend", "arch", "name"),
-        [("cuda", 120, "sm_120"), ("cuda", 89, "sm_89"), ("hip", "gfx1151", "gfx1151"),
-         ("hip", "gfx942:sramecc+:xnack-", "gfx942"), ("hip", "gfx1201", "gfx1201"),
-         ("xpu", "pvc", None)],
-    )
-    def test_arch_name(self, backend, arch, name):
-        from collections import namedtuple
-
-        la = _linear_act()
-        target = namedtuple("GPUTarget", ["backend", "arch", "warp_size"])(backend, arch, 32)
-        assert la._arch_name(target) == name
-
-    @pytest.mark.parametrize("arch", ["sm_120", "gfx1151", "gfx1201", "sm_90", None])
-    def test_autotuner_prunes_by_current_arch(self, arch, monkeypatch):
-        """The autotuner prunes with the arch read when it tunes a new key."""
-        la = _linear_act()
-        monkeypatch.setattr(la, "_current_arch", lambda: arch)
-        tuner = la._linear_gelu_tanh_kernel
-        got = tuner.early_config_prune(tuner.configs, {})
-        assert [_cfg(c) for c in got] == _ARCH_LISTS[arch]
-
-    def test_current_arch_matches_device(self, cuda_available):
-        if not cuda_available:
-            pytest.skip("needs a GPU")
-        la = _linear_act()
-        arch = la._current_arch()
-        if getattr(torch.version, "hip", None):
-            name = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-            assert arch == name
-        else:
-            major, minor = torch.cuda.get_device_capability(0)
-            assert arch == f"sm_{major}{minor}"
 
 
 class TestAutotuneTimer:
