@@ -68,6 +68,7 @@ CASES = [
     ((1, 2, 5, 33, 4, 16), 3, 1, [(3, 3), (5, 5), (3, 7)], 2, False),  # hd 16, MQA
     ((1, 2, 6, 70, 2, 128), 4, 2, [(5, 40)], 3, True),        # hd 128 with four warps along W (wide window)
     ((1, 1, 9, 20, 8, 128), 3, 2, [(5, 7), (5, 7), (3, 5)], None, False),  # hd 128 on the grouped-head patch kernel
+    ((1, 2, 6, 10, 2, 32), 10, 2, [(3, 5)] * 10, 2, True),     # more than 8 planes, all with the same window
 ]
 
 
@@ -105,6 +106,17 @@ def test_window_attention_backends(shape, tk, kv_heads, windows, temporal_window
         assert_values_close(out.float(), ref.float(), rtol, atol, name=f"window_attention[{backend}]")
 
 
+@pytest.mark.parametrize("scale", [0.5, 0.05])
+def test_window_attention_scale(scale):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    q, k, v = _inputs((1, 2, 6, 10, 4, 64), 3, 2, torch.bfloat16, device, seed=2)
+    ref = _ref_window_attention(q, k, v, [(5, 5)], 2, True, scale)
+    for backend in get_capable_backends("window_attention", device):
+        with ck.use_backend(backend):
+            out = ck.window_attention(q, k, v, (5, 5), temporal_window=2, scale=scale)
+        assert_values_close(out.float(), ref.float(), 2e-2, 2e-2, name=f"window_attention-scale[{backend}]")
+
+
 def test_window_attention_matches_na3d():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     q, k, v = _inputs((1, 6, 9, 20, 2, 64), 6, 2, torch.bfloat16, device, seed=1)
@@ -124,6 +136,8 @@ def test_window_attention_matches_na3d():
     ("heads", "do not divide"),
     ("planes", "more than the"),
     ("windows", "one window for every key plane"),
+    ("no_windows", "non-empty"),
+    ("kv_heads", "do not divide"),
 ])
 def test_window_attention_rejects_mismatches(bad, match):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -139,6 +153,10 @@ def test_window_attention_rejects_mismatches(bad, match):
         v = torch.cat((v, v[:, :, :, :, :1]), dim=4)
     elif bad == "planes":
         k, v = k[:, :1].contiguous(), v[:, :1].contiguous()
+    elif bad == "no_windows":
+        windows = []
+    elif bad == "kv_heads":
+        k, v = k[:, :, :, :, :0], v[:, :, :, :, :0]
     else:
         windows = [(3, 3), (5, 5)]
     with pytest.raises(NoCapableBackendError, match=match):

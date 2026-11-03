@@ -379,7 +379,7 @@ def window_attention_common_call_rule(kwargs):
                 )
             if tq > k.shape[1]:
                 return ValidationResult.fail("q", f"has {tq} planes, more than the {k.shape[1]} key planes")
-            if nh % k.shape[4] != 0:
+            if k.shape[4] < 1 or nh % k.shape[4] != 0:
                 return ValidationResult.fail("k", f"{k.shape[4]} heads do not divide the {nh} query heads")
     kh, kw = kwargs.get("kh"), kwargs.get("kw")
     if kh is not None and kw is not None:

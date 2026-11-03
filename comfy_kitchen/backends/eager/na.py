@@ -47,7 +47,7 @@ def _window_bounds(length, kernel, causal):
     return starts, ends
 
 
-def _pick_tiles(dims, kernels):
+def _pick_tiles(dims, kernels, budget=NA_SCORE_BUDGET):
     """Per-axis query-tile lengths keeping one tile's [Nq, Nk] under budget."""
     tiles = list(dims)
 
@@ -56,8 +56,8 @@ def _pick_tiles(dims, kernels):
         nk = math.prod(min(d, t + k - 1) for t, k, d in zip(ts, kernels, dims, strict=True))
         return nq * nk
 
-    while cost(tiles) > NA_SCORE_BUDGET and max(tiles) > 1:
-        i = max(range(3), key=lambda a: tiles[a] / kernels[a])
+    while cost(tiles) > budget and max(tiles) > 1:
+        i = max(range(len(tiles)), key=lambda a: tiles[a] / kernels[a])
         if tiles[i] <= 1:
             break
         tiles[i] = max(1, (tiles[i] + 1) // 2)
@@ -155,10 +155,6 @@ def na3d(
     return out
 
 
-# Query tile edge of the window_attention fallback.
-WINDOW_TILE = 16
-
-
 def _axis_keys(q0, q1, size, window, clamp, device):
     """Key range covering the windows of queries q0..q1-1 along one axis, and
     which of those keys each query sees."""
@@ -185,14 +181,17 @@ def window_attention(
 ) -> torch.Tensor:
     """Window attention over stacked key planes in pure torch.
 
-    Queries go in square tiles, each against the crop of every key plane its
-    windows touch, with a per-query mask over the concatenated crops.
+    Queries go in tiles, each against the crop of every key plane its windows
+    touch, with a per-query mask over the concatenated crops.
     """
     batch, tq, h, w, nh, hd = q.shape
     tk, kv_heads = k.shape[1], k.shape[4]
     windows = list(zip(kh, kw, strict=True)) if len(kh) > 1 else [(kh[0], kw[0])] * tk
     if clamp:
         windows = [(min(wh, h), min(ww, w)) for wh, ww in windows]
+    # one tile's mask spans the crops of all attended planes
+    planes_per_query = min(temporal_window, tk)
+    tile_h, tile_w = _pick_tiles((h, w), (max(wh for wh, _ in windows), max(ww for _, ww in windows)), NA_SCORE_BUDGET // planes_per_query)
     gqa = {"enable_gqa": True} if nh != kv_heads else {}
     axes = {}
 
@@ -206,10 +205,10 @@ def window_attention(
     for t in range(tq):
         last = t + tk - tq
         planes = range(max(0, last - temporal_window + 1), last + 1)
-        for y0 in range(0, h, WINDOW_TILE):
-            y1 = min(y0 + WINDOW_TILE, h)
-            for x0 in range(0, w, WINDOW_TILE):
-                x1 = min(x0 + WINDOW_TILE, w)
+        for y0 in range(0, h, tile_h):
+            y1 = min(y0 + tile_h, h)
+            for x0 in range(0, w, tile_w):
+                x1 = min(x0 + tile_w, w)
                 ks, vs, masks = [], [], []
                 for p in planes:
                     top, bottom, rows = axis(y0, y1, h, windows[p][0])

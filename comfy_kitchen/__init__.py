@@ -359,8 +359,10 @@ def window_attention(
     Returns:
         ``(B, Tq, H, W, num_heads, head_dim)`` attention output.
     """
-    if isinstance(windows[0], int):
+    if windows and isinstance(windows[0], int):
         windows = [windows]
+    if len(set(map(tuple, windows))) == 1:
+        windows = windows[:1]
     kh = [int(wh) for wh, _ in windows]
     kw = [int(ww) for _, ww in windows]
     if temporal_window is None:
