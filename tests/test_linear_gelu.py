@@ -115,6 +115,36 @@ class TestLinearGelu:
         assert_values_close(out.float(), ref.float(), rtol=rtol, atol=atol,
                             name=f"linear_gelu[{backend} vs eager/{dtype}]")
 
+    def test_gelu_form(self, seed, cuda_available):
+        """The triton epilogue applies tanh-GELU, not erf-GELU. The two differ by
+        less than an fp16 ulp at most inputs, so the GEMM is made exact: each x row
+        is one-hot, so every output is gelu(w) with w an fp16 weight value spread
+        over [-2.5, 4] (below that the 1 + tanh / 1 + erf terms cancel in fp32).
+        Where the fp64 references, rounded to fp16, differ, the output must be
+        the tanh one."""
+        device = "cuda" if cuda_available else "cpu"
+        capable = get_capable_backends("linear_gelu", device)
+        if "triton" not in capable:
+            pytest.skip("triton backend not capable for linear_gelu")
+
+        m, k, n = 256, 64, 1024
+        x = torch.zeros(m, k, dtype=torch.float16, device=device)
+        x[torch.arange(m), torch.arange(m) % k] = 1.0
+        weight = torch.linspace(-2.5, 4.0, n * k, device=device).reshape(n, k).half()
+        _skip_unless_served("triton", _kwargs(x, weight, None))
+        with ck.use_backend("triton"):
+            out = ck.linear_gelu(x, weight, None)
+
+        pre = weight.double().t()[torch.arange(m) % k]  # (m, n): the exact pre-activation of every output
+        want = functional.gelu(pre, approximate="tanh").half()
+        alt = functional.gelu(pre, approximate="none").half()
+        differ = want != alt
+        assert differ.sum().item() >= 1000, "inputs do not separate the two GELU forms"
+        assert (out == want).float().mean().item() >= 0.99
+        assert (out[differ] == want[differ]).float().mean().item() >= 0.9, (
+            "output follows erf-GELU, not tanh-GELU"
+        )
+
     def test_non_contiguous_input(self, seed, cuda_available):
         """A transposed x still computes the right result on whichever backend runs."""
         device = "cuda" if cuda_available else "cpu"
