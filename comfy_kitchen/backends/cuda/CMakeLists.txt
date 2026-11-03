@@ -147,6 +147,7 @@ set(CUDA_SOURCES
     ops/scaled_mm_svdquant_w4a4.cu
     ops/awq_w4a16.cu
     ops/w4a8_gemm.cu
+    ops/memmove.cu
     ops/adaln.cu
     ops/flash_decode.cu
     ops/gated_delta.cu

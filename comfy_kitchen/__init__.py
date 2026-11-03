@@ -8,6 +8,7 @@ from .backends import ascend as _ascend_backend  # noqa: F401
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
+from .backends.cuda import memmove_ as _memmove_
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
 from .exceptions import (
@@ -67,6 +68,7 @@ if getattr(torch.version, "hip", None):
     elif registry.is_available("hip"):
         registry.set_priority(["hip", "cuda", "triton", "eager"])
         sol_attn_chunked = _hip_backend.sol_attn_chunked
+        _memmove_ = _hip_backend.memmove_
 else:
     _amd = None
     registry.mark_unavailable("hip", "PyTorch ROCm/HIP runtime not available")
@@ -168,6 +170,7 @@ __all__ = [
     "delaunay3d",
     "mesh_bvh",
     "closest_point_on_mesh",
+    "closest_hit_on_mesh",
     "connected_components",
     "edge_collapse_checks",
     "min_cut",
@@ -176,6 +179,7 @@ __all__ = [
     "to_blocked",
     "from_blocked",
     "set_allocation_context",
+    "memmove",
     # Backend configuration
     "list_backends",
     "set_backend_priority",
@@ -267,6 +271,13 @@ def sol_attn(
         coarse_gate,
         int(token_aug),
     )
+
+
+def memmove(dst: torch.Tensor, src: torch.Tensor):
+    """Copy src's bytes into dst in place; the two ranges may overlap."""
+    if dst.device.type == "cuda" and registry.is_available("hip" if torch.version.hip else "cuda"):
+        return _memmove_(dst, src)
+    dst.copy_(src.clone())
 
 
 def sol_attn_is_available(device: torch.device | None = None) -> bool:
@@ -1426,7 +1437,7 @@ def delaunay3d(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.
 
 
 def mesh_bvh(triangles: torch.Tensor):
-    """Linear BVH over triangles (F, 3, 3) float32 for closest_point_on_mesh.
+    """Linear BVH over triangles (F, 3, 3) float32 for closest_point_on_mesh and closest_hit_on_mesh.
 
     Returns a reusable tuple (triangles in Morton order, their original ids, child links,
     node boxes).
@@ -1447,6 +1458,22 @@ def closest_point_on_mesh(
     """
     kwargs = {"bvh": bvh, "points": points, "max_dist": max_dist}
     impl = registry.get_implementation("closest_point_on_mesh", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def closest_hit_on_mesh(
+    bvh, origins: torch.Tensor, directions: torch.Tensor, tmin: float = 0.0, tmax: float = float("inf"),
+    cull_backface: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Nearest hit on the `bvh` mesh of each ray origins + t * directions, (N, 3) float32, for t in (tmin, tmax).
+
+    Triangles are double-sided unless cull_backface, which keeps those whose winding normal faces the ray; edges
+    count as inside. Returns (t (N,) float32, triangle id (N,) int64 into the triangles given to mesh_bvh); rays
+    that hit nothing get t = tmax and triangle -1.
+    """
+    kwargs = {"bvh": bvh, "origins": origins, "directions": directions, "tmin": tmin, "tmax": tmax,
+              "cull_backface": cull_backface}
+    impl = registry.get_implementation("closest_hit_on_mesh", kwargs=kwargs)
     return impl(**kwargs)
 
 

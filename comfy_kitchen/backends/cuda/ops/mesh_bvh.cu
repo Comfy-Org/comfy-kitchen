@@ -15,15 +15,16 @@
  * limitations under the License.
  */
 
-// Triangle BVH and closest-point-on-mesh queries.
+// Triangle BVH, closest-point-on-mesh and closest-hit ray queries.
 //
 // Build: Karras 2012 linear BVH over triangles sorted by the 63-bit Morton code of their
 // box centres (index breaks ties), with boxes fitted bottom up by the second child to reach
 // each node. Nodes 0..F-2 are internal (0 is the root), F-1..2F-2 are leaves (leaf i is
 // sorted triangle i); with F == 1 the root is the single leaf.
 //
-// Query: one thread per point, stack traversal nearer child first, pruning boxes no closer
-// than the best hit. Float32 except for thin triangles.
+// Queries: one thread per point or ray, stack traversal nearer child first, pruning boxes no
+// closer than the best hit. Closest point is float32 except for thin triangles; rays use the
+// watertight float32 test of Woop et al. 2013.
 
 #include <cuda_runtime.h>
 #include <cmath>
@@ -240,6 +241,109 @@ __global__ void closest_point_kernel(const float* __restrict__ points, int n_poi
     face[q] = best_leaf < 0 ? -1 : tri_index[best_leaf];
 }
 
+// Narrow [t_in, t_out] to one axis's slab [lo, hi], given the reciprocal direction. NaN means a
+// zero direction with the origin on a face plane: the ray then lies in the closed slab.
+__device__ __forceinline__ void clip_slab(float lo, float hi, float o, float inv, float& t_in, float& t_out) {
+    const float a = (lo - o) * inv, b = (hi - o) * inv;
+    if (a == a && b == b) {
+        t_in = fmaxf(t_in, fminf(a, b));
+        t_out = fminf(t_out, fmaxf(a, b));
+    }
+}
+
+// Where the ray enters box b within (tmin, tmax), else infinity. t_out gets 8e-7 relative slack
+// (over Ize 2013's 2 gamma(3)) so rounding never drops a hit on a box face.
+__device__ __forceinline__ float ray_box_enter(const float* b, float ox, float oy, float oz, float ix, float iy, float iz,
+                                               float tmin, float tmax) {
+    float t_in = tmin, t_out = tmax;
+    clip_slab(b[0], b[3], ox, ix, t_in, t_out);
+    clip_slab(b[1], b[4], oy, iy, t_in, t_out);
+    clip_slab(b[2], b[5], oz, iz, t_in, t_out);
+    return t_in <= t_out + 8e-7f * fabsf(t_out) ? t_in : INFINITY;
+}
+
+// The ray in the frame of the watertight test (Woop, Benthin, Wald 2013): axes permuted so the
+// direction's largest component is z, keeping handedness, then sheared onto +z.
+struct ShearedRay {
+    int kx, ky, kz;
+    float ox, oy, oz, sx, sy, sz;
+};
+
+__device__ __forceinline__ float axis(float x, float y, float z, int k) { return k == 0 ? x : (k == 1 ? y : z); }
+
+__device__ __forceinline__ ShearedRay shear_ray(float ox, float oy, float oz, float dx, float dy, float dz) {
+    const float ax = fabsf(dx), ay = fabsf(dy), az = fabsf(dz);
+    const int kz = ax > ay ? (ax > az ? 0 : 2) : (ay > az ? 1 : 2);
+    const float dk = axis(dx, dy, dz, kz);
+    const int kx = (kz + (dk < 0.0f ? 2 : 1)) % 3, ky = (kz + (dk < 0.0f ? 1 : 2)) % 3;
+    return {kx, ky, kz, axis(ox, oy, oz, kx), axis(ox, oy, oz, ky), axis(ox, oy, oz, kz),
+            axis(dx, dy, dz, kx) / dk, axis(dx, dy, dz, ky) / dk, 1.0f / dk};
+}
+
+// Ray parameter of the hit on triangle t in (tmin, tmax), else infinity. Neighbours compute a
+// shared edge's function from the same products, negated (no FMA; exact zeros redone in double),
+// so no ray slips between them. Edges and corners count as inside; det > 0 when the winding
+// normal faces the ray.
+__device__ __forceinline__ float ray_triangle(const float* t, const ShearedRay& r, float tmin, float tmax,
+                                              bool cull_backface) {
+    const float az = t[r.kz] - r.oz, bz = t[3 + r.kz] - r.oz, cz = t[6 + r.kz] - r.oz;
+    const float ax = __fmaf_rn(-r.sx, az, t[r.kx] - r.ox), ay = __fmaf_rn(-r.sy, az, t[r.ky] - r.oy);
+    const float bx = __fmaf_rn(-r.sx, bz, t[3 + r.kx] - r.ox), by = __fmaf_rn(-r.sy, bz, t[3 + r.ky] - r.oy);
+    const float cx = __fmaf_rn(-r.sx, cz, t[6 + r.kx] - r.ox), cy = __fmaf_rn(-r.sy, cz, t[6 + r.ky] - r.oy);
+    float u = __fsub_rn(__fmul_rn(cx, by), __fmul_rn(cy, bx));
+    float v = __fsub_rn(__fmul_rn(ax, cy), __fmul_rn(ay, cx));
+    float w = __fsub_rn(__fmul_rn(bx, ay), __fmul_rn(by, ax));
+    if (u == 0.0f || v == 0.0f || w == 0.0f) {
+        u = static_cast<float>(static_cast<double>(cx) * by - static_cast<double>(cy) * bx);
+        v = static_cast<float>(static_cast<double>(ax) * cy - static_cast<double>(ay) * cx);
+        w = static_cast<float>(static_cast<double>(bx) * ay - static_cast<double>(by) * ax);
+    }
+    if ((u < 0.0f || v < 0.0f || w < 0.0f) && (u > 0.0f || v > 0.0f || w > 0.0f)) return INFINITY;
+    const float det = u + v + w;
+    if (det == 0.0f || (cull_backface && det < 0.0f)) return INFINITY;
+    const float hit = (u * az + v * bz + w * cz) * r.sz / det;
+    return hit > tmin && hit < tmax ? hit : INFINITY;
+}
+
+__global__ void closest_hit_kernel(const float* __restrict__ origins, const float* __restrict__ directions, int n_rays,
+                                   const float* __restrict__ tris, const int* __restrict__ tri_index, int n_leaves,
+                                   const int* __restrict__ child, const float* __restrict__ box, float tmin, float tmax,
+                                   bool cull_backface, float* t_out, long long* face) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_rays) return;
+    const int64_t r3 = 3 * static_cast<int64_t>(r);
+    const float ox = origins[r3], oy = origins[r3 + 1], oz = origins[r3 + 2];
+    const float dx = directions[r3], dy = directions[r3 + 1], dz = directions[r3 + 2];
+    const float ix = 1.0f / dx, iy = 1.0f / dy, iz = 1.0f / dz;
+    const ShearedRay sheared = shear_ray(ox, oy, oz, dx, dy, dz);
+    const int leaf0 = n_leaves - 1;
+    float best = tmax;
+    int best_leaf = -1;
+    int stack[kMaxStack];
+    int sp = 0;
+    if (ray_box_enter(box, ox, oy, oz, ix, iy, iz, tmin, best) < INFINITY) stack[sp++] = 0;  // misses leave after one box
+    while (sp > 0) {
+        const int node = stack[--sp];
+        if (node >= leaf0) {
+            const float hit = ray_triangle(tris + 9 * static_cast<int64_t>(node - leaf0), sheared, tmin, best,
+                                           cull_backface);
+            if (hit < best) {
+                best = hit;
+                best_leaf = node - leaf0;
+            }
+            continue;
+        }
+        const int c0 = child[2 * node], c1 = child[2 * node + 1];
+        const float t0 = ray_box_enter(box + 6 * static_cast<int64_t>(c0), ox, oy, oz, ix, iy, iz, tmin, best);
+        const float t1 = ray_box_enter(box + 6 * static_cast<int64_t>(c1), ox, oy, oz, ix, iy, iz, tmin, best);
+        const int near = t0 <= t1 ? c0 : c1, far = t0 <= t1 ? c1 : c0;
+        if (fmaxf(t0, t1) < best) stack[sp++] = far;  // pushed first so near pops first
+        if (fminf(t0, t1) < best) stack[sp++] = near;
+    }
+    t_out[r] = best;
+    face[r] = best_leaf < 0 ? -1 : tri_index[best_leaf];
+}
+
 inline unsigned int blocks_for(int n) { return static_cast<unsigned int>((n + kThreads - 1) / kThreads); }
 
 
@@ -272,6 +376,17 @@ void launch_closest_point_on_mesh(const void* points, int n_points, const void* 
         static_cast<const float*>(points), n_points, static_cast<const float*>(tris),
         static_cast<const int*>(tri_index), n_leaves, static_cast<const int*>(child), static_cast<const float*>(box),
         max_dist, static_cast<float*>(dist), static_cast<float*>(closest), static_cast<long long*>(face));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_closest_hit_on_mesh(const void* origins, const void* directions, int n_rays, const void* tris,
+                                const void* tri_index, int n_leaves, const void* child, const void* box, float tmin,
+                                float tmax, bool cull_backface, void* t, void* face, cudaStream_t stream) {
+    if (n_rays <= 0) return;
+    closest_hit_kernel<<<blocks_for(n_rays), kThreads, 0, stream>>>(
+        static_cast<const float*>(origins), static_cast<const float*>(directions), n_rays,
+        static_cast<const float*>(tris), static_cast<const int*>(tri_index), n_leaves, static_cast<const int*>(child),
+        static_cast<const float*>(box), tmin, tmax, cull_backface, static_cast<float*>(t), static_cast<long long*>(face));
     CUDA_CHECK(cudaGetLastError());
 }
 

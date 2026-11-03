@@ -143,6 +143,8 @@ void launch_rms_rope_kernel(const void*, const void*, const void*, const void*, 
                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int, int,
                             int, float, bool, hipStream_t);
+int64_t memmove_flag_count(int64_t);
+void launch_memmove(void*, const void*, int64_t, void*, hipStream_t);
 }
 
 static void check_hip_launch() {
@@ -605,6 +607,18 @@ static void require_convrot_group(int k, int group_size, const char* fn) {
         throw std::runtime_error(std::string(fn) + ": K=" + std::to_string(k) +
                                  " is not divisible by group_size=" + std::to_string(group_size));
     }
+}
+
+void memmove_bytes(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::rocm> dst,
+                   nb::ndarray<uint8_t, nb::ndim<1>, nb::device::rocm> src,
+                   nb::ndarray<int32_t, nb::ndim<1>, nb::device::rocm> flags, uintptr_t stream_ptr) {
+    const int64_t nbytes = dst.size();
+    if (src.size() != static_cast<size_t>(nbytes) || nbytes % 16 || dst.stride(0) != 1 || src.stride(0) != 1
+            || reinterpret_cast<uintptr_t>(dst.data()) % 16 || reinterpret_cast<uintptr_t>(src.data()) % 16
+            || flags.stride(0) != 1 || flags.size() < static_cast<size_t>(memmove_flag_count(nbytes)))
+        throw std::runtime_error("memmove: ranges must be equal, 16-byte aligned multiples of 16 bytes with enough flags");
+    launch_memmove(dst.data(), src.data(), nbytes, flags.data(), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
 }
 
 void quantize_int8_rowwise(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales, int M, int K,
@@ -2933,6 +2947,8 @@ NB_MODULE(_C, m) {
           nb::arg("W"), nb::arg("C"), nb::arg("K"), nb::arg("T"), nb::arg("R"), nb::arg("S"),
           nb::arg("sd"), nb::arg("sh"), nb::arg("sw"), nb::arg("stream_ptr"), nb::arg("xs_w") = 0,
           nb::arg("xs_h") = 0, nb::arg("xs_d") = 0, nb::arg("xs_n") = 0);
+    m.def("memmove", &memmove_bytes, nb::arg("dst"), nb::arg("src"), nb::arg("flags"),
+          nb::arg("stream_ptr"));
     m.def("quantize_int8_rowwise", &quantize_int8_rowwise, nb::arg("x"), nb::arg("q"),
           nb::arg("scales"), nb::arg("M"), nb::arg("K"), nb::arg("stream_ptr"),
           nb::arg("tiled_output") = false);
