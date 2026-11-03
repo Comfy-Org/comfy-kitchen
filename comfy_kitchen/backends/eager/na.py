@@ -155,6 +155,76 @@ def na3d(
     return out
 
 
+# Query tile edge of the window_attention fallback.
+WINDOW_TILE = 16
+
+
+def _axis_keys(q0, q1, size, window, clamp, device):
+    """Key range covering the windows of queries q0..q1-1 along one axis, and
+    which of those keys each query sees."""
+    half = window // 2
+    low0, low1 = q0 - half, q1 - 1 - half
+    low = torch.arange(q0, q1, device=device) - half
+    if clamp:
+        low0, low1 = min(max(low0, 0), size - window), min(max(low1, 0), size - window)
+        low = low.clamp(0, size - window)
+    start, stop = max(low0, 0), min(low1 + window, size)
+    keys = torch.arange(start, stop, device=device)
+    return start, stop, (keys >= low[:, None]) & (keys < low[:, None] + window)
+
+
+def window_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kh: list[int],
+    kw: list[int],
+    temporal_window: int,
+    clamp: bool,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Window attention over stacked key planes in pure torch.
+
+    Queries go in square tiles, each against the crop of every key plane its
+    windows touch, with a per-query mask over the concatenated crops.
+    """
+    batch, tq, h, w, nh, hd = q.shape
+    tk, kv_heads = k.shape[1], k.shape[4]
+    windows = list(zip(kh, kw, strict=True)) if len(kh) > 1 else [(kh[0], kw[0])] * tk
+    if clamp:
+        windows = [(min(wh, h), min(ww, w)) for wh, ww in windows]
+    gqa = {"enable_gqa": True} if nh != kv_heads else {}
+    axes = {}
+
+    def axis(q0, q1, size, window):
+        key = (q0, size, window)
+        if key not in axes:
+            axes[key] = _axis_keys(q0, q1, size, window, clamp, q.device)
+        return axes[key]
+
+    out = torch.empty_like(q)
+    for t in range(tq):
+        last = t + tk - tq
+        planes = range(max(0, last - temporal_window + 1), last + 1)
+        for y0 in range(0, h, WINDOW_TILE):
+            y1 = min(y0 + WINDOW_TILE, h)
+            for x0 in range(0, w, WINDOW_TILE):
+                x1 = min(x0 + WINDOW_TILE, w)
+                ks, vs, masks = [], [], []
+                for p in planes:
+                    top, bottom, rows = axis(y0, y1, h, windows[p][0])
+                    left, right, cols = axis(x0, x1, w, windows[p][1])
+                    ks.append(k[:, p, top:bottom, left:right].reshape(batch, -1, kv_heads, hd))
+                    vs.append(v[:, p, top:bottom, left:right].reshape(batch, -1, kv_heads, hd))
+                    masks.append((rows[:, None, :, None] & cols[None, :, None, :]).flatten(2).flatten(0, 1))
+                qt = q[:, t, y0:y1, x0:x1].reshape(batch, -1, nh, hd).transpose(1, 2)
+                kt = torch.cat(ks, dim=1).transpose(1, 2)
+                vt = torch.cat(vs, dim=1).transpose(1, 2)
+                o = functional.scaled_dot_product_attention(qt, kt, vt, attn_mask=torch.cat(masks, dim=-1), scale=scale, **gqa)
+                out[:, t, y0:y1, x0:x1] = o.transpose(1, 2).reshape(batch, y1 - y0, x1 - x0, nh, hd)
+    return out
+
+
 # =============================================================================
 # torch.library Custom Op Definitions
 # =============================================================================
@@ -177,3 +247,24 @@ def _op_na3d(
 @_op_na3d.register_fake
 def _op_na3d_fake(q, k, v, kernel_size, is_causal, scale):
     return torch.empty_like(v)  # v's dtype, as the eager implementation returns
+
+
+@torch.library.custom_op("comfy_kitchen::window_attention", mutates_args=())
+def _op_window_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kh: list[int],
+    kw: list[int],
+    temporal_window: int,
+    clamp: bool,
+    scale: float | None,
+) -> torch.Tensor:
+    kwargs = {"q": q, "k": k, "v": v, "kh": kh, "kw": kw, "temporal_window": temporal_window, "clamp": clamp, "scale": scale}
+    impl = registry.get_implementation("window_attention", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_window_attention.register_fake
+def _op_window_attention_fake(q, k, v, kh, kw, temporal_window, clamp, scale):
+    return torch.empty_like(q)
