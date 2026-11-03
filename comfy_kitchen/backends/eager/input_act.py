@@ -31,15 +31,22 @@ def _op_input_act(
         # The op is registered as functional (mutates_args=()), so it must not
         # return an alias of an input; the eager path returns x for this mode.
         return x.clone()
+    _check_gated_width(x, input_act)
     kwargs = {"x": x, "input_act": input_act, "act_weight": act_weight, "act_eps": act_eps}
     impl = registry.get_implementation("input_act", kwargs=kwargs)
     return impl(**kwargs)
+
+
+def _check_gated_width(x: torch.Tensor, input_act: str) -> None:
+    if input_act in ("swiglu", "situ") and x.shape[-1] % 2:
+        raise ValueError(f"input_act {input_act!r} needs an even last dim, got {x.shape[-1]}")
 
 
 @_op_input_act.register_fake
 def _op_input_act_fake(x, input_act, act_weight, act_eps):
     if input_act == "none":
         return x.clone()
+    _check_gated_width(x, input_act)
     # Run the eager chain on the fake tensor so the metadata (shape and strides)
     # matches what the real kernel returns; `new_empty` would claim contiguous
     # strides for an activation that preserves a transposed input's layout.
