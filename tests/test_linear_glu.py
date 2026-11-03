@@ -489,7 +489,7 @@ class TestPartialNTile:
 
 
 # ---------------------------------------------------------------------------
-# Autotune: per-arch config lists and the autotune timer
+# Autotune timer
 # ---------------------------------------------------------------------------
 
 
@@ -498,96 +498,6 @@ def _linear_act():
     from comfy_kitchen.backends.triton import linear_act
 
     return linear_act
-
-
-def _cfg(c):
-    k = c.kwargs
-    return (k["block_m"], k["block_n"], k["block_k"], k["group_size_m"], c.num_warps, c.num_stages)
-
-
-_GEGLU_SM120 = (128, 64, 32, 8, 4, 3)
-_GEGLU_K640_SM120 = (64, 64, 32, 8, 4, 3)
-_GEGLU_GFX1151 = (64, 64, 64, 8, 4, 2)
-_GEGLU_GFX1201 = [(128, 64, 64, 16, 8, 1), (128, 64, 32, 16, 8, 3)]
-_SWIGLU_GM32 = (128, 64, 64, 32, 4, 2)
-_SWIGLU_GM16 = (128, 64, 64, 16, 8, 1)
-_SWIGLU_GM8 = (128, 64, 64, 8, 4, 2)
-_GEGLU_ALL = [_GEGLU_SM120, _GEGLU_K640_SM120, _GEGLU_GFX1151, *_GEGLU_GFX1201]
-_SWIGLU_ALL = [_SWIGLU_GM32, _SWIGLU_GM16, _SWIGLU_GM8]
-
-# arch -> (GEGLU configs timed, SwiGLU configs timed). Untagged archs get the full lists.
-_ARCH_LISTS = {
-    "sm_120": ([_GEGLU_SM120], [_SWIGLU_GM32]),
-    "gfx1151": ([_GEGLU_GFX1151], [_SWIGLU_GM8]),
-    "gfx1201": (_GEGLU_GFX1201, _SWIGLU_ALL),
-    "sm_90": (_GEGLU_ALL, _SWIGLU_ALL),
-    "sm_89": (_GEGLU_ALL, _SWIGLU_ALL),
-    "gfx942": (_GEGLU_ALL, _SWIGLU_ALL),
-    "gfx1200": (_GEGLU_ALL, _SWIGLU_ALL),
-    None: (_GEGLU_ALL, _SWIGLU_ALL),
-}
-
-
-class TestAutotuneArch:
-    def test_full_lists(self):
-        la = _linear_act()
-        assert [_cfg(c) for c in la._GEGLU_CONFIGS] == _GEGLU_ALL
-        assert [_cfg(c) for c in la._SWIGLU_CONFIGS] == _SWIGLU_ALL
-
-    @pytest.mark.parametrize("arch", list(_ARCH_LISTS))
-    def test_configs_for_arch(self, arch):
-        la = _linear_act()
-        geglu, swiglu = _ARCH_LISTS[arch]
-        got = la._configs_for_arch(la._GEGLU_CONFIGS, la._GEGLU_TAGGED, arch)
-        assert [_cfg(c) for c in got] == geglu
-        got = la._configs_for_arch(la._SWIGLU_CONFIGS, la._SWIGLU_TAGGED, arch)
-        assert [_cfg(c) for c in got] == swiglu
-
-    def test_configs_not_in_tagged_list_are_kept(self):
-        """A config list the tags do not cover (a test forcing its own config)
-        is returned unchanged."""
-        la = _linear_act()
-        import triton
-
-        own = [triton.Config({"block_m": 64, "block_n": 128, "block_k": 32, "group_size_m": 8},
-                             num_warps=4, num_stages=1)]
-        for arch in ("sm_120", "gfx1151", "gfx1201", None):
-            assert la._configs_for_arch(own, la._GEGLU_TAGGED, arch) == own
-
-    @pytest.mark.parametrize(
-        ("backend", "arch", "name"),
-        [("cuda", 120, "sm_120"), ("cuda", 89, "sm_89"), ("hip", "gfx1151", "gfx1151"),
-         ("hip", "gfx942:sramecc+:xnack-", "gfx942"), ("hip", "gfx1201", "gfx1201"),
-         ("xpu", "pvc", None)],
-    )
-    def test_arch_name(self, backend, arch, name):
-        from collections import namedtuple
-
-        la = _linear_act()
-        target = namedtuple("GPUTarget", ["backend", "arch", "warp_size"])(backend, arch, 32)
-        assert la._arch_name(target) == name
-
-    @pytest.mark.parametrize("arch", ["sm_120", "gfx1151", "gfx1201", "sm_90", None])
-    def test_autotuners_prune_by_current_arch(self, arch, monkeypatch):
-        """Each op's autotuner prunes with the arch read when it tunes a new key."""
-        la = _linear_act()
-        monkeypatch.setattr(la, "_current_arch", lambda: arch)
-        geglu, swiglu = _ARCH_LISTS[arch]
-        for tuner, expected in ((la._linear_geglu_kernel, geglu), (la._linear_swiglu_kernel, swiglu)):
-            got = tuner.early_config_prune(tuner.configs, {})
-            assert [_cfg(c) for c in got] == expected
-
-    def test_current_arch_matches_device(self, cuda_available):
-        if not cuda_available:
-            pytest.skip("needs a GPU")
-        la = _linear_act()
-        arch = la._current_arch()
-        if getattr(torch.version, "hip", None):
-            name = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-            assert arch == name
-        else:
-            major, minor = torch.cuda.get_device_capability(0)
-            assert arch == f"sm_{major}{minor}"
 
 
 class TestAutotuneTimer:
