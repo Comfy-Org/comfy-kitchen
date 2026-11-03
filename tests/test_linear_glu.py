@@ -169,6 +169,37 @@ class TestLinearGeglu:
         assert_values_close(out.float(), _ref_geglu(x, weight, bias).float(), rtol=rtol,
                             atol=atol, name="linear_geglu[strided weight rows]")
 
+    @pytest.mark.parametrize("approximate", ["none", "tanh"])
+    def test_gelu_form(self, approximate, seed, cuda_available):
+        """The epilogue applies the GELU form asked for (erf for "none", tanh for
+        "tanh"), not the other one. The two differ by less than an fp16 ulp at most
+        inputs, so the GEMM is made exact: each x row is one-hot, so every output is
+        1.0 * gelu(gate) with gate an fp16 weight value spread over [-2.5, 4] (below
+        that the 1 + erf / 1 + tanh terms cancel in fp32). Where the fp64
+        references, rounded to fp16, differ, the output must be the requested one."""
+        device = "cuda" if cuda_available else "cpu"
+        _require("linear_geglu", "triton", device)
+
+        m, k, n = 256, 64, 1024
+        x = torch.zeros(m, k, dtype=torch.float16, device=device)
+        x[torch.arange(m), torch.arange(m) % k] = 1.0
+        gate = torch.linspace(-2.5, 4.0, n * k, device=device).reshape(n, k).half()
+        weight = torch.cat([torch.ones(n, k, dtype=torch.float16, device=device), gate])
+        _require_served("triton", "linear_geglu", _geglu_kwargs(x, weight, None, approximate))
+        with ck.use_backend("triton"):
+            out = ck.linear_geglu(x, weight, None, approximate)
+
+        g64 = gate.double().t()[torch.arange(m) % k]  # (m, n): the exact gate of every output
+        other = "tanh" if approximate == "none" else "none"
+        want = functional.gelu(g64, approximate=approximate).half()
+        alt = functional.gelu(g64, approximate=other).half()
+        differ = want != alt
+        assert differ.sum().item() >= 1000, "inputs do not separate the two GELU forms"
+        assert (out == want).float().mean().item() >= 0.99
+        assert (out[differ] == want[differ]).float().mean().item() >= 0.9, (
+            f"output follows approximate={other!r}, not {approximate!r}"
+        )
+
     def test_non_contiguous_input(self, seed, cuda_available):
         """A transposed x still computes the right result on whichever backend runs."""
         device = "cuda" if cuda_available else "cpu"
