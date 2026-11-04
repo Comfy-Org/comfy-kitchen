@@ -1578,8 +1578,11 @@ def quantize_w4a8_int8_weight(
     codebook g16, or 6-bit without the quantize-time scale search; fp8 scales). W4A8
     uses staged CUDA requant when fusion is unavailable; other configs use chunked eager."""
     validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
+    # The fused and staged kernels take the 16-entry table only; the nested codebook is decoded
+    # through its level tables in the chunked path.
     fused_ok = scale_dtype == torch.float8_e4m3fn and symmetric and (
-        (bits == 4 and codebook and group_size == 16)
+        (bits == 4 and codebook and group_size == 16
+         and (codebook_tensor is None or not is_nested_codebook(codebook_tensor)))
         or (bits == 6 and not scale_search and group_size in (16, 32, 64))
     )
     if fused_ok:
@@ -2480,12 +2483,13 @@ def dequantize_w4a8_int8_weight(
         convrot_groupsize,
     )
     if is_nested_codebook(codebook):
-        codebook = _canonical_level_table(qdata, s_rel, codebook, group_size)
-        if codebook is None:
+        table = _canonical_level_table(qdata, s_rel, codebook, group_size)
+        if table is None:
             return eager_dequantize_w4a8_int8_weight(
                 qdata, s_rel, s_channel, codebook=codebook, correction=correction,
                 group_size=group_size, convrot_groupsize=convrot_groupsize, output_dtype=output_dtype,
             )
+        codebook = table
     int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
     weight_rotated = _dequantize_w4a8_int8_weight_from_int8(
         int8_weight,
@@ -2583,13 +2587,14 @@ def w4a8_int8_linear(
         convrot_groupsize,
     )
     if is_nested_codebook(codebook):
-        codebook = _canonical_level_table(qdata, s_rel, codebook, group_size)
-        if codebook is None:
+        table = _canonical_level_table(qdata, s_rel, codebook, group_size)
+        if table is None:
             return eager_w4a8_int8_linear(
                 x, qdata, s_rel, s_channel, codebook=codebook, correction=correction, bias=bias,
                 group_size=group_size, convrot_groupsize=convrot_groupsize, out_dtype=out_dtype,
                 input_act=input_act, input_act_weight=input_act_weight, input_act_eps=input_act_eps,
             )
+        codebook = table
     if x.shape[-1] != k * _input_act_width(input_act):
         raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={k}")
     groups = k // group_size
