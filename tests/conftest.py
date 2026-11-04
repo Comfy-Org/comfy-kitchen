@@ -72,6 +72,15 @@ def requires_compiled_op(name: str):
     return pytest.mark.skipif(not ok, reason=f"compiled CUDA or HIP backend with {name} required")
 
 
+def serving_backend(name: str, kwargs: dict):
+    """The backend module the registry dispatches `name` to for these arguments."""
+    import importlib
+
+    from comfy_kitchen.registry import registry
+
+    return importlib.import_module(f"comfy_kitchen.backends.{registry.get_capable_backend(name, kwargs)}")
+
+
 def skip_unless_gfx12_wmma() -> None:
     if not getattr(torch.version, "hip", None):
         pytest.skip("requires HIP")
