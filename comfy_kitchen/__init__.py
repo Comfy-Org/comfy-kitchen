@@ -1086,8 +1086,9 @@ def linear_gelu(
 
     The fused (triton) path takes fp16/bf16 ``x``/``weight``/``bias`` of one dtype,
     ``approximate="tanh"``, weight rows contiguous with ``out_features % 128 == 0``
-    and ``in_features % 64 == 0``, and at least 256 rows of ``x``. Everything else
-    runs the eager reference, so the result is always defined.
+    and ``in_features % 64 == 0``, and at least 256 rows of ``x``. Other fp32 /
+    fp16 / bf16 calls (``x``/``weight``/``bias`` of one dtype, as ``F.linear``
+    requires) run the eager reference.
 
     Note the default ``approximate`` is "tanh" (the form DiT MLPs use), unlike
     ``F.gelu``'s "none".
