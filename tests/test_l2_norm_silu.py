@@ -90,6 +90,16 @@ class TestL2NormSiluTriton:
                 got = ck.l2_norm_silu(xx, g, 32 ** 0.5)
             assert _rel(got, eager_backend.l2_norm_silu(xx, g, 32 ** 0.5)) < 1e-2
 
+    @pytest.mark.parametrize("shape", [(0, 64, 32), (2, 0, 32), (2, 64, 0), (1, 16, 0, 4, 4)])
+    def test_empty_input_goes_to_eager(self, shape):
+        x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+        g = torch.ones(shape[1], device="cuda")
+        kwargs = {"x": x, "weight": g, "scale": 1.0, "eps": 1e-12}
+        assert not registry.validate_backend_for_call("triton", "l2_norm_silu", kwargs).success
+        with ck.use_backend("triton"):
+            got = ck.l2_norm_silu(x, g, 1.0)
+        assert got.shape == x.shape and got.dtype == x.dtype
+
     def test_unsupported_inputs_go_to_eager(self):
         g = torch.ones(32, device="cuda")
         for xx in (torch.randn(1, 32, 2, 4, 4, device="cuda"), torch.randn(4, 32, device="cuda", dtype=torch.bfloat16)):

@@ -135,6 +135,8 @@ def _build_constraints() -> dict:
             return ValidationResult.ok()
         if x.dim() < 3:
             return ValidationResult.fail("x", "x must be [B, C, *spatial]")
+        if x.numel() == 0:
+            return ValidationResult.fail("x", "empty tensors are not supported by triton l2_norm_silu")
         if weight.numel() != x.shape[1]:
             return ValidationResult.fail("weight", f"weight needs {x.shape[1]} elements")
         return ValidationResult.ok()
