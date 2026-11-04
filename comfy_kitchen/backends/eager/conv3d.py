@@ -34,6 +34,95 @@ def fp16_conv3d_out(
     out.copy_(fp16_conv3d(x, weight, bias, residual, stride))
 
 
+def fp16_packed_conv3d(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    dilation: list[int],
+) -> Tensor:
+    """3D conv with zero padding in x's dtype."""
+    return functional.conv3d(x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype),
+                             stride=stride, padding=padding, dilation=dilation)
+
+
+def fp16_packed_conv_transpose3d(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    output_padding: list[int],
+) -> Tensor:
+    """3D transposed conv in x's dtype."""
+    return functional.conv_transpose3d(x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype),
+                                       stride=stride, padding=padding, output_padding=output_padding)
+
+
+def direct_conv3d(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    dilation: list[int],
+) -> Tensor:
+    """3D conv with zero padding in x's dtype."""
+    return fp16_packed_conv3d(x, weight, bias, stride, padding, dilation)
+
+
+def fp32_winograd_conv2d(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor | None,
+    stride: list[int],
+    padding: list[int],
+) -> Tensor:
+    """fp32 2D conv with zero padding."""
+    return functional.conv2d(x, weight, bias, stride=stride, padding=padding)
+
+
+def fp32_winograd_conv_transpose2d(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    output_padding: list[int],
+) -> Tensor:
+    """fp32 2D transposed conv, one group."""
+    return functional.conv_transpose2d(x, weight, bias, stride=stride, padding=padding,
+                                       output_padding=output_padding)
+
+
+def depthwise_conv3d(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    dilation: list[int],
+) -> Tensor:
+    """3D conv with one filter per channel, in x's dtype."""
+    return functional.conv3d(x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype),
+                             stride=stride, padding=padding, dilation=dilation, groups=x.shape[1])
+
+
+def depthwise_conv_transpose3d(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor | None,
+    stride: list[int],
+    padding: list[int],
+    output_padding: list[int],
+) -> Tensor:
+    """3D transposed conv with one filter per channel, in x's dtype."""
+    return functional.conv_transpose3d(x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype),
+                                       stride=stride, padding=padding, output_padding=output_padding,
+                                       groups=x.shape[1])
+
+
 @torch.library.custom_op("comfy_kitchen::fp16_conv3d_out", mutates_args=("out",))
 def _op_fp16_conv3d_out(
     x: torch.Tensor,

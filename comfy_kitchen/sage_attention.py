@@ -14,8 +14,10 @@ from .backends import cuda as _cuda_backend
 from .backends.eager.quantization import DTYPE_TO_CODE
 
 if getattr(torch.version, "hip", None):
+    from .backends import amd as _amd
     from .backends import hip as _hip_backend
 else:
+    _amd = None
     _hip_backend = None
 
 CTA_K = 64
@@ -50,6 +52,15 @@ class PrequantizedInt8Attention:
     attn_mask: torch.Tensor | None
 
 
+def _hip_backend_for(device: torch.device | None):
+    """The AMD backend module serving ``device``: rdna1 where it does, else
+    _hip_backend (None off ROCm)."""
+    if _amd is None:
+        return None
+    name, module = _amd.backend_for(device)
+    return _hip_backend if name == "hip" else module
+
+
 def _pad_to_cta_k(length: int, cta_k: int = CTA_K) -> int:
     return ((length + cta_k - 1) // cta_k) * cta_k
 
@@ -73,6 +84,7 @@ def _prepare_attn_mask(
     fuse_short_dense_mask: bool = False,
 ) -> torch.Tensor | None:
     """Prepare masks for the native tile layout or let a short fused call do it."""
+    _hip_backend = _hip_backend_for(None if attn_mask is None else attn_mask.device)
     if (
         fuse_short_dense_mask
         and _hip_backend is not None
@@ -138,6 +150,7 @@ def is_available(device: torch.device | None = None) -> bool:
         return False
     if not torch.cuda.is_available():
         return False
+    _hip_backend = _hip_backend_for(device)
     if _hip_backend is not None:
         # torch.cuda is the ROCm API here, and get_device_capability reports
         # something SM-shaped for a gfx part, so the compute capability test
@@ -167,7 +180,7 @@ def _validate_inputs(
     if not is_available(q.device):
         raise RuntimeError(
             "INT8 attention requires the comfy-kitchen CUDA extension on SM75 or newer, "
-            "or the HIP extension on an AMD device with matrix cores (RDNA3 or newer)"
+            "or the HIP extension on RDNA3 or newer or gfx1010"
         )
 
     batch, q_heads, q_length, head_dim = q.shape
@@ -238,6 +251,7 @@ def _int8_attention_cuda(
         fuse_short_key_mask=kernel_head_dim <= 128,
         fuse_short_dense_mask=kernel_head_dim <= 128,
     )
+    _hip_backend = _hip_backend_for(q.device)
     if _hip_backend is not None:
         output = _hip_backend.sage_int8_sdpa(
             q,
@@ -360,6 +374,7 @@ def prequantize_int8_attention(
         raise ValueError(f"scale must be finite, got {attention_scale}")
 
     attn_mask = _prepare_attn_mask(attn_mask, attention_scale)
+    _hip_backend = _hip_backend_for(q.device)
     if _hip_backend is not None:
         # The packed V row width follows this cta_k, so the value that packed the
         # buffers is the one that has to come back to attend over them. Taking the
@@ -483,7 +498,7 @@ def int8_attention_from_prequantized(
     if not is_available(quantized.q.device):
         raise RuntimeError(
             "INT8 attention requires the comfy-kitchen CUDA extension on SM75 or newer, "
-            "or the HIP extension on an AMD device with matrix cores (RDNA3 or newer)"
+            "or the HIP extension on RDNA3 or newer or gfx1010"
         )
 
     batch, q_heads, q_length, kernel_head_dim = quantized.q.shape
@@ -491,6 +506,7 @@ def int8_attention_from_prequantized(
         torch.bfloat16 if quantized.input_dtype == torch.float32 else quantized.input_dtype
     )
 
+    _hip_backend = _hip_backend_for(quantized.q.device)
     if _hip_backend is not None:
         output = _hip_backend.sage_int8_attend(
             quantized.q,
@@ -538,6 +554,54 @@ def int8_attention_from_prequantized(
 
     output = output[..., : quantized.original_head_dim]
     return output.float() if quantized.input_dtype == torch.float32 else output
+
+
+def is_block_sparse_available(device: torch.device | None = None) -> bool:
+    """Whether :func:`int8_block_sparse_attention` has a kernel for this device (gfx1010)."""
+    return is_available(device) and hasattr(_hip_backend_for(device), "sage_int8_block_sparse_attend")
+
+
+def int8_block_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lut: torch.Tensor,
+    *,
+    block_q: int,
+    scale: float | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Block-sparse :func:`int8_attention`: query block ``b`` (``block_q`` 64 or 128
+    queries) of each head attends only to the 64-key tiles ``lut[batch, head, b, :]``.
+
+    ``lut`` is int32 ``[batch, q_heads, ceil(q_len / block_q), topk]`` with distinct
+    tiles per row (a repeated tile is attended twice), as top-k selectors produce it.
+    Inputs use ``[batch, heads, sequence, head_dim]`` layout with head_dim 64 or 128
+    and are quantized exactly as in :func:`int8_attention`. The result has the
+    inputs' dtype and is written by the kernel itself, float32 included. ``out``,
+    when given, is a ``[batch, heads, sequence, head_dim]`` tensor of that dtype,
+    contiguous along ``head_dim`` but otherwise strided as the caller likes (such as
+    a sequence-major buffer, transposed), that receives the result without a copy.
+    Requires :func:`is_block_sparse_available`.
+    """
+    if not is_block_sparse_available(q.device):
+        raise RuntimeError("INT8 block-sparse attention requires the rdna1 backend on gfx1010")
+    if q.shape[-1] not in (64, 128):
+        raise ValueError(f"head_dim must be 64 or 128, got {q.shape[-1]}")
+    packed = prequantize_int8_attention(q, k, v, scale=scale)
+    return _hip_backend_for(q.device).sage_int8_block_sparse_attend(
+        packed.q,
+        packed.k,
+        packed.v,
+        packed.q_scale,
+        packed.k_scale,
+        packed.v_scale,
+        lut.to(torch.int32).contiguous(),
+        block_q=block_q,
+        attention_scale=packed.attention_scale,
+        output_dtype=packed.input_dtype,
+        out=out,
+    )
 
 
 @torch.library.custom_op("comfy_kitchen::int8_attention", mutates_args=())

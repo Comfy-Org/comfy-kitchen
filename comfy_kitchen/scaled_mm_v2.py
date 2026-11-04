@@ -48,10 +48,11 @@ def _hip_fp8_gemm(
     operands, K not a multiple of 16, unsupported output dtype), in which case
     the caller falls back to torch.
     """
-    from .backends import hip
+    from .backends import amd
     from .registry import registry
 
-    if not registry.is_available("hip"):
+    name, hip = amd.backend_for(input.device)
+    if not registry.is_available(name):
         return None
     # This path skips the registry, so its per-architecture capability filter does
     # not cover it. RDNA2 registers for the elementwise kernels but has no matrix

@@ -1,0 +1,102 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// INT8 GEMM, as the thread-level GEMM in gemm_simt.h.
+// C[M, N] = (A[M, K] @ B[N, K]^T) * scale_a[row] * scale_b[col] + bias
+#include <stdexcept>
+#include <string>
+
+#include "../epilogue.h"
+#include "../gemm_simt.h"
+#include "../launchers.h"
+
+namespace comfy::hip_backend {
+
+// Small-M path: reduce K across the wave, one wave per output column.
+template <typename OutT>
+__global__ __launch_bounds__(256) void gemv_int8_kernel(
+    const int8_t* __restrict__ A, const int8_t* __restrict__ B, OutT* __restrict__ C,
+    int M, int N, int K, int ldc, EpiRowwise epi) {
+
+    const int col = blockIdx.x * blockDim.y + threadIdx.y;
+    const int row = blockIdx.y;
+    if (col >= N || row >= M) return;
+
+    const int8_t* a = A + static_cast<int64_t>(row) * K;
+    const int8_t* b = B + static_cast<int64_t>(col) * K;
+
+    int sum = 0;
+    for (int k = threadIdx.x * 16; k < K; k += kWave * 16) {
+        const uint4 av = *reinterpret_cast<const uint4*>(a + k);
+        const uint4 bv = *reinterpret_cast<const uint4*>(b + k);
+        const int8_t* ab = reinterpret_cast<const int8_t*>(&av);
+        const int8_t* bb = reinterpret_cast<const int8_t*>(&bv);
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) sum += ab[i] * bb[i];
+    }
+    sum = wave_reduce_sum(sum);
+
+    if (threadIdx.x == 0) {
+        epi.init();
+        C[static_cast<int64_t>(row) * ldc + col] =
+            static_cast<OutT>(epi(row, col, static_cast<float>(sum)));
+    }
+}
+
+template <typename OutT>
+static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N, int K, int ldc,
+                        EpiRowwise epi, hipStream_t stream) {
+    const uint8_t* Au = reinterpret_cast<const uint8_t*>(A);
+    const uint8_t* Bu = reinterpret_cast<const uint8_t*>(B);
+
+    if (M <= 8) {
+        dim3 block(kWave, 8);
+        dim3 grid((N + 7) / 8, M);
+        gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
+        return;
+    }
+    launch_gemm_simt<SimtInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
+}
+
+}  // namespace comfy::hip_backend
+
+// scale_b_stride is 1 for a per-output-channel weight scale, 0 for a scalar one.
+extern "C" void launch_int8_gemm_kernel(
+    const void* a, const void* b, void* c,
+    const void* scale_a, const void* scale_b, int scale_b_stride,
+    const void* bias, int bias_code,
+    int M, int N, int K, int ldc, int out_code, hipStream_t stream) {
+
+    using namespace comfy::hip_backend;
+
+    if (M == 0 || N == 0) {
+        return;  // a zero-dimension grid is hipErrorInvalidConfiguration
+    }
+    if (ldc < N) {
+        throw std::runtime_error("int8_gemm: ldc=" + std::to_string(ldc) +
+                                 " is narrower than N=" + std::to_string(N));
+    }
+    // Both the tile loader and the small-M GEMV read a row 16 bytes at a time; an
+    // unaligned K would take the last chunk past the end of the row. An empty GEMM
+    // does no reads, so this only applies once there is real work above.
+    if (K % 16 != 0) {
+        throw std::runtime_error("int8_gemm: K=" + std::to_string(K) +
+                                 " must be a multiple of 16");
+    }
+
+    EpiRowwise epi{static_cast<const float*>(scale_a), static_cast<const float*>(scale_b),
+                   scale_b_stride, bias, bias_code};
+
+    const int8_t* A = static_cast<const int8_t*>(a);
+    const int8_t* B = static_cast<const int8_t*>(b);
+
+    if (out_code == kBF16) {
+        launch_int8<__bf16>(A, B, static_cast<__bf16*>(c), M, N, K, ldc, epi, stream);
+    } else if (out_code == kF16) {
+        launch_int8<__half>(A, B, static_cast<__half*>(c), M, N, K, ldc, epi, stream);
+    } else if (out_code == kF32) {
+        launch_int8<float>(A, B, static_cast<float*>(c), M, N, K, ldc, epi, stream);
+    } else {
+        throw std::runtime_error("int8_gemm: unsupported output dtype");
+    }
+}
