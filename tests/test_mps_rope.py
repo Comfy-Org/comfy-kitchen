@@ -123,6 +123,34 @@ def test_paired_rms_rope_uses_each_scale(dtype, split_half):
     k_scale = (torch.rand(d, device=DEV) + 0.5).to(dtype)
     op = ck.rms_rope_split_half if split_half else ck.rms_rope
     eager_op = eager.rms_rope_split_half if split_half else eager.rms_rope
+    op_name = "rms_rope_split_half" if split_half else "rms_rope"
+    call = {"q": q, "k": k, "freqs_cis": fr, "q_scale": q_scale, "k_scale": k_scale,
+            "epsilon": 1e-6}
+    assert registry.get_capable_backend(op_name, call) == "mps"
+    got = op(q, k, fr, q_scale, k_scale, 1e-6)
+    stock = eager_op(q, k, fr, q_scale, k_scale, 1e-6)
+    ref = eager_op(q.float().cpu(), k.float().cpu(), fr.cpu(), q_scale.float().cpu(),
+                   k_scale.float().cpu(), 1e-6)
+    for g, s, r in zip(got, stock, ref, strict=True):
+        assert_close_to_reference(g, s, r)
+
+
+@pytest.mark.parametrize("split_half", [False, True], ids=["interleaved", "split_half"])
+@pytest.mark.parametrize("dtype", DTYPES, ids=lambda d: str(d)[6:])
+def test_paired_rms_rope_allows_different_head_counts(dtype, split_half):
+    torch.manual_seed(0)
+    b, n, d = 2, 9, 64
+    q = torch.randn(b, n, 4, d, device=DEV, dtype=dtype)
+    k = torch.randn(b, n, 2, d, device=DEV, dtype=dtype)
+    fr = freqs_for((1, n, 1), d // 2)
+    q_scale = (torch.rand(d, device=DEV) + 0.5).to(dtype)
+    k_scale = (torch.rand(d, device=DEV) + 0.5).to(dtype)
+    op = ck.rms_rope_split_half if split_half else ck.rms_rope
+    eager_op = eager.rms_rope_split_half if split_half else eager.rms_rope
+    op_name = "rms_rope_split_half" if split_half else "rms_rope"
+    call = {"q": q, "k": k, "freqs_cis": fr, "q_scale": q_scale, "k_scale": k_scale,
+            "epsilon": 1e-6}
+    assert registry.get_capable_backend(op_name, call) == "mps"
     got = op(q, k, fr, q_scale, k_scale, 1e-6)
     stock = eager_op(q, k, fr, q_scale, k_scale, 1e-6)
     ref = eager_op(q.float().cpu(), k.float().cpu(), fr.cpu(), q_scale.float().cpu(),
