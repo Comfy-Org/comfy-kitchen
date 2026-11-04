@@ -19,8 +19,8 @@ from comfy_kitchen.constraints import rms_rope_norm_over_heads_call_rule
 from comfy_kitchen.registry import registry
 
 
-def _freqs(seq, head_dim, device="cpu", batch=1):
-    pos = torch.arange(seq, dtype=torch.float32, device=device)[:, None]
+def _freqs(seq, head_dim, device="cpu", batch=1, start=0):
+    pos = torch.arange(start, start + seq, dtype=torch.float32, device=device)[:, None]
     omega = 1.0 / (10000 ** (torch.arange(head_dim // 2, dtype=torch.float32, device=device) * 2 / head_dim))
     ang = pos * omega
     f = torch.stack([ang.cos(), -ang.sin(), ang.sin(), ang.cos()], -1).reshape(1, seq, 1, head_dim // 2, 2, 2)
@@ -130,8 +130,11 @@ class TestNormOverHeadsTriton:
     def test_freqs_broadcast_over_seq(self):
         b, s, h, d = 1, 64, 4, 128
         q, k, qs, ks = _make(b, s, h, d, torch.bfloat16, "cuda")
-        f = _freqs(1, d, "cuda")
+        f = _freqs(1, d, "cuda", start=7)  # position 0 is the identity rotation
         q4, k4 = q.view(b, s, h, d), k.view(b, s, h, d)
+        kwargs = {"q": q4, "k": k4, "freqs_cis": f, "q_scale": qs, "k_scale": ks,
+                  "epsilon": 1e-6, "norm_over_heads": True}
+        assert registry.validate_backend_for_call("triton", "rms_rope", kwargs).success
         with ck.use_backend("triton"):
             got = ck.rms_rope(q4, k4, f, qs, ks, 1e-6, norm_over_heads=True)
         ref = eager_backend.rms_rope(q4, k4, f, qs, ks, 1e-6, norm_over_heads=True)
