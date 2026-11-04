@@ -75,6 +75,18 @@ class TestL2NormSiluTriton:
         assert _rel(got, ref32) < tol
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_weight_rounded_to_x_dtype(self, dtype):
+        # the reference multiplies by gamma.to(x): an fp32 weight must give exactly the output of
+        # the same weight rounded to x's dtype first (the tolerance tests are too loose to see it)
+        x = torch.randn(1, 64, 2, 8, 8, dtype=dtype, device="cuda") * 3
+        g = torch.rand(64, device="cuda") + 0.5
+        assert not torch.equal(g.to(dtype).float(), g)
+        with ck.use_backend("triton"):
+            got = ck.l2_norm_silu(x, g, 8.0)
+            rounded = ck.l2_norm_silu(x, g.to(dtype), 8.0)
+        assert torch.equal(got, rounded)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_zero_channel_vector_matches_eager(self, dtype):
         # F.normalize rounds eps to x's dtype: 1e-12 is 0 in fp16, so a zero vector is 0 / 0 = NaN
         # there and 0 in bf16. The Triton kernel must give the same as eager in both.
