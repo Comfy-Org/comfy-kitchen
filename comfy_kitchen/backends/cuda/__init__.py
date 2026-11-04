@@ -4770,7 +4770,7 @@ def _build_constraints() -> dict:
         "quantize_nvfp4": FunctionConstraints(
             params={
                 "x": ParamConstraint(
-                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
                     shape_rules=(ExactDims(2),),
                 ),
                 "per_tensor_scale": ParamConstraint(
