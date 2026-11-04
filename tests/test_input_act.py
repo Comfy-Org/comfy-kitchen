@@ -88,3 +88,12 @@ def test_compiles_rms_norm_with_a_weight():
 def test_op_rejects_an_odd_last_dim(act, width):
     with pytest.raises(ValueError, match="needs an even last dim"):
         torch.ops.comfy_kitchen.input_act(torch.randn(2, width), act, None, 0.0)
+
+
+@pytest.mark.parametrize("act", ["gelu_tanh", "rms_norm"])
+def test_float64_takes_the_eager_path(act):
+    x = torch.randn(2, 8, dtype=torch.float64)
+    weight = torch.rand(8, dtype=torch.float64) if act == "rms_norm" else None
+    out = ck.input_act(x, act, weight, 1e-6)
+    assert out.dtype == torch.float64
+    assert torch.equal(out, apply_input_act(x, act, weight, 1e-6))
