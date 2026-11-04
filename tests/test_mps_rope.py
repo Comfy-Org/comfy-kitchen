@@ -77,7 +77,12 @@ def test_rope_matches_eager(dtype, shape, layout, split_half):
     rms, rms_ck = (
         (eager.rms_rope_split_half1, ck.rms_rope_split_half1) if split_half
         else (eager.rms_rope1, ck.rms_rope1))
-    assert registry.get_capable_backend("apply_rope1", {"x": x, "freqs_cis": fr}) == "mps"
+    plain_op = "apply_rope_split_half1" if split_half else "apply_rope1"
+    assert registry.get_capable_backend(plain_op, {"x": x, "freqs_cis": fr}) == "mps"
+    rms_op = "rms_rope_split_half1" if split_half else "rms_rope1"
+    assert registry.get_capable_backend(
+        rms_op, {"x": x, "freqs_cis": fr, "scale": w, "epsilon": 1e-6}
+    ) == "mps"
     assert_close_to_reference(plain_ck(x, fr), plain(x, fr), plain(x.float().cpu(), fr.cpu()))
     assert_close_to_reference(rms_ck(x, fr, w, 1e-6), rms(x, fr, w, 1e-6),
                               rms(x.float().cpu(), fr.cpu(), w.float().cpu(), 1e-6))
