@@ -66,9 +66,11 @@ __all__ = [
 import torch
 
 from comfy_kitchen.constraints import (
+    DivisibleBy,
     ExactDims,
     FunctionConstraints,
     ParamConstraint,
+    ValidationResult,
     na3d_common_call_rule,
     sol_attn_common_call_rule,
     with_out_param,
@@ -584,12 +586,22 @@ def _build_constraints() -> dict:
     out["linear_geglu"] = FunctionConstraints(
         params={
             "x": ParamConstraint(dtypes=standard_floats),
-            "weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+            # Packed [h | gate]: an even row count splits into two equal halves.
+            "weight": ParamConstraint(
+                dtypes=standard_floats, shape_rules=(ExactDims(2), DivisibleBy(0, 2))
+            ),
             "bias": ParamConstraint(dtypes=standard_floats),
             "approximate": ParamConstraint(dtypes=frozenset({str})),
         },
         default_devices=all_devices,
     )
+
+    def _linear_swiglu_call_rule(kwargs):
+        w1, w3 = kwargs.get("w1"), kwargs.get("w3")
+        if w1 is not None and w3 is not None and w1.shape != w3.shape:
+            return ValidationResult.fail("w3", "must have w1's shape")
+        return ValidationResult.ok()
+
     out["linear_swiglu"] = FunctionConstraints(
         params={
             "x": ParamConstraint(dtypes=standard_floats),
@@ -599,6 +611,7 @@ def _build_constraints() -> dict:
             "b3": ParamConstraint(dtypes=standard_floats),
         },
         default_devices=all_devices,
+        call_rules=(_linear_swiglu_call_rule,),
     )
     out["int8_linear"] = FunctionConstraints(
         params={
