@@ -53,7 +53,7 @@ class TestStorage:
             q = torch.zeros(384, 1024 * bits // 8, device="cuda", dtype=torch.int8)
             assert eager_w4a8._w4a8_geometry(q, s_rel, 16) == (384, 1024, bits)
         with pytest.raises(ValueError):
-            eager_w4a8._w4a8_geometry(torch.zeros(384, 640, device="cuda", dtype=torch.int8), s_rel, 16)
+            eager_w4a8._w4a8_geometry(torch.zeros(384, 896, device="cuda", dtype=torch.int8), s_rel, 16)
 
     def test_six_bit_rejects_codebook_correction_and_k_not_multiple_of_32(self, seed):
         with pytest.raises(ValueError):
