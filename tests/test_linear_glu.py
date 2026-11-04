@@ -271,6 +271,14 @@ class TestLinearGeglu:
         h, gate = functional.linear(x, weight, bias).chunk(2, dim=-1)
         assert torch.equal(out, h * functional.gelu(gate))
 
+    def test_odd_packed_rows_rejected(self, seed):
+        """A packed weight with an odd row count has no [h | gate] split; no backend
+        takes it (the fake impl's N = rows // 2 would not match a chunked result)."""
+        x = torch.randn(3, 40)
+        weight = torch.randn(13, 40)
+        with pytest.raises(ck.NoCapableBackendError):
+            ck.linear_geglu(x, weight)
+
     def test_public_api(self):
         assert "linear_geglu" in ck.__all__
 
@@ -425,6 +433,13 @@ class TestLinearSwiglu:
         out = ck.linear_swiglu(x, w1, w3)
         ref = functional.silu(functional.linear(x, w1)) * functional.linear(x, w3)
         assert torch.equal(out, ref)
+
+    def test_mismatched_weights_rejected(self, seed):
+        """w1 and w3 of different shapes are not a SwiGLU pair; no backend takes them
+        (eager would broadcast a one-row gate, which the fake impl does not model)."""
+        x = torch.randn(3, 40)
+        with pytest.raises(ck.NoCapableBackendError):
+            ck.linear_swiglu(x, torch.randn(24, 40), torch.randn(1, 40))
 
     def test_public_api(self):
         assert "linear_swiglu" in ck.__all__
