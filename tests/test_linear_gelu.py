@@ -162,6 +162,27 @@ class TestLinearGelu:
         assert_values_close(out.float(), ref.float(), rtol=rtol, atol=atol,
                             name="linear_gelu[non-contiguous x]")
 
+    def test_strided_features_triton(self, seed, cuda_available):
+        """An x whose last dim is strided goes through the wrapper's copy to
+        contiguous rows before the triton kernel reads it."""
+        device = "cuda" if cuda_available else "cpu"
+        if "triton" not in get_capable_backends("linear_gelu", device):
+            pytest.skip(f"backend 'triton' not capable for linear_gelu on {device}")
+
+        x, weight, bias = _inputs((2, 512), 512, 512, torch.float16, device)
+        weight = weight[:, ::2].contiguous()
+        x = x[..., ::2]  # (2, 512, 256), last-dim stride 2
+        assert x.stride(-1) == 2
+        _skip_unless_served("triton", _kwargs(x, weight, bias))
+        with ck.use_backend("triton"):
+            out = ck.linear_gelu(x, weight, bias)
+        ref = _ref_linear_gelu(x, weight, bias)
+
+        rtol, atol = _tol(torch.float16)
+        assert out.shape == (2, 512, 512)
+        assert_values_close(out.float(), ref.float(), rtol=rtol, atol=atol,
+                            name="linear_gelu[strided features]")
+
     @pytest.mark.parametrize("n", [384, 640])
     def test_partial_n_tile_vs_eager(self, n, seed, cuda_available):
         """A served N (multiple of 128) that the BN 256 config does not divide: the
