@@ -9,6 +9,8 @@ written out between the norm and the activation. Other layouts are made
 contiguous first; the output is always contiguous.
 """
 
+import functools
+
 import torch
 
 import triton
@@ -44,6 +46,13 @@ def _l2_norm_silu_kernel(x_ptr, w_ptr, y_ptr, channels, positions, scale, eps,
                  v.to(y_ptr.dtype.element_ty), mask=msk)
 
 
+@functools.cache
+def _eps_in(dtype: torch.dtype, eps: float) -> float:
+    # F.normalize clamps the norm, a tensor of x's dtype, so eps is rounded to that dtype:
+    # the default 1e-12 is 0 in fp16, and an all-zero channel vector gives 0 / 0 = NaN there.
+    return float(torch.tensor(eps, dtype=dtype))
+
+
 def l2_norm_silu(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -57,6 +66,6 @@ def l2_norm_silu(
     # the reference rounds the weight to x's dtype (gamma.to(x)) before it multiplies
     w = weight.reshape(-1).to(x.dtype).contiguous()
     grid = (triton.cdiv(positions, _BLOCK_P), batch)
-    _l2_norm_silu_kernel[grid](x, w, y, channels, positions, float(scale), eps,
+    _l2_norm_silu_kernel[grid](x, w, y, channels, positions, float(scale), _eps_in(x.dtype, eps),
                                block_p=_BLOCK_P, block_c=_BLOCK_C, num_warps=_NUM_WARPS)
     return y

@@ -74,11 +74,20 @@ class TestL2NormSiluTriton:
         assert _rel(got, ref) < tol
         assert _rel(got, ref32) < tol
 
-    def test_zero_input_is_zero(self):
-        x = torch.zeros(1, 32, 2, 4, 4, dtype=torch.bfloat16, device="cuda")
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_zero_channel_vector_matches_eager(self, dtype):
+        # F.normalize rounds eps to x's dtype: 1e-12 is 0 in fp16, so a zero vector is 0 / 0 = NaN
+        # there and 0 in bf16. The Triton kernel must give the same as eager in both.
+        x = torch.randn(1, 32, 2, 4, 4, dtype=dtype, device="cuda")
+        x[0, :, 1, 2, 3] = 0
+        g = torch.rand(32, device="cuda") + 0.5
         with ck.use_backend("triton"):
-            got = ck.l2_norm_silu(x, torch.ones(32, device="cuda"), 32 ** 0.5)
-        assert torch.equal(got, torch.zeros_like(x))
+            got = ck.l2_norm_silu(x, g, 32 ** 0.5)
+        ref = eager_backend.l2_norm_silu(x, g, 32 ** 0.5)
+        assert torch.equal(torch.isnan(got), torch.isnan(ref))
+        assert torch.isnan(got[0, :, 1, 2, 3]).all() == (dtype == torch.float16)
+        keep = ~torch.isnan(ref)
+        assert _rel(got[keep], ref[keep]) < 1e-2
 
     def test_non_contiguous_input(self):
         x = torch.randn(1, 32, 3, 8, 8, dtype=torch.bfloat16, device="cuda")
