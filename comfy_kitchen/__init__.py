@@ -1091,7 +1091,8 @@ def linear_geglu(
     The fused (triton) path takes fp16/bf16 ``x``/``weight``/``bias`` of one dtype,
     ``approximate`` "none" or "tanh", weight rows contiguous with
     ``out_features % 128 == 0`` and ``in_features % 64 == 0``, and at least 256
-    rows of ``x``. Everything else runs the eager reference.
+    rows of ``x``. Other calls with an even weight row count and fp32 / fp16 / bf16
+    tensors of one dtype run the eager reference.
 
     Args:
         x: Input tensor (..., in_features).
@@ -1121,8 +1122,9 @@ def linear_swiglu(
 
     The fused (triton) path takes fp16/bf16 tensors of one dtype, ``w1`` and ``w3``
     of the same shape with contiguous rows, ``out_features % 64 == 0`` and
-    ``in_features % 64 == 0``, and at least 256 rows of ``x``. Everything else
-    runs the eager reference.
+    ``in_features % 64 == 0``, and at least 256 rows of ``x``. Other calls with
+    ``w1`` and ``w3`` of the same shape and fp32 / fp16 / bf16 tensors of one dtype
+    run the eager reference.
 
     Args:
         x: Input tensor (..., in_features).
