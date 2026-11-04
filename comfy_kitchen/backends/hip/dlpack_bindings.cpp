@@ -624,19 +624,22 @@ void memmove_bytes(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::rocm> dst,
     check_hip_launch();
 }
 
+// The geometry kernels dereference every operand on the device, so host memory has to be
+// rejected here, as the CUDA bindings do with their nb::device::cuda operand types.
+using rocm_array = nb::ndarray<nb::device::rocm>;
+
 // Union-find connected components; see ops/connected_components.hip.
-void connected_components(nb::ndarray<> edges, int64_t n_edges, bool edges_int64, int n_nodes, nb::ndarray<> parent,
-                          nb::ndarray<> labels, uintptr_t stream_ptr) {
+void connected_components(rocm_array edges, int64_t n_edges, bool edges_int64, int n_nodes, rocm_array parent,
+                          rocm_array labels, uintptr_t stream_ptr) {
     launch_connected_components(edges.data(), n_edges, edges_int64, n_nodes, parent.data(), labels.data(),
                                 reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
 // Flip / skinny / link checks for candidate edge collapses; see ops/edge_collapse.hip.
-void edge_collapse_checks(nb::ndarray<> verts, nb::ndarray<> faces, nb::ndarray<> offsets, nb::ndarray<> cursor,
-                          nb::ndarray<> fan, nb::ndarray<> edges, nb::ndarray<> positions, int n_corners, int n_edges,
-                          float cos_threshold, nb::ndarray<> flips, nb::ndarray<> skinny, nb::ndarray<> link_ok,
-                          uintptr_t stream_ptr) {
+void edge_collapse_checks(rocm_array verts, rocm_array faces, rocm_array offsets, rocm_array cursor, rocm_array fan,
+                          rocm_array edges, rocm_array positions, int n_corners, int n_edges, float cos_threshold,
+                          rocm_array flips, rocm_array skinny, rocm_array link_ok, uintptr_t stream_ptr) {
     launch_edge_collapse_checks(verts.data(), faces.data(), offsets.data(), cursor.data(), fan.data(), edges.data(),
                                 positions.data(), n_corners, n_edges, cos_threshold, flips.data(), skinny.data(),
                                 link_ok.data(), reinterpret_cast<hipStream_t>(stream_ptr));
