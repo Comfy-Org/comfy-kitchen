@@ -73,6 +73,24 @@ def _require(backend, device="cuda"):
         pytest.skip(f"backend '{backend}' not capable for act_cat_quantize_fp8 on {device}")
 
 
+def _triton_refusal():
+    """Why triton's call rule refuses a plain bf16 call on this GPU (e.g. a ROCm arch
+    other than gfx12), or None where triton serves it."""
+    x = torch.zeros(2, 8, device="cuda", dtype=torch.bfloat16)
+    h = torch.zeros(2, 16, device="cuda", dtype=torch.bfloat16)
+    kwargs = _kwargs(x, h, _scale(1.0, "cuda"))
+    valid = ck.registry.validate_backend_for_call("triton", "act_cat_quantize_fp8", kwargs)
+    return None if valid.success else valid.failure_reason
+
+
+def _require_served():
+    """triton is available and its call rule serves this GPU."""
+    _require("triton")
+    reason = _triton_refusal()
+    if reason is not None:
+        pytest.skip(f"triton does not serve act_cat_quantize_fp8 here: {reason}")
+
+
 def _native_quant_backend():
     """The compiled per-tensor quantizer the triton op reproduces: cuda, or hip under ROCm."""
     name = "hip" if IS_HIP else "cuda"
@@ -138,7 +156,7 @@ class TestActCatQuantizeFp8Triton:
     def test_matches_native_quantizer(self, act, dtype, shape, scale, seed):
         """Bit-identical to act + cat + the compiled CUDA (HIP) quantizer, with NaN and inf
         in x (copied as they are) and saturating values in both parts."""
-        _require("triton")
+        _require_served()
         native = _native_quant_backend()
         lead, dx, dm = shape
         x, h = _inputs(lead, dx, dm, act, dtype, "cuda")
@@ -162,7 +180,7 @@ class TestActCatQuantizeFp8Triton:
         """Against act + cat + kitchen's triton quantizer, finite inputs. Under CUDA both
         divide the same way, so the bytes are equal; under ROCm the op follows the HIP
         quantizer's fast division, which rounds a few values one fp8 step apart."""
-        _require("triton")
+        _require_served()
         lead, dx, dm = shape
         x, h = _inputs(lead, dx, dm, act, dtype, "cuda")
         st = _scale(scale, "cuda")
@@ -181,7 +199,7 @@ class TestActCatQuantizeFp8Triton:
     @pytest.mark.parametrize("act", ACTS)
     def test_every_bf16_value(self, act, seed):
         """Every bf16 bit pattern in both inputs (x copied, h activated), three scales."""
-        _require("triton")
+        _require_served()
         vals = torch.arange(-32768, 32768, dtype=torch.int32, device="cuda")
         vals = vals.to(torch.int16).view(torch.bfloat16).reshape(128, 512)
         other = (torch.randn(128, 512, device="cuda") * 4).to(torch.bfloat16)
@@ -201,7 +219,7 @@ class TestActCatQuantizeFp8Triton:
     def test_flux2_klein_block(self, scale, seed):
         """Flux.2 Klein single block: attn (B, N, 3072) and h = the MLP slice (B, N, 18432)
         of linear1's (B, N, 3 * 3072 + 18432) bf16 output, swiglu."""
-        _require("triton")
+        _require_served()
         b, n, d, dm = 2, 300, 3072, 9216
         lin1 = (torch.randn(b, n, 3 * d + 2 * dm, device="cuda") * 2.5).to(torch.bfloat16)
         attn = (torch.randn(b, n, d, device="cuda") * 0.7).to(torch.bfloat16)
@@ -215,7 +233,7 @@ class TestActCatQuantizeFp8Triton:
 
     def test_non_contiguous_x(self, seed):
         """x with strided rows (a column slice) is read in place."""
-        _require("triton")
+        _require_served()
         x = torch.randn(130, 1024, device="cuda", dtype=torch.bfloat16)[:, 100:612]
         _, h = _inputs((130,), 1, 384, "swiglu", torch.bfloat16, "cuda")
         st = _scale(0.25, "cuda")
@@ -224,7 +242,7 @@ class TestActCatQuantizeFp8Triton:
         assert _mismatch(out, ref, keep) == 0
 
     def test_zero_rows(self):
-        _require("triton")
+        _require_served()
         x = torch.empty(3, 0, 64, device="cuda", dtype=torch.bfloat16)
         h = torch.empty(3, 0, 128, device="cuda", dtype=torch.bfloat16)
         out = _triton(x, h, _scale(1.0, "cuda"), "swiglu")
@@ -292,6 +310,21 @@ class TestActCatQuantizeFp8Eager:
         out = ck.act_cat_quantize_fp8(x, h, st, "swiglu", output_type)
         cat = torch.cat((x, _act(h, "swiglu")), dim=-1)
         assert _mismatch(out, ck.quantize_per_tensor_fp8(cat, st, output_type)) == 0
+
+    @pytest.mark.parametrize("act", ACTS)
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_unserved_gpu_runs_unfused(self, act, dtype, seed):
+        """Where triton's call rule refuses the GPU itself (a ROCm arch other than
+        gfx12), the public op runs eager and returns what the unfused calls return."""
+        _require("triton")
+        if _triton_refusal() is None:
+            pytest.skip("triton serves act_cat_quantize_fp8 on this GPU")
+        x, h = _inputs((2, 45), 512, 1024, act, dtype, "cuda")
+        st = _scale(0.3589285612106323, "cuda")
+        kwargs = _kwargs(x, h, st, act)
+        assert ck.registry.get_capable_backend("act_cat_quantize_fp8", kwargs) == "eager"
+        out = ck.act_cat_quantize_fp8(x, h, st, act)
+        assert _mismatch(out, _unfused(x, h, st, act)) == 0
 
     def test_invalid_act(self, device):
         x = torch.zeros(4, 8, device=device)
