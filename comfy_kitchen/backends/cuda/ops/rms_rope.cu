@@ -27,6 +27,299 @@
 #include <cstdint>
 #include <type_traits>
 
+namespace comfy::optimized {
+inline int device_sm() {
+  int current;
+  CUDA_CHECK(cudaGetDevice(&current));
+  static thread_local int cached_device = -1, sm = 0;
+  if (current != cached_device) {
+    cudaDeviceProp props{};
+    CUDA_CHECK(cudaGetDeviceProperties(&props, current));
+    sm = props.major * 10 + props.minor;
+    cached_device = current;
+  }
+  return sm;
+}
+inline bool overlap(const void *a, const void *b, uint64_t bytes) {
+  auto x = reinterpret_cast<uintptr_t>(a), y = reinterpret_cast<uintptr_t>(b);
+  return x <= y ? y - x < bytes : x - y < bytes;
+}
+
+// Reuse a token's general FP32 2x2 matrices across 16 heads, keeping Q and K
+// in separate half-warps. Four BF16 head buffers hide input load latency.
+// FP32 statistics and the BF16 normalization materialization are preserved.
+template <int V> union Packed {
+  uint4 v4[(V + 7) / 8];
+  uint64_t v2[(V + 3) / 4];
+  __nv_bfloat162 h[V / 2];
+};
+template <int V>
+__device__ __forceinline__ void storep(__nv_bfloat16 *x, const Packed<V> &a) {
+  if constexpr (V >= 8) {
+#pragma unroll
+    for (int j = 0; j < V / 8; j++)
+      reinterpret_cast<uint4 *>(x)[j] = a.v4[j];
+  } else
+    *reinterpret_cast<uint64_t *>(x) = a.v2[0];
+}
+__device__ __forceinline__ float rsqrt_fast(float x) {
+  float y;
+  asm("rsqrt.approx.ftz.f32 %0,%1;" : "=f"(y) : "f"(x));
+  return y;
+}
+__device__ __forceinline__ float2 expand2(__nv_bfloat162 x) {
+  union {
+    __nv_bfloat162 h;
+    uint32_t u;
+  } a;
+  a.h = x;
+  return make_float2(__uint_as_float(a.u << 16),
+                     __uint_as_float(a.u & 0xffff0000u));
+}
+__device__ __forceinline__ float expand1(__nv_bfloat16 x) {
+  union {
+    __nv_bfloat16 h;
+    uint16_t u;
+  } a;
+  a.h = x;
+  return __uint_as_float(uint32_t(a.u) << 16);
+}
+template <bool SPLIT>
+__device__ __forceinline__ void readrow(Packed<8> &v, const __nv_bfloat16 *x,
+                                        uint32_t row, int lane, bool valid) {
+  if (!valid) {
+    v.v4[0] = make_uint4(0, 0, 0, 0);
+    return;
+  }
+  if constexpr (SPLIT) {
+    v.v2[0] =
+        *reinterpret_cast<const uint64_t *>(x + (uint64_t)row * 128 + lane * 4);
+    v.v2[1] = *reinterpret_cast<const uint64_t *>(x + (uint64_t)row * 128 + 64 +
+                                                  lane * 4);
+  } else
+    v.v4[0] =
+        *reinterpret_cast<const uint4 *>(x + (uint64_t)row * 128 + lane * 8);
+}
+template <bool SPLIT, bool WF32>
+__global__ void
+rms_rope_pipelined(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
+                   const float4 *__restrict__ f, const void *__restrict__ wq,
+                   const void *__restrict__ wk, __nv_bfloat16 *oq,
+                   __nv_bfloat16 *ok, int B, int H, int T, bool bnhd,
+                   float eps) {
+  constexpr int G = 16, STAGES = 4, V = 8, P = 4;
+  int lane = threadIdx.x % 32, lc = lane % 16;
+  bool isk = lane >= 16;
+  const __nv_bfloat16 *x = isk ? k : q;
+  __nv_bfloat16 *y = isk ? ok : oq;
+  const void *w = isk ? wk : wq;
+  const uint32_t head_tiles = (H + G - 1) / G,
+                 tiles = (uint64_t)B * (uint32_t)T * head_tiles;
+  const bool pow2 = (T & (T - 1)) == 0;
+  const int tsh = __ffs(T) - 1;
+  for (uint32_t tile = ((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+       tile < tiles; tile += gridDim.x * (blockDim.x >> 5)) {
+    uint32_t token, bh, batch, hb;
+    if (pow2) {
+      token = tile & ((uint32_t)T - 1);
+      bh = tile >> tsh;
+    } else {
+      bh = tile / (uint32_t)T;
+      token = tile - bh * (uint32_t)T;
+    }
+    if (B == 1) {
+      batch = 0;
+      hb = bh * G;
+    } else if (head_tiles == 1) {
+      batch = bh;
+      hb = 0;
+    } else {
+      batch = bh / head_tiles;
+      hb = (bh - batch * head_tiles) * G;
+    }
+    float4 ff[P];
+    float2 ww[P];
+#pragma unroll
+    for (int p = 0; p < P; p++) {
+      int pair = lc * P + p, c0 = SPLIT ? pair : pair * 2,
+          c1 = SPLIT ? pair + 64 : pair * 2 + 1;
+      ff[p] = f[(uint64_t)token * 64 + pair];
+      if constexpr (WF32)
+        ww[p] = make_float2(((const float *)w)[c0], ((const float *)w)[c1]);
+      else
+        ww[p] = make_float2(expand1(((const __nv_bfloat16 *)w)[c0]),
+                            expand1(((const __nv_bfloat16 *)w)[c1]));
+    }
+    Packed<V> buf[STAGES];
+#pragma unroll
+    for (int s = 0; s < STAGES; s++) {
+      int head = hb + s;
+      uint32_t row = bnhd ? (batch * (uint32_t)T + token) * (uint32_t)H + head
+                          : (batch * (uint32_t)H + head) * (uint32_t)T + token;
+      readrow<SPLIT>(buf[s], x, row, lc, head < H);
+    }
+#pragma unroll
+    for (int g = 0; g < G; g++) {
+      int head = hb + g;
+      bool valid = head < H;
+      uint32_t row = bnhd ? (batch * (uint32_t)T + token) * (uint32_t)H + head
+                          : (batch * (uint32_t)H + head) * (uint32_t)T + token;
+      float2 xx[P];
+      float sum = 0;
+      if constexpr (SPLIT) {
+#pragma unroll
+        for (int j = 0; j < P / 2; j++) {
+          float2 l = expand2(buf[g % STAGES].h[j]),
+                 h = expand2(buf[g % STAGES].h[j + P / 2]);
+          xx[2 * j] = make_float2(l.x, h.x);
+          xx[2 * j + 1] = make_float2(l.y, h.y);
+        }
+      } else {
+#pragma unroll
+        for (int p = 0; p < P; p++)
+          xx[p] = expand2(buf[g % STAGES].h[p]);
+      }
+      if constexpr (STAGES < G) {
+        if (g + STAGES < G) {
+          int fh = hb + g + STAGES;
+          uint32_t fr = bnhd ? (batch * (uint32_t)T + token) * (uint32_t)H + fh
+                             : (batch * (uint32_t)H + fh) * (uint32_t)T + token;
+          readrow<SPLIT>(buf[g % STAGES], x, fr, lc, fh < H);
+        }
+      }
+#pragma unroll
+      for (int p = 0; p < P; p++)
+        sum += xx[p].x * xx[p].x + xx[p].y * xx[p].y;
+#pragma unroll
+      for (int delta = 8; delta; delta /= 2)
+        sum += __shfl_xor_sync(0xffffffff, sum, delta, 16);
+      float inv = rsqrt_fast(sum * (1.f / 128.f) + eps);
+      Packed<V> out;
+      Packed<P> lo, hi;
+      if constexpr (SPLIT) {
+#pragma unroll
+        for (int j = 0; j < P / 2; j++) {
+          int p = 2 * j;
+          float4 a = ff[p], b = ff[p + 1];
+          float2 n = expand2(__floats2bfloat162_rn(xx[p].x * inv * ww[p].x,
+                                                   xx[p].y * inv * ww[p].y));
+          float2 m =
+              expand2(__floats2bfloat162_rn(xx[p + 1].x * inv * ww[p + 1].x,
+                                            xx[p + 1].y * inv * ww[p + 1].y));
+          float a0 = fmaf(a.y, n.y, a.x * n.x), a1 = fmaf(a.z, n.x, a.w * n.y),
+                b0 = fmaf(b.y, m.y, b.x * m.x), b1 = fmaf(b.z, m.x, b.w * m.y);
+          lo.h[j] = __floats2bfloat162_rn(a0, b0);
+          hi.h[j] = __floats2bfloat162_rn(a1, b1);
+        }
+      } else {
+#pragma unroll
+        for (int p = 0; p < P; p++) {
+          float4 a = ff[p];
+          float2 n = expand2(__floats2bfloat162_rn(xx[p].x * inv * ww[p].x,
+                                                   xx[p].y * inv * ww[p].y));
+          out.h[p] = __floats2bfloat162_rn(fmaf(a.y, n.y, a.x * n.x),
+                                           fmaf(a.z, n.x, a.w * n.y));
+        }
+      }
+      if (valid) {
+        if constexpr (SPLIT) {
+          storep<P>(y + (uint64_t)row * 128 + lc * P, lo);
+          storep<P>(y + (uint64_t)row * 128 + 64 + lc * P, hi);
+        } else
+          storep<V>(y + (uint64_t)row * 128 + lc * V, out);
+      }
+    }
+  }
+}
+
+template <bool Split, bool FP32Weights>
+inline void
+launch_rms_rope_pipelined(const void *q, const void *k, const void *freqs,
+                          const void *wq, const void *wk, void *oq, void *ok,
+                          int batch, int heads, int tokens, bool bnhd,
+                          float epsilon, cudaStream_t stream) {
+  const int threads = Split && !FP32Weights ? 64 : 128;
+  const int tiles = batch * tokens * ((heads + 15) / 16);
+  const int blocks = (tiles + threads / 32 - 1) / (threads / 32);
+  rms_rope_pipelined<Split, FP32Weights><<<blocks, threads, 0, stream>>>(
+      static_cast<const __nv_bfloat16 *>(q),
+      static_cast<const __nv_bfloat16 *>(k), static_cast<const float4 *>(freqs),
+      wq, wk, static_cast<__nv_bfloat16 *>(oq),
+      static_cast<__nv_bfloat16 *>(ok), batch, heads, tokens, bnhd, epsilon);
+}
+inline bool try_rms_rope(const void *q, const void *k, const void *freqs,
+                         const void *wq, const void *wk, void *oq, void *ok,
+                         int64_t batch, int64_t dim1, int64_t dim2,
+                         int64_t head_dim, int64_t rot_dim, int64_t fb,
+                         int64_t f1, int64_t f2, const int64_t *qs,
+                         const int64_t *ks, const int64_t *os,
+                         const int64_t *ps, const int64_t *fs, int64_t wqs,
+                         int64_t wks, float epsilon, int input_dtype,
+                         int freq_dtype, int weight_dtype, bool has_k,
+                         bool split, cudaStream_t stream) {
+  if (!has_k || input_dtype != 2 || freq_dtype != 0 ||
+      (weight_dtype != 0 && weight_dtype != 2) || head_dim != 128 ||
+      rot_dim != 128 || wqs != 1 || wks != 1 || fb != 1 || batch < 1 ||
+      batch > 2)
+    return false;
+  bool bnhd;
+  int64_t heads, tokens;
+  if (f1 == 1 && f2 == dim2) {
+    bnhd = false;
+    heads = dim1;
+    tokens = dim2;
+  } else if (f2 == 1 && f1 == dim1) {
+    bnhd = true;
+    heads = dim2;
+    tokens = dim1;
+  } else
+    return false;
+  // Bound all row/tile indexing before forming products or pointer ranges.
+  if ((heads != 8 && heads != 16 && heads != 32) || tokens < 1024 ||
+      tokens > 32768 || (tokens & (tokens - 1)))
+    return false;
+  if (batch * heads * tokens < 32768)
+    return false;
+  const int64_t expected[4] = {dim1 * dim2 * 128, dim2 * 128, 128, 1};
+  for (int i = 0; i < 4; ++i)
+    if (qs[i] != expected[i] || ks[i] != expected[i] || os[i] != expected[i] ||
+        ps[i] != expected[i])
+      return false;
+  if (fs[3] != 4 || fs[4] != 2 || fs[5] != 1 || fs[bnhd ? 1 : 2] != 256)
+    return false;
+  if (!aligned_to(q, 16) || !aligned_to(k, 16) || !aligned_to(oq, 16) ||
+      !aligned_to(ok, 16) || !aligned_to(freqs, 16))
+    return false;
+  const uint64_t bytes = batch * heads * tokens * 128 * 2;
+  if (overlap(q, oq, bytes) || overlap(q, ok, bytes) || overlap(k, oq, bytes) ||
+      overlap(k, ok, bytes) || overlap(oq, ok, bytes))
+    return false;
+  const int sm = device_sm();
+  if ((sm != 90 && sm != 103 && sm != 120) || (bnhd && sm != 90) ||
+      (sm == 120 && heads < 16))
+    return false;
+#define LAUNCH(SPLIT, FP32)                                                    \
+  launch_rms_rope_pipelined<SPLIT, FP32>(q, k, freqs, wq, wk, oq, ok, batch,   \
+                                         heads, tokens, bnhd, epsilon, stream)
+  if (split) {
+    if (weight_dtype == 0) {
+      LAUNCH(true, true);
+    } else {
+      LAUNCH(true, false);
+    }
+  } else {
+    if (weight_dtype == 0) {
+      LAUNCH(false, true);
+    } else {
+      LAUNCH(false, false);
+    }
+  }
+#undef LAUNCH
+  CUDA_CHECK(cudaGetLastError());
+  return true;
+}
+} // namespace comfy::optimized
+
 namespace comfy {
 namespace {
 
@@ -363,6 +656,15 @@ extern "C" void launch_rms_rope_kernel(
     int64_t ks_stride, float epsilon, int input_dtype_code,
     int freqs_dtype_code, int scale_dtype_code, bool has_k, bool split_half,
     cudaStream_t stream) {
+  const int64_t qs[] = {q_s0,q_s1,q_s2,q_s3};
+  const int64_t ks[] = {k_s0,k_s1,k_s2,k_s3};
+  const int64_t os[] = {qo_s0,qo_s1,qo_s2,qo_s3};
+  const int64_t ps[] = {ko_s0,ko_s1,ko_s2,ko_s3};
+  const int64_t fs[] = {f_s0,f_s1,f_s2,f_s3,f_s4,f_s5};
+  if (comfy::optimized::try_rms_rope(q,k,freqs,q_scale,k_scale,q_out,k_out,
+      batch,dim1,dim2,head_dim,rot_dim,freqs_batch,freqs_dim1,freqs_dim2,
+      qs,ks,os,ps,fs,qs_stride,ks_stride,epsilon,input_dtype_code,
+      freqs_dtype_code,scale_dtype_code,has_k,split_half,stream)) return;
   DISPATCH_HALF_DTYPE(input_dtype_code, InputType, [&] {
     DISPATCH_FP_DTYPE(freqs_dtype_code, FreqsType, [&] {
       DISPATCH_FP_DTYPE(scale_dtype_code, ScaleType, [&] {

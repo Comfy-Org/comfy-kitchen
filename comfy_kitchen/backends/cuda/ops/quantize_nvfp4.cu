@@ -14,206 +14,73 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "utils.cuh"
-#include "float_utils.cuh"
 #include "dtype_dispatch.cuh"
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include "float_utils.cuh"
+#include "utils.cuh"
 #include <cfloat>
-#include <cuda/barrier>
 #include <stdexcept>
 
-
 namespace comfy {
-
-constexpr unsigned int kValsPerThread = 4; // Can only be 2 or 4
-constexpr unsigned int kBlockSize = 16; // Always 16 for NVFP4
-constexpr unsigned int kThreadsPerGroup = kBlockSize / kValsPerThread;  // 4 threads per group (with kValsPerThread=4)
-
 namespace {
-
-/*
- * FP4 E2M1 Block Quantization with E4M3 Scales
- *  https://docs.nvidia.com/cuda/cublas/index.html#d-block-quantization
- * 
- * Algorithm:
- *   1. Load kValsPerThread values per thread and compute local absmax
- *   2. Shuffle-down reduction to get single absmax per block of kBlockSize values
- *   3. Compute decode_scale = absmax / FP4_MAX / global_decode_scale
- *   4. Clamp decode_scale to E4M3 range and store as FP8 E4M3 in swizzled layout
- *   5. Compute encode_scale = 1.0 / (decode_scale * global_decode_scale) = FP4_MAX / absmax
- *   6. Encode values: multiply by encode_scale and convert to FP4 E2M1
- * 
- * Block Scale Layout (swizzled):
- *   - One scale per block of kBlockSize (16) elements
- *   - Uses swizzled layout: 128-row base blocks, 4-column groups
- *   - Layout: (rb_cnt, cbg_cnt, 32, 4, 4) reshaped to (M_padded, N_blocks_padded)
- *   - M_padded = RoundUp(M, 128), N_blocks_padded = RoundUp(N/16, 4)
- *   - Only group leader (lane_id % kThreadsPerGroup == 0) writes scale
- * 
- * With kValsPerThread=4, kBlockSize=16:
- *   - 4 threads per group, 8 groups per warp
- *   - 2 shuffle iterations (log2(4))
- */
-template <
-    typename IType,
-    typename OType=__nv_fp4x2_e2m1,
-    typename ScaleType=__nv_fp8_e4m3,
-    bool Misaligned = false,
-    bool HiFirst = true>
-__global__ void quantize_nvfp4_kernel(
-    const IType* const input,
-    const float* global_scale, // absmax(input) / (6.0 * 488.0)
-    OType* const output,
-    ScaleType* const block_scales,
-    const size_t num_cols,
-    const size_t num_rows,
-    const size_t orig_rows,
-    const size_t orig_cols,
-    const float epsilon) {
-
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    // Storage for values - loaded differently based on Misaligned template
-    IType vals[kValsPerThread];
-    
-    if constexpr (Misaligned) {
-        // Misaligned path: load kValsPerThread values one at a time with 2D bounds checking
-        // 
-        // elem_idx is in PADDED coordinate space (num_rows x num_cols layout)
-        // but input tensor memory is in ORIGINAL coordinate space (orig_rows x orig_cols layout)
-        const size_t base_elem_idx = static_cast<size_t>(idx) * kValsPerThread;
-        
+// Identical group ownership and arithmetic on every GPU.
+template <typename Input, int V, bool Masked, bool HiFirst>
+__global__ void
+quantize_nvfp4_kernel(const Input *input, const float *global_scale,
+                      uint8_t *output, __nv_fp8_e4m3 *scales, uint64_t groups,
+                      uint64_t runtime_columns, uint64_t original_rows,
+                      uint64_t original_columns) {
+  constexpr int threads_per_group = 16 / V;
+  const uint64_t columns = runtime_columns;
+  const uint64_t chunk = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  {
+    const uint64_t group = chunk / threads_per_group;
+    const auto values = quantization::load_group<Input, V, Masked>(
+        input, chunk, columns, original_rows, original_columns);
+    float maximum = quantization::group_absmax(values);
+    if constexpr (threads_per_group > 1) {
 #pragma unroll
-        for (int i = 0; i < kValsPerThread; i++) {
-            const size_t elem_idx = base_elem_idx + i;
-            const size_t row = elem_idx / num_cols;
-            const size_t col = elem_idx % num_cols;
-            
-            if (row < orig_rows && col < orig_cols) {
-                vals[i] = input[row * orig_cols + col];
-            } else {
-                vals[i] = static_cast<IType>(0.0f);
-            }
-        }
-    } else {
-        // Aligned path: vectorized load of kValsPerThread values
-        const IType *vals_ptr = (kValsPerThread == 2) 
-            ? load_f16x2(input + kValsPerThread * idx)
-            : load_f16x4(input + kValsPerThread * idx);
-        
+      for (int offset = threads_per_group / 2; offset; offset /= 2)
+        maximum = fmaxf(maximum, __shfl_down_sync(0xffffffff, maximum, offset,
+                                                  threads_per_group));
+      maximum = __shfl_sync(0xffffffff, maximum, 0, threads_per_group);
+    }
+    const float tensor_scale = global_scale[0];
+    const __nv_fp8_e4m3 scale(
+        fminf(__fdividef(maximum * (1.0f / 6.0f), tensor_scale), 448.0f));
+    const float encode =
+        fminf(__fdividef(1.0f, float(scale) * tensor_scale), FLT_MAX);
+    if (threadIdx.x % threads_per_group == 0) {
+      const uint64_t row = group / (columns / 16), col = group % (columns / 16);
+      scales[scale_factor_swizzled_offset(row, col, columns / 16)] = scale;
+    }
+    union {
+      uint64_t word;
+      uint16_t short_word;
+      __nv_fp4x2_storage_t pairs[V / 2];
+    } packed;
 #pragma unroll
-        for (int i = 0; i < kValsPerThread; i++) {
-            vals[i] = vals_ptr[i];
-        }
+    for (int i = 0; i < V / 2; ++i) {
+      const float a = float(values.values[2 * i]) * encode;
+      const float b = float(values.values[2 * i + 1]) * encode;
+      packed.pairs[i] = __nv_cvt_float2_to_fp4x2(HiFirst ? make_float2(b, a)
+                                                         : make_float2(a, b),
+                                                 __NV_E2M1, cudaRoundNearest);
     }
-
-    // Compute local absmax (shared by both paths)
-    IType absmax = __habs(vals[0]);
-#pragma unroll
-    for (int i = 1; i < kValsPerThread; i++) {
-        absmax = __hmax(absmax, __habs(vals[i]));
-    }
-
-    // Shuffle down reduction across kThreadsPerGroup threads to get absmax of kBlockSize values
-    // Each thread has kValsPerThread values, so kThreadsPerGroup threads cover kBlockSize values
-    unsigned int mask = 0xffffffff;
-#pragma unroll
-    for (int offset = kThreadsPerGroup / 2; offset >= 1; offset /= 2) {
-        IType other = __shfl_down_sync(mask, absmax, offset, kThreadsPerGroup);
-        absmax = __hmax(absmax, other);
-    }
-    
-    // Broadcast from group leader to all threads in the group
-    unsigned int lane_id = threadIdx.x & 0x1f;  // Lane ID within warp (0-31)
-    unsigned int group_leader = (lane_id / kThreadsPerGroup) * kThreadsPerGroup;
-    absmax = __shfl_sync(mask, absmax, group_leader, comfy::kThreadsPerWarp);
-    
-    // Compute block scale per NVIDIA spec: decode_scale = absmax / FP4_MAX
-    float decode_scale = static_cast<float>(absmax) / FP4LimitsTrait<__nv_fp4x2_storage_t>::max;
-    
-    // Apply global scale (divide by global_decode_scale, following the transpose kernel pattern)
-    // global_scale[0] is the decode scale, so we use its reciprocal for encoding
-    const float global_decode_scale = global_scale[0];
-    decode_scale = decode_scale / global_decode_scale;  // This is: (absmax/6.0) / global_decode_scale
-    
-    decode_scale = fminf(decode_scale, FP8LimitsTrait<__nv_fp8_e4m3>::max);
-    ScaleType scale_fp8 = static_cast<ScaleType>(decode_scale);
-    
-    // Cast back to float to match reference implementation (ComputeEncodeScaleFP4)
-    // This ensures FP8 quantization error is included in encode_scale computation
-    float decode_scale_fp8 = static_cast<float>(scale_fp8);
-    
-    // Store block scale using swizzled layout
-    // Only the first thread in each group (group leader) writes the scale
-    // Use threadIdx.x to match reference implementation pattern
-    const bool is_group_leader = (threadIdx.x % kThreadsPerGroup) == 0;
-    const size_t global_elem_idx = static_cast<size_t>(idx) * kValsPerThread;
-    
-    if (is_group_leader) {
-        // Calculate which block this thread group is processing
-        const size_t block_linear_idx = global_elem_idx / 16;  // Linear block index (use literal 16)
-        
-        // Convert linear block index to 2D coordinates (row, col) based on num_cols
-        const size_t num_blocks_per_row = num_cols / 16;  // Use literal 16
-        const size_t row_idx = block_linear_idx / num_blocks_per_row;  // Row in the matrix
-        const size_t col_idx = block_linear_idx % num_blocks_per_row;  // Column block index
-        
-        // Use swizzled layout function (matches transpose kernel with swizzled_scale=True)
-        size_t scale_offset = scale_factor_swizzled_offset(
-            row_idx, col_idx, num_blocks_per_row);
-        
-        block_scales[scale_offset] = scale_fp8;
-    }
-
-    // Quantize kValsPerThread values: compute encode scale and pack into FP4
-    // Each OType (__nv_fp4x2_e2m1) stores 2 FP4 values
-    // With kValsPerThread=2, each thread outputs exactly 1 packed value
-    
-    // Compute encode scale using the FP8-quantized decode_scale (matches ComputeEncodeScaleFP4)
-    // encode_scale = 1.0 / (decode_scale_fp8 * global_decode_scale)
-    float encode_scale = fminf(
-        1.0f / (decode_scale_fp8 * global_decode_scale),
-        3.402823466e+38f);  // FLT_MAX to avoid overflow
-    
-    // Apply encode scale to map to FP4 range (multiply by encode_scale = 6.0 / absmax
-    float vals_encoded[kValsPerThread];
-    for (int i = 0; i < kValsPerThread; i++) {
-        vals_encoded[i] = static_cast<float>(vals[i]) * encode_scale;
-    }
-
-    // Store quantized values to output using vectorized stores
-    // Both aligned and misaligned paths use the same store since each thread processes kValsPerThread values
-    if (kValsPerThread == 2) {
-        store_fp4x2<OType, HiFirst>(output, idx, vals_encoded[0], vals_encoded[1]);
-    }
-    else if (kValsPerThread == 4) {
-        store_fp4x4<OType, HiFirst>(output, idx, vals_encoded[0], vals_encoded[1], vals_encoded[2], vals_encoded[3]);
-    }
+    if constexpr (V == 16)
+      reinterpret_cast<uint64_t *>(output)[chunk] = packed.word;
+    else
+      reinterpret_cast<uint16_t *>(output)[chunk] = packed.short_word;
+  }
 }
 
-/*
- * FP4 E2M1 Block Dequantization with E4M3 Scales
- * 
- * Algorithm (reverse of quantization):
- *   1. Load kValsPerThread FP4 packed values per thread
- *   2. Compute which block this thread belongs to
- *   3. Read the corresponding block scale from swizzled layout
- *   4. Compute decode_scale = block_scale_fp8 * global_decode_scale
- *   5. Unpack FP4 values to float and multiply by decode_scale
- *   6. Convert to output type (FP16 or BF16)
- * 
- * Block Scale Layout (swizzled):
- *   - One scale per block of kBlockSize (16) elements
- *   - Uses swizzled layout matching quantization kernel
- */
+// Keep the existing four-value decode kernel on every GPU.
+constexpr unsigned int kValsPerThread = 4;
 template <
     typename IType=__nv_fp4x2_e2m1,
     typename OType,
     typename ScaleType=__nv_fp8_e4m3,
-    bool HiFirst = true>
+    bool HiFirst = true,
+    bool AlignedInput = true>
 __global__ void dequantize_nvfp4_kernel(
     const IType* const input,
     const float* global_scale,
@@ -270,7 +137,13 @@ __global__ void dequantize_nvfp4_kernel(
             uint16_t u16;
             __nv_fp4x2_storage_t fp4x2[2];
         } packed;
-        packed.u16 = *reinterpret_cast<const uint16_t*>(input_ptr);
+        // Public contiguous views may begin at an odd byte offset.
+        if constexpr (AlignedInput) {
+            packed.u16 = *reinterpret_cast<const uint16_t*>(input_ptr);
+        } else {
+            packed.fp4x2[0] = reinterpret_cast<const __nv_fp4x2_storage_t*>(input_ptr)[0];
+            packed.fp4x2[1] = reinterpret_cast<const __nv_fp4x2_storage_t*>(input_ptr)[1];
+        }
         
         __half2_raw unpacked_raw0 = __nv_cvt_fp4x2_to_halfraw2(packed.fp4x2[0], __NV_E2M1);
         __half2_raw unpacked_raw1 = __nv_cvt_fp4x2_to_halfraw2(packed.fp4x2[1], __NV_E2M1);
@@ -313,125 +186,130 @@ __global__ void dequantize_nvfp4_kernel(
     }
 }
 
-} // namespace
+template <typename Input, int V>
+void launch_nvfp4_quantization(const void *input, const void *global_scale,
+                               void *output, void *scales, int64_t rows,
+                               int64_t columns, int64_t original_rows,
+                               int64_t original_columns, bool hi_first,
+                               int threads, cudaStream_t stream) {
+  const int64_t groups = rows * columns / 16;
+  const int64_t chunks = groups * (16 / V);
+  threads = quantization::block_size(chunks, threads);
+  const int blocks = static_cast<int>(chunks / threads);
+  const bool masked = rows != original_rows || columns != original_columns ||
+                      !optimized::aligned_to(input, 16);
+#define LAUNCH(MASKED, HI_FIRST)                                               \
+  quantize_nvfp4_kernel<Input, V, MASKED, HI_FIRST>                         \
+      <<<blocks, threads, 0, stream>>>(                                        \
+          static_cast<const Input *>(input),                                   \
+          static_cast<const float *>(global_scale),                            \
+          static_cast<uint8_t *>(output),                                      \
+          static_cast<__nv_fp8_e4m3 *>(scales), groups, columns,               \
+          original_rows, original_columns)
+  if (masked) {
+    if (hi_first) {
+      LAUNCH(true, true);
+    } else {
+      LAUNCH(true, false);
+    }
+  } else {
+    if (hi_first) {
+      LAUNCH(false, true);
+    } else {
+      LAUNCH(false, false);
+    }
+  }
+#undef LAUNCH
+}
 
+template <typename Input>
+void dispatch_nvfp4_quantization(const void *input, const void *global_scale,
+                                 void *output, void *scales, int64_t rows,
+                                 int64_t columns, int64_t original_rows,
+                                 int64_t original_columns, bool hi_first,
+                                 int threads, cudaStream_t stream) {
+#define RUN(V)                                                                 \
+  launch_nvfp4_quantization<Input, V>(                                  \
+      input, global_scale, output, scales, rows, columns, original_rows,       \
+      original_columns, hi_first, threads, stream)
+  if (rows * columns < 4194304) {
+    RUN(4);
+  } else {
+    RUN(16);
+  }
+#undef RUN
+}
+
+template <typename Output>
+void dispatch_nvfp4_dequantization(const void *input, const void *global_scale,
+                                   const void *scales, void *output,
+                                   int64_t rows, int64_t columns, bool hi_first,
+                                   int threads, cudaStream_t stream) {
+  const int64_t chunks = rows * columns / kValsPerThread;
+  threads = quantization::block_size(chunks, threads);
+  const int blocks = static_cast<int>(chunks / threads);
+  const bool aligned = optimized::aligned_to(input, alignof(uint16_t));
+#define LAUNCH(HI_FIRST, ALIGNED)                                              \
+  dequantize_nvfp4_kernel<__nv_fp4x2_e2m1, Output, __nv_fp8_e4m3, HI_FIRST,    \
+                          ALIGNED><<<blocks, threads, 0, stream>>>(            \
+      static_cast<const __nv_fp4x2_e2m1 *>(input),                             \
+      static_cast<const float *>(global_scale),                                \
+      static_cast<const __nv_fp8_e4m3 *>(scales),                              \
+      static_cast<Output *>(output), columns, rows)
+  if (aligned) {
+    if (hi_first) {
+      LAUNCH(true, true);
+    } else {
+      LAUNCH(false, true);
+    }
+  } else {
+    if (hi_first) {
+      LAUNCH(true, false);
+    } else {
+      LAUNCH(false, false);
+    }
+  }
+#undef LAUNCH
+}
+} // namespace
 } // namespace comfy
 
-// C interface for DLPack bindings
 extern "C" {
-
-void launch_quantize_nvfp4_kernel(
-    const void* input,
-    const void* global_scale,
-    void* output,
-    void* block_scales,
-    int64_t num_rows,
-    int64_t num_cols,
-    int64_t orig_rows,
-    int64_t orig_cols,
-    float epsilon,
-    int input_dtype_code,
-    bool hi_first,
-    cudaStream_t stream) {
-    
-    if (num_rows == 0 || num_cols == 0) {
-        return;
-    }
-    
-    // Check that dimensions are divisible by block size (16)
-    if (num_rows % comfy::kBlockSize != 0 || num_cols % comfy::kBlockSize != 0) {
-        throw std::runtime_error("num_rows and num_cols must be divisible by 16 for FP4 block quantization");
-    }
-    
-    // Check if input is misaligned (original dimensions differ from padded dimensions)
-    const bool misaligned = (orig_rows != num_rows) || (orig_cols != num_cols);
-    
-    const int64_t numel = num_rows * num_cols;
-    const float* scale_f = static_cast<const float*>(global_scale);
-    
-    // Each thread processes kValsPerThread values (same for both aligned and misaligned paths)
-    constexpr int threads_per_block = 128;  // CUDA block size
-    const int64_t total_threads_needed = numel / comfy::kValsPerThread;
-    const int blocks = static_cast<int>((total_threads_needed + threads_per_block - 1) / threads_per_block);
-
-    // Macro to reduce duplication across misaligned x hi_first combinations
-    #define LAUNCH_QUANT_KERNEL(MISALIGNED, HI_FIRST) \
-        comfy::quantize_nvfp4_kernel<InputType, __nv_fp4x2_e2m1, __nv_fp8_e4m3, MISALIGNED, HI_FIRST> \
-            <<<blocks, threads_per_block, 0, stream>>>( \
-                static_cast<const InputType*>(input), \
-                scale_f, \
-                static_cast<__nv_fp4x2_e2m1*>(output), \
-                static_cast<__nv_fp8_e4m3*>(block_scales), \
-                num_cols, num_rows, orig_rows, orig_cols, epsilon)
-
-    DISPATCH_HALF_DTYPE(input_dtype_code, InputType, [&] {
-        if (misaligned) {
-            if (hi_first) { LAUNCH_QUANT_KERNEL(true, true); }
-            else          { LAUNCH_QUANT_KERNEL(true, false); }
-        } else {
-            if (hi_first) { LAUNCH_QUANT_KERNEL(false, true); }
-            else          { LAUNCH_QUANT_KERNEL(false, false); }
-        }
-    });
-
-    #undef LAUNCH_QUANT_KERNEL
-    
-    // Check for kernel launch errors
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("CUDA kernel launch failed: ") + cudaGetErrorString(err));
-    }
+void launch_quantize_nvfp4_kernel(const void *input, const void *global_scale,
+                                  void *output, void *scales, int64_t rows,
+                                  int64_t columns, int64_t original_rows,
+                                  int64_t original_columns, float epsilon,
+                                  int dtype, bool hi_first,
+                                  cudaStream_t stream) {
+  if (!rows || !columns)
+    return;
+  if (rows % 16 || columns % 16)
+    throw std::runtime_error("num_rows and num_cols must be divisible by 16 "
+                             "for FP4 block quantization");
+  // Tensor-size tuning is identical on every GPU.
+  const int threads = 128;
+  DISPATCH_HALF_DTYPE(dtype, Input, [&] {
+    comfy::dispatch_nvfp4_quantization<Input>(
+        input, global_scale, output, scales, rows, columns, original_rows,
+        original_columns, hi_first, threads, stream);
+  });
+  CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_dequantize_nvfp4_kernel(
-    const void* input,
-    const void* global_scale,
-    const void* block_scales,
-    void* output,
-    int64_t num_rows,
-    int64_t num_cols,
-    int output_dtype_code,
-    bool hi_first,
-    cudaStream_t stream) {
-
-    if (num_rows == 0 || num_cols == 0) {
-        return;
-    }
-    
-    // Check that dimensions are divisible by block size (16)
-    if (num_rows % comfy::kBlockSize != 0 || num_cols % comfy::kBlockSize != 0) {
-        throw std::runtime_error("num_rows and num_cols must be divisible by 16 for FP4 block dequantization");
-    }
-    
-    const int64_t numel = num_rows * num_cols;
-    const float* scale_f = static_cast<const float*>(global_scale);
-    
-    // Each thread processes kValsPerThread values
-    constexpr int threads_per_block = 128;
-    const int64_t total_threads_needed = numel / comfy::kValsPerThread;
-    const int blocks = static_cast<int>((total_threads_needed + threads_per_block - 1) / threads_per_block);
-
-    #define LAUNCH_DEQUANT_KERNEL(HI_FIRST) \
-        comfy::dequantize_nvfp4_kernel<__nv_fp4x2_e2m1, OutputType, __nv_fp8_e4m3, HI_FIRST> \
-            <<<blocks, threads_per_block, 0, stream>>>( \
-                static_cast<const __nv_fp4x2_e2m1*>(input), \
-                scale_f, \
-                static_cast<const __nv_fp8_e4m3*>(block_scales), \
-                static_cast<OutputType*>(output), \
-                num_cols, num_rows)
-
-    DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
-        if (hi_first) { LAUNCH_DEQUANT_KERNEL(true); }
-        else          { LAUNCH_DEQUANT_KERNEL(false); }
-    });
-
-    #undef LAUNCH_DEQUANT_KERNEL
-    
-    // Check for kernel launch errors
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("CUDA kernel launch failed: ") + cudaGetErrorString(err));
-    }
+void launch_dequantize_nvfp4_kernel(const void *input, const void *global_scale,
+                                    const void *scales, void *output,
+                                    int64_t rows, int64_t columns, int dtype,
+                                    bool hi_first, cudaStream_t stream) {
+  if (!rows || !columns)
+    return;
+  if (rows % 16 || columns % 16)
+    throw std::runtime_error("num_rows and num_cols must be divisible by 16 "
+                             "for FP4 block dequantization");
+  DISPATCH_FP_DTYPE(dtype, Output, [&] {
+    comfy::dispatch_nvfp4_dequantization<Output>(input, global_scale, scales,
+                                                 output, rows, columns,
+                                                 hi_first, 128, stream);
+  });
+  CUDA_CHECK(cudaGetLastError());
 }
-
 } // extern "C"
