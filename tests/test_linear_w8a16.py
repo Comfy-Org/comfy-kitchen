@@ -261,21 +261,24 @@ class TestLinearW8A16Triton:
                 assert tuner.do_bench is mod._bench_read_flush
 
     def test_rocm_gate(self, seed):
-        """Under ROCm the kernel is served only on gfx1151 (exact arch, feature suffixes
-        stripped), only up to HIP_MAX_ROWS["gfx1151"] rows and only for weights of at
-        least HIP_MIN_WEIGHT["gfx1151"] elements; every other ROCm arch, more rows and
-        smaller weights fall back to eager. The arch is mocked, so this runs on any GPU;
-        on a real ROCm device a refused call returns the eager reference."""
+        """Under ROCm the kernel is served only on the measured archs, gfx1151 and gfx1201
+        (exact arch, feature suffixes stripped), each only up to HIP_MAX_ROWS[arch] rows and
+        only for weights of at least HIP_MIN_WEIGHT[arch] elements; every other ROCm arch,
+        more rows and smaller weights fall back to eager. The arch is mocked, so this runs on
+        any GPU; on a real ROCm device a refused call returns the eager reference."""
         _require_triton()
         import comfy_kitchen.backends.triton as triton_backend
         from comfy_kitchen.backends.triton import w8a16 as mod
 
         assert triton_backend._arch_name("gfx1151") == "gfx1151"
         assert triton_backend._arch_name("gfx942:sramecc+:xnack-") == "gfx942"
-        limit = mod.HIP_MAX_ROWS["gfx1151"]
-        min_weight = mod.HIP_MIN_WEIGHT["gfx1151"]
-        big = (torch.randn(min_weight // 1024, 1024, device="cuda") * 0.02).to(FP8)
-        small = big[: min_weight // 1024 - 1]
+        assert set(mod.HIP_MAX_ROWS) == set(mod.HIP_MIN_WEIGHT) == {"gfx1151", "gfx1201"}
+
+        def weights(arch):
+            # the smallest served weight of this arch and one row (1024 elements) less
+            min_weight = mod.HIP_MIN_WEIGHT[arch]
+            big = (torch.randn(min_weight // 1024, 1024, device="cuda") * 0.02).to(FP8)
+            return big, big[: min_weight // 1024 - 1]
 
         def served(rows, w):
             x = torch.randn(rows, 1024, device="cuda", dtype=torch.bfloat16)
@@ -285,10 +288,14 @@ class TestLinearW8A16Triton:
 
         real_hip = getattr(torch.version, "hip", None)
         saved_arch = triton_backend._hip_arch
-        cases = [("gfx1151", 1, big, True), ("gfx1151", limit, big, True),
-                 ("gfx1151", limit + 1, big, False), ("gfx1151", 1, small, False)]
-        others = ("gfx1201", "gfx1200", "gfx1150", "gfx1100", "gfx942", "gfx950")
-        cases += [(a, 1, big, False) for a in others]
+        cases = []
+        for arch, limit in mod.HIP_MAX_ROWS.items():
+            big, small = weights(arch)
+            cases += [(arch, 1, big, True), (arch, limit, big, True),
+                      (arch, limit + 1, big, False), (arch, 1, small, False)]
+        largest = max((weights(a)[0] for a in mod.HIP_MAX_ROWS), key=torch.Tensor.numel)
+        others = ("gfx1200", "gfx1150", "gfx1100", "gfx942", "gfx950")
+        cases += [(a, 1, largest, False) for a in others]
         try:
             torch.version.hip = real_hip or "mocked"
             for arch, rows, w, ok in cases:
@@ -298,6 +305,9 @@ class TestLinearW8A16Triton:
             triton_backend._hip_arch = saved_arch
             torch.version.hip = real_hip
         if real_hip:
+            arch = triton_backend._hip_arch(None)
+            big, small = weights(arch if arch in mod.HIP_MAX_ROWS else "gfx1151")
+            limit = mod.HIP_MAX_ROWS.get(arch, mod.HIP_MAX_ROWS["gfx1151"])
             for rows, w in ((limit + 1, big), (1, small)):
                 x, ok = served(rows, w)
                 assert not ok
@@ -305,13 +315,15 @@ class TestLinearW8A16Triton:
 
     def test_dispatch_follows_gate(self, seed):
         """Dispatch picks triton where its gate serves the call (NVIDIA SM 8.9+, the
-        served ROCm archs) and eager elsewhere (e.g. gfx1201). 16 rows and a 2^21
-        element weight are within every served arch's limits."""
+        served ROCm archs) and eager elsewhere (e.g. gfx1200). 16 rows and a weight of
+        the largest HIP_MIN_WEIGHT (4096 x 1024) are within every served arch's limits."""
         _require_triton()
         import comfy_kitchen.backends.triton as triton_backend
         from comfy_kitchen.backends.triton import w8a16 as mod
 
-        x, w, b = _inputs(16, 1024, 2048, torch.bfloat16)
+        rows, n = 16, max(mod.HIP_MIN_WEIGHT.values()) // 1024
+        assert rows <= min(mod.HIP_MAX_ROWS.values())
+        x, w, b = _inputs(rows, 1024, n, torch.bfloat16)
         served = True
         if getattr(torch.version, "hip", None):
             served = triton_backend._hip_arch(x.device.index) in mod.HIP_MAX_ROWS
