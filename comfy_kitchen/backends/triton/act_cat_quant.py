@@ -10,7 +10,8 @@ once and writes only the FP8 data.
 Numerics follow the unfused ops step by step, so the result is bit-identical:
 
 - silu: ``x / (1 + exp(-x))`` in fp32, rounded to the input dtype (PyTorch's
-  GPU silu); the product with the other half is rounded again.
+  GPU silu); the product with the other half is rounded again. Under ROCm
+  exp is written out as hipcc's expf, which PyTorch's ROCm silu calls.
 - gelu_tanh: PyTorch's tanh-approximation formula in fp32, rounded once.
 - quantize: the per-tensor quantizer of kitchen's compiled backend, then a
   round-to-nearest-even cast. CUDA: ``float(v) / scale`` (Triton's default fp32
@@ -40,15 +41,28 @@ BLOCK_M = 2
 BLOCK_N = 1024
 NUM_WARPS = 8
 
-# Reproduce the per-tensor quantizer the platform's compiled backend serves:
-# kitchen's HIP kernel under ROCm, its CUDA kernel otherwise.
+# Reproduce the platform's compiled code: under ROCm kitchen's HIP quantizer and
+# hipcc's expf (PyTorch's silu), otherwise kitchen's CUDA quantizer.
 _HIP = bool(getattr(torch.version, "hip", None))
 
 
 @triton.jit
-def _silu_rounded(g):
+def _silu_rounded(g, hip: tl.constexpr):
     gf = g.to(tl.float32)
-    return tl.div_rn(gf, 1.0 + libdevice.exp(-gf)).to(g.dtype)
+    if hip:
+        # HIP's expf(-x) written out (log2(e) = 0x1.715476p+0 + 0x1.4ae0bep-26).
+        # libdevice.exp is the same sequence, but with FMA fusion on it measured
+        # 1 ulp off (fp16 silu at -2.7246); computing ph as an fma with a +0
+        # addend matches hipcc on every fp16 and bf16 value.
+        ph = tl.fma(gf, -1.4426950216293335, 0.0)
+        pl = tl.fma(gf, -1.925962855864327e-08, tl.fma(gf, -1.4426950216293335, -ph))
+        e = libdevice.rint(ph)
+        ex = libdevice.ldexp(tl.math.exp2((ph - e) + pl), e.to(tl.int32))
+        ex = tl.where(gf > 103.2789306640625, 0.0, ex)  # 0x1.9d1da0p+6
+        ex = tl.where(gf < -88.72283935546875, float("inf"), ex)  # -0x1.62e430p+6
+    else:
+        ex = libdevice.exp(-gf)
+    return tl.div_rn(gf, 1.0 + ex).to(g.dtype)
 
 
 @triton.jit
@@ -56,7 +70,7 @@ def _act_cat_quant_kernel(
     x_ptr, h_ptr, out_ptr, scale_ptr, n_rows,
     stride_x, stride_h, stride_out,
     dx: tl.constexpr, dm: tl.constexpr, act: tl.constexpr, fp8_max: tl.constexpr,
-    hip_quant: tl.constexpr, block_m: tl.constexpr, block_n: tl.constexpr,
+    hip: tl.constexpr, block_m: tl.constexpr, block_n: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -76,11 +90,11 @@ def _act_cat_quant_kernel(
         if act == 0:  # [gate | up]: silu(gate) * up
             g = tl.load(base, mask=mask, other=0.0)
             u = tl.load(base + dm, mask=mask, other=0.0)
-            v = (_silu_rounded(g).to(tl.float32) * u.to(tl.float32)).to(g.dtype)
+            v = (_silu_rounded(g, hip).to(tl.float32) * u.to(tl.float32)).to(g.dtype)
         elif act == 1:  # [hidden | gate]: silu(gate) * hidden
             u = tl.load(base, mask=mask, other=0.0)
             g = tl.load(base + dm, mask=mask, other=0.0)
-            v = (_silu_rounded(g).to(tl.float32) * u.to(tl.float32)).to(g.dtype)
+            v = (_silu_rounded(g, hip).to(tl.float32) * u.to(tl.float32)).to(g.dtype)
         else:  # gelu, tanh approximation
             g = tl.load(base, mask=mask, other=0.0)
             xf = g.to(tl.float32)
@@ -89,7 +103,7 @@ def _act_cat_quant_kernel(
         out_cols = dx + cols
     vf = v.to(tl.float32)
     s = tl.load(scale_ptr)
-    if hip_quant:
+    if hip:
         # kitchen's HIP quantizer: fast-math division, NaN stays NaN
         q = libdevice.fast_dividef(vf, tl.zeros([block_m, block_n], tl.float32) + s)
         c = tl.minimum(tl.maximum(q, -fp8_max), fp8_max)
@@ -125,7 +139,7 @@ def act_cat_quantize_fp8(
         _act_cat_quant_kernel[grid](
             x2, h2, out, scale, m,
             x2.stride(0), h2.stride(0), out.stride(0),
-            dx=dx, dm=dm, act=_ACT_CODE[act], fp8_max=F8_E4M3_MAX, hip_quant=_HIP,
+            dx=dx, dm=dm, act=_ACT_CODE[act], fp8_max=F8_E4M3_MAX, hip=_HIP,
             block_m=BLOCK_M, block_n=BLOCK_N, num_warps=NUM_WARPS,
             # The activation formulas are matched with FMA contraction on (the
             # default before Triton 3.10, and how the PyTorch kernels are built).
