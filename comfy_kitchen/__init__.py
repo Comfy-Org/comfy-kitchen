@@ -94,6 +94,7 @@ __all__ = [
     "flash_attention_decode_is_available",
     "na2d",
     "na3d",
+    "window_attention",
     "sol_attn",
     "sol_attn_chunked",
     "sol_attn_is_available",
@@ -339,6 +340,47 @@ def na2d(
         [1, *kernel_size], [False, *is_causal], scale,
     )
     return out.squeeze(1)
+
+
+def window_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    windows: list[int] | list[list[int]],
+    temporal_window: int | None = None,
+    clamp: bool = True,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Attention of query planes over local 2D windows of a stack of key planes.
+
+    The Tq query planes are the last Tq of the Tk key planes. Query plane i
+    attends key plane i + Tk - Tq and the ``temporal_window - 1`` before it
+    (all earlier planes when None). In key plane p a query at (y, x) attends
+    the ``windows[p]`` = (wh, ww) keys centered on (y, x), shifted inward at
+    the frame border when ``clamp`` is set (NATTEN) or cut off by it. With
+    Tq == Tk, one window and clamp this is ``na3d`` with a causal T axis.
+
+    Args:
+        q: ``(B, Tq, H, W, num_heads, head_dim)``.
+        k, v: ``(B, Tk, H, W, kv_heads, head_dim)``, kv_heads dividing
+            num_heads (grouped-query attention).
+        windows: One (wh, ww) for every key plane, or Tk of them.
+        temporal_window: Key planes each query plane attends, counting its own.
+        clamp: Shift border windows inward instead of cutting them off.
+        scale: Score scale; None means ``head_dim ** -0.5``.
+
+    Returns:
+        ``(B, Tq, H, W, num_heads, head_dim)`` attention output.
+    """
+    if windows and isinstance(windows[0], int):
+        windows = [windows]
+    if len(set(map(tuple, windows))) == 1:
+        windows = windows[:1]
+    kh = [int(wh) for wh, _ in windows]
+    kw = [int(ww) for _, ww in windows]
+    if temporal_window is None:
+        temporal_window = k.shape[1]
+    return torch.ops.comfy_kitchen.window_attention(q, k, v, kh, kw, temporal_window, clamp, scale)
 
 
 def adaln(
