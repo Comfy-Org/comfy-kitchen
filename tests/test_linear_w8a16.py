@@ -216,8 +216,13 @@ class TestLinearW8A16Triton:
 
     def test_read_flush_bench(self, seed):
         """The ROCm autotune timer returns one time (ms) per requested quantile, in order,
-        and is the timer both tuners use under ROCm."""
+        and is the timer both tuners use under ROCm when Triton takes do_bench (3.2+);
+        otherwise the tuners keep Triton's default timer."""
         _require_triton()
+        import inspect
+
+        import triton
+
         from comfy_kitchen.backends.triton import w8a16 as mod
 
         x, w, b = _inputs(64, 512, 256, torch.bfloat16)
@@ -225,7 +230,11 @@ class TestLinearW8A16Triton:
             lambda: mod.linear_w8a16(x, w, b), quantiles=(0.5, 0.2, 0.8), reps=5
         )
         assert 0 < q20 <= q50 <= q80
-        if getattr(torch.version, "hip", None):
+        takes_do_bench = "do_bench" in inspect.signature(triton.autotune).parameters
+        hip = bool(getattr(torch.version, "hip", None))
+        expected = {"do_bench": mod._bench_read_flush} if hip and takes_do_bench else {}
+        assert expected == mod._AUTOTUNE_TIMER
+        if mod._AUTOTUNE_TIMER:
             for tuner in (mod._small_m_kernel, mod._large_m_kernel):
                 assert tuner.do_bench is mod._bench_read_flush
 

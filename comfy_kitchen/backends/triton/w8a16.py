@@ -34,6 +34,7 @@ a small block_k 32 entry, so K % K_MULTIPLE == 0 always leaves at least one.
 """
 
 import functools
+import inspect
 
 import torch
 
@@ -249,10 +250,19 @@ def _bench_read_flush(kernel_call, quantiles, reps=25):
     return [torch.quantile(t, q).item() for q in quantiles]
 
 
+# triton.autotune takes do_bench since Triton 3.2; older versions, and CUDA, keep
+# Triton's default timer.
+_AUTOTUNE_TIMER = (
+    {"do_bench": _bench_read_flush}
+    if _HIP and "do_bench" in inspect.signature(triton.autotune).parameters
+    else {}
+)
+
+
 def _autotuned(configs, key):
     return triton.autotune(
         configs=configs, key=key, prune_configs_by={"early_config_prune": _prune},
-        do_bench=_bench_read_flush if _HIP else None,
+        **_AUTOTUNE_TIMER,
     )(_linear_w8a16_kernel)
 
 
