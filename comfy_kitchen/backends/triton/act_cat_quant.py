@@ -66,6 +66,23 @@ def _silu_rounded(g, hip: tl.constexpr):
 
 
 @triton.jit
+def _round_product(p, sign, g, hip: tl.constexpr):
+    """The fp32 product ``p`` rounded to ``g``'s dtype; ``sign`` holds p's sign bit."""
+    if hip and g.dtype == tl.float16:
+        # The AMDGPU backend can fold the multiply and the fp16 rounding into
+        # one v_fma_mix with a +0 addend, which turns a -0 product into +0 (and
+        # so the FP8 byte 0x80 into 0x00). Adding the product's own signed zero
+        # keeps that sign and changes no other value.
+        p = p + (sign & 0x80000000).to(tl.float32, bitcast=True)
+    return p.to(g.dtype)
+
+
+@triton.jit
+def _bits(f):
+    return f.to(tl.uint32, bitcast=True)
+
+
+@triton.jit
 def _act_cat_quant_kernel(
     x_ptr, h_ptr, out_ptr, scale_ptr, n_rows,
     stride_x, stride_h, stride_out,
@@ -90,16 +107,19 @@ def _act_cat_quant_kernel(
         if act == 0:  # [gate | up]: silu(gate) * up
             g = tl.load(base, mask=mask, other=0.0)
             u = tl.load(base + dm, mask=mask, other=0.0)
-            v = (_silu_rounded(g, hip).to(tl.float32) * u.to(tl.float32)).to(g.dtype)
+            sf, uf = _silu_rounded(g, hip).to(tl.float32), u.to(tl.float32)
+            v = _round_product(sf * uf, _bits(sf) ^ _bits(uf), g, hip)
         elif act == 1:  # [hidden | gate]: silu(gate) * hidden
             u = tl.load(base, mask=mask, other=0.0)
             g = tl.load(base + dm, mask=mask, other=0.0)
-            v = (_silu_rounded(g, hip).to(tl.float32) * u.to(tl.float32)).to(g.dtype)
+            sf, uf = _silu_rounded(g, hip).to(tl.float32), u.to(tl.float32)
+            v = _round_product(sf * uf, _bits(sf) ^ _bits(uf), g, hip)
         else:  # gelu, tanh approximation
             g = tl.load(base, mask=mask, other=0.0)
             xf = g.to(tl.float32)
             inner = 0.7978845608028654 * (xf + 0.044715 * (xf * xf * xf))
-            v = (0.5 * xf * (1.0 + libdevice.tanh(inner))).to(g.dtype)
+            # sign of x: 1 + tanh is never below +0
+            v = _round_product(0.5 * xf * (1.0 + libdevice.tanh(inner)), _bits(xf), g, hip)
         out_cols = dx + cols
     vf = v.to(tl.float32)
     s = tl.load(scale_ptr)
