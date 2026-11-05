@@ -287,11 +287,21 @@ class TestLinearW8A16Triton:
                 assert not ok
                 assert torch.equal(ck.linear_w8a16(x, w), _ref(x, w))
 
-    def test_dispatch_selects_triton(self, seed):
+    def test_dispatch_follows_gate(self, seed):
+        """Dispatch picks triton where its gate serves the call (NVIDIA SM 8.9+, the
+        served ROCm archs) and eager elsewhere (e.g. gfx1201). 16 rows and a 2^21
+        element weight are within every served arch's limits."""
         _require_triton()
+        import comfy_kitchen.backends.triton as triton_backend
+        from comfy_kitchen.backends.triton import w8a16 as mod
+
         x, w, b = _inputs(16, 1024, 2048, torch.bfloat16)
+        served = True
+        if getattr(torch.version, "hip", None):
+            served = triton_backend._hip_arch(x.device.index) in mod.HIP_MAX_ROWS
         kwargs = {"x": x, "weight": w, "bias": b}
-        assert ck.registry.get_capable_backend("linear_w8a16", kwargs) == "triton"
+        expected = "triton" if served else "eager"
+        assert ck.registry.get_capable_backend("linear_w8a16", kwargs) == expected
 
 
 # ---------------------------------------------------------------------------
