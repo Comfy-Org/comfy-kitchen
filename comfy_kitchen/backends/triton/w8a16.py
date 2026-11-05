@@ -87,8 +87,9 @@ _LARGE_M_CONFIGS = [
     _mm(64, 128, 64, 8, 4, 3),  # text M 262, FFN up
     _mm(64, 64, 64, 8, 4, 3),  # text M 256, FFN up (Flux)
     _mm(16, 64, 128, 8, 4, 3),  # M 9..64 (Qwen-Image 2512 uncond text M 46)
-    # Tuned on AMD Radeon 8060S (gfx1151, 64 KB LDS: the 5090's 3+ stage block_k 128 and
-    # block_k 32 x 5 stage tiles do not fit) at the text M 256 / 262 shapes.
+    # Tuned on AMD Radeon 8060S (gfx1151) at the text M 256 / 262 shapes. Of the tiles
+    # above, only the 128 x 128 x block_k 128 3-stage ones exceed its 64 KB of LDS
+    # (98304 B by _smem_bytes) and are pruned there.
     _mm(64, 128, 64, 8, 4, 2),  # N 3072 / 12288 at K 3072, K 3584
     _mm(128, 64, 64, 8, 4, 2),  # N 9216 / 12288 (Flux)
     _mm(128, 128, 64, 8, 8, 2),  # K 12288 / 4096
