@@ -652,8 +652,8 @@ jobs:
           # Tests requiring CUDA will be skipped on CPU-only runners
           python -m pytest tests/ -v --tb=short
 
-  # Windows on ARM CUDA wheels via CUDA Toolkit 13.4 developer preview
-  # (https://packages.nvidia.com/prerelease/cuda/13.4.0/...).
+  # Windows on ARM CUDA wheels via CUDA Toolkit 13.5.
+  # SM 100 requires CUDA 13.5 on Windows ARM only.
   # WoA ships only the Stable ABI (cp312-abi3) wheel — no 3.10/3.11 builds.
   build_wheels_windows_arm:
     name: Build Windows ARM abi3 wheel
@@ -669,32 +669,33 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-windows-arm64-cuda13.4-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'third_party/cutlass/.git') }}
+          key: ccache-windows-arm64-cuda13.5-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'third_party/cutlass/.git') }}
           restore-keys: |
-            ccache-windows-arm64-cuda13.4-
+            ccache-windows-arm64-cuda13.5-
 
       - name: Install compiler cache
         shell: pwsh
         run: choco install ccache --no-progress --yes
 
-      - name: Cache CUDA 13.4 WoA installer
+      - name: Cache CUDA 13.5 WoA installer
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/cuda_installer
-          key: cuda-13.4.0-windows-arm64-local-installer
+          key: cuda-13.5.0-windows-arm64-local-installer
 
-      - name: Download CUDA Toolkit 13.4 (Windows ARM64)
+      - name: Download CUDA Toolkit 13.5 (Windows ARM64)
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP "cuda_installer"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          $installer = Join-Path $dir "cuda_13.4.0_windows_arm64.exe"
-          if ((Test-Path $installer) -and (Get-Item $installer).Length -lt 3GB) {
+          $installer = Join-Path $dir "cuda_13.5.0_windows_arm64.exe"
+          # Exact size of the CUDA 13.5.0 Windows ARM64 local installer.
+          if ((Test-Path $installer) -and (Get-Item $installer).Length -ne 2596681472) {
             Write-Warning "Discarding incomplete cached CUDA installer"
             Remove-Item $installer -Force
           }
           if (-not (Test-Path $installer)) {
-            $uri = "https://packages.nvidia.com/prerelease/cuda/13.4.0/local_installers/cuda_13.4.0_windows_arm64.exe"
+            $uri = "https://developer.download.nvidia.com/compute/cuda/13.5.0/local_installers/cuda_13.5.0_windows_arm64.exe"
             $partial = "$installer.part"
             Write-Host "Downloading $uri"
             curl.exe `
@@ -713,12 +714,12 @@ jobs:
           }
           Get-Item $installer | Format-List FullName, Length
 
-      - name: Install CUDA Toolkit 13.4
+      - name: Install CUDA Toolkit 13.5
         id: install-cuda
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
-          $installer = Join-Path $env:RUNNER_TEMP "cuda_installer\cuda_13.4.0_windows_arm64.exe"
+          $installer = Join-Path $env:RUNNER_TEMP "cuda_installer\cuda_13.5.0_windows_arm64.exe"
           $logDir = Join-Path $env:RUNNER_TEMP "cuda_install_logs"
           $diagDir = Join-Path $env:RUNNER_TEMP "woa_cuda_diagnostics"
           New-Item -ItemType Directory -Force -Path $logDir, $diagDir | Out-Null
@@ -733,15 +734,15 @@ jobs:
           # Minimal compile-time packages (mirrors Linux CI). -n skips reboot.
           # -log / -loglevel:6 writes verbose NVIDIA installer logs for first-run debugging.
           $packages = @(
-            "nvcc_13.4",
-            "cudart_13.4",
-            "crt_13.4",
-            "cublas_13.4",
-            "cublas_dev_13.4",
-            "nvjitlink_13.4",
-            "nvvm_13.4",
-            "thrust_13.4",
-            "visual_studio_integration_13.4"
+            "nvcc_13.5",
+            "cudart_13.5",
+            "crt_13.5",
+            "cublas_13.5",
+            "cublas_dev_13.5",
+            "nvjitlink_13.5",
+            "nvvm_13.5",
+            "cccl_13.5",
+            "visual_studio_integration_13.5"
           )
           # Pass -log as a single argv token; path has no spaces on GHA runners.
           $installArgs = @("-s", "-n", "-log:$logDir", "-loglevel:6") + $packages
@@ -763,7 +764,7 @@ jobs:
           }
 
           $cudaRootCandidates = @(
-            "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4",
+            "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.5",
             "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
           )
           $treePath = Join-Path $diagDir "cuda_install_tree.txt"
@@ -789,7 +790,7 @@ jobs:
             }
           }
 
-          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4"
+          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.5"
           $nvcc = Join-Path $cudaRoot "bin\nvcc.exe"
           $cicc = Join-Path $cudaRoot "nvvm\bin\cicc.exe"
           if ($null -eq $installExit) {
@@ -818,7 +819,7 @@ jobs:
 
           echo "CUDA_PATH=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "CUDA_HOME=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "CUDA_PATH_V13_4=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CUDA_PATH_V13_5=$cudaRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "$cudaRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Upload WoA CUDA install diagnostics
@@ -896,13 +897,13 @@ jobs:
 
       - name: Build CUDA abi3 wheel
         env:
-          COMFY_CUDA_ARCHS: "120f"
+          COMFY_CUDA_ARCHS: "100f;120f"
         shell: bash
         run: |
           set -x
           # Python 3.12 produces the cp312-abi3 wheel (covers 3.12+).
-          # WoA / RTX Spark targets Blackwell (SM 120). Keep the arch set narrow
-          # so the 4-core windows-11-arm runners stay within CI time budgets.
+          # Include both SM 100 and SM 120 Blackwell families. Keep the arch set
+          # limited to Blackwell to control build time on 4-core ARM runners.
           python setup.py bdist_wheel -v
 
       - name: Report compiler-cache statistics

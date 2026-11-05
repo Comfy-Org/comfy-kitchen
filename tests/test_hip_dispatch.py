@@ -246,6 +246,7 @@ def test_hip_drops_gemms_without_matrix_cores():
     # once here instead of carrying a suppression.
     expected_wmma_only = frozenset({
         "fp16_conv3d", "fp16_conv3d_out", "na3d", "sol_attn",
+        "window_attention",
         "scaled_mm_svdquant_w4a4", "scaled_mm_nvfp4",
     })
     assert expected_wmma_only == hip_backend._WMMA_ONLY_OPS

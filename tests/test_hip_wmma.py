@@ -3986,6 +3986,41 @@ def test_na3d_launcher_rejects_a_mismatched_operand(hip):
                     *extents, hip.DTYPE_TO_CODE[torch.float32], stream)
 
 
+@needs_wmma
+def test_window_attention_launcher_rejects_a_mismatched_operand(hip):
+    """q is sized with the query extents and k/v with the key-plane extents, so a
+    short k or v is caught in _C rather than read past its end."""
+    q = torch.zeros(1, 1, 3, 16, 4, 64, device=DEV, dtype=torch.bfloat16)
+    kv = torch.zeros(1, 2, 3, 16, 2, 64, device=DEV, dtype=torch.bfloat16)
+    short = torch.zeros(1, 1, 3, 16, 2, 64, device=DEV, dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    code = hip.DTYPE_TO_CODE[torch.bfloat16]
+
+    def call(k_arg, v_arg, kh=(3,), kw=(5,), tq=1, tk=2, q_arg=q):
+        hip._C.window_attention(hip._dl(q_arg), hip._dl(k_arg), hip._dl(v_arg), hip._dl(out),
+                                1, tq, tk, 3, 16, 4, 2, 64, list(kh), list(kw), 2, 1, 0.125,
+                                code, 0)
+
+    for k_arg, v_arg in ((short, kv), (kv, short)):
+        with pytest.raises(RuntimeError, match="needs at least"):
+            call(k_arg, v_arg)
+    with pytest.raises(ValueError, match="1 to 8 windows"):
+        call(kv, kv, kh=(3,) * 9, kw=(5,) * 9)
+    with pytest.raises(ValueError, match="tq <= tk"):
+        call(kv, kv, tq=3)
+    # Three key planes need more k/v than q, so k/v cannot be checked against q's size.
+    with pytest.raises(RuntimeError, match="needs at least"):
+        call(kv, kv, tk=3)
+    with pytest.raises(RuntimeError, match="packed layout"):
+        call(kv.transpose(2, 3), kv)
+    with pytest.raises(RuntimeError, match="ROCm device"):
+        call(kv.cpu(), kv)
+    with pytest.raises(ValueError, match="overflow"):
+        hip._C.window_attention(hip._dl(q), hip._dl(kv), hip._dl(kv), hip._dl(out),
+                                1, 1, 2, 1 << 30, 1 << 30, 4, 2, 1 << 30, [3], [5], 2, 1,
+                                0.125, code, 0)
+
+
 # ---------------------------------------------------------------------------
 # GatedDeltaNet decode
 #

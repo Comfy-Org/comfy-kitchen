@@ -135,6 +135,14 @@ void launch_na3d_kernel(const void* q, const void* k, const void* v, void* out, 
                         int kh, int kw, int causal_t, int causal_h, int causal_w, float scale,
                         int dtype_code, hipStream_t stream);
 
+// Window attention of (B, Tq, H, W, NH, HD) queries over (B, Tk, H, W, KVH, HD) key
+// planes, n_windows (kh, kw) pairs. See ops/na3d.hip.
+void launch_window_attention_kernel(const void* q, const void* k, const void* v, void* out,
+                                    int batch, int tq, int tk, int h_size, int w_size,
+                                    int num_heads, int kv_heads, int head_dim, const int* kh,
+                                    const int* kw, int n_windows, int temporal_window, int clamp,
+                                    float scale, int dtype_code, hipStream_t stream);
+
 // BF16 decode attention over a fixed-capacity KV cache. The rows of one KV head
 // are a (group, step) grid of query_length = groups * steps rows; `causal` gives
 // row (g, s) the slot limit kv_lengths[b] - steps + s + 1. head_dim is 128 or

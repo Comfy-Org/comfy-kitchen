@@ -2,14 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <hip/hip_runtime.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/vector.h>
 
 #include "launchers.h"
 #include "sage_attention/dense_mask.h"
@@ -1510,6 +1513,30 @@ void ndhwc_to_nchw(nb::ndarray<> src, nb::ndarray<> dst, uintptr_t stream_ptr) {
     check_hip_launch();
 }
 
+// Element count of a packed (B, T, H, W, heads, HD) operand. The extents are
+// caller-supplied, so a wrapped product must not pass the size check.
+static int64_t na_numel(std::initializer_list<int> dims, const char* fn) {
+    int64_t n = 1;
+    for (int d : dims) {
+        if (__builtin_mul_overflow(n, static_cast<int64_t>(d), &n)) {
+            throw std::invalid_argument(std::string(fn) + ": extents overflow int64");
+        }
+    }
+    return n;
+}
+
+// The kernels read every operand off a bare pointer with packed strides they build
+// themselves, on q's device.
+static void require_na_operand(const nb::ndarray<>& t, const nb::ndarray<>& q, int dtype_code,
+                               int64_t need, const char* fn, const char* name) {
+    if (t.device_type() != nb::device::rocm::value || t.device_id() != q.device_id()) {
+        throw std::runtime_error(std::string(fn) + ": " + name + " must be on q's ROCm device");
+    }
+    require_dtype(t, dtype_code, dtype_code, fn, name);
+    require_packed_contiguous(t, fn, name);
+    require_len(t, need, fn, name);
+}
+
 // Fused 3D neighborhood attention. Every extent is caller-supplied and the kernel
 // indexes up to it, so the operands are sized here rather than trusted.
 void na3d(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> out, int batch,
@@ -1531,20 +1558,58 @@ void na3d(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> out, 
     }
     // The kernel reads k and v off bare pointers with q's extents, so a differing
     // dtype or a shorter operand is an out-of-bounds device read.
-    const int64_t need = static_cast<int64_t>(batch) * t_size * h_size * w_size * num_heads *
-                         head_dim;
-    require_dtype(q, dtype_code, dtype_code, kFn, "q");
-    require_dtype(k, dtype_code, dtype_code, kFn, "k");
-    require_dtype(v, dtype_code, dtype_code, kFn, "v");
-    require_dtype(out, dtype_code, dtype_code, kFn, "out");
-    require_len(q, need, kFn, "q");
-    require_len(k, need, kFn, "k");
-    require_len(v, need, kFn, "v");
-    require_len(out, need, kFn, "out");
+    const int64_t need = na_numel({batch, t_size, h_size, w_size, num_heads, head_dim}, kFn);
+    require_na_operand(q, q, dtype_code, need, kFn, "q");
+    require_na_operand(k, q, dtype_code, need, kFn, "k");
+    require_na_operand(v, q, dtype_code, need, kFn, "v");
+    require_na_operand(out, q, dtype_code, need, kFn, "out");
 
     launch_na3d_kernel(q.data(), k.data(), v.data(), out.data(), batch, t_size, h_size, w_size,
                        num_heads, head_dim, kt, kh, kw, causal_t, causal_h, causal_w, scale,
                        dtype_code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// Window attention over stacked key planes. q is sized by (batch, tq, ..., num_heads) and
+// k/v by (batch, tk, ..., kv_heads), the extents the kernel indexes up to.
+void window_attention(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> out,
+                      int batch, int tq, int tk, int h_size, int w_size, int num_heads,
+                      int kv_heads, int head_dim, const std::vector<int>& kh,
+                      const std::vector<int>& kw, int temporal_window, int clamp, float scale,
+                      int dtype_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "window_attention";
+    require_positive(batch, kFn, "batch");
+    require_positive(tq, kFn, "tq");
+    require_positive(tk, kFn, "tk");
+    require_positive(h_size, kFn, "h_size");
+    require_positive(w_size, kFn, "w_size");
+    require_positive(num_heads, kFn, "num_heads");
+    require_positive(kv_heads, kFn, "kv_heads");
+    require_positive(head_dim, kFn, "head_dim");
+    require_positive(temporal_window, kFn, "temporal_window");
+    if (tq > tk || num_heads % kv_heads != 0) {
+        throw std::invalid_argument(std::string(kFn) +
+                                    ": needs tq <= tk and kv_heads dividing num_heads");
+    }
+    if (kh.size() != kw.size() || kh.empty() || kh.size() > 8) {
+        throw std::invalid_argument(std::string(kFn) +
+                                    ": kh and kw need the same length, 1 to 8 windows");
+    }
+    if (dtype_code != 1 && dtype_code != 2) {
+        throw std::runtime_error(std::string(kFn) + ": q must be float16 or bfloat16");
+    }
+    const int64_t need_q = na_numel({batch, tq, h_size, w_size, num_heads, head_dim}, kFn);
+    const int64_t need_k = na_numel({batch, tk, h_size, w_size, kv_heads, head_dim}, kFn);
+    require_na_operand(q, q, dtype_code, need_q, kFn, "q");
+    require_na_operand(k, q, dtype_code, need_k, kFn, "k");
+    require_na_operand(v, q, dtype_code, need_k, kFn, "v");
+    require_na_operand(out, q, dtype_code, need_q, kFn, "out");
+
+    launch_window_attention_kernel(q.data(), k.data(), v.data(), out.data(), batch, tq, tk,
+                                   h_size, w_size, num_heads, kv_heads, head_dim, kh.data(),
+                                   kw.data(), static_cast<int>(kh.size()), temporal_window,
+                                   clamp, scale, dtype_code,
+                                   reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -3388,6 +3453,7 @@ m.def("int4_gemm", &int4_gemm);
           nb::arg("proj_buf"), nb::arg("conv_state"), nb::arg("conv_w"),
           nb::arg("conv_b").none(), nb::arg("qkv_buf"), nb::arg("ctl"), nb::arg("stream_ptr"));
     m.def("na3d", &na3d);
+    m.def("window_attention", &window_attention);
     m.def("flash_attention_decode", &flash_attention_decode, nb::arg("q"), nb::arg("k"),
           nb::arg("v"), nb::arg("kv_lengths"), nb::arg("output"), nb::arg("softmax_lse"),
           nb::arg("softmax_lse_accum"), nb::arg("output_accum"), nb::arg("num_splits"),
