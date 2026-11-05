@@ -141,6 +141,22 @@ class TestLinearW8A16Triton:
         _check(_triton(x, w, b), x, w, b)
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("m", [4, 200])
+    def test_bias_rounded_first(self, dtype, m):
+        """Exact check of the bias rounding: out = 1 + b with an fp32 b just above half an
+        ulp of 1. Rounded to x's dtype first (the reference), b is exactly half an ulp and
+        1 + b ties to 1; added unrounded in fp32 it would round up to 1 + ulp."""
+        _require_triton()
+        k, n = 64, 96
+        x = torch.zeros(m, k, device="cuda", dtype=dtype)
+        x[:, 0] = 1
+        w = torch.ones(n, k, device="cuda").to(FP8)
+        b = torch.full((n,), torch.finfo(dtype).eps / 2 * (1 + 2**-12), device="cuda")
+        out = _triton(x, w, b)
+        assert torch.equal(out, _ref(x, w, b))
+        assert torch.all(out == 1)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     @pytest.mark.parametrize("m", [1, 8, 128])
     def test_every_fp8_value_exact(self, dtype, m):
         """x = rows of the identity: out[i, j] = weight[j, i], exactly. Covers every
