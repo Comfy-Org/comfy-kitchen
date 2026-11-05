@@ -7,6 +7,8 @@ kernel keeps the whole chain in fp32 and rounds once, so it is compared to eager
 tolerance and to an fp32 reference.
 """
 
+import importlib
+
 import pytest
 import torch
 from torch.nn import functional
@@ -25,6 +27,10 @@ def _reference(x, gamma, scale, eps=1e-12):
 
 def _rel(a, b):
     return ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-12)).item()
+
+
+def _randn(*shape, dtype):
+    return torch.randn(shape, device="cuda", dtype=dtype)
 
 
 class TestL2NormSiluEager:
@@ -110,6 +116,55 @@ class TestL2NormSiluTriton:
             with ck.use_backend("triton"):
                 got = ck.l2_norm_silu(xx, g, 32 ** 0.5)
             assert _rel(got, eager_backend.l2_norm_silu(xx, g, 32 ** 0.5)) < 1e-2
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("layout", [
+        "channels_last_3d",     # read in place, position stride C
+        "channels_last",        # 4D, read in place
+        "channels_last_b2",     # batch 2, channels last
+        "last_dim_step2",       # x[..., ::2]: position stride 2
+        "batch_step2",          # x[::2]: batch stride 2 * C * P
+        "spatial_transposed",   # H and W swapped: no single position stride, copied
+        "time_sliced",          # x[:, :, 1:] of a T-major tensor: copied
+    ])
+    def test_strided_input_matches_contiguous(self, dtype, layout):
+        # a strided x must give the output of the same values made contiguous to within one
+        # rounding step (the in-chunk reduction order follows the load layout), and match eager
+        g = torch.rand(48, device="cuda") + 0.5
+        cl3, cl = torch.channels_last_3d, torch.channels_last
+        make = {
+            "channels_last_3d": lambda: _randn(1, 48, 3, 9, 13, dtype=dtype).to(memory_format=cl3),
+            "channels_last": lambda: _randn(1, 48, 17, 23, dtype=dtype).to(memory_format=cl),
+            "channels_last_b2": lambda: _randn(2, 48, 2, 9, 13, dtype=dtype).to(memory_format=cl3),
+            "last_dim_step2": lambda: _randn(1, 48, 3, 9, 26, dtype=dtype)[..., ::2],
+            "batch_step2": lambda: _randn(4, 48, 3, 9, 13, dtype=dtype)[::2],
+            "spatial_transposed": lambda: _randn(1, 48, 3, 13, 9, dtype=dtype).transpose(3, 4),
+            "time_sliced": lambda: _randn(1, 3, 48, 9, 13, dtype=dtype).transpose(1, 2)[:, :, 1:],
+        }
+        x = make[layout]()
+        assert not x.is_contiguous()
+        with ck.use_backend("triton"):
+            got = ck.l2_norm_silu(x, g, 48 ** 0.5)
+            want = ck.l2_norm_silu(x.contiguous(), g, 48 ** 0.5)
+        assert got.is_contiguous() and got.shape == x.shape
+        eps = torch.finfo(dtype).eps
+        torch.testing.assert_close(got, want, rtol=eps, atol=eps)
+        tol = 1e-2 if dtype == torch.bfloat16 else 2e-3
+        assert _rel(got, eager_backend.l2_norm_silu(x, g, 48 ** 0.5)) < tol
+
+    def test_position_stride(self):
+        # which layouts the kernel reads in place (a position stride) and which it copies (None)
+        kernel = importlib.import_module("comfy_kitchen.backends.triton.l2_norm_silu")
+        x = torch.empty(2, 48, 3, 9, 13)
+        assert kernel._position_stride(x) == 1
+        assert kernel._position_stride(x.to(memory_format=torch.channels_last_3d)) == 48
+        assert kernel._position_stride(x[:, :, 0].to(memory_format=torch.channels_last)) == 48
+        assert kernel._position_stride(torch.empty(1, 48, 3, 9, 26)[..., ::2]) == 2
+        assert kernel._position_stride(x[..., ::2]) is None  # 13 is odd: rows do not line up
+        assert kernel._position_stride(x[:, :, :1]) == 1
+        assert kernel._position_stride(x.transpose(3, 4)) is None
+        assert kernel._position_stride(x[:, :, 1:]) == 1  # channel stride is not P: fine
+        assert kernel._position_stride(x.transpose(1, 2)[:, :, 1:]) is None
 
     @pytest.mark.parametrize("shape", [(0, 64, 32), (2, 0, 32), (2, 64, 0), (1, 16, 0, 4, 4)])
     def test_empty_input_goes_to_eager(self, shape):
