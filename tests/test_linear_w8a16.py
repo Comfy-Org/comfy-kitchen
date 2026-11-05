@@ -51,10 +51,16 @@ def _inputs(m, k, n, dtype, bias="fp8", device="cuda"):
 
 
 def _require_triton():
+    """Skip unless the triton backend can run the kernel on this GPU: on NVIDIA that
+    needs the SM version of the triton constraint (8.9, FP8 e4m3 conversion)."""
     if not torch.cuda.is_available():
         pytest.skip("GPU required")
     if "triton" not in get_capable_backends("linear_w8a16", "cuda"):
         pytest.skip("triton backend not capable for linear_w8a16")
+    need = ck.registry.get_constraints("triton", "linear_w8a16").min_compute_capability
+    have = torch.cuda.get_device_capability()
+    if need is not None and have < need:
+        pytest.skip(f"triton linear_w8a16 needs SM {need[0]}.{need[1]}+ (FP8 e4m3), have {have}")
 
 
 @contextlib.contextmanager
