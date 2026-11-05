@@ -29,7 +29,7 @@ configs plus small GEMM tiles), more rows another (GEMM tiles), keyed on N, K
 and the row count (rounded up to a power of two above SMALL_M, so a new text
 length does not trigger a new tuning run). Configs whose block_k does not divide K,
 or whose pipelined tiles do not fit the device's shared memory (64 KB of LDS on
-gfx1151 vs ~99 KB on an RTX 5090), are pruned before tuning; every list has
+gfx1151 / gfx1201 vs ~99 KB on an RTX 5090), are pruned before tuning; every list has
 a small block_k 32 entry, so K % K_MULTIPLE == 0 always leaves at least one.
 """
 
@@ -52,12 +52,21 @@ SMALL_M = 8
 # kernel's time vs the cast path at 384 / 512 rows: 3072 -> 3072 0.79x / 1.02x,
 # 3072 -> 12288 0.64x / 0.79x, 12288 -> 3072 0.46x / 0.62x; so 384 rows, below
 # the first measured loss.
-HIP_MAX_ROWS = {"gfx1151": 384}
+# AMD Radeon AI PRO R9700 (gfx1201), same rule: every weight of 9.4M elements or
+# more (Qwen-Image / Flux.1 dev projections, FFN, modulation) wins at every row
+# count measured up to 1024 (0.17x - 0.90x) and loses from 2048 rows on (1.08x -
+# 1.45x); at 512 / 1024 / 2048 rows 3072 -> 3072 0.68x / 0.86x / 1.13x,
+# 3072 -> 12288 0.65x / 0.90x / 1.16x, 12288 -> 3072 0.61x / 0.79x / 1.08x; so
+# 1024 rows. With this gate the linear time of one forward drops by 12.9%
+# (Qwen-Image cond), 13.2% (uncond) and 8.9% (Flux.1 dev).
+HIP_MAX_ROWS = {"gfx1151": 384, "gfx1201": 1024}
 # Fewer weight elements than this stay on eager too: for a weight that small (the
 # gfx1151 measurement: 256 -> 3072, 0.8 MB of FP8) the saved weight read is worth
 # less than the triton launch path costs on the CPU, and a back-to-back call was
-# 1.41x slower than the cast path (768 -> 3072, 2.4 MB: 0.82x, faster).
-HIP_MIN_WEIGHT = {"gfx1151": 1 << 21}
+# 1.41x slower than the cast path (768 -> 3072, 2.4 MB: 0.82x, faster). On gfx1201
+# 768 -> 3072 (2.4M elements) is still 1.31x slower at one row (the public op's
+# dispatch costs more than the kernel), 3072 -> 3072 (9.4M) 0.50x faster.
+HIP_MIN_WEIGHT = {"gfx1151": 1 << 21, "gfx1201": 1 << 22}
 
 
 def _mm(bm, bn, bk, group_m, num_warps, num_stages):
