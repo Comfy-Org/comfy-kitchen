@@ -14,9 +14,17 @@ def fp16_conv3d(
     bias: Tensor | None,
     residual: Tensor | None,
     stride: list[int],
+    zero_border: bool = False,
 ) -> Tensor:
     """3D conv with zero padding plus an optional residual add (torch's
-    accumulate mode; the CUDA backend accumulates in fp16)."""
+    accumulate mode; the CUDA backend accumulates in fp16).
+
+    zero_border reads a border of zeros around x instead of asking the caller
+    to pad it: the border is (R-1)/2 and (S-1)/2, so the output is x's size.
+    """
+    if zero_border:
+        _, _, _, r, s = weight.shape
+        x = functional.pad(x, (s // 2, s // 2, r // 2, r // 2, 0, 0))
     out = functional.conv3d(x, weight, bias, stride=stride)
     out = out if residual is None else out + residual
     return out.contiguous(memory_format=torch.channels_last_3d)  # like the CUDA backend and the fake
@@ -67,16 +75,21 @@ def _op_fp16_conv3d(
     bias: torch.Tensor | None,
     residual: torch.Tensor | None,
     stride: list[int],
+    zero_border: bool = False,
 ) -> torch.Tensor:
-    kwargs = {"x": x, "weight": weight, "bias": bias, "residual": residual, "stride": stride}
+    kwargs = {"x": x, "weight": weight, "bias": bias, "residual": residual, "stride": stride,
+              "zero_border": zero_border}
     impl = registry.get_implementation("fp16_conv3d", kwargs=kwargs)
     return impl(**kwargs)
 
 
 @_op_fp16_conv3d.register_fake
-def _op_fp16_conv3d_fake(x, weight, bias, residual, stride):
+def _op_fp16_conv3d_fake(x, weight, bias, residual, stride, zero_border=False):
     n, _, d, h, w = x.shape
     k, _, t, r, s = weight.shape
     sd, sh, sw = stride
     shape = (n, k, (d - t) // sd + 1, (h - r) // sh + 1, (w - s) // sw + 1)
+    if zero_border:
+        shape = (n, k, (d - t) // sd + 1, (h + 2 * ((r - 1) // 2) - r) // sh + 1,
+                 (w + 2 * ((s - 1) // 2) - s) // sw + 1)
     return torch.empty(shape, dtype=x.dtype, device=x.device, memory_format=torch.channels_last_3d)

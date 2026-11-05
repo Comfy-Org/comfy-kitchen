@@ -27,6 +27,49 @@ from comfy_kitchen.float_utils import (
 from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
 from triton.language.extra import libdevice
 
+# ``cvt.rn.satfinite.e2m1x2.f32`` and ``cvt.rn.f16x2.e2m1x2`` are SM100 (Blackwell)
+# PTX. On a ROCm build Triton's AMDGPU backend does not know them: LLVM reports
+# "could not allocate output register" and the inline asm silently becomes a
+# no-op, so the kernels return uninitialised registers instead of failing. The
+# arithmetic-conversion path below is bit-identical to the instruction on every
+# target, so it is the one used whenever this build is not NVIDIA.
+_NVFP4_INLINE_PTX = not getattr(torch.version, "hip", None)
+
+
+@triton.jit
+def _e2m1_code_to_f32(code):
+    """Decode one 4-bit e2m1 code (sign, 2 exponent, 1 mantissa) to float32.
+
+    Portable equivalent of the ``cvt.rn.f16x2.e2m1x2`` unpack. The three-bit
+    magnitude is assembled straight into the float32 bit pattern: exponents
+    1..3 map to unbiased -1..1, and exponent 0 is the single subnormal 0.5*m.
+    """
+    sign = (code & 0x8) << 28  # e2m1 bit 3 -> float32 bit 31
+    m = code & 0x1
+    e = (code >> 1) & 0x3
+    subnormal = m * 0x3F000000  # 0.5 when m == 1
+    normal = ((126 + e) << 23) | (m << 22)
+    return (tl.where(e == 0, subnormal, normal) | sign).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _f32_to_e2m1_code(x):
+    """Round float32 to an e2m1 code, round-to-nearest-even and saturating.
+
+    Portable equivalent of ``cvt.rn.satfinite.e2m1x2.f32``. The comparison
+    thresholds are the midpoints between consecutive representable magnitudes
+    (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0); the ones landing on an even
+    mantissa are strict so that a tie rounds down, and the last one is strict
+    so that 5.0 saturates to 4.0 rather than 6.0. Matches
+    ``float_utils._f32_to_floatx_unpacked(x, 2, 1)`` bit for bit, including the
+    sign of -0.0.
+    """
+    a = tl.abs(x)
+    sign = (x.to(tl.int32, bitcast=True) >> 28) & 0x8
+    code = (a > 0.25).to(tl.int32) + (a >= 0.75).to(tl.int32) + (a > 1.25).to(tl.int32)
+    code += (a >= 1.75).to(tl.int32) + (a > 2.5).to(tl.int32) + (a >= 3.5).to(tl.int32)
+    return code + (a > 5.0).to(tl.int32) + sign
+
 
 @triton.jit
 def quantize_fp8_kernel_tl(
@@ -209,6 +252,7 @@ def quantize_nvfp4_kernel_tl(
     block_size: tl.constexpr,
     blocks_per_program: tl.constexpr,
     hi_first: tl.constexpr,
+    use_ptx: tl.constexpr,
 ):
     """Single Triton kernel for NVFP4 quantization with packing and scale swizzling.
 
@@ -236,6 +280,8 @@ def quantize_nvfp4_kernel_tl(
         padded_scale_cols: Padded scale cols for swizzle
         block_size: Size of each quantization block (typically 16)
         blocks_per_program: Number of blocks to process per program
+        use_ptx: Use the SM100 cvt.rn.satfinite.e2m1x2.f32 instruction instead of
+            the portable conversion. Only valid on an NVIDIA build.
     """
     # Get program IDs - each program processes blocks_per_program blocks
     pid_m = tl.program_id(axis=0)
@@ -300,30 +346,38 @@ def quantize_nvfp4_kernel_tl(
             f32_even = tl.sum(tl.where(indices == even_idx[:, None], data_scaled, 0), axis=1)
             f32_odd = tl.sum(tl.where(indices == odd_idx[:, None], data_scaled, 0), axis=1)
 
-            # cvt.rn.satfinite.e2m1x2.f32 packs $1 into the high nibble, $2 into the low nibble.
+            # The high nibble holds the first element of the pair and the low
+            # nibble the second: cvt.rn.satfinite.e2m1x2.f32 packs $1 high / $2 low,
+            # and _f32_to_e2m1_code codes are combined the same way.
             if hi_first:
                 asm_arg_hi, asm_arg_lo = f32_even, f32_odd
             else:
                 asm_arg_hi, asm_arg_lo = f32_odd, f32_even
 
-            packed_bytes_u16 = tl.inline_asm_elementwise(
-                asm="""
-                {
-                    .reg .b8 fp4_byte;
-                    .reg .b16 result;
-                    cvt.rn.satfinite.e2m1x2.f32 fp4_byte, $1, $2;
-                    mov.b16 result, {fp4_byte, 0};
-                    mov.u16 $0, result;
-                }
-                """,
-                constraints="=h,f,f",
-                args=[asm_arg_hi, asm_arg_lo],
-                dtype=tl.uint16,
-                is_pure=True,
-                pack=1,
-            )
-            # Extract the low byte
-            packed_bytes = (packed_bytes_u16 & 0xFF).to(tl.uint8)
+            if use_ptx:
+                packed_bytes_u16 = tl.inline_asm_elementwise(
+                    asm="""
+                    {
+                        .reg .b8 fp4_byte;
+                        .reg .b16 result;
+                        cvt.rn.satfinite.e2m1x2.f32 fp4_byte, $1, $2;
+                        mov.b16 result, {fp4_byte, 0};
+                        mov.u16 $0, result;
+                    }
+                    """,
+                    constraints="=h,f,f",
+                    args=[asm_arg_hi, asm_arg_lo],
+                    dtype=tl.uint16,
+                    is_pure=True,
+                    pack=1,
+                )
+                # Extract the low byte
+                packed_bytes = (packed_bytes_u16 & 0xFF).to(tl.uint8)
+            else:
+                packed_bytes = (
+                    (_f32_to_e2m1_code(asm_arg_hi) << 4)
+                    | _f32_to_e2m1_code(asm_arg_lo)
+                ).to(tl.uint8)
 
             # Store packed bytes
             out_offs = pid_m * (n // 2) + pid_n * (block_size // 2) + pair_idx
@@ -406,6 +460,7 @@ def quantize_nvfp4(
         block_size=block_size,
         blocks_per_program=blocks_per_program,
         hi_first=hi_first,
+        use_ptx=_NVFP4_INLINE_PTX,
     )
 
     # Reshape packed output to original shape (with last dim halved)
@@ -423,12 +478,14 @@ def dequantize_nvfp4_kernel_tl(
     global_scale_ptr,
     output_ptr,
     n,
+    total_packed,
     scale_cols,
     n_col_blocks,
     padded_scale_cols,
     block_size: tl.constexpr,
     tile_size: tl.constexpr,
     hi_first: tl.constexpr,
+    use_ptx: tl.constexpr,
 ):
     """Dequantizes FP4 packed data using per-block scaling factors.
 
@@ -438,11 +495,14 @@ def dequantize_nvfp4_kernel_tl(
         output_ptr (tl.pointer): Pointer to output tensor (m x n)
         global_scale_ptr (tl.pointer): Pointer to global scale tensor
         n (int): Number of columns in unpacked tensor
+        total_packed (int): Total number of packed elements, m * (n // 2)
         scale_cols (int): Number of scale columns (n // block_size)
         n_col_blocks (int): Number of 4-column blocks in scales
         padded_scale_cols (int): Padded scale columns (n_col_blocks * 4)
         block_size (tl.constexpr): Size of each FP4 quantization block
         tile_size (tl.constexpr): Size of the processing tile (in packed elements)
+        use_ptx: Use the SM100 cvt.rn.f16x2.e2m1x2 instruction instead of the
+            portable conversion. Only valid on an NVIDIA build.
     """
     # Get program ID for processing packed elements
     pid = tl.program_id(0)
@@ -455,8 +515,11 @@ def dequantize_nvfp4_kernel_tl(
     packed_row_idx = packed_offs // (n // 2)
     packed_col_idx = packed_offs % (n // 2)
 
-    # Create mask for packed data bounds checking
-    packed_mask = packed_col_idx < (n // 2)
+    # The tile is the last one whenever total_packed is not a multiple of
+    # tile_size, so bound the whole packed index range rather than the column:
+    # the column is already in range by construction, but an out-of-range row
+    # would turn the stores below into out-of-bounds writes.
+    packed_mask = packed_offs < total_packed
 
     # Load global scale
     global_scale = tl.load(global_scale_ptr)
@@ -464,30 +527,37 @@ def dequantize_nvfp4_kernel_tl(
     # Load packed data
     packed_data = tl.load(packed_ptr + packed_offs, mask=packed_mask, other=0)
 
-    # Unpack packed FP4 values (uint8) to float16x2
-    x_f16x2_packed = tl.inline_asm_elementwise(
-        asm="""
-        {
-            .reg .b8 byte0, byte1, byte2, byte3;
-            mov.b32 {byte0, byte1, byte2, byte3}, $4;
-            cvt.rn.f16x2.e2m1x2 $0, byte0;
-            cvt.rn.f16x2.e2m1x2 $1, byte1;
-            cvt.rn.f16x2.e2m1x2 $2, byte2;
-            cvt.rn.f16x2.e2m1x2 $3, byte3;
-        }
-        """,
-        constraints="=r,=r,=r,=r,r",
-        args=[packed_data],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=4,
-    )
-    val_low = (
-        (x_f16x2_packed & 0xFFFF).cast(tl.uint16).cast(tl.float16, bitcast=True).cast(tl.float32)
-    )
-    val_high = (
-        (x_f16x2_packed >> 16).cast(tl.uint16).cast(tl.float16, bitcast=True).cast(tl.float32)
-    )
+    if use_ptx:
+        # Unpack packed FP4 values (uint8) to float16x2
+        x_f16x2_packed = tl.inline_asm_elementwise(
+            asm="""
+            {
+                .reg .b8 byte0, byte1, byte2, byte3;
+                mov.b32 {byte0, byte1, byte2, byte3}, $4;
+                cvt.rn.f16x2.e2m1x2 $0, byte0;
+                cvt.rn.f16x2.e2m1x2 $1, byte1;
+                cvt.rn.f16x2.e2m1x2 $2, byte2;
+                cvt.rn.f16x2.e2m1x2 $3, byte3;
+            }
+            """,
+            constraints="=r,=r,=r,=r,r",
+            args=[packed_data],
+            dtype=tl.uint32,
+            is_pure=True,
+            pack=4,
+        )
+        val_low = (
+            (x_f16x2_packed & 0xFFFF).cast(tl.uint16).cast(tl.float16, bitcast=True).cast(tl.float32)
+        )
+        val_high = (
+            (x_f16x2_packed >> 16).cast(tl.uint16).cast(tl.float16, bitcast=True).cast(tl.float32)
+        )
+    else:
+        # Same split, taken with ordinary bit operations: the low nibble of each
+        # byte holds the even element and the high nibble the odd one.
+        byte = (packed_data & 0xFF).to(tl.int32)
+        val_low = _e2m1_code_to_f32(byte & 0x0F)
+        val_high = _e2m1_code_to_f32((byte >> 4) & 0x0F)
 
     # Calculate output positions for both values
     out_col_low = packed_col_idx * 2
@@ -545,7 +615,8 @@ def dequantize_nvfp4(
     output_type: torch.dtype = torch.bfloat16,
     hi_first: bool = True,
 ) -> torch.Tensor:
-    # Triton backend: fused kernel with inline SM100 cvt.rn.f16x2.e2m1x2 instruction
+    # Triton backend: fused kernel. Uses the inline SM100 cvt.rn.f16x2.e2m1x2
+    # instruction on an NVIDIA build and the portable equivalent otherwise.
     block_size = 16
     tile_size = 128
 
@@ -562,9 +633,11 @@ def dequantize_nvfp4(
     output_shape[-1] = n
     output = torch.empty(output_shape, dtype=output_type, device=qx.device)
 
+    total_packed = qx.numel()
+
     # Calculate total number of elements and grid size
     def grid(meta):
-        return (triton.cdiv(qx.numel(), meta["tile_size"]),)
+        return (triton.cdiv(total_packed, meta["tile_size"]),)
 
     dequantize_nvfp4_kernel_tl[grid](
         qx,
@@ -572,12 +645,14 @@ def dequantize_nvfp4(
         per_tensor_scale,
         output,
         n,
+        total_packed,
         scale_cols,
         n_col_blocks,
         padded_scale_cols,
         block_size=block_size,
         tile_size=tile_size,
         hi_first=hi_first,
+        use_ptx=_NVFP4_INLINE_PTX,
     )
 
     return output

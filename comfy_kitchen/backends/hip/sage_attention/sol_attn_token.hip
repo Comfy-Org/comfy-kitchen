@@ -318,7 +318,7 @@ __global__ __launch_bounds__(kThreads) void sol_token_kernel(
         bmax = fmaxf(bmax, swap_half_wave(bmax));
         has = has || swap_half_wave_b32(static_cast<uint32_t>(has)) != 0u;
         if (!has) bmax = c_r;
-        const float alpha = exp2f(c_r - bmax);
+        const float alpha = hw_exp2(c_r - bmax);
         c_r = bmax;
         m_r = fmaxf(m_r, bmax);
 
@@ -330,7 +330,7 @@ __global__ __launch_bounds__(kThreads) void sol_token_kernel(
             uint32_t packed[8];
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                packed[e] = prob_to_u8(exp2f(p_val[kt][e] - m_off));
+                packed[e] = prob_to_u8(hw_exp2(p_val[kt][e] - m_off));
                 li += packed[e];
             }
             p_frag[kt] = pack_prob_frag(packed, lane);
@@ -370,7 +370,7 @@ __global__ __launch_bounds__(kThreads) void sol_token_kernel(
     if (row >= NG) return;
     // rescaled to m_r, which is what the merge exponentiates against
     const size_t qs = (static_cast<size_t>(split) * gridDim.z + bh) * NG + row;
-    const float f = m_r > kTileMasked ? exp2f(c_r - m_r) : 1.f;
+    const float f = m_r > kTileMasked ? hw_exp2(c_r - m_r) : 1.f;
     if (half == 0) {
         part_m[qs] = m_r;
         part_l[qs] = l_r * f;
@@ -432,13 +432,13 @@ __global__ __launch_bounds__(HD) void sol_token_merge_kernel(
     float l = 0.f, o = 0.f;
     if (m > kTileMasked) {
         if (rm > kTileMasked) {
-            const float w = exp2f(rm - m);
+            const float w = hw_exp2(rm - m);
             l += rl * w;
             o += ro * w;
         }
         for (int s = 0; s < nsplit; ++s) {
             const size_t p = qg + s * stride;
-            const float w = part_m[p] > kTileMasked ? exp2f(part_m[p] - m) : 0.f;
+            const float w = part_m[p] > kTileMasked ? hw_exp2(part_m[p] - m) : 0.f;
             l += part_l[p] * w;
             o += static_cast<float>(part_o[p * HD + c]) * w;
         }

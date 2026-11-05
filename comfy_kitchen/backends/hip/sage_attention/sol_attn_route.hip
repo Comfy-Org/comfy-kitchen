@@ -227,7 +227,7 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
             for (int e = 0; e < 8; ++e) m_new = fmaxf(m_new, pv[kt][e]);
         }
         m_new = fmaxf(m_new, swap_half_wave(m_new));
-        const float alpha = exp2f(m_r - m_new);
+        const float alpha = hw_exp2(m_r - m_new);
         m_r = m_new;
 
         float l_add = 0.f;
@@ -235,7 +235,7 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
         for (int kt = 0; kt < KT; ++kt) {
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                const float p = pv[kt][e] <= kNeg ? 0.f : exp2f(pv[kt][e] - m_new);
+                const float p = pv[kt][e] <= kNeg ? 0.f : hw_exp2(pv[kt][e] - m_new);
                 pv[kt][e] = p;
                 l_add += p * sLen[kt * 16 + acc_row(lane, e)];
             }
