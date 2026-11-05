@@ -32,6 +32,7 @@ from comfy_kitchen.allocation import allocation_context
 
 __all__ = [
     "na3d",
+    "window_attention",
     "delaunay3d",
     "mesh_bvh",
     "closest_point_on_mesh",
@@ -233,6 +234,7 @@ from comfy_kitchen.constraints import (  # noqa: E402
     na3d_common_call_rule,
     rms_rope_norm_over_heads_call_rule,
     sol_attn_common_call_rule,
+    window_attention_common_call_rule,
     with_out_param,
     with_w4a8_packed_storage,
 )
@@ -2877,6 +2879,44 @@ def na3d(
     return out
 
 
+_NA3D_HEAD_DIMS = (16, 32, 48, 64, 128)
+
+
+def window_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kh: list[int],
+    kw: list[int],
+    temporal_window: int,
+    clamp: bool,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Window attention over stacked key planes, ``(B, Tq, H, W, NH, HD)``
+    queries against ``(B, Tk, H, W, KVH, HD)`` keys. See ops/na3d.cu."""
+    batch, tq, h, w, nh, hd = q.shape
+    if scale is None:
+        scale = hd ** -0.5
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    out = torch.empty_like(q)
+    stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
+    _C.window_attention(
+        _wrap_for_dlpack(q),
+        _wrap_for_dlpack(k),
+        _wrap_for_dlpack(v),
+        _wrap_for_dlpack(out),
+        batch, tq, k.shape[1], h, w, nh, k.shape[4], hd,
+        [int(x) for x in kh], [int(x) for x in kw],
+        int(temporal_window), int(clamp),
+        float(scale),
+        DTYPE_TO_CODE[q.dtype],
+        stream_ptr,
+    )
+    return out
+
+
 _SOL_HD = 128
 _SOL_VSCALE_MARGIN = 1.1   # clip headroom on last step's V absmax
 # Slice sizes that bound sol_attn's top-k temporaries
@@ -4491,17 +4531,31 @@ def gemv_awq_w4a16(
 
 
 def _build_constraints() -> dict:
+    def _na3d_launch_rule(q):
+        # head dims the kernel is built for, and grid y = T * H, grid z = B * heads
+        if q is not None:
+            if q.shape[-1] not in _NA3D_HEAD_DIMS:
+                return ValidationResult.fail("q", f"head_dim must be one of {_NA3D_HEAD_DIMS}")
+            if q.shape[1] * q.shape[2] > 65535 or q.shape[0] * q.shape[4] > 65535:
+                return ValidationResult.fail("q", "grid dims exceed CUDA limits")
+        return ValidationResult.ok()
+
     def _na3d_call_rule(kwargs):
         common = na3d_common_call_rule(kwargs)
         if not common.success:
             return common
-        q = kwargs.get("q")
-        if q is not None:
-            hd = q.shape[-1]
-            if hd % 16 != 0 or hd > 64:
-                return ValidationResult.fail("q", "head_dim must be a multiple of 16 and <= 64")
-            if q.shape[1] * q.shape[2] > 65535 or q.shape[0] * q.shape[4] > 65535:
-                return ValidationResult.fail("q", "grid dims exceed CUDA limits")
+        return _na3d_launch_rule(kwargs.get("q"))
+
+    def _window_attention_call_rule(kwargs):
+        common = window_attention_common_call_rule(kwargs)
+        if not common.success:
+            return common
+        launch = _na3d_launch_rule(kwargs.get("q"))
+        if not launch.success:
+            return launch
+        kh = kwargs.get("kh")
+        if kh is not None and len(kh) > 8:
+            return ValidationResult.fail("kh", "at most 8 distinct per-plane windows")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -4544,6 +4598,25 @@ def _build_constraints() -> dict:
             default_devices=cuda_devices,
             min_compute_capability=(8, 0),
             call_rules=(_na3d_call_rule,),
+        ),
+        "window_attention": FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(6),),
+                ),
+                "k": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(6),),
+                ),
+                "v": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(6),),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
+            call_rules=(_window_attention_call_rule,),
         ),
         "delaunay3d": FunctionConstraints(
             params={
@@ -4698,7 +4771,7 @@ def _build_constraints() -> dict:
         "quantize_nvfp4": FunctionConstraints(
             params={
                 "x": ParamConstraint(
-                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
                     shape_rules=(ExactDims(2),),
                 ),
                 "per_tensor_scale": ParamConstraint(
