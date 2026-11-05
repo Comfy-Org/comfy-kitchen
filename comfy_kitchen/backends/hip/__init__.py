@@ -59,6 +59,7 @@ logger = logging.getLogger("comfy_kitchen.hip")
 __all__ = [
     "adaln",
     "na3d",
+    "window_attention",
     "rms_adaln",
     "fp16_conv3d",
     "fp16_conv3d_out",
@@ -214,6 +215,7 @@ _WMMA_ONLY_OPS = frozenset({
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
     "na3d",
+    "window_attention",
     "sol_attn",
     "convrot_w4a4_linear",
     "scaled_mm_svdquant_w4a4",
@@ -1980,6 +1982,52 @@ def na3d(
     return out
 
 
+_NA3D_HEAD_DIMS = (16, 32, 48, 64, 128)
+
+
+def window_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kh: list[int],
+    kw: list[int],
+    temporal_window: int,
+    clamp: bool,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Window attention over stacked key planes, ``(B, Tq, H, W, NH, HD)``
+    queries against ``(B, Tk, H, W, KVH, HD)`` keys. See ops/na3d.hip."""
+    batch, tq, h, w, num_heads, head_dim = q.shape
+    if scale is None:
+        scale = head_dim ** -0.5
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    out = torch.empty_like(q)
+    _C.window_attention(
+        _dl(q),
+        _dl(k),
+        _dl(v),
+        _dl(out),
+        batch,
+        tq,
+        k.shape[1],
+        h,
+        w,
+        num_heads,
+        k.shape[4],
+        head_dim,
+        [int(x) for x in kh],
+        [int(x) for x in kw],
+        int(temporal_window),
+        int(clamp),
+        float(scale),
+        DTYPE_TO_CODE[q.dtype],
+        _stream(q),
+    )
+    return out
+
+
 def _adaln_impl(kernel, x, scale, shift, eps) -> torch.Tensor:
     """``kernel`` is _C.adaln (LayerNorm) or _C.rms_adaln (RMSNorm)."""
     from comfy_kitchen.backends._modulation import adaln_prep_modulation
@@ -2909,6 +2957,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ValidationResult,
         na3d_common_call_rule,
         sol_attn_common_call_rule,
+        window_attention_common_call_rule,
         with_out_param,
     )
 
@@ -2919,19 +2968,31 @@ def _build_constraints(has_wmma: bool = True) -> dict:
     fp8s = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
     out_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
 
+    def _na3d_launch_rule(q):
+        # Head dims the kernel is built for, and grid y = T * H, grid z = B * heads.
+        if q is not None:
+            if q.shape[-1] not in _NA3D_HEAD_DIMS:
+                return ValidationResult.fail("q", f"head_dim must be one of {_NA3D_HEAD_DIMS}")
+            if q.shape[1] * q.shape[2] > 65535 or q.shape[0] * q.shape[4] > 65535:
+                return ValidationResult.fail("q", "grid dims exceed HIP limits")
+        return ValidationResult.ok()
+
     def _na3d_call_rule(kwargs):
         common = na3d_common_call_rule(kwargs)
         if not common.success:
             return common
-        q = kwargs.get("q")
-        if q is not None:
-            head_dim = q.shape[-1]
-            # The WMMA K-step is 16 wide and the output accumulators are held in
-            # registers, one 16-column tile each.
-            if head_dim % 16 != 0 or head_dim > 64:
-                return ValidationResult.fail("q", "head_dim must be a multiple of 16 and <= 64")
-            if q.shape[1] * q.shape[2] > 65535 or q.shape[0] * q.shape[4] > 65535:
-                return ValidationResult.fail("q", "grid dims exceed HIP limits")
+        return _na3d_launch_rule(kwargs.get("q"))
+
+    def _window_attention_call_rule(kwargs):
+        common = window_attention_common_call_rule(kwargs)
+        if not common.success:
+            return common
+        launch = _na3d_launch_rule(kwargs.get("q"))
+        if not launch.success:
+            return launch
+        kh = kwargs.get("kh")
+        if kh is not None and len(kh) > 8:
+            return ValidationResult.fail("kh", "at most 8 distinct per-plane windows")
         return ValidationResult.ok()
 
     bf16_param = ParamConstraint(dtypes=frozenset({torch.bfloat16}))
@@ -2974,6 +3035,15 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             },
             default_devices=dev,
             call_rules=(_na3d_call_rule,),
+        ),
+        "window_attention": FunctionConstraints(
+            params={
+                "q": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(6),)),
+                "k": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(6),)),
+                "v": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(6),)),
+            },
+            default_devices=dev,
+            call_rules=(_window_attention_call_rule,),
         ),
         "quantize_per_tensor_fp8": FunctionConstraints(
             params={

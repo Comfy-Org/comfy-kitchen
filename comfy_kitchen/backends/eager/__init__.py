@@ -7,6 +7,7 @@ __all__ = [
     "group_norm_silu_pad3d_out",
     "group_norm_stats3d",
     "na3d",
+    "window_attention",
     "sol_attn",
     "rms_adaln",
     "apply_rope",
@@ -70,6 +71,7 @@ from comfy_kitchen.constraints import (
     ParamConstraint,
     na3d_common_call_rule,
     sol_attn_common_call_rule,
+    window_attention_common_call_rule,
     with_out_param,
     with_w4a8_packed_storage,
 )
@@ -86,7 +88,7 @@ from .convrot_w4a4 import (
 )
 from .group_norm_pad3d import group_norm_silu_pad3d, group_norm_silu_pad3d_out, group_norm_stats3d
 from .linear_act import linear_gelu
-from .na import na3d
+from .na import na3d, window_attention
 from .quantization import (
     dequantize_int8_convrot_weight,
     dequantize_int8_convrot_weight_dtype,
@@ -703,6 +705,15 @@ def _build_constraints() -> dict:
         },
         default_devices=all_devices,
         call_rules=(na3d_common_call_rule,),
+    )
+    out["window_attention"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
+            "k": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
+            "v": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
+        },
+        default_devices=all_devices,
+        call_rules=(window_attention_common_call_rule,),
     )
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in out:
