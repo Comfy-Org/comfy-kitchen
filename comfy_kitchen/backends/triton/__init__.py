@@ -27,6 +27,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "temporal_interleave_upsample_nearest2x",
 ]
 
 # Try to import triton and register if available
@@ -89,6 +90,7 @@ try:
         apply_rope_split_half1_,
         apply_rope_split_half_,
     )
+    from .temporal_interleave_upsample_nearest2x import temporal_interleave_upsample_nearest2x
     from .w4a8_int8 import w4a8_int8_linear
 except ImportError as e:
     _TRITON_AVAILABLE = False
@@ -125,6 +127,36 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    # The plain form (interleave=False) is a single upsample kernel in the eager path already,
+    # and below about 12M output elements the gather kernel is slower than it. Measured on the
+    # Wan VAE decode shapes (bf16, fresh process per arm, A B A B pairs, speedup over eager):
+    # output 9.58M elements, x (1, 384, 1, 60, 104): 0.66-0.67x on RTX 5090, 0.78-0.80x on
+    # Radeon 8060S; output 14.4M, x (1, 1024, 1, 44, 80): 1.06x and 1.55-1.61x. The crossover
+    # is between 9.58M and 14.4M (not bisected). The interleave form replaces a stack, a copy and
+    # the upsample and was faster at every measured shape (smallest output 28.8M elements:
+    # 2.58-2.60x and 2.39x), so it is not limited; smaller interleave inputs were not measured.
+    _plain_upsample_min_numel = 12_000_000
+
+    def _temporal_interleave_upsample_call_rule(kwargs):
+        x = kwargs.get("x")
+        if x is None:
+            return ValidationResult.ok()
+        if x.dim() != 5:
+            return ValidationResult.fail("x", "x must be [B, C, T, H, W]")
+        interleave = bool(kwargs.get("interleave", False))
+        if interleave and x.shape[1] % 2:
+            return ValidationResult.fail("x", "interleave needs an even channel count")
+        out_numel = x.numel() * 4
+        if out_numel == 0:
+            return ValidationResult.fail(
+                "x", "empty tensors are not supported by triton temporal_interleave_upsample_nearest2x"
+            )
+        if not interleave and out_numel < _plain_upsample_min_numel:
+            return ValidationResult.fail(
+                "x", f"output below {_plain_upsample_min_numel} elements runs faster in eager"
+            )
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -326,6 +358,14 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
+    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both
+    out["temporal_interleave_upsample_nearest2x"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=cuda_devices,
+        call_rules=(_temporal_interleave_upsample_call_rule,),
+    )
     out["na3d"] = FunctionConstraints(
         params={
             "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
