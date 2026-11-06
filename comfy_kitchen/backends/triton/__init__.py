@@ -24,6 +24,7 @@ __all__ = [
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
     "int8_linear",
+    "linear_gelu",
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
@@ -33,6 +34,7 @@ __all__ = [
 import torch
 
 from comfy_kitchen.constraints import (
+    DivisibleBy,
     ExactDims,
     FunctionConstraints,
     ParamConstraint,
@@ -54,6 +56,7 @@ try:
     )
 
     from .adaln import adaln, rms_adaln
+    from .linear_act import linear_gelu
     from .na import na3d
     from .quantization import (
         dequantize_nvfp4,
@@ -125,6 +128,37 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    from .linear_act import K_MULTIPLE, MIN_M, N_MULTIPLE
+
+    def _linear_gelu_call_rule(kwargs):
+        # The kernel reads weight / bias as bare pointers sized from x and weight,
+        # so anything it does not serve must fall through to eager here.
+        if kwargs.get("approximate", "tanh") != "tanh":
+            return ValidationResult.fail("approximate", "triton linear_gelu is tanh-GELU only")
+        x = kwargs.get("x")
+        weight = kwargs.get("weight")
+        if x is None or weight is None:
+            return ValidationResult.ok()
+        if x.dim() < 1 or x.shape[-1] == 0 or x.shape[-1] != weight.shape[1]:
+            return ValidationResult.fail(
+                "x", f"last dim must equal weight.shape[1] ({weight.shape[1]}) and be > 0"
+            )
+        if weight.dtype != x.dtype or weight.device != x.device:
+            return ValidationResult.fail("weight", "must match x's dtype and device")
+        if weight.shape[0] == 0 or weight.stride(1) != 1:
+            return ValidationResult.fail("weight", "must be non-empty with contiguous rows")
+        if x.numel() // x.shape[-1] < MIN_M:
+            return ValidationResult.fail("x", f"fewer than {MIN_M} rows; left to the unfused path")
+        bias = kwargs.get("bias")
+        if bias is not None:
+            if bias.dtype != x.dtype or bias.device != x.device:
+                return ValidationResult.fail("bias", "must match x's dtype and device")
+            if bias.shape[0] != weight.shape[0] or bias.stride(0) != 1:
+                return ValidationResult.fail(
+                    "bias", "must be contiguous with weight.shape[0] elements"
+                )
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -336,6 +370,26 @@ def _build_constraints() -> dict:
         # tl.dot needs Ampere matrix capability for the non-IEEE float paths
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
+    )
+    half_floats = frozenset({torch.float16, torch.bfloat16})
+    out["linear_gelu"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=half_floats),
+            "weight": ParamConstraint(
+                dtypes=half_floats,
+                shape_rules=(
+                    ExactDims(2),
+                    DivisibleBy(0, N_MULTIPLE),
+                    DivisibleBy(1, K_MULTIPLE),
+                ),
+            ),
+            "bias": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(1),)),
+            "approximate": ParamConstraint(dtypes=frozenset({str})),
+        },
+        default_devices=cuda_devices,
+        # fp16 / bf16 tl.dot
+        min_compute_capability=(8, 0),
+        call_rules=(_linear_gelu_call_rule,),
     )
     return out
 
