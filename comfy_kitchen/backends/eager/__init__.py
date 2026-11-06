@@ -37,6 +37,8 @@ __all__ = [
     "dequantize_convrot_w4a4_weight",
     "dequantize_w4a8_int8_weight",
     "gemv_awq_w4a16",
+    "linear_geglu",
+    "linear_swiglu",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
     "quantize_mxfp8",
@@ -65,9 +67,11 @@ __all__ = [
 import torch
 
 from comfy_kitchen.constraints import (
+    DivisibleBy,
     ExactDims,
     FunctionConstraints,
     ParamConstraint,
+    ValidationResult,
     na3d_common_call_rule,
     sol_attn_common_call_rule,
     window_attention_common_call_rule,
@@ -86,6 +90,7 @@ from .convrot_w4a4 import (
     quantize_convrot_w4a4_weight,
 )
 from .group_norm_pad3d import group_norm_silu_pad3d, group_norm_silu_pad3d_out, group_norm_stats3d
+from .linear_act import linear_geglu, linear_swiglu
 from .na import na3d, window_attention
 from .quantization import (
     dequantize_int8_convrot_weight,
@@ -579,6 +584,36 @@ def _build_constraints() -> dict:
             "residual_scale": ParamConstraint(dtypes=standard_floats),
         },
         default_devices=all_devices,
+    )
+    out["linear_geglu"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            # Packed [h | gate]: an even row count splits into two equal halves.
+            "weight": ParamConstraint(
+                dtypes=standard_floats, shape_rules=(ExactDims(2), DivisibleBy(0, 2))
+            ),
+            "bias": ParamConstraint(dtypes=standard_floats),
+            "approximate": ParamConstraint(dtypes=frozenset({str})),
+        },
+        default_devices=all_devices,
+    )
+
+    def _linear_swiglu_call_rule(kwargs):
+        w1, w3 = kwargs.get("w1"), kwargs.get("w3")
+        if w1 is not None and w3 is not None and w1.shape != w3.shape:
+            return ValidationResult.fail("w3", "must have w1's shape")
+        return ValidationResult.ok()
+
+    out["linear_swiglu"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "w1": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+            "w3": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+            "b1": ParamConstraint(dtypes=standard_floats),
+            "b3": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+        call_rules=(_linear_swiglu_call_rule,),
     )
     out["int8_linear"] = FunctionConstraints(
         params={

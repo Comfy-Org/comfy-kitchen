@@ -37,6 +37,8 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `dequantize_int8_simple_dtype` | ✓  | ✓    |        | ✓   | ✓   |
 | `dequantize_int8_convrot_weight_dtype` | ✓ | ✓ |    | ✓   |     |
 | `int8_linear`               | ✓     | ✓    | ✓      | ✓   | ✓*  |
+| `linear_geglu`              | ✓     |      | ✓**    |     |     |
+| `linear_swiglu`             | ✓     |      | ✓**    |     |     |
 | `gemv_awq_w4a16`            | ✓     | ✓    |        | ✓   |     |
 | `quantize_svdquant_w4a4`    | ✓     | ✓    |        | ✓   |     |
 | `scaled_mm_svdquant_w4a4`   | ✓     | ✓    |        | ✓   |     |
@@ -62,6 +64,14 @@ Ascend support for `quantize_and_rotate_rowwise` requires
 `convrot_w4a4_linear` requires only `torch_npu.npu_quant_matmul`.
 These capabilities are registered only when the
 corresponding operator is available.
+
+\*\* Triton `linear_geglu` / `linear_swiglu` serve fp16/bf16 tensors of one
+dtype, weight rows contiguous, `in_features % 64 == 0` and at least 256 input
+rows. `linear_geglu` takes the packed `[h | gate]` weight (`out_features % 128
+== 0`, so each half is a multiple of 64) and `approximate` "none" or "tanh";
+`linear_swiglu` takes `w1` (gate) and `w3` (up) of one shape with
+`out_features % 64 == 0`. Other calls run the eager references
+`h * F.gelu(gate)` and `F.silu(x @ w1.T) * (x @ w3.T)`.
 
 ## Huawei Ascend backend
 
