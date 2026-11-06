@@ -66,7 +66,6 @@ else:
 __all__ = [
     # Normalization
     "adaln",
-    "adaln_segmented",
     "gated_residual_segmented",
     "gated_residual_segmented_",
     "rms_gated_residual",
@@ -402,31 +401,6 @@ def adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
-
-
-def adaln_segmented(
-    x: torch.Tensor,
-    scale: torch.Tensor,
-    shift: torch.Tensor,
-    split: int,
-    eps: float = 1e-6,
-    rms_weight: torch.Tensor | None = None,
-    rms_weight_offset: float = 0.0,
-) -> torch.Tensor:
-    """AdaLN with two modulation segments along the tokens.
-
-    ``norm(x) * (1 + scale[i]) + shift[i]`` for x ``[B, L, D]``, with ``i = 0`` for the
-    tokens before ``split`` and ``i = 1`` from ``split`` on: the reference-token
-    (``index_timestep_zero``) modulation of Qwen-Image, Krea2 and Flux / Flux.2.
-    ``scale`` / ``shift`` are ``[2, B, D]`` or ``[2, 1, D]``, any strides on the first two
-    dims. The norm is LayerNorm without affine, or with ``rms_weight`` given, an fp32
-    RMSNorm with weight ``rms_weight + rms_weight_offset`` (Krea2 stores its RMSNorm scale
-    zero-centered: offset 1.0). The eager backend rounds each step to x's dtype as the
-    unfused sequence does; the triton backend computes in fp32 and rounds once.
-    """
-    return torch.ops.comfy_kitchen.adaln_segmented(
-        x, scale, shift, int(split), float(eps), rms_weight, float(rms_weight_offset)
-    )
 
 
 def gated_residual_segmented(
