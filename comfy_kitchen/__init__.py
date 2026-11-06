@@ -71,6 +71,8 @@ __all__ = [
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
     "rms_adaln",
+    # Resampling
+    "temporal_interleave_upsample_nearest2x",
     # Attention
     "PrequantizedInt8Attention",
     "int8_attention",
@@ -455,6 +457,22 @@ def group_norm_stats3d(x: torch.Tensor, num_groups: int = 32, eps: float = 1e-6)
     """Per-frame GroupNorm statistics of x [B, C, T, H, W]: float32 [B*T, num_groups, 2]
     of (mean, rstd), for group_norm_silu_pad3d's stats argument."""
     return torch.ops.comfy_kitchen.group_norm_stats3d(x, num_groups, eps)
+
+
+def temporal_interleave_upsample_nearest2x(
+    x: torch.Tensor,
+    interleave: bool = False,
+) -> torch.Tensor:
+    """Optional temporal frame interleave, frames to batch, and a nearest-exact 2x upsample.
+
+    x ``[B, C, T, H, W]`` gives the contiguous ``[B * T, C, 2H, 2W]`` of
+    ``rearrange(x, 'b c t h w -> (b t) c h w')`` upsampled with
+    ``nn.Upsample(scale_factor=(2., 2.), mode='nearest-exact')``: the Wan VAE ``Resample``
+    upsample body up to its Conv2d. With ``interleave`` x is the ``[B, 2C, T, H, W]``
+    time_conv output and the frames of its two channel halves are interleaved first
+    (``[B, C, 2T, H, W]``, frame ``2t + k`` from half ``k``), giving ``[B * 2T, C, 2H, 2W]``.
+    """
+    return torch.ops.comfy_kitchen.temporal_interleave_upsample_nearest2x(x, bool(interleave))
 
 
 def rms_adaln(
