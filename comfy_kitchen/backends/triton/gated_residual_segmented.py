@@ -8,11 +8,8 @@ and stores ``residual + x * gate``, computed in fp32 and rounded once, in place 
 the output is the residual. The per-segment gate rows are read through their own
 batch strides, so the ``[2, B, D]`` views the models produce are not copied.
 
-Launch: num_warps 8 for block_d >= 4096, else 4. Of the configs tried on the RTX 5090
-and the Radeon 8060S (this one, a two-pass loop over 1024 / 2048-column chunks, and
-autotuning num_warps 4 / 8 / 16), it was the fastest or within 3% of the fastest at
-every captured Qwen-Image, Krea2 and Flux.2 shape (D 3072, 4096, 6144). The kernel is
-not autotuned: autotuning re-runs an in-place launch.
+Launch: num_warps 8 for block_d >= 4096, else 4. The kernel is not autotuned: autotuning
+re-runs an in-place launch.
 """
 
 import torch
