@@ -147,9 +147,13 @@ def _build_constraints() -> dict:
             return ValidationResult.fail("x", "empty tensors are not supported by triton")
         factors_first = kwargs.get("factors_first", False)
         if factors_first != kwargs.get("residual_packed", False):
-            return ValidationResult.fail("residual_packed", "needs residual_packed == factors_first")
+            return ValidationResult.fail(
+                "residual_packed", "needs residual_packed == factors_first"
+            )
         if factors_first and (kwargs.get("factor_s") != 2 or kwargs.get("first_chunk", False)):
-            return ValidationResult.fail("factor_s", "factors_first needs factor_s 2, no first_chunk")
+            return ValidationResult.fail(
+                "factor_s", "factors_first needs factor_s 2, no first_chunk"
+            )
         return ValidationResult.ok()
 
     def _depth_to_space3d_residual_add_inplace_call_rule(kwargs):

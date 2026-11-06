@@ -29,13 +29,35 @@ import triton.language as tl
 
 @triton.jit
 def _d2s3d_residual_add_kernel(
-    x_ptr, main_ptr, out_ptr,
-    n_rows, n_oc, n_to, n_ho, n_wo, t_off,
-    sxb, sxc, sxt, sxh, sxw,
-    smb, smc, smt, smh, smw,
-    sob, soc, sot, soh, sow,
-    ft: tl.constexpr, fs: tl.constexpr, rep: tl.constexpr,
-    block_r: tl.constexpr, block_w: tl.constexpr,
+    x_ptr,
+    main_ptr,
+    out_ptr,
+    n_rows,
+    n_oc,
+    n_to,
+    n_ho,
+    n_wo,
+    t_off,
+    sxb,
+    sxc,
+    sxt,
+    sxh,
+    sxw,
+    smb,
+    smc,
+    smt,
+    smh,
+    smw,
+    sob,
+    soc,
+    sot,
+    soh,
+    sow,
+    ft: tl.constexpr,
+    fs: tl.constexpr,
+    rep: tl.constexpr,
+    block_r: tl.constexpr,
+    block_w: tl.constexpr,
 ):
     # out[b, oc, to, ho, wo] = main[b, oc, to, ho, wo] + x[b, ci, t, h, w] with
     #   t, it = divmod(to + t_off, ft); h, ih = divmod(ho, fs); w, iw = divmod(wo, fs)
@@ -59,11 +81,11 @@ def _d2s3d_residual_add_kernel(
     it = t_full % ft
     h = ho // fs
     ih = ho % fs
-    ce_row = ((oc * ft + it) * fs + ih) * fs          # [block_r]
+    ce_row = ((oc * ft + it) * fs + ih) * fs  # [block_r]
     # col -> (w, iw)
     w = cols // fs
     iw = cols % fs
-    ci = (ce_row[:, None] + iw[None, :]) // rep       # [block_r, block_w]
+    ci = (ce_row[:, None] + iw[None, :]) // rep  # [block_r, block_w]
 
     x_off = (b * sxb + t * sxt + h * sxh)[:, None] + ci * sxc + (w * sxw)[None, :]
     m_off = (b * smb + oc * smc + to * smt + ho * smh)[:, None] + (cols * smw)[None, :]
@@ -78,13 +100,33 @@ def _d2s3d_residual_add_kernel(
 
 @triton.jit
 def _pixel_shuffle3d_add_kernel(
-    h_ptr, x_ptr, out_ptr,
-    n_rows, nc, n_to, n_ho, n_wo,
-    shb, shc, sht, shh, shw,
-    sxb, sxc, sxt, sxh, sxw,
-    sob, soc, sot, soh, sow,
-    r1: tl.constexpr, rep: tl.constexpr,
-    block_r: tl.constexpr, block_w: tl.constexpr,
+    h_ptr,
+    x_ptr,
+    out_ptr,
+    n_rows,
+    nc,
+    n_to,
+    n_ho,
+    n_wo,
+    shb,
+    shc,
+    sht,
+    shh,
+    shw,
+    sxb,
+    sxc,
+    sxt,
+    sxh,
+    sxw,
+    sob,
+    soc,
+    sot,
+    soh,
+    sow,
+    r1: tl.constexpr,
+    rep: tl.constexpr,
+    block_r: tl.constexpr,
+    block_w: tl.constexpr,
 ):
     # out[b, oc, to, ho, wo] = h[b, c, t, hh, w] + x[b, c // rep, t, hh, w] with
     #   t, it = divmod(to, r1); hh, ih = divmod(ho, 2); w, iw = divmod(wo, 2)
@@ -106,10 +148,10 @@ def _pixel_shuffle3d_add_kernel(
     it = to % r1
     hh = ho // 2
     ih = ho % 2
-    c_row = (it * 2 + ih) * 2 * nc + oc            # [block_r]
+    c_row = (it * 2 + ih) * 2 * nc + oc  # [block_r]
     w = cols // 2
     iw = cols % 2
-    c = c_row[:, None] + (iw * nc)[None, :]        # [block_r, block_w]
+    c = c_row[:, None] + (iw * nc)[None, :]  # [block_r, block_w]
     ci = c // rep
 
     hw_off = (w * shw)[None, :]
@@ -139,7 +181,8 @@ _d2s3d_residual_add = triton.autotune(
 )(_d2s3d_residual_add_kernel)
 
 _pixel_shuffle3d_add = triton.autotune(configs=_CONFIGS, key=["n_wo", "n_rows", "r1", "rep"])(
-    _pixel_shuffle3d_add_kernel)
+    _pixel_shuffle3d_add_kernel
+)
 
 
 def _launch_d2s3d(x, residual, out, factor_t, factor_s, repeats, first_chunk):
@@ -147,9 +190,23 @@ def _launch_d2s3d(x, residual, out, factor_t, factor_s, repeats, first_chunk):
     n_rows = b * oc * to * ho
     t_off = factor_t - 1 if first_chunk else 0
     grid = lambda meta: (triton.cdiv(n_rows, meta["block_r"]), triton.cdiv(wo, meta["block_w"]))  # noqa: E731
-    _d2s3d_residual_add[grid](x, residual, out, n_rows, oc, to, ho, wo, t_off,
-                              *x.stride(), *residual.stride(), *out.stride(),
-                              ft=factor_t, fs=factor_s, rep=repeats)
+    _d2s3d_residual_add[grid](
+        x,
+        residual,
+        out,
+        n_rows,
+        oc,
+        to,
+        ho,
+        wo,
+        t_off,
+        *x.stride(),
+        *residual.stride(),
+        *out.stride(),
+        ft=factor_t,
+        fs=factor_s,
+        rep=repeats,
+    )
     return out
 
 
@@ -170,13 +227,27 @@ def depth_to_space3d_residual_add(
     # (ft, 2, 2, c) order with a packed residual, factor_s 2 (the call rule declines the rest)
     b, c, t, h, w = residual.shape
     nc = c // (factor_t * 4)
-    out = torch.empty((b, nc, t * factor_t, 2 * h, 2 * w), dtype=residual.dtype, device=residual.device)
+    out = torch.empty(
+        (b, nc, t * factor_t, 2 * h, 2 * w), dtype=residual.dtype, device=residual.device
+    )
     _, _, to, ho, wo = out.shape
     n_rows = b * nc * to * ho
     grid = lambda meta: (triton.cdiv(n_rows, meta["block_r"]), triton.cdiv(wo, meta["block_w"]))  # noqa: E731
-    _pixel_shuffle3d_add[grid](residual, x, out, n_rows, nc, to, ho, wo,
-                               *residual.stride(), *x.stride(), *out.stride(),
-                               r1=factor_t, rep=repeats)
+    _pixel_shuffle3d_add[grid](
+        residual,
+        x,
+        out,
+        n_rows,
+        nc,
+        to,
+        ho,
+        wo,
+        *residual.stride(),
+        *x.stride(),
+        *out.stride(),
+        r1=factor_t,
+        rep=repeats,
+    )
     return out
 
 

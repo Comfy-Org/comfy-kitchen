@@ -21,13 +21,18 @@ eager_module = importlib.import_module("comfy_kitchen.backends.eager.depth_to_sp
 
 # --- stock ComfyUI code (comfy/ldm/wan/vae2_2.py, comfy/ldm/hunyuan_video/vae_refiner.py) ---
 
+
 def _stock_dup_up3d(x, first_chunk, factor_t, factor_s, out_channels, repeats):
     x = x.repeat_interleave(repeats, dim=1)
-    x = x.view(x.size(0), out_channels, factor_t, factor_s, factor_s, x.size(2), x.size(3), x.size(4))
+    x = x.view(
+        x.size(0), out_channels, factor_t, factor_s, factor_s, x.size(2), x.size(3), x.size(4)
+    )
     x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()
-    x = x.view(x.size(0), out_channels, x.size(2) * factor_t, x.size(4) * factor_s, x.size(6) * factor_s)
+    x = x.view(
+        x.size(0), out_channels, x.size(2) * factor_t, x.size(4) * factor_s, x.size(6) * factor_s
+    )
     if first_chunk:
-        x = x[:, :, factor_t - 1:, :, :]
+        x = x[:, :, factor_t - 1 :, :, :]
     return x
 
 
@@ -67,6 +72,7 @@ def _stock(x, residual, factor_t, factor_s, repeats, first_chunk, factors_first)
 
 
 # --- inputs ---
+
 
 def _make(shape, dtype, device, t_major=False):
     # t_major: [B, T, C, H, W] in memory, the layout of the Wan 2.2 decoder's activations
@@ -114,15 +120,22 @@ def _inputs(case, dtype, device):
     xs, rs, ft, fs, rep, first, ff, t_major = case
     x = _make(xs, dtype, device, t_major)
     residual = _make(rs, dtype, device, t_major)
-    kwargs = {"factor_t": ft, "factor_s": fs, "repeats": rep, "first_chunk": first,
-              "factors_first": ff, "residual_packed": ff}
+    kwargs = {
+        "factor_t": ft,
+        "factor_s": fs,
+        "repeats": rep,
+        "first_chunk": first,
+        "factors_first": ff,
+        "residual_packed": ff,
+    }
     return x, residual, kwargs
 
 
 def _same_layout(a, b):
     # strides of size-1 dims carry no layout
     return a.shape == b.shape and all(
-        sa == sb for sa, sb, n in zip(a.stride(), b.stride(), a.shape, strict=True) if n > 1)
+        sa == sb for sa, sb, n in zip(a.stride(), b.stride(), a.shape, strict=True) if n > 1
+    )
 
 
 def _call_kwargs(x, residual, kwargs):
@@ -136,8 +149,15 @@ class TestDepthToSpace3dResidualAddEager:
         x, residual, kwargs = _inputs(CASES[name], dtype, "cpu")
         with ck.use_backend("eager"):
             out = ck.depth_to_space3d_residual_add(x, residual, **kwargs)
-        ref = _stock(x, residual, kwargs["factor_t"], kwargs["factor_s"], kwargs["repeats"],
-                     kwargs["first_chunk"], kwargs["factors_first"])
+        ref = _stock(
+            x,
+            residual,
+            kwargs["factor_t"],
+            kwargs["factor_s"],
+            kwargs["repeats"],
+            kwargs["first_chunk"],
+            kwargs["factors_first"],
+        )
         assert torch.equal(out, ref)
         assert out.stride() == ref.stride()
 
@@ -157,8 +177,13 @@ class TestDepthToSpace3dResidualAddEager:
         x = torch.randn(1, 16, 2, 4, 4)
         rs = (1, 128, 2, 4, 4) if packed else (1, 16, 4, 8, 8)
         residual = torch.randn(rs).to(torch.bfloat16)
-        kwargs = {"factor_t": 2, "factor_s": 2, "repeats": 8, "factors_first": packed,
-                  "residual_packed": packed}
+        kwargs = {
+            "factor_t": 2,
+            "factor_s": 2,
+            "repeats": 8,
+            "factors_first": packed,
+            "residual_packed": packed,
+        }
         with ck.use_backend("eager"):
             out = ck.depth_to_space3d_residual_add(x, residual, **kwargs)
         fake = ck.depth_to_space3d_residual_add(x.to("meta"), residual.to("meta"), **kwargs)
@@ -166,7 +191,7 @@ class TestDepthToSpace3dResidualAddEager:
         assert fake.dtype == out.dtype
         assert _same_layout(fake, out)
 
-    @pytest.mark.parametrize("strip_elems", [2 ** 24, 2 ** 12])
+    @pytest.mark.parametrize("strip_elems", [2**24, 2**12])
     @pytest.mark.parametrize("name", list(INPLACE_CASES))
     def test_inplace_matches_strip_apply(self, name, strip_elems, monkeypatch):
         # small STRIP_ELEMS splits these inputs into row strips the way the full-size ones are
@@ -175,8 +200,13 @@ class TestDepthToSpace3dResidualAddEager:
         x = torch.randn(xs).to(torch.bfloat16)
         residual = torch.randn(rs).to(torch.bfloat16)
         oc = rs[1]
-        ref = _stock_strip_apply(lambda s: _stock_dup_up3d(s, True, ft, fs, oc, rep), x, fs,
-                                 strip_elems, residual.clone())
+        ref = _stock_strip_apply(
+            lambda s: _stock_dup_up3d(s, True, ft, fs, oc, rep),
+            x,
+            fs,
+            strip_elems,
+            residual.clone(),
+        )
         got = residual.clone()
         with ck.use_backend("eager"):
             ret = ck.depth_to_space3d_residual_add_(x, got, ft, fs, rep, first_chunk=True)
@@ -191,12 +221,15 @@ class TestDepthToSpace3dResidualAddEager:
             got = ck.depth_to_space3d_residual_add_(x, residual.clone(), 2, 2, 8, first_chunk=True)
         assert torch.equal(got, want)
 
-    @pytest.mark.parametrize("args", [
-        ((1, 16, 2, 4, 4), (1, 16, 4, 8, 9), 2, 2, 8, False),      # wrong residual width
-        ((1, 16, 2, 4, 4), (1, 16, 4, 8, 8), 2, 2, 8, True),       # first_chunk drops a frame
-        ((1, 15, 2, 4, 4), (1, 3, 4, 8, 8), 2, 2, 2, False),       # 15 * 2 channels not / 8
-        ((1, 16, 4, 4), (1, 16, 8, 8), 1, 2, 4, False),            # 4-D
-    ])
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ((1, 16, 2, 4, 4), (1, 16, 4, 8, 9), 2, 2, 8, False),  # wrong residual width
+            ((1, 16, 2, 4, 4), (1, 16, 4, 8, 8), 2, 2, 8, True),  # first_chunk drops a frame
+            ((1, 15, 2, 4, 4), (1, 3, 4, 8, 8), 2, 2, 2, False),  # 15 * 2 channels not / 8
+            ((1, 16, 4, 4), (1, 16, 8, 8), 1, 2, 4, False),  # 4-D
+        ],
+    )
     def test_rejects_bad_shapes(self, args):
         xs, rs, ft, fs, rep, first = args
         with pytest.raises(ValueError):
@@ -204,8 +237,15 @@ class TestDepthToSpace3dResidualAddEager:
 
     def test_rejects_bad_packed_residual(self):
         with pytest.raises(ValueError):
-            ck.depth_to_space3d_residual_add(torch.randn(1, 8, 2, 4, 4), torch.randn(1, 32, 2, 4, 4),
-                                             2, 2, 8, factors_first=True, residual_packed=True)
+            ck.depth_to_space3d_residual_add(
+                torch.randn(1, 8, 2, 4, 4),
+                torch.randn(1, 32, 2, 4, 4),
+                2,
+                2,
+                8,
+                factors_first=True,
+                residual_packed=True,
+            )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
@@ -218,7 +258,9 @@ class TestDepthToSpace3dResidualAddTriton:
 
     def _check_served_and_equal(self, x, residual, kwargs):
         call = _call_kwargs(x, residual, kwargs)
-        assert registry.validate_backend_for_call("triton", "depth_to_space3d_residual_add", call).success
+        assert registry.validate_backend_for_call(
+            "triton", "depth_to_space3d_residual_add", call
+        ).success
         assert registry.get_capable_backend("depth_to_space3d_residual_add", call) == "triton"
         with ck.use_backend("triton"):
             got = ck.depth_to_space3d_residual_add(x, residual, **kwargs)
@@ -239,32 +281,65 @@ class TestDepthToSpace3dResidualAddTriton:
         x, residual, kwargs = _inputs(REAL_CASES[name], dtype, "cuda")
         self._check_served_and_equal(x, residual, kwargs)
 
-    @pytest.mark.parametrize("layout", [
-        "contiguous",           # Wan 2.2 form with contiguous operands
-        "residual_cl3d",        # residual channels_last_3d: output keeps that layout
-        "x_cl3d",               # x channels_last_3d
-        "x_last_dim_step2",     # x[..., ::2]
-        "batch2",               # batch 2, T-major
-        "hv_h_cl3d",            # HunyuanVideo form, packed residual channels_last_3d
-        "hv_x_sliced",          # HunyuanVideo form, x a frame slice of a longer tensor
-    ])
+    @pytest.mark.parametrize(
+        "layout",
+        [
+            "contiguous",  # Wan 2.2 form with contiguous operands
+            "residual_cl3d",  # residual channels_last_3d: output keeps that layout
+            "x_cl3d",  # x channels_last_3d
+            "x_last_dim_step2",  # x[..., ::2]
+            "batch2",  # batch 2, T-major
+            "hv_h_cl3d",  # HunyuanVideo form, packed residual channels_last_3d
+            "hv_x_sliced",  # HunyuanVideo form, x a frame slice of a longer tensor
+        ],
+    )
     def test_strided_inputs(self, layout):
         d, dev = torch.bfloat16, "cuda"
         cl3 = torch.channels_last_3d
         wan = {"factor_t": 2, "factor_s": 2, "repeats": 8}
-        hv = {"factor_t": 2, "factor_s": 2, "repeats": 8, "factors_first": True, "residual_packed": True}
+        hv = {
+            "factor_t": 2,
+            "factor_s": 2,
+            "repeats": 8,
+            "factors_first": True,
+            "residual_packed": True,
+        }
         make = {
-            "contiguous": lambda: (_make((1, 32, 2, 7, 9), d, dev), _make((1, 32, 4, 14, 18), d, dev), wan),
-            "residual_cl3d": lambda: (_make((1, 32, 2, 7, 9), d, dev),
-                                      _make((1, 32, 4, 14, 18), d, dev).to(memory_format=cl3), wan),
-            "x_cl3d": lambda: (_make((1, 32, 2, 7, 9), d, dev).to(memory_format=cl3),
-                               _make((1, 32, 4, 14, 18), d, dev), wan),
-            "x_last_dim_step2": lambda: (_make((1, 32, 2, 7, 18), d, dev)[..., ::2],
-                                         _make((1, 32, 4, 14, 18), d, dev), wan),
-            "batch2": lambda: (_make((2, 32, 2, 7, 9), d, dev, True), _make((2, 32, 4, 14, 18), d, dev, True), wan),
-            "hv_h_cl3d": lambda: (_make((1, 16, 2, 7, 9), d, dev),
-                                  _make((1, 128, 2, 7, 9), d, dev).to(memory_format=cl3), hv),
-            "hv_x_sliced": lambda: (_make((1, 16, 3, 7, 9), d, dev)[:, :, 1:], _make((1, 128, 2, 7, 9), d, dev), hv),
+            "contiguous": lambda: (
+                _make((1, 32, 2, 7, 9), d, dev),
+                _make((1, 32, 4, 14, 18), d, dev),
+                wan,
+            ),
+            "residual_cl3d": lambda: (
+                _make((1, 32, 2, 7, 9), d, dev),
+                _make((1, 32, 4, 14, 18), d, dev).to(memory_format=cl3),
+                wan,
+            ),
+            "x_cl3d": lambda: (
+                _make((1, 32, 2, 7, 9), d, dev).to(memory_format=cl3),
+                _make((1, 32, 4, 14, 18), d, dev),
+                wan,
+            ),
+            "x_last_dim_step2": lambda: (
+                _make((1, 32, 2, 7, 18), d, dev)[..., ::2],
+                _make((1, 32, 4, 14, 18), d, dev),
+                wan,
+            ),
+            "batch2": lambda: (
+                _make((2, 32, 2, 7, 9), d, dev, True),
+                _make((2, 32, 4, 14, 18), d, dev, True),
+                wan,
+            ),
+            "hv_h_cl3d": lambda: (
+                _make((1, 16, 2, 7, 9), d, dev),
+                _make((1, 128, 2, 7, 9), d, dev).to(memory_format=cl3),
+                hv,
+            ),
+            "hv_x_sliced": lambda: (
+                _make((1, 16, 3, 7, 9), d, dev)[:, :, 1:],
+                _make((1, 128, 2, 7, 9), d, dev),
+                hv,
+            ),
         }
         x, residual, kwargs = make[layout]()
         self._check_served_and_equal(x, residual, kwargs)
@@ -274,8 +349,14 @@ class TestDepthToSpace3dResidualAddTriton:
         xs, rs, ft, fs, rep = INPLACE_CASES[name]
         x = _make(xs, torch.bfloat16, "cuda")
         residual = _make(rs, torch.bfloat16, "cuda")
-        call = {"x": x, "residual": residual, "factor_t": ft, "factor_s": fs, "repeats": rep,
-                "first_chunk": True}
+        call = {
+            "x": x,
+            "residual": residual,
+            "factor_t": ft,
+            "factor_s": fs,
+            "repeats": rep,
+            "first_chunk": True,
+        }
         assert registry.get_capable_backend("depth_to_space3d_residual_add_", call) == "triton"
         want = eager_backend.depth_to_space3d_residual_add_(x, residual.clone(), ft, fs, rep, True)
         got = residual.clone()
@@ -290,10 +371,14 @@ class TestDepthToSpace3dResidualAddTriton:
         x = _make((1, 36, 1, 32, 32), torch.bfloat16, "cuda")
         full = _make((1, 18, 1, 128, 64), torch.bfloat16, "cuda")
         want = full.clone()
-        eager_backend.depth_to_space3d_residual_add_(x[..., :8, :], want.narrow(-2, 32, 16), 1, 2, 2, True)
+        eager_backend.depth_to_space3d_residual_add_(
+            x[..., :8, :], want.narrow(-2, 32, 16), 1, 2, 2, True
+        )
         got = full.clone()
         with ck.use_backend("triton"):
-            ck.depth_to_space3d_residual_add_(x[..., :8, :], got.narrow(-2, 32, 16), 1, 2, 2, first_chunk=True)
+            ck.depth_to_space3d_residual_add_(
+                x[..., :8, :], got.narrow(-2, 32, 16), 1, 2, 2, first_chunk=True
+            )
         assert torch.equal(got, want)
 
     def test_declined_inputs_go_to_eager(self):
@@ -308,25 +393,49 @@ class TestDepthToSpace3dResidualAddTriton:
             (x, r, {"factor_t": 2, "factor_s": 2, "repeats": 8, "factors_first": True}),
             (x, h, {"factor_t": 2, "factor_s": 2, "repeats": 8, "residual_packed": True}),
             # factors_first with factor_s 3, or with first_chunk
-            (x3, h3, {"factor_t": 2, "factor_s": 3, "repeats": 2, "factors_first": True,
-                      "residual_packed": True}),
-            (x, h, {"factor_t": 2, "factor_s": 2, "repeats": 8, "first_chunk": True,
-                    "factors_first": True, "residual_packed": True}),
+            (
+                x3,
+                h3,
+                {
+                    "factor_t": 2,
+                    "factor_s": 3,
+                    "repeats": 2,
+                    "factors_first": True,
+                    "residual_packed": True,
+                },
+            ),
+            (
+                x,
+                h,
+                {
+                    "factor_t": 2,
+                    "factor_s": 2,
+                    "repeats": 8,
+                    "first_chunk": True,
+                    "factors_first": True,
+                    "residual_packed": True,
+                },
+            ),
         ]
         for xx, rr, kwargs in declined:
             call = _call_kwargs(xx, rr, kwargs)
-            assert not registry.validate_backend_for_call("triton", "depth_to_space3d_residual_add", call).success
+            assert not registry.validate_backend_for_call(
+                "triton", "depth_to_space3d_residual_add", call
+            ).success
             assert registry.get_capable_backend("depth_to_space3d_residual_add", call) == "eager"
             with ck.use_backend("triton"):
                 got = ck.depth_to_space3d_residual_add(xx, rr, **kwargs)
             assert torch.equal(got, eager_backend.depth_to_space3d_residual_add(xx, rr, **kwargs))
 
-    @pytest.mark.parametrize("xs, rs", [((0, 16, 2, 4, 4), (0, 16, 4, 8, 8)),
-                                         ((1, 16, 2, 0, 4), (1, 16, 4, 0, 8))])
+    @pytest.mark.parametrize(
+        "xs, rs", [((0, 16, 2, 4, 4), (0, 16, 4, 8, 8)), ((1, 16, 2, 0, 4), (1, 16, 4, 0, 8))]
+    )
     def test_empty_input_goes_to_eager(self, xs, rs):
         x, r = _make(xs, torch.bfloat16, "cuda"), _make(rs, torch.bfloat16, "cuda")
         call = {"x": x, "residual": r, "factor_t": 2, "factor_s": 2, "repeats": 8}
-        assert not registry.validate_backend_for_call("triton", "depth_to_space3d_residual_add", call).success
+        assert not registry.validate_backend_for_call(
+            "triton", "depth_to_space3d_residual_add", call
+        ).success
         with ck.use_backend("triton"):
             got = ck.depth_to_space3d_residual_add(x, r, 2, 2, 8)
             ck.depth_to_space3d_residual_add_(x, r, 2, 2, 8)
@@ -335,7 +444,9 @@ class TestDepthToSpace3dResidualAddTriton:
     def test_inplace_sharing_storage_goes_to_eager(self):
         buf = _make((16 * 2 * 4 * 4 + 16 * 4 * 8 * 8,), torch.bfloat16, "cuda")
         x = buf[: 16 * 2 * 4 * 4].view(1, 16, 2, 4, 4)
-        r = buf[16 * 2 * 4 * 4:].view(1, 16, 4, 8, 8)
+        r = buf[16 * 2 * 4 * 4 :].view(1, 16, 4, 8, 8)
         call = {"x": x, "residual": r, "factor_t": 2, "factor_s": 2, "repeats": 8}
-        assert not registry.validate_backend_for_call("triton", "depth_to_space3d_residual_add_", call).success
+        assert not registry.validate_backend_for_call(
+            "triton", "depth_to_space3d_residual_add_", call
+        ).success
         assert registry.get_capable_backend("depth_to_space3d_residual_add_", call) == "eager"

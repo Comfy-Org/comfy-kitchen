@@ -480,8 +480,15 @@ def depth_to_space3d_residual_add(
     The output has residual's layout (a new contiguous tensor when residual_packed).
     """
     return torch.ops.comfy_kitchen.depth_to_space3d_residual_add(
-        x, residual, int(factor_t), int(factor_s), int(repeats), bool(first_chunk),
-        bool(factors_first), bool(residual_packed))
+        x,
+        residual,
+        int(factor_t),
+        int(factor_s),
+        int(repeats),
+        bool(first_chunk),
+        bool(factors_first),
+        bool(residual_packed),
+    )
 
 
 def depth_to_space3d_residual_add_(
@@ -495,7 +502,8 @@ def depth_to_space3d_residual_add_(
     """depth_to_space3d_residual_add added into residual in place (``(c, ft, fs, fs)`` order),
     the Wan 2.2 VAE's ``Up_ResidualBlock`` image path. Returns residual."""
     torch.ops.comfy_kitchen.depth_to_space3d_residual_add_(
-        x, residual, int(factor_t), int(factor_s), int(repeats), bool(first_chunk))
+        x, residual, int(factor_t), int(factor_s), int(repeats), bool(first_chunk)
+    )
     return residual
 
 
