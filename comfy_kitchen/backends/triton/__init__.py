@@ -134,10 +134,7 @@ def _build_constraints() -> dict:
         return ValidationResult.ok()
 
     def _depth_to_space3d_residual_add_call_rule(kwargs):
-        # No size threshold: the kernel was faster than ComfyUI's current path at every
-        # measured shape, down to the smallest Wan 2.2 call (x (1, 1024, 1, 44, 80) -> residual
-        # (1, 1024, 1, 88, 160), bf16): 150 -> 27-37 us on an RTX 5090, 1424 -> 385 us on a
-        # Radeon 8060S. The forms the kernels do not cover go to eager.
+        # No size threshold. The forms the kernels do not cover go to eager.
         x, residual = kwargs.get("x"), kwargs.get("residual")
         if x is None or residual is None:
             return ValidationResult.ok()
