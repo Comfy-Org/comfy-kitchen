@@ -1,26 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""AdaLN modulation and gated residual with two modulation segments along the tokens.
+"""AdaLN modulation with two modulation segments along the tokens.
 
 DiTs that condition reference-image tokens on timestep zero (``index_timestep_zero``)
-modulate tokens ``[0, split)`` with one set of scale / shift / gate rows and tokens
+modulate tokens ``[0, split)`` with one set of scale / shift rows and tokens
 ``[split, L)`` with another. ComfyUI runs this as a norm followed by per-segment slices
 updated in place:
 
 - Flux / Flux.2 ``apply_mod`` with ``modulation_dims`` (comfy/ldm/flux/layers.py):
-  ``t = layer_norm(x); t[:, a:b] *= 1 + scale[:, i]; t[:, a:b] += shift[:, i]`` and
-  ``x += apply_mod(out, gate, None, modulation_dims)``.
+  ``t = layer_norm(x); t[:, a:b] *= 1 + scale[:, i]; t[:, a:b] += shift[:, i]``.
 - Krea2 ``SingleStreamBlock.forward`` (comfy/ldm/krea2/model.py): fp32 ``RMSNorm`` with
   weight ``scale + 1``, rounded to x's dtype, then ``mul_(1 + scale).add_(shift)`` per
-  segment; ``attn[:, a:b].mul_(gate)`` per segment, then ``x + attn``.
-- Qwen-Image ``_modulate`` / ``_apply_gate`` (comfy/ldm/qwen_image/model.py):
-  ``addcmul(shift, layer_norm(x)[:, a:b], 1 + scale)`` per segment, ``torch.cat``, and
-  ``y + cat(x[:, a:b] * gate)``.
+  segment.
+- Qwen-Image ``_modulate`` (comfy/ldm/qwen_image/model.py):
+  ``addcmul(shift, layer_norm(x)[:, a:b], 1 + scale)`` per segment, then ``torch.cat``.
 
 The reference below is the Flux / Krea2 order: the product ``t * (1 + scale)`` is rounded
 to x's dtype before the shift is added. Qwen-Image's ``addcmul`` rounds once, so it can
-differ from the reference by one rounding step. The gated residual is the same sequence
-(``x * gate`` rounded, then added to the residual) in all three models.
+differ from the reference by one rounding step.
 
 The modulation is ``[2, B, D]`` (``[2, 1, D]`` broadcasts over the batch): row 0 for the
 tokens before ``split``, row 1 for the rest. The three models produce it as a view:
@@ -55,29 +52,6 @@ def adaln_segmented(
     out = _norm(x, eps, rms_weight, rms_weight_offset)
     for i, seg in enumerate((slice(0, split), slice(split, x.shape[1]))):
         out[:, seg].mul_(1 + scale[i].unsqueeze(1)).add_(shift[i].unsqueeze(1))
-    return out
-
-
-def gated_residual_segmented_(
-    residual: torch.Tensor,
-    x: torch.Tensor,
-    gate: torch.Tensor,
-    split: int,
-) -> None:
-    """Reference: ``residual[:, seg] += x[:, seg] * gate[i]`` on each segment."""
-    for i, seg in enumerate((slice(0, split), slice(split, x.shape[1]))):
-        residual[:, seg] += x[:, seg] * gate[i].unsqueeze(1)
-
-
-def gated_residual_segmented(
-    residual: torch.Tensor,
-    x: torch.Tensor,
-    gate: torch.Tensor,
-    split: int,
-) -> torch.Tensor:
-    """Reference: ``residual + cat(x[:, seg] * gate[i])``, as a new tensor."""
-    out = residual.clone(memory_format=torch.contiguous_format)
-    gated_residual_segmented_(out, x, gate, split)
     return out
 
 
@@ -129,42 +103,3 @@ def _op_adaln_segmented(
 @_op_adaln_segmented.register_fake
 def _op_adaln_segmented_fake(x, scale, shift, split, eps, rms_weight, rms_weight_offset):
     return torch.empty_like(x, memory_format=torch.contiguous_format)
-
-
-@torch.library.custom_op("comfy_kitchen::gated_residual_segmented", mutates_args=())
-def _op_gated_residual_segmented(
-    residual: torch.Tensor,
-    x: torch.Tensor,
-    gate: torch.Tensor,
-    split: int,
-) -> torch.Tensor:
-    _check("gated_residual_segmented", x, split, gate=gate)
-    if residual.shape != x.shape:
-        raise ValueError("gated_residual_segmented: residual and x must have the same shape")
-    kwargs = {"residual": residual, "x": x, "gate": gate, "split": split}
-    impl = registry.get_implementation("gated_residual_segmented", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-@_op_gated_residual_segmented.register_fake
-def _op_gated_residual_segmented_fake(residual, x, gate, split):
-    return torch.empty_like(residual, memory_format=torch.contiguous_format)
-
-
-@torch.library.custom_op("comfy_kitchen::gated_residual_segmented_", mutates_args={"residual"})
-def _op_gated_residual_segmented_(
-    residual: torch.Tensor,
-    x: torch.Tensor,
-    gate: torch.Tensor,
-    split: int,
-) -> None:
-    _check("gated_residual_segmented_", x, split, gate=gate)
-    if residual.shape != x.shape:
-        raise ValueError("gated_residual_segmented_: residual and x must have the same shape")
-    kwargs = {"residual": residual, "x": x, "gate": gate, "split": split}
-    registry.get_implementation("gated_residual_segmented_", kwargs=kwargs)(**kwargs)
-
-
-@_op_gated_residual_segmented_.register_fake
-def _op_gated_residual_segmented_fake_(residual, x, gate, split):
-    return None

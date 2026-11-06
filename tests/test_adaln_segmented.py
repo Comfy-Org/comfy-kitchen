@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""adaln_segmented / gated_residual_segmented -- reference-token (index_timestep_zero)
-modulation of Qwen-Image, Krea2 and Flux / Flux.2.
+"""adaln_segmented -- reference-token (index_timestep_zero) modulation of Qwen-Image,
+Krea2 and Flux / Flux.2.
 
 The eager backend is the sequence ComfyUI runs today (Flux apply_mod with modulation_dims,
 Krea2 SingleStreamBlock.forward), so it is compared to copies of those for equality. The
@@ -39,22 +39,12 @@ def _krea2_mod(x, norm_scale, scale, shift, bs, split, eps):
     return pre
 
 
-def _krea2_gate(x, attn, gate, bs, split):
-    attn[:, :split].mul_(gate[:bs])
-    attn[:, split:].mul_(gate[bs:])
-    return x + attn
-
-
-# ComfyUI fb2b26f, comfy/ldm/qwen_image/model.py _modulate / _apply_gate
+# ComfyUI fb2b26f, comfy/ldm/qwen_image/model.py _modulate
 def _qwen_mod(x, shift, scale, split):
     b = shift.size(0) // 2
     reg = torch.addcmul(shift[:b].unsqueeze(1), x[:, :split], 1 + scale[:b].unsqueeze(1))
     zero = torch.addcmul(shift[b:].unsqueeze(1), x[:, split:], 1 + scale[b:].unsqueeze(1))
     return torch.cat((reg, zero), dim=1)
-
-
-def _qwen_gate(x, y, gate, split):
-    return y + torch.cat((x[:, :split] * gate[0], x[:, split:] * gate[1]), dim=1)
 
 
 def _reference(x, scale, shift, split, eps=1e-6, rms_weight=None, rms_weight_offset=0.0):
@@ -68,11 +58,6 @@ def _reference(x, scale, shift, split, eps=1e-6, rms_weight=None, rms_weight_off
     sc = scale.float()[seg].transpose(0, 1)
     sh = shift.float()[seg].transpose(0, 1)
     return xn * (1 + sc) + sh
-
-
-def _gate_reference(residual, x, gate, split):
-    seg = (torch.arange(x.shape[1], device=x.device) >= split).long()
-    return residual.float() + x.float() * gate.float()[seg].transpose(0, 1)
 
 
 def _rel(a, b):
@@ -127,31 +112,6 @@ class TestSegmentedEager:
         ref = _reference(x, _split_rows(scale), _split_rows(shift), 13)
         assert _rel(got, ref) < 1e-2
 
-    @pytest.mark.parametrize("split", [0, 6, 17])
-    def test_gate_matches_qwen_krea2_flux(self, split):
-        bs, d = 2, 64
-        x = torch.randn(bs, 17, d, dtype=torch.bfloat16)
-        residual = torch.randn(bs, 17, d, dtype=torch.bfloat16)
-        gate = torch.randn(2 * bs, 1, d, dtype=torch.bfloat16)
-        g = _split_rows(gate)
-        with ck.use_backend("eager"):
-            got = ck.gated_residual_segmented(residual, x, g, split)
-        assert torch.equal(got, _qwen_gate(x, residual, (gate[:bs], gate[bs:]), split))
-        assert torch.equal(got, _krea2_gate(residual, x.clone(), gate, bs, split))
-        flux = residual.clone()
-        flux += _flux_apply_mod(x.clone(), g.transpose(0, 1), None, [(0, split, 0), (split, 17, 1)])
-        assert torch.equal(got, flux)
-
-    def test_gate_in_place(self):
-        x = torch.randn(1, 12, 32)
-        residual = torch.randn(1, 12, 32)
-        gate = torch.randn(2, 1, 32)
-        want = ck.gated_residual_segmented(residual, x, gate, 4)
-        with ck.use_backend("eager"):
-            out = ck.gated_residual_segmented_(residual, x, gate, 4)
-        assert out is residual
-        assert torch.equal(residual, want)
-
     def test_rejects_bad_arguments(self):
         x = torch.randn(1, 8, 16)
         good = torch.randn(2, 1, 16)
@@ -165,8 +125,6 @@ class TestSegmentedEager:
             ck.adaln_segmented(x, good, good, 4, rms_weight=torch.ones(8))
         with pytest.raises(ValueError):
             ck.adaln_segmented(x[0], good, good, 4)  # not [B, L, D]
-        with pytest.raises(ValueError):
-            ck.gated_residual_segmented(torch.randn(1, 8, 8), x, good, 4)
 
 
 # Captured shapes (bf16), tokens scaled down 8x for CI; D, the split position relative to
@@ -188,17 +146,17 @@ def _case_inputs(case, dtype, device="cuda"):
     x = torch.randn(1, seq, d, dtype=dtype, device=device) * 2 + 0.3
     if case == "krea2":
         mod = torch.randn(2, 1, 6 * d, dtype=dtype, device=device).chunk(6, dim=-1)
-        scale, shift, gate = _split_rows(mod[0]), _split_rows(mod[1]), _split_rows(mod[2])
+        scale, shift = _split_rows(mod[0]), _split_rows(mod[1])
         rms_weight = torch.randn(d, dtype=dtype, device=device) * 0.1
     elif case == "qwen_image":
-        shift, scale, gate = torch.randn(2, 3 * d, dtype=dtype, device=device).chunk(3, dim=-1)
-        scale, shift, gate = _split_rows(scale), _split_rows(shift), _split_rows(gate)
+        shift, scale, _ = torch.randn(2, 3 * d, dtype=dtype, device=device).chunk(3, dim=-1)
+        scale, shift = _split_rows(scale), _split_rows(shift)
         rms_weight = None
     else:
-        shift, scale, gate = _flux_modulation(1, d, 3, dtype, device)
-        scale, shift, gate = scale.transpose(0, 1), shift.transpose(0, 1), gate.transpose(0, 1)
+        shift, scale, _ = _flux_modulation(1, d, 3, dtype, device)
+        scale, shift = scale.transpose(0, 1), shift.transpose(0, 1)
         rms_weight = None
-    return x, scale, shift, gate, split, rms_weight
+    return x, scale, shift, split, rms_weight
 
 
 def _tol(dtype):
@@ -216,7 +174,7 @@ class TestSegmentedTriton:
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
     @pytest.mark.parametrize("case", list(_CASES))
     def test_adaln_matches_eager(self, case, dtype):
-        x, scale, shift, _, split, w = _case_inputs(case, dtype)
+        x, scale, shift, split, w = _case_inputs(case, dtype)
         off = 1.0 if w is not None else 0.0
         kwargs = {
             "x": x,
@@ -235,28 +193,6 @@ class TestSegmentedTriton:
         assert _rel(got, ref) < _tol(dtype)
         assert _rel(got, _reference(x, scale, shift, split, 1e-6, w, off)) < _tol(dtype)
 
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-    @pytest.mark.parametrize("case", list(_CASES))
-    def test_gate_matches_eager(self, case, dtype):
-        x, _, _, gate, split, _ = _case_inputs(case, dtype)
-        residual = torch.randn_like(x) * 4
-        kwargs = {"residual": residual, "x": x, "gate": gate, "split": split}
-        assert registry.validate_backend_for_call(
-            "triton", "gated_residual_segmented", kwargs
-        ).success
-        assert registry.validate_backend_for_call(
-            "triton", "gated_residual_segmented_", kwargs
-        ).success
-        with ck.use_backend("triton"):
-            got = ck.gated_residual_segmented(residual, x, gate, split)
-            inplace = residual.clone()
-            ck.gated_residual_segmented_(inplace, x, gate, split)
-        ref = eager_backend.gated_residual_segmented(residual, x, gate, split)
-        assert got.shape == x.shape and got.dtype == dtype
-        assert _rel(got, ref) < _tol(dtype)
-        assert _rel(got, _gate_reference(residual, x, gate, split)) < _tol(dtype)
-        assert torch.equal(inplace, got)
-
     @pytest.mark.parametrize("split", [0, 1, 37, 63, 64])
     @pytest.mark.parametrize("mod_batch", [1, 3])
     def test_split_and_batch(self, split, mod_batch):
@@ -264,16 +200,13 @@ class TestSegmentedTriton:
         x = torch.randn(3, 64, 1000, dtype=torch.bfloat16, device="cuda")
         scale = torch.randn(2, mod_batch, 1000, dtype=torch.bfloat16, device="cuda")
         shift = torch.randn(2, mod_batch, 1000, dtype=torch.bfloat16, device="cuda")
-        residual = torch.randn_like(x)
         with ck.use_backend("triton"):
             got = ck.adaln_segmented(x, scale, shift, split)
-            gated = ck.gated_residual_segmented(residual, x, scale, split)
         assert _rel(got, _reference(x, scale, shift, split)) < 1e-2
-        assert _rel(gated, _gate_reference(residual, x, scale, split)) < 1e-2
 
     def test_strided_inputs(self):
-        # x / residual as token slices of larger buffers (read in place), x with a non-unit
-        # D stride (copied), and modulation with a non-unit D stride (copied)
+        # x as a token slice of a larger buffer (read in place), x with a non-unit D stride
+        # (copied), and modulation with a non-unit D stride (copied)
         d = 512
         big = torch.randn(2, 80, d, dtype=torch.bfloat16, device="cuda")
         x_tok = big[:, 7:71]
@@ -286,16 +219,6 @@ class TestSegmentedTriton:
             with ck.use_backend("triton"):
                 got = ck.adaln_segmented(x, scale, shift, 20)
             assert _rel(got, eager_backend.adaln_segmented(x, scale, shift, 20)) < 1e-2
-
-        buf = torch.randn(2, 80, d, dtype=torch.bfloat16, device="cuda")
-        before = buf.clone()
-        residual = buf[:, 7:71]
-        with ck.use_backend("triton"):
-            want = ck.gated_residual_segmented(residual, x_t, scale, 20)
-            ck.gated_residual_segmented_(residual, x_t, scale, 20)
-        assert torch.equal(buf[:, 7:71], want)
-        assert torch.equal(buf[:, :7], before[:, :7]) and torch.equal(buf[:, 71:], before[:, 71:])
-        assert _rel(want, _gate_reference(before[:, 7:71], x_t, scale, 20)) < 1e-2
 
     def test_unsupported_inputs_go_to_eager(self):
         def cuda(*shape, dtype=torch.bfloat16):
@@ -314,16 +237,3 @@ class TestSegmentedTriton:
             with ck.use_backend("triton"):
                 got = ck.adaln_segmented(**kwargs)
             assert got.shape == kwargs["x"].shape
-
-        # an in-place residual without unit stride on D cannot be written by the kernel
-        residual = cuda(1, 64, 8).transpose(1, 2)
-        x = cuda(1, 8, 64)
-        kwargs = {"residual": residual, "x": x, "gate": mods, "split": 3}
-        assert registry.validate_backend_for_call(
-            "triton", "gated_residual_segmented", kwargs
-        ).success
-        assert registry.get_capable_backend("gated_residual_segmented_", kwargs) == "eager"
-        want = _gate_reference(residual, x, mods, 3).to(residual.dtype)
-        with ck.use_backend("triton"):
-            ck.gated_residual_segmented_(residual, x, mods, 3)
-        assert _rel(residual, want) < 1e-2

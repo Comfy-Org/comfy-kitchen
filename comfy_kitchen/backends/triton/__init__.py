@@ -28,8 +28,6 @@ __all__ = [
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
     "adaln_segmented",
-    "gated_residual_segmented",
-    "gated_residual_segmented_",
 ]
 
 # Try to import triton and register if available
@@ -57,11 +55,7 @@ try:
     )
 
     from .adaln import adaln, rms_adaln
-    from .adaln_segmented import (
-        adaln_segmented,
-        gated_residual_segmented,
-        gated_residual_segmented_,
-    )
+    from .adaln_segmented import adaln_segmented
     from .na import na3d
     from .quantization import (
         dequantize_nvfp4,
@@ -135,12 +129,12 @@ def _build_constraints() -> dict:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
         return ValidationResult.ok()
 
-    # The segmented kernels hold one token row of D in registers (block_d =
-    # next_power_of_2(D)); they were measured up to D = 6144 (block_d 8192), so wider
+    # The segmented kernel holds one token row of D in registers (block_d =
+    # next_power_of_2(D)); it was measured up to D = 6144 (block_d 8192), so wider
     # rows go to eager. No size threshold below that: every captured shape was faster
     # than the eager chain, the smallest (1, 4056, 4096) with split 4056 (Flux.2 Klein
     # double block after the KV cache step) by 2.5x on the RTX 5090 and 2.3x on the
-    # Radeon 8060S for the modulation, 1.9x / 1.6x for the gated residual.
+    # Radeon 8060S.
     max_segmented_d = 8192
 
     def _segmented_common(x, split, mods):
@@ -176,20 +170,6 @@ def _build_constraints() -> dict:
         if w is not None and (w.numel() != x.shape[-1] or w.device != x.device):
             return ValidationResult.fail("rms_weight", f"rms_weight needs {x.shape[-1]} elements on x's device")
         return ValidationResult.ok()
-
-    def _gated_residual_segmented_call_rule(kwargs):
-        x, residual = kwargs.get("x"), kwargs.get("residual")
-        if x is None or residual is None:
-            return ValidationResult.ok()
-        if residual.shape != x.shape or residual.dtype != x.dtype or residual.device != x.device:
-            return ValidationResult.fail("residual", "residual must match x's shape, dtype and device")
-        return _segmented_common(x, kwargs.get("split"), {"gate": kwargs.get("gate")})
-
-    def _gated_residual_segmented_inplace_call_rule(kwargs):
-        residual = kwargs.get("residual")
-        if residual is not None and residual.dim() == 3 and residual.stride(-1) != 1:
-            return ValidationResult.fail("residual", "in-place residual needs unit stride on D")
-        return _gated_residual_segmented_call_rule(kwargs)
 
     cuda_devices = frozenset({"cuda"})
     triton_devices = frozenset({"cuda", "xpu"})
@@ -399,21 +379,6 @@ def _build_constraints() -> dict:
         },
         default_devices=triton_devices,
         call_rules=(_adaln_segmented_call_rule,),
-    )
-    gated_residual_params = {
-        "residual": ParamConstraint(dtypes=standard_floats),
-        "x": ParamConstraint(dtypes=standard_floats),
-        "gate": ParamConstraint(dtypes=standard_floats),
-    }
-    out["gated_residual_segmented"] = FunctionConstraints(
-        params=gated_residual_params,
-        default_devices=triton_devices,
-        call_rules=(_gated_residual_segmented_call_rule,),
-    )
-    out["gated_residual_segmented_"] = FunctionConstraints(
-        params=gated_residual_params,
-        default_devices=triton_devices,
-        call_rules=(_gated_residual_segmented_inplace_call_rule,),
     )
     out["na3d"] = FunctionConstraints(
         params={

@@ -67,8 +67,6 @@ __all__ = [
     # Normalization
     "adaln",
     "adaln_segmented",
-    "gated_residual_segmented",
-    "gated_residual_segmented_",
     "rms_gated_residual",
     "fp16_conv3d",
     "group_norm_silu_pad3d",
@@ -427,33 +425,6 @@ def adaln_segmented(
     return torch.ops.comfy_kitchen.adaln_segmented(
         x, scale, shift, int(split), float(eps), rms_weight, float(rms_weight_offset)
     )
-
-
-def gated_residual_segmented(
-    residual: torch.Tensor,
-    x: torch.Tensor,
-    gate: torch.Tensor,
-    split: int,
-) -> torch.Tensor:
-    """``residual + x * gate[i]`` with two gate segments along the tokens, as a new tensor.
-
-    x and residual ``[B, L, D]``; ``gate`` ``[2, B, D]`` or ``[2, 1, D]``, row 0 for the
-    tokens before ``split`` and row 1 from ``split`` on. The eager backend rounds
-    ``x * gate`` to the activation dtype before the add, as the unfused sequence does;
-    the triton backend computes in fp32 and rounds once.
-    """
-    return torch.ops.comfy_kitchen.gated_residual_segmented(residual, x, gate, int(split))
-
-
-def gated_residual_segmented_(
-    residual: torch.Tensor,
-    x: torch.Tensor,
-    gate: torch.Tensor,
-    split: int,
-) -> torch.Tensor:
-    """:func:`gated_residual_segmented` written into ``residual`` in place (inference only)."""
-    torch.ops.comfy_kitchen.gated_residual_segmented_(residual, x, gate, int(split))
-    return residual
 
 
 def fp16_conv3d(
