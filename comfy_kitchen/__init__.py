@@ -420,8 +420,9 @@ def adaln_segmented(
     (``index_timestep_zero``) modulation of Qwen-Image, Krea2 and Flux / Flux.2.
     ``scale`` / ``shift`` are ``[2, B, D]`` or ``[2, 1, D]``, any strides on the first two
     dims. The norm is LayerNorm without affine, or with ``rms_weight`` given, an fp32
-    RMSNorm with weight ``rms_weight + rms_weight_offset`` rounded to x's dtype after the
-    norm (Krea2 stores its RMSNorm scale zero-centered: offset 1.0).
+    RMSNorm with weight ``rms_weight + rms_weight_offset`` (Krea2 stores its RMSNorm scale
+    zero-centered: offset 1.0). The eager backend rounds each step to x's dtype as the
+    unfused sequence does; the triton backend computes in fp32 and rounds once.
     """
     return torch.ops.comfy_kitchen.adaln_segmented(
         x, scale, shift, int(split), float(eps), rms_weight, float(rms_weight_offset)
@@ -437,8 +438,9 @@ def gated_residual_segmented(
     """``residual + x * gate[i]`` with two gate segments along the tokens, as a new tensor.
 
     x and residual ``[B, L, D]``; ``gate`` ``[2, B, D]`` or ``[2, 1, D]``, row 0 for the
-    tokens before ``split`` and row 1 from ``split`` on. ``x * gate`` is rounded to the
-    activation dtype before the add, as in the unfused sequence.
+    tokens before ``split`` and row 1 from ``split`` on. The eager backend rounds
+    ``x * gate`` to the activation dtype before the add, as the unfused sequence does;
+    the triton backend computes in fp32 and rounds once.
     """
     return torch.ops.comfy_kitchen.gated_residual_segmented(residual, x, gate, int(split))
 
