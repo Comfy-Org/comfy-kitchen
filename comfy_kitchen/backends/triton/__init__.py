@@ -142,9 +142,13 @@ def _build_constraints() -> dict:
         if x.dim() != 3:
             return ValidationResult.fail("x", "x must be [B, L, D]")
         if x.numel() == 0:
-            return ValidationResult.fail("x", "empty tensors are not supported by the triton kernel")
+            return ValidationResult.fail(
+                "x", "empty tensors are not supported by the triton kernel"
+            )
         if x.shape[-1] > max_segmented_d:
-            return ValidationResult.fail("x", f"D > {max_segmented_d} is not supported by the triton kernel")
+            return ValidationResult.fail(
+                "x", f"D > {max_segmented_d} is not supported by the triton kernel"
+            )
         if split is not None and not 0 <= split <= x.shape[1]:
             return ValidationResult.fail("split", f"split must be in [0, {x.shape[1]}]")
         batch, _, d = x.shape
@@ -152,7 +156,9 @@ def _build_constraints() -> dict:
             if t is None:
                 continue
             if t.dim() != 3 or t.shape[0] != 2 or t.shape[1] not in (1, batch) or t.shape[2] != d:
-                return ValidationResult.fail(name, f"{name} must be [2, {batch}, {d}] or [2, 1, {d}]")
+                return ValidationResult.fail(
+                    name, f"{name} must be [2, {batch}, {d}] or [2, 1, {d}]"
+                )
             if t.dtype != x.dtype:
                 return ValidationResult.fail(name, f"{name} must have x's dtype")
             if t.device != x.device:
@@ -164,7 +170,9 @@ def _build_constraints() -> dict:
         if x is None or residual is None:
             return ValidationResult.ok()
         if residual.shape != x.shape or residual.dtype != x.dtype or residual.device != x.device:
-            return ValidationResult.fail("residual", "residual must match x's shape, dtype and device")
+            return ValidationResult.fail(
+                "residual", "residual must match x's shape, dtype and device"
+            )
         return _segmented_common(x, kwargs.get("split"), {"gate": kwargs.get("gate")})
 
     def _gated_residual_segmented_inplace_call_rule(kwargs):
