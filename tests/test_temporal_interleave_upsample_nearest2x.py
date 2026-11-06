@@ -111,7 +111,7 @@ class TestTemporalInterleaveUpsampleCallRule:
     @pytest.mark.parametrize(
         ("shape", "interleave", "ok"),
         [
-            ((1, 384, 1, 60, 104), False, False),  # Wan2.1 first chunk, 9.58M out: eager faster
+            ((1, 384, 1, 60, 104), False, False),  # Wan2.1 first chunk, 9.58M out
             ((1, 1024, 1, 44, 80), False, True),  # Wan2.2 first chunk, 14.4M out
             ((1, 1, 1, 1000, 2999), False, False),  # 11,996,000 out
             ((1, 1, 1, 1000, 3000), False, True),  # 12,000,000 out
@@ -211,7 +211,7 @@ class TestTemporalInterleaveUpsampleTriton:
             )
 
     def test_small_plain_goes_to_eager(self):
-        # Wan2.1 first-chunk upsample, 9.58M output elements: the eager upsample is faster
+        # Wan2.1 first-chunk upsample, 9.58M output elements: below the threshold
         x = torch.randn(1, 384, 1, 60, 104, device="cuda", dtype=torch.bfloat16)
         kwargs = {"x": x, "interleave": False}
         assert not registry.validate_backend_for_call("triton", OP, kwargs).success

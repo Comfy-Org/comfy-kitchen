@@ -150,7 +150,7 @@ def _build_constraints() -> dict:
             )
         if not interleave and out_numel < _plain_upsample_min_numel:
             return ValidationResult.fail(
-                "x", f"output below {_plain_upsample_min_numel} elements runs faster in eager"
+                "x", f"output below {_plain_upsample_min_numel} elements runs in eager"
             )
         return ValidationResult.ok()
 
