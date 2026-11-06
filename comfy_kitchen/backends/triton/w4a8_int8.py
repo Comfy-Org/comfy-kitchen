@@ -25,10 +25,12 @@ from .quantization import int8_linear
 
 @triton.jit
 def _dequant_int4_grouped_to_int8_kernel(
-    qdata_ptr,   # [n, k*bits/8] int8 storage: nibble plane (even col=low nibble, odd=high),
-                 # then at 6 bits a k/4-byte plane of top-2-bit codes (col c: byte c//4, bit 2*(c%4))
+    qdata_ptr,   # [n, k*bits/8] int8 storage of bit planes: 4/5/6 bits a nibble plane (even col=low
+                 # nibble, odd=high); 6 bits then a k/4-byte 2-bit plane of the top 2 bits (col c:
+                 # byte c//4, bit 2*(c%4)); 5 bits a k/8-byte 1-bit plane of the top bit (byte c//8,
+                 # bit c%8); 3 bits a k/4-byte 2-bit plane of the low 2 bits then the 1-bit plane
     srel_ptr,    # [n, groups] fp32 per-group scale (fp8 decoded to fp32 by the wrapper)
-    cb_ptr,      # [16] fp32 codebook (unused when has_cb is False)
+    cb_ptr,      # [16] (4-bit) or [8] (3-bit) fp32 codebook (unused when has_cb is False)
     out_ptr,     # [n, k] int8 output
     n, k, group_size,
     stride_qn, stride_qk,
@@ -44,20 +46,40 @@ def _dequant_int4_grouped_to_int8_kernel(
     k_half = k // 2
 
     rows = pid_n * block_n + tl.arange(0, block_n)          # [block_n]
-    bcols = pid_k * block_kh + tl.arange(0, block_kh)       # [block_kh] packed byte cols
+    bcols = pid_k * block_kh + tl.arange(0, block_kh)       # [block_kh] output column PAIRS (2b, 2b+1)
     m = (rows[:, None] < n) & (bcols[None, :] < k_half)     # [block_n, block_kh]
 
-    byte = tl.load(qdata_ptr + rows[:, None] * stride_qn + bcols[None, :] * stride_qk,
-                   mask=m, other=0).to(tl.int32) & 0xFF
-    low = byte & 0xF
-    high = (byte >> 4) & 0xF
-    if bits == 6:
-        # byte col b -> output cols 2b, 2b+1 -> high-plane byte b//2, bits 4*(b%2) (+2)
-        hib = tl.load(qdata_ptr + rows[:, None] * stride_qn + (k_half + (bcols >> 1))[None, :] * stride_qk,
+    if bits == 3:
+        # pair b -> 2-bit-plane byte b//2 at bits 4*(b%2) (+2); 1-bit-plane byte k//4 + b//4 at bits 2*(b%4) (+1)
+        lob = tl.load(qdata_ptr + rows[:, None] * stride_qn + (bcols >> 1)[None, :] * stride_qk,
                       mask=m, other=0).to(tl.int32) & 0xFF
-        sh = (4 * (bcols & 1))[None, :]
-        low = low | (((hib >> sh) & 0x3) << 4)
-        high = high | (((hib >> (sh + 2)) & 0x3) << 4)
+        sh2 = (4 * (bcols & 1))[None, :]
+        low = (lob >> sh2) & 0x3
+        high = (lob >> (sh2 + 2)) & 0x3
+        hib = tl.load(qdata_ptr + rows[:, None] * stride_qn + (k // 4 + (bcols >> 2))[None, :] * stride_qk,
+                      mask=m, other=0).to(tl.int32) & 0xFF
+        sh1 = (2 * (bcols & 3))[None, :]
+        low = low | (((hib >> sh1) & 0x1) << 2)
+        high = high | (((hib >> (sh1 + 1)) & 0x1) << 2)
+    else:
+        byte = tl.load(qdata_ptr + rows[:, None] * stride_qn + bcols[None, :] * stride_qk,
+                       mask=m, other=0).to(tl.int32) & 0xFF
+        low = byte & 0xF
+        high = (byte >> 4) & 0xF
+        if bits == 6:
+            # byte col b -> output cols 2b, 2b+1 -> high-plane byte b//2, bits 4*(b%2) (+2)
+            hib = tl.load(qdata_ptr + rows[:, None] * stride_qn + (k_half + (bcols >> 1))[None, :] * stride_qk,
+                          mask=m, other=0).to(tl.int32) & 0xFF
+            sh = (4 * (bcols & 1))[None, :]
+            low = low | (((hib >> sh) & 0x3) << 4)
+            high = high | (((hib >> (sh + 2)) & 0x3) << 4)
+        if bits == 5:
+            # byte col b -> output cols 2b, 2b+1 -> 1-bit-plane byte b//4, bits 2*(b%4) (+1)
+            hib = tl.load(qdata_ptr + rows[:, None] * stride_qn + (k_half + (bcols >> 2))[None, :] * stride_qk,
+                          mask=m, other=0).to(tl.int32) & 0xFF
+            sh = (2 * (bcols & 3))[None, :]
+            low = low | (((hib >> sh) & 0x1) << 4)
+            high = high | (((hib >> (sh + 1)) & 0x1) << 4)
 
     # even group_size => a byte's two nibbles share a group -> one scale load per byte
     grp = (2 * bcols) // group_size                         # [block_kh]
@@ -65,7 +87,7 @@ def _dequant_int4_grouped_to_int8_kernel(
                 mask=m, other=0.0)                          # [block_n, block_kh] fp32
 
     if has_cb:
-        v_low = tl.load(cb_ptr + low)                       # gather (indices always 0..15)
+        v_low = tl.load(cb_ptr + low)                       # gather (indices 0..15, or 0..7 at 3 bits)
         v_high = tl.load(cb_ptr + high)
     else:
         v_low = (low - (1 << (bits - 1))).to(tl.float32)    # uniform, zero point mid-range
@@ -84,7 +106,7 @@ def _dequant_int4_grouped_to_int8(
     codebook: torch.Tensor | None,
     group_size: int,
 ) -> torch.Tensor:
-    """Fused Triton int4/int6 -> grouped int8: round(clamp(level(q) * s_rel, -127, 127))."""
+    """Fused Triton int3/int4/int5/int6 -> grouped int8: round(clamp(level(q) * s_rel, -127, 127))."""
     n, k, bits = _w4a8_geometry(qdata, s_rel, group_size)
     k_half = k // 2
     qi = qdata.contiguous()

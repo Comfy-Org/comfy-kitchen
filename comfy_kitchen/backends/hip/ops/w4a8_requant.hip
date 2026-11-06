@@ -116,25 +116,26 @@ __forceinline__ __device__ float rq_block_max(float v, float* slice_max) {
     return m;
 }
 
-// Entries of a sorted 16-entry table below x (<= x with LE); branch-free bisection.
+// Entries of a sorted L-entry (16 or 8) table below x (<= x with LE); branch-free bisection.
 // Tables are callables so the level table never materializes as a private array,
 // which would spill to scratch.
-template <bool LE, typename Table>
+template <bool LE, int L = 16, typename Table>
 __forceinline__ __device__ int rq_count16(Table tab, float x) {
     auto lt = [&](int j) { return LE ? (tab(j) <= x) : (tab(j) < x); };
-    int p = lt(7) ? 8 : 0;
-    p += lt(p + 3) ? 4 : 0;
-    p += lt(p + 1) ? 2 : 0;
-    p += lt(p) ? 1 : 0;
+    int p = 0;
+    #pragma unroll
+    for (int step = L / 2; step >= 1; step >>= 1) {
+        p += lt(p + step - 1) ? step : 0;
+    }
     return p;
 }
 
 // Nearest entry, the lower bracket on a tie; DISTINCT skips the search for the first
 // copy of a repeated value.
-template <bool DISTINCT, typename Table>
+template <bool DISTINCT, int L = 16, typename Table>
 __forceinline__ __device__ int rq_nearest16(Table tab, float x) {
-    const int pos = rq_count16<false>(tab, x);
-    const int h = min(pos, 15);
+    const int pos = rq_count16<false, L>(tab, x);
+    const int h = min(pos, L - 1);
     const int l = max(pos - 1, 0);
     const float th = tab(h);
     const float tl = tab(l);
@@ -144,7 +145,7 @@ __forceinline__ __device__ int rq_nearest16(Table tab, float x) {
     if (DISTINCT) {
         return l;
     }
-    return rq_count16<false>(tab, tl);  // first index holding the value tl
+    return rq_count16<false, L>(tab, tl);  // first index holding the value tl
 }
 
 template <int LOG2G>
@@ -156,8 +157,9 @@ struct RqLog2 {
     static constexpr int value = G == 16 ? 4 : G == 32 ? 5 : 6;
 };
 
-// src(i) is the rotated row's element i as fp32.
-template <typename Src>
+// src(i) is the rotated row's element i as fp32. L = 16 (W4A8 nibbles) or 8 (W3A8: a 2-bit
+// plane then a 1-bit plane); cb holds L sorted levels.
+template <int L = 16, typename Src>
 __forceinline__ __device__ void w4_quantize_row(Src src, int k, int64_t elem_base,
                                                 const float* cb, int8_t* __restrict__ packed_row,
                                                 uint8_t* __restrict__ s_rel_row,
@@ -183,7 +185,7 @@ __forceinline__ __device__ void w4_quantize_row(Src src, int k, int64_t elem_bas
         int idx[G];
         #pragma unroll
         for (int i = 0; i < G; ++i) {
-            idx[i] = rq_nearest16<true>(cbt, rq_div(w[i], gs));
+            idx[i] = rq_nearest16<true, L>(cbt, rq_div(w[i], gs));
         }
         #pragma unroll
         for (int it = 0; it < 2; ++it) {  // eager _ALS_ITERS
@@ -198,7 +200,7 @@ __forceinline__ __device__ void w4_quantize_row(Src src, int k, int64_t elem_bas
             gs = fmaxf(rq_div(num, fmaxf(den, 1e-8f)), 1e-8f);
             #pragma unroll
             for (int i = 0; i < G; ++i) {
-                idx[i] = rq_nearest16<true>(cbt, rq_div(w[i], gs));
+                idx[i] = rq_nearest16<true, L>(cbt, rq_div(w[i], gs));
             }
         }
         gscale[g] = gs;
@@ -228,21 +230,31 @@ __forceinline__ __device__ void w4_quantize_row(Src src, int k, int64_t elem_bas
                 const float t = rq_div(src(base + i), sc);
                 int a;
                 if constexpr (SR) {
-                    const int lo = min(max(rq_count16<true>(lv, t) - 1, 0), 14);
+                    const int lo = min(max(rq_count16<true, L>(lv, t) - 1, 0), L - 2);
                     const float l0 = lv(lo);
                     const float thr = l0 + rq_uniform(elem_base + base + i, seed) * (lv(lo + 1) - l0);
-                    a = min(lo + (t > thr ? 1 : 0), 15);
+                    a = min(lo + (t > thr ? 1 : 0), L - 1);
                 } else {
                     // Rounded levels can repeat. Eager's _assign_grid returns pos - 1, the
                     // last copy of the lower level, which the plain search already lands
                     // on, so the packed codes match eager's byte for byte.
-                    a = rq_nearest16<true>(lv, t);
+                    a = rq_nearest16<true, L>(lv, t);
                 }
-                words[i >> 3] |= static_cast<uint32_t>(a & 0xF) << (4 * (i & 7));
+                if constexpr (L == 16) {
+                    words[i >> 3] |= static_cast<uint32_t>(a & 0xF) << (4 * (i & 7));
+                } else {
+                    words[0] |= static_cast<uint32_t>(a & 3) << (2 * i);   // 2-bit plane word
+                    words[1] |= static_cast<uint32_t>((a >> 2) & 1) << i;  // 1-bit plane half-word
+                }
             }
-            uint32_t* out = reinterpret_cast<uint32_t*>(packed_row + g * (G / 2));
-            out[0] = words[0];
-            out[1] = words[1];
+            if constexpr (L == 16) {
+                uint32_t* out = reinterpret_cast<uint32_t*>(packed_row + g * (G / 2));
+                out[0] = words[0];
+                out[1] = words[1];
+            } else {
+                *reinterpret_cast<uint32_t*>(packed_row + g * 4) = words[0];
+                *reinterpret_cast<uint16_t*>(packed_row + k / 4 + g * 2) = static_cast<uint16_t>(words[1]);
+            }
         }
     };
     if (stochastic) {
@@ -252,19 +264,23 @@ __forceinline__ __device__ void w4_quantize_row(Src src, int k, int64_t elem_bas
     }
 }
 
-// int8 value of 6-bit level index i (0..62) at group step s: eager's _grid_levels.
+// int8 value of uniform level index i (0..2*LMAX) at group step s: eager's _grid_levels.
+// LMAX is 31 (6-bit) or 15 (5-bit).
+template <int LMAX>
 __forceinline__ __device__ float w6_level(int i, float s) {
-    return fminf(127.0f, fmaxf(-127.0f, rintf(static_cast<float>(i - 31) * s)));
+    return fminf(127.0f, fmaxf(-127.0f, rintf(static_cast<float>(i - LMAX) * s)));
 }
 
 // First level index >= t (searchsorted): a closed-form estimate, then fixups make it exact.
+template <int LMAX>
 __forceinline__ __device__ int w6_lower_bound(float t, float s, float inv_s) {
-    int i = __float2int_rn((ceilf(t) - 0.5f) * inv_s) + 31;
-    i = min(max(i, 0), 63);
-    while (i > 0 && w6_level(i - 1, s) >= t) {
+    constexpr int top = 2 * LMAX + 1;
+    int i = __float2int_rn((ceilf(t) - 0.5f) * inv_s) + LMAX;
+    i = min(max(i, 0), top);
+    while (i > 0 && w6_level<LMAX>(i - 1, s) >= t) {
         --i;
     }
-    while (i < 63 && w6_level(i, s) < t) {
+    while (i < top && w6_level<LMAX>(i, s) < t) {
         ++i;
     }
     return i;
@@ -272,22 +288,25 @@ __forceinline__ __device__ int w6_lower_bound(float t, float s, float inv_s) {
 
 // Eager _assign_grid: the nearer level of the bracket around t (lower on a tie), or
 // an SR draw inside it.
-template <bool SR>
+template <bool SR, int LMAX>
 __forceinline__ __device__ int w6_assign(float t, float s, float inv_s, int64_t idx,
                                          uint64_t seed) {
-    const int pos = w6_lower_bound(t, s, inv_s);
+    constexpr int last = 2 * LMAX;
+    const int pos = w6_lower_bound<LMAX>(t, s, inv_s);
     if constexpr (SR) {
-        const int l = min(max(pos - 1, 0), 61);
-        const float level_lo = w6_level(l, s);
-        const float thr = level_lo + rq_uniform(idx, seed) * (w6_level(l + 1, s) - level_lo);
-        return min(l + (t > thr ? 1 : 0), 62);
+        const int l = min(max(pos - 1, 0), last - 1);
+        const float level_lo = w6_level<LMAX>(l, s);
+        const float thr = level_lo + rq_uniform(idx, seed) * (w6_level<LMAX>(l + 1, s) - level_lo);
+        return min(l + (t > thr ? 1 : 0), last);
     }
-    const int l = min(max(pos - 1, 0), 62);
-    const int h = min(pos, 62);
-    return (fabsf(t - w6_level(h, s)) < fabsf(t - w6_level(l, s))) ? h : l;
+    const int l = min(max(pos - 1, 0), last);
+    const int h = min(pos, last);
+    return (fabsf(t - w6_level<LMAX>(h, s)) < fabsf(t - w6_level<LMAX>(l, s))) ? h : l;
 }
 
-template <typename InputT, int G>
+// One W6A8 (LMAX 31: nibble plane then 2-bit plane) or W5A8 (LMAX 15: nibble plane then
+// 1-bit plane) row.
+template <typename InputT, int G, int LMAX = 31>
 __forceinline__ __device__ void w6_quantize_row(const InputT* row_buf, int k, int64_t elem_base,
                                                 int8_t* __restrict__ packed_row,
                                                 uint8_t* __restrict__ s_rel_row,
@@ -308,14 +327,15 @@ __forceinline__ __device__ void w6_quantize_row(const InputT* row_buf, int k, in
             w[i] = src(base + i);
             amax = fmaxf(amax, fabsf(w[i]));
         }
-        float gs = fmaxf(amax * (1.0f / 31.0f), 1e-8f);
+        constexpr float lmax = static_cast<float>(LMAX);
+        float gs = fmaxf(amax * (1.0f / lmax), 1e-8f);
         #pragma unroll
         for (int it = 0; it < 2; ++it) {  // eager _ALS_ITERS
             float num = 0.0f;
             float den = 0.0f;
             #pragma unroll
             for (int i = 0; i < G; ++i) {
-                const float q = fminf(31.0f, fmaxf(-31.0f, rintf(rq_div(w[i], gs))));
+                const float q = fminf(lmax, fmaxf(-lmax, rintf(rq_div(w[i], gs))));
                 num += w[i] * q;
                 den += q * q;
             }
@@ -324,7 +344,7 @@ __forceinline__ __device__ void w6_quantize_row(const InputT* row_buf, int k, in
         gscale[g] = gs;
         #pragma unroll
         for (int i = 0; i < G; ++i) {
-            thr_amax = fmaxf(thr_amax, fabsf(fminf(31.0f, fmaxf(-31.0f, rintf(rq_div(w[i], gs)))) * gs));
+            thr_amax = fmaxf(thr_amax, fabsf(fminf(lmax, fmaxf(-lmax, rintf(rq_div(w[i], gs)))) * gs));
         }
     }
     const float sc = fmaxf(rq_block_max(thr_amax, slice_max) * (1.0f / 127.0f), 1e-8f);
@@ -332,7 +352,7 @@ __forceinline__ __device__ void w6_quantize_row(const InputT* row_buf, int k, in
         *s_channel_out = sc;
     }
 
-    // fp8 s_rel -> grid assignment -> code q + 32 -> nibble plane then 2-bit plane.
+    // fp8 s_rel -> grid assignment -> code q + LMAX + 1 -> nibble plane then the high plane.
     int8_t* hi_plane = packed_row + k / 2;
     auto phase2 = [&](auto sr_tag) {
         constexpr bool SR = decltype(sr_tag)::value;
@@ -343,20 +363,33 @@ __forceinline__ __device__ void w6_quantize_row(const InputT* row_buf, int k, in
             const float inv_srel = 1.0f / fmaxf(srel, 1e-30f);  // estimate only
             const int base = g * G;
             int8_t* lo = packed_row + g * (G / 2);
-            int8_t* hi = hi_plane + g * (G / 4);
+            int8_t* hi = hi_plane + g * (LMAX == 31 ? G / 4 : G / 8);
+            uint8_t hib[G / 8] = {};  // 5-bit: one top bit per code, 8 codes per byte
             #pragma unroll
             for (int p = 0; p < G / 4; ++p) {
                 const int c = 4 * p;
                 int u[4];
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    u[j] = w6_assign<SR>(rq_div(src(base + c + j), sc), srel, inv_srel,
-                                         elem_base + base + c + j, seed) + 1;
+                    u[j] = w6_assign<SR, LMAX>(rq_div(src(base + c + j), sc), srel, inv_srel,
+                                               elem_base + base + c + j, seed) + 1;
                 }
                 lo[2 * p] = static_cast<int8_t>((u[0] & 0xF) | ((u[1] & 0xF) << 4));
                 lo[2 * p + 1] = static_cast<int8_t>((u[2] & 0xF) | ((u[3] & 0xF) << 4));
-                hi[p] = static_cast<int8_t>(((u[0] >> 4) & 3) | (((u[1] >> 4) & 3) << 2) |
-                                            (((u[2] >> 4) & 3) << 4) | (((u[3] >> 4) & 3) << 6));
+                if constexpr (LMAX == 31) {
+                    hi[p] = static_cast<int8_t>(((u[0] >> 4) & 3) | (((u[1] >> 4) & 3) << 2) |
+                                                (((u[2] >> 4) & 3) << 4) | (((u[3] >> 4) & 3) << 6));
+                } else {
+                    hib[p >> 1] |= static_cast<uint8_t>(
+                        (((u[0] >> 4) & 1) | (((u[1] >> 4) & 1) << 1) | (((u[2] >> 4) & 1) << 2) |
+                         (((u[3] >> 4) & 1) << 3)) << (4 * (p & 1)));
+                }
+            }
+            if constexpr (LMAX != 31) {
+                #pragma unroll
+                for (int p = 0; p < G / 8; ++p) {
+                    hi[p] = static_cast<int8_t>(hib[p]);
+                }
             }
         }
     };
@@ -448,7 +481,7 @@ __forceinline__ __device__ void rq_rotate_group_regs(const InputT* __restrict__ 
 template <typename InputT, int BITS, int G>
 __global__ __launch_bounds__(512) void quantize_wxa8_convrot_fused_kernel(
     const InputT* __restrict__ weight,  // [N, K], unrotated
-    const float* __restrict__ codebook, // [16] at 4 bits, else null
+    const float* __restrict__ codebook, // [16] at 4 bits, [8] at 3, else null
     int8_t* __restrict__ packed,        // [N, K*BITS/8]
     uint8_t* __restrict__ s_rel,        // [N, K/G], raw e4m3 bytes
     float* __restrict__ s_channel,      // [N]
@@ -460,7 +493,7 @@ __global__ __launch_bounds__(512) void quantize_wxa8_convrot_fused_kernel(
     extern __shared__ float smem[];
     float* gscale = smem;                                                  // [K/G]
     InputT* row_buf = reinterpret_cast<InputT*>(gscale + (k >> LOG2G));  // padded rotated row
-    if (BITS == 4 && threadIdx.x < 16) {
+    if ((BITS == 4 || BITS == 3) && threadIdx.x < (BITS == 4 ? 16 : 8)) {
         cb[threadIdx.x] = codebook[threadIdx.x];
     }
 
@@ -479,14 +512,15 @@ __global__ __launch_bounds__(512) void quantize_wxa8_convrot_fused_kernel(
                                             lane8, active);
     }
     __syncthreads();
-    if constexpr (BITS == 4) {
+    if constexpr (BITS == 4 || BITS == 3) {
         auto src = [&](int i) { return rq_to_float(row_buf[rq_padded_index<4>(i)]); };
-        w4_quantize_row(src, k, row * k, cb, packed + row * (k / 2), s_rel + row * (k / G),
-                        s_channel + row, gscale, slice_max, stochastic, seed);
+        w4_quantize_row<(BITS == 4 ? 16 : 8)>(src, k, row * k, cb, packed + row * (k * BITS / 8),
+                                              s_rel + row * (k / G), s_channel + row, gscale,
+                                              slice_max, stochastic, seed);
     } else {
-        w6_quantize_row<InputT, G>(row_buf, k, row * k, packed + row * (k * 3 / 4),
-                                   s_rel + row * (k / G), s_channel + row, gscale, slice_max,
-                                   stochastic, seed);
+        w6_quantize_row<InputT, G, (BITS == 6 ? 31 : 15)>(
+            row_buf, k, row * k, packed + row * (k * BITS / 8), s_rel + row * (k / G),
+            s_channel + row, gscale, slice_max, stochastic, seed);
     }
 }
 
@@ -495,7 +529,7 @@ void launch_wxa8_fused(const void* weight, const float* codebook, void* packed, 
                        void* s_channel, int64_t n, int64_t k, int in_dtype_code, bool stochastic,
                        uint64_t seed, hipStream_t stream) {
     // Long rows hold a CU alone anyway, so they get more waves. Same split as CUDA.
-    const bool wide = k > (BITS == 4 ? 16384 : 8192);
+    const bool wide = k > (BITS <= 4 ? 16384 : 8192);
     const int groups = static_cast<int>(k / G);
     const int threads = std::min(wide ? 512 : 256, (groups + 31) / 32 * 32);
     const size_t shmem = wxa8_requant_row_lds(k, G);
@@ -556,7 +590,7 @@ void launch_w4a8_staged(const void* rotated, const float* codebook, void* packed
 }  // namespace comfy::hip_backend
 
 // weight is the raw [N, K] fp16 (code 1) or bf16 (code 2) weight; ConvRot group 256.
-// bits 4 takes the 16-entry codebook at G 16, bits 6 uniform levels at G 16/32/64.
+// bits 4/3 take the 16-/8-entry codebook at G 16, bits 6/5 uniform levels at G 16/32/64.
 // s_rel is written as raw e4m3 bytes; seed is ignored unless stochastic is set.
 extern "C" void launch_quantize_wxa8_convrot_fused_kernel(
     const void* weight, const void* codebook, void* packed, void* s_rel, void* s_channel,
@@ -593,9 +627,21 @@ extern "C" void launch_quantize_wxa8_convrot_fused_kernel(
     } else if (bits == 6 && g == 64) {
         launch_wxa8_fused<6, 64>(weight, nullptr, packed, s_rel, s_channel, n, k, in_dtype_code,
                                  stochastic, seed, stream);
+    } else if (bits == 3 && g == 16) {
+        launch_wxa8_fused<3, 16>(weight, cb, packed, s_rel, s_channel, n, k, in_dtype_code,
+                                 stochastic, seed, stream);
+    } else if (bits == 5 && g == 16) {
+        launch_wxa8_fused<5, 16>(weight, nullptr, packed, s_rel, s_channel, n, k, in_dtype_code,
+                                 stochastic, seed, stream);
+    } else if (bits == 5 && g == 32) {
+        launch_wxa8_fused<5, 32>(weight, nullptr, packed, s_rel, s_channel, n, k, in_dtype_code,
+                                 stochastic, seed, stream);
+    } else if (bits == 5 && g == 64) {
+        launch_wxa8_fused<5, 64>(weight, nullptr, packed, s_rel, s_channel, n, k, in_dtype_code,
+                                 stochastic, seed, stream);
     } else {
         throw std::runtime_error(std::string(kFn) +
-                                 ": bits/group_size must be 4/16 or 6/{16,32,64}");
+                                 ": bits/group_size must be 4/16, 3/16, 6/{16,32,64} or 5/{16,32,64}");
     }
 }
 

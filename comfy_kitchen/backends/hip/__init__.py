@@ -1410,12 +1410,11 @@ def _fused_quantize_wxa8(
     """ConvRot and requantize the raw weight in one launch, with no rotated copy."""
     n, k = weight.shape
     dev = weight.device
-    if bits == 4:
+    if bits in (3, 4):
         cb = codebook.to(device=dev, dtype=torch.float32).contiguous()
-        packed = torch.empty(n, k // 2, dtype=torch.int8, device=dev)
     else:
         cb = torch.empty(0, dtype=torch.float32, device=dev)
-        packed = torch.empty(n, k * 3 // 4, dtype=torch.int8, device=dev)
+    packed = torch.empty(n, k * bits // 8, dtype=torch.int8, device=dev)
     s_rel = torch.empty(n, k // group_size, dtype=torch.float8_e4m3fn, device=dev)
     s_channel = torch.empty(n, dtype=torch.float32, device=dev)
     with torch.cuda.device(dev):
@@ -1433,7 +1432,7 @@ def _fused_quantize_wxa8(
             int(stochastic_rounding) if stochastic_rounding > 0 else 0,
             _stream(weight),
         )
-    return packed, s_rel, s_channel, None, (cb if bits == 4 else None)
+    return packed, s_rel, s_channel, None, (cb if bits in (3, 4) else None)
 
 
 _W4A8_STAGED_QUANT = _EXT_AVAILABLE
@@ -1498,17 +1497,17 @@ def quantize_w4a8_int8_weight(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Prepare W4A8/W6A8 weights: the fused HIP ConvRot + requantize for the default
-    configs (4-bit symmetric codebook g16, or 6-bit without the quantize-time scale
-    search; fp8 scales). W4A8 the fused kernel declines takes the staged HIP requantize;
-    everything else the chunked eager path."""
+    """Prepare W4A8/W6A8 (and 3/5-bit) weights: the fused HIP ConvRot + requantize for the
+    default configs (4/3-bit symmetric codebook g16, or 6/5-bit without the quantize-time
+    scale search; fp8 scales). W4A8 the fused kernel declines takes the staged HIP
+    requantize; everything else the chunked eager path."""
     validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
     layout_ok = (
         scale_dtype == torch.float8_e4m3fn
         and symmetric
         and (
-            (bits == 4 and codebook and group_size == 16)
-            or (bits == 6 and not scale_search and group_size in (16, 32, 64))
+            ((bits == 3 or (bits == 4 and codebook)) and group_size == 16)   # 3-bit is always codebook
+            or (bits in (5, 6) and not scale_search and group_size in (16, 32, 64))
         )
     )
     fused_ok = (
@@ -1526,12 +1525,13 @@ def quantize_w4a8_int8_weight(
     )
     if fused_ok or staged_ok:
         cb = None
-        if bits == 4:
+        if bits in (3, 4):
             cb = (
                 codebook_tensor
                 if codebook_tensor is not None
                 else _decide_codebook(
-                    weight, _eager.rotate_int8_convrot_weight, group_size, convrot_groupsize
+                    weight, _eager.rotate_int8_convrot_weight, group_size, convrot_groupsize,
+                    levels=16 if bits == 4 else 8,
                 )
             )
         if staged_ok:
