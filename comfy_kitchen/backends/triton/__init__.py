@@ -1,4 +1,5 @@
 __all__ = [
+    "act_cat_quantize_fp8",
     "adaln",
     "na3d",
     "rms_adaln",
@@ -30,8 +31,11 @@ __all__ = [
 ]
 
 # Try to import triton and register if available
+import functools
+
 import torch
 
+from comfy_kitchen.backends.eager.act_cat_quant import ACT_CAT_ACTS
 from comfy_kitchen.constraints import (
     ExactDims,
     FunctionConstraints,
@@ -53,6 +57,7 @@ try:
         quantize_int8_rowwise as _eager_quantize_int8_rowwise,
     )
 
+    from .act_cat_quant import act_cat_quantize_fp8
     from .adaln import adaln, rms_adaln
     from .na import na3d
     from .quantization import (
@@ -117,6 +122,14 @@ if _TRITON_AVAILABLE:
         return _triton_quantize_and_rotate_rowwise(x, h, group_size)
 
 
+@functools.cache
+def _hip_gfx12(device_index: int | None) -> bool:
+    """ROCm device with OCP fp8 conversions (RDNA4); the fused fp8 kernels are only
+    served (and validated) there."""
+    index = torch.cuda.current_device() if device_index is None else device_index
+    return torch.cuda.get_device_properties(index).gcnArchName.startswith("gfx12")
+
+
 def _build_constraints() -> dict:
     def _na3d_call_rule(kwargs):
         common = na3d_common_call_rule(kwargs)
@@ -125,6 +138,27 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _act_cat_quantize_fp8_call_rule(kwargs):
+        # The kernel indexes both inputs as (rows, last dim) with one row count and
+        # reads the scale through a device pointer.
+        x, h, scale = kwargs.get("x"), kwargs.get("h"), kwargs.get("scale")
+        act = kwargs.get("act", "swiglu")
+        if act not in ACT_CAT_ACTS:
+            return ValidationResult.fail("act", f"must be one of {sorted(ACT_CAT_ACTS)}")
+        if x is None or h is None or scale is None:
+            return ValidationResult.ok()
+        if x.dim() < 1 or h.dim() != x.dim() or h.shape[:-1] != x.shape[:-1]:
+            return ValidationResult.fail("h", "must have x's leading dims")
+        if h.dtype != x.dtype or h.device != x.device:
+            return ValidationResult.fail("h", "must match x's dtype and device")
+        if h.shape[-1] % ACT_CAT_ACTS[act]:
+            return ValidationResult.fail("h", f"last dim must be even for act {act!r}")
+        if scale.numel() != 1 or scale.device != x.device:
+            return ValidationResult.fail("scale", "must be one element on x's device")
+        if getattr(torch.version, "hip", None) and not _hip_gfx12(x.device.index):
+            return ValidationResult.fail("x", "under ROCm only gfx12 (OCP fp8) is served")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -336,6 +370,19 @@ def _build_constraints() -> dict:
         # tl.dot needs Ampere matrix capability for the non-IEEE float paths
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
+    )
+    out["act_cat_quantize_fp8"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=frozenset({torch.float16, torch.bfloat16})),
+            "h": ParamConstraint(dtypes=frozenset({torch.float16, torch.bfloat16})),
+            "scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+            "act": ParamConstraint(dtypes=frozenset({str})),
+            "output_type": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn})),
+        },
+        default_devices=cuda_devices,
+        # FP8 e4m3 conversion
+        min_compute_capability=(8, 9),
+        call_rules=(_act_cat_quantize_fp8_call_rule,),
     )
     return out
 

@@ -101,6 +101,7 @@ __all__ = [
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
+    "act_cat_quantize_fp8",
     "quantize_nvfp4",
     "dequantize_nvfp4",
     "quantize_mxfp8",
@@ -516,6 +517,46 @@ def dequantize_per_tensor_fp8(
     """
     dtype_code = DTYPE_TO_CODE[output_type]
     return torch.ops.comfy_kitchen.dequantize_fp8(x, scale, dtype_code)
+
+
+def act_cat_quantize_fp8(
+    x: torch.Tensor,
+    h: torch.Tensor,
+    scale: torch.Tensor,
+    act: str = "swiglu",
+    output_type: torch.dtype = torch.float8_e4m3fn,
+) -> torch.Tensor:
+    """Activation, concat and per-tensor FP8 quantization in one pass.
+
+    Computes ``quantize_per_tensor_fp8(torch.cat((x, act(h)), -1), scale, output_type)``:
+    the input of the output projection of a single-stream DiT block (Flux's
+    ``SingleStreamBlock``: ``x`` = attention output, ``h`` = the MLP part of linear1's
+    output) when that projection is an FP8 linear with a static input scale. The
+    result is the FP8 data such a linear consumes; ``scale`` stays the caller's
+    (as with :func:`quantize_per_tensor_fp8`).
+
+    The fused (triton) path reads ``x`` and ``h`` once (``h`` may be a strided view,
+    e.g. a slice of linear1's output) and writes only the FP8 result, bit-identical
+    to the unfused sequence quantized by kitchen's CUDA backend (or, under ROCm,
+    its HIP backend). It takes fp16/bf16 ``x`` and ``h`` of one dtype on a GPU, a
+    float32 one-element ``scale`` on the same device, and ``output_type``
+    float8_e4m3fn. Everything else runs the unfused sequence (eager act and cat,
+    then :func:`quantize_per_tensor_fp8` as dispatched).
+
+    Args:
+        x: Tensor (..., Dx), copied into the first Dx output columns.
+        h: Tensor (..., Dh) with the same leading dims; activated into the rest.
+        scale: Per-tensor scale (float32, one element); output = clamp(v / scale).
+        act: "swiglu" (``h = [gate | up]``, ``silu(gate) * up``),
+            "swiglu_hidden_gate" (``h = [hidden | gate]``, ``silu(gate) * hidden``)
+            or "gelu_tanh" (``gelu(h, approximate="tanh")``).
+        output_type: FP8 dtype (float8_e4m3fn or float8_e5m2).
+
+    Returns:
+        FP8 tensor (..., Dx + Dh // 2) for the gated acts, (..., Dx + Dh) for gelu_tanh.
+    """
+    return torch.ops.comfy_kitchen.act_cat_quantize_fp8(
+        x, h, scale, act, DTYPE_TO_CODE[output_type])
 
 
 def stochastic_rounding_fp8(

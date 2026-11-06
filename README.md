@@ -8,6 +8,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 |-----------------------------|-------|------|--------|-----|-----|
 | `quantize_per_tensor_fp8`   | ✓     | ✓    | ✓      | ✓   |     |
 | `dequantize_per_tensor_fp8` | ✓     | ✓    | ✓      | ✓   |     |
+| `act_cat_quantize_fp8`      | ✓     |      | ✓**    |     |     |
 | `stochastic_rounding_fp8`   | ✓     | ✓    |        | ✓   |     |
 | `quantize_nvfp4`            | ✓     | ✓    | ✓      |     |     |
 | `dequantize_nvfp4`          | ✓     | ✓    | ✓      |     |     |
@@ -62,6 +63,14 @@ Ascend support for `quantize_and_rotate_rowwise` requires
 `convrot_w4a4_linear` requires only `torch_npu.npu_quant_matmul`.
 These capabilities are registered only when the
 corresponding operator is available.
+
+\*\* Triton `act_cat_quantize_fp8` serves fp16/bf16 `x` and `h` of one dtype
+and leading shape, a float32 one-element `scale` on their device and
+float8_e4m3fn output; `h` may be a strided view (e.g. a slice of a fused
+projection's output). Its output equals the unfused sequence quantized by the
+compiled per-tensor quantizer (CUDA, or HIP under ROCm) bit for bit. Other
+calls run the eager reference: `act(h)`, `torch.cat`, then
+`quantize_per_tensor_fp8`.
 
 ## Huawei Ascend backend
 
