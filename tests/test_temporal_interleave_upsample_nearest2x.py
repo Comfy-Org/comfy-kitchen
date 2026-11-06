@@ -213,9 +213,12 @@ class TestTemporalInterleaveUpsampleTriton:
         assert got.shape == (0, 4, 8, 8) and got.dtype == x.dtype
 
     def test_unsupported_inputs_go_to_eager(self):
-        for x in (
-            torch.randn(1, 8, 2, 4, 4, device="cuda", dtype=torch.float64),
-            torch.randn(1, 8, 2, 4, 4, dtype=torch.bfloat16),
-        ):
-            kwargs = {"x": x, "interleave": True}
-            assert registry.get_capable_backend(OP, kwargs) == "eager"
+        # fp64 is outside the float dtypes of both backends; triton must decline it
+        x = torch.randn(1, 8, 2, 4, 4, device="cuda", dtype=torch.float64)
+        kwargs = {"x": x, "interleave": True}
+        assert not registry.validate_backend_for_call("triton", OP, kwargs).success
+        # CPU tensors go to eager
+        x = torch.randn(1, 8, 2, 4, 4, dtype=torch.bfloat16)
+        kwargs = {"x": x, "interleave": True}
+        assert not registry.validate_backend_for_call("triton", OP, kwargs).success
+        assert registry.get_capable_backend(OP, kwargs) == "eager"
