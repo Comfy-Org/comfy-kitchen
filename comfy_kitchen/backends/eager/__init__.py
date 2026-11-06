@@ -1,6 +1,8 @@
 __all__ = [
     "adaln",
     "rms_gated_residual",
+    "depth_to_space3d_residual_add",
+    "depth_to_space3d_residual_add_",
     "fp16_conv3d",
     "fp16_conv3d_out",
     "group_norm_silu_pad3d",
@@ -79,6 +81,10 @@ from comfy_kitchen.registry import registry
 from .adaln import adaln, rms_adaln
 from .awq import gemv_awq_w4a16
 from .conv3d import fp16_conv3d, fp16_conv3d_out
+from .depth_to_space3d_residual_add import (
+    depth_to_space3d_residual_add,
+    depth_to_space3d_residual_add_,
+)
 from .convrot_w4a4 import (
     convrot_w4a4_linear,
     dequantize_convrot_w4a4_weight,
@@ -704,6 +710,14 @@ def _build_constraints() -> dict:
         default_devices=all_devices,
         call_rules=(window_attention_common_call_rule,),
     )
+    out["depth_to_space3d_residual_add"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
+            "residual": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
+        },
+        default_devices=all_devices,
+    )
+    out["depth_to_space3d_residual_add_"] = out["depth_to_space3d_residual_add"]
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in out:
             out[name + "_out"] = with_out_param(out[name])
