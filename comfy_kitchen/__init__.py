@@ -828,6 +828,7 @@ def rms_rope(
     q_scale: torch.Tensor,
     k_scale: torch.Tensor | None = None,
     epsilon: float = 1e-6,
+    norm_over_heads: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply per-head RMSNorm followed by interleaved RoPE to query and key tensors.
 
@@ -840,11 +841,17 @@ def rms_rope(
         q_scale: Per-dimension RMSNorm scale for q.
         k_scale: Optional per-dimension RMSNorm scale for k. Defaults to q_scale.
         epsilon: RMSNorm numerical-stability epsilon.
+        norm_over_heads: Normalize over each token's whole ``H * head_dim`` row instead
+            of per head: an ``RMSNorm(dim)`` applied before the head split (Wan). q and k
+            are then ``[B, S, H, head_dim]``, the scales have ``H * head_dim`` entries and
+            freqs broadcast over the heads. Backends without it (CUDA, HIP, Ascend)
+            decline, so it runs on Triton or eager.
 
     Returns:
         Tuple of normalized and rotated (query, key) tensors.
     """
-    return torch.ops.comfy_kitchen.rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon)
+    return torch.ops.comfy_kitchen.rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon,
+                                            norm_over_heads)
 
 
 def rms_rope_(
