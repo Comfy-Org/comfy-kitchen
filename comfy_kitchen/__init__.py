@@ -70,6 +70,8 @@ __all__ = [
     "fp16_conv3d",
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
+    "depth_to_space3d_residual_add",
+    "depth_to_space3d_residual_add_",
     "rms_adaln",
     # Attention
     "PrequantizedInt8Attention",
@@ -455,6 +457,46 @@ def group_norm_stats3d(x: torch.Tensor, num_groups: int = 32, eps: float = 1e-6)
     """Per-frame GroupNorm statistics of x [B, C, T, H, W]: float32 [B*T, num_groups, 2]
     of (mean, rstd), for group_norm_silu_pad3d's stats argument."""
     return torch.ops.comfy_kitchen.group_norm_stats3d(x, num_groups, eps)
+
+
+def depth_to_space3d_residual_add(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    factor_t: int,
+    factor_s: int,
+    repeats: int = 1,
+    first_chunk: bool = False,
+    factors_first: bool = False,
+    residual_packed: bool = False,
+) -> torch.Tensor:
+    """``residual + depth_to_space3d(repeat_interleave(x, repeats, dim=1))`` in one pass.
+
+    x [B, C, T, H, W]; each group of ``factor_t * factor_s**2`` repeated channels becomes a
+    ``factor_t x factor_s x factor_s`` block of output positions. Channels are ordered
+    ``(c, ft, fs, fs)`` as in the Wan 2.2 VAE's ``DupUp3D``, or ``(ft, fs, fs, c)`` when
+    factors_first, as in the HunyuanVideo 1.5 VAE's ``UpSmpl``. first_chunk drops the first
+    ``factor_t - 1`` output frames. residual has the output shape, or when residual_packed the
+    packed shape [B, C * repeats, T, H, W] and goes through the same depth-to-space (no repeat).
+    The output has residual's layout (a new contiguous tensor when residual_packed).
+    """
+    return torch.ops.comfy_kitchen.depth_to_space3d_residual_add(
+        x, residual, int(factor_t), int(factor_s), int(repeats), bool(first_chunk),
+        bool(factors_first), bool(residual_packed))
+
+
+def depth_to_space3d_residual_add_(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    factor_t: int,
+    factor_s: int,
+    repeats: int = 1,
+    first_chunk: bool = False,
+) -> torch.Tensor:
+    """depth_to_space3d_residual_add added into residual in place (``(c, ft, fs, fs)`` order),
+    the Wan 2.2 VAE's ``Up_ResidualBlock`` image path. Returns residual."""
+    torch.ops.comfy_kitchen.depth_to_space3d_residual_add_(
+        x, residual, int(factor_t), int(factor_s), int(repeats), bool(first_chunk))
+    return residual
 
 
 def rms_adaln(
