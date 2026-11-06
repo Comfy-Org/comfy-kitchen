@@ -70,6 +70,7 @@ __all__ = [
     "fp16_conv3d",
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
+    "pixel_norm_silu_pad3d",
     "rms_adaln",
     # Attention
     "PrequantizedInt8Attention",
@@ -455,6 +456,30 @@ def group_norm_stats3d(x: torch.Tensor, num_groups: int = 32, eps: float = 1e-6)
     """Per-frame GroupNorm statistics of x [B, C, T, H, W]: float32 [B*T, num_groups, 2]
     of (mean, rstd), for group_norm_silu_pad3d's stats argument."""
     return torch.ops.comfy_kitchen.group_norm_stats3d(x, num_groups, eps)
+
+
+def pixel_norm_silu_pad3d(
+    x: torch.Tensor,
+    prefix: torch.Tensor | None = None,
+    n_front: int = 1,
+    n_back: int = 0,
+    pad_mode: str = "zeros",
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """PixelNorm over channels, SiLU and the causal temporal padding of a conv, in one pass.
+
+    x ``[B, C, T, H, W]``, ``h = silu(x / sqrt(mean(x**2, dim=1) + eps))``; returns the
+    contiguous ``cat([prefix, n_front x h[:, :, :1], h, n_back x h[:, :, -1:]], dim=2)``: the
+    LTX VAE ``PixelNorm`` -> ``SiLU`` -> ``CausalConv3d`` conv input. prefix ``[B, C, Tp, H, W]``
+    is the conv's temporal cache, frames that are already normalized and activated (the conv
+    input of the previous chunk), copied as they are; pass ``n_front=0`` with it, as
+    CausalConv3d does. pad_mode ``"reflect"`` also reflect-pads H and W by 1 (``Conv3d`` with
+    ``padding_mode="reflect"``, which then runs with padding 0); ``"zeros"`` leaves the
+    padding to the conv.
+    """
+    return torch.ops.comfy_kitchen.pixel_norm_silu_pad3d(
+        x, prefix, int(n_front), int(n_back), str(pad_mode), float(eps)
+    )
 
 
 def rms_adaln(
