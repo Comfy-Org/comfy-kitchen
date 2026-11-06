@@ -75,7 +75,7 @@ def _interleave_upsample_nearest2x_kernel(
     tl.store(out_ptr + o_off + width_out, v2, mask=smask)
 
 
-# (block_r, block_ws) tiles x num_warps, as measured on RTX 5090 and Radeon 8060S
+# (block_r, block_ws) tiles x num_warps
 _CONFIGS = [
     triton.Config({"block_r": r, "block_ws": w}, num_warps=nw)
     for (r, w) in [(1, 512), (2, 256), (4, 128), (8, 64), (2, 512), (4, 256), (8, 128)]

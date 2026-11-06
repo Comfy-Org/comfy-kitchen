@@ -130,13 +130,7 @@ def _build_constraints() -> dict:
         return ValidationResult.ok()
 
     # The plain form (interleave=False) is a single upsample kernel in the eager path already,
-    # and below about 12M output elements the gather kernel is slower than it. Measured on the
-    # Wan VAE decode shapes (bf16, fresh process per arm, A B A B pairs, speedup over eager):
-    # output 9.58M elements, x (1, 384, 1, 60, 104): 0.66-0.67x on RTX 5090, 0.78-0.80x on
-    # Radeon 8060S; output 14.4M, x (1, 1024, 1, 44, 80): 1.06x and 1.55-1.61x. The crossover
-    # is between 9.58M and 14.4M (not bisected). The interleave form replaces a stack, a copy and
-    # the upsample and was faster at every measured shape (smallest output 28.8M elements:
-    # 2.58-2.60x and 2.39x), so it is not limited; smaller interleave inputs were not measured.
+    # so outputs below 12M elements go to eager. The interleave form is not limited.
     _plain_upsample_min_numel = 12_000_000
 
     def _temporal_interleave_upsample_call_rule(kwargs):
@@ -359,7 +353,7 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
-    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both
+    # cuda covers ROCm builds of PyTorch (device type "cuda")
     out["temporal_interleave_upsample_nearest2x"] = FunctionConstraints(
         params={
             "x": ParamConstraint(dtypes=standard_floats),
