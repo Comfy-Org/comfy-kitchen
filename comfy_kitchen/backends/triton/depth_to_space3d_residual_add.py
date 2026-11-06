@@ -15,9 +15,10 @@ out. All operands are read and written through their strides.
   rearranged by the same index map; the output is a new contiguous tensor.
 
 The tile shape and warp count are autotuned per output size (key ``n_wo``, ``n_rows`` and the
-factors) over 7 tile shapes x num_warps {4, 8}: that list was best or tied with the best
-fixed tile on every Wan 2.2, Qwen-Image 2.1 and HunyuanVideo 1.5 shape measured on an
-RTX 5090 and a Radeon 8060S (gfx1151).
+factors) over 7 tile shapes x num_warps {4, 8}: on every Wan 2.2, Qwen-Image 2.1 and
+HunyuanVideo 1.5 shape measured it came within 4% of the fixed tiles it was compared with
+(1 x next_pow2(width), and 4 x 256 for the Wan 2.2 order) on an RTX 5090 and within 10%
+on a Radeon 8060S (gfx1151).
 """
 
 import torch
