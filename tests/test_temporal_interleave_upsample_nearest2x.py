@@ -78,7 +78,7 @@ class TestTemporalInterleaveUpsampleEager:
         assert out.shape == (b * 2 * t, c, 2 * h, 2 * w)
         for bb in range(b):
             for tt in range(2 * t):
-                src = x[bb, (tt % 2) * c:(tt % 2 + 1) * c, tt // 2]
+                src = x[bb, (tt % 2) * c : (tt % 2 + 1) * c, tt // 2]
                 want = src.repeat_interleave(2, -1).repeat_interleave(2, -2)
                 assert torch.equal(out[bb * 2 * t + tt], want)
 
@@ -108,17 +108,20 @@ class TestTemporalInterleaveUpsampleEager:
 
 class TestTemporalInterleaveUpsampleCallRule:
     # the Triton call rule only looks at shapes, so it runs on meta tensors without a GPU
-    @pytest.mark.parametrize(("shape", "interleave", "ok"), [
-        ((1, 384, 1, 60, 104), False, False),     # Wan2.1 first chunk, 9.58M out: eager faster
-        ((1, 1024, 1, 44, 80), False, True),      # Wan2.2 first chunk, 14.4M out
-        ((1, 1, 1, 1000, 2999), False, False),    # 11,996,000 out
-        ((1, 1, 1, 1000, 3000), False, True),     # 12,000,000 out
-        ((1, 8, 1, 4, 4), True, True),            # interleave is not limited by size
-        ((1, 7, 1, 4, 4), True, False),           # odd channels
-        ((0, 8, 2, 4, 4), True, False),           # empty
-        ((1, 8, 0, 4, 4), True, False),           # empty
-        ((8, 2, 4, 4), False, False),             # 4D
-    ])
+    @pytest.mark.parametrize(
+        ("shape", "interleave", "ok"),
+        [
+            ((1, 384, 1, 60, 104), False, False),  # Wan2.1 first chunk, 9.58M out: eager faster
+            ((1, 1024, 1, 44, 80), False, True),  # Wan2.2 first chunk, 14.4M out
+            ((1, 1, 1, 1000, 2999), False, False),  # 11,996,000 out
+            ((1, 1, 1, 1000, 3000), False, True),  # 12,000,000 out
+            ((1, 8, 1, 4, 4), True, True),  # interleave is not limited by size
+            ((1, 7, 1, 4, 4), True, False),  # odd channels
+            ((0, 8, 2, 4, 4), True, False),  # empty
+            ((1, 8, 0, 4, 4), True, False),  # empty
+            ((8, 2, 4, 4), False, False),  # 4D
+        ],
+    )
     def test_call_rule(self, shape, interleave, ok):
         x = torch.empty(shape, device="meta", dtype=torch.bfloat16)
         assert _call_rule()({"x": x, "interleave": interleave}).success == ok
@@ -133,18 +136,21 @@ class TestTemporalInterleaveUpsampleTriton:
             pytest.skip("triton backend not available")
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-    @pytest.mark.parametrize(("shape", "interleave"), [
-        # x of the Wan VAE decoder upsamples (Wan2.1 832 x 480 x 33, Wan2.2 1280 x 704 x 121);
-        # interleave and upsample2d channel counts scaled down, H / W / T kept
-        ((1, 96, 2, 60, 104), True),       # Wan2.1 upsample3d, 768 channels
-        ((1, 96, 2, 120, 208), True),      # Wan2.1 upsample3d, 768 channels
-        ((1, 256, 1, 44, 80), True),       # Wan2.2 upsample3d, 2048 channels
-        ((1, 256, 2, 88, 160), True),      # Wan2.2 upsample3d, 2048 channels
-        ((1, 384, 1, 120, 208), False),    # Wan2.1 upsample3d first chunk ('Rep'), full size
-        ((1, 1024, 1, 44, 80), False),     # Wan2.2 upsample3d first chunk ('Rep'), full size
-        ((1, 48, 2, 240, 416), False),     # Wan2.1 upsample2d, 192 channels
-        ((1, 32, 4, 176, 320), False),     # Wan2.2 upsample2d, 512 channels
-    ])
+    @pytest.mark.parametrize(
+        ("shape", "interleave"),
+        [
+            # x of the Wan VAE decoder upsamples (Wan2.1 832 x 480 x 33, Wan2.2 1280 x 704 x 121);
+            # interleave and upsample2d channel counts scaled down, H / W / T kept
+            ((1, 96, 2, 60, 104), True),  # Wan2.1 upsample3d, 768 channels
+            ((1, 96, 2, 120, 208), True),  # Wan2.1 upsample3d, 768 channels
+            ((1, 256, 1, 44, 80), True),  # Wan2.2 upsample3d, 2048 channels
+            ((1, 256, 2, 88, 160), True),  # Wan2.2 upsample3d, 2048 channels
+            ((1, 384, 1, 120, 208), False),  # Wan2.1 upsample3d first chunk ('Rep'), full size
+            ((1, 1024, 1, 44, 80), False),  # Wan2.2 upsample3d first chunk ('Rep'), full size
+            ((1, 48, 2, 240, 416), False),  # Wan2.1 upsample2d, 192 channels
+            ((1, 32, 4, 176, 320), False),  # Wan2.2 upsample2d, 512 channels
+        ],
+    )
     def test_matches_eager(self, shape, interleave, dtype):
         x = torch.randn(shape, device="cuda").to(dtype)
         kwargs = {"x": x, "interleave": interleave}
@@ -157,14 +163,17 @@ class TestTemporalInterleaveUpsampleTriton:
         assert torch.equal(got, _comfy_resample_body(x, interleave))
 
     @pytest.mark.parametrize("interleave", [False, True])
-    @pytest.mark.parametrize("layout", [
-        "odd_sizes",            # batch 2, H / W not multiples of any tile
-        "wide",                 # W > block_ws of every config
-        "channels_last_3d",
-        "time_sliced",          # x[:, :, 1:] of a T-major tensor, storage offset
-        "last_dim_step2",       # x[..., ::2]
-        "batch_step2",          # x[::2]
-    ])
+    @pytest.mark.parametrize(
+        "layout",
+        [
+            "odd_sizes",  # batch 2, H / W not multiples of any tile
+            "wide",  # W > block_ws of every config
+            "channels_last_3d",
+            "time_sliced",  # x[:, :, 1:] of a T-major tensor, storage offset
+            "last_dim_step2",  # x[..., ::2]
+            "batch_step2",  # x[::2]
+        ],
+    )
     def test_kernel_layouts(self, layout, interleave):
         # the kernel itself (no size routing) reads x through its strides
         kernel = importlib.import_module("comfy_kitchen.backends.triton." + OP)
@@ -172,8 +181,12 @@ class TestTemporalInterleaveUpsampleTriton:
         make = {
             "odd_sizes": lambda: torch.randn(2, 6, 3, 5, 7, device="cuda"),
             "wide": lambda: torch.randn(1, 4, 2, 3, 1100, device="cuda"),
-            "channels_last_3d": lambda: torch.randn(1, 8, 3, 6, 10, device="cuda").to(memory_format=cl3),
-            "time_sliced": lambda: torch.randn(1, 3, 8, 6, 10, device="cuda").transpose(1, 2)[:, :, 1:],
+            "channels_last_3d": lambda: torch.randn(1, 8, 3, 6, 10, device="cuda").to(
+                memory_format=cl3
+            ),
+            "time_sliced": lambda: torch.randn(1, 3, 8, 6, 10, device="cuda").transpose(1, 2)[
+                :, :, 1:
+            ],
             "last_dim_step2": lambda: torch.randn(1, 4, 2, 6, 20, device="cuda")[..., ::2],
             "batch_step2": lambda: torch.randn(4, 4, 2, 6, 10, device="cuda")[::2],
         }
@@ -184,14 +197,18 @@ class TestTemporalInterleaveUpsampleTriton:
 
     def test_strided_input_served(self):
         # a non-contiguous x large enough for the plain form is still served by triton
-        x = torch.randn(1, 3, 64, 120, 208, device="cuda", dtype=torch.bfloat16).transpose(1, 2)[:, :, 1:]
+        x = torch.randn(1, 3, 64, 120, 208, device="cuda", dtype=torch.bfloat16).transpose(1, 2)[
+            :, :, 1:
+        ]
         assert not x.is_contiguous()
         for interleave in (False, True):
             kwargs = {"x": x, "interleave": interleave}
             assert registry.validate_backend_for_call("triton", OP, kwargs).success
             with ck.use_backend("triton"):
                 got = ck.temporal_interleave_upsample_nearest2x(x, interleave)
-            assert torch.equal(got, eager_backend.temporal_interleave_upsample_nearest2x(x, interleave))
+            assert torch.equal(
+                got, eager_backend.temporal_interleave_upsample_nearest2x(x, interleave)
+            )
 
     def test_small_plain_goes_to_eager(self):
         # Wan2.1 first-chunk upsample, 9.58M output elements: the eager upsample is faster

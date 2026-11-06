@@ -42,9 +42,21 @@ def _src_row_base(rows, channels, frames, height, sxb, sxc, sxt, sxh, interleave
 
 @triton.jit
 def _interleave_upsample_nearest2x_kernel(
-    x_ptr, out_ptr, n_rows, channels, frames, height, width,
-    sxb, sxc, sxt, sxh, sxw,
-    interleave: tl.constexpr, block_r: tl.constexpr, block_ws: tl.constexpr,
+    x_ptr,
+    out_ptr,
+    n_rows,
+    channels,
+    frames,
+    height,
+    width,
+    sxb,
+    sxc,
+    sxt,
+    sxh,
+    sxw,
+    interleave: tl.constexpr,
+    block_r: tl.constexpr,
+    block_ws: tl.constexpr,
 ):
     pid_r = tl.program_id(0)
     pid_w = tl.program_id(1)

@@ -151,7 +151,8 @@ def _build_constraints() -> dict:
         out_numel = x.numel() * 4
         if out_numel == 0:
             return ValidationResult.fail(
-                "x", "empty tensors are not supported by triton temporal_interleave_upsample_nearest2x"
+                "x",
+                "empty tensors are not supported by triton temporal_interleave_upsample_nearest2x",
             )
         if not interleave and out_numel < _plain_upsample_min_numel:
             return ValidationResult.fail(
