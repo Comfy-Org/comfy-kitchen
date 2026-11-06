@@ -73,6 +73,21 @@ def skip_unless_gfx12_wmma() -> None:
         pytest.skip("requires non-duplicated WMMA (gfx12 or gfx117)")
 
 
+def gpu_backend_available() -> bool:
+    """Whether the compiled CUDA or HIP backend is loadable, for ops both implement."""
+    backends = ck.list_backends()
+    return any(backends.get(name, {}).get("available", False) for name in ("cuda", "hip"))
+
+
+requires_hip_backend = pytest.mark.skipif(
+    not ck.list_backends().get("hip", {}).get("available", False), reason="compiled HIP backend required"
+)
+
+requires_gpu_backend = pytest.mark.skipif(
+    not gpu_backend_available(), reason="compiled CUDA or HIP backend required"
+)
+
+
 @pytest.fixture(scope="session")
 def cuda_available():
     return torch.cuda.is_available()
