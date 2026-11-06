@@ -130,11 +130,7 @@ def _build_constraints() -> dict:
         return ValidationResult.ok()
 
     # The segmented kernel holds one token row of D in registers (block_d =
-    # next_power_of_2(D)); it was measured up to D = 6144 (block_d 8192), so wider
-    # rows go to eager. No size threshold below that: every captured shape was faster
-    # than the eager chain, the smallest (1, 4056, 4096) with split 4056 (Flux.2 Klein
-    # double block after the KV cache step) by 2.5x on the RTX 5090 and 2.3x on the
-    # Radeon 8060S.
+    # next_power_of_2(D)), so wider rows go to eager. There is no size threshold.
     max_segmented_d = 8192
 
     def _segmented_common(x, split, mods):

@@ -8,10 +8,7 @@ optional RMSNorm weight and the modulation of the row's segment are computed in 
 and rounded once on the store. The per-segment modulation rows are read through their
 own batch strides, so the ``[2, B, D]`` views the models produce are not copied.
 
-Launch: num_warps 8 for block_d >= 4096, else 4. Of the configs tried on the RTX 5090
-and the Radeon 8060S (this one, a two-pass loop over 1024 / 2048-column chunks, and
-autotuning num_warps 4 / 8 / 16), it was the fastest or within 3% of the fastest at
-every captured Qwen-Image, Krea2 and Flux.2 shape (D 3072, 4096, 6144).
+Launch: num_warps 8 for block_d >= 4096, else 4.
 """
 
 import torch
