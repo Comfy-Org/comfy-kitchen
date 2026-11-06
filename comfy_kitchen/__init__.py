@@ -119,6 +119,7 @@ __all__ = [
     "dequantize_convrot_w4a4_weight",
     "dequantize_w4a8_int8_weight",
     "gemv_awq_w4a16",
+    "linear_w8a16",
     "fp16_linear",
     "int8_linear",
     "int8_linear_modulated",
@@ -791,6 +792,38 @@ def gemv_awq_w4a16(
     return torch.ops.comfy_kitchen.gemv_awq_w4a16(
         x, qweight, wscales, wzeros, bias, group_size
     )
+
+
+def linear_w8a16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Linear layer with an unscaled FP8 weight and 16-bit activations (W8A16).
+
+    Computes ``F.linear(x, weight.to(x.dtype), bias.to(x.dtype))``: the forward of
+    a checkpoint that stores its linear weights as plain ``float8_e4m3fn`` without
+    a scale (e.g. ``qwen_image_fp8_e4m3fn``, ``flux1-dev-fp8``) and runs in
+    bf16/fp16. The fused (triton) path reads the FP8 weight directly and converts
+    each tile to the activation dtype in registers (exact), with fp32
+    accumulation and the bias added before the single rounding to the output
+    dtype; no 16-bit copy of the weight is made. Results match the reference up
+    to the fp32 summation order (not bit-identical to cuBLAS / hipBLASLt).
+
+    The fused path takes fp16/bf16 ``x``, a ``float8_e4m3fn`` weight with
+    contiguous rows and ``in_features % 32 == 0``, and an optional 1D bias
+    (FP8, fp16, bf16 or fp32) on the same device. Everything else runs the eager
+    reference.
+
+    Args:
+        x: Input tensor (..., in_features).
+        weight: FP8 weight (out_features, in_features), no scale.
+        bias: Optional bias (out_features,), any float dtype.
+
+    Returns:
+        Tensor (..., out_features) in x's dtype.
+    """
+    return torch.ops.comfy_kitchen.linear_w8a16(x, weight, bias)
 
 
 def apply_rope(

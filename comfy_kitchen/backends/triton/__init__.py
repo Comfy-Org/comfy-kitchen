@@ -24,12 +24,15 @@ __all__ = [
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
     "int8_linear",
+    "linear_w8a16",
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
 ]
 
 # Try to import triton and register if available
+import functools
+
 import torch
 
 from comfy_kitchen.constraints import (
@@ -90,6 +93,7 @@ try:
         apply_rope_split_half_,
     )
     from .w4a8_int8 import w4a8_int8_linear
+    from .w8a16 import linear_w8a16
 except ImportError as e:
     _TRITON_AVAILABLE = False
     _TRITON_ERROR = f"ImportError: {e!s}"
@@ -117,6 +121,17 @@ if _TRITON_AVAILABLE:
         return _triton_quantize_and_rotate_rowwise(x, h, group_size)
 
 
+def _arch_name(gcn_arch_name: str) -> str:
+    """Bare ROCm arch, e.g. 'gfx942:sramecc+:xnack-' -> 'gfx942'."""
+    return gcn_arch_name.split(":")[0]
+
+
+@functools.cache
+def _hip_arch(device_index: int | None) -> str:
+    index = torch.cuda.current_device() if device_index is None else device_index
+    return _arch_name(torch.cuda.get_device_properties(index).gcnArchName)
+
+
 def _build_constraints() -> dict:
     def _na3d_call_rule(kwargs):
         common = na3d_common_call_rule(kwargs)
@@ -125,6 +140,49 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    from .w8a16 import HIP_MAX_ROWS as _W8A16_HIP_MAX_ROWS
+    from .w8a16 import HIP_MIN_WEIGHT as _W8A16_HIP_MIN_WEIGHT
+    from .w8a16 import K_MULTIPLE as _W8A16_K_MULTIPLE
+
+    def _linear_w8a16_call_rule(kwargs):
+        # The kernel reads weight / bias as bare pointers sized from x and the
+        # weight, so anything it does not serve must fall through to eager here.
+        x, weight, bias = kwargs.get("x"), kwargs.get("weight"), kwargs.get("bias")
+        if x is None or weight is None:
+            return ValidationResult.ok()
+        k = weight.shape[1]
+        if x.dim() < 1 or x.shape[-1] != k:
+            return ValidationResult.fail("x", f"last dim must equal weight.shape[1] ({k})")
+        if k == 0 or k % _W8A16_K_MULTIPLE:
+            return ValidationResult.fail(
+                "weight", f"in_features must be a positive multiple of {_W8A16_K_MULTIPLE}"
+            )
+        if weight.device != x.device or weight.stride(1) != 1:
+            return ValidationResult.fail("weight", "must be on x's device with contiguous rows")
+        if bias is not None and (bias.device != x.device or bias.shape[0] != weight.shape[0]):
+            return ValidationResult.fail(
+                "bias", "must be on x's device with weight.shape[0] elements"
+            )
+        if getattr(torch.version, "hip", None):
+            # Only measured ROCm archs, and only in their measured winning regime;
+            # everything else keeps the cast + hipBLASLt path (eager).
+            arch = _hip_arch(x.device.index)
+            max_rows = _W8A16_HIP_MAX_ROWS.get(arch)
+            if max_rows is None:
+                return ValidationResult.fail(
+                    "x", f"ROCm arch {arch} not measured (served: {sorted(_W8A16_HIP_MAX_ROWS)})"
+                )
+            if x.numel() // k > max_rows:
+                return ValidationResult.fail(
+                    "x", f"more than {max_rows} rows on {arch}: the cast + hipBLASLt path is faster"
+                )
+            min_weight = _W8A16_HIP_MIN_WEIGHT.get(arch, 0)
+            if weight.numel() < min_weight:
+                return ValidationResult.fail(
+                    "weight", f"fewer than {min_weight} elements on {arch}: eager is faster"
+                )
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -336,6 +394,22 @@ def _build_constraints() -> dict:
         # tl.dot needs Ampere matrix capability for the non-IEEE float paths
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
+    )
+    out["linear_w8a16"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=frozenset({torch.float16, torch.bfloat16})),
+            "weight": ParamConstraint(
+                dtypes=frozenset({torch.float8_e4m3fn}), shape_rules=(ExactDims(2),)
+            ),
+            "bias": ParamConstraint(
+                dtypes=standard_floats | frozenset({torch.float8_e4m3fn}),
+                shape_rules=(ExactDims(1),),
+            ),
+        },
+        default_devices=cuda_devices,
+        # FP8 e4m3 conversion
+        min_compute_capability=(8, 9),
+        call_rules=(_linear_w8a16_call_rule,),
     )
     return out
 
