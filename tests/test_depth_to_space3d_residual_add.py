@@ -148,6 +148,22 @@ class TestDepthToSpace3dResidualAddEager:
         with ck.use_backend("eager"):
             out = ck.depth_to_space3d_residual_add(x, residual, **kwargs)
         fake = ck.depth_to_space3d_residual_add(x.to("meta"), residual.to("meta"), **kwargs)
+        assert fake.dtype == out.dtype
+        assert _same_layout(fake, out)
+
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_fake_matches_eager_mixed_dtypes(self, packed):
+        # eager promotes an fp32 x added to a bf16 residual to fp32; the fake must say so
+        x = torch.randn(1, 16, 2, 4, 4)
+        rs = (1, 128, 2, 4, 4) if packed else (1, 16, 4, 8, 8)
+        residual = torch.randn(rs).to(torch.bfloat16)
+        kwargs = {"factor_t": 2, "factor_s": 2, "repeats": 8, "factors_first": packed,
+                  "residual_packed": packed}
+        with ck.use_backend("eager"):
+            out = ck.depth_to_space3d_residual_add(x, residual, **kwargs)
+        fake = ck.depth_to_space3d_residual_add(x.to("meta"), residual.to("meta"), **kwargs)
+        assert out.dtype == torch.float32
+        assert fake.dtype == out.dtype
         assert _same_layout(fake, out)
 
     @pytest.mark.parametrize("strip_elems", [2 ** 24, 2 ** 12])

@@ -132,10 +132,12 @@ def _op_depth_to_space3d_residual_add(
 @_op_depth_to_space3d_residual_add.register_fake
 def _op_depth_to_space3d_residual_add_fake(x, residual, factor_t, factor_s, repeats, first_chunk,
                                            factors_first, residual_packed):
+    # the eager add promotes mixed dtypes
+    dtype = torch.promote_types(x.dtype, residual.dtype)
     if residual_packed:
         shape = _out_shape(x, factor_t, factor_s, repeats, first_chunk)
-        return torch.empty(shape, dtype=residual.dtype, device=residual.device)
-    return torch.empty_like(residual)
+        return torch.empty(shape, dtype=dtype, device=residual.device)
+    return torch.empty_like(residual, dtype=dtype)
 
 
 @torch.library.custom_op("comfy_kitchen::depth_to_space3d_residual_add_", mutates_args=("residual",))
