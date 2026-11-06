@@ -66,6 +66,9 @@ else:
 __all__ = [
     # Normalization
     "adaln",
+    "adaln_segmented",
+    "gated_residual_segmented",
+    "gated_residual_segmented_",
     "rms_gated_residual",
     "fp16_conv3d",
     "group_norm_silu_pad3d",
@@ -399,6 +402,56 @@ def adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
+
+
+def adaln_segmented(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    split: int,
+    eps: float = 1e-6,
+    rms_weight: torch.Tensor | None = None,
+    rms_weight_offset: float = 0.0,
+) -> torch.Tensor:
+    """AdaLN with two modulation segments along the tokens.
+
+    ``norm(x) * (1 + scale[i]) + shift[i]`` for x ``[B, L, D]``, with ``i = 0`` for the
+    tokens before ``split`` and ``i = 1`` from ``split`` on: the reference-token
+    (``index_timestep_zero``) modulation of Qwen-Image, Krea2 and Flux / Flux.2.
+    ``scale`` / ``shift`` are ``[2, B, D]`` or ``[2, 1, D]``, any strides on the first two
+    dims. The norm is LayerNorm without affine, or with ``rms_weight`` given, an fp32
+    RMSNorm with weight ``rms_weight + rms_weight_offset`` rounded to x's dtype after the
+    norm (Krea2 stores its RMSNorm scale zero-centered: offset 1.0).
+    """
+    return torch.ops.comfy_kitchen.adaln_segmented(
+        x, scale, shift, int(split), float(eps), rms_weight, float(rms_weight_offset)
+    )
+
+
+def gated_residual_segmented(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    split: int,
+) -> torch.Tensor:
+    """``residual + x * gate[i]`` with two gate segments along the tokens, as a new tensor.
+
+    x and residual ``[B, L, D]``; ``gate`` ``[2, B, D]`` or ``[2, 1, D]``, row 0 for the
+    tokens before ``split`` and row 1 from ``split`` on. ``x * gate`` is rounded to the
+    activation dtype before the add, as in the unfused sequence.
+    """
+    return torch.ops.comfy_kitchen.gated_residual_segmented(residual, x, gate, int(split))
+
+
+def gated_residual_segmented_(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    split: int,
+) -> torch.Tensor:
+    """:func:`gated_residual_segmented` written into ``residual`` in place (inference only)."""
+    torch.ops.comfy_kitchen.gated_residual_segmented_(residual, x, gate, int(split))
+    return residual
 
 
 def fp16_conv3d(
