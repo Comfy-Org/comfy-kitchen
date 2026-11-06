@@ -47,8 +47,8 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `mesh_bvh`                  |       | ✓    |        |     |     |
 | `closest_point_on_mesh`     |       | ✓    |        |     |     |
 | `closest_hit_on_mesh`       |       | ✓    |        |     |     |
-| `connected_components`      |       | ✓    |        |     |     |
-| `edge_collapse_checks`      |       | ✓    |        |     |     |
+| `connected_components`      |       | ✓    |        | ✓   |     |
+| `edge_collapse_checks`      |       | ✓    |        | ✓   |     |
 | `min_cut`                   |       | ✓    |        |     |     |
 
 Each of the eight rope entries also has an in-place form (`apply_rope_`,

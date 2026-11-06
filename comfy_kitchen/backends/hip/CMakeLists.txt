@@ -185,6 +185,8 @@ set(HIP_SOURCES
     ops/w4a8_requant.hip
     ops/gated_delta.hip
     ops/memmove.hip
+    ops/connected_components.hip
+    ops/edge_collapse.hip
 )
 
 set(CPP_SOURCES

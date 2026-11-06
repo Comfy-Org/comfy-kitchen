@@ -4,8 +4,9 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
+from comfy_kitchen.exceptions import NoCapableBackendError
 
-from .conftest import requires_cuda_backend
+from .conftest import requires_compiled_op, serving_backend
 
 
 def _sub(u, v):
@@ -90,7 +91,7 @@ def _check(vertices, faces, edges, positions, cos_threshold=0.0):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_compiled_op("edge_collapse_checks")
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("merges", [0, 40])
 @pytest.mark.parametrize("scale", [1.0, 1e-4])
@@ -107,7 +108,7 @@ def test_grid(index_dtype, merges, scale):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_compiled_op("edge_collapse_checks")
 def test_high_valence_fan():
     # cone apex with 200 faces: no valence cap
     k = 200
@@ -121,7 +122,7 @@ def test_high_valence_fan():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_compiled_op("edge_collapse_checks")
 def test_no_edges():
     vertices, faces = _grid(4, torch.Generator().manual_seed(0))
     flips, skinny, link_ok = ck.edge_collapse_checks(
@@ -132,7 +133,7 @@ def test_no_edges():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_compiled_op("edge_collapse_checks")
 def test_deterministic():
     # the fans are filled with atomics, in varying order; the outputs must not depend on it
     gen = torch.Generator().manual_seed(3)
@@ -147,7 +148,7 @@ def test_deterministic():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_compiled_op("edge_collapse_checks")
 def test_rejects_bad_input():
     vertices, faces = _grid(4, torch.Generator().manual_seed(0))
     vertices, faces = vertices.cuda(), faces.cuda()
@@ -163,3 +164,23 @@ def test_rejects_bad_input():
     bad[0, 1] = vertices.shape[0]
     with pytest.raises(ValueError, match="edges must lie"):
         ck.edge_collapse_checks(vertices, faces, bad, positions)
+
+
+@pytest.mark.cuda
+@requires_compiled_op("edge_collapse_checks")
+def test_rejects_host_memory_and_wrong_dtype():
+    vertices, faces = _grid(4, torch.Generator().manual_seed(0))
+    vertices, faces = vertices.cuda(), faces.cuda()
+    edges = _edges(faces).cuda()
+    positions = vertices[edges].mean(1)
+    args = {"vertices": vertices, "faces": faces, "edges": edges, "positions": positions}
+    for name, value in args.items():
+        for bad in (value.cpu(), value.double()):
+            with pytest.raises(NoCapableBackendError):
+                ck.edge_collapse_checks(**{**args, name: bad})
+    # called past the dispatcher, a host operand must raise rather than be dereferenced on the device
+    backend = serving_backend("edge_collapse_checks", args)
+    for name in ("edges", "positions"):
+        with pytest.raises(TypeError):
+            backend.edge_collapse_checks(**{**args, name: args[name].cpu()})
+    torch.cuda.synchronize()

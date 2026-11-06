@@ -79,12 +79,14 @@ __all__ = [
     "apply_rope_split_half_",
     "apply_rope_split_half1",
     "apply_rope_split_half1_",
+    "connected_components",
     "convrot_w4a4_linear",
     "dequantize_convrot_w4a4_weight",
     "dequantize_int8_convrot_weight_dtype",
     "dequantize_int8_simple_dtype",
     "dequantize_per_tensor_fp8",
     "dequantize_w4a8_int8_weight",
+    "edge_collapse_checks",
     "has_wmma",
     "int8_linear",
     "int8_attention_is_available",
@@ -2944,6 +2946,76 @@ def _topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sinks):
 
 
 # ---------------------------------------------------------------------------
+# Mesh geometry (ports of the CUDA backend's union-find and edge-collapse kernels)
+# ---------------------------------------------------------------------------
+
+def _check_count(name: str, value) -> int:
+    """A size the kernels index with: a non-negative integer."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _check_shape(name: str, tensor: torch.Tensor, shape: tuple) -> None:
+    """`shape` entries of None accept any size."""
+    if tensor.dim() != len(shape) or any(s is not None and t != s for t, s in zip(tensor.shape, shape, strict=True)):
+        want = ", ".join("*" if s is None else str(s) for s in shape)
+        raise ValueError(f"{name} must have shape ({want}), got {tuple(tensor.shape)}")
+
+
+def _check_indices(name: str, index: torch.Tensor, n: int) -> None:
+    """The kernels index raw buffers with these values, so out-of-range ones would read or write past them.
+
+    Skipped during graph capture, where reading the bounds back would break the capture."""
+    if index.numel() == 0 or torch.cuda.is_current_stream_capturing():
+        return
+    lo, hi = torch.stack(torch.aminmax(index)).tolist()
+    if lo < 0 or hi >= n:
+        raise ValueError(f"{name} must lie in [0, {n}), got values in [{lo}, {hi}]")
+
+
+def connected_components(edges: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    num_nodes = _check_count("num_nodes", num_nodes)
+    _check_shape("edges", edges, (None, 2))
+    _check_indices("edges", edges, num_nodes)
+    edges = edges.contiguous()
+    parent = torch.arange(num_nodes, dtype=torch.int32, device=edges.device)
+    labels = torch.empty(num_nodes, dtype=torch.int64, device=edges.device)
+    _C.connected_components(_dl(edges), edges.shape[0], edges.dtype == torch.int64, num_nodes,
+                            _dl(parent), _dl(labels), _stream(edges))
+    return labels
+
+
+def edge_collapse_checks(
+    vertices: torch.Tensor, faces: torch.Tensor, edges: torch.Tensor, positions: torch.Tensor,
+    cos_threshold: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = vertices.device
+    n_verts, n_edges = vertices.shape[0], edges.shape[0]
+    _check_shape("vertices", vertices, (None, 3))
+    _check_shape("faces", faces, (None, 3))
+    _check_shape("edges", edges, (None, 2))
+    _check_shape("positions", positions, (n_edges, 3))
+    _check_indices("faces", faces, n_verts)
+    _check_indices("edges", edges, n_verts)
+    faces = faces.to(torch.int32).contiguous()
+    corners = faces.reshape(-1)
+    # vertex-to-face CSR, filled by the kernel: sorting the corners would take several times their size
+    offsets = torch.zeros(n_verts + 1, dtype=torch.int32, device=device)
+    torch.cumsum(torch.bincount(corners, minlength=n_verts), dim=0, out=offsets[1:])
+    cursor = torch.zeros(n_verts, dtype=torch.int32, device=device)
+    fan = torch.empty(corners.numel(), dtype=torch.int32, device=device)
+    flips = torch.empty(n_edges, dtype=torch.int32, device=device)
+    skinny = torch.empty(n_edges, dtype=torch.float32, device=device)
+    link_ok = torch.empty(n_edges, dtype=torch.bool, device=device)
+    _C.edge_collapse_checks(_dl(vertices.contiguous()), _dl(faces), _dl(offsets), _dl(cursor), _dl(fan),
+                            _dl(edges.to(torch.int32).contiguous()), _dl(positions.contiguous()),
+                            corners.numel(), n_edges, float(cos_threshold),
+                            _dl(flips), _dl(skinny), _dl(link_ok), _stream(vertices))
+    return flips, skinny, link_ok
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -2967,6 +3039,8 @@ def _build_constraints(has_wmma: bool = True) -> dict:
     half_floats = frozenset({torch.float16, torch.bfloat16})
     fp8s = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
     out_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
+    f32 = frozenset({torch.float32})
+    indices = frozenset({torch.int32, torch.int64})
 
     def _na3d_launch_rule(q):
         # Head dims the kernel is built for, and grid y = T * H, grid z = B * heads.
@@ -3044,6 +3118,20 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             },
             default_devices=dev,
             call_rules=(_window_attention_call_rule,),
+        ),
+        # Integer union-find and fp32 scalar geometry: no matrix cores, any supported arch.
+        "connected_components": FunctionConstraints(
+            params={"edges": ParamConstraint(dtypes=indices, shape_rules=(ExactDims(2),))},
+            default_devices=dev,
+        ),
+        "edge_collapse_checks": FunctionConstraints(
+            params={
+                "vertices": ParamConstraint(dtypes=f32, shape_rules=(ExactDims(2),)),
+                "faces": ParamConstraint(dtypes=indices, shape_rules=(ExactDims(2),)),
+                "edges": ParamConstraint(dtypes=indices, shape_rules=(ExactDims(2),)),
+                "positions": ParamConstraint(dtypes=f32, shape_rules=(ExactDims(2),)),
+            },
+            default_devices=dev,
         ),
         "quantize_per_tensor_fp8": FunctionConstraints(
             params={

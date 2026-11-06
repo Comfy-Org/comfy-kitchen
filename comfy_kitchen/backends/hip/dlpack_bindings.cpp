@@ -148,6 +148,9 @@ void launch_rms_rope_kernel(const void*, const void*, const void*, const void*, 
                             int, float, bool, hipStream_t);
 int64_t memmove_flag_count(int64_t);
 void launch_memmove(void*, const void*, int64_t, void*, hipStream_t);
+void launch_connected_components(const void*, int64_t, bool, int, void*, void*, hipStream_t);
+void launch_edge_collapse_checks(const void*, const void*, const void*, void*, void*, const void*, const void*,
+                                 int, int, float, void*, void*, void*, hipStream_t);
 }
 
 static void check_hip_launch() {
@@ -621,6 +624,28 @@ void memmove_bytes(nb::ndarray<uint8_t, nb::ndim<1>, nb::device::rocm> dst,
             || flags.stride(0) != 1 || flags.size() < static_cast<size_t>(memmove_flag_count(nbytes)))
         throw std::runtime_error("memmove: ranges must be equal, 16-byte aligned multiples of 16 bytes with enough flags");
     launch_memmove(dst.data(), src.data(), nbytes, flags.data(), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// The geometry kernels dereference every operand on the device, so host memory has to be
+// rejected here, as the CUDA bindings do with their nb::device::cuda operand types.
+using rocm_array = nb::ndarray<nb::device::rocm>;
+
+// Union-find connected components; see ops/connected_components.hip.
+void connected_components(rocm_array edges, int64_t n_edges, bool edges_int64, int n_nodes, rocm_array parent,
+                          rocm_array labels, uintptr_t stream_ptr) {
+    launch_connected_components(edges.data(), n_edges, edges_int64, n_nodes, parent.data(), labels.data(),
+                                reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// Flip / skinny / link checks for candidate edge collapses; see ops/edge_collapse.hip.
+void edge_collapse_checks(rocm_array verts, rocm_array faces, rocm_array offsets, rocm_array cursor, rocm_array fan,
+                          rocm_array edges, rocm_array positions, int n_corners, int n_edges, float cos_threshold,
+                          rocm_array flips, rocm_array skinny, rocm_array link_ok, uintptr_t stream_ptr) {
+    launch_edge_collapse_checks(verts.data(), faces.data(), offsets.data(), cursor.data(), fan.data(), edges.data(),
+                                positions.data(), n_corners, n_edges, cos_threshold, flips.data(), skinny.data(),
+                                link_ok.data(), reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -3014,6 +3039,13 @@ NB_MODULE(_C, m) {
           nb::arg("xs_h") = 0, nb::arg("xs_d") = 0, nb::arg("xs_n") = 0);
     m.def("memmove", &memmove_bytes, nb::arg("dst"), nb::arg("src"), nb::arg("flags"),
           nb::arg("stream_ptr"));
+    m.def("connected_components", &connected_components, "Union-find connected components of an edge list",
+          nb::arg("edges"), nb::arg("n_edges"), nb::arg("edges_int64"), nb::arg("n_nodes"), nb::arg("parent"),
+          nb::arg("labels"), nb::arg("stream_ptr"));
+    m.def("edge_collapse_checks", &edge_collapse_checks, "Flip / skinny / link checks for candidate edge collapses",
+          nb::arg("verts"), nb::arg("faces"), nb::arg("offsets"), nb::arg("cursor"), nb::arg("fan"), nb::arg("edges"),
+          nb::arg("positions"), nb::arg("n_corners"), nb::arg("n_edges"), nb::arg("cos_threshold"), nb::arg("flips"),
+          nb::arg("skinny"), nb::arg("link_ok"), nb::arg("stream_ptr"));
     m.def("quantize_int8_rowwise", &quantize_int8_rowwise, nb::arg("x"), nb::arg("q"),
           nb::arg("scales"), nb::arg("M"), nb::arg("K"), nb::arg("stream_ptr"),
           nb::arg("tiled_output") = false);
