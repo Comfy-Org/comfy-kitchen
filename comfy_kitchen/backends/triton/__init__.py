@@ -132,8 +132,8 @@ def _build_constraints() -> dict:
     def _pixel_norm_silu_pad3d_call_rule(kwargs):
         # No size threshold: on the 57 LTX-2.3 / LTXV 0.9 decode shapes measured (bf16, C 128 to
         # 1024, T 8 to 39, with and without a temporal cache, zeros and reflect) the kernel was
-        # faster than ComfyUI's current path at every shape, 3.07x and up on an RTX 5090 and
-        # 2.79x and up on a Radeon 8060S (lowest single pair of an A B A B run).
+        # faster than ComfyUI's current path at every shape on an RTX 5090 and on a Radeon 8060S
+        # (per-call numbers in the PR that added this op).
         x, prefix = kwargs.get("x"), kwargs.get("prefix")
         if x is None:
             return ValidationResult.ok()
