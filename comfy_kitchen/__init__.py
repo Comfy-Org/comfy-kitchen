@@ -29,6 +29,7 @@ from .gated_delta import deferred_buffers as gated_delta_deferred_buffers
 from .gated_delta import deltanet_conv_step_deferred, gated_delta_decode_deferred
 from .gated_delta import CTL_INTS as gated_delta_ctl_ints  # noqa: N811
 from .gated_delta import SLOT_MAX as gated_delta_slot_max  # noqa: N811
+from .indexed_norm import indexed_norm_convrot
 from .registry import registry
 from .sage_attention import (
     PrequantizedInt8Attention,
@@ -71,6 +72,7 @@ __all__ = [
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
     "rms_adaln",
+    "indexed_norm_convrot",
     # Attention
     "PrequantizedInt8Attention",
     "int8_attention",
