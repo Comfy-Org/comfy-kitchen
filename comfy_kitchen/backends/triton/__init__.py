@@ -27,6 +27,8 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "snake_beta",
+    "snake_beta_with_sum",
 ]
 
 # Try to import triton and register if available
@@ -89,6 +91,7 @@ try:
         apply_rope_split_half1_,
         apply_rope_split_half_,
     )
+    from .snake_beta import snake_beta, snake_beta_with_sum
     from .w4a8_int8 import w4a8_int8_linear
 except ImportError as e:
     _TRITON_AVAILABLE = False
@@ -125,6 +128,28 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _snake_beta_call_rule(kwargs):
+        # No size threshold: the kernel was faster than ComfyUI's current path at every
+        # measured Oobleck decoder shape (fp16, C 128 to 2048, T 3000 to 5760000, with and
+        # without the residual add) on an RTX 5090 and on a Radeon 8060S (per-call numbers in
+        # the PR that added this op). The layouts the kernel does not cover go to eager.
+        x, alpha, beta = kwargs.get("x"), kwargs.get("alpha"), kwargs.get("beta")
+        residual = kwargs.get("residual")
+        if x is None:
+            return ValidationResult.ok()
+        if x.numel() == 0:
+            return ValidationResult.fail(
+                "x", "empty tensors are not supported by triton snake_beta"
+            )
+        for name, t in (("x", x), ("alpha", alpha), ("beta", beta), ("residual", residual)):
+            if t is not None and not t.is_contiguous():
+                return ValidationResult.fail(name, "must be contiguous for triton snake_beta")
+            if t is not None and t.device != x.device:
+                return ValidationResult.fail(name, "must be on x's device")
+        if x.shape[0] * x.shape[1] > 65535:
+            return ValidationResult.fail("x", "B * C must be <= 65535 (grid)")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -326,6 +351,20 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
+    # fp16 only, the dtype the Oobleck audio VAE runs in and the one measured; cuda covers ROCm
+    # builds of PyTorch (device type "cuda"), measured on both
+    fp16_only = frozenset({torch.float16})
+    out["snake_beta"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=fp16_only, shape_rules=(ExactDims(3),)),
+            "alpha": ParamConstraint(dtypes=fp16_only, shape_rules=(ExactDims(1),)),
+            "beta": ParamConstraint(dtypes=fp16_only, shape_rules=(ExactDims(1),)),
+            "residual": ParamConstraint(dtypes=fp16_only, shape_rules=(ExactDims(3),)),
+        },
+        default_devices=cuda_devices,
+        call_rules=(_snake_beta_call_rule,),
+    )
+    out["snake_beta_with_sum"] = out["snake_beta"]
     out["na3d"] = FunctionConstraints(
         params={
             "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
