@@ -458,8 +458,17 @@ def prequantize_int8_attention(
 
 def int8_attention_from_prequantized(
     quantized: PrequantizedInt8Attention,
+    *,
+    output_layout: str = "BHSD",
 ) -> torch.Tensor:
-    """Run INT8 attention after the floating-point Q/K/V inputs are released."""
+    """Run INT8 attention after the floating-point Q/K/V inputs are released.
+
+    ``output_layout="BSHD"`` returns contiguous [batch, sequence, heads, dim]
+    storage, avoiding a layout copy before an output projection on CUDA.
+    The default keeps the existing [batch, heads, sequence, dim] contract.
+    """
+    if output_layout not in ("BHSD", "BSHD"):
+        raise ValueError("output_layout must be BHSD or BSHD")
     if not isinstance(quantized, PrequantizedInt8Attention):
         raise TypeError(
             "quantized must be returned by prequantize_int8_attention, got "
@@ -505,16 +514,17 @@ def int8_attention_from_prequantized(
             cta_k=quantized.cta_k,
         )
         output = output[..., : quantized.original_head_dim]
+        if output_layout == "BSHD":
+            output = output.transpose(1, 2).contiguous()
         return output.float() if quantized.input_dtype == torch.float32 else output
 
-    output = torch.empty(
-        batch,
-        q_heads,
-        q_length,
-        kernel_head_dim,
-        dtype=output_dtype,
-        device=quantized.q.device,
-    )
+    shape = (batch, q_heads, q_length, kernel_head_dim)
+    if output_layout == "BSHD":
+        shape = (batch, q_length, q_heads, kernel_head_dim)
+    output = torch.empty(shape, dtype=output_dtype, device=quantized.q.device)
+    # The native ABI keeps logical BHSD dimensions and uses output strides.
+    if output_layout == "BSHD":
+        output = output.transpose(1, 2)
 
     stream_ptr = torch.cuda.current_stream(quantized.q.device).cuda_stream
     _cuda_backend._C.sage_sdpa_prequantized(
@@ -537,6 +547,8 @@ def int8_attention_from_prequantized(
     )
 
     output = output[..., : quantized.original_head_dim]
+    if output_layout == "BSHD":
+        output = output.transpose(1, 2).contiguous()
     return output.float() if quantized.input_dtype == torch.float32 else output
 
 

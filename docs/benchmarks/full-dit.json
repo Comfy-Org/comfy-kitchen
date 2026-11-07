@@ -1,0 +1,82 @@
+{
+  "baseline": {
+    "arm": "base",
+    "gpu": "NVIDIA GeForce RTX 5090 D v2",
+    "torch": "2.12.0+cu130",
+    "records": [
+      {
+        "repeat": -1,
+        "dit_seconds": 21.787675066036172,
+        "latent_sha256": [
+          "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+          "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+        ]
+      },
+      {
+        "repeat": 0,
+        "dit_seconds": 15.855177834047936,
+        "latent_sha256": [
+          "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+          "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+        ]
+      },
+      {
+        "repeat": 1,
+        "dit_seconds": 15.86187753698323,
+        "latent_sha256": [
+          "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+          "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+        ]
+      },
+      {
+        "repeat": 2,
+        "dit_seconds": 15.864398470963351,
+        "latent_sha256": [
+          "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+          "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+        ]
+      }
+    ],
+    "kitchen": "source build: base"
+  },
+  "candidate": {
+    "arm": "attention",
+    "gpu": "NVIDIA GeForce RTX 5090 D v2",
+    "torch": "2.12.0+cu130",
+    "records": [
+      {
+        "repeat": -1,
+        "dit_seconds": 22.865092450985685,
+        "latent_sha256": [
+          "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+          "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+        ]
+      },
+      {
+        "repeat": 0,
+        "dit_seconds": 15.841791248996742,
+        "latent_sha256": [
+          "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+          "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+        ]
+      },
+      {
+        "repeat": 1,
+        "dit_seconds": 15.838711324962787,
+        "latent_sha256": [
+          "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+          "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+        ]
+      },
+      {
+        "repeat": 2,
+        "dit_seconds": 15.838753456017002,
+        "latent_sha256": [
+          "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+          "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+        ]
+      }
+    ],
+    "kitchen": "source build: attention"
+  }
+}
