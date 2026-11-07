@@ -71,6 +71,8 @@ __all__ = [
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
     "rms_adaln",
+    "snake_beta",
+    "snake_beta_with_sum",
     # Attention
     "PrequantizedInt8Attention",
     "int8_attention",
@@ -455,6 +457,34 @@ def group_norm_stats3d(x: torch.Tensor, num_groups: int = 32, eps: float = 1e-6)
     """Per-frame GroupNorm statistics of x [B, C, T, H, W]: float32 [B*T, num_groups, 2]
     of (mean, rstd), for group_norm_silu_pad3d's stats argument."""
     return torch.ops.comfy_kitchen.group_norm_stats3d(x, num_groups, eps)
+
+
+def snake_beta(
+    x: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    residual: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """SnakeBeta with log-scale parameters, optionally of ``x + residual``, in one pass.
+
+    x ``[B, C, T]``, alpha and beta the raw ``[C]`` parameters (``alpha_logscale=True``):
+    ``x + 1 / (exp(beta) + 1e-9) * sin(x * exp(alpha)) ** 2`` per channel, the Oobleck audio
+    VAE's ``SnakeBeta``. With residual (x's shape) the activation is applied to
+    ``x + residual``, the ``ResidualUnit`` add that feeds the next ``SnakeBeta``.
+    """
+    return torch.ops.comfy_kitchen.snake_beta(x, alpha, beta, residual)
+
+
+def snake_beta_with_sum(
+    x: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    residual: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``s = x + residual`` and ``snake_beta(s, alpha, beta)`` in one pass; returns
+    ``(s, snake_beta(s))``, for a ``ResidualUnit`` add whose sum is also the next unit's
+    residual."""
+    return torch.ops.comfy_kitchen.snake_beta_with_sum(x, alpha, beta, residual)
 
 
 def rms_adaln(

@@ -10,6 +10,8 @@ __all__ = [
     "window_attention",
     "sol_attn",
     "rms_adaln",
+    "snake_beta",
+    "snake_beta_with_sum",
     "apply_rope",
     "apply_rope_",
     "apply_rope1",
@@ -131,6 +133,7 @@ from .rope import (
     rms_rope_split_half1_,
     rms_rope_split_half_,
 )
+from .snake_beta import snake_beta, snake_beta_with_sum
 from .sol_attn import sol_attn
 from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
 from .w4a8_int8 import (
@@ -704,6 +707,16 @@ def _build_constraints() -> dict:
         default_devices=all_devices,
         call_rules=(window_attention_common_call_rule,),
     )
+    out["snake_beta"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(3),)),
+            "alpha": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(1),)),
+            "beta": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(1),)),
+            "residual": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(3),)),
+        },
+        default_devices=all_devices,
+    )
+    out["snake_beta_with_sum"] = out["snake_beta"]
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in out:
             out[name + "_out"] = with_out_param(out[name])
