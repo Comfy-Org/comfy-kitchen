@@ -247,6 +247,30 @@ class TestDepthToSpace3dResidualAddEager:
                 residual_packed=True,
             )
 
+    def test_inplace_rejects_overlapping_residual(self):
+        x = torch.randn(1, 16, 2, 4, 4)
+        residual = torch.randn(1, 16, 4, 8, 1).expand(1, 16, 4, 8, 8)
+        with pytest.raises(ValueError, match="internal overlap"):
+            ck.depth_to_space3d_residual_add_(x, residual, 2, 2, 8)
+
+    def test_inplace_rejects_x_overlapping_residual(self):
+        buf = torch.randn(16 * 4 * 8 * 8)
+        residual = buf.view(1, 16, 4, 8, 8)
+        x = buf[: 16 * 2 * 4 * 4].view(1, 16, 2, 4, 4)
+        with pytest.raises(ValueError, match="must not overlap"):
+            ck.depth_to_space3d_residual_add_(x, residual, 2, 2, 8)
+
+    def test_packed_output_is_contiguous(self):
+        # factor_t 1 and H = W = 1: the sum of the two permuted views comes out strided
+        x = torch.randn(1, 2, 1, 1, 1)
+        residual = torch.randn(1, 8, 1, 1, 1)
+        with ck.use_backend("eager"):
+            out = ck.depth_to_space3d_residual_add(
+                x, residual, 1, 2, 4, factors_first=True, residual_packed=True
+            )
+        assert out.shape == (1, 2, 1, 2, 2)
+        assert out.is_contiguous()
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 class TestDepthToSpace3dResidualAddTriton:

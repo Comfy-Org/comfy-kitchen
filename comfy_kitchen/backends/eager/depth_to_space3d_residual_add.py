@@ -21,6 +21,7 @@ This backend runs those ComfyUI sequences as they are.
 
 import torch
 
+from comfy_kitchen._rope_utils import _tensors_overlap
 from comfy_kitchen.registry import registry
 
 # comfy/ldm/wan/vae2_2.py: strips of rows bound the size of the shortcut temporary
@@ -61,6 +62,9 @@ def depth_to_space3d_residual_add(
     shortcut = _depth_to_space3d(x, factor_t, factor_s, repeats, first_chunk, factors_first)
     if residual_packed:
         residual = _depth_to_space3d(residual, factor_t, factor_s, None, first_chunk, factors_first)
+        # the sum of two permuted views can come out strided (factor_t 1, H = W = 1); the op returns
+        # a contiguous tensor for the packed residual, as the fake and the triton backend do
+        return (residual + shortcut).contiguous()
     return residual + shortcut
 
 
@@ -122,6 +126,23 @@ def _check(x, residual, factor_t, factor_s, repeats, first_chunk, residual_packe
         raise ValueError(f"{name}: residual must be {want}, got {tuple(residual.shape)}")
 
 
+def _check_inplace(x, residual):
+    # same rules as check_rope_inplace in comfy_kitchen/_rope_utils.py
+    name = "depth_to_space3d_residual_add_"
+    required = 1
+    dimensions = sorted(
+        (abs(stride), size)
+        for size, stride in zip(residual.shape, residual.stride(), strict=True)
+        if size > 1
+    )
+    for stride, size in dimensions:
+        if stride < required:
+            raise ValueError(f"{name}: residual must be a view without internal overlap")
+        required = stride * size
+    if _tensors_overlap(x, residual):
+        raise ValueError(f"{name}: x must not overlap residual")
+
+
 @torch.library.custom_op("comfy_kitchen::depth_to_space3d_residual_add", mutates_args=())
 def _op_depth_to_space3d_residual_add(
     x: torch.Tensor,
@@ -172,6 +193,7 @@ def _op_depth_to_space3d_residual_add_(
     first_chunk: bool,
 ) -> None:
     _check(x, residual, factor_t, factor_s, repeats, first_chunk)
+    _check_inplace(x, residual)
     kwargs = {
         "x": x,
         "residual": residual,
