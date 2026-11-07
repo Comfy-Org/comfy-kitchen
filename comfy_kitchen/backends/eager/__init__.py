@@ -1,5 +1,6 @@
 __all__ = [
     "adaln",
+    "adaln_segmented",
     "rms_gated_residual",
     "fp16_conv3d",
     "fp16_conv3d_out",
@@ -77,6 +78,7 @@ from comfy_kitchen.constraints import (
 from comfy_kitchen.registry import registry
 
 from .adaln import adaln, rms_adaln
+from .adaln_segmented import adaln_segmented
 from .awq import gemv_awq_w4a16
 from .conv3d import fp16_conv3d, fp16_conv3d_out
 from .convrot_w4a4 import (
@@ -703,6 +705,15 @@ def _build_constraints() -> dict:
         },
         default_devices=all_devices,
         call_rules=(window_attention_common_call_rule,),
+    )
+    out["adaln_segmented"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats),
+            "scale": ParamConstraint(dtypes=standard_floats),
+            "shift": ParamConstraint(dtypes=standard_floats),
+            "rms_weight": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
     )
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in out:
