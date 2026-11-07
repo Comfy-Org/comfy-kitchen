@@ -6,6 +6,8 @@
 #   Copyright (c) Meta Platforms, Inc. and affiliates.
 #   Licensed under the BSD 3-Clause License (see NOTICE file for details)
 
+import os
+
 import torch
 
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
@@ -724,6 +726,7 @@ def _op_scaled_mm_mxfp8_fake(
 
 
 _turing_device_cache: dict[int, bool] = {}
+_no_int8_tensor_core_cache: dict[int, bool] = {}
 
 
 def _cuda_device_is_turing(device_index: int) -> bool:
@@ -736,6 +739,119 @@ def _cuda_device_is_turing(device_index: int) -> bool:
         is_turing = False
     _turing_device_cache[device_index] = is_turing
     return is_turing
+
+
+def _cuda_device_has_int8_tensor_core(device_index: int) -> bool:
+    """True when the device runs INT8 GEMMs on tensor cores (IMMA).
+
+    Volta (sm_70) has no INT8 tensor core: ``torch._int_mm`` falls back to a
+    DP4A-emulated INT8 GEMM whose throughput is below the device's FP16
+    tensor-core throughput, so an INT8 weight buys nothing but memory.
+    """
+    cached = _no_int8_tensor_core_cache.get(device_index)
+    if cached is not None:
+        return cached
+    try:
+        major, _minor = torch.cuda.get_device_capability(device_index)
+        has_int8 = major >= 8 or (major == 7 and _minor >= 5)
+    except RuntimeError:
+        has_int8 = False
+    _no_int8_tensor_core_cache[device_index] = has_int8
+    return has_int8
+
+
+_fp16_tensor_core_cache: dict[int, bool] = {}
+
+
+def _cuda_device_has_fp16_tensor_core(device_index: int) -> bool:
+    """True when the device has FP16 tensor cores (Volta/sm_70 and later).
+
+    The fallback only pays off when the GEMM it moves to actually runs on
+    tensor cores. Pre-Volta parts (Pascal sm_61, Maxwell sm_52) execute FP16
+    at a fraction of their DP4A INT8 rate -- measured at 1/64 on the GTX 1080
+    -- so routing them through the FP16 fallback would be a large regression
+    rather than the speedup it is on Volta.
+    """
+    cached = _fp16_tensor_core_cache.get(device_index)
+    if cached is not None:
+        return cached
+    try:
+        major, _minor = torch.cuda.get_device_capability(device_index)
+        has_fp16 = major >= 7
+    except RuntimeError:
+        has_fp16 = False
+    _fp16_tensor_core_cache[device_index] = has_fp16
+    return has_fp16
+
+
+_bf16_tensor_core_cache: dict[int, bool] = {}
+
+
+def _cuda_device_has_bf16_tensor_core(device_index: int) -> bool:
+    """True when the device runs BF16 GEMMs on tensor cores (Ampere/sm_80+).
+
+    BF16 matrix instructions arrive with Ampere. Volta (sm_70) and Turing
+    (sm_75) can execute BF16 only through a conversion path, so a BF16 GEMM
+    there is slower than the FP16 one -- Turing is a narrow case because
+    ``int8_linear`` never routes to the fallback on a device that has INT8
+    tensor cores, but an explicit ``int8_linear_fp16`` call can still ask for
+    it.
+    """
+    cached = _bf16_tensor_core_cache.get(device_index)
+    if cached is not None:
+        return cached
+    try:
+        major, _minor = torch.cuda.get_device_capability(device_index)
+        has_bf16 = major >= 8
+    except RuntimeError:
+        has_bf16 = False
+    _bf16_tensor_core_cache[device_index] = has_bf16
+    return has_bf16
+
+
+def _int8_fp16_fallback_enabled() -> bool:
+    """Whether ``int8_linear`` may delegate to the FP16 fallback.
+
+    The fallback is the right default on devices where the FP16 tensor cores
+    outrun the DP4A-emulated INT8 GEMM. Devices without FP16 tensor cores of
+    their own (Pascal, Maxwell) are not covered by that argument, so this
+    escape hatch lets them keep the original INT8 path::
+
+        COMFY_KITCHEN_INT8_FP16_FALLBACK=0
+
+    The same switch makes it possible to A/B the two paths.
+    """
+    return os.environ.get("COMFY_KITCHEN_INT8_FP16_FALLBACK", "1") != "0"
+
+
+def _int8_fp16_fallback_for_fp32_input() -> bool:
+    """Whether an FP32 activation may also be routed through the FP16 fallback.
+
+    Default **off**: an FP32 activation is the caller explicitly asking for
+    FP32 numerics, usually on purpose (a NaN/overflow fuse re-running a block
+    in FP32, or a model whose compute dtype is pinned to FP32). Downgrading
+    that to FP16 trades away 13 mantissa bits; it is measurably faster, but
+    the caller asked for accuracy, not speed.
+
+    Measured on Volta (sm_70, MiniMax H3 INT8 ConvRot, 4 layers, M=4096,
+    FP32 activation in):
+
+    ==============================  ==========  ==========
+    path                            total       vs INT8
+    ==============================  ==========  ==========
+    INT8 (DP4A)                     86.64 ms    1.00x
+    FP16 fallback                   38.30 ms    0.44x
+    ==============================  ==========  ==========
+
+    Callers who want that 2.27x anyway can opt in explicitly::
+
+        COMFY_KITCHEN_INT8_FP16_FALLBACK_FP32=1
+
+    FP16/BF16 activations are unaffected by this switch: BF16 in particular
+    *gains* precision by moving to FP16 on Volta (10 vs 8 mantissa bits) while
+    avoiding the slow BF16 conversion path (measured 7.4x faster).
+    """
+    return os.environ.get("COMFY_KITCHEN_INT8_FP16_FALLBACK_FP32", "0") == "1"
 
 
 def _int8_mm_n_alignment(tensor: torch.Tensor) -> int:
@@ -982,6 +1098,125 @@ def fp16_linear(
     return _apply_residual(out, residual, residual_scale)
 
 
+
+def _int8_fp16_compute_dtype(x: torch.Tensor) -> torch.dtype:
+    """Pick the GEMM dtype for :func:`int8_linear_fp16`.
+
+    BF16 is kept only where the GEMM can actually run on BF16 tensor cores
+    (Ampere/sm_80+). Below that threshold -- Volta (sm_70) and Turing (sm_75)
+    -- BF16 goes through a conversion path, measured at 13.449 ms for 4096^3
+    on Volta against 1.535 ms for FP16 and 2.909 ms for the DP4A INT8 path
+    this fallback replaces.
+    """
+    dtype = x.dtype
+    if dtype not in (torch.float16, torch.bfloat16):
+        dtype = torch.float16
+    if x.is_cuda and not _cuda_device_has_bf16_tensor_core(x.get_device()):
+        dtype = torch.float16
+    return dtype
+
+
+def int8_linear_fp16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """INT8 linear layer that runs the GEMM on the FP16 tensor cores.
+
+    This is the fallback for devices without INT8 tensor cores (Volta/sm_70).
+    ``torch._int_mm`` there emulates INT8 with DP4A, which is *slower* than the
+    device's FP16 tensor cores, so keeping the weights in INT8 only costs
+    memory while making the GEMM slower.
+
+    The INT8 weights are dequantized to FP16 on the fly, exactly like the FP8
+    path already does, so the memory footprint stays that of the INT8 model.
+
+    For a ConvRot weight the stored matrix is ``W_rot = W @ H^T`` and the
+    activation is rotated online (``x_rot = x @ H``), so the GEMM runs entirely
+    in the rotated basis. That means the dequantized weight must **not** be
+    rotated back: dequantizing ``W_rot`` and multiplying by ``x_rot`` is
+    mathematically equivalent to the original basis, while rotating the weight
+    back would cost an extra Hadamard transform per layer.
+
+    The activation is still quantized to INT8 (same grid as the INT8 path), so
+    the numerics match the INT8 implementation; only the GEMM moves to FP16.
+
+    Args:
+        x: Input tensor [..., K].
+        weight: INT8 weight tensor [N, K].
+        weight_scale: Scalar or per-output-channel weight scale.
+        bias: Optional bias [N].
+        out_dtype: Output dtype.
+        convrot: If True, apply online activation rotation.
+        convrot_groupsize: Group size for Hadamard rotation.
+        input_act: Optional activation folded in before quantization.
+        input_act_weight: K-element weight for input_act "rms_norm".
+        input_act_eps: Eps for input_act "rms_norm".
+        residual: Optional [..., N] tensor; the result becomes
+            ``residual + residual_scale * linear(x)``.
+        residual_scale: Per-channel [N] scale for the residual form.
+
+    Returns:
+        Result tensor [..., N].
+    """
+    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    if x.shape[-1] != weight.shape[-1]:
+        raise ValueError(
+            f"Input and weight inner dimensions must match, got {x.shape[-1]} and {weight.shape[-1]}"
+        )
+
+    weight = weight.to(device=x.device).contiguous()
+    weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1)
+    if weight_scale.numel() not in (1, weight.shape[0]):
+        raise ValueError(
+            f"INT8 weight scale must be scalar or per-output-channel, got {tuple(weight_scale.shape)} "
+            f"for weight shape {tuple(weight.shape)}"
+        )
+
+    if convrot:
+        if x.shape[-1] % convrot_groupsize != 0:
+            raise ValueError(
+                f"ConvRot group size {convrot_groupsize} does not divide input features {x.shape[-1]}"
+            )
+        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        x = _rotate_activation(x, h, convrot_groupsize)
+
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1])
+
+    # Same per-row activation quantization as the INT8 path, so the result
+    # stays on the INT8 quantization grid.
+    x_8, x_scale = quantize_int8_rowwise(x_2d)
+
+    compute_dtype = _int8_fp16_compute_dtype(x)
+
+    # Dequantize both operands to FP16 and use the FP16 tensor cores.
+    # The weight stays in the rotated basis on purpose (see the docstring).
+    x_fp16 = x_8.to(compute_dtype) * x_scale.to(compute_dtype)
+    w_fp16 = weight.to(compute_dtype)
+    if weight_scale.numel() == weight.shape[0]:
+        w_fp16 = w_fp16 * weight_scale.reshape(-1, 1).to(compute_dtype)
+    else:
+        w_fp16 = w_fp16 * weight_scale.to(compute_dtype)
+
+    result = torch.matmul(x_fp16, w_fp16.t()).to(out_dtype)
+
+    if bias is not None:
+        result = result + bias.to(device=result.device, dtype=result.dtype).reshape(1, -1)
+
+    result = result.reshape(*orig_shape[:-1], weight.shape[0])
+    return _apply_residual(result, residual, residual_scale)
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1001,6 +1236,21 @@ def int8_linear(
     Quantizes x dynamically per-row, uses tensorwise weight scale.
     Processes scaling in chunks to avoid materializing large float32 tensors.
 
+    On CUDA devices without INT8 tensor cores (Volta/sm_70) the INT8 GEMM is
+    DP4A-emulated and slower than the FP16 tensor cores, so this delegates to
+    :func:`int8_linear_fp16`, which keeps the INT8 weights in memory but runs
+    the GEMM in FP16. Set ``COMFY_KITCHEN_INT8_FP16_FALLBACK=0`` to opt out.
+
+    An FP32 activation keeps the INT8 path by default: FP32 numerics are
+    normally requested on purpose (a NaN/overflow fuse re-running a block in
+    FP32, or a model pinned to FP32 compute), and the FP16 fallback would
+    trade 13 mantissa bits for a 2.27x speedup. Opt in with
+    ``COMFY_KITCHEN_INT8_FP16_FALLBACK_FP32=1`` if the speed is wanted anyway.
+
+    Pre-Volta parts keep the INT8 path too: without FP16 tensor cores the
+    moved GEMM would run *slower* than the DP4A one it replaces, so the
+    fallback is limited to sm_70 and later.
+
     Args:
         x: Input tensor [..., K].
         weight: INT8 weight tensor [N, K].
@@ -1019,6 +1269,21 @@ def int8_linear(
     Returns:
         Result tensor [..., N].
     """
+    if (
+        x.is_cuda
+        and weight.is_cuda
+        and _int8_fp16_fallback_enabled()
+        and (x.dtype != torch.float32 or _int8_fp16_fallback_for_fp32_input())
+        and not _cuda_device_has_int8_tensor_core(x.get_device())
+        and _cuda_device_has_fp16_tensor_core(x.get_device())
+    ):
+        return int8_linear_fp16(
+            x, weight, weight_scale, bias, out_dtype,
+            convrot, convrot_groupsize,
+            input_act, input_act_weight, input_act_eps,
+            residual, residual_scale,
+        )
+
     x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
     if x.shape[-1] != weight.shape[-1]:
         raise ValueError(
@@ -1134,7 +1399,7 @@ def int8_linear_rms_modulated(
 
 
 # =============================================================================
-# torch.library Custom Op Definitions — INT8 Tensor-wise
+# torch.library Custom Op Definitions —INT8 Tensor-wise
 # =============================================================================
 
 
@@ -1318,5 +1583,48 @@ def _op_int8_linear_fake(x, weight, weight_scale, bias, output_dtype_code,
                          convrot=False, convrot_groupsize=256, input_act=None,
                          input_act_weight=None, input_act_eps=0.0,
                          residual=None, residual_scale=None):
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty(*x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device)
+
+
+@torch.library.custom_op("comfy_kitchen::int8_linear_fp16", mutates_args=())
+def _op_int8_linear_fp16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    output_dtype_code: int,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "x": x,
+        "weight": weight,
+        "weight_scale": weight_scale,
+        "bias": bias,
+        "out_dtype": out_dtype,
+        "convrot": convrot,
+        "convrot_groupsize": convrot_groupsize,
+        "input_act": input_act,
+        "input_act_weight": input_act_weight,
+        "input_act_eps": input_act_eps,
+        "residual": residual,
+        "residual_scale": residual_scale,
+    }
+    impl = registry.get_implementation("int8_linear_fp16", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_int8_linear_fp16.register_fake
+def _op_int8_linear_fp16_fake(x, weight, weight_scale, bias, output_dtype_code,
+                              convrot=False, convrot_groupsize=256, input_act=None,
+                              input_act_weight=None, input_act_eps=0.0,
+                              residual=None, residual_scale=None):
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     return torch.empty(*x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device)
