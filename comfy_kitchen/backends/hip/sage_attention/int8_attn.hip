@@ -503,18 +503,28 @@ __global__ __launch_bounds__((Shape<HD, kMask, Paged>::kThreads)) void int8_attn
         const int kb0 = iter * CTA_K;
 
         __syncthreads();
+        // The copies count trips from zero rather than striding idx up to the
+        // end: with `idx = tid; idx < n; idx += kThreads` the compiler cannot
+        // tell every trip runs, guards each load with its own exec branch and
+        // waits for it before the next, so the tile's loads never overlap.
+        constexpr int kKUnits = CTA_K * kUnitsK;
+        constexpr int kVUnits = HD * kUnitsV;
         // K tile: [key][d]. Load 16 bytes at a time, then split the LDS stores:
         // gfx12's row padding guarantees only eight-byte alignment. A row past
-        // the end is zeroed; its score is masked below.
+        // the end is zeroed; its score is masked below. A thread's rows are a
+        // fixed stride apart, so one base pointer serves every trip.
+        static_assert(S::kThreads % kUnitsK == 0);
+        const int8_t* k_src = k_head + static_cast<int64_t>(kb0 + tid / kUnitsK) * HD +
+                              (tid % kUnitsK) * 16;
 #pragma unroll
-        for (int idx = tid; idx < CTA_K * kUnitsK; idx += S::kThreads) {
+        for (int i = 0; i < (kKUnits + S::kThreads - 1) / S::kThreads; ++i) {
+            const int idx = tid + i * S::kThreads;
+            if (kKUnits % S::kThreads != 0 && idx >= kKUnits) break;
             const int row = idx / kUnitsK;
             const int unit = idx % kUnitsK;
-            const int key = kb0 + row;
             uint4 val = {0u, 0u, 0u, 0u};
-            if (!kBoundary || key < kv_len) {
-                val = *reinterpret_cast<const uint4*>(k_head + static_cast<int64_t>(key) * HD +
-                                                     unit * 16);
+            if (!kBoundary || kb0 + row < kv_len) {
+                val = *reinterpret_cast<const uint4*>(k_src + i * (S::kThreads / kUnitsK) * HD);
             }
             *reinterpret_cast<uint2*>(smem_k + row * kStrideK + unit * 16) = uint2{val.x, val.y};
             *reinterpret_cast<uint2*>(smem_k + row * kStrideK + unit * 16 + 8) = uint2{val.z, val.w};
@@ -522,7 +532,9 @@ __global__ __launch_bounds__((Shape<HD, kMask, Paged>::kThreads)) void int8_attn
         // V tile: [d][key], already transposed and zero padded by the quantizer,
         // so a whole CTA_K tile is always in bounds.
 #pragma unroll
-        for (int idx = tid; idx < HD * kUnitsV; idx += S::kThreads) {
+        for (int i = 0; i < (kVUnits + S::kThreads - 1) / S::kThreads; ++i) {
+            const int idx = tid + i * S::kThreads;
+            if (kVUnits % S::kThreads != 0 && idx >= kVUnits) break;
             const int row = idx / kUnitsV;
             const int unit = idx % kUnitsV;
             const uint4 val = *reinterpret_cast<const uint4*>(
