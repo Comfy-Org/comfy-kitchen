@@ -13,7 +13,6 @@ from dataclasses import dataclass
 
 import torch
 
-import comfy_kitchen as ck
 from comfy_kitchen.exceptions import NoCapableBackendError
 from comfy_kitchen.registry import registry
 
@@ -268,11 +267,12 @@ class TensorWiseINT8Layout(QuantizedLayout):
         if params.transposed:
             return NotImplemented
         qdata, scale = cls.get_plain_tensors(weight)
-        return ck.int8_linear(
-            x, qdata, scale, bias, x.dtype,
-            convrot=params.convrot, convrot_groupsize=params.convrot_groupsize,
-            input_act=input_act, input_act_weight=input_act_weight, input_act_eps=input_act_eps,
-            residual=residual, residual_scale=residual_scale,
+        # Through the custom op, as linear does: torch.compile cannot trace the raw kernels.
+        return torch.ops.comfy_kitchen.int8_linear(
+            x, qdata, scale, bias, _dtype_code(x.dtype),
+            params.convrot, params.convrot_groupsize,
+            input_act, input_act_weight, float(input_act_eps),
+            residual, residual_scale,
         )
 
     @classmethod
