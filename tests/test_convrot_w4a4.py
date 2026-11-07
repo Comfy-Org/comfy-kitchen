@@ -64,6 +64,30 @@ def test_convrot_w4a4_linear_eager_matches_dequantized_weight(seed):
     assert rel_err.mean().item() < 0.08
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_convrot_w4a4_eager_int4_linear_fp16_rail_overflow(seed, dtype, with_bias):
+    # Regression for #299: eager int4_linear used to compute the int4 MMA in
+    # out_dtype. Constant rows survive the ConvRot rotation unchanged, so every
+    # element quantizes onto the +/-7 rail and the integer dot product reaches
+    # 7 * 7 * 1536 = 75264 > fp16 max (65504); only fp32 accumulation stays finite.
+    torch.manual_seed(789)
+    m, k, n = 8, 1536, 32
+    x = torch.full((m, k), 4.5, dtype=dtype)
+    w = torch.full((n, k), 4.5, dtype=dtype)
+    bias = torch.full((n,), 0.5, dtype=dtype) if with_bias else None
+    qt = QuantizedTensor.from_float(w, "TensorCoreConvRotW4A4Layout")
+
+    out = functional.linear(x, qt, bias)
+
+    expected = 49 * k * (4.5 / 7) ** 2 + (0.5 if with_bias else 0.0)
+    assert out.shape == (m, n)
+    assert out.dtype == dtype
+    assert torch.isfinite(out).all()
+    rel_err = (out.float() - expected).abs() / expected
+    assert rel_err.max().item() < 0.05
+
+
 def test_convrot_w4a4_layout_linear_mm_addmm(seed):
     x = torch.randn(5, 256, dtype=torch.float32)
     w = torch.randn(17, 256, dtype=torch.float32)
