@@ -1,0 +1,11 @@
+{
+  "baseline_commit": "19ea55b9ebdaf77942dab36223e1222009d3ce11",
+  "files": {
+    "comfy_kitchen/__init__.py": "cf08691049f029a039abe62e5a2cc6c258dfcc1998ca72f47289c1d742ed857e",
+    "comfy_kitchen/backends/cuda/CMakeLists.txt": "dd6c6afe34528b46fe874e45838e6661cf52ceb9eb7692d2b4a687c8c8251424",
+    "comfy_kitchen/backends/cuda/dlpack_bindings.cpp": "2f4c0ea11d57796c16b9d3889b27622f5bf3e182c125f48d98f26191339be90f",
+    "comfy_kitchen/backends/cuda/ops/cutlass_gemm_indexed_gate.cu": "5721fc105c56f12d883641c738118714b3b8e1db8f0b2b20284626d48069fd50",
+    "comfy_kitchen/backends/cuda/ops/indexed_gate.cuh": "752533dd1abbb45b29a57c3b04d09a3371f7a17601f79c174fe28e5aabadd3ac",
+    "comfy_kitchen/indexed_gate.py": "6a8aa24bf9ef605cf73231db42d81593ac8cfc5171b861b51fd30b575a1fecf8"
+  }
+}
