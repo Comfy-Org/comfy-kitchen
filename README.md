@@ -4,52 +4,52 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 
 ## Backend Capabilities Matrix
 
-| Function                    | eager | cuda | triton | hip | ascend |
-|-----------------------------|-------|------|--------|-----|-----|
-| `quantize_per_tensor_fp8`   | ✓     | ✓    | ✓      | ✓   |     |
-| `dequantize_per_tensor_fp8` | ✓     | ✓    | ✓      | ✓   |     |
-| `stochastic_rounding_fp8`   | ✓     | ✓    |        | ✓   |     |
-| `quantize_nvfp4`            | ✓     | ✓    | ✓      |     |     |
-| `dequantize_nvfp4`          | ✓     | ✓    | ✓      |     |     |
-| `scaled_mm_nvfp4`           | ✓     | ✓    |        |     |     |
-| `quantize_mxfp8`            | ✓     | ✓    | ✓      |     |     |
-| `dequantize_mxfp8`          | ✓     |      |        |     |     |
-| `scaled_mm_mxfp8`           | ✓     |      |        |     |     |
-| `adaln`                     | ✓     | ✓    | ✓      | ✓   |     |
-| `rms_adaln`                 | ✓     | ✓    | ✓      | ✓   |     |
-| `na3d`                      | ✓     | ✓    | ✓      | ✓   |     |
-| `na2d`                      | ✓     | ✓    | ✓      | ✓   |     |
-| `sol_attn`                  | ✓     | ✓    |        | ✓   |     |
-| `int8_attention`            |       | ✓    |        | ✓   |     |
-| `apply_rope`                | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `apply_rope1`               | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `apply_rope_split_half`     | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `apply_rope_split_half1`    | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `rms_rope`                  | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `rms_rope1`                 | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `rms_rope_split_half`       | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `rms_rope_split_half1`      | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `quantize_int8_rowwise`     | ✓     | ✓    | ✓      | ✓   | ✓   |
-| `quantize_int8_tensorwise`  | ✓     | ✓    |        | ✓   | ✓   |
-| `quantize_and_rotate_rowwise` | ✓   | ✓    | ✓      | ✓   | ✓*  |
-| `quantize_int8_convrot_weight` | ✓  | ✓    |        | ✓   |     |
-| `dequantize_int8_simple`    | ✓     | ✓    |        | ✓   | ✓   |
-| `dequantize_int8_simple_dtype` | ✓  | ✓    |        | ✓   | ✓   |
-| `dequantize_int8_convrot_weight_dtype` | ✓ | ✓ |    | ✓   |     |
-| `int8_linear`               | ✓     | ✓    | ✓      | ✓   | ✓*  |
-| `gemv_awq_w4a16`            | ✓     | ✓    |        | ✓   |     |
-| `quantize_svdquant_w4a4`    | ✓     | ✓    |        | ✓   |     |
-| `scaled_mm_svdquant_w4a4`   | ✓     | ✓    |        | ✓   |     |
-| `convrot_w4a4_linear`       | ✓     | ✓    |        | ✓   | ✓*  |
-| `quantize_convrot_w4a4_weight` | ✓  | ✓    |        | ✓   |     |
-| `dequantize_convrot_w4a4_weight` | ✓ | ✓   |        | ✓   |     |
-| `delaunay3d`                |       | ✓    |        | ✓   |     |
-| `mesh_bvh`                  |       | ✓    |        | ✓   |     |
-| `closest_point_on_mesh`     |       | ✓    |        | ✓   |     |
-| `closest_hit_on_mesh`       |       | ✓    |        | ✓   |     |
-| `connected_components`      |       | ✓    |        | ✓   |     |
-| `edge_collapse_checks`      |       | ✓    |        | ✓   |     |
-| `min_cut`                   |       | ✓    |        | ✓   |     |
+| Function                               | eager | cuda | triton | hip | ascend | metal |
+|----------------------------------------|-------|------|--------|-----|--------|-------|
+| `quantize_per_tensor_fp8`              | ✓     | ✓    | ✓      | ✓   |        | ✓     |
+| `dequantize_per_tensor_fp8`            | ✓     | ✓    | ✓      | ✓   |        | ✓     |
+| `stochastic_rounding_fp8`              | ✓     | ✓    |        | ✓   |        | ✓     |
+| `quantize_nvfp4`                       | ✓     | ✓    | ✓      |     |        | ✓     |
+| `dequantize_nvfp4`                     | ✓     | ✓    | ✓      |     |        | ✓     |
+| `scaled_mm_nvfp4`                      | ✓     | ✓    |        |     |        | ✓     |
+| `quantize_mxfp8`                       | ✓     | ✓    | ✓      |     |        | ✓     |
+| `dequantize_mxfp8`                     | ✓     |      |        |     |        | ✓     |
+| `scaled_mm_mxfp8`                      | ✓     |      |        |     |        | ✓     |
+| `adaln`                                | ✓     | ✓    | ✓      | ✓   |        | ✓     |
+| `rms_adaln`                            | ✓     | ✓    | ✓      | ✓   |        | ✓     |
+| `na3d`                                 | ✓     | ✓    | ✓      | ✓   |        | ✓     |
+| `na2d`                                 | ✓     | ✓    | ✓      | ✓   |        | ✓     |
+| `sol_attn`                             | ✓     | ✓    |        | ✓   |        | ✓     |
+| `int8_attention`                       |       | ✓    |        | ✓   |        |       |
+| `apply_rope`                           | ✓     | ✓    | ✓      | ✓   | ✓*     | ✓     |
+| `apply_rope1`                          | ✓     | ✓    | ✓      | ✓   | ✓*     | ✓     |
+| `apply_rope_split_half`                | ✓     | ✓    | ✓      | ✓   | ✓*     | ✓     |
+| `apply_rope_split_half1`               | ✓     | ✓    | ✓      | ✓   | ✓*     | ✓     |
+| `rms_rope`                             | ✓     | ✓    | ✓      | ✓   | ✓*     | ✓     |
+| `rms_rope1`                            | ✓     | ✓    | ✓      | ✓   | ✓*     | ✓     |
+| `rms_rope_split_half`                  | ✓     | ✓    | ✓      | ✓   | ✓*     | ✓     |
+| `rms_rope_split_half1`                 | ✓     | ✓    | ✓      | ✓   | ✓*     | ✓     |
+| `quantize_int8_rowwise`                | ✓     | ✓    | ✓      | ✓   | ✓      | ✓     |
+| `quantize_int8_tensorwise`             | ✓     | ✓    |        | ✓   | ✓      | ✓     |
+| `quantize_and_rotate_rowwise`          | ✓     | ✓    | ✓      | ✓   | ✓*     | ✓     |
+| `quantize_int8_convrot_weight`         | ✓     | ✓    |        | ✓   |        | ✓     |
+| `dequantize_int8_simple`               | ✓     | ✓    |        | ✓   | ✓      | ✓     |
+| `dequantize_int8_simple_dtype`         | ✓     | ✓    |        | ✓   | ✓      | ✓     |
+| `dequantize_int8_convrot_weight_dtype` | ✓     | ✓    |        | ✓   |        | ✓     |
+| `int8_linear`                          | ✓     | ✓    | ✓      | ✓   | ✓*     | ✓     |
+| `gemv_awq_w4a16`                       | ✓     | ✓    |        | ✓   |        | ✓     |
+| `quantize_svdquant_w4a4`               | ✓     | ✓    |        | ✓   |        | ✓     |
+| `scaled_mm_svdquant_w4a4`              | ✓     | ✓    |        | ✓   |        | ✓     |
+| `convrot_w4a4_linear`                  | ✓     | ✓    |        | ✓   | ✓*     | ✓     |
+| `quantize_convrot_w4a4_weight`         | ✓     | ✓    |        | ✓   |        | ✓     |
+| `dequantize_convrot_w4a4_weight`       | ✓     | ✓    |        | ✓   |        | ✓     |
+| `delaunay3d`                           |       | ✓    |        | ✓   |        |       |
+| `mesh_bvh`                             |       | ✓    |        | ✓   |        |       |
+| `closest_point_on_mesh`                |       | ✓    |        | ✓   |        |       |
+| `closest_hit_on_mesh`                  |       | ✓    |        | ✓   |        |       |
+| `connected_components`                 |       | ✓    |        | ✓   |        |       |
+| `edge_collapse_checks`                 |       | ✓    |        | ✓   |        |       |
+| `min_cut`                              |       | ✓    |        | ✓   |        |       |
 
 Each of the eight rope entries also has an in-place form (`apply_rope_`,
 `rms_rope_split_half1_`, ...) with the same backend coverage as the row above.
@@ -62,6 +62,11 @@ Ascend support for `quantize_and_rotate_rowwise` requires
 `convrot_w4a4_linear` requires only `torch_npu.npu_quant_matmul`.
 These capabilities are registered only when the
 corresponding operator is available.
+
+Metal via MPS: fused RMS-RoPE (BHND + BNHD), AdaLN/RMS-AdaLN, INT8/FP8 quant,
+W8A8 `int8_linear` (`_int_mm`), TensorOps MXFP8 `matmul2d` with E8M0 scale planes,
+fused NVFP4 / SVDQuant W4A4 / AWQ GEMV Metal kernels, RoPE, `fp16_linear`, batched
+MPS SDPA for `na3d`/`window_attention`. Deterministic INT8 quant only.
 
 ## Huawei Ascend backend
 
@@ -132,12 +137,12 @@ HBM just to read it straight back.
 
 What a GPU gets depends on whether it has matrix cores:
 
-| Generation | gfx targets                 | Matrix cores | What runs                               |
-|------------|-----------------------------|--------------|-----------------------------------------|
-| RDNA4      | `gfx1200`, `gfx1201`        | WMMA + fp8   | All HIP-supported kernels, fp8 native   |
-| RDNA3.5    | `gfx1150`-`gfx1153`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
-| RDNA3      | `gfx1100`-`gfx1103`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
-| RDNA2      | `gfx1030`-`gfx1036`         | none         | Non-WMMA kernels incl. AWQ GEMV; WMMA GEMMs decline |
+| Generation | gfx targets          | Matrix cores | What runs                                           |
+|------------|----------------------|--------------|-----------------------------------------------------|
+| RDNA4      | `gfx1200`, `gfx1201` | WMMA + fp8   | All HIP-supported kernels, fp8 native               |
+| RDNA3.5    | `gfx1150`-`gfx1153`  | WMMA, no fp8 | All HIP-supported kernels; fp8 widened              |
+| RDNA3      | `gfx1100`-`gfx1103`  | WMMA, no fp8 | All HIP-supported kernels; fp8 widened              |
+| RDNA2      | `gfx1030`-`gfx1036`  | none         | Non-WMMA kernels incl. AWQ GEMV; WMMA GEMMs decline |
 
 fp8, int8 and int4 share one byte-addressed tile kernel (`gemm_wmma.h`). RDNA3
 and RDNA4 spread a WMMA operand across the wave differently and RDNA3 has no fp8
@@ -221,11 +226,11 @@ extension matching PyTorch's CUDA or ROCm runtime is loaded.
 
 The library provides `QuantizedTensor`, a `torch.Tensor` subclass that transparently intercepts PyTorch operations and dispatches them to optimized quantized kernels when available.
 
-| Layout                 | Format       | HW Requirement  | Description                             |
-|------------------------|--------------|-----------------|----------------------------------------|
-| `TensorCoreFP8Layout`  | FP8 E4M3     | SM ≥ 8.9 (Ada)  | Per-tensor scaling, 1:1 element mapping |
-| `TensorCoreNVFP4Layout`| NVFP4 E2M1   | SM ≥ 10.0 (Blackwell) | Block quantization with 16-element blocks |
-| `TensorCoreMXFP8Layout`| MXFP8 E4M3   | SM ≥ 10.0 (Blackwell) | Block quantization with 32-element blocks, E8M0 scales |
+| Layout                  | Format     | HW Requirement        | Description                                            |
+|-------------------------|------------|-----------------------|--------------------------------------------------------|
+| `TensorCoreFP8Layout`   | FP8 E4M3   | SM ≥ 8.9 (Ada)        | Per-tensor scaling, 1:1 element mapping                |
+| `TensorCoreNVFP4Layout` | NVFP4 E2M1 | SM ≥ 10.0 (Blackwell) | Block quantization with 16-element blocks              |
+| `TensorCoreMXFP8Layout` | MXFP8 E4M3 | SM ≥ 10.0 (Blackwell) | Block quantization with 32-element blocks, E8M0 scales |
 
 ```python
 from comfy_kitchen.tensor import QuantizedTensor, TensorCoreFP8Layout, TensorCoreNVFP4Layout
@@ -278,15 +283,15 @@ pip install -e . --no-build-isolation -v
 
 These options require using `setup.py` directly (not `pip install`):
 
-| Option | Command | Description | Default                                                                     |
-|--------|---------|-------------|-----------------------------------------------------------------------------|
-| `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Disable CUDA; without `--hip`, build a CPU-only wheel | Enabled (build with CUDA)                                                   |
-| `--hip` | `python setup.py bdist_wheel --hip` | Add HIP explicitly (including to a CUDA build) | Auto only when CUDA is unavailable                                          |
-| `--no-hip` | `python setup.py bdist_wheel --no-hip` | Disable HIP | Disabled                                                                    |
-| `--hip-archs=...` | `python setup.py build_ext --hip-archs="gfx1200;gfx1201"` | HIP architectures to build for | Visible supported AMD GPUs, otherwise all supported targets                 |
-| `--cuda-archs=...` | `python setup.py build_ext --cuda-archs="80;89"` | CUDA architectures to build for | `75-virtual;80;89;90a;100f;120f` (Linux), `75-virtual;80;89;120f` (Windows) |
-| `--debug-build` | `python setup.py build_ext --debug-build` | Build in debug mode with symbols | Disabled (Release)                                                          |
-| `--lineinfo` | `python setup.py build_ext --lineinfo` | Enable NVCC line info for profiling | Disabled                                                                    |
+| Option             | Command                                                   | Description                                           | Default                                                                     |
+|--------------------|-----------------------------------------------------------|-------------------------------------------------------|-----------------------------------------------------------------------------|
+| `--no-cuda`        | `python setup.py bdist_wheel --no-cuda`                   | Disable CUDA; without `--hip`, build a CPU-only wheel | Enabled (build with CUDA)                                                   |
+| `--hip`            | `python setup.py bdist_wheel --hip`                       | Add HIP explicitly (including to a CUDA build)        | Auto only when CUDA is unavailable                                          |
+| `--no-hip`         | `python setup.py bdist_wheel --no-hip`                    | Disable HIP                                           | Disabled                                                                    |
+| `--hip-archs=...`  | `python setup.py build_ext --hip-archs="gfx1200;gfx1201"` | HIP architectures to build for                        | Visible supported AMD GPUs, otherwise all supported targets                 |
+| `--cuda-archs=...` | `python setup.py build_ext --cuda-archs="80;89"`          | CUDA architectures to build for                       | `75-virtual;80;89;90a;100f;120f` (Linux), `75-virtual;80;89;120f` (Windows) |
+| `--debug-build`    | `python setup.py build_ext --debug-build`                 | Build in debug mode with symbols                      | Disabled (Release)                                                          |
+| `--lineinfo`       | `python setup.py build_ext --lineinfo`                    | Enable NVCC line info for profiling                   | Disabled                                                                    |
 
 ```bash
 # Build CPU-only wheel (pure Python, no CUDA required)
@@ -339,11 +344,13 @@ The library supports multiple backends:
 - **eager**: Pure PyTorch implementation
 - **cuda**: Custom CUDA C kernels (CUDA only)
 - **hip**: Custom HIP kernels (WMMA GEMMs on RDNA3/3.5/4; non-WMMA kernels also on RDNA2)
+- **metal**: Apple Metal via MPS — W8A8 (`_int_mm`), TensorOps MXFP8 `matmul2d`, fused NVFP4 / SVDQuant W4A4 / AWQ GEMV, ConvRot/FP8/RoPE/AdaLN/RMS kernels, `fp16_linear`, batched MPS SDPA for `na3d`/`window_attention`
 - **triton**: Triton JIT-compiled kernels
+- **ascend**: Huawei Ascend NPU via torch-npu (optional)
 
 ### Automatic Backend Selection
 
-When you call a function, the registry selects the best backend by checking **constraints** in priority order (`hip` → `cuda` → `triton` → `eager`):
+When you call a function, the registry selects the best backend by checking **constraints** in priority order (`hip` → `cuda` → `metal` → `triton` → `eager`, with `ascend` preferred on NPU):
 
 ```python
 # Backend is selected automatically based on input constraints
@@ -357,11 +364,11 @@ result = ck.quantize_per_tensor_fp8(x, scale)
 
 Each backend declares constraints for its functions:
 
-| Constraint | Description |
-|------------|-------------|
-| **Device** | Which device types are supported |
-| **Dtype** | Allowed input/output dtypes per parameter |
-| **Shape** | Shape requirements (e.g., 2D tensors, dimensions divisible by 16) |
+| Constraint             | Description                                                        |
+|------------------------|--------------------------------------------------------------------|
+| **Device**             | Which device types are supported                                   |
+| **Dtype**              | Allowed input/output dtypes per parameter                          |
+| **Shape**              | Shape requirements (e.g., 2D tensors, dimensions divisible by 16)  |
 | **Compute Capability** | Minimum GPU architecture (e.g., SM 8.0 for FP8, SM 10.0 for NVFP4) |
 
 The registry validates inputs against these constraints **before** calling the backend—no try/except fallback patterns. If no backend can handle the inputs, a `NoCapableBackendError` is raised with details.
