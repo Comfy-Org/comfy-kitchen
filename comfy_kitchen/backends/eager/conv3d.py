@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+import typing
 from torch import Tensor
 from torch.nn import functional
 
@@ -13,7 +14,7 @@ def fp16_conv3d(
     weight: Tensor,
     bias: Tensor | None,
     residual: Tensor | None,
-    stride: list[int],
+    stride: typing.List[int],
 ) -> Tensor:
     """3D conv with zero padding plus an optional residual add (torch's
     accumulate mode; the CUDA backend accumulates in fp16)."""
@@ -27,7 +28,7 @@ def fp16_conv3d_out(
     weight: Tensor,
     bias: Tensor | None,
     residual: Tensor | None,
-    stride: list[int],
+    stride: typing.List[int],
     out: Tensor,
 ) -> None:
     """fp16_conv3d written into ``out``, an NDHWC-ordered tensor or view of the output shape."""
@@ -40,7 +41,7 @@ def _op_fp16_conv3d_out(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     residual: torch.Tensor | None,
-    stride: list[int],
+    stride: typing.List[int],
     out: torch.Tensor,
 ) -> None:
     # copy_ would broadcast or cast into a mismatched buffer instead of failing
@@ -66,7 +67,7 @@ def _op_fp16_conv3d(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     residual: torch.Tensor | None,
-    stride: list[int],
+    stride: typing.List[int],
 ) -> torch.Tensor:
     kwargs = {"x": x, "weight": weight, "bias": bias, "residual": residual, "stride": stride}
     impl = registry.get_implementation("fp16_conv3d", kwargs=kwargs)

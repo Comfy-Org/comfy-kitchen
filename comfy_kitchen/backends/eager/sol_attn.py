@@ -10,6 +10,7 @@ densely, so memory is O(T^2).
 """
 
 import torch
+import typing
 
 from ...registry import registry
 
@@ -123,8 +124,8 @@ def sol_attn(
     v: torch.Tensor,
     tau: float = 1.0,
     scale: float | None = None,
-    sink_blocks: list[int] | None = None,
-    sink_q: list[int] | None = None,
+    sink_blocks: typing.List[int] | None = None,
+    sink_q: typing.List[int] | None = None,
     key_bias: torch.Tensor | None = None,
     topk_ratio: float = 0.0,
     tail: bool = True,
@@ -252,8 +253,8 @@ def _op_sol_attn(
     v: torch.Tensor,
     tau: float,
     scale: float | None,
-    sink_blocks: list[int],
-    sink_q: list[int],
+    sink_blocks: typing.List[int],
+    sink_q: typing.List[int],
     key_bias: torch.Tensor | None,
     topk_ratio: float,
     tail: bool,
