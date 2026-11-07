@@ -1,0 +1,148 @@
+{
+  "torch": "2.12.0+cu130",
+  "gpu": "NVIDIA GeForce RTX 5090 D v2",
+  "baseline_comfy": "8cfe5e1ecb97512dea8deaac15e1228d7e6feeb1",
+  "records": [
+    {
+      "arm": "stock",
+      "repeat": -1,
+      "warmup": true,
+      "dit_seconds": 22.730326566961594,
+      "sha256": [
+        "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+        "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+      ],
+      "counts": {
+        "qkv": 0
+      },
+      "peak_allocated_bytes": 1833455616
+    },
+    {
+      "arm": "qkv",
+      "repeat": -1,
+      "warmup": true,
+      "dit_seconds": 15.352294820011593,
+      "sha256": [
+        "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+        "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+      ],
+      "counts": {
+        "qkv": 400
+      },
+      "peak_allocated_bytes": 1833455616
+    },
+    {
+      "arm": "qkv",
+      "repeat": 0,
+      "warmup": false,
+      "dit_seconds": 15.365257302997634,
+      "sha256": [
+        "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+        "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+      ],
+      "counts": {
+        "qkv": 400
+      },
+      "peak_allocated_bytes": 1833455616
+    },
+    {
+      "arm": "stock",
+      "repeat": 0,
+      "warmup": false,
+      "dit_seconds": 15.739762726938352,
+      "sha256": [
+        "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+        "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+      ],
+      "counts": {
+        "qkv": 0
+      },
+      "peak_allocated_bytes": 1833455616
+    },
+    {
+      "arm": "stock",
+      "repeat": 1,
+      "warmup": false,
+      "dit_seconds": 15.742124533979222,
+      "sha256": [
+        "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+        "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+      ],
+      "counts": {
+        "qkv": 0
+      },
+      "peak_allocated_bytes": 1833455616
+    },
+    {
+      "arm": "qkv",
+      "repeat": 1,
+      "warmup": false,
+      "dit_seconds": 15.36642242805101,
+      "sha256": [
+        "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+        "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+      ],
+      "counts": {
+        "qkv": 400
+      },
+      "peak_allocated_bytes": 1833455616
+    },
+    {
+      "arm": "qkv",
+      "repeat": 2,
+      "warmup": false,
+      "dit_seconds": 15.36707140202634,
+      "sha256": [
+        "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+        "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+      ],
+      "counts": {
+        "qkv": 400
+      },
+      "peak_allocated_bytes": 1833455616
+    },
+    {
+      "arm": "stock",
+      "repeat": 2,
+      "warmup": false,
+      "dit_seconds": 15.996152703999542,
+      "sha256": [
+        "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+        "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+      ],
+      "counts": {
+        "qkv": 0
+      },
+      "peak_allocated_bytes": 1833455616
+    },
+    {
+      "arm": "stock",
+      "repeat": 3,
+      "warmup": false,
+      "dit_seconds": 15.737348320079036,
+      "sha256": [
+        "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+        "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+      ],
+      "counts": {
+        "qkv": 0
+      },
+      "peak_allocated_bytes": 1833455616
+    },
+    {
+      "arm": "qkv",
+      "repeat": 3,
+      "warmup": false,
+      "dit_seconds": 15.366076625999995,
+      "sha256": [
+        "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+        "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+      ],
+      "counts": {
+        "qkv": 400
+      },
+      "peak_allocated_bytes": 1833455616
+    }
+  ],
+  "status": "passed"
+}
