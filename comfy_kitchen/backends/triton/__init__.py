@@ -27,6 +27,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "pixel_norm_silu_pad3d",
 ]
 
 # Try to import triton and register if available
@@ -55,6 +56,7 @@ try:
 
     from .adaln import adaln, rms_adaln
     from .na import na3d
+    from .pixel_norm_silu_pad3d import pixel_norm_silu_pad3d
     from .quantization import (
         dequantize_nvfp4,
         dequantize_per_tensor_fp8,
@@ -125,6 +127,26 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _pixel_norm_silu_pad3d_call_rule(kwargs):
+        # No size threshold: on the 57 LTX-2.3 / LTXV 0.9 decode shapes measured (bf16, C 128 to
+        # 1024, T 8 to 39, with and without a temporal cache, zeros and reflect) the kernel was
+        # faster than ComfyUI's current path at every shape on an RTX 5090 and on a Radeon 8060S
+        # (per-call numbers in the PR that added this op).
+        x, prefix = kwargs.get("x"), kwargs.get("prefix")
+        if x is None:
+            return ValidationResult.ok()
+        if x.numel() == 0:
+            return ValidationResult.fail(
+                "x", "empty tensors are not supported by triton pixel_norm_silu_pad3d"
+            )
+        if prefix is not None and prefix.dtype != x.dtype:
+            return ValidationResult.fail("prefix", "prefix must have x's dtype")
+        t_pre = 0 if prefix is None else prefix.shape[2]
+        out_frames = t_pre + kwargs.get("n_front", 1) + x.shape[2] + kwargs.get("n_back", 0)
+        if out_frames > 65535 or x.shape[0] > 65535:
+            return ValidationResult.fail("x", "output frames and batch must be <= 65535 (grid)")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -326,6 +348,16 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
+    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both
+    half_floats = frozenset({torch.float16, torch.bfloat16})
+    out["pixel_norm_silu_pad3d"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(5),)),
+            "prefix": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(5),)),
+        },
+        default_devices=cuda_devices,
+        call_rules=(_pixel_norm_silu_pad3d_call_rule,),
+    )
     out["na3d"] = FunctionConstraints(
         params={
             "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
