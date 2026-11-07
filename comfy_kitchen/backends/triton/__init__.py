@@ -27,6 +27,24 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "lora_bypass",
+    "lora_bypass_backward",
+    "lora_merge",
+    "lora_merge_backward",
+    "loha_bypass",
+    "loha_bypass_backward",
+    "loha_merge",
+    "loha_merge_backward",
+    "lokr_bypass",
+    "lokr_bypass_backward",
+    "lokr_merge",
+    "lokr_merge_backward",
+    "oft_apply",
+    "oft_apply_backward",
+    "weight_decompose",
+    "weight_decompose_backward",
+    "channel_scale",
+    "channel_scale_backward",
 ]
 
 # Try to import triton and register if available
@@ -54,6 +72,27 @@ try:
     )
 
     from .adaln import adaln, rms_adaln
+    from .adapters import (
+        adapter_constraints,
+        channel_scale,
+        channel_scale_backward,
+        loha_bypass,
+        loha_bypass_backward,
+        loha_merge,
+        loha_merge_backward,
+        lokr_bypass,
+        lokr_bypass_backward,
+        lokr_merge,
+        lokr_merge_backward,
+        lora_bypass,
+        lora_bypass_backward,
+        lora_merge,
+        lora_merge_backward,
+        oft_apply,
+        oft_apply_backward,
+        weight_decompose,
+        weight_decompose_backward,
+    )
     from .na import na3d
     from .quantization import (
         dequantize_nvfp4,
@@ -337,6 +376,7 @@ def _build_constraints() -> dict:
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
     )
+    out.update(adapter_constraints())
     return out
 
 
