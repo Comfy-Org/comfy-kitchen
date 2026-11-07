@@ -62,7 +62,7 @@ void launch_sol_exact(const void*, const void*, const void*, const void*, const 
                       int, int, int, int, int, int, float, int, cudaStream_t);
 void launch_sol_token(const void*, const void*, const void*, void*, void*, void*, void*,
                       const void*, const void*, const void*, void*, void*,
-                      void*, void*, void*, void*, void*, void*, void*, void*, void*,
+                      void*, void*, void*, void*, void*, void*, void*, void*, void*, void*,
                       int, int, int, int, int, int, int, int, int, int, float, cudaStream_t);
 int sol_token_splits(int, int, int);
 
@@ -77,7 +77,7 @@ inline size_t align16(size_t n) { return (n + 15u) & ~(size_t)15u; }
 struct Plan {
     int Tp, NTB, NPAD, NQ;
     size_t qiP, qs, kiP, ksb, vTi, vsc, kciP, kcs, vcT, thr, cen8, cens;
-    size_t idx, cnt, oPart, mPart, lPart, statsV, qmean, vRow, tokIdx, tokCnt, tokRef, tokHist, tokBits;
+    size_t idx, cnt, oPart, mPart, lPart, statsV, qmean, vRow, tokIdx, tokCnt, tokOverflow, tokRef, tokHist, tokBits;
     size_t tokTiles, tokTileCnt, gCen8, gCens, gRef, gBits;
     size_t tokPartO, tokPartM, tokPartL, scratch, total;
 
@@ -121,6 +121,7 @@ struct Plan {
         gBits   = take(on * bh * NG * W * sizeof(uint32_t));
         tokIdx  = take(on * bh * NG * n_tok * sizeof(uint32_t));
         tokCnt  = take(on * bh * NG * sizeof(int32_t));
+        tokOverflow = take(on * bh * NG * sizeof(uint32_t));
         tokHist = take(on * bh * NG * sol::TOK_HIST_BINS * sizeof(uint32_t));
         const size_t groups = (size_t)((NG + BLK - 1) / BLK) * bh;   // CTAs of 64 rows
         tokTiles = take(on * groups * NTB * sizeof(uint16_t));
@@ -169,7 +170,7 @@ void run_route_exact(const Plan& p, char* w, const void* ext_threshold, void* ou
         launch_sol_token(w + p.qmean, w + p.tokRef, w + p.tokBits,
                          w + p.gCen8, w + p.gCens, w + p.gRef, w + p.gBits,
                          w + p.kiP, w + p.ksb, w + p.vTi, w + p.tokTiles, w + p.tokTileCnt,
-                         w + p.tokHist, w + p.tokIdx, w + p.tokCnt,
+                         w + p.tokHist, w + p.tokIdx, w + p.tokCnt, w + p.tokOverflow,
                          w + p.tokPartO, w + p.tokPartM, w + p.tokPartL,
                          w + p.oPart, w + p.mPart, w + p.lPart,
                          batch, p.Tp, num_heads, p.NQ, p.NPAD, p.NTB, n_tok, tail,
@@ -192,7 +193,7 @@ extern "C" const char* const sol_attn_plan_names[] = {
     "Tp", "NTB", "NPAD", "NQ",
     "qiP", "qs", "kiP", "ksb", "vTi", "vsc", "kciP", "kcs", "vcT", "thr", "cen8", "cens",
     "idx", "cnt", "oPart", "mPart", "lPart", "statsV", "qmean",
-    "vRow", "tokIdx", "tokCnt", "tokRef", "tokHist", "tokBits", "tokTiles", "tokTileCnt",
+    "vRow", "tokIdx", "tokCnt", "tokOverflow", "tokRef", "tokHist", "tokBits", "tokTiles", "tokTileCnt",
     "gCen8", "gCens", "gRef", "gBits", "tokPartO", "tokPartM", "tokPartL",
     "scratch", "total", nullptr,
 };
@@ -207,7 +208,7 @@ extern "C" int sol_attn_plan(int batch, int seq_len, int num_heads, int n_tok, i
         (int64_t)p.vsc, (int64_t)p.kciP, (int64_t)p.kcs, (int64_t)p.vcT, (int64_t)p.thr,
         (int64_t)p.cen8, (int64_t)p.cens, (int64_t)p.idx, (int64_t)p.cnt, (int64_t)p.oPart,
         (int64_t)p.mPart, (int64_t)p.lPart, (int64_t)p.statsV, (int64_t)p.qmean,
-        (int64_t)p.vRow, (int64_t)p.tokIdx, (int64_t)p.tokCnt, (int64_t)p.tokRef, (int64_t)p.tokHist,
+        (int64_t)p.vRow, (int64_t)p.tokIdx, (int64_t)p.tokCnt, (int64_t)p.tokOverflow, (int64_t)p.tokRef, (int64_t)p.tokHist,
         (int64_t)p.tokBits, (int64_t)p.tokTiles, (int64_t)p.tokTileCnt,
         (int64_t)p.gCen8, (int64_t)p.gCens, (int64_t)p.gRef, (int64_t)p.gBits,
         (int64_t)p.tokPartO, (int64_t)p.tokPartM, (int64_t)p.tokPartL,
