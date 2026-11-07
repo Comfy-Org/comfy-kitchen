@@ -33,6 +33,11 @@ def _nrmse(actual, expected):
     return (error / magnitude).item()
 
 
+def _free_vram_gb():
+    free, _total = torch.cuda.mem_get_info()
+    return free / (1024 ** 3)
+
+
 def test_int8_attention_availability_is_bool():
     assert isinstance(ck.int8_attention_is_available(), bool)
 
@@ -1167,3 +1172,48 @@ def test_int8_decode_graph_growing_prefix_and_rollback(seq, circular):
         assert _nrmse(out, expected) < 0.025
         torch.testing.assert_close(lse, scores.logsumexp(-1), rtol=0, atol=0.04)
         previous = n
+
+
+@requires_int8_attention
+@pytest.mark.slow
+@pytest.mark.parametrize("kv_length", [299520, 299521, 314437])
+def test_int8_attention_long_key_sequences(kv_length):
+    if _free_vram_gb() < 18:
+        pytest.skip("needs ~18 GB free VRAM")
+    q, k, v = _qkv(1, 56, 56, 512, kv_length, 128)
+    actual = ck.int8_attention(q, k, v)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    assert actual.shape == expected.shape
+    assert torch.isfinite(actual).all()
+    assert _nrmse(actual, expected) < 0.03
+
+
+@requires_int8_attention
+@pytest.mark.slow
+def test_int8_attention_long_key_sequences_multi_batch():
+    if _free_vram_gb() < 12:
+        pytest.skip("needs ~12 GB free VRAM")
+    q, k, v = _qkv(2, 16, 16, 512, 300000, 128)
+    actual = ck.int8_attention(q, k, v)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    assert actual.shape == expected.shape
+    assert torch.isfinite(actual).all()
+    assert _nrmse(actual, expected) < 0.03
+
+
+@requires_int8_attention
+@pytest.mark.slow
+def test_int8_attention_wide_head_base_offsets():
+    # 63 * 540000 * 128 = 4,354,560,000 exceeds uint32, so the launcher takes
+    # its 64-bit Offset variant for the head base pointers.
+    if _free_vram_gb() < 30:
+        pytest.skip("needs ~30 GB free VRAM")
+    q, k, v = _qkv(1, 64, 64, 512, 540000, 128)
+    actual = ck.int8_attention(q, k, v)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    assert actual.shape == expected.shape
+    assert torch.isfinite(actual).all()
+    assert _nrmse(actual, expected) < 0.03
