@@ -233,6 +233,224 @@ __global__ __launch_bounds__(kThreads) void sol_exact_kernel(
     }
 }
 
+
+// Pair adjacent 64Q query blocks in one 256-thread CTA.
+// The two exact route lists are ascending, so a two-pointer union preserves each
+// query block's original key-block order.  When both lists contain the same key
+// block, K / V^T / KSB are staged once and both 128-thread cohorts consume it.
+constexpr int kPairThreads = kThreads * 2;
+
+template <typename TOut>
+__global__ void sol_exact_pair128_kernel(
+    const int8_t* __restrict__ qi, const float* __restrict__ qs, const int8_t* __restrict__ ki,
+    const float2* __restrict__ ksb, const int8_t* __restrict__ vT, const float* __restrict__ vsc,
+    const uint16_t* __restrict__ blk_idx, const int32_t* __restrict__ blk_cnt,
+    const __bf16* __restrict__ o_part, const float* __restrict__ m_part,
+    const float* __restrict__ l_part, TOut* __restrict__ out,
+    int T, int Tp, int H, int NQ, int NTB, float scale_log2) {
+    __shared__ __attribute__((aligned(16))) int8_t sK[BK * kStrideK];
+    __shared__ __attribute__((aligned(16))) int8_t sVt[HD * kStrideV];
+    __shared__ float2 sKsb[BK];
+
+    // Merge state is shared so it does not extend every lane's already-large
+    // register live range.  thread 0 advances the two sorted exact lists.
+    __shared__ int sIa, sIb, sNA, sNB;
+    __shared__ int sNext, sUseMask, sDone;
+
+    const int tid = threadIdx.x;
+    const int cohort = tid / kThreads;          // 0 or 1
+    const int ltid = tid - cohort * kThreads;   // 0..127
+    const int wave = ltid >> 5, lane = ltid & 31;
+    const int r = frag_row(lane);
+
+    const int pair_block = blockIdx.x;
+    const int q_block_raw = pair_block * 2 + cohort;
+    const bool q_block_live = q_block_raw < NQ;
+    const int q_block = q_block_live ? q_block_raw : (NQ - 1);
+
+    const int bh = blockIdx.y;
+    const int batch = bh / H, head = bh % H;
+    const int64_t bh_base =
+        static_cast<int64_t>(batch) * T * H * HD + static_cast<int64_t>(head) * HD;
+    const int64_t bh_s = static_cast<int64_t>(batch) * T * H + head;
+    const int64_t vT_base = static_cast<int64_t>(bh) * HD * Tp;
+    const int64_t vsc_base = static_cast<int64_t>(bh) * HD;
+    const int64_t kp_base = static_cast<int64_t>(bh) * Tp;
+    const int64_t kd_base = static_cast<int64_t>(bh) * Tp * HD;
+
+    const int q_row = q_block * BQ + wave * 16 + r;
+    const int q_clamped = imin(q_row, T - 1);
+
+    typename MmaInt8::Frag q_frag[DT];
+    {
+        const int8_t* qrow = qi + bh_base + static_cast<int64_t>(q_clamped) * H * HD;
+#pragma unroll
+        for (int dt = 0; dt < DT; ++dt)
+            q_frag[dt] = MmaInt8::load_aligned(qrow, 0, dt * 16, 0, lane);
+    }
+    const float qsc = qs[bh_s + static_cast<int64_t>(q_clamped) * H] * scale_log2;
+
+    const size_t qb_s = static_cast<size_t>(bh) * NQ + q_block;
+
+    float o_acc[NT][8];
+    {
+        const __bf16* orow = o_part + qb_s * HD;
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+            load_o_tile<__bf16>(orow, nt * 16, o_acc[nt], lane);
+    }
+    float m_r = m_part[qb_s], l_r = l_part[qb_s], c_r = m_r;
+
+    auto compute_tile = [&]() {
+        typename MmaInt8::Acc s_acc[KT];
+#pragma unroll
+        for (int kt = 0; kt < KT; ++kt) {
+            s_acc[kt] = MmaInt8::zero();
+#pragma unroll
+            for (int dt = 0; dt < DT; ++dt) {
+                s_acc[kt] = MmaInt8::mma(
+                    MmaInt8::load_aligned(sK, kt * 16 + r, dt * 16, kStrideK, lane),
+                    q_frag[dt], s_acc[kt]);
+            }
+        }
+
+        float p_val[KT][8];
+        float bmax = m_r - 20.f;
+#pragma unroll
+        for (int kt = 0; kt < KT; ++kt) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const float2 kb2 = sKsb[kt * 16 + acc_row(lane, e)];
+                const float sv =
+                    fmaf(static_cast<float>(s_acc[kt][e]), qsc * kb2.x, kb2.y);
+                p_val[kt][e] = sv;
+                bmax = fmaxf(bmax, sv);
+            }
+        }
+        bmax = fmaxf(bmax, swap_half_wave(bmax));
+        const float alpha = exp2f(c_r - bmax);
+        c_r = bmax;
+        m_r = fmaxf(m_r, bmax);
+
+        const float m_off = bmax - kProbU8Offset;
+        typename MmaInt8::Frag p_frag[KT];
+        uint32_t li = 0u;
+#pragma unroll
+        for (int kt = 0; kt < KT; ++kt) {
+            uint32_t packed[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                packed[e] = prob_to_u8(exp2f(p_val[kt][e] - m_off));
+                li += packed[e];
+            }
+            p_frag[kt] = pack_prob_frag(packed, lane);
+        }
+        li += swap_half_wave_b32(li);
+        l_r = fmaf(l_r, alpha, static_cast<float>(li));
+
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            typename MmaInt8::Acc partial = MmaInt8::zero();
+#pragma unroll
+            for (int kt = 0; kt < KT; ++kt) {
+                partial = MmaInt8::mma_ub(
+                    MmaInt8::load_aligned(sVt, nt * 16 + r, kt * 16, kStrideV, lane),
+                    p_frag[kt], partial);
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                o_acc[nt][e] =
+                    fmaf(o_acc[nt][e], alpha, static_cast<float>(partial[e]));
+            }
+        }
+    };
+
+    const int q0 = pair_block * 2;
+    const int q1 = q0 + 1;
+    const size_t row0 = static_cast<size_t>(bh) * NQ + q0;
+    const size_t row1 = static_cast<size_t>(bh) * NQ + (q1 < NQ ? q1 : q0);
+
+    if (tid == 0) {
+        sIa = 0;
+        sIb = 0;
+        sNA = blk_cnt[row0];
+        sNB = q1 < NQ ? blk_cnt[row1] : 0;
+
+        const int sentinel = NTB + 1;
+        const int a = sNA > 0 ? static_cast<int>(blk_idx[row0 * NTB]) : sentinel;
+        const int b = sNB > 0 ? static_cast<int>(blk_idx[row1 * NTB]) : sentinel;
+        const int next = imin(a, b);
+
+        sDone = next == sentinel;
+        sNext = next;
+        sUseMask = (a == next ? 1 : 0) | (b == next ? 2 : 0);
+    }
+    __syncthreads();
+
+    while (!sDone) {
+        const int kblock = sNext;
+        const int use_mask = sUseMask;
+        const int64_t k0 = static_cast<int64_t>(kblock) * BK;
+
+        // All 256 threads cooperate on one K/V/KSB stage.
+        for (int idx = tid; idx < BK * (HD / 8); idx += kPairThreads) {
+            const int p = idx / (HD / 8), c8 = (idx % (HD / 8)) * 8;
+            *reinterpret_cast<uint2*>(sK + p * kStrideK + c8) =
+                *reinterpret_cast<const uint2*>(ki + kd_base + (k0 + p) * HD + c8);
+        }
+        for (int idx = tid; idx < HD * (BK / 8); idx += kPairThreads) {
+            const int c = idx / (BK / 8), part = (idx % (BK / 8)) * 8;
+            *reinterpret_cast<uint2*>(sVt + c * kStrideV + part) =
+                *reinterpret_cast<const uint2*>(
+                    vT + vT_base + static_cast<int64_t>(c) * Tp + k0 + part);
+        }
+        for (int idx = tid; idx < BK; idx += kPairThreads)
+            sKsb[idx] = ksb[kp_base + k0 + idx];
+
+        __syncthreads();
+
+        const bool consume =
+            q_block_live && ((cohort == 0 && (use_mask & 1)) ||
+                             (cohort == 1 && (use_mask & 2)));
+        if (consume) compute_tile();
+
+        // thread 0 can compute the next list item after its own compute.  The
+        // barrier below both waits for the other cohort and publishes metadata
+        // before any thread overwrites the shared K/V tile.
+        if (tid == 0) {
+            if (use_mask & 1) ++sIa;
+            if (use_mask & 2) ++sIb;
+
+            const int sentinel = NTB + 1;
+            const int a =
+                sIa < sNA ? static_cast<int>(blk_idx[row0 * NTB + sIa]) : sentinel;
+            const int b =
+                sIb < sNB ? static_cast<int>(blk_idx[row1 * NTB + sIb]) : sentinel;
+            const int next = imin(a, b);
+
+            sDone = next == sentinel;
+            sNext = next;
+            sUseMask = (a == next ? 1 : 0) | (b == next ? 2 : 0);
+        }
+        __syncthreads();
+    }
+
+    if (!q_block_live || q_row >= T) return;
+
+    const float inv = 1.f / fmaxf(l_r, 1e-30f);
+    TOut* orow = out + bh_base + static_cast<int64_t>(q_row) * H * HD;
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+        float vals[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            vals[e] =
+                o_acc[nt][e] * inv * vsc[vsc_base + nt * 16 + acc_row(lane, e)];
+        }
+        store_o_tile<TOut>(orow, nt * 16, vals, lane);
+    }
+}
+
 }  // namespace
 }  // namespace comfy::hip_backend::sol
 
@@ -244,6 +462,26 @@ void launch_sol_exact(const void* qi, const void* qs, const void* ki, const void
                       const void* vRow, const void* tok_idx, const void* tok_cnt, int n_tok,
                       void* out, int B, int T, int Tp, int H, int NQ, int NTB, float scale_log2,
                       int elem, hipStream_t stream) {
+    if (n_tok == 0) {
+        dim3 grid((NQ + 1) / 2, B * H);
+#define SOLX_PAIR_LAUNCH(TOut)                                                              \
+        sol_exact_pair128_kernel<TOut><<<grid, kPairThreads, 0, stream>>>(                  \
+            static_cast<const int8_t*>(qi), static_cast<const float*>(qs),                  \
+            static_cast<const int8_t*>(ki), static_cast<const float2*>(ksb),                \
+            static_cast<const int8_t*>(vT), static_cast<const float*>(vsc),                 \
+            static_cast<const uint16_t*>(blk_idx), static_cast<const int32_t*>(blk_cnt),    \
+            static_cast<const __bf16*>(o_part), static_cast<const float*>(m_part),          \
+            static_cast<const float*>(l_part), static_cast<TOut*>(out),                    \
+            T, Tp, H, NQ, NTB, scale_log2)
+        if (elem == kSolFp16) {
+            SOLX_PAIR_LAUNCH(_Float16);
+        } else {
+            SOLX_PAIR_LAUNCH(__bf16);
+        }
+#undef SOLX_PAIR_LAUNCH
+        return;
+    }
+
     dim3 grid(NQ, B * H);
 #define SOLX_LAUNCH(TOut)                                                                    \
     sol_exact_kernel<TOut><<<grid, kThreads, 0, stream>>>(                                   \
