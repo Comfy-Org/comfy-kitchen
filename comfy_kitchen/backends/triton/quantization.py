@@ -202,9 +202,6 @@ def quantize_nvfp4_kernel_tl(
     m,
     n,
     num_blocks,
-    scale_rows,
-    scale_cols,
-    padded_scale_rows,
     padded_scale_cols,
     block_size: tl.constexpr,
     blocks_per_program: tl.constexpr,
@@ -218,117 +215,112 @@ def quantize_nvfp4_kernel_tl(
     3. Applies to_blocked swizzle pattern to scales
 
     Optimized with:
-    - Vectorized processing of multiple blocks per thread
-    - Efficient packing using interleave operations
+    - Parallel processing of multiple blocks per program
+    - Efficient packing using reshape and split operations
     - Coalesced memory accesses
 
     Args:
         x_ptr: Input tensor pointer (m x n)
         packed_output_ptr: Output packed FP4 data (m x n//2)
-        swizzled_scales_ptr: Output swizzled FP8 block scales (padded_scale_rows x padded_scale_cols)
+        swizzled_scales_ptr: Output swizzled FP8 block scales (rows padded to 128)
         per_tensor_scale_ptr: Pointer to global scaling factor tensor
         m: Number of rows in input
         n: Number of columns in input (must be divisible by block_size)
         num_blocks: Number of blocks per row (n // block_size)
-        scale_rows: Unpadded scale rows (m)
-        scale_cols: Unpadded scale cols (num_blocks)
-        padded_scale_rows: Padded scale rows for swizzle
         padded_scale_cols: Padded scale cols for swizzle
         block_size: Size of each quantization block (typically 16)
-        blocks_per_program: Number of blocks to process per program
+        blocks_per_program: Number of blocks to process in parallel per program
+        hi_first: Pack the first value of each pair into the high nibble
     """
-    # Get program IDs - each program processes blocks_per_program blocks
-    pid_m = tl.program_id(axis=0)
-    pid_n_base = tl.program_id(axis=1) * blocks_per_program
+    # Get block offsets - each program processes blocks_per_program blocks in parallel
+    offs_blocks = tl.program_id(axis=0) * blocks_per_program + tl.arange(0, blocks_per_program)
+    block_mask = offs_blocks < m * num_blocks
+    # Convert flattened block offsets to row and block column indices
+    offs_m = offs_blocks // num_blocks
+    offs_block_n = offs_blocks % num_blocks
 
     # Load per-tensor scale value from device tensor
     per_tensor_scale = tl.load(per_tensor_scale_ptr)
 
-    # Process multiple blocks per program
-    for block_offset in range(blocks_per_program):
-        pid_n = pid_n_base + block_offset
+    # Calculate input offsets for the tile
+    offs_n = offs_block_n[:, None] * block_size + tl.arange(0, block_size)[None, :]
+    mask = block_mask[:, None] & (offs_n < n)
+    x_offs = offs_m[:, None] * n + offs_n
 
-        # Skip if beyond num_blocks
-        if pid_n < num_blocks:
-            # Calculate offsets for the input data block
-            offs_n = pid_n * block_size + tl.arange(0, block_size)
-            mask = offs_n < n
-            x_offs = pid_m * n + offs_n
+    # Load input data
+    x = tl.load(x_ptr + x_offs, mask=mask, other=0.0).to(tl.float32)
 
-            # Load input data block
-            x = tl.load(x_ptr + x_offs, mask=mask, other=0.0).to(tl.float32)
+    # Compute block-wise absolute maximum
+    x_abs = tl.abs(x)
+    max_abs = tl.max(x_abs, axis=1)
 
-            # Compute block-wise absolute maximum
-            x_abs = tl.abs(x)
-            max_abs = tl.max(x_abs, axis=0)
+    # Calculate block scale: block_scale = max_abs / F4_E2M1_MAX (6.0)
+    block_scale = max_abs / 6.0
 
-            # Calculate block scale: block_scale = max_abs / F4_E2M1_MAX (6.0)
-            block_scale = max_abs / 6.0
+    # Scale block scale to FP8
+    scaled_block_scale = block_scale / per_tensor_scale
+    scaled_block_scale = tl.minimum(scaled_block_scale, 448.0)
 
-            # Scale block scale to FP8
-            scaled_block_scale = block_scale / per_tensor_scale
-            scaled_block_scale = tl.minimum(scaled_block_scale, 448.0)
+    # Round to FP8 precision
+    scaled_block_scale_fp8 = scaled_block_scale.to(tl.float8e4nv)
 
-            # Round to FP8 precision
-            scaled_block_scale_fp8 = scaled_block_scale.to(tl.float8e4nv)
+    # Compute swizzled position and store scale
+    n_col_blocks = tl.cdiv(num_blocks, 4)
+    swizzled_offs = _compute_swizzled_scale_offset(
+        offs_m, offs_block_n, n_col_blocks, padded_scale_cols
+    )
+    tl.store(swizzled_scales_ptr + swizzled_offs, scaled_block_scale_fp8, mask=block_mask)
 
-            # Compute swizzled position and store scale
-            n_col_blocks = tl.cdiv(scale_cols, 4)
-            swizzled_offs = _compute_swizzled_scale_offset(
-                pid_m, pid_n, n_col_blocks, padded_scale_cols
-            )
-            if pid_m < scale_rows and pid_n < scale_cols:
-                tl.store(swizzled_scales_ptr + swizzled_offs, scaled_block_scale_fp8)
+    # Calculate total scale for data quantization
+    scaled_block_scale_fp32 = scaled_block_scale_fp8.to(tl.float32)
+    total_scale = per_tensor_scale * scaled_block_scale_fp32
+    zero_scale_mask = total_scale < 1e-10
+    total_scale = tl.where(zero_scale_mask, 1.0, total_scale)
 
-            # Calculate total scale for data quantization
-            scaled_block_scale_fp32 = scaled_block_scale_fp8.to(tl.float32)
-            total_scale = per_tensor_scale * scaled_block_scale_fp32
-            zero_scale_mask = total_scale < 1e-10
-            total_scale = tl.where(zero_scale_mask, 1.0, total_scale)
+    # Scale data (satfinite modifier in PTX will handle clamping)
+    data_scaled = x / total_scale[:, None]
+    data_scaled = tl.where(zero_scale_mask[:, None], 0.0, data_scaled)
 
-            # Scale data (satfinite modifier in PTX will handle clamping)
-            data_scaled = x / total_scale
-            data_scaled = tl.where(zero_scale_mask, 0.0, data_scaled)
+    # Preserve the positive zero produced by the original one-hot reduction
+    data_scaled = tl.where(data_scaled == 0.0, 0.0, data_scaled)
+    # Extract even and odd elements by reshaping into adjacent pairs
+    f32_even, f32_odd = tl.split(
+        tl.reshape(data_scaled, (blocks_per_program, block_size // 2, 2))
+    )
 
-            # We want to pack: (v0,v1), (v2,v3), ..., (v14,v15)
-            pair_idx = tl.arange(0, block_size // 2)
-            even_idx = pair_idx * 2
-            odd_idx = pair_idx * 2 + 1
+    # cvt.rn.satfinite.e2m1x2.f32 packs $1 into the high nibble, $2 into the low nibble.
+    if hi_first:
+        asm_arg_hi, asm_arg_lo = f32_even, f32_odd
+    else:
+        asm_arg_hi, asm_arg_lo = f32_odd, f32_even
 
-            # Extract even and odd elements using one-hot selection
-            indices = tl.arange(0, block_size)
-            f32_even = tl.sum(tl.where(indices == even_idx[:, None], data_scaled, 0), axis=1)
-            f32_odd = tl.sum(tl.where(indices == odd_idx[:, None], data_scaled, 0), axis=1)
+    packed_bytes_u16 = tl.inline_asm_elementwise(
+        asm="""
+        {
+            .reg .b8 fp4_byte;
+            .reg .b16 result;
+            cvt.rn.satfinite.e2m1x2.f32 fp4_byte, $1, $2;
+            mov.b16 result, {fp4_byte, 0};
+            mov.u16 $0, result;
+        }
+        """,
+        constraints="=h,f,f",
+        args=[asm_arg_hi, asm_arg_lo],
+        dtype=tl.uint16,
+        is_pure=True,
+        pack=1,
+    )
+    # Extract the low byte
+    packed_bytes = (packed_bytes_u16 & 0xFF).to(tl.uint8)
 
-            # cvt.rn.satfinite.e2m1x2.f32 packs $1 into the high nibble, $2 into the low nibble.
-            if hi_first:
-                asm_arg_hi, asm_arg_lo = f32_even, f32_odd
-            else:
-                asm_arg_hi, asm_arg_lo = f32_odd, f32_even
-
-            packed_bytes_u16 = tl.inline_asm_elementwise(
-                asm="""
-                {
-                    .reg .b8 fp4_byte;
-                    .reg .b16 result;
-                    cvt.rn.satfinite.e2m1x2.f32 fp4_byte, $1, $2;
-                    mov.b16 result, {fp4_byte, 0};
-                    mov.u16 $0, result;
-                }
-                """,
-                constraints="=h,f,f",
-                args=[asm_arg_hi, asm_arg_lo],
-                dtype=tl.uint16,
-                is_pure=True,
-                pack=1,
-            )
-            # Extract the low byte
-            packed_bytes = (packed_bytes_u16 & 0xFF).to(tl.uint8)
-
-            # Store packed bytes
-            out_offs = pid_m * (n // 2) + pid_n * (block_size // 2) + pair_idx
-            out_mask = (pid_n * block_size + even_idx) < n
-            tl.store(packed_output_ptr + out_offs, packed_bytes, mask=out_mask)
+    # Store packed bytes
+    pair_idx = tl.arange(0, block_size // 2)
+    out_offs = (
+        offs_m[:, None] * (n // 2)
+        + offs_block_n[:, None] * (block_size // 2)
+        + pair_idx[None, :]
+    )
+    tl.store(packed_output_ptr + out_offs, packed_bytes, mask=block_mask[:, None])
 
 
 def quantize_nvfp4(
@@ -379,17 +371,9 @@ def quantize_nvfp4(
         device=x.device
     )
 
-    # Determine blocks per program based on tensor size for better occupancy
-    total_blocks = m * num_blocks
-    if total_blocks < 1024:
-        blocks_per_program = 1
-    elif total_blocks < 4096:
-        blocks_per_program = 2
-    else:
-        blocks_per_program = 4
-
-    # Launch single kernel that does everything
-    grid = (m, triton.cdiv(num_blocks, blocks_per_program))
+    # Process independent quantization blocks in parallel
+    blocks_per_program = 32
+    grid = (triton.cdiv(m * num_blocks, blocks_per_program),)
 
     quantize_nvfp4_kernel_tl[grid](
         x_2d,
@@ -399,9 +383,6 @@ def quantize_nvfp4(
         m,
         n,
         num_blocks,
-        scale_rows,
-        scale_cols,
-        padded_scale_rows,
         padded_scale_cols,
         block_size=block_size,
         blocks_per_program=blocks_per_program,
@@ -583,6 +564,19 @@ def dequantize_nvfp4(
     return output
 
 @triton.jit
+def _f32_to_e8m0(x):
+    """Convert nonnegative FP32 values to E8M0, rounding up and saturating infinity."""
+    scale_bits = x.to(tl.uint32, bitcast=True)
+    exp_biased = (scale_bits >> 23) + ((scale_bits & 0x7FFFFF) != 0).to(tl.uint32)
+    # E8M0's minimum scale is 2^-127, halfway through the FP32 subnormal range
+    exp_biased = tl.where(scale_bits <= 0x00400000, 0, exp_biased)
+    exp_biased = tl.minimum(exp_biased, 254)
+    exp_biased = tl.where(scale_bits > 0x7F800000, 255, exp_biased)
+
+    return exp_biased
+
+
+@triton.jit
 def quantize_mxfp8_kernel_tl(
     x_ptr,
     output_ptr,
@@ -590,8 +584,6 @@ def quantize_mxfp8_kernel_tl(
     m,
     n,
     num_blocks,
-    scale_rows,
-    scale_cols,
     padded_scale_cols,
     block_size: tl.constexpr,
     blocks_per_program: tl.constexpr,
@@ -610,78 +602,59 @@ def quantize_mxfp8_kernel_tl(
         m: Number of rows in input
         n: Number of columns in input (must be divisible by block_size)
         num_blocks: Number of blocks per row (n // block_size)
-        scale_rows: Unpadded scale rows (m)
-        scale_cols: Unpadded scale cols (num_blocks)
         padded_scale_cols: Padded scale cols for swizzle
         block_size: Size of each quantization block (32 for MXFP8)
-        blocks_per_program: Number of blocks to process per program
+        blocks_per_program: Number of blocks to process in parallel per program
     """
-    # Get program IDs
-    pid_m = tl.program_id(axis=0)
-    pid_n_base = tl.program_id(axis=1) * blocks_per_program
+    # Get block offsets - each program processes blocks_per_program blocks in parallel
+    offs_blocks = tl.program_id(axis=0) * blocks_per_program + tl.arange(0, blocks_per_program)
+    block_mask = offs_blocks < m * num_blocks
+    # Convert flattened block offsets to row and block column indices
+    offs_m = offs_blocks // num_blocks
+    offs_block_n = offs_blocks % num_blocks
 
     # FP8 E4M3 max value
     fp8_max: tl.constexpr = 448.0
 
-    # Process multiple blocks per program
-    for block_offset in range(blocks_per_program):
-        pid_n = pid_n_base + block_offset
+    # Calculate input offsets for the tile
+    offs_n = offs_block_n[:, None] * block_size + tl.arange(0, block_size)[None, :]
+    mask = block_mask[:, None] & (offs_n < n)
+    x_offs = offs_m[:, None] * n + offs_n
 
-        if pid_n < num_blocks:
-            # Calculate offsets for the input data block
-            offs_n = pid_n * block_size + tl.arange(0, block_size)
-            mask = offs_n < n
-            x_offs = pid_m * n + offs_n
+    # Load input data
+    x = tl.load(x_ptr + x_offs, mask=mask, other=0.0).to(tl.float32)
 
-            # Load input data block
-            x = tl.load(x_ptr + x_offs, mask=mask, other=0.0).to(tl.float32)
+    # Compute block-wise absolute maximum
+    x_abs = tl.abs(x)
+    max_abs = tl.max(x_abs, axis=1)
 
-            # Compute block-wise absolute maximum
-            x_abs = tl.abs(x)
-            max_abs = tl.max(x_abs, axis=0)
+    # Convert the FP32 ratio to E8M0 with round-toward-positive-infinity
+    scale_ratio = tl.div_rn(max_abs, fp8_max)
+    exp_biased = _f32_to_e8m0(scale_ratio)
 
-            # Compute E8M0 scale: find power-of-2 that covers max_abs
-            # E8M0 has bias 127, so scale = 2^(exp - 127)
-            # We want 2^exp >= max_abs / fp8_max, so exp = ceil(log2(max_abs / fp8_max)) + 127
-            # Using floor(log2(x)) + 1 for ceiling
-            scale_ratio = max_abs / fp8_max
-            # Clamp to avoid log2(0) and ensure valid E8M0 range
-            scale_ratio = tl.maximum(scale_ratio, 2.0 ** (-127))  # min E8M0 value
-            scale_ratio = tl.minimum(scale_ratio, 2.0 ** 127)     # max E8M0 value
+    # Decode E8M0, including its minimum scale and NaN encoding
+    scale_bits = tl.where(exp_biased == 0, 0x00400000, exp_biased << 23)
+    scale_bits = tl.where(exp_biased == 255, 0x7FC00000, scale_bits)
+    block_scale = scale_bits.to(tl.float32, bitcast=True)
 
-            # Compute exponent: round up to next power of 2
-            log2_ratio = tl.log2(scale_ratio)
-            exp_unbiased = tl.ceil(log2_ratio).to(tl.int32)
-            exp_biased = exp_unbiased + 127  # E8M0 bias
+    # Store E8M0 scale in swizzled layout
+    n_col_blocks = tl.cdiv(num_blocks, 4)
+    swizzled_offs = _compute_swizzled_scale_offset(
+        offs_m, offs_block_n, n_col_blocks, padded_scale_cols
+    )
+    # Store as uint8 (E8M0 is just an 8-bit exponent)
+    tl.store(swizzled_scales_ptr + swizzled_offs, exp_biased.to(tl.uint8), mask=block_mask)
 
-            # Clamp to valid E8M0 range [0, 254] (255 is NaN)
-            exp_biased = tl.maximum(exp_biased, 0)
-            exp_biased = tl.minimum(exp_biased, 254)
+    # Scale in FP32, retaining subnormal input and scale values
+    data_scaled = tl.div_rn(x, block_scale[:, None])
+    data_scaled = tl.where((max_abs == 0.0)[:, None], 0.0, data_scaled)
 
-            # Compute actual scale value for quantization
-            block_scale = tl.exp2((exp_biased - 127).to(tl.float32))
+    # Clamp to FP8 range and convert
+    data_clamped = tl.maximum(tl.minimum(data_scaled, fp8_max), -fp8_max)
 
-            # Store E8M0 scale in swizzled layout
-            n_col_blocks = tl.cdiv(scale_cols, 4)
-            swizzled_offs = _compute_swizzled_scale_offset(
-                pid_m, pid_n, n_col_blocks, padded_scale_cols
-            )
-            if pid_m < scale_rows and pid_n < scale_cols:
-                # Store as uint8 (E8M0 is just an 8-bit exponent)
-                tl.store(swizzled_scales_ptr + swizzled_offs, exp_biased.to(tl.uint8))
-
-            # Quantize data to FP8
-            # Handle zero scale to avoid division by zero
-            safe_scale = tl.where(block_scale < 1e-30, 1.0, block_scale)
-            data_scaled = x / safe_scale
-            data_scaled = tl.where(block_scale < 1e-30, 0.0, data_scaled)
-
-            # Clamp to FP8 range and convert
-            data_clamped = tl.maximum(tl.minimum(data_scaled, fp8_max), -fp8_max)
-
-            # Store as FP8 E4M3
-            out_offs = pid_m * n + offs_n
-            tl.store(output_ptr + out_offs, data_clamped.to(tl.float8e4nv), mask=mask)
+    # Store as FP8 E4M3
+    out_offs = offs_m[:, None] * n + offs_n
+    tl.store(output_ptr + out_offs, data_clamped.to(tl.float8e4nv), mask=mask)
 
 
 def quantize_mxfp8(
@@ -732,17 +705,9 @@ def quantize_mxfp8(
         device=x.device
     )
 
-    # Determine blocks per program
-    total_blocks = m * num_blocks
-    if total_blocks < 1024:
-        blocks_per_program = 1
-    elif total_blocks < 4096:
-        blocks_per_program = 2
-    else:
-        blocks_per_program = 4
-
-    # Launch kernel
-    grid = (m, triton.cdiv(num_blocks, blocks_per_program))
+    # Process independent quantization blocks in parallel
+    blocks_per_program = 32
+    grid = (triton.cdiv(m * num_blocks, blocks_per_program),)
 
     quantize_mxfp8_kernel_tl[grid](
         x,
@@ -751,8 +716,6 @@ def quantize_mxfp8(
         m,
         n,
         num_blocks,
-        scale_rows,
-        scale_cols,
         padded_scale_cols,
         block_size=block_size,
         blocks_per_program=blocks_per_program,
