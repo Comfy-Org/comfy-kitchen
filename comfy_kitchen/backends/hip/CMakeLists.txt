@@ -30,10 +30,12 @@ endfunction()
 
 _ck_read_arch_group(COMFY_HIP_ELEMENTWISE_ARCHS elementwise_only)
 _ck_read_arch_group(COMFY_HIP_WMMA_GFX11_ARCHS wmma_gfx11)
+_ck_read_arch_group(COMFY_HIP_WMMA_GFX117_ARCHS wmma_gfx117)
 _ck_read_arch_group(COMFY_HIP_WMMA_GFX12_ARCHS wmma_gfx12)
 set(COMFY_HIP_SUPPORTED_ARCHS
     ${COMFY_HIP_ELEMENTWISE_ARCHS}
     ${COMFY_HIP_WMMA_GFX11_ARCHS}
+    ${COMFY_HIP_WMMA_GFX117_ARCHS}
     ${COMFY_HIP_WMMA_GFX12_ARCHS}
 )
 list(LENGTH COMFY_HIP_SUPPORTED_ARCHS _arch_count)
@@ -68,6 +70,7 @@ function(_ck_make_arch_condition output)
 endfunction()
 
 _ck_make_arch_condition(COMFY_HIP_GFX11_CONDITION ${COMFY_HIP_WMMA_GFX11_ARCHS})
+_ck_make_arch_condition(COMFY_HIP_GFX117_CONDITION ${COMFY_HIP_WMMA_GFX117_ARCHS})
 _ck_make_arch_condition(COMFY_HIP_GFX12_CONDITION ${COMFY_HIP_WMMA_GFX12_ARCHS})
 set(_CK_HIP_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${_CK_HIP_GENERATED_INCLUDE_DIR}")
