@@ -1,0 +1,39 @@
+{
+  "arm": "attention",
+  "gpu": "NVIDIA GeForce RTX 5090 D v2",
+  "torch": "2.12.0+cu130",
+  "records": [
+    {
+      "repeat": -1,
+      "dit_seconds": 22.94595260103233,
+      "latent_sha256": [
+        "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+        "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+      ]
+    },
+    {
+      "repeat": 0,
+      "dit_seconds": 15.831496048020199,
+      "latent_sha256": [
+        "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+        "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+      ]
+    },
+    {
+      "repeat": 1,
+      "dit_seconds": 15.835095086949877,
+      "latent_sha256": [
+        "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+        "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+      ]
+    },
+    {
+      "repeat": 2,
+      "dit_seconds": 15.836300870985724,
+      "latent_sha256": [
+        "8df41570a04e49d6e71924eacfcf5967baddab5762299589e813f6212d12abf1",
+        "72e7410dc0809f58071a923c9cd8b4c80a2abf3239cafe5910060b4dfb98aefb"
+      ]
+    }
+  ]
+}
