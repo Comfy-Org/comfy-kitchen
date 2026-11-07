@@ -1,0 +1,149 @@
+{
+  "protocol": "One Kitchen extension per fresh process. ABBA processes, each one warmup + two formal decodes, single243frame768x1344latent. Same linked object files except D64 launcher. RGB float and RGB8 signatures exact. Multi-extension swapping result kept as invalid integration harness evidence, not deployment speed.",
+  "rows": [
+    {
+      "process_index": 0,
+      "case": "c01-r0",
+      "arm": "base",
+      "repeat": 0,
+      "warmup": true,
+      "seconds": 11.801235688035376,
+      "signature": [
+        "c20e47118805b61b34a606886721eb6ecd202450897a7f5946624a020b537120",
+        "25e08e1d73f3f64f0a20a1f640625f8c0749d159e0426b26bf3dd092087054dc"
+      ]
+    },
+    {
+      "process_index": 0,
+      "case": "c01-r0",
+      "arm": "base",
+      "repeat": 1,
+      "warmup": false,
+      "seconds": 9.97052678198088,
+      "signature": [
+        "c20e47118805b61b34a606886721eb6ecd202450897a7f5946624a020b537120",
+        "25e08e1d73f3f64f0a20a1f640625f8c0749d159e0426b26bf3dd092087054dc"
+      ]
+    },
+    {
+      "process_index": 0,
+      "case": "c01-r0",
+      "arm": "base",
+      "repeat": 2,
+      "warmup": false,
+      "seconds": 9.956912078894675,
+      "signature": [
+        "c20e47118805b61b34a606886721eb6ecd202450897a7f5946624a020b537120",
+        "25e08e1d73f3f64f0a20a1f640625f8c0749d159e0426b26bf3dd092087054dc"
+      ]
+    },
+    {
+      "process_index": 1,
+      "case": "c01-r0",
+      "arm": "candidate",
+      "repeat": 0,
+      "warmup": true,
+      "seconds": 11.036446671001613,
+      "signature": [
+        "c20e47118805b61b34a606886721eb6ecd202450897a7f5946624a020b537120",
+        "25e08e1d73f3f64f0a20a1f640625f8c0749d159e0426b26bf3dd092087054dc"
+      ]
+    },
+    {
+      "process_index": 1,
+      "case": "c01-r0",
+      "arm": "candidate",
+      "repeat": 1,
+      "warmup": false,
+      "seconds": 9.845234156004153,
+      "signature": [
+        "c20e47118805b61b34a606886721eb6ecd202450897a7f5946624a020b537120",
+        "25e08e1d73f3f64f0a20a1f640625f8c0749d159e0426b26bf3dd092087054dc"
+      ]
+    },
+    {
+      "process_index": 1,
+      "case": "c01-r0",
+      "arm": "candidate",
+      "repeat": 2,
+      "warmup": false,
+      "seconds": 9.858300061896443,
+      "signature": [
+        "c20e47118805b61b34a606886721eb6ecd202450897a7f5946624a020b537120",
+        "25e08e1d73f3f64f0a20a1f640625f8c0749d159e0426b26bf3dd092087054dc"
+      ]
+    },
+    {
+      "process_index": 2,
+      "case": "c01-r0",
+      "arm": "candidate",
+      "repeat": 0,
+      "warmup": true,
+      "seconds": 10.985885803005658,
+      "signature": [
+        "c20e47118805b61b34a606886721eb6ecd202450897a7f5946624a020b537120",
+        "25e08e1d73f3f64f0a20a1f640625f8c0749d159e0426b26bf3dd092087054dc"
+      ]
+    },
+    {
+      "process_index": 2,
+      "case": "c01-r0",
+      "arm": "candidate",
+      "repeat": 1,
+      "warmup": false,
+      "seconds": 9.887190765934065,
+      "signature": [
+        "c20e47118805b61b34a606886721eb6ecd202450897a7f5946624a020b537120",
+        "25e08e1d73f3f64f0a20a1f640625f8c0749d159e0426b26bf3dd092087054dc"
+      ]
+    },
+    {
+      "process_index": 2,
+      "case": "c01-r0",
+      "arm": "candidate",
+      "repeat": 2,
+      "warmup": false,
+      "seconds": 9.875749610015191,
+      "signature": [
+        "c20e47118805b61b34a606886721eb6ecd202450897a7f5946624a020b537120",
+        "25e08e1d73f3f64f0a20a1f640625f8c0749d159e0426b26bf3dd092087054dc"
+      ]
+    },
+    {
+      "process_index": 3,
+      "case": "c01-r0",
+      "arm": "base",
+      "repeat": 0,
+      "warmup": true,
+      "seconds": 11.020449667004868,
+      "signature": [
+        "c20e47118805b61b34a606886721eb6ecd202450897a7f5946624a020b537120",
+        "25e08e1d73f3f64f0a20a1f640625f8c0749d159e0426b26bf3dd092087054dc"
+      ]
+    },
+    {
+      "process_index": 3,
+      "case": "c01-r0",
+      "arm": "base",
+      "repeat": 1,
+      "warmup": false,
+      "seconds": 9.94722352991812,
+      "signature": [
+        "c20e47118805b61b34a606886721eb6ecd202450897a7f5946624a020b537120",
+        "25e08e1d73f3f64f0a20a1f640625f8c0749d159e0426b26bf3dd092087054dc"
+      ]
+    },
+    {
+      "process_index": 3,
+      "case": "c01-r0",
+      "arm": "base",
+      "repeat": 2,
+      "warmup": false,
+      "seconds": 9.974976171040908,
+      "signature": [
+        "c20e47118805b61b34a606886721eb6ecd202450897a7f5946624a020b537120",
+        "25e08e1d73f3f64f0a20a1f640625f8c0749d159e0426b26bf3dd092087054dc"
+      ]
+    }
+  ]
+}
