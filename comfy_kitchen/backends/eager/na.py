@@ -131,10 +131,11 @@ def na3d(
     for rel, tiles in groups.items():
         mask = _group_mask(rel, q.dtype, device)
         nq, nk = mask.shape[2], mask.shape[3]
-        if device.type == "cuda":
+        if device.type in ("cuda", "mps"):
+            # CUDA and MPS SDPA keep scores online; CPU math materializes them.
             g_max = max(1, NA_KV_STACK_BUDGET // max(1, batch * nh * nk * hd * 2))
         else:
-            g_max = 1  # CPU math backend materializes [G*B, NH, Nq, Nk]
+            g_max = 1
         qs0, _ = tiles[0]
         tq, th, tw = (qs0[0].stop - qs0[0].start, qs0[1].stop - qs0[1].start, qs0[2].stop - qs0[2].start)
         for c0 in range(0, len(tiles), g_max):
