@@ -57,6 +57,7 @@ include = ["comfy_kitchen*"]
 exclude = ["tests*"]
 
 [tool.setuptools.package-data]
+"comfy_kitchen" = ["a6000_int8_cfg_table.json"]
 "comfy_kitchen.backends.cuda" = ["*.cuh", "*.h"]
 "comfy_kitchen.backends.hip" = ["architectures.json"]
 
