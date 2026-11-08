@@ -84,9 +84,9 @@ def _op_adaln_segmented(
     rms_weight_offset: float,
 ) -> torch.Tensor:
     _check("adaln_segmented", x, split, scale=scale, shift=shift)
-    if rms_weight is not None and rms_weight.numel() != x.shape[-1]:
+    if rms_weight is not None and tuple(rms_weight.shape) != (x.shape[-1],):
         raise ValueError(
-            f"adaln_segmented: rms_weight needs {x.shape[-1]} elements, got {rms_weight.numel()}"
+            f"adaln_segmented: rms_weight must be [{x.shape[-1]}], got {tuple(rms_weight.shape)}"
         )
     kwargs = {
         "x": x,

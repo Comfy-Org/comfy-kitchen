@@ -124,6 +124,8 @@ class TestSegmentedEager:
         with pytest.raises(ValueError):
             ck.adaln_segmented(x, good, good, 4, rms_weight=torch.ones(8))
         with pytest.raises(ValueError):
+            ck.adaln_segmented(x, good, good, 4, rms_weight=torch.ones(1, 16))  # not [D]
+        with pytest.raises(ValueError):
             ck.adaln_segmented(x[0], good, good, 4)  # not [B, L, D]
 
 
@@ -200,9 +202,30 @@ class TestSegmentedTriton:
         x = torch.randn(3, 64, 1000, dtype=torch.bfloat16, device="cuda")
         scale = torch.randn(2, mod_batch, 1000, dtype=torch.bfloat16, device="cuda")
         shift = torch.randn(2, mod_batch, 1000, dtype=torch.bfloat16, device="cuda")
+        kwargs = {"x": x, "scale": scale, "shift": shift, "split": split, "eps": 1e-6}
+        assert registry.get_capable_backend("adaln_segmented", kwargs) == "triton"
         with ck.use_backend("triton"):
             got = ck.adaln_segmented(x, scale, shift, split)
         assert _rel(got, _reference(x, scale, shift, split)) < 1e-2
+
+    @pytest.mark.parametrize("layout", ["flux", "qwen_krea2"])
+    def test_batched_model_layouts(self, layout):
+        # B = 2 with the per-batch modulation rows the models pass as views (batch stride != D)
+        b, d = 2, 512
+        x = torch.randn(b, 64, d, dtype=torch.bfloat16, device="cuda")
+        if layout == "flux":
+            mod = _flux_modulation(b, d, 3, torch.bfloat16, "cuda")
+            shift, scale = mod[0].transpose(0, 1), mod[1].transpose(0, 1)
+        else:
+            mod = torch.randn(2 * b, 3 * d, dtype=torch.bfloat16, device="cuda") * 0.5
+            mod = mod.chunk(3, dim=-1)
+            shift, scale = _split_rows(mod[0]), _split_rows(mod[1])
+        assert scale.shape == (2, b, d) and scale.stride(1) != d
+        kwargs = {"x": x, "scale": scale, "shift": shift, "split": 20, "eps": 1e-6}
+        assert registry.get_capable_backend("adaln_segmented", kwargs) == "triton"
+        with ck.use_backend("triton"):
+            got = ck.adaln_segmented(x, scale, shift, 20)
+        assert _rel(got, _reference(x, scale, shift, 20)) < 1e-2
 
     def test_strided_inputs(self):
         # x as a token slice of a larger buffer (read in place), x with a non-unit D stride
