@@ -141,6 +141,7 @@ __all__ = [
     "rms_rope_split_half_",
     "rms_rope_split_half1",
     "rms_rope_split_half1_",
+    "qk_layernorm_rope_partial",
     # Geometry
     "delaunay3d",
     "mesh_bvh",
@@ -1016,6 +1017,57 @@ def apply_rope_split_half1_(
     """Apply split-half RoPE in place (inference only)."""
     torch.ops.comfy_kitchen.apply_rope_split_half1_(x, freqs_cis)
     return x
+
+
+def qk_layernorm_rope_partial(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_weight: torch.Tensor,
+    k_bias: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    text_len: int,
+    heads: int,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Joint text + video attention prep: per-head QK LayerNorm, then RoPE on the video tokens.
+
+    Takes the q and k projection outputs ``[B, S, heads * head_dim]`` of a joint sequence
+    whose first ``text_len`` tokens are text and returns ``(q, k)`` in the same contiguous
+    layout: every ``[head_dim]`` row is LayerNorm-ed with its weight and bias, and the rows of
+    the video tokens (``s >= text_len``) are then rotated with the interleaved RoPE of the
+    ``[S - text_len, head_dim]`` cos / sin tables (``x * cos + rotate_pairs(x) * sin`` in
+    fp32, pair j = elements 2j, 2j + 1). This is the CogVideoX ``CogVideoXBlock.forward``
+    sequence (``norm_q`` / ``norm_k``, the video-token slice, ``apply_rotary_emb``,
+    ``torch.cat`` with the text tokens, reshape) up to the attention call.
+
+    Args:
+        q, k: Projection outputs ``[B, S, heads * head_dim]``.
+        q_weight, q_bias, k_weight, k_bias: LayerNorm affine parameters ``[head_dim]`` in
+            q's dtype.
+        cos, sin: RoPE tables ``[S - text_len, head_dim]``.
+        text_len: Number of leading text tokens (normalized, not rotated).
+        heads: Number of attention heads.
+        eps: LayerNorm epsilon.
+
+    Returns:
+        Tuple of the (query, key) tensors, each ``[B, S, heads * head_dim]``.
+    """
+    return torch.ops.comfy_kitchen.qk_layernorm_rope_partial(
+        q,
+        k,
+        q_weight,
+        q_bias,
+        k_weight,
+        k_bias,
+        cos,
+        sin,
+        int(text_len),
+        int(heads),
+        float(eps),
+    )
 
 
 def quantize_int8_tensorwise(
