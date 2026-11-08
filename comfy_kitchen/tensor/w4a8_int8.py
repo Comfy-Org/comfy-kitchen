@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Grouped W4A8 / W6A8 weights executed through the shared INT8 linear operation.
+"""Grouped W3A8 / W4A8 / W6A8 weights executed through the shared INT8 linear operation.
 
 Weights are ConvRot-rotated and quantized per ``group_size``. The default (``bits=4``)
 uses a symmetric Lloyd-Max codebook and FP8 group scales; ``bits=6`` stores uniform
 6-bit codes (no codebook) in a 3K/4-byte row, at ~3x lower weight error for 1.5x the
-bytes. The bit depth is implied by the packed row width, so one layout class and one
-checkpoint format cover both. The tensor layout owns only metadata and operator
+bytes; ``bits=3`` is the codebook path with an 8-level table in a 3K/8-byte row. The bit
+depth is implied by the packed row width, so one layout class and one checkpoint format
+cover all three. The tensor layout owns only metadata and operator
 routing; eager, CUDA, and Triton backends own the operation implementations.
 """
 
@@ -210,9 +211,9 @@ class AsymW4A8Int8Layout(QuantizedLayout):
                 raise ValueError(
                     f"correction must have shape {(groups, n)}, got {tuple(self.correction.shape)}"
                 )
-            if self.codebook is not None and tuple(self.codebook.shape) != (16,):
+            if self.codebook is not None and tuple(self.codebook.shape) not in ((8,), (16,)):
                 raise ValueError(
-                    f"codebook must have shape (16,), got {tuple(self.codebook.shape)}"
+                    f"codebook must have shape (8,) or (16,), got {tuple(self.codebook.shape)}"
                 )
 
     @classmethod
@@ -270,10 +271,11 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             return weight
         n, k = params.orig_shape
         if params.codebook is None:
-            # 6-bit codes are uniform; 4-bit without a codebook is not what the kernel decodes
+            # 6-bit codes are uniform; 3/4-bit without a codebook is not what the kernel decodes
             codebook_ok = qdata.shape[1] * 8 == k * 6
         else:
-            codebook_ok = torch.equal(params.codebook.float().cpu(), default_w4a8_codebook())
+            bits = 3 if qdata.shape[1] * 8 == k * 3 else 4
+            codebook_ok = torch.equal(params.codebook.float().cpu(), default_w4a8_codebook(bits))
         if (
             n % 16 != 0 or k % 256 != 0
             or params.group_size != 16
@@ -369,7 +371,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
 
     @classmethod
     def bits(cls, qtensor: QuantizedTensor) -> int:
-        """Code width implied by the packed row: K/2 bytes at 4 bits, 3K/4 at 6."""
+        """Code width implied by the packed row: 3K/8 bytes at 3 bits, K/2 at 4, 3K/4 at 6."""
         from comfy_kitchen.backends.eager.w4a8_int8 import _w4a8_geometry
 
         params = qtensor._params
