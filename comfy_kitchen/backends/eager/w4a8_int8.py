@@ -20,7 +20,9 @@ from comfy_kitchen.tensor.w4a8_packed import (  # noqa: F401  (_FIXED_LUT re-exp
     _pack_codes,
     _unpack_codes,
     default_w4a8_codebook,
+    is_nested_codebook,
     unpack_w4a8_mma_weight,
+    w4a8_level_table,
 )
 
 from .quantization import int8_linear, rotate_int8_convrot_weight
@@ -65,8 +67,8 @@ def _w4a8_geometry(
     n, cols = qdata.shape
     k = s_rel.shape[1] * group_size
     bits = (cols * 8) // k if k > 0 else 0
-    if k <= 0 or bits not in (3, 4, 6) or k * bits != cols * 8:
-        raise ValueError(f"packed row width {cols} does not match K={k} at 3, 4 or 6 bits")
+    if k <= 0 or bits not in (3, 4, 5, 6) or k * bits != cols * 8:
+        raise ValueError(f"packed row width {cols} does not match K={k} at 3, 4, 5 or 6 bits")
     if bits != 4:
         _check_planar_layout(bits, k, group_size)
     return n, k, bits
@@ -155,6 +157,29 @@ def _assign_grid(
     return torch.where(dhi < dlo, hi, lo).to(torch.int32).reshape(n, groups, gsize)
 
 
+def _assign_nested(
+    weight: torch.Tensor,
+    codebook: torch.Tensor,
+    s_rel: torch.Tensor,
+    s_channel: torch.Tensor,
+    bits: int,
+) -> torch.Tensor:
+    """Hierarchical assignment against a nested codebook: nearest 3-bit level, then at each
+    wider table the nearer of the two child levels (2c, 2c + 1). Every prefix of the code
+    is the nearest-by-descent code of the narrower table, which is what dropping low bits
+    at runtime decodes."""
+    target = weight / s_channel.view(-1, 1, 1)
+    codes = _assign_grid(
+        weight, _grid_levels(w4a8_level_table(codebook, 3), s_rel), s_channel, target=target
+    )
+    for b in range(4, bits + 1):
+        levels = _grid_levels(w4a8_level_table(codebook, b), s_rel)
+        lo = torch.gather(levels, 2, (codes * 2).long())
+        hi = torch.gather(levels, 2, (codes * 2 + 1).long())
+        codes = codes * 2 + ((target - hi).abs() < (target - lo).abs()).to(torch.int32)
+    return codes
+
+
 def _grid_levels(level_table: torch.Tensor, s_rel: torch.Tensor) -> torch.Tensor:
     """The int8 values each level of every group decodes to: round(clamp(level * s_rel))."""
     return (level_table.view(1, 1, -1) * s_rel.float().unsqueeze(-1)).round_().clamp_(-127, 127)
@@ -203,8 +228,8 @@ def validate_w4a8_weight_shape(
     """Validate a floating weight (and the requested layout) before W4A8/W6A8 preparation."""
     if weight.dim() != 2:
         raise ValueError(f"W4A8 weight must be 2D, got shape {tuple(weight.shape)}")
-    if bits not in (3, 4, 6):
-        raise ValueError(f"bits must be 3, 4 or 6, got {bits}")
+    if bits not in (3, 4, 5, 6):
+        raise ValueError(f"bits must be 3, 4, 5 or 6, got {bits}")
     k = weight.shape[1]
     if bits != 4:
         _check_planar_layout(bits, k, group_size)
@@ -279,7 +304,12 @@ def _quantize_rotated_w4a8_int8_weight(
             codebook_tensor = (
                 codebook_override if codebook_override is not None else _codebook_for(normalized, bits)
             )
-            level_table = codebook_tensor
+            nested = is_nested_codebook(codebook_tensor)
+            if nested and stochastic_rounding > 0:
+                raise ValueError("stochastic rounding is not supported with the nested codebook")
+            # Nested tables share one scale fit (at the 4-bit level) so a weight's scales stay
+            # valid when its codes are narrowed.
+            level_table = w4a8_level_table(codebook_tensor, 4 if nested else bits)
 
             def assign(normalized):
                 return _assign_codes(normalized, level_table)
@@ -320,7 +350,9 @@ def _quantize_rotated_w4a8_int8_weight(
         searched = bits == 6 and scale_search
         if searched:
             s_rel, unsigned = _search_group_scale(grouped_weight, s_rel, s_channel, level_table)
-        if not searched or stochastic_rounding > 0:  # SR needs its own (seeded) assignment
+        if codebook_tensor is not None and is_nested_codebook(codebook_tensor):
+            unsigned = _assign_nested(grouped_weight, codebook_tensor, s_rel, s_channel, bits)
+        elif not searched or stochastic_rounding > 0:  # SR needs its own (seeded) assignment
             levels = _grid_levels(level_table, s_rel)
             unsigned = _assign_grid(grouped_weight, levels, s_channel, stochastic_rounding)
         if bits == 6:
@@ -441,8 +473,10 @@ def _quantize_w4a8_chunked(
         if not symmetric:
             raise ValueError("6-bit storage is symmetric only")
         codebook = False  # uniform only; a 6-bit table is never fit or stored
-    elif bits == 3 and not (symmetric and codebook):
-        raise ValueError("3-bit storage is symmetric codebook only")
+    elif bits in (3, 5) and not (symmetric and codebook):
+        raise ValueError(f"{bits}-bit storage is symmetric codebook only")
+    if bits == 5 and not is_nested_codebook(codebook_override):
+        raise ValueError("5-bit storage needs the nested codebook")
     if symmetric and codebook:
         override = (
             codebook_override.to(device=weight.device, dtype=torch.float32)
@@ -543,7 +577,8 @@ def _dequant_int4_grouped_to_int8(
     groups = k // group_size
     quantized = _unpack_codes(qdata, k, bits)
     if codebook is not None:
-        values = codebook.to(device=qdata.device, dtype=torch.float32)[quantized]
+        table = w4a8_level_table(codebook, bits).to(device=qdata.device, dtype=torch.float32)
+        values = table[quantized]
     else:
         values = quantized.float() - float(1 << (bits - 1))  # uniform, zero point mid-range
     values = values.view(n, groups, group_size) * s_rel.float().unsqueeze(-1)
@@ -569,8 +604,10 @@ def validate_w4a8_operands(
     n, k, bits = _w4a8_geometry(qdata, s_rel, group_size)  # k = groups * group_size
     if bits == 6 and (codebook is not None or correction is not None):
         raise ValueError("6-bit storage is uniform and symmetric: no codebook or correction")
-    if bits == 3 and (codebook is None or correction is not None):
-        raise ValueError("3-bit storage is symmetric codebook only")
+    if bits in (3, 5) and (codebook is None or correction is not None):
+        raise ValueError(f"{bits}-bit storage is symmetric codebook only")
+    if bits == 5 and not is_nested_codebook(codebook):
+        raise ValueError("5-bit storage needs the nested codebook")
     if k % 16 != 0 or k % convrot_groupsize != 0:
         raise ValueError(
             f"K={k} must be divisible by 16 and convrot_groupsize={convrot_groupsize}"
@@ -583,7 +620,7 @@ def validate_w4a8_operands(
         raise ValueError(f"s_channel must have shape {(n,)}, got {tuple(s_channel.shape)}")
     if correction is not None and tuple(correction.shape) != (groups, n):
         raise ValueError(f"correction must have shape {(groups, n)}, got {tuple(correction.shape)}")
-    if codebook is not None and tuple(codebook.shape) != (1 << bits,):
+    if codebook is not None and not is_nested_codebook(codebook) and tuple(codebook.shape) != (1 << bits,):
         raise ValueError(f"codebook must have shape {(1 << bits,)}, got {tuple(codebook.shape)}")
     return n, k, bits
 
@@ -727,10 +764,11 @@ def w4a8_packed_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    lsb_tier: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Portable fallback for resident packed weights."""
     x = apply_input_act(x, input_act, input_act_weight, input_act_eps)
-    qdata, s_rel = unpack_w4a8_mma_weight(qdata, s_channel.numel(), x.shape[-1])
+    qdata, s_rel = unpack_w4a8_mma_weight(qdata, s_channel.numel(), x.shape[-1], lsb_tier=lsb_tier)
     return w4a8_int8_linear(
         x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
         convrot_groupsize, out_dtype, residual=residual, residual_scale=residual_scale,
