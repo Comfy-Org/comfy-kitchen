@@ -197,15 +197,61 @@ __device__ __forceinline__ void decode_w4a8_record_smem(
     decoded[3] = decode_w4a8_chunk(packed.y >> 16, scales >> 24, lut);
 }
 
+// Four 3-bit codes of a 12-bit chunk spread to four selector nibbles.
+__device__ __forceinline__ unsigned spread_w3a8_chunk(unsigned codes)
+{
+    return (codes & 0x7u) | ((codes << 1) & 0x70u) | ((codes << 2) & 0x700u) | ((codes << 3) & 0x7000u);
+}
+
 // 3-bit: four codes per 12-bit chunk spread to four selector nibbles, one permute over the
 // [8 codes] LUT row of the chunk's scale.
 __device__ __forceinline__ unsigned decode_w3a8_chunk(
     unsigned codes, unsigned scale_bits, const uint2* __restrict__ lut)
 {
     const uint2 table = lut[scale_bits];
-    const unsigned sel = (codes & 0x7u) | ((codes << 1) & 0x70u)
-        | ((codes << 2) & 0x700u) | ((codes << 3) & 0x7000u);
-    return __byte_perm(table.x, table.y, sel);
+    return __byte_perm(table.x, table.y, spread_w3a8_chunk(codes));
+}
+
+// LSB tier: a lane's uint16 holds bit 4c + j = the low bit of its code c of chunk j, so
+// (tier >> j) & 0x1111 lands chunk j's low bits in the four selector nibbles.
+__device__ __forceinline__ unsigned tier_chunk_bits(unsigned tier, int j)
+{
+    return (tier >> j) & 0x1111u;
+}
+
+// 3-bit stream + LSB tier = 4-bit codes decoded over the 16-level table.
+__device__ __forceinline__ void decode_w3a8_lsb_record_smem(
+    unsigned a, unsigned b, unsigned tier, unsigned scales,
+    const uint4* __restrict__ lut, unsigned (&decoded)[4])
+{
+    const unsigned chunk[4] = {a, a >> 12, __funnelshift_r(a, b, 24), b >> 4};
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const unsigned sel = (spread_w3a8_chunk(chunk[j]) << 1) | tier_chunk_bits(tier, j);
+        decoded[j] = decode_w4a8_chunk(sel, (scales >> (8 * j)) & 0xffu, lut);
+    }
+}
+
+// 4-bit stream + LSB tier = 5-bit codes over a [256 scales][32 levels] table: each
+// scale row is two 16-byte halves, the low 4 code bits permute within a half and the
+// stream nibble's top bit (code bit 4) picks the half.
+__device__ __forceinline__ unsigned decode_w5a8_chunk(
+    unsigned codes, unsigned low, unsigned scale_bits, const uint4* __restrict__ lut)
+{
+    const unsigned sel = ((codes << 1) & 0xEEEEu) | low;
+    const unsigned lo = decode_w4a8_chunk(sel, 2 * scale_bits, lut);
+    const unsigned hi = decode_w4a8_chunk(sel, 2 * scale_bits + 1, lut);
+    return __byte_perm(lo, hi, ((codes >> 1) & 0x4444u) | 0x3210u);
+}
+
+__device__ __forceinline__ void decode_w4a8_lsb_record_smem(
+    const uint2& packed, unsigned tier, unsigned scales,
+    const uint4* __restrict__ lut, unsigned (&decoded)[4])
+{
+    const unsigned chunk[4] = {packed.x, packed.x >> 16, packed.y, packed.y >> 16};
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+        decoded[j] = decode_w5a8_chunk(chunk[j], tier_chunk_bits(tier, j), (scales >> (8 * j)) & 0xffu, lut);
 }
 
 // Lane's 6 code bytes form one 48-bit value (chunk j at bit 12j): 4 at lane*4 (plane A),
@@ -305,23 +351,30 @@ template <int N> __device__ __forceinline__ void cp_async_wait() {
 constexpr int kStreamStages = 4;
 constexpr int kMmaWarps = 8;
 
-template <int BITS> struct StreamRecord {
-    static constexpr int kBytes = 512 * BITS / 8 + 32;
-    static constexpr int kTableBytes = BITS == 6 ? 256 * static_cast<int>(sizeof(float)) : 256 * (1 << BITS);
+// BITS is the record stream's code width. With LSB each record is followed in its stage
+// by its 64-byte low-bit tier (its own tensor in global memory), so the decoded codes are
+// BITS + 1 wide and the table has 2^(BITS + 1) levels per scale.
+constexpr int kLsbTierBytes = 64;
+
+template <int BITS, bool LSB> struct StreamRecord {
+    static constexpr int kRecordBytes = 512 * BITS / 8 + 32;
+    static constexpr int kBytes = kRecordBytes + (LSB ? kLsbTierBytes : 0);
+    static constexpr int kTableBytes = BITS == 6 ? 256 * static_cast<int>(sizeof(float)) : 256 * (1 << (BITS + LSB));
 };
 
-template <int BITS>
+template <int BITS, bool LSB>
 __host__ __device__ constexpr int w4a8_stream_smem_bytes(int rows) {
-    return StreamRecord<BITS>::kTableBytes + 8 * (rows * 32 + 16)
-        + kMmaWarps * kStreamStages * StreamRecord<BITS>::kBytes;
+    return StreamRecord<BITS, LSB>::kTableBytes + 8 * (rows * 32 + 16)
+        + kMmaWarps * kStreamStages * StreamRecord<BITS, LSB>::kBytes;
 }
 
 
-template <typename OutputT, int BITS>
+template <typename OutputT, int BITS, bool LSB>
 __global__ __launch_bounds__(kMmaWarps * 32)
 void w4a8_codebook_mma_stream_kernel(
     const int8_t* __restrict__ x,
     const int8_t* __restrict__ weight,
+    const int8_t* __restrict__ lsb_tier,
     const int8_t* __restrict__ decode_lut,
     const float* __restrict__ s_channel,
     const float* __restrict__ x_scales,
@@ -334,12 +387,13 @@ void w4a8_codebook_mma_stream_kernel(
     int M, int N, int K, int rows)
 {
     constexpr int S = kStreamStages;
-    constexpr int R = StreamRecord<BITS>::kBytes;
+    constexpr int R = StreamRecord<BITS, LSB>::kBytes;
+    constexpr int Rrec = StreamRecord<BITS, LSB>::kRecordBytes;
     extern __shared__ __align__(16) uint8_t stream_smem[];
     uint4* lut = reinterpret_cast<uint4*>(stream_smem);
     uint2* lut3 = reinterpret_cast<uint2*>(stream_smem);
     float* scale_table = reinterpret_cast<float*>(stream_smem);
-    uint8_t* xs_s = stream_smem + StreamRecord<BITS>::kTableBytes;
+    uint8_t* xs_s = stream_smem + StreamRecord<BITS, LSB>::kTableBytes;
     const int x_stride = rows * 32 + 16;   // +16 keeps the per-token rows off one bank pattern
     uint8_t* stages = xs_s + 8 * x_stride;
 
@@ -352,11 +406,14 @@ void w4a8_codebook_mma_stream_kernel(
     const int splits = static_cast<int>(gridDim.y);
     const int k_begin = split * rows * 32;
 
-    // lanes 0..R/16-1 each move 16 B of the record
-    const int8_t* tile_base = weight
-        + (static_cast<int64_t>(output_tile) * (K / 32) + split * rows) * R + lane * 16;
+    // lanes 0..Rrec/16-1 each move 16 B of the record; with LSB the next 4 lanes move
+    // its tier into the stage right after it
+    const int64_t first_record = static_cast<int64_t>(output_tile) * (K / 32) + split * rows;
+    const int8_t* tile_base = weight + first_record * Rrec + lane * 16;
+    const int8_t* tier_base = lsb_tier + first_record * kLsbTierBytes + (lane - Rrec / 16) * 16;
     auto record = [&](int i) -> const int8_t* {
-        return tile_base + i * R;
+        if (LSB && lane >= Rrec / 16) return tier_base + i * kLsbTierBytes;
+        return tile_base + i * Rrec;
     };
     const bool issuer = active && lane < R / 16;
     const uint8_t* my_stages = stages + warp * S * R;
@@ -367,13 +424,14 @@ void w4a8_codebook_mma_stream_kernel(
         if (issuer) cp_async16(st_s + s * R, record(s));
         cp_async_commit();
     }
-    for (int i = threadIdx.x; i < 256; i += kMmaWarps * 32) {
-        if constexpr (BITS == 4) {
-            lut[i] = reinterpret_cast<const uint4*>(decode_lut)[i];
-        } else if constexpr (BITS == 3) {
-            lut3[i] = reinterpret_cast<const uint2*>(decode_lut)[i];
-        } else {
+    // the [256][2^bits] int8 table, copied in 16-byte words (the 6-bit path builds its
+    // fp8 -> fp32 scale table instead)
+    constexpr int kTableWords = BITS == 6 ? 256 : StreamRecord<BITS, LSB>::kTableBytes / 16;
+    for (int i = threadIdx.x; i < kTableWords; i += kMmaWarps * 32) {
+        if constexpr (BITS == 6) {
             scale_table[i] = load_scale<uint8_t>(static_cast<uint8_t>(i));
+        } else {
+            lut[i] = reinterpret_cast<const uint4*>(decode_lut)[i];
         }
     }
     for (int i = threadIdx.x; i < 8 * rows * 2; i += kMmaWarps * 32) {
@@ -392,16 +450,26 @@ void w4a8_codebook_mma_stream_kernel(
     const uint8_t* xrow = xs_s + token * x_stride + thread_in_group * 4;
     const uint8_t* rec_codes = my_stages + lane * (BITS == 3 ? 4 : 8);
     const uint8_t* rec_codes_hi = my_stages + (BITS == 3 ? 128 + lane * 2 : 256 + lane * 4);
-    const uint8_t* rec_scales = my_stages + (R - 32) + token * 4;
+    const uint8_t* rec_scales = my_stages + (Rrec - 32) + token * 4;
+    const uint8_t* rec_tier = my_stages + Rrec + lane * 2;
     int acc[4] = {};
 
     auto consume = [&](int stage, int i) {
         const unsigned scales = *reinterpret_cast<const unsigned*>(rec_scales + stage * R);
         unsigned decoded[4];
-        if constexpr (BITS == 3) {
+        if constexpr (BITS == 3 && LSB) {
+            const unsigned a = *reinterpret_cast<const unsigned*>(rec_codes + stage * R);
+            const unsigned b = *reinterpret_cast<const unsigned short*>(rec_codes_hi + stage * R);
+            const unsigned tier = *reinterpret_cast<const unsigned short*>(rec_tier + stage * R);
+            decode_w3a8_lsb_record_smem(a, b, tier, scales, lut, decoded);
+        } else if constexpr (BITS == 3) {
             const unsigned a = *reinterpret_cast<const unsigned*>(rec_codes + stage * R);
             const unsigned b = *reinterpret_cast<const unsigned short*>(rec_codes_hi + stage * R);
             decode_w3a8_record_smem(a, b, scales, lut3, decoded);
+        } else if constexpr (BITS == 4 && LSB) {
+            const uint2 packed = *reinterpret_cast<const uint2*>(rec_codes + stage * R);
+            const unsigned tier = *reinterpret_cast<const unsigned short*>(rec_tier + stage * R);
+            decode_w4a8_lsb_record_smem(packed, tier, scales, lut, decoded);
         } else if constexpr (BITS == 4) {
             const uint2 packed = *reinterpret_cast<const uint2*>(rec_codes + stage * R);
             decode_w4a8_record_smem(packed, scales, lut, decoded);
@@ -592,9 +660,12 @@ __global__ void pack_w4a8_slabs_kernel(uint8_t* data, const uint8_t* scales,
 
 // Read record-stream weights directly into one canonical INT8 GEMM chunk.
 // One thread writes a 16-code group; n0/cols may cut across a 16-output record.
-template <int BITS>
+// With LSB, tiers is the 64-byte-per-record low-bit tier region and codebook the
+// (BITS + 1)-bit table.
+template <int BITS, bool LSB>
 __global__ void dequant_w4a8_mma_chunk_kernel(
-    const uint8_t* __restrict__ packed, const float* __restrict__ codebook,
+    const uint8_t* __restrict__ packed, const uint8_t* __restrict__ tiers,
+    const float* __restrict__ codebook,
     int8_t* __restrict__ out, long n_groups, int n0, int K)
 {
     const long v = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -630,9 +701,13 @@ __global__ void dequant_w4a8_mma_chunk_kernel(
         } else {
             codes = *reinterpret_cast<const unsigned short*>(record + lane * 8 + j * 2);
         }
+        unsigned tier = 0;
+        if constexpr (LSB)
+            tier = *reinterpret_cast<const unsigned short*>(tiers + rec * kLsbTierBytes + lane * 2) >> j;
         #pragma unroll
         for (int c = 0; c < 4; ++c) {
-            const unsigned code = (codes >> (BITS * c)) & ((1u << BITS) - 1);
+            unsigned code = (codes >> (BITS * c)) & ((1u << BITS) - 1);
+            if constexpr (LSB) code = (code << 1) | ((tier >> (4 * c)) & 1u);
             const float level = BITS == 6 ? code_level(code, 32.0f)
                 : (codebook ? codebook[code] : code_level(code, 8.0f));
             values[g * 4 + c] = level_to_int8(level, scale);
@@ -668,25 +743,30 @@ extern "C" void launch_pack_w4a8_mma_inplace(
         pack_w4a8_slabs_kernel<6, true><<<1, 1024, 0, stream>>>(bytes, static_cast<const uint8_t*>(scales), temp, 0, last, K);
 }
 
+// bits is the decoded code width; with lsb_tier the stream is one bit narrower.
 static void launch_dequant_w4a8_mma_chunk(
-    const void* packed, const void* codebook, void* out,
+    const void* packed, const void* lsb_tier, const void* codebook, void* out,
     int64_t n0, int64_t cols, int64_t K, int64_t bits, cudaStream_t stream)
 {
     const long n_groups = (long)cols * K / 16;
     const int block = 256;
     const long grid = (n_groups + block - 1) / block;
-    if (bits == 6)
-        dequant_w4a8_mma_chunk_kernel<6><<<grid, block, 0, stream>>>(
-            static_cast<const uint8_t*>(packed), nullptr, static_cast<int8_t*>(out),
-            n_groups, n0, K);
-    else if (bits == 3)
-        dequant_w4a8_mma_chunk_kernel<3><<<grid, block, 0, stream>>>(
-            static_cast<const uint8_t*>(packed), static_cast<const float*>(codebook), static_cast<int8_t*>(out),
-            n_groups, n0, K);
-    else
-        dequant_w4a8_mma_chunk_kernel<4><<<grid, block, 0, stream>>>(
-            static_cast<const uint8_t*>(packed), static_cast<const float*>(codebook), static_cast<int8_t*>(out),
-            n_groups, n0, K);
+    const auto* bytes = static_cast<const uint8_t*>(packed);
+    const auto* tiers = static_cast<const uint8_t*>(lsb_tier);
+    const auto* cb = static_cast<const float*>(codebook);
+    auto* o = static_cast<int8_t*>(out);
+    if (tiers) {
+        if (bits == 4)
+            dequant_w4a8_mma_chunk_kernel<3, true><<<grid, block, 0, stream>>>(bytes, tiers, cb, o, n_groups, n0, K);
+        else
+            dequant_w4a8_mma_chunk_kernel<4, true><<<grid, block, 0, stream>>>(bytes, tiers, cb, o, n_groups, n0, K);
+    } else if (bits == 6) {
+        dequant_w4a8_mma_chunk_kernel<6, false><<<grid, block, 0, stream>>>(bytes, nullptr, nullptr, o, n_groups, n0, K);
+    } else if (bits == 3) {
+        dequant_w4a8_mma_chunk_kernel<3, false><<<grid, block, 0, stream>>>(bytes, nullptr, cb, o, n_groups, n0, K);
+    } else {
+        dequant_w4a8_mma_chunk_kernel<4, false><<<grid, block, 0, stream>>>(bytes, nullptr, cb, o, n_groups, n0, K);
+    }
 }
 
 // codebook: 2^bits floats (non-uniform levels) or, at 4 bits, nullptr for uniform (q-8); ignored at 6 bits.
@@ -727,7 +807,7 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
     void* workspace,       // [chunk_cols, K] int8 scratch (preallocated, reused)
     void* out,             // [M, N] output (out_dtype)
     int64_t M, int64_t N, int64_t K, int64_t G, int64_t chunk_cols, int64_t bits,
-    bool mma_packed, int out_dtype_code, cudaStream_t stream)
+    bool mma_packed, const void* lsb_tier, int out_dtype_code, cudaStream_t stream)
 {
     // A non-positive chunk stride never advances n0 -> would loop forever; a non-positive
     // K/G would divide by zero below. Bail so the caller uses the 2-pass path.
@@ -736,7 +816,7 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
     for (int64_t n0 = 0; n0 < N; n0 += chunk_cols) {
         const int64_t cols = (chunk_cols < N - n0) ? chunk_cols : (N - n0);
         if (mma_packed) {
-            launch_dequant_w4a8_mma_chunk(weight, codebook, workspace, n0, cols, K, bits, stream);
+            launch_dequant_w4a8_mma_chunk(weight, lsb_tier, codebook, workspace, n0, cols, K, bits, stream);
         } else {
             launch_dequant_int4_grouped_to_int8_e4m3(
                 static_cast<const int8_t*>(weight) + n0 * row_bytes,
@@ -755,20 +835,22 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
     return true;
 }
 
-// bits (3, 4 or 6) is the code width. The workspace [M, N] int32 and counters [N/16] int32 must
-// be zero on entry and are zero again on exit, so the caller keeps both across
-// launches. residual [M, N] and residual_scale [N] are in the output dtype (both or
-// neither).
+// bits is the decoded code width: 3, 4 or 6 for a plain record stream, 4 or 5 with an
+// lsb_tier (a 3- or 4-bit stream plus its low-bit tier). decode_lut is [256, 2^bits].
+// The workspace [M, N] int32 and counters [N/16] int32 must be zero on entry and are
+// zero again on exit, so the caller keeps both across launches. residual [M, N] and
+// residual_scale [N] are in the output dtype (both or neither).
 extern "C" bool launch_w4a8_codebook_mma(
-    const void* xq, const void* weight, const void* decode_lut,
+    const void* xq, const void* weight, const void* lsb_tier, const void* decode_lut,
     const void* s_channel, const void* xs, const void* bias, const void* residual,
     const void* residual_scale, void* workspace, void* counters, void* out,
     int64_t M, int64_t N, int64_t K, int64_t G, int64_t bits,
     int out_dtype_code, cudaStream_t stream)
 {
     if (M == 0 || N == 0 || K == 0) return true;
+    const bool width_ok = lsb_tier ? (bits == 4 || bits == 5) : (bits == 3 || bits == 4 || bits == 6);
     if (M > 8 || (bits != 6 && decode_lut == nullptr) || N > std::numeric_limits<int>::max()
-            || (bits != 3 && bits != 4 && bits != 6)
+            || !width_ok
             || K > std::numeric_limits<int>::max() || N % 16 != 0
             || G != 16 || K % 256 != 0) {
         return false;
@@ -783,16 +865,17 @@ extern "C" bool launch_w4a8_codebook_mma(
     }
     const int rows = K % 512 == 0 ? 16 : 8;
     const int splits = static_cast<int>(K) / 32 / rows;
-    auto launch = [&]<int BITS>() {
+    auto launch = [&]<int BITS, bool LSB>() {
         constexpr int OutputsPerBlock = kMmaWarps * 16;
         const dim3 grid(
             static_cast<unsigned int>((N + OutputsPerBlock - 1) / OutputsPerBlock),
             static_cast<unsigned int>(splits));
         DISPATCH_FP_DTYPE(out_dtype_code, OutputT, [&] {
-            w4a8_codebook_mma_stream_kernel<OutputT, BITS>
-                <<<grid, kMmaWarps * 32, w4a8_stream_smem_bytes<BITS>(rows), stream>>>(
+            w4a8_codebook_mma_stream_kernel<OutputT, BITS, LSB>
+                <<<grid, kMmaWarps * 32, w4a8_stream_smem_bytes<BITS, LSB>(rows), stream>>>(
                 static_cast<const int8_t*>(xq),
                 static_cast<const int8_t*>(weight),
+                static_cast<const int8_t*>(lsb_tier),
                 static_cast<const int8_t*>(decode_lut),
                 static_cast<const float*>(s_channel),
                 static_cast<const float*>(xs),
@@ -805,9 +888,11 @@ extern "C" bool launch_w4a8_codebook_mma(
                 static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), rows);
         });
     };
-    if (bits == 4) launch.template operator()<4>();
-    else if (bits == 3) launch.template operator()<3>();
-    else launch.template operator()<6>();
+    if (lsb_tier && bits == 4) launch.template operator()<3, true>();
+    else if (lsb_tier) launch.template operator()<4, true>();
+    else if (bits == 4) launch.template operator()<4, false>();
+    else if (bits == 3) launch.template operator()<3, false>();
+    else launch.template operator()<6, false>();
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
         throw std::runtime_error(std::string("W4A8 packed MMA failed: ") + cudaGetErrorString(error));
