@@ -341,7 +341,8 @@ class TestSumIndexedValuesTriton:
         image = _image(16, 1536, 5376, device="cuda")
         index_matrix = _index(1536, 5376, "runs", device="cuda")
         counts = torch.bincount(index_matrix.view(-1))
-        assert counts.max().item() > 1536 * 5376 // 2
+        # about half: the copied pixels move some in or out of the group, so not always more
+        assert counts.max().item() > 1536 * 5376 * 2 // 5
         got, ref, ref64 = self._check(image, index_matrix)
         # never further from the fp64 reference than the current path
         got_max, got_mean = _errors(got, ref64)
@@ -361,7 +362,6 @@ class TestSumIndexedValuesTriton:
             (image, index_matrix.int()),  # int32 index
             (wide, index_matrix),  # > 16 channels
             (image.permute(1, 2, 0).contiguous().permute(2, 0, 1), index_matrix),  # strided
-            (image, index_matrix.t().contiguous().t()),
         ]
         for img, idx in cases:
             kwargs = _kwargs(img, idx)
@@ -370,6 +370,11 @@ class TestSumIndexedValuesTriton:
             with ck.use_backend("triton"):
                 got = ck.sum_indexed_values(img, idx)
             assert torch.equal(got, _stock_sum_indexed_values(img, idx))
+        # a strided index goes to eager too; like the stock view(-1), eager does not take it
+        # (unique_pixels gives a contiguous index), so only the dispatch is checked
+        kwargs = _kwargs(image, index_matrix.t().contiguous().t())
+        assert not registry.validate_backend_for_call("triton", OP, kwargs).success
+        assert registry.get_capable_backend(OP, kwargs) == "eager"
         # deterministic algorithms: eager, whose index_add_ is deterministic on CUDA then
         image = _image(16, 48, 168, device="cuda")
         index_matrix = _index(48, 168, "runs", device="cuda")
