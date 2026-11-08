@@ -149,6 +149,8 @@ __all__ = [
     "connected_components",
     "edge_collapse_checks",
     "min_cut",
+    # Indexed reductions
+    "sum_indexed_values",
     # Utilities
     "swap_nibbles",
     "to_blocked",
@@ -1337,6 +1339,21 @@ def min_cut(nbr: torch.Tensor, cap: torch.Tensor, s_cap: torch.Tensor, t_cap: to
     kwargs = {"nbr": nbr, "cap": cap, "s_cap": s_cap, "t_cap": t_cap}
     impl = registry.get_implementation("min_cut", kwargs=kwargs)
     return impl(**kwargs)
+
+
+def sum_indexed_values(image: torch.Tensor, index_matrix: torch.Tensor) -> torch.Tensor:
+    """Per-group channel sums: ``out[g] = image[:, index_matrix == g].sum(-1)``.
+
+    image ``[C, H, W]``, index_matrix ``[H, W]`` int32 / int64 with values >= 0. Returns
+    ``[U, C]`` of image's dtype, ``U = index_matrix.max() + 1``; an index no pixel has gives a
+    zero row. This is ComfyUI's ``sum_indexed_values`` in the VOID warped-noise
+    ``regaussianize`` (``comfy_extras/void_noise_warp.py``: ``max().item()``, ``torch.zeros``,
+    ``index_add_`` over the ``(h w) c`` view of the image). On a GPU the sums are atomic adds,
+    so the last bits of a group spread over many pixels can vary from call to call, as with
+    ``index_add_``; under ``torch.use_deterministic_algorithms(True)`` the call runs
+    ``index_add_``, which PyTorch makes deterministic.
+    """
+    return torch.ops.comfy_kitchen.sum_indexed_values(image, index_matrix)
 
 
 # =============================================================================
