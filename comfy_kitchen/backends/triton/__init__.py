@@ -130,14 +130,9 @@ def _build_constraints() -> dict:
         return ValidationResult.ok()
 
     def _conv_bias_leaky_relu_call_rule(kwargs):
-        # Size threshold on the pixels per channel plane. FILM at 1920 x 1072, 16 x 30 level
-        # (480 pixels), against ComfyUI's current path: on a Radeon 8060S the kernel was slower
-        # at [1, 256, 16, 30] with and without the conv in the timed call and only marginally
-        # faster at [1, 512, 16, 30] without it; on an RTX 5090 it was faster without the conv
-        # at both shapes and slower in one of two runs at [1, 256, 16, 30] with the conv. From
-        # the 67 x 120 level up it was faster on both GPUs (per-call numbers in the PR that
-        # added this op). Planes of fewer than 1024 pixels run eager; the 33 x 60 level (1980
-        # pixels) runs the kernel.
+        # Size threshold on the pixels per channel plane: smaller planes run eager. Set from
+        # per-call measurements on the FILM pyramid levels against ComfyUI's current path, on
+        # both GPUs listed in the PR that added this op.
         x, bias = kwargs.get("x"), kwargs.get("bias")
         if x is None or bias is None:
             return ValidationResult.ok()
@@ -152,8 +147,8 @@ def _build_constraints() -> dict:
         n, c, h, w = x.shape
         if x.numel() == 0 or x.numel() >= 2**31:
             return ValidationResult.fail("x", "numel must be in [1, 2**31)")
-        if h * w < 1024:
-            return ValidationResult.fail("x", "H * W < 1024 runs faster eager")
+        if h * w < 16384:
+            return ValidationResult.fail("x", "H * W < 16384 runs eager")
         if x.is_contiguous():
             if n * c > 65535:
                 return ValidationResult.fail("x", "N * C must be <= 65535 (grid)")

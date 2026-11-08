@@ -153,14 +153,14 @@ class TestConvBiasLeakyReluCallRule:
             (64, 1072, 1920, True),  # FILM level 0
             (128, 536, 960, True),
             (256, 268, 480, True),
-            (512, 134, 240, True),
-            (256, 67, 120, True),
-            (512, 33, 60, True),  # 1980 pixels per plane
-            (512, 16, 30, False),  # 480: runs eager
+            (512, 134, 240, True),  # 32160 pixels per plane
+            (256, 67, 120, False),  # 8040: runs eager
+            (512, 33, 60, False),
+            (512, 16, 30, False),
             (256, 16, 30, False),
             (64, 16, 30, False),
-            (8, 32, 32, True),  # 1024
-            (8, 31, 33, False),  # 1023
+            (8, 128, 128, True),  # 16384
+            (8, 127, 129, False),  # 16383
         ],
     )
     def test_call_rule_sizes(self, c, h, w, layout, ok):
@@ -177,29 +177,29 @@ class TestConvBiasLeakyReluCallRule:
         ],
     )
     def test_call_rule_dtypes(self, x_dtype, bias_dtype, ok):
-        kwargs = _kwargs(_meta(1, 64, 34, 60, dtype=x_dtype), _meta_bias(64, bias_dtype))
+        kwargs = _kwargs(_meta(1, 64, 128, 128, dtype=x_dtype), _meta_bias(64, bias_dtype))
         assert _call_rule()(kwargs).success == ok
 
     def test_call_rule_layouts(self):
         bias = _meta_bias(64)
-        strided = _meta(1, 64, 68, 60)[:, :, ::2]
+        strided = _meta(1, 64, 256, 128)[:, :, ::2]
         assert not _call_rule()(_kwargs(strided, bias)).success
-        permuted = _meta(1, 34, 64, 60).transpose(1, 2)
+        permuted = _meta(1, 128, 64, 128).transpose(1, 2)
         assert not _call_rule()(_kwargs(permuted, bias)).success
         bias2 = _meta_bias(128)[::2]
-        assert not _call_rule()(_kwargs(_meta(1, 64, 34, 60), bias2)).success
+        assert not _call_rule()(_kwargs(_meta(1, 64, 128, 128), bias2)).success
 
     def test_call_rule_limits(self):
         # 2**31 elements
         assert not _call_rule()(_kwargs(_meta(1, 1024, 2048, 1024), _meta_bias(1024))).success
         assert _call_rule()(_kwargs(_meta(1, 1023, 2048, 1024), _meta_bias(1023))).success
         # contiguous: N * C is a grid dimension
-        assert not _call_rule()(_kwargs(_meta(2, 32768, 32, 32), _meta_bias(32768))).success
-        assert _call_rule()(_kwargs(_meta(1, 65535, 32, 32), _meta_bias(65535))).success
+        assert not _call_rule()(_kwargs(_meta(2, 32768, 128, 128), _meta_bias(32768))).success
+        assert _call_rule()(_kwargs(_meta(1, 65535, 128, 128), _meta_bias(65535))).success
         # channels_last: all channels in one tile
-        x = _meta(1, 2048, 32, 32, "channels_last")
+        x = _meta(1, 2048, 128, 128, "channels_last")
         assert not _call_rule()(_kwargs(x, _meta_bias(2048))).success
-        x = _meta(1, 1024, 32, 32, "channels_last")
+        x = _meta(1, 1024, 128, 128, "channels_last")
         assert _call_rule()(_kwargs(x, _meta_bias(1024))).success
 
     def test_fp16_only(self):
@@ -236,13 +236,12 @@ class TestConvBiasLeakyReluTriton:
     @pytest.mark.parametrize(
         ("n", "c", "h", "w"),
         [
-            (1, 64, 67, 120),
-            (1, 512, 33, 60),
-            (1, 256, 34, 60),
+            (1, 512, 134, 240),
+            (1, 256, 134, 240),
             (1, 16, 134, 240),
-            (2, 32, 37, 61),  # odd plane, batch 2
-            (1, 24, 40, 33),  # C not a power of two
-            (1, 3, 32, 32),
+            (2, 32, 129, 131),  # odd plane, batch 2
+            (1, 24, 130, 129),  # C not a power of two
+            (1, 3, 128, 128),
         ],
     )
     def test_matches_eager(self, n, c, h, w, layout):
@@ -251,11 +250,11 @@ class TestConvBiasLeakyReluTriton:
 
     @pytest.mark.parametrize("slope", [0.0, 0.01, 1.5])
     def test_negative_slope(self, slope):
-        x = _conv_out(1, 64, 34, 60, "contiguous", device="cuda")
+        x = _conv_out(1, 64, 128, 128, "contiguous", device="cuda")
         self._check(x, _bias(64, device="cuda"), slope)
 
     def test_special_values(self):
-        x = _conv_out(1, 8, 32, 40, "contiguous", device="cuda")
+        x = _conv_out(1, 8, 128, 128, "contiguous", device="cuda")
         flat = x.view(-1)
         flat[:6] = torch.tensor(
             [float("inf"), -float("inf"), float("nan"), 65504.0, -65504.0, 0.0],
@@ -263,6 +262,7 @@ class TestConvBiasLeakyReluTriton:
         )
         bias = _bias(8, device="cuda")
         bias[0] = 65504.0  # overflows to inf in the fp16 add
+        assert registry.get_capable_backend(OP, _kwargs(x, bias)) == "triton"
         ref = _stock_chain(x.clone(), bias)
         with ck.use_backend("triton"):
             got = ck.conv_bias_leaky_relu_(x, bias)
@@ -271,15 +271,15 @@ class TestConvBiasLeakyReluTriton:
 
     def test_unaligned_view(self):
         # a conv output view at an odd element offset (pointer not 16-byte aligned)
-        base = torch.randn(1 * 64 * 34 * 60 + 1, device="cuda").to(torch.float16)
-        x = base[1:].view(1, 64, 34, 60)
+        base = torch.randn(1 * 64 * 128 * 128 + 1, device="cuda").to(torch.float16)
+        x = base[1:].view(1, 64, 128, 128)
         self._check(x, _bias(64, device="cuda"))
 
     @pytest.mark.parametrize("layout", _LAYOUTS)
     def test_film_conv_matches_stock(self, layout):
         # FilmConv2d with activation on the GPU: the stock conv with bias + nn.LeakyReLU(0.2)
         # against the conv without bias + this op
-        x = _conv_out(1, 32, 67, 120, layout, device="cuda")
+        x = _conv_out(1, 32, 134, 240, layout, device="cuda")
         conv = nn.Conv2d(32, 64, 3, padding=1, device="cuda", dtype=torch.float16)
         if layout == "channels_last":
             conv = conv.to(memory_format=torch.channels_last)
@@ -299,7 +299,13 @@ class TestConvBiasLeakyReluTriton:
 
     def test_unsupported_inputs_go_to_eager(self):
         cases = [
-            # the 16 x 30 FILM level (below the size threshold), both layouts
+            # the 67 x 120, 33 x 60 and 16 x 30 FILM levels (below the size threshold), both
+            # layouts
+            (_conv_out(1, 256, 67, 120, "contiguous", device="cuda"), _bias(256, device="cuda")),
+            (
+                _conv_out(1, 512, 33, 60, "channels_last", device="cuda"),
+                _bias(512, device="cuda"),
+            ),
             (_conv_out(1, 512, 16, 30, "contiguous", device="cuda"), _bias(512, device="cuda")),
             (
                 _conv_out(1, 256, 16, 30, "channels_last", device="cuda"),
@@ -307,23 +313,26 @@ class TestConvBiasLeakyReluTriton:
             ),
             # bf16 / fp32, an fp32 bias with fp16 x
             (
-                _conv_out(1, 64, 34, 60, "contiguous", device="cuda", dtype=torch.bfloat16),
+                _conv_out(1, 64, 128, 128, "contiguous", device="cuda", dtype=torch.bfloat16),
                 _bias(64, device="cuda", dtype=torch.bfloat16),
             ),
             (
-                _conv_out(1, 64, 34, 60, "contiguous", device="cuda", dtype=torch.float32),
+                _conv_out(1, 64, 128, 128, "contiguous", device="cuda", dtype=torch.float32),
                 _bias(64, device="cuda", dtype=torch.float32),
             ),
             (
-                _conv_out(1, 64, 34, 60, "contiguous", device="cuda"),
+                _conv_out(1, 64, 128, 128, "contiguous", device="cuda"),
                 _bias(64, device="cuda", dtype=torch.float32),
             ),
             # a strided view, a non-contiguous bias
             (
-                _conv_out(1, 64, 68, 60, "contiguous", device="cuda")[:, :, ::2],
+                _conv_out(1, 64, 256, 128, "contiguous", device="cuda")[:, :, ::2],
                 _bias(64, device="cuda"),
             ),
-            (_conv_out(1, 64, 34, 60, "contiguous", device="cuda"), _bias(128, device="cuda")[::2]),
+            (
+                _conv_out(1, 64, 128, 128, "contiguous", device="cuda"),
+                _bias(128, device="cuda")[::2],
+            ),
         ]
         for x, bias in cases:
             kwargs = _kwargs(x, bias)
@@ -335,6 +344,6 @@ class TestConvBiasLeakyReluTriton:
             assert got is x
             assert torch.equal(got, ref)
         # CPU tensors go to eager
-        kwargs = _kwargs(_conv_out(1, 64, 34, 60, "contiguous"), _bias(64))
+        kwargs = _kwargs(_conv_out(1, 64, 128, 128, "contiguous"), _bias(64))
         assert not registry.validate_backend_for_call("triton", OP, kwargs).success
         assert registry.get_capable_backend(OP, kwargs) == "eager"
