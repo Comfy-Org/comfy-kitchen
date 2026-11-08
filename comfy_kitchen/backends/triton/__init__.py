@@ -130,12 +130,14 @@ def _build_constraints() -> dict:
         return ValidationResult.ok()
 
     def _conv_bias_leaky_relu_call_rule(kwargs):
-        # Size threshold on the pixels per channel plane. FILM at 1920 x 1072: at the 16 x 30
-        # level ([1, 512, 16, 30] and [1, 256, 16, 30], with and without the conv in the
-        # timed call) the kernel was slower than ComfyUI's current path on a Radeon 8060S, and
-        # with the conv on an RTX 5090; from the 67 x 120 level up it was faster on both GPUs
-        # (per-call numbers in the PR that added this op). Planes of fewer than 1024 pixels
-        # (16 x 30 = 480) run eager; the 33 x 60 level (1980) runs the kernel.
+        # Size threshold on the pixels per channel plane. FILM at 1920 x 1072, 16 x 30 level
+        # (480 pixels), against ComfyUI's current path: on a Radeon 8060S the kernel was slower
+        # at [1, 256, 16, 30] with and without the conv in the timed call and only marginally
+        # faster at [1, 512, 16, 30] without it; on an RTX 5090 it was faster without the conv
+        # at both shapes and slower in one of two runs at [1, 256, 16, 30] with the conv. From
+        # the 67 x 120 level up it was faster on both GPUs (per-call numbers in the PR that
+        # added this op). Planes of fewer than 1024 pixels run eager; the 33 x 60 level (1980
+        # pixels) runs the kernel.
         x, bias = kwargs.get("x"), kwargs.get("bias")
         if x is None or bias is None:
             return ValidationResult.ok()
