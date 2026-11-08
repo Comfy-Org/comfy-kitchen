@@ -2488,6 +2488,10 @@ def pack_w4a8_mma_weight_(dest: torch.Tensor, s_rel: torch.Tensor):
     n, groups = s_rel.shape
     k = groups * 16
     bits = 4 if dest.numel() == n * k * 9 // 16 else 6
+    if bits == 4:
+        # Packing runs eagerly; build the decode table here so a first decode that
+        # lands inside CUDA graph capture does not copy it from pageable host memory.
+        _w4a8_fixed_decode_lut(dest.device)
     scales = s_rel.view(torch.uint8).clone()
     scratch = torch.empty(2 * k * bits, dtype=torch.uint8, device=dest.device)
     _C.pack_w4a8_mma_inplace(
