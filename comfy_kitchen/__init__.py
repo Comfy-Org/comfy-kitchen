@@ -1048,7 +1048,7 @@ def qk_layernorm_rope_partial(
         q_weight, q_bias, k_weight, k_bias: LayerNorm affine parameters ``[head_dim]`` in
             q's dtype.
         cos, sin: RoPE tables ``[S - text_len, head_dim]``.
-        text_len: Number of leading text tokens (normalized, not rotated).
+        text_len: Number of leading text tokens (normalized, not rotated), < S.
         heads: Number of attention heads.
         eps: LayerNorm epsilon.
 

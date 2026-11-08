@@ -99,8 +99,9 @@ def _check(q, k, q_weight, q_bias, k_weight, k_bias, cos, sin, text_len, heads):
         if t.dtype != q.dtype or t.device != q.device:
             raise ValueError(f"{name}: weights and biases must have q's dtype and device")
     seq = q.shape[1]
-    if not 0 <= text_len <= seq:
-        raise ValueError(f"{name}: text_len {text_len} must be in [0, {seq}]")
+    # at least one video token: the stock rotation cannot reshape an empty video slice
+    if not 0 <= text_len < seq:
+        raise ValueError(f"{name}: text_len {text_len} must be in [0, {seq})")
     expected = (seq - text_len, head_dim)
     for t in (cos, sin):
         if tuple(t.shape) != expected:
