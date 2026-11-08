@@ -286,7 +286,8 @@ class TestQkvInterleavedQkRmsNormCallRule:
             (2, 4097, 4097, 16, 128, True, True),  # Hunyuan3D-2.1 self-attention
             (2, 4097, 1370, 16, 128, False, True),  # Hunyuan3D-2.1 cross-attention
             (1, 4097, 4097, 16, 128, True, True),  # batch 1
-            (1, 300, 300, 1, 128, True, True),
+            (1, 300, 300, 2, 128, True, True),
+            (1, 300, 300, 1, 128, True, False),  # one head (stock v is a strided view)
             (1, 300, 77, 32, 128, False, True),
             (1, 300, 300, 64, 128, True, False),  # more than 32 heads
             (1, 300, 300, 12, 128, True, False),  # heads not a power of 2
@@ -295,8 +296,8 @@ class TestQkvInterleavedQkRmsNormCallRule:
             (1, 0, 0, 16, 128, True, False),  # empty sequence
             (0, 300, 300, 16, 128, True, False),  # empty batch
             (1, 300, 0, 16, 128, False, False),  # no k / v tokens
-            (1, 2**31, 77, 1, 128, False, False),  # 2**31 tokens
-            (1, 2**31 - 1, 77, 1, 128, False, True),
+            (1, 2**31, 77, 2, 128, False, False),  # 2**31 tokens
+            (1, 2**31 - 1, 77, 2, 128, False, True),
         ],
     )
     def test_call_rule(self, batch, seq, seq_kv, heads, head_dim, q_interleaved, ok):
@@ -370,7 +371,7 @@ class TestQkvInterleavedQkRmsNormTriton:
         inputs = _inputs(batch, seq, seq_kv, 16, 128, device="cuda", dtype=torch.float16)
         self._check(inputs, 16, q_interleaved=q_interleaved)
 
-    @pytest.mark.parametrize("heads", [1, 2, 8, 32])
+    @pytest.mark.parametrize("heads", [2, 8, 32])
     @pytest.mark.parametrize("q_interleaved", [True, False])
     def test_other_head_counts(self, heads, q_interleaved):
         inputs = _inputs(
@@ -435,6 +436,13 @@ class TestQkvInterleavedQkRmsNormTriton:
         fp16 = torch.float16
         # head_dim 64
         expect_eager(_inputs(1, 9, 5, 4, 64, device="cuda", dtype=fp16), 4, q_interleaved=False)
+        # one head (the stock v is a strided view of the concatenation)
+        for q_interleaved in (True, False):
+            expect_eager(
+                _inputs(1, 9, 9 if q_interleaved else 5, 1, 128, device="cuda", dtype=fp16),
+                1,
+                q_interleaved=q_interleaved,
+            )
         # 12 heads
         expect_eager(_inputs(1, 9, 9, 12, 128, device="cuda", dtype=fp16), 12)
         # q, k, v as chunks of one projection (not contiguous)

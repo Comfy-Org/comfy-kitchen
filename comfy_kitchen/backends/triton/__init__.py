@@ -146,8 +146,9 @@ def _build_constraints() -> dict:
         # the sum of squares follows torch's rms kernel order for head_dim 128
         if channels != heads * 128:
             return ValidationResult.fail("q", "head_dim must be 128")
-        if heads not in (1, 2, 4, 8, 16, 32):
-            return ValidationResult.fail("q", "heads must be a power of 2, at most 32")
+        # with one head the stock v (and the q / k norm inputs) are strided views, not copies
+        if heads not in (2, 4, 8, 16, 32):
+            return ValidationResult.fail("q", "heads must be a power of 2 from 2 to 32")
         if any(not t.is_contiguous() for t in tensors):
             return ValidationResult.fail("q", "q, k, v and the weights must be contiguous")
         if batch_size * max(seq, seq_kv) >= 2**31:
