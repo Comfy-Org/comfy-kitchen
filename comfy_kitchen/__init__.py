@@ -425,8 +425,11 @@ def flow_warp_cat(
         images = [images]
     if isinstance(flows, torch.Tensor):
         flows = [flows]
+    if scales is not None and len(scales) == 0:
+        raise ValueError("flow_warp_cat: scales must have one entry per flow")
+    # the custom op takes an empty list for no scales
     return torch.ops.comfy_kitchen.flow_warp_cat(
-        list(images), list(flows), grid_x, grid_y, prefix, None if scales is None else list(scales)
+        list(images), list(flows), grid_x, grid_y, prefix, [] if scales is None else list(scales)
     )
 
 

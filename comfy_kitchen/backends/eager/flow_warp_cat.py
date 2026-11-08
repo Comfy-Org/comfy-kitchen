@@ -97,9 +97,12 @@ def _op_flow_warp_cat(
     flows: list[torch.Tensor],
     grid_x: torch.Tensor,
     grid_y: torch.Tensor,
-    prefix: torch.Tensor | None = None,
-    scales: list[torch.Tensor] | None = None,
+    prefix: torch.Tensor | None,
+    scales: list[torch.Tensor],
 ) -> torch.Tensor:
+    # an empty scales list means no scales: "Tensor[]?" is a custom op schema type only from
+    # torch 2.15
+    scales = scales or None
     _check(images, flows, grid_x, grid_y, prefix, scales)
     kwargs = {
         "images": images,
@@ -114,7 +117,8 @@ def _op_flow_warp_cat(
 
 
 @_op_flow_warp_cat.register_fake
-def _op_flow_warp_cat_fake(images, flows, grid_x, grid_y, prefix=None, scales=None):
+def _op_flow_warp_cat_fake(images, flows, grid_x, grid_y, prefix, scales):
+    scales = scales or None
     _check(images, flows, grid_x, grid_y, prefix, scales)
     batch, _, height, width = flows[0].shape
     channels = sum(i.shape[1] for i in images)
