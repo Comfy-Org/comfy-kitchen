@@ -27,6 +27,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "flow_warp_cat",
 ]
 
 # Try to import triton and register if available
@@ -54,6 +55,7 @@ try:
     )
 
     from .adaln import adaln, rms_adaln
+    from .flow_warp_cat import flow_warp_cat
     from .na import na3d
     from .quantization import (
         dequantize_nvfp4,
@@ -125,6 +127,65 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _flow_warp_cat_call_rule(kwargs):
+        # No size threshold: at the FILM frame interpolation shapes measured (1920 x 1072 frames,
+        # fp16, every flow estimator and fusion level) the kernel was faster than ComfyUI's
+        # current path on an RTX 5090 and on a Radeon 8060S, with an output equal to it
+        # (per-call numbers in the PR that added this op).
+        images, flows = kwargs.get("images"), kwargs.get("flows")
+        grid_x, grid_y = kwargs.get("grid_x"), kwargs.get("grid_y")
+        prefix, scales = kwargs.get("prefix"), kwargs.get("scales")
+        if not images or not flows or grid_x is None or grid_y is None:
+            return ValidationResult.ok()
+        if len(images) == 1 and prefix is not None and scales is None:
+            tensors = [images[0], flows[0], prefix]
+            out_channels = prefix.shape[1] + images[0].shape[1]
+        elif len(images) == 2 and prefix is None and scales is not None and len(scales) == 2:
+            i0, i1 = images
+            if i0.shape != i1.shape or i0.stride() != i1.stride():
+                return ValidationResult.fail(
+                    "images", "images must have the same shape and strides"
+                )
+            if flows[0].stride() != flows[1].stride():
+                return ValidationResult.fail("flows", "flows must have the same strides")
+            for s in scales:
+                if s.numel() != 1 or s.dtype != torch.float16:
+                    return ValidationResult.fail("scales", "scales must be one float16 value each")
+            tensors = [*images, *flows, *scales]
+            out_channels = 2 * i0.shape[1] + 4
+        else:
+            return ValidationResult.fail(
+                "images", "one image with a prefix, or two images with scales, are supported"
+            )
+        height, width = images[0].shape[2:]
+        for t in tensors:
+            if t.dtype != torch.float16:
+                return ValidationResult.fail("images", "images, flows and prefix must be float16")
+            if t.device != grid_x.device:
+                return ValidationResult.fail("images", "all tensors must be on grid_x's device")
+            if t.numel() == 0:
+                return ValidationResult.fail("images", "empty tensors are not supported")
+            if sum((n - 1) * st for n, st in zip(t.shape, t.stride(), strict=True)) >= 2**31:
+                return ValidationResult.fail("images", "element offsets must be < 2**31")
+        for image, flow in zip(images, flows, strict=True):
+            if image.shape[0] != 1 or flow.shape[0] != 1:
+                return ValidationResult.fail("images", "batch must be 1")
+            if image.shape[2:] != flow.shape[2:]:
+                return ValidationResult.fail(
+                    "flows", "flows must have the images' height and width"
+                )
+        if grid_x.device != grid_y.device:
+            return ValidationResult.fail("grid_y", "grid_y must be on grid_x's device")
+        if grid_x.numel() != width or grid_y.numel() != height:
+            return ValidationResult.fail("grid_x", "grid_x must have W and grid_y H elements")
+        if (width > 1 and grid_x.stride(0) != 1) or (height > 1 and grid_y.stride(0) != 1):
+            return ValidationResult.fail("grid_x", "grid_x and grid_y must be contiguous")
+        if out_channels * height * width >= 2**31:
+            return ValidationResult.fail("images", "output numel must be < 2**31")
+        if (out_channels + 15) // 16 > 65535:
+            return ValidationResult.fail("images", "too many channels for the launch grid")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -336,6 +397,19 @@ def _build_constraints() -> dict:
         # tl.dot needs Ampere matrix capability for the non-IEEE float paths
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
+    )
+    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both
+    fp32_only = frozenset({torch.float32})
+    out["flow_warp_cat"] = FunctionConstraints(
+        params={
+            "grid_x": ParamConstraint(dtypes=fp32_only, shape_rules=(ExactDims(1),)),
+            "grid_y": ParamConstraint(dtypes=fp32_only, shape_rules=(ExactDims(1),)),
+            "prefix": ParamConstraint(
+                dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(4),)
+            ),
+        },
+        default_devices=cuda_devices,
+        call_rules=(_flow_warp_cat_call_rule,),
     )
     return out
 
