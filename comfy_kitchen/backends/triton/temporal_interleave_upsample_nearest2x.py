@@ -64,7 +64,7 @@ def _interleave_upsample_nearest2x_kernel(
     ws = pid_w * block_ws + tl.arange(0, block_ws)
     base = _src_row_base(rows, channels, frames, height, sxb, sxc, sxt, sxh, interleave)
     lmask = (rows < n_rows)[:, None] & (ws < width)[None, :]
-    v = tl.load(x_ptr + base[:, None] + (ws * sxw)[None, :], mask=lmask)
+    v = tl.load(x_ptr + base[:, None] + (ws.to(tl.int64) * sxw)[None, :], mask=lmask)
     v2 = tl.interleave(v, v)  # [block_r, 2 * block_ws]: every pixel twice along the row
     cols = pid_w * (2 * block_ws) + tl.arange(0, 2 * block_ws)
     width_out = 2 * width

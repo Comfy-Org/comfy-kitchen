@@ -137,8 +137,6 @@ def _build_constraints() -> dict:
         x = kwargs.get("x")
         if x is None:
             return ValidationResult.ok()
-        if x.dim() != 5:
-            return ValidationResult.fail("x", "x must be [B, C, T, H, W]")
         interleave = bool(kwargs.get("interleave", False))
         if interleave and x.shape[1] % 2:
             return ValidationResult.fail("x", "interleave needs an even channel count")
@@ -356,7 +354,7 @@ def _build_constraints() -> dict:
     # cuda covers ROCm builds of PyTorch (device type "cuda")
     out["temporal_interleave_upsample_nearest2x"] = FunctionConstraints(
         params={
-            "x": ParamConstraint(dtypes=standard_floats),
+            "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
         },
         default_devices=cuda_devices,
         call_rules=(_temporal_interleave_upsample_call_rule,),

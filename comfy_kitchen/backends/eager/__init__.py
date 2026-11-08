@@ -708,7 +708,7 @@ def _build_constraints() -> dict:
     )
     out["temporal_interleave_upsample_nearest2x"] = FunctionConstraints(
         params={
-            "x": ParamConstraint(dtypes=standard_floats),
+            "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
         },
         default_devices=all_devices,
     )
