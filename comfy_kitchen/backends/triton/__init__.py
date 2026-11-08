@@ -27,6 +27,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "moe_top2_dispatch",
 ]
 
 # Try to import triton and register if available
@@ -54,6 +55,7 @@ try:
     )
 
     from .adaln import adaln, rms_adaln
+    from .moe_top2_dispatch import moe_top2_dispatch
     from .na import na3d
     from .quantization import (
         dequantize_nvfp4,
@@ -125,6 +127,25 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _moe_top2_dispatch_call_rule(kwargs):
+        # No size threshold: on the four HiDream-I1 shapes measured (bf16, 4096 to 8960 tokens,
+        # dim 2560, 4 experts) the kernels were faster than ComfyUI's current path on an RTX
+        # 5090 and on a Radeon 8060S (per-call numbers in the PR that added this op).
+        x, logits = kwargs.get("x"), kwargs.get("logits")
+        if x is None or logits is None:
+            return ValidationResult.ok()
+        if logits.shape[-1] != 4:
+            return ValidationResult.fail("logits", "triton moe_top2_dispatch takes 4 experts")
+        if x.numel() == 0:
+            return ValidationResult.fail(
+                "x", "empty tensors are not supported by triton moe_top2_dispatch"
+            )
+        if x.stride(-1) != 1 or logits.stride(-1) != 1:
+            return ValidationResult.fail("x", "x and logits need a unit stride in the last dim")
+        if 2 * x.shape[0] > 2**31 - 1:
+            return ValidationResult.fail("x", "2 * tokens must fit in int32 (slot arithmetic)")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -326,6 +347,16 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
+    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both, bf16 only
+    bf16_only = frozenset({torch.bfloat16})
+    out["moe_top2_dispatch"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=bf16_only, shape_rules=(ExactDims(2),)),
+            "logits": ParamConstraint(dtypes=bf16_only, shape_rules=(ExactDims(2),)),
+        },
+        default_devices=cuda_devices,
+        call_rules=(_moe_top2_dispatch_call_rule,),
+    )
     out["na3d"] = FunctionConstraints(
         params={
             "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
