@@ -69,25 +69,46 @@ def _check(op, x, split, **modulation):
         _check_modulation(f"{op}: {name}", t, x)
 
 
+def _byte_range(t):
+    # [first, last + 1) byte address the view can touch
+    lo = hi = t.data_ptr()
+    size_of = t.element_size()
+    for size, stride in zip(t.shape, t.stride(), strict=True):
+        extent = (size - 1) * stride * size_of
+        if extent < 0:
+            lo += extent
+        else:
+            hi += extent
+    return lo, hi + size_of
+
+
 def _check_inplace(residual, x, gate):
-    # same rules as check_rope_inplace in comfy_kitchen/_rope_utils.py
+    # same rules as check_rope_inplace in comfy_kitchen/_rope_utils.py; the common case (a
+    # contiguous residual, x and gate outside its byte range) only reads a few attributes
     name = "gated_residual_segmented_"
-    required = 1
-    dimensions = sorted(
-        (abs(stride), size)
-        for size, stride in zip(residual.shape, residual.stride(), strict=True)
-        if size > 1
-    )
-    for stride, size in dimensions:
-        if stride < required:
-            raise ValueError(f"{name}: residual must be a view without internal overlap")
-        required = stride * size
+    if residual.numel() == 0:
+        return
+    if not residual.is_contiguous():
+        required = 1
+        dimensions = sorted(
+            (abs(stride), size)
+            for size, stride in zip(residual.shape, residual.stride(), strict=True)
+            if size > 1
+        )
+        for stride, size in dimensions:
+            if stride < required:
+                raise ValueError(f"{name}: residual must be a view without internal overlap")
+            required = stride * size
+    first, end = _byte_range(residual)
     for other_name, other in (("x", x), ("gate", gate)):
+        if other.numel() == 0:
+            continue
+        other_first, other_end = _byte_range(other)
+        if other_end <= first or other_first >= end:
+            continue
         # _tensors_overlap compares element offsets, so views of one buffer with different
         # element sizes are treated as overlapping
-        same_storage = other.untyped_storage().data_ptr() == residual.untyped_storage().data_ptr()
-        mixed_views = same_storage and other.element_size() != residual.element_size()
-        if mixed_views or _tensors_overlap(other, residual):
+        if other.element_size() != residual.element_size() or _tensors_overlap(other, residual):
             raise ValueError(f"{name}: {other_name} must not overlap residual")
 
 

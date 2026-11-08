@@ -143,6 +143,15 @@ class TestSegmentedEager:
         with pytest.raises(ValueError, match="x must not overlap"):
             ck.gated_residual_segmented_(residual, x, torch.randn(2, 1, 8), 2)
 
+    def test_inplace_accepts_disjoint_views_of_one_buffer(self):
+        buf = torch.randn(3 * 8 * 16)
+        residual = buf[: 8 * 16].view(1, 8, 16)
+        x = buf[8 * 16 : 2 * 8 * 16].view(1, 8, 16)
+        gate = buf[2 * 8 * 16 : 2 * 8 * 16 + 2 * 16].view(2, 1, 16)
+        expected = eager_backend.gated_residual_segmented(residual, x, gate, 4)
+        ck.gated_residual_segmented_(residual, x, gate, 4)
+        assert torch.equal(residual, expected)
+
 
 # Captured shapes (bf16), tokens scaled down 8x for CI; D, the split position relative to
 # L and the gate layouts are kept. Full sizes: Krea2 (1, 8414, 6144) split 4270,
