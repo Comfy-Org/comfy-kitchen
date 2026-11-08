@@ -144,28 +144,42 @@ def _meta_bias(c, dtype=torch.float16):
     return torch.empty(c, device="meta", dtype=dtype)
 
 
+@pytest.fixture(params=["cuda", "hip"])
+def build(request, monkeypatch):
+    # the call rule reads torch.version.hip at call time: run it as on a CUDA and a ROCm build
+    monkeypatch.setattr(torch.version, "hip", "7.0" if request.param == "hip" else None)
+    return request.param
+
+
 class TestConvBiasLeakyReluCallRule:
     # the Triton call rule only looks at shapes, dtypes and layouts, so it runs on meta tensors
     @pytest.mark.parametrize("layout", _LAYOUTS)
     @pytest.mark.parametrize(
-        ("c", "h", "w", "ok"),
+        ("n", "c", "h", "w", "ok_cuda", "ok_hip"),
         [
-            (64, 1072, 1920, True),  # FILM level 0
-            (128, 536, 960, True),
-            (256, 268, 480, True),
-            (512, 134, 240, True),  # 32160 pixels per plane
-            (256, 67, 120, False),  # 8040: runs eager
-            (512, 33, 60, False),
-            (512, 16, 30, False),
-            (256, 16, 30, False),
-            (64, 16, 30, False),
-            (8, 128, 128, True),  # 16384
-            (8, 127, 129, False),  # 16383
+            (1, 64, 1072, 1920, True, True),  # FILM level 0
+            (1, 128, 536, 960, True, True),
+            (1, 256, 268, 480, True, True),
+            (1, 128, 268, 480, True, True),
+            (1, 512, 134, 240, True, True),  # 32160 pixels per plane
+            (1, 64, 268, 480, False, True),  # numel below the CUDA threshold
+            (1, 256, 134, 240, False, True),
+            (1, 256, 67, 120, False, False),  # 8040 pixels: runs eager
+            (1, 512, 33, 60, False, False),
+            (1, 512, 16, 30, False, False),
+            (1, 256, 16, 30, False, False),
+            (1, 64, 16, 30, False, False),
+            (1, 8, 128, 128, False, True),  # 16384 pixels
+            (1, 8, 127, 129, False, False),  # 16383 pixels
+            (1, 768, 128, 128, True, True),  # numel 12 * 2**20
+            (1, 767, 128, 128, False, True),  # numel 12 * 2**20 - 16384
+            (3, 256, 128, 128, True, True),  # batch counts towards numel
+            (1, 3072, 64, 64, False, False),  # 4096 pixels
         ],
     )
-    def test_call_rule_sizes(self, c, h, w, layout, ok):
-        kwargs = _kwargs(_meta(1, c, h, w, layout), _meta_bias(c))
-        assert _call_rule()(kwargs).success == ok
+    def test_call_rule_sizes(self, build, n, c, h, w, layout, ok_cuda, ok_hip):
+        kwargs = _kwargs(_meta(n, c, h, w, layout), _meta_bias(c))
+        assert _call_rule()(kwargs).success == (ok_hip if build == "hip" else ok_cuda)
 
     @pytest.mark.parametrize(
         ("x_dtype", "bias_dtype", "ok"),
@@ -176,20 +190,22 @@ class TestConvBiasLeakyReluCallRule:
             (torch.float16, torch.float32, False),  # bias not cast
         ],
     )
-    def test_call_rule_dtypes(self, x_dtype, bias_dtype, ok):
-        kwargs = _kwargs(_meta(1, 64, 128, 128, dtype=x_dtype), _meta_bias(64, bias_dtype))
+    def test_call_rule_dtypes(self, build, x_dtype, bias_dtype, ok):
+        kwargs = _kwargs(_meta(1, 768, 128, 128, dtype=x_dtype), _meta_bias(768, bias_dtype))
         assert _call_rule()(kwargs).success == ok
 
-    def test_call_rule_layouts(self):
-        bias = _meta_bias(64)
-        strided = _meta(1, 64, 256, 128)[:, :, ::2]
+    def test_call_rule_layouts(self, build):
+        # shapes served on both builds when contiguous
+        bias = _meta_bias(768)
+        assert _call_rule()(_kwargs(_meta(1, 768, 128, 128), bias)).success
+        strided = _meta(1, 768, 256, 128)[:, :, ::2]
         assert not _call_rule()(_kwargs(strided, bias)).success
-        permuted = _meta(1, 128, 64, 128).transpose(1, 2)
+        permuted = _meta(1, 128, 768, 128).transpose(1, 2)
         assert not _call_rule()(_kwargs(permuted, bias)).success
-        bias2 = _meta_bias(128)[::2]
-        assert not _call_rule()(_kwargs(_meta(1, 64, 128, 128), bias2)).success
+        bias2 = _meta_bias(1536)[::2]
+        assert not _call_rule()(_kwargs(_meta(1, 768, 128, 128), bias2)).success
 
-    def test_call_rule_limits(self):
+    def test_call_rule_limits(self, build):
         # 2**31 elements
         assert not _call_rule()(_kwargs(_meta(1, 1024, 2048, 1024), _meta_bias(1024))).success
         assert _call_rule()(_kwargs(_meta(1, 1023, 2048, 1024), _meta_bias(1023))).success
@@ -218,16 +234,27 @@ class TestConvBiasLeakyReluTriton:
             pytest.skip("triton backend not available")
 
     @staticmethod
-    def _check(x, bias, slope=0.2):
+    def _kernel(x, bias, slope=0.2):
+        triton_op = importlib.import_module("comfy_kitchen.backends.triton.conv_bias_leaky_relu")
+        return triton_op.conv_bias_leaky_relu_(x, bias, slope)
+
+    @classmethod
+    def _check(cls, x, bias, slope=0.2):
+        # every plane here passes the H * W threshold; on CUDA builds the tensors below the
+        # element count threshold go to eager, so the kernel is called directly for them
         kwargs = _kwargs(x, bias, slope)
-        assert registry.validate_backend_for_call("triton", OP, kwargs).success
-        assert registry.get_capable_backend(OP, kwargs) == "triton"
+        served = bool(torch.version.hip) or x.numel() >= 12 * 2**20
+        assert registry.validate_backend_for_call("triton", OP, kwargs).success == served
+        assert registry.get_capable_backend(OP, kwargs) == ("triton" if served else "eager")
         ref = eager_backend.conv_bias_leaky_relu_(
             x.clone(memory_format=torch.preserve_format), bias, slope
         )
         ptr, stride = x.data_ptr(), x.stride()
-        with ck.use_backend("triton"):
-            got = ck.conv_bias_leaky_relu_(x, bias, slope)
+        if served:
+            with ck.use_backend("triton"):
+                got = ck.conv_bias_leaky_relu_(x, bias, slope)
+        else:
+            got = cls._kernel(x, bias, slope)
         assert got is x and x.data_ptr() == ptr and x.stride() == stride
         assert torch.equal(got, ref)
         return got
@@ -262,10 +289,8 @@ class TestConvBiasLeakyReluTriton:
         )
         bias = _bias(8, device="cuda")
         bias[0] = 65504.0  # overflows to inf in the fp16 add
-        assert registry.get_capable_backend(OP, _kwargs(x, bias)) == "triton"
         ref = _stock_chain(x.clone(), bias)
-        with ck.use_backend("triton"):
-            got = ck.conv_bias_leaky_relu_(x, bias)
+        got = self._kernel(x, bias)
         assert torch.equal(got.isnan(), ref.isnan())
         assert torch.equal(got.nan_to_num(), ref.nan_to_num())
 
@@ -280,7 +305,7 @@ class TestConvBiasLeakyReluTriton:
         # FilmConv2d with activation on the GPU: the stock conv with bias + nn.LeakyReLU(0.2)
         # against the conv without bias + this op
         x = _conv_out(1, 32, 134, 240, layout, device="cuda")
-        conv = nn.Conv2d(32, 64, 3, padding=1, device="cuda", dtype=torch.float16)
+        conv = nn.Conv2d(32, 512, 3, padding=1, device="cuda", dtype=torch.float16)
         if layout == "channels_last":
             conv = conv.to(memory_format=torch.channels_last)
         with torch.no_grad():
@@ -334,6 +359,19 @@ class TestConvBiasLeakyReluTriton:
                 _bias(128, device="cuda")[::2],
             ),
         ]
+        if not torch.version.hip:
+            # CUDA builds: the 134 x 240 level at 256 channels and the 268 x 480 level at 64
+            # channels (below the element count threshold)
+            cases += [
+                (
+                    _conv_out(1, 256, 134, 240, "contiguous", device="cuda"),
+                    _bias(256, device="cuda"),
+                ),
+                (
+                    _conv_out(1, 64, 268, 480, "channels_last", device="cuda"),
+                    _bias(64, device="cuda"),
+                ),
+            ]
         for x, bias in cases:
             kwargs = _kwargs(x, bias)
             assert not registry.validate_backend_for_call("triton", OP, kwargs).success
