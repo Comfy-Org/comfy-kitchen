@@ -132,8 +132,9 @@ def _build_constraints() -> dict:
     def _conv_bias_leaky_relu_call_rule(kwargs):
         # Size threshold on the pixels per channel plane: smaller planes run eager. On CUDA
         # (not ROCm) builds, tensors below an element count threshold also run eager. Both set
-        # from per-call measurements on the FILM pyramid levels against ComfyUI's current path,
-        # on both GPUs listed in the PR that added this op.
+        # from per-call measurements on the FILM pyramid levels against ComfyUI's current path:
+        # the plane threshold on both GPUs listed in the PR that added this op, the element
+        # count threshold on the CUDA GPU listed there.
         x, bias = kwargs.get("x"), kwargs.get("bias")
         if x is None or bias is None:
             return ValidationResult.ok()
