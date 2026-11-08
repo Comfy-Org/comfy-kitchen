@@ -18,8 +18,8 @@ weights and the scale is applied in fp32 after the dot: the normalized matrices,
 the gate / value / hidden activations and the MLP output are never written out. Norms are
 clamped to 1e-12 as ``F.normalize`` does.
 
-Launch configuration: block_m 256, block_h 32, 8 warps on every GPU; it was the fastest of
-the three measured on an RTX 5090 and on a Radeon 8060S at Chroma Radiance's block
+Launch configuration: block_m 256, block_h 32, 8 warps on every GPU, chosen from a sweep of
+three configurations on the prototype of this kernel at Chroma Radiance's block
 (x [512, 256, 64], mlp_params [512, 49152], bf16).
 """
 
