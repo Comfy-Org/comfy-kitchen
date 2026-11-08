@@ -67,6 +67,7 @@ __all__ = [
     # Normalization
     "adaln",
     "rms_gated_residual",
+    "conv_bias_leaky_relu_",
     "fp16_conv3d",
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
@@ -399,6 +400,21 @@ def adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
+
+
+def conv_bias_leaky_relu_(
+    x: torch.Tensor, bias: torch.Tensor, negative_slope: float = 0.2
+) -> torch.Tensor:
+    """Conv bias add + LeakyReLU in place on a conv output computed without its bias.
+
+    x ``[N, C, H, W]`` is the output of ``F.conv2d(input, weight, None, ...)``; writes
+    ``leaky_relu(x + bias[None, :, None, None], negative_slope)`` into x and returns it: the
+    in-place bias ``add_`` that ``at::convolution`` runs after cuDNN / MIOpen, then
+    ``nn.LeakyReLU`` (FILM's ``FilmConv2d`` with ``activation=True``). The sum is rounded to
+    x's dtype before the activation, as in the stock chain.
+    """
+    torch.ops.comfy_kitchen.conv_bias_leaky_relu_(x, bias, float(negative_slope))
+    return x
 
 
 def fp16_conv3d(
