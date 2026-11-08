@@ -192,7 +192,28 @@ set(HIP_SOURCES
     ops/gated_delta.hip
     ops/nvfp4.hip
     ops/memmove.hip
+    ops/delaunay3d.hip
+    ops/mesh_bvh.hip
+    ops/connected_components.hip
+    ops/edge_collapse.hip
+    ops/min_cut.hip
 )
+
+# The geometry predicates rely on IEEE semantics: the double-double sums need exact
+# rounding that reassociation cancels away, and an infinite cutoff must stay infinite.
+# Source options follow the target's, so this overrides -ffast-math for these files.
+set_source_files_properties(
+    ops/delaunay3d.hip
+    ops/mesh_bvh.hip
+    ops/connected_components.hip
+    ops/edge_collapse.hip
+    ops/min_cut.hip
+    PROPERTIES COMPILE_OPTIONS "-fno-fast-math"
+)
+
+# ROCm clang still contracts the products despite #pragma clang fp contract(off) in
+# ray_triangle; only exact products keep neighbours' shared-edge functions exact negations.
+set_source_files_properties(ops/mesh_bvh.hip PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
 
 set(CPP_SOURCES
     dlpack_bindings.cpp

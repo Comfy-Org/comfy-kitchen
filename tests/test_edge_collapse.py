@@ -5,7 +5,7 @@ import torch
 
 import comfy_kitchen as ck
 
-from .conftest import requires_cuda_backend
+from .conftest import requires_gpu_backend, requires_hip_backend
 
 
 def _sub(u, v):
@@ -90,7 +90,7 @@ def _check(vertices, faces, edges, positions, cos_threshold=0.0):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("merges", [0, 40])
 @pytest.mark.parametrize("scale", [1.0, 1e-4])
@@ -107,7 +107,7 @@ def test_grid(index_dtype, merges, scale):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_high_valence_fan():
     # cone apex with 200 faces: no valence cap
     k = 200
@@ -121,7 +121,7 @@ def test_high_valence_fan():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_no_edges():
     vertices, faces = _grid(4, torch.Generator().manual_seed(0))
     flips, skinny, link_ok = ck.edge_collapse_checks(
@@ -132,7 +132,7 @@ def test_no_edges():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_deterministic():
     # the fans are filled with atomics, in varying order; the outputs must not depend on it
     gen = torch.Generator().manual_seed(3)
@@ -147,7 +147,7 @@ def test_deterministic():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_rejects_bad_input():
     vertices, faces = _grid(4, torch.Generator().manual_seed(0))
     vertices, faces = vertices.cuda(), faces.cuda()
@@ -163,3 +163,65 @@ def test_rejects_bad_input():
     bad[0, 1] = vertices.shape[0]
     with pytest.raises(ValueError, match="edges must lie"):
         ck.edge_collapse_checks(vertices, faces, bad, positions)
+
+
+@pytest.mark.cuda
+@requires_gpu_backend
+@pytest.mark.parametrize(
+    "faces, edge, want",
+    [
+        ([[0, 1, 2], [1, 0, 3]], [0, 1], True),  # two faces, two common neighbours
+        ([[0, 1, 2], [1, 0, 3]], [2, 3], False),  # not an edge: common neighbours but no face on it
+        ([[0, 1, 2], [0, 1, 2]], [0, 1], True),  # duplicate face: one common neighbour, two faces
+        ([[0, 1, 2], [0, 3, 4], [1, 3, 5]], [0, 1], False),  # pinch: the face holds 2, vertex 3 is a second neighbour
+    ],
+)
+def test_link_condition_cases(faces, edge, want):
+    vertices = torch.rand(6, 3, generator=torch.Generator().manual_seed(0)).cuda()
+    edges = torch.tensor([edge], dtype=torch.int32).cuda()
+    positions = vertices[edges[0]].mean(0, keepdim=True)
+    faces = torch.tensor(faces, dtype=torch.int32).cuda()
+    _, _, link_ok = ck.edge_collapse_checks(vertices, faces, edges, positions)
+    assert link_ok.tolist() == [want]
+
+
+@pytest.mark.cuda
+@requires_hip_backend
+def test_hip_rejects_mixed_devices():
+    from comfy_kitchen.backends import hip
+
+    vertices = torch.rand(3, 3).cuda()
+    faces = torch.tensor([[0, 1, 2]], dtype=torch.int32).cuda()
+    edges = torch.tensor([[0, 1]], dtype=torch.int32).cuda()
+    positions = vertices[:1]
+    with pytest.raises(ValueError, match="positions must be on"):
+        hip.edge_collapse_checks(vertices, faces, edges, positions.cpu())
+
+
+@pytest.mark.cuda
+@requires_hip_backend
+def test_hip_binding_rejects_undersized_buffers():
+    from comfy_kitchen.backends import hip
+
+    w = hip._dl
+    i32 = {"dtype": torch.int32, "device": "cuda"}
+    verts = torch.rand(3, 3).cuda()
+    faces = torch.tensor([[0, 1, 2]], **i32)
+    edges = torch.tensor([[0, 1]], **i32)
+    good = {
+        "offsets": torch.zeros(4, **i32), "cursor": torch.zeros(3, **i32), "fan": torch.empty(3, **i32),
+        "flips": torch.empty(1, **i32), "skinny": torch.empty(1).cuda(), "link_ok": torch.empty(1, dtype=torch.bool).cuda(),
+    }
+
+    def launch(**over):
+        a = {**good, **over}
+        hip._C.edge_collapse_checks(w(verts), w(faces), w(a["offsets"]), w(a["cursor"]), w(a["fan"]), w(edges), w(verts[:1]),
+                                    3, 1, 0.0, w(a["flips"]), w(a["skinny"]), w(a["link_ok"]),
+                                    torch.cuda.current_stream().cuda_stream)
+
+    with pytest.raises(RuntimeError, match="offsets has 3 elements"):
+        launch(offsets=good["offsets"][:3])
+    with pytest.raises(RuntimeError, match="fan has 2 elements"):
+        launch(fan=good["fan"][:2])
+    with pytest.raises(RuntimeError, match="link_ok has the wrong dtype"):
+        launch(link_ok=good["flips"])

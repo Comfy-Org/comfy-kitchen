@@ -77,8 +77,11 @@ def _op_fp16_conv3d(
     stride: list[int],
     zero_border: bool = False,
 ) -> torch.Tensor:
-    kwargs = {"x": x, "weight": weight, "bias": bias, "residual": residual, "stride": stride,
-              "zero_border": zero_border}
+    kwargs = {"x": x, "weight": weight, "bias": bias, "residual": residual, "stride": stride}
+    # Only the HIP backend implements zero_border; keep the mainline backends' call
+    # shape unchanged so a default call dispatches to them exactly as before.
+    if zero_border:
+        kwargs["zero_border"] = True
     impl = registry.get_implementation("fp16_conv3d", kwargs=kwargs)
     return impl(**kwargs)
 
