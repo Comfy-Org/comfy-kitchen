@@ -27,6 +27,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "sum_indexed_values",
 ]
 
 # Try to import triton and register if available
@@ -89,6 +90,7 @@ try:
         apply_rope_split_half1_,
         apply_rope_split_half_,
     )
+    from .sum_indexed_values import sum_indexed_values
     from .w4a8_int8 import w4a8_int8_linear
 except ImportError as e:
     _TRITON_AVAILABLE = False
@@ -125,6 +127,33 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _sum_indexed_values_call_rule(kwargs):
+        # No size threshold: the VOID warped-noise call (image [16, 1536, 5376] fp32, about half
+        # of the pixels in one group) was faster than ComfyUI's current path on an RTX 5090 and
+        # on a Radeon 8060S (per-call numbers in the PR that added this op).
+        image, index = kwargs.get("image"), kwargs.get("index_matrix")
+        if image is None or index is None:
+            return ValidationResult.ok()
+        if image.dtype != torch.float32 or index.dtype != torch.int64:
+            return ValidationResult.fail("image", "image must be float32 and index_matrix int64")
+        if torch.are_deterministic_algorithms_enabled():
+            # the run sums are added with atomics in a varying order; index_add_ is
+            # deterministic on CUDA in this mode
+            return ValidationResult.fail("image", "deterministic algorithms are enabled")
+        if index.device != image.device:
+            return ValidationResult.fail("index_matrix", "index_matrix must be on image's device")
+        if image.dim() != 3 or index.shape != image.shape[1:]:
+            return ValidationResult.fail("index_matrix", "index_matrix must be [H, W] of image")
+        if not image.is_contiguous() or not index.is_contiguous():
+            return ValidationResult.fail("image", "image and index_matrix must be contiguous")
+        if not 1 <= image.shape[0] <= 16:
+            # a 1024-pixel tile of up to 16 channels fits the 64 KB of shared memory of gfx1151
+            return ValidationResult.fail("image", "channels must be in [1, 16]")
+        if not 1 <= index.numel() <= 2**31 - 1024:
+            # pixel offsets are int32, up to the end of the last 1024-pixel tile
+            return ValidationResult.fail("index_matrix", "H * W must be in [1, 2**31 - 1024]")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -336,6 +365,19 @@ def _build_constraints() -> dict:
         # tl.dot needs Ampere matrix capability for the non-IEEE float paths
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
+    )
+    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both
+    out["sum_indexed_values"] = FunctionConstraints(
+        params={
+            "image": ParamConstraint(
+                dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(3),)
+            ),
+            "index_matrix": ParamConstraint(
+                dtypes=frozenset({torch.int64}), shape_rules=(ExactDims(2),)
+            ),
+        },
+        default_devices=cuda_devices,
+        call_rules=(_sum_indexed_values_call_rule,),
     )
     return out
 
