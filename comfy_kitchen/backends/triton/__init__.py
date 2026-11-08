@@ -144,8 +144,10 @@ def _build_constraints() -> dict:
             )
         if x.stride(-1) != 1 or logits.stride(-1) != 1:
             return ValidationResult.fail("x", "x and logits need a unit stride in the last dim")
-        if 2 * x.shape[0] > 2**31 - 1:
-            return ValidationResult.fail("x", "2 * tokens must fit in int32 (slot arithmetic)")
+        # the gather kernel holds the counts of all 32-row blocks in one [next_pow2(blocks), 4]
+        # tile, at most 2**20 elements in Triton; this also keeps 2 * tokens in int32
+        if x.shape[0] > 2**23:
+            return ValidationResult.fail("x", "more than 2**23 tokens (gather kernel count tile)")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})

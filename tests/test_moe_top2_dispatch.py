@@ -230,8 +230,8 @@ class TestMoeTop2DispatchCallRule:
             (8, 16, 2, False),
             (0, 16, 4, False),  # empty
             (8, 0, 4, False),  # empty
-            (2**30 - 1, 1, 4, True),
-            (2**30, 1, 4, False),  # 2 * tokens over int32
+            (2**23, 1, 4, True),
+            (2**23 + 1, 1, 4, False),  # count tile over Triton's 2**20 elements
         ],
     )
     def test_call_rule(self, n, d, n_experts, ok):
