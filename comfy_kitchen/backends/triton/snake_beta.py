@@ -13,11 +13,9 @@ in fp32, rounded once to the output dtype. The stored sum is the fp32 sum rounde
 which for fp16 inputs is the correctly rounded fp16 sum (fp32's 24 bits >= 2 x 11 + 2), so
 it equals the eager add bit for bit; the activation uses the fp32 sum. tl.sin / tl.exp only.
 
-One launch configuration on every GPU: grid (cdiv(T, 2048), B * C), block 2048, 4 warps. Of the
-three configurations measured at the Oobleck decoder's shapes (this one, block 8192 with 8 warps,
-and a flat 1D grid of block 4096 with 8 warps), it was within 1% of the fastest on an RTX 5090 at
-every shape but one (11% behind the flat grid at [1, 1024, 30000]) and within 7% of the fastest
-on a Radeon 8060S.
+One launch configuration on every GPU: grid (cdiv(T, 2048), B * C), block 2048, 4 warps, picked
+from three configurations measured at the Oobleck decoder's shapes (this one, block 8192 with 8
+warps, and a flat 1D grid of block 4096 with 8 warps).
 """
 
 import torch
