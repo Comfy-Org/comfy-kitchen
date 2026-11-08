@@ -25,6 +25,7 @@ of ``[2B, 1, D]``.
 
 import torch
 
+from comfy_kitchen._rope_utils import _tensors_overlap
 from comfy_kitchen.registry import registry
 
 
@@ -68,6 +69,28 @@ def _check(op, x, split, **modulation):
         _check_modulation(f"{op}: {name}", t, x)
 
 
+def _check_inplace(residual, x, gate):
+    # same rules as check_rope_inplace in comfy_kitchen/_rope_utils.py
+    name = "gated_residual_segmented_"
+    required = 1
+    dimensions = sorted(
+        (abs(stride), size)
+        for size, stride in zip(residual.shape, residual.stride(), strict=True)
+        if size > 1
+    )
+    for stride, size in dimensions:
+        if stride < required:
+            raise ValueError(f"{name}: residual must be a view without internal overlap")
+        required = stride * size
+    for other_name, other in (("x", x), ("gate", gate)):
+        # _tensors_overlap compares element offsets, so views of one buffer with different
+        # element sizes are treated as overlapping
+        same_storage = other.untyped_storage().data_ptr() == residual.untyped_storage().data_ptr()
+        mixed_views = same_storage and other.element_size() != residual.element_size()
+        if mixed_views or _tensors_overlap(other, residual):
+            raise ValueError(f"{name}: {other_name} must not overlap residual")
+
+
 @torch.library.custom_op("comfy_kitchen::gated_residual_segmented", mutates_args=())
 def _op_gated_residual_segmented(
     residual: torch.Tensor,
@@ -98,6 +121,7 @@ def _op_gated_residual_segmented_(
     _check("gated_residual_segmented_", x, split, gate=gate)
     if residual.shape != x.shape:
         raise ValueError("gated_residual_segmented_: residual and x must have the same shape")
+    _check_inplace(residual, x, gate)
     kwargs = {"residual": residual, "x": x, "gate": gate, "split": split}
     registry.get_implementation("gated_residual_segmented_", kwargs=kwargs)(**kwargs)
 

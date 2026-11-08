@@ -87,11 +87,61 @@ class TestSegmentedEager:
         assert out is residual
         assert torch.equal(residual, want)
 
-    def test_rejects_bad_arguments(self):
+    @pytest.mark.parametrize("op", ["gated_residual_segmented", "gated_residual_segmented_"])
+    @pytest.mark.parametrize(
+        "case",
+        ["residual shape", "split -1", "split > L", "gate rows", "gate batch", "gate D", "2-D x"],
+    )
+    def test_rejects_bad_arguments(self, op, case):
         x = torch.randn(1, 8, 16)
-        good = torch.randn(2, 1, 16)
+        residual = torch.randn(1, 8, 16)
+        gate = torch.randn(2, 1, 16)
+        split = 4
+        if case == "residual shape":
+            residual = torch.randn(1, 8, 8)
+        elif case == "split -1":
+            split = -1
+        elif case == "split > L":
+            split = 9
+        elif case == "gate rows":
+            gate = torch.randn(3, 1, 16)
+        elif case == "gate batch":
+            gate = torch.randn(2, 2, 16)
+        elif case == "gate D":
+            gate = torch.randn(2, 1, 15)
+        else:
+            x, residual = x[0], residual[0]
         with pytest.raises(ValueError):
-            ck.gated_residual_segmented(torch.randn(1, 8, 8), x, good, 4)
+            getattr(ck, op)(residual, x, gate, split)
+
+    def test_inplace_rejects_overlapping_residual(self):
+        x = torch.randn(1, 8, 16)
+        gate = torch.randn(2, 1, 16)
+        residual = torch.randn(1, 1, 16).expand(1, 8, 16)
+        with pytest.raises(ValueError, match="internal overlap"):
+            ck.gated_residual_segmented_(residual, x, gate, 4)
+
+    @pytest.mark.parametrize("other", ["x", "gate"])
+    def test_inplace_rejects_x_or_gate_overlapping_residual(self, other):
+        buf = torch.randn(2 * 8 * 16)
+        residual = buf[: 8 * 16].view(1, 8, 16)
+        x = torch.randn(1, 8, 16)
+        gate = torch.randn(2, 1, 16)
+        if other == "x":
+            x = buf[16 : 16 + 8 * 16].view(1, 8, 16)
+        else:
+            gate = buf[: 2 * 16].view(2, 1, 16)
+        with pytest.raises(ValueError, match=f"{other} must not overlap"):
+            ck.gated_residual_segmented_(residual, x, gate, 4)
+
+    def test_inplace_rejects_x_of_another_dtype_in_residual_storage(self):
+        # same shape and element strides, rows interleaved by element offset, but x is bf16 and
+        # residual fp32, so the bytes overlap
+        buf = torch.zeros(64)
+        residual = buf.view(1, 4, 16)[..., :8]
+        x = buf.view(torch.bfloat16).as_strided((1, 4, 8), (64, 16, 1), 8)
+        with pytest.raises(ValueError, match="x must not overlap"):
+            ck.gated_residual_segmented_(residual, x, torch.randn(2, 1, 8), 2)
 
 
 # Captured shapes (bf16), tokens scaled down 8x for CI; D, the split position relative to
@@ -164,9 +214,34 @@ class TestSegmentedTriton:
         x = torch.randn(3, 64, 1000, dtype=torch.bfloat16, device="cuda")
         gate = torch.randn(2, mod_batch, 1000, dtype=torch.bfloat16, device="cuda")
         residual = torch.randn_like(x)
+        kwargs = {"residual": residual, "x": x, "gate": gate, "split": split}
+        assert registry.get_capable_backend("gated_residual_segmented", kwargs) == "triton"
         with ck.use_backend("triton"):
             gated = ck.gated_residual_segmented(residual, x, gate, split)
         assert _rel(gated, _gate_reference(residual, x, gate, split)) < 1e-2
+
+    @pytest.mark.parametrize("layout", ["flux", "qwen_krea2"])
+    def test_batched_model_layouts(self, layout):
+        # B = 2 with the per-batch gate rows the models pass as views (batch stride != D)
+        b, d = 2, 512
+        x = torch.randn(b, 64, d, dtype=torch.bfloat16, device="cuda")
+        residual = torch.randn_like(x)
+        if layout == "flux":
+            gate = _flux_modulation(b, d, 3, torch.bfloat16, "cuda")[2].transpose(0, 1)
+        else:
+            mod = torch.randn(2 * b, 3 * d, dtype=torch.bfloat16, device="cuda") * 0.5
+            gate = _split_rows(mod.chunk(3, dim=-1)[2])
+        assert gate.shape == (2, b, d) and gate.stride(1) != d
+        kwargs = {"residual": residual, "x": x, "gate": gate, "split": 20}
+        assert registry.get_capable_backend("gated_residual_segmented", kwargs) == "triton"
+        assert registry.get_capable_backend("gated_residual_segmented_", kwargs) == "triton"
+        want = _gate_reference(residual, x, gate, 20)
+        with ck.use_backend("triton"):
+            got = ck.gated_residual_segmented(residual, x, gate, 20)
+            inplace = residual.clone()
+            ck.gated_residual_segmented_(inplace, x, gate, 20)
+        assert _rel(got, want) < 1e-2
+        assert torch.equal(inplace, got)
 
     def test_strided_inputs(self):
         # residual as a token slice of a larger buffer (written in place), x with a non-unit
@@ -177,6 +252,9 @@ class TestSegmentedTriton:
         buf = torch.randn(2, 80, d, dtype=torch.bfloat16, device="cuda")
         before = buf.clone()
         residual = buf[:, 7:71]
+        kwargs = {"residual": residual, "x": x_t, "gate": gate, "split": 20}
+        assert registry.get_capable_backend("gated_residual_segmented", kwargs) == "triton"
+        assert registry.get_capable_backend("gated_residual_segmented_", kwargs) == "triton"
         with ck.use_backend("triton"):
             want = ck.gated_residual_segmented(residual, x_t, gate, 20)
             ck.gated_residual_segmented_(residual, x_t, gate, 20)
