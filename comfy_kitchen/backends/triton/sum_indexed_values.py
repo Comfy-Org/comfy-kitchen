@@ -3,12 +3,13 @@
 """Triton per-group channel sums with one atomic add per run of equal indices.
 
 ``index_add_`` adds every pixel to its group's row with an atomic, one per (pixel, channel).
-In the VOID warped noise about half of the pixels of a frame share one index (the zero-noise
-pixels the warp starts from), so millions of atomics land on the same C addresses. Here each
-program takes ``block_p`` consecutive pixels (raster order) with all channels, marks where the
-index changes, sums each run of equal consecutive indices with a segmented inclusive scan and
-adds the run's sum at its last pixel: one atomic per (run, channel). A pixel whose neighbours
-have other indices still costs one atomic per channel, as before.
+In the VOID warped noise about half of the pixels of a frame share one index (the zero noise
+``warp_state`` writes where the shrink branch fills a pixel), so millions of atomics land on the
+same C addresses. Here each program takes ``block_p`` consecutive pixels (raster order) with
+all channels, marks where the index changes, sums each run of equal consecutive indices with a
+segmented inclusive scan and adds the run's sum at its last pixel: one atomic per (run,
+channel). A pixel whose neighbours have other indices still costs one atomic per channel, as
+before.
 
 The partial sums of a group spread over several runs (several programs, or pixels that are not
 adjacent) are added in a varying order, so those rows can differ in the last bits from call to

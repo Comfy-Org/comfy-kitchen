@@ -69,10 +69,10 @@ def _stock_regaussianize(noise, sum_indexed_values):
 
 
 def _warped_noise(height, width, hot, *, seed=0, dup=0.03):
-    # one channel of warped noise as regaussianize sees it: a "hot" group of zeros (the zero
-    # pixels warp_state starts from: about half of the frame in the VOID template, in long
-    # runs of a row, or scattered), randn elsewhere, with a few pixels copied onto others as
-    # a nearest-neighbour warp does
+    # one channel of the noise regaussianize gets: a "hot" group of zeros (the zero noise
+    # warp_state writes where the shrink branch fills a pixel or a source leaves the frame;
+    # about half of the pixels in the VOID template, in long runs of a row, or scattered),
+    # randn elsewhere, with a few pixels copied onto others as the nearest-neighbour remap does
     g = torch.Generator().manual_seed(seed)
     noise = torch.randn(1, height, width, generator=g)
     if hot == "runs":
@@ -111,7 +111,8 @@ def _errors(out, ref64):
 
 def _within(out, ref64, counts):
     # summation-order error bound per group: 1e-6 per pixel of the group (about 8 fp32 ulps of
-    # one per pixel; the measured error at the real shape was well under a tenth of it)
+    # one per pixel); the current path's largest error measured at the real shape, on a group
+    # of 4.1M pixels, was about a ninth of it
     tol = 1e-6 * counts.double()[:, None]
     return bool(((out.double() - ref64).abs() <= tol).all())
 
@@ -126,8 +127,9 @@ def _call_rule():
     return rule
 
 
-# (channels, height, width, hot): the template call is C 16, 1536 x 5376 (the 384 x 672 frame
-# upscaled for the 32x downscale), about half of the pixels in one group; scaled down here
+# (channels, height, width, hot): the template call is C 16, 1536 x 5376 (warp_state's shrink
+# and expansion branches side by side, each 1536 x 2688: the 384 x 672 video at x 0.5 for RAFT,
+# x 8 for the noise), about half of the pixels in one group; scaled down here
 _EAGER_SHAPES = [
     (16, 48, 168, "runs"),  # 1/32 of the real H and W
     (16, 48, 168, "scattered"),
