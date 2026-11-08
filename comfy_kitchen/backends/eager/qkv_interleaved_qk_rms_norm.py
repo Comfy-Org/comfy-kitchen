@@ -56,18 +56,18 @@ def qkv_interleaved_qk_rms_norm(
     """Reference: the cat, view, split, reshape and ``F.rms_norm`` sequence, in ComfyUI's
     order (``Attention.forward`` if ``q_interleaved`` else ``CrossAttention.forward``)."""
     if q_interleaved:
-        B, N, _ = q.shape
+        b, n, _ = q.shape
         head_dim = q.shape[-1] // heads
         qkv_combined = torch.cat((q, k, v), dim=-1)
         split_size = qkv_combined.shape[-1] // heads // 3
-        qkv = qkv_combined.view(B, -1, heads, split_size * 3)
+        qkv = qkv_combined.view(b, -1, heads, split_size * 3)
         query, key, value = torch.split(qkv, split_size, dim=-1)
-        query = query.reshape(B, N, heads, head_dim)
-        key = key.reshape(B, N, heads, head_dim)
-        value = value.reshape(B, N, heads * head_dim)
+        query = query.reshape(b, n, heads, head_dim)
+        key = key.reshape(b, n, heads, head_dim)
+        value = value.reshape(b, n, heads * head_dim)
         query = functional.rms_norm(query, (head_dim,), q_weight, eps)
         key = functional.rms_norm(key, (head_dim,), k_weight, eps)
-        return query.reshape(B, N, -1), key.reshape(B, N, -1), value
+        return query.reshape(b, n, -1), key.reshape(b, n, -1), value
 
     b, s1, _ = q.shape
     s2 = k.shape[1]
