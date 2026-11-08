@@ -6,7 +6,10 @@ route   one program per block of token rows: softmax over the 4 logits in fp32, 
         order of the PyTorch softmax kernel for a last dim of 4 (max, exp(x - max),
         (e0 + e2) + (e1 + e3), IEEE division), rounded to the logits dtype; top 2 of the
         rounded scores, highest first, the smaller expert index first on ties (the order
-        torch.topk(k=2, sorted=False) returns); per-block expert counts.
+        torch.topk(k=2, sorted=False) returns), NaN above every number as in torch.topk; the
+        two choices always differ. A row with a NaN, a +inf or only -inf logits has 4 NaN
+        scores, as in the PyTorch softmax, and gets experts 0 and 1 with NaN weights;
+        per-block expert counts, each (token, k) counted once.
 gather  one program per block of token rows: the expert bases from the counts of all
         blocks, the slot of every (token, k) inside its expert in token order (the row order
         of x[flat_topk_idx == i]), each x row read once and written to its two slots;
@@ -26,6 +29,12 @@ NUM_EXPERTS = 4
 _BLOCK_T = 32  # token rows per program
 _BLOCK_D = 256  # columns per copy step
 _NUM_WARPS = 4
+
+
+@triton.jit
+def _ranks_above(a, b):
+    # torch.topk order: NaN ranks above every number, two NaNs tie
+    return (a > b) | ((a != a) & (b == b))
 
 
 @triton.jit
@@ -57,42 +66,40 @@ def _moe_top2_route_kernel(
     q1 = tl.div_rn(e1, s).to(out_ty).to(tl.float32)
     q2 = tl.div_rn(e2, s).to(out_ty).to(tl.float32)
     q3 = tl.div_rn(e3, s).to(out_ty).to(tl.float32)
-    # first choice: strict > keeps the smaller index on ties
+    # first choice: a strict comparison keeps the smaller index on ties
     b1 = q0
     i1 = tl.zeros([block_t], dtype=tl.int32)
-    c = q1 > b1
+    c = _ranks_above(q1, b1)
     b1 = tl.where(c, q1, b1)
     i1 = tl.where(c, 1, i1)
-    c = q2 > b1
+    c = _ranks_above(q2, b1)
     b1 = tl.where(c, q2, b1)
     i1 = tl.where(c, 2, i1)
-    c = q3 > b1
+    c = _ranks_above(q3, b1)
     b1 = tl.where(c, q3, b1)
     i1 = tl.where(c, 3, i1)
-    # second choice among the other three, same tie rule
-    neg = tl.full([block_t], float("-inf"), tl.float32)
-    r0 = tl.where(i1 == 0, neg, q0)
-    r1 = tl.where(i1 == 1, neg, q1)
-    r2 = tl.where(i1 == 2, neg, q2)
-    r3 = tl.where(i1 == 3, neg, q3)
-    b2 = r0
-    i2 = tl.zeros([block_t], dtype=tl.int32)
-    c = r1 > b2
-    b2 = tl.where(c, r1, b2)
+    # second choice among the other three, same tie rule: start from the smallest index that
+    # is not the first choice and never take the first choice, so the pair is always distinct
+    i2 = tl.where(i1 == 0, 1, 0)
+    b2 = tl.where(i1 == 0, q1, q0)
+    c = (i1 != 1) & _ranks_above(q1, b2)
+    b2 = tl.where(c, q1, b2)
     i2 = tl.where(c, 1, i2)
-    c = r2 > b2
-    b2 = tl.where(c, r2, b2)
+    c = (i1 != 2) & _ranks_above(q2, b2)
+    b2 = tl.where(c, q2, b2)
     i2 = tl.where(c, 2, i2)
-    c = r3 > b2
-    b2 = tl.where(c, r3, b2)
+    c = (i1 != 3) & _ranks_above(q3, b2)
+    b2 = tl.where(c, q3, b2)
     i2 = tl.where(c, 3, i2)
     tl.store(weight_ptr + rows * 2, b1.to(out_ty), mask=rm)
     tl.store(weight_ptr + rows * 2 + 1, b2.to(out_ty), mask=rm)
     tl.store(idx_ptr + rows * 2, i1.to(tl.int64), mask=rm)
     tl.store(idx_ptr + rows * 2 + 1, i2.to(tl.int64), mask=rm)
     ex = tl.arange(0, 4)
-    hit = ((i1[:, None] == ex[None, :]) | (i2[:, None] == ex[None, :])) & rm[:, None]
-    tl.store(block_counts_ptr + pid * 4 + ex, tl.sum(hit.to(tl.int32), axis=0))
+    # count each (token, k) separately, as the gather kernel does
+    hit = (i1[:, None] == ex[None, :]).to(tl.int32) + (i2[:, None] == ex[None, :]).to(tl.int32)
+    hit = tl.where(rm[:, None], hit, 0)
+    tl.store(block_counts_ptr + pid * 4 + ex, tl.sum(hit, axis=0))
 
 
 @triton.jit
