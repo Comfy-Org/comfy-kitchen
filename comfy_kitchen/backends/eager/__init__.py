@@ -6,6 +6,7 @@ __all__ = [
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
     "group_norm_stats3d",
+    "nerf_glu_block",
     "na3d",
     "window_attention",
     "sol_attn",
@@ -87,6 +88,7 @@ from .convrot_w4a4 import (
 )
 from .group_norm_pad3d import group_norm_silu_pad3d, group_norm_silu_pad3d_out, group_norm_stats3d
 from .na import na3d, window_attention
+from .nerf_glu_block import nerf_glu_block
 from .quantization import (
     dequantize_int8_convrot_weight,
     dequantize_int8_convrot_weight_dtype,
@@ -703,6 +705,14 @@ def _build_constraints() -> dict:
         },
         default_devices=all_devices,
         call_rules=(window_attention_common_call_rule,),
+    )
+    out["nerf_glu_block"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(3),)),
+            "mlp_params": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+            "norm_weight": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(1),)),
+        },
+        default_devices=all_devices,
     )
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in out:
