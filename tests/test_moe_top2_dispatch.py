@@ -124,6 +124,37 @@ def _router(n, d, n_experts=4, *, device="cpu", dtype=torch.bfloat16, seed=0):
     return x, functional.linear(x, gate)
 
 
+def _non_finite_router(n, d, *, device="cpu", seed=0):
+    # rows with a NaN, a +inf, two +inf or only -inf logits (4 NaN scores after the softmax)
+    # among finite rows, in the first and in a later 32-row block; the row with one finite
+    # logit and three -inf logits stays finite
+    x, logits = _router(n, d, device=device, seed=seed)
+    nan, inf = float("nan"), float("inf")
+    bad = {
+        2: [1.0, nan, 0.0, 2.0],
+        5: [inf, 0.0, 1.0, 2.0],
+        40: [-inf, -inf, -inf, -inf],
+        41: [nan, nan, nan, nan],
+        42: [inf, inf, 0.0, 0.0],
+    }
+    for row, values in bad.items():
+        logits[row] = torch.tensor(values, dtype=logits.dtype, device=device)
+    logits[43] = torch.tensor([0.0, -inf, -inf, -inf], dtype=logits.dtype, device=device)
+    return x, logits, sorted(bad)
+
+
+def _assert_dispatch_consistent(x, out, n_experts=4):
+    # two distinct experts per token, counts that match the indices, and slots that are a
+    # permutation of the rows of x_sorted, each holding its token row
+    _, idx, x_sorted, slot, counts = out
+    n = x.shape[0]
+    assert bool((idx[:, 0] != idx[:, 1]).all())
+    assert torch.equal(counts.cpu(), torch.bincount(idx.view(-1).cpu(), minlength=n_experts))
+    assert int(counts.sum()) == 2 * n
+    assert torch.equal(slot.sort().values.cpu(), torch.arange(2 * n))
+    assert torch.equal(x_sorted.index_select(0, slot), x.repeat_interleave(2, dim=0))
+
+
 def _call_rule():
     triton_backend = importlib.import_module("comfy_kitchen.backends.triton")
     (rule,) = triton_backend._build_constraints()[OP].call_rules
@@ -188,6 +219,18 @@ class TestMoeTop2DispatchEager:
             out = ck.moe_top2_dispatch(torch.randn(0, 16), torch.randn(0, 4))
         assert [tuple(t.shape) for t in out] == [(0, 2), (0, 2), (0, 16), (0,), (4,)]
         assert out[4].tolist() == [0, 0, 0, 0]
+
+    def test_non_finite_rows(self):
+        # the stock softmax + topk: 4 NaN scores, NaN weights, experts 0 and 1
+        x, logits, bad = _non_finite_router(70, 16)
+        with ck.use_backend("eager"):
+            out = ck.moe_top2_dispatch(x, logits)
+        want_weight, want_idx = torch.topk(logits.softmax(dim=-1), k=2, dim=-1, sorted=False)
+        assert torch.equal(out[1], want_idx)
+        torch.testing.assert_close(out[0], want_weight, rtol=0, atol=0, equal_nan=True)
+        assert bool(out[0][bad].isnan().all())
+        assert not bool(out[0][43].isnan().any())
+        _assert_dispatch_consistent(x, out)
 
     @pytest.mark.parametrize(
         ("x_shape", "logits_shape"),
@@ -315,6 +358,26 @@ class TestMoeTop2DispatchTriton:
             got = ck.moe_top2_dispatch(x, logits)
         _assert_same_dispatch(got, eager_backend.moe_top2_dispatch(**kwargs))
 
+    def test_non_finite_rows(self):
+        # a row whose scores are all NaN gets two distinct experts, as torch.topk gives, and
+        # does not move the slots of the other rows
+        x, logits, bad = _non_finite_router(70, 64, device="cuda", seed=5)
+        kwargs = {"x": x, "logits": logits}
+        assert registry.get_capable_backend(OP, kwargs) == "triton"
+        with ck.use_backend("triton"):
+            got = ck.moe_top2_dispatch(x, logits)
+        want = eager_backend.moe_top2_dispatch(**kwargs)
+        gw, gi, gs = _canonical(got[0], got[1], got[3])
+        ww, wi, ws = _canonical(want[0], want[1], want[3])
+        assert torch.equal(gi, wi)
+        torch.testing.assert_close(gw, ww, rtol=0, atol=0, equal_nan=True)
+        assert torch.equal(gs, ws)
+        assert torch.equal(got[2], want[2])
+        assert torch.equal(got[4], want[4])
+        assert got[1][bad].tolist() == [[0, 1]] * len(bad)
+        assert bool(got[0][bad].isnan().all())
+        _assert_dispatch_consistent(x, got)
+
     def test_moe_forward_matches_stock(self):
         # the whole MoE on the op against the stock forward; the expert GEMMs run on slices
         # of x_sorted instead of masked copies, so allow for a different GEMM kernel choice
@@ -327,15 +390,21 @@ class TestMoeTop2DispatchTriton:
         rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
         assert rel < 1e-2
 
-    def test_real_shape_served(self):
-        # HiDream-I1 double block at 1024x1024, cond + uncond: x [2 * 4096, 2560]
-        x, logits = _router(8192, 2560, device="cuda", seed=11)
+    @pytest.mark.parametrize(
+        ("n", "d"),
+        [(8192, 2560), (8960, 2560), (4096, 2560), (4480, 2560)],
+        ids=["double_batch2", "single_batch2", "double_batch1", "single_batch1"],
+    )
+    def test_real_shape_served(self, n, d):
+        # HiDream-I1 at 1024x1024: 4096 image tokens per sample, plus 3 x 128 text tokens in a
+        # single block; batch 2 is cond + uncond
+        x, logits = _router(n, d, device="cuda", seed=11)
         kwargs = {"x": x, "logits": logits}
         assert registry.get_capable_backend(OP, kwargs) == "triton"
         with ck.use_backend("triton"):
             got = ck.moe_top2_dispatch(x, logits)
         _assert_same_dispatch(got, eager_backend.moe_top2_dispatch(**kwargs))
-        assert int(got[4].sum()) == 2 * 8192
+        assert int(got[4].sum()) == 2 * n
 
     def test_empty_input_goes_to_eager(self):
         x = torch.empty(0, 64, device="cuda", dtype=torch.bfloat16)
