@@ -27,6 +27,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "nerf_glu_block",
 ]
 
 # Try to import triton and register if available
@@ -55,6 +56,7 @@ try:
 
     from .adaln import adaln, rms_adaln
     from .na import na3d
+    from .nerf_glu_block import nerf_glu_block
     from .quantization import (
         dequantize_nvfp4,
         dequantize_per_tensor_fp8,
@@ -125,6 +127,32 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _nerf_glu_block_call_rule(kwargs):
+        # The kernel has one fixed tile (256 pixels x 32 hidden units) and no masks; Chroma
+        # Radiance's block (16 x 16 patches, H 64, D 256) fits it. The rest runs eager.
+        block_m, block_h = 256, 32  # BLOCK_M, BLOCK_H of triton/nerf_glu_block.py
+        x, params, weight = kwargs.get("x"), kwargs.get("mlp_params"), kwargs.get("norm_weight")
+        if x is None or params is None or weight is None:
+            return ValidationResult.ok()
+        if x.numel() == 0 or params.numel() == 0:
+            return ValidationResult.fail("x", "empty tensors are not supported by triton")
+        batch_size, num_x, hidden_x = x.shape
+        if hidden_x not in (16, 32, 64):
+            return ValidationResult.fail("x", "hidden size must be 16, 32 or 64")
+        if num_x % block_m:
+            return ValidationResult.fail("x", f"pixels per patch must be a multiple of {block_m}")
+        if params.shape[1] % (3 * hidden_x * block_h):
+            return ValidationResult.fail(
+                "mlp_params", f"MLP hidden size must be a multiple of {block_h}"
+            )
+        if batch_size > 65535:
+            return ValidationResult.fail("x", "batch must be <= 65535 (grid)")
+        if x.stride(2) != 1 or params.stride(1) != 1 or weight.stride(0) != 1:
+            return ValidationResult.fail(
+                "x", "x, mlp_params and norm_weight need a unit last stride"
+            )
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -326,6 +354,19 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
+    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both, bf16 only
+    bf16 = frozenset({torch.bfloat16})
+    out["nerf_glu_block"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=bf16, shape_rules=(ExactDims(3),)),
+            "mlp_params": ParamConstraint(dtypes=bf16, shape_rules=(ExactDims(2),)),
+            "norm_weight": ParamConstraint(dtypes=bf16, shape_rules=(ExactDims(1),)),
+        },
+        default_devices=cuda_devices,
+        # bf16 tl.dot needs Ampere matrix capability
+        min_compute_capability=(8, 0),
+        call_rules=(_nerf_glu_block_call_rule,),
+    )
     out["na3d"] = FunctionConstraints(
         params={
             "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
