@@ -139,7 +139,11 @@ def _check_inplace(x, residual):
         if stride < required:
             raise ValueError(f"{name}: residual must be a view without internal overlap")
         required = stride * size
-    if _tensors_overlap(x, residual):
+    # _tensors_overlap compares element offsets, so views of one buffer with different element
+    # sizes are treated as overlapping
+    same_storage = x.untyped_storage().data_ptr() == residual.untyped_storage().data_ptr()
+    mixed_views = same_storage and x.element_size() != residual.element_size()
+    if mixed_views or _tensors_overlap(x, residual):
         raise ValueError(f"{name}: x must not overlap residual")
 
 

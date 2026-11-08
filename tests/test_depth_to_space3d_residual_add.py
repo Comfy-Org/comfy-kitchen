@@ -260,6 +260,15 @@ class TestDepthToSpace3dResidualAddEager:
         with pytest.raises(ValueError, match="must not overlap"):
             ck.depth_to_space3d_residual_add_(x, residual, 2, 2, 8)
 
+    def test_inplace_rejects_x_of_another_dtype_in_residual_storage(self):
+        # same shape and element strides, rows interleaved by element offset, but x is bf16 and
+        # residual fp32, so the bytes overlap
+        buf = torch.zeros(64)
+        residual = buf.view(1, 1, 1, 4, 16)[..., :8]
+        x = buf.view(torch.bfloat16).as_strided((1, 1, 1, 4, 8), (64, 64, 64, 16, 1), 8)
+        with pytest.raises(ValueError, match="must not overlap"):
+            ck.depth_to_space3d_residual_add_(x, residual, 1, 1, 1)
+
     def test_packed_output_is_contiguous(self):
         # factor_t 1 and H = W = 1: the sum of the two permuted views comes out strided
         x = torch.randn(1, 2, 1, 1, 1)
