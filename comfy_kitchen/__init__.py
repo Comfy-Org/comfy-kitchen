@@ -124,6 +124,8 @@ __all__ = [
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
     "w4a8_int8_linear",
+    # Mixture of experts
+    "moe_top2_dispatch",
     # Positional encoding
     "apply_rope",
     "apply_rope_",
@@ -1231,6 +1233,25 @@ def int8_linear_rms_modulated(
             "convrot_groupsize": convrot_groupsize,
         },
     )
+
+
+def moe_top2_dispatch(
+    x: torch.Tensor, logits: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Top-2 MoE routing and expert-major dispatch of the token rows, in one pass.
+
+    x ``[N, D]`` token rows, logits ``[N, E]`` router logits. Takes the softmax of the logits
+    and the top 2 experts of every row (``torch.topk(k=2, sorted=False)``) and returns
+    ``(topk_weight [N, 2], topk_idx [N, 2], x_sorted [2N, D], slot [2N], counts [E])``.
+    x_sorted holds the rows of ``x.repeat_interleave(2, dim=0)`` grouped by expert (expert 0
+    first, each expert's rows in token order, ``counts[i]`` rows for expert i), so every
+    expert runs on one contiguous slice. ``slot[t * 2 + k]`` is the row of x_sorted that holds
+    token t's k-th choice: the expert outputs in x_sorted's order gathered with
+    ``index_select(0, slot)`` are the token-major ``y`` of the HiDream ``MOEFeedForwardSwiGLU``
+    loop (``y[flat_topk_idx == i] = expert_i(x[flat_topk_idx == i])``). topk_weight has
+    logits' dtype; topk_idx, slot and counts are int64.
+    """
+    return torch.ops.comfy_kitchen.moe_top2_dispatch(x, logits)
 
 
 def delaunay3d(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
