@@ -38,6 +38,36 @@ constexpr float kLog2e = 1.44269504088896340736f;
 // them, and -ffast-math is on. See the fast-math note in the HIP backend README.
 constexpr float kMaskedScore = -50000.0f;
 
+// The bias a prepared mask hands back for a dropped key, and why it is not the
+// base-two form of kMaskedScore: the score loop *adds* the bias to the caller's
+// Q*K, so a sentinel only works if no score can climb back out of it. -50000
+// cannot manage that -- a Q*K of a few hundred already exceeds it -- which is why
+// the dropped-key fix had to carry per-element validity bits beside the score and
+// select on them.
+//
+// A sentinel large enough to be unrecoverable makes every one of those selects
+// unnecessary, because each consumer of the score already does the right thing with
+// an unrecoverable value:
+//   * the reduced maximum cannot be raised by a key that scores -1e30, so it cannot
+//     promote a fully dropped tile;
+//   * exp2(-1e30 - tile_m + kProbU8Offset) is exactly 0, so a dropped key
+//     contributes nothing to the PV product nor to tile_sum;
+//   * tile validity is then a single compare of the reduced maximum against it.
+//
+// Measured on gfx1103 over a sweep of scores from 1e-3 to 1e30: fmaf(score, 1,
+// kDroppedBias) is exactly kDroppedBias for every score below 1e23 (the sweep's only
+// exceptions were the 1e30 values injected on purpose), and the hardware exp2 returns
+// exactly 0.0f. Real scores are bounded by K * 127 * 127 * sm_scale, about 1e7 at
+// K=4096, so the margin is over fifteen orders of magnitude. 1e30 is also far enough
+// below FLT_MAX (3.4e38) that the fma cannot overflow to -inf, which
+// -ffinite-math-only would then be free to mishandle.
+constexpr float kDroppedBias = -1.0e30f;
+
+// Half of the above: the test that asks "did this tile keep anything". A real score is
+// nowhere near it, and the factor of two keeps the compare clear of kDroppedBias
+// itself without needing a strict inequality on the exact sentinel.
+constexpr float kDroppedBiasTest = kDroppedBias * 0.5f;
+
 constexpr float kInt8Max = 127.0f;
 
 template <typename T>
@@ -235,6 +265,32 @@ __forceinline__ __device__ void convrot(float* v) {
 
 // Round to nearest even and saturate, matching cvt.rni.sat.u8.f32 in the CUDA
 // backend's pack_u8x4.
+//
+// Written as `fminf(255, fmaxf(0, rintf(p)))` because that is what the ISA says
+// it has to be, and both halves of that are load-bearing in opposite ways. An
+// attempt to fold the rint away -- reasoning that v_cvt_u32_f32 already rounds to
+// nearest even, clamps negatives to zero, saturates above UINT_MAX and maps NaN to
+// zero, so the float-domain rint and both clamps would be the same answers
+// recomputed -- measured faster and failed tests/test_int8_attention.py's
+// nonpositive-scale tolerance at NRMSE 0.0317 against a 0.03 bound. It turned out
+// to buy nothing at all, for the reason below.
+//
+// Half of that reasoning is right and half is wrong, and the ISA settles which:
+//   * the two clamps **are** free. The generated loop carries no v_med3_f32 for
+//     them at all -- the compiler folds fmaxf(0,·) and fminf(255,·) into the
+//     convert's own saturation, so this expression is already two instructions,
+//     v_rndne_f32 and v_cvt_u32_f32, and there is nothing to remove.
+//   * the rint is **not** free. v_cvt_u32_f32 truncates toward zero; it does not
+//     round to nearest even. Casting 0.6, 1.5 and 254.6 gives 0, 1 and 254 where
+//     rintf gives 1, 2 and 255. The dropped rint biases every probability
+//     downward by up to 1/255, which is exactly the small systematic drift that
+//     took NRMSE from just under 0.03 to 0.0317.
+//
+// The gfx12 path below does get to use the native cvt_pk_u8_f32, whose comment
+// says the same thing is redundant there -- because that instruction really does
+// round to nearest even and saturate. It does not exist on gfx11. Worth knowing
+// before touching this again: the ISA for the two targets differs in a way the
+// shared spelling hides.
 __forceinline__ __device__ uint32_t prob_to_u8(float p) {
     return static_cast<uint32_t>(fminf(255.0f, fmaxf(0.0f, rintf(p))));
 }

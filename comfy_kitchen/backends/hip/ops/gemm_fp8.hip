@@ -56,7 +56,8 @@ static void launch_fp8(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N
         gemv_fp8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, epi);
         return;
     }
-    launch_gemm_wmma<MmaFp8, EpiTensorwise, OutT>(A, B, C, M, N, K, N, epi, stream);
+    launch_gemm_wmma<MmaFp8, EpiTensorwise, OutT>(A, B, C, M, N, K, N, epi, stream,
+                                                GemmPolicy{false, false});
 }
 
 }  // namespace comfy::hip_backend

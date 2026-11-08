@@ -14,6 +14,7 @@ from .base import (
     QuantizedLayout,
     QuantizedTensor,
     dequantize_args,
+    quantized_mm_has_fast_path,
     register_layout_op,
 )
 
@@ -177,6 +178,13 @@ def _handle_fp8_mm(qt, args, kwargs):
     if not (isinstance(a, QuantizedTensor) and isinstance(b, QuantizedTensor)):
         return torch.mm(*dequantize_args(args))
 
+    # Decline before dispatching rather than let the try/except below catch it:
+    # under torch.compile the op is traced into the graph, so the exception would
+    # escape at runtime instead (see quantized_mm_has_fast_path).
+    if not quantized_mm_has_fast_path(a._qdata.device.type):
+        logger.debug("FP8 mm: no native scaled GEMM here, falling back to dequantize")
+        return torch.mm(*dequantize_args(args))
+
     a_qdata, scale_a = TensorCoreFP8Layout.get_plain_tensors(a)
     b_qdata, scale_b = TensorCoreFP8Layout.get_plain_tensors(b)
     out_dtype = kwargs.get("out_dtype", a._params.orig_dtype)
@@ -193,6 +201,12 @@ def _handle_fp8_addmm(qt, args, kwargs):
     bias, input_tensor, weight = args[0], args[1], args[2]
 
     if not (isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor)):
+        return torch.addmm(*dequantize_args(args))
+
+    # See _handle_fp8_mm: the gate has to be a Python decision dynamo can trace,
+    # not a caught exception.
+    if not quantized_mm_has_fast_path(input_tensor._qdata.device.type):
+        logger.debug("FP8 addmm: no native scaled GEMM here, falling back to dequantize")
         return torch.addmm(*dequantize_args(args))
 
     input_qdata, scale_a = TensorCoreFP8Layout.get_plain_tensors(input_tensor)

@@ -7,6 +7,12 @@
 #define COMFY_MMA_GFX11 1
 #endif
 
+// gfx1103 (6-WGP Radeon 780M iGPU) carries the fork's small-iGPU tuning, a
+// subset of wmma_gfx11. Defined only in the gfx1103 device pass.
+#if @COMFY_HIP_GFX1103_CONDITION@
+#define COMFY_MMA_GFX1103 1
+#endif
+
 #if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX11)
 #define COMFY_HAS_WMMA 1
 #endif
