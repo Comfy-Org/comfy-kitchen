@@ -419,6 +419,38 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         }
 
 
+def cat_packed_weights(weights: tuple[QuantizedTensor, ...]) -> QuantizedTensor | None:
+    """Concatenate compatible packed row streams, preserving their active precision tier."""
+    first = weights[0]
+    params = first._params
+    if not params.mma_packed or params.transposed or params.correction is not None:
+        return None
+    bits = AsymW4A8Int8Layout.bits(first)
+    fields = params._tensor_fields()
+    for weight in weights[1:]:
+        other = weight._params
+        if (weight._layout_cls != first._layout_cls or not other.mma_packed or other.transposed
+                or other.correction is not None or other.orig_shape[1] != params.orig_shape[1]
+                or other.orig_dtype != params.orig_dtype or other.group_size != params.group_size
+                or other.convrot_groupsize != params.convrot_groupsize
+                or other._tensor_fields() != fields or AsymW4A8Int8Layout.bits(weight) != bits):
+            return None
+        for name in fields:
+            a, b = getattr(params, name), getattr(other, name)
+            if a.dtype != b.dtype or a.device != b.device:
+                return None
+        if params.codebook is not None and not torch.equal(params.codebook, other.codebook):
+            return None
+    # Snapshot before the caller overwrites member storage, which may be in reverse row order.
+    qdata = torch.cat([weight._qdata for weight in weights])
+    s_channel = torch.cat([weight._params.s_channel for weight in weights])
+    tier = None if params.lsb_tier is None else torch.cat([weight._params.lsb_tier for weight in weights])
+    return QuantizedTensor(qdata, first._layout_cls, dataclasses.replace(
+        params, orig_shape=(sum(weight.shape[0] for weight in weights), params.orig_shape[1]),
+        s_channel=s_channel, codebook=None if params.codebook is None else params.codebook.clone(), lsb_tier=tier,
+    ))
+
+
 def _is_w4a8(weight: object) -> bool:
     return isinstance(weight, QuantizedTensor) and weight._layout_cls == "AsymW4A8Int8Layout"
 
