@@ -263,7 +263,7 @@ class TestMoeTop2DispatchEager:
 
 
 class TestMoeTop2DispatchCallRule:
-    # the Triton call rule only looks at shapes and strides, so it runs on meta tensors
+    # the Triton call rule only looks at shapes, strides and devices, so it runs on meta tensors
     @pytest.mark.parametrize(
         ("n", "d", "n_experts", "ok"),
         [
@@ -289,6 +289,16 @@ class TestMoeTop2DispatchCallRule:
         assert _call_rule()({"x": x[:, ::2], "logits": logits}).success is False
         assert _call_rule()({"x": x, "logits": logits.t().contiguous().t()}).success is False
         assert _call_rule()({"x": x[:, 8:24], "logits": logits}).success  # row-strided view
+
+    def test_call_rule_devices(self):
+        # logits must be on x's device
+        x = torch.empty(8, 32, device="meta", dtype=torch.bfloat16)
+        logits = torch.empty(8, 4, device="meta", dtype=torch.bfloat16)
+        assert _call_rule()({"x": x, "logits": logits}).success
+        logits_cpu = torch.empty_like(logits, device="cpu")
+        assert not _call_rule()({"x": x, "logits": logits_cpu}).success
+        x_cpu = torch.empty_like(x, device="cpu")
+        assert not _call_rule()({"x": x_cpu, "logits": logits}).success
 
     def test_bf16_only(self):
         triton_backend = importlib.import_module("comfy_kitchen.backends.triton")
@@ -334,8 +344,7 @@ class TestMoeTop2DispatchTriton:
         x, logits = _router(n, d, device="cuda", seed=n)
         kwargs = {"x": x, "logits": logits}
         assert registry.validate_backend_for_call("triton", OP, kwargs).success
-        assert registry.get_capable_backend(OP, kwargs) == "triton"
-        with ck.use_backend("triton"):
+        with self._served("triton"), ck.use_backend("triton"):
             got = ck.moe_top2_dispatch(x, logits)
         want = eager_backend.moe_top2_dispatch(**kwargs)
         _assert_same_dispatch(got, want)
@@ -373,8 +382,7 @@ class TestMoeTop2DispatchTriton:
             # [B, S, D].view(-1, D), as MoEGate does
             x = x.view(2, 150, 520).view(-1, 520)
         kwargs = {"x": x, "logits": logits}
-        assert registry.get_capable_backend(OP, kwargs) == "triton"
-        with ck.use_backend("triton"):
+        with self._served("triton"), ck.use_backend("triton"):
             got = ck.moe_top2_dispatch(x, logits)
         _assert_same_dispatch(got, eager_backend.moe_top2_dispatch(**kwargs))
 
@@ -383,8 +391,7 @@ class TestMoeTop2DispatchTriton:
         # does not move the slots of the other rows
         x, logits, bad = _non_finite_router(70, 64, device="cuda", seed=5)
         kwargs = {"x": x, "logits": logits}
-        assert registry.get_capable_backend(OP, kwargs) == "triton"
-        with ck.use_backend("triton"):
+        with self._served("triton"), ck.use_backend("triton"):
             got = ck.moe_top2_dispatch(x, logits)
         want = eager_backend.moe_top2_dispatch(**kwargs)
         gw, gi, gs = _canonical(got[0], got[1], got[3])
@@ -420,8 +427,7 @@ class TestMoeTop2DispatchTriton:
         # single block; batch 2 is cond + uncond
         x, logits = _router(n, d, device="cuda", seed=11)
         kwargs = {"x": x, "logits": logits}
-        assert registry.get_capable_backend(OP, kwargs) == "triton"
-        with ck.use_backend("triton"):
+        with self._served("triton"), ck.use_backend("triton"):
             got = ck.moe_top2_dispatch(x, logits)
         _assert_same_dispatch(got, eager_backend.moe_top2_dispatch(**kwargs))
         assert int(got[4].sum()) == 2 * n

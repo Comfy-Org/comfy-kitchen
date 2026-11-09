@@ -139,6 +139,8 @@ def _build_constraints() -> dict:
             return ValidationResult.fail(
                 "x", "empty tensors are not supported by triton moe_top2_dispatch"
             )
+        if logits.device != x.device:
+            return ValidationResult.fail("logits", "must be on x's device")
         if x.stride(-1) != 1 or logits.stride(-1) != 1:
             return ValidationResult.fail("x", "x and logits need a unit stride in the last dim")
         # at most 2**14 tokens (HiDream-I1 calls have up to 8960), more go to eager: the gather
