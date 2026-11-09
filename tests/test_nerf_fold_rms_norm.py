@@ -10,6 +10,7 @@ and rounds once, so it is compared to eager and to an fp32 reference with a tole
 never be further from the fp32 reference than eager.
 """
 
+import contextlib
 import importlib
 
 import pytest
@@ -230,11 +231,28 @@ class TestNerfFoldRmsNormTriton:
             pytest.skip("triton backend not available")
 
     @staticmethod
-    def _check(tiles, weight, batch, height, width, patch, eps=None):
+    @contextlib.contextmanager
+    def _served(expected="triton"):
+        # the backend of the implementation the registry returns for each call in the block
+        # (get_implementation wrapped), so the check is on the call that ran, not on a query
+        served = []
+        get_implementation = registry.get_implementation
+
+        def recording(func_name, backend=None, kwargs=None):
+            impl = get_implementation(func_name, backend, kwargs)
+            if func_name == OP:
+                served.append(impl.__module__.rsplit(".", 2)[-2])
+            return impl
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(registry, "get_implementation", recording)
+            yield
+        assert served and all(b == expected for b in served), served
+
+    def _check(self, tiles, weight, batch, height, width, patch, eps=None):
         kwargs = _kwargs(tiles, weight, batch, height, width, patch, eps)
         assert registry.validate_backend_for_call("triton", OP, kwargs).success
-        assert registry.get_capable_backend(OP, kwargs) == "triton"
-        with ck.use_backend("triton"):
+        with self._served("triton"), ck.use_backend("triton"):
             got = ck.nerf_fold_rms_norm(tiles, weight, batch, height, width, patch, eps)
         ref = eager_backend.nerf_fold_rms_norm(**kwargs)
         ref32 = _reference32(tiles, weight, batch, height, width, patch, eps)
