@@ -5,10 +5,9 @@
 The eager backend is the sequence ComfyUI's Qwen-Image Attention.forward runs today (the
 view / transpose / contiguous of the six projections, the four RMSNorms, the txt-then-img
 torch.cat of q, k and v, and apply_rope1 on the joint q and k), so it must match the stock
-code exactly, including the output layout the attention call reads. The Triton kernel computes
-the norm and the rotation in fp32 and rounds once, so q and k are compared to eager and to an
-fp32 reference with a tolerance and must never be further from the fp32 reference than eager;
-v is a copy and must be exact.
+code exactly, including the output layout the attention call reads. The Triton kernel rounds
+like the unfused chain on the GPU (F.rms_norm, then the build's apply_rope1 kernel), so q, k
+and v must equal that chain exactly.
 """
 
 import importlib
@@ -128,21 +127,6 @@ def _kwargs(projections, weights, freqs, heads, eps=1e-6):
 
 def _kitchen(projections, weights, freqs, heads, eps=1e-6):
     return ck.joint_qk_rms_rope_cat(*projections, *weights, freqs, heads, eps)
-
-
-def _reference32(projections, weights, freqs, heads, eps=1e-6):
-    norms = [_cast_norm(w.float(), eps) for w in weights]
-    with ck.use_backend("eager"):
-        return _stock_prep([p.float() for p in projections], norms, freqs.float(), heads)
-
-
-def _rel(a, b):
-    return ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-12)).item()
-
-
-def _err(a, ref32):
-    d = (a.float() - ref32).abs()
-    return d.max().item(), d.mean().item()
 
 
 def _call_rule():
@@ -345,26 +329,34 @@ class TestJointQkRmsRopeCatTriton:
             pytest.skip("triton backend not available")
 
     @staticmethod
-    def _check(projections, weights, freqs, heads, eps=1e-6):
+    def _stock(projections, weights, freqs, heads, eps=1e-6):
+        # the unfused chain on this GPU: F.rms_norm, then the apply_rope1 kernel whose
+        # rounding the Triton kernel follows (eager rounds as the HIP kernel does)
+        kernel = importlib.import_module("comfy_kitchen.backends.triton." + OP)
+        if kernel._ROUND_SECOND:
+            if not registry.is_available("cuda"):
+                pytest.skip("CUDA apply_rope1 not built")
+            rope = "cuda"
+        else:
+            rope = "hip" if registry.is_available("hip") else "eager"
+        with ck.use_backend(rope):
+            return _stock_prep(projections, [_cast_norm(w, eps) for w in weights], freqs, heads)
+
+    @classmethod
+    def _check(cls, projections, weights, freqs, heads, eps=1e-6):
         kwargs = _kwargs(projections, weights, freqs, heads, eps)
         assert registry.validate_backend_for_call("triton", OP, kwargs).success
         assert registry.get_capable_backend(OP, kwargs) == "triton"
         with ck.use_backend("triton"):
             got = _kitchen(projections, weights, freqs, heads, eps)
         ref = eager_backend.joint_qk_rms_rope_cat(**kwargs)
-        ref32 = _reference32(projections, weights, freqs, heads, eps)
         for g, r in zip(got, ref, strict=True):
             assert g.shape == r.shape and g.stride() == r.stride()
             assert g.dtype == torch.bfloat16
-        for g, r, r32 in zip(got[:2], ref[:2], ref32[:2], strict=True):
-            assert _rel(g, r) < 1e-2
-            assert _rel(g, r32) < 1e-2
-            # one rounding: never further from the fp32 reference than the eager chain
-            g_max, g_mean = _err(g, r32)
-            r_max, r_mean = _err(r, r32)
-            assert g_max <= r_max and g_mean <= r_mean
-        # v is a copy
-        assert torch.equal(got[2], ref[2])
+        # q and k round like the unfused chain, v is a copy
+        stock = cls._stock(projections, weights, freqs, heads, eps)
+        for g, s in zip(got, stock, strict=True):
+            assert torch.equal(g, s)
         return got, ref
 
     @pytest.mark.parametrize(
@@ -404,6 +396,18 @@ class TestJointQkRmsRopeCatTriton:
         )
         self._check(projections, weights, freqs, 24, eps=1e-3)
 
+    def test_large_values(self):
+        # outputs in the hundreds (bf16 step 2 to 4), where a different rounding shows most:
+        # a few large weight entries and rows with large inputs
+        projections, weights, freqs = _inputs(
+            1, 1024, 77, 24, 128, device="cuda", dtype=torch.bfloat16
+        )
+        for w in weights:
+            w[::29] = 48
+        for p in projections:
+            p[:, ::5] *= 100
+        self._check(projections, weights, freqs, 24)
+
     @pytest.mark.parametrize("layout", ["fused", "batch_step2"])
     def test_kernel_layouts(self, layout):
         if layout == "fused":
@@ -430,14 +434,10 @@ class TestJointQkRmsRopeCatTriton:
         projections, weights, freqs = _inputs(
             2, 150, 11, 24, 128, device="cuda", dtype=torch.bfloat16, freqs_batch=2
         )
-        kwargs = _kwargs(projections, weights, freqs, 24)
-        got = kernel.joint_qk_rms_rope_cat(**kwargs)
-        ref = eager_backend.joint_qk_rms_rope_cat(**kwargs)
-        ref32 = _reference32(projections, weights, freqs, 24)
-        for g, r, r32 in zip(got[:2], ref[:2], ref32[:2], strict=True):
-            assert _rel(g, r32) < 1e-2
-            assert _err(g, r32)[0] <= _err(r, r32)[0]
-        assert torch.equal(got[2], ref[2])
+        got = kernel.joint_qk_rms_rope_cat(**_kwargs(projections, weights, freqs, 24))
+        stock = self._stock(projections, weights, freqs, 24)
+        for g, s in zip(got, stock, strict=True):
+            assert torch.equal(g, s)
 
     def test_real_shape_served(self):
         # the Qwen-Image 2512 cond call at its captured size: L_img 6889, L_txt 210

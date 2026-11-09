@@ -8,9 +8,12 @@ head_dim]`` q, k and v, text rows first (joint row l < L_txt is text row l, the 
 l - L_txt). Each program owns ``block_l`` joint rows of one batch item, for one head or for
 all heads (see the launch configuration below):
 
-    q, k: per-head RMSNorm in fp32 with the stream's weight, then the interleaved RoPE
+    q, k: per-head RMSNorm with the stream's weight, then the interleaved RoPE
           (pair j = elements 2j, 2j + 1; out[2j + i] = f[j, i, 0] * x[2j] + f[j, i, 1] * x[2j + 1])
-          from the [.., head_dim / 2, 2, 2] table in fp32, rounded once to the output dtype
+          from the [.., head_dim / 2, 2, 2] table, with the unfused path's rounding: the
+          normalized value rounded to bf16 as F.rms_norm stores it (same summation order),
+          and the rotation rounded as the build's apply_rope1 kernel does, so q and k equal
+          the unfused chain bit for bit
     v:    copied
 
 so the heads-first copies, the normalized tensors and the unrotated concatenations are never
@@ -28,6 +31,64 @@ import triton
 import triton.language as tl
 
 _HIP = bool(torch.version.hip)  # picks the launch configuration
+# the rotation rounds like the build's apply_rope1 kernel (CUDA or HIP)
+_ROUND_SECOND = not torch.version.hip
+
+
+@triton.jit
+def _round_bf16(v):
+    return v.to(tl.bfloat16).to(tl.float32)
+
+
+@triton.jit
+def _sum_odd(a, b):
+    # a + b rounded to odd in fp32: rounding that to bf16 equals rounding the exact sum
+    # once (24 >= 8 + 2 bits), as a bf16 fma does
+    s = a + b
+    bb = s - a
+    err = (a - (s - bb)) + (b - bb)
+    bits = s.to(tl.int32, bitcast=True)
+    step = tl.where((err > 0) == (s > 0), 1, -1)
+    bits = tl.where((err != 0) & ((bits & 1) == 0), bits + step, bits)
+    return bits.to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _fold(s, block_l: tl.constexpr, half: tl.constexpr):
+    # s[:, t] + s[:, t + half], the shuffle-down step of a warp reduction
+    lo, hi = tl.split(tl.permute(tl.reshape(s, (block_l, 2, half)), (0, 2, 1)))
+    return hi + lo
+
+
+@triton.jit
+def _sum_squares(x, block_l: tl.constexpr, head_dim: tl.constexpr):
+    # F.rms_norm's summation order on CUDA (vectorized_layer_norm_kernel): lane t adds the
+    # squares of elements 4t .. 4t + 3 in turn, then the lanes reduce by shuffle-down
+    lanes: tl.constexpr = head_dim // 4
+    e, o = tl.split(tl.reshape(x * x, (block_l, lanes, 2, 2)))
+    e0, e1 = tl.split(e)
+    o0, o1 = tl.split(o)
+    s = ((e0 + o0) + e1) + o1
+    if lanes >= 32:
+        s = _fold(s, block_l, 16)
+    if lanes >= 16:
+        s = _fold(s, block_l, 8)
+    if lanes >= 8:
+        s = _fold(s, block_l, 4)
+    s = _fold(s, block_l, 2)
+    s = _fold(s, block_l, 1)
+    return tl.reshape(s, (block_l,))
+
+
+@triton.jit
+def _rope_pair(fa, xa, fb, xb, round_second: tl.constexpr):
+    # fa * xa + fb * xb with the rounding of the apply_rope1 that serves the unfused path;
+    # x and f are bf16 values, so each product is exact in fp32
+    if round_second:
+        # CUDA apply_rope1 (bf16 arithmetic): the second product rounded, fused into the add
+        return _sum_odd(fa * xa, _round_bf16(fb * xb))
+    # HIP apply_rope1 and eager: the first product rounded, addcmul_ fuses the second
+    return _round_bf16(fa * xa) + fb * xb
 
 
 @triton.jit
@@ -48,6 +109,7 @@ def _qk_row(
     eps,
     head_dim: tl.constexpr,
     block_l: tl.constexpr,
+    round_second: tl.constexpr,
 ):
     ptr = tl.where(
         is_txt[:, None],
@@ -55,13 +117,14 @@ def _qk_row(
         src_i + row_i[:, None] + offs_d[None, :],
     )
     x = tl.load(ptr, mask=lmask[:, None], other=0.0).to(tl.float32)
-    ss = tl.sum(x * x, axis=1) / head_dim
+    ss = _sum_squares(x, block_l, head_dim) / head_dim
     inv = tl.math.rsqrt(ss + eps)
     w = tl.where(is_txt[:, None], w_t[None, :], w_i[None, :])
-    y = x * inv[:, None] * w
+    # F.rms_norm's single rounding of w * (x * rstd) to bf16: the unfused path stores it
+    y = _round_bf16(x * inv[:, None] * w)
     ye, yo = tl.split(tl.reshape(y, (block_l, head_dim // 2, 2)))
-    oe = f00 * ye + f01 * yo
-    oo = f10 * ye + f11 * yo
+    oe = _rope_pair(f00, ye, f01, yo, round_second)
+    oo = _rope_pair(f10, ye, f11, yo, round_second)
     return tl.interleave(oe, oo)
 
 
@@ -94,6 +157,7 @@ def _joint_qk_rms_rope_cat_kernel(
     head_dim: tl.constexpr,
     block_l: tl.constexpr,
     head_loop: tl.constexpr,
+    round_second: tl.constexpr,
 ):
     pid_l = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -143,6 +207,7 @@ def _joint_qk_rms_rope_cat_kernel(
                 eps,
                 head_dim,
                 block_l,
+                round_second,
             )
             tl.store(oq + hoff + out_row, yq.to(oq.dtype.element_ty), mask=lmask[:, None])
             yk = _qk_row(
@@ -162,6 +227,7 @@ def _joint_qk_rms_rope_cat_kernel(
                 eps,
                 head_dim,
                 block_l,
+                round_second,
             )
             tl.store(ok + hoff + out_row, yk.to(ok.dtype.element_ty), mask=lmask[:, None])
             pv = tl.where(
@@ -191,6 +257,7 @@ def _joint_qk_rms_rope_cat_kernel(
             eps,
             head_dim,
             block_l,
+            round_second,
         )
         tl.store(oq + hoff + out_row, yq.to(oq.dtype.element_ty), mask=lmask[:, None])
         yk = _qk_row(
@@ -210,6 +277,7 @@ def _joint_qk_rms_rope_cat_kernel(
             eps,
             head_dim,
             block_l,
+            round_second,
         )
         tl.store(ok + hoff + out_row, yk.to(ok.dtype.element_ty), mask=lmask[:, None])
         pv = tl.where(
@@ -282,6 +350,7 @@ def joint_qk_rms_rope_cat(
         head_dim=head_dim,
         block_l=block_l,
         head_loop=head_loop,
+        round_second=_ROUND_SECOND,
         num_warps=num_warps,
     )
     return out_q, out_k, out_v
