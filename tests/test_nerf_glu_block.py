@@ -215,6 +215,33 @@ class TestNerfGluBlockCallRule:
         assert not rule(_kwargs(x[..., :64], p[:, ::2], w[:64])).success
         assert not rule(_kwargs(x[..., :64], p[:, :49152], w[::2])).success
 
+    def test_call_rule_int32_offsets(self):
+        # offsets within a patch of x / out and within an mlp_params row are int32 in the
+        # kernel; meta tensors give the sizes and strides without allocating them
+        rule = _call_rule()
+        w = torch.empty(64, device="meta", dtype=torch.bfloat16)
+        p = torch.empty(1, 49152, device="meta", dtype=torch.bfloat16)
+
+        def x_strided(n, row_stride):
+            return torch.empty_strided(
+                (1, n, 64), (n * row_stride, row_stride, 1), device="meta", dtype=torch.bfloat16
+            )
+
+        # contiguous x (and out): N * H elements per patch
+        assert rule(_kwargs(x_strided(2**25, 64), p, w)).success
+        assert not rule(_kwargs(x_strided(2**25 + 256, 64), p, w)).success
+        # wide pixel stride: the last element of the patch is at 255 * stride + 63
+        last_ok = (2**31 - 64) // 255
+        assert rule(_kwargs(x_strided(256, last_ok), p, w)).success
+        assert not rule(_kwargs(x_strided(256, last_ok + 1), p, w)).success
+        # mlp_params row length (a multiple of 3 * H * 32)
+        x = torch.empty(1, 256, 64, device="meta", dtype=torch.bfloat16)
+        cols_ok = 2**31 // 6144 * 6144
+        p_ok = torch.empty(1, cols_ok, device="meta", dtype=torch.bfloat16)
+        p_big = torch.empty(1, cols_ok + 6144, device="meta", dtype=torch.bfloat16)
+        assert rule(_kwargs(x, p_ok, w)).success
+        assert not rule(_kwargs(x, p_big, w)).success
+
     def test_bf16_only(self):
         triton_backend = importlib.import_module("comfy_kitchen.backends.triton")
         constraints = triton_backend._build_constraints()[OP]
@@ -354,6 +381,17 @@ class TestNerfGluBlockTriton:
         with ck.use_backend("triton"):
             got = ck.nerf_glu_block(x, p, w)
         assert got.shape == (0, 256, 64) and got.dtype == torch.bfloat16
+
+    def test_int32_offset_bound_goes_to_eager(self):
+        # an expanded x has a patch of 2**25 + 256 pixels without the memory; its output
+        # patch would pass int32 offsets, so dispatch picks eager (the op is not run here)
+        _, p, w = _inputs(1, 256, 64, 4, device="cuda", dtype=torch.bfloat16)
+        x = torch.empty(1, 1, 64, device="cuda", dtype=torch.bfloat16).expand(1, 2**25 + 256, 64)
+        kwargs = _kwargs(x, p, w)
+        assert not registry.validate_backend_for_call("triton", OP, kwargs).success
+        assert registry.get_capable_backend(OP, kwargs) == "eager"
+        x = torch.empty(1, 1, 64, device="cuda", dtype=torch.bfloat16).expand(1, 2**25, 64)
+        assert registry.validate_backend_for_call("triton", OP, _kwargs(x, p, w)).success
 
     @pytest.mark.parametrize(
         ("dtype", "b", "n", "h", "ratio", "view"),

@@ -153,6 +153,14 @@ def _build_constraints() -> dict:
             return ValidationResult.fail(
                 "x", "x, mlp_params and norm_weight need a unit last stride"
             )
+        # Only the patch / row base is 64-bit in the kernel; the element offset inside one
+        # patch of x and of out (contiguous) and inside one mlp_params row is int32.
+        int32_end = 2**31
+        x_end = max((num_x - 1) * x.stride(1), (num_x - 1) * hidden_x) + hidden_x
+        if x_end > int32_end:
+            return ValidationResult.fail("x", "offsets within a patch must fit in int32")
+        if params.shape[1] > int32_end:
+            return ValidationResult.fail("mlp_params", "a row must have at most 2**31 elements")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
