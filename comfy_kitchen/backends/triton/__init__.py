@@ -130,9 +130,6 @@ def _build_constraints() -> dict:
         return ValidationResult.ok()
 
     def _moe_top2_dispatch_call_rule(kwargs):
-        # No size threshold: on the four HiDream-I1 shapes measured (bf16, 4096 to 8960 tokens,
-        # dim 2560, 4 experts) the kernels were faster than ComfyUI's current path on an RTX
-        # 5090 and on a Radeon 8060S (per-call numbers in the PR that added this op).
         x, logits = kwargs.get("x"), kwargs.get("logits")
         if x is None or logits is None:
             return ValidationResult.ok()
@@ -144,10 +141,11 @@ def _build_constraints() -> dict:
             )
         if x.stride(-1) != 1 or logits.stride(-1) != 1:
             return ValidationResult.fail("x", "x and logits need a unit stride in the last dim")
-        # the gather kernel holds the counts of all 32-row blocks in one [next_pow2(blocks), 4]
-        # tile, at most 2**20 elements in Triton; this also keeps 2 * tokens in int32
-        if x.shape[0] > 2**23:
-            return ValidationResult.fail("x", "more than 2**23 tokens (gather kernel count tile)")
+        # at most 2**14 tokens (HiDream-I1 calls have up to 8960), more go to eager: the gather
+        # kernel's count tile is a constexpr sized by the token count, so every new size
+        # compiles its own kernel
+        if x.shape[0] > 2**14:
+            return ValidationResult.fail("x", "more than 2**14 tokens")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})

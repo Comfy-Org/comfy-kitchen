@@ -273,8 +273,8 @@ class TestMoeTop2DispatchCallRule:
             (8, 16, 2, False),
             (0, 16, 4, False),  # empty
             (8, 0, 4, False),  # empty
-            (2**23, 1, 4, True),
-            (2**23 + 1, 1, 4, False),  # count tile over Triton's 2**20 elements
+            (2**14, 1, 4, True),
+            (2**14 + 1, 1, 4, False),  # over the token cap
         ],
     )
     def test_call_rule(self, n, d, n_experts, ok):
@@ -405,6 +405,19 @@ class TestMoeTop2DispatchTriton:
             got = ck.moe_top2_dispatch(x, logits)
         _assert_same_dispatch(got, eager_backend.moe_top2_dispatch(**kwargs))
         assert int(got[4].sum()) == 2 * n
+
+    def test_token_cap(self):
+        # the largest accepted token count really launches; one more token goes to eager
+        x, logits = _router(2**14, 8, device="cuda", seed=5)
+        kwargs = {"x": x, "logits": logits}
+        assert registry.get_capable_backend(OP, kwargs) == "triton"
+        with ck.use_backend("triton"):
+            got = ck.moe_top2_dispatch(x, logits)
+        _assert_same_dispatch(got, eager_backend.moe_top2_dispatch(**kwargs))
+        x, logits = _router(2**14 + 1, 8, device="cuda", seed=5)
+        kwargs = {"x": x, "logits": logits}
+        assert not registry.validate_backend_for_call("triton", OP, kwargs).success
+        assert registry.get_capable_backend(OP, kwargs) == "eager"
 
     def test_empty_input_goes_to_eager(self):
         x = torch.empty(0, 64, device="cuda", dtype=torch.bfloat16)
