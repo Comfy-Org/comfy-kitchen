@@ -30,8 +30,14 @@
 
 #ifdef COMFY_HAVE_CONVROT_BF16
 namespace comfy {
-bool try_quantize_int8_convrot_bf16_4096(
-    const void*, void*, float*, int64_t, cudaStream_t);
+bool try_quantize_int8_convrot_bf16_4096(const void *, void *, float *, int64_t, int, cudaStream_t);
+}
+#endif
+
+#ifdef COMFY_HAVE_CONVROT_BF16_VEC
+namespace comfy {
+bool try_quantize_int8_convrot_bf16_vec_4096(const void *, void *, float *, int64_t, int,
+                                             cudaStream_t);
 }
 #endif
 
@@ -273,32 +279,34 @@ __global__ void quantize_int8_rowwise_kernel(
 // slot `sub = tid / 256`.
 constexpr int kConvRotGroup = 256;
 
-// Scalar and packed paths share the same ordered H4 sum. Only the arithmetic
-// primitives differ; the three additions and normalization keep their order.
-__device__ __forceinline__ float convrot_add(float a, float b) { return a + b; }
-__device__ __forceinline__ float convrot_half(float a) { return 0.5f * a; }
-#ifdef COMFY_CONVROT_SPECIALIZATION_ONLY
-__device__ __forceinline__ float2 convrot_add(float2 a, float2 b) {
-    float2 result;
-    asm("{ .reg .b64 a,b; mov.b64 a,{%2,%3}; mov.b64 b,{%4,%5};"
-        "add.rn.ftz.f32x2 a,a,b; mov.b64 {%0,%1},a; }"
-        : "=f"(result.x), "=f"(result.y)
-        : "f"(a.x), "f"(a.y), "f"(b.x), "f"(b.y));
-    return result;
+// Preserve the three ordered FP32 additions and power-of-two normalization.
+__device__ __forceinline__ float convrot_h4_sum(float a, float b, float c, float d) {
+    return .5f * (((a + b) + c) + d);
 }
-__device__ __forceinline__ float2 convrot_half(float2 a) {
+#ifdef COMFY_CONVROT_SPECIALIZATION_ONLY
+__device__ __forceinline__ float2 convrot_h4_sum(float2 a, float2 b, float2 c, float2 d) {
     float2 result;
-    asm("{ .reg .b64 a,h; mov.b64 a,{%2,%3}; mov.b64 h,0x3f0000003f000000;"
+#if __CUDA_ARCH__ < 1000
+    // Keep one ordered scalar instruction chain per component.
+    asm("add.rn.ftz.f32 %0,%1,%2; add.rn.ftz.f32 %0,%0,%3; add.rn.ftz.f32 %0,%0,%4;"
+        "mul.rn.ftz.f32 %0,%0,0f3f000000;"
+        : "=&f"(result.x)
+        : "f"(a.x), "f"(b.x), "f"(c.x), "f"(d.x));
+    asm("add.rn.ftz.f32 %0,%1,%2; add.rn.ftz.f32 %0,%0,%3; add.rn.ftz.f32 %0,%0,%4;"
+        "mul.rn.ftz.f32 %0,%0,0f3f000000;"
+        : "=&f"(result.y)
+        : "f"(a.y), "f"(b.y), "f"(c.y), "f"(d.y));
+#else
+    asm("{ .reg .b64 a,b,c,d,h; mov.b64 a,{%2,%3}; mov.b64 b,{%4,%5};"
+        "mov.b64 c,{%6,%7}; mov.b64 d,{%8,%9}; mov.b64 h,0x3f0000003f000000;"
+        "add.rn.ftz.f32x2 a,a,b; add.rn.ftz.f32x2 a,a,c; add.rn.ftz.f32x2 a,a,d;"
         "mul.rn.ftz.f32x2 a,a,h; mov.b64 {%0,%1},a; }"
         : "=f"(result.x), "=f"(result.y)
-        : "f"(a.x), "f"(a.y));
+        : "f"(a.x), "f"(a.y), "f"(b.x), "f"(b.y), "f"(c.x), "f"(c.y), "f"(d.x), "f"(d.y));
+#endif
     return result;
 }
 #endif
-
-template <typename T> __device__ __forceinline__ T convrot_h4_sum(T a, T b, T c, T d) {
-    return convrot_half(convrot_add(convrot_add(convrot_add(a, b), c), d));
-}
 
 template <typename InputType> __device__ __forceinline__ float convrot_int8_scale(float abs_max) {
     return fmaxf(finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f), 1.0e-30f);
@@ -364,20 +372,52 @@ __device__ __forceinline__ unsigned convrot_bf16_numerator(float2 a) {
 // the signed INT8 byte encoding. Keep the lower clamp for CK's NaN behavior;
 // the converter supplies rounding and upper saturation without scalar CVTs.
 __device__ __forceinline__ unsigned convrot_encode_int8x4(unsigned n0, unsigned n1, float inv) {
+#if __CUDA_ARCH__ >= 1000
     unsigned r;
-    asm("{ .reg .b32 q01,q23,lo; .reg .b16 out01,out23,sf; .reg .f32 a0,a1,a2,a3,c0,c1,c2,c3; .reg "
+    asm("{ .reg .b32 q01,q23,lo; .reg .b16 out01,out23,sf; .reg .f32 "
+        "a0,a1,a2,a3,c0,c1,c2,c3; .reg "
         ".b64 a,b;"
-        "prmt.b32 a0,%1,0,0x1044; prmt.b32 a1,%1,0,0x3244; prmt.b32 a2,%2,0,0x1044; prmt.b32 "
+        "prmt.b32 a0,%1,0,0x1044; prmt.b32 a1,%1,0,0x3244; prmt.b32 "
+        "a2,%2,0,0x1044; prmt.b32 "
         "a3,%2,0,0x3244;"
-        "mov.b64 b,{%3,%3}; mov.b64 a,{a0,a1}; mul.rn.ftz.f32x2 a,a,b; mov.b64 {c0,c1},a;"
+        "mov.b64 b,{%3,%3}; mov.b64 a,{a0,a1}; mul.rn.ftz.f32x2 a,a,b; mov.b64 "
+        "{c0,c1},a;"
         "mov.b64 a,{a2,a3}; mul.rn.ftz.f32x2 a,a,b; mov.b64 {c2,c3},a;"
-        "cvt.rn.bf16x2.f32 q01,c1,c0; cvt.rn.bf16x2.f32 q23,c3,c2; mov.b32 lo,0xc300c300;"
+        "cvt.rn.bf16x2.f32 q01,c1,c0; cvt.rn.bf16x2.f32 q23,c3,c2; mov.b32 "
+        "lo,0xc300c300;"
         "max.bf16x2 q01,q01,lo; max.bf16x2 q23,q23,lo; mov.b16 sf,0x8585;"
         "cvt.rn.satfinite.scaled::n2::ue8m0.s2f6x2.bf16x2 out01,q01,sf;"
-        "cvt.rn.satfinite.scaled::n2::ue8m0.s2f6x2.bf16x2 out23,q23,sf; mov.b32 %0,{out01,out23}; }"
+        "cvt.rn.satfinite.scaled::n2::ue8m0.s2f6x2.bf16x2 out23,q23,sf; mov.b32 "
+        "%0,{out01,out23}; }"
         : "=r"(r)
         : "r"(n0), "r"(n1), "f"(inv));
     return r;
+#else
+    auto a = convrot_decode_bf16(n0), b = convrot_decode_bf16(n1);
+    float v[4] = {a.x, a.y, b.x, b.y};
+    int result[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        float f;
+        asm("mul.rn.ftz.f32 %0,%1,%2;" : "=f"(f) : "f"(v[i]), "f"(inv));
+        unsigned short q = __bfloat16_as_ushort(__float2bfloat16_rn(f));
+#if __CUDA_ARCH__ >= 900
+        // BF16 lower clamp preserves CK's NaN handling. The final pack supplies
+        // INT8 saturation, so no upper clamp or FP32 round trip is needed.
+        asm("max.bf16 %0,%0,%1;" : "+h"(q) : "h"((unsigned short)0xc300));
+        asm("cvt.rni.s32.bf16 %0,%1;" : "=r"(result[i]) : "h"(q));
+#else
+        f = fmaxf(-128.f, __bfloat162float(__ushort_as_bfloat16(q)));
+        result[i] = __float2int_rn(f);
+#endif
+    }
+    unsigned r, tmp;
+    asm("cvt.pack.sat.s8.s32.b32 %0,%1,%2,0;" : "=r"(tmp) : "r"(result[3]), "r"(result[2]));
+    asm("cvt.pack.sat.s8.s32.b32 %0,%1,%2,%3;"
+        : "=r"(r)
+        : "r"(result[1]), "r"(result[0]), "r"(tmp));
+    return r;
+#endif
 }
 __device__ __forceinline__ int convrot_exchange_index(int i) {
     return i ^ (((i >> 6) & 7) << 2) ^ (((i >> 4) & 3) << 2);
@@ -408,34 +448,8 @@ template <int Stride> __device__ __forceinline__ void convrot_h4_stage(float (&v
     for (int i = 0; i < 64; i++)
         v[i] = next[i];
 }
-// One CTA owns a complete row. TMA first uses 8 KiB of shared memory; after
-// all readers finish, the same allocation holds the FP32 exchange. Groups
-// exchanged in the last H4 stage are entirely within a warp.
-__global__ __launch_bounds__(64) void quantize_int8_rowwise_convrot_bf16_kernel(
-    const __grid_constant__ CUtensorMap map, int8_t *__restrict__ q, float *__restrict__ scales) {
-    __shared__ __align__(1024) float shared[4096];
-    __shared__ __align__(8) uint64_t barrier;
-    __shared__ float peaks[2];
-    unsigned sm = unsigned(__cvta_generic_to_shared(shared)),
-             bar = unsigned(__cvta_generic_to_shared(&barrier));
-    int t = threadIdx.x, row = blockIdx.x;
-    if (t == 0) {
-        asm volatile("mbarrier.init.shared.b64 [%0],1; fence.mbarrier_init.release.cluster; "
-                     "fence.proxy.async.shared::cta;" ::"r"(bar)
-                     : "memory");
-        asm volatile("mbarrier.arrive.expect_tx.shared.b64 _,[%0],8192;" ::"r"(bar) : "memory");
-    }
-    __syncthreads();
-    if (t == 0)
-        asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes "
-                     "[%0],[%1,{0,0,%2}],[%3];" ::"r"(sm),
-                     "l"(&map), "r"(row), "r"(bar)
-                     : "memory");
-    asm volatile("{ .reg .pred p; wait_loop: mbarrier.try_wait.parity.shared.b64 p,[%0],0; @!p bra "
-                 "wait_loop; }" ::"r"(bar)
-                 : "memory");
-    __syncthreads();
-    float v[64];
+// The loader supplies one row in the same shared-memory layout on every GPU.
+__device__ __forceinline__ void convrot_read_bf16_row(const float *shared, float (&v)[64], int t) {
 #pragma unroll
     for (int chunk = 0; chunk < 8; chunk++) {
         int logical = t * 64 + chunk * 8, physical = logical ^ (((logical >> 6) & 7) << 3);
@@ -449,14 +463,19 @@ __global__ __launch_bounds__(64) void quantize_int8_rowwise_convrot_bf16_kernel(
             v[chunk * 8 + j * 2 + 1] = a.y;
         }
     }
-    __syncthreads();
+}
+
+// Keep the rotation, row maximum, scale and output packing in one body.
+__device__ __forceinline__ void convrot_rotate_quantize_bf16_row(float (&v)[64], float *shared,
+                                                                 float *peaks, int8_t *q,
+                                                                 float *scales, int t, int row) {
 #pragma unroll
     for (int i = 0; i < 64; i += 4) {
         float a = v[i], b = v[i + 1], c = v[i + 2], d = v[i + 3];
-        auto y = convrot_h4_sum<float2>({a, a}, {b, b}, {c, convrot_sign_flip(c)},
-                                        {convrot_sign_flip(d), d});
-        auto z = convrot_h4_sum<float2>({a, convrot_sign_flip(a)}, {convrot_sign_flip(b), b},
-                                        {c, c}, {d, d});
+        auto y =
+            convrot_h4_sum({a, a}, {b, b}, {c, convrot_sign_flip(c)}, {convrot_sign_flip(d), d});
+        auto z =
+            convrot_h4_sum({a, convrot_sign_flip(a)}, {convrot_sign_flip(b), b}, {c, c}, {d, d});
         v[i] = y.x;
         v[i + 1] = y.y;
         v[i + 2] = z.x;
@@ -524,6 +543,62 @@ __global__ __launch_bounds__(64) void quantize_int8_rowwise_convrot_bf16_kernel(
                                    slot * 64) = out;
     }
 }
+
+#ifdef COMFY_CONVROT_ASYNC_ONLY
+__global__ __launch_bounds__(64) void quantize_int8_rowwise_convrot_bf16_vec_kernel(
+    const nv_bfloat16 *__restrict__ input, int8_t *__restrict__ q, float *__restrict__ scales) {
+    __shared__ __align__(1024) float shared[4096];
+    __shared__ float peaks[2];
+    int t = threadIdx.x, row = blockIdx.x;
+    unsigned sm = unsigned(__cvta_generic_to_shared(shared));
+#pragma unroll
+    for (int chunk = 0; chunk < 8; chunk++) {
+        int logical = t * 8 + chunk * 512;
+        int physical = logical ^ (((logical >> 6) & 7) << 3);
+        asm volatile("cp.async.cg.shared.global [%0],[%1],16;" ::"r"(sm + physical * 2),
+                     "l"(input + int64_t(row) * 4096 + logical)
+                     : "memory");
+    }
+    asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");
+    __syncthreads();
+    float v[64];
+    convrot_read_bf16_row(shared, v, t);
+    __syncthreads();
+    convrot_rotate_quantize_bf16_row(v, shared, peaks, q, scales, t, row);
+}
+#else
+__global__ __launch_bounds__(64) void quantize_int8_rowwise_convrot_bf16_kernel(
+    const __grid_constant__ CUtensorMap input, int8_t *__restrict__ q, float *__restrict__ scales) {
+    __shared__ __align__(1024) float shared[4096];
+    __shared__ __align__(8) uint64_t barrier;
+    __shared__ float peaks[2];
+    unsigned sm = unsigned(__cvta_generic_to_shared(shared)),
+             bar = unsigned(__cvta_generic_to_shared(&barrier));
+    int t = threadIdx.x, row = blockIdx.x;
+    if (t == 0) {
+        asm volatile("mbarrier.init.shared.b64 [%0],1; fence.mbarrier_init.release.cluster; "
+                     "fence.proxy.async.shared::cta;" ::"r"(bar)
+                     : "memory");
+        asm volatile("mbarrier.arrive.expect_tx.shared.b64 _,[%0],8192;" ::"r"(bar) : "memory");
+    }
+    __syncthreads();
+    if (t == 0)
+        asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::"
+                     "complete_tx::bytes "
+                     "[%0],[%1,{0,0,%2}],[%3];" ::"r"(sm),
+                     "l"(&input), "r"(row), "r"(bar)
+                     : "memory");
+    asm volatile("{ .reg .pred p; wait_loop: mbarrier.try_wait.parity.shared.b64 "
+                 "p,[%0],0; @!p bra "
+                 "wait_loop; }" ::"r"(bar)
+                 : "memory");
+    __syncthreads();
+    float v[64];
+    convrot_read_bf16_row(shared, v, t);
+    __syncthreads();
+    convrot_rotate_quantize_bf16_row(v, shared, peaks, q, scales, t, row);
+}
+#endif
 
 #else
 
@@ -1902,30 +1977,61 @@ quantize_int8_convrot_cluster_kernel(
 } // namespace
 
 #ifdef COMFY_CONVROT_SPECIALIZATION_ONLY
-bool try_quantize_int8_convrot_bf16_4096(const void *input, void *output, float *scales,
-                                         int64_t rows, cudaStream_t stream) {
+#ifdef COMFY_CONVROT_ASYNC_ONLY
+bool try_quantize_int8_convrot_bf16_vec_4096(const void *input, void *output, float *scales,
+                                             int64_t rows, int cc, cudaStream_t stream) {
     if (rows <= 8 || rows > std::numeric_limits<int>::max() ||
-        reinterpret_cast<uintptr_t>(input) % 16 || reinterpret_cast<uintptr_t>(output) % 16) {
+        reinterpret_cast<uintptr_t>(input) % 16 || reinterpret_cast<uintptr_t>(output) % 16)
         return false;
-    }
-
-    int device, major, minor;
-    if (cudaGetDevice(&device) != cudaSuccess ||
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
-        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
-        throw std::runtime_error("ConvRot: cannot query the current CUDA device");
-    }
     bool supported = false;
+#if defined(COMFY_CONVROT_SM80) || defined(COMFY_CONVROT_SM86)
+    supported |= cc >= 86 && cc <= 89;
+#endif
+#ifdef COMFY_CONVROT_SM87
+    supported |= cc == 87;
+#endif
+#ifdef COMFY_CONVROT_SM89
+    supported |= cc == 89;
+#endif
+    if (!supported)
+        return false;
+    quantize_int8_rowwise_convrot_bf16_vec_kernel<<<static_cast<unsigned int>(rows), 64, 0,
+                                                    stream>>>(
+        static_cast<const nv_bfloat16 *>(input), static_cast<int8_t *>(output), scales);
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA INT8 ConvRot BF16 quantization failed: ") +
+                                 cudaGetErrorString(error));
+    }
+    return true;
+}
+#else
+bool try_quantize_int8_convrot_bf16_4096(const void *input, void *output, float *scales,
+                                         int64_t rows, int cc, cudaStream_t stream) {
+    if (rows <= 8 || rows > std::numeric_limits<int>::max() ||
+        reinterpret_cast<uintptr_t>(input) % 16 || reinterpret_cast<uintptr_t>(output) % 16)
+        return false;
+    bool supported = false;
+#ifdef COMFY_CONVROT_SM90
+    supported |= cc == 90;
+#endif
 #ifdef COMFY_CONVROT_SM100
-    supported |= major == 10 && minor == 0;
+    supported |= cc == 100;
+#endif
+#ifdef COMFY_CONVROT_SM103
+    supported |= cc == 103;
+#endif
+#ifdef COMFY_CONVROT_SM110
+    supported |= cc == 110;
+#endif
+#ifdef COMFY_CONVROT_SM121
+    supported |= cc == 121;
 #endif
 #ifdef COMFY_CONVROT_SM120
-    supported |= major == 12 && minor == 0;
+    supported |= cc == 120;
 #endif
-    if (!supported) {
+    if (!supported)
         return false;
-    }
-
     // Resolve once, without adding a libcuda dependency. Encoding is host-only
     // and uses the current call's pointer and dimensions, including in capture.
     static const auto encode = []() -> PFN_cuTensorMapEncodeTiled_v12000 {
@@ -1964,6 +2070,7 @@ bool try_quantize_int8_convrot_bf16_4096(const void *input, void *output, float 
     }
     return true;
 }
+#endif
 
 #endif
 
@@ -2048,11 +2155,27 @@ void launch_quantize_int8_rowwise_convrot_kernel(
         throw std::runtime_error("convrot fused kernel only supports K <= INT_MAX");
     }
 
-#ifdef COMFY_HAVE_CONVROT_BF16
+#if defined(COMFY_HAVE_CONVROT_BF16) || defined(COMFY_HAVE_CONVROT_BF16_VEC)
     if (!stochastic && input_dtype_code == comfy::DTYPE_CODE_BFLOAT16 && num_cols == 4096 &&
-        comfy::try_quantize_int8_convrot_bf16_4096(
-            input, output, static_cast<float*>(scales), num_rows, stream)) {
-        return;
+        num_rows > 8) {
+        int device, major, minor;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) !=
+                cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) !=
+                cudaSuccess)
+            throw std::runtime_error("ConvRot: cannot query the current CUDA device");
+        int cc = major * 10 + minor;
+#ifdef COMFY_HAVE_CONVROT_BF16
+        if (major >= 9 && comfy::try_quantize_int8_convrot_bf16_4096(
+                              input, output, static_cast<float *>(scales), num_rows, cc, stream))
+            return;
+#endif
+#ifdef COMFY_HAVE_CONVROT_BF16_VEC
+        if (major == 8 && comfy::try_quantize_int8_convrot_bf16_vec_4096(
+                              input, output, static_cast<float *>(scales), num_rows, cc, stream))
+            return;
+#endif
     }
 #endif
 

@@ -218,35 +218,53 @@ endif()
 
 target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_cuda_kernels>)
 
-# The packed fixed-point converter needs PTX 9.1 and an architecture-specific
-# image. Keep it out of generic/family PTX and preserve CUDA 12.8 builds.
-# Compile only the specialized region of int8_linear.cu in this target.
-# One additional kernel per requested Blackwell architecture. Other devices
-# retain the existing dispatch, even when this object is included in the wheel.
+# One shared ConvRot body, with TMA or asynchronous vector input loading.
+# Compile the specialized region only; do not duplicate other INT8 kernels.
 set(COMFY_CONVROT_ARCHS "")
 set(COMFY_CONVROT_DEFINITIONS "")
+set(COMFY_CONVROT_VEC_ARCHS "")
+set(COMFY_CONVROT_VEC_DEFINITIONS "")
+# Retain the original CUDA 12.8 fallback; the optional specialization build
+# uses CUDA 13.1+ for the Blackwell fixed-point converter.
 if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.1")
-    foreach(arch IN ITEMS 100 120)
-        if(COMFY_CUDA_ARCHS MATCHES "(^|;)${arch}[af]?(-real)?(;|$)")
+    foreach(arch IN ITEMS 90 100 103 110 120 121)
+        if(COMFY_CUDA_ARCHS MATCHES "(^|;)${arch}[af]?(-real)?(;|$)"
+           OR (arch EQUAL 103 AND COMFY_CUDA_ARCHS MATCHES "(^|;)100f(-real)?(;|$)")
+           OR (arch EQUAL 121 AND COMFY_CUDA_ARCHS MATCHES "(^|;)120f(-real)?(;|$)"))
             list(APPEND COMFY_CONVROT_ARCHS "${arch}a-real")
             list(APPEND COMFY_CONVROT_DEFINITIONS "COMFY_CONVROT_SM${arch}")
         endif()
     endforeach()
+    foreach(arch IN ITEMS 80 86 87 89)
+        if(COMFY_CUDA_ARCHS MATCHES "(^|;)${arch}(-real)?(;|$)")
+            list(APPEND COMFY_CONVROT_VEC_ARCHS "${arch}-real")
+            list(APPEND COMFY_CONVROT_VEC_DEFINITIONS "COMFY_CONVROT_SM${arch}")
+        endif()
+    endforeach()
 endif()
 if(COMFY_CONVROT_ARCHS)
-    add_library(comfy_convrot_bf16 OBJECT ops/int8_linear.cu)
-    set_target_properties(comfy_convrot_bf16 PROPERTIES
-        CUDA_ARCHITECTURES "${COMFY_CONVROT_ARCHS}"
-        CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
-    target_compile_options(comfy_convrot_bf16 PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>)
-    target_include_directories(comfy_convrot_bf16 PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
-    target_compile_definitions(comfy_convrot_bf16 PRIVATE
+    add_library(comfy_convrot_tma OBJECT ops/int8_linear.cu)
+    set_target_properties(comfy_convrot_tma PROPERTIES CUDA_ARCHITECTURES "${COMFY_CONVROT_ARCHS}")
+    target_compile_definitions(comfy_convrot_tma PRIVATE
         COMFY_CONVROT_SPECIALIZATION_ONLY ${COMFY_CONVROT_DEFINITIONS})
     target_compile_definitions(comfy_kitchen_cuda_kernels PRIVATE COMFY_HAVE_CONVROT_BF16)
-    target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_convrot_bf16>)
+    target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_convrot_tma>)
 endif()
+if(COMFY_CONVROT_VEC_ARCHS)
+    add_library(comfy_convrot_vec OBJECT ops/int8_linear.cu)
+    set_target_properties(comfy_convrot_vec PROPERTIES CUDA_ARCHITECTURES "${COMFY_CONVROT_VEC_ARCHS}")
+    target_compile_definitions(comfy_convrot_vec PRIVATE
+        COMFY_CONVROT_SPECIALIZATION_ONLY COMFY_CONVROT_ASYNC_ONLY ${COMFY_CONVROT_VEC_DEFINITIONS})
+    target_compile_definitions(comfy_kitchen_cuda_kernels PRIVATE COMFY_HAVE_CONVROT_BF16_VEC)
+    target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_convrot_vec>)
+endif()
+foreach(target IN ITEMS comfy_convrot_tma comfy_convrot_vec)
+    if(TARGET ${target})
+        set_target_properties(${target} PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>)
+        target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+    endif()
+endforeach()
 
 target_compile_definitions(_C PRIVATE NB_STATIC)
 
