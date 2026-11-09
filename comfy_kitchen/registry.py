@@ -171,8 +171,8 @@ class BackendRegistry:
         if constraints is None:
             return ValidationResult.ok()
 
-        if constraints.max_compute_capability is not None:
-            # Upper bounds apply to the input GPU, never to CPU tensors or a
+        if constraints.excluded_compute_capabilities:
+            # Exclusions apply to the input GPU, never to CPU tensors or a
             # different CUDA device that happens to be current.
             capability = next((
                 torch.cuda.get_device_capability(value.device)

@@ -220,10 +220,11 @@ class TestFunctionConstraints:
         result = validate_function_call(constraints, {}, compute_capability=(9, 0))
         assert result.success is True
 
-        constraints = FunctionConstraints(max_compute_capability=(10, 2))
+        constraints = FunctionConstraints(excluded_compute_capabilities=frozenset({(10, 3)}))
         assert validate_function_call(constraints, {}, compute_capability=(10, 2)).success
         assert not validate_function_call(constraints, {}, compute_capability=(10, 3)).success
-        assert not validate_function_call(constraints, {}, compute_capability=(12, 0)).success
+        assert validate_function_call(constraints, {}, compute_capability=(12, 0)).success
+        assert validate_function_call(constraints, {}, compute_capability=(12, 1)).success
 
     def test_compute_capability_none_required(self):
         """Test that CUDA requirement fails when no CUDA available."""

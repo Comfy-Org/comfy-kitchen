@@ -65,7 +65,7 @@ __all__ = [
 import torch
 
 from comfy_kitchen.constraints import (
-    INT8_MAX_COMPUTE_CAPABILITY,
+    INT8_EXCLUDED_COMPUTE_CAPABILITIES,
     ExactDims,
     FunctionConstraints,
     ParamConstraint,
@@ -459,7 +459,7 @@ def _build_constraints() -> dict:
                 "out_dtype": ParamConstraint(dtypes=standard_floats),
             },
             default_devices=all_devices,
-            max_compute_capability=INT8_MAX_COMPUTE_CAPABILITY,
+            excluded_compute_capabilities=INT8_EXCLUDED_COMPUTE_CAPABILITIES,
         ),
         "prepare_int4_weight_for_int8_linear": FunctionConstraints(
             params={
@@ -592,7 +592,7 @@ def _build_constraints() -> dict:
             "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
         },
         default_devices=all_devices,
-        max_compute_capability=INT8_MAX_COMPUTE_CAPABILITY,
+        excluded_compute_capabilities=INT8_EXCLUDED_COMPUTE_CAPABILITIES,
     )
     float_param = ParamConstraint(dtypes=standard_floats)
     int8_param = ParamConstraint(dtypes=frozenset({torch.int8}))
@@ -608,7 +608,7 @@ def _build_constraints() -> dict:
     def fusion_constraints(params):
         return FunctionConstraints(
             params=params | fusion_options, default_devices=all_devices,
-            max_compute_capability=INT8_MAX_COMPUTE_CAPABILITY,
+            excluded_compute_capabilities=INT8_EXCLUDED_COMPUTE_CAPABILITIES,
         )
 
     single = {

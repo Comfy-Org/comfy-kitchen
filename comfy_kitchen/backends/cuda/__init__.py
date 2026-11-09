@@ -29,7 +29,7 @@ from comfy_kitchen._rope_utils import (
     trim_rope_freqs,
 )
 from comfy_kitchen.allocation import allocation_context
-from comfy_kitchen.constraints import INT8_MAX_COMPUTE_CAPABILITY
+from comfy_kitchen.constraints import INT8_EXCLUDED_COMPUTE_CAPABILITIES
 
 __all__ = [
     "na3d",
@@ -3043,11 +3043,11 @@ def _sink_pair(value):
 
 def _check_sol_args(device, sink_blocks, sink_q, topk_ratio, **tensors):
     """Shared by both CUDA entries (callers may bypass the registry): the
-    registry rule plus a per-device SM80-SM102 check for its INT8 MMA path."""
+    registry rule plus a per-device SM check for its INT8 MMA path."""
     cap = torch.cuda.get_device_capability(device)
-    if not (8, 0) <= cap <= INT8_MAX_COMPUTE_CAPABILITY:
+    if cap < (8, 0) or cap in INT8_EXCLUDED_COMPUTE_CAPABILITIES:
         raise RuntimeError(
-            f"sol_attn: requires sm_80 through sm_102 (INT8 Tensor Cores are disabled on SM103+); {device} is "
+            f"sol_attn: requires sm_80+ excluding sm_103; {device} is "
             f"sm_{cap[0]}{cap[1]}")
     check = sol_attn_common_call_rule(
         {"sink_blocks": sink_blocks, "sink_q": sink_q, "topk_ratio": topk_ratio, **tensors})
@@ -4578,7 +4578,7 @@ def _build_constraints() -> dict:
             default_devices=cuda_devices,
             min_compute_capability=(8, 0),
             call_rules=(sol_attn_common_call_rule,),
-            max_compute_capability=INT8_MAX_COMPUTE_CAPABILITY,
+            excluded_compute_capabilities=INT8_EXCLUDED_COMPUTE_CAPABILITIES,
         ),
         "na3d": FunctionConstraints(
             params={
@@ -5062,7 +5062,7 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
             min_compute_capability=(8, 0),
-            max_compute_capability=INT8_MAX_COMPUTE_CAPABILITY,
+            excluded_compute_capabilities=INT8_EXCLUDED_COMPUTE_CAPABILITIES,
         ),
         "dequantize_int8_convrot_weight": FunctionConstraints(
             params={
@@ -5226,7 +5226,7 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
             min_compute_capability=(7, 5),
-            max_compute_capability=INT8_MAX_COMPUTE_CAPABILITY,
+            excluded_compute_capabilities=INT8_EXCLUDED_COMPUTE_CAPABILITIES,
         ),
         "prepare_int4_weight_for_int8_linear": FunctionConstraints(
             params={
@@ -5303,7 +5303,7 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
             min_compute_capability=(7, 5),
-            max_compute_capability=INT8_MAX_COMPUTE_CAPABILITY,
+            excluded_compute_capabilities=INT8_EXCLUDED_COMPUTE_CAPABILITIES,
         )
         constraints["scaled_mm_nvfp4"] = FunctionConstraints(
             params={

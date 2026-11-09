@@ -10,7 +10,7 @@ import torch
 
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
 from comfy_kitchen.backends._activations import apply_residual as _apply_residual
-from comfy_kitchen.constraints import INT8_MAX_COMPUTE_CAPABILITY, FunctionConstraints, validate_function_call
+from comfy_kitchen.constraints import INT8_EXCLUDED_COMPUTE_CAPABILITIES, FunctionConstraints, validate_function_call
 from comfy_kitchen.float_utils import (
     E8M0_BIAS,
     F4_E2M1_MAX,
@@ -752,7 +752,7 @@ def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Multiply INT8 matrices and return INT32 accumulators."""
     if a.is_cuda and not getattr(torch.version, "hip", None):
         check = validate_function_call(
-            FunctionConstraints(max_compute_capability=INT8_MAX_COMPUTE_CAPABILITY), {},
+            FunctionConstraints(excluded_compute_capabilities=INT8_EXCLUDED_COMPUTE_CAPABILITIES), {},
             compute_capability=torch.cuda.get_device_capability(a.device),
         )
         if not check.success:

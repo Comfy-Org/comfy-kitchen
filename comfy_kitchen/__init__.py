@@ -257,7 +257,7 @@ def memmove(dst: torch.Tensor, src: torch.Tensor):
 
 def sol_attn_is_available(device: torch.device | None = None) -> bool:
     """Whether the compiled Sol-Attn kernels can run on ``device``: the CUDA
-    backend on SM80-SM102, or the HIP backend on a GPU with matrix cores. The
+    backend on SM80+ excluding SM103, or the HIP backend on a GPU with matrix cores. The
     per-call rules (bf16/fp16, head_dim 128, matching q/k/v) still apply."""
     if device is not None and device.type != "cuda":
         return False
@@ -271,8 +271,8 @@ def sol_attn_is_available(device: torch.device | None = None) -> bool:
     ext = getattr(_cuda_backend, "_C", None)
     return (registry.is_available("cuda") and _cuda_backend._EXT_AVAILABLE and hasattr(ext, "sol_attn")
             and rules is not None
-            and rules.min_compute_capability <= torch.cuda.get_device_capability(device)
-            <= rules.max_compute_capability)
+            and torch.cuda.get_device_capability(device) >= rules.min_compute_capability
+            and torch.cuda.get_device_capability(device) not in rules.excluded_compute_capabilities)
 
 
 def na3d(

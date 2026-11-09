@@ -130,14 +130,14 @@ class FunctionConstraints:
         params: Per-parameter constraints keyed by parameter name.
         default_devices: Default allowed devices when param doesn't specify.
         min_compute_capability: Minimum CUDA compute capability (major, minor).
-        max_compute_capability: Inclusive CUDA upper bound; CPU/HIP calls are unaffected.
+        excluded_compute_capabilities: Excluded NVIDIA SMs; CPU/HIP calls are unaffected.
     """
 
     params: dict[str, ParamConstraint] = field(default_factory=dict)
     default_devices: frozenset[str] = field(default_factory=lambda: frozenset({"cuda", "cpu"}))
     min_compute_capability: tuple[int, int] | None = None
     call_rules: tuple[Callable[[Mapping[str, object]], ValidationResult], ...] = ()
-    max_compute_capability: tuple[int, int] | None = None
+    excluded_compute_capabilities: frozenset[tuple[int, int]] = frozenset()
 
     def __hash__(self) -> int:
         return hash((
@@ -145,7 +145,7 @@ class FunctionConstraints:
             self.default_devices,
             self.min_compute_capability,
             self.call_rules,
-            self.max_compute_capability,
+            self.excluded_compute_capabilities,
         ))
 
 
@@ -245,13 +245,12 @@ def validate_function_call(
                 f"compute capability {curr_major}.{curr_minor} < required {min_major}.{min_minor}",
             )
 
-    maximum = constraints.max_compute_capability
-    if (maximum is not None and compute_capability is not None
-            and not getattr(torch.version, "hip", None) and compute_capability > maximum):
+    if (compute_capability in constraints.excluded_compute_capabilities
+            and not getattr(torch.version, "hip", None)):
         return ValidationResult.fail(
             "__hardware__",
             f"CUDA compute capability {compute_capability[0]}.{compute_capability[1]} "
-            f"> maximum supported {maximum[0]}.{maximum[1]}",
+            "is excluded for this operation",
         )
 
     for param_name, param_constraint in constraints.params.items():
@@ -268,8 +267,8 @@ def validate_function_call(
     return ValidationResult.ok()
 
 
-# INT8 Tensor Core operations are disabled from SM103 onward, including SM12x.
-INT8_MAX_COMPUTE_CAPABILITY = (10, 2)
+# Exclude SM103 for INT8 Tensor Core paths; keep SM12x eligible.
+INT8_EXCLUDED_COMPUTE_CAPABILITIES = frozenset({(10, 3)})
 
 
 def sol_attn_common_call_rule(kwargs):

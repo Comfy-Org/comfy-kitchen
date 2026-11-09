@@ -143,9 +143,9 @@ def get_capable_backends(func_name: str, device: str | None = None) -> list[str]
             if constraints is not None and device not in constraints.default_devices:
                 continue
             if (device == "cuda" and constraints is not None
-                    and constraints.max_compute_capability is not None
+                    and constraints.excluded_compute_capabilities
                     and torch.cuda.is_available() and not getattr(torch.version, "hip", None)
-                    and torch.cuda.get_device_capability() > constraints.max_compute_capability):
+                    and torch.cuda.get_device_capability() in constraints.excluded_compute_capabilities):
                 continue
 
         capable.append(backend_name)
