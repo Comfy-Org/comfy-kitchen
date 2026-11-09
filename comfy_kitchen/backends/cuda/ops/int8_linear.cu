@@ -1,12 +1,23 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
+// Build the packed specialization without unrelated device globals from
+// utils.cuh. Both compiler passes still share the recipe helpers in this file.
+#ifdef COMFY_CONVROT_SPECIALIZATION_ONLY
+#include <cuda.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <cudaTypedefs.h>
+#else
 #include "utils.cuh"
 #include "dtype_dispatch.cuh"
 #include "input_act_codes.h"
 #include <cooperative_groups.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -27,8 +38,6 @@ bool try_quantize_int8_convrot_bf16_4096(
 namespace comfy {
 
 namespace {
-
-constexpr int kInt8Threads = 256;
 
 template<typename T>
 __device__ __forceinline__ float to_float(T val);
@@ -52,6 +61,9 @@ __device__ __forceinline__ T from_float(float val);
 template<> __device__ __forceinline__ float from_float<float>(float val) { return val; }
 template<> __device__ __forceinline__ half from_float<half>(float val) { return __float2half_rn(val); }
 template<> __device__ __forceinline__ nv_bfloat16 from_float<nv_bfloat16>(float val) { return __float2bfloat16_rn(val); }
+
+#ifndef COMFY_CONVROT_SPECIALIZATION_ONLY
+constexpr int kInt8Threads = 256;
 
 template<typename T>
 __device__ __forceinline__ float quant_div_to_float(T val, float scale) {
@@ -235,6 +247,8 @@ __global__ void quantize_int8_rowwise_kernel(
     }
 }
 
+#endif
+
 // Fused ConvRot (online Hadamard rotation) + row-wise INT8 quantization.
 //
 // The rotation group is fixed to 256 = 4^4 and uses the symmetric "regular"
@@ -259,6 +273,37 @@ __global__ void quantize_int8_rowwise_kernel(
 // slot `sub = tid / 256`.
 constexpr int kConvRotGroup = 256;
 
+// Scalar and packed paths share the same ordered H4 sum. Only the arithmetic
+// primitives differ; the three additions and normalization keep their order.
+__device__ __forceinline__ float convrot_add(float a, float b) { return a + b; }
+__device__ __forceinline__ float convrot_half(float a) { return 0.5f * a; }
+#ifdef COMFY_CONVROT_SPECIALIZATION_ONLY
+__device__ __forceinline__ float2 convrot_add(float2 a, float2 b) {
+    float2 result;
+    asm("{ .reg .b64 a,b; mov.b64 a,{%2,%3}; mov.b64 b,{%4,%5};"
+        "add.rn.ftz.f32x2 a,a,b; mov.b64 {%0,%1},a; }"
+        : "=f"(result.x), "=f"(result.y)
+        : "f"(a.x), "f"(a.y), "f"(b.x), "f"(b.y));
+    return result;
+}
+__device__ __forceinline__ float2 convrot_half(float2 a) {
+    float2 result;
+    asm("{ .reg .b64 a,h; mov.b64 a,{%2,%3}; mov.b64 h,0x3f0000003f000000;"
+        "mul.rn.ftz.f32x2 a,a,h; mov.b64 {%0,%1},a; }"
+        : "=f"(result.x), "=f"(result.y)
+        : "f"(a.x), "f"(a.y));
+    return result;
+}
+#endif
+
+template <typename T> __device__ __forceinline__ T convrot_h4_sum(T a, T b, T c, T d) {
+    return convrot_half(convrot_add(convrot_add(convrot_add(a, b), c), d));
+}
+
+template <typename InputType> __device__ __forceinline__ float convrot_int8_scale(float abs_max) {
+    return fmaxf(finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f), 1.0e-30f);
+}
+#ifndef COMFY_CONVROT_SPECIALIZATION_ONLY
 __device__ __forceinline__ float h4_row_dot(int d, float x0, float x1, float x2, float x3) {
     // Row d of H4 dotted with (x0, x1, x2, x3).
     switch (d) {
@@ -288,6 +333,199 @@ __device__ __forceinline__ float block_reduce_max_t(float v, float* warp_smem, f
     __syncthreads();
     return *block_smem;
 }
+
+#endif
+
+#ifdef COMFY_CONVROT_SPECIALIZATION_ONLY
+// NVCC's fast-math unary minus emits neg.ftz.f32, which becomes an extra
+// scalar FADD per lane. A non-flushing negate preserves the sign bit and lets
+// ptxas fold it into the packed arithmetic's source modifiers. The H4 adds
+// still explicitly flush to zero, exactly as in the original recipe.
+__device__ __forceinline__ float convrot_sign_flip(float a) {
+    float result;
+    asm("neg.f32 %0,%1;" : "=f"(result) : "f"(a));
+    return result;
+}
+__device__ __forceinline__ float2 convrot_neg(float2 a) {
+    return {convrot_sign_flip(a.x), convrot_sign_flip(a.y)};
+}
+__device__ __forceinline__ float2 convrot_decode_bf16(unsigned bits) {
+    float2 r;
+    asm("prmt.b32 %0,%2,0,0x1044; prmt.b32 %1,%2,0,0x3244;" : "=f"(r.x), "=f"(r.y) : "r"(bits));
+    return r;
+}
+__device__ __forceinline__ unsigned convrot_bf16_numerator(float2 a) {
+    unsigned r;
+    asm("cvt.rn.bf16x2.f32 %0,%2,%1;" : "=r"(r) : "f"(a.x), "f"(a.y));
+    return r;
+}
+// RNE BF16 numerator, BF16-rounded scale, approximate FP32 reciprocal and
+// BF16-rounded quotient match CK's fast-math quantizer. S2F6 at scale 64 has
+// the signed INT8 byte encoding. Keep the lower clamp for CK's NaN behavior;
+// the converter supplies rounding and upper saturation without scalar CVTs.
+__device__ __forceinline__ unsigned convrot_encode_int8x4(unsigned n0, unsigned n1, float inv) {
+    unsigned r;
+    asm("{ .reg .b32 q01,q23,lo; .reg .b16 out01,out23,sf; .reg .f32 a0,a1,a2,a3,c0,c1,c2,c3; .reg "
+        ".b64 a,b;"
+        "prmt.b32 a0,%1,0,0x1044; prmt.b32 a1,%1,0,0x3244; prmt.b32 a2,%2,0,0x1044; prmt.b32 "
+        "a3,%2,0,0x3244;"
+        "mov.b64 b,{%3,%3}; mov.b64 a,{a0,a1}; mul.rn.ftz.f32x2 a,a,b; mov.b64 {c0,c1},a;"
+        "mov.b64 a,{a2,a3}; mul.rn.ftz.f32x2 a,a,b; mov.b64 {c2,c3},a;"
+        "cvt.rn.bf16x2.f32 q01,c1,c0; cvt.rn.bf16x2.f32 q23,c3,c2; mov.b32 lo,0xc300c300;"
+        "max.bf16x2 q01,q01,lo; max.bf16x2 q23,q23,lo; mov.b16 sf,0x8585;"
+        "cvt.rn.satfinite.scaled::n2::ue8m0.s2f6x2.bf16x2 out01,q01,sf;"
+        "cvt.rn.satfinite.scaled::n2::ue8m0.s2f6x2.bf16x2 out23,q23,sf; mov.b32 %0,{out01,out23}; }"
+        : "=r"(r)
+        : "r"(n0), "r"(n1), "f"(inv));
+    return r;
+}
+__device__ __forceinline__ int convrot_exchange_index(int i) {
+    return i ^ (((i >> 6) & 7) << 2) ^ (((i >> 4) & 3) << 2);
+}
+template <int Stride> __device__ __forceinline__ void convrot_h4_stage(float (&v)[64]) {
+    float next[64];
+#pragma unroll
+    for (int p = 0; p < 32; p++) {
+        constexpr int stride = Stride;
+        int i = p * 2, base = (i / (4 * stride)) * (4 * stride) + i % stride,
+            slot = (i / stride) % 4;
+        float2 a = {v[base], v[base + 1]}, b = {v[base + stride], v[base + stride + 1]},
+               c = {v[base + 2 * stride], v[base + 2 * stride + 1]},
+               d = {v[base + 3 * stride], v[base + 3 * stride + 1]};
+        if (slot == 3)
+            a = convrot_neg(a);
+        if (slot == 2)
+            b = convrot_neg(b);
+        if (slot == 1)
+            c = convrot_neg(c);
+        if (slot == 0)
+            d = convrot_neg(d);
+        auto y = convrot_h4_sum(a, b, c, d);
+        next[i] = y.x;
+        next[i + 1] = y.y;
+    }
+#pragma unroll
+    for (int i = 0; i < 64; i++)
+        v[i] = next[i];
+}
+// One CTA owns a complete row. TMA first uses 8 KiB of shared memory; after
+// all readers finish, the same allocation holds the FP32 exchange. Groups
+// exchanged in the last H4 stage are entirely within a warp.
+__global__ __launch_bounds__(64) void quantize_int8_rowwise_convrot_bf16_kernel(
+    const __grid_constant__ CUtensorMap map, int8_t *__restrict__ q, float *__restrict__ scales) {
+    __shared__ __align__(1024) float shared[4096];
+    __shared__ __align__(8) uint64_t barrier;
+    __shared__ float peaks[2];
+    unsigned sm = unsigned(__cvta_generic_to_shared(shared)),
+             bar = unsigned(__cvta_generic_to_shared(&barrier));
+    int t = threadIdx.x, row = blockIdx.x;
+    if (t == 0) {
+        asm volatile("mbarrier.init.shared.b64 [%0],1; fence.mbarrier_init.release.cluster; "
+                     "fence.proxy.async.shared::cta;" ::"r"(bar)
+                     : "memory");
+        asm volatile("mbarrier.arrive.expect_tx.shared.b64 _,[%0],8192;" ::"r"(bar) : "memory");
+    }
+    __syncthreads();
+    if (t == 0)
+        asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes "
+                     "[%0],[%1,{0,0,%2}],[%3];" ::"r"(sm),
+                     "l"(&map), "r"(row), "r"(bar)
+                     : "memory");
+    asm volatile("{ .reg .pred p; wait_loop: mbarrier.try_wait.parity.shared.b64 p,[%0],0; @!p bra "
+                 "wait_loop; }" ::"r"(bar)
+                 : "memory");
+    __syncthreads();
+    float v[64];
+#pragma unroll
+    for (int chunk = 0; chunk < 8; chunk++) {
+        int logical = t * 64 + chunk * 8, physical = logical ^ (((logical >> 6) & 7) << 3);
+        auto raw =
+            *reinterpret_cast<const uint4 *>(reinterpret_cast<const uint16_t *>(shared) + physical);
+        unsigned words[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            auto a = convrot_decode_bf16(words[j]);
+            v[chunk * 8 + j * 2] = a.x;
+            v[chunk * 8 + j * 2 + 1] = a.y;
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 64; i += 4) {
+        float a = v[i], b = v[i + 1], c = v[i + 2], d = v[i + 3];
+        auto y = convrot_h4_sum<float2>({a, a}, {b, b}, {c, convrot_sign_flip(c)},
+                                        {convrot_sign_flip(d), d});
+        auto z = convrot_h4_sum<float2>({a, convrot_sign_flip(a)}, {convrot_sign_flip(b), b},
+                                        {c, c}, {d, d});
+        v[i] = y.x;
+        v[i + 1] = y.y;
+        v[i + 2] = z.x;
+        v[i + 3] = z.y;
+    }
+    convrot_h4_stage<4>(v);
+    convrot_h4_stage<16>(v);
+#pragma unroll
+    for (int i = 0; i < 64; i += 4)
+        *reinterpret_cast<float4 *>(shared + convrot_exchange_index(t * 64 + i)) = {
+            v[i], v[i + 1], v[i + 2], v[i + 3]};
+    __syncwarp();
+    unsigned held[32];
+    float peak = 0;
+#pragma unroll
+    for (int chunk = 0; chunk < 4; chunk++) {
+        float4 gathered[4];
+#pragma unroll
+        for (int s = 0; s < 4; s++)
+            gathered[s] = *reinterpret_cast<const float4 *>(
+                shared + convrot_exchange_index((t / 4) * 256 + (t % 4) * 16 + s * 64 + chunk * 4));
+#pragma unroll
+        for (int pair = 0; pair < 2; pair++) {
+            float2 a =
+                pair ? float2{gathered[0].z, gathered[0].w} : float2{gathered[0].x, gathered[0].y};
+            float2 b =
+                pair ? float2{gathered[1].z, gathered[1].w} : float2{gathered[1].x, gathered[1].y};
+            float2 c =
+                pair ? float2{gathered[2].z, gathered[2].w} : float2{gathered[2].x, gathered[2].y};
+            float2 d =
+                pair ? float2{gathered[3].z, gathered[3].w} : float2{gathered[3].x, gathered[3].y};
+#pragma unroll
+            for (int slot = 0; slot < 4; slot++) {
+                auto y =
+                    convrot_h4_sum(slot == 3 ? convrot_neg(a) : a, slot == 2 ? convrot_neg(b) : b,
+                                   slot == 1 ? convrot_neg(c) : c, slot == 0 ? convrot_neg(d) : d);
+                int vi = slot * 16 + chunk * 4 + pair * 2;
+                held[vi / 2] = convrot_bf16_numerator(y);
+                peak = fmaxf(peak, fabsf(y.x));
+                peak = fmaxf(peak, fabsf(y.y));
+            }
+        }
+    }
+#pragma unroll
+    for (int shift = 1; shift < 32; shift *= 2)
+        peak = fmaxf(peak, __shfl_xor_sync(0xffffffff, peak, shift));
+    if ((t & 31) == 0)
+        peaks[t / 32] = peak;
+    __syncthreads();
+    peak = fmaxf(peaks[0], peaks[1]);
+    const float scale = convrot_int8_scale<nv_bfloat16>(peak);
+    if (t == 0)
+        scales[row] = scale;
+    float inv;
+    const float rounded_scale = to_float(from_float<nv_bfloat16>(scale));
+    asm("rcp.approx.ftz.f32 %0,%1;" : "=f"(inv) : "f"(rounded_scale));
+#pragma unroll
+    for (int slot = 0; slot < 4; slot++) {
+        uint4 out;
+        out.x = convrot_encode_int8x4(held[slot * 8], held[slot * 8 + 1], inv);
+        out.y = convrot_encode_int8x4(held[slot * 8 + 2], held[slot * 8 + 3], inv);
+        out.z = convrot_encode_int8x4(held[slot * 8 + 4], held[slot * 8 + 5], inv);
+        out.w = convrot_encode_int8x4(held[slot * 8 + 6], held[slot * 8 + 7], inv);
+        *reinterpret_cast<uint4 *>(q + int64_t(row) * 4096 + (t / 4) * 256 + (t % 4) * 16 +
+                                   slot * 64) = out;
+    }
+}
+
+#else
 
 template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC>
 __global__ void quantize_int8_rowwise_convrot_kernel(
@@ -354,9 +592,7 @@ __global__ void quantize_int8_rowwise_convrot_kernel(
         abs_max = fmaxf(abs_max, fabsf(row_buf[col]));
     }
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
-    const float scale = fmaxf(
-        finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f),
-        1.0e-30f);
+    const float scale = convrot_int8_scale<InputType>(abs_max);
     if (tid == 0) {
         scales[row] = scale;
     }
@@ -394,7 +630,7 @@ __device__ __forceinline__ float h4_butterfly(int d, float m0, float m1, float m
     const float y1 = neg == 1 ? -m1 : m1;
     const float y2 = neg == 2 ? -m2 : m2;
     const float y3 = neg == 3 ? -m3 : m3;
-    return 0.5f * (((y0 + y1) + y2) + y3);
+    return convrot_h4_sum(y0, y1, y2, y3);
 }
 template<typename InputType, int BLOCK_THREADS, int MAX_GROUPS_PER_WARP>
 __global__ void quantize_int8_rowwise_convrot_warp_kernel(
@@ -501,9 +737,7 @@ __global__ void quantize_int8_rowwise_convrot_warp_kernel(
             abs_max = fmaxf(abs_max, fabsf(v[it][j]));
     }
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
-    const float scale = fmaxf(
-        finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f),
-        1.0e-30f);
+    const float scale = convrot_int8_scale<InputType>(abs_max);
     if (threadIdx.x == 0) {
         scales[row] = scale;
     }
@@ -1178,9 +1412,7 @@ __global__ void quantize_int8_rowwise_from_partials_kernel(
         abs_max = fmaxf(abs_max, row_partials[g]);
     }
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
-    const float scale = fmaxf(
-        finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f),
-        1.0e-30f);
+    const float scale = convrot_int8_scale<InputType>(abs_max);
     if (tid == 0) {
         scales[row] = scale;
     }
@@ -1336,9 +1568,7 @@ __device__ __forceinline__ float convrot64_quantize_row(
     }
 
     abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, block_smem);
-    const float scale = fmaxf(
-        finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f),
-        1.0e-30f);
+    const float scale = convrot_int8_scale<InputType>(abs_max);
 
     for (int col = tid; col < K; col += BLOCK_THREADS) {
         const float scaled = quant_div_float_to_float<InputType>(row_buf[col], scale);
@@ -1667,10 +1897,79 @@ quantize_int8_convrot_cluster_kernel(
 #endif
 }
 
+#endif // COMFY_CONVROT_SPECIALIZATION_ONLY
+
 } // namespace
+
+#ifdef COMFY_CONVROT_SPECIALIZATION_ONLY
+bool try_quantize_int8_convrot_bf16_4096(const void *input, void *output, float *scales,
+                                         int64_t rows, cudaStream_t stream) {
+    if (rows <= 8 || rows > std::numeric_limits<int>::max() ||
+        reinterpret_cast<uintptr_t>(input) % 16 || reinterpret_cast<uintptr_t>(output) % 16) {
+        return false;
+    }
+
+    int device, major, minor;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
+        throw std::runtime_error("ConvRot: cannot query the current CUDA device");
+    }
+    bool supported = false;
+#ifdef COMFY_CONVROT_SM100
+    supported |= major == 10 && minor == 0;
+#endif
+#ifdef COMFY_CONVROT_SM120
+    supported |= major == 12 && minor == 0;
+#endif
+    if (!supported) {
+        return false;
+    }
+
+    // Resolve once, without adding a libcuda dependency. Encoding is host-only
+    // and uses the current call's pointer and dimensions, including in capture.
+    static const auto encode = []() -> PFN_cuTensorMapEncodeTiled_v12000 {
+        void *address = nullptr;
+        cudaDriverEntryPointQueryResult status;
+        if (cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &address, 12000,
+                                             cudaEnableDefault, &status) != cudaSuccess ||
+            status != cudaDriverEntryPointSuccess) {
+            return nullptr;
+        }
+        return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(address);
+    }();
+    if (!encode) {
+        return false;
+    }
+
+    CUtensorMap map;
+    uint64_t dimensions[] = {64, 64, static_cast<uint64_t>(rows)};
+    uint64_t strides[] = {128, 8192};
+    uint32_t box[] = {64, 64, 1}, element_strides[] = {1, 1, 1};
+    CUresult result = encode(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, const_cast<void *>(input),
+                             dimensions, strides, box, element_strides,
+                             CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                             CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (result != CUDA_SUCCESS) {
+        throw std::runtime_error("ConvRot: tensor-map encoding failed (" +
+                                 std::to_string(static_cast<int>(result)) + ")");
+    }
+
+    quantize_int8_rowwise_convrot_bf16_kernel<<<static_cast<unsigned int>(rows), 64, 0, stream>>>(
+        map, static_cast<int8_t *>(output), scales);
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA INT8 ConvRot BF16 quantization failed: ") +
+                                 cudaGetErrorString(error));
+    }
+    return true;
+}
+
+#endif
 
 } // namespace comfy
 
+#ifndef COMFY_CONVROT_SPECIALIZATION_ONLY
 extern "C" {
 
 void launch_quantize_int8_rowwise_kernel(
@@ -2717,3 +3016,5 @@ void launch_dequantize_int8_convrot_kernel(
 }
 
 } // extern "C"
+
+#endif // !COMFY_CONVROT_SPECIALIZATION_ONLY

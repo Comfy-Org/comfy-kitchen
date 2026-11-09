@@ -220,6 +220,7 @@ target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_cuda_kernels>)
 
 # The packed fixed-point converter needs PTX 9.1 and an architecture-specific
 # image. Keep it out of generic/family PTX and preserve CUDA 12.8 builds.
+# Compile only the specialized region of int8_linear.cu in this target.
 # One additional kernel per requested Blackwell architecture. Other devices
 # retain the existing dispatch, even when this object is included in the wheel.
 set(COMFY_CONVROT_ARCHS "")
@@ -233,14 +234,16 @@ if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.1")
     endforeach()
 endif()
 if(COMFY_CONVROT_ARCHS)
-    add_library(comfy_convrot_bf16 OBJECT ops/int8_convrot_bf16.cu)
+    add_library(comfy_convrot_bf16 OBJECT ops/int8_linear.cu)
     set_target_properties(comfy_convrot_bf16 PROPERTIES
         CUDA_ARCHITECTURES "${COMFY_CONVROT_ARCHS}"
         CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
     target_compile_options(comfy_convrot_bf16 PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>)
-    target_include_directories(comfy_convrot_bf16 PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-    target_compile_definitions(comfy_convrot_bf16 PRIVATE ${COMFY_CONVROT_DEFINITIONS})
+    target_include_directories(comfy_convrot_bf16 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+    target_compile_definitions(comfy_convrot_bf16 PRIVATE
+        COMFY_CONVROT_SPECIALIZATION_ONLY ${COMFY_CONVROT_DEFINITIONS})
     target_compile_definitions(comfy_kitchen_cuda_kernels PRIVATE COMFY_HAVE_CONVROT_BF16)
     target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_convrot_bf16>)
 endif()
