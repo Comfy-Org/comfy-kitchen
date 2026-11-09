@@ -4728,6 +4728,7 @@ def _build_constraints() -> dict:
             default_devices=cuda_devices,
         ),
         "quantize_per_tensor_fp8": FunctionConstraints(
+            min_compute_capability=(8, 9),
             params={
                 "x": ParamConstraint(
                     dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
@@ -4756,6 +4757,7 @@ def _build_constraints() -> dict:
             default_devices=cuda_devices,
         ),
         "stochastic_rounding_fp8": FunctionConstraints(
+            min_compute_capability=(8, 9),
             params={
                 "x": ParamConstraint(
                     dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
@@ -4768,6 +4770,7 @@ def _build_constraints() -> dict:
             default_devices=cuda_devices,
         ),
         "quantize_nvfp4": FunctionConstraints(
+            min_compute_capability=(10, 0),
             params={
                 "x": ParamConstraint(
                     dtypes=frozenset({torch.float16, torch.bfloat16}),
@@ -4780,6 +4783,7 @@ def _build_constraints() -> dict:
             default_devices=cuda_devices,
         ),
         "quantize_mxfp8": FunctionConstraints(
+            min_compute_capability=(10, 0),
             params={
                 "x": ParamConstraint(
                     dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
