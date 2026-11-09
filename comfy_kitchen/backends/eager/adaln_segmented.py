@@ -34,7 +34,8 @@ from comfy_kitchen.registry import registry
 
 def _norm(x, eps, rms_weight, rms_weight_offset):
     if rms_weight is None:
-        return functional.layer_norm(x, x.shape[-1:], eps=eps)
+        # layer_norm returns fp32 under autocast; keep x's dtype as the fake and triton do
+        return functional.layer_norm(x, x.shape[-1:], eps=eps).to(x.dtype)
     # Krea2 RMSNorm: fp32 norm with an fp32 weight, rounded to x's dtype after the norm
     weight = rms_weight.to(torch.float32) + rms_weight_offset
     return functional.rms_norm(x.float(), x.shape[-1:], weight=weight, eps=eps).to(x.dtype)

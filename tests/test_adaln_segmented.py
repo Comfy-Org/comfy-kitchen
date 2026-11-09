@@ -259,4 +259,23 @@ class TestSegmentedTriton:
             assert registry.get_capable_backend("adaln_segmented", kwargs) == "eager"
             with ck.use_backend("triton"):
                 got = ck.adaln_segmented(**kwargs)
-            assert got.shape == kwargs["x"].shape
+            # Flux apply_mod (ComfyUI's current path) on the same rows as the reference
+            x, scale, shift = kwargs["x"], kwargs["scale"], kwargs["shift"]
+            want = _flux_apply_mod(
+                functional.layer_norm(x, x.shape[-1:], eps=1e-6),
+                1 + scale.transpose(0, 1),
+                shift.transpose(0, 1),
+                [(0, 0, 0), (0, x.shape[1], 1)],
+            )
+            assert torch.equal(got, want)
+
+    @pytest.mark.parametrize("backend", ["eager", "triton"])
+    def test_autocast_keeps_dtype(self, backend):
+        x = torch.randn(1, 8, 64, dtype=torch.float16, device="cuda")
+        mods = torch.randn(2, 1, 64, dtype=torch.float16, device="cuda")
+        with ck.use_backend(backend):
+            want = ck.adaln_segmented(x, mods, mods, 3)
+            with torch.autocast("cuda", dtype=torch.float16):
+                got = ck.adaln_segmented(x, mods, mods, 3)
+        assert got.dtype == x.dtype
+        assert torch.equal(got, want)
