@@ -153,8 +153,9 @@ def _build_constraints() -> dict:
             return ValidationResult.fail(
                 "x", "x, mlp_params and norm_weight need a unit last stride"
             )
-        # Only the patch / row base is 64-bit in the kernel; the element offset inside one
-        # patch of x and of out (contiguous) and inside one mlp_params row is int32.
+        # In the kernel the patch base of x and of out, the mlp_params row base and the bases
+        # of the three matrices in a row are 64-bit; only the element offset inside one patch
+        # of x and of out (contiguous) and inside one matrix of a row is int32.
         int32_end = 2**31
         x_end = max((num_x - 1) * x.stride(1), (num_x - 1) * hidden_x) + hidden_x
         if x_end > int32_end:
@@ -362,7 +363,7 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
-    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both, bf16 only
+    # cuda covers ROCm builds of PyTorch (device type "cuda"); bf16 only
     bf16 = frozenset({torch.bfloat16})
     out["nerf_glu_block"] = FunctionConstraints(
         params={
