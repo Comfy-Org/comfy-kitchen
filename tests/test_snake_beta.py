@@ -458,18 +458,21 @@ class TestSnakeBetaTriton:
         n = 8192
         if torch.cuda.mem_get_info()[0] < 9 * 2**30:
             pytest.skip("needs 9 GiB of free GPU memory")
-        x = torch.empty(1, 1, t, device="cuda", dtype=torch.float16)
-        x[..., :n].normal_()
-        x[..., -n:].normal_()
-        alpha, beta = _params(1, device="cuda", dtype=torch.float16)
-        with self._served("triton"), ck.use_backend("triton"):
-            got = ck.snake_beta(x, alpha, beta)
-        torch.cuda.synchronize()
-        for sl in (slice(0, n), slice(t - n, t)):
-            ref = eager_backend.snake_beta(x[..., sl], alpha, beta)
-            assert _rel(got[..., sl], ref) < 2e-3
-        del x, got
-        torch.cuda.empty_cache()
+        x = got = None
+        try:
+            x = torch.empty(1, 1, t, device="cuda", dtype=torch.float16)
+            x[..., :n].normal_()
+            x[..., -n:].normal_()
+            alpha, beta = _params(1, device="cuda", dtype=torch.float16)
+            with self._served("triton"), ck.use_backend("triton"):
+                got = ck.snake_beta(x, alpha, beta)
+            torch.cuda.synchronize()
+            for sl in (slice(0, n), slice(t - n, t)):
+                ref = eager_backend.snake_beta(x[..., sl], alpha, beta)
+                assert _rel(got[..., sl], ref) < 2e-3
+        finally:
+            del x, got
+            torch.cuda.empty_cache()
 
     def test_empty_input_goes_to_eager(self):
         x, alpha, beta, _ = self._inputs(8, 0, False)

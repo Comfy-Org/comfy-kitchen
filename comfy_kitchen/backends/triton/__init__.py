@@ -131,10 +131,8 @@ def _build_constraints() -> dict:
         return ValidationResult.ok()
 
     def _snake_beta_call_rule(kwargs):
-        # No size threshold: the kernel was faster than ComfyUI's current path at every
-        # measured Oobleck decoder shape (fp16, C 128 to 2048, T 3000 to 5760000, with and
-        # without the residual add) on an RTX 5090 and on a Radeon 8060S (per-call numbers in
-        # the PR that added this op). The layouts the kernel does not cover go to eager.
+        # No size threshold: every call that passes the checks below goes to the kernel.
+        # The layouts the kernel does not cover go to eager.
         x, alpha, beta = kwargs.get("x"), kwargs.get("alpha"), kwargs.get("beta")
         residual = kwargs.get("residual")
         if x is None:
@@ -351,8 +349,8 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
-    # fp16 only, the dtype the Oobleck audio VAE runs in and the one measured; cuda covers ROCm
-    # builds of PyTorch (device type "cuda"), measured on both
+    # fp16 only, the dtype the Oobleck audio VAE runs in; cuda covers ROCm builds of PyTorch
+    # (device type "cuda")
     fp16_only = frozenset({torch.float16})
     out["snake_beta"] = FunctionConstraints(
         params={
