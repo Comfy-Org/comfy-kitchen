@@ -10,6 +10,7 @@ __all__ = [
     "window_attention",
     "sol_attn",
     "rms_adaln",
+    "sum_indexed_values",
     "apply_rope",
     "apply_rope_",
     "apply_rope1",
@@ -132,6 +133,7 @@ from .rope import (
     rms_rope_split_half_,
 )
 from .sol_attn import sol_attn
+from .sum_indexed_values import sum_indexed_values
 from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
 from .w4a8_int8 import (
     dequantize_w4a8_int8_weight,
@@ -703,6 +705,15 @@ def _build_constraints() -> dict:
         },
         default_devices=all_devices,
         call_rules=(window_attention_common_call_rule,),
+    )
+    out["sum_indexed_values"] = FunctionConstraints(
+        params={
+            "image": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(3),)),
+            "index_matrix": ParamConstraint(
+                dtypes=frozenset({torch.int32, torch.int64}), shape_rules=(ExactDims(2),)
+            ),
+        },
+        default_devices=all_devices,
     )
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in out:
