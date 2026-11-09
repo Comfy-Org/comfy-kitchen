@@ -285,16 +285,32 @@ RMS ? 6 : 7
  else rope_reuse_body<T,SPLIT,WF32,RMS>(q,k,f,wq,wk,oq,ok,B,H,N,D,bnhd,dual,eps);
 }
 
+template <bool WF32>
+__global__ __launch_bounds__(128, 6)
+void rope_reuse_128_kernel(const nv_bfloat16 *q, const nv_bfloat16 *k, const float4 *f,
+ const void *wq,const void *wk,nv_bfloat16 *oq,nv_bfloat16 *ok,
+ int B,int H,int N,bool bnhd,bool dual,float eps) {
+ rope_reuse_body<nv_bfloat16,false,WF32,true>(q,k,f,wq,wk,oq,ok,B,H,N,128,bnhd,dual,eps);
+}
+
 template <typename T,bool Split, bool FP32Weights,bool RMS>
 inline void
 launch_rope_reuse(const void *q, const void *k, const void *freqs,
                           const void *wq, const void *wk, void *oq, void *ok,
                           int batch, int heads, int tokens, int D, bool bnhd, bool dual,
-                          float epsilon, cudaStream_t stream) {
+                          float epsilon, int sm, cudaStream_t stream) {
   const int threads = Split && !FP32Weights ? 64 : 128;
   const int tiles = tokens;
   const int warps=tiles*((D==256&&dual)?2:1);
   const int blocks = (warps + threads / 32 - 1) / (threads / 32);
+  if constexpr (RMS && !Split && std::is_same_v<T,nv_bfloat16>) {
+    if (D==128 && (sm==100 || sm==103)) {
+      rope_reuse_128_kernel<FP32Weights><<<dim3(blocks,batch*((heads+31)/32)), threads, 0, stream>>>(
+        static_cast<const T *>(q),static_cast<const T *>(k),static_cast<const float4 *>(freqs),
+        wq,wk,static_cast<T *>(oq),static_cast<T *>(ok),batch,heads,tokens,bnhd,dual,epsilon);
+      return;
+    }
+  }
   rope_reuse_kernel<T,Split, FP32Weights,RMS><<<dim3(blocks,batch*((heads+31)/32)), threads, 0, stream>>>(
       static_cast<const T *>(q),
       static_cast<const T *>(k), static_cast<const float4 *>(freqs),
@@ -340,7 +356,7 @@ inline bool try_rope_reuse(
   if (rms && dtype==2 && dual && D==128 && q!=oq && k!=ok &&
       (H==8 || H==16 || H==32) && N<=32768 && !(N&(N-1)) &&
       B*H*N>=32768 && (sm==90 || (sm==103 && !bnhd))) return false;
-#define REUSE(T,S,W,R) launch_rope_reuse<T,S,W,R>(q,k,f,wq,wk,oq,ok,B,H,N,D,bnhd,dual,epsilon,stream)
+#define REUSE(T,S,W,R) launch_rope_reuse<T,S,W,R>(q,k,f,wq,wk,oq,ok,B,H,N,D,bnhd,dual,epsilon,sm,stream)
 #define MODE(T,S) if(rms) { if(wtype==0) { REUSE(T,S,true,true); } else { REUSE(T,S,false,true); } } else { REUSE(T,S,true,false); }
   if(dtype==1) { if(split) { MODE(half,true) } else { MODE(half,false) } }
   else { if(split) { MODE(nv_bfloat16,true) } else { MODE(nv_bfloat16,false) } }
