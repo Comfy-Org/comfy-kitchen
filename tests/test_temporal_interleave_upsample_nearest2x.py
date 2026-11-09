@@ -178,19 +178,21 @@ class TestTemporalInterleaveUpsampleTriton:
         # the kernel itself (no size routing) reads x through its strides
         kernel = importlib.import_module("comfy_kitchen.backends.triton." + OP)
         cl3 = torch.channels_last_3d
+        # built in bf16: casting a strided fp32 view would hand the kernel a compact copy
+        bf = {"device": "cuda", "dtype": torch.bfloat16}
         make = {
-            "odd_sizes": lambda: torch.randn(2, 6, 3, 5, 7, device="cuda"),
-            "wide": lambda: torch.randn(1, 4, 2, 3, 1100, device="cuda"),
-            "channels_last_3d": lambda: torch.randn(1, 8, 3, 6, 10, device="cuda").to(
-                memory_format=cl3
-            ),
-            "time_sliced": lambda: torch.randn(1, 3, 8, 6, 10, device="cuda").transpose(1, 2)[
-                :, :, 1:
-            ],
-            "last_dim_step2": lambda: torch.randn(1, 4, 2, 6, 20, device="cuda")[..., ::2],
-            "batch_step2": lambda: torch.randn(4, 4, 2, 6, 10, device="cuda")[::2],
+            "odd_sizes": lambda: torch.randn(2, 6, 3, 5, 7, **bf),
+            "wide": lambda: torch.randn(1, 4, 2, 3, 1100, **bf),
+            "channels_last_3d": lambda: torch.randn(1, 8, 3, 6, 10, **bf).to(memory_format=cl3),
+            "time_sliced": lambda: torch.randn(1, 3, 8, 6, 10, **bf).transpose(1, 2)[:, :, 1:],
+            "last_dim_step2": lambda: torch.randn(1, 4, 2, 6, 20, **bf)[..., ::2],
+            "batch_step2": lambda: torch.randn(4, 4, 2, 6, 10, **bf)[::2],
         }
-        x = make[layout]().to(torch.bfloat16)
+        x = make[layout]()
+        if layout not in ("odd_sizes", "wide"):
+            assert not x.is_contiguous()
+        if layout == "time_sliced":
+            assert x.storage_offset() > 0
         got = kernel.temporal_interleave_upsample_nearest2x(x, interleave)
         assert got.is_contiguous()
         assert torch.equal(got, eager_backend.temporal_interleave_upsample_nearest2x(x, interleave))
