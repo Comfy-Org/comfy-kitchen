@@ -22,9 +22,9 @@ approximate reciprocal ``__builtin_amdgcn_rcpf(count)``, which is exact for 1, 2
 one ulp below the correctly rounded value for 3. The kernel takes the count-3 reciprocal
 that matches the torch build it runs under.
 
-Launch configuration (same kernel body), picked per GPU from the measured shapes:
-  CUDA: block_r 32 rows, 4 warps (RTX 5090)
-  HIP:  block_r 16 rows, 4 warps (Radeon 8060S)
+Launch configuration (same kernel body), per backend:
+  CUDA: block_r 32 rows, 4 warps
+  HIP:  block_r 16 rows, 4 warps
 """
 
 import functools

@@ -318,7 +318,9 @@ class TestQkLayernormKvInterleavedTriton:
         # the CUDA and HIP launch configurations, on whichever GPU
         kernel = importlib.import_module("comfy_kitchen.backends.triton." + OP)
         monkeypatch.setattr(kernel, "_HIP", hip)
-        # _rcp3 is cached per device and reads _HIP: drop what it cached under the patched flag
+        # _rcp3 is cached per device and reads _HIP: drop what an earlier test cached, and
+        # what this one caches under the patched flag
+        kernel._rcp3.cache_clear()
         request.addfinalizer(kernel._rcp3.cache_clear)
         assert kernel._launch_config() == ((16, 4) if hip else (32, 4))
         inputs = _inputs(1, 500, 256, 16, 64, device="cuda", dtype=torch.float16)

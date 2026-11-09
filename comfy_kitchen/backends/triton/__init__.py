@@ -130,7 +130,7 @@ def _build_constraints() -> dict:
         return ValidationResult.ok()
 
     def _qk_layernorm_kv_interleaved_call_rule(kwargs):
-        # No size threshold (the shapes measured are in the PR that added this op).
+        # No size threshold: every call that passes the checks below goes to the kernel.
         names = ("q", "kv", "q_weight", "q_bias", "k_weight", "k_bias")
         tensors = [kwargs.get(n) for n in names]
         heads = kwargs.get("heads")
@@ -362,7 +362,7 @@ def _build_constraints() -> dict:
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
     )
-    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both
+    # cuda covers ROCm builds of PyTorch (device type "cuda")
     out["qk_layernorm_kv_interleaved"] = FunctionConstraints(
         params={
             name: ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(3),))
