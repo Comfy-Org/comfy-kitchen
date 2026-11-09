@@ -737,29 +737,37 @@ __device__ __forceinline__ float2 dequantize_int8_pair(float2 x, float scale) {
     float2 result;
     asm("{ .reg .b64 a,b; mov.b64 a,{%2,%3}; mov.b64 b,{%4,%4};"
         "mul.rn.ftz.f32x2 a,a,b; mov.b64 {%0,%1},a; }"
-        : "=f"(result.x),"=f"(result.y) : "f"(x.x),"f"(x.y),"f"(scale));
+        : "=f"(result.x), "=f"(result.y)
+        : "f"(x.x), "f"(x.y), "f"(scale));
     return result;
 }
 template<typename OutputType>
-__global__ void dequantize_int8_vec8_kernel(
-    const int8_t* input, const float* scales, OutputType* output,
-    int64_t chunks, int64_t columns, int mode)
-{
-    const int64_t row = mode == 2 ? blockIdx.x : 0;
-    int64_t chunk = mode == 2 ? row * columns + int64_t(blockIdx.y) * blockDim.x + threadIdx.x:
-        int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t end = mode == 2?(row + 1) * columns : chunks;
-    const int64_t stride = mode == 2 ? end : int64_t(gridDim.x) * blockDim.x;
+__global__ void dequantize_int8_vec8_kernel(const int8_t* input, const float* scales, OutputType* output,
+    int64_t total_chunks, int64_t row_chunks, int scale_mode) {
+    const int64_t row = scale_mode == 2 ? blockIdx.x : 0;
+    int64_t chunk = scale_mode == 2 ? row * row_chunks + int64_t(blockIdx.y) * blockDim.x + threadIdx.x
+                                    : int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t end = scale_mode == 2 ? (row + 1) * row_chunks : total_chunks;
+    const int64_t stride = scale_mode == 2 ? end : int64_t(gridDim.x) * blockDim.x;
     const float scale = scales[row];
     for (; chunk < end; chunk += stride) {
-        union { uint2 word; int8_t q[8]; } values;
+        union {
+            uint2 word;
+            int8_t q[8];
+        } values;
         values.word = reinterpret_cast<const uint2*>(input)[chunk];
-        union { __half2 h[4]; nv_bfloat162 b[4]; uint4 word; } result;
+        union {
+            __half2 h[4];
+            nv_bfloat162 b[4];
+            uint4 word;
+        } result;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const float2 v = dequantize_int8_pair({float(values.q[2 * i]), float(values.q[2 * i + 1])}, scale);
-            if constexpr (std::is_same_v<OutputType, half>)result.h[i] = __floats2half2_rn(v.x, v.y);
-            else result.b[i] = __floats2bfloat162_rn(v.x, v.y);
+            if constexpr (std::is_same_v<OutputType, half>)
+                result.h[i] = __floats2half2_rn(v.x, v.y);
+            else
+                result.b[i] = __floats2bfloat162_rn(v.x, v.y);
         }
         reinterpret_cast<uint4*>(output)[chunk] = result.word;
     }
@@ -767,16 +775,13 @@ __global__ void dequantize_int8_vec8_kernel(
 #endif
 
 template<typename OutputType>
-__global__ void dequantize_int8_elementwise_vec4_kernel(
-    const int8_t* __restrict__ input, const float* __restrict__ scales,
-    OutputType* __restrict__ output, int64_t chunks)
-{
+__global__ void dequantize_int8_elementwise_vec4_kernel(const int8_t* __restrict__ input,
+    const float* __restrict__ scales, OutputType* __restrict__ output, int64_t chunks) {
     const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= chunks) return;
     const char4 q = reinterpret_cast<const char4*>(input)[i];
     const float4 s = reinterpret_cast<const float4*>(scales)[i];
-    store4_contiguous(output, i * 4, float(q.x) * s.x, float(q.y) * s.y,
-                      float(q.z) * s.z, float(q.w) * s.w);
+    store4_contiguous(output, i * 4, float(q.x) * s.x, float(q.y) * s.y, float(q.z) * s.z, float(q.w) * s.w);
 }
 
 template<typename OutputType>
@@ -1008,17 +1013,22 @@ __device__ __forceinline__ float convrot_fht_stage64_store_absmax(
 // Integer additions make the inverse transform exact until the final scale.
 // Even 256 INT8 terms fit in INT32; scaling last changes only FP32 rounding.
 template<int GROUP, typename OutputType>
-__device__ __forceinline__ void dequantize_int8_convrot_group(const int8_t* q, float scale, OutputType* output, int lane) {
-    constexpr int values = GROUP == 256 ? 8 : 4, lanes = GROUP / values;
-    int v[values];
+__device__ __forceinline__ void dequantize_int8_convrot_group(
+    const int8_t* q, float scale, OutputType* output, int lane) {
+    constexpr int kValuesPerLane = GROUP == 256 ? 8 : 4, kGroupLanes = GROUP / kValuesPerLane;
+    int v[kValuesPerLane];
 #pragma unroll
-    for (int j = 0; j < values; j += 4) {
+    for (int j = 0; j < kValuesPerLane; j += 4) {
         int packed;
-        if (reinterpret_cast<uintptr_t>(q) % 4 == 0) packed = reinterpret_cast<const int*>(q)[lane * (values / 4) + j / 4];
+        if (reinterpret_cast<uintptr_t>(q) % 4 == 0)
+            packed = reinterpret_cast<const int*>(q)[lane * (kValuesPerLane / 4) + j / 4];
         else {
-            union { int word; int8_t bytes[4]; } input;
+            union {
+                int word;
+                int8_t bytes[4];
+            } input;
 #pragma unroll
-            for (int k = 0; k < 4; ++k) input.bytes[k] = q[lane * values + j + k];
+            for (int k = 0; k < 4; ++k) input.bytes[k] = q[lane * kValuesPerLane + j + k];
             packed = input.word;
         }
         v[j] = __dp4a(packed, int(0xff010101), 0);
@@ -1032,143 +1042,170 @@ __device__ __forceinline__ void dequantize_int8_convrot_group(const int8_t* q, f
             const int x = v[j], y = v[j + 4];
             const int xx = __shfl_xor_sync(0xffffffff, x, 1), yy = __shfl_xor_sync(0xffffffff, y, 1);
             const int total = x + y + xx + yy;
-            v[j] = total - 2 * yy; v[j + 4] = total - 2 * xx;
+            v[j] = total - 2 * yy;
+            v[j + 4] = total - 2 * xx;
         }
     }
 #pragma unroll
     for (int stage = 0; stage < 2; ++stage) {
         const int shift = stage * 2 + (GROUP == 256 ? 1 : 0);
 #pragma unroll
-        for (int j = 0; j < values; ++j) {
+        for (int j = 0; j < kValuesPerLane; ++j) {
             const int x = v[j];
-            const int pair = x + __shfl_xor_sync(0xffffffff, x, 1 << shift, lanes);
-            const int total = pair + __shfl_xor_sync(0xffffffff, pair, 2 << shift, lanes);
-            v[j] = total - 2 * __shfl_xor_sync(0xffffffff, x, 3 << shift, lanes);
+            const int pair = x + __shfl_xor_sync(0xffffffff, x, 1 << shift, kGroupLanes);
+            const int total = pair + __shfl_xor_sync(0xffffffff, pair, 2 << shift, kGroupLanes);
+            v[j] = total - 2 * __shfl_xor_sync(0xffffffff, x, 3 << shift, kGroupLanes);
         }
     }
     const float factor = scale * (GROUP == 256 ? 0.0625f : 0.125f);
 #pragma unroll
-    for (int j = 0; j < values; j += 4) {
-        const int idx = lane * values + j;
-        const float a = float(v[j]) * factor, b = float(v[j + 1]) * factor, c = float(v[j + 2]) * factor, d = float(v[j + 3]) * factor;
-        if (reinterpret_cast<uintptr_t>(output) % 16 == 0) store4_contiguous(output, idx, a, b, c, d);
+    for (int j = 0; j < kValuesPerLane; j += 4) {
+        const int idx = lane * kValuesPerLane + j;
+        const float a = float(v[j]) * factor, b = float(v[j + 1]) * factor, c = float(v[j + 2]) * factor,
+                    d = float(v[j + 3]) * factor;
+        if (reinterpret_cast<uintptr_t>(output) % 16 == 0)
+            store4_contiguous(output, idx, a, b, c, d);
         else {
-            output[idx] = from_float<OutputType>(a); output[idx + 1] = from_float<OutputType>(b);
-            output[idx + 2] = from_float<OutputType>(c); output[idx + 3] = from_float<OutputType>(d);
+            output[idx] = from_float<OutputType>(a);
+            output[idx + 1] = from_float<OutputType>(b);
+            output[idx + 2] = from_float<OutputType>(c);
+            output[idx + 3] = from_float<OutputType>(d);
         }
     }
 }
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
 template<typename OutputType>
-__global__ void dequantize_int8_convrot_warp_kernel(const int8_t* q, const float* scales, OutputType* out, int64_t groups, int ng, int scale_size, uint64_t reciprocal) {
+__global__ void dequantize_int8_convrot_warp_kernel(const int8_t* input, const float* scales, OutputType* output,
+    int64_t num_groups, int groups_per_row, int scale_size, uint64_t row_reciprocal) {
 #if __CUDA_ARCH__ >= 1000 && CUDA_VERSION >= 13010
-    constexpr int L = 2, V = 128 / L, LOAD = 32, CHUNK = 32 / sizeof(OutputType);
+    constexpr int kGroupLanes = 2, kLoadBytes = 32, kStoreBytes = 32;
 #else
-    constexpr int L = std::is_same_v<OutputType, float> ? 32 : 8;
-    constexpr int V = 128 / L, LOAD = 16, CHUNK = 16 / sizeof(OutputType);
+    constexpr int kGroupLanes = std::is_same_v<OutputType, float> ? 32 : 8;
+    constexpr int kLoadBytes = 16, kStoreBytes = 16;
 #endif
-    const int slots = blockDim.x / L, lane = threadIdx.x % L;
-    const int64_t g = int64_t(blockIdx.x) * slots + threadIdx.x / L;
-    if (g >= groups) return;
-    int64_t row = ng == 1 ? g : __umul64hi(uint64_t(g), reciprocal);
-    row += g - row * ng >= ng;
+    constexpr int kValuesPerLane = 128 / kGroupLanes, kStoreValues = kStoreBytes / sizeof(OutputType);
+    const int groups_per_block = blockDim.x / kGroupLanes, lane = threadIdx.x % kGroupLanes;
+    const int64_t group = int64_t(blockIdx.x) * groups_per_block + threadIdx.x / kGroupLanes;
+    if (group >= num_groups) return;
+    int64_t row = groups_per_row == 1 ? group : __umul64hi(uint64_t(group), row_reciprocal);
+    // Correct the reciprocal quotient when it is one below the exact row.
+    row += group - row * groups_per_row >= groups_per_row;
 #if __CUDA_ARCH__ < 1000 || CUDA_VERSION < 13010
     // Hopper's FP32 output is faster with the previous 32-lane transform.
     if constexpr (std::is_same_v<OutputType, float>) {
-        dequantize_int8_convrot_group<256>(q + g * 256, scales[scale_size == 1 ? 0 : row], out + g * 256, lane);
+        dequantize_int8_convrot_group<256>(
+            input + group * 256, scales[scale_size == 1 ? 0 : row], output + group * 256, lane);
         return;
     } else
 #endif
     {
         // Each half starts at +128. Biases 512, 2048, 8192, 32768 keep each
         // stage result within 16 bits, giving two independent integer transforms.
-        uint32_t v[V];
+        uint32_t v[kValuesPerLane];
 #pragma unroll
-        for (int j = 0; j < V; j += LOAD) {
-            union {uint4 word; uint32_t ints[8]; } a, b;
+        for (int j = 0; j < kValuesPerLane; j += kLoadBytes) {
+            union {
+                uint4 word;
+                uint32_t ints[8];
+            } a, b;
 #if __CUDA_ARCH__ >= 1000 && CUDA_VERSION >= 13010
-            if constexpr (LOAD == 32) {
-                const int8_t* p0 = q + g * 256 + lane * V + j;
-                const int8_t* p1 = p0 + 128;
-                asm("ld.global.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7},[%8];"
-                    :"=r"(a.ints[0]),"=r"(a.ints[1]),"=r"(a.ints[2]),"=r"(a.ints[3]),"=r"(a.ints[4]),"=r"(a.ints[5]),"=r"(a.ints[6]),"=r"(a.ints[7]):"l"(p0));
-                asm("ld.global.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7},[%8];"
-                    :"=r"(b.ints[0]),"=r"(b.ints[1]),"=r"(b.ints[2]),"=r"(b.ints[3]),"=r"(b.ints[4]),"=r"(b.ints[5]),"=r"(b.ints[6]),"=r"(b.ints[7]):"l"(p1));
-            } else
+            const int8_t* p0 = input + group * 256 + lane * kValuesPerLane + j;
+            const int8_t* p1 = p0 + 128;
+            asm("ld.global.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7},[%8];"
+                : "=r"(a.ints[0]), "=r"(a.ints[1]), "=r"(a.ints[2]), "=r"(a.ints[3]), "=r"(a.ints[4]), "=r"(a.ints[5]),
+                "=r"(a.ints[6]), "=r"(a.ints[7])
+                : "l"(p0));
+            asm("ld.global.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7},[%8];"
+                : "=r"(b.ints[0]), "=r"(b.ints[1]), "=r"(b.ints[2]), "=r"(b.ints[3]), "=r"(b.ints[4]), "=r"(b.ints[5]),
+                "=r"(b.ints[6]), "=r"(b.ints[7])
+                : "l"(p1));
+#else
+            a.word = reinterpret_cast<const uint4*>(input + group * 256 + lane * kValuesPerLane)[j / 16];
+            b.word = reinterpret_cast<const uint4*>(input + group * 256 + 128 + lane * kValuesPerLane)[j / 16];
 #endif
-            if constexpr (LOAD == 16) {
-                a.word = reinterpret_cast<const uint4*>(q + g * 256 + lane * V)[j / 16];
-                b.word = reinterpret_cast<const uint4*>(q + g * 256 + 128 + lane * V)[j / 16];
-            }
 #pragma unroll
-            for (int h = 0; h < LOAD; ++h) v[j + h] = (__byte_perm(a.ints[h / 4], b.ints[h / 4], ((4 + h % 4) << 8)|(h % 4))&0x00ff00ff)^0x00800080;
+            for (int h = 0; h < kLoadBytes; ++h)
+                v[j + h] =
+                    (__byte_perm(a.ints[h / 4], b.ints[h / 4], ((4 + h % 4) << 8) | (h % 4)) & 0x00ff00ff) ^ 0x00800080;
         }
 #pragma unroll
         for (int stride = 1; stride < 64; stride *= 4) {
             constexpr uint32_t repeat = 0x10001;
             const uint32_t bias = 256 * stride * repeat;
-            if (stride * 4 <= V) {
+            if (stride * 4 <= kValuesPerLane) {
 #pragma unroll
-                for (int base = 0; base < V; base += stride * 4) {
+                for (int base = 0; base < kValuesPerLane; base += stride * 4) {
 #pragma unroll
                     for (int j = 0; j < stride; ++j) {
-                        const auto a = v[base + j], b = v[base + j + stride], c = v[base + j + 2 * stride], d = v[base + j + 3 * stride], sum = a + b + c + d + bias;
-                        v[base + j] = sum - 2 * d; v[base + j + stride] = sum - 2 * c; v[base + j + 2 * stride] = sum - 2 * b; v[base + j + 3 * stride] = sum - 2 * a;
+                        const auto a = v[base + j], b = v[base + j + stride], c = v[base + j + 2 * stride],
+                                   d = v[base + j + 3 * stride], sum = a + b + c + d + bias;
+                        v[base + j] = sum - 2 * d;
+                        v[base + j + stride] = sum - 2 * c;
+                        v[base + j + 2 * stride] = sum - 2 * b;
+                        v[base + j + 3 * stride] = sum - 2 * a;
                     }
                 }
             } else {
-                const int step = stride / V;
+                const int step = stride / kValuesPerLane;
 #pragma unroll
-                for (int j = 0; j < V; ++j) {
-                    const auto x = v[j], reverse = __shfl_xor_sync(0xffffffff, x, 3 * step, L);
+                for (int j = 0; j < kValuesPerLane; ++j) {
+                    const auto x = v[j], reverse = __shfl_xor_sync(0xffffffff, x, 3 * step, kGroupLanes);
                     const auto sum = x + reverse + bias;
-                    v[j] = x - reverse + __shfl_xor_sync(0xffffffff, sum, step, L);
+                    v[j] = x - reverse + __shfl_xor_sync(0xffffffff, sum, step, kGroupLanes);
                 }
             }
         }
 #pragma unroll
-        for (int j = 0; j < V; ++j) {
-            const uint32_t x = v[j], y = __shfl_xor_sync(0xffffffff, x, L / 2, L);
+        for (int j = 0; j < kValuesPerLane; ++j) {
+            const uint32_t x = v[j], y = __shfl_xor_sync(0xffffffff, x, kGroupLanes / 2, kGroupLanes);
             const uint32_t reverse = __funnelshift_l(y, y, 16), sum = x + reverse + 0x40004000;
             v[j] = x - reverse + __funnelshift_l(sum, sum, 16);
         }
         const float scale = scales[scale_size == 1 ? 0 : row] * 0.0625f;
 #pragma unroll
-        for (int j = 0; j < V; j += CHUNK) {
-            union {OutputType values[CHUNK]; uint4 word; uint32_t words[8]; } low, high;
+        for (int j = 0; j < kValuesPerLane; j += kStoreValues) {
+            union {
+                OutputType values[kStoreValues];
+                uint4 word;
+                uint32_t words[8];
+            } low, high;
 #pragma unroll
-            for (int h = 0; h < CHUNK; ++h) {
+            for (int h = 0; h < kStoreValues; ++h) {
 #if __CUDA_ARCH__ >= 1000 && CUDA_VERSION >= 13010
                 float lo, hi;
                 // Bit insertion gives 2^23 + the biased integer exactly; subtract
                 // 2^23 + 32768 before scaling, preserving the FP32 result.
-                const float a = __uint_as_float((v[j + h]&65535)|0x4b000000);
-                const float b = __uint_as_float((v[j + h] >> 16)|0x4b000000);
+                const float a = __uint_as_float((v[j + h] & 65535) | 0x4b000000);
+                const float b = __uint_as_float((v[j + h] >> 16) | 0x4b000000);
                 asm("{ .reg .b64 a,b,s; mov.b64 a,{%2,%3}; mov.b64 b,0xcb008000cb008000; mov.b64 s,{%4,%4};"
                     "add.rn.ftz.f32x2 a,a,b; mul.rn.ftz.f32x2 a,a,s; mov.b64 {%0,%1},a; }"
-                    : "=f"(lo),"=f"(hi):"f"(a),"f"(b),"f"(scale));
+                    : "=f"(lo), "=f"(hi)
+                    : "f"(a), "f"(b), "f"(scale));
 #else
-                const float lo = float(int(v[j + h]&65535)-32768) * scale;
-                const float hi = float(int(v[j + h] >> 16)-32768) * scale;
+                const float lo = float(int(v[j + h] & 65535) - 32768) * scale;
+                const float hi = float(int(v[j + h] >> 16) - 32768) * scale;
 #endif
                 low.values[h] = from_float<OutputType>(lo);
                 high.values[h] = from_float<OutputType>(hi);
             }
-            {
 #if __CUDA_ARCH__ >= 1000 && CUDA_VERSION >= 13010
-                if constexpr (CHUNK * sizeof(OutputType) == 32) {
-                    OutputType* p0 = out + g * 256 + lane * V + j;
-                    OutputType* p1 = p0 + 128;
-                    asm volatile("st.global.v8.b32 [%0],{%1,%2,%3,%4,%5,%6,%7,%8};"::"l"(p0),"r"(low.words[0]),"r"(low.words[1]),"r"(low.words[2]),"r"(low.words[3]),"r"(low.words[4]),"r"(low.words[5]),"r"(low.words[6]),"r"(low.words[7]):"memory");
-                    asm volatile("st.global.v8.b32 [%0],{%1,%2,%3,%4,%5,%6,%7,%8};"::"l"(p1),"r"(high.words[0]),"r"(high.words[1]),"r"(high.words[2]),"r"(high.words[3]),"r"(high.words[4]),"r"(high.words[5]),"r"(high.words[6]),"r"(high.words[7]):"memory");
-                } else
+            OutputType* p0 = output + group * 256 + lane * kValuesPerLane + j;
+            OutputType* p1 = p0 + 128;
+            asm volatile("st.global.v8.b32 [%0],{%1,%2,%3,%4,%5,%6,%7,%8};" ::"l"(p0), "r"(low.words[0]),
+                         "r"(low.words[1]), "r"(low.words[2]), "r"(low.words[3]), "r"(low.words[4]), "r"(low.words[5]),
+                         "r"(low.words[6]), "r"(low.words[7])
+                         : "memory");
+            asm volatile("st.global.v8.b32 [%0],{%1,%2,%3,%4,%5,%6,%7,%8};" ::"l"(p1), "r"(high.words[0]),
+                         "r"(high.words[1]), "r"(high.words[2]), "r"(high.words[3]), "r"(high.words[4]),
+                         "r"(high.words[5]), "r"(high.words[6]), "r"(high.words[7])
+                         : "memory");
+#else
+            reinterpret_cast<uint4*>(output + group * 256 + lane * kValuesPerLane)[j / (16 / sizeof(OutputType))] =
+                low.word;
+            reinterpret_cast<uint4*>(
+                output + group * 256 + 128 + lane * kValuesPerLane)[j / (16 / sizeof(OutputType))] = high.word;
 #endif
-                {
-                    reinterpret_cast<uint4*>(out + g * 256 + lane * V)[j / (16 / sizeof(OutputType))] = low.word;
-                    reinterpret_cast<uint4*>(out + g * 256 + 128 + lane * V)[j / (16 / sizeof(OutputType))] = high.word;
-                }
-            }
         }
     }
 }
@@ -1235,7 +1272,8 @@ __global__ void dequantize_int8_convrot_g64_kernel(
     const int64_t group = int64_t(blockIdx.x) * GROUPS_PER_BLOCK + threadIdx.x / 16;
     if (group >= num_groups) return;
     const int64_t row = group / (K / 64);
-    dequantize_int8_convrot_group<64>(q + group * 64, scales[scale_size == 1 ? 0 : row], output + group * 64, threadIdx.x % 16);
+    dequantize_int8_convrot_group<64>(
+        q + group * 64, scales[scale_size == 1 ? 0 : row], output + group * 64, threadIdx.x % 16);
 #else
 
     constexpr int kGroup = 64;
@@ -2715,14 +2753,14 @@ void launch_dequantize_int8_simple_kernel(
         throw std::runtime_error("dequantize_int8_simple scale mode is invalid");
     }
 
-    const bool aligned = reinterpret_cast<uintptr_t>(input) % 16 == 0 &&
-        reinterpret_cast<uintptr_t>(output) % 16 == 0;
-    if (scale_mode == 1 && aligned && reinterpret_cast<uintptr_t>(scales) % 16 == 0 && total % 4 == 0 && total >= 1024) {
+    const bool aligned = reinterpret_cast<uintptr_t>(input) % 16 == 0 && reinterpret_cast<uintptr_t>(output) % 16 == 0;
+    if (scale_mode == 1 && aligned && reinterpret_cast<uintptr_t>(scales) % 16 == 0 && total % 4 == 0 &&
+        total >= 1024) {
         const int blocks = static_cast<int>((total / 4 + 255) / 256);
         DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
-            comfy::dequantize_int8_elementwise_vec4_kernel<OutputType><<<blocks, 256, 0, stream>>>(
-                static_cast<const int8_t*>(input), static_cast<const float*>(scales),
-                static_cast<OutputType*>(output), total / 4);
+            comfy::dequantize_int8_elementwise_vec4_kernel<OutputType>
+                <<<blocks, 256, 0, stream>>>(static_cast<const int8_t*>(input), static_cast<const float*>(scales),
+                    static_cast<OutputType*>(output), total / 4);
         });
         CUDA_CHECK(cudaGetLastError());
         return;
@@ -2735,13 +2773,14 @@ void launch_dequantize_int8_simple_kernel(
         CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
         if (major == 10) {
             const int threads = scale_mode == 2 && inner_dim < 4096 ? 128 : 256;
-            const dim3 grid = scale_mode == 2?
-                dim3(static_cast<unsigned>(total / inner_dim), static_cast<unsigned>((inner_dim / 8 + threads-1) / threads)):
-                dim3(static_cast<unsigned>(std::min<int64_t>((total / 8 + threads-1) / threads, 16384)));
+            const dim3 grid = scale_mode == 2
+                ? dim3(static_cast<unsigned>(total / inner_dim),
+                      static_cast<unsigned>((inner_dim / 8 + threads - 1) / threads))
+                : dim3(static_cast<unsigned>(std::min<int64_t>((total / 8 + threads - 1) / threads, 16384)));
             DISPATCH_HALF_DTYPE(output_dtype_code, OutputType, [&] {
-                comfy::dequantize_int8_vec8_kernel<OutputType><<<grid, threads, 0, stream>>>(
-                    static_cast<const int8_t*>(input), static_cast<const float*>(scales),
-                    static_cast<OutputType*>(output), total / 8, inner_dim / 8, scale_mode);
+                comfy::dequantize_int8_vec8_kernel<OutputType>
+                    <<<grid, threads, 0, stream>>>(static_cast<const int8_t*>(input), static_cast<const float*>(scales),
+                        static_cast<OutputType*>(output), total / 8, inner_dim / 8, scale_mode);
             });
             CUDA_CHECK(cudaGetLastError());
             return;
@@ -2886,11 +2925,11 @@ void launch_dequantize_int8_convrot_kernel(
         int device = 0, major = 0;
         CUDA_CHECK(cudaGetDevice(&device));
         CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
-        if (major >= 9 && major<12) {
+        if (major >= 9 && major < 12) {
             const int groups_per_row = static_cast<int>(num_cols / 256);
             const int64_t groups = num_rows * groups_per_row;
-            const uint64_t reciprocal = UINT64_MAX / groups_per_row+
-                (UINT64_MAX % groups_per_row == static_cast<uint64_t>(groups_per_row-1));
+            const uint64_t reciprocal = UINT64_MAX / groups_per_row +
+                (UINT64_MAX % groups_per_row == static_cast<uint64_t>(groups_per_row - 1));
 #if CUDA_VERSION >= 13010
             const int groups_per_block = major >= 10 ? 32 : 8;
             const int threads = major == 9 && output_dtype_code == 0 ? 256 : 64;
@@ -2898,13 +2937,11 @@ void launch_dequantize_int8_convrot_kernel(
             const int groups_per_block = 8;
             const int threads = output_dtype_code == 0 ? 256 : 64;
 #endif
-            const unsigned blocks = static_cast<unsigned>((groups + groups_per_block-1) / groups_per_block);
+            const unsigned blocks = static_cast<unsigned>((groups + groups_per_block - 1) / groups_per_block);
             DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
-                comfy::dequantize_int8_convrot_warp_kernel<OutputType>
-                    <<<blocks, threads, 0, stream>>>(
+                comfy::dequantize_int8_convrot_warp_kernel<OutputType><<<blocks, threads, 0, stream>>>(
                     static_cast<const int8_t*>(input), static_cast<const float*>(scales),
-                    static_cast<OutputType*>(output), groups, groups_per_row,
-                    static_cast<int>(scale_size), reciprocal);
+                    static_cast<OutputType*>(output), groups, groups_per_row, static_cast<int>(scale_size), reciprocal);
             });
             CUDA_CHECK(cudaGetLastError());
             return;
