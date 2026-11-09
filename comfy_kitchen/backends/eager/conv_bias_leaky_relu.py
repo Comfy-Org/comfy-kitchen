@@ -34,8 +34,8 @@ def conv_bias_leaky_relu_(
 ) -> torch.Tensor:
     """Reference: the bias ``add_`` of ``at::convolution`` and ``F.leaky_relu``, in ComfyUI's
     order, written into ``x``."""
-    x.add_(bias.reshape((1, -1) + (1,) * (x.dim() - 2)))
-    functional.leaky_relu(x, negative_slope, inplace=True)
+    x.add_(bias.view((-1,) + (1,) * (x.dim() - 2)))
+    functional.leaky_relu_(x, negative_slope)
     return x
 
 
@@ -65,8 +65,16 @@ def _byte_range(t):
 def _check_overlap(x, bias):
     # every backend rejects a bias that shares memory with x (eager's add_ raises on a partial
     # overlap, the Triton kernel would read bias values it has already overwritten). The common
-    # case (bias outside x's byte range) only reads a few attributes. x itself needs no check:
-    # the Triton call rule takes only dense x, and add_ raises on an x with internal overlap.
+    # case (bias outside the bytes of x's storage) only reads a few attributes. x itself needs no
+    # check: the Triton call rule takes only dense x, and add_ raises on an x with internal
+    # overlap.
+    storage = x.untyped_storage()
+    s_first, b_first = storage.data_ptr(), bias.data_ptr()
+    if b_first >= s_first + storage.nbytes():
+        return
+    size_of = bias.element_size()  # bias is 1-D (checked)
+    if b_first + (bias.shape[0] - 1) * bias.stride(0) * size_of + size_of <= s_first:
+        return
     if x.numel() == 0 or bias.numel() == 0:
         return
     x_first, x_end = _byte_range(x)
@@ -84,10 +92,16 @@ def _check_overlap(x, bias):
         raise ValueError("conv_bias_leaky_relu_: bias must not overlap x")
 
 
-@torch.library.custom_op("comfy_kitchen::conv_bias_leaky_relu_", mutates_args={"x"})
-def _op_conv_bias_leaky_relu_(x: torch.Tensor, bias: torch.Tensor, negative_slope: float) -> None:
+def check_conv_bias_leaky_relu_args(x, bias):
+    """The checks every backend's call goes through (ValueError on bad shapes, devices or a bias
+    that overlaps x)."""
     _check(x, bias)
     _check_overlap(x, bias)
+
+
+@torch.library.custom_op("comfy_kitchen::conv_bias_leaky_relu_", mutates_args={"x"})
+def _op_conv_bias_leaky_relu_(x: torch.Tensor, bias: torch.Tensor, negative_slope: float) -> None:
+    check_conv_bias_leaky_relu_args(x, bias)
     kwargs = {"x": x, "bias": bias, "negative_slope": negative_slope}
     registry.get_implementation("conv_bias_leaky_relu_", kwargs=kwargs)(**kwargs)
 

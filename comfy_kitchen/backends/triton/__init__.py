@@ -119,6 +119,16 @@ if _TRITON_AVAILABLE:
         return _triton_quantize_and_rotate_rowwise(x, h, group_size)
 
 
+def conv_bias_leaky_relu_too_small(x: torch.Tensor) -> str | None:
+    """The size part of the conv_bias_leaky_relu_ call rule for a 4-D x: why x runs eager, or
+    None. The public function reads it too, to run these calls eager without the dispatch."""
+    if x.shape[2] * x.shape[3] < 16384:
+        return "H * W < 16384 runs eager"
+    if not torch.version.hip and x.numel() < 12 * 2**20:
+        return "numel < 12 * 2**20 runs eager on CUDA"
+    return None
+
+
 def _build_constraints() -> dict:
     def _na3d_call_rule(kwargs):
         common = na3d_common_call_rule(kwargs)
@@ -146,13 +156,12 @@ def _build_constraints() -> dict:
             return ValidationResult.fail("bias", "bias must be on x's device")
         if not bias.is_contiguous():
             return ValidationResult.fail("bias", "bias must be contiguous")
-        n, c, h, w = x.shape
+        n, c, _, _ = x.shape
         if x.numel() == 0 or x.numel() >= 2**31:
             return ValidationResult.fail("x", "numel must be in [1, 2**31)")
-        if h * w < 16384:
-            return ValidationResult.fail("x", "H * W < 16384 runs eager")
-        if not torch.version.hip and x.numel() < 12 * 2**20:
-            return ValidationResult.fail("x", "numel < 12 * 2**20 runs eager on CUDA")
+        too_small = conv_bias_leaky_relu_too_small(x)
+        if too_small:
+            return ValidationResult.fail("x", too_small)
         if x.is_contiguous():
             if n * c > 65535:
                 return ValidationResult.fail("x", "N * C must be <= 65535 (grid)")
