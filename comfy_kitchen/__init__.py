@@ -153,6 +153,7 @@ __all__ = [
     "swap_nibbles",
     "to_blocked",
     "from_blocked",
+    "flow_warp_cat",
     "set_allocation_context",
     "memmove",
     # Backend configuration
@@ -399,6 +400,37 @@ def adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
+
+
+def flow_warp_cat(
+    images: torch.Tensor | list[torch.Tensor],
+    flows: torch.Tensor | list[torch.Tensor],
+    grid_x: torch.Tensor,
+    grid_y: torch.Tensor,
+    prefix: torch.Tensor | None = None,
+    scales: list[torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Bilinear backward warp of images by flows, concatenated over channels, in one pass.
+
+    Each image ``[B, C, H, W]`` is warped by its flow ``[B, 2, H, W]`` (pixel units) as FILM's
+    ``_warp_core`` does: ``grid_sample`` in fp32 at ``(grid_x[w] + fx / (W / 2),
+    grid_y[h] + fy / (H / 2))``, bilinear, border padding, ``align_corners=False``, cast back
+    to the image dtype; ``grid_x`` / ``grid_y`` are the per-level pixel-centre ``linspace``
+    grids. Returns ``cat([prefix, *warped], dim=1)`` (``prefix`` optional; the FILM
+    ``FlowEstimator`` input). With ``scales`` (1D tensors, one per flow) the flows are first
+    scaled as ``f * s[:, None, None, None]`` and appended after the warped images (a FILM
+    fusion level: ``cat([warp(i0, f0 * s0), warp(i1, f1 * s1), f0 * s0, f1 * s1])``).
+    """
+    if isinstance(images, torch.Tensor):
+        images = [images]
+    if isinstance(flows, torch.Tensor):
+        flows = [flows]
+    if scales is not None and len(scales) == 0:
+        raise ValueError("flow_warp_cat: scales must have one entry per flow")
+    # the custom op takes an empty list for no scales
+    return torch.ops.comfy_kitchen.flow_warp_cat(
+        list(images), list(flows), grid_x, grid_y, prefix, [] if scales is None else list(scales)
+    )
 
 
 def fp16_conv3d(
