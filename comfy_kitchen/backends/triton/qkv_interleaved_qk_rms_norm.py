@@ -16,7 +16,7 @@ order of torch's vectorized rms kernel for ``head_dim`` 128: four values per lan
 fma, then a pairwise tree over the lanes) and rounded once to the output dtype; v is
 copied. Cross-attention launches the q programs and the k / v programs in one grid.
 
-Launch configuration (same kernel bodies), picked per GPU from the measured shapes:
+Launch configuration (same kernel bodies), per build:
   CUDA: self-attention 1 token per program, 8 warps; cross-attention 4 tokens, 8 warps
   HIP:  1 token per program, 8 warps for both
 """

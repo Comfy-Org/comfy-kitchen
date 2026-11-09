@@ -130,7 +130,7 @@ def _build_constraints() -> dict:
         return ValidationResult.ok()
 
     def _qkv_interleaved_qk_rms_norm_call_rule(kwargs):
-        # No size threshold (the shapes measured are in the PR that added this op).
+        # No size threshold: every call that passes the checks below runs triton.
         names = ("q", "k", "v", "q_weight", "k_weight")
         tensors = [kwargs.get(n) for n in names]
         heads = kwargs.get("heads")
@@ -365,7 +365,7 @@ def _build_constraints() -> dict:
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
     )
-    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both
+    # cuda covers ROCm builds of PyTorch (device type "cuda")
     out["qkv_interleaved_qk_rms_norm"] = FunctionConstraints(
         params={
             name: ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(3),))
