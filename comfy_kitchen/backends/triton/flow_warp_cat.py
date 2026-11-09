@@ -20,7 +20,7 @@ scalar is a multiply by its fp32 reciprocal), the grid add, the unnormalize
 nw, ne, sw, se accumulation with fma and its in-bounds checks. The kernel is compiled with
 ``enable_fp_fusion=False`` so that only these explicit fma are fused; on CUDA ``dx`` / ``dy``
 use ``libdevice.mul_rn``, because a plain multiply can still be contracted into the grid add.
-Launch configuration on CUDA and HIP, as measured on both: 128 pixels x 32 channels with 8
+Launch configuration on CUDA and HIP: 128 pixels x 32 channels with 8
 warps for the ``prefix`` form, 128 pixels x 16 channels with 4 warps for the fusion form.
 """
 

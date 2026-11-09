@@ -130,10 +130,7 @@ def _build_constraints() -> dict:
         return ValidationResult.ok()
 
     def _flow_warp_cat_call_rule(kwargs):
-        # No size threshold: at the FILM frame interpolation shapes measured (1920 x 1072 frames,
-        # fp16, every flow estimator and fusion level) the kernel was faster than ComfyUI's
-        # current path on an RTX 5090 and on a Radeon 8060S, with an output equal to it
-        # (per-call numbers in the PR that added this op).
+        # No size threshold: every call that passes the checks below goes to the kernel.
         images, flows = kwargs.get("images"), kwargs.get("flows")
         grid_x, grid_y = kwargs.get("grid_x"), kwargs.get("grid_y")
         prefix, scales = kwargs.get("prefix"), kwargs.get("scales")
@@ -398,7 +395,7 @@ def _build_constraints() -> dict:
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
     )
-    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both
+    # cuda covers ROCm builds of PyTorch (device type "cuda")
     fp32_only = frozenset({torch.float32})
     out["flow_warp_cat"] = FunctionConstraints(
         params={
