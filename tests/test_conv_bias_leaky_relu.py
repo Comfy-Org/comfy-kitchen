@@ -9,6 +9,7 @@ ops exactly. The Triton kernel rounds the sum to x's dtype before the activation
 add_ does, so it must be equal to eager as well.
 """
 
+import contextlib
 import importlib
 
 import pytest
@@ -277,6 +278,25 @@ class TestConvBiasLeakyReluTriton:
             pytest.skip("triton backend not available")
 
     @staticmethod
+    @contextlib.contextmanager
+    def _ran(expected):
+        # the backend whose implementation ran, per call in the block: the public function
+        # goes through registry.get_implementation, or calls the eager backend directly for
+        # sizes the call rule sends to eager, so both backends' functions are wrapped
+        ran = []
+        with pytest.MonkeyPatch.context() as mp:
+            for name in ("eager", "triton"):
+                module = importlib.import_module("comfy_kitchen.backends." + name)
+
+                def recording(*args, _impl=getattr(module, OP), _name=name, **kwargs):
+                    ran.append(_name)
+                    return _impl(*args, **kwargs)
+
+                mp.setattr(module, OP, recording)
+            yield
+        assert ran == expected, ran
+
+    @staticmethod
     def _kernel(x, bias, slope=0.2):
         triton_op = importlib.import_module("comfy_kitchen.backends.triton.conv_bias_leaky_relu")
         return triton_op.conv_bias_leaky_relu_(x, bias, slope)
@@ -288,13 +308,12 @@ class TestConvBiasLeakyReluTriton:
         kwargs = _kwargs(x, bias, slope)
         served = bool(torch.version.hip) or x.numel() >= 12 * 2**20
         assert registry.validate_backend_for_call("triton", OP, kwargs).success == served
-        assert registry.get_capable_backend(OP, kwargs) == ("triton" if served else "eager")
         ref = eager_backend.conv_bias_leaky_relu_(
             x.clone(memory_format=torch.preserve_format), bias, slope
         )
         ptr, stride = x.data_ptr(), x.stride()
         if served:
-            with ck.use_backend("triton"):
+            with cls._ran(["triton"]), ck.use_backend("triton"):
                 got = ck.conv_bias_leaky_relu_(x, bias, slope)
         else:
             got = cls._kernel(x, bias, slope)
@@ -354,8 +373,8 @@ class TestConvBiasLeakyReluTriton:
         with torch.no_grad():
             ref = nn.LeakyReLU(0.2)(conv(x))
             y = functional.conv2d(x, conv.weight, None, conv.stride, conv.padding)
-            assert registry.get_capable_backend(OP, _kwargs(y, conv.bias)) == "triton"
-            got = ck.conv_bias_leaky_relu_(y, conv.bias)
+            with self._ran(["triton"]):
+                got = ck.conv_bias_leaky_relu_(y, conv.bias)
         assert got.stride() == ref.stride()
         assert torch.equal(got, ref)
 
@@ -369,7 +388,8 @@ class TestConvBiasLeakyReluTriton:
     @pytest.mark.parametrize("backend", ["triton", "eager"])
     def test_rejects_bias_overlapping_x(self, backend, layout):
         # a plane and element count the Triton call rule serves on CUDA and ROCm builds; bias is
-        # a view of x's first C elements
+        # a view of x's first C elements. The overlap check runs before dispatch, so neither
+        # backend runs; with a copy of that bias the same x is served by the chosen backend
         n, c, h, w = 1, 64, 448, 448
         x = _conv_out(n, c, h, w, layout, device="cuda")
         bias = x.as_strided((c,), (1,), x.storage_offset())
@@ -377,10 +397,16 @@ class TestConvBiasLeakyReluTriton:
         kwargs = _kwargs(x, bias)
         assert registry.validate_backend_for_call("triton", OP, kwargs).success
         before = x.clone(memory_format=torch.preserve_format)
-        with ck.use_backend(backend), pytest.raises(ValueError, match="bias must not overlap x"):
+        with (
+            self._ran([]),
+            ck.use_backend(backend),
+            pytest.raises(ValueError, match="bias must not overlap x"),
+        ):
             ck.conv_bias_leaky_relu_(x, bias)
         torch.cuda.synchronize()
         assert torch.equal(x, before)
+        with self._ran([backend]), ck.use_backend(backend):
+            ck.conv_bias_leaky_relu_(x, bias.clone())
 
     def test_unsupported_inputs_go_to_eager(self):
         cases = [
@@ -437,7 +463,7 @@ class TestConvBiasLeakyReluTriton:
             assert not registry.validate_backend_for_call("triton", OP, kwargs).success
             assert registry.get_capable_backend(OP, kwargs) == "eager"
             ref = _stock_chain(x.clone(memory_format=torch.preserve_format), bias)
-            with ck.use_backend("triton"):
+            with self._ran(["eager"]), ck.use_backend("triton"):
                 got = ck.conv_bias_leaky_relu_(x, bias)
             assert got is x
             assert torch.equal(got, ref)
