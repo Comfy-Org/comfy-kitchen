@@ -15,7 +15,7 @@ gather  one program per block of token rows: the expert bases from the counts of
         of x[flat_topk_idx == i]), each x row read once and written to its two slots;
         program 0 writes the expert totals.
 
-Launch configuration (same on CUDA and HIP, measured on an RTX 5090 and a Radeon 8060S):
+Launch configuration (same on CUDA and HIP):
 32 token rows per program, 256 columns per step, 4 warps.
 """
 

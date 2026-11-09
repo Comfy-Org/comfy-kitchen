@@ -142,8 +142,9 @@ def _build_constraints() -> dict:
         if x.stride(-1) != 1 or logits.stride(-1) != 1:
             return ValidationResult.fail("x", "x and logits need a unit stride in the last dim")
         # at most 2**14 tokens (HiDream-I1 calls have up to 8960), more go to eager: the gather
-        # kernel's count tile is a constexpr sized by the token count, so every new size
-        # compiles its own kernel
+        # kernel's count tile is [next_pow2(ceil(tokens / 32)), 4], a constexpr, so the kernel
+        # compiles once per power-of-two block count and that first compile takes longer as
+        # the tile grows
         if x.shape[0] > 2**14:
             return ValidationResult.fail("x", "more than 2**14 tokens")
         return ValidationResult.ok()
@@ -347,7 +348,7 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
-    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both, bf16 only
+    # cuda covers ROCm builds of PyTorch (device type "cuda"); bf16 only
     bf16_only = frozenset({torch.bfloat16})
     out["moe_top2_dispatch"] = FunctionConstraints(
         params={
