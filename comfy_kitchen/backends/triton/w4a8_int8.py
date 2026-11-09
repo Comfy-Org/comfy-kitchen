@@ -11,6 +11,7 @@ import torch
 import triton
 import triton.language as tl
 from comfy_kitchen.backends.eager.w4a8_int8 import (
+    _dequant_int4_grouped_to_int8 as eager_dequant_int4_grouped_to_int8,
     _w4a8_geometry,
     validate_w4a8_operands,
 )
@@ -86,6 +87,8 @@ def _dequant_int4_grouped_to_int8(
 ) -> torch.Tensor:
     """Fused Triton int4/int6 -> grouped int8: round(clamp(level(q) * s_rel, -127, 127))."""
     n, k, bits = _w4a8_geometry(qdata, s_rel, group_size)
+    if bits == 3:  # the kernel decodes the 4/6-bit nibble layouts only
+        return eager_dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
     k_half = k // 2
     qi = qdata.contiguous()
     srel_f = s_rel.float().contiguous()  # decode fp8 scale to fp32 (small tensor)
