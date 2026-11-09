@@ -141,6 +141,7 @@ __all__ = [
     "rms_rope_split_half_",
     "rms_rope_split_half1",
     "rms_rope_split_half1_",
+    "qkv_interleaved_qk_rms_norm",
     # Geometry
     "delaunay3d",
     "mesh_bvh",
@@ -1016,6 +1017,49 @@ def apply_rope_split_half1_(
     """Apply split-half RoPE in place (inference only)."""
     torch.ops.comfy_kitchen.apply_rope_split_half1_(x, freqs_cis)
     return x
+
+
+def qkv_interleaved_qk_rms_norm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    heads: int,
+    eps: float = 1e-6,
+    q_interleaved: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Hunyuan3D-2.1 DiT attention prep: per-head q / k / v relayout + QK RMSNorm.
+
+    The Hunyuan3D-2.1 DiT concatenates the projection outputs and splits the result per
+    head (``torch.cat`` on the last dim, ``view(B, S, heads, n * head_dim)``,
+    ``torch.split(head_dim)``), so head h takes interleaved ``[head_dim]`` blocks of the
+    concatenation. This op returns the q, k and v the attention call receives, each a
+    ``[B, S, heads * head_dim]`` tensor, with q and k RMS-normalized per head
+    (``F.rms_norm`` over ``head_dim`` with the given weight). q and k are contiguous; v is
+    contiguous for ``heads > 1`` and, for ``heads == 1``, the same strided view the stock
+    code returns (the last ``head_dim`` channels of the concatenation, row stride
+    ``n * head_dim``, n = 3 for self- and 2 for cross-attention):
+
+    - ``q_interleaved=True`` (``Attention.forward``): q, k and v are concatenated and split.
+    - ``q_interleaved=False`` (``CrossAttention.forward``): only k and v are concatenated
+      and split; q is viewed per head.
+
+    Args:
+        q: Query projection ``[B, S, heads * head_dim]``.
+        k, v: Key and value projections ``[B, S_kv, heads * head_dim]`` (``S_kv == S``
+            when ``q_interleaved``).
+        q_weight, k_weight: RMSNorm weights ``[head_dim]`` in q's dtype.
+        heads: Number of attention heads.
+        eps: RMSNorm epsilon.
+        q_interleaved: Whether q takes part in the concatenation (self-attention).
+
+    Returns:
+        Tuple of the (query, key, value) tensors.
+    """
+    return torch.ops.comfy_kitchen.qkv_interleaved_qk_rms_norm(
+        q, k, v, q_weight, k_weight, int(heads), float(eps), bool(q_interleaved)
+    )
 
 
 def quantize_int8_tensorwise(
