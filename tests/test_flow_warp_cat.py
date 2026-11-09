@@ -9,6 +9,7 @@ the stock code exactly. The Triton kernel follows ATen's operation order for the
 bilinear interpolation and rounds once to fp16, so it must be equal to the stock code too.
 """
 
+import contextlib
 import importlib
 
 import pytest
@@ -340,17 +341,30 @@ class TestFlowWarpCatTriton:
             pytest.skip("triton backend not available")
 
     @staticmethod
-    def _served(kwargs):
-        assert registry.validate_backend_for_call("triton", OP, kwargs).success
-        assert registry.get_capable_backend(OP, kwargs) == "triton"
+    @contextlib.contextmanager
+    def _served(expected="triton"):
+        # the backend of the implementation the registry returns for each call in the block
+        # (get_implementation wrapped), so the check is on the call that ran, not on a query
+        served = []
+        get_implementation = registry.get_implementation
+
+        def recording(func_name, backend=None, kwargs=None):
+            impl = get_implementation(func_name, backend, kwargs)
+            if func_name == OP:
+                served.append(impl.__module__.rsplit(".", 2)[-2])
+            return impl
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(registry, "get_implementation", recording)
+            yield
+        assert served and all(b == expected for b in served), served
 
     @pytest.mark.parametrize("layout", ["nchw", "cl"])
     @pytest.mark.parametrize(("channels", "height", "width"), _ESTIMATOR_SHAPES)
     def test_estimator_equals_stock(self, channels, height, width, layout):
         fa, fb, v = _estimator_inputs(channels, height, width, device="cuda", layout=layout)
         gx, gy = _grids(height, width, "cuda")
-        self._served(_kwargs([fb], [v], gx, gy, prefix=fa))
-        with ck.use_backend("triton"):
+        with self._served(), ck.use_backend("triton"):
             got = ck.flow_warp_cat(fb, v, gx, gy, prefix=fa)
         ref = _stock_estimator_step(fa, fb, v, gx, gy)
         assert got.shape == ref.shape and got.stride() == ref.stride()
@@ -363,8 +377,7 @@ class TestFlowWarpCatTriton:
         p0, p1, fwd, bwd, dt = _fusion_inputs(channels, height, width, device="cuda", layout=layout)
         gx, gy = _grids(height, width, "cuda")
         scales = [dt, 1 - dt]
-        self._served(_kwargs([p0, p1], [bwd, fwd], gx, gy, scales=scales))
-        with ck.use_backend("triton"):
+        with self._served(), ck.use_backend("triton"):
             got = ck.flow_warp_cat([p0, p1], [bwd, fwd], gx, gy, scales=scales)
         (ref,) = _stock_fusion_levels([p0], [p1], [fwd], [bwd], dt, {(height, width): (gx, gy)})
         assert got.shape == ref.shape and got.stride() == ref.stride()
@@ -375,8 +388,7 @@ class TestFlowWarpCatTriton:
         p0, p1, fwd, bwd, batch_dt = _fusion_inputs(67, 67, 120, dt=dt, device="cuda")
         gx, gy = _grids(67, 120, "cuda")
         scales = [batch_dt, 1 - batch_dt]
-        self._served(_kwargs([p0, p1], [bwd, fwd], gx, gy, scales=scales))
-        with ck.use_backend("triton"):
+        with self._served(), ck.use_backend("triton"):
             got = ck.flow_warp_cat([p0, p1], [bwd, fwd], gx, gy, scales=scales)
         (ref,) = _stock_fusion_levels([p0], [p1], [fwd], [bwd], batch_dt, {(67, 120): (gx, gy)})
         assert torch.equal(got, ref)
@@ -386,8 +398,7 @@ class TestFlowWarpCatTriton:
         fa, fb, v = _estimator_inputs(64, 33, 60, device="cuda", layout="cl")
         fa = fa.contiguous()
         gx, gy = _grids(33, 60, "cuda")
-        self._served(_kwargs([fb], [v], gx, gy, prefix=fa))
-        with ck.use_backend("triton"):
+        with self._served(), ck.use_backend("triton"):
             got = ck.flow_warp_cat(fb, v, gx, gy, prefix=fa)
         assert torch.equal(got, _stock_estimator_step(fa, fb, v, gx, gy))
 
@@ -396,16 +407,14 @@ class TestFlowWarpCatTriton:
         # the largest calls of a 1920 x 1072 interpolation: estimator level 0, fusion level 0
         fa, fb, v = _estimator_inputs(64, 1072, 1920, device="cuda", layout=layout)
         gx, gy = _grids(1072, 1920, "cuda")
-        self._served(_kwargs([fb], [v], gx, gy, prefix=fa))
-        with ck.use_backend("triton"):
+        with self._served(), ck.use_backend("triton"):
             got = ck.flow_warp_cat(fb, v, gx, gy, prefix=fa)
         assert got.shape == (1, 128, 1072, 1920) and got.is_contiguous()
         assert torch.equal(got, _stock_estimator_step(fa, fb, v, gx, gy))
         del fa, fb, v, got
         p0, p1, fwd, bwd, dt = _fusion_inputs(67, 1072, 1920, device="cuda", layout=layout)
         scales = [dt, 1 - dt]
-        self._served(_kwargs([p0, p1], [bwd, fwd], gx, gy, scales=scales))
-        with ck.use_backend("triton"):
+        with self._served(), ck.use_backend("triton"):
             got = ck.flow_warp_cat([p0, p1], [bwd, fwd], gx, gy, scales=scales)
         (ref,) = _stock_fusion_levels([p0], [p1], [fwd], [bwd], dt, {(1072, 1920): (gx, gy)})
         assert got.shape == (1, 138, 1072, 1920) and got.is_contiguous()
@@ -439,7 +448,7 @@ class TestFlowWarpCatTriton:
         for kwargs in cases:
             assert not registry.validate_backend_for_call("triton", OP, kwargs).success
             assert registry.get_capable_backend(OP, kwargs) == "eager"
-            with ck.use_backend("triton"):
+            with self._served("eager"), ck.use_backend("triton"):
                 got = ck.flow_warp_cat(**kwargs)
             assert torch.equal(got, eager_backend.flow_warp_cat(**kwargs))
         # CPU tensors go to eager
