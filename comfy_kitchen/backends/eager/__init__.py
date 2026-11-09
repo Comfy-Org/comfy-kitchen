@@ -6,6 +6,7 @@ __all__ = [
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
     "group_norm_stats3d",
+    "moe_top2_dispatch",
     "na3d",
     "window_attention",
     "sol_attn",
@@ -86,6 +87,7 @@ from .convrot_w4a4 import (
     quantize_convrot_w4a4_weight,
 )
 from .group_norm_pad3d import group_norm_silu_pad3d, group_norm_silu_pad3d_out, group_norm_stats3d
+from .moe_top2_dispatch import moe_top2_dispatch
 from .na import na3d, window_attention
 from .quantization import (
     dequantize_int8_convrot_weight,
@@ -703,6 +705,13 @@ def _build_constraints() -> dict:
         },
         default_devices=all_devices,
         call_rules=(window_attention_common_call_rule,),
+    )
+    out["moe_top2_dispatch"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+            "logits": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+        },
+        default_devices=all_devices,
     )
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in out:
