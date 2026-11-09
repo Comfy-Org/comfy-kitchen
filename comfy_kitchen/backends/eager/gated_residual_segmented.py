@@ -101,14 +101,19 @@ def _check_inplace(residual, x, gate):
             required = stride * size
     first, end = _byte_range(residual)
     for other_name, other in (("x", x), ("gate", gate)):
-        if other.numel() == 0:
+        if other.numel() == 0 or other.device != residual.device:
             continue
         other_first, other_end = _byte_range(other)
         if other_end <= first or other_first >= end:
             continue
-        # _tensors_overlap compares element offsets, so views of one buffer with different
-        # element sizes are treated as overlapping
-        if other.element_size() != residual.element_size() or _tensors_overlap(other, residual):
+        # the byte ranges meet. _tensors_overlap compares element offsets and returns False for
+        # different storages (e.g. two torch.frombuffer wrappers of one buffer), so mixed element
+        # sizes and different storages are treated as overlapping
+        if (
+            other.element_size() != residual.element_size()
+            or other.untyped_storage().data_ptr() != residual.untyped_storage().data_ptr()
+            or _tensors_overlap(other, residual)
+        ):
             raise ValueError(f"{name}: {other_name} must not overlap residual")
 
 

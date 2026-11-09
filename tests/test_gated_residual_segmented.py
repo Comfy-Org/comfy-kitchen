@@ -143,6 +143,15 @@ class TestSegmentedEager:
         with pytest.raises(ValueError, match="x must not overlap"):
             ck.gated_residual_segmented_(residual, x, torch.randn(2, 1, 8), 2)
 
+    def test_inplace_rejects_x_sharing_bytes_through_another_storage(self):
+        # two torch.frombuffer wrappers of one buffer: different storages, shared bytes
+        raw = bytearray(12 * 4)
+        residual = torch.frombuffer(raw, dtype=torch.float32, count=8, offset=4).view(1, 2, 4)
+        x = torch.frombuffer(raw, dtype=torch.float32, count=8).view(1, 2, 4)
+        assert residual.untyped_storage().data_ptr() != x.untyped_storage().data_ptr()
+        with pytest.raises(ValueError, match="x must not overlap"):
+            ck.gated_residual_segmented_(residual, x, torch.randn(2, 1, 4), 1)
+
     def test_inplace_accepts_disjoint_views_of_one_buffer(self):
         buf = torch.randn(3 * 8 * 16)
         residual = buf[: 8 * 16].view(1, 8, 16)
