@@ -220,7 +220,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
                   get_warp_idx_k<num_warps_q, num_warps_k>();
   } else if constexpr (K_GRAN == QuantGranularity::kPerThread) {
     const uint32_t num_warp_block_k =
-        (decode_page ? stride_h_k / (head_dim * CTA_K) : div_ceil(kv_len, CTA_K)) * (CTA_K / WARP_K);
+        div_ceil(decode_page ? stride_h_k / head_dim : kv_len, CTA_K) * (CTA_K / WARP_K);
     k_scale_idx =
         batch_id * (num_qo_heads / num_kv_groups) * (num_warp_block_k * 4) +
         (head_id / num_kv_groups) * (num_warp_block_k * 4) +

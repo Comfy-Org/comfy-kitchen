@@ -307,9 +307,9 @@ __global__ __launch_bounds__((Shape<HD, kMask, Paged>::kThreads)) void int8_attn
         const int64_t out_slab = (static_cast<int64_t>(blockIdx.z) * pages * kDecodeSplits + blockIdx.x) * gridDim.y;
         q += static_cast<int64_t>(blockIdx.z) * gridDim.y * qo_len * HD;
         q_scale += static_cast<int64_t>(blockIdx.z) * gridDim.y * qo_len_padded;
-        k += slab * page_size * HD + start * HD;
-        v += slab * page_size * HD + start;
-        k_scale += slab * k_groups_per_head + start / 16;
+        k += (static_cast<int64_t>(blockIdx.z) * gridDim.y * pages * page_size + page * page_size + start) * HD;
+        v += static_cast<int64_t>(blockIdx.z) * gridDim.y * HD * pages * page_size + page * page_size + start;
+        k_scale += static_cast<int64_t>(blockIdx.z) * gridDim.y * k_groups_per_head + (page * page_size + start) / 16;
         v_scale += slab * HD;
         o += out_slab * qo_len * HD;
         lse += out_slab * qo_len;
@@ -1094,8 +1094,8 @@ extern "C" void launch_int8_decode(
     // A 32-key tile keeps the transposed D256 accumulator out of scratch on gfx12.
     int8_attn_kernel<256, 32, MaskMode::kNone, __bf16, true><<<dim3(pages * kDecodeSplits, heads, batch), 128, 0, stream>>>(
         q, k, v, static_cast<__bf16*>(partial), qs, ks, vs, nullptr, 0, 0, 0, 0, 0,
-        rows, page_size, 64, page_size / 16, 1,
-        0, rows * 256, 0, page_size * 256, 0, page_size * 256, page_size,
+        rows, page_size, 64, pages * page_size / 16, 1,
+        0, rows * 256, 0, pages * page_size * 256, 0, pages * page_size * 256, pages * page_size,
         0, rows * 256, 256, 0.0625f, length, lse, pages);
     int8_decode_combine<<<batch * heads * rows, 256, 0, stream>>>(
         static_cast<const __bf16*>(partial), lse, length, static_cast<__bf16*>(out), out_lse,

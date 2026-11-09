@@ -18,32 +18,33 @@ extern "C" void launch_int8_decode(int8_t*, int8_t*, int8_t*, float*, float*, fl
 void register_int8_decode(nb::module_& m) {
     m.def("_int8_decode_update", [](Tensor k, Tensor v, Bytes ki, Bytes vi, Scales ks, Scales vs,
                                   Length length, bool initialize, uintptr_t stream) {
-        if (k.ndim() != 4 || v.ndim() != 4 || ki.ndim() != 5 || vi.ndim() != 5 ||
+        if (k.ndim() != 4 || v.ndim() != 4 || ki.ndim() != 4 || vi.ndim() != 2 || ks.ndim() != 3 || vs.ndim() != 4 ||
             k.dtype() != nb::dlpack::dtype{static_cast<uint8_t>(nb::dlpack::dtype_code::Bfloat), 16, 1} || v.dtype() != k.dtype() ||
-            k.shape(3) != 256 || v.size() != k.size() || ki.shape(0) != k.shape(0) || ki.shape(2) != k.shape(1) ||
-            ki.shape(4) != 256 || ki.shape(3) != 512 || ki.shape(1) * ki.shape(3) < k.shape(2) || vi.size() != ki.size() ||
-            ks.size() != ki.size() / (16 * 256) || vs.size() != ki.size() / ki.shape(3) || length.size() != 1)
+            k.shape(3) != 256 || v.size() != k.size() || ki.shape(0) != k.shape(0) || ki.shape(1) != k.shape(1) ||
+            ki.shape(3) != 256 || vs.shape(1) * 512 != ki.shape(2) || ki.shape(2) < k.shape(2) ||
+            vi.shape(0) != k.shape(0) * k.shape(1) * 256 || vi.shape(1) != ki.shape(2) ||
+            ks.size() != ki.size() / (16 * 256) || vs.shape(0) != ki.shape(0) || vs.shape(2) != ki.shape(1) || vs.shape(3) != 256 || length.size() != 1)
             throw std::runtime_error("Invalid int8 decode cache tensors");
         auto s = reinterpret_cast<hipStream_t>(stream);
-        launch_int8_decode_quant_k(k.data(), ki.data(), ks.data(), length.data(), k.shape(0), k.shape(1), k.shape(2), ki.shape(1), ki.shape(3), initialize, s);
-        launch_int8_decode_quant_v(v.data(), vi.data(), vs.data(), length.data(), k.shape(0), k.shape(1), k.shape(2), ki.shape(1), ki.shape(3), initialize, s);
+        launch_int8_decode_quant_k(k.data(), ki.data(), ks.data(), length.data(), k.shape(0), k.shape(1), k.shape(2), vs.shape(1), 512, initialize, s);
+        launch_int8_decode_quant_v(v.data(), vi.data(), vs.data(), length.data(), k.shape(0), k.shape(1), k.shape(2), vs.shape(1), 512, initialize, s);
         auto error = hipGetLastError();
         if (error != hipSuccess) throw std::runtime_error(hipGetErrorString(error));
     });
     m.def("_int8_decode", [](Tensor q, Bytes qi, Scales qs, Bytes k, Bytes v, Scales ks, Scales vs,
                             Length length, Tensor partial, Scales lse, Tensor out, Scales out_lse, int seq, uintptr_t stream) {
-        if (q.ndim() != 4 || k.ndim() != 5 || q.shape(3) != 256 || q.shape(2) < 1 || q.shape(2) > 64 || seq < 1 || q.shape(2) % seq ||
+        if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 2 || ks.ndim() != 3 || vs.ndim() != 4 || q.shape(3) != 256 || q.shape(2) < 1 || q.shape(2) > 64 || seq < 1 || q.shape(2) % seq ||
             q.dtype() != nb::dlpack::dtype{static_cast<uint8_t>(nb::dlpack::dtype_code::Bfloat), 16, 1} ||
             partial.dtype() != q.dtype() || out.dtype() != q.dtype() || qi.size() != q.size() ||
-            qs.size() != q.shape(0) * q.shape(1) * 64 || q.shape(0) != k.shape(0) || q.shape(1) != k.shape(2) ||
-            k.shape(3) != 512 || k.shape(4) != 256 || v.size() != k.size() ||
-            ks.size() != k.size() / (16 * 256) || vs.size() != k.size() / k.shape(3) ||
-            partial.size() != q.size() * k.shape(1) * 8 || lse.size() != partial.size() / 256 ||
+            qs.size() != q.shape(0) * q.shape(1) * 64 || q.shape(0) != k.shape(0) || q.shape(1) != k.shape(1) ||
+            k.shape(3) != 256 || vs.shape(1) * 512 != k.shape(2) || v.size() != k.size() || v.shape(1) != k.shape(2) ||
+            ks.size() != k.size() / (16 * 256) || vs.shape(0) != k.shape(0) || vs.shape(2) != k.shape(1) || vs.shape(3) != 256 ||
+            partial.size() != q.size() * vs.shape(1) * 8 || lse.size() != partial.size() / 256 ||
             out.size() != q.size() || out_lse.size() != q.size() / 256 || length.size() != 1)
             throw std::runtime_error("Invalid int8 decode query or workspace");
         auto s = reinterpret_cast<hipStream_t>(stream);
         launch_int8_decode_quant_q(q.data(), qi.data(), qs.data(), q.shape(0), q.shape(1), q.shape(2), s);
         launch_int8_decode(qi.data(), k.data(), v.data(), qs.data(), ks.data(), vs.data(), length.data(),
-            partial.data(), lse.data(), out.data(), out_lse.data(), q.shape(0), q.shape(1), q.shape(2), k.shape(1), k.shape(3), seq, s);
+            partial.data(), lse.data(), out.data(), out_lse.data(), q.shape(0), q.shape(1), q.shape(2), vs.shape(1), 512, seq, s);
     });
 }

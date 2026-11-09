@@ -226,6 +226,8 @@ __global__ __launch_bounds__(kQuantWaves * 32) void quant_k_int8_kernel(
     const int h = blockIdx.y;
     int b = blockIdx.z;
     const int padded_Lk = Lk;
+    const int output_Lk = Paged ? pages * padded_Lk : padded_Lk;
+    const int output_groups = Paged ? pages * groups_per_head : groups_per_head;
     if constexpr (Paged) {
         const int count = initialize ? pages : 2;
         b = blockIdx.z / count;
@@ -237,9 +239,8 @@ __global__ __launch_bounds__(kQuantWaves * 32) void quant_k_int8_kernel(
         const int source_row = initialize ? page * padded_Lk :
             page * padded_Lk % (stride_h / stride_n);
         k += static_cast<int64_t>(source_row) * stride_n;
-        const int64_t offset = (static_cast<int64_t>(b) * (pages - 1) + page) * H_kv;
-        k_out += offset * padded_Lk * HD;
-        k_scale += offset * groups_per_head;
+        k_out += static_cast<int64_t>(page) * padded_Lk * HD;
+        k_scale += page * groups_per_head;
     }
     const int64_t bh = static_cast<int64_t>(b) * H_kv + h;
     const T* head = k + static_cast<int64_t>(b) * stride_b + static_cast<int64_t>(h) * stride_h;
@@ -278,7 +279,7 @@ __global__ __launch_bounds__(kQuantWaves * 32) void quant_k_int8_kernel(
     mx = row_reduce_fmax<32>(mx);
     const float scale = mx / kInt8Max + 1e-7f;
     const float inv_scale = 1.0f / scale;
-    if (lane == 0) k_scale[bh * groups_per_head + group] = scale;
+    if (lane == 0) k_scale[bh * output_groups + group] = scale;
 
 #pragma unroll
     for (int pass = 0; pass < kRowPasses; ++pass) {
@@ -293,7 +294,7 @@ __global__ __launch_bounds__(kQuantWaves * 32) void quant_k_int8_kernel(
                 for (int i = 0; i < Tile::kValsPerLane; ++i) vals[i] -= bias[i];
                 rotate_row<HD, Rotation>(vals);
             }
-            store_row<HD, T>(k_out + (bh * padded_Lk + key) * HD, lane_in_row, vals, inv_scale);
+            store_row<HD, T>(k_out + (bh * output_Lk + key) * HD, lane_in_row, vals, inv_scale);
         }
     }
 }

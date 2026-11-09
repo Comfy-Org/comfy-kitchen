@@ -70,6 +70,7 @@ quant_v_int8_kernel(const T *__restrict__ v, int8_t *__restrict__ out,
   const int h = bh % H;
   const int b = bh / H;
   const int d0 = d_tile * kDTile;
+  const int output_N = paged ? pages * padded_N : padded_N;
 
   if constexpr (paged) {
     const int length = static_cast<int>(position[0]);
@@ -79,7 +80,7 @@ quant_v_int8_kernel(const T *__restrict__ v, int8_t *__restrict__ out,
     const int source_row = initialize ? page * padded_N : page * padded_N % (sh / sn);
     v += static_cast<int64_t>(source_row) * sn;
     const int64_t offset = (static_cast<int64_t>(b) * (pages - 1) + page) * H * D;
-    out += offset * padded_N;
+    out += static_cast<int64_t>(page) * padded_N;
     scale_out += offset;
   }
   const T *base = v + b * sb + h * sh + d0;
@@ -166,7 +167,7 @@ quant_v_int8_kernel(const T *__restrict__ v, int8_t *__restrict__ out,
     load_tile(base + (int64_t)src * sn, tmp);
 #pragma unroll
     for (int di = 0; di < kDTile; ++di) {
-      out[(out_row + di) * padded_N + dst] =
+      out[(out_row + di) * output_N + dst] =
           comfy::float_to_int8_rn(tmp[di] * inv_sc[di]);
     }
   }
@@ -178,7 +179,7 @@ quant_v_int8_kernel(const T *__restrict__ v, int8_t *__restrict__ out,
     const int dst = (src & ~15) | inv_perm16(w);
 #pragma unroll
     for (int di = 0; di < kDTile; ++di)
-      out[(out_row + di) * padded_N + dst] = 0;
+      out[(out_row + di) * output_N + dst] = 0;
   }
 }
 

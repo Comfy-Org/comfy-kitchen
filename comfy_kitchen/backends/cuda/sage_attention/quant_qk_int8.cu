@@ -877,11 +877,13 @@ __global__ void quant_k_decode_pages(
   const int page = initialize ? blockIdx.y : max(0, (length - 1) / page_size - 1) + blockIdx.y;
   if (page >= pages || page * page_size >= length) return;
   const int live = min(page_size, length - page * page_size);
-  const int64_t dst = (static_cast<int64_t>(b) * pages + page) * H + h;
+  const int64_t head = static_cast<int64_t>(b) * H + h;
+  const int output_capacity = pages * page_size;
   const int source_row = initialize ? page * page_size : page * page_size % capacity;
   process_k<nv_bfloat16, 8, 64, 2, 129, true>(
       k + ((static_cast<int64_t>(b) * H + h) * capacity + source_row) * 256,
-      out + dst * page_size * 256, scales + dst * (page_size / 64) * 4,
+      out + (head * output_capacity + page * page_size) * 256,
+      scales + (head * output_capacity / 64 + page * (page_size / 64)) * 4,
       blockIdx.x, live, 256, -1, 256);
 }
 }

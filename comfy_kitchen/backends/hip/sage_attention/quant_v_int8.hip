@@ -60,6 +60,7 @@ __global__ __launch_bounds__(Threads) void quant_v_int8_kernel(
     const int h = bh % H;
     const int b = bh / H;
     const int d0 = d_tile * kDTile;
+    const int output_N = Paged ? pages * padded_N : padded_N;
 
     if constexpr (Paged) {
         const int length = static_cast<int>(position[0]);
@@ -69,7 +70,7 @@ __global__ __launch_bounds__(Threads) void quant_v_int8_kernel(
         const int source_row = initialize ? page * padded_N : page * padded_N % (stride_h / stride_n);
         v += static_cast<int64_t>(source_row) * stride_n;
         const int64_t offset = (static_cast<int64_t>(b) * (pages - 1) + page) * H * D;
-        out += offset * padded_N;
+        out += static_cast<int64_t>(page) * padded_N;
         scale_out += offset;
     }
     const T* base = v + static_cast<int64_t>(b) * stride_b + static_cast<int64_t>(h) * stride_h +
@@ -138,7 +139,7 @@ __global__ __launch_bounds__(Threads) void quant_v_int8_kernel(
         load8<T>(base + static_cast<int64_t>(src) * stride_n, t);
 #pragma unroll
         for (int i = 0; i < kDTile; ++i) {
-            out[(out_row + i) * padded_N + src] = float_to_int8_rn(t[i] * inv_scale[i]);
+            out[(out_row + i) * output_N + src] = float_to_int8_rn(t[i] * inv_scale[i]);
         }
     }
 
@@ -146,7 +147,7 @@ __global__ __launch_bounds__(Threads) void quant_v_int8_kernel(
     // real zero rather than whatever the allocator left behind.
     for (int src = N + static_cast<int>(threadIdx.x); src < padded_N; src += Threads) {
 #pragma unroll
-        for (int i = 0; i < kDTile; ++i) out[(out_row + i) * padded_N + src] = 0;
+        for (int i = 0; i < kDTile; ++i) out[(out_row + i) * output_N + src] = 0;
     }
 }
 

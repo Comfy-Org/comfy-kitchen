@@ -12,17 +12,21 @@ __global__ void int8_decode_pages(
   const int live = min(page_size, max(0, static_cast<int>(lengths[0]) - page * page_size));
   if (!live) return;
   const int64_t slab = (static_cast<int64_t>(b) * pages + page) * heads;
+  const int capacity = pages * page_size;
   qk_int_sv_i8_attn_body<false, 64, 64, 16, 64, 256, DataType::kInt8,
       QuantGranularity::kPerThread, QuantGranularity::kPerThread, float, false,
       nv_bfloat16, ComputeUnit::kCudaCore, MaskMode::kNone, true, true, false,
       false, true, false, uint32_t, true>(
       q + static_cast<int64_t>(b) * heads * rows * 256,
-      k + slab * page_size * 256, v + slab * page_size * 256,
+      k + (static_cast<int64_t>(b) * heads * capacity + page * page_size) * 256,
+      v + static_cast<int64_t>(b) * heads * 256 * capacity + page * page_size,
       partial + slab * rows * 256, lse + slab * rows,
-      qs + b * heads * 64, ks + slab * (page_size / 64) * 4, vs + slab * 256,
+      qs + b * heads * 64,
+      ks + static_cast<int64_t>(b) * heads * (capacity / 64) * 4 + page * (page_size / 64) * 4,
+      vs + slab * 256,
       nullptr, nullptr, 0, 0, 0, 0, 0, rows, live, 1,
-      0, 256, rows * 256, 0, 256, page_size * 256,
-      0, page_size * 256, page_size, 0, 256, rows * 256, 0.0625f, nullptr);
+      0, 256, rows * 256, 0, 256, capacity * 256,
+      0, capacity * 256, capacity, 0, 256, rows * 256, 0.0625f, nullptr);
 }
 
 // Merge page-local normalized outputs in their shared (uncentered) score domain.
