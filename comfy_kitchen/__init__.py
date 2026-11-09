@@ -141,6 +141,7 @@ __all__ = [
     "rms_rope_split_half_",
     "rms_rope_split_half1",
     "rms_rope_split_half1_",
+    "qk_layernorm_kv_interleaved",
     # Geometry
     "delaunay3d",
     "mesh_bvh",
@@ -1016,6 +1017,42 @@ def apply_rope_split_half1_(
     """Apply split-half RoPE in place (inference only)."""
     torch.ops.comfy_kitchen.apply_rope_split_half1_(x, freqs_cis)
     return x
+
+
+def qk_layernorm_kv_interleaved(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_weight: torch.Tensor,
+    k_bias: torch.Tensor,
+    heads: int,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cross-attention prep: per-head QK LayerNorm with k read from the fused kv projection.
+
+    Takes q ``[B, S_q, heads * head_dim]`` and the fused kv ``[B, S_kv, 2 * heads *
+    head_dim]`` whose ``[2 * head_dim]`` block per head holds k then v, and returns the
+    LayerNorm-ed q ``[B, S_q, heads, head_dim]`` and k ``[B, S_kv, heads, head_dim]``
+    (``F.layer_norm`` over ``head_dim`` with the given weight and bias). This is the Hunyuan3D
+    VAE ``QKVMultiheadCrossAttention.forward`` sequence (views, ``torch.split``, ``q_norm`` /
+    ``k_norm``) up to the permutes; v stays the strided view
+    ``kv.view(B, S_kv, heads, 2 * head_dim)[..., head_dim:]``.
+
+    Args:
+        q: Query projection ``[B, S_q, heads * head_dim]``.
+        kv: Fused key / value projection ``[B, S_kv, 2 * heads * head_dim]``.
+        q_weight, q_bias, k_weight, k_bias: LayerNorm affine parameters ``[head_dim]`` in
+            q's dtype.
+        heads: Number of attention heads.
+        eps: LayerNorm epsilon.
+
+    Returns:
+        Tuple of the normalized (query, key) tensors.
+    """
+    return torch.ops.comfy_kitchen.qk_layernorm_kv_interleaved(
+        q, kv, q_weight, q_bias, k_weight, k_bias, int(heads), float(eps)
+    )
 
 
 def quantize_int8_tensorwise(
