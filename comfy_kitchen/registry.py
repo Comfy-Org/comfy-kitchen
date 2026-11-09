@@ -171,10 +171,20 @@ class BackendRegistry:
         if constraints is None:
             return ValidationResult.ok()
 
+        if constraints.excluded_compute_capabilities:
+            # Exclusions apply to the input GPU, never to CPU tensors or a
+            # different CUDA device that happens to be current.
+            capability = next((
+                torch.cuda.get_device_capability(value.device)
+                for value in kwargs.values()
+                if isinstance(value, torch.Tensor) and value.device.type == "cuda"
+            ), None)
+        else:
+            capability = self._compute_capability
         return validate_function_call(
             constraints,
             kwargs,
-            compute_capability=self._compute_capability,
+            compute_capability=capability,
         )
 
     def get_capable_backend(
