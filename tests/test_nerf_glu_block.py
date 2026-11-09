@@ -10,6 +10,7 @@ hidden activation and the output once, so it is compared to eager and to an fp32
 with a tolerance, and its error against the fp32 reference must not exceed eager's.
 """
 
+import contextlib
 import importlib
 
 import pytest
@@ -176,7 +177,7 @@ class TestNerfGluBlockEager:
 
 
 class TestNerfGluBlockCallRule:
-    # the Triton call rule only looks at shapes and strides, so it runs on meta tensors
+    # the Triton call rule only looks at shapes, strides and devices, so it runs on meta tensors
     @pytest.mark.parametrize(
         ("x_shape", "p_cols", "ok"),
         [
@@ -214,6 +215,17 @@ class TestNerfGluBlockCallRule:
         assert not rule(_kwargs(x[..., ::2], p[:, :49152], w[:64])).success
         assert not rule(_kwargs(x[..., :64], p[:, ::2], w[:64])).success
         assert not rule(_kwargs(x[..., :64], p[:, :49152], w[::2])).success
+
+    def test_call_rule_devices(self):
+        # mlp_params and norm_weight must be on x's device
+        x = torch.empty(4, 256, 64, device="meta", dtype=torch.bfloat16)
+        p = torch.empty(4, 49152, device="meta", dtype=torch.bfloat16)
+        w = torch.empty(64, device="meta", dtype=torch.bfloat16)
+        rule = _call_rule()
+        assert rule(_kwargs(x, p, w)).success
+        assert not rule(_kwargs(x, torch.empty_like(p, device="cpu"), w)).success
+        assert not rule(_kwargs(x, p, torch.empty_like(w, device="cpu"))).success
+        assert not rule(_kwargs(torch.empty_like(x, device="cpu"), p, w)).success
 
     def test_call_rule_int32_offsets(self):
         # offsets within a patch of x / out and within an mlp_params row are int32 in the
@@ -273,6 +285,25 @@ class TestNerfGluBlockTriton:
         torch.manual_seed(0)
 
     @staticmethod
+    @contextlib.contextmanager
+    def _served(expected="triton"):
+        # the backend of the implementation the registry returns for each call in the block
+        # (get_implementation wrapped), so the check is on the call that ran, not on a query
+        served = []
+        get_implementation = registry.get_implementation
+
+        def recording(func_name, backend=None, kwargs=None):
+            impl = get_implementation(func_name, backend, kwargs)
+            if func_name == OP:
+                served.append(impl.__module__.rsplit(".", 2)[-2])
+            return impl
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(registry, "get_implementation", recording)
+            yield
+        assert served and all(b == expected for b in served), served
+
+    @staticmethod
     def _check_close(got, x, mlp_params, norm_weight):
         ref = eager_backend.nerf_glu_block(x, mlp_params, norm_weight)
         ref32 = _reference32(x, mlp_params, norm_weight)
@@ -290,8 +321,7 @@ class TestNerfGluBlockTriton:
         x, mlp_params, norm_weight = _inputs(b, n, h, ratio, device="cuda", dtype=torch.bfloat16)
         kwargs = _kwargs(x, mlp_params, norm_weight)
         assert registry.validate_backend_for_call("triton", OP, kwargs).success
-        assert registry.get_capable_backend(OP, kwargs) == "triton"
-        with ck.use_backend("triton"):
+        with self._served(), ck.use_backend("triton"):
             got = ck.nerf_glu_block(x, mlp_params, norm_weight)
         self._check_close(got, x, mlp_params, norm_weight)
 
@@ -306,10 +336,7 @@ class TestNerfGluBlockTriton:
         x = torch.randn(4, 256, 64, device="cuda").to(torch.bfloat16)
         with torch.no_grad():
             params = block.param_generator(s)
-            assert registry.get_capable_backend(OP, _kwargs(x, params, block.norm.weight)) == (
-                "triton"
-            )
-            with ck.use_backend("triton"):
+            with self._served(), ck.use_backend("triton"):
                 got = ck.nerf_glu_block(x, params, block.norm.weight)
             ref = block(x, s)
             assert torch.equal(eager_backend.nerf_glu_block(x, params, block.norm.weight), ref)
@@ -335,8 +362,7 @@ class TestNerfGluBlockTriton:
             xw[..., :64].copy_(x)
             pw[:, : p.shape[1]].copy_(p)
             x, p = xw[..., :64], pw[:, : p.shape[1]]
-        assert registry.get_capable_backend(OP, _kwargs(x, p, w)) == "triton"
-        with ck.use_backend("triton"):
+        with self._served(), ck.use_backend("triton"):
             got = ck.nerf_glu_block(x, p, w)
             want = ck.nerf_glu_block(x.contiguous(), p.contiguous(), w)
         assert got.is_contiguous()
@@ -350,7 +376,7 @@ class TestNerfGluBlockTriton:
         eps32 = torch.finfo(torch.float32).eps
         ref_none = eager_backend.nerf_glu_block(x, p, w)
         assert torch.equal(ref_none, eager_backend.nerf_glu_block(x, p, w, eps32))
-        with ck.use_backend("triton"):
+        with self._served(), ck.use_backend("triton"):
             got_none = ck.nerf_glu_block(x, p, w)
             got_eps32 = ck.nerf_glu_block(x, p, w, eps32)
             got_big = ck.nerf_glu_block(x * 1e-2, p, w, 1e-2)
@@ -362,7 +388,7 @@ class TestNerfGluBlockTriton:
         # an all-zero generated column normalizes to zero (norm clamped to 1e-12), not NaN
         x, p, w = _inputs(2, 256, 64, 4, device="cuda", dtype=torch.bfloat16)
         p.view(2, 3, 64, 256)[:, 0, :, :5] = 0  # five gate columns
-        with ck.use_backend("triton"):
+        with self._served(), ck.use_backend("triton"):
             got = ck.nerf_glu_block(x, p, w)
         self._check_close(got, x, p, w)
 
@@ -370,8 +396,7 @@ class TestNerfGluBlockTriton:
         # Chroma Radiance at 1024 x 1024: one tile of 512 patches, 16 x 16 pixels, H 64, D 256
         x, p, w = _inputs(512, 256, 64, 4, device="cuda", dtype=torch.bfloat16)
         assert p.shape == (512, 49152)
-        assert registry.get_capable_backend(OP, _kwargs(x, p, w)) == "triton"
-        with ck.use_backend("triton"):
+        with self._served(), ck.use_backend("triton"):
             got = ck.nerf_glu_block(x, p, w)
         self._check_close(got, x, p, w)
 

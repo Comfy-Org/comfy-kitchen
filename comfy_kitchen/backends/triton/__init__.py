@@ -138,6 +138,9 @@ def _build_constraints() -> dict:
             return ValidationResult.ok()
         if x.numel() == 0 or params.numel() == 0:
             return ValidationResult.fail("x", "empty tensors are not supported by triton")
+        for name, t in (("mlp_params", params), ("norm_weight", weight)):
+            if t.device != x.device:
+                return ValidationResult.fail(name, "must be on x's device")
         batch_size, num_x, hidden_x = x.shape
         if hidden_x not in (16, 32, 64):
             return ValidationResult.fail("x", "hidden size must be 16, 32 or 64")
