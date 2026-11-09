@@ -395,16 +395,15 @@ class TestSnakeBetaTriton:
         kwargs = {"x": x, "alpha": alpha, "beta": beta, "residual": res}
         op = OP_SUM if form == "sum" else OP
         assert registry.validate_backend_for_call("triton", op, kwargs).success
-        assert registry.get_capable_backend(op, kwargs) == "triton"
         _, ref32 = _reference32(x, alpha, beta, res)
         if form == "sum":
-            with ck.use_backend("triton"):
+            with self._served("triton", op), ck.use_backend("triton"):
                 s, got = ck.snake_beta_with_sum(x, alpha, beta, res)
             s_ref, ref = eager_backend.snake_beta_with_sum(**kwargs)
             assert s.dtype == torch.float16 and s.is_contiguous()
             assert torch.equal(s, s_ref)
         else:
-            with ck.use_backend("triton"):
+            with self._served("triton", op), ck.use_backend("triton"):
                 got = ck.snake_beta(x, alpha, beta, res)
             ref = eager_backend.snake_beta(**kwargs)
         assert got.shape == x.shape and got.dtype == torch.float16 and got.is_contiguous()
@@ -413,7 +412,7 @@ class TestSnakeBetaTriton:
     def test_sum_and_single_outputs_agree(self):
         # the activation is the same with and without the stored sum
         x, alpha, beta, res = self._inputs(256, 5000, True)
-        with ck.use_backend("triton"):
+        with self._served("triton", OP), self._served("triton", OP_SUM), ck.use_backend("triton"):
             s, out_sum = ck.snake_beta_with_sum(x, alpha, beta, res)
             out = ck.snake_beta(x, alpha, beta, res)
         assert torch.equal(out, out_sum)
@@ -431,8 +430,7 @@ class TestSnakeBetaTriton:
     def test_odd_sizes(self, b, c, t):
         x, alpha, beta, res = self._inputs(c, t, True, b=b)
         kwargs = {"x": x, "alpha": alpha, "beta": beta, "residual": res}
-        assert registry.get_capable_backend(OP_SUM, kwargs) == "triton"
-        with ck.use_backend("triton"):
+        with self._served("triton", OP), self._served("triton", OP_SUM), ck.use_backend("triton"):
             got = ck.snake_beta(x, alpha, beta)
             s, got_add = ck.snake_beta_with_sum(x, alpha, beta, res)
         assert _rel(got, eager_backend.snake_beta(x, alpha, beta)) < 2e-3
@@ -444,8 +442,7 @@ class TestSnakeBetaTriton:
         # the second DecoderBlock's SnakeBeta call at its captured size
         x, alpha, beta, res = self._inputs(1024, 30000, True)
         kwargs = {"x": x, "alpha": alpha, "beta": beta, "residual": res}
-        assert registry.get_capable_backend(OP_SUM, kwargs) == "triton"
-        with ck.use_backend("triton"):
+        with self._served("triton", OP_SUM), ck.use_backend("triton"):
             s, got = ck.snake_beta_with_sum(x, alpha, beta, res)
         s_ref, ref = eager_backend.snake_beta_with_sum(**kwargs)
         assert torch.equal(s, s_ref)
