@@ -12,6 +12,7 @@ order; the kernel's own pair order (highest first, the smaller index first on ti
 separately.
 """
 
+import contextlib
 import importlib
 
 import pytest
@@ -309,6 +310,25 @@ class TestMoeTop2DispatchTriton:
         if not registry.is_available("triton"):
             pytest.skip("triton backend not available")
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _served(expected):
+        # the backend of the implementation the registry returns for each call in the block
+        # (get_implementation wrapped), so the check is on the call that ran, not on a query
+        served = []
+        get_implementation = registry.get_implementation
+
+        def recording(func_name, backend=None, kwargs=None):
+            impl = get_implementation(func_name, backend, kwargs)
+            if func_name == OP:
+                served.append(impl.__module__.rsplit(".", 2)[-2])
+            return impl
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(registry, "get_implementation", recording)
+            yield
+        assert served and all(b == expected for b in served), served
+
     @pytest.mark.parametrize(("n", "d"), _SHAPES)
     def test_matches_eager(self, n, d):
         x, logits = _router(n, d, device="cuda", seed=n)
@@ -407,17 +427,18 @@ class TestMoeTop2DispatchTriton:
         assert int(got[4].sum()) == 2 * n
 
     def test_token_cap(self):
-        # the largest accepted token count really launches; one more token goes to eager
+        # the largest accepted token count is served by triton; one more token by eager
         x, logits = _router(2**14, 8, device="cuda", seed=5)
         kwargs = {"x": x, "logits": logits}
-        assert registry.get_capable_backend(OP, kwargs) == "triton"
-        with ck.use_backend("triton"):
+        with self._served("triton"), ck.use_backend("triton"):
             got = ck.moe_top2_dispatch(x, logits)
         _assert_same_dispatch(got, eager_backend.moe_top2_dispatch(**kwargs))
         x, logits = _router(2**14 + 1, 8, device="cuda", seed=5)
         kwargs = {"x": x, "logits": logits}
         assert not registry.validate_backend_for_call("triton", OP, kwargs).success
-        assert registry.get_capable_backend(OP, kwargs) == "eager"
+        with self._served("eager"), ck.use_backend("triton"):
+            got = ck.moe_top2_dispatch(x, logits)
+        _assert_same_dispatch(got, eager_backend.moe_top2_dispatch(**kwargs))
 
     def test_empty_input_goes_to_eager(self):
         x = torch.empty(0, 64, device="cuda", dtype=torch.bfloat16)
