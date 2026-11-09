@@ -54,6 +54,7 @@ __all__ = [
     "scaled_mm_nvfp4",
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
+    "temporal_interleave_upsample_nearest2x",
     "fp16_linear",
     "int8_linear",
     "int8_linear_modulated",
@@ -133,6 +134,7 @@ from .rope import (
 )
 from .sol_attn import sol_attn
 from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
+from .temporal_interleave_upsample_nearest2x import temporal_interleave_upsample_nearest2x
 from .w4a8_int8 import (
     dequantize_w4a8_int8_weight,
     quantize_w4a8_int8_weight,
@@ -703,6 +705,12 @@ def _build_constraints() -> dict:
         },
         default_devices=all_devices,
         call_rules=(window_attention_common_call_rule,),
+    )
+    out["temporal_interleave_upsample_nearest2x"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
+        },
+        default_devices=all_devices,
     )
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in out:
