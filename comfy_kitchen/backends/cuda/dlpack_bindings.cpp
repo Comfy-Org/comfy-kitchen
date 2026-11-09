@@ -82,7 +82,7 @@ extern "C" {
         bool accumulate,
         cudaStream_t stream);
 
-    void launch_apply_rope_kernel(
+    void launch_apply_rope_dispatch(
         const void* xq,
         const void* xk,
         const void* freqs,
@@ -125,7 +125,7 @@ extern "C" {
         bool hi_first,
         cudaStream_t stream);
 
-    void launch_rms_rope_kernel(
+    void launch_rms_rope_dispatch(
         const void* q,
         const void* k,
         const void* freqs,
@@ -767,7 +767,7 @@ void apply_rope(
     int64_t stride_freqs_pair = freqs.stride(5);
 
     // Launch kernel
-    launch_apply_rope_kernel(
+    launch_apply_rope_dispatch(
         xq.data(),
         xk_data,
         freqs.data(),
@@ -870,7 +870,7 @@ void rms_rope(nb::ndarray<nb::device::cuda> q, nb::ndarray<nb::device::cuda> k,
                              "or BF16; scale dtypes must match");
   }
 
-  launch_rms_rope_kernel(
+  launch_rms_rope_dispatch(
       q.data(), k.data(), freqs.data(), q_scale.data(), k_scale.data(),
       q_out.data(), k_out.data(), batch, dim1, dim2, head_dim, rot,
       freqs.shape(0), freqs.shape(1), freqs.shape(2),
@@ -937,7 +937,7 @@ void rms_rope1(nb::ndarray<nb::device::cuda> q,
         "rms_rope1 frequencies and scale must be FP32, FP16, or BF16");
   }
 
-  launch_rms_rope_kernel(
+  launch_rms_rope_dispatch(
       q.data(), nullptr, freqs.data(), q_scale.data(), nullptr, q_out.data(),
       nullptr, batch, dim1, dim2, head_dim, head_dim,
       freqs.shape(0), freqs.shape(1), freqs.shape(2),

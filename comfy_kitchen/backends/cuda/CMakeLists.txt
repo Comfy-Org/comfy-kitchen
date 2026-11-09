@@ -135,6 +135,7 @@ set(CUDA_SOURCES
     ops/convrot_w4a4.cu
     ops/turing_int4.cu
     ops/rms_rope.cu
+    ops/rope_reuse.cu
     ops/na3d.cu
     sage_attention/sol_attn.cu
     sage_attention/sol_attn_preprocess.cu
