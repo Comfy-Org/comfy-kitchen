@@ -5,11 +5,13 @@
 The eager backend is the sequence ComfyUI's Qwen-Image Attention.forward runs today (the
 view / transpose / contiguous of the six projections, the four RMSNorms, the txt-then-img
 torch.cat of q, k and v, and apply_rope1 on the joint q and k), so it must match the stock
-code exactly, including the output layout the attention call reads. On CUDA the Triton kernel
+code exactly, including the output layout the attention call reads. Where stock apply_rope1
+runs on the HIP backend (a ROCm build with the HIP backend registered), the Triton kernel rounds
+like the unfused chain (F.rms_norm, then apply_rope1, which the HIP backend rounds as eager
+does), so q and k must equal that chain run with the backend the registry picks. Elsewhere it
 computes the norm and the rotation in fp32 and rounds once, so q and k are compared to eager
 and to an fp32 reference with a tolerance and must never be further from the fp32 reference
-than eager; on HIP it rounds like the unfused chain (F.rms_norm, then the HIP apply_rope1,
-which rounds as eager does), so q and k must equal that chain. v is a copy and must be exact.
+than eager. v is a copy and must be exact.
 """
 
 import contextlib
@@ -366,14 +368,14 @@ class TestJointQkRmsRopeCatTriton:
         assert served and all(b == expected for b in served), served
 
     @staticmethod
-    def _numerics(got, ref, projections, weights, freqs, heads, eps=1e-6):
-        # ref: the eager backend's output for the same inputs
+    def _numerics(got, ref, projections, weights, freqs, heads, eps=1e-6, rope=None):
+        # ref: the eager backend's output for the same inputs; rope: the backend for the stock
+        # chain's apply_rope1, None for the one the registry picks (as in ComfyUI)
         kernel = importlib.import_module("comfy_kitchen.backends.triton." + OP)
-        if kernel._STOCK_ROUNDING:
-            # the unfused chain: F.rms_norm, then the HIP apply_rope1 (eager rounds the same)
-            rope = "hip" if registry.is_available("hip") else "eager"
+        if kernel._rounds_like_stock():
+            # the unfused chain: F.rms_norm, then apply_rope1
             norms = [_cast_norm(w, eps) for w in weights]
-            with ck.use_backend(rope):
+            with contextlib.nullcontext() if rope is None else ck.use_backend(rope):
                 stock = _stock_prep(projections, norms, freqs, heads)
             for g, s in zip(got, stock, strict=True):
                 assert torch.equal(g, s)
@@ -471,6 +473,7 @@ class TestJointQkRmsRopeCatTriton:
     def test_both_launch_configs(self, monkeypatch, hip):
         # the CUDA (one head per program) and HIP (head loop) configurations, on whichever GPU
         kernel = importlib.import_module("comfy_kitchen.backends.triton." + OP)
+        kernel._rounds_like_stock()  # the rounding mode of this build, before _HIP is patched
         monkeypatch.setattr(kernel, "_HIP", hip)
         assert kernel._launch_config()[2] == hip
         projections, weights, freqs = _inputs(
@@ -480,6 +483,27 @@ class TestJointQkRmsRopeCatTriton:
         got = kernel.joint_qk_rms_rope_cat(**kwargs)
         ref = eager_backend.joint_qk_rms_rope_cat(**kwargs)
         self._numerics(got, ref, projections, weights, freqs, 24)
+
+    def test_rounding_mode_follows_stock_rope(self):
+        # stock rounding exactly when stock apply_rope1 dispatches to the HIP backend
+        kernel = importlib.import_module("comfy_kitchen.backends.triton." + OP)
+        stock_rope = registry.get_capable_backend("apply_rope1")
+        assert kernel._rounds_like_stock() == (stock_rope == "hip")
+
+    @pytest.mark.parametrize("hip", [False, True])
+    def test_stock_rounding_branch(self, monkeypatch, hip):
+        # the stock-rounding branch on whichever GPU, in both launch configurations: q and k
+        # equal F.rms_norm, then the eager apply_rope1 (which the HIP apply_rope1 rounds as)
+        kernel = importlib.import_module("comfy_kitchen.backends.triton." + OP)
+        monkeypatch.setattr(kernel, "_HIP", hip)
+        monkeypatch.setattr(kernel, "_stock_rounding", True)
+        projections, weights, freqs = _inputs(
+            2, 150, 11, 24, 128, device="cuda", dtype=torch.bfloat16, freqs_batch=2
+        )
+        kwargs = _kwargs(projections, weights, freqs, 24)
+        got = kernel.joint_qk_rms_rope_cat(**kwargs)
+        ref = eager_backend.joint_qk_rms_rope_cat(**kwargs)
+        self._numerics(got, ref, projections, weights, freqs, 24, rope="eager")
 
     def test_real_shape_served(self):
         # the Qwen-Image 2512 cond call at its captured size: L_img 6889, L_txt 210

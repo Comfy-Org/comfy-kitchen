@@ -10,20 +10,27 @@ all heads (see the launch configuration below):
 
     q, k: per-head RMSNorm with the stream's weight, then the interleaved RoPE
           (pair j = elements 2j, 2j + 1; out[2j + i] = f[j, i, 0] * x[2j] + f[j, i, 1] * x[2j + 1])
-          from the [.., head_dim / 2, 2, 2] table
-          CUDA: in fp32, rounded once to the output dtype
-          HIP:  with the unfused path's rounding, so q and k equal it bit for bit: the
-                normalized value rounded to bf16 as F.rms_norm stores it (same summation
-                order), and the rotation rounded as the HIP apply_rope1 kernel and eager do
+          from the [.., head_dim / 2, 2, 2] table, in one of two rounding modes:
+          stock rounding: the unfused path's rounding, so q and k equal the unfused chain
+                (F.rms_norm, then apply_rope1 on the HIP backend) bit for bit: the normalized
+                value rounded to bf16 as F.rms_norm stores it (same summation order), and
+                the rotation rounded as the HIP apply_rope1 kernel and eager do
+          otherwise: in fp32, rounded once to the output dtype
     v:    copied
 
 so the heads-first copies, the normalized tensors and the unrotated concatenations are never
 written out.
 
-Launch configuration (same kernel body), picked per GPU from the measured shapes:
-  CUDA: grid (L tiles, heads, B), block_l 32, 4 warps (RTX 5090)
+Stock rounding is used only on a ROCm build where the HIP backend is registered with
+apply_rope1 (it is then first in the backend priority, so stock apply_rope1 runs it). On CUDA
+builds, and on ROCm builds without the HIP backend (an arch it does not support, or the
+extension not built), stock apply_rope1 runs another backend with another rounding, and q and
+k are rounded once. Decided on the first call and kept for the process.
+
+Launch configuration (same kernel body), picked per build:
+  CUDA: grid (L tiles, heads, B), block_l 32, 4 warps
   HIP:  grid (L tiles, 1, B), block_l 16, 4 warps, loop over the heads inside the program so
-        the rows' RoPE table tile is loaded once (Radeon 8060S)
+        the rows' RoPE table tile is loaded once
 """
 
 import torch
@@ -31,9 +38,23 @@ import torch
 import triton
 import triton.language as tl
 
+from comfy_kitchen.registry import registry
+
 _HIP = bool(torch.version.hip)  # picks the launch configuration
-# HIP builds round q / k like the unfused path (F.rms_norm, then the HIP apply_rope1)
-_STOCK_ROUNDING = bool(torch.version.hip)
+_stock_rounding: bool | None = None  # set by _rounds_like_stock on the first call
+
+
+def _rounds_like_stock() -> bool:
+    # Stock rounding iff stock apply_rope1 runs on the HIP backend: a ROCm build with the HIP
+    # backend registered for apply_rope1 (comfy_kitchen then puts it first in the priority).
+    # Read once; the backends are registered when comfy_kitchen is imported.
+    global _stock_rounding
+    if _stock_rounding is None:
+        hip = registry.list_backends().get("hip", {})
+        _stock_rounding = bool(
+            _HIP and registry.is_available("hip") and "apply_rope1" in hip.get("capabilities", ())
+        )
+    return _stock_rounding
 
 
 @triton.jit
@@ -50,8 +71,9 @@ def _fold(s, block_l: tl.constexpr, half: tl.constexpr):
 
 @triton.jit
 def _sum_squares(x, block_l: tl.constexpr, head_dim: tl.constexpr):
-    # F.rms_norm's summation order on CUDA (vectorized_layer_norm_kernel): lane t adds the
-    # squares of elements 4t .. 4t + 3 in turn, then the lanes reduce by shuffle-down
+    # the summation order of ATen's vectorized layer-norm reduction (vectorized_layer_norm_kernel),
+    # which F.rms_norm runs: lane t adds the squares of elements 4t .. 4t + 3 in turn, then
+    # the lanes reduce by shuffle-down
     lanes: tl.constexpr = head_dim // 4
     e, o = tl.split(tl.reshape(x * x, (block_l, lanes, 2, 2)))
     e0, e1 = tl.split(e)
@@ -341,7 +363,7 @@ def joint_qk_rms_rope_cat(
         head_dim=head_dim,
         block_l=block_l,
         head_loop=head_loop,
-        stock_rounding=_STOCK_ROUNDING,
+        stock_rounding=_rounds_like_stock(),
         num_warps=num_warps,
     )
     return out_q, out_k, out_v

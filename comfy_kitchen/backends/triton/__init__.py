@@ -130,10 +130,7 @@ def _build_constraints() -> dict:
         return ValidationResult.ok()
 
     def _joint_qk_rms_rope_cat_call_rule(kwargs):
-        # No size threshold: at the Qwen-Image 2512 / Edit 2511 shapes measured (bf16, 24 heads
-        # of 128, L_img 6889 to 12336, L_txt 46 to 425) the kernel was faster than ComfyUI's
-        # current path at every shape on an RTX 5090 and on a Radeon 8060S (per-call numbers in
-        # the PR that added this op).
+        # No size threshold: every call that passes the checks below goes to the kernel.
         img_q, txt_q = kwargs.get("img_q"), kwargs.get("txt_q")
         freqs_cis, heads = kwargs.get("freqs_cis"), kwargs.get("heads")
         if img_q is None or txt_q is None or freqs_cis is None or heads is None:
@@ -384,7 +381,7 @@ def _build_constraints() -> dict:
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
     )
-    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both
+    # cuda covers ROCm builds of PyTorch (device type "cuda")
     bf16 = frozenset({torch.bfloat16})
     out["joint_qk_rms_rope_cat"] = FunctionConstraints(
         params={
