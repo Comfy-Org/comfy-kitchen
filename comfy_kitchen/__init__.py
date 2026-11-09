@@ -70,6 +70,7 @@ __all__ = [
     "fp16_conv3d",
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
+    "nerf_glu_block",
     "rms_adaln",
     # Attention
     "PrequantizedInt8Attention",
@@ -455,6 +456,24 @@ def group_norm_stats3d(x: torch.Tensor, num_groups: int = 32, eps: float = 1e-6)
     """Per-frame GroupNorm statistics of x [B, C, T, H, W]: float32 [B*T, num_groups, 2]
     of (mean, rstd), for group_norm_silu_pad3d's stats argument."""
     return torch.ops.comfy_kitchen.group_norm_stats3d(x, num_groups, eps)
+
+
+def nerf_glu_block(
+    x: torch.Tensor,
+    mlp_params: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float | None = None,
+) -> torch.Tensor:
+    """Chroma Radiance's NeRF GLU block after its parameter generator, in one pass.
+
+    x ``[B, N, H]`` (N pixels of each of B patches), mlp_params ``[B, 3 * H * D]`` (the
+    ``param_generator`` output: one gate ``[H, D]``, value ``[H, D]`` and output ``[D, H]``
+    matrix per patch), norm_weight ``[H]``. Returns
+    ``bmm(silu(bmm(n, gate)) * bmm(n, value), w2) + x`` with ``n = rms_norm(x, norm_weight, eps)``
+    and every generated matrix column-normalized (``F.normalize(dim=-2)``): ``NerfGLUBlock.forward``
+    from the ``chunk`` on. eps None resolves as ``F.rms_norm`` does (the module passes None).
+    """
+    return torch.ops.comfy_kitchen.nerf_glu_block(x, mlp_params, norm_weight, eps)
 
 
 def rms_adaln(
