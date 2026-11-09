@@ -176,6 +176,61 @@ class TestConvBiasLeakyReluEager:
         kwargs = _kwargs(_conv_out(1, 64, 34, 60, "contiguous"), _bias(64))
         assert registry.get_capable_backend(OP, kwargs) == "eager"
 
+    @staticmethod
+    def _grad_case(case, call):
+        # what autograd and the version counter saw, or the error raised
+        leaf = torch.randn(1, 8, 4, 4, requires_grad=case != "bias")
+        bias = torch.randn(8, requires_grad=case != "x_leaf")
+        x = leaf if case == "x_leaf" else leaf * 1
+        version = x._version
+        try:
+            call(x, bias)
+        except Exception as e:
+            return ("raised", type(e))
+        grad_fn = None if x.grad_fn is None else type(x.grad_fn).__name__
+        if x.requires_grad:
+            x.sum().backward()
+        return (
+            x._version - version,
+            grad_fn,
+            leaf.grad,
+            bias.grad,
+            x.detach(),
+        )
+
+    @pytest.mark.parametrize("case", ["x_nonleaf", "x_leaf", "bias"])
+    def test_requires_grad_runs_the_custom_op(self, case):
+        torch.manual_seed(0)
+        public = self._grad_case(case, ck.conv_bias_leaky_relu_)
+        torch.manual_seed(0)
+        op = self._grad_case(
+            case, lambda x, bias: torch.ops.comfy_kitchen.conv_bias_leaky_relu_(x, bias, 0.2)
+        )
+        assert len(public) == len(op)
+        for a, b in zip(public, op, strict=True):
+            if isinstance(a, torch.Tensor):
+                assert isinstance(b, torch.Tensor) and torch.equal(a, b)
+            else:
+                assert a == b
+
+    @pytest.mark.parametrize("mode", [torch.no_grad, torch.inference_mode])
+    def test_no_grad_skips_the_custom_op(self, mode, monkeypatch):
+        # small shapes run eager without the op dispatch or the registry lookup, also when x
+        # and bias require grad
+        def custom_op_path(*args, **kwargs):
+            raise AssertionError("custom op path taken")
+
+        monkeypatch.setattr(registry, "get_implementation", custom_op_path)
+        x = _conv_out(1, 8, 4, 4, "contiguous", dtype=torch.float32).requires_grad_()
+        bias = _bias(8, dtype=torch.float32).requires_grad_()
+        ref = _stock_chain(x.detach().clone(), bias.detach())
+        with pytest.raises(AssertionError, match="custom op path taken"):
+            ck.conv_bias_leaky_relu_(x.detach().clone(), bias)
+        with mode():
+            out = ck.conv_bias_leaky_relu_(x, bias)
+        assert out is x
+        assert torch.equal(out.detach(), ref)
+
 
 def _meta(n, c, h, w, layout="contiguous", dtype=torch.float16):
     x = torch.empty(n, c, h, w, device="meta", dtype=dtype)

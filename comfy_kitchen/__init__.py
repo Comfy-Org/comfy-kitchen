@@ -406,7 +406,8 @@ def adaln(
 def conv_bias_leaky_relu_(
     x: torch.Tensor, bias: torch.Tensor, negative_slope: float = 0.2
 ) -> torch.Tensor:
-    """Conv bias add + LeakyReLU in place on a conv output computed without its bias.
+    """Conv bias add + LeakyReLU in place on a conv output computed without its bias
+    (inference only).
 
     x ``[N, C, H, W]`` is the output of ``F.conv2d(input, weight, None, ...)``; writes
     ``leaky_relu(x + bias[None, :, None, None], negative_slope)`` into x and returns it: the
@@ -415,7 +416,14 @@ def conv_bias_leaky_relu_(
     x's dtype before the activation, as in the stock chain.
     """
     negative_slope = float(negative_slope)
-    if type(x) is not torch.Tensor or x.is_meta or torch.compiler.is_compiling():
+    if (
+        type(x) is not torch.Tensor
+        or x.is_meta
+        or torch.compiler.is_compiling()
+        or (torch.is_grad_enabled() and (x.requires_grad or bias.requires_grad))
+    ):
+        # under autograd keep the custom op, as for the other in-place ops here, so the graph
+        # and x's version counter are the same as through torch.ops
         torch.ops.comfy_kitchen.conv_bias_leaky_relu_(x, bias, negative_slope)
         return x
     # the custom op's body without the op dispatch, which costs about as much as the kernels
