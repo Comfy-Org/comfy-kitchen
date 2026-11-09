@@ -43,7 +43,7 @@ inline bool overlap(const void *a, const void *b, uint64_t bytes) {
   return x <= y ? y - x < bytes : x - y < bytes;
 }
 
-// Reuse each general FP32 rotation matrix across up to 16 heads.
+// Reuse each general FP32 rotation matrix across up to 32 heads.
 // Four input buffers hide load latency; FP32 RMS statistics and the
 // input-dtype normalization materialization are preserved.
 template <typename T,int V> union Packed {
@@ -97,21 +97,21 @@ __device__ __forceinline__ void readrow(Packed<T,8> &v, const T *x,
   }
   if constexpr (SPLIT) {
     v.v2[0] =
-        *reinterpret_cast<const uint64_t *>(x + (uint64_t)row * D + lane * 4);
-    v.v2[1] = *reinterpret_cast<const uint64_t *>(x + (uint64_t)row * D + D/2 +
+        *reinterpret_cast<const uint64_t *>(x + row + lane * 4);
+    v.v2[1] = *reinterpret_cast<const uint64_t *>(x + row + D/2 +
                                                   lane * 4);
   } else
     v.v4[0] =
-        *reinterpret_cast<const uint4 *>(x + (uint64_t)row * D + lane * 8);
+        *reinterpret_cast<const uint4 *>(x + row + lane * 8);
 }
 template <typename T,bool SPLIT, bool WF32,bool RMS>
-__global__ void
-rope_reuse_kernel(const T *q, const T *k,
+__device__ __forceinline__ void
+rope_reuse_body(const T *q, const T *k,
                    const float4 *__restrict__ f, const void *__restrict__ wq,
                    const void *__restrict__ wk, T *oq,
                    T *ok, int B, int H, int N, int D, bool bnhd, bool dual,
                    float eps) {
-  constexpr int G = 16, STAGES = 4, V = 8, P = 4;
+  constexpr int G = 32, STAGES = 4, V = 8, P = 4;
   int lane = threadIdx.x % 32;
   const int width=D/8, groups=32/width;
   const int head_groups=(dual&&width<32)?groups/2:groups;
@@ -123,20 +123,10 @@ rope_reuse_kernel(const T *q, const T *k,
   const T *x = isk ? k : q;
   T *y = isk ? ok : oq;
   const void *w = isk ? wk : wq;
-  const uint64_t head_tiles = (H + G - 1) / G,
-                 tiles = (uint64_t)B * (uint64_t)N * head_tiles;
-  const bool pow2 = (N & (N - 1)) == 0;
-  const int tsh = __ffs(N) - 1;
-  for (uint64_t tile = warp >> duplicate;
-       tile < tiles; tile += (uint64_t(gridDim.x) * (blockDim.x >> 5)) >> duplicate) {
-    uint64_t token, bh, batch, hb;
-    if (pow2) {
-      token = tile & ((uint64_t)N - 1);
-      bh = tile >> tsh;
-    } else {
-      bh = tile / (uint64_t)N;
-      token = tile - bh * (uint64_t)N;
-    }
+  const uint64_t head_tiles = (H + G - 1) / G;
+  for (uint64_t token = warp >> duplicate;
+       token < uint64_t(N); token += (uint64_t(gridDim.x) * (blockDim.x >> 5)) >> duplicate) {
+    uint64_t bh=blockIdx.y, batch, hb;
     if (B == 1) {
       batch = 0;
       hb = bh * G;
@@ -167,41 +157,38 @@ rope_reuse_kernel(const T *q, const T *k,
       }
     }
     Packed<T,V> buf[STAGES];
+    const uint64_t stride=bnhd?uint64_t(D):uint64_t(N)*D;
+    uint64_t row=(bnhd ? (batch*uint64_t(N)+token)*H+hb : (batch*uint64_t(H)+hb)*N+token)*D;
 #pragma unroll
-    for (int s = 0; s < STAGES; s++) {
-      int head = hb + s;
-      uint64_t row = bnhd ? (batch * (uint64_t)N + token) * (uint64_t)H + head
-                          : (batch * (uint64_t)H + head) * (uint64_t)N + token;
-      readrow<T,SPLIT>(buf[s], x, row, lc, D, head < H && s < iterations);
-    }
+    for(int s=0;s<STAGES;++s)
+      readrow<T,SPLIT>(buf[s],x,row+uint64_t(s)*stride,lc,D,hb+s<H && s<iterations);
+    for(int chunk=0;chunk<iterations;chunk+=STAGES) {
 #pragma unroll
-    for (int g = 0; g < G; g++) {
+    for(int stage=0;stage<STAGES;++stage) {
+      const int g=chunk+stage;
       if(g>=iterations)break;
-      int head = hb + g;
-      bool valid = head < H;
-      uint64_t row = bnhd ? (batch * (uint64_t)N + token) * (uint64_t)H + head
-                          : (batch * (uint64_t)H + head) * (uint64_t)N + token;
+      const int head=hb+g;
+      const bool valid=head<H;
       float2 xx[P];
       float sum = 0;
       if constexpr (SPLIT) {
 #pragma unroll
         for (int j = 0; j < P / 2; j++) {
-          float2 l = expand2(buf[g % STAGES].h[j]),
-                 h = expand2(buf[g % STAGES].h[j + P / 2]);
+          float2 l = expand2(buf[stage].h[j]),
+                 h = expand2(buf[stage].h[j + P / 2]);
           xx[2 * j] = make_float2(l.x, h.x);
           xx[2 * j + 1] = make_float2(l.y, h.y);
         }
       } else {
 #pragma unroll
         for (int p = 0; p < P; p++)
-          xx[p] = expand2(buf[g % STAGES].h[p]);
+          xx[p] = expand2(buf[stage].h[p]);
       }
       if constexpr (STAGES < G) {
         if (g + STAGES < iterations) {
           int fh = hb + g + STAGES;
-          uint64_t fr = bnhd ? (batch * (uint64_t)N + token) * (uint64_t)H + fh
-                             : (batch * (uint64_t)H + fh) * (uint64_t)N + token;
-          readrow<T,SPLIT>(buf[g % STAGES], x, fr, lc, D, fh < H);
+          uint64_t fr=row+uint64_t(STAGES)*stride;
+          readrow<T,SPLIT>(buf[stage], x, fr, lc, D, fh < H);
         }
       }
 #pragma unroll
@@ -240,13 +227,26 @@ rope_reuse_kernel(const T *q, const T *k,
       }
       if (valid) {
         if constexpr (SPLIT) {
-          storep<P>(y + (uint64_t)row * D + lc * P, lo);
-          storep<P>(y + (uint64_t)row * D + D/2 + lc * P, hi);
+          storep<P>(y + row + lc * P, lo);
+          storep<P>(y + row + D/2 + lc * P, hi);
         } else
-          storep<V>(y + (uint64_t)row * D + lc * V, out);
+          storep<V>(y + row + lc * V, out);
       }
+      row+=stride;
+    }
     }
   }
+}
+
+template <typename T,bool SPLIT, bool WF32,bool RMS>
+__global__
+#if __CUDA_ARCH__ != 900
+__launch_bounds__(128,RMS?6:7)
+#endif
+void rope_reuse_kernel(const T *q, const T *k, const float4 *f,
+ const void *wq,const void *wk,T *oq,T *ok,int B,int H,int N,int D,bool bnhd,bool dual,float eps) {
+ if(D==128) rope_reuse_body<T,SPLIT,WF32,RMS>(q,k,f,wq,wk,oq,ok,B,H,N,128,bnhd,dual,eps);
+ else rope_reuse_body<T,SPLIT,WF32,RMS>(q,k,f,wq,wk,oq,ok,B,H,N,D,bnhd,dual,eps);
 }
 
 template <typename T,bool Split, bool FP32Weights,bool RMS>
@@ -256,10 +256,10 @@ launch_rope_reuse(const void *q, const void *k, const void *freqs,
                           int batch, int heads, int tokens, int D, bool bnhd, bool dual,
                           float epsilon, cudaStream_t stream) {
   const int threads = Split && !FP32Weights ? 64 : 128;
-  const int tiles = batch * tokens * ((heads + 15) / 16);
+  const int tiles = tokens;
   const int warps=tiles*((D==256&&dual)?2:1);
   const int blocks = (warps + threads / 32 - 1) / (threads / 32);
-  rope_reuse_kernel<T,Split, FP32Weights,RMS><<<blocks, threads, 0, stream>>>(
+  rope_reuse_kernel<T,Split, FP32Weights,RMS><<<dim3(blocks,batch*((heads+31)/32)), threads, 0, stream>>>(
       static_cast<const T *>(q),
       static_cast<const T *>(k), static_cast<const float4 *>(freqs),
       wq, wk, static_cast<T *>(oq),
