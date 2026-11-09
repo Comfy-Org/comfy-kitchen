@@ -12,6 +12,7 @@ than eager; on HIP it rounds like the unfused chain (F.rms_norm, then the HIP ap
 which rounds as eager does), so q and k must equal that chain. v is a copy and must be exact.
 """
 
+import contextlib
 import importlib
 
 import pytest
@@ -346,6 +347,25 @@ class TestJointQkRmsRopeCatTriton:
             pytest.skip("triton backend not available")
 
     @staticmethod
+    @contextlib.contextmanager
+    def _served(expected):
+        # the backend of the implementation the registry returns for each call in the block
+        # (get_implementation wrapped), so the check is on the call that ran, not on a query
+        served = []
+        get_implementation = registry.get_implementation
+
+        def recording(func_name, backend=None, kwargs=None):
+            impl = get_implementation(func_name, backend, kwargs)
+            if func_name == OP:
+                served.append(impl.__module__.rsplit(".", 2)[-2])
+            return impl
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(registry, "get_implementation", recording)
+            yield
+        assert served and all(b == expected for b in served), served
+
+    @staticmethod
     def _numerics(got, ref, projections, weights, freqs, heads, eps=1e-6):
         # ref: the eager backend's output for the same inputs
         kernel = importlib.import_module("comfy_kitchen.backends.triton." + OP)
@@ -372,9 +392,7 @@ class TestJointQkRmsRopeCatTriton:
     @classmethod
     def _check(cls, projections, weights, freqs, heads, eps=1e-6):
         kwargs = _kwargs(projections, weights, freqs, heads, eps)
-        assert registry.validate_backend_for_call("triton", OP, kwargs).success
-        assert registry.get_capable_backend(OP, kwargs) == "triton"
-        with ck.use_backend("triton"):
+        with cls._served("triton"), ck.use_backend("triton"):
             got = _kitchen(projections, weights, freqs, heads, eps)
         ref = eager_backend.joint_qk_rms_rope_cat(**kwargs)
         for g, r in zip(got, ref, strict=True):
@@ -476,7 +494,7 @@ class TestJointQkRmsRopeCatTriton:
             kwargs = _kwargs(projections, weights, freqs, heads)
             assert not registry.validate_backend_for_call("triton", OP, kwargs).success
             assert registry.get_capable_backend(OP, kwargs) == "eager"
-            with ck.use_backend("triton"):
+            with self._served("eager"), ck.use_backend("triton"):
                 got = _kitchen(projections, weights, freqs, heads)
             with ck.use_backend("eager"):
                 ref = _stock_prep(projections, [_cast_norm(w) for w in weights], freqs, heads)
