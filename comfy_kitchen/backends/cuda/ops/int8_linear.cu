@@ -1,6 +1,5 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
- * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -1977,23 +1976,28 @@ quantize_int8_convrot_cluster_kernel(
 } // namespace
 
 #ifdef COMFY_CONVROT_SPECIALIZATION_ONLY
+static bool convrot_has_image(int cc) {
+    constexpr int images[] = {COMFY_CONVROT_CCS};
+    for (int image : images) {
+#ifdef COMFY_CONVROT_ASYNC_ONLY
+        // SM80/86 images also serve SM86–89; retain the SM80 fallback.
+        if (cc >= 86 && cc < 90 && (image <= 86 || cc == image))
+#else
+        // TMA uses architecture-specific images, without minor-version compatibility.
+        if (cc == image)
+#endif
+            return true;
+    }
+    return false;
+}
+
 #ifdef COMFY_CONVROT_ASYNC_ONLY
 bool try_quantize_int8_convrot_bf16_vec_4096(const void *input, void *output, float *scales,
                                              int64_t rows, int cc, cudaStream_t stream) {
     if (rows <= 8 || rows > std::numeric_limits<int>::max() ||
         reinterpret_cast<uintptr_t>(input) % 16 || reinterpret_cast<uintptr_t>(output) % 16)
         return false;
-    bool supported = false;
-#if defined(COMFY_CONVROT_SM80) || defined(COMFY_CONVROT_SM86)
-    supported |= cc >= 86 && cc <= 89;
-#endif
-#ifdef COMFY_CONVROT_SM87
-    supported |= cc == 87;
-#endif
-#ifdef COMFY_CONVROT_SM89
-    supported |= cc == 89;
-#endif
-    if (!supported)
+    if (!convrot_has_image(cc))
         return false;
     quantize_int8_rowwise_convrot_bf16_vec_kernel<<<static_cast<unsigned int>(rows), 64, 0,
                                                     stream>>>(
@@ -2011,26 +2015,7 @@ bool try_quantize_int8_convrot_bf16_4096(const void *input, void *output, float 
     if (rows <= 8 || rows > std::numeric_limits<int>::max() ||
         reinterpret_cast<uintptr_t>(input) % 16 || reinterpret_cast<uintptr_t>(output) % 16)
         return false;
-    bool supported = false;
-#ifdef COMFY_CONVROT_SM90
-    supported |= cc == 90;
-#endif
-#ifdef COMFY_CONVROT_SM100
-    supported |= cc == 100;
-#endif
-#ifdef COMFY_CONVROT_SM103
-    supported |= cc == 103;
-#endif
-#ifdef COMFY_CONVROT_SM110
-    supported |= cc == 110;
-#endif
-#ifdef COMFY_CONVROT_SM121
-    supported |= cc == 121;
-#endif
-#ifdef COMFY_CONVROT_SM120
-    supported |= cc == 120;
-#endif
-    if (!supported)
+    if (!convrot_has_image(cc))
         return false;
     // Resolve once, without adding a libcuda dependency. Encoding is host-only
     // and uses the current call's pointer and dimensions, including in capture.
