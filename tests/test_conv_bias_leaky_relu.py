@@ -213,16 +213,53 @@ class TestConvBiasLeakyReluEager:
             else:
                 assert a == b
 
-    @pytest.mark.parametrize("mode", [torch.no_grad, torch.inference_mode])
-    def test_no_grad_skips_the_custom_op(self, mode, monkeypatch):
-        # small shapes run eager without the op dispatch or the registry lookup, also when x
-        # and bias require grad
+    @staticmethod
+    def _saved_x_case(call):
+        # x requires no grad but y = x * w saves it for w's gradient: writing x in place must
+        # bump its version counter so that backward raises
+        x = torch.randn(1, 8, 4, 4)
+        w = torch.randn(1, 8, 4, 4, requires_grad=True)
+        bias = torch.randn(8)
+        y = x * w
+        call(x, bias)
+        with pytest.raises(RuntimeError) as e:
+            y.sum().backward()
+        return str(e.value)
+
+    def test_x_saved_by_another_op_raises_as_the_custom_op(self):
+        public = self._saved_x_case(ck.conv_bias_leaky_relu_)
+        op = self._saved_x_case(
+            lambda x, bias: torch.ops.comfy_kitchen.conv_bias_leaky_relu_(x, bias, 0.2)
+        )
+        assert "modified by an inplace operation" in public
+        assert public == op
+
+    def test_grad_mode_runs_the_custom_op(self, monkeypatch):
+        # in grad mode the custom op runs also when neither x nor bias requires grad
         def custom_op_path(*args, **kwargs):
             raise AssertionError("custom op path taken")
 
         monkeypatch.setattr(registry, "get_implementation", custom_op_path)
-        x = _conv_out(1, 8, 4, 4, "contiguous", dtype=torch.float32).requires_grad_()
-        bias = _bias(8, dtype=torch.float32).requires_grad_()
+        x = _conv_out(1, 8, 4, 4, "contiguous", dtype=torch.float32)
+        bias = _bias(8, dtype=torch.float32)
+        assert torch.is_grad_enabled()
+        with pytest.raises(AssertionError, match="custom op path taken"):
+            ck.conv_bias_leaky_relu_(x, bias)
+
+    @pytest.mark.parametrize("mode", [torch.no_grad, torch.inference_mode])
+    @pytest.mark.parametrize("requires_grad", [False, True])
+    def test_no_grad_skips_the_custom_op(self, mode, requires_grad, monkeypatch):
+        # small shapes run eager without the op dispatch or the registry lookup, whether or not
+        # x and bias require grad
+        def custom_op_path(*args, **kwargs):
+            raise AssertionError("custom op path taken")
+
+        monkeypatch.setattr(registry, "get_implementation", custom_op_path)
+        x = _conv_out(1, 8, 4, 4, "contiguous", dtype=torch.float32)
+        bias = _bias(8, dtype=torch.float32)
+        if requires_grad:
+            x.requires_grad_()
+            bias.requires_grad_()
         ref = _stock_chain(x.detach().clone(), bias.detach())
         with pytest.raises(AssertionError, match="custom op path taken"):
             ck.conv_bias_leaky_relu_(x.detach().clone(), bias)

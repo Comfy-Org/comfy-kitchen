@@ -141,10 +141,8 @@ def _build_constraints() -> dict:
 
     def _conv_bias_leaky_relu_call_rule(kwargs):
         # Size threshold on the pixels per channel plane: smaller planes run eager. On CUDA
-        # (not ROCm) builds, tensors below an element count threshold also run eager. Both set
-        # from per-call measurements on the FILM pyramid levels against ComfyUI's current path:
-        # the plane threshold on both GPUs listed in the PR that added this op, the element
-        # count threshold on the CUDA GPU listed there.
+        # (not ROCm) builds, tensors below an element count threshold also run eager. The PR
+        # that added this op lists the FILM pyramid levels each threshold was set on.
         x, bias = kwargs.get("x"), kwargs.get("bias")
         if x is None or bias is None:
             return ValidationResult.ok()
@@ -382,7 +380,7 @@ def _build_constraints() -> dict:
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
     )
-    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both
+    # cuda covers ROCm builds of PyTorch (device type "cuda")
     out["conv_bias_leaky_relu_"] = FunctionConstraints(
         params={
             "x": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(4),)),

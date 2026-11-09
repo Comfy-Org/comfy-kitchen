@@ -420,13 +420,14 @@ def conv_bias_leaky_relu_(
         type(x) is not torch.Tensor
         or x.is_meta
         or torch.compiler.is_compiling()
-        or (torch.is_grad_enabled() and (x.requires_grad or bias.requires_grad))
+        or torch.is_grad_enabled()
     ):
-        # under autograd keep the custom op, as for the other in-place ops here, so the graph
-        # and x's version counter are the same as through torch.ops
+        # in grad mode keep the custom op, as for the other in-place ops here, so the graph
+        # and x's version counter are the same as through torch.ops: x may be saved for
+        # backward by another node even when neither x nor bias requires grad
         torch.ops.comfy_kitchen.conv_bias_leaky_relu_(x, bias, negative_slope)
         return x
-    # the custom op's body without the op dispatch, which costs about as much as the kernels
+    # the custom op's body without the op dispatch
     _eager_conv_bias_leaky_relu.check_conv_bias_leaky_relu_args(x, bias)
     if (
         x.dim() == 4
