@@ -627,6 +627,14 @@ extern "C" void launch_int8_decode_quant_q(
         static_cast<int64_t>(H) * rows * 256, static_cast<int64_t>(rows) * 256, 256);
 }
 
+extern "C" void launch_int8_prefill_quant_q(
+    const void* q, int8_t* out, float* scales, int B, int H, int rows, hipStream_t stream) {
+    const int padded = (rows + 63) / 64 * 64;
+    quant_q_int8_kernel<__bf16, 256, 129><<<dim3(padded / 64, H, B), kQuantWaves * 32, 0, stream>>>(
+        static_cast<const __bf16*>(q), out, scales, rows, padded, H,
+        static_cast<int64_t>(H) * rows * 256, static_cast<int64_t>(rows) * 256, 256);
+}
+
 extern "C" void launch_int8_decode_quant_k(
     const void* k, int8_t* out, float* scales, const int64_t* position,
     int B, int H, int capacity, int pages, int page_size, bool initialize, hipStream_t stream) {

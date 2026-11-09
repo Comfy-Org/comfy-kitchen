@@ -19,6 +19,7 @@ def is_available(device: torch.device | None = None) -> bool:
         backend._EXT_AVAILABLE
         and hasattr(backend._C, "_int8_decode_update")
         and hasattr(backend._C, "_int8_decode")
+        and hasattr(backend._C, "_int8_prefill")
         and (backend.has_wmma() if torch.version.hip else torch.cuda.get_device_capability(device) >= (8, 0))
     )
 
@@ -69,3 +70,16 @@ class Int8DecodeCache:
                                        length, partial, lse, out, out_lse)),
             seq, torch.cuda.current_stream(q.device).cuda_stream)
         return out, out_lse
+
+    def prefill(self, query, length, mask=None):
+        batch, heads, rows, dim = query.shape
+        query = query.contiguous()
+        qi = torch.empty_like(query, dtype=torch.int8)
+        scale_rows = (rows + 63) // 64 * 64 if torch.version.hip else (rows + 127) // 128 * 64
+        qs = torch.empty((batch, heads, scale_rows), dtype=torch.float32, device=query.device)
+        out = torch.empty((batch, rows, heads * dim), dtype=query.dtype, device=query.device)
+        backend._C._int8_prefill(
+            *map(wrap_for_dlpack, (query, qi, qs, self.key, self.value, self.key_scale, self.value_scale, out)),
+            wrap_for_dlpack(mask) if mask is not None else None, length,
+            torch.cuda.current_stream(query.device).cuda_stream)
+        return out

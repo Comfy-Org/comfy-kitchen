@@ -69,3 +69,43 @@ extern "C" void launch_int8_decode(
   const auto error = cudaGetLastError();
   if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
+
+namespace {
+template <MaskMode Mask, bool FuseProbabilities = true>
+__global__ void int8_prefill(
+    int8_t* q, int8_t* k, int8_t* v, float* qs, float* ks, float* vs, nv_bfloat16* out,
+    const void* mask, int mask_dtype, int64_t mask_b, int64_t mask_h, int64_t mask_q, int64_t mask_k,
+    int heads, int kv_heads, int rows, int length, int capacity, int chunk_size) {
+  qk_int_sv_i8_attn_body<false, 128, 64, 16, 64, 256, DataType::kInt8,
+      QuantGranularity::kPerThread, QuantGranularity::kPerThread, float, false,
+      nv_bfloat16, ComputeUnit::kCudaCore, Mask, false, true, false,
+      false, FuseProbabilities, false, uint32_t, false, true>(
+      q, k, v, out, nullptr, qs, ks, vs, nullptr, mask, mask_b, mask_h, mask_q, mask_k,
+      mask_dtype, rows, length, heads / kv_heads,
+      heads * rows * 256, 256, rows * 256, kv_heads * capacity * 256, 256, capacity * 256,
+      kv_heads * 256 * capacity, 256 * capacity, capacity,
+      rows * heads * 256, heads * 256, 256, 0.0625f, nullptr, capacity / chunk_size, chunk_size);
+}
+}
+
+extern "C" void launch_int8_prefill(
+    int8_t* q, int8_t* k, int8_t* v, float* qs, float* ks, float* vs, void* out,
+    const void* mask, int mask_dtype, int64_t mask_b, int64_t mask_h, int64_t mask_q, int64_t mask_k,
+    int batch, int heads, int kv_heads, int rows, int length, int capacity, int chunk_size, cudaStream_t stream) {
+  constexpr int smem = (128 + 64 + 64) * 256;
+  const dim3 grid((rows + 127) / 128, heads, batch), block(32, 8);
+  if (mask) {
+    cudaFuncSetAttribute(int8_prefill<MaskMode::kCustom>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    int8_prefill<MaskMode::kCustom><<<grid, block, smem, stream>>>(
+        q, k, v, qs, ks, vs, static_cast<nv_bfloat16*>(out), mask, mask_dtype, mask_b, mask_h, mask_q, mask_k,
+        heads, kv_heads, rows, length, capacity, chunk_size);
+  } else {
+    auto kernel = length <= 512 ? int8_prefill<MaskMode::kNone, false> : int8_prefill<MaskMode::kNone>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    kernel<<<grid, block, smem, stream>>>(
+        q, k, v, qs, ks, vs, static_cast<nv_bfloat16*>(out), nullptr, 0, 0, 0, 0, 0,
+        heads, kv_heads, rows, length, capacity, chunk_size);
+  }
+  const auto error = cudaGetLastError();
+  if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}

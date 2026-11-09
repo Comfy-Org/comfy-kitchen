@@ -284,7 +284,7 @@ __forceinline__ __device__ float bool_mask_bias(uint32_t keep_bits, int bit) {
     return __uint_as_float(static_cast<uint32_t>(dropped) & 0xff800000u);
 }
 
-template <int HD, int CTA_K, MaskMode kMask, typename OutT, bool Paged = false>
+template <int HD, int CTA_K, MaskMode kMask, typename OutT, bool Paged = false, bool ChunkedV = false>
 __global__ __launch_bounds__((Shape<HD, kMask, Paged>::kThreads)) void int8_attn_kernel(
     const int8_t* __restrict__ q, const int8_t* __restrict__ k, const int8_t* __restrict__ v,
     OutT* __restrict__ o, const float* __restrict__ q_scale, const float* __restrict__ k_scale,
@@ -294,7 +294,8 @@ __global__ __launch_bounds__((Shape<HD, kMask, Paged>::kThreads)) void int8_attn
     int64_t q_stride_b, int64_t q_stride_h, int64_t k_stride_b, int64_t k_stride_h,
     int64_t v_stride_b, int64_t v_stride_h, int64_t v_stride_d, int64_t o_stride_b,
     int64_t o_stride_h, int64_t o_stride_n, float sm_scale,
-    const int64_t* length = nullptr, float* lse = nullptr, int pages = 0) {
+    const int64_t* length = nullptr, float* lse = nullptr, int pages = 0,
+    int v_chunks = 1, int v_chunk_size = 0) {
 
     if constexpr (Paged) {
         const int page_size = kv_len;
@@ -375,6 +376,9 @@ __global__ __launch_bounds__((Shape<HD, kMask, Paged>::kThreads)) void int8_attn
     const int batch = Paged ? 0 : blockIdx.z;
     const int num_qo_heads = gridDim.y;
     const int kv_head = head / num_kv_groups;
+    const float* v_chunk_scales = v_scale +
+        (static_cast<int64_t>(batch) * v_chunks * (num_qo_heads / num_kv_groups) + kv_head) * HD;
+    int v_scale_chunk = 0;
     const float* key_mask = nullptr;
     const uint32_t* dense_bool_mask = nullptr;
     const uint16_t* dense_half_mask = nullptr;
@@ -501,6 +505,26 @@ __global__ __launch_bounds__((Shape<HD, kMask, Paged>::kThreads)) void int8_attn
     auto run_iter = [&](auto boundary_tag, int iter) {
         constexpr bool kBoundary = decltype(boundary_tag)::value;
         const int kb0 = iter * CTA_K;
+        if constexpr (ChunkedV) {
+            static_assert(HD == 256);
+            const int chunk = kb0 / v_chunk_size;
+            if (chunk != v_scale_chunk) {
+                const int stride = (num_qo_heads / num_kv_groups) * HD;
+#pragma unroll
+                for (int dt = 0; dt < DT; ++dt) {
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const int channel = dt * 16 + acc_row(lane, e);
+                        const float before = v_chunk_scales[v_scale_chunk * stride + channel];
+                        const float after = v_chunk_scales[chunk * stride + channel];
+                        const float ratio = before == after ? 1.0f : before / after;
+#pragma unroll
+                        for (int fq = 0; fq < QT; ++fq) o_val[fq][dt][e] *= ratio;
+                    }
+                }
+                v_scale_chunk = chunk;
+            }
+        }
 
         __syncthreads();
         // K tile: [key][d]. Load 16 bytes at a time, then split the LDS stores:
@@ -860,6 +884,7 @@ __global__ __launch_bounds__((Shape<HD, kMask, Paged>::kThreads)) void int8_attn
     }
 
     const float* v_scale_head =
+        ChunkedV ? v_chunk_scales + v_scale_chunk * (num_qo_heads / num_kv_groups) * HD :
         v_scale + (static_cast<int64_t>(batch) * (num_qo_heads / num_kv_groups) + kv_head) * HD;
 
 #pragma unroll
@@ -1100,6 +1125,34 @@ extern "C" void launch_int8_decode(
     int8_decode_combine<<<batch * heads * rows, 256, 0, stream>>>(
         static_cast<const __bf16*>(partial), lse, length, static_cast<__bf16*>(out), out_lse,
         heads, rows, pages * kDecodeSplits, page_size / kDecodeSplits, seq);
+    const auto error = hipGetLastError();
+    if (error != hipSuccess) throw std::runtime_error(hipGetErrorString(error));
+}
+
+extern "C" void launch_int8_prefill(
+    int8_t* q, int8_t* k, int8_t* v, float* qs, float* ks, float* vs, void* out,
+    const void* mask, int mask_dtype, int64_t mask_b, int64_t mask_h, int64_t mask_q, int64_t mask_k,
+    int batch, int heads, int kv_heads, int rows, int length, int capacity, int chunk_size, hipStream_t stream) {
+    const int padded = (rows + 63) / 64 * 64;
+    if (mask) {
+        using S = Shape<256, MaskMode::kCustom, false>;
+        int8_attn_kernel<256, 64, MaskMode::kCustom, __bf16, false, true>
+            <<<dim3((rows + S::kBlockQ - 1) / S::kBlockQ, heads, batch), S::kThreads, 0, stream>>>(
+            q, k, v, static_cast<__bf16*>(out), qs, ks, vs, mask, mask_b, mask_h, mask_q, mask_k, mask_dtype,
+            rows, length, padded, capacity / 16, heads / kv_heads,
+            heads * rows * 256, rows * 256, kv_heads * capacity * 256, capacity * 256,
+            kv_heads * 256 * capacity, 256 * capacity, capacity, rows * heads * 256, 256, heads * 256,
+            0.0625f, nullptr, nullptr, 0, capacity / chunk_size, chunk_size);
+    } else {
+        using S = Shape<256, MaskMode::kNone, false>;
+        int8_attn_kernel<256, 64, MaskMode::kNone, __bf16, false, true>
+            <<<dim3((rows + S::kBlockQ - 1) / S::kBlockQ, heads, batch), S::kThreads, 0, stream>>>(
+            q, k, v, static_cast<__bf16*>(out), qs, ks, vs, nullptr, 0, 0, 0, 0, 0,
+            rows, length, padded, capacity / 16, heads / kv_heads,
+            heads * rows * 256, rows * 256, kv_heads * capacity * 256, capacity * 256,
+            kv_heads * 256 * capacity, 256 * capacity, capacity, rows * heads * 256, 256, heads * 256,
+            0.0625f, nullptr, nullptr, 0, capacity / chunk_size, chunk_size);
+    }
     const auto error = hipGetLastError();
     if (error != hipSuccess) throw std::runtime_error(hipGetErrorString(error));
 }

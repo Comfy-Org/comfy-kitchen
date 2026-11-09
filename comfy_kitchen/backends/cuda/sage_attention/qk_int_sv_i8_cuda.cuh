@@ -61,6 +61,26 @@ __device__ __forceinline__ uint32_t attention_next_active_tile(
   return count;
 }
 
+template <uint32_t TilesQ, uint32_t TilesV>
+__device__ __forceinline__ void rescale_v_accumulator(
+    float (&output)[TilesQ][TilesV][8], const float *scales, int stride,
+    int chunk, int &previous) {
+  if (chunk == previous) return;
+  const int lane = get_lane_id() % 4;
+#pragma unroll
+  for (uint32_t v = 0; v < TilesV; ++v) {
+#pragma unroll
+    for (uint32_t k = 0; k < 8; ++k) {
+      const int channel = v * 16 + lane * 2 + (k / 4) * 8 + k % 2;
+      const float before = scales[previous * stride + channel], after = scales[chunk * stride + channel];
+      const float ratio = before == after ? 1.0f : before / after;
+#pragma unroll
+      for (uint32_t q = 0; q < TilesQ; ++q) output[q][v][k] *= ratio;
+    }
+  }
+  previous = chunk;
+}
+
 template <bool skip_masked_tiles, uint32_t CTA_Q, uint32_t CTA_K,
           uint32_t WARP_Q, uint32_t WARP_K,
           uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN,
@@ -71,7 +91,8 @@ template <bool skip_masked_tiles, uint32_t CTA_Q, uint32_t CTA_K,
           bool fuse_v_scale = false, bool fuse_v_mean = false,
           bool use_pv_fp16_accu = false,
           bool fuse_fp32_probabilities = true, bool skip_masked_copies = false,
-          typename Offset = uint32_t, bool decode_page = false>
+          typename Offset = uint32_t, bool decode_page = false,
+          bool chunked_v_scale = false>
 __device__ __forceinline__ void qk_int_sv_i8_attn_body(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
@@ -87,7 +108,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
     const Offset stride_bz_v, const Offset stride_h_v,
     const uint32_t stride_d_v, const Offset stride_bz_o,
     const uint32_t stride_seq_o, const Offset stride_h_o, float sm_scale,
-    const float *__restrict__ MaskTileBias) {
+    const float *__restrict__ MaskTileBias, int v_chunks = 1, int v_chunk_size = 0) {
   // compile time check
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4,
                 "DTypeQK must be int8 or int4");
@@ -152,6 +173,11 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
   const uint32_t bx = decode_page ? 0 : blockIdx.x;
   const uint32_t num_qo_heads = gridDim.y;
   const uint32_t head_id = blockIdx.y;
+  const int v_scale_stride = (num_qo_heads / num_kv_groups) * head_dim;
+  float *v_chunk_scales = V_scale;
+  if constexpr (chunked_v_scale)
+    v_chunk_scales += batch_id * v_chunks * v_scale_stride + (head_id / num_kv_groups) * head_dim;
+  int v_scale_chunk = 0;
 
   const float *key_mask = nullptr;
   const float *key_tile_bias = nullptr;
@@ -220,7 +246,7 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
                   get_warp_idx_k<num_warps_q, num_warps_k>();
   } else if constexpr (K_GRAN == QuantGranularity::kPerThread) {
     const uint32_t num_warp_block_k =
-        div_ceil(decode_page ? stride_h_k / head_dim : kv_len, CTA_K) * (CTA_K / WARP_K);
+        div_ceil((decode_page || chunked_v_scale) ? stride_h_k / head_dim : kv_len, CTA_K) * (CTA_K / WARP_K);
     k_scale_idx =
         batch_id * (num_qo_heads / num_kv_groups) * (num_warp_block_k * 4) +
         (head_id / num_kv_groups) * (num_warp_block_k * 4) +
@@ -523,6 +549,9 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
         cp_async::wait_group<0>();
       }
       __syncthreads();
+      if constexpr (chunked_v_scale)
+        rescale_v_accumulator(RO, v_chunk_scales, v_scale_stride,
+                              K_idx_lane_base / v_chunk_size, v_scale_chunk);
       compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
                       num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V,
                         mask_mode == MaskMode::kNone>(
@@ -706,6 +735,9 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
       }
 
       if (active_tile) {
+        if constexpr (chunked_v_scale)
+          rescale_v_accumulator(RO, v_chunk_scales, v_scale_stride,
+                                (K_idx_lane_base - CTA_K) / v_chunk_size, v_scale_chunk);
         compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
                         num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V,
                         mask_mode == MaskMode::kNone>(
@@ -878,6 +910,9 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
       }
 
       if (active_tile) {
+        if constexpr (chunked_v_scale)
+          rescale_v_accumulator(RO, v_chunk_scales, v_scale_stride,
+                                (K_idx_lane_base - CTA_K) / v_chunk_size, v_scale_chunk);
         compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
                         num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V,
                         mask_mode == MaskMode::kNone>(
@@ -1012,6 +1047,9 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
       }
 
       if (active_tile) {
+        if constexpr (chunked_v_scale)
+          rescale_v_accumulator(RO, v_chunk_scales, v_scale_stride,
+                                (K_idx_lane_base - CTA_K) / v_chunk_size, v_scale_chunk);
         compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
                         num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V,
                         mask_mode == MaskMode::kNone>(
@@ -1056,8 +1094,9 @@ __device__ __forceinline__ void qk_int_sv_i8_attn_body(
   if constexpr (fuse_v_scale) {
     float v_scale[4];
     float *V_scale_base_ptr =
-        V_scale + batch_id * (num_qo_heads / num_kv_groups) * head_dim +
-        (head_id / num_kv_groups) * head_dim + (lane_id % 4) * 2;
+        (chunked_v_scale ? v_chunk_scales + v_scale_chunk * v_scale_stride :
+         V_scale + batch_id * (num_qo_heads / num_kv_groups) * head_dim +
+         (head_id / num_kv_groups) * head_dim) + (lane_id % 4) * 2;
 #pragma unroll
     for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
       ((float2 *)v_scale)[0] = *((float2 *)(V_scale_base_ptr + fv * 16));

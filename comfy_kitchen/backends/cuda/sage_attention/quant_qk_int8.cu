@@ -895,6 +895,14 @@ extern "C" void launch_int8_decode_quant_q(
       static_cast<int64_t>(H) * rows * 256, static_cast<int64_t>(rows) * 256, 256);
 }
 
+extern "C" void launch_int8_prefill_quant_q(
+    const void* q, int8_t* out, float* scales, int B, int H, int rows, cudaStream_t stream) {
+  const int blocks = (rows + 127) / 128;
+  quant_q_kernel<nv_bfloat16, 2, 128, 16, 2, 129, true><<<dim3(blocks * 8, H, B), 128, 0, stream>>>(
+      static_cast<const nv_bfloat16*>(q), out, scales, rows, 256, H, blocks * 64,
+      static_cast<int64_t>(H) * rows * 256, static_cast<int64_t>(rows) * 256, 256);
+}
+
 extern "C" void launch_int8_decode_quant_k(
     const void* k, int8_t* out, float* scales, const int64_t* position,
     int B, int H, int capacity, int pages, int page_size, bool initialize, cudaStream_t stream) {
