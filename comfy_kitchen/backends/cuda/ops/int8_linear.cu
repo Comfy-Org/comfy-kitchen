@@ -1061,17 +1061,118 @@ __device__ __forceinline__ void dequantize_int8_convrot_group(const int8_t* q, f
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
 template<typename OutputType>
-__global__ void dequantize_int8_convrot_warp_kernel(
-    const int8_t* q, const float* scales, OutputType* output, int K, int scale_size, int64_t rows, int rows_per_block)
-{
-    constexpr int groups = 8;
-    const int n_groups = K / 256, slot = threadIdx.x / 32;
-    const int64_t row = int64_t(blockIdx.x) * rows_per_block + (rows_per_block > 1 ? slot / n_groups : 0);
-    const int group = rows_per_block > 1 ? slot % n_groups : blockIdx.y * groups + slot;
-    if (row >= rows || group >= n_groups || (rows_per_block > 1 && slot >= rows_per_block * n_groups)) return;
-    const int64_t offset = row * K + int64_t(group) * 256;
-    dequantize_int8_convrot_group<256>(q + offset, scales[scale_size == 1 ? 0 : row], output + offset, threadIdx.x % 32);
+__global__ void dequantize_int8_convrot_warp_kernel(const int8_t* q, const float* scales, OutputType* out, int64_t groups, int ng, int scale_size, uint64_t reciprocal) {
+#if __CUDA_ARCH__ >= 1000 && CUDA_VERSION >= 13010
+    constexpr int L = 2, V = 128 / L, LOAD = 32, CHUNK = 32 / sizeof(OutputType);
+#else
+    constexpr int L = std::is_same_v<OutputType, float> ? 32 : 8;
+    constexpr int V = 128 / L, LOAD = 16, CHUNK = 16 / sizeof(OutputType);
+#endif
+    const int slots = blockDim.x / L, lane = threadIdx.x % L;
+    const int64_t g = int64_t(blockIdx.x) * slots + threadIdx.x / L;
+    if (g >= groups) return;
+    int64_t row = ng == 1 ? g : __umul64hi(uint64_t(g), reciprocal);
+    row += g - row * ng >= ng;
+#if __CUDA_ARCH__ < 1000 || CUDA_VERSION < 13010
+    // Hopper's FP32 output is faster with the previous 32-lane transform.
+    if constexpr (std::is_same_v<OutputType, float>) {
+        dequantize_int8_convrot_group<256>(q + g * 256, scales[scale_size == 1 ? 0 : row], out + g * 256, lane);
+        return;
+    } else
+#endif
+    {
+        // Each half starts at +128. Biases 512, 2048, 8192, 32768 keep each
+        // stage result within 16 bits, giving two independent integer transforms.
+        uint32_t v[V];
+#pragma unroll
+        for (int j = 0; j < V; j += LOAD) {
+            union {uint4 word; uint32_t ints[8]; } a, b;
+#if __CUDA_ARCH__ >= 1000 && CUDA_VERSION >= 13010
+            if constexpr (LOAD == 32) {
+                const int8_t* p0 = q + g * 256 + lane * V + j;
+                const int8_t* p1 = p0 + 128;
+                asm("ld.global.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7},[%8];"
+                    :"=r"(a.ints[0]),"=r"(a.ints[1]),"=r"(a.ints[2]),"=r"(a.ints[3]),"=r"(a.ints[4]),"=r"(a.ints[5]),"=r"(a.ints[6]),"=r"(a.ints[7]):"l"(p0));
+                asm("ld.global.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7},[%8];"
+                    :"=r"(b.ints[0]),"=r"(b.ints[1]),"=r"(b.ints[2]),"=r"(b.ints[3]),"=r"(b.ints[4]),"=r"(b.ints[5]),"=r"(b.ints[6]),"=r"(b.ints[7]):"l"(p1));
+            } else
+#endif
+            if constexpr (LOAD == 16) {
+                a.word = reinterpret_cast<const uint4*>(q + g * 256 + lane * V)[j / 16];
+                b.word = reinterpret_cast<const uint4*>(q + g * 256 + 128 + lane * V)[j / 16];
+            }
+#pragma unroll
+            for (int h = 0; h < LOAD; ++h) v[j + h] = (__byte_perm(a.ints[h / 4], b.ints[h / 4], ((4 + h % 4) << 8)|(h % 4))&0x00ff00ff)^0x00800080;
+        }
+#pragma unroll
+        for (int stride = 1; stride < 64; stride *= 4) {
+            constexpr uint32_t repeat = 0x10001;
+            const uint32_t bias = 256 * stride * repeat;
+            if (stride * 4 <= V) {
+#pragma unroll
+                for (int base = 0; base < V; base += stride * 4) {
+#pragma unroll
+                    for (int j = 0; j < stride; ++j) {
+                        const auto a = v[base + j], b = v[base + j + stride], c = v[base + j + 2 * stride], d = v[base + j + 3 * stride], sum = a + b + c + d + bias;
+                        v[base + j] = sum - 2 * d; v[base + j + stride] = sum - 2 * c; v[base + j + 2 * stride] = sum - 2 * b; v[base + j + 3 * stride] = sum - 2 * a;
+                    }
+                }
+            } else {
+                const int step = stride / V;
+#pragma unroll
+                for (int j = 0; j < V; ++j) {
+                    const auto x = v[j], reverse = __shfl_xor_sync(0xffffffff, x, 3 * step, L);
+                    const auto sum = x + reverse + bias;
+                    v[j] = x - reverse + __shfl_xor_sync(0xffffffff, sum, step, L);
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < V; ++j) {
+            const uint32_t x = v[j], y = __shfl_xor_sync(0xffffffff, x, L / 2, L);
+            const uint32_t reverse = __funnelshift_l(y, y, 16), sum = x + reverse + 0x40004000;
+            v[j] = x - reverse + __funnelshift_l(sum, sum, 16);
+        }
+        const float scale = scales[scale_size == 1 ? 0 : row] * 0.0625f;
+#pragma unroll
+        for (int j = 0; j < V; j += CHUNK) {
+            union {OutputType values[CHUNK]; uint4 word; uint32_t words[8]; } low, high;
+#pragma unroll
+            for (int h = 0; h < CHUNK; ++h) {
+#if __CUDA_ARCH__ >= 1000 && CUDA_VERSION >= 13010
+                float lo, hi;
+                // Bit insertion gives 2^23 + the biased integer exactly; subtract
+                // 2^23 + 32768 before scaling, preserving the FP32 result.
+                const float a = __uint_as_float((v[j + h]&65535)|0x4b000000);
+                const float b = __uint_as_float((v[j + h] >> 16)|0x4b000000);
+                asm("{ .reg .b64 a,b,s; mov.b64 a,{%2,%3}; mov.b64 b,0xcb008000cb008000; mov.b64 s,{%4,%4};"
+                    "add.rn.ftz.f32x2 a,a,b; mul.rn.ftz.f32x2 a,a,s; mov.b64 {%0,%1},a; }"
+                    : "=f"(lo),"=f"(hi):"f"(a),"f"(b),"f"(scale));
+#else
+                const float lo = float(int(v[j + h]&65535)-32768) * scale;
+                const float hi = float(int(v[j + h] >> 16)-32768) * scale;
+#endif
+                low.values[h] = from_float<OutputType>(lo);
+                high.values[h] = from_float<OutputType>(hi);
+            }
+            {
+#if __CUDA_ARCH__ >= 1000 && CUDA_VERSION >= 13010
+                if constexpr (CHUNK * sizeof(OutputType) == 32) {
+                    OutputType* p0 = out + g * 256 + lane * V + j;
+                    OutputType* p1 = p0 + 128;
+                    asm volatile("st.global.v8.b32 [%0],{%1,%2,%3,%4,%5,%6,%7,%8};"::"l"(p0),"r"(low.words[0]),"r"(low.words[1]),"r"(low.words[2]),"r"(low.words[3]),"r"(low.words[4]),"r"(low.words[5]),"r"(low.words[6]),"r"(low.words[7]):"memory");
+                    asm volatile("st.global.v8.b32 [%0],{%1,%2,%3,%4,%5,%6,%7,%8};"::"l"(p1),"r"(high.words[0]),"r"(high.words[1]),"r"(high.words[2]),"r"(high.words[3]),"r"(high.words[4]),"r"(high.words[5]),"r"(high.words[6]),"r"(high.words[7]):"memory");
+                } else
+#endif
+                {
+                    reinterpret_cast<uint4*>(out + g * 256 + lane * V)[j / (16 / sizeof(OutputType))] = low.word;
+                    reinterpret_cast<uint4*>(out + g * 256 + 128 + lane * V)[j / (16 / sizeof(OutputType))] = high.word;
+                }
+            }
+        }
+    }
 }
+
 #endif
 
 template<int GROUPS_PER_BLOCK, typename OutputType>
@@ -2780,19 +2881,30 @@ void launch_dequantize_int8_convrot_kernel(
     }
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
-    if (num_rows * num_cols >= 4194304) {
+    if (num_rows * num_cols >= 4194304 && reinterpret_cast<uintptr_t>(input) % 32 == 0 &&
+        reinterpret_cast<uintptr_t>(output) % 32 == 0) {
         int device = 0, major = 0;
         CUDA_CHECK(cudaGetDevice(&device));
         CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
-        if (major >= 9 && major < 12) {
-            const int groups = 8, rows_per_block = std::max(1, groups / static_cast<int>(num_cols / 256));
-            const dim3 grid(static_cast<unsigned>((num_rows + rows_per_block-1) / rows_per_block),
-                static_cast<unsigned>((num_cols / 256 + groups-1) / groups));
+        if (major >= 9 && major<12) {
+            const int groups_per_row = static_cast<int>(num_cols / 256);
+            const int64_t groups = num_rows * groups_per_row;
+            const uint64_t reciprocal = UINT64_MAX / groups_per_row+
+                (UINT64_MAX % groups_per_row == static_cast<uint64_t>(groups_per_row-1));
+#if CUDA_VERSION >= 13010
+            const int groups_per_block = major >= 10 ? 32 : 8;
+            const int threads = major == 9 && output_dtype_code == 0 ? 256 : 64;
+#else
+            const int groups_per_block = 8;
+            const int threads = output_dtype_code == 0 ? 256 : 64;
+#endif
+            const unsigned blocks = static_cast<unsigned>((groups + groups_per_block-1) / groups_per_block);
             DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
-                comfy::dequantize_int8_convrot_warp_kernel<OutputType><<<grid, 256, 0, stream>>>(
+                comfy::dequantize_int8_convrot_warp_kernel<OutputType>
+                    <<<blocks, threads, 0, stream>>>(
                     static_cast<const int8_t*>(input), static_cast<const float*>(scales),
-                    static_cast<OutputType*>(output), static_cast<int>(num_cols),
-                    static_cast<int>(scale_size), num_rows, rows_per_block);
+                    static_cast<OutputType*>(output), groups, groups_per_row,
+                    static_cast<int>(scale_size), reciprocal);
             });
             CUDA_CHECK(cudaGetLastError());
             return;
