@@ -10,6 +10,7 @@ so q and k are compared to eager and to an fp32 reference with a tolerance and m
 further from the fp32 reference than eager; v is a copy and must be equal.
 """
 
+import contextlib
 import importlib
 
 import pytest
@@ -357,11 +358,28 @@ class TestQkvInterleavedQkRmsNormTriton:
         torch.manual_seed(0)
 
     @staticmethod
-    def _check(inputs, heads, eps=1e-6, q_interleaved=True):
+    @contextlib.contextmanager
+    def _served(expected="triton"):
+        # the backend of the implementation the registry returns for each call in the block
+        # (get_implementation wrapped), so the check is on the call that ran, not on a query
+        served = []
+        get_implementation = registry.get_implementation
+
+        def recording(func_name, backend=None, kwargs=None):
+            impl = get_implementation(func_name, backend, kwargs)
+            if func_name == OP:
+                served.append(impl.__module__.rsplit(".", 2)[-2])
+            return impl
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(registry, "get_implementation", recording)
+            yield
+        assert served and all(b == expected for b in served), served
+
+    def _check(self, inputs, heads, eps=1e-6, q_interleaved=True):
         kwargs = _kwargs(inputs, heads, eps, q_interleaved)
         assert registry.validate_backend_for_call("triton", OP, kwargs).success
-        assert registry.get_capable_backend(OP, kwargs) == "triton"
-        with ck.use_backend("triton"):
+        with self._served(), ck.use_backend("triton"):
             got = _kitchen(inputs, heads, eps, q_interleaved)
         ref = eager_backend.qkv_interleaved_qk_rms_norm(**kwargs)
         ref32 = _reference32(inputs, heads, eps, q_interleaved)
