@@ -374,8 +374,10 @@ class TestFlowWarpCatTriton:
     def test_other_timesteps(self, dt):
         p0, p1, fwd, bwd, batch_dt = _fusion_inputs(67, 67, 120, dt=dt, device="cuda")
         gx, gy = _grids(67, 120, "cuda")
+        scales = [batch_dt, 1 - batch_dt]
+        self._served(_kwargs([p0, p1], [bwd, fwd], gx, gy, scales=scales))
         with ck.use_backend("triton"):
-            got = ck.flow_warp_cat([p0, p1], [bwd, fwd], gx, gy, scales=[batch_dt, 1 - batch_dt])
+            got = ck.flow_warp_cat([p0, p1], [bwd, fwd], gx, gy, scales=scales)
         (ref,) = _stock_fusion_levels([p0], [p1], [fwd], [bwd], batch_dt, {(67, 120): (gx, gy)})
         assert torch.equal(got, ref)
 
@@ -384,6 +386,7 @@ class TestFlowWarpCatTriton:
         fa, fb, v = _estimator_inputs(64, 33, 60, device="cuda", layout="cl")
         fa = fa.contiguous()
         gx, gy = _grids(33, 60, "cuda")
+        self._served(_kwargs([fb], [v], gx, gy, prefix=fa))
         with ck.use_backend("triton"):
             got = ck.flow_warp_cat(fb, v, gx, gy, prefix=fa)
         assert torch.equal(got, _stock_estimator_step(fa, fb, v, gx, gy))
