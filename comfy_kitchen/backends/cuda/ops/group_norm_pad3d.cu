@@ -4,7 +4,7 @@
  */
 // group_norm_silu_pad3d: per-frame GroupNorm + SiLU + causal-conv padding (reflect
 // in space, zero frames in front) in one pass, NDHWC in and out.
-//   stats_partial:  per (frame, 1024-row chunk, channel) sum / sum of squares
+//   stats_partial:  per (frame, 1024-row chunk, channel tile) sum / sum of squares
 //   stats_finalize: reduce to per-group mean, rstd
 //   apply:          normalize, silu, store into the padded output (reflected indices)
 // C % 8 == 0 (16-byte vectors), C <= 2048. fp32 partial sums reduced in double, so results
@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <cstdint>
+#include <algorithm>
 
 #include "dtype_dispatch.cuh"
 
@@ -41,11 +42,12 @@ __global__ void __launch_bounds__(kThreads)
 stats_partial_kernel(const T* __restrict__ x, float2* __restrict__ partial,
                      int64_t rows, int C, int chunks, int W, int64_t row_stride) {
     // rows counts pixels; an image row of W pixels is row_stride elements apart (W * C when packed)
-    const int cv = C / kVec;
+    // Tile channels so wide frames expose more blocks without increasing workspace.
+    const int cv = min(C / kVec, 16);
     const int rows_per_iter = blockDim.x / cv;  // launched with the largest multiple of cv <= kThreads
     const int frame = blockIdx.y;
     const int chunk = blockIdx.x;
-    const int cvec = threadIdx.x % cv;
+    const int cvec = blockIdx.z * cv + threadIdx.x % cv;
     const int r0 = threadIdx.x / cv;
     const int64_t row_begin = static_cast<int64_t>(chunk) * kChunkRows;
     const int64_t row_end = min(row_begin + kChunkRows, rows);
@@ -54,8 +56,9 @@ stats_partial_kernel(const T* __restrict__ x, float2* __restrict__ partial,
     float s[kVec], ss[kVec];
 #pragma unroll
     for (int i = 0; i < kVec; ++i) { s[i] = 0.f; ss[i] = 0.f; }
-    for (int64_t r = row_begin + r0; r < row_end; r += rows_per_iter) {
-        uint4 raw = *reinterpret_cast<const uint4*>(base + (r / W) * row_stride + (r % W) * C);
+    for (int64_t r = row_begin + r0; r < row_end && cvec < C / kVec; r += rows_per_iter) {
+        uint4 raw = *reinterpret_cast<const uint4*>(base +
+            (row_stride == static_cast<int64_t>(W) * C ? r * C : (r / W) * row_stride + (r % W) * C));
         const T* v = reinterpret_cast<const T*>(&raw);
 #pragma unroll
         for (int i = 0; i < kVec; ++i) {
@@ -65,40 +68,59 @@ stats_partial_kernel(const T* __restrict__ x, float2* __restrict__ partial,
         }
     }
 
-    __shared__ float sh_s[kThreads][kVec];
-    __shared__ float sh_ss[kThreads][kVec];
+    // Padding spreads neighboring channels over distinct banks during the reduction.
+    __shared__ float sh_s[kVec][kThreads + 4];
+    __shared__ float sh_ss[kVec][kThreads + 4];
 #pragma unroll
-    for (int i = 0; i < kVec; ++i) { sh_s[threadIdx.x][i] = s[i]; sh_ss[threadIdx.x][i] = ss[i]; }
+    for (int i = 0; i < kVec; ++i) { sh_s[i][threadIdx.x] = s[i]; sh_ss[i][threadIdx.x] = ss[i]; }
     __syncthreads();
-    if (r0 == 0) {
-        float2* dst = partial + (static_cast<int64_t>(frame) * chunks + chunk) * C + cvec * kVec;
-#pragma unroll
-        for (int i = 0; i < kVec; ++i) {
-            float ts = 0.f, tss = 0.f;
-            for (int j = 0; j < rows_per_iter; ++j) {
-                ts += sh_s[j * cv + cvec][i];
-                tss += sh_ss[j * cv + cvec][i];
-            }
-            dst[i] = make_float2(ts, tss);
+    const int c = blockIdx.z * cv * kVec + threadIdx.x;
+    if (threadIdx.x < cv * kVec && c < C) {
+        const int v = threadIdx.x / kVec;
+        const int i = threadIdx.x % kVec;
+        float ts = 0.f, tss = 0.f;
+        for (int j = 0; j < rows_per_iter; ++j) {
+            ts += sh_s[i][j * cv + v];
+            tss += sh_ss[i][j * cv + v];
         }
+        partial[(static_cast<int64_t>(frame) * chunks + chunk) * C + c] = make_float2(ts, tss);
     }
 }
 
-// One block per frame, one thread per group.
+// One block per group; keep FP64 accumulation while reducing in parallel.
 __global__ void stats_finalize_kernel(const float2* __restrict__ partial, float2* __restrict__ stats,
                                       int C, int G, int chunks, double n_per_group, float eps) {
     const int frame = blockIdx.x;
-    const int g = threadIdx.x;
+    const int g = blockIdx.y;
     const int cpg = C / G;
     double s = 0.0, ss = 0.0;
-    for (int chunk = 0; chunk < chunks; ++chunk) {
-        const float2* p = partial + (static_cast<int64_t>(frame) * chunks + chunk) * C + g * cpg;
-        for (int c = 0; c < cpg; ++c) { s += p[c].x; ss += p[c].y; }
+    for (int i = threadIdx.x; i < chunks * cpg; i += blockDim.x) {
+        const float2 p = partial[(static_cast<int64_t>(frame) * chunks + i / cpg) * C + g * cpg + i % cpg];
+        s += p.x;
+        ss += p.y;
     }
-    const double mean = s / n_per_group;
-    const double var = fmax(ss / n_per_group - mean * mean, 0.0);
-    stats[frame * G + g] = make_float2(static_cast<float>(mean),
-                                       rsqrtf(static_cast<float>(var) + eps));
+    for (int offset = 16; offset; offset /= 2) {
+        s += __shfl_down_sync(0xffffffff, s, offset);
+        ss += __shfl_down_sync(0xffffffff, ss, offset);
+    }
+    __shared__ double2 warp_sums[4];
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    if (lane == 0) warp_sums[warp] = make_double2(s, ss);
+    __syncthreads();
+    if (warp == 0) {
+        s = lane < 4 ? warp_sums[lane].x : 0.0;
+        ss = lane < 4 ? warp_sums[lane].y : 0.0;
+        for (int offset = 16; offset; offset /= 2) {
+            s += __shfl_down_sync(0xffffffff, s, offset);
+            ss += __shfl_down_sync(0xffffffff, ss, offset);
+        }
+        if (lane == 0) {
+            const double mean = s / n_per_group;
+            const double var = fmax(ss / n_per_group - mean * mean, 0.0);
+            stats[frame * G + g] = make_float2(static_cast<float>(mean), rsqrtf(static_cast<float>(var) + eps));
+        }
+    }
 }
 
 template <typename T, bool kNorm, bool kSilu, bool kZeroPad>
@@ -116,9 +138,10 @@ apply_kernel(const T* __restrict__ x, const float2* __restrict__ stats,
     const int bidx = oframe / T_out;
     const int t = oframe % T_out - front;
     const int64_t out_rows = static_cast<int64_t>(H_out) * W_out;
-    const int64_t idx = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x;
-    const bool in_range = idx < out_rows * cv;
-    T* dst = in_range ? out + (oframe * out_rows + idx / cv) * C + (idx % cv) * kVec : nullptr;
+    const int64_t orow = static_cast<int64_t>(blockIdx.x) * (blockDim.x / cv) + threadIdx.x / cv;
+    const int c0 = (threadIdx.x % cv) * kVec;
+    const bool in_range = orow < out_rows;
+    T* dst = in_range ? out + (oframe * out_rows + orow) * C + c0 : nullptr;
 
     if (t < 0) {
         if (in_range) *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
@@ -127,7 +150,7 @@ apply_kernel(const T* __restrict__ x, const float2* __restrict__ stats,
     const int iframe = bidx * T_in + t;
     if (kNorm) {
         const int cpg = C / G;
-        for (int c = threadIdx.x; c < C; c += kThreads) {
+        for (int c = threadIdx.x; c < C; c += blockDim.x) {
             const float2 st = stats[iframe * G + c / cpg];
             a[c] = st.y * to_f(gamma[c]);
             b[c] = to_f(beta[c]) - st.x * a[c];
@@ -136,10 +159,8 @@ apply_kernel(const T* __restrict__ x, const float2* __restrict__ stats,
     }
     if (!in_range) return;
 
-    const int orow = static_cast<int>(idx / cv);
-    const int c0 = static_cast<int>(idx % cv) * kVec;
-    const int y0 = orow / W_out - top;
-    const int x0 = orow % W_out - left;
+    const int y0 = static_cast<int>(orow) / W_out - top;
+    const int x0 = static_cast<int>(orow) % W_out - left;
     if (kZeroPad && (y0 < 0 || y0 >= H || x0 < 0 || x0 >= W)) {
         // zero border, for models whose convolutions pad with zeros rather than reflecting
         *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
@@ -166,10 +187,10 @@ void stats_typed(const T* x, float2* partial, float2* stats, int frames, int C, 
                  int64_t row_stride, cudaStream_t stream) {
     const int64_t rows = static_cast<int64_t>(H) * W;
     const int chunks = static_cast<int>((rows + kChunkRows - 1) / kChunkRows);
-    const int cv = C / kVec;
-    stats_partial_kernel<T><<<dim3(chunks, frames), (kThreads / cv) * cv, 0, stream>>>(
+    const int cv = std::min(C / kVec, 16);
+    stats_partial_kernel<T><<<dim3(chunks, frames, (C / kVec + cv - 1) / cv), (kThreads / cv) * cv, 0, stream>>>(
         x, partial, rows, C, chunks, W, row_stride);
-    stats_finalize_kernel<<<frames, G, 0, stream>>>(
+    stats_finalize_kernel<<<dim3(frames, G), 128, 0, stream>>>(
         partial, stats, C, G, chunks, static_cast<double>(rows) * (C / G), eps);
 }
 
@@ -194,11 +215,14 @@ void launch_typed(const T* x, const T* gamma, const T* beta, T* out, float2* wor
     const int T_out = T_in + front;
     const int H_out = H + top + bottom;
     const int W_out = W + left + right;
-    const int64_t out_vecs = static_cast<int64_t>(H_out) * W_out * (C / kVec);
-    const dim3 grid(static_cast<unsigned>((out_vecs + kThreads - 1) / kThreads), B * T_out);
+    const int cv = C / kVec;
+    const int threads = (kThreads / cv) * cv;
+    const int rows_per_block = threads / cv;
+    const int64_t out_rows = static_cast<int64_t>(H_out) * W_out;
+    const dim3 grid(static_cast<unsigned>((out_rows + rows_per_block - 1) / rows_per_block), B * T_out);
     const size_t smem = norm ? 2 * C * sizeof(float) : 0;
 #define LAUNCH_APPLY(N, S, Z)                                                         \
-    apply_kernel<T, N, S, Z><<<grid, kThreads, smem, stream>>>(                       \
+    apply_kernel<T, N, S, Z><<<grid, threads, smem, stream>>>(                       \
         x, stats, gamma, beta, out, T_in, H, W, C, G, T_out, H_out, W_out, left, top, front, row_stride)
     if (zero_pad) {
         if (norm && silu) LAUNCH_APPLY(true, true, true);
