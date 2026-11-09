@@ -382,9 +382,10 @@ class TestNerfGluBlockTriton:
             got = ck.nerf_glu_block(x, p, w)
         assert got.shape == (0, 256, 64) and got.dtype == torch.bfloat16
 
-    def test_int32_offset_bound_goes_to_eager(self):
+    def test_int32_offset_bound_call_rule(self):
         # an expanded x has a patch of 2**25 + 256 pixels without the memory; its output
-        # patch would pass int32 offsets, so dispatch picks eager (the op is not run here)
+        # patch would pass int32 offsets, so the call rule declines it on GPU tensors. Only the
+        # registry is queried: the op is not run (its output would take 4 GiB)
         _, p, w = _inputs(1, 256, 64, 4, device="cuda", dtype=torch.bfloat16)
         x = torch.empty(1, 1, 64, device="cuda", dtype=torch.bfloat16).expand(1, 2**25 + 256, 64)
         kwargs = _kwargs(x, p, w)
