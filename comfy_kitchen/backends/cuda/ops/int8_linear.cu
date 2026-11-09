@@ -775,16 +775,6 @@ __global__ void dequantize_int8_vec8_kernel(const int8_t* input, const float* sc
 #endif
 
 template<typename OutputType>
-__global__ void dequantize_int8_elementwise_vec4_kernel(const int8_t* __restrict__ input,
-    const float* __restrict__ scales, OutputType* __restrict__ output, int64_t chunks) {
-    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= chunks) return;
-    const char4 q = reinterpret_cast<const char4*>(input)[i];
-    const float4 s = reinterpret_cast<const float4*>(scales)[i];
-    store4_contiguous(output, i * 4, float(q.x) * s.x, float(q.y) * s.y, float(q.z) * s.z, float(q.w) * s.w);
-}
-
-template<typename OutputType>
 __global__ void dequantize_int8_simple_kernel(
     const int8_t* __restrict__ input,
     const float* __restrict__ scales,
@@ -822,13 +812,19 @@ __global__ void dequantize_int8_simple_vec4_kernel(
     }
 
     const char4 q4 = reinterpret_cast<const char4*>(input)[idx4];
-    const float scale = scales[scale_mode == 0 ? 0 : idx4 / inner_dim_vec4];
+    float4 scale;
+    if (scale_mode == 1) {
+        scale = reinterpret_cast<const float4*>(scales)[idx4];
+    } else {
+        const float s = scales[scale_mode == 0 ? 0 : idx4 / inner_dim_vec4];
+        scale = make_float4(s, s, s, s);
+    }
     const int64_t idx = idx4 * 4;
     store4_contiguous(output, idx,
-        static_cast<float>(q4.x) * scale,
-        static_cast<float>(q4.y) * scale,
-        static_cast<float>(q4.z) * scale,
-        static_cast<float>(q4.w) * scale);
+        static_cast<float>(q4.x) * scale.x,
+        static_cast<float>(q4.y) * scale.y,
+        static_cast<float>(q4.z) * scale.z,
+        static_cast<float>(q4.w) * scale.w);
 }
 
 template<typename OutputType>
@@ -854,104 +850,6 @@ __global__ void dequantize_int8_rowwise_vec4_2d_kernel(
         static_cast<float>(q4.y) * scale,
         static_cast<float>(q4.z) * scale,
         static_cast<float>(q4.w) * scale);
-}
-
-template<int BLOCK_THREADS, typename OutputType>
-__global__ void dequantize_int8_convrot_kernel(
-    const int8_t* __restrict__ q,
-    const float* __restrict__ scales,
-    OutputType* __restrict__ output,
-    int K,
-    int scale_size)
-{
-    constexpr int kGroupsInFlight = BLOCK_THREADS / kConvRotGroup;
-
-    extern __shared__ float smem[];
-    float* row_buf = smem;
-    float* tmp = smem + K;
-
-    const int row = static_cast<int>(blockIdx.x);
-    const int tid = threadIdx.x;
-    const int64_t row_offset = static_cast<int64_t>(row) * K;
-    const float scale = scales[scale_size == 1 ? 0 : row];
-
-    for (int col = tid; col < K; col += BLOCK_THREADS) {
-        row_buf[col] = static_cast<float>(q[row_offset + col]) * scale;
-    }
-    __syncthreads();
-
-    const int n_groups = K / kConvRotGroup;
-    const int sub = tid / kConvRotGroup;
-    const int i = tid % kConvRotGroup;
-    float* buf0 = tmp + sub * (2 * kConvRotGroup);
-    float* buf1 = buf0 + kConvRotGroup;
-    const int iters = (n_groups + kGroupsInFlight - 1) / kGroupsInFlight;
-
-    for (int it = 0; it < iters; ++it) {
-        const int g = it * kGroupsInFlight + sub;
-        const bool active = (g < n_groups);
-        float* src = active ? (row_buf + g * kConvRotGroup) : buf0;
-        float* dst = active ? buf0 : buf1;
-        #pragma unroll
-        for (int stage = 0; stage < 4; ++stage) {
-            const int s = (stage == 0) ? 1 : (stage == 1) ? 4 : (stage == 2) ? 16 : 64;
-            const int d = (i / s) & 3;
-            const int base = i - d * s;
-            const float v = 0.5f * h4_row_dot(
-                d, src[base], src[base + s], src[base + 2 * s], src[base + 3 * s]);
-            dst[i] = v;
-            __syncthreads();
-            float* t = src; src = dst; dst = t;
-        }
-    }
-
-    for (int col = tid; col < K; col += BLOCK_THREADS) {
-        output[row_offset + col] = from_float<OutputType>(row_buf[col]);
-    }
-}
-
-template<int BLOCK_THREADS, typename OutputType>
-__global__ void dequantize_int8_convrot_groups_kernel(
-    const int8_t* __restrict__ q,
-    const float* __restrict__ scales,
-    OutputType* __restrict__ output,
-    int K,
-    int scale_size)
-{
-    constexpr int kGroupsPerBlock = BLOCK_THREADS / kConvRotGroup;
-    extern __shared__ float smem[];
-
-    const int group = static_cast<int>(blockIdx.x) * kGroupsPerBlock + threadIdx.x / kConvRotGroup;
-    const int row = static_cast<int>(blockIdx.y);
-    const int i = threadIdx.x % kConvRotGroup;
-    const int sub = threadIdx.x / kConvRotGroup;
-    const bool active = group < K / kConvRotGroup;
-    const int64_t row_offset = static_cast<int64_t>(row) * K;
-    const int col = group * kConvRotGroup + i;
-    const float scale = scales[scale_size == 1 ? 0 : row];
-    float* buf0 = smem + sub * (2 * kConvRotGroup);
-    float* buf1 = buf0 + kConvRotGroup;
-
-    buf0[i] = active ? static_cast<float>(q[row_offset + col]) * scale : 0.0f;
-    __syncthreads();
-
-    float* src = buf0;
-    float* dst = buf1;
-    #pragma unroll
-    for (int stage = 0; stage < 4; ++stage) {
-        const int s = (stage == 0) ? 1 : (stage == 1) ? 4 : (stage == 2) ? 16 : 64;
-        const int d = (i / s) & 3;
-        const int base = i - d * s;
-        const float v = 0.5f * h4_row_dot(
-            d, src[base], src[base + s], src[base + 2 * s], src[base + 3 * s]);
-        dst[i] = v;
-        __syncthreads();
-        float* t = src; src = dst; dst = t;
-    }
-
-    if (active) {
-        output[row_offset + col] = from_float<OutputType>(src[i]);
-    }
 }
 
 template<int S>
@@ -2758,9 +2656,9 @@ void launch_dequantize_int8_simple_kernel(
         total >= 1024) {
         const int blocks = static_cast<int>((total / 4 + 255) / 256);
         DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
-            comfy::dequantize_int8_elementwise_vec4_kernel<OutputType>
+            comfy::dequantize_int8_simple_vec4_kernel<OutputType>
                 <<<blocks, 256, 0, stream>>>(static_cast<const int8_t*>(input), static_cast<const float*>(scales),
-                    static_cast<OutputType*>(output), total / 4);
+                    static_cast<OutputType*>(output), total / 4, 0, scale_mode);
         });
         CUDA_CHECK(cudaGetLastError());
         return;
@@ -2948,78 +2846,39 @@ void launch_dequantize_int8_convrot_kernel(
         }
     }
 #endif
-    if (num_cols >= comfy::kConvRotGroup) {
-        auto launch_groups = [&](auto groups_tag) {
-            constexpr int groups_per_block = decltype(groups_tag)::value;
-            // const (not constexpr): MSVC 14.42 rejects capturing a constexpr
-            // local into the nested dispatch lambda (C3495); it is only a
-            // runtime launch dimension here.
-            const int block_threads = groups_per_block * 64;
-            const int group_blocks =
-                static_cast<int>((num_cols / comfy::kConvRotGroup + groups_per_block - 1) / groups_per_block);
-            const size_t smem_bytes = groups_per_block * 2 * comfy::kConvRotGroup * sizeof(float);
-            const dim3 grid(
-                static_cast<unsigned int>(num_rows),
-                static_cast<unsigned int>(group_blocks));
-            DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
-                // Re-derived from the tag: MSVC 14.42 refuses to capture the
-                // enclosing lambda's constexpr local (C3495).
-                constexpr int kGroupsPerBlock = decltype(groups_tag)::value;
-                comfy::dequantize_int8_convrot_groups64_kernel<kGroupsPerBlock, OutputType>
-                    <<<grid, block_threads, smem_bytes, stream>>>(
-                        static_cast<const int8_t*>(input),
-                        static_cast<const float*>(scales),
-                        static_cast<OutputType*>(output),
-                        static_cast<int>(num_cols),
-                        static_cast<int>(scale_size));
-            });
-        };
-
-        if (num_cols < 1024) {
-            launch_groups(std::integral_constant<int, 1>{});
-        } else if (num_cols < 4096) {
-            launch_groups(std::integral_constant<int, 2>{});
-        } else {
-            launch_groups(std::integral_constant<int, 4>{});
-        }
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            throw std::runtime_error(std::string("CUDA INT8 convrot dequantization failed: ") + cudaGetErrorString(err));
-        }
-        return;
-    }
-
-    const bool wide = num_cols > 5120;
-    const int block_threads = wide ? 1024 : comfy::kInt8Threads;
-    const int groups_in_flight = block_threads / comfy::kConvRotGroup;
-    const size_t smem_bytes =
-        (static_cast<size_t>(num_cols) + groups_in_flight * 2 * comfy::kConvRotGroup) * sizeof(float);
-
-    auto launch = [&](auto kernel, auto* output_typed) {
-        cudaError_t attr_err = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(smem_bytes));
-        if (attr_err != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("convrot dequant kernel shared memory request (") +
-                std::to_string(smem_bytes) + " bytes) failed: " +
-                cudaGetErrorString(attr_err));
-        }
-        kernel<<<static_cast<unsigned int>(num_rows), block_threads, smem_bytes, stream>>>(
-            static_cast<const int8_t*>(input),
-            static_cast<const float*>(scales),
-            output_typed,
-            static_cast<int>(num_cols),
-            static_cast<int>(scale_size));
+    auto launch_groups = [&](auto groups_tag) {
+        constexpr int groups_per_block = decltype(groups_tag)::value;
+        // const (not constexpr): MSVC 14.42 rejects capturing a constexpr
+        // local into the nested dispatch lambda (C3495); it is only a
+        // runtime launch dimension here.
+        const int block_threads = groups_per_block * 64;
+        const int group_blocks =
+            static_cast<int>((num_cols / comfy::kConvRotGroup + groups_per_block - 1) / groups_per_block);
+        const size_t smem_bytes = groups_per_block * 2 * comfy::kConvRotGroup * sizeof(float);
+        const dim3 grid(
+            static_cast<unsigned int>(num_rows),
+            static_cast<unsigned int>(group_blocks));
+        DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+            // Re-derived from the tag: MSVC 14.42 refuses to capture the
+            // enclosing lambda's constexpr local (C3495).
+            constexpr int kGroupsPerBlock = decltype(groups_tag)::value;
+            comfy::dequantize_int8_convrot_groups64_kernel<kGroupsPerBlock, OutputType>
+                <<<grid, block_threads, smem_bytes, stream>>>(
+                    static_cast<const int8_t*>(input),
+                    static_cast<const float*>(scales),
+                    static_cast<OutputType*>(output),
+                    static_cast<int>(num_cols),
+                    static_cast<int>(scale_size));
+        });
     };
-    DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
-        if (wide) {
-            launch(comfy::dequantize_int8_convrot_kernel<1024, OutputType>, static_cast<OutputType*>(output));
-        } else {
-            launch(comfy::dequantize_int8_convrot_kernel<256, OutputType>, static_cast<OutputType*>(output));
-        }
-    });
+
+    if (num_cols < 1024) {
+        launch_groups(std::integral_constant<int, 1>{});
+    } else if (num_cols < 4096) {
+        launch_groups(std::integral_constant<int, 2>{});
+    } else {
+        launch_groups(std::integral_constant<int, 4>{});
+    }
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
