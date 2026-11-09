@@ -47,17 +47,21 @@ def _snake_beta_kernel(
     a = tl.exp(tl.load(alpha_ptr + c).to(tl.float32))
     # 0.000000001: SnakeBeta.no_div_by_zero
     inv_b = 1.0 / (tl.exp(tl.load(beta_ptr + c).to(tl.float32)) + 0.000000001)
-    offs_t = pid_t * block + tl.arange(0, block)
-    mask = offs_t < steps
-    offs = row.to(tl.int64) * steps + offs_t
-    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    # The tile start (row * steps + pid_t * block) can pass 2**31, so it is computed once per
+    # program in int64 and folded into the base pointers; the per-element offsets and the mask
+    # stay int32 (at most block).
+    t0 = pid_t.to(tl.int64) * block
+    start = row.to(tl.int64) * steps + t0
+    offs = tl.arange(0, block)
+    mask = offs < tl.minimum(steps - t0, block).to(tl.int32)
+    x = tl.load(x_ptr + start + offs, mask=mask, other=0.0).to(tl.float32)
     if has_res:
-        x = x + tl.load(res_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        x = x + tl.load(res_ptr + start + offs, mask=mask, other=0.0).to(tl.float32)
         if write_sum:
-            tl.store(sum_ptr + offs, x.to(sum_ptr.dtype.element_ty), mask=mask)
+            tl.store(sum_ptr + start + offs, x.to(sum_ptr.dtype.element_ty), mask=mask)
     s = tl.sin(x * a)
     y = x + inv_b * (s * s)
-    tl.store(out_ptr + offs, y.to(out_ptr.dtype.element_ty), mask=mask)
+    tl.store(out_ptr + start + offs, y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 def _launch(x, alpha, beta, residual, write_sum):

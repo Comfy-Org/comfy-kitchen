@@ -98,7 +98,9 @@ def _op_snake_beta(
     _check(x, alpha, beta, residual)
     kwargs = {"x": x, "alpha": alpha, "beta": beta, "residual": residual}
     impl = registry.get_implementation("snake_beta", kwargs=kwargs)
-    return impl(**kwargs)
+    # Contiguous on every backend, like the fake below and the Triton output: eager keeps a
+    # non-contiguous x's layout, which the fake would otherwise have to predict.
+    return impl(**kwargs).contiguous()
 
 
 @_op_snake_beta.register_fake
@@ -117,7 +119,8 @@ def _op_snake_beta_with_sum(
     _check(x, alpha, beta, residual)
     kwargs = {"x": x, "alpha": alpha, "beta": beta, "residual": residual}
     impl = registry.get_implementation("snake_beta_with_sum", kwargs=kwargs)
-    return impl(**kwargs)
+    s, out = impl(**kwargs)
+    return s.contiguous(), out.contiguous()  # see _op_snake_beta
 
 
 @_op_snake_beta_with_sum.register_fake

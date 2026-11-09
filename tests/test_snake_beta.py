@@ -16,6 +16,7 @@ import importlib
 import pytest
 import torch
 from torch import nn
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 import comfy_kitchen as ck
 from comfy_kitchen.backends import eager as eager_backend
@@ -225,6 +226,42 @@ class TestSnakeBetaEager:
                     )
                     assert (s.dtype, out.dtype) == (s_ref.dtype, ref.dtype)
 
+    @pytest.mark.parametrize(
+        "device",
+        [
+            "cpu",
+            pytest.param(
+                "cuda",
+                marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required"),
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("view", ["transposed", "step2"])
+    def test_fake_strides_non_contiguous(self, view, device):
+        # The real outputs must have the fake's strides also when eager serves a non-contiguous
+        # x, or torch.compile asserts on the stride. opcheck compares strides on GPU tensors
+        # only, so the strides are also compared directly.
+        if view == "transposed":
+            x = torch.randn(2, 40, 16, device=device).half().transpose(1, 2)
+        else:
+            x = torch.randn(2, 16, 80, device=device).half()[:, :, ::2]
+        residual = torch.randn(2, 40, 16, device=device).half().transpose(1, 2)
+        alpha, beta = _params(16, device=device, dtype=torch.float16)
+        assert not x.is_contiguous()
+        cases = [
+            (torch.ops.comfy_kitchen.snake_beta.default, (x, alpha, beta, None)),
+            (torch.ops.comfy_kitchen.snake_beta.default, (x, alpha, beta, residual)),
+            (torch.ops.comfy_kitchen.snake_beta_with_sum.default, (x, alpha, beta, residual)),
+        ]
+        for op, args in cases:
+            torch.library.opcheck(op, args, test_utils=("test_faketensor",))
+            real = op(*args)
+            with FakeTensorMode() as mode:
+                fake = op(*(None if a is None else mode.from_tensor(a) for a in args))
+            real = real if isinstance(real, tuple) else (real,)
+            fake = fake if isinstance(fake, tuple) else (fake,)
+            assert [t.stride() for t in real] == [t.stride() for t in fake]
+
     def test_cpu_goes_to_eager(self):
         x = torch.randn(1, 8, 20, dtype=torch.float16)
         alpha, beta = _params(8, dtype=torch.float16)
@@ -393,6 +430,28 @@ class TestSnakeBetaTriton:
         s_ref, ref = eager_backend.snake_beta_with_sum(**kwargs)
         assert torch.equal(s, s_ref)
         self._check_close(got, ref, _reference32(x, alpha, beta, res)[1])
+
+    def test_long_row_offsets(self):
+        # T past 2**31: the tile start no longer fits in int32. Needs two 4 GiB fp16 buffers;
+        # only the first and the last n steps are filled and checked.
+        t = 2**31 + 4096
+        n = 8192
+        if torch.cuda.mem_get_info()[0] < 9 * 2**30:
+            pytest.skip("needs 9 GiB of free GPU memory")
+        x = torch.empty(1, 1, t, device="cuda", dtype=torch.float16)
+        x[..., :n].normal_()
+        x[..., -n:].normal_()
+        alpha, beta = _params(1, device="cuda", dtype=torch.float16)
+        kwargs = {"x": x, "alpha": alpha, "beta": beta, "residual": None}
+        assert registry.get_capable_backend(OP, kwargs) == "triton"
+        with ck.use_backend("triton"):
+            got = ck.snake_beta(x, alpha, beta)
+        torch.cuda.synchronize()
+        for sl in (slice(0, n), slice(t - n, t)):
+            ref = eager_backend.snake_beta(x[..., sl], alpha, beta)
+            assert _rel(got[..., sl], ref) < 2e-3
+        del x, got
+        torch.cuda.empty_cache()
 
     def test_empty_input_goes_to_eager(self):
         x, alpha, beta, _ = self._inputs(8, 0, False)
