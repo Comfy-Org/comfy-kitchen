@@ -141,6 +141,7 @@ __all__ = [
     "rms_rope_split_half_",
     "rms_rope_split_half1",
     "rms_rope_split_half1_",
+    "joint_qk_rms_rope_cat",
     # Geometry
     "delaunay3d",
     "mesh_bvh",
@@ -1016,6 +1017,61 @@ def apply_rope_split_half1_(
     """Apply split-half RoPE in place (inference only)."""
     torch.ops.comfy_kitchen.apply_rope_split_half1_(x, freqs_cis)
     return x
+
+
+def joint_qk_rms_rope_cat(
+    img_q: torch.Tensor,
+    img_k: torch.Tensor,
+    img_v: torch.Tensor,
+    txt_q: torch.Tensor,
+    txt_k: torch.Tensor,
+    txt_v: torch.Tensor,
+    img_q_weight: torch.Tensor,
+    img_k_weight: torch.Tensor,
+    txt_q_weight: torch.Tensor,
+    txt_k_weight: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    heads: int,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dual-stream attention prep: per-head QK RMSNorm, txt / img concat and RoPE, in one pass.
+
+    Takes the six projection outputs ``[B, L, heads * head_dim]`` of the image and text
+    streams and returns the joint ``(q, k, v)``, each a contiguous
+    ``[B, heads, L_txt + L_img, head_dim]`` tensor with the text rows first: q and k are
+    ``apply_rope1(cat([rms_norm(txt), rms_norm(img)], dim=2), freqs_cis)`` with one RMSNorm
+    weight per stream and per q / k, v is the concatenation alone. This is the Qwen-Image
+    ``Attention.forward`` sequence (view / transpose / contiguous, ``norm_q`` / ``norm_k`` /
+    ``norm_added_q`` / ``norm_added_k``, ``torch.cat``, ``apply_rope1``) up to the attention
+    call.
+
+    Args:
+        img_q, img_k, img_v: Image-stream projections ``[B, L_img, heads * head_dim]``.
+        txt_q, txt_k, txt_v: Text-stream projections ``[B, L_txt, heads * head_dim]``.
+        img_q_weight, img_k_weight, txt_q_weight, txt_k_weight: RMSNorm weights
+            ``[head_dim]`` in the projections' dtype.
+        freqs_cis: Interleaved RoPE table ``[B or 1, 1, L_txt + L_img, head_dim / 2, 2, 2]``.
+        heads: Number of attention heads.
+        eps: RMSNorm epsilon.
+
+    Returns:
+        Tuple of the joint (query, key, value) tensors.
+    """
+    return torch.ops.comfy_kitchen.joint_qk_rms_rope_cat(
+        img_q,
+        img_k,
+        img_v,
+        txt_q,
+        txt_k,
+        txt_v,
+        img_q_weight,
+        img_k_weight,
+        txt_q_weight,
+        txt_k_weight,
+        freqs_cis,
+        int(heads),
+        float(eps),
+    )
 
 
 def quantize_int8_tensorwise(
