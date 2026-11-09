@@ -273,9 +273,11 @@ class TestSegmentedTriton:
     def test_autocast_keeps_dtype(self, backend):
         x = torch.randn(1, 8, 64, dtype=torch.float16, device="cuda")
         mods = torch.randn(2, 1, 64, dtype=torch.float16, device="cuda")
+        kwargs = {"x": x, "scale": mods, "shift": mods, "split": 3, "eps": 1e-6}
         with ck.use_backend(backend):
             want = ck.adaln_segmented(x, mods, mods, 3)
             with torch.autocast("cuda", dtype=torch.float16):
+                assert registry.get_capable_backend("adaln_segmented", kwargs) == backend
                 got = ck.adaln_segmented(x, mods, mods, 3)
         assert got.dtype == x.dtype
         assert torch.equal(got, want)
