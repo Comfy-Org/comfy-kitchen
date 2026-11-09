@@ -25,6 +25,7 @@ extra buffer.
 import torch
 from torch.nn import functional
 
+from comfy_kitchen._rope_utils import _tensors_overlap
 from comfy_kitchen.registry import registry
 
 
@@ -48,9 +49,45 @@ def _check(x, bias):
         raise ValueError(f"{name}: bias must be on x's device")
 
 
+def _byte_range(t):
+    # [first, last + 1) byte address the view can touch
+    lo = hi = t.data_ptr()
+    size_of = t.element_size()
+    for size, stride in zip(t.shape, t.stride(), strict=True):
+        extent = (size - 1) * stride * size_of
+        if extent < 0:
+            lo += extent
+        else:
+            hi += extent
+    return lo, hi + size_of
+
+
+def _check_overlap(x, bias):
+    # every backend rejects a bias that shares memory with x (eager's add_ raises on a partial
+    # overlap, the Triton kernel would read bias values it has already overwritten). The common
+    # case (bias outside x's byte range) only reads a few attributes. x itself needs no check:
+    # the Triton call rule takes only dense x, and add_ raises on an x with internal overlap.
+    if x.numel() == 0 or bias.numel() == 0:
+        return
+    x_first, x_end = _byte_range(x)
+    b_first, b_end = _byte_range(bias)
+    if b_end <= x_first or b_first >= x_end:
+        return
+    # the byte ranges meet. _tensors_overlap compares element offsets and returns False for
+    # different storages (e.g. two torch.frombuffer wrappers of one buffer), so mixed element
+    # sizes and different storages are treated as overlapping
+    if (
+        bias.element_size() != x.element_size()
+        or bias.untyped_storage().data_ptr() != x.untyped_storage().data_ptr()
+        or _tensors_overlap(bias, x)
+    ):
+        raise ValueError("conv_bias_leaky_relu_: bias must not overlap x")
+
+
 @torch.library.custom_op("comfy_kitchen::conv_bias_leaky_relu_", mutates_args={"x"})
 def _op_conv_bias_leaky_relu_(x: torch.Tensor, bias: torch.Tensor, negative_slope: float) -> None:
     _check(x, bias)
+    _check_overlap(x, bias)
     kwargs = {"x": x, "bias": bias, "negative_slope": negative_slope}
     registry.get_implementation("conv_bias_leaky_relu_", kwargs=kwargs)(**kwargs)
 

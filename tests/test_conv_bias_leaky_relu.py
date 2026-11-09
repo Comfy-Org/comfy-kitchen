@@ -122,6 +122,49 @@ class TestConvBiasLeakyReluEager:
         with pytest.raises(ValueError):
             ck.conv_bias_leaky_relu_(torch.randn(x_shape), torch.randn(bias_shape))
 
+    @pytest.mark.parametrize(
+        ("start", "c"),
+        [
+            (0, 8),  # bias is the first C elements of x
+            (40, 8),  # bias inside x
+            (124, 8),  # bias straddles the end of x
+            (0, 128),  # [1, C, 1, 1]: bias is all of x
+        ],
+    )
+    def test_rejects_bias_overlapping_x(self, start, c):
+        base = torch.randn(256, dtype=torch.float16)
+        hw = 16 if c == 8 else 1
+        x = base[: c * hw].view(1, c, 4 if hw == 16 else 1, -1)
+        bias = base[start : start + c]
+        before = base.clone()
+        with pytest.raises(ValueError, match="bias must not overlap x"):
+            ck.conv_bias_leaky_relu_(x, bias)
+        assert torch.equal(base, before)
+
+    def test_rejects_bias_sharing_bytes_through_another_storage(self):
+        # two torch.frombuffer wrappers of one buffer: different storages, shared bytes
+        raw = bytearray(64 * 2)
+        x = torch.frombuffer(raw, dtype=torch.float16, count=32).view(1, 2, 4, 4)
+        bias = torch.frombuffer(raw, dtype=torch.float16, count=2, offset=8)
+        assert bias.untyped_storage().data_ptr() != x.untyped_storage().data_ptr()
+        with pytest.raises(ValueError, match="bias must not overlap x"):
+            ck.conv_bias_leaky_relu_(x, bias)
+
+    def test_rejects_bias_with_another_element_size_over_x(self):
+        base = torch.zeros(64, dtype=torch.float32)
+        x = base.view(torch.float16)[:32].view(1, 2, 4, 4)
+        bias = base[4:6]
+        with pytest.raises(ValueError, match="bias must not overlap x"):
+            ck.conv_bias_leaky_relu_(x, bias)
+
+    def test_accepts_bias_next_to_x_in_one_buffer(self):
+        base = torch.randn(8 * 16 + 8, dtype=torch.float16)
+        x = base[: 8 * 16].view(1, 8, 4, 4)
+        bias = base[8 * 16 :]
+        ref = _stock_chain(x.clone(), bias.clone())
+        ck.conv_bias_leaky_relu_(x, bias)
+        assert torch.equal(x, ref)
+
     def test_fake(self):
         x = torch.empty(1, 64, 33, 60, device="meta", dtype=torch.float16)
         bias = torch.empty(64, device="meta", dtype=torch.float16)
@@ -321,6 +364,23 @@ class TestConvBiasLeakyReluTriton:
         # FILM level 0 at 1920 x 1072: [1, 64, 1072, 1920] fp16
         x = _conv_out(1, 64, 1072, 1920, layout, device="cuda")
         self._check(x, _bias(64, device="cuda"))
+
+    @pytest.mark.parametrize("layout", _LAYOUTS)
+    @pytest.mark.parametrize("backend", ["triton", "eager"])
+    def test_rejects_bias_overlapping_x(self, backend, layout):
+        # a plane and element count the Triton call rule serves on CUDA and ROCm builds; bias is
+        # a view of x's first C elements
+        n, c, h, w = 1, 64, 448, 448
+        x = _conv_out(n, c, h, w, layout, device="cuda")
+        bias = x.as_strided((c,), (1,), x.storage_offset())
+        assert bias.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
+        kwargs = _kwargs(x, bias)
+        assert registry.validate_backend_for_call("triton", OP, kwargs).success
+        before = x.clone(memory_format=torch.preserve_format)
+        with ck.use_backend(backend), pytest.raises(ValueError, match="bias must not overlap x"):
+            ck.conv_bias_leaky_relu_(x, bias)
+        torch.cuda.synchronize()
+        assert torch.equal(x, before)
 
     def test_unsupported_inputs_go_to_eager(self):
         cases = [
