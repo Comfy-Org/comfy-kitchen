@@ -5,10 +5,11 @@ from .backends import cuda as _cuda_backend
 
 # Import backends to trigger auto-registration
 from .backends import ascend as _ascend_backend  # noqa: F401
-from .backends import eager as _eager_backend  # noqa: F401
-from .backends import triton as _triton_backend  # noqa: F401
+from .backends import eager as _eager_backend
+from .backends import triton as _triton_backend
 from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
 from .backends.cuda import memmove_ as _memmove_
+from .backends.eager import conv_bias_leaky_relu as _eager_conv_bias_leaky_relu
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
 from .exceptions import (
@@ -67,6 +68,7 @@ __all__ = [
     # Normalization
     "adaln",
     "rms_gated_residual",
+    "conv_bias_leaky_relu_",
     "fp16_conv3d",
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
@@ -399,6 +401,46 @@ def adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
+
+
+def conv_bias_leaky_relu_(
+    x: torch.Tensor, bias: torch.Tensor, negative_slope: float = 0.2
+) -> torch.Tensor:
+    """Conv bias add + LeakyReLU in place on a conv output computed without its bias
+    (inference only).
+
+    x ``[N, C, H, W]`` is the output of ``F.conv2d(input, weight, None, ...)``; writes
+    ``leaky_relu(x + bias[None, :, None, None], negative_slope)`` into x and returns it: the
+    in-place bias ``add_`` that ``at::convolution`` runs after cuDNN / MIOpen, then
+    ``nn.LeakyReLU`` (FILM's ``FilmConv2d`` with ``activation=True``). The sum is rounded to
+    x's dtype before the activation, as in the stock chain.
+    """
+    negative_slope = float(negative_slope)
+    if (
+        type(x) is not torch.Tensor
+        or x.is_meta
+        or torch.compiler.is_compiling()
+        or torch.is_grad_enabled()
+    ):
+        # in grad mode keep the custom op, as for the other in-place ops here, so the graph
+        # and x's version counter are the same as through torch.ops: x may be saved for
+        # backward by another node even when neither x nor bias requires grad
+        torch.ops.comfy_kitchen.conv_bias_leaky_relu_(x, bias, negative_slope)
+        return x
+    # the custom op's body without the op dispatch
+    _eager_conv_bias_leaky_relu.check_conv_bias_leaky_relu_args(x, bias)
+    if (
+        x.dim() == 4
+        and _triton_backend.conv_bias_leaky_relu_too_small(x)
+        and registry.is_available("eager")
+    ):
+        # the call rule sends these to eager whatever the backend priority or override (only
+        # eager and triton implement the op), so skip the registry lookup as well
+        _eager_backend.conv_bias_leaky_relu_(x, bias, negative_slope)
+        return x
+    kwargs = {"x": x, "bias": bias, "negative_slope": negative_slope}
+    registry.get_implementation("conv_bias_leaky_relu_", kwargs=kwargs)(**kwargs)
+    return x
 
 
 def fp16_conv3d(

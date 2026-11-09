@@ -27,6 +27,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "conv_bias_leaky_relu_",
 ]
 
 # Try to import triton and register if available
@@ -54,6 +55,7 @@ try:
     )
 
     from .adaln import adaln, rms_adaln
+    from .conv_bias_leaky_relu import conv_bias_leaky_relu_
     from .na import na3d
     from .quantization import (
         dequantize_nvfp4,
@@ -117,6 +119,16 @@ if _TRITON_AVAILABLE:
         return _triton_quantize_and_rotate_rowwise(x, h, group_size)
 
 
+def conv_bias_leaky_relu_too_small(x: torch.Tensor) -> str | None:
+    """The size part of the conv_bias_leaky_relu_ call rule for a 4-D x: why x runs eager, or
+    None. The public function reads it too, to run these calls eager without the dispatch."""
+    if x.shape[2] * x.shape[3] < 16384:
+        return "H * W < 16384 runs eager"
+    if not torch.version.hip and x.numel() < 12 * 2**20:
+        return "numel < 12 * 2**20 runs eager on CUDA"
+    return None
+
+
 def _build_constraints() -> dict:
     def _na3d_call_rule(kwargs):
         common = na3d_common_call_rule(kwargs)
@@ -125,6 +137,37 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _conv_bias_leaky_relu_call_rule(kwargs):
+        # Size threshold on the pixels per channel plane: smaller planes run eager. On CUDA
+        # (not ROCm) builds, tensors below an element count threshold also run eager. The PR
+        # that added this op lists the FILM pyramid levels each threshold was set on.
+        x, bias = kwargs.get("x"), kwargs.get("bias")
+        if x is None or bias is None:
+            return ValidationResult.ok()
+        if x.dim() != 4:
+            return ValidationResult.fail("x", "x must be [N, C, H, W]")
+        if x.dtype != torch.float16 or bias.dtype != x.dtype:
+            return ValidationResult.fail("x", "x and bias must be float16")
+        if bias.device != x.device:
+            return ValidationResult.fail("bias", "bias must be on x's device")
+        if not bias.is_contiguous():
+            return ValidationResult.fail("bias", "bias must be contiguous")
+        n, c, _, _ = x.shape
+        if x.numel() == 0 or x.numel() >= 2**31:
+            return ValidationResult.fail("x", "numel must be in [1, 2**31)")
+        too_small = conv_bias_leaky_relu_too_small(x)
+        if too_small:
+            return ValidationResult.fail("x", too_small)
+        if x.is_contiguous():
+            if n * c > 65535:
+                return ValidationResult.fail("x", "N * C must be <= 65535 (grid)")
+        elif x.is_contiguous(memory_format=torch.channels_last):
+            if c > 1024:
+                return ValidationResult.fail("x", "channels_last needs C <= 1024")
+        else:
+            return ValidationResult.fail("x", "x must be contiguous or channels_last")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -336,6 +379,15 @@ def _build_constraints() -> dict:
         # tl.dot needs Ampere matrix capability for the non-IEEE float paths
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
+    )
+    # cuda covers ROCm builds of PyTorch (device type "cuda")
+    out["conv_bias_leaky_relu_"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(4),)),
+            "bias": ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(1),)),
+        },
+        default_devices=cuda_devices,
+        call_rules=(_conv_bias_leaky_relu_call_rule,),
     )
     return out
 
