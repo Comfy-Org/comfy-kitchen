@@ -351,7 +351,7 @@ class TestMoeTop2DispatchTriton:
             device="cuda",
         )
         x = torch.randn(6, 64, device="cuda").to(torch.bfloat16)
-        with ck.use_backend("triton"):
+        with self._served("triton"), ck.use_backend("triton"):
             weight, idx, x_sorted, slot, _ = ck.moe_top2_dispatch(x, logits)
         assert idx.tolist() == [[0, 1], [1, 2], [0, 1], [3, 0], [0, 2], [2, 3]]
         assert torch.equal(weight, logits.softmax(dim=-1).gather(1, idx))
@@ -404,7 +404,7 @@ class TestMoeTop2DispatchTriton:
         x = torch.randn(2, 300, 256, device="cuda").to(torch.bfloat16)
         gate = (torch.randn(4, 256) * 0.02).to(device="cuda", dtype=torch.bfloat16)
         experts, shared = _moe_weights(256, 384, 4, torch.bfloat16, "cuda")
-        with ck.use_backend("triton"):
+        with self._served("triton"), ck.use_backend("triton"):
             got = _kitchen_moe(x, gate, experts, shared)
         ref = _stock_moe(x, gate, experts, shared)
         rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
