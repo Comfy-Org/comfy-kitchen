@@ -17,6 +17,13 @@
 #include <string>
 #include <type_traits>
 
+#ifdef COMFY_HAVE_CONVROT_BF16
+namespace comfy {
+bool try_quantize_int8_convrot_bf16_4096(
+    const void*, void*, float*, int64_t, cudaStream_t);
+}
+#endif
+
 namespace comfy {
 
 namespace {
@@ -1741,6 +1748,14 @@ void launch_quantize_int8_rowwise_convrot_kernel(
     if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("convrot fused kernel only supports K <= INT_MAX");
     }
+
+#ifdef COMFY_HAVE_CONVROT_BF16
+    if (!stochastic && input_dtype_code == comfy::DTYPE_CODE_BFLOAT16 && num_cols == 4096 &&
+        comfy::try_quantize_int8_convrot_bf16_4096(
+            input, output, static_cast<float*>(scales), num_rows, stream)) {
+        return;
+    }
+#endif
 
     // Decode fast path: at small M the smem kernel's barrier chain dominates
     // its runtime (1-3 blocks in flight); the warp-shuffle variant is bit-exact
