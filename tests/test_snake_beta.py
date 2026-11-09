@@ -11,6 +11,7 @@ add. The decoder passes contiguous fp16 tensors (conv outputs and the fp16 param
 dtypes and layouts must go to eager.
 """
 
+import contextlib
 import importlib
 
 import pytest
@@ -354,6 +355,25 @@ class TestSnakeBetaTriton:
             pytest.skip("triton backend not available")
 
     @staticmethod
+    @contextlib.contextmanager
+    def _served(expected, op=OP):
+        # the backend of the implementation the registry returns for each call in the block
+        # (get_implementation wrapped), so the check is on the call that ran, not on a query
+        served = []
+        get_implementation = registry.get_implementation
+
+        def recording(func_name, backend=None, kwargs=None):
+            impl = get_implementation(func_name, backend, kwargs)
+            if func_name == op:
+                served.append(impl.__module__.rsplit(".", 2)[-2])
+            return impl
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(registry, "get_implementation", recording)
+            yield
+        assert served and all(b == expected for b in served), served
+
+    @staticmethod
     def _inputs(c, t, residual, b=1, dtype=torch.float16):
         x = torch.randn(b, c, t, device="cuda").to(dtype)
         alpha, beta = _params(c, device="cuda", dtype=dtype)
@@ -442,9 +462,7 @@ class TestSnakeBetaTriton:
         x[..., :n].normal_()
         x[..., -n:].normal_()
         alpha, beta = _params(1, device="cuda", dtype=torch.float16)
-        kwargs = {"x": x, "alpha": alpha, "beta": beta, "residual": None}
-        assert registry.get_capable_backend(OP, kwargs) == "triton"
-        with ck.use_backend("triton"):
+        with self._served("triton"), ck.use_backend("triton"):
             got = ck.snake_beta(x, alpha, beta)
         torch.cuda.synchronize()
         for sl in (slice(0, n), slice(t - n, t)):
