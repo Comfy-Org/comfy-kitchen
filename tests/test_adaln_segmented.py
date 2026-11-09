@@ -270,14 +270,27 @@ class TestSegmentedTriton:
             assert torch.equal(got, want)
 
     @pytest.mark.parametrize("backend", ["eager", "triton"])
-    def test_autocast_keeps_dtype(self, backend):
-        x = torch.randn(1, 8, 64, dtype=torch.float16, device="cuda")
-        mods = torch.randn(2, 1, 64, dtype=torch.float16, device="cuda")
-        kwargs = {"x": x, "scale": mods, "shift": mods, "split": 3, "eps": 1e-6}
+    @pytest.mark.parametrize("rms", [False, True])
+    def test_autocast_keeps_dtype(self, backend, rms, monkeypatch):
+        # bf16 inputs under fp16 autocast, so a cast of the inputs would change the dtype;
+        # the backend that served each call is recorded rather than looked up separately
+        x = torch.randn(1, 8, 64, dtype=torch.bfloat16, device="cuda")
+        mods = torch.randn(2, 1, 64, dtype=torch.bfloat16, device="cuda")
+        norm = (1e-5, torch.randn(64, device="cuda") * 0.1, 1.0) if rms else ()
+        served = []
+        get_implementation = registry.get_implementation
+
+        def recording(func_name, backend=None, kwargs=None):
+            impl = get_implementation(func_name, backend, kwargs)
+            if func_name == "adaln_segmented":
+                served.append(impl.__module__.rsplit(".", 2)[-2])
+            return impl
+
+        monkeypatch.setattr(registry, "get_implementation", recording)
         with ck.use_backend(backend):
-            want = ck.adaln_segmented(x, mods, mods, 3)
+            want = ck.adaln_segmented(x, mods, mods, 3, *norm)
             with torch.autocast("cuda", dtype=torch.float16):
-                assert registry.get_capable_backend("adaln_segmented", kwargs) == backend
-                got = ck.adaln_segmented(x, mods, mods, 3)
+                got = ck.adaln_segmented(x, mods, mods, 3, *norm)
+        assert served == [backend, backend]
         assert got.dtype == x.dtype
         assert torch.equal(got, want)
