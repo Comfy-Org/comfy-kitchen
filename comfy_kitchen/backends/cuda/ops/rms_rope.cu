@@ -45,16 +45,13 @@ inline bool overlap(const void *a, const void *b, uint64_t bytes) {
   return x <= y ? y - x < bytes : x - y < bytes;
 }
 
-// Reuse a token's general FP32 2x2 matrices across 16 heads, keeping Q and K
-// in separate half-warps. Four BF16 head buffers hide input load latency.
-// FP32 statistics and the BF16 normalization materialization are preserved.
-template <int V> union Packed {
+template <typename T, int V> union Packed {
   uint4 v4[(V + 7) / 8];
   uint64_t v2[(V + 3) / 4];
-  __nv_bfloat162 h[V / 2];
+  std::conditional_t<std::is_same_v<T, half>, half2, __nv_bfloat162> h[V / 2];
 };
-template <int V>
-__device__ __forceinline__ void storep(__nv_bfloat16 *x, const Packed<V> &a) {
+template <int V, typename T>
+__device__ __forceinline__ void storep(T *x, const Packed<T, V> &a) {
   if constexpr (V >= 8) {
 #pragma unroll
     for (int j = 0; j < V / 8; j++)
@@ -73,8 +70,7 @@ __device__ __forceinline__ float2 expand2(__nv_bfloat162 x) {
     uint32_t u;
   } a;
   a.h = x;
-  return make_float2(__uint_as_float(a.u << 16),
-                     __uint_as_float(a.u & 0xffff0000u));
+  return make_float2(__uint_as_float(a.u << 16), __uint_as_float(a.u & 0xffff0000u));
 }
 __device__ __forceinline__ float expand1(__nv_bfloat16 x) {
   union {
@@ -84,29 +80,148 @@ __device__ __forceinline__ float expand1(__nv_bfloat16 x) {
   a.h = x;
   return __uint_as_float(uint32_t(a.u) << 16);
 }
-template <bool SPLIT>
-__device__ __forceinline__ void readrow(Packed<8> &v, const __nv_bfloat16 *x,
-                                        uint32_t row, int lane, bool valid) {
+__device__ __forceinline__ float2 expand2(half2 v) { return __half22float2(v); }
+__device__ __forceinline__ float expand1(half v) { return __half2float(v); }
+template <class T> __device__ __forceinline__ auto pack2(float a, float b) {
+  if constexpr (std::is_same_v<T, half>)
+    return __floats2half2_rn(a, b);
+  else
+    return __floats2bfloat162_rn(a, b);
+}
+template <typename T, bool SPLIT>
+__device__ __forceinline__ void readrow(Packed<T, 8> &v, const T *x, uint64_t row,
+                                        int lane, int D, bool valid) {
   if (!valid) {
     v.v4[0] = make_uint4(0, 0, 0, 0);
     return;
   }
   if constexpr (SPLIT) {
-    v.v2[0] =
-        *reinterpret_cast<const uint64_t *>(x + (uint64_t)row * 128 + lane * 4);
-    v.v2[1] = *reinterpret_cast<const uint64_t *>(x + (uint64_t)row * 128 + 64 +
-                                                  lane * 4);
+    v.v2[0] = *reinterpret_cast<const uint64_t *>(x + row + lane * 4);
+    v.v2[1] = *reinterpret_cast<const uint64_t *>(x + row + D / 2 + lane * 4);
   } else
-    v.v4[0] =
-        *reinterpret_cast<const uint4 *>(x + (uint64_t)row * 128 + lane * 8);
+    v.v4[0] = *reinterpret_cast<const uint4 *>(x + row + lane * 8);
 }
+
+// Both scheduling paths share the same normalization and rotation math.
+#if __CUDA_ARCH__ >= 1000
+constexpr bool kPairedMath = true;
+#else
+constexpr bool kPairedMath = false;
+#endif
+
+template <typename T, bool Split>
+__device__ __forceinline__ void unpack_head(const Packed<T, 8> &input,
+                                            float2 (&values)[4]) {
+  if constexpr (Split) {
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      float2 lo = expand2(input.h[j]), hi = expand2(input.h[j + 2]);
+      values[2 * j] = make_float2(lo.x, hi.x);
+      values[2 * j + 1] = make_float2(lo.y, hi.y);
+    }
+  } else {
+#pragma unroll
+    for (int p = 0; p < 4; ++p)
+      values[p] = expand2(input.h[p]);
+  }
+}
+
+template <typename T, bool Split, bool FP32Weights, bool RMS>
+__device__ __forceinline__ void
+load_rotation_weights(const float4 *freqs, const void *weights, uint64_t token, int D,
+                      int lane, float4 (&rotation)[4], float2 (&scale)[4]) {
+#pragma unroll
+  for (int p = 0; p < 4; ++p) {
+    int pair = lane * 4 + p;
+    int c0 = Split ? pair : pair * 2;
+    int c1 = Split ? pair + D / 2 : pair * 2 + 1;
+    rotation[p] = freqs[token * (D / 2) + pair];
+    if constexpr (!RMS)
+      scale[p] = make_float2(1.f, 1.f);
+    else if constexpr (FP32Weights)
+      scale[p] = make_float2(static_cast<const float *>(weights)[c0],
+                             static_cast<const float *>(weights)[c1]);
+    else
+      scale[p] = make_float2(expand1(static_cast<const T *>(weights)[c0]),
+                             expand1(static_cast<const T *>(weights)[c1]));
+  }
+}
+
+template <typename T, bool RMS, bool Paired>
+__device__ __forceinline__ float2 normalize_pair(float2 x, float inv, float2 w) {
+#if __CUDA_ARCH__ >= 1000
+  if constexpr (Paired) {
+    if constexpr (!RMS)
+      return x;
+    float2 value = __fmul2_rn(__fmul2_rn(x, make_float2(inv, inv)), w);
+    return expand2(pack2<T>(value.x, value.y));
+  }
+#endif
+  return expand2(pack2<T>(x.x * inv * w.x, x.y * inv * w.y));
+}
+
+template <typename T, bool Split, bool RMS, bool Paired>
+__device__ __forceinline__ void
+transform_head(const float2 (&values)[4], const float4 (&rotation)[4],
+               const float2 (&scale)[4], T *output, uint64_t row, int lane, int D,
+               bool valid, float epsilon) {
+  float sum = 0.f;
+  if constexpr (RMS) {
+#if __CUDA_ARCH__ >= 1000
+    if constexpr (Paired) {
+      float2 pair_sum = make_float2(0.f, 0.f);
+#pragma unroll
+      for (int p = 0; p < 4; ++p)
+        pair_sum = __ffma2_rn(values[p], values[p], pair_sum);
+      sum = pair_sum.x + pair_sum.y;
+    } else
+#endif
+    {
+#pragma unroll
+      for (int p = 0; p < 4; ++p)
+        sum += values[p].x * values[p].x + values[p].y * values[p].y;
+    }
+#pragma unroll
+    for (int delta = D / 16; delta; delta /= 2)
+      sum += __shfl_xor_sync(0xffffffff, sum, delta, D / 8);
+  }
+  float inv = RMS ? rsqrt_fast(sum * (1.f / D) + epsilon) : 1.f;
+  Packed<T, 8> out;
+  Packed<T, 4> lo, hi;
+  if constexpr (Split) {
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      int p = 2 * j;
+      float4 a = rotation[p], b = rotation[p + 1];
+      float2 n = normalize_pair<T, RMS, Paired>(values[p], inv, scale[p]);
+      float2 m = normalize_pair<T, RMS, Paired>(values[p + 1], inv, scale[p + 1]);
+      lo.h[j] = pack2<T>(fmaf(a.y, n.y, a.x * n.x), fmaf(b.y, m.y, b.x * m.x));
+      hi.h[j] = pack2<T>(fmaf(a.z, n.x, a.w * n.y), fmaf(b.z, m.x, b.w * m.y));
+    }
+  } else {
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+      float4 a = rotation[p];
+      float2 n = normalize_pair<T, RMS, Paired>(values[p], inv, scale[p]);
+      out.h[p] = pack2<T>(fmaf(a.y, n.y, a.x * n.x), fmaf(a.z, n.x, a.w * n.y));
+    }
+  }
+  if (valid) {
+    if constexpr (Split) {
+      storep<4>(output + row + lane * 4, lo);
+      storep<4>(output + row + D / 2 + lane * 4, hi);
+    } else
+      storep<8>(output + row + lane * 8, out);
+  }
+}
+
+// Preserve the 16-head scheduler for protected Hopper/RTX shapes.
 template <bool SPLIT, bool WF32>
 __global__ void
 rms_rope_pipelined(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
                    const float4 *__restrict__ f, const void *__restrict__ wq,
-                   const void *__restrict__ wk, __nv_bfloat16 *oq,
-                   __nv_bfloat16 *ok, int B, int H, int T, bool bnhd,
-                   float eps) {
+                   const void *__restrict__ wk, __nv_bfloat16 *oq, __nv_bfloat16 *ok,
+                   int B, int H, int T, bool bnhd, float eps) {
   constexpr int G = 16, STAGES = 4, V = 8, P = 4;
   int lane = threadIdx.x % 32, lc = lane % 16;
   bool isk = lane >= 16;
@@ -139,24 +254,15 @@ rms_rope_pipelined(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
     }
     float4 ff[P];
     float2 ww[P];
-#pragma unroll
-    for (int p = 0; p < P; p++) {
-      int pair = lc * P + p, c0 = SPLIT ? pair : pair * 2,
-          c1 = SPLIT ? pair + 64 : pair * 2 + 1;
-      ff[p] = f[(uint64_t)token * 64 + pair];
-      if constexpr (WF32)
-        ww[p] = make_float2(((const float *)w)[c0], ((const float *)w)[c1]);
-      else
-        ww[p] = make_float2(expand1(((const __nv_bfloat16 *)w)[c0]),
-                            expand1(((const __nv_bfloat16 *)w)[c1]));
-    }
-    Packed<V> buf[STAGES];
+    load_rotation_weights<__nv_bfloat16, SPLIT, WF32, true>(f, w, token, 128, lc, ff,
+                                                            ww);
+    Packed<__nv_bfloat16, V> buf[STAGES];
 #pragma unroll
     for (int s = 0; s < STAGES; s++) {
       int head = hb + s;
       uint32_t row = bnhd ? (batch * (uint32_t)T + token) * (uint32_t)H + head
                           : (batch * (uint32_t)H + head) * (uint32_t)T + token;
-      readrow<SPLIT>(buf[s], x, row, lc, head < H);
+      readrow<__nv_bfloat16, SPLIT>(buf[s], x, uint64_t(row) * 128, lc, 128, head < H);
     }
 #pragma unroll
     for (int g = 0; g < G; g++) {
@@ -165,159 +271,232 @@ rms_rope_pipelined(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
       uint32_t row = bnhd ? (batch * (uint32_t)T + token) * (uint32_t)H + head
                           : (batch * (uint32_t)H + head) * (uint32_t)T + token;
       float2 xx[P];
-      float sum = 0;
-      if constexpr (SPLIT) {
-#pragma unroll
-        for (int j = 0; j < P / 2; j++) {
-          float2 l = expand2(buf[g % STAGES].h[j]),
-                 h = expand2(buf[g % STAGES].h[j + P / 2]);
-          xx[2 * j] = make_float2(l.x, h.x);
-          xx[2 * j + 1] = make_float2(l.y, h.y);
-        }
-      } else {
-#pragma unroll
-        for (int p = 0; p < P; p++)
-          xx[p] = expand2(buf[g % STAGES].h[p]);
-      }
+      unpack_head<__nv_bfloat16, SPLIT>(buf[g % STAGES], xx);
       if constexpr (STAGES < G) {
         if (g + STAGES < G) {
           int fh = hb + g + STAGES;
           uint32_t fr = bnhd ? (batch * (uint32_t)T + token) * (uint32_t)H + fh
                              : (batch * (uint32_t)H + fh) * (uint32_t)T + token;
-          readrow<SPLIT>(buf[g % STAGES], x, fr, lc, fh < H);
+          readrow<__nv_bfloat16, SPLIT>(buf[g % STAGES], x, uint64_t(fr) * 128, lc, 128,
+                                        fh < H);
         }
       }
-#pragma unroll
-      for (int p = 0; p < P; p++)
-        sum += xx[p].x * xx[p].x + xx[p].y * xx[p].y;
-#pragma unroll
-      for (int delta = 8; delta; delta /= 2)
-        sum += __shfl_xor_sync(0xffffffff, sum, delta, 16);
-      float inv = rsqrt_fast(sum * (1.f / 128.f) + eps);
-      Packed<V> out;
-      Packed<P> lo, hi;
-      if constexpr (SPLIT) {
-#pragma unroll
-        for (int j = 0; j < P / 2; j++) {
-          int p = 2 * j;
-          float4 a = ff[p], b = ff[p + 1];
-          float2 n = expand2(__floats2bfloat162_rn(xx[p].x * inv * ww[p].x,
-                                                   xx[p].y * inv * ww[p].y));
-          float2 m =
-              expand2(__floats2bfloat162_rn(xx[p + 1].x * inv * ww[p + 1].x,
-                                            xx[p + 1].y * inv * ww[p + 1].y));
-          float a0 = fmaf(a.y, n.y, a.x * n.x), a1 = fmaf(a.z, n.x, a.w * n.y),
-                b0 = fmaf(b.y, m.y, b.x * m.x), b1 = fmaf(b.z, m.x, b.w * m.y);
-          lo.h[j] = __floats2bfloat162_rn(a0, b0);
-          hi.h[j] = __floats2bfloat162_rn(a1, b1);
-        }
-      } else {
-#pragma unroll
-        for (int p = 0; p < P; p++) {
-          float4 a = ff[p];
-          float2 n = expand2(__floats2bfloat162_rn(xx[p].x * inv * ww[p].x,
-                                                   xx[p].y * inv * ww[p].y));
-          out.h[p] = __floats2bfloat162_rn(fmaf(a.y, n.y, a.x * n.x),
-                                           fmaf(a.z, n.x, a.w * n.y));
-        }
-      }
-      if (valid) {
-        if constexpr (SPLIT) {
-          storep<P>(y + (uint64_t)row * 128 + lc * P, lo);
-          storep<P>(y + (uint64_t)row * 128 + 64 + lc * P, hi);
-        } else
-          storep<V>(y + (uint64_t)row * 128 + lc * V, out);
-      }
+      transform_head<__nv_bfloat16, SPLIT, true, false>(
+          xx, ff, ww, y, uint64_t(row) * 128, lc, 128, valid, eps);
     }
   }
 }
 
 template <bool Split, bool FP32Weights>
-inline void
-launch_rms_rope_pipelined(const void *q, const void *k, const void *freqs,
-                          const void *wq, const void *wk, void *oq, void *ok,
-                          int batch, int heads, int tokens, bool bnhd,
-                          float epsilon, cudaStream_t stream) {
+inline void launch_rms_rope_pipelined(const void *q, const void *k, const void *freqs,
+                                      const void *wq, const void *wk, void *oq,
+                                      void *ok, int batch, int heads, int tokens,
+                                      bool bnhd, float epsilon, cudaStream_t stream) {
   const int threads = Split && !FP32Weights ? 64 : 128;
   const int tiles = batch * tokens * ((heads + 15) / 16);
   const int blocks = (tiles + threads / 32 - 1) / (threads / 32);
   rms_rope_pipelined<Split, FP32Weights><<<blocks, threads, 0, stream>>>(
-      static_cast<const __nv_bfloat16 *>(q),
-      static_cast<const __nv_bfloat16 *>(k), static_cast<const float4 *>(freqs),
-      wq, wk, static_cast<__nv_bfloat16 *>(oq),
+      static_cast<const __nv_bfloat16 *>(q), static_cast<const __nv_bfloat16 *>(k),
+      static_cast<const float4 *>(freqs), wq, wk, static_cast<__nv_bfloat16 *>(oq),
       static_cast<__nv_bfloat16 *>(ok), batch, heads, tokens, bnhd, epsilon);
 }
-inline bool try_rms_rope(const void *q, const void *k, const void *freqs,
-                         const void *wq, const void *wk, void *oq, void *ok,
-                         int64_t batch, int64_t dim1, int64_t dim2,
-                         int64_t head_dim, int64_t rot_dim, int64_t fb,
-                         int64_t f1, int64_t f2, const int64_t *qs,
-                         const int64_t *ks, const int64_t *os,
-                         const int64_t *ps, const int64_t *fs, int64_t wqs,
-                         int64_t wks, float epsilon, int input_dtype,
-                         int freq_dtype, int weight_dtype, bool has_k,
-                         bool split, cudaStream_t stream) {
-  if (!has_k || input_dtype != 2 || freq_dtype != 0 ||
-      (weight_dtype != 0 && weight_dtype != 2) || head_dim != 128 ||
-      rot_dim != 128 || wqs != 1 || wks != 1 || fb != 1 || batch < 1 ||
-      batch > 2)
-    return false;
-  bool bnhd;
-  int64_t heads, tokens;
-  if (f1 == 1 && f2 == dim2) {
-    bnhd = false;
-    heads = dim1;
-    tokens = dim2;
-  } else if (f2 == 1 && f1 == dim1) {
-    bnhd = true;
-    heads = dim2;
-    tokens = dim1;
-  } else
-    return false;
-  // Bound all row/tile indexing before forming products or pointer ranges.
-  if ((heads != 8 && heads != 16 && heads != 32) || tokens < 1024 ||
-      tokens > 32768 || (tokens & (tokens - 1)))
-    return false;
-  if (batch * heads * tokens < 32768)
-    return false;
-  const int64_t expected[4] = {dim1 * dim2 * 128, dim2 * 128, 128, 1};
-  for (int i = 0; i < 4; ++i)
-    if (qs[i] != expected[i] || ks[i] != expected[i] || os[i] != expected[i] ||
-        ps[i] != expected[i])
-      return false;
-  if (fs[3] != 4 || fs[4] != 2 || fs[5] != 1 || fs[bnhd ? 1 : 2] != 256)
-    return false;
-  if (!aligned_to(q, 16) || !aligned_to(k, 16) || !aligned_to(oq, 16) ||
-      !aligned_to(ok, 16) || !aligned_to(freqs, 16))
-    return false;
-  const uint64_t bytes = batch * heads * tokens * 128 * 2;
-  if (overlap(q, oq, bytes) || overlap(q, ok, bytes) || overlap(k, oq, bytes) ||
-      overlap(k, ok, bytes) || overlap(oq, ok, bytes))
-    return false;
-  const int sm = device_sm();
-  if ((sm != 90 && sm != 103 && sm != 120) || (bnhd && sm != 90) ||
-      (sm == 120 && heads < 16))
-    return false;
-#define LAUNCH(SPLIT, FP32)                                                    \
-  launch_rms_rope_pipelined<SPLIT, FP32>(q, k, freqs, wq, wk, oq, ok, batch,   \
-                                         heads, tokens, bnhd, epsilon, stream)
-  if (split) {
-    if (weight_dtype == 0) {
-      LAUNCH(true, true);
+// Reuse matrices across up to 32 heads with four staged input loads.
+template <typename T, bool SPLIT, bool WF32, bool RMS>
+__device__ __forceinline__ void
+rope_reuse_body(const T *q, const T *k, const float4 *__restrict__ f,
+                const void *__restrict__ wq, const void *__restrict__ wk, T *oq, T *ok,
+                int B, int H, int N, int D, bool bnhd, bool dual, float eps) {
+  constexpr int G = 32, STAGES = 4, V = 8, P = 4;
+  int lane = threadIdx.x % 32;
+  const int width = D / 8, groups = 32 / width;
+  const int head_groups = (dual && width < 32) ? groups / 2 : groups;
+  const uint64_t warp = (uint64_t(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+  const int duplicate = dual && width == 32;
+  const int lc = lane % width;
+  const bool isk = dual && (width == 32 ? (warp & 1) : ((lane / width) & 1));
+  const int head_group = dual ? (lane / width) / 2 : lane / width;
+  const T *x = isk ? k : q;
+  T *y = isk ? ok : oq;
+  const void *w = isk ? wk : wq;
+  const uint64_t head_tiles = (H + G - 1) / G;
+  for (uint64_t token = warp >> duplicate; token < uint64_t(N);
+       token += (uint64_t(gridDim.x) * (blockDim.x >> 5)) >> duplicate) {
+    uint64_t bh = blockIdx.y, batch, hb;
+    if (B == 1) {
+      batch = 0;
+      hb = bh * G;
+    } else if (head_tiles == 1) {
+      batch = bh;
+      hb = 0;
     } else {
-      LAUNCH(true, false);
+      batch = bh / head_tiles;
+      hb = (bh - batch * head_tiles) * G;
     }
-  } else {
-    if (weight_dtype == 0) {
-      LAUNCH(false, true);
-    } else {
-      LAUNCH(false, false);
+    const int available = min(G, int(H - hb));
+    const int iterations = (available + head_groups - 1) / head_groups;
+    hb += head_group * iterations;
+    float4 ff[P];
+    float2 ww[P];
+    load_rotation_weights<T, SPLIT, WF32, RMS>(f, w, token, D, lc, ff, ww);
+    Packed<T, V> buf[STAGES];
+    const uint64_t stride = bnhd ? uint64_t(D) : uint64_t(N) * D;
+    uint64_t row = (bnhd ? (batch * uint64_t(N) + token) * H + hb
+                         : (batch * uint64_t(H) + hb) * N + token) *
+                   D;
+#pragma unroll
+    for (int s = 0; s < STAGES; ++s)
+      readrow<T, SPLIT>(buf[s], x, row + uint64_t(s) * stride, lc, D,
+                        hb + s < H && s < iterations);
+    for (int chunk = 0; chunk < iterations; chunk += STAGES) {
+#pragma unroll
+      for (int stage = 0; stage < STAGES; ++stage) {
+        const int g = chunk + stage;
+        if (g >= iterations)
+          break;
+        const int head = hb + g;
+        const bool valid = head < H;
+        float2 xx[P];
+        unpack_head<T, SPLIT>(buf[stage], xx);
+        if constexpr (STAGES < G) {
+          if (g + STAGES < iterations) {
+            int fh = hb + g + STAGES;
+            uint64_t fr = row + uint64_t(STAGES) * stride;
+            readrow<T, SPLIT>(buf[stage], x, fr, lc, D, fh < H);
+          }
+        }
+        transform_head<T, SPLIT, RMS, kPairedMath>(xx, ff, ww, y, row, lc, D, valid,
+                                                   eps);
+        row += stride;
+      }
     }
   }
-#undef LAUNCH
+}
+
+template <typename T, bool SPLIT, bool WF32, bool RMS>
+#if __CUDA_ARCH__ == 900
+__global__ __launch_bounds__(128, 1)
+#else
+__global__ __launch_bounds__(128, RMS ? 6 : 7)
+#endif
+    void rope_reuse_kernel(const T *q, const T *k, const float4 *f, const void *wq,
+                           const void *wk, T *oq, T *ok, int B, int H, int N, int D,
+                           bool bnhd, bool dual, float eps) {
+  if (D == 128)
+    rope_reuse_body<T, SPLIT, WF32, RMS>(q, k, f, wq, wk, oq, ok, B, H, N, 128, bnhd,
+                                         dual, eps);
+  else
+    rope_reuse_body<T, SPLIT, WF32, RMS>(q, k, f, wq, wk, oq, ok, B, H, N, D, bnhd,
+                                         dual, eps);
+}
+
+// Keep D128 register allocation independent of the general-width body.
+template <bool WF32>
+__global__ __launch_bounds__(128, 6) void rope_reuse_128_kernel(
+    const nv_bfloat16 *q, const nv_bfloat16 *k, const float4 *f, const void *wq,
+    const void *wk, nv_bfloat16 *oq, nv_bfloat16 *ok, int B, int H, int N, bool bnhd,
+    bool dual, float eps) {
+  rope_reuse_body<nv_bfloat16, false, WF32, true>(q, k, f, wq, wk, oq, ok, B, H, N, 128,
+                                                  bnhd, dual, eps);
+}
+
+template <typename T, bool Split, bool FP32Weights, bool RMS>
+inline void launch_rope_reuse(const void *q, const void *k, const void *freqs,
+                              const void *wq, const void *wk, void *oq, void *ok,
+                              int batch, int heads, int tokens, int D, bool bnhd,
+                              bool dual, float epsilon, int sm, bool legacy,
+                              cudaStream_t stream) {
+  if constexpr (RMS && std::is_same_v<T, nv_bfloat16>) {
+    if (legacy) {
+      launch_rms_rope_pipelined<Split, FP32Weights>(
+          q, k, freqs, wq, wk, oq, ok, batch, heads, tokens, bnhd, epsilon, stream);
+      return;
+    }
+  }
+  const int threads = Split && !FP32Weights ? 64 : 128;
+  const int tiles = tokens;
+  const int warps = tiles * ((D == 256 && dual) ? 2 : 1);
+  const int blocks = (warps + threads / 32 - 1) / (threads / 32);
+  if constexpr (RMS && !Split && std::is_same_v<T, nv_bfloat16>) {
+    if (D == 128 && (sm == 100 || sm == 103)) {
+      rope_reuse_128_kernel<FP32Weights>
+          <<<dim3(blocks, batch * ((heads + 31) / 32)), threads, 0, stream>>>(
+              static_cast<const T *>(q), static_cast<const T *>(k),
+              static_cast<const float4 *>(freqs), wq, wk, static_cast<T *>(oq),
+              static_cast<T *>(ok), batch, heads, tokens, bnhd, dual, epsilon);
+      return;
+    }
+  }
+  rope_reuse_kernel<T, Split, FP32Weights, RMS>
+      <<<dim3(blocks, batch * ((heads + 31) / 32)), threads, 0, stream>>>(
+          static_cast<const T *>(q), static_cast<const T *>(k),
+          static_cast<const float4 *>(freqs), wq, wk, static_cast<T *>(oq),
+          static_cast<T *>(ok), batch, heads, tokens, D, bnhd, dual, epsilon);
+}
+inline bool try_fast_rope(const void *q, const void *k, const void *f, const void *wq,
+                          const void *wk, void *oq, void *ok, int64_t B, int64_t d1,
+                          int64_t d2, int64_t D, int64_t rot, int64_t fb, int64_t f1,
+                          int64_t f2, const int64_t *qs, const int64_t *ks,
+                          const int64_t *os, const int64_t *ps, const int64_t *fs,
+                          int64_t wqs, int64_t wks, float epsilon, int dtype, int ftype,
+                          int wtype, bool dual, bool split, bool rms,
+                          cudaStream_t stream) {
+  if ((dtype != 1 && dtype != 2) || ftype != 0 || fb != 1 || rot != D ||
+      (D != 64 && D != 128 && D != 256) || B < 1 || B > 2 || d1 < 1 || d2 < 1 ||
+      d1 > INT32_MAX || d2 > INT32_MAX || B > INT32_MAX / d1 / d2 ||
+      B * d1 * d2 * D < 1048576 ||
+      (rms && ((wtype != 0 && wtype != dtype) || wqs != 1 || (dual && wks != 1))))
+    return false;
+  bool bnhd;
+  int64_t H, N;
+  if (f1 == 1 && f2 == d2) {
+    bnhd = false;
+    H = d1;
+    N = d2;
+  } else if (f2 == 1 && f1 == d1) {
+    bnhd = true;
+    H = d2;
+    N = d1;
+  } else
+    return false;
+  if (H > 32 || N < 1024 || N > 262144 || fs[3] != 4 || fs[4] != 2 || fs[5] != 1 ||
+      fs[bnhd ? 1 : 2] != D * 2)
+    return false;
+  const int64_t strides[] = {d1 * d2 * D, d2 * D, D, 1};
+  for (int i = 0; i < 4; ++i)
+    if (qs[i] != strides[i] || os[i] != strides[i] ||
+        (dual && (ks[i] != strides[i] || ps[i] != strides[i])))
+      return false;
+  if (!aligned_to(q, 16) || !aligned_to(oq, 16) || !aligned_to(f, 16) ||
+      (dual && (!aligned_to(k, 16) || !aligned_to(ok, 16))))
+    return false;
+  const uint64_t bytes = uint64_t(B) * d1 * d2 * D * 2;
+  if ((q != oq && overlap(q, oq, bytes)) ||
+      (dual && ((k != ok && overlap(k, ok, bytes)) || overlap(q, ok, bytes) ||
+                overlap(k, oq, bytes) || overlap(oq, ok, bytes))))
+    return false;
+  const int sm = device_sm();
+  const bool legacy =
+      rms && dtype == 2 && dual && D == 128 && q != oq && k != ok &&
+      (H == 8 || H == 16 || H == 32) && N <= 32768 && !(N & (N - 1)) &&
+      B * H * N >= 32768 &&
+      (sm == 90 || ((sm == 103 || sm == 120) && !bnhd && (sm != 120 || H >= 16)));
+  if (!legacy && sm != 90 && sm != 100 && sm != 103)
+    return false;
+  DISPATCH_HALF_DTYPE(dtype, T, [&] {
+    DISPATCH_BOOL(split, Split, [&] {
+      DISPATCH_BOOL(rms, RMS, [&] {
+        DISPATCH_BOOL(wtype == 0, FP32Weights, [&] {
+          launch_rope_reuse<T, Split, !RMS || FP32Weights, RMS>(
+              q, k, f, wq, wk, oq, ok, B, H, N, D, bnhd, dual, epsilon, sm, legacy,
+              stream);
+        });
+      });
+    });
+  });
   CUDA_CHECK(cudaGetLastError());
   return true;
 }
+
 } // namespace comfy::optimized
 
 namespace comfy {
@@ -629,6 +808,16 @@ extern "C" void launch_apply_rope_kernel(
     int64_t ko_s3, int64_t f_s0, int64_t f_s1, int64_t f_s2, int64_t f_s3,
     int64_t f_s4, int64_t f_s5, int input_dtype_code, int freqs_dtype_code,
     bool has_k, bool split_half, cudaStream_t stream) {
+  const int64_t qs[] = {q_s0, q_s1, q_s2, q_s3};
+  const int64_t ks[] = {k_s0, k_s1, k_s2, k_s3};
+  const int64_t os[] = {qo_s0, qo_s1, qo_s2, qo_s3};
+  const int64_t ps[] = {ko_s0, ko_s1, ko_s2, ko_s3};
+  const int64_t fs[] = {f_s0, f_s1, f_s2, f_s3, f_s4, f_s5};
+  if (comfy::optimized::try_fast_rope(
+          q, k, freqs, nullptr, nullptr, q_out, k_out, batch, dim1, dim2, head_dim,
+          head_dim, freqs_batch, freqs_dim1, freqs_dim2, qs, ks, os, ps, fs, 0, 0, 0.f,
+          input_dtype_code, freqs_dtype_code, 0, has_k, split_half, false, stream))
+    return;
   DISPATCH_HALF_INPUT_FP_FREQS_DTYPES(input_dtype_code, freqs_dtype_code,
                                       InputType, FreqsType, [&] {
     comfy::rope_launcher<InputType, FreqsType, float, false>(
@@ -656,15 +845,17 @@ extern "C" void launch_rms_rope_kernel(
     int64_t ks_stride, float epsilon, int input_dtype_code,
     int freqs_dtype_code, int scale_dtype_code, bool has_k, bool split_half,
     cudaStream_t stream) {
-  const int64_t qs[] = {q_s0,q_s1,q_s2,q_s3};
-  const int64_t ks[] = {k_s0,k_s1,k_s2,k_s3};
-  const int64_t os[] = {qo_s0,qo_s1,qo_s2,qo_s3};
-  const int64_t ps[] = {ko_s0,ko_s1,ko_s2,ko_s3};
-  const int64_t fs[] = {f_s0,f_s1,f_s2,f_s3,f_s4,f_s5};
-  if (comfy::optimized::try_rms_rope(q,k,freqs,q_scale,k_scale,q_out,k_out,
-      batch,dim1,dim2,head_dim,rot_dim,freqs_batch,freqs_dim1,freqs_dim2,
-      qs,ks,os,ps,fs,qs_stride,ks_stride,epsilon,input_dtype_code,
-      freqs_dtype_code,scale_dtype_code,has_k,split_half,stream)) return;
+  const int64_t qs[] = {q_s0, q_s1, q_s2, q_s3};
+  const int64_t ks[] = {k_s0, k_s1, k_s2, k_s3};
+  const int64_t os[] = {qo_s0, qo_s1, qo_s2, qo_s3};
+  const int64_t ps[] = {ko_s0, ko_s1, ko_s2, ko_s3};
+  const int64_t fs[] = {f_s0, f_s1, f_s2, f_s3, f_s4, f_s5};
+  if (comfy::optimized::try_fast_rope(
+          q, k, freqs, q_scale, k_scale, q_out, k_out, batch, dim1, dim2, head_dim,
+          rot_dim, freqs_batch, freqs_dim1, freqs_dim2, qs, ks, os, ps, fs, qs_stride,
+          ks_stride, epsilon, input_dtype_code, freqs_dtype_code, scale_dtype_code,
+          has_k, split_half, true, stream))
+    return;
   DISPATCH_HALF_DTYPE(input_dtype_code, InputType, [&] {
     DISPATCH_FP_DTYPE(freqs_dtype_code, FreqsType, [&] {
       DISPATCH_FP_DTYPE(scale_dtype_code, ScaleType, [&] {
