@@ -62,13 +62,6 @@ requires_cuda_backend = pytest.mark.skipif(
 )
 
 
-requires_int8 = pytest.mark.skipif(
-    torch.cuda.is_available() and not getattr(torch.version, "hip", None)
-    and torch.cuda.get_device_capability() >= (10, 3),
-    reason="INT8 execution is disabled on NVIDIA SM103+",
-)
-
-
 def skip_unless_gfx12_wmma() -> None:
     if not getattr(torch.version, "hip", None):
         pytest.skip("requires HIP")

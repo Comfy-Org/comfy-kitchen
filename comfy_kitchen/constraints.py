@@ -3,8 +3,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
-from functools import wraps
-from itertools import chain
 
 import torch
 
@@ -270,40 +268,8 @@ def validate_function_call(
     return ValidationResult.ok()
 
 
-# INT8 execution is disabled from SM103 onward, including SM12x.
+# INT8 Tensor Core operations are disabled from SM103 onward, including SM12x.
 INT8_MAX_COMPUTE_CAPABILITY = (10, 2)
-
-
-def cuda_compute_capabilities(values, *, include_hip=False):
-    """Resolve NVIDIA capability from the actual tensors, not the current device."""
-    if getattr(torch.version, "hip", None) and not include_hip:
-        return ()
-    devices = {
-        value.device for value in values
-        if isinstance(value, torch.Tensor) and value.device.type == "cuda"
-    }
-    return tuple(torch.cuda.get_device_capability(device) for device in devices)
-
-
-def guard_compute_capability(maximum):
-    """Also enforce upper bounds on direct/previously retrieved implementations."""
-    def decorate(func):
-        if getattr(func, "_max_compute_capability", None) == maximum:
-            return func
-        constraints = FunctionConstraints(max_compute_capability=maximum)
-
-        @wraps(func)
-        def guarded(*args, **kwargs):
-            for capability in cuda_compute_capabilities(chain(args, kwargs.values())):
-                result = validate_function_call(constraints, {}, compute_capability=capability)
-                if not result.success:
-                    raise RuntimeError(f"{getattr(func, '__name__', type(func).__name__)}: {result.failure_reason}")
-            return func(*args, **kwargs)
-
-        guarded._max_compute_capability = maximum
-        return guarded
-
-    return decorate
 
 
 def sol_attn_common_call_rule(kwargs):

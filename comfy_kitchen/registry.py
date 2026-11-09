@@ -2,17 +2,12 @@ import logging
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
-from dataclasses import replace
+from functools import cached_property
 from typing import Any
 
-from .constraints import (
-    INT8_MAX_COMPUTE_CAPABILITY,
-    FunctionConstraints,
-    ValidationResult,
-    cuda_compute_capabilities,
-    guard_compute_capability,
-    validate_function_call,
-)
+import torch
+
+from .constraints import FunctionConstraints, ValidationResult, validate_function_call
 from .exceptions import (
     BackendNotFoundError,
     BackendNotImplementedError,
@@ -33,6 +28,16 @@ class BackendRegistry:
         self._lock = threading.Lock()
         self._thread_local = threading.local()
 
+    @cached_property
+    def _compute_capability(self) -> tuple[int, int] | None:
+        if torch.cuda.is_available():
+            try:
+                props = torch.cuda.get_device_properties(torch.cuda.current_device())
+                return (props.major, props.minor)
+            except Exception:
+                return None
+        return None
+
     def register(
         self,
         name: str,
@@ -50,31 +55,7 @@ class BackendRegistry:
             self._backends[name] = module
             self._capabilities[name] = set(capabilities.keys())
             for func_name, constraints in capabilities.items():
-                int8 = (
-                    "int8" in func_name.split("_")
-                    and func_name != "rotate_int8_convrot_weight"
-                ) or func_name in {"w4a8_packed_linear", "w6a8_linear", "quantize_and_rotate_rowwise"}
-                if int8 or (name == "cuda" and func_name in {
-                    "int4_linear", "convrot_w4a4_linear", "sol_attn",
-                }):
-                    maximum = min(
-                        constraints.max_compute_capability or INT8_MAX_COMPUTE_CAPABILITY,
-                        INT8_MAX_COMPUTE_CAPABILITY,
-                    )
-                    constraints = replace(constraints, max_compute_capability=maximum)
                 self._constraints[(name, func_name)] = constraints
-                if constraints.max_compute_capability is not None:
-                    func = getattr(module, func_name, None)
-                    if callable(func):
-                        guarded = guard_compute_capability(constraints.max_compute_capability)(func)
-                        setattr(module, func_name, guarded)
-            # Some CUDA helper entries are called directly by mixed-precision paths.
-            for func_name, func in list(vars(module).items()):
-                if (func_name not in capabilities and callable(func)
-                        and not func_name.startswith("_")
-                        and "int8" in func_name.split("_")
-                        and func_name != "rotate_int8_convrot_weight"):
-                    setattr(module, func_name, guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)(func))
             self._unavailable.pop(name, None)
 
     def get_constraints(
@@ -190,16 +171,21 @@ class BackendRegistry:
         if constraints is None:
             return ValidationResult.ok()
 
-        capabilities = (None,)
-        if constraints.min_compute_capability is not None or constraints.max_compute_capability is not None:
-            capabilities = cuda_compute_capabilities(
-                kwargs.values(), include_hip=constraints.min_compute_capability is not None
-            ) or (None,)
-        for capability in capabilities:
-            result = validate_function_call(constraints, kwargs, compute_capability=capability)
-            if not result.success:
-                return result
-        return result
+        if constraints.max_compute_capability is not None:
+            # Upper bounds apply to the input GPU, never to CPU tensors or a
+            # different CUDA device that happens to be current.
+            capability = next((
+                torch.cuda.get_device_capability(value.device)
+                for value in kwargs.values()
+                if isinstance(value, torch.Tensor) and value.device.type == "cuda"
+            ), None)
+        else:
+            capability = self._compute_capability
+        return validate_function_call(
+            constraints,
+            kwargs,
+            compute_capability=capability,
+        )
 
     def get_capable_backend(
         self,

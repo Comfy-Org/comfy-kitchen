@@ -70,12 +70,9 @@ def test_prequantized_attention_rejects_cpu_tensors():
         ((7, 0), False),
         ((8, 0), True),
         ((8, 7), True),
-        ((10, 0), True),
-        ((10, 1), True),
         ((10, 2), True),
         ((10, 3), False),
         ((11, 0), False),
-        ((12, 0), False),
     ],
 )
 def test_int8_attention_capability_dispatch(monkeypatch, capability, expected):

@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import torch
 
-from comfy_kitchen.constraints import INT8_MAX_COMPUTE_CAPABILITY, guard_compute_capability
-
 from comfy_kitchen.backends._activations import apply_input_act, apply_residual
 from comfy_kitchen.tensor.w4a8_packed import _FIXED_LUT, _pack_codes, _unpack_codes, unpack_w4a8_mma_weight
 
@@ -486,7 +484,6 @@ def _quantize_w4a8_chunked(
     )
 
 
-@guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)
 def quantize_w4a8_int8_weight(
     weight: torch.Tensor,
     group_size: int = 16,
@@ -593,7 +590,6 @@ def _dequantize_w4a8_int8_weight_from_int8(
     return weight_rotated.view(n, k).to(output_dtype)
 
 
-@guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)
 def dequantize_w4a8_int8_weight(
     qdata: torch.Tensor,
     s_rel: torch.Tensor,
@@ -630,7 +626,6 @@ def dequantize_w4a8_int8_weight(
     return rotate_int8_convrot_weight(weight_rotated, convrot_groupsize).to(output_dtype)
 
 
-@guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)
 def w4a8_int8_linear(
     x: torch.Tensor,
     qdata: torch.Tensor,

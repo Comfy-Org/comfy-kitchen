@@ -29,7 +29,7 @@ def _fused_backend():
     """The compiled backend that owns sol_attn here. PyTorch reports ROCm devices
     as "cuda", so torch.cuda.is_available() does not distinguish them; ask which
     extension actually loaded."""
-    if ck.list_backends().get("cuda", {}).get("available", False) and ck.sol_attn_is_available():
+    if ck.list_backends().get("cuda", {}).get("available", False):
         return cuda_backend
     if hip_backend.is_available() and hip_backend.has_wmma():
         return hip_backend

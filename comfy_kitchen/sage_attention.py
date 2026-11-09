@@ -154,6 +154,8 @@ def _validate_inputs(
     k: torch.Tensor,
     v: torch.Tensor,
     attn_mask: torch.Tensor | None,
+    *,
+    prequantize_only: bool = False,
 ) -> torch.Tensor | None:
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("q, k, and v must have shape [batch, heads, sequence, head_dim]")
@@ -165,9 +167,13 @@ def _validate_inputs(
         )
     if not q.is_cuda or q.device != k.device or q.device != v.device:
         raise ValueError("q, k, and v must be on the same CUDA device")
-    if not is_available(q.device):
+    available = is_available(q.device)
+    if prequantize_only and _hip_backend is None:
+        available = (_cuda_backend._EXT_AVAILABLE
+                     and torch.cuda.get_device_capability(q.device) >= _NATIVE_MINIMUM_CAPABILITY)
+    if not available:
         raise RuntimeError(
-            "INT8 attention requires the comfy-kitchen CUDA extension on SM75-SM102 (INT8 is disabled on SM103+), "
+            "INT8 attention requires the comfy-kitchen CUDA extension on SM75-SM102, "
             "or the HIP extension on an AMD device with matrix cores (RDNA3 or newer)"
         )
 
@@ -340,7 +346,7 @@ def prequantize_int8_attention(
     remains the lower-overhead single-call path when early Q/K/V release is not
     needed.
     """
-    attn_mask = _validate_inputs(q, k, v, attn_mask)
+    attn_mask = _validate_inputs(q, k, v, attn_mask, prequantize_only=True)
 
     original_head_dim = q.shape[-1]
     input_dtype = q.dtype
@@ -483,7 +489,7 @@ def int8_attention_from_prequantized(
         raise ValueError("attn_mask must be on the same CUDA device as the packed tensors")
     if not is_available(quantized.q.device):
         raise RuntimeError(
-            "INT8 attention requires the comfy-kitchen CUDA extension on SM75-SM102 (INT8 is disabled on SM103+), "
+            "INT8 attention requires the comfy-kitchen CUDA extension on SM75-SM102, "
             "or the HIP extension on an AMD device with matrix cores (RDNA3 or newer)"
         )
 

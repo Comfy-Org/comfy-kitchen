@@ -7,9 +7,7 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
-from tests.conftest import requires_int8, get_capable_backends, rel_err
-
-pytestmark = requires_int8
+from tests.conftest import get_capable_backends, rel_err
 
 _GROUP = 256
 

@@ -10,7 +10,7 @@ import torch
 
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
 from comfy_kitchen.backends._activations import apply_residual as _apply_residual
-from comfy_kitchen.constraints import INT8_MAX_COMPUTE_CAPABILITY, guard_compute_capability
+from comfy_kitchen.constraints import INT8_MAX_COMPUTE_CAPABILITY, FunctionConstraints, validate_function_call
 from comfy_kitchen.float_utils import (
     E8M0_BIAS,
     F4_E2M1_MAX,
@@ -750,6 +750,13 @@ def _round_up(value: int, alignment: int) -> int:
 
 def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Multiply INT8 matrices and return INT32 accumulators."""
+    if a.is_cuda and not getattr(torch.version, "hip", None):
+        check = validate_function_call(
+            FunctionConstraints(max_compute_capability=INT8_MAX_COMPUTE_CAPABILITY), {},
+            compute_capability=torch.cuda.get_device_capability(a.device),
+        )
+        if not check.success:
+            raise RuntimeError(check.failure_reason)
     def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
         if hasattr(torch, "int8_mm"):
             return torch.int8_mm(lhs, rhs)
@@ -784,7 +791,6 @@ def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return result
 
 
-@guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)
 def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N].
 
@@ -829,7 +835,6 @@ def _round_int8(scaled: torch.Tensor, stochastic_rounding: int | None = 0) -> to
     return scaled.round_().clamp_(-128.0, 127.0).to(torch.int8)
 
 
-@guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)
 def quantize_int8_tensorwise(
     x: torch.Tensor,
     scale: torch.Tensor | float | str | None = None,
@@ -858,7 +863,6 @@ def quantize_int8_tensorwise(
     return q, scale
 
 
-@guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)
 def quantize_int8_rowwise(
     x: torch.Tensor,
     stochastic_rounding: int | None = 0,
@@ -900,7 +904,6 @@ def quantize_and_rotate_rowwise(
     return quantize_int8_rowwise(x_rot, stochastic_rounding=stochastic_rounding)
 
 
-@guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)
 def quantize_int8_convrot_weight(
     weight: torch.Tensor,
     group_size: int,
@@ -918,14 +921,12 @@ def rotate_int8_convrot_weight(weight: torch.Tensor, group_size: int) -> torch.T
     return _rotate_weight(weight, h, group_size)
 
 
-@guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)
 def dequantize_int8_convrot_weight(q: torch.Tensor, scale: torch.Tensor, group_size: int) -> torch.Tensor:
     """Dequantize INT8 ConvRot weights and rotate them back to the original basis."""
     h = _build_hadamard(group_size, device=q.device, dtype=torch.float32)
     return _rotate_weight(dequantize_int8_simple(q, scale), h, group_size)
 
 
-@guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)
 def dequantize_int8_convrot_weight_dtype(
     q: torch.Tensor, scale: torch.Tensor, group_size: int, output_dtype_code: int
 ) -> torch.Tensor:
@@ -933,7 +934,6 @@ def dequantize_int8_convrot_weight_dtype(
     return dequantize_int8_convrot_weight(q, scale, group_size).to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
 
 
-@guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)
 def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Dequantize INT8 tensor with scale.
 
@@ -947,7 +947,6 @@ def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
     return q.float() * scale
 
 
-@guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)
 def dequantize_int8_embedding(
     q: torch.Tensor,
     scale: torch.Tensor,
@@ -973,7 +972,6 @@ def dequantize_int8_embedding(
     return x.to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
 
 
-@guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)
 def dequantize_int8_simple_dtype(q: torch.Tensor, scale: torch.Tensor, output_dtype_code: int) -> torch.Tensor:
     """Dequantize INT8 tensor with scale into a requested floating dtype."""
     return dequantize_int8_simple(q, scale).to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
@@ -992,7 +990,6 @@ def fp16_linear(
     return _apply_residual(out, residual, residual_scale)
 
 
-@guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1104,7 +1101,6 @@ def _modulate_int8_input(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return x * (1.0 + scale.reshape(shape))
 
 
-@guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)
 def int8_linear_modulated(
     x: torch.Tensor,
     modulation_scale: torch.Tensor,
@@ -1123,7 +1119,6 @@ def int8_linear_modulated(
     )
 
 
-@guard_compute_capability(INT8_MAX_COMPUTE_CAPABILITY)
 def int8_linear_rms_modulated(
     x: torch.Tensor,
     norm_weight: torch.Tensor,

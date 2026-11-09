@@ -3047,7 +3047,7 @@ def _check_sol_args(device, sink_blocks, sink_q, topk_ratio, **tensors):
     cap = torch.cuda.get_device_capability(device)
     if not (8, 0) <= cap <= INT8_MAX_COMPUTE_CAPABILITY:
         raise RuntimeError(
-            f"sol_attn: requires sm_80 through sm_102 (INT8 is disabled on SM103+); {device} is "
+            f"sol_attn: requires sm_80 through sm_102 (INT8 Tensor Cores are disabled on SM103+); {device} is "
             f"sm_{cap[0]}{cap[1]}")
     check = sol_attn_common_call_rule(
         {"sink_blocks": sink_blocks, "sink_q": sink_q, "topk_ratio": topk_ratio, **tensors})
@@ -4578,6 +4578,7 @@ def _build_constraints() -> dict:
             default_devices=cuda_devices,
             min_compute_capability=(8, 0),
             call_rules=(sol_attn_common_call_rule,),
+            max_compute_capability=INT8_MAX_COMPUTE_CAPABILITY,
         ),
         "na3d": FunctionConstraints(
             params={
@@ -5061,6 +5062,7 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
             min_compute_capability=(8, 0),
+            max_compute_capability=INT8_MAX_COMPUTE_CAPABILITY,
         ),
         "dequantize_int8_convrot_weight": FunctionConstraints(
             params={
@@ -5224,6 +5226,7 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
             min_compute_capability=(7, 5),
+            max_compute_capability=INT8_MAX_COMPUTE_CAPABILITY,
         ),
         "prepare_int4_weight_for_int8_linear": FunctionConstraints(
             params={
@@ -5300,6 +5303,7 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
             min_compute_capability=(7, 5),
+            max_compute_capability=INT8_MAX_COMPUTE_CAPABILITY,
         )
         constraints["scaled_mm_nvfp4"] = FunctionConstraints(
             params={

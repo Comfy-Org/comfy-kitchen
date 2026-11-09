@@ -10,15 +10,12 @@ from comfy_kitchen.backends import cuda
 from comfy_kitchen.tensor import TensorWiseINT8Layout
 
 from .conftest import (
-    requires_int8,
     assert_values_close,
     cuda_backend_available,
     get_capable_backends,
     rel_err,
     requires_cuda_backend,
 )
-
-pytestmark = requires_int8
 
 COMFYUI_NVIDIA_16_SERIES = (
     "1660",

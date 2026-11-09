@@ -9,9 +9,7 @@ from torch.nn import functional
 import comfy_kitchen as ck
 from comfy_kitchen.backends._activations import input_act_width
 from comfy_kitchen.tensor.int8_utils import _build_hadamard
-from tests.conftest import requires_int8, cuda_backend_available, get_capable_backends, rel_err
-
-pytestmark = requires_int8
+from tests.conftest import cuda_backend_available, get_capable_backends, rel_err
 
 _GROUP = 256
 
