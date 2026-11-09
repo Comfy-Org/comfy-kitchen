@@ -130,9 +130,7 @@ def _build_constraints() -> dict:
         return ValidationResult.ok()
 
     def _nerf_fold_rms_norm_call_rule(kwargs):
-        # No size threshold: the Chroma Radiance 1024x1024 call (8 tiles [512, 256, 64], bf16)
-        # was faster than ComfyUI's current path on an RTX 5090 and on a Radeon 8060S, with an
-        # output equal to it (per-call numbers in the PR that added this op).
+        # No size threshold: every call that passes the checks below goes to the kernel.
         tiles, weight = kwargs.get("tiles"), kwargs.get("weight")
         if not tiles or weight is None:
             return ValidationResult.ok()
@@ -362,7 +360,7 @@ def _build_constraints() -> dict:
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
     )
-    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both
+    # cuda covers ROCm builds of PyTorch (device type "cuda")
     out["nerf_fold_rms_norm"] = FunctionConstraints(
         params={
             "weight": ParamConstraint(
