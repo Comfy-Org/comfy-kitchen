@@ -191,13 +191,26 @@ rope_reuse_body(const T *q, const T *k,
           readrow<T,SPLIT>(buf[stage], x, fr, lc, D, fh < H);
         }
       }
+#if __CUDA_ARCH__ >= 1000
+      float2 pair_sum=make_float2(0.f,0.f);
+#else
+#endif
 #pragma unroll
+#if __CUDA_ARCH__ >= 1000
+      for(int p=0;p<P;++p) pair_sum=__ffma2_rn(xx[p],xx[p],pair_sum);
+      sum=pair_sum.x+pair_sum.y;
+#else
       for (int p = 0; p < P; p++)
         sum += xx[p].x * xx[p].x + xx[p].y * xx[p].y;
+#endif
 #pragma unroll
       for (int delta = width/2; delta; delta /= 2)
         sum += __shfl_xor_sync(0xffffffff, sum, delta, width);
       float inv = RMS ? rsqrt_fast(sum * (1.f / D) + eps) : 1.f;
+#if __CUDA_ARCH__ >= 1000
+      const float2 inv2=make_float2(inv,inv);
+#else
+#endif
       Packed<T,V> out;
       Packed<T,P> lo, hi;
       if constexpr (SPLIT) {
@@ -205,11 +218,24 @@ rope_reuse_body(const T *q, const T *k,
         for (int j = 0; j < P / 2; j++) {
           int p = 2 * j;
           float4 a = ff[p], b = ff[p + 1];
+#if __CUDA_ARCH__ >= 1000
+          float2 n=xx[p];
+          if constexpr(RMS){
+           float2 norm=__fmul2_rn(__fmul2_rn(xx[p],inv2),ww[p]);
+           n=expand2(pack2<T>(norm.x,norm.y));
+          }
+          float2 m=xx[p+1];
+          if constexpr(RMS){
+           float2 norm=__fmul2_rn(__fmul2_rn(xx[p+1],inv2),ww[p+1]);
+           m=expand2(pack2<T>(norm.x,norm.y));
+          }
+#else
           float2 n = expand2(pack2<T>(xx[p].x * inv * ww[p].x,
                                                    xx[p].y * inv * ww[p].y));
           float2 m =
               expand2(pack2<T>(xx[p + 1].x * inv * ww[p + 1].x,
                                             xx[p + 1].y * inv * ww[p + 1].y));
+#endif
           float a0 = fmaf(a.y, n.y, a.x * n.x), a1 = fmaf(a.z, n.x, a.w * n.y),
                 b0 = fmaf(b.y, m.y, b.x * m.x), b1 = fmaf(b.z, m.x, b.w * m.y);
           lo.h[j] = pack2<T>(a0, b0);
@@ -219,8 +245,16 @@ rope_reuse_body(const T *q, const T *k,
 #pragma unroll
         for (int p = 0; p < P; p++) {
           float4 a = ff[p];
+#if __CUDA_ARCH__ >= 1000
+          float2 n=xx[p];
+          if constexpr(RMS){
+           float2 norm=__fmul2_rn(__fmul2_rn(xx[p],inv2),ww[p]);
+           n=expand2(pack2<T>(norm.x,norm.y));
+          }
+#else
           float2 n = expand2(pack2<T>(xx[p].x * inv * ww[p].x,
                                                    xx[p].y * inv * ww[p].y));
+#endif
           out.h[p] = pack2<T>(fmaf(a.y, n.y, a.x * n.x),
                                            fmaf(a.z, n.x, a.w * n.y));
         }
@@ -239,11 +273,13 @@ rope_reuse_body(const T *q, const T *k,
 }
 
 template <typename T,bool SPLIT, bool WF32,bool RMS>
-__global__
-#if __CUDA_ARCH__ != 900
-__launch_bounds__(128,RMS?6:7)
+__global__ __launch_bounds__(128,
+#if __CUDA_ARCH__ == 900
+1
+#else
+RMS ? 6 : 7
 #endif
-void rope_reuse_kernel(const T *q, const T *k, const float4 *f,
+) void rope_reuse_kernel(const T *q, const T *k, const float4 *f,
  const void *wq,const void *wk,T *oq,T *ok,int B,int H,int N,int D,bool bnhd,bool dual,float eps) {
  if(D==128) rope_reuse_body<T,SPLIT,WF32,RMS>(q,k,f,wq,wk,oq,ok,B,H,N,128,bnhd,dual,eps);
  else rope_reuse_body<T,SPLIT,WF32,RMS>(q,k,f,wq,wk,oq,ok,B,H,N,D,bnhd,dual,eps);
