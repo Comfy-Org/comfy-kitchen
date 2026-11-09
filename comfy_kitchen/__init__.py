@@ -1035,8 +1035,11 @@ def qkv_interleaved_qk_rms_norm(
     head (``torch.cat`` on the last dim, ``view(B, S, heads, n * head_dim)``,
     ``torch.split(head_dim)``), so head h takes interleaved ``[head_dim]`` blocks of the
     concatenation. This op returns the q, k and v the attention call receives, each a
-    contiguous ``[B, S, heads * head_dim]`` tensor, with q and k RMS-normalized per head
-    (``F.rms_norm`` over ``head_dim`` with the given weight):
+    ``[B, S, heads * head_dim]`` tensor, with q and k RMS-normalized per head
+    (``F.rms_norm`` over ``head_dim`` with the given weight). q and k are contiguous; v is
+    contiguous for ``heads > 1`` and, for ``heads == 1``, the same strided view the stock
+    code returns (the last ``head_dim`` channels of the concatenation, row stride
+    ``n * head_dim``, n = 3 for self- and 2 for cross-attention):
 
     - ``q_interleaved=True`` (``Attention.forward``): q, k and v are concatenated and split.
     - ``q_interleaved=False`` (``CrossAttention.forward``): only k and v are concatenated

@@ -262,6 +262,31 @@ class TestQkvInterleavedQkRmsNormEager:
             assert o.shape == (2, s, 64) and o.is_contiguous()
             assert o.dtype == torch.float16
 
+    # one head is the case where the stock v is a strided view of the concatenation, so the
+    # fake has to give that layout (strides and storage offset), not a contiguous tensor
+    @pytest.mark.parametrize("heads", [1, 4])
+    @pytest.mark.parametrize(("batch", "seq", "seq_kv"), [(2, 9, 5), (1, 1, 1), (2, 1, 3)])
+    @pytest.mark.parametrize("q_interleaved", [True, False])
+    def test_fake_matches_eager_layout(self, heads, batch, seq, seq_kv, q_interleaved):
+        inputs = _inputs(batch, seq, seq if q_interleaved else seq_kv, heads, 16)
+        with ck.use_backend("eager"):
+            real = _kitchen(inputs, heads, q_interleaved=q_interleaved)
+        fake = _kitchen([t.to("meta") for t in inputs], heads, q_interleaved=q_interleaved)
+        for f, r in zip(fake, real, strict=True):
+            assert f.shape == r.shape and f.dtype == r.dtype
+            assert f.stride() == r.stride()
+            assert f.storage_offset() == r.storage_offset()
+
+    @pytest.mark.parametrize("heads", [1, 4])
+    @pytest.mark.parametrize("q_interleaved", [True, False])
+    def test_opcheck(self, heads, q_interleaved):
+        inputs = _inputs(2, 9, 9 if q_interleaved else 5, heads, 16)
+        torch.library.opcheck(
+            torch.ops.comfy_kitchen.qkv_interleaved_qk_rms_norm.default,
+            (*inputs, heads, 1e-6, q_interleaved),
+            test_utils=("test_schema", "test_faketensor"),
+        )
+
     def test_cpu_goes_to_eager(self):
         inputs = _inputs(1, 9, 9, 4, 128, dtype=torch.float16)
         assert registry.get_capable_backend(OP, _kwargs(inputs, 4)) == "eager"

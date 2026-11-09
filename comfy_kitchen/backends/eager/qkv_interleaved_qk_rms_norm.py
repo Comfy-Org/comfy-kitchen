@@ -149,4 +149,14 @@ def _op_qkv_interleaved_qk_rms_norm_fake(
     q, k, v, q_weight, k_weight, heads, eps=1e-6, q_interleaved=True
 ):
     _check(q, k, v, q_weight, k_weight, heads, q_interleaved)
-    return q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
+    if heads == 1:
+        # one head (always eager, see the Triton call rule): the stock reshape of v is a view,
+        # the last C channels of the [B, S_kv, n * C] concatenation (n = 3 self, 2 cross);
+        # same view / slice / reshape as eager so the size-1 dim strides match too
+        b, s, channels = v.shape
+        n = 3 if q_interleaved else 2
+        cat = v.new_empty((b, s, n * channels)).view(b, s, 1, n * channels)
+        out_v = cat[..., (n - 1) * channels :].reshape(b, s, channels)
+    else:
+        out_v = v.new_empty(v.shape)
+    return q.new_empty(q.shape), k.new_empty(k.shape), out_v
