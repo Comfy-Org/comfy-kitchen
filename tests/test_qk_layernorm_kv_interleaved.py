@@ -314,10 +314,12 @@ class TestQkLayernormKvInterleavedTriton:
         self._check(inputs, 16, eps=1e-3)
 
     @pytest.mark.parametrize("hip", [False, True])
-    def test_both_launch_configs(self, monkeypatch, hip):
+    def test_both_launch_configs(self, request, monkeypatch, hip):
         # the CUDA and HIP launch configurations, on whichever GPU
         kernel = importlib.import_module("comfy_kitchen.backends.triton." + OP)
         monkeypatch.setattr(kernel, "_HIP", hip)
+        # _rcp3 is cached per device and reads _HIP: drop what it cached under the patched flag
+        request.addfinalizer(kernel._rcp3.cache_clear)
         assert kernel._launch_config() == ((16, 4) if hip else (32, 4))
         inputs = _inputs(1, 500, 256, 16, 64, device="cuda", dtype=torch.float16)
         kwargs = _kwargs(inputs, 16)
