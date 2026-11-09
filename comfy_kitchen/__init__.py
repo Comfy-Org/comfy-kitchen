@@ -70,6 +70,7 @@ __all__ = [
     "fp16_conv3d",
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
+    "nerf_fold_rms_norm",
     "rms_adaln",
     # Attention
     "PrequantizedInt8Attention",
@@ -455,6 +456,38 @@ def group_norm_stats3d(x: torch.Tensor, num_groups: int = 32, eps: float = 1e-6)
     """Per-frame GroupNorm statistics of x [B, C, T, H, W]: float32 [B*T, num_groups, 2]
     of (mean, rstd), for group_norm_silu_pad3d's stats argument."""
     return torch.ops.comfy_kitchen.group_norm_stats3d(x, num_groups, eps)
+
+
+def nerf_fold_rms_norm(
+    tiles: torch.Tensor | list[torch.Tensor],
+    weight: torch.Tensor,
+    batch: int,
+    height: int,
+    width: int,
+    patch_size: int,
+    eps: float | None = None,
+) -> torch.Tensor:
+    """Patch-to-image fold of the NeRF head output and RMSNorm over channels, in one pass.
+
+    tiles ``[rows, P*P, C]`` (one tensor, or the list of row tiles in order) hold
+    ``batch * (height // P) * (width // P)`` patches of ``P = patch_size`` pixels; returns
+    ``rms_norm(fold(...).movedim(1, -1), (C,), weight, eps).movedim(-1, 1)``: the Chroma
+    Radiance ``torch.cat`` of the tiles -> transpose / reshape -> ``F.fold`` ->
+    ``NerfFinalLayerConv.norm`` sequence, up to the final conv. The output is
+    ``[batch, C, height, width]`` with the channels innermost in memory, the layout the stock
+    path gives the conv. ``eps=None`` is ``RMSNorm``'s default.
+    """
+    if isinstance(tiles, torch.Tensor):
+        tiles = [tiles]
+    return torch.ops.comfy_kitchen.nerf_fold_rms_norm(
+        list(tiles),
+        weight,
+        int(batch),
+        int(height),
+        int(width),
+        int(patch_size),
+        None if eps is None else float(eps),
+    )
 
 
 def rms_adaln(

@@ -27,6 +27,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "nerf_fold_rms_norm",
 ]
 
 # Try to import triton and register if available
@@ -55,6 +56,7 @@ try:
 
     from .adaln import adaln, rms_adaln
     from .na import na3d
+    from .nerf_fold_rms_norm import nerf_fold_rms_norm
     from .quantization import (
         dequantize_nvfp4,
         dequantize_per_tensor_fp8,
@@ -125,6 +127,27 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _nerf_fold_rms_norm_call_rule(kwargs):
+        # No size threshold: every call that passes the checks below goes to the kernel.
+        tiles, weight = kwargs.get("tiles"), kwargs.get("weight")
+        if not tiles or weight is None:
+            return ValidationResult.ok()
+        dtype = tiles[0].dtype
+        if dtype != torch.bfloat16 or weight.dtype != dtype:
+            return ValidationResult.fail("tiles", "tiles and weight must be bfloat16")
+        if tiles[0].shape[2] != 64:
+            return ValidationResult.fail("tiles", "the kernel's reduction order needs C == 64")
+        if not weight.is_contiguous():
+            return ValidationResult.fail("weight", "weight must be contiguous")
+        for t in tiles:
+            if t.device != weight.device:
+                return ValidationResult.fail("tiles", "tiles must be on weight's device")
+            if not t.is_contiguous():
+                return ValidationResult.fail("tiles", "tiles must be contiguous")
+            if t.numel() == 0 or t.numel() >= 2**31:
+                return ValidationResult.fail("tiles", "tile numel must be in [1, 2**31)")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -336,6 +359,16 @@ def _build_constraints() -> dict:
         # tl.dot needs Ampere matrix capability for the non-IEEE float paths
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
+    )
+    # cuda covers ROCm builds of PyTorch (device type "cuda")
+    out["nerf_fold_rms_norm"] = FunctionConstraints(
+        params={
+            "weight": ParamConstraint(
+                dtypes=frozenset({torch.bfloat16}), shape_rules=(ExactDims(1),)
+            ),
+        },
+        default_devices=cuda_devices,
+        call_rules=(_nerf_fold_rms_norm_call_rule,),
     )
     return out
 
