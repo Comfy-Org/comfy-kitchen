@@ -18,6 +18,7 @@
 #include "float_utils.cuh"
 #include "dtype_dispatch.cuh"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -28,6 +29,7 @@ namespace comfy {
 
 constexpr int kQMaxKernelThreads = 128;
 constexpr int kE4M3Alignment = 16;
+constexpr int kStochasticWidth = 16;
 
 namespace {
 
@@ -118,46 +120,85 @@ __global__ void dequantize_fp8_tensor_kernel(
     }
 }
 
+template<typename OutputType>
+__device__ __forceinline__ unsigned stochastic_round_fp8_pair(unsigned bits, unsigned noise) {
+    constexpr bool e4m3 = std::is_same_v<OutputType, __nv_fp8_e4m3>;
+    const __half2 maximum = __float2half2_rn(FP8LimitsTrait<OutputType>::max);
+    union { unsigned bits; __half2 halves; } value, magnitude;
+    value.bits = bits;
+    // Adding +0 clears source -0; clamping first preserves finite saturation and NaN -> -max.
+    value.halves = __hmin2(maximum, __hmax2(__hadd2(value.halves, __float2half2_rn(0.0f)),
+                                         __hneg2(maximum)));
+    magnitude.bits = value.bits & 0x7fff7fff;
+    unsigned rounded;
+    if constexpr (e4m3) {
+        union { unsigned bits; __half2 halves; } normal, subnormal;
+        normal.halves = __hmax2(magnitude.halves, __float2half2_rn(0.015625f));
+        // Keep carries and borrows within each lane, then discard seven mantissa bits.
+        normal.bits = (((normal.bits | 0x80008000) - 0x20002000
+                       + ((noise >> 1) & 0x007f007f)) >> 7) & 0x00ff00ff;
+        // Below E4M3's normal range, floor(x * 2^17) retains every relevant RNG bit.
+        // The two power-of-two multiplies are exact for those FP16 values.
+        subnormal.halves = __hmul2(__hmul2(__hmin2(magnitude.halves, __float2half2_rn(0.25f)),
+                                         __float2half2_rn(32768.0f)), __float2half2_rn(4.0f));
+        const unsigned lo = __half2uint_rz(__low2half(subnormal.halves));
+        const unsigned hi = __half2uint_rz(__high2half(subnormal.halves));
+        subnormal.bits = ((__byte_perm(lo, hi, 0x5410) + noise) >> 8) & 0x00ff00ff;
+        // These nonnegative integer codes are also ordered as FP16 subnormals.
+        normal.halves = __hmin2(normal.halves, subnormal.halves);
+        rounded = normal.bits;
+    } else {
+        // E5M2 shares FP16's exponent bias, so both lanes round with one addition.
+        rounded = ((magnitude.bits + noise) >> 8) & 0x00ff00ff;
+    }
+    rounded |= (value.bits >> 8) & 0x00800080;
+    return rounded;
+}
+
 template<typename InputType, typename OutputType>
 __global__ void stochastic_round_fp8_kernel(
     uint8_t *rng_and_dst,
     const InputType *src,
-    const uint32_t size) {
+    const int64_t size,
+    const int width) {
 
-    constexpr float kFP8Max = FP8LimitsTrait<OutputType>::max;
-    constexpr int kExponentBits = std::is_same_v<OutputType, __nv_fp8_e4m3> ? 4 : 5;
-    constexpr int kMantissaBits = std::is_same_v<OutputType, __nv_fp8_e4m3> ? 3 : 2;
-    constexpr int kExponentBias = std::is_same_v<OutputType, __nv_fp8_e4m3> ? 7 : 15;
-    constexpr float kMantissaLevels = static_cast<float>(1 << kMantissaBits);
-    const float subnormal_mantissa_scale = exp2f(-kExponentBias + 1 - kMantissaBits);
-    const float subnormal_value_scale = exp2f(-kExponentBias + 1);
-
-    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) {
-        return;
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x * width;
+    for (int64_t base = static_cast<int64_t>(blockIdx.x) * blockDim.x * width;
+         base < size; base += stride) {
+        const int64_t idx = base + static_cast<int64_t>(threadIdx.x) * width;
+        if (width == kStochasticWidth && base + blockDim.x * kStochasticWidth <= size) {
+            struct alignas(16) Input { InputType values[kStochasticWidth]; };
+            struct alignas(16) Bytes { unsigned values[kStochasticWidth / 4]; };
+            const Input input = *reinterpret_cast<const Input*>(src + idx);
+            Bytes bytes = *reinterpret_cast<const Bytes*>(rng_and_dst + idx);
+#pragma unroll
+            for (int i = 0; i < kStochasticWidth / 4; ++i) {
+                unsigned rounded[2];
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    // Preserve FP16 materialization for every input dtype.
+                    union { __half2 halves; unsigned bits; } pair;
+                    if constexpr (std::is_same_v<InputType, __half>)
+                        pair.halves = __halves2half2(input.values[4*i+2*j], input.values[4*i+2*j+1]);
+                    else
+                        pair.halves = __floats2half2_rn(static_cast<float>(input.values[4*i+2*j]),
+                                                      static_cast<float>(input.values[4*i+2*j+1]));
+                    rounded[j] = stochastic_round_fp8_pair<OutputType>(
+                        pair.bits, __byte_perm(bytes.values[i], 0, j == 0 ? 0x4140 : 0x4342));
+                }
+                bytes.values[i] = __byte_perm(rounded[0], rounded[1], 0x6420);
+            }
+            *reinterpret_cast<Bytes*>(rng_and_dst + idx) = bytes;
+        } else {
+            for (int i = 0; i < width; ++i) {
+                const int64_t j = base + threadIdx.x + static_cast<int64_t>(i) * blockDim.x;
+                if (j < size) {
+                    const unsigned bits = __half_as_ushort(__float2half(static_cast<float>(src[j])));
+                    rng_and_dst[j] = stochastic_round_fp8_pair<OutputType>(bits, rng_and_dst[j]);
+                }
+            }
+        }
     }
-
-    const float value = __half2float(__float2half(static_cast<float>(src[idx])));
-    const float abs_value = fabsf(value);
-    const float sign = value < 0.0f ? -1.0f : (value > 0.0f ? 1.0f : 0.0f);
-
-    float exponent = floorf(log2f(abs_value)) + kExponentBias;
-    exponent = clamp(exponent, 0.0f, static_cast<float>((1 << kExponentBits) - 1));
-    const bool normal = exponent != 0.0f;
-    const float exponent_scale = exp2f(exponent - kExponentBias);
-
-    const float normal_mantissa = (abs_value / exponent_scale - 1.0f) * kMantissaLevels;
-    const float subnormal_mantissa = abs_value / subnormal_mantissa_scale;
-    const float random = static_cast<float>(rng_and_dst[idx]) * (1.0f / 256.0f);
-    const float mantissa = floorf((normal ? normal_mantissa : subnormal_mantissa) + random) / kMantissaLevels;
-    const float rounded = sign * (normal ? exponent_scale * (1.0f + mantissa) : subnormal_value_scale * mantissa);
-
-    union {
-        OutputType fp8;
-        uint8_t u8;
-    } out;
-    out.fp8 = static_cast<OutputType>(clamp(rounded, -kFP8Max, kFP8Max));
-    rng_and_dst[idx] = out.u8;
 }
 
 } // anonymous namespace
@@ -265,9 +306,14 @@ void launch_stochastic_round_fp8_kernel(
         throw std::runtime_error("stochastic_round_fp8 requires uint8 RNG storage");
     }
 
-    constexpr int vals_per_thread = 1;
-    constexpr int vals_per_block = vals_per_thread * comfy::kQMaxKernelThreads;
-    const int blocks = static_cast<int>((numel + vals_per_block - 1) / vals_per_block);
+    const int vals_per_thread = numel >= comfy::kStochasticWidth * comfy::kQMaxKernelThreads &&
+        ((reinterpret_cast<uintptr_t>(input) | reinterpret_cast<uintptr_t>(rng_and_output)) & 15) == 0
+        ? comfy::kStochasticWidth : 1;
+    const int vals_per_block = vals_per_thread * comfy::kQMaxKernelThreads;
+    const int max_blocks = vals_per_thread == comfy::kStochasticWidth &&
+        output_dtype_code == comfy::DTYPE_CODE_FLOAT8_E4M3FN ? 16384 : std::numeric_limits<int>::max();
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        (numel + vals_per_block - 1) / vals_per_block, max_blocks));
 
     DISPATCH_INPUT_FP8_OUTPUT_DTYPES(
         input_dtype_code, output_dtype_code,
@@ -276,7 +322,7 @@ void launch_stochastic_round_fp8_kernel(
                 <<<blocks, comfy::kQMaxKernelThreads, 0, stream>>>(
                     static_cast<uint8_t*>(rng_and_output),
                     static_cast<const InputType*>(input),
-                    numel);
+                    numel, vals_per_thread);
         });
 
     cudaError_t err = cudaGetLastError();
