@@ -3778,6 +3778,14 @@ def fp16_conv3d_out(
     out.copy_(res if residual is None else res + residual)
 
 
+def _group_norm_chunks(b: int, c: int, t: int, h: int, w: int) -> int:
+    # Match stats_chunk_rows in ops/group_norm_pad3d.cu.
+    chunk_rows = 64
+    while chunk_rows < 1024 and b * t * h * w * ((c + 63) // 64) > 512 * chunk_rows:
+        chunk_rows *= 2
+    return -(-(h * w) // chunk_rows)
+
+
 def group_norm_silu_pad3d(
     x: torch.Tensor,
     weight: torch.Tensor | None,
@@ -3827,7 +3835,7 @@ def group_norm_silu_pad3d(
     if weight is None:
         weight = bias = placeholder
     elif stats is None:
-        chunks = -(-(h * w) // 1024)
+        chunks = _group_norm_chunks(b, c, t, h, w)
         workspace = torch.empty(2 * b * t * (chunks * c + num_groups), dtype=torch.float32, device=x.device)
     _C.group_norm_silu_pad3d(
         _wrap_for_dlpack(x), _wrap_for_dlpack(weight), _wrap_for_dlpack(bias),
@@ -3864,7 +3872,7 @@ def group_norm_stats3d(x: torch.Tensor, num_groups: int, eps: float) -> torch.Te
     served = served and _aligned16(x)
     if not served:
         return _eager_group_norm_stats3d(x, num_groups, eps)
-    chunks = -(-(h * w) // 1024)
+    chunks = _group_norm_chunks(b, c, t, h, w)
     workspace = torch.empty(2 * b * t * chunks * c, dtype=torch.float32, device=x.device)
     stats = torch.empty((b * t, num_groups, 2), dtype=torch.float32, device=x.device)
     _C.group_norm_stats3d(
