@@ -67,13 +67,18 @@ def _to_device(qt, device):
     return QuantizedTensor(qt._qdata.to(device), qt._layout_cls, type(params)(**moved))
 
 
+# The INT8 GEMM the native path calls: torch.int8_mm when this torch has it, else _int_mm.
+INT8_MM_OP = "int8_mm" if hasattr(torch, "int8_mm") else "_int_mm"
+
+
 def _forbid_int_mm(monkeypatch):
     monkeypatch.setattr(quantization, "_device_has_int8_mm", lambda device_type: False)
 
-    def no_int_mm(*args, **kwargs):
-        raise AssertionError("torch._int_mm must not be called on the fallback path")
+    for op in {"_int_mm", INT8_MM_OP}:
+        def no_int_mm(*args, _op=op, **kwargs):
+            raise AssertionError(f"torch.{_op} must not be called on the fallback path")
 
-    monkeypatch.setattr(torch, "_int_mm", no_int_mm)
+        monkeypatch.setattr(torch, op, no_int_mm)
 
 
 def test_device_has_int8_mm_trusts_cuda_and_cpu():
@@ -181,15 +186,15 @@ def test_fallback_chunks_match_single_pass(monkeypatch, convrot):
 
 
 def test_native_path_untouched_when_int_mm_exists(monkeypatch):
-    """CPU has ``_int_mm``: the fallback must not engage there."""
+    """CPU has an INT8 GEMM: the fallback must not engage there."""
     calls = []
-    real = torch._int_mm
+    real = getattr(torch, INT8_MM_OP)
 
     def counting_int_mm(*args, **kwargs):
         calls.append(1)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(torch, "_int_mm", counting_int_mm)
+    monkeypatch.setattr(torch, INT8_MM_OP, counting_int_mm)
     qt = _quantized_weight(convrot=False, seed=2)
     torch.nn.functional.linear(torch.randn(8, K, dtype=torch.bfloat16), qt)
     assert calls, "expected the native INT8 GEMM on CPU"
