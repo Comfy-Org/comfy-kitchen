@@ -23,6 +23,21 @@ namespace {
 
 constexpr int kInt8Threads = 256;
 
+// Query the selected image: PTX JIT can run an older layout on a newer GPU.
+template<typename Kernel>
+int dequantize_kernel_arch(Kernel kernel) {
+    cudaFuncAttributes attributes{};
+    const cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
+    // Newer runtimes also interpret an absent symbol as a kernel handle.
+    if (status == cudaErrorInvalidDeviceFunction || status == cudaErrorNoKernelImageForDevice ||
+        status == cudaErrorInvalidResourceHandle) {
+        cudaGetLastError();  // An optional image is absent; use the existing fallback.
+        return 0;
+    }
+    CUDA_CHECK(status);
+    return attributes.ptxVersion;
+}
+
 template<typename T>
 __device__ __forceinline__ float to_float(T val);
 template<> __device__ __forceinline__ float to_float<float>(float val) { return val; }
@@ -732,6 +747,48 @@ __global__ void int8_gemv2_dequant_warp_kernel(
     }
 }
 
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 1000 && CUDA_VERSION >= 13010)
+__device__ __forceinline__ float2 dequantize_int8_pair(float2 x, float scale) {
+    float2 result;
+    asm("{ .reg .b64 a,b; mov.b64 a,{%2,%3}; mov.b64 b,{%4,%4};"
+        "mul.rn.ftz.f32x2 a,a,b; mov.b64 {%0,%1},a; }"
+        : "=f"(result.x), "=f"(result.y)
+        : "f"(x.x), "f"(x.y), "f"(scale));
+    return result;
+}
+template<typename OutputType>
+__global__ void dequantize_int8_vec8_kernel(const int8_t* input, const float* scales, OutputType* output,
+    int64_t total_chunks, int64_t row_chunks, int scale_mode) {
+    const int64_t row = scale_mode == 2 ? blockIdx.x : 0;
+    int64_t chunk = scale_mode == 2 ? row * row_chunks + int64_t(blockIdx.y) * blockDim.x + threadIdx.x
+                                    : int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t end = scale_mode == 2 ? (row + 1) * row_chunks : total_chunks;
+    const int64_t stride = scale_mode == 2 ? end : int64_t(gridDim.x) * blockDim.x;
+    const float scale = scales[row];
+    for (; chunk < end; chunk += stride) {
+        union {
+            uint2 word;
+            int8_t q[8];
+        } values;
+        values.word = reinterpret_cast<const uint2*>(input)[chunk];
+        union {
+            __half2 h[4];
+            nv_bfloat162 b[4];
+            uint4 word;
+        } result;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 v = dequantize_int8_pair({float(values.q[2 * i]), float(values.q[2 * i + 1])}, scale);
+            if constexpr (std::is_same_v<OutputType, half>)
+                result.h[i] = __floats2half2_rn(v.x, v.y);
+            else
+                result.b[i] = __floats2bfloat162_rn(v.x, v.y);
+        }
+        reinterpret_cast<uint4*>(output)[chunk] = result.word;
+    }
+}
+#endif
+
 template<typename OutputType>
 __global__ void dequantize_int8_simple_kernel(
     const int8_t* __restrict__ input,
@@ -770,13 +827,19 @@ __global__ void dequantize_int8_simple_vec4_kernel(
     }
 
     const char4 q4 = reinterpret_cast<const char4*>(input)[idx4];
-    const float scale = scales[scale_mode == 0 ? 0 : idx4 / inner_dim_vec4];
+    float4 scale;
+    if (scale_mode == 1) {
+        scale = reinterpret_cast<const float4*>(scales)[idx4];
+    } else {
+        const float s = scales[scale_mode == 0 ? 0 : idx4 / inner_dim_vec4];
+        scale = make_float4(s, s, s, s);
+    }
     const int64_t idx = idx4 * 4;
     store4_contiguous(output, idx,
-        static_cast<float>(q4.x) * scale,
-        static_cast<float>(q4.y) * scale,
-        static_cast<float>(q4.z) * scale,
-        static_cast<float>(q4.w) * scale);
+        static_cast<float>(q4.x) * scale.x,
+        static_cast<float>(q4.y) * scale.y,
+        static_cast<float>(q4.z) * scale.z,
+        static_cast<float>(q4.w) * scale.w);
 }
 
 template<typename OutputType>
@@ -802,104 +865,6 @@ __global__ void dequantize_int8_rowwise_vec4_2d_kernel(
         static_cast<float>(q4.y) * scale,
         static_cast<float>(q4.z) * scale,
         static_cast<float>(q4.w) * scale);
-}
-
-template<int BLOCK_THREADS, typename OutputType>
-__global__ void dequantize_int8_convrot_kernel(
-    const int8_t* __restrict__ q,
-    const float* __restrict__ scales,
-    OutputType* __restrict__ output,
-    int K,
-    int scale_size)
-{
-    constexpr int kGroupsInFlight = BLOCK_THREADS / kConvRotGroup;
-
-    extern __shared__ float smem[];
-    float* row_buf = smem;
-    float* tmp = smem + K;
-
-    const int row = static_cast<int>(blockIdx.x);
-    const int tid = threadIdx.x;
-    const int64_t row_offset = static_cast<int64_t>(row) * K;
-    const float scale = scales[scale_size == 1 ? 0 : row];
-
-    for (int col = tid; col < K; col += BLOCK_THREADS) {
-        row_buf[col] = static_cast<float>(q[row_offset + col]) * scale;
-    }
-    __syncthreads();
-
-    const int n_groups = K / kConvRotGroup;
-    const int sub = tid / kConvRotGroup;
-    const int i = tid % kConvRotGroup;
-    float* buf0 = tmp + sub * (2 * kConvRotGroup);
-    float* buf1 = buf0 + kConvRotGroup;
-    const int iters = (n_groups + kGroupsInFlight - 1) / kGroupsInFlight;
-
-    for (int it = 0; it < iters; ++it) {
-        const int g = it * kGroupsInFlight + sub;
-        const bool active = (g < n_groups);
-        float* src = active ? (row_buf + g * kConvRotGroup) : buf0;
-        float* dst = active ? buf0 : buf1;
-        #pragma unroll
-        for (int stage = 0; stage < 4; ++stage) {
-            const int s = (stage == 0) ? 1 : (stage == 1) ? 4 : (stage == 2) ? 16 : 64;
-            const int d = (i / s) & 3;
-            const int base = i - d * s;
-            const float v = 0.5f * h4_row_dot(
-                d, src[base], src[base + s], src[base + 2 * s], src[base + 3 * s]);
-            dst[i] = v;
-            __syncthreads();
-            float* t = src; src = dst; dst = t;
-        }
-    }
-
-    for (int col = tid; col < K; col += BLOCK_THREADS) {
-        output[row_offset + col] = from_float<OutputType>(row_buf[col]);
-    }
-}
-
-template<int BLOCK_THREADS, typename OutputType>
-__global__ void dequantize_int8_convrot_groups_kernel(
-    const int8_t* __restrict__ q,
-    const float* __restrict__ scales,
-    OutputType* __restrict__ output,
-    int K,
-    int scale_size)
-{
-    constexpr int kGroupsPerBlock = BLOCK_THREADS / kConvRotGroup;
-    extern __shared__ float smem[];
-
-    const int group = static_cast<int>(blockIdx.x) * kGroupsPerBlock + threadIdx.x / kConvRotGroup;
-    const int row = static_cast<int>(blockIdx.y);
-    const int i = threadIdx.x % kConvRotGroup;
-    const int sub = threadIdx.x / kConvRotGroup;
-    const bool active = group < K / kConvRotGroup;
-    const int64_t row_offset = static_cast<int64_t>(row) * K;
-    const int col = group * kConvRotGroup + i;
-    const float scale = scales[scale_size == 1 ? 0 : row];
-    float* buf0 = smem + sub * (2 * kConvRotGroup);
-    float* buf1 = buf0 + kConvRotGroup;
-
-    buf0[i] = active ? static_cast<float>(q[row_offset + col]) * scale : 0.0f;
-    __syncthreads();
-
-    float* src = buf0;
-    float* dst = buf1;
-    #pragma unroll
-    for (int stage = 0; stage < 4; ++stage) {
-        const int s = (stage == 0) ? 1 : (stage == 1) ? 4 : (stage == 2) ? 16 : 64;
-        const int d = (i / s) & 3;
-        const int base = i - d * s;
-        const float v = 0.5f * h4_row_dot(
-            d, src[base], src[base + s], src[base + 2 * s], src[base + 3 * s]);
-        dst[i] = v;
-        __syncthreads();
-        float* t = src; src = dst; dst = t;
-    }
-
-    if (active) {
-        output[row_offset + col] = from_float<OutputType>(src[i]);
-    }
 }
 
 template<int S>
@@ -958,6 +923,208 @@ __device__ __forceinline__ float convrot_fht_stage64_store_absmax(
     return fmaxf(fmaxf(fabsf(y0), fabsf(y1)), fmaxf(fabsf(y2), fabsf(y3)));
 }
 
+// Integer additions make the inverse transform exact until the final scale.
+// Even 256 INT8 terms fit in INT32; scaling last changes only FP32 rounding.
+template<int GROUP, typename OutputType>
+__device__ __forceinline__ void dequantize_int8_convrot_group(
+    const int8_t* q, float scale, OutputType* output, int lane) {
+    constexpr int kValuesPerLane = GROUP == 256 ? 8 : 4, kGroupLanes = GROUP / kValuesPerLane;
+    int v[kValuesPerLane];
+#pragma unroll
+    for (int j = 0; j < kValuesPerLane; j += 4) {
+        int packed;
+        if (reinterpret_cast<uintptr_t>(q) % 4 == 0)
+            packed = reinterpret_cast<const int*>(q)[lane * (kValuesPerLane / 4) + j / 4];
+        else {
+            union {
+                int word;
+                int8_t bytes[4];
+            } input;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) input.bytes[k] = q[lane * kValuesPerLane + j + k];
+            packed = input.word;
+        }
+        v[j] = __dp4a(packed, int(0xff010101), 0);
+        v[j + 1] = __dp4a(packed, int(0x01ff0101), 0);
+        v[j + 2] = __dp4a(packed, int(0x0101ff01), 0);
+        v[j + 3] = __dp4a(packed, int(0x010101ff), 0);
+    }
+    if constexpr (GROUP == 256) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int x = v[j], y = v[j + 4];
+            const int xx = __shfl_xor_sync(0xffffffff, x, 1), yy = __shfl_xor_sync(0xffffffff, y, 1);
+            const int total = x + y + xx + yy;
+            v[j] = total - 2 * yy;
+            v[j + 4] = total - 2 * xx;
+        }
+    }
+#pragma unroll
+    for (int stage = 0; stage < 2; ++stage) {
+        const int shift = stage * 2 + (GROUP == 256 ? 1 : 0);
+#pragma unroll
+        for (int j = 0; j < kValuesPerLane; ++j) {
+            const int x = v[j];
+            const int pair = x + __shfl_xor_sync(0xffffffff, x, 1 << shift, kGroupLanes);
+            const int total = pair + __shfl_xor_sync(0xffffffff, pair, 2 << shift, kGroupLanes);
+            v[j] = total - 2 * __shfl_xor_sync(0xffffffff, x, 3 << shift, kGroupLanes);
+        }
+    }
+    const float factor = scale * (GROUP == 256 ? 0.0625f : 0.125f);
+#pragma unroll
+    for (int j = 0; j < kValuesPerLane; j += 4) {
+        const int idx = lane * kValuesPerLane + j;
+        const float a = float(v[j]) * factor, b = float(v[j + 1]) * factor, c = float(v[j + 2]) * factor,
+                    d = float(v[j + 3]) * factor;
+        if (reinterpret_cast<uintptr_t>(output) % 16 == 0)
+            store4_contiguous(output, idx, a, b, c, d);
+        else {
+            output[idx] = from_float<OutputType>(a);
+            output[idx + 1] = from_float<OutputType>(b);
+            output[idx + 2] = from_float<OutputType>(c);
+            output[idx + 3] = from_float<OutputType>(d);
+        }
+    }
+}
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+template<typename OutputType>
+__global__ void dequantize_int8_convrot_warp_kernel(const int8_t* input, const float* scales, OutputType* output,
+    int64_t num_groups, int groups_per_row, int scale_size, uint64_t row_reciprocal) {
+#if __CUDA_ARCH__ >= 1000 && CUDA_VERSION >= 13010
+    constexpr int kGroupLanes = 2, kLoadBytes = 32, kStoreBytes = 32;
+#else
+    constexpr int kGroupLanes = std::is_same_v<OutputType, float> ? 32 : 8;
+    constexpr int kLoadBytes = 16, kStoreBytes = 16;
+#endif
+    constexpr int kValuesPerLane = 128 / kGroupLanes, kStoreValues = kStoreBytes / sizeof(OutputType);
+    const int groups_per_block = blockDim.x / kGroupLanes, lane = threadIdx.x % kGroupLanes;
+    const int64_t group = int64_t(blockIdx.x) * groups_per_block + threadIdx.x / kGroupLanes;
+    if (group >= num_groups) return;
+    int64_t row = groups_per_row == 1 ? group : __umul64hi(uint64_t(group), row_reciprocal);
+    // Correct the reciprocal quotient when it is one below the exact row.
+    row += group - row * groups_per_row >= groups_per_row;
+#if __CUDA_ARCH__ < 1000 || CUDA_VERSION < 13010
+    // Hopper's FP32 output is faster with the previous 32-lane transform.
+    if constexpr (std::is_same_v<OutputType, float>) {
+        dequantize_int8_convrot_group<256>(
+            input + group * 256, scales[scale_size == 1 ? 0 : row], output + group * 256, lane);
+        return;
+    } else
+#endif
+    {
+        // Each half starts at +128. Biases 512, 2048, 8192, 32768 keep each
+        // stage result within 16 bits, giving two independent integer transforms.
+        uint32_t v[kValuesPerLane];
+#pragma unroll
+        for (int j = 0; j < kValuesPerLane; j += kLoadBytes) {
+            union {
+                uint4 word;
+                uint32_t ints[8];
+            } a, b;
+#if __CUDA_ARCH__ >= 1000 && CUDA_VERSION >= 13010
+            const int8_t* p0 = input + group * 256 + lane * kValuesPerLane + j;
+            const int8_t* p1 = p0 + 128;
+            asm("ld.global.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7},[%8];"
+                : "=r"(a.ints[0]), "=r"(a.ints[1]), "=r"(a.ints[2]), "=r"(a.ints[3]), "=r"(a.ints[4]), "=r"(a.ints[5]),
+                "=r"(a.ints[6]), "=r"(a.ints[7])
+                : "l"(p0));
+            asm("ld.global.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7},[%8];"
+                : "=r"(b.ints[0]), "=r"(b.ints[1]), "=r"(b.ints[2]), "=r"(b.ints[3]), "=r"(b.ints[4]), "=r"(b.ints[5]),
+                "=r"(b.ints[6]), "=r"(b.ints[7])
+                : "l"(p1));
+#else
+            a.word = reinterpret_cast<const uint4*>(input + group * 256 + lane * kValuesPerLane)[j / 16];
+            b.word = reinterpret_cast<const uint4*>(input + group * 256 + 128 + lane * kValuesPerLane)[j / 16];
+#endif
+#pragma unroll
+            for (int h = 0; h < kLoadBytes; ++h)
+                v[j + h] =
+                    (__byte_perm(a.ints[h / 4], b.ints[h / 4], ((4 + h % 4) << 8) | (h % 4)) & 0x00ff00ff) ^ 0x00800080;
+        }
+#pragma unroll
+        for (int stride = 1; stride < 64; stride *= 4) {
+            constexpr uint32_t repeat = 0x10001;
+            const uint32_t bias = 256 * stride * repeat;
+            if (stride * 4 <= kValuesPerLane) {
+#pragma unroll
+                for (int base = 0; base < kValuesPerLane; base += stride * 4) {
+#pragma unroll
+                    for (int j = 0; j < stride; ++j) {
+                        const auto a = v[base + j], b = v[base + j + stride], c = v[base + j + 2 * stride],
+                                   d = v[base + j + 3 * stride], sum = a + b + c + d + bias;
+                        v[base + j] = sum - 2 * d;
+                        v[base + j + stride] = sum - 2 * c;
+                        v[base + j + 2 * stride] = sum - 2 * b;
+                        v[base + j + 3 * stride] = sum - 2 * a;
+                    }
+                }
+            } else {
+                const int step = stride / kValuesPerLane;
+#pragma unroll
+                for (int j = 0; j < kValuesPerLane; ++j) {
+                    const auto x = v[j], reverse = __shfl_xor_sync(0xffffffff, x, 3 * step, kGroupLanes);
+                    const auto sum = x + reverse + bias;
+                    v[j] = x - reverse + __shfl_xor_sync(0xffffffff, sum, step, kGroupLanes);
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < kValuesPerLane; ++j) {
+            const uint32_t x = v[j], y = __shfl_xor_sync(0xffffffff, x, kGroupLanes / 2, kGroupLanes);
+            const uint32_t reverse = __funnelshift_l(y, y, 16), sum = x + reverse + 0x40004000;
+            v[j] = x - reverse + __funnelshift_l(sum, sum, 16);
+        }
+        const float scale = scales[scale_size == 1 ? 0 : row] * 0.0625f;
+#pragma unroll
+        for (int j = 0; j < kValuesPerLane; j += kStoreValues) {
+            union {
+                OutputType values[kStoreValues];
+                uint4 word;
+                uint32_t words[8];
+            } low, high;
+#pragma unroll
+            for (int h = 0; h < kStoreValues; ++h) {
+#if __CUDA_ARCH__ >= 1000 && CUDA_VERSION >= 13010
+                float lo, hi;
+                // Bit insertion gives 2^23 + the biased integer exactly; subtract
+                // 2^23 + 32768 before scaling, preserving the FP32 result.
+                const float a = __uint_as_float((v[j + h] & 65535) | 0x4b000000);
+                const float b = __uint_as_float((v[j + h] >> 16) | 0x4b000000);
+                asm("{ .reg .b64 a,b,s; mov.b64 a,{%2,%3}; mov.b64 b,0xcb008000cb008000; mov.b64 s,{%4,%4};"
+                    "add.rn.ftz.f32x2 a,a,b; mul.rn.ftz.f32x2 a,a,s; mov.b64 {%0,%1},a; }"
+                    : "=f"(lo), "=f"(hi)
+                    : "f"(a), "f"(b), "f"(scale));
+#else
+                const float lo = float(int(v[j + h] & 65535) - 32768) * scale;
+                const float hi = float(int(v[j + h] >> 16) - 32768) * scale;
+#endif
+                low.values[h] = from_float<OutputType>(lo);
+                high.values[h] = from_float<OutputType>(hi);
+            }
+#if __CUDA_ARCH__ >= 1000 && CUDA_VERSION >= 13010
+            OutputType* p0 = output + group * 256 + lane * kValuesPerLane + j;
+            OutputType* p1 = p0 + 128;
+            asm volatile("st.global.v8.b32 [%0],{%1,%2,%3,%4,%5,%6,%7,%8};" ::"l"(p0), "r"(low.words[0]),
+                         "r"(low.words[1]), "r"(low.words[2]), "r"(low.words[3]), "r"(low.words[4]), "r"(low.words[5]),
+                         "r"(low.words[6]), "r"(low.words[7])
+                         : "memory");
+            asm volatile("st.global.v8.b32 [%0],{%1,%2,%3,%4,%5,%6,%7,%8};" ::"l"(p1), "r"(high.words[0]),
+                         "r"(high.words[1]), "r"(high.words[2]), "r"(high.words[3]), "r"(high.words[4]),
+                         "r"(high.words[5]), "r"(high.words[6]), "r"(high.words[7])
+                         : "memory");
+#else
+            reinterpret_cast<uint4*>(output + group * 256 + lane * kValuesPerLane)[j / (16 / sizeof(OutputType))] =
+                low.word;
+            reinterpret_cast<uint4*>(
+                output + group * 256 + 128 + lane * kValuesPerLane)[j / (16 / sizeof(OutputType))] = high.word;
+#endif
+        }
+    }
+}
+
+#endif
+
 template<int GROUPS_PER_BLOCK, typename OutputType>
 __global__ void dequantize_int8_convrot_groups64_kernel(
     const int8_t* __restrict__ q,
@@ -1014,6 +1181,14 @@ __global__ void dequantize_int8_convrot_g64_kernel(
     int K,
     int scale_size)
 {
+#if __CUDA_ARCH__ >= 900 && __CUDA_ARCH__ < 1200
+    const int64_t group = int64_t(blockIdx.x) * GROUPS_PER_BLOCK + threadIdx.x / 16;
+    if (group >= num_groups) return;
+    const int64_t row = group / (K / 64);
+    dequantize_int8_convrot_group<64>(
+        q + group * 64, scales[scale_size == 1 ? 0 : row], output + group * 64, threadIdx.x % 16);
+#else
+
     constexpr int kGroup = 64;
     constexpr int kGroupThreads = kGroup / 4;
     __shared__ float smem[GROUPS_PER_BLOCK * 2 * kGroup];
@@ -1047,6 +1222,7 @@ __global__ void dequantize_int8_convrot_g64_kernel(
     if (active) {
         convrot_fht_stage64_store<16, OutputType>(buf0, output + offset, lane);
     }
+#endif
 }
 
 template<int GROUPS_PER_BLOCK, typename InputType, typename OutputType>
@@ -2490,7 +2666,46 @@ void launch_dequantize_int8_simple_kernel(
         throw std::runtime_error("dequantize_int8_simple scale mode is invalid");
     }
 
-    if (scale_mode == 2 && (total % 4) == 0 && (inner_dim % 4) == 0) {
+    const bool aligned = reinterpret_cast<uintptr_t>(input) % 16 == 0 && reinterpret_cast<uintptr_t>(output) % 16 == 0;
+    if (scale_mode == 1 && aligned && reinterpret_cast<uintptr_t>(scales) % 16 == 0 && total % 4 == 0 &&
+        total >= 1024) {
+        const int blocks = static_cast<int>((total / 4 + 255) / 256);
+        DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+            comfy::dequantize_int8_simple_vec4_kernel<OutputType>
+                <<<blocks, 256, 0, stream>>>(static_cast<const int8_t*>(input), static_cast<const float*>(scales),
+                    static_cast<OutputType*>(output), total / 4, 0, scale_mode);
+        });
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#if CUDA_VERSION >= 13010 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000)
+    if (aligned && output_dtype_code != 0 && scale_mode != 1 && total >= 33554432 && total % 8 == 0 &&
+        (scale_mode == 0 || (inner_dim >= 1024 && inner_dim % 8 == 0 && total / inner_dim <= INT_MAX))) {
+        int device = 0, major = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+        if (major == 10) {
+            const int threads = scale_mode == 2 && inner_dim < 4096 ? 128 : 256;
+            const dim3 grid = scale_mode == 2
+                ? dim3(static_cast<unsigned>(total / inner_dim),
+                      static_cast<unsigned>((inner_dim / 8 + threads - 1) / threads))
+                : dim3(static_cast<unsigned>(std::min<int64_t>((total / 8 + threads - 1) / threads, 16384)));
+            const bool launched = DISPATCH_HALF_DTYPE(output_dtype_code, OutputType, [&] {
+                if (comfy::dequantize_kernel_arch(comfy::dequantize_int8_vec8_kernel<OutputType>) < 100)
+                    return false;
+                comfy::dequantize_int8_vec8_kernel<OutputType>
+                    <<<grid, threads, 0, stream>>>(static_cast<const int8_t*>(input), static_cast<const float*>(scales),
+                        static_cast<OutputType*>(output), total / 8, inner_dim / 8, scale_mode);
+                return true;
+            });
+            if (launched) {
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+        }
+    }
+#endif
+    if (aligned && scale_mode == 2 && (total % 4) == 0 && (inner_dim % 4) == 0) {
         const int64_t total_vec4 = total / 4;
         const int64_t rows = total / inner_dim;
         const int inner_dim_vec4 = static_cast<int>(inner_dim / 4);
@@ -2534,7 +2749,7 @@ void launch_dequantize_int8_simple_kernel(
         return;
     }
 
-    if (scale_mode == 0 && (total % 4) == 0) {
+    if (aligned && scale_mode == 0 && (total % 4) == 0) {
         const int64_t total_vec4 = total / 4;
         const int block_threads = (total_vec4 >= 8'000'000 && total_vec4 <= 16'000'000)
             ? 512
@@ -2622,78 +2837,69 @@ void launch_dequantize_int8_convrot_kernel(
         return;
     }
 
-    if (num_cols >= comfy::kConvRotGroup) {
-        auto launch_groups = [&](auto groups_tag) {
-            constexpr int groups_per_block = decltype(groups_tag)::value;
-            // const (not constexpr): MSVC 14.42 rejects capturing a constexpr
-            // local into the nested dispatch lambda (C3495); it is only a
-            // runtime launch dimension here.
-            const int block_threads = groups_per_block * 64;
-            const int group_blocks =
-                static_cast<int>((num_cols / comfy::kConvRotGroup + groups_per_block - 1) / groups_per_block);
-            const size_t smem_bytes = groups_per_block * 2 * comfy::kConvRotGroup * sizeof(float);
-            const dim3 grid(
-                static_cast<unsigned int>(num_rows),
-                static_cast<unsigned int>(group_blocks));
-            DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
-                // Re-derived from the tag: MSVC 14.42 refuses to capture the
-                // enclosing lambda's constexpr local (C3495).
-                constexpr int kGroupsPerBlock = decltype(groups_tag)::value;
-                comfy::dequantize_int8_convrot_groups64_kernel<kGroupsPerBlock, OutputType>
-                    <<<grid, block_threads, smem_bytes, stream>>>(
-                        static_cast<const int8_t*>(input),
-                        static_cast<const float*>(scales),
-                        static_cast<OutputType*>(output),
-                        static_cast<int>(num_cols),
-                        static_cast<int>(scale_size));
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+    if (num_rows * num_cols >= 4194304 && reinterpret_cast<uintptr_t>(input) % 32 == 0 &&
+        reinterpret_cast<uintptr_t>(output) % 32 == 0) {
+        int device = 0, major = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+        if (major >= 9 && major < 12) {
+            const int groups_per_row = static_cast<int>(num_cols / 256);
+            const int64_t groups = num_rows * groups_per_row;
+            const uint64_t reciprocal = UINT64_MAX / groups_per_row +
+                (UINT64_MAX % groups_per_row == static_cast<uint64_t>(groups_per_row - 1));
+            const bool launched = DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+                const int arch = comfy::dequantize_kernel_arch(comfy::dequantize_int8_convrot_warp_kernel<OutputType>);
+                if (arch < 90) return false;
+                const bool wide = arch >= 100 && CUDA_VERSION >= 13010;
+                const int groups_per_block = wide ? 32 : 8;
+                const int threads = !wide && output_dtype_code == 0 ? 256 : 64;
+                const unsigned blocks = static_cast<unsigned>((groups + groups_per_block - 1) / groups_per_block);
+                comfy::dequantize_int8_convrot_warp_kernel<OutputType><<<blocks, threads, 0, stream>>>(
+                    static_cast<const int8_t*>(input), static_cast<const float*>(scales),
+                    static_cast<OutputType*>(output), groups, groups_per_row, static_cast<int>(scale_size), reciprocal);
+                return true;
             });
-        };
-
-        if (num_cols < 1024) {
-            launch_groups(std::integral_constant<int, 1>{});
-        } else if (num_cols < 4096) {
-            launch_groups(std::integral_constant<int, 2>{});
-        } else {
-            launch_groups(std::integral_constant<int, 4>{});
+            if (launched) {
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
         }
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            throw std::runtime_error(std::string("CUDA INT8 convrot dequantization failed: ") + cudaGetErrorString(err));
-        }
-        return;
     }
-
-    const bool wide = num_cols > 5120;
-    const int block_threads = wide ? 1024 : comfy::kInt8Threads;
-    const int groups_in_flight = block_threads / comfy::kConvRotGroup;
-    const size_t smem_bytes =
-        (static_cast<size_t>(num_cols) + groups_in_flight * 2 * comfy::kConvRotGroup) * sizeof(float);
-
-    auto launch = [&](auto kernel, auto* output_typed) {
-        cudaError_t attr_err = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(smem_bytes));
-        if (attr_err != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("convrot dequant kernel shared memory request (") +
-                std::to_string(smem_bytes) + " bytes) failed: " +
-                cudaGetErrorString(attr_err));
-        }
-        kernel<<<static_cast<unsigned int>(num_rows), block_threads, smem_bytes, stream>>>(
-            static_cast<const int8_t*>(input),
-            static_cast<const float*>(scales),
-            output_typed,
-            static_cast<int>(num_cols),
-            static_cast<int>(scale_size));
+#endif
+    auto launch_groups = [&](auto groups_tag) {
+        constexpr int groups_per_block = decltype(groups_tag)::value;
+        // const (not constexpr): MSVC 14.42 rejects capturing a constexpr
+        // local into the nested dispatch lambda (C3495); it is only a
+        // runtime launch dimension here.
+        const int block_threads = groups_per_block * 64;
+        const int group_blocks =
+            static_cast<int>((num_cols / comfy::kConvRotGroup + groups_per_block - 1) / groups_per_block);
+        const size_t smem_bytes = groups_per_block * 2 * comfy::kConvRotGroup * sizeof(float);
+        const dim3 grid(
+            static_cast<unsigned int>(num_rows),
+            static_cast<unsigned int>(group_blocks));
+        DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+            // Re-derived from the tag: MSVC 14.42 refuses to capture the
+            // enclosing lambda's constexpr local (C3495).
+            constexpr int kGroupsPerBlock = decltype(groups_tag)::value;
+            comfy::dequantize_int8_convrot_groups64_kernel<kGroupsPerBlock, OutputType>
+                <<<grid, block_threads, smem_bytes, stream>>>(
+                    static_cast<const int8_t*>(input),
+                    static_cast<const float*>(scales),
+                    static_cast<OutputType*>(output),
+                    static_cast<int>(num_cols),
+                    static_cast<int>(scale_size));
+        });
     };
-    DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
-        if (wide) {
-            launch(comfy::dequantize_int8_convrot_kernel<1024, OutputType>, static_cast<OutputType*>(output));
-        } else {
-            launch(comfy::dequantize_int8_convrot_kernel<256, OutputType>, static_cast<OutputType*>(output));
-        }
-    });
+
+    if (num_cols < 1024) {
+        launch_groups(std::integral_constant<int, 1>{});
+    } else if (num_cols < 4096) {
+        launch_groups(std::integral_constant<int, 2>{});
+    } else {
+        launch_groups(std::integral_constant<int, 4>{});
+    }
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
