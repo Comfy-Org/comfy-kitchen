@@ -1544,6 +1544,345 @@ bool mxfp8_tensorops_available() {
   }
 }
 
+struct ConvRotQuantParams {
+  uint32_t rows;
+  uint32_t dim;
+  uint32_t group_size;
+  uint32_t stochastic;
+  uint32_t seed_lo;
+  uint32_t seed_hi;
+  uint32_t x_stride;
+  uint32_t q_stride;
+};
+
+struct RotateParams {
+  uint32_t rows;
+  uint32_t dim;
+  uint32_t group_size;
+  uint32_t x_stride;
+  uint32_t out_stride;
+};
+
+struct W4A4MmParams {
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+  uint32_t a_packed_stride;
+  uint32_t w_packed_stride;
+  uint32_t out_stride;
+};
+
+struct Int8EpilogueParams {
+  uint32_t M;
+  uint32_t N;
+  uint32_t acc_stride;
+  uint32_t out_stride;
+  uint32_t has_bias;
+  uint32_t has_residual;
+};
+
+static bool is_power_of_four(int64_t g) {
+  if (g < 4) {
+    return false;
+  }
+  if ((g & (g - 1)) != 0) {
+    return false;
+  }
+  // power of 2 and even exponent => power of 4
+  int exp = 0;
+  int64_t x = g;
+  while (x > 1) {
+    x >>= 1;
+    exp++;
+  }
+  return (exp % 2) == 0;
+}
+
+static constexpr NSUInteger kConvRotThreads = 256;
+
+static NSUInteger convrot_row_tg_bytes(int64_t dim, int64_t group_size) {
+  // Full-row fused quant: row buffer + FHT temp + 8-float absmax scratch.
+  return (NSUInteger)((dim + group_size + 8) * (int64_t)sizeof(float));
+}
+
+static NSUInteger convrot_group_tg_bytes(int64_t group_size) {
+  // Streaming rotate: one group buffer + FHT temp.
+  return (NSUInteger)((group_size + group_size) * (int64_t)sizeof(float));
+}
+
+static void check_convrot_shape(int64_t dim, int64_t group_size) {
+  TORCH_CHECK(is_power_of_four(group_size), "convrot group_size must be 4^n");
+  TORCH_CHECK(dim % group_size == 0, "K must be divisible by group_size");
+}
+
+static bool convrot_row_fits_tg(id<MTLDevice> device, int64_t dim, int64_t group_size) {
+  return convrot_row_tg_bytes(dim, group_size) <= [device maxThreadgroupMemoryLength];
+}
+
+// Forward decls used by the large-K quantize fallback.
+at::Tensor rotate_hadamard_rows(at::Tensor x, int64_t group_size);
+std::tuple<at::Tensor, at::Tensor> quantize_int8_rowwise(
+    at::Tensor x, bool stochastic, int64_t seed);
+std::tuple<at::Tensor, at::Tensor> quantize_int4_rowwise(
+    at::Tensor x, bool stochastic, int64_t seed);
+
+static void dispatch_convrot_quant(
+    const char* kname,
+    at::Tensor x2,
+    at::Tensor q,
+    at::Tensor scale,
+    int64_t group_size,
+    bool stochastic,
+    int64_t seed) {
+  id<MTLDevice> device = (id<MTLDevice>)at::mps::MPSDevice::getInstance()->device();
+  check_convrot_shape(x2.size(1), group_size);
+  TORCH_CHECK(
+      convrot_row_fits_tg(device, x2.size(1), group_size),
+      "fused convrot quant K exceeds Metal TG memory budget");
+
+  ConvRotQuantParams p{};
+  p.rows = (uint32_t)x2.size(0);
+  p.dim = (uint32_t)x2.size(1);
+  p.group_size = (uint32_t)group_size;
+  p.stochastic = stochastic ? 1u : 0u;
+  const uint64_t s = (uint64_t)seed;
+  p.seed_lo = (uint32_t)s;
+  p.seed_hi = (uint32_t)(s >> 32);
+  p.x_stride = stride_u32(x2, 0, "x");
+  p.q_stride = stride_u32(q, 0, "q");
+
+  const NSUInteger tg_bytes = convrot_row_tg_bytes((int64_t)p.dim, (int64_t)p.group_size);
+  id<MTLComputePipelineState> pipeline = get_pipeline(device, kname);
+  at::mps::MPSStream* stream = at::mps::getCurrentMPSStream();
+  dispatch_sync(stream->queue(), ^{
+    id<MTLComputeCommandEncoder> enc = (id<MTLComputeCommandEncoder>)stream->commandEncoder();
+    [enc setComputePipelineState:pipeline];
+    set_tensor(enc, x2, 0);
+    set_tensor(enc, q, 1);
+    set_tensor(enc, scale, 2);
+    [enc setBytes:&p length:sizeof(ConvRotQuantParams) atIndex:3];
+    [enc setThreadgroupMemoryLength:tg_bytes atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(p.rows, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(kConvRotThreads, 1, 1)];
+    stream->endKernelCoalescing();
+  });
+}
+
+std::tuple<at::Tensor, at::Tensor> quantize_int8_rowwise_convrot(
+    at::Tensor x, int64_t group_size, bool stochastic = false, int64_t seed = 0) {
+  check_mps_fp(x, "quantize_int8_rowwise_convrot");
+  TORCH_CHECK(x.stride(-1) == 1);
+  const int64_t dim = x.size(-1);
+  check_convrot_shape(dim, group_size);
+  auto x2 = x.reshape({-1, dim}).contiguous();
+  id<MTLDevice> device = (id<MTLDevice>)at::mps::MPSDevice::getInstance()->device();
+  if (!convrot_row_fits_tg(device, dim, group_size)) {
+    // Large-K path (e.g. LTX K=16384): stream rotate, then row-wise quant.
+    auto rotated = rotate_hadamard_rows(x2, group_size);
+    auto [q, scale] = quantize_int8_rowwise(rotated, stochastic, seed);
+    std::vector<int64_t> sshape(x.sizes().begin(), x.sizes().end());
+    sshape.back() = 1;
+    return {q.reshape_as(x), scale.reshape(sshape)};
+  }
+  auto q = at::empty(x2.sizes(), x2.options().dtype(at::kChar));
+  auto scale = at::empty({x2.size(0)}, x2.options().dtype(at::kFloat));
+  std::string kname = std::string("quantize_int8_rowwise_convrot_") + suffix(x.scalar_type());
+  dispatch_convrot_quant(kname.c_str(), x2, q, scale, group_size, stochastic, seed);
+  std::vector<int64_t> sshape(x.sizes().begin(), x.sizes().end());
+  sshape.back() = 1;
+  return {q.reshape_as(x), scale.reshape(sshape)};
+}
+
+std::tuple<at::Tensor, at::Tensor> quantize_int4_rowwise_convrot(
+    at::Tensor x, int64_t group_size, bool stochastic = false, int64_t seed = 0) {
+  check_mps_fp(x, "quantize_int4_rowwise_convrot");
+  TORCH_CHECK(x.stride(-1) == 1);
+  const int64_t dim = x.size(-1);
+  TORCH_CHECK(dim % 2 == 0);
+  check_convrot_shape(dim, group_size);
+  auto x2 = x.reshape({-1, dim}).contiguous();
+  id<MTLDevice> device = (id<MTLDevice>)at::mps::MPSDevice::getInstance()->device();
+  if (!convrot_row_fits_tg(device, dim, group_size)) {
+    auto rotated = rotate_hadamard_rows(x2, group_size);
+    return quantize_int4_rowwise(rotated, stochastic, seed);
+  }
+  auto packed = at::empty({x2.size(0), dim / 2}, x2.options().dtype(at::kChar));
+  auto scale = at::empty({x2.size(0)}, x2.options().dtype(at::kFloat));
+  std::string kname = std::string("quantize_int4_rowwise_convrot_") + suffix(x.scalar_type());
+  dispatch_convrot_quant(kname.c_str(), x2, packed, scale, group_size, stochastic, seed);
+  return {packed, scale};
+}
+
+at::Tensor rotate_hadamard_rows(at::Tensor x, int64_t group_size) {
+  check_mps_fp(x, "rotate_hadamard_rows");
+  TORCH_CHECK(x.stride(-1) == 1);
+  const int64_t dim = x.size(-1);
+  check_convrot_shape(dim, group_size);
+  id<MTLDevice> device = (id<MTLDevice>)at::mps::MPSDevice::getInstance()->device();
+  const NSUInteger tg_bytes = convrot_group_tg_bytes(group_size);
+  TORCH_CHECK(
+      tg_bytes <= [device maxThreadgroupMemoryLength],
+      "convrot group_size exceeds Metal TG memory budget");
+  auto x2 = x.reshape({-1, dim}).contiguous();
+  auto out = at::empty_like(x2);
+  const int64_t n_groups = dim / group_size;
+
+  RotateParams p{};
+  p.rows = (uint32_t)x2.size(0);
+  p.dim = (uint32_t)dim;
+  p.group_size = (uint32_t)group_size;
+  p.x_stride = stride_u32(x2, 0, "x");
+  p.out_stride = stride_u32(out, 0, "out");
+
+  std::string kname = std::string("rotate_hadamard_rows_") + suffix(x.scalar_type());
+  id<MTLComputePipelineState> pipeline = get_pipeline(device, kname.c_str());
+  at::mps::MPSStream* stream = at::mps::getCurrentMPSStream();
+  const NSUInteger threads =
+      std::min<NSUInteger>(kConvRotThreads, (NSUInteger)std::max<int64_t>(group_size, 1));
+  dispatch_sync(stream->queue(), ^{
+    id<MTLComputeCommandEncoder> enc = (id<MTLComputeCommandEncoder>)stream->commandEncoder();
+    [enc setComputePipelineState:pipeline];
+    set_tensor(enc, x2, 0);
+    set_tensor(enc, out, 1);
+    [enc setBytes:&p length:sizeof(RotateParams) atIndex:2];
+    [enc setThreadgroupMemoryLength:tg_bytes atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_groups * (int64_t)p.rows), 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    stream->endKernelCoalescing();
+  });
+  return out.reshape_as(x);
+}
+
+at::Tensor convrot_w4a4_linear_fused(
+    at::Tensor a_packed,
+    at::Tensor w_packed,
+    at::Tensor a_scales,
+    at::Tensor w_scales,
+    c10::optional<at::Tensor> bias_opt) {
+  TORCH_CHECK(a_packed.device().is_mps() && w_packed.device().is_mps());
+  TORCH_CHECK(a_packed.dtype() == at::kChar && w_packed.dtype() == at::kChar);
+  TORCH_CHECK(a_packed.dim() == 2 && w_packed.dim() == 2);
+  const int64_t M = a_packed.size(0);
+  const int64_t N = w_packed.size(0);
+  const int64_t K = a_packed.size(1) * 2;
+  TORCH_CHECK(w_packed.size(1) * 2 == K);
+  TORCH_CHECK(K % 64 == 0, "convrot_w4a4_linear_fused requires K divisible by 64");
+  a_packed = a_packed.contiguous();
+  w_packed = w_packed.contiguous();
+  a_scales = a_scales.to(at::kFloat).reshape({-1}).contiguous();
+  w_scales = w_scales.to(at::kFloat).reshape({-1}).contiguous();
+  TORCH_CHECK(a_scales.numel() == M && w_scales.numel() == N);
+
+  auto out = at::empty({M, N}, a_packed.options().dtype(at::kHalf));
+  at::Tensor bias = out; // dummy binding when absent
+  uint32_t has_bias = 0;
+  if (bias_opt.has_value() && bias_opt->defined()) {
+    bias = bias_opt->to(at::kHalf).reshape({-1}).contiguous();
+    TORCH_CHECK(bias.numel() == N);
+    has_bias = 1;
+  }
+
+  W4A4MmParams p{};
+  p.M = (uint32_t)M;
+  p.N = (uint32_t)N;
+  p.K = (uint32_t)K;
+  p.a_packed_stride = stride_u32(a_packed, 0, "a");
+  p.w_packed_stride = stride_u32(w_packed, 0, "w");
+  p.out_stride = stride_u32(out, 0, "out");
+
+  id<MTLDevice> device = (id<MTLDevice>)at::mps::MPSDevice::getInstance()->device();
+  id<MTLComputePipelineState> pipeline = get_pipeline(device, "convrot_w4a4_linear_fused");
+  at::mps::MPSStream* stream = at::mps::getCurrentMPSStream();
+  const NSUInteger tgx = 8, tgy = 8;
+  dispatch_sync(stream->queue(), ^{
+    id<MTLComputeCommandEncoder> enc = (id<MTLComputeCommandEncoder>)stream->commandEncoder();
+    [enc setComputePipelineState:pipeline];
+    set_tensor(enc, a_packed, 0);
+    set_tensor(enc, w_packed, 1);
+    set_tensor(enc, a_scales, 2);
+    set_tensor(enc, w_scales, 3);
+    set_tensor(enc, out, 4);
+    set_tensor(enc, bias, 5);
+    [enc setBytes:&p length:sizeof(W4A4MmParams) atIndex:6];
+    [enc setBytes:&has_bias length:sizeof(uint32_t) atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 7) / 8, (M + 7) / 8, 1)
+        threadsPerThreadgroup:MTLSizeMake(tgx, tgy, 1)];
+    stream->endKernelCoalescing();
+  });
+  return out;
+}
+
+at::Tensor int8_mm_epilogue(
+    at::Tensor acc,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    c10::optional<at::Tensor> bias_opt,
+    c10::optional<at::Tensor> residual_opt,
+    c10::optional<at::Tensor> residual_scale_opt,
+    int64_t out_dtype_code) {
+  TORCH_CHECK(acc.device().is_mps() && acc.dtype() == at::kInt);
+  TORCH_CHECK(acc.dim() == 2);
+  const int64_t M = acc.size(0);
+  const int64_t N = acc.size(1);
+  // Matches eager DTYPE_TO_CODE: 1=float16, 2=bfloat16.
+  const c10::ScalarType out_dtype =
+      out_dtype_code == 2 ? at::kBFloat16 : at::kHalf;
+  acc = acc.contiguous();
+  x_scale = x_scale.to(at::kFloat).reshape({-1}).contiguous();
+  w_scale = w_scale.to(at::kFloat).reshape({-1}).contiguous();
+  TORCH_CHECK(x_scale.numel() == M && w_scale.numel() == N);
+
+  auto out = at::empty({M, N}, acc.options().dtype(out_dtype));
+  at::Tensor bias = out;
+  at::Tensor residual = out;
+  at::Tensor residual_scale = out;
+  uint32_t has_bias = 0;
+  uint32_t has_residual = 0;
+  if (bias_opt.has_value() && bias_opt->defined()) {
+    bias = bias_opt->to(out_dtype).reshape({-1}).contiguous();
+    TORCH_CHECK(bias.numel() == N);
+    has_bias = 1;
+  }
+  if (residual_opt.has_value() && residual_opt->defined()) {
+    residual = residual_opt->to(out_dtype).reshape({M, N}).contiguous();
+    TORCH_CHECK(residual_scale_opt.has_value() && residual_scale_opt->defined());
+    residual_scale = residual_scale_opt->to(out_dtype).reshape({-1}).contiguous();
+    TORCH_CHECK(residual_scale.numel() == N);
+    has_residual = 1;
+  }
+
+  Int8EpilogueParams p{};
+  p.M = (uint32_t)M;
+  p.N = (uint32_t)N;
+  p.acc_stride = stride_u32(acc, 0, "acc");
+  p.out_stride = stride_u32(out, 0, "out");
+  p.has_bias = has_bias;
+  p.has_residual = has_residual;
+
+  const char* kname = out_dtype == at::kBFloat16 ? "int8_mm_epilogue_bf16" : "int8_mm_epilogue_fp16";
+  id<MTLDevice> device = (id<MTLDevice>)at::mps::MPSDevice::getInstance()->device();
+  id<MTLComputePipelineState> pipeline = get_pipeline(device, kname);
+  at::mps::MPSStream* stream = at::mps::getCurrentMPSStream();
+  const NSUInteger tgx = std::min<NSUInteger>((NSUInteger)std::max<int64_t>(N, 1), 32u);
+  const NSUInteger tgy = 8;
+  dispatch_sync(stream->queue(), ^{
+    id<MTLComputeCommandEncoder> enc = (id<MTLComputeCommandEncoder>)stream->commandEncoder();
+    [enc setComputePipelineState:pipeline];
+    set_tensor(enc, acc, 0);
+    set_tensor(enc, x_scale, 1);
+    set_tensor(enc, w_scale, 2);
+    set_tensor(enc, bias, 3);
+    set_tensor(enc, residual, 4);
+    set_tensor(enc, residual_scale, 5);
+    set_tensor(enc, out, 6);
+    [enc setBytes:&p length:sizeof(Int8EpilogueParams) atIndex:7];
+    [enc dispatchThreads:MTLSizeMake((NSUInteger)N, (NSUInteger)M, 1)
+        threadsPerThreadgroup:MTLSizeMake(tgx, tgy, 1)];
+    stream->endKernelCoalescing();
+  });
+  return out;
+}
+
 } // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1584,6 +1923,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("scaled_mm_nvfp4_fused", &scaled_mm_nvfp4_fused);
   m.def("scaled_mm_svdquant_fused", &scaled_mm_svdquant_fused);
   m.def("gemv_awq_w4a16_fused", &gemv_awq_w4a16_fused);
+  m.def(
+      "quantize_int8_rowwise_convrot",
+      &quantize_int8_rowwise_convrot,
+      py::arg("x"),
+      py::arg("group_size"),
+      py::arg("stochastic") = false,
+      py::arg("seed") = 0);
+  m.def(
+      "quantize_int4_rowwise_convrot",
+      &quantize_int4_rowwise_convrot,
+      py::arg("x"),
+      py::arg("group_size"),
+      py::arg("stochastic") = false,
+      py::arg("seed") = 0);
+  m.def("rotate_hadamard_rows", &rotate_hadamard_rows);
+  m.def("convrot_w4a4_linear_fused", &convrot_w4a4_linear_fused);
+  m.def("int8_mm_epilogue", &int8_mm_epilogue);
   m.def("metal_available", &metal_available);
   m.def("mxfp8_tensorops_available", &mxfp8_tensorops_available);
 }

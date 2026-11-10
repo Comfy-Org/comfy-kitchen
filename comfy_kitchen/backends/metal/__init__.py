@@ -3,8 +3,10 @@
 """Apple Metal backend for Comfy Kitchen.
 
 Hardware-sympathetic path:
-  - ``int8_linear`` → Apple ``torch._weight_int8pack_mm`` (native MPS GEMM)
-  - RoPE / AdaLN / RMS / INT8 quant → custom Metal kernels (simdgroup + float2/float4)
+  - ``int8_linear`` → fused ConvRot FHT+quant, ``torch._int_mm``, Metal epilogue
+  - ``convrot_w4a4_linear`` → fused FHT+int4 quant + tiled W4A4 GEMM
+  - ``sol_attn`` / ``na3d`` → block-sparse / tiled MPS SDPA (no O(T²) eager)
+  - RoPE / AdaLN / RMS / INT8 quant → custom Metal kernels
 
 Optional: importing :mod:`comfy_kitchen` must not require MPS off Mac.
 """
@@ -30,10 +32,7 @@ from comfy_kitchen.backends.eager.convrot_w4a4 import (
     dequantize_convrot_w4a4_weight as _eager_dequantize_convrot_w4a4_weight,
 )
 from comfy_kitchen.backends.eager.convrot_w4a4 import validate_w4a4_shape
-from comfy_kitchen.backends.eager.na import na3d as _eager_na3d
-from comfy_kitchen.backends.eager.na import window_attention as _eager_window_attention
 from comfy_kitchen.backends.eager.quantization import DTYPE_CODE_TO_DTYPE, DTYPE_TO_CODE
-from comfy_kitchen.backends.eager.sol_attn import sol_attn as _eager_sol_attn
 from comfy_kitchen.backends.eager.svdquant import (
     _INT4_GROUP_SIZE,
     _ceil_div,
@@ -49,6 +48,9 @@ from comfy_kitchen.backends.metal.mx_nv_fp import (
     scaled_mm_mxfp8,
     scaled_mm_nvfp4,
 )
+from comfy_kitchen.backends.metal.na import na3d as _metal_na3d
+from comfy_kitchen.backends.metal.na import window_attention as _metal_window_attention
+from comfy_kitchen.backends.metal.sol_attn import sol_attn as _metal_sol_attn
 from comfy_kitchen.constraints import (
     ExactDims,
     FunctionConstraints,
@@ -59,7 +61,7 @@ from comfy_kitchen.constraints import (
     window_attention_common_call_rule,
 )
 from comfy_kitchen.registry import registry
-from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation, _rotate_weight
+from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
 
 _logger = logging.getLogger("comfy_kitchen.metal")
 
@@ -252,9 +254,10 @@ def int8_linear(
 ) -> torch.Tensor:
     """Dynamic W8A8 linear on MPS.
 
-    Prefer Metal row-wise INT8 quant + ``torch._int_mm`` (matches eager). When
-    kernels are unavailable but dims are 32-aligned, fall back to Apple
-    ``_weight_int8pack_mm`` (W8A16).
+    ConvRot uses a fused Metal FHT+quantize kernel (no bf16 Hadamard round-trip).
+    The W8A8 path is Metal row-wise INT8 quant + ``torch._int_mm`` + a Metal
+    scale/bias/residual epilogue. When kernels are unavailable but dims are
+    32-aligned, fall back to Apple ``_weight_int8pack_mm`` (W8A16).
     """
     orig_shape = x.shape
     x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
@@ -264,28 +267,32 @@ def int8_linear(
         )
 
     weight = weight.to(device=x.device).contiguous()
-    if convrot:
-        if x.shape[-1] % convrot_groupsize != 0:
-            raise ValueError(
-                f"ConvRot group size {convrot_groupsize} does not divide input features {x.shape[-1]}"
-            )
-        hadamard = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
-        x = _rotate_activation(x, hadamard, convrot_groupsize)
+    if convrot and x.shape[-1] % convrot_groupsize != 0:
+        raise ValueError(
+            f"ConvRot group size {convrot_groupsize} does not divide input features {x.shape[-1]}"
+        )
 
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     w_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1)
     if w_scale.numel() == 1:
-        w_scale = w_scale.expand(weight.shape[0])
+        w_scale = w_scale.expand(weight.shape[0]).contiguous()
     elif w_scale.numel() != weight.shape[0]:
         raise ValueError(
             "INT8 weight scale must be scalar or per-output-channel, "
             f"got {tuple(weight_scale.shape)} for weight shape {tuple(weight.shape)}"
         )
+    else:
+        w_scale = w_scale.contiguous()
 
     ops = _kernels()
     use_w8a8 = ops is not None and _METAL_INT_MM_AVAILABLE and _mps_fp(x_2d)
     if use_w8a8:
-        x_8, x_scale = ops.quantize_int8_rowwise(x_2d, False, 0)
+        if convrot:
+            x_8, x_scale = ops.quantize_int8_rowwise_convrot(
+                x_2d, int(convrot_groupsize), False, 0
+            )
+        else:
+            x_8, x_scale = ops.quantize_int8_rowwise(x_2d, False, 0)
         x_8 = x_8.to(torch.int8)
         acc = torch._int_mm(x_8, weight.t().contiguous())
         if acc.device.type != "mps":
@@ -293,19 +300,32 @@ def int8_linear(
                 "metal int8_linear: torch._int_mm left MPS (CPU fallback); "
                 "refusing silent host bounce"
             )
-        result = (acc.float() * (x_scale.to(torch.float32) * w_scale.reshape(1, -1))).to(out_dtype)
-    else:
-        if not _METAL_INT8PACK_AVAILABLE:
-            raise RuntimeError("metal int8_linear: no int8 matmul path")
-        if x_2d.dtype != torch.float16:
-            x_2d = x_2d.to(dtype=torch.float16)
-        if weight.shape[0] % 32 != 0 or weight.shape[1] % 32 != 0:
-            raise RuntimeError("metal pack_mm fallback requires N/K divisible by 32")
-        scale = w_scale.to(dtype=torch.float16).contiguous()
-        result = torch._weight_int8pack_mm(x_2d, weight, scale)
-        if result.dtype != out_dtype:
-            result = result.to(dtype=out_dtype)
+        if out_dtype not in (torch.float16, torch.bfloat16):
+            raise RuntimeError("metal int8_linear epilogue requires fp16/bf16 out_dtype")
+        result = ops.int8_mm_epilogue(
+            acc,
+            x_scale.to(torch.float32).reshape(-1).contiguous(),
+            w_scale,
+            bias,
+            residual.reshape(-1, weight.shape[0]) if residual is not None else None,
+            residual_scale,
+            int(DTYPE_TO_CODE[out_dtype]),
+        )
+        return result.reshape(*orig_shape[:-1], weight.shape[0])
 
+    if convrot:
+        hadamard = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        x_2d = _rotate_activation(x_2d, hadamard, convrot_groupsize).contiguous()
+    if not _METAL_INT8PACK_AVAILABLE:
+        raise RuntimeError("metal int8_linear: no int8 matmul path")
+    if x_2d.dtype != torch.float16:
+        x_2d = x_2d.to(dtype=torch.float16)
+    if weight.shape[0] % 32 != 0 or weight.shape[1] % 32 != 0:
+        raise RuntimeError("metal pack_mm fallback requires N/K divisible by 32")
+    scale = w_scale.to(dtype=torch.float16).contiguous()
+    result = torch._weight_int8pack_mm(x_2d, weight, scale)
+    if result.dtype != out_dtype:
+        result = result.to(dtype=out_dtype)
     if bias is not None:
         result = result + bias.to(device=result.device, dtype=result.dtype).reshape(1, -1)
     result = result.reshape(*orig_shape[:-1], weight.shape[0])
@@ -574,10 +594,10 @@ def na3d(
     is_causal: list[bool] | None = None,
     scale: float | None = None,
 ) -> torch.Tensor:
-    """Neighborhood attention on MPS with batched SDPA (eager g_max path)."""
+    """Neighborhood attention on MPS with metal-owned tiled SDPA."""
     if q.device.type != "mps":
         raise RuntimeError("metal na3d requires mps tensors")
-    return _eager_na3d(q, k, v, kernel_size, is_causal, scale)
+    return _metal_na3d(q, k, v, kernel_size, is_causal, scale)
 
 
 def window_attention(
@@ -592,7 +612,7 @@ def window_attention(
 ) -> torch.Tensor:
     if q.device.type != "mps":
         raise RuntimeError("metal window_attention requires mps tensors")
-    return _eager_window_attention(q, k, v, kh, kw, temporal_window, clamp, scale)
+    return _metal_window_attention(q, k, v, kh, kw, temporal_window, clamp, scale)
 
 
 def quantize_and_rotate_rowwise(
@@ -601,22 +621,26 @@ def quantize_and_rotate_rowwise(
     group_size: int,
     stochastic_rounding: int | None = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    del H  # fused FHT owns the orthonormal transform; H is API-compatible only
     ops = _kernels()
     if ops is None or not _mps_fp(x):
         raise RuntimeError("metal quantize_and_rotate_rowwise declined")
     if x.shape[-1] % group_size != 0:
         raise RuntimeError("metal quantize_and_rotate_rowwise: group_size must divide features")
-    x_rot = _rotate_activation(x.contiguous(), H, group_size)
-    return quantize_int8_rowwise(x_rot, stochastic_rounding=stochastic_rounding)
+    stochastic, seed = _sr_args(stochastic_rounding)
+    q, scale = ops.quantize_int8_rowwise_convrot(
+        x.contiguous(), int(group_size), stochastic, seed
+    )
+    return q.to(torch.int8), scale
 
 
 def rotate_int8_convrot_weight(weight: torch.Tensor, group_size: int) -> torch.Tensor:
-    if not _mps_fp(weight) or weight.dim() != 2:
+    ops = _kernels()
+    if ops is None or not _mps_fp(weight) or weight.dim() != 2:
         raise RuntimeError("metal rotate_int8_convrot_weight declined")
     if weight.shape[-1] % group_size != 0:
         raise RuntimeError("metal rotate_int8_convrot_weight: group_size must divide K")
-    h = _build_hadamard(group_size, device=weight.device, dtype=weight.dtype)
-    return _rotate_weight(weight.contiguous(), h, group_size)
+    return ops.rotate_hadamard_rows(weight.contiguous(), int(group_size))
 
 
 def quantize_int8_convrot_weight(
@@ -624,10 +648,14 @@ def quantize_int8_convrot_weight(
     group_size: int,
     stochastic_rounding: int | None = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if _kernels() is None or not _mps_fp(weight):
+    ops = _kernels()
+    if ops is None or not _mps_fp(weight):
         raise RuntimeError("metal quantize_int8_convrot_weight declined")
-    rotated = rotate_int8_convrot_weight(weight, group_size)
-    return quantize_int8_rowwise(rotated, stochastic_rounding=stochastic_rounding)
+    stochastic, seed = _sr_args(stochastic_rounding)
+    q, scale = ops.quantize_int8_rowwise_convrot(
+        weight.contiguous(), int(group_size), stochastic, seed
+    )
+    return q.to(torch.int8), scale
 
 
 def dequantize_int8_convrot_weight(
@@ -637,8 +665,10 @@ def dequantize_int8_convrot_weight(
     if ops is None or q.device.type != "mps" or q.dim() != 2:
         raise RuntimeError("metal dequantize_int8_convrot_weight declined")
     dequant = ops.dequantize_int8_simple(q.contiguous(), scale.contiguous())
-    h = _build_hadamard(group_size, device=q.device, dtype=torch.float32)
-    return _rotate_weight(dequant, h, group_size)
+    # H is symmetric, so the inverse rotation is the same FHT. Dequant is fp32;
+    # rotate in fp16 on GPU then restore fp32 to match the eager contract.
+    rotated = ops.rotate_hadamard_rows(dequant.to(dtype=torch.float16), int(group_size))
+    return rotated.float()
 
 
 def dequantize_int8_convrot_weight_dtype(
@@ -698,10 +728,10 @@ def quantize_convrot_w4a4_weight(
     if quant_group_size != _INT4_GROUP_SIZE:
         raise RuntimeError("metal convrot w4a4 requires quant_group_size 64")
     validate_w4a4_shape(weight, convrot_groupsize, quant_group_size)
-    h = _build_hadamard(convrot_groupsize, device=weight.device, dtype=weight.dtype)
-    weight_rot = _rotate_weight(weight.contiguous(), h, convrot_groupsize)
     stochastic, seed = _sr_args(stochastic_rounding)
-    packed, scales = ops.quantize_int4_rowwise(weight_rot.contiguous(), stochastic, seed)
+    packed, scales = ops.quantize_int4_rowwise_convrot(
+        weight.contiguous(), int(convrot_groupsize), stochastic, seed
+    )
     return packed.to(torch.int8), scales
 
 
@@ -712,11 +742,22 @@ def dequantize_convrot_w4a4_weight(
     quant_group_size: int = _INT4_GROUP_SIZE,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
+    ops = _kernels()
     if qdata.device.type != "mps":
         raise RuntimeError("metal dequantize_convrot_w4a4_weight declined")
-    return _eager_dequantize_convrot_w4a4_weight(
-        qdata, scales, convrot_groupsize, quant_group_size, output_dtype
+    if ops is None:
+        return _eager_dequantize_convrot_w4a4_weight(
+            qdata, scales, convrot_groupsize, quant_group_size, output_dtype
+        )
+    if quant_group_size != _INT4_GROUP_SIZE:
+        raise RuntimeError("metal convrot w4a4 requires quant_group_size 64")
+    w_rot = ops.dequantize_int4_rowwise(
+        qdata.contiguous(),
+        scales.to(device=qdata.device, dtype=torch.float32).reshape(-1).contiguous(),
     )
+    # dequant kernel writes fp16; rotate in fp16 then cast.
+    rotated = ops.rotate_hadamard_rows(w_rot.contiguous(), int(convrot_groupsize))
+    return rotated.to(dtype=output_dtype)
 
 
 def convrot_w4a4_linear(
@@ -742,17 +783,18 @@ def convrot_w4a4_linear(
 
     orig_shape = x.shape
     x2d = x.reshape(-1, orig_shape[-1]).contiguous()
-    h = _build_hadamard(convrot_groupsize, device=x2d.device, dtype=x2d.dtype)
-    x_rot = _rotate_activation(x2d, h, convrot_groupsize).contiguous()
-    qact, x_scale = ops.quantize_int4_rowwise(x_rot, False, 0)
-    x_fp = ops.dequantize_int4_rowwise(qact, x_scale)
-    w_fp = ops.dequantize_int4_rowwise(
-        qweight.contiguous(),
-        wscales.to(device=x.device, dtype=torch.float32).reshape(-1).contiguous(),
+    qact, x_scale = ops.quantize_int4_rowwise_convrot(
+        x2d, int(convrot_groupsize), False, 0
     )
-    out = x_fp.to(dtype=x.dtype) @ w_fp.to(dtype=x.dtype).t()
-    if bias is not None:
-        out = out + bias.to(device=out.device, dtype=out.dtype).reshape(1, -1)
+    out = ops.convrot_w4a4_linear_fused(
+        qact,
+        qweight.contiguous(),
+        x_scale.to(torch.float32).reshape(-1).contiguous(),
+        wscales.to(device=x.device, dtype=torch.float32).reshape(-1).contiguous(),
+        bias.to(dtype=torch.float16) if bias is not None else None,
+    )
+    if out.dtype != x.dtype:
+        out = out.to(dtype=x.dtype)
     return out[: x2d.shape[0]].reshape(*orig_shape[:-1], qweight.shape[0])
 
 
@@ -773,7 +815,7 @@ def sol_attn(
 ) -> torch.Tensor:
     if q.device.type != "mps":
         raise RuntimeError("metal sol_attn requires mps tensors")
-    return _eager_sol_attn(
+    return _metal_sol_attn(
         q, k, v, tau, scale, sink_blocks, sink_q, key_bias,
         topk_ratio, tail, block_len, coarse_gate, token_aug,
     )

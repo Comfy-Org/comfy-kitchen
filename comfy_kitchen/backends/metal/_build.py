@@ -19,6 +19,7 @@ _BUILD = _PACKAGE_DIR / "build"
 _METAL_SOURCES = (
     ("kernels.metal", ["-std=metal3.1"]),
     ("fused_quant_mm.metal", ["-std=metal3.1"]),
+    ("convrot_fused.metal", ["-std=metal3.1"]),
     ("mxfp8_matmul.metal", []),
 )
 _METALLIB_NAME = "comfy_kitchen_metal.metallib"
