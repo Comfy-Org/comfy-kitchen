@@ -223,10 +223,50 @@ def test_fp16_fallback_does_not_overflow(monkeypatch, per_channel):
 
 
 @needs_cpu_fp16_matmul
+@pytest.mark.parametrize("per_channel", [False, True])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_fp16_input_wide_out_dtype_does_not_overflow(monkeypatch, per_channel, out_dtype):
+    """FP16 activations with a bf16 / fp32 output: the scaled output itself, 512 * 1 * 127
+    * 2 = 130048 (times the channel index when per-channel), is past fp16's 65504 but fits
+    out_dtype. The fallback's GEMM must not be held to fp16's range."""
+    _forbid_int_mm(monkeypatch)
+    rows = 8
+    x = torch.ones((1, K), dtype=torch.float16)
+    weight = torch.full((rows, K), 127, dtype=torch.int8)
+    if per_channel:
+        scale = torch.arange(1, rows + 1, dtype=torch.float32).reshape(rows, 1) * 2
+    else:
+        scale = torch.tensor(2.0, dtype=torch.float32)
+    expected = (K * 1.0 * 127 * scale.reshape(-1)).expand(1, rows)
+
+    out = ck.int8_linear(x, weight, scale, None, out_dtype)
+    assert out.dtype == out_dtype
+    assert torch.isfinite(out).all()
+    rtol = 2**-8 if out_dtype == torch.bfloat16 else 0
+    torch.testing.assert_close(out.float(), expected, rtol=rtol, atol=0)
+
+
+@needs_cpu_fp16_matmul
+def test_fp16_input_fp16_out_large_value_that_fits(monkeypatch):
+    """FP16 in and out, output 512 * 1 * 127 * 0.5 = 32512: inside fp16's range (and exact
+    in fp16), with no fp16 rounding anywhere before the final cast."""
+    _forbid_int_mm(monkeypatch)
+    x = torch.ones((1, K), dtype=torch.float16)
+    weight = torch.full((8, K), 127, dtype=torch.int8)
+    scale = torch.tensor(0.5, dtype=torch.float32)
+
+    out = ck.int8_linear(x, weight, scale, None, torch.float16)
+    assert out.dtype == torch.float16
+    torch.testing.assert_close(out.float(), torch.full((1, 8), 32512.0), rtol=0, atol=0)
+
+
+@needs_cpu_fp16_matmul
 @pytest.mark.parametrize("convrot", [False, True])
 def test_fp16_fallback_matches_float32_reference(monkeypatch, convrot):
-    """The fp16 path folds the scale into the weight slice; single-pass and chunked runs
-    must both match the float32 dequantize-then-GEMM reference."""
+    """The fp16 path runs the GEMM in float32 on exactly converted inputs, so without
+    ConvRot it is the float32 dequantize-then-GEMM reference plus the final fp16 rounding
+    (<= 2**-11 relative). ConvRot also rotates x in fp16 first, as the INT8 path does,
+    which adds ~2**-11 * sqrt(K) * |x| * |w| of error (std ~0.01 here)."""
     _forbid_int_mm(monkeypatch)
     qt = _quantized_weight(convrot, seed=10)
     x = torch.randn(8, K, dtype=torch.float16)
@@ -239,18 +279,41 @@ def test_fp16_fallback_matches_float32_reference(monkeypatch, convrot):
         w_ref = qt._qdata.float() * qt._params.scale.float()
     ref = torch.nn.functional.linear(x.float(), w_ref.float(), bias.float())
 
+    out = ck.int8_linear(
+        x, qt._qdata, qt._params.scale, bias, torch.float16,
+        convrot=convrot, convrot_groupsize=256,
+    )
+    assert out.dtype == torch.float16
+    if convrot:
+        assert_values_close(out.float(), ref, rtol=1e-2, atol=0.1)
+    else:
+        assert_values_close(out.float(), ref, rtol=1e-3, atol=1e-3)
+
+
+@needs_cpu_fp16_matmul
+@pytest.mark.parametrize("convrot", [False, True])
+@pytest.mark.parametrize("out_dtype", [torch.float16, torch.float32])
+def test_fp16_fallback_row_and_column_blocks_match_single_pass(monkeypatch, convrot, out_dtype):
+    """A tiny chunk budget splits the fp16 path's float32 work into several row blocks of x
+    (3, 3, 2 rows) and many output-channel slices (3 channels each); every output element is
+    the same float32 dot product, so the result must equal the single-block run exactly."""
+    _forbid_int_mm(monkeypatch)
+    qt = _quantized_weight(convrot, seed=11)
+    x = torch.randn(2, 4, K, dtype=torch.float16)
+    bias = torch.randn(N, dtype=torch.float16)
+
     def run():
         return ck.int8_linear(
-            x, qt._qdata, qt._params.scale, bias, torch.float16,
+            x, qt._qdata, qt._params.scale, bias, out_dtype,
             convrot=convrot, convrot_groupsize=256,
         )
 
     single = run()
-    monkeypatch.setattr(quantization, "_FALLBACK_CHUNK_BYTES", K * 4 * 7)  # ~7 rows per slice
+    # float32 row block [3, K] and weight slice [3, K] each fit; [3, 3] output fits too.
+    monkeypatch.setattr(quantization, "_FALLBACK_CHUNK_BYTES", K * 4 * 3)
     chunked = run()
-    for out in (single, chunked):
-        assert out.dtype == torch.float16
-        assert_values_close(out.float(), ref, rtol=1e-2, atol=0.1)
+    assert chunked.shape == (2, 4, N) and chunked.dtype == out_dtype
+    torch.testing.assert_close(chunked, single, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("input_act", [None, "swiglu", "rms_norm"])

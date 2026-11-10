@@ -1023,18 +1023,19 @@ def _int8_linear_dequant(
     Mirrors the INT8 path's math on a float GEMM. ConvRot rotates the *activations*,
     exactly as the INT8 path does (the stored weight is already in the rotated basis).
     The weight is cast one output-channel slice at a time, so it stays INT8 in memory
-    (no full-weight float copy, no weight rotation), and the slice is sized so no
-    per-slice temporary exceeds ``_FALLBACK_CHUNK_BYTES``. By x's dtype:
+    (no full-weight float copy, no weight rotation), and every slice is sized so no
+    per-slice temporary exceeds ``_FALLBACK_CHUNK_BYTES``. The INT8 values are cast
+    exactly (|q| <= 127) and the weight scale is applied to the GEMM output in float32,
+    in that order for every dtype. By x's dtype:
 
-    - bf16 / fp32: the INT8 values are cast to x's dtype (exact, |q| <= 127), the
-      GEMM runs in that dtype, and the weight scale is applied to the output in
-      float32. bf16 has fp32's exponent range, so the unscaled product (|q| <= 127
-      times the activations) stays far inside it.
-    - fp16: the unscaled product can exceed fp16's 65504 even when the scaled
-      output is small, so the scale is folded into the weight slice first, in
-      float32 (``q * scale``), then rounded to fp16 for the GEMM. The fp16 weight
-      carries one fp16 rounding per element, as a native fp16 weight would, and
-      the GEMM works at the magnitude of the scaled output, not 1/scale times it.
+    - bf16 / fp32: the GEMM runs in x's dtype. bf16 has fp32's exponent range, so the
+      unscaled product (|q| <= 127 times the activations) stays far inside it.
+    - fp16: the GEMM runs in float32, since the unscaled product, and the scaled
+      output itself when ``out_dtype`` is bf16 or fp32, can exceed fp16's 65504. x is
+      converted one row block at a time (fp16 to float32 is exact), so the float32
+      copy of x is bounded too. From the GEMM on, nothing is limited to fp16's range
+      except a final cast to an fp16 ``out_dtype`` (ConvRot still rotates x in fp16,
+      as the INT8 path does).
 
     Bias is added in float32 before the cast to ``out_dtype``. Activations are not
     quantized on this path, so it carries none of the INT8 path's activation
@@ -1049,33 +1050,38 @@ def _int8_linear_dequant(
         x = _rotate_activation(x, h, convrot_groupsize)
     n, k = weight.shape
     x2 = x.reshape(-1, k)
-    out = torch.empty(x2.shape[0], n, device=x.device, dtype=out_dtype)
+    rows = x2.shape[0]
+    out = torch.empty(rows, n, device=x.device, dtype=out_dtype)
     if bias is not None:
         bias = bias.to(device=x.device, dtype=torch.float32)
-    # fp16 folds the scale into the weight slice in float32 (see above).
-    fold_scale = x.dtype == torch.float16
-    # One output-channel slice at a time: bounds the weight slice [chunk, K] (float32
-    # while folding the scale, else x.dtype) and the float32 output slice [rows, chunk].
-    weight_elem_bytes = 4 if fold_scale else x.element_size()
+    gemm_dtype = torch.float32 if x.dtype == torch.float16 else x.dtype
+    gemm_elem_bytes = torch.finfo(gemm_dtype).bits // 8
+    # bf16 / fp32 use x as is (one row block, no copy); fp16 converts a row block
+    # [row_block, K] of x to float32 at a time.
+    if gemm_dtype == x.dtype:
+        row_block = max(1, rows)
+    else:
+        row_block = max(1, min(rows, _FALLBACK_CHUNK_BYTES // max(1, k * gemm_elem_bytes)))
+    # One output-channel slice at a time: bounds the weight slice [chunk, K] in
+    # gemm_dtype and the float32 output block [row_block, chunk].
     chunk = max(
         1,
         min(
             n,
-            _FALLBACK_CHUNK_BYTES // max(1, k * weight_elem_bytes),
-            _FALLBACK_CHUNK_BYTES // max(1, x2.shape[0] * 4),
+            _FALLBACK_CHUNK_BYTES // max(1, k * gemm_elem_bytes),
+            _FALLBACK_CHUNK_BYTES // max(1, row_block * 4),
         ),
     )
-    for i in range(0, n, chunk):
-        scale = weight_scale if weight_scale.numel() == 1 else weight_scale[i:i + chunk]
-        w = weight[i:i + chunk]
-        if fold_scale:
-            w = w.float().mul_(scale.reshape(-1, 1))
-        y = torch.nn.functional.linear(x2, w.to(dtype=x.dtype)).float()
-        if not fold_scale:
+    for r in range(0, rows, row_block):
+        xr = x2[r:r + row_block].to(dtype=gemm_dtype)
+        for i in range(0, n, chunk):
+            scale = weight_scale if weight_scale.numel() == 1 else weight_scale[i:i + chunk]
+            w = weight[i:i + chunk].to(dtype=gemm_dtype)
+            y = torch.nn.functional.linear(xr, w).float()
             y *= scale
-        if bias is not None:
-            y += bias[i:i + chunk]
-        out[:, i:i + chunk] = y.to(out_dtype)
+            if bias is not None:
+                y += bias[i:i + chunk]
+            out[r:r + row_block, i:i + chunk] = y.to(out_dtype)
     return out.reshape(x.shape[:-1] + (n,))
 
 
