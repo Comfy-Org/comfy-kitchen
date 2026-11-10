@@ -23,6 +23,21 @@ namespace {
 
 constexpr int kInt8Threads = 256;
 
+// Query the selected image: PTX JIT can run an older layout on a newer GPU.
+template<typename Kernel>
+int dequantize_kernel_arch(Kernel kernel) {
+    cudaFuncAttributes attributes{};
+    const cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
+    // Newer runtimes also interpret an absent symbol as a kernel handle.
+    if (status == cudaErrorInvalidDeviceFunction || status == cudaErrorNoKernelImageForDevice ||
+        status == cudaErrorInvalidResourceHandle) {
+        cudaGetLastError();  // An optional image is absent; use the existing fallback.
+        return 0;
+    }
+    CUDA_CHECK(status);
+    return attributes.ptxVersion;
+}
+
 template<typename T>
 __device__ __forceinline__ float to_float(T val);
 template<> __device__ __forceinline__ float to_float<float>(float val) { return val; }
@@ -2663,7 +2678,7 @@ void launch_dequantize_int8_simple_kernel(
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 1000 && CUDA_VERSION >= 13010)
+#if CUDA_VERSION >= 13010 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000)
     if (aligned && output_dtype_code != 0 && scale_mode != 1 && total >= 33554432 && total % 8 == 0 &&
         (scale_mode == 0 || (inner_dim >= 1024 && inner_dim % 8 == 0 && total / inner_dim <= INT_MAX))) {
         int device = 0, major = 0;
@@ -2675,13 +2690,18 @@ void launch_dequantize_int8_simple_kernel(
                 ? dim3(static_cast<unsigned>(total / inner_dim),
                       static_cast<unsigned>((inner_dim / 8 + threads - 1) / threads))
                 : dim3(static_cast<unsigned>(std::min<int64_t>((total / 8 + threads - 1) / threads, 16384)));
-            DISPATCH_HALF_DTYPE(output_dtype_code, OutputType, [&] {
+            const bool launched = DISPATCH_HALF_DTYPE(output_dtype_code, OutputType, [&] {
+                if (comfy::dequantize_kernel_arch(comfy::dequantize_int8_vec8_kernel<OutputType>) < 100)
+                    return false;
                 comfy::dequantize_int8_vec8_kernel<OutputType>
                     <<<grid, threads, 0, stream>>>(static_cast<const int8_t*>(input), static_cast<const float*>(scales),
                         static_cast<OutputType*>(output), total / 8, inner_dim / 8, scale_mode);
+                return true;
             });
-            CUDA_CHECK(cudaGetLastError());
-            return;
+            if (launched) {
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
         }
     }
 #endif
@@ -2828,21 +2848,22 @@ void launch_dequantize_int8_convrot_kernel(
             const int64_t groups = num_rows * groups_per_row;
             const uint64_t reciprocal = UINT64_MAX / groups_per_row +
                 (UINT64_MAX % groups_per_row == static_cast<uint64_t>(groups_per_row - 1));
-#if CUDA_VERSION >= 13010
-            const int groups_per_block = major >= 10 ? 32 : 8;
-            const int threads = major == 9 && output_dtype_code == 0 ? 256 : 64;
-#else
-            const int groups_per_block = 8;
-            const int threads = output_dtype_code == 0 ? 256 : 64;
-#endif
-            const unsigned blocks = static_cast<unsigned>((groups + groups_per_block - 1) / groups_per_block);
-            DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+            const bool launched = DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+                const int arch = comfy::dequantize_kernel_arch(comfy::dequantize_int8_convrot_warp_kernel<OutputType>);
+                if (arch < 90) return false;
+                const bool wide = arch >= 100 && CUDA_VERSION >= 13010;
+                const int groups_per_block = wide ? 32 : 8;
+                const int threads = !wide && output_dtype_code == 0 ? 256 : 64;
+                const unsigned blocks = static_cast<unsigned>((groups + groups_per_block - 1) / groups_per_block);
                 comfy::dequantize_int8_convrot_warp_kernel<OutputType><<<blocks, threads, 0, stream>>>(
                     static_cast<const int8_t*>(input), static_cast<const float*>(scales),
                     static_cast<OutputType*>(output), groups, groups_per_row, static_cast<int>(scale_size), reciprocal);
+                return true;
             });
-            CUDA_CHECK(cudaGetLastError());
-            return;
+            if (launched) {
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
         }
     }
 #endif

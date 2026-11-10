@@ -305,6 +305,59 @@ def test_eager_int8_stochastic_rounding_convrot(seed):
     assert not torch.equal(q1, q3)
 
 
+@requires_cuda_backend
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("convrot,cols,per_row,side,input_offset,output_offset", [
+    # Cross each dispatch threshold with scalar/per-row scales and 1/3/4 groups.
+    *[(True, 256 * groups, per_row, side, 0, 0)
+      for groups in (1, 3, 4) for per_row in (False, True) for side in (-1, 1)],
+    *[(False, cols, per_row, side, 0, 0)
+      for cols in (1024, 4096) for per_row in (False, True) for side in (-1, 1)],
+    # Contiguous offset views must take the scalar/shared-memory fallbacks.
+    *[(convrot, 768 if convrot else 1024, per_row, 1, input_offset, output_offset)
+      for convrot in (False, True)
+      for per_row, input_offset, output_offset in ((True, 1, 0), (False, 0, 1))],
+])
+def test_cuda_int8_dequant_dispatch_reference(
+    dtype, convrot, cols, per_row, side, input_offset, output_offset
+):
+    """Check actual large CUDA paths and fallback views against an independent reference."""
+    from comfy_kitchen.tensor.int8_utils import _build_hadamard
+
+    threshold = (1 << 22) if convrot else (1 << 25)
+    rows = (threshold - 1) // cols if side < 0 else threshold // cols + 1
+    storage = torch.empty(rows * cols + input_offset, device="cuda", dtype=torch.int8)
+    q = storage[input_offset:].view(rows, cols)
+    # Every position sees every INT8 value across rows, plus all-min/all-max rows.
+    q.copy_(((torch.arange(rows, device="cuda")[:, None]
+              + torch.arange(cols, device="cuda")) % 256 - 128).to(torch.int8))
+    q[0].fill_(-128)
+    q[1].fill_(127)
+    if convrot:
+        signs = _build_hadamard(256, device="cuda")[0]
+        q[2].copy_(torch.where(signs > 0, 127, -128).repeat(cols // 256))
+    scales = torch.exp2((torch.arange(rows if per_row else 1, device="cuda") % 7 - 3).float())
+    start = 16 + output_offset
+    guard = torch.full((q.numel() + 32,), 13, device="cuda", dtype=dtype)
+    out = guard[start:start + q.numel()].view_as(q)
+    out.fill_(float("nan"))  # Catch incomplete writes, not just wrong values.
+    assert q.data_ptr() % 32 == input_offset
+    assert out.data_ptr() % 32 == output_offset * out.element_size()
+
+    ref = q.float()
+    if convrot:
+        ref = (ref.reshape(-1, 256) @ _build_hadamard(256, device="cuda")).view_as(q)
+    ref = (ref * scales.reshape(-1, 1)).to(dtype)
+    wrap = cuda._wrap_for_dlpack
+    stream = torch.cuda.current_stream().cuda_stream
+    if convrot:
+        cuda._C.dequantize_int8_convrot_weight(wrap(q), wrap(scales), wrap(out), 256, stream)
+    else:
+        cuda._C.dequantize_int8_simple(wrap(q), wrap(scales), wrap(out), cols, 2 if per_row else 0, stream)
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    assert torch.all(guard[:start] == 13) and torch.all(guard[start + q.numel():] == 13)
+
+
 class TestTensorWiseINT8Layout:
     """Tests for TensorWiseINT8Layout quantized tensor format."""
 
