@@ -1020,15 +1020,25 @@ def _int8_linear_dequant(
 ) -> torch.Tensor:
     """``int8_linear`` on a device with no INT8 GEMM (e.g. MPS, pytorch/pytorch#141287).
 
-    Mirrors the INT8 path's math on a float GEMM: ConvRot rotates the *activations*,
-    exactly as the INT8 path does (the stored weight is already in the rotated
-    basis); the INT8 weight values are cast to x's dtype for the GEMM (exact:
-    |q| <= 127 is representable in bf16/fp16/fp32) one output-channel slice at a
-    time, bounded so neither the cast weight slice nor the float32 output slice
-    exceeds ~256 MB; and the weight scale is applied to the output in float32. The
-    weight stays INT8 in memory — no full-weight float copy and no weight rotation.
-    Activations are not quantized on this path, so the result is slightly more
-    accurate than the INT8 path, not less.
+    Mirrors the INT8 path's math on a float GEMM. ConvRot rotates the *activations*,
+    exactly as the INT8 path does (the stored weight is already in the rotated basis).
+    The weight is cast one output-channel slice at a time, so it stays INT8 in memory
+    (no full-weight float copy, no weight rotation), and the slice is sized so no
+    per-slice temporary exceeds ``_FALLBACK_CHUNK_BYTES``. By x's dtype:
+
+    - bf16 / fp32: the INT8 values are cast to x's dtype (exact, |q| <= 127), the
+      GEMM runs in that dtype, and the weight scale is applied to the output in
+      float32. bf16 has fp32's exponent range, so the unscaled product (|q| <= 127
+      times the activations) stays far inside it.
+    - fp16: the unscaled product can exceed fp16's 65504 even when the scaled
+      output is small, so the scale is folded into the weight slice first, in
+      float32 (``q * scale``), then rounded to fp16 for the GEMM. The fp16 weight
+      carries one fp16 rounding per element, as a native fp16 weight would, and
+      the GEMM works at the magnitude of the scaled output, not 1/scale times it.
+
+    Bias is added in float32 before the cast to ``out_dtype``. Activations are not
+    quantized on this path, so it carries none of the INT8 path's activation
+    quantization error.
     """
     if convrot:
         if x.shape[-1] % convrot_groupsize != 0:
@@ -1042,20 +1052,27 @@ def _int8_linear_dequant(
     out = torch.empty(x2.shape[0], n, device=x.device, dtype=out_dtype)
     if bias is not None:
         bias = bias.to(device=x.device, dtype=torch.float32)
-    # One output-channel slice at a time: bounds both the cast weight slice
-    # [chunk, K] (x.dtype) and the float32 output slice [rows, chunk].
+    # fp16 folds the scale into the weight slice in float32 (see above).
+    fold_scale = x.dtype == torch.float16
+    # One output-channel slice at a time: bounds the weight slice [chunk, K] (float32
+    # while folding the scale, else x.dtype) and the float32 output slice [rows, chunk].
+    weight_elem_bytes = 4 if fold_scale else x.element_size()
     chunk = max(
         1,
         min(
             n,
-            _FALLBACK_CHUNK_BYTES // max(1, k * x.element_size()),
+            _FALLBACK_CHUNK_BYTES // max(1, k * weight_elem_bytes),
             _FALLBACK_CHUNK_BYTES // max(1, x2.shape[0] * 4),
         ),
     )
     for i in range(0, n, chunk):
-        w = weight[i:i + chunk].to(dtype=x.dtype)
-        y = torch.nn.functional.linear(x2, w).float()
-        y *= weight_scale if weight_scale.numel() == 1 else weight_scale[i:i + chunk]
+        scale = weight_scale if weight_scale.numel() == 1 else weight_scale[i:i + chunk]
+        w = weight[i:i + chunk]
+        if fold_scale:
+            w = w.float().mul_(scale.reshape(-1, 1))
+        y = torch.nn.functional.linear(x2, w.to(dtype=x.dtype)).float()
+        if not fold_scale:
+            y *= scale
         if bias is not None:
             y += bias[i:i + chunk]
         out[:, i:i + chunk] = y.to(out_dtype)

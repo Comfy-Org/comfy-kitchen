@@ -19,10 +19,25 @@ from comfy_kitchen.backends._activations import apply_input_act
 from comfy_kitchen.backends.eager import quantization
 from comfy_kitchen.tensor import QuantizedTensor
 
-from .conftest import assert_values_close
+from .conftest import assert_values_close, rel_err
 
 MPS_AVAILABLE = torch.backends.mps.is_available()
 N, K = 256, 512
+
+
+def _cpu_fp16_matmul_supported():
+    try:
+        a = torch.ones(2, 2, dtype=torch.float16)
+        torch.nn.functional.linear(a, a)
+        return True
+    except RuntimeError:
+        return False
+
+
+CPU_FP16_MATMUL = _cpu_fp16_matmul_supported()
+needs_cpu_fp16_matmul = pytest.mark.skipif(
+    not CPU_FP16_MATMUL, reason="this torch has no float16 matmul on CPU"
+)
 
 # bf16 comparisons: the fallback keeps the INT8 weight values exact and applies the scale to
 # the output, while the reference multiplies bf16-rounded dequantized weights — different
@@ -178,6 +193,90 @@ def test_native_path_untouched_when_int_mm_exists(monkeypatch):
     qt = _quantized_weight(convrot=False, seed=2)
     torch.nn.functional.linear(torch.randn(8, K, dtype=torch.bfloat16), qt)
     assert calls, "expected the native INT8 GEMM on CPU"
+
+
+@needs_cpu_fp16_matmul
+@pytest.mark.parametrize("per_channel", [False, True])
+def test_fp16_fallback_does_not_overflow(monkeypatch, per_channel):
+    """FP16 activations (what ComfyUI picks on MPS): the unscaled INT8 product here is
+    512 * 8 * 127 = 520192, past fp16's 65504, while the scaled output (4064 per unit of
+    scale * 128) is representable. The fallback must return the scaled value, not inf."""
+    _forbid_int_mm(monkeypatch)
+    rows = 8
+    x = torch.full((1, K), 8.0, dtype=torch.float16)
+    weight = torch.full((rows, K), 127, dtype=torch.int8)
+    if per_channel:
+        scale = torch.arange(1, rows + 1, dtype=torch.float32).reshape(rows, 1) / 128
+    else:
+        scale = torch.tensor(1 / 128, dtype=torch.float32)
+    expected = (K * 8.0 * 127 * scale.reshape(-1)).expand(1, rows)
+
+    out = ck.int8_linear(x, weight, scale, None, torch.float16)
+    assert out.dtype == torch.float16
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.float(), expected, rtol=1e-3, atol=0)
+
+
+@needs_cpu_fp16_matmul
+@pytest.mark.parametrize("convrot", [False, True])
+def test_fp16_fallback_matches_float32_reference(monkeypatch, convrot):
+    """The fp16 path folds the scale into the weight slice; single-pass and chunked runs
+    must both match the float32 dequantize-then-GEMM reference."""
+    _forbid_int_mm(monkeypatch)
+    qt = _quantized_weight(convrot, seed=10)
+    x = torch.randn(8, K, dtype=torch.float16)
+    bias = torch.randn(N, dtype=torch.float16)
+    if convrot:
+        w_ref = quantization.dequantize_int8_convrot_weight(
+            qt._qdata, qt._params.scale.reshape(-1, 1), 256
+        )
+    else:
+        w_ref = qt._qdata.float() * qt._params.scale.float()
+    ref = torch.nn.functional.linear(x.float(), w_ref.float(), bias.float())
+
+    def run():
+        return ck.int8_linear(
+            x, qt._qdata, qt._params.scale, bias, torch.float16,
+            convrot=convrot, convrot_groupsize=256,
+        )
+
+    single = run()
+    monkeypatch.setattr(quantization, "_FALLBACK_CHUNK_BYTES", K * 4 * 7)  # ~7 rows per slice
+    chunked = run()
+    for out in (single, chunked):
+        assert out.dtype == torch.float16
+        assert_values_close(out.float(), ref, rtol=1e-2, atol=0.1)
+
+
+@pytest.mark.parametrize("input_act", [None, "swiglu", "rms_norm"])
+def test_fallback_matches_native_with_input_act_and_residual(monkeypatch, input_act):
+    """The fallback honors input_act / input_act_weight / input_act_eps and
+    residual / residual_scale exactly as the native INT8 path does (CPU has _int_mm)."""
+    qt = _quantized_weight(convrot=False, seed=8)
+    torch.manual_seed(9)
+    in_features = 2 * K if input_act == "swiglu" else K
+    x = torch.randn(8, in_features, dtype=torch.bfloat16)
+    bias = torch.randn(N, dtype=torch.bfloat16)
+    residual = torch.randn(8, N, dtype=torch.bfloat16)
+    residual_scale = torch.rand(N, dtype=torch.bfloat16) + 0.5
+    act_weight = torch.rand(K, dtype=torch.bfloat16) + 0.5 if input_act == "rms_norm" else None
+    act_kwargs = {"input_act": input_act, "input_act_weight": act_weight, "input_act_eps": 1e-6}
+
+    def run(**kwargs):
+        return quantization.int8_linear(
+            x, qt._qdata, qt._params.scale, bias, torch.bfloat16, **act_kwargs, **kwargs
+        )
+
+    native = run(residual=residual, residual_scale=residual_scale)
+    _forbid_int_mm(monkeypatch)
+    plain = run()
+    fallback = run(residual=residual, residual_scale=residual_scale)
+
+    assert fallback.dtype == torch.bfloat16 and fallback.shape == native.shape
+    # The residual epilogue is the same op on both paths.
+    torch.testing.assert_close(fallback, torch.addcmul(residual, plain, residual_scale))
+    # The paths differ only by the native path's activation quantization (~1%).
+    assert rel_err(fallback, native) < 3e-2
 
 
 @pytest.mark.skipif(not MPS_AVAILABLE, reason="MPS device required")
