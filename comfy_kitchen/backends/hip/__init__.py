@@ -210,8 +210,8 @@ def _has_nonduplicated_wmma(device: torch.device | int | None = None) -> bool:
     return _gfx_arch(device) in (_ARCH_WMMA_GFX12 | _ARCH_WMMA_GFX117)
 
 
-# The GEMMs, and only the GEMMs, need matrix cores. Everything else is elementwise
-# or a scalar reduction and runs on any supported architecture. This set names the
+# The GEMMs need matrix cores, except the INT8 one, which also has a SIMT
+# v_dot4 path for RDNA2 (see ops/gemm_int8.hip). This set names the
 # registry-dispatched GEMMs so _build_constraints can drop them on RDNA2; the fp8
 # GEMM is not among them because it is reached through scaled_mm_v2's _hip_fp8_gemm,
 # which gates on has_wmma() itself rather than through the registry.
@@ -219,7 +219,6 @@ _WMMA_ONLY_OPS = frozenset({
     "fp16_conv3d",
     "fp16_conv3d_out",
     "fp16_linear",
-    "int8_linear",
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
     "na3d",
@@ -916,7 +915,11 @@ def int8_linear(
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """INT8 linear with dynamic row-wise activation quantization, on WMMA."""
+    """INT8 linear with dynamic row-wise activation quantization.
+
+    Runs the WMMA tile kernel where the device has matrix cores and the SIMT
+    ``v_dot4`` tile kernel where it does not (RDNA2).
+    """
     x, input_act, act_weight = _split_input_act(
         x, input_act, input_act_weight, input_act_eps, convrot, convrot_groupsize)
     # k_act is the activated (quantized) row width: swiglu and situ halve the raw row.

@@ -3989,3 +3989,42 @@ def test_deltanet_conv_step_window_fits_registers(hip, kernel_size, seq, seed):
             [combined[:, :, 1 + s: s + kernel_size] for s in range(seq - 1)]
         )
         assert torch.equal(snaps, expected)
+
+
+# RDNA2 has no matrix cores, so the INT8 GEMM runs the SIMT v_dot4 tile kernel
+# instead of the WMMA one.
+needs_simt_int8 = pytest.mark.skipif(
+    HAS_WMMA, reason=_UNAVAILABLE or "WMMA devices take the matrix-core INT8 path"
+)
+
+
+@pytest.mark.parametrize(("m", "n", "k"), [*GEMM_SHAPES, (257, 137, 1024)])
+@pytest.mark.parametrize("per_channel", [False, True])
+@needs_simt_int8
+def test_int8_linear_simt_matches_int32_reference(m, n, k, per_channel):
+    """The SIMT tile kernel must agree with the exact int32 product.
+
+    The activation is quantized by the same kernel the linear uses, so this
+    covers the GEMM and the epilogue only; a second quantizer would add its own
+    rounding. The eager backend is not a usable reference here: it needs
+    torch._int_mm, which hipBLASLt does not implement on RDNA2.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16)
+    wq, ws = ck.quantize_int8_rowwise(w)
+    ws = ws.reshape(-1) if per_channel else ws.reshape(-1)[:1]
+    bias = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+
+    xq, xs = ck.quantize_int8_rowwise(x)
+    ref = (xq.float() @ wq.float().t()) * xs.reshape(-1)[:, None] * ws.float()[None, :]
+    ref += bias.float()
+
+    with ck.use_backend("hip"):
+        out = ck.int8_linear(x, wq, ws, bias, torch.bfloat16)
+
+    assert out.shape == (m, n)
+    # Integer accumulators on both sides; only the bf16 writeback rounds here,
+    # which is at most half a bf16 step of the largest output.
+    scale = max(ref.abs().max().item(), 1e-6)
+    assert (out.float() - ref).abs().max().item() < 1e-2 * scale
