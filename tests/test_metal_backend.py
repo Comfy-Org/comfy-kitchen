@@ -573,6 +573,32 @@ class TestMetalKernels:
         dq_e = eager_deq(q, scale, group, code)
         torch.testing.assert_close(dq.float(), dq_e.float(), rtol=2e-2, atol=2e-2)
 
+    def test_convrot_weight_stochastic_rounding(self, mps_device):
+        """LoRA requantize passes a seed; metal must run, not decline."""
+        from comfy_kitchen.backends.eager.quantization import (
+            quantize_int8_convrot_weight as eager_q,
+        )
+
+        group = 64
+        seed = 12345
+        w = torch.randn(64, 256, device=mps_device, dtype=torch.float16)
+        call = {"weight": w, "group_size": group, "stochastic_rounding": seed}
+        assert registry.get_capable_backend("quantize_int8_convrot_weight", call) == "metal"
+
+        q0, s0 = metal_backend.quantize_int8_convrot_weight(w, group, stochastic_rounding=seed)
+        q1, s1 = metal_backend.quantize_int8_convrot_weight(w, group, stochastic_rounding=seed)
+        q_det, s_det = metal_backend.quantize_int8_convrot_weight(w, group, stochastic_rounding=0)
+        torch.testing.assert_close(s0, s1, rtol=0, atol=0)
+        torch.testing.assert_close(s0, s_det, rtol=1e-5, atol=1e-5)
+        assert torch.equal(q0, q1)
+        assert not torch.equal(q0, q_det)
+
+        # Eager uses torch.rand; metal uses CUDA-matching PCG. Scales must still agree.
+        _q_e, s_e = eager_q(w, group, stochastic_rounding=seed)
+        torch.testing.assert_close(s0, s_e, rtol=1e-5, atol=1e-5)
+        assert q0.dtype == torch.int8
+        assert int(q0.min()) >= -128 and int(q0.max()) <= 127
+
     def test_convrot_w4a4_linear_matches_eager(self, mps_device):
         from comfy_kitchen.backends.eager.convrot_w4a4 import (
             convrot_w4a4_linear as eager_linear,

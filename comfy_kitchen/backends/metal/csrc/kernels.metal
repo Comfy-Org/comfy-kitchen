@@ -57,7 +57,37 @@ struct QuantRowParams {
   uint dim;
   uint x_stride;
   uint q_stride;
+  uint stochastic; // 1 => floor(x + U), 0 => round(x)
+  uint seed_lo;
+  uint seed_hi;
+  uint _pad;
 };
+
+inline uint pcg_hash(uint x) {
+  const uint state = x * 747796405u + 2891336453u;
+  const uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+
+inline float stochastic_rng_value(ulong idx, ulong seed) {
+  const ulong key = idx + seed;
+  const uint folded = uint(key) ^ uint(key >> 32);
+  return float(pcg_hash(folded) >> 8) * 0x1.0p-24f;
+}
+
+inline ulong quant_seed(constant QuantRowParams& p) {
+  return (ulong(p.seed_hi) << 32) | ulong(p.seed_lo);
+}
+
+inline int quantize_int8_value(float scaled, bool stochastic, ulong idx, ulong seed) {
+  float q = stochastic ? floor(scaled + stochastic_rng_value(idx, seed)) : round(scaled);
+  return clamp(int(q), -128, 127);
+}
+
+inline int quantize_int4_value(float scaled, bool stochastic, ulong idx, ulong seed) {
+  float q = stochastic ? floor(scaled + stochastic_rng_value(idx, seed)) : round(scaled);
+  return clamp(int(q), -7, 7);
+}
 
 struct RmsRopeParams {
   uint B;
@@ -593,23 +623,22 @@ void quantize_int8_rowwise_impl(
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const float s = red[0];
   const float inv = 1.0f / s;
+  const bool stochastic = p.stochastic != 0u;
+  const ulong seed = quant_seed(p);
+  const ulong row_base = ulong(row) * ulong(p.dim);
   for (uint i = tid; i < vec_count; i += tptg) {
     const uint d = i * 4u;
     float4 v = float4(
         float(xrow[d]), float(xrow[d + 1u]), float(xrow[d + 2u]), float(xrow[d + 3u]));
     v *= inv;
-    int4 qi = int4(round(v));
-    qi = clamp(qi, -128, 127);
-    qrow[d] = char(qi.x);
-    qrow[d + 1u] = char(qi.y);
-    qrow[d + 2u] = char(qi.z);
-    qrow[d + 3u] = char(qi.w);
+    qrow[d] = char(quantize_int8_value(v.x, stochastic, row_base + d, seed));
+    qrow[d + 1u] = char(quantize_int8_value(v.y, stochastic, row_base + d + 1u, seed));
+    qrow[d + 2u] = char(quantize_int8_value(v.z, stochastic, row_base + d + 2u, seed));
+    qrow[d + 3u] = char(quantize_int8_value(v.w, stochastic, row_base + d + 3u, seed));
   }
   for (uint d = vec_count * 4u + tid; d < p.dim; d += tptg) {
     float v = float(xrow[d]) * inv;
-    int qi = int(round(v));
-    qi = clamp(qi, -128, 127);
-    qrow[d] = char(qi);
+    qrow[d] = char(quantize_int8_value(v, stochastic, row_base + d, seed));
   }
 }
 
@@ -678,12 +707,13 @@ void quantize_int4_rowwise_impl(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const float inv = 1.0f / red[0];
+  const bool stochastic = p.stochastic != 0u;
+  const ulong seed = quant_seed(p);
+  const ulong row_base = ulong(row) * ulong(p.dim);
   for (uint i = tid; i < pairs; i += tptg) {
     const uint d = i * 2u;
-    int lo = int(round(float(xrow[d]) * inv));
-    int hi = int(round(float(xrow[d + 1u]) * inv));
-    lo = clamp(lo, -7, 7);
-    hi = clamp(hi, -7, 7);
+    int lo = quantize_int4_value(float(xrow[d]) * inv, stochastic, row_base + d, seed);
+    int hi = quantize_int4_value(float(xrow[d + 1u]) * inv, stochastic, row_base + d + 1u, seed);
     prow[i] = char((lo & 0xF) | ((hi & 0xF) << 4));
   }
 }
@@ -1341,6 +1371,9 @@ kernel void svdquant_quantize_bf16(
 
 struct TensorQuantParams {
   uint numel;
+  uint stochastic;
+  uint seed_lo;
+  uint seed_hi;
 };
 
 struct DequantFlatParams {
@@ -1358,10 +1391,10 @@ void quantize_int8_tensorwise_impl(
     uint gid,
     uint nthreads) {
   const float inv = 1.0f / max(*scale, 1e-30f);
+  const bool stochastic = p.stochastic != 0u;
+  const ulong seed = (ulong(p.seed_hi) << 32) | ulong(p.seed_lo);
   for (uint i = gid; i < p.numel; i += nthreads) {
-    int qi = int(round(float(x[i]) * inv));
-    qi = clamp(qi, -128, 127);
-    q[i] = char(qi);
+    q[i] = char(quantize_int8_value(float(x[i]) * inv, stochastic, ulong(i), seed));
   }
 }
 

@@ -285,7 +285,7 @@ def int8_linear(
     ops = _kernels()
     use_w8a8 = ops is not None and _METAL_INT_MM_AVAILABLE and _mps_fp(x_2d)
     if use_w8a8:
-        x_8, x_scale = ops.quantize_int8_rowwise(x_2d)
+        x_8, x_scale = ops.quantize_int8_rowwise(x_2d, False, 0)
         x_8 = x_8.to(torch.int8)
         acc = torch._int_mm(x_8, weight.t().contiguous())
         if acc.device.type != "mps":
@@ -488,11 +488,17 @@ def rms_adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: fl
     return ops.adaln(x.contiguous(), scale.contiguous(), shift.contiguous(), float(eps), True)
 
 
+def _sr_args(stochastic_rounding: int | None) -> tuple[bool, int]:
+    seed = int(stochastic_rounding or 0)
+    return seed > 0, seed
+
+
 def quantize_int8_rowwise(x: torch.Tensor, stochastic_rounding: int | None = 0):
     ops = _kernels()
-    if ops is None or not _mps_fp(x) or (stochastic_rounding is not None and stochastic_rounding > 0):
+    if ops is None or not _mps_fp(x):
         raise RuntimeError("metal quantize_int8_rowwise declined")
-    q, scale = ops.quantize_int8_rowwise(x.contiguous())
+    stochastic, seed = _sr_args(stochastic_rounding)
+    q, scale = ops.quantize_int8_rowwise(x.contiguous(), stochastic, seed)
     return q.to(torch.int8), scale
 
 
@@ -509,7 +515,7 @@ def quantize_int8_tensorwise(
     stochastic_rounding: int | None = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     ops = _kernels()
-    if ops is None or not _mps_fp(x) or (stochastic_rounding is not None and int(stochastic_rounding) > 0):
+    if ops is None or not _mps_fp(x):
         raise RuntimeError("metal quantize_int8_tensorwise declined")
     x_c = x.contiguous()
     if scale is None or (isinstance(scale, str) and scale == "recalculate"):
@@ -519,7 +525,8 @@ def quantize_int8_tensorwise(
         scale_t = torch.tensor(scale, device=x.device, dtype=torch.float32)
     else:
         scale_t = scale.to(device=x.device, dtype=torch.float32).reshape(()).contiguous()
-    q = ops.quantize_int8_tensorwise(x_c, scale_t)
+    stochastic, seed = _sr_args(stochastic_rounding)
+    q = ops.quantize_int8_tensorwise(x_c, scale_t, stochastic, seed)
     return q.to(torch.int8), scale_t
 
 
@@ -595,13 +602,12 @@ def quantize_and_rotate_rowwise(
     stochastic_rounding: int | None = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     ops = _kernels()
-    if ops is None or not _mps_fp(x) or (stochastic_rounding is not None and int(stochastic_rounding) > 0):
+    if ops is None or not _mps_fp(x):
         raise RuntimeError("metal quantize_and_rotate_rowwise declined")
     if x.shape[-1] % group_size != 0:
         raise RuntimeError("metal quantize_and_rotate_rowwise: group_size must divide features")
     x_rot = _rotate_activation(x.contiguous(), H, group_size)
-    q, scale = ops.quantize_int8_rowwise(x_rot.contiguous())
-    return q.to(torch.int8), scale
+    return quantize_int8_rowwise(x_rot, stochastic_rounding=stochastic_rounding)
 
 
 def rotate_int8_convrot_weight(weight: torch.Tensor, group_size: int) -> torch.Tensor:
@@ -618,12 +624,10 @@ def quantize_int8_convrot_weight(
     group_size: int,
     stochastic_rounding: int | None = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    ops = _kernels()
-    if ops is None or not _mps_fp(weight) or (stochastic_rounding is not None and int(stochastic_rounding) > 0):
+    if _kernels() is None or not _mps_fp(weight):
         raise RuntimeError("metal quantize_int8_convrot_weight declined")
     rotated = rotate_int8_convrot_weight(weight, group_size)
-    q, scale = ops.quantize_int8_rowwise(rotated.contiguous())
-    return q.to(torch.int8), scale
+    return quantize_int8_rowwise(rotated, stochastic_rounding=stochastic_rounding)
 
 
 def dequantize_int8_convrot_weight(
@@ -689,18 +693,15 @@ def quantize_convrot_w4a4_weight(
     stochastic_rounding: int | None = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     ops = _kernels()
-    if (
-        ops is None
-        or not _mps_fp(weight)
-        or (stochastic_rounding is not None and int(stochastic_rounding) > 0)
-    ):
+    if ops is None or not _mps_fp(weight):
         raise RuntimeError("metal quantize_convrot_w4a4_weight declined")
     if quant_group_size != _INT4_GROUP_SIZE:
         raise RuntimeError("metal convrot w4a4 requires quant_group_size 64")
     validate_w4a4_shape(weight, convrot_groupsize, quant_group_size)
     h = _build_hadamard(convrot_groupsize, device=weight.device, dtype=weight.dtype)
     weight_rot = _rotate_weight(weight.contiguous(), h, convrot_groupsize)
-    packed, scales = ops.quantize_int4_rowwise(weight_rot.contiguous())
+    stochastic, seed = _sr_args(stochastic_rounding)
+    packed, scales = ops.quantize_int4_rowwise(weight_rot.contiguous(), stochastic, seed)
     return packed.to(torch.int8), scales
 
 
@@ -743,7 +744,7 @@ def convrot_w4a4_linear(
     x2d = x.reshape(-1, orig_shape[-1]).contiguous()
     h = _build_hadamard(convrot_groupsize, device=x2d.device, dtype=x2d.dtype)
     x_rot = _rotate_activation(x2d, h, convrot_groupsize).contiguous()
-    qact, x_scale = ops.quantize_int4_rowwise(x_rot)
+    qact, x_scale = ops.quantize_int4_rowwise(x_rot, False, 0)
     x_fp = ops.dequantize_int4_rowwise(qact, x_scale)
     w_fp = ops.dequantize_int4_rowwise(
         qweight.contiguous(),
@@ -939,9 +940,6 @@ def _validate_quantize_rowwise(kwargs) -> ValidationResult:
     x = kwargs.get("x")
     if isinstance(x, torch.Tensor) and not _mps_fp(x):
         return ValidationResult.fail("x", "metal requires mps fp16/bf16")
-    sr = kwargs.get("stochastic_rounding", 0)
-    if sr is not None and int(sr) > 0:
-        return ValidationResult.fail("stochastic_rounding", "metal path is deterministic only")
     return ValidationResult.ok()
 
 

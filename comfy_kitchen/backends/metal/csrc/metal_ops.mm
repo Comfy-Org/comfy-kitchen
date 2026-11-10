@@ -72,7 +72,19 @@ struct QuantRowParams {
   uint32_t dim;
   uint32_t x_stride;
   uint32_t q_stride;
+  uint32_t stochastic;
+  uint32_t seed_lo;
+  uint32_t seed_hi;
+  uint32_t _pad;
 };
+
+inline void set_quant_seed(QuantRowParams& p, bool stochastic, int64_t seed) {
+  p.stochastic = stochastic ? 1u : 0u;
+  const uint64_t s = static_cast<uint64_t>(seed);
+  p.seed_lo = static_cast<uint32_t>(s);
+  p.seed_hi = static_cast<uint32_t>(s >> 32);
+  p._pad = 0;
+}
 
 struct RmsRopeParams {
   uint32_t B;
@@ -109,7 +121,17 @@ struct Fp8Params {
 
 struct TensorQuantParams {
   uint32_t numel;
+  uint32_t stochastic;
+  uint32_t seed_lo;
+  uint32_t seed_hi;
 };
+
+inline void set_tensor_quant_seed(TensorQuantParams& p, bool stochastic, int64_t seed) {
+  p.stochastic = stochastic ? 1u : 0u;
+  const uint64_t s = static_cast<uint64_t>(seed);
+  p.seed_lo = static_cast<uint32_t>(s);
+  p.seed_hi = static_cast<uint32_t>(s >> 32);
+}
 
 struct DequantFlatParams {
   uint32_t numel;
@@ -668,7 +690,8 @@ at::Tensor apply_rope_split_(at::Tensor x, at::Tensor freqs) {
   return x;
 }
 
-std::tuple<at::Tensor, at::Tensor> quantize_int8_rowwise(at::Tensor x) {
+std::tuple<at::Tensor, at::Tensor> quantize_int8_rowwise(
+    at::Tensor x, bool stochastic = false, int64_t seed = 0) {
   check_mps_fp(x, "quantize_int8_rowwise");
   TORCH_CHECK(x.stride(-1) == 1);
   const int64_t dim = x.size(-1);
@@ -676,11 +699,12 @@ std::tuple<at::Tensor, at::Tensor> quantize_int8_rowwise(at::Tensor x) {
   auto q = at::empty(x2.sizes(), x2.options().dtype(at::kChar));
   auto scale = at::empty({x2.size(0)}, x2.options().dtype(at::kFloat));
 
-  QuantRowParams p;
+  QuantRowParams p{};
   p.rows = (uint32_t)x2.size(0);
   p.dim = (uint32_t)dim;
   p.x_stride = stride_u32(x2, 0, "x");
   p.q_stride = stride_u32(q, 0, "q");
+  set_quant_seed(p, stochastic, seed);
 
   std::string kname = std::string("quantize_int8_rowwise_") + suffix(x.scalar_type());
   id<MTLDevice> device = (id<MTLDevice>)at::mps::MPSDevice::getInstance()->device();
@@ -704,7 +728,8 @@ std::tuple<at::Tensor, at::Tensor> quantize_int8_rowwise(at::Tensor x) {
   return {q.reshape_as(x), scale.reshape(sshape)};
 }
 
-std::tuple<at::Tensor, at::Tensor> quantize_int4_rowwise(at::Tensor x) {
+std::tuple<at::Tensor, at::Tensor> quantize_int4_rowwise(
+    at::Tensor x, bool stochastic = false, int64_t seed = 0) {
   check_mps_fp(x, "quantize_int4_rowwise");
   TORCH_CHECK(x.stride(-1) == 1);
   const int64_t dim = x.size(-1);
@@ -713,11 +738,12 @@ std::tuple<at::Tensor, at::Tensor> quantize_int4_rowwise(at::Tensor x) {
   auto packed = at::empty({x2.size(0), dim / 2}, x2.options().dtype(at::kChar));
   auto scale = at::empty({x2.size(0)}, x2.options().dtype(at::kFloat));
 
-  QuantRowParams p;
+  QuantRowParams p{};
   p.rows = (uint32_t)x2.size(0);
   p.dim = (uint32_t)dim;
   p.x_stride = stride_u32(x2, 0, "x");
   p.q_stride = stride_u32(packed, 0, "packed");
+  set_quant_seed(p, stochastic, seed);
 
   std::string kname = std::string("quantize_int4_rowwise_") + suffix(x.scalar_type());
   id<MTLDevice> device = (id<MTLDevice>)at::mps::MPSDevice::getInstance()->device();
@@ -751,7 +777,7 @@ at::Tensor dequantize_int4_rowwise(at::Tensor packed, at::Tensor scale) {
   // Emit fp16 when possible; callers cast if they need bf16.
   auto out = at::empty({rows, dim}, packed.options().dtype(at::kHalf));
 
-  QuantRowParams p;
+  QuantRowParams p{};
   p.rows = (uint32_t)rows;
   p.dim = (uint32_t)dim;
   p.x_stride = stride_u32(out, 0, "out");
@@ -787,7 +813,7 @@ at::Tensor dequantize_int8_simple(at::Tensor q, at::Tensor scale) {
   }
   TORCH_CHECK(scale2.numel() == q2.size(0));
 
-  QuantRowParams p;
+  QuantRowParams p{};
   p.rows = (uint32_t)q2.size(0);
   p.dim = (uint32_t)dim;
   p.x_stride = stride_u32(out, 0, "out");
@@ -1111,15 +1137,17 @@ static void dispatch_flat(
   });
 }
 
-at::Tensor quantize_int8_tensorwise(at::Tensor x, at::Tensor scale) {
+at::Tensor quantize_int8_tensorwise(
+    at::Tensor x, at::Tensor scale, bool stochastic = false, int64_t seed = 0) {
   check_mps_fp(x, "quantize_int8_tensorwise");
   TORCH_CHECK(scale.device().is_mps() && scale.numel() == 1);
   x = x.contiguous();
   scale = scale.to(at::kFloat).contiguous();
   auto q = at::empty(x.sizes(), x.options().dtype(at::kChar));
 
-  TensorQuantParams p;
+  TensorQuantParams p{};
   p.numel = (uint32_t)x.numel();
+  set_tensor_quant_seed(p, stochastic, seed);
 
   std::string kname = std::string("quantize_int8_tensorwise_") + suffix(x.scalar_type());
   id<MTLDevice> device = (id<MTLDevice>)at::mps::MPSDevice::getInstance()->device();
@@ -1525,11 +1553,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("apply_rope1_", &apply_rope1_);
   m.def("apply_rope_split_", &apply_rope_split_);
   m.def("rms_rope_fused", &rms_rope_fused);
-  m.def("quantize_int8_rowwise", &quantize_int8_rowwise);
-  m.def("quantize_int4_rowwise", &quantize_int4_rowwise);
+  m.def(
+      "quantize_int8_rowwise",
+      &quantize_int8_rowwise,
+      py::arg("x"),
+      py::arg("stochastic") = false,
+      py::arg("seed") = 0);
+  m.def(
+      "quantize_int4_rowwise",
+      &quantize_int4_rowwise,
+      py::arg("x"),
+      py::arg("stochastic") = false,
+      py::arg("seed") = 0);
   m.def("dequantize_int4_rowwise", &dequantize_int4_rowwise);
   m.def("dequantize_int8_simple", &dequantize_int8_simple);
-  m.def("quantize_int8_tensorwise", &quantize_int8_tensorwise);
+  m.def(
+      "quantize_int8_tensorwise",
+      &quantize_int8_tensorwise,
+      py::arg("x"),
+      py::arg("scale"),
+      py::arg("stochastic") = false,
+      py::arg("seed") = 0);
   m.def("dequantize_int8_simple_dtype", &dequantize_int8_simple_dtype);
   m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8);
   m.def("dequantize_per_tensor_fp8", &dequantize_per_tensor_fp8);
