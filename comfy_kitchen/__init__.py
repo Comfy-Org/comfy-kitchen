@@ -6,6 +6,7 @@ from .backends import cuda as _cuda_backend
 # Import backends to trigger auto-registration
 from .backends import ascend as _ascend_backend  # noqa: F401
 from .backends import eager as _eager_backend  # noqa: F401
+from .backends import metal as _metal_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
 from .backends.cuda import memmove_ as _memmove_
@@ -57,7 +58,7 @@ if getattr(torch.version, "hip", None):
     # The HIP backend registers only on a supported AMD device (RDNA2/3/3.5/4),
     # and advertises only the ops that device can run; prefer it where it registers.
     if registry.is_available("hip"):
-        registry.set_priority(["hip", "cuda", "triton", "eager"])
+        registry.set_priority(["hip", "cuda", "metal", "triton", "eager"])
         sol_attn_chunked = _hip_backend.sol_attn_chunked
         _memmove_ = _hip_backend.memmove_
 else:
