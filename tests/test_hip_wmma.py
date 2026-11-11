@@ -3989,3 +3989,65 @@ def test_deltanet_conv_step_window_fits_registers(hip, kernel_size, seq, seed):
             [combined[:, :, 1 + s: s + kernel_size] for s in range(seq - 1)]
         )
         assert torch.equal(snaps, expected)
+
+
+# RDNA2 has no matrix cores, so the INT8 GEMM runs the SIMT v_dot4 tile kernel
+# instead of the WMMA one.
+needs_simt_int8 = pytest.mark.skipif(
+    HAS_WMMA, reason=_UNAVAILABLE or "WMMA devices take the matrix-core INT8 path"
+)
+
+
+# Both sides accumulate the quantized int8 products exactly, so what is left is the
+# scale/bias writeback and the cast to out_dtype: a few ULP of the largest output.
+# The reference keeps a float64 intermediate, while the epilogue multiplies by the
+# two scales in float32 and adds the bias afterwards, hence ~2 ULP for fp32. The
+# measured worst cases are 8e-8, 4e-4 and 3e-3 (half a bf16 ULP) of the largest
+# output, i.e. correctly rounded; a dropped K block moves the sum by ~10% of it.
+_SIMT_OUT_TOL = {
+    torch.float32: 1e-6,
+    torch.float16: 1e-3,
+    torch.bfloat16: 1e-2,
+}
+
+
+@pytest.mark.parametrize(("m", "n", "k"), [*GEMM_SHAPES, (257, 137, 1024)])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("per_channel", [False, True])
+@needs_simt_int8
+def test_int8_linear_simt_matches_int32_reference(m, n, k, out_dtype, bias, per_channel):
+    """The SIMT tile kernel must agree with the exact int32 product.
+
+    The activation is quantized by the same kernel the linear uses, so this
+    covers the GEMM and the epilogue only; a second quantizer would add its own
+    rounding. The eager backend is not a usable reference here: it needs
+    torch._int_mm, which hipBLASLt does not implement on RDNA2.
+
+    m of 1 and 8 take the small-M GEMV, which is the other RDNA2 path.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16)
+    wq, ws = ck.quantize_int8_rowwise(w)
+    ws = ws.reshape(-1) if per_channel else ws.reshape(-1)[:1]
+    bias_t = torch.randn(n, device=DEV, dtype=torch.bfloat16) if bias else None
+
+    xq, xs = ck.quantize_int8_rowwise(x)
+    # Products of two int8 are exact in float64, and so is their sum over K (K * 127^2
+    # stays under 2^53), so this is the true int32 product rather than a float32
+    # matmul that would round the wide partial sums.
+    ref = xq.double() @ wq.double().t()
+    ref = ref * xs.double().reshape(-1)[:, None] * ws.double()[None, :]
+    if bias:
+        ref += bias_t.double()
+
+    with ck.use_backend("hip"):
+        out = ck.int8_linear(x, wq, ws, bias_t, out_dtype)
+
+    assert out.shape == (m, n)
+    assert out.dtype == out_dtype
+    scale = max(ref.abs().max().item(), 1e-6)
+    err = (out.double() - ref).abs().max().item()
+    tol = _SIMT_OUT_TOL[out_dtype] * scale
+    assert err <= tol, f"max abs err {err:.3e}, allowed {tol:.3e}"
